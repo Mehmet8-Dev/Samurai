@@ -1,0 +1,332 @@
+{
+  "score": 100.0,
+  "grade": "A+",
+  "passed": 62,
+  "total": 62,
+  "checks": [
+    {
+      "rfc": "RFC 791",
+      "name": "DNS-AMP: victim IP as source",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 768",
+      "name": "LDAP-AMP: dst port 389",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 768",
+      "name": "Memcached-AMP: dst port 11211",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 768",
+      "name": "NTP-AMP: dst port 123",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 768",
+      "name": "SSDP-AMP: dst port 1900 + valid",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 1035",
+      "name": "Label encoding (length-prefixed)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 1035",
+      "name": "QDCount == 1",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 1035",
+      "name": "Root label terminator (0x00)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 1071",
+      "name": "Odd-length data handled",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 1071",
+      "name": "Checksum of all-ones = 0x0000",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 1071",
+      "name": "Checksum of valid header == 0 (verify)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 1071",
+      "name": "Checksum of all-zeros = 0xFFFF",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 7414",
+      "name": "Options 32-bit aligned",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 7414",
+      "name": "MSS option (Kind=2, Len=4)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 7414",
+      "name": "SACK Permitted (Kind=4, Len=2)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 7414",
+      "name": "Timestamp (Kind=8, Len=10)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 7414",
+      "name": "Window Scale (Kind=3, Len=3)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 768",
+      "name": "UDP length = header(8) + payload",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 768",
+      "name": "UDP checksum validates",
+      "passed": true,
+      "weight": 2
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "Header checksum validates (sum \u2192 0xFFFF)",
+      "passed": true,
+      "weight": 2
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "Destination IP matches config",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "Fragmentation MF/offset correct",
+      "passed": true,
+      "weight": 2
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "IHL >= 5 (20 bytes minimum)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "Protocol field correct (ICMP=1)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "Protocol field correct (TCP=6)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "Protocol field correct (UDP=17)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "Spoofed source IP applied correctly",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "Total Length matches actual packet",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "TTL > 0 (non-zero)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "Version field == 4",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 792",
+      "name": "Type=8 (Echo Request), Code=0",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 792",
+      "name": "ICMP checksum validates",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "Data offset >= 5 (20 bytes)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "Destination port matches config",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "Source port in ephemeral range (1024-65535)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "SYN flag set correctly",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "SYN-only has no payload (stealth)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "TCP checksum validates (pseudo-header)",
+      "passed": true,
+      "weight": 2
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "Window size > 0",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 894",
+      "name": "EtherType 0x0800 (IPv4)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 894",
+      "name": "Frame length >= 14 + IP packet",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 768",
+      "name": "[GPU] UDP checksum valid (sample)",
+      "passed": true,
+      "weight": 2
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "[GPU] IHL == 5",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "[GPU] IP checksum valid (sample)",
+      "passed": true,
+      "weight": 2
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "[GPU] Protocol fields correct",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "[GPU] Total length matches pkt size",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "[GPU] TTL > 0",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 791",
+      "name": "[GPU] Version == 4",
+      "passed": true,
+      "weight": 2
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "[GPU] Data offset == 10 (40-byte header)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "[GPU] Dst port == 80",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 7414",
+      "name": "[GPU] MSS option present (Kind=2)",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "[GPU] SYN flag set",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "rfc": "RFC 793",
+      "name": "[GPU] TCP checksum valid (sample)",
+      "passed": true,
+      "weight": 2
+    },
+    {
+      "rfc": "RFC 7414",
+      "name": "[GPU] Timestamp option present (Kind=8)",
+      "passed": true,
+      "weight": 1.0
+    }
+  ]
+}

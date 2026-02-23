@@ -1,0 +1,33 @@
+{
+  "checks": [
+    {
+      "name": "checksum_invalid_detected",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "name": "tcp_data_offset_invalid_detected",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "name": "total_length_mismatch_detected",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "name": "ttl_zero_detected",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "name": "udp_length_mismatch_detected",
+      "passed": true,
+      "weight": 1.0
+    }
+  ],
+  "passed": 5,
+  "score": 100.0,
+  "suite": "rfc_negative",
+  "total": 5
+}
