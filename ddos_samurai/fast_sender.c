@@ -205,7 +205,11 @@ static int fill_ring_request_for_version(
         req_v3->tp_block_nr = block_nr;
         req_v3->tp_frame_size = frame_size;
         req_v3->tp_frame_nr = frame_nr;
-        req_v3->tp_retire_blk_tov = 64;
+        /*
+         * TX_RING path: kernel expects v3 RX-only fields to stay zero.
+         * Non-zero tp_retire_blk_tov can make PACKET_TX_RING fail with EINVAL.
+         */
+        req_v3->tp_retire_blk_tov = 0;
         req_v3->tp_sizeof_priv = 0;
         req_v3->tp_feature_req_word = 0;
     } else if (packet_version == TPACKET_V2) {
@@ -846,7 +850,14 @@ static int setup_tx_ring(const char* iface, int packet_size, const uint8_t* mac)
     if (try_setup_tx_ring_version(iface, packet_size, mac, 1) == 0) {
         return 0;
     }
-    return try_setup_tx_ring_version(iface, packet_size, mac, 0);
+    int v3_errno = errno;
+    if (try_setup_tx_ring_version(iface, packet_size, mac, 0) == 0) {
+        fprintf(stderr,
+                "[TX_RING] TPACKET_V3 setup failed (%d: %s), falling back to TPACKET_V2\n",
+                v3_errno, strerror(v3_errno));
+        return 0;
+    }
+    return -1;
 }
 
 static PyObject* cleanup_ring(PyObject* self, PyObject* args) {
