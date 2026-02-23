@@ -65,6 +65,7 @@ Bu akislarda profil semantigi aciktir:
 1. TX_RING_L2 (en hizli)
    |-- Kosul: fast_sender C extension yuklu + send_ring_optimized mevcut
    |          + gateway MAC bulundu + MAC uzunlugu 6 byte
+   |-- Not: C extension TX_RING kurulumunda once TPACKET_V3 dener, gerekirse TPACKET_V2'ye otomatik duser
    |-- Basarisiz olursa -> fallback_count++
    |
 2. C_EXT_L3 (sendmmsg via C)
@@ -79,6 +80,11 @@ Bu akislarda profil semantigi aciktir:
    |-- Her paket icin sendto() cagrisi
    |-- PermissionError -> permission_error_count++
 ```
+
+Ek gozlemlenebilirlik:
+
+- `fast_sender.get_ring_info()` ile aktif TX_RING versiyonu (`TPACKET_V3` / `TPACKET_V2`) ve ring boyutlari okunabilir.
+- Bu introspection API sender path ismini degistirmez; `sender_path=TX_RING_L2` semantigi ayni kalir.
 
 ### Stats Dict Yeni Alanlari
 
@@ -101,4 +107,3 @@ Run report seviyesinde toplanir:
 - `fallback_count`: Toplam fallback sayisi
 - `permission_error_count`: Toplam yetki hatasi
 - `send_success_ratio_pct`: `sent / attempted * 100`
-

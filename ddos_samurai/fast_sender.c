@@ -17,6 +17,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
 #include <linux/net_tstamp.h>
@@ -90,13 +91,171 @@ typedef struct {
     int sock;
     char* map;
     size_t ring_size;
-    struct tpacket_req req;
+    int packet_version;
+    size_t frame_header_size;
+    struct tpacket_req req_v2;
+    struct tpacket_req3 req_v3;
     char iface[IFNAMSIZ];
     int is_setup;
     unsigned int frame_idx;
 } ring_context_t;
 
-static ring_context_t tx_ring_ctx = { .is_setup = 0, .sock = -1, .map = MAP_FAILED };
+static ring_context_t tx_ring_ctx = {
+    .is_setup = 0,
+    .sock = -1,
+    .map = MAP_FAILED,
+    .packet_version = TPACKET_V2,
+    .frame_header_size = 0,
+};
+
+static const char* packet_version_name(int version) {
+    switch (version) {
+        case TPACKET_V3: return "TPACKET_V3";
+        case TPACKET_V2: return "TPACKET_V2";
+        case TPACKET_V1: return "TPACKET_V1";
+        default: return "NONE";
+    }
+}
+
+static size_t frame_header_size_for_version(int version) {
+    if (version == TPACKET_V3) {
+        return TPACKET_ALIGN(sizeof(struct tpacket3_hdr));
+    }
+    return TPACKET_ALIGN(sizeof(struct tpacket2_hdr));
+}
+
+static unsigned int tx_ring_frame_size(const ring_context_t* ctx) {
+    if (ctx->packet_version == TPACKET_V3) return ctx->req_v3.tp_frame_size;
+    return ctx->req_v2.tp_frame_size;
+}
+
+static unsigned int tx_ring_frame_nr(const ring_context_t* ctx) {
+    if (ctx->packet_version == TPACKET_V3) return ctx->req_v3.tp_frame_nr;
+    return ctx->req_v2.tp_frame_nr;
+}
+
+static unsigned int tx_ring_block_size(const ring_context_t* ctx) {
+    if (ctx->packet_version == TPACKET_V3) return ctx->req_v3.tp_block_size;
+    return ctx->req_v2.tp_block_size;
+}
+
+static unsigned int tx_ring_block_nr(const ring_context_t* ctx) {
+    if (ctx->packet_version == TPACKET_V3) return ctx->req_v3.tp_block_nr;
+    return ctx->req_v2.tp_block_nr;
+}
+
+static void reset_tx_ring_context(void) {
+    memset(&tx_ring_ctx.req_v2, 0, sizeof(tx_ring_ctx.req_v2));
+    memset(&tx_ring_ctx.req_v3, 0, sizeof(tx_ring_ctx.req_v3));
+    tx_ring_ctx.ring_size = 0;
+    tx_ring_ctx.packet_version = TPACKET_V2;
+    tx_ring_ctx.frame_header_size = 0;
+    tx_ring_ctx.frame_idx = 0;
+    tx_ring_ctx.iface[0] = '\0';
+    tx_ring_ctx.is_setup = 0;
+    tx_ring_ctx.map = MAP_FAILED;
+    tx_ring_ctx.sock = -1;
+}
+
+static void cleanup_tx_ring_internal(void) {
+    if (tx_ring_ctx.map != MAP_FAILED && tx_ring_ctx.ring_size > 0) {
+        munmap(tx_ring_ctx.map, tx_ring_ctx.ring_size);
+    }
+    if (tx_ring_ctx.sock >= 0) {
+        close(tx_ring_ctx.sock);
+    }
+    reset_tx_ring_context();
+}
+
+static int set_packet_version_or_fallback(int sock, int preferred_v3) {
+    int version = preferred_v3 ? TPACKET_V3 : TPACKET_V2;
+    if (setsockopt(sock, SOL_PACKET, PACKET_VERSION, &version, sizeof(version)) == 0) {
+        return version;
+    }
+    if (preferred_v3) {
+        int v2 = TPACKET_V2;
+        if (setsockopt(sock, SOL_PACKET, PACKET_VERSION, &v2, sizeof(v2)) == 0) {
+            return v2;
+        }
+    }
+    return -1;
+}
+
+static int fill_ring_request_for_version(
+    int packet_version,
+    int packet_size,
+    struct tpacket_req* req_v2,
+    struct tpacket_req3* req_v3,
+    size_t* out_frame_header_size
+) {
+    if (packet_size <= 0) return -1;
+
+    size_t frame_header_size = frame_header_size_for_version(packet_version);
+    unsigned int block_size = (unsigned int)getpagesize();
+    while (block_size < (unsigned int)(packet_size + frame_header_size)) {
+        block_size <<= 1;
+    }
+    unsigned int block_nr = 4096;
+    unsigned int frame_size = block_size;
+    unsigned int frame_nr = block_nr;
+
+    if (packet_version == TPACKET_V3) {
+        memset(req_v3, 0, sizeof(*req_v3));
+        req_v3->tp_block_size = block_size;
+        req_v3->tp_block_nr = block_nr;
+        req_v3->tp_frame_size = frame_size;
+        req_v3->tp_frame_nr = frame_nr;
+        req_v3->tp_retire_blk_tov = 64;
+        req_v3->tp_sizeof_priv = 0;
+        req_v3->tp_feature_req_word = 0;
+    } else if (packet_version == TPACKET_V2) {
+        memset(req_v2, 0, sizeof(*req_v2));
+        req_v2->tp_block_size = block_size;
+        req_v2->tp_block_nr = block_nr;
+        req_v2->tp_frame_size = frame_size;
+        req_v2->tp_frame_nr = frame_nr;
+    } else {
+        return -1;
+    }
+
+    if (out_frame_header_size) *out_frame_header_size = frame_header_size;
+    return 0;
+}
+
+static inline uint32_t tx_frame_status(const void* frame_base, int packet_version) {
+    if (packet_version == TPACKET_V3) {
+        const struct tpacket3_hdr* h = (const struct tpacket3_hdr*)frame_base;
+        return h->tp_status;
+    }
+    const struct tpacket2_hdr* h = (const struct tpacket2_hdr*)frame_base;
+    return h->tp_status;
+}
+
+static inline void tx_frame_prepare(
+    void* frame_base,
+    int packet_version,
+    size_t frame_header_size,
+    int packet_size
+) {
+    if (packet_version == TPACKET_V3) {
+        struct tpacket3_hdr* h = (struct tpacket3_hdr*)frame_base;
+        h->tp_next_offset = 0;
+        h->tp_len = (uint32_t)packet_size;
+        h->tp_snaplen = (uint32_t)packet_size;
+        h->tp_mac = (uint16_t)frame_header_size;
+        h->tp_net = (uint16_t)(frame_header_size + 14);
+        __sync_synchronize();
+        h->tp_status = TP_STATUS_SEND_REQUEST;
+        return;
+    }
+    struct tpacket2_hdr* h = (struct tpacket2_hdr*)frame_base;
+    h->tp_len = (uint32_t)packet_size;
+    h->tp_snaplen = (uint32_t)packet_size;
+    h->tp_mac = (uint16_t)frame_header_size;
+    h->tp_net = (uint16_t)(frame_header_size + 14);
+    __sync_synchronize();
+    h->tp_status = TP_STATUS_SEND_REQUEST;
+}
 
 // --- Checksum Helpers ---
 static uint16_t checksum(uint8_t *ptr, int nbytes) {
@@ -226,6 +385,54 @@ static PyObject* set_mimicry_settings(PyObject* self, PyObject* args) {
 }
 
 // --- RX_RING Handshake Handler ---
+static void process_rx_packet(const uint8_t* pkt, uint32_t pkt_len, int sock, const struct sockaddr_ll* sll) {
+    if (!pkt || pkt_len < 54) return;
+
+    const uint8_t* ip = pkt + 14;
+    if (ip[9] != 6) return; // TCP
+
+    uint8_t ihl = (ip[0] & 0x0F) * 4;
+    if (pkt_len < (uint32_t)(14 + ihl + 20)) return;
+
+    const uint8_t* tcp = ip + ihl;
+    uint8_t flags = tcp[13];
+    if (flags != 0x12) return; // SYN-ACK
+
+    uint32_t src_ip = ntohl(*(const uint32_t*)(ip + 12));
+    uint32_t dst_ip = ntohl(*(const uint32_t*)(ip + 16));
+    uint16_t src_port = ntohs(*(const uint16_t*)tcp);
+    uint16_t dst_port = ntohs(*(const uint16_t*)(tcp + 2));
+    uint32_t seq = ntohl(*(const uint32_t*)(tcp + 4));
+    uint32_t ack = ntohl(*(const uint32_t*)(tcp + 8));
+
+    update_state(dst_ip, dst_port, ack, seq + 1, 2, global_window_size, global_mss, global_ttl);
+
+    uint8_t ack_pkt[54];
+    memset(ack_pkt, 0, sizeof(ack_pkt));
+    memcpy(ack_pkt, pkt + 6, 6);
+    memcpy(ack_pkt + 6, pkt, 6);
+    *(uint16_t*)(ack_pkt + 12) = htons(0x0800);
+    ack_pkt[14] = 0x45;
+    *(uint16_t*)(ack_pkt + 16) = htons(40);
+    ack_pkt[22] = global_ttl;
+    ack_pkt[23] = 6;
+    *(uint32_t*)(ack_pkt + 26) = htonl(dst_ip);
+    *(uint32_t*)(ack_pkt + 30) = htonl(src_ip);
+    *(uint16_t*)(ack_pkt + 34) = htons(dst_port);
+    *(uint16_t*)(ack_pkt + 36) = htons(src_port);
+    *(uint32_t*)(ack_pkt + 38) = htonl(ack);
+    *(uint32_t*)(ack_pkt + 42) = htonl(seq + 1);
+    ack_pkt[46] = 0x50;
+    ack_pkt[47] = 0x10;
+    *(uint16_t*)(ack_pkt + 48) = htons(global_window_size);
+    *(uint16_t*)(ack_pkt + 24) = htons(checksum(ack_pkt + 14, 20));
+    *(uint16_t*)(ack_pkt + 50) = htons(tcp_checksum(ack_pkt + 14, ack_pkt + 34, 20));
+
+    if (sendto(sock, ack_pkt, sizeof(ack_pkt), 0, (const struct sockaddr*)sll, sizeof(*sll)) < 0) {
+        // Ignore errors
+    }
+}
+
 static void* rx_thread_func(void* arg) {
     char* iface = (char*)arg;
     int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -235,12 +442,23 @@ static void* rx_thread_func(void* arg) {
         return NULL;
     }
 
-    struct tpacket_req req;
+    int version = TPACKET_V3;
+    if (setsockopt(sock, SOL_PACKET, PACKET_VERSION, &version, sizeof(version)) < 0) {
+        perror("setsockopt PACKET_VERSION(TPACKET_V3) failed");
+        close(sock);
+        free(iface);
+        return NULL;
+    }
+
+    struct tpacket_req3 req;
     memset(&req, 0, sizeof(req));
     req.tp_block_size = getpagesize();
     req.tp_frame_size = req.tp_block_size;
     req.tp_block_nr = 1024;
-    req.tp_frame_nr = 1024;
+    req.tp_frame_nr = req.tp_block_nr;
+    req.tp_retire_blk_tov = 64;
+    req.tp_sizeof_priv = 0;
+    req.tp_feature_req_word = 0;
 
     if (setsockopt(sock, SOL_PACKET, PACKET_RX_RING, (void*)&req, sizeof(req)) < 0) {
         perror("setsockopt PACKET_RX_RING failed");
@@ -254,7 +472,8 @@ static void* rx_thread_func(void* arg) {
         // Not fatal
     }
 
-    uint8_t* map = mmap(NULL, req.tp_block_size * req.tp_block_nr, PROT_READ | PROT_WRITE, MAP_SHARED, sock, 0);
+    size_t rx_ring_size = (size_t)req.tp_block_size * req.tp_block_nr;
+    uint8_t* map = mmap(NULL, rx_ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, sock, 0);
     if (map == MAP_FAILED) {
         perror("mmap RX_RING failed");
         close(sock);
@@ -269,72 +488,45 @@ static void* rx_thread_func(void* arg) {
     sll.sll_ifindex = if_nametoindex(iface);
     if (bind(sock, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
         perror("bind RX socket failed");
-        munmap(map, req.tp_block_size * req.tp_block_nr);
+        munmap(map, rx_ring_size);
         close(sock);
         free(iface);
         return NULL;
     }
 
-    unsigned int frame_idx = 0;
+    unsigned int block_idx = 0;
     printf("[RX] Thread started on interface %s\n", iface);
     fflush(stdout);
 
     while (1) {
-        struct tpacket2_hdr* header = (struct tpacket2_hdr*)(map + (frame_idx * req.tp_frame_size));
-        if (header->tp_status & TP_STATUS_USER) {
-            uint8_t* pkt = (uint8_t*)header + header->tp_mac;
-            if (header->tp_len >= 54) {
-                uint8_t* ip = pkt + 14;
-                if (ip[9] == 6) { // TCP
-                    uint8_t ihl = (ip[0] & 0x0F) * 4;
-                    uint8_t* tcp = ip + ihl;
-                    uint8_t flags = tcp[13];
-                    
-                    if (flags == 0x12) { // SYN-ACK
-                        uint32_t src_ip = ntohl(*(uint32_t*)(ip + 12));
-                        uint32_t dst_ip = ntohl(*(uint32_t*)(ip + 16));
-                        uint16_t src_port = ntohs(*(uint16_t*)tcp);
-                        uint16_t dst_port = ntohs(*(uint16_t*)(tcp + 2));
-                        uint32_t seq = ntohl(*(uint32_t*)(tcp + 4));
-                        uint32_t ack = ntohl(*(uint32_t*)(tcp + 8));
-
-                        // Update State Table
-                        update_state(dst_ip, dst_port, ack, seq + 1, 2, global_window_size, global_mss, global_ttl); // ESTABLISHED
-                        
-                        // --- Send ACK ---
-                        uint8_t ack_pkt[54];
-                        memset(ack_pkt, 0, 54);
-                        memcpy(ack_pkt, pkt + 6, 6); 
-                        memcpy(ack_pkt + 6, pkt, 6); 
-                        *(uint16_t*)(ack_pkt + 12) = htons(0x0800);
-                        ack_pkt[14] = 0x45;
-                        *(uint16_t*)(ack_pkt + 16) = htons(40);
-                        ack_pkt[22] = global_ttl; 
-                        ack_pkt[23] = 6;  
-                        *(uint32_t*)(ack_pkt + 26) = htonl(dst_ip);
-                        *(uint32_t*)(ack_pkt + 30) = htonl(src_ip);
-                        *(uint16_t*)(ack_pkt + 34) = htons(dst_port);
-                        *(uint16_t*)(ack_pkt + 36) = htons(src_port);
-                        *(uint32_t*)(ack_pkt + 38) = htonl(ack);
-                        *(uint32_t*)(ack_pkt + 42) = htonl(seq + 1);
-                        ack_pkt[46] = 0x50; 
-                        ack_pkt[47] = 0x10; 
-                        *(uint16_t*)(ack_pkt + 48) = htons(global_window_size);
-                        *(uint16_t*)(ack_pkt + 24) = htons(checksum(ack_pkt + 14, 20));
-                        *(uint16_t*)(ack_pkt + 50) = htons(tcp_checksum(ack_pkt + 14, ack_pkt + 34, 20));
-                        
-                        if (sendto(sock, ack_pkt, 54, 0, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
-                            // Ignore errors
-                        }
-                    }
-                }
-            }
-            header->tp_status = TP_STATUS_KERNEL;
-            frame_idx = (frame_idx + 1) % req.tp_frame_nr;
-        } else {
+        struct tpacket_block_desc* block_desc =
+            (struct tpacket_block_desc*)(map + ((size_t)block_idx * req.tp_block_size));
+        if (!(block_desc->hdr.bh1.block_status & TP_STATUS_USER)) {
             usleep(10);
+            continue;
         }
+
+        uint32_t num_pkts = block_desc->hdr.bh1.num_pkts;
+        uint32_t offset = block_desc->hdr.bh1.offset_to_first_pkt;
+        struct tpacket3_hdr* header = (struct tpacket3_hdr*)((uint8_t*)block_desc + offset);
+
+        for (uint32_t pkt_idx = 0; pkt_idx < num_pkts; pkt_idx++) {
+            uint8_t* pkt = (uint8_t*)header + header->tp_mac;
+            uint32_t pkt_len = header->tp_snaplen ? header->tp_snaplen : header->tp_len;
+            process_rx_packet(pkt, pkt_len, sock, &sll);
+
+            if (pkt_idx + 1 >= num_pkts) break;
+            if (header->tp_next_offset == 0) break;
+            header = (struct tpacket3_hdr*)((uint8_t*)header + header->tp_next_offset);
+        }
+
+        __sync_synchronize();
+        block_desc->hdr.bh1.block_status = TP_STATUS_KERNEL;
+        block_idx = (block_idx + 1) % req.tp_block_nr;
     }
+
+    munmap(map, rx_ring_size);
+    close(sock);
     free(iface);
     return NULL;
 }
@@ -342,7 +534,7 @@ static void* rx_thread_func(void* arg) {
 static PyObject* start_rx_handler(PyObject* self, PyObject* args) {
     char* iface;
     if (!PyArg_ParseTuple(args, "s", &iface)) return NULL;
-    
+
     pthread_t thread;
     if (pthread_create(&thread, NULL, rx_thread_func, strdup(iface)) != 0) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to create RX thread");
@@ -553,40 +745,54 @@ static PyObject* check_so_txtime(PyObject* self, PyObject* args) {
 
 // --- L2 Sender (AF_PACKET TX_RING Zero-Copy) ---
 
-static int setup_tx_ring(const char* iface, int packet_size, const uint8_t* mac) {
-    if (tx_ring_ctx.is_setup) {
-        // If interface or packet size changed, we need to re-setup
-        if (strcmp(tx_ring_ctx.iface, iface) == 0 && tx_ring_ctx.req.tp_frame_size >= packet_size + TPACKET_ALIGN(sizeof(struct tpacket2_hdr))) {
-            return 0; 
-        }
-        // Cleanup old ring
-        if (tx_ring_ctx.map != MAP_FAILED) munmap(tx_ring_ctx.map, tx_ring_ctx.ring_size);
-        if (tx_ring_ctx.sock >= 0) close(tx_ring_ctx.sock);
-        tx_ring_ctx.is_setup = 0;
-    }
+static int try_setup_tx_ring_version(const char* iface, int packet_size, const uint8_t* mac, int prefer_v3) {
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sock < 0) return -1;
 
-    tx_ring_ctx.sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (tx_ring_ctx.sock < 0) return -1;
-
-    memset(&tx_ring_ctx.req, 0, sizeof(tx_ring_ctx.req));
-    tx_ring_ctx.req.tp_block_size = getpagesize();
-    size_t frame_header_size = TPACKET_ALIGN(sizeof(struct tpacket2_hdr));  
-    while (tx_ring_ctx.req.tp_block_size < packet_size + frame_header_size) {
-        tx_ring_ctx.req.tp_block_size <<= 1;
-    }
-    tx_ring_ctx.req.tp_frame_size = tx_ring_ctx.req.tp_block_size;
-    tx_ring_ctx.req.tp_block_nr = 4096; 
-    tx_ring_ctx.req.tp_frame_nr = tx_ring_ctx.req.tp_block_nr;
-
-    if (setsockopt(tx_ring_ctx.sock, SOL_PACKET, PACKET_TX_RING, &tx_ring_ctx.req, sizeof(tx_ring_ctx.req)) < 0) {
-        close(tx_ring_ctx.sock);
+    int packet_version = set_packet_version_or_fallback(sock, prefer_v3);
+    if (packet_version < 0) {
+        int saved_errno = errno;
+        close(sock);
+        errno = saved_errno;
         return -1;
     }
 
-    tx_ring_ctx.ring_size = tx_ring_ctx.req.tp_block_nr * tx_ring_ctx.req.tp_block_size;
-    tx_ring_ctx.map = mmap(NULL, tx_ring_ctx.ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, tx_ring_ctx.sock, 0);
-    if (tx_ring_ctx.map == MAP_FAILED) {
-        close(tx_ring_ctx.sock);
+    struct tpacket_req req_v2;
+    struct tpacket_req3 req_v3;
+    memset(&req_v2, 0, sizeof(req_v2));
+    memset(&req_v3, 0, sizeof(req_v3));
+    size_t frame_header_size = 0;
+    if (fill_ring_request_for_version(packet_version, packet_size, &req_v2, &req_v3, &frame_header_size) < 0) {
+        close(sock);
+        errno = EINVAL;
+        return -1;
+    }
+
+    int ring_rc;
+    if (packet_version == TPACKET_V3) {
+        ring_rc = setsockopt(sock, SOL_PACKET, PACKET_TX_RING, &req_v3, sizeof(req_v3));
+    } else {
+        ring_rc = setsockopt(sock, SOL_PACKET, PACKET_TX_RING, &req_v2, sizeof(req_v2));
+    }
+    if (ring_rc < 0) {
+        int saved_errno = errno;
+        close(sock);
+        errno = saved_errno;
+        return -1;
+    }
+
+    size_t ring_size;
+    if (packet_version == TPACKET_V3) {
+        ring_size = (size_t)req_v3.tp_block_nr * req_v3.tp_block_size;
+    } else {
+        ring_size = (size_t)req_v2.tp_block_nr * req_v2.tp_block_size;
+    }
+
+    char* map = mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, sock, 0);
+    if (map == MAP_FAILED) {
+        int saved_errno = errno;
+        close(sock);
+        errno = saved_errno;
         return -1;
     }
 
@@ -598,27 +804,86 @@ static int setup_tx_ring(const char* iface, int packet_size, const uint8_t* mac)
     sll.sll_halen = ETH_ALEN;
     memcpy(sll.sll_addr, mac, 6);
 
-    if (bind(tx_ring_ctx.sock, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
-        munmap(tx_ring_ctx.map, tx_ring_ctx.ring_size);
-        close(tx_ring_ctx.sock);
+    if (bind(sock, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+        int saved_errno = errno;
+        munmap(map, ring_size);
+        close(sock);
+        errno = saved_errno;
         return -1;
     }
 
-    strncpy(tx_ring_ctx.iface, iface, IFNAMSIZ);
+    // Best effort; not fatal if unavailable
+    int qdisc_bypass = 1;
+    (void)setsockopt(sock, SOL_PACKET, PACKET_QDISC_BYPASS, &qdisc_bypass, sizeof(qdisc_bypass));
+
+    tx_ring_ctx.sock = sock;
+    tx_ring_ctx.map = map;
+    tx_ring_ctx.ring_size = ring_size;
+    tx_ring_ctx.packet_version = packet_version;
+    tx_ring_ctx.frame_header_size = frame_header_size;
+    tx_ring_ctx.req_v2 = req_v2;
+    tx_ring_ctx.req_v3 = req_v3;
+    snprintf(tx_ring_ctx.iface, IFNAMSIZ, "%s", iface);
     tx_ring_ctx.is_setup = 1;
     tx_ring_ctx.frame_idx = 0;
     return 0;
 }
 
-static PyObject* cleanup_ring(PyObject* self, PyObject* args) {
+static int setup_tx_ring(const char* iface, int packet_size, const uint8_t* mac) {
     if (tx_ring_ctx.is_setup) {
-        if (tx_ring_ctx.map != MAP_FAILED) munmap(tx_ring_ctx.map, tx_ring_ctx.ring_size);
-        if (tx_ring_ctx.sock >= 0) close(tx_ring_ctx.sock);
-        tx_ring_ctx.is_setup = 0;
-        tx_ring_ctx.map = MAP_FAILED;
-        tx_ring_ctx.sock = -1;
+        unsigned int current_frame_size = tx_ring_frame_size(&tx_ring_ctx);
+        size_t current_frame_header_size = tx_ring_ctx.frame_header_size;
+        if (current_frame_header_size == 0) {
+            current_frame_header_size = frame_header_size_for_version(tx_ring_ctx.packet_version);
+        }
+        if (strcmp(tx_ring_ctx.iface, iface) == 0 &&
+            current_frame_size >= (unsigned int)(packet_size + current_frame_header_size)) {
+            return 0;
+        }
+        cleanup_tx_ring_internal();
     }
+
+    if (try_setup_tx_ring_version(iface, packet_size, mac, 1) == 0) {
+        return 0;
+    }
+    return try_setup_tx_ring_version(iface, packet_size, mac, 0);
+}
+
+static PyObject* cleanup_ring(PyObject* self, PyObject* args) {
+    (void)self;
+    (void)args;
+    cleanup_tx_ring_internal();
     Py_RETURN_NONE;
+}
+
+static PyObject* get_ring_info(PyObject* self, PyObject* args) {
+    (void)self;
+    (void)args;
+
+    int is_setup = tx_ring_ctx.is_setup ? 1 : 0;
+    int packet_version = is_setup ? tx_ring_ctx.packet_version : 0;
+    const char* version_name = is_setup ? packet_version_name(packet_version) : "NONE";
+    const char* iface = is_setup ? tx_ring_ctx.iface : "";
+    unsigned int tp_block_size = is_setup ? tx_ring_block_size(&tx_ring_ctx) : 0;
+    unsigned int tp_frame_size = is_setup ? tx_ring_frame_size(&tx_ring_ctx) : 0;
+    unsigned int tp_block_nr = is_setup ? tx_ring_block_nr(&tx_ring_ctx) : 0;
+    unsigned int tp_frame_nr = is_setup ? tx_ring_frame_nr(&tx_ring_ctx) : 0;
+    unsigned long long ring_size = is_setup ? (unsigned long long)tx_ring_ctx.ring_size : 0ULL;
+    unsigned long long frame_header_size = is_setup ? (unsigned long long)tx_ring_ctx.frame_header_size : 0ULL;
+
+    return Py_BuildValue(
+        "{s:i,s:i,s:s,s:s,s:I,s:I,s:I,s:I,s:K,s:K}",
+        "is_setup", is_setup,
+        "packet_version", packet_version,
+        "packet_version_name", version_name,
+        "iface", iface,
+        "tp_block_size", tp_block_size,
+        "tp_frame_size", tp_frame_size,
+        "tp_block_nr", tp_block_nr,
+        "tp_frame_nr", tp_frame_nr,
+        "ring_size", ring_size,
+        "frame_header_size", frame_header_size
+    );
 }
 
 static PyObject* send_ring_optimized(PyObject* self, PyObject* args) {
@@ -648,32 +913,30 @@ static PyObject* send_ring_optimized(PyObject* self, PyObject* args) {
 
     int total_sent = 0;
     char* data_ptr = (char*)view.buf;
-    size_t frame_header_size = TPACKET_ALIGN(sizeof(struct tpacket2_hdr));
+    size_t frame_header_size = tx_ring_ctx.frame_header_size;
+    unsigned int frame_size = tx_ring_frame_size(&tx_ring_ctx);
+    unsigned int frame_nr = tx_ring_frame_nr(&tx_ring_ctx);
+    int packet_version = tx_ring_ctx.packet_version;
 
     struct pollfd pfd;
     pfd.fd = tx_ring_ctx.sock;
     pfd.events = POLLOUT;
 
     for (int i = 0; i < count; ) {
-        struct tpacket2_hdr* header = (struct tpacket2_hdr*)(tx_ring_ctx.map + (tx_ring_ctx.frame_idx * tx_ring_ctx.req.tp_frame_size));
+        char* frame_base = tx_ring_ctx.map + ((size_t)tx_ring_ctx.frame_idx * frame_size);
         
         int busy_loops = 1000 + (i % 2000); 
-        while (header->tp_status != TP_STATUS_AVAILABLE) {
+        while (tx_frame_status(frame_base, packet_version) != TP_STATUS_AVAILABLE) {
             if (busy_loops > 0) { busy_loops--; continue; }
             poll(&pfd, 1, 1);
-            if (header->tp_status != TP_STATUS_AVAILABLE) {
+            if (tx_frame_status(frame_base, packet_version) != TP_STATUS_AVAILABLE) {
                  sendto(tx_ring_ctx.sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
             }
         }
 
-        char* payload_ptr = (char*)header + frame_header_size;
+        char* payload_ptr = frame_base + frame_header_size;
         memcpy(payload_ptr, data_ptr + (i * packet_size), packet_size);
-        
-        header->tp_len = packet_size;
-        header->tp_snaplen = packet_size;
-        header->tp_mac = frame_header_size;        
-        header->tp_net = frame_header_size + 14;   
-        header->tp_status = TP_STATUS_SEND_REQUEST;
+        tx_frame_prepare(frame_base, packet_version, frame_header_size, packet_size);
 
         int dynamic_batch = 128 + (i & 0xFF);
         if ((i % dynamic_batch == 0) || (i == count - 1)) {
@@ -682,7 +945,7 @@ static PyObject* send_ring_optimized(PyObject* self, PyObject* args) {
 
         total_sent++;
         i++;
-        tx_ring_ctx.frame_idx = (tx_ring_ctx.frame_idx + 1) % tx_ring_ctx.req.tp_frame_nr;
+        tx_ring_ctx.frame_idx = (tx_ring_ctx.frame_idx + 1) % frame_nr;
     }
 
     PyBuffer_Release(&view);
@@ -699,6 +962,7 @@ static PyMethodDef FastSenderMethods[] = {
      "Returns: dict with 'sent' and 'tx_errors' counts."},
     {"send_ring_optimized", send_ring_optimized, METH_VARARGS, "Send packets using AF_PACKET TX_RING (L2 Zero-Copy)"},
     {"cleanup_ring", cleanup_ring, METH_VARARGS, "Cleanup persistent TX_RING context"},
+    {"get_ring_info", get_ring_info, METH_NOARGS, "Return active TX_RING setup details including packet version."},
     {"get_tcp_state", get_tcp_state, METH_VARARGS, "Get TCP state from the state table"},
     {"get_states_batch", get_states_batch, METH_VARARGS, "Get multiple TCP states in one call"},
     {"start_rx_handler", start_rx_handler, METH_VARARGS, "Start the background RX handler thread"},
