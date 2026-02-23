@@ -32,6 +32,28 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _write_json_with_fallback(preferred: Path, payload: dict, fallback_name: str) -> Path:
+    content = json.dumps(payload, indent=2, sort_keys=True)
+    candidates = [
+        preferred,
+        Path.cwd() / ".pytest_artifacts" / fallback_name,
+        Path(tempfile.gettempdir()) / ".pytest_artifacts" / fallback_name,
+    ]
+    seen = set()
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            cand.parent.mkdir(parents=True, exist_ok=True)
+            cand.write_text(content, encoding="utf-8")
+            return cand
+        except PermissionError:
+            continue
+    raise PermissionError(f"Unable to write benchmark report to any candidate path: {candidates}")
+
+
 def _percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -194,15 +216,19 @@ class TestZZ_WriteBenchmarkReport(unittest.TestCase):
         out_path = str(os.environ.get("SAMURAI_BENCH_REPORT_OUT", "") or "").strip()
         if not out_path:
             out_path = str(Path(tempfile.gettempdir()) / "benchmark_summary.json")
-        out = Path(out_path).resolve()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        out = _write_json_with_fallback(
+            Path(out_path).resolve(),
+            summary,
+            "benchmark_summary.json",
+        )
 
         # Optional baseline refresh.
         baseline_path = str(os.environ.get("SAMURAI_BENCH_BASELINE", "") or "").strip()
         if baseline_path and _truthy(os.environ.get("SAMURAI_BENCH_UPDATE_BASELINE")):
-            base = Path(baseline_path).resolve()
-            base.parent.mkdir(parents=True, exist_ok=True)
-            base.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+            _write_json_with_fallback(
+                Path(baseline_path).resolve(),
+                summary,
+                "benchmark_baseline.json",
+            )
 
         self.assertTrue(out.exists())

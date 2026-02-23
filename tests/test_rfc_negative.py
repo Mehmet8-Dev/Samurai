@@ -59,6 +59,28 @@ def _score(name: str, weight: float = 1.0):
 
     return deco
 
+
+def _write_json_with_fallback(preferred: Path, payload: dict, fallback_name: str) -> Path:
+    content = json.dumps(payload, indent=2, sort_keys=True)
+    candidates = [
+        preferred,
+        Path.cwd() / ".pytest_artifacts" / fallback_name,
+        Path(tempfile.gettempdir()) / ".pytest_artifacts" / fallback_name,
+    ]
+    seen = set()
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            cand.parent.mkdir(parents=True, exist_ok=True)
+            cand.write_text(content, encoding="utf-8")
+            return cand
+        except PermissionError:
+            continue
+    raise PermissionError(f"Unable to write RFC negative report to any candidate path: {candidates}")
+
 _ScoreBoard.reset()
 
 
@@ -161,8 +183,7 @@ class TestZZFinalRFCNegativeReport(unittest.TestCase):
             else:
                 out = base_path / "rfc_negative_report.json"
 
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(r, indent=2, sort_keys=True), encoding="utf-8")
+        out = _write_json_with_fallback(out, r, "rfc_negative_report.json")
 
         self.assertGreaterEqual(r["score"], 95.0)
 

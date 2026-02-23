@@ -45,6 +45,28 @@ def _raw_socket_available() -> bool:
         return False
 
 
+def _write_json_with_fallback(preferred: Path, payload: dict, fallback_name: str) -> Path:
+    content = json.dumps(payload, indent=2, sort_keys=True)
+    candidates = [
+        preferred,
+        Path.cwd() / ".pytest_artifacts" / fallback_name,
+        Path(tempfile.gettempdir()) / ".pytest_artifacts" / fallback_name,
+    ]
+    seen = set()
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            cand.parent.mkdir(parents=True, exist_ok=True)
+            cand.write_text(content, encoding="utf-8")
+            return cand
+        except PermissionError:
+            continue
+    raise PermissionError(f"Unable to write full benchmark report to any candidate path: {candidates}")
+
+
 class TestFullPacingBenchmark(unittest.TestCase):
     def test_pacing_accuracy_full(self):
         _require_root_or_skip()
@@ -140,7 +162,9 @@ class TestZZWriteFullBenchmarkReport(unittest.TestCase):
         out_path = str(os.environ.get("SAMURAI_BENCH_REPORT_OUT", "") or "").strip()
         if not out_path:
             out_path = str(Path(tempfile.gettempdir()) / "benchmark_summary_full.json")
-        out = Path(out_path).resolve()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(_FullBenchState.summary, indent=2, sort_keys=True), encoding="utf-8")
+        out = _write_json_with_fallback(
+            Path(out_path).resolve(),
+            _FullBenchState.summary,
+            "benchmark_summary_full.json",
+        )
         self.assertTrue(out.exists())

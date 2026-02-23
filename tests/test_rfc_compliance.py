@@ -109,6 +109,28 @@ def _score(rfc, name, weight=1.0):
         return wrapper
     return decorator
 
+
+def _write_json_with_fallback(path: str, payload: dict, fallback_name: str) -> str:
+    content = json.dumps(payload, indent=2)
+    candidates = [
+        os.path.abspath(path),
+        os.path.abspath(os.path.join(os.getcwd(), ".pytest_artifacts", fallback_name)),
+        os.path.abspath(os.path.join(tempfile.gettempdir(), ".pytest_artifacts", fallback_name)),
+    ]
+    seen = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            os.makedirs(os.path.dirname(cand), exist_ok=True)
+            with open(cand, "w", encoding="utf-8") as f:
+                f.write(content)
+            return cand
+        except PermissionError:
+            continue
+    raise PermissionError(f"Unable to write RFC report to any candidate path: {candidates}")
+
 _ScoreBoard.reset()
 
 
@@ -656,10 +678,8 @@ class TestZZ_FinalReport(unittest.TestCase):
                 path = base_path
             else:
                 path = os.path.join(base_path, "rfc_positive_report.json")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(r, f, indent=2)
-        print(f"\n  Report saved → {os.path.abspath(path)}")
+        path = _write_json_with_fallback(path, r, "rfc_positive_report.json")
+        print(f"\n  Report saved → {path}")
 
         self.assertGreaterEqual(r["score"], 95, "RFC compliance score below 95%!")
 
