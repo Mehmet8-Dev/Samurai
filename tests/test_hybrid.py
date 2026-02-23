@@ -8,11 +8,21 @@ import unittest
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from ddos_samurai import packet, gpu_packet
+from ddos_samurai import packet
 from ddos_samurai.scapy_support import is_scapy_available
+
+GPU_MODULES_IMPORTABLE = False
+try:
+    from ddos_samurai import gpu_packet
+    GPU_MODULES_IMPORTABLE = True
+except Exception:
+    gpu_packet = None
+    GPU_MODULES_IMPORTABLE = False
 
 class TestHybridGeneration(unittest.TestCase):
     def test_hybrid_generation(self):
+        if not GPU_MODULES_IMPORTABLE:
+            self.skipTest("gpu_packet module unavailable (missing numba/cupy/CUDA deps).")
         if not is_scapy_available():
             self.skipTest("Scapy unavailable; hybrid CPU-template generation requires scapy.")
 
@@ -49,12 +59,10 @@ class TestHybridGeneration(unittest.TestCase):
                 spoof_enabled=True  
             )
         except Exception as e:
-            print(f"[SKIP] GPU generation failed (No CUDA?): {e}")
-            return
+            self.skipTest(f"GPU generation unavailable in this environment: {e}")
 
         if gpu_packets is None:
-            print("[SKIP] GPU generation returned None (No CUDA device found?)")
-            return
+            self.skipTest("GPU generation returned None (CUDA device unavailable).")
 
         cpu_packets = gpu_packets.get()
         packet_len = len(template_bytes)
