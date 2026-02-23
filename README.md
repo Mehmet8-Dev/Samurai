@@ -1,51 +1,93 @@
-# DDoSamurai v2.0 ⚔️
+# DDoSamurai v2.0
 
-**DDoSamurai**, gelişmiş, yüksek performanslı ve modüler bir ağ stres testi ve sızma testi aracıdır. Modern WAF/IPS sistemlerini test etmek için tasarlanmış olup, **CPU**, **GPU (CUDA)** ve **Ninja (Headless Browser)** modlarını destekler.
+DDoSamurai, **yalnizca yetkili ortamlarda** kullanilmak uzere tasarlanmis, moduler bir ag stres ve guvenlik test platformudur.
 
-## Documentation
+Proje; tek bir CLI uzerinden CPU/GPU veri yollari, C hizlandirma katmanlari, opsiyonel SaaS API + dashboard ve dis monitoring yiginini birlestirir.
 
-Mimari ve kod yapisini parca parca anlatan ic dokumantasyon: `docs/README.md`
+## Durum Ozeti
 
-## Monitoring (External)
+- Mimari: Python + C extension + opsiyonel CUDA + FastAPI + React
+- Olgunluk: Guclu teknik beta / pilot-ready
+- Odak: Yetkili ortamlarda L4/L7 yuk testi, davranis testi, gozlemlenebilirlik
 
-Uygulama disi Prometheus + Grafana izleme paketi: `monitoring/README.md`
+## Yasal ve Etik Sinir
 
-## 🚀 Özellikler
+Bu proje sadece izinli hedeflerde kullanilmalidir.
+Yetkisiz sistemlere trafik gondermek yasa disi olabilir ve tum sorumluluk kullanicidadir.
 
-*   **Hibrit Mimari:** `multiprocessing` (CPU) ve `CUDA` (GPU) gücünü birleştirir.
-*   **Yüksek Performans:** C eklentisi (`fast_sender`) ve `AF_PACKET` (TX_RING) ile milyonlarca PPS.
-*   **Ninja Mode (WAF Bypass):** `Playwright` kullanarak gerçek bir tarayıcı gibi davranır, JS challenge'larını aşar (Cloudflare, Akamai vb.).
-*   **Protokol Taklidi:** JA3/JA4 parmak izi taklidi (SSL/TLS) ve HTTP/2 desteği.
-*   **Gelişmiş Saldırı Vektörleri:**
-    *   **L4:** TCP, UDP, ICMP Flood (IP Spoofing destekli).
-    *   **L7:** HTTP/HTTPS Flood, Slowloris, DNS/NTP Amplification, WebSocket, QUIC/HTTP3.
-*   **Gözlemlenebilirlik:** Terminal tabanlı canlı izleme paneli (Rich) ve Prometheus metrikleri.
+## Ana Bilesenler
 
-## 🛠️ Kurulum
+- CLI giris noktasi: `advv2.py`, `ddos_samurai/cli.py`
+- Worker / dispatch: `ddos_samurai/orchestrator.py`
+- Sender katmani: `ddos_samurai/senders.py`
+- CPU paket uretimi: `ddos_samurai/packet.py`, `ddos_samurai/cpu_packet_engine.py`
+- GPU paket/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_payload.py`, `ddos_samurai/anomaly_packet.py`
+- C hizlandirma: `ddos_samurai/fast_sender.c`, `ddos_samurai/pacing_engine.c`, `ddos_samurai/xdp_sender.c`
+- API/SaaS: `ddos_samurai/api.py`
+- Dashboard: `dashboard/`
+- Monitoring stack: `monitoring/`
 
-### 1. Standart Kurulum (CPU Modu)
-Temel özellikler için yeterlidir.
+## Desteklenen Modlar ve Vektorler
+
+- Backend: `cpu`, `cuda`
+- L4/L3: TCP, UDP, ICMP, spoofing, pcap replay
+- L7: HTTP, HTTP/2, WebSocket, QUIC
+- Diger: slow-* senaryolari, amplification simule akislari, anomaly paket akislari
+- Yardimci modlar: `--dry-run`, `--self-test`, run report, soak profile
+
+## Kurulum
+
+### 1) Temel kurulum (CPU odakli)
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Pro Kurulum (GPU & Ninja Modu)
-Yüksek performans ve WAF bypass için gereklidir.
-
-**Gereksinimler:**
-*   NVIDIA GPU ve Sürücüleri
-*   CUDA Toolkit 12.x
+### 2) C extension build (onerilen)
 
 ```bash
-# GPU ve Browser desteği
-pip install cupy-cuda12x numba playwright
+python setup.py build_ext --inplace
+```
+
+### 3) Opsiyonel GPU kurulum
+
+GPU kullaniminda CUDA uyumlu ortama ihtiyac vardir.
+
+```bash
+pip install cupy-cuda12x numba-cuda[cu13]
+```
+
+### 4) Opsiyonel browser automation (Ninja)
+
+```bash
+pip install playwright
 playwright install chromium
 ```
 
-### 3. SaaS Stack (FastAPI + PostgreSQL + React)
+## Hizli Baslangic (Guvenli)
 
-JWT authentication, abonelik/usage billing, test run loglama ve dashboard için:
+### Self-test (trafik gondermez)
+
+```bash
+python -m ddos_samurai.cli --self-test
+```
+
+### Dry-run (konfig dogrular, gonderim yapmaz)
+
+```bash
+python -m ddos_samurai.cli \
+  --target 127.0.0.1 --port 8080 \
+  --protocol tcp --attack-vector basic \
+  --count 100 --dry-run --confirm
+```
+
+### Profil listesi
+
+```bash
+python -m ddos_samurai.cli --list-profiles
+```
+
+## SaaS Stack (Opsiyonel)
 
 ```bash
 docker compose up -d --build
@@ -56,56 +98,82 @@ Servisler:
 - API: `http://localhost:5099`
 - Dashboard: `http://localhost:8080`
 - PostgreSQL: `localhost:5432` (`samurai/samurai`)
+- Metrics endpoint: `http://localhost:5099/metrics`
 
-İlk kullanıcı otomatik olarak `admin` rolüyle oluşturulur.
-Dashboard üzerinden kayıt/login sonrası:
+Not: Varsayilan compose ayarlari gelistirme odaklidir. Uretimde secret, CORS, auth policy ve rate-limit hardening gereklidir.
 
-- Plan ve abonelik bilgisi
-- Pay-as-you-go usage özeti
-- Test başlatma/durdurma
-- Run geçmişi ve runtime istatistikleri
-
-Monitoring entegrasyonu için API metrik endpointi:
-
-- `http://localhost:5099/metrics`
-
-## 💻 Kullanım
-
-### Temel Komutlar
-
-**TCP SYN Flood (Root yetkisi gerekir):**
-```bash
-sudo python3 advv2.py --target 192.168.1.100 --port 80 --protocol tcp --tcp-flags S --count 10000
-```
-
-**GPU Hızlandırmalı Saldırı:**
-```bash
-sudo python3 advv2.py --target 192.168.1.100 --port 80 --count 10000000 --compute-backend cuda
-```
-
-**Ninja Mode (WAF Bypass):**
-```bash
-python3 advv2.py --target 192.168.1.100 --port 443 --attack-vector http --ninja-mode --workers 4
-```
-
-**IP Spoofing (Subnet):**
-```bash
-sudo python3 advv2.py --target 192.168.1.100 --port 80 --spoof --spoof-mode subnet --spoof-subnet 10.0.0.0/8
-```
-
-## 🧪 Geliştirme ve Test
-
-Testleri çalıştırmak için:
+## Monitoring (Opsiyonel, uygulama disi)
 
 ```bash
-python3 -m unittest discover -s tests -p "test_*.py"
+cd monitoring
+docker compose up -d
 ```
 
-Testler, GPU donanımını otomatik algılar ve yoksa ilgili testleri atlar.
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3000`
 
-## ⚠️ Yasal Uyarı
+Detay: `monitoring/README.md`
 
-Bu araç **yalnızca** izin verilen sistemlerde, eğitim ve güvenlik testi (stress testing) amacıyla kullanılmalıdır. Yetkisiz sistemlere saldırı düzenlemek yasa dışıdır ve suç teşkil eder. Geliştiriciler, bu aracın kötüye kullanımından sorumlu tutulamaz.
+## Test ve CI
 
----
-*DDoSamurai Team - 2026*
+### Lokal test
+
+```bash
+pytest tests -q -rs
+```
+
+Frontend test:
+
+```bash
+cd dashboard
+npm ci
+npm run test -- --run
+```
+
+### GitHub Actions
+
+Workflow: `.github/workflows/ci.yml`
+
+- `Backend Tests (Python 3.11)`
+- `Dashboard Tests (Node 20)`
+
+CI ortaminda GPU/root gerektiren testler otomatik olarak skip olabilir.
+
+## Dokumantasyon Haritasi
+
+Detayli teknik dokumantasyon:
+
+- `docs/README.md`
+- `docs/00-overview.md`
+- `docs/01-cli.md`
+- `docs/02-orchestrator.md`
+- `docs/03-senders.md`
+- `docs/05-gpu.md`
+- `docs/12-dashboard.md`
+- `docs/13-api.md`
+
+## Proje Dizini (kisa)
+
+```text
+.
+├── advv2.py
+├── ddos_samurai/
+├── tests/
+├── dashboard/
+├── monitoring/
+├── docs/
+├── Dockerfile
+├── docker-compose.yml
+└── .github/workflows/ci.yml
+```
+
+## Bilinen Operasyon Notlari
+
+- Bazi sender yollari root/capability gerektirir.
+- GPU yolu, CUDA surucu/runtime uyumuna baglidir.
+- CI ortaminda Scapy/GPU/root kosullarina bagli skip beklenir.
+- Uretim kullaniminda varsayilan ayarlarin hardening'i zorunludur.
+
+## Lisans
+
+Bu repoda `setup.py` siniflandirmasinda MIT lisansi belirtilmistir.
