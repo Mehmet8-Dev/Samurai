@@ -1587,11 +1587,49 @@ def init_gpu():
     device = cuda.get_current_device()
     logging.info(f"GPU Initialized: {device.name}")
 
+
+def _normalize_numba_stream(stream):
+    """Normalize external stream objects to a Numba-compatible stream.
+
+    Accepts:
+    - None / 0 (default stream)
+    - Native Numba stream objects
+    - CuPy stream objects (converted via cuda.external_stream(ptr))
+    """
+    if stream is None:
+        return None
+    if stream == 0:
+        return 0
+
+    mod = getattr(type(stream), "__module__", "") or ""
+    if mod.startswith("numba"):
+        return stream
+
+    ptr = getattr(stream, "ptr", None)
+    if ptr:
+        try:
+            return cuda.external_stream(int(ptr))
+        except Exception:
+            return None
+    return None
+
+
+def _synchronize_numba_stream(stream):
+    """Synchronize stream with a safe fallback to device-wide sync."""
+    if stream in (None, 0):
+        cuda.synchronize()
+        return
+    try:
+        stream.synchronize()
+    except Exception:
+        cuda.synchronize()
+
 def generate_packets(count, target_ip, target_port, protocol="tcp", spoof_ip=True, real_src_ip="192.168.1.100", tcp_flags=0x02, has_ethernet=True, window=-1, stream=None, gateway_mac=0xFFFFFFFFFFFF, spoof_subnet="1.0.0.0/8"):
     """
     Generates packets on GPU.
     P2 FIX #30: Added spoof_subnet support.
     """
+    stream = _normalize_numba_stream(stream)
     spoof_base_ip, spoof_mask = parse_subnet(spoof_subnet or "1.0.0.0/8")
     
     # ... (Rest of conversions) ...
@@ -1704,6 +1742,7 @@ def generate_packets_from_template(template_bytes, count, real_src_ip="192.168.1
     """
     P2 FIX #30: Added spoof_subnet support.
     """
+    stream = _normalize_numba_stream(stream)
     spoof_base_ip, spoof_mask = parse_subnet(spoof_subnet or "1.0.0.0/8")
     
     packet_size = len(template_bytes)
@@ -1758,6 +1797,7 @@ def generate_packets_from_template_pool(templates_bytes_list, count, target_ip, 
     """
     P2 FIX #30: Added spoof_subnet support.
     """
+    stream = _normalize_numba_stream(stream)
     spoof_base_ip, spoof_mask = parse_subnet(spoof_subnet or "1.0.0.0/8")
     if not templates_bytes_list:
         return None, 0
@@ -1834,6 +1874,7 @@ def generate_fragmented_packets(payload_bytes, count, target_ip, target_port, pr
     """
     P2 FIX #30: Added spoof_subnet support.
     """
+    stream = _normalize_numba_stream(stream)
     spoof_base_ip, spoof_mask = parse_subnet(spoof_subnet or "1.0.0.0/8")
 
     proto_map = {"tcp": TCP_PROTOCOL, "udp": UDP_PROTOCOL}
@@ -1895,6 +1936,7 @@ def generate_amplification_packets(template_bytes, reflectors_ips, victim_ip, co
     """
     P2 FIX #19: Added gateway_mac support.
     """
+    stream = _normalize_numba_stream(stream)
     if not reflectors_ips:
         raise ValueError("reflectors_ips must not be empty")
 
@@ -1939,6 +1981,7 @@ def generate_stateful_packets(templates_bytes_list, count, target_ip, spoof_ip=T
     """
     Wrapper for stateful_pool_kernel.
     """
+    stream = _normalize_numba_stream(stream)
     if not templates_bytes_list:
         return None
         
@@ -2027,7 +2070,12 @@ def benchmark_template_generation_paths(template_bytes, count=200000, iterations
     if iterations < 1:
         raise ValueError("iterations must be >= 1")
 
-    stream = cp.cuda.Stream(non_blocking=True)
+    cp_stream = None
+    try:
+        cp_stream = cp.cuda.Stream(non_blocking=True)
+    except Exception:
+        cp_stream = None
+    stream = _normalize_numba_stream(cp_stream)
 
     def _run(force_global):
         # Warm-up for JIT + first-launch effects.
@@ -2042,7 +2090,7 @@ def benchmark_template_generation_paths(template_bytes, count=200000, iterations
             spoof_subnet=spoof_subnet,
             force_global_fallback=force_global,
         )
-        stream.synchronize()
+        _synchronize_numba_stream(stream)
 
         total = 0.0
         for _ in range(iterations):
@@ -2058,7 +2106,7 @@ def benchmark_template_generation_paths(template_bytes, count=200000, iterations
                 spoof_subnet=spoof_subnet,
                 force_global_fallback=force_global,
             )
-            stream.synchronize()
+            _synchronize_numba_stream(stream)
             total += (time.perf_counter() - start)
 
         avg_sec = total / iterations
@@ -2074,6 +2122,10 @@ def benchmark_template_generation_paths(template_bytes, count=200000, iterations
         "count": count,
         "iterations": iterations,
         "template_size": len(template_bytes),
+        # Backward-compatible keys consumed by legacy tests/reporting.
+        "constant": auto_result,
+        "global": global_result,
+        # New explicit keys.
         "auto_path": auto_result,
         "forced_global_fallback": global_result,
     }
@@ -2208,6 +2260,7 @@ def generate_icmp_packets(count, target_ip, real_src_ip="192.168.1.100", spoof_i
     Returns:
         Tuple of (packets_gpu, packet_size)
     """
+    stream = _normalize_numba_stream(stream)
     spoof_base_ip, spoof_mask = parse_subnet(spoof_subnet or "1.0.0.0/8")
     target_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(target_ip.split('.'))]))
     real_src_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(real_src_ip.split('.'))]))
@@ -2632,8 +2685,9 @@ def safe_kernel_launch(kernel, grid, block, stream, *args, name="kernel"):
         GPUKernelError: On kernel launch failure
     """
     try:
-        kernel[grid, block, stream](*args)
-        if stream is None:
+        norm_stream = _normalize_numba_stream(stream)
+        kernel[grid, block, norm_stream](*args)
+        if norm_stream is None:
             cuda.synchronize()
     except Exception as e:
         raise GPUKernelError(f"Kernel '{name}' failed: {e}") from e

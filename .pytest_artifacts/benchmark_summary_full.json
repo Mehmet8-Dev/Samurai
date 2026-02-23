@@ -1,12 +1,22 @@
 {
-  "generated_utc": "2026-02-23T18:28:05+00:00",
+  "generated_utc": "2026-02-23T18:35:56+00:00",
   "profile": "full",
   "schema": "samurai.benchmark.summary.v1",
   "sections": {
+    "gpu_template": {
+      "constant": {
+        "avg_ms": 7.384611666566343,
+        "pps": 6770836.742353539
+      },
+      "global": {
+        "avg_ms": 7.256070000342636,
+        "pps": 6890782.475587883
+      }
+    },
     "pacing": {
-      "actual_rps": 5002.010057741704,
-      "jitter_p99_ns": 71.0,
-      "rate_accuracy_pct": 100.04020115483408,
+      "actual_rps": 5003.430602192393,
+      "jitter_p99_ns": 61.0,
+      "rate_accuracy_pct": 100.06861204384788,
       "sent": 1000,
       "target_rps": 5000.0
     }
