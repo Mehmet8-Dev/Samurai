@@ -578,36 +578,58 @@ static PyObject* send_optimized(PyObject* self, PyObject* args) {
     memset(iovecs, 0, sizeof(iovecs));
 
     int total_sent = 0;
+    int eagain_retry_count = 0;
+    int partial_send_retry_count = 0;
     char* data_ptr = (char*)view.buf;
 
-    for (int i = 0; i < count; ) {
-        int batch = 0;
-        while (batch < BATCH_SIZE && i < count) {
-            iovecs[batch].iov_base = data_ptr + (i * packet_size);
-            iovecs[batch].iov_len = packet_size;
-            
-            msgs[batch].msg_hdr.msg_name = &addr;
-            msgs[batch].msg_hdr.msg_namelen = sizeof(addr);
-            msgs[batch].msg_hdr.msg_iov = &iovecs[batch];
-            msgs[batch].msg_hdr.msg_iovlen = 1;
-            
-            batch++;
-            i++;
+    for (int pkt_idx = 0; pkt_idx < count; ) {
+        int batch = count - pkt_idx;
+        if (batch > BATCH_SIZE) {
+            batch = BATCH_SIZE;
+        }
+
+        for (int j = 0; j < batch; j++) {
+            int idx = pkt_idx + j;
+            iovecs[j].iov_base = data_ptr + ((uint64_t)idx * packet_size);
+            iovecs[j].iov_len = packet_size;
+
+            msgs[j].msg_hdr.msg_name = &addr;
+            msgs[j].msg_hdr.msg_namelen = sizeof(addr);
+            msgs[j].msg_hdr.msg_iov = &iovecs[j];
+            msgs[j].msg_hdr.msg_iovlen = 1;
         }
 
         int retval = sendmmsg(sockfd, msgs, batch, 0);
         if (retval < 0) {
-            if (errno == EINTR) continue;
-             if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                 break;
-             }
-        } else {
-            total_sent += retval;
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                eagain_retry_count++;
+                continue;
+            }
+            break;
+        }
+
+        if (retval == 0) {
+            eagain_retry_count++;
+            continue;
+        }
+
+        total_sent += retval;
+        pkt_idx += retval;
+        if (retval < batch) {
+            partial_send_retry_count++;
         }
     }
 
     PyBuffer_Release(&view);
-    return Py_BuildValue("i", total_sent);
+    return Py_BuildValue(
+        "{s:i,s:i,s:i}",
+        "sent", total_sent,
+        "eagain_retry_count", eagain_retry_count,
+        "partial_send_retry_count", partial_send_retry_count
+    );
 }
 
 // --- L3 Sender with SO_TXTIME (Kernel Pacing) ---

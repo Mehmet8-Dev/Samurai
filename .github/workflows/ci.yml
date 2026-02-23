@@ -14,6 +14,11 @@ jobs:
     name: Backend Tests (Python 3.11)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+      SAMURAI_TEST_PROFILE: "ci_safe"
+      SAMURAI_RFC_REPORT_OUT: "${{ github.workspace }}/artifacts"
+      SAMURAI_BENCH_REPORT_OUT: "${{ github.workspace }}/artifacts/benchmark_summary.json"
 
     steps:
       - name: Checkout
@@ -44,9 +49,17 @@ jobs:
         run: python setup.py build_ext --inplace
 
       - name: Run backend test suite
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: pytest tests -q -rs
+        run: |
+          mkdir -p artifacts
+          pytest tests -q -rs
+
+      - name: Upload backend reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-reports
+          path: artifacts/*.json
+          if-no-files-found: ignore
 
   dashboard-tests:
     name: Dashboard Tests (Node 20)

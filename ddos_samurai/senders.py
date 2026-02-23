@@ -5,6 +5,7 @@ import socket
 import traceback
 import random
 import os
+import errno
 import numpy as np
 
 # Lazy import httpx for HTTP/2 support
@@ -53,6 +54,10 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "sent": int(sent),
         "errors": int(errors),
         "bytes_sent_est": int(bytes_sent_est),
+        "buffer_copy_count": 0,
+        "buffer_copy_bytes": 0,
+        "eagain_retry_count": 0,
+        "partial_send_retry_count": 0,
     }
     for k, v in extra.items():
         if isinstance(v, bool):
@@ -72,25 +77,44 @@ def _update_live(val, inc):
             pass
 
 
-def _normalize_packets_buffer(packets_buffer, required_bytes: int, pool_key: str):
+def _normalize_packets_buffer(
+    packets_buffer,
+    required_bytes: int,
+    pool_key: str,
+    *,
+    return_meta: bool = False,
+):
     """
     Normalize packet buffer for TX paths.
     - If a GPU array is provided, copy once into shared pinned host pool.
     - If a NumPy array is non-contiguous, compact it (prefer pinned pool).
     """
+    meta = {"buffer_copy_count": 0, "buffer_copy_bytes": 0}
+
+    def _ret(buf):
+        if return_meta:
+            return buf, meta
+        return buf
+
     if required_bytes <= 0:
-        return packets_buffer
+        return _ret(packets_buffer)
 
     # CUDA array interface (CuPy / Numba device arrays, etc.)
     if hasattr(packets_buffer, "__cuda_array_interface__"):
         try:
             from . import gpu_packet
-            return gpu_packet.copy_gpu_to_host_pinned(packets_buffer, key=pool_key, blocking=True)
+            out = gpu_packet.copy_gpu_to_host_pinned(packets_buffer, key=pool_key, blocking=True)
+            meta["buffer_copy_count"] = 1
+            meta["buffer_copy_bytes"] = int(required_bytes)
+            return _ret(out)
         except Exception as e:
             log_error(f"GPU->host normalize failed, using fallback copy: {e}")
             try:
                 # Fallback for CuPy-like arrays
-                return packets_buffer.get()
+                out = packets_buffer.get()
+                meta["buffer_copy_count"] = 1
+                meta["buffer_copy_bytes"] = int(required_bytes)
+                return _ret(out)
             except Exception:
                 pass
 
@@ -98,7 +122,7 @@ def _normalize_packets_buffer(packets_buffer, required_bytes: int, pool_key: str
     if isinstance(packets_buffer, memoryview):
         if packets_buffer.itemsize != 1:
             packets_buffer = packets_buffer.cast("B")
-        return packets_buffer
+        return _ret(packets_buffer)
 
     if isinstance(packets_buffer, np.ndarray):
         flat = np.ravel(packets_buffer)
@@ -115,21 +139,33 @@ def _normalize_packets_buffer(packets_buffer, required_bytes: int, pool_key: str
 
         flat = flat[:required_bytes]
         if flat.flags.c_contiguous:
-            return flat
+            return _ret(flat)
 
         try:
             from . import gpu_packet
             out = gpu_packet.get_pinned_host_pool().acquire(required_bytes, dtype=np.uint8, key=pool_key)
             out[:required_bytes] = flat
-            return out[:required_bytes]
+            meta["buffer_copy_count"] = 1
+            meta["buffer_copy_bytes"] = int(required_bytes)
+            return _ret(out[:required_bytes])
         except Exception:
-            return np.ascontiguousarray(flat)
+            out = np.ascontiguousarray(flat)
+            meta["buffer_copy_count"] = 1
+            meta["buffer_copy_bytes"] = int(required_bytes)
+            return _ret(out)
 
-    return packets_buffer
+    return _ret(packets_buffer)
 
 
 def _merge_stats(*items):
-    acc = _stats()
+    acc = _stats(
+        buffer_copy_count=0,
+        buffer_copy_bytes=0,
+        eagain_retry_count=0,
+        partial_send_retry_count=0,
+        permission_error_count=0,
+        fallback_count=0,
+    )
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -137,6 +173,14 @@ def _merge_stats(*items):
         acc["sent"] += int(it.get("sent", 0) or 0)
         acc["errors"] += int(it.get("errors", 0) or 0)
         acc["bytes_sent_est"] += int(it.get("bytes_sent_est", 0) or 0)
+        acc["buffer_copy_count"] += int(it.get("buffer_copy_count", 0) or 0)
+        acc["buffer_copy_bytes"] += int(it.get("buffer_copy_bytes", 0) or 0)
+        acc["eagain_retry_count"] += int(it.get("eagain_retry_count", 0) or 0)
+        acc["partial_send_retry_count"] += int(it.get("partial_send_retry_count", 0) or 0)
+        acc["permission_error_count"] += int(it.get("permission_error_count", 0) or 0)
+        acc["fallback_count"] += int(it.get("fallback_count", 0) or 0)
+        if "sender_path" in it:
+            acc["sender_path"] = str(it.get("sender_path") or "")
     return acc
 
 async def send_packet_async(packet, verbose, packet_no, loop, protocol):
@@ -495,10 +539,11 @@ async def xdp_sender(
     if packet_size == 0:
         log_error("[XDP] Invalid packet buffer")
         return _stats(attempted=count, sent=0, errors=count)
-    packets_buffer = _normalize_packets_buffer(
+    packets_buffer, normalize_meta = _normalize_packets_buffer(
         packets_buffer,
         required_bytes=packet_size * count,
         pool_key="senders_xdp_tx",
+        return_meta=True,
     )
     
     log_info(f"[XDP] Initializing AF_XDP sender for {target_ip}:{target_port}")
@@ -573,7 +618,16 @@ async def xdp_sender(
         log_info("[XDP] Falling back to raw_socket_sender...")
         return await raw_socket_sender(packets_buffer, target_ip, target_port, count, verbose)
     
-    return _stats(attempted=count, sent=total_sent, errors=max(0, count - total_sent), bytes_sent_est=total_sent * packet_size)
+    return _stats(
+        attempted=count,
+        sent=total_sent,
+        errors=max(0, count - total_sent),
+        bytes_sent_est=total_sent * packet_size,
+        buffer_copy_count=int(normalize_meta.get("buffer_copy_count", 0) or 0),
+        buffer_copy_bytes=int(normalize_meta.get("buffer_copy_bytes", 0) or 0),
+        eagain_retry_count=0,
+        partial_send_retry_count=0,
+    )
 
 
 async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbose, live_sent=None, live_errors=None, live_progress=None):
@@ -585,27 +639,62 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
         s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
     except PermissionError:
         log_error("Raw socket creation failed. Please run the script with sudo/root privileges.")
-        return _stats(attempted=count, sent=0, errors=count, sender_path="NONE", permission_error_count=1, fallback_count=0)
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="NONE",
+            permission_error_count=1,
+            fallback_count=0,
+            buffer_copy_count=0,
+            buffer_copy_bytes=0,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
     except Exception as e:
         log_error(f"Failed to create raw socket: {e}")
-        return _stats(attempted=count, sent=0, errors=count, sender_path="NONE", permission_error_count=0, fallback_count=0)
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="NONE",
+            permission_error_count=0,
+            fallback_count=0,
+            buffer_copy_count=0,
+            buffer_copy_bytes=0,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
 
     log_info(f"Raw socket sender initialized. Sending {count} packets...")
     
     packet_size = len(packets_buffer) // count if count > 0 else 0
     if packet_size == 0 and count > 0:
         log_error("Packet buffer is empty or count is zero, cannot determine packet size.")
-        return _stats(attempted=count, sent=0, errors=count)
-    packets_buffer = _normalize_packets_buffer(
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            buffer_copy_count=0,
+            buffer_copy_bytes=0,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+    packets_buffer, normalize_meta = _normalize_packets_buffer(
         packets_buffer,
         required_bytes=packet_size * count,
         pool_key="senders_raw_tx",
+        return_meta=True,
     )
 
     sent_total = 0
     sender_path = "PYTHON_SENDTO"  # default fallback
     fallback_count = 0
     permission_error_count = 0
+    eagain_retry_count = 0
+    partial_send_retry_count = 0
+    buffer_copy_count = int(normalize_meta.get("buffer_copy_count", 0) or 0)
+    buffer_copy_bytes = int(normalize_meta.get("buffer_copy_bytes", 0) or 0)
 
     # 1. Try C Extension (Fastest)
     if FAST_SENDER_AVAILABLE:
@@ -635,6 +724,10 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                             sender_path="TX_RING_L2",
                             permission_error_count=0,
                             fallback_count=0,
+                            buffer_copy_count=buffer_copy_count,
+                            buffer_copy_bytes=buffer_copy_bytes,
+                            eagain_retry_count=eagain_retry_count,
+                            partial_send_retry_count=partial_send_retry_count,
                         )
                 else:
                     fallback_count += 1
@@ -647,10 +740,18 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
 
         # 1.b Try Standard sendmmsg (L3)
         try:
-            sent = fast_sender.send_optimized(s.fileno(), packets_buffer, target_ip, target_port, packet_size, count)
+            cext_result = fast_sender.send_optimized(
+                s.fileno(), packets_buffer, target_ip, target_port, packet_size, count
+            )
+            if isinstance(cext_result, dict):
+                sent = int(cext_result.get("sent", 0) or 0)
+                eagain_retry_count += int(cext_result.get("eagain_retry_count", 0) or 0)
+                partial_send_retry_count += int(cext_result.get("partial_send_retry_count", 0) or 0)
+            else:
+                sent = int(cext_result or 0)
             log_info(f"Fast Sender (C Ext L3) finished. Sent {sent} packets.")
             s.close()
-            sent_total = int(sent or 0)
+            sent_total = sent
             _update_live(live_progress, count)
             _update_live(live_sent, sent_total)
             _update_live(live_errors, max(0, count - sent_total))
@@ -662,6 +763,10 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                 sender_path="C_EXT_L3",
                 permission_error_count=0,
                 fallback_count=fallback_count,
+                buffer_copy_count=buffer_copy_count,
+                buffer_copy_bytes=buffer_copy_bytes,
+                eagain_retry_count=eagain_retry_count,
+                partial_send_retry_count=partial_send_retry_count,
             )
         except Exception as e:
             fallback_count += 1
@@ -691,17 +796,58 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                     start = idx * packet_size
                     end = start + packet_size
                     datagrams.append((mv[start:end], []))
-                
-                try:
-                    sent_msgs = s.sendmmsg(datagrams, 0, address)
-                    total_sent += sent_msgs
-                    _update_live(live_progress, batch_count)
-                    _update_live(live_sent, sent_msgs)
-                except PermissionError:
-                    permission_error_count += 1
-                    _update_live(live_errors, batch_count)
-                except Exception:
-                    _update_live(live_errors, batch_count)
+
+                batch_progress = 0
+                batch_index = 0
+                consecutive_eagain = 0
+                while batch_index < batch_count:
+                    pending = batch_count - batch_index
+                    try:
+                        sent_msgs = s.sendmmsg(datagrams[batch_index:], 0, address)
+                        sent_msgs = int(sent_msgs or 0)
+                        if sent_msgs <= 0:
+                            # Defensive retry when kernel returns 0 without raising.
+                            eagain_retry_count += 1
+                            consecutive_eagain += 1
+                            if consecutive_eagain >= 1024:
+                                _update_live(live_errors, pending)
+                                batch_progress += pending
+                                batch_index = batch_count
+                            continue
+
+                        total_sent += sent_msgs
+                        batch_index += sent_msgs
+                        batch_progress += sent_msgs
+                        _update_live(live_sent, sent_msgs)
+                        consecutive_eagain = 0
+
+                        if sent_msgs < pending:
+                            partial_send_retry_count += 1
+                    except PermissionError:
+                        permission_error_count += 1
+                        _update_live(live_errors, pending)
+                        batch_progress += pending
+                        batch_index = batch_count
+                    except OSError as exc:
+                        if exc.errno == errno.EINTR:
+                            continue
+                        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                            eagain_retry_count += 1
+                            consecutive_eagain += 1
+                            if consecutive_eagain >= 1024:
+                                _update_live(live_errors, pending)
+                                batch_progress += pending
+                                batch_index = batch_count
+                            continue
+                        _update_live(live_errors, pending)
+                        batch_progress += pending
+                        batch_index = batch_count
+                    except Exception:
+                        _update_live(live_errors, pending)
+                        batch_progress += pending
+                        batch_index = batch_count
+
+                _update_live(live_progress, batch_progress)
                 
                 if verbose and total_sent % 10000 < BATCH_SIZE:
                      log_info(f"Sent {total_sent}/{count} raw packets (sendmmsg)...")
@@ -741,6 +887,10 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
         sender_path=sender_path,
         permission_error_count=permission_error_count,
         fallback_count=fallback_count,
+        buffer_copy_count=buffer_copy_count,
+        buffer_copy_bytes=buffer_copy_bytes,
+        eagain_retry_count=eagain_retry_count,
+        partial_send_retry_count=partial_send_retry_count,
     )
 
 
@@ -773,12 +923,23 @@ async def paced_raw_socket_sender(
     packet_size = len(packets_buffer) // count if count > 0 else 0
     if packet_size == 0:
         log_error("[Pacing] Invalid packet buffer (size=0)")
-        return _stats(attempted=count, sent=0, errors=count)
-    packets_buffer = _normalize_packets_buffer(
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            buffer_copy_count=0,
+            buffer_copy_bytes=0,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+    packets_buffer, normalize_meta = _normalize_packets_buffer(
         packets_buffer,
         required_bytes=packet_size * count,
         pool_key="senders_pacing_tx",
+        return_meta=True,
     )
+    buffer_copy_count = int(normalize_meta.get("buffer_copy_count", 0) or 0)
+    buffer_copy_bytes = int(normalize_meta.get("buffer_copy_bytes", 0) or 0)
 
     log_info(
         f"[Pacing] C engine: mode={pacing_config.pacing_mode.name}, "
@@ -798,7 +959,7 @@ async def paced_raw_socket_sender(
                     None,
                     lambda: paced_send_l2(
                         iface,
-                        bytes(packets_buffer),
+                        packets_buffer,
                         packet_size,
                         count,
                         gateway_mac,
@@ -824,6 +985,10 @@ async def paced_raw_socket_sender(
                     sent=int(sent or 0),
                     errors=max(0, count - int(sent or 0)),
                     bytes_sent_est=int(sent or 0) * packet_size,
+                    buffer_copy_count=buffer_copy_count,
+                    buffer_copy_bytes=buffer_copy_bytes,
+                    eagain_retry_count=0,
+                    partial_send_retry_count=0,
                 )
                 if stats:
                     out["actual_rps"] = float(stats.get("actual_rps", 0) or 0)
@@ -841,7 +1006,7 @@ async def paced_raw_socket_sender(
         sent = await loop.run_in_executor(
             None,
             lambda: paced_send(
-                bytes(packets_buffer),
+                packets_buffer,
                 target_ip,
                 target_port,
                 packet_size,
@@ -860,6 +1025,10 @@ async def paced_raw_socket_sender(
             sent=int(sent or 0),
             errors=max(0, count - int(sent or 0)),
             bytes_sent_est=int(sent or 0) * packet_size,
+            buffer_copy_count=buffer_copy_count,
+            buffer_copy_bytes=buffer_copy_bytes,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
         )
         if stats:
             out["actual_rps"] = float(stats.get("actual_rps", 0) or 0)

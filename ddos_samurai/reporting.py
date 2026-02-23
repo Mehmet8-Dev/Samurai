@@ -503,6 +503,10 @@ def build_live_attack_report(
     bytes_sent_est_total = 0
     permission_error_count_total = 0
     fallback_count_total = 0
+    buffer_copy_count_total = 0
+    buffer_copy_bytes_total = 0
+    eagain_retry_count_total = 0
+    partial_send_retry_count_total = 0
     backlog_peak_max = 0
     sender_paths_used: Dict[str, int] = {}
     by_vector: Dict[str, Dict[str, int]] = {}
@@ -549,6 +553,18 @@ def build_live_attack_report(
         )
         fallback_count_total += int(
             ev.get("fallback_count", st.get("fallback_count", 0)) or 0
+        )
+        buffer_copy_count_total += int(
+            ev.get("buffer_copy_count", st.get("buffer_copy_count", 0)) or 0
+        )
+        buffer_copy_bytes_total += int(
+            ev.get("buffer_copy_bytes", st.get("buffer_copy_bytes", 0)) or 0
+        )
+        eagain_retry_count_total += int(
+            ev.get("eagain_retry_count", st.get("eagain_retry_count", 0)) or 0
+        )
+        partial_send_retry_count_total += int(
+            ev.get("partial_send_retry_count", st.get("partial_send_retry_count", 0)) or 0
         )
         _bp = int(ev.get("queue_backlog_peak", 0) or 0)
         if _bp > backlog_peak_max:
@@ -599,6 +615,10 @@ def build_live_attack_report(
             "sender_paths_used": sender_paths_used,
             "permission_error_count": int(permission_error_count_total),
             "fallback_count": int(fallback_count_total),
+            "buffer_copy_count": int(buffer_copy_count_total),
+            "buffer_copy_bytes": int(buffer_copy_bytes_total),
+            "eagain_retry_count": int(eagain_retry_count_total),
+            "partial_send_retry_count": int(partial_send_retry_count_total),
             "queue_backlog_peak": int(backlog_peak_max),
             "by_vector": by_vector,
             "by_backend": by_backend,

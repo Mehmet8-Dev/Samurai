@@ -822,6 +822,7 @@ def build_transport_packet(cfg: PacketConfig) -> bytes:
     src_port = random.randint(1024, 65535)
 
     proto = cfg.protocol.lower()
+    is_syn_only = False
 
     if proto == "tcp":
         # Parse flags
@@ -918,7 +919,6 @@ def build_transport_packet(cfg: PacketConfig) -> bytes:
     packet = bytes(ip_hdr) + l4_data
 
     # Padding
-    is_syn_only = proto == "tcp" and (parse_tcp_flags(cfg.tcp_flags) & TCP_SYN) and not (parse_tcp_flags(cfg.tcp_flags) & (TCP_ACK | TCP_PSH))
     if not is_syn_only and cfg.pad_size > 0 and len(packet) < cfg.pad_size:
         packet += b"\x00" * (cfg.pad_size - len(packet))
 
@@ -1097,6 +1097,7 @@ def generate_packet_pool(
     count: int,
     *,
     uniform_size: bool = True,
+    low_peak_memory: bool = False,
 ) -> Tuple[bytes, int]:
     """
     Generate a pool of *count* packets as a flat contiguous buffer.
@@ -1104,26 +1105,55 @@ def generate_packet_pool(
     If ``uniform_size`` is True (default), all packets are padded/truncated
     to the same size so the buffer can be indexed as ``pool[i * pkt_size : (i+1) * pkt_size]``.
 
+    If ``low_peak_memory`` is True, packet pools are built without retaining
+    a full list of per-packet temporary buffers (lower memory peak, more CPU work).
+
     Returns:
         (packets_buffer, packet_size)
     """
-    packets: List[bytes] = []
-    for _ in range(count):
-        packets.append(create_packet(cfg))
-
-    if not packets:
+    if count <= 0:
         return b"", 0
 
     if uniform_size:
-        max_size = max(len(p) for p in packets)
+        if low_peak_memory:
+            max_size = 0
+            for _ in range(count):
+                pkt_len = len(create_packet(cfg))
+                if pkt_len > max_size:
+                    max_size = pkt_len
+        else:
+            packets: List[bytes] = []
+            for _ in range(count):
+                packets.append(create_packet(cfg))
+            max_size = max(len(p) for p in packets)
+
         pkt_size = (max_size + 3) & ~3  # 4-byte aligned
         buf = bytearray(pkt_size * count)
-        for i, pkt in enumerate(packets):
-            offset = i * pkt_size
-            buf[offset:offset + len(pkt)] = pkt
+
+        if low_peak_memory:
+            for i in range(count):
+                pkt = create_packet(cfg)
+                if len(pkt) > pkt_size:
+                    # Safety fallback if packet size assumptions changed at runtime.
+                    return generate_packet_pool(cfg, count, uniform_size=uniform_size, low_peak_memory=False)
+                offset = i * pkt_size
+                buf[offset:offset + len(pkt)] = pkt
+        else:
+            for i, pkt in enumerate(packets):
+                offset = i * pkt_size
+                buf[offset:offset + len(pkt)] = pkt
         return bytes(buf), pkt_size
     else:
         # Variable-size: just concatenate (no size info)
+        if low_peak_memory:
+            buf = bytearray()
+            for _ in range(count):
+                buf.extend(create_packet(cfg))
+            return bytes(buf), 0
+
+        packets: List[bytes] = []
+        for _ in range(count):
+            packets.append(create_packet(cfg))
         return b"".join(packets), 0
 
 

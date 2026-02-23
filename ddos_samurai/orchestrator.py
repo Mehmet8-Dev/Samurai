@@ -38,7 +38,16 @@ _JITTER_MODEL_MAP = {
 
 
 def _empty_stats() -> dict:
-    return {"attempted": 0, "sent": 0, "errors": 0, "bytes_sent_est": 0}
+    return {
+        "attempted": 0,
+        "sent": 0,
+        "errors": 0,
+        "bytes_sent_est": 0,
+        "buffer_copy_count": 0,
+        "buffer_copy_bytes": 0,
+        "eagain_retry_count": 0,
+        "partial_send_retry_count": 0,
+    }
 
 
 def _add_stats(acc: dict, item: dict) -> dict:
@@ -48,6 +57,10 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["sent"] = int(acc.get("sent", 0)) + int(item.get("sent", 0) or 0)
     acc["errors"] = int(acc.get("errors", 0)) + int(item.get("errors", 0) or 0)
     acc["bytes_sent_est"] = int(acc.get("bytes_sent_est", 0)) + int(item.get("bytes_sent_est", 0) or 0)
+    acc["buffer_copy_count"] = int(acc.get("buffer_copy_count", 0)) + int(item.get("buffer_copy_count", 0) or 0)
+    acc["buffer_copy_bytes"] = int(acc.get("buffer_copy_bytes", 0)) + int(item.get("buffer_copy_bytes", 0) or 0)
+    acc["eagain_retry_count"] = int(acc.get("eagain_retry_count", 0)) + int(item.get("eagain_retry_count", 0) or 0)
+    acc["partial_send_retry_count"] = int(acc.get("partial_send_retry_count", 0)) + int(item.get("partial_send_retry_count", 0) or 0)
     return acc
 
 
@@ -1413,6 +1426,10 @@ async def worker_process(
                 _sender_path = str(worker_stats.get("sender_path", "unknown"))
                 _fallback_count = int(worker_stats.get("fallback_count", 0) or 0)
                 _perm_errors = int(worker_stats.get("permission_error_count", 0) or 0)
+                _buffer_copy_count = int(worker_stats.get("buffer_copy_count", 0) or 0)
+                _buffer_copy_bytes = int(worker_stats.get("buffer_copy_bytes", 0) or 0)
+                _eagain_retry_count = int(worker_stats.get("eagain_retry_count", 0) or 0)
+                _partial_send_retry_count = int(worker_stats.get("partial_send_retry_count", 0) or 0)
 
                 # Backlog peak from resource stats
                 _backlog_peak = 0
@@ -1439,6 +1456,10 @@ async def worker_process(
                         "sender_path": _sender_path,
                         "fallback_count": _fallback_count,
                         "permission_error_count": _perm_errors,
+                        "buffer_copy_count": _buffer_copy_count,
+                        "buffer_copy_bytes": _buffer_copy_bytes,
+                        "eagain_retry_count": _eagain_retry_count,
+                        "partial_send_retry_count": _partial_send_retry_count,
                         "queue_backlog_peak": _backlog_peak,
                     }
                 )
