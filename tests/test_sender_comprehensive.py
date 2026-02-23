@@ -238,7 +238,7 @@ class TestPacketFormatForSending(_ScapyRequiredTestCase):
 class TestRingBufferStructure(unittest.TestCase):
     """
     TEST SUITE 10: TX_RING Ring Buffer Structure
-    TPACKET_V2 header, frame layout, alignment
+    TPACKET header (version-dependent), frame layout, alignment
     """
     
     def test_ring_buffer_frame_size_calculation(self):
@@ -247,8 +247,8 @@ class TestRingBufferStructure(unittest.TestCase):
         print("TEST 10.1: RING BUFFER FRAME SIZE")
         print("="*70)
         
-        # TPACKET_V2_HDR = 64 bytes (fixed)
-        TPACKET2_HDRLEN = 64
+        # Header offset is alignment-based and depends on packet version
+        user_data_offset = 64
         
         # L2 + L3 payload
         eth_size = 14  # Ethernet header
@@ -258,22 +258,22 @@ class TestRingBufferStructure(unittest.TestCase):
         # Total frame size (with alignment)
         tp_len = payload_size  # This is what goes in tp_len field
         
-        print(f"✓ TPACKET2_HDRLEN: {TPACKET2_HDRLEN} bytes")
+        print(f"✓ User data offset (aligned): {user_data_offset} bytes")
         print(f"✓ Ethernet header: {eth_size} bytes")
         print(f"✓ IPv4+TCP: {ipv4_tcp_size} bytes")
         print(f"✓ Total payload: {payload_size} bytes (tp_len value)")
         
         # In ring buffer
-        frame_start = TPACKET2_HDRLEN
-        payload_start = TPACKET2_HDRLEN
-        payload_end = TPACKET2_HDRLEN + payload_size
+        frame_start = user_data_offset
+        payload_start = user_data_offset
+        payload_end = user_data_offset + payload_size
         
         print(f"\n✓ Ring buffer frame layout:")
-        print(f"  [0-63]:        TPACKET2_HDR (kernel fills this)")
-        print(f"  [64-77]:       Ethernet header (14 bytes)")
-        print(f"  [78-106]:      IPv4 header (20 bytes)")
-        print(f"  [98-117]:      TCP header (20 bytes)")
-        print(f"  [118+]:        Payload (if any)")
+        print(f"  [0-{user_data_offset-1}]:  TPACKET header (kernel managed)")
+        print(f"  [{user_data_offset}-{user_data_offset+13}]: Ethernet header (14 bytes)")
+        print(f"  [{user_data_offset+14}-{user_data_offset+33}]: IPv4 header (20 bytes)")
+        print(f"  [{user_data_offset+34}-{user_data_offset+53}]: TCP header (20 bytes)")
+        print(f"  [{user_data_offset+54}+]: Payload (if any)")
         print(f"  tp_len field:  {tp_len} (tells kernel how much user data)")
         
         print("\n✓ TEST 10.1 PASSED\n")
@@ -318,7 +318,7 @@ class TestRingBufferStructure(unittest.TestCase):
 class TestPayloadOffsetInFrame(unittest.TestCase):
     """
     TEST SUITE 11: Payload Offset in Ring Buffer
-    TPACKET_ALIGN macro, user data offset
+    TPACKET_ALIGN macro, user data offset (version-agnostic)
     """
     
     def test_tpacket_align_macro(self):
@@ -330,24 +330,19 @@ class TestPayloadOffsetInFrame(unittest.TestCase):
         # TPACKET_ALIGN(x) = (((x)+TPACKET_ALIGNMENT-1)&~(TPACKET_ALIGNMENT-1))
         # TPACKET_ALIGNMENT = 16 (for modern systems)
         TPACKET_ALIGNMENT = 16
-        TPACKET2_HDRLEN = 64
+        header_sizes = [52, 68]  # Typical kernel header lengths for V2 and V3
         
         def TPACKET_ALIGN(x):
             return ((x + TPACKET_ALIGNMENT - 1) & ~(TPACKET_ALIGNMENT - 1))
         
-        aligned_hdr = TPACKET_ALIGN(TPACKET2_HDRLEN)
-        
         print(f"✓ TPACKET_ALIGNMENT: {TPACKET_ALIGNMENT}")
-        print(f"✓ TPACKET2_HDRLEN: {TPACKET2_HDRLEN}")
-        print(f"✓ Aligned header size: {aligned_hdr}")
-        
-        # Payload starts at TPACKET_ALIGN(TPACKET2_HDRLEN)
-        # For 64-byte header + 16-byte alignment = 64 (already aligned!)
-        print(f"\n✓ Payload offset in frame:")
-        print(f"  Frame[0-{aligned_hdr-1}]: TPACKET2_HDR ({aligned_hdr} bytes)")
-        print(f"  Frame[{aligned_hdr}+]:    User payload (L2+L3+L4)")
-        
-        self.assertEqual(aligned_hdr, 64, "64-byte header should align to 64")
+        for hdr in header_sizes:
+            aligned_hdr = TPACKET_ALIGN(hdr)
+            print(f"✓ Header={hdr} -> aligned={aligned_hdr}")
+            print(f"  Frame[0-{aligned_hdr-1}]: metadata/header area")
+            print(f"  Frame[{aligned_hdr}+]: user payload (L2+L3+L4)")
+            self.assertEqual(aligned_hdr % TPACKET_ALIGNMENT, 0)
+            self.assertGreaterEqual(aligned_hdr, hdr)
         
         print("\n✓ TEST 11.1 PASSED\n")
     
@@ -357,8 +352,7 @@ class TestPayloadOffsetInFrame(unittest.TestCase):
         print("TEST 11.2: USER DATA WRITE OFFSET")
         print("="*70)
         
-        TPACKET2_HDRLEN = 64
-        user_data_offset = 64  # Payload starts here
+        user_data_offset = 64  # Example aligned payload start
         
         eth_header_offset = user_data_offset
         ipv4_header_offset = user_data_offset + 14
@@ -366,14 +360,14 @@ class TestPayloadOffsetInFrame(unittest.TestCase):
         
         print(f"✓ User payload offset: {user_data_offset}")
         print(f"\n✓ Offsets within frame:")
-        print(f"  TPACKET2_HDR:   [0-63]")
+        print(f"  TPACKET_HDR:    [0-{user_data_offset-1}]")
         print(f"  Ethernet:       [{eth_header_offset}-{eth_header_offset+13}]")
         print(f"  IPv4:           [{ipv4_header_offset}-{ipv4_header_offset+19}]")
         print(f"  TCP:            [{tcp_header_offset}-{tcp_header_offset+19}]")
         
         print(f"\n✓ In C code (fast_sender.c):")
         print(f"  char* header = ring_buffer + frame_offset")
-        print(f"  char* payload_ptr = (char*)header + 64  // User data offset")
+        print(f"  char* payload_ptr = (char*)header + aligned_header_size")
         print(f"  memcpy(payload_ptr + 0, eth_header, 14)")
         print(f"  memcpy(payload_ptr + 14, ipv4_packet, 28)")
         

@@ -23,6 +23,7 @@ class TestFastSender(unittest.TestCase):
         self.assertTrue(hasattr(fast_sender, 'send_optimized'), "Missing send_optimized")
         self.assertTrue(hasattr(fast_sender, 'send_ring_optimized'), "Missing send_ring_optimized")
         self.assertTrue(hasattr(fast_sender, 'cleanup_ring'), "Missing cleanup_ring")
+        self.assertTrue(hasattr(fast_sender, 'get_ring_info'), "Missing get_ring_info")
 
     def test_send_optimized_signature(self):
         """
@@ -58,6 +59,24 @@ class TestFastSender(unittest.TestCase):
                 fast_sender.set_mimicry_settings(65535, 1460, 64)
             except Exception as e:
                 self.fail(f"set_mimicry_settings failed: {e}")
+
+    def test_get_ring_info_schema(self):
+        """get_ring_info should return a dict with stable introspection keys."""
+        info = fast_sender.get_ring_info()
+        self.assertIsInstance(info, dict)
+        expected_keys = {
+            "is_setup",
+            "packet_version",
+            "packet_version_name",
+            "iface",
+            "tp_block_size",
+            "tp_frame_size",
+            "tp_block_nr",
+            "tp_frame_nr",
+            "ring_size",
+            "frame_header_size",
+        }
+        self.assertTrue(expected_keys.issubset(set(info.keys())))
 
 if __name__ == '__main__':
     unittest.main()

@@ -117,17 +117,18 @@ class TestEthernetFrameStructure(unittest.TestCase):
         
         packet = create_packet(config)
         pkt_bytes = bytes(packet)
+        user_data_offset = 64  # Example aligned offset used in frame math
         
         print(f"\nPayload structure in ring buffer:")
         print("-" * 80)
-        print(f"User data offset: 64 (after TPACKET2_HDR)")
-        print(f"\n  Ring_buffer[64-77]:    Ethernet header (14 bytes)")
-        print(f"  Ring_buffer[78-97]:    IPv4 header (20 bytes)")
-        print(f"  Ring_buffer[98-117]:   TCP header (20 bytes)")
+        print(f"User data offset: {user_data_offset} (aligned TPACKET header area)")
+        print(f"\n  Ring_buffer[{user_data_offset}-{user_data_offset+13}]:    Ethernet header (14 bytes)")
+        print(f"  Ring_buffer[{user_data_offset+14}-{user_data_offset+33}]:    IPv4 header (20 bytes)")
+        print(f"  Ring_buffer[{user_data_offset+34}-{user_data_offset+53}]:   TCP header (20 bytes)")
         print(f"\nIP Byte[0] in ring buffer:")
-        print(f"  Payload_offset = 64")
-        print(f"  IPv4_offset = payload_offset + 14 = 78")
-        print(f"  IPv4_Byte[0] = ring_buffer[78] = pkt_bytes[0] = 0x{pkt_bytes[0]:02x}")
+        print(f"  Payload_offset = {user_data_offset}")
+        print(f"  IPv4_offset = payload_offset + 14 = {user_data_offset + 14}")
+        print(f"  IPv4_Byte[0] = ring_buffer[{user_data_offset + 14}] = pkt_bytes[0] = 0x{pkt_bytes[0]:02x}")
         
         self.assertEqual(pkt_bytes[0], 0x45, "IPv4 Byte[0] must be 0x45")
         
@@ -138,30 +139,25 @@ class TestEthernetFrameStructure(unittest.TestCase):
 class TestRingBufferConfiguration(unittest.TestCase):
     """
     TEST SUITE 8: Ring Buffer Configuration
-    TPACKET_V2 header, frame alignment
+    TPACKET header (version-dependent), frame alignment
     """
     
-    def test_tpacket2_header_size(self):
-        """Test 8.1: TPACKET2_HDR boyutu"""
+    def test_tpacket_header_alignment(self):
+        """Test 8.1: TPACKET header alignment"""
         print("\n" + "="*80)
-        print("TEST 8.1: TPACKET2_HDR SIZE")
+        print("TEST 8.1: TPACKET HEADER ALIGNMENT")
         print("="*80)
         
-        TPACKET2_HDRLEN = 64
         TPACKET_ALIGNMENT = 16
+        header_sizes = [52, 68]  # Typical kernel header lengths for V2 and V3
         
-        print(f"✓ TPACKET2_HDRLEN: {TPACKET2_HDRLEN} bytes")
         print(f"✓ TPACKET_ALIGNMENT: {TPACKET_ALIGNMENT} bytes")
-        
-        # Align kontrolü
-        aligned = ((TPACKET2_HDRLEN + TPACKET_ALIGNMENT - 1) & 
-                  ~(TPACKET_ALIGNMENT - 1))
-        
-        print(f"✓ Aligned header: {aligned} bytes")
-        print(f"✓ User data offset: {aligned}")
-        
-        self.assertEqual(TPACKET2_HDRLEN, 64)
-        self.assertEqual(aligned, 64, "64-byte header should align to 64")
+
+        for hdr in header_sizes:
+            aligned = ((hdr + TPACKET_ALIGNMENT - 1) & ~(TPACKET_ALIGNMENT - 1))
+            print(f"✓ Header {hdr} -> aligned {aligned} bytes")
+            self.assertEqual(aligned % TPACKET_ALIGNMENT, 0)
+            self.assertGreaterEqual(aligned, hdr)
         
         print("\n✓ TEST 8.1 PASSED\n")
     
@@ -221,14 +217,15 @@ class TestPayloadOffsets(unittest.TestCase):
         
         print(f"\n✓ In ring buffer frame:")
         print("-" * 80)
-        print(f"  [0-63]:      TPACKET2_HDR (kernel fills)")
-        print(f"  [64-77]:     Ethernet frame (dest_mac + src_mac + ethertype)")
-        print(f"  [78-97]:     IPv4 header (20 bytes)")
-        print(f"  [98-117]:    TCP header (20 bytes)")
-        print(f"  [118+]:      Payload/Options")
+        user_data_offset = 64  # Example aligned start
+        print(f"  [0-{user_data_offset-1}]:      TPACKET header (kernel fills)")
+        print(f"  [{user_data_offset}-{user_data_offset+13}]:     Ethernet frame (dest_mac + src_mac + ethertype)")
+        print(f"  [{user_data_offset+14}-{user_data_offset+33}]:     IPv4 header (20 bytes)")
+        print(f"  [{user_data_offset+34}-{user_data_offset+53}]:    TCP header (20 bytes)")
+        print(f"  [{user_data_offset+54}+]:      Payload/Options")
         
         # Frame'de ethernet offset
-        eth_offset = 64  # User payload offset
+        eth_offset = user_data_offset
         ipv4_offset = eth_offset + 14  # Ethernet 14 bytes
         tcp_offset = ipv4_offset + 20  # IPv4 20 bytes
         

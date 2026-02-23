@@ -123,7 +123,7 @@ class TestRawSocketSender(unittest.TestCase):
         
         print(f"✓ TX_RING socket options:")
         print(f"  Protocol: IPPROTO_RAW")
-        print(f"  Packet type: TPACKET_V2 (kernel constant: 2)")
+        print(f"  Packet type: TPACKET_V3 preferred, auto-fallback to TPACKET_V2")
         print(f"  Block size: 4096 bytes (4KB)")
         print(f"  Frame size: 2048 bytes (2KB)")
         print(f"  Ring size: 4 blocks (16KB total)")
