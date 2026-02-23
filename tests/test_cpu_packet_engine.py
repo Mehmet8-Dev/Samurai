@@ -28,6 +28,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+try:
+    import pytest
+except Exception:  # pragma: no cover - unittest-only environments
+    pytest = None
+
 from ddos_samurai.cpu_packet_engine import (
     # Checksum
     _checksum,
@@ -907,6 +912,10 @@ class TestPerformance(unittest.TestCase):
 
         self.assertGreater(pps, 5000)
         self.assertEqual(len(buf), N * pkt_size)
+
+if pytest is not None:
+    TestPerformance = pytest.mark.benchmark(TestPerformance)
+    TestPerformance = pytest.mark.ci_safe(TestPerformance)
 
 
 if __name__ == "__main__":

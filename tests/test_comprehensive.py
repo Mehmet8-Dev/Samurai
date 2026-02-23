@@ -14,6 +14,9 @@ try:
 except ModuleNotFoundError:  # unittest-only environments
     pytest = None
 
+if pytest is not None:
+    pytestmark = [pytest.mark.privileged]
+
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

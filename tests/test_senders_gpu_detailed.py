@@ -11,6 +11,12 @@ import struct
 import socket
 import time
 
+try:
+    import pytest
+    pytestmark = [pytest.mark.privileged]
+except Exception:  # pragma: no cover - unittest-only environments
+    pytestmark = []
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from ddos_samurai.packet import create_packet, PacketConfig

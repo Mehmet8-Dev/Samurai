@@ -5,6 +5,12 @@ import socket
 import struct
 import unittest
 
+try:
+    import pytest
+    pytestmark = [pytest.mark.gpu]
+except Exception:  # pragma: no cover - unittest-only environments
+    pytestmark = []
+
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

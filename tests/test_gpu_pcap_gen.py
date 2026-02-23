@@ -2,6 +2,12 @@ import os
 import tempfile
 import unittest
 
+try:
+    import pytest
+    pytestmark = [pytest.mark.gpu]
+except Exception:  # pragma: no cover - unittest-only environments
+    pytestmark = []
+
 
 class TestGpuPcapGen(unittest.TestCase):
     def test_generate_pcap_small_if_gpu_available(self):
@@ -38,4 +44,3 @@ class TestGpuPcapGen(unittest.TestCase):
             metrics = gpu_pcap_gen._extract_pcap_metrics(out_path, sample_packets=500)
             self.assertEqual(metrics["invalid_records"], 0)
             self.assertEqual(metrics["packets_total"], cfg.duration_s * cfg.pps)
-

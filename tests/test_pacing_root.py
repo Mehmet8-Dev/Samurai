@@ -26,6 +26,8 @@ import socket
 import argparse
 import pytest
 
+pytestmark = [pytest.mark.privileged, pytest.mark.benchmark]
+
 # Ensure project root is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

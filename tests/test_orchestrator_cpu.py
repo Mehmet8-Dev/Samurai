@@ -203,6 +203,40 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
         self.assertIn("fallback_count", ev)
         self.assertIn("permission_error_count", ev)
 
+    async def test_worker_event_contains_extended_sender_counters(self):
+        """Extended sender counters should propagate into worker events."""
+        args = _base_args()
+        args["attack_vector"] = "http"
+        args["count"] = 10
+
+        events = []
+        mock_http = AsyncMock(return_value={
+            "attempted": 10,
+            "sent": 10,
+            "errors": 0,
+            "bytes_sent_est": 640,
+            "sender_path": "PYTHON_SENDMMSG",
+            "fallback_count": 1,
+            "permission_error_count": 0,
+            "buffer_copy_count": 2,
+            "buffer_copy_bytes": 4096,
+            "eagain_retry_count": 3,
+            "partial_send_retry_count": 4,
+        })
+        with patch.object(orchestrator.senders, "http_app_sender", mock_http):
+            await orchestrator.worker_process(
+                worker_id=1, args=args, ssl_context=None, run_events=events,
+            )
+
+        self.assertEqual(len(events), 1)
+        ev = events[0]
+        self.assertEqual(ev["buffer_copy_count"], 2)
+        self.assertEqual(ev["buffer_copy_bytes"], 4096)
+        self.assertEqual(ev["eagain_retry_count"], 3)
+        self.assertEqual(ev["partial_send_retry_count"], 4)
+        self.assertEqual(ev["stats"]["buffer_copy_count"], 2)
+        self.assertEqual(ev["stats"]["eagain_retry_count"], 3)
+
     async def test_worker_status_interrupted_on_keyboard_interrupt(self):
         """Worker should report 'interrupted' on KeyboardInterrupt."""
         args = _base_args()

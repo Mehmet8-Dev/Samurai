@@ -1,6 +1,6 @@
 """
-DDoSamurai — RFC Compliance & Benchmark Scoring Suite
-======================================================
+DDoSamurai — RFC Compliance Scoring Suite
+=========================================
 
 Validates packet correctness against:
     RFC 791  — Internet Protocol (IPv4)
@@ -16,14 +16,14 @@ Engines tested:
     1. CPU Packet Engine  (cpu_packet_engine.py)
     2. GPU Packet Engine  (gpu_packet.py)  — skipped if no CUDA
 
-Each check is scored.  A final report is printed with a letter grade.
+Each check is scored. A final report is printed with a letter grade.
 """
 
 import json
 import os
 import struct
 import sys
-import time
+import tempfile
 import unittest
 
 # ── CPU Engine Imports ──────────────────────────────────────────────────────
@@ -55,6 +55,12 @@ try:
         GPU_AVAILABLE = True
 except Exception:
     pass
+
+try:
+    import pytest
+    pytestmark = [pytest.mark.rfc_positive, pytest.mark.ci_safe]
+except Exception:  # pragma: no cover - unittest-only environments
+    pytestmark = []
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Scoring Infrastructure
@@ -102,6 +108,8 @@ def _score(rfc, name, weight=1.0):
         wrapper.__doc__ = fn.__doc__
         return wrapper
     return decorator
+
+_ScoreBoard.reset()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -564,50 +572,10 @@ class TestGPU_RFC768(unittest.TestCase):
             pkt = bytes(buf[i*ps:(i+1)*ps])
             self.assertTrue(_udp_cksum_valid(pkt), f"GPU UDP cksum invalid pkt {i}")
 
-
-# ════════════════════════════════════════════════════════════════════════════
-#  PERFORMANCE BENCHMARKS
-# ════════════════════════════════════════════════════════════════════════════
-
-class TestPerformanceBenchmarks(unittest.TestCase):
-    """Throughput benchmarks for CPU and GPU engines."""
-
-    @_score("PERF", "CPU Engine >= 10K pkt/s (TCP SYN)", 2)
-    def test_cpu_tcp_throughput(self):
-        cfg = PacketConfig("10.0.0.1", 80, protocol="tcp", tcp_flags="S")
-        for _ in range(10): create_packet(cfg)
-        N = 10000
-        t0 = time.monotonic()
-        for _ in range(N): create_packet(cfg)
-        elapsed = time.monotonic() - t0
-        pps = N / elapsed
-        self.assertGreater(pps, 10000, f"CPU too slow: {pps:.0f} pkt/s")
-
-    @_score("PERF", "CPU Pool >= 10K pkt/s", 1)
-    def test_cpu_pool_throughput(self):
-        cfg = PacketConfig("10.0.0.1", 80, protocol="tcp", tcp_flags="S")
-        N = 10000
-        t0 = time.monotonic()
-        generate_packet_pool(cfg, N)
-        elapsed = time.monotonic() - t0
-        pps = N / elapsed
-        self.assertGreater(pps, 10000)
-
-    @unittest.skipUnless(GPU_AVAILABLE, "CUDA/GPU not available")
-    @_score("PERF", "[GPU] >= 1M pkt/s (TCP SYN)", 3)
-    def test_gpu_tcp_throughput(self):
-        N = 100000
-        # warm up
-        gpu_packet.generate_packets(1000, "10.0.0.1", 80, protocol="tcp",
-                                     spoof_ip=True, has_ethernet=False)
-        cp.cuda.Stream.null.synchronize()
-        t0 = time.monotonic()
-        gpu_packet.generate_packets(N, "10.0.0.1", 80, protocol="tcp",
-                                     spoof_ip=True, has_ethernet=False)
-        cp.cuda.Stream.null.synchronize()
-        elapsed = time.monotonic() - t0
-        pps = N / elapsed
-        self.assertGreater(pps, 1_000_000, f"GPU too slow: {pps:.0f} pkt/s")
+if "pytest" in globals():
+    TestGPU_RFC791 = pytest.mark.gpu(TestGPU_RFC791)
+    TestGPU_RFC793 = pytest.mark.gpu(TestGPU_RFC793)
+    TestGPU_RFC768 = pytest.mark.gpu(TestGPU_RFC768)
 
 
 class TestAmplificationRFC(unittest.TestCase):
@@ -676,15 +644,24 @@ class TestZZ_FinalReport(unittest.TestCase):
                   + " " * max(0, 29 - len(rfc)) + "║")
         print("╚════════════════════════════════════════════════════════════╝")
 
-        # Write JSON report
-        out_dir = os.path.join(os.path.dirname(__file__), "..", "reports")
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, "rfc_compliance_report.json")
+        # Write JSON report without polluting repo state by default.
+        # - SAMURAI_RFC_REPORT_OUT may point to a file path.
+        # - Default: system temp dir.
+        base = str(os.environ.get("SAMURAI_RFC_REPORT_OUT", "") or "").strip()
+        if not base:
+            path = os.path.join(tempfile.gettempdir(), "rfc_positive_report.json")
+        else:
+            base_path = os.path.abspath(os.path.expanduser(base))
+            if os.path.splitext(base_path)[1]:
+                path = base_path
+            else:
+                path = os.path.join(base_path, "rfc_positive_report.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             json.dump(r, f, indent=2)
         print(f"\n  Report saved → {os.path.abspath(path)}")
 
-        self.assertGreaterEqual(r["score"], 80, "RFC compliance score below 80%!")
+        self.assertGreaterEqual(r["score"], 95, "RFC compliance score below 95%!")
 
 
 if __name__ == "__main__":

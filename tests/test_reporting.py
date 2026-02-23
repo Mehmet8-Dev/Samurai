@@ -43,3 +43,61 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["tests_run"], 10)
         self.assertEqual(rr.results["skipped"], 2)
         self.assertTrue(rr.results["successful"])
+
+    def test_live_attack_report_aggregates_extended_sender_counters(self):
+        from ddos_samurai import reporting
+
+        events = [
+            {
+                "status": "ok",
+                "attack_vector": "basic",
+                "compute_backend": "cpu",
+                "sender_path": "PYTHON_SENDMMSG",
+                "fallback_count": 1,
+                "permission_error_count": 0,
+                "buffer_copy_count": 2,
+                "buffer_copy_bytes": 1024,
+                "eagain_retry_count": 3,
+                "partial_send_retry_count": 4,
+                "stats": {
+                    "attempted": 10,
+                    "sent": 9,
+                    "errors": 1,
+                    "bytes_sent_est": 900,
+                },
+            },
+            {
+                "status": "degraded",
+                "attack_vector": "basic",
+                "compute_backend": "cpu",
+                "sender_path": "C_EXT_L3",
+                "fallback_count": 0,
+                "permission_error_count": 1,
+                "buffer_copy_count": 0,
+                "buffer_copy_bytes": 0,
+                "eagain_retry_count": 2,
+                "partial_send_retry_count": 1,
+                "stats": {
+                    "attempted": 10,
+                    "sent": 8,
+                    "errors": 2,
+                    "bytes_sent_est": 800,
+                },
+            },
+        ]
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1"},
+            worker_events=events,
+            duration_s=2.0,
+            progress_total=20,
+            total_count=20,
+            metrics={},
+            warnings=[],
+        )
+
+        self.assertEqual(rr.mode, "live_attack")
+        self.assertEqual(rr.results["buffer_copy_count"], 2)
+        self.assertEqual(rr.results["buffer_copy_bytes"], 1024)
+        self.assertEqual(rr.results["eagain_retry_count"], 5)
+        self.assertEqual(rr.results["partial_send_retry_count"], 5)

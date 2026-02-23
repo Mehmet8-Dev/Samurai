@@ -1,91 +1,92 @@
 # 09 - Gelistirme ve Test
 
-## Testleri Calistirma
+## Test Profilleri
 
-Bu repoda test runner olarak `pytest` yerine Python standart kutuphanesi `unittest` kullanilir.
+Bu repo test orchestrasyonu icin `pytest` kullanir ve iki profile ayrilir:
+
+- `ci_safe` (default): non-privileged, GPU olmayan hizli katman
+- `full`: privileged/root + opsiyonel GPU + genis benchmark katmani
+
+Profil secimi:
 
 ```bash
-python3 -m unittest discover -s tests -p "test_*.py"
+SAMURAI_TEST_PROFILE=ci_safe pytest tests -q -rs
+SAMURAI_TEST_PROFILE=full pytest tests -q -rs
 ```
 
-## Testlerin Yapisi
+## Marker Sozlesmesi
 
-`tests/` dizinindeki unit test'ler genelde:
+Asagidaki marker seti kullanilir:
 
-- CLI parser'da beklenen flag setleri
-- Orchestrator dispatch davranisi (sender fonksiyonlarini monkeypatch ederek)
-- Packet builder (payload/padding/fragment flag semantigi)
-- Fragmentation sender davranisi
-- Safety gate
+- `ci_safe`
+- `privileged`
+- `gpu`
+- `benchmark`
+- `rfc_positive`
+- `rfc_negative`
+
+`SAMURAI_TEST_PROFILE=ci_safe` iken `privileged` ve `gpu` testler otomatik skip edilir.
+
+## RFC Suite Ayrimi
+
+- Pozitif RFC suite: `tests/test_rfc_compliance.py` (`rfc_positive`)
+- Negatif RFC/anomaly suite: `tests/test_rfc_negative.py` (`rfc_negative`)
+
+Calistirma:
+
+```bash
+pytest tests/test_rfc_compliance.py tests/test_rfc_negative.py -q -rs
+```
+
+Rapor cikti dizini/dosyasi:
+
+- `SAMURAI_RFC_REPORT_OUT`
+
+Uretilen dosyalar:
+
+- `rfc_positive_report.json`
+- `rfc_negative_report.json`
+
+## Benchmark Suite
+
+CI-safe benchmark:
+
+```bash
+pytest tests/test_benchmark_ci.py -q -rs
+```
+
+Full benchmark:
+
+```bash
+SAMURAI_TEST_PROFILE=full pytest tests/test_benchmark_full.py tests/test_pacing_root.py -q -rs
+```
+
+Benchmark environment degiskenleri:
+
+- `SAMURAI_BENCH_REPORT_OUT`
+- `SAMURAI_BENCH_BASELINE`
+- `SAMURAI_BENCH_UPDATE_BASELINE`
+
+Ornek:
+
+```bash
+SAMURAI_BENCH_BASELINE=artifacts/benchmark_baseline.json \
+SAMURAI_BENCH_REPORT_OUT=artifacts/benchmark_summary.json \
+pytest tests/test_benchmark_ci.py -q -rs
+```
+
+`SAMURAI_BENCH_UPDATE_BASELINE=1` verildiginde mevcut benchmark raporu baseline dosyasina yazilir.
+
+## CI Is Akislari
+
+- `.github/workflows/ci.yml`: `ci_safe` profile
+- `.github/workflows/full-bench.yml`: manuel full RFC + benchmark kosusu
 
 ## Sandbox/CI Ortami Notu (Scapy PermissionError)
 
-Bazi kilitli ortamlarda (container/sandbox), Scapy import sirasinda netlink soketi acip interface listesini reload etmeye calisir.
-Bu da test import/collection asamasinda `PermissionError: [Errno 1] Operation not permitted` uretebilir.
+Bazi kilitli ortamlarda Scapy importu netlink socket erisimine takilabilir.
+Repo bu riski azaltmak icin lazy import kullanir:
 
-Gelistirme hedefi:
+- `ddos_samurai/scapy_support.py`
 
-- Scapy importunu "lazy" hale getirip (gerekmedikce import etmeyerek)
-- Veya interface reload'u gerektirmeyen bir konfig ile (ortama gore) calistirarak
-
-testlerin non-root/sandbox ortamlarda da kosmasini saglamak.
-
-Bu, urunlestirme ve CI icin onemlidir.
-
-Bu repo bunun icin iki seyi yapar:
-
-- `ddos_samurai/scapy_support.py`: scapy importunu lazy hale getirir.
-- `tests/_scapy_fake.py`: scapy gerekmeden logic test edilebilsin diye minimal fake saglar.
-
-## Local Degisim Rehberi
-
-Degisiklik yaparken su ayrimi korumaya calisin:
-
-- "args parse / config / safety": `cli.py` ve `utils.py`
-- "dispatch": `orchestrator.py`
-- "packet format": `packet.py` ve GPU modulleri
-- "transport": `senders.py` + C extensions
-
-## Dashboard (UI) Gelistirme
-
-UI kodu `dashboard/` altindadir.
-
-```bash
-npm -C dashboard install
-npm -C dashboard run dev
-```
-
-API adresi icin `dashboard/.env` kullanin:
-
-- `VITE_API_BASE_URL=http://localhost:5099`
-
-Detay: `docs/12-dashboard.md`
-
-## Dashboard (UI) Testleri
-
-Dashboard tarafinda test runner olarak `vitest` kullanilir.
-
-```bash
-npm -C dashboard test
-npm -C dashboard test:watch
-```
-
-Testlerde su kombinasyon kullanilir:
-
-- Unit: formatter ve form validation
-- Unit: UI varyant sinif sozlesmeleri (`Button`, `Card`, `Badge`, `Tabs`)
-- Unit: Start form gelismis ayar ac/kapa davranisi
-- Unit: Recent runs compact/detay drawer davranisi
-- Integration: route akisi, login, plan degisimi, run stop davranisi
-- Mock API: `msw`
-
-## Docker ile Smoke Calistirma
-
-UI + API stack:
-
-```bash
-docker compose up -d --build
-docker compose logs -f api
-```
-
-Detay: `docs/11-docker.md`
+Bu sayede non-root/sandbox ortamlarda test collection daha stabil calisir.

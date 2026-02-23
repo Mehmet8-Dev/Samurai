@@ -11,6 +11,12 @@ from io import BytesIO
 import struct
 import socket
 
+try:
+    import pytest
+    pytestmark = [pytest.mark.privileged]
+except Exception:  # pragma: no cover - unittest-only environments
+    pytestmark = []
+
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

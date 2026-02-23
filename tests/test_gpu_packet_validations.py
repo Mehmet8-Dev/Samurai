@@ -5,6 +5,12 @@ from unittest.mock import patch
 
 import numpy as np
 
+try:
+    import pytest
+    pytestmark = [pytest.mark.gpu]
+except Exception:  # pragma: no cover - unittest-only environments
+    pytestmark = []
+
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
