@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: samurai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: samurai
+      POSTGRES_USER: samurai
+      POSTGRES_PASSWORD: samurai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: samurai-api
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    shm_size: "1gb"
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    ports:
+      - "5099:5099"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      SAMURAI_DATABASE_URL: postgresql+psycopg://samurai:samurai@postgres:5432/samurai
+      SAMURAI_JWT_SECRET: change-this-in-prod
+      SAMURAI_CORS_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
+    volumes:
+      - ./reports:/app/reports
+    depends_on:
+      - postgres
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: samurai-dashboard
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+  # CLI runner (interactive). Example:
+  # docker compose run --rm samurai --target 1.2.3.4 --port 80 --protocol udp --count 10000 --confirm --allow-public-target
+  samurai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: samurai-cli
+    profiles: ["cli"]
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: "host"
+    shm_size: "1gb"
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    volumes:
+      - ./reports:/app/reports
+    entrypoint: ["python", "-m", "ddos_samurai.cli"]
+    command: ["--help"]
+    stdin_open: true
+    tty: true
+
+volumes:
+  postgres_data:

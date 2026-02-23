@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "node"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # SaaS API monitoring. If you run the main docker-compose stack,
+  # expose API metrics at /metrics (port 5099).
+  - job_name: "samurai_api"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:5099", "samurai-api:5099"]

@@ -1,0 +1,40 @@
+# Core Network & Transport
+scapy
+uvloop
+aiohttp
+websockets
+aioquic
+httpx[http2]
+
+# Web Automation & WAF Bypass
+playwright
+requests
+pytest
+# API & Metrics Server
+fastapi
+uvicorn
+starlette
+python-multipart
+prometheus-client
+psutil
+
+# Auth / Billing / DB
+SQLAlchemy
+psycopg[binary]
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt<4.1
+email-validator
+
+# GPU & High Performance Computing
+numpy
+numba-cuda[cu13]
+cupy-cuda12x
+
+# CLI & Utilities
+rich
+colorama
+PyYAML
+
+# Testing
+# unittest is in the Python standard library

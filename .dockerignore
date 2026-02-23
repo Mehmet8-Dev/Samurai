@@ -1,0 +1,38 @@
+.git
+.github
+.pytest_cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local venvs
+ven/
+ven311/
+ddos_samurai/venv/
+
+# Build artifacts
+build/
+*.egg-info/
+*.so
+*.a
+*.o
+
+# Huge/binary artifacts in this repo (keep Docker build context small)
+*.pcap
+*.pcapng
+*.realism.json
+ddos_logs*.txt
+attack_log*.txt
+*.log
+
+# Optional large docs/assets not needed for container builds
+Papers/
+docs/
+dashboard/
+reports/
+monitoring/textfile
+*.pdf
+*.png
+

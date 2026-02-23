@@ -1,0 +1,612 @@
+from __future__ import annotations
+
+import json
+import os
+import platform
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def collect_system_snapshot() -> Dict[str, Any]:
+    snap: Dict[str, Any] = {
+        "timestamp_utc": _utc_now_iso(),
+        "cpu_count": os.cpu_count(),
+    }
+
+    try:
+        la = os.getloadavg()
+        snap["loadavg_1_5_15"] = [float(la[0]), float(la[1]), float(la[2])]
+    except Exception:
+        pass
+
+    # Linux-only best-effort memory info
+    try:
+        if os.path.exists("/proc/meminfo"):
+            mem: Dict[str, int] = {}
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if ":" not in line:
+                        continue
+                    k, rest = line.split(":", 1)
+                    parts = rest.strip().split()
+                    if not parts:
+                        continue
+                    try:
+                        v = int(parts[0])
+                    except Exception:
+                        continue
+                    unit = parts[1].lower() if len(parts) > 1 else ""
+                    # meminfo is typically kB
+                    if unit == "kb":
+                        v *= 1024
+                    mem[k] = v
+            # Keep only high-signal keys.
+            for k in ("MemTotal", "MemFree", "MemAvailable", "Buffers", "Cached", "SwapTotal", "SwapFree"):
+                if k in mem:
+                    snap[k] = mem[k]
+    except Exception:
+        pass
+
+    return snap
+
+
+def _safe_stat(path: str) -> Dict[str, Any]:
+    try:
+        st = os.stat(path)
+        return {
+            "path": path,
+            "exists": True,
+            "size_bytes": int(st.st_size),
+            "mtime_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(timespec="seconds"),
+        }
+    except Exception:
+        return {"path": path, "exists": False}
+
+
+def _try_maxrss_kb() -> Optional[int]:
+    # Works on Linux/macOS. Not available on Windows.
+    try:
+        import resource  # type: ignore
+
+        r = resource.getrusage(resource.RUSAGE_SELF)
+        # ru_maxrss is kilobytes on Linux, bytes on macOS. Detect crudely.
+        v = int(getattr(r, "ru_maxrss", 0) or 0)
+        if v <= 0:
+            return None
+        if platform.system().lower() == "darwin":
+            return int(v / 1024)
+        return v
+    except Exception:
+        return None
+
+
+def collect_environment() -> Dict[str, Any]:
+    env: Dict[str, Any] = {
+        "timestamp_utc": _utc_now_iso(),
+        "python": {
+            "version": sys.version.split()[0],
+            "executable": sys.executable,
+            "implementation": platform.python_implementation(),
+        },
+        "os": {
+            "platform": platform.platform(),
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+        },
+        "process": {
+            "pid": os.getpid(),
+            "cwd": os.getcwd(),
+            "maxrss_kb": _try_maxrss_kb(),
+        },
+        "capabilities": {},
+    }
+
+    # Optional CUDA/GPU info (best-effort; safe if missing).
+    try:
+        import cupy as cp  # type: ignore
+
+        try:
+            dev = cp.cuda.Device()
+            props = cp.cuda.runtime.getDeviceProperties(int(dev.id))
+            name = props.get("name", b"")
+            if isinstance(name, (bytes, bytearray)):
+                name = name.decode(errors="replace")
+            env["gpu"] = {
+                "available": True,
+                "device_id": int(dev.id),
+                "name": str(name),
+            }
+        except Exception:
+            env["gpu"] = {"available": True}
+    except Exception:
+        env["gpu"] = {"available": False}
+
+    try:
+        from . import get_capabilities  # type: ignore
+
+        env["capabilities"] = get_capabilities() or {}
+    except Exception:
+        env["capabilities"] = {}
+
+    return env
+
+
+@dataclass
+class Artifact:
+    kind: str
+    path: str
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RunReport:
+    schema_version: str = "1"
+    run_id: str = ""
+    started_utc: str = ""
+    finished_utc: str = ""
+    duration_s: float = 0.0
+    mode: str = ""
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    inputs: Dict[str, Any] = field(default_factory=dict)
+    results: Dict[str, Any] = field(default_factory=dict)
+    environment: Dict[str, Any] = field(default_factory=dict)
+    artifacts: List[Artifact] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        # Ensure dataclass list items serialize cleanly
+        d["artifacts"] = [asdict(a) for a in self.artifacts]
+        return d
+
+
+def write_json(report: RunReport, out_path: str) -> str:
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(report.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(p)
+    return str(p)
+
+def write_text(text: str, out_path: str) -> str:
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8", errors="replace")
+    tmp.replace(p)
+    return str(p)
+
+
+def _md_kv_table(d: Dict[str, Any]) -> str:
+    lines = ["| Key | Value |", "|---|---|"]
+    for k, v in d.items():
+        vv = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+        lines.append(f"| `{k}` | {vv} |")
+    return "\n".join(lines)
+
+
+def write_markdown(report: RunReport, out_path: str) -> str:
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    env = report.environment or {}
+    results = report.results or {}
+
+    lines: List[str] = []
+    lines.append("# Run Report")
+    lines.append("")
+    lines.append(_md_kv_table({
+        "run_id": report.run_id,
+        "mode": report.mode,
+        "started_utc": report.started_utc,
+        "finished_utc": report.finished_utc,
+        "duration_s": f"{report.duration_s:.3f}",
+    }))
+    lines.append("")
+
+    lines.append("## Inputs")
+    lines.append("")
+    lines.append(_md_kv_table(report.inputs or {}))
+    lines.append("")
+
+    lines.append("## Results")
+    lines.append("")
+    lines.append(_md_kv_table(results))
+    lines.append("")
+
+    if report.metrics:
+        lines.append("## Metrics")
+        lines.append("")
+        lines.append("```json")
+        lines.append(json.dumps(report.metrics, indent=2, ensure_ascii=False))
+        lines.append("```")
+        lines.append("")
+
+    lines.append("## Artifacts")
+    lines.append("")
+    if report.artifacts:
+        lines.append("| Kind | Path | Meta |")
+        lines.append("|---|---|---|")
+        for a in report.artifacts:
+            meta = json.dumps(a.meta, ensure_ascii=False) if a.meta else ""
+            lines.append(f"| `{a.kind}` | `{a.path}` | {meta} |")
+    else:
+        lines.append("_No artifacts_")
+    lines.append("")
+
+    lines.append("## Environment")
+    lines.append("")
+    # Keep environment concise; include a few high-signal fields only.
+    env_summary: Dict[str, Any] = {
+        "python": env.get("python", {}),
+        "os": env.get("os", {}),
+        "gpu": env.get("gpu", {}),
+        "process": env.get("process", {}),
+    }
+    lines.append("```json")
+    lines.append(json.dumps(env_summary, indent=2, ensure_ascii=False))
+    lines.append("```")
+    lines.append("")
+
+    if report.warnings:
+        lines.append("## Warnings")
+        lines.append("")
+        for w in report.warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return str(p)
+
+def _metric_name(key: str) -> str:
+    # Prometheus metric name sanitization (very small subset).
+    out = []
+    for ch in str(key):
+        if ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9") or ch in ("_", ":"):
+            out.append(ch)
+        else:
+            out.append("_")
+    s = "".join(out)
+    if not s or (not (s[0].isalpha() or s[0] in ("_", ":"))):
+        s = "m_" + s
+    return s
+
+
+def _flatten_numbers(d: Any, *, prefix: str, out: Dict[str, float]) -> None:
+    if isinstance(d, bool):
+        out[prefix] = 1.0 if d else 0.0
+        return
+    if isinstance(d, (int, float)) and not isinstance(d, bool):
+        out[prefix] = float(d)
+        return
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if k is None:
+                continue
+            key = f"{prefix}_{k}" if prefix else str(k)
+            _flatten_numbers(v, prefix=key, out=out)
+        return
+    # Ignore lists/strings/bytes/None/objects by default.
+
+
+def export_prometheus(report: RunReport, *, prefix: str = "samurai") -> str:
+    """Best-effort Prometheus exposition for offline/test monitoring.
+
+    This is intentionally minimal and numeric-only.
+    """
+    flat: Dict[str, float] = {}
+    _flatten_numbers({"duration_s": report.duration_s}, prefix="run", out=flat)
+    _flatten_numbers(report.results or {}, prefix="results", out=flat)
+    _flatten_numbers(report.metrics or {}, prefix="metrics", out=flat)
+
+    lines = []
+    for k, v in sorted(flat.items()):
+        name = _metric_name(f"{prefix}_{k}")
+        # No labels here to avoid high-cardinality in a file-based exporter.
+        lines.append(f"{name} {v}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_metrics_files(report: RunReport, base_path: str) -> Dict[str, str]:
+    """Write additional machine-friendly metrics artifacts next to the run report.
+
+    Files:
+    - <base>.metrics.json: structured metrics snapshot
+    - <base>.metrics.prom: Prometheus exposition (numeric-only)
+    """
+    p = Path(base_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    metrics_json = {
+        "run_id": report.run_id,
+        "mode": report.mode,
+        "started_utc": report.started_utc,
+        "finished_utc": report.finished_utc,
+        "duration_s": report.duration_s,
+        "metrics": report.metrics or {},
+    }
+    out_json = str(p) + ".metrics.json"
+    write_text(json.dumps(metrics_json, indent=2, sort_keys=True), out_json)
+
+    out_prom = str(p) + ".metrics.prom"
+    write_text(export_prometheus(report), out_prom)
+
+    return {"metrics_json": out_json, "metrics_prom": out_prom}
+
+
+def build_gpu_pcap_report(
+    *,
+    cfg: Any,
+    pcap_path: str,
+    realism: Optional[Dict[str, Any]] = None,
+    realism_path: Optional[str] = None,
+    duration_s: float,
+    metrics: Optional[Dict[str, Any]] = None,
+    warnings: Optional[List[str]] = None,
+) -> RunReport:
+    run_id = f"gpu-pcap-{int(time.time())}"
+    inputs = {
+        "duration_s": getattr(cfg, "duration_s", None),
+        "pps": getattr(cfg, "pps", None),
+        "mode": getattr(cfg, "mode", None),
+        "src_ip": getattr(cfg, "src_ip", None),
+        "dst_ip": getattr(cfg, "dst_ip", None),
+        "tcp_dport": getattr(cfg, "tcp_dport", None),
+        "udp_dport": getattr(cfg, "udp_dport", None),
+        "chunk_size": getattr(cfg, "chunk_size", None),
+        "seed": getattr(cfg, "seed", None),
+        "flow_count": getattr(cfg, "flow_count", None),
+        "realistic": getattr(cfg, "realistic", None),
+        "udp_checksum": getattr(cfg, "udp_checksum", None),
+        "variable_size": getattr(cfg, "variable_size", None),
+        "mtu": getattr(cfg, "mtu", None),
+        "size_profile": getattr(cfg, "size_profile", None),
+    }
+
+    packets_total = None
+    try:
+        dur = int(getattr(cfg, "duration_s", 0) or 0)
+        pps = int(getattr(cfg, "pps", 0) or 0)
+        if dur > 0 and pps > 0:
+            packets_total = dur * pps
+    except Exception:
+        packets_total = None
+
+    pcap_stat = _safe_stat(pcap_path)
+    results: Dict[str, Any] = {
+        "pcap": pcap_stat,
+        "packets_estimated": packets_total,
+        "throughput_estimated_pps": (packets_total / duration_s) if (packets_total and duration_s > 0) else None,
+        "duration_wall_s": duration_s,
+        "system_snapshot": collect_system_snapshot(),
+    }
+    if realism:
+        results["realism"] = realism
+    if realism_path:
+        results["realism_report"] = _safe_stat(realism_path)
+
+    report = RunReport(
+        run_id=run_id,
+        started_utc="",  # caller fills for better accuracy
+        finished_utc="",
+        duration_s=float(duration_s),
+        mode="gpu_pcap",
+        metrics=dict(metrics or {}),
+        inputs=inputs,
+        results=results,
+        environment=collect_environment(),
+        artifacts=[
+            Artifact(kind="pcap", path=pcap_path, meta=pcap_stat),
+        ],
+        warnings=list(warnings or []),
+    )
+    if realism_path:
+        report.artifacts.append(Artifact(kind="realism_json", path=realism_path, meta=_safe_stat(realism_path)))
+    return report
+
+
+def build_dry_run_report(
+    *,
+    args: Dict[str, Any],
+    packet_len: int,
+    packet_hex_prefix: str,
+    duration_s: float,
+    metrics: Optional[Dict[str, Any]] = None,
+    warnings: Optional[List[str]] = None,
+) -> RunReport:
+    run_id = f"dry-run-{int(time.time())}"
+    report = RunReport(
+        run_id=run_id,
+        started_utc="",
+        finished_utc="",
+        duration_s=float(duration_s),
+        mode="dry_run",
+        metrics=dict(metrics or {}),
+        inputs={"args": args},
+        results={
+            "sample_packet_len": int(packet_len),
+            "sample_packet_hex_prefix": packet_hex_prefix,
+            "system_snapshot": collect_system_snapshot(),
+        },
+        environment=collect_environment(),
+        artifacts=[],
+        warnings=list(warnings or []),
+    )
+    return report
+
+
+def build_self_test_report(
+    *,
+    summary: Dict[str, Any],
+    log_path: Optional[str],
+    duration_s: float,
+    metrics: Optional[Dict[str, Any]] = None,
+    warnings: Optional[List[str]] = None,
+) -> RunReport:
+    run_id = f"self-test-{int(time.time())}"
+    artifacts: List[Artifact] = []
+    if log_path:
+        artifacts.append(Artifact(kind="self_test_log", path=str(log_path), meta=_safe_stat(str(log_path))))
+
+    report = RunReport(
+        run_id=run_id,
+        started_utc="",
+        finished_utc="",
+        duration_s=float(duration_s),
+        mode="self_test",
+        metrics=dict(metrics or {}),
+        inputs={},
+        results={
+            "tests_run": int(summary.get("tests_run", 0) or 0),
+            "failures": int(summary.get("failures", 0) or 0),
+            "errors": int(summary.get("errors", 0) or 0),
+            "skipped": int(summary.get("skipped", 0) or 0),
+            "successful": bool(summary.get("successful", False)),
+            "system_snapshot": collect_system_snapshot(),
+        },
+        environment=collect_environment(),
+        artifacts=artifacts,
+        warnings=list(warnings or []),
+    )
+    return report
+
+
+def build_live_attack_report(
+    *,
+    args: Dict[str, Any],
+    worker_events: List[Dict[str, Any]],
+    duration_s: float,
+    progress_total: int,
+    total_count: int,
+    metrics: Optional[Dict[str, Any]] = None,
+    warnings: Optional[List[str]] = None,
+) -> RunReport:
+    run_id = f"live-run-{int(time.time())}"
+
+    workers_total = 0
+    workers_ok = 0
+    workers_degraded = 0
+    workers_failed = 0
+    workers_interrupted = 0
+    attempted_total = 0
+    sent_total = 0
+    errors_total = 0
+    bytes_sent_est_total = 0
+    permission_error_count_total = 0
+    fallback_count_total = 0
+    backlog_peak_max = 0
+    sender_paths_used: Dict[str, int] = {}
+    by_vector: Dict[str, Dict[str, int]] = {}
+    by_backend: Dict[str, Dict[str, int]] = {}
+    worker_errors: List[Dict[str, Any]] = []
+
+    for ev in list(worker_events or []):
+        if not isinstance(ev, dict):
+            continue
+        workers_total += 1
+        status = str(ev.get("status", "unknown"))
+        if status == "ok":
+            workers_ok += 1
+        elif status == "degraded":
+            workers_degraded += 1
+        elif status == "interrupted":
+            workers_interrupted += 1
+        else:
+            workers_failed += 1
+            if ev.get("error"):
+                worker_errors.append(
+                    {
+                        "worker_id": ev.get("worker_id"),
+                        "status": status,
+                        "error": str(ev.get("error")),
+                    }
+                )
+
+        st = ev.get("stats") or {}
+        attempted = int(st.get("attempted", 0) or 0)
+        sent = int(st.get("sent", 0) or 0)
+        errors = int(st.get("errors", 0) or 0)
+        bytes_sent = int(st.get("bytes_sent_est", 0) or 0)
+        attempted_total += attempted
+        sent_total += sent
+        errors_total += errors
+        bytes_sent_est_total += bytes_sent
+
+        # Aggregate sender path / fallback / permission metrics
+        _sp = str(ev.get("sender_path", st.get("sender_path", "unknown")))
+        sender_paths_used[_sp] = sender_paths_used.get(_sp, 0) + 1
+        permission_error_count_total += int(
+            ev.get("permission_error_count", st.get("permission_error_count", 0)) or 0
+        )
+        fallback_count_total += int(
+            ev.get("fallback_count", st.get("fallback_count", 0)) or 0
+        )
+        _bp = int(ev.get("queue_backlog_peak", 0) or 0)
+        if _bp > backlog_peak_max:
+            backlog_peak_max = _bp
+
+        vec = str(ev.get("attack_vector", "unknown"))
+        be = str(ev.get("compute_backend", "unknown"))
+
+        v = by_vector.setdefault(vec, {"attempted": 0, "sent": 0, "errors": 0, "workers": 0})
+        v["attempted"] += attempted
+        v["sent"] += sent
+        v["errors"] += errors
+        v["workers"] += 1
+
+        b = by_backend.setdefault(be, {"attempted": 0, "sent": 0, "errors": 0, "workers": 0})
+        b["attempted"] += attempted
+        b["sent"] += sent
+        b["errors"] += errors
+        b["workers"] += 1
+
+    effective_pps = (float(sent_total) / float(duration_s)) if duration_s > 0 else None
+    throughput_bps_est = (float(bytes_sent_est_total) * 8.0 / float(duration_s)) if duration_s > 0 else None
+    send_success_ratio = (float(sent_total) / float(attempted_total) * 100.0) if attempted_total > 0 else 0.0
+
+    report = RunReport(
+        run_id=run_id,
+        started_utc="",
+        finished_utc="",
+        duration_s=float(duration_s),
+        mode="live_attack",
+        metrics=dict(metrics or {}),
+        inputs={"args": dict(args or {})},
+        results={
+            "target_count": int(total_count),
+            "progress_total": int(progress_total),
+            "workers_total": int(workers_total),
+            "workers_ok": int(workers_ok),
+            "workers_degraded": int(workers_degraded),
+            "workers_failed": int(workers_failed),
+            "workers_interrupted": int(workers_interrupted),
+            "attempted_total": int(attempted_total),
+            "sent_total": int(sent_total),
+            "errors_total": int(errors_total),
+            "bytes_sent_est_total": int(bytes_sent_est_total),
+            "effective_pps": effective_pps,
+            "throughput_bps_est": throughput_bps_est,
+            "send_success_ratio_pct": round(send_success_ratio, 2),
+            "sender_paths_used": sender_paths_used,
+            "permission_error_count": int(permission_error_count_total),
+            "fallback_count": int(fallback_count_total),
+            "queue_backlog_peak": int(backlog_peak_max),
+            "by_vector": by_vector,
+            "by_backend": by_backend,
+            "worker_errors": worker_errors,
+            "system_snapshot": collect_system_snapshot(),
+        },
+        environment=collect_environment(),
+        artifacts=[],
+        warnings=list(warnings or []),
+    )
+    return report

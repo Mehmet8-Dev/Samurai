@@ -1,0 +1,56 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.codacy/
+
+# Python cache / build
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.so
+*.o
+*.a
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+ven/
+ven311/
+ddos_samurai/venv/
+.venv/
+env/
+
+# Node
+dashboard/node_modules/
+dashboard/dist/
+
+# Runtime outputs / telemetry / artifacts
+reports/
+monitoring/textfile/
+*.log
+*.log.txt
+ddos_logs*.txt
+attack_log*.txt
+*.pcap
+*.pcapng
+*.realism.json
+samurai_local.db
+*.db
+
+# Large docs/assets not needed in source repo
+Papers/
+*.pdf
+*.docx
+
+# Local env files
+.env
+.env.*
+
+# Keep local Codacy instruction file out of repository history
+.github/instructions/codacy.instructions.md
