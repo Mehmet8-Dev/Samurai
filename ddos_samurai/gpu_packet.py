@@ -355,19 +355,11 @@ def calculate_checksum(buffer, offset, length):
 @cuda.jit(device=True)
 def read_uint16_be(buffer, offset):
     """Reads a 16-bit integer in Big Endian."""
-    if (offset & 0x1) == 0:
-        # Numba CUDA may widen view() results in some environments; force int.
-        val = int64(buffer.view(np.uint16)[offset >> 1]) & 0xFFFF
-        return ((val & 0xFF) << 8) | ((val >> 8) & 0xFF)
     return (buffer[offset] << 8) | buffer[offset + 1]
 
 @cuda.jit(device=True)
 def read_uint32_be(buffer, offset):
     """Reads a 32-bit integer in Big Endian."""
-    if (offset & 0x3) == 0:
-        # Numba CUDA may widen view() results in some environments; force int.
-        val = int64(buffer.view(np.uint32)[offset >> 2]) & 0xFFFFFFFF
-        return ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | ((val & 0xFF0000) >> 8) | ((val >> 24) & 0xFF)
     return (buffer[offset] << 24) | (buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3]
 
 @cuda.jit(device=True)
@@ -597,24 +589,16 @@ def calculate_checksum_warp(buffer, offset, length):
 @cuda.jit(device=True)
 def write_uint32_be(buffer, offset, value):
     """Writes a 32-bit integer in Big Endian."""
-    if (offset & 0x3) == 0:
-        bswap_val = ((value & 0xFF) << 24) | ((value & 0xFF00) << 8) | ((value & 0xFF0000) >> 8) | ((value >> 24) & 0xFF)
-        buffer.view(np.uint32)[offset >> 2] = bswap_val
-    else:
-        buffer[offset] = (value >> 24) & 0xFF
-        buffer[offset + 1] = (value >> 16) & 0xFF
-        buffer[offset + 2] = (value >> 8) & 0xFF
-        buffer[offset + 3] = value & 0xFF
+    buffer[offset] = (value >> 24) & 0xFF
+    buffer[offset + 1] = (value >> 16) & 0xFF
+    buffer[offset + 2] = (value >> 8) & 0xFF
+    buffer[offset + 3] = value & 0xFF
 
 @cuda.jit(device=True)
 def write_uint16_be(buffer, offset, value):
     """Writes a 16-bit integer in Big Endian."""
-    if (offset & 0x1) == 0:
-        bswap_val = ((value & 0xFF) << 8) | ((value >> 8) & 0xFF)
-        buffer.view(np.uint16)[offset >> 1] = bswap_val
-    else:
-        buffer[offset] = (value >> 8) & 0xFF
-        buffer[offset + 1] = value & 0xFF
+    buffer[offset] = (value >> 8) & 0xFF
+    buffer[offset + 1] = value & 0xFF
 
 @cuda.jit(device=True)
 def fast_memcpy_aligned(dst_buffer, dst_offset, src_buffer, src_offset, length):
