@@ -919,33 +919,101 @@ static PyObject* get_ring_info(PyObject* self, PyObject* args) {
     );
 }
 
-static PyObject* send_ring_optimized(PyObject* self, PyObject* args) {
-    char* iface;
-    Py_buffer view;
-    int packet_size;
-    int count;
-    Py_buffer mac_view;
+typedef struct {
+    int attempted;
+    int sent;
+    unsigned long long txring_flush_call_count;
+    unsigned long long txring_flush_error_count;
+    unsigned long long txring_flush_eagain_count;
+    unsigned long long txring_tp_packets;
+    unsigned long long txring_tp_drops;
+    unsigned long long txring_tp_freeze_q_cnt;
+} txring_send_metrics_t;
 
-    if (!PyArg_ParseTuple(args, "sy*iiy*", &iface, &view, &packet_size, &count, &mac_view)) {
-        return NULL;
+static void drain_txring_packet_stats(const ring_context_t* ctx) {
+    if (!ctx || !ctx->is_setup || ctx->sock < 0) return;
+
+    if (ctx->packet_version == TPACKET_V3) {
+        struct tpacket_stats_v3 stats_v3;
+        socklen_t optlen = sizeof(stats_v3);
+        (void)getsockopt(ctx->sock, SOL_PACKET, PACKET_STATISTICS, &stats_v3, &optlen);
+        return;
     }
 
-    if (mac_view.len != 6) {
-        PyBuffer_Release(&view);
-        PyBuffer_Release(&mac_view);
-        PyErr_SetString(PyExc_ValueError, "MAC address must be 6 bytes");
-        return NULL;
+    struct tpacket_stats stats_v2;
+    socklen_t optlen = sizeof(stats_v2);
+    (void)getsockopt(ctx->sock, SOL_PACKET, PACKET_STATISTICS, &stats_v2, &optlen);
+}
+
+static void collect_txring_packet_stats(const ring_context_t* ctx, txring_send_metrics_t* metrics) {
+    if (!ctx || !metrics || !ctx->is_setup || ctx->sock < 0) return;
+
+    if (ctx->packet_version == TPACKET_V3) {
+        struct tpacket_stats_v3 stats_v3;
+        socklen_t optlen = sizeof(stats_v3);
+        if (getsockopt(ctx->sock, SOL_PACKET, PACKET_STATISTICS, &stats_v3, &optlen) == 0) {
+            metrics->txring_tp_packets = (unsigned long long)stats_v3.tp_packets;
+            metrics->txring_tp_drops = (unsigned long long)stats_v3.tp_drops;
+            metrics->txring_tp_freeze_q_cnt = (unsigned long long)stats_v3.tp_freeze_q_cnt;
+        }
+        return;
     }
 
-    if (setup_tx_ring(iface, packet_size, (uint8_t*)mac_view.buf) < 0) {
-        PyBuffer_Release(&view);
-        PyBuffer_Release(&mac_view);
+    struct tpacket_stats stats_v2;
+    socklen_t optlen = sizeof(stats_v2);
+    if (getsockopt(ctx->sock, SOL_PACKET, PACKET_STATISTICS, &stats_v2, &optlen) == 0) {
+        metrics->txring_tp_packets = (unsigned long long)stats_v2.tp_packets;
+        metrics->txring_tp_drops = (unsigned long long)stats_v2.tp_drops;
+        metrics->txring_tp_freeze_q_cnt = 0ULL;
+    }
+}
+
+static inline void txring_flush_socket(int sock, txring_send_metrics_t* metrics) {
+    ssize_t flush_ret;
+    if (!metrics) return;
+
+    metrics->txring_flush_call_count++;
+    flush_ret = sendto(sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
+    if (flush_ret < 0) {
+        metrics->txring_flush_error_count++;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            metrics->txring_flush_eagain_count++;
+        }
+    }
+}
+
+static int send_ring_optimized_core(
+    const char* iface,
+    Py_buffer* view,
+    int packet_size,
+    int count,
+    const uint8_t* mac,
+    txring_send_metrics_t* metrics
+) {
+    if (!iface || !view || !mac || !metrics) {
+        PyErr_SetString(PyExc_ValueError, "invalid send_ring_optimized arguments");
+        return -1;
+    }
+    if (packet_size <= 0 || count < 0) {
+        PyErr_SetString(PyExc_ValueError, "packet_size must be > 0 and count must be >= 0");
+        return -1;
+    }
+    if ((size_t)view->len < ((size_t)packet_size * (size_t)count)) {
+        PyErr_SetString(PyExc_ValueError, "packets buffer is smaller than packet_size * count");
+        return -1;
+    }
+
+    memset(metrics, 0, sizeof(*metrics));
+    metrics->attempted = count;
+
+    if (setup_tx_ring(iface, packet_size, mac) < 0) {
         PyErr_SetString(PyExc_OSError, "Failed to setup TX_RING");
-        return NULL;
+        return -1;
     }
 
-    int total_sent = 0;
-    char* data_ptr = (char*)view.buf;
+    drain_txring_packet_stats(&tx_ring_ctx);
+
+    char* data_ptr = (char*)view->buf;
     size_t frame_header_size = tx_ring_ctx.frame_header_size;
     unsigned int frame_size = tx_ring_frame_size(&tx_ring_ctx);
     unsigned int frame_nr = tx_ring_frame_nr(&tx_ring_ctx);
@@ -957,33 +1025,117 @@ static PyObject* send_ring_optimized(PyObject* self, PyObject* args) {
 
     for (int i = 0; i < count; ) {
         char* frame_base = tx_ring_ctx.map + ((size_t)tx_ring_ctx.frame_idx * frame_size);
-        
-        int busy_loops = 1000 + (i % 2000); 
+
+        int busy_loops = 1000 + (i % 2000);
         while (tx_frame_status(frame_base, packet_version) != TP_STATUS_AVAILABLE) {
-            if (busy_loops > 0) { busy_loops--; continue; }
+            if (busy_loops > 0) {
+                busy_loops--;
+                continue;
+            }
             poll(&pfd, 1, 1);
             if (tx_frame_status(frame_base, packet_version) != TP_STATUS_AVAILABLE) {
-                 sendto(tx_ring_ctx.sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
+                txring_flush_socket(tx_ring_ctx.sock, metrics);
             }
         }
 
         char* payload_ptr = frame_base + frame_header_size;
-        memcpy(payload_ptr, data_ptr + (i * packet_size), packet_size);
+        memcpy(payload_ptr, data_ptr + ((uint64_t)i * (uint64_t)packet_size), (size_t)packet_size);
         tx_frame_prepare(frame_base, packet_version, frame_header_size, packet_size);
 
-        int dynamic_batch = 128 + (i & 0xFF);
-        if ((i % dynamic_batch == 0) || (i == count - 1)) {
-            sendto(tx_ring_ctx.sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
+        {
+            int dynamic_batch = 128 + (i & 0xFF);
+            if ((i % dynamic_batch == 0) || (i == count - 1)) {
+                txring_flush_socket(tx_ring_ctx.sock, metrics);
+            }
         }
 
-        total_sent++;
+        metrics->sent++;
         i++;
-        tx_ring_ctx.frame_idx = (tx_ring_ctx.frame_idx + 1) % frame_nr;
+        tx_ring_ctx.frame_idx = (tx_ring_ctx.frame_idx + 1U) % frame_nr;
+    }
+
+    collect_txring_packet_stats(&tx_ring_ctx, metrics);
+    return 0;
+}
+
+static PyObject* send_ring_optimized(PyObject* self, PyObject* args) {
+    char* iface;
+    Py_buffer view;
+    int packet_size;
+    int count;
+    Py_buffer mac_view;
+    txring_send_metrics_t metrics;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "sy*iiy*", &iface, &view, &packet_size, &count, &mac_view)) {
+        return NULL;
+    }
+
+    if (mac_view.len != 6) {
+        PyBuffer_Release(&view);
+        PyBuffer_Release(&mac_view);
+        PyErr_SetString(PyExc_ValueError, "MAC address must be 6 bytes");
+        return NULL;
+    }
+
+    if (send_ring_optimized_core(
+            iface, &view, packet_size, count, (const uint8_t*)mac_view.buf, &metrics) < 0) {
+        PyBuffer_Release(&view);
+        PyBuffer_Release(&mac_view);
+        return NULL;
     }
 
     PyBuffer_Release(&view);
     PyBuffer_Release(&mac_view);
-    return Py_BuildValue("i", total_sent);
+    return Py_BuildValue("i", metrics.sent);
+}
+
+static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
+    char* iface;
+    Py_buffer view;
+    int packet_size;
+    int count;
+    Py_buffer mac_view;
+    txring_send_metrics_t metrics;
+    int errors = 0;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "sy*iiy*", &iface, &view, &packet_size, &count, &mac_view)) {
+        return NULL;
+    }
+
+    if (mac_view.len != 6) {
+        PyBuffer_Release(&view);
+        PyBuffer_Release(&mac_view);
+        PyErr_SetString(PyExc_ValueError, "MAC address must be 6 bytes");
+        return NULL;
+    }
+
+    if (send_ring_optimized_core(
+            iface, &view, packet_size, count, (const uint8_t*)mac_view.buf, &metrics) < 0) {
+        PyBuffer_Release(&view);
+        PyBuffer_Release(&mac_view);
+        return NULL;
+    }
+
+    PyBuffer_Release(&view);
+    PyBuffer_Release(&mac_view);
+
+    errors = metrics.attempted - metrics.sent;
+    if (errors < 0) errors = 0;
+
+    return Py_BuildValue(
+        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K}",
+        "attempted", metrics.attempted,
+        "sent", metrics.sent,
+        "errors", errors,
+        "txring_flush_call_count", metrics.txring_flush_call_count,
+        "txring_flush_error_count", metrics.txring_flush_error_count,
+        "txring_flush_eagain_count", metrics.txring_flush_eagain_count,
+        "txring_tp_packets", metrics.txring_tp_packets,
+        "txring_tp_drops", metrics.txring_tp_drops,
+        "txring_tp_freeze_q_cnt", metrics.txring_tp_freeze_q_cnt
+    );
 }
 
 // --- Module Definition ---
@@ -994,6 +1146,8 @@ static PyMethodDef FastSenderMethods[] = {
      "Args: sockfd, buffer, target_ip, target_port, packet_size, count, ipg_ns\n"
      "Returns: dict with 'sent' and 'tx_errors' counts."},
     {"send_ring_optimized", send_ring_optimized, METH_VARARGS, "Send packets using AF_PACKET TX_RING (L2 Zero-Copy)"},
+    {"send_ring_optimized_ex", send_ring_optimized_ex, METH_VARARGS,
+     "Send packets using AF_PACKET TX_RING (L2 Zero-Copy) and return detailed counters."},
     {"cleanup_ring", cleanup_ring, METH_VARARGS, "Cleanup persistent TX_RING context"},
     {"get_ring_info", get_ring_info, METH_NOARGS, "Return active TX_RING setup details including packet version."},
     {"get_tcp_state", get_tcp_state, METH_VARARGS, "Get TCP state from the state table"},

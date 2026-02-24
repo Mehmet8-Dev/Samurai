@@ -58,6 +58,23 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "buffer_copy_bytes": 0,
         "eagain_retry_count": 0,
         "partial_send_retry_count": 0,
+        "txring_flush_call_count": 0,
+        "txring_flush_error_count": 0,
+        "txring_flush_eagain_count": 0,
+        "txring_tp_packets": 0,
+        "txring_tp_drops": 0,
+        "txring_tp_freeze_q_cnt": 0,
+        "host_tx_packets_delta": 0,
+        "host_tx_dropped_delta": 0,
+        "host_tx_errors_delta": 0,
+        "softnet_dropped_delta": 0,
+        "softnet_time_squeeze_delta": 0,
+        "wire_loss_est_packets": 0,
+        "wire_loss_est_pct": 0.0,
+        "gpu_template_h2d_copy_count": 0,
+        "gpu_template_h2d_copy_bytes": 0,
+        "gpu_rng_state_alloc_count": 0,
+        "gpu_rng_state_reuse_count": 0,
     }
     for k, v in extra.items():
         if isinstance(v, bool):
@@ -75,6 +92,61 @@ def _update_live(val, inc):
                 val.value += int(inc)
         except Exception:
             pass
+
+
+def _loss_telemetry_enabled() -> bool:
+    mode = str(os.environ.get("SAMURAI_LOSS_TELEMETRY", "auto") or "auto").strip().lower()
+    return mode not in {"0", "false", "off", "no", "disabled"}
+
+
+def _resolve_loss_iface(preferred_iface=None):
+    env_iface = str(os.environ.get("SAMURAI_LOSS_IFACE", "") or "").strip()
+    if env_iface:
+        return env_iface
+    return preferred_iface
+
+
+def _take_loss_snapshot(preferred_iface=None):
+    if not _loss_telemetry_enabled():
+        return {}
+    try:
+        from . import loss_telemetry
+
+        return dict(loss_telemetry.snapshot(iface=_resolve_loss_iface(preferred_iface)) or {})
+    except Exception:
+        return {}
+
+
+def _take_loss_delta(before: dict, preferred_iface=None) -> dict:
+    if not isinstance(before, dict) or not before:
+        return {}
+    try:
+        from . import loss_telemetry
+
+        after = dict(loss_telemetry.snapshot(iface=_resolve_loss_iface(preferred_iface)) or {})
+        return dict(loss_telemetry.delta(before, after) or {})
+    except Exception:
+        return {}
+
+
+def _attach_loss_telemetry(stats_out: dict, before_snapshot: dict, preferred_iface=None) -> dict:
+    out = dict(stats_out or {})
+    delta = _take_loss_delta(before_snapshot, preferred_iface=preferred_iface)
+
+    out["host_tx_packets_delta"] = int(delta.get("host_tx_packets_delta", 0) or 0)
+    out["host_tx_dropped_delta"] = int(delta.get("host_tx_dropped_delta", 0) or 0)
+    out["host_tx_errors_delta"] = int(delta.get("host_tx_errors_delta", 0) or 0)
+    out["softnet_dropped_delta"] = int(delta.get("softnet_dropped_delta", 0) or 0)
+    out["softnet_time_squeeze_delta"] = int(delta.get("softnet_time_squeeze_delta", 0) or 0)
+
+    attempted = int(out.get("attempted", 0) or 0)
+    txring_tp_drops = int(out.get("txring_tp_drops", 0) or 0)
+    host_tx_dropped = int(out.get("host_tx_dropped_delta", 0) or 0)
+    wire_loss_est_packets = max(0, txring_tp_drops, host_tx_dropped)
+    out["wire_loss_est_packets"] = int(wire_loss_est_packets)
+    out["wire_loss_est_pct"] = float((100.0 * wire_loss_est_packets) / max(1, attempted))
+
+    return out
 
 
 def _normalize_packets_buffer(
@@ -179,8 +251,27 @@ def _merge_stats(*items):
         acc["partial_send_retry_count"] += int(it.get("partial_send_retry_count", 0) or 0)
         acc["permission_error_count"] += int(it.get("permission_error_count", 0) or 0)
         acc["fallback_count"] += int(it.get("fallback_count", 0) or 0)
+        acc["txring_flush_call_count"] += int(it.get("txring_flush_call_count", 0) or 0)
+        acc["txring_flush_error_count"] += int(it.get("txring_flush_error_count", 0) or 0)
+        acc["txring_flush_eagain_count"] += int(it.get("txring_flush_eagain_count", 0) or 0)
+        acc["txring_tp_packets"] += int(it.get("txring_tp_packets", 0) or 0)
+        acc["txring_tp_drops"] += int(it.get("txring_tp_drops", 0) or 0)
+        acc["txring_tp_freeze_q_cnt"] += int(it.get("txring_tp_freeze_q_cnt", 0) or 0)
+        acc["host_tx_packets_delta"] += int(it.get("host_tx_packets_delta", 0) or 0)
+        acc["host_tx_dropped_delta"] += int(it.get("host_tx_dropped_delta", 0) or 0)
+        acc["host_tx_errors_delta"] += int(it.get("host_tx_errors_delta", 0) or 0)
+        acc["softnet_dropped_delta"] += int(it.get("softnet_dropped_delta", 0) or 0)
+        acc["softnet_time_squeeze_delta"] += int(it.get("softnet_time_squeeze_delta", 0) or 0)
+        acc["wire_loss_est_packets"] += int(it.get("wire_loss_est_packets", 0) or 0)
+        acc["gpu_template_h2d_copy_count"] += int(it.get("gpu_template_h2d_copy_count", 0) or 0)
+        acc["gpu_template_h2d_copy_bytes"] += int(it.get("gpu_template_h2d_copy_bytes", 0) or 0)
+        acc["gpu_rng_state_alloc_count"] += int(it.get("gpu_rng_state_alloc_count", 0) or 0)
+        acc["gpu_rng_state_reuse_count"] += int(it.get("gpu_rng_state_reuse_count", 0) or 0)
         if "sender_path" in it:
             acc["sender_path"] = str(it.get("sender_path") or "")
+    attempted_total = int(acc.get("attempted", 0) or 0)
+    wire_loss_total = int(acc.get("wire_loss_est_packets", 0) or 0)
+    acc["wire_loss_est_pct"] = float((100.0 * wire_loss_total) / max(1, attempted_total))
     return acc
 
 async def send_packet_async(packet, verbose, packet_no, loop, protocol):
@@ -671,6 +762,7 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
     packet_size = len(packets_buffer) // count if count > 0 else 0
     if packet_size == 0 and count > 0:
         log_error("Packet buffer is empty or count is zero, cannot determine packet size.")
+        s.close()
         return _stats(
             attempted=count,
             sent=0,
@@ -695,6 +787,15 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
     partial_send_retry_count = 0
     buffer_copy_count = int(normalize_meta.get("buffer_copy_count", 0) or 0)
     buffer_copy_bytes = int(normalize_meta.get("buffer_copy_bytes", 0) or 0)
+    txring_flush_call_count = 0
+    txring_flush_error_count = 0
+    txring_flush_eagain_count = 0
+    txring_tp_packets = 0
+    txring_tp_drops = 0
+    txring_tp_freeze_q_cnt = 0
+
+    loss_iface_hint = _resolve_loss_iface(None)
+    loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
 
     # 1. Try C Extension (Fastest)
     if FAST_SENDER_AVAILABLE:
@@ -703,20 +804,43 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
             try:
                 iface, gateway_mac = get_gateway_info(target_ip)
                 if iface and gateway_mac:
+                    if not str(os.environ.get("SAMURAI_LOSS_IFACE", "") or "").strip():
+                        loss_iface_hint = str(iface)
+                        loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
                     # Validate MAC length
                     if len(gateway_mac) != 6:
                         log_error(f"Invalid MAC address length: {len(gateway_mac)} (expected 6)")
                     else:
                         # iface string, buffer, size, count, mac bytes
                         log_info(f"[TX_RING] Starting zero-copy L2 send with MAC: {gateway_mac.hex()}")
-                        sent = fast_sender.send_ring_optimized(iface, packets_buffer, packet_size, count, gateway_mac)
+                        if hasattr(fast_sender, "send_ring_optimized_ex"):
+                            tx_result = fast_sender.send_ring_optimized_ex(
+                                iface, packets_buffer, packet_size, count, gateway_mac
+                            )
+                            if isinstance(tx_result, dict):
+                                sent = int(tx_result.get("sent", 0) or 0)
+                                txring_flush_call_count += int(tx_result.get("txring_flush_call_count", 0) or 0)
+                                txring_flush_error_count += int(tx_result.get("txring_flush_error_count", 0) or 0)
+                                txring_flush_eagain_count += int(tx_result.get("txring_flush_eagain_count", 0) or 0)
+                                txring_tp_packets += int(tx_result.get("txring_tp_packets", 0) or 0)
+                                txring_tp_drops += int(tx_result.get("txring_tp_drops", 0) or 0)
+                                txring_tp_freeze_q_cnt += int(tx_result.get("txring_tp_freeze_q_cnt", 0) or 0)
+                            else:
+                                sent = int(tx_result or 0)
+                        else:
+                            sent = int(
+                                fast_sender.send_ring_optimized(
+                                    iface, packets_buffer, packet_size, count, gateway_mac
+                                )
+                                or 0
+                            )
                         log_info(f"Fast Sender (TX_RING L2) finished. Sent {sent} packets via {iface}.")
                         s.close()
                         sent_total = int(sent or 0)
                         _update_live(live_progress, count)
                         _update_live(live_sent, sent_total)
                         _update_live(live_errors, max(0, count - sent_total))
-                        return _stats(
+                        out = _stats(
                             attempted=count,
                             sent=sent_total,
                             errors=max(0, count - sent_total),
@@ -728,6 +852,15 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                             buffer_copy_bytes=buffer_copy_bytes,
                             eagain_retry_count=eagain_retry_count,
                             partial_send_retry_count=partial_send_retry_count,
+                            txring_flush_call_count=txring_flush_call_count,
+                            txring_flush_error_count=txring_flush_error_count,
+                            txring_flush_eagain_count=txring_flush_eagain_count,
+                            txring_tp_packets=txring_tp_packets,
+                            txring_tp_drops=txring_tp_drops,
+                            txring_tp_freeze_q_cnt=txring_tp_freeze_q_cnt,
+                        )
+                        return _attach_loss_telemetry(
+                            out, loss_before_snapshot, preferred_iface=loss_iface_hint
                         )
                 else:
                     fallback_count += 1
@@ -755,7 +888,7 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
             _update_live(live_progress, count)
             _update_live(live_sent, sent_total)
             _update_live(live_errors, max(0, count - sent_total))
-            return _stats(
+            out = _stats(
                 attempted=count,
                 sent=sent_total,
                 errors=max(0, count - sent_total),
@@ -767,6 +900,9 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                 buffer_copy_bytes=buffer_copy_bytes,
                 eagain_retry_count=eagain_retry_count,
                 partial_send_retry_count=partial_send_retry_count,
+            )
+            return _attach_loss_telemetry(
+                out, loss_before_snapshot, preferred_iface=loss_iface_hint
             )
         except Exception as e:
             fallback_count += 1
@@ -879,7 +1015,7 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
         if FAST_SENDER_AVAILABLE and hasattr(fast_sender, 'cleanup_ring'):
             fast_sender.cleanup_ring()
         log_info(f"Raw socket sender finished sending {count} packets.")
-    return _stats(
+    out = _stats(
         attempted=count,
         sent=sent_total,
         errors=max(0, count - sent_total),
@@ -891,7 +1027,14 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
         buffer_copy_bytes=buffer_copy_bytes,
         eagain_retry_count=eagain_retry_count,
         partial_send_retry_count=partial_send_retry_count,
+        txring_flush_call_count=txring_flush_call_count,
+        txring_flush_error_count=txring_flush_error_count,
+        txring_flush_eagain_count=txring_flush_eagain_count,
+        txring_tp_packets=txring_tp_packets,
+        txring_tp_drops=txring_tp_drops,
+        txring_tp_freeze_q_cnt=txring_tp_freeze_q_cnt,
     )
+    return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
 
 
 async def paced_raw_socket_sender(
@@ -940,6 +1083,8 @@ async def paced_raw_socket_sender(
     )
     buffer_copy_count = int(normalize_meta.get("buffer_copy_count", 0) or 0)
     buffer_copy_bytes = int(normalize_meta.get("buffer_copy_bytes", 0) or 0)
+    loss_iface_hint = _resolve_loss_iface(None)
+    loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
 
     log_info(
         f"[Pacing] C engine: mode={pacing_config.pacing_mode.name}, "
@@ -953,6 +1098,9 @@ async def paced_raw_socket_sender(
         try:
             iface, gateway_mac = get_gateway_info(target_ip)
             if iface and gateway_mac and len(gateway_mac) == 6:
+                if not str(os.environ.get("SAMURAI_LOSS_IFACE", "") or "").strip():
+                    loss_iface_hint = str(iface)
+                    loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
                 log_info(f"[Pacing] Using L2 paced sender on {iface}")
                 loop = asyncio.get_running_loop()
                 sent = await loop.run_in_executor(
@@ -994,7 +1142,15 @@ async def paced_raw_socket_sender(
                     out["actual_rps"] = float(stats.get("actual_rps", 0) or 0)
                     out["rate_accuracy_pct"] = float(stats.get("rate_accuracy_pct", 0) or 0)
                     out["jitter_p99_ns"] = float(stats.get("jitter_p99_ns", 0) or 0)
-                return out
+                    out["txring_flush_call_count"] = int(stats.get("txring_flush_call_count", 0) or 0)
+                    out["txring_flush_error_count"] = int(stats.get("txring_flush_error_count", 0) or 0)
+                    out["txring_flush_eagain_count"] = int(stats.get("txring_flush_eagain_count", 0) or 0)
+                    out["txring_tp_packets"] = int(stats.get("txring_tp_packets", 0) or 0)
+                    out["txring_tp_drops"] = int(stats.get("txring_tp_drops", 0) or 0)
+                    out["txring_tp_freeze_q_cnt"] = int(stats.get("txring_tp_freeze_q_cnt", 0) or 0)
+                return _attach_loss_telemetry(
+                    out, loss_before_snapshot, preferred_iface=loss_iface_hint
+                )
         except Exception as e:
             if verbose:
                 log_error(f"[Pacing] L2 paced send failed, falling back to L3: {e}")
@@ -1034,7 +1190,13 @@ async def paced_raw_socket_sender(
             out["actual_rps"] = float(stats.get("actual_rps", 0) or 0)
             out["rate_accuracy_pct"] = float(stats.get("rate_accuracy_pct", 0) or 0)
             out["jitter_p99_ns"] = float(stats.get("jitter_p99_ns", 0) or 0)
-        return out
+            out["txring_flush_call_count"] = int(stats.get("txring_flush_call_count", 0) or 0)
+            out["txring_flush_error_count"] = int(stats.get("txring_flush_error_count", 0) or 0)
+            out["txring_flush_eagain_count"] = int(stats.get("txring_flush_eagain_count", 0) or 0)
+            out["txring_tp_packets"] = int(stats.get("txring_tp_packets", 0) or 0)
+            out["txring_tp_drops"] = int(stats.get("txring_tp_drops", 0) or 0)
+            out["txring_tp_freeze_q_cnt"] = int(stats.get("txring_tp_freeze_q_cnt", 0) or 0)
+        return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
     except PermissionError:
         log_error("[Pacing] Raw socket requires root. Falling back to unpaced.")
         return await raw_socket_sender(

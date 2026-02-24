@@ -1,0 +1,67 @@
+{
+  "generated_utc": "2026-02-24T14:14:38+00:00",
+  "profile": "full",
+  "schema": "samurai.benchmark.summary.v1",
+  "sections": {
+    "gpu_template": {
+      "constant": {
+        "avg_ms": 3.155846333356749,
+        "cache_hit": 3,
+        "cache_miss": 0,
+        "h2d_copy_bytes": 0,
+        "h2d_copy_count": 0,
+        "pps": 15843610.46718551,
+        "rng_alloc": 1,
+        "rng_reuse": 2
+      },
+      "generation_telemetry": {
+        "gpu_rng_state_alloc_count": 2,
+        "gpu_rng_state_reuse_count": 6,
+        "gpu_template_cache_hit_count": 7,
+        "gpu_template_cache_miss_count": 1,
+        "gpu_template_h2d_copy_bytes": 64,
+        "gpu_template_h2d_copy_count": 1
+      },
+      "global": {
+        "avg_ms": 0.8491473333075797,
+        "cache_hit": 3,
+        "cache_miss": 0,
+        "h2d_copy_bytes": 0,
+        "h2d_copy_count": 0,
+        "pps": 58882596.74000402,
+        "rng_alloc": 0,
+        "rng_reuse": 3
+      }
+    },
+    "loss_telemetry": {
+      "host_tx_dropped_delta": 0,
+      "host_tx_errors_delta": 0,
+      "host_tx_packets_delta": 0,
+      "softnet_dropped_delta": 0,
+      "softnet_time_squeeze_delta": 0,
+      "txring_flush_call_count": 0,
+      "txring_flush_eagain_count": 0,
+      "txring_flush_error_count": 0,
+      "txring_tp_drops": 0,
+      "txring_tp_freeze_q_cnt": 0,
+      "txring_tp_packets": 0,
+      "wire_loss_est_packets": 0,
+      "wire_loss_est_pct": 0.0,
+      "wire_loss_fail_pct": 5.0,
+      "wire_loss_status": "ok"
+    },
+    "pacing": {
+      "actual_rps": 5003.73135752928,
+      "jitter_p99_ns": 63.0,
+      "rate_accuracy_pct": 100.0746271505856,
+      "sent": 1000,
+      "target_rps": 5000.0,
+      "txring_flush_call_count": 0,
+      "txring_flush_eagain_count": 0,
+      "txring_flush_error_count": 0,
+      "txring_tp_drops": 0,
+      "txring_tp_freeze_q_cnt": 0,
+      "txring_tp_packets": 0
+    }
+  }
+}

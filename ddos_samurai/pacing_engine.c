@@ -128,6 +128,14 @@ typedef struct {
     int      so_txtime_active;
     uint64_t txtime_errors;
 
+    /* L2/TX_RING flush + drop visibility */
+    uint64_t txring_flush_call_count;
+    uint64_t txring_flush_error_count;
+    uint64_t txring_flush_eagain_count;
+    uint64_t txring_tp_packets;
+    uint64_t txring_tp_drops;
+    uint64_t txring_tp_freeze_q_cnt;
+
     /* calibration */
     uint64_t syscall_overhead_ns;
     uint64_t sleep_overhead_ns;
@@ -583,6 +591,39 @@ static void cleanup_ring(void)
     }
 }
 
+static void drain_ring_packet_stats(void)
+{
+    if (!g_ring.is_setup || g_ring.sock < 0) return;
+
+    struct tpacket_stats stats;
+    socklen_t optlen = sizeof(stats);
+    (void)getsockopt(g_ring.sock, SOL_PACKET, PACKET_STATISTICS, &stats, &optlen);
+}
+
+static void capture_ring_packet_stats(void)
+{
+    if (!g_ring.is_setup || g_ring.sock < 0) return;
+
+    struct tpacket_stats stats;
+    socklen_t optlen = sizeof(stats);
+    if (getsockopt(g_ring.sock, SOL_PACKET, PACKET_STATISTICS, &stats, &optlen) == 0) {
+        g_stats.txring_tp_packets = (uint64_t)stats.tp_packets;
+        g_stats.txring_tp_drops = (uint64_t)stats.tp_drops;
+        g_stats.txring_tp_freeze_q_cnt = 0ULL;
+    }
+}
+
+static inline void record_l2_flush_result(ssize_t ret)
+{
+    g_stats.txring_flush_call_count++;
+    if (ret < 0) {
+        g_stats.txring_flush_error_count++;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            g_stats.txring_flush_eagain_count++;
+        }
+    }
+}
+
 /* ========================================================================== */
 /* Python: paced_send_l3                                                      */
 /*   Paced L3 sender using IPPROTO_RAW + sendmmsg + precision timing          */
@@ -909,6 +950,8 @@ static PyObject *py_paced_send_l2(PyObject *self,
     stats_reset(target_rps);
     pthread_mutex_unlock(&g_stats_lock);
 
+    drain_ring_packet_stats();
+
     rng_seed();
 
     const char *data = (const char *)view.buf;
@@ -979,8 +1022,10 @@ static PyObject *py_paced_send_l2(PyObject *self,
                 continue;
             }
             poll(&pfd, 1, 1);
-            if (hdr->tp_status != TP_STATUS_AVAILABLE)
-                sendto(g_ring.sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
+            if (hdr->tp_status != TP_STATUS_AVAILABLE) {
+                ssize_t flush_ret = sendto(g_ring.sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
+                record_l2_flush_result(flush_ret);
+            }
         }
 
         uint64_t t_pre = time_ns();
@@ -997,8 +1042,10 @@ static PyObject *py_paced_send_l2(PyObject *self,
 
         /* flush every burst_size packets, or at end */
         int dyn_flush = burst_size > 0 ? burst_size : 128;
-        if (((i + 1) % dyn_flush == 0) || i == count - 1)
-            sendto(g_ring.sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
+        if (((i + 1) % dyn_flush == 0) || i == count - 1) {
+            ssize_t flush_ret = sendto(g_ring.sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
+            record_l2_flush_result(flush_ret);
+        }
 
         total_sent++;
         g_stats.total_packets++;
@@ -1014,6 +1061,7 @@ static PyObject *py_paced_send_l2(PyObject *self,
             (g_ring.frame_idx + 1) % g_ring.req.tp_frame_nr;
     }
 
+    capture_ring_packet_stats();
     g_stats.elapsed_ns = (double)(time_ns() - t_start);
     stats_finalize();
 
@@ -1037,6 +1085,9 @@ PyDoc_STRVAR(doc_get_stats,
 "ipg_stddev_ns, jitter_min_ns, jitter_max_ns, jitter_mean_ns,\n"
 "jitter_stddev_ns, jitter_p50_ns, jitter_p95_ns, jitter_p99_ns,\n"
 "busywait_cycles, sleep_calls, so_txtime_active, txtime_errors,\n"
+"txring_flush_call_count, txring_flush_error_count,\n"
+"txring_flush_eagain_count, txring_tp_packets, txring_tp_drops,\n"
+"txring_tp_freeze_q_cnt,\n"
 "syscall_overhead_ns, sleep_overhead_ns, spin_threshold_ns,\n"
 "ipg_histogram (list of 128 bin counts, 500 ns/bin).\n");
 
@@ -1083,6 +1134,7 @@ static PyObject *py_get_pacing_stats(PyObject *self, PyObject *args)
         " s:d, s:d, s:d,"
         " s:K, s:K,"
         " s:i, s:K,"
+        " s:K, s:K, s:K, s:K, s:K, s:K,"
         " s:K, s:K, s:K,"
         " s:O}",
         "total_packets",      g_stats.total_packets,
@@ -1111,6 +1163,13 @@ static PyObject *py_get_pacing_stats(PyObject *self, PyObject *args)
 
         "so_txtime_active",   g_stats.so_txtime_active,
         "txtime_errors",      g_stats.txtime_errors,
+
+        "txring_flush_call_count", g_stats.txring_flush_call_count,
+        "txring_flush_error_count", g_stats.txring_flush_error_count,
+        "txring_flush_eagain_count", g_stats.txring_flush_eagain_count,
+        "txring_tp_packets", g_stats.txring_tp_packets,
+        "txring_tp_drops", g_stats.txring_tp_drops,
+        "txring_tp_freeze_q_cnt", g_stats.txring_tp_freeze_q_cnt,
 
         "syscall_overhead_ns", g_stats.syscall_overhead_ns,
         "sleep_overhead_ns",   g_stats.sleep_overhead_ns,

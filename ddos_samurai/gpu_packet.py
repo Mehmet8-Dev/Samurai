@@ -20,7 +20,10 @@ import random
 import logging
 import threading
 import time
+import os
+import hashlib
 import ipaddress
+from collections import OrderedDict
 from typing import List, Optional, Tuple, Union
 
 from numba import cuda, uint8, uint16, uint32, uint64, void, int64
@@ -118,6 +121,19 @@ _CONST_FINGERPRINTS = {
     "POOL_CONST_HOST": None,
 }
 
+# Generation-path telemetry + caches
+_generation_lock = threading.Lock()
+_template_device_cache = OrderedDict()
+_rng_state_pool = OrderedDict()
+_generation_telemetry = {
+    "gpu_template_h2d_copy_count": 0,
+    "gpu_template_h2d_copy_bytes": 0,
+    "gpu_rng_state_alloc_count": 0,
+    "gpu_rng_state_reuse_count": 0,
+    "gpu_template_cache_hit_count": 0,
+    "gpu_template_cache_miss_count": 0,
+}
+
 def _can_use_constant_memory(total_bytes, constant_limit):
     return total_bytes <= constant_limit
 
@@ -176,6 +192,134 @@ def _update_gpu_constant(symbol_name, host_data):
         _CONST_UPDATE_AVAILABLE = True
         logging.warning(f"Failed to update GPU Constant Memory '{symbol_name}', using global fallback: {e}")
         return False
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or default)
+    except Exception:
+        return int(default)
+
+
+def _gpu_cache_limit() -> int:
+    return max(0, _env_int("SAMURAI_GPU_CACHE_MAX_ENTRIES", 8))
+
+
+def _rng_pool_limit() -> int:
+    return max(0, _env_int("SAMURAI_GPU_RNG_POOL_MAX_ENTRIES", 8))
+
+
+def _active_device_id() -> int:
+    try:
+        return int(cp.cuda.runtime.getDevice())
+    except Exception:
+        try:
+            return int(cp.cuda.Device().id)
+        except Exception:
+            return -1
+
+
+def _stream_cache_key(stream) -> str:
+    if stream in (None, 0):
+        return "default"
+    ptr = getattr(stream, "ptr", None)
+    if ptr is None:
+        handle = getattr(stream, "handle", None)
+        if handle is not None:
+            ptr = getattr(handle, "value", None)
+    if ptr is None:
+        ptr = id(stream)
+    try:
+        return f"{int(ptr):x}"
+    except Exception:
+        return str(ptr)
+
+
+def _template_digest(host_array: np.ndarray) -> str:
+    h = hashlib.blake2b(host_array.tobytes(order="C"), digest_size=16)
+    return h.hexdigest()
+
+
+def _telemetry_inc(key: str, value: int = 1) -> None:
+    with _generation_lock:
+        _generation_telemetry[key] = int(_generation_telemetry.get(key, 0) or 0) + int(value)
+
+
+def get_generation_telemetry() -> dict:
+    with _generation_lock:
+        out = dict(_generation_telemetry)
+        out["template_cache_entries"] = int(len(_template_device_cache))
+        out["rng_pool_entries"] = int(len(_rng_state_pool))
+        out["template_cache_limit"] = int(_gpu_cache_limit())
+        out["rng_pool_limit"] = int(_rng_pool_limit())
+    return out
+
+
+def reset_generation_telemetry() -> None:
+    with _generation_lock:
+        for key in list(_generation_telemetry.keys()):
+            _generation_telemetry[key] = 0
+
+
+def clear_generation_caches() -> None:
+    with _generation_lock:
+        _template_device_cache.clear()
+        _rng_state_pool.clear()
+
+
+def _acquire_template_gpu(host_array: np.ndarray, packet_size: int):
+    dev = _active_device_id()
+    digest = _template_digest(host_array)
+    key = (int(dev), str(digest), int(packet_size))
+    limit = _gpu_cache_limit()
+
+    if limit > 0:
+        with _generation_lock:
+            cached = _template_device_cache.get(key)
+            if cached is not None:
+                _template_device_cache.move_to_end(key, last=True)
+                _generation_telemetry["gpu_template_cache_hit_count"] += 1
+                return cached
+            _generation_telemetry["gpu_template_cache_miss_count"] += 1
+    else:
+        _telemetry_inc("gpu_template_cache_miss_count", 1)
+
+    template_gpu = cp.array(host_array)
+    _telemetry_inc("gpu_template_h2d_copy_count", 1)
+    _telemetry_inc("gpu_template_h2d_copy_bytes", int(host_array.nbytes))
+
+    if limit > 0:
+        with _generation_lock:
+            _template_device_cache[key] = template_gpu
+            while len(_template_device_cache) > limit:
+                _template_device_cache.popitem(last=False)
+    return template_gpu
+
+
+def _acquire_rng_states(count: int, stream=None):
+    count = max(1, int(count))
+    dev = _active_device_id()
+    skey = _stream_cache_key(stream)
+    key = (int(dev), int(count), str(skey))
+    limit = _rng_pool_limit()
+
+    if limit > 0:
+        with _generation_lock:
+            cached = _rng_state_pool.get(key)
+            if cached is not None:
+                _rng_state_pool.move_to_end(key, last=True)
+                _generation_telemetry["gpu_rng_state_reuse_count"] += 1
+                return cached
+
+    rng_states = create_xoroshiro128p_states(count, seed=random.randint(0, 0xFFFFFFFF))
+    _telemetry_inc("gpu_rng_state_alloc_count", 1)
+
+    if limit > 0:
+        with _generation_lock:
+            _rng_state_pool[key] = rng_states
+            while len(_rng_state_pool) > limit:
+                _rng_state_pool.popitem(last=False)
+    return rng_states
 
 @cuda.jit(device=True)
 def calculate_checksum(buffer, offset, length):
@@ -1747,14 +1891,13 @@ def generate_packets_from_template(template_bytes, count, real_src_ip="192.168.1
     
     packet_size = len(template_bytes)
     template_host = np.frombuffer(template_bytes, dtype=np.uint8)
-    template_gpu = cp.array(template_host)
+    template_gpu = _acquire_template_gpu(template_host, packet_size)
     packets_gpu = cp.zeros((count * packet_size), dtype=cp.uint8)
     
     real_src_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(real_src_ip.split('.'))]))
     
-    # P2 FIX #16: Initialize RNG states
-    from numba.cuda.random import create_xoroshiro128p_states
-    rng_states = create_xoroshiro128p_states(count, seed=random.randint(0, 0xFFFFFFFF))
+    # Reuse RNG state buffers by (device, count, stream) to reduce alloc churn.
+    rng_states = _acquire_rng_states(count, stream=stream)
     
     global _WARNED_TEMPLATE_CONST_FALLBACK
     use_constant = 0
@@ -1822,12 +1965,10 @@ def generate_packets_from_template_pool(templates_bytes_list, count, target_ip, 
     # Flatten templates into a single buffer
     flat_templates = b"".join(templates_bytes_list)
     flat_templates_host = np.frombuffer(flat_templates, dtype=np.uint8)
-    templates_gpu = cp.array(flat_templates_host)
+    templates_gpu = _acquire_template_gpu(flat_templates_host, packet_size)
     packets_gpu = cp.zeros((count * packet_size), dtype=cp.uint8)
     
-    # P2 FIX #16: Initialize RNG states
-    from numba.cuda.random import create_xoroshiro128p_states
-    rng_states = create_xoroshiro128p_states(count, seed=random.randint(0, 0xFFFFFFFF))
+    rng_states = _acquire_rng_states(count, stream=stream)
     
     global _WARNED_POOL_CONST_FALLBACK
     use_constant = 0
@@ -1994,13 +2135,13 @@ def generate_stateful_packets(templates_bytes_list, count, target_ip, spoof_ip=T
     # Upload templates
     flat_templates = b"".join(templates_bytes_list)
     flat_templates_host = np.frombuffer(flat_templates, dtype=np.uint8)
-    templates_gpu = cp.array(flat_templates_host)
+    templates_gpu = _acquire_template_gpu(flat_templates_host, packet_size)
     
     # Allocate output buffer
     packets_gpu = cp.zeros((count * packet_size), dtype=cp.uint8)
     
-    # Prepare RNG
-    rng_states = create_xoroshiro128p_states(count, seed=random.randint(1, 1000000))
+    # Prepare RNG with pooled/reusable states.
+    rng_states = _acquire_rng_states(count, stream=stream)
     
     # Parse IPs
     target_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(target_ip.split('.'))]))
@@ -2077,6 +2218,20 @@ def benchmark_template_generation_paths(template_bytes, count=200000, iterations
         cp_stream = None
     stream = _normalize_numba_stream(cp_stream)
 
+    def _telemetry_delta(before: dict, after: dict) -> dict:
+        keys = [
+            "gpu_template_h2d_copy_count",
+            "gpu_template_h2d_copy_bytes",
+            "gpu_rng_state_alloc_count",
+            "gpu_rng_state_reuse_count",
+            "gpu_template_cache_hit_count",
+            "gpu_template_cache_miss_count",
+        ]
+        out = {}
+        for k in keys:
+            out[k] = max(0, int(after.get(k, 0) or 0) - int(before.get(k, 0) or 0))
+        return out
+
     def _run(force_global):
         # Warm-up for JIT + first-launch effects.
         generate_packets_from_template(
@@ -2091,6 +2246,7 @@ def benchmark_template_generation_paths(template_bytes, count=200000, iterations
             force_global_fallback=force_global,
         )
         _synchronize_numba_stream(stream)
+        telemetry_before = get_generation_telemetry()
 
         total = 0.0
         for _ in range(iterations):
@@ -2108,15 +2264,26 @@ def benchmark_template_generation_paths(template_bytes, count=200000, iterations
             )
             _synchronize_numba_stream(stream)
             total += (time.perf_counter() - start)
+        telemetry_after = get_generation_telemetry()
+        telemetry_delta = _telemetry_delta(telemetry_before, telemetry_after)
 
         avg_sec = total / iterations
         return {
             "avg_ms": avg_sec * 1000.0,
             "pps": (count / avg_sec) if avg_sec > 0 else 0.0,
+            "cache_hit": int(telemetry_delta.get("gpu_template_cache_hit_count", 0) or 0),
+            "cache_miss": int(telemetry_delta.get("gpu_template_cache_miss_count", 0) or 0),
+            "h2d_copy_count": int(telemetry_delta.get("gpu_template_h2d_copy_count", 0) or 0),
+            "h2d_copy_bytes": int(telemetry_delta.get("gpu_template_h2d_copy_bytes", 0) or 0),
+            "rng_alloc": int(telemetry_delta.get("gpu_rng_state_alloc_count", 0) or 0),
+            "rng_reuse": int(telemetry_delta.get("gpu_rng_state_reuse_count", 0) or 0),
         }
 
+    telemetry_before_all = get_generation_telemetry()
     auto_result = _run(force_global=False)
     global_result = _run(force_global=True)
+    telemetry_after_all = get_generation_telemetry()
+    telemetry_all = _telemetry_delta(telemetry_before_all, telemetry_after_all)
 
     return {
         "count": count,
@@ -2128,6 +2295,7 @@ def benchmark_template_generation_paths(template_bytes, count=200000, iterations
         # New explicit keys.
         "auto_path": auto_result,
         "forced_global_fallback": global_result,
+        "generation_telemetry": telemetry_all,
     }
 
 # ============================================================================

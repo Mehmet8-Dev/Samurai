@@ -47,6 +47,23 @@ def _empty_stats() -> dict:
         "buffer_copy_bytes": 0,
         "eagain_retry_count": 0,
         "partial_send_retry_count": 0,
+        "txring_flush_call_count": 0,
+        "txring_flush_error_count": 0,
+        "txring_flush_eagain_count": 0,
+        "txring_tp_packets": 0,
+        "txring_tp_drops": 0,
+        "txring_tp_freeze_q_cnt": 0,
+        "host_tx_packets_delta": 0,
+        "host_tx_dropped_delta": 0,
+        "host_tx_errors_delta": 0,
+        "softnet_dropped_delta": 0,
+        "softnet_time_squeeze_delta": 0,
+        "wire_loss_est_packets": 0,
+        "wire_loss_est_pct": 0.0,
+        "gpu_template_h2d_copy_count": 0,
+        "gpu_template_h2d_copy_bytes": 0,
+        "gpu_rng_state_alloc_count": 0,
+        "gpu_rng_state_reuse_count": 0,
     }
 
 
@@ -61,6 +78,25 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["buffer_copy_bytes"] = int(acc.get("buffer_copy_bytes", 0)) + int(item.get("buffer_copy_bytes", 0) or 0)
     acc["eagain_retry_count"] = int(acc.get("eagain_retry_count", 0)) + int(item.get("eagain_retry_count", 0) or 0)
     acc["partial_send_retry_count"] = int(acc.get("partial_send_retry_count", 0)) + int(item.get("partial_send_retry_count", 0) or 0)
+    acc["txring_flush_call_count"] = int(acc.get("txring_flush_call_count", 0)) + int(item.get("txring_flush_call_count", 0) or 0)
+    acc["txring_flush_error_count"] = int(acc.get("txring_flush_error_count", 0)) + int(item.get("txring_flush_error_count", 0) or 0)
+    acc["txring_flush_eagain_count"] = int(acc.get("txring_flush_eagain_count", 0)) + int(item.get("txring_flush_eagain_count", 0) or 0)
+    acc["txring_tp_packets"] = int(acc.get("txring_tp_packets", 0)) + int(item.get("txring_tp_packets", 0) or 0)
+    acc["txring_tp_drops"] = int(acc.get("txring_tp_drops", 0)) + int(item.get("txring_tp_drops", 0) or 0)
+    acc["txring_tp_freeze_q_cnt"] = int(acc.get("txring_tp_freeze_q_cnt", 0)) + int(item.get("txring_tp_freeze_q_cnt", 0) or 0)
+    acc["host_tx_packets_delta"] = int(acc.get("host_tx_packets_delta", 0)) + int(item.get("host_tx_packets_delta", 0) or 0)
+    acc["host_tx_dropped_delta"] = int(acc.get("host_tx_dropped_delta", 0)) + int(item.get("host_tx_dropped_delta", 0) or 0)
+    acc["host_tx_errors_delta"] = int(acc.get("host_tx_errors_delta", 0)) + int(item.get("host_tx_errors_delta", 0) or 0)
+    acc["softnet_dropped_delta"] = int(acc.get("softnet_dropped_delta", 0)) + int(item.get("softnet_dropped_delta", 0) or 0)
+    acc["softnet_time_squeeze_delta"] = int(acc.get("softnet_time_squeeze_delta", 0)) + int(item.get("softnet_time_squeeze_delta", 0) or 0)
+    acc["wire_loss_est_packets"] = int(acc.get("wire_loss_est_packets", 0)) + int(item.get("wire_loss_est_packets", 0) or 0)
+    acc["gpu_template_h2d_copy_count"] = int(acc.get("gpu_template_h2d_copy_count", 0)) + int(item.get("gpu_template_h2d_copy_count", 0) or 0)
+    acc["gpu_template_h2d_copy_bytes"] = int(acc.get("gpu_template_h2d_copy_bytes", 0)) + int(item.get("gpu_template_h2d_copy_bytes", 0) or 0)
+    acc["gpu_rng_state_alloc_count"] = int(acc.get("gpu_rng_state_alloc_count", 0)) + int(item.get("gpu_rng_state_alloc_count", 0) or 0)
+    acc["gpu_rng_state_reuse_count"] = int(acc.get("gpu_rng_state_reuse_count", 0)) + int(item.get("gpu_rng_state_reuse_count", 0) or 0)
+    attempted = int(acc.get("attempted", 0) or 0)
+    wire_loss = int(acc.get("wire_loss_est_packets", 0) or 0)
+    acc["wire_loss_est_pct"] = float((100.0 * wire_loss) / max(1, attempted))
     return acc
 
 
@@ -1398,6 +1434,30 @@ async def worker_process(
                 int(worker_stats.get("errors", 0) or 0),
                 max(0, int(worker_stats.get("attempted", 0) or 0) - int(worker_stats.get("sent", 0) or 0)),
             )
+
+            # Pull GPU generation telemetry once per worker (if available).
+            if _gpu_packet_mod is not None and hasattr(_gpu_packet_mod, "get_generation_telemetry"):
+                try:
+                    gtel = _gpu_packet_mod.get_generation_telemetry() or {}
+                    worker_stats["gpu_template_h2d_copy_count"] = int(worker_stats.get("gpu_template_h2d_copy_count", 0) or 0) + int(gtel.get("gpu_template_h2d_copy_count", 0) or 0)
+                    worker_stats["gpu_template_h2d_copy_bytes"] = int(worker_stats.get("gpu_template_h2d_copy_bytes", 0) or 0) + int(gtel.get("gpu_template_h2d_copy_bytes", 0) or 0)
+                    worker_stats["gpu_rng_state_alloc_count"] = int(worker_stats.get("gpu_rng_state_alloc_count", 0) or 0) + int(gtel.get("gpu_rng_state_alloc_count", 0) or 0)
+                    worker_stats["gpu_rng_state_reuse_count"] = int(worker_stats.get("gpu_rng_state_reuse_count", 0) or 0) + int(gtel.get("gpu_rng_state_reuse_count", 0) or 0)
+                except Exception:
+                    pass
+
+            # Keep wire-loss estimate consistent even if sender path omitted pct.
+            _attempted = int(worker_stats.get("attempted", 0) or 0)
+            _tx_drop = int(worker_stats.get("txring_tp_drops", 0) or 0)
+            _host_drop = int(worker_stats.get("host_tx_dropped_delta", 0) or 0)
+            _wire_loss_est = max(
+                int(worker_stats.get("wire_loss_est_packets", 0) or 0),
+                _tx_drop,
+                _host_drop,
+                0,
+            )
+            worker_stats["wire_loss_est_packets"] = int(_wire_loss_est)
+            worker_stats["wire_loss_est_pct"] = float((100.0 * _wire_loss_est) / max(1, _attempted))
         except Exception:
             pass
 
@@ -1430,6 +1490,23 @@ async def worker_process(
                 _buffer_copy_bytes = int(worker_stats.get("buffer_copy_bytes", 0) or 0)
                 _eagain_retry_count = int(worker_stats.get("eagain_retry_count", 0) or 0)
                 _partial_send_retry_count = int(worker_stats.get("partial_send_retry_count", 0) or 0)
+                _txring_flush_call_count = int(worker_stats.get("txring_flush_call_count", 0) or 0)
+                _txring_flush_error_count = int(worker_stats.get("txring_flush_error_count", 0) or 0)
+                _txring_flush_eagain_count = int(worker_stats.get("txring_flush_eagain_count", 0) or 0)
+                _txring_tp_packets = int(worker_stats.get("txring_tp_packets", 0) or 0)
+                _txring_tp_drops = int(worker_stats.get("txring_tp_drops", 0) or 0)
+                _txring_tp_freeze_q_cnt = int(worker_stats.get("txring_tp_freeze_q_cnt", 0) or 0)
+                _host_tx_packets_delta = int(worker_stats.get("host_tx_packets_delta", 0) or 0)
+                _host_tx_dropped_delta = int(worker_stats.get("host_tx_dropped_delta", 0) or 0)
+                _host_tx_errors_delta = int(worker_stats.get("host_tx_errors_delta", 0) or 0)
+                _softnet_dropped_delta = int(worker_stats.get("softnet_dropped_delta", 0) or 0)
+                _softnet_time_squeeze_delta = int(worker_stats.get("softnet_time_squeeze_delta", 0) or 0)
+                _wire_loss_est_packets = int(worker_stats.get("wire_loss_est_packets", 0) or 0)
+                _wire_loss_est_pct = float(worker_stats.get("wire_loss_est_pct", 0.0) or 0.0)
+                _gpu_template_h2d_copy_count = int(worker_stats.get("gpu_template_h2d_copy_count", 0) or 0)
+                _gpu_template_h2d_copy_bytes = int(worker_stats.get("gpu_template_h2d_copy_bytes", 0) or 0)
+                _gpu_rng_state_alloc_count = int(worker_stats.get("gpu_rng_state_alloc_count", 0) or 0)
+                _gpu_rng_state_reuse_count = int(worker_stats.get("gpu_rng_state_reuse_count", 0) or 0)
 
                 # Backlog peak from resource stats
                 _backlog_peak = 0
@@ -1460,6 +1537,23 @@ async def worker_process(
                         "buffer_copy_bytes": _buffer_copy_bytes,
                         "eagain_retry_count": _eagain_retry_count,
                         "partial_send_retry_count": _partial_send_retry_count,
+                        "txring_flush_call_count": _txring_flush_call_count,
+                        "txring_flush_error_count": _txring_flush_error_count,
+                        "txring_flush_eagain_count": _txring_flush_eagain_count,
+                        "txring_tp_packets": _txring_tp_packets,
+                        "txring_tp_drops": _txring_tp_drops,
+                        "txring_tp_freeze_q_cnt": _txring_tp_freeze_q_cnt,
+                        "host_tx_packets_delta": _host_tx_packets_delta,
+                        "host_tx_dropped_delta": _host_tx_dropped_delta,
+                        "host_tx_errors_delta": _host_tx_errors_delta,
+                        "softnet_dropped_delta": _softnet_dropped_delta,
+                        "softnet_time_squeeze_delta": _softnet_time_squeeze_delta,
+                        "wire_loss_est_packets": _wire_loss_est_packets,
+                        "wire_loss_est_pct": _wire_loss_est_pct,
+                        "gpu_template_h2d_copy_count": _gpu_template_h2d_copy_count,
+                        "gpu_template_h2d_copy_bytes": _gpu_template_h2d_copy_bytes,
+                        "gpu_rng_state_alloc_count": _gpu_rng_state_alloc_count,
+                        "gpu_rng_state_reuse_count": _gpu_rng_state_reuse_count,
                         "queue_backlog_peak": _backlog_peak,
                     }
                 )

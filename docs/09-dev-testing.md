@@ -58,7 +58,7 @@ pytest tests/test_benchmark_ci.py -q -rs
 Full benchmark:
 
 ```bash
-SAMURAI_TEST_PROFILE=full pytest tests/test_benchmark_full.py tests/test_pacing_root.py -q -rs
+SAMURAI_TEST_PROFILE=full pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
 ```
 
 Benchmark environment degiskenleri:
@@ -66,6 +66,12 @@ Benchmark environment degiskenleri:
 - `SAMURAI_BENCH_REPORT_OUT`
 - `SAMURAI_BENCH_BASELINE`
 - `SAMURAI_BENCH_UPDATE_BASELINE`
+- `SAMURAI_LOSS_TELEMETRY` (`auto|0|1`, default: `auto`)
+- `SAMURAI_LOSS_IFACE` (opsiyonel iface override)
+- `SAMURAI_LOSS_FAIL_PCT` (default: `5`)
+- `SAMURAI_LOSS_REPORT_OUT` (opsiyonel loss JSON output)
+- `SAMURAI_GPU_CACHE_MAX_ENTRIES` (default: `8`)
+- `SAMURAI_GPU_RNG_POOL_MAX_ENTRIES` (default: `8`)
 
 Ornek:
 
@@ -76,6 +82,20 @@ pytest tests/test_benchmark_ci.py -q -rs
 ```
 
 `SAMURAI_BENCH_UPDATE_BASELINE=1` verildiginde mevcut benchmark raporu baseline dosyasina yazilir.
+
+Full + loss telemetry tek komut:
+
+```bash
+sudo SAMURAI_TEST_PROFILE=full \
+SAMURAI_LOSS_TELEMETRY=1 \
+SAMURAI_LOSS_FAIL_PCT=5 \
+SAMURAI_BENCH_REPORT_OUT=artifacts/benchmark_summary_full.json \
+SAMURAI_LOSS_REPORT_OUT=artifacts/loss_telemetry_full.json \
+./ven311/bin/python -m pytest -q \
+tests/test_benchmark_full.py \
+tests/test_pacing_root.py \
+tests/test_loss_telemetry_full.py -rs
+```
 
 ## CI Is Akislari
 

@@ -29,6 +29,8 @@ jobs:
       SAMURAI_RFC_REPORT_OUT: "${{ github.workspace }}/artifacts"
       SAMURAI_BENCH_BASELINE: "${{ github.workspace }}/artifacts/benchmark_baseline.json"
       SAMURAI_BENCH_UPDATE_BASELINE: "${{ inputs.update_baseline }}"
+      SAMURAI_LOSS_TELEMETRY: "1"
+      SAMURAI_LOSS_FAIL_PCT: "5"
 
     steps:
       - name: Checkout
@@ -73,11 +75,17 @@ jobs:
           if [ "${{ inputs.run_root }}" = "true" ]; then
             sudo -E env \
               SAMURAI_TEST_PROFILE=full \
+              SAMURAI_LOSS_TELEMETRY=1 \
+              SAMURAI_LOSS_FAIL_PCT=5 \
               SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_full.json" \
-              pytest tests/test_benchmark_full.py tests/test_pacing_root.py -q -rs
+              SAMURAI_LOSS_REPORT_OUT="${{ github.workspace }}/artifacts/loss_telemetry_full.json" \
+              pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
           else
+            SAMURAI_LOSS_TELEMETRY=1 \
+            SAMURAI_LOSS_FAIL_PCT=5 \
             SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_full.json" \
-            pytest tests/test_benchmark_full.py tests/test_pacing_root.py -q -rs
+            SAMURAI_LOSS_REPORT_OUT="${{ github.workspace }}/artifacts/loss_telemetry_full.json" \
+            pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
           fi
 
       - name: Upload full benchmark artifacts

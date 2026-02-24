@@ -507,6 +507,22 @@ def build_live_attack_report(
     buffer_copy_bytes_total = 0
     eagain_retry_count_total = 0
     partial_send_retry_count_total = 0
+    txring_flush_call_count_total = 0
+    txring_flush_error_count_total = 0
+    txring_flush_eagain_count_total = 0
+    txring_tp_packets_total = 0
+    txring_tp_drops_total = 0
+    txring_tp_freeze_q_cnt_total = 0
+    host_tx_packets_delta_total = 0
+    host_tx_dropped_delta_total = 0
+    host_tx_errors_delta_total = 0
+    softnet_dropped_delta_total = 0
+    softnet_time_squeeze_delta_total = 0
+    wire_loss_est_packets_total = 0
+    gpu_template_h2d_copy_count_total = 0
+    gpu_template_h2d_copy_bytes_total = 0
+    gpu_rng_state_alloc_count_total = 0
+    gpu_rng_state_reuse_count_total = 0
     backlog_peak_max = 0
     sender_paths_used: Dict[str, int] = {}
     by_vector: Dict[str, Dict[str, int]] = {}
@@ -566,6 +582,54 @@ def build_live_attack_report(
         partial_send_retry_count_total += int(
             ev.get("partial_send_retry_count", st.get("partial_send_retry_count", 0)) or 0
         )
+        txring_flush_call_count_total += int(
+            ev.get("txring_flush_call_count", st.get("txring_flush_call_count", 0)) or 0
+        )
+        txring_flush_error_count_total += int(
+            ev.get("txring_flush_error_count", st.get("txring_flush_error_count", 0)) or 0
+        )
+        txring_flush_eagain_count_total += int(
+            ev.get("txring_flush_eagain_count", st.get("txring_flush_eagain_count", 0)) or 0
+        )
+        txring_tp_packets_total += int(
+            ev.get("txring_tp_packets", st.get("txring_tp_packets", 0)) or 0
+        )
+        txring_tp_drops_total += int(
+            ev.get("txring_tp_drops", st.get("txring_tp_drops", 0)) or 0
+        )
+        txring_tp_freeze_q_cnt_total += int(
+            ev.get("txring_tp_freeze_q_cnt", st.get("txring_tp_freeze_q_cnt", 0)) or 0
+        )
+        host_tx_packets_delta_total += int(
+            ev.get("host_tx_packets_delta", st.get("host_tx_packets_delta", 0)) or 0
+        )
+        host_tx_dropped_delta_total += int(
+            ev.get("host_tx_dropped_delta", st.get("host_tx_dropped_delta", 0)) or 0
+        )
+        host_tx_errors_delta_total += int(
+            ev.get("host_tx_errors_delta", st.get("host_tx_errors_delta", 0)) or 0
+        )
+        softnet_dropped_delta_total += int(
+            ev.get("softnet_dropped_delta", st.get("softnet_dropped_delta", 0)) or 0
+        )
+        softnet_time_squeeze_delta_total += int(
+            ev.get("softnet_time_squeeze_delta", st.get("softnet_time_squeeze_delta", 0)) or 0
+        )
+        wire_loss_est_packets_total += int(
+            ev.get("wire_loss_est_packets", st.get("wire_loss_est_packets", 0)) or 0
+        )
+        gpu_template_h2d_copy_count_total += int(
+            ev.get("gpu_template_h2d_copy_count", st.get("gpu_template_h2d_copy_count", 0)) or 0
+        )
+        gpu_template_h2d_copy_bytes_total += int(
+            ev.get("gpu_template_h2d_copy_bytes", st.get("gpu_template_h2d_copy_bytes", 0)) or 0
+        )
+        gpu_rng_state_alloc_count_total += int(
+            ev.get("gpu_rng_state_alloc_count", st.get("gpu_rng_state_alloc_count", 0)) or 0
+        )
+        gpu_rng_state_reuse_count_total += int(
+            ev.get("gpu_rng_state_reuse_count", st.get("gpu_rng_state_reuse_count", 0)) or 0
+        )
         _bp = int(ev.get("queue_backlog_peak", 0) or 0)
         if _bp > backlog_peak_max:
             backlog_peak_max = _bp
@@ -588,6 +652,17 @@ def build_live_attack_report(
     effective_pps = (float(sent_total) / float(duration_s)) if duration_s > 0 else None
     throughput_bps_est = (float(bytes_sent_est_total) * 8.0 / float(duration_s)) if duration_s > 0 else None
     send_success_ratio = (float(sent_total) / float(attempted_total) * 100.0) if attempted_total > 0 else 0.0
+    wire_loss_est_pct = (float(wire_loss_est_packets_total) * 100.0 / float(max(1, attempted_total)))
+    try:
+        loss_fail_pct = float(os.environ.get("SAMURAI_LOSS_FAIL_PCT", "5") or 5.0)
+    except Exception:
+        loss_fail_pct = 5.0
+    if wire_loss_est_pct > loss_fail_pct:
+        wire_loss_status = "fail"
+    elif wire_loss_est_pct > 0.0:
+        wire_loss_status = "warn"
+    else:
+        wire_loss_status = "ok"
 
     report = RunReport(
         run_id=run_id,
@@ -619,6 +694,25 @@ def build_live_attack_report(
             "buffer_copy_bytes": int(buffer_copy_bytes_total),
             "eagain_retry_count": int(eagain_retry_count_total),
             "partial_send_retry_count": int(partial_send_retry_count_total),
+            "txring_flush_call_count": int(txring_flush_call_count_total),
+            "txring_flush_error_count": int(txring_flush_error_count_total),
+            "txring_flush_eagain_count": int(txring_flush_eagain_count_total),
+            "txring_tp_packets": int(txring_tp_packets_total),
+            "txring_tp_drops": int(txring_tp_drops_total),
+            "txring_tp_freeze_q_cnt": int(txring_tp_freeze_q_cnt_total),
+            "host_tx_packets_delta": int(host_tx_packets_delta_total),
+            "host_tx_dropped_delta": int(host_tx_dropped_delta_total),
+            "host_tx_errors_delta": int(host_tx_errors_delta_total),
+            "softnet_dropped_delta": int(softnet_dropped_delta_total),
+            "softnet_time_squeeze_delta": int(softnet_time_squeeze_delta_total),
+            "wire_loss_est_packets": int(wire_loss_est_packets_total),
+            "wire_loss_est_pct": round(float(wire_loss_est_pct), 4),
+            "wire_loss_fail_pct": float(loss_fail_pct),
+            "wire_loss_status": wire_loss_status,
+            "gpu_template_h2d_copy_count": int(gpu_template_h2d_copy_count_total),
+            "gpu_template_h2d_copy_bytes": int(gpu_template_h2d_copy_bytes_total),
+            "gpu_rng_state_alloc_count": int(gpu_rng_state_alloc_count_total),
+            "gpu_rng_state_reuse_count": int(gpu_rng_state_reuse_count_total),
             "queue_backlog_peak": int(backlog_peak_max),
             "by_vector": by_vector,
             "by_backend": by_backend,
