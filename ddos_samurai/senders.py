@@ -64,6 +64,8 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "txring_tp_packets": 0,
         "txring_tp_drops": 0,
         "txring_tp_freeze_q_cnt": 0,
+        "txring_packet_version": 0,
+        "txring_packet_version_name": "TPACKET_UNKNOWN",
         "host_tx_packets_delta": 0,
         "host_tx_dropped_delta": 0,
         "host_tx_errors_delta": 0,
@@ -284,6 +286,19 @@ def _merge_stats(*items):
         acc["txring_tp_packets"] += int(it.get("txring_tp_packets", 0) or 0)
         acc["txring_tp_drops"] += int(it.get("txring_tp_drops", 0) or 0)
         acc["txring_tp_freeze_q_cnt"] += int(it.get("txring_tp_freeze_q_cnt", 0) or 0)
+        item_txring_ver = int(it.get("txring_packet_version", 0) or 0)
+        item_txring_ver_name = str(it.get("txring_packet_version_name", "") or "").strip()
+        if item_txring_ver > 0:
+            current_ver = int(acc.get("txring_packet_version", 0) or 0)
+            current_ver_name = str(acc.get("txring_packet_version_name", "") or "").strip()
+            if current_ver <= 0:
+                acc["txring_packet_version"] = item_txring_ver
+                acc["txring_packet_version_name"] = item_txring_ver_name or "TPACKET_UNKNOWN"
+            elif current_ver != item_txring_ver:
+                acc["txring_packet_version"] = 0
+                acc["txring_packet_version_name"] = "MIXED"
+            elif not current_ver_name:
+                acc["txring_packet_version_name"] = item_txring_ver_name or "TPACKET_UNKNOWN"
         acc["host_tx_packets_delta"] += int(it.get("host_tx_packets_delta", 0) or 0)
         acc["host_tx_dropped_delta"] += int(it.get("host_tx_dropped_delta", 0) or 0)
         acc["host_tx_errors_delta"] += int(it.get("host_tx_errors_delta", 0) or 0)
@@ -819,6 +834,8 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
     txring_tp_packets = 0
     txring_tp_drops = 0
     txring_tp_freeze_q_cnt = 0
+    txring_packet_version = 0
+    txring_packet_version_name = "TPACKET_UNKNOWN"
 
     loss_iface_hint = _resolve_loss_iface(None)
     loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
@@ -851,6 +868,10 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                                 txring_tp_packets += int(tx_result.get("txring_tp_packets", 0) or 0)
                                 txring_tp_drops += int(tx_result.get("txring_tp_drops", 0) or 0)
                                 txring_tp_freeze_q_cnt += int(tx_result.get("txring_tp_freeze_q_cnt", 0) or 0)
+                                txring_packet_version = int(tx_result.get("txring_packet_version", 0) or 0)
+                                txring_packet_version_name = str(
+                                    tx_result.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
+                                )
                             else:
                                 sent = int(tx_result or 0)
                         else:
@@ -884,6 +905,8 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                             txring_tp_packets=txring_tp_packets,
                             txring_tp_drops=txring_tp_drops,
                             txring_tp_freeze_q_cnt=txring_tp_freeze_q_cnt,
+                            txring_packet_version=txring_packet_version,
+                            txring_packet_version_name=txring_packet_version_name,
                         )
                         return _attach_loss_telemetry(
                             out, loss_before_snapshot, preferred_iface=loss_iface_hint
@@ -1059,6 +1082,8 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
         txring_tp_packets=txring_tp_packets,
         txring_tp_drops=txring_tp_drops,
         txring_tp_freeze_q_cnt=txring_tp_freeze_q_cnt,
+        txring_packet_version=txring_packet_version,
+        txring_packet_version_name=txring_packet_version_name,
     )
     return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
 
@@ -1180,6 +1205,10 @@ async def paced_raw_socket_sender(
                     out["txring_tp_packets"] = int(stats.get("txring_tp_packets", 0) or 0)
                     out["txring_tp_drops"] = int(stats.get("txring_tp_drops", 0) or 0)
                     out["txring_tp_freeze_q_cnt"] = int(stats.get("txring_tp_freeze_q_cnt", 0) or 0)
+                    out["txring_packet_version"] = int(stats.get("txring_packet_version", 0) or 0)
+                    out["txring_packet_version_name"] = str(
+                        stats.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
+                    )
                 return _attach_loss_telemetry(
                     out, loss_before_snapshot, preferred_iface=loss_iface_hint
                 )
@@ -1234,6 +1263,10 @@ async def paced_raw_socket_sender(
             out["txring_tp_packets"] = int(stats.get("txring_tp_packets", 0) or 0)
             out["txring_tp_drops"] = int(stats.get("txring_tp_drops", 0) or 0)
             out["txring_tp_freeze_q_cnt"] = int(stats.get("txring_tp_freeze_q_cnt", 0) or 0)
+            out["txring_packet_version"] = int(stats.get("txring_packet_version", 0) or 0)
+            out["txring_packet_version_name"] = str(
+                stats.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
+            )
         return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
     except PermissionError:
         log_error("[Pacing] Raw socket requires root. Falling back to unpaced.")

@@ -1098,6 +1098,8 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
     Py_buffer mac_view;
     txring_send_metrics_t metrics;
     int errors = 0;
+    int packet_version = 0;
+    const char* packet_version_str = "TPACKET_UNKNOWN";
 
     (void)self;
     if (!PyArg_ParseTuple(args, "sy*iiy*", &iface, &view, &packet_size, &count, &mac_view)) {
@@ -1123,9 +1125,11 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
 
     errors = metrics.attempted - metrics.sent;
     if (errors < 0) errors = 0;
+    packet_version = tx_ring_ctx.packet_version;
+    packet_version_str = packet_version_name(packet_version);
 
     return Py_BuildValue(
-        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K}",
+        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:i,s:s}",
         "attempted", metrics.attempted,
         "sent", metrics.sent,
         "errors", errors,
@@ -1134,7 +1138,9 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
         "txring_flush_eagain_count", metrics.txring_flush_eagain_count,
         "txring_tp_packets", metrics.txring_tp_packets,
         "txring_tp_drops", metrics.txring_tp_drops,
-        "txring_tp_freeze_q_cnt", metrics.txring_tp_freeze_q_cnt
+        "txring_tp_freeze_q_cnt", metrics.txring_tp_freeze_q_cnt,
+        "txring_packet_version", packet_version,
+        "txring_packet_version_name", packet_version_str
     );
 }
 

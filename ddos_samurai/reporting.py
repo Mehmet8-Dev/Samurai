@@ -513,6 +513,8 @@ def build_live_attack_report(
     txring_tp_packets_total = 0
     txring_tp_drops_total = 0
     txring_tp_freeze_q_cnt_total = 0
+    txring_packet_version = 0
+    txring_packet_version_name = "TPACKET_UNKNOWN"
     host_tx_packets_delta_total = 0
     host_tx_dropped_delta_total = 0
     host_tx_errors_delta_total = 0
@@ -602,6 +604,19 @@ def build_live_attack_report(
         txring_tp_freeze_q_cnt_total += int(
             ev.get("txring_tp_freeze_q_cnt", st.get("txring_tp_freeze_q_cnt", 0)) or 0
         )
+        _tp_ver = int(ev.get("txring_packet_version", st.get("txring_packet_version", 0)) or 0)
+        _tp_ver_name = str(
+            ev.get("txring_packet_version_name", st.get("txring_packet_version_name", "")) or ""
+        ).strip()
+        if _tp_ver > 0:
+            if txring_packet_version <= 0:
+                txring_packet_version = _tp_ver
+                txring_packet_version_name = _tp_ver_name or "TPACKET_UNKNOWN"
+            elif txring_packet_version != _tp_ver:
+                txring_packet_version = 0
+                txring_packet_version_name = "MIXED"
+            elif txring_packet_version_name in ("", "TPACKET_UNKNOWN"):
+                txring_packet_version_name = _tp_ver_name or "TPACKET_UNKNOWN"
         host_tx_packets_delta_total += int(
             ev.get("host_tx_packets_delta", st.get("host_tx_packets_delta", 0)) or 0
         )
@@ -726,6 +741,8 @@ def build_live_attack_report(
             "txring_tp_packets": int(txring_tp_packets_total),
             "txring_tp_drops": int(txring_tp_drops_total),
             "txring_tp_freeze_q_cnt": int(txring_tp_freeze_q_cnt_total),
+            "txring_packet_version": int(txring_packet_version),
+            "txring_packet_version_name": str(txring_packet_version_name),
             "host_tx_packets_delta": int(host_tx_packets_delta_total),
             "host_tx_dropped_delta": int(host_tx_dropped_delta_total),
             "host_tx_errors_delta": int(host_tx_errors_delta_total),

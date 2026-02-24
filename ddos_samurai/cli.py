@@ -1454,6 +1454,10 @@ def main(argv=None):
                     "txring_tp_packets": int(rr.results.get("txring_tp_packets", 0) or 0),
                     "txring_tp_drops": int(rr.results.get("txring_tp_drops", 0) or 0),
                     "txring_tp_freeze_q_cnt": int(rr.results.get("txring_tp_freeze_q_cnt", 0) or 0),
+                    "txring_packet_version": int(rr.results.get("txring_packet_version", 0) or 0),
+                    "txring_packet_version_name": str(
+                        rr.results.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
+                    ),
                     "txring_drop_ratio_pct": float(rr.results.get("txring_drop_ratio_pct", 0.0) or 0.0),
                     "host_tx_packets_delta": int(rr.results.get("host_tx_packets_delta", 0) or 0),
                     "host_tx_dropped_delta": int(rr.results.get("host_tx_dropped_delta", 0) or 0),

@@ -53,6 +53,8 @@ def _empty_stats() -> dict:
         "txring_tp_packets": 0,
         "txring_tp_drops": 0,
         "txring_tp_freeze_q_cnt": 0,
+        "txring_packet_version": 0,
+        "txring_packet_version_name": "TPACKET_UNKNOWN",
         "host_tx_packets_delta": 0,
         "host_tx_dropped_delta": 0,
         "host_tx_errors_delta": 0,
@@ -118,6 +120,19 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["txring_tp_packets"] = int(acc.get("txring_tp_packets", 0)) + int(item.get("txring_tp_packets", 0) or 0)
     acc["txring_tp_drops"] = int(acc.get("txring_tp_drops", 0)) + int(item.get("txring_tp_drops", 0) or 0)
     acc["txring_tp_freeze_q_cnt"] = int(acc.get("txring_tp_freeze_q_cnt", 0)) + int(item.get("txring_tp_freeze_q_cnt", 0) or 0)
+    item_txring_ver = int(item.get("txring_packet_version", 0) or 0)
+    item_txring_ver_name = str(item.get("txring_packet_version_name", "") or "").strip()
+    if item_txring_ver > 0:
+        current_ver = int(acc.get("txring_packet_version", 0) or 0)
+        current_ver_name = str(acc.get("txring_packet_version_name", "") or "").strip()
+        if current_ver <= 0:
+            acc["txring_packet_version"] = item_txring_ver
+            acc["txring_packet_version_name"] = item_txring_ver_name or "TPACKET_UNKNOWN"
+        elif current_ver != item_txring_ver:
+            acc["txring_packet_version"] = 0
+            acc["txring_packet_version_name"] = "MIXED"
+        elif not current_ver_name:
+            acc["txring_packet_version_name"] = item_txring_ver_name or "TPACKET_UNKNOWN"
     acc["host_tx_packets_delta"] = int(acc.get("host_tx_packets_delta", 0)) + int(item.get("host_tx_packets_delta", 0) or 0)
     acc["host_tx_dropped_delta"] = int(acc.get("host_tx_dropped_delta", 0)) + int(item.get("host_tx_dropped_delta", 0) or 0)
     acc["host_tx_errors_delta"] = int(acc.get("host_tx_errors_delta", 0)) + int(item.get("host_tx_errors_delta", 0) or 0)
@@ -1525,6 +1540,10 @@ async def worker_process(
                 _txring_tp_packets = int(worker_stats.get("txring_tp_packets", 0) or 0)
                 _txring_tp_drops = int(worker_stats.get("txring_tp_drops", 0) or 0)
                 _txring_tp_freeze_q_cnt = int(worker_stats.get("txring_tp_freeze_q_cnt", 0) or 0)
+                _txring_packet_version = int(worker_stats.get("txring_packet_version", 0) or 0)
+                _txring_packet_version_name = str(
+                    worker_stats.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
+                )
                 _host_tx_packets_delta = int(worker_stats.get("host_tx_packets_delta", 0) or 0)
                 _host_tx_dropped_delta = int(worker_stats.get("host_tx_dropped_delta", 0) or 0)
                 _host_tx_errors_delta = int(worker_stats.get("host_tx_errors_delta", 0) or 0)
@@ -1578,6 +1597,8 @@ async def worker_process(
                         "txring_tp_packets": _txring_tp_packets,
                         "txring_tp_drops": _txring_tp_drops,
                         "txring_tp_freeze_q_cnt": _txring_tp_freeze_q_cnt,
+                        "txring_packet_version": _txring_packet_version,
+                        "txring_packet_version_name": _txring_packet_version_name,
                         "host_tx_packets_delta": _host_tx_packets_delta,
                         "host_tx_dropped_delta": _host_tx_dropped_delta,
                         "host_tx_errors_delta": _host_tx_errors_delta,
