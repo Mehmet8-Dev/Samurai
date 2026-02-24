@@ -3,31 +3,48 @@ name: Full Bench (Manual)
 on:
   workflow_dispatch:
     inputs:
-      run_root:
-        description: "Run privileged benchmark tests with sudo"
+      runner_strategy:
+        description: "Runner strategy"
         required: true
-        default: false
+        default: "github-hosted"
+        type: choice
+        options:
+          - github-hosted
+          - self-hosted
+      use_sudo:
+        description: "Use sudo for privileged benchmark command"
+        required: true
+        default: true
         type: boolean
       update_baseline:
         description: "Update benchmark baseline artifact from current run"
         required: true
         default: false
         type: boolean
+      promote_baseline:
+        description: "Commit updated baseline back to repository branch"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
 
 concurrency:
   group: full-bench-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  full-bench:
-    name: Full RFC + Benchmark (Python 3.11)
+  full-bench-github:
+    if: ${{ inputs.runner_strategy == 'github-hosted' }}
+    name: Full RFC + Benchmark (GH hosted, Python 3.11)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       PYTHONUNBUFFERED: "1"
       SAMURAI_TEST_PROFILE: "full"
       SAMURAI_RFC_REPORT_OUT: "${{ github.workspace }}/artifacts"
-      SAMURAI_BENCH_BASELINE: "${{ github.workspace }}/artifacts/benchmark_baseline.json"
+      SAMURAI_BENCH_BASELINE: "${{ github.workspace }}/benchmarks/benchmark_baseline_ci.json"
       SAMURAI_BENCH_UPDATE_BASELINE: "${{ inputs.update_baseline }}"
       SAMURAI_LOSS_TELEMETRY: "1"
       SAMURAI_LOSS_FAIL_PCT: "5"
@@ -65,14 +82,14 @@ jobs:
           mkdir -p artifacts
           pytest tests/test_rfc_compliance.py tests/test_rfc_negative.py -q -rs
 
-      - name: CI-safe Benchmark Summary
+      - name: CI-safe Benchmark Summary (with baseline gate)
         run: |
           SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_ci.json" \
           pytest tests/test_benchmark_ci.py -q -rs
 
       - name: Full Benchmark Summary
         run: |
-          if [ "${{ inputs.run_root }}" = "true" ]; then
+          if [ "${{ inputs.use_sudo }}" = "true" ]; then
             sudo -E env \
               SAMURAI_TEST_PROFILE=full \
               SAMURAI_LOSS_TELEMETRY=1 \
@@ -88,10 +105,140 @@ jobs:
             pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
           fi
 
+      - name: Export updated baseline candidate
+        if: ${{ inputs.update_baseline }}
+        run: |
+          cp benchmarks/benchmark_baseline_ci.json artifacts/benchmark_baseline_ci.updated.json
+
+      - name: Promote baseline to repository (GH hosted)
+        if: ${{ inputs.update_baseline && inputs.promote_baseline }}
+        run: |
+          cp artifacts/benchmark_baseline_ci.updated.json benchmarks/benchmark_baseline_ci.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/benchmark_baseline_ci.json
+          if git diff --cached --quiet; then
+            echo "No baseline changes to commit."
+            exit 0
+          fi
+          git commit -m "ci(benchmark): refresh ci baseline from GH hosted run"
+          git push
+
       - name: Upload full benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-benchmark-reports
+          name: full-benchmark-reports-github-hosted
+          path: artifacts/*.json
+          if-no-files-found: ignore
+
+  full-bench-self-hosted:
+    if: ${{ inputs.runner_strategy == 'self-hosted' }}
+    name: Full RFC + Benchmark (Self-hosted, Python 3.11)
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+    timeout-minutes: 60
+    env:
+      PYTHONUNBUFFERED: "1"
+      SAMURAI_TEST_PROFILE: "full"
+      SAMURAI_RFC_REPORT_OUT: "${{ github.workspace }}/artifacts"
+      SAMURAI_BENCH_BASELINE: "${{ github.workspace }}/benchmarks/benchmark_baseline_ci.json"
+      SAMURAI_BENCH_UPDATE_BASELINE: "${{ inputs.update_baseline }}"
+      SAMURAI_LOSS_TELEMETRY: "1"
+      SAMURAI_LOSS_FAIL_PCT: "5"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            setup.py
+            requirements.txt
+            ddos_samurai/requirements.txt
+
+      - name: Install system dependencies (best effort)
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            if [ "$(id -u)" -eq 0 ]; then
+              apt-get update
+              apt-get install -y --no-install-recommends libpcap-dev
+            elif command -v sudo >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends libpcap-dev
+            else
+              echo "apt-get present but sudo missing and not root; skipping libpcap install"
+            fi
+          else
+            echo "apt-get not present; skipping system dependency install"
+          fi
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -e .
+          python -m pip install pytest PyYAML requests aiohttp websockets aioquic "httpx[http2]" rich colorama psutil
+
+      - name: Build C extensions
+        run: python setup.py build_ext --inplace
+
+      - name: RFC Positive + Negative
+        run: |
+          mkdir -p artifacts
+          pytest tests/test_rfc_compliance.py tests/test_rfc_negative.py -q -rs
+
+      - name: CI-safe Benchmark Summary (with baseline gate)
+        run: |
+          SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_ci.json" \
+          pytest tests/test_benchmark_ci.py -q -rs
+
+      - name: Full Benchmark Summary
+        run: |
+          if [ "${{ inputs.use_sudo }}" = "true" ] && command -v sudo >/dev/null 2>&1; then
+            sudo -E env \
+              SAMURAI_TEST_PROFILE=full \
+              SAMURAI_LOSS_TELEMETRY=1 \
+              SAMURAI_LOSS_FAIL_PCT=5 \
+              SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_full.json" \
+              SAMURAI_LOSS_REPORT_OUT="${{ github.workspace }}/artifacts/loss_telemetry_full.json" \
+              pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
+          else
+            SAMURAI_LOSS_TELEMETRY=1 \
+            SAMURAI_LOSS_FAIL_PCT=5 \
+            SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_full.json" \
+            SAMURAI_LOSS_REPORT_OUT="${{ github.workspace }}/artifacts/loss_telemetry_full.json" \
+            pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
+          fi
+
+      - name: Export updated baseline candidate
+        if: ${{ inputs.update_baseline }}
+        run: |
+          cp benchmarks/benchmark_baseline_ci.json artifacts/benchmark_baseline_ci.updated.json
+
+      - name: Promote baseline to repository (self-hosted)
+        if: ${{ inputs.update_baseline && inputs.promote_baseline }}
+        run: |
+          cp artifacts/benchmark_baseline_ci.updated.json benchmarks/benchmark_baseline_ci.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/benchmark_baseline_ci.json
+          if git diff --cached --quiet; then
+            echo "No baseline changes to commit."
+            exit 0
+          fi
+          git commit -m "ci(benchmark): refresh ci baseline from self-hosted run"
+          git push
+
+      - name: Upload full benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-benchmark-reports-self-hosted
           path: artifacts/*.json
           if-no-files-found: ignore

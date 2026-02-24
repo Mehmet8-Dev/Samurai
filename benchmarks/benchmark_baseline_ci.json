@@ -1,0 +1,102 @@
+{
+  "baseline": {
+    "comparisons": {},
+    "loaded": false,
+    "path": "benchmarks/benchmark_baseline_ci.json"
+  },
+  "generated_utc": "2026-02-24T15:25:36+00:00",
+  "memory": {
+    "pool_buffer_len": 1280000,
+    "pool_peak_bytes": 2560347,
+    "pool_peak_over_buffer_ratio": 2.00027109375
+  },
+  "params": {
+    "n_flags": 200000,
+    "n_packets": 20000,
+    "pool_pkt_size": 64
+  },
+  "profile": "ci_safe",
+  "scenarios": {
+    "create_packet_tcp_pa": {
+      "cv_pct": 2.7897893527156254,
+      "mean_s": 0.2855884693326516,
+      "name": "create_packet_tcp_pa",
+      "p95_s": 0.29678092499852937,
+      "rate_per_s": 70030.83859350123,
+      "rounds": 3,
+      "samples_s": [
+        0.29678092499852937,
+        0.2788680059984472,
+        0.2811164770009782
+      ],
+      "stdev_s": 0.007967316710025842,
+      "units": 20000
+    },
+    "create_packet_tcp_syn": {
+      "cv_pct": 0.4590631810463467,
+      "mean_s": 0.22530823533331082,
+      "name": "create_packet_tcp_syn",
+      "p95_s": 0.2265613609997672,
+      "rate_per_s": 88767.28349681894,
+      "rounds": 3,
+      "samples_s": [
+        0.22533508200103824,
+        0.2265613609997672,
+        0.22402826299912704
+      ],
+      "stdev_s": 0.0010343071522804855,
+      "units": 20000
+    },
+    "create_packet_udp": {
+      "cv_pct": 3.1140870853012528,
+      "mean_s": 0.14348258266666866,
+      "name": "create_packet_udp",
+      "p95_s": 0.1496617539996805,
+      "rate_per_s": 139389.74074966973,
+      "rounds": 3,
+      "samples_s": [
+        0.14153764999900886,
+        0.13924834400131658,
+        0.1496617539996805
+      ],
+      "stdev_s": 0.004468172576479423,
+      "units": 20000
+    },
+    "generate_packet_pool": {
+      "cv_pct": 0.6450933849038553,
+      "mean_s": 0.4356683783335029,
+      "name": "generate_packet_pool",
+      "p95_s": 0.43964289399991685,
+      "rate_per_s": 45906.47610575504,
+      "rounds": 3,
+      "samples_s": [
+        0.43964289399991685,
+        0.43370378200052073,
+        0.43365845900007116
+      ],
+      "stdev_s": 0.0028104678887473284,
+      "units": 20000
+    },
+    "parse_tcp_flags": {
+      "cv_pct": 0.6911579544938967,
+      "mean_s": 0.19595925166686357,
+      "name": "parse_tcp_flags",
+      "p95_s": 0.1977314280011342,
+      "rate_per_s": 1020620.3498878727,
+      "rounds": 3,
+      "samples_s": [
+        0.1977314280011342,
+        0.19444380399909278,
+        0.19570252300036373
+      ],
+      "stdev_s": 0.0013543879554622415,
+      "units": 200000
+    }
+  },
+  "schema": "samurai.benchmark.summary.v1",
+  "thresholds": {
+    "max_cv_pct": 5.0,
+    "max_pool_peak_over_buf": 4.0,
+    "max_regression_pct": 10.0
+  }
+}

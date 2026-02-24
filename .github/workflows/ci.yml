@@ -18,6 +18,8 @@ jobs:
       PYTHONUNBUFFERED: "1"
       SAMURAI_TEST_PROFILE: "ci_safe"
       SAMURAI_RFC_REPORT_OUT: "${{ github.workspace }}/artifacts"
+      SAMURAI_BENCH_BASELINE: "${{ github.workspace }}/benchmarks/benchmark_baseline_ci.json"
+      SAMURAI_BENCH_UPDATE_BASELINE: "0"
       SAMURAI_BENCH_REPORT_OUT: "${{ github.workspace }}/artifacts/benchmark_summary.json"
 
     steps:
@@ -47,6 +49,9 @@ jobs:
 
       - name: Build C extensions (smoke)
         run: python setup.py build_ext --inplace
+
+      - name: Verify benchmark baseline exists
+        run: test -f benchmarks/benchmark_baseline_ci.json
 
       - name: Run backend test suite
         run: |

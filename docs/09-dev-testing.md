@@ -73,15 +73,29 @@ Benchmark environment degiskenleri:
 - `SAMURAI_GPU_CACHE_MAX_ENTRIES` (default: `8`)
 - `SAMURAI_GPU_RNG_POOL_MAX_ENTRIES` (default: `8`)
 
+Repo baseline dosyasi:
+
+- `benchmarks/benchmark_baseline_ci.json`
+
 Ornek:
 
 ```bash
-SAMURAI_BENCH_BASELINE=artifacts/benchmark_baseline.json \
+SAMURAI_BENCH_BASELINE=benchmarks/benchmark_baseline_ci.json \
 SAMURAI_BENCH_REPORT_OUT=artifacts/benchmark_summary.json \
 pytest tests/test_benchmark_ci.py -q -rs
 ```
 
 `SAMURAI_BENCH_UPDATE_BASELINE=1` verildiginde mevcut benchmark raporu baseline dosyasina yazilir.
+
+Baseline yenileme (lokal):
+
+```bash
+mkdir -p benchmarks artifacts
+SAMURAI_BENCH_BASELINE=benchmarks/benchmark_baseline_ci.json \
+SAMURAI_BENCH_UPDATE_BASELINE=1 \
+SAMURAI_BENCH_REPORT_OUT=artifacts/benchmark_summary_ci_local.json \
+pytest tests/test_benchmark_ci.py -q -rs
+```
 
 Full + loss telemetry tek komut:
 
@@ -99,8 +113,18 @@ tests/test_loss_telemetry_full.py -rs
 
 ## CI Is Akislari
 
-- `.github/workflows/ci.yml`: `ci_safe` profile
+- `.github/workflows/ci.yml`: `ci_safe` profile + relatif benchmark regresyon kapisi (`SAMURAI_BENCH_BASELINE=benchmarks/benchmark_baseline_ci.json`)
 - `.github/workflows/full-bench.yml`: manuel full RFC + benchmark kosusu
+- `runner_strategy=github-hosted|self-hosted`
+- `use_sudo=true|false`
+- `update_baseline=true` secilirse guncellenmis baseline `artifacts/benchmark_baseline_ci.updated.json` olarak artifact'e yuklenir
+- `promote_baseline=true` + `update_baseline=true` secilirse baseline dosyasi branch'e otomatik commit/push edilir
+
+Onerilen CI-uyumlu baseline yenileme:
+
+1. `full-bench` workflow'unu `runner_strategy=github-hosted`, `update_baseline=true`, `promote_baseline=true` ile calistir.
+2. Workflow commit'i branch'e push eder ve `benchmarks/benchmark_baseline_ci.json` GH runner metrikleriyle guncellenir.
+3. Sonraki `ci.yml` kosularinda relatif regresyon kapisi bu dosyaya gore calisir.
 
 ## Sandbox/CI Ortami Notu (Scapy PermissionError)
 
