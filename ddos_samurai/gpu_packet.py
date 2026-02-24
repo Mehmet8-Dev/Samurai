@@ -236,8 +236,7 @@ def _stream_cache_key(stream) -> str:
 
 
 def _template_digest(host_array: np.ndarray) -> str:
-    h = hashlib.blake2b(host_array.tobytes(order="C"), digest_size=16)
-    return h.hexdigest()
+    return str(hash(host_array.tobytes(order="C")))
 
 
 def _telemetry_inc(key: str, value: int = 1) -> None:
@@ -356,19 +355,28 @@ def calculate_checksum(buffer, offset, length):
 @cuda.jit(device=True)
 def read_uint16_be(buffer, offset):
     """Reads a 16-bit integer in Big Endian."""
+    if (offset & 0x1) == 0:
+        # Numba CUDA may widen view() results in some environments; force int.
+        val = int64(buffer.view(np.uint16)[offset >> 1]) & 0xFFFF
+        return ((val & 0xFF) << 8) | ((val >> 8) & 0xFF)
     return (buffer[offset] << 8) | buffer[offset + 1]
 
 @cuda.jit(device=True)
 def read_uint32_be(buffer, offset):
     """Reads a 32-bit integer in Big Endian."""
+    if (offset & 0x3) == 0:
+        # Numba CUDA may widen view() results in some environments; force int.
+        val = int64(buffer.view(np.uint32)[offset >> 2]) & 0xFFFFFFFF
+        return ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | ((val & 0xFF0000) >> 8) | ((val >> 24) & 0xFF)
     return (buffer[offset] << 24) | (buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3]
 
 @cuda.jit(device=True)
 def fold_ones_complement(sum32):
     """Fold a running checksum sum to 16 bits."""
-    while (sum32 >> 16) > 0:
-        sum32 = (sum32 & 0xFFFF) + (sum32 >> 16)
-    return sum32 & 0xFFFF
+    acc = int64(sum32) & 0xFFFFFFFF
+    while (acc >> 16) > 0:
+        acc = (acc & 0xFFFF) + (acc >> 16)
+    return acc & 0xFFFF
 
 @cuda.jit(device=True)
 def rfc1624_update_word(old_checksum, old_word, new_word):
@@ -376,15 +384,21 @@ def rfc1624_update_word(old_checksum, old_word, new_word):
     RFC 1624 incremental checksum update for a single 16-bit word:
     HC' = ~(~HC + ~m + m')
     """
-    sum32 = ((~old_checksum) & 0xFFFF) + ((~old_word) & 0xFFFF) + (new_word & 0xFFFF)
+    old_c = int64(old_checksum) & 0xFFFF
+    old_w = int64(old_word) & 0xFFFF
+    new_w = int64(new_word) & 0xFFFF
+    sum32 = (old_c ^ 0xFFFF) + (old_w ^ 0xFFFF) + new_w
     sum32 = fold_ones_complement(sum32)
-    return (~sum32) & 0xFFFF
+    return (sum32 ^ 0xFFFF) & 0xFFFF
 
 @cuda.jit(device=True)
 def rfc1624_update_dword(old_checksum, old_dword, new_dword):
     """RFC 1624 update for a 32-bit field (two 16-bit words)."""
-    csum = rfc1624_update_word(old_checksum, (old_dword >> 16) & 0xFFFF, (new_dword >> 16) & 0xFFFF)
-    csum = rfc1624_update_word(csum, old_dword & 0xFFFF, new_dword & 0xFFFF)
+    csum16 = int64(old_checksum) & 0xFFFF
+    old32 = int64(old_dword) & 0xFFFFFFFF
+    new32 = int64(new_dword) & 0xFFFFFFFF
+    csum = rfc1624_update_word(csum16, (old32 >> 16) & 0xFFFF, (new32 >> 16) & 0xFFFF)
+    csum = rfc1624_update_word(csum, old32 & 0xFFFF, new32 & 0xFFFF)
     return csum
 
 @cuda.jit(device=True)
@@ -583,16 +597,24 @@ def calculate_checksum_warp(buffer, offset, length):
 @cuda.jit(device=True)
 def write_uint32_be(buffer, offset, value):
     """Writes a 32-bit integer in Big Endian."""
-    buffer[offset] = (value >> 24) & 0xFF
-    buffer[offset + 1] = (value >> 16) & 0xFF
-    buffer[offset + 2] = (value >> 8) & 0xFF
-    buffer[offset + 3] = value & 0xFF
+    if (offset & 0x3) == 0:
+        bswap_val = ((value & 0xFF) << 24) | ((value & 0xFF00) << 8) | ((value & 0xFF0000) >> 8) | ((value >> 24) & 0xFF)
+        buffer.view(np.uint32)[offset >> 2] = bswap_val
+    else:
+        buffer[offset] = (value >> 24) & 0xFF
+        buffer[offset + 1] = (value >> 16) & 0xFF
+        buffer[offset + 2] = (value >> 8) & 0xFF
+        buffer[offset + 3] = value & 0xFF
 
 @cuda.jit(device=True)
 def write_uint16_be(buffer, offset, value):
     """Writes a 16-bit integer in Big Endian."""
-    buffer[offset] = (value >> 8) & 0xFF
-    buffer[offset + 1] = value & 0xFF
+    if (offset & 0x1) == 0:
+        bswap_val = ((value & 0xFF) << 8) | ((value >> 8) & 0xFF)
+        buffer.view(np.uint16)[offset >> 1] = bswap_val
+    else:
+        buffer[offset] = (value >> 8) & 0xFF
+        buffer[offset + 1] = value & 0xFF
 
 @cuda.jit(device=True)
 def fast_memcpy_aligned(dst_buffer, dst_offset, src_buffer, src_offset, length):
@@ -641,188 +663,6 @@ def write_uint32_le(buffer, offset, value):
     buffer[offset + 1] = (value >> 8) & 0xFF
     buffer[offset + 2] = (value >> 16) & 0xFF
     buffer[offset + 3] = (value >> 24) & 0xFF
-
-@cuda.jit
-def create_packets_kernel(packets_buffer, count, target_ip_int, target_port, protocol, real_src_ip_int, spoof_enabled, tcp_flags_int, has_ethernet, user_tcp_window, rng_states, gateway_mac, spoof_base_ip, spoof_mask):
-    """
-    P2 FIX #16: Added rng_states.
-    P2 FIX #19: Added gateway_mac.
-    P2 FIX #30: Added spoof_base_ip and spoof_mask.
-    """
-    idx = cuda.grid(1)
-    if idx >= count:
-        return
-
-    # --- 1. Determine Header Lengths ---
-    # Constants: eth=14, ip=20, tcp=40, udp=8, icmp=8
-    if protocol == TCP_PROTOCOL:
-        transport_len = 40
-    elif protocol == UDP_PROTOCOL:
-        transport_len = 8
-    elif protocol == ICMP_PROTOCOL:
-        transport_len = 8
-    else:
-        transport_len = 0
-        
-    packet_size = (14 if has_ethernet else 0) + 20 + transport_len
-    packet_offset = idx * packet_size
-    
-    # --- 2. Generate Dynamic Fields ---
-    # P2 FIX #16: Use xoroshiro128p for better randomness
-    
-    # Source IP
-    if spoof_enabled:
-        # P2 FIX #30: Subnet-based spoofing
-        rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
-        src_ip_int = spoof_base_ip + int(rand_tmp * ((1 << (32 - spoof_mask)) - 1))
-    else:
-        src_ip_int = real_src_ip_int
-    
-    # TTL randomization (48-128)
-    rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
-    ip_ttl = 48 + int(rand_tmp * 81)
-    
-    # IP ID randomization
-    rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
-    ip_id = int(rand_tmp * 65535)
-    
-    # TCP Sequence randomization
-    rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
-    tcp_seq = int(rand_tmp * 0xFFFFFFFF)
-    
-    # Source Port randomization (1024-65535)
-    rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
-    src_port = 1024 + int(rand_tmp * 64511)
-    
-    # TCP Window selector
-    if user_tcp_window >= 0:
-        tcp_window = user_tcp_window
-    else:
-        rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
-        os_selector = int(rand_tmp * 6)
-        if os_selector == 0:
-            tcp_window = 64240   # Windows 10
-        elif os_selector == 1:
-            tcp_window = 65535   # Windows 7
-        elif os_selector == 2:
-            tcp_window = 29200   # Linux 4.x
-        elif os_selector == 3:
-            tcp_window = 65535   # Linux 5.x
-        elif os_selector == 4:
-            tcp_window = 65535   # macOS
-        else:
-            tcp_window = 32768   # FreeBSD
-
-    # --- 3. Write Ethernet Header ---
-    current_offset = packet_offset
-    if has_ethernet == 1:
-        # P2 FIX #19: Use gateway_mac instead of broadcast
-        # Dst MAC (6 bytes)
-        packets_buffer[current_offset] = (gateway_mac >> 40) & 0xFF
-        packets_buffer[current_offset + 1] = (gateway_mac >> 32) & 0xFF
-        packets_buffer[current_offset + 2] = (gateway_mac >> 24) & 0xFF
-        packets_buffer[current_offset + 3] = (gateway_mac >> 16) & 0xFF
-        packets_buffer[current_offset + 4] = (gateway_mac >> 8) & 0xFF
-        packets_buffer[current_offset + 5] = gateway_mac & 0xFF
-        
-        # Src MAC (6 bytes) - dummy for now
-        write_uint32_be(packets_buffer, current_offset + 6, 0x00000000)
-        write_uint16_be(packets_buffer, current_offset + 10, 0x0000)
-        
-        # EtherType (0x0800 for IPv4)
-        write_uint16_be(packets_buffer, current_offset + 12, 0x0800)
-        current_offset += ETHERNET_HEADER_LEN
-
-    # --- 4. Write IP Header ---
-    ip_offset = current_offset
-    # IP Total Length
-    ip_total_len = 20 + transport_len
-    
-    # Version(4) + IHL(5) = 0x45, TOS=0
-    write_uint16_be(packets_buffer, ip_offset, 0x4500)
-    write_uint16_be(packets_buffer, ip_offset + 2, ip_total_len)
-    write_uint16_be(packets_buffer, ip_offset + 4, ip_id)
-    write_uint16_be(packets_buffer, ip_offset + 6, 0) # Frag Off
-    
-    # TTL + Protocol
-    packets_buffer[ip_offset + 8] = ip_ttl
-    packets_buffer[ip_offset + 9] = protocol
-    
-    # Checksum (Zero first)
-    write_uint16_be(packets_buffer, ip_offset + 10, 0)
-    
-    # IPs
-    write_uint32_be(packets_buffer, ip_offset + 12, src_ip_int)
-    write_uint32_be(packets_buffer, ip_offset + 16, target_ip_int)
-    
-    # Calculate IP Checksum
-    ip_csum = calculate_checksum(packets_buffer, ip_offset, 20)
-    write_uint16_be(packets_buffer, ip_offset + 10, ip_csum)
-    
-    current_offset += 20
-
-    # --- 5. Write Transport Header ---
-    transport_offset = current_offset
-    
-    # P2 FIX: Full port range 1024-65535
-    src_port = 1024 + (idx % 64512)
-    
-    if protocol == TCP_PROTOCOL:
-        tcp_ack = 0
-        # Data Offset: 5 (20 bytes) + Options (20 bytes) / 4 = 10 (0xA)
-        # 0xA << 4 = 0xA0
-        tcp_doff = 0xA0 
-        
-        write_uint16_be(packets_buffer, transport_offset, src_port)
-        write_uint16_be(packets_buffer, transport_offset + 2, target_port)
-        write_uint32_be(packets_buffer, transport_offset + 4, tcp_seq)
-        write_uint32_be(packets_buffer, transport_offset + 8, tcp_ack)
-        
-        packets_buffer[transport_offset + 12] = tcp_doff
-        packets_buffer[transport_offset + 13] = tcp_flags_int
-        write_uint16_be(packets_buffer, transport_offset + 14, tcp_window)
-        write_uint16_be(packets_buffer, transport_offset + 16, 0x0000) # Checksum
-        write_uint16_be(packets_buffer, transport_offset + 18, 0x0000) # Urg Pointer
-        
-        # --- TCP Options (20 Bytes) ---
-        opt_offset = transport_offset + 20
-        
-        # 1. MSS (4 bytes): Kind=2, Len=4, Val=1460 (variable: 1380-1460)
-        mss_val = 1380 + (idx % 81)  # Range 1380-1460
-        packets_buffer[opt_offset] = 2; packets_buffer[opt_offset+1] = 4
-        write_uint16_be(packets_buffer, opt_offset+2, mss_val)
-        
-        # 2. SACK Permitted (2 bytes): Kind=4, Len=2
-        packets_buffer[opt_offset+4] = 4; packets_buffer[opt_offset+5] = 2
-        
-        # 3. Timestamp (10 bytes): Kind=8, Len=10, TSval, TSecr
-        # P2 FIX #16: Randomized timestamp value
-        rand_ts = xoroshiro128p_uniform_float32(rng_states, idx)
-        ts_val = int(rand_ts * 0xFFFFFFFF)
-        packets_buffer[opt_offset+6] = 8; packets_buffer[opt_offset+7] = 10
-        write_uint32_be(packets_buffer, opt_offset+8, ts_val)  # Use randomized TS
-        write_uint32_be(packets_buffer, opt_offset+12, 0)
-        
-        # 4. NOP (1 byte)
-        packets_buffer[opt_offset+16] = 1
-        
-        # 5. Window Scale (3 bytes): Kind=3, Len=3, Shift=7
-        packets_buffer[opt_offset+17] = 3; packets_buffer[opt_offset+18] = 3; packets_buffer[opt_offset+19] = 7
-        
-        # Calculate TCP Checksum
-        tcp_csum = calculate_tcp_checksum_optimized(packets_buffer, transport_offset, transport_len, src_ip_int, target_ip_int)
-        write_uint16_be(packets_buffer, transport_offset + 16, tcp_csum)
-
-    elif protocol == UDP_PROTOCOL:
-        udp_len = transport_len
-        write_uint16_be(packets_buffer, transport_offset, src_port)
-        write_uint16_be(packets_buffer, transport_offset + 2, target_port)
-        write_uint16_be(packets_buffer, transport_offset + 4, udp_len)
-        write_uint16_be(packets_buffer, transport_offset + 6, 0x0000) # Checksum
-        
-        # Calculate UDP Checksum
-        udp_csum = calculate_udp_checksum_optimized(packets_buffer, transport_offset, udp_len, src_ip_int, target_ip_int)
-        write_uint16_be(packets_buffer, transport_offset + 6, udp_csum)
 
 @cuda.jit(device=True)
 def _select_tcp_window(user_tcp_window, rng_states, idx):
@@ -1861,24 +1701,24 @@ def generate_packets(count, target_ip, target_port, protocol="tcp", spoof_ip=Tru
                 rng_states,
                 np.int64(gateway_mac),
             )
-    else:
-        # Legacy mixed kernel fallback for unsupported protocol variants.
-        create_packets_kernel[blocks_per_grid, threads_per_block, stream](
-            packets_gpu, 
-            np.int64(count), 
-            np.int64(target_ip_int), 
-            np.int64(target_port), 
-            np.int64(proto_int), 
-            np.int64(real_src_ip_int), 
-            np.int64(1 if spoof_ip else 0), 
-            np.int64(tcp_flags), 
-            np.int64(1 if has_ethernet else 0), 
-            np.int64(window),
+    elif proto_int == ICMP_PROTOCOL:
+        create_icmp_packets_kernel[blocks_per_grid, threads_per_block, stream](
+            packets_gpu,
+            np.int64(count),
+            np.int64(target_ip_int),
+            np.int64(real_src_ip_int),
+            np.int64(1 if spoof_ip else 0),
+            np.int64(1 if has_ethernet else 0),
+            np.int64(8), # default icmp_type=8
+            np.int64(0), # default icmp_code=0
             rng_states,
             np.int64(gateway_mac),
             np.int64(spoof_base_ip),
-            np.int64(spoof_mask)
+            np.int64(spoof_mask),
+            np.int64(0)
         )
+    else:
+        raise ValueError(f"GPU packet generation does not support protocol {protocol}")
     
     return packets_gpu, packet_size
 

@@ -40,6 +40,7 @@
 #define BATCH_SIZE 1024
 #define STATE_TABLE_SIZE 65536
 #define MAX_PACKET_SIZE 2048
+#define NUM_LOCKS 256
 
 // --- TCP State Table ---
 typedef struct {
@@ -57,7 +58,7 @@ typedef struct {
 } tcp_state_t;
 
 static tcp_state_t state_table[STATE_TABLE_SIZE];
-static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t state_locks[NUM_LOCKS];
 
 static inline uint32_t hash_state(uint32_t src_ip, uint16_t src_port) {
     // Improved hash function (Murmur-like mixing)
@@ -68,22 +69,52 @@ static inline uint32_t hash_state(uint32_t src_ip, uint16_t src_port) {
     h *= 0xc2b2ae35;
     h ^= (h >> 16);
     h ^= src_port;
-    return h % STATE_TABLE_SIZE;
+    return h;
 }
 
 static void update_state(uint32_t src_ip, uint16_t src_port, uint32_t seq, uint32_t ack, uint8_t state, uint16_t window, uint16_t mss, uint8_t ttl) {
-    uint32_t idx = hash_state(src_ip, src_port);
-    pthread_mutex_lock(&state_mutex);
-    state_table[idx].src_ip = src_ip;
-    state_table[idx].src_port = src_port;
-    state_table[idx].seq = seq;
-    state_table[idx].ack = ack;
-    state_table[idx].state = state;
-    state_table[idx].last_seen = (uint32_t)time(NULL);
-    state_table[idx].window_size = window;
-    state_table[idx].mss = mss;
-    state_table[idx].ttl = ttl;
-    pthread_mutex_unlock(&state_mutex);
+    uint32_t h = hash_state(src_ip, src_port);
+    uint32_t segment = h % NUM_LOCKS;
+    uint32_t segment_size = STATE_TABLE_SIZE / NUM_LOCKS;
+    uint32_t segment_start = segment * segment_size;
+    uint32_t start_idx = segment_start + ((h / NUM_LOCKS) % segment_size);
+
+    pthread_mutex_lock(&state_locks[segment]);
+    uint32_t idx = start_idx;
+    int found = 0;
+    uint32_t now = (uint32_t)time(NULL);
+
+    for (uint32_t i = 0; i < segment_size; i++) {
+        if (state_table[idx].state == 0 || (now - state_table[idx].last_seen > 60) || 
+            (state_table[idx].src_ip == src_ip && state_table[idx].src_port == src_port)) {
+            state_table[idx].src_ip = src_ip;
+            state_table[idx].src_port = src_port;
+            state_table[idx].seq = seq;
+            state_table[idx].ack = ack;
+            state_table[idx].state = state;
+            state_table[idx].last_seen = now;
+            state_table[idx].window_size = window;
+            state_table[idx].mss = mss;
+            state_table[idx].ttl = ttl;
+            found = 1;
+            break;
+        }
+        idx = segment_start + ((idx - segment_start + 1) % segment_size);
+    }
+    
+    if (!found) { // Overwrite if bucket is full
+        idx = start_idx;
+        state_table[idx].src_ip = src_ip;
+        state_table[idx].src_port = src_port;
+        state_table[idx].seq = seq;
+        state_table[idx].ack = ack;
+        state_table[idx].state = state;
+        state_table[idx].last_seen = now;
+        state_table[idx].window_size = window;
+        state_table[idx].mss = mss;
+        state_table[idx].ttl = ttl;
+    }
+    pthread_mutex_unlock(&state_locks[segment]);
 }
 
 // --- TX_RING Context (Persistent Mapping) ---
@@ -316,24 +347,35 @@ static PyObject* get_states_batch(PyObject* self, PyObject* args) {
     PyObject* mss_list = PyList_New(count);
     PyObject* ttl_list = PyList_New(count);
 
-    pthread_mutex_lock(&state_mutex);
     for (uint32_t i = 0; i < count; i++) {
         uint16_t port = start_port + (i % 64512);
-        uint32_t idx = hash_state(src_ip, port);
+        uint32_t h = hash_state(src_ip, port);
+        uint32_t segment = h % NUM_LOCKS;
+        uint32_t segment_size = STATE_TABLE_SIZE / NUM_LOCKS;
+        uint32_t segment_start = segment * segment_size;
+        uint32_t start_idx = segment_start + ((h / NUM_LOCKS) % segment_size);
         
         uint32_t seq = 0, ack = 0;
         uint8_t state = 0;
         uint16_t window = 0, mss = 0;
         uint8_t ttl = 0;
         
-        if (state_table[idx].src_ip == src_ip && state_table[idx].src_port == port) {
-            seq = state_table[idx].seq;
-            ack = state_table[idx].ack;
-            state = state_table[idx].state;
-            window = state_table[idx].window_size;
-            mss = state_table[idx].mss;
-            ttl = state_table[idx].ttl;
+        pthread_mutex_lock(&state_locks[segment]);
+        uint32_t idx = start_idx;
+        for (uint32_t j = 0; j < segment_size; j++) {
+            if (state_table[idx].state != 0 && state_table[idx].src_ip == src_ip && state_table[idx].src_port == port) {
+                seq = state_table[idx].seq;
+                ack = state_table[idx].ack;
+                state = state_table[idx].state;
+                window = state_table[idx].window_size;
+                mss = state_table[idx].mss;
+                ttl = state_table[idx].ttl;
+                break;
+            }
+            if (state_table[idx].state == 0) break; // Optimization: stop probing
+            idx = segment_start + ((idx - segment_start + 1) % segment_size);
         }
+        pthread_mutex_unlock(&state_locks[segment]);
         
         PyList_SetItem(seq_list, i, PyLong_FromUnsignedLong(seq));
         PyList_SetItem(ack_list, i, PyLong_FromUnsignedLong(ack));
@@ -342,7 +384,6 @@ static PyObject* get_states_batch(PyObject* self, PyObject* args) {
         PyList_SetItem(mss_list, i, PyLong_FromUnsignedLong(mss));
         PyList_SetItem(ttl_list, i, PyLong_FromUnsignedLong(ttl));
     }
-    pthread_mutex_unlock(&state_mutex);
 
     return Py_BuildValue("OOOOOO", seq_list, ack_list, state_list, window_list, mss_list, ttl_list);
 }
@@ -357,17 +398,28 @@ static PyObject* get_tcp_state(PyObject* self, PyObject* args) {
     uint16_t window = 0, mss = 0;
     uint8_t ttl = 0;
 
-    uint32_t idx = hash_state(src_ip, src_port);
-    pthread_mutex_lock(&state_mutex);
-    if (state_table[idx].src_ip == src_ip && state_table[idx].src_port == src_port) {
-        seq = state_table[idx].seq;
-        ack = state_table[idx].ack;
-        state = state_table[idx].state;
-        window = state_table[idx].window_size;
-        mss = state_table[idx].mss;
-        ttl = state_table[idx].ttl;
+    uint32_t h = hash_state(src_ip, src_port);
+    uint32_t segment = h % NUM_LOCKS;
+    uint32_t segment_size = STATE_TABLE_SIZE / NUM_LOCKS;
+    uint32_t segment_start = segment * segment_size;
+    uint32_t start_idx = segment_start + ((h / NUM_LOCKS) % segment_size);
+
+    pthread_mutex_lock(&state_locks[segment]);
+    uint32_t idx = start_idx;
+    for (uint32_t i = 0; i < segment_size; i++) {
+        if (state_table[idx].state != 0 && state_table[idx].src_ip == src_ip && state_table[idx].src_port == src_port) {
+            seq = state_table[idx].seq;
+            ack = state_table[idx].ack;
+            state = state_table[idx].state;
+            window = state_table[idx].window_size;
+            mss = state_table[idx].mss;
+            ttl = state_table[idx].ttl;
+            break;
+        }
+        if (state_table[idx].state == 0) break;
+        idx = segment_start + ((idx - segment_start + 1) % segment_size);
     }
-    pthread_mutex_unlock(&state_mutex);
+    pthread_mutex_unlock(&state_locks[segment]);
 
     return Py_BuildValue("{s:I,s:I,s:i,s:H,s:H,s:b}", "seq", seq, "ack", ack, "state", state, "window", window, "mss", mss, "ttl", ttl);
 }
@@ -392,11 +444,21 @@ static PyObject* set_mimicry_settings(PyObject* self, PyObject* args) {
 static void process_rx_packet(const uint8_t* pkt, uint32_t pkt_len, int sock, const struct sockaddr_ll* sll) {
     if (!pkt || pkt_len < 54) return;
 
-    const uint8_t* ip = pkt + 14;
+    // L2 Parsing with VLAN support
+    uint16_t eth_type = (pkt[12] << 8) | pkt[13];
+    uint32_t l2_offset = 14;
+    if (eth_type == 0x8100) { // VLAN 802.1Q
+        if (pkt_len < 58) return;
+        eth_type = (pkt[16] << 8) | pkt[17];
+        l2_offset = 18;
+    }
+    if (eth_type != 0x0800) return; // Not IPv4
+
+    const uint8_t* ip = pkt + l2_offset;
     if (ip[9] != 6) return; // TCP
 
     uint8_t ihl = (ip[0] & 0x0F) * 4;
-    if (pkt_len < (uint32_t)(14 + ihl + 20)) return;
+    if (pkt_len < (uint32_t)(l2_offset + ihl + 20)) return;
 
     const uint8_t* tcp = ip + ihl;
     uint8_t flags = tcp[13];
@@ -582,6 +644,8 @@ static PyObject* send_optimized(PyObject* self, PyObject* args) {
     int partial_send_retry_count = 0;
     char* data_ptr = (char*)view.buf;
 
+    Py_BEGIN_ALLOW_THREADS
+
     for (int pkt_idx = 0; pkt_idx < count; ) {
         int batch = count - pkt_idx;
         if (batch > BATCH_SIZE) {
@@ -622,6 +686,8 @@ static PyObject* send_optimized(PyObject* self, PyObject* args) {
             partial_send_retry_count++;
         }
     }
+
+    Py_END_ALLOW_THREADS
 
     PyBuffer_Release(&view);
     return Py_BuildValue(
@@ -1026,10 +1092,12 @@ static int send_ring_optimized_core(
     for (int i = 0; i < count; ) {
         char* frame_base = tx_ring_ctx.map + ((size_t)tx_ring_ctx.frame_idx * frame_size);
 
-        int busy_loops = 1000 + (i % 2000);
+        int spins = 0;
         while (tx_frame_status(frame_base, packet_version) != TP_STATUS_AVAILABLE) {
-            if (busy_loops > 0) {
-                busy_loops--;
+            if (spins < 100) {
+                spins++;
+                // Quick yield
+                __asm__ volatile("pause" ::: "memory");
                 continue;
             }
             poll(&pfd, 1, 1);
@@ -1175,5 +1243,8 @@ static struct PyModuleDef fastsendermodule = {
 };
 
 PyMODINIT_FUNC PyInit_fast_sender(void) {
+    for (int i = 0; i < NUM_LOCKS; i++) {
+        pthread_mutex_init(&state_locks[i], NULL);
+    }
     return PyModule_Create(&fastsendermodule);
 }
