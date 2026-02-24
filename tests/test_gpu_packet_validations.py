@@ -119,6 +119,75 @@ class TestGpuPacketValidations(unittest.TestCase):
             gpu_packet.TEMPLATE_CONST_HOST[:] = orig_backing
             gpu_packet._CONST_FINGERPRINTS["TEMPLATE_CONST_HOST"] = orig_fp
 
+    def test_template_generation_cache_reduces_h2d_copy_count(self):
+        fake_kernel = _FakeKernel()
+        template = bytes([0x45]) + bytes([0x00] * 63)
+        with patch.dict(os.environ, {"SAMURAI_GPU_CACHE_MAX_ENTRIES": "8"}, clear=False), \
+             patch.object(gpu_packet, "template_kernel", fake_kernel), \
+             patch.object(gpu_packet.cp, "zeros", side_effect=lambda shape, dtype: np.zeros(shape, dtype=np.uint8)), \
+             patch.object(gpu_packet.cp, "array", side_effect=lambda arr, dtype=None: np.array(arr, dtype=np.uint8)), \
+             patch.object(gpu_packet, "create_xoroshiro128p_states", side_effect=lambda _c, seed=None: {"count": _c}):
+            gpu_packet.clear_generation_caches()
+            gpu_packet.reset_generation_telemetry()
+
+            gpu_packet.generate_packets_from_template(
+                template_bytes=template,
+                count=8,
+                real_src_ip="192.168.1.10",
+                spoof_ip=False,
+                has_ethernet=False,
+            )
+            first = gpu_packet.get_generation_telemetry()
+
+            gpu_packet.generate_packets_from_template(
+                template_bytes=template,
+                count=8,
+                real_src_ip="192.168.1.10",
+                spoof_ip=False,
+                has_ethernet=False,
+            )
+            second = gpu_packet.get_generation_telemetry()
+
+        self.assertEqual(int(first.get("gpu_template_h2d_copy_count", 0)), 1)
+        self.assertEqual(int(second.get("gpu_template_h2d_copy_count", 0)), 1)
+        self.assertGreaterEqual(int(second.get("gpu_template_cache_hit_count", 0)), 1)
+
+    def test_rng_state_pool_reuse_in_template_generation(self):
+        fake_kernel = _FakeKernel()
+        alloc_counter = {"n": 0}
+
+        def _fake_states(c, seed=None):
+            alloc_counter["n"] += 1
+            return {"count": int(c), "alloc_id": alloc_counter["n"]}
+
+        template = bytes([0x45]) + bytes([0x00] * 63)
+        with patch.dict(os.environ, {"SAMURAI_GPU_RNG_POOL_MAX_ENTRIES": "8"}, clear=False), \
+             patch.object(gpu_packet, "template_kernel", fake_kernel), \
+             patch.object(gpu_packet.cp, "zeros", side_effect=lambda shape, dtype: np.zeros(shape, dtype=np.uint8)), \
+             patch.object(gpu_packet.cp, "array", side_effect=lambda arr, dtype=None: np.array(arr, dtype=np.uint8)), \
+             patch.object(gpu_packet, "create_xoroshiro128p_states", side_effect=_fake_states):
+            gpu_packet.clear_generation_caches()
+            gpu_packet.reset_generation_telemetry()
+
+            gpu_packet.generate_packets_from_template(
+                template_bytes=template,
+                count=16,
+                real_src_ip="192.168.1.10",
+                spoof_ip=False,
+                has_ethernet=False,
+            )
+            gpu_packet.generate_packets_from_template(
+                template_bytes=template,
+                count=16,
+                real_src_ip="192.168.1.10",
+                spoof_ip=False,
+                has_ethernet=False,
+            )
+            tel = gpu_packet.get_generation_telemetry()
+
+        self.assertEqual(int(tel.get("gpu_rng_state_alloc_count", 0)), 1)
+        self.assertGreaterEqual(int(tel.get("gpu_rng_state_reuse_count", 0)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

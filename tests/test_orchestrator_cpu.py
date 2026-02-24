@@ -222,6 +222,18 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
             "buffer_copy_bytes": 4096,
             "eagain_retry_count": 3,
             "partial_send_retry_count": 4,
+            "txring_flush_call_count": 5,
+            "txring_flush_error_count": 1,
+            "txring_flush_eagain_count": 1,
+            "txring_tp_packets": 9,
+            "txring_tp_drops": 2,
+            "txring_tp_freeze_q_cnt": 0,
+            "host_tx_packets_delta": 10,
+            "host_tx_dropped_delta": 2,
+            "host_tx_errors_delta": 1,
+            "softnet_dropped_delta": 0,
+            "softnet_time_squeeze_delta": 0,
+            "wire_loss_est_packets": 2,
         })
         with patch.object(orchestrator.senders, "http_app_sender", mock_http):
             await orchestrator.worker_process(
@@ -234,6 +246,14 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ev["buffer_copy_bytes"], 4096)
         self.assertEqual(ev["eagain_retry_count"], 3)
         self.assertEqual(ev["partial_send_retry_count"], 4)
+        self.assertEqual(ev["txring_flush_call_count"], 5)
+        self.assertEqual(ev["txring_flush_error_count"], 1)
+        self.assertEqual(ev["txring_tp_packets"], 9)
+        self.assertEqual(ev["txring_tp_drops"], 2)
+        self.assertEqual(ev["host_tx_packets_delta"], 10)
+        self.assertEqual(ev["host_tx_dropped_delta"], 2)
+        self.assertEqual(ev["wire_loss_est_packets"], 2)
+        self.assertGreater(ev["wire_loss_est_pct"], 0.0)
         self.assertEqual(ev["stats"]["buffer_copy_count"], 2)
         self.assertEqual(ev["stats"]["eagain_retry_count"], 3)
 

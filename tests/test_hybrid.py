@@ -15,8 +15,7 @@ except Exception:  # pragma: no cover - unittest-only environments
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from ddos_samurai import packet
-from ddos_samurai.scapy_support import is_scapy_available
+from ddos_samurai import cpu_packet_engine
 
 GPU_MODULES_IMPORTABLE = False
 try:
@@ -30,8 +29,6 @@ class TestHybridGeneration(unittest.TestCase):
     def test_hybrid_generation(self):
         if not GPU_MODULES_IMPORTABLE:
             self.skipTest("gpu_packet module unavailable (missing numba/cupy/CUDA deps).")
-        if not is_scapy_available():
-            self.skipTest("Scapy unavailable; hybrid CPU-template generation requires scapy.")
 
         print("\n[TEST] Testing Hybrid CPU-Template + GPU-Replication...")
         
@@ -40,7 +37,7 @@ class TestHybridGeneration(unittest.TestCase):
         target_port = 80
         payload_data = b"HYBRID_TEST_PAYLOAD"
         
-        cfg = packet.PacketConfig(
+        cfg = cpu_packet_engine.PacketConfig(
             target_ip=target_ip,
             target_port=target_port,
             protocol="tcp",
@@ -51,7 +48,7 @@ class TestHybridGeneration(unittest.TestCase):
             window=8192
         )
         
-        template_pkt = packet.create_packet(cfg)
+        template_pkt = cpu_packet_engine.create_packet(cfg)
         template_bytes = bytes(template_pkt)
         
         print(f"[INFO] Template created. Length: {len(template_bytes)} bytes")

@@ -109,8 +109,36 @@ class TestFullPacingBenchmark(unittest.TestCase):
         accuracy = float(stats.get("rate_accuracy_pct", 0.0) or 0.0)
         jitter_p99 = float(stats.get("jitter_p99_ns", 0.0) or 0.0)
         actual_rps = float(stats.get("actual_rps", 0.0) or 0.0)
+        txring_flush_calls = int(stats.get("txring_flush_call_count", 0) or 0)
+        txring_flush_errors = int(stats.get("txring_flush_error_count", 0) or 0)
+        txring_flush_eagain = int(stats.get("txring_flush_eagain_count", 0) or 0)
+        txring_tp_packets = int(stats.get("txring_tp_packets", 0) or 0)
+        txring_tp_drops = int(stats.get("txring_tp_drops", 0) or 0)
+        txring_tp_freeze = int(stats.get("txring_tp_freeze_q_cnt", 0) or 0)
 
         self.assertGreaterEqual(accuracy, 95.0, f"rate_accuracy_pct below threshold: {accuracy:.2f}")
+        for k in (
+            "txring_flush_call_count",
+            "txring_flush_error_count",
+            "txring_flush_eagain_count",
+            "txring_tp_packets",
+            "txring_tp_drops",
+            "txring_tp_freeze_q_cnt",
+        ):
+            self.assertIn(k, stats)
+
+        loss_est_packets = max(txring_tp_drops, 0)
+        loss_est_pct = float((100.0 * loss_est_packets) / max(1, count))
+        try:
+            fail_pct = float(os.environ.get("SAMURAI_LOSS_FAIL_PCT", "5") or 5.0)
+        except Exception:
+            fail_pct = 5.0
+        if loss_est_pct > fail_pct:
+            loss_status = "fail"
+        elif loss_est_pct > 0:
+            loss_status = "warn"
+        else:
+            loss_status = "ok"
 
         _FullBenchState.summary["sections"]["pacing"] = {
             "sent": int(sent),
@@ -118,6 +146,29 @@ class TestFullPacingBenchmark(unittest.TestCase):
             "actual_rps": actual_rps,
             "rate_accuracy_pct": accuracy,
             "jitter_p99_ns": jitter_p99,
+            "txring_flush_call_count": txring_flush_calls,
+            "txring_flush_error_count": txring_flush_errors,
+            "txring_flush_eagain_count": txring_flush_eagain,
+            "txring_tp_packets": txring_tp_packets,
+            "txring_tp_drops": txring_tp_drops,
+            "txring_tp_freeze_q_cnt": txring_tp_freeze,
+        }
+        _FullBenchState.summary["sections"]["loss_telemetry"] = {
+            "host_tx_packets_delta": 0,
+            "host_tx_dropped_delta": 0,
+            "host_tx_errors_delta": 0,
+            "softnet_dropped_delta": 0,
+            "softnet_time_squeeze_delta": 0,
+            "wire_loss_est_packets": int(loss_est_packets),
+            "wire_loss_est_pct": float(loss_est_pct),
+            "wire_loss_fail_pct": float(fail_pct),
+            "wire_loss_status": loss_status,
+            "txring_flush_call_count": txring_flush_calls,
+            "txring_flush_error_count": txring_flush_errors,
+            "txring_flush_eagain_count": txring_flush_eagain,
+            "txring_tp_packets": txring_tp_packets,
+            "txring_tp_drops": txring_tp_drops,
+            "txring_tp_freeze_q_cnt": txring_tp_freeze,
         }
 
 
@@ -152,6 +203,7 @@ class TestFullGpuBenchmark(unittest.TestCase):
         _FullBenchState.summary["sections"]["gpu_template"] = {
             "global": global_stats,
             "constant": out.get("constant", {}),
+            "generation_telemetry": out.get("generation_telemetry", {}),
         }
 
 
@@ -168,3 +220,18 @@ class TestZZWriteFullBenchmarkReport(unittest.TestCase):
             "benchmark_summary_full.json",
         )
         self.assertTrue(out.exists())
+
+        loss_out_path = str(os.environ.get("SAMURAI_LOSS_REPORT_OUT", "") or "").strip()
+        if loss_out_path:
+            payload = {
+                "schema": "samurai.loss.telemetry.v1",
+                "profile": "full",
+                "generated_utc": _FullBenchState.summary.get("generated_utc"),
+                "loss_telemetry": _FullBenchState.summary.get("sections", {}).get("loss_telemetry", {}),
+            }
+            loss_out = _write_json_with_fallback(
+                Path(loss_out_path).resolve(),
+                payload,
+                "loss_telemetry_full.json",
+            )
+            self.assertTrue(loss_out.exists())

@@ -335,6 +335,55 @@ def test_jitter_models():
         assert sent > 0
 
 
+# ── Test 5: L2 TX_RING Counters ─────────────────────────────────────────────
+
+def test_l2_txring_stats_fields():
+    banner("Test 5: L2 TX_RING Stats Fields")
+    _require_privileged_pacing()
+
+    from ddos_samurai.pacing import (
+        PacingConfig, PacingMode, paced_send_l2, get_stats, cleanup_l2,
+    )
+
+    iface = str(os.environ.get("SAMURAI_LOSS_IFACE", "lo") or "lo").strip()
+    try:
+        socket.if_nametoindex(iface)
+    except Exception as exc:
+        pytest.skip(f"interface unavailable for L2 test: {exc}")
+
+    count = 256
+    packet_size = 64
+    frame = (b"\xff" * 6) + (b"\x00" * 6) + b"\x08\x00" + (b"\x00" * (packet_size - 14))
+    buf = frame * count
+    gateway_mac = b"\x00\x11\x22\x33\x44\x55"
+
+    cfg = PacingConfig(
+        pacing_mode=PacingMode.RPS,
+        target_rps=20_000,
+        burst_size=32,
+    )
+
+    try:
+        sent = paced_send_l2(iface, buf, packet_size, count, gateway_mac, cfg)
+    except OSError as exc:
+        pytest.skip(f"L2 pacing unavailable in this environment: {exc}")
+    finally:
+        cleanup_l2()
+
+    stats = get_stats() or {}
+    print(f"    Sent (L2): {sent:,}")
+    for key in (
+        "txring_flush_call_count",
+        "txring_flush_error_count",
+        "txring_flush_eagain_count",
+        "txring_tp_packets",
+        "txring_tp_drops",
+        "txring_tp_freeze_q_cnt",
+    ):
+        assert key in stats
+        assert int(stats.get(key, 0) or 0) >= 0
+
+
 # ── Test 5: SCHED_FIFO Real-Time Scheduling ─────────────────────────────────
 
 def test_sched_fifo():

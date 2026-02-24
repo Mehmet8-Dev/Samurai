@@ -46,6 +46,9 @@ class TestGPUModules(unittest.TestCase):
         """Verify gpu_packet module structure."""
         self.assertTrue(hasattr(gpu_packet, 'generate_packets'), "Missing generate_packets")
         self.assertTrue(hasattr(gpu_packet, 'generate_packets_from_template'), "Missing generate_packets_from_template")
+        self.assertTrue(hasattr(gpu_packet, 'get_generation_telemetry'), "Missing get_generation_telemetry")
+        self.assertTrue(hasattr(gpu_packet, 'reset_generation_telemetry'), "Missing reset_generation_telemetry")
+        self.assertTrue(hasattr(gpu_packet, 'clear_generation_caches'), "Missing clear_generation_caches")
         self.assertTrue(hasattr(gpu_packet, 'init_gpu'), "Missing init_gpu")
 
     def test_gpu_payload_structure(self):

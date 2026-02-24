@@ -59,6 +59,22 @@ class TestReporting(unittest.TestCase):
                 "buffer_copy_bytes": 1024,
                 "eagain_retry_count": 3,
                 "partial_send_retry_count": 4,
+                "txring_flush_call_count": 11,
+                "txring_flush_error_count": 1,
+                "txring_flush_eagain_count": 1,
+                "txring_tp_packets": 9,
+                "txring_tp_drops": 1,
+                "txring_tp_freeze_q_cnt": 0,
+                "host_tx_packets_delta": 10,
+                "host_tx_dropped_delta": 1,
+                "host_tx_errors_delta": 0,
+                "softnet_dropped_delta": 2,
+                "softnet_time_squeeze_delta": 1,
+                "wire_loss_est_packets": 1,
+                "gpu_template_h2d_copy_count": 3,
+                "gpu_template_h2d_copy_bytes": 2048,
+                "gpu_rng_state_alloc_count": 1,
+                "gpu_rng_state_reuse_count": 5,
                 "stats": {
                     "attempted": 10,
                     "sent": 9,
@@ -77,6 +93,22 @@ class TestReporting(unittest.TestCase):
                 "buffer_copy_bytes": 0,
                 "eagain_retry_count": 2,
                 "partial_send_retry_count": 1,
+                "txring_flush_call_count": 7,
+                "txring_flush_error_count": 0,
+                "txring_flush_eagain_count": 0,
+                "txring_tp_packets": 8,
+                "txring_tp_drops": 0,
+                "txring_tp_freeze_q_cnt": 0,
+                "host_tx_packets_delta": 9,
+                "host_tx_dropped_delta": 0,
+                "host_tx_errors_delta": 1,
+                "softnet_dropped_delta": 0,
+                "softnet_time_squeeze_delta": 0,
+                "wire_loss_est_packets": 0,
+                "gpu_template_h2d_copy_count": 1,
+                "gpu_template_h2d_copy_bytes": 1024,
+                "gpu_rng_state_alloc_count": 1,
+                "gpu_rng_state_reuse_count": 3,
                 "stats": {
                     "attempted": 10,
                     "sent": 8,
@@ -101,3 +133,14 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["buffer_copy_bytes"], 1024)
         self.assertEqual(rr.results["eagain_retry_count"], 5)
         self.assertEqual(rr.results["partial_send_retry_count"], 5)
+        self.assertEqual(rr.results["txring_flush_call_count"], 18)
+        self.assertEqual(rr.results["txring_flush_error_count"], 1)
+        self.assertEqual(rr.results["txring_tp_packets"], 17)
+        self.assertEqual(rr.results["txring_tp_drops"], 1)
+        self.assertEqual(rr.results["host_tx_packets_delta"], 19)
+        self.assertEqual(rr.results["host_tx_dropped_delta"], 1)
+        self.assertEqual(rr.results["softnet_dropped_delta"], 2)
+        self.assertEqual(rr.results["wire_loss_est_packets"], 1)
+        self.assertEqual(rr.results["wire_loss_status"], "warn")
+        self.assertEqual(rr.results["gpu_template_h2d_copy_count"], 4)
+        self.assertEqual(rr.results["gpu_rng_state_alloc_count"], 2)
