@@ -70,6 +70,33 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--tls-profile", opts)
         self.assertIn("--h2-profile", opts)
         self.assertIn("--ja3-profile", opts)
+        self.assertIn("--loss-telemetry", opts)
+        self.assertIn("--loss-iface", opts)
+        self.assertIn("--loss-fail-pct", opts)
+        self.assertIn("--loss-report-out", opts)
+
+    def test_loss_telemetry_flags_defaults(self):
+        parser = cli.build_parser()
+        args = parser.parse_args([])
+        self.assertEqual(args.loss_telemetry, "auto")
+        self.assertEqual(args.loss_iface, "")
+        self.assertEqual(args.loss_fail_pct, 5.0)
+        self.assertEqual(args.loss_report_out, "")
+
+    def test_loss_telemetry_flags_parse(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--loss-telemetry", "1",
+                "--loss-iface", "eth0",
+                "--loss-fail-pct", "7.5",
+                "--loss-report-out", "artifacts/loss.json",
+            ]
+        )
+        self.assertEqual(args.loss_telemetry, "1")
+        self.assertEqual(args.loss_iface, "eth0")
+        self.assertEqual(args.loss_fail_pct, 7.5)
+        self.assertEqual(args.loss_report_out, "artifacts/loss.json")
 
     def test_ja3_profile_alias_sets_tls_profile(self):
         parser = cli.build_parser()

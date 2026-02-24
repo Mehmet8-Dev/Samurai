@@ -241,6 +241,9 @@ def _report_inputs_from_args(args) -> dict:
         "h2_profile": str(getattr(args, "h2_profile", PROFILE_NONE)),
         "soak_profile": str(getattr(args, "soak_profile", "none")),
         "soak_warmup_s": int(getattr(args, "soak_warmup_s", 0) or 0),
+        "loss_telemetry": str(getattr(args, "loss_telemetry", "auto")),
+        "loss_iface": str(getattr(args, "loss_iface", "")),
+        "loss_fail_pct": float(getattr(args, "loss_fail_pct", 5.0) or 5.0),
         "fault_inject": list(getattr(args, "fault_inject", []) or []),
     }
 
@@ -696,6 +699,30 @@ def build_parser() -> argparse.ArgumentParser:
     report_group.add_argument("--soak-max-vram-growth-mb", type=float, default=None, help="Soak pass/fail: maksimum VRAM artis limiti (MB).")
     report_group.add_argument("--soak-max-pinned-growth-mb", type=float, default=None, help="Soak pass/fail: maksimum pinned-memory artis limiti (MB).")
     report_group.add_argument("--soak-max-backlog", type=int, default=None, help="Soak pass/fail: maksimum backlog limiti (paket).")
+    report_group.add_argument(
+        "--loss-telemetry",
+        choices=["auto", "0", "1"],
+        default="auto",
+        help="Wire-loss telemetry modu: auto|0|1 (varsayilan: auto).",
+    )
+    report_group.add_argument(
+        "--loss-iface",
+        type=str,
+        default="",
+        help="Loss telemetry icin arayuz ismi (opsiyonel, bossa otomatik).",
+    )
+    report_group.add_argument(
+        "--loss-fail-pct",
+        type=float,
+        default=5.0,
+        help="Wire-loss fail esigi (%%). Varsayilan: 5.",
+    )
+    report_group.add_argument(
+        "--loss-report-out",
+        type=str,
+        default="",
+        help="Canli run sonunda loss telemetry JSON ciktisi (opsiyonel dosya yolu).",
+    )
 
     fault_group = parser.add_argument_group("Fault Injection")
     fault_group.add_argument(
@@ -772,6 +799,18 @@ def main(argv=None):
     report_dir = str(getattr(args, "run_report_dir", "reports/runs"))
     report_base = str(getattr(args, "run_report_out", "")).strip() or str(getattr(args, "gpu_pcap_run_report_out", "")).strip()
     soak_cfg = _build_soak_config(args)
+    os.environ["SAMURAI_LOSS_TELEMETRY"] = str(getattr(args, "loss_telemetry", "auto"))
+    os.environ["SAMURAI_LOSS_FAIL_PCT"] = str(float(getattr(args, "loss_fail_pct", 5.0) or 5.0))
+    loss_iface = str(getattr(args, "loss_iface", "") or "").strip()
+    if loss_iface:
+        os.environ["SAMURAI_LOSS_IFACE"] = loss_iface
+    else:
+        os.environ.pop("SAMURAI_LOSS_IFACE", None)
+    loss_report_out = str(getattr(args, "loss_report_out", "") or "").strip()
+    if loss_report_out:
+        os.environ["SAMURAI_LOSS_REPORT_OUT"] = loss_report_out
+    else:
+        os.environ.pop("SAMURAI_LOSS_REPORT_OUT", None)
 
     # Live mode reporting is supported as well (aggregated worker events).
 
@@ -1397,6 +1436,30 @@ def main(argv=None):
             extra = reporting.write_metrics_files(rr, base_path)
             utils.log_info(f"Run metrikleri: {extra['metrics_json']}")
             utils.log_info(f"Run metrikleri (Prom): {extra['metrics_prom']}")
+            if loss_report_out:
+                loss_summary = {
+                    "schema_version": "1",
+                    "generated_at_utc": finished_utc,
+                    "wire_loss_est_packets": int(rr.results.get("wire_loss_est_packets", 0) or 0),
+                    "wire_loss_est_pct": float(rr.results.get("wire_loss_est_pct", 0.0) or 0.0),
+                    "wire_loss_status": str(rr.results.get("wire_loss_status", "ok")),
+                    "txring_flush_call_count": int(rr.results.get("txring_flush_call_count", 0) or 0),
+                    "txring_flush_error_count": int(rr.results.get("txring_flush_error_count", 0) or 0),
+                    "txring_flush_eagain_count": int(rr.results.get("txring_flush_eagain_count", 0) or 0),
+                    "txring_tp_packets": int(rr.results.get("txring_tp_packets", 0) or 0),
+                    "txring_tp_drops": int(rr.results.get("txring_tp_drops", 0) or 0),
+                    "txring_tp_freeze_q_cnt": int(rr.results.get("txring_tp_freeze_q_cnt", 0) or 0),
+                    "host_tx_packets_delta": int(rr.results.get("host_tx_packets_delta", 0) or 0),
+                    "host_tx_dropped_delta": int(rr.results.get("host_tx_dropped_delta", 0) or 0),
+                    "host_tx_errors_delta": int(rr.results.get("host_tx_errors_delta", 0) or 0),
+                    "softnet_dropped_delta": int(rr.results.get("softnet_dropped_delta", 0) or 0),
+                    "softnet_time_squeeze_delta": int(rr.results.get("softnet_time_squeeze_delta", 0) or 0),
+                }
+                out_loss = reporting.write_text(
+                    json.dumps(loss_summary, indent=2, sort_keys=True),
+                    loss_report_out,
+                )
+                utils.log_info(f"Loss telemetry (JSON): {out_loss}")
         except Exception as e:
             utils.log_warning(f"Run raporu üretilemedi: {e}")
 
