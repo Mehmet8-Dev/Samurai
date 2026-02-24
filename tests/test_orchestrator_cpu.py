@@ -200,6 +200,7 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(events), 1)
         ev = events[0]
         self.assertIn("sender_path", ev)
+        self.assertEqual(ev["sender_path"], "HTTPX_H1")
         self.assertIn("fallback_count", ev)
         self.assertIn("permission_error_count", ev)
 

@@ -519,6 +519,8 @@ def build_live_attack_report(
     softnet_dropped_delta_total = 0
     softnet_time_squeeze_delta_total = 0
     wire_loss_est_packets_total = 0
+    wire_loss_raw_packets_total = 0
+    wire_loss_estimation_capped_total = 0
     gpu_template_h2d_copy_count_total = 0
     gpu_template_h2d_copy_bytes_total = 0
     gpu_rng_state_alloc_count_total = 0
@@ -562,7 +564,7 @@ def build_live_attack_report(
         bytes_sent_est_total += bytes_sent
 
         # Aggregate sender path / fallback / permission metrics
-        _sp = str(ev.get("sender_path", st.get("sender_path", "unknown")))
+        _sp = str(ev.get("sender_path", st.get("sender_path", "unknown")) or "").strip() or "unknown"
         sender_paths_used[_sp] = sender_paths_used.get(_sp, 0) + 1
         permission_error_count_total += int(
             ev.get("permission_error_count", st.get("permission_error_count", 0)) or 0
@@ -618,6 +620,12 @@ def build_live_attack_report(
         wire_loss_est_packets_total += int(
             ev.get("wire_loss_est_packets", st.get("wire_loss_est_packets", 0)) or 0
         )
+        wire_loss_raw_packets_total += int(
+            ev.get("wire_loss_raw_packets", st.get("wire_loss_raw_packets", 0)) or 0
+        )
+        wire_loss_estimation_capped_total += int(
+            ev.get("wire_loss_estimation_capped", st.get("wire_loss_estimation_capped", 0)) or 0
+        )
         gpu_template_h2d_copy_count_total += int(
             ev.get("gpu_template_h2d_copy_count", st.get("gpu_template_h2d_copy_count", 0)) or 0
         )
@@ -652,7 +660,25 @@ def build_live_attack_report(
     effective_pps = (float(sent_total) / float(duration_s)) if duration_s > 0 else None
     throughput_bps_est = (float(bytes_sent_est_total) * 8.0 / float(duration_s)) if duration_s > 0 else None
     send_success_ratio = (float(sent_total) / float(attempted_total) * 100.0) if attempted_total > 0 else 0.0
+    txring_tp_drops_bounded_total = min(
+        int(txring_tp_drops_total),
+        int(txring_tp_packets_total),
+    ) if int(txring_tp_packets_total) > 0 else int(txring_tp_drops_total)
+    wire_loss_raw_packets_total = int(max(0, wire_loss_raw_packets_total, txring_tp_drops_total, host_tx_dropped_delta_total))
+    wire_loss_est_packets_total = int(
+        min(
+            max(0, attempted_total),
+            max(0, int(wire_loss_est_packets_total), int(txring_tp_drops_bounded_total), int(host_tx_dropped_delta_total)),
+        )
+    )
     wire_loss_est_pct = (float(wire_loss_est_packets_total) * 100.0 / float(max(1, attempted_total)))
+    wire_loss_raw_pct = (float(wire_loss_raw_packets_total) * 100.0 / float(max(1, attempted_total)))
+    txring_drop_ratio_pct = (float(txring_tp_drops_bounded_total) * 100.0 / float(max(1, txring_tp_packets_total)))
+    txring_flush_error_ratio_pct = (float(txring_flush_error_count_total) * 100.0 / float(max(1, txring_flush_call_count_total)))
+    txring_flush_eagain_ratio_pct = (float(txring_flush_eagain_count_total) * 100.0 / float(max(1, txring_flush_call_count_total)))
+    wire_loss_estimation_capped = int(
+        (wire_loss_raw_packets_total > wire_loss_est_packets_total) or (wire_loss_estimation_capped_total > 0)
+    )
     try:
         loss_fail_pct = float(os.environ.get("SAMURAI_LOSS_FAIL_PCT", "5") or 5.0)
     except Exception:
@@ -707,8 +733,14 @@ def build_live_attack_report(
             "softnet_time_squeeze_delta": int(softnet_time_squeeze_delta_total),
             "wire_loss_est_packets": int(wire_loss_est_packets_total),
             "wire_loss_est_pct": round(float(wire_loss_est_pct), 4),
+            "wire_loss_raw_packets": int(wire_loss_raw_packets_total),
+            "wire_loss_raw_pct": round(float(wire_loss_raw_pct), 4),
+            "wire_loss_estimation_capped": int(wire_loss_estimation_capped),
             "wire_loss_fail_pct": float(loss_fail_pct),
             "wire_loss_status": wire_loss_status,
+            "txring_drop_ratio_pct": round(float(txring_drop_ratio_pct), 4),
+            "txring_flush_error_ratio_pct": round(float(txring_flush_error_ratio_pct), 4),
+            "txring_flush_eagain_ratio_pct": round(float(txring_flush_eagain_ratio_pct), 4),
             "gpu_template_h2d_copy_count": int(gpu_template_h2d_copy_count_total),
             "gpu_template_h2d_copy_bytes": int(gpu_template_h2d_copy_bytes_total),
             "gpu_rng_state_alloc_count": int(gpu_rng_state_alloc_count_total),

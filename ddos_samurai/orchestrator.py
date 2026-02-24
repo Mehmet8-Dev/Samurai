@@ -60,11 +60,45 @@ def _empty_stats() -> dict:
         "softnet_time_squeeze_delta": 0,
         "wire_loss_est_packets": 0,
         "wire_loss_est_pct": 0.0,
+        "wire_loss_raw_packets": 0,
+        "wire_loss_raw_pct": 0.0,
+        "wire_loss_estimation_capped": 0,
+        "txring_drop_ratio_pct": 0.0,
+        "txring_flush_error_ratio_pct": 0.0,
+        "txring_flush_eagain_ratio_pct": 0.0,
+        "sender_path": "",
         "gpu_template_h2d_copy_count": 0,
         "gpu_template_h2d_copy_bytes": 0,
         "gpu_rng_state_alloc_count": 0,
         "gpu_rng_state_reuse_count": 0,
     }
+
+
+def _recompute_loss_metrics(d: dict) -> dict:
+    out = dict(d or {})
+    attempted = max(0, int(out.get("attempted", 0) or 0))
+    tx_packets = max(0, int(out.get("txring_tp_packets", 0) or 0))
+    tx_drops = max(0, int(out.get("txring_tp_drops", 0) or 0))
+    host_tx_dropped = max(0, int(out.get("host_tx_dropped_delta", 0) or 0))
+    existing_est = max(0, int(out.get("wire_loss_est_packets", 0) or 0))
+    existing_raw = max(0, int(out.get("wire_loss_raw_packets", 0) or 0))
+    flush_calls = max(0, int(out.get("txring_flush_call_count", 0) or 0))
+    flush_errors = max(0, int(out.get("txring_flush_error_count", 0) or 0))
+    flush_eagain = max(0, int(out.get("txring_flush_eagain_count", 0) or 0))
+
+    tx_drops_bounded = min(tx_drops, tx_packets) if tx_packets > 0 else tx_drops
+    raw_loss_packets = max(existing_raw, tx_drops, host_tx_dropped)
+    est_loss_packets = min(attempted, max(existing_est, tx_drops_bounded, host_tx_dropped))
+
+    out["wire_loss_raw_packets"] = int(raw_loss_packets)
+    out["wire_loss_raw_pct"] = float((100.0 * raw_loss_packets) / max(1, attempted))
+    out["wire_loss_est_packets"] = int(est_loss_packets)
+    out["wire_loss_est_pct"] = float((100.0 * est_loss_packets) / max(1, attempted))
+    out["wire_loss_estimation_capped"] = int(raw_loss_packets > est_loss_packets)
+    out["txring_drop_ratio_pct"] = float((100.0 * tx_drops_bounded) / max(1, tx_packets))
+    out["txring_flush_error_ratio_pct"] = float((100.0 * flush_errors) / max(1, flush_calls))
+    out["txring_flush_eagain_ratio_pct"] = float((100.0 * flush_eagain) / max(1, flush_calls))
+    return out
 
 
 def _add_stats(acc: dict, item: dict) -> dict:
@@ -90,14 +124,19 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["softnet_dropped_delta"] = int(acc.get("softnet_dropped_delta", 0)) + int(item.get("softnet_dropped_delta", 0) or 0)
     acc["softnet_time_squeeze_delta"] = int(acc.get("softnet_time_squeeze_delta", 0)) + int(item.get("softnet_time_squeeze_delta", 0) or 0)
     acc["wire_loss_est_packets"] = int(acc.get("wire_loss_est_packets", 0)) + int(item.get("wire_loss_est_packets", 0) or 0)
+    acc["wire_loss_raw_packets"] = int(acc.get("wire_loss_raw_packets", 0)) + int(item.get("wire_loss_raw_packets", 0) or 0)
     acc["gpu_template_h2d_copy_count"] = int(acc.get("gpu_template_h2d_copy_count", 0)) + int(item.get("gpu_template_h2d_copy_count", 0) or 0)
     acc["gpu_template_h2d_copy_bytes"] = int(acc.get("gpu_template_h2d_copy_bytes", 0)) + int(item.get("gpu_template_h2d_copy_bytes", 0) or 0)
     acc["gpu_rng_state_alloc_count"] = int(acc.get("gpu_rng_state_alloc_count", 0)) + int(item.get("gpu_rng_state_alloc_count", 0) or 0)
     acc["gpu_rng_state_reuse_count"] = int(acc.get("gpu_rng_state_reuse_count", 0)) + int(item.get("gpu_rng_state_reuse_count", 0) or 0)
-    attempted = int(acc.get("attempted", 0) or 0)
-    wire_loss = int(acc.get("wire_loss_est_packets", 0) or 0)
-    acc["wire_loss_est_pct"] = float((100.0 * wire_loss) / max(1, attempted))
-    return acc
+    item_sender_path = str(item.get("sender_path", "") or "").strip()
+    if item_sender_path:
+        current = str(acc.get("sender_path", "") or "").strip()
+        if not current:
+            acc["sender_path"] = item_sender_path
+        elif current != item_sender_path and current != "MIXED":
+            acc["sender_path"] = "MIXED"
+    return _recompute_loss_metrics(acc)
 
 
 def _build_pacing_config(args: dict) -> PacingConfig:
@@ -1446,18 +1485,8 @@ async def worker_process(
                 except Exception:
                     pass
 
-            # Keep wire-loss estimate consistent even if sender path omitted pct.
-            _attempted = int(worker_stats.get("attempted", 0) or 0)
-            _tx_drop = int(worker_stats.get("txring_tp_drops", 0) or 0)
-            _host_drop = int(worker_stats.get("host_tx_dropped_delta", 0) or 0)
-            _wire_loss_est = max(
-                int(worker_stats.get("wire_loss_est_packets", 0) or 0),
-                _tx_drop,
-                _host_drop,
-                0,
-            )
-            worker_stats["wire_loss_est_packets"] = int(_wire_loss_est)
-            worker_stats["wire_loss_est_pct"] = float((100.0 * _wire_loss_est) / max(1, _attempted))
+            # Recompute bounded loss metrics at worker finalization.
+            worker_stats = _recompute_loss_metrics(worker_stats)
         except Exception:
             pass
 
@@ -1483,7 +1512,7 @@ async def worker_process(
         if run_events is not None:
             try:
                 # Collect sender_path from last batch stats if available
-                _sender_path = str(worker_stats.get("sender_path", "unknown"))
+                _sender_path = str(worker_stats.get("sender_path", "") or "").strip() or "unknown"
                 _fallback_count = int(worker_stats.get("fallback_count", 0) or 0)
                 _perm_errors = int(worker_stats.get("permission_error_count", 0) or 0)
                 _buffer_copy_count = int(worker_stats.get("buffer_copy_count", 0) or 0)
@@ -1503,6 +1532,12 @@ async def worker_process(
                 _softnet_time_squeeze_delta = int(worker_stats.get("softnet_time_squeeze_delta", 0) or 0)
                 _wire_loss_est_packets = int(worker_stats.get("wire_loss_est_packets", 0) or 0)
                 _wire_loss_est_pct = float(worker_stats.get("wire_loss_est_pct", 0.0) or 0.0)
+                _wire_loss_raw_packets = int(worker_stats.get("wire_loss_raw_packets", 0) or 0)
+                _wire_loss_raw_pct = float(worker_stats.get("wire_loss_raw_pct", 0.0) or 0.0)
+                _wire_loss_estimation_capped = int(worker_stats.get("wire_loss_estimation_capped", 0) or 0)
+                _txring_drop_ratio_pct = float(worker_stats.get("txring_drop_ratio_pct", 0.0) or 0.0)
+                _txring_flush_error_ratio_pct = float(worker_stats.get("txring_flush_error_ratio_pct", 0.0) or 0.0)
+                _txring_flush_eagain_ratio_pct = float(worker_stats.get("txring_flush_eagain_ratio_pct", 0.0) or 0.0)
                 _gpu_template_h2d_copy_count = int(worker_stats.get("gpu_template_h2d_copy_count", 0) or 0)
                 _gpu_template_h2d_copy_bytes = int(worker_stats.get("gpu_template_h2d_copy_bytes", 0) or 0)
                 _gpu_rng_state_alloc_count = int(worker_stats.get("gpu_rng_state_alloc_count", 0) or 0)
@@ -1550,6 +1585,12 @@ async def worker_process(
                         "softnet_time_squeeze_delta": _softnet_time_squeeze_delta,
                         "wire_loss_est_packets": _wire_loss_est_packets,
                         "wire_loss_est_pct": _wire_loss_est_pct,
+                        "wire_loss_raw_packets": _wire_loss_raw_packets,
+                        "wire_loss_raw_pct": _wire_loss_raw_pct,
+                        "wire_loss_estimation_capped": _wire_loss_estimation_capped,
+                        "txring_drop_ratio_pct": _txring_drop_ratio_pct,
+                        "txring_flush_error_ratio_pct": _txring_flush_error_ratio_pct,
+                        "txring_flush_eagain_ratio_pct": _txring_flush_eagain_ratio_pct,
                         "gpu_template_h2d_copy_count": _gpu_template_h2d_copy_count,
                         "gpu_template_h2d_copy_bytes": _gpu_template_h2d_copy_bytes,
                         "gpu_rng_state_alloc_count": _gpu_rng_state_alloc_count,

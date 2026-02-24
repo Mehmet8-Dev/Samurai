@@ -1,16 +1,16 @@
 {
-  "generated_utc": "2026-02-24T14:14:38+00:00",
+  "generated_utc": "2026-02-24T16:22:14+00:00",
   "profile": "full",
   "schema": "samurai.benchmark.summary.v1",
   "sections": {
     "gpu_template": {
       "constant": {
-        "avg_ms": 3.155846333356749,
+        "avg_ms": 3.162411000327362,
         "cache_hit": 3,
         "cache_miss": 0,
         "h2d_copy_bytes": 0,
         "h2d_copy_count": 0,
-        "pps": 15843610.46718551,
+        "pps": 15810721.62815781,
         "rng_alloc": 1,
         "rng_reuse": 2
       },
@@ -23,12 +23,12 @@
         "gpu_template_h2d_copy_count": 1
       },
       "global": {
-        "avg_ms": 0.8491473333075797,
+        "avg_ms": 0.8520453332797236,
         "cache_hit": 3,
         "cache_miss": 0,
         "h2d_copy_bytes": 0,
         "h2d_copy_count": 0,
-        "pps": 58882596.74000402,
+        "pps": 58682323.63592462,
         "rng_alloc": 0,
         "rng_reuse": 3
       }
@@ -51,9 +51,9 @@
       "wire_loss_status": "ok"
     },
     "pacing": {
-      "actual_rps": 5003.73135752928,
-      "jitter_p99_ns": 63.0,
-      "rate_accuracy_pct": 100.0746271505856,
+      "actual_rps": 4997.508492141244,
+      "jitter_p99_ns": 2254.0,
+      "rate_accuracy_pct": 99.95016984282488,
       "sent": 1000,
       "target_rps": 5000.0,
       "txring_flush_call_count": 0,

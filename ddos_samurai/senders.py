@@ -71,6 +71,12 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "softnet_time_squeeze_delta": 0,
         "wire_loss_est_packets": 0,
         "wire_loss_est_pct": 0.0,
+        "wire_loss_raw_packets": 0,
+        "wire_loss_raw_pct": 0.0,
+        "wire_loss_estimation_capped": 0,
+        "txring_drop_ratio_pct": 0.0,
+        "txring_flush_error_ratio_pct": 0.0,
+        "txring_flush_eagain_ratio_pct": 0.0,
         "gpu_template_h2d_copy_count": 0,
         "gpu_template_h2d_copy_bytes": 0,
         "gpu_rng_state_alloc_count": 0,
@@ -84,6 +90,35 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         elif isinstance(v, str):
             out[k] = v
     return out
+
+
+def _recompute_loss_metrics(out: dict) -> dict:
+    d = dict(out or {})
+    attempted = max(0, int(d.get("attempted", 0) or 0))
+    tx_packets = max(0, int(d.get("txring_tp_packets", 0) or 0))
+    tx_drops = max(0, int(d.get("txring_tp_drops", 0) or 0))
+    host_tx_dropped = max(0, int(d.get("host_tx_dropped_delta", 0) or 0))
+    existing_est = max(0, int(d.get("wire_loss_est_packets", 0) or 0))
+    existing_raw = max(0, int(d.get("wire_loss_raw_packets", 0) or 0))
+    flush_calls = max(0, int(d.get("txring_flush_call_count", 0) or 0))
+    flush_errors = max(0, int(d.get("txring_flush_error_count", 0) or 0))
+    flush_eagain = max(0, int(d.get("txring_flush_eagain_count", 0) or 0))
+
+    # TX_RING drop counters are kernel-facing and may diverge from app attempted.
+    # Bound them before mapping to an attempted-based loss estimate.
+    tx_drops_bounded = min(tx_drops, tx_packets) if tx_packets > 0 else tx_drops
+    raw_loss_packets = max(existing_raw, tx_drops, host_tx_dropped)
+    est_loss_packets = min(attempted, max(existing_est, tx_drops_bounded, host_tx_dropped))
+
+    d["wire_loss_raw_packets"] = int(raw_loss_packets)
+    d["wire_loss_raw_pct"] = float((100.0 * raw_loss_packets) / max(1, attempted))
+    d["wire_loss_est_packets"] = int(est_loss_packets)
+    d["wire_loss_est_pct"] = float((100.0 * est_loss_packets) / max(1, attempted))
+    d["wire_loss_estimation_capped"] = int(raw_loss_packets > est_loss_packets)
+    d["txring_drop_ratio_pct"] = float((100.0 * tx_drops_bounded) / max(1, tx_packets))
+    d["txring_flush_error_ratio_pct"] = float((100.0 * flush_errors) / max(1, flush_calls))
+    d["txring_flush_eagain_ratio_pct"] = float((100.0 * flush_eagain) / max(1, flush_calls))
+    return d
 
 def _update_live(val, inc):
     if val is not None:
@@ -138,15 +173,7 @@ def _attach_loss_telemetry(stats_out: dict, before_snapshot: dict, preferred_ifa
     out["host_tx_errors_delta"] = int(delta.get("host_tx_errors_delta", 0) or 0)
     out["softnet_dropped_delta"] = int(delta.get("softnet_dropped_delta", 0) or 0)
     out["softnet_time_squeeze_delta"] = int(delta.get("softnet_time_squeeze_delta", 0) or 0)
-
-    attempted = int(out.get("attempted", 0) or 0)
-    txring_tp_drops = int(out.get("txring_tp_drops", 0) or 0)
-    host_tx_dropped = int(out.get("host_tx_dropped_delta", 0) or 0)
-    wire_loss_est_packets = max(0, txring_tp_drops, host_tx_dropped)
-    out["wire_loss_est_packets"] = int(wire_loss_est_packets)
-    out["wire_loss_est_pct"] = float((100.0 * wire_loss_est_packets) / max(1, attempted))
-
-    return out
+    return _recompute_loss_metrics(out)
 
 
 def _normalize_packets_buffer(
@@ -263,16 +290,14 @@ def _merge_stats(*items):
         acc["softnet_dropped_delta"] += int(it.get("softnet_dropped_delta", 0) or 0)
         acc["softnet_time_squeeze_delta"] += int(it.get("softnet_time_squeeze_delta", 0) or 0)
         acc["wire_loss_est_packets"] += int(it.get("wire_loss_est_packets", 0) or 0)
+        acc["wire_loss_raw_packets"] += int(it.get("wire_loss_raw_packets", 0) or 0)
         acc["gpu_template_h2d_copy_count"] += int(it.get("gpu_template_h2d_copy_count", 0) or 0)
         acc["gpu_template_h2d_copy_bytes"] += int(it.get("gpu_template_h2d_copy_bytes", 0) or 0)
         acc["gpu_rng_state_alloc_count"] += int(it.get("gpu_rng_state_alloc_count", 0) or 0)
         acc["gpu_rng_state_reuse_count"] += int(it.get("gpu_rng_state_reuse_count", 0) or 0)
         if "sender_path" in it:
             acc["sender_path"] = str(it.get("sender_path") or "")
-    attempted_total = int(acc.get("attempted", 0) or 0)
-    wire_loss_total = int(acc.get("wire_loss_est_packets", 0) or 0)
-    acc["wire_loss_est_pct"] = float((100.0 * wire_loss_total) / max(1, attempted_total))
-    return acc
+    return _recompute_loss_metrics(acc)
 
 async def send_packet_async(packet, verbose, packet_no, loop, protocol):
     """Asynchronously send a packet using scapy in a thread executor."""
@@ -500,12 +525,13 @@ except ImportError:
 try:
     from .pacing import (
         PacingConfig, PacingMode, JitterModel,
-        paced_send, paced_send_l2, get_stats, format_stats, cleanup_l2,
+        paced_send, paced_send_l2, get_stats, reset_stats, format_stats, cleanup_l2,
         PACING_ENGINE_AVAILABLE,
     )
 except ImportError:
     PACING_ENGINE_AVAILABLE = False
     PacingConfig = None
+    reset_stats = None
 
 # Lazy import AF_XDP sender module
 try:
@@ -1103,6 +1129,11 @@ async def paced_raw_socket_sender(
                     loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
                 log_info(f"[Pacing] Using L2 paced sender on {iface}")
                 loop = asyncio.get_running_loop()
+                try:
+                    if callable(reset_stats):
+                        reset_stats()
+                except Exception:
+                    pass
                 sent = await loop.run_in_executor(
                     None,
                     lambda: paced_send_l2(
@@ -1133,6 +1164,7 @@ async def paced_raw_socket_sender(
                     sent=int(sent or 0),
                     errors=max(0, count - int(sent or 0)),
                     bytes_sent_est=int(sent or 0) * packet_size,
+                    sender_path="PACED_L2",
                     buffer_copy_count=buffer_copy_count,
                     buffer_copy_bytes=buffer_copy_bytes,
                     eagain_retry_count=0,
@@ -1159,6 +1191,11 @@ async def paced_raw_socket_sender(
     try:
         log_info(f"[Pacing] Using L3 paced sender")
         loop = asyncio.get_running_loop()
+        try:
+            if callable(reset_stats):
+                reset_stats()
+        except Exception:
+            pass
         sent = await loop.run_in_executor(
             None,
             lambda: paced_send(
@@ -1181,6 +1218,7 @@ async def paced_raw_socket_sender(
             sent=int(sent or 0),
             errors=max(0, count - int(sent or 0)),
             bytes_sent_est=int(sent or 0) * packet_size,
+            sender_path="PACED_L3",
             buffer_copy_count=buffer_copy_count,
             buffer_copy_bytes=buffer_copy_bytes,
             eagain_retry_count=0,
