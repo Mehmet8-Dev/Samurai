@@ -55,13 +55,22 @@ class TestFastSenderTxRingStats(unittest.TestCase):
             "txring_tp_packets",
             "txring_tp_drops",
             "txring_tp_freeze_q_cnt",
+            "txring_packet_version",
+            "txring_packet_version_name",
         ):
             self.assertIn(key, out)
+            if key == "txring_packet_version_name":
+                self.assertIn(str(out.get(key, "")), ("TPACKET_V2", "TPACKET_V3"))
+                continue
             self.assertGreaterEqual(int(out.get(key, 0) or 0), 0)
 
         self.assertLessEqual(int(out["sent"]), int(out["attempted"]))
+        version = int(out.get("txring_packet_version", 0) or 0)
+        version_name = str(out.get("txring_packet_version_name", "") or "")
+        self.assertIn(version, (1, 2))
+        expected = {1: "TPACKET_V2", 2: "TPACKET_V3"}[version]
+        self.assertEqual(version_name, expected)
 
 
 if __name__ == "__main__":
     unittest.main()
-

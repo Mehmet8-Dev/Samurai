@@ -65,6 +65,8 @@ class TestReporting(unittest.TestCase):
                 "txring_tp_packets": 9,
                 "txring_tp_drops": 1,
                 "txring_tp_freeze_q_cnt": 0,
+                "txring_packet_version": 1,
+                "txring_packet_version_name": "TPACKET_V2",
                 "host_tx_packets_delta": 10,
                 "host_tx_dropped_delta": 1,
                 "host_tx_errors_delta": 0,
@@ -99,6 +101,8 @@ class TestReporting(unittest.TestCase):
                 "txring_tp_packets": 8,
                 "txring_tp_drops": 0,
                 "txring_tp_freeze_q_cnt": 0,
+                "txring_packet_version": 1,
+                "txring_packet_version_name": "TPACKET_V2",
                 "host_tx_packets_delta": 9,
                 "host_tx_dropped_delta": 0,
                 "host_tx_errors_delta": 1,
@@ -137,6 +141,8 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["txring_flush_error_count"], 1)
         self.assertEqual(rr.results["txring_tp_packets"], 17)
         self.assertEqual(rr.results["txring_tp_drops"], 1)
+        self.assertEqual(rr.results["txring_packet_version"], 1)
+        self.assertEqual(rr.results["txring_packet_version_name"], "TPACKET_V2")
         self.assertEqual(rr.results["host_tx_packets_delta"], 19)
         self.assertEqual(rr.results["host_tx_dropped_delta"], 1)
         self.assertEqual(rr.results["softnet_dropped_delta"], 2)

@@ -229,6 +229,8 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
             "txring_tp_packets": 9,
             "txring_tp_drops": 2,
             "txring_tp_freeze_q_cnt": 0,
+            "txring_packet_version": 1,
+            "txring_packet_version_name": "TPACKET_V2",
             "host_tx_packets_delta": 10,
             "host_tx_dropped_delta": 2,
             "host_tx_errors_delta": 1,
@@ -251,6 +253,8 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ev["txring_flush_error_count"], 1)
         self.assertEqual(ev["txring_tp_packets"], 9)
         self.assertEqual(ev["txring_tp_drops"], 2)
+        self.assertEqual(ev["txring_packet_version"], 1)
+        self.assertEqual(ev["txring_packet_version_name"], "TPACKET_V2")
         self.assertEqual(ev["host_tx_packets_delta"], 10)
         self.assertEqual(ev["host_tx_dropped_delta"], 2)
         self.assertEqual(ev["wire_loss_est_packets"], 2)

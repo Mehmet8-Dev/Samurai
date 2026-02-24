@@ -379,9 +379,27 @@ def test_l2_txring_stats_fields():
         "txring_tp_packets",
         "txring_tp_drops",
         "txring_tp_freeze_q_cnt",
+        "txring_packet_version",
+        "txring_packet_version_name",
     ):
         assert key in stats
+        if key in ("txring_packet_version_name",):
+            assert isinstance(stats.get(key), str)
+            continue
         assert int(stats.get(key, 0) or 0) >= 0
+
+    version = int(stats.get("txring_packet_version", 0) or 0)
+    version_name = str(stats.get("txring_packet_version_name", "") or "")
+    # Linux AF_PACKET enum values are typically:
+    #   TPACKET_V1=0, TPACKET_V2=1, TPACKET_V3=2
+    # so raw "packet_version" should not be compared against literal (2,3).
+    assert version_name in ("TPACKET_V2", "TPACKET_V3")
+    expected_name_by_raw = {
+        1: "TPACKET_V2",
+        2: "TPACKET_V3",
+    }.get(version)
+    if expected_name_by_raw is not None:
+        assert version_name == expected_name_by_raw
 
 
 # ── Test 5: SCHED_FIFO Real-Time Scheduling ─────────────────────────────────
