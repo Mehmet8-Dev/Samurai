@@ -52,6 +52,11 @@ class TestFastSenderTxRingStats(unittest.TestCase):
             "txring_flush_call_count",
             "txring_flush_error_count",
             "txring_flush_eagain_count",
+            "txring_flush_enobufs_count",
+            "txring_flush_ebusy_count",
+            "txring_flush_other_errno_count",
+            "txring_flush_last_errno",
+            "txring_flush_last_errno_name",
             "txring_frame_wait_ns",
             "txring_poll_count",
             "flush_mode",
@@ -67,6 +72,9 @@ class TestFastSenderTxRingStats(unittest.TestCase):
                 continue
             if key == "flush_mode":
                 self.assertIn(str(out.get(key, "")), ("legacy", "adaptive"))
+                continue
+            if key == "txring_flush_last_errno_name":
+                self.assertIn(str(out.get(key, "")), ("NONE", "EAGAIN", "ENOBUFS", "EBUSY", "OTHER"))
                 continue
             self.assertGreaterEqual(int(out.get(key, 0) or 0), 0)
 

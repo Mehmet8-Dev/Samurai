@@ -226,6 +226,11 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
             "txring_flush_call_count": 5,
             "txring_flush_error_count": 1,
             "txring_flush_eagain_count": 1,
+            "txring_flush_enobufs_count": 2,
+            "txring_flush_ebusy_count": 1,
+            "txring_flush_other_errno_count": 0,
+            "txring_flush_last_errno": 105,
+            "txring_flush_last_errno_name": "ENOBUFS",
             "txring_tp_packets": 9,
             "txring_tp_drops": 2,
             "txring_tp_freeze_q_cnt": 0,
@@ -251,6 +256,10 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ev["partial_send_retry_count"], 4)
         self.assertEqual(ev["txring_flush_call_count"], 5)
         self.assertEqual(ev["txring_flush_error_count"], 1)
+        self.assertEqual(ev["txring_flush_enobufs_count"], 2)
+        self.assertEqual(ev["txring_flush_ebusy_count"], 1)
+        self.assertEqual(ev["txring_flush_last_errno"], 105)
+        self.assertEqual(ev["txring_flush_last_errno_name"], "ENOBUFS")
         self.assertEqual(ev["txring_tp_packets"], 9)
         self.assertEqual(ev["txring_tp_drops"], 2)
         self.assertEqual(ev["txring_packet_version"], 1)

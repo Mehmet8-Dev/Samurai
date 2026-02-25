@@ -62,6 +62,11 @@ class TestReporting(unittest.TestCase):
                 "txring_flush_call_count": 11,
                 "txring_flush_error_count": 1,
                 "txring_flush_eagain_count": 1,
+                "txring_flush_enobufs_count": 0,
+                "txring_flush_ebusy_count": 0,
+                "txring_flush_other_errno_count": 0,
+                "txring_flush_last_errno": 11,
+                "txring_flush_last_errno_name": "EAGAIN",
                 "txring_tp_packets": 9,
                 "txring_tp_drops": 1,
                 "txring_tp_freeze_q_cnt": 0,
@@ -98,6 +103,11 @@ class TestReporting(unittest.TestCase):
                 "txring_flush_call_count": 7,
                 "txring_flush_error_count": 0,
                 "txring_flush_eagain_count": 0,
+                "txring_flush_enobufs_count": 2,
+                "txring_flush_ebusy_count": 1,
+                "txring_flush_other_errno_count": 3,
+                "txring_flush_last_errno": 105,
+                "txring_flush_last_errno_name": "ENOBUFS",
                 "txring_tp_packets": 8,
                 "txring_tp_drops": 0,
                 "txring_tp_freeze_q_cnt": 0,
@@ -139,6 +149,11 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["partial_send_retry_count"], 5)
         self.assertEqual(rr.results["txring_flush_call_count"], 18)
         self.assertEqual(rr.results["txring_flush_error_count"], 1)
+        self.assertEqual(rr.results["txring_flush_enobufs_count"], 2)
+        self.assertEqual(rr.results["txring_flush_ebusy_count"], 1)
+        self.assertEqual(rr.results["txring_flush_other_errno_count"], 3)
+        self.assertEqual(rr.results["txring_flush_last_errno"], 105)
+        self.assertEqual(rr.results["txring_flush_last_errno_name"], "ENOBUFS")
         self.assertEqual(rr.results["txring_tp_packets"], 17)
         self.assertEqual(rr.results["txring_tp_drops"], 1)
         self.assertEqual(rr.results["txring_packet_version"], 1)
@@ -148,6 +163,9 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["softnet_dropped_delta"], 2)
         self.assertEqual(rr.results["wire_loss_est_packets"], 1)
         self.assertEqual(rr.results["wire_loss_status"], "warn")
+        self.assertAlmostEqual(rr.results["txring_flush_enobufs_ratio_pct"], 11.1111, places=4)
+        self.assertAlmostEqual(rr.results["txring_flush_ebusy_ratio_pct"], 5.5556, places=4)
+        self.assertAlmostEqual(rr.results["txring_flush_other_errno_ratio_pct"], 16.6667, places=4)
         self.assertEqual(rr.results["gpu_template_h2d_copy_count"], 4)
         self.assertEqual(rr.results["gpu_rng_state_alloc_count"], 2)
 
