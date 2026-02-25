@@ -62,6 +62,11 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "txring_flush_call_count": 0,
         "txring_flush_error_count": 0,
         "txring_flush_eagain_count": 0,
+        "txring_flush_enobufs_count": 0,
+        "txring_flush_ebusy_count": 0,
+        "txring_flush_other_errno_count": 0,
+        "txring_flush_last_errno": 0,
+        "txring_flush_last_errno_name": "NONE",
         "txring_frame_wait_ns": 0,
         "txring_poll_count": 0,
         "flush_mode": "unknown",
@@ -83,6 +88,9 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "txring_drop_ratio_pct": 0.0,
         "txring_flush_error_ratio_pct": 0.0,
         "txring_flush_eagain_ratio_pct": 0.0,
+        "txring_flush_enobufs_ratio_pct": 0.0,
+        "txring_flush_ebusy_ratio_pct": 0.0,
+        "txring_flush_other_errno_ratio_pct": 0.0,
         "gpu_template_h2d_copy_count": 0,
         "gpu_template_h2d_copy_bytes": 0,
         "gpu_rng_state_alloc_count": 0,
@@ -109,6 +117,9 @@ def _recompute_loss_metrics(out: dict) -> dict:
     flush_calls = max(0, int(d.get("txring_flush_call_count", 0) or 0))
     flush_errors = max(0, int(d.get("txring_flush_error_count", 0) or 0))
     flush_eagain = max(0, int(d.get("txring_flush_eagain_count", 0) or 0))
+    flush_enobufs = max(0, int(d.get("txring_flush_enobufs_count", 0) or 0))
+    flush_ebusy = max(0, int(d.get("txring_flush_ebusy_count", 0) or 0))
+    flush_other_errno = max(0, int(d.get("txring_flush_other_errno_count", 0) or 0))
 
     # TX_RING drop counters are kernel-facing and may diverge from app attempted.
     # Bound them before mapping to an attempted-based loss estimate.
@@ -124,6 +135,9 @@ def _recompute_loss_metrics(out: dict) -> dict:
     d["txring_drop_ratio_pct"] = float((100.0 * tx_drops_bounded) / max(1, tx_packets))
     d["txring_flush_error_ratio_pct"] = float((100.0 * flush_errors) / max(1, flush_calls))
     d["txring_flush_eagain_ratio_pct"] = float((100.0 * flush_eagain) / max(1, flush_calls))
+    d["txring_flush_enobufs_ratio_pct"] = float((100.0 * flush_enobufs) / max(1, flush_calls))
+    d["txring_flush_ebusy_ratio_pct"] = float((100.0 * flush_ebusy) / max(1, flush_calls))
+    d["txring_flush_other_errno_ratio_pct"] = float((100.0 * flush_other_errno) / max(1, flush_calls))
     return d
 
 def _update_live(val, inc):
@@ -289,6 +303,14 @@ def _merge_stats(*items):
         acc["txring_flush_call_count"] += int(it.get("txring_flush_call_count", 0) or 0)
         acc["txring_flush_error_count"] += int(it.get("txring_flush_error_count", 0) or 0)
         acc["txring_flush_eagain_count"] += int(it.get("txring_flush_eagain_count", 0) or 0)
+        acc["txring_flush_enobufs_count"] += int(it.get("txring_flush_enobufs_count", 0) or 0)
+        acc["txring_flush_ebusy_count"] += int(it.get("txring_flush_ebusy_count", 0) or 0)
+        acc["txring_flush_other_errno_count"] += int(it.get("txring_flush_other_errno_count", 0) or 0)
+        _item_last_errno = int(it.get("txring_flush_last_errno", 0) or 0)
+        _item_last_errno_name = str(it.get("txring_flush_last_errno_name", "") or "").strip()
+        if _item_last_errno or _item_last_errno_name:
+            acc["txring_flush_last_errno"] = _item_last_errno
+            acc["txring_flush_last_errno_name"] = _item_last_errno_name or "OTHER"
         acc["txring_frame_wait_ns"] += int(it.get("txring_frame_wait_ns", 0) or 0)
         acc["txring_poll_count"] += int(it.get("txring_poll_count", 0) or 0)
         item_flush_mode = str(it.get("flush_mode", "") or "").strip()
@@ -848,6 +870,11 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
     txring_flush_call_count = 0
     txring_flush_error_count = 0
     txring_flush_eagain_count = 0
+    txring_flush_enobufs_count = 0
+    txring_flush_ebusy_count = 0
+    txring_flush_other_errno_count = 0
+    txring_flush_last_errno = 0
+    txring_flush_last_errno_name = "NONE"
     txring_frame_wait_ns = 0
     txring_poll_count = 0
     flush_mode = "unknown"
@@ -886,6 +913,15 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                                 txring_flush_call_count += int(tx_result.get("txring_flush_call_count", 0) or 0)
                                 txring_flush_error_count += int(tx_result.get("txring_flush_error_count", 0) or 0)
                                 txring_flush_eagain_count += int(tx_result.get("txring_flush_eagain_count", 0) or 0)
+                                txring_flush_enobufs_count += int(tx_result.get("txring_flush_enobufs_count", 0) or 0)
+                                txring_flush_ebusy_count += int(tx_result.get("txring_flush_ebusy_count", 0) or 0)
+                                txring_flush_other_errno_count += int(
+                                    tx_result.get("txring_flush_other_errno_count", 0) or 0
+                                )
+                                txring_flush_last_errno = int(tx_result.get("txring_flush_last_errno", 0) or 0)
+                                txring_flush_last_errno_name = str(
+                                    tx_result.get("txring_flush_last_errno_name", "NONE") or "NONE"
+                                )
                                 txring_frame_wait_ns += int(tx_result.get("txring_frame_wait_ns", 0) or 0)
                                 txring_poll_count += int(tx_result.get("txring_poll_count", 0) or 0)
                                 _tx_flush_mode = str(tx_result.get("flush_mode", "") or "").strip()
@@ -932,6 +968,11 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                             txring_flush_call_count=txring_flush_call_count,
                             txring_flush_error_count=txring_flush_error_count,
                             txring_flush_eagain_count=txring_flush_eagain_count,
+                            txring_flush_enobufs_count=txring_flush_enobufs_count,
+                            txring_flush_ebusy_count=txring_flush_ebusy_count,
+                            txring_flush_other_errno_count=txring_flush_other_errno_count,
+                            txring_flush_last_errno=txring_flush_last_errno,
+                            txring_flush_last_errno_name=txring_flush_last_errno_name,
                             txring_frame_wait_ns=txring_frame_wait_ns,
                             txring_poll_count=txring_poll_count,
                             flush_mode=flush_mode,
@@ -1133,6 +1174,11 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
         txring_flush_call_count=txring_flush_call_count,
         txring_flush_error_count=txring_flush_error_count,
         txring_flush_eagain_count=txring_flush_eagain_count,
+        txring_flush_enobufs_count=txring_flush_enobufs_count,
+        txring_flush_ebusy_count=txring_flush_ebusy_count,
+        txring_flush_other_errno_count=txring_flush_other_errno_count,
+        txring_flush_last_errno=txring_flush_last_errno,
+        txring_flush_last_errno_name=txring_flush_last_errno_name,
         txring_frame_wait_ns=txring_frame_wait_ns,
         txring_poll_count=txring_poll_count,
         flush_mode=flush_mode,
@@ -1259,6 +1305,15 @@ async def paced_raw_socket_sender(
                     out["txring_flush_call_count"] = int(stats.get("txring_flush_call_count", 0) or 0)
                     out["txring_flush_error_count"] = int(stats.get("txring_flush_error_count", 0) or 0)
                     out["txring_flush_eagain_count"] = int(stats.get("txring_flush_eagain_count", 0) or 0)
+                    out["txring_flush_enobufs_count"] = int(stats.get("txring_flush_enobufs_count", 0) or 0)
+                    out["txring_flush_ebusy_count"] = int(stats.get("txring_flush_ebusy_count", 0) or 0)
+                    out["txring_flush_other_errno_count"] = int(
+                        stats.get("txring_flush_other_errno_count", 0) or 0
+                    )
+                    out["txring_flush_last_errno"] = int(stats.get("txring_flush_last_errno", 0) or 0)
+                    out["txring_flush_last_errno_name"] = str(
+                        stats.get("txring_flush_last_errno_name", "NONE") or "NONE"
+                    )
                     out["txring_tp_packets"] = int(stats.get("txring_tp_packets", 0) or 0)
                     out["txring_tp_drops"] = int(stats.get("txring_tp_drops", 0) or 0)
                     out["txring_tp_freeze_q_cnt"] = int(stats.get("txring_tp_freeze_q_cnt", 0) or 0)
@@ -1317,6 +1372,13 @@ async def paced_raw_socket_sender(
             out["txring_flush_call_count"] = int(stats.get("txring_flush_call_count", 0) or 0)
             out["txring_flush_error_count"] = int(stats.get("txring_flush_error_count", 0) or 0)
             out["txring_flush_eagain_count"] = int(stats.get("txring_flush_eagain_count", 0) or 0)
+            out["txring_flush_enobufs_count"] = int(stats.get("txring_flush_enobufs_count", 0) or 0)
+            out["txring_flush_ebusy_count"] = int(stats.get("txring_flush_ebusy_count", 0) or 0)
+            out["txring_flush_other_errno_count"] = int(stats.get("txring_flush_other_errno_count", 0) or 0)
+            out["txring_flush_last_errno"] = int(stats.get("txring_flush_last_errno", 0) or 0)
+            out["txring_flush_last_errno_name"] = str(
+                stats.get("txring_flush_last_errno_name", "NONE") or "NONE"
+            )
             out["txring_tp_packets"] = int(stats.get("txring_tp_packets", 0) or 0)
             out["txring_tp_drops"] = int(stats.get("txring_tp_drops", 0) or 0)
             out["txring_tp_freeze_q_cnt"] = int(stats.get("txring_tp_freeze_q_cnt", 0) or 0)

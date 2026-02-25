@@ -76,6 +76,14 @@ static const char* txring_flush_mode_name(int mode) {
     return (mode == TXRING_FLUSH_MODE_ADAPTIVE) ? "adaptive" : "legacy";
 }
 
+static const char* txring_flush_errno_name(int err) {
+    if (err == 0) return "NONE";
+    if (err == EAGAIN || err == EWOULDBLOCK) return "EAGAIN";
+    if (err == ENOBUFS) return "ENOBUFS";
+    if (err == EBUSY) return "EBUSY";
+    return "OTHER";
+}
+
 static inline uint64_t monotonic_ns_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1031,6 +1039,10 @@ typedef struct {
     unsigned long long txring_flush_call_count;
     unsigned long long txring_flush_error_count;
     unsigned long long txring_flush_eagain_count;
+    unsigned long long txring_flush_enobufs_count;
+    unsigned long long txring_flush_ebusy_count;
+    unsigned long long txring_flush_other_errno_count;
+    int txring_flush_last_errno;
     unsigned long long txring_tp_packets;
     unsigned long long txring_tp_drops;
     unsigned long long txring_tp_freeze_q_cnt;
@@ -1079,16 +1091,25 @@ static void collect_txring_packet_stats(const ring_context_t* ctx, txring_send_m
 
 static inline int txring_flush_socket(int sock, txring_send_metrics_t* metrics) {
     ssize_t flush_ret;
+    int err = 0;
     if (!metrics) return 0;
 
     metrics->txring_flush_call_count++;
     flush_ret = sendto(sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
     if (flush_ret < 0) {
+        err = errno;
         metrics->txring_flush_error_count++;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (err == EAGAIN || err == EWOULDBLOCK) {
             metrics->txring_flush_eagain_count++;
+        } else if (err == ENOBUFS) {
+            metrics->txring_flush_enobufs_count++;
+        } else if (err == EBUSY) {
+            metrics->txring_flush_ebusy_count++;
+        } else {
+            metrics->txring_flush_other_errno_count++;
         }
-        return errno;
+        metrics->txring_flush_last_errno = err;
+        return err;
     }
     return 0;
 }
@@ -1288,13 +1309,18 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
     packet_version_str = packet_version_name(packet_version);
 
     return Py_BuildValue(
-        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:s,s:i,s:s}",
+        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:i,s:s,s:K,s:K,s:K,s:K,s:K,s:s,s:i,s:s}",
         "attempted", metrics.attempted,
         "sent", metrics.sent,
         "errors", errors,
         "txring_flush_call_count", metrics.txring_flush_call_count,
         "txring_flush_error_count", metrics.txring_flush_error_count,
         "txring_flush_eagain_count", metrics.txring_flush_eagain_count,
+        "txring_flush_enobufs_count", metrics.txring_flush_enobufs_count,
+        "txring_flush_ebusy_count", metrics.txring_flush_ebusy_count,
+        "txring_flush_other_errno_count", metrics.txring_flush_other_errno_count,
+        "txring_flush_last_errno", metrics.txring_flush_last_errno,
+        "txring_flush_last_errno_name", txring_flush_errno_name(metrics.txring_flush_last_errno),
         "txring_tp_packets", metrics.txring_tp_packets,
         "txring_tp_drops", metrics.txring_tp_drops,
         "txring_tp_freeze_q_cnt", metrics.txring_tp_freeze_q_cnt,

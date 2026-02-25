@@ -1449,8 +1449,26 @@ def main(argv=None):
                     "txring_flush_call_count": int(rr.results.get("txring_flush_call_count", 0) or 0),
                     "txring_flush_error_count": int(rr.results.get("txring_flush_error_count", 0) or 0),
                     "txring_flush_eagain_count": int(rr.results.get("txring_flush_eagain_count", 0) or 0),
+                    "txring_flush_enobufs_count": int(rr.results.get("txring_flush_enobufs_count", 0) or 0),
+                    "txring_flush_ebusy_count": int(rr.results.get("txring_flush_ebusy_count", 0) or 0),
+                    "txring_flush_other_errno_count": int(
+                        rr.results.get("txring_flush_other_errno_count", 0) or 0
+                    ),
+                    "txring_flush_last_errno": int(rr.results.get("txring_flush_last_errno", 0) or 0),
+                    "txring_flush_last_errno_name": str(
+                        rr.results.get("txring_flush_last_errno_name", "NONE") or "NONE"
+                    ),
                     "txring_flush_error_ratio_pct": float(rr.results.get("txring_flush_error_ratio_pct", 0.0) or 0.0),
                     "txring_flush_eagain_ratio_pct": float(rr.results.get("txring_flush_eagain_ratio_pct", 0.0) or 0.0),
+                    "txring_flush_enobufs_ratio_pct": float(
+                        rr.results.get("txring_flush_enobufs_ratio_pct", 0.0) or 0.0
+                    ),
+                    "txring_flush_ebusy_ratio_pct": float(
+                        rr.results.get("txring_flush_ebusy_ratio_pct", 0.0) or 0.0
+                    ),
+                    "txring_flush_other_errno_ratio_pct": float(
+                        rr.results.get("txring_flush_other_errno_ratio_pct", 0.0) or 0.0
+                    ),
                     "txring_frame_wait_ns": int(rr.results.get("txring_frame_wait_ns", 0) or 0),
                     "txring_poll_count": int(rr.results.get("txring_poll_count", 0) or 0),
                     "flush_mode": str(rr.results.get("flush_mode", "unknown") or "unknown"),

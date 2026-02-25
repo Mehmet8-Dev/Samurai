@@ -51,6 +51,11 @@ def _empty_stats() -> dict:
         "txring_flush_call_count": 0,
         "txring_flush_error_count": 0,
         "txring_flush_eagain_count": 0,
+        "txring_flush_enobufs_count": 0,
+        "txring_flush_ebusy_count": 0,
+        "txring_flush_other_errno_count": 0,
+        "txring_flush_last_errno": 0,
+        "txring_flush_last_errno_name": "NONE",
         "txring_frame_wait_ns": 0,
         "txring_poll_count": 0,
         "flush_mode": "unknown",
@@ -72,6 +77,9 @@ def _empty_stats() -> dict:
         "txring_drop_ratio_pct": 0.0,
         "txring_flush_error_ratio_pct": 0.0,
         "txring_flush_eagain_ratio_pct": 0.0,
+        "txring_flush_enobufs_ratio_pct": 0.0,
+        "txring_flush_ebusy_ratio_pct": 0.0,
+        "txring_flush_other_errno_ratio_pct": 0.0,
         "sender_path": "",
         "gpu_template_h2d_copy_count": 0,
         "gpu_template_h2d_copy_bytes": 0,
@@ -91,6 +99,9 @@ def _recompute_loss_metrics(d: dict) -> dict:
     flush_calls = max(0, int(out.get("txring_flush_call_count", 0) or 0))
     flush_errors = max(0, int(out.get("txring_flush_error_count", 0) or 0))
     flush_eagain = max(0, int(out.get("txring_flush_eagain_count", 0) or 0))
+    flush_enobufs = max(0, int(out.get("txring_flush_enobufs_count", 0) or 0))
+    flush_ebusy = max(0, int(out.get("txring_flush_ebusy_count", 0) or 0))
+    flush_other_errno = max(0, int(out.get("txring_flush_other_errno_count", 0) or 0))
 
     tx_drops_bounded = min(tx_drops, tx_packets) if tx_packets > 0 else tx_drops
     raw_loss_packets = max(existing_raw, tx_drops, host_tx_dropped)
@@ -104,6 +115,9 @@ def _recompute_loss_metrics(d: dict) -> dict:
     out["txring_drop_ratio_pct"] = float((100.0 * tx_drops_bounded) / max(1, tx_packets))
     out["txring_flush_error_ratio_pct"] = float((100.0 * flush_errors) / max(1, flush_calls))
     out["txring_flush_eagain_ratio_pct"] = float((100.0 * flush_eagain) / max(1, flush_calls))
+    out["txring_flush_enobufs_ratio_pct"] = float((100.0 * flush_enobufs) / max(1, flush_calls))
+    out["txring_flush_ebusy_ratio_pct"] = float((100.0 * flush_ebusy) / max(1, flush_calls))
+    out["txring_flush_other_errno_ratio_pct"] = float((100.0 * flush_other_errno) / max(1, flush_calls))
     return out
 
 
@@ -122,6 +136,14 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["txring_flush_call_count"] = int(acc.get("txring_flush_call_count", 0)) + int(item.get("txring_flush_call_count", 0) or 0)
     acc["txring_flush_error_count"] = int(acc.get("txring_flush_error_count", 0)) + int(item.get("txring_flush_error_count", 0) or 0)
     acc["txring_flush_eagain_count"] = int(acc.get("txring_flush_eagain_count", 0)) + int(item.get("txring_flush_eagain_count", 0) or 0)
+    acc["txring_flush_enobufs_count"] = int(acc.get("txring_flush_enobufs_count", 0)) + int(item.get("txring_flush_enobufs_count", 0) or 0)
+    acc["txring_flush_ebusy_count"] = int(acc.get("txring_flush_ebusy_count", 0)) + int(item.get("txring_flush_ebusy_count", 0) or 0)
+    acc["txring_flush_other_errno_count"] = int(acc.get("txring_flush_other_errno_count", 0)) + int(item.get("txring_flush_other_errno_count", 0) or 0)
+    _item_last_errno = int(item.get("txring_flush_last_errno", 0) or 0)
+    _item_last_errno_name = str(item.get("txring_flush_last_errno_name", "") or "").strip()
+    if _item_last_errno or _item_last_errno_name:
+        acc["txring_flush_last_errno"] = _item_last_errno
+        acc["txring_flush_last_errno_name"] = _item_last_errno_name or "OTHER"
     acc["txring_frame_wait_ns"] = int(acc.get("txring_frame_wait_ns", 0)) + int(item.get("txring_frame_wait_ns", 0) or 0)
     acc["txring_poll_count"] = int(acc.get("txring_poll_count", 0)) + int(item.get("txring_poll_count", 0) or 0)
     item_flush_mode = str(item.get("flush_mode", "") or "").strip()
@@ -1559,6 +1581,13 @@ async def worker_process(
                 _txring_flush_call_count = int(worker_stats.get("txring_flush_call_count", 0) or 0)
                 _txring_flush_error_count = int(worker_stats.get("txring_flush_error_count", 0) or 0)
                 _txring_flush_eagain_count = int(worker_stats.get("txring_flush_eagain_count", 0) or 0)
+                _txring_flush_enobufs_count = int(worker_stats.get("txring_flush_enobufs_count", 0) or 0)
+                _txring_flush_ebusy_count = int(worker_stats.get("txring_flush_ebusy_count", 0) or 0)
+                _txring_flush_other_errno_count = int(worker_stats.get("txring_flush_other_errno_count", 0) or 0)
+                _txring_flush_last_errno = int(worker_stats.get("txring_flush_last_errno", 0) or 0)
+                _txring_flush_last_errno_name = str(
+                    worker_stats.get("txring_flush_last_errno_name", "NONE") or "NONE"
+                )
                 _txring_frame_wait_ns = int(worker_stats.get("txring_frame_wait_ns", 0) or 0)
                 _txring_poll_count = int(worker_stats.get("txring_poll_count", 0) or 0)
                 _flush_mode = str(worker_stats.get("flush_mode", "unknown") or "unknown")
@@ -1582,6 +1611,15 @@ async def worker_process(
                 _txring_drop_ratio_pct = float(worker_stats.get("txring_drop_ratio_pct", 0.0) or 0.0)
                 _txring_flush_error_ratio_pct = float(worker_stats.get("txring_flush_error_ratio_pct", 0.0) or 0.0)
                 _txring_flush_eagain_ratio_pct = float(worker_stats.get("txring_flush_eagain_ratio_pct", 0.0) or 0.0)
+                _txring_flush_enobufs_ratio_pct = float(
+                    worker_stats.get("txring_flush_enobufs_ratio_pct", 0.0) or 0.0
+                )
+                _txring_flush_ebusy_ratio_pct = float(
+                    worker_stats.get("txring_flush_ebusy_ratio_pct", 0.0) or 0.0
+                )
+                _txring_flush_other_errno_ratio_pct = float(
+                    worker_stats.get("txring_flush_other_errno_ratio_pct", 0.0) or 0.0
+                )
                 _gpu_template_h2d_copy_count = int(worker_stats.get("gpu_template_h2d_copy_count", 0) or 0)
                 _gpu_template_h2d_copy_bytes = int(worker_stats.get("gpu_template_h2d_copy_bytes", 0) or 0)
                 _gpu_rng_state_alloc_count = int(worker_stats.get("gpu_rng_state_alloc_count", 0) or 0)
@@ -1620,6 +1658,11 @@ async def worker_process(
                         "txring_flush_call_count": _txring_flush_call_count,
                         "txring_flush_error_count": _txring_flush_error_count,
                         "txring_flush_eagain_count": _txring_flush_eagain_count,
+                        "txring_flush_enobufs_count": _txring_flush_enobufs_count,
+                        "txring_flush_ebusy_count": _txring_flush_ebusy_count,
+                        "txring_flush_other_errno_count": _txring_flush_other_errno_count,
+                        "txring_flush_last_errno": _txring_flush_last_errno,
+                        "txring_flush_last_errno_name": _txring_flush_last_errno_name,
                         "txring_frame_wait_ns": _txring_frame_wait_ns,
                         "txring_poll_count": _txring_poll_count,
                         "flush_mode": _flush_mode,
@@ -1641,6 +1684,9 @@ async def worker_process(
                         "txring_drop_ratio_pct": _txring_drop_ratio_pct,
                         "txring_flush_error_ratio_pct": _txring_flush_error_ratio_pct,
                         "txring_flush_eagain_ratio_pct": _txring_flush_eagain_ratio_pct,
+                        "txring_flush_enobufs_ratio_pct": _txring_flush_enobufs_ratio_pct,
+                        "txring_flush_ebusy_ratio_pct": _txring_flush_ebusy_ratio_pct,
+                        "txring_flush_other_errno_ratio_pct": _txring_flush_other_errno_ratio_pct,
                         "gpu_template_h2d_copy_count": _gpu_template_h2d_copy_count,
                         "gpu_template_h2d_copy_bytes": _gpu_template_h2d_copy_bytes,
                         "gpu_rng_state_alloc_count": _gpu_rng_state_alloc_count,

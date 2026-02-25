@@ -511,6 +511,11 @@ def build_live_attack_report(
     txring_flush_call_count_total = 0
     txring_flush_error_count_total = 0
     txring_flush_eagain_count_total = 0
+    txring_flush_enobufs_count_total = 0
+    txring_flush_ebusy_count_total = 0
+    txring_flush_other_errno_count_total = 0
+    txring_flush_last_errno = 0
+    txring_flush_last_errno_name = "NONE"
     txring_frame_wait_ns_total = 0
     txring_poll_count_total = 0
     flush_mode = "unknown"
@@ -602,6 +607,22 @@ def build_live_attack_report(
         txring_flush_eagain_count_total += int(
             ev.get("txring_flush_eagain_count", st.get("txring_flush_eagain_count", 0)) or 0
         )
+        txring_flush_enobufs_count_total += int(
+            ev.get("txring_flush_enobufs_count", st.get("txring_flush_enobufs_count", 0)) or 0
+        )
+        txring_flush_ebusy_count_total += int(
+            ev.get("txring_flush_ebusy_count", st.get("txring_flush_ebusy_count", 0)) or 0
+        )
+        txring_flush_other_errno_count_total += int(
+            ev.get("txring_flush_other_errno_count", st.get("txring_flush_other_errno_count", 0)) or 0
+        )
+        _flush_last_errno = int(ev.get("txring_flush_last_errno", st.get("txring_flush_last_errno", 0)) or 0)
+        _flush_last_errno_name = str(
+            ev.get("txring_flush_last_errno_name", st.get("txring_flush_last_errno_name", "")) or ""
+        ).strip()
+        if _flush_last_errno or _flush_last_errno_name:
+            txring_flush_last_errno = _flush_last_errno
+            txring_flush_last_errno_name = _flush_last_errno_name or "OTHER"
         txring_frame_wait_ns_total += int(
             ev.get("txring_frame_wait_ns", st.get("txring_frame_wait_ns", 0)) or 0
         )
@@ -710,6 +731,11 @@ def build_live_attack_report(
     txring_drop_ratio_pct = (float(txring_tp_drops_bounded_total) * 100.0 / float(max(1, txring_tp_packets_total)))
     txring_flush_error_ratio_pct = (float(txring_flush_error_count_total) * 100.0 / float(max(1, txring_flush_call_count_total)))
     txring_flush_eagain_ratio_pct = (float(txring_flush_eagain_count_total) * 100.0 / float(max(1, txring_flush_call_count_total)))
+    txring_flush_enobufs_ratio_pct = (float(txring_flush_enobufs_count_total) * 100.0 / float(max(1, txring_flush_call_count_total)))
+    txring_flush_ebusy_ratio_pct = (float(txring_flush_ebusy_count_total) * 100.0 / float(max(1, txring_flush_call_count_total)))
+    txring_flush_other_errno_ratio_pct = (
+        float(txring_flush_other_errno_count_total) * 100.0 / float(max(1, txring_flush_call_count_total))
+    )
     wire_loss_estimation_capped = int(
         (wire_loss_raw_packets_total > wire_loss_est_packets_total) or (wire_loss_estimation_capped_total > 0)
     )
@@ -758,6 +784,11 @@ def build_live_attack_report(
             "txring_flush_call_count": int(txring_flush_call_count_total),
             "txring_flush_error_count": int(txring_flush_error_count_total),
             "txring_flush_eagain_count": int(txring_flush_eagain_count_total),
+            "txring_flush_enobufs_count": int(txring_flush_enobufs_count_total),
+            "txring_flush_ebusy_count": int(txring_flush_ebusy_count_total),
+            "txring_flush_other_errno_count": int(txring_flush_other_errno_count_total),
+            "txring_flush_last_errno": int(txring_flush_last_errno),
+            "txring_flush_last_errno_name": str(txring_flush_last_errno_name),
             "txring_frame_wait_ns": int(txring_frame_wait_ns_total),
             "txring_poll_count": int(txring_poll_count_total),
             "flush_mode": str(flush_mode),
@@ -781,6 +812,9 @@ def build_live_attack_report(
             "txring_drop_ratio_pct": round(float(txring_drop_ratio_pct), 4),
             "txring_flush_error_ratio_pct": round(float(txring_flush_error_ratio_pct), 4),
             "txring_flush_eagain_ratio_pct": round(float(txring_flush_eagain_ratio_pct), 4),
+            "txring_flush_enobufs_ratio_pct": round(float(txring_flush_enobufs_ratio_pct), 4),
+            "txring_flush_ebusy_ratio_pct": round(float(txring_flush_ebusy_ratio_pct), 4),
+            "txring_flush_other_errno_ratio_pct": round(float(txring_flush_other_errno_ratio_pct), 4),
             "gpu_template_h2d_copy_count": int(gpu_template_h2d_copy_count_total),
             "gpu_template_h2d_copy_bytes": int(gpu_template_h2d_copy_bytes_total),
             "gpu_rng_state_alloc_count": int(gpu_rng_state_alloc_count_total),
