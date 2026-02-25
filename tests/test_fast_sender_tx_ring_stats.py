@@ -52,6 +52,9 @@ class TestFastSenderTxRingStats(unittest.TestCase):
             "txring_flush_call_count",
             "txring_flush_error_count",
             "txring_flush_eagain_count",
+            "txring_frame_wait_ns",
+            "txring_poll_count",
+            "flush_mode",
             "txring_tp_packets",
             "txring_tp_drops",
             "txring_tp_freeze_q_cnt",
@@ -61,6 +64,9 @@ class TestFastSenderTxRingStats(unittest.TestCase):
             self.assertIn(key, out)
             if key == "txring_packet_version_name":
                 self.assertIn(str(out.get(key, "")), ("TPACKET_V2", "TPACKET_V3"))
+                continue
+            if key == "flush_mode":
+                self.assertIn(str(out.get(key, "")), ("legacy", "adaptive"))
                 continue
             self.assertGreaterEqual(int(out.get(key, 0) or 0), 0)
 

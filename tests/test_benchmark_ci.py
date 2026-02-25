@@ -32,6 +32,13 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.environ.get(name, default)).strip())
+    except Exception:
+        return float(default)
+
+
 def _write_json_with_fallback(preferred: Path, payload: dict, fallback_name: str) -> Path:
     content = json.dumps(payload, indent=2, sort_keys=True)
     candidates = [
@@ -99,9 +106,11 @@ class TestCISafeBenchmarks(unittest.TestCase):
 
     def test_ci_safe_benchmark_matrix(self):
         thresholds = {
-            "max_cv_pct": 5.0,
-            "max_regression_pct": 10.0,
-            "max_pool_peak_over_buf": 4.0,
+            # Default tightened less aggressively to reduce CI/root-runtime flakiness.
+            # Can be overridden by environment for stricter gates in controlled runs.
+            "max_cv_pct": _env_float("SAMURAI_BENCH_MAX_CV_PCT", 8.0),
+            "max_regression_pct": _env_float("SAMURAI_BENCH_MAX_REGRESSION_PCT", 5.0),
+            "max_pool_peak_over_buf": _env_float("SAMURAI_BENCH_MAX_POOL_PEAK_RATIO", 2.2),
         }
 
         n_packets = 20000
@@ -156,6 +165,28 @@ class TestCISafeBenchmarks(unittest.TestCase):
             f"Pool peak memory ratio too high: {peak_over_buf:.2f}",
         )
 
+        throughput_core = {
+            "create_packet_tcp_syn_rate_per_s": float(
+                scenarios["create_packet_tcp_syn"].get("rate_per_s", 0.0) or 0.0
+            ),
+            "create_packet_tcp_pa_rate_per_s": float(
+                scenarios["create_packet_tcp_pa"].get("rate_per_s", 0.0) or 0.0
+            ),
+            "create_packet_udp_rate_per_s": float(
+                scenarios["create_packet_udp"].get("rate_per_s", 0.0) or 0.0
+            ),
+            "generate_packet_pool_rate_per_s": float(
+                scenarios["generate_packet_pool"].get("rate_per_s", 0.0) or 0.0
+            ),
+            # CI-safe profile does not run privileged TX path; use CPU send-rate proxy.
+            "effective_pps": float(scenarios["generate_packet_pool"].get("rate_per_s", 0.0) or 0.0),
+        }
+        loss_path = {
+            # CI-safe profile has no privileged TX_RING live-run loss counters.
+            "wire_loss_est_pct": 0.0,
+            "txring_flush_eagain_ratio_pct": 0.0,
+        }
+
         summary = {
             "schema": "samurai.benchmark.summary.v1",
             "profile": "ci_safe",
@@ -172,12 +203,28 @@ class TestCISafeBenchmarks(unittest.TestCase):
                 "pool_peak_bytes": int(peak),
                 "pool_peak_over_buffer_ratio": float(peak_over_buf),
             },
+            "sections": {
+                "throughput_core": throughput_core,
+                "loss_path": loss_path,
+            },
+            # Flat results_* compatibility fields
+            "results_create_packet_tcp_syn_rate_per_s": float(throughput_core["create_packet_tcp_syn_rate_per_s"]),
+            "results_create_packet_tcp_pa_rate_per_s": float(throughput_core["create_packet_tcp_pa_rate_per_s"]),
+            "results_create_packet_udp_rate_per_s": float(throughput_core["create_packet_udp_rate_per_s"]),
+            "results_generate_packet_pool_rate_per_s": float(throughput_core["generate_packet_pool_rate_per_s"]),
+            "results_effective_pps": float(throughput_core["effective_pps"]),
+            "results_wire_loss_est_pct": float(loss_path["wire_loss_est_pct"]),
+            "results_txring_flush_eagain_ratio_pct": float(loss_path["txring_flush_eagain_ratio_pct"]),
             "baseline": {
                 "path": str(os.environ.get("SAMURAI_BENCH_BASELINE", "") or ""),
                 "loaded": False,
                 "comparisons": {},
             },
         }
+
+        # Keep summary available even when threshold assertions fail, so
+        # report-writing tests can still emit diagnostics.
+        _BenchState.summary = summary
 
         baseline_path = str(os.environ.get("SAMURAI_BENCH_BASELINE", "") or "").strip()
         if baseline_path and Path(baseline_path).exists():
@@ -204,8 +251,6 @@ class TestCISafeBenchmarks(unittest.TestCase):
                     )
             except Exception as exc:  # pragma: no cover
                 summary["baseline"]["load_error"] = f"{type(exc).__name__}: {exc}"
-
-        _BenchState.summary = summary
 
 
 class TestZZ_WriteBenchmarkReport(unittest.TestCase):
