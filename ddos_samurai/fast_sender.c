@@ -18,6 +18,7 @@
 #include <sched.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <stdint.h>
 #include <time.h>
 #include <linux/net_tstamp.h>
@@ -41,6 +42,45 @@
 #define STATE_TABLE_SIZE 65536
 #define MAX_PACKET_SIZE 2048
 #define NUM_LOCKS 256
+
+typedef enum {
+    TXRING_FLUSH_MODE_LEGACY = 0,
+    TXRING_FLUSH_MODE_ADAPTIVE = 1,
+} txring_flush_mode_t;
+
+static int env_truthy(const char* value) {
+    if (!value || !value[0]) return 0;
+    return (
+        strcmp(value, "1") == 0 ||
+        strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "yes") == 0 ||
+        strcasecmp(value, "on") == 0
+    );
+}
+
+static txring_flush_mode_t txring_flush_mode_from_env(void) {
+    const char* mode = getenv("SAMURAI_TXRING_FLUSH_MODE");
+    if (mode && mode[0]) {
+        if (strcasecmp(mode, "adaptive") == 0 || strcmp(mode, "1") == 0) {
+            return TXRING_FLUSH_MODE_ADAPTIVE;
+        }
+        return TXRING_FLUSH_MODE_LEGACY;
+    }
+    if (env_truthy(getenv("SAMURAI_TXRING_ADAPTIVE"))) {
+        return TXRING_FLUSH_MODE_ADAPTIVE;
+    }
+    return TXRING_FLUSH_MODE_LEGACY;
+}
+
+static const char* txring_flush_mode_name(int mode) {
+    return (mode == TXRING_FLUSH_MODE_ADAPTIVE) ? "adaptive" : "legacy";
+}
+
+static inline uint64_t monotonic_ns_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
 
 // --- TCP State Table ---
 typedef struct {
@@ -994,6 +1034,9 @@ typedef struct {
     unsigned long long txring_tp_packets;
     unsigned long long txring_tp_drops;
     unsigned long long txring_tp_freeze_q_cnt;
+    unsigned long long txring_frame_wait_ns;
+    unsigned long long txring_poll_count;
+    int flush_mode;
 } txring_send_metrics_t;
 
 static void drain_txring_packet_stats(const ring_context_t* ctx) {
@@ -1034,9 +1077,9 @@ static void collect_txring_packet_stats(const ring_context_t* ctx, txring_send_m
     }
 }
 
-static inline void txring_flush_socket(int sock, txring_send_metrics_t* metrics) {
+static inline int txring_flush_socket(int sock, txring_send_metrics_t* metrics) {
     ssize_t flush_ret;
-    if (!metrics) return;
+    if (!metrics) return 0;
 
     metrics->txring_flush_call_count++;
     flush_ret = sendto(sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
@@ -1045,7 +1088,9 @@ static inline void txring_flush_socket(int sock, txring_send_metrics_t* metrics)
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             metrics->txring_flush_eagain_count++;
         }
+        return errno;
     }
+    return 0;
 }
 
 static int send_ring_optimized_core(
@@ -1071,6 +1116,7 @@ static int send_ring_optimized_core(
 
     memset(metrics, 0, sizeof(*metrics));
     metrics->attempted = count;
+    metrics->flush_mode = (int)txring_flush_mode_from_env();
 
     if (setup_tx_ring(iface, packet_size, mac) < 0) {
         PyErr_SetString(PyExc_OSError, "Failed to setup TX_RING");
@@ -1088,33 +1134,78 @@ static int send_ring_optimized_core(
     struct pollfd pfd;
     pfd.fd = tx_ring_ctx.sock;
     pfd.events = POLLOUT;
+    pfd.revents = 0;
+
+    const txring_flush_mode_t flush_mode = (txring_flush_mode_t)metrics->flush_mode;
+    const unsigned int legacy_batch = 256U;
+    const int spin_limit = 64;
+    unsigned int pending_since_flush = 0U;
+    int last_flush_errno = 0;
 
     for (int i = 0; i < count; ) {
         char* frame_base = tx_ring_ctx.map + ((size_t)tx_ring_ctx.frame_idx * frame_size);
 
         int spins = 0;
+        int poll_timeout_ms = 0;
+        uint64_t wait_start_ns = 0ULL;
         while (tx_frame_status(frame_base, packet_version) != TP_STATUS_AVAILABLE) {
-            if (spins < 100) {
+            if (wait_start_ns == 0ULL) {
+                wait_start_ns = monotonic_ns_now();
+            }
+
+            if (spins < spin_limit) {
                 spins++;
-                // Quick yield
                 __asm__ volatile("pause" ::: "memory");
                 continue;
             }
-            poll(&pfd, 1, 1);
+
+            pfd.revents = 0;
+            (void)poll(&pfd, 1, poll_timeout_ms);
+            metrics->txring_poll_count++;
+
             if (tx_frame_status(frame_base, packet_version) != TP_STATUS_AVAILABLE) {
-                txring_flush_socket(tx_ring_ctx.sock, metrics);
+                if (flush_mode == TXRING_FLUSH_MODE_ADAPTIVE) {
+                    if ((pfd.revents & (POLLOUT | POLLERR | POLLHUP)) != 0 || poll_timeout_ms >= 2) {
+                        last_flush_errno = txring_flush_socket(tx_ring_ctx.sock, metrics);
+                    }
+                } else {
+                    last_flush_errno = txring_flush_socket(tx_ring_ctx.sock, metrics);
+                }
+                if (poll_timeout_ms < 8) {
+                    poll_timeout_ms = (poll_timeout_ms == 0) ? 1 : (poll_timeout_ms << 1);
+                } else {
+                    sched_yield();
+                }
             }
+        }
+        if (wait_start_ns != 0ULL) {
+            metrics->txring_frame_wait_ns += (unsigned long long)(monotonic_ns_now() - wait_start_ns);
         }
 
         char* payload_ptr = frame_base + frame_header_size;
         memcpy(payload_ptr, data_ptr + ((uint64_t)i * (uint64_t)packet_size), (size_t)packet_size);
         tx_frame_prepare(frame_base, packet_version, frame_header_size, packet_size);
 
-        {
-            int dynamic_batch = 128 + (i & 0xFF);
-            if ((i % dynamic_batch == 0) || (i == count - 1)) {
-                txring_flush_socket(tx_ring_ctx.sock, metrics);
+        pending_since_flush++;
+        int should_flush = 0;
+        if (flush_mode == TXRING_FLUSH_MODE_ADAPTIVE) {
+            unsigned int adaptive_batch = (
+                (last_flush_errno == EAGAIN || last_flush_errno == EWOULDBLOCK) ? 64U : 256U
+            );
+            if (pending_since_flush >= adaptive_batch || i == count - 1) {
+                should_flush = 1;
+            } else if ((pfd.revents & POLLOUT) && pending_since_flush >= 32U) {
+                should_flush = 1;
             }
+        } else {
+            if (pending_since_flush >= legacy_batch || i == count - 1) {
+                should_flush = 1;
+            }
+        }
+
+        if (should_flush) {
+            last_flush_errno = txring_flush_socket(tx_ring_ctx.sock, metrics);
+            pending_since_flush = 0U;
         }
 
         metrics->sent++;
@@ -1197,7 +1288,7 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
     packet_version_str = packet_version_name(packet_version);
 
     return Py_BuildValue(
-        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:i,s:s}",
+        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:s,s:i,s:s}",
         "attempted", metrics.attempted,
         "sent", metrics.sent,
         "errors", errors,
@@ -1207,6 +1298,9 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
         "txring_tp_packets", metrics.txring_tp_packets,
         "txring_tp_drops", metrics.txring_tp_drops,
         "txring_tp_freeze_q_cnt", metrics.txring_tp_freeze_q_cnt,
+        "txring_frame_wait_ns", metrics.txring_frame_wait_ns,
+        "txring_poll_count", metrics.txring_poll_count,
+        "flush_mode", txring_flush_mode_name(metrics.flush_mode),
         "txring_packet_version", packet_version,
         "txring_packet_version_name", packet_version_str
     );

@@ -651,6 +651,103 @@ static int xdp_send_batch(struct xsk_socket_info *xsk,
     return submitted;
 }
 
+typedef struct {
+    const uint8_t **packets;
+    uint16_t *lengths;
+    Py_ssize_t capacity;
+} xdp_send_scratch_t;
+
+static xdp_send_scratch_t g_send_scratch = {0};
+
+static int ensure_send_scratch_capacity(Py_ssize_t needed)
+{
+    if (needed <= 0) {
+        return 0;
+    }
+    if (g_send_scratch.capacity >= needed &&
+        g_send_scratch.packets != NULL &&
+        g_send_scratch.lengths != NULL) {
+        return 0;
+    }
+
+    Py_ssize_t new_cap = g_send_scratch.capacity > 0 ? g_send_scratch.capacity : 64;
+    while (new_cap < needed) {
+        new_cap <<= 1;
+    }
+
+    const uint8_t **new_packets = (const uint8_t**)realloc(
+        g_send_scratch.packets, (size_t)new_cap * sizeof(uint8_t*)
+    );
+    if (!new_packets) {
+        return -1;
+    }
+
+    uint16_t *new_lengths = (uint16_t*)realloc(
+        g_send_scratch.lengths, (size_t)new_cap * sizeof(uint16_t)
+    );
+    if (!new_lengths) {
+        // Preserve old pointers on failure.
+        g_send_scratch.packets = new_packets;
+        return -1;
+    }
+
+    g_send_scratch.packets = new_packets;
+    g_send_scratch.lengths = new_lengths;
+    g_send_scratch.capacity = new_cap;
+    return 0;
+}
+
+static void clear_send_scratch(void)
+{
+    free((void*)g_send_scratch.packets);
+    free((void*)g_send_scratch.lengths);
+    g_send_scratch.packets = NULL;
+    g_send_scratch.lengths = NULL;
+    g_send_scratch.capacity = 0;
+}
+
+static int xdp_send_vector_locked(const uint8_t **packets, uint16_t *lengths, Py_ssize_t valid_count)
+{
+    int total_sent = 0;
+    Py_ssize_t offset = 0;
+
+    while (offset < valid_count) {
+        int batch = (int)(valid_count - offset);
+        if (batch > XDP_BATCH_SIZE) {
+            batch = XDP_BATCH_SIZE;
+        }
+
+        int sent = xdp_send_batch(
+            xdp_ctx.xsk,
+            packets + offset,
+            lengths + offset,
+            batch
+        );
+
+        if (sent <= 0) {
+            complete_tx(xdp_ctx.xsk);
+            sent = xdp_send_batch(
+                xdp_ctx.xsk,
+                packets + offset,
+                lengths + offset,
+                batch
+            );
+        }
+
+        if (sent <= 0) {
+            break;
+        }
+        if (sent > batch) {
+            sent = batch;
+        }
+
+        total_sent += sent;
+        offset += sent;
+    }
+
+    return total_sent;
+}
+
 // ============================================================================
 // Python Interface Functions
 // ============================================================================
@@ -746,6 +843,7 @@ static PyObject* py_xdp_cleanup(PyObject* self, PyObject* args)
     xdp_ctx.umem = NULL;
     
     xdp_ctx.is_initialized = 0;
+    clear_send_scratch();
     
     pthread_mutex_unlock(&xdp_ctx.lock);
     
@@ -786,18 +884,15 @@ static PyObject* py_xdp_send(PyObject* self, PyObject* args)
         pthread_mutex_unlock(&xdp_ctx.lock);
         return PyLong_FromLong(0);
     }
-    
-    // Allocate arrays for packet pointers and lengths
-    const uint8_t **packets = malloc(count * sizeof(uint8_t*));
-    uint16_t *lengths = malloc(count * sizeof(uint16_t));
-    
-    if (!packets || !lengths) {
-        free(packets);
-        free(lengths);
+
+    if (ensure_send_scratch_capacity(count) < 0) {
         pthread_mutex_unlock(&xdp_ctx.lock);
         PyErr_NoMemory();
         return NULL;
     }
+
+    const uint8_t **packets = g_send_scratch.packets;
+    uint16_t *lengths = g_send_scratch.lengths;
     
     // Extract packet data from Python list
     Py_ssize_t valid_count = 0;
@@ -809,41 +904,74 @@ static PyObject* py_xdp_send(PyObject* self, PyObject* args)
             valid_count++;
         }
     }
-    
-    // Send packets in batches
-    int total_sent = 0;
-    int offset = 0;
-    
-    while (offset < valid_count) {
-        int batch = valid_count - offset;
-        if (batch > XDP_BATCH_SIZE) batch = XDP_BATCH_SIZE;
-        
-        int sent = xdp_send_batch(xdp_ctx.xsk, 
-                                  packets + offset, 
-                                  lengths + offset, 
-                                  batch);
-        
-        if (sent == 0) {
-            // Ring full, try to complete and retry once
-            complete_tx(xdp_ctx.xsk);
-            sent = xdp_send_batch(xdp_ctx.xsk, 
-                                  packets + offset, 
-                                  lengths + offset, 
-                                  batch);
-        }
-        
-        total_sent += sent;
-        offset += sent;
-        
-        // Break if we couldn't send anything
-        if (sent == 0) break;
-    }
-    
-    free(packets);
-    free(lengths);
+
+    int total_sent = xdp_send_vector_locked(packets, lengths, valid_count);
     
     pthread_mutex_unlock(&xdp_ctx.lock);
     
+    return PyLong_FromLong(total_sent);
+}
+
+/**
+ * Send packets from a contiguous buffer.
+ * Python: xdp_send_buffer(buffer, packet_size, count) -> int
+ */
+static PyObject* py_xdp_send_buffer(PyObject* self, PyObject* args)
+{
+    Py_buffer view;
+    int packet_size = 0;
+    int count = 0;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*ii", &view, &packet_size, &count)) {
+        return NULL;
+    }
+
+    if (packet_size <= 0 || count < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size must be > 0 and count must be >= 0");
+        return NULL;
+    }
+    if (count == 0) {
+        PyBuffer_Release(&view);
+        return PyLong_FromLong(0);
+    }
+
+    if ((size_t)view.len < ((size_t)packet_size * (size_t)count)) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "buffer smaller than packet_size * count");
+        return NULL;
+    }
+    if (packet_size > 65535) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size exceeds uint16_t limit");
+        return NULL;
+    }
+
+    pthread_mutex_lock(&xdp_ctx.lock);
+    if (!xdp_ctx.is_initialized || !xdp_ctx.is_running) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
+        return NULL;
+    }
+
+    if (ensure_send_scratch_capacity((Py_ssize_t)count) < 0) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyBuffer_Release(&view);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    const uint8_t *base = (const uint8_t*)view.buf;
+    for (int i = 0; i < count; i++) {
+        g_send_scratch.packets[i] = base + ((size_t)i * (size_t)packet_size);
+        g_send_scratch.lengths[i] = (uint16_t)packet_size;
+    }
+
+    int total_sent = xdp_send_vector_locked(g_send_scratch.packets, g_send_scratch.lengths, (Py_ssize_t)count);
+    pthread_mutex_unlock(&xdp_ctx.lock);
+    PyBuffer_Release(&view);
     return PyLong_FromLong(total_sent);
 }
 
@@ -1058,6 +1186,11 @@ static PyMethodDef XdpSenderMethods[] = {
     {"xdp_send", py_xdp_send, METH_VARARGS, 
      "Send raw packets through AF_XDP.\n"
      "Args: packets (list of bytes)\n"
+     "Returns: int (number of packets sent)"},
+
+    {"xdp_send_buffer", py_xdp_send_buffer, METH_VARARGS,
+     "Send raw packets from contiguous buffer through AF_XDP.\n"
+     "Args: buffer (bytes-like), packet_size (int), count (int)\n"
      "Returns: int (number of packets sent)"},
     
     {"xdp_send_udp", py_xdp_send_udp, METH_VARARGS, 

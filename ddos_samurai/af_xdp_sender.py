@@ -455,6 +455,34 @@ class XDPSender:
         except Exception as e:
             utils.log_error(f"[XDP] Send error: {e}")
             return 0
+
+    def send_buffer(self, packet_buffer, packet_size: int, count: int) -> int:
+        """
+        Send packets from a contiguous fixed-size packet buffer.
+
+        Args:
+            packet_buffer: bytes-like object containing count * packet_size bytes
+            packet_size: size of each packet
+            count: number of packets
+        """
+        if not self._is_running:
+            raise RuntimeError("XDP sender not started")
+        if packet_size <= 0 or count <= 0:
+            return 0
+
+        if self._use_fallback:
+            return self._send_buffer_fallback(packet_buffer, packet_size, count)
+
+        try:
+            if hasattr(self._xdp, "xdp_send_buffer"):
+                return int(self._xdp.xdp_send_buffer(packet_buffer, int(packet_size), int(count)) or 0)
+
+            mv = memoryview(packet_buffer)
+            packets = [bytes(mv[i * packet_size:(i + 1) * packet_size]) for i in range(count)]
+            return int(self._xdp.xdp_send(packets) or 0)
+        except Exception as e:
+            utils.log_error(f"[XDP] Send buffer error: {e}")
+            return 0
     
     def send_udp(
         self,
@@ -547,6 +575,36 @@ class XDPSender:
             
         except Exception as e:
             utils.log_error(f"[XDP Fallback] UDP error: {e}")
+            return 0
+
+    def _send_buffer_fallback(self, packet_buffer, packet_size: int, count: int) -> int:
+        """Send contiguous packet buffer using standard raw socket fallback."""
+        try:
+            mv = memoryview(packet_buffer)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            sock.setblocking(False)
+
+            sent = 0
+            for i in range(count):
+                start = i * packet_size
+                end = start + packet_size
+                pkt = mv[start:end]
+                if len(pkt) < 20:
+                    continue
+                try:
+                    dst_ip = socket.inet_ntoa(pkt[16:20])
+                    sock.sendto(pkt, (dst_ip, 0))
+                    sent += 1
+                    self._total_bytes += len(pkt)
+                except Exception:
+                    pass
+
+            sock.close()
+            self._total_packets += sent
+            return sent
+        except Exception as e:
+            utils.log_error(f"[XDP Fallback] buffer error: {e}")
             return 0
     
     def get_stats(self) -> XDPStats:

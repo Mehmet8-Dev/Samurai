@@ -58,9 +58,13 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "buffer_copy_bytes": 0,
         "eagain_retry_count": 0,
         "partial_send_retry_count": 0,
+        "buffer_reuse_hits": 0,
         "txring_flush_call_count": 0,
         "txring_flush_error_count": 0,
         "txring_flush_eagain_count": 0,
+        "txring_frame_wait_ns": 0,
+        "txring_poll_count": 0,
+        "flush_mode": "unknown",
         "txring_tp_packets": 0,
         "txring_tp_drops": 0,
         "txring_tp_freeze_q_cnt": 0,
@@ -264,6 +268,7 @@ def _merge_stats(*items):
         buffer_copy_bytes=0,
         eagain_retry_count=0,
         partial_send_retry_count=0,
+        buffer_reuse_hits=0,
         permission_error_count=0,
         fallback_count=0,
     )
@@ -278,11 +283,21 @@ def _merge_stats(*items):
         acc["buffer_copy_bytes"] += int(it.get("buffer_copy_bytes", 0) or 0)
         acc["eagain_retry_count"] += int(it.get("eagain_retry_count", 0) or 0)
         acc["partial_send_retry_count"] += int(it.get("partial_send_retry_count", 0) or 0)
+        acc["buffer_reuse_hits"] += int(it.get("buffer_reuse_hits", 0) or 0)
         acc["permission_error_count"] += int(it.get("permission_error_count", 0) or 0)
         acc["fallback_count"] += int(it.get("fallback_count", 0) or 0)
         acc["txring_flush_call_count"] += int(it.get("txring_flush_call_count", 0) or 0)
         acc["txring_flush_error_count"] += int(it.get("txring_flush_error_count", 0) or 0)
         acc["txring_flush_eagain_count"] += int(it.get("txring_flush_eagain_count", 0) or 0)
+        acc["txring_frame_wait_ns"] += int(it.get("txring_frame_wait_ns", 0) or 0)
+        acc["txring_poll_count"] += int(it.get("txring_poll_count", 0) or 0)
+        item_flush_mode = str(it.get("flush_mode", "") or "").strip()
+        if item_flush_mode:
+            curr_flush_mode = str(acc.get("flush_mode", "") or "").strip()
+            if not curr_flush_mode or curr_flush_mode == "unknown":
+                acc["flush_mode"] = item_flush_mode
+            elif curr_flush_mode != item_flush_mode and curr_flush_mode != "mixed":
+                acc["flush_mode"] = "mixed"
         acc["txring_tp_packets"] += int(it.get("txring_tp_packets", 0) or 0)
         acc["txring_tp_drops"] += int(it.get("txring_tp_drops", 0) or 0)
         acc["txring_tp_freeze_q_cnt"] += int(it.get("txring_tp_freeze_q_cnt", 0) or 0)
@@ -698,38 +713,40 @@ async def xdp_sender(
         else:
             log_info(f"[XDP] Using fallback mode on interface: {sender.interface}")
         
-        # Send in batches without pre-building a full list.
-        # Prefer zero-copy views (memoryview slices) if the extension accepts them;
-        # otherwise fall back to bytes() conversion per-batch.
-        mv = memoryview(packets_buffer)
-        needs_bytes = False
+        # Prefer contiguous-buffer API when available to avoid Python list overhead.
+        if hasattr(sender, "send_buffer"):
+            sent = sender.send_buffer(packets_buffer, packet_size, count)
+            total_sent = int(sent or 0)
+        else:
+            # Fallback path: send batch lists.
+            mv = memoryview(packets_buffer)
+            needs_bytes = False
+            batch_start = 0
+            while batch_start < count:
+                batch_end = min(batch_start + batch_size, count)
+                batch_views = []
+                for i in range(batch_start, batch_end):
+                    start = i * packet_size
+                    end = start + packet_size
+                    batch_views.append(mv[start:end])
 
-        batch_start = 0
-        while batch_start < count:
-            batch_end = min(batch_start + batch_size, count)
-            batch_views = []
-            for i in range(batch_start, batch_end):
-                start = i * packet_size
-                end = start + packet_size
-                batch_views.append(mv[start:end])
-
-            if needs_bytes:
-                sent = sender.send([bytes(v) for v in batch_views])
-            else:
-                try:
-                    sent = sender.send(batch_views)  # may work if extension uses buffer protocol
-                except TypeError:
-                    needs_bytes = True
+                if needs_bytes:
                     sent = sender.send([bytes(v) for v in batch_views])
+                else:
+                    try:
+                        sent = sender.send(batch_views)  # may work if extension uses buffer protocol
+                    except TypeError:
+                        needs_bytes = True
+                        sent = sender.send([bytes(v) for v in batch_views])
 
-            total_sent += sent
-            
-            if verbose and total_sent % 10000 < batch_size:
-                stats = sender.get_stats()
-                log_info(f"[XDP] Progress: {total_sent}/{count} packets, "
-                        f"{stats.packets_per_second:.0f} pps, {stats.mbps:.2f} Mbps")
-            
-            batch_start = batch_end
+                total_sent += sent
+
+                if verbose and total_sent % 10000 < batch_size:
+                    stats = sender.get_stats()
+                    log_info(f"[XDP] Progress: {total_sent}/{count} packets, "
+                            f"{stats.packets_per_second:.0f} pps, {stats.mbps:.2f} Mbps")
+
+                batch_start = batch_end
         
         # Get final stats
         stats = sender.get_stats()
@@ -831,11 +848,15 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
     txring_flush_call_count = 0
     txring_flush_error_count = 0
     txring_flush_eagain_count = 0
+    txring_frame_wait_ns = 0
+    txring_poll_count = 0
+    flush_mode = "unknown"
     txring_tp_packets = 0
     txring_tp_drops = 0
     txring_tp_freeze_q_cnt = 0
     txring_packet_version = 0
     txring_packet_version_name = "TPACKET_UNKNOWN"
+    buffer_reuse_hits = 0
 
     loss_iface_hint = _resolve_loss_iface(None)
     loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
@@ -865,6 +886,14 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                                 txring_flush_call_count += int(tx_result.get("txring_flush_call_count", 0) or 0)
                                 txring_flush_error_count += int(tx_result.get("txring_flush_error_count", 0) or 0)
                                 txring_flush_eagain_count += int(tx_result.get("txring_flush_eagain_count", 0) or 0)
+                                txring_frame_wait_ns += int(tx_result.get("txring_frame_wait_ns", 0) or 0)
+                                txring_poll_count += int(tx_result.get("txring_poll_count", 0) or 0)
+                                _tx_flush_mode = str(tx_result.get("flush_mode", "") or "").strip()
+                                if _tx_flush_mode:
+                                    if flush_mode in ("", "unknown"):
+                                        flush_mode = _tx_flush_mode
+                                    elif flush_mode != _tx_flush_mode:
+                                        flush_mode = "mixed"
                                 txring_tp_packets += int(tx_result.get("txring_tp_packets", 0) or 0)
                                 txring_tp_drops += int(tx_result.get("txring_tp_drops", 0) or 0)
                                 txring_tp_freeze_q_cnt += int(tx_result.get("txring_tp_freeze_q_cnt", 0) or 0)
@@ -899,9 +928,13 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                             buffer_copy_bytes=buffer_copy_bytes,
                             eagain_retry_count=eagain_retry_count,
                             partial_send_retry_count=partial_send_retry_count,
+                            buffer_reuse_hits=buffer_reuse_hits,
                             txring_flush_call_count=txring_flush_call_count,
                             txring_flush_error_count=txring_flush_error_count,
                             txring_flush_eagain_count=txring_flush_eagain_count,
+                            txring_frame_wait_ns=txring_frame_wait_ns,
+                            txring_poll_count=txring_poll_count,
+                            flush_mode=flush_mode,
                             txring_tp_packets=txring_tp_packets,
                             txring_tp_drops=txring_tp_drops,
                             txring_tp_freeze_q_cnt=txring_tp_freeze_q_cnt,
@@ -949,6 +982,7 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                 buffer_copy_bytes=buffer_copy_bytes,
                 eagain_retry_count=eagain_retry_count,
                 partial_send_retry_count=partial_send_retry_count,
+                buffer_reuse_hits=buffer_reuse_hits,
             )
             return _attach_loss_telemetry(
                 out, loss_before_snapshot, preferred_iface=loss_iface_hint
@@ -971,16 +1005,35 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
         
         if hasattr(s, 'sendmmsg'):
             sender_path = "PYTHON_SENDMMSG"
+            prebuilt_datagrams = None
+            reuse_sendmmsg = str(os.environ.get("SAMURAI_SENDMMSG_REUSE", "1") or "1").strip().lower() not in {
+                "0", "false", "no", "off"
+            }
+            try:
+                max_reuse_count = int(os.environ.get("SAMURAI_SENDMMSG_REUSE_MAX", "131072") or 131072)
+            except Exception:
+                max_reuse_count = 131072
+            if reuse_sendmmsg and 0 < count <= max_reuse_count:
+                try:
+                    packet_views = [mv[(idx * packet_size):((idx + 1) * packet_size)] for idx in range(count)]
+                    prebuilt_datagrams = [(pkt_view, []) for pkt_view in packet_views]
+                    buffer_reuse_hits += 1
+                except Exception:
+                    prebuilt_datagrams = None
+
             for i in range(0, count, BATCH_SIZE):
                 batch_end = min(i + BATCH_SIZE, count)
                 batch_count = batch_end - i
-                
-                datagrams = []
-                for j in range(batch_count):
-                    idx = i + j
-                    start = idx * packet_size
-                    end = start + packet_size
-                    datagrams.append((mv[start:end], []))
+
+                if prebuilt_datagrams is not None:
+                    datagrams = prebuilt_datagrams[i:batch_end]
+                else:
+                    datagrams = []
+                    for j in range(batch_count):
+                        idx = i + j
+                        start = idx * packet_size
+                        end = start + packet_size
+                        datagrams.append((mv[start:end], []))
 
                 batch_progress = 0
                 batch_index = 0
@@ -1076,9 +1129,13 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
         buffer_copy_bytes=buffer_copy_bytes,
         eagain_retry_count=eagain_retry_count,
         partial_send_retry_count=partial_send_retry_count,
+        buffer_reuse_hits=buffer_reuse_hits,
         txring_flush_call_count=txring_flush_call_count,
         txring_flush_error_count=txring_flush_error_count,
         txring_flush_eagain_count=txring_flush_eagain_count,
+        txring_frame_wait_ns=txring_frame_wait_ns,
+        txring_poll_count=txring_poll_count,
+        flush_mode=flush_mode,
         txring_tp_packets=txring_tp_packets,
         txring_tp_drops=txring_tp_drops,
         txring_tp_freeze_q_cnt=txring_tp_freeze_q_cnt,
