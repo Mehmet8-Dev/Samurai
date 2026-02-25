@@ -1451,6 +1451,9 @@ def main(argv=None):
                     "txring_flush_eagain_count": int(rr.results.get("txring_flush_eagain_count", 0) or 0),
                     "txring_flush_error_ratio_pct": float(rr.results.get("txring_flush_error_ratio_pct", 0.0) or 0.0),
                     "txring_flush_eagain_ratio_pct": float(rr.results.get("txring_flush_eagain_ratio_pct", 0.0) or 0.0),
+                    "txring_frame_wait_ns": int(rr.results.get("txring_frame_wait_ns", 0) or 0),
+                    "txring_poll_count": int(rr.results.get("txring_poll_count", 0) or 0),
+                    "flush_mode": str(rr.results.get("flush_mode", "unknown") or "unknown"),
                     "txring_tp_packets": int(rr.results.get("txring_tp_packets", 0) or 0),
                     "txring_tp_drops": int(rr.results.get("txring_tp_drops", 0) or 0),
                     "txring_tp_freeze_q_cnt": int(rr.results.get("txring_tp_freeze_q_cnt", 0) or 0),
@@ -1459,6 +1462,7 @@ def main(argv=None):
                         rr.results.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
                     ),
                     "txring_drop_ratio_pct": float(rr.results.get("txring_drop_ratio_pct", 0.0) or 0.0),
+                    "buffer_reuse_hits": int(rr.results.get("buffer_reuse_hits", 0) or 0),
                     "host_tx_packets_delta": int(rr.results.get("host_tx_packets_delta", 0) or 0),
                     "host_tx_dropped_delta": int(rr.results.get("host_tx_dropped_delta", 0) or 0),
                     "host_tx_errors_delta": int(rr.results.get("host_tx_errors_delta", 0) or 0),

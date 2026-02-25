@@ -320,7 +320,12 @@ def _security_log(
         details_json=details or {},
     )
     db.add(row)
-    db.commit()
+    commit_mode = str(os.environ.get("SAMURAI_SECURITY_LOG_COMMIT_MODE", "sync") or "sync").strip().lower()
+    if commit_mode in {"defer", "batch", "async", "off", "0", "false"}:
+        # Defer commit to surrounding request transaction to reduce per-request overhead.
+        db.flush()
+    else:
+        db.commit()
 
 
 def _estimate_usage_units(payload: TestStartRequest) -> int:

@@ -505,11 +505,15 @@ def build_live_attack_report(
     fallback_count_total = 0
     buffer_copy_count_total = 0
     buffer_copy_bytes_total = 0
+    buffer_reuse_hits_total = 0
     eagain_retry_count_total = 0
     partial_send_retry_count_total = 0
     txring_flush_call_count_total = 0
     txring_flush_error_count_total = 0
     txring_flush_eagain_count_total = 0
+    txring_frame_wait_ns_total = 0
+    txring_poll_count_total = 0
+    flush_mode = "unknown"
     txring_tp_packets_total = 0
     txring_tp_drops_total = 0
     txring_tp_freeze_q_cnt_total = 0
@@ -580,6 +584,9 @@ def build_live_attack_report(
         buffer_copy_bytes_total += int(
             ev.get("buffer_copy_bytes", st.get("buffer_copy_bytes", 0)) or 0
         )
+        buffer_reuse_hits_total += int(
+            ev.get("buffer_reuse_hits", st.get("buffer_reuse_hits", 0)) or 0
+        )
         eagain_retry_count_total += int(
             ev.get("eagain_retry_count", st.get("eagain_retry_count", 0)) or 0
         )
@@ -595,6 +602,18 @@ def build_live_attack_report(
         txring_flush_eagain_count_total += int(
             ev.get("txring_flush_eagain_count", st.get("txring_flush_eagain_count", 0)) or 0
         )
+        txring_frame_wait_ns_total += int(
+            ev.get("txring_frame_wait_ns", st.get("txring_frame_wait_ns", 0)) or 0
+        )
+        txring_poll_count_total += int(
+            ev.get("txring_poll_count", st.get("txring_poll_count", 0)) or 0
+        )
+        _flush_mode_item = str(ev.get("flush_mode", st.get("flush_mode", "")) or "").strip()
+        if _flush_mode_item:
+            if flush_mode in ("", "unknown"):
+                flush_mode = _flush_mode_item
+            elif flush_mode != _flush_mode_item:
+                flush_mode = "mixed"
         txring_tp_packets_total += int(
             ev.get("txring_tp_packets", st.get("txring_tp_packets", 0)) or 0
         )
@@ -733,11 +752,15 @@ def build_live_attack_report(
             "fallback_count": int(fallback_count_total),
             "buffer_copy_count": int(buffer_copy_count_total),
             "buffer_copy_bytes": int(buffer_copy_bytes_total),
+            "buffer_reuse_hits": int(buffer_reuse_hits_total),
             "eagain_retry_count": int(eagain_retry_count_total),
             "partial_send_retry_count": int(partial_send_retry_count_total),
             "txring_flush_call_count": int(txring_flush_call_count_total),
             "txring_flush_error_count": int(txring_flush_error_count_total),
             "txring_flush_eagain_count": int(txring_flush_eagain_count_total),
+            "txring_frame_wait_ns": int(txring_frame_wait_ns_total),
+            "txring_poll_count": int(txring_poll_count_total),
+            "flush_mode": str(flush_mode),
             "txring_tp_packets": int(txring_tp_packets_total),
             "txring_tp_drops": int(txring_tp_drops_total),
             "txring_tp_freeze_q_cnt": int(txring_tp_freeze_q_cnt_total),

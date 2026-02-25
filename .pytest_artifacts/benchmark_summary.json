@@ -4,11 +4,11 @@
     "loaded": false,
     "path": ""
   },
-  "generated_utc": "2026-02-24T23:57:36+00:00",
+  "generated_utc": "2026-02-25T12:16:40+00:00",
   "memory": {
     "pool_buffer_len": 1280000,
-    "pool_peak_bytes": 2560279,
-    "pool_peak_over_buffer_ratio": 2.00021796875
+    "pool_peak_bytes": 2560247,
+    "pool_peak_over_buffer_ratio": 2.00019296875
   },
   "params": {
     "n_flags": 200000,
@@ -16,87 +16,107 @@
     "pool_pkt_size": 64
   },
   "profile": "ci_safe",
+  "results_create_packet_tcp_pa_rate_per_s": 105071.16191379969,
+  "results_create_packet_tcp_syn_rate_per_s": 120387.69074048378,
+  "results_create_packet_udp_rate_per_s": 154601.3246298708,
+  "results_effective_pps": 118257.65812620011,
+  "results_generate_packet_pool_rate_per_s": 118257.65812620011,
+  "results_txring_flush_eagain_ratio_pct": 0.0,
+  "results_wire_loss_est_pct": 0.0,
   "scenarios": {
     "create_packet_tcp_pa": {
-      "cv_pct": 0.5412313282076303,
-      "mean_s": 0.30143469266719575,
+      "cv_pct": 3.043392413050403,
+      "mean_s": 0.19034718599959888,
       "name": "create_packet_tcp_pa",
-      "p95_s": 0.3031645680021029,
-      "rate_per_s": 66349.36351563671,
+      "p95_s": 0.19852835899928323,
+      "rate_per_s": 105071.16191379969,
       "rounds": 3,
       "samples_s": [
-        0.3031645680021029,
-        0.30189192599937087,
-        0.2992475840001134
+        0.19852835899928323,
+        0.1866304779996426,
+        0.1858827209998708
       ],
-      "stdev_s": 0.0016314589908012522,
+      "stdev_s": 0.005793011817166732,
       "units": 20000
     },
     "create_packet_tcp_syn": {
-      "cv_pct": 0.6304675240387951,
-      "mean_s": 0.2414931990012216,
+      "cv_pct": 0.8855697073457042,
+      "mean_s": 0.1661299413335655,
       "name": "create_packet_tcp_syn",
-      "p95_s": 0.24326957899756962,
-      "rate_per_s": 82818.06726945892,
+      "p95_s": 0.1681832399999621,
+      "rate_per_s": 120387.69074048378,
       "rounds": 3,
       "samples_s": [
-        0.24326957899756962,
-        0.24165882600209443,
-        0.23955119200400077
+        0.16481242800000473,
+        0.1681832399999621,
+        0.1653941560007297
       ],
-      "stdev_s": 0.001522536192465082,
+      "stdev_s": 0.001471196435281246,
       "units": 20000
     },
     "create_packet_udp": {
-      "cv_pct": 0.1113036144706062,
-      "mean_s": 0.14488839366822504,
+      "cv_pct": 0.559515889246208,
+      "mean_s": 0.1293649976666226,
       "name": "create_packet_udp",
-      "p95_s": 0.14503631700063124,
-      "rate_per_s": 138037.28161827312,
+      "p95_s": 0.13038588799918216,
+      "rate_per_s": 154601.3246298708,
       "rounds": 3,
       "samples_s": [
-        0.14466410200111568,
-        0.14496476200292818,
-        0.14503631700063124
+        0.13038588799918216,
+        0.12891940100053034,
+        0.12878970400015533
       ],
-      "stdev_s": 0.00016126601910113538,
+      "stdev_s": 0.0007238177170677396,
       "units": 20000
     },
     "generate_packet_pool": {
-      "cv_pct": 2.2349448163768892,
-      "mean_s": 0.4771155736671062,
+      "cv_pct": 2.9610083889553795,
+      "mean_s": 0.1691222396663458,
       "name": "generate_packet_pool",
-      "p95_s": 0.49216900800092844,
-      "rate_per_s": 41918.5646074811,
+      "p95_s": 0.1761668239996652,
+      "rate_per_s": 118257.65812620011,
       "rounds": 3,
       "samples_s": [
-        0.49216900800092844,
-        0.47036575400125,
-        0.4688119589991402
+        0.1761668239996652,
+        0.16622948599979281,
+        0.16497040899957938
       ],
-      "stdev_s": 0.010663269781799848,
+      "stdev_s": 0.005007723704109721,
       "units": 20000
     },
     "parse_tcp_flags": {
-      "cv_pct": 1.214974865599589,
-      "mean_s": 0.19614282600135388,
+      "cv_pct": 1.3654685381159613,
+      "mean_s": 0.06935004466686223,
       "name": "parse_tcp_flags",
-      "p95_s": 0.19839646000036737,
-      "rate_per_s": 1019665.1291167769,
+      "p95_s": 0.07068920599976991,
+      "rate_per_s": 2883920.2766305744,
       "rounds": 3,
       "samples_s": [
-        0.19718614700104808,
-        0.19839646000036737,
-        0.19284587100264616
+        0.07068920599976991,
+        0.06868854399999691,
+        0.06867238400081987
       ],
-      "stdev_s": 0.002383086036593185,
+      "stdev_s": 0.0009469530410953699,
       "units": 200000
     }
   },
   "schema": "samurai.benchmark.summary.v1",
+  "sections": {
+    "loss_path": {
+      "txring_flush_eagain_ratio_pct": 0.0,
+      "wire_loss_est_pct": 0.0
+    },
+    "throughput_core": {
+      "create_packet_tcp_pa_rate_per_s": 105071.16191379969,
+      "create_packet_tcp_syn_rate_per_s": 120387.69074048378,
+      "create_packet_udp_rate_per_s": 154601.3246298708,
+      "effective_pps": 118257.65812620011,
+      "generate_packet_pool_rate_per_s": 118257.65812620011
+    }
+  },
   "thresholds": {
-    "max_cv_pct": 5.0,
-    "max_pool_peak_over_buf": 4.0,
-    "max_regression_pct": 10.0
+    "max_cv_pct": 8.0,
+    "max_pool_peak_over_buf": 2.2,
+    "max_regression_pct": 5.0
   }
 }
