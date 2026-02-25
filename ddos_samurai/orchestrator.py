@@ -47,9 +47,13 @@ def _empty_stats() -> dict:
         "buffer_copy_bytes": 0,
         "eagain_retry_count": 0,
         "partial_send_retry_count": 0,
+        "buffer_reuse_hits": 0,
         "txring_flush_call_count": 0,
         "txring_flush_error_count": 0,
         "txring_flush_eagain_count": 0,
+        "txring_frame_wait_ns": 0,
+        "txring_poll_count": 0,
+        "flush_mode": "unknown",
         "txring_tp_packets": 0,
         "txring_tp_drops": 0,
         "txring_tp_freeze_q_cnt": 0,
@@ -114,9 +118,19 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["buffer_copy_bytes"] = int(acc.get("buffer_copy_bytes", 0)) + int(item.get("buffer_copy_bytes", 0) or 0)
     acc["eagain_retry_count"] = int(acc.get("eagain_retry_count", 0)) + int(item.get("eagain_retry_count", 0) or 0)
     acc["partial_send_retry_count"] = int(acc.get("partial_send_retry_count", 0)) + int(item.get("partial_send_retry_count", 0) or 0)
+    acc["buffer_reuse_hits"] = int(acc.get("buffer_reuse_hits", 0)) + int(item.get("buffer_reuse_hits", 0) or 0)
     acc["txring_flush_call_count"] = int(acc.get("txring_flush_call_count", 0)) + int(item.get("txring_flush_call_count", 0) or 0)
     acc["txring_flush_error_count"] = int(acc.get("txring_flush_error_count", 0)) + int(item.get("txring_flush_error_count", 0) or 0)
     acc["txring_flush_eagain_count"] = int(acc.get("txring_flush_eagain_count", 0)) + int(item.get("txring_flush_eagain_count", 0) or 0)
+    acc["txring_frame_wait_ns"] = int(acc.get("txring_frame_wait_ns", 0)) + int(item.get("txring_frame_wait_ns", 0) or 0)
+    acc["txring_poll_count"] = int(acc.get("txring_poll_count", 0)) + int(item.get("txring_poll_count", 0) or 0)
+    item_flush_mode = str(item.get("flush_mode", "") or "").strip()
+    if item_flush_mode:
+        curr_flush_mode = str(acc.get("flush_mode", "") or "").strip()
+        if not curr_flush_mode or curr_flush_mode == "unknown":
+            acc["flush_mode"] = item_flush_mode
+        elif curr_flush_mode != item_flush_mode and curr_flush_mode != "mixed":
+            acc["flush_mode"] = "mixed"
     acc["txring_tp_packets"] = int(acc.get("txring_tp_packets", 0)) + int(item.get("txring_tp_packets", 0) or 0)
     acc["txring_tp_drops"] = int(acc.get("txring_tp_drops", 0)) + int(item.get("txring_tp_drops", 0) or 0)
     acc["txring_tp_freeze_q_cnt"] = int(acc.get("txring_tp_freeze_q_cnt", 0)) + int(item.get("txring_tp_freeze_q_cnt", 0) or 0)
@@ -497,11 +511,11 @@ async def worker_process(
                 # P2 FIX #19: Resolve Gateway MAC
                 gw_mac_str = get_gateway_mac(args['target'])
                 gw_mac_int = mac_to_int(gw_mac_str)
-                
+
                 # --- NEW: TCP Mimicry Synchronization ---
                 profile_name = args.get("tls_profile", args.get("ja3_profile", "chrome_120"))
                 tcp_params = stealth.get_tcp_params(profile_name)
-                
+
                 win_val = tcp_params['window']
                 mss_val = tcp_params['mss']
                 ttl_val = tcp_params['ttl']
@@ -516,18 +530,25 @@ async def worker_process(
 
                 BATCH_SIZE = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
                 remaining = args['count']
+                payload_engine = gpu_payload.GPUPayloadEngine(BATCH_SIZE)
+
+                # Load custom wordlists once per worker/engine.
+                if args.get('http_path') and isinstance(args['http_path'], list):
+                    payload_engine.load_custom_wordlists(paths=args['http_path'])
+
+                window_sizes_full = cp.empty(BATCH_SIZE, dtype=cp.uint16)
+                window_sizes_full.fill(win_val)
+                mss_values_full = cp.empty(BATCH_SIZE, dtype=cp.uint16)
+                mss_values_full.fill(mss_val)
+                ttls_full = cp.empty(BATCH_SIZE, dtype=cp.uint8)
+                ttls_full.fill(ttl_val)
 
                 while remaining > 0:
                     batch_count = min(remaining, BATCH_SIZE)
-                    payload_engine = gpu_payload.GPUPayloadEngine(batch_count)
-
-                    # Load custom wordlists if provided
-                    if args.get('http_path') and isinstance(args['http_path'], list):
-                        payload_engine.load_custom_wordlists(paths=args['http_path'])
-
-                    window_sizes = cp.full(batch_count, win_val, dtype=cp.uint16)
-                    mss_values = cp.full(batch_count, mss_val, dtype=cp.uint16)
-                    ttls = cp.full(batch_count, ttl_val, dtype=cp.uint8)
+                    payload_engine.count = batch_count
+                    window_sizes = window_sizes_full[:batch_count]
+                    mss_values = mss_values_full[:batch_count]
+                    ttls = ttls_full[:batch_count]
 
                     packets_gpu_array, packet_size = payload_engine.generate_fused_http(
                         target_ip=args['target'],
@@ -542,10 +563,11 @@ async def worker_process(
                         mss_values=mss_values,
                         ttls=ttls
                     )
+                    active_gpu = packets_gpu_array[: batch_count * packet_size]
 
                     current_batch = {
                         "cpu": _gpu_to_host(
-                            packets_gpu_array,
+                            active_gpu,
                             f"http_fused_slot{stream_idx}",
                             stream=stream_ring[stream_idx],
                             blocking=False,
@@ -553,7 +575,6 @@ async def worker_process(
                         "count": batch_count,
                         "stream": stream_ring[stream_idx],
                         "slot": stream_idx,
-                        "engine": payload_engine,
                         "ready_event": cp.cuda.Event(),
                     }
                     current_batch["ready_event"].record(current_batch["stream"])
@@ -1532,11 +1553,15 @@ async def worker_process(
                 _perm_errors = int(worker_stats.get("permission_error_count", 0) or 0)
                 _buffer_copy_count = int(worker_stats.get("buffer_copy_count", 0) or 0)
                 _buffer_copy_bytes = int(worker_stats.get("buffer_copy_bytes", 0) or 0)
+                _buffer_reuse_hits = int(worker_stats.get("buffer_reuse_hits", 0) or 0)
                 _eagain_retry_count = int(worker_stats.get("eagain_retry_count", 0) or 0)
                 _partial_send_retry_count = int(worker_stats.get("partial_send_retry_count", 0) or 0)
                 _txring_flush_call_count = int(worker_stats.get("txring_flush_call_count", 0) or 0)
                 _txring_flush_error_count = int(worker_stats.get("txring_flush_error_count", 0) or 0)
                 _txring_flush_eagain_count = int(worker_stats.get("txring_flush_eagain_count", 0) or 0)
+                _txring_frame_wait_ns = int(worker_stats.get("txring_frame_wait_ns", 0) or 0)
+                _txring_poll_count = int(worker_stats.get("txring_poll_count", 0) or 0)
+                _flush_mode = str(worker_stats.get("flush_mode", "unknown") or "unknown")
                 _txring_tp_packets = int(worker_stats.get("txring_tp_packets", 0) or 0)
                 _txring_tp_drops = int(worker_stats.get("txring_tp_drops", 0) or 0)
                 _txring_tp_freeze_q_cnt = int(worker_stats.get("txring_tp_freeze_q_cnt", 0) or 0)
@@ -1589,11 +1614,15 @@ async def worker_process(
                         "permission_error_count": _perm_errors,
                         "buffer_copy_count": _buffer_copy_count,
                         "buffer_copy_bytes": _buffer_copy_bytes,
+                        "buffer_reuse_hits": _buffer_reuse_hits,
                         "eagain_retry_count": _eagain_retry_count,
                         "partial_send_retry_count": _partial_send_retry_count,
                         "txring_flush_call_count": _txring_flush_call_count,
                         "txring_flush_error_count": _txring_flush_error_count,
                         "txring_flush_eagain_count": _txring_flush_eagain_count,
+                        "txring_frame_wait_ns": _txring_frame_wait_ns,
+                        "txring_poll_count": _txring_poll_count,
+                        "flush_mode": _flush_mode,
                         "txring_tp_packets": _txring_tp_packets,
                         "txring_tp_drops": _txring_tp_drops,
                         "txring_tp_freeze_q_cnt": _txring_tp_freeze_q_cnt,

@@ -655,7 +655,7 @@ def fused_http_generator_kernel(packets_buffer, rng_states, count, max_packet_si
 
 # --- Host Helper Functions ---
 
-def prepare_string_array(string_list):
+def _prepare_string_array_impl(string_list):
     """
     Flattens a list of strings into a single byte array and offset/len arrays for GPU.
     """
@@ -665,17 +665,26 @@ def prepare_string_array(string_list):
     current_off = 0
     
     for s in string_list:
-        l = len(s)
+        l = len(s) if isinstance(s, (bytes, bytearray)) else len(str(s).encode("utf-8"))
         offsets.append(current_off)
         lengths.append(l)
         current_off += l
-        
+
+    flat_np = np.frombuffer(flat_data, dtype=np.uint8)
+    offs_np = np.asarray(offsets, dtype=np.uint32)
+    lens_np = np.asarray(lengths, dtype=np.uint32)
+
     return (
-        cp.array(list(flat_data), dtype=cp.uint8),
-        cp.array(offsets, dtype=cp.uint32),
-        cp.array(lengths, dtype=cp.uint32),
+        cp.asarray(flat_np, dtype=cp.uint8),
+        cp.asarray(offs_np, dtype=cp.uint32),
+        cp.asarray(lens_np, dtype=cp.uint32),
         len(string_list)
     )
+
+
+def prepare_string_array(string_list):
+    return _prepare_string_array_impl(string_list)
+
 
 class GPUPayloadEngine:
     def __init__(self, count, max_packet_size=512):
@@ -738,7 +747,7 @@ class GPUPayloadEngine:
         threads_per_block = 256
         blocks_per_grid = (self.count + (threads_per_block - 1)) // threads_per_block
         
-        target_ip_bytes = cp.array(list(target_ip.encode()), dtype=cp.uint8)
+        target_ip_bytes = cp.asarray(np.frombuffer(target_ip.encode(), dtype=np.uint8), dtype=cp.uint8)
         target_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(target_ip.split('.'))]))
         real_src_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(real_src_ip.split('.'))]))
         
@@ -770,7 +779,7 @@ class GPUPayloadEngine:
         threads_per_block = 256
         blocks_per_grid = (self.count + (threads_per_block - 1)) // threads_per_block
         
-        target_ip_bytes = cp.array(list(target_ip.encode()), dtype=cp.uint8)
+        target_ip_bytes = cp.asarray(np.frombuffer(target_ip.encode(), dtype=np.uint8), dtype=cp.uint8)
         target_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(target_ip.split('.'))]))
         
         assemble_http_payload_kernel[blocks_per_grid, threads_per_block, stream](
@@ -919,7 +928,7 @@ class POSTBodyGenerator:
             bodies.append(body)
         
         flat = b''.join(bodies)
-        return cp.array(np.frombuffer(flat, dtype=np.uint8))
+        return cp.asarray(np.frombuffer(flat, dtype=np.uint8))
     
     def generate_json_bodies(self) -> cp.ndarray:
         """Generate JSON bodies on GPU."""
@@ -930,7 +939,7 @@ class POSTBodyGenerator:
             bodies.append(body)
         
         flat = b''.join(bodies)
-        return cp.array(np.frombuffer(flat, dtype=np.uint8))
+        return cp.asarray(np.frombuffer(flat, dtype=np.uint8))
     
     def get_body_lengths(self, bodies_gpu: cp.ndarray) -> cp.ndarray:
         """Calculate actual body lengths (before null padding)."""
@@ -1433,32 +1442,8 @@ class HTTP2PayloadGenerator:
 # ============================================================================
 
 def prepare_string_array(string_list: List[str]) -> Tuple[cp.ndarray, cp.ndarray, cp.ndarray, int]:
-    """
-    Flattens a list of strings into a single byte array and offset/len arrays for GPU.
-    
-    Args:
-        string_list: List of strings
-        
-    Returns:
-        Tuple of (flat_data, offsets, lengths, count)
-    """
-    flat_data = b"".join([s.encode('utf-8') if isinstance(s, str) else s for s in string_list])
-    offsets = []
-    lengths = []
-    current_off = 0
-    
-    for s in string_list:
-        l = len(s) if isinstance(s, str) else len(s)
-        offsets.append(current_off)
-        lengths.append(l)
-        current_off += l
-        
-    return (
-        cp.array(list(flat_data), dtype=cp.uint8),
-        cp.array(offsets, dtype=cp.uint32),
-        cp.array(lengths, dtype=cp.uint32),
-        len(string_list)
-    )
+    """Compatibility wrapper around the single implementation."""
+    return _prepare_string_array_impl(string_list)
 
 
 def get_content_type_header(content_type: int) -> str:

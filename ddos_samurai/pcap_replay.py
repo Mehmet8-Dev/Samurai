@@ -814,7 +814,11 @@ def prepare_replay(
         cfg.src_ip_override or cfg.src_port_override
     )
 
-    processed_data: List[bytes] = []
+    expected_count = len(filtered_packets)
+    uniform_size = 0
+    prepared_count = 0
+    max_size = 0
+    buf = bytearray()
     timestamps: List[float] = []
 
     for pkt, ip_info in filtered_packets:
@@ -853,30 +857,45 @@ def prepare_replay(
                 continue
             raise PcapParseError(f"Malformed packet during rewrite/strip: {exc}") from exc
 
-        processed_data.append(bytes(raw))
+        data = bytes(raw)
+        data_len = len(data)
+        if data_len > max_size:
+            max_size = data_len
+
+        needed_size = (data_len + 3) & ~3
+        if uniform_size == 0:
+            uniform_size = needed_size
+            buf = bytearray(uniform_size * expected_count)
+        elif needed_size > uniform_size:
+            new_uniform = max(needed_size, (uniform_size * 3) // 2)
+            new_uniform = (new_uniform + 3) & ~3
+            new_buf = bytearray(new_uniform * expected_count)
+            for i in range(prepared_count):
+                old_off = i * uniform_size
+                new_off = i * new_uniform
+                new_buf[new_off:new_off + uniform_size] = buf[old_off:old_off + uniform_size]
+            buf = new_buf
+            uniform_size = new_uniform
+
+        write_off = prepared_count * uniform_size
+        buf[write_off:write_off + data_len] = data
+        prepared_count += 1
         timestamps.append(pkt.timestamp_s)
 
-    if not processed_data:
+    if prepared_count <= 0:
         raise PcapParseError(
             "No packets remained after malformed-packet handling "
             f"(malformed_errors={malformed_errors}, malformed_skipped={malformed_skipped})"
         )
 
-    # ── Normalize to uniform packet size ────────────────────────
-    max_size = max(len(d) for d in processed_data)
-    # Align to 4-byte boundary for hardware compatibility
-    uniform_size = (max_size + 3) & ~3
-
-    buf = bytearray(uniform_size * len(processed_data))
-    for i, data in enumerate(processed_data):
-        offset = i * uniform_size
-        buf[offset:offset + len(data)] = data
-        # Remaining bytes stay zero (padding)
+    # Trim to the actual number of prepared packets.
+    if len(buf) != (uniform_size * prepared_count):
+        buf = buf[: uniform_size * prepared_count]
 
     prep_stats = {
         "total_in_file": len(packets),
         "filtered_out": skipped,
-        "prepared_count": len(processed_data),
+        "prepared_count": prepared_count,
         "uniform_packet_size": uniform_size,
         "max_raw_size": max_size,
         "buffer_size_bytes": len(buf),
@@ -889,7 +908,7 @@ def prepare_replay(
     return PreparedReplay(
         packets_buffer=bytes(buf),
         packet_size=uniform_size,
-        count=len(processed_data),
+        count=prepared_count,
         timestamps=timestamps,
         meta=meta,
         stats=prep_stats,
@@ -1127,9 +1146,12 @@ async def replay_pcap(
                 loop_start_t = time.monotonic()
                 dst_ip = cfg.target_ip_override or "0.0.0.0"
                 dst_port = cfg.target_port_override or 0
+                address = (dst_ip, dst_port)
+                has_sendmmsg = hasattr(s, "sendmmsg")
 
                 try:
-                    for pkt_idx in range(prep.count):
+                    pkt_idx = 0
+                    while pkt_idx < prep.count:
                         if pkt_idx > 0:
                             target_t = loop_start_t + schedule_offsets[pkt_idx]
                             drift_ms = await _wait_until(target_t)
@@ -1138,24 +1160,84 @@ async def replay_pcap(
                             if drift_ms > drift_max_ms:
                                 drift_max_ms = drift_ms
 
-                        pkt_start = pkt_idx * prep.packet_size
-                        pkt_end = pkt_start + prep.packet_size
-                        pkt_view = mv[pkt_start:pkt_end]
+                        if has_sendmmsg:
+                            now_off = max(0.0, time.monotonic() - loop_start_t)
+                            max_window = max(1, int(cfg.batch_size))
+                            send_end = min(prep.count, pkt_idx + 1)
+                            hard_limit = min(prep.count, pkt_idx + max_window)
+                            while send_end < hard_limit:
+                                if schedule_offsets[send_end] > now_off:
+                                    break
+                                send_end += 1
 
-                        try:
-                            s.sendto(pkt_view, (dst_ip, dst_port))
-                            loop_sent += 1
-                        except Exception:
-                            loop_errors += 1
+                            datagrams = []
+                            for send_i in range(pkt_idx, send_end):
+                                pkt_start = send_i * prep.packet_size
+                                pkt_end = pkt_start + prep.packet_size
+                                datagrams.append((mv[pkt_start:pkt_end], []))
 
-                        if live_progress:
+                            batch_count = len(datagrams)
+                            batch_sent = 0
                             try:
-                                live_progress.value += 1
+                                while batch_sent < batch_count:
+                                    sent_now = int(s.sendmmsg(datagrams[batch_sent:], 0, address) or 0)
+                                    if sent_now <= 0:
+                                        break
+                                    batch_sent += sent_now
                             except Exception:
-                                pass
+                                batch_sent = 0
+
+                            loop_sent += int(batch_sent)
+                            batch_errors = max(0, batch_count - int(batch_sent))
+                            loop_errors += batch_errors
+
+                            if live_progress:
+                                try:
+                                    live_progress.value += int(batch_count)
+                                except Exception:
+                                    pass
+                            if live_sent and batch_sent > 0:
+                                try:
+                                    live_sent.value += int(batch_sent)
+                                except Exception:
+                                    pass
+                            if live_errors and batch_errors > 0:
+                                try:
+                                    live_errors.value += int(batch_errors)
+                                except Exception:
+                                    pass
+
+                            pkt_idx += batch_count
+                        else:
+                            pkt_start = pkt_idx * prep.packet_size
+                            pkt_end = pkt_start + prep.packet_size
+                            pkt_view = mv[pkt_start:pkt_end]
+
+                            try:
+                                s.sendto(pkt_view, address)
+                                loop_sent += 1
+                                if live_sent:
+                                    try:
+                                        live_sent.value += 1
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                loop_errors += 1
+                                if live_errors:
+                                    try:
+                                        live_errors.value += 1
+                                    except Exception:
+                                        pass
+
+                            if live_progress:
+                                try:
+                                    live_progress.value += 1
+                                except Exception:
+                                    pass
+                            pkt_idx += 1
 
                         # Cooperative yield at configured chunk boundaries.
-                        if (pkt_idx + 1) % cfg.batch_size == 0:
+                        if pkt_idx % max(1, int(cfg.batch_size)) == 0:
                             await asyncio.sleep(0)
                 finally:
                     s.close()
@@ -1164,17 +1246,6 @@ async def replay_pcap(
                 stats["sent"] += loop_sent
                 stats["errors"] += loop_errors
                 stats["bytes_sent_est"] += loop_sent * prep.packet_size
-
-                if live_sent:
-                    try:
-                        live_sent.value += loop_sent
-                    except Exception:
-                        pass
-                if live_errors:
-                    try:
-                        live_errors.value += loop_errors
-                    except Exception:
-                        pass
 
             stats["loops_completed"] += 1
 

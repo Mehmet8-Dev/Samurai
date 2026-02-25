@@ -75,6 +75,7 @@ _TCP_FLAG_NAME_MAP: Dict[str, int] = {
     "CWR": TCP_CWR,
 }
 _TCP_FLAG_NAME_TOKENS = tuple(sorted(_TCP_FLAG_NAME_MAP.keys(), key=len, reverse=True))
+_TCP_FLAG_PARSE_CACHE: Dict[str, int] = {}
 
 # TCP Option kinds
 TCP_OPT_EOL       = 0
@@ -101,6 +102,12 @@ DNS_CLASS_IN   = 1
 _DNS_QTYPE_MAP: Dict[str, int] = {
     "A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "PTR": 12,
     "MX": 15, "TXT": 16, "AAAA": 28, "SRV": 33, "ANY": 255,
+}
+
+_PROTO_STR_TO_INT: Dict[str, int] = {
+    "tcp": PROTO_TCP,
+    "udp": PROTO_UDP,
+    "icmp": PROTO_ICMP,
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -160,6 +167,57 @@ OS_MACOS_14 = OSProfile(
 )
 
 OS_PROFILES = (OS_WINDOWS_10, OS_LINUX_5, OS_MACOS_14)
+_PROFILE_TCP_OPTIONS_CACHE: Dict[str, Tuple[bytes, Tuple[int, ...]]] = {}
+
+
+def _get_profile_tcp_options_cached(profile: OSProfile) -> Tuple[bytes, Tuple[int, ...]]:
+    """
+    Return cached TCP option bytes template for an OS profile.
+
+    The returned tuple is:
+        (base_option_bytes_with_tsval_zero, tsval_offsets)
+    """
+    cached = _PROFILE_TCP_OPTIONS_CACHE.get(profile.name)
+    if cached is not None:
+        return cached
+
+    buf = bytearray()
+    tsval_offsets: List[int] = []
+
+    for kind, value in profile.tcp_options:
+        if kind == TCP_OPT_EOL:
+            buf.append(0)
+        elif kind == TCP_OPT_NOP:
+            buf.append(1)
+        elif kind == TCP_OPT_MSS:
+            buf.extend(struct.pack("!BBH", 2, 4, value if value else 1460))
+        elif kind == TCP_OPT_WSCALE:
+            buf.extend(struct.pack("!BBB", 3, 3, value if value else 7))
+        elif kind == TCP_OPT_SACK_OK:
+            buf.extend(struct.pack("!BB", 4, 2))
+        elif kind == TCP_OPT_TIMESTAMP:
+            # Track TSval offset (Kind + Len + TSval + TSecr)
+            tsval_offsets.append(len(buf) + 2)
+            buf.extend(struct.pack("!BBII", 8, 10, 0, 0))
+
+    while len(buf) % 4 != 0:
+        buf.append(0)
+
+    out = (bytes(buf), tuple(tsval_offsets))
+    _PROFILE_TCP_OPTIONS_CACHE[profile.name] = out
+    return out
+
+
+def _build_profile_tcp_options(profile: OSProfile) -> bytes:
+    """Build TCP options for an OS profile using cached templates."""
+    base, tsval_offsets = _get_profile_tcp_options_cached(profile)
+    if not tsval_offsets:
+        return base
+
+    out = bytearray(base)
+    for off in tsval_offsets:
+        struct.pack_into("!I", out, off, random.randint(1, 0xFFFFFFFF))
+    return bytes(out)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -373,6 +431,31 @@ def get_spoofed_ip(
 #  TCP Options Builder
 # ════════════════════════════════════════════════════════════════════════════
 
+_TCP_OPTIONS_CACHE: Dict[Tuple[Tuple[int, Optional[int], Optional[int]], ...], bytes] = {}
+
+
+def _tcp_options_cache_key(options: tuple | list) -> Optional[Tuple[Tuple[int, Optional[int], Optional[int]], ...]]:
+    """
+    Build a stable cache key for deterministic TCP options.
+
+    Dynamic timestamp options (value is not tuple/list) are excluded from cache.
+    """
+    norm: List[Tuple[int, Optional[int], Optional[int]]] = []
+    for kind, value in options:
+        if kind == TCP_OPT_TIMESTAMP:
+            if isinstance(value, (tuple, list)) and len(value) >= 2:
+                norm.append((int(kind), int(value[0]), int(value[1])))
+            else:
+                return None
+        elif value is None:
+            norm.append((int(kind), None, None))
+        elif isinstance(value, int):
+            norm.append((int(kind), int(value), None))
+        else:
+            return None
+    return tuple(norm)
+
+
 def build_tcp_options(options: tuple | list) -> bytes:
     """
     Build raw TCP options bytes from a list of (kind, value) tuples.
@@ -385,6 +468,12 @@ def build_tcp_options(options: tuple | list) -> bytes:
         - (TCP_OPT_SACK_OK, None)              → 2 bytes: kind(1) + len(1)
         - (TCP_OPT_TIMESTAMP, (tsval, tsecr))  → 10 bytes: kind(1) + len(1) + tsval(4) + tsecr(4)
     """
+    cache_key = _tcp_options_cache_key(options)
+    if cache_key is not None:
+        cached = _TCP_OPTIONS_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
     buf = bytearray()
     for kind, value in options:
         if kind == TCP_OPT_EOL:
@@ -416,7 +505,13 @@ def build_tcp_options(options: tuple | list) -> bytes:
     while len(buf) % 4 != 0:
         buf.append(0)  # EOL/padding
 
-    return bytes(buf)
+    out = bytes(buf)
+    if cache_key is not None:
+        _TCP_OPTIONS_CACHE[cache_key] = out
+        # Bound cache growth.
+        if len(_TCP_OPTIONS_CACHE) > 256:
+            _TCP_OPTIONS_CACHE.pop(next(iter(_TCP_OPTIONS_CACHE)))
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -736,12 +831,24 @@ def parse_tcp_flags(flags_str: str) -> int:
             idx += 1
         return result_local
 
-    result = 0
     normalized = str(flags_str).upper()
+    normalized_key = normalized
+    for sep in ("+", ",", "/", "|"):
+        normalized_key = normalized_key.replace(sep, " ")
+    normalized_key = " ".join(normalized_key.split())
+
+    cached = _TCP_FLAG_PARSE_CACHE.get(normalized_key)
+    if cached is not None:
+        return cached
+
+    result = 0
     for sep in ("+", ",", "/", "|"):
         normalized = normalized.replace(sep, " ")
     for token in normalized.split():
         result |= _parse_token(token)
+    _TCP_FLAG_PARSE_CACHE[normalized_key] = result
+    if len(_TCP_FLAG_PARSE_CACHE) > 256:
+        _TCP_FLAG_PARSE_CACHE.pop(next(iter(_TCP_FLAG_PARSE_CACHE)))
     return result
 
 
@@ -770,10 +877,35 @@ class PacketConfig:
     dns_qtype:        Union[str, List[str]] = "A"
     dns_edns:         bool = False
     dns_recursive:    bool = True
+    target_ip_int:    int = field(init=False, repr=False, default=0)
+    protocol_int:     int = field(init=False, repr=False, default=0)
+    tcp_flags_int:    int = field(init=False, repr=False, default=0)
+    fixed_tcp_options_bytes: bytes = field(init=False, repr=False, default=b"")
+    precomputed_profile: Optional[OSProfile] = field(init=False, repr=False, default=None)
 
     def __post_init__(self):
         if self.spoof_opts is None:
             self.spoof_opts = SpoofingOptions()
+        self.protocol = str(self.protocol or "tcp").lower()
+        self.protocol_int = int(_PROTO_STR_TO_INT.get(self.protocol, 0) or 0)
+        try:
+            self.target_ip_int = ip_to_int(self.target_ip)
+        except Exception:
+            self.target_ip_int = 0
+        if self.protocol == "tcp":
+            self.tcp_flags_int = parse_tcp_flags(self.tcp_flags)
+        else:
+            self.tcp_flags_int = 0
+
+        fixed_profile_name = str(os.environ.get("SAMURAI_CPU_FIXED_OS_PROFILE", "") or "").strip().lower()
+        if fixed_profile_name:
+            for prof in OS_PROFILES:
+                if str(prof.name).lower() == fixed_profile_name:
+                    self.precomputed_profile = prof
+                    base_opts, ts_offsets = _get_profile_tcp_options_cached(prof)
+                    if not ts_offsets:
+                        self.fixed_tcp_options_bytes = base_opts
+                    break
 
 
 @dataclass
@@ -807,12 +939,12 @@ def build_transport_packet(cfg: PacketConfig) -> bytes:
     This is the primary packet builder for the CPU path.
     Returns the raw IP packet (no Ethernet).
     """
-    profile = _select_os_profile()
+    profile = cfg.precomputed_profile or _select_os_profile()
 
     # Source IP
     src_ip = _get_source_ip(cfg)
     src_ip_int = ip_to_int(src_ip) if src_ip != "0.0.0.0" else 0
-    dst_ip_int = ip_to_int(cfg.target_ip)
+    dst_ip_int = cfg.target_ip_int or ip_to_int(cfg.target_ip)
 
     # TTL / TOS
     ttl = cfg.ttl if cfg.ttl is not None else profile.ttl
@@ -821,25 +953,22 @@ def build_transport_packet(cfg: PacketConfig) -> bytes:
     # Source port
     src_port = random.randint(1024, 65535)
 
-    proto = cfg.protocol.lower()
+    proto = cfg.protocol
     is_syn_only = False
 
     if proto == "tcp":
         # Parse flags
-        flags_int = parse_tcp_flags(cfg.tcp_flags)
+        flags_int = int(cfg.tcp_flags_int)
         is_syn_only = (flags_int & TCP_SYN) and not (flags_int & (TCP_ACK | TCP_PSH))
 
         # Window
         window = cfg.window if cfg.window else profile.window
 
-        # TCP options (with timestamp randomization)
-        opts = []
-        for kind, value in profile.tcp_options:
-            if kind == TCP_OPT_TIMESTAMP:
-                opts.append((kind, (random.randint(1, 0xFFFFFFFF), 0)))
-            else:
-                opts.append((kind, value))
-        options_bytes = build_tcp_options(opts)
+        # TCP options (cached profile options + timestamp patching)
+        if cfg.fixed_tcp_options_bytes:
+            options_bytes = cfg.fixed_tcp_options_bytes
+        else:
+            options_bytes = _build_profile_tcp_options(profile)
 
         # Payload
         payload = b""
@@ -910,7 +1039,7 @@ def build_transport_packet(cfg: PacketConfig) -> bytes:
     ip_hdr = build_ipv4_header(
         src_ip=src_ip_int or 0,
         dst_ip=dst_ip_int,
-        protocol={"tcp": PROTO_TCP, "udp": PROTO_UDP, "icmp": PROTO_ICMP}[proto],
+        protocol=cfg.protocol_int or _PROTO_STR_TO_INT[proto],
         payload_len=len(l4_data),
         ttl=ttl,
         tos=tos,
@@ -929,7 +1058,7 @@ def build_dns_packet(cfg: PacketConfig) -> bytes:
     """Build a complete IPv4 + UDP + DNS query packet."""
     src_ip = _get_source_ip(cfg)
     src_ip_int = ip_to_int(src_ip) if src_ip != "0.0.0.0" else 0
-    dst_ip_int = ip_to_int(cfg.target_ip)
+    dst_ip_int = cfg.target_ip_int or ip_to_int(cfg.target_ip)
     src_port = random.randint(1024, 65535)
 
     # Select query type
@@ -975,23 +1104,20 @@ def build_polymorphic_http_packet(cfg: PacketConfig) -> bytes:
     """Build TCP packet with a polymorphic HTTP payload."""
     src_ip = _get_source_ip(cfg)
     src_ip_int = ip_to_int(src_ip) if src_ip != "0.0.0.0" else 0
-    dst_ip_int = ip_to_int(cfg.target_ip)
+    dst_ip_int = cfg.target_ip_int or ip_to_int(cfg.target_ip)
     src_port = random.randint(1024, 65535)
 
-    profile = _select_os_profile()
+    profile = cfg.precomputed_profile or _select_os_profile()
     ttl = cfg.ttl if cfg.ttl is not None else profile.ttl
 
     # Polymorphic HTTP payload
     payload = _build_polymorphic_http_payload(cfg.target_ip)
 
     # TCP options
-    opts = []
-    for kind, value in profile.tcp_options:
-        if kind == TCP_OPT_TIMESTAMP:
-            opts.append((kind, (random.randint(1, 0xFFFFFFFF), 0)))
-        else:
-            opts.append((kind, value))
-    options_bytes = build_tcp_options(opts)
+    if cfg.fixed_tcp_options_bytes:
+        options_bytes = cfg.fixed_tcp_options_bytes
+    else:
+        options_bytes = _build_profile_tcp_options(profile)
 
     # TCP: PSH+ACK for data-carrying segment
     tcp_hdr = build_tcp_header(
@@ -1116,11 +1242,32 @@ def generate_packet_pool(
 
     if uniform_size:
         if low_peak_memory:
-            max_size = 0
-            for _ in range(count):
-                pkt_len = len(create_packet(cfg))
-                if pkt_len > max_size:
-                    max_size = pkt_len
+            # Single-pass strategy with amortized stride growth.
+            pkt_size = 0
+            buf = bytearray()
+            for i in range(count):
+                pkt = create_packet(cfg)
+                pkt_len = len(pkt)
+                needed_pkt_size = (pkt_len + 3) & ~3
+
+                if pkt_size == 0:
+                    pkt_size = needed_pkt_size
+                    buf = bytearray(pkt_size * count)
+                elif needed_pkt_size > pkt_size:
+                    # Grow stride geometrically to avoid repeated reallocations.
+                    new_pkt_size = max(needed_pkt_size, (pkt_size * 3) // 2)
+                    new_pkt_size = (new_pkt_size + 3) & ~3
+                    new_buf = bytearray(new_pkt_size * count)
+                    for j in range(i):
+                        old_off = j * pkt_size
+                        new_off = j * new_pkt_size
+                        new_buf[new_off:new_off + pkt_size] = buf[old_off:old_off + pkt_size]
+                    buf = new_buf
+                    pkt_size = new_pkt_size
+
+                offset = i * pkt_size
+                buf[offset:offset + pkt_len] = pkt
+            return bytes(buf), pkt_size
         else:
             packets: List[bytes] = []
             for _ in range(count):
@@ -1130,18 +1277,9 @@ def generate_packet_pool(
         pkt_size = (max_size + 3) & ~3  # 4-byte aligned
         buf = bytearray(pkt_size * count)
 
-        if low_peak_memory:
-            for i in range(count):
-                pkt = create_packet(cfg)
-                if len(pkt) > pkt_size:
-                    # Safety fallback if packet size assumptions changed at runtime.
-                    return generate_packet_pool(cfg, count, uniform_size=uniform_size, low_peak_memory=False)
-                offset = i * pkt_size
-                buf[offset:offset + len(pkt)] = pkt
-        else:
-            for i, pkt in enumerate(packets):
-                offset = i * pkt_size
-                buf[offset:offset + len(pkt)] = pkt
+        for i, pkt in enumerate(packets):
+            offset = i * pkt_size
+            buf[offset:offset + len(pkt)] = pkt
         return bytes(buf), pkt_size
     else:
         # Variable-size: just concatenate (no size info)

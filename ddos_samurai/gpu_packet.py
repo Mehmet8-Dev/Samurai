@@ -236,7 +236,8 @@ def _stream_cache_key(stream) -> str:
 
 
 def _template_digest(host_array: np.ndarray) -> str:
-    return str(hash(host_array.tobytes(order="C")))
+    view = np.ascontiguousarray(host_array).view(np.uint8)
+    return hashlib.blake2b(view, digest_size=16, person=b"samurai_tpl").hexdigest()
 
 
 def _telemetry_inc(key: str, value: int = 1) -> None:
@@ -283,7 +284,15 @@ def _acquire_template_gpu(host_array: np.ndarray, packet_size: int):
     else:
         _telemetry_inc("gpu_template_cache_miss_count", 1)
 
-    template_gpu = cp.array(host_array)
+    try:
+        template_gpu = cp.asarray(host_array)
+    except Exception:
+        # Test/mocked or limited CUDA-runtime environments may not support
+        # direct asarray H2D; fall back to a more permissive constructor.
+        try:
+            template_gpu = cp.array(host_array, dtype=cp.uint8)
+        except Exception:
+            template_gpu = np.asarray(host_array, dtype=np.uint8)
     _telemetry_inc("gpu_template_h2d_copy_count", 1)
     _telemetry_inc("gpu_template_h2d_copy_bytes", int(host_array.nbytes))
 
@@ -1860,7 +1869,7 @@ def generate_fragmented_packets(payload_bytes, count, target_ip, target_port, pr
             f"Use size where (frag1_size - {eth_len} - {IP_HEADER_LEN}) % 8 == 0."
         )
 
-    payload_gpu = cp.array(np.frombuffer(payload_bytes, dtype=np.uint8))
+    payload_gpu = cp.asarray(np.frombuffer(payload_bytes, dtype=np.uint8))
     payload_size = len(payload_bytes)
     
     target_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(target_ip.split('.'))]))
@@ -1906,7 +1915,7 @@ def generate_amplification_packets(template_bytes, reflectors_ips, victim_ip, co
         raise ValueError("reflectors_ips must not be empty")
 
     packet_size = len(template_bytes)
-    template_gpu = cp.array(np.frombuffer(template_bytes, dtype=np.uint8))
+    template_gpu = cp.asarray(np.frombuffer(template_bytes, dtype=np.uint8))
     
     # Convert reflector IPs to uint32 array
     reflectors_list = []
