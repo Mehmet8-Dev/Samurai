@@ -48,6 +48,14 @@ def _empty_stats() -> dict:
         "eagain_retry_count": 0,
         "partial_send_retry_count": 0,
         "buffer_reuse_hits": 0,
+        "actual_rps": 0.0,
+        "rate_accuracy_pct": 0.0,
+        "jitter_p99_ns": 0.0,
+        "ipg_mean_ns": 0.0,
+        "sleep_calls": 0,
+        "busywait_cycles": 0,
+        "so_txtime_active": 0,
+        "txtime_errors": 0,
         "txring_flush_call_count": 0,
         "txring_flush_error_count": 0,
         "txring_flush_eagain_count": 0,
@@ -133,6 +141,25 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["eagain_retry_count"] = int(acc.get("eagain_retry_count", 0)) + int(item.get("eagain_retry_count", 0) or 0)
     acc["partial_send_retry_count"] = int(acc.get("partial_send_retry_count", 0)) + int(item.get("partial_send_retry_count", 0) or 0)
     acc["buffer_reuse_hits"] = int(acc.get("buffer_reuse_hits", 0)) + int(item.get("buffer_reuse_hits", 0) or 0)
+    item_actual_rps = float(item.get("actual_rps", 0.0) or 0.0)
+    if item_actual_rps > 0.0 or float(acc.get("actual_rps", 0.0) or 0.0) == 0.0:
+        acc["actual_rps"] = item_actual_rps
+    item_rate_accuracy = float(item.get("rate_accuracy_pct", 0.0) or 0.0)
+    if item_rate_accuracy > 0.0 or float(acc.get("rate_accuracy_pct", 0.0) or 0.0) == 0.0:
+        acc["rate_accuracy_pct"] = item_rate_accuracy
+    item_jitter_p99 = float(item.get("jitter_p99_ns", 0.0) or 0.0)
+    if item_jitter_p99 > 0.0 or float(acc.get("jitter_p99_ns", 0.0) or 0.0) == 0.0:
+        acc["jitter_p99_ns"] = item_jitter_p99
+    item_ipg_mean = float(item.get("ipg_mean_ns", 0.0) or 0.0)
+    if item_ipg_mean > 0.0 or float(acc.get("ipg_mean_ns", 0.0) or 0.0) == 0.0:
+        acc["ipg_mean_ns"] = item_ipg_mean
+    acc["sleep_calls"] = int(acc.get("sleep_calls", 0)) + int(item.get("sleep_calls", 0) or 0)
+    acc["busywait_cycles"] = int(acc.get("busywait_cycles", 0)) + int(item.get("busywait_cycles", 0) or 0)
+    acc["so_txtime_active"] = max(
+        int(acc.get("so_txtime_active", 0) or 0),
+        int(bool(item.get("so_txtime_active", 0))),
+    )
+    acc["txtime_errors"] = int(acc.get("txtime_errors", 0)) + int(item.get("txtime_errors", 0) or 0)
     acc["txring_flush_call_count"] = int(acc.get("txring_flush_call_count", 0)) + int(item.get("txring_flush_call_count", 0) or 0)
     acc["txring_flush_error_count"] = int(acc.get("txring_flush_error_count", 0)) + int(item.get("txring_flush_error_count", 0) or 0)
     acc["txring_flush_eagain_count"] = int(acc.get("txring_flush_eagain_count", 0)) + int(item.get("txring_flush_eagain_count", 0) or 0)
@@ -378,6 +405,14 @@ async def worker_process(
                 "gpu_pool_in_use": int(gpu_pool_in_use),
                 "backlog": int(backlog),
                 "backend": str(backend_used),
+                "pacing_actual_rps": float(worker_stats.get("actual_rps", 0.0) or 0.0),
+                "pacing_rate_accuracy_pct": float(worker_stats.get("rate_accuracy_pct", 0.0) or 0.0),
+                "pacing_jitter_p99_ns": float(worker_stats.get("jitter_p99_ns", 0.0) or 0.0),
+                "pacing_ipg_mean_ns": float(worker_stats.get("ipg_mean_ns", 0.0) or 0.0),
+                "pacing_sleep_calls": int(worker_stats.get("sleep_calls", 0) or 0),
+                "pacing_busywait_cycles": int(worker_stats.get("busywait_cycles", 0) or 0),
+                "pacing_so_txtime_active": int(worker_stats.get("so_txtime_active", 0) or 0),
+                "pacing_txtime_errors": int(worker_stats.get("txtime_errors", 0) or 0),
             }
         except Exception:
             pass
@@ -1578,6 +1613,14 @@ async def worker_process(
                 _buffer_reuse_hits = int(worker_stats.get("buffer_reuse_hits", 0) or 0)
                 _eagain_retry_count = int(worker_stats.get("eagain_retry_count", 0) or 0)
                 _partial_send_retry_count = int(worker_stats.get("partial_send_retry_count", 0) or 0)
+                _actual_rps = float(worker_stats.get("actual_rps", 0.0) or 0.0)
+                _rate_accuracy_pct = float(worker_stats.get("rate_accuracy_pct", 0.0) or 0.0)
+                _jitter_p99_ns = float(worker_stats.get("jitter_p99_ns", 0.0) or 0.0)
+                _ipg_mean_ns = float(worker_stats.get("ipg_mean_ns", 0.0) or 0.0)
+                _sleep_calls = int(worker_stats.get("sleep_calls", 0) or 0)
+                _busywait_cycles = int(worker_stats.get("busywait_cycles", 0) or 0)
+                _so_txtime_active = int(worker_stats.get("so_txtime_active", 0) or 0)
+                _txtime_errors = int(worker_stats.get("txtime_errors", 0) or 0)
                 _txring_flush_call_count = int(worker_stats.get("txring_flush_call_count", 0) or 0)
                 _txring_flush_error_count = int(worker_stats.get("txring_flush_error_count", 0) or 0)
                 _txring_flush_eagain_count = int(worker_stats.get("txring_flush_eagain_count", 0) or 0)
@@ -1655,6 +1698,14 @@ async def worker_process(
                         "buffer_reuse_hits": _buffer_reuse_hits,
                         "eagain_retry_count": _eagain_retry_count,
                         "partial_send_retry_count": _partial_send_retry_count,
+                        "actual_rps": _actual_rps,
+                        "rate_accuracy_pct": _rate_accuracy_pct,
+                        "jitter_p99_ns": _jitter_p99_ns,
+                        "ipg_mean_ns": _ipg_mean_ns,
+                        "sleep_calls": _sleep_calls,
+                        "busywait_cycles": _busywait_cycles,
+                        "so_txtime_active": _so_txtime_active,
+                        "txtime_errors": _txtime_errors,
                         "txring_flush_call_count": _txring_flush_call_count,
                         "txring_flush_error_count": _txring_flush_error_count,
                         "txring_flush_eagain_count": _txring_flush_eagain_count,

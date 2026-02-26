@@ -24,7 +24,7 @@ Usage::
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional
 
@@ -77,8 +77,21 @@ class PacingConfig:
     pin_cpu:        int         = -1         # CPU core to pin (-1 = none)
     use_so_txtime:  bool        = False      # kernel SO_TXTIME offload
 
+    def validate(self) -> None:
+        if self.jitter_pct < 0.0 or self.jitter_pct > 1.0:
+            raise ValueError("jitter_pct must be within [0.0, 1.0]")
+        if self.burst_size < 1:
+            raise ValueError("burst_size must be >= 1")
+        if self.burst_gap_ns < 0:
+            raise ValueError("burst_gap_ns must be >= 0")
+        if self.pacing_mode == PacingMode.RPS and self.target_rps <= 0:
+            raise ValueError("target_rps must be > 0 for RPS mode")
+        if self.pacing_mode == PacingMode.IPG and self.ipg_ns <= 0:
+            raise ValueError("ipg_ns must be > 0 for IPG mode")
+
     def as_kwargs(self) -> dict:
         """Return a dict suitable for ``pacing_engine.paced_send_*``."""
+        self.validate()
         return dict(
             target_rps    = self.target_rps,
             ipg_ns        = self.ipg_ns,
@@ -90,6 +103,63 @@ class PacingConfig:
             pin_cpu       = self.pin_cpu,
             use_so_txtime = self.use_so_txtime,
         )
+
+
+_PACER_STATS_DEFAULTS = {
+    "total_packets": 0,
+    "total_bytes": 0,
+    "elapsed_ns": 0.0,
+    "target_rps": 0.0,
+    "actual_rps": 0.0,
+    "rate_accuracy_pct": 0.0,
+    "ipg_min_ns": 0,
+    "ipg_max_ns": 0,
+    "ipg_mean_ns": 0.0,
+    "ipg_stddev_ns": 0.0,
+    "jitter_min_ns": 0.0,
+    "jitter_max_ns": 0.0,
+    "jitter_mean_ns": 0.0,
+    "jitter_stddev_ns": 0.0,
+    "jitter_p50_ns": 0.0,
+    "jitter_p95_ns": 0.0,
+    "jitter_p99_ns": 0.0,
+    "busywait_cycles": 0,
+    "sleep_calls": 0,
+    "so_txtime_active": 0,
+    "txtime_errors": 0,
+    "txring_flush_call_count": 0,
+    "txring_flush_error_count": 0,
+    "txring_flush_eagain_count": 0,
+    "txring_flush_enobufs_count": 0,
+    "txring_flush_ebusy_count": 0,
+    "txring_flush_other_errno_count": 0,
+    "txring_flush_last_errno": 0,
+    "txring_flush_last_errno_name": "NONE",
+    "txring_frame_wait_ns": 0,
+    "txring_poll_count": 0,
+    "txring_tp_packets": 0,
+    "txring_tp_drops": 0,
+    "txring_tp_freeze_q_cnt": 0,
+    "txring_packet_version": 0,
+    "txring_packet_version_name": "TPACKET_UNKNOWN",
+    "syscall_overhead_ns": 0,
+    "sleep_overhead_ns": 0,
+    "spin_threshold_ns": 0,
+    "ipg_histogram": [],
+}
+
+
+def normalize_stats(stats: Optional[dict]) -> dict:
+    out = dict(_PACER_STATS_DEFAULTS)
+    raw = dict(stats or {})
+    out.update(raw)
+    # Ensure expected field types.
+    out["so_txtime_active"] = int(bool(out.get("so_txtime_active", 0)))
+    out["txring_flush_last_errno_name"] = str(out.get("txring_flush_last_errno_name", "NONE") or "NONE")
+    out["txring_packet_version_name"] = str(out.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN")
+    hist = out.get("ipg_histogram")
+    out["ipg_histogram"] = list(hist) if isinstance(hist, (list, tuple)) else []
+    return out
 
 
 # ── High-Level API ───────────────────────────────────────────────────────────
@@ -109,6 +179,7 @@ def paced_send(
     """
     if config is None:
         config = PacingConfig()
+    config.validate()
 
     if not PACING_ENGINE_AVAILABLE:
         log.warning("Pacing engine unavailable — falling back to unpaced send")
@@ -134,6 +205,7 @@ def paced_send_l2(
     """
     if config is None:
         config = PacingConfig()
+    config.validate()
 
     if not PACING_ENGINE_AVAILABLE:
         log.warning("Pacing engine unavailable — L2 paced send not possible")
@@ -152,8 +224,8 @@ def paced_send_l2(
 def get_stats() -> dict:
     """Retrieve pacing statistics from the last send operation."""
     if not PACING_ENGINE_AVAILABLE:
-        return {}
-    return _eng.get_pacing_stats()
+        return normalize_stats({})
+    return normalize_stats(_eng.get_pacing_stats())
 
 
 def reset_stats() -> None:
@@ -173,7 +245,14 @@ def calibrate() -> dict:
     """
     if not PACING_ENGINE_AVAILABLE:
         return {}
-    return _eng.calibrate()
+    cal = dict(_eng.calibrate() or {})
+    # Keep calibration values visible in normalized schema as well.
+    merged = normalize_stats(cal)
+    return {
+        "syscall_overhead_ns": int(merged.get("syscall_overhead_ns", 0) or 0),
+        "sleep_overhead_ns": int(merged.get("sleep_overhead_ns", 0) or 0),
+        "spin_threshold_ns": int(merged.get("spin_threshold_ns", 0) or 0),
+    }
 
 
 def check_capabilities() -> dict:

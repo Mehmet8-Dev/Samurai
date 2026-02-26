@@ -508,6 +508,15 @@ def build_live_attack_report(
     buffer_reuse_hits_total = 0
     eagain_retry_count_total = 0
     partial_send_retry_count_total = 0
+    pacing_weight_total = 0
+    actual_rps_weighted_sum = 0.0
+    rate_accuracy_weighted_sum = 0.0
+    jitter_p99_weighted_sum = 0.0
+    ipg_mean_weighted_sum = 0.0
+    sleep_calls_total = 0
+    busywait_cycles_total = 0
+    so_txtime_active_any = 0
+    txtime_errors_total = 0
     txring_flush_call_count_total = 0
     txring_flush_error_count_total = 0
     txring_flush_eagain_count_total = 0
@@ -598,6 +607,24 @@ def build_live_attack_report(
         partial_send_retry_count_total += int(
             ev.get("partial_send_retry_count", st.get("partial_send_retry_count", 0)) or 0
         )
+        _w = int(max(0, attempted))
+        _actual_rps = float(ev.get("actual_rps", st.get("actual_rps", 0.0)) or 0.0)
+        _rate_accuracy = float(ev.get("rate_accuracy_pct", st.get("rate_accuracy_pct", 0.0)) or 0.0)
+        _jitter_p99 = float(ev.get("jitter_p99_ns", st.get("jitter_p99_ns", 0.0)) or 0.0)
+        _ipg_mean = float(ev.get("ipg_mean_ns", st.get("ipg_mean_ns", 0.0)) or 0.0)
+        if _w > 0:
+            pacing_weight_total += _w
+            actual_rps_weighted_sum += (_actual_rps * _w)
+            rate_accuracy_weighted_sum += (_rate_accuracy * _w)
+            jitter_p99_weighted_sum += (_jitter_p99 * _w)
+            ipg_mean_weighted_sum += (_ipg_mean * _w)
+        sleep_calls_total += int(ev.get("sleep_calls", st.get("sleep_calls", 0)) or 0)
+        busywait_cycles_total += int(ev.get("busywait_cycles", st.get("busywait_cycles", 0)) or 0)
+        so_txtime_active_any = max(
+            int(so_txtime_active_any),
+            int(ev.get("so_txtime_active", st.get("so_txtime_active", 0)) or 0),
+        )
+        txtime_errors_total += int(ev.get("txtime_errors", st.get("txtime_errors", 0)) or 0)
         txring_flush_call_count_total += int(
             ev.get("txring_flush_call_count", st.get("txring_flush_call_count", 0)) or 0
         )
@@ -715,6 +742,18 @@ def build_live_attack_report(
     effective_pps = (float(sent_total) / float(duration_s)) if duration_s > 0 else None
     throughput_bps_est = (float(bytes_sent_est_total) * 8.0 / float(duration_s)) if duration_s > 0 else None
     send_success_ratio = (float(sent_total) / float(attempted_total) * 100.0) if attempted_total > 0 else 0.0
+    pacing_actual_rps = (
+        float(actual_rps_weighted_sum) / float(pacing_weight_total)
+    ) if pacing_weight_total > 0 else 0.0
+    pacing_rate_accuracy_pct = (
+        float(rate_accuracy_weighted_sum) / float(pacing_weight_total)
+    ) if pacing_weight_total > 0 else 0.0
+    pacing_jitter_p99_ns = (
+        float(jitter_p99_weighted_sum) / float(pacing_weight_total)
+    ) if pacing_weight_total > 0 else 0.0
+    pacing_ipg_mean_ns = (
+        float(ipg_mean_weighted_sum) / float(pacing_weight_total)
+    ) if pacing_weight_total > 0 else 0.0
     txring_tp_drops_bounded_total = min(
         int(txring_tp_drops_total),
         int(txring_tp_packets_total),
@@ -781,6 +820,14 @@ def build_live_attack_report(
             "buffer_reuse_hits": int(buffer_reuse_hits_total),
             "eagain_retry_count": int(eagain_retry_count_total),
             "partial_send_retry_count": int(partial_send_retry_count_total),
+            "actual_rps": round(float(pacing_actual_rps), 4),
+            "rate_accuracy_pct": round(float(pacing_rate_accuracy_pct), 4),
+            "jitter_p99_ns": round(float(pacing_jitter_p99_ns), 4),
+            "ipg_mean_ns": round(float(pacing_ipg_mean_ns), 4),
+            "sleep_calls": int(sleep_calls_total),
+            "busywait_cycles": int(busywait_cycles_total),
+            "so_txtime_active": int(so_txtime_active_any),
+            "txtime_errors": int(txtime_errors_total),
             "txring_flush_call_count": int(txring_flush_call_count_total),
             "txring_flush_error_count": int(txring_flush_error_count_total),
             "txring_flush_eagain_count": int(txring_flush_eagain_count_total),

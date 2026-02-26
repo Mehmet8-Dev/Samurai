@@ -280,6 +280,32 @@ def _build_soak_config(args) -> dict | None:
         "max_backlog": _i("soak_max_backlog", int(base.get("max_backlog", 0))),
     }
 
+
+def _validate_pacing_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    mode = str(getattr(args, "pacing_mode", "none") or "none").strip().lower()
+    rps = float(getattr(args, "rps", 0.0) or 0.0)
+    ipg = int(getattr(args, "ipg", 0) or 0)
+    burst_size = int(getattr(args, "burst_size", 64) or 0)
+    burst_gap = int(getattr(args, "burst_gap", 0) or 0)
+    jitter_pct = float(getattr(args, "jitter_pct", 0.0) or 0.0)
+
+    if mode == "rps" and rps <= 0:
+        parser.error("Hata: --pacing-mode rps için --rps > 0 olmalıdır.")
+    if mode == "ipg" and ipg <= 0:
+        parser.error("Hata: --pacing-mode ipg için --ipg > 0 olmalıdır.")
+    if mode == "burst" and burst_size < 1:
+        parser.error("Hata: --pacing-mode burst için --burst-size >= 1 olmalıdır.")
+    if burst_gap < 0:
+        parser.error("Hata: --burst-gap >= 0 olmalıdır.")
+    if jitter_pct < 0.0 or jitter_pct > 1.0:
+        parser.error("Hata: --jitter-pct 0.0 ile 1.0 aralığında olmalıdır.")
+
+    # Keep legacy auto-promote behavior: --rps without explicit pacing mode.
+    if mode == "none" and rps > 0:
+        utils.log_info(
+            "--rps > 0 ve --pacing-mode none: worker tarafında pacing-mode otomatik rps'e yükseltilecek."
+        )
+
 def build_parser() -> argparse.ArgumentParser:
     """
     Build the CLI argument parser.
@@ -786,6 +812,7 @@ def main(argv=None):
 
     apply_profile(args)
     _resolve_profile_args(parser, args, argv)
+    _validate_pacing_args(parser, args)
 
     global CONNECTION_POOL
     try:

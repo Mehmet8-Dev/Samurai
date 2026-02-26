@@ -285,6 +285,17 @@ def attack_live_monitor(
             rss_bytes = 0
             vram_used_bytes = 0
             pinned_bytes = 0
+            pacing_actual_rps = 0.0
+            pacing_rate_accuracy_sum = 0.0
+            pacing_rate_accuracy_n = 0
+            pacing_jitter_p99_sum = 0.0
+            pacing_jitter_p99_n = 0
+            pacing_ipg_mean_sum = 0.0
+            pacing_ipg_mean_n = 0
+            pacing_sleep_calls = 0
+            pacing_busywait_cycles = 0
+            pacing_so_txtime_active = 0
+            pacing_txtime_errors = 0
             if resource_stats is not None:
                 try:
                     for _, item in dict(resource_stats).items():
@@ -293,8 +304,38 @@ def attack_live_monitor(
                         rss_bytes += int(item.get("rss_bytes", 0) or 0)
                         vram_used_bytes += int(item.get("vram_used_bytes", 0) or 0)
                         pinned_bytes += int(item.get("pinned_bytes", 0) or 0)
+                        pacing_actual_rps += float(item.get("pacing_actual_rps", 0.0) or 0.0)
+                        _acc = float(item.get("pacing_rate_accuracy_pct", 0.0) or 0.0)
+                        if _acc > 0.0:
+                            pacing_rate_accuracy_sum += _acc
+                            pacing_rate_accuracy_n += 1
+                        _j99 = float(item.get("pacing_jitter_p99_ns", 0.0) or 0.0)
+                        if _j99 > 0.0:
+                            pacing_jitter_p99_sum += _j99
+                            pacing_jitter_p99_n += 1
+                        _ipg = float(item.get("pacing_ipg_mean_ns", 0.0) or 0.0)
+                        if _ipg > 0.0:
+                            pacing_ipg_mean_sum += _ipg
+                            pacing_ipg_mean_n += 1
+                        pacing_sleep_calls += int(item.get("pacing_sleep_calls", 0) or 0)
+                        pacing_busywait_cycles += int(item.get("pacing_busywait_cycles", 0) or 0)
+                        pacing_so_txtime_active = max(
+                            pacing_so_txtime_active,
+                            int(item.get("pacing_so_txtime_active", 0) or 0),
+                        )
+                        pacing_txtime_errors += int(item.get("pacing_txtime_errors", 0) or 0)
                 except Exception:
                     pass
+
+            pacing_rate_accuracy_pct = (
+                pacing_rate_accuracy_sum / pacing_rate_accuracy_n
+            ) if pacing_rate_accuracy_n > 0 else 0.0
+            pacing_jitter_p99_ns = (
+                pacing_jitter_p99_sum / pacing_jitter_p99_n
+            ) if pacing_jitter_p99_n > 0 else 0.0
+            pacing_ipg_mean_ns = (
+                pacing_ipg_mean_sum / pacing_ipg_mean_n
+            ) if pacing_ipg_mean_n > 0 else 0.0
 
             error_rate_pct = (float(e_val) * 100.0 / float(p_val)) if p_val > 0 else 0.0
 
@@ -313,6 +354,14 @@ def attack_live_monitor(
                     "rss_bytes": rss_bytes,
                     "vram_used_bytes": vram_used_bytes,
                     "pinned_bytes": pinned_bytes,
+                    "pacing_actual_rps": pacing_actual_rps,
+                    "pacing_rate_accuracy_pct": pacing_rate_accuracy_pct,
+                    "pacing_jitter_p99_ns": pacing_jitter_p99_ns,
+                    "pacing_ipg_mean_ns": pacing_ipg_mean_ns,
+                    "pacing_sleep_calls": pacing_sleep_calls,
+                    "pacing_busywait_cycles": pacing_busywait_cycles,
+                    "pacing_so_txtime_active": pacing_so_txtime_active,
+                    "pacing_txtime_errors": pacing_txtime_errors,
                 })
             except Exception:
                 pass

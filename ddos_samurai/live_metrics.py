@@ -13,7 +13,9 @@ class LiveMetricsExporter:
     aggregated worker stats.
 
     Exported gauges include sender_path breakdown, fallback counts, and
-    permission errors for better runtime observability.
+    permission errors for better runtime observability. Pacing V2 gauges
+    (actual_rps, rate_accuracy, jitter_p99, txtime errors) are exported when
+    provided by the orchestrator resource snapshots.
     """
 
     def __init__(

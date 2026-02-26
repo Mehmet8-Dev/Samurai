@@ -59,6 +59,14 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "eagain_retry_count": 0,
         "partial_send_retry_count": 0,
         "buffer_reuse_hits": 0,
+        "actual_rps": 0.0,
+        "rate_accuracy_pct": 0.0,
+        "jitter_p99_ns": 0.0,
+        "ipg_mean_ns": 0.0,
+        "sleep_calls": 0,
+        "busywait_cycles": 0,
+        "so_txtime_active": 0,
+        "txtime_errors": 0,
         "txring_flush_call_count": 0,
         "txring_flush_error_count": 0,
         "txring_flush_eagain_count": 0,
@@ -196,6 +204,41 @@ def _attach_loss_telemetry(stats_out: dict, before_snapshot: dict, preferred_ifa
     return _recompute_loss_metrics(out)
 
 
+def _apply_pacing_stats(out: dict, stats: dict | None) -> dict:
+    d = dict(out or {})
+    st = dict(stats or {})
+
+    d["actual_rps"] = float(st.get("actual_rps", 0.0) or 0.0)
+    d["rate_accuracy_pct"] = float(st.get("rate_accuracy_pct", 0.0) or 0.0)
+    d["jitter_p99_ns"] = float(st.get("jitter_p99_ns", 0.0) or 0.0)
+    d["ipg_mean_ns"] = float(st.get("ipg_mean_ns", 0.0) or 0.0)
+    d["sleep_calls"] = int(st.get("sleep_calls", 0) or 0)
+    d["busywait_cycles"] = int(st.get("busywait_cycles", 0) or 0)
+    d["so_txtime_active"] = int(bool(st.get("so_txtime_active", 0)))
+    d["txtime_errors"] = int(st.get("txtime_errors", 0) or 0)
+
+    d["txring_flush_call_count"] = int(st.get("txring_flush_call_count", 0) or 0)
+    d["txring_flush_error_count"] = int(st.get("txring_flush_error_count", 0) or 0)
+    d["txring_flush_eagain_count"] = int(st.get("txring_flush_eagain_count", 0) or 0)
+    d["txring_flush_enobufs_count"] = int(st.get("txring_flush_enobufs_count", 0) or 0)
+    d["txring_flush_ebusy_count"] = int(st.get("txring_flush_ebusy_count", 0) or 0)
+    d["txring_flush_other_errno_count"] = int(st.get("txring_flush_other_errno_count", 0) or 0)
+    d["txring_flush_last_errno"] = int(st.get("txring_flush_last_errno", 0) or 0)
+    d["txring_flush_last_errno_name"] = str(
+        st.get("txring_flush_last_errno_name", "NONE") or "NONE"
+    )
+    d["txring_frame_wait_ns"] = int(st.get("txring_frame_wait_ns", 0) or 0)
+    d["txring_poll_count"] = int(st.get("txring_poll_count", 0) or 0)
+    d["txring_tp_packets"] = int(st.get("txring_tp_packets", 0) or 0)
+    d["txring_tp_drops"] = int(st.get("txring_tp_drops", 0) or 0)
+    d["txring_tp_freeze_q_cnt"] = int(st.get("txring_tp_freeze_q_cnt", 0) or 0)
+    d["txring_packet_version"] = int(st.get("txring_packet_version", 0) or 0)
+    d["txring_packet_version_name"] = str(
+        st.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
+    )
+    return d
+
+
 def _normalize_packets_buffer(
     packets_buffer,
     required_bytes: int,
@@ -298,6 +341,25 @@ def _merge_stats(*items):
         acc["eagain_retry_count"] += int(it.get("eagain_retry_count", 0) or 0)
         acc["partial_send_retry_count"] += int(it.get("partial_send_retry_count", 0) or 0)
         acc["buffer_reuse_hits"] += int(it.get("buffer_reuse_hits", 0) or 0)
+        item_actual_rps = float(it.get("actual_rps", 0.0) or 0.0)
+        if item_actual_rps > 0.0 or float(acc.get("actual_rps", 0.0) or 0.0) == 0.0:
+            acc["actual_rps"] = item_actual_rps
+        item_rate_accuracy = float(it.get("rate_accuracy_pct", 0.0) or 0.0)
+        if item_rate_accuracy > 0.0 or float(acc.get("rate_accuracy_pct", 0.0) or 0.0) == 0.0:
+            acc["rate_accuracy_pct"] = item_rate_accuracy
+        item_jitter_p99 = float(it.get("jitter_p99_ns", 0.0) or 0.0)
+        if item_jitter_p99 > 0.0 or float(acc.get("jitter_p99_ns", 0.0) or 0.0) == 0.0:
+            acc["jitter_p99_ns"] = item_jitter_p99
+        item_ipg_mean = float(it.get("ipg_mean_ns", 0.0) or 0.0)
+        if item_ipg_mean > 0.0 or float(acc.get("ipg_mean_ns", 0.0) or 0.0) == 0.0:
+            acc["ipg_mean_ns"] = item_ipg_mean
+        acc["sleep_calls"] += int(it.get("sleep_calls", 0) or 0)
+        acc["busywait_cycles"] += int(it.get("busywait_cycles", 0) or 0)
+        acc["so_txtime_active"] = max(
+            int(acc.get("so_txtime_active", 0) or 0),
+            int(bool(it.get("so_txtime_active", 0))),
+        )
+        acc["txtime_errors"] += int(it.get("txtime_errors", 0) or 0)
         acc["permission_error_count"] += int(it.get("permission_error_count", 0) or 0)
         acc["fallback_count"] += int(it.get("fallback_count", 0) or 0)
         acc["txring_flush_call_count"] += int(it.get("txring_flush_call_count", 0) or 0)
@@ -1299,28 +1361,7 @@ async def paced_raw_socket_sender(
                     partial_send_retry_count=0,
                 )
                 if stats:
-                    out["actual_rps"] = float(stats.get("actual_rps", 0) or 0)
-                    out["rate_accuracy_pct"] = float(stats.get("rate_accuracy_pct", 0) or 0)
-                    out["jitter_p99_ns"] = float(stats.get("jitter_p99_ns", 0) or 0)
-                    out["txring_flush_call_count"] = int(stats.get("txring_flush_call_count", 0) or 0)
-                    out["txring_flush_error_count"] = int(stats.get("txring_flush_error_count", 0) or 0)
-                    out["txring_flush_eagain_count"] = int(stats.get("txring_flush_eagain_count", 0) or 0)
-                    out["txring_flush_enobufs_count"] = int(stats.get("txring_flush_enobufs_count", 0) or 0)
-                    out["txring_flush_ebusy_count"] = int(stats.get("txring_flush_ebusy_count", 0) or 0)
-                    out["txring_flush_other_errno_count"] = int(
-                        stats.get("txring_flush_other_errno_count", 0) or 0
-                    )
-                    out["txring_flush_last_errno"] = int(stats.get("txring_flush_last_errno", 0) or 0)
-                    out["txring_flush_last_errno_name"] = str(
-                        stats.get("txring_flush_last_errno_name", "NONE") or "NONE"
-                    )
-                    out["txring_tp_packets"] = int(stats.get("txring_tp_packets", 0) or 0)
-                    out["txring_tp_drops"] = int(stats.get("txring_tp_drops", 0) or 0)
-                    out["txring_tp_freeze_q_cnt"] = int(stats.get("txring_tp_freeze_q_cnt", 0) or 0)
-                    out["txring_packet_version"] = int(stats.get("txring_packet_version", 0) or 0)
-                    out["txring_packet_version_name"] = str(
-                        stats.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
-                    )
+                    out = _apply_pacing_stats(out, stats)
                 return _attach_loss_telemetry(
                     out, loss_before_snapshot, preferred_iface=loss_iface_hint
                 )
@@ -1366,26 +1407,7 @@ async def paced_raw_socket_sender(
             partial_send_retry_count=0,
         )
         if stats:
-            out["actual_rps"] = float(stats.get("actual_rps", 0) or 0)
-            out["rate_accuracy_pct"] = float(stats.get("rate_accuracy_pct", 0) or 0)
-            out["jitter_p99_ns"] = float(stats.get("jitter_p99_ns", 0) or 0)
-            out["txring_flush_call_count"] = int(stats.get("txring_flush_call_count", 0) or 0)
-            out["txring_flush_error_count"] = int(stats.get("txring_flush_error_count", 0) or 0)
-            out["txring_flush_eagain_count"] = int(stats.get("txring_flush_eagain_count", 0) or 0)
-            out["txring_flush_enobufs_count"] = int(stats.get("txring_flush_enobufs_count", 0) or 0)
-            out["txring_flush_ebusy_count"] = int(stats.get("txring_flush_ebusy_count", 0) or 0)
-            out["txring_flush_other_errno_count"] = int(stats.get("txring_flush_other_errno_count", 0) or 0)
-            out["txring_flush_last_errno"] = int(stats.get("txring_flush_last_errno", 0) or 0)
-            out["txring_flush_last_errno_name"] = str(
-                stats.get("txring_flush_last_errno_name", "NONE") or "NONE"
-            )
-            out["txring_tp_packets"] = int(stats.get("txring_tp_packets", 0) or 0)
-            out["txring_tp_drops"] = int(stats.get("txring_tp_drops", 0) or 0)
-            out["txring_tp_freeze_q_cnt"] = int(stats.get("txring_tp_freeze_q_cnt", 0) or 0)
-            out["txring_packet_version"] = int(stats.get("txring_packet_version", 0) or 0)
-            out["txring_packet_version_name"] = str(
-                stats.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
-            )
+            out = _apply_pacing_stats(out, stats)
         return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
     except PermissionError:
         log_error("[Pacing] Raw socket requires root. Falling back to unpaced.")

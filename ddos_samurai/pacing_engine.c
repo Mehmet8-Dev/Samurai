@@ -32,6 +32,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <sched.h>
 #include <pthread.h>
 #include <sys/types.h>
@@ -132,6 +133,12 @@ typedef struct {
     uint64_t txring_flush_call_count;
     uint64_t txring_flush_error_count;
     uint64_t txring_flush_eagain_count;
+    uint64_t txring_flush_enobufs_count;
+    uint64_t txring_flush_ebusy_count;
+    uint64_t txring_flush_other_errno_count;
+    int      txring_flush_last_errno;
+    uint64_t txring_frame_wait_ns;
+    uint64_t txring_poll_count;
     uint64_t txring_tp_packets;
     uint64_t txring_tp_drops;
     uint64_t txring_tp_freeze_q_cnt;
@@ -149,6 +156,8 @@ typedef struct {
 
 static pacing_stats_t g_stats;
 static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_calib_syscall_overhead_ns = 0;
+static uint64_t g_calib_sleep_overhead_ns = 0;
 
 /* ========================================================================== */
 /* High-Precision Timing                                                      */
@@ -295,6 +304,30 @@ static inline int64_t calc_jitter_ns(uint64_t base_ns, int model, double pct)
     return (int64_t)j;
 }
 
+static inline uint64_t abs_i64_to_u64(int64_t v)
+{
+    if (v >= 0) return (uint64_t)v;
+    return (uint64_t)(-(v + 1)) + 1ULL;
+}
+
+static inline uint64_t add_saturating_u64(uint64_t a, uint64_t b)
+{
+    if (a > UINT64_MAX - b) return UINT64_MAX;
+    return a + b;
+}
+
+static inline uint64_t add_jitter_saturating_u64(uint64_t base, int64_t jitter)
+{
+    if (jitter >= 0) {
+        uint64_t uj = (uint64_t)jitter;
+        if (base > UINT64_MAX - uj) return UINT64_MAX;
+        return base + uj;
+    }
+    uint64_t neg = abs_i64_to_u64(jitter);
+    if (neg >= base) return 0;
+    return base - neg;
+}
+
 /* ========================================================================== */
 /* Token Bucket Rate Limiter                                                  */
 /* ========================================================================== */
@@ -430,6 +463,8 @@ static void stats_reset(double target_rps)
     g_stats.target_rps  = target_rps;
     g_stats.ipg_min_ns  = UINT64_MAX;
     g_stats.jitter_min_ns = 1e18;
+    g_stats.syscall_overhead_ns = g_calib_syscall_overhead_ns;
+    g_stats.sleep_overhead_ns = g_calib_sleep_overhead_ns;
 }
 
 /* qsort comparator for p99 */
@@ -440,15 +475,14 @@ static int cmp_u64(const void *a, const void *b)
     return (va > vb) - (va < vb);
 }
 
-static double stats_percentile(double pct)
+static double stats_percentile_from_ring(const uint64_t *ring, uint32_t n, double pct)
 {
-    if (g_stats.pct_ring_len == 0) return 0.0;
+    if (n == 0 || ring == NULL) return 0.0;
 
     /* copy ring to tmp for sorting */
-    uint32_t n = g_stats.pct_ring_len;
     uint64_t *tmp = (uint64_t *)malloc(n * sizeof(uint64_t));
     if (!tmp) return 0.0;
-    memcpy(tmp, g_stats.pct_ring, n * sizeof(uint64_t));
+    memcpy(tmp, ring, n * sizeof(uint64_t));
     qsort(tmp, n, sizeof(uint64_t), cmp_u64);
 
     uint32_t idx = (uint32_t)((pct / 100.0) * (n - 1));
@@ -481,7 +515,7 @@ static void calibrate_timing(void)
         uint64_t t1 = time_ns();
         sum += (t1 - t0);
     }
-    g_stats.syscall_overhead_ns = sum / CALIBRATION_ITERS;
+    g_calib_syscall_overhead_ns = sum / CALIBRATION_ITERS;
 
     /* sleep overhead → clock_nanosleep wakeup latency */
     sum = 0;
@@ -494,11 +528,16 @@ static void calibrate_timing(void)
         uint64_t actual = time_ns();
         sum += (actual - target);               /* overshoot */
     }
-    g_stats.sleep_overhead_ns = sum / 100;
+    g_calib_sleep_overhead_ns = sum / 100;
 
     /* set spin threshold = max(15 µs, 2× sleep overshoot) */
-    uint64_t overshoot2x = g_stats.sleep_overhead_ns * 2;
+    uint64_t overshoot2x = g_calib_sleep_overhead_ns * 2;
     g_spin_threshold_ns = overshoot2x > 15000 ? overshoot2x : 15000;
+
+    pthread_mutex_lock(&g_stats_lock);
+    g_stats.syscall_overhead_ns = g_calib_syscall_overhead_ns;
+    g_stats.sleep_overhead_ns = g_calib_sleep_overhead_ns;
+    pthread_mutex_unlock(&g_stats_lock);
 }
 
 /* ========================================================================== */
@@ -781,13 +820,38 @@ static void capture_ring_packet_stats(void)
     }
 }
 
+static inline const char *flush_errno_name(int err)
+{
+    if (err == 0) return "NONE";
+    if (err == EAGAIN || err == EWOULDBLOCK) return "EAGAIN";
+#ifdef ENOBUFS
+    if (err == ENOBUFS) return "ENOBUFS";
+#endif
+#ifdef EBUSY
+    if (err == EBUSY) return "EBUSY";
+#endif
+    return "OTHER";
+}
+
 static inline void record_l2_flush_result(ssize_t ret)
 {
     g_stats.txring_flush_call_count++;
     if (ret < 0) {
+        int err = errno;
         g_stats.txring_flush_error_count++;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        g_stats.txring_flush_last_errno = err;
+        if (err == EAGAIN || err == EWOULDBLOCK) {
             g_stats.txring_flush_eagain_count++;
+#ifdef ENOBUFS
+        } else if (err == ENOBUFS) {
+            g_stats.txring_flush_enobufs_count++;
+#endif
+#ifdef EBUSY
+        } else if (err == EBUSY) {
+            g_stats.txring_flush_ebusy_count++;
+#endif
+        } else {
+            g_stats.txring_flush_other_errno_count++;
         }
     }
 }
@@ -851,6 +915,37 @@ static PyObject *py_paced_send_l3(PyObject *self,
             &jitter_model, &jitter_pct, &pacing_mode,
             &pin_cpu, &use_so_txtime))
         return NULL;
+
+    if (packet_size <= 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size must be > 0");
+        return NULL;
+    }
+    if (count < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "count must be >= 0");
+        return NULL;
+    }
+    if (count > 0) {
+        uint64_t u_packet_size = (uint64_t)packet_size;
+        uint64_t u_count = (uint64_t)count;
+        if (u_packet_size > UINT64_MAX / u_count) {
+            PyBuffer_Release(&view);
+            PyErr_SetString(PyExc_ValueError, "packet_size * count overflow");
+            return NULL;
+        }
+        uint64_t needed = u_packet_size * u_count;
+        if ((uint64_t)view.len < needed) {
+            PyBuffer_Release(&view);
+            PyErr_Format(
+                PyExc_ValueError,
+                "buffer too small: got %zu bytes, expected at least %llu",
+                (size_t)view.len,
+                (unsigned long long)needed
+            );
+            return NULL;
+        }
+    }
 
     /* ------------------------------------------------------------------ */
     /* Setup                                                               */
@@ -922,12 +1017,16 @@ static PyObject *py_paced_send_l3(PyObject *self,
     const char *data = (const char *)view.buf;
     int  total_sent = 0;
     int  burst_ctr  = 0;
+    int  burst_limit = burst_size > 0 ? burst_size : 1;
 
     Py_BEGIN_ALLOW_THREADS
 
+    pthread_mutex_lock(&g_stats_lock);
+
     uint64_t t_start    = time_ns();
     uint64_t t_last     = t_start;
-    uint64_t t_next     = t_start;
+    uint64_t t_deadline = t_start;
+    uint64_t t_burst_deadline = t_start;
     uint64_t tai_offset = 0;
 
     if (txtime_ok) {
@@ -952,18 +1051,19 @@ static PyObject *py_paced_send_l3(PyObject *self,
         switch (pacing_mode) {
         case PACING_IPG:
             if (i > 0) {
-                t_next = t_last + eff_ipg;
-                t_next += (uint64_t)calc_jitter_ns(eff_ipg, jitter_model, jitter_pct);
-                precision_wait(t_next);
+                int64_t j = calc_jitter_ns(eff_ipg, jitter_model, jitter_pct);
+                t_deadline = add_saturating_u64(t_deadline, eff_ipg);
+                t_deadline = add_jitter_saturating_u64(t_deadline, j);
+                precision_wait(t_deadline);
             }
             break;
 
         case PACING_RPS:
             if (eff_ipg > 0 && i > 0) {
-                /* IPG-based pacing is more deterministic than token bucket */
-                t_next = t_last + eff_ipg;
-                t_next += (uint64_t)calc_jitter_ns(eff_ipg, jitter_model, jitter_pct);
-                precision_wait(t_next);
+                int64_t j = calc_jitter_ns(eff_ipg, jitter_model, jitter_pct);
+                t_deadline = add_saturating_u64(t_deadline, eff_ipg);
+                t_deadline = add_jitter_saturating_u64(t_deadline, j);
+                precision_wait(t_deadline);
             } else {
                 /* fallback: spin on token bucket */
                 uint64_t now;
@@ -979,12 +1079,12 @@ static PyObject *py_paced_send_l3(PyObject *self,
 
         case PACING_BURST:
             burst_ctr++;
-            if (burst_ctr >= burst_size && burst_gap_ns > 0) {
+            if (burst_ctr >= burst_limit && burst_gap_ns > 0) {
                 burst_ctr = 0;
-                t_next = t_last + (uint64_t)burst_gap_ns;
-                t_next += (uint64_t)calc_jitter_ns(
-                    (uint64_t)burst_gap_ns, jitter_model, jitter_pct);
-                precision_wait(t_next);
+                int64_t j = calc_jitter_ns((uint64_t)burst_gap_ns, jitter_model, jitter_pct);
+                t_burst_deadline = add_saturating_u64(t_burst_deadline, (uint64_t)burst_gap_ns);
+                t_burst_deadline = add_jitter_saturating_u64(t_burst_deadline, j);
+                precision_wait(t_burst_deadline);
             }
             break;
 
@@ -1028,6 +1128,8 @@ static PyObject *py_paced_send_l3(PyObject *self,
 
     g_stats.elapsed_ns = (double)(time_ns() - t_start);
     stats_finalize();
+
+    pthread_mutex_unlock(&g_stats_lock);
 
     Py_END_ALLOW_THREADS
 
@@ -1081,6 +1183,41 @@ static PyObject *py_paced_send_l2(PyObject *self,
             &jitter_model, &jitter_pct, &pacing_mode, &pin_cpu))
         return NULL;
 
+    if (packet_size <= 0) {
+        PyBuffer_Release(&view);
+        PyBuffer_Release(&mac_view);
+        PyErr_SetString(PyExc_ValueError, "packet_size must be > 0");
+        return NULL;
+    }
+    if (count < 0) {
+        PyBuffer_Release(&view);
+        PyBuffer_Release(&mac_view);
+        PyErr_SetString(PyExc_ValueError, "count must be >= 0");
+        return NULL;
+    }
+    if (count > 0) {
+        uint64_t u_packet_size = (uint64_t)packet_size;
+        uint64_t u_count = (uint64_t)count;
+        if (u_packet_size > UINT64_MAX / u_count) {
+            PyBuffer_Release(&view);
+            PyBuffer_Release(&mac_view);
+            PyErr_SetString(PyExc_ValueError, "packet_size * count overflow");
+            return NULL;
+        }
+        uint64_t needed = u_packet_size * u_count;
+        if ((uint64_t)view.len < needed) {
+            PyBuffer_Release(&view);
+            PyBuffer_Release(&mac_view);
+            PyErr_Format(
+                PyExc_ValueError,
+                "buffer too small: got %zu bytes, expected at least %llu",
+                (size_t)view.len,
+                (unsigned long long)needed
+            );
+            return NULL;
+        }
+    }
+
     if (mac_view.len != 6) {
         PyBuffer_Release(&view);
         PyBuffer_Release(&mac_view);
@@ -1126,6 +1263,7 @@ static PyObject *py_paced_send_l2(PyObject *self,
     const char *data = (const char *)view.buf;
     int total_sent   = 0;
     int burst_ctr    = 0;
+    int burst_limit  = burst_size > 0 ? burst_size : 1;
     size_t frame_hdr = g_ring.frame_header_size;
     unsigned int frame_size = ring_frame_size();
     unsigned int frame_nr = ring_frame_nr();
@@ -1134,9 +1272,12 @@ static PyObject *py_paced_send_l2(PyObject *self,
 
     Py_BEGIN_ALLOW_THREADS
 
+    pthread_mutex_lock(&g_stats_lock);
+
     uint64_t t_start = time_ns();
     uint64_t t_last  = t_start;
-    uint64_t t_next  = t_start;
+    uint64_t t_deadline = t_start;
+    uint64_t t_burst_deadline = t_start;
 
     for (int i = 0; i < count; i++) {
 
@@ -1144,16 +1285,18 @@ static PyObject *py_paced_send_l2(PyObject *self,
         switch (pacing_mode) {
         case PACING_IPG:
             if (i > 0) {
-                t_next = t_last + eff_ipg
-                       + (uint64_t)calc_jitter_ns(eff_ipg, jitter_model, jitter_pct);
-                precision_wait(t_next);
+                int64_t j = calc_jitter_ns(eff_ipg, jitter_model, jitter_pct);
+                t_deadline = add_saturating_u64(t_deadline, eff_ipg);
+                t_deadline = add_jitter_saturating_u64(t_deadline, j);
+                precision_wait(t_deadline);
             }
             break;
         case PACING_RPS:
             if (eff_ipg > 0 && i > 0) {
-                t_next = t_last + eff_ipg
-                       + (uint64_t)calc_jitter_ns(eff_ipg, jitter_model, jitter_pct);
-                precision_wait(t_next);
+                int64_t j = calc_jitter_ns(eff_ipg, jitter_model, jitter_pct);
+                t_deadline = add_saturating_u64(t_deadline, eff_ipg);
+                t_deadline = add_jitter_saturating_u64(t_deadline, j);
+                precision_wait(t_deadline);
             } else {
                 uint64_t now;
                 while (1) {
@@ -1167,12 +1310,12 @@ static PyObject *py_paced_send_l2(PyObject *self,
             break;
         case PACING_BURST:
             burst_ctr++;
-            if (burst_ctr >= burst_size && burst_gap_ns > 0) {
+            if (burst_ctr >= burst_limit && burst_gap_ns > 0) {
                 burst_ctr = 0;
-                t_next = t_last + (uint64_t)burst_gap_ns
-                       + (uint64_t)calc_jitter_ns(
-                             (uint64_t)burst_gap_ns, jitter_model, jitter_pct);
-                precision_wait(t_next);
+                int64_t j = calc_jitter_ns((uint64_t)burst_gap_ns, jitter_model, jitter_pct);
+                t_burst_deadline = add_saturating_u64(t_burst_deadline, (uint64_t)burst_gap_ns);
+                t_burst_deadline = add_jitter_saturating_u64(t_burst_deadline, j);
+                precision_wait(t_burst_deadline);
             }
             break;
         default:
@@ -1183,6 +1326,7 @@ static PyObject *py_paced_send_l2(PyObject *self,
         char *frame_base = g_ring.map + ((size_t)g_ring.frame_idx * frame_size);
 
         /* wait for frame to become available */
+        uint64_t frame_wait_start = time_ns();
         int spins = 2000;
         while (ring_tx_frame_status(frame_base) != TP_STATUS_AVAILABLE) {
             if (--spins > 0) {
@@ -1192,11 +1336,13 @@ static PyObject *py_paced_send_l2(PyObject *self,
                 continue;
             }
             poll(&pfd, 1, 1);
+            g_stats.txring_poll_count++;
             if (ring_tx_frame_status(frame_base) != TP_STATUS_AVAILABLE) {
                 ssize_t flush_ret = sendto(g_ring.sock, NULL, 0, MSG_DONTWAIT, NULL, 0);
                 record_l2_flush_result(flush_ret);
             }
         }
+        g_stats.txring_frame_wait_ns += (time_ns() - frame_wait_start);
 
         uint64_t t_pre = time_ns();
 
@@ -1231,6 +1377,8 @@ static PyObject *py_paced_send_l2(PyObject *self,
     g_stats.elapsed_ns = (double)(time_ns() - t_start);
     stats_finalize();
 
+    pthread_mutex_unlock(&g_stats_lock);
+
     Py_END_ALLOW_THREADS
 
     PyBuffer_Release(&view);
@@ -1252,7 +1400,11 @@ PyDoc_STRVAR(doc_get_stats,
 "jitter_stddev_ns, jitter_p50_ns, jitter_p95_ns, jitter_p99_ns,\n"
 "busywait_cycles, sleep_calls, so_txtime_active, txtime_errors,\n"
 "txring_flush_call_count, txring_flush_error_count,\n"
-"txring_flush_eagain_count, txring_tp_packets, txring_tp_drops,\n"
+"txring_flush_eagain_count, txring_flush_enobufs_count,\n"
+"txring_flush_ebusy_count, txring_flush_other_errno_count,\n"
+"txring_flush_last_errno, txring_flush_last_errno_name,\n"
+"txring_frame_wait_ns, txring_poll_count,\n"
+"txring_tp_packets, txring_tp_drops,\n"
 "txring_tp_freeze_q_cnt, txring_packet_version,\n"
 "txring_packet_version_name,\n"
 "syscall_overhead_ns, sleep_overhead_ns, spin_threshold_ns,\n"
@@ -1261,41 +1413,49 @@ PyDoc_STRVAR(doc_get_stats,
 static PyObject *py_get_pacing_stats(PyObject *self, PyObject *args)
 {
     (void)self; (void)args;
+    pacing_stats_t snap;
+    memset(&snap, 0, sizeof(snap));
 
     pthread_mutex_lock(&g_stats_lock);
+    memcpy(&snap, &g_stats, sizeof(snap));
+    pthread_mutex_unlock(&g_stats_lock);
 
     double ipg_mean = 0.0, ipg_stddev = 0.0;
-    if (g_stats.ipg_count > 0)
-        ipg_mean = g_stats.ipg_sum_ns / g_stats.ipg_count;
-    if (g_stats.ipg_count > 1) {
-        double var = (g_stats.ipg_sum_sq_ns / g_stats.ipg_count)
+    if (snap.ipg_count > 0)
+        ipg_mean = snap.ipg_sum_ns / snap.ipg_count;
+    if (snap.ipg_count > 1) {
+        double var = (snap.ipg_sum_sq_ns / snap.ipg_count)
                    - (ipg_mean * ipg_mean);
         ipg_stddev = sqrt(var > 0 ? var : 0);
     }
 
     double j_mean = 0.0, j_stddev = 0.0;
-    if (g_stats.jitter_count > 0)
-        j_mean = g_stats.jitter_sum_ns / g_stats.jitter_count;
-    if (g_stats.jitter_count > 1) {
-        double var = (g_stats.jitter_sum_sq_ns / g_stats.jitter_count)
+    if (snap.jitter_count > 0)
+        j_mean = snap.jitter_sum_ns / snap.jitter_count;
+    if (snap.jitter_count > 1) {
+        double var = (snap.jitter_sum_sq_ns / snap.jitter_count)
                    - (j_mean * j_mean);
         j_stddev = sqrt(var > 0 ? var : 0);
     }
 
-    double p50 = stats_percentile(50.0);
-    double p95 = stats_percentile(95.0);
-    double p99 = stats_percentile(99.0);
+    double p50 = stats_percentile_from_ring(snap.pct_ring, snap.pct_ring_len, 50.0);
+    double p95 = stats_percentile_from_ring(snap.pct_ring, snap.pct_ring_len, 95.0);
+    double p99 = stats_percentile_from_ring(snap.pct_ring, snap.pct_ring_len, 99.0);
 
-    /* build histogram list */
     PyObject *hist = PyList_New(HISTOGRAM_BINS);
-    for (int b = 0; b < HISTOGRAM_BINS; b++)
-        PyList_SET_ITEM(hist, b, PyLong_FromUnsignedLongLong(
-                                     g_stats.ipg_histogram[b]));
-
-    pthread_mutex_unlock(&g_stats_lock);
+    if (!hist) return NULL;
+    for (int b = 0; b < HISTOGRAM_BINS; b++) {
+        PyObject *v = PyLong_FromUnsignedLongLong(snap.ipg_histogram[b]);
+        if (!v) {
+            Py_DECREF(hist);
+            return NULL;
+        }
+        PyList_SET_ITEM(hist, b, v);
+    }
 
     const char *txring_packet_version_name =
-        packet_version_name(g_stats.txring_packet_version);
+        packet_version_name(snap.txring_packet_version);
+    const char *last_errno_name = flush_errno_name(snap.txring_flush_last_errno);
 
     return Py_BuildValue(
         "{s:K, s:K, s:d, s:d, s:d, s:d,"
@@ -1304,23 +1464,24 @@ static PyObject *py_get_pacing_stats(PyObject *self, PyObject *args)
         " s:d, s:d, s:d,"
         " s:K, s:K,"
         " s:i, s:K,"
-        " s:K, s:K, s:K, s:K, s:K, s:K, s:i, s:s,"
+        " s:K, s:K, s:K, s:K, s:K, s:K, s:i, s:s, s:K, s:K,"
+        " s:K, s:K, s:K, s:i, s:s,"
         " s:K, s:K, s:K,"
         " s:O}",
-        "total_packets",      g_stats.total_packets,
-        "total_bytes",        g_stats.total_bytes,
-        "elapsed_ns",         g_stats.elapsed_ns,
-        "target_rps",         g_stats.target_rps,
-        "actual_rps",         g_stats.actual_rps,
-        "rate_accuracy_pct",  g_stats.rate_accuracy_pct,
+        "total_packets",      snap.total_packets,
+        "total_bytes",        snap.total_bytes,
+        "elapsed_ns",         snap.elapsed_ns,
+        "target_rps",         snap.target_rps,
+        "actual_rps",         snap.actual_rps,
+        "rate_accuracy_pct",  snap.rate_accuracy_pct,
 
-        "ipg_min_ns",         g_stats.ipg_min_ns == UINT64_MAX ? 0ULL : g_stats.ipg_min_ns,
-        "ipg_max_ns",         g_stats.ipg_max_ns,
+        "ipg_min_ns",         snap.ipg_min_ns == UINT64_MAX ? 0ULL : snap.ipg_min_ns,
+        "ipg_max_ns",         snap.ipg_max_ns,
         "ipg_mean_ns",        ipg_mean,
         "ipg_stddev_ns",      ipg_stddev,
 
-        "jitter_min_ns",      g_stats.jitter_min_ns > 1e17 ? 0.0 : g_stats.jitter_min_ns,
-        "jitter_max_ns",      g_stats.jitter_max_ns,
+        "jitter_min_ns",      snap.jitter_min_ns > 1e17 ? 0.0 : snap.jitter_min_ns,
+        "jitter_max_ns",      snap.jitter_max_ns,
         "jitter_mean_ns",     j_mean,
         "jitter_stddev_ns",   j_stddev,
 
@@ -1328,23 +1489,30 @@ static PyObject *py_get_pacing_stats(PyObject *self, PyObject *args)
         "jitter_p95_ns",      p95,
         "jitter_p99_ns",      p99,
 
-        "busywait_cycles",    g_stats.busywait_cycles,
-        "sleep_calls",        g_stats.sleep_calls,
+        "busywait_cycles",    snap.busywait_cycles,
+        "sleep_calls",        snap.sleep_calls,
 
-        "so_txtime_active",   g_stats.so_txtime_active,
-        "txtime_errors",      g_stats.txtime_errors,
+        "so_txtime_active",   snap.so_txtime_active,
+        "txtime_errors",      snap.txtime_errors,
 
-        "txring_flush_call_count", g_stats.txring_flush_call_count,
-        "txring_flush_error_count", g_stats.txring_flush_error_count,
-        "txring_flush_eagain_count", g_stats.txring_flush_eagain_count,
-        "txring_tp_packets", g_stats.txring_tp_packets,
-        "txring_tp_drops", g_stats.txring_tp_drops,
-        "txring_tp_freeze_q_cnt", g_stats.txring_tp_freeze_q_cnt,
-        "txring_packet_version", g_stats.txring_packet_version,
+        "txring_flush_call_count", snap.txring_flush_call_count,
+        "txring_flush_error_count", snap.txring_flush_error_count,
+        "txring_flush_eagain_count", snap.txring_flush_eagain_count,
+        "txring_flush_enobufs_count", snap.txring_flush_enobufs_count,
+        "txring_flush_ebusy_count", snap.txring_flush_ebusy_count,
+        "txring_flush_other_errno_count", snap.txring_flush_other_errno_count,
+        "txring_flush_last_errno", snap.txring_flush_last_errno,
+        "txring_flush_last_errno_name", last_errno_name,
+        "txring_frame_wait_ns", snap.txring_frame_wait_ns,
+        "txring_poll_count", snap.txring_poll_count,
+        "txring_tp_packets", snap.txring_tp_packets,
+        "txring_tp_drops", snap.txring_tp_drops,
+        "txring_tp_freeze_q_cnt", snap.txring_tp_freeze_q_cnt,
+        "txring_packet_version", snap.txring_packet_version,
         "txring_packet_version_name", txring_packet_version_name,
 
-        "syscall_overhead_ns", g_stats.syscall_overhead_ns,
-        "sleep_overhead_ns",   g_stats.sleep_overhead_ns,
+        "syscall_overhead_ns", snap.syscall_overhead_ns,
+        "sleep_overhead_ns",   snap.sleep_overhead_ns,
         "spin_threshold_ns",   g_spin_threshold_ns,
 
         "ipg_histogram",       hist
@@ -1381,10 +1549,17 @@ static PyObject *py_calibrate(PyObject *self, PyObject *args)
 
     calibrate_timing();
 
+    uint64_t syscall_overhead_ns = 0;
+    uint64_t sleep_overhead_ns = 0;
+    pthread_mutex_lock(&g_stats_lock);
+    syscall_overhead_ns = g_stats.syscall_overhead_ns;
+    sleep_overhead_ns = g_stats.sleep_overhead_ns;
+    pthread_mutex_unlock(&g_stats_lock);
+
     return Py_BuildValue(
         "{s:K, s:K, s:K}",
-        "syscall_overhead_ns", g_stats.syscall_overhead_ns,
-        "sleep_overhead_ns",   g_stats.sleep_overhead_ns,
+        "syscall_overhead_ns", syscall_overhead_ns,
+        "sleep_overhead_ns",   sleep_overhead_ns,
         "spin_threshold_ns",   g_spin_threshold_ns
     );
 }
