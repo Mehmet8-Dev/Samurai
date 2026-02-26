@@ -106,3 +106,26 @@ Her worker tamamlandiginda `run_events` listesine su alanlarla eklenir:
 - **permission_error_count**: Yetki hatasi kaynakli basarisiz islem sayisi.
 - **queue_backlog_peak**: Worker'in en yuksek kuyruk derinligi (resource_stats'tan).
 
+### Pacing V2 Event Alanlari (additive)
+
+Worker event ve `stats` icinde su alanlar da toplanir:
+
+- `actual_rps`
+- `rate_accuracy_pct`
+- `jitter_p99_ns`
+- `ipg_mean_ns`
+- `sleep_calls`
+- `busywait_cycles`
+- `so_txtime_active`
+- `txtime_errors`
+
+Bu alanlar `resource_stats` icine de aktarilir ve live textfile exporter tarafinda gauge olarak yayinlanir:
+
+- `pacing_actual_rps`
+- `pacing_rate_accuracy_pct`
+- `pacing_jitter_p99_ns`
+- `pacing_ipg_mean_ns`
+- `pacing_sleep_calls`
+- `pacing_busywait_cycles`
+- `pacing_so_txtime_active`
+- `pacing_txtime_errors`

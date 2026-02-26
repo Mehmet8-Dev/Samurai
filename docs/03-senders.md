@@ -107,3 +107,23 @@ Run report seviyesinde toplanir:
 - `fallback_count`: Toplam fallback sayisi
 - `permission_error_count`: Toplam yetki hatasi
 - `send_success_ratio_pct`: `sent / attempted * 100`
+
+## Pacing V2 Alanlari
+
+`paced_raw_socket_sender` L2/L3 yollarinda ayni semayi dondurur (additive/backward-compatible):
+
+- `actual_rps`
+- `rate_accuracy_pct`
+- `jitter_p99_ns`
+- `ipg_mean_ns`
+- `sleep_calls`
+- `busywait_cycles`
+- `so_txtime_active`
+- `txtime_errors`
+- `txring_flush_enobufs_count`
+- `txring_flush_ebusy_count`
+- `txring_flush_other_errno_count`
+- `txring_flush_last_errno`
+- `txring_flush_last_errno_name`
+- `txring_frame_wait_ns`
+- `txring_poll_count`

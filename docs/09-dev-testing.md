@@ -10,9 +10,11 @@ Bu repo test orchestrasyonu icin `pytest` kullanir ve iki profile ayrilir:
 Profil secimi:
 
 ```bash
-SAMURAI_TEST_PROFILE=ci_safe pytest tests -q -rs
-SAMURAI_TEST_PROFILE=full pytest tests -q -rs
+SAMURAI_TEST_PROFILE=ci_safe python3 -m pytest tests -q -rs
+SAMURAI_TEST_PROFILE=full python3 -m pytest tests -q -rs
 ```
+
+Komut standardi: testler `python3 -m pytest ...` formatiyla calistirilir.
 
 ## Marker Sozlesmesi
 
@@ -35,7 +37,7 @@ Asagidaki marker seti kullanilir:
 Calistirma:
 
 ```bash
-pytest tests/test_rfc_compliance.py tests/test_rfc_negative.py -q -rs
+python3 -m pytest tests/test_rfc_compliance.py tests/test_rfc_negative.py -q -rs
 ```
 
 Rapor cikti dizini/dosyasi:
@@ -52,13 +54,13 @@ Uretilen dosyalar:
 CI-safe benchmark:
 
 ```bash
-pytest tests/test_benchmark_ci.py -q -rs
+python3 -m pytest tests/test_benchmark_ci.py -q -rs
 ```
 
 Full benchmark:
 
 ```bash
-SAMURAI_TEST_PROFILE=full pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
+SAMURAI_TEST_PROFILE=full python3 -m pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
 ```
 
 Benchmark environment degiskenleri:
@@ -82,7 +84,7 @@ Ornek:
 ```bash
 SAMURAI_BENCH_BASELINE=benchmarks/benchmark_baseline_ci.json \
 SAMURAI_BENCH_REPORT_OUT=artifacts/benchmark_summary.json \
-pytest tests/test_benchmark_ci.py -q -rs
+python3 -m pytest tests/test_benchmark_ci.py -q -rs
 ```
 
 `SAMURAI_BENCH_UPDATE_BASELINE=1` verildiginde mevcut benchmark raporu baseline dosyasina yazilir.
@@ -94,7 +96,7 @@ mkdir -p benchmarks artifacts
 SAMURAI_BENCH_BASELINE=benchmarks/benchmark_baseline_ci.json \
 SAMURAI_BENCH_UPDATE_BASELINE=1 \
 SAMURAI_BENCH_REPORT_OUT=artifacts/benchmark_summary_ci_local.json \
-pytest tests/test_benchmark_ci.py -q -rs
+python3 -m pytest tests/test_benchmark_ci.py -q -rs
 ```
 
 Full + loss telemetry tek komut:
