@@ -59,6 +59,14 @@ class TestReporting(unittest.TestCase):
                 "buffer_copy_bytes": 1024,
                 "eagain_retry_count": 3,
                 "partial_send_retry_count": 4,
+                "actual_rps": 9000.0,
+                "rate_accuracy_pct": 90.0,
+                "jitter_p99_ns": 1000.0,
+                "ipg_mean_ns": 100000.0,
+                "sleep_calls": 10,
+                "busywait_cycles": 100,
+                "so_txtime_active": 1,
+                "txtime_errors": 1,
                 "txring_flush_call_count": 11,
                 "txring_flush_error_count": 1,
                 "txring_flush_eagain_count": 1,
@@ -100,6 +108,14 @@ class TestReporting(unittest.TestCase):
                 "buffer_copy_bytes": 0,
                 "eagain_retry_count": 2,
                 "partial_send_retry_count": 1,
+                "actual_rps": 7000.0,
+                "rate_accuracy_pct": 70.0,
+                "jitter_p99_ns": 2000.0,
+                "ipg_mean_ns": 120000.0,
+                "sleep_calls": 20,
+                "busywait_cycles": 200,
+                "so_txtime_active": 0,
+                "txtime_errors": 2,
                 "txring_flush_call_count": 7,
                 "txring_flush_error_count": 0,
                 "txring_flush_eagain_count": 0,
@@ -147,6 +163,14 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["buffer_copy_bytes"], 1024)
         self.assertEqual(rr.results["eagain_retry_count"], 5)
         self.assertEqual(rr.results["partial_send_retry_count"], 5)
+        self.assertAlmostEqual(rr.results["actual_rps"], 8000.0, places=4)
+        self.assertAlmostEqual(rr.results["rate_accuracy_pct"], 80.0, places=4)
+        self.assertAlmostEqual(rr.results["jitter_p99_ns"], 1500.0, places=4)
+        self.assertAlmostEqual(rr.results["ipg_mean_ns"], 110000.0, places=4)
+        self.assertEqual(rr.results["sleep_calls"], 30)
+        self.assertEqual(rr.results["busywait_cycles"], 300)
+        self.assertEqual(rr.results["so_txtime_active"], 1)
+        self.assertEqual(rr.results["txtime_errors"], 3)
         self.assertEqual(rr.results["txring_flush_call_count"], 18)
         self.assertEqual(rr.results["txring_flush_error_count"], 1)
         self.assertEqual(rr.results["txring_flush_enobufs_count"], 2)

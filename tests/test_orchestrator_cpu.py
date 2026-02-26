@@ -223,6 +223,14 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
             "buffer_copy_bytes": 4096,
             "eagain_retry_count": 3,
             "partial_send_retry_count": 4,
+            "actual_rps": 9500.0,
+            "rate_accuracy_pct": 95.0,
+            "jitter_p99_ns": 1200.0,
+            "ipg_mean_ns": 104000.0,
+            "sleep_calls": 12,
+            "busywait_cycles": 34,
+            "so_txtime_active": 1,
+            "txtime_errors": 2,
             "txring_flush_call_count": 5,
             "txring_flush_error_count": 1,
             "txring_flush_eagain_count": 1,
@@ -254,6 +262,14 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ev["buffer_copy_bytes"], 4096)
         self.assertEqual(ev["eagain_retry_count"], 3)
         self.assertEqual(ev["partial_send_retry_count"], 4)
+        self.assertAlmostEqual(ev["actual_rps"], 9500.0)
+        self.assertAlmostEqual(ev["rate_accuracy_pct"], 95.0)
+        self.assertAlmostEqual(ev["jitter_p99_ns"], 1200.0)
+        self.assertAlmostEqual(ev["ipg_mean_ns"], 104000.0)
+        self.assertEqual(ev["sleep_calls"], 12)
+        self.assertEqual(ev["busywait_cycles"], 34)
+        self.assertEqual(ev["so_txtime_active"], 1)
+        self.assertEqual(ev["txtime_errors"], 2)
         self.assertEqual(ev["txring_flush_call_count"], 5)
         self.assertEqual(ev["txring_flush_error_count"], 1)
         self.assertEqual(ev["txring_flush_enobufs_count"], 2)
@@ -268,6 +284,8 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ev["host_tx_dropped_delta"], 2)
         self.assertEqual(ev["wire_loss_est_packets"], 2)
         self.assertGreater(ev["wire_loss_est_pct"], 0.0)
+        self.assertEqual(ev["stats"]["sleep_calls"], 12)
+        self.assertEqual(ev["stats"]["busywait_cycles"], 34)
         self.assertEqual(ev["stats"]["buffer_copy_count"], 2)
         self.assertEqual(ev["stats"]["eagain_retry_count"], 3)
 
@@ -286,3 +304,48 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["status"], "interrupted")
+
+
+class TestStatsAggregateHelpers(unittest.TestCase):
+    def test_add_stats_aggregates_pacing_fields(self):
+        acc = orchestrator._empty_stats()
+        acc = orchestrator._add_stats(
+            acc,
+            {
+                "attempted": 5,
+                "sent": 5,
+                "errors": 0,
+                "actual_rps": 1000.0,
+                "rate_accuracy_pct": 95.0,
+                "jitter_p99_ns": 100.0,
+                "ipg_mean_ns": 1000.0,
+                "sleep_calls": 2,
+                "busywait_cycles": 4,
+                "so_txtime_active": 1,
+                "txtime_errors": 1,
+            },
+        )
+        acc = orchestrator._add_stats(
+            acc,
+            {
+                "attempted": 5,
+                "sent": 5,
+                "errors": 0,
+                "actual_rps": 2000.0,
+                "rate_accuracy_pct": 96.0,
+                "jitter_p99_ns": 120.0,
+                "ipg_mean_ns": 900.0,
+                "sleep_calls": 3,
+                "busywait_cycles": 5,
+                "so_txtime_active": 0,
+                "txtime_errors": 2,
+            },
+        )
+
+        self.assertEqual(acc["attempted"], 10)
+        self.assertEqual(acc["sleep_calls"], 5)
+        self.assertEqual(acc["busywait_cycles"], 9)
+        self.assertEqual(acc["so_txtime_active"], 1)
+        self.assertEqual(acc["txtime_errors"], 3)
+        self.assertAlmostEqual(acc["actual_rps"], 2000.0)
+        self.assertAlmostEqual(acc["rate_accuracy_pct"], 96.0)

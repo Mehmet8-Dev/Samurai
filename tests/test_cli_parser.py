@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from ddos_samurai import cli
 
@@ -114,6 +115,45 @@ class TestCliParser(unittest.TestCase):
                 args,
                 ["--tls-profile", "chrome_120", "--ja3-profile", "firefox_120"],
             )
+
+
+class TestPacingArgValidation(unittest.TestCase):
+    def test_validate_pacing_args_requires_positive_rps_in_rps_mode(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--pacing-mode", "rps", "--rps", "0"])
+        with self.assertRaises(SystemExit):
+            cli._validate_pacing_args(parser, args)
+
+    def test_validate_pacing_args_requires_positive_ipg_in_ipg_mode(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--pacing-mode", "ipg", "--ipg", "0"])
+        with self.assertRaises(SystemExit):
+            cli._validate_pacing_args(parser, args)
+
+    def test_validate_pacing_args_requires_burst_size_in_burst_mode(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--pacing-mode", "burst", "--burst-size", "0"])
+        with self.assertRaises(SystemExit):
+            cli._validate_pacing_args(parser, args)
+
+    def test_validate_pacing_args_rejects_out_of_range_jitter(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--jitter-pct", "1.2"])
+        with self.assertRaises(SystemExit):
+            cli._validate_pacing_args(parser, args)
+
+    def test_validate_pacing_args_rejects_negative_burst_gap(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--burst-gap", "-1"])
+        with self.assertRaises(SystemExit):
+            cli._validate_pacing_args(parser, args)
+
+    def test_validate_pacing_args_logs_auto_promote_hint(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--rps", "1000", "--pacing-mode", "none"])
+        with patch.object(cli.utils, "log_info") as mock_log:
+            cli._validate_pacing_args(parser, args)
+            mock_log.assert_called_once()
 
 
 class TestRootGateRegression(unittest.TestCase):
