@@ -2796,6 +2796,48 @@ def get_gpu_info() -> dict:
         return {"available": False, "error": str(e)}
 
 
+class GPUPacketGenerator:
+    """Backward-compatible wrapper used by legacy comprehensive tests."""
+
+    def __init__(
+        self,
+        max_batch_size: int = 100000,
+        *,
+        real_src_ip: str = "192.168.1.100",
+        spoof_ip: bool = True,
+        has_ethernet: bool = False,
+        spoof_subnet: str = "1.0.0.0/8",
+    ):
+        self.max_batch_size = int(max(1, max_batch_size))
+        self.real_src_ip = str(real_src_ip)
+        self.spoof_ip = bool(spoof_ip)
+        self.has_ethernet = bool(has_ethernet)
+        self.spoof_subnet = str(spoof_subnet or "1.0.0.0/8")
+
+    def generate_batch(self, template_bytes: bytes, batch_size: int):
+        count = int(batch_size or 0)
+        if count < 0:
+            raise ValueError("batch_size must be >= 0")
+        if count > self.max_batch_size:
+            raise ValueError(
+                f"batch_size {count} exceeds max_batch_size {self.max_batch_size}"
+            )
+
+        packets_gpu, packet_size = generate_packets_from_template(
+            template_bytes=template_bytes,
+            count=count,
+            real_src_ip=self.real_src_ip,
+            spoof_ip=self.spoof_ip,
+            has_ethernet=self.has_ethernet,
+            spoof_subnet=self.spoof_subnet,
+        )
+        packets_host = cp.asnumpy(packets_gpu)
+        return [
+            bytes(packets_host[i * packet_size : (i + 1) * packet_size])
+            for i in range(count)
+        ]
+
+
 # ============================================================================
 # Module Initialization
 # ============================================================================

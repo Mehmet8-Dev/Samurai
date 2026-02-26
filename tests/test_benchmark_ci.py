@@ -152,19 +152,6 @@ class TestCISafeBenchmarks(unittest.TestCase):
         pool_buf_len = len(pool_buf)
         peak_over_buf = (float(peak) / float(pool_buf_len)) if pool_buf_len else 0.0
 
-        for info in scenarios.values():
-            self.assertLessEqual(
-                info["cv_pct"],
-                thresholds["max_cv_pct"],
-                f"High variance in {info['name']}: cv={info['cv_pct']:.2f}%",
-            )
-
-        self.assertLessEqual(
-            peak_over_buf,
-            thresholds["max_pool_peak_over_buf"],
-            f"Pool peak memory ratio too high: {peak_over_buf:.2f}",
-        )
-
         throughput_core = {
             "create_packet_tcp_syn_rate_per_s": float(
                 scenarios["create_packet_tcp_syn"].get("rate_per_s", 0.0) or 0.0
@@ -225,6 +212,19 @@ class TestCISafeBenchmarks(unittest.TestCase):
         # Keep summary available even when threshold assertions fail, so
         # report-writing tests can still emit diagnostics.
         _BenchState.summary = summary
+
+        for info in scenarios.values():
+            self.assertLessEqual(
+                info["cv_pct"],
+                thresholds["max_cv_pct"],
+                f"High variance in {info['name']}: cv={info['cv_pct']:.2f}%",
+            )
+
+        self.assertLessEqual(
+            peak_over_buf,
+            thresholds["max_pool_peak_over_buf"],
+            f"Pool peak memory ratio too high: {peak_over_buf:.2f}",
+        )
 
         baseline_path = str(os.environ.get("SAMURAI_BENCH_BASELINE", "") or "").strip()
         if baseline_path and Path(baseline_path).exists():
