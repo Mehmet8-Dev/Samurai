@@ -57,6 +57,17 @@ GPU kullaniminda CUDA uyumlu ortama ihtiyac vardir.
 pip install cupy-cuda12x numba-cuda[cu13]
 ```
 
+### CUDA Hybrid Raw Knob'lari (Yeni)
+
+- `--gpu-template-pool-size-l4` (vars: `10`, env: `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4`)
+- `--gpu-template-pool-size-l7` (vars: `50`, env: `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7`)
+- `--gpu-ring-capacity` (vars: `3`, env: `SAMURAI_GPU_RING_CAPACITY`)
+- `--gpu-pinned-max-mb` (vars: `512`, env: `SAMURAI_GPU_PINNED_MAX_MB`)
+- `--state-table-size` (vars: `65536`, env: `SAMURAI_STATE_TABLE_SIZE`)
+- `--state-lock-count` (vars: `256`, env: `SAMURAI_STATE_LOCK_COUNT`)
+- `--state-timeout-sec` (vars: `60`, env: `SAMURAI_STATE_TIMEOUT_SEC`)
+- `--state-sweep-interval-ms` (vars: `1000`, env: `SAMURAI_STATE_SWEEP_INTERVAL_MS`)
+
 ### 4) Opsiyonel browser automation (Ninja)
 
 ```bash

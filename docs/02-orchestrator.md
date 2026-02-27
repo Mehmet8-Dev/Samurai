@@ -49,6 +49,32 @@ GPU genel L4 paket uretiminde:
 
 Bu tasarim, "Scapy ile paket formatini tanimla, GPU ile hizli cogalt" modelidir.
 
+## Hybrid Ring + Backpressure (CUDA Raw)
+
+CUDA raw/template-pool ve stateful hatlarinda worker su akisi kullanir:
+
+- producer: GPU kernel launch + async D2H pinned copy
+- consumer: `senders.paced_raw_socket_sender` ile NIC aktarimi
+- queue: bounded ring (`--gpu-ring-capacity`, env: `SAMURAI_GPU_RING_CAPACITY`)
+- politika: queue dolunca producer block olur (drop yok)
+
+Run metrikleri:
+
+- `gpu_ring_depth_peak`
+- `gpu_ring_block_wait_ns`
+
+## State Engine Konfigurasyonu
+
+CUDA worker baslangicinda C extension state engine runtime olarak konfigure edilir:
+
+- `--state-table-size` (`SAMURAI_STATE_TABLE_SIZE`)
+- `--state-lock-count` (`SAMURAI_STATE_LOCK_COUNT`)
+- `--state-timeout-sec` (`SAMURAI_STATE_TIMEOUT_SEC`)
+- `--state-sweep-interval-ms` (`SAMURAI_STATE_SWEEP_INTERVAL_MS`)
+
+Gonderim sonrasi `ingest_tx_packets(...)` ile paket bazli state update yapilir.
+Periyodik `sweep_state_table(...)` cagrisi timeout olan kayitlari temizler.
+
 ## Progress Guncellemesi
 
 `finally` blogunda `progress.value += args['count']` yapilir.
