@@ -188,6 +188,35 @@ class TestGpuPacketValidations(unittest.TestCase):
         self.assertEqual(int(tel.get("gpu_rng_state_alloc_count", 0)), 1)
         self.assertGreaterEqual(int(tel.get("gpu_rng_state_reuse_count", 0)), 1)
 
+    def test_pinned_pool_cap_triggers_eviction(self):
+        pool = gpu_packet.get_pinned_host_pool()
+        original_max = int(pool.get_stats().get("max_bytes", 0) or 0)
+        try:
+            gpu_packet.configure_pinned_host_pool(max_bytes=128)
+            _ = pool.acquire(64, dtype=np.uint8, key="slot_a")
+            _ = pool.acquire(80, dtype=np.uint8, key="slot_b")
+            stats = pool.get_stats()
+            self.assertLessEqual(int(stats.get("total_nbytes", 0)), int(stats.get("max_bytes", 0)))
+            self.assertGreaterEqual(int(stats.get("pool_evictions", 0)), 1)
+        finally:
+            if original_max > 0:
+                gpu_packet.configure_pinned_host_pool(max_bytes=original_max)
+            pool.clear()
+
+    def test_pinned_pool_oversize_request_bypasses_cache(self):
+        pool = gpu_packet.get_pinned_host_pool()
+        original_max = int(pool.get_stats().get("max_bytes", 0) or 0)
+        try:
+            gpu_packet.configure_pinned_host_pool(max_bytes=64)
+            _ = pool.acquire(1024, dtype=np.uint8, key="oversize")
+            stats = pool.get_stats()
+            self.assertGreaterEqual(int(stats.get("oversize_bypass", 0)), 1)
+            self.assertLessEqual(int(stats.get("total_nbytes", 0)), int(stats.get("max_bytes", 0)))
+        finally:
+            if original_max > 0:
+                gpu_packet.configure_pinned_host_pool(max_bytes=original_max)
+            pool.clear()
+
 
 if __name__ == "__main__":
     unittest.main()

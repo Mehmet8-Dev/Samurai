@@ -90,6 +90,11 @@ class TestReporting(unittest.TestCase):
                 "gpu_template_h2d_copy_bytes": 2048,
                 "gpu_rng_state_alloc_count": 1,
                 "gpu_rng_state_reuse_count": 5,
+                "gpu_ring_depth_peak": 3,
+                "gpu_ring_block_wait_ns": 1200,
+                "state_active_entries": 100,
+                "state_timeout_evictions": 4,
+                "state_overwrites": 2,
                 "stats": {
                     "attempted": 10,
                     "sent": 9,
@@ -139,6 +144,11 @@ class TestReporting(unittest.TestCase):
                 "gpu_template_h2d_copy_bytes": 1024,
                 "gpu_rng_state_alloc_count": 1,
                 "gpu_rng_state_reuse_count": 3,
+                "gpu_ring_depth_peak": 2,
+                "gpu_ring_block_wait_ns": 800,
+                "state_active_entries": 120,
+                "state_timeout_evictions": 1,
+                "state_overwrites": 1,
                 "stats": {
                     "attempted": 10,
                     "sent": 8,
@@ -192,6 +202,11 @@ class TestReporting(unittest.TestCase):
         self.assertAlmostEqual(rr.results["txring_flush_other_errno_ratio_pct"], 16.6667, places=4)
         self.assertEqual(rr.results["gpu_template_h2d_copy_count"], 4)
         self.assertEqual(rr.results["gpu_rng_state_alloc_count"], 2)
+        self.assertEqual(rr.results["gpu_ring_depth_peak"], 3)
+        self.assertEqual(rr.results["gpu_ring_block_wait_ns"], 2000)
+        self.assertEqual(rr.results["state_active_entries"], 120)
+        self.assertEqual(rr.results["state_timeout_evictions"], 5)
+        self.assertEqual(rr.results["state_overwrites"], 3)
 
     def test_live_attack_report_caps_wire_loss_pct_and_preserves_raw(self):
         from ddos_samurai import reporting

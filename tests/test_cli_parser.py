@@ -1,5 +1,6 @@
 import unittest
 import io
+import os
 from contextlib import redirect_stderr
 from unittest.mock import patch
 
@@ -77,6 +78,14 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--loss-iface", opts)
         self.assertIn("--loss-fail-pct", opts)
         self.assertIn("--loss-report-out", opts)
+        self.assertIn("--gpu-template-pool-size-l4", opts)
+        self.assertIn("--gpu-template-pool-size-l7", opts)
+        self.assertIn("--gpu-ring-capacity", opts)
+        self.assertIn("--gpu-pinned-max-mb", opts)
+        self.assertIn("--state-table-size", opts)
+        self.assertIn("--state-lock-count", opts)
+        self.assertIn("--state-timeout-sec", opts)
+        self.assertIn("--state-sweep-interval-ms", opts)
 
     def test_loss_telemetry_flags_defaults(self):
         parser = cli.build_parser()
@@ -100,6 +109,32 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.loss_iface, "eth0")
         self.assertEqual(args.loss_fail_pct, 7.5)
         self.assertEqual(args.loss_report_out, "artifacts/loss.json")
+
+    def test_hybrid_flags_read_env_defaults(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4": "11",
+                "SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7": "55",
+                "SAMURAI_GPU_RING_CAPACITY": "4",
+                "SAMURAI_GPU_PINNED_MAX_MB": "256",
+                "SAMURAI_STATE_TABLE_SIZE": "32768",
+                "SAMURAI_STATE_LOCK_COUNT": "128",
+                "SAMURAI_STATE_TIMEOUT_SEC": "45",
+                "SAMURAI_STATE_SWEEP_INTERVAL_MS": "1500",
+            },
+            clear=False,
+        ):
+            parser = cli.build_parser()
+            args = parser.parse_args([])
+            self.assertEqual(args.gpu_template_pool_size_l4, 11)
+            self.assertEqual(args.gpu_template_pool_size_l7, 55)
+            self.assertEqual(args.gpu_ring_capacity, 4)
+            self.assertEqual(args.gpu_pinned_max_mb, 256)
+            self.assertEqual(args.state_table_size, 32768)
+            self.assertEqual(args.state_lock_count, 128)
+            self.assertEqual(args.state_timeout_sec, 45)
+            self.assertEqual(args.state_sweep_interval_ms, 1500)
 
     def test_ja3_profile_alias_sets_tls_profile(self):
         parser = cli.build_parser()
@@ -159,6 +194,23 @@ class TestPacingArgValidation(unittest.TestCase):
             mock_log.assert_called_once()
 
 
+class TestHybridArgValidation(unittest.TestCase):
+    def _assert_validation_fails(self, parser, args):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli._validate_hybrid_cuda_args(parser, args)
+
+    def test_rejects_non_divisible_state_table_config(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--state-table-size", "1000", "--state-lock-count", "256"])
+        self._assert_validation_fails(parser, args)
+
+    def test_accepts_valid_state_table_config(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--state-table-size", "65536", "--state-lock-count", "256"])
+        cli._validate_hybrid_cuda_args(parser, args)
+
+
 class TestRootGateRegression(unittest.TestCase):
     """Regression tests for the vector-based root privilege check (trex_path Görev #5).
 
@@ -167,34 +219,34 @@ class TestRootGateRegression(unittest.TestCase):
     sockets and must be runnable without root.
     """
 
-    # This must match the set defined in cli.py main()
-    EXPECTED_RAW_VECTORS = {
+    # This must match _CPU_RAW_SOCKET_VECTORS defined in cli.py main().
+    EXPECTED_CPU_RAW_VECTORS = {
         "basic", "dns", "anomaly",
         "ntp-amp", "ssdp-amp", "dns-amp", "memcached-amp", "ldap-amp",
         "pcap-replay",
-        "slowloris", "slow-post", "slow-read",
     }
 
     def test_root_required_vectors_match(self):
-        """The set of raw-socket vectors in the test should match those in cli.py."""
+        """The CPU raw-socket vector set should match those in cli.py."""
         import inspect
         src = inspect.getsource(cli.main)
-        # Verify the set is defined in main()
-        self.assertIn("_RAW_SOCKET_VECTORS", src)
-        for v in self.EXPECTED_RAW_VECTORS:
-            self.assertIn(f'"{v}"', src, f"Vector '{v}' should be in _RAW_SOCKET_VECTORS")
+        self.assertIn("_CPU_RAW_SOCKET_VECTORS", src)
+        for v in self.EXPECTED_CPU_RAW_VECTORS:
+            self.assertIn(f'"{v}"', src, f"Vector '{v}' should be in _CPU_RAW_SOCKET_VECTORS")
 
     def test_http_vectors_not_in_root_gate(self):
-        """HTTP-layer vectors should NOT require root."""
-        import inspect
-        src = inspect.getsource(cli.main)
+        """HTTP-layer vectors should not be considered raw on CPU backend."""
+        parser = cli.build_parser()
         for v in ("http", "http2", "websocket", "quic"):
-            # These should NOT appear in the raw socket vectors set
-            # (but they might appear elsewhere in main, so check specifically)
-            self.assertNotIn(
-                f'"{v}"', src.split("_RAW_SOCKET_VECTORS")[1].split("}")[0],
-                f"Vector '{v}' should NOT be in _RAW_SOCKET_VECTORS",
-            )
+            args = parser.parse_args(["--attack-vector", v, "--compute-backend", "cpu"])
+            self.assertFalse(cli._is_cuda_raw_vector(args))
+
+    def test_cuda_http_vectors_are_marked_raw(self):
+        """CUDA HTTP/HTTP2 paths use raw sender, therefore root-gated."""
+        parser = cli.build_parser()
+        for v in ("http", "http2"):
+            args = parser.parse_args(["--attack-vector", v, "--compute-backend", "cuda"])
+            self.assertTrue(cli._is_cuda_raw_vector(args))
 
 
 class TestBuildTestCommandRegression(unittest.TestCase):

@@ -24,6 +24,10 @@ class TestFastSender(unittest.TestCase):
         self.assertTrue(hasattr(fast_sender, 'send_ring_optimized'), "Missing send_ring_optimized")
         self.assertTrue(hasattr(fast_sender, 'cleanup_ring'), "Missing cleanup_ring")
         self.assertTrue(hasattr(fast_sender, 'get_ring_info'), "Missing get_ring_info")
+        self.assertTrue(hasattr(fast_sender, 'configure_state_engine'), "Missing configure_state_engine")
+        self.assertTrue(hasattr(fast_sender, 'get_state_engine_stats'), "Missing get_state_engine_stats")
+        self.assertTrue(hasattr(fast_sender, 'ingest_tx_packets'), "Missing ingest_tx_packets")
+        self.assertTrue(hasattr(fast_sender, 'sweep_state_table'), "Missing sweep_state_table")
 
     def test_send_optimized_signature(self):
         """
@@ -77,6 +81,28 @@ class TestFastSender(unittest.TestCase):
             "frame_header_size",
         }
         self.assertTrue(expected_keys.issubset(set(info.keys())))
+
+    def test_configure_state_engine_and_stats(self):
+        """State-engine runtime configuration APIs should be callable."""
+        out = fast_sender.configure_state_engine(65536, 256, 60)
+        self.assertIsInstance(out, dict)
+        self.assertEqual(int(out.get("table_size", 0)), 65536)
+        self.assertEqual(int(out.get("lock_count", 0)), 256)
+        self.assertEqual(int(out.get("timeout_sec", 0)), 60)
+
+        stats = fast_sender.get_state_engine_stats()
+        self.assertIsInstance(stats, dict)
+        self.assertIn("active_entries", stats)
+        self.assertIn("timeout_evictions", stats)
+        self.assertIn("overwrites", stats)
+
+    def test_ingest_and_sweep_state_engine(self):
+        """Ingest/sweep APIs should return integer counts."""
+        dummy_packet = b"A" * 64
+        ingested = fast_sender.ingest_tx_packets(dummy_packet, len(dummy_packet), 1)
+        self.assertIsInstance(ingested, int)
+        swept = fast_sender.sweep_state_table(1024)
+        self.assertIsInstance(swept, int)
 
 if __name__ == '__main__':
     unittest.main()
