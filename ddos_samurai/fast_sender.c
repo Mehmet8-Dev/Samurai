@@ -39,9 +39,10 @@
 #endif
 
 #define BATCH_SIZE 1024
-#define STATE_TABLE_SIZE 65536
+#define DEFAULT_STATE_TABLE_SIZE 65536
 #define MAX_PACKET_SIZE 2048
-#define NUM_LOCKS 256
+#define DEFAULT_NUM_LOCKS 256
+#define DEFAULT_STATE_TIMEOUT_SEC 60
 
 typedef enum {
     TXRING_FLUSH_MODE_LEGACY = 0,
@@ -105,8 +106,85 @@ typedef struct {
     uint8_t ttl;
 } tcp_state_t;
 
-static tcp_state_t state_table[STATE_TABLE_SIZE];
-static pthread_mutex_t state_locks[NUM_LOCKS];
+static tcp_state_t* state_table = NULL;
+static pthread_mutex_t* state_locks = NULL;
+static uint32_t state_table_size = DEFAULT_STATE_TABLE_SIZE;
+static uint32_t state_lock_count = DEFAULT_NUM_LOCKS;
+static uint32_t state_timeout_sec = DEFAULT_STATE_TIMEOUT_SEC;
+static uint32_t state_sweep_cursor = 0;
+static unsigned long long state_timeout_evictions = 0ULL;
+static unsigned long long state_overwrites = 0ULL;
+static unsigned long long state_sweeps = 0ULL;
+static unsigned long long state_last_sweep_removed = 0ULL;
+static unsigned long long state_active_entries = 0ULL;
+
+static uint32_t env_uint(const char* name, uint32_t fallback) {
+    const char* raw = getenv(name);
+    char* endptr = NULL;
+    unsigned long parsed;
+    if (!raw || !raw[0]) return fallback;
+    errno = 0;
+    parsed = strtoul(raw, &endptr, 10);
+    if (errno != 0 || endptr == raw || (endptr && *endptr != '\0')) return fallback;
+    if (parsed == 0UL) return fallback;
+    if (parsed > 0x7fffffffUL) return fallback;
+    return (uint32_t)parsed;
+}
+
+static void destroy_state_engine(void) {
+    if (state_locks) {
+        for (uint32_t i = 0; i < state_lock_count; i++) {
+            pthread_mutex_destroy(&state_locks[i]);
+        }
+        free(state_locks);
+        state_locks = NULL;
+    }
+    if (state_table) {
+        free(state_table);
+        state_table = NULL;
+    }
+    state_active_entries = 0ULL;
+    state_timeout_evictions = 0ULL;
+    state_overwrites = 0ULL;
+    state_sweeps = 0ULL;
+    state_last_sweep_removed = 0ULL;
+    state_sweep_cursor = 0U;
+}
+
+static int init_state_engine(uint32_t table_size, uint32_t lock_count, uint32_t timeout_sec) {
+    tcp_state_t* new_table = NULL;
+    pthread_mutex_t* new_locks = NULL;
+
+    if (table_size == 0 || lock_count == 0 || timeout_sec == 0) return -1;
+    if (table_size % lock_count != 0) return -1;
+
+    new_table = (tcp_state_t*)calloc((size_t)table_size, sizeof(tcp_state_t));
+    if (!new_table) return -1;
+    new_locks = (pthread_mutex_t*)calloc((size_t)lock_count, sizeof(pthread_mutex_t));
+    if (!new_locks) {
+        free(new_table);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < lock_count; i++) {
+        if (pthread_mutex_init(&new_locks[i], NULL) != 0) {
+            for (uint32_t j = 0; j < i; j++) {
+                pthread_mutex_destroy(&new_locks[j]);
+            }
+            free(new_locks);
+            free(new_table);
+            return -1;
+        }
+    }
+
+    destroy_state_engine();
+    state_table = new_table;
+    state_locks = new_locks;
+    state_table_size = table_size;
+    state_lock_count = lock_count;
+    state_timeout_sec = timeout_sec;
+    return 0;
+}
 
 static inline uint32_t hash_state(uint32_t src_ip, uint16_t src_port) {
     // Improved hash function (Murmur-like mixing)
@@ -120,12 +198,19 @@ static inline uint32_t hash_state(uint32_t src_ip, uint16_t src_port) {
     return h;
 }
 
+static inline uint32_t state_segment_size(void) {
+    if (state_lock_count == 0) return 0;
+    return state_table_size / state_lock_count;
+}
+
 static void update_state(uint32_t src_ip, uint16_t src_port, uint32_t seq, uint32_t ack, uint8_t state, uint16_t window, uint16_t mss, uint8_t ttl) {
+    if (!state_table || !state_locks || state_table_size == 0 || state_lock_count == 0) return;
     uint32_t h = hash_state(src_ip, src_port);
-    uint32_t segment = h % NUM_LOCKS;
-    uint32_t segment_size = STATE_TABLE_SIZE / NUM_LOCKS;
+    uint32_t segment = h % state_lock_count;
+    uint32_t segment_size = state_segment_size();
+    if (segment_size == 0) return;
     uint32_t segment_start = segment * segment_size;
-    uint32_t start_idx = segment_start + ((h / NUM_LOCKS) % segment_size);
+    uint32_t start_idx = segment_start + ((h / state_lock_count) % segment_size);
 
     pthread_mutex_lock(&state_locks[segment]);
     uint32_t idx = start_idx;
@@ -133,8 +218,17 @@ static void update_state(uint32_t src_ip, uint16_t src_port, uint32_t seq, uint3
     uint32_t now = (uint32_t)time(NULL);
 
     for (uint32_t i = 0; i < segment_size; i++) {
-        if (state_table[idx].state == 0 || (now - state_table[idx].last_seen > 60) || 
-            (state_table[idx].src_ip == src_ip && state_table[idx].src_port == src_port)) {
+        int timed_out = (
+            state_table[idx].state != 0 &&
+            (uint32_t)(now - state_table[idx].last_seen) > state_timeout_sec
+        );
+        int same_key = (state_table[idx].src_ip == src_ip && state_table[idx].src_port == src_port);
+        if (state_table[idx].state == 0 || timed_out || same_key) {
+            if (state_table[idx].state == 0) {
+                state_active_entries++;
+            } else if (timed_out && !same_key) {
+                state_timeout_evictions++;
+            }
             state_table[idx].src_ip = src_ip;
             state_table[idx].src_port = src_port;
             state_table[idx].seq = seq;
@@ -152,6 +246,11 @@ static void update_state(uint32_t src_ip, uint16_t src_port, uint32_t seq, uint3
     
     if (!found) { // Overwrite if bucket is full
         idx = start_idx;
+        if (state_table[idx].state != 0) {
+            state_overwrites++;
+        } else {
+            state_active_entries++;
+        }
         state_table[idx].src_ip = src_ip;
         state_table[idx].src_port = src_port;
         state_table[idx].seq = seq;
@@ -387,6 +486,11 @@ static PyObject* get_states_batch(PyObject* self, PyObject* args) {
     uint16_t start_port;
     uint32_t count;
     if (!PyArg_ParseTuple(args, "IHI", &src_ip, &start_port, &count)) return NULL;
+    (void)self;
+    if (!state_table || !state_locks || state_table_size == 0 || state_lock_count == 0) {
+        PyErr_SetString(PyExc_RuntimeError, "state engine is not initialized");
+        return NULL;
+    }
 
     PyObject* seq_list = PyList_New(count);
     PyObject* ack_list = PyList_New(count);
@@ -394,14 +498,18 @@ static PyObject* get_states_batch(PyObject* self, PyObject* args) {
     PyObject* window_list = PyList_New(count);
     PyObject* mss_list = PyList_New(count);
     PyObject* ttl_list = PyList_New(count);
+    uint32_t segment_size = state_segment_size();
+    if (segment_size == 0) {
+        PyErr_SetString(PyExc_RuntimeError, "invalid state engine segment size");
+        return NULL;
+    }
 
     for (uint32_t i = 0; i < count; i++) {
         uint16_t port = start_port + (i % 64512);
         uint32_t h = hash_state(src_ip, port);
-        uint32_t segment = h % NUM_LOCKS;
-        uint32_t segment_size = STATE_TABLE_SIZE / NUM_LOCKS;
+        uint32_t segment = h % state_lock_count;
         uint32_t segment_start = segment * segment_size;
-        uint32_t start_idx = segment_start + ((h / NUM_LOCKS) % segment_size);
+        uint32_t start_idx = segment_start + ((h / state_lock_count) % segment_size);
         
         uint32_t seq = 0, ack = 0;
         uint8_t state = 0;
@@ -440,6 +548,11 @@ static PyObject* get_tcp_state(PyObject* self, PyObject* args) {
     uint32_t src_ip;
     uint16_t src_port;
     if (!PyArg_ParseTuple(args, "IH", &src_ip, &src_port)) return NULL;
+    (void)self;
+    if (!state_table || !state_locks || state_table_size == 0 || state_lock_count == 0) {
+        PyErr_SetString(PyExc_RuntimeError, "state engine is not initialized");
+        return NULL;
+    }
 
     uint32_t seq = 0, ack = 0;
     uint8_t state = 0;
@@ -447,10 +560,14 @@ static PyObject* get_tcp_state(PyObject* self, PyObject* args) {
     uint8_t ttl = 0;
 
     uint32_t h = hash_state(src_ip, src_port);
-    uint32_t segment = h % NUM_LOCKS;
-    uint32_t segment_size = STATE_TABLE_SIZE / NUM_LOCKS;
+    uint32_t segment = h % state_lock_count;
+    uint32_t segment_size = state_segment_size();
+    if (segment_size == 0) {
+        PyErr_SetString(PyExc_RuntimeError, "invalid state engine segment size");
+        return NULL;
+    }
     uint32_t segment_start = segment * segment_size;
-    uint32_t start_idx = segment_start + ((h / NUM_LOCKS) % segment_size);
+    uint32_t start_idx = segment_start + ((h / state_lock_count) % segment_size);
 
     pthread_mutex_lock(&state_locks[segment]);
     uint32_t idx = start_idx;
@@ -486,6 +603,171 @@ static PyObject* set_mimicry_settings(PyObject* self, PyObject* args) {
     global_mss = mss;
     global_ttl = ttl;
     Py_RETURN_NONE;
+}
+
+static int sweep_state_table_internal(uint32_t max_scan) {
+    if (!state_table || !state_locks || state_table_size == 0 || state_lock_count == 0) return 0;
+    uint32_t segment_size = state_segment_size();
+    if (segment_size == 0) return 0;
+    if (max_scan == 0 || max_scan > state_table_size) max_scan = state_table_size;
+
+    uint32_t now = (uint32_t)time(NULL);
+    uint32_t removed = 0;
+    for (uint32_t i = 0; i < max_scan; i++) {
+        uint32_t idx = state_sweep_cursor % state_table_size;
+        uint32_t segment = idx / segment_size;
+        state_sweep_cursor = (state_sweep_cursor + 1U) % state_table_size;
+        pthread_mutex_lock(&state_locks[segment]);
+        if (state_table[idx].state != 0 &&
+            (uint32_t)(now - state_table[idx].last_seen) > state_timeout_sec) {
+            memset(&state_table[idx], 0, sizeof(tcp_state_t));
+            removed++;
+            if (state_active_entries > 0ULL) state_active_entries--;
+            state_timeout_evictions++;
+        }
+        pthread_mutex_unlock(&state_locks[segment]);
+    }
+    state_sweeps++;
+    state_last_sweep_removed = (unsigned long long)removed;
+    return (int)removed;
+}
+
+static inline uint16_t read_be16(const uint8_t* p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
+
+static inline uint32_t read_be32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static PyObject* configure_state_engine(PyObject* self, PyObject* args) {
+    unsigned int table_size = DEFAULT_STATE_TABLE_SIZE;
+    unsigned int lock_count = DEFAULT_NUM_LOCKS;
+    unsigned int timeout_sec = DEFAULT_STATE_TIMEOUT_SEC;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "III", &table_size, &lock_count, &timeout_sec)) return NULL;
+    if (table_size == 0 || lock_count == 0 || timeout_sec == 0 || (table_size % lock_count) != 0) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "Invalid state-engine config: table_size/lock_count/timeout_sec must be >0 and table_size % lock_count == 0"
+        );
+        return NULL;
+    }
+    if (init_state_engine((uint32_t)table_size, (uint32_t)lock_count, (uint32_t)timeout_sec) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to initialize state engine");
+        return NULL;
+    }
+    return Py_BuildValue(
+        "{s:I,s:I,s:I}",
+        "table_size", (unsigned int)state_table_size,
+        "lock_count", (unsigned int)state_lock_count,
+        "timeout_sec", (unsigned int)state_timeout_sec
+    );
+}
+
+static PyObject* get_state_engine_stats(PyObject* self, PyObject* args) {
+    (void)self;
+    (void)args;
+    return Py_BuildValue(
+        "{s:I,s:I,s:I,s:K,s:K,s:K,s:K,s:K,s:I}",
+        "table_size", (unsigned int)state_table_size,
+        "lock_count", (unsigned int)state_lock_count,
+        "timeout_sec", (unsigned int)state_timeout_sec,
+        "active_entries", state_active_entries,
+        "timeout_evictions", state_timeout_evictions,
+        "overwrites", state_overwrites,
+        "sweeps", state_sweeps,
+        "last_sweep_removed", state_last_sweep_removed,
+        "sweep_cursor", (unsigned int)state_sweep_cursor
+    );
+}
+
+static PyObject* sweep_state_table(PyObject* self, PyObject* args) {
+    unsigned int max_scan = 0;
+    int removed = 0;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "|I", &max_scan)) return NULL;
+    removed = sweep_state_table_internal((uint32_t)max_scan);
+    return PyLong_FromLong((long)removed);
+}
+
+static PyObject* ingest_tx_packets(PyObject* self, PyObject* args) {
+    Py_buffer view;
+    int packet_size = 0;
+    int count = 0;
+    int updated = 0;
+    (void)self;
+
+    if (!PyArg_ParseTuple(args, "y*ii", &view, &packet_size, &count)) return NULL;
+    if (packet_size <= 0 || count <= 0) {
+        PyBuffer_Release(&view);
+        return PyLong_FromLong(0);
+    }
+    if ((size_t)view.len < ((size_t)packet_size * (size_t)count)) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packets buffer is smaller than packet_size * count");
+        return NULL;
+    }
+
+    const uint8_t* base = (const uint8_t*)view.buf;
+    for (int i = 0; i < count; i++) {
+        const uint8_t* pkt = base + ((size_t)i * (size_t)packet_size);
+        int pkt_len = packet_size;
+        int ip_offset = -1;
+        int transport_offset;
+        uint8_t protocol;
+        uint8_t ihl_bytes;
+        uint8_t flags;
+        uint32_t src_ip;
+        uint16_t src_port;
+        uint32_t seq;
+        uint32_t ack;
+        uint8_t next_state = 1;
+        uint32_t next_seq;
+        uint32_t next_ack;
+
+        if (pkt_len >= 18) {
+            uint16_t eth_type = read_be16(pkt + 12);
+            if (eth_type == 0x8100 && pkt_len >= 22) {
+                uint16_t inner_type = read_be16(pkt + 16);
+                if (inner_type == 0x0800) ip_offset = 18;
+            } else if (eth_type == 0x0800) {
+                ip_offset = 14;
+            }
+        }
+        if (ip_offset < 0 && pkt_len >= 20 && ((pkt[0] >> 4) & 0x0F) == 4) {
+            ip_offset = 0;
+        }
+        if (ip_offset < 0 || pkt_len < (ip_offset + 20)) continue;
+        if (((pkt[ip_offset] >> 4) & 0x0F) != 4) continue;
+
+        ihl_bytes = (uint8_t)((pkt[ip_offset] & 0x0F) * 4);
+        if (ihl_bytes < 20 || pkt_len < (ip_offset + ihl_bytes + 20)) continue;
+        protocol = pkt[ip_offset + 9];
+        if (protocol != 6) continue; // TCP only
+
+        transport_offset = ip_offset + ihl_bytes;
+        src_ip = read_be32(pkt + ip_offset + 12);
+        src_port = read_be16(pkt + transport_offset);
+        seq = read_be32(pkt + transport_offset + 4);
+        ack = read_be32(pkt + transport_offset + 8);
+        flags = pkt[transport_offset + 13];
+
+        if ((flags & 0x10) != 0) {
+            next_state = 2; // ESTABLISHED-ish
+            next_seq = seq;
+            next_ack = ack;
+        } else {
+            next_state = 1; // SYN_SENT-ish
+            next_seq = seq + 1U;
+            next_ack = 0U;
+        }
+        update_state(src_ip, src_port, next_seq, next_ack, next_state, global_window_size, global_mss, global_ttl);
+        updated++;
+    }
+
+    PyBuffer_Release(&view);
+    return PyLong_FromLong((long)updated);
 }
 
 // --- RX_RING Handshake Handler ---
@@ -1344,6 +1626,10 @@ static PyMethodDef FastSenderMethods[] = {
      "Send packets using AF_PACKET TX_RING (L2 Zero-Copy) and return detailed counters."},
     {"cleanup_ring", cleanup_ring, METH_VARARGS, "Cleanup persistent TX_RING context"},
     {"get_ring_info", get_ring_info, METH_NOARGS, "Return active TX_RING setup details including packet version."},
+    {"configure_state_engine", configure_state_engine, METH_VARARGS, "Configure state table size/locks/timeout."},
+    {"get_state_engine_stats", get_state_engine_stats, METH_NOARGS, "Return state-engine counters and active entries."},
+    {"ingest_tx_packets", ingest_tx_packets, METH_VARARGS, "Ingest transmitted packets and update CPU state table."},
+    {"sweep_state_table", sweep_state_table, METH_VARARGS, "Sweep stale state entries by timeout and return removed count."},
     {"get_tcp_state", get_tcp_state, METH_VARARGS, "Get TCP state from the state table"},
     {"get_states_batch", get_states_batch, METH_VARARGS, "Get multiple TCP states in one call"},
     {"start_rx_handler", start_rx_handler, METH_VARARGS, "Start the background RX handler thread"},
@@ -1354,17 +1640,37 @@ static PyMethodDef FastSenderMethods[] = {
     {NULL, NULL, 0, NULL}
 };
 
+static void fast_sender_free(void* module) {
+    (void)module;
+    cleanup_tx_ring_internal();
+    destroy_state_engine();
+}
+
 static struct PyModuleDef fastsendermodule = {
     PyModuleDef_HEAD_INIT,
     "fast_sender",
     "High performance packet sender module for DDoSamurai",
     -1,
-    FastSenderMethods
+    FastSenderMethods,
+    NULL,
+    NULL,
+    NULL,
+    fast_sender_free
 };
 
 PyMODINIT_FUNC PyInit_fast_sender(void) {
-    for (int i = 0; i < NUM_LOCKS; i++) {
-        pthread_mutex_init(&state_locks[i], NULL);
+    uint32_t cfg_table = env_uint("SAMURAI_STATE_TABLE_SIZE", DEFAULT_STATE_TABLE_SIZE);
+    uint32_t cfg_locks = env_uint("SAMURAI_STATE_LOCK_COUNT", DEFAULT_NUM_LOCKS);
+    uint32_t cfg_timeout = env_uint("SAMURAI_STATE_TIMEOUT_SEC", DEFAULT_STATE_TIMEOUT_SEC);
+
+    if (cfg_table == 0 || cfg_locks == 0 || cfg_timeout == 0 || (cfg_table % cfg_locks) != 0) {
+        cfg_table = DEFAULT_STATE_TABLE_SIZE;
+        cfg_locks = DEFAULT_NUM_LOCKS;
+        cfg_timeout = DEFAULT_STATE_TIMEOUT_SEC;
+    }
+    if (init_state_engine(cfg_table, cfg_locks, cfg_timeout) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to initialize state engine");
+        return NULL;
     }
     return PyModule_Create(&fastsendermodule);
 }

@@ -2545,49 +2545,122 @@ _gpu_memory_pool: Optional[GPUMemoryPool] = None
 class PinnedHostBufferPool:
     """Reusable host buffer pool (prefers pinned/page-locked memory)."""
 
-    def __init__(self):
-        self._buffers = {}
+    def __init__(self, max_bytes: Optional[int] = None):
+        env_mb = max(1, _env_int("SAMURAI_GPU_PINNED_MAX_MB", 512))
+        default_limit = int(env_mb * 1024 * 1024)
+        self._max_bytes = int(max_bytes) if max_bytes is not None else default_limit
+        self._limit_mb_seen = int(env_mb)
+        self._buffers = OrderedDict()
         self._lock = threading.Lock()
+        self._total_nbytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._alloc_fallbacks = 0
+        self._oversize_bypass = 0
+        self._high_watermark_bytes = 0
         try:
             from cupyx import empty_pinned as _empty_pinned
         except Exception:
             _empty_pinned = None
         self._empty_pinned = _empty_pinned
 
+    def _buffer_nbytes(self, buf) -> int:
+        try:
+            return int(getattr(buf, "nbytes", 0) or 0)
+        except Exception:
+            return 0
+
+    def _allocate_buffer(self, size: int, dtype):
+        if self._empty_pinned is not None:
+            try:
+                return self._empty_pinned((int(size),), dtype=dtype)
+            except Exception:
+                self._alloc_fallbacks += 1
+        return np.empty((int(size),), dtype=dtype)
+
+    def _evict_until_fit(self, extra_nbytes: int, protect_slot: Optional[str] = None):
+        if self._max_bytes <= 0:
+            return
+        while self._buffers and (self._total_nbytes + int(extra_nbytes)) > self._max_bytes:
+            old_slot, old_buf = next(iter(self._buffers.items()))
+            if protect_slot is not None and old_slot == protect_slot:
+                break
+            self._buffers.popitem(last=False)
+            self._total_nbytes = max(0, self._total_nbytes - self._buffer_nbytes(old_buf))
+            self._evictions += 1
+
+    def _set_max_bytes_locked(self, max_bytes: int):
+        self._max_bytes = max(1, int(max_bytes))
+        self._limit_mb_seen = max(1, self._max_bytes // (1024 * 1024))
+        self._evict_until_fit(0)
+
+    def configure(self, max_bytes: Optional[int] = None):
+        with self._lock:
+            if max_bytes is not None:
+                self._set_max_bytes_locked(max_bytes)
+
+    def refresh_limit_from_env(self):
+        env_mb = max(1, _env_int("SAMURAI_GPU_PINNED_MAX_MB", self._limit_mb_seen or 512))
+        if env_mb != self._limit_mb_seen:
+            self._set_max_bytes_locked(int(env_mb * 1024 * 1024))
+
     def acquire(self, size: int, dtype=np.uint8, key: Optional[str] = None):
         """Acquire a host buffer with at least `size` elements."""
         dtype = np.dtype(dtype)
         slot = key if key is not None else (str(dtype), int(size))
+        requested_elems = int(size)
+        requested_nbytes = int(requested_elems * dtype.itemsize)
         with self._lock:
-            buf = self._buffers.get(slot)
-            if buf is None or buf.dtype != dtype or buf.size < int(size):
-                if self._empty_pinned is not None:
-                    try:
-                        buf = self._empty_pinned((int(size),), dtype=dtype)
-                    except Exception:
-                        buf = np.empty((int(size),), dtype=dtype)
-                else:
-                    buf = np.empty((int(size),), dtype=dtype)
-                self._buffers[slot] = buf
-            return self._buffers[slot]
+            buf = self._buffers.get(slot, None)
+            if buf is not None and buf.dtype == dtype and buf.size >= requested_elems:
+                self._hits += 1
+                self._buffers.move_to_end(slot, last=True)
+                return buf
+
+            self._misses += 1
+
+            # Remove incompatible stale entry for this slot before replacement.
+            if buf is not None:
+                self._buffers.pop(slot, None)
+                self._total_nbytes = max(0, self._total_nbytes - self._buffer_nbytes(buf))
+
+            # Oversize requests bypass cache to avoid persistent limit violation.
+            if self._max_bytes > 0 and requested_nbytes > self._max_bytes:
+                self._oversize_bypass += 1
+                return self._allocate_buffer(requested_elems, dtype)
+
+            self._evict_until_fit(requested_nbytes, protect_slot=slot)
+            new_buf = self._allocate_buffer(requested_elems, dtype)
+            self._buffers[slot] = new_buf
+            self._buffers.move_to_end(slot, last=True)
+            self._total_nbytes += self._buffer_nbytes(new_buf)
+            if self._total_nbytes > self._high_watermark_bytes:
+                self._high_watermark_bytes = self._total_nbytes
+            return new_buf
 
     def clear(self):
         with self._lock:
             self._buffers.clear()
+            self._total_nbytes = 0
 
     def get_stats(self) -> dict:
         """Best-effort pinned host-pool stats."""
         with self._lock:
-            total_nbytes = 0
-            for buf in self._buffers.values():
-                try:
-                    total_nbytes += int(getattr(buf, "nbytes", 0) or 0)
-                except Exception:
-                    pass
+            total_nbytes = int(self._total_nbytes)
+            hit_den = max(1, self._hits + self._misses)
             return {
                 "buffers_allocated": int(len(self._buffers)),
-                "total_nbytes": int(total_nbytes),
+                "total_nbytes": total_nbytes,
+                "max_bytes": int(self._max_bytes),
+                "high_watermark_bytes": int(self._high_watermark_bytes),
                 "pinned_enabled": int(self._empty_pinned is not None),
+                "pool_hits": int(self._hits),
+                "pool_misses": int(self._misses),
+                "pool_evictions": int(self._evictions),
+                "alloc_fallbacks": int(self._alloc_fallbacks),
+                "oversize_bypass": int(self._oversize_bypass),
+                "hit_rate_pct": round(float(self._hits) * 100.0 / float(hit_den), 2),
             }
 
 
@@ -2608,6 +2681,15 @@ def get_pinned_host_pool() -> PinnedHostBufferPool:
     if _pinned_host_pool is None:
         _pinned_host_pool = PinnedHostBufferPool()
     return _pinned_host_pool
+
+
+def configure_pinned_host_pool(max_mb: Optional[int] = None, max_bytes: Optional[int] = None) -> None:
+    """Configure pinned-host pool capacity at runtime."""
+    pool = get_pinned_host_pool()
+    if max_bytes is None and max_mb is not None:
+        max_bytes = int(max(1, int(max_mb)) * 1024 * 1024)
+    if max_bytes is not None:
+        pool.configure(max_bytes=int(max_bytes))
 
 
 # Module-level D2H telemetry counters

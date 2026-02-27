@@ -44,6 +44,32 @@ USER_AGENTS = [
     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
 ]
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or default)
+    except Exception:
+        return int(default)
+
+
+def _is_cuda_raw_vector(args: argparse.Namespace) -> bool:
+    """Return True when the selected route uses raw socket sending on CUDA path."""
+    if str(getattr(args, "compute_backend", "cpu") or "cpu").strip().lower() != "cuda":
+        return False
+    vec = str(getattr(args, "attack_vector", "") or "").strip().lower()
+    return vec in {
+        "basic",
+        "dns",
+        "http",
+        "http2",
+        "anomaly",
+        "ntp-amp",
+        "ssdp-amp",
+        "dns-amp",
+        "memcached-amp",
+        "ldap-amp",
+    }
+
 _SOAK_PROFILE_PRESETS = {
     "none": {
         "duration_s": 0,
@@ -241,6 +267,14 @@ def _report_inputs_from_args(args) -> dict:
         "h2_profile": str(getattr(args, "h2_profile", PROFILE_NONE)),
         "soak_profile": str(getattr(args, "soak_profile", "none")),
         "soak_warmup_s": int(getattr(args, "soak_warmup_s", 0) or 0),
+        "gpu_template_pool_size_l4": int(getattr(args, "gpu_template_pool_size_l4", 10) or 10),
+        "gpu_template_pool_size_l7": int(getattr(args, "gpu_template_pool_size_l7", 50) or 50),
+        "gpu_ring_capacity": int(getattr(args, "gpu_ring_capacity", 3) or 3),
+        "gpu_pinned_max_mb": int(getattr(args, "gpu_pinned_max_mb", 512) or 512),
+        "state_table_size": int(getattr(args, "state_table_size", 65536) or 65536),
+        "state_lock_count": int(getattr(args, "state_lock_count", 256) or 256),
+        "state_timeout_sec": int(getattr(args, "state_timeout_sec", 60) or 60),
+        "state_sweep_interval_ms": int(getattr(args, "state_sweep_interval_ms", 1000) or 1000),
         "loss_telemetry": str(getattr(args, "loss_telemetry", "auto")),
         "loss_iface": str(getattr(args, "loss_iface", "")),
         "loss_fail_pct": float(getattr(args, "loss_fail_pct", 5.0) or 5.0),
@@ -305,6 +339,28 @@ def _validate_pacing_args(parser: argparse.ArgumentParser, args: argparse.Namesp
         utils.log_info(
             "--rps > 0 ve --pacing-mode none: worker tarafında pacing-mode otomatik rps'e yükseltilecek."
         )
+
+
+def _validate_hybrid_cuda_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    # Unified sanity checks for new hybrid CUDA + state engine knobs.
+    for name in (
+        "gpu_template_pool_size_l4",
+        "gpu_template_pool_size_l7",
+        "gpu_ring_capacity",
+        "gpu_pinned_max_mb",
+        "state_table_size",
+        "state_lock_count",
+        "state_timeout_sec",
+        "state_sweep_interval_ms",
+    ):
+        value = int(getattr(args, name, 0) or 0)
+        if value <= 0:
+            parser.error(f"Hata: --{name.replace('_', '-')} pozitif bir tamsayı olmalıdır.")
+
+    table_size = int(getattr(args, "state_table_size", 65536) or 65536)
+    lock_count = int(getattr(args, "state_lock_count", 256) or 256)
+    if table_size % lock_count != 0:
+        parser.error("Hata: --state-table-size değeri --state-lock-count değerine tam bölünmelidir.")
 
 def build_parser() -> argparse.ArgumentParser:
     """
@@ -415,6 +471,54 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evasion-techniques", type=str, nargs='+', choices=['case', 'url', 'comment'], help="DEPRECATED (no-op): kaldırılacak")
     parser.add_argument("--compute-backend", type=str, default="cpu", choices=["cpu", "cuda"], help="Paket oluşturma için kullanılacak işlem birimi (cpu veya cuda)")
     parser.add_argument("--stateful", action="store_true", help="Enable Stateful TCP Engine (Viper-State) for full 3-way handshake.")
+    parser.add_argument(
+        "--gpu-template-pool-size-l4",
+        type=int,
+        default=_env_int("SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4", 10),
+        help="CUDA template-pool L4 varsayılan şablon sayısı (env: SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4).",
+    )
+    parser.add_argument(
+        "--gpu-template-pool-size-l7",
+        type=int,
+        default=_env_int("SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7", 50),
+        help="CUDA template-pool L7 set varsayılan şablon sayısı (env: SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7).",
+    )
+    parser.add_argument(
+        "--gpu-ring-capacity",
+        type=int,
+        default=_env_int("SAMURAI_GPU_RING_CAPACITY", 3),
+        help="CUDA producer-consumer ring kapasitesi (env: SAMURAI_GPU_RING_CAPACITY).",
+    )
+    parser.add_argument(
+        "--gpu-pinned-max-mb",
+        type=int,
+        default=_env_int("SAMURAI_GPU_PINNED_MAX_MB", 512),
+        help="Pinned host buffer pool üst sınırı MB (env: SAMURAI_GPU_PINNED_MAX_MB).",
+    )
+    parser.add_argument(
+        "--state-table-size",
+        type=int,
+        default=_env_int("SAMURAI_STATE_TABLE_SIZE", 65536),
+        help="State engine tablosu kapasitesi (env: SAMURAI_STATE_TABLE_SIZE).",
+    )
+    parser.add_argument(
+        "--state-lock-count",
+        type=int,
+        default=_env_int("SAMURAI_STATE_LOCK_COUNT", 256),
+        help="State engine lock segment sayısı (env: SAMURAI_STATE_LOCK_COUNT).",
+    )
+    parser.add_argument(
+        "--state-timeout-sec",
+        type=int,
+        default=_env_int("SAMURAI_STATE_TIMEOUT_SEC", 60),
+        help="State timeout süresi saniye (env: SAMURAI_STATE_TIMEOUT_SEC).",
+    )
+    parser.add_argument(
+        "--state-sweep-interval-ms",
+        type=int,
+        default=_env_int("SAMURAI_STATE_SWEEP_INTERVAL_MS", 1000),
+        help="State cleanup sweep periyodu ms (env: SAMURAI_STATE_SWEEP_INTERVAL_MS).",
+    )
 
     pcap_group = parser.add_argument_group("GPU PCAP Generator (Test)")
     pcap_group.add_argument(
@@ -813,6 +917,7 @@ def main(argv=None):
     apply_profile(args)
     _resolve_profile_args(parser, args, argv)
     _validate_pacing_args(parser, args)
+    _validate_hybrid_cuda_args(parser, args)
 
     global CONNECTION_POOL
     try:
@@ -838,6 +943,14 @@ def main(argv=None):
         os.environ["SAMURAI_LOSS_REPORT_OUT"] = loss_report_out
     else:
         os.environ.pop("SAMURAI_LOSS_REPORT_OUT", None)
+    os.environ["SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4"] = str(int(getattr(args, "gpu_template_pool_size_l4", 10) or 10))
+    os.environ["SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7"] = str(int(getattr(args, "gpu_template_pool_size_l7", 50) or 50))
+    os.environ["SAMURAI_GPU_RING_CAPACITY"] = str(int(getattr(args, "gpu_ring_capacity", 3) or 3))
+    os.environ["SAMURAI_GPU_PINNED_MAX_MB"] = str(int(getattr(args, "gpu_pinned_max_mb", 512) or 512))
+    os.environ["SAMURAI_STATE_TABLE_SIZE"] = str(int(getattr(args, "state_table_size", 65536) or 65536))
+    os.environ["SAMURAI_STATE_LOCK_COUNT"] = str(int(getattr(args, "state_lock_count", 256) or 256))
+    os.environ["SAMURAI_STATE_TIMEOUT_SEC"] = str(int(getattr(args, "state_timeout_sec", 60) or 60))
+    os.environ["SAMURAI_STATE_SWEEP_INTERVAL_MS"] = str(int(getattr(args, "state_sweep_interval_ms", 1000) or 1000))
 
     # Live mode reporting is supported as well (aggregated worker events).
 
@@ -1179,18 +1292,22 @@ def main(argv=None):
     )
     logging.info("Ana süreç başlatıldı.")
     
-    # Check for root privileges only for vectors that ACTUALLY need raw sockets.
-    # HTTP/HTTP2/WebSocket/QUIC use userspace sockets and do NOT require root.
-    _RAW_SOCKET_VECTORS = {
+    # Check for root privileges based on the actual send path.
+    _CPU_RAW_SOCKET_VECTORS = {
         "basic", "dns", "anomaly",
         "ntp-amp", "ssdp-amp", "dns-amp", "memcached-amp", "ldap-amp",
         "pcap-replay",
-        "slowloris", "slow-post", "slow-read",
     }
-    needs_root = args.attack_vector in _RAW_SOCKET_VECTORS
+    needs_root = (
+        (args.attack_vector in _CPU_RAW_SOCKET_VECTORS)
+        or _is_cuda_raw_vector(args)
+        or bool(getattr(args, "use_so_txtime", False))
+    )
     if needs_root and not is_admin():
         utils.log_critical("Hata: Bu saldırı vektörü raw socket gerektirdiği için ROOT (sudo) yetkisi gereklidir.")
-        utils.log_info(f"Vektör: {args.attack_vector}")
+        utils.log_info(
+            f"Vektör: {args.attack_vector} (backend={args.compute_backend}, so_txtime={int(bool(args.use_so_txtime))})"
+        )
         utils.log_info("Lütfen aracı 'sudo' ile çalıştırın veya 'CAP_NET_RAW' yetkisini verin.")
         sys.exit(1)
 

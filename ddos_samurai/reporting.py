@@ -545,6 +545,11 @@ def build_live_attack_report(
     gpu_template_h2d_copy_bytes_total = 0
     gpu_rng_state_alloc_count_total = 0
     gpu_rng_state_reuse_count_total = 0
+    gpu_ring_depth_peak_max = 0
+    gpu_ring_block_wait_ns_total = 0
+    state_active_entries_max = 0
+    state_timeout_evictions_total = 0
+    state_overwrites_total = 0
     backlog_peak_max = 0
     sender_paths_used: Dict[str, int] = {}
     by_vector: Dict[str, Dict[str, int]] = {}
@@ -720,6 +725,21 @@ def build_live_attack_report(
         gpu_rng_state_reuse_count_total += int(
             ev.get("gpu_rng_state_reuse_count", st.get("gpu_rng_state_reuse_count", 0)) or 0
         )
+        _ring_depth = int(ev.get("gpu_ring_depth_peak", st.get("gpu_ring_depth_peak", 0)) or 0)
+        if _ring_depth > gpu_ring_depth_peak_max:
+            gpu_ring_depth_peak_max = _ring_depth
+        gpu_ring_block_wait_ns_total += int(
+            ev.get("gpu_ring_block_wait_ns", st.get("gpu_ring_block_wait_ns", 0)) or 0
+        )
+        _state_active = int(ev.get("state_active_entries", st.get("state_active_entries", 0)) or 0)
+        if _state_active > state_active_entries_max:
+            state_active_entries_max = _state_active
+        state_timeout_evictions_total += int(
+            ev.get("state_timeout_evictions", st.get("state_timeout_evictions", 0)) or 0
+        )
+        state_overwrites_total += int(
+            ev.get("state_overwrites", st.get("state_overwrites", 0)) or 0
+        )
         _bp = int(ev.get("queue_backlog_peak", 0) or 0)
         if _bp > backlog_peak_max:
             backlog_peak_max = _bp
@@ -866,6 +886,11 @@ def build_live_attack_report(
             "gpu_template_h2d_copy_bytes": int(gpu_template_h2d_copy_bytes_total),
             "gpu_rng_state_alloc_count": int(gpu_rng_state_alloc_count_total),
             "gpu_rng_state_reuse_count": int(gpu_rng_state_reuse_count_total),
+            "gpu_ring_depth_peak": int(gpu_ring_depth_peak_max),
+            "gpu_ring_block_wait_ns": int(gpu_ring_block_wait_ns_total),
+            "state_active_entries": int(state_active_entries_max),
+            "state_timeout_evictions": int(state_timeout_evictions_total),
+            "state_overwrites": int(state_overwrites_total),
             "queue_backlog_peak": int(backlog_peak_max),
             "by_vector": by_vector,
             "by_backend": by_backend,
