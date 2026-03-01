@@ -129,11 +129,11 @@ def _recompute_loss_metrics(out: dict) -> dict:
     flush_ebusy = max(0, int(d.get("txring_flush_ebusy_count", 0) or 0))
     flush_other_errno = max(0, int(d.get("txring_flush_other_errno_count", 0) or 0))
 
-    # TX_RING drop counters are kernel-facing and may diverge from app attempted.
-    # Bound them before mapping to an attempted-based loss estimate.
+    # TX_RING counters are kept as diagnostics, but not as direct wire-loss
+    # evidence. PACKET_STATISTICS may include traffic unrelated to this sender.
     tx_drops_bounded = min(tx_drops, tx_packets) if tx_packets > 0 else tx_drops
     raw_loss_packets = max(existing_raw, tx_drops, host_tx_dropped)
-    est_loss_packets = min(attempted, max(existing_est, tx_drops_bounded, host_tx_dropped))
+    est_loss_packets = min(attempted, max(existing_est, host_tx_dropped))
 
     d["wire_loss_raw_packets"] = int(raw_loss_packets)
     d["wire_loss_raw_pct"] = float((100.0 * raw_loss_packets) / max(1, attempted))
@@ -155,6 +155,99 @@ def _update_live(val, inc):
                 val.value += int(inc)
         except Exception:
             pass
+
+
+def _env_flag(name: str, default: str = "1") -> bool:
+    raw = str(os.environ.get(name, default) or default).strip().lower()
+    return raw not in {"0", "false", "no", "off", "disabled"}
+
+
+def _estimate_paced_packets(
+    pacing_config,
+    elapsed_s: float,
+    *,
+    progress_budget: int,
+) -> int:
+    if pacing_config is None or progress_budget <= 0:
+        return 0
+
+    mode = int(getattr(pacing_config, "pacing_mode", 0) or 0)
+    est = 0.0
+
+    if mode == 1:  # RPS
+        rps = float(getattr(pacing_config, "target_rps", 0.0) or 0.0)
+        if rps > 0.0:
+            est = elapsed_s * rps
+    elif mode == 2:  # IPG
+        ipg_ns = int(getattr(pacing_config, "ipg_ns", 0) or 0)
+        if ipg_ns > 0:
+            est = elapsed_s * (1e9 / float(ipg_ns))
+    elif mode == 3:  # BURST
+        burst_size = max(1, int(getattr(pacing_config, "burst_size", 1) or 1))
+        burst_gap_ns = max(0, int(getattr(pacing_config, "burst_gap_ns", 0) or 0))
+        if burst_gap_ns <= 0:
+            est = float(progress_budget)
+        else:
+            est = elapsed_s * (1e9 / float(burst_gap_ns)) * float(burst_size)
+
+    out = int(est)
+    if out < 0:
+        return 0
+    if out > progress_budget:
+        return int(progress_budget)
+    return out
+
+
+class _PacedSendRuntimeError(RuntimeError):
+    def __init__(self, cause: Exception, progress_emitted: int):
+        super().__init__(str(cause))
+        self.cause = cause
+        self.progress_emitted = int(progress_emitted)
+
+
+async def _run_paced_send_with_live_progress(
+    send_callable,
+    *,
+    pacing_config,
+    progress_budget: int,
+    live_progress=None,
+):
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(None, send_callable)
+
+    budget = max(0, int(progress_budget))
+    if budget <= 0 or live_progress is None or not _env_flag("SAMURAI_PACING_PROGRESS_EST", "1"):
+        return int(await fut or 0), 0
+
+    try:
+        refresh_ms = int(os.environ.get("SAMURAI_PACING_PROGRESS_REFRESH_MS", "200") or 200)
+    except Exception:
+        refresh_ms = 200
+    refresh_s = max(0.05, float(refresh_ms) / 1000.0)
+
+    start = time.monotonic()
+    emitted = 0
+    soft_cap = max(0, budget - 1)
+
+    while not fut.done():
+        await asyncio.sleep(refresh_s)
+        target = _estimate_paced_packets(
+            pacing_config,
+            elapsed_s=max(0.0, time.monotonic() - start),
+            progress_budget=budget,
+        )
+        if target > soft_cap:
+            target = soft_cap
+        delta = int(target) - int(emitted)
+        if delta > 0:
+            _update_live(live_progress, delta)
+            emitted += delta
+
+    try:
+        sent = int(fut.result() or 0)
+    except Exception as exc:
+        raise _PacedSendRuntimeError(exc, emitted) from exc
+    return sent, emitted
 
 
 def _loss_telemetry_enabled() -> bool:
@@ -1301,6 +1394,7 @@ async def paced_raw_socket_sender(
     buffer_copy_bytes = int(normalize_meta.get("buffer_copy_bytes", 0) or 0)
     loss_iface_hint = _resolve_loss_iface(None)
     loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
+    progress_reported = 0
 
     log_info(
         f"[Pacing] C engine: mode={pacing_config.pacing_mode.name}, "
@@ -1324,17 +1418,25 @@ async def paced_raw_socket_sender(
                         reset_stats()
                 except Exception:
                     pass
-                sent = await loop.run_in_executor(
-                    None,
-                    lambda: paced_send_l2(
-                        iface,
-                        packets_buffer,
-                        packet_size,
-                        count,
-                        gateway_mac,
-                        config=pacing_config,
-                    ),
-                )
+                progress_budget = max(0, int(count) - int(progress_reported))
+                try:
+                    sent, progress_emitted = await _run_paced_send_with_live_progress(
+                        lambda: paced_send_l2(
+                            iface,
+                            packets_buffer,
+                            packet_size,
+                            count,
+                            gateway_mac,
+                            config=pacing_config,
+                        ),
+                        pacing_config=pacing_config,
+                        progress_budget=progress_budget,
+                        live_progress=live_progress,
+                    )
+                    progress_reported += int(progress_emitted)
+                except _PacedSendRuntimeError as exc:
+                    progress_reported += int(exc.progress_emitted)
+                    raise exc.cause
                 # Log pacing statistics
                 stats = get_stats()
                 if stats:
@@ -1345,7 +1447,9 @@ async def paced_raw_socket_sender(
                     if verbose:
                         log_info(f"\n{format_stats(stats)}")
                 cleanup_l2()
-                _update_live(live_progress, count)
+                progress_tail = max(0, int(count) - int(progress_reported))
+                _update_live(live_progress, progress_tail)
+                progress_reported += int(progress_tail)
                 _update_live(live_sent, int(sent or 0))
                 _update_live(live_errors, max(0, count - int(sent or 0)))
                 
@@ -1366,6 +1470,10 @@ async def paced_raw_socket_sender(
                     out, loss_before_snapshot, preferred_iface=loss_iface_hint
                 )
         except Exception as e:
+            try:
+                cleanup_l2()
+            except Exception:
+                pass
             if verbose:
                 log_error(f"[Pacing] L2 paced send failed, falling back to L3: {e}")
 
@@ -1378,20 +1486,30 @@ async def paced_raw_socket_sender(
                 reset_stats()
         except Exception:
             pass
-        sent = await loop.run_in_executor(
-            None,
-            lambda: paced_send(
-                packets_buffer,
-                target_ip,
-                target_port,
-                packet_size,
-                count,
-                config=pacing_config,
-            ),
-        )
+        progress_budget = max(0, int(count) - int(progress_reported))
+        try:
+            sent, progress_emitted = await _run_paced_send_with_live_progress(
+                lambda: paced_send(
+                    packets_buffer,
+                    target_ip,
+                    target_port,
+                    packet_size,
+                    count,
+                    config=pacing_config,
+                ),
+                pacing_config=pacing_config,
+                progress_budget=progress_budget,
+                live_progress=live_progress,
+            )
+            progress_reported += int(progress_emitted)
+        except _PacedSendRuntimeError as exc:
+            progress_reported += int(exc.progress_emitted)
+            raise exc.cause
         # Log pacing statistics
         stats = get_stats()
-        _update_live(live_progress, count)
+        progress_tail = max(0, int(count) - int(progress_reported))
+        _update_live(live_progress, progress_tail)
+        progress_reported += int(progress_tail)
         _update_live(live_sent, int(sent or 0))
         _update_live(live_errors, max(0, count - int(sent or 0)))
 
@@ -1411,16 +1529,24 @@ async def paced_raw_socket_sender(
         return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
     except PermissionError:
         log_error("[Pacing] Raw socket requires root. Falling back to unpaced.")
-        return await raw_socket_sender(
+        fallback_live_progress = None if progress_reported > 0 else live_progress
+        out = await raw_socket_sender(
             packets_buffer, target_ip, target_port, count, verbose,
-            live_sent=live_sent, live_errors=live_errors, live_progress=live_progress
+            live_sent=live_sent, live_errors=live_errors, live_progress=fallback_live_progress
         )
+        if progress_reported > 0:
+            _update_live(live_progress, max(0, int(count) - int(progress_reported)))
+        return out
     except Exception as e:
         log_error(f"[Pacing] L3 paced send failed: {e}. Falling back to unpaced.")
-        return await raw_socket_sender(
+        fallback_live_progress = None if progress_reported > 0 else live_progress
+        out = await raw_socket_sender(
             packets_buffer, target_ip, target_port, count, verbose,
-            live_sent=live_sent, live_errors=live_errors, live_progress=live_progress
+            live_sent=live_sent, live_errors=live_errors, live_progress=fallback_live_progress
         )
+        if progress_reported > 0:
+            _update_live(live_progress, max(0, int(count) - int(progress_reported)))
+        return out
 
 async def http2_sender(target_ip, target_port, count, concurrency, http_path, http_method, verbose, scheme="https", cookies=None, user_agent=None, ssl_context=None, h2_profile_name=None, live_sent=None, live_errors=None, live_progress=None):
     """

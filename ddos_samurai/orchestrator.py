@@ -116,9 +116,11 @@ def _recompute_loss_metrics(d: dict) -> dict:
     flush_ebusy = max(0, int(out.get("txring_flush_ebusy_count", 0) or 0))
     flush_other_errno = max(0, int(out.get("txring_flush_other_errno_count", 0) or 0))
 
+    # TX_RING drop counters are kept for diagnostics only.
+    # Do not directly map them to wire-loss estimation.
     tx_drops_bounded = min(tx_drops, tx_packets) if tx_packets > 0 else tx_drops
     raw_loss_packets = max(existing_raw, tx_drops, host_tx_dropped)
-    est_loss_packets = min(attempted, max(existing_est, tx_drops_bounded, host_tx_dropped))
+    est_loss_packets = min(attempted, max(existing_est, host_tx_dropped))
 
     out["wire_loss_raw_packets"] = int(raw_loss_packets)
     out["wire_loss_raw_pct"] = float((100.0 * raw_loss_packets) / max(1, attempted))
@@ -240,6 +242,17 @@ def _build_pacing_config(args: dict) -> PacingConfig:
     if mode == PacingMode.NONE and args.get("rps", 0) > 0:
         mode = PacingMode.RPS
 
+    pin_cpu = int(args.get("pin_cpu", -1) or -1)
+    if pin_cpu < 0 and str(os.environ.get("SAMURAI_PACING_AUTO_PIN", "1") or "1").strip().lower() not in {
+        "0", "false", "no", "off", "disabled"
+    }:
+        try:
+            aff = sorted(int(x) for x in os.sched_getaffinity(0))
+            if aff:
+                pin_cpu = int(aff[0])
+        except Exception:
+            pin_cpu = -1
+
     return PacingConfig(
         pacing_mode   = mode,
         target_rps    = float(args.get("rps", 0)),
@@ -248,7 +261,7 @@ def _build_pacing_config(args: dict) -> PacingConfig:
         burst_gap_ns  = int(args.get("burst_gap", 0)),
         jitter_model  = _JITTER_MODEL_MAP.get(args.get("jitter_model", "none"), JitterModel.NONE),
         jitter_pct    = float(args.get("jitter_pct", 0.0)),
-        pin_cpu       = int(args.get("pin_cpu", -1)),
+        pin_cpu       = int(pin_cpu),
         use_so_txtime = bool(args.get("use_so_txtime", False)),
     )
 

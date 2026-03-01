@@ -778,11 +778,12 @@ def build_live_attack_report(
         int(txring_tp_drops_total),
         int(txring_tp_packets_total),
     ) if int(txring_tp_packets_total) > 0 else int(txring_tp_drops_total)
+    # Keep TX_RING tp_drops as diagnostics; do not fold directly into wire-loss.
     wire_loss_raw_packets_total = int(max(0, wire_loss_raw_packets_total, txring_tp_drops_total, host_tx_dropped_delta_total))
     wire_loss_est_packets_total = int(
         min(
             max(0, attempted_total),
-            max(0, int(wire_loss_est_packets_total), int(txring_tp_drops_bounded_total), int(host_tx_dropped_delta_total)),
+            max(0, int(wire_loss_est_packets_total), int(host_tx_dropped_delta_total)),
         )
     )
     wire_loss_est_pct = (float(wire_loss_est_packets_total) * 100.0 / float(max(1, attempted_total)))
