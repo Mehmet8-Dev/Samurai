@@ -190,8 +190,10 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["txring_flush_last_errno_name"], "ENOBUFS")
         self.assertEqual(rr.results["txring_tp_packets"], 17)
         self.assertEqual(rr.results["txring_tp_drops"], 1)
+        self.assertEqual(rr.results["txring_kernel_raw_tp_drops"], 1)
         self.assertEqual(rr.results["txring_packet_version"], 1)
         self.assertEqual(rr.results["txring_packet_version_name"], "TPACKET_V2")
+        self.assertAlmostEqual(rr.results["txring_hold_block_pressure_pct"], 0.0, places=4)
         self.assertEqual(rr.results["host_tx_packets_delta"], 19)
         self.assertEqual(rr.results["host_tx_dropped_delta"], 1)
         self.assertEqual(rr.results["softnet_dropped_delta"], 2)
@@ -279,3 +281,43 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["wire_loss_est_packets"], 0)
         self.assertEqual(rr.results["wire_loss_status"], "ok")
         self.assertEqual(rr.results["wire_loss_raw_packets"], 400)
+        self.assertEqual(rr.results["txring_kernel_raw_tp_drops"], 400)
+
+    def test_live_attack_report_computes_hold_block_pressure(self):
+        from ddos_samurai import reporting
+
+        events = [
+            {
+                "status": "ok",
+                "attack_vector": "basic",
+                "compute_backend": "cuda",
+                "sender_path": "PACED_L2",
+                "txring_tp_packets": 10,
+                "txring_tp_drops": 0,
+                "txring_tp_freeze_q_cnt": 1,
+                "txring_poll_count": 2,
+                "txring_frame_wait_ns": 200_000_000,
+                "stats": {
+                    "attempted": 10,
+                    "sent": 10,
+                    "errors": 0,
+                    "bytes_sent_est": 640,
+                },
+            }
+        ]
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1"},
+            worker_events=events,
+            duration_s=1.0,
+            progress_total=10,
+            total_count=10,
+            metrics={},
+            warnings=[],
+        )
+
+        # frame_wait=20% + poll=20% + freeze=10% => 50%
+        self.assertAlmostEqual(rr.results["txring_hold_block_pressure_pct"], 50.0, places=4)
+        self.assertAlmostEqual(rr.results["txring_hold_block_frame_wait_ratio_pct"], 20.0, places=4)
+        self.assertAlmostEqual(rr.results["txring_hold_block_poll_ratio_pct"], 20.0, places=4)
+        self.assertAlmostEqual(rr.results["txring_hold_block_freeze_ratio_pct"], 10.0, places=4)
