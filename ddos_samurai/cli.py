@@ -1618,7 +1618,22 @@ def main(argv=None):
                     "flush_mode": str(rr.results.get("flush_mode", "unknown") or "unknown"),
                     "txring_tp_packets": int(rr.results.get("txring_tp_packets", 0) or 0),
                     "txring_tp_drops": int(rr.results.get("txring_tp_drops", 0) or 0),
+                    "txring_kernel_raw_tp_drops": int(
+                        rr.results.get("txring_kernel_raw_tp_drops", rr.results.get("txring_tp_drops", 0)) or 0
+                    ),
                     "txring_tp_freeze_q_cnt": int(rr.results.get("txring_tp_freeze_q_cnt", 0) or 0),
+                    "txring_hold_block_pressure_pct": float(
+                        rr.results.get("txring_hold_block_pressure_pct", 0.0) or 0.0
+                    ),
+                    "txring_hold_block_frame_wait_ratio_pct": float(
+                        rr.results.get("txring_hold_block_frame_wait_ratio_pct", 0.0) or 0.0
+                    ),
+                    "txring_hold_block_poll_ratio_pct": float(
+                        rr.results.get("txring_hold_block_poll_ratio_pct", 0.0) or 0.0
+                    ),
+                    "txring_hold_block_freeze_ratio_pct": float(
+                        rr.results.get("txring_hold_block_freeze_ratio_pct", 0.0) or 0.0
+                    ),
                     "txring_packet_version": int(rr.results.get("txring_packet_version", 0) or 0),
                     "txring_packet_version_name": str(
                         rr.results.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"

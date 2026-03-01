@@ -796,6 +796,15 @@ def build_live_attack_report(
     txring_flush_other_errno_ratio_pct = (
         float(txring_flush_other_errno_count_total) * 100.0 / float(max(1, txring_flush_call_count_total))
     )
+    frame_wait_ratio_pct = (float(txring_frame_wait_ns_total) * 100.0 / float(max(1.0, float(duration_s) * 1e9)))
+    poll_ratio_pct = (float(txring_poll_count_total) * 100.0 / float(max(1, sent_total)))
+    freeze_ratio_pct = (
+        float(txring_tp_freeze_q_cnt_total) * 100.0 / float(max(1, txring_tp_packets_total))
+    )
+    txring_hold_block_pressure_pct = min(
+        100.0,
+        max(0.0, frame_wait_ratio_pct + poll_ratio_pct + freeze_ratio_pct),
+    )
     wire_loss_estimation_capped = int(
         (wire_loss_raw_packets_total > wire_loss_est_packets_total) or (wire_loss_estimation_capped_total > 0)
     )
@@ -862,7 +871,12 @@ def build_live_attack_report(
             "flush_mode": str(flush_mode),
             "txring_tp_packets": int(txring_tp_packets_total),
             "txring_tp_drops": int(txring_tp_drops_total),
+            "txring_kernel_raw_tp_drops": int(txring_tp_drops_total),
             "txring_tp_freeze_q_cnt": int(txring_tp_freeze_q_cnt_total),
+            "txring_hold_block_pressure_pct": round(float(txring_hold_block_pressure_pct), 4),
+            "txring_hold_block_frame_wait_ratio_pct": round(float(frame_wait_ratio_pct), 4),
+            "txring_hold_block_poll_ratio_pct": round(float(poll_ratio_pct), 4),
+            "txring_hold_block_freeze_ratio_pct": round(float(freeze_ratio_pct), 4),
             "txring_packet_version": int(txring_packet_version),
             "txring_packet_version_name": str(txring_packet_version_name),
             "host_tx_packets_delta": int(host_tx_packets_delta_total),
