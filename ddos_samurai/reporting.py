@@ -540,6 +540,7 @@ def build_live_attack_report(
     softnet_time_squeeze_delta_total = 0
     wire_loss_est_packets_total = 0
     wire_loss_raw_packets_total = 0
+    wire_loss_raw_uncapped_packets_total = 0
     wire_loss_estimation_capped_total = 0
     gpu_template_h2d_copy_count_total = 0
     gpu_template_h2d_copy_bytes_total = 0
@@ -707,8 +708,19 @@ def build_live_attack_report(
         wire_loss_est_packets_total += int(
             ev.get("wire_loss_est_packets", st.get("wire_loss_est_packets", 0)) or 0
         )
+        _raw_uncapped_ev = int(
+            ev.get(
+                "wire_loss_raw_uncapped_packets",
+                st.get(
+                    "wire_loss_raw_uncapped_packets",
+                    ev.get("wire_loss_raw_packets", st.get("wire_loss_raw_packets", 0)),
+                ),
+            )
+            or 0
+        )
+        wire_loss_raw_uncapped_packets_total += _raw_uncapped_ev
         wire_loss_raw_packets_total += int(
-            ev.get("wire_loss_raw_packets", st.get("wire_loss_raw_packets", 0)) or 0
+            ev.get("wire_loss_raw_packets", st.get("wire_loss_raw_packets", _raw_uncapped_ev)) or 0
         )
         wire_loss_estimation_capped_total += int(
             ev.get("wire_loss_estimation_capped", st.get("wire_loss_estimation_capped", 0)) or 0
@@ -778,8 +790,17 @@ def build_live_attack_report(
         int(txring_tp_drops_total),
         int(txring_tp_packets_total),
     ) if int(txring_tp_packets_total) > 0 else int(txring_tp_drops_total)
-    # Keep TX_RING tp_drops as diagnostics; do not fold directly into wire-loss.
-    wire_loss_raw_packets_total = int(max(0, wire_loss_raw_packets_total, txring_tp_drops_total, host_tx_dropped_delta_total))
+    # Keep TX_RING tp_drops as diagnostics; report raw counters without capping.
+    wire_loss_raw_uncapped_packets_total = int(
+        max(
+            0,
+            wire_loss_raw_uncapped_packets_total,
+            wire_loss_raw_packets_total,
+            txring_tp_drops_total,
+            host_tx_dropped_delta_total,
+        )
+    )
+    wire_loss_raw_packets_total = int(wire_loss_raw_uncapped_packets_total)
     wire_loss_est_packets_total = int(
         min(
             max(0, attempted_total),
@@ -788,6 +809,11 @@ def build_live_attack_report(
     )
     wire_loss_est_pct = (float(wire_loss_est_packets_total) * 100.0 / float(max(1, attempted_total)))
     wire_loss_raw_pct = (float(wire_loss_raw_packets_total) * 100.0 / float(max(1, attempted_total)))
+    wire_loss_raw_over_attempted_packets = int(max(0, wire_loss_raw_packets_total - attempted_total))
+    wire_loss_raw_over_attempted_pct = (
+        float(wire_loss_raw_over_attempted_packets) * 100.0 / float(max(1, attempted_total))
+    )
+    wire_loss_raw_gt_attempted = int(wire_loss_raw_over_attempted_packets > 0)
     txring_drop_ratio_pct = (float(txring_tp_drops_bounded_total) * 100.0 / float(max(1, txring_tp_packets_total)))
     txring_flush_error_ratio_pct = (float(txring_flush_error_count_total) * 100.0 / float(max(1, txring_flush_call_count_total)))
     txring_flush_eagain_ratio_pct = (float(txring_flush_eagain_count_total) * 100.0 / float(max(1, txring_flush_call_count_total)))
@@ -812,9 +838,12 @@ def build_live_attack_report(
         loss_fail_pct = float(os.environ.get("SAMURAI_LOSS_FAIL_PCT", "5") or 5.0)
     except Exception:
         loss_fail_pct = 5.0
-    if wire_loss_est_pct > loss_fail_pct:
+    # Loss status should reflect the stricter signal between conservative
+    # estimate and raw diagnostic counters.
+    wire_loss_policy_pct = max(float(wire_loss_est_pct), float(wire_loss_raw_pct))
+    if wire_loss_policy_pct > loss_fail_pct:
         wire_loss_status = "fail"
-    elif wire_loss_est_pct > 0.0:
+    elif wire_loss_policy_pct > 0.0:
         wire_loss_status = "warn"
     else:
         wire_loss_status = "ok"
@@ -887,7 +916,12 @@ def build_live_attack_report(
             "wire_loss_est_packets": int(wire_loss_est_packets_total),
             "wire_loss_est_pct": round(float(wire_loss_est_pct), 4),
             "wire_loss_raw_packets": int(wire_loss_raw_packets_total),
+            "wire_loss_raw_uncapped_packets": int(wire_loss_raw_uncapped_packets_total),
             "wire_loss_raw_pct": round(float(wire_loss_raw_pct), 4),
+            "wire_loss_raw_pct_of_attempted": round(float(wire_loss_raw_pct), 4),
+            "wire_loss_raw_over_attempted_packets": int(wire_loss_raw_over_attempted_packets),
+            "wire_loss_raw_over_attempted_pct": round(float(wire_loss_raw_over_attempted_pct), 4),
+            "wire_loss_raw_gt_attempted": int(wire_loss_raw_gt_attempted),
             "wire_loss_estimation_capped": int(wire_loss_estimation_capped),
             "wire_loss_fail_pct": float(loss_fail_pct),
             "wire_loss_status": wire_loss_status,

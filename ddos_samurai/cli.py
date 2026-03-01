@@ -1587,7 +1587,22 @@ def main(argv=None):
                     "wire_loss_est_packets": int(rr.results.get("wire_loss_est_packets", 0) or 0),
                     "wire_loss_est_pct": float(rr.results.get("wire_loss_est_pct", 0.0) or 0.0),
                     "wire_loss_raw_packets": int(rr.results.get("wire_loss_raw_packets", 0) or 0),
+                    "wire_loss_raw_uncapped_packets": int(
+                        rr.results.get("wire_loss_raw_uncapped_packets", rr.results.get("wire_loss_raw_packets", 0))
+                        or 0
+                    ),
                     "wire_loss_raw_pct": float(rr.results.get("wire_loss_raw_pct", 0.0) or 0.0),
+                    "wire_loss_raw_pct_of_attempted": float(
+                        rr.results.get("wire_loss_raw_pct_of_attempted", rr.results.get("wire_loss_raw_pct", 0.0))
+                        or 0.0
+                    ),
+                    "wire_loss_raw_over_attempted_packets": int(
+                        rr.results.get("wire_loss_raw_over_attempted_packets", 0) or 0
+                    ),
+                    "wire_loss_raw_over_attempted_pct": float(
+                        rr.results.get("wire_loss_raw_over_attempted_pct", 0.0) or 0.0
+                    ),
+                    "wire_loss_raw_gt_attempted": int(rr.results.get("wire_loss_raw_gt_attempted", 0) or 0),
                     "wire_loss_estimation_capped": int(rr.results.get("wire_loss_estimation_capped", 0) or 0),
                     "wire_loss_status": str(rr.results.get("wire_loss_status", "ok")),
                     "txring_flush_call_count": int(rr.results.get("txring_flush_call_count", 0) or 0),

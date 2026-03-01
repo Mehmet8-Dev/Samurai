@@ -80,7 +80,12 @@ def _empty_stats() -> dict:
         "wire_loss_est_packets": 0,
         "wire_loss_est_pct": 0.0,
         "wire_loss_raw_packets": 0,
+        "wire_loss_raw_uncapped_packets": 0,
         "wire_loss_raw_pct": 0.0,
+        "wire_loss_raw_pct_of_attempted": 0.0,
+        "wire_loss_raw_over_attempted_packets": 0,
+        "wire_loss_raw_over_attempted_pct": 0.0,
+        "wire_loss_raw_gt_attempted": 0,
         "wire_loss_estimation_capped": 0,
         "txring_drop_ratio_pct": 0.0,
         "txring_flush_error_ratio_pct": 0.0,
@@ -108,7 +113,11 @@ def _recompute_loss_metrics(d: dict) -> dict:
     tx_drops = max(0, int(out.get("txring_tp_drops", 0) or 0))
     host_tx_dropped = max(0, int(out.get("host_tx_dropped_delta", 0) or 0))
     existing_est = max(0, int(out.get("wire_loss_est_packets", 0) or 0))
-    existing_raw = max(0, int(out.get("wire_loss_raw_packets", 0) or 0))
+    existing_raw = max(
+        0,
+        int(out.get("wire_loss_raw_packets", 0) or 0),
+        int(out.get("wire_loss_raw_uncapped_packets", 0) or 0),
+    )
     flush_calls = max(0, int(out.get("txring_flush_call_count", 0) or 0))
     flush_errors = max(0, int(out.get("txring_flush_error_count", 0) or 0))
     flush_eagain = max(0, int(out.get("txring_flush_eagain_count", 0) or 0))
@@ -120,10 +129,17 @@ def _recompute_loss_metrics(d: dict) -> dict:
     # Do not directly map them to wire-loss estimation.
     tx_drops_bounded = min(tx_drops, tx_packets) if tx_packets > 0 else tx_drops
     raw_loss_packets = max(existing_raw, tx_drops, host_tx_dropped)
+    raw_over_attempted = max(0, raw_loss_packets - attempted)
+    raw_over_attempted_pct = float((100.0 * raw_over_attempted) / max(1, attempted))
     est_loss_packets = min(attempted, max(existing_est, host_tx_dropped))
 
     out["wire_loss_raw_packets"] = int(raw_loss_packets)
+    out["wire_loss_raw_uncapped_packets"] = int(raw_loss_packets)
     out["wire_loss_raw_pct"] = float((100.0 * raw_loss_packets) / max(1, attempted))
+    out["wire_loss_raw_pct_of_attempted"] = float(out["wire_loss_raw_pct"])
+    out["wire_loss_raw_over_attempted_packets"] = int(raw_over_attempted)
+    out["wire_loss_raw_over_attempted_pct"] = float(raw_over_attempted_pct)
+    out["wire_loss_raw_gt_attempted"] = int(raw_over_attempted > 0)
     out["wire_loss_est_packets"] = int(est_loss_packets)
     out["wire_loss_est_pct"] = float((100.0 * est_loss_packets) / max(1, attempted))
     out["wire_loss_estimation_capped"] = int(raw_loss_packets > est_loss_packets)
@@ -209,7 +225,11 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["softnet_dropped_delta"] = int(acc.get("softnet_dropped_delta", 0)) + int(item.get("softnet_dropped_delta", 0) or 0)
     acc["softnet_time_squeeze_delta"] = int(acc.get("softnet_time_squeeze_delta", 0)) + int(item.get("softnet_time_squeeze_delta", 0) or 0)
     acc["wire_loss_est_packets"] = int(acc.get("wire_loss_est_packets", 0)) + int(item.get("wire_loss_est_packets", 0) or 0)
-    acc["wire_loss_raw_packets"] = int(acc.get("wire_loss_raw_packets", 0)) + int(item.get("wire_loss_raw_packets", 0) or 0)
+    _raw_uncapped = int(item.get("wire_loss_raw_uncapped_packets", item.get("wire_loss_raw_packets", 0)) or 0)
+    acc["wire_loss_raw_packets"] = int(acc.get("wire_loss_raw_packets", 0)) + int(
+        item.get("wire_loss_raw_packets", _raw_uncapped) or 0
+    )
+    acc["wire_loss_raw_uncapped_packets"] = int(acc.get("wire_loss_raw_uncapped_packets", 0)) + _raw_uncapped
     acc["gpu_template_h2d_copy_count"] = int(acc.get("gpu_template_h2d_copy_count", 0)) + int(item.get("gpu_template_h2d_copy_count", 0) or 0)
     acc["gpu_template_h2d_copy_bytes"] = int(acc.get("gpu_template_h2d_copy_bytes", 0)) + int(item.get("gpu_template_h2d_copy_bytes", 0) or 0)
     acc["gpu_rng_state_alloc_count"] = int(acc.get("gpu_rng_state_alloc_count", 0)) + int(item.get("gpu_rng_state_alloc_count", 0) or 0)
@@ -1770,7 +1790,20 @@ async def worker_process(
                 _wire_loss_est_packets = int(worker_stats.get("wire_loss_est_packets", 0) or 0)
                 _wire_loss_est_pct = float(worker_stats.get("wire_loss_est_pct", 0.0) or 0.0)
                 _wire_loss_raw_packets = int(worker_stats.get("wire_loss_raw_packets", 0) or 0)
+                _wire_loss_raw_uncapped_packets = int(
+                    worker_stats.get("wire_loss_raw_uncapped_packets", _wire_loss_raw_packets) or 0
+                )
                 _wire_loss_raw_pct = float(worker_stats.get("wire_loss_raw_pct", 0.0) or 0.0)
+                _wire_loss_raw_pct_of_attempted = float(
+                    worker_stats.get("wire_loss_raw_pct_of_attempted", _wire_loss_raw_pct) or 0.0
+                )
+                _wire_loss_raw_over_attempted_packets = int(
+                    worker_stats.get("wire_loss_raw_over_attempted_packets", 0) or 0
+                )
+                _wire_loss_raw_over_attempted_pct = float(
+                    worker_stats.get("wire_loss_raw_over_attempted_pct", 0.0) or 0.0
+                )
+                _wire_loss_raw_gt_attempted = int(worker_stats.get("wire_loss_raw_gt_attempted", 0) or 0)
                 _wire_loss_estimation_capped = int(worker_stats.get("wire_loss_estimation_capped", 0) or 0)
                 _txring_drop_ratio_pct = float(worker_stats.get("txring_drop_ratio_pct", 0.0) or 0.0)
                 _txring_flush_error_ratio_pct = float(worker_stats.get("txring_flush_error_ratio_pct", 0.0) or 0.0)
@@ -1851,7 +1884,12 @@ async def worker_process(
                         "wire_loss_est_packets": _wire_loss_est_packets,
                         "wire_loss_est_pct": _wire_loss_est_pct,
                         "wire_loss_raw_packets": _wire_loss_raw_packets,
+                        "wire_loss_raw_uncapped_packets": _wire_loss_raw_uncapped_packets,
                         "wire_loss_raw_pct": _wire_loss_raw_pct,
+                        "wire_loss_raw_pct_of_attempted": _wire_loss_raw_pct_of_attempted,
+                        "wire_loss_raw_over_attempted_packets": _wire_loss_raw_over_attempted_packets,
+                        "wire_loss_raw_over_attempted_pct": _wire_loss_raw_over_attempted_pct,
+                        "wire_loss_raw_gt_attempted": _wire_loss_raw_gt_attempted,
                         "wire_loss_estimation_capped": _wire_loss_estimation_capped,
                         "txring_drop_ratio_pct": _txring_drop_ratio_pct,
                         "txring_flush_error_ratio_pct": _txring_flush_error_ratio_pct,
