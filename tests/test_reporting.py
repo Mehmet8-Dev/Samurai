@@ -244,3 +244,38 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["wire_loss_est_pct"], 100.0)
         self.assertEqual(rr.results["wire_loss_raw_packets"], 400)
         self.assertEqual(rr.results["wire_loss_estimation_capped"], 1)
+
+    def test_live_attack_report_keeps_tp_drops_diagnostic_only(self):
+        from ddos_samurai import reporting
+
+        events = [
+            {
+                "status": "ok",
+                "attack_vector": "basic",
+                "compute_backend": "cuda",
+                "sender_path": "PACED_L2",
+                "txring_tp_packets": 500,
+                "txring_tp_drops": 400,
+                "host_tx_dropped_delta": 0,
+                "stats": {
+                    "attempted": 100,
+                    "sent": 100,
+                    "errors": 0,
+                    "bytes_sent_est": 6400,
+                },
+            }
+        ]
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1"},
+            worker_events=events,
+            duration_s=1.0,
+            progress_total=100,
+            total_count=100,
+            metrics={},
+            warnings=[],
+        )
+
+        self.assertEqual(rr.results["wire_loss_est_packets"], 0)
+        self.assertEqual(rr.results["wire_loss_status"], "ok")
+        self.assertEqual(rr.results["wire_loss_raw_packets"], 400)

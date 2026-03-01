@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock
 from unittest.mock import patch
+import os
 
 from ddos_samurai import orchestrator
 
@@ -349,3 +350,22 @@ class TestStatsAggregateHelpers(unittest.TestCase):
         self.assertEqual(acc["txtime_errors"], 3)
         self.assertAlmostEqual(acc["actual_rps"], 2000.0)
         self.assertAlmostEqual(acc["rate_accuracy_pct"], 96.0)
+
+
+class TestPacingConfigBuilder(unittest.TestCase):
+    def test_build_pacing_config_auto_pin_from_affinity(self):
+        args = _base_args()
+        args.update({"pacing_mode": "rps", "rps": 1000.0, "pin_cpu": -1})
+
+        with patch.object(orchestrator.os, "sched_getaffinity", return_value={7}):
+            cfg = orchestrator._build_pacing_config(args)
+        self.assertEqual(int(cfg.pin_cpu), 7)
+
+    def test_build_pacing_config_auto_pin_can_be_disabled(self):
+        args = _base_args()
+        args.update({"pacing_mode": "rps", "rps": 1000.0, "pin_cpu": -1})
+
+        with patch.dict(os.environ, {"SAMURAI_PACING_AUTO_PIN": "0"}, clear=False):
+            with patch.object(orchestrator.os, "sched_getaffinity", return_value={9}):
+                cfg = orchestrator._build_pacing_config(args)
+        self.assertEqual(int(cfg.pin_cpu), -1)
