@@ -14,6 +14,28 @@ from typing import Any, Dict, List, Optional, Tuple
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+
+_REPORT_DIAGNOSTIC_RESULT_PREFIXES: Tuple[str, ...] = ("txring_",)
+_REPORT_DIAGNOSTIC_RESULT_KEYS = {"flush_mode"}
+
+
+def _sanitize_results_for_report_output(results: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in dict(results or {}).items():
+        key = str(k)
+        if key in _REPORT_DIAGNOSTIC_RESULT_KEYS:
+            continue
+        if any(key.startswith(prefix) for prefix in _REPORT_DIAGNOSTIC_RESULT_PREFIXES):
+            continue
+        out[key] = v
+    return out
+
+
+def _report_to_output_dict(report: "RunReport") -> Dict[str, Any]:
+    d = report.to_dict()
+    d["results"] = _sanitize_results_for_report_output(d.get("results", {}) or {})
+    return d
+
 def collect_system_snapshot() -> Dict[str, Any]:
     snap: Dict[str, Any] = {
         "timestamp_utc": _utc_now_iso(),
@@ -172,7 +194,7 @@ def write_json(report: RunReport, out_path: str) -> str:
     p = Path(out_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(report.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    tmp.write_text(json.dumps(_report_to_output_dict(report), indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(p)
     return str(p)
 
@@ -198,7 +220,7 @@ def write_markdown(report: RunReport, out_path: str) -> str:
     p.parent.mkdir(parents=True, exist_ok=True)
 
     env = report.environment or {}
-    results = report.results or {}
+    results = _sanitize_results_for_report_output(report.results or {})
 
     lines: List[str] = []
     lines.append("# Run Report")
@@ -304,7 +326,7 @@ def export_prometheus(report: RunReport, *, prefix: str = "samurai") -> str:
     """
     flat: Dict[str, float] = {}
     _flatten_numbers({"duration_s": report.duration_s}, prefix="run", out=flat)
-    _flatten_numbers(report.results or {}, prefix="results", out=flat)
+    _flatten_numbers(_sanitize_results_for_report_output(report.results or {}), prefix="results", out=flat)
     _flatten_numbers(report.metrics or {}, prefix="metrics", out=flat)
 
     lines = []

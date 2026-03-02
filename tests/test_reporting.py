@@ -15,7 +15,7 @@ class TestReporting(unittest.TestCase):
             duration_s=1.0,
             mode="unit",
             inputs={"a": 1},
-            results={"ok": True},
+            results={"ok": True, "txring_drop_ratio_pct": 99.0, "flush_mode": "adaptive"},
             environment={"python": {"version": "3.x"}},
         )
 
@@ -33,6 +33,14 @@ class TestReporting(unittest.TestCase):
                 data = json.loads(f.read())
             self.assertEqual(data["run_id"], "unit-test")
             self.assertEqual(data["mode"], "unit")
+            self.assertIn("ok", data["results"])
+            self.assertNotIn("txring_drop_ratio_pct", data["results"])
+            self.assertNotIn("flush_mode", data["results"])
+
+            with open(out_md, "r", encoding="utf-8") as f:
+                md = f.read()
+            self.assertNotIn("txring_drop_ratio_pct", md)
+            self.assertNotIn("flush_mode", md)
 
     def test_self_test_report_builder(self):
         from ddos_samurai import reporting
