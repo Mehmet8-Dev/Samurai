@@ -125,10 +125,9 @@ def _recompute_loss_metrics(d: dict) -> dict:
     flush_ebusy = max(0, int(out.get("txring_flush_ebusy_count", 0) or 0))
     flush_other_errno = max(0, int(out.get("txring_flush_other_errno_count", 0) or 0))
 
-    # TX_RING drop counters are kept for diagnostics only.
-    # Do not directly map them to wire-loss estimation.
+    # TX_RING counters are diagnostic only and must not be treated as wire-loss.
     tx_drops_bounded = min(tx_drops, tx_packets) if tx_packets > 0 else tx_drops
-    raw_loss_packets = max(existing_raw, tx_drops, host_tx_dropped)
+    raw_loss_packets = max(existing_raw, host_tx_dropped)
     raw_over_attempted = max(0, raw_loss_packets - attempted)
     raw_over_attempted_pct = float((100.0 * raw_over_attempted) / max(1, attempted))
     est_loss_packets = min(attempted, max(existing_est, host_tx_dropped))

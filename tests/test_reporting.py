@@ -213,7 +213,7 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["state_timeout_evictions"], 5)
         self.assertEqual(rr.results["state_overwrites"], 3)
 
-    def test_live_attack_report_preserves_uncapped_raw_and_marks_over_attempted(self):
+    def test_live_attack_report_ignores_txring_drops_for_wire_loss(self):
         from ddos_samurai import reporting
 
         events = [
@@ -247,14 +247,14 @@ class TestReporting(unittest.TestCase):
 
         self.assertEqual(rr.results["wire_loss_est_packets"], 100)
         self.assertEqual(rr.results["wire_loss_est_pct"], 100.0)
-        self.assertEqual(rr.results["wire_loss_raw_packets"], 400)
-        self.assertEqual(rr.results["wire_loss_raw_uncapped_packets"], 400)
-        self.assertEqual(rr.results["wire_loss_raw_over_attempted_packets"], 300)
-        self.assertEqual(rr.results["wire_loss_raw_over_attempted_pct"], 300.0)
-        self.assertEqual(rr.results["wire_loss_raw_gt_attempted"], 1)
-        self.assertEqual(rr.results["wire_loss_estimation_capped"], 1)
+        self.assertEqual(rr.results["wire_loss_raw_packets"], 0)
+        self.assertEqual(rr.results["wire_loss_raw_uncapped_packets"], 0)
+        self.assertEqual(rr.results["wire_loss_raw_over_attempted_packets"], 0)
+        self.assertEqual(rr.results["wire_loss_raw_over_attempted_pct"], 0.0)
+        self.assertEqual(rr.results["wire_loss_raw_gt_attempted"], 0)
+        self.assertEqual(rr.results["wire_loss_estimation_capped"], 0)
 
-    def test_live_attack_report_uses_raw_loss_for_status(self):
+    def test_live_attack_report_txring_drops_do_not_fail_wire_status(self):
         from ddos_samurai import reporting
 
         events = [
@@ -286,11 +286,11 @@ class TestReporting(unittest.TestCase):
         )
 
         self.assertEqual(rr.results["wire_loss_est_packets"], 0)
-        self.assertEqual(rr.results["wire_loss_status"], "fail")
-        self.assertEqual(rr.results["wire_loss_raw_packets"], 400)
-        self.assertEqual(rr.results["wire_loss_raw_uncapped_packets"], 400)
-        self.assertEqual(rr.results["wire_loss_raw_over_attempted_packets"], 300)
-        self.assertEqual(rr.results["wire_loss_raw_gt_attempted"], 1)
+        self.assertEqual(rr.results["wire_loss_status"], "ok")
+        self.assertEqual(rr.results["wire_loss_raw_packets"], 0)
+        self.assertEqual(rr.results["wire_loss_raw_uncapped_packets"], 0)
+        self.assertEqual(rr.results["wire_loss_raw_over_attempted_packets"], 0)
+        self.assertEqual(rr.results["wire_loss_raw_gt_attempted"], 0)
         self.assertEqual(rr.results["txring_kernel_raw_tp_drops"], 400)
 
     def test_live_attack_report_computes_hold_block_pressure(self):

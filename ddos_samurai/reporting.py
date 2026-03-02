@@ -790,13 +790,12 @@ def build_live_attack_report(
         int(txring_tp_drops_total),
         int(txring_tp_packets_total),
     ) if int(txring_tp_packets_total) > 0 else int(txring_tp_drops_total)
-    # Keep TX_RING tp_drops as diagnostics; report raw counters without capping.
+    # Keep TX_RING tp_drops as diagnostics; wire-loss must come from host/loss telemetry.
     wire_loss_raw_uncapped_packets_total = int(
         max(
             0,
             wire_loss_raw_uncapped_packets_total,
             wire_loss_raw_packets_total,
-            txring_tp_drops_total,
             host_tx_dropped_delta_total,
         )
     )
@@ -831,15 +830,12 @@ def build_live_attack_report(
         100.0,
         max(0.0, frame_wait_ratio_pct + poll_ratio_pct + freeze_ratio_pct),
     )
-    wire_loss_estimation_capped = int(
-        (wire_loss_raw_packets_total > wire_loss_est_packets_total) or (wire_loss_estimation_capped_total > 0)
-    )
+    wire_loss_estimation_capped = int(wire_loss_raw_packets_total > wire_loss_est_packets_total)
     try:
         loss_fail_pct = float(os.environ.get("SAMURAI_LOSS_FAIL_PCT", "5") or 5.0)
     except Exception:
         loss_fail_pct = 5.0
-    # Loss status should reflect the stricter signal between conservative
-    # estimate and raw diagnostic counters.
+    # Loss status reflects host/loss-telemetry derived wire-loss only.
     wire_loss_policy_pct = max(float(wire_loss_est_pct), float(wire_loss_raw_pct))
     if wire_loss_policy_pct > loss_fail_pct:
         wire_loss_status = "fail"
