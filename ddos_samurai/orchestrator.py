@@ -77,6 +77,17 @@ def _empty_stats() -> dict:
         "host_tx_errors_delta": 0,
         "softnet_dropped_delta": 0,
         "softnet_time_squeeze_delta": 0,
+        "wire_counter_available": 0,
+        "wire_counter_source": "none",
+        "wire_counter_confidence": 0.0,
+        "wire_counter_reason": "",
+        "wire_tx_packets_delta": 0,
+        "wire_tx_dropped_delta": 0,
+        "wire_tx_errors_delta": 0,
+        "wire_tx_bytes_delta": 0,
+        "wire_tx_accounted_packets": 0,
+        "wire_tx_over_attempted_packets": 0,
+        "wire_loss_measurement_mode": "unknown",
         "wire_loss_est_packets": 0,
         "wire_loss_est_pct": 0.0,
         "wire_loss_raw_packets": 0,
@@ -111,6 +122,33 @@ def _recompute_loss_metrics(d: dict) -> dict:
     attempted = max(0, int(out.get("attempted", 0) or 0))
     tx_packets = max(0, int(out.get("txring_tp_packets", 0) or 0))
     tx_drops = max(0, int(out.get("txring_tp_drops", 0) or 0))
+    wire_tx_packets = max(0, int(out.get("wire_tx_packets_delta", 0) or 0))
+    wire_counter_available = int(
+        bool(
+            int(
+                out.get(
+                    "wire_counter_available",
+                    1 if ("wire_tx_packets_delta" in out or "host_tx_packets_delta" in out) else 0,
+                )
+                or 0
+            )
+        )
+    )
+    wire_counter_confidence = max(0.0, min(1.0, float(out.get("wire_counter_confidence", 0.0) or 0.0)))
+    wire_counter_source = str(out.get("wire_counter_source", "none") or "none")
+    wire_counter_reason = str(out.get("wire_counter_reason", "") or "")
+    legacy_host_tx_packets = max(0, int(out.get("host_tx_packets_delta", 0) or 0))
+    if (
+        wire_counter_available
+        and wire_tx_packets <= 0
+        and wire_counter_source in ("", "none", "unknown", "legacy_host_tx_packets")
+        and legacy_host_tx_packets > 0
+    ):
+        wire_tx_packets = legacy_host_tx_packets
+        wire_counter_source = "legacy_host_tx_packets"
+        wire_counter_confidence = max(wire_counter_confidence, 0.5)
+        if not wire_counter_reason:
+            wire_counter_reason = "wire_tx_packets_missing_using_host_tx_packets_delta"
     host_tx_dropped = max(0, int(out.get("host_tx_dropped_delta", 0) or 0))
     existing_est = max(0, int(out.get("wire_loss_est_packets", 0) or 0))
     existing_raw = max(
@@ -125,13 +163,34 @@ def _recompute_loss_metrics(d: dict) -> dict:
     flush_ebusy = max(0, int(out.get("txring_flush_ebusy_count", 0) or 0))
     flush_other_errno = max(0, int(out.get("txring_flush_other_errno_count", 0) or 0))
 
-    # TX_RING counters are diagnostic only and must not be treated as wire-loss.
     tx_drops_bounded = min(tx_drops, tx_packets) if tx_packets > 0 else tx_drops
-    raw_loss_packets = max(existing_raw, host_tx_dropped)
+    wire_tx_accounted_packets = min(attempted, wire_tx_packets) if wire_counter_available else 0
+    wire_tx_over_attempted_packets = max(0, wire_tx_packets - attempted) if wire_counter_available else 0
+    if wire_counter_available:
+        derived_raw_loss = max(0, attempted - wire_tx_accounted_packets)
+        raw_loss_packets = max(existing_raw, derived_raw_loss)
+        est_loss_packets = min(attempted, max(existing_est, raw_loss_packets))
+        measurement_mode = "wire_tx_packets"
+    else:
+        raw_loss_packets = max(existing_raw, 0)
+        est_loss_packets = min(attempted, max(existing_est, 0))
+        measurement_mode = "unavailable"
+        # Backward compatibility fallback for legacy test inputs with no wire counters.
+        if host_tx_dropped > 0:
+            raw_loss_packets = max(raw_loss_packets, host_tx_dropped)
+            est_loss_packets = min(attempted, max(est_loss_packets, host_tx_dropped))
+            measurement_mode = "host_tx_dropped_fallback"
+
     raw_over_attempted = max(0, raw_loss_packets - attempted)
     raw_over_attempted_pct = float((100.0 * raw_over_attempted) / max(1, attempted))
-    est_loss_packets = min(attempted, max(existing_est, host_tx_dropped))
 
+    out["wire_counter_available"] = int(wire_counter_available)
+    out["wire_counter_source"] = str(wire_counter_source)
+    out["wire_counter_confidence"] = float(wire_counter_confidence)
+    out["wire_counter_reason"] = str(wire_counter_reason)
+    out["wire_tx_accounted_packets"] = int(wire_tx_accounted_packets)
+    out["wire_tx_over_attempted_packets"] = int(wire_tx_over_attempted_packets)
+    out["wire_loss_measurement_mode"] = str(measurement_mode)
     out["wire_loss_raw_packets"] = int(raw_loss_packets)
     out["wire_loss_raw_uncapped_packets"] = int(raw_loss_packets)
     out["wire_loss_raw_pct"] = float((100.0 * raw_loss_packets) / max(1, attempted))
@@ -223,6 +282,36 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["host_tx_errors_delta"] = int(acc.get("host_tx_errors_delta", 0)) + int(item.get("host_tx_errors_delta", 0) or 0)
     acc["softnet_dropped_delta"] = int(acc.get("softnet_dropped_delta", 0)) + int(item.get("softnet_dropped_delta", 0) or 0)
     acc["softnet_time_squeeze_delta"] = int(acc.get("softnet_time_squeeze_delta", 0)) + int(item.get("softnet_time_squeeze_delta", 0) or 0)
+    item_wire_avail = int(
+        item.get(
+            "wire_counter_available",
+            1 if ("wire_tx_packets_delta" in item or "host_tx_packets_delta" in item) else 0,
+        )
+        or 0
+    )
+    acc["wire_counter_available"] = max(int(acc.get("wire_counter_available", 0) or 0), item_wire_avail)
+    item_wire_source = str(item.get("wire_counter_source", "") or "").strip()
+    if item_wire_source:
+        curr_wire_source = str(acc.get("wire_counter_source", "") or "").strip()
+        if not curr_wire_source or curr_wire_source in ("none", "unknown"):
+            acc["wire_counter_source"] = item_wire_source
+        elif curr_wire_source != item_wire_source and curr_wire_source != "mixed":
+            acc["wire_counter_source"] = "mixed"
+    item_wire_reason = str(item.get("wire_counter_reason", "") or "").strip()
+    if item_wire_reason:
+        curr_wire_reason = str(acc.get("wire_counter_reason", "") or "").strip()
+        if not curr_wire_reason:
+            acc["wire_counter_reason"] = item_wire_reason
+        elif item_wire_reason not in curr_wire_reason:
+            acc["wire_counter_reason"] = f"{curr_wire_reason};{item_wire_reason}"
+    acc["wire_counter_confidence"] = max(
+        float(acc.get("wire_counter_confidence", 0.0) or 0.0),
+        float(item.get("wire_counter_confidence", 0.0) or 0.0),
+    )
+    acc["wire_tx_packets_delta"] = int(acc.get("wire_tx_packets_delta", 0)) + int(item.get("wire_tx_packets_delta", 0) or 0)
+    acc["wire_tx_dropped_delta"] = int(acc.get("wire_tx_dropped_delta", 0)) + int(item.get("wire_tx_dropped_delta", 0) or 0)
+    acc["wire_tx_errors_delta"] = int(acc.get("wire_tx_errors_delta", 0)) + int(item.get("wire_tx_errors_delta", 0) or 0)
+    acc["wire_tx_bytes_delta"] = int(acc.get("wire_tx_bytes_delta", 0)) + int(item.get("wire_tx_bytes_delta", 0) or 0)
     acc["wire_loss_est_packets"] = int(acc.get("wire_loss_est_packets", 0)) + int(item.get("wire_loss_est_packets", 0) or 0)
     _raw_uncapped = int(item.get("wire_loss_raw_uncapped_packets", item.get("wire_loss_raw_packets", 0)) or 0)
     acc["wire_loss_raw_packets"] = int(acc.get("wire_loss_raw_packets", 0)) + int(
@@ -1873,6 +1962,19 @@ async def worker_process(
                 _host_tx_errors_delta = int(worker_stats.get("host_tx_errors_delta", 0) or 0)
                 _softnet_dropped_delta = int(worker_stats.get("softnet_dropped_delta", 0) or 0)
                 _softnet_time_squeeze_delta = int(worker_stats.get("softnet_time_squeeze_delta", 0) or 0)
+                _wire_counter_available = int(worker_stats.get("wire_counter_available", 0) or 0)
+                _wire_counter_source = str(worker_stats.get("wire_counter_source", "none") or "none")
+                _wire_counter_confidence = float(worker_stats.get("wire_counter_confidence", 0.0) or 0.0)
+                _wire_counter_reason = str(worker_stats.get("wire_counter_reason", "") or "")
+                _wire_tx_packets_delta = int(worker_stats.get("wire_tx_packets_delta", 0) or 0)
+                _wire_tx_dropped_delta = int(worker_stats.get("wire_tx_dropped_delta", 0) or 0)
+                _wire_tx_errors_delta = int(worker_stats.get("wire_tx_errors_delta", 0) or 0)
+                _wire_tx_bytes_delta = int(worker_stats.get("wire_tx_bytes_delta", 0) or 0)
+                _wire_tx_accounted_packets = int(worker_stats.get("wire_tx_accounted_packets", 0) or 0)
+                _wire_tx_over_attempted_packets = int(worker_stats.get("wire_tx_over_attempted_packets", 0) or 0)
+                _wire_loss_measurement_mode = str(
+                    worker_stats.get("wire_loss_measurement_mode", "unknown") or "unknown"
+                )
                 _wire_loss_est_packets = int(worker_stats.get("wire_loss_est_packets", 0) or 0)
                 _wire_loss_est_pct = float(worker_stats.get("wire_loss_est_pct", 0.0) or 0.0)
                 _wire_loss_raw_packets = int(worker_stats.get("wire_loss_raw_packets", 0) or 0)
@@ -1967,6 +2069,17 @@ async def worker_process(
                         "host_tx_errors_delta": _host_tx_errors_delta,
                         "softnet_dropped_delta": _softnet_dropped_delta,
                         "softnet_time_squeeze_delta": _softnet_time_squeeze_delta,
+                        "wire_counter_available": _wire_counter_available,
+                        "wire_counter_source": _wire_counter_source,
+                        "wire_counter_confidence": _wire_counter_confidence,
+                        "wire_counter_reason": _wire_counter_reason,
+                        "wire_tx_packets_delta": _wire_tx_packets_delta,
+                        "wire_tx_dropped_delta": _wire_tx_dropped_delta,
+                        "wire_tx_errors_delta": _wire_tx_errors_delta,
+                        "wire_tx_bytes_delta": _wire_tx_bytes_delta,
+                        "wire_tx_accounted_packets": _wire_tx_accounted_packets,
+                        "wire_tx_over_attempted_packets": _wire_tx_over_attempted_packets,
+                        "wire_loss_measurement_mode": _wire_loss_measurement_mode,
                         "wire_loss_est_packets": _wire_loss_est_packets,
                         "wire_loss_est_pct": _wire_loss_est_pct,
                         "wire_loss_raw_packets": _wire_loss_raw_packets,

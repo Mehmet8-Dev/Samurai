@@ -560,6 +560,18 @@ def build_live_attack_report(
     host_tx_errors_delta_total = 0
     softnet_dropped_delta_total = 0
     softnet_time_squeeze_delta_total = 0
+    wire_counter_available_workers = 0
+    wire_counter_missing_workers = 0
+    wire_counter_confidence_max = 0.0
+    wire_counter_source = "none"
+    wire_counter_reason = ""
+    wire_tx_packets_delta_total = 0
+    wire_tx_dropped_delta_total = 0
+    wire_tx_errors_delta_total = 0
+    wire_tx_bytes_delta_total = 0
+    wire_tx_accounted_packets_total = 0
+    wire_tx_over_attempted_packets_total = 0
+    wire_loss_measurement_mode = "unknown"
     wire_loss_est_packets_total = 0
     wire_loss_raw_packets_total = 0
     wire_loss_raw_uncapped_packets_total = 0
@@ -727,6 +739,79 @@ def build_live_attack_report(
         softnet_time_squeeze_delta_total += int(
             ev.get("softnet_time_squeeze_delta", st.get("softnet_time_squeeze_delta", 0)) or 0
         )
+        _legacy_host_tx_packets = int(
+            ev.get("host_tx_packets_delta", st.get("host_tx_packets_delta", 0)) or 0
+        )
+        _legacy_host_tx_dropped = int(
+            ev.get("host_tx_dropped_delta", st.get("host_tx_dropped_delta", 0)) or 0
+        )
+        _legacy_host_tx_errors = int(
+            ev.get("host_tx_errors_delta", st.get("host_tx_errors_delta", 0)) or 0
+        )
+        _wire_tx_packets_delta = int(
+            ev.get("wire_tx_packets_delta", st.get("wire_tx_packets_delta", _legacy_host_tx_packets)) or 0
+        )
+        _wire_tx_dropped_delta = int(
+            ev.get("wire_tx_dropped_delta", st.get("wire_tx_dropped_delta", _legacy_host_tx_dropped)) or 0
+        )
+        _wire_tx_errors_delta = int(
+            ev.get("wire_tx_errors_delta", st.get("wire_tx_errors_delta", _legacy_host_tx_errors)) or 0
+        )
+        _wire_tx_bytes_delta = int(
+            ev.get("wire_tx_bytes_delta", st.get("wire_tx_bytes_delta", 0)) or 0
+        )
+        _wire_counter_available = int(
+            ev.get(
+                "wire_counter_available",
+                st.get(
+                    "wire_counter_available",
+                    1 if (_wire_tx_packets_delta > 0 or _legacy_host_tx_packets > 0) else 0,
+                ),
+            )
+            or 0
+        )
+        if _wire_counter_available > 0:
+            wire_counter_available_workers += 1
+        else:
+            wire_counter_missing_workers += 1
+        _wire_counter_confidence = float(
+            ev.get("wire_counter_confidence", st.get("wire_counter_confidence", 0.0)) or 0.0
+        )
+        wire_counter_confidence_max = max(float(wire_counter_confidence_max), float(_wire_counter_confidence))
+        _wire_counter_source_item = str(
+            ev.get("wire_counter_source", st.get("wire_counter_source", "")) or ""
+        ).strip()
+        if _wire_counter_source_item:
+            if wire_counter_source in ("", "none", "unknown"):
+                wire_counter_source = _wire_counter_source_item
+            elif wire_counter_source != _wire_counter_source_item and wire_counter_source != "mixed":
+                wire_counter_source = "mixed"
+        _wire_counter_reason_item = str(
+            ev.get("wire_counter_reason", st.get("wire_counter_reason", "")) or ""
+        ).strip()
+        if _wire_counter_reason_item:
+            if not wire_counter_reason:
+                wire_counter_reason = _wire_counter_reason_item
+            elif _wire_counter_reason_item not in wire_counter_reason:
+                wire_counter_reason = f"{wire_counter_reason};{_wire_counter_reason_item}"
+        wire_tx_packets_delta_total += _wire_tx_packets_delta
+        wire_tx_dropped_delta_total += _wire_tx_dropped_delta
+        wire_tx_errors_delta_total += _wire_tx_errors_delta
+        wire_tx_bytes_delta_total += _wire_tx_bytes_delta
+        wire_tx_accounted_packets_total += int(
+            ev.get("wire_tx_accounted_packets", st.get("wire_tx_accounted_packets", 0)) or 0
+        )
+        wire_tx_over_attempted_packets_total += int(
+            ev.get("wire_tx_over_attempted_packets", st.get("wire_tx_over_attempted_packets", 0)) or 0
+        )
+        _wire_measure_mode_item = str(
+            ev.get("wire_loss_measurement_mode", st.get("wire_loss_measurement_mode", "")) or ""
+        ).strip()
+        if _wire_measure_mode_item:
+            if wire_loss_measurement_mode in ("", "unknown"):
+                wire_loss_measurement_mode = _wire_measure_mode_item
+            elif wire_loss_measurement_mode != _wire_measure_mode_item and wire_loss_measurement_mode != "mixed":
+                wire_loss_measurement_mode = "mixed"
         wire_loss_est_packets_total += int(
             ev.get("wire_loss_est_packets", st.get("wire_loss_est_packets", 0)) or 0
         )
@@ -812,22 +897,49 @@ def build_live_attack_report(
         int(txring_tp_drops_total),
         int(txring_tp_packets_total),
     ) if int(txring_tp_packets_total) > 0 else int(txring_tp_drops_total)
-    # Keep TX_RING tp_drops as diagnostics; wire-loss must come from host/loss telemetry.
-    wire_loss_raw_uncapped_packets_total = int(
-        max(
-            0,
-            wire_loss_raw_uncapped_packets_total,
-            wire_loss_raw_packets_total,
-            host_tx_dropped_delta_total,
+    wire_counter_available = int(wire_counter_available_workers > 0 and wire_counter_missing_workers == 0)
+    wire_counter_partial = int(wire_counter_available_workers > 0 and wire_counter_missing_workers > 0)
+    wire_counter_any = int(wire_counter_available_workers > 0)
+    if wire_counter_any:
+        _wire_accounted_derived = int(min(max(0, attempted_total), max(0, wire_tx_packets_delta_total)))
+        _wire_over_attempted_derived = int(max(0, wire_tx_packets_delta_total - attempted_total))
+        _wire_loss_derived = int(max(0, attempted_total - _wire_accounted_derived))
+        wire_tx_accounted_packets_total = int(max(wire_tx_accounted_packets_total, _wire_accounted_derived))
+        wire_tx_over_attempted_packets_total = int(
+            max(wire_tx_over_attempted_packets_total, _wire_over_attempted_derived)
         )
-    )
-    wire_loss_raw_packets_total = int(wire_loss_raw_uncapped_packets_total)
-    wire_loss_est_packets_total = int(
-        min(
-            max(0, attempted_total),
-            max(0, int(wire_loss_est_packets_total), int(host_tx_dropped_delta_total)),
+        wire_loss_raw_uncapped_packets_total = int(
+            max(
+                0,
+                wire_loss_raw_uncapped_packets_total,
+                wire_loss_raw_packets_total,
+                _wire_loss_derived,
+            )
         )
-    )
+        wire_loss_raw_packets_total = int(wire_loss_raw_uncapped_packets_total)
+        wire_loss_est_packets_total = int(
+            min(
+                max(0, attempted_total),
+                max(0, int(wire_loss_est_packets_total), int(wire_loss_raw_packets_total)),
+            )
+        )
+    else:
+        # Legacy fallback when explicit wire counters are unavailable.
+        wire_loss_raw_uncapped_packets_total = int(
+            max(
+                0,
+                wire_loss_raw_uncapped_packets_total,
+                wire_loss_raw_packets_total,
+                host_tx_dropped_delta_total,
+            )
+        )
+        wire_loss_raw_packets_total = int(wire_loss_raw_uncapped_packets_total)
+        wire_loss_est_packets_total = int(
+            min(
+                max(0, attempted_total),
+                max(0, int(wire_loss_est_packets_total), int(host_tx_dropped_delta_total)),
+            )
+        )
     wire_loss_est_pct = (float(wire_loss_est_packets_total) * 100.0 / float(max(1, attempted_total)))
     wire_loss_raw_pct = (float(wire_loss_raw_packets_total) * 100.0 / float(max(1, attempted_total)))
     wire_loss_raw_over_attempted_packets = int(max(0, wire_loss_raw_packets_total - attempted_total))
@@ -857,9 +969,10 @@ def build_live_attack_report(
         loss_fail_pct = float(os.environ.get("SAMURAI_LOSS_FAIL_PCT", "5") or 5.0)
     except Exception:
         loss_fail_pct = 5.0
-    # Loss status reflects host/loss-telemetry derived wire-loss only.
     wire_loss_policy_pct = max(float(wire_loss_est_pct), float(wire_loss_raw_pct))
-    if wire_loss_policy_pct > loss_fail_pct:
+    if attempted_total > 0 and (wire_counter_any == 0 or wire_counter_partial == 1):
+        wire_loss_status = "unknown"
+    elif wire_loss_policy_pct > loss_fail_pct:
         wire_loss_status = "fail"
     elif wire_loss_policy_pct > 0.0:
         wire_loss_status = "warn"
@@ -931,6 +1044,20 @@ def build_live_attack_report(
             "host_tx_errors_delta": int(host_tx_errors_delta_total),
             "softnet_dropped_delta": int(softnet_dropped_delta_total),
             "softnet_time_squeeze_delta": int(softnet_time_squeeze_delta_total),
+            "wire_counter_available": int(wire_counter_available),
+            "wire_counter_partial": int(wire_counter_partial),
+            "wire_counter_available_workers": int(wire_counter_available_workers),
+            "wire_counter_missing_workers": int(wire_counter_missing_workers),
+            "wire_counter_source": str(wire_counter_source),
+            "wire_counter_confidence": round(float(wire_counter_confidence_max), 4),
+            "wire_counter_reason": str(wire_counter_reason),
+            "wire_tx_packets_delta": int(wire_tx_packets_delta_total),
+            "wire_tx_dropped_delta": int(wire_tx_dropped_delta_total),
+            "wire_tx_errors_delta": int(wire_tx_errors_delta_total),
+            "wire_tx_bytes_delta": int(wire_tx_bytes_delta_total),
+            "wire_tx_accounted_packets": int(wire_tx_accounted_packets_total),
+            "wire_tx_over_attempted_packets": int(wire_tx_over_attempted_packets_total),
+            "wire_loss_measurement_mode": str(wire_loss_measurement_mode),
             "wire_loss_est_packets": int(wire_loss_est_packets_total),
             "wire_loss_est_pct": round(float(wire_loss_est_pct), 4),
             "wire_loss_raw_packets": int(wire_loss_raw_packets_total),

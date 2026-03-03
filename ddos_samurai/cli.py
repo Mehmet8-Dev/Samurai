@@ -1606,6 +1606,22 @@ def main(argv=None):
                     "host_tx_errors_delta": int(rr.results.get("host_tx_errors_delta", 0) or 0),
                     "softnet_dropped_delta": int(rr.results.get("softnet_dropped_delta", 0) or 0),
                     "softnet_time_squeeze_delta": int(rr.results.get("softnet_time_squeeze_delta", 0) or 0),
+                    "wire_counter_available": int(rr.results.get("wire_counter_available", 0) or 0),
+                    "wire_counter_partial": int(rr.results.get("wire_counter_partial", 0) or 0),
+                    "wire_counter_available_workers": int(rr.results.get("wire_counter_available_workers", 0) or 0),
+                    "wire_counter_missing_workers": int(rr.results.get("wire_counter_missing_workers", 0) or 0),
+                    "wire_counter_source": str(rr.results.get("wire_counter_source", "none") or "none"),
+                    "wire_counter_confidence": float(rr.results.get("wire_counter_confidence", 0.0) or 0.0),
+                    "wire_counter_reason": str(rr.results.get("wire_counter_reason", "") or ""),
+                    "wire_tx_packets_delta": int(rr.results.get("wire_tx_packets_delta", 0) or 0),
+                    "wire_tx_dropped_delta": int(rr.results.get("wire_tx_dropped_delta", 0) or 0),
+                    "wire_tx_errors_delta": int(rr.results.get("wire_tx_errors_delta", 0) or 0),
+                    "wire_tx_bytes_delta": int(rr.results.get("wire_tx_bytes_delta", 0) or 0),
+                    "wire_tx_accounted_packets": int(rr.results.get("wire_tx_accounted_packets", 0) or 0),
+                    "wire_tx_over_attempted_packets": int(rr.results.get("wire_tx_over_attempted_packets", 0) or 0),
+                    "wire_loss_measurement_mode": str(
+                        rr.results.get("wire_loss_measurement_mode", "unknown") or "unknown"
+                    ),
                 }
                 out_loss = reporting.write_text(
                     json.dumps(loss_summary, indent=2, sort_keys=True),
