@@ -7,6 +7,10 @@ import random
 import os
 import errno
 import numpy as np
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .gpu_payload import H2RequestPlan
 
 # Lazy import httpx for HTTP/2 support
 try:
@@ -1565,16 +1569,23 @@ async def paced_raw_socket_sender(
             _update_live(live_progress, max(0, int(count) - int(progress_reported)))
         return out
 
-async def http2_sender(target_ip, target_port, count, concurrency, http_path, http_method, verbose, scheme="https", cookies=None, user_agent=None, ssl_context=None, h2_profile_name=None, live_sent=None, live_errors=None, live_progress=None):
+async def http2_sender(target_ip, target_port, count, concurrency, http_path, http_method, verbose, scheme="https", cookies=None, user_agent=None, ssl_context=None, h2_profile_name=None, request_plan: "H2RequestPlan | None" = None, live_sent=None, live_errors=None, live_progress=None):
     """
     Sends HTTP/2 requests using httpx, leveraging multiplexing.
+    If request_plan is provided, method/path/user-agent are consumed per item.
     """
     if not HTTPX_AVAILABLE:
         log_error("HTTP/2 desteği için 'httpx[http2]' kütüphanesi yüklü değil.")
         return _stats(attempted=count, sent=0, errors=count)
 
     base_url = f"{scheme}://{target_ip}:{target_port}"
-    log_info(f"HTTP/2 sender initialized. Target: {base_url}, Count: {count}, Concurrency: {concurrency}")
+    planned_items = []
+    if request_plan is not None:
+        planned_items = list(getattr(request_plan, "items", []) or [])
+    dispatch_count = int(len(planned_items) if planned_items else count)
+    if dispatch_count <= 0:
+        return _stats(attempted=0, sent=0, errors=0)
+    log_info(f"HTTP/2 sender initialized. Target: {base_url}, Count: {dispatch_count}, Concurrency: {concurrency}")
 
     ok = 0
     err = 0
@@ -1627,10 +1638,21 @@ async def http2_sender(target_ip, target_port, count, concurrency, http_path, ht
                 log_warning(f"HTTP/2 profile not applied: requested={h2_cfg.requested} resolved={h2_cfg.resolved} reason={h2_cfg.reason}")
 
             tasks = []
-            for i in range(count):
+            for i in range(dispatch_count):
                 _update_live(live_progress, 1)
-                path = random.choice(http_path) if isinstance(http_path, list) else http_path
-                tasks.append(asyncio.create_task(client.request(http_method, path)))
+                if planned_items:
+                    item = planned_items[i]
+                    req_method = str(getattr(item, "method", http_method) or http_method)
+                    req_path = str(getattr(item, "path", "/") or "/")
+                    per_req_headers = None
+                    if not user_agent:
+                        plan_ua = str(getattr(item, "user_agent", "") or "").strip()
+                        if plan_ua:
+                            per_req_headers = {"User-Agent": plan_ua}
+                    tasks.append(asyncio.create_task(client.request(req_method, req_path, headers=per_req_headers)))
+                else:
+                    path = random.choice(http_path) if isinstance(http_path, list) else http_path
+                    tasks.append(asyncio.create_task(client.request(http_method, path)))
                 
                 # If we reached concurrency limit, wait for some to finish or just yield
                 if len(tasks) >= concurrency:
@@ -1642,16 +1664,16 @@ async def http2_sender(target_ip, target_port, count, concurrency, http_path, ht
                 
     except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError) as e:
         log_error(f"HTTP/2 bağlantı hatası: Hedef sunucu HTTP/2'yi desteklemiyor veya bağlantıyı kesti. ({e})")
-        err += max(1, count - ok)
+        err += max(1, dispatch_count - ok)
     except Exception as e:
         log_error(f"HTTP/2 sender failed: {e}\n{traceback.format_exc()}")
-        err += max(1, count - ok)
+        err += max(1, dispatch_count - ok)
     finally:
-        log_info(f"HTTP/2 sender finished sending {count} requests.")
+        log_info(f"HTTP/2 sender finished sending {dispatch_count} requests.")
     return _stats(
-        attempted=count,
+        attempted=dispatch_count,
         sent=ok,
-        errors=max(err, count - ok),
+        errors=max(err, dispatch_count - ok),
         responses_total=responses,
         status_2xx=status_2xx,
         status_4xx=status_4xx,

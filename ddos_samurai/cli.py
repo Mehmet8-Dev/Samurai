@@ -61,7 +61,6 @@ def _is_cuda_raw_vector(args: argparse.Namespace) -> bool:
         "basic",
         "dns",
         "http",
-        "http2",
         "anomaly",
         "ntp-amp",
         "ssdp-amp",
@@ -271,6 +270,7 @@ def _report_inputs_from_args(args) -> dict:
         "gpu_template_pool_size_l7": int(getattr(args, "gpu_template_pool_size_l7", 50) or 50),
         "gpu_ring_capacity": int(getattr(args, "gpu_ring_capacity", 3) or 3),
         "gpu_pinned_max_mb": int(getattr(args, "gpu_pinned_max_mb", 512) or 512),
+        "gpu_rng_seed": int(getattr(args, "gpu_rng_seed", 1234) or 0) if getattr(args, "gpu_rng_seed", None) is not None else None,
         "state_table_size": int(getattr(args, "state_table_size", 65536) or 65536),
         "state_lock_count": int(getattr(args, "state_lock_count", 256) or 256),
         "state_timeout_sec": int(getattr(args, "state_timeout_sec", 60) or 60),
@@ -361,6 +361,9 @@ def _validate_hybrid_cuda_args(parser: argparse.ArgumentParser, args: argparse.N
     lock_count = int(getattr(args, "state_lock_count", 256) or 256)
     if table_size % lock_count != 0:
         parser.error("Hata: --state-table-size değeri --state-lock-count değerine tam bölünmelidir.")
+    rng_seed = int(getattr(args, "gpu_rng_seed", 1234) or 0)
+    if rng_seed < 0 or rng_seed > 0xFFFFFFFF:
+        parser.error("Hata: --gpu-rng-seed 0..4294967295 aralığında olmalıdır.")
 
 def build_parser() -> argparse.ArgumentParser:
     """
@@ -494,6 +497,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_env_int("SAMURAI_GPU_PINNED_MAX_MB", 512),
         help="Pinned host buffer pool üst sınırı MB (env: SAMURAI_GPU_PINNED_MAX_MB).",
+    )
+    parser.add_argument(
+        "--gpu-rng-seed",
+        type=int,
+        default=_env_int("SAMURAI_GPU_RNG_SEED", 1234),
+        help="GPU payload RNG seed (varsayılan: deterministik 1234, env: SAMURAI_GPU_RNG_SEED).",
     )
     parser.add_argument(
         "--state-table-size",
@@ -947,6 +956,7 @@ def main(argv=None):
     os.environ["SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7"] = str(int(getattr(args, "gpu_template_pool_size_l7", 50) or 50))
     os.environ["SAMURAI_GPU_RING_CAPACITY"] = str(int(getattr(args, "gpu_ring_capacity", 3) or 3))
     os.environ["SAMURAI_GPU_PINNED_MAX_MB"] = str(int(getattr(args, "gpu_pinned_max_mb", 512) or 512))
+    os.environ["SAMURAI_GPU_RNG_SEED"] = str(int(getattr(args, "gpu_rng_seed", 1234) or 0))
     os.environ["SAMURAI_STATE_TABLE_SIZE"] = str(int(getattr(args, "state_table_size", 65536) or 65536))
     os.environ["SAMURAI_STATE_LOCK_COUNT"] = str(int(getattr(args, "state_lock_count", 256) or 256))
     os.environ["SAMURAI_STATE_TIMEOUT_SEC"] = str(int(getattr(args, "state_timeout_sec", 60) or 60))

