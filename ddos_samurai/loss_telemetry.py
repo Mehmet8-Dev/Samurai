@@ -10,6 +10,8 @@ This module is Linux-oriented and best-effort. It collects:
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Dict, Optional
@@ -24,6 +26,10 @@ _WIRE_SOURCE_SYSFS = "sysfs_netdev_stats"
 _WIRE_SOURCE_PROC = "proc_net_dev_fallback"
 _WIRE_CONFIDENCE_SYSFS = 1.0
 _WIRE_CONFIDENCE_PROC = 0.65
+
+_NICQ_SOURCE_NONE = "none"
+_NICQ_SOURCE_ETHTOOL = "ethtool_stats"
+_NICQ_CONFIDENCE_ETHTOOL = 0.85
 
 
 def _to_int(value) -> int:
@@ -111,6 +117,88 @@ def _parse_softnet_stat_text(text: str) -> Dict[str, int]:
     }
 
 
+def _normalize_stat_key(raw: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(raw or "").strip().lower()).strip("_")
+
+
+def _parse_ethtool_stats_text(text: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        left, right = line.split(":", 1)
+        key = _normalize_stat_key(left)
+        if not key:
+            continue
+        val_token = str(right or "").strip().split()
+        if not val_token:
+            continue
+        try:
+            val = int(val_token[0], 0)
+        except Exception:
+            continue
+        out[key] = int(out.get(key, 0) or 0) + int(val)
+    return out
+
+
+def _collect_nicq_pressure(stats: Dict[str, int]) -> Dict[str, int]:
+    nicq_drop = 0
+    nicq_fifo = 0
+    nicq_timeout = 0
+    nicq_restart = 0
+    nicq_busy = 0
+    pressure_keys = 0
+
+    for raw_key, raw_val in dict(stats or {}).items():
+        key = _normalize_stat_key(raw_key)
+        if not key:
+            continue
+        value = int(raw_val or 0)
+        if value < 0:
+            continue
+        # Restrict to transmit-path counters so RX-side pressure does not pollute TX diagnostics.
+        if not any(token in key for token in ("tx", "transmit", "send")):
+            continue
+
+        matched = False
+        is_fifo = any(token in key for token in ("fifo", "underrun"))
+        is_timeout = "timeout" in key
+        is_restart = any(token in key for token in ("restart", "recover", "reset"))
+        is_busy = any(token in key for token in ("busy", "stop", "full", "nobuf", "no_buffer", "no_desc"))
+        is_drop = any(token in key for token in ("drop", "dropped", "discard", "aborted"))
+        is_tx_error_total = key in ("tx_error", "tx_errors")
+
+        if is_drop or (is_tx_error_total and not (is_fifo or is_timeout or is_restart or is_busy)):
+            nicq_drop += value
+            matched = True
+        if is_fifo:
+            nicq_fifo += value
+            matched = True
+        if is_timeout:
+            nicq_timeout += value
+            matched = True
+        if is_restart:
+            nicq_restart += value
+            matched = True
+        if is_busy:
+            nicq_busy += value
+            matched = True
+
+        if matched:
+            pressure_keys += 1
+
+    return {
+        "nicq_drop": int(nicq_drop),
+        "nicq_fifo": int(nicq_fifo),
+        "nicq_timeout": int(nicq_timeout),
+        "nicq_restart": int(nicq_restart),
+        "nicq_busy": int(nicq_busy),
+        "nicq_pressure": int(nicq_drop + nicq_fifo + nicq_timeout + nicq_restart + nicq_busy),
+        "nicq_pressure_keys": int(pressure_keys),
+    }
+
+
 def read_proc_net_dev(path: str = "/proc/net/dev") -> Dict[str, Dict[str, int]]:
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return _parse_proc_net_dev_text(f.read())
@@ -182,6 +270,35 @@ def _read_sysfs_wire_counters(iface: str, *, sysfs_root: str = _WIRE_SYSFS_ROOT)
     return out, ""
 
 
+def _read_ethtool_stats(iface: str) -> tuple[dict, str]:
+    try:
+        proc = subprocess.run(
+            ["ethtool", "-S", str(iface)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1.0,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {}, "ethtool_not_found"
+    except subprocess.TimeoutExpired:
+        return {}, "ethtool_timeout"
+    except Exception as exc:
+        return {}, f"ethtool_exec_failed:{type(exc).__name__}"
+
+    if int(proc.returncode or 0) != 0:
+        msg = str(proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = msg[0].strip() if msg else f"rc{int(proc.returncode or 0)}"
+        return {}, f"ethtool_failed:{detail}"
+
+    parsed = _parse_ethtool_stats_text(proc.stdout or "")
+    if not parsed:
+        return {}, "ethtool_stats_empty"
+    return parsed, ""
+
+
 def _wire_snapshot_from_proc(iface_stats: Dict[str, int]) -> Dict[str, int]:
     return {
         "wire_tx_packets": int(iface_stats.get("tx_packets", 0) or 0),
@@ -219,6 +336,16 @@ def _empty_snapshot(reason: str = "", iface: str = "") -> Dict[str, int | float 
         "wire_tx_dropped": 0,
         "wire_tx_errors": 0,
         "wire_tx_bytes": 0,
+        "nicq_counter_available": 0,
+        "nicq_counter_source": _NICQ_SOURCE_NONE,
+        "nicq_counter_confidence": 0.0,
+        "nicq_counter_reason": str(reason or ""),
+        "nicq_pressure": 0,
+        "nicq_drop": 0,
+        "nicq_fifo": 0,
+        "nicq_timeout": 0,
+        "nicq_restart": 0,
+        "nicq_busy": 0,
     }
 
 
@@ -267,6 +394,18 @@ def snapshot(
         "wire_tx_errors": 0,
         "wire_tx_bytes": 0,
     }
+    nicq_counter_available = 0
+    nicq_counter_source = _NICQ_SOURCE_NONE
+    nicq_counter_confidence = 0.0
+    nicq_counter_reason = ""
+    nicq = {
+        "nicq_pressure": 0,
+        "nicq_drop": 0,
+        "nicq_fifo": 0,
+        "nicq_timeout": 0,
+        "nicq_restart": 0,
+        "nicq_busy": 0,
+    }
 
     sysfs_stats, sysfs_reason = _read_sysfs_wire_counters(resolved, sysfs_root=sysfs_root)
     if sysfs_stats:
@@ -282,6 +421,26 @@ def snapshot(
         wire_tx = _wire_snapshot_from_proc(iface_stats)
     else:
         wire_counter_reason = _join_reason([sysfs_reason, dev_reason, "wire_counter_unavailable"])
+
+    ethtool_stats, ethtool_reason = _read_ethtool_stats(resolved)
+    if ethtool_stats:
+        nicq_probe = _collect_nicq_pressure(ethtool_stats)
+        if int(nicq_probe.get("nicq_pressure_keys", 0) or 0) > 0:
+            nicq_counter_available = 1
+            nicq_counter_source = _NICQ_SOURCE_ETHTOOL
+            nicq_counter_confidence = _NICQ_CONFIDENCE_ETHTOOL
+            nicq = {
+                "nicq_pressure": int(nicq_probe.get("nicq_pressure", 0) or 0),
+                "nicq_drop": int(nicq_probe.get("nicq_drop", 0) or 0),
+                "nicq_fifo": int(nicq_probe.get("nicq_fifo", 0) or 0),
+                "nicq_timeout": int(nicq_probe.get("nicq_timeout", 0) or 0),
+                "nicq_restart": int(nicq_probe.get("nicq_restart", 0) or 0),
+                "nicq_busy": int(nicq_probe.get("nicq_busy", 0) or 0),
+            }
+        else:
+            nicq_counter_reason = "ethtool_no_tx_pressure_keys"
+    else:
+        nicq_counter_reason = ethtool_reason or "ethtool_unavailable"
 
     reason = _join_reason([dev_reason, softnet_reason])
     return {
@@ -302,6 +461,16 @@ def snapshot(
         "wire_tx_dropped": int(wire_tx["wire_tx_dropped"]),
         "wire_tx_errors": int(wire_tx["wire_tx_errors"]),
         "wire_tx_bytes": int(wire_tx["wire_tx_bytes"]),
+        "nicq_counter_available": int(nicq_counter_available),
+        "nicq_counter_source": str(nicq_counter_source),
+        "nicq_counter_confidence": float(nicq_counter_confidence),
+        "nicq_counter_reason": str(nicq_counter_reason),
+        "nicq_pressure": int(nicq["nicq_pressure"]),
+        "nicq_drop": int(nicq["nicq_drop"]),
+        "nicq_fifo": int(nicq["nicq_fifo"]),
+        "nicq_timeout": int(nicq["nicq_timeout"]),
+        "nicq_restart": int(nicq["nicq_restart"]),
+        "nicq_busy": int(nicq["nicq_busy"]),
     }
 
 
@@ -335,6 +504,16 @@ def delta(before: Dict[str, int | float | str], after: Dict[str, int | float | s
             "wire_tx_dropped_delta": 0,
             "wire_tx_errors_delta": 0,
             "wire_tx_bytes_delta": 0,
+            "nicq_counter_available": 0,
+            "nicq_counter_source": _NICQ_SOURCE_NONE,
+            "nicq_counter_confidence": 0.0,
+            "nicq_counter_reason": reason or "telemetry_unavailable",
+            "nicq_pressure_delta": 0,
+            "nicq_drop_delta": 0,
+            "nicq_fifo_delta": 0,
+            "nicq_timeout_delta": 0,
+            "nicq_restart_delta": 0,
+            "nicq_busy_delta": 0,
         }
 
     before_wire_ok = int(bool(_to_int(b.get("wire_counter_available", 0))))
@@ -354,6 +533,25 @@ def delta(before: Dict[str, int | float | str], after: Dict[str, int | float | s
     if wire_counter_available == 0 and not wire_counter_reason:
         wire_counter_reason = "wire_counter_unavailable"
 
+    before_nicq_ok = int(bool(_to_int(b.get("nicq_counter_available", 0))))
+    after_nicq_ok = int(bool(_to_int(a.get("nicq_counter_available", 0))))
+    nicq_source_before = str(b.get("nicq_counter_source", "") or "")
+    nicq_source_after = str(a.get("nicq_counter_source", "") or "")
+    nicq_source_now = nicq_source_after or nicq_source_before or _NICQ_SOURCE_NONE
+    nicq_source_changed = (
+        nicq_source_before and nicq_source_after and nicq_source_before != nicq_source_after
+    )
+
+    nicq_counter_available = int(bool(before_nicq_ok) and bool(after_nicq_ok))
+    nicq_counter_confidence = max(0.0, min(1.0, _to_float(a.get("nicq_counter_confidence", 0.0))))
+    nicq_counter_reason = str(a.get("nicq_counter_reason", "") or "")
+    if nicq_source_changed:
+        nicq_counter_reason = _join_reason(
+            [nicq_counter_reason, f"nicq_counter_source_changed:{nicq_source_before}->{nicq_source_after}"]
+        )
+    if nicq_counter_available == 0 and not nicq_counter_reason:
+        nicq_counter_reason = "nicq_counter_unavailable"
+
     return {
         "enabled": 1,
         "iface": iface,
@@ -371,4 +569,14 @@ def delta(before: Dict[str, int | float | str], after: Dict[str, int | float | s
         "wire_tx_dropped_delta": _d("wire_tx_dropped") if wire_counter_available else 0,
         "wire_tx_errors_delta": _d("wire_tx_errors") if wire_counter_available else 0,
         "wire_tx_bytes_delta": _d("wire_tx_bytes") if wire_counter_available else 0,
+        "nicq_counter_available": int(nicq_counter_available),
+        "nicq_counter_source": str(nicq_source_now),
+        "nicq_counter_confidence": float(nicq_counter_confidence),
+        "nicq_counter_reason": str(nicq_counter_reason),
+        "nicq_pressure_delta": _d("nicq_pressure") if nicq_counter_available else 0,
+        "nicq_drop_delta": _d("nicq_drop") if nicq_counter_available else 0,
+        "nicq_fifo_delta": _d("nicq_fifo") if nicq_counter_available else 0,
+        "nicq_timeout_delta": _d("nicq_timeout") if nicq_counter_available else 0,
+        "nicq_restart_delta": _d("nicq_restart") if nicq_counter_available else 0,
+        "nicq_busy_delta": _d("nicq_busy") if nicq_counter_available else 0,
     }

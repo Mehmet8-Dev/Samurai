@@ -17,6 +17,10 @@ def _utc_now_iso() -> str:
 
 _REPORT_DIAGNOSTIC_RESULT_PREFIXES: Tuple[str, ...] = ("txring_",)
 _REPORT_DIAGNOSTIC_RESULT_KEYS = {"flush_mode"}
+_REPORT_DIAGNOSTIC_RESULT_EXPOSED_KEYS = {
+    "txring_packet_version",
+    "txring_packet_version_name",
+}
 
 
 def _sanitize_results_for_report_output(results: Dict[str, Any]) -> Dict[str, Any]:
@@ -25,7 +29,10 @@ def _sanitize_results_for_report_output(results: Dict[str, Any]) -> Dict[str, An
         key = str(k)
         if key in _REPORT_DIAGNOSTIC_RESULT_KEYS:
             continue
-        if any(key.startswith(prefix) for prefix in _REPORT_DIAGNOSTIC_RESULT_PREFIXES):
+        if (
+            any(key.startswith(prefix) for prefix in _REPORT_DIAGNOSTIC_RESULT_PREFIXES)
+            and key not in _REPORT_DIAGNOSTIC_RESULT_EXPOSED_KEYS
+        ):
             continue
         out[key] = v
     return out
@@ -569,6 +576,18 @@ def build_live_attack_report(
     wire_tx_dropped_delta_total = 0
     wire_tx_errors_delta_total = 0
     wire_tx_bytes_delta_total = 0
+    nicq_counter_available_workers = 0
+    nicq_counter_missing_workers = 0
+    nicq_counter_confidence_max = 0.0
+    nicq_counter_source = "none"
+    nicq_counter_reason = ""
+    nicq_pressure_delta_total = 0
+    nicq_drop_delta_total = 0
+    nicq_fifo_delta_total = 0
+    nicq_timeout_delta_total = 0
+    nicq_restart_delta_total = 0
+    nicq_busy_delta_total = 0
+    nicq_pressure_status = "unknown"
     wire_tx_accounted_packets_total = 0
     wire_tx_over_attempted_packets_total = 0
     wire_loss_measurement_mode = "unknown"
@@ -794,10 +813,73 @@ def build_live_attack_report(
                 wire_counter_reason = _wire_counter_reason_item
             elif _wire_counter_reason_item not in wire_counter_reason:
                 wire_counter_reason = f"{wire_counter_reason};{_wire_counter_reason_item}"
+        _nicq_counter_available = int(
+            ev.get(
+                "nicq_counter_available",
+                st.get(
+                    "nicq_counter_available",
+                    1 if (
+                        int(ev.get("nicq_pressure_delta", st.get("nicq_pressure_delta", 0)) or 0) > 0
+                        or int(ev.get("nicq_drop_delta", st.get("nicq_drop_delta", 0)) or 0) > 0
+                    ) else 0,
+                ),
+            )
+            or 0
+        )
+        if _nicq_counter_available > 0:
+            nicq_counter_available_workers += 1
+        else:
+            nicq_counter_missing_workers += 1
+        _nicq_counter_confidence = float(
+            ev.get("nicq_counter_confidence", st.get("nicq_counter_confidence", 0.0)) or 0.0
+        )
+        nicq_counter_confidence_max = max(float(nicq_counter_confidence_max), float(_nicq_counter_confidence))
+        _nicq_counter_source_item = str(
+            ev.get("nicq_counter_source", st.get("nicq_counter_source", "")) or ""
+        ).strip()
+        if _nicq_counter_source_item:
+            if nicq_counter_source in ("", "none", "unknown"):
+                nicq_counter_source = _nicq_counter_source_item
+            elif nicq_counter_source != _nicq_counter_source_item and nicq_counter_source != "mixed":
+                nicq_counter_source = "mixed"
+        _nicq_counter_reason_item = str(
+            ev.get("nicq_counter_reason", st.get("nicq_counter_reason", "")) or ""
+        ).strip()
+        if _nicq_counter_reason_item:
+            if not nicq_counter_reason:
+                nicq_counter_reason = _nicq_counter_reason_item
+            elif _nicq_counter_reason_item not in nicq_counter_reason:
+                nicq_counter_reason = f"{nicq_counter_reason};{_nicq_counter_reason_item}"
         wire_tx_packets_delta_total += _wire_tx_packets_delta
         wire_tx_dropped_delta_total += _wire_tx_dropped_delta
         wire_tx_errors_delta_total += _wire_tx_errors_delta
         wire_tx_bytes_delta_total += _wire_tx_bytes_delta
+        nicq_pressure_delta_total += int(
+            ev.get("nicq_pressure_delta", st.get("nicq_pressure_delta", 0)) or 0
+        )
+        nicq_drop_delta_total += int(
+            ev.get("nicq_drop_delta", st.get("nicq_drop_delta", 0)) or 0
+        )
+        nicq_fifo_delta_total += int(
+            ev.get("nicq_fifo_delta", st.get("nicq_fifo_delta", 0)) or 0
+        )
+        nicq_timeout_delta_total += int(
+            ev.get("nicq_timeout_delta", st.get("nicq_timeout_delta", 0)) or 0
+        )
+        nicq_restart_delta_total += int(
+            ev.get("nicq_restart_delta", st.get("nicq_restart_delta", 0)) or 0
+        )
+        nicq_busy_delta_total += int(
+            ev.get("nicq_busy_delta", st.get("nicq_busy_delta", 0)) or 0
+        )
+        _nicq_status_item = str(
+            ev.get("nicq_pressure_status", st.get("nicq_pressure_status", "")) or ""
+        ).strip()
+        if _nicq_status_item:
+            if nicq_pressure_status in ("", "unknown"):
+                nicq_pressure_status = _nicq_status_item
+            elif nicq_pressure_status != _nicq_status_item and nicq_pressure_status != "mixed":
+                nicq_pressure_status = "mixed"
         wire_tx_accounted_packets_total += int(
             ev.get("wire_tx_accounted_packets", st.get("wire_tx_accounted_packets", 0)) or 0
         )
@@ -900,6 +982,26 @@ def build_live_attack_report(
     wire_counter_available = int(wire_counter_available_workers > 0 and wire_counter_missing_workers == 0)
     wire_counter_partial = int(wire_counter_available_workers > 0 and wire_counter_missing_workers > 0)
     wire_counter_any = int(wire_counter_available_workers > 0)
+    nicq_counter_available = int(nicq_counter_available_workers > 0 and nicq_counter_missing_workers == 0)
+    nicq_counter_partial = int(nicq_counter_available_workers > 0 and nicq_counter_missing_workers > 0)
+    nicq_counter_any = int(nicq_counter_available_workers > 0)
+    if nicq_counter_any:
+        _nicq_pressure_derived = int(
+            max(
+                0,
+                nicq_pressure_delta_total,
+                nicq_drop_delta_total + nicq_fifo_delta_total + nicq_timeout_delta_total
+                + nicq_restart_delta_total + nicq_busy_delta_total,
+            )
+        )
+        nicq_pressure_delta_total = _nicq_pressure_derived
+    else:
+        nicq_pressure_delta_total = 0
+        nicq_drop_delta_total = 0
+        nicq_fifo_delta_total = 0
+        nicq_timeout_delta_total = 0
+        nicq_restart_delta_total = 0
+        nicq_busy_delta_total = 0
     if wire_counter_any:
         _wire_accounted_derived = int(min(max(0, attempted_total), max(0, wire_tx_packets_delta_total)))
         _wire_over_attempted_derived = int(max(0, wire_tx_packets_delta_total - attempted_total))
@@ -978,6 +1080,12 @@ def build_live_attack_report(
         wire_loss_status = "warn"
     else:
         wire_loss_status = "ok"
+    if attempted_total > 0 and (nicq_counter_any == 0 or nicq_counter_partial == 1):
+        nicq_pressure_status = "unknown"
+    elif int(nicq_pressure_delta_total) > 0:
+        nicq_pressure_status = "warn"
+    else:
+        nicq_pressure_status = "ok"
 
     report = RunReport(
         run_id=run_id,
@@ -1055,6 +1163,20 @@ def build_live_attack_report(
             "wire_tx_dropped_delta": int(wire_tx_dropped_delta_total),
             "wire_tx_errors_delta": int(wire_tx_errors_delta_total),
             "wire_tx_bytes_delta": int(wire_tx_bytes_delta_total),
+            "nicq_counter_available": int(nicq_counter_available),
+            "nicq_counter_partial": int(nicq_counter_partial),
+            "nicq_counter_available_workers": int(nicq_counter_available_workers),
+            "nicq_counter_missing_workers": int(nicq_counter_missing_workers),
+            "nicq_counter_source": str(nicq_counter_source),
+            "nicq_counter_confidence": round(float(nicq_counter_confidence_max), 4),
+            "nicq_counter_reason": str(nicq_counter_reason),
+            "nicq_pressure_delta": int(nicq_pressure_delta_total),
+            "nicq_drop_delta": int(nicq_drop_delta_total),
+            "nicq_fifo_delta": int(nicq_fifo_delta_total),
+            "nicq_timeout_delta": int(nicq_timeout_delta_total),
+            "nicq_restart_delta": int(nicq_restart_delta_total),
+            "nicq_busy_delta": int(nicq_busy_delta_total),
+            "nicq_pressure_status": str(nicq_pressure_status),
             "wire_tx_accounted_packets": int(wire_tx_accounted_packets_total),
             "wire_tx_over_attempted_packets": int(wire_tx_over_attempted_packets_total),
             "wire_loss_measurement_mode": str(wire_loss_measurement_mode),

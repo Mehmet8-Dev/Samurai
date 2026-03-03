@@ -100,6 +100,17 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "wire_tx_dropped_delta": 0,
         "wire_tx_errors_delta": 0,
         "wire_tx_bytes_delta": 0,
+        "nicq_counter_available": 0,
+        "nicq_counter_source": "none",
+        "nicq_counter_confidence": 0.0,
+        "nicq_counter_reason": "",
+        "nicq_pressure_delta": 0,
+        "nicq_drop_delta": 0,
+        "nicq_fifo_delta": 0,
+        "nicq_timeout_delta": 0,
+        "nicq_restart_delta": 0,
+        "nicq_busy_delta": 0,
+        "nicq_pressure_status": "unknown",
         "wire_tx_accounted_packets": 0,
         "wire_tx_over_attempted_packets": 0,
         "wire_loss_measurement_mode": "unknown",
@@ -154,6 +165,30 @@ def _recompute_loss_metrics(out: dict) -> dict:
     wire_counter_confidence = max(0.0, min(1.0, float(d.get("wire_counter_confidence", 0.0) or 0.0)))
     wire_counter_source = str(d.get("wire_counter_source", "none") or "none")
     wire_counter_reason = str(d.get("wire_counter_reason", "") or "")
+    nicq_counter_available = int(
+        bool(
+            int(
+                d.get(
+                    "nicq_counter_available",
+                    1 if ("nicq_pressure_delta" in d or "nicq_drop_delta" in d) else 0,
+                )
+                or 0
+            )
+        )
+    )
+    nicq_counter_confidence = max(0.0, min(1.0, float(d.get("nicq_counter_confidence", 0.0) or 0.0)))
+    nicq_counter_source = str(d.get("nicq_counter_source", "none") or "none")
+    nicq_counter_reason = str(d.get("nicq_counter_reason", "") or "")
+    nicq_drop_delta = max(0, int(d.get("nicq_drop_delta", 0) or 0))
+    nicq_fifo_delta = max(0, int(d.get("nicq_fifo_delta", 0) or 0))
+    nicq_timeout_delta = max(0, int(d.get("nicq_timeout_delta", 0) or 0))
+    nicq_restart_delta = max(0, int(d.get("nicq_restart_delta", 0) or 0))
+    nicq_busy_delta = max(0, int(d.get("nicq_busy_delta", 0) or 0))
+    nicq_pressure_delta = max(0, int(d.get("nicq_pressure_delta", 0) or 0))
+    nicq_pressure_delta = max(
+        nicq_pressure_delta,
+        nicq_drop_delta + nicq_fifo_delta + nicq_timeout_delta + nicq_restart_delta + nicq_busy_delta,
+    )
     legacy_host_tx_packets = max(0, int(d.get("host_tx_packets_delta", 0) or 0))
     if (
         wire_counter_available
@@ -205,6 +240,19 @@ def _recompute_loss_metrics(out: dict) -> dict:
     d["wire_counter_source"] = str(wire_counter_source)
     d["wire_counter_confidence"] = float(wire_counter_confidence)
     d["wire_counter_reason"] = str(wire_counter_reason)
+    d["nicq_counter_available"] = int(nicq_counter_available)
+    d["nicq_counter_source"] = str(nicq_counter_source)
+    d["nicq_counter_confidence"] = float(nicq_counter_confidence)
+    d["nicq_counter_reason"] = str(nicq_counter_reason)
+    d["nicq_pressure_delta"] = int(nicq_pressure_delta) if nicq_counter_available else 0
+    d["nicq_drop_delta"] = int(nicq_drop_delta) if nicq_counter_available else 0
+    d["nicq_fifo_delta"] = int(nicq_fifo_delta) if nicq_counter_available else 0
+    d["nicq_timeout_delta"] = int(nicq_timeout_delta) if nicq_counter_available else 0
+    d["nicq_restart_delta"] = int(nicq_restart_delta) if nicq_counter_available else 0
+    d["nicq_busy_delta"] = int(nicq_busy_delta) if nicq_counter_available else 0
+    d["nicq_pressure_status"] = (
+        "warn" if int(d["nicq_pressure_delta"]) > 0 else "ok"
+    ) if nicq_counter_available else "unknown"
     d["wire_tx_accounted_packets"] = int(wire_tx_accounted_packets)
     d["wire_tx_over_attempted_packets"] = int(wire_tx_over_attempted_packets)
     d["wire_loss_measurement_mode"] = str(measurement_mode)
@@ -380,6 +428,16 @@ def _attach_loss_telemetry(stats_out: dict, before_snapshot: dict, preferred_ifa
     out["wire_tx_dropped_delta"] = int(delta.get("wire_tx_dropped_delta", 0) or 0)
     out["wire_tx_errors_delta"] = int(delta.get("wire_tx_errors_delta", 0) or 0)
     out["wire_tx_bytes_delta"] = int(delta.get("wire_tx_bytes_delta", 0) or 0)
+    out["nicq_counter_available"] = int(delta.get("nicq_counter_available", 0) or 0)
+    out["nicq_counter_source"] = str(delta.get("nicq_counter_source", "none") or "none")
+    out["nicq_counter_confidence"] = float(delta.get("nicq_counter_confidence", 0.0) or 0.0)
+    out["nicq_counter_reason"] = str(delta.get("nicq_counter_reason", "") or "")
+    out["nicq_pressure_delta"] = int(delta.get("nicq_pressure_delta", 0) or 0)
+    out["nicq_drop_delta"] = int(delta.get("nicq_drop_delta", 0) or 0)
+    out["nicq_fifo_delta"] = int(delta.get("nicq_fifo_delta", 0) or 0)
+    out["nicq_timeout_delta"] = int(delta.get("nicq_timeout_delta", 0) or 0)
+    out["nicq_restart_delta"] = int(delta.get("nicq_restart_delta", 0) or 0)
+    out["nicq_busy_delta"] = int(delta.get("nicq_busy_delta", 0) or 0)
     return _recompute_loss_metrics(out)
 
 
@@ -612,6 +670,38 @@ def _merge_stats(*items):
         acc["wire_tx_dropped_delta"] += int(it.get("wire_tx_dropped_delta", 0) or 0)
         acc["wire_tx_errors_delta"] += int(it.get("wire_tx_errors_delta", 0) or 0)
         acc["wire_tx_bytes_delta"] += int(it.get("wire_tx_bytes_delta", 0) or 0)
+        item_nicq_avail = int(
+            it.get(
+                "nicq_counter_available",
+                1 if ("nicq_pressure_delta" in it or "nicq_drop_delta" in it) else 0,
+            )
+            or 0
+        )
+        acc["nicq_counter_available"] = max(int(acc.get("nicq_counter_available", 0) or 0), item_nicq_avail)
+        item_nicq_source = str(it.get("nicq_counter_source", "") or "").strip()
+        if item_nicq_source:
+            curr_nicq_source = str(acc.get("nicq_counter_source", "") or "").strip()
+            if not curr_nicq_source or curr_nicq_source in ("none", "unknown"):
+                acc["nicq_counter_source"] = item_nicq_source
+            elif curr_nicq_source != item_nicq_source and curr_nicq_source != "mixed":
+                acc["nicq_counter_source"] = "mixed"
+        item_nicq_reason = str(it.get("nicq_counter_reason", "") or "").strip()
+        if item_nicq_reason:
+            curr_nicq_reason = str(acc.get("nicq_counter_reason", "") or "").strip()
+            if not curr_nicq_reason:
+                acc["nicq_counter_reason"] = item_nicq_reason
+            elif item_nicq_reason not in curr_nicq_reason:
+                acc["nicq_counter_reason"] = f"{curr_nicq_reason};{item_nicq_reason}"
+        acc["nicq_counter_confidence"] = max(
+            float(acc.get("nicq_counter_confidence", 0.0) or 0.0),
+            float(it.get("nicq_counter_confidence", 0.0) or 0.0),
+        )
+        acc["nicq_pressure_delta"] += int(it.get("nicq_pressure_delta", 0) or 0)
+        acc["nicq_drop_delta"] += int(it.get("nicq_drop_delta", 0) or 0)
+        acc["nicq_fifo_delta"] += int(it.get("nicq_fifo_delta", 0) or 0)
+        acc["nicq_timeout_delta"] += int(it.get("nicq_timeout_delta", 0) or 0)
+        acc["nicq_restart_delta"] += int(it.get("nicq_restart_delta", 0) or 0)
+        acc["nicq_busy_delta"] += int(it.get("nicq_busy_delta", 0) or 0)
         acc["wire_loss_est_packets"] += int(it.get("wire_loss_est_packets", 0) or 0)
         _raw_uncapped = int(it.get("wire_loss_raw_uncapped_packets", it.get("wire_loss_raw_packets", 0)) or 0)
         acc["wire_loss_raw_packets"] += int(it.get("wire_loss_raw_packets", _raw_uncapped) or 0)
