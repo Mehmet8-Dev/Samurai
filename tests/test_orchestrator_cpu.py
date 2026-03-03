@@ -250,6 +250,16 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
             "host_tx_errors_delta": 1,
             "softnet_dropped_delta": 0,
             "softnet_time_squeeze_delta": 0,
+            "nicq_counter_available": 1,
+            "nicq_counter_source": "ethtool_stats",
+            "nicq_counter_confidence": 0.8,
+            "nicq_pressure_delta": 3,
+            "nicq_drop_delta": 2,
+            "nicq_fifo_delta": 1,
+            "nicq_timeout_delta": 0,
+            "nicq_restart_delta": 0,
+            "nicq_busy_delta": 0,
+            "nicq_pressure_status": "warn",
             "wire_loss_est_packets": 2,
         })
         with patch.object(orchestrator.senders, "http_app_sender", mock_http):
@@ -283,12 +293,19 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ev["txring_packet_version_name"], "TPACKET_V2")
         self.assertEqual(ev["host_tx_packets_delta"], 10)
         self.assertEqual(ev["host_tx_dropped_delta"], 2)
+        self.assertEqual(ev["nicq_counter_available"], 1)
+        self.assertEqual(ev["nicq_counter_source"], "ethtool_stats")
+        self.assertEqual(ev["nicq_pressure_delta"], 3)
+        self.assertEqual(ev["nicq_drop_delta"], 2)
+        self.assertEqual(ev["nicq_fifo_delta"], 1)
+        self.assertEqual(ev["nicq_pressure_status"], "warn")
         self.assertEqual(ev["wire_loss_est_packets"], 2)
         self.assertGreater(ev["wire_loss_est_pct"], 0.0)
         self.assertEqual(ev["stats"]["sleep_calls"], 12)
         self.assertEqual(ev["stats"]["busywait_cycles"], 34)
         self.assertEqual(ev["stats"]["buffer_copy_count"], 2)
         self.assertEqual(ev["stats"]["eagain_retry_count"], 3)
+        self.assertEqual(ev["stats"]["nicq_pressure_delta"], 3)
 
     async def test_worker_status_interrupted_on_keyboard_interrupt(self):
         """Worker should report 'interrupted' on KeyboardInterrupt."""

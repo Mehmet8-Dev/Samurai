@@ -15,7 +15,13 @@ class TestReporting(unittest.TestCase):
             duration_s=1.0,
             mode="unit",
             inputs={"a": 1},
-            results={"ok": True, "txring_drop_ratio_pct": 99.0, "flush_mode": "adaptive"},
+            results={
+                "ok": True,
+                "txring_drop_ratio_pct": 99.0,
+                "txring_packet_version": 2,
+                "txring_packet_version_name": "TPACKET_V3",
+                "flush_mode": "adaptive",
+            },
             environment={"python": {"version": "3.x"}},
         )
 
@@ -36,11 +42,15 @@ class TestReporting(unittest.TestCase):
             self.assertIn("ok", data["results"])
             self.assertNotIn("txring_drop_ratio_pct", data["results"])
             self.assertNotIn("flush_mode", data["results"])
+            self.assertEqual(int(data["results"].get("txring_packet_version", 0)), 2)
+            self.assertEqual(str(data["results"].get("txring_packet_version_name", "")), "TPACKET_V3")
 
             with open(out_md, "r", encoding="utf-8") as f:
                 md = f.read()
             self.assertNotIn("txring_drop_ratio_pct", md)
             self.assertNotIn("flush_mode", md)
+            self.assertIn("`txring_packet_version`", md)
+            self.assertIn("`txring_packet_version_name`", md)
 
     def test_self_test_report_builder(self):
         from ddos_samurai import reporting
@@ -100,6 +110,16 @@ class TestReporting(unittest.TestCase):
                 "wire_tx_dropped_delta": 1,
                 "wire_tx_errors_delta": 0,
                 "wire_tx_bytes_delta": 900,
+                "nicq_counter_available": 1,
+                "nicq_counter_source": "ethtool_stats",
+                "nicq_counter_confidence": 0.8,
+                "nicq_pressure_delta": 2,
+                "nicq_drop_delta": 1,
+                "nicq_fifo_delta": 1,
+                "nicq_timeout_delta": 0,
+                "nicq_restart_delta": 0,
+                "nicq_busy_delta": 0,
+                "nicq_pressure_status": "warn",
                 "wire_loss_est_packets": 1,
                 "gpu_template_h2d_copy_count": 3,
                 "gpu_template_h2d_copy_bytes": 2048,
@@ -161,6 +181,16 @@ class TestReporting(unittest.TestCase):
                 "wire_tx_dropped_delta": 0,
                 "wire_tx_errors_delta": 1,
                 "wire_tx_bytes_delta": 800,
+                "nicq_counter_available": 1,
+                "nicq_counter_source": "ethtool_stats",
+                "nicq_counter_confidence": 0.9,
+                "nicq_pressure_delta": 0,
+                "nicq_drop_delta": 0,
+                "nicq_fifo_delta": 0,
+                "nicq_timeout_delta": 0,
+                "nicq_restart_delta": 0,
+                "nicq_busy_delta": 0,
+                "nicq_pressure_status": "ok",
                 "wire_loss_est_packets": 0,
                 "gpu_template_h2d_copy_count": 1,
                 "gpu_template_h2d_copy_bytes": 1024,
@@ -224,6 +254,15 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["wire_loss_raw_over_attempted_packets"], 0)
         self.assertEqual(rr.results["wire_loss_raw_gt_attempted"], 0)
         self.assertEqual(rr.results["wire_loss_status"], "warn")
+        self.assertEqual(rr.results["nicq_counter_available"], 1)
+        self.assertEqual(rr.results["nicq_counter_partial"], 0)
+        self.assertEqual(rr.results["nicq_counter_available_workers"], 2)
+        self.assertEqual(rr.results["nicq_counter_missing_workers"], 0)
+        self.assertEqual(rr.results["nicq_counter_source"], "ethtool_stats")
+        self.assertEqual(rr.results["nicq_pressure_delta"], 2)
+        self.assertEqual(rr.results["nicq_drop_delta"], 1)
+        self.assertEqual(rr.results["nicq_fifo_delta"], 1)
+        self.assertEqual(rr.results["nicq_pressure_status"], "warn")
         self.assertAlmostEqual(rr.results["txring_flush_enobufs_ratio_pct"], 11.1111, places=4)
         self.assertAlmostEqual(rr.results["txring_flush_ebusy_ratio_pct"], 5.5556, places=4)
         self.assertAlmostEqual(rr.results["txring_flush_other_errno_ratio_pct"], 16.6667, places=4)
@@ -309,6 +348,7 @@ class TestReporting(unittest.TestCase):
 
         self.assertEqual(rr.results["wire_loss_est_packets"], 0)
         self.assertEqual(rr.results["wire_loss_status"], "unknown")
+        self.assertEqual(rr.results["nicq_pressure_status"], "unknown")
         self.assertEqual(rr.results["wire_loss_raw_packets"], 0)
         self.assertEqual(rr.results["wire_loss_raw_uncapped_packets"], 0)
         self.assertEqual(rr.results["wire_loss_raw_over_attempted_packets"], 0)

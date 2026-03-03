@@ -35,6 +35,27 @@ Inter-|   Receive                                                |  Transmit
         self.assertEqual(out["dropped"], 0x06)
         self.assertEqual(out["time_squeeze"], 0x08)
 
+    def test_parse_ethtool_stats_and_collect_nicq(self):
+        sample = """
+NIC statistics:
+     tx_queue_0_dropped: 3
+     tx_timeout: 2
+     tx_fifo_errors: 1
+     tx_underrun: 6
+     tx_aborted: 2
+     tx_errors: 5
+     tx_busy: 4
+"""
+        parsed = loss_telemetry._parse_ethtool_stats_text(sample)
+        self.assertEqual(parsed["tx_queue_0_dropped"], 3)
+        self.assertEqual(parsed["tx_timeout"], 2)
+        nicq = loss_telemetry._collect_nicq_pressure(parsed)
+        self.assertEqual(nicq["nicq_drop"], 10)
+        self.assertEqual(nicq["nicq_timeout"], 2)
+        self.assertEqual(nicq["nicq_fifo"], 7)
+        self.assertEqual(nicq["nicq_busy"], 4)
+        self.assertEqual(nicq["nicq_pressure"], 23)
+
     def test_delta_computation(self):
         before = {
             "enabled": 1,
@@ -51,6 +72,15 @@ Inter-|   Receive                                                |  Transmit
             "wire_tx_dropped": 1,
             "wire_tx_errors": 0,
             "wire_tx_bytes": 9000,
+            "nicq_counter_available": 1,
+            "nicq_counter_source": "ethtool_stats",
+            "nicq_counter_confidence": 0.85,
+            "nicq_pressure": 5,
+            "nicq_drop": 2,
+            "nicq_fifo": 1,
+            "nicq_timeout": 1,
+            "nicq_restart": 0,
+            "nicq_busy": 1,
         }
         after = {
             "enabled": 1,
@@ -67,6 +97,15 @@ Inter-|   Receive                                                |  Transmit
             "wire_tx_dropped": 2,
             "wire_tx_errors": 1,
             "wire_tx_bytes": 10240,
+            "nicq_counter_available": 1,
+            "nicq_counter_source": "ethtool_stats",
+            "nicq_counter_confidence": 0.85,
+            "nicq_pressure": 11,
+            "nicq_drop": 4,
+            "nicq_fifo": 2,
+            "nicq_timeout": 2,
+            "nicq_restart": 1,
+            "nicq_busy": 2,
         }
         d = loss_telemetry.delta(before, after)
         self.assertEqual(d["host_tx_packets_delta"], 20)
@@ -80,6 +119,14 @@ Inter-|   Receive                                                |  Transmit
         self.assertEqual(d["wire_tx_dropped_delta"], 1)
         self.assertEqual(d["wire_tx_errors_delta"], 1)
         self.assertEqual(d["wire_tx_bytes_delta"], 1240)
+        self.assertEqual(d["nicq_counter_available"], 1)
+        self.assertEqual(d["nicq_counter_source"], "ethtool_stats")
+        self.assertEqual(d["nicq_pressure_delta"], 6)
+        self.assertEqual(d["nicq_drop_delta"], 2)
+        self.assertEqual(d["nicq_fifo_delta"], 1)
+        self.assertEqual(d["nicq_timeout_delta"], 1)
+        self.assertEqual(d["nicq_restart_delta"], 1)
+        self.assertEqual(d["nicq_busy_delta"], 1)
 
     def test_snapshot_fallback_when_proc_missing(self):
         with patch.dict(os.environ, {"SAMURAI_LOSS_TELEMETRY": "1"}, clear=False):
