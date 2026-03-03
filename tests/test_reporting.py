@@ -93,6 +93,13 @@ class TestReporting(unittest.TestCase):
                 "host_tx_errors_delta": 0,
                 "softnet_dropped_delta": 2,
                 "softnet_time_squeeze_delta": 1,
+                "wire_counter_available": 1,
+                "wire_counter_source": "sysfs_netdev_stats",
+                "wire_counter_confidence": 1.0,
+                "wire_tx_packets_delta": 10,
+                "wire_tx_dropped_delta": 1,
+                "wire_tx_errors_delta": 0,
+                "wire_tx_bytes_delta": 900,
                 "wire_loss_est_packets": 1,
                 "gpu_template_h2d_copy_count": 3,
                 "gpu_template_h2d_copy_bytes": 2048,
@@ -147,6 +154,13 @@ class TestReporting(unittest.TestCase):
                 "host_tx_errors_delta": 1,
                 "softnet_dropped_delta": 0,
                 "softnet_time_squeeze_delta": 0,
+                "wire_counter_available": 1,
+                "wire_counter_source": "sysfs_netdev_stats",
+                "wire_counter_confidence": 1.0,
+                "wire_tx_packets_delta": 9,
+                "wire_tx_dropped_delta": 0,
+                "wire_tx_errors_delta": 1,
+                "wire_tx_bytes_delta": 800,
                 "wire_loss_est_packets": 0,
                 "gpu_template_h2d_copy_count": 1,
                 "gpu_template_h2d_copy_bytes": 1024,
@@ -294,7 +308,7 @@ class TestReporting(unittest.TestCase):
         )
 
         self.assertEqual(rr.results["wire_loss_est_packets"], 0)
-        self.assertEqual(rr.results["wire_loss_status"], "ok")
+        self.assertEqual(rr.results["wire_loss_status"], "unknown")
         self.assertEqual(rr.results["wire_loss_raw_packets"], 0)
         self.assertEqual(rr.results["wire_loss_raw_uncapped_packets"], 0)
         self.assertEqual(rr.results["wire_loss_raw_over_attempted_packets"], 0)

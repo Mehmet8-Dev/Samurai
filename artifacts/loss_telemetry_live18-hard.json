@@ -1,0 +1,16 @@
+{
+  "generated_at_utc": "2026-03-03T03:52:13+00:00",
+  "host_tx_dropped_delta": 0,
+  "host_tx_errors_delta": 0,
+  "host_tx_packets_delta": 600275,
+  "schema_version": "1",
+  "softnet_dropped_delta": 0,
+  "softnet_time_squeeze_delta": 0,
+  "wire_loss_est_packets": 0,
+  "wire_loss_est_pct": 0.0,
+  "wire_loss_estimation_capped": 0,
+  "wire_loss_fail_pct": 5.0,
+  "wire_loss_raw_packets": 0,
+  "wire_loss_raw_pct": 0.0,
+  "wire_loss_status": "ok"
+}

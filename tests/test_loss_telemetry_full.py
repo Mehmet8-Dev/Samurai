@@ -25,8 +25,16 @@ class TestLossTelemetryPolicy(unittest.TestCase):
                     "sent": max(0, attempted - wire_loss_packets),
                     "errors": wire_loss_packets,
                     "bytes_sent_est": max(0, attempted - wire_loss_packets) * 64,
+                    "wire_counter_available": 1,
+                    "wire_counter_source": "sysfs_netdev_stats",
+                    "wire_counter_confidence": 1.0,
+                    "wire_tx_packets_delta": max(0, attempted - wire_loss_packets),
                     "wire_loss_est_packets": wire_loss_packets,
                 },
+                "wire_counter_available": 1,
+                "wire_counter_source": "sysfs_netdev_stats",
+                "wire_counter_confidence": 1.0,
+                "wire_tx_packets_delta": max(0, attempted - wire_loss_packets),
                 "wire_loss_est_packets": wire_loss_packets,
             }
         ]
@@ -57,4 +65,3 @@ class TestLossTelemetryPolicy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
