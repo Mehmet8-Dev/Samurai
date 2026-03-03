@@ -82,6 +82,7 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--gpu-template-pool-size-l7", opts)
         self.assertIn("--gpu-ring-capacity", opts)
         self.assertIn("--gpu-pinned-max-mb", opts)
+        self.assertIn("--gpu-rng-seed", opts)
         self.assertIn("--state-table-size", opts)
         self.assertIn("--state-lock-count", opts)
         self.assertIn("--state-timeout-sec", opts)
@@ -118,6 +119,7 @@ class TestCliParser(unittest.TestCase):
                 "SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7": "55",
                 "SAMURAI_GPU_RING_CAPACITY": "4",
                 "SAMURAI_GPU_PINNED_MAX_MB": "256",
+                "SAMURAI_GPU_RNG_SEED": "987654",
                 "SAMURAI_STATE_TABLE_SIZE": "32768",
                 "SAMURAI_STATE_LOCK_COUNT": "128",
                 "SAMURAI_STATE_TIMEOUT_SEC": "45",
@@ -131,6 +133,7 @@ class TestCliParser(unittest.TestCase):
             self.assertEqual(args.gpu_template_pool_size_l7, 55)
             self.assertEqual(args.gpu_ring_capacity, 4)
             self.assertEqual(args.gpu_pinned_max_mb, 256)
+            self.assertEqual(args.gpu_rng_seed, 987654)
             self.assertEqual(args.state_table_size, 32768)
             self.assertEqual(args.state_lock_count, 128)
             self.assertEqual(args.state_timeout_sec, 45)
@@ -242,11 +245,16 @@ class TestRootGateRegression(unittest.TestCase):
             self.assertFalse(cli._is_cuda_raw_vector(args))
 
     def test_cuda_http_vectors_are_marked_raw(self):
-        """CUDA HTTP/HTTP2 paths use raw sender, therefore root-gated."""
+        """CUDA HTTP path uses raw sender and remains root-gated."""
         parser = cli.build_parser()
-        for v in ("http", "http2"):
+        for v in ("http",):
             args = parser.parse_args(["--attack-vector", v, "--compute-backend", "cuda"])
             self.assertTrue(cli._is_cuda_raw_vector(args))
+
+    def test_cuda_http2_vector_not_marked_raw_after_hybrid_integration(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--attack-vector", "http2", "--compute-backend", "cuda"])
+        self.assertFalse(cli._is_cuda_raw_vector(args))
 
 
 class TestBuildTestCommandRegression(unittest.TestCase):

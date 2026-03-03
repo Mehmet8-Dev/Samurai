@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from ddos_samurai import senders
@@ -16,6 +17,7 @@ class _FakeLimits:
 
 class _FakeAsyncClient:
     response_plan = []
+    requests = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -27,7 +29,8 @@ class _FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def request(self, method, path):
+    async def request(self, method, path, headers=None):
+        self.requests.append((method, path, headers))
         item = self.response_plan.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -44,6 +47,7 @@ class _FakeHttpx:
 
 class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
     async def test_http2_sender_status_counters(self):
+        _FakeAsyncClient.requests = []
         _FakeAsyncClient.response_plan = [
             _FakeResponse(200),
             _FakeResponse(404),
@@ -71,8 +75,10 @@ class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["status_5xx"], 1)
         self.assertEqual(out["h2_profile_disabled"], 1)
         self.assertEqual(out["h2_profile_applied"], 0)
+        self.assertEqual(len(_FakeAsyncClient.requests), 3)
 
     async def test_http2_sender_error_path_does_not_raise_nameerror(self):
+        _FakeAsyncClient.requests = []
         _FakeAsyncClient.response_plan = [
             _FakeResponse(200),
             RuntimeError("boom"),
@@ -99,3 +105,39 @@ class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["status_4xx"], 0)
         self.assertEqual(out["status_5xx"], 1)
         self.assertEqual(out["h2_profile_apply_failed"], 1)
+        self.assertEqual(len(_FakeAsyncClient.requests), 3)
+
+    async def test_http2_sender_consumes_request_plan_and_keeps_backward_compatible_fallback(self):
+        _FakeAsyncClient.requests = []
+        _FakeAsyncClient.response_plan = [
+            _FakeResponse(200),
+            _FakeResponse(201),
+        ]
+        request_plan = SimpleNamespace(
+            items=[
+                SimpleNamespace(method="POST", path="/submit", user_agent="Plan-UA-1"),
+                SimpleNamespace(method="GET", path="/health", user_agent="Plan-UA-2"),
+            ]
+        )
+        with patch.object(senders, "HTTPX_AVAILABLE", True), patch.object(senders, "httpx", _FakeHttpx):
+            out = await senders.http2_sender(
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=99,
+                concurrency=4,
+                http_path="/",
+                http_method="GET",
+                verbose=False,
+                scheme="https",
+                h2_profile_name="none",
+                request_plan=request_plan,
+            )
+
+        self.assertEqual(out["attempted"], 2)
+        self.assertEqual(out["sent"], 2)
+        self.assertEqual(out["errors"], 0)
+        self.assertEqual(_FakeAsyncClient.requests[0][0], "POST")
+        self.assertEqual(_FakeAsyncClient.requests[0][1], "/submit")
+        self.assertEqual(_FakeAsyncClient.requests[0][2], {"User-Agent": "Plan-UA-1"})
+        self.assertEqual(_FakeAsyncClient.requests[1][0], "GET")
+        self.assertEqual(_FakeAsyncClient.requests[1][1], "/health")
