@@ -488,7 +488,13 @@ def start_worker(
     except Exception as e:
         print(f"[Worker {worker_id}] Failed to set CPU affinity: {e}")
 
-    try:
+    soak_deadline_ts = float(args.get("soak_deadline_ts", 0.0) or 0.0)
+    soak_profile = str(args.get("soak_profile", "none") or "none").strip().lower()
+    soak_continuous_mode = soak_profile in {"1h", "6h", "24h"}
+    if int(args.get("count", 0) or 0) <= 0:
+        args["count"] = 1
+
+    def _run_once():
         asyncio.run(
             worker_process(
                 worker_id,
@@ -502,6 +508,13 @@ def start_worker(
                 resource_stats=resource_stats,
             )
         )
+
+    try:
+        if soak_continuous_mode and soak_deadline_ts > 0.0:
+            while time.time() < soak_deadline_ts:
+                _run_once()
+        else:
+            _run_once()
     except KeyboardInterrupt:
         pass
 

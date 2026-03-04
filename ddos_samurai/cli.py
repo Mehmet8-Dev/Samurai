@@ -382,7 +382,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-t", "--target", help="Hedef IP adresi (config dosyasında da belirtilebilir)")
     parser.add_argument("-p", "--port", type=int, help="Hedef port (config dosyasında da belirtilebilir)")
     parser.add_argument("--source-port", type=int, default=0, help="Kaynak port (0: rastgele)")
-    parser.add_argument("-c", "--count", type=int, default=10, help="Gönderilecek toplam paket/istek sayısı")
+    parser.add_argument(
+        "-c",
+        "--count",
+        type=int,
+        default=10,
+        help="Gönderilecek toplam paket/istek sayısı (soak profilinde per-iterasyon batch boyutu).",
+    )
     parser.add_argument("-P", "--protocol", choices=["tcp", "udp", "icmp"], default="tcp", help="Kullanılacak protokol (tcp/udp/icmp)")
     parser.add_argument("-d", "--delay", type=float, default=0, help="Paketler arası gecikme (saniye cinsinden) - RPS ile birlikte kullanılmaz")
 
@@ -1436,10 +1442,25 @@ def main(argv=None):
     resource_stats = manager.dict()
 
     workers = args.workers if args.workers > 0 else multiprocessing.cpu_count()
-    total_count = args.count
-    if total_count < workers:
-        workers = total_count
-        utils.log_warning(f"Toplam paket sayısı ({total_count}), işçi sayısından ({args.workers}) az. İşçi sayısı {total_count} olarak ayarlandı.")
+    soak_duration_s = int((soak_cfg or {}).get("duration_s", 0) or 0)
+    if soak_cfg is not None and soak_duration_s > 0:
+        soak_chunk_total = int(args.count or 0)
+        if float(args.rps or 0.0) > 0.0:
+            soak_chunk_total = max(soak_chunk_total, int(float(args.rps) * 5.0))
+        soak_chunk_total = max(soak_chunk_total, workers * 64, 1024)
+        soak_chunk_total = min(soak_chunk_total, 500000)
+        total_count = int(soak_chunk_total)
+        monitor_total_count = 0
+        utils.log_info(
+            f"Soak sürekli modu aktif: {soak_duration_s}s boyunca count toplam limiti uygulanmayacak "
+            f"(iterasyon başına toplam batch: {total_count})."
+        )
+    else:
+        total_count = int(args.count or 0)
+        if total_count < workers:
+            workers = total_count
+            utils.log_warning(f"Toplam paket sayısı ({total_count}), işçi sayısından ({args.workers}) az. İşçi sayısı {total_count} olarak ayarlandı.")
+        monitor_total_count = total_count
 
     count_per_worker = total_count // workers if workers > 0 else 0
     worker_counts = [count_per_worker] * workers
@@ -1451,6 +1472,7 @@ def main(argv=None):
     
     processes = []
     start_time = time.time()
+    soak_deadline_ts = (start_time + float(soak_duration_s)) if (soak_cfg is not None and soak_duration_s > 0) else 0.0
     started_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     interrupted = False
     monitor_summary = {}
@@ -1462,6 +1484,8 @@ def main(argv=None):
 
         worker_args = argparse.Namespace(**vars(args))
         worker_args.count = worker_counts[i]
+        if soak_deadline_ts > 0.0:
+            worker_args.soak_deadline_ts = float(soak_deadline_ts)
 
         if worker_args.rps > 0:
             worker_args.rps = worker_args.rps / workers
@@ -1491,7 +1515,7 @@ def main(argv=None):
             processes,
             progress,
             progress_lock,
-            total_count,
+            monitor_total_count,
             refresh=0.25,
             sent_total=sent_total_shared,
             errors_total=errors_total_shared,
@@ -1574,7 +1598,7 @@ def main(argv=None):
                 worker_events=events_local,
                 duration_s=float(duration),
                 progress_total=int(progress_total),
-                total_count=int(total_count),
+                total_count=int(progress_total if soak_cfg is not None else total_count),
                 metrics=m.snapshot(),
                 warnings=warnings,
             )

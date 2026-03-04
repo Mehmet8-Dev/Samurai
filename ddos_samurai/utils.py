@@ -212,6 +212,7 @@ def attack_live_monitor(
     last_inst_time = start
 
     soak_enabled = bool(soak_config)
+    has_total_target = int(total_count or 0) > 0
     soak_snapshots = []
     soak_alarms = []
     soak_alarm_codes = set()
@@ -271,7 +272,7 @@ def attack_live_monitor(
             except Exception:
                 pass
 
-            pct = (p_val / total_count * 100) if total_count else 0
+            pct = (p_val / total_count * 100) if has_total_target else 0.0
             alive = sum(1 for p in processes if p.is_alive())
             backlog = max(0, int(p_val) - int(s_val) - int(e_val))
             pps_avg = (float(s_val) / float(elapsed)) if elapsed > 0 else 0.0
@@ -478,8 +479,12 @@ def attack_live_monitor(
                         f" ┆ VRAM: {_bytes_to_mb(vram_used_bytes):.0f}MB"
                         f" ┆ PINNED: {_bytes_to_mb(pinned_bytes):.0f}MB"
                     )
+                if has_total_target:
+                    progress_text = f"İlerleme: {p_val:,} / {total_count:,} ({pct:.1f}%)"
+                else:
+                    progress_text = f"İlerleme: {p_val:,} (sürekli)"
                 log_info(
-                    f"İlerleme: {p_val:,} / {total_count:,} ({pct:.1f}%) ┆ Geçen Süre: {elapsed:.0f}s "
+                    f"{progress_text} ┆ Geçen Süre: {elapsed:.0f}s "
                     f"┆ Aktif İşçi: {alive}/{len(processes)}{pps_str}{soak_str}"
                 )
 
