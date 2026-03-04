@@ -1310,25 +1310,53 @@ async def replay_pcap(
                 # ── TIMING-AWARE REPLAY (original / multiplier / rps-without-pacing) ──
                 # Single socket per loop + absolute schedule to reduce drift.
                 if cfg.use_l2:
-                    log_warning(
-                        "[PCAP Replay] use_l2 with timing-aware mode currently falls back to batch replay timing."
-                    )
-                    result = await senders.paced_raw_socket_sender(
-                        packets_buffer=prep.packets_buffer,
-                        target_ip=cfg.target_ip_override or "0.0.0.0",
-                        target_port=cfg.target_port_override or 0,
-                        count=prep.count,
-                        verbose=cfg.verbose,
-                        pacing_config=pacing_config,
-                        force_l2=True,
-                        live_sent=live_sent,
-                        live_errors=live_errors,
-                        live_progress=live_progress,
-                    )
-                    stats["attempted"] += int(result.get("attempted", 0) or 0)
-                    stats["sent"] += int(result.get("sent", 0) or 0)
-                    stats["errors"] += int(result.get("errors", 0) or 0)
-                    stats["bytes_sent_est"] += int(result.get("bytes_sent_est", 0) or 0)
+                    mv = memoryview(prep.packets_buffer)
+                    loop_start_t = time.monotonic()
+                    pkt_idx = 0
+                    max_window = max(1, int(cfg.batch_size))
+                    while pkt_idx < prep.count:
+                        if pkt_idx > 0:
+                            target_t = loop_start_t + schedule_offsets[pkt_idx]
+                            drift_ms = await _wait_until(target_t)
+                            drift_total_ms += drift_ms
+                            drift_samples += 1
+                            if drift_ms > drift_max_ms:
+                                drift_max_ms = drift_ms
+
+                        now_off = max(0.0, time.monotonic() - loop_start_t)
+                        send_end = min(prep.count, pkt_idx + 1)
+                        hard_limit = min(prep.count, pkt_idx + max_window)
+                        while send_end < hard_limit:
+                            if schedule_offsets[send_end] > now_off:
+                                break
+                            send_end += 1
+
+                        batch_count = max(1, int(send_end - pkt_idx))
+                        pkt_start = int(pkt_idx * prep.packet_size)
+                        pkt_end = int(pkt_start + (batch_count * prep.packet_size))
+                        batch_buffer = bytes(mv[pkt_start:pkt_end])
+
+                        result = await senders.paced_raw_socket_sender(
+                            packets_buffer=batch_buffer,
+                            target_ip=cfg.target_ip_override or "0.0.0.0",
+                            target_port=cfg.target_port_override or 0,
+                            count=batch_count,
+                            verbose=cfg.verbose,
+                            pacing_config=None,
+                            force_l2=True,
+                            live_sent=live_sent,
+                            live_errors=live_errors,
+                            live_progress=live_progress,
+                        )
+                        stats["attempted"] += int(result.get("attempted", 0) or 0)
+                        stats["sent"] += int(result.get("sent", 0) or 0)
+                        stats["errors"] += int(result.get("errors", 0) or 0)
+                        stats["bytes_sent_est"] += int(result.get("bytes_sent_est", 0) or 0)
+
+                        pkt_idx += batch_count
+                        if pkt_idx % max_window == 0:
+                            await asyncio.sleep(0)
+
                     stats["loops_completed"] += 1
                     continue
 

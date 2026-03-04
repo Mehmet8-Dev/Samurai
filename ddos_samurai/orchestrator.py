@@ -1046,6 +1046,7 @@ async def worker_process(
 
             if args['attack_vector'] == 'http2':
                 log_info("Initializing GPU HTTP/2 planner (hybrid GPU plan + CPU transport)...")
+                verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
                 BATCH_SIZE = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
                 remaining = int(args['count'])
                 payload_engine = gpu_payload.GPUPayloadEngine(
@@ -1086,6 +1087,7 @@ async def worker_process(
                             cookies=args.get('cookies'),
                             user_agent=args.get('user_agent'),
                             ssl_context=ssl_context,
+                            verify=verify_ssl,
                             h2_profile_name=args.get("h2_profile", args.get("ja3_profile", "none")),
                             request_plan=request_plan,
                             live_sent=sent_total,
@@ -1788,6 +1790,7 @@ async def worker_process(
                     live_progress=progress
                 ))
         elif args['attack_vector'] == "http2":
+            verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
             worker_stats = _add_stats(worker_stats, await senders.http2_sender(
                 target_ip=args['target'],
                 target_port=args['port'],
@@ -1800,6 +1803,7 @@ async def worker_process(
                 cookies=args.get('cookies'),
                 user_agent=args.get('user_agent'),
                 ssl_context=ssl_context,
+                verify=verify_ssl,
                 h2_profile_name=args.get("h2_profile", args.get("ja3_profile", "none")),
                 h2_transport_name=args.get("h2_transport", "auto"),
                 live_sent=sent_total,

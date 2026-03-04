@@ -1843,6 +1843,7 @@ async def http2_sender(
     h2_profile_name=None,
     h2_transport_name="auto",
     request_plan: "H2RequestPlan | None" = None,
+    verify=True,
     live_sent=None,
     live_errors=None,
     live_progress=None,
@@ -1869,6 +1870,14 @@ async def http2_sender(
     transport_name = str(h2_transport_name or "auto").strip().lower()
     if transport_name not in {"auto", "httpx", "hyper-h2"}:
         transport_name = "auto"
+    profile_requested = bool(
+        str(h2_profile_name or "").strip()
+        and str(h2_profile_name).strip().lower() != "none"
+    )
+    profile_disabled = int(not profile_requested)
+    scheme_name = str(scheme or "https").strip().lower()
+    ssl_ctx_obj = ssl_context if hasattr(ssl_context, "wrap_socket") else None
+    verify_tls = bool(verify)
 
     resolved_profile = None
     try:
@@ -1881,18 +1890,48 @@ async def http2_sender(
             attempted=dispatch_count,
             sent=0,
             errors=dispatch_count,
-            h2_profile_requested=bool(str(h2_profile_name or "").strip() and str(h2_profile_name).strip().lower() != "none"),
+            h2_profile_requested=int(profile_requested),
             h2_profile_applied=0,
-            h2_profile_disabled=0,
-            h2_profile_apply_failed=1,
+            h2_profile_disabled=profile_disabled,
+            h2_profile_apply_failed=int(profile_requested),
             h2_transport=transport_name,
         )
+
+    if transport_name == "hyper-h2":
+        if scheme_name != "https":
+            log_error("HTTP/2 hyper-h2 transport only supports scheme=https.")
+            _update_live(live_progress, dispatch_count)
+            _update_live(live_errors, dispatch_count)
+            return _stats(
+                attempted=dispatch_count,
+                sent=0,
+                errors=dispatch_count,
+                h2_profile_requested=int(profile_requested),
+                h2_profile_applied=0,
+                h2_profile_disabled=profile_disabled,
+                h2_profile_apply_failed=0,
+                h2_transport="hyper-h2",
+            )
+        if (not bool(HYPER_H2_AVAILABLE)) or _h2_transport is None:
+            log_error("HTTP/2 hyper-h2 transport requested but dependency is unavailable.")
+            _update_live(live_progress, dispatch_count)
+            _update_live(live_errors, dispatch_count)
+            return _stats(
+                attempted=dispatch_count,
+                sent=0,
+                errors=dispatch_count,
+                h2_profile_requested=int(profile_requested),
+                h2_profile_applied=0,
+                h2_profile_disabled=profile_disabled,
+                h2_profile_apply_failed=0,
+                h2_transport="hyper-h2",
+            )
 
     # Hyper-h2 path: real transport-level profile application
     can_try_hyper_h2 = (
         transport_name in {"auto", "hyper-h2"}
-        and resolved_profile is not None
-        and str(scheme).lower() == "https"
+        and (resolved_profile is not None or transport_name == "hyper-h2")
+        and scheme_name == "https"
         and bool(HYPER_H2_AVAILABLE)
         and _h2_transport is not None
     )
@@ -1922,12 +1961,11 @@ async def http2_sender(
                 host=str(target_ip),
                 port=int(target_port),
                 requests=reqs,
-                verify=bool(ssl_context) if isinstance(ssl_context, bool) else True,
-                ssl_context=ssl_context if hasattr(ssl_context, "wrap_socket") else None,
+                verify=verify_tls,
+                ssl_context=ssl_ctx_obj,
                 timeout_s=10.0,
-                settings=dict(getattr(resolved_profile, "settings", {}) or {}),
-                window_update=int(getattr(resolved_profile, "window_update", 0) or 0),
-                max_inflight_streams=max(1, int(concurrency or 1)),
+                settings=dict(getattr(resolved_profile, "settings", {}) or {}) if resolved_profile is not None else {},
+                window_update=int(getattr(resolved_profile, "window_update", 0) or 0) if resolved_profile is not None else 0,
             )
             sent_count = int(h2_out.get("sent", 0) or 0)
             err_count = int(h2_out.get("errors", max(0, dispatch_count - sent_count)) or 0)
@@ -1943,9 +1981,9 @@ async def http2_sender(
                 status_2xx=int(h2_out.get("status_2xx", 0) or 0),
                 status_4xx=int(h2_out.get("status_4xx", 0) or 0),
                 status_5xx=int(h2_out.get("status_5xx", 0) or 0),
-                h2_profile_requested=1,
-                h2_profile_applied=1,
-                h2_profile_disabled=0,
+                h2_profile_requested=int(profile_requested),
+                h2_profile_applied=int(bool(profile_requested and resolved_profile is not None)),
+                h2_profile_disabled=profile_disabled,
                 h2_profile_apply_failed=0,
                 h2_transport="hyper-h2",
             )
@@ -1958,10 +1996,10 @@ async def http2_sender(
                     attempted=dispatch_count,
                     sent=0,
                     errors=dispatch_count,
-                    h2_profile_requested=1,
+                    h2_profile_requested=int(profile_requested),
                     h2_profile_applied=0,
-                    h2_profile_disabled=0,
-                    h2_profile_apply_failed=1,
+                    h2_profile_disabled=profile_disabled,
+                    h2_profile_apply_failed=int(bool(profile_requested and resolved_profile is not None)),
                     h2_transport="hyper-h2",
                 )
 
@@ -2007,7 +2045,14 @@ async def http2_sender(
     
     try:
         limits = httpx.Limits(max_keepalive_connections=concurrency, max_connections=concurrency)
-        async with httpx.AsyncClient(http2=True, base_url=base_url, limits=limits, cookies=cookies, headers=headers, verify=ssl_context if ssl_context else False) as client:
+        async with httpx.AsyncClient(
+            http2=True,
+            base_url=base_url,
+            limits=limits,
+            cookies=cookies,
+            headers=headers,
+            verify=ssl_ctx_obj if ssl_ctx_obj is not None else verify_tls,
+        ) as client:
             h2_cfg = h2_mimic.apply_h2_profile(client, h2_profile_name)
             if h2_cfg.applied:
                 log_info(f"HTTP/2 profile applied: {h2_cfg.resolved}")
