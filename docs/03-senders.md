@@ -19,12 +19,17 @@ Not: Fragmentation karari builder'da degil sender'da uygulanir (builder tek pake
 
 ## Raw Socket Sender (L3/L2 Fast Path)
 
-- `raw_socket_sender(packets_buffer, target_ip, target_port, count, verbose)`
+- `raw_socket_sender(packets_buffer, target_ip, target_port, count, verbose, ..., force_l2=False)`
   - `socket.SOCK_RAW` uzerinden L3 gonderim (genelde root ister).
   - Varsa `fast_sender` C eklentisi ile hizli gonderim:
     - `send_ring_optimized`: L2 TX_RING (Ether header gerekir)
     - `send_optimized`: L3 sendmmsg benzeri hizlandirma
   - Yoksa Python `sendmmsg` veya `sendto` fallback.
+
+`force_l2=True` davranisi:
+
+- L2 yolu kullanilamazsa sessiz L3 fallback yapmaz.
+- `sender_path=L2_UNAVAILABLE` ile fail-visible sonuc doner.
 
 `packets_buffer` beklenen format:
 
@@ -41,8 +46,10 @@ Bu sebeple GPU tarafinda paketlerin sabit boyda uretilmesi kritik.
 ## L7 Sender'lar
 
 - HTTP/1.1: `http_app_sender` (httpx)
-- HTTP/2: `http2_sender` (httpx http2)
+- HTTP/1.1 Stateful: `http_stateful_sender` (VirtualUser pool)
+- HTTP/2: `http2_sender` (`httpx` veya `hyper-h2`)
 - WebSocket: `websocket_sender` (websockets)
+- WebSocket Stateful Scenario: `websocket_scenario_sender` (auth -> subscribe -> ping/pong)
 - QUIC/HTTP3: `quic_sender` (aioquic)
 - Slow-* akislari: `slow_attack_sender` (baglanti/soket davranisi)
 
@@ -56,6 +63,55 @@ Bu akislarda profil semantigi aciktir:
 - `h2_profile_disabled`
 - `h2_profile_applied`
 - `h2_profile_apply_failed`
+
+Ek HTTP/2 transport metri gi:
+
+- `h2_transport=httpx|hyper-h2`
+
+### HTTP/2 Transport Secimi (Faz 3)
+
+`http2_sender` icinde iki yol vardir:
+
+1. `hyper-h2` yolu
+   - Profil ayarlari gercek transport seviyesinde uygulanir.
+   - `h2_profile_applied=1` ve `h2_transport=hyper-h2` doner.
+   - Hata durumunda:
+     - `h2_transport=hyper-h2` zorlandiysa fail-visible cikis
+     - `auto` modda `httpx` fallback
+
+2. `httpx` yolu (geri uyum)
+   - Mevcut request-plan / status counter davranisi korunur.
+   - `h2_transport=httpx` olarak raporlanir.
+
+Not: `hyper-h2` implementation detaylari `ddos_samurai/h2_transport.py` icindedir.
+
+### HTTP Stateful Sender (Faz 2)
+
+`http_stateful_sender`:
+
+- Per-VU workflow zinciri calistirir.
+- Varsayilan chain: `bootstrap -> prefetch -> action`.
+- `run_vu_pool(...)` ile cookie/token/redirect izolasyonu saglar.
+- L7 metrikleri (`session_success_rate`, `cookie_set_apply_rate`, `redirect_follow_ratio`, `retry_success_rate`) stats icinde doner.
+
+### WebSocket Scenario Sender (Faz 3)
+
+`websocket_scenario_sender` adimlari:
+
+1. connect
+2. optional auth message
+3. 0..N subscribe message
+4. ping adimi (`ws_ping_count`)
+5. optional recv/ack (`ws_await_response`)
+
+Ek stats:
+
+- `ws_sessions_ok`
+- `ws_auth_sent`
+- `ws_subscribe_sent`
+- `ws_ping_sent`
+- `ws_pong_received`
+- `ws_scenario_enabled`
 
 ## Sender Path Secimi ve Fallback Karar Agaci (trex_path)
 
@@ -110,7 +166,8 @@ Run report seviyesinde toplanir:
 
 ## Pacing V2 Alanlari
 
-`paced_raw_socket_sender` L2/L3 yollarinda ayni semayi dondurur (additive/backward-compatible):
+`paced_raw_socket_sender` L2/L3 yollarinda ayni semayi dondurur (additive/backward-compatible).
+Ek olarak `force_l2=True` ile L2 zorlamasi desteklenir.
 
 - `actual_rps`
 - `rate_accuracy_pct`

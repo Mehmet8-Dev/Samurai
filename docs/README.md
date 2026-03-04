@@ -29,3 +29,5 @@ Onemli not:
 13. `docs/12-dashboard.md`: Dashboard UI, env config (VITE_API_BASE_URL), log/stats modeli
 14. `docs/13-api.md`: FastAPI katmani (ddos_samurai/api.py) endpoint semantigi
 15. `docs/14-project-analysis-and-trex-comparison.md`: Detayli proje analizi + Cisco TRex karsilastirmasi ve puanlama
+16. `docs/15-technology-maturity-and-trex-gap-analysis.md`: Teknoloji olgunlugu, urunlesme riski, TRex/Keysight gap analizi
+17. `docs/16-l7-stateful-phase2-phase3-update.md`: Faz 2/3 stateful, H2 transport, WS scenario, PCAP flow-aware/L2 degisiklik ozeti

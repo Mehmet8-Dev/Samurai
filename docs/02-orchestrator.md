@@ -21,7 +21,7 @@ CLI sadece processleri baslatir; is mantigi worker tarafinda dispatch edilir.
 
 `attack_vector`:
 
-- L7: `senders.http_app_sender`, `senders.http2_sender`, `senders.websocket_sender`, `senders.quic_sender`, `senders.slow_attack_sender`
+- L7: `senders.http_app_sender`, `senders.http_stateful_sender`, `senders.http2_sender`, `senders.websocket_sender`, `senders.websocket_scenario_sender`, `senders.quic_sender`, `senders.slow_attack_sender`
 - Amplification: `senders.amplification_sender`
 - Diger L4/L3: `senders.packet_sender` + `packet.PacketConfig`
 
@@ -30,6 +30,17 @@ Profil akisi:
 - `tls_profile` yalnizca TLS context olusturma hattinda kullanilir.
 - `h2_profile` yalnizca HTTP/2 sender hattina gider.
 - `h2_profile=none` oldugunda orchestrator explicit olarak "uygulama yok" semantigini korur.
+- `h2_transport` HTTP/2 sender'a dogrudan aktarilir (`auto|httpx|hyper-h2`).
+
+HTTP stateful dispatch:
+
+- `attack_vector=http` ve `stateful=true` ise `http_stateful_sender(...)` cagrilir.
+- `stateful=false` ise `http_app_sender(...)` kullanilir.
+
+WebSocket scenario dispatch:
+
+- `attack_vector=websocket` ve `ws_scenario=true` ise `websocket_scenario_sender(...)` cagrilir.
+- `ws_scenario=false` ise klasik `websocket_sender(...)` yolu korunur.
 
 ### CUDA yolu
 
@@ -79,6 +90,15 @@ Periyodik `sweep_state_table(...)` cagrisi timeout olan kayitlari temizler.
 
 `finally` blogunda `progress.value += args['count']` yapilir.
 Bu, "gonderildi" degil "worker gorev tamamlandi" semantigine daha yakindir (tek tek paket sayimi degil).
+
+## PCAP Replay Dispatch Guncellemesi (Faz 3)
+
+Orchestrator, `pcap_replay.PcapReplayConfig` olustururken yeni alanlari da doldurur:
+
+- `use_l2` <- `--pcap-use-l2`
+- `flow_aware_rewrite` <- `not --pcap-no-flow-aware`
+
+Boylece replay hattinda L2 zorlama ve TCP flow-aware rewrite davranisi worker katmanindan aktif edilir.
 
 ## Worker Status Semantigi (v2 - trex_path)
 

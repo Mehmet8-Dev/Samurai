@@ -29,6 +29,31 @@ Asagidaki marker seti kullanilir:
 
 `SAMURAI_TEST_PROFILE=ci_safe` iken `privileged` ve `gpu` testler otomatik skip edilir.
 
+## Faz 2/3 Regresyon Seti (onerilen hizli dogrulama)
+
+Asagidaki set, HTTP stateful + HTTP/2 transport + WS scenario + PCAP flow-aware/L2 degisikliklerini hedefli dogrular:
+
+```bash
+PYTHONPATH=. python3 -m pytest -q \
+  tests/test_l7_stateful.py \
+  tests/test_senders_http2.py \
+  tests/test_orchestrator_cpu.py \
+  tests/test_pcap_replay.py
+```
+
+CLI parser degisiklikleri (yeni flag'ler) icin:
+
+```bash
+PYTHONPATH=. python3 -m pytest -q \
+  tests/test_cli_parser.py::TestCliParser::test_parser_has_expected_flags \
+  tests/test_cli_parser.py::TestCliParser::test_attack_vector_choices_are_aligned_with_orchestrator
+```
+
+Not:
+
+- `tests/test_sender_comprehensive.py` bazi ortamlarda `SAMURAI_TEST_PROFILE=ci_safe` ile skip olabilir.
+- Bu beklenen davranistir; privileged path testleri full profile ile kosulmalidir.
+
 ## RFC Suite Ayrimi
 
 - Pozitif RFC suite: `tests/test_rfc_compliance.py` (`rfc_positive`)

@@ -43,3 +43,31 @@ Gelistirme icin kritik nokta:
 `if __name__ == '__main__'` altinda `spawn` start method'u ayarlanir.
 Bu, CUDA context ve fork etkileisimlerini daha kontrol edilebilir hale getirir.
 
+## Faz 2/3 ile Eklenen Bayraklar
+
+HTTP/2:
+
+- `--h2-transport {auto,httpx,hyper-h2}`
+  - `auto`: uygun kosulda `hyper-h2`, degilse `httpx` fallback
+  - `httpx`: mevcut transport davranisini zorlar
+  - `hyper-h2`: profile-aware transportu zorlar (destek yoksa fail-visible)
+
+WebSocket scenario:
+
+- `--ws-scenario`
+- `--ws-auth-message`
+- `--ws-subscribe-message ...`
+- `--ws-ping-count`
+- `--ws-await-response`
+
+PCAP replay:
+
+- `--pcap-use-l2`
+  - PCAP replay yolunu L2 TX_RING hattina zorlar
+- `--pcap-no-flow-aware`
+  - TCP seq/ack flow-aware rewrite'i kapatir
+
+Run report input snapshot alanlari da guncellendi:
+
+- `ws_scenario`
+- `h2_transport`
