@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from ddos_samurai import senders
 
@@ -141,3 +141,40 @@ class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_FakeAsyncClient.requests[0][2], {"User-Agent": "Plan-UA-1"})
         self.assertEqual(_FakeAsyncClient.requests[1][0], "GET")
         self.assertEqual(_FakeAsyncClient.requests[1][1], "/health")
+
+    async def test_http2_sender_uses_hyper_h2_transport_when_requested(self):
+        fake_h2_transport = SimpleNamespace(
+            send_h2_requests=AsyncMock(
+                return_value={
+                    "attempted": 2,
+                    "sent": 2,
+                    "errors": 0,
+                    "responses_total": 2,
+                    "status_2xx": 2,
+                    "status_4xx": 0,
+                    "status_5xx": 0,
+                }
+            )
+        )
+        with patch.object(senders, "HTTPX_AVAILABLE", True), \
+             patch.object(senders, "HYPER_H2_AVAILABLE", True), \
+             patch.object(senders, "_h2_transport", fake_h2_transport):
+            out = await senders.http2_sender(
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=2,
+                concurrency=2,
+                http_path="/",
+                http_method="GET",
+                verbose=False,
+                scheme="https",
+                h2_profile_name="chrome_120",
+                h2_transport_name="hyper-h2",
+            )
+
+        fake_h2_transport.send_h2_requests.assert_awaited_once()
+        self.assertEqual(out["attempted"], 2)
+        self.assertEqual(out["sent"], 2)
+        self.assertEqual(out["errors"], 0)
+        self.assertEqual(out["h2_profile_applied"], 1)
+        self.assertEqual(out["h2_transport"], "hyper-h2")

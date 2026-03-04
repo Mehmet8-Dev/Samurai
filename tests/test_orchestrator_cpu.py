@@ -44,6 +44,17 @@ def _base_args():
         "http_timeout": 2.0,
         "http_retries": 0,
         "http2_concurrency": 10,
+        "h2_transport": "auto",
+        "ws_path": "/ws",
+        "ws_message": "ping",
+        "ws_concurrency": 10,
+        "ws_scenario": False,
+        "ws_auth_message": "",
+        "ws_subscribe_message": None,
+        "ws_ping_count": 1,
+        "ws_await_response": False,
+        "pcap_use_l2": False,
+        "pcap_no_flow_aware": False,
         "evasion_techniques": None,
         "cookies": None,
         "user_agent": None,
@@ -66,6 +77,34 @@ class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
         with patch.object(orchestrator.senders, "http_app_sender", mock_http):
             await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
             mock_http.assert_awaited_once()
+
+    async def test_worker_process_http_stateful_calls_stateful_sender(self):
+        args = _base_args()
+        args["attack_vector"] = "http"
+        args["stateful"] = True
+        args["count"] = 3
+
+        mock_http = AsyncMock()
+        mock_stateful = AsyncMock(return_value={"attempted": 3, "sent": 3, "errors": 0})
+        with patch.object(orchestrator.senders, "http_app_sender", mock_http):
+            with patch.object(orchestrator.senders, "http_stateful_sender", mock_stateful):
+                await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
+                mock_stateful.assert_awaited_once()
+                mock_http.assert_not_awaited()
+
+    async def test_worker_process_websocket_scenario_calls_scenario_sender(self):
+        args = _base_args()
+        args["attack_vector"] = "websocket"
+        args["ws_scenario"] = True
+        args["count"] = 3
+
+        mock_ws = AsyncMock()
+        mock_ws_scenario = AsyncMock(return_value={"attempted": 3, "sent": 3, "errors": 0})
+        with patch.object(orchestrator.senders, "websocket_sender", mock_ws):
+            with patch.object(orchestrator.senders, "websocket_scenario_sender", mock_ws_scenario):
+                await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
+                mock_ws_scenario.assert_awaited_once()
+                mock_ws.assert_not_awaited()
 
     async def test_worker_process_http2_path_calls_http2_sender(self):
         args = _base_args()
@@ -112,6 +151,43 @@ class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
             cfg = call_kwargs["packet_config"]
             self.assertTrue(getattr(cfg, "fragment_enabled") is True)
             self.assertEqual(getattr(cfg, "fragment_size"), 256)
+
+    async def test_worker_process_basic_with_pacing_routes_to_paced_sender(self):
+        args = _base_args()
+        args["attack_vector"] = "basic"
+        args["pacing_mode"] = "rps"
+        args["rps"] = 1000.0
+
+        mock_pkt = AsyncMock()
+        mock_paced = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
+        with patch.object(orchestrator, "PACING_ENGINE_AVAILABLE", True):
+            with patch.object(orchestrator.cpu_packet_engine, "generate_packet_pool", return_value=(b"x" * 320, 64)):
+                with patch.object(orchestrator.senders, "packet_sender", mock_pkt):
+                    with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_paced):
+                        await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
+
+        mock_paced.assert_awaited_once()
+        _call_args, call_kwargs = mock_paced.call_args
+        self.assertEqual(call_kwargs["count"], 5)
+        mock_pkt.assert_not_awaited()
+
+    async def test_worker_process_basic_with_pacing_and_fragment_falls_back(self):
+        args = _base_args()
+        args["attack_vector"] = "basic"
+        args["pacing_mode"] = "rps"
+        args["rps"] = 1000.0
+        args["fragment"] = True
+        args["fragment_size"] = 256
+
+        mock_pkt = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
+        mock_paced = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
+        with patch.object(orchestrator, "PACING_ENGINE_AVAILABLE", True):
+            with patch.object(orchestrator.senders, "packet_sender", mock_pkt):
+                with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_paced):
+                    await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
+
+        mock_pkt.assert_awaited_once()
+        mock_paced.assert_not_awaited()
 
 
 class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):

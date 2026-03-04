@@ -17,7 +17,7 @@ import struct
 import tempfile
 import unittest
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from ddos_samurai.pcap_replay import (
     PCAP_MAGIC_LE,
@@ -612,6 +612,82 @@ class TestPrepareReplay(unittest.TestCase):
             # Check that first byte looks like IPv4 (0x45)
             first_byte = prep.packets_buffer[0]
             self.assertEqual((first_byte >> 4) & 0xF, 4, "Should be IPv4 after stripping Ethernet")
+        finally:
+            os.unlink(path)
+
+    def test_use_l2_and_strip_eth_conflict(self):
+        packets_data = [(1000, 0, _build_eth_tcp_packet())]
+        path = _write_pcap_to_tempfile(packets_data)
+        try:
+            cfg = PcapReplayConfig(
+                pcap_file=path,
+                use_l2=True,
+                strip_ethernet=True,
+            )
+            with self.assertRaises(PcapParseError):
+                prepare_replay(cfg)
+        finally:
+            os.unlink(path)
+
+    def test_flow_aware_rewrite_adjusts_seq_on_colliding_flows(self):
+        tcp_a = _build_tcp_header(src_port=1111, dst_port=80, seq=1000, ack=0, flags=0x02)
+        ip_a = _build_ipv4_header(src_ip="10.0.0.1", dst_ip="20.0.0.1", protocol=PROTO_TCP, total_len=20 + len(tcp_a))
+        pkt_a = _build_ethernet_header() + ip_a + tcp_a
+
+        tcp_b = _build_tcp_header(src_port=2222, dst_port=80, seq=2000, ack=0, flags=0x02)
+        ip_b = _build_ipv4_header(src_ip="10.0.0.2", dst_ip="20.0.0.1", protocol=PROTO_TCP, total_len=20 + len(tcp_b))
+        pkt_b = _build_ethernet_header() + ip_b + tcp_b
+
+        packets_data = [(1000, 0, pkt_a), (1000, 1000, pkt_b)]
+        path = _write_pcap_to_tempfile(packets_data)
+        try:
+            cfg = PcapReplayConfig(
+                pcap_file=path,
+                src_ip_override="30.30.30.30",
+                src_port_override=5555,
+                flow_aware_rewrite=True,
+            )
+            prep = prepare_replay(cfg)
+            self.assertEqual(prep.count, 2)
+            self.assertGreaterEqual(int(prep.stats.get("flow_collision_count", 0) or 0), 1)
+            self.assertGreaterEqual(int(prep.stats.get("tcp_seq_adjusted", 0) or 0), 1)
+
+            pkt0 = prep.packets_buffer[:prep.packet_size]
+            pkt1 = prep.packets_buffer[prep.packet_size:2 * prep.packet_size]
+            info0 = _get_ip_info(ParsedPacket(0, pkt0, len(pkt0), DLT_EN10MB))
+            info1 = _get_ip_info(ParsedPacket(0, pkt1, len(pkt1), DLT_EN10MB))
+            self.assertIsNotNone(info0)
+            self.assertIsNotNone(info1)
+            off0 = int(info0["ip_offset"]) + int(info0["ihl"]) + 4
+            off1 = int(info1["ip_offset"]) + int(info1["ihl"]) + 4
+            seq0 = struct.unpack("!I", pkt0[off0:off0 + 4])[0]
+            seq1 = struct.unpack("!I", pkt1[off1:off1 + 4])[0]
+
+            self.assertEqual(seq0, 1000)
+            self.assertNotEqual(seq1, 2000)
+        finally:
+            os.unlink(path)
+
+
+class TestReplayExecution(unittest.IsolatedAsyncioTestCase):
+    async def test_replay_use_l2_passes_force_l2_to_sender(self):
+        packets_data = [(1000, 0, _build_eth_tcp_packet())]
+        path = _write_pcap_to_tempfile(packets_data)
+        try:
+            cfg = PcapReplayConfig(
+                pcap_file=path,
+                timing_mode="topspeed",
+                use_l2=True,
+                target_ip_override="127.0.0.1",
+                target_port_override=80,
+            )
+            mock_sender = AsyncMock(return_value={"attempted": 1, "sent": 1, "errors": 0, "bytes_sent_est": 64})
+            with patch("ddos_samurai.senders.paced_raw_socket_sender", mock_sender):
+                out = await replay_pcap(cfg)
+            self.assertEqual(out["attempted"], 1)
+            self.assertEqual(out["sent"], 1)
+            _args, kwargs = mock_sender.call_args
+            self.assertTrue(bool(kwargs.get("force_l2", False)))
         finally:
             os.unlink(path)
 
