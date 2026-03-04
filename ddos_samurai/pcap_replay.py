@@ -51,7 +51,7 @@ import struct
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -241,8 +241,11 @@ def _validate_replay_config(cfg: PcapReplayConfig) -> None:
         )
 
 
-def _parse_pcap_classic(fp: io.BufferedIOBase) -> Tuple[List[ParsedPacket], dict]:
-    """Parse a classic PCAP file (libpcap v2.4 format)."""
+def _stream_pcap_classic(
+    fp: io.BufferedIOBase,
+    on_packet: Callable[[ParsedPacket], Any],
+) -> dict:
+    """Stream a classic PCAP file and invoke `on_packet` per decoded packet."""
     header = fp.read(24)
     if len(header) < 24:
         raise PcapParseError("PCAP file too short for global header")
@@ -275,9 +278,9 @@ def _parse_pcap_classic(fp: io.BufferedIOBase) -> Tuple[List[ParsedPacket], dict
         "endian": endian,
     }
 
-    packets: List[ParsedPacket] = []
     rec_hdr_fmt = f"{endian}IIII"
     rec_hdr_size = 16
+    total_packets = 0
 
     while True:
         hdr_bytes = fp.read(rec_hdr_size)
@@ -301,14 +304,18 @@ def _parse_pcap_classic(fp: io.BufferedIOBase) -> Tuple[List[ParsedPacket], dict
         else:
             ts = float(ts_sec) + float(ts_frac) / 1e6
 
-        packets.append(ParsedPacket(
+        pkt = ParsedPacket(
             timestamp_s=ts,
             raw_data=pkt_data,
             orig_len=orig_len,
             link_type=link_type,
-        ))
+        )
+        total_packets += 1
+        if on_packet(pkt) is False:
+            break
 
-    return packets, meta
+    meta["total_packets"] = int(total_packets)
+    return meta
 
 
 def _read_pcapng_block(fp: io.BufferedIOBase, endian: str) -> Optional[Tuple[int, bytes]]:
@@ -338,8 +345,11 @@ def _read_pcapng_block(fp: io.BufferedIOBase, endian: str) -> Optional[Tuple[int
     return (btype, body)
 
 
-def _parse_pcapng(fp: io.BufferedIOBase) -> Tuple[List[ParsedPacket], dict]:
-    """Parse a PCAP-NG file (basic SHB + IDB + EPB/SPB support)."""
+def _stream_pcapng(
+    fp: io.BufferedIOBase,
+    on_packet: Callable[[ParsedPacket], Any],
+) -> dict:
+    """Stream a PCAP-NG file and invoke `on_packet` per decoded packet."""
     # Read SHB to determine endianness
     shb_header = fp.read(12)
     if len(shb_header) < 12:
@@ -388,7 +398,7 @@ def _parse_pcapng(fp: io.BufferedIOBase) -> Tuple[List[ParsedPacket], dict]:
     iface_ts_resol: Dict[int, Tuple[int, int]] = {}
     iface_idx = 0
 
-    packets: List[ParsedPacket] = []
+    total_packets = 0
 
     while True:
         result = _read_pcapng_block(fp, endian)
@@ -441,12 +451,15 @@ def _parse_pcapng(fp: io.BufferedIOBase) -> Tuple[List[ParsedPacket], dict]:
             ts = ts_raw / float(base ** exponent)
 
             lt = iface_link_types.get(iface_id, DLT_EN10MB)
-            packets.append(ParsedPacket(
+            pkt = ParsedPacket(
                 timestamp_s=ts,
                 raw_data=pkt_data,
                 orig_len=orig_len,
                 link_type=lt,
-            ))
+            )
+            total_packets += 1
+            if on_packet(pkt) is False:
+                break
 
         elif btype == PCAPNG_SPB:
             # Simple Packet Block
@@ -455,23 +468,29 @@ def _parse_pcapng(fp: io.BufferedIOBase) -> Tuple[List[ParsedPacket], dict]:
             orig_len = struct.unpack(f"{endian}I", body[:4])[0]
             pkt_data = body[4:]
             lt = iface_link_types.get(0, DLT_EN10MB)
-            packets.append(ParsedPacket(
+            pkt = ParsedPacket(
                 timestamp_s=0.0,
                 raw_data=pkt_data,
                 orig_len=orig_len,
                 link_type=lt,
-            ))
+            )
+            total_packets += 1
+            if on_packet(pkt) is False:
+                break
 
     meta["link_types"] = iface_link_types
-    return packets, meta
+    meta["total_packets"] = int(total_packets)
+    return meta
 
 
-def parse_pcap_file(file_path: str) -> Tuple[List[ParsedPacket], dict]:
+def _stream_parse_pcap_file(
+    file_path: str,
+    on_packet: Callable[[ParsedPacket], Any],
+) -> dict:
     """
-    Parse a PCAP or PCAP-NG file.
+    Stream parse a PCAP/PCAP-NG file.
 
-    Returns:
-        (packets, metadata) — list of ParsedPacket and format metadata dict
+    `on_packet` is called for each decoded packet; if it returns False, parsing stops.
     """
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"PCAP file not found: {file_path}")
@@ -483,26 +502,50 @@ def parse_pcap_file(file_path: str) -> Tuple[List[ParsedPacket], dict]:
     with open(file_path, "rb") as fp:
         magic_bytes = fp.read(4)
         fp.seek(0)
-
         magic = struct.unpack("<I", magic_bytes)[0]
 
         if magic in (PCAP_MAGIC_LE, PCAP_MAGIC_BE, PCAP_MAGIC_NS_LE, PCAP_MAGIC_NS_BE):
-            packets, meta = _parse_pcap_classic(fp)
+            meta = _stream_pcap_classic(fp, on_packet)
         elif magic == PCAPNG_SHB:
-            packets, meta = _parse_pcapng(fp)
+            meta = _stream_pcapng(fp, on_packet)
         else:
-            # Try big-endian PCAP-NG SHB
             magic_be = struct.unpack(">I", magic_bytes)[0]
             if magic_be == PCAPNG_SHB:
-                packets, meta = _parse_pcapng(fp)
+                meta = _stream_pcapng(fp, on_packet)
             else:
                 raise PcapParseError(
                     f"Unrecognized file format (magic: 0x{magic:08X})"
                 )
 
-    meta["total_packets"] = len(packets)
     meta["file_path"] = file_path
     meta["file_size"] = file_size
+    return meta
+
+
+def _parse_pcap_classic(fp: io.BufferedIOBase) -> Tuple[List[ParsedPacket], dict]:
+    """Parse a classic PCAP file (libpcap v2.4 format)."""
+    packets: List[ParsedPacket] = []
+    meta = _stream_pcap_classic(fp, packets.append)
+    return packets, meta
+
+
+def _parse_pcapng(fp: io.BufferedIOBase) -> Tuple[List[ParsedPacket], dict]:
+    """Parse a PCAP-NG file (basic SHB + IDB + EPB/SPB support)."""
+    packets: List[ParsedPacket] = []
+    meta = _stream_pcapng(fp, packets.append)
+    return packets, meta
+
+
+def parse_pcap_file(file_path: str) -> Tuple[List[ParsedPacket], dict]:
+    """
+    Parse a PCAP or PCAP-NG file.
+
+    Returns:
+        (packets, metadata) — list of ParsedPacket and format metadata dict
+    """
+    packets: List[ParsedPacket] = []
+    meta = _stream_parse_pcap_file(file_path, packets.append)
+    meta["total_packets"] = len(packets)
     return packets, meta
 
 
@@ -857,10 +900,6 @@ def prepare_replay(
     5. Return timing info for replay scheduling
     """
     _validate_replay_config(cfg)
-    packets, meta = parse_pcap_file(cfg.pcap_file)
-
-    if not packets:
-        raise PcapParseError(f"No packets found in {cfg.pcap_file}")
 
     # ── Filtering ───────────────────────────────────────────────
     has_filter = (
@@ -869,40 +908,6 @@ def prepare_replay(
         cfg.filter_cfg.dst_port or cfg.filter_cfg.min_len > 0 or
         cfg.filter_cfg.max_len > 0
     )
-
-    filtered_packets: List[Tuple[ParsedPacket, Optional[Dict[str, Any]]]] = []
-    skipped = 0
-    malformed_errors = 0
-    malformed_skipped = 0
-
-    for pkt in packets:
-        try:
-            ip_info = _get_ip_info(pkt)
-        except (IndexError, struct.error, ValueError) as exc:
-            malformed_errors += 1
-            if cfg.skip_malformed:
-                malformed_skipped += 1
-                continue
-            raise PcapParseError(f"Malformed packet while extracting IP info: {exc}") from exc
-
-        if has_filter:
-            try:
-                keep = _apply_filter(pkt, ip_info, cfg.filter_cfg)
-            except ValueError as exc:
-                raise PcapParseError(f"Invalid filter configuration: {exc}") from exc
-            if not keep:
-                skipped += 1
-                continue
-
-        filtered_packets.append((pkt, ip_info))
-
-        if cfg.max_packets > 0 and len(filtered_packets) >= cfg.max_packets:
-            break
-
-    if not filtered_packets:
-        raise PcapParseError(
-            f"No packets remaining after filtering (total={len(packets)}, skipped={skipped})"
-        )
 
     # ── IP Rewriting & Strip Ethernet ───────────────────────────
     needs_rewrite = (
@@ -920,25 +925,77 @@ def prepare_replay(
             "tcp_ack_adjusted": 0,
         }
 
-    expected_count = len(filtered_packets)
+    skipped = 0
+    malformed_errors = 0
+    malformed_skipped = 0
+    selected_count = 0
+    total_in_file = 0
+    max_size = 0
     uniform_size = 0
     prepared_count = 0
-    max_size = 0
-    buf = bytearray()
     timestamps: List[float] = []
 
-    for pkt, ip_info in filtered_packets:
+    base_capacity = max(1, int(cfg.batch_size))
+    if int(cfg.max_packets) > 0:
+        capacity_packets = min(int(cfg.max_packets), max(1024, base_capacity))
+    else:
+        capacity_packets = max(1024, base_capacity)
+    buf = bytearray()
+
+    def _grow_capacity(min_packets: int) -> None:
+        nonlocal buf, capacity_packets
+        if uniform_size <= 0:
+            return
+        target = max(int(min_packets), int(capacity_packets) * 2, 1)
+        if int(cfg.max_packets) > 0:
+            target = min(target, int(cfg.max_packets))
+        if target <= capacity_packets:
+            return
+        new_buf = bytearray(target * uniform_size)
+        if prepared_count > 0:
+            used = prepared_count * uniform_size
+            new_buf[:used] = buf[:used]
+        buf = new_buf
+        capacity_packets = target
+
+    def _on_packet(pkt: ParsedPacket) -> bool:
+        nonlocal total_in_file, skipped, malformed_errors, malformed_skipped
+        nonlocal selected_count, uniform_size, prepared_count, max_size, buf, capacity_packets
+        total_in_file += 1
+
+        # Preserve old max_packets semantics: selection stops after N filter-passing packets.
+        if int(cfg.max_packets) > 0 and selected_count >= int(cfg.max_packets):
+            return True
+
+        try:
+            ip_info = _get_ip_info(pkt)
+        except (IndexError, struct.error, ValueError) as exc:
+            malformed_errors += 1
+            if cfg.skip_malformed:
+                malformed_skipped += 1
+                return True
+            raise PcapParseError(f"Malformed packet while extracting IP info: {exc}") from exc
+
+        if has_filter:
+            try:
+                keep = _apply_filter(pkt, ip_info, cfg.filter_cfg)
+            except ValueError as exc:
+                raise PcapParseError(f"Invalid filter configuration: {exc}") from exc
+            if not keep:
+                skipped += 1
+                return True
+
+        selected_count += 1
+
         try:
             raw = bytearray(pkt.raw_data)
 
             if cfg.strip_ethernet and pkt.link_type == DLT_EN10MB and len(raw) > ETH_HEADER_LEN:
-                # Check VLAN
                 ethertype = struct.unpack("!H", raw[12:14])[0]
                 if ethertype == 0x8100 and len(raw) > 18:
-                    raw = bytearray(raw[18:])
+                    raw = raw[18:]
                 else:
-                    raw = bytearray(raw[ETH_HEADER_LEN:])
-                # Recalculate IP info with new offsets
+                    raw = raw[ETH_HEADER_LEN:]
                 if ip_info:
                     ip_info = dict(ip_info)
                     ip_info["ip_offset"] = 0
@@ -961,46 +1018,59 @@ def prepare_replay(
             malformed_errors += 1
             if cfg.skip_malformed:
                 malformed_skipped += 1
-                continue
+                return True
             raise PcapParseError(f"Malformed packet during rewrite/strip: {exc}") from exc
 
-        data = bytes(raw)
-        data_len = len(data)
+        data_len = len(raw)
         if data_len > max_size:
             max_size = data_len
 
         needed_size = (data_len + 3) & ~3
         if uniform_size == 0:
             uniform_size = needed_size
-            buf = bytearray(uniform_size * expected_count)
+            cap = max(1, capacity_packets)
+            buf = bytearray(uniform_size * cap)
+            capacity_packets = cap
         elif needed_size > uniform_size:
+            old_uniform = uniform_size
             new_uniform = max(needed_size, (uniform_size * 3) // 2)
             new_uniform = (new_uniform + 3) & ~3
-            new_buf = bytearray(new_uniform * expected_count)
+            new_buf = bytearray(new_uniform * max(1, capacity_packets))
             for i in range(prepared_count):
-                old_off = i * uniform_size
+                old_off = i * old_uniform
                 new_off = i * new_uniform
-                new_buf[new_off:new_off + uniform_size] = buf[old_off:old_off + uniform_size]
+                new_buf[new_off:new_off + old_uniform] = buf[old_off:old_off + old_uniform]
             buf = new_buf
             uniform_size = new_uniform
 
+        if prepared_count >= capacity_packets:
+            _grow_capacity(prepared_count + 1)
+
         write_off = prepared_count * uniform_size
-        buf[write_off:write_off + data_len] = data
+        buf[write_off:write_off + data_len] = raw
         prepared_count += 1
         timestamps.append(pkt.timestamp_s)
+        return True
+
+    meta = _stream_parse_pcap_file(cfg.pcap_file, _on_packet)
+    if total_in_file <= 0:
+        raise PcapParseError(f"No packets found in {cfg.pcap_file}")
 
     if prepared_count <= 0:
+        if selected_count <= 0:
+            raise PcapParseError(
+                f"No packets remaining after filtering (total={total_in_file}, skipped={skipped})"
+            )
         raise PcapParseError(
             "No packets remained after malformed-packet handling "
             f"(malformed_errors={malformed_errors}, malformed_skipped={malformed_skipped})"
         )
 
-    # Trim to the actual number of prepared packets.
     if len(buf) != (uniform_size * prepared_count):
         buf = buf[: uniform_size * prepared_count]
 
     prep_stats = {
-        "total_in_file": len(packets),
+        "total_in_file": int(meta.get("total_packets", total_in_file)),
         "filtered_out": skipped,
         "prepared_count": prepared_count,
         "uniform_packet_size": uniform_size,

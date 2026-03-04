@@ -37,6 +37,7 @@ async def send_h2_requests(
     timeout_s: float = 10.0,
     settings: Optional[dict[int, int]] = None,
     window_update: int = 0,
+    max_inflight_streams: int = 100,
 ) -> dict[str, int]:
     """
     Minimal HTTP/2 client transport using hyper-h2.
@@ -81,67 +82,78 @@ async def send_h2_requests(
     status_2xx = 0
     status_4xx = 0
     status_5xx = 0
+    stream_status: dict[int, int] = {}
+    inflight: set[int] = set()
+    req_index = 0
+    max_inflight = max(1, int(max_inflight_streams or 1))
 
     try:
-        for item in requests:
-            method = str(item.get("method", "GET") or "GET").upper()
-            path = str(item.get("path", "/") or "/")
-            headers_in = dict(item.get("headers", {}) or {})
-            headers = [
-                (":method", method),
-                (":path", path),
-                (":scheme", "https"),
-                (":authority", str(host)),
-                ("user-agent", str(headers_in.pop("user-agent", headers_in.pop("User-Agent", "DDoSamurai-H2/3.0")))),
-            ]
-            for hk, hv in headers_in.items():
-                if hk and hv is not None:
-                    headers.append((str(hk), str(hv)))
+        while req_index < total or inflight:
+            # Fill the connection with as many concurrent streams as allowed.
+            while req_index < total and len(inflight) < max_inflight:
+                item = requests[req_index]
+                req_index += 1
+                method = str(item.get("method", "GET") or "GET").upper()
+                path = str(item.get("path", "/") or "/")
+                headers_in = dict(item.get("headers", {}) or {})
+                headers = [
+                    (":method", method),
+                    (":path", path),
+                    (":scheme", "https"),
+                    (":authority", str(host)),
+                    ("user-agent", str(headers_in.pop("user-agent", headers_in.pop("User-Agent", "DDoSamurai-H2/3.0")))),
+                ]
+                for hk, hv in headers_in.items():
+                    if hk and hv is not None:
+                        headers.append((str(hk), str(hv)))
 
-            stream_id = conn.get_next_available_stream_id()
-            conn.send_headers(stream_id=stream_id, headers=headers, end_stream=True)
-            if window_update > 0:
-                try:
-                    conn.increment_flow_control_window(int(window_update), stream_id=stream_id)
-                except Exception:
-                    pass
-            writer.write(conn.data_to_send())
-            await writer.drain()
+                stream_id = conn.get_next_available_stream_id()
+                stream_status[stream_id] = 0
+                inflight.add(stream_id)
+                conn.send_headers(stream_id=stream_id, headers=headers, end_stream=True)
+                if window_update > 0:
+                    try:
+                        conn.increment_flow_control_window(int(window_update), stream_id=stream_id)
+                    except Exception:
+                        pass
 
-            stream_done = False
-            stream_status = 0
-            while not stream_done:
-                data = await asyncio.wait_for(reader.read(65535), timeout=float(timeout_s))
-                if not data:
-                    raise RuntimeError("HTTP/2 connection closed before stream completion")
-                events = conn.receive_data(data)
-                for ev in events:
-                    if isinstance(ev, ResponseReceived) and int(ev.stream_id) == int(stream_id):
+            pending = conn.data_to_send()
+            if pending:
+                writer.write(pending)
+                await writer.drain()
+
+            if not inflight:
+                continue
+
+            data = await asyncio.wait_for(reader.read(65535), timeout=float(timeout_s))
+            if not data:
+                raise RuntimeError("HTTP/2 connection closed before stream completion")
+            events = conn.receive_data(data)
+            for ev in events:
+                if isinstance(ev, ResponseReceived):
+                    sid = int(ev.stream_id)
+                    if sid in inflight:
                         try:
                             ev_headers = dict(ev.headers or [])
                         except Exception:
                             ev_headers = {}
-                        stream_status = int(ev_headers.get(":status", 0) or 0)
-                    elif isinstance(ev, DataReceived):
-                        conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
-                    elif isinstance(ev, StreamEnded) and int(ev.stream_id) == int(stream_id):
-                        stream_done = True
-                    elif isinstance(ev, StreamReset) and int(ev.stream_id) == int(stream_id):
-                        stream_done = True
-
-                pending = conn.data_to_send()
-                if pending:
-                    writer.write(pending)
-                    await writer.drain()
-
-            sent += 1
-            responses_total += 1
-            if 200 <= stream_status < 300:
-                status_2xx += 1
-            elif 400 <= stream_status < 500:
-                status_4xx += 1
-            elif stream_status >= 500:
-                status_5xx += 1
+                        stream_status[sid] = int(ev_headers.get(":status", 0) or 0)
+                elif isinstance(ev, DataReceived):
+                    conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                elif isinstance(ev, (StreamEnded, StreamReset)):
+                    sid = int(ev.stream_id)
+                    if sid in inflight:
+                        inflight.remove(sid)
+                        sent += 1
+                        responses_total += 1
+                        status = int(stream_status.get(sid, 0) or 0)
+                        if 200 <= status < 300:
+                            status_2xx += 1
+                        elif 400 <= status < 500:
+                            status_4xx += 1
+                        elif status >= 500:
+                            status_5xx += 1
+                        stream_status.pop(sid, None)
     except Exception:
         errors = max(0, total - sent)
         raise

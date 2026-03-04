@@ -1927,6 +1927,7 @@ async def http2_sender(
                 timeout_s=10.0,
                 settings=dict(getattr(resolved_profile, "settings", {}) or {}),
                 window_update=int(getattr(resolved_profile, "window_update", 0) or 0),
+                max_inflight_streams=max(1, int(concurrency or 1)),
             )
             sent_count = int(h2_out.get("sent", 0) or 0)
             err_count = int(h2_out.get("errors", max(0, dispatch_count - sent_count)) or 0)

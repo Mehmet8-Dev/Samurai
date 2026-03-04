@@ -952,6 +952,7 @@ async def worker_process(
                         real_src_ip=real_src_ip,
                         spoof_ip=args['spoof'],
                         stream=stream_ring[stream_idx],
+                        slot=stream_idx,
                         gateway_mac=gw_mac_int,
                         spoof_subnet=args.get('spoof_subnet', '1.0.0.0/8'),
                         current_time=int(time.time() * 1000),
