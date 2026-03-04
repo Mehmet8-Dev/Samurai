@@ -18,9 +18,11 @@ class _FakeLimits:
 class _FakeAsyncClient:
     response_plan = []
     requests = []
+    init_kwargs = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.init_kwargs.append(kwargs)
         self._transport = object()
 
     async def __aenter__(self):
@@ -48,6 +50,7 @@ class _FakeHttpx:
 class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
     async def test_http2_sender_status_counters(self):
         _FakeAsyncClient.requests = []
+        _FakeAsyncClient.init_kwargs = []
         _FakeAsyncClient.response_plan = [
             _FakeResponse(200),
             _FakeResponse(404),
@@ -64,6 +67,7 @@ class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
                 verbose=False,
                 scheme="https",
                 h2_profile_name="none",
+                verify=False,
             )
 
         self.assertEqual(out["attempted"], 3)
@@ -76,9 +80,11 @@ class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["h2_profile_disabled"], 1)
         self.assertEqual(out["h2_profile_applied"], 0)
         self.assertEqual(len(_FakeAsyncClient.requests), 3)
+        self.assertEqual(_FakeAsyncClient.init_kwargs[0]["verify"], False)
 
     async def test_http2_sender_error_path_does_not_raise_nameerror(self):
         _FakeAsyncClient.requests = []
+        _FakeAsyncClient.init_kwargs = []
         _FakeAsyncClient.response_plan = [
             _FakeResponse(200),
             RuntimeError("boom"),
@@ -109,6 +115,7 @@ class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
 
     async def test_http2_sender_consumes_request_plan_and_keeps_backward_compatible_fallback(self):
         _FakeAsyncClient.requests = []
+        _FakeAsyncClient.init_kwargs = []
         _FakeAsyncClient.response_plan = [
             _FakeResponse(200),
             _FakeResponse(201),
@@ -170,11 +177,82 @@ class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
                 scheme="https",
                 h2_profile_name="chrome_120",
                 h2_transport_name="hyper-h2",
+                verify=False,
             )
 
         fake_h2_transport.send_h2_requests.assert_awaited_once()
+        _call_args, call_kwargs = fake_h2_transport.send_h2_requests.call_args
+        self.assertEqual(call_kwargs["verify"], False)
         self.assertEqual(out["attempted"], 2)
         self.assertEqual(out["sent"], 2)
         self.assertEqual(out["errors"], 0)
         self.assertEqual(out["h2_profile_applied"], 1)
         self.assertEqual(out["h2_transport"], "hyper-h2")
+
+    async def test_http2_sender_hyper_h2_explicit_works_with_profile_none(self):
+        fake_h2_transport = SimpleNamespace(
+            send_h2_requests=AsyncMock(
+                return_value={
+                    "attempted": 2,
+                    "sent": 2,
+                    "errors": 0,
+                    "responses_total": 2,
+                    "status_2xx": 2,
+                    "status_4xx": 0,
+                    "status_5xx": 0,
+                }
+            )
+        )
+        with patch.object(senders, "HTTPX_AVAILABLE", True), \
+             patch.object(senders, "HYPER_H2_AVAILABLE", True), \
+             patch.object(senders, "_h2_transport", fake_h2_transport):
+            out = await senders.http2_sender(
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=2,
+                concurrency=2,
+                http_path="/",
+                http_method="GET",
+                verbose=False,
+                scheme="https",
+                h2_profile_name="none",
+                h2_transport_name="hyper-h2",
+            )
+
+        fake_h2_transport.send_h2_requests.assert_awaited_once()
+        _call_args, call_kwargs = fake_h2_transport.send_h2_requests.call_args
+        self.assertEqual(call_kwargs["settings"], {})
+        self.assertEqual(call_kwargs["window_update"], 0)
+        self.assertEqual(out["attempted"], 2)
+        self.assertEqual(out["sent"], 2)
+        self.assertEqual(out["errors"], 0)
+        self.assertEqual(out["h2_profile_disabled"], 1)
+        self.assertEqual(out["h2_profile_applied"], 0)
+        self.assertEqual(out["h2_transport"], "hyper-h2")
+
+    async def test_http2_sender_hyper_h2_explicit_no_silent_httpx_fallback(self):
+        _FakeAsyncClient.requests = []
+        _FakeAsyncClient.init_kwargs = []
+        _FakeAsyncClient.response_plan = [_FakeResponse(200)]
+        with patch.object(senders, "HTTPX_AVAILABLE", True), \
+             patch.object(senders, "httpx", _FakeHttpx), \
+             patch.object(senders, "HYPER_H2_AVAILABLE", False), \
+             patch.object(senders, "_h2_transport", None):
+            out = await senders.http2_sender(
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=1,
+                concurrency=1,
+                http_path="/",
+                http_method="GET",
+                verbose=False,
+                scheme="https",
+                h2_profile_name="chrome_120",
+                h2_transport_name="hyper-h2",
+            )
+
+        self.assertEqual(out["attempted"], 1)
+        self.assertEqual(out["sent"], 0)
+        self.assertEqual(out["errors"], 1)
+        self.assertEqual(out["h2_transport"], "hyper-h2")
+        self.assertEqual(len(_FakeAsyncClient.init_kwargs), 0)

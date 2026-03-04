@@ -117,6 +117,19 @@ class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
             mock_h2.assert_awaited_once()
             _call_args, call_kwargs = mock_h2.call_args
             self.assertEqual(call_kwargs["h2_profile_name"], "none")
+            self.assertTrue(bool(call_kwargs["verify"]))
+
+    async def test_worker_process_http2_respects_http_verify_false(self):
+        args = _base_args()
+        args["attack_vector"] = "http2"
+        args["http_verify"] = "false"
+
+        mock_h2 = AsyncMock()
+        with patch.object(orchestrator.senders, "http2_sender", mock_h2):
+            await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
+            mock_h2.assert_awaited_once()
+            _call_args, call_kwargs = mock_h2.call_args
+            self.assertFalse(bool(call_kwargs["verify"]))
 
     async def test_worker_process_slow_post_calls_slow_sender(self):
         args = _base_args()
