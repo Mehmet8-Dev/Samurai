@@ -148,6 +148,8 @@ class PcapReplayConfig:
     batch_size:           int  = 512
     # Statistics
     max_packets:          int  = 0       # 0 = all
+    # Advanced rewrite
+    flow_aware_rewrite:   bool = True    # TCP flow-aware seq/ack delta remap
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -204,6 +206,8 @@ def _validate_replay_config(cfg: PcapReplayConfig) -> None:
         raise PcapParseError(f"Invalid target_rps: {cfg.target_rps} (expected >= 0)")
     if int(cfg.max_packets) < 0:
         raise PcapParseError(f"Invalid max_packets: {cfg.max_packets} (expected >= 0)")
+    if bool(cfg.use_l2) and bool(cfg.strip_ethernet):
+        raise PcapParseError("Invalid config: use_l2=True cannot be combined with strip_ethernet=True")
 
     _validate_port(cfg.target_port_override, "target_port_override")
     _validate_port(cfg.src_port_override, "src_port_override")
@@ -642,6 +646,85 @@ def _ones_complement_sum(data: bytes, start: int, length: int) -> int:
     return s
 
 
+def _stable_tcp_seq_delta(flow_key: Tuple[str, int, str, int]) -> int:
+    """
+    Deterministic non-zero 32-bit delta from a 4-tuple direction key.
+    """
+    src_ip, src_port, dst_ip, dst_port = flow_key
+    a = _ip_to_int(src_ip)
+    b = _ip_to_int(dst_ip)
+    mixed = (
+        ((a * 2654435761) ^ (b * 2246822519) ^ (int(src_port) << 16) ^ int(dst_port))
+        & 0xFFFFFFFF
+    )
+    if mixed == 0:
+        mixed = 0x10001
+    return mixed
+
+
+def _apply_flow_aware_tcp_rewrite(
+    raw: bytearray,
+    ip_off: int,
+    info: Dict[str, Any],
+    dst_ip_override: Optional[str],
+    dst_port_override: Optional[int],
+    src_ip_override: Optional[str],
+    src_port_override: Optional[int],
+    flow_state: Dict[str, Any],
+) -> None:
+    if info.get("protocol") != PROTO_TCP:
+        return
+
+    ihl = int(info.get("ihl", 0) or 0)
+    l4_off = ip_off + ihl
+    if ihl < 20 or len(raw) < l4_off + 20:
+        return
+
+    orig_key = (
+        str(info.get("src_ip", "")),
+        int(info.get("src_port", 0) or 0),
+        str(info.get("dst_ip", "")),
+        int(info.get("dst_port", 0) or 0),
+    )
+    new_key = (
+        str(src_ip_override or info.get("src_ip", "")),
+        int(src_port_override if src_port_override is not None else int(info.get("src_port", 0) or 0)),
+        str(dst_ip_override or info.get("dst_ip", "")),
+        int(dst_port_override if dst_port_override is not None else int(info.get("dst_port", 0) or 0)),
+    )
+
+    owner_map = flow_state.setdefault("new_key_owner", {})
+    seq_delta_map = flow_state.setdefault("seq_delta_by_orig", {})
+    collision_keys = flow_state.setdefault("collision_keys", set())
+    owner = owner_map.get(new_key)
+    if owner is None:
+        owner_map[new_key] = orig_key
+    elif owner != orig_key:
+        collision_sig = (owner, orig_key, new_key)
+        if collision_sig not in collision_keys:
+            collision_keys.add(collision_sig)
+            flow_state["flow_collision_count"] = int(flow_state.get("flow_collision_count", 0) or 0) + 1
+
+    if orig_key not in seq_delta_map:
+        seq_delta_map[orig_key] = 0 if owner_map.get(new_key) == orig_key and owner is None else _stable_tcp_seq_delta(orig_key)
+
+    seq_delta = int(seq_delta_map.get(orig_key, 0) or 0)
+    if seq_delta:
+        seq = struct.unpack("!I", raw[l4_off + 4:l4_off + 8])[0]
+        struct.pack_into("!I", raw, l4_off + 4, (seq + seq_delta) & 0xFFFFFFFF)
+        flow_state["tcp_seq_adjusted"] = int(flow_state.get("tcp_seq_adjusted", 0) or 0) + 1
+
+    flags = int(raw[l4_off + 13])
+    ack_is_set = bool(flags & 0x10)
+    if ack_is_set:
+        ack = struct.unpack("!I", raw[l4_off + 8:l4_off + 12])[0]
+        reverse_orig = (orig_key[2], orig_key[3], orig_key[0], orig_key[1])
+        reverse_delta = int(seq_delta_map.get(reverse_orig, 0) or 0)
+        if ack and reverse_delta:
+            struct.pack_into("!I", raw, l4_off + 8, (ack + reverse_delta) & 0xFFFFFFFF)
+            flow_state["tcp_ack_adjusted"] = int(flow_state.get("tcp_ack_adjusted", 0) or 0) + 1
+
+
 def _rewrite_packet(
     raw: bytearray,
     ip_off: int,
@@ -650,6 +733,7 @@ def _rewrite_packet(
     dst_port_override: Optional[int],
     src_ip_override: Optional[str],
     src_port_override: Optional[int],
+    flow_state: Optional[Dict[str, Any]] = None,
 ) -> bytearray:
     """Rewrite IP addresses and/or ports in a packet, then fix checksums."""
     ihl = int(info["ihl"])
@@ -678,6 +762,18 @@ def _rewrite_packet(
             struct.pack_into("!H", raw, l4_off, src_port_override)
         if dst_port_override is not None:
             struct.pack_into("!H", raw, l4_off + 2, dst_port_override)
+
+    if flow_state is not None and protocol == PROTO_TCP:
+        _apply_flow_aware_tcp_rewrite(
+            raw=raw,
+            ip_off=ip_off,
+            info=info,
+            dst_ip_override=dst_ip_override,
+            dst_port_override=dst_port_override,
+            src_ip_override=src_ip_override,
+            src_port_override=src_port_override,
+            flow_state=flow_state,
+        )
 
     # Recalculate IP header checksum
     struct.pack_into("!H", raw, ip_off + 10, 0)  # zero out checksum field
@@ -813,6 +909,16 @@ def prepare_replay(
         cfg.target_ip_override or cfg.target_port_override or
         cfg.src_ip_override or cfg.src_port_override
     )
+    flow_state: Optional[Dict[str, Any]] = None
+    if bool(needs_rewrite) and bool(getattr(cfg, "flow_aware_rewrite", True)):
+        flow_state = {
+            "new_key_owner": {},
+            "seq_delta_by_orig": {},
+            "collision_keys": set(),
+            "flow_collision_count": 0,
+            "tcp_seq_adjusted": 0,
+            "tcp_ack_adjusted": 0,
+        }
 
     expected_count = len(filtered_packets)
     uniform_size = 0
@@ -849,6 +955,7 @@ def prepare_replay(
                     cfg.target_port_override,
                     cfg.src_ip_override,
                     cfg.src_port_override,
+                    flow_state=flow_state,
                 )
         except (IndexError, struct.error, ValueError) as exc:
             malformed_errors += 1
@@ -903,6 +1010,11 @@ def prepare_replay(
         "duration_capture_s": (timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 0.0,
         "malformed_errors": malformed_errors,
         "malformed_skipped": malformed_skipped,
+        "flow_aware_rewrite": int(bool(flow_state is not None)),
+        "flow_rewrite_direction_count": int(len((flow_state or {}).get("seq_delta_by_orig", {}))),
+        "flow_collision_count": int((flow_state or {}).get("flow_collision_count", 0) or 0),
+        "tcp_seq_adjusted": int((flow_state or {}).get("tcp_seq_adjusted", 0) or 0),
+        "tcp_ack_adjusted": int((flow_state or {}).get("tcp_ack_adjusted", 0) or 0),
     }
 
     return PreparedReplay(
@@ -1033,9 +1145,7 @@ async def replay_pcap(
     _validate_replay_config(cfg)
     timing_mode = TIMING_MODE_MAP.get(cfg.timing_mode, TimingMode.ORIGINAL)
     if cfg.use_l2:
-        log_warning(
-            "[PCAP Replay] use_l2=True is currently informational only; replay path uses raw IP sending."
-        )
+        log_info("[PCAP Replay] use_l2=True: replay will use L2 sender path (TX_RING).")
 
     log_info(f"[PCAP Replay] Parsing: {cfg.pcap_file}")
     prep = prepare_replay(cfg)
@@ -1070,6 +1180,7 @@ async def replay_pcap(
         "timing_drift_ms_avg": 0.0,
         "timing_drift_ms_max": 0.0,
         "socket_open_count": 0,
+        "use_l2": int(bool(cfg.use_l2)),
         "prep_stats": prep.stats,
     }
 
@@ -1096,6 +1207,7 @@ async def replay_pcap(
                     count=prep.count,
                     verbose=cfg.verbose,
                     pacing_config=pacing_config,
+                    force_l2=bool(cfg.use_l2),
                     live_sent=live_sent,
                     live_errors=live_errors,
                     live_progress=live_progress,
@@ -1114,6 +1226,7 @@ async def replay_pcap(
                     count=prep.count,
                     verbose=cfg.verbose,
                     pacing_config=pacing_config,
+                    force_l2=bool(cfg.use_l2),
                     live_sent=live_sent,
                     live_errors=live_errors,
                     live_progress=live_progress,
@@ -1126,6 +1239,29 @@ async def replay_pcap(
             else:
                 # ── TIMING-AWARE REPLAY (original / multiplier / rps-without-pacing) ──
                 # Single socket per loop + absolute schedule to reduce drift.
+                if cfg.use_l2:
+                    log_warning(
+                        "[PCAP Replay] use_l2 with timing-aware mode currently falls back to batch replay timing."
+                    )
+                    result = await senders.paced_raw_socket_sender(
+                        packets_buffer=prep.packets_buffer,
+                        target_ip=cfg.target_ip_override or "0.0.0.0",
+                        target_port=cfg.target_port_override or 0,
+                        count=prep.count,
+                        verbose=cfg.verbose,
+                        pacing_config=pacing_config,
+                        force_l2=True,
+                        live_sent=live_sent,
+                        live_errors=live_errors,
+                        live_progress=live_progress,
+                    )
+                    stats["attempted"] += int(result.get("attempted", 0) or 0)
+                    stats["sent"] += int(result.get("sent", 0) or 0)
+                    stats["errors"] += int(result.get("errors", 0) or 0)
+                    stats["bytes_sent_est"] += int(result.get("bytes_sent_est", 0) or 0)
+                    stats["loops_completed"] += 1
+                    continue
+
                 mv = memoryview(prep.packets_buffer)
                 try:
                     s = _open_raw_socket()

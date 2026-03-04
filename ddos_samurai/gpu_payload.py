@@ -944,14 +944,80 @@ def prepare_string_array(string_list: Sequence[Union[str, bytes]]) -> GPUStringA
     return _prepare_string_array_impl(string_list)
 
 
-def _apply_session_suffix(path: str, step: int) -> str:
-    if step == 1:
-        return f"{path}.css"
-    if step == 2:
-        return f"{path}.js"
-    if step == 3:
-        return f"{path}.png"
-    return path
+_DEFAULT_RESOURCE_CHAIN: tuple[tuple[str, ...], ...] = (
+    (".css", ".min.css", ".theme.css"),
+    (".js", ".mjs", ".bundle.js"),
+    (".png", ".webp", ".svg"),
+)
+_RESOURCE_CHAIN_PROFILES: dict[str, tuple[tuple[str, ...], ...]] = {
+    "default": _DEFAULT_RESOURCE_CHAIN,
+    "web": (
+        (".css", ".min.css", ".critical.css"),
+        (".js", ".bundle.js", ".vendor.js"),
+        (".png", ".webp", ".avif"),
+    ),
+    "api": (
+        (".css",),
+        (".js", ".mjs"),
+        (".json", ".txt"),
+    ),
+}
+
+
+def _parse_custom_chain(raw: str) -> tuple[tuple[str, ...], ...]:
+    """
+    Parse custom chain syntax:
+      step1a|step1b;step2a|step2b;step3a|step3b
+    """
+    steps = [s.strip() for s in str(raw or "").split(";")]
+    chain: list[tuple[str, ...]] = []
+    for step in steps[:3]:
+        if not step:
+            continue
+        suffixes = [x.strip() for x in step.split("|") if x.strip()]
+        if suffixes:
+            chain.append(tuple(suffixes))
+    return tuple(chain)
+
+
+def _resolve_resource_chain() -> tuple[tuple[str, ...], ...]:
+    profile = str(os.environ.get("SAMURAI_GPU_SESSION_CHAIN_PROFILE", "default") or "default").strip().lower()
+    chain = _RESOURCE_CHAIN_PROFILES.get(profile, _DEFAULT_RESOURCE_CHAIN)
+    custom_raw = str(os.environ.get("SAMURAI_GPU_SESSION_CHAIN", "") or "").strip()
+    if not custom_raw:
+        return chain
+    custom = _parse_custom_chain(custom_raw)
+    if not custom:
+        return chain
+    out = list(chain)
+    for i, vals in enumerate(custom):
+        if i >= len(out):
+            break
+        out[i] = vals
+    return tuple(out)
+
+
+def _apply_session_suffix(
+    path: str,
+    step: int,
+    *,
+    rng: Optional[random.Random] = None,
+    chain: Optional[tuple[tuple[str, ...], ...]] = None,
+) -> str:
+    if step <= 0:
+        return path
+    suffix_chain = chain or _DEFAULT_RESOURCE_CHAIN
+    idx = step - 1
+    if idx < 0 or idx >= len(suffix_chain):
+        return path
+    candidates = suffix_chain[idx]
+    if not candidates:
+        return path
+    suffix = candidates[0] if rng is None else candidates[int(rng.randrange(len(candidates)))]
+    for existing in candidates:
+        if path.endswith(existing):
+            return path
+    return f"{path}{suffix}"
 
 
 class GPUPayloadEngine:
@@ -1111,6 +1177,8 @@ class GPUPayloadEngine:
         path_idx = cp.asnumpy(self.h2_path_idx[:plan_count])
         ua_idx = cp.asnumpy(self.h2_ua_idx[:plan_count])
         step_used = cp.asnumpy(self.h2_step_used[:plan_count])
+        resource_chain = _resolve_resource_chain()
+        step_rng = random.Random((int(self.rng_seed) << 32) ^ int(current_time) ^ int(plan_count))
 
         items: List[H2RequestPlanItem] = []
         for i in range(plan_count):
@@ -1119,7 +1187,7 @@ class GPUPayloadEngine:
             m = self._to_text(self.methods[int(method_idx[i]) % self.n_methods])
             p = self._to_text(self.paths[int(path_idx[i]) % self.n_paths])
             u = self._to_text(self.uas[int(ua_idx[i]) % self.n_uas])
-            p = _apply_session_suffix(p, int(step_used[i]))
+            p = _apply_session_suffix(p, int(step_used[i]), rng=step_rng, chain=resource_chain)
             items.append(H2RequestPlanItem(method=m, path=p, user_agent=u))
         return H2RequestPlan(items=items)
 

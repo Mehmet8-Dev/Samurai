@@ -262,8 +262,10 @@ def _report_inputs_from_args(args) -> dict:
         "spoof_mode": str(getattr(args, "spoof_mode", "")),
         "http_scheme": str(getattr(args, "http_scheme", "http")),
         "http_method": str(getattr(args, "http_method", "GET")),
+        "ws_scenario": bool(getattr(args, "ws_scenario", False)),
         "tls_profile": str(getattr(args, "tls_profile", PROFILE_NONE)),
         "h2_profile": str(getattr(args, "h2_profile", PROFILE_NONE)),
+        "h2_transport": str(getattr(args, "h2_transport", "auto")),
         "soak_profile": str(getattr(args, "soak_profile", "none")),
         "soak_warmup_s": int(getattr(args, "soak_warmup_s", 0) or 0),
         "gpu_template_pool_size_l4": int(getattr(args, "gpu_template_pool_size_l4", 10) or 10),
@@ -453,12 +455,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=multiprocessing.cpu_count(), help=f"Kullanılacak işçi (worker) süreç sayısı. Varsayılan: {multiprocessing.cpu_count()}")
     parser.add_argument("--tls-profile", choices=list(TLS_PROFILE_CHOICES), default=PROFILE_NONE, help="TLS/JA3 parmak izi profili")
     parser.add_argument("--h2-profile", choices=list(H2_PROFILE_CHOICES), default=PROFILE_NONE, help="HTTP/2 profil adı")
+    parser.add_argument(
+        "--h2-transport",
+        choices=["auto", "httpx", "hyper-h2"],
+        default="auto",
+        help="HTTP/2 transport secimi: auto|httpx|hyper-h2 (varsayilan: auto).",
+    )
     parser.add_argument("--ja3-profile", choices=list(TLS_PROFILE_CHOICES), default=None, help="DEPRECATED: --tls-profile alias (1 minor sürüm)")
     parser.add_argument("--ech", action="store_true", help="Encrypted Client Hello (ECH) desteğini etkinleştir (deneysel)")
     parser.add_argument("--http2-concurrency", type=int, default=100, help="HTTP/2 vektörü için eşzamanlı stream sayısı")
     parser.add_argument("--ws-path", type=str, default="/", help="WebSocket vektörü için bağlantı yolu")
     parser.add_argument("--ws-message", type=str, default="ping", help="WebSocket vektörü için gönderilecek mesaj")
     parser.add_argument("--ws-concurrency", type=int, default=50, help="WebSocket vektörü eşzamanlı bağlantı sayısı")
+    parser.add_argument("--ws-scenario", action="store_true", help="WebSocket senaryo modu (auth->subscribe->ping/pong state machine).")
+    parser.add_argument("--ws-auth-message", type=str, default="", help="WS senaryo modu auth adımı mesajı.")
+    parser.add_argument("--ws-subscribe-message", type=str, nargs="+", default=None, help="WS senaryo modu subscribe adımı mesaj(ları).")
+    parser.add_argument("--ws-ping-count", type=int, default=1, help="WS senaryo modu ping adım sayısı (varsayılan: 1).")
+    parser.add_argument("--ws-await-response", action="store_true", help="WS senaryo adımlarında send sonrası recv bekle.")
     parser.add_argument("--quic-path", type=str, default="/", help="QUIC/HTTP3 vektörü için istek yolu")
     parser.add_argument("--quic-method", type=str, default="GET", help="QUIC/HTTP3 vektörü için HTTP metodu")
     parser.add_argument("--quic-concurrency", type=int, default=50, help="QUIC/HTTP3 vektörü eşzamanlı istek sayısı")
@@ -767,6 +780,14 @@ def build_parser() -> argparse.ArgumentParser:
     pcap_replay_group.add_argument(
         "--pcap-strip-eth", action="store_true",
         help="Ethernet başlığını soyup sadece raw IP olarak gönder.",
+    )
+    pcap_replay_group.add_argument(
+        "--pcap-use-l2", action="store_true",
+        help="PCAP replay'i L2 TX_RING yolu ile gönder (Ethernet frame korunur).",
+    )
+    pcap_replay_group.add_argument(
+        "--pcap-no-flow-aware", action="store_true",
+        help="PCAP replay TCP flow-aware seq/ack delta rewrite'i kapat.",
     )
     pcap_replay_group.add_argument(
         "--pcap-src-ip-override", type=str, default=None,

