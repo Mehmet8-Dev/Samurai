@@ -16,6 +16,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef SAMURAI_WITH_OPENSSL
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#endif
+
 typedef struct {
     long id;
     long runs_total;
@@ -35,13 +40,15 @@ typedef struct {
 
 typedef enum {
     SESSION_CONNECTING = 1,
-    SESSION_SENDING = 2,
-    SESSION_READING = 3
+    SESSION_TLS_HANDSHAKE = 2,
+    SESSION_SENDING = 3,
+    SESSION_READING = 4
 } SessionState;
 
 typedef struct {
     int in_use;
     int fd;
+    int use_tls;
     SessionState state;
     size_t req_len;
     size_t req_off;
@@ -50,7 +57,19 @@ typedef struct {
     char resp[2048];
     long long start_ns;
     long long deadline_ns;
+#ifdef SAMURAI_WITH_OPENSSL
+    SSL *ssl;
+#endif
 } Session;
+
+typedef struct {
+    int enabled;
+    int verify_peer;
+    const char *server_name;
+#ifdef SAMURAI_WITH_OPENSSL
+    SSL_CTX *ctx;
+#endif
+} TlsConfig;
 
 static long g_l7_next_id = 1;
 
@@ -200,6 +219,82 @@ static int _scheme_is_tls(const char *scheme) {
     return strcmp(scheme, "https") == 0 || strcmp(scheme, "wss") == 0;
 }
 
+static int _is_ipv4_literal(const char *value) {
+    struct in_addr tmp;
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+    return inet_pton(AF_INET, value, &tmp) == 1;
+}
+
+#ifdef SAMURAI_WITH_OPENSSL
+static int g_ssl_global_init_done = 0;
+
+static int _ssl_global_init(void) {
+    if (g_ssl_global_init_done) {
+        return 0;
+    }
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+#else
+    if (OPENSSL_init_ssl(0, NULL) != 1) {
+        return -1;
+    }
+#endif
+    g_ssl_global_init_done = 1;
+    return 0;
+}
+
+static SSL_CTX *_tls_ctx_create(int verify_peer, const char **reason_out) {
+    SSL_CTX *ctx = NULL;
+    static const unsigned char alpn_http11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+
+    if (reason_out != NULL) {
+        *reason_out = "tls_ctx_create_failed";
+    }
+    if (_ssl_global_init() < 0) {
+        if (reason_out != NULL) {
+            *reason_out = "tls_init_failed";
+        }
+        return NULL;
+    }
+
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx == NULL) {
+        if (reason_out != NULL) {
+            *reason_out = "tls_ctx_create_failed";
+        }
+        return NULL;
+    }
+
+#ifdef TLS1_2_VERSION
+    (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+#endif
+
+    (void)SSL_CTX_set_alpn_protos(ctx, alpn_http11, sizeof(alpn_http11));
+
+    if (verify_peer) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            if (reason_out != NULL) {
+                *reason_out = "tls_verify_store_unavailable";
+            }
+            SSL_CTX_free(ctx);
+            return NULL;
+        }
+    } else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    }
+
+    if (reason_out != NULL) {
+        *reason_out = "none";
+    }
+    return ctx;
+}
+#endif
+
 static int _cmp_longlong(const void *a, const void *b) {
     long long av = *(const long long *)a;
     long long bv = *(const long long *)b;
@@ -317,6 +412,12 @@ static void _session_release(int epfd, Session *s) {
     if (s == NULL) {
         return;
     }
+#ifdef SAMURAI_WITH_OPENSSL
+    if (s->ssl != NULL) {
+        SSL_free(s->ssl);
+        s->ssl = NULL;
+    }
+#endif
     if (s->fd >= 0) {
         (void)epoll_ctl(epfd, EPOLL_CTL_DEL, s->fd, NULL);
         close(s->fd);
@@ -335,7 +436,8 @@ static int _session_start(
     int target_port,
     const char *path,
     const char *http_method,
-    int websocket_mode
+    int websocket_mode,
+    const TlsConfig *tls_cfg
 ) {
     int fd;
     int rc;
@@ -366,6 +468,40 @@ static int _session_start(
             return -1;
         }
         s->state = SESSION_CONNECTING;
+    }
+
+    if (tls_cfg != NULL && tls_cfg->enabled) {
+#ifdef SAMURAI_WITH_OPENSSL
+        s->ssl = SSL_new(tls_cfg->ctx);
+        if (s->ssl == NULL) {
+            close(fd);
+            return -1;
+        }
+        if (SSL_set_fd(s->ssl, fd) != 1) {
+            SSL_free(s->ssl);
+            s->ssl = NULL;
+            close(fd);
+            return -1;
+        }
+        SSL_set_connect_state(s->ssl);
+        if (tls_cfg->server_name != NULL &&
+            tls_cfg->server_name[0] != '\0' &&
+            !_is_ipv4_literal(tls_cfg->server_name)) {
+            (void)SSL_set_tlsext_host_name(s->ssl, tls_cfg->server_name);
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+            if (tls_cfg->verify_peer) {
+                (void)SSL_set1_host(s->ssl, tls_cfg->server_name);
+            }
+#endif
+        }
+        s->use_tls = 1;
+        if (s->state == SESSION_SENDING) {
+            s->state = SESSION_TLS_HANDSHAKE;
+        }
+#else
+        close(fd);
+        return -1;
+#endif
     }
 
     memset(&ev, 0, sizeof(ev));
@@ -405,28 +541,78 @@ static int _session_progress(Session *s, uint32_t events, int websocket_mode) {
             if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &sock_err, &sock_err_len) < 0 || sock_err != 0) {
                 return -1;
             }
-            s->state = SESSION_SENDING;
+            s->state = s->use_tls ? SESSION_TLS_HANDSHAKE : SESSION_SENDING;
             continue;
+        }
+
+        if (s->state == SESSION_TLS_HANDSHAKE) {
+#ifdef SAMURAI_WITH_OPENSSL
+            int rc = SSL_connect(s->ssl);
+            if (rc == 1) {
+                s->state = SESSION_SENDING;
+                continue;
+            }
+            rc = SSL_get_error(s->ssl, rc);
+            if (rc == SSL_ERROR_WANT_READ || rc == SSL_ERROR_WANT_WRITE) {
+                return 0;
+            }
+            return -1;
+#else
+            return -1;
+#endif
         }
 
         if (s->state == SESSION_SENDING) {
             while (s->req_off < s->req_len) {
-                n = send(s->fd, s->req + s->req_off, s->req_len - s->req_off, MSG_NOSIGNAL);
-                if (n > 0) {
-                    s->req_off += (size_t)n;
-                    continue;
+                if (s->use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+                    int wr = SSL_write(s->ssl, s->req + s->req_off, (int)(s->req_len - s->req_off));
+                    if (wr > 0) {
+                        s->req_off += (size_t)wr;
+                        continue;
+                    }
+                    wr = SSL_get_error(s->ssl, wr);
+                    if (wr == SSL_ERROR_WANT_READ || wr == SSL_ERROR_WANT_WRITE) {
+                        return 0;
+                    }
+                    return -1;
+#else
+                    return -1;
+#endif
+                } else {
+                    n = send(s->fd, s->req + s->req_off, s->req_len - s->req_off, MSG_NOSIGNAL);
+                    if (n > 0) {
+                        s->req_off += (size_t)n;
+                        continue;
+                    }
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        return 0;
+                    }
+                    return -1;
                 }
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    return 0;
-                }
-                return -1;
             }
             s->state = SESSION_READING;
             continue;
         }
 
         if (s->state == SESSION_READING) {
-            n = recv(s->fd, s->resp + s->resp_len, sizeof(s->resp) - s->resp_len - 1, 0);
+            if (s->use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+                n = SSL_read(s->ssl, s->resp + s->resp_len, (int)(sizeof(s->resp) - s->resp_len - 1));
+                if (n < 0) {
+                    int rd = SSL_get_error(s->ssl, (int)n);
+                    if (rd == SSL_ERROR_WANT_READ || rd == SSL_ERROR_WANT_WRITE) {
+                        return 0;
+                    }
+                    return -1;
+                }
+#else
+                return -1;
+#endif
+            } else {
+                n = recv(s->fd, s->resp + s->resp_len, sizeof(s->resp) - s->resp_len - 1, 0);
+            }
+
             if (n > 0) {
                 s->resp_len += (size_t)n;
                 s->resp[s->resp_len] = '\0';
@@ -454,8 +640,10 @@ static int _session_progress(Session *s, uint32_t events, int websocket_mode) {
                 }
                 return -1;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return 0;
+            if (!s->use_tls) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return 0;
+                }
             }
             return -1;
         }
@@ -481,6 +669,7 @@ static int _run_single_pass(
     const char *path,
     const char *http_method,
     int websocket_mode,
+    const TlsConfig *tls_cfg,
     long long *latency_samples,
     long latency_sample_cap,
     long *latency_sample_count,
@@ -553,7 +742,8 @@ static int _run_single_pass(
                     target_port,
                     path,
                     http_method,
-                    websocket_mode
+                    websocket_mode,
+                    tls_cfg
                 ) < 0) {
                 errors += 1;
                 completed += 1;
@@ -812,6 +1002,8 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
     const char *path;
     const char *scheme;
     int verify_tls;
+    int use_tls;
+    const char *server_name;
     char http_method[24];
     long ws_ping_count;
     long ws_subscribe_count;
@@ -836,6 +1028,10 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
     int fatal_loop_error = 0;
     const char *final_reason = "none";
     PyObject *result = NULL;
+    TlsConfig tls_cfg;
+#ifdef SAMURAI_WITH_OPENSSL
+    const char *tls_setup_reason = "none";
+#endif
 
     if (!PyDict_Check(cfg)) {
         return _attach_handle_stats(_make_result(0, 0, 0, 0, 0.0, 0.0, sender_path, "invalid_config", 0, 0), handle);
@@ -866,7 +1062,14 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
     path = _dict_cstr(cfg, websocket_mode ? "ws_path" : "http_path", "/");
     scheme = _dict_cstr(cfg, "scheme", websocket_mode ? "ws" : "http");
     verify_tls = _dict_bool(cfg, "verify", 0);
+    use_tls = _scheme_is_tls(scheme) || verify_tls;
+    server_name = _dict_cstr(cfg, "server_name", target_ip);
     _copy_upper_ascii(http_method, sizeof(http_method), _dict_cstr(cfg, "http_method", "GET"), "GET");
+
+    memset(&tls_cfg, 0, sizeof(tls_cfg));
+    tls_cfg.enabled = use_tls ? 1 : 0;
+    tls_cfg.verify_peer = verify_tls ? 1 : 0;
+    tls_cfg.server_name = server_name;
 
     if (max_retries < 0) {
         max_retries = 0;
@@ -890,11 +1093,21 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
         timeout_s = websocket_mode ? 3.0 : 5.0;
     }
 
-    if (_scheme_is_tls(scheme) || verify_tls) {
+    if (tls_cfg.enabled) {
+#ifdef SAMURAI_WITH_OPENSSL
+        tls_cfg.ctx = _tls_ctx_create(tls_cfg.verify_peer, &tls_setup_reason);
+        if (tls_cfg.ctx == NULL) {
+            return _attach_handle_stats(
+                _make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, sender_path, tls_setup_reason, 0, 0),
+                handle
+            );
+        }
+#else
         return _attach_handle_stats(
             _make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, sender_path, "tls_not_supported", 0, 0),
             handle
         );
+#endif
     }
 
     if (websocket_mode) {
@@ -982,11 +1195,18 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
                 path,
                 http_method,
                 websocket_mode,
+                &tls_cfg,
                 latency_samples,
                 latency_sample_cap,
                 &latency_sample_count,
                 &pass
             ) < 0) {
+#ifdef SAMURAI_WITH_OPENSSL
+            if (tls_cfg.ctx != NULL) {
+                SSL_CTX_free(tls_cfg.ctx);
+                tls_cfg.ctx = NULL;
+            }
+#endif
             PyMem_Free(latency_samples);
             return NULL;
         }
@@ -1072,6 +1292,12 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
     }
 
     PyMem_Free(latency_samples);
+#ifdef SAMURAI_WITH_OPENSSL
+    if (tls_cfg.ctx != NULL) {
+        SSL_CTX_free(tls_cfg.ctx);
+        tls_cfg.ctx = NULL;
+    }
+#endif
     return _attach_handle_stats(result, handle);
 }
 
@@ -1169,6 +1395,16 @@ static PyObject *l7_snapshot(PyObject *self, PyObject *args) {
     return out;
 }
 
+static PyObject *l7_tls_supported(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+#ifdef SAMURAI_WITH_OPENSSL
+    Py_RETURN_TRUE;
+#else
+    Py_RETURN_FALSE;
+#endif
+}
+
 static PyObject *l7_run_http1_stateful(PyObject *self, PyObject *args) {
     PyObject *cfg = NULL;
     PyObject *handle_obj = NULL;
@@ -1225,6 +1461,7 @@ static PyMethodDef L7Methods[] = {
     {"open", l7_open, METH_VARARGS, "open(config) -> handle"},
     {"close", l7_close, METH_VARARGS, "close(handle)"},
     {"snapshot", l7_snapshot, METH_VARARGS, "snapshot(handle) -> stats"},
+    {"tls_supported", l7_tls_supported, METH_NOARGS, "tls_supported() -> bool"},
     {"run_http1_stateful", l7_run_http1_stateful, METH_VARARGS, "run_http1_stateful(config) -> stats"},
     {"run_websocket_stateful", l7_run_websocket_stateful, METH_VARARGS, "run_websocket_stateful(config) -> stats"},
     {NULL, NULL, 0, NULL}

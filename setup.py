@@ -18,6 +18,7 @@ Requirements for xdp_sender:
 import os
 import sys
 import platform
+import ctypes.util
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 
@@ -82,12 +83,32 @@ def get_extensions():
     )
     extensions.append(dataplane_core)
 
-    # L7 state engine extension (HTTP/1.1 + WS scaffold)
+    # L7 state engine extension (HTTP/1.1 + WS + optional TLS/WSS)
+    l7_compile_args = ['-O2', '-Wall', '-fPIC']
+    l7_link_args = ['-lpthread', '-lm']
+    l7_macros = []
+    openssl_header_candidates = [
+        '/usr/include/openssl/ssl.h',
+        '/usr/local/include/openssl/ssl.h',
+    ]
+    has_openssl_headers = any(os.path.exists(p) for p in openssl_header_candidates)
+    has_openssl_libs = (
+        ctypes.util.find_library('ssl') is not None and
+        ctypes.util.find_library('crypto') is not None
+    )
+    force_disable_tls = str(os.environ.get("SAMURAI_DISABLE_OPENSSL", "0")).strip() == "1"
+    if not force_disable_tls and has_openssl_headers and has_openssl_libs:
+        l7_macros.append(('SAMURAI_WITH_OPENSSL', '1'))
+        l7_link_args.extend(['-lssl', '-lcrypto'])
+    else:
+        print("⚠️  OpenSSL dev files not found (or disabled); l7_state_engine TLS/WSS support disabled.")
+
     l7_state_engine = Extension(
         'ddos_samurai.l7_state_engine',
         sources=['ddos_samurai/l7_state_engine.c'],
-        extra_compile_args=['-O2', '-Wall', '-fPIC'],
-        extra_link_args=['-lpthread', '-lm']
+        extra_compile_args=l7_compile_args,
+        extra_link_args=l7_link_args,
+        define_macros=l7_macros,
     )
     extensions.append(l7_state_engine)
 
