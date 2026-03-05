@@ -31,3 +31,4 @@ Onemli not:
 15. `docs/14-project-analysis-and-trex-comparison.md`: Detayli proje analizi + Cisco TRex karsilastirmasi ve puanlama
 16. `docs/15-technology-maturity-and-trex-gap-analysis.md`: Teknoloji olgunlugu, urunlesme riski, TRex/Keysight gap analizi
 17. `docs/16-l7-stateful-phase2-phase3-update.md`: Faz 2/3 stateful, H2 transport, WS scenario, PCAP flow-aware/L2 degisiklik ozeti
+18. `docs/17-gpu-ai-dataplane-research-validation-roadmap.md`: GPU+AI dataplane icin research roadmap, maturity matrisi ve sistematik validation checklist'i
