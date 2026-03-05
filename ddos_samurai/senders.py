@@ -47,6 +47,7 @@ except Exception:
 from . import utils
 from . import packet as packet_utils
 from . import cpu_packet_engine
+from . import l7_engine as l7_engine_adapter
 from .scapy_support import ScapyUnavailableError, require_scapy
 
 log_info = utils.log_info
@@ -171,6 +172,11 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "l7_conn_rate": 0.0,
         "l7_handshake_p99_ms": 0.0,
         "l7_step_fail_ratio": 0.0,
+        "session_success_rate": 0.0,
+        "retry_success_rate": 0.0,
+        "dp_queue_id": -1,
+        "dp_queue_strategy": "unknown",
+        "dp_affinity_cpu": -1,
     }
     for k, v in extra.items():
         if isinstance(v, bool):
@@ -611,6 +617,11 @@ def _merge_stats(*items):
         l7_conn_rate=0.0,
         l7_handshake_p99_ms=0.0,
         l7_step_fail_ratio=0.0,
+        session_success_rate=0.0,
+        retry_success_rate=0.0,
+        dp_queue_id=-1,
+        dp_queue_strategy="unknown",
+        dp_affinity_cpu=-1,
     )
     for it in items:
         if not isinstance(it, dict):
@@ -796,6 +807,33 @@ def _merge_stats(*items):
         item_l7_step_fail_ratio = float(it.get("l7_step_fail_ratio", 0.0) or 0.0)
         if item_l7_step_fail_ratio > 0.0 or float(acc.get("l7_step_fail_ratio", 0.0) or 0.0) == 0.0:
             acc["l7_step_fail_ratio"] = item_l7_step_fail_ratio
+        item_session_success_rate = float(it.get("session_success_rate", 0.0) or 0.0)
+        if item_session_success_rate > 0.0 or float(acc.get("session_success_rate", 0.0) or 0.0) == 0.0:
+            acc["session_success_rate"] = item_session_success_rate
+        item_retry_success_rate = float(it.get("retry_success_rate", 0.0) or 0.0)
+        if item_retry_success_rate > 0.0 or float(acc.get("retry_success_rate", 0.0) or 0.0) == 0.0:
+            acc["retry_success_rate"] = item_retry_success_rate
+        item_dp_queue_id = int(it.get("dp_queue_id", -1) or -1)
+        if item_dp_queue_id >= 0:
+            curr_dp_queue_id = int(acc.get("dp_queue_id", -1) or -1)
+            if curr_dp_queue_id < 0:
+                acc["dp_queue_id"] = item_dp_queue_id
+            elif curr_dp_queue_id != item_dp_queue_id:
+                acc["dp_queue_id"] = -2
+        item_dp_queue_strategy = str(it.get("dp_queue_strategy", "") or "").strip()
+        if item_dp_queue_strategy:
+            curr_dp_queue_strategy = str(acc.get("dp_queue_strategy", "") or "").strip()
+            if not curr_dp_queue_strategy or curr_dp_queue_strategy == "unknown":
+                acc["dp_queue_strategy"] = item_dp_queue_strategy
+            elif curr_dp_queue_strategy != item_dp_queue_strategy and curr_dp_queue_strategy != "mixed":
+                acc["dp_queue_strategy"] = "mixed"
+        item_dp_affinity_cpu = int(it.get("dp_affinity_cpu", -1) or -1)
+        if item_dp_affinity_cpu >= 0:
+            curr_dp_affinity_cpu = int(acc.get("dp_affinity_cpu", -1) or -1)
+            if curr_dp_affinity_cpu < 0:
+                acc["dp_affinity_cpu"] = item_dp_affinity_cpu
+            elif curr_dp_affinity_cpu != item_dp_affinity_cpu:
+                acc["dp_affinity_cpu"] = -2
         if "sender_path" in it:
             acc["sender_path"] = str(it.get("sender_path") or "")
     return _recompute_loss_metrics(acc)
@@ -805,6 +843,12 @@ def close_sender_context(sender_context: Dict[str, Any] | None) -> None:
     """Best-effort cleanup for reusable sender resources."""
     if not isinstance(sender_context, dict):
         return
+    dp_session = sender_context.pop("dataplane_session", None)
+    if dp_session is not None and hasattr(dp_session, "close"):
+        try:
+            dp_session.close()
+        except Exception:
+            pass
     raw_sock = sender_context.pop("raw_socket", None)
     if raw_sock is not None:
         try:
@@ -1495,6 +1539,65 @@ async def raw_socket_sender(
     loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
 
     allow_fallback = (fallback_policy == "allow")
+
+    # Optional in-proc dataplane core path (scaffold). If it handles the batch,
+    # we return immediately; otherwise we continue with legacy TX_RING/C/Python chain.
+    dp_session = ctx.get("dataplane_session") if isinstance(ctx, dict) else None
+    if dp_session is not None and hasattr(dp_session, "send_batch"):
+        dp_out = None
+        try:
+            dp_out = dp_session.send_batch(
+                packets_buffer=packets_buffer,
+                packet_size=packet_size,
+                count=count,
+                target_ip=target_ip,
+                target_port=target_port,
+            )
+        except Exception as e:
+            _register_fallback(f"dataplane_exception:{type(e).__name__}")
+        if dp_out is not None:
+            if hasattr(dp_out, "to_stats"):
+                dp_stats = dict(dp_out.to_stats() or {})
+            elif isinstance(dp_out, dict):
+                dp_stats = dict(dp_out or {})
+            else:
+                dp_stats = {}
+            dp_attempted = int(dp_stats.get("attempted", count) or count)
+            dp_sent = int(dp_stats.get("sent", 0) or 0)
+            dp_errors = int(dp_stats.get("errors", max(0, dp_attempted - dp_sent)) or 0)
+            dp_reason = str(dp_stats.get("sender_fallback_reason", "none") or "none").strip()
+            if dp_sent > 0 or not allow_fallback:
+                if owns_socket and s is not None:
+                    s.close()
+                _update_live(live_progress, int(dp_attempted))
+                _update_live(live_sent, int(dp_sent))
+                _update_live(live_errors, int(max(dp_errors, dp_attempted - dp_sent)))
+                out = _stats(
+                    attempted=dp_attempted,
+                    sent=dp_sent,
+                    errors=max(dp_errors, dp_attempted - dp_sent),
+                    bytes_sent_est=int(
+                        dp_stats.get("bytes_sent_est", int(dp_sent) * int(max(0, int(packet_size or 0)))) or 0
+                    ),
+                    sender_path=str(dp_stats.get("sender_path", "DP_CORE") or "DP_CORE"),
+                    fallback_count=int(dp_stats.get("fallback_count", 0) or 0),
+                    sender_fallback_reason=str(dp_reason or "none"),
+                    sender_backend_requested=requested_backend,
+                    sender_fallback_policy=fallback_policy,
+                    buffer_copy_count=buffer_copy_count,
+                    buffer_copy_bytes=buffer_copy_bytes,
+                    eagain_retry_count=0,
+                    partial_send_retry_count=0,
+                )
+                for k in ("dp_queue_id", "dp_queue_strategy", "dp_affinity_cpu", "session_success_rate", "retry_success_rate"):
+                    if k in dp_stats:
+                        out[k] = dp_stats[k]
+                return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
+            if dp_reason and dp_reason.lower() != "none":
+                _register_fallback(dp_reason)
+            else:
+                _register_fallback("dataplane_unhandled")
+
     try_txring = bool(force_l2) or requested_backend in {"auto", "txring"}
     try_c_ext_l3 = requested_backend in {"auto", "txring", "c_ext_l3"}
     try_python = requested_backend in {"auto", "txring", "c_ext_l3", "python"}
@@ -2725,6 +2828,9 @@ async def http_stateful_sender(
     session_repeats=1,
     max_active_sessions=None,
     session_keepalive=True,
+    l7_engine="python",
+    legacy_path_enable=False,
+    lab_profile="off",
     live_sent=None, live_errors=None, live_progress=None,
 ):
     """
@@ -2736,12 +2842,42 @@ async def http_stateful_sender(
         concurrency: Max parallel VUs.
         workflow_steps: list of virtual_user.WorkflowStep objects.
     """
-    from .virtual_user import run_vu_pool, WorkflowStep, ExtractRule
-
     base_url = f"{scheme}://{target_ip}:{target_port}"
     vu_count = max(0, int(vu_count or 0))
     if vu_count <= 0:
         return _stats(attempted=0, sent=0, errors=0)
+
+    engine_mode = str(l7_engine or "python").strip().lower()
+    if engine_mode == "c_state":
+        cfg = l7_engine_adapter.L7EngineConfig(
+            engine="c_state",
+            target_ip=str(target_ip),
+            target_port=int(target_port or 0),
+            count=int(vu_count),
+            concurrency=int(concurrency or 1),
+            session_repeats=int(session_repeats or 1),
+            max_active_sessions=int(max_active_sessions or 0),
+            mode="http1_stateful",
+            extra={
+                "scheme": str(scheme or "http"),
+                "verify": bool(verify),
+                "timeout_s": float(timeout_s or 10.0),
+                "lab_profile": str(lab_profile or "off"),
+            },
+        )
+        c_res = await l7_engine_adapter.run_http1_stateful(cfg)
+        if c_res is not None and c_res.handled:
+            c_stats = c_res.as_stats()
+            if int(c_res.sent) > 0 or not bool(c_res.allow_legacy_fallback) or not bool(legacy_path_enable):
+                _update_live(live_progress, int(c_stats.get("attempted", vu_count) or 0))
+                _update_live(live_sent, int(c_stats.get("sent", 0) or 0))
+                _update_live(live_errors, int(c_stats.get("errors", 0) or 0))
+                return _stats(**c_stats)
+            log_warning(
+                "L7 c_state HTTP engine unavailable/failed; legacy VirtualUser path fallback enabled."
+            )
+
+    from .virtual_user import run_vu_pool, WorkflowStep, ExtractRule
 
     max_vus = max(1, int(os.environ.get("SAMURAI_L7_MAX_VUS", "20000") or 20000))
     if vu_count > max_vus:
@@ -3014,6 +3150,9 @@ async def websocket_scenario_sender(
     ping_message="ping",
     ping_count=1,
     await_response=False,
+    l7_engine="python",
+    legacy_path_enable=False,
+    lab_profile="off",
     ssl_context=None,
     live_sent=None,
     live_errors=None,
@@ -3024,6 +3163,33 @@ async def websocket_scenario_sender(
       connect -> auth -> subscribe -> ping/pong (optional recv on each step)
     `count` denotes number of WS sessions/scenario runs.
     """
+    engine_mode = str(l7_engine or "python").strip().lower()
+    if engine_mode == "c_state":
+        cfg = l7_engine_adapter.L7EngineConfig(
+            engine="c_state",
+            target_ip=str(target_ip),
+            target_port=int(target_port or 0),
+            count=int(count or 0),
+            concurrency=int(concurrency or 1),
+            mode="websocket_stateful",
+            extra={
+                "ws_path": str(ws_path or "/"),
+                "ws_ping_count": int(ping_count or 0),
+                "lab_profile": str(lab_profile or "off"),
+            },
+        )
+        c_res = await l7_engine_adapter.run_websocket_stateful(cfg)
+        if c_res is not None and c_res.handled:
+            c_stats = c_res.as_stats()
+            if int(c_res.sent) > 0 or not bool(c_res.allow_legacy_fallback) or not bool(legacy_path_enable):
+                _update_live(live_progress, int(c_stats.get("attempted", count) or 0))
+                _update_live(live_sent, int(c_stats.get("sent", 0) or 0))
+                _update_live(live_errors, int(c_stats.get("errors", 0) or 0))
+                return _stats(**c_stats)
+            log_warning(
+                "L7 c_state websocket engine unavailable/failed; legacy websocket path fallback enabled."
+            )
+
     if not WEBSOCKETS_AVAILABLE:
         log_error("WebSocket desteği için 'websockets' kütüphanesi yüklü değil.")
         return _stats(attempted=count, sent=0, errors=count)

@@ -5,6 +5,7 @@ import os
 import logging
 import multiprocessing
 import random
+import json
 
 from datetime import datetime
 
@@ -12,6 +13,7 @@ from ddos_samurai import packet
 from ddos_samurai import senders
 from ddos_samurai import stealth
 from ddos_samurai import cpu_packet_engine
+from ddos_samurai import dataplane
 
 
 from ddos_samurai import utils
@@ -136,6 +138,11 @@ def _empty_stats() -> dict:
         "l7_conn_rate": 0.0,
         "l7_handshake_p99_ms": 0.0,
         "l7_step_fail_ratio": 0.0,
+        "session_success_rate": 0.0,
+        "retry_success_rate": 0.0,
+        "dp_queue_id": -1,
+        "dp_queue_strategy": "unknown",
+        "dp_affinity_cpu": -1,
     }
 
 
@@ -458,6 +465,33 @@ def _add_stats(acc: dict, item: dict) -> dict:
     item_l7_step_fail_ratio = float(item.get("l7_step_fail_ratio", 0.0) or 0.0)
     if item_l7_step_fail_ratio > 0.0 or float(acc.get("l7_step_fail_ratio", 0.0) or 0.0) == 0.0:
         acc["l7_step_fail_ratio"] = item_l7_step_fail_ratio
+    item_session_success_rate = float(item.get("session_success_rate", 0.0) or 0.0)
+    if item_session_success_rate > 0.0 or float(acc.get("session_success_rate", 0.0) or 0.0) == 0.0:
+        acc["session_success_rate"] = item_session_success_rate
+    item_retry_success_rate = float(item.get("retry_success_rate", 0.0) or 0.0)
+    if item_retry_success_rate > 0.0 or float(acc.get("retry_success_rate", 0.0) or 0.0) == 0.0:
+        acc["retry_success_rate"] = item_retry_success_rate
+    item_dp_queue_id = int(item.get("dp_queue_id", -1) or -1)
+    if item_dp_queue_id >= 0:
+        current_dp_queue_id = int(acc.get("dp_queue_id", -1) or -1)
+        if current_dp_queue_id < 0:
+            acc["dp_queue_id"] = item_dp_queue_id
+        elif current_dp_queue_id != item_dp_queue_id:
+            acc["dp_queue_id"] = -2
+    item_dp_queue_strategy = str(item.get("dp_queue_strategy", "") or "").strip()
+    if item_dp_queue_strategy:
+        current_dp_queue_strategy = str(acc.get("dp_queue_strategy", "") or "").strip()
+        if not current_dp_queue_strategy or current_dp_queue_strategy == "unknown":
+            acc["dp_queue_strategy"] = item_dp_queue_strategy
+        elif current_dp_queue_strategy != item_dp_queue_strategy and current_dp_queue_strategy != "mixed":
+            acc["dp_queue_strategy"] = "mixed"
+    item_dp_affinity_cpu = int(item.get("dp_affinity_cpu", -1) or -1)
+    if item_dp_affinity_cpu >= 0:
+        current_dp_affinity_cpu = int(acc.get("dp_affinity_cpu", -1) or -1)
+        if current_dp_affinity_cpu < 0:
+            acc["dp_affinity_cpu"] = item_dp_affinity_cpu
+        elif current_dp_affinity_cpu != item_dp_affinity_cpu:
+            acc["dp_affinity_cpu"] = -2
     _state_active = int(item.get("state_active_entries", 0) or 0)
     if _state_active > 0 or int(acc.get("state_active_entries", 0) or 0) == 0:
         acc["state_active_entries"] = _state_active
@@ -518,25 +552,24 @@ def start_worker(
 ):
     """Synchronous entry point for a worker process."""
     # --- CPU Pinning (TRex Style) ---
+    cpu_id = -1
     try:
         cpu_count = multiprocessing.cpu_count()
-        # Reserve CPU 0 for OS/Management if possible, otherwise use all
-        if cpu_count > 1:
-            # Simple round-robin: (worker_id % (total_cpus - 1)) + 1
-            # This ensures we skip CPU 0 but wrap around if workers > cpus
+        dp_queue_strategy = str(args.get("dp_queue_strategy", "rr") or "rr").strip().lower()
+        dp_queue_id = int(args.get("dp_queue_id", args.get("xdp_queue_id", 0)) or 0)
+        # Reserve CPU 0 for OS/Management if possible.
+        if cpu_count > 1 and dp_queue_strategy == "pin" and dp_queue_id >= 0:
+            cpu_id = min(cpu_count - 1, dp_queue_id + 1)
+        elif cpu_count > 1:
+            # Round-robin pinning by worker id.
             cpu_id = (worker_id % (cpu_count - 1)) + 1
         else:
             cpu_id = 0
-            
-        # Log which CPU this worker is pinned to
-        # print(f"[Worker {worker_id}] Pinned to CPU {cpu_id}")
 
-            
         os.sched_setaffinity(0, {cpu_id})
-        # We use print here because logging might not be fully set up or to ensure visibility
-        # log_info is defined below but available in module scope
     except Exception as e:
         print(f"[Worker {worker_id}] Failed to set CPU affinity: {e}")
+    args["dp_affinity_cpu"] = int(cpu_id)
 
     soak_deadline_ts = float(args.get("soak_deadline_ts", 0.0) or 0.0)
     soak_profile = str(args.get("soak_profile", "none") or "none").strip().lower()
@@ -706,9 +739,32 @@ async def worker_process(
     sender_context_cache = {}
     sender_backend_cfg = str(args.get("sender_backend", "auto") or "auto")
     sender_fallback_policy_cfg = str(args.get("sender_fallback_policy", "allow") or "allow")
+    lab_profile_cfg = str(args.get("lab_profile", "off") or "off")
+    dp_queue_strategy_cfg = str(args.get("dp_queue_strategy", "rr") or "rr")
+    dp_queue_id_cfg = int(args.get("dp_queue_id", args.get("xdp_queue_id", 0)) or 0)
     xdp_enable_cfg = bool(args.get("xdp_enable", False))
     xdp_interface_cfg = str(args.get("xdp_interface", "") or "").strip() or None
-    xdp_queue_id_cfg = int(args.get("xdp_queue_id", 0) or 0)
+    xdp_queue_id_cfg = int(dp_queue_id_cfg)
+    worker_stats["dp_queue_id"] = int(dp_queue_id_cfg)
+    worker_stats["dp_queue_strategy"] = str(dp_queue_strategy_cfg)
+    worker_stats["dp_affinity_cpu"] = int(args.get("dp_affinity_cpu", -1) or -1)
+    worker_stats["sender_backend_requested"] = str(sender_backend_cfg)
+    worker_stats["sender_fallback_policy"] = str(sender_fallback_policy_cfg)
+
+    try:
+        dp_cfg = dataplane.build_dataplane_config(args, queue_id=dp_queue_id_cfg)
+        sender_context_cache["dataplane_config"] = dp_cfg.as_dict()
+        sender_context_cache["lab_profile"] = str(lab_profile_cfg)
+        if bool(dp_cfg.use_core):
+            dp_session = dataplane.DataplaneSession(dp_cfg)
+            sender_context_cache["dataplane_session"] = dp_session
+            sender_context_cache["dataplane_opened"] = int(dp_session.open())
+            if not sender_context_cache["dataplane_opened"] and str(lab_profile_cfg).strip().lower() == "dedicated":
+                log_warning(
+                    f"[Worker {worker_id}] dataplane core open failed in dedicated mode: {dp_session.open_error or 'unknown'}"
+                )
+    except Exception as e:
+        log_warning(f"[Worker {worker_id}] dataplane init failed: {e}")
 
     async def _paced_sender_with_faults(
         *,
@@ -1877,6 +1933,9 @@ async def worker_process(
                     payloads=args.get('payloads', []),
                     session_repeats=args.get('l7_session_repeats', 1),
                     max_active_sessions=args.get('l7_max_active_sessions', 0),
+                    l7_engine=args.get('l7_engine', 'python'),
+                    legacy_path_enable=bool(args.get('legacy_path_enable', False)),
+                    lab_profile=args.get('lab_profile', 'off'),
                     live_sent=sent_total,
                     live_errors=errors_total,
                     live_progress=progress,
@@ -1931,6 +1990,9 @@ async def worker_process(
                     ping_message=args.get("ws_message", "ping"),
                     ping_count=args.get("ws_ping_count", 1),
                     await_response=bool(args.get("ws_await_response", False)),
+                    l7_engine=args.get('l7_engine', 'python'),
+                    legacy_path_enable=bool(args.get('legacy_path_enable', False)),
+                    lab_profile=args.get('lab_profile', 'off'),
                     ssl_context=ssl_context,
                     live_sent=sent_total,
                     live_errors=errors_total,
@@ -2405,6 +2467,11 @@ async def worker_process(
                 _l7_conn_rate = float(worker_stats.get("l7_conn_rate", 0.0) or 0.0)
                 _l7_handshake_p99_ms = float(worker_stats.get("l7_handshake_p99_ms", 0.0) or 0.0)
                 _l7_step_fail_ratio = float(worker_stats.get("l7_step_fail_ratio", 0.0) or 0.0)
+                _session_success_rate = float(worker_stats.get("session_success_rate", 0.0) or 0.0)
+                _retry_success_rate = float(worker_stats.get("retry_success_rate", 0.0) or 0.0)
+                _dp_queue_id = int(worker_stats.get("dp_queue_id", -1) or -1)
+                _dp_queue_strategy = str(worker_stats.get("dp_queue_strategy", "rr") or "rr")
+                _dp_affinity_cpu = int(worker_stats.get("dp_affinity_cpu", -1) or -1)
 
                 # Backlog peak from resource stats
                 _backlog_peak = 0
@@ -2514,6 +2581,11 @@ async def worker_process(
                         "l7_conn_rate": _l7_conn_rate,
                         "l7_handshake_p99_ms": _l7_handshake_p99_ms,
                         "l7_step_fail_ratio": _l7_step_fail_ratio,
+                        "session_success_rate": _session_success_rate,
+                        "retry_success_rate": _retry_success_rate,
+                        "dp_queue_id": _dp_queue_id,
+                        "dp_queue_strategy": _dp_queue_strategy,
+                        "dp_affinity_cpu": _dp_affinity_cpu,
                         "gpu_ring_depth_peak": int(worker_stats.get("gpu_ring_depth_peak", 0) or 0),
                         "gpu_ring_block_wait_ns": int(worker_stats.get("gpu_ring_block_wait_ns", 0) or 0),
                         "state_active_entries": int(worker_stats.get("state_active_entries", 0) or 0),

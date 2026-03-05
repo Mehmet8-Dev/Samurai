@@ -6,20 +6,30 @@
       "description": "Lab NIC queue/IRQ affinity pinned, privileged datapath enabled.",
       "gates": {
         "run_quality": "valid",
+        "send_success_ratio_pct_min": 99.0,
         "wire_loss_est_pct_max": 1.0,
         "rate_accuracy_pct_min": 98.0,
+        "txring_flush_error_ratio_pct_max": 0.5,
+        "txring_flush_eagain_ratio_pct_max": 2.0,
+        "txring_hold_block_pressure_pct_max": 35.0,
         "session_success_rate_min": 99.0,
-        "retry_success_rate_min": 90.0
+        "retry_success_rate_min": 90.0,
+        "l7_step_fail_ratio_max": 0.01
       }
     },
     "developer_fallback": {
       "description": "General developer workstation fallback profile.",
       "gates": {
         "run_quality": "valid",
+        "send_success_ratio_pct_min": 95.0,
         "wire_loss_est_pct_max": 5.0,
         "rate_accuracy_pct_min": 90.0,
+        "txring_flush_error_ratio_pct_max": 2.0,
+        "txring_flush_eagain_ratio_pct_max": 5.0,
+        "txring_hold_block_pressure_pct_max": 60.0,
         "session_success_rate_min": 95.0,
-        "retry_success_rate_min": 70.0
+        "retry_success_rate_min": 70.0,
+        "l7_step_fail_ratio_max": 0.05
       }
     }
   },
@@ -35,7 +45,14 @@
     "l7_active_sessions_peak",
     "l7_conn_rate",
     "l7_handshake_p99_ms",
-    "l7_step_fail_ratio"
+    "l7_step_fail_ratio",
+    "session_success_rate",
+    "retry_success_rate",
+    "kpi_gate_profile",
+    "kpi_gate_status",
+    "kpi_gate_hard_fail",
+    "kpi_violations",
+    "score_eligible"
   ],
   "scenarios": [
     {

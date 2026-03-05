@@ -70,6 +70,9 @@ class LiveMetricsExporter:
             elif k == "run_quality" and isinstance(v, str):
                 safe_quality = str(v).replace('"', '\\"')
                 lines.append(f'{self.prefix}_run_quality{{quality="{safe_quality}"}} 1')
+            elif k == "kpi_gate_status" and isinstance(v, str):
+                safe_status = str(v).replace('"', '\\"')
+                lines.append(f'{self.prefix}_kpi_gate_status{{status="{safe_status}"}} 1')
 
         # Sender path breakdown (labelled gauge)
         sender_paths = stats.get("sender_paths_used")

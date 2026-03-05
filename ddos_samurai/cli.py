@@ -282,9 +282,17 @@ def _report_inputs_from_args(args) -> dict:
         "loss_fail_pct": float(getattr(args, "loss_fail_pct", 5.0) or 5.0),
         "sender_backend": str(getattr(args, "sender_backend", "auto")),
         "sender_fallback_policy": str(getattr(args, "sender_fallback_policy", "allow")),
+        "lab_profile": str(getattr(args, "lab_profile", "off")),
+        "dp_queue_strategy": str(getattr(args, "dp_queue_strategy", "rr")),
+        "dp_queues": int(getattr(args, "dp_queues", 1) or 1),
+        "dp_queue_map": str(getattr(args, "dp_queue_map", "")),
         "xdp_enable": bool(getattr(args, "xdp_enable", False)),
         "xdp_interface": str(getattr(args, "xdp_interface", "")),
         "xdp_queue_id": int(getattr(args, "xdp_queue_id", 0) or 0),
+        "kpi_gate_profile": str(getattr(args, "kpi_gate_profile", "off")),
+        "kpi_hard_fail": bool(getattr(args, "kpi_hard_fail", False)),
+        "l7_engine": str(getattr(args, "l7_engine", "python")),
+        "legacy_path_enable": bool(getattr(args, "legacy_path_enable", False)),
         "http2_connections": int(getattr(args, "http2_connections", 1) or 1),
         "http2_streams_per_conn": int(getattr(args, "http2_streams_per_conn", 100) or 100),
         "l7_session_repeats": int(getattr(args, "l7_session_repeats", 1) or 1),
@@ -382,9 +390,14 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
     fallback_policy = str(getattr(args, "sender_fallback_policy", "allow") or "allow").strip().lower()
     xdp_enable = bool(getattr(args, "xdp_enable", False))
     xdp_interface = str(getattr(args, "xdp_interface", "") or "").strip()
+    lab_profile = str(getattr(args, "lab_profile", "off") or "off").strip().lower()
+    dp_queue_strategy = str(getattr(args, "dp_queue_strategy", "rr") or "rr").strip().lower()
+    dp_queue_map = str(getattr(args, "dp_queue_map", "") or "").strip()
 
     if int(getattr(args, "xdp_queue_id", 0) or 0) < 0:
         parser.error("Hata: --xdp-queue-id >= 0 olmalıdır.")
+    if int(getattr(args, "dp_queues", 1) or 0) <= 0:
+        parser.error("Hata: --dp-queues >= 1 olmalıdır.")
     if int(getattr(args, "http2_connections", 1) or 0) <= 0:
         parser.error("Hata: --http2-connections >= 1 olmalıdır.")
     if int(getattr(args, "http2_streams_per_conn", 100) or 0) <= 0:
@@ -397,6 +410,123 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: XDP yolu için --xdp-interface zorunludur.")
     if fallback_policy == "fail" and sender_backend == "auto":
         parser.error("Hata: --sender-fallback-policy fail için --sender-backend auto kullanılamaz.")
+    if dp_queue_strategy == "map":
+        if not dp_queue_map:
+            parser.error("Hata: --dp-queue-strategy map için --dp-queue-map zorunludur.")
+        try:
+            _ = _parse_dp_queue_map(dp_queue_map)
+        except Exception as exc:
+            parser.error(f"Hata: --dp-queue-map formatı geçersiz: {exc}")
+    if (
+        bool(getattr(args, "kpi_hard_fail", False))
+        and str(getattr(args, "kpi_gate_profile", "off") or "off") == "off"
+        and lab_profile != "dedicated"
+    ):
+        parser.error("Hata: --kpi-hard-fail için --kpi-gate-profile off olamaz.")
+    if lab_profile == "dedicated":
+        if sender_backend == "auto":
+            parser.error("Hata: --lab-profile dedicated için --sender-backend explicit olmalıdır (auto kullanılamaz).")
+        if fallback_policy != "fail":
+            parser.error("Hata: --lab-profile dedicated için --sender-fallback-policy fail zorunludur.")
+        if int(getattr(args, "dp_queues", 1) or 1) < 1:
+            parser.error("Hata: --lab-profile dedicated için --dp-queues >= 1 zorunludur.")
+
+
+def _parse_dp_queue_map(raw: str) -> dict[int, int]:
+    out: dict[int, int] = {}
+    txt = str(raw or "").strip()
+    if not txt:
+        return out
+    for token in txt.split(","):
+        item = str(token).strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"'{item}' 'worker:queue' formatında olmalı")
+        worker_s, queue_s = item.split(":", 1)
+        worker_id = int(worker_s.strip())
+        queue_id = int(queue_s.strip())
+        if worker_id <= 0:
+            raise ValueError(f"worker_id > 0 olmalı: {worker_id}")
+        if queue_id < 0:
+            raise ValueError(f"queue_id >= 0 olmalı: {queue_id}")
+        out[int(worker_id)] = int(queue_id)
+    return out
+
+
+def _resolve_worker_queue_map(
+    *,
+    workers: int,
+    strategy: str,
+    dp_queues: int,
+    map_spec: str,
+) -> dict[int, int]:
+    workers = max(0, int(workers or 0))
+    dp_queues = max(1, int(dp_queues or 1))
+    strategy = str(strategy or "rr").strip().lower()
+    out: dict[int, int] = {}
+    if workers <= 0:
+        return out
+    if strategy == "map":
+        parsed = _parse_dp_queue_map(map_spec)
+        for wid in range(1, workers + 1):
+            if wid not in parsed:
+                raise ValueError(f"worker {wid} için queue map eksik")
+            qid = int(parsed[wid])
+            if qid >= dp_queues:
+                raise ValueError(f"worker {wid} queue_id {qid} dp_queues({dp_queues}) sınırını aşıyor")
+            out[wid] = qid
+        return out
+    for wid in range(1, workers + 1):
+        if strategy == "pin":
+            qid = min(wid - 1, dp_queues - 1)
+        else:
+            qid = (wid - 1) % dp_queues
+        out[wid] = int(qid)
+    return out
+
+
+def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    lab_profile = str(getattr(args, "lab_profile", "off") or "off").strip().lower()
+    if lab_profile != "dedicated":
+        return
+    if str(getattr(args, "kpi_gate_profile", "off") or "off").strip().lower() == "off":
+        args.kpi_gate_profile = "dedicated_lab"
+        utils.log_info("lab-profile=dedicated için --kpi-gate-profile otomatik dedicated_lab olarak ayarlandı.")
+    if not bool(getattr(args, "kpi_hard_fail", False)):
+        args.kpi_hard_fail = True
+        utils.log_info("lab-profile=dedicated için --kpi-hard-fail otomatik etkinleştirildi.")
+
+    workers = int(getattr(args, "workers", multiprocessing.cpu_count()) or 0)
+    dp_queues = int(getattr(args, "dp_queues", 1) or 1)
+    strategy = str(getattr(args, "dp_queue_strategy", "rr") or "rr")
+    map_spec = str(getattr(args, "dp_queue_map", "") or "")
+    qmap = _resolve_worker_queue_map(workers=workers, strategy=strategy, dp_queues=dp_queues, map_spec=map_spec)
+    if strategy == "map":
+        used = list(qmap.values())
+        if len(used) != len(set(used)):
+            parser.error("Hata: dedicated + map stratejisinde queue çakışmaları yasak (her worker tekil queue).")
+
+    iface = str(getattr(args, "xdp_interface", "") or "").strip()
+    if not iface:
+        iface = str(getattr(args, "loss_iface", "") or "").strip()
+    if not iface:
+        parser.error("Hata: --lab-profile dedicated için --xdp-interface (veya --loss-iface) zorunludur.")
+    try:
+        from .af_xdp_sender import get_interface_queue_count
+
+        nic_tx_queues = int(get_interface_queue_count(iface) or 1)
+    except Exception:
+        nic_tx_queues = 1
+    if dp_queues > nic_tx_queues:
+        parser.error(
+            f"Hata: --dp-queues ({dp_queues}) interface {iface} TX queue sayısından ({nic_tx_queues}) büyük olamaz."
+        )
+    for wid, qid in qmap.items():
+        if qid >= nic_tx_queues:
+            parser.error(
+                f"Hata: worker {wid} queue_id {qid}, interface {iface} TX queue sınırını ({nic_tx_queues - 1}) aşıyor."
+            )
 
 def build_parser() -> argparse.ArgumentParser:
     """
@@ -538,9 +668,55 @@ def build_parser() -> argparse.ArgumentParser:
         default="allow",
         help="Backend fallback politikası: allow=alt yola düş, fail=run'ı fail-visible bitir.",
     )
+    parser.add_argument(
+        "--lab-profile",
+        choices=["off", "dedicated"],
+        default=str(os.environ.get("SAMURAI_LAB_PROFILE", "off") or "off"),
+        help="Lab çalışma profili: off=genel geliştirici, dedicated=hard benchmark profili.",
+    )
+    parser.add_argument(
+        "--dp-queue-strategy",
+        choices=["rr", "pin", "map"],
+        default=str(os.environ.get("SAMURAI_DP_QUEUE_STRATEGY", "rr") or "rr"),
+        help="Dataplane queue dağıtımı: rr=round-robin, pin=worker->queue, map=explicit map.",
+    )
+    parser.add_argument(
+        "--dp-queues",
+        type=int,
+        default=_env_int("SAMURAI_DP_QUEUES", 1),
+        help="Dataplane queue sayısı (dedicated profilde NIC TX queue kontrolüne girer).",
+    )
+    parser.add_argument(
+        "--dp-queue-map",
+        type=str,
+        default=str(os.environ.get("SAMURAI_DP_QUEUE_MAP", "") or ""),
+        help="Explicit worker->queue haritası. Format: '1:0,2:1,3:2'.",
+    )
     parser.add_argument("--xdp-enable", action="store_true", help="AF_XDP sender yolunu etkinleştir (xdp backend).")
     parser.add_argument("--xdp-interface", type=str, default="", help="AF_XDP için NIC adı (örn: eth0).")
     parser.add_argument("--xdp-queue-id", type=int, default=0, help="AF_XDP queue id (varsayılan: 0).")
+    parser.add_argument(
+        "--kpi-gate-profile",
+        choices=["off", "developer_fallback", "dedicated_lab"],
+        default=str(os.environ.get("SAMURAI_KPI_GATE_PROFILE", "off") or "off"),
+        help="KPI gate profili: off|developer_fallback|dedicated_lab.",
+    )
+    parser.add_argument(
+        "--kpi-hard-fail",
+        action="store_true",
+        help="Dedicated gate ihlalinde non-zero exit döndür.",
+    )
+    parser.add_argument(
+        "--l7-engine",
+        choices=["python", "c_state"],
+        default=str(os.environ.get("SAMURAI_L7_ENGINE", "python") or "python"),
+        help="L7 state engine seçimi: python|c_state.",
+    )
+    parser.add_argument(
+        "--legacy-path-enable",
+        action="store_true",
+        help="Yeni engine yolu başarısız olursa legacy Python L7 yoluna dönüşe izin ver.",
+    )
     parser.add_argument("--l7-session-repeats", type=int, default=1, help="Stateful L7 oturumlarını kullanıcı başına tekrar sayısı.")
     parser.add_argument("--l7-max-active-sessions", type=int, default=0, help="Stateful L7 için eşzamanlı aktif session üst limiti (0=sınırsız).")
     parser.add_argument(
@@ -1005,6 +1181,7 @@ def main(argv=None):
     _validate_pacing_args(parser, args)
     _validate_hybrid_cuda_args(parser, args)
     _validate_sender_route_args(parser, args)
+    _preflight_lab_profile(parser, args)
 
     global CONNECTION_POOL
     try:
@@ -1017,6 +1194,8 @@ def main(argv=None):
     report_fmt = str(getattr(args, "run_report_format", getattr(args, "gpu_pcap_run_report_format", "both")))
     report_dir = str(getattr(args, "run_report_dir", "reports/runs"))
     report_base = str(getattr(args, "run_report_out", "")).strip() or str(getattr(args, "gpu_pcap_run_report_out", "")).strip()
+    if bool(getattr(args, "kpi_hard_fail", False)) or str(getattr(args, "kpi_gate_profile", "off") or "off") != "off":
+        want_report = True
     soak_cfg = _build_soak_config(args)
     os.environ["SAMURAI_LOSS_TELEMETRY"] = str(getattr(args, "loss_telemetry", "auto"))
     os.environ["SAMURAI_LOSS_FAIL_PCT"] = str(float(getattr(args, "loss_fail_pct", 5.0) or 5.0))
@@ -1043,9 +1222,17 @@ def main(argv=None):
     os.environ["SAMURAI_SENDER_FALLBACK_POLICY"] = str(
         getattr(args, "sender_fallback_policy", "allow") or "allow"
     )
+    os.environ["SAMURAI_LAB_PROFILE"] = str(getattr(args, "lab_profile", "off") or "off")
+    os.environ["SAMURAI_DP_QUEUE_STRATEGY"] = str(getattr(args, "dp_queue_strategy", "rr") or "rr")
+    os.environ["SAMURAI_DP_QUEUES"] = str(int(getattr(args, "dp_queues", 1) or 1))
+    os.environ["SAMURAI_DP_QUEUE_MAP"] = str(getattr(args, "dp_queue_map", "") or "")
     os.environ["SAMURAI_XDP_ENABLE"] = "1" if bool(getattr(args, "xdp_enable", False)) else "0"
     os.environ["SAMURAI_XDP_INTERFACE"] = str(getattr(args, "xdp_interface", "") or "")
     os.environ["SAMURAI_XDP_QUEUE_ID"] = str(int(getattr(args, "xdp_queue_id", 0) or 0))
+    os.environ["SAMURAI_KPI_GATE_PROFILE"] = str(getattr(args, "kpi_gate_profile", "off") or "off")
+    os.environ["SAMURAI_KPI_HARD_FAIL"] = "1" if bool(getattr(args, "kpi_hard_fail", False)) else "0"
+    os.environ["SAMURAI_L7_ENGINE"] = str(getattr(args, "l7_engine", "python") or "python")
+    os.environ["SAMURAI_LEGACY_PATH_ENABLE"] = "1" if bool(getattr(args, "legacy_path_enable", False)) else "0"
 
     # Live mode reporting is supported as well (aggregated worker events).
 
@@ -1500,6 +1687,16 @@ def main(argv=None):
     resource_stats = manager.dict()
 
     workers = args.workers if args.workers > 0 else multiprocessing.cpu_count()
+    try:
+        worker_queue_map = _resolve_worker_queue_map(
+            workers=int(workers),
+            strategy=str(getattr(args, "dp_queue_strategy", "rr") or "rr"),
+            dp_queues=int(getattr(args, "dp_queues", 1) or 1),
+            map_spec=str(getattr(args, "dp_queue_map", "") or ""),
+        )
+    except Exception as exc:
+        utils.log_critical(f"Dataplane queue map çözümleme hatası: {exc}")
+        sys.exit(1)
     soak_duration_s = int((soak_cfg or {}).get("duration_s", 0) or 0)
     if soak_cfg is not None and soak_duration_s > 0:
         soak_chunk_total = int(args.count or 0)
@@ -1534,6 +1731,7 @@ def main(argv=None):
     started_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     interrupted = False
     monitor_summary = {}
+    kpi_hard_fail_triggered = False
 
     # Start worker processes (no loud progress bar). A smooth live monitor will show concise status.
     for i in range(workers):
@@ -1542,6 +1740,11 @@ def main(argv=None):
 
         worker_args = argparse.Namespace(**vars(args))
         worker_args.count = worker_counts[i]
+        worker_id = i + 1
+        worker_queue_id = int(worker_queue_map.get(worker_id, getattr(args, "xdp_queue_id", 0)) or 0)
+        worker_args.dp_queue_id = worker_queue_id
+        worker_args.xdp_queue_id = worker_queue_id
+        worker_args.dp_worker_queue_map = json.dumps(worker_queue_map, sort_keys=True)
         if soak_deadline_ts > 0.0:
             worker_args.soak_deadline_ts = float(soak_deadline_ts)
 
@@ -1669,6 +1872,12 @@ def main(argv=None):
                 rr.results["soak_alarms"] = list((monitor_summary or {}).get("alarms", []) or [])
                 rr.results["soak_thresholds"] = dict((monitor_summary or {}).get("thresholds", {}) or {})
                 rr.results["soak_baseline"] = dict((monitor_summary or {}).get("baseline", {}) or {})
+            if int(rr.results.get("kpi_gate_hard_fail", 0) or 0) == 1:
+                kpi_hard_fail_triggered = True
+                utils.log_critical(
+                    "KPI gate hard-fail tetiklendi: "
+                    + ", ".join([str(x) for x in list(rr.results.get("kpi_violations", []))])
+                )
 
             base = report_base or f"live_{int(start_time)}"
             base_path = os.path.join(os.getcwd(), report_dir, base)
@@ -1756,6 +1965,8 @@ def main(argv=None):
         manager.shutdown()
     except Exception:
         pass
+    if kpi_hard_fail_triggered:
+        sys.exit(2)
 
 if __name__ == '__main__':
     try:

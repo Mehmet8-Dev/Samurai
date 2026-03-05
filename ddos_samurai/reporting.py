@@ -615,6 +615,13 @@ def build_live_attack_report(
     l7_handshake_p99_ms_max = 0.0
     l7_step_fail_ratio_weighted_sum = 0.0
     l7_step_fail_ratio_weight = 0
+    session_success_rate_weighted_sum = 0.0
+    session_success_rate_weight = 0
+    retry_success_rate_weighted_sum = 0.0
+    retry_success_rate_weight = 0
+    dp_queue_ids_used: set[int] = set()
+    dp_affinity_cpus_used: set[int] = set()
+    dp_queue_strategy = "unknown"
     backlog_peak_max = 0
     sender_paths_used: Dict[str, int] = {}
     by_vector: Dict[str, Dict[str, int]] = {}
@@ -980,9 +987,29 @@ def build_live_attack_report(
         if _l7_step_fail_ratio > 0.0:
             l7_step_fail_ratio_weighted_sum += (_l7_step_fail_ratio * max(1, attempted))
             l7_step_fail_ratio_weight += max(1, attempted)
+        _session_success_rate = float(ev.get("session_success_rate", st.get("session_success_rate", 0.0)) or 0.0)
+        if _session_success_rate > 0.0:
+            session_success_rate_weighted_sum += (_session_success_rate * max(1, attempted))
+            session_success_rate_weight += max(1, attempted)
+        _retry_success_rate = float(ev.get("retry_success_rate", st.get("retry_success_rate", 0.0)) or 0.0)
+        if _retry_success_rate > 0.0:
+            retry_success_rate_weighted_sum += (_retry_success_rate * max(1, attempted))
+            retry_success_rate_weight += max(1, attempted)
         _bp = int(ev.get("queue_backlog_peak", 0) or 0)
         if _bp > backlog_peak_max:
             backlog_peak_max = _bp
+        _dp_queue_id = int(ev.get("dp_queue_id", st.get("dp_queue_id", -1)) or -1)
+        if _dp_queue_id >= 0:
+            dp_queue_ids_used.add(_dp_queue_id)
+        _dp_affinity_cpu = int(ev.get("dp_affinity_cpu", st.get("dp_affinity_cpu", -1)) or -1)
+        if _dp_affinity_cpu >= 0:
+            dp_affinity_cpus_used.add(_dp_affinity_cpu)
+        _dp_strategy_item = str(ev.get("dp_queue_strategy", st.get("dp_queue_strategy", "")) or "").strip()
+        if _dp_strategy_item:
+            if dp_queue_strategy in ("", "unknown"):
+                dp_queue_strategy = _dp_strategy_item
+            elif dp_queue_strategy != _dp_strategy_item and dp_queue_strategy != "mixed":
+                dp_queue_strategy = "mixed"
 
         vec = str(ev.get("attack_vector", "unknown"))
         be = str(ev.get("compute_backend", "unknown"))
@@ -1020,6 +1047,12 @@ def build_live_attack_report(
     l7_step_fail_ratio = (
         float(l7_step_fail_ratio_weighted_sum) / float(l7_step_fail_ratio_weight)
     ) if l7_step_fail_ratio_weight > 0 else 0.0
+    session_success_rate = (
+        float(session_success_rate_weighted_sum) / float(session_success_rate_weight)
+    ) if session_success_rate_weight > 0 else 0.0
+    retry_success_rate = (
+        float(retry_success_rate_weighted_sum) / float(retry_success_rate_weight)
+    ) if retry_success_rate_weight > 0 else 0.0
     txring_tp_drops_bounded_total = min(
         int(txring_tp_drops_total),
         int(txring_tp_packets_total),
@@ -1267,6 +1300,11 @@ def build_live_attack_report(
             "l7_conn_rate": round(float(l7_conn_rate), 4),
             "l7_handshake_p99_ms": round(float(l7_handshake_p99_ms_max), 4),
             "l7_step_fail_ratio": round(float(l7_step_fail_ratio), 6),
+            "session_success_rate": round(float(session_success_rate), 6),
+            "retry_success_rate": round(float(retry_success_rate), 6),
+            "dp_queue_ids_used": sorted(int(x) for x in list(dp_queue_ids_used)),
+            "dp_affinity_cpus_used": sorted(int(x) for x in list(dp_affinity_cpus_used)),
+            "dp_queue_strategy": str(dp_queue_strategy or "unknown"),
             "queue_backlog_peak": int(backlog_peak_max),
             "by_vector": by_vector,
             "by_backend": by_backend,
@@ -1277,4 +1315,26 @@ def build_live_attack_report(
         artifacts=[],
         warnings=list(warnings or []),
     )
+    try:
+        from . import kpi_gate
+
+        gate_profile = str(
+            (args or {}).get("kpi_gate_profile", os.environ.get("SAMURAI_KPI_GATE_PROFILE", "off")) or "off"
+        )
+        gate_hard_fail = bool(
+            (args or {}).get("kpi_hard_fail", str(os.environ.get("SAMURAI_KPI_HARD_FAIL", "0")) in {"1", "true"})
+        )
+        gate_result = kpi_gate.evaluate(
+            report.results,
+            profile=gate_profile,
+            hard_fail=gate_hard_fail,
+        )
+        report.results.update(gate_result.as_report_fields())
+        report.results["kpi_evaluated_rules"] = list(gate_result.evaluated_rules)
+    except Exception:
+        report.results.setdefault("kpi_gate_profile", "off")
+        report.results.setdefault("kpi_gate_status", "pass")
+        report.results.setdefault("kpi_gate_hard_fail", 0)
+        report.results.setdefault("kpi_violations", [])
+        report.results.setdefault("score_eligible", 1 if str(report.results.get("run_quality", "")) == "valid" else 0)
     return report

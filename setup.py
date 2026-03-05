@@ -73,6 +73,24 @@ def get_extensions():
     )
     extensions.append(pacing_engine)
     
+    # Dataplane core extension (L4 unified hot-path scaffold)
+    dataplane_core = Extension(
+        'ddos_samurai.dataplane_core',
+        sources=['ddos_samurai/dataplane_core.c'],
+        extra_compile_args=['-O2', '-Wall', '-fPIC'],
+        extra_link_args=['-lpthread', '-lm']
+    )
+    extensions.append(dataplane_core)
+
+    # L7 state engine extension (HTTP/1.1 + WS scaffold)
+    l7_state_engine = Extension(
+        'ddos_samurai.l7_state_engine',
+        sources=['ddos_samurai/l7_state_engine.c'],
+        extra_compile_args=['-O2', '-Wall', '-fPIC'],
+        extra_link_args=['-lpthread', '-lm']
+    )
+    extensions.append(l7_state_engine)
+
     # XDP sender extension (Linux only, requires XDP headers)
     if platform.system() == 'Linux':
         xdp_compile_args = ['-O2', '-Wall', '-Wextra']
