@@ -1,10 +1,19 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 #ifndef IFNAMSIZ
 #define IFNAMSIZ 16
@@ -23,6 +32,7 @@ typedef struct {
     int xdp_initialized;
     int queue_id;
     int xdp_mode;
+    int raw_sockfd;
     char backend[32];
     char fallback_policy[16];
     char interface[IFNAMSIZ];
@@ -32,6 +42,17 @@ typedef struct {
 } DpHandle;
 
 static long g_next_id = 1;
+
+static int _fallback_is_enabled(const char *policy) {
+    const char *p = policy;
+    if (p == NULL || p[0] == '\0') {
+        return 1;
+    }
+    if (strcmp(p, "deny") == 0 || strcmp(p, "fail") == 0) {
+        return 0;
+    }
+    return 1;
+}
 
 static void _copy_lower(char *dst, size_t dst_len, const char *src, const char *fallback) {
     size_t i = 0;
@@ -673,6 +694,384 @@ static PyObject *_run_xdp_backend(
     return out;
 }
 
+static int _ensure_raw_socket(DpHandle *h, char *reason_out, size_t reason_out_len) {
+    int fd;
+
+    if (h == NULL) {
+        return -1;
+    }
+    if (h->raw_sockfd >= 0) {
+        return 0;
+    }
+
+    fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (fd < 0) {
+        if (reason_out != NULL && reason_out_len > 0) {
+            if (errno == EPERM || errno == EACCES) {
+                (void)snprintf(reason_out, reason_out_len, "raw_socket_permission_denied");
+            } else {
+                (void)snprintf(reason_out, reason_out_len, "raw_socket_open_failed");
+            }
+        }
+        return -1;
+    }
+
+    h->raw_sockfd = fd;
+    return 0;
+}
+
+static PyObject *_run_c_ext_l3_backend(
+    DpHandle *h,
+    PyObject *buffer_obj,
+    int packet_size,
+    int count,
+    const char *target_ip,
+    int target_port
+) {
+    PyObject *fast_mod = NULL;
+    PyObject *cext_result = NULL;
+    PyObject *out = NULL;
+    char reason[96];
+    long attempted;
+    long sent;
+    long errors;
+    long fallback_count = 0;
+    const char *fallback_reason = "none";
+
+    reason[0] = '\0';
+
+    if (_ensure_raw_socket(h, reason, sizeof(reason)) < 0) {
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_C_EXT_L3_FAILED",
+            reason[0] != '\0' ? reason : "raw_socket_unavailable",
+            1
+        );
+    }
+
+    fast_mod = _import_cached(&h->fast_mod, "ddos_samurai.fast_sender");
+    if (fast_mod == NULL) {
+        PyErr_Clear();
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_C_EXT_L3_FAILED",
+            "cext_module_unavailable",
+            1
+        );
+    }
+    if (!PyObject_HasAttrString(fast_mod, "send_optimized")) {
+        Py_DECREF(fast_mod);
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_C_EXT_L3_FAILED",
+            "cext_send_optimized_missing",
+            1
+        );
+    }
+
+    cext_result = PyObject_CallMethod(
+        fast_mod,
+        "send_optimized",
+        "iOsiii",
+        h->raw_sockfd,
+        buffer_obj,
+        target_ip != NULL ? target_ip : "",
+        target_port,
+        packet_size,
+        count
+    );
+    Py_DECREF(fast_mod);
+    if (cext_result == NULL) {
+        _capture_exception_type(reason, sizeof(reason), "cext_send_failed");
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_C_EXT_L3_FAILED",
+            reason,
+            1
+        );
+    }
+
+    attempted = count;
+    if (PyDict_Check(cext_result)) {
+        attempted = _py_dict_long(cext_result, "attempted", count);
+        sent = _py_dict_long(cext_result, "sent", 0);
+    } else {
+        sent = PyLong_AsLong(cext_result);
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            sent = 0;
+        }
+    }
+
+    if (attempted < 0) {
+        attempted = 0;
+    }
+    if (sent < 0) {
+        sent = 0;
+    }
+    if (sent > attempted) {
+        sent = attempted;
+    }
+    errors = attempted - sent;
+    if (errors < 0) {
+        errors = 0;
+    }
+
+    if (sent <= 0 && attempted > 0) {
+        fallback_count = 1;
+        fallback_reason = "cext_sent_zero";
+    }
+
+    out = _build_result(
+        attempted,
+        sent,
+        errors,
+        packet_size,
+        target_ip,
+        target_port,
+        "DP_C_EXT_L3",
+        fallback_reason,
+        fallback_count
+    );
+    if (out == NULL) {
+        Py_DECREF(cext_result);
+        return NULL;
+    }
+
+    if (PyDict_Check(cext_result)) {
+        const char *core_reason = _py_dict_cstr(cext_result, "sender_fallback_reason", "");
+        long core_fb = _py_dict_long(cext_result, "fallback_count", fallback_count);
+        if (_merge_dict(out, cext_result) < 0) {
+            Py_DECREF(cext_result);
+            Py_DECREF(out);
+            return NULL;
+        }
+        if (_set_str(out, "sender_path", "DP_C_EXT_L3") < 0) {
+            Py_DECREF(cext_result);
+            Py_DECREF(out);
+            return NULL;
+        }
+        if (core_reason != NULL && core_reason[0] != '\0' && strcmp(core_reason, "none") != 0) {
+            if (_set_str(out, "sender_fallback_reason", core_reason) < 0) {
+                Py_DECREF(cext_result);
+                Py_DECREF(out);
+                return NULL;
+            }
+            if (core_fb < 0) {
+                core_fb = 0;
+            }
+            if (_set_long(out, "fallback_count", core_fb) < 0) {
+                Py_DECREF(cext_result);
+                Py_DECREF(out);
+                return NULL;
+            }
+        } else if (fallback_count == 0) {
+            if (_set_str(out, "sender_fallback_reason", "none") < 0 ||
+                _set_long(out, "fallback_count", 0) < 0) {
+                Py_DECREF(cext_result);
+                Py_DECREF(out);
+                return NULL;
+            }
+        }
+    }
+
+    Py_DECREF(cext_result);
+    return out;
+}
+
+static PyObject *_run_python_backend(
+    DpHandle *h,
+    PyObject *buffer_obj,
+    int packet_size,
+    int count,
+    const char *target_ip,
+    int target_port
+) {
+    Py_buffer view;
+    struct sockaddr_in addr;
+    char reason[96];
+    long sent = 0;
+    long errors;
+    PyObject *out;
+
+    reason[0] = '\0';
+
+    if (_ensure_raw_socket(h, reason, sizeof(reason)) < 0) {
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_PYTHON_SENDTO_FAILED",
+            reason[0] != '\0' ? reason : "raw_socket_unavailable",
+            1
+        );
+    }
+
+    if (target_ip == NULL || target_ip[0] == '\0') {
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_PYTHON_SENDTO_FAILED",
+            "target_ip_missing",
+            1
+        );
+    }
+    if (target_port <= 0 || target_port > 65535) {
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_PYTHON_SENDTO_FAILED",
+            "target_port_invalid",
+            1
+        );
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)target_port);
+    if (inet_pton(AF_INET, target_ip, &addr.sin_addr) != 1) {
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_PYTHON_SENDTO_FAILED",
+            "target_ip_invalid",
+            1
+        );
+    }
+
+    if (packet_size <= 0) {
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_PYTHON_SENDTO_FAILED",
+            "packet_size_invalid",
+            1
+        );
+    }
+
+    if (PyObject_GetBuffer(buffer_obj, &view, PyBUF_SIMPLE) < 0) {
+        PyErr_Clear();
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_PYTHON_SENDTO_FAILED",
+            "buffer_unavailable",
+            1
+        );
+    }
+
+    if ((size_t)view.len < ((size_t)packet_size * (size_t)count)) {
+        PyBuffer_Release(&view);
+        return _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_PYTHON_SENDTO_FAILED",
+            "buffer_too_small",
+            1
+        );
+    }
+
+    for (int i = 0; i < count; i++) {
+        const uint8_t *pkt = (const uint8_t *)view.buf + ((size_t)i * (size_t)packet_size);
+        ssize_t n;
+        for (;;) {
+            n = sendto(
+                h->raw_sockfd,
+                pkt,
+                (size_t)packet_size,
+                MSG_NOSIGNAL,
+                (const struct sockaddr *)&addr,
+                sizeof(addr)
+            );
+            if (n >= 0) {
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (n == (ssize_t)packet_size) {
+            sent += 1;
+        }
+    }
+
+    PyBuffer_Release(&view);
+
+    errors = count - sent;
+    if (errors < 0) {
+        errors = 0;
+    }
+
+    out = _build_result(
+        count,
+        sent,
+        errors,
+        packet_size,
+        target_ip,
+        target_port,
+        "DP_PYTHON_SENDTO",
+        (sent > 0 || count == 0) ? "none" : "python_sendto_failed",
+        (sent > 0 || count == 0) ? 0 : 1
+    );
+    if (out == NULL) {
+        return NULL;
+    }
+    if (_set_long(out, "py_sendto_fd", h->raw_sockfd) < 0) {
+        Py_DECREF(out);
+        return NULL;
+    }
+
+    return out;
+}
+
 static void _cleanup_handle(DpHandle *h) {
     PyObject *ret;
 
@@ -696,6 +1095,10 @@ static void _cleanup_handle(DpHandle *h) {
     h->xdp_mod = NULL;
     h->fast_mod = NULL;
     h->senders_mod = NULL;
+    if (h->raw_sockfd >= 0) {
+        close(h->raw_sockfd);
+        h->raw_sockfd = -1;
+    }
 }
 
 static void _capsule_destructor(PyObject *capsule) {
@@ -735,6 +1138,7 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
     h->xdp_mode = 0;
     h->xdp_enable = 0;
     h->xdp_initialized = 0;
+    h->raw_sockfd = -1;
 
     _copy_lower(h->backend, sizeof(h->backend), "auto", "auto");
     _copy_lower(h->fallback_policy, sizeof(h->fallback_policy), "allow", "allow");
@@ -751,6 +1155,11 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
 
     _copy_lower(h->backend, sizeof(h->backend), backend, "auto");
     _copy_lower(h->fallback_policy, sizeof(h->fallback_policy), fallback_policy, "allow");
+    if (strcmp(h->fallback_policy, "deny") == 0) {
+        (void)snprintf(h->fallback_policy, sizeof(h->fallback_policy), "fail");
+    } else if (strcmp(h->fallback_policy, "allow") != 0 && strcmp(h->fallback_policy, "fail") != 0) {
+        (void)snprintf(h->fallback_policy, sizeof(h->fallback_policy), "allow");
+    }
     (void)snprintf(h->interface, sizeof(h->interface), "%s", iface != NULL ? iface : "");
 
     return PyCapsule_New((void *)h, "samurai.dataplane.handle", _capsule_destructor);
@@ -775,6 +1184,7 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
     long sent;
     long errors;
     long fallback_count;
+    int txring_tried = 0;
 
     (void)self;
 
@@ -800,7 +1210,7 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
     }
 
     staged_reason[0] = '\0';
-    allow_fallback = strcmp(h->fallback_policy, "deny") != 0;
+    allow_fallback = _fallback_is_enabled(h->fallback_policy);
     backend = h->backend[0] != '\0' ? h->backend : "auto";
 
     if (count == 0) {
@@ -809,6 +1219,10 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
         out = _run_xdp_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
     } else if (strcmp(backend, "txring") == 0) {
         out = _run_txring_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
+    } else if (strcmp(backend, "c_ext_l3") == 0) {
+        out = _run_c_ext_l3_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
+    } else if (strcmp(backend, "python") == 0) {
+        out = _run_python_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
     } else if (strcmp(backend, "auto") == 0) {
         if (h->xdp_enable || h->interface[0] != '\0') {
             first = _run_xdp_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
@@ -827,15 +1241,60 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
                 Py_DECREF(first);
                 first = NULL;
 
+                txring_tried = 1;
                 second = _run_txring_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
                 if (second == NULL) {
                     return NULL;
                 }
+                sent = _py_dict_long(second, "sent", 0);
+                fallback_count = _py_dict_long(second, "fallback_count", sent > 0 ? 0 : 1);
+                if (sent > 0 || !allow_fallback) {
+                    out = second;
+                    second = NULL;
+                } else {
+                    staged_fallback_count += fallback_count;
+                    _append_reason(staged_reason, sizeof(staged_reason), _py_dict_cstr(second, "sender_fallback_reason", "none"));
+                    Py_DECREF(second);
+                    second = NULL;
+                }
+            }
+        }
+
+        if (out == NULL && !txring_tried) {
+            out = _run_txring_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
+            if (out == NULL) {
+                return NULL;
+            }
+            sent = _py_dict_long(out, "sent", 0);
+            fallback_count = _py_dict_long(out, "fallback_count", sent > 0 ? 0 : 1);
+            if (sent <= 0 && allow_fallback) {
+                staged_fallback_count += fallback_count;
+                _append_reason(staged_reason, sizeof(staged_reason), _py_dict_cstr(out, "sender_fallback_reason", "none"));
+                Py_DECREF(out);
+                out = NULL;
+            }
+        }
+
+        if (out == NULL) {
+            second = _run_c_ext_l3_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
+            if (second == NULL) {
+                return NULL;
+            }
+            sent = _py_dict_long(second, "sent", 0);
+            fallback_count = _py_dict_long(second, "fallback_count", sent > 0 ? 0 : 1);
+            if (sent > 0 || !allow_fallback) {
                 out = second;
                 second = NULL;
+            } else {
+                staged_fallback_count += fallback_count;
+                _append_reason(staged_reason, sizeof(staged_reason), _py_dict_cstr(second, "sender_fallback_reason", "none"));
+                Py_DECREF(second);
+                second = NULL;
             }
-        } else {
-            out = _run_txring_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
+        }
+
+        if (out == NULL) {
+            out = _run_python_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
         }
     } else {
         out = _build_result(

@@ -2849,6 +2849,11 @@ async def http_stateful_sender(
 
     engine_mode = str(l7_engine or "python").strip().lower()
     if engine_mode == "c_state":
+        _http_path_first = (
+            str(http_path[0])
+            if isinstance(http_path, list) and len(http_path) > 0
+            else str(http_path or "/")
+        )
         cfg = l7_engine_adapter.L7EngineConfig(
             engine="c_state",
             target_ip=str(target_ip),
@@ -2863,6 +2868,9 @@ async def http_stateful_sender(
                 "verify": bool(verify),
                 "timeout_s": float(timeout_s or 10.0),
                 "lab_profile": str(lab_profile or "off"),
+                "retries": int(retries or 0),
+                "http_method": str(http_method or "GET"),
+                "http_path": _http_path_first,
             },
         )
         c_res = await l7_engine_adapter.run_http1_stateful(cfg)
@@ -3173,8 +3181,12 @@ async def websocket_scenario_sender(
             concurrency=int(concurrency or 1),
             mode="websocket_stateful",
             extra={
+                "scheme": "wss" if int(target_port or 0) == 443 else "ws",
                 "ws_path": str(ws_path or "/"),
+                "ws_auth_message": str(auth_message or ""),
+                "ws_subscribe_count": int(len(subscribe_messages or [])),
                 "ws_ping_count": int(ping_count or 0),
+                "ws_await_response": bool(await_response),
                 "lab_profile": str(lab_profile or "off"),
             },
         )
