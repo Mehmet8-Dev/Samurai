@@ -59,6 +59,9 @@ typedef struct {
     long long deadline_ns;
 #ifdef SAMURAI_WITH_OPENSSL
     SSL *ssl;
+    size_t tls_pending_len;
+    size_t tls_pending_off;
+    unsigned char tls_pending[8192];
 #endif
 } Session;
 
@@ -272,6 +275,14 @@ static SSL_CTX *_tls_ctx_create(int verify_peer, const char **reason_out) {
 #ifdef TLS1_2_VERSION
     (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 #endif
+#ifdef SSL_OP_NO_KTLS
+    /* Userspace TLS keeps behavior stable across kernels/runners. */
+    SSL_CTX_set_options(ctx, SSL_OP_NO_KTLS);
+#endif
+#ifdef SSL_OP_ENABLE_KTLS
+    /* Some OpenSSL builds expose ENABLE-only semantics; force-disable kernel TLS. */
+    SSL_CTX_clear_options(ctx, SSL_OP_ENABLE_KTLS);
+#endif
 
     (void)SSL_CTX_set_alpn_protos(ctx, alpn_http11, sizeof(alpn_http11));
 
@@ -426,6 +437,144 @@ static void _session_release(int epfd, Session *s) {
     s->fd = -1;
 }
 
+#ifdef SAMURAI_WITH_OPENSSL
+static int _session_attach_tls(Session *s, const TlsConfig *tls_cfg) {
+    BIO *rbio = NULL;
+    BIO *wbio = NULL;
+
+    if (s == NULL || tls_cfg == NULL || !tls_cfg->enabled || tls_cfg->ctx == NULL) {
+        return -1;
+    }
+    if (s->ssl != NULL) {
+        return 0;
+    }
+
+    s->ssl = SSL_new(tls_cfg->ctx);
+    if (s->ssl == NULL) {
+        return -1;
+    }
+
+    rbio = BIO_new(BIO_s_mem());
+    wbio = BIO_new(BIO_s_mem());
+    if (rbio == NULL || wbio == NULL) {
+        if (rbio != NULL) {
+            BIO_free(rbio);
+        }
+        if (wbio != NULL) {
+            BIO_free(wbio);
+        }
+        SSL_free(s->ssl);
+        s->ssl = NULL;
+        return -1;
+    }
+    SSL_set_bio(s->ssl, rbio, wbio);
+#ifdef SSL_OP_NO_KTLS
+    (void)SSL_set_options(s->ssl, SSL_OP_NO_KTLS);
+#endif
+#ifdef SSL_OP_ENABLE_KTLS
+    (void)SSL_clear_options(s->ssl, SSL_OP_ENABLE_KTLS);
+#endif
+    SSL_set_connect_state(s->ssl);
+    if (tls_cfg->server_name != NULL &&
+        tls_cfg->server_name[0] != '\0' &&
+        !_is_ipv4_literal(tls_cfg->server_name)) {
+        (void)SSL_set_tlsext_host_name(s->ssl, tls_cfg->server_name);
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+        if (tls_cfg->verify_peer) {
+            (void)SSL_set1_host(s->ssl, tls_cfg->server_name);
+        }
+#endif
+    }
+    return 0;
+}
+
+static int _tls_flush_socket(Session *s) {
+    BIO *wbio;
+    unsigned char scratch[4096];
+
+    if (s == NULL || s->ssl == NULL) {
+        return -1;
+    }
+    wbio = SSL_get_wbio(s->ssl);
+    if (wbio == NULL) {
+        return -1;
+    }
+
+    for (;;) {
+        while (s->tls_pending_off < s->tls_pending_len) {
+            ssize_t wr = send(
+                s->fd,
+                s->tls_pending + s->tls_pending_off,
+                s->tls_pending_len - s->tls_pending_off,
+                MSG_NOSIGNAL
+            );
+            if (wr > 0) {
+                s->tls_pending_off += (size_t)wr;
+                continue;
+            }
+            if (wr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return 0;
+            }
+            return -1;
+        }
+
+        s->tls_pending_off = 0;
+        s->tls_pending_len = 0;
+
+        for (;;) {
+            int rd = BIO_read(wbio, scratch, (int)sizeof(scratch));
+            if (rd > 0) {
+                size_t copy_len = (size_t)rd;
+                if (copy_len > sizeof(s->tls_pending)) {
+                    copy_len = sizeof(s->tls_pending);
+                }
+                memcpy(s->tls_pending, scratch, copy_len);
+                s->tls_pending_len = copy_len;
+                break;
+            }
+            if (rd == 0) {
+                return 1;
+            }
+            if (BIO_should_retry(wbio)) {
+                return 1;
+            }
+            return -1;
+        }
+    }
+}
+
+static int _tls_feed_socket(Session *s) {
+    BIO *rbio;
+    unsigned char buf[4096];
+
+    if (s == NULL || s->ssl == NULL) {
+        return -1;
+    }
+    rbio = SSL_get_rbio(s->ssl);
+    if (rbio == NULL) {
+        return -1;
+    }
+
+    for (;;) {
+        ssize_t n = recv(s->fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            int bw = BIO_write(rbio, buf, (int)n);
+            if (bw <= 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (n == 0) {
+            return 0;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        return -1;
+    }
+}
+#endif
+
 static int _session_start(
     Session *s,
     int epfd,
@@ -460,6 +609,7 @@ static int _session_start(
     }
 
     rc = connect(fd, (const struct sockaddr *)addr, sizeof(*addr));
+    s->fd = fd;
     if (rc == 0) {
         s->state = SESSION_SENDING;
     } else {
@@ -471,33 +621,16 @@ static int _session_start(
     }
 
     if (tls_cfg != NULL && tls_cfg->enabled) {
-#ifdef SAMURAI_WITH_OPENSSL
-        s->ssl = SSL_new(tls_cfg->ctx);
-        if (s->ssl == NULL) {
-            close(fd);
-            return -1;
-        }
-        if (SSL_set_fd(s->ssl, fd) != 1) {
-            SSL_free(s->ssl);
-            s->ssl = NULL;
-            close(fd);
-            return -1;
-        }
-        SSL_set_connect_state(s->ssl);
-        if (tls_cfg->server_name != NULL &&
-            tls_cfg->server_name[0] != '\0' &&
-            !_is_ipv4_literal(tls_cfg->server_name)) {
-            (void)SSL_set_tlsext_host_name(s->ssl, tls_cfg->server_name);
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
-            if (tls_cfg->verify_peer) {
-                (void)SSL_set1_host(s->ssl, tls_cfg->server_name);
-            }
-#endif
-        }
         s->use_tls = 1;
-        if (s->state == SESSION_SENDING) {
-            s->state = SESSION_TLS_HANDSHAKE;
+    }
+
+    if (s->use_tls && s->state == SESSION_SENDING) {
+#ifdef SAMURAI_WITH_OPENSSL
+        if (_session_attach_tls(s, tls_cfg) < 0) {
+            close(fd);
+            return -1;
         }
+        s->state = SESSION_TLS_HANDSHAKE;
 #else
         close(fd);
         return -1;
@@ -513,13 +646,12 @@ static int _session_start(
     }
 
     s->in_use = 1;
-    s->fd = fd;
     s->start_ns = now_ns;
     s->deadline_ns = now_ns + timeout_ns;
     return 0;
 }
 
-static int _session_progress(Session *s, uint32_t events, int websocket_mode) {
+static int _session_progress(Session *s, uint32_t events, int websocket_mode, const TlsConfig *tls_cfg) {
     int sock_err = 0;
     socklen_t sock_err_len = sizeof(sock_err);
     ssize_t n;
@@ -541,14 +673,40 @@ static int _session_progress(Session *s, uint32_t events, int websocket_mode) {
             if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &sock_err, &sock_err_len) < 0 || sock_err != 0) {
                 return -1;
             }
-            s->state = s->use_tls ? SESSION_TLS_HANDSHAKE : SESSION_SENDING;
+            if (s->use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+                if (_session_attach_tls(s, tls_cfg) < 0) {
+                    return -1;
+                }
+                s->state = SESSION_TLS_HANDSHAKE;
+#else
+                return -1;
+#endif
+            } else {
+                s->state = SESSION_SENDING;
+            }
             continue;
         }
 
         if (s->state == SESSION_TLS_HANDSHAKE) {
 #ifdef SAMURAI_WITH_OPENSSL
+            if ((events & EPOLLIN) != 0) {
+                int fed = _tls_feed_socket(s);
+                if (fed < 0) {
+                    return -1;
+                }
+            }
+            if (_tls_flush_socket(s) < 0) {
+                return -1;
+            }
             int rc = SSL_connect(s->ssl);
+            if (_tls_flush_socket(s) < 0) {
+                return -1;
+            }
             if (rc == 1) {
+                if (s->tls_pending_off < s->tls_pending_len) {
+                    return 0;
+                }
                 s->state = SESSION_SENDING;
                 continue;
             }
@@ -566,9 +724,24 @@ static int _session_progress(Session *s, uint32_t events, int websocket_mode) {
             while (s->req_off < s->req_len) {
                 if (s->use_tls) {
 #ifdef SAMURAI_WITH_OPENSSL
+                    if ((events & EPOLLIN) != 0) {
+                        int fed = _tls_feed_socket(s);
+                        if (fed < 0) {
+                            return -1;
+                        }
+                    }
+                    if (_tls_flush_socket(s) < 0) {
+                        return -1;
+                    }
                     int wr = SSL_write(s->ssl, s->req + s->req_off, (int)(s->req_len - s->req_off));
+                    if (_tls_flush_socket(s) < 0) {
+                        return -1;
+                    }
                     if (wr > 0) {
                         s->req_off += (size_t)wr;
+                        if (s->tls_pending_off < s->tls_pending_len) {
+                            return 0;
+                        }
                         continue;
                     }
                     wr = SSL_get_error(s->ssl, wr);
@@ -598,11 +771,35 @@ static int _session_progress(Session *s, uint32_t events, int websocket_mode) {
         if (s->state == SESSION_READING) {
             if (s->use_tls) {
 #ifdef SAMURAI_WITH_OPENSSL
-                n = SSL_read(s->ssl, s->resp + s->resp_len, (int)(sizeof(s->resp) - s->resp_len - 1));
-                if (n < 0) {
-                    int rd = SSL_get_error(s->ssl, (int)n);
+                if ((events & EPOLLIN) != 0) {
+                    int fed = _tls_feed_socket(s);
+                    if (fed < 0) {
+                        return -1;
+                    }
+                }
+                if (_tls_flush_socket(s) < 0) {
+                    return -1;
+                }
+                int rdret = SSL_read(s->ssl, s->resp + s->resp_len, (int)(sizeof(s->resp) - s->resp_len - 1));
+                if (_tls_flush_socket(s) < 0) {
+                    return -1;
+                }
+                if (rdret > 0) {
+                    n = (ssize_t)rdret;
+                } else {
+                    int rd = SSL_get_error(s->ssl, rdret);
                     if (rd == SSL_ERROR_WANT_READ || rd == SSL_ERROR_WANT_WRITE) {
                         return 0;
+                    }
+                    if (rd == SSL_ERROR_ZERO_RETURN) {
+                        status = _parse_http_status(s->resp, s->resp_len);
+                        if (status > 0) {
+                            if (!websocket_mode) {
+                                return 1;
+                            }
+                            return status == 101 ? 1 : -1;
+                        }
+                        return -1;
                     }
                     return -1;
                 }
@@ -691,9 +888,8 @@ static int _run_single_pass(
         return -1;
     }
 
-    sessions = (Session *)PyMem_Calloc((size_t)concurrency, sizeof(Session));
+    sessions = (Session *)calloc((size_t)concurrency, sizeof(Session));
     if (sessions == NULL) {
-        PyErr_NoMemory();
         return -1;
     }
     for (long i = 0; i < concurrency; i++) {
@@ -704,17 +900,16 @@ static int _run_single_pass(
     if (event_cap < 1) {
         event_cap = 1;
     }
-    events = (struct epoll_event *)PyMem_Calloc((size_t)event_cap, sizeof(struct epoll_event));
+    events = (struct epoll_event *)calloc((size_t)event_cap, sizeof(struct epoll_event));
     if (events == NULL) {
-        PyMem_Free(sessions);
-        PyErr_NoMemory();
+        free(sessions);
         return -1;
     }
 
     epfd = epoll_create1(0);
     if (epfd < 0) {
-        PyMem_Free(events);
-        PyMem_Free(sessions);
+        free(events);
+        free(sessions);
         out->sent = 0;
         out->errors = attempt_count;
         out->peak_active = 0;
@@ -777,7 +972,7 @@ static int _run_single_pass(
                         continue;
                     }
 
-                    outcome = _session_progress(s, events[j].events, websocket_mode);
+                    outcome = _session_progress(s, events[j].events, websocket_mode, tls_cfg);
                     if (outcome == 0) {
                         continue;
                     }
@@ -832,8 +1027,8 @@ static int _run_single_pass(
     }
 
     close(epfd);
-    PyMem_Free(events);
-    PyMem_Free(sessions);
+    free(events);
+    free(sessions);
 
     out->sent = sent;
     out->errors = errors < 0 ? 0 : errors;
@@ -1175,6 +1370,7 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
     for (long pass_idx = 0; remaining > 0 && pass_idx <= max_retries; pass_idx++) {
         PassResult pass;
         long current = remaining;
+        int pass_rc = 0;
 
         pass.sent = 0;
         pass.errors = current;
@@ -1185,22 +1381,26 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
             retry_attempts += current;
         }
 
-        if (_run_single_pass(
-                current,
-                concurrency,
-                &addr,
-                timeout_ns,
-                target_ip,
-                (int)target_port,
-                path,
-                http_method,
-                websocket_mode,
-                &tls_cfg,
-                latency_samples,
-                latency_sample_cap,
-                &latency_sample_count,
-                &pass
-            ) < 0) {
+        Py_BEGIN_ALLOW_THREADS
+        pass_rc = _run_single_pass(
+            current,
+            concurrency,
+            &addr,
+            timeout_ns,
+            target_ip,
+            (int)target_port,
+            path,
+            http_method,
+            websocket_mode,
+            &tls_cfg,
+            latency_samples,
+            latency_sample_cap,
+            &latency_sample_count,
+            &pass
+        );
+        Py_END_ALLOW_THREADS
+
+        if (pass_rc < 0) {
 #ifdef SAMURAI_WITH_OPENSSL
             if (tls_cfg.ctx != NULL) {
                 SSL_CTX_free(tls_cfg.ctx);
@@ -1208,6 +1408,9 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
             }
 #endif
             PyMem_Free(latency_samples);
+            if (!PyErr_Occurred()) {
+                PyErr_SetString(PyExc_RuntimeError, "l7 state machine pass failed");
+            }
             return NULL;
         }
 
