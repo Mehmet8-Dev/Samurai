@@ -67,6 +67,9 @@ class LiveMetricsExporter:
             name = f"{self.prefix}_{k}"
             if isinstance(v, (int, float)):
                 lines.append(f"{name} {v}")
+            elif k == "run_quality" and isinstance(v, str):
+                safe_quality = str(v).replace('"', '\\"')
+                lines.append(f'{self.prefix}_run_quality{{quality="{safe_quality}"}} 1')
 
         # Sender path breakdown (labelled gauge)
         sender_paths = stats.get("sender_paths_used")

@@ -80,6 +80,7 @@ class WorkflowResult:
     tokens_extracted: int = 0
     retries_used: int = 0
     total_time_s: float = 0.0
+    first_step_latency_ms: float = 0.0
     error: str | None = None
 
 
@@ -103,6 +104,9 @@ class L7Metrics:
     tokens_injected: int = 0        # times an extracted token was reused
     retry_attempts: int = 0
     retry_successes: int = 0
+    session_runs_total: int = 0
+    active_sessions: int = 0
+    active_sessions_peak: int = 0
 
     @property
     def session_success_rate(self) -> float:
@@ -138,6 +142,8 @@ class L7Metrics:
             "tokens_injected": self.tokens_injected,
             "retry_attempts": self.retry_attempts,
             "retry_successes": self.retry_successes,
+            "session_runs_total": self.session_runs_total,
+            "active_sessions_peak": self.active_sessions_peak,
         }
 
 
@@ -321,7 +327,10 @@ class VirtualUser:
         try:
             while 0 <= step_idx < len(steps):
                 step = steps[step_idx]
+                step_started = time.monotonic()
                 ok, status, retries_used = await self._execute_step(step)
+                if result.first_step_latency_ms <= 0.0:
+                    result.first_step_latency_ms = max(0.0, (time.monotonic() - step_started) * 1000.0)
                 result.retries_used += int(max(0, retries_used))
 
                 if self._metrics:
@@ -368,6 +377,9 @@ async def run_vu_pool(
     verify: bool = False,
     timeout_s: float = 10.0,
     user_agent: str | None = None,
+    session_repeats: int = 1,
+    max_active_sessions: int | None = None,
+    session_keepalive: bool = True,
 ) -> tuple[list[WorkflowResult], L7Metrics]:
     """
     Create `vu_count` VirtualUsers, each executing the same workflow,
@@ -375,34 +387,53 @@ async def run_vu_pool(
     Returns (results, aggregated_metrics).
     """
     vu_count = max(0, int(vu_count))
+    session_repeats = max(1, int(session_repeats))
+    total_sessions = int(vu_count * session_repeats)
     concurrency = max(1, int(concurrency))
-    metrics = L7Metrics(total_vus=vu_count)
-    if vu_count <= 0:
+    if max_active_sessions is not None:
+        try:
+            concurrency = min(concurrency, max(1, int(max_active_sessions)))
+        except Exception:
+            pass
+    metrics = L7Metrics(total_vus=vu_count, session_runs_total=total_sessions)
+    if total_sessions <= 0:
         return [], metrics
 
     results: list[WorkflowResult] = []
     result_lock = asyncio.Lock()
-    id_queue: asyncio.Queue[int | None] = asyncio.Queue()
+    id_queue: asyncio.Queue[tuple[int, int] | None] = asyncio.Queue()
     for uid in range(vu_count):
-        id_queue.put_nowait(uid)
+        for rep_idx in range(session_repeats):
+            id_queue.put_nowait((uid, rep_idx))
 
-    worker_count = min(vu_count, concurrency)
+    worker_count = min(total_sessions, concurrency)
     for _ in range(worker_count):
         id_queue.put_nowait(None)
 
     async def _worker_loop() -> None:
+        vu_cache: dict[int, VirtualUser] = {}
         while True:
-            uid = await id_queue.get()
-            if uid is None:
-                return
-            vu = VirtualUser(
-                user_id=uid,
-                base_url=base_url,
-                verify=verify,
-                timeout_s=timeout_s,
-                user_agent=user_agent,
-                metrics=metrics,
-            )
+            item = await id_queue.get()
+            if item is None:
+                break
+            uid, _rep_idx = item
+            vu: VirtualUser | None = None
+            if session_keepalive:
+                vu = vu_cache.get(int(uid))
+            if vu is None:
+                vu = VirtualUser(
+                    user_id=int(uid),
+                    base_url=base_url,
+                    verify=verify,
+                    timeout_s=timeout_s,
+                    user_agent=user_agent,
+                    metrics=metrics,
+                )
+                if session_keepalive:
+                    vu_cache[int(uid)] = vu
+            metrics.active_sessions += 1
+            if metrics.active_sessions > metrics.active_sessions_peak:
+                metrics.active_sessions_peak = metrics.active_sessions
             try:
                 result = await vu.execute_workflow(steps)
                 if result.error is None and result.steps_failed == 0:
@@ -413,9 +444,16 @@ async def run_vu_pool(
                 metrics.workflows_failed += 1
                 result = WorkflowResult(user_id=int(uid), error=str(exc))
             finally:
-                await vu.close()
+                metrics.active_sessions = max(0, int(metrics.active_sessions) - 1)
+                if not session_keepalive:
+                    await vu.close()
             async with result_lock:
                 results.append(result)
+        for vu in list(vu_cache.values()):
+            try:
+                await vu.close()
+            except Exception:
+                pass
 
     workers = [asyncio.create_task(_worker_loop()) for _ in range(worker_count)]
     await asyncio.gather(*workers, return_exceptions=False)

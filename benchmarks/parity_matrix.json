@@ -1,0 +1,120 @@
+{
+  "schema": "samurai.parity.matrix.v1",
+  "updated_utc": "2026-03-05T00:00:00Z",
+  "profiles": {
+    "dedicated_lab": {
+      "description": "Lab NIC queue/IRQ affinity pinned, privileged datapath enabled.",
+      "gates": {
+        "run_quality": "valid",
+        "wire_loss_est_pct_max": 1.0,
+        "rate_accuracy_pct_min": 98.0,
+        "session_success_rate_min": 99.0,
+        "retry_success_rate_min": 90.0
+      }
+    },
+    "developer_fallback": {
+      "description": "General developer workstation fallback profile.",
+      "gates": {
+        "run_quality": "valid",
+        "wire_loss_est_pct_max": 5.0,
+        "rate_accuracy_pct_min": 90.0,
+        "session_success_rate_min": 95.0,
+        "retry_success_rate_min": 70.0
+      }
+    }
+  },
+  "required_run_report_results": [
+    "run_quality",
+    "sender_paths_used",
+    "sender_fallback_reason",
+    "wire_counter_confidence",
+    "wire_loss_est_pct",
+    "rate_accuracy_pct",
+    "txring_batch_target",
+    "txring_backoff_ns",
+    "l7_active_sessions_peak",
+    "l7_conn_rate",
+    "l7_handshake_p99_ms",
+    "l7_step_fail_ratio"
+  ],
+  "scenarios": [
+    {
+      "id": "l4_top_speed",
+      "layer": "L4",
+      "comparison": "higher_is_better",
+      "ddos_samurai": {
+        "report_field": "effective_pps",
+        "unit": "pps"
+      },
+      "trex": {
+        "report_field": "effective_pps",
+        "unit": "pps"
+      }
+    },
+    {
+      "id": "l4_wire_loss",
+      "layer": "L4",
+      "comparison": "lower_is_better",
+      "ddos_samurai": {
+        "report_field": "wire_loss_est_pct",
+        "unit": "percent"
+      },
+      "trex": {
+        "report_field": "wire_loss_pct",
+        "unit": "percent"
+      }
+    },
+    {
+      "id": "l4_pacing_accuracy",
+      "layer": "L4",
+      "comparison": "higher_is_better",
+      "ddos_samurai": {
+        "report_field": "rate_accuracy_pct",
+        "unit": "percent"
+      },
+      "trex": {
+        "report_field": "rate_accuracy_pct",
+        "unit": "percent"
+      }
+    },
+    {
+      "id": "l7_stateful_scale",
+      "layer": "L7",
+      "comparison": "higher_is_better",
+      "ddos_samurai": {
+        "report_field": "l7_active_sessions_peak",
+        "unit": "sessions"
+      },
+      "trex": {
+        "report_field": "active_flows_peak",
+        "unit": "sessions"
+      }
+    },
+    {
+      "id": "l7_conn_rate",
+      "layer": "L7",
+      "comparison": "higher_is_better",
+      "ddos_samurai": {
+        "report_field": "l7_conn_rate",
+        "unit": "connections_per_second"
+      },
+      "trex": {
+        "report_field": "conn_rate",
+        "unit": "connections_per_second"
+      }
+    },
+    {
+      "id": "l7_handshake_latency",
+      "layer": "L7",
+      "comparison": "lower_is_better",
+      "ddos_samurai": {
+        "report_field": "l7_handshake_p99_ms",
+        "unit": "milliseconds"
+      },
+      "trex": {
+        "report_field": "handshake_p99_ms",
+        "unit": "milliseconds"
+      }
+    }
+  ]
+}

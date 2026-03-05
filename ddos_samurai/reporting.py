@@ -20,6 +20,8 @@ _REPORT_DIAGNOSTIC_RESULT_KEYS = {"flush_mode"}
 _REPORT_DIAGNOSTIC_RESULT_EXPOSED_KEYS = {
     "txring_packet_version",
     "txring_packet_version_name",
+    "txring_batch_target",
+    "txring_backoff_ns",
 }
 
 
@@ -532,6 +534,7 @@ def build_live_attack_report(
     bytes_sent_est_total = 0
     permission_error_count_total = 0
     fallback_count_total = 0
+    sender_fallback_reason = "none"
     buffer_copy_count_total = 0
     buffer_copy_bytes_total = 0
     buffer_reuse_hits_total = 0
@@ -562,6 +565,8 @@ def build_live_attack_report(
     txring_tp_freeze_q_cnt_total = 0
     txring_packet_version = 0
     txring_packet_version_name = "TPACKET_UNKNOWN"
+    txring_batch_target_max = 0
+    txring_backoff_ns_total = 0
     host_tx_packets_delta_total = 0
     host_tx_dropped_delta_total = 0
     host_tx_errors_delta_total = 0
@@ -604,6 +609,12 @@ def build_live_attack_report(
     state_active_entries_max = 0
     state_timeout_evictions_total = 0
     state_overwrites_total = 0
+    l7_active_sessions_peak_max = 0
+    l7_conn_rate_weighted_sum = 0.0
+    l7_conn_rate_weight = 0
+    l7_handshake_p99_ms_max = 0.0
+    l7_step_fail_ratio_weighted_sum = 0.0
+    l7_step_fail_ratio_weight = 0
     backlog_peak_max = 0
     sender_paths_used: Dict[str, int] = {}
     by_vector: Dict[str, Dict[str, int]] = {}
@@ -651,6 +662,14 @@ def build_live_attack_report(
         fallback_count_total += int(
             ev.get("fallback_count", st.get("fallback_count", 0)) or 0
         )
+        _fallback_reason_item = str(
+            ev.get("sender_fallback_reason", st.get("sender_fallback_reason", "")) or ""
+        ).strip()
+        if _fallback_reason_item:
+            if sender_fallback_reason in ("", "none"):
+                sender_fallback_reason = _fallback_reason_item
+            elif sender_fallback_reason != _fallback_reason_item and sender_fallback_reason != "mixed":
+                sender_fallback_reason = "mixed"
         buffer_copy_count_total += int(
             ev.get("buffer_copy_count", st.get("buffer_copy_count", 0)) or 0
         )
@@ -729,6 +748,13 @@ def build_live_attack_report(
         )
         txring_tp_freeze_q_cnt_total += int(
             ev.get("txring_tp_freeze_q_cnt", st.get("txring_tp_freeze_q_cnt", 0)) or 0
+        )
+        txring_batch_target_max = max(
+            int(txring_batch_target_max),
+            int(ev.get("txring_batch_target", st.get("txring_batch_target", 0)) or 0),
+        )
+        txring_backoff_ns_total += int(
+            ev.get("txring_backoff_ns", st.get("txring_backoff_ns", 0)) or 0
         )
         _tp_ver = int(ev.get("txring_packet_version", st.get("txring_packet_version", 0)) or 0)
         _tp_ver_name = str(
@@ -941,6 +967,19 @@ def build_live_attack_report(
         state_overwrites_total += int(
             ev.get("state_overwrites", st.get("state_overwrites", 0)) or 0
         )
+        _l7_peak = int(ev.get("l7_active_sessions_peak", st.get("l7_active_sessions_peak", 0)) or 0)
+        if _l7_peak > l7_active_sessions_peak_max:
+            l7_active_sessions_peak_max = _l7_peak
+        _l7_conn_rate = float(ev.get("l7_conn_rate", st.get("l7_conn_rate", 0.0)) or 0.0)
+        if _l7_conn_rate > 0.0:
+            l7_conn_rate_weighted_sum += (_l7_conn_rate * max(1, attempted))
+            l7_conn_rate_weight += max(1, attempted)
+        _l7_hs_p99 = float(ev.get("l7_handshake_p99_ms", st.get("l7_handshake_p99_ms", 0.0)) or 0.0)
+        l7_handshake_p99_ms_max = max(float(l7_handshake_p99_ms_max), float(_l7_hs_p99))
+        _l7_step_fail_ratio = float(ev.get("l7_step_fail_ratio", st.get("l7_step_fail_ratio", 0.0)) or 0.0)
+        if _l7_step_fail_ratio > 0.0:
+            l7_step_fail_ratio_weighted_sum += (_l7_step_fail_ratio * max(1, attempted))
+            l7_step_fail_ratio_weight += max(1, attempted)
         _bp = int(ev.get("queue_backlog_peak", 0) or 0)
         if _bp > backlog_peak_max:
             backlog_peak_max = _bp
@@ -975,6 +1014,12 @@ def build_live_attack_report(
     pacing_ipg_mean_ns = (
         float(ipg_mean_weighted_sum) / float(pacing_weight_total)
     ) if pacing_weight_total > 0 else 0.0
+    l7_conn_rate = (
+        float(l7_conn_rate_weighted_sum) / float(l7_conn_rate_weight)
+    ) if l7_conn_rate_weight > 0 else 0.0
+    l7_step_fail_ratio = (
+        float(l7_step_fail_ratio_weighted_sum) / float(l7_step_fail_ratio_weight)
+    ) if l7_step_fail_ratio_weight > 0 else 0.0
     txring_tp_drops_bounded_total = min(
         int(txring_tp_drops_total),
         int(txring_tp_packets_total),
@@ -1086,6 +1131,13 @@ def build_live_attack_report(
         nicq_pressure_status = "warn"
     else:
         nicq_pressure_status = "ok"
+    warning_set = {str(w).strip() for w in list(warnings or []) if str(w).strip()}
+    if "run_interrupted_by_user" in warning_set or int(workers_interrupted) > 0:
+        run_quality = "interrupted"
+    elif int(workers_total) <= 0 or int(attempted_total) <= 0:
+        run_quality = "invalid_metrics"
+    else:
+        run_quality = "valid"
 
     report = RunReport(
         run_id=run_id,
@@ -1110,9 +1162,11 @@ def build_live_attack_report(
             "effective_pps": effective_pps,
             "throughput_bps_est": throughput_bps_est,
             "send_success_ratio_pct": round(send_success_ratio, 2),
+            "run_quality": str(run_quality),
             "sender_paths_used": sender_paths_used,
             "permission_error_count": int(permission_error_count_total),
             "fallback_count": int(fallback_count_total),
+            "sender_fallback_reason": str(sender_fallback_reason),
             "buffer_copy_count": int(buffer_copy_count_total),
             "buffer_copy_bytes": int(buffer_copy_bytes_total),
             "buffer_reuse_hits": int(buffer_reuse_hits_total),
@@ -1141,6 +1195,8 @@ def build_live_attack_report(
             "txring_tp_drops": int(txring_tp_drops_total),
             "txring_kernel_raw_tp_drops": int(txring_tp_drops_total),
             "txring_tp_freeze_q_cnt": int(txring_tp_freeze_q_cnt_total),
+            "txring_batch_target": int(txring_batch_target_max),
+            "txring_backoff_ns": int(txring_backoff_ns_total),
             "txring_hold_block_pressure_pct": round(float(txring_hold_block_pressure_pct), 4),
             "txring_hold_block_frame_wait_ratio_pct": round(float(frame_wait_ratio_pct), 4),
             "txring_hold_block_poll_ratio_pct": round(float(poll_ratio_pct), 4),
@@ -1207,6 +1263,10 @@ def build_live_attack_report(
             "state_active_entries": int(state_active_entries_max),
             "state_timeout_evictions": int(state_timeout_evictions_total),
             "state_overwrites": int(state_overwrites_total),
+            "l7_active_sessions_peak": int(l7_active_sessions_peak_max),
+            "l7_conn_rate": round(float(l7_conn_rate), 4),
+            "l7_handshake_p99_ms": round(float(l7_handshake_p99_ms_max), 4),
+            "l7_step_fail_ratio": round(float(l7_step_fail_ratio), 6),
             "queue_backlog_peak": int(backlog_peak_max),
             "by_vector": by_vector,
             "by_backend": by_backend,
