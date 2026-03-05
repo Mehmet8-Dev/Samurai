@@ -87,6 +87,28 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--state-lock-count", opts)
         self.assertIn("--state-timeout-sec", opts)
         self.assertIn("--state-sweep-interval-ms", opts)
+        self.assertIn("--sender-backend", opts)
+        self.assertIn("--sender-fallback-policy", opts)
+        self.assertIn("--xdp-enable", opts)
+        self.assertIn("--xdp-interface", opts)
+        self.assertIn("--xdp-queue-id", opts)
+        self.assertIn("--http2-connections", opts)
+        self.assertIn("--http2-streams-per-conn", opts)
+        self.assertIn("--l7-session-repeats", opts)
+        self.assertIn("--l7-max-active-sessions", opts)
+
+    def test_sender_route_defaults(self):
+        parser = cli.build_parser()
+        args = parser.parse_args([])
+        self.assertEqual(args.sender_backend, "auto")
+        self.assertEqual(args.sender_fallback_policy, "allow")
+        self.assertFalse(args.xdp_enable)
+        self.assertEqual(args.xdp_interface, "")
+        self.assertEqual(args.xdp_queue_id, 0)
+        self.assertEqual(args.http2_connections, 1)
+        self.assertEqual(args.http2_streams_per_conn, 100)
+        self.assertEqual(args.l7_session_repeats, 1)
+        self.assertEqual(args.l7_max_active_sessions, 0)
 
     def test_loss_telemetry_flags_defaults(self):
         parser = cli.build_parser()
@@ -212,6 +234,44 @@ class TestHybridArgValidation(unittest.TestCase):
         parser = cli.build_parser()
         args = parser.parse_args(["--state-table-size", "65536", "--state-lock-count", "256"])
         cli._validate_hybrid_cuda_args(parser, args)
+
+
+class TestSenderRouteValidation(unittest.TestCase):
+    def _assert_validation_fails(self, parser, args):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli._validate_sender_route_args(parser, args)
+
+    def test_sender_backend_xdp_requires_interface(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--sender-backend", "xdp"])
+        self._assert_validation_fails(parser, args)
+
+    def test_xdp_enable_requires_interface(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--xdp-enable"])
+        self._assert_validation_fails(parser, args)
+
+    def test_sender_fallback_fail_forbids_auto_backend(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--sender-backend", "auto", "--sender-fallback-policy", "fail"])
+        self._assert_validation_fails(parser, args)
+
+    def test_sender_route_accepts_explicit_xdp_config(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--sender-backend",
+                "xdp",
+                "--sender-fallback-policy",
+                "fail",
+                "--xdp-interface",
+                "eth0",
+                "--xdp-queue-id",
+                "1",
+            ]
+        )
+        cli._validate_sender_route_args(parser, args)
 
 
 class TestRootGateRegression(unittest.TestCase):

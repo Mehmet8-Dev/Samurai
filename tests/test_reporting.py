@@ -393,3 +393,88 @@ class TestReporting(unittest.TestCase):
         self.assertAlmostEqual(rr.results["txring_hold_block_frame_wait_ratio_pct"], 20.0, places=4)
         self.assertAlmostEqual(rr.results["txring_hold_block_poll_ratio_pct"], 20.0, places=4)
         self.assertAlmostEqual(rr.results["txring_hold_block_freeze_ratio_pct"], 10.0, places=4)
+
+    def test_live_attack_report_run_quality_interrupted(self):
+        from ddos_samurai import reporting
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1"},
+            worker_events=[
+                {
+                    "status": "ok",
+                    "attack_vector": "basic",
+                    "compute_backend": "cpu",
+                    "sender_path": "PYTHON_SENDMMSG",
+                    "stats": {"attempted": 10, "sent": 10, "errors": 0, "bytes_sent_est": 640},
+                }
+            ],
+            duration_s=1.0,
+            progress_total=10,
+            total_count=10,
+            metrics={},
+            warnings=["run_interrupted_by_user"],
+        )
+        self.assertEqual(rr.results["run_quality"], "interrupted")
+
+    def test_live_attack_report_run_quality_invalid_metrics(self):
+        from ddos_samurai import reporting
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1"},
+            worker_events=[],
+            duration_s=1.0,
+            progress_total=0,
+            total_count=0,
+            metrics={},
+            warnings=[],
+        )
+        self.assertEqual(rr.results["run_quality"], "invalid_metrics")
+
+    def test_live_attack_report_includes_new_sender_and_l7_fields(self):
+        from ddos_samurai import reporting
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1"},
+            worker_events=[
+                {
+                    "status": "ok",
+                    "attack_vector": "http",
+                    "compute_backend": "cpu",
+                    "sender_path": "C_EXT_L3",
+                    "sender_fallback_reason": "none",
+                    "txring_batch_target": 128,
+                    "txring_backoff_ns": 2000,
+                    "l7_active_sessions_peak": 50,
+                    "l7_conn_rate": 1234.5,
+                    "l7_handshake_p99_ms": 44.0,
+                    "l7_step_fail_ratio": 0.01,
+                    "stats": {"attempted": 200, "sent": 198, "errors": 2, "bytes_sent_est": 19800},
+                },
+                {
+                    "status": "degraded",
+                    "attack_vector": "http",
+                    "compute_backend": "cpu",
+                    "sender_path": "PYTHON_SENDMMSG",
+                    "sender_fallback_reason": "txring_unavailable",
+                    "txring_batch_target": 256,
+                    "txring_backoff_ns": 4000,
+                    "l7_active_sessions_peak": 60,
+                    "l7_conn_rate": 1000.0,
+                    "l7_handshake_p99_ms": 50.0,
+                    "l7_step_fail_ratio": 0.03,
+                    "stats": {"attempted": 100, "sent": 95, "errors": 5, "bytes_sent_est": 9500},
+                },
+            ],
+            duration_s=2.0,
+            progress_total=300,
+            total_count=300,
+            metrics={},
+            warnings=[],
+        )
+
+        self.assertEqual(rr.results["run_quality"], "valid")
+        self.assertEqual(rr.results["sender_fallback_reason"], "txring_unavailable")
+        self.assertEqual(rr.results["txring_batch_target"], 256)
+        self.assertEqual(rr.results["txring_backoff_ns"], 6000)
+        self.assertEqual(rr.results["l7_active_sessions_peak"], 60)
+        self.assertAlmostEqual(rr.results["l7_handshake_p99_ms"], 50.0, places=4)

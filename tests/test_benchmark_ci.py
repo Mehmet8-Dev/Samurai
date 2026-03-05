@@ -61,6 +61,34 @@ def _write_json_with_fallback(preferred: Path, payload: dict, fallback_name: str
     raise PermissionError(f"Unable to write benchmark report to any candidate path: {candidates}")
 
 
+def _load_parity_matrix() -> tuple[Path, dict]:
+    path = (Path(__file__).resolve().parents[1] / "benchmarks" / "parity_matrix.json").resolve()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return path, payload
+
+
+def _build_parity_rows(matrix: dict, normalized_results: dict) -> list[dict]:
+    rows: list[dict] = []
+    for scenario in list((matrix.get("scenarios") or [])):
+        sid = str(scenario.get("id", "") or "").strip()
+        if not sid:
+            continue
+        samurai = scenario.get("ddos_samurai") or {}
+        field = str(samurai.get("report_field", "") or "").strip()
+        val = normalized_results.get(field, None) if field else None
+        rows.append(
+            {
+                "id": sid,
+                "layer": str(scenario.get("layer", "") or ""),
+                "comparison": str(scenario.get("comparison", "") or ""),
+                "samurai_field": field,
+                "samurai_value": val,
+                "status": "measured" if val is not None else "not_measured",
+            }
+        )
+    return rows
+
+
 def _percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -190,6 +218,31 @@ class TestCISafeBenchmarks(unittest.TestCase):
             "wire_loss_est_pct": 0.0,
             "txring_flush_eagain_ratio_pct": 0.0,
         }
+        normalized_results = {
+            "run_quality": "valid",
+            "sender_paths_used": {"CI_SAFE_CPU_POOL": 1},
+            "sender_fallback_reason": "none",
+            "wire_counter_confidence": 0.0,
+            "wire_loss_est_pct": float(loss_path["wire_loss_est_pct"]),
+            "rate_accuracy_pct": 100.0,
+            "txring_batch_target": 0,
+            "txring_backoff_ns": 0,
+            "l7_active_sessions_peak": 0,
+            "l7_conn_rate": 0.0,
+            "l7_handshake_p99_ms": 0.0,
+            "l7_step_fail_ratio": 0.0,
+            "effective_pps": float(throughput_core["effective_pps"]),
+        }
+        parity_matrix_path, parity_matrix = _load_parity_matrix()
+        parity_profile = str(os.environ.get("SAMURAI_PARITY_PROFILE", "developer_fallback") or "developer_fallback")
+        parity_gates = (
+            ((parity_matrix.get("profiles") or {}).get(parity_profile) or {}).get("gates") or {}
+        )
+        parity_rows = _build_parity_rows(parity_matrix, normalized_results)
+        parity_missing_fields = [
+            key for key in list(parity_matrix.get("required_run_report_results") or [])
+            if key not in normalized_results
+        ]
 
         summary = {
             "schema": "samurai.benchmark.summary.v1",
@@ -219,6 +272,16 @@ class TestCISafeBenchmarks(unittest.TestCase):
             "results_effective_pps": float(throughput_core["effective_pps"]),
             "results_wire_loss_est_pct": float(loss_path["wire_loss_est_pct"]),
             "results_txring_flush_eagain_ratio_pct": float(loss_path["txring_flush_eagain_ratio_pct"]),
+            "parity": {
+                "schema": str(parity_matrix.get("schema", "") or ""),
+                "matrix_path": str(parity_matrix_path),
+                "profile": parity_profile,
+                "gates": parity_gates,
+                "required_result_fields": list(parity_matrix.get("required_run_report_results") or []),
+                "missing_result_fields": parity_missing_fields,
+                "normalized_results": normalized_results,
+                "rows": parity_rows,
+            },
             "baseline": {
                 "path": str(os.environ.get("SAMURAI_BENCH_BASELINE", "") or ""),
                 "loaded": False,
@@ -245,6 +308,9 @@ class TestCISafeBenchmarks(unittest.TestCase):
             thresholds["max_pool_peak_over_buf"],
             f"Pool peak memory ratio too high: {peak_over_buf:.2f}",
         )
+        self.assertEqual(summary["parity"]["missing_result_fields"], [])
+        self.assertTrue(summary["parity"]["rows"])
+        self.assertEqual(summary["parity"]["normalized_results"]["run_quality"], "valid")
 
         baseline_path = str(os.environ.get("SAMURAI_BENCH_BASELINE", "") or "").strip()
         if baseline_path and Path(baseline_path).exists():
