@@ -250,6 +250,23 @@ Ortak kriterler üzerinden 1 (zayıf) – 10 (mükemmel) arası değerlendirme.
 | Mikrosaniye gecikme ölçümü, donanım istatistik | **TRex** |
 | Çok büyük ölçekte stateful L7 (ASTF) | **TRex** |
 
+### 4.4 Parity Harness (2026-03-05)
+
+TRex kiyasini ayni cikti semasinda uretmek icin benchmark sozlesmesi eklendi:
+
+- `benchmarks/parity_matrix.json`
+- CI-safe benchmark: `tests/test_benchmark_ci.py` (`developer_fallback` profili)
+- Full benchmark: `tests/test_benchmark_full.py` (`dedicated_lab` profili)
+
+Parity raporunda normalize edilen ana alanlar:
+
+- `run_quality`, `sender_paths_used`, `sender_fallback_reason`
+- `wire_loss_est_pct`, `rate_accuracy_pct`
+- `txring_batch_target`, `txring_backoff_ns`
+- `l7_active_sessions_peak`, `l7_conn_rate`, `l7_handshake_p99_ms`, `l7_step_fail_ratio`
+
+`run_quality != valid` olan kosular parity skoruna dahil edilmemelidir.
+
 ---
 
 *DDoSamurai Team — 2026*

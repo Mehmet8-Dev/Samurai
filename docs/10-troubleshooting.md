@@ -78,3 +78,37 @@ Yapilabilecekler:
 - Gerekirse (izole test ortaminda) `privileged: true`
 
 Detay: `docs/11-docker.md`
+
+## 6) `run_quality` Beklenenden Farkli (`interrupted` / `invalid_metrics`)
+
+Belirti:
+
+- Run raporunda `results.run_quality` degeri `valid` degil.
+
+Kontrol listesi:
+
+- `workers_total > 0` mi?
+- `attempted_total > 0` mi?
+- `warnings` icinde `run_interrupted_by_user` var mi?
+
+Yorum:
+
+- `interrupted`: kosu kullanici veya dis etkenden erken kesildi.
+- `invalid_metrics`: metrik zemini eksik oldugu icin benchmark/parity skoruna girmemeli.
+
+## 7) Sender Backend/Fallback Sorunlari
+
+Belirti:
+
+- Beklenen backend kullanilmiyor, `sender_paths_used` farkli cikiyor.
+- `sender_fallback_reason` bos veya beklenmeyen bir deger.
+
+Kontrol listesi:
+
+- `--sender-backend` dogru secildi mi (`auto|txring|c_ext_l3|python|xdp`)?
+- `--sender-fallback-policy fail` kullaniliyorsa `--sender-backend auto` secilmemeli.
+- XDP yolu icin `--xdp-interface` zorunludur.
+
+Not:
+
+- Deterministik benchmark icin `--sender-backend` explicit secilmeli, `auto` yalnizca genel fallback modunda kullanilmalidir.

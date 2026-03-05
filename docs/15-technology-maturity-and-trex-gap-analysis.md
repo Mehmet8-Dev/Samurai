@@ -183,3 +183,23 @@ Bu implementasyonda uretilen artefaktlar icin tanimlanan analiz semalari:
 4. TRex fark matrisi boyut sayisi >= 8: PASS (9 boyut).
 5. Her `geride` maddesi icin uygulanabilir aksiyon yazildi: PASS.
 6. Mevcut repo raporlariyla celiskili iddia eklenmedi: PASS.
+
+## 9) Gap Kapatma Implementasyon Notu (2026-03-05)
+
+Asagidaki alanlar kod tabaninda additive olarak eklendi:
+
+- CLI: `--sender-backend`, `--sender-fallback-policy`, `--xdp-enable`, `--xdp-interface`, `--xdp-queue-id`
+- CLI: `--http2-connections`, `--http2-streams-per-conn`, `--l7-session-repeats`, `--l7-max-active-sessions`
+- Run report results: `run_quality`, `sender_fallback_reason`, `txring_batch_target`, `txring_backoff_ns`
+- Run report results: `l7_active_sessions_peak`, `l7_conn_rate`, `l7_handshake_p99_ms`, `l7_step_fail_ratio`
+
+Benchmark/Parity:
+
+- Ortak sozlesme: `benchmarks/parity_matrix.json`
+- CI-safe ve full benchmark testleri parity bolumu uretir (`parity.normalized_results`, `parity.rows`)
+- `run_quality` kurali: `valid | interrupted | invalid_metrics`
+
+Hedef etki:
+
+- L4: deterministic sender secimi + adaptive TX_RING telemetry ile throughput/loss tuning.
+- L7: session repeat + bounded active session modeli ile stateful olcek gorunurlugu.

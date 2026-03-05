@@ -103,6 +103,7 @@ Benchmark environment degiskenleri:
 Repo baseline dosyasi:
 
 - `benchmarks/benchmark_baseline_ci.json`
+- `benchmarks/parity_matrix.json` (DDoSamurai + TRex ortak benchmark sozlesmesi)
 
 Ornek:
 
@@ -137,6 +138,19 @@ tests/test_benchmark_full.py \
 tests/test_pacing_root.py \
 tests/test_loss_telemetry_full.py -rs
 ```
+
+Parite profili secimi:
+
+```bash
+SAMURAI_PARITY_PROFILE=developer_fallback python3 -m pytest tests/test_benchmark_ci.py -q -rs
+SAMURAI_PARITY_PROFILE=dedicated_lab SAMURAI_TEST_PROFILE=full python3 -m pytest tests/test_benchmark_full.py -q -rs
+```
+
+Notlar:
+
+- Benchmark raporlari `parity` bolumu altinda normalize edilmis `normalized_results` ve `rows` uretir.
+- `parity.required_result_fields` listesi, run-report tarafinda zorunlu takip edilen alanlarin aynisidir.
+- `run_quality != valid` kosular parity skorlamasinda kullanilmamalidir.
 
 ## CI Is Akislari
 
