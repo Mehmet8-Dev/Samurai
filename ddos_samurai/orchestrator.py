@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import time
 import os
 import logging
@@ -49,6 +50,9 @@ def _empty_stats() -> dict:
         "eagain_retry_count": 0,
         "partial_send_retry_count": 0,
         "buffer_reuse_hits": 0,
+        "sender_fallback_reason": "none",
+        "sender_backend_requested": "auto",
+        "sender_fallback_policy": "allow",
         "actual_rps": 0.0,
         "rate_accuracy_pct": 0.0,
         "jitter_p99_ns": 0.0,
@@ -73,6 +77,8 @@ def _empty_stats() -> dict:
         "txring_tp_freeze_q_cnt": 0,
         "txring_packet_version": 0,
         "txring_packet_version_name": "TPACKET_UNKNOWN",
+        "txring_batch_target": 0,
+        "txring_backoff_ns": 0,
         "host_tx_packets_delta": 0,
         "host_tx_dropped_delta": 0,
         "host_tx_errors_delta": 0,
@@ -126,6 +132,10 @@ def _empty_stats() -> dict:
         "state_active_entries": 0,
         "state_timeout_evictions": 0,
         "state_overwrites": 0,
+        "l7_active_sessions_peak": 0,
+        "l7_conn_rate": 0.0,
+        "l7_handshake_p99_ms": 0.0,
+        "l7_step_fail_ratio": 0.0,
     }
 
 
@@ -290,6 +300,27 @@ def _add_stats(acc: dict, item: dict) -> dict:
         int(bool(item.get("so_txtime_active", 0))),
     )
     acc["txtime_errors"] = int(acc.get("txtime_errors", 0)) + int(item.get("txtime_errors", 0) or 0)
+    item_fallback_reason = str(item.get("sender_fallback_reason", "") or "").strip()
+    if item_fallback_reason:
+        curr_reason = str(acc.get("sender_fallback_reason", "") or "").strip()
+        if not curr_reason or curr_reason == "none":
+            acc["sender_fallback_reason"] = item_fallback_reason
+        elif curr_reason != item_fallback_reason and curr_reason != "mixed":
+            acc["sender_fallback_reason"] = "mixed"
+    item_sender_backend_requested = str(item.get("sender_backend_requested", "") or "").strip()
+    if item_sender_backend_requested:
+        curr_backend = str(acc.get("sender_backend_requested", "") or "").strip()
+        if not curr_backend or curr_backend == "auto":
+            acc["sender_backend_requested"] = item_sender_backend_requested
+        elif curr_backend != item_sender_backend_requested and curr_backend != "mixed":
+            acc["sender_backend_requested"] = "mixed"
+    item_sender_fallback_policy = str(item.get("sender_fallback_policy", "") or "").strip()
+    if item_sender_fallback_policy:
+        curr_policy = str(acc.get("sender_fallback_policy", "") or "").strip()
+        if not curr_policy or curr_policy == "allow":
+            acc["sender_fallback_policy"] = item_sender_fallback_policy
+        elif curr_policy != item_sender_fallback_policy and curr_policy != "mixed":
+            acc["sender_fallback_policy"] = "mixed"
     acc["txring_flush_call_count"] = int(acc.get("txring_flush_call_count", 0)) + int(item.get("txring_flush_call_count", 0) or 0)
     acc["txring_flush_error_count"] = int(acc.get("txring_flush_error_count", 0)) + int(item.get("txring_flush_error_count", 0) or 0)
     acc["txring_flush_eagain_count"] = int(acc.get("txring_flush_eagain_count", 0)) + int(item.get("txring_flush_eagain_count", 0) or 0)
@@ -313,6 +344,11 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["txring_tp_packets"] = int(acc.get("txring_tp_packets", 0)) + int(item.get("txring_tp_packets", 0) or 0)
     acc["txring_tp_drops"] = int(acc.get("txring_tp_drops", 0)) + int(item.get("txring_tp_drops", 0) or 0)
     acc["txring_tp_freeze_q_cnt"] = int(acc.get("txring_tp_freeze_q_cnt", 0)) + int(item.get("txring_tp_freeze_q_cnt", 0) or 0)
+    acc["txring_batch_target"] = max(
+        int(acc.get("txring_batch_target", 0) or 0),
+        int(item.get("txring_batch_target", 0) or 0),
+    )
+    acc["txring_backoff_ns"] = int(acc.get("txring_backoff_ns", 0)) + int(item.get("txring_backoff_ns", 0) or 0)
     item_txring_ver = int(item.get("txring_packet_version", 0) or 0)
     item_txring_ver_name = str(item.get("txring_packet_version_name", "") or "").strip()
     if item_txring_ver > 0:
@@ -408,6 +444,20 @@ def _add_stats(acc: dict, item: dict) -> dict:
         int(item.get("gpu_ring_depth_peak", 0) or 0),
     )
     acc["gpu_ring_block_wait_ns"] = int(acc.get("gpu_ring_block_wait_ns", 0)) + int(item.get("gpu_ring_block_wait_ns", 0) or 0)
+    acc["l7_active_sessions_peak"] = max(
+        int(acc.get("l7_active_sessions_peak", 0) or 0),
+        int(item.get("l7_active_sessions_peak", 0) or 0),
+    )
+    item_l7_conn_rate = float(item.get("l7_conn_rate", 0.0) or 0.0)
+    if item_l7_conn_rate > 0.0 or float(acc.get("l7_conn_rate", 0.0) or 0.0) == 0.0:
+        acc["l7_conn_rate"] = item_l7_conn_rate
+    acc["l7_handshake_p99_ms"] = max(
+        float(acc.get("l7_handshake_p99_ms", 0.0) or 0.0),
+        float(item.get("l7_handshake_p99_ms", 0.0) or 0.0),
+    )
+    item_l7_step_fail_ratio = float(item.get("l7_step_fail_ratio", 0.0) or 0.0)
+    if item_l7_step_fail_ratio > 0.0 or float(acc.get("l7_step_fail_ratio", 0.0) or 0.0) == 0.0:
+        acc["l7_step_fail_ratio"] = item_l7_step_fail_ratio
     _state_active = int(item.get("state_active_entries", 0) or 0)
     if _state_active > 0 or int(acc.get("state_active_entries", 0) or 0) == 0:
         acc["state_active_entries"] = _state_active
@@ -653,6 +703,12 @@ async def worker_process(
             pass
 
     _orig_paced_sender = senders.paced_raw_socket_sender
+    sender_context_cache = {}
+    sender_backend_cfg = str(args.get("sender_backend", "auto") or "auto")
+    sender_fallback_policy_cfg = str(args.get("sender_fallback_policy", "allow") or "allow")
+    xdp_enable_cfg = bool(args.get("xdp_enable", False))
+    xdp_interface_cfg = str(args.get("xdp_interface", "") or "").strip() or None
+    xdp_queue_id_cfg = int(args.get("xdp_queue_id", 0) or 0)
 
     async def _paced_sender_with_faults(
         *,
@@ -665,6 +721,12 @@ async def worker_process(
         live_sent=None,
         live_errors=None,
         live_progress=None,
+        sender_backend=None,
+        sender_fallback_policy=None,
+        sender_context=None,
+        xdp_enable=None,
+        xdp_interface=None,
+        xdp_queue_id=None,
     ):
         elapsed = max(0.0, time.time() - worker_started)
         can_inject = fault_after_s > 0 and elapsed >= fault_after_s
@@ -690,17 +752,44 @@ async def worker_process(
                     "bytes_sent_est": 0,
                 }
 
-        out = await _orig_paced_sender(
-            packets_buffer=packets_buffer,
-            target_ip=target_ip,
-            target_port=target_port,
-            count=count,
-            verbose=verbose,
-            pacing_config=pacing_config,
-            live_sent=live_sent,
-            live_errors=live_errors,
-            live_progress=live_progress,
-        )
+        sender_call_kwargs = {
+            "packets_buffer": packets_buffer,
+            "target_ip": target_ip,
+            "target_port": target_port,
+            "count": count,
+            "verbose": verbose,
+            "pacing_config": pacing_config,
+            "live_sent": live_sent,
+            "live_errors": live_errors,
+            "live_progress": live_progress,
+            "sender_backend": sender_backend if sender_backend is not None else sender_backend_cfg,
+            "sender_fallback_policy": (
+                sender_fallback_policy
+                if sender_fallback_policy is not None
+                else sender_fallback_policy_cfg
+            ),
+            "sender_context": sender_context if sender_context is not None else sender_context_cache,
+            "xdp_enable": bool(xdp_enable if xdp_enable is not None else xdp_enable_cfg),
+            "xdp_interface": xdp_interface if xdp_interface is not None else xdp_interface_cfg,
+            "xdp_queue_id": int(xdp_queue_id if xdp_queue_id is not None else xdp_queue_id_cfg),
+        }
+        try:
+            sig_target = _orig_paced_sender
+            side_effect = getattr(_orig_paced_sender, "side_effect", None)
+            if callable(side_effect):
+                sig_target = side_effect
+            sig = inspect.signature(sig_target)
+            accepts_varkw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            if not accepts_varkw:
+                sender_call_kwargs = {
+                    k: v for k, v in sender_call_kwargs.items() if k in sig.parameters
+                }
+        except Exception:
+            pass
+
+        out = await _orig_paced_sender(**sender_call_kwargs)
         _update_resource_stats(force=False)
         return out
 
@@ -1786,6 +1875,8 @@ async def worker_process(
                     http_method=args.get('http_method', 'GET'),
                     http_path=args.get('http_path', ['/']),
                     payloads=args.get('payloads', []),
+                    session_repeats=args.get('l7_session_repeats', 1),
+                    max_active_sessions=args.get('l7_max_active_sessions', 0),
                     live_sent=sent_total,
                     live_errors=errors_total,
                     live_progress=progress,
@@ -1809,6 +1900,8 @@ async def worker_process(
                 target_port=args['port'],
                 count=args['count'],
                 concurrency=args['http2_concurrency'],
+                http2_connections=args.get("http2_connections", 1),
+                http2_streams_per_conn=args.get("http2_streams_per_conn", 100),
                 http_path=args['http_path'],
                 http_method=args['http_method'],
                 verbose=args['verbose'],
@@ -1993,6 +2086,14 @@ async def worker_process(
                 and PACING_ENGINE_AVAILABLE
                 and not bool(args.get("fragment", False))
             )
+            use_cpu_direct_sender = (
+                pacing_cfg.pacing_mode == PacingMode.NONE
+                and not bool(args.get("fragment", False))
+                and (
+                    str(args.get("sender_backend", "auto") or "auto").strip().lower() != "auto"
+                    or bool(args.get("xdp_enable", False))
+                )
+            )
 
             if use_cpu_c_pacing:
                 try:
@@ -2059,6 +2160,59 @@ async def worker_process(
                         f"[Worker {worker_id}] CPU paced sender pool path failed ({e}); packet_sender fallback."
                     )
                     worker_stats = _add_stats(worker_stats, await senders.packet_sender(**packet_sender_kwargs))
+            elif use_cpu_direct_sender:
+                try:
+                    engine_spoof_opts = cpu_packet_engine.SpoofingOptions(
+                        mode=args['spoof_mode'],
+                        subnet=args['spoof_subnet'],
+                        list_file=args['spoof_list_file'],
+                    )
+                    engine_cfg = cpu_packet_engine.PacketConfig(
+                        target_ip=args['target'],
+                        target_port=args['port'],
+                        protocol=args['protocol'],
+                        spoof=args['spoof'],
+                        spoof_opts=engine_spoof_opts,
+                        payload=args['payloads'][0] if args['payloads'] else None,
+                        tcp_flags=args['tcp_flags'],
+                        ttl=args['ttl'],
+                        tos=args['tos'],
+                        window=args['window'],
+                        fragment_enabled=False,
+                        pad_size=args['pad'],
+                        attack_vector=args['attack_vector'],
+                        dns_name=args['dns_name'],
+                        dns_qtype=args['dns_qtype'],
+                        dns_edns=args['dns_edns'],
+                        dns_recursive=not args['dns_nord'],
+                    )
+                    packets_buffer, packet_size = cpu_packet_engine.generate_packet_pool(
+                        engine_cfg,
+                        int(args['count'] or 0),
+                        uniform_size=True,
+                        low_peak_memory=True,
+                    )
+                    expected_bytes = int(packet_size) * int(args['count'] or 0)
+                    if packet_size <= 0 or len(packets_buffer) < expected_bytes:
+                        raise RuntimeError(
+                            f"invalid packet pool size={packet_size} bytes={len(packets_buffer)} count={args['count']}"
+                        )
+                    worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
+                        packets_buffer=packets_buffer,
+                        target_ip=args['target'],
+                        target_port=args['port'],
+                        count=int(args['count'] or 0),
+                        verbose=args['verbose'],
+                        pacing_config=None,
+                        live_sent=sent_total,
+                        live_errors=errors_total,
+                        live_progress=progress,
+                    ))
+                except Exception as e:
+                    log_warning(
+                        f"[Worker {worker_id}] Direct sender backend path failed ({e}); packet_sender fallback."
+                    )
+                    worker_stats = _add_stats(worker_stats, await senders.packet_sender(**packet_sender_kwargs))
             else:
                 if pacing_cfg.pacing_mode != PacingMode.NONE and bool(args.get("fragment", False)):
                     log_warning(
@@ -2087,6 +2241,11 @@ async def worker_process(
         # Restore original sender symbol for safety inside the process lifetime.
         try:
             senders.paced_raw_socket_sender = _orig_paced_sender
+        except Exception:
+            pass
+        try:
+            if hasattr(senders, "close_sender_context"):
+                senders.close_sender_context(sender_context_cache)
         except Exception:
             pass
 
@@ -2142,6 +2301,7 @@ async def worker_process(
                 # Collect sender_path from last batch stats if available
                 _sender_path = str(worker_stats.get("sender_path", "") or "").strip() or "unknown"
                 _fallback_count = int(worker_stats.get("fallback_count", 0) or 0)
+                _sender_fallback_reason = str(worker_stats.get("sender_fallback_reason", "none") or "none")
                 _perm_errors = int(worker_stats.get("permission_error_count", 0) or 0)
                 _buffer_copy_count = int(worker_stats.get("buffer_copy_count", 0) or 0)
                 _buffer_copy_bytes = int(worker_stats.get("buffer_copy_bytes", 0) or 0)
@@ -2176,6 +2336,8 @@ async def worker_process(
                 _txring_packet_version_name = str(
                     worker_stats.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
                 )
+                _txring_batch_target = int(worker_stats.get("txring_batch_target", 0) or 0)
+                _txring_backoff_ns = int(worker_stats.get("txring_backoff_ns", 0) or 0)
                 _host_tx_packets_delta = int(worker_stats.get("host_tx_packets_delta", 0) or 0)
                 _host_tx_dropped_delta = int(worker_stats.get("host_tx_dropped_delta", 0) or 0)
                 _host_tx_errors_delta = int(worker_stats.get("host_tx_errors_delta", 0) or 0)
@@ -2239,6 +2401,10 @@ async def worker_process(
                 _gpu_template_h2d_copy_bytes = int(worker_stats.get("gpu_template_h2d_copy_bytes", 0) or 0)
                 _gpu_rng_state_alloc_count = int(worker_stats.get("gpu_rng_state_alloc_count", 0) or 0)
                 _gpu_rng_state_reuse_count = int(worker_stats.get("gpu_rng_state_reuse_count", 0) or 0)
+                _l7_active_sessions_peak = int(worker_stats.get("l7_active_sessions_peak", 0) or 0)
+                _l7_conn_rate = float(worker_stats.get("l7_conn_rate", 0.0) or 0.0)
+                _l7_handshake_p99_ms = float(worker_stats.get("l7_handshake_p99_ms", 0.0) or 0.0)
+                _l7_step_fail_ratio = float(worker_stats.get("l7_step_fail_ratio", 0.0) or 0.0)
 
                 # Backlog peak from resource stats
                 _backlog_peak = 0
@@ -2264,6 +2430,7 @@ async def worker_process(
                         "stats": dict(worker_stats),
                         "sender_path": _sender_path,
                         "fallback_count": _fallback_count,
+                        "sender_fallback_reason": _sender_fallback_reason,
                         "permission_error_count": _perm_errors,
                         "buffer_copy_count": _buffer_copy_count,
                         "buffer_copy_bytes": _buffer_copy_bytes,
@@ -2294,6 +2461,8 @@ async def worker_process(
                         "txring_tp_freeze_q_cnt": _txring_tp_freeze_q_cnt,
                         "txring_packet_version": _txring_packet_version,
                         "txring_packet_version_name": _txring_packet_version_name,
+                        "txring_batch_target": _txring_batch_target,
+                        "txring_backoff_ns": _txring_backoff_ns,
                         "host_tx_packets_delta": _host_tx_packets_delta,
                         "host_tx_dropped_delta": _host_tx_dropped_delta,
                         "host_tx_errors_delta": _host_tx_errors_delta,
@@ -2341,6 +2510,10 @@ async def worker_process(
                         "gpu_template_h2d_copy_bytes": _gpu_template_h2d_copy_bytes,
                         "gpu_rng_state_alloc_count": _gpu_rng_state_alloc_count,
                         "gpu_rng_state_reuse_count": _gpu_rng_state_reuse_count,
+                        "l7_active_sessions_peak": _l7_active_sessions_peak,
+                        "l7_conn_rate": _l7_conn_rate,
+                        "l7_handshake_p99_ms": _l7_handshake_p99_ms,
+                        "l7_step_fail_ratio": _l7_step_fail_ratio,
                         "gpu_ring_depth_peak": int(worker_stats.get("gpu_ring_depth_peak", 0) or 0),
                         "gpu_ring_block_wait_ns": int(worker_stats.get("gpu_ring_block_wait_ns", 0) or 0),
                         "state_active_entries": int(worker_stats.get("state_active_entries", 0) or 0),

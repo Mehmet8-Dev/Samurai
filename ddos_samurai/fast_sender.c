@@ -1330,6 +1330,8 @@ typedef struct {
     unsigned long long txring_tp_freeze_q_cnt;
     unsigned long long txring_frame_wait_ns;
     unsigned long long txring_poll_count;
+    unsigned int txring_batch_target;
+    unsigned long long txring_backoff_ns;
     int flush_mode;
 } txring_send_metrics_t;
 
@@ -1441,9 +1443,16 @@ static int send_ring_optimized_core(
 
     const txring_flush_mode_t flush_mode = (txring_flush_mode_t)metrics->flush_mode;
     const unsigned int legacy_batch = 256U;
+    const unsigned int adaptive_batch_min = 32U;
+    const unsigned int adaptive_batch_max = 512U;
+    const unsigned long long adaptive_backoff_min_ns = 1000ULL;
+    const unsigned long long adaptive_backoff_max_ns = 500000ULL;
     const int spin_limit = 64;
     unsigned int pending_since_flush = 0U;
+    unsigned int adaptive_batch_target = legacy_batch;
+    unsigned long long adaptive_backoff_ns = 0ULL;
     int last_flush_errno = 0;
+    metrics->txring_batch_target = adaptive_batch_target;
 
     for (int i = 0; i < count; ) {
         char* frame_base = tx_ring_ctx.map + ((size_t)tx_ring_ctx.frame_idx * frame_size);
@@ -1470,6 +1479,35 @@ static int send_ring_optimized_core(
                 if (flush_mode == TXRING_FLUSH_MODE_ADAPTIVE) {
                     if ((pfd.revents & (POLLOUT | POLLERR | POLLHUP)) != 0 || poll_timeout_ms >= 2) {
                         last_flush_errno = txring_flush_socket(tx_ring_ctx.sock, metrics);
+                        if (last_flush_errno == EAGAIN || last_flush_errno == EWOULDBLOCK || last_flush_errno == ENOBUFS || last_flush_errno == EBUSY) {
+                            if (adaptive_batch_target > adaptive_batch_min) {
+                                adaptive_batch_target >>= 1;
+                                if (adaptive_batch_target < adaptive_batch_min) adaptive_batch_target = adaptive_batch_min;
+                            }
+                            if (adaptive_backoff_ns == 0ULL) {
+                                adaptive_backoff_ns = adaptive_backoff_min_ns;
+                            } else if (adaptive_backoff_ns < adaptive_backoff_max_ns) {
+                                adaptive_backoff_ns <<= 1;
+                                if (adaptive_backoff_ns > adaptive_backoff_max_ns) adaptive_backoff_ns = adaptive_backoff_max_ns;
+                            }
+                        } else {
+                            if (adaptive_batch_target < adaptive_batch_max) {
+                                adaptive_batch_target += 16U;
+                                if (adaptive_batch_target > adaptive_batch_max) adaptive_batch_target = adaptive_batch_max;
+                            }
+                            if (adaptive_backoff_ns > 0ULL) {
+                                adaptive_backoff_ns >>= 1;
+                                if (adaptive_backoff_ns < adaptive_backoff_min_ns) adaptive_backoff_ns = 0ULL;
+                            }
+                        }
+                        metrics->txring_batch_target = adaptive_batch_target;
+                        if (adaptive_backoff_ns > 0ULL) {
+                            struct timespec ts;
+                            ts.tv_sec = (time_t)(adaptive_backoff_ns / 1000000000ULL);
+                            ts.tv_nsec = (long)(adaptive_backoff_ns % 1000000000ULL);
+                            nanosleep(&ts, NULL);
+                            metrics->txring_backoff_ns += adaptive_backoff_ns;
+                        }
                     }
                 } else {
                     last_flush_errno = txring_flush_socket(tx_ring_ctx.sock, metrics);
@@ -1492,12 +1530,9 @@ static int send_ring_optimized_core(
         pending_since_flush++;
         int should_flush = 0;
         if (flush_mode == TXRING_FLUSH_MODE_ADAPTIVE) {
-            unsigned int adaptive_batch = (
-                (last_flush_errno == EAGAIN || last_flush_errno == EWOULDBLOCK) ? 64U : 256U
-            );
-            if (pending_since_flush >= adaptive_batch || i == count - 1) {
+            if (pending_since_flush >= adaptive_batch_target || i == count - 1) {
                 should_flush = 1;
-            } else if ((pfd.revents & POLLOUT) && pending_since_flush >= 32U) {
+            } else if ((pfd.revents & POLLOUT) && pending_since_flush >= adaptive_batch_min) {
                 should_flush = 1;
             }
         } else {
@@ -1508,6 +1543,37 @@ static int send_ring_optimized_core(
 
         if (should_flush) {
             last_flush_errno = txring_flush_socket(tx_ring_ctx.sock, metrics);
+            if (flush_mode == TXRING_FLUSH_MODE_ADAPTIVE) {
+                if (last_flush_errno == EAGAIN || last_flush_errno == EWOULDBLOCK || last_flush_errno == ENOBUFS || last_flush_errno == EBUSY) {
+                    if (adaptive_batch_target > adaptive_batch_min) {
+                        adaptive_batch_target >>= 1;
+                        if (adaptive_batch_target < adaptive_batch_min) adaptive_batch_target = adaptive_batch_min;
+                    }
+                    if (adaptive_backoff_ns == 0ULL) {
+                        adaptive_backoff_ns = adaptive_backoff_min_ns;
+                    } else if (adaptive_backoff_ns < adaptive_backoff_max_ns) {
+                        adaptive_backoff_ns <<= 1;
+                        if (adaptive_backoff_ns > adaptive_backoff_max_ns) adaptive_backoff_ns = adaptive_backoff_max_ns;
+                    }
+                } else {
+                    if (adaptive_batch_target < adaptive_batch_max) {
+                        adaptive_batch_target += 16U;
+                        if (adaptive_batch_target > adaptive_batch_max) adaptive_batch_target = adaptive_batch_max;
+                    }
+                    if (adaptive_backoff_ns > 0ULL) {
+                        adaptive_backoff_ns >>= 1;
+                        if (adaptive_backoff_ns < adaptive_backoff_min_ns) adaptive_backoff_ns = 0ULL;
+                    }
+                }
+                metrics->txring_batch_target = adaptive_batch_target;
+                if (adaptive_backoff_ns > 0ULL) {
+                    struct timespec ts;
+                    ts.tv_sec = (time_t)(adaptive_backoff_ns / 1000000000ULL);
+                    ts.tv_nsec = (long)(adaptive_backoff_ns % 1000000000ULL);
+                    nanosleep(&ts, NULL);
+                    metrics->txring_backoff_ns += adaptive_backoff_ns;
+                }
+            }
             pending_since_flush = 0U;
         }
 
@@ -1591,7 +1657,7 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
     packet_version_str = packet_version_name(packet_version);
 
     return Py_BuildValue(
-        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:i,s:s,s:K,s:K,s:K,s:K,s:K,s:s,s:i,s:s}",
+        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:i,s:s,s:K,s:K,s:K,s:K,s:K,s:I,s:K,s:s,s:i,s:s}",
         "attempted", metrics.attempted,
         "sent", metrics.sent,
         "errors", errors,
@@ -1608,6 +1674,8 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
         "txring_tp_freeze_q_cnt", metrics.txring_tp_freeze_q_cnt,
         "txring_frame_wait_ns", metrics.txring_frame_wait_ns,
         "txring_poll_count", metrics.txring_poll_count,
+        "txring_batch_target", metrics.txring_batch_target,
+        "txring_backoff_ns", metrics.txring_backoff_ns,
         "flush_mode", txring_flush_mode_name(metrics.flush_mode),
         "txring_packet_version", packet_version,
         "txring_packet_version_name", packet_version_str

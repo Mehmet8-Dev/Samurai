@@ -280,6 +280,15 @@ def _report_inputs_from_args(args) -> dict:
         "loss_telemetry": str(getattr(args, "loss_telemetry", "auto")),
         "loss_iface": str(getattr(args, "loss_iface", "")),
         "loss_fail_pct": float(getattr(args, "loss_fail_pct", 5.0) or 5.0),
+        "sender_backend": str(getattr(args, "sender_backend", "auto")),
+        "sender_fallback_policy": str(getattr(args, "sender_fallback_policy", "allow")),
+        "xdp_enable": bool(getattr(args, "xdp_enable", False)),
+        "xdp_interface": str(getattr(args, "xdp_interface", "")),
+        "xdp_queue_id": int(getattr(args, "xdp_queue_id", 0) or 0),
+        "http2_connections": int(getattr(args, "http2_connections", 1) or 1),
+        "http2_streams_per_conn": int(getattr(args, "http2_streams_per_conn", 100) or 100),
+        "l7_session_repeats": int(getattr(args, "l7_session_repeats", 1) or 1),
+        "l7_max_active_sessions": int(getattr(args, "l7_max_active_sessions", 0) or 0),
         "fault_inject": list(getattr(args, "fault_inject", []) or []),
     }
 
@@ -366,6 +375,28 @@ def _validate_hybrid_cuda_args(parser: argparse.ArgumentParser, args: argparse.N
     rng_seed = int(getattr(args, "gpu_rng_seed", 1234) or 0)
     if rng_seed < 0 or rng_seed > 0xFFFFFFFF:
         parser.error("Hata: --gpu-rng-seed 0..4294967295 aralığında olmalıdır.")
+
+
+def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    sender_backend = str(getattr(args, "sender_backend", "auto") or "auto").strip().lower()
+    fallback_policy = str(getattr(args, "sender_fallback_policy", "allow") or "allow").strip().lower()
+    xdp_enable = bool(getattr(args, "xdp_enable", False))
+    xdp_interface = str(getattr(args, "xdp_interface", "") or "").strip()
+
+    if int(getattr(args, "xdp_queue_id", 0) or 0) < 0:
+        parser.error("Hata: --xdp-queue-id >= 0 olmalıdır.")
+    if int(getattr(args, "http2_connections", 1) or 0) <= 0:
+        parser.error("Hata: --http2-connections >= 1 olmalıdır.")
+    if int(getattr(args, "http2_streams_per_conn", 100) or 0) <= 0:
+        parser.error("Hata: --http2-streams-per-conn >= 1 olmalıdır.")
+    if int(getattr(args, "l7_session_repeats", 1) or 0) <= 0:
+        parser.error("Hata: --l7-session-repeats >= 1 olmalıdır.")
+    if int(getattr(args, "l7_max_active_sessions", 0) or 0) < 0:
+        parser.error("Hata: --l7-max-active-sessions >= 0 olmalıdır.")
+    if (xdp_enable or sender_backend == "xdp") and not xdp_interface:
+        parser.error("Hata: XDP yolu için --xdp-interface zorunludur.")
+    if fallback_policy == "fail" and sender_backend == "auto":
+        parser.error("Hata: --sender-fallback-policy fail için --sender-backend auto kullanılamaz.")
 
 def build_parser() -> argparse.ArgumentParser:
     """
@@ -470,6 +501,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ja3-profile", choices=list(TLS_PROFILE_CHOICES), default=None, help="DEPRECATED: --tls-profile alias (1 minor sürüm)")
     parser.add_argument("--ech", action="store_true", help="Encrypted Client Hello (ECH) desteğini etkinleştir (deneysel)")
     parser.add_argument("--http2-concurrency", type=int, default=100, help="HTTP/2 vektörü için eşzamanlı stream sayısı")
+    parser.add_argument("--http2-connections", type=int, default=1, help="HTTP/2 için bağlantı sayısı (connection pool).")
+    parser.add_argument("--http2-streams-per-conn", type=int, default=100, help="HTTP/2 bağlantı başına maksimum eşzamanlı stream.")
     parser.add_argument("--ws-path", type=str, default="/", help="WebSocket vektörü için bağlantı yolu")
     parser.add_argument("--ws-message", type=str, default="ping", help="WebSocket vektörü için gönderilecek mesaj")
     parser.add_argument("--ws-concurrency", type=int, default=50, help="WebSocket vektörü eşzamanlı bağlantı sayısı")
@@ -493,6 +526,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evasion-techniques", type=str, nargs='+', choices=['case', 'url', 'comment'], help="DEPRECATED (no-op): kaldırılacak")
     parser.add_argument("--compute-backend", type=str, default="cpu", choices=["cpu", "cuda"], help="Paket oluşturma için kullanılacak işlem birimi (cpu veya cuda)")
     parser.add_argument("--stateful", action="store_true", help="Enable Stateful TCP Engine (Viper-State) for full 3-way handshake.")
+    parser.add_argument(
+        "--sender-backend",
+        choices=["auto", "txring", "c_ext_l3", "python", "xdp"],
+        default="auto",
+        help="Raw sender backend seçimi: auto|txring|c_ext_l3|python|xdp.",
+    )
+    parser.add_argument(
+        "--sender-fallback-policy",
+        choices=["allow", "fail"],
+        default="allow",
+        help="Backend fallback politikası: allow=alt yola düş, fail=run'ı fail-visible bitir.",
+    )
+    parser.add_argument("--xdp-enable", action="store_true", help="AF_XDP sender yolunu etkinleştir (xdp backend).")
+    parser.add_argument("--xdp-interface", type=str, default="", help="AF_XDP için NIC adı (örn: eth0).")
+    parser.add_argument("--xdp-queue-id", type=int, default=0, help="AF_XDP queue id (varsayılan: 0).")
+    parser.add_argument("--l7-session-repeats", type=int, default=1, help="Stateful L7 oturumlarını kullanıcı başına tekrar sayısı.")
+    parser.add_argument("--l7-max-active-sessions", type=int, default=0, help="Stateful L7 için eşzamanlı aktif session üst limiti (0=sınırsız).")
     parser.add_argument(
         "--gpu-template-pool-size-l4",
         type=int,
@@ -954,6 +1004,7 @@ def main(argv=None):
     _resolve_profile_args(parser, args, argv)
     _validate_pacing_args(parser, args)
     _validate_hybrid_cuda_args(parser, args)
+    _validate_sender_route_args(parser, args)
 
     global CONNECTION_POOL
     try:
@@ -988,6 +1039,13 @@ def main(argv=None):
     os.environ["SAMURAI_STATE_LOCK_COUNT"] = str(int(getattr(args, "state_lock_count", 256) or 256))
     os.environ["SAMURAI_STATE_TIMEOUT_SEC"] = str(int(getattr(args, "state_timeout_sec", 60) or 60))
     os.environ["SAMURAI_STATE_SWEEP_INTERVAL_MS"] = str(int(getattr(args, "state_sweep_interval_ms", 1000) or 1000))
+    os.environ["SAMURAI_SENDER_BACKEND"] = str(getattr(args, "sender_backend", "auto") or "auto")
+    os.environ["SAMURAI_SENDER_FALLBACK_POLICY"] = str(
+        getattr(args, "sender_fallback_policy", "allow") or "allow"
+    )
+    os.environ["SAMURAI_XDP_ENABLE"] = "1" if bool(getattr(args, "xdp_enable", False)) else "0"
+    os.environ["SAMURAI_XDP_INTERFACE"] = str(getattr(args, "xdp_interface", "") or "")
+    os.environ["SAMURAI_XDP_QUEUE_ID"] = str(int(getattr(args, "xdp_queue_id", 0) or 0))
 
     # Live mode reporting is supported as well (aggregated worker events).
 
