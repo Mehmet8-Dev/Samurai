@@ -231,6 +231,13 @@ class TestCISafeBenchmarks(unittest.TestCase):
             "l7_conn_rate": 0.0,
             "l7_handshake_p99_ms": 0.0,
             "l7_step_fail_ratio": 0.0,
+            "session_success_rate": 1.0,
+            "retry_success_rate": 1.0,
+            "kpi_gate_profile": "developer_fallback",
+            "kpi_gate_status": "pass",
+            "kpi_gate_hard_fail": 0,
+            "kpi_violations": [],
+            "score_eligible": 1,
             "effective_pps": float(throughput_core["effective_pps"]),
         }
         parity_matrix_path, parity_matrix = _load_parity_matrix()

@@ -89,9 +89,17 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--state-sweep-interval-ms", opts)
         self.assertIn("--sender-backend", opts)
         self.assertIn("--sender-fallback-policy", opts)
+        self.assertIn("--lab-profile", opts)
+        self.assertIn("--dp-queue-strategy", opts)
+        self.assertIn("--dp-queues", opts)
+        self.assertIn("--dp-queue-map", opts)
         self.assertIn("--xdp-enable", opts)
         self.assertIn("--xdp-interface", opts)
         self.assertIn("--xdp-queue-id", opts)
+        self.assertIn("--kpi-gate-profile", opts)
+        self.assertIn("--kpi-hard-fail", opts)
+        self.assertIn("--l7-engine", opts)
+        self.assertIn("--legacy-path-enable", opts)
         self.assertIn("--http2-connections", opts)
         self.assertIn("--http2-streams-per-conn", opts)
         self.assertIn("--l7-session-repeats", opts)
@@ -102,9 +110,17 @@ class TestCliParser(unittest.TestCase):
         args = parser.parse_args([])
         self.assertEqual(args.sender_backend, "auto")
         self.assertEqual(args.sender_fallback_policy, "allow")
+        self.assertEqual(args.lab_profile, "off")
+        self.assertEqual(args.dp_queue_strategy, "rr")
+        self.assertEqual(args.dp_queues, 1)
+        self.assertEqual(args.dp_queue_map, "")
         self.assertFalse(args.xdp_enable)
         self.assertEqual(args.xdp_interface, "")
         self.assertEqual(args.xdp_queue_id, 0)
+        self.assertEqual(args.kpi_gate_profile, "off")
+        self.assertFalse(args.kpi_hard_fail)
+        self.assertEqual(args.l7_engine, "python")
+        self.assertFalse(args.legacy_path_enable)
         self.assertEqual(args.http2_connections, 1)
         self.assertEqual(args.http2_streams_per_conn, 100)
         self.assertEqual(args.l7_session_repeats, 1)
@@ -255,6 +271,21 @@ class TestSenderRouteValidation(unittest.TestCase):
     def test_sender_fallback_fail_forbids_auto_backend(self):
         parser = cli.build_parser()
         args = parser.parse_args(["--sender-backend", "auto", "--sender-fallback-policy", "fail"])
+        self._assert_validation_fails(parser, args)
+
+    def test_dp_queue_map_requires_map_spec(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--dp-queue-strategy", "map"])
+        self._assert_validation_fails(parser, args)
+
+    def test_dp_queue_map_rejects_invalid_format(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--dp-queue-strategy", "map", "--dp-queue-map", "1=0"])
+        self._assert_validation_fails(parser, args)
+
+    def test_kpi_hard_fail_requires_profile(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--kpi-hard-fail"])
         self._assert_validation_fails(parser, args)
 
     def test_sender_route_accepts_explicit_xdp_config(self):

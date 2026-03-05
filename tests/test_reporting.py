@@ -448,6 +448,8 @@ class TestReporting(unittest.TestCase):
                     "l7_conn_rate": 1234.5,
                     "l7_handshake_p99_ms": 44.0,
                     "l7_step_fail_ratio": 0.01,
+                    "session_success_rate": 0.995,
+                    "retry_success_rate": 0.91,
                     "stats": {"attempted": 200, "sent": 198, "errors": 2, "bytes_sent_est": 19800},
                 },
                 {
@@ -462,6 +464,8 @@ class TestReporting(unittest.TestCase):
                     "l7_conn_rate": 1000.0,
                     "l7_handshake_p99_ms": 50.0,
                     "l7_step_fail_ratio": 0.03,
+                    "session_success_rate": 0.98,
+                    "retry_success_rate": 0.85,
                     "stats": {"attempted": 100, "sent": 95, "errors": 5, "bytes_sent_est": 9500},
                 },
             ],
@@ -478,3 +482,33 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["txring_backoff_ns"], 6000)
         self.assertEqual(rr.results["l7_active_sessions_peak"], 60)
         self.assertAlmostEqual(rr.results["l7_handshake_p99_ms"], 50.0, places=4)
+        self.assertGreater(rr.results["session_success_rate"], 0.0)
+        self.assertGreater(rr.results["retry_success_rate"], 0.0)
+        self.assertEqual(rr.results["kpi_gate_profile"], "off")
+        self.assertEqual(rr.results["kpi_gate_status"], "pass")
+        self.assertEqual(rr.results["score_eligible"], 1)
+
+    def test_live_attack_report_kpi_gate_dedicated_hard_fail(self):
+        from ddos_samurai import reporting
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1", "kpi_gate_profile": "dedicated_lab", "kpi_hard_fail": True},
+            worker_events=[
+                {
+                    "status": "ok",
+                    "attack_vector": "basic",
+                    "compute_backend": "cpu",
+                    "sender_path": "C_EXT_L3",
+                    "stats": {"attempted": 100, "sent": 50, "errors": 50, "bytes_sent_est": 3200},
+                }
+            ],
+            duration_s=1.0,
+            progress_total=100,
+            total_count=100,
+            metrics={},
+            warnings=[],
+        )
+        self.assertEqual(rr.results["kpi_gate_profile"], "dedicated_lab")
+        self.assertEqual(rr.results["kpi_gate_status"], "fail")
+        self.assertEqual(rr.results["kpi_gate_hard_fail"], 1)
+        self.assertEqual(rr.results["score_eligible"], 0)
