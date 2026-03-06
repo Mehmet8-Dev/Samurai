@@ -3566,6 +3566,9 @@ async def quic_sender(
     quic_method,
     verbose,
     ssl_context=None,
+    retries=0,
+    timeout_s=3.0,
+    quic_verify=True,
     l7_quic_engine="python",
     l7_fallback_policy="allow",
     l7_capability_strict=False,
@@ -3591,6 +3594,7 @@ async def quic_sender(
         )
     )
     c_fallback_reason = "none"
+    verify_tls = bool(quic_verify and ssl_context is None)
     if route.engine == "c_state":
         c_cfg = l7_c_adapter.make_config(
             target_ip=str(target_ip),
@@ -3601,6 +3605,10 @@ async def quic_sender(
             extra={
                 "quic_path": str(quic_path or "/"),
                 "quic_method": str(quic_method or "GET"),
+                "scheme": "https",
+                "verify": bool(verify_tls),
+                "retries": int(retries or 0),
+                "timeout_s": float(timeout_s or 3.0),
             },
         )
         c_res = await l7_c_adapter.run("quic", c_cfg)
@@ -3640,7 +3648,7 @@ async def quic_sender(
              f"Count: {count}, Method: {quic_method}, Path: {quic_path}")
 
     configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
-    if ssl_context:
+    if ssl_context or not verify_tls:
         configuration.verify_mode = ssl.CERT_NONE
 
     ok_requests = 0
@@ -3713,6 +3721,7 @@ async def quic_sender(
                 "sent": ok_requests,
                 "errors": max(err_requests, count - ok_requests),
                 "quic_stream_fail_ratio": float(max(err_requests, 0)) / float(max(1, int(count or 0))),
+                "quic_handshake_fail_ratio": 0.0,
                 "sender_path": "PY_QUIC",
             },
             attempted_default=count,

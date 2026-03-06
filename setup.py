@@ -98,14 +98,17 @@ def detect_l7_capabilities() -> Dict[str, bool]:
         # Runtime-only libnghttp2 (versioned .so) is insufficient for editable build linking.
         nghttp2_enabled = _pkg_config_exists("nghttp2")
 
-    ngtcp2_present = _pkg_config_exists("ngtcp2") or ctypes.util.find_library("ngtcp2") is not None
-    nghttp3_present = _pkg_config_exists("nghttp3") or ctypes.util.find_library("nghttp3") is not None
-    quic_enabled = (
-        (not _env_flag("SAMURAI_DISABLE_QUIC", "0"))
-        and openssl_enabled
-        and ngtcp2_present
-        and nghttp3_present
-    )
+    quic_enabled = False
+    if _env_flag("SAMURAI_FORCE_QUIC", "0"):
+        # Explicit override for maintainers who inject cflags/libs externally.
+        quic_enabled = True
+    elif not _env_flag("SAMURAI_DISABLE_QUIC", "0"):
+        # CI-safe gate: require pkg-config metadata for deterministic ngtcp2/nghttp3 link flags.
+        quic_enabled = (
+            openssl_enabled
+            and _pkg_config_exists("ngtcp2")
+            and _pkg_config_exists("nghttp3")
+        )
 
     return {
         "openssl": bool(openssl_enabled),
@@ -152,7 +155,11 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
             # Fallback linker names when pkg-config modules are unavailable.
             link_args.extend(["-lngtcp2", "-lnghttp3"])
     else:
-        print("Warning: ngtcp2/nghttp3/OpenSSL stack not fully available; C QUIC mode will report capability_unavailable.")
+        print(
+            "Warning: ngtcp2/nghttp3 dev metadata (or OpenSSL) not found/disabled; "
+            "C QUIC mode will report capability_unavailable. "
+            "Use SAMURAI_FORCE_QUIC=1 only if linker flags are provided externally."
+        )
 
     if pkg_names:
         compile_args.extend(_pkg_config_tokens("--cflags", pkg_names))

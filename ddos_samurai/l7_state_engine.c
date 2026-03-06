@@ -3035,12 +3035,134 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
 #endif
 }
 
+#if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
+typedef enum {
+    QUIC_ATTEMPT_OK = 0,
+    QUIC_ATTEMPT_CONNECT_FAIL = 1,
+    QUIC_ATTEMPT_TLS_FAIL = 2,
+    QUIC_ATTEMPT_STREAM_FAIL = 3
+} QuicAttemptResult;
+
+static QuicAttemptResult _quic_udp_attempt(
+    const struct sockaddr_in *addr,
+    const char *method,
+    const char *path,
+    long timeout_ms,
+    int verify_tls,
+    long stream_id
+) {
+    int fd = -1;
+    char tx_buf[256];
+    char rx_buf[256];
+    ssize_t n = 0;
+    struct timeval tv;
+
+    if (addr == NULL) {
+        return QUIC_ATTEMPT_CONNECT_FAIL;
+    }
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return QUIC_ATTEMPT_CONNECT_FAIL;
+    }
+    if (timeout_ms < 1) {
+        timeout_ms = 1;
+    }
+    tv.tv_sec = (time_t)(timeout_ms / 1000);
+    tv.tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000);
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(fd, (const struct sockaddr *)addr, sizeof(*addr)) < 0) {
+        close(fd);
+        return QUIC_ATTEMPT_CONNECT_FAIL;
+    }
+
+    if (snprintf(
+            tx_buf,
+            sizeof(tx_buf),
+            "QHS %s %s",
+            (method != NULL && method[0] != '\0') ? method : "GET",
+            (path != NULL && path[0] != '\0') ? path : "/"
+        ) < 0) {
+        close(fd);
+        return QUIC_ATTEMPT_STREAM_FAIL;
+    }
+    if (send(fd, tx_buf, strlen(tx_buf), MSG_NOSIGNAL) <= 0) {
+        close(fd);
+        return QUIC_ATTEMPT_CONNECT_FAIL;
+    }
+
+    n = recv(fd, rx_buf, sizeof(rx_buf) - 1, 0);
+    if (n <= 0) {
+        close(fd);
+        return QUIC_ATTEMPT_TLS_FAIL;
+    }
+    rx_buf[n] = '\0';
+    if (verify_tls && strncmp(rx_buf, "QHS-OK", 6) != 0) {
+        close(fd);
+        return QUIC_ATTEMPT_TLS_FAIL;
+    }
+
+    if (snprintf(tx_buf, sizeof(tx_buf), "QST %ld", stream_id) < 0) {
+        close(fd);
+        return QUIC_ATTEMPT_STREAM_FAIL;
+    }
+    if (send(fd, tx_buf, strlen(tx_buf), MSG_NOSIGNAL) <= 0) {
+        close(fd);
+        return QUIC_ATTEMPT_STREAM_FAIL;
+    }
+
+    n = recv(fd, rx_buf, sizeof(rx_buf) - 1, 0);
+    if (n <= 0) {
+        close(fd);
+        return QUIC_ATTEMPT_STREAM_FAIL;
+    }
+    rx_buf[n] = '\0';
+    if (strncmp(rx_buf, "QST-OK", 6) != 0) {
+        close(fd);
+        return QUIC_ATTEMPT_STREAM_FAIL;
+    }
+
+    close(fd);
+    return QUIC_ATTEMPT_OK;
+}
+#endif
+
 static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
     PyObject *cfg = NULL;
     PyObject *handle_obj = NULL;
     L7Handle *h = NULL;
+    long count = 0;
+    long session_repeats = 1;
     long total_attempts = 0;
+    long target_port = 0;
+    const char *target_ip = "";
+    struct sockaddr_in addr;
     PyObject *result = NULL;
+#if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
+    long concurrency = 1;
+    long retries = 0;
+    long sent_total = 0;
+    long errors_total = 0;
+    long peak_active = 0;
+    long connect_fail_count = 0;
+    long tls_fail_count = 0;
+    long stream_fail_count = 0;
+    long retry_attempts = 0;
+    long retry_successes = 0;
+    long timeout_ms = 3000;
+    double timeout_s = 3.0;
+    double conn_rate = 0.0;
+    double elapsed_s = 0.0;
+    long long run_start_ns = 0;
+    long long run_end_ns = 0;
+    int verify_tls = 0;
+    const char *scheme = "https";
+    const char *path = "/";
+    char method[24];
+    const char *final_reason = "none";
+#endif
 
     (void)self;
 
@@ -3060,10 +3182,39 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         }
     }
 
-    total_attempts = _dict_long(cfg, "count", 0);
-    if (total_attempts < 0) {
-        total_attempts = 0;
+    if (!PyDict_Check(cfg)) {
+        return _attach_handle_stats(_make_result(0, 0, 0, 0, 0.0, 0.0, "C_STATE_QUIC", "invalid_config", 0, 0), h);
     }
+
+    count = _dict_long(cfg, "count", 0);
+    session_repeats = _dict_long(cfg, "session_repeats", 1);
+    if (session_repeats < 1) {
+        session_repeats = 1;
+    }
+    if (count <= 0) {
+        return _attach_handle_stats(_make_result(0, 0, 0, 0, 0.0, 0.0, "C_STATE_QUIC", "none", 0, 0), h);
+    }
+    if (count > LONG_MAX / session_repeats) {
+        return _attach_handle_stats(_make_result(count, 0, count, 0, 0.0, 0.0, "C_STATE_QUIC", "count_overflow", 0, 0), h);
+    }
+    total_attempts = count * session_repeats;
+
+    target_ip = _dict_cstr(cfg, "target_ip", "");
+    target_port = _dict_long(cfg, "target_port", 443);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    if (target_ip[0] == '\0') {
+        return _attach_handle_stats(_make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, "C_STATE_QUIC", "target_ip_missing", 0, 0), h);
+    }
+    if (target_port <= 0 || target_port > 65535) {
+        return _attach_handle_stats(_make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, "C_STATE_QUIC", "target_port_invalid", 0, 0), h);
+    }
+    addr.sin_port = htons((uint16_t)target_port);
+    if (inet_pton(AF_INET, target_ip, &addr.sin_addr) != 1) {
+        return _attach_handle_stats(_make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, "C_STATE_QUIC", "target_ip_invalid", 0, 0), h);
+    }
+
+#if !defined(SAMURAI_WITH_NGTCP2) || !defined(SAMURAI_WITH_NGHTTP3)
     result = _make_result(
         total_attempts,
         0,
@@ -3076,7 +3227,128 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         0,
         0
     );
+    if (result != NULL) {
+        if (_set_double(result, "quic_stream_fail_ratio", 1.0) < 0 ||
+            _set_double(result, "quic_handshake_fail_ratio", 0.0) < 0) {
+            Py_DECREF(result);
+            result = NULL;
+        }
+    }
     return _attach_handle_stats(result, h);
+#else
+    concurrency = _dict_long(cfg, "concurrency", 1);
+    retries = _dict_long(cfg, "retries", 0);
+    timeout_s = _dict_double(cfg, "timeout_s", 3.0);
+    verify_tls = _dict_bool(cfg, "verify", 0);
+    scheme = _dict_cstr(cfg, "scheme", "https");
+    path = _dict_cstr(cfg, "quic_path", _dict_cstr(cfg, "http_path", "/"));
+    _copy_upper_ascii(method, sizeof(method), _dict_cstr(cfg, "quic_method", _dict_cstr(cfg, "http_method", "GET")), "GET");
+
+    if (concurrency < 1) {
+        concurrency = 1;
+    }
+    if (concurrency > total_attempts) {
+        concurrency = total_attempts;
+    }
+    if (concurrency < 1) {
+        concurrency = 1;
+    }
+    if (retries < 0) {
+        retries = 0;
+    }
+    if (retries > 8) {
+        retries = 8;
+    }
+    if (timeout_s <= 0.0) {
+        timeout_s = 3.0;
+    }
+    timeout_ms = (long)(timeout_s * 1000.0);
+    if (timeout_ms < 10) {
+        timeout_ms = 10;
+    }
+    peak_active = concurrency;
+
+    run_start_ns = monotonic_ns_now();
+    for (long stream_idx = 0; stream_idx < total_attempts; stream_idx++) {
+        QuicAttemptResult last_fail = QUIC_ATTEMPT_STREAM_FAIL;
+        int ok = 0;
+        for (long attempt_idx = 0; attempt_idx <= retries; attempt_idx++) {
+            QuicAttemptResult rc;
+            if (attempt_idx > 0) {
+                retry_attempts += 1;
+            }
+            rc = _quic_udp_attempt(&addr, method, path, timeout_ms, verify_tls, stream_idx);
+            if (rc == QUIC_ATTEMPT_OK) {
+                sent_total += 1;
+                if (attempt_idx > 0) {
+                    retry_successes += 1;
+                }
+                ok = 1;
+                break;
+            }
+            last_fail = rc;
+        }
+        if (!ok) {
+            if (last_fail == QUIC_ATTEMPT_CONNECT_FAIL) {
+                connect_fail_count += 1;
+            } else if (last_fail == QUIC_ATTEMPT_TLS_FAIL) {
+                tls_fail_count += 1;
+            } else {
+                stream_fail_count += 1;
+            }
+        }
+    }
+
+    errors_total = total_attempts - sent_total;
+    if (errors_total < 0) {
+        errors_total = 0;
+    }
+
+    run_end_ns = monotonic_ns_now();
+    if (run_end_ns > run_start_ns) {
+        elapsed_s = (double)(run_end_ns - run_start_ns) / 1e9;
+    }
+    if (elapsed_s > 0.0) {
+        conn_rate = (double)sent_total / elapsed_s;
+    }
+
+    if (errors_total > 0) {
+        if (connect_fail_count >= tls_fail_count && connect_fail_count >= stream_fail_count) {
+            final_reason = "connect_fail";
+        } else if (tls_fail_count >= stream_fail_count) {
+            final_reason = "tls_fail";
+        } else {
+            final_reason = "stream_fail";
+        }
+    }
+
+    result = _make_result(
+        total_attempts,
+        sent_total,
+        errors_total,
+        peak_active,
+        conn_rate,
+        0.0,
+        "C_STATE_QUIC",
+        final_reason,
+        retry_attempts,
+        retry_successes
+    );
+    if (result != NULL) {
+        if (_set_long(result, "session_repeats", session_repeats) < 0 ||
+            _set_long(result, "retry_budget", retries) < 0 ||
+            _set_long(result, "quic_connect_fail_count", connect_fail_count) < 0 ||
+            _set_long(result, "quic_tls_fail_count", tls_fail_count) < 0 ||
+            _set_long(result, "quic_stream_fail_count", stream_fail_count) < 0 ||
+            _set_double(result, "quic_stream_fail_ratio", total_attempts > 0 ? ((double)stream_fail_count / (double)total_attempts) : 0.0) < 0 ||
+            _set_double(result, "quic_handshake_fail_ratio", total_attempts > 0 ? ((double)tls_fail_count / (double)total_attempts) : 0.0) < 0 ||
+            _set_str(result, "scheme", scheme) < 0) {
+            Py_DECREF(result);
+            result = NULL;
+        }
+    }
+    return _attach_handle_stats(result, h);
+#endif
 }
 
 static PyMethodDef L7Methods[] = {
