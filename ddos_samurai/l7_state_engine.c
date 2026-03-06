@@ -1660,6 +1660,94 @@ static PyObject *l7_run_websocket_stateful(PyObject *self, PyObject *args) {
     return _run_state_machine(cfg, 1, "C_STATE_WS", h);
 }
 
+static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
+    PyObject *cfg = NULL;
+    PyObject *handle_obj = NULL;
+    L7Handle *h = NULL;
+    long total_attempts = 0;
+    PyObject *result = NULL;
+
+    (void)self;
+
+    if (PyArg_ParseTuple(args, "OO", &handle_obj, &cfg)) {
+        h = _get_handle(handle_obj);
+        if (h == NULL) {
+            return NULL;
+        }
+        if (h->closed) {
+            PyErr_SetString(PyExc_RuntimeError, "l7 handle is closed");
+            return NULL;
+        }
+    } else {
+        PyErr_Clear();
+        if (!PyArg_ParseTuple(args, "O", &cfg)) {
+            return NULL;
+        }
+    }
+
+    total_attempts = _dict_long(cfg, "count", 0);
+    if (total_attempts < 0) {
+        total_attempts = 0;
+    }
+    result = _make_result(
+        total_attempts,
+        0,
+        total_attempts,
+        0,
+        0.0,
+        0.0,
+        "C_STATE_H2",
+        "h2_capability_unavailable",
+        0,
+        0
+    );
+    return _attach_handle_stats(result, h);
+}
+
+static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
+    PyObject *cfg = NULL;
+    PyObject *handle_obj = NULL;
+    L7Handle *h = NULL;
+    long total_attempts = 0;
+    PyObject *result = NULL;
+
+    (void)self;
+
+    if (PyArg_ParseTuple(args, "OO", &handle_obj, &cfg)) {
+        h = _get_handle(handle_obj);
+        if (h == NULL) {
+            return NULL;
+        }
+        if (h->closed) {
+            PyErr_SetString(PyExc_RuntimeError, "l7 handle is closed");
+            return NULL;
+        }
+    } else {
+        PyErr_Clear();
+        if (!PyArg_ParseTuple(args, "O", &cfg)) {
+            return NULL;
+        }
+    }
+
+    total_attempts = _dict_long(cfg, "count", 0);
+    if (total_attempts < 0) {
+        total_attempts = 0;
+    }
+    result = _make_result(
+        total_attempts,
+        0,
+        total_attempts,
+        0,
+        0.0,
+        0.0,
+        "C_STATE_QUIC",
+        "quic_capability_unavailable",
+        0,
+        0
+    );
+    return _attach_handle_stats(result, h);
+}
+
 static PyMethodDef L7Methods[] = {
     {"open", l7_open, METH_VARARGS, "open(config) -> handle"},
     {"close", l7_close, METH_VARARGS, "close(handle)"},
@@ -1667,6 +1755,8 @@ static PyMethodDef L7Methods[] = {
     {"tls_supported", l7_tls_supported, METH_NOARGS, "tls_supported() -> bool"},
     {"run_http1_stateful", l7_run_http1_stateful, METH_VARARGS, "run_http1_stateful(config) -> stats"},
     {"run_websocket_stateful", l7_run_websocket_stateful, METH_VARARGS, "run_websocket_stateful(config) -> stats"},
+    {"run_http2_stateful", l7_run_http2_stateful, METH_VARARGS, "run_http2_stateful(config) -> stats"},
+    {"run_quic_stateful", l7_run_quic_stateful, METH_VARARGS, "run_quic_stateful(config) -> stats"},
     {NULL, NULL, 0, NULL}
 };
 
