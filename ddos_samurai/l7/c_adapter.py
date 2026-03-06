@@ -37,12 +37,20 @@ def capability_map() -> Dict[str, Any]:
             except Exception:
                 return False
         return True
+    quic_mode = "unavailable"
+    if core is not None and hasattr(core, "quic_stack_mode"):
+        try:
+            quic_mode = str(getattr(core, "quic_stack_mode")() or "unavailable")
+        except Exception:
+            quic_mode = "unavailable"
     return {
         "core_available": bool(core is not None),
         "http1": _has("run_http1_stateful"),
         "ws": _has("run_websocket_stateful"),
         "http2": _has("run_http2_stateful", "h2_supported"),
         "quic": _has("run_quic_stateful", "quic_supported"),
+        "quic_stack_mode": quic_mode,
+        "quic_h3_stateful": quic_mode == "h3_stateful",
     }
 
 

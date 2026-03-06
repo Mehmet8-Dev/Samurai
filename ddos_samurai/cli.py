@@ -574,6 +574,12 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
         if route.engine != "c_state":
             return
         if bool(caps.get(str(protocol), False)):
+            if str(protocol) == "quic" and not bool(caps.get("quic_h3_stateful", False)):
+                mode = str(caps.get("quic_stack_mode", "unknown") or "unknown")
+                parser.error(
+                    "Hata: L7 capability strict aktifken C QUIC engine yalnızca tam H3 stateful modda kabul edilir. "
+                    f"mevcut_quic_mode={mode}"
+                )
             return
         parser.error(
             "Hata: L7 capability strict aktifken seçili C engine mevcut değil: "
