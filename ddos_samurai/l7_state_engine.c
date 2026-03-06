@@ -304,66 +304,6 @@ static int _quic_stack_probe(const char **reason_out) {
         goto done;
     }
 
-    {
-        ngtcp2_cid dcid;
-        ngtcp2_cid scid;
-        uint8_t dcid_buf[20];
-        uint8_t scid_buf[8];
-        ngtcp2_path_storage path_storage;
-        ngtcp2_settings settings;
-        ngtcp2_transport_params params;
-        ngtcp2_callbacks callbacks;
-        ngtcp2_conn *conn = NULL;
-        nghttp3_settings h3_settings;
-        nghttp3_callbacks h3_callbacks;
-        nghttp3_conn *h3_conn = NULL;
-        int rc = 0;
-        size_t i = 0;
-
-        for (i = 0; i < sizeof(dcid_buf); i++) {
-            dcid_buf[i] = (uint8_t)(0xA0u + (uint8_t)i);
-        }
-        for (i = 0; i < sizeof(scid_buf); i++) {
-            scid_buf[i] = (uint8_t)(0xC0u + (uint8_t)i);
-        }
-        ngtcp2_cid_init(&dcid, dcid_buf, sizeof(dcid_buf));
-        ngtcp2_cid_init(&scid, scid_buf, sizeof(scid_buf));
-        ngtcp2_path_storage_zero(&path_storage);
-        ngtcp2_settings_default(&settings);
-        ngtcp2_transport_params_default(&params);
-        memset(&callbacks, 0, sizeof(callbacks));
-
-        /* Soft-probe constructors to verify ABI compatibility without making it mandatory. */
-        rc = ngtcp2_conn_client_new(
-            &conn,
-            &dcid,
-            &scid,
-            &path_storage.path,
-            (uint32_t)0x00000001u,
-            &callbacks,
-            &settings,
-            &params,
-            NULL,
-            NULL
-        );
-        if (rc == 0 && conn != NULL) {
-            ngtcp2_conn_del(conn);
-            conn = NULL;
-        } else if (strcmp(reason, "ok") == 0) {
-            reason = "ngtcp2_conn_client_new_failed_nonfatal";
-        }
-
-        nghttp3_settings_default(&h3_settings);
-        memset(&h3_callbacks, 0, sizeof(h3_callbacks));
-        rc = nghttp3_conn_client_new(&h3_conn, &h3_callbacks, &h3_settings, NULL, NULL);
-        if (rc == 0 && h3_conn != NULL) {
-            nghttp3_conn_del(h3_conn);
-            h3_conn = NULL;
-        } else if (strcmp(reason, "ok") == 0) {
-            reason = "nghttp3_conn_client_new_failed_nonfatal";
-        }
-    }
-
     available = 1;
 
 done:

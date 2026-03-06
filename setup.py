@@ -37,6 +37,13 @@ def _pkg_config_exists(package: str) -> bool:
         return False
 
 
+def _pkg_config_first(candidates: List[str]) -> str:
+    for name in [str(x or "").strip() for x in candidates]:
+        if name and _pkg_config_exists(name):
+            return name
+    return ""
+
+
 def _pkg_config_tokens(flag: str, packages: List[str]) -> List[str]:
     cmd = ["pkg-config", flag] + [p for p in packages if p]
     try:
@@ -89,6 +96,10 @@ def detect_l7_capabilities() -> Dict[str, bool]:
         and has_openssl_libs
     )
 
+    nghttp2_pkg = _pkg_config_first(["nghttp2", "libnghttp2"])
+    ngtcp2_pkg = _pkg_config_first(["ngtcp2", "libngtcp2"])
+    nghttp3_pkg = _pkg_config_first(["nghttp3", "libnghttp3"])
+
     nghttp2_enabled = False
     if _env_flag("SAMURAI_FORCE_NGHTTP2", "0"):
         # Explicit override for environments where maintainers ensure flags/libs externally.
@@ -96,7 +107,7 @@ def detect_l7_capabilities() -> Dict[str, bool]:
     elif not _env_flag("SAMURAI_DISABLE_NGHTTP2", "0"):
         # CI-safe gate: require pkg-config metadata for deterministic cflags/libs resolution.
         # Runtime-only libnghttp2 (versioned .so) is insufficient for editable build linking.
-        nghttp2_enabled = _pkg_config_exists("nghttp2")
+        nghttp2_enabled = bool(nghttp2_pkg)
 
     quic_enabled = False
     if _env_flag("SAMURAI_FORCE_QUIC", "0"):
@@ -106,8 +117,8 @@ def detect_l7_capabilities() -> Dict[str, bool]:
         # CI-safe gate: require pkg-config metadata for deterministic ngtcp2/nghttp3 link flags.
         quic_enabled = (
             openssl_enabled
-            and _pkg_config_exists("ngtcp2")
-            and _pkg_config_exists("nghttp3")
+            and bool(ngtcp2_pkg)
+            and bool(nghttp3_pkg)
         )
 
     return {
@@ -124,6 +135,9 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
 
     caps = detect_l7_capabilities()
     pkg_names: List[str] = []
+    nghttp2_pkg = _pkg_config_first(["nghttp2", "libnghttp2"])
+    ngtcp2_pkg = _pkg_config_first(["ngtcp2", "libngtcp2"])
+    nghttp3_pkg = _pkg_config_first(["nghttp3", "libnghttp3"])
 
     if caps["openssl"]:
         macros.append(("SAMURAI_WITH_OPENSSL", "1"))
@@ -133,7 +147,10 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
 
     if caps["nghttp2"]:
         macros.append(("SAMURAI_WITH_NGHTTP2", "1"))
-        pkg_names.append("nghttp2")
+        if nghttp2_pkg:
+            pkg_names.append(nghttp2_pkg)
+        else:
+            link_args.append("-lnghttp2")
     else:
         print(
             "Warning: nghttp2 dev metadata not found (or disabled); "
@@ -146,12 +163,20 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
             ("SAMURAI_WITH_NGTCP2", "1"),
             ("SAMURAI_WITH_NGHTTP3", "1"),
         ])
-        pkg_names.extend(["ngtcp2", "nghttp3"])
+        if ngtcp2_pkg:
+            pkg_names.append(ngtcp2_pkg)
+        if nghttp3_pkg:
+            pkg_names.append(nghttp3_pkg)
         crypto_pkg = None
         for candidate in (
             "ngtcp2_crypto_ossl",
             "ngtcp2_crypto_openssl",
             "ngtcp2_crypto_quictls",
+            "libngtcp2_crypto_ossl",
+            "libngtcp2_crypto_openssl",
+            "libngtcp2_crypto_quictls",
+            "ngtcp2_crypto_gnutls",
+            "libngtcp2_crypto_gnutls",
         ):
             if _pkg_config_exists(candidate):
                 crypto_pkg = candidate
