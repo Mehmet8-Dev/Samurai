@@ -23,9 +23,15 @@ class _CoreWithProbes:
     def quic_supported(self):
         return False
 
+    def quic_stack_mode(self):
+        return "h3_stateful"
+
 
 class _CoreProbeRaises(_CoreWithProbes):
     def h2_supported(self):
+        raise RuntimeError("boom")
+
+    def quic_stack_mode(self):
         raise RuntimeError("boom")
 
 
@@ -39,12 +45,16 @@ class TestL7CAdapter(unittest.TestCase):
         self.assertTrue(caps["ws"])
         self.assertFalse(caps["http2"])
         self.assertFalse(caps["quic"])
+        self.assertEqual(caps.get("quic_stack_mode"), "h3_stateful")
+        self.assertTrue(bool(caps.get("quic_h3_stateful", False)))
 
     def test_capability_map_handles_probe_exception(self):
         core = _CoreProbeRaises()
         with patch.object(c_adapter._adapter, "_l7_core", core):
             caps = c_adapter.capability_map()
         self.assertFalse(caps["http2"])
+        self.assertEqual(caps.get("quic_stack_mode"), "unavailable")
+        self.assertFalse(bool(caps.get("quic_h3_stateful", True)))
 
 
 if __name__ == "__main__":  # pragma: no cover
