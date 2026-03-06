@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -19,6 +20,10 @@
 #ifdef SAMURAI_WITH_OPENSSL
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#endif
+
+#ifdef SAMURAI_WITH_NGHTTP2
+#include <nghttp2/nghttp2.h>
 #endif
 
 typedef struct {
@@ -275,9 +280,13 @@ static int _ssl_global_init(void) {
     return 0;
 }
 
-static SSL_CTX *_tls_ctx_create(int verify_peer, const char **reason_out) {
+static SSL_CTX *_tls_ctx_create_with_alpn(
+    int verify_peer,
+    const unsigned char *alpn,
+    size_t alpn_len,
+    const char **reason_out
+) {
     SSL_CTX *ctx = NULL;
-    static const unsigned char alpn_http11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
 
     if (reason_out != NULL) {
         *reason_out = "tls_ctx_create_failed";
@@ -309,7 +318,9 @@ static SSL_CTX *_tls_ctx_create(int verify_peer, const char **reason_out) {
     SSL_CTX_clear_options(ctx, SSL_OP_ENABLE_KTLS);
 #endif
 
-    (void)SSL_CTX_set_alpn_protos(ctx, alpn_http11, sizeof(alpn_http11));
+    if (alpn != NULL && alpn_len > 0) {
+        (void)SSL_CTX_set_alpn_protos(ctx, alpn, (unsigned int)alpn_len);
+    }
 
     if (verify_peer) {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
@@ -328,6 +339,11 @@ static SSL_CTX *_tls_ctx_create(int verify_peer, const char **reason_out) {
         *reason_out = "none";
     }
     return ctx;
+}
+
+static SSL_CTX *_tls_ctx_create(int verify_peer, const char **reason_out) {
+    static const unsigned char alpn_http11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    return _tls_ctx_create_with_alpn(verify_peer, alpn_http11, sizeof(alpn_http11), reason_out);
 }
 #endif
 
@@ -2140,6 +2156,26 @@ static PyObject *l7_tls_supported(PyObject *self, PyObject *args) {
 #endif
 }
 
+static PyObject *l7_h2_supported(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+#ifdef SAMURAI_WITH_NGHTTP2
+    Py_RETURN_TRUE;
+#else
+    Py_RETURN_FALSE;
+#endif
+}
+
+static PyObject *l7_quic_supported(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+#if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
+    Py_RETURN_TRUE;
+#else
+    Py_RETURN_FALSE;
+#endif
+}
+
 static PyObject *l7_run_http1_stateful(PyObject *self, PyObject *args) {
     PyObject *cfg = NULL;
     PyObject *handle_obj = NULL;
@@ -2192,12 +2228,539 @@ static PyObject *l7_run_websocket_stateful(PyObject *self, PyObject *args) {
     return _run_state_machine(cfg, 1, "C_STATE_WS", h);
 }
 
+#ifdef SAMURAI_WITH_NGHTTP2
+static int _set_blocking_mode(int fd, int blocking) {
+    int flags;
+    if (fd < 0) {
+        return -1;
+    }
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+    if (blocking) {
+        flags &= ~O_NONBLOCK;
+    } else {
+        flags |= O_NONBLOCK;
+    }
+    if (fcntl(fd, F_SETFL, flags) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int _set_socket_io_timeout(int fd, long timeout_ms) {
+    struct timeval tv;
+    if (timeout_ms < 1) {
+        timeout_ms = 1;
+    }
+    tv.tv_sec = (time_t)(timeout_ms / 1000);
+    tv.tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000);
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        return -1;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int _connect_with_timeout(int fd, const struct sockaddr_in *addr, long timeout_ms) {
+    int rc;
+    int sock_err = 0;
+    socklen_t sock_err_len = sizeof(sock_err);
+    fd_set wfds;
+    struct timeval tv;
+
+    if (fd < 0 || addr == NULL) {
+        return -1;
+    }
+    if (_set_blocking_mode(fd, 0) < 0) {
+        return -1;
+    }
+
+    rc = connect(fd, (const struct sockaddr *)addr, sizeof(*addr));
+    if (rc == 0) {
+        return 0;
+    }
+    if (errno != EINPROGRESS) {
+        return -1;
+    }
+
+    if (timeout_ms < 1) {
+        timeout_ms = 1;
+    }
+
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    tv.tv_sec = (time_t)(timeout_ms / 1000);
+    tv.tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000);
+    for (;;) {
+        rc = select(fd + 1, NULL, &wfds, NULL, &tv);
+        if (rc < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+    if (rc <= 0) {
+        if (rc == 0) {
+            errno = ETIMEDOUT;
+        }
+        return -1;
+    }
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &sock_err_len) < 0) {
+        return -1;
+    }
+    if (sock_err != 0) {
+        errno = sock_err;
+        return -1;
+    }
+    return 0;
+}
+
+typedef struct {
+    int fd;
+    int use_tls;
+#ifdef SAMURAI_WITH_OPENSSL
+    SSL *ssl;
+#endif
+    long submitted;
+    long completed;
+    long failed;
+    long rst_stream;
+    long goaway;
+    int transport_error;
+    int protocol_error;
+} H2ConnContext;
+
+typedef struct {
+    long sent;
+    long errors;
+    long goaway_count;
+    long rst_stream_count;
+    int transport_error;
+    int protocol_error;
+    long long handshake_ns;
+} H2ConnResult;
+
+static ssize_t _h2_send_callback(
+    nghttp2_session *session,
+    const uint8_t *data,
+    size_t length,
+    int flags,
+    void *user_data
+) {
+    H2ConnContext *ctx = (H2ConnContext *)user_data;
+    size_t off = 0;
+    (void)session;
+    (void)flags;
+    if (ctx == NULL) {
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    while (off < length) {
+        ssize_t wr = -1;
+        if (ctx->use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+            int tls_wr;
+            if (ctx->ssl == NULL) {
+                ctx->transport_error = 1;
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
+            tls_wr = SSL_write(ctx->ssl, data + off, (int)(length - off));
+            if (tls_wr > 0) {
+                wr = (ssize_t)tls_wr;
+            } else {
+                int err = SSL_get_error(ctx->ssl, tls_wr);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                    errno = EAGAIN;
+                    continue;
+                }
+                ctx->transport_error = 1;
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
+#else
+            ctx->transport_error = 1;
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+#endif
+        } else {
+            wr = send(ctx->fd, data + off, length - off, MSG_NOSIGNAL);
+        }
+        if (wr > 0) {
+            off += (size_t)wr;
+            continue;
+        }
+        if (wr < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        }
+        ctx->transport_error = 1;
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    return (ssize_t)length;
+}
+
+static int _h2_on_frame_recv_callback(
+    nghttp2_session *session,
+    const nghttp2_frame *frame,
+    void *user_data
+) {
+    H2ConnContext *ctx = (H2ConnContext *)user_data;
+    (void)session;
+    if (ctx != NULL && frame != NULL && frame->hd.type == NGHTTP2_GOAWAY) {
+        ctx->goaway += 1;
+    }
+    return 0;
+}
+
+static int _h2_on_stream_close_callback(
+    nghttp2_session *session,
+    int32_t stream_id,
+    uint32_t error_code,
+    void *user_data
+) {
+    H2ConnContext *ctx = (H2ConnContext *)user_data;
+    (void)session;
+    if (ctx == NULL || stream_id <= 0) {
+        return 0;
+    }
+    if (error_code == NGHTTP2_NO_ERROR) {
+        ctx->completed += 1;
+    } else {
+        ctx->failed += 1;
+        ctx->rst_stream += 1;
+    }
+    return 0;
+}
+
+static ssize_t _h2_socket_read(H2ConnContext *ctx, unsigned char *buf, size_t cap) {
+    if (ctx == NULL || buf == NULL || cap == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (ctx->use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+        int rd;
+        if (ctx->ssl == NULL) {
+            errno = EIO;
+            return -1;
+        }
+        rd = SSL_read(ctx->ssl, buf, (int)cap);
+        if (rd > 0) {
+            return (ssize_t)rd;
+        }
+        if (rd == 0) {
+            return 0;
+        }
+        {
+            int err = SSL_get_error(ctx->ssl, rd);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                errno = EAGAIN;
+            } else if (err == SSL_ERROR_ZERO_RETURN) {
+                return 0;
+            } else {
+                errno = EIO;
+            }
+        }
+        return -1;
+#else
+        errno = EIO;
+        return -1;
+#endif
+    }
+    return recv(ctx->fd, buf, cap, 0);
+}
+
+static void _h2_run_connection(
+    const struct sockaddr_in *addr,
+    const char *target_ip,
+    int target_port,
+    const char *scheme,
+    const char *method,
+    const char *path,
+    long request_count,
+    long timeout_ms,
+    int use_tls,
+#ifdef SAMURAI_WITH_OPENSSL
+    SSL_CTX *tls_ctx,
+#endif
+    const char *server_name,
+    H2ConnResult *out
+) {
+    int fd = -1;
+    long long hs_start_ns = 0;
+    long long hs_end_ns = 0;
+    H2ConnContext ctx;
+    nghttp2_session_callbacks *callbacks = NULL;
+    nghttp2_session *session = NULL;
+    unsigned char read_buf[16384];
+    char authority[160];
+    long long deadline_ns = 0;
+
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (request_count <= 0 || addr == NULL || target_ip == NULL) {
+        return;
+    }
+    out->errors = request_count;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fd = -1;
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        out->transport_error = 1;
+        return;
+    }
+    hs_start_ns = monotonic_ns_now();
+    if (_connect_with_timeout(fd, addr, timeout_ms) < 0) {
+        out->transport_error = 1;
+        goto done;
+    }
+    if (_set_blocking_mode(fd, 1) < 0) {
+        out->transport_error = 1;
+        goto done;
+    }
+    if (_set_socket_io_timeout(fd, timeout_ms) < 0) {
+        out->transport_error = 1;
+        goto done;
+    }
+
+    ctx.fd = fd;
+    ctx.use_tls = use_tls ? 1 : 0;
+#ifdef SAMURAI_WITH_OPENSSL
+    ctx.ssl = NULL;
+#endif
+
+    if (ctx.use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+        const unsigned char *alpn = NULL;
+        unsigned int alpn_len = 0;
+        if (tls_ctx == NULL) {
+            out->transport_error = 1;
+            goto done;
+        }
+        ctx.ssl = SSL_new(tls_ctx);
+        if (ctx.ssl == NULL) {
+            out->transport_error = 1;
+            goto done;
+        }
+        if (SSL_set_fd(ctx.ssl, fd) != 1) {
+            out->transport_error = 1;
+            goto done;
+        }
+        if (server_name != NULL && server_name[0] != '\0' && !_is_ipv4_literal(server_name)) {
+            (void)SSL_set_tlsext_host_name(ctx.ssl, server_name);
+        }
+        if (SSL_connect(ctx.ssl) != 1) {
+            out->transport_error = 1;
+            goto done;
+        }
+        SSL_get0_alpn_selected(ctx.ssl, &alpn, &alpn_len);
+        if (alpn_len != 2 || alpn == NULL || memcmp(alpn, "h2", 2) != 0) {
+            out->protocol_error = 1;
+            goto done;
+        }
+#else
+        out->transport_error = 1;
+        goto done;
+#endif
+    }
+
+    hs_end_ns = monotonic_ns_now();
+    if (hs_end_ns > hs_start_ns) {
+        out->handshake_ns = hs_end_ns - hs_start_ns;
+    }
+
+    if (nghttp2_session_callbacks_new(&callbacks) != 0 || callbacks == NULL) {
+        out->protocol_error = 1;
+        goto done;
+    }
+    nghttp2_session_callbacks_set_send_callback(callbacks, _h2_send_callback);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, _h2_on_frame_recv_callback);
+    nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, _h2_on_stream_close_callback);
+    if (nghttp2_session_client_new(&session, callbacks, &ctx) != 0 || session == NULL) {
+        out->protocol_error = 1;
+        goto done;
+    }
+    if (nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, NULL, 0) != 0) {
+        ctx.protocol_error = 1;
+        goto finalize_session;
+    }
+
+    if (snprintf(authority, sizeof(authority), "%s:%d", target_ip, target_port) < 0) {
+        ctx.protocol_error = 1;
+        goto finalize_session;
+    }
+
+    for (long idx = 0; idx < request_count; idx++) {
+        const char *req_method = (method != NULL && method[0] != '\0') ? method : "GET";
+        const char *req_path = (path != NULL && path[0] != '\0') ? path : "/";
+        const char *req_scheme = (scheme != NULL && scheme[0] != '\0') ? scheme : (ctx.use_tls ? "https" : "http");
+        nghttp2_nv hdrs[4];
+        hdrs[0].name = (uint8_t *)":method";
+        hdrs[0].value = (uint8_t *)req_method;
+        hdrs[0].namelen = strlen(":method");
+        hdrs[0].valuelen = strlen(req_method);
+        hdrs[0].flags = NGHTTP2_NV_FLAG_NONE;
+        hdrs[1].name = (uint8_t *)":scheme";
+        hdrs[1].value = (uint8_t *)req_scheme;
+        hdrs[1].namelen = strlen(":scheme");
+        hdrs[1].valuelen = strlen(req_scheme);
+        hdrs[1].flags = NGHTTP2_NV_FLAG_NONE;
+        hdrs[2].name = (uint8_t *)":authority";
+        hdrs[2].value = (uint8_t *)authority;
+        hdrs[2].namelen = strlen(":authority");
+        hdrs[2].valuelen = strlen(authority);
+        hdrs[2].flags = NGHTTP2_NV_FLAG_NONE;
+        hdrs[3].name = (uint8_t *)":path";
+        hdrs[3].value = (uint8_t *)req_path;
+        hdrs[3].namelen = strlen(":path");
+        hdrs[3].valuelen = strlen(req_path);
+        hdrs[3].flags = NGHTTP2_NV_FLAG_NONE;
+        if (nghttp2_submit_request(session, NULL, hdrs, 4, NULL, NULL) < 0) {
+            ctx.protocol_error = 1;
+            break;
+        }
+        ctx.submitted += 1;
+    }
+
+    if (nghttp2_session_send(session) < 0) {
+        if (!ctx.transport_error) {
+            ctx.protocol_error = 1;
+        }
+        goto finalize_session;
+    }
+
+    deadline_ns = monotonic_ns_now() + ((long long)timeout_ms * 1000000LL);
+    while (ctx.completed + ctx.failed < ctx.submitted) {
+        ssize_t rd;
+        int recv_rc;
+        if (monotonic_ns_now() > deadline_ns) {
+            ctx.transport_error = 1;
+            break;
+        }
+        rd = _h2_socket_read(&ctx, read_buf, sizeof(read_buf));
+        if (rd > 0) {
+            recv_rc = nghttp2_session_mem_recv(session, read_buf, (size_t)rd);
+            if (recv_rc < 0) {
+                ctx.protocol_error = 1;
+                break;
+            }
+            if (nghttp2_session_send(session) < 0) {
+                if (!ctx.transport_error) {
+                    ctx.protocol_error = 1;
+                }
+                break;
+            }
+            continue;
+        }
+        if (rd == 0) {
+            break;
+        }
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            continue;
+        }
+        ctx.transport_error = 1;
+        break;
+    }
+
+    if (ctx.submitted < request_count) {
+        ctx.failed += (request_count - ctx.submitted);
+        if (!ctx.protocol_error) {
+            ctx.protocol_error = 1;
+        }
+    }
+    if (ctx.completed + ctx.failed < request_count) {
+        ctx.failed += (request_count - (ctx.completed + ctx.failed));
+        if (!ctx.protocol_error) {
+            ctx.transport_error = 1;
+        }
+    }
+
+finalize_session:
+    out->sent = ctx.completed;
+    if (out->sent < 0) {
+        out->sent = 0;
+    }
+    if (out->sent > request_count) {
+        out->sent = request_count;
+    }
+    out->errors = request_count - out->sent;
+    out->goaway_count = ctx.goaway;
+    out->rst_stream_count = ctx.rst_stream;
+    out->transport_error = ctx.transport_error;
+    out->protocol_error = ctx.protocol_error;
+    if (out->errors > 0 && !out->transport_error && !out->protocol_error) {
+        out->transport_error = 1;
+    }
+
+done:
+    if (session != NULL) {
+        nghttp2_session_del(session);
+    }
+    if (callbacks != NULL) {
+        nghttp2_session_callbacks_del(callbacks);
+    }
+#ifdef SAMURAI_WITH_OPENSSL
+    if (ctx.ssl != NULL) {
+        SSL_shutdown(ctx.ssl);
+        SSL_free(ctx.ssl);
+        ctx.ssl = NULL;
+    }
+#endif
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+#endif
+
 static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
     PyObject *cfg = NULL;
     PyObject *handle_obj = NULL;
     L7Handle *h = NULL;
+    long count = 0;
+    long session_repeats = 1;
     long total_attempts = 0;
+    long target_port = 0;
+    const char *target_ip = "";
+    struct sockaddr_in addr;
     PyObject *result = NULL;
+#ifdef SAMURAI_WITH_NGHTTP2
+    long h2_connections = 1;
+    long h2_streams_per_conn = 100;
+    double timeout_s = 5.0;
+    long timeout_ms = 5000;
+    int verify_tls = 0;
+    int use_tls = 0;
+    const char *scheme = "https";
+    const char *path = "/";
+    const char *server_name = "";
+    char http_method[24];
+    long sent_total = 0;
+    long errors_total = 0;
+    long peak_active = 0;
+    long total_goaway = 0;
+    long total_rst = 0;
+    long connections_used = 0;
+    int saw_transport_error = 0;
+    int saw_protocol_error = 0;
+    long long run_start_ns = 0;
+    long long run_end_ns = 0;
+    double elapsed_s = 0.0;
+    double conn_rate = 0.0;
+    double handshake_p99_ms = 0.0;
+    const char *final_reason = "none";
+    const long sample_cap_hard = 200000;
+    long conn_sample_cap = 0;
+    long sample_count = 0;
+    long long *handshake_samples = NULL;
+    long remaining = 0;
+#ifdef SAMURAI_WITH_OPENSSL
+    SSL_CTX *tls_ctx = NULL;
+    const char *tls_reason = "none";
+    static const unsigned char alpn_h2[] = {2, 'h', '2'};
+#endif
+#endif
 
     (void)self;
 
@@ -2217,10 +2780,78 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
         }
     }
 
-    total_attempts = _dict_long(cfg, "count", 0);
-    if (total_attempts < 0) {
-        total_attempts = 0;
+    if (!PyDict_Check(cfg)) {
+        return _attach_handle_stats(_make_result(0, 0, 0, 0, 0.0, 0.0, "C_STATE_H2", "invalid_config", 0, 0), h);
     }
+
+    count = _dict_long(cfg, "count", 0);
+    session_repeats = _dict_long(cfg, "session_repeats", 1);
+    if (session_repeats < 1) {
+        session_repeats = 1;
+    }
+    if (count <= 0) {
+        return _attach_handle_stats(_make_result(0, 0, 0, 0, 0.0, 0.0, "C_STATE_H2", "none", 0, 0), h);
+    }
+    if (count > LONG_MAX / session_repeats) {
+        return _attach_handle_stats(_make_result(count, 0, count, 0, 0.0, 0.0, "C_STATE_H2", "count_overflow", 0, 0), h);
+    }
+    total_attempts = count * session_repeats;
+
+#ifdef SAMURAI_WITH_NGHTTP2
+    target_ip = _dict_cstr(cfg, "target_ip", "");
+    target_port = _dict_long(cfg, "target_port", 443);
+    scheme = _dict_cstr(cfg, "scheme", "https");
+    path = _dict_cstr(cfg, "http_path", "/");
+    verify_tls = _dict_bool(cfg, "verify", 0);
+    use_tls = _scheme_is_tls(scheme) || verify_tls;
+    server_name = _dict_cstr(cfg, "server_name", target_ip);
+    _copy_upper_ascii(http_method, sizeof(http_method), _dict_cstr(cfg, "http_method", "GET"), "GET");
+
+    timeout_s = _dict_double(cfg, "timeout_s", 5.0);
+    if (timeout_s <= 0.0) {
+        timeout_s = 5.0;
+    }
+    timeout_ms = (long)(timeout_s * 1000.0);
+    if (timeout_ms < 50) {
+        timeout_ms = 50;
+    }
+
+    h2_connections = _dict_long(cfg, "h2_connections", _dict_long(cfg, "http2_connections", _dict_long(cfg, "concurrency", 1)));
+    h2_streams_per_conn = _dict_long(cfg, "h2_streams_per_conn", _dict_long(cfg, "http2_streams_per_conn", 100));
+    if (h2_connections < 1) {
+        h2_connections = 1;
+    }
+    if (h2_streams_per_conn < 1) {
+        h2_streams_per_conn = 1;
+    }
+    if (h2_streams_per_conn > 10000) {
+        h2_streams_per_conn = 10000;
+    }
+    if (h2_connections > total_attempts) {
+        h2_connections = total_attempts;
+    }
+    if (h2_connections < 1) {
+        h2_connections = 1;
+    }
+#else
+    target_ip = _dict_cstr(cfg, "target_ip", "");
+    target_port = _dict_long(cfg, "target_port", 443);
+#endif
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    if (target_ip[0] == '\0') {
+        return _attach_handle_stats(_make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, "C_STATE_H2", "target_ip_missing", 0, 0), h);
+    }
+    if (target_port <= 0 || target_port > 65535) {
+        return _attach_handle_stats(_make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, "C_STATE_H2", "target_port_invalid", 0, 0), h);
+    }
+    addr.sin_port = htons((uint16_t)target_port);
+    if (inet_pton(AF_INET, target_ip, &addr.sin_addr) != 1) {
+        return _attach_handle_stats(_make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, "C_STATE_H2", "target_ip_invalid", 0, 0), h);
+    }
+
+#ifndef SAMURAI_WITH_NGHTTP2
     result = _make_result(
         total_attempts,
         0,
@@ -2233,7 +2864,175 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
         0,
         0
     );
+    if (result != NULL) {
+        if (_set_long(result, "h2_goaway_count", 0) < 0 ||
+            _set_double(result, "h2_stream_reset_ratio", 0.0) < 0) {
+            Py_DECREF(result);
+            result = NULL;
+        }
+    }
     return _attach_handle_stats(result, h);
+#else
+    if (use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+        tls_ctx = _tls_ctx_create_with_alpn(verify_tls ? 1 : 0, alpn_h2, sizeof(alpn_h2), &tls_reason);
+        if (tls_ctx == NULL) {
+            return _attach_handle_stats(_make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, "C_STATE_H2", "h2_transport_error", 0, 0), h);
+        }
+#else
+        return _attach_handle_stats(_make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, "C_STATE_H2", "h2_transport_error", 0, 0), h);
+#endif
+    }
+
+    conn_sample_cap = (total_attempts + h2_streams_per_conn - 1) / h2_streams_per_conn;
+    if (conn_sample_cap > sample_cap_hard) {
+        conn_sample_cap = sample_cap_hard;
+    }
+    if (conn_sample_cap > 0) {
+        handshake_samples = (long long *)PyMem_Calloc((size_t)conn_sample_cap, sizeof(long long));
+        if (handshake_samples == NULL) {
+#ifdef SAMURAI_WITH_OPENSSL
+            if (tls_ctx != NULL) {
+                SSL_CTX_free(tls_ctx);
+                tls_ctx = NULL;
+            }
+#endif
+            return PyErr_NoMemory();
+        }
+    }
+
+    run_start_ns = monotonic_ns_now();
+    remaining = total_attempts;
+    while (remaining > 0) {
+        long need_conn = (remaining + h2_streams_per_conn - 1) / h2_streams_per_conn;
+        long batch_conn = need_conn < h2_connections ? need_conn : h2_connections;
+        if (batch_conn < 1) {
+            batch_conn = 1;
+        }
+        if (batch_conn > peak_active) {
+            peak_active = batch_conn;
+        }
+        for (long i = 0; i < batch_conn && remaining > 0; i++) {
+            long reqs = remaining < h2_streams_per_conn ? remaining : h2_streams_per_conn;
+            H2ConnResult conn_out;
+            memset(&conn_out, 0, sizeof(conn_out));
+            Py_BEGIN_ALLOW_THREADS
+            _h2_run_connection(
+                &addr,
+                target_ip,
+                (int)target_port,
+                scheme,
+                http_method,
+                path,
+                reqs,
+                timeout_ms,
+                use_tls,
+#ifdef SAMURAI_WITH_OPENSSL
+                tls_ctx,
+#endif
+                server_name,
+                &conn_out
+            );
+            Py_END_ALLOW_THREADS
+            connections_used += 1;
+            sent_total += conn_out.sent;
+            total_goaway += conn_out.goaway_count;
+            total_rst += conn_out.rst_stream_count;
+            if (conn_out.transport_error) {
+                saw_transport_error = 1;
+            }
+            if (conn_out.protocol_error) {
+                saw_protocol_error = 1;
+            }
+            if (handshake_samples != NULL &&
+                conn_out.handshake_ns > 0 &&
+                conn_out.sent > 0 &&
+                sample_count < conn_sample_cap) {
+                long copy_count = conn_out.sent;
+                while (copy_count > 0 && sample_count < conn_sample_cap) {
+                    handshake_samples[sample_count] = conn_out.handshake_ns;
+                    sample_count += 1;
+                    copy_count -= 1;
+                }
+            }
+            remaining -= reqs;
+        }
+    }
+
+    if (sent_total > total_attempts) {
+        sent_total = total_attempts;
+    }
+    errors_total = total_attempts - sent_total;
+    if (errors_total < 0) {
+        errors_total = 0;
+    }
+
+    run_end_ns = monotonic_ns_now();
+    if (run_end_ns > run_start_ns) {
+        elapsed_s = (double)(run_end_ns - run_start_ns) / 1e9;
+    }
+    if (elapsed_s > 0.0) {
+        conn_rate = (double)sent_total / elapsed_s;
+    }
+
+    if (sample_count > 0 && handshake_samples != NULL) {
+        long p99_index;
+        qsort(handshake_samples, (size_t)sample_count, sizeof(long long), _cmp_longlong);
+        p99_index = (long)(0.99 * (double)(sample_count - 1));
+        if (p99_index < 0) {
+            p99_index = 0;
+        }
+        if (p99_index >= sample_count) {
+            p99_index = sample_count - 1;
+        }
+        handshake_p99_ms = (double)handshake_samples[p99_index] / 1e6;
+    }
+
+    if (errors_total > 0) {
+        if (saw_protocol_error || total_rst > 0 || total_goaway > 0) {
+            final_reason = "h2_protocol_error";
+        } else if (saw_transport_error) {
+            final_reason = "h2_transport_error";
+        } else {
+            final_reason = "h2_transport_error";
+        }
+    }
+
+    result = _make_result(
+        total_attempts,
+        sent_total,
+        errors_total,
+        peak_active,
+        conn_rate,
+        handshake_p99_ms,
+        "C_STATE_H2",
+        final_reason,
+        0,
+        0
+    );
+    if (result != NULL) {
+        if (_set_long(result, "session_repeats", session_repeats) < 0 ||
+            _set_long(result, "h2_connections_used", connections_used) < 0 ||
+            _set_long(result, "h2_streams_per_conn", h2_streams_per_conn) < 0 ||
+            _set_long(result, "h2_goaway_count", total_goaway) < 0 ||
+            _set_long(result, "h2_stream_resets", total_rst) < 0 ||
+            _set_double(result, "h2_stream_reset_ratio", total_attempts > 0 ? ((double)total_rst / (double)total_attempts) : 0.0) < 0 ||
+            _set_str(result, "scheme", scheme) < 0) {
+            Py_DECREF(result);
+            result = NULL;
+        }
+    }
+
+    PyMem_Free(handshake_samples);
+#ifdef SAMURAI_WITH_OPENSSL
+    if (tls_ctx != NULL) {
+        SSL_CTX_free(tls_ctx);
+        tls_ctx = NULL;
+    }
+    (void)tls_reason;
+#endif
+    return _attach_handle_stats(result, h);
+#endif
 }
 
 static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
@@ -2285,6 +3084,8 @@ static PyMethodDef L7Methods[] = {
     {"close", l7_close, METH_VARARGS, "close(handle)"},
     {"snapshot", l7_snapshot, METH_VARARGS, "snapshot(handle) -> stats"},
     {"tls_supported", l7_tls_supported, METH_NOARGS, "tls_supported() -> bool"},
+    {"h2_supported", l7_h2_supported, METH_NOARGS, "h2_supported() -> bool"},
+    {"quic_supported", l7_quic_supported, METH_NOARGS, "quic_supported() -> bool"},
     {"run_http1_stateful", l7_run_http1_stateful, METH_VARARGS, "run_http1_stateful(config) -> stats"},
     {"run_websocket_stateful", l7_run_websocket_stateful, METH_VARARGS, "run_websocket_stateful(config) -> stats"},
     {"run_http2_stateful", l7_run_http2_stateful, METH_VARARGS, "run_http2_stateful(config) -> stats"},

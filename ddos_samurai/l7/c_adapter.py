@@ -28,12 +28,21 @@ _UNAVAILABLE_PATH = {
 
 def capability_map() -> Dict[str, Any]:
     core = getattr(_adapter, "_l7_core", None)
+    def _has(protocol_runner: str, support_probe: str | None = None) -> bool:
+        if core is None or not hasattr(core, protocol_runner):
+            return False
+        if support_probe and hasattr(core, support_probe):
+            try:
+                return bool(getattr(core, support_probe)())
+            except Exception:
+                return False
+        return True
     return {
         "core_available": bool(core is not None),
-        "http1": bool(core is not None and hasattr(core, "run_http1_stateful")),
-        "ws": bool(core is not None and hasattr(core, "run_websocket_stateful")),
-        "http2": bool(core is not None and hasattr(core, "run_http2_stateful")),
-        "quic": bool(core is not None and hasattr(core, "run_quic_stateful")),
+        "http1": _has("run_http1_stateful"),
+        "ws": _has("run_websocket_stateful"),
+        "http2": _has("run_http2_stateful", "h2_supported"),
+        "quic": _has("run_quic_stateful", "quic_supported"),
     }
 
 
@@ -88,4 +97,3 @@ async def run(protocol: str, config: _adapter.L7EngineConfig) -> _adapter.L7Engi
     if out is None:
         return _unavailable_result(proto, int(config.count or 0))
     return out
-

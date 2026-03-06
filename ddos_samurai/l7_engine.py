@@ -315,6 +315,16 @@ async def run_http2_stateful(config: L7EngineConfig) -> Optional[L7EngineResult]
             sender_fallback_reason="h2_capability_unavailable",
             allow_legacy_fallback=True,
         )
+    if hasattr(_l7_core, "h2_supported") and not bool(_l7_core.h2_supported()):
+        return L7EngineResult(
+            handled=True,
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="C_STATE_H2_UNAVAILABLE",
+            sender_fallback_reason="h2_capability_unavailable",
+            allow_legacy_fallback=True,
+        )
 
     payload = config.as_dict()
     try:
@@ -355,6 +365,16 @@ async def run_quic_stateful(config: L7EngineConfig) -> Optional[L7EngineResult]:
             allow_legacy_fallback=True,
         )
     if not hasattr(_l7_core, "run_quic_stateful"):
+        return L7EngineResult(
+            handled=True,
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="C_STATE_QUIC_UNAVAILABLE",
+            sender_fallback_reason="quic_capability_unavailable",
+            allow_legacy_fallback=True,
+        )
+    if hasattr(_l7_core, "quic_supported") and not bool(_l7_core.quic_supported()):
         return L7EngineResult(
             handled=True,
             attempted=count,
