@@ -457,6 +457,61 @@ class TestStatsAggregateHelpers(unittest.TestCase):
         self.assertAlmostEqual(acc["actual_rps"], 2000.0)
         self.assertAlmostEqual(acc["rate_accuracy_pct"], 96.0)
 
+    def test_add_stats_preserves_l7_protocol_specific_fields(self):
+        acc = orchestrator._empty_stats()
+        acc = orchestrator._add_stats(
+            acc,
+            {
+                "attempted": 4,
+                "sent": 4,
+                "errors": 0,
+                "l7_engine_path_used": "C_STATE_H2",
+                "l7_fallback_reason": "none",
+                "l7_capability_status": "ok",
+                "h2_goaway_count": 2,
+                "h2_stream_resets": 1,
+                "h2_connections_used": 1,
+                "h2_request_plan_used": 1,
+                "h2_request_plan_items": 4,
+                "h2_stream_reset_ratio": 0.25,
+            },
+        )
+        acc = orchestrator._add_stats(
+            acc,
+            {
+                "attempted": 2,
+                "sent": 1,
+                "errors": 1,
+                "l7_engine_path_used": "C_STATE_QUIC",
+                "l7_fallback_reason": "connect_fail",
+                "l7_capability_status": "partial",
+                "quic_connect_fail_count": 1,
+                "quic_connect_timeout_count": 1,
+                "quic_tls_fail_count": 2,
+                "quic_handshake_timeout_count": 1,
+                "quic_stream_fail_count": 3,
+                "quic_stream_fail_ratio": 0.5,
+                "quic_handshake_fail_ratio": 0.3,
+            },
+        )
+
+        self.assertEqual(acc["l7_engine_path_used"], "mixed")
+        self.assertEqual(acc["l7_fallback_reason"], "connect_fail")
+        self.assertEqual(acc["l7_capability_status"], "partial")
+        self.assertEqual(acc["h2_goaway_count"], 2)
+        self.assertEqual(acc["h2_stream_resets"], 1)
+        self.assertEqual(acc["h2_connections_used"], 1)
+        self.assertEqual(acc["h2_request_plan_used"], 1)
+        self.assertEqual(acc["h2_request_plan_items"], 4)
+        self.assertAlmostEqual(float(acc["h2_stream_reset_ratio"]), 0.25, places=6)
+        self.assertEqual(acc["quic_connect_fail_count"], 1)
+        self.assertEqual(acc["quic_connect_timeout_count"], 1)
+        self.assertEqual(acc["quic_tls_fail_count"], 2)
+        self.assertEqual(acc["quic_handshake_timeout_count"], 1)
+        self.assertEqual(acc["quic_stream_fail_count"], 3)
+        self.assertAlmostEqual(float(acc["quic_stream_fail_ratio"]), 0.5, places=6)
+        self.assertAlmostEqual(float(acc["quic_handshake_fail_ratio"]), 0.3, places=6)
+
 
 class TestPacingConfigBuilder(unittest.TestCase):
     def test_build_pacing_config_auto_pin_from_affinity(self):

@@ -442,6 +442,9 @@ class TestReporting(unittest.TestCase):
                     "compute_backend": "cpu",
                     "sender_path": "C_EXT_L3",
                     "sender_fallback_reason": "none",
+                    "l7_engine_path_used": "C_STATE_H2",
+                    "l7_fallback_reason": "none",
+                    "l7_capability_status": "ok",
                     "txring_batch_target": 128,
                     "txring_backoff_ns": 2000,
                     "l7_active_sessions_peak": 50,
@@ -450,6 +453,19 @@ class TestReporting(unittest.TestCase):
                     "l7_step_fail_ratio": 0.01,
                     "session_success_rate": 0.995,
                     "retry_success_rate": 0.91,
+                    "h2_goaway_count": 2,
+                    "h2_stream_resets": 1,
+                    "h2_connections_used": 2,
+                    "h2_request_plan_used": 1,
+                    "h2_request_plan_items": 200,
+                    "h2_stream_reset_ratio": 0.10,
+                    "quic_connect_fail_count": 0,
+                    "quic_connect_timeout_count": 0,
+                    "quic_tls_fail_count": 0,
+                    "quic_handshake_timeout_count": 0,
+                    "quic_stream_fail_count": 0,
+                    "quic_stream_fail_ratio": 0.0,
+                    "quic_handshake_fail_ratio": 0.0,
                     "stats": {"attempted": 200, "sent": 198, "errors": 2, "bytes_sent_est": 19800},
                 },
                 {
@@ -458,6 +474,9 @@ class TestReporting(unittest.TestCase):
                     "compute_backend": "cpu",
                     "sender_path": "PYTHON_SENDMMSG",
                     "sender_fallback_reason": "txring_unavailable",
+                    "l7_engine_path_used": "C_STATE_QUIC",
+                    "l7_fallback_reason": "connect_fail",
+                    "l7_capability_status": "partial",
                     "txring_batch_target": 256,
                     "txring_backoff_ns": 4000,
                     "l7_active_sessions_peak": 60,
@@ -466,6 +485,19 @@ class TestReporting(unittest.TestCase):
                     "l7_step_fail_ratio": 0.03,
                     "session_success_rate": 0.98,
                     "retry_success_rate": 0.85,
+                    "h2_goaway_count": 1,
+                    "h2_stream_resets": 2,
+                    "h2_connections_used": 1,
+                    "h2_request_plan_used": 0,
+                    "h2_request_plan_items": 0,
+                    "h2_stream_reset_ratio": 0.30,
+                    "quic_connect_fail_count": 1,
+                    "quic_connect_timeout_count": 1,
+                    "quic_tls_fail_count": 2,
+                    "quic_handshake_timeout_count": 1,
+                    "quic_stream_fail_count": 4,
+                    "quic_stream_fail_ratio": 0.40,
+                    "quic_handshake_fail_ratio": 0.20,
                     "stats": {"attempted": 100, "sent": 95, "errors": 5, "bytes_sent_est": 9500},
                 },
             ],
@@ -484,6 +516,22 @@ class TestReporting(unittest.TestCase):
         self.assertAlmostEqual(rr.results["l7_handshake_p99_ms"], 50.0, places=4)
         self.assertGreater(rr.results["session_success_rate"], 0.0)
         self.assertGreater(rr.results["retry_success_rate"], 0.0)
+        self.assertEqual(rr.results["l7_engine_path_used"], "mixed")
+        self.assertEqual(rr.results["l7_fallback_reason"], "connect_fail")
+        self.assertEqual(rr.results["l7_capability_status"], "partial")
+        self.assertEqual(rr.results["h2_goaway_count"], 3)
+        self.assertEqual(rr.results["h2_stream_resets"], 3)
+        self.assertEqual(rr.results["h2_connections_used"], 3)
+        self.assertEqual(rr.results["h2_request_plan_used"], 1)
+        self.assertEqual(rr.results["h2_request_plan_items"], 200)
+        self.assertAlmostEqual(rr.results["h2_stream_reset_ratio"], 0.166667, places=6)
+        self.assertEqual(rr.results["quic_connect_fail_count"], 1)
+        self.assertEqual(rr.results["quic_connect_timeout_count"], 1)
+        self.assertEqual(rr.results["quic_tls_fail_count"], 2)
+        self.assertEqual(rr.results["quic_handshake_timeout_count"], 1)
+        self.assertEqual(rr.results["quic_stream_fail_count"], 4)
+        self.assertAlmostEqual(rr.results["quic_stream_fail_ratio"], 0.133333, places=6)
+        self.assertAlmostEqual(rr.results["quic_handshake_fail_ratio"], 0.066667, places=6)
         self.assertEqual(rr.results["kpi_gate_profile"], "off")
         self.assertEqual(rr.results["kpi_gate_status"], "pass")
         self.assertEqual(rr.results["score_eligible"], 1)
