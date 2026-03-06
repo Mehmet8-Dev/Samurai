@@ -116,7 +116,7 @@ class TestL7StateEngineQuic(unittest.TestCase):
             srv.stop()
 
         reason = str(out.get("sender_fallback_reason", ""))
-        if reason == "quic_capability_unavailable":
+        if reason in {"quic_capability_unavailable", "capability_unavailable"}:
             self.assertEqual(int(out.get("sent", -1)), 0)
             self.assertEqual(int(out.get("errors", -1)), 3)
             return
@@ -152,7 +152,7 @@ class TestL7StateEngineQuic(unittest.TestCase):
             srv.stop()
 
         reason = str(out.get("sender_fallback_reason", ""))
-        if reason == "quic_capability_unavailable":
+        if reason in {"quic_capability_unavailable", "capability_unavailable"}:
             self.assertEqual(int(out.get("sent", -1)), 0)
             self.assertEqual(int(out.get("errors", -1)), 1)
             return
@@ -187,7 +187,7 @@ class TestL7StateEngineQuic(unittest.TestCase):
             srv.stop()
 
         reason = str(out.get("sender_fallback_reason", ""))
-        if reason == "quic_capability_unavailable":
+        if reason in {"quic_capability_unavailable", "capability_unavailable"}:
             self.assertEqual(int(out.get("sent", -1)), 0)
             self.assertEqual(int(out.get("errors", -1)), 1)
             return
@@ -222,7 +222,7 @@ class TestL7StateEngineQuic(unittest.TestCase):
             srv.stop()
 
         reason = str(out.get("sender_fallback_reason", ""))
-        if reason == "quic_capability_unavailable":
+        if reason in {"quic_capability_unavailable", "capability_unavailable"}:
             self.assertEqual(int(out.get("sent", -1)), 0)
             self.assertEqual(int(out.get("errors", -1)), 1)
             return

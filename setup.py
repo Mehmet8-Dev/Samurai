@@ -147,10 +147,17 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
             ("SAMURAI_WITH_NGHTTP3", "1"),
         ])
         pkg_names.extend(["ngtcp2", "nghttp3"])
-        if _pkg_config_exists("ngtcp2_crypto_ossl"):
-            pkg_names.append("ngtcp2_crypto_ossl")
-        elif _pkg_config_exists("ngtcp2_crypto_openssl"):
-            pkg_names.append("ngtcp2_crypto_openssl")
+        crypto_pkg = None
+        for candidate in (
+            "ngtcp2_crypto_ossl",
+            "ngtcp2_crypto_openssl",
+            "ngtcp2_crypto_quictls",
+        ):
+            if _pkg_config_exists(candidate):
+                crypto_pkg = candidate
+                break
+        if crypto_pkg:
+            pkg_names.append(crypto_pkg)
         else:
             # Fallback linker names when pkg-config modules are unavailable.
             link_args.extend(["-lngtcp2", "-lnghttp3"])

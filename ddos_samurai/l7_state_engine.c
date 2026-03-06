@@ -26,6 +26,11 @@
 #include <nghttp2/nghttp2.h>
 #endif
 
+#if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
+#include <ngtcp2/ngtcp2.h>
+#include <nghttp3/nghttp3.h>
+#endif
+
 typedef struct {
     long id;
     long runs_total;
@@ -259,6 +264,118 @@ static int _is_ipv4_literal(const char *value) {
     }
     return inet_pton(AF_INET, value, &tmp) == 1;
 }
+
+#if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
+typedef struct {
+    int checked;
+    int available;
+    const char *reason;
+} QuicStackProbeState;
+
+static QuicStackProbeState g_quic_stack_probe = {0, 0, "not_checked"};
+
+static int _quic_stack_probe(const char **reason_out) {
+    const ngtcp2_info *ngtcp2_info_ptr = NULL;
+    const nghttp3_info *nghttp3_info_ptr = NULL;
+    const char *reason = "ok";
+    int available = 0;
+
+    if (g_quic_stack_probe.checked) {
+        if (reason_out != NULL) {
+            *reason_out = g_quic_stack_probe.reason;
+        }
+        return g_quic_stack_probe.available;
+    }
+
+    ngtcp2_info_ptr = ngtcp2_version(0);
+    if (ngtcp2_info_ptr == NULL) {
+        reason = "ngtcp2_version_unavailable";
+        goto done;
+    }
+
+    nghttp3_info_ptr = nghttp3_version(0);
+    if (nghttp3_info_ptr == NULL) {
+        reason = "nghttp3_version_unavailable";
+        goto done;
+    }
+
+    if (!ngtcp2_is_supported_version((uint32_t)0x00000001u)) {
+        reason = "ngtcp2_quic_v1_unsupported";
+        goto done;
+    }
+
+    {
+        ngtcp2_cid dcid;
+        ngtcp2_cid scid;
+        uint8_t dcid_buf[20];
+        uint8_t scid_buf[8];
+        ngtcp2_path_storage path_storage;
+        ngtcp2_settings settings;
+        ngtcp2_transport_params params;
+        ngtcp2_callbacks callbacks;
+        ngtcp2_conn *conn = NULL;
+        nghttp3_settings h3_settings;
+        nghttp3_callbacks h3_callbacks;
+        nghttp3_conn *h3_conn = NULL;
+        int rc = 0;
+        size_t i = 0;
+
+        for (i = 0; i < sizeof(dcid_buf); i++) {
+            dcid_buf[i] = (uint8_t)(0xA0u + (uint8_t)i);
+        }
+        for (i = 0; i < sizeof(scid_buf); i++) {
+            scid_buf[i] = (uint8_t)(0xC0u + (uint8_t)i);
+        }
+        ngtcp2_cid_init(&dcid, dcid_buf, sizeof(dcid_buf));
+        ngtcp2_cid_init(&scid, scid_buf, sizeof(scid_buf));
+        ngtcp2_path_storage_zero(&path_storage);
+        ngtcp2_settings_default(&settings);
+        ngtcp2_transport_params_default(&params);
+        memset(&callbacks, 0, sizeof(callbacks));
+
+        /* Soft-probe constructors to verify ABI compatibility without making it mandatory. */
+        rc = ngtcp2_conn_client_new(
+            &conn,
+            &dcid,
+            &scid,
+            &path_storage.path,
+            (uint32_t)0x00000001u,
+            &callbacks,
+            &settings,
+            &params,
+            NULL,
+            NULL
+        );
+        if (rc == 0 && conn != NULL) {
+            ngtcp2_conn_del(conn);
+            conn = NULL;
+        } else if (strcmp(reason, "ok") == 0) {
+            reason = "ngtcp2_conn_client_new_failed_nonfatal";
+        }
+
+        nghttp3_settings_default(&h3_settings);
+        memset(&h3_callbacks, 0, sizeof(h3_callbacks));
+        rc = nghttp3_conn_client_new(&h3_conn, &h3_callbacks, &h3_settings, NULL, NULL);
+        if (rc == 0 && h3_conn != NULL) {
+            nghttp3_conn_del(h3_conn);
+            h3_conn = NULL;
+        } else if (strcmp(reason, "ok") == 0) {
+            reason = "nghttp3_conn_client_new_failed_nonfatal";
+        }
+    }
+
+    available = 1;
+
+done:
+    g_quic_stack_probe.checked = 1;
+    g_quic_stack_probe.available = available;
+    g_quic_stack_probe.reason = reason;
+    if (reason_out != NULL) {
+        *reason_out = reason;
+    }
+    return available;
+}
+#endif
 
 #ifdef SAMURAI_WITH_OPENSSL
 static int g_ssl_global_init_done = 0;
@@ -2170,7 +2287,10 @@ static PyObject *l7_quic_supported(PyObject *self, PyObject *args) {
     (void)self;
     (void)args;
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
-    Py_RETURN_TRUE;
+    if (_quic_stack_probe(NULL)) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
 #else
     Py_RETURN_FALSE;
 #endif
@@ -3040,7 +3160,9 @@ typedef enum {
     QUIC_ATTEMPT_OK = 0,
     QUIC_ATTEMPT_CONNECT_FAIL = 1,
     QUIC_ATTEMPT_TLS_FAIL = 2,
-    QUIC_ATTEMPT_STREAM_FAIL = 3
+    QUIC_ATTEMPT_STREAM_FAIL = 3,
+    QUIC_ATTEMPT_CONNECT_TIMEOUT = 4,
+    QUIC_ATTEMPT_TLS_TIMEOUT = 5
 } QuicAttemptResult;
 
 static QuicAttemptResult _quic_udp_attempt(
@@ -3074,7 +3196,11 @@ static QuicAttemptResult _quic_udp_attempt(
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     if (connect(fd, (const struct sockaddr *)addr, sizeof(*addr)) < 0) {
+        int err = errno;
         close(fd);
+        if (err == ETIMEDOUT) {
+            return QUIC_ATTEMPT_CONNECT_TIMEOUT;
+        }
         return QUIC_ATTEMPT_CONNECT_FAIL;
     }
 
@@ -3089,13 +3215,21 @@ static QuicAttemptResult _quic_udp_attempt(
         return QUIC_ATTEMPT_STREAM_FAIL;
     }
     if (send(fd, tx_buf, strlen(tx_buf), MSG_NOSIGNAL) <= 0) {
+        int err = errno;
         close(fd);
+        if (err == ETIMEDOUT || err == EAGAIN || err == EWOULDBLOCK) {
+            return QUIC_ATTEMPT_CONNECT_TIMEOUT;
+        }
         return QUIC_ATTEMPT_CONNECT_FAIL;
     }
 
     n = recv(fd, rx_buf, sizeof(rx_buf) - 1, 0);
     if (n <= 0) {
+        int err = errno;
         close(fd);
+        if (err == ETIMEDOUT || err == EAGAIN || err == EWOULDBLOCK) {
+            return QUIC_ATTEMPT_TLS_TIMEOUT;
+        }
         return QUIC_ATTEMPT_TLS_FAIL;
     }
     rx_buf[n] = '\0';
@@ -3109,7 +3243,11 @@ static QuicAttemptResult _quic_udp_attempt(
         return QUIC_ATTEMPT_STREAM_FAIL;
     }
     if (send(fd, tx_buf, strlen(tx_buf), MSG_NOSIGNAL) <= 0) {
+        int err = errno;
         close(fd);
+        if (err == ETIMEDOUT || err == EAGAIN || err == EWOULDBLOCK) {
+            return QUIC_ATTEMPT_TLS_TIMEOUT;
+        }
         return QUIC_ATTEMPT_STREAM_FAIL;
     }
 
@@ -3147,7 +3285,9 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
     long errors_total = 0;
     long peak_active = 0;
     long connect_fail_count = 0;
+    long connect_timeout_count = 0;
     long tls_fail_count = 0;
+    long tls_timeout_count = 0;
     long stream_fail_count = 0;
     long retry_attempts = 0;
     long retry_successes = 0;
@@ -3162,6 +3302,7 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
     const char *path = "/";
     char method[24];
     const char *final_reason = "none";
+    const char *stack_probe_reason = "not_checked";
 #endif
 
     (void)self;
@@ -3236,6 +3377,30 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
     }
     return _attach_handle_stats(result, h);
 #else
+    if (!_quic_stack_probe(&stack_probe_reason)) {
+        result = _make_result(
+            total_attempts,
+            0,
+            total_attempts,
+            0,
+            0.0,
+            0.0,
+            "C_STATE_QUIC",
+            "capability_unavailable",
+            0,
+            0
+        );
+        if (result != NULL) {
+            if (_set_double(result, "quic_stream_fail_ratio", 1.0) < 0 ||
+                _set_double(result, "quic_handshake_fail_ratio", 0.0) < 0 ||
+                _set_str(result, "quic_stack_probe_reason", stack_probe_reason) < 0) {
+                Py_DECREF(result);
+                result = NULL;
+            }
+        }
+        return _attach_handle_stats(result, h);
+    }
+
     concurrency = _dict_long(cfg, "concurrency", 1);
     retries = _dict_long(cfg, "retries", 0);
     timeout_s = _dict_double(cfg, "timeout_s", 3.0);
@@ -3289,10 +3454,16 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
             last_fail = rc;
         }
         if (!ok) {
-            if (last_fail == QUIC_ATTEMPT_CONNECT_FAIL) {
+            if (last_fail == QUIC_ATTEMPT_CONNECT_FAIL || last_fail == QUIC_ATTEMPT_CONNECT_TIMEOUT) {
                 connect_fail_count += 1;
-            } else if (last_fail == QUIC_ATTEMPT_TLS_FAIL) {
+                if (last_fail == QUIC_ATTEMPT_CONNECT_TIMEOUT) {
+                    connect_timeout_count += 1;
+                }
+            } else if (last_fail == QUIC_ATTEMPT_TLS_FAIL || last_fail == QUIC_ATTEMPT_TLS_TIMEOUT) {
                 tls_fail_count += 1;
+                if (last_fail == QUIC_ATTEMPT_TLS_TIMEOUT) {
+                    tls_timeout_count += 1;
+                }
             } else {
                 stream_fail_count += 1;
             }
@@ -3338,11 +3509,14 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         if (_set_long(result, "session_repeats", session_repeats) < 0 ||
             _set_long(result, "retry_budget", retries) < 0 ||
             _set_long(result, "quic_connect_fail_count", connect_fail_count) < 0 ||
+            _set_long(result, "quic_connect_timeout_count", connect_timeout_count) < 0 ||
             _set_long(result, "quic_tls_fail_count", tls_fail_count) < 0 ||
+            _set_long(result, "quic_handshake_timeout_count", tls_timeout_count) < 0 ||
             _set_long(result, "quic_stream_fail_count", stream_fail_count) < 0 ||
             _set_double(result, "quic_stream_fail_ratio", total_attempts > 0 ? ((double)stream_fail_count / (double)total_attempts) : 0.0) < 0 ||
             _set_double(result, "quic_handshake_fail_ratio", total_attempts > 0 ? ((double)tls_fail_count / (double)total_attempts) : 0.0) < 0 ||
-            _set_str(result, "scheme", scheme) < 0) {
+            _set_str(result, "scheme", scheme) < 0 ||
+            _set_str(result, "quic_stack_probe_reason", stack_probe_reason) < 0) {
             Py_DECREF(result);
             result = NULL;
         }
