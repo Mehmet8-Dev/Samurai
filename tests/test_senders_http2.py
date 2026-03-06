@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from ddos_samurai import senders
+from ddos_samurai.l7.types import L7RouteDecision
 
 
 class _FakeResponse:
@@ -45,6 +46,23 @@ class _FakeHttpx:
     ReadError = RuntimeError
     RemoteProtocolError = RuntimeError
     ConnectError = RuntimeError
+
+
+class _FakeCResult:
+    sent = 2
+    allow_legacy_fallback = False
+    sender_fallback_reason = "none"
+
+    def as_stats(self):
+        return {
+            "attempted": 2,
+            "sent": 2,
+            "errors": 0,
+            "sender_path": "C_STATE_H2",
+            "sender_fallback_reason": "none",
+            "h2_stream_reset_ratio": 0.0,
+            "h2_goaway_count": 0,
+        }
 
 
 class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
@@ -256,3 +274,51 @@ class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["errors"], 1)
         self.assertEqual(out["h2_transport"], "hyper-h2")
         self.assertEqual(len(_FakeAsyncClient.init_kwargs), 0)
+
+    async def test_http2_sender_c_state_forwards_request_plan_to_core(self):
+        request_plan = SimpleNamespace(
+            items=[
+                SimpleNamespace(method="POST", path="/submit", user_agent="Plan-UA-1"),
+                SimpleNamespace(method="GET", path="/health", user_agent="Plan-UA-2"),
+            ]
+        )
+        route = L7RouteDecision(
+            protocol="http2",
+            engine="c_state",
+            fallback_policy="allow",
+            capability_strict=False,
+            allow_python_fallback=True,
+            legacy_path_enable=True,
+            l7_engine_path_used="C_STATE_H2",
+        )
+        mock_run = AsyncMock(return_value=_FakeCResult())
+        with patch.object(senders.l7_dispatch, "build_route_decision", return_value=route), \
+             patch.object(senders.l7_c_adapter, "run", mock_run):
+            out = await senders.http2_sender(
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=99,
+                concurrency=4,
+                http_path="/fallback",
+                http_method="PUT",
+                verbose=False,
+                scheme="https",
+                user_agent=None,
+                l7_http2_engine="c_state",
+                request_plan=request_plan,
+            )
+
+        mock_run.assert_awaited_once()
+        _call_args, call_kwargs = mock_run.call_args
+        self.assertEqual(_call_args[0], "http2")
+        cfg = _call_args[1]
+        self.assertEqual(cfg.count, 2)
+        self.assertEqual(cfg.extra["http_method"], "PUT")
+        self.assertEqual(cfg.extra["http_path"], "/fallback")
+        self.assertEqual(cfg.extra["h2_request_plan_count"], 2)
+        self.assertEqual(cfg.extra["h2_request_plan_methods"], ["POST", "GET"])
+        self.assertEqual(cfg.extra["h2_request_plan_paths"], ["/submit", "/health"])
+        self.assertEqual(cfg.extra["h2_request_plan_user_agents"], ["Plan-UA-1", "Plan-UA-2"])
+        self.assertEqual(out["attempted"], 2)
+        self.assertEqual(out["sent"], 2)
+        self.assertEqual(out["errors"], 0)

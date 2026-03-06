@@ -31,22 +31,25 @@ class _FakeQuicUdpServer:
 
     def stop(self):
         self._stop.set()
-        if self._sock is not None:
+        sock = self._sock
+        thread = self._thread
+        self._sock = None
+        self._thread = None
+        if sock is not None:
             try:
-                self._sock.close()
+                sock.close()
             except OSError:
                 pass
-            self._sock = None
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+        if thread is not None:
+            thread.join(timeout=2.0)
 
     def _serve(self):
-        if self._sock is None:
+        sock = self._sock
+        if sock is None:
             return
         while not self._stop.is_set():
             try:
-                data, addr = self._sock.recvfrom(4096)
+                data, addr = sock.recvfrom(4096)
             except socket.timeout:
                 continue
             except OSError:
@@ -60,7 +63,7 @@ class _FakeQuicUdpServer:
                 else:
                     reply = b"QHS-OK"
                 try:
-                    self._sock.sendto(reply, addr)
+                    sock.sendto(reply, addr)
                 except OSError:
                     return
                 continue
@@ -76,7 +79,7 @@ class _FakeQuicUdpServer:
                             self.stream_fail_once_budget -= 1
                             continue
                 try:
-                    self._sock.sendto(b"QST-OK", addr)
+                    sock.sendto(b"QST-OK", addr)
                 except OSError:
                     return
 

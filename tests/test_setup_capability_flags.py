@@ -63,3 +63,18 @@ class TestSetupCapabilityFlags(unittest.TestCase):
         self.assertFalse(caps["openssl"])
         self.assertTrue(caps["nghttp2"])
         self.assertTrue(caps["quic"])
+
+    def test_detect_l7_capabilities_accepts_lib_prefixed_pkg_names(self):
+        setup_mod = _load_setup_module()
+        with patch.object(
+            setup_mod,
+            "_pkg_config_exists",
+            side_effect=lambda name: name in {"libnghttp2", "libngtcp2", "libnghttp3"},
+        ), \
+             patch.object(setup_mod.ctypes.util, "find_library", side_effect=lambda name: "libok" if name in {"ssl", "crypto"} else None), \
+             patch.object(setup_mod.os.path, "exists", return_value=True), \
+             patch.dict(os.environ, {}, clear=False):
+            caps = setup_mod.detect_l7_capabilities()
+        self.assertTrue(caps["openssl"])
+        self.assertTrue(caps["nghttp2"])
+        self.assertTrue(caps["quic"])

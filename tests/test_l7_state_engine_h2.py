@@ -23,6 +23,7 @@ class _H2CServer:
         self.expected_requests = max(1, int(expected_requests))
         self.handled_requests = 0
         self.validation_failures = 0
+        self.received_requests = []
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._sock = None
@@ -94,6 +95,11 @@ class _H2CServer:
 
                     for event in events:
                         if isinstance(event, RequestReceived):
+                            headers = dict(event.headers or [])
+                            method = str(headers.get(":method", "") or "")
+                            path = str(headers.get(":path", "") or "")
+                            with self._lock:
+                                self.received_requests.append((method, path))
                             stream_id = int(event.stream_id)
                             h2_conn.send_headers(
                                 stream_id,
@@ -255,6 +261,52 @@ class TestL7StateEngineHTTP2(unittest.TestCase):
         self.assertEqual(int(out.get("sent", -1)), 0, msg=f"unexpected h2 protocol result: {out}")
         self.assertEqual(int(out.get("errors", -1)), 1, msg=f"unexpected h2 protocol result: {out}")
         self.assertEqual(reason, "h2_protocol_error", msg=f"unexpected h2 protocol result: {out}")
+
+    def test_http2_stateful_consumes_request_plan_or_capability_unavailable(self):
+        if not H2_AVAILABLE:
+            self.skipTest("python-h2 dependency unavailable in test environment")
+
+        srv = _H2CServer(expected_requests=3)
+        srv.start()
+        handle = l7_core.open({})
+        try:
+            out = l7_core.run_http2_stateful(
+                handle,
+                {
+                    "target_ip": "127.0.0.1",
+                    "target_port": int(srv.port),
+                    "count": 3,
+                    "concurrency": 2,
+                    "h2_connections": 1,
+                    "h2_streams_per_conn": 3,
+                    "scheme": "http",
+                    "http_method": "GET",
+                    "http_path": "/default",
+                    "h2_request_plan_count": 3,
+                    "h2_request_plan_methods": ["POST", "GET", "DELETE"],
+                    "h2_request_plan_paths": ["/submit", "/health", "/cleanup"],
+                    "timeout_s": 2.0,
+                },
+            )
+        finally:
+            l7_core.close(handle)
+            srv.stop()
+
+        reason = str(out.get("sender_fallback_reason", ""))
+        if reason == "h2_capability_unavailable":
+            self.assertEqual(int(out.get("sent", -1)), 0)
+            self.assertEqual(int(out.get("errors", -1)), 3)
+            return
+
+        self.assertEqual(reason, "none", msg=f"unexpected h2 plan result: {out}")
+        self.assertEqual(int(out.get("sent", -1)), 3, msg=f"unexpected h2 plan result: {out}")
+        self.assertEqual(int(out.get("errors", -1)), 0, msg=f"unexpected h2 plan result: {out}")
+        self.assertEqual(int(out.get("h2_request_plan_used", 0)), 1)
+        self.assertEqual(int(out.get("h2_request_plan_items", 0)), 3)
+        self.assertEqual(
+            srv.received_requests,
+            [("POST", "/submit"), ("GET", "/health"), ("DELETE", "/cleanup")],
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
