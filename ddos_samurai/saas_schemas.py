@@ -106,6 +106,7 @@ class TestStartRequest(BaseModel):
     user_agent: str = "chrome_120"
     ja3_profile: str = "none"
     h2_profile: str = "none"
+    l7_quic_require_native: bool = False
     ninja_mode: bool = False
 
     anomaly_types: list[int] = []

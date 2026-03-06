@@ -372,6 +372,8 @@ def _build_test_command(payload: TestStartRequest) -> list[str]:
     if payload.attack_vector == "http2":
         h2_profile = payload.h2_profile if payload.h2_profile and payload.h2_profile != "none" else payload.user_agent
         cmd.extend(["--h2-profile", h2_profile])
+    if bool(getattr(payload, "l7_quic_require_native", False)):
+        cmd.append("--l7-quic-require-native")
 
     if payload.ninja_mode:
         cmd.append("--ninja-mode")
