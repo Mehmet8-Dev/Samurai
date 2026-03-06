@@ -35,6 +35,27 @@ class _FakeL7Core:
         }
 
 
+class _FakeNativeQuicCore(_FakeL7Core):
+    def quic_supported(self):
+        return True
+
+    def quic_stack_mode(self):
+        return "h3_stateful"
+
+    def run_quic_stateful(self, _handle, payload=None):
+        if payload is None:
+            payload = _handle
+        count = int((payload or {}).get("count", 0) or 0)
+        return {
+            "attempted": count,
+            "sent": 0,
+            "errors": count,
+            "sender_path": "C_STATE_QUIC",
+            "sender_fallback_reason": "h3_stateful_not_implemented",
+            "quic_stack_mode": "h3_stateful",
+        }
+
+
 class TestL7EngineAdapter(unittest.IsolatedAsyncioTestCase):
     async def test_core_handle_is_reused_and_snapshot_is_attached(self):
         fake_core = _FakeL7Core()
@@ -141,3 +162,55 @@ class TestL7EngineAdapter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quic_out.sender_fallback_reason, "none")
         self.assertEqual(quic_out.sent, 2)
         self.assertFalse(quic_out.allow_legacy_fallback)
+
+    async def test_quic_require_native_fails_when_native_unavailable(self):
+        fake_core = _FakeL7Core()
+        with patch.object(l7_engine, "_l7_core", fake_core), patch.object(l7_engine, "_CORE_HANDLE", None):
+            cfg_quic = l7_engine.L7EngineConfig(
+                engine="c_state",
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=2,
+                concurrency=1,
+                mode="quic_stateful",
+                extra={"require_native_quic": 1, "enable_quic_py_bridge": 1},
+            )
+            quic_out = await l7_engine.run_quic_stateful(cfg_quic)
+
+        self.assertIsNotNone(quic_out)
+        self.assertEqual(quic_out.sender_path, "C_STATE_QUIC_NATIVE_REQUIRED")
+        self.assertEqual(quic_out.sent, 0)
+        self.assertFalse(quic_out.allow_legacy_fallback)
+
+    async def test_quic_native_recoverable_result_falls_back_to_bridge(self):
+        fake_core = _FakeNativeQuicCore()
+        with patch.object(l7_engine, "_l7_core", fake_core), patch.object(l7_engine, "_CORE_HANDLE", None), patch.object(
+            l7_engine.quic_h3_bridge, "supported", return_value=True
+        ), patch.object(
+            l7_engine.quic_h3_bridge,
+            "run_stateful",
+            new=AsyncMock(
+                return_value={
+                    "attempted": 2,
+                    "sent": 2,
+                    "errors": 0,
+                    "sender_path": "C_STATE_QUIC_H3PY",
+                    "sender_fallback_reason": "none",
+                    "quic_stack_mode": "h3_stateful_py",
+                }
+            ),
+        ):
+            cfg_quic = l7_engine.L7EngineConfig(
+                engine="c_state",
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=2,
+                concurrency=1,
+                mode="quic_stateful",
+                extra={"enable_quic_py_bridge": 1},
+            )
+            quic_out = await l7_engine.run_quic_stateful(cfg_quic)
+
+        self.assertIsNotNone(quic_out)
+        self.assertEqual(quic_out.sender_path, "C_STATE_QUIC_H3PY")
+        self.assertEqual(quic_out.sent, 2)

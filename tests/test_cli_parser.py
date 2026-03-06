@@ -101,6 +101,7 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--l7-engine", opts)
         self.assertIn("--l7-http2-engine", opts)
         self.assertIn("--l7-quic-engine", opts)
+        self.assertIn("--l7-quic-require-native", opts)
         self.assertIn("--l7-fallback-policy", opts)
         self.assertIn("--l7-capability-strict", opts)
         self.assertIn("--legacy-path-enable", opts)
@@ -126,6 +127,7 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.l7_engine, "python")
         self.assertEqual(args.l7_http2_engine, "auto")
         self.assertEqual(args.l7_quic_engine, "auto")
+        self.assertFalse(args.l7_quic_require_native)
         self.assertEqual(args.l7_fallback_policy, "allow")
         self.assertFalse(args.l7_capability_strict)
         self.assertFalse(args.legacy_path_enable)
@@ -296,6 +298,18 @@ class TestSenderRouteValidation(unittest.TestCase):
         args = parser.parse_args(["--kpi-hard-fail"])
         self._assert_validation_fails(parser, args)
 
+    def test_l7_quic_require_native_requires_capability_strict(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--l7-quic-require-native"])
+        self._assert_validation_fails(parser, args)
+
+    def test_l7_quic_require_native_rejects_python_engine(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            ["--l7-quic-require-native", "--l7-capability-strict", "--l7-quic-engine", "python"]
+        )
+        self._assert_validation_fails(parser, args)
+
     def test_sender_route_accepts_explicit_xdp_config(self):
         parser = cli.build_parser()
         args = parser.parse_args(
@@ -383,6 +397,58 @@ class TestL7CapabilityPreflight(unittest.TestCase):
                 "http2": True,
                 "quic": True,
                 "quic_stack_mode": "h3_stateful_py",
+                "quic_h3_stateful": True,
+            },
+        ):
+            cli._preflight_l7_capabilities(parser, args)
+
+    def test_capability_strict_quic_require_native_rejects_h3_stateful_py_mode(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--attack-vector",
+                "quic",
+                "--l7-capability-strict",
+                "--l7-quic-engine",
+                "c_state",
+                "--l7-quic-require-native",
+            ]
+        )
+        with patch(
+            "ddos_samurai.l7.c_adapter.capability_map",
+            return_value={
+                "core_available": True,
+                "http1": True,
+                "ws": True,
+                "http2": True,
+                "quic": True,
+                "quic_stack_mode": "h3_stateful_py",
+                "quic_h3_stateful": True,
+            },
+        ):
+            self._assert_preflight_fails(parser, args)
+
+    def test_capability_strict_quic_require_native_accepts_native_mode(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--attack-vector",
+                "quic",
+                "--l7-capability-strict",
+                "--l7-quic-engine",
+                "c_state",
+                "--l7-quic-require-native",
+            ]
+        )
+        with patch(
+            "ddos_samurai.l7.c_adapter.capability_map",
+            return_value={
+                "core_available": True,
+                "http1": True,
+                "ws": True,
+                "http2": True,
+                "quic": True,
+                "quic_stack_mode": "h3_stateful",
                 "quic_h3_stateful": True,
             },
         ):
@@ -487,3 +553,16 @@ class TestBuildTestCommandRegression(unittest.TestCase):
         tls_val = cmd[idx + 1]
         self.assertEqual(tls_val, "chrome_120",
                          "Should fallback to user_agent when ja3_profile is 'none'")
+
+    def test_quic_require_native_flag_is_forwarded(self):
+        from ddos_samurai.saas_schemas import TestStartRequest
+        from ddos_samurai.api import _build_test_command
+
+        payload = TestStartRequest(
+            target="127.0.0.1",
+            port=443,
+            attack_vector="quic",
+            l7_quic_require_native=True,
+        )
+        cmd = _build_test_command(payload)
+        self.assertIn("--l7-quic-require-native", cmd)
