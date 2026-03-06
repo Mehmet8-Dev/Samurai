@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
 
-from .l7 import quic_h3_bridge
+from .l7 import quic_h3_bridge, quic_mode
 
 log = logging.getLogger(__name__)
 
@@ -102,23 +102,24 @@ def quic_py_bridge_supported() -> bool:
 def _quic_core_native_status() -> tuple[bool, str]:
     if _l7_core is None or not hasattr(_l7_core, "run_quic_stateful"):
         return False, "unavailable"
-    mode = "unknown"
+    mode = "unavailable"
     if hasattr(_l7_core, "quic_stack_mode"):
         try:
-            mode = str(_l7_core.quic_stack_mode() or "unavailable")
+            mode = quic_mode.normalize(_l7_core.quic_stack_mode())
         except Exception:
-            mode = "unknown"
-    supported = str(mode).startswith("h3_stateful")
+            mode = "unavailable"
+    supported_native = quic_mode.is_native_h3_stateful(mode)
     if hasattr(_l7_core, "quic_supported"):
         try:
-            supported = bool(_l7_core.quic_supported())
+            core_supported = bool(_l7_core.quic_supported())
         except Exception:
-            pass
-    if supported and mode == "unknown":
-        mode = "h3_stateful"
-    if not supported and mode == "unknown":
-        mode = "unavailable"
-    return bool(supported), str(mode)
+            core_supported = False
+        # Backward compatibility for older cores that expose quic_supported()
+        # without a stack-mode contract.
+        if core_supported and mode == "unavailable":
+            mode = "h3_stateful"
+            supported_native = True
+    return bool(supported_native), str(mode)
 
 
 def _normalize_engine(name: str | None) -> str:

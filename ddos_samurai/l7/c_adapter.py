@@ -4,7 +4,7 @@ import os
 from typing import Any, Dict
 
 from .. import l7_engine as _adapter
-from . import quic_h3_bridge
+from . import quic_h3_bridge, quic_mode
 
 _FN_BY_PROTOCOL = {
     "http1": "run_http1_stateful",
@@ -46,24 +46,30 @@ def capability_map() -> Dict[str, Any]:
                 return False
         return True
 
-    quic_mode = "unavailable"
-    quic_mode_core = "unavailable"
+    mode_effective = "unavailable"
+    mode_core = "unavailable"
     if core is not None and hasattr(core, "quic_stack_mode"):
         try:
-            quic_mode_core = str(getattr(core, "quic_stack_mode")() or "unavailable")
-            quic_mode = str(quic_mode_core)
+            mode_core = quic_mode.normalize(getattr(core, "quic_stack_mode")())
+            mode_effective = str(mode_core)
         except Exception:
-            quic_mode = "unavailable"
-            quic_mode_core = "unavailable"
+            mode_effective = "unavailable"
+            mode_core = "unavailable"
+    quic_probe_reason = "unknown"
+    if core is not None and hasattr(core, "quic_stack_probe_reason"):
+        try:
+            quic_probe_reason = str(getattr(core, "quic_stack_probe_reason")() or "unknown")
+        except Exception:
+            quic_probe_reason = "unknown"
 
-    bridge_mode = str(quic_h3_bridge.stack_mode() or "unavailable")
-    if not str(quic_mode).startswith("h3_stateful") and str(bridge_mode).startswith("h3_stateful"):
-        quic_mode = bridge_mode
+    bridge_mode = quic_mode.normalize(quic_h3_bridge.stack_mode())
+    if not quic_mode.is_h3_stateful(mode_effective) and quic_mode.is_h3_stateful(bridge_mode):
+        mode_effective = bridge_mode
 
     quic_supported = _has("run_quic_stateful", "quic_supported")
-    quic_native_h3_stateful = str(quic_mode_core).startswith("h3_stateful")
-    quic_bridge_h3_stateful = str(bridge_mode).startswith("h3_stateful")
-    quic_h3_stateful = str(quic_mode).startswith("h3_stateful")
+    quic_native_h3_stateful = quic_mode.is_native_h3_stateful(mode_core)
+    quic_bridge_h3_stateful = quic_mode.is_bridge_h3_stateful(bridge_mode)
+    quic_h3_stateful = quic_mode.is_h3_stateful(mode_effective)
     if quic_native_h3_stateful or quic_bridge_h3_stateful:
         quic_supported = True
 
@@ -79,9 +85,10 @@ def capability_map() -> Dict[str, Any]:
         "ws": _has("run_websocket_stateful"),
         "http2": _has("run_http2_stateful", "h2_supported"),
         "quic": bool(quic_supported),
-        "quic_stack_mode": quic_mode,
+        "quic_stack_mode": mode_effective,
         "quic_h3_stateful": bool(quic_h3_stateful),
-        "quic_core_stack_mode": str(quic_mode_core),
+        "quic_core_stack_mode": str(mode_core),
+        "quic_stack_probe_reason": str(quic_probe_reason),
         "quic_bridge_stack_mode": str(bridge_mode),
         "quic_native_h3_stateful": bool(quic_native_h3_stateful),
         "quic_bridge_h3_stateful": bool(quic_bridge_h3_stateful),

@@ -551,6 +551,7 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
     try:
         from .l7 import c_adapter as _l7_c_adapter
         from .l7 import dispatch as _l7_dispatch
+        from .l7 import quic_mode as _l7_quic_mode
         from .l7.types import L7RouteRequest
     except Exception as exc:
         parser.error(f"Hata: L7 capability preflight başlatılamadı: {exc}")
@@ -584,13 +585,14 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
             return
         if bool(caps.get(str(protocol), False)):
             if str(protocol) == "quic":
-                mode = str(caps.get("quic_stack_mode", "unknown") or "unknown")
-                if quic_require_native and str(mode) != "h3_stateful":
+                mode = _l7_quic_mode.normalize(caps.get("quic_stack_mode", "unavailable"))
+                if quic_require_native and not _l7_quic_mode.is_native_h3_stateful(mode):
+                    probe_reason = str(caps.get("quic_stack_probe_reason", "unknown") or "unknown")
                     parser.error(
                         "Hata: --l7-quic-require-native aktifken QUIC mode native h3_stateful olmalıdır. "
-                        f"mevcut_quic_mode={mode}"
+                        f"mevcut_quic_mode={mode} probe_reason={probe_reason}"
                     )
-                if not bool(caps.get("quic_h3_stateful", False)):
+                if not _l7_quic_mode.is_h3_stateful(mode):
                     parser.error(
                         "Hata: L7 capability strict aktifken C QUIC engine yalnızca tam H3 stateful modda kabul edilir. "
                         f"mevcut_quic_mode={mode}"

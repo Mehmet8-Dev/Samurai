@@ -78,3 +78,18 @@ class TestSetupCapabilityFlags(unittest.TestCase):
         self.assertTrue(caps["openssl"])
         self.assertTrue(caps["nghttp2"])
         self.assertTrue(caps["quic"])
+
+    def test_detect_l7_capabilities_fallbacks_without_pkg_config(self):
+        setup_mod = _load_setup_module()
+        with patch.object(setup_mod, "_pkg_config_exists", return_value=False), \
+             patch.object(
+                 setup_mod.ctypes.util,
+                 "find_library",
+                 side_effect=lambda name: "libok" if name in {"ssl", "crypto", "nghttp2", "ngtcp2", "nghttp3"} else None,
+             ), \
+             patch.object(setup_mod.os.path, "exists", return_value=True), \
+             patch.dict(os.environ, {}, clear=False):
+            caps = setup_mod.detect_l7_capabilities()
+        self.assertTrue(caps["openssl"])
+        self.assertTrue(caps["nghttp2"])
+        self.assertTrue(caps["quic"])

@@ -2377,6 +2377,18 @@ static PyObject *l7_quic_stack_mode(PyObject *self, PyObject *args) {
 #endif
 }
 
+static PyObject *l7_quic_stack_probe_reason(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+#if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
+    const char *reason = "unknown";
+    (void)_quic_stack_probe(&reason, NULL);
+    return PyUnicode_FromString(reason != NULL ? reason : "unknown");
+#else
+    return PyUnicode_FromString("quic_build_disabled");
+#endif
+}
+
 static PyObject *l7_run_http1_stateful(PyObject *self, PyObject *args) {
     PyObject *cfg = NULL;
     PyObject *handle_obj = NULL;
@@ -3518,6 +3530,7 @@ static PyMethodDef L7Methods[] = {
     {"h2_supported", l7_h2_supported, METH_NOARGS, "h2_supported() -> bool"},
     {"quic_supported", l7_quic_supported, METH_NOARGS, "quic_supported() -> bool"},
     {"quic_stack_mode", l7_quic_stack_mode, METH_NOARGS, "quic_stack_mode() -> str"},
+    {"quic_stack_probe_reason", l7_quic_stack_probe_reason, METH_NOARGS, "quic_stack_probe_reason() -> str"},
     {"run_http1_stateful", l7_run_http1_stateful, METH_VARARGS, "run_http1_stateful(config) -> stats"},
     {"run_websocket_stateful", l7_run_websocket_stateful, METH_VARARGS, "run_websocket_stateful(config) -> stats"},
     {"run_http2_stateful", l7_run_http2_stateful, METH_VARARGS, "run_http2_stateful(config) -> stats"},

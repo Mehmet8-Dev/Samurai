@@ -27,6 +27,9 @@ class _CoreWithProbes:
     def quic_stack_mode(self):
         return "h3_stateful"
 
+    def quic_stack_probe_reason(self):
+        return "h3_stateful_not_implemented"
+
 
 class _CoreProbeRaises(_CoreWithProbes):
     def h2_supported(self):
@@ -50,6 +53,7 @@ class TestL7CAdapter(unittest.TestCase):
         self.assertTrue(caps["quic"])
         self.assertEqual(caps.get("quic_stack_mode"), "h3_stateful")
         self.assertTrue(bool(caps.get("quic_h3_stateful", False)))
+        self.assertEqual(caps.get("quic_stack_probe_reason"), "h3_stateful_not_implemented")
         self.assertEqual(caps.get("quic_effective_path"), "c_native")
         self.assertTrue(bool(caps.get("quic_native_h3_stateful", False)))
         self.assertFalse(bool(caps.get("quic_bridge_h3_stateful", True)))

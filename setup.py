@@ -44,6 +44,17 @@ def _pkg_config_first(candidates: List[str]) -> str:
     return ""
 
 
+def _has_header(paths: List[str]) -> bool:
+    return any(os.path.exists(str(p)) for p in paths)
+
+
+def _has_lib(names: List[str]) -> bool:
+    for name in names:
+        if ctypes.util.find_library(str(name)) is not None:
+            return True
+    return False
+
+
 def _pkg_config_tokens(flag: str, packages: List[str]) -> List[str]:
     cmd = ["pkg-config", flag] + [p for p in packages if p]
     try:
@@ -99,26 +110,38 @@ def detect_l7_capabilities() -> Dict[str, bool]:
     nghttp2_pkg = _pkg_config_first(["nghttp2", "libnghttp2"])
     ngtcp2_pkg = _pkg_config_first(["ngtcp2", "libngtcp2"])
     nghttp3_pkg = _pkg_config_first(["nghttp3", "libnghttp3"])
+    nghttp2_headers = _has_header(
+        ["/usr/include/nghttp2/nghttp2.h", "/usr/local/include/nghttp2/nghttp2.h"]
+    )
+    ngtcp2_headers = _has_header(
+        ["/usr/include/ngtcp2/ngtcp2.h", "/usr/local/include/ngtcp2/ngtcp2.h"]
+    )
+    nghttp3_headers = _has_header(
+        ["/usr/include/nghttp3/nghttp3.h", "/usr/local/include/nghttp3/nghttp3.h"]
+    )
+    nghttp2_lib = _has_lib(["nghttp2"])
+    ngtcp2_lib = _has_lib(["ngtcp2"])
+    nghttp3_lib = _has_lib(["nghttp3"])
 
     nghttp2_enabled = False
     if _env_flag("SAMURAI_FORCE_NGHTTP2", "0"):
         # Explicit override for environments where maintainers ensure flags/libs externally.
         nghttp2_enabled = True
     elif not _env_flag("SAMURAI_DISABLE_NGHTTP2", "0"):
-        # CI-safe gate: require pkg-config metadata for deterministic cflags/libs resolution.
-        # Runtime-only libnghttp2 (versioned .so) is insufficient for editable build linking.
-        nghttp2_enabled = bool(nghttp2_pkg)
+        # Prefer pkg-config metadata, but allow header+library fallback for distro setups
+        # where .pc files are unavailable yet development headers/libs are installed.
+        nghttp2_enabled = bool(nghttp2_pkg) or bool(nghttp2_headers and nghttp2_lib)
 
     quic_enabled = False
     if _env_flag("SAMURAI_FORCE_QUIC", "0"):
         # Explicit override for maintainers who inject cflags/libs externally.
         quic_enabled = True
     elif not _env_flag("SAMURAI_DISABLE_QUIC", "0"):
-        # CI-safe gate: require pkg-config metadata for deterministic ngtcp2/nghttp3 link flags.
-        quic_enabled = (
-            openssl_enabled
-            and bool(ngtcp2_pkg)
-            and bool(nghttp3_pkg)
+        # Prefer pkg-config metadata, but allow header+library fallback for systems where
+        # ngtcp2/nghttp3 are installed without pkg-config modules.
+        quic_enabled = bool(
+            (ngtcp2_pkg and nghttp3_pkg)
+            or (ngtcp2_headers and nghttp3_headers and ngtcp2_lib and nghttp3_lib)
         )
 
     return {
@@ -184,6 +207,18 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
         if crypto_pkg:
             pkg_names.append(crypto_pkg)
         else:
+            crypto_link_name = None
+            for candidate in (
+                "ngtcp2_crypto_ossl",
+                "ngtcp2_crypto_openssl",
+                "ngtcp2_crypto_quictls",
+                "ngtcp2_crypto_gnutls",
+            ):
+                if ctypes.util.find_library(candidate) is not None:
+                    crypto_link_name = candidate
+                    break
+            if crypto_link_name:
+                link_args.append(f"-l{crypto_link_name}")
             # Fallback linker names when pkg-config modules are unavailable.
             link_args.extend(["-lngtcp2", "-lnghttp3"])
     else:
