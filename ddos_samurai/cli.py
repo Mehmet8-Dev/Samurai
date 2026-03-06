@@ -292,6 +292,10 @@ def _report_inputs_from_args(args) -> dict:
         "kpi_gate_profile": str(getattr(args, "kpi_gate_profile", "off")),
         "kpi_hard_fail": bool(getattr(args, "kpi_hard_fail", False)),
         "l7_engine": str(getattr(args, "l7_engine", "python")),
+        "l7_http2_engine": str(getattr(args, "l7_http2_engine", "auto")),
+        "l7_quic_engine": str(getattr(args, "l7_quic_engine", "auto")),
+        "l7_fallback_policy": str(getattr(args, "l7_fallback_policy", "allow")),
+        "l7_capability_strict": bool(getattr(args, "l7_capability_strict", False)),
         "legacy_path_enable": bool(getattr(args, "legacy_path_enable", False)),
         "http2_connections": int(getattr(args, "http2_connections", 1) or 1),
         "http2_streams_per_conn": int(getattr(args, "http2_streams_per_conn", 100) or 100),
@@ -496,6 +500,9 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
     if not bool(getattr(args, "kpi_hard_fail", False)):
         args.kpi_hard_fail = True
         utils.log_info("lab-profile=dedicated için --kpi-hard-fail otomatik etkinleştirildi.")
+    if not bool(getattr(args, "l7_capability_strict", False)):
+        args.l7_capability_strict = True
+        utils.log_info("lab-profile=dedicated için --l7-capability-strict otomatik etkinleştirildi.")
 
     workers = int(getattr(args, "workers", multiprocessing.cpu_count()) or 0)
     dp_queues = int(getattr(args, "dp_queues", 1) or 1)
@@ -711,6 +718,30 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["python", "c_state"],
         default=str(os.environ.get("SAMURAI_L7_ENGINE", "python") or "python"),
         help="L7 state engine seçimi: python|c_state.",
+    )
+    parser.add_argument(
+        "--l7-http2-engine",
+        choices=["python", "c_state", "auto"],
+        default=str(os.environ.get("SAMURAI_L7_HTTP2_ENGINE", "auto") or "auto"),
+        help="HTTP/2 L7 engine seçimi: python|c_state|auto.",
+    )
+    parser.add_argument(
+        "--l7-quic-engine",
+        choices=["python", "c_state", "auto"],
+        default=str(os.environ.get("SAMURAI_L7_QUIC_ENGINE", "auto") or "auto"),
+        help="QUIC L7 engine seçimi: python|c_state|auto.",
+    )
+    parser.add_argument(
+        "--l7-fallback-policy",
+        choices=["allow", "fail"],
+        default=str(os.environ.get("SAMURAI_L7_FALLBACK_POLICY", "allow") or "allow"),
+        help="L7 C->Python fallback politikası: allow|fail.",
+    )
+    parser.add_argument(
+        "--l7-capability-strict",
+        action="store_true",
+        default=str(os.environ.get("SAMURAI_L7_CAPABILITY_STRICT", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
+        help="L7 capability strict modu: eksik capability varsa fallback yerine preflight/run fail.",
     )
     parser.add_argument(
         "--legacy-path-enable",
@@ -1232,6 +1263,10 @@ def main(argv=None):
     os.environ["SAMURAI_KPI_GATE_PROFILE"] = str(getattr(args, "kpi_gate_profile", "off") or "off")
     os.environ["SAMURAI_KPI_HARD_FAIL"] = "1" if bool(getattr(args, "kpi_hard_fail", False)) else "0"
     os.environ["SAMURAI_L7_ENGINE"] = str(getattr(args, "l7_engine", "python") or "python")
+    os.environ["SAMURAI_L7_HTTP2_ENGINE"] = str(getattr(args, "l7_http2_engine", "auto") or "auto")
+    os.environ["SAMURAI_L7_QUIC_ENGINE"] = str(getattr(args, "l7_quic_engine", "auto") or "auto")
+    os.environ["SAMURAI_L7_FALLBACK_POLICY"] = str(getattr(args, "l7_fallback_policy", "allow") or "allow")
+    os.environ["SAMURAI_L7_CAPABILITY_STRICT"] = "1" if bool(getattr(args, "l7_capability_strict", False)) else "0"
     os.environ["SAMURAI_LEGACY_PATH_ENABLE"] = "1" if bool(getattr(args, "legacy_path_enable", False)) else "0"
 
     # Live mode reporting is supported as well (aggregated worker events).

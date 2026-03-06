@@ -112,10 +112,14 @@ def _from_core_result(raw: Dict[str, Any], *, default_count: int, sender_path: s
             reason_l.startswith("unsupported_")
             or reason_l.startswith("tls_")
             or reason_l.startswith("ws_")
+            or reason_l.startswith("h2_")
+            or reason_l.startswith("quic_")
             or reason_l in {
                 "l7_state_engine_unavailable",
                 "tls_not_supported",
                 "ws_scenario_unsupported",
+                "h2_capability_unavailable",
+                "quic_capability_unavailable",
                 "invalid_config",
                 "target_ip_missing",
                 "target_port_invalid",
@@ -279,5 +283,103 @@ async def run_websocket_stateful(config: L7EngineConfig) -> Optional[L7EngineRes
             errors=count,
             sender_path="C_STATE_WS_FAILED",
             sender_fallback_reason=f"l7_state_engine_error:{type(exc).__name__}",
+            allow_legacy_fallback=True,
+        )
+
+
+async def run_http2_stateful(config: L7EngineConfig) -> Optional[L7EngineResult]:
+    if _normalize_engine(config.engine) != "c_state":
+        return None
+
+    count = max(0, int(config.count or 0))
+    if count <= 0:
+        return L7EngineResult(handled=True, attempted=0, sent=0, errors=0, sender_path="C_STATE_H2")
+
+    if _l7_core is None:
+        return L7EngineResult(
+            handled=True,
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="C_STATE_UNAVAILABLE",
+            sender_fallback_reason="l7_state_engine_unavailable",
+            allow_legacy_fallback=True,
+        )
+    if not hasattr(_l7_core, "run_http2_stateful"):
+        return L7EngineResult(
+            handled=True,
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="C_STATE_H2_UNAVAILABLE",
+            sender_fallback_reason="h2_capability_unavailable",
+            allow_legacy_fallback=True,
+        )
+
+    payload = config.as_dict()
+    try:
+        raw, snap = await _invoke_core_runner_async("run_http2_stateful", payload)
+        if snap:
+            for k, v in snap.items():
+                raw.setdefault(f"l7_handle_{k}", v)
+        return _from_core_result(raw, default_count=count, sender_path="C_STATE_H2")
+    except Exception as exc:
+        log.warning("l7_state_engine.run_http2_stateful failed: %s", exc)
+        return L7EngineResult(
+            handled=True,
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="C_STATE_H2_FAILED",
+            sender_fallback_reason=f"h2_engine_error:{type(exc).__name__}",
+            allow_legacy_fallback=True,
+        )
+
+
+async def run_quic_stateful(config: L7EngineConfig) -> Optional[L7EngineResult]:
+    if _normalize_engine(config.engine) != "c_state":
+        return None
+
+    count = max(0, int(config.count or 0))
+    if count <= 0:
+        return L7EngineResult(handled=True, attempted=0, sent=0, errors=0, sender_path="C_STATE_QUIC")
+
+    if _l7_core is None:
+        return L7EngineResult(
+            handled=True,
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="C_STATE_UNAVAILABLE",
+            sender_fallback_reason="l7_state_engine_unavailable",
+            allow_legacy_fallback=True,
+        )
+    if not hasattr(_l7_core, "run_quic_stateful"):
+        return L7EngineResult(
+            handled=True,
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="C_STATE_QUIC_UNAVAILABLE",
+            sender_fallback_reason="quic_capability_unavailable",
+            allow_legacy_fallback=True,
+        )
+
+    payload = config.as_dict()
+    try:
+        raw, snap = await _invoke_core_runner_async("run_quic_stateful", payload)
+        if snap:
+            for k, v in snap.items():
+                raw.setdefault(f"l7_handle_{k}", v)
+        return _from_core_result(raw, default_count=count, sender_path="C_STATE_QUIC")
+    except Exception as exc:
+        log.warning("l7_state_engine.run_quic_stateful failed: %s", exc)
+        return L7EngineResult(
+            handled=True,
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="C_STATE_QUIC_FAILED",
+            sender_fallback_reason=f"quic_engine_error:{type(exc).__name__}",
             allow_legacy_fallback=True,
         )

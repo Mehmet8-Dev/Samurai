@@ -47,7 +47,11 @@ except Exception:
 from . import utils
 from . import packet as packet_utils
 from . import cpu_packet_engine
-from . import l7_engine as l7_engine_adapter
+from .l7 import c_adapter as l7_c_adapter
+from .l7 import dispatch as l7_dispatch
+from .l7 import legacy as l7_legacy
+from .l7 import telemetry as l7_telemetry
+from .l7.types import L7RouteRequest
 from .scapy_support import ScapyUnavailableError, require_scapy
 
 log_info = utils.log_info
@@ -185,6 +189,29 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
             out[k] = float(v) if isinstance(v, float) else int(v)
         elif isinstance(v, str):
             out[k] = v
+    return out
+
+
+def _normalize_l7_output(
+    raw_stats: Dict[str, Any],
+    *,
+    attempted_default: int = 0,
+    sender_path: str = "",
+    engine_path_used: str = "",
+    fallback_reason: str = "none",
+    route=None,
+) -> Dict[str, Any]:
+    out = l7_telemetry.normalize_l7_stats(
+        raw_stats,
+        attempted_default=attempted_default,
+        sender_path=sender_path,
+        engine_path_used=engine_path_used,
+        fallback_reason=fallback_reason,
+    )
+    if route is not None:
+        out.update(route.as_stats())
+    if engine_path_used:
+        out["l7_engine_path_used"] = str(engine_path_used)
     return out
 
 
@@ -2371,6 +2398,10 @@ async def http2_sender(
     verify=True,
     http2_connections=1,
     http2_streams_per_conn=100,
+    l7_http2_engine="auto",
+    l7_fallback_policy="allow",
+    l7_capability_strict=False,
+    lab_profile="off",
     live_sent=None,
     live_errors=None,
     live_progress=None,
@@ -2379,12 +2410,6 @@ async def http2_sender(
     Sends HTTP/2 requests using httpx, leveraging multiplexing.
     If request_plan is provided, method/path/user-agent are consumed per item.
     """
-    if not HTTPX_AVAILABLE:
-        log_error("HTTP/2 desteği için 'httpx[http2]' kütüphanesi yüklü değil.")
-        return _stats(attempted=count, sent=0, errors=count)
-
-    from . import h2_mimic
-
     base_url = f"{scheme}://{target_ip}:{target_port}"
     planned_items = []
     if request_plan is not None:
@@ -2392,6 +2417,69 @@ async def http2_sender(
     dispatch_count = int(len(planned_items) if planned_items else count)
     if dispatch_count <= 0:
         return _stats(attempted=0, sent=0, errors=0)
+    route = l7_dispatch.build_route_decision(
+        L7RouteRequest(
+            protocol="http2",
+            l7_engine="python",
+            protocol_engine=str(l7_http2_engine or "auto"),
+            fallback_policy=str(l7_fallback_policy or "allow"),
+            capability_strict=bool(l7_capability_strict),
+            legacy_path_enable=True,
+            lab_profile=str(lab_profile or "off"),
+        )
+    )
+    c_fallback_reason = "none"
+    if route.engine == "c_state":
+        c_cfg = l7_c_adapter.make_config(
+            target_ip=str(target_ip),
+            target_port=int(target_port or 0),
+            count=dispatch_count,
+            concurrency=max(1, int(concurrency or 1)),
+            mode="http2_stateful",
+            extra={
+                "scheme": str(scheme or "https"),
+                "verify": bool(verify),
+                "h2_profile": str(h2_profile_name or "none"),
+                "h2_transport": str(h2_transport_name or "auto"),
+                "h2_connections": int(http2_connections or 1),
+                "h2_streams_per_conn": int(http2_streams_per_conn or 100),
+            },
+        )
+        c_res = await l7_c_adapter.run("http2", c_cfg)
+        if l7_legacy.should_return_c_result(c_res, allow_python_fallback=route.allow_python_fallback):
+            c_stats = _normalize_l7_output(
+                c_res.as_stats(),
+                attempted_default=dispatch_count,
+                sender_path="C_STATE_H2",
+                engine_path_used=route.l7_engine_path_used,
+                fallback_reason=str(getattr(c_res, "sender_fallback_reason", "none") or "none"),
+                route=route,
+            )
+            _update_live(live_progress, int(c_stats.get("attempted", dispatch_count) or 0))
+            _update_live(live_sent, int(c_stats.get("sent", 0) or 0))
+            _update_live(live_errors, int(c_stats.get("errors", 0) or 0))
+            return _stats(**c_stats)
+        c_fallback_reason = str(getattr(c_res, "sender_fallback_reason", "none") or "none")
+        log_warning(
+            "L7 c_state HTTP/2 engine unavailable/failed; "
+            f"Python HTTP/2 path fallback enabled (reason={c_fallback_reason})."
+        )
+
+    if not HTTPX_AVAILABLE:
+        log_error("HTTP/2 desteği için 'httpx[http2]' kütüphanesi yüklü değil.")
+        return _stats(
+            **_normalize_l7_output(
+                {"attempted": dispatch_count, "sent": 0, "errors": dispatch_count, "sender_path": "PY_HTTP2"},
+                attempted_default=dispatch_count,
+                sender_path="PY_HTTP2",
+                engine_path_used="PY_HTTP2",
+                fallback_reason=c_fallback_reason,
+                route=route,
+            )
+        )
+
+    from . import h2_mimic
+
     h2_conn_count = max(1, int(http2_connections or 1))
     h2_stream_cap = max(1, int(http2_streams_per_conn or 1))
     max_dispatch_concurrency = max(1, min(int(concurrency or 1), h2_conn_count * h2_stream_cap))
@@ -2421,16 +2509,26 @@ async def http2_sender(
         _update_live(live_progress, dispatch_count)
         _update_live(live_errors, dispatch_count)
         return _stats(
-            attempted=dispatch_count,
-            sent=0,
-            errors=dispatch_count,
-            h2_profile_requested=int(profile_requested),
-            h2_profile_applied=0,
-            h2_profile_disabled=profile_disabled,
-            h2_profile_apply_failed=int(profile_requested),
-            h2_transport=transport_name,
-            h2_connections=h2_conn_count,
-            h2_streams_per_conn=h2_stream_cap,
+            **_normalize_l7_output(
+                {
+                    "attempted": dispatch_count,
+                    "sent": 0,
+                    "errors": dispatch_count,
+                    "h2_profile_requested": int(profile_requested),
+                    "h2_profile_applied": 0,
+                    "h2_profile_disabled": profile_disabled,
+                    "h2_profile_apply_failed": int(profile_requested),
+                    "h2_transport": transport_name,
+                    "h2_connections": h2_conn_count,
+                    "h2_streams_per_conn": h2_stream_cap,
+                    "sender_path": "PY_HTTP2",
+                },
+                attempted_default=dispatch_count,
+                sender_path="PY_HTTP2",
+                engine_path_used="PY_HTTP2",
+                fallback_reason=c_fallback_reason,
+                route=route,
+            )
         )
 
     if transport_name == "hyper-h2":
@@ -2439,32 +2537,52 @@ async def http2_sender(
             _update_live(live_progress, dispatch_count)
             _update_live(live_errors, dispatch_count)
             return _stats(
-                attempted=dispatch_count,
-                sent=0,
-                errors=dispatch_count,
-                h2_profile_requested=int(profile_requested),
-                h2_profile_applied=0,
-                h2_profile_disabled=profile_disabled,
-                h2_profile_apply_failed=0,
-                h2_transport="hyper-h2",
-                h2_connections=h2_conn_count,
-                h2_streams_per_conn=h2_stream_cap,
+                **_normalize_l7_output(
+                    {
+                        "attempted": dispatch_count,
+                        "sent": 0,
+                        "errors": dispatch_count,
+                        "h2_profile_requested": int(profile_requested),
+                        "h2_profile_applied": 0,
+                        "h2_profile_disabled": profile_disabled,
+                        "h2_profile_apply_failed": 0,
+                        "h2_transport": "hyper-h2",
+                        "h2_connections": h2_conn_count,
+                        "h2_streams_per_conn": h2_stream_cap,
+                        "sender_path": "PY_HTTP2",
+                    },
+                    attempted_default=dispatch_count,
+                    sender_path="PY_HTTP2",
+                    engine_path_used="PY_HTTP2",
+                    fallback_reason=c_fallback_reason,
+                    route=route,
+                )
             )
         if (not bool(HYPER_H2_AVAILABLE)) or _h2_transport is None:
             log_error("HTTP/2 hyper-h2 transport requested but dependency is unavailable.")
             _update_live(live_progress, dispatch_count)
             _update_live(live_errors, dispatch_count)
             return _stats(
-                attempted=dispatch_count,
-                sent=0,
-                errors=dispatch_count,
-                h2_profile_requested=int(profile_requested),
-                h2_profile_applied=0,
-                h2_profile_disabled=profile_disabled,
-                h2_profile_apply_failed=0,
-                h2_transport="hyper-h2",
-                h2_connections=h2_conn_count,
-                h2_streams_per_conn=h2_stream_cap,
+                **_normalize_l7_output(
+                    {
+                        "attempted": dispatch_count,
+                        "sent": 0,
+                        "errors": dispatch_count,
+                        "h2_profile_requested": int(profile_requested),
+                        "h2_profile_applied": 0,
+                        "h2_profile_disabled": profile_disabled,
+                        "h2_profile_apply_failed": 0,
+                        "h2_transport": "hyper-h2",
+                        "h2_connections": h2_conn_count,
+                        "h2_streams_per_conn": h2_stream_cap,
+                        "sender_path": "PY_HTTP2",
+                    },
+                    attempted_default=dispatch_count,
+                    sender_path="PY_HTTP2",
+                    engine_path_used="PY_HTTP2",
+                    fallback_reason=c_fallback_reason,
+                    route=route,
+                )
             )
 
     # Hyper-h2 path: real transport-level profile application
@@ -2563,20 +2681,30 @@ async def http2_sender(
             _update_live(live_errors, err_count)
             log_info(f"HTTP/2 (hyper-h2) finished sending {dispatch_count} requests.")
             return _stats(
-                attempted=dispatch_count,
-                sent=sent_count,
-                errors=max(err_count, dispatch_count - sent_count),
-                responses_total=int(merged.get("responses_total", sent_count) or sent_count),
-                status_2xx=int(merged.get("status_2xx", 0) or 0),
-                status_4xx=int(merged.get("status_4xx", 0) or 0),
-                status_5xx=int(merged.get("status_5xx", 0) or 0),
-                h2_profile_requested=int(profile_requested),
-                h2_profile_applied=int(bool(profile_requested and resolved_profile is not None)),
-                h2_profile_disabled=profile_disabled,
-                h2_profile_apply_failed=0,
-                h2_transport="hyper-h2",
-                h2_connections=h2_conn_count,
-                h2_streams_per_conn=h2_stream_cap,
+                **_normalize_l7_output(
+                    {
+                        "attempted": dispatch_count,
+                        "sent": sent_count,
+                        "errors": max(err_count, dispatch_count - sent_count),
+                        "responses_total": int(merged.get("responses_total", sent_count) or sent_count),
+                        "status_2xx": int(merged.get("status_2xx", 0) or 0),
+                        "status_4xx": int(merged.get("status_4xx", 0) or 0),
+                        "status_5xx": int(merged.get("status_5xx", 0) or 0),
+                        "h2_profile_requested": int(profile_requested),
+                        "h2_profile_applied": int(bool(profile_requested and resolved_profile is not None)),
+                        "h2_profile_disabled": profile_disabled,
+                        "h2_profile_apply_failed": 0,
+                        "h2_transport": "hyper-h2",
+                        "h2_connections": h2_conn_count,
+                        "h2_streams_per_conn": h2_stream_cap,
+                        "sender_path": "PY_HTTP2",
+                    },
+                    attempted_default=dispatch_count,
+                    sender_path="PY_HTTP2",
+                    engine_path_used="PY_HTTP2",
+                    fallback_reason=c_fallback_reason,
+                    route=route,
+                )
             )
         except Exception as exc:
             log_warning(f"HTTP/2 hyper-h2 transport failed: {exc}")
@@ -2584,16 +2712,26 @@ async def http2_sender(
                 _update_live(live_progress, dispatch_count)
                 _update_live(live_errors, dispatch_count)
                 return _stats(
-                    attempted=dispatch_count,
-                    sent=0,
-                    errors=dispatch_count,
-                    h2_profile_requested=int(profile_requested),
-                    h2_profile_applied=0,
-                    h2_profile_disabled=profile_disabled,
-                    h2_profile_apply_failed=int(bool(profile_requested and resolved_profile is not None)),
-                    h2_transport="hyper-h2",
-                    h2_connections=h2_conn_count,
-                    h2_streams_per_conn=h2_stream_cap,
+                    **_normalize_l7_output(
+                        {
+                            "attempted": dispatch_count,
+                            "sent": 0,
+                            "errors": dispatch_count,
+                            "h2_profile_requested": int(profile_requested),
+                            "h2_profile_applied": 0,
+                            "h2_profile_disabled": profile_disabled,
+                            "h2_profile_apply_failed": int(bool(profile_requested and resolved_profile is not None)),
+                            "h2_transport": "hyper-h2",
+                            "h2_connections": h2_conn_count,
+                            "h2_streams_per_conn": h2_stream_cap,
+                            "sender_path": "PY_HTTP2",
+                        },
+                        attempted_default=dispatch_count,
+                        sender_path="PY_HTTP2",
+                        engine_path_used="PY_HTTP2",
+                        fallback_reason=c_fallback_reason,
+                        route=route,
+                    )
                 )
 
     ok = 0
@@ -2686,20 +2824,30 @@ async def http2_sender(
     finally:
         log_info(f"HTTP/2 sender finished sending {dispatch_count} requests.")
     return _stats(
-        attempted=dispatch_count,
-        sent=ok,
-        errors=max(err, dispatch_count - ok),
-        responses_total=responses,
-        status_2xx=status_2xx,
-        status_4xx=status_4xx,
-        status_5xx=status_5xx,
-        h2_profile_requested=bool(h2_cfg and h2_cfg.requested and h2_cfg.requested != "none"),
-        h2_profile_applied=bool(h2_cfg and h2_cfg.applied),
-        h2_profile_disabled=bool(h2_cfg and h2_cfg.reason == "profile_disabled"),
-        h2_profile_apply_failed=bool(h2_cfg and (not h2_cfg.applied) and h2_cfg.reason != "profile_disabled"),
-        h2_transport="httpx",
-        h2_connections=h2_conn_count,
-        h2_streams_per_conn=h2_stream_cap,
+        **_normalize_l7_output(
+            {
+                "attempted": dispatch_count,
+                "sent": ok,
+                "errors": max(err, dispatch_count - ok),
+                "responses_total": responses,
+                "status_2xx": status_2xx,
+                "status_4xx": status_4xx,
+                "status_5xx": status_5xx,
+                "h2_profile_requested": bool(h2_cfg and h2_cfg.requested and h2_cfg.requested != "none"),
+                "h2_profile_applied": bool(h2_cfg and h2_cfg.applied),
+                "h2_profile_disabled": bool(h2_cfg and h2_cfg.reason == "profile_disabled"),
+                "h2_profile_apply_failed": bool(h2_cfg and (not h2_cfg.applied) and h2_cfg.reason != "profile_disabled"),
+                "h2_transport": "httpx",
+                "h2_connections": h2_conn_count,
+                "h2_streams_per_conn": h2_stream_cap,
+                "sender_path": "PY_HTTP2",
+            },
+            attempted_default=dispatch_count,
+            sender_path="PY_HTTP2",
+            engine_path_used="PY_HTTP2",
+            fallback_reason=c_fallback_reason,
+            route=route,
+        )
     )
 
 async def http_app_sender(
@@ -2831,6 +2979,8 @@ async def http_stateful_sender(
     l7_engine="python",
     legacy_path_enable=False,
     lab_profile="off",
+    l7_fallback_policy="allow",
+    l7_capability_strict=False,
     live_sent=None, live_errors=None, live_progress=None,
 ):
     """
@@ -2847,15 +2997,25 @@ async def http_stateful_sender(
     if vu_count <= 0:
         return _stats(attempted=0, sent=0, errors=0)
 
-    engine_mode = str(l7_engine or "python").strip().lower()
-    if engine_mode == "c_state":
+    route = l7_dispatch.build_route_decision(
+        L7RouteRequest(
+            protocol="http1",
+            l7_engine=str(l7_engine or "python"),
+            protocol_engine="auto",
+            fallback_policy=str(l7_fallback_policy or "allow"),
+            capability_strict=bool(l7_capability_strict),
+            legacy_path_enable=bool(legacy_path_enable),
+            lab_profile=str(lab_profile or "off"),
+        )
+    )
+    c_fallback_reason = "none"
+    if route.engine == "c_state":
         _http_path_first = (
             str(http_path[0])
             if isinstance(http_path, list) and len(http_path) > 0
             else str(http_path or "/")
         )
-        cfg = l7_engine_adapter.L7EngineConfig(
-            engine="c_state",
+        cfg = l7_c_adapter.make_config(
             target_ip=str(target_ip),
             target_port=int(target_port or 0),
             count=int(vu_count),
@@ -2873,17 +3033,25 @@ async def http_stateful_sender(
                 "http_path": _http_path_first,
             },
         )
-        c_res = await l7_engine_adapter.run_http1_stateful(cfg)
-        if c_res is not None and c_res.handled:
-            c_stats = c_res.as_stats()
-            if int(c_res.sent) > 0 or not bool(c_res.allow_legacy_fallback) or not bool(legacy_path_enable):
-                _update_live(live_progress, int(c_stats.get("attempted", vu_count) or 0))
-                _update_live(live_sent, int(c_stats.get("sent", 0) or 0))
-                _update_live(live_errors, int(c_stats.get("errors", 0) or 0))
-                return _stats(**c_stats)
-            log_warning(
-                "L7 c_state HTTP engine unavailable/failed; legacy VirtualUser path fallback enabled."
+        c_res = await l7_c_adapter.run("http1", cfg)
+        if l7_legacy.should_return_c_result(c_res, allow_python_fallback=route.allow_python_fallback):
+            c_stats = l7_telemetry.normalize_l7_stats(
+                c_res.as_stats(),
+                attempted_default=vu_count,
+                sender_path="C_STATE_HTTP1",
+                engine_path_used=route.l7_engine_path_used,
+                fallback_reason=str(getattr(c_res, "sender_fallback_reason", "none") or "none"),
             )
+            c_stats.update(route.as_stats())
+            _update_live(live_progress, int(c_stats.get("attempted", vu_count) or 0))
+            _update_live(live_sent, int(c_stats.get("sent", 0) or 0))
+            _update_live(live_errors, int(c_stats.get("errors", 0) or 0))
+            return _stats(**c_stats)
+        c_fallback_reason = str(getattr(c_res, "sender_fallback_reason", "none") or "none")
+        log_warning(
+            "L7 c_state HTTP engine unavailable/failed; "
+            f"Python VirtualUser path fallback enabled (reason={c_fallback_reason})."
+        )
 
     from .virtual_user import run_vu_pool, WorkflowStep, ExtractRule
 
@@ -2993,17 +3161,29 @@ async def http_stateful_sender(
     log_info(f"Stateful HTTP finished. VUs={vu_count} ok={metrics.workflows_completed} "
              f"fail={metrics.workflows_failed} session_success={metrics.session_success_rate:.2%}")
 
-    return _stats(
-        attempted=total_steps,
-        sent=total_ok,
-        errors=total_err,
-        retries_used=retries_used,
-        l7_active_sessions_peak=int(getattr(metrics, "active_sessions_peak", 0) or 0),
-        l7_conn_rate=float(l7_conn_rate),
-        l7_handshake_p99_ms=float(l7_handshake_p99_ms),
-        l7_step_fail_ratio=float(l7_step_fail_ratio),
-        **metrics.as_dict(),
+    py_stats = l7_telemetry.normalize_l7_stats(
+        {
+            "attempted": total_steps,
+            "sent": total_ok,
+            "errors": total_err,
+            "retries_used": retries_used,
+            "l7_active_sessions_peak": int(getattr(metrics, "active_sessions_peak", 0) or 0),
+            "l7_conn_rate": float(l7_conn_rate),
+            "l7_handshake_p99_ms": float(l7_handshake_p99_ms),
+            "l7_step_fail_ratio": float(l7_step_fail_ratio),
+            "sender_path": "PY_HTTP1_STATEFUL",
+            "l7_engine_path_used": "PY_HTTP1",
+            "l7_fallback_reason": c_fallback_reason,
+            **metrics.as_dict(),
+        },
+        attempted_default=total_steps,
+        sender_path="PY_HTTP1_STATEFUL",
+        engine_path_used="PY_HTTP1",
+        fallback_reason=c_fallback_reason,
     )
+    py_stats.update(route.as_stats())
+    py_stats["l7_engine_path_used"] = "PY_HTTP1"
+    return _stats(**py_stats)
 
 
 async def amplification_sender(victim_ip, count, rps, reflector_file, amp_type, verbose, live_sent=None, live_errors=None, live_progress=None):
@@ -3161,6 +3341,8 @@ async def websocket_scenario_sender(
     l7_engine="python",
     legacy_path_enable=False,
     lab_profile="off",
+    l7_fallback_policy="allow",
+    l7_capability_strict=False,
     ssl_context=None,
     live_sent=None,
     live_errors=None,
@@ -3171,10 +3353,20 @@ async def websocket_scenario_sender(
       connect -> auth -> subscribe -> ping/pong (optional recv on each step)
     `count` denotes number of WS sessions/scenario runs.
     """
-    engine_mode = str(l7_engine or "python").strip().lower()
-    if engine_mode == "c_state":
-        cfg = l7_engine_adapter.L7EngineConfig(
-            engine="c_state",
+    route = l7_dispatch.build_route_decision(
+        L7RouteRequest(
+            protocol="ws",
+            l7_engine=str(l7_engine or "python"),
+            protocol_engine="auto",
+            fallback_policy=str(l7_fallback_policy or "allow"),
+            capability_strict=bool(l7_capability_strict),
+            legacy_path_enable=bool(legacy_path_enable),
+            lab_profile=str(lab_profile or "off"),
+        )
+    )
+    c_fallback_reason = "none"
+    if route.engine == "c_state":
+        cfg = l7_c_adapter.make_config(
             target_ip=str(target_ip),
             target_port=int(target_port or 0),
             count=int(count or 0),
@@ -3190,21 +3382,38 @@ async def websocket_scenario_sender(
                 "lab_profile": str(lab_profile or "off"),
             },
         )
-        c_res = await l7_engine_adapter.run_websocket_stateful(cfg)
-        if c_res is not None and c_res.handled:
-            c_stats = c_res.as_stats()
-            if int(c_res.sent) > 0 or not bool(c_res.allow_legacy_fallback) or not bool(legacy_path_enable):
-                _update_live(live_progress, int(c_stats.get("attempted", count) or 0))
-                _update_live(live_sent, int(c_stats.get("sent", 0) or 0))
-                _update_live(live_errors, int(c_stats.get("errors", 0) or 0))
-                return _stats(**c_stats)
-            log_warning(
-                "L7 c_state websocket engine unavailable/failed; legacy websocket path fallback enabled."
+        c_res = await l7_c_adapter.run("ws", cfg)
+        if l7_legacy.should_return_c_result(c_res, allow_python_fallback=route.allow_python_fallback):
+            c_stats = l7_telemetry.normalize_l7_stats(
+                c_res.as_stats(),
+                attempted_default=count,
+                sender_path="C_STATE_WS",
+                engine_path_used=route.l7_engine_path_used,
+                fallback_reason=str(getattr(c_res, "sender_fallback_reason", "none") or "none"),
             )
+            c_stats.update(route.as_stats())
+            _update_live(live_progress, int(c_stats.get("attempted", count) or 0))
+            _update_live(live_sent, int(c_stats.get("sent", 0) or 0))
+            _update_live(live_errors, int(c_stats.get("errors", 0) or 0))
+            return _stats(**c_stats)
+        c_fallback_reason = str(getattr(c_res, "sender_fallback_reason", "none") or "none")
+        log_warning(
+            "L7 c_state websocket engine unavailable/failed; "
+            f"Python websocket path fallback enabled (reason={c_fallback_reason})."
+        )
 
     if not WEBSOCKETS_AVAILABLE:
         log_error("WebSocket desteği için 'websockets' kütüphanesi yüklü değil.")
-        return _stats(attempted=count, sent=0, errors=count)
+        return _stats(
+            **_normalize_l7_output(
+                {"attempted": count, "sent": 0, "errors": count, "sender_path": "PY_WS"},
+                attempted_default=count,
+                sender_path="PY_WS",
+                engine_path_used="PY_WS",
+                fallback_reason=c_fallback_reason,
+                route=route,
+            )
+        )
 
     scheme = "wss" if target_port == 443 else "ws"
     uri = f"{scheme}://{target_ip}:{target_port}{ws_path}"
@@ -3271,17 +3480,29 @@ async def websocket_scenario_sender(
         f"sessions_ok={sessions_ok} errors={session_errors} auth={auth_sent} "
         f"sub={subscribe_sent} ping={ping_sent} pong={pong_received}"
     )
-    return _stats(
-        attempted=count,
-        sent=sessions_ok,
-        errors=max(session_errors, count - sessions_ok),
-        ws_sessions_ok=sessions_ok,
-        ws_auth_sent=auth_sent,
-        ws_subscribe_sent=subscribe_sent,
-        ws_ping_sent=ping_sent,
-        ws_pong_received=pong_received,
-        ws_scenario_enabled=1,
+    py_stats = l7_telemetry.normalize_l7_stats(
+        {
+            "attempted": count,
+            "sent": sessions_ok,
+            "errors": max(session_errors, count - sessions_ok),
+            "ws_sessions_ok": sessions_ok,
+            "ws_auth_sent": auth_sent,
+            "ws_subscribe_sent": subscribe_sent,
+            "ws_ping_sent": ping_sent,
+            "ws_pong_received": pong_received,
+            "ws_scenario_enabled": 1,
+            "sender_path": "PY_WS_SCENARIO",
+            "l7_engine_path_used": "PY_WS",
+            "l7_fallback_reason": c_fallback_reason,
+        },
+        attempted_default=count,
+        sender_path="PY_WS_SCENARIO",
+        engine_path_used="PY_WS",
+        fallback_reason=c_fallback_reason,
     )
+    py_stats.update(route.as_stats())
+    py_stats["l7_engine_path_used"] = "PY_WS"
+    return _stats(**py_stats)
 
 async def websocket_sender(target_ip, target_port, count, concurrency, ws_path, ws_message, verbose, ssl_context=None, live_sent=None, live_errors=None, live_progress=None):
     """
@@ -3333,15 +3554,84 @@ async def websocket_sender(target_ip, target_port, count, concurrency, ws_path, 
     log_info(f"WebSocket sender finished.")
     return _stats(attempted=count, sent=sent_msgs, errors=max(errors, count - sent_msgs))
 
-async def quic_sender(target_ip, target_port, count, concurrency, quic_path, quic_method, verbose, ssl_context=None, live_sent=None, live_errors=None, live_progress=None):
+async def quic_sender(
+    target_ip,
+    target_port,
+    count,
+    concurrency,
+    quic_path,
+    quic_method,
+    verbose,
+    ssl_context=None,
+    l7_quic_engine="auto",
+    l7_fallback_policy="allow",
+    l7_capability_strict=False,
+    lab_profile="off",
+    live_sent=None,
+    live_errors=None,
+    live_progress=None,
+):
     """
     Sends real HTTP/3 requests over QUIC using aioquic.
     Opens H3 streams, sends :method/:path pseudo-headers, reads responses.
     Correct count semantics: distributes `count` across `concurrency` workers.
     """
+    route = l7_dispatch.build_route_decision(
+        L7RouteRequest(
+            protocol="quic",
+            l7_engine="python",
+            protocol_engine=str(l7_quic_engine or "auto"),
+            fallback_policy=str(l7_fallback_policy or "allow"),
+            capability_strict=bool(l7_capability_strict),
+            legacy_path_enable=True,
+            lab_profile=str(lab_profile or "off"),
+        )
+    )
+    c_fallback_reason = "none"
+    if route.engine == "c_state":
+        c_cfg = l7_c_adapter.make_config(
+            target_ip=str(target_ip),
+            target_port=int(target_port or 0),
+            count=int(count or 0),
+            concurrency=int(concurrency or 1),
+            mode="quic_stateful",
+            extra={
+                "quic_path": str(quic_path or "/"),
+                "quic_method": str(quic_method or "GET"),
+            },
+        )
+        c_res = await l7_c_adapter.run("quic", c_cfg)
+        if l7_legacy.should_return_c_result(c_res, allow_python_fallback=route.allow_python_fallback):
+            c_stats = _normalize_l7_output(
+                c_res.as_stats(),
+                attempted_default=count,
+                sender_path="C_STATE_QUIC",
+                engine_path_used=route.l7_engine_path_used,
+                fallback_reason=str(getattr(c_res, "sender_fallback_reason", "none") or "none"),
+                route=route,
+            )
+            _update_live(live_progress, int(c_stats.get("attempted", count) or 0))
+            _update_live(live_sent, int(c_stats.get("sent", 0) or 0))
+            _update_live(live_errors, int(c_stats.get("errors", 0) or 0))
+            return _stats(**c_stats)
+        c_fallback_reason = str(getattr(c_res, "sender_fallback_reason", "none") or "none")
+        log_warning(
+            "L7 c_state QUIC engine unavailable/failed; "
+            f"Python QUIC path fallback enabled (reason={c_fallback_reason})."
+        )
+
     if not AIOQUIC_AVAILABLE:
         log_error("QUIC/HTTP3 desteği için 'aioquic' kütüphanesi yüklü değil.")
-        return _stats(attempted=count, sent=0, errors=count)
+        return _stats(
+            **_normalize_l7_output(
+                {"attempted": count, "sent": 0, "errors": count, "sender_path": "PY_QUIC"},
+                attempted_default=count,
+                sender_path="PY_QUIC",
+                engine_path_used="PY_QUIC",
+                fallback_reason=c_fallback_reason,
+                route=route,
+            )
+        )
 
     log_info(f"QUIC sender initialized. Target: {target_ip}:{target_port}, "
              f"Count: {count}, Method: {quic_method}, Path: {quic_path}")
@@ -3413,4 +3703,19 @@ async def quic_sender(target_ip, target_port, count, concurrency, quic_path, qui
 
     await asyncio.gather(*tasks)
     log_info(f"QUIC sender finished. ok={ok_requests} err={err_requests}")
-    return _stats(attempted=count, sent=ok_requests, errors=max(err_requests, count - ok_requests))
+    return _stats(
+        **_normalize_l7_output(
+            {
+                "attempted": count,
+                "sent": ok_requests,
+                "errors": max(err_requests, count - ok_requests),
+                "quic_stream_fail_ratio": float(max(err_requests, 0)) / float(max(1, int(count or 0))),
+                "sender_path": "PY_QUIC",
+            },
+            attempted_default=count,
+            sender_path="PY_QUIC",
+            engine_path_used="PY_QUIC",
+            fallback_reason=c_fallback_reason,
+            route=route,
+        )
+    )
