@@ -535,6 +535,62 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
                 f"Hata: worker {wid} queue_id {qid}, interface {iface} TX queue sınırını ({nic_tx_queues - 1}) aşıyor."
             )
 
+
+def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "l7_capability_strict", False)):
+        return
+
+    try:
+        from .l7 import c_adapter as _l7_c_adapter
+        from .l7 import dispatch as _l7_dispatch
+        from .l7.types import L7RouteRequest
+    except Exception as exc:
+        parser.error(f"Hata: L7 capability preflight başlatılamadı: {exc}")
+
+    caps = _l7_c_adapter.capability_map()
+    dedicated = str(getattr(args, "lab_profile", "off") or "off").strip().lower() == "dedicated"
+    fallback_policy = str(getattr(args, "l7_fallback_policy", "allow") or "allow")
+    capability_strict = bool(getattr(args, "l7_capability_strict", False))
+    legacy_path_enable = bool(getattr(args, "legacy_path_enable", False))
+    lab_profile = str(getattr(args, "lab_profile", "off") or "off")
+
+    def _check(protocol: str, *, protocol_engine: str, global_engine: str, legacy: bool, hint: str) -> None:
+        route = _l7_dispatch.build_route_decision(
+            L7RouteRequest(
+                protocol=str(protocol),
+                l7_engine=str(global_engine),
+                protocol_engine=str(protocol_engine),
+                fallback_policy=str(fallback_policy),
+                capability_strict=capability_strict,
+                legacy_path_enable=bool(legacy),
+                lab_profile=lab_profile,
+            )
+        )
+        if dedicated and route.engine != "c_state":
+            parser.error(
+                f"Hata: --lab-profile dedicated için {protocol} vektöründe C engine zorunlu "
+                f"(mevcut={route.engine}). İpucu: {hint}"
+            )
+        if route.engine != "c_state":
+            return
+        if bool(caps.get(str(protocol), False)):
+            return
+        parser.error(
+            "Hata: L7 capability strict aktifken seçili C engine mevcut değil: "
+            f"protocol={protocol} core_available={int(bool(caps.get('core_available', False)))} "
+            f"hint={hint}"
+        )
+
+    attack_vector = str(getattr(args, "attack_vector", "basic") or "basic").strip().lower()
+    if attack_vector == "http" and bool(getattr(args, "stateful", False)):
+        _check("http1", protocol_engine="auto", global_engine=str(getattr(args, "l7_engine", "python") or "python"), legacy=legacy_path_enable, hint="--l7-engine c_state")
+    elif attack_vector == "websocket" and bool(getattr(args, "ws_scenario", False)):
+        _check("ws", protocol_engine="auto", global_engine=str(getattr(args, "l7_engine", "python") or "python"), legacy=legacy_path_enable, hint="--l7-engine c_state --ws-scenario")
+    elif attack_vector == "http2":
+        _check("http2", protocol_engine=str(getattr(args, "l7_http2_engine", "auto") or "auto"), global_engine="python", legacy=True, hint="--l7-http2-engine c_state")
+    elif attack_vector == "quic":
+        _check("quic", protocol_engine=str(getattr(args, "l7_quic_engine", "auto") or "auto"), global_engine="python", legacy=True, hint="--l7-quic-engine c_state")
+
 def build_parser() -> argparse.ArgumentParser:
     """
     Build the CLI argument parser.
@@ -1213,6 +1269,7 @@ def main(argv=None):
     _validate_hybrid_cuda_args(parser, args)
     _validate_sender_route_args(parser, args)
     _preflight_lab_profile(parser, args)
+    _preflight_l7_capabilities(parser, args)
 
     global CONNECTION_POOL
     try:

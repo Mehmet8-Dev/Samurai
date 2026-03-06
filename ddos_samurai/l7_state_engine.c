@@ -97,6 +97,9 @@ typedef struct {
 
 #define WS_MAX_SUBSCRIBE_MESSAGES 16
 #define WS_MAX_MESSAGE_LEN 192
+#define H2_PLAN_METHOD_MAX_LEN 24
+#define H2_PLAN_PATH_MAX_LEN 512
+#define H2_PLAN_UA_MAX_LEN 256
 
 typedef struct {
     int enabled;
@@ -233,6 +236,119 @@ static const char *_dict_cstr(PyObject *cfg, const char *key, const char *fallba
         return fallback;
     }
     return s;
+}
+
+static char *_dup_limited_cstr(const char *src, size_t max_len) {
+    size_t n = 0;
+    char *out = NULL;
+    if (src == NULL || src[0] == '\0' || max_len == 0) {
+        return NULL;
+    }
+    while (n < max_len && src[n] != '\0') {
+        n += 1;
+    }
+    if (n == 0) {
+        return NULL;
+    }
+    out = (char *)PyMem_Malloc(n + 1);
+    if (out == NULL) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    memcpy(out, src, n);
+    out[n] = '\0';
+    return out;
+}
+
+static char **_cfg_string_plan(
+    PyObject *cfg,
+    const char *key,
+    long expected_count,
+    size_t max_len,
+    long *used_out
+) {
+    PyObject *raw = NULL;
+    PyObject *seq = NULL;
+    Py_ssize_t seq_len = 0;
+    Py_ssize_t limit = 0;
+    char **out = NULL;
+    long used = 0;
+
+    if (used_out != NULL) {
+        *used_out = 0;
+    }
+    if (!PyDict_Check(cfg) || key == NULL || expected_count <= 0 || max_len == 0) {
+        return NULL;
+    }
+
+    raw = PyDict_GetItemString(cfg, key);
+    if (raw == NULL) {
+        return NULL;
+    }
+    seq = PySequence_Fast(raw, "sequence expected");
+    if (seq == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+
+    seq_len = PySequence_Fast_GET_SIZE(seq);
+    if (seq_len <= 0) {
+        Py_DECREF(seq);
+        return NULL;
+    }
+
+    out = (char **)PyMem_Calloc((size_t)expected_count, sizeof(char *));
+    if (out == NULL) {
+        Py_DECREF(seq);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    limit = seq_len;
+    if ((long)limit > expected_count) {
+        limit = (Py_ssize_t)expected_count;
+    }
+
+    for (Py_ssize_t i = 0; i < limit; i++) {
+        PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
+        const char *s = NULL;
+        if (item == NULL || !PyUnicode_Check(item)) {
+            continue;
+        }
+        s = PyUnicode_AsUTF8(item);
+        if (s == NULL || s[0] == '\0') {
+            PyErr_Clear();
+            continue;
+        }
+        out[i] = _dup_limited_cstr(s, max_len);
+        if (out[i] == NULL) {
+            if (PyErr_Occurred()) {
+                for (Py_ssize_t j = 0; j < i; j++) {
+                    PyMem_Free(out[j]);
+                }
+                PyMem_Free(out);
+                Py_DECREF(seq);
+                return NULL;
+            }
+            continue;
+        }
+        used += 1;
+    }
+    Py_DECREF(seq);
+    if (used_out != NULL) {
+        *used_out = used;
+    }
+    return out;
+}
+
+static void _free_string_plan(char **plan, long count) {
+    if (plan == NULL || count <= 0) {
+        return;
+    }
+    for (long i = 0; i < count; i++) {
+        PyMem_Free(plan[i]);
+    }
+    PyMem_Free(plan);
 }
 
 static void _copy_upper_ascii(char *dst, size_t dst_len, const char *src, const char *fallback) {
@@ -2396,6 +2512,7 @@ typedef struct {
 typedef struct {
     long sent;
     long errors;
+    long submitted_count;
     long goaway_count;
     long rst_stream_count;
     int transport_error;
@@ -2536,6 +2653,11 @@ static void _h2_run_connection(
     const char *scheme,
     const char *method,
     const char *path,
+    const char *user_agent,
+    char **plan_methods,
+    char **plan_paths,
+    char **plan_user_agents,
+    long plan_offset,
     long request_count,
     long timeout_ms,
     int use_tls,
@@ -2653,10 +2775,29 @@ static void _h2_run_connection(
     }
 
     for (long idx = 0; idx < request_count; idx++) {
+        long plan_idx = plan_offset + idx;
         const char *req_method = (method != NULL && method[0] != '\0') ? method : "GET";
         const char *req_path = (path != NULL && path[0] != '\0') ? path : "/";
         const char *req_scheme = (scheme != NULL && scheme[0] != '\0') ? scheme : (ctx.use_tls ? "https" : "http");
-        nghttp2_nv hdrs[4];
+        const char *req_ua = (user_agent != NULL && user_agent[0] != '\0') ? user_agent : NULL;
+        nghttp2_nv hdrs[5];
+        size_t hdr_count = 4;
+
+        if (plan_idx >= 0) {
+            if (plan_methods != NULL && plan_methods[plan_idx] != NULL && plan_methods[plan_idx][0] != '\0') {
+                req_method = plan_methods[plan_idx];
+            }
+            if (plan_paths != NULL && plan_paths[plan_idx] != NULL && plan_paths[plan_idx][0] != '\0') {
+                req_path = plan_paths[plan_idx];
+            }
+            if ((req_ua == NULL || req_ua[0] == '\0') &&
+                plan_user_agents != NULL &&
+                plan_user_agents[plan_idx] != NULL &&
+                plan_user_agents[plan_idx][0] != '\0') {
+                req_ua = plan_user_agents[plan_idx];
+            }
+        }
+
         hdrs[0].name = (uint8_t *)":method";
         hdrs[0].value = (uint8_t *)req_method;
         hdrs[0].namelen = strlen(":method");
@@ -2677,7 +2818,15 @@ static void _h2_run_connection(
         hdrs[3].namelen = strlen(":path");
         hdrs[3].valuelen = strlen(req_path);
         hdrs[3].flags = NGHTTP2_NV_FLAG_NONE;
-        if (nghttp2_submit_request(session, NULL, hdrs, 4, NULL, NULL) < 0) {
+        if (req_ua != NULL && req_ua[0] != '\0') {
+            hdrs[4].name = (uint8_t *)"user-agent";
+            hdrs[4].value = (uint8_t *)req_ua;
+            hdrs[4].namelen = strlen("user-agent");
+            hdrs[4].valuelen = strlen(req_ua);
+            hdrs[4].flags = NGHTTP2_NV_FLAG_NONE;
+            hdr_count = 5;
+        }
+        if (nghttp2_submit_request(session, NULL, hdrs, hdr_count, NULL, NULL) < 0) {
             ctx.protocol_error = 1;
             break;
         }
@@ -2686,6 +2835,9 @@ static void _h2_run_connection(
 
     if (nghttp2_session_send(session) < 0) {
         if (!ctx.transport_error) {
+            ctx.protocol_error = 1;
+        } else if (ctx.submitted > 0 && ctx.completed == 0 && ctx.failed == 0) {
+            /* Early disconnect right after request submission is a protocol break for H2 flow. */
             ctx.protocol_error = 1;
         }
         goto finalize_session;
@@ -2709,12 +2861,18 @@ static void _h2_run_connection(
             if (nghttp2_session_send(session) < 0) {
                 if (!ctx.transport_error) {
                     ctx.protocol_error = 1;
+                } else if (ctx.completed + ctx.failed < ctx.submitted) {
+                    ctx.protocol_error = 1;
                 }
                 break;
             }
             continue;
         }
         if (rd == 0) {
+            /* Peer closed before all submitted streams completed: classify as protocol break. */
+            if (ctx.completed + ctx.failed < ctx.submitted && !ctx.transport_error) {
+                ctx.protocol_error = 1;
+            }
             break;
         }
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -2738,6 +2896,7 @@ static void _h2_run_connection(
     }
 
 finalize_session:
+    out->submitted_count = ctx.submitted;
     out->sent = ctx.completed;
     if (out->sent < 0) {
         out->sent = 0;
@@ -2794,13 +2953,24 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
     int use_tls = 0;
     const char *scheme = "https";
     const char *path = "/";
+    const char *user_agent = "";
     const char *server_name = "";
     char http_method[24];
+    char **plan_methods = NULL;
+    char **plan_paths = NULL;
+    char **plan_user_agents = NULL;
+    long plan_methods_used = 0;
+    long plan_paths_used = 0;
+    long plan_uas_used = 0;
+    long plan_items_used = 0;
+    long plan_offset = 0;
+    long plan_items_cfg = 0;
     long sent_total = 0;
     long errors_total = 0;
     long peak_active = 0;
     long total_goaway = 0;
     long total_rst = 0;
+    long total_submitted = 0;
     long connections_used = 0;
     int saw_transport_error = 0;
     int saw_protocol_error = 0;
@@ -2862,9 +3032,14 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
     target_port = _dict_long(cfg, "target_port", 443);
     scheme = _dict_cstr(cfg, "scheme", "https");
     path = _dict_cstr(cfg, "http_path", "/");
+    user_agent = _dict_cstr(cfg, "user_agent", "");
     verify_tls = _dict_bool(cfg, "verify", 0);
     use_tls = _scheme_is_tls(scheme) || verify_tls;
     server_name = _dict_cstr(cfg, "server_name", target_ip);
+    plan_items_cfg = _dict_long(cfg, "h2_request_plan_count", 0);
+    if (plan_items_cfg < 0) {
+        plan_items_cfg = 0;
+    }
     _copy_upper_ascii(http_method, sizeof(http_method), _dict_cstr(cfg, "http_method", "GET"), "GET");
 
     timeout_s = _dict_double(cfg, "timeout_s", 5.0);
@@ -2961,6 +3136,35 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
         }
     }
 
+    plan_methods = _cfg_string_plan(cfg, "h2_request_plan_methods", total_attempts, H2_PLAN_METHOD_MAX_LEN, &plan_methods_used);
+    if (plan_methods == NULL && PyErr_Occurred()) {
+        result = NULL;
+        goto finalize_h2;
+    }
+    plan_paths = _cfg_string_plan(cfg, "h2_request_plan_paths", total_attempts, H2_PLAN_PATH_MAX_LEN, &plan_paths_used);
+    if (plan_paths == NULL && PyErr_Occurred()) {
+        result = NULL;
+        goto finalize_h2;
+    }
+    plan_user_agents = _cfg_string_plan(cfg, "h2_request_plan_user_agents", total_attempts, H2_PLAN_UA_MAX_LEN, &plan_uas_used);
+    if (plan_user_agents == NULL && PyErr_Occurred()) {
+        result = NULL;
+        goto finalize_h2;
+    }
+    plan_items_used = plan_methods_used;
+    if (plan_paths_used > plan_items_used) {
+        plan_items_used = plan_paths_used;
+    }
+    if (plan_uas_used > plan_items_used) {
+        plan_items_used = plan_uas_used;
+    }
+    if (plan_items_cfg > plan_items_used) {
+        plan_items_used = plan_items_cfg;
+    }
+    if (plan_items_used > total_attempts) {
+        plan_items_used = total_attempts;
+    }
+
     run_start_ns = monotonic_ns_now();
     remaining = total_attempts;
     while (remaining > 0) {
@@ -2984,6 +3188,11 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
                 scheme,
                 http_method,
                 path,
+                user_agent,
+                plan_methods,
+                plan_paths,
+                plan_user_agents,
+                plan_offset,
                 reqs,
                 timeout_ms,
                 use_tls,
@@ -2995,6 +3204,7 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
             );
             Py_END_ALLOW_THREADS
             connections_used += 1;
+            total_submitted += conn_out.submitted_count;
             sent_total += conn_out.sent;
             total_goaway += conn_out.goaway_count;
             total_rst += conn_out.rst_stream_count;
@@ -3016,6 +3226,7 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
                 }
             }
             remaining -= reqs;
+            plan_offset += reqs;
         }
     }
 
@@ -3051,6 +3262,12 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
     if (errors_total > 0) {
         if (saw_protocol_error || total_rst > 0 || total_goaway > 0) {
             final_reason = "h2_protocol_error";
+        } else if (!use_tls && sent_total == 0 && total_submitted > 0 && saw_transport_error) {
+            /*
+             * h2c path submitted requests but received no valid H2 completion:
+             * classify as protocol error (e.g. HTTP/1.x/plaintext peer).
+             */
+            final_reason = "h2_protocol_error";
         } else if (saw_transport_error) {
             final_reason = "h2_transport_error";
         } else {
@@ -3076,6 +3293,8 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
             _set_long(result, "h2_streams_per_conn", h2_streams_per_conn) < 0 ||
             _set_long(result, "h2_goaway_count", total_goaway) < 0 ||
             _set_long(result, "h2_stream_resets", total_rst) < 0 ||
+            _set_long(result, "h2_request_plan_used", plan_items_used > 0 ? 1 : 0) < 0 ||
+            _set_long(result, "h2_request_plan_items", plan_items_used) < 0 ||
             _set_double(result, "h2_stream_reset_ratio", total_attempts > 0 ? ((double)total_rst / (double)total_attempts) : 0.0) < 0 ||
             _set_str(result, "scheme", scheme) < 0) {
             Py_DECREF(result);
@@ -3083,6 +3302,10 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
         }
     }
 
+finalize_h2:
+    _free_string_plan(plan_methods, total_attempts);
+    _free_string_plan(plan_paths, total_attempts);
+    _free_string_plan(plan_user_agents, total_attempts);
     PyMem_Free(handshake_samples);
 #ifdef SAMURAI_WITH_OPENSSL
     if (tls_ctx != NULL) {
@@ -3091,6 +3314,9 @@ static PyObject *l7_run_http2_stateful(PyObject *self, PyObject *args) {
     }
     (void)tls_reason;
 #endif
+    if (result == NULL && PyErr_Occurred()) {
+        return NULL;
+    }
     return _attach_handle_stats(result, h);
 #endif
 }
@@ -3382,7 +3608,9 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
             if (attempt_idx > 0) {
                 retry_attempts += 1;
             }
+            Py_BEGIN_ALLOW_THREADS
             rc = _quic_udp_attempt(&addr, method, path, timeout_ms, verify_tls, stream_idx);
+            Py_END_ALLOW_THREADS
             if (rc == QUIC_ATTEMPT_OK) {
                 sent_total += 1;
                 if (attempt_idx > 0) {

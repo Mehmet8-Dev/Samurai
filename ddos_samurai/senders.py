@@ -2411,9 +2411,31 @@ async def http2_sender(
     If request_plan is provided, method/path/user-agent are consumed per item.
     """
     base_url = f"{scheme}://{target_ip}:{target_port}"
+
+    def _resolve_default_h2_path(path_value):
+        if isinstance(path_value, (list, tuple)):
+            for entry in path_value:
+                candidate = str(entry or "").strip()
+                if candidate:
+                    return candidate
+            return "/"
+        candidate = str(path_value or "").strip()
+        return candidate if candidate else "/"
+
+    default_http_method = str(http_method or "GET").strip() or "GET"
+    default_http_path = _resolve_default_h2_path(http_path)
+    default_user_agent = str(user_agent or "").strip()
     planned_items = []
     if request_plan is not None:
         planned_items = list(getattr(request_plan, "items", []) or [])
+    planned_methods = []
+    planned_paths = []
+    planned_user_agents = []
+    if planned_items:
+        for item in planned_items:
+            planned_methods.append(str(getattr(item, "method", default_http_method) or default_http_method))
+            planned_paths.append(str(getattr(item, "path", default_http_path) or default_http_path))
+            planned_user_agents.append(str(getattr(item, "user_agent", "") or "").strip())
     dispatch_count = int(len(planned_items) if planned_items else count)
     if dispatch_count <= 0:
         return _stats(attempted=0, sent=0, errors=0)
@@ -2439,10 +2461,17 @@ async def http2_sender(
             extra={
                 "scheme": str(scheme or "https"),
                 "verify": bool(verify),
+                "http_method": str(default_http_method),
+                "http_path": str(default_http_path),
+                "user_agent": str(default_user_agent),
                 "h2_profile": str(h2_profile_name or "none"),
                 "h2_transport": str(h2_transport_name or "auto"),
                 "h2_connections": int(http2_connections or 1),
                 "h2_streams_per_conn": int(http2_streams_per_conn or 100),
+                "h2_request_plan_count": int(dispatch_count if planned_items else 0),
+                "h2_request_plan_methods": planned_methods,
+                "h2_request_plan_paths": planned_paths,
+                "h2_request_plan_user_agents": [] if default_user_agent else planned_user_agents,
             },
         )
         c_res = await l7_c_adapter.run("http2", c_cfg)
