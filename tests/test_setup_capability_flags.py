@@ -46,3 +46,20 @@ class TestSetupCapabilityFlags(unittest.TestCase):
         self.assertFalse(caps["nghttp2"])
         self.assertFalse(caps["quic"])
 
+    def test_detect_l7_capabilities_force_flags(self):
+        setup_mod = _load_setup_module()
+        with patch.object(setup_mod, "_pkg_config_exists", return_value=False), \
+             patch.object(setup_mod.ctypes.util, "find_library", return_value=None), \
+             patch.object(setup_mod.os.path, "exists", return_value=False), \
+             patch.dict(
+                 os.environ,
+                 {
+                     "SAMURAI_FORCE_NGHTTP2": "1",
+                     "SAMURAI_FORCE_QUIC": "1",
+                 },
+                 clear=False,
+             ):
+            caps = setup_mod.detect_l7_capabilities()
+        self.assertFalse(caps["openssl"])
+        self.assertTrue(caps["nghttp2"])
+        self.assertTrue(caps["quic"])

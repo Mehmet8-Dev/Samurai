@@ -64,12 +64,18 @@ class TestL7EngineAdapter(unittest.IsolatedAsyncioTestCase):
             default_count=5,
             sender_path="C_STATE_WS",
         )
+        quic_connect = l7_engine._from_core_result(
+            {"attempted": 5, "sent": 0, "errors": 5, "sender_fallback_reason": "connect_fail"},
+            default_count=5,
+            sender_path="C_STATE_QUIC",
+        )
         normal = l7_engine._from_core_result(
             {"attempted": 5, "sent": 0, "errors": 5, "sender_fallback_reason": "none"},
             default_count=5,
             sender_path="C_STATE_WS",
         )
         self.assertTrue(bool(unsupported.allow_legacy_fallback))
+        self.assertTrue(bool(quic_connect.allow_legacy_fallback))
         self.assertFalse(bool(normal.allow_legacy_fallback))
 
     async def test_http2_and_quic_return_capability_unavailable_when_runner_is_missing(self):
