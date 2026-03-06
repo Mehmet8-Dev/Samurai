@@ -42,7 +42,8 @@ typedef enum {
     SESSION_CONNECTING = 1,
     SESSION_TLS_HANDSHAKE = 2,
     SESSION_SENDING = 3,
-    SESSION_READING = 4
+    SESSION_READING = 4,
+    SESSION_WEBSOCKET_SCENARIO = 5
 } SessionState;
 
 typedef struct {
@@ -57,6 +58,16 @@ typedef struct {
     char resp[2048];
     long long start_ns;
     long long deadline_ns;
+    int ws_scenario_enabled;
+    int ws_await_response;
+    int ws_step_index;
+    int ws_total_steps;
+    int ws_waiting_response;
+    size_t ws_frame_len;
+    size_t ws_frame_off;
+    unsigned char ws_frame[512];
+    size_t ws_recv_len;
+    unsigned char ws_recv[1024];
 #ifdef SAMURAI_WITH_OPENSSL
     SSL *ssl;
     size_t tls_pending_len;
@@ -73,6 +84,20 @@ typedef struct {
     SSL_CTX *ctx;
 #endif
 } TlsConfig;
+
+#define WS_MAX_SUBSCRIBE_MESSAGES 16
+#define WS_MAX_MESSAGE_LEN 192
+
+typedef struct {
+    int enabled;
+    int await_response;
+    int subscribe_count;
+    int ping_count;
+    int total_steps;
+    char auth_message[WS_MAX_MESSAGE_LEN];
+    char ping_message[WS_MAX_MESSAGE_LEN];
+    char subscribe_messages[WS_MAX_SUBSCRIBE_MESSAGES][WS_MAX_MESSAGE_LEN];
+} WsScenarioConfig;
 
 static long g_l7_next_id = 1;
 
@@ -356,6 +381,218 @@ static int _parse_http_status(const char *buf, size_t len) {
     return ((sp[1] - '0') * 100) + ((sp[2] - '0') * 10) + (sp[3] - '0');
 }
 
+static void _copy_bounded_cstr(char *dst, size_t dst_len, const char *src, const char *fallback) {
+    size_t i = 0;
+    const char *s = src;
+    if (dst == NULL || dst_len == 0) {
+        return;
+    }
+    if (s == NULL || s[0] == '\0') {
+        s = fallback != NULL ? fallback : "";
+    }
+    for (i = 0; i + 1 < dst_len && s[i] != '\0'; i++) {
+        dst[i] = s[i];
+    }
+    dst[i] = '\0';
+}
+
+static int _http_headers_complete(const char *buf, size_t len, size_t *header_end_out) {
+    size_t i;
+    if (buf == NULL || len < 4) {
+        return 0;
+    }
+    for (i = 0; i + 3 < len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            if (header_end_out != NULL) {
+                *header_end_out = i + 4;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int _ws_parse_subscribe_messages(WsScenarioConfig *cfg, const char *raw, long requested_count) {
+    const char *cursor;
+    int parsed = 0;
+    if (cfg == NULL) {
+        return 0;
+    }
+    if (requested_count < 0) {
+        requested_count = 0;
+    }
+    if (requested_count > WS_MAX_SUBSCRIBE_MESSAGES) {
+        requested_count = WS_MAX_SUBSCRIBE_MESSAGES;
+    }
+
+    cursor = raw;
+    while (cursor != NULL && cursor[0] != '\0' && parsed < WS_MAX_SUBSCRIBE_MESSAGES) {
+        const char *sep = strchr(cursor, '\x1f');
+        size_t len = sep != NULL ? (size_t)(sep - cursor) : strlen(cursor);
+        if (len > 0) {
+            size_t cap = sizeof(cfg->subscribe_messages[parsed]);
+            if (len >= cap) {
+                len = cap - 1;
+            }
+            memcpy(cfg->subscribe_messages[parsed], cursor, len);
+            cfg->subscribe_messages[parsed][len] = '\0';
+            parsed += 1;
+        }
+        if (sep == NULL) {
+            break;
+        }
+        cursor = sep + 1;
+    }
+
+    while (parsed < requested_count && parsed < WS_MAX_SUBSCRIBE_MESSAGES) {
+        _copy_bounded_cstr(cfg->subscribe_messages[parsed], sizeof(cfg->subscribe_messages[parsed]), "subscribe", "subscribe");
+        parsed += 1;
+    }
+    cfg->subscribe_count = parsed;
+    return parsed;
+}
+
+static const char *_ws_step_message(const WsScenarioConfig *cfg, int step_index) {
+    int idx = step_index;
+    int has_auth;
+    if (cfg == NULL || idx < 0) {
+        return NULL;
+    }
+    has_auth = cfg->auth_message[0] != '\0';
+    if (has_auth) {
+        if (idx == 0) {
+            return cfg->auth_message;
+        }
+        idx -= 1;
+    }
+    if (idx < cfg->subscribe_count) {
+        return cfg->subscribe_messages[idx];
+    }
+    idx -= cfg->subscribe_count;
+    if (idx < cfg->ping_count) {
+        return cfg->ping_message;
+    }
+    return NULL;
+}
+
+static int _ws_build_text_frame(unsigned char *dst, size_t cap, const char *message, uint32_t mask_seed) {
+    size_t payload_len;
+    size_t idx = 0;
+    unsigned char mask[4];
+    if (dst == NULL || cap < 6) {
+        return -1;
+    }
+    if (message == NULL) {
+        message = "";
+    }
+    payload_len = strlen(message);
+    if (payload_len > 65535) {
+        return -1;
+    }
+
+    dst[idx++] = 0x81; /* FIN + text frame */
+    if (payload_len < 126) {
+        dst[idx++] = (unsigned char)(0x80 | payload_len);
+    } else {
+        dst[idx++] = 0x80 | 126;
+        dst[idx++] = (unsigned char)((payload_len >> 8) & 0xFF);
+        dst[idx++] = (unsigned char)(payload_len & 0xFF);
+    }
+
+    mask[0] = (unsigned char)(mask_seed & 0xFF);
+    mask[1] = (unsigned char)((mask_seed >> 8) & 0xFF);
+    mask[2] = (unsigned char)((mask_seed >> 16) & 0xFF);
+    mask[3] = (unsigned char)((mask_seed >> 24) & 0xFF);
+    if (mask[0] == 0 && mask[1] == 0 && mask[2] == 0 && mask[3] == 0) {
+        mask[0] = 0xA5;
+        mask[1] = 0x5A;
+        mask[2] = 0x11;
+        mask[3] = 0x77;
+    }
+
+    if (idx + 4 + payload_len > cap) {
+        return -1;
+    }
+    memcpy(dst + idx, mask, 4);
+    idx += 4;
+
+    for (size_t i = 0; i < payload_len; i++) {
+        dst[idx + i] = ((const unsigned char *)message)[i] ^ mask[i & 3];
+    }
+    idx += payload_len;
+    return (int)idx;
+}
+
+static int _ws_next_frame_consumed(const unsigned char *buf, size_t len, size_t *consumed_out) {
+    size_t pos = 2;
+    uint64_t payload_len;
+    int masked;
+
+    if (buf == NULL || len < 2) {
+        return 0;
+    }
+
+    masked = (buf[1] & 0x80) ? 1 : 0;
+    payload_len = (uint64_t)(buf[1] & 0x7F);
+    if (payload_len == 126) {
+        if (len < 4) {
+            return 0;
+        }
+        payload_len = ((uint64_t)buf[2] << 8) | (uint64_t)buf[3];
+        pos = 4;
+    } else if (payload_len == 127) {
+        if (len < 10) {
+            return 0;
+        }
+        payload_len =
+            ((uint64_t)buf[2] << 56) |
+            ((uint64_t)buf[3] << 48) |
+            ((uint64_t)buf[4] << 40) |
+            ((uint64_t)buf[5] << 32) |
+            ((uint64_t)buf[6] << 24) |
+            ((uint64_t)buf[7] << 16) |
+            ((uint64_t)buf[8] << 8) |
+            (uint64_t)buf[9];
+        pos = 10;
+    }
+
+    if (masked) {
+        if (len < pos + 4) {
+            return 0;
+        }
+        pos += 4;
+    }
+    if (payload_len > (uint64_t)(SIZE_MAX - pos)) {
+        return -1;
+    }
+    if (len < pos + (size_t)payload_len) {
+        return 0;
+    }
+    if (consumed_out != NULL) {
+        *consumed_out = pos + (size_t)payload_len;
+    }
+    return 1;
+}
+
+static int _ws_consume_one_frame(Session *s) {
+    size_t consumed = 0;
+    int rc;
+    if (s == NULL) {
+        return -1;
+    }
+    rc = _ws_next_frame_consumed(s->ws_recv, s->ws_recv_len, &consumed);
+    if (rc <= 0) {
+        return rc;
+    }
+    if (consumed >= s->ws_recv_len) {
+        s->ws_recv_len = 0;
+        return 1;
+    }
+    memmove(s->ws_recv, s->ws_recv + consumed, s->ws_recv_len - consumed);
+    s->ws_recv_len -= consumed;
+    return 1;
+}
+
 static int _build_request(
     Session *s,
     const char *target_ip,
@@ -586,7 +823,8 @@ static int _session_start(
     const char *path,
     const char *http_method,
     int websocket_mode,
-    const TlsConfig *tls_cfg
+    const TlsConfig *tls_cfg,
+    const WsScenarioConfig *ws_cfg
 ) {
     int fd;
     int rc;
@@ -648,10 +886,212 @@ static int _session_start(
     s->in_use = 1;
     s->start_ns = now_ns;
     s->deadline_ns = now_ns + timeout_ns;
+    s->ws_scenario_enabled = (websocket_mode && ws_cfg != NULL && ws_cfg->enabled) ? 1 : 0;
+    s->ws_await_response = s->ws_scenario_enabled ? (ws_cfg->await_response ? 1 : 0) : 0;
+    s->ws_total_steps = s->ws_scenario_enabled ? ws_cfg->total_steps : 0;
+    s->ws_step_index = 0;
+    s->ws_waiting_response = 0;
+    s->ws_frame_len = 0;
+    s->ws_frame_off = 0;
+    s->ws_recv_len = 0;
     return 0;
 }
 
-static int _session_progress(Session *s, uint32_t events, int websocket_mode, const TlsConfig *tls_cfg) {
+static int _session_socket_send_bytes(Session *s, const unsigned char *buf, size_t len, uint32_t events) {
+    ssize_t n;
+    if (s == NULL || buf == NULL) {
+        return -1;
+    }
+    while (s->ws_frame_off < len) {
+        if (s->use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+            if ((events & EPOLLIN) != 0) {
+                int fed = _tls_feed_socket(s);
+                if (fed < 0) {
+                    return -1;
+                }
+            }
+            if (_tls_flush_socket(s) < 0) {
+                return -1;
+            }
+            int wr = SSL_write(s->ssl, buf + s->ws_frame_off, (int)(len - s->ws_frame_off));
+            if (_tls_flush_socket(s) < 0) {
+                return -1;
+            }
+            if (wr > 0) {
+                s->ws_frame_off += (size_t)wr;
+                continue;
+            }
+            wr = SSL_get_error(s->ssl, wr);
+            if (wr == SSL_ERROR_WANT_READ || wr == SSL_ERROR_WANT_WRITE) {
+                return 0;
+            }
+            return -1;
+#else
+            return -1;
+#endif
+        } else {
+            n = send(s->fd, buf + s->ws_frame_off, len - s->ws_frame_off, MSG_NOSIGNAL);
+            if (n > 0) {
+                s->ws_frame_off += (size_t)n;
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return 0;
+            }
+            return -1;
+        }
+    }
+    return 1;
+}
+
+static int _session_socket_read_ws(Session *s, uint32_t events) {
+    ssize_t n;
+    int read_any = 0;
+    if (s == NULL) {
+        return -1;
+    }
+    if (s->ws_recv_len >= sizeof(s->ws_recv)) {
+        return -1;
+    }
+
+    for (;;) {
+        if (s->use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+            if ((events & EPOLLIN) != 0) {
+                int fed = _tls_feed_socket(s);
+                if (fed < 0) {
+                    return -1;
+                }
+            }
+            if (_tls_flush_socket(s) < 0) {
+                return -1;
+            }
+            int rdret = SSL_read(s->ssl, s->ws_recv + s->ws_recv_len, (int)(sizeof(s->ws_recv) - s->ws_recv_len));
+            if (_tls_flush_socket(s) < 0) {
+                return -1;
+            }
+            if (rdret > 0) {
+                s->ws_recv_len += (size_t)rdret;
+                read_any = 1;
+                if (s->ws_recv_len >= sizeof(s->ws_recv)) {
+                    return -1;
+                }
+                continue;
+            } else {
+                int rd = SSL_get_error(s->ssl, rdret);
+                if (rd == SSL_ERROR_WANT_READ || rd == SSL_ERROR_WANT_WRITE) {
+                    return read_any ? 1 : 0;
+                }
+                if (rd == SSL_ERROR_ZERO_RETURN) {
+                    return read_any ? 1 : -1;
+                }
+                return -1;
+            }
+#else
+            return -1;
+#endif
+        } else {
+            n = recv(s->fd, s->ws_recv + s->ws_recv_len, sizeof(s->ws_recv) - s->ws_recv_len, 0);
+            if (n > 0) {
+                s->ws_recv_len += (size_t)n;
+                read_any = 1;
+                if (s->ws_recv_len >= sizeof(s->ws_recv)) {
+                    return -1;
+                }
+                continue;
+            }
+            if (n == 0) {
+                return read_any ? 1 : -1;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return read_any ? 1 : 0;
+            }
+            return -1;
+        }
+    }
+}
+
+static int _session_websocket_scenario_progress(
+    Session *s,
+    uint32_t events,
+    const WsScenarioConfig *ws_cfg
+) {
+    if (s == NULL || ws_cfg == NULL || !s->ws_scenario_enabled) {
+        return 1;
+    }
+    if (s->ws_total_steps <= 0) {
+        return 1;
+    }
+
+    for (;;) {
+        if (s->ws_step_index >= s->ws_total_steps) {
+            return 1;
+        }
+
+        if (s->ws_waiting_response) {
+            int consume_rc = _ws_consume_one_frame(s);
+            if (consume_rc > 0) {
+                s->ws_waiting_response = 0;
+                s->ws_step_index += 1;
+                continue;
+            }
+            if (consume_rc < 0) {
+                return -1;
+            }
+            int read_rc = _session_socket_read_ws(s, events);
+            if (read_rc < 0) {
+                return -1;
+            }
+            if (read_rc == 0) {
+                return 0;
+            }
+            continue;
+        }
+
+        if (s->ws_frame_len == 0) {
+            const char *msg = _ws_step_message(ws_cfg, s->ws_step_index);
+            uint32_t mask_seed = (uint32_t)(monotonic_ns_now() ^ ((long long)s->fd << 16) ^ (long long)s->ws_step_index);
+            int frame_len;
+            if (msg == NULL) {
+                s->ws_step_index = s->ws_total_steps;
+                return 1;
+            }
+            frame_len = _ws_build_text_frame(s->ws_frame, sizeof(s->ws_frame), msg, mask_seed);
+            if (frame_len < 0) {
+                return -1;
+            }
+            s->ws_frame_len = (size_t)frame_len;
+            s->ws_frame_off = 0;
+        }
+
+        {
+            int send_rc = _session_socket_send_bytes(s, s->ws_frame, s->ws_frame_len, events);
+            if (send_rc < 0) {
+                return -1;
+            }
+            if (send_rc == 0) {
+                return 0;
+            }
+        }
+
+        s->ws_frame_len = 0;
+        s->ws_frame_off = 0;
+        if (s->ws_await_response) {
+            s->ws_waiting_response = 1;
+            continue;
+        }
+        s->ws_step_index += 1;
+    }
+}
+
+static int _session_progress(
+    Session *s,
+    uint32_t events,
+    int websocket_mode,
+    const TlsConfig *tls_cfg,
+    const WsScenarioConfig *ws_cfg
+) {
     int sock_err = 0;
     socklen_t sock_err_len = sizeof(sock_err);
     ssize_t n;
@@ -797,7 +1237,30 @@ static int _session_progress(Session *s, uint32_t events, int websocket_mode, co
                             if (!websocket_mode) {
                                 return 1;
                             }
-                            return status == 101 ? 1 : -1;
+                            if (status != 101) {
+                                return -1;
+                            }
+                            if (!s->ws_scenario_enabled) {
+                                return 1;
+                            }
+                            {
+                                size_t header_end = 0;
+                                int headers_done = _http_headers_complete(s->resp, s->resp_len, &header_end);
+                                if (!headers_done) {
+                                    return -1;
+                                }
+                                if (s->resp_len > header_end) {
+                                    size_t leftover = s->resp_len - header_end;
+                                    if (leftover > sizeof(s->ws_recv)) {
+                                        return -1;
+                                    }
+                                    memcpy(s->ws_recv, s->resp + header_end, leftover);
+                                    s->ws_recv_len = leftover;
+                                }
+                            }
+                            s->resp_len = 0;
+                            s->state = SESSION_WEBSOCKET_SCENARIO;
+                            continue;
                         }
                         return -1;
                     }
@@ -819,7 +1282,33 @@ static int _session_progress(Session *s, uint32_t events, int websocket_mode, co
                     if (!websocket_mode) {
                         return 1;
                     }
-                    return status == 101 ? 1 : -1;
+                    if (status != 101) {
+                        return -1;
+                    }
+                    if (!s->ws_scenario_enabled) {
+                        return 1;
+                    }
+                    {
+                        size_t header_end = 0;
+                        int headers_done = _http_headers_complete(s->resp, s->resp_len, &header_end);
+                        if (!headers_done) {
+                            if (s->resp_len + 1 >= sizeof(s->resp)) {
+                                return -1;
+                            }
+                            return 0;
+                        }
+                        if (s->resp_len > header_end) {
+                            size_t leftover = s->resp_len - header_end;
+                            if (leftover > sizeof(s->ws_recv)) {
+                                return -1;
+                            }
+                            memcpy(s->ws_recv, s->resp + header_end, leftover);
+                            s->ws_recv_len = leftover;
+                        }
+                    }
+                    s->resp_len = 0;
+                    s->state = SESSION_WEBSOCKET_SCENARIO;
+                    continue;
                 }
 
                 if (s->resp_len + 1 >= sizeof(s->resp)) {
@@ -833,7 +1322,9 @@ static int _session_progress(Session *s, uint32_t events, int websocket_mode, co
                     if (!websocket_mode) {
                         return 1;
                     }
-                    return status == 101 ? 1 : -1;
+                    if (status == 101 && !s->ws_scenario_enabled) {
+                        return 1;
+                    }
                 }
                 return -1;
             }
@@ -843,6 +1334,14 @@ static int _session_progress(Session *s, uint32_t events, int websocket_mode, co
                 }
             }
             return -1;
+        }
+
+        if (s->state == SESSION_WEBSOCKET_SCENARIO) {
+            int ws_rc = _session_websocket_scenario_progress(s, events, ws_cfg);
+            if (ws_rc == 0) {
+                return 0;
+            }
+            return ws_rc > 0 ? 1 : -1;
         }
 
         return -1;
@@ -867,6 +1366,7 @@ static int _run_single_pass(
     const char *http_method,
     int websocket_mode,
     const TlsConfig *tls_cfg,
+    const WsScenarioConfig *ws_cfg,
     long long *latency_samples,
     long latency_sample_cap,
     long *latency_sample_count,
@@ -938,7 +1438,8 @@ static int _run_single_pass(
                     path,
                     http_method,
                     websocket_mode,
-                    tls_cfg
+                    tls_cfg,
+                    ws_cfg
                 ) < 0) {
                 errors += 1;
                 completed += 1;
@@ -972,7 +1473,7 @@ static int _run_single_pass(
                         continue;
                     }
 
-                    outcome = _session_progress(s, events[j].events, websocket_mode, tls_cfg);
+                    outcome = _session_progress(s, events[j].events, websocket_mode, tls_cfg, ws_cfg);
                     if (outcome == 0) {
                         continue;
                     }
@@ -1200,9 +1701,12 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
     int use_tls;
     const char *server_name;
     char http_method[24];
+    long ws_scenario_enabled;
     long ws_ping_count;
     long ws_subscribe_count;
     const char *ws_auth_message;
+    const char *ws_subscribe_messages;
+    const char *ws_ping_message;
     int ws_await_response;
     struct sockaddr_in addr;
     long long timeout_ns;
@@ -1224,6 +1728,7 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
     const char *final_reason = "none";
     PyObject *result = NULL;
     TlsConfig tls_cfg;
+    WsScenarioConfig ws_cfg;
 #ifdef SAMURAI_WITH_OPENSSL
     const char *tls_setup_reason = "none";
 #endif
@@ -1265,6 +1770,7 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
     tls_cfg.enabled = use_tls ? 1 : 0;
     tls_cfg.verify_peer = verify_tls ? 1 : 0;
     tls_cfg.server_name = server_name;
+    memset(&ws_cfg, 0, sizeof(ws_cfg));
 
     if (max_retries < 0) {
         max_retries = 0;
@@ -1306,26 +1812,42 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
     }
 
     if (websocket_mode) {
+        ws_scenario_enabled = _dict_bool(cfg, "ws_scenario_enabled", 0);
         ws_ping_count = _dict_long(cfg, "ws_ping_count", 1);
         ws_subscribe_count = _dict_long(cfg, "ws_subscribe_count", 0);
         ws_auth_message = _dict_cstr(cfg, "ws_auth_message", "");
+        ws_subscribe_messages = _dict_cstr(cfg, "ws_subscribe_messages", "");
+        ws_ping_message = _dict_cstr(cfg, "ws_ping_message", "ping");
         ws_await_response = _dict_bool(cfg, "ws_await_response", 0);
-        if (ws_ping_count > 1 || ws_subscribe_count > 0 || ws_auth_message[0] != '\0' || ws_await_response) {
-            return _attach_handle_stats(
-                _make_result(
-                    total_attempts,
-                    0,
-                    total_attempts,
-                    0,
-                    0.0,
-                    0.0,
-                    sender_path,
-                    "ws_scenario_unsupported",
-                    0,
-                    0
-                ),
-                handle
-            );
+        if (ws_ping_count < 0) {
+            ws_ping_count = 0;
+        }
+        if (ws_ping_count > 512) {
+            ws_ping_count = 512;
+        }
+        if (ws_subscribe_count < 0) {
+            ws_subscribe_count = 0;
+        }
+        if (ws_subscribe_count > WS_MAX_SUBSCRIBE_MESSAGES) {
+            ws_subscribe_count = WS_MAX_SUBSCRIBE_MESSAGES;
+        }
+
+        _copy_bounded_cstr(ws_cfg.auth_message, sizeof(ws_cfg.auth_message), ws_auth_message, "");
+        _copy_bounded_cstr(ws_cfg.ping_message, sizeof(ws_cfg.ping_message), ws_ping_message, "ping");
+        ws_cfg.await_response = ws_await_response ? 1 : 0;
+        ws_cfg.ping_count = (int)ws_ping_count;
+        ws_cfg.subscribe_count = _ws_parse_subscribe_messages(&ws_cfg, ws_subscribe_messages, ws_subscribe_count);
+        ws_cfg.enabled = ws_scenario_enabled ? 1 : 0;
+        if (!ws_cfg.enabled &&
+            (ws_cfg.await_response || ws_cfg.ping_count != 1 || ws_cfg.subscribe_count > 0 || ws_cfg.auth_message[0] != '\0')) {
+            ws_cfg.enabled = 1;
+        }
+        ws_cfg.total_steps =
+            (ws_cfg.auth_message[0] != '\0' ? 1 : 0) +
+            ws_cfg.subscribe_count +
+            ws_cfg.ping_count;
+        if (ws_cfg.total_steps < 0) {
+            ws_cfg.total_steps = 0;
         }
     }
 
@@ -1393,6 +1915,7 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
             http_method,
             websocket_mode,
             &tls_cfg,
+            websocket_mode ? &ws_cfg : NULL,
             latency_samples,
             latency_sample_cap,
             &latency_sample_count,
@@ -1491,6 +2014,15 @@ static PyObject *_run_state_machine(PyObject *cfg, int websocket_mode, const cha
             _set_str(result, "scheme", scheme) < 0) {
             Py_DECREF(result);
             result = NULL;
+        } else if (websocket_mode) {
+            if (_set_long(result, "ws_scenario_enabled", ws_cfg.enabled ? 1 : 0) < 0 ||
+                _set_long(result, "ws_step_count", ws_cfg.total_steps) < 0 ||
+                _set_long(result, "ws_subscribe_count", ws_cfg.subscribe_count) < 0 ||
+                _set_long(result, "ws_ping_count", ws_cfg.ping_count) < 0 ||
+                _set_long(result, "ws_await_response", ws_cfg.await_response ? 1 : 0) < 0) {
+                Py_DECREF(result);
+                result = NULL;
+            }
         }
     }
 
