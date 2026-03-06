@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
 
+from .l7 import quic_h3_bridge
+
 log = logging.getLogger(__name__)
 
 try:
@@ -91,6 +93,10 @@ class L7EngineResult:
 
 def is_c_state_available() -> bool:
     return _l7_core is not None
+
+
+def quic_py_bridge_supported() -> bool:
+    return bool(quic_h3_bridge.supported())
 
 
 def _normalize_engine(name: str | None) -> str:
@@ -358,6 +364,27 @@ async def run_quic_stateful(config: L7EngineConfig) -> Optional[L7EngineResult]:
     if count <= 0:
         return L7EngineResult(handled=True, attempted=0, sent=0, errors=0, sender_path="C_STATE_QUIC")
 
+    payload = config.as_dict()
+    bridge_enabled = bool(int(payload.get("enable_quic_py_bridge", 0) or 0))
+    if bridge_enabled and quic_h3_bridge.supported():
+        try:
+            raw = await quic_h3_bridge.run_stateful(payload)
+            out = _from_core_result(raw, default_count=count, sender_path="C_STATE_QUIC_H3PY")
+            # Bridge path is already the final H3 execution path.
+            out.allow_legacy_fallback = False
+            return out
+        except Exception as exc:
+            log.warning("l7 quic_h3_bridge.run_stateful failed: %s", exc)
+            return L7EngineResult(
+                handled=True,
+                attempted=count,
+                sent=0,
+                errors=count,
+                sender_path="C_STATE_QUIC_H3PY_FAILED",
+                sender_fallback_reason=f"quic_h3_bridge_error:{type(exc).__name__}",
+                allow_legacy_fallback=False,
+            )
+
     if _l7_core is None:
         return L7EngineResult(
             handled=True,
@@ -389,7 +416,6 @@ async def run_quic_stateful(config: L7EngineConfig) -> Optional[L7EngineResult]:
             allow_legacy_fallback=True,
         )
 
-    payload = config.as_dict()
     try:
         raw, snap = await _invoke_core_runner_async("run_quic_stateful", payload)
         if snap:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from .. import l7_engine as _adapter
+from . import quic_h3_bridge
 
 _FN_BY_PROTOCOL = {
     "http1": "run_http1_stateful",
@@ -28,6 +29,7 @@ _UNAVAILABLE_PATH = {
 
 def capability_map() -> Dict[str, Any]:
     core = getattr(_adapter, "_l7_core", None)
+
     def _has(protocol_runner: str, support_probe: str | None = None) -> bool:
         if core is None or not hasattr(core, protocol_runner):
             return False
@@ -37,20 +39,31 @@ def capability_map() -> Dict[str, Any]:
             except Exception:
                 return False
         return True
+
     quic_mode = "unavailable"
     if core is not None and hasattr(core, "quic_stack_mode"):
         try:
             quic_mode = str(getattr(core, "quic_stack_mode")() or "unavailable")
         except Exception:
             quic_mode = "unavailable"
+
+    bridge_mode = str(quic_h3_bridge.stack_mode() or "unavailable")
+    if not str(quic_mode).startswith("h3_stateful") and str(bridge_mode).startswith("h3_stateful"):
+        quic_mode = bridge_mode
+
+    quic_supported = _has("run_quic_stateful", "quic_supported")
+    quic_h3_stateful = str(quic_mode).startswith("h3_stateful")
+    if quic_h3_stateful:
+        quic_supported = True
+
     return {
         "core_available": bool(core is not None),
         "http1": _has("run_http1_stateful"),
         "ws": _has("run_websocket_stateful"),
         "http2": _has("run_http2_stateful", "h2_supported"),
-        "quic": _has("run_quic_stateful", "quic_supported"),
+        "quic": bool(quic_supported),
         "quic_stack_mode": quic_mode,
-        "quic_h3_stateful": quic_mode == "h3_stateful",
+        "quic_h3_stateful": bool(quic_h3_stateful),
     }
 
 
@@ -65,6 +78,9 @@ def make_config(
     session_repeats: int = 1,
     max_active_sessions: int = 0,
 ) -> _adapter.L7EngineConfig:
+    payload_extra = dict(extra or {})
+    if str(mode or "http1_stateful").strip().lower() == "quic_stateful":
+        payload_extra.setdefault("enable_quic_py_bridge", 1)
     return _adapter.L7EngineConfig(
         engine="c_state",
         target_ip=str(target_ip),
@@ -74,7 +90,7 @@ def make_config(
         session_repeats=int(session_repeats or 1),
         max_active_sessions=int(max_active_sessions or 0),
         mode=str(mode or "http1_stateful"),
-        extra=dict(extra or {}),
+        extra=payload_extra,
     )
 
 
