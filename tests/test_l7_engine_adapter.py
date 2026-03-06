@@ -72,3 +72,31 @@ class TestL7EngineAdapter(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bool(unsupported.allow_legacy_fallback))
         self.assertFalse(bool(normal.allow_legacy_fallback))
 
+    async def test_http2_and_quic_return_capability_unavailable_when_runner_is_missing(self):
+        fake_core = _FakeL7Core()
+        with patch.object(l7_engine, "_l7_core", fake_core), patch.object(l7_engine, "_CORE_HANDLE", None):
+            cfg_h2 = l7_engine.L7EngineConfig(
+                engine="c_state",
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=2,
+                concurrency=1,
+                mode="http2_stateful",
+            )
+            cfg_quic = l7_engine.L7EngineConfig(
+                engine="c_state",
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=2,
+                concurrency=1,
+                mode="quic_stateful",
+            )
+            h2_out = await l7_engine.run_http2_stateful(cfg_h2)
+            quic_out = await l7_engine.run_quic_stateful(cfg_quic)
+
+        self.assertIsNotNone(h2_out)
+        self.assertIsNotNone(quic_out)
+        self.assertEqual(h2_out.sender_fallback_reason, "h2_capability_unavailable")
+        self.assertEqual(quic_out.sender_fallback_reason, "quic_capability_unavailable")
+        self.assertTrue(h2_out.allow_legacy_fallback)
+        self.assertTrue(quic_out.allow_legacy_fallback)
