@@ -619,6 +619,25 @@ def build_live_attack_report(
     session_success_rate_weight = 0
     retry_success_rate_weighted_sum = 0.0
     retry_success_rate_weight = 0
+    l7_engine_path_used = ""
+    l7_fallback_reason = "none"
+    l7_capability_status = "ok"
+    h2_goaway_count_total = 0
+    h2_stream_resets_total = 0
+    h2_connections_used_total = 0
+    h2_request_plan_used_any = 0
+    h2_request_plan_items_total = 0
+    h2_stream_reset_ratio_weighted_sum = 0.0
+    h2_stream_reset_ratio_weight = 0
+    quic_connect_fail_count_total = 0
+    quic_connect_timeout_count_total = 0
+    quic_tls_fail_count_total = 0
+    quic_handshake_timeout_count_total = 0
+    quic_stream_fail_count_total = 0
+    quic_stream_fail_ratio_weighted_sum = 0.0
+    quic_stream_fail_ratio_weight = 0
+    quic_handshake_fail_ratio_weighted_sum = 0.0
+    quic_handshake_fail_ratio_weight = 0
     dp_queue_ids_used: set[int] = set()
     dp_affinity_cpus_used: set[int] = set()
     dp_queue_strategy = "unknown"
@@ -995,6 +1014,81 @@ def build_live_attack_report(
         if _retry_success_rate > 0.0:
             retry_success_rate_weighted_sum += (_retry_success_rate * max(1, attempted))
             retry_success_rate_weight += max(1, attempted)
+        _l7_engine_path_item = str(
+            ev.get("l7_engine_path_used", st.get("l7_engine_path_used", ""))
+            or ""
+        ).strip()
+        if _l7_engine_path_item:
+            if not l7_engine_path_used:
+                l7_engine_path_used = _l7_engine_path_item
+            elif l7_engine_path_used != _l7_engine_path_item and l7_engine_path_used != "mixed":
+                l7_engine_path_used = "mixed"
+        _l7_fallback_reason_item = str(
+            ev.get("l7_fallback_reason", st.get("l7_fallback_reason", ""))
+            or ""
+        ).strip()
+        if _l7_fallback_reason_item:
+            if l7_fallback_reason in ("", "none"):
+                l7_fallback_reason = _l7_fallback_reason_item
+            elif (
+                _l7_fallback_reason_item != "none"
+                and l7_fallback_reason != _l7_fallback_reason_item
+                and l7_fallback_reason != "mixed"
+            ):
+                l7_fallback_reason = "mixed"
+        _l7_capability_item = str(
+            ev.get("l7_capability_status", st.get("l7_capability_status", ""))
+            or ""
+        ).strip().lower()
+        if _l7_capability_item in {"ok", "partial", "missing"}:
+            if l7_capability_status == "missing" or _l7_capability_item == "missing":
+                l7_capability_status = "missing"
+            elif l7_capability_status == "partial" or _l7_capability_item == "partial":
+                l7_capability_status = "partial"
+            else:
+                l7_capability_status = "ok"
+        h2_goaway_count_total += int(ev.get("h2_goaway_count", st.get("h2_goaway_count", 0)) or 0)
+        h2_stream_resets_total += int(ev.get("h2_stream_resets", st.get("h2_stream_resets", 0)) or 0)
+        h2_connections_used_total += int(ev.get("h2_connections_used", st.get("h2_connections_used", 0)) or 0)
+        h2_request_plan_used_any = max(
+            int(h2_request_plan_used_any),
+            int(ev.get("h2_request_plan_used", st.get("h2_request_plan_used", 0)) or 0),
+        )
+        h2_request_plan_items_total += int(
+            ev.get("h2_request_plan_items", st.get("h2_request_plan_items", 0)) or 0
+        )
+        _h2_stream_reset_ratio = float(
+            ev.get("h2_stream_reset_ratio", st.get("h2_stream_reset_ratio", 0.0)) or 0.0
+        )
+        if attempted > 0:
+            h2_stream_reset_ratio_weighted_sum += (_h2_stream_reset_ratio * attempted)
+            h2_stream_reset_ratio_weight += attempted
+        quic_connect_fail_count_total += int(
+            ev.get("quic_connect_fail_count", st.get("quic_connect_fail_count", 0)) or 0
+        )
+        quic_connect_timeout_count_total += int(
+            ev.get("quic_connect_timeout_count", st.get("quic_connect_timeout_count", 0)) or 0
+        )
+        quic_tls_fail_count_total += int(
+            ev.get("quic_tls_fail_count", st.get("quic_tls_fail_count", 0)) or 0
+        )
+        quic_handshake_timeout_count_total += int(
+            ev.get("quic_handshake_timeout_count", st.get("quic_handshake_timeout_count", 0)) or 0
+        )
+        quic_stream_fail_count_total += int(
+            ev.get("quic_stream_fail_count", st.get("quic_stream_fail_count", 0)) or 0
+        )
+        _quic_stream_fail_ratio = float(
+            ev.get("quic_stream_fail_ratio", st.get("quic_stream_fail_ratio", 0.0)) or 0.0
+        )
+        _quic_handshake_fail_ratio = float(
+            ev.get("quic_handshake_fail_ratio", st.get("quic_handshake_fail_ratio", 0.0)) or 0.0
+        )
+        if attempted > 0:
+            quic_stream_fail_ratio_weighted_sum += (_quic_stream_fail_ratio * attempted)
+            quic_stream_fail_ratio_weight += attempted
+            quic_handshake_fail_ratio_weighted_sum += (_quic_handshake_fail_ratio * attempted)
+            quic_handshake_fail_ratio_weight += attempted
         _bp = int(ev.get("queue_backlog_peak", 0) or 0)
         if _bp > backlog_peak_max:
             backlog_peak_max = _bp
@@ -1053,6 +1147,15 @@ def build_live_attack_report(
     retry_success_rate = (
         float(retry_success_rate_weighted_sum) / float(retry_success_rate_weight)
     ) if retry_success_rate_weight > 0 else 0.0
+    h2_stream_reset_ratio = (
+        float(h2_stream_reset_ratio_weighted_sum) / float(h2_stream_reset_ratio_weight)
+    ) if h2_stream_reset_ratio_weight > 0 else 0.0
+    quic_stream_fail_ratio = (
+        float(quic_stream_fail_ratio_weighted_sum) / float(quic_stream_fail_ratio_weight)
+    ) if quic_stream_fail_ratio_weight > 0 else 0.0
+    quic_handshake_fail_ratio = (
+        float(quic_handshake_fail_ratio_weighted_sum) / float(quic_handshake_fail_ratio_weight)
+    ) if quic_handshake_fail_ratio_weight > 0 else 0.0
     txring_tp_drops_bounded_total = min(
         int(txring_tp_drops_total),
         int(txring_tp_packets_total),
@@ -1302,6 +1405,22 @@ def build_live_attack_report(
             "l7_step_fail_ratio": round(float(l7_step_fail_ratio), 6),
             "session_success_rate": round(float(session_success_rate), 6),
             "retry_success_rate": round(float(retry_success_rate), 6),
+            "l7_engine_path_used": str(l7_engine_path_used),
+            "l7_fallback_reason": str(l7_fallback_reason),
+            "l7_capability_status": str(l7_capability_status),
+            "h2_goaway_count": int(h2_goaway_count_total),
+            "h2_stream_resets": int(h2_stream_resets_total),
+            "h2_connections_used": int(h2_connections_used_total),
+            "h2_request_plan_used": int(h2_request_plan_used_any),
+            "h2_request_plan_items": int(h2_request_plan_items_total),
+            "h2_stream_reset_ratio": round(float(h2_stream_reset_ratio), 6),
+            "quic_connect_fail_count": int(quic_connect_fail_count_total),
+            "quic_connect_timeout_count": int(quic_connect_timeout_count_total),
+            "quic_tls_fail_count": int(quic_tls_fail_count_total),
+            "quic_handshake_timeout_count": int(quic_handshake_timeout_count_total),
+            "quic_stream_fail_count": int(quic_stream_fail_count_total),
+            "quic_stream_fail_ratio": round(float(quic_stream_fail_ratio), 6),
+            "quic_handshake_fail_ratio": round(float(quic_handshake_fail_ratio), 6),
             "dp_queue_ids_used": sorted(int(x) for x in list(dp_queue_ids_used)),
             "dp_affinity_cpus_used": sorted(int(x) for x in list(dp_affinity_cpus_used)),
             "dp_queue_strategy": str(dp_queue_strategy or "unknown"),

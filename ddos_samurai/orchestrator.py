@@ -140,6 +140,22 @@ def _empty_stats() -> dict:
         "l7_step_fail_ratio": 0.0,
         "session_success_rate": 0.0,
         "retry_success_rate": 0.0,
+        "l7_engine_path_used": "",
+        "l7_fallback_reason": "none",
+        "l7_capability_status": "ok",
+        "h2_goaway_count": 0,
+        "h2_stream_resets": 0,
+        "h2_connections_used": 0,
+        "h2_request_plan_used": 0,
+        "h2_request_plan_items": 0,
+        "h2_stream_reset_ratio": 0.0,
+        "quic_connect_fail_count": 0,
+        "quic_connect_timeout_count": 0,
+        "quic_tls_fail_count": 0,
+        "quic_handshake_timeout_count": 0,
+        "quic_stream_fail_count": 0,
+        "quic_stream_fail_ratio": 0.0,
+        "quic_handshake_fail_ratio": 0.0,
         "dp_queue_id": -1,
         "dp_queue_strategy": "unknown",
         "dp_affinity_cpu": -1,
@@ -471,6 +487,51 @@ def _add_stats(acc: dict, item: dict) -> dict:
     item_retry_success_rate = float(item.get("retry_success_rate", 0.0) or 0.0)
     if item_retry_success_rate > 0.0 or float(acc.get("retry_success_rate", 0.0) or 0.0) == 0.0:
         acc["retry_success_rate"] = item_retry_success_rate
+    item_l7_engine_path_used = str(item.get("l7_engine_path_used", "") or "").strip()
+    if item_l7_engine_path_used:
+        current_l7_engine_path_used = str(acc.get("l7_engine_path_used", "") or "").strip()
+        if not current_l7_engine_path_used:
+            acc["l7_engine_path_used"] = item_l7_engine_path_used
+        elif current_l7_engine_path_used != item_l7_engine_path_used and current_l7_engine_path_used != "mixed":
+            acc["l7_engine_path_used"] = "mixed"
+    item_l7_fallback_reason = str(item.get("l7_fallback_reason", "") or "").strip()
+    if item_l7_fallback_reason:
+        current_l7_fallback_reason = str(acc.get("l7_fallback_reason", "") or "").strip()
+        if not current_l7_fallback_reason or current_l7_fallback_reason == "none":
+            acc["l7_fallback_reason"] = item_l7_fallback_reason
+        elif item_l7_fallback_reason != "none" and current_l7_fallback_reason != item_l7_fallback_reason and current_l7_fallback_reason != "mixed":
+            acc["l7_fallback_reason"] = "mixed"
+    item_l7_capability_status = str(item.get("l7_capability_status", "") or "").strip().lower()
+    if item_l7_capability_status in {"ok", "partial", "missing"}:
+        current_l7_capability_status = str(acc.get("l7_capability_status", "ok") or "ok").strip().lower()
+        if current_l7_capability_status == "missing" or item_l7_capability_status == "missing":
+            acc["l7_capability_status"] = "missing"
+        elif current_l7_capability_status == "partial" or item_l7_capability_status == "partial":
+            acc["l7_capability_status"] = "partial"
+        else:
+            acc["l7_capability_status"] = "ok"
+    acc["h2_goaway_count"] = int(acc.get("h2_goaway_count", 0)) + int(item.get("h2_goaway_count", 0) or 0)
+    acc["h2_stream_resets"] = int(acc.get("h2_stream_resets", 0)) + int(item.get("h2_stream_resets", 0) or 0)
+    acc["h2_connections_used"] = int(acc.get("h2_connections_used", 0)) + int(item.get("h2_connections_used", 0) or 0)
+    acc["h2_request_plan_used"] = max(
+        int(acc.get("h2_request_plan_used", 0) or 0),
+        int(item.get("h2_request_plan_used", 0) or 0),
+    )
+    acc["h2_request_plan_items"] = int(acc.get("h2_request_plan_items", 0)) + int(item.get("h2_request_plan_items", 0) or 0)
+    item_h2_stream_reset_ratio = float(item.get("h2_stream_reset_ratio", 0.0) or 0.0)
+    if item_h2_stream_reset_ratio > 0.0 or float(acc.get("h2_stream_reset_ratio", 0.0) or 0.0) == 0.0:
+        acc["h2_stream_reset_ratio"] = item_h2_stream_reset_ratio
+    acc["quic_connect_fail_count"] = int(acc.get("quic_connect_fail_count", 0)) + int(item.get("quic_connect_fail_count", 0) or 0)
+    acc["quic_connect_timeout_count"] = int(acc.get("quic_connect_timeout_count", 0)) + int(item.get("quic_connect_timeout_count", 0) or 0)
+    acc["quic_tls_fail_count"] = int(acc.get("quic_tls_fail_count", 0)) + int(item.get("quic_tls_fail_count", 0) or 0)
+    acc["quic_handshake_timeout_count"] = int(acc.get("quic_handshake_timeout_count", 0)) + int(item.get("quic_handshake_timeout_count", 0) or 0)
+    acc["quic_stream_fail_count"] = int(acc.get("quic_stream_fail_count", 0)) + int(item.get("quic_stream_fail_count", 0) or 0)
+    item_quic_stream_fail_ratio = float(item.get("quic_stream_fail_ratio", 0.0) or 0.0)
+    if item_quic_stream_fail_ratio > 0.0 or float(acc.get("quic_stream_fail_ratio", 0.0) or 0.0) == 0.0:
+        acc["quic_stream_fail_ratio"] = item_quic_stream_fail_ratio
+    item_quic_handshake_fail_ratio = float(item.get("quic_handshake_fail_ratio", 0.0) or 0.0)
+    if item_quic_handshake_fail_ratio > 0.0 or float(acc.get("quic_handshake_fail_ratio", 0.0) or 0.0) == 0.0:
+        acc["quic_handshake_fail_ratio"] = item_quic_handshake_fail_ratio
     item_dp_queue_id = int(item.get("dp_queue_id", -1) or -1)
     if item_dp_queue_id >= 0:
         current_dp_queue_id = int(acc.get("dp_queue_id", -1) or -1)
@@ -2485,6 +2546,22 @@ async def worker_process(
                 _l7_step_fail_ratio = float(worker_stats.get("l7_step_fail_ratio", 0.0) or 0.0)
                 _session_success_rate = float(worker_stats.get("session_success_rate", 0.0) or 0.0)
                 _retry_success_rate = float(worker_stats.get("retry_success_rate", 0.0) or 0.0)
+                _l7_engine_path_used = str(worker_stats.get("l7_engine_path_used", "") or "")
+                _l7_fallback_reason = str(worker_stats.get("l7_fallback_reason", "none") or "none")
+                _l7_capability_status = str(worker_stats.get("l7_capability_status", "ok") or "ok")
+                _h2_goaway_count = int(worker_stats.get("h2_goaway_count", 0) or 0)
+                _h2_stream_resets = int(worker_stats.get("h2_stream_resets", 0) or 0)
+                _h2_connections_used = int(worker_stats.get("h2_connections_used", 0) or 0)
+                _h2_request_plan_used = int(worker_stats.get("h2_request_plan_used", 0) or 0)
+                _h2_request_plan_items = int(worker_stats.get("h2_request_plan_items", 0) or 0)
+                _h2_stream_reset_ratio = float(worker_stats.get("h2_stream_reset_ratio", 0.0) or 0.0)
+                _quic_connect_fail_count = int(worker_stats.get("quic_connect_fail_count", 0) or 0)
+                _quic_connect_timeout_count = int(worker_stats.get("quic_connect_timeout_count", 0) or 0)
+                _quic_tls_fail_count = int(worker_stats.get("quic_tls_fail_count", 0) or 0)
+                _quic_handshake_timeout_count = int(worker_stats.get("quic_handshake_timeout_count", 0) or 0)
+                _quic_stream_fail_count = int(worker_stats.get("quic_stream_fail_count", 0) or 0)
+                _quic_stream_fail_ratio = float(worker_stats.get("quic_stream_fail_ratio", 0.0) or 0.0)
+                _quic_handshake_fail_ratio = float(worker_stats.get("quic_handshake_fail_ratio", 0.0) or 0.0)
                 _dp_queue_id = int(worker_stats.get("dp_queue_id", -1) or -1)
                 _dp_queue_strategy = str(worker_stats.get("dp_queue_strategy", "rr") or "rr")
                 _dp_affinity_cpu = int(worker_stats.get("dp_affinity_cpu", -1) or -1)
@@ -2599,6 +2676,22 @@ async def worker_process(
                         "l7_step_fail_ratio": _l7_step_fail_ratio,
                         "session_success_rate": _session_success_rate,
                         "retry_success_rate": _retry_success_rate,
+                        "l7_engine_path_used": _l7_engine_path_used,
+                        "l7_fallback_reason": _l7_fallback_reason,
+                        "l7_capability_status": _l7_capability_status,
+                        "h2_goaway_count": _h2_goaway_count,
+                        "h2_stream_resets": _h2_stream_resets,
+                        "h2_connections_used": _h2_connections_used,
+                        "h2_request_plan_used": _h2_request_plan_used,
+                        "h2_request_plan_items": _h2_request_plan_items,
+                        "h2_stream_reset_ratio": _h2_stream_reset_ratio,
+                        "quic_connect_fail_count": _quic_connect_fail_count,
+                        "quic_connect_timeout_count": _quic_connect_timeout_count,
+                        "quic_tls_fail_count": _quic_tls_fail_count,
+                        "quic_handshake_timeout_count": _quic_handshake_timeout_count,
+                        "quic_stream_fail_count": _quic_stream_fail_count,
+                        "quic_stream_fail_ratio": _quic_stream_fail_ratio,
+                        "quic_handshake_fail_ratio": _quic_handshake_fail_ratio,
                         "dp_queue_id": _dp_queue_id,
                         "dp_queue_strategy": _dp_queue_strategy,
                         "dp_affinity_cpu": _dp_affinity_cpu,
