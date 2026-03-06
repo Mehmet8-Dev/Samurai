@@ -2098,6 +2098,7 @@ async def worker_process(
                 verbose=args['verbose'],
                 ssl_context=ssl_context,
                 l7_quic_engine=args.get("l7_quic_engine", "auto"),
+                l7_quic_require_native=bool(args.get("l7_quic_require_native", False)),
                 l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
                 l7_capability_strict=bool(args.get("l7_capability_strict", False)),
                 lab_profile=args.get("lab_profile", "off"),

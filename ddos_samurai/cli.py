@@ -294,6 +294,7 @@ def _report_inputs_from_args(args) -> dict:
         "l7_engine": str(getattr(args, "l7_engine", "python")),
         "l7_http2_engine": str(getattr(args, "l7_http2_engine", "auto")),
         "l7_quic_engine": str(getattr(args, "l7_quic_engine", "auto")),
+        "l7_quic_require_native": bool(getattr(args, "l7_quic_require_native", False)),
         "l7_fallback_policy": str(getattr(args, "l7_fallback_policy", "allow")),
         "l7_capability_strict": bool(getattr(args, "l7_capability_strict", False)),
         "legacy_path_enable": bool(getattr(args, "legacy_path_enable", False)),
@@ -397,6 +398,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
     lab_profile = str(getattr(args, "lab_profile", "off") or "off").strip().lower()
     dp_queue_strategy = str(getattr(args, "dp_queue_strategy", "rr") or "rr").strip().lower()
     dp_queue_map = str(getattr(args, "dp_queue_map", "") or "").strip()
+    l7_quic_require_native = bool(getattr(args, "l7_quic_require_native", False))
+    l7_quic_engine = str(getattr(args, "l7_quic_engine", "auto") or "auto").strip().lower()
 
     if int(getattr(args, "xdp_queue_id", 0) or 0) < 0:
         parser.error("Hata: --xdp-queue-id >= 0 olmalıdır.")
@@ -427,6 +430,11 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         and lab_profile != "dedicated"
     ):
         parser.error("Hata: --kpi-hard-fail için --kpi-gate-profile off olamaz.")
+    if l7_quic_require_native:
+        if not bool(getattr(args, "l7_capability_strict", False)) and lab_profile != "dedicated":
+            parser.error("Hata: --l7-quic-require-native için --l7-capability-strict zorunludur.")
+        if l7_quic_engine == "python":
+            parser.error("Hata: --l7-quic-require-native ile --l7-quic-engine python kullanılamaz.")
     if lab_profile == "dedicated":
         if sender_backend == "auto":
             parser.error("Hata: --lab-profile dedicated için --sender-backend explicit olmalıdır (auto kullanılamaz).")
@@ -553,6 +561,7 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
     capability_strict = bool(getattr(args, "l7_capability_strict", False))
     legacy_path_enable = bool(getattr(args, "legacy_path_enable", False))
     lab_profile = str(getattr(args, "lab_profile", "off") or "off")
+    quic_require_native = bool(getattr(args, "l7_quic_require_native", False))
 
     def _check(protocol: str, *, protocol_engine: str, global_engine: str, legacy: bool, hint: str) -> None:
         route = _l7_dispatch.build_route_decision(
@@ -574,12 +583,18 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
         if route.engine != "c_state":
             return
         if bool(caps.get(str(protocol), False)):
-            if str(protocol) == "quic" and not bool(caps.get("quic_h3_stateful", False)):
+            if str(protocol) == "quic":
                 mode = str(caps.get("quic_stack_mode", "unknown") or "unknown")
-                parser.error(
-                    "Hata: L7 capability strict aktifken C QUIC engine yalnızca tam H3 stateful modda kabul edilir. "
-                    f"mevcut_quic_mode={mode}"
-                )
+                if quic_require_native and str(mode) != "h3_stateful":
+                    parser.error(
+                        "Hata: --l7-quic-require-native aktifken QUIC mode native h3_stateful olmalıdır. "
+                        f"mevcut_quic_mode={mode}"
+                    )
+                if not bool(caps.get("quic_h3_stateful", False)):
+                    parser.error(
+                        "Hata: L7 capability strict aktifken C QUIC engine yalnızca tam H3 stateful modda kabul edilir. "
+                        f"mevcut_quic_mode={mode}"
+                    )
             return
         parser.error(
             "Hata: L7 capability strict aktifken seçili C engine mevcut değil: "
@@ -792,6 +807,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["python", "c_state", "auto"],
         default=str(os.environ.get("SAMURAI_L7_QUIC_ENGINE", "auto") or "auto"),
         help="QUIC L7 engine seçimi: python|c_state|auto.",
+    )
+    parser.add_argument(
+        "--l7-quic-require-native",
+        action="store_true",
+        default=str(os.environ.get("SAMURAI_L7_QUIC_REQUIRE_NATIVE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
+        help="QUIC için yalnızca native C h3_stateful modunu kabul et (py-bridge kabul edilmez).",
     )
     parser.add_argument(
         "--l7-fallback-policy",
@@ -1328,6 +1349,7 @@ def main(argv=None):
     os.environ["SAMURAI_L7_ENGINE"] = str(getattr(args, "l7_engine", "python") or "python")
     os.environ["SAMURAI_L7_HTTP2_ENGINE"] = str(getattr(args, "l7_http2_engine", "auto") or "auto")
     os.environ["SAMURAI_L7_QUIC_ENGINE"] = str(getattr(args, "l7_quic_engine", "auto") or "auto")
+    os.environ["SAMURAI_L7_QUIC_REQUIRE_NATIVE"] = "1" if bool(getattr(args, "l7_quic_require_native", False)) else "0"
     os.environ["SAMURAI_L7_FALLBACK_POLICY"] = str(getattr(args, "l7_fallback_policy", "allow") or "allow")
     os.environ["SAMURAI_L7_CAPABILITY_STRICT"] = "1" if bool(getattr(args, "l7_capability_strict", False)) else "0"
     os.environ["SAMURAI_LEGACY_PATH_ENABLE"] = "1" if bool(getattr(args, "legacy_path_enable", False)) else "0"

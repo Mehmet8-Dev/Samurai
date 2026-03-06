@@ -99,6 +99,28 @@ def quic_py_bridge_supported() -> bool:
     return bool(quic_h3_bridge.supported())
 
 
+def _quic_core_native_status() -> tuple[bool, str]:
+    if _l7_core is None or not hasattr(_l7_core, "run_quic_stateful"):
+        return False, "unavailable"
+    mode = "unknown"
+    if hasattr(_l7_core, "quic_stack_mode"):
+        try:
+            mode = str(_l7_core.quic_stack_mode() or "unavailable")
+        except Exception:
+            mode = "unknown"
+    supported = str(mode).startswith("h3_stateful")
+    if hasattr(_l7_core, "quic_supported"):
+        try:
+            supported = bool(_l7_core.quic_supported())
+        except Exception:
+            pass
+    if supported and mode == "unknown":
+        mode = "h3_stateful"
+    if not supported and mode == "unknown":
+        mode = "unavailable"
+    return bool(supported), str(mode)
+
+
 def _normalize_engine(name: str | None) -> str:
     e = str(name or "python").strip().lower()
     if e in {"c", "c_state", "state", "cstate"}:
@@ -366,6 +388,62 @@ async def run_quic_stateful(config: L7EngineConfig) -> Optional[L7EngineResult]:
 
     payload = config.as_dict()
     bridge_enabled = bool(int(payload.get("enable_quic_py_bridge", 0) or 0))
+    require_native = bool(int(payload.get("require_native_quic", 0) or 0))
+    native_supported, native_mode = _quic_core_native_status()
+
+    if require_native and not native_supported:
+        return L7EngineResult(
+            handled=True,
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="C_STATE_QUIC_NATIVE_REQUIRED",
+            sender_fallback_reason=f"quic_native_required:{native_mode}",
+            allow_legacy_fallback=False,
+            extra={"quic_stack_mode": str(native_mode)},
+        )
+
+    if native_supported:
+        try:
+            raw, snap = await _invoke_core_runner_async("run_quic_stateful", payload)
+            if snap:
+                for k, v in snap.items():
+                    raw.setdefault(f"l7_handle_{k}", v)
+            out = _from_core_result(raw, default_count=count, sender_path="C_STATE_QUIC")
+            out.extra.setdefault("quic_stack_mode", str(native_mode))
+            if int(out.sent or 0) > 0:
+                out.allow_legacy_fallback = False
+                return out
+
+            reason_l = str(out.sender_fallback_reason or "").strip().lower()
+            recoverable_for_bridge = reason_l in {
+                "h3_stateful_not_implemented",
+                "quic_capability_unavailable",
+                "capability_unavailable",
+            }
+            if require_native:
+                out.allow_legacy_fallback = False
+                return out
+            if not bridge_enabled or not quic_h3_bridge.supported() or not recoverable_for_bridge:
+                return out
+            log.warning(
+                "l7 native quic path returned recoverable reason=%s; trying h3 py-bridge",
+                out.sender_fallback_reason,
+            )
+        except Exception as exc:
+            if require_native or not bridge_enabled or not quic_h3_bridge.supported():
+                log.warning("l7_state_engine.run_quic_stateful(native) failed: %s", exc)
+                return L7EngineResult(
+                    handled=True,
+                    attempted=count,
+                    sent=0,
+                    errors=count,
+                    sender_path="C_STATE_QUIC_FAILED",
+                    sender_fallback_reason=f"quic_engine_error:{type(exc).__name__}",
+                    allow_legacy_fallback=not bool(require_native),
+                )
+            log.warning("l7 native quic path failed (%s); trying h3 py-bridge", exc)
+
     if bridge_enabled and quic_h3_bridge.supported():
         try:
             raw = await quic_h3_bridge.run_stateful(payload)

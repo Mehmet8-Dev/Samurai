@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 from .. import l7_engine as _adapter
@@ -27,6 +28,11 @@ _UNAVAILABLE_PATH = {
 }
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    raw = str(os.environ.get(name, default) or default).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def capability_map() -> Dict[str, Any]:
     core = getattr(_adapter, "_l7_core", None)
 
@@ -41,20 +47,31 @@ def capability_map() -> Dict[str, Any]:
         return True
 
     quic_mode = "unavailable"
+    quic_mode_core = "unavailable"
     if core is not None and hasattr(core, "quic_stack_mode"):
         try:
-            quic_mode = str(getattr(core, "quic_stack_mode")() or "unavailable")
+            quic_mode_core = str(getattr(core, "quic_stack_mode")() or "unavailable")
+            quic_mode = str(quic_mode_core)
         except Exception:
             quic_mode = "unavailable"
+            quic_mode_core = "unavailable"
 
     bridge_mode = str(quic_h3_bridge.stack_mode() or "unavailable")
     if not str(quic_mode).startswith("h3_stateful") and str(bridge_mode).startswith("h3_stateful"):
         quic_mode = bridge_mode
 
     quic_supported = _has("run_quic_stateful", "quic_supported")
+    quic_native_h3_stateful = str(quic_mode_core).startswith("h3_stateful")
+    quic_bridge_h3_stateful = str(bridge_mode).startswith("h3_stateful")
     quic_h3_stateful = str(quic_mode).startswith("h3_stateful")
-    if quic_h3_stateful:
+    if quic_native_h3_stateful or quic_bridge_h3_stateful:
         quic_supported = True
+
+    quic_effective_path = "unavailable"
+    if quic_native_h3_stateful:
+        quic_effective_path = "c_native"
+    elif quic_bridge_h3_stateful:
+        quic_effective_path = "py_bridge"
 
     return {
         "core_available": bool(core is not None),
@@ -64,6 +81,11 @@ def capability_map() -> Dict[str, Any]:
         "quic": bool(quic_supported),
         "quic_stack_mode": quic_mode,
         "quic_h3_stateful": bool(quic_h3_stateful),
+        "quic_core_stack_mode": str(quic_mode_core),
+        "quic_bridge_stack_mode": str(bridge_mode),
+        "quic_native_h3_stateful": bool(quic_native_h3_stateful),
+        "quic_bridge_h3_stateful": bool(quic_bridge_h3_stateful),
+        "quic_effective_path": str(quic_effective_path),
     }
 
 
@@ -80,7 +102,15 @@ def make_config(
 ) -> _adapter.L7EngineConfig:
     payload_extra = dict(extra or {})
     if str(mode or "http1_stateful").strip().lower() == "quic_stateful":
-        payload_extra.setdefault("enable_quic_py_bridge", 1)
+        if "enable_quic_py_bridge" not in payload_extra:
+            caps = capability_map()
+            prefer_native = _env_flag("SAMURAI_L7_QUIC_PREFER_NATIVE", "1")
+            native_ready = bool(caps.get("quic_native_h3_stateful", False))
+            payload_extra["enable_quic_py_bridge"] = 0 if (prefer_native and native_ready) else 1
+        payload_extra.setdefault(
+            "require_native_quic",
+            1 if _env_flag("SAMURAI_L7_QUIC_REQUIRE_NATIVE", "0") else 0,
+        )
     return _adapter.L7EngineConfig(
         engine="c_state",
         target_ip=str(target_ip),
