@@ -11,12 +11,12 @@ except Exception:  # pragma: no cover
 class TestL7StateEngineQuic(unittest.TestCase):
     def test_quic_stack_mode_contract(self):
         mode = str(l7_core.quic_stack_mode() or "")
-        self.assertIn(mode, {"h3_stateful", "unavailable"})
+        self.assertIn(mode, {"h3_stateful", "h3_stateful_py", "unavailable"})
 
     def test_quic_supported_matches_mode(self):
         mode = str(l7_core.quic_stack_mode() or "")
         supported = bool(l7_core.quic_supported())
-        self.assertEqual(supported, mode == "h3_stateful")
+        self.assertEqual(supported, mode in {"h3_stateful", "h3_stateful_py"})
 
     def test_quic_unavailable_result_contract(self):
         mode = str(l7_core.quic_stack_mode() or "")

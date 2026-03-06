@@ -381,6 +381,148 @@ static int _is_ipv4_literal(const char *value) {
     return inet_pton(AF_INET, value, &tmp) == 1;
 }
 
+static int _str_starts_with(const char *value, const char *prefix) {
+    size_t n = 0;
+    if (value == NULL || prefix == NULL) {
+        return 0;
+    }
+    n = strlen(prefix);
+    if (n == 0) {
+        return 1;
+    }
+    return strncmp(value, prefix, n) == 0;
+}
+
+static int _quic_bridge_supported(const char **mode_out, const char **reason_out) {
+    PyObject *mod = NULL;
+    PyObject *fn = NULL;
+    PyObject *ret = NULL;
+    const char *mode = "unavailable";
+    const char *reason = "aioquic_bridge_unavailable";
+    int supported = 0;
+
+    mod = PyImport_ImportModule("ddos_samurai.l7.quic_h3_bridge");
+    if (mod == NULL) {
+        PyErr_Clear();
+        goto done;
+    }
+
+    fn = PyObject_GetAttrString(mod, "supported");
+    if (fn == NULL || !PyCallable_Check(fn)) {
+        PyErr_Clear();
+        goto done;
+    }
+    ret = PyObject_CallNoArgs(fn);
+    if (ret == NULL) {
+        PyErr_Clear();
+        goto done;
+    }
+    if (!PyObject_IsTrue(ret)) {
+        reason = "aioquic_bridge_disabled";
+        goto done;
+    }
+    Py_CLEAR(ret);
+    Py_CLEAR(fn);
+
+    fn = PyObject_GetAttrString(mod, "stack_mode");
+    if (fn == NULL || !PyCallable_Check(fn)) {
+        PyErr_Clear();
+        goto done;
+    }
+    ret = PyObject_CallNoArgs(fn);
+    if (ret == NULL) {
+        PyErr_Clear();
+        goto done;
+    }
+    if (PyUnicode_Check(ret)) {
+        const char *raw_mode = PyUnicode_AsUTF8(ret);
+        if (raw_mode != NULL && raw_mode[0] != '\0') {
+            mode = raw_mode;
+        }
+    }
+    if (_str_starts_with(mode, "h3_stateful")) {
+        supported = 1;
+        reason = "aioquic_bridge_ready";
+    } else {
+        reason = "aioquic_bridge_mode_invalid";
+    }
+
+done:
+    if (mode_out != NULL) {
+        *mode_out = mode;
+    }
+    if (reason_out != NULL) {
+        *reason_out = reason;
+    }
+    Py_XDECREF(ret);
+    Py_XDECREF(fn);
+    Py_XDECREF(mod);
+    return supported;
+}
+
+static PyObject *_quic_bridge_run_stateful(PyObject *cfg) {
+    PyObject *mod = NULL;
+    PyObject *fn = NULL;
+    PyObject *coro = NULL;
+    PyObject *asyncio_mod = NULL;
+    PyObject *asyncio_run = NULL;
+    PyObject *result = NULL;
+
+    mod = PyImport_ImportModule("ddos_samurai.l7.quic_h3_bridge");
+    if (mod == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+
+    fn = PyObject_GetAttrString(mod, "run_stateful");
+    if (fn == NULL || !PyCallable_Check(fn)) {
+        PyErr_Clear();
+        goto fail;
+    }
+    coro = PyObject_CallFunctionObjArgs(fn, cfg, NULL);
+    if (coro == NULL) {
+        PyErr_Clear();
+        goto fail;
+    }
+
+    asyncio_mod = PyImport_ImportModule("asyncio");
+    if (asyncio_mod == NULL) {
+        PyErr_Clear();
+        goto fail;
+    }
+    asyncio_run = PyObject_GetAttrString(asyncio_mod, "run");
+    if (asyncio_run == NULL || !PyCallable_Check(asyncio_run)) {
+        PyErr_Clear();
+        goto fail;
+    }
+
+    result = PyObject_CallFunctionObjArgs(asyncio_run, coro, NULL);
+    if (result == NULL) {
+        PyErr_Clear();
+        goto fail;
+    }
+    if (!PyDict_Check(result)) {
+        Py_DECREF(result);
+        result = NULL;
+        goto fail;
+    }
+
+    Py_DECREF(asyncio_run);
+    Py_DECREF(asyncio_mod);
+    Py_DECREF(coro);
+    Py_DECREF(fn);
+    Py_DECREF(mod);
+    return result;
+
+fail:
+    Py_XDECREF(asyncio_run);
+    Py_XDECREF(asyncio_mod);
+    Py_XDECREF(coro);
+    Py_XDECREF(fn);
+    Py_XDECREF(mod);
+    return NULL;
+}
+
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
 typedef struct {
     int checked;
@@ -425,11 +567,16 @@ static int _quic_stack_probe(const char **reason_out, const char **mode_out) {
         goto done;
     }
 
-    /* QUIC stack is linked, but real ngtcp2/nghttp3 H3 stateful engine
-       is intentionally not exposed until full transport integration lands. */
-    reason = "h3_stateful_not_implemented";
-    mode = "unavailable";
-    available = 0;
+    /* Native ngtcp2/nghttp3 engine is not fully wired yet in this build.
+       If Python H3 bridge is available, expose it from core so strict
+       capability checks can use a concrete h3_stateful_py mode. */
+    if (_quic_bridge_supported(&mode, &reason)) {
+        available = 1;
+    } else {
+        reason = "h3_stateful_not_implemented";
+        mode = "unavailable";
+        available = 0;
+    }
 
 done:
     g_quic_stack_probe.checked = 1;
@@ -3453,6 +3600,14 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
 #endif
 
     if (!quic_ready) {
+        const char *bridge_mode = "unavailable";
+        const char *bridge_reason = "aioquic_bridge_unavailable";
+        if (_quic_bridge_supported(&bridge_mode, &bridge_reason)) {
+            PyObject *bridge_result = _quic_bridge_run_stateful(cfg);
+            if (bridge_result != NULL) {
+                return _attach_handle_stats(bridge_result, h);
+            }
+        }
         const char *reason = "quic_capability_unavailable";
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
         reason = "capability_unavailable";
@@ -3489,7 +3644,16 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         return _attach_handle_stats(result, h);
     }
 
-    /* Reserved for the real ngtcp2/nghttp3 H3 stateful engine. */
+    /* Core path delegates to QUIC H3 bridge while native loop is under
+       active integration. This keeps core result contracts stable and
+       executes real connect/handshake/request flow. */
+    {
+        PyObject *bridge_result = _quic_bridge_run_stateful(cfg);
+        if (bridge_result != NULL) {
+            return _attach_handle_stats(bridge_result, h);
+        }
+    }
+
     result = _make_result(
         total_attempts,
         0,
@@ -3509,8 +3673,8 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
             _set_long(result, "quic_connect_timeout_count", 0) < 0 ||
             _set_long(result, "quic_tls_fail_count", 0) < 0 ||
             _set_long(result, "quic_handshake_timeout_count", 0) < 0 ||
-            _set_long(result, "quic_stream_fail_count", 0) < 0 ||
-            _set_double(result, "quic_stream_fail_ratio", 0.0) < 0 ||
+            _set_long(result, "quic_stream_fail_count", total_attempts) < 0 ||
+            _set_double(result, "quic_stream_fail_ratio", 1.0) < 0 ||
             _set_double(result, "quic_handshake_fail_ratio", 0.0) < 0 ||
             _set_str(result, "scheme", scheme) < 0 ||
             _set_str(result, "quic_stack_probe_reason", stack_probe_reason) < 0 ||
