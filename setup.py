@@ -90,8 +90,13 @@ def detect_l7_capabilities() -> Dict[str, bool]:
     )
 
     nghttp2_enabled = False
-    if not _env_flag("SAMURAI_DISABLE_NGHTTP2", "0"):
-        nghttp2_enabled = _pkg_config_exists("nghttp2") or ctypes.util.find_library("nghttp2") is not None
+    if _env_flag("SAMURAI_FORCE_NGHTTP2", "0"):
+        # Explicit override for environments where maintainers ensure flags/libs externally.
+        nghttp2_enabled = True
+    elif not _env_flag("SAMURAI_DISABLE_NGHTTP2", "0"):
+        # CI-safe gate: require pkg-config metadata for deterministic cflags/libs resolution.
+        # Runtime-only libnghttp2 (versioned .so) is insufficient for editable build linking.
+        nghttp2_enabled = _pkg_config_exists("nghttp2")
 
     ngtcp2_present = _pkg_config_exists("ngtcp2") or ctypes.util.find_library("ngtcp2") is not None
     nghttp3_present = _pkg_config_exists("nghttp3") or ctypes.util.find_library("nghttp3") is not None
@@ -126,10 +131,12 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
     if caps["nghttp2"]:
         macros.append(("SAMURAI_WITH_NGHTTP2", "1"))
         pkg_names.append("nghttp2")
-        if not _pkg_config_exists("nghttp2"):
-            link_args.append("-lnghttp2")
     else:
-        print("Warning: nghttp2 not found (or disabled); C HTTP/2 mode will report capability_unavailable.")
+        print(
+            "Warning: nghttp2 dev metadata not found (or disabled); "
+            "C HTTP/2 mode will report capability_unavailable. "
+            "Use SAMURAI_FORCE_NGHTTP2=1 only if linker flags are provided externally."
+        )
 
     if caps["quic"]:
         macros.extend([
@@ -263,4 +270,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
