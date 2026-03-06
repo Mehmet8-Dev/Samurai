@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from ddos_samurai import l7_engine
 
@@ -106,3 +106,38 @@ class TestL7EngineAdapter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quic_out.sender_fallback_reason, "quic_capability_unavailable")
         self.assertTrue(h2_out.allow_legacy_fallback)
         self.assertTrue(quic_out.allow_legacy_fallback)
+
+    async def test_quic_uses_h3_bridge_when_enabled(self):
+        fake_core = _FakeL7Core()
+        with patch.object(l7_engine, "_l7_core", fake_core), patch.object(l7_engine, "_CORE_HANDLE", None), patch.object(
+            l7_engine.quic_h3_bridge, "supported", return_value=True
+        ), patch.object(
+            l7_engine.quic_h3_bridge,
+            "run_stateful",
+            new=AsyncMock(
+                return_value={
+                    "attempted": 2,
+                    "sent": 2,
+                    "errors": 0,
+                    "sender_path": "C_STATE_QUIC_H3PY",
+                    "sender_fallback_reason": "none",
+                    "quic_stack_mode": "h3_stateful_py",
+                }
+            ),
+        ):
+            cfg_quic = l7_engine.L7EngineConfig(
+                engine="c_state",
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=2,
+                concurrency=1,
+                mode="quic_stateful",
+                extra={"enable_quic_py_bridge": 1},
+            )
+            quic_out = await l7_engine.run_quic_stateful(cfg_quic)
+
+        self.assertIsNotNone(quic_out)
+        self.assertEqual(quic_out.sender_path, "C_STATE_QUIC_H3PY")
+        self.assertEqual(quic_out.sender_fallback_reason, "none")
+        self.assertEqual(quic_out.sent, 2)
+        self.assertFalse(quic_out.allow_legacy_fallback)

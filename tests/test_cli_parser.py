@@ -371,6 +371,23 @@ class TestL7CapabilityPreflight(unittest.TestCase):
         ):
             cli._preflight_l7_capabilities(parser, args)
 
+    def test_capability_strict_quic_accepts_h3_stateful_py_mode(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--attack-vector", "quic", "--l7-capability-strict", "--l7-quic-engine", "c_state"])
+        with patch(
+            "ddos_samurai.l7.c_adapter.capability_map",
+            return_value={
+                "core_available": True,
+                "http1": True,
+                "ws": True,
+                "http2": True,
+                "quic": True,
+                "quic_stack_mode": "h3_stateful_py",
+                "quic_h3_stateful": True,
+            },
+        ):
+            cli._preflight_l7_capabilities(parser, args)
+
 
 class TestRootGateRegression(unittest.TestCase):
     """Regression tests for the vector-based root privilege check (trex_path Görev #5).
