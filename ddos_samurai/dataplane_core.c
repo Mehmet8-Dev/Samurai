@@ -33,6 +33,7 @@ typedef struct {
     int queue_id;
     int xdp_mode;
     int raw_sockfd;
+    int allow_python_fallback;
     char backend[32];
     char fallback_policy[16];
     char interface[IFNAMSIZ];
@@ -1120,6 +1121,7 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
     DpHandle *h = NULL;
     const char *backend = "auto";
     const char *fallback_policy = "allow";
+    const char *core_mode = "off";
     const char *iface = "";
 
     (void)self;
@@ -1139,6 +1141,7 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
     h->xdp_enable = 0;
     h->xdp_initialized = 0;
     h->raw_sockfd = -1;
+    h->allow_python_fallback = 0;
 
     _copy_lower(h->backend, sizeof(h->backend), "auto", "auto");
     _copy_lower(h->fallback_policy, sizeof(h->fallback_policy), "allow", "allow");
@@ -1147,10 +1150,12 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
     if (PyDict_Check(cfg)) {
         backend = _dict_cstr(cfg, "backend", "auto");
         fallback_policy = _dict_cstr(cfg, "fallback_policy", "allow");
+        core_mode = _dict_cstr(cfg, "core_mode", "off");
         iface = _dict_cstr(cfg, "interface", "");
         h->queue_id = (int)_dict_long(cfg, "queue_id", 0);
         h->xdp_enable = _dict_bool(cfg, "xdp_enable", 0);
         h->xdp_mode = (int)_dict_long(cfg, "xdp_mode", 0);
+        h->allow_python_fallback = _dict_bool(cfg, "allow_python_fallback", 0);
     }
 
     _copy_lower(h->backend, sizeof(h->backend), backend, "auto");
@@ -1159,6 +1164,9 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
         (void)snprintf(h->fallback_policy, sizeof(h->fallback_policy), "fail");
     } else if (strcmp(h->fallback_policy, "allow") != 0 && strcmp(h->fallback_policy, "fail") != 0) {
         (void)snprintf(h->fallback_policy, sizeof(h->fallback_policy), "allow");
+    }
+    if (strcmp(core_mode, "required") == 0) {
+        h->allow_python_fallback = 0;
     }
     (void)snprintf(h->interface, sizeof(h->interface), "%s", iface != NULL ? iface : "");
 
@@ -1294,7 +1302,21 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
         }
 
         if (out == NULL) {
-            out = _run_python_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
+            if (allow_fallback && h->allow_python_fallback) {
+                out = _run_python_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
+            } else {
+                out = _build_result(
+                    count,
+                    0,
+                    count,
+                    packet_size,
+                    target_ip,
+                    target_port,
+                    "DP_AUTO_CHAIN_EXHAUSTED",
+                    "auto_chain_exhausted",
+                    staged_fallback_count > 0 ? staged_fallback_count : 1
+                );
+            }
         }
     } else {
         out = _build_result(

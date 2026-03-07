@@ -83,6 +83,24 @@ def _normalize_quic_crypto_backend(raw: str | None) -> str:
     return "auto"
 
 
+def _normalize_quic_build_mode(raw: str | None) -> str:
+    val = str(raw or "auto").strip().lower()
+    aliases = {
+        "strict": "native_required",
+        "required": "native_required",
+        "native": "native_required",
+        "bridge": "bridge_only",
+        "bridge_only": "bridge_only",
+        "bridge-only": "bridge_only",
+        "off": "disabled",
+        "none": "disabled",
+    }
+    mode = aliases.get(val, val)
+    if mode in {"auto", "native_required", "bridge_only", "disabled"}:
+        return mode
+    return "auto"
+
+
 def _resolve_quic_crypto_backend() -> Tuple[str, str, str]:
     """
     Resolve QUIC crypto backend with deterministic preference and optional override.
@@ -153,6 +171,7 @@ class OptionalBuildExt(build_ext):
 
 
 def detect_l7_capabilities() -> Dict[str, bool]:
+    quic_build_mode = _normalize_quic_build_mode(os.environ.get("SAMURAI_QUIC_BUILD_MODE", "auto"))
     openssl_header_candidates = [
         "/usr/include/openssl/ssl.h",
         "/usr/local/include/openssl/ssl.h",
@@ -199,7 +218,9 @@ def detect_l7_capabilities() -> Dict[str, bool]:
         nghttp2_enabled = bool(nghttp2_pkg) or bool(nghttp2_headers and nghttp2_lib)
 
     quic_enabled = False
-    if _env_flag("SAMURAI_FORCE_QUIC", "0"):
+    if quic_build_mode in {"disabled", "bridge_only"}:
+        quic_enabled = False
+    elif _env_flag("SAMURAI_FORCE_QUIC", "0"):
         # Explicit override for maintainers who inject cflags/libs externally.
         quic_enabled = True
     elif not _env_flag("SAMURAI_DISABLE_QUIC", "0"):
@@ -222,6 +243,7 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
     compile_args = ["-O2", "-Wall", "-fPIC"]
     link_args = ["-lpthread", "-lm"]
     macros: List[Tuple[str, str]] = []
+    quic_build_mode = _normalize_quic_build_mode(os.environ.get("SAMURAI_QUIC_BUILD_MODE", "auto"))
 
     caps = detect_l7_capabilities()
     pkg_names: List[str] = []
@@ -248,7 +270,11 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
             "Use SAMURAI_FORCE_NGHTTP2=1 only if linker flags are provided externally."
         )
 
-    if caps["quic"]:
+    if quic_build_mode == "disabled":
+        print("Info: SAMURAI_QUIC_BUILD_MODE=disabled -> native C QUIC build kapalı.")
+    elif quic_build_mode == "bridge_only":
+        print("Info: SAMURAI_QUIC_BUILD_MODE=bridge_only -> native C QUIC build kapalı (bridge-only).")
+    elif caps["quic"]:
         quic_crypto_is_gnutls = False
         quic_crypto_linked = False
         macros.extend([
@@ -275,12 +301,25 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
             macros.append(("SAMURAI_WITH_NGTCP2_GNUTLS", "1"))
             if not crypto_pkg:
                 link_args.append("-lgnutls")
+            if quic_build_mode == "native_required":
+                print("Info: native_required mode: ngtcp2/nghttp3 + gnutls doğrulandı.")
         elif quic_crypto_linked:
+            if quic_build_mode == "native_required":
+                raise RuntimeError(
+                    "SAMURAI_QUIC_BUILD_MODE=native_required: ngtcp2 crypto backend gnutls olmalı "
+                    f"(resolved={crypto_backend})."
+                )
             print(
                 "Warning: ngtcp2 crypto backend resolved but non-gnutls "
                 f"({crypto_backend}); native C QUIC loop requires gnutls and will stay disabled."
             )
         else:
+            if quic_build_mode == "native_required":
+                requested_backend = _normalize_quic_crypto_backend(os.environ.get("SAMURAI_QUIC_CRYPTO_BACKEND", "auto"))
+                raise RuntimeError(
+                    "SAMURAI_QUIC_BUILD_MODE=native_required: ngtcp2 crypto backend bulunamadı "
+                    f"(requested={requested_backend})."
+                )
             requested_backend = _normalize_quic_crypto_backend(os.environ.get("SAMURAI_QUIC_CRYPTO_BACKEND", "auto"))
             print(
                 "Warning: ngtcp2 crypto backend not found "
@@ -288,6 +327,10 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
                 "(py bridge/fallback paths remain available)."
             )
     else:
+        if quic_build_mode == "native_required":
+            raise RuntimeError(
+                "SAMURAI_QUIC_BUILD_MODE=native_required: ngtcp2/nghttp3 bağımlılıkları eksik veya devre dışı."
+            )
         print(
             "Warning: ngtcp2/nghttp3 dev metadata not found/disabled; "
             "C QUIC mode will report capability_unavailable. "

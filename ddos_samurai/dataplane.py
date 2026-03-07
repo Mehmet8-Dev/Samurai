@@ -17,6 +17,7 @@ except Exception:
 class DataplaneConfig:
     backend: str = "auto"
     fallback_policy: str = "allow"
+    core_mode: str = "off"
     lab_profile: str = "off"
     queue_strategy: str = "rr"
     queue_id: int = 0
@@ -29,6 +30,7 @@ class DataplaneConfig:
         out = {
             "backend": str(self.backend or "auto"),
             "fallback_policy": str(self.fallback_policy or "allow"),
+            "core_mode": str(self.core_mode or "off"),
             "lab_profile": str(self.lab_profile or "off"),
             "queue_strategy": str(self.queue_strategy or "rr"),
             "queue_id": int(self.queue_id or 0),
@@ -215,22 +217,61 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
+def _normalize_core_mode(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "on": "auto",
+        "enable": "auto",
+        "enabled": "auto",
+        "1": "auto",
+        "true": "auto",
+        "off": "off",
+        "disable": "off",
+        "disabled": "off",
+        "0": "off",
+        "false": "off",
+        "strict": "required",
+        "must": "required",
+    }
+    mode = aliases.get(raw, raw)
+    if mode in {"off", "auto", "required"}:
+        return mode
+    return "off"
+
+
 def build_dataplane_config(args: Dict[str, Any], queue_id: Optional[int] = None) -> DataplaneConfig:
     backend = str(args.get("sender_backend", "auto") or "auto").strip().lower()
     fallback_policy = str(args.get("sender_fallback_policy", "allow") or "allow").strip().lower()
     lab_profile = str(args.get("lab_profile", "off") or "off").strip().lower()
+    core_mode_raw = args.get("dataplane_core_mode", os.environ.get("SAMURAI_DATAPLANE_CORE_MODE", "off"))
+    core_mode = _normalize_core_mode(core_mode_raw)
     queue_strategy = str(args.get("dp_queue_strategy", "rr") or "rr").strip().lower()
     qid = int(queue_id if queue_id is not None else (args.get("dp_queue_id", args.get("xdp_queue_id", 0)) or 0))
     interface = str(args.get("xdp_interface", "") or "")
     xdp_enable = bool(args.get("xdp_enable", False))
-    use_core = bool(args.get("dataplane_core_enable", _env_truthy("SAMURAI_DATAPLANE_CORE_ENABLE", False)))
+    if "dataplane_core_enable" in args:
+        use_core_legacy = bool(args.get("dataplane_core_enable", False))
+        if use_core_legacy and core_mode == "off":
+            core_mode = "auto"
+        elif not use_core_legacy:
+            core_mode = "off"
+    elif core_mode == "off" and _env_truthy("SAMURAI_DATAPLANE_CORE_ENABLE", False):
+        core_mode = "auto"
+    if lab_profile == "dedicated" and core_mode != "required":
+        core_mode = "required"
+    use_core = core_mode in {"auto", "required"}
+    allow_python_fallback = _env_truthy("SAMURAI_DP_ALLOW_PY_FALLBACK", False)
+    if core_mode == "required":
+        allow_python_fallback = False
     extra = {
         "dp_queues": int(args.get("dp_queues", 1) or 1),
         "dp_queue_map": str(args.get("dp_queue_map", "") or ""),
+        "allow_python_fallback": int(1 if allow_python_fallback else 0),
     }
     return DataplaneConfig(
         backend=backend,
         fallback_policy=fallback_policy,
+        core_mode=core_mode,
         lab_profile=lab_profile,
         queue_strategy=queue_strategy,
         queue_id=qid,

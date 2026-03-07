@@ -63,20 +63,22 @@ def capability_map() -> Dict[str, Any]:
             quic_probe_reason = "unknown"
 
     bridge_mode = quic_mode.normalize(quic_h3_bridge.stack_mode())
-    if not quic_mode.is_h3_stateful(mode_effective) and quic_mode.is_h3_stateful(bridge_mode):
+    bridge_autopromote = _env_flag("SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE", "0")
+    if bridge_autopromote and not quic_mode.is_h3_stateful(mode_effective) and quic_mode.is_h3_stateful(bridge_mode):
         mode_effective = bridge_mode
 
-    quic_supported = _has("run_quic_stateful", "quic_supported")
+    quic_supported_probe = _has("run_quic_stateful", "quic_supported")
     quic_native_h3_stateful = quic_mode.is_native_h3_stateful(mode_core)
     quic_bridge_h3_stateful = quic_mode.is_bridge_h3_stateful(bridge_mode)
     quic_h3_stateful = quic_mode.is_h3_stateful(mode_effective)
-    if quic_native_h3_stateful or quic_bridge_h3_stateful:
+    quic_supported = bool(quic_supported_probe and quic_native_h3_stateful)
+    if bridge_autopromote and quic_bridge_h3_stateful:
         quic_supported = True
 
     quic_effective_path = "unavailable"
     if quic_native_h3_stateful:
         quic_effective_path = "c_native"
-    elif quic_bridge_h3_stateful:
+    elif bridge_autopromote and quic_bridge_h3_stateful:
         quic_effective_path = "py_bridge"
 
     return {
@@ -90,6 +92,7 @@ def capability_map() -> Dict[str, Any]:
         "quic_core_stack_mode": str(mode_core),
         "quic_stack_probe_reason": str(quic_probe_reason),
         "quic_bridge_stack_mode": str(bridge_mode),
+        "quic_bridge_autopromote": bool(bridge_autopromote),
         "quic_native_h3_stateful": bool(quic_native_h3_stateful),
         "quic_bridge_h3_stateful": bool(quic_bridge_h3_stateful),
         "quic_effective_path": str(quic_effective_path),
@@ -112,8 +115,9 @@ def make_config(
         if "enable_quic_py_bridge" not in payload_extra:
             caps = capability_map()
             prefer_native = _env_flag("SAMURAI_L7_QUIC_PREFER_NATIVE", "1")
+            auto_bridge = _env_flag("SAMURAI_L7_QUIC_AUTO_BRIDGE", "0")
             native_ready = bool(caps.get("quic_native_h3_stateful", False))
-            payload_extra["enable_quic_py_bridge"] = 0 if (prefer_native and native_ready) else 1
+            payload_extra["enable_quic_py_bridge"] = 1 if (auto_bridge and not (prefer_native and native_ready)) else 0
         payload_extra.setdefault(
             "require_native_quic",
             1 if _env_flag("SAMURAI_L7_QUIC_REQUIRE_NATIVE", "0") else 0,
