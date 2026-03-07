@@ -619,6 +619,24 @@ typedef enum {
 } QuicNativeResultCode;
 
 typedef struct {
+    long attempted;
+    long sent;
+    long connect_fail;
+    long connect_timeout;
+    long tls_fail;
+    long handshake_timeout;
+    long stream_fail;
+    long long handshake_ns;
+} QuicNativeBatchResult;
+
+typedef struct {
+    int in_use;
+    int64_t stream_id;
+    int status_code;
+    int failed;
+} QuicNativeStreamState;
+
+typedef struct {
     int fd;
     int epfd;
     struct sockaddr_in remote_addr;
@@ -632,10 +650,14 @@ typedef struct {
     gnutls_certificate_credentials_t tls_cred;
     ngtcp2_crypto_conn_ref conn_ref;
     int h3_initialized;
-    int response_complete;
-    int response_status;
-    int response_stream_failed;
-    int64_t request_stream_id;
+    int aborted;
+    QuicNativeStreamState *stream_states;
+    size_t stream_cap;
+    long requests_target;
+    long requests_submitted;
+    long requests_completed;
+    long requests_success;
+    long requests_failed;
     int64_t control_stream_id;
     int64_t qpack_enc_stream_id;
     int64_t qpack_dec_stream_id;
@@ -664,6 +686,93 @@ static void _quic_native_fill_random(uint8_t *dst, size_t len) {
     }
     for (i = 0; i < len; i++) {
         dst[i] = (uint8_t)(rand() & 0xff);
+    }
+}
+
+static void _quic_native_batch_result_init(QuicNativeBatchResult *out, long attempted) {
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->attempted = attempted > 0 ? attempted : 0;
+}
+
+static QuicNativeStreamState *_quic_native_stream_state_find(QuicNativeSession *s, int64_t stream_id) {
+    size_t i;
+    if (s == NULL || s->stream_states == NULL || s->stream_cap == 0) {
+        return NULL;
+    }
+    for (i = 0; i < s->stream_cap; i++) {
+        if (s->stream_states[i].in_use && s->stream_states[i].stream_id == stream_id) {
+            return &s->stream_states[i];
+        }
+    }
+    return NULL;
+}
+
+static int _quic_native_stream_state_begin(QuicNativeSession *s, int64_t stream_id) {
+    size_t i;
+    if (s == NULL || s->stream_states == NULL || s->stream_cap == 0) {
+        return -1;
+    }
+    for (i = 0; i < s->stream_cap; i++) {
+        if (!s->stream_states[i].in_use) {
+            s->stream_states[i].in_use = 1;
+            s->stream_states[i].stream_id = stream_id;
+            s->stream_states[i].status_code = 0;
+            s->stream_states[i].failed = 0;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static long _quic_native_active_streams(const QuicNativeSession *s) {
+    size_t i;
+    long active = 0;
+    if (s == NULL || s->stream_states == NULL) {
+        return 0;
+    }
+    for (i = 0; i < s->stream_cap; i++) {
+        if (s->stream_states[i].in_use) {
+            active += 1;
+        }
+    }
+    return active;
+}
+
+static void _quic_native_stream_state_finish(QuicNativeSession *s, int64_t stream_id, int failed_hint) {
+    QuicNativeStreamState *st;
+    int ok;
+    if (s == NULL) {
+        return;
+    }
+    st = _quic_native_stream_state_find(s, stream_id);
+    if (st == NULL || !st->in_use) {
+        return;
+    }
+    ok = (!failed_hint && !st->failed && st->status_code >= 100 && st->status_code < 600);
+    if (ok) {
+        s->requests_success += 1;
+    } else {
+        s->requests_failed += 1;
+    }
+    s->requests_completed += 1;
+    st->in_use = 0;
+    st->stream_id = -1;
+    st->status_code = 0;
+    st->failed = 0;
+}
+
+static void _quic_native_fail_all_active_streams(QuicNativeSession *s) {
+    size_t i;
+    if (s == NULL || s->stream_states == NULL) {
+        return;
+    }
+    for (i = 0; i < s->stream_cap; i++) {
+        if (s->stream_states[i].in_use) {
+            _quic_native_stream_state_finish(s, s->stream_states[i].stream_id, 1);
+        }
     }
 }
 
@@ -736,9 +845,8 @@ static int _quic_native_h3_stream_close_cb(
     QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
     (void)conn;
     (void)stream_user_data;
-    if (s != NULL && stream_id == s->request_stream_id && app_error_code != 0) {
-        s->response_stream_failed = 1;
-        s->response_complete = 1;
+    if (s != NULL) {
+        _quic_native_stream_state_finish(s, stream_id, app_error_code != 0 ? 1 : 0);
     }
     return 0;
 }
@@ -803,11 +911,12 @@ static int _quic_native_h3_recv_header_cb(
     void *stream_user_data
 ) {
     QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
+    QuicNativeStreamState *st = _quic_native_stream_state_find(s, stream_id);
     (void)conn;
     (void)name;
     (void)flags;
     (void)stream_user_data;
-    if (s == NULL || stream_id != s->request_stream_id || value == NULL) {
+    if (s == NULL || st == NULL || value == NULL) {
         return 0;
     }
     if (token == NGHTTP3_QPACK_TOKEN__STATUS) {
@@ -822,7 +931,7 @@ static int _quic_native_h3_recv_header_cb(
             parsed = (parsed * 10) + (int)(ch - '0');
         }
         if (parsed > 0) {
-            s->response_status = parsed;
+            st->status_code = parsed;
         }
     }
     return 0;
@@ -838,8 +947,8 @@ static int _quic_native_h3_end_headers_cb(
     QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
     (void)conn;
     (void)stream_user_data;
-    if (s != NULL && stream_id == s->request_stream_id && fin) {
-        s->response_complete = 1;
+    if (s != NULL && fin) {
+        _quic_native_stream_state_finish(s, stream_id, 0);
     }
     return 0;
 }
@@ -853,8 +962,8 @@ static int _quic_native_h3_end_stream_cb(
     QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
     (void)conn;
     (void)stream_user_data;
-    if (s != NULL && stream_id == s->request_stream_id) {
-        s->response_complete = 1;
+    if (s != NULL) {
+        _quic_native_stream_state_finish(s, stream_id, 0);
     }
     return 0;
 }
@@ -870,9 +979,8 @@ static int _quic_native_h3_stop_sending_cb(
     (void)conn;
     (void)app_error_code;
     (void)stream_user_data;
-    if (s != NULL && stream_id == s->request_stream_id) {
-        s->response_stream_failed = 1;
-        s->response_complete = 1;
+    if (s != NULL) {
+        _quic_native_stream_state_finish(s, stream_id, 1);
     }
     return 0;
 }
@@ -888,9 +996,8 @@ static int _quic_native_h3_reset_stream_cb(
     (void)conn;
     (void)app_error_code;
     (void)stream_user_data;
-    if (s != NULL && stream_id == s->request_stream_id) {
-        s->response_stream_failed = 1;
-        s->response_complete = 1;
+    if (s != NULL) {
+        _quic_native_stream_state_finish(s, stream_id, 1);
     }
     return 0;
 }
@@ -900,8 +1007,8 @@ static int _quic_native_h3_shutdown_cb(nghttp3_conn *conn, int64_t id, void *con
     (void)conn;
     (void)id;
     if (s != NULL) {
-        s->response_stream_failed = 1;
-        s->response_complete = 1;
+        s->aborted = 1;
+        _quic_native_fail_all_active_streams(s);
     }
     return 0;
 }
@@ -926,7 +1033,10 @@ static int _quic_native_recv_stream_data_cb(
     }
     nconsumed = nghttp3_conn_read_stream(s->h3_conn, stream_id, data, datalen, fin);
     if (nconsumed < 0) {
-        s->response_stream_failed = 1;
+        QuicNativeStreamState *st = _quic_native_stream_state_find(s, stream_id);
+        if (st != NULL) {
+            st->failed = 1;
+        }
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     if (nconsumed > 0) {
@@ -966,9 +1076,8 @@ static int _quic_native_stream_close_cb(
     (void)conn;
     (void)flags;
     (void)stream_user_data;
-    if (s != NULL && stream_id == s->request_stream_id && app_error_code != 0) {
-        s->response_stream_failed = 1;
-        s->response_complete = 1;
+    if (s != NULL) {
+        _quic_native_stream_state_finish(s, stream_id, app_error_code != 0 ? 1 : 0);
     }
     return 0;
 }
@@ -977,6 +1086,9 @@ static void _quic_native_cleanup(QuicNativeSession *s) {
     if (s == NULL) {
         return;
     }
+    PyMem_Free(s->stream_states);
+    s->stream_states = NULL;
+    s->stream_cap = 0;
     if (s->h3_conn != NULL) {
         nghttp3_conn_del(s->h3_conn);
         s->h3_conn = NULL;
@@ -1187,13 +1299,9 @@ static int _quic_native_send_datagram(QuicNativeSession *s, const uint8_t *pkt, 
     return 1;
 }
 
-static int _quic_native_setup_h3(QuicNativeSession *s, const char *method, const char *path, const char *authority) {
+static int _quic_native_setup_h3(QuicNativeSession *s) {
     nghttp3_callbacks callbacks;
     nghttp3_settings settings;
-    nghttp3_nv nva[5];
-    size_t method_len;
-    size_t path_len;
-    size_t authority_len;
     if (s == NULL || s->conn == NULL) {
         return -1;
     }
@@ -1232,7 +1340,28 @@ static int _quic_native_setup_h3(QuicNativeSession *s, const char *method, const
         return -1;
     }
 
-    if (ngtcp2_conn_open_bidi_stream(s->conn, &s->request_stream_id, NULL) != 0) {
+    s->h3_initialized = 1;
+    return 0;
+}
+
+static int _quic_native_submit_request_stream(
+    QuicNativeSession *s,
+    const char *method,
+    const char *path,
+    const char *authority
+) {
+    nghttp3_nv nva[5];
+    size_t method_len;
+    size_t path_len;
+    size_t authority_len;
+    int64_t stream_id = -1;
+    if (s == NULL || s->h3_conn == NULL || s->conn == NULL) {
+        return -1;
+    }
+    if (ngtcp2_conn_open_bidi_stream(s->conn, &stream_id, NULL) != 0) {
+        return -1;
+    }
+    if (_quic_native_stream_state_begin(s, stream_id) != 0) {
         return -1;
     }
 
@@ -1265,11 +1394,11 @@ static int _quic_native_setup_h3(QuicNativeSession *s, const char *method, const
     nva[4].valuelen = 14;
     nva[4].flags = NGHTTP3_NV_FLAG_NONE;
 
-    if (nghttp3_conn_submit_request(s->h3_conn, s->request_stream_id, nva, 5, NULL, NULL) != 0) {
+    if (nghttp3_conn_submit_request(s->h3_conn, stream_id, nva, 5, NULL, NULL) != 0) {
+        _quic_native_stream_state_finish(s, stream_id, 1);
         return -1;
     }
-
-    s->h3_initialized = 1;
+    s->requests_submitted += 1;
     return 0;
 }
 
@@ -1365,7 +1494,31 @@ static int _quic_native_flush_pending(QuicNativeSession *s, long long now_ns) {
     return 0;
 }
 
-static QuicNativeResultCode _quic_native_single_request(
+static void _quic_native_assign_remaining_failure(QuicNativeBatchResult *out, long remaining, QuicNativeResultCode code) {
+    if (out == NULL || remaining <= 0) {
+        return;
+    }
+    switch (code) {
+        case QUIC_NATIVE_CONNECT_FAIL:
+            out->connect_fail += remaining;
+            break;
+        case QUIC_NATIVE_CONNECT_TIMEOUT:
+            out->connect_timeout += remaining;
+            break;
+        case QUIC_NATIVE_TLS_FAIL:
+            out->tls_fail += remaining;
+            break;
+        case QUIC_NATIVE_HANDSHAKE_TIMEOUT:
+            out->handshake_timeout += remaining;
+            break;
+        case QUIC_NATIVE_STREAM_FAIL:
+        default:
+            out->stream_fail += remaining;
+            break;
+    }
+}
+
+static QuicNativeResultCode _quic_native_run_batch(
     const char *target_ip,
     int target_port,
     const char *server_name,
@@ -1373,25 +1526,48 @@ static QuicNativeResultCode _quic_native_single_request(
     const char *path,
     int verify_peer,
     double timeout_s,
-    long long *handshake_ns_out
+    long request_count,
+    long max_inflight,
+    QuicNativeBatchResult *out
 ) {
     QuicNativeSession s;
     long long timeout_ns;
     long long deadline_ns;
     char authority[96];
     QuicNativeResultCode final_code = QUIC_NATIVE_STREAM_FAIL;
+    long remaining = request_count;
+
+    _quic_native_batch_result_init(out, request_count);
+    if (request_count <= 0) {
+        return QUIC_NATIVE_OK;
+    }
+    if (max_inflight < 1) {
+        max_inflight = 1;
+    }
+    if (max_inflight > 256) {
+        max_inflight = 256;
+    }
 
     memset(&s, 0, sizeof(s));
     s.fd = -1;
     s.epfd = -1;
-    s.request_stream_id = -1;
     s.control_stream_id = -1;
     s.qpack_enc_stream_id = -1;
     s.qpack_dec_stream_id = -1;
-    s.response_status = 0;
-
-    if (handshake_ns_out != NULL) {
-        *handshake_ns_out = 0;
+    s.requests_target = request_count;
+    s.stream_cap = (size_t)(max_inflight * 2 + 8);
+    if (s.stream_cap < 16) {
+        s.stream_cap = 16;
+    }
+    if (s.stream_cap > 2048) {
+        s.stream_cap = 2048;
+    }
+    s.stream_states = (QuicNativeStreamState *)PyMem_Calloc(s.stream_cap, sizeof(QuicNativeStreamState));
+    if (s.stream_states == NULL) {
+        if (out != NULL) {
+            out->stream_fail = request_count;
+        }
+        return QUIC_NATIVE_STREAM_FAIL;
     }
 
     timeout_ns = (long long)(timeout_s > 0.05 ? timeout_s * 1e9 : 3.0 * 1e9);
@@ -1400,10 +1576,12 @@ static QuicNativeResultCode _quic_native_single_request(
 
     if (_quic_native_open_socket(&s, target_ip, target_port) < 0) {
         final_code = (errno == ETIMEDOUT) ? QUIC_NATIVE_CONNECT_TIMEOUT : QUIC_NATIVE_CONNECT_FAIL;
+        _quic_native_assign_remaining_failure(out, request_count, final_code);
         goto done;
     }
     if (_quic_native_init_conn(&s, server_name, verify_peer, timeout_ns) < 0) {
         final_code = QUIC_NATIVE_TLS_FAIL;
+        _quic_native_assign_remaining_failure(out, request_count, final_code);
         goto done;
     }
 
@@ -1417,47 +1595,59 @@ static QuicNativeResultCode _quic_native_single_request(
         int nfds;
         ngtcp2_tstamp expiry;
 
-        if (_quic_native_flush_pending(&s, now_ns) < 0) {
-            int tls_err = s.conn != NULL ? ngtcp2_conn_get_tls_error(s.conn) : 0;
-            final_code = (tls_err != 0) ? QUIC_NATIVE_TLS_FAIL : QUIC_NATIVE_STREAM_FAIL;
-            goto done;
-        }
-
         if (s.conn != NULL && ngtcp2_conn_get_handshake_completed(s.conn)) {
             if (s.handshake_ns == 0 && now_ns > s.start_ns) {
                 s.handshake_ns = now_ns - s.start_ns;
             }
             if (!s.h3_initialized) {
-                if (_quic_native_setup_h3(&s, method, path, authority) < 0) {
+                if (_quic_native_setup_h3(&s) < 0) {
                     final_code = QUIC_NATIVE_STREAM_FAIL;
-                    goto done;
+                    break;
+                }
+            }
+            if (s.h3_initialized && !s.aborted) {
+                int submitted_any = 0;
+                while (s.requests_submitted < s.requests_target &&
+                       _quic_native_active_streams(&s) < max_inflight) {
+                    if (_quic_native_submit_request_stream(&s, method, path, authority) != 0) {
+                        break;
+                    }
+                    submitted_any = 1;
+                }
+                if (!submitted_any &&
+                    s.requests_submitted < s.requests_target &&
+                    _quic_native_active_streams(&s) == 0 &&
+                    s.requests_completed >= s.requests_submitted) {
+                    final_code = QUIC_NATIVE_STREAM_FAIL;
+                    break;
                 }
             }
         }
 
-        if (s.response_complete) {
-            if (!s.response_stream_failed && s.response_status >= 100 && s.response_status < 600) {
-                final_code = QUIC_NATIVE_OK;
-            } else {
-                final_code = QUIC_NATIVE_STREAM_FAIL;
-            }
-            goto done;
+        if (_quic_native_flush_pending(&s, now_ns) < 0) {
+            int tls_err = s.conn != NULL ? ngtcp2_conn_get_tls_error(s.conn) : 0;
+            final_code = (tls_err != 0) ? QUIC_NATIVE_TLS_FAIL : QUIC_NATIVE_STREAM_FAIL;
+            break;
         }
 
+        if (s.requests_completed >= s.requests_target) {
+            final_code = (s.requests_failed == 0) ? QUIC_NATIVE_OK : QUIC_NATIVE_STREAM_FAIL;
+            break;
+        }
         if (s.conn == NULL) {
-            final_code = QUIC_NATIVE_STREAM_FAIL;
-            goto done;
+            final_code = QUIC_NATIVE_CONNECT_FAIL;
+            break;
         }
         if (ngtcp2_conn_is_in_closing_period(s.conn)) {
             final_code = QUIC_NATIVE_STREAM_FAIL;
-            goto done;
+            break;
         }
 
         expiry = ngtcp2_conn_get_expiry(s.conn);
         if (expiry != UINT64_MAX && (long long)expiry <= now_ns) {
             if (ngtcp2_conn_handle_expiry(s.conn, (ngtcp2_tstamp)now_ns) != 0) {
                 final_code = QUIC_NATIVE_HANDSHAKE_TIMEOUT;
-                goto done;
+                break;
             }
             continue;
         }
@@ -1486,7 +1676,7 @@ static QuicNativeResultCode _quic_native_single_request(
                 continue;
             }
             final_code = QUIC_NATIVE_CONNECT_FAIL;
-            goto done;
+            break;
         }
         if (nfds == 0) {
             continue;
@@ -1501,7 +1691,7 @@ static QuicNativeResultCode _quic_native_single_request(
                             break;
                         }
                         final_code = QUIC_NATIVE_CONNECT_FAIL;
-                        goto done;
+                        goto done_loop;
                     }
                     if (nread == 0) {
                         break;
@@ -1524,10 +1714,12 @@ static QuicNativeResultCode _quic_native_single_request(
                                 final_code = QUIC_NATIVE_HANDSHAKE_TIMEOUT;
                             } else if (ngtcp2_conn_get_tls_error(s.conn) != 0) {
                                 final_code = QUIC_NATIVE_TLS_FAIL;
+                            } else if (!ngtcp2_conn_get_handshake_completed(s.conn)) {
+                                final_code = QUIC_NATIVE_CONNECT_FAIL;
                             } else {
                                 final_code = QUIC_NATIVE_STREAM_FAIL;
                             }
-                            goto done;
+                            goto done_loop;
                         }
                     }
                 }
@@ -1535,16 +1727,31 @@ static QuicNativeResultCode _quic_native_single_request(
         }
     }
 
-    if (s.conn != NULL && !ngtcp2_conn_get_handshake_completed(s.conn)) {
-        final_code = QUIC_NATIVE_HANDSHAKE_TIMEOUT;
-    } else {
-        final_code = QUIC_NATIVE_STREAM_FAIL;
+    if (s.requests_completed < s.requests_target) {
+        if (s.conn != NULL && !ngtcp2_conn_get_handshake_completed(s.conn)) {
+            final_code = QUIC_NATIVE_HANDSHAKE_TIMEOUT;
+        } else if (final_code == QUIC_NATIVE_OK) {
+            final_code = QUIC_NATIVE_STREAM_FAIL;
+        }
+    }
+
+done_loop:
+    if (out != NULL) {
+        out->sent = s.requests_success;
+        out->stream_fail += s.requests_failed;
+        out->handshake_ns = s.handshake_ns;
+    }
+    remaining = request_count;
+    remaining -= s.requests_success;
+    remaining -= s.requests_failed;
+    if (remaining < 0) {
+        remaining = 0;
+    }
+    if (remaining > 0) {
+        _quic_native_assign_remaining_failure(out, remaining, final_code);
     }
 
 done:
-    if (handshake_ns_out != NULL) {
-        *handshake_ns_out = s.handshake_ns;
-    }
     _quic_native_cleanup(&s);
     return final_code;
 }
@@ -4507,7 +4714,7 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
     const char *method_cfg = "GET";
     char method[24];
     int verify_tls = 1;
-    int enable_quic_py_bridge = 1;
+    int enable_quic_py_bridge = 0;
     int require_native_quic = 0;
     double timeout_s = 3.0;
     struct in_addr target_addr;
@@ -4566,7 +4773,7 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         timeout_s = 3.0;
     }
     verify_tls = _dict_bool(cfg, "verify", 1);
-    enable_quic_py_bridge = _dict_bool(cfg, "enable_quic_py_bridge", 1);
+    enable_quic_py_bridge = _dict_bool(cfg, "enable_quic_py_bridge", 0);
     require_native_quic = _dict_bool(cfg, "require_native_quic", 0);
 
     target_ip = _dict_cstr(cfg, "target_ip", "");
@@ -4691,7 +4898,10 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         long stream_fail_count = 0;
         long retry_attempts = 0;
         long retry_successes = 0;
-        long peak_active = concurrency;
+        long quic_streams_per_conn = _dict_long(cfg, "quic_streams_per_conn", concurrency);
+        long quic_requests_per_conn = _dict_long(cfg, "quic_requests_per_conn", 0);
+        long peak_active = 0;
+        long conn_attempts = 0;
         long sample_count = 0;
         long sample_cap = total_attempts;
         const long sample_cap_hard = 200000;
@@ -4702,6 +4912,16 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         double handshake_p99_ms = 0.0;
         const char *final_reason = "none";
 
+        if (quic_streams_per_conn < 1) {
+            quic_streams_per_conn = concurrency > 0 ? concurrency : 1;
+        }
+        if (quic_streams_per_conn > 256) {
+            quic_streams_per_conn = 256;
+        }
+        if (quic_requests_per_conn < 0) {
+            quic_requests_per_conn = 0;
+        }
+        peak_active = quic_streams_per_conn;
         if (peak_active > total_attempts) {
             peak_active = total_attempts;
         }
@@ -4715,16 +4935,23 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
             }
         }
 
-        for (long i = 0; i < total_attempts; i++) {
-            int success = 0;
-            QuicNativeResultCode last_code = QUIC_NATIVE_STREAM_FAIL;
-            for (long attempt_idx = 0; attempt_idx <= retries; attempt_idx++) {
-                long long hs_ns = 0;
+        for (long batch_start = 0; batch_start < total_attempts;) {
+            long batch_target = total_attempts - batch_start;
+            long wave_remaining;
+            if (quic_requests_per_conn > 0 && batch_target > quic_requests_per_conn) {
+                batch_target = quic_requests_per_conn;
+            }
+            wave_remaining = batch_target;
+            for (long attempt_idx = 0; attempt_idx <= retries && wave_remaining > 0; attempt_idx++) {
+                QuicNativeBatchResult batch_out;
+                long batch_errors;
+                QuicNativeResultCode batch_code;
+
                 if (attempt_idx > 0) {
-                    retry_attempts += 1;
+                    retry_attempts += wave_remaining;
                 }
                 Py_BEGIN_ALLOW_THREADS
-                last_code = _quic_native_single_request(
+                batch_code = _quic_native_run_batch(
                     target_ip,
                     (int)target_port,
                     server_name,
@@ -4732,52 +4959,95 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
                     path,
                     verify_tls ? 1 : 0,
                     timeout_s,
-                    &hs_ns
+                    wave_remaining,
+                    quic_streams_per_conn,
+                    &batch_out
                 );
                 Py_END_ALLOW_THREADS
 
-                if (last_code == QUIC_NATIVE_OK) {
-                    sent_total += 1;
-                    success = 1;
-                    if (attempt_idx > 0) {
-                        retry_successes += 1;
-                    }
-                    if (hs_ns > 0 && handshake_samples != NULL && sample_count < sample_cap) {
-                        handshake_samples[sample_count] = hs_ns;
-                        sample_count += 1;
-                    }
+                conn_attempts += 1;
+                sent_total += batch_out.sent;
+                batch_errors = batch_out.connect_fail +
+                               batch_out.connect_timeout +
+                               batch_out.tls_fail +
+                               batch_out.handshake_timeout +
+                               batch_out.stream_fail;
+                if (batch_errors < 0) {
+                    batch_errors = 0;
+                }
+                if (batch_errors > wave_remaining) {
+                    batch_errors = wave_remaining;
+                }
+
+                if (batch_out.handshake_ns > 0 && handshake_samples != NULL && sample_count < sample_cap) {
+                    handshake_samples[sample_count] = batch_out.handshake_ns;
+                    sample_count += 1;
+                }
+
+                if (attempt_idx > 0) {
+                    retry_successes += batch_out.sent;
+                }
+
+                if (batch_errors <= 0 || batch_code == QUIC_NATIVE_OK) {
+                    wave_remaining = 0;
                     break;
                 }
-            }
-            if (!success) {
-                switch (last_code) {
-                    case QUIC_NATIVE_CONNECT_FAIL:
-                        connect_fail_count += 1;
-                        break;
-                    case QUIC_NATIVE_CONNECT_TIMEOUT:
-                        connect_timeout_count += 1;
-                        break;
-                    case QUIC_NATIVE_TLS_FAIL:
-                        tls_fail_count += 1;
-                        break;
-                    case QUIC_NATIVE_HANDSHAKE_TIMEOUT:
-                        handshake_timeout_count += 1;
-                        break;
-                    case QUIC_NATIVE_STREAM_FAIL:
-                    default:
-                        stream_fail_count += 1;
-                        break;
+
+                if (attempt_idx == retries) {
+                    connect_fail_count += batch_out.connect_fail;
+                    connect_timeout_count += batch_out.connect_timeout;
+                    tls_fail_count += batch_out.tls_fail;
+                    handshake_timeout_count += batch_out.handshake_timeout;
+                    stream_fail_count += batch_out.stream_fail;
+                    wave_remaining = 0;
+                } else {
+                    wave_remaining = batch_errors;
                 }
             }
+            batch_start += batch_target;
         }
 
         errors_total = total_attempts - sent_total;
         if (errors_total < 0) {
             errors_total = 0;
         }
+        if (errors_total > 0) {
+            long categorized_errors = connect_fail_count +
+                                      connect_timeout_count +
+                                      tls_fail_count +
+                                      handshake_timeout_count +
+                                      stream_fail_count;
+            if (categorized_errors < errors_total) {
+                stream_fail_count += (errors_total - categorized_errors);
+            } else if (categorized_errors > errors_total) {
+                long overflow = categorized_errors - errors_total;
+                long reduce = stream_fail_count > overflow ? overflow : stream_fail_count;
+                stream_fail_count -= reduce;
+                overflow -= reduce;
+                if (overflow > 0) {
+                    reduce = connect_fail_count > overflow ? overflow : connect_fail_count;
+                    connect_fail_count -= reduce;
+                    overflow -= reduce;
+                }
+                if (overflow > 0) {
+                    reduce = connect_timeout_count > overflow ? overflow : connect_timeout_count;
+                    connect_timeout_count -= reduce;
+                    overflow -= reduce;
+                }
+                if (overflow > 0) {
+                    reduce = tls_fail_count > overflow ? overflow : tls_fail_count;
+                    tls_fail_count -= reduce;
+                    overflow -= reduce;
+                }
+                if (overflow > 0) {
+                    reduce = handshake_timeout_count > overflow ? overflow : handshake_timeout_count;
+                    handshake_timeout_count -= reduce;
+                }
+            }
+        }
         run_end_ns = monotonic_ns_now();
-        if (run_end_ns > run_start_ns && sent_total > 0) {
-            conn_rate = (double)sent_total / ((double)(run_end_ns - run_start_ns) / 1e9);
+        if (run_end_ns > run_start_ns && conn_attempts > 0) {
+            conn_rate = (double)conn_attempts / ((double)(run_end_ns - run_start_ns) / 1e9);
         }
 
         if (sample_count > 0 && handshake_samples != NULL) {
@@ -4823,6 +5093,9 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
             long handshake_fail_total = connect_timeout_count + tls_fail_count + handshake_timeout_count;
             if (_set_long(result, "session_repeats", session_repeats) < 0 ||
                 _set_long(result, "retry_budget", retries) < 0 ||
+                _set_long(result, "quic_streams_per_conn", quic_streams_per_conn) < 0 ||
+                _set_long(result, "quic_requests_per_conn", quic_requests_per_conn) < 0 ||
+                _set_long(result, "quic_connection_attempts", conn_attempts) < 0 ||
                 _set_long(result, "quic_connect_fail_count", connect_fail_count) < 0 ||
                 _set_long(result, "quic_connect_timeout_count", connect_timeout_count) < 0 ||
                 _set_long(result, "quic_tls_fail_count", tls_fail_count) < 0 ||

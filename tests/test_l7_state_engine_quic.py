@@ -18,6 +18,41 @@ class TestL7StateEngineQuic(unittest.TestCase):
         supported = bool(l7_core.quic_supported())
         self.assertEqual(supported, mode in {"h3_stateful", "h3_stateful_py"})
 
+    def test_quic_h3_native_batch_contract(self):
+        mode = str(l7_core.quic_stack_mode() or "")
+        if mode != "h3_stateful":
+            self.skipTest("requires native h3_stateful mode")
+
+        handle = l7_core.open({})
+        try:
+            out = l7_core.run_quic_stateful(
+                handle,
+                {
+                    "target_ip": "127.0.0.1",
+                    "target_port": 65530,
+                    "count": 6,
+                    "concurrency": 4,
+                    "retries": 1,
+                    "timeout_s": 0.3,
+                    "scheme": "https",
+                    "verify": False,
+                    "quic_method": "GET",
+                    "quic_path": "/",
+                    "quic_streams_per_conn": 2,
+                    "quic_requests_per_conn": 3,
+                    "enable_quic_py_bridge": 0,
+                },
+            )
+        finally:
+            l7_core.close(handle)
+
+        self.assertEqual(str(out.get("quic_stack_mode", "")), "h3_stateful")
+        self.assertEqual(int(out.get("attempted", -1)), 6)
+        self.assertEqual(int(out.get("quic_streams_per_conn", -1)), 2)
+        self.assertEqual(int(out.get("quic_requests_per_conn", -1)), 3)
+        self.assertGreaterEqual(int(out.get("quic_connection_attempts", -1)), 1)
+        self.assertEqual(int(out.get("retry_attempts", -1)), 6)
+
     def test_quic_unavailable_result_contract(self):
         mode = str(l7_core.quic_stack_mode() or "")
         if mode != "unavailable":
