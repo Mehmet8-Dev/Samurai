@@ -94,6 +94,17 @@ class TestSetupCapabilityFlags(unittest.TestCase):
         self.assertTrue(caps["nghttp2"])
         self.assertTrue(caps["quic"])
 
+    def test_detect_l7_capabilities_bridge_only_disables_quic(self):
+        setup_mod = _load_setup_module()
+        with patch.object(setup_mod, "_pkg_config_exists", return_value=True), \
+             patch.object(setup_mod.ctypes.util, "find_library", return_value="libok"), \
+             patch.object(setup_mod.os.path, "exists", return_value=True), \
+             patch.dict(os.environ, {"SAMURAI_QUIC_BUILD_MODE": "bridge_only"}, clear=False):
+            caps = setup_mod.detect_l7_capabilities()
+        self.assertTrue(caps["openssl"])
+        self.assertTrue(caps["nghttp2"])
+        self.assertFalse(caps["quic"])
+
     def test_resolve_quic_crypto_backend_prefers_forced_gnutls(self):
         setup_mod = _load_setup_module()
         with patch.object(
@@ -119,3 +130,45 @@ class TestSetupCapabilityFlags(unittest.TestCase):
         self.assertEqual(link_name, "")
         pkg_mock.assert_not_called()
         lib_mock.assert_not_called()
+
+    def test_resolve_l7_flags_native_required_raises_when_quic_missing(self):
+        setup_mod = _load_setup_module()
+        with patch.dict(os.environ, {"SAMURAI_QUIC_BUILD_MODE": "native_required"}, clear=False), \
+             patch.object(
+                 setup_mod,
+                 "detect_l7_capabilities",
+                 return_value={"openssl": True, "nghttp2": True, "quic": False, "gnutls": False},
+             ):
+            with self.assertRaises(RuntimeError):
+                setup_mod._resolve_l7_flags()
+
+    def test_resolve_l7_flags_native_required_raises_without_gnutls_crypto(self):
+        setup_mod = _load_setup_module()
+        with patch.dict(os.environ, {"SAMURAI_QUIC_BUILD_MODE": "native_required"}, clear=False), \
+             patch.object(
+                 setup_mod,
+                 "detect_l7_capabilities",
+                 return_value={"openssl": True, "nghttp2": True, "quic": True, "gnutls": True},
+             ), \
+             patch.object(setup_mod, "_pkg_config_first", side_effect=lambda names: names[0]), \
+             patch.object(setup_mod, "_resolve_quic_crypto_backend", return_value=("openssl", "ngtcp2_crypto_ossl", "")), \
+             patch.object(setup_mod, "_pkg_config_tokens", return_value=[]):
+            with self.assertRaises(RuntimeError):
+                setup_mod._resolve_l7_flags()
+
+    def test_resolve_l7_flags_native_required_accepts_gnutls_crypto(self):
+        setup_mod = _load_setup_module()
+        with patch.dict(os.environ, {"SAMURAI_QUIC_BUILD_MODE": "native_required"}, clear=False), \
+             patch.object(
+                 setup_mod,
+                 "detect_l7_capabilities",
+                 return_value={"openssl": True, "nghttp2": True, "quic": True, "gnutls": True},
+             ), \
+             patch.object(setup_mod, "_pkg_config_first", side_effect=lambda names: names[0]), \
+             patch.object(setup_mod, "_resolve_quic_crypto_backend", return_value=("gnutls", "ngtcp2_crypto_gnutls", "")), \
+             patch.object(setup_mod, "_pkg_config_tokens", return_value=[]):
+            compile_args, link_args, macros = setup_mod._resolve_l7_flags()
+        macro_dict = {k: v for k, v in macros}
+        self.assertIn("-O2", compile_args)
+        self.assertIn("-lpthread", link_args)
+        self.assertEqual(macro_dict.get("SAMURAI_WITH_NGTCP2_GNUTLS"), "1")

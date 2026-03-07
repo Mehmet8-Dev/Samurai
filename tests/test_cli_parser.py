@@ -102,6 +102,7 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--state-sweep-interval-ms", opts)
         self.assertIn("--sender-backend", opts)
         self.assertIn("--sender-fallback-policy", opts)
+        self.assertIn("--dataplane-core-mode", opts)
         self.assertIn("--lab-profile", opts)
         self.assertIn("--dp-queue-strategy", opts)
         self.assertIn("--dp-queues", opts)
@@ -115,6 +116,8 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--l7-http2-engine", opts)
         self.assertIn("--l7-quic-engine", opts)
         self.assertIn("--l7-quic-require-native", opts)
+        self.assertIn("--l7-quic-auto-bridge", opts)
+        self.assertIn("--l7-quic-bridge-autopromote", opts)
         self.assertIn("--l7-fallback-policy", opts)
         self.assertIn("--l7-capability-strict", opts)
         self.assertIn("--legacy-path-enable", opts)
@@ -131,6 +134,7 @@ class TestCliParser(unittest.TestCase):
         args = parser.parse_args([])
         self.assertEqual(args.sender_backend, "auto")
         self.assertEqual(args.sender_fallback_policy, "allow")
+        self.assertEqual(args.dataplane_core_mode, "off")
         self.assertEqual(args.lab_profile, "off")
         self.assertEqual(args.dp_queue_strategy, "rr")
         self.assertEqual(args.dp_queues, 1)
@@ -144,6 +148,8 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.l7_http2_engine, "auto")
         self.assertEqual(args.l7_quic_engine, "auto")
         self.assertFalse(args.l7_quic_require_native)
+        self.assertFalse(args.l7_quic_auto_bridge)
+        self.assertFalse(args.l7_quic_bridge_autopromote)
         self.assertEqual(args.quic_streams_per_conn, 0)
         self.assertEqual(args.quic_requests_per_conn, 0)
         self.assertEqual(args.quic_conn_pool_size, 1)
@@ -322,6 +328,11 @@ class TestSenderRouteValidation(unittest.TestCase):
         args = parser.parse_args(["--sender-backend", "auto", "--sender-fallback-policy", "fail"])
         self._assert_validation_fails(parser, args)
 
+    def test_dataplane_required_requires_fail_policy(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--dataplane-core-mode", "required"])
+        self._assert_validation_fails(parser, args)
+
     def test_dp_queue_map_requires_map_spec(self):
         parser = cli.build_parser()
         args = parser.parse_args(["--dp-queue-strategy", "map"])
@@ -346,6 +357,20 @@ class TestSenderRouteValidation(unittest.TestCase):
         parser = cli.build_parser()
         args = parser.parse_args(
             ["--l7-quic-require-native", "--l7-capability-strict", "--l7-quic-engine", "python"]
+        )
+        self._assert_validation_fails(parser, args)
+
+    def test_l7_quic_require_native_rejects_auto_bridge(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            ["--l7-quic-require-native", "--l7-capability-strict", "--l7-quic-auto-bridge"]
+        )
+        self._assert_validation_fails(parser, args)
+
+    def test_l7_quic_require_native_rejects_bridge_autopromote(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            ["--l7-quic-require-native", "--l7-capability-strict", "--l7-quic-bridge-autopromote"]
         )
         self._assert_validation_fails(parser, args)
 

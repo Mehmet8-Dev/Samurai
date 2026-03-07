@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 class TestReporting(unittest.TestCase):
@@ -560,3 +561,30 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["kpi_gate_status"], "fail")
         self.assertEqual(rr.results["kpi_gate_hard_fail"], 1)
         self.assertEqual(rr.results["score_eligible"], 0)
+
+    def test_live_attack_report_kpi_gate_exception_is_fail_closed(self):
+        from ddos_samurai import reporting
+
+        with patch("ddos_samurai.kpi_gate.evaluate", side_effect=RuntimeError("gate_boom")):
+            rr = reporting.build_live_attack_report(
+                args={"target": "127.0.0.1", "kpi_gate_profile": "dedicated_lab", "kpi_hard_fail": True},
+                worker_events=[
+                    {
+                        "status": "ok",
+                        "attack_vector": "basic",
+                        "compute_backend": "cpu",
+                        "sender_path": "C_EXT_L3",
+                        "stats": {"attempted": 10, "sent": 10, "errors": 0, "bytes_sent_est": 640},
+                    }
+                ],
+                duration_s=1.0,
+                progress_total=10,
+                total_count=10,
+                metrics={},
+                warnings=[],
+            )
+        self.assertEqual(rr.results["kpi_gate_profile"], "dedicated_lab")
+        self.assertEqual(rr.results["kpi_gate_status"], "fail")
+        self.assertEqual(rr.results["kpi_gate_hard_fail"], 1)
+        self.assertEqual(rr.results["score_eligible"], 0)
+        self.assertIn("kpi_gate_exception:RuntimeError", rr.results.get("kpi_violations", []))
