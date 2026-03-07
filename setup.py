@@ -110,6 +110,7 @@ def detect_l7_capabilities() -> Dict[str, bool]:
     nghttp2_pkg = _pkg_config_first(["nghttp2", "libnghttp2"])
     ngtcp2_pkg = _pkg_config_first(["ngtcp2", "libngtcp2"])
     nghttp3_pkg = _pkg_config_first(["nghttp3", "libnghttp3"])
+    gnutls_pkg = _pkg_config_first(["gnutls", "libgnutls"])
     nghttp2_headers = _has_header(
         ["/usr/include/nghttp2/nghttp2.h", "/usr/local/include/nghttp2/nghttp2.h"]
     )
@@ -122,6 +123,10 @@ def detect_l7_capabilities() -> Dict[str, bool]:
     nghttp2_lib = _has_lib(["nghttp2"])
     ngtcp2_lib = _has_lib(["ngtcp2"])
     nghttp3_lib = _has_lib(["nghttp3"])
+    gnutls_headers = _has_header(
+        ["/usr/include/gnutls/gnutls.h", "/usr/local/include/gnutls/gnutls.h"]
+    )
+    gnutls_lib = _has_lib(["gnutls"])
 
     nghttp2_enabled = False
     if _env_flag("SAMURAI_FORCE_NGHTTP2", "0"):
@@ -148,6 +153,7 @@ def detect_l7_capabilities() -> Dict[str, bool]:
         "openssl": bool(openssl_enabled),
         "nghttp2": bool(nghttp2_enabled),
         "quic": bool(quic_enabled),
+        "gnutls": bool(gnutls_pkg or (gnutls_headers and gnutls_lib)),
     }
 
 
@@ -182,6 +188,8 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
         )
 
     if caps["quic"]:
+        quic_crypto_is_gnutls = False
+        quic_crypto_linked = False
         macros.extend([
             ("SAMURAI_WITH_NGTCP2", "1"),
             ("SAMURAI_WITH_NGHTTP3", "1"),
@@ -192,38 +200,56 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
             pkg_names.append(nghttp3_pkg)
         crypto_pkg = None
         for candidate in (
+            "ngtcp2_crypto_gnutls",
+            "libngtcp2_crypto_gnutls",
             "ngtcp2_crypto_ossl",
             "ngtcp2_crypto_openssl",
             "ngtcp2_crypto_quictls",
             "libngtcp2_crypto_ossl",
             "libngtcp2_crypto_openssl",
             "libngtcp2_crypto_quictls",
-            "ngtcp2_crypto_gnutls",
-            "libngtcp2_crypto_gnutls",
         ):
             if _pkg_config_exists(candidate):
                 crypto_pkg = candidate
                 break
         if crypto_pkg:
             pkg_names.append(crypto_pkg)
+            quic_crypto_linked = True
+            if "gnutls" in str(crypto_pkg):
+                quic_crypto_is_gnutls = True
         else:
             crypto_link_name = None
             for candidate in (
+                "ngtcp2_crypto_gnutls",
                 "ngtcp2_crypto_ossl",
                 "ngtcp2_crypto_openssl",
                 "ngtcp2_crypto_quictls",
-                "ngtcp2_crypto_gnutls",
             ):
                 if ctypes.util.find_library(candidate) is not None:
                     crypto_link_name = candidate
                     break
             if crypto_link_name:
                 link_args.append(f"-l{crypto_link_name}")
+                quic_crypto_linked = True
+                if "gnutls" in str(crypto_link_name):
+                    quic_crypto_is_gnutls = True
             # Fallback linker names when pkg-config modules are unavailable.
             link_args.extend(["-lngtcp2", "-lnghttp3"])
+        if quic_crypto_linked:
+            macros.append(("SAMURAI_WITH_NGTCP2_CRYPTO", "1"))
+        else:
+            print(
+                "Warning: ngtcp2 crypto backend not found; native C QUIC loop disabled "
+                "(py bridge/fallback paths remain available)."
+            )
+        if quic_crypto_is_gnutls:
+            macros.append(("SAMURAI_WITH_GNUTLS", "1"))
+            macros.append(("SAMURAI_WITH_NGTCP2_GNUTLS", "1"))
+            if not crypto_pkg:
+                link_args.append("-lgnutls")
     else:
         print(
-            "Warning: ngtcp2/nghttp3 dev metadata (or OpenSSL) not found/disabled; "
+            "Warning: ngtcp2/nghttp3 dev metadata not found/disabled; "
             "C QUIC mode will report capability_unavailable. "
             "Use SAMURAI_FORCE_QUIC=1 only if linker flags are provided externally."
         )

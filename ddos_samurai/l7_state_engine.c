@@ -29,6 +29,18 @@
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
 #include <ngtcp2/ngtcp2.h>
 #include <nghttp3/nghttp3.h>
+#ifdef SAMURAI_WITH_NGTCP2_CRYPTO
+#include <ngtcp2/ngtcp2_crypto.h>
+#endif
+#ifdef SAMURAI_WITH_NGTCP2_GNUTLS
+#include <gnutls/gnutls.h>
+#include <ngtcp2/ngtcp2_crypto_gnutls.h>
+#endif
+#endif
+
+#if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3) && \
+    defined(SAMURAI_WITH_NGTCP2_CRYPTO) && defined(SAMURAI_WITH_NGTCP2_GNUTLS)
+#define SAMURAI_WITH_QUIC_NATIVE 1
 #endif
 
 typedef struct {
@@ -567,9 +579,12 @@ static int _quic_stack_probe(const char **reason_out, const char **mode_out) {
         goto done;
     }
 
-    /* Native ngtcp2/nghttp3 engine is not fully wired yet in this build.
-       If Python H3 bridge is available, expose it from core so strict
-       capability checks can use a concrete h3_stateful_py mode. */
+#ifdef SAMURAI_WITH_QUIC_NATIVE
+    reason = "native_ready";
+    mode = "h3_stateful";
+    available = 1;
+#else
+    /* If native stack is unavailable, expose bridge mode when present. */
     if (_quic_bridge_supported(&mode, &reason)) {
         available = 1;
     } else {
@@ -577,6 +592,7 @@ static int _quic_stack_probe(const char **reason_out, const char **mode_out) {
         mode = "unavailable";
         available = 0;
     }
+#endif
 
 done:
     g_quic_stack_probe.checked = 1;
@@ -591,6 +607,948 @@ done:
     }
     return available;
 }
+
+#ifdef SAMURAI_WITH_QUIC_NATIVE
+typedef enum {
+    QUIC_NATIVE_OK = 0,
+    QUIC_NATIVE_CONNECT_FAIL = 1,
+    QUIC_NATIVE_CONNECT_TIMEOUT = 2,
+    QUIC_NATIVE_TLS_FAIL = 3,
+    QUIC_NATIVE_HANDSHAKE_TIMEOUT = 4,
+    QUIC_NATIVE_STREAM_FAIL = 5
+} QuicNativeResultCode;
+
+typedef struct {
+    int fd;
+    int epfd;
+    struct sockaddr_in remote_addr;
+    struct sockaddr_storage local_addr;
+    socklen_t local_addrlen;
+    ngtcp2_path_storage path_storage;
+    ngtcp2_pkt_info pkt_info;
+    ngtcp2_conn *conn;
+    nghttp3_conn *h3_conn;
+    gnutls_session_t tls_session;
+    gnutls_certificate_credentials_t tls_cred;
+    ngtcp2_crypto_conn_ref conn_ref;
+    int h3_initialized;
+    int response_complete;
+    int response_status;
+    int response_stream_failed;
+    int64_t request_stream_id;
+    int64_t control_stream_id;
+    int64_t qpack_enc_stream_id;
+    int64_t qpack_dec_stream_id;
+    long long start_ns;
+    long long handshake_ns;
+} QuicNativeSession;
+
+static int g_quic_gnutls_init_done = 0;
+
+static int _quic_native_gnutls_init(void) {
+    if (g_quic_gnutls_init_done) {
+        return 0;
+    }
+    if (gnutls_global_init() != GNUTLS_E_SUCCESS) {
+        return -1;
+    }
+    srand((unsigned int)time(NULL));
+    g_quic_gnutls_init_done = 1;
+    return 0;
+}
+
+static void _quic_native_fill_random(uint8_t *dst, size_t len) {
+    size_t i;
+    if (dst == NULL || len == 0) {
+        return;
+    }
+    for (i = 0; i < len; i++) {
+        dst[i] = (uint8_t)(rand() & 0xff);
+    }
+}
+
+static ngtcp2_conn *_quic_native_conn_ref_get_conn(ngtcp2_crypto_conn_ref *conn_ref) {
+    QuicNativeSession *s;
+    if (conn_ref == NULL || conn_ref->user_data == NULL) {
+        return NULL;
+    }
+    s = (QuicNativeSession *)conn_ref->user_data;
+    return s->conn;
+}
+
+static void _quic_native_rand_cb(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *rand_ctx) {
+    (void)rand_ctx;
+    _quic_native_fill_random(dest, destlen);
+}
+
+static int _quic_native_get_new_connection_id_cb(
+    ngtcp2_conn *conn,
+    ngtcp2_cid *cid,
+    uint8_t *token,
+    size_t cidlen,
+    void *user_data
+) {
+    (void)conn;
+    (void)user_data;
+    if (cid == NULL || token == NULL || cidlen == 0 || cidlen > NGTCP2_MAX_CIDLEN) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    _quic_native_fill_random(cid->data, cidlen);
+    cid->datalen = cidlen;
+    _quic_native_fill_random(token, NGTCP2_STATELESS_RESET_TOKENLEN);
+    return 0;
+}
+
+static int _quic_native_handshake_completed_cb(ngtcp2_conn *conn, void *user_data) {
+    QuicNativeSession *s = (QuicNativeSession *)user_data;
+    (void)conn;
+    if (s != NULL && s->handshake_ns == 0) {
+        long long now_ns = monotonic_ns_now();
+        if (now_ns > s->start_ns) {
+            s->handshake_ns = now_ns - s->start_ns;
+        }
+    }
+    return 0;
+}
+
+static int _quic_native_h3_acked_stream_data_cb(
+    nghttp3_conn *conn,
+    int64_t stream_id,
+    uint64_t datalen,
+    void *conn_user_data,
+    void *stream_user_data
+) {
+    (void)conn;
+    (void)stream_id;
+    (void)datalen;
+    (void)conn_user_data;
+    (void)stream_user_data;
+    return 0;
+}
+
+static int _quic_native_h3_stream_close_cb(
+    nghttp3_conn *conn,
+    int64_t stream_id,
+    uint64_t app_error_code,
+    void *conn_user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
+    (void)conn;
+    (void)stream_user_data;
+    if (s != NULL && stream_id == s->request_stream_id && app_error_code != 0) {
+        s->response_stream_failed = 1;
+        s->response_complete = 1;
+    }
+    return 0;
+}
+
+static int _quic_native_h3_recv_data_cb(
+    nghttp3_conn *conn,
+    int64_t stream_id,
+    const uint8_t *data,
+    size_t datalen,
+    void *conn_user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
+    (void)conn;
+    (void)data;
+    (void)stream_user_data;
+    if (s != NULL && s->conn != NULL && datalen > 0) {
+        ngtcp2_conn_extend_max_offset(s->conn, (uint64_t)datalen);
+        (void)ngtcp2_conn_extend_max_stream_offset(s->conn, stream_id, (uint64_t)datalen);
+    }
+    return 0;
+}
+
+static int _quic_native_h3_deferred_consume_cb(
+    nghttp3_conn *conn,
+    int64_t stream_id,
+    size_t consumed,
+    void *conn_user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
+    (void)conn;
+    (void)stream_user_data;
+    if (s != NULL && s->conn != NULL && consumed > 0) {
+        ngtcp2_conn_extend_max_offset(s->conn, (uint64_t)consumed);
+        (void)ngtcp2_conn_extend_max_stream_offset(s->conn, stream_id, (uint64_t)consumed);
+    }
+    return 0;
+}
+
+static int _quic_native_h3_begin_headers_cb(
+    nghttp3_conn *conn,
+    int64_t stream_id,
+    void *conn_user_data,
+    void *stream_user_data
+) {
+    (void)conn;
+    (void)stream_id;
+    (void)conn_user_data;
+    (void)stream_user_data;
+    return 0;
+}
+
+static int _quic_native_h3_recv_header_cb(
+    nghttp3_conn *conn,
+    int64_t stream_id,
+    int32_t token,
+    nghttp3_rcbuf *name,
+    nghttp3_rcbuf *value,
+    uint8_t flags,
+    void *conn_user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
+    (void)conn;
+    (void)name;
+    (void)flags;
+    (void)stream_user_data;
+    if (s == NULL || stream_id != s->request_stream_id || value == NULL) {
+        return 0;
+    }
+    if (token == NGHTTP3_QPACK_TOKEN__STATUS) {
+        nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+        int parsed = 0;
+        size_t i;
+        for (i = 0; i < v.len; i++) {
+            unsigned char ch = (unsigned char)v.base[i];
+            if (!isdigit(ch)) {
+                break;
+            }
+            parsed = (parsed * 10) + (int)(ch - '0');
+        }
+        if (parsed > 0) {
+            s->response_status = parsed;
+        }
+    }
+    return 0;
+}
+
+static int _quic_native_h3_end_headers_cb(
+    nghttp3_conn *conn,
+    int64_t stream_id,
+    int fin,
+    void *conn_user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
+    (void)conn;
+    (void)stream_user_data;
+    if (s != NULL && stream_id == s->request_stream_id && fin) {
+        s->response_complete = 1;
+    }
+    return 0;
+}
+
+static int _quic_native_h3_end_stream_cb(
+    nghttp3_conn *conn,
+    int64_t stream_id,
+    void *conn_user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
+    (void)conn;
+    (void)stream_user_data;
+    if (s != NULL && stream_id == s->request_stream_id) {
+        s->response_complete = 1;
+    }
+    return 0;
+}
+
+static int _quic_native_h3_stop_sending_cb(
+    nghttp3_conn *conn,
+    int64_t stream_id,
+    uint64_t app_error_code,
+    void *conn_user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
+    (void)conn;
+    (void)app_error_code;
+    (void)stream_user_data;
+    if (s != NULL && stream_id == s->request_stream_id) {
+        s->response_stream_failed = 1;
+        s->response_complete = 1;
+    }
+    return 0;
+}
+
+static int _quic_native_h3_reset_stream_cb(
+    nghttp3_conn *conn,
+    int64_t stream_id,
+    uint64_t app_error_code,
+    void *conn_user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
+    (void)conn;
+    (void)app_error_code;
+    (void)stream_user_data;
+    if (s != NULL && stream_id == s->request_stream_id) {
+        s->response_stream_failed = 1;
+        s->response_complete = 1;
+    }
+    return 0;
+}
+
+static int _quic_native_h3_shutdown_cb(nghttp3_conn *conn, int64_t id, void *conn_user_data) {
+    QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
+    (void)conn;
+    (void)id;
+    if (s != NULL) {
+        s->response_stream_failed = 1;
+        s->response_complete = 1;
+    }
+    return 0;
+}
+
+static int _quic_native_recv_stream_data_cb(
+    ngtcp2_conn *conn,
+    uint32_t flags,
+    int64_t stream_id,
+    uint64_t offset,
+    const uint8_t *data,
+    size_t datalen,
+    void *user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)user_data;
+    nghttp3_ssize nconsumed;
+    int fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) ? 1 : 0;
+    (void)offset;
+    (void)stream_user_data;
+    if (s == NULL || s->h3_conn == NULL) {
+        return 0;
+    }
+    nconsumed = nghttp3_conn_read_stream(s->h3_conn, stream_id, data, datalen, fin);
+    if (nconsumed < 0) {
+        s->response_stream_failed = 1;
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    if (nconsumed > 0) {
+        ngtcp2_conn_extend_max_offset(conn, (uint64_t)nconsumed);
+        (void)ngtcp2_conn_extend_max_stream_offset(conn, stream_id, (uint64_t)nconsumed);
+    }
+    return 0;
+}
+
+static int _quic_native_acked_stream_data_offset_cb(
+    ngtcp2_conn *conn,
+    int64_t stream_id,
+    uint64_t offset,
+    uint64_t datalen,
+    void *user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)user_data;
+    (void)conn;
+    (void)offset;
+    (void)stream_user_data;
+    if (s != NULL && s->h3_conn != NULL && datalen > 0) {
+        (void)nghttp3_conn_add_ack_offset(s->h3_conn, stream_id, datalen);
+    }
+    return 0;
+}
+
+static int _quic_native_stream_close_cb(
+    ngtcp2_conn *conn,
+    uint32_t flags,
+    int64_t stream_id,
+    uint64_t app_error_code,
+    void *user_data,
+    void *stream_user_data
+) {
+    QuicNativeSession *s = (QuicNativeSession *)user_data;
+    (void)conn;
+    (void)flags;
+    (void)stream_user_data;
+    if (s != NULL && stream_id == s->request_stream_id && app_error_code != 0) {
+        s->response_stream_failed = 1;
+        s->response_complete = 1;
+    }
+    return 0;
+}
+
+static void _quic_native_cleanup(QuicNativeSession *s) {
+    if (s == NULL) {
+        return;
+    }
+    if (s->h3_conn != NULL) {
+        nghttp3_conn_del(s->h3_conn);
+        s->h3_conn = NULL;
+    }
+    if (s->conn != NULL) {
+        ngtcp2_conn_del(s->conn);
+        s->conn = NULL;
+    }
+    if (s->tls_session != NULL) {
+        gnutls_deinit(s->tls_session);
+        s->tls_session = NULL;
+    }
+    if (s->tls_cred != NULL) {
+        gnutls_certificate_free_credentials(s->tls_cred);
+        s->tls_cred = NULL;
+    }
+    if (s->epfd >= 0) {
+        close(s->epfd);
+        s->epfd = -1;
+    }
+    if (s->fd >= 0) {
+        close(s->fd);
+        s->fd = -1;
+    }
+}
+
+static int _quic_native_open_socket(QuicNativeSession *s, const char *target_ip, int target_port) {
+    struct epoll_event ev;
+    socklen_t remote_len = (socklen_t)sizeof(s->remote_addr);
+    if (s == NULL || target_ip == NULL || target_ip[0] == '\0') {
+        return -1;
+    }
+    s->fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s->fd < 0) {
+        return -1;
+    }
+    if (set_nonblocking(s->fd) < 0) {
+        return -1;
+    }
+
+    memset(&s->remote_addr, 0, sizeof(s->remote_addr));
+    s->remote_addr.sin_family = AF_INET;
+    s->remote_addr.sin_port = htons((uint16_t)target_port);
+    if (inet_pton(AF_INET, target_ip, &s->remote_addr.sin_addr) != 1) {
+        return -1;
+    }
+
+    if (connect(s->fd, (const struct sockaddr *)&s->remote_addr, remote_len) < 0 &&
+        errno != EINPROGRESS) {
+        return -1;
+    }
+
+    s->local_addrlen = (socklen_t)sizeof(s->local_addr);
+    memset(&s->local_addr, 0, sizeof(s->local_addr));
+    if (getsockname(s->fd, (struct sockaddr *)&s->local_addr, &s->local_addrlen) < 0) {
+        return -1;
+    }
+
+    ngtcp2_path_storage_init(
+        &s->path_storage,
+        (const ngtcp2_sockaddr *)&s->local_addr,
+        (ngtcp2_socklen)s->local_addrlen,
+        (const ngtcp2_sockaddr *)&s->remote_addr,
+        (ngtcp2_socklen)sizeof(s->remote_addr),
+        NULL
+    );
+    memset(&s->pkt_info, 0, sizeof(s->pkt_info));
+
+    s->epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (s->epfd < 0) {
+        return -1;
+    }
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.fd = s->fd;
+    if (epoll_ctl(s->epfd, EPOLL_CTL_ADD, s->fd, &ev) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int _quic_native_init_conn(
+    QuicNativeSession *s,
+    const char *server_name,
+    int verify_peer,
+    long long timeout_ns
+) {
+    ngtcp2_settings settings;
+    ngtcp2_transport_params params;
+    ngtcp2_callbacks callbacks;
+    ngtcp2_cid dcid;
+    ngtcp2_cid scid;
+    uint8_t dcid_data[16];
+    uint8_t scid_data[16];
+    gnutls_datum_t alpn;
+    int rv;
+
+    if (s == NULL) {
+        return -1;
+    }
+    if (_quic_native_gnutls_init() < 0) {
+        return -1;
+    }
+
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.client_initial = ngtcp2_crypto_client_initial_cb;
+    callbacks.recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
+    callbacks.recv_retry = ngtcp2_crypto_recv_retry_cb;
+    callbacks.encrypt = ngtcp2_crypto_encrypt_cb;
+    callbacks.decrypt = ngtcp2_crypto_decrypt_cb;
+    callbacks.hp_mask = ngtcp2_crypto_hp_mask_cb;
+    callbacks.recv_stream_data = _quic_native_recv_stream_data_cb;
+    callbacks.acked_stream_data_offset = _quic_native_acked_stream_data_offset_cb;
+    callbacks.stream_close = _quic_native_stream_close_cb;
+    callbacks.rand = _quic_native_rand_cb;
+    callbacks.get_new_connection_id = _quic_native_get_new_connection_id_cb;
+    callbacks.update_key = ngtcp2_crypto_update_key_cb;
+    callbacks.version_negotiation = ngtcp2_crypto_version_negotiation_cb;
+    callbacks.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
+    callbacks.delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
+    callbacks.get_path_challenge_data = ngtcp2_crypto_get_path_challenge_data_cb;
+    callbacks.handshake_completed = _quic_native_handshake_completed_cb;
+
+    _quic_native_fill_random(dcid_data, sizeof(dcid_data));
+    _quic_native_fill_random(scid_data, sizeof(scid_data));
+    ngtcp2_cid_init(&dcid, dcid_data, sizeof(dcid_data));
+    ngtcp2_cid_init(&scid, scid_data, sizeof(scid_data));
+
+    ngtcp2_settings_default(&settings);
+    settings.initial_ts = (ngtcp2_tstamp)s->start_ns;
+    settings.max_tx_udp_payload_size = 1350;
+    settings.handshake_timeout = timeout_ns > 0 ? (ngtcp2_duration)timeout_ns : (ngtcp2_duration)(3LL * 1000LL * 1000LL * 1000LL);
+
+    ngtcp2_transport_params_default(&params);
+    params.initial_max_stream_data_bidi_local = 1U << 20;
+    params.initial_max_stream_data_bidi_remote = 1U << 20;
+    params.initial_max_stream_data_uni = 1U << 20;
+    params.initial_max_data = 1U << 22;
+    params.initial_max_streams_bidi = 128;
+    params.initial_max_streams_uni = 32;
+    params.max_idle_timeout = timeout_ns > 0 ? (ngtcp2_duration)timeout_ns : (ngtcp2_duration)(3LL * 1000LL * 1000LL * 1000LL);
+
+    rv = ngtcp2_conn_client_new(
+        &s->conn,
+        &dcid,
+        &scid,
+        &s->path_storage.path,
+        NGTCP2_PROTO_VER_V1,
+        &callbacks,
+        &settings,
+        &params,
+        NULL,
+        s
+    );
+    if (rv != 0 || s->conn == NULL) {
+        return -1;
+    }
+
+    if (gnutls_certificate_allocate_credentials(&s->tls_cred) != GNUTLS_E_SUCCESS) {
+        return -1;
+    }
+    if (verify_peer) {
+        (void)gnutls_certificate_set_x509_system_trust(s->tls_cred);
+    }
+    if (gnutls_init(&s->tls_session, GNUTLS_CLIENT | GNUTLS_DATAGRAM | GNUTLS_NONBLOCK) != GNUTLS_E_SUCCESS) {
+        return -1;
+    }
+    if (gnutls_priority_set_direct(s->tls_session, "NORMAL:-VERS-ALL:+VERS-TLS1.3", NULL) != GNUTLS_E_SUCCESS) {
+        return -1;
+    }
+    if (gnutls_credentials_set(s->tls_session, GNUTLS_CRD_CERTIFICATE, s->tls_cred) != GNUTLS_E_SUCCESS) {
+        return -1;
+    }
+    if (server_name != NULL && server_name[0] != '\0') {
+        (void)gnutls_server_name_set(s->tls_session, GNUTLS_NAME_DNS, server_name, strlen(server_name));
+    }
+    alpn.data = (unsigned char *)"h3";
+    alpn.size = 2;
+    if (gnutls_alpn_set_protocols(s->tls_session, &alpn, 1, 0) != GNUTLS_E_SUCCESS) {
+        return -1;
+    }
+    if (verify_peer && server_name != NULL && server_name[0] != '\0') {
+        (void)gnutls_session_set_verify_cert(s->tls_session, server_name, 0);
+    }
+
+    s->conn_ref.get_conn = _quic_native_conn_ref_get_conn;
+    s->conn_ref.user_data = s;
+    gnutls_session_set_ptr(s->tls_session, &s->conn_ref);
+    if (ngtcp2_crypto_gnutls_configure_client_session(s->tls_session) != 0) {
+        return -1;
+    }
+    ngtcp2_conn_set_tls_native_handle(s->conn, s->tls_session);
+    return 0;
+}
+
+static int _quic_native_send_datagram(QuicNativeSession *s, const uint8_t *pkt, size_t pktlen) {
+    ssize_t nwrite;
+    if (s == NULL || s->fd < 0 || pkt == NULL || pktlen == 0) {
+        return -1;
+    }
+    nwrite = send(s->fd, pkt, pktlen, 0);
+    if (nwrite < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+            return 0;
+        }
+        return -1;
+    }
+    return 1;
+}
+
+static int _quic_native_setup_h3(QuicNativeSession *s, const char *method, const char *path, const char *authority) {
+    nghttp3_callbacks callbacks;
+    nghttp3_settings settings;
+    nghttp3_nv nva[5];
+    size_t method_len;
+    size_t path_len;
+    size_t authority_len;
+    if (s == NULL || s->conn == NULL) {
+        return -1;
+    }
+    if (s->h3_initialized) {
+        return 0;
+    }
+
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.acked_stream_data = _quic_native_h3_acked_stream_data_cb;
+    callbacks.stream_close = _quic_native_h3_stream_close_cb;
+    callbacks.recv_data = _quic_native_h3_recv_data_cb;
+    callbacks.deferred_consume = _quic_native_h3_deferred_consume_cb;
+    callbacks.begin_headers = _quic_native_h3_begin_headers_cb;
+    callbacks.recv_header = _quic_native_h3_recv_header_cb;
+    callbacks.end_headers = _quic_native_h3_end_headers_cb;
+    callbacks.begin_trailers = _quic_native_h3_begin_headers_cb;
+    callbacks.recv_trailer = _quic_native_h3_recv_header_cb;
+    callbacks.end_trailers = _quic_native_h3_end_headers_cb;
+    callbacks.stop_sending = _quic_native_h3_stop_sending_cb;
+    callbacks.end_stream = _quic_native_h3_end_stream_cb;
+    callbacks.reset_stream = _quic_native_h3_reset_stream_cb;
+    callbacks.shutdown = _quic_native_h3_shutdown_cb;
+
+    nghttp3_settings_default(&settings);
+    if (nghttp3_conn_client_new(&s->h3_conn, &callbacks, &settings, NULL, s) != 0 || s->h3_conn == NULL) {
+        return -1;
+    }
+
+    if (ngtcp2_conn_open_uni_stream(s->conn, &s->control_stream_id, NULL) != 0 ||
+        ngtcp2_conn_open_uni_stream(s->conn, &s->qpack_enc_stream_id, NULL) != 0 ||
+        ngtcp2_conn_open_uni_stream(s->conn, &s->qpack_dec_stream_id, NULL) != 0) {
+        return -1;
+    }
+    if (nghttp3_conn_bind_control_stream(s->h3_conn, s->control_stream_id) != 0 ||
+        nghttp3_conn_bind_qpack_streams(s->h3_conn, s->qpack_enc_stream_id, s->qpack_dec_stream_id) != 0) {
+        return -1;
+    }
+
+    if (ngtcp2_conn_open_bidi_stream(s->conn, &s->request_stream_id, NULL) != 0) {
+        return -1;
+    }
+
+    method_len = strlen(method != NULL ? method : "GET");
+    path_len = strlen(path != NULL ? path : "/");
+    authority_len = strlen(authority != NULL ? authority : "");
+    nva[0].name = (uint8_t *)":method";
+    nva[0].value = (uint8_t *)(method != NULL ? method : "GET");
+    nva[0].namelen = 7;
+    nva[0].valuelen = method_len;
+    nva[0].flags = NGHTTP3_NV_FLAG_NONE;
+    nva[1].name = (uint8_t *)":scheme";
+    nva[1].value = (uint8_t *)"https";
+    nva[1].namelen = 7;
+    nva[1].valuelen = 5;
+    nva[1].flags = NGHTTP3_NV_FLAG_NONE;
+    nva[2].name = (uint8_t *)":path";
+    nva[2].value = (uint8_t *)(path != NULL ? path : "/");
+    nva[2].namelen = 5;
+    nva[2].valuelen = path_len;
+    nva[2].flags = NGHTTP3_NV_FLAG_NONE;
+    nva[3].name = (uint8_t *)":authority";
+    nva[3].value = (uint8_t *)(authority != NULL ? authority : "");
+    nva[3].namelen = 10;
+    nva[3].valuelen = authority_len;
+    nva[3].flags = NGHTTP3_NV_FLAG_NONE;
+    nva[4].name = (uint8_t *)"user-agent";
+    nva[4].value = (uint8_t *)"DDoSamurai/2.0";
+    nva[4].namelen = 10;
+    nva[4].valuelen = 14;
+    nva[4].flags = NGHTTP3_NV_FLAG_NONE;
+
+    if (nghttp3_conn_submit_request(s->h3_conn, s->request_stream_id, nva, 5, NULL, NULL) != 0) {
+        return -1;
+    }
+
+    s->h3_initialized = 1;
+    return 0;
+}
+
+static int _quic_native_flush_pending(QuicNativeSession *s, long long now_ns) {
+    uint8_t pkt[2048];
+    int loops;
+    if (s == NULL || s->conn == NULL) {
+        return -1;
+    }
+
+    for (loops = 0; loops < 8; loops++) {
+        ngtcp2_ssize nwrite = ngtcp2_conn_write_pkt(
+            s->conn,
+            &s->path_storage.path,
+            &s->pkt_info,
+            pkt,
+            sizeof(pkt),
+            (ngtcp2_tstamp)now_ns
+        );
+        if (nwrite < 0) {
+            return -1;
+        }
+        if (nwrite == 0) {
+            break;
+        }
+        if (_quic_native_send_datagram(s, pkt, (size_t)nwrite) < 0) {
+            return -1;
+        }
+    }
+
+    if (s->h3_conn != NULL) {
+        for (loops = 0; loops < 16; loops++) {
+            nghttp3_vec h3_vec[8];
+            ngtcp2_vec qvec[8];
+            int64_t stream_id = -1;
+            int fin = 0;
+            nghttp3_ssize nvec = nghttp3_conn_writev_stream(
+                s->h3_conn,
+                &stream_id,
+                &fin,
+                h3_vec,
+                sizeof(h3_vec) / sizeof(h3_vec[0])
+            );
+            if (nvec < 0) {
+                return -1;
+            }
+            if (nvec == 0 && stream_id == -1) {
+                break;
+            }
+            if (nvec > 0) {
+                ngtcp2_ssize pdatalen = 0;
+                ngtcp2_ssize nwrite;
+                uint32_t wflags = fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : NGTCP2_WRITE_STREAM_FLAG_NONE;
+                size_t i;
+                for (i = 0; i < (size_t)nvec; i++) {
+                    qvec[i].base = h3_vec[i].base;
+                    qvec[i].len = h3_vec[i].len;
+                }
+                nwrite = ngtcp2_conn_writev_stream(
+                    s->conn,
+                    &s->path_storage.path,
+                    &s->pkt_info,
+                    pkt,
+                    sizeof(pkt),
+                    &pdatalen,
+                    wflags,
+                    stream_id,
+                    qvec,
+                    (size_t)nvec,
+                    (ngtcp2_tstamp)now_ns
+                );
+                if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+                    nghttp3_conn_block_stream(s->h3_conn, stream_id);
+                    break;
+                }
+                if (nwrite < 0) {
+                    return -1;
+                }
+                if (nwrite == 0) {
+                    break;
+                }
+                if (_quic_native_send_datagram(s, pkt, (size_t)nwrite) < 0) {
+                    return -1;
+                }
+                if (pdatalen >= 0) {
+                    (void)nghttp3_conn_add_write_offset(s->h3_conn, stream_id, (size_t)pdatalen);
+                }
+            } else {
+                (void)nghttp3_conn_add_write_offset(s->h3_conn, stream_id, 0);
+            }
+        }
+    }
+    return 0;
+}
+
+static QuicNativeResultCode _quic_native_single_request(
+    const char *target_ip,
+    int target_port,
+    const char *server_name,
+    const char *method,
+    const char *path,
+    int verify_peer,
+    double timeout_s,
+    long long *handshake_ns_out
+) {
+    QuicNativeSession s;
+    long long timeout_ns;
+    long long deadline_ns;
+    char authority[96];
+    QuicNativeResultCode final_code = QUIC_NATIVE_STREAM_FAIL;
+
+    memset(&s, 0, sizeof(s));
+    s.fd = -1;
+    s.epfd = -1;
+    s.request_stream_id = -1;
+    s.control_stream_id = -1;
+    s.qpack_enc_stream_id = -1;
+    s.qpack_dec_stream_id = -1;
+    s.response_status = 0;
+
+    if (handshake_ns_out != NULL) {
+        *handshake_ns_out = 0;
+    }
+
+    timeout_ns = (long long)(timeout_s > 0.05 ? timeout_s * 1e9 : 3.0 * 1e9);
+    s.start_ns = monotonic_ns_now();
+    deadline_ns = s.start_ns + timeout_ns;
+
+    if (_quic_native_open_socket(&s, target_ip, target_port) < 0) {
+        final_code = (errno == ETIMEDOUT) ? QUIC_NATIVE_CONNECT_TIMEOUT : QUIC_NATIVE_CONNECT_FAIL;
+        goto done;
+    }
+    if (_quic_native_init_conn(&s, server_name, verify_peer, timeout_ns) < 0) {
+        final_code = QUIC_NATIVE_TLS_FAIL;
+        goto done;
+    }
+
+    snprintf(authority, sizeof(authority), "%s:%d", target_ip, target_port);
+
+    while (monotonic_ns_now() < deadline_ns) {
+        struct epoll_event events[4];
+        long long now_ns = monotonic_ns_now();
+        long long wait_ns = 0;
+        int wait_ms = 1;
+        int nfds;
+        ngtcp2_tstamp expiry;
+
+        if (_quic_native_flush_pending(&s, now_ns) < 0) {
+            int tls_err = s.conn != NULL ? ngtcp2_conn_get_tls_error(s.conn) : 0;
+            final_code = (tls_err != 0) ? QUIC_NATIVE_TLS_FAIL : QUIC_NATIVE_STREAM_FAIL;
+            goto done;
+        }
+
+        if (s.conn != NULL && ngtcp2_conn_get_handshake_completed(s.conn)) {
+            if (s.handshake_ns == 0 && now_ns > s.start_ns) {
+                s.handshake_ns = now_ns - s.start_ns;
+            }
+            if (!s.h3_initialized) {
+                if (_quic_native_setup_h3(&s, method, path, authority) < 0) {
+                    final_code = QUIC_NATIVE_STREAM_FAIL;
+                    goto done;
+                }
+            }
+        }
+
+        if (s.response_complete) {
+            if (!s.response_stream_failed && s.response_status >= 100 && s.response_status < 600) {
+                final_code = QUIC_NATIVE_OK;
+            } else {
+                final_code = QUIC_NATIVE_STREAM_FAIL;
+            }
+            goto done;
+        }
+
+        if (s.conn == NULL) {
+            final_code = QUIC_NATIVE_STREAM_FAIL;
+            goto done;
+        }
+        if (ngtcp2_conn_is_in_closing_period(s.conn)) {
+            final_code = QUIC_NATIVE_STREAM_FAIL;
+            goto done;
+        }
+
+        expiry = ngtcp2_conn_get_expiry(s.conn);
+        if (expiry != UINT64_MAX && (long long)expiry <= now_ns) {
+            if (ngtcp2_conn_handle_expiry(s.conn, (ngtcp2_tstamp)now_ns) != 0) {
+                final_code = QUIC_NATIVE_HANDSHAKE_TIMEOUT;
+                goto done;
+            }
+            continue;
+        }
+        if (expiry == UINT64_MAX) {
+            wait_ns = deadline_ns - now_ns;
+        } else {
+            wait_ns = (long long)expiry - now_ns;
+            if (wait_ns > (deadline_ns - now_ns)) {
+                wait_ns = deadline_ns - now_ns;
+            }
+        }
+        if (wait_ns < 0) {
+            wait_ns = 0;
+        }
+        wait_ms = (int)(wait_ns / 1000000LL);
+        if (wait_ms < 1) {
+            wait_ms = 1;
+        }
+        if (wait_ms > 100) {
+            wait_ms = 100;
+        }
+
+        nfds = epoll_wait(s.epfd, events, 4, wait_ms);
+        if (nfds < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            final_code = QUIC_NATIVE_CONNECT_FAIL;
+            goto done;
+        }
+        if (nfds == 0) {
+            continue;
+        }
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd == s.fd && (events[i].events & EPOLLIN)) {
+                for (;;) {
+                    uint8_t rbuf[2048];
+                    ssize_t nread = recv(s.fd, rbuf, sizeof(rbuf), 0);
+                    if (nread < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break;
+                        }
+                        final_code = QUIC_NATIVE_CONNECT_FAIL;
+                        goto done;
+                    }
+                    if (nread == 0) {
+                        break;
+                    }
+                    {
+                        int rv;
+                        ngtcp2_pkt_info pi;
+                        long long ts_now = monotonic_ns_now();
+                        memset(&pi, 0, sizeof(pi));
+                        rv = ngtcp2_conn_read_pkt(
+                            s.conn,
+                            &s.path_storage.path,
+                            &pi,
+                            rbuf,
+                            (size_t)nread,
+                            (ngtcp2_tstamp)ts_now
+                        );
+                        if (rv != 0) {
+                            if (rv == NGTCP2_ERR_HANDSHAKE_TIMEOUT) {
+                                final_code = QUIC_NATIVE_HANDSHAKE_TIMEOUT;
+                            } else if (ngtcp2_conn_get_tls_error(s.conn) != 0) {
+                                final_code = QUIC_NATIVE_TLS_FAIL;
+                            } else {
+                                final_code = QUIC_NATIVE_STREAM_FAIL;
+                            }
+                            goto done;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (s.conn != NULL && !ngtcp2_conn_get_handshake_completed(s.conn)) {
+        final_code = QUIC_NATIVE_HANDSHAKE_TIMEOUT;
+    } else {
+        final_code = QUIC_NATIVE_STREAM_FAIL;
+    }
+
+done:
+    if (handshake_ns_out != NULL) {
+        *handshake_ns_out = s.handshake_ns;
+    }
+    _quic_native_cleanup(&s);
+    return final_code;
+}
+#endif
 #endif
 
 #ifdef SAMURAI_WITH_OPENSSL
@@ -3539,10 +4497,19 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
     long count = 0;
     long session_repeats = 1;
     long total_attempts = 0;
+    long concurrency = 1;
     long retries = 0;
     long target_port = 0;
     const char *target_ip = "";
+    const char *server_name = "";
     const char *scheme = "https";
+    const char *path = "/";
+    const char *method_cfg = "GET";
+    char method[24];
+    int verify_tls = 1;
+    int enable_quic_py_bridge = 1;
+    int require_native_quic = 0;
+    double timeout_s = 3.0;
     struct in_addr target_addr;
     PyObject *result = NULL;
     const char *stack_probe_reason = "quic_build_disabled";
@@ -3590,10 +4557,25 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
     if (retries > 8) {
         retries = 8;
     }
+    concurrency = _dict_long(cfg, "concurrency", 1);
+    if (concurrency < 1) {
+        concurrency = 1;
+    }
+    timeout_s = _dict_double(cfg, "timeout_s", 3.0);
+    if (timeout_s <= 0.0) {
+        timeout_s = 3.0;
+    }
+    verify_tls = _dict_bool(cfg, "verify", 1);
+    enable_quic_py_bridge = _dict_bool(cfg, "enable_quic_py_bridge", 1);
+    require_native_quic = _dict_bool(cfg, "require_native_quic", 0);
 
     target_ip = _dict_cstr(cfg, "target_ip", "");
     target_port = _dict_long(cfg, "target_port", 443);
     scheme = _dict_cstr(cfg, "scheme", "https");
+    method_cfg = _dict_cstr(cfg, "quic_method", _dict_cstr(cfg, "http_method", "GET"));
+    path = _dict_cstr(cfg, "quic_path", _dict_cstr(cfg, "http_path", "/"));
+    server_name = _dict_cstr(cfg, "server_name", target_ip);
+    _copy_upper_ascii(method, sizeof(method), method_cfg, "GET");
     if (target_ip[0] == '\0') {
         return _attach_handle_stats(_make_result(total_attempts, 0, total_attempts, 0, 0.0, 0.0, "C_STATE_QUIC", "target_ip_missing", 0, 0), h);
     }
@@ -3615,7 +4597,7 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
     if (!quic_ready) {
         const char *bridge_mode = "unavailable";
         const char *bridge_reason = "aioquic_bridge_unavailable";
-        if (_quic_bridge_supported(&bridge_mode, &bridge_reason)) {
+        if (!require_native_quic && enable_quic_py_bridge && _quic_bridge_supported(&bridge_mode, &bridge_reason)) {
             PyObject *bridge_result = _quic_bridge_run_stateful(cfg);
             if (bridge_result != NULL) {
                 return _attach_handle_stats(bridge_result, h);
@@ -3657,16 +4639,208 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         return _attach_handle_stats(result, h);
     }
 
-    /* Core path delegates to QUIC H3 bridge while native loop is under
-       active integration. This keeps core result contracts stable and
-       executes real connect/handshake/request flow. */
-    {
-        PyObject *bridge_result = _quic_bridge_run_stateful(cfg);
-        if (bridge_result != NULL) {
-            return _attach_handle_stats(bridge_result, h);
+    if (strcmp(stack_mode, "h3_stateful") != 0) {
+        const char *bridge_mode = "unavailable";
+        const char *bridge_reason = "aioquic_bridge_unavailable";
+        if (!require_native_quic && enable_quic_py_bridge && _quic_bridge_supported(&bridge_mode, &bridge_reason)) {
+            PyObject *bridge_result = _quic_bridge_run_stateful(cfg);
+            if (bridge_result != NULL) {
+                return _attach_handle_stats(bridge_result, h);
+            }
         }
+        result = _make_result(
+            total_attempts,
+            0,
+            total_attempts,
+            0,
+            0.0,
+            0.0,
+            "C_STATE_QUIC",
+            "quic_native_required_unavailable",
+            0,
+            0
+        );
+        if (result != NULL) {
+            if (_set_long(result, "session_repeats", session_repeats) < 0 ||
+                _set_long(result, "retry_budget", retries) < 0 ||
+                _set_long(result, "quic_connect_fail_count", 0) < 0 ||
+                _set_long(result, "quic_connect_timeout_count", 0) < 0 ||
+                _set_long(result, "quic_tls_fail_count", 0) < 0 ||
+                _set_long(result, "quic_handshake_timeout_count", 0) < 0 ||
+                _set_long(result, "quic_stream_fail_count", total_attempts) < 0 ||
+                _set_double(result, "quic_stream_fail_ratio", 1.0) < 0 ||
+                _set_double(result, "quic_handshake_fail_ratio", 0.0) < 0 ||
+                _set_str(result, "scheme", scheme) < 0 ||
+                _set_str(result, "quic_stack_probe_reason", stack_probe_reason) < 0 ||
+                _set_str(result, "quic_stack_mode", stack_mode) < 0) {
+                Py_DECREF(result);
+                result = NULL;
+            }
+        }
+        return _attach_handle_stats(result, h);
     }
 
+#ifdef SAMURAI_WITH_QUIC_NATIVE
+    {
+        long sent_total = 0;
+        long errors_total = 0;
+        long connect_fail_count = 0;
+        long connect_timeout_count = 0;
+        long tls_fail_count = 0;
+        long handshake_timeout_count = 0;
+        long stream_fail_count = 0;
+        long retry_attempts = 0;
+        long retry_successes = 0;
+        long peak_active = concurrency;
+        long sample_count = 0;
+        long sample_cap = total_attempts;
+        const long sample_cap_hard = 200000;
+        long long *handshake_samples = NULL;
+        long long run_start_ns = monotonic_ns_now();
+        long long run_end_ns = run_start_ns;
+        double conn_rate = 0.0;
+        double handshake_p99_ms = 0.0;
+        const char *final_reason = "none";
+
+        if (peak_active > total_attempts) {
+            peak_active = total_attempts;
+        }
+        if (sample_cap > sample_cap_hard) {
+            sample_cap = sample_cap_hard;
+        }
+        if (sample_cap > 0) {
+            handshake_samples = (long long *)PyMem_Calloc((size_t)sample_cap, sizeof(long long));
+            if (handshake_samples == NULL) {
+                return PyErr_NoMemory();
+            }
+        }
+
+        for (long i = 0; i < total_attempts; i++) {
+            int success = 0;
+            QuicNativeResultCode last_code = QUIC_NATIVE_STREAM_FAIL;
+            for (long attempt_idx = 0; attempt_idx <= retries; attempt_idx++) {
+                long long hs_ns = 0;
+                if (attempt_idx > 0) {
+                    retry_attempts += 1;
+                }
+                Py_BEGIN_ALLOW_THREADS
+                last_code = _quic_native_single_request(
+                    target_ip,
+                    (int)target_port,
+                    server_name,
+                    method,
+                    path,
+                    verify_tls ? 1 : 0,
+                    timeout_s,
+                    &hs_ns
+                );
+                Py_END_ALLOW_THREADS
+
+                if (last_code == QUIC_NATIVE_OK) {
+                    sent_total += 1;
+                    success = 1;
+                    if (attempt_idx > 0) {
+                        retry_successes += 1;
+                    }
+                    if (hs_ns > 0 && handshake_samples != NULL && sample_count < sample_cap) {
+                        handshake_samples[sample_count] = hs_ns;
+                        sample_count += 1;
+                    }
+                    break;
+                }
+            }
+            if (!success) {
+                switch (last_code) {
+                    case QUIC_NATIVE_CONNECT_FAIL:
+                        connect_fail_count += 1;
+                        break;
+                    case QUIC_NATIVE_CONNECT_TIMEOUT:
+                        connect_timeout_count += 1;
+                        break;
+                    case QUIC_NATIVE_TLS_FAIL:
+                        tls_fail_count += 1;
+                        break;
+                    case QUIC_NATIVE_HANDSHAKE_TIMEOUT:
+                        handshake_timeout_count += 1;
+                        break;
+                    case QUIC_NATIVE_STREAM_FAIL:
+                    default:
+                        stream_fail_count += 1;
+                        break;
+                }
+            }
+        }
+
+        errors_total = total_attempts - sent_total;
+        if (errors_total < 0) {
+            errors_total = 0;
+        }
+        run_end_ns = monotonic_ns_now();
+        if (run_end_ns > run_start_ns && sent_total > 0) {
+            conn_rate = (double)sent_total / ((double)(run_end_ns - run_start_ns) / 1e9);
+        }
+
+        if (sample_count > 0 && handshake_samples != NULL) {
+            long p99_index;
+            qsort(handshake_samples, (size_t)sample_count, sizeof(long long), _cmp_longlong);
+            p99_index = (long)(0.99 * (double)(sample_count - 1));
+            if (p99_index < 0) {
+                p99_index = 0;
+            }
+            if (p99_index >= sample_count) {
+                p99_index = sample_count - 1;
+            }
+            handshake_p99_ms = (double)handshake_samples[p99_index] / 1e6;
+        }
+
+        if (errors_total > 0) {
+            if (connect_fail_count > 0) {
+                final_reason = "connect_fail";
+            } else if (connect_timeout_count > 0) {
+                final_reason = "connect_timeout";
+            } else if (tls_fail_count > 0) {
+                final_reason = "tls_fail";
+            } else if (handshake_timeout_count > 0) {
+                final_reason = "handshake_timeout";
+            } else {
+                final_reason = "stream_fail";
+            }
+        }
+
+        result = _make_result(
+            total_attempts,
+            sent_total,
+            errors_total,
+            peak_active,
+            conn_rate,
+            handshake_p99_ms,
+            "C_STATE_QUIC_NATIVE",
+            final_reason,
+            retry_attempts,
+            retry_successes
+        );
+        if (result != NULL) {
+            long handshake_fail_total = connect_timeout_count + tls_fail_count + handshake_timeout_count;
+            if (_set_long(result, "session_repeats", session_repeats) < 0 ||
+                _set_long(result, "retry_budget", retries) < 0 ||
+                _set_long(result, "quic_connect_fail_count", connect_fail_count) < 0 ||
+                _set_long(result, "quic_connect_timeout_count", connect_timeout_count) < 0 ||
+                _set_long(result, "quic_tls_fail_count", tls_fail_count) < 0 ||
+                _set_long(result, "quic_handshake_timeout_count", handshake_timeout_count) < 0 ||
+                _set_long(result, "quic_stream_fail_count", stream_fail_count) < 0 ||
+                _set_double(result, "quic_stream_fail_ratio", total_attempts > 0 ? ((double)stream_fail_count / (double)total_attempts) : 0.0) < 0 ||
+                _set_double(result, "quic_handshake_fail_ratio", total_attempts > 0 ? ((double)handshake_fail_total / (double)total_attempts) : 0.0) < 0 ||
+                _set_str(result, "scheme", scheme) < 0 ||
+                _set_str(result, "quic_stack_probe_reason", stack_probe_reason) < 0 ||
+                _set_str(result, "quic_stack_mode", stack_mode) < 0) {
+                Py_DECREF(result);
+                result = NULL;
+            }
+        }
+        PyMem_Free(handshake_samples);
+        return _attach_handle_stats(result, h);
+    }
+#else
     result = _make_result(
         total_attempts,
         0,
@@ -3697,6 +4871,7 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         }
     }
     return _attach_handle_stats(result, h);
+#endif
 }
 
 static PyMethodDef L7Methods[] = {
