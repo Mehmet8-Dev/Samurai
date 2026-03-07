@@ -34,6 +34,7 @@ typedef struct {
     int xdp_mode;
     int raw_sockfd;
     int allow_python_fallback;
+    char auto_resolve_reason[96];
     char backend[32];
     char fallback_policy[16];
     char interface[IFNAMSIZ];
@@ -43,17 +44,6 @@ typedef struct {
 } DpHandle;
 
 static long g_next_id = 1;
-
-static int _fallback_is_enabled(const char *policy) {
-    const char *p = policy;
-    if (p == NULL || p[0] == '\0') {
-        return 1;
-    }
-    if (strcmp(p, "deny") == 0 || strcmp(p, "fail") == 0) {
-        return 0;
-    }
-    return 1;
-}
 
 static void _copy_lower(char *dst, size_t dst_len, const char *src, const char *fallback) {
     size_t i = 0;
@@ -216,26 +206,6 @@ static const char *_py_dict_cstr(PyObject *dict, const char *key, const char *fa
     return s;
 }
 
-static void _append_reason(char *dst, size_t dst_len, const char *reason) {
-    size_t cur_len;
-
-    if (dst == NULL || dst_len == 0 || reason == NULL || reason[0] == '\0') {
-        return;
-    }
-    if (strcmp(reason, "none") == 0) {
-        return;
-    }
-
-    cur_len = strnlen(dst, dst_len);
-    if (cur_len == 0) {
-        (void)snprintf(dst, dst_len, "%s", reason);
-        return;
-    }
-    if (cur_len + 1 < dst_len) {
-        (void)snprintf(dst + cur_len, dst_len - cur_len, ";%s", reason);
-    }
-}
-
 static void _capture_exception_type(char *out, size_t out_len, const char *prefix) {
     PyObject *ptype = NULL;
     PyObject *pvalue = NULL;
@@ -298,6 +268,65 @@ static PyObject *_import_cached(PyObject **slot, const char *module_name) {
     *slot = mod;
     Py_INCREF(mod);
     return mod;
+}
+
+static void _resolve_auto_backend(DpHandle *h) {
+    PyObject *xdp_mod = NULL;
+    PyObject *fast_mod = NULL;
+    int has_xdp_send = 0;
+    int has_txring = 0;
+    int has_cext = 0;
+
+    if (h == NULL) {
+        return;
+    }
+    if (strcmp(h->backend, "auto") != 0) {
+        (void)snprintf(h->auto_resolve_reason, sizeof(h->auto_resolve_reason), "explicit_backend");
+        return;
+    }
+
+    if (h->xdp_enable || h->interface[0] != '\0') {
+        xdp_mod = _import_cached(&h->xdp_mod, "ddos_samurai.xdp_sender");
+        if (xdp_mod != NULL) {
+            has_xdp_send = PyObject_HasAttrString(xdp_mod, "xdp_send_buffer");
+            Py_DECREF(xdp_mod);
+            if (has_xdp_send) {
+                (void)snprintf(h->backend, sizeof(h->backend), "%s", "xdp");
+                (void)snprintf(h->auto_resolve_reason, sizeof(h->auto_resolve_reason), "auto->xdp");
+                return;
+            }
+        } else {
+            PyErr_Clear();
+        }
+    }
+
+    fast_mod = _import_cached(&h->fast_mod, "ddos_samurai.fast_sender");
+    if (fast_mod != NULL) {
+        has_txring = PyObject_HasAttrString(fast_mod, "send_ring_optimized_ex");
+        has_cext = PyObject_HasAttrString(fast_mod, "send_optimized");
+        Py_DECREF(fast_mod);
+        if (has_txring) {
+            (void)snprintf(h->backend, sizeof(h->backend), "%s", "txring");
+            (void)snprintf(h->auto_resolve_reason, sizeof(h->auto_resolve_reason), "auto->txring");
+            return;
+        }
+        if (has_cext) {
+            (void)snprintf(h->backend, sizeof(h->backend), "%s", "c_ext_l3");
+            (void)snprintf(h->auto_resolve_reason, sizeof(h->auto_resolve_reason), "auto->c_ext_l3");
+            return;
+        }
+    } else {
+        PyErr_Clear();
+    }
+
+    if (h->allow_python_fallback) {
+        (void)snprintf(h->backend, sizeof(h->backend), "%s", "python");
+        (void)snprintf(h->auto_resolve_reason, sizeof(h->auto_resolve_reason), "auto->python");
+        return;
+    }
+
+    (void)snprintf(h->backend, sizeof(h->backend), "%s", "unavailable");
+    (void)snprintf(h->auto_resolve_reason, sizeof(h->auto_resolve_reason), "auto_no_backend");
 }
 
 static PyObject *_build_result(
@@ -1142,6 +1171,7 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
     h->xdp_initialized = 0;
     h->raw_sockfd = -1;
     h->allow_python_fallback = 0;
+    h->auto_resolve_reason[0] = '\0';
 
     _copy_lower(h->backend, sizeof(h->backend), "auto", "auto");
     _copy_lower(h->fallback_policy, sizeof(h->fallback_policy), "allow", "allow");
@@ -1169,6 +1199,7 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
         h->allow_python_fallback = 0;
     }
     (void)snprintf(h->interface, sizeof(h->interface), "%s", iface != NULL ? iface : "");
+    _resolve_auto_backend(h);
 
     return PyCapsule_New((void *)h, "samurai.dataplane.handle", _capsule_destructor);
 }
@@ -1182,17 +1213,11 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
     int target_port = 0;
     DpHandle *h = NULL;
     PyObject *out = NULL;
-    PyObject *first = NULL;
-    PyObject *second = NULL;
-    char staged_reason[192];
-    long staged_fallback_count = 0;
-    int allow_fallback = 1;
     const char *backend = NULL;
     long attempted;
     long sent;
     long errors;
     long fallback_count;
-    int txring_tried = 0;
 
     (void)self;
 
@@ -1217,9 +1242,11 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
         packet_size = 0;
     }
 
-    staged_reason[0] = '\0';
-    allow_fallback = _fallback_is_enabled(h->fallback_policy);
     backend = h->backend[0] != '\0' ? h->backend : "auto";
+    if (strcmp(backend, "auto") == 0) {
+        _resolve_auto_backend(h);
+        backend = h->backend[0] != '\0' ? h->backend : "unavailable";
+    }
 
     if (count == 0) {
         out = _build_result(0, 0, 0, packet_size, target_ip, target_port, "DP_NONE", "none", 0);
@@ -1231,93 +1258,19 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
         out = _run_c_ext_l3_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
     } else if (strcmp(backend, "python") == 0) {
         out = _run_python_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
-    } else if (strcmp(backend, "auto") == 0) {
-        if (h->xdp_enable || h->interface[0] != '\0') {
-            first = _run_xdp_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
-            if (first == NULL) {
-                return NULL;
-            }
-
-            sent = _py_dict_long(first, "sent", 0);
-            fallback_count = _py_dict_long(first, "fallback_count", sent > 0 ? 0 : 1);
-            if (sent > 0 || !allow_fallback) {
-                out = first;
-                first = NULL;
-            } else {
-                staged_fallback_count += fallback_count;
-                _append_reason(staged_reason, sizeof(staged_reason), _py_dict_cstr(first, "sender_fallback_reason", "none"));
-                Py_DECREF(first);
-                first = NULL;
-
-                txring_tried = 1;
-                second = _run_txring_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
-                if (second == NULL) {
-                    return NULL;
-                }
-                sent = _py_dict_long(second, "sent", 0);
-                fallback_count = _py_dict_long(second, "fallback_count", sent > 0 ? 0 : 1);
-                if (sent > 0 || !allow_fallback) {
-                    out = second;
-                    second = NULL;
-                } else {
-                    staged_fallback_count += fallback_count;
-                    _append_reason(staged_reason, sizeof(staged_reason), _py_dict_cstr(second, "sender_fallback_reason", "none"));
-                    Py_DECREF(second);
-                    second = NULL;
-                }
-            }
-        }
-
-        if (out == NULL && !txring_tried) {
-            out = _run_txring_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
-            if (out == NULL) {
-                return NULL;
-            }
-            sent = _py_dict_long(out, "sent", 0);
-            fallback_count = _py_dict_long(out, "fallback_count", sent > 0 ? 0 : 1);
-            if (sent <= 0 && allow_fallback) {
-                staged_fallback_count += fallback_count;
-                _append_reason(staged_reason, sizeof(staged_reason), _py_dict_cstr(out, "sender_fallback_reason", "none"));
-                Py_DECREF(out);
-                out = NULL;
-            }
-        }
-
-        if (out == NULL) {
-            second = _run_c_ext_l3_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
-            if (second == NULL) {
-                return NULL;
-            }
-            sent = _py_dict_long(second, "sent", 0);
-            fallback_count = _py_dict_long(second, "fallback_count", sent > 0 ? 0 : 1);
-            if (sent > 0 || !allow_fallback) {
-                out = second;
-                second = NULL;
-            } else {
-                staged_fallback_count += fallback_count;
-                _append_reason(staged_reason, sizeof(staged_reason), _py_dict_cstr(second, "sender_fallback_reason", "none"));
-                Py_DECREF(second);
-                second = NULL;
-            }
-        }
-
-        if (out == NULL) {
-            if (allow_fallback && h->allow_python_fallback) {
-                out = _run_python_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
-            } else {
-                out = _build_result(
-                    count,
-                    0,
-                    count,
-                    packet_size,
-                    target_ip,
-                    target_port,
-                    "DP_AUTO_CHAIN_EXHAUSTED",
-                    "auto_chain_exhausted",
-                    staged_fallback_count > 0 ? staged_fallback_count : 1
-                );
-            }
-        }
+    } else if (strcmp(backend, "unavailable") == 0) {
+        const char *reason = h->auto_resolve_reason[0] != '\0' ? h->auto_resolve_reason : "auto_no_backend";
+        out = _build_result(
+            count,
+            0,
+            count,
+            packet_size,
+            target_ip,
+            target_port,
+            "DP_BACKEND_UNAVAILABLE",
+            reason,
+            1
+        );
     } else {
         out = _build_result(
             count,
@@ -1334,24 +1287,6 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
 
     if (out == NULL) {
         return NULL;
-    }
-
-    if (staged_reason[0] != '\0') {
-        char combined[256];
-        long existing_fb = _py_dict_long(out, "fallback_count", 0);
-
-        combined[0] = '\0';
-        _append_reason(combined, sizeof(combined), staged_reason);
-        _append_reason(combined, sizeof(combined), _py_dict_cstr(out, "sender_fallback_reason", "none"));
-
-        if (combined[0] != '\0' && _set_str(out, "sender_fallback_reason", combined) < 0) {
-            Py_DECREF(out);
-            return NULL;
-        }
-        if (_set_long(out, "fallback_count", existing_fb + staged_fallback_count) < 0) {
-            Py_DECREF(out);
-            return NULL;
-        }
     }
 
     if (_set_long(out, "dp_queue_id", h->queue_id) < 0 ||

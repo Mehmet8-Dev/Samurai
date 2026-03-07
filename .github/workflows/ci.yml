@@ -17,6 +17,7 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       SAMURAI_TEST_PROFILE: "ci_safe"
+      SAMURAI_QUIC_BUILD_MODE: "native_required"
       SAMURAI_RFC_REPORT_OUT: "${{ github.workspace }}/artifacts"
       SAMURAI_BENCH_BASELINE: "${{ github.workspace }}/benchmarks/benchmark_baseline_ci.json"
       SAMURAI_BENCH_UPDATE_BASELINE: "0"
@@ -39,7 +40,9 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libpcap-dev libssl-dev openssl
+          sudo apt-get install -y --no-install-recommends \
+            libpcap-dev libssl-dev openssl \
+            libgnutls28-dev libngtcp2-dev libnghttp3-dev libngtcp2-crypto-gnutls-dev pkg-config
 
       - name: Install Python dependencies
         run: |

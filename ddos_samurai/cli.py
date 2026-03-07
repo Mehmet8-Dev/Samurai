@@ -620,6 +620,10 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
         if bool(getattr(args, "l7_quic_bridge_autopromote", False)):
             args.l7_quic_bridge_autopromote = False
             utils.log_info("native QUIC zorunlu olduğu için --l7-quic-bridge-autopromote kapatıldı.")
+        quic_build_mode = str(os.environ.get("SAMURAI_QUIC_BUILD_MODE", "auto") or "auto").strip().lower()
+        if quic_build_mode != "native_required":
+            os.environ["SAMURAI_QUIC_BUILD_MODE"] = "native_required"
+            utils.log_info("native QUIC zorunluluğu için SAMURAI_QUIC_BUILD_MODE=native_required ayarlandı.")
 
     workers = int(getattr(args, "workers", multiprocessing.cpu_count()) or 0)
     dp_queues = int(getattr(args, "dp_queues", 1) or 1)

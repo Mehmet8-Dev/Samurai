@@ -475,6 +475,27 @@ static int _str_starts_with(const char *value, const char *prefix) {
     return strncmp(value, prefix, n) == 0;
 }
 
+static int _env_flag_enabled(const char *name) {
+    const char *raw = NULL;
+    char lowered[24];
+    size_t i = 0;
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+    raw = getenv(name);
+    if (raw == NULL || raw[0] == '\0') {
+        return 0;
+    }
+    for (i = 0; i + 1 < sizeof(lowered) && raw[i] != '\0'; i++) {
+        lowered[i] = (char)tolower((unsigned char)raw[i]);
+    }
+    lowered[i] = '\0';
+    return strcmp(lowered, "1") == 0 ||
+           strcmp(lowered, "true") == 0 ||
+           strcmp(lowered, "yes") == 0 ||
+           strcmp(lowered, "on") == 0;
+}
+
 static int _quic_bridge_supported(const char **mode_out, const char **reason_out) {
     PyObject *mod = NULL;
     PyObject *fn = NULL;
@@ -3957,15 +3978,20 @@ static PyObject *l7_h2_supported(PyObject *self, PyObject *args) {
 }
 
 static PyObject *l7_quic_supported(PyObject *self, PyObject *args) {
+    const int require_native = _env_flag_enabled("SAMURAI_L7_QUIC_REQUIRE_NATIVE");
+    const char *mode = "unavailable";
     const char *bridge_mode = "unavailable";
     const char *bridge_reason = "unknown";
     (void)self;
     (void)args;
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
-    if (_quic_stack_probe(NULL, NULL)) {
+    if (_quic_stack_probe(NULL, &mode) && strcmp(mode, "h3_stateful") == 0) {
         Py_RETURN_TRUE;
     }
 #endif
+    if (require_native) {
+        Py_RETURN_FALSE;
+    }
     if (_quic_bridge_supported(&bridge_mode, &bridge_reason)) {
         Py_RETURN_TRUE;
     }
@@ -3973,6 +3999,7 @@ static PyObject *l7_quic_supported(PyObject *self, PyObject *args) {
 }
 
 static PyObject *l7_quic_stack_mode(PyObject *self, PyObject *args) {
+    const int require_native = _env_flag_enabled("SAMURAI_L7_QUIC_REQUIRE_NATIVE");
     const char *mode = "unavailable";
     const char *reason = "unknown";
     (void)self;
@@ -3980,6 +4007,9 @@ static PyObject *l7_quic_stack_mode(PyObject *self, PyObject *args) {
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
     (void)_quic_stack_probe(NULL, &mode);
 #endif
+    if (require_native && strcmp(mode, "h3_stateful") != 0) {
+        return PyUnicode_FromString("unavailable");
+    }
     if (!_str_starts_with(mode, "h3_stateful")) {
         if (_quic_bridge_supported(&mode, &reason)) {
             (void)reason;
@@ -3989,6 +4019,7 @@ static PyObject *l7_quic_stack_mode(PyObject *self, PyObject *args) {
 }
 
 static PyObject *l7_quic_stack_probe_reason(PyObject *self, PyObject *args) {
+    const int require_native = _env_flag_enabled("SAMURAI_L7_QUIC_REQUIRE_NATIVE");
     const char *reason = "unknown";
     const char *mode = "unavailable";
     (void)self;
@@ -3996,6 +4027,12 @@ static PyObject *l7_quic_stack_probe_reason(PyObject *self, PyObject *args) {
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
     (void)_quic_stack_probe(&reason, &mode);
 #endif
+    if (require_native && strcmp(mode, "h3_stateful") != 0) {
+        if (reason == NULL || reason[0] == '\0' || strcmp(reason, "unknown") == 0) {
+            reason = "native_required_unavailable";
+        }
+        return PyUnicode_FromString(reason != NULL ? reason : "native_required_unavailable");
+    }
     if (!_str_starts_with(mode, "h3_stateful")) {
         if (_quic_bridge_supported(&mode, &reason)) {
             /* bridge reason becomes probe reason when native stack is unavailable */
@@ -5067,6 +5104,9 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
     verify_tls = _dict_bool(cfg, "verify", 1);
     enable_quic_py_bridge = _dict_bool(cfg, "enable_quic_py_bridge", 0);
     require_native_quic = _dict_bool(cfg, "require_native_quic", 0);
+    if (_env_flag_enabled("SAMURAI_L7_QUIC_REQUIRE_NATIVE")) {
+        require_native_quic = 1;
+    }
 
     target_ip = _dict_cstr(cfg, "target_ip", "");
     target_port = _dict_long(cfg, "target_port", 443);
