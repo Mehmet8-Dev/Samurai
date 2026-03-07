@@ -283,6 +283,10 @@ def _report_inputs_from_args(args) -> dict:
         "gpu_template_pool_size_l4": int(getattr(args, "gpu_template_pool_size_l4", 10) or 10),
         "gpu_template_pool_size_l7": int(getattr(args, "gpu_template_pool_size_l7", 50) or 50),
         "gpu_ring_capacity": int(getattr(args, "gpu_ring_capacity", 3) or 3),
+        "gpu_batch_size": int(getattr(args, "gpu_batch_size", 100000) or 100000),
+        "gpu_stream_count": int(getattr(args, "gpu_stream_count", 3) or 3),
+        "gpu_pipeline_depth": int(getattr(args, "gpu_pipeline_depth", 2) or 2),
+        "gpu_full_variation": bool(getattr(args, "gpu_full_variation", True)),
         "gpu_pinned_max_mb": int(getattr(args, "gpu_pinned_max_mb", 512) or 512),
         "gpu_rng_seed": int(getattr(args, "gpu_rng_seed", 1234) or 0) if getattr(args, "gpu_rng_seed", None) is not None else None,
         "state_table_size": int(getattr(args, "state_table_size", 65536) or 65536),
@@ -391,6 +395,9 @@ def _validate_hybrid_cuda_args(parser: argparse.ArgumentParser, args: argparse.N
         "gpu_template_pool_size_l4",
         "gpu_template_pool_size_l7",
         "gpu_ring_capacity",
+        "gpu_batch_size",
+        "gpu_stream_count",
+        "gpu_pipeline_depth",
         "gpu_pinned_max_mb",
         "state_table_size",
         "state_lock_count",
@@ -904,6 +911,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="CUDA producer-consumer ring kapasitesi (env: SAMURAI_GPU_RING_CAPACITY).",
     )
     parser.add_argument(
+        "--gpu-batch-size",
+        type=int,
+        default=_env_int("SAMURAI_GPU_BATCH", 100000),
+        help="CUDA üretim batch boyutu (env: SAMURAI_GPU_BATCH).",
+    )
+    parser.add_argument(
+        "--gpu-stream-count",
+        type=int,
+        default=_env_int("SAMURAI_GPU_STREAMS", 3),
+        help="CUDA stream sayısı (gen/copy/send overlap için).",
+    )
+    parser.add_argument(
+        "--gpu-pipeline-depth",
+        type=int,
+        default=_env_int("SAMURAI_GPU_PIPELINE_DEPTH", 2),
+        help="GPU pipeline overlap derinliği (ready batch kuyruk eşiği).",
+    )
+    parser.add_argument(
+        "--gpu-full-variation",
+        action=argparse.BooleanOptionalAction,
+        default=str(os.environ.get("SAMURAI_GPU_FULL_VARIATION", "1") or "1").strip().lower() in {"1", "true", "yes", "on"},
+        help="Basic L4 akışında varyasyonları tamamen GPU hot-path üzerinden üret.",
+    )
+    parser.add_argument(
         "--gpu-pinned-max-mb",
         type=int,
         default=_env_int("SAMURAI_GPU_PINNED_MAX_MB", 512),
@@ -1379,6 +1410,10 @@ def main(argv=None):
     os.environ["SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4"] = str(int(getattr(args, "gpu_template_pool_size_l4", 10) or 10))
     os.environ["SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7"] = str(int(getattr(args, "gpu_template_pool_size_l7", 50) or 50))
     os.environ["SAMURAI_GPU_RING_CAPACITY"] = str(int(getattr(args, "gpu_ring_capacity", 3) or 3))
+    os.environ["SAMURAI_GPU_BATCH"] = str(int(getattr(args, "gpu_batch_size", 100000) or 100000))
+    os.environ["SAMURAI_GPU_STREAMS"] = str(int(getattr(args, "gpu_stream_count", 3) or 3))
+    os.environ["SAMURAI_GPU_PIPELINE_DEPTH"] = str(int(getattr(args, "gpu_pipeline_depth", 2) or 2))
+    os.environ["SAMURAI_GPU_FULL_VARIATION"] = "1" if bool(getattr(args, "gpu_full_variation", True)) else "0"
     os.environ["SAMURAI_GPU_PINNED_MAX_MB"] = str(int(getattr(args, "gpu_pinned_max_mb", 512) or 512))
     os.environ["SAMURAI_GPU_RNG_SEED"] = str(int(getattr(args, "gpu_rng_seed", 1234) or 0))
     os.environ["SAMURAI_STATE_TABLE_SIZE"] = str(int(getattr(args, "state_table_size", 65536) or 65536))

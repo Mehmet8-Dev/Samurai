@@ -89,6 +89,11 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--gpu-template-pool-size-l4", opts)
         self.assertIn("--gpu-template-pool-size-l7", opts)
         self.assertIn("--gpu-ring-capacity", opts)
+        self.assertIn("--gpu-batch-size", opts)
+        self.assertIn("--gpu-stream-count", opts)
+        self.assertIn("--gpu-pipeline-depth", opts)
+        self.assertIn("--gpu-full-variation", opts)
+        self.assertIn("--no-gpu-full-variation", opts)
         self.assertIn("--gpu-pinned-max-mb", opts)
         self.assertIn("--gpu-rng-seed", opts)
         self.assertIn("--state-table-size", opts)
@@ -147,6 +152,10 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.l7_fallback_policy, "allow")
         self.assertFalse(args.l7_capability_strict)
         self.assertFalse(args.legacy_path_enable)
+        self.assertEqual(args.gpu_batch_size, 100000)
+        self.assertEqual(args.gpu_stream_count, 3)
+        self.assertEqual(args.gpu_pipeline_depth, 2)
+        self.assertTrue(args.gpu_full_variation)
         self.assertEqual(args.http2_connections, 1)
         self.assertEqual(args.http2_streams_per_conn, 100)
         self.assertEqual(args.l7_session_repeats, 1)
@@ -182,6 +191,10 @@ class TestCliParser(unittest.TestCase):
                 "SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4": "11",
                 "SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7": "55",
                 "SAMURAI_GPU_RING_CAPACITY": "4",
+                "SAMURAI_GPU_BATCH": "131072",
+                "SAMURAI_GPU_STREAMS": "5",
+                "SAMURAI_GPU_PIPELINE_DEPTH": "3",
+                "SAMURAI_GPU_FULL_VARIATION": "0",
                 "SAMURAI_GPU_PINNED_MAX_MB": "256",
                 "SAMURAI_GPU_RNG_SEED": "987654",
                 "SAMURAI_STATE_TABLE_SIZE": "32768",
@@ -196,6 +209,10 @@ class TestCliParser(unittest.TestCase):
             self.assertEqual(args.gpu_template_pool_size_l4, 11)
             self.assertEqual(args.gpu_template_pool_size_l7, 55)
             self.assertEqual(args.gpu_ring_capacity, 4)
+            self.assertEqual(args.gpu_batch_size, 131072)
+            self.assertEqual(args.gpu_stream_count, 5)
+            self.assertEqual(args.gpu_pipeline_depth, 3)
+            self.assertFalse(args.gpu_full_variation)
             self.assertEqual(args.gpu_pinned_max_mb, 256)
             self.assertEqual(args.gpu_rng_seed, 987654)
             self.assertEqual(args.state_table_size, 32768)

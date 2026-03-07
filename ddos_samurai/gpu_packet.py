@@ -1634,8 +1634,8 @@ def generate_packets(count, target_ip, target_port, protocol="tcp", spoof_ip=Tru
     # Allocate memory on GPU (CuPy uses its memory pool)
     packets_gpu = cp.zeros((count * packet_size), dtype=cp.uint8)
     
-    # P2 FIX #16: Initialize RNG states
-    rng_states = create_xoroshiro128p_states(count, seed=random.randint(0, 0xFFFFFFFF))
+    # Reuse RNG state buffers across batches to keep hot-path allocations low.
+    rng_states = _acquire_rng_states(count, stream=stream)
     
     # Configure kernel
     threads_per_block = 256
@@ -1878,9 +1878,8 @@ def generate_fragmented_packets(payload_bytes, count, target_ip, target_port, pr
     total_buf_size = count * (frag1_size + frag2_size)
     packets_gpu = cp.zeros(total_buf_size, dtype=cp.uint8)
     
-    # P2 FIX #16: Initialize RNG states
-    from numba.cuda.random import create_xoroshiro128p_states
-    rng_states = create_xoroshiro128p_states(count, seed=random.randint(0, 0xFFFFFFFF))
+    # Reuse RNG state buffers across batches to keep hot-path allocations low.
+    rng_states = _acquire_rng_states(count, stream=stream)
     
     threads_per_block = 256
     blocks_per_grid = (count + (threads_per_block - 1)) // threads_per_block
@@ -1929,9 +1928,8 @@ def generate_amplification_packets(template_bytes, reflectors_ips, victim_ip, co
     
     packets_gpu = cp.zeros((count * packet_size), dtype=cp.uint8)
     
-    # P2 FIX #16: Initialize RNG states
-    from numba.cuda.random import create_xoroshiro128p_states
-    rng_states = create_xoroshiro128p_states(count, seed=random.randint(0, 0xFFFFFFFF))
+    # Reuse RNG state buffers across batches to keep hot-path allocations low.
+    rng_states = _acquire_rng_states(count, stream=stream)
     
     threads_per_block = 256
     blocks_per_grid = (count + (threads_per_block - 1)) // threads_per_block

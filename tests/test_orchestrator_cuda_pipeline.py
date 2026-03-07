@@ -164,6 +164,27 @@ def _build_fake_gpu_packet_module():
         state["h2d_bytes"] += len(buf)
         return buf, packet_size
 
+    def generate_packets(
+        count,
+        target_ip,
+        target_port,
+        protocol="tcp",
+        spoof_ip=True,
+        real_src_ip="192.168.1.100",
+        tcp_flags=0x02,
+        has_ethernet=True,
+        window=-1,
+        stream=None,
+        gateway_mac=0xFFFFFFFFFFFF,
+        spoof_subnet="1.0.0.0/8",
+    ):
+        del target_ip, target_port, protocol, spoof_ip, real_src_ip, tcp_flags, has_ethernet, window, stream, gateway_mac, spoof_subnet
+        packet_size = 54
+        buf = bytearray(packet_size * int(count))
+        state["h2d_count"] += 1
+        state["h2d_bytes"] += len(buf)
+        return buf, packet_size
+
     def copy_gpu_to_host_pinned(gpu_arr, key="default", stream=None, blocking=True):
         del key, stream, blocking
         return bytes(gpu_arr)
@@ -198,6 +219,7 @@ def _build_fake_gpu_packet_module():
         }
 
     mod.configure_pinned_host_pool = configure_pinned_host_pool
+    mod.generate_packets = generate_packets
     mod.generate_packets_from_template_pool = generate_packets_from_template_pool
     mod.copy_gpu_to_host_pinned = copy_gpu_to_host_pinned
     mod.get_memory_pool = get_memory_pool
