@@ -3770,6 +3770,9 @@ async def quic_sender(
     quic_require_response_headers=True,
     quic_require_response_body=False,
     quic_min_response_body_bytes=0,
+    quic_expect_header_name="",
+    quic_expect_header_value_contains="",
+    quic_expect_body_substring="",
     request_plan: "H2RequestPlan | None" = None,
     live_sent=None,
     live_errors=None,
@@ -3840,6 +3843,9 @@ async def quic_sender(
             "quic_require_response_headers": 1 if bool(quic_require_response_headers) else 0,
             "quic_require_response_body": 1 if bool(quic_require_response_body) else 0,
             "quic_min_response_body_bytes": int(quic_min_response_body_bytes or 0),
+            "quic_expect_header_name": str(quic_expect_header_name or ""),
+            "quic_expect_header_value_contains": str(quic_expect_header_value_contains or ""),
+            "quic_expect_body_substring": str(quic_expect_body_substring or ""),
             "l7_request_plan_count": int(len(planned_items)),
         }
         if require_native_effective:

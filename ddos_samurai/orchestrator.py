@@ -158,6 +158,8 @@ def _empty_stats() -> dict:
         "quic_handshake_fail_ratio": 0.0,
         "quic_response_headers_ok_count": 0,
         "quic_response_body_ok_count": 0,
+        "quic_response_expected_header_ok_count": 0,
+        "quic_response_expected_body_match_ok_count": 0,
         "quic_response_validation_fail_count": 0,
         "quic_response_validation_fail_ratio": 0.0,
         "quic_connection_attempts": 0,
@@ -535,6 +537,12 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["quic_stream_fail_count"] = int(acc.get("quic_stream_fail_count", 0)) + int(item.get("quic_stream_fail_count", 0) or 0)
     acc["quic_response_headers_ok_count"] = int(acc.get("quic_response_headers_ok_count", 0)) + int(item.get("quic_response_headers_ok_count", 0) or 0)
     acc["quic_response_body_ok_count"] = int(acc.get("quic_response_body_ok_count", 0)) + int(item.get("quic_response_body_ok_count", 0) or 0)
+    acc["quic_response_expected_header_ok_count"] = int(acc.get("quic_response_expected_header_ok_count", 0)) + int(
+        item.get("quic_response_expected_header_ok_count", 0) or 0
+    )
+    acc["quic_response_expected_body_match_ok_count"] = int(acc.get("quic_response_expected_body_match_ok_count", 0)) + int(
+        item.get("quic_response_expected_body_match_ok_count", 0) or 0
+    )
     acc["quic_response_validation_fail_count"] = int(acc.get("quic_response_validation_fail_count", 0)) + int(item.get("quic_response_validation_fail_count", 0) or 0)
     acc["quic_connection_attempts"] = int(acc.get("quic_connection_attempts", 0)) + int(item.get("quic_connection_attempts", 0) or 0)
     acc["quic_conn_pool_size"] = max(
@@ -1546,6 +1554,9 @@ async def worker_process(
                         quic_require_response_headers=bool(args.get("quic_require_response_headers", True)),
                         quic_require_response_body=bool(args.get("quic_require_response_body", False)),
                         quic_min_response_body_bytes=int(args.get("quic_min_response_body_bytes", 0) or 0),
+                        quic_expect_header_name=str(args.get("quic_expect_header_name", "") or ""),
+                        quic_expect_header_value_contains=str(args.get("quic_expect_header_value_contains", "") or ""),
+                        quic_expect_body_substring=str(args.get("quic_expect_body_substring", "") or ""),
                         request_plan=request_plan,
                         live_sent=sent_total,
                         live_errors=errors_total,
@@ -2338,6 +2349,9 @@ async def worker_process(
                 quic_require_response_headers=bool(args.get("quic_require_response_headers", True)),
                 quic_require_response_body=bool(args.get("quic_require_response_body", False)),
                 quic_min_response_body_bytes=int(args.get("quic_min_response_body_bytes", 0) or 0),
+                quic_expect_header_name=str(args.get("quic_expect_header_name", "") or ""),
+                quic_expect_header_value_contains=str(args.get("quic_expect_header_value_contains", "") or ""),
+                quic_expect_body_substring=str(args.get("quic_expect_body_substring", "") or ""),
                 live_sent=sent_total,
                 live_errors=errors_total,
                 live_progress=progress
@@ -2861,6 +2875,12 @@ async def worker_process(
                 _quic_handshake_fail_ratio = float(worker_stats.get("quic_handshake_fail_ratio", 0.0) or 0.0)
                 _quic_response_headers_ok_count = int(worker_stats.get("quic_response_headers_ok_count", 0) or 0)
                 _quic_response_body_ok_count = int(worker_stats.get("quic_response_body_ok_count", 0) or 0)
+                _quic_response_expected_header_ok_count = int(
+                    worker_stats.get("quic_response_expected_header_ok_count", 0) or 0
+                )
+                _quic_response_expected_body_match_ok_count = int(
+                    worker_stats.get("quic_response_expected_body_match_ok_count", 0) or 0
+                )
                 _quic_response_validation_fail_count = int(worker_stats.get("quic_response_validation_fail_count", 0) or 0)
                 _quic_response_validation_fail_ratio = float(
                     worker_stats.get("quic_response_validation_fail_ratio", 0.0) or 0.0
@@ -3000,6 +3020,8 @@ async def worker_process(
                         "quic_handshake_fail_ratio": _quic_handshake_fail_ratio,
                         "quic_response_headers_ok_count": _quic_response_headers_ok_count,
                         "quic_response_body_ok_count": _quic_response_body_ok_count,
+                        "quic_response_expected_header_ok_count": _quic_response_expected_header_ok_count,
+                        "quic_response_expected_body_match_ok_count": _quic_response_expected_body_match_ok_count,
                         "quic_response_validation_fail_count": _quic_response_validation_fail_count,
                         "quic_response_validation_fail_ratio": _quic_response_validation_fail_ratio,
                         "quic_connection_attempts": _quic_connection_attempts,

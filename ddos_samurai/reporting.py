@@ -640,6 +640,8 @@ def build_live_attack_report(
     quic_handshake_fail_ratio_weight = 0
     quic_response_headers_ok_count_total = 0
     quic_response_body_ok_count_total = 0
+    quic_response_expected_header_ok_count_total = 0
+    quic_response_expected_body_match_ok_count_total = 0
     quic_response_validation_fail_count_total = 0
     quic_response_validation_fail_ratio_weighted_sum = 0.0
     quic_response_validation_fail_ratio_weight = 0
@@ -1092,6 +1094,16 @@ def build_live_attack_report(
         quic_response_body_ok_count_total += int(
             ev.get("quic_response_body_ok_count", st.get("quic_response_body_ok_count", 0)) or 0
         )
+        quic_response_expected_header_ok_count_total += int(
+            ev.get("quic_response_expected_header_ok_count", st.get("quic_response_expected_header_ok_count", 0)) or 0
+        )
+        quic_response_expected_body_match_ok_count_total += int(
+            ev.get(
+                "quic_response_expected_body_match_ok_count",
+                st.get("quic_response_expected_body_match_ok_count", 0),
+            )
+            or 0
+        )
         quic_response_validation_fail_count_total += int(
             ev.get("quic_response_validation_fail_count", st.get("quic_response_validation_fail_count", 0)) or 0
         )
@@ -1466,6 +1478,8 @@ def build_live_attack_report(
             "quic_handshake_fail_ratio": round(float(quic_handshake_fail_ratio), 6),
             "quic_response_headers_ok_count": int(quic_response_headers_ok_count_total),
             "quic_response_body_ok_count": int(quic_response_body_ok_count_total),
+            "quic_response_expected_header_ok_count": int(quic_response_expected_header_ok_count_total),
+            "quic_response_expected_body_match_ok_count": int(quic_response_expected_body_match_ok_count_total),
             "quic_response_validation_fail_count": int(quic_response_validation_fail_count_total),
             "quic_response_validation_fail_ratio": round(float(quic_response_validation_fail_ratio), 6),
             "quic_connection_attempts": int(quic_connection_attempts_total),
