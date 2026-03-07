@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/select.h>
@@ -112,6 +113,9 @@ typedef struct {
 #define H2_PLAN_METHOD_MAX_LEN 24
 #define H2_PLAN_PATH_MAX_LEN 512
 #define H2_PLAN_UA_MAX_LEN 256
+#define QUIC_EXPECT_HEADER_NAME_MAX 64
+#define QUIC_EXPECT_HEADER_VALUE_MAX 160
+#define QUIC_EXPECT_BODY_SUBSTR_MAX 160
 
 typedef struct {
     int enabled;
@@ -378,6 +382,72 @@ static void _copy_upper_ascii(char *dst, size_t dst_len, const char *src, const 
     dst[i] = '\0';
 }
 
+static void _copy_lower_ascii(char *dst, size_t dst_len, const char *src, const char *fallback) {
+    size_t i;
+    const char *s = src;
+    if (dst == NULL || dst_len == 0) {
+        return;
+    }
+    if (s == NULL || s[0] == '\0') {
+        s = fallback != NULL ? fallback : "";
+    }
+    for (i = 0; i + 1 < dst_len && s[i] != '\0'; i++) {
+        dst[i] = (char)tolower((unsigned char)s[i]);
+    }
+    dst[i] = '\0';
+}
+
+static int _ascii_eq_casefold_bytes(const uint8_t *a, size_t a_len, const char *b, size_t b_len) {
+    size_t i;
+    if (a == NULL || b == NULL || a_len != b_len || b_len == 0) {
+        return 0;
+    }
+    for (i = 0; i < a_len; i++) {
+        unsigned char ca = (unsigned char)tolower((unsigned char)a[i]);
+        unsigned char cb = (unsigned char)tolower((unsigned char)b[i]);
+        if (ca != cb) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int _ascii_contains_casefold_bytes(const uint8_t *hay, size_t hay_len, const char *needle, size_t needle_len) {
+    size_t i;
+    size_t j;
+    if (hay == NULL || needle == NULL || needle_len == 0 || hay_len < needle_len) {
+        return 0;
+    }
+    for (i = 0; i + needle_len <= hay_len; i++) {
+        int ok = 1;
+        for (j = 0; j < needle_len; j++) {
+            unsigned char ch = (unsigned char)tolower((unsigned char)hay[i + j]);
+            unsigned char cn = (unsigned char)tolower((unsigned char)needle[j]);
+            if (ch != cn) {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int _bytes_contains_bytes(const uint8_t *hay, size_t hay_len, const uint8_t *needle, size_t needle_len) {
+    size_t i;
+    if (hay == NULL || needle == NULL || needle_len == 0 || hay_len < needle_len) {
+        return 0;
+    }
+    for (i = 0; i + needle_len <= hay_len; i++) {
+        if (memcmp(hay + i, needle, needle_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int _scheme_is_tls(const char *scheme) {
     if (scheme == NULL || scheme[0] == '\0') {
         return 0;
@@ -629,6 +699,8 @@ typedef struct {
     long response_headers_ok;
     long response_body_ok;
     long response_validation_fail;
+    long response_expected_header_ok;
+    long response_expected_body_match_ok;
     long long handshake_ns;
 } QuicNativeBatchResult;
 
@@ -638,7 +710,12 @@ typedef struct {
     int status_code;
     int status_seen;
     int headers_seen;
+    int expected_header_seen;
+    int expected_header_value_match;
+    int expected_body_match;
     size_t body_bytes;
+    unsigned char body_tail[QUIC_EXPECT_BODY_SUBSTR_MAX];
+    size_t body_tail_len;
     int failed;
 } QuicNativeStreamState;
 
@@ -662,6 +739,15 @@ typedef struct {
     int require_response_headers;
     int require_response_body;
     size_t min_response_body_bytes;
+    int require_header_name_match;
+    int require_header_value_match;
+    int require_body_substring_match;
+    char expect_header_name[QUIC_EXPECT_HEADER_NAME_MAX];
+    size_t expect_header_name_len;
+    char expect_header_value_substr[QUIC_EXPECT_HEADER_VALUE_MAX];
+    size_t expect_header_value_len;
+    char expect_body_substr[QUIC_EXPECT_BODY_SUBSTR_MAX];
+    size_t expect_body_substr_len;
     QuicNativeStreamState *stream_states;
     size_t stream_cap;
     long requests_target;
@@ -672,6 +758,8 @@ typedef struct {
     long response_headers_ok;
     long response_body_ok;
     long response_validation_fail;
+    long response_expected_header_ok;
+    long response_expected_body_match_ok;
     int64_t control_stream_id;
     int64_t qpack_enc_stream_id;
     int64_t qpack_dec_stream_id;
@@ -736,7 +824,11 @@ static int _quic_native_stream_state_begin(QuicNativeSession *s, int64_t stream_
             s->stream_states[i].status_code = 0;
             s->stream_states[i].status_seen = 0;
             s->stream_states[i].headers_seen = 0;
+            s->stream_states[i].expected_header_seen = 0;
+            s->stream_states[i].expected_header_value_match = 0;
+            s->stream_states[i].expected_body_match = 0;
             s->stream_states[i].body_bytes = 0;
+            s->stream_states[i].body_tail_len = 0;
             s->stream_states[i].failed = 0;
             return 0;
         }
@@ -763,6 +855,8 @@ static void _quic_native_stream_state_finish(QuicNativeSession *s, int64_t strea
     int status_ok;
     int headers_ok;
     int body_ok;
+    int expected_header_ok;
+    int expected_body_substring_ok;
     int validation_ok;
     int ok;
     if (s == NULL) {
@@ -794,7 +888,24 @@ static void _quic_native_stream_state_finish(QuicNativeSession *s, int64_t strea
     if (body_ok) {
         s->response_body_ok += 1;
     }
-    validation_ok = headers_ok && body_ok;
+    expected_header_ok = 1;
+    if (s->require_header_name_match) {
+        expected_header_ok = st->expected_header_seen ? 1 : 0;
+        if (s->require_header_value_match) {
+            expected_header_ok = expected_header_ok && (st->expected_header_value_match ? 1 : 0);
+        }
+        if (expected_header_ok) {
+            s->response_expected_header_ok += 1;
+        }
+    }
+    expected_body_substring_ok = 1;
+    if (s->require_body_substring_match) {
+        expected_body_substring_ok = st->expected_body_match ? 1 : 0;
+        if (expected_body_substring_ok) {
+            s->response_expected_body_match_ok += 1;
+        }
+    }
+    validation_ok = headers_ok && body_ok && expected_header_ok && expected_body_substring_ok;
     if (!validation_ok) {
         s->response_validation_fail += 1;
     }
@@ -810,7 +921,11 @@ static void _quic_native_stream_state_finish(QuicNativeSession *s, int64_t strea
     st->status_code = 0;
     st->status_seen = 0;
     st->headers_seen = 0;
+    st->expected_header_seen = 0;
+    st->expected_header_value_match = 0;
+    st->expected_body_match = 0;
     st->body_bytes = 0;
+    st->body_tail_len = 0;
     st->failed = 0;
 }
 
@@ -916,6 +1031,53 @@ static int _quic_native_h3_recv_data_cb(
     (void)stream_user_data;
     if (st != NULL && datalen > 0) {
         st->body_bytes += datalen;
+        if (s != NULL && s->require_body_substring_match && s->expect_body_substr_len > 0 && !st->expected_body_match) {
+            if (_bytes_contains_bytes(data, datalen, (const uint8_t *)s->expect_body_substr, s->expect_body_substr_len)) {
+                st->expected_body_match = 1;
+            } else {
+                unsigned char merged[(QUIC_EXPECT_BODY_SUBSTR_MAX * 2) + 32];
+                size_t merged_len = 0;
+                size_t keep = 0;
+                if (st->body_tail_len > 0) {
+                    size_t copy_tail = st->body_tail_len;
+                    if (copy_tail > sizeof(merged)) {
+                        copy_tail = sizeof(merged);
+                    }
+                    memcpy(merged, st->body_tail, copy_tail);
+                    merged_len += copy_tail;
+                }
+                if (datalen > 0 && merged_len < sizeof(merged)) {
+                    size_t copy_now = datalen;
+                    if (copy_now > sizeof(merged) - merged_len) {
+                        copy_now = sizeof(merged) - merged_len;
+                    }
+                    memcpy(merged + merged_len, data, copy_now);
+                    merged_len += copy_now;
+                }
+                if (_bytes_contains_bytes(merged, merged_len, (const uint8_t *)s->expect_body_substr, s->expect_body_substr_len)) {
+                    st->expected_body_match = 1;
+                }
+                if (!st->expected_body_match) {
+                    keep = s->expect_body_substr_len > 1 ? (s->expect_body_substr_len - 1) : 0;
+                    if (keep > sizeof(st->body_tail)) {
+                        keep = sizeof(st->body_tail);
+                    }
+                    if (merged_len >= keep) {
+                        if (keep > 0) {
+                            memcpy(st->body_tail, merged + (merged_len - keep), keep);
+                        }
+                        st->body_tail_len = keep;
+                    } else {
+                        if (merged_len > 0) {
+                            memcpy(st->body_tail, merged, merged_len);
+                        }
+                        st->body_tail_len = merged_len;
+                    }
+                } else {
+                    st->body_tail_len = 0;
+                }
+            }
+        }
     }
     if (s != NULL && s->conn != NULL && datalen > 0) {
         ngtcp2_conn_extend_max_offset(s->conn, (uint64_t)datalen);
@@ -966,14 +1128,34 @@ static int _quic_native_h3_recv_header_cb(
 ) {
     QuicNativeSession *s = (QuicNativeSession *)conn_user_data;
     QuicNativeStreamState *st = _quic_native_stream_state_find(s, stream_id);
+    nghttp3_vec name_vec;
+    nghttp3_vec val_vec;
     (void)conn;
-    (void)name;
     (void)flags;
     (void)stream_user_data;
     if (s == NULL || st == NULL || value == NULL) {
         return 0;
     }
     st->headers_seen = 1;
+    if (s->require_header_name_match && name != NULL) {
+        name_vec = nghttp3_rcbuf_get_buf(name);
+        if (_ascii_eq_casefold_bytes(name_vec.base, name_vec.len, s->expect_header_name, s->expect_header_name_len)) {
+            st->expected_header_seen = 1;
+            if (!s->require_header_value_match) {
+                st->expected_header_value_match = 1;
+            }
+            if (s->require_header_value_match) {
+                val_vec = nghttp3_rcbuf_get_buf(value);
+                if (_ascii_contains_casefold_bytes(
+                        val_vec.base,
+                        val_vec.len,
+                        s->expect_header_value_substr,
+                        s->expect_header_value_len)) {
+                    st->expected_header_value_match = 1;
+                }
+            }
+        }
+    }
     if (token == NGHTTP3_QPACK_TOKEN__STATUS) {
         nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
         int parsed = 0;
@@ -1589,6 +1771,9 @@ static QuicNativeResultCode _quic_native_run_batch(
     int require_response_headers,
     int require_response_body,
     size_t min_response_body_bytes,
+    const char *expect_header_name,
+    const char *expect_header_value_substr,
+    const char *expect_body_substr,
     QuicNativeBatchResult *out
 ) {
     QuicNativeSession s;
@@ -1620,6 +1805,42 @@ static QuicNativeResultCode _quic_native_run_batch(
     s.require_response_headers = require_response_headers ? 1 : 0;
     s.require_response_body = require_response_body ? 1 : 0;
     s.min_response_body_bytes = min_response_body_bytes;
+    if (expect_header_name != NULL && expect_header_name[0] != '\0') {
+        size_t n = strlen(expect_header_name);
+        if (n >= sizeof(s.expect_header_name)) {
+            n = sizeof(s.expect_header_name) - 1;
+        }
+        memcpy(s.expect_header_name, expect_header_name, n);
+        s.expect_header_name[n] = '\0';
+        s.expect_header_name_len = strlen(s.expect_header_name);
+        if (s.expect_header_name_len > 0) {
+            s.require_header_name_match = 1;
+        }
+    }
+    if (expect_header_value_substr != NULL && expect_header_value_substr[0] != '\0') {
+        size_t n = strlen(expect_header_value_substr);
+        if (n >= sizeof(s.expect_header_value_substr)) {
+            n = sizeof(s.expect_header_value_substr) - 1;
+        }
+        memcpy(s.expect_header_value_substr, expect_header_value_substr, n);
+        s.expect_header_value_substr[n] = '\0';
+        s.expect_header_value_len = strlen(s.expect_header_value_substr);
+        if (s.expect_header_value_len > 0 && s.require_header_name_match) {
+            s.require_header_value_match = 1;
+        }
+    }
+    if (expect_body_substr != NULL && expect_body_substr[0] != '\0') {
+        size_t n = strlen(expect_body_substr);
+        if (n >= sizeof(s.expect_body_substr)) {
+            n = sizeof(s.expect_body_substr) - 1;
+        }
+        memcpy(s.expect_body_substr, expect_body_substr, n);
+        s.expect_body_substr[n] = '\0';
+        s.expect_body_substr_len = strlen(s.expect_body_substr);
+        if (s.expect_body_substr_len > 0) {
+            s.require_body_substring_match = 1;
+        }
+    }
     s.requests_target = request_count;
     s.stream_cap = (size_t)(max_inflight * 2 + 8);
     if (s.stream_cap < 16) {
@@ -1808,6 +2029,8 @@ done_loop:
         out->response_headers_ok += s.response_headers_ok;
         out->response_body_ok += s.response_body_ok;
         out->response_validation_fail += s.response_validation_fail;
+        out->response_expected_header_ok += s.response_expected_header_ok;
+        out->response_expected_body_match_ok += s.response_expected_body_match_ok;
         out->handshake_ns = s.handshake_ns;
     }
     remaining = request_count;
@@ -4975,9 +5198,17 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         int quic_require_response_headers = _dict_bool(cfg, "quic_require_response_headers", 1);
         int quic_require_response_body = _dict_bool(cfg, "quic_require_response_body", 0);
         long quic_min_response_body_bytes = _dict_long(cfg, "quic_min_response_body_bytes", 0);
+        const char *quic_expect_header_name_cfg = _dict_cstr(cfg, "quic_expect_header_name", "");
+        const char *quic_expect_header_value_contains_cfg = _dict_cstr(cfg, "quic_expect_header_value_contains", "");
+        const char *quic_expect_body_substring_cfg = _dict_cstr(cfg, "quic_expect_body_substring", "");
+        char quic_expect_header_name[QUIC_EXPECT_HEADER_NAME_MAX];
+        char quic_expect_header_value_contains[QUIC_EXPECT_HEADER_VALUE_MAX];
+        char quic_expect_body_substring[QUIC_EXPECT_BODY_SUBSTR_MAX];
         long quic_response_headers_ok = 0;
         long quic_response_body_ok = 0;
         long quic_response_validation_fail = 0;
+        long quic_response_expected_header_ok = 0;
+        long quic_response_expected_body_match_ok = 0;
         long peak_active = 0;
         long conn_attempts = 0;
         long sample_count = 0;
@@ -4989,6 +5220,10 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         double conn_rate = 0.0;
         double handshake_p99_ms = 0.0;
         const char *final_reason = "none";
+
+        quic_expect_header_name[0] = '\0';
+        quic_expect_header_value_contains[0] = '\0';
+        quic_expect_body_substring[0] = '\0';
 
         if (quic_streams_per_conn < 1) {
             quic_streams_per_conn = concurrency > 0 ? concurrency : 1;
@@ -5014,6 +5249,60 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
         if (quic_min_response_body_bytes < 0) {
             quic_min_response_body_bytes = 0;
         }
+        {
+            size_t n0 = strlen(quic_expect_header_name_cfg);
+            size_t n1 = strlen(quic_expect_header_value_contains_cfg);
+            size_t n2 = strlen(quic_expect_body_substring_cfg);
+            if (n0 >= QUIC_EXPECT_HEADER_NAME_MAX) {
+                n0 = QUIC_EXPECT_HEADER_NAME_MAX - 1;
+            }
+            if (n1 >= QUIC_EXPECT_HEADER_VALUE_MAX) {
+                n1 = QUIC_EXPECT_HEADER_VALUE_MAX - 1;
+            }
+            if (n2 >= QUIC_EXPECT_BODY_SUBSTR_MAX) {
+                n2 = QUIC_EXPECT_BODY_SUBSTR_MAX - 1;
+            }
+            if (n0 > 0) {
+                memcpy(quic_expect_header_name, quic_expect_header_name_cfg, n0);
+                quic_expect_header_name[n0] = '\0';
+                _copy_lower_ascii(quic_expect_header_name, sizeof(quic_expect_header_name), quic_expect_header_name, "");
+            }
+            if (n1 > 0 && n0 == 0) {
+                /* Value matcher requires a header-name target. */
+                n1 = 0;
+            }
+            if (n1 > 0) {
+                memcpy(quic_expect_header_value_contains, quic_expect_header_value_contains_cfg, n1);
+                quic_expect_header_value_contains[n1] = '\0';
+                _copy_lower_ascii(
+                    quic_expect_header_value_contains,
+                    sizeof(quic_expect_header_value_contains),
+                    quic_expect_header_value_contains,
+                    ""
+                );
+            }
+            if (n2 > 0) {
+                memcpy(quic_expect_body_substring, quic_expect_body_substring_cfg, n2);
+                quic_expect_body_substring[n2] = '\0';
+            }
+            if (n2 > 0) {
+                quic_require_response_body = 1;
+            }
+        }
+        if (quic_requests_per_conn == 0) {
+            long auto_per_conn = quic_streams_per_conn * 8;
+            long evenly = (total_attempts + quic_conn_pool_size - 1) / quic_conn_pool_size;
+            if (auto_per_conn < evenly) {
+                auto_per_conn = evenly;
+            }
+            if (auto_per_conn < quic_streams_per_conn) {
+                auto_per_conn = quic_streams_per_conn;
+            }
+            if (auto_per_conn < 1) {
+                auto_per_conn = 1;
+            }
+            quic_requests_per_conn = auto_per_conn;
+        }
         peak_active = quic_streams_per_conn;
         if (peak_active > total_attempts) {
             peak_active = total_attempts;
@@ -5038,17 +5327,9 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
                 for (long slot = 0; slot < slots && remaining_total > 0; slot++) {
                     long batch_target;
                     long wave_remaining;
-                    if (quic_requests_per_conn > 0) {
-                        batch_target = remaining_total;
-                        if (batch_target > quic_requests_per_conn) {
-                            batch_target = quic_requests_per_conn;
-                        }
-                    } else {
-                        long slots_left = slots - slot;
-                        if (slots_left < 1) {
-                            slots_left = 1;
-                        }
-                        batch_target = (remaining_total + slots_left - 1) / slots_left;
+                    batch_target = remaining_total;
+                    if (batch_target > quic_requests_per_conn) {
+                        batch_target = quic_requests_per_conn;
                     }
                     if (batch_target < 1) {
                         batch_target = 1;
@@ -5078,6 +5359,9 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
                             quic_require_response_headers,
                             quic_require_response_body,
                             (size_t)quic_min_response_body_bytes,
+                            quic_expect_header_name,
+                            quic_expect_header_value_contains,
+                            quic_expect_body_substring,
                             &batch_out
                         );
                         Py_END_ALLOW_THREADS
@@ -5086,6 +5370,8 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
                         sent_total += batch_out.sent;
                         quic_response_headers_ok += batch_out.response_headers_ok;
                         quic_response_body_ok += batch_out.response_body_ok;
+                        quic_response_expected_header_ok += batch_out.response_expected_header_ok;
+                        quic_response_expected_body_match_ok += batch_out.response_expected_body_match_ok;
                         batch_errors = batch_out.connect_fail +
                                        batch_out.connect_timeout +
                                        batch_out.tls_fail +
@@ -5232,9 +5518,14 @@ static PyObject *l7_run_quic_stateful(PyObject *self, PyObject *args) {
                 _set_long(result, "quic_response_headers_ok_count", quic_response_headers_ok) < 0 ||
                 _set_long(result, "quic_response_body_ok_count", quic_response_body_ok) < 0 ||
                 _set_long(result, "quic_response_validation_fail_count", quic_response_validation_fail) < 0 ||
+                _set_long(result, "quic_response_expected_header_ok_count", quic_response_expected_header_ok) < 0 ||
+                _set_long(result, "quic_response_expected_body_match_ok_count", quic_response_expected_body_match_ok) < 0 ||
                 _set_double(result, "quic_response_validation_fail_ratio", total_attempts > 0 ? ((double)quic_response_validation_fail / (double)total_attempts) : 0.0) < 0 ||
                 _set_double(result, "quic_stream_fail_ratio", total_attempts > 0 ? ((double)stream_fail_count / (double)total_attempts) : 0.0) < 0 ||
                 _set_double(result, "quic_handshake_fail_ratio", total_attempts > 0 ? ((double)handshake_fail_total / (double)total_attempts) : 0.0) < 0 ||
+                _set_str(result, "quic_expect_header_name", quic_expect_header_name) < 0 ||
+                _set_str(result, "quic_expect_header_value_contains", quic_expect_header_value_contains) < 0 ||
+                _set_str(result, "quic_expect_body_substring", quic_expect_body_substring) < 0 ||
                 _set_str(result, "scheme", scheme) < 0 ||
                 _set_str(result, "quic_stack_probe_reason", stack_probe_reason) < 0 ||
                 _set_str(result, "quic_stack_mode", stack_mode) < 0) {

@@ -319,6 +319,9 @@ def _report_inputs_from_args(args) -> dict:
         "quic_require_response_headers": bool(getattr(args, "quic_require_response_headers", True)),
         "quic_require_response_body": bool(getattr(args, "quic_require_response_body", False)),
         "quic_min_response_body_bytes": int(getattr(args, "quic_min_response_body_bytes", 0) or 0),
+        "quic_expect_header_name": str(getattr(args, "quic_expect_header_name", "") or ""),
+        "quic_expect_header_value_contains": str(getattr(args, "quic_expect_header_value_contains", "") or ""),
+        "quic_expect_body_substring": str(getattr(args, "quic_expect_body_substring", "") or ""),
         "l7_fallback_policy": str(getattr(args, "l7_fallback_policy", "allow")),
         "l7_capability_strict": bool(getattr(args, "l7_capability_strict", False)),
         "legacy_path_enable": bool(getattr(args, "legacy_path_enable", False)),
@@ -456,6 +459,12 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: --quic-expect-status-max, --quic-expect-status-min değerinden küçük olamaz.")
     if int(getattr(args, "quic_min_response_body_bytes", 0) or 0) < 0:
         parser.error("Hata: --quic-min-response-body-bytes >= 0 olmalıdır.")
+    if len(str(getattr(args, "quic_expect_header_name", "") or "")) > 63:
+        parser.error("Hata: --quic-expect-header-name en fazla 63 karakter olmalıdır.")
+    if len(str(getattr(args, "quic_expect_header_value_contains", "") or "")) > 159:
+        parser.error("Hata: --quic-expect-header-value-contains en fazla 159 karakter olmalıdır.")
+    if len(str(getattr(args, "quic_expect_body_substring", "") or "")) > 159:
+        parser.error("Hata: --quic-expect-body-substring en fazla 159 karakter olmalıdır.")
     if (xdp_enable or sender_backend == "xdp") and not xdp_interface:
         parser.error("Hata: XDP yolu için --xdp-interface zorunludur.")
     if fallback_policy == "fail" and sender_backend == "auto":
@@ -787,6 +796,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quic-require-response-headers", type=_arg_bool, nargs="?", const=True, default=True, help="Native QUIC response header/status doğrulaması zorunlu (true/false)")
     parser.add_argument("--quic-require-response-body", action="store_true", help="Native QUIC için response body gelmesi zorunlu")
     parser.add_argument("--quic-min-response-body-bytes", type=int, default=0, help="Native QUIC response body minimum byte eşiği")
+    parser.add_argument("--quic-expect-header-name", type=str, default="", help="Native QUIC response'da zorunlu header adı (opsiyonel, küçük/büyük harf duyarsız).")
+    parser.add_argument("--quic-expect-header-value-contains", type=str, default="", help="Native QUIC response'da beklenen header değer alt dizesi (quic-expect-header-name ile birlikte).")
+    parser.add_argument("--quic-expect-body-substring", type=str, default="", help="Native QUIC response body içinde zorunlu alt dize (opsiyonel).")
     parser.add_argument("--slowloris-concurrency", type=int, default=200, help="Slowloris vektörü eşzamanlı bağlantı sayısı")
     parser.add_argument("--stealth-mode", action="store_true", help="DEPRECATED (no-op): kaldırılacak")
     parser.add_argument("--payload-mutation", action="store_true", help="Payload mutation - her istekte payload'u değiştir")

@@ -149,7 +149,91 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
-def _build_rules(gates: Dict[str, Any]) -> List[KpiGateRule]:
+def _metric_gt_zero(results: Dict[str, Any], key: str) -> bool:
+    if not isinstance(results, dict):
+        return False
+    v = _to_float(results.get(key))
+    return bool(v is not None and v > 0.0)
+
+
+def _by_vector_has_activity(results: Dict[str, Any], vectors: set[str]) -> bool:
+    if not isinstance(results, dict):
+        return False
+    by_vector = results.get("by_vector")
+    if not isinstance(by_vector, dict):
+        return False
+    for vec_name, vec_stats in by_vector.items():
+        if str(vec_name or "").strip().lower() not in vectors:
+            continue
+        if isinstance(vec_stats, dict):
+            if (
+                _to_float(vec_stats.get("attempted")) not in (None, 0.0)
+                or _to_float(vec_stats.get("sent")) not in (None, 0.0)
+                or _to_float(vec_stats.get("errors")) not in (None, 0.0)
+            ):
+                return True
+        else:
+            v = _to_float(vec_stats)
+            if v is not None and v > 0.0:
+                return True
+    return False
+
+
+def _sender_path_has(results: Dict[str, Any], token: str) -> bool:
+    if not isinstance(results, dict):
+        return False
+    paths = results.get("sender_paths_used")
+    if not isinstance(paths, dict):
+        return False
+    token_u = str(token or "").strip().upper()
+    for name in paths.keys():
+        if token_u and token_u in str(name or "").upper():
+            return True
+    return False
+
+
+def _infer_quic_scope(results: Dict[str, Any]) -> bool:
+    if _by_vector_has_activity(results, {"quic"}):
+        return True
+    if _sender_path_has(results, "QUIC"):
+        return True
+    quic_metric_keys = (
+        "quic_connection_attempts",
+        "quic_connect_fail_count",
+        "quic_connect_timeout_count",
+        "quic_tls_fail_count",
+        "quic_handshake_timeout_count",
+        "quic_stream_fail_count",
+        "quic_response_headers_ok_count",
+        "quic_response_body_ok_count",
+        "quic_response_validation_fail_count",
+    )
+    return any(_metric_gt_zero(results, key) for key in quic_metric_keys)
+
+
+def _infer_l7_scope(results: Dict[str, Any], quic_scope: bool) -> bool:
+    if quic_scope:
+        return True
+    if _by_vector_has_activity(results, {"http", "http2", "http-stateful", "websocket", "websocket-scenario", "ws"}):
+        return True
+    if _sender_path_has(results, "C_STATE_") or _sender_path_has(results, "PY_HTTP") or _sender_path_has(results, "PY_WS"):
+        return True
+    l7_metric_keys = (
+        "l7_active_sessions_peak",
+        "l7_conn_rate",
+        "l7_handshake_p99_ms",
+        "l7_step_fail_ratio",
+        "session_success_rate",
+        "retry_success_rate",
+        "h2_connections_used",
+        "h2_request_plan_items",
+    )
+    return any(_metric_gt_zero(results, key) for key in l7_metric_keys)
+
+
+def _build_rules(gates: Dict[str, Any], results: Dict[str, Any]) -> List[KpiGateRule]:
+    quic_scope = _infer_quic_scope(results)
+    l7_scope = _infer_l7_scope(results, quic_scope=quic_scope)
     rules: List[KpiGateRule] = [
         KpiGateRule("run_quality", "run_quality", "eq", gates.get("run_quality", "valid"), required=True),
         KpiGateRule(
@@ -199,56 +283,56 @@ def _build_rules(gates: Dict[str, Any]) -> List[KpiGateRule]:
             "session_success_rate",
             "min",
             float(gates.get("session_success_rate_min", 99.0) or 99.0),
-            required=False,
+            required=bool(l7_scope),
         ),
         KpiGateRule(
             "retry_success_rate",
             "retry_success_rate",
             "min",
             float(gates.get("retry_success_rate_min", 90.0) or 90.0),
-            required=False,
+            required=bool(l7_scope),
         ),
         KpiGateRule(
             "l7_step_fail_ratio",
             "l7_step_fail_ratio",
             "max",
             float(gates.get("l7_step_fail_ratio_max", 0.01) or 0.01),
-            required=False,
+            required=bool(l7_scope),
         ),
         KpiGateRule(
             "l7_handshake_p99_ms",
             "l7_handshake_p99_ms",
             "max",
             float(gates.get("l7_handshake_p99_ms_max", 250.0) or 250.0),
-            required=False,
+            required=bool(l7_scope),
         ),
         KpiGateRule(
             "l7_fail_budget_pct",
             "l7_fail_budget_pct",
             "max",
             float(gates.get("l7_fail_budget_pct_max", 1.0) or 1.0),
-            required=False,
+            required=bool(l7_scope),
         ),
         KpiGateRule(
             "quic_stream_fail_ratio",
             "quic_stream_fail_ratio",
             "max",
             float(gates.get("quic_stream_fail_ratio_max", 0.01) or 0.01),
-            required=False,
+            required=bool(quic_scope),
         ),
         KpiGateRule(
             "quic_handshake_fail_ratio",
             "quic_handshake_fail_ratio",
             "max",
             float(gates.get("quic_handshake_fail_ratio_max", 0.01) or 0.01),
-            required=False,
+            required=bool(quic_scope),
         ),
         KpiGateRule(
             "quic_response_validation_fail_ratio",
             "quic_response_validation_fail_ratio",
             "max",
             float(gates.get("quic_response_validation_fail_ratio_max", 0.01) or 0.01),
-            required=False,
+            required=bool(quic_scope),
         ),
     ]
     quic_mode_required = str(gates.get("quic_stack_mode_required", "") or "").strip()
@@ -259,7 +343,7 @@ def _build_rules(gates: Dict[str, Any]) -> List[KpiGateRule]:
                 "quic_stack_mode",
                 "eq",
                 quic_mode_required,
-                required=False,
+                required=bool(quic_scope),
             )
         )
     return rules
@@ -286,7 +370,7 @@ def evaluate(
         )
 
     gates = _merge_gate_defaults(profile_norm, parity_matrix_path=parity_matrix_path)
-    rules = _build_rules(gates)
+    rules = _build_rules(gates, results or {})
 
     violations: List[str] = []
     evaluated: List[Dict[str, Any]] = []
