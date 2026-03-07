@@ -32,8 +32,8 @@ class _FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def request(self, method, path, headers=None):
-        self.requests.append((method, path, headers))
+    async def request(self, method, path, headers=None, content=None):
+        self.requests.append((method, path, headers, content))
         item = self.response_plan.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -166,6 +166,47 @@ class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_FakeAsyncClient.requests[0][2], {"User-Agent": "Plan-UA-1"})
         self.assertEqual(_FakeAsyncClient.requests[1][0], "GET")
         self.assertEqual(_FakeAsyncClient.requests[1][1], "/health")
+
+    async def test_http2_sender_request_plan_forwards_headers_and_body(self):
+        _FakeAsyncClient.requests = []
+        _FakeAsyncClient.init_kwargs = []
+        _FakeAsyncClient.response_plan = [_FakeResponse(200)]
+        request_plan = SimpleNamespace(
+            items=[
+                SimpleNamespace(
+                    method="POST",
+                    path="/gpu/body",
+                    user_agent="Plan-UA-Body",
+                    headers={"accept": "application/json", "x-gpu-plan-seed": "abc123"},
+                    body=b'{"k":"v"}',
+                    content_type="application/json",
+                ),
+            ]
+        )
+        with patch.object(senders, "HTTPX_AVAILABLE", True), patch.object(senders, "httpx", _FakeHttpx):
+            out = await senders.http2_sender(
+                target_ip="127.0.0.1",
+                target_port=443,
+                count=1,
+                concurrency=1,
+                http_path="/",
+                http_method="GET",
+                verbose=False,
+                scheme="https",
+                h2_profile_name="none",
+                request_plan=request_plan,
+            )
+
+        self.assertEqual(out["attempted"], 1)
+        self.assertEqual(out["sent"], 1)
+        self.assertEqual(out["errors"], 0)
+        req_method, req_path, req_headers, req_content = _FakeAsyncClient.requests[0]
+        self.assertEqual(req_method, "POST")
+        self.assertEqual(req_path, "/gpu/body")
+        self.assertEqual(req_content, b'{"k":"v"}')
+        self.assertIn("Content-Type", req_headers)
+        self.assertEqual(req_headers["Content-Type"], "application/json")
+        self.assertEqual(req_headers.get("x-gpu-plan-seed"), "abc123")
 
     async def test_http2_sender_uses_hyper_h2_transport_when_requested(self):
         fake_h2_transport = SimpleNamespace(

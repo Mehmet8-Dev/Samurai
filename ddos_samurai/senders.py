@@ -2629,19 +2629,24 @@ async def http2_sender(
                 item = planned_items[i]
                 req_method = str(getattr(item, "method", http_method) or http_method)
                 req_path = str(getattr(item, "path", "/") or "/")
-                req_headers = {}
+                req_headers = dict(getattr(item, "headers", {}) or {})
                 plan_ua = str(getattr(item, "user_agent", "") or "").strip()
                 if user_agent:
                     req_headers["user-agent"] = str(user_agent)
                 elif plan_ua:
                     req_headers["user-agent"] = plan_ua
+                req_body = getattr(item, "body", None)
+                req_content_type = str(getattr(item, "content_type", "") or "").strip()
+                if req_body is not None and req_content_type and "content-type" not in {str(k).lower() for k in req_headers}:
+                    req_headers["content-type"] = req_content_type
             else:
                 req_method = str(http_method or "GET")
                 req_path = str(random.choice(http_path) if isinstance(http_path, list) else http_path)
                 req_headers = {}
                 if user_agent:
                     req_headers["user-agent"] = str(user_agent)
-            reqs.append({"method": req_method, "path": req_path, "headers": req_headers})
+                req_body = None
+            reqs.append({"method": req_method, "path": req_path, "headers": req_headers, "body": req_body})
 
         try:
             h2_settings = dict(getattr(resolved_profile, "settings", {}) or {}) if resolved_profile is not None else {}
@@ -2826,12 +2831,29 @@ async def http2_sender(
                     item = planned_items[i]
                     req_method = str(getattr(item, "method", http_method) or http_method)
                     req_path = str(getattr(item, "path", "/") or "/")
-                    per_req_headers = None
-                    if not user_agent:
+                    per_req_headers = dict(getattr(item, "headers", {}) or {})
+                    if user_agent:
+                        per_req_headers["User-Agent"] = str(user_agent)
+                    else:
                         plan_ua = str(getattr(item, "user_agent", "") or "").strip()
                         if plan_ua:
-                            per_req_headers = {"User-Agent": plan_ua}
-                    tasks.append(asyncio.create_task(client.request(req_method, req_path, headers=per_req_headers)))
+                            per_req_headers["User-Agent"] = plan_ua
+                    req_body = getattr(item, "body", None)
+                    req_content_type = str(getattr(item, "content_type", "") or "").strip()
+                    if req_body is not None and req_content_type:
+                        existing_keys = {str(k).lower() for k in per_req_headers.keys()}
+                        if "content-type" not in existing_keys:
+                            per_req_headers["Content-Type"] = req_content_type
+                    tasks.append(
+                        asyncio.create_task(
+                            client.request(
+                                req_method,
+                                req_path,
+                                headers=per_req_headers or None,
+                                content=req_body,
+                            )
+                        )
+                    )
                 else:
                     path = random.choice(http_path) if isinstance(http_path, list) else http_path
                     tasks.append(asyncio.create_task(client.request(http_method, path)))
@@ -3010,6 +3032,7 @@ async def http_stateful_sender(
     lab_profile="off",
     l7_fallback_policy="allow",
     l7_capability_strict=False,
+    request_plan: "H2RequestPlan | None" = None,
     live_sent=None, live_errors=None, live_progress=None,
 ):
     """
@@ -3025,6 +3048,19 @@ async def http_stateful_sender(
     vu_count = max(0, int(vu_count or 0))
     if vu_count <= 0:
         return _stats(attempted=0, sent=0, errors=0)
+    planned_items = list(getattr(request_plan, "items", []) or []) if request_plan is not None else []
+    planned_paths = [str(getattr(item, "path", "") or "").strip() for item in planned_items]
+    planned_paths = [p for p in planned_paths if p]
+    planned_methods = [str(getattr(item, "method", "") or "").strip().upper() for item in planned_items]
+    planned_methods = [m for m in planned_methods if m]
+    planned_uas = [str(getattr(item, "user_agent", "") or "").strip() for item in planned_items]
+    planned_uas = [ua for ua in planned_uas if ua]
+    planned_headers = [dict(getattr(item, "headers", {}) or {}) for item in planned_items]
+    planned_bodies = [getattr(item, "body", None) for item in planned_items]
+    planned_content_types = [str(getattr(item, "content_type", "") or "").strip() for item in planned_items]
+
+    if not user_agent and planned_uas:
+        user_agent = planned_uas[0]
 
     route = l7_dispatch.build_route_decision(
         L7RouteRequest(
@@ -3039,11 +3075,10 @@ async def http_stateful_sender(
     )
     c_fallback_reason = "none"
     if route.engine == "c_state":
-        _http_path_first = (
-            str(http_path[0])
-            if isinstance(http_path, list) and len(http_path) > 0
-            else str(http_path or "/")
+        _http_path_first = str(planned_paths[0]) if planned_paths else (
+            str(http_path[0]) if isinstance(http_path, list) and len(http_path) > 0 else str(http_path or "/")
         )
+        _http_method_first = str(planned_methods[0]) if planned_methods else str(http_method or "GET")
         cfg = l7_c_adapter.make_config(
             target_ip=str(target_ip),
             target_port=int(target_port or 0),
@@ -3058,8 +3093,9 @@ async def http_stateful_sender(
                 "timeout_s": float(timeout_s or 10.0),
                 "lab_profile": str(lab_profile or "off"),
                 "retries": int(retries or 0),
-                "http_method": str(http_method or "GET"),
+                "http_method": _http_method_first,
                 "http_path": _http_path_first,
+                "l7_request_plan_count": int(len(planned_items)),
             },
         )
         c_res = await l7_c_adapter.run("http1", cfg)
@@ -3097,17 +3133,25 @@ async def http_stateful_sender(
     if max_active_sessions > 0:
         concurrency = min(int(concurrency or 1), max_active_sessions)
     concurrency = max(1, int(concurrency or 1))
-    if not workflow_steps:
-        path_list = list(http_path) if isinstance(http_path, list) else [http_path]
-        path_list = [str(p) for p in path_list if str(p).strip()] or ["/"]
-        method_name = str(http_method or "GET").upper()
-        body_payload = None
-        if isinstance(payloads, list) and payloads:
-            body_payload = random.choice(payloads)
+    steps_provider = None
+
+    def _build_default_workflow(
+        *,
+        path_list: list[str],
+        method_name: str,
+        body_payload,
+        action_headers: dict[str, str] | None = None,
+    ):
         step0 = str(path_list[0])
         step1 = str(path_list[1] if len(path_list) > 1 else path_list[0])
         step2 = str(path_list[2] if len(path_list) > 2 else path_list[-1])
-        workflow_steps = [
+        action_headers = dict(action_headers or {})
+        common_headers = {}
+        if "accept" in action_headers:
+            common_headers["Accept"] = str(action_headers["accept"])
+        if "accept-language" in action_headers:
+            common_headers["Accept-Language"] = str(action_headers["accept-language"])
+        return [
             WorkflowStep(
                 name="bootstrap",
                 method="GET",
@@ -3125,6 +3169,7 @@ async def http_stateful_sender(
                 ],
                 timeout_s=float(timeout_s),
                 max_retries=max_retries,
+                headers=common_headers,
             ),
             WorkflowStep(
                 name="prefetch",
@@ -3134,6 +3179,7 @@ async def http_stateful_sender(
                 follow_redirects=True,
                 timeout_s=float(timeout_s),
                 max_retries=max_retries,
+                headers=common_headers,
             ),
             WorkflowStep(
                 name="action",
@@ -3145,8 +3191,56 @@ async def http_stateful_sender(
                 inject_tokens=["X-CSRF-Token", "X-CSRF-Token:csrf_token"],
                 timeout_s=float(timeout_s),
                 max_retries=max_retries,
+                headers=action_headers,
             ),
         ]
+
+    if not workflow_steps:
+        default_paths = list(planned_paths) if planned_paths else (
+            list(http_path) if isinstance(http_path, list) else [http_path]
+        )
+        default_paths = [str(p) for p in default_paths if str(p).strip()] or ["/"]
+        default_method = str(planned_methods[0] if planned_methods else (http_method or "GET")).upper()
+        default_body = None
+        if planned_bodies and planned_bodies[0] is not None:
+            default_body = planned_bodies[0]
+        elif isinstance(payloads, list) and payloads:
+            default_body = random.choice(payloads)
+        default_headers = dict(planned_headers[0] if planned_headers else {})
+        if default_body is not None and planned_content_types and planned_content_types[0]:
+            default_headers.setdefault("Content-Type", planned_content_types[0])
+        workflow_steps = _build_default_workflow(
+            path_list=default_paths,
+            method_name=default_method,
+            body_payload=default_body,
+            action_headers=default_headers,
+        )
+        if planned_items:
+            def _item_for_session(uid: int, rep_idx: int):
+                idx = (int(uid) * int(session_repeats) + int(rep_idx)) % max(1, len(planned_items))
+                return planned_items[idx]
+
+            def _steps_provider(uid: int, rep_idx: int):
+                plan_item = _item_for_session(uid, rep_idx)
+                item_method = str(getattr(plan_item, "method", default_method) or default_method).upper()
+                item_path = str(getattr(plan_item, "path", default_paths[0]) or default_paths[0])
+                item_headers = dict(getattr(plan_item, "headers", {}) or {})
+                item_body = getattr(plan_item, "body", None)
+                item_content_type = str(getattr(plan_item, "content_type", "") or "").strip()
+                if item_body is not None and item_content_type:
+                    item_headers.setdefault("Content-Type", item_content_type)
+                if not user_agent:
+                    plan_ua = str(getattr(plan_item, "user_agent", "") or "").strip()
+                    if plan_ua:
+                        item_headers.setdefault("User-Agent", plan_ua)
+                return _build_default_workflow(
+                    path_list=[item_path, item_path, item_path],
+                    method_name=item_method,
+                    body_payload=item_body,
+                    action_headers=item_headers,
+                )
+
+            steps_provider = _steps_provider
 
     step_count = len(workflow_steps)
     log_info(f"Stateful HTTP sender: {vu_count} VUs × {step_count} steps → {base_url}")
@@ -3156,6 +3250,7 @@ async def http_stateful_sender(
         vu_count=vu_count,
         base_url=base_url,
         steps=workflow_steps,
+        steps_provider=steps_provider,
         concurrency=concurrency,
         verify=ssl_context if ssl_context else verify,
         timeout_s=timeout_s,
@@ -3203,6 +3298,8 @@ async def http_stateful_sender(
             "sender_path": "PY_HTTP1_STATEFUL",
             "l7_engine_path_used": "PY_HTTP1",
             "l7_fallback_reason": c_fallback_reason,
+            "l7_request_plan_used": int(bool(planned_items)),
+            "l7_request_plan_items": int(len(planned_items)),
             **metrics.as_dict(),
         },
         attempted_default=total_steps,
@@ -3372,6 +3469,7 @@ async def websocket_scenario_sender(
     lab_profile="off",
     l7_fallback_policy="allow",
     l7_capability_strict=False,
+    request_plan: "H2RequestPlan | None" = None,
     ssl_context=None,
     live_sent=None,
     live_errors=None,
@@ -3393,6 +3491,29 @@ async def websocket_scenario_sender(
             lab_profile=str(lab_profile or "off"),
         )
     )
+    planned_items = list(getattr(request_plan, "items", []) or []) if request_plan is not None else []
+    planned_paths = [str(getattr(item, "path", "") or "").strip() for item in planned_items]
+    planned_paths = [p for p in planned_paths if p]
+    planned_auth_msgs = [str(getattr(item, "ws_auth_message", "") or "").strip() for item in planned_items]
+    planned_sub_msgs = [str(getattr(item, "ws_subscribe_message", "") or "").strip() for item in planned_items]
+    planned_ping_msgs = [str(getattr(item, "ws_ping_message", "") or "").strip() for item in planned_items]
+
+    def _normalize_ws_path(path_val: str) -> str:
+        p = str(path_val or "").strip()
+        if not p:
+            return str(ws_path or "/")
+        if p.startswith("ws://") or p.startswith("wss://"):
+            try:
+                # Keep only resource path part when a full URL is provided.
+                from urllib.parse import urlsplit
+                parsed = urlsplit(p)
+                if parsed.path:
+                    p = parsed.path
+            except Exception:
+                pass
+        if not p.startswith("/"):
+            p = "/" + p
+        return p
     c_fallback_reason = "none"
     if route.engine == "c_state":
         cfg = l7_c_adapter.make_config(
@@ -3403,7 +3524,7 @@ async def websocket_scenario_sender(
             mode="websocket_stateful",
             extra={
                 "scheme": "wss" if int(target_port or 0) == 443 else "ws",
-                "ws_path": str(ws_path or "/"),
+                "ws_path": _normalize_ws_path(planned_paths[0] if planned_paths else ws_path),
                 "ws_auth_message": str(auth_message or ""),
                 "ws_subscribe_count": int(len(subscribe_messages or [])),
                 "ws_subscribe_messages": "\x1f".join(str(m) for m in list(subscribe_messages or [])),
@@ -3412,6 +3533,7 @@ async def websocket_scenario_sender(
                 "ws_await_response": bool(await_response),
                 "ws_scenario_enabled": 1,
                 "lab_profile": str(lab_profile or "off"),
+                "l7_request_plan_count": int(len(planned_items)),
             },
         )
         c_res = await l7_c_adapter.run("ws", cfg)
@@ -3448,8 +3570,30 @@ async def websocket_scenario_sender(
         )
 
     scheme = "wss" if target_port == 443 else "ws"
-    uri = f"{scheme}://{target_ip}:{target_port}{ws_path}"
-    log_info(f"WebSocket scenario sender initialized. URI: {uri}, Sessions: {count}")
+    base_ws_path = _normalize_ws_path(ws_path)
+    session_paths = []
+    session_auth_messages = []
+    session_subscribe_messages = []
+    session_ping_messages = []
+    for idx in range(max(0, int(count or 0))):
+        if planned_paths:
+            session_paths.append(_normalize_ws_path(planned_paths[idx % len(planned_paths)]))
+        else:
+            session_paths.append(base_ws_path)
+        plan_auth = planned_auth_msgs[idx % len(planned_auth_msgs)] if planned_auth_msgs else ""
+        plan_sub = planned_sub_msgs[idx % len(planned_sub_msgs)] if planned_sub_msgs else ""
+        plan_ping = planned_ping_msgs[idx % len(planned_ping_msgs)] if planned_ping_msgs else ""
+        session_auth_messages.append(plan_auth if plan_auth else str(auth_message or ""))
+        if plan_sub:
+            session_subscribe_messages.append([plan_sub])
+        else:
+            session_subscribe_messages.append([str(m) for m in list(subscribe_messages or [])])
+        session_ping_messages.append(plan_ping if plan_ping else str(ping_message or "ping"))
+    uri = f"{scheme}://{target_ip}:{target_port}{base_ws_path}"
+    log_info(
+        f"WebSocket scenario sender initialized. URI: {uri}, Sessions: {count}, "
+        f"gpu_plan_items={len(planned_items)}"
+    )
 
     subscribe_messages = list(subscribe_messages or [])
     ping_count = max(0, int(ping_count or 0))
@@ -3468,6 +3612,12 @@ async def websocket_scenario_sender(
     def _worker_count(worker_id: int) -> int:
         return per_worker_base + (1 if worker_id < remainder else 0)
 
+    worker_offsets = []
+    _cursor = 0
+    for i in range(effective_concurrency):
+        worker_offsets.append(_cursor)
+        _cursor += _worker_count(i)
+
     async def _maybe_recv(ws):
         nonlocal pong_received
         if not await_response:
@@ -3478,22 +3628,29 @@ async def websocket_scenario_sender(
     async def _scenario_worker(worker_id: int):
         nonlocal sessions_ok, session_errors, auth_sent, subscribe_sent, ping_sent
         my_sessions = _worker_count(worker_id)
-        for _ in range(my_sessions):
+        base_index = int(worker_offsets[worker_id]) if worker_id < len(worker_offsets) else 0
+        for session_local in range(my_sessions):
+            session_idx = base_index + session_local
+            session_path = session_paths[session_idx] if session_idx < len(session_paths) else base_ws_path
+            session_uri = f"{scheme}://{target_ip}:{target_port}{session_path}"
+            session_auth = session_auth_messages[session_idx] if session_idx < len(session_auth_messages) else str(auth_message or "")
+            session_subs = session_subscribe_messages[session_idx] if session_idx < len(session_subscribe_messages) else list(subscribe_messages or [])
+            session_ping = session_ping_messages[session_idx] if session_idx < len(session_ping_messages) else str(ping_message or "ping")
             _update_live(live_progress, 1)
             try:
-                async with websockets.connect(uri, ssl=ssl_context) as websocket:
-                    if auth_message:
-                        await websocket.send(str(auth_message))
+                async with websockets.connect(session_uri, ssl=ssl_context) as websocket:
+                    if session_auth:
+                        await websocket.send(str(session_auth))
                         auth_sent += 1
                         await _maybe_recv(websocket)
 
-                    for sub_msg in subscribe_messages:
+                    for sub_msg in session_subs:
                         await websocket.send(str(sub_msg))
                         subscribe_sent += 1
                         await _maybe_recv(websocket)
 
                     for _ in range(ping_count):
-                        await websocket.send(str(ping_message))
+                        await websocket.send(str(session_ping))
                         ping_sent += 1
                         await _maybe_recv(websocket)
 
@@ -3526,6 +3683,8 @@ async def websocket_scenario_sender(
             "sender_path": "PY_WS_SCENARIO",
             "l7_engine_path_used": "PY_WS",
             "l7_fallback_reason": c_fallback_reason,
+            "l7_request_plan_used": int(bool(planned_items)),
+            "l7_request_plan_items": int(len(planned_items)),
         },
         attempted_default=count,
         sender_path="PY_WS_SCENARIO",
@@ -3611,6 +3770,7 @@ async def quic_sender(
     quic_require_response_headers=True,
     quic_require_response_body=False,
     quic_min_response_body_bytes=0,
+    request_plan: "H2RequestPlan | None" = None,
     live_sent=None,
     live_errors=None,
     live_progress=None,
@@ -3631,6 +3791,14 @@ async def quic_sender(
             lab_profile=str(lab_profile or "off"),
         )
     )
+    planned_items = list(getattr(request_plan, "items", []) or []) if request_plan is not None else []
+    planned_methods = [str(getattr(item, "method", "") or "").strip().upper() for item in planned_items]
+    planned_methods = [m for m in planned_methods if m]
+    planned_paths = [str(getattr(item, "path", "") or "").strip() for item in planned_items]
+    planned_paths = [p for p in planned_paths if p]
+    planned_headers = [dict(getattr(item, "headers", {}) or {}) for item in planned_items]
+    planned_bodies = [getattr(item, "body", None) for item in planned_items]
+    planned_content_types = [str(getattr(item, "content_type", "") or "").strip() for item in planned_items]
     lab_profile_norm = str(lab_profile or "off").strip().lower()
     require_native_effective = bool(l7_quic_require_native) or (
         lab_profile_norm == "dedicated" and bool(l7_capability_strict)
@@ -3657,8 +3825,8 @@ async def quic_sender(
 
     if route.engine == "c_state":
         c_extra = {
-            "quic_path": str(quic_path or "/"),
-            "quic_method": str(quic_method or "GET"),
+            "quic_path": str(planned_paths[0] if planned_paths else (quic_path or "/")),
+            "quic_method": str(planned_methods[0] if planned_methods else (quic_method or "GET")),
             "scheme": "https",
             "verify": bool(verify_tls),
             "require_native_quic": 1 if bool(require_native_effective) else 0,
@@ -3672,6 +3840,7 @@ async def quic_sender(
             "quic_require_response_headers": 1 if bool(quic_require_response_headers) else 0,
             "quic_require_response_body": 1 if bool(quic_require_response_body) else 0,
             "quic_min_response_body_bytes": int(quic_min_response_body_bytes or 0),
+            "l7_request_plan_count": int(len(planned_items)),
         }
         if require_native_effective:
             c_extra["enable_quic_py_bridge"] = 0
@@ -3730,8 +3899,10 @@ async def quic_sender(
             )
         )
 
-    log_info(f"QUIC sender initialized. Target: {target_ip}:{target_port}, "
-             f"Count: {count}, Method: {quic_method}, Path: {quic_path}")
+    log_info(
+        f"QUIC sender initialized. Target: {target_ip}:{target_port}, Count: {count}, "
+        f"Method: {quic_method}, Path: {quic_path}, gpu_plan_items={len(planned_items)}"
+    )
 
     configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     if ssl_context or not verify_tls:
@@ -3747,38 +3918,100 @@ async def quic_sender(
     def _worker_count(worker_id):
         return per_worker_base + (1 if worker_id < remainder else 0)
 
+    def _normalize_quic_path(path_value: str) -> str:
+        path_norm = str(path_value or "").strip()
+        if not path_norm:
+            return str(quic_path or "/")
+        if not path_norm.startswith("/"):
+            path_norm = "/" + path_norm
+        return path_norm
+
+    request_items = []
+    for i in range(max(0, int(count or 0))):
+        if planned_items:
+            item = planned_items[i % len(planned_items)]
+            method_i = str(getattr(item, "method", quic_method) or quic_method)
+            path_i = str(getattr(item, "path", quic_path) or quic_path)
+            headers_i = dict(planned_headers[i % len(planned_headers)] if planned_headers else {})
+            plan_ua = str(getattr(item, "user_agent", "") or "").strip()
+            if plan_ua and "user-agent" not in {str(k).lower() for k in headers_i.keys()}:
+                headers_i["user-agent"] = plan_ua
+            body_i = planned_bodies[i % len(planned_bodies)] if planned_bodies else None
+            content_type_i = planned_content_types[i % len(planned_content_types)] if planned_content_types else ""
+            if body_i is not None and content_type_i and "content-type" not in {str(k).lower() for k in headers_i.keys()}:
+                headers_i["content-type"] = content_type_i
+        else:
+            method_i = str(quic_method or "GET")
+            path_i = str(quic_path or "/")
+            headers_i = {}
+            body_i = None
+        if body_i is None:
+            body_bytes_i = b""
+        elif isinstance(body_i, bytes):
+            body_bytes_i = body_i
+        else:
+            body_bytes_i = str(body_i).encode("utf-8")
+        request_items.append((method_i.upper(), _normalize_quic_path(path_i), headers_i, body_bytes_i))
+
+    worker_offsets = []
+    _cursor = 0
+    for i in range(effective_concurrency):
+        worker_offsets.append(_cursor)
+        _cursor += _worker_count(i)
+
     async def _quic_worker(worker_id):
         nonlocal ok_requests, err_requests
         my_count = _worker_count(worker_id)
         if my_count <= 0:
             return
+        start_idx = int(worker_offsets[worker_id]) if worker_id < len(worker_offsets) else 0
         try:
             async with connect(
                 target_ip, target_port, configuration=configuration,
                 create_protocol=H3Connection
             ) as protocol:
                 h3_conn = protocol._quic  # underlying H3Connection
-                for _ in range(my_count):
+                for req_local in range(my_count):
                     _update_live(live_progress, 1)
                     try:
+                        req_idx = start_idx + req_local
+                        req_method, req_path, req_headers, req_body = request_items[req_idx] if req_idx < len(request_items) else (
+                            str(quic_method or "GET").upper(),
+                            _normalize_quic_path(str(quic_path or "/")),
+                            {},
+                            b"",
+                        )
                         # Open a new stream and send H3 request headers
                         stream_id = h3_conn.get_next_available_stream_id()
                         h3_headers = [
-                            (b":method", quic_method.encode() if isinstance(quic_method, str) else quic_method),
-                            (b":path", quic_path.encode() if isinstance(quic_path, str) else quic_path),
+                            (b":method", req_method.encode()),
+                            (b":path", req_path.encode()),
                             (b":scheme", b"https"),
                             (b":authority", target_ip.encode() if isinstance(target_ip, str) else target_ip),
                             (b"user-agent", b"DDoSamurai/2.0"),
                         ]
+                        for hk, hv in dict(req_headers or {}).items():
+                            if hk is None or hv is None:
+                                continue
+                            hname = str(hk).strip().lower()
+                            if not hname:
+                                continue
+                            if hname.startswith(":") or hname == "authority":
+                                continue
+                            if hname == "user-agent":
+                                h3_headers = [x for x in h3_headers if x[0] != b"user-agent"]
+                            h3_headers.append((hname.encode(), str(hv).encode()))
                         h3_conn.send_headers(
                             stream_id=stream_id,
                             headers=h3_headers,
-                            end_stream=True,
+                            end_stream=(len(req_body) == 0),
                         )
+                        if req_body:
+                            h3_conn.send_data(stream_id=stream_id, data=req_body, end_stream=True)
                         ok_requests += 1
                         _update_live(live_sent, 1)
                         if verbose:
-                            log_info(f"H3 request sent: {quic_method} {quic_path} stream={stream_id}")
+                            log_info(f"H3 request sent: {req_method} {req_path} stream={stream_id}")
                         # Allow event loop to process
                         await asyncio.sleep(0)
                     except Exception as req_e:
@@ -3809,6 +4042,8 @@ async def quic_sender(
                 "quic_stream_fail_ratio": float(max(err_requests, 0)) / float(max(1, int(count or 0))),
                 "quic_handshake_fail_ratio": 0.0,
                 "sender_path": "PY_QUIC",
+                "l7_request_plan_used": int(bool(planned_items)),
+                "l7_request_plan_items": int(len(planned_items)),
             },
             attempted_default=count,
             sender_path="PY_QUIC",

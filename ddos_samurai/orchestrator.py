@@ -1177,6 +1177,62 @@ async def worker_process(
             if not real_src_ip: real_src_ip = "192.168.1.100"
             real_src_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(real_src_ip.split('.'))]))
 
+            if args['attack_vector'] == 'http' and bool(args.get('stateful', False)):
+                log_info("Initializing GPU L7 planner + CPU Stateful HTTP engine...")
+                verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
+                BATCH_SIZE = int(_gpu_batch_size)
+                remaining = int(args['count'])
+                payload_engine = gpu_payload.GPUPayloadEngine(
+                    BATCH_SIZE,
+                    rng_seed=args.get("gpu_rng_seed", 1234),
+                )
+                custom_methods = [str(args.get("http_method", "GET") or "GET").upper()]
+                custom_paths = args.get("http_path")
+                custom_uas = [str(args.get("user_agent"))] if args.get("user_agent") else None
+                payload_engine.load_custom_wordlists(
+                    methods=custom_methods,
+                    paths=custom_paths if isinstance(custom_paths, list) and custom_paths else ["/"],
+                    uas=custom_uas,
+                )
+
+                while remaining > 0:
+                    batch_count = min(remaining, BATCH_SIZE)
+                    payload_engine.count = batch_count
+                    request_plan = payload_engine.generate_h2_request_plan(
+                        target_ip=args['target'],
+                        count=batch_count,
+                        current_time=int(time.time() * 1000),
+                    )
+                    worker_stats = _add_stats(worker_stats, await senders.http_stateful_sender(
+                        args['target'], args['port'],
+                        batch_count, args['http_concurrency'],
+                        workflow_steps=None,
+                        verbose=args['verbose'],
+                        scheme=args['http_scheme'],
+                        verify=verify_ssl,
+                        timeout_s=args['http_timeout'],
+                        ssl_context=ssl_context,
+                        user_agent=args.get('user_agent'),
+                        retries=args.get('http_retries', 0),
+                        http_method=args.get('http_method', 'GET'),
+                        http_path=args.get('http_path', ['/']),
+                        payloads=args.get('payloads', []),
+                        session_repeats=args.get('l7_session_repeats', 1),
+                        max_active_sessions=args.get('l7_max_active_sessions', 0),
+                        l7_engine=args.get('l7_engine', 'python'),
+                        legacy_path_enable=bool(args.get('legacy_path_enable', False)),
+                        lab_profile=args.get('lab_profile', 'off'),
+                        l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
+                        l7_capability_strict=bool(args.get("l7_capability_strict", False)),
+                        request_plan=request_plan,
+                        live_sent=sent_total,
+                        live_errors=errors_total,
+                        live_progress=progress,
+                    ))
+                    remaining -= batch_count
+                    await asyncio.sleep(0)
+                return
+
             # --- NEW: GPU Payload Engine for HTTP ---
             if args['attack_vector'] == 'http':
                 log_info("Initializing GPU Payload Engine (Polymorphic HTTP)...")
@@ -1379,6 +1435,122 @@ async def worker_process(
                             live_errors=errors_total,
                             live_progress=progress,
                         ))
+                    remaining -= batch_count
+                    await asyncio.sleep(0)
+                return
+
+            if args['attack_vector'] == 'websocket':
+                if bool(args.get("ws_scenario", False)):
+                    log_info("Initializing GPU L7 planner + CPU WebSocket scenario engine...")
+                    BATCH_SIZE = int(_gpu_batch_size)
+                    remaining = int(args['count'])
+                    payload_engine = gpu_payload.GPUPayloadEngine(
+                        BATCH_SIZE,
+                        rng_seed=args.get("gpu_rng_seed", 1234),
+                    )
+                    ws_paths = [str(args.get("ws_path", "/") or "/")]
+                    payload_engine.load_custom_wordlists(
+                        methods=["GET"],
+                        paths=ws_paths,
+                        uas=[str(args.get("user_agent"))] if args.get("user_agent") else None,
+                    )
+                    while remaining > 0:
+                        batch_count = min(remaining, BATCH_SIZE)
+                        payload_engine.count = batch_count
+                        request_plan = payload_engine.generate_h2_request_plan(
+                            target_ip=args['target'],
+                            count=batch_count,
+                            current_time=int(time.time() * 1000),
+                        )
+                        worker_stats = _add_stats(worker_stats, await senders.websocket_scenario_sender(
+                            target_ip=args['target'],
+                            target_port=args['port'],
+                            count=batch_count,
+                            concurrency=args['ws_concurrency'],
+                            ws_path=args['ws_path'],
+                            verbose=args['verbose'],
+                            auth_message=args.get("ws_auth_message", ""),
+                            subscribe_messages=args.get("ws_subscribe_message"),
+                            ping_message=args.get("ws_message", "ping"),
+                            ping_count=args.get("ws_ping_count", 1),
+                            await_response=bool(args.get("ws_await_response", False)),
+                            l7_engine=args.get('l7_engine', 'python'),
+                            legacy_path_enable=bool(args.get('legacy_path_enable', False)),
+                            lab_profile=args.get('lab_profile', 'off'),
+                            l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
+                            l7_capability_strict=bool(args.get("l7_capability_strict", False)),
+                            request_plan=request_plan,
+                            ssl_context=ssl_context,
+                            live_sent=sent_total,
+                            live_errors=errors_total,
+                            live_progress=progress,
+                        ))
+                        remaining -= batch_count
+                        await asyncio.sleep(0)
+                    return
+                worker_stats = _add_stats(worker_stats, await senders.websocket_sender(
+                    target_ip=args['target'],
+                    target_port=args['port'],
+                    count=args['count'],
+                    concurrency=args['ws_concurrency'],
+                    ws_path=args['ws_path'],
+                    ws_message=args['ws_message'],
+                    verbose=args['verbose'],
+                    ssl_context=ssl_context,
+                    live_sent=sent_total,
+                    live_errors=errors_total,
+                    live_progress=progress,
+                ))
+                return
+
+            if args['attack_vector'] == 'quic':
+                log_info("Initializing GPU L7 planner + CPU QUIC engine...")
+                BATCH_SIZE = int(_gpu_batch_size)
+                remaining = int(args['count'])
+                payload_engine = gpu_payload.GPUPayloadEngine(
+                    BATCH_SIZE,
+                    rng_seed=args.get("gpu_rng_seed", 1234),
+                )
+                payload_engine.load_custom_wordlists(
+                    methods=[str(args.get("quic_method", "GET") or "GET").upper()],
+                    paths=[str(args.get("quic_path", "/") or "/")],
+                    uas=[str(args.get("user_agent"))] if args.get("user_agent") else None,
+                )
+                while remaining > 0:
+                    batch_count = min(remaining, BATCH_SIZE)
+                    payload_engine.count = batch_count
+                    request_plan = payload_engine.generate_h2_request_plan(
+                        target_ip=args['target'],
+                        count=batch_count,
+                        current_time=int(time.time() * 1000),
+                    )
+                    worker_stats = _add_stats(worker_stats, await senders.quic_sender(
+                        target_ip=args['target'],
+                        target_port=args['port'],
+                        count=batch_count,
+                        concurrency=args['quic_concurrency'],
+                        quic_path=args['quic_path'],
+                        quic_method=args['quic_method'],
+                        verbose=args['verbose'],
+                        ssl_context=ssl_context,
+                        l7_quic_engine=args.get("l7_quic_engine", "auto"),
+                        l7_quic_require_native=bool(args.get("l7_quic_require_native", False)),
+                        l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
+                        l7_capability_strict=bool(args.get("l7_capability_strict", False)),
+                        lab_profile=args.get("lab_profile", "off"),
+                        quic_streams_per_conn=int(args.get("quic_streams_per_conn", 0) or 0),
+                        quic_requests_per_conn=int(args.get("quic_requests_per_conn", 0) or 0),
+                        quic_conn_pool_size=int(args.get("quic_conn_pool_size", 1) or 1),
+                        quic_expect_status_min=int(args.get("quic_expect_status_min", 200) or 200),
+                        quic_expect_status_max=int(args.get("quic_expect_status_max", 399) or 399),
+                        quic_require_response_headers=bool(args.get("quic_require_response_headers", True)),
+                        quic_require_response_body=bool(args.get("quic_require_response_body", False)),
+                        quic_min_response_body_bytes=int(args.get("quic_min_response_body_bytes", 0) or 0),
+                        request_plan=request_plan,
+                        live_sent=sent_total,
+                        live_errors=errors_total,
+                        live_progress=progress,
+                    ))
                     remaining -= batch_count
                     await asyncio.sleep(0)
                 return
