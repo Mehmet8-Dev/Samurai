@@ -1,7 +1,29 @@
 # 15 - Teknoloji Olgunluk ve Cisco TRex Fark Analizi
 
-Tarih: 2026-02-21  
+Tarih: 2026-03-07  
 Kapsam: Tam stack (`ddos_samurai/` + API + dashboard + monitoring + testler + raporlar)
+
+## Guncel Durum Notu (2026-03-07)
+
+2026-02-21 skor tablosu tarihsel referans olarak korunmustur. Mevcut kod tabanina gore one cikan degisimler:
+
+- Dataplane core API ve worker-omru session modeli devrede (`open/send_batch/snapshot/close`).
+- Dedicated profile + strict capability preflight kurallari CLI tarafinda sertlestirildi.
+- KPI gate, parity matrix ile L4/L7/QUIC metriklerini fail/warn/pass semantigine bagliyor.
+- L7 C engine tarafinda HTTP/WS/H2/QUIC route entegrasyonu genisledi; bridge/native ayrimi rapora yaziliyor.
+- GPU tarafinda stream overlap + pinned host pool + pipeline depth kontrolu olgunlasti.
+
+Guncel mimari-temelli olgunluk skoru (repo icindeki kod+entegrasyon sinyali):
+
+- Genel: `7.9 / 10`
+- L4 dataplane determinism: `7.4 / 10`
+- L7 stateful olgunluk: `7.5 / 10`
+- Gozlemlenebilirlik + KPI gate: `8.6 / 10`
+- GPU generation yetkinligi: `8.8 / 10`
+
+Kritik karsi-arguman:
+- Fallback/karma yol derinligi azalmis olsa da tamamen kaldirilmis degil.
+- Bu nedenle TRex ile parity icin "tek hot-path + hard policy" disiplini halen temel kapanacak gap olarak duruyor.
 
 ## 1) Yontem ve Veri Kaynaklari
 

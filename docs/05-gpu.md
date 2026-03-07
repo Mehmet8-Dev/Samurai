@@ -9,6 +9,20 @@ GPU yolu iki ana hedefe hizmet eder:
 
 Bu repo, GPU tarafinda Numba CUDA kernel'lari ve CuPy buffer'lari kullanir.
 
+## Guncel Durum (2026-03-07)
+
+GPU yolu iki farkli seviyede kullaniliyor:
+
+1. L4/L3 paket uretim hot-path:
+   - GPU generate (header/checksum/randomization/template mutate)
+   - GPU->host pinned copy
+   - CPU TX (TX_RING/C_EXT/Python)
+2. L7 planner path:
+   - GPU request plan/payload varyasyonu uretir
+   - Gercek state ve I/O CPU tarafinda (Python veya C state engine)
+
+Yani L7 icin "tam GPU network stack" yok; GPU burada planlama/uretme hizlandiricisi.
+
 ## Hybrid CUDA Raw Pipeline (v11)
 
 CUDA raw hattinda guncel model:
@@ -18,6 +32,13 @@ CUDA raw hattinda guncel model:
 - GPU -> CPU kopyasi pinned host pool ile yapilir
 - CPU sender (TX_RING/sendmmsg) paketleri NIC'e aktarir
 - State takibi C extension tarafinda CPU'da tutulur
+
+Pipeline overlap kontrol bayraklari:
+
+- `--gpu-stream-count`
+- `--gpu-pipeline-depth`
+- `--gpu-ring-capacity`
+- `--gpu-full-variation`
 
 ### Backpressure ve Ring
 
@@ -47,6 +68,7 @@ Orchestrator'in kullandigi ana fonksiyonlar:
 - `generate_amplification_packets(...)`
 - `generate_stateful_packets(...)`
 - `generate_fragmented_packets(...)` (not: tum flow'lar bu fonksiyonu kullanmiyor)
+- `copy_gpu_to_host_pinned(...)` (shared pinned host pool uzerinden D2H)
 
 ## Template Normalizasyon Neden Gerekli?
 
@@ -62,6 +84,14 @@ Orchestrator bu yuzden:
 
 Bu modul, bazi L7 benzeri payload uretimlerini GPU'da yapmaya yonelik bir altyapi gibi konumlanmis.
 Orchestrator icinde belirli kosullarda (ornek: belirli vector/backends) kullaniliyor.
+
+Guncel kullanim:
+
+- HTTP/1.1 fused payload uretimi
+- HTTP/2 request plan uretimi (CPU transport tarafinda tuketilir)
+- WebSocket/QUIC icin plan item alanlari (path/method/header/body varyasyonu)
+
+Not: L7 state machine (session, retry, handshake accounting) GPU'da degil, sender/l7_state_engine tarafinda.
 
 Not: GPU payload/packet tarafinda hata ayiklama icin stream synchronize, OOM handling vb. yardimci fonksiyonlar mevcut.
 

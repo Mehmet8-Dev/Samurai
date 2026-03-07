@@ -5,6 +5,15 @@
 Orchestrator, worker basina "hangi yol calisacak" kararini tek yerde toplar.
 CLI sadece processleri baslatir; is mantigi worker tarafinda dispatch edilir.
 
+## Guncel Durum (2026-03-07)
+
+Orchestrator artik yalniz dispatch yapmiyor; worker-omru context yonetimi de yapiyor:
+
+- Worker basinda `DataplaneSession` konfiguru edilip aciliyor (opsiyonel core path).
+- Sender cagri zincirine `sender_context` enjekte edilerek socket/dataplane context tekrar kullanimina izin veriliyor.
+- `dp_queue_id`, `dp_queue_strategy`, `dp_affinity_cpu` gibi queue/affinity metadata worker stats'e yaziliyor.
+- L7 senderlara `l7_engine`, `l7_fallback_policy`, `l7_capability_strict`, `lab_profile` bilgileri sistematik geciliyor.
+
 ## Giris Noktalari
 
 - `start_worker(worker_id, args, progress, progress_lock, tls_profile)`
@@ -44,7 +53,7 @@ WebSocket scenario dispatch:
 
 ### CUDA yolu
 
-CUDA akisi, GPU tarafinda paket/payload uretir; gonderim genelde `senders.raw_socket_sender` ile yapilir.
+CUDA akisi, GPU tarafinda paket/payload uretir; gonderim genelde `senders.paced_raw_socket_sender` ile yapilir.
 
 GPU modulu importu "lazy" tutulur:
 
@@ -69,6 +78,12 @@ CUDA raw/template-pool ve stateful hatlarinda worker su akisi kullanir:
 - queue: bounded ring (`--gpu-ring-capacity`, env: `SAMURAI_GPU_RING_CAPACITY`)
 - politika: queue dolunca producer block olur (drop yok)
 
+Ek overlap kontrolu:
+
+- `--gpu-stream-count`: ayni anda kac CUDA stream aktif olacagi
+- `--gpu-pipeline-depth`: ready queue su derinlige ulasinca producer'in drain etmesi
+- `--gpu-full-variation`: basic L4 varyasyonlarini CPU patch yerine GPU hot-path'te uretme tercihi
+
 Run metrikleri:
 
 - `gpu_ring_depth_peak`
@@ -85,6 +100,12 @@ CUDA worker baslangicinda C extension state engine runtime olarak konfigure edil
 
 Gonderim sonrasi `ingest_tx_packets(...)` ile paket bazli state update yapilir.
 Periyodik `sweep_state_table(...)` cagrisi timeout olan kayitlari temizler.
+
+## L7 GPU/CPU Ayrimi (Net Semantik)
+
+- L4/L3 tarafinda GPU kernel + CPU TX modeli uygulanir.
+- L7 tarafinda GPU agirlikli kisim "request/payload planlama"dir.
+- L7 state machine ve network I/O (HTTP/WS/H2/QUIC) CPU tarafinda, c_state secildiginde C engine (epoll loop) uzerinden yurutulur.
 
 ## Progress Guncellemesi
 

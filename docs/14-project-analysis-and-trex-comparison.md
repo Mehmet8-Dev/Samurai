@@ -2,6 +2,31 @@
 
 Bu doküman DDoSamurai v2.0 projesinin kapsamlı analizini ve Cisco TRex ile detaylı karşılaştırma/puanlamasını içerir.
 
+## Guncel Durum Ozeti (2026-03-07)
+
+Bu dosyadaki asagidaki bolumler tarihsel analiz kaydi olarak korunmustur. Guncel repo durumuna gore teknik ozet:
+
+- Control-plane (CLI/orchestrator) ile dataplane (dataplane_core/fast_sender/pacing/xdp) ayrimi guclendirildi.
+- Worker-omru `DataplaneSession` ve sender context reuse aktif mimari hedef haline geldi.
+- L7 tarafinda route modeli `l7.dispatch` uzerinden `c_state` onceleyecek sekilde duzenlendi.
+- QUIC path, `h3_stateful` native mod / `h3_stateful_py` bridge / `unavailable` ayrimini acikca raporluyor.
+- KPI gate (`run_quality`, `kpi_gate_*`, `score_eligible`) parity matrisi ile baglandi.
+
+Mimari-temelli guncel puan (benchmark degil, kod/entegrasyon odakli):
+
+| Boyut | DDoSamurai | TRex |
+|---|---:|---:|
+| Control-plane / dataplane ayrimi | 8.2 | 9.6 |
+| L4 hot-path determinism | 7.4 | 9.7 |
+| L4 telemetry + gate disiplini | 8.6 | 9.0 |
+| L7 stateful engine mimarisi | 7.5 | 8.8 |
+| GPU-assisted packet generation | 8.8 | 5.5 |
+| Genel teknik olgunluk | 7.9 | 9.3 |
+
+Not:
+- DDoSamurai'nin guclu farki GPU-assisted generation ve vektor cesitliligidir.
+- TRex'in guclu farki tek dataplane disiplini ve olgun L4 performans hattidir.
+
 ---
 
 ## BÖLÜM 1: DDoSamurai Proje Analizi

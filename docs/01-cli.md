@@ -4,6 +4,38 @@
 
 `ddos_samurai/cli.py`, tum calistirma parametrelerini tek yerde toplar ve worker'lara dagitilacak "args snapshot" olusturur.
 
+## Guncel Durum (2026-03-07)
+
+CLI tarafi artik yalniz parser degil, ayni zamanda profile-aware preflight katmanidir.
+
+- Dataplane route kontrolu:
+  - `--sender-backend {auto,txring,c_ext_l3,python,xdp}`
+  - `--sender-fallback-policy {allow,fail}`
+  - `--lab-profile {off,dedicated}`
+  - `--dp-queue-strategy {rr,pin,map}`, `--dp-queues`, `--dp-queue-map`
+- KPI gate:
+  - `--kpi-gate-profile {off,developer_fallback,dedicated_lab}`
+  - `--kpi-hard-fail`
+- L7 engine route:
+  - `--l7-engine {python,c_state}`
+  - `--l7-http2-engine {python,c_state,auto}`
+  - `--l7-quic-engine {python,c_state,auto}`
+  - `--l7-capability-strict`
+  - `--l7-quic-require-native`
+  - `--legacy-path-enable`
+- GPU pipeline:
+  - `--gpu-ring-capacity`, `--gpu-stream-count`, `--gpu-pipeline-depth`
+  - `--gpu-full-variation`
+
+Dedicated profil (`--lab-profile dedicated`) secildiginde CLI otomatik olarak:
+
+- `kpi_gate_profile=dedicated_lab`
+- `kpi_hard_fail=true`
+- `l7_capability_strict=true`
+- QUIC vektorunde `l7_quic_require_native=true`
+
+ve queue/NIC preflight kontrollerini kosmadan run baslatmaz.
+
 ## Onemli Fonksiyonlar
 
 - `build_parser()`: tum bayraklari/opsiyonlari tanimlar.
@@ -71,3 +103,12 @@ Run report input snapshot alanlari da guncellendi:
 
 - `ws_scenario`
 - `h2_transport`
+
+## Not
+
+Bu dosyada listelenen eski bayraklar halen gecerli olsa da, benchmark/disiplinli run semantigi icin asagidaki yeni eksenler artik birincil kabul edilmelidir:
+
+- sender backend + fallback policy
+- lab profile + queue strategy
+- KPI gate profile + hard fail
+- L7 capability strict + native QUIC zorunlulugu

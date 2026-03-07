@@ -6,7 +6,18 @@ Sender katmani, "uretilmis bir seyi hedefe iletme" sorumlulugunu tasir.
 Bu, iki ana gruba ayrilir:
 
 - Paket tabanli (L3/L2): Scapy / raw socket / C extension / AF_XDP
-- Uygulama tabanli (L7): httpx, websockets, aioquic
+- Uygulama tabanli (L7): c_state engine + Python legacy (httpx/websockets/aioquic)
+
+## Guncel Durum (2026-03-07)
+
+L4 tarafinda oncelik artik `dataplane_core` + explicit backend politikasidir.
+L7 tarafinda oncelik `l7.dispatch` ile c_state route edilmis engine yoludur.
+
+Ana semantik:
+
+- Route karari `allow/fail` fallback policy ile birlikte degerlendirilir.
+- Dedicated + strict profilde fallback kapisi kapanir.
+- Sonuc metrikleri `sender_path`, `sender_fallback_reason`, `l7_engine_path_used`, `quic_stack_mode` alanlariyla rapora tasinir.
 
 ## CPU Paket Sender (Scapy)
 
@@ -20,6 +31,8 @@ Not: Fragmentation karari builder'da degil sender'da uygulanir (builder tek pake
 ## Raw Socket Sender (L3/L2 Fast Path)
 
 - `raw_socket_sender(packets_buffer, target_ip, target_port, count, verbose, ..., force_l2=False)`
+  - Varsa once worker context icindeki `dataplane_session.send_batch(...)` cagrilir.
+  - Batch dataplane core tarafinda handle edilirse Python zinciri calistirilmaz.
   - `socket.SOCK_RAW` uzerinden L3 gonderim (genelde root ister).
   - Varsa `fast_sender` C eklentisi ile hizli gonderim:
     - `send_ring_optimized`: L2 TX_RING (Ether header gerekir)
@@ -30,6 +43,15 @@ Not: Fragmentation karari builder'da degil sender'da uygulanir (builder tek pake
 
 - L2 yolu kullanilamazsa sessiz L3 fallback yapmaz.
 - `sender_path=L2_UNAVAILABLE` ile fail-visible sonuc doner.
+
+Fallback zinciri (ozet):
+
+1. `dataplane_core` (enable ise)
+2. `TX_RING_L2`
+3. `C_EXT_L3`
+4. `PYTHON_SENDMMSG`/`PYTHON_SENDTO`
+
+`sender_fallback_policy=fail` oldugunda zincir erken kesilir.
 
 `packets_buffer` beklenen format:
 
@@ -52,6 +74,13 @@ Bu sebeple GPU tarafinda paketlerin sabit boyda uretilmesi kritik.
 - WebSocket Stateful Scenario: `websocket_scenario_sender` (auth -> subscribe -> ping/pong)
 - QUIC/HTTP3: `quic_sender` (aioquic)
 - Slow-* akislari: `slow_attack_sender` (baglanti/soket davranisi)
+
+Guncel route modeli:
+
+- `http_stateful_sender`, `websocket_scenario_sender`, `http2_sender`, `quic_sender`
+  once `l7.dispatch` + `l7.c_adapter` ile c_state yolunu dener.
+- `l7_capability_strict=true` veya dedicated profile altinda Python fallback kapatilabilir.
+- QUIC icin `l7_quic_require_native` etkinse py bridge kabul edilmez.
 
 Bu akislarda profil semantigi aciktir:
 
@@ -85,6 +114,8 @@ Ek HTTP/2 transport metri gi:
 
 Not: `hyper-h2` implementation detaylari `ddos_samurai/h2_transport.py` icindedir.
 
+Not: C state engine secildiginde HTTP/2 sender route karari Python transporttan once yapilir.
+
 ### HTTP Stateful Sender (Faz 2)
 
 `http_stateful_sender`:
@@ -112,6 +143,18 @@ Ek stats:
 - `ws_ping_sent`
 - `ws_pong_received`
 - `ws_scenario_enabled`
+
+C state mode'da ayni senaryo semantigi C engine'e aktarilir; C fail durumunda policy izin verirse Python path'e donulur.
+
+### QUIC Sender (Native/Bridge/Legacy)
+
+`quic_sender` icinde uc durum vardir:
+
+1. C native `h3_stateful` (tercihli)
+2. C route + py bridge (`h3_stateful_py`) sadece policy izin veriyorsa
+3. Python legacy aioquic path
+
+`l7_quic_require_native=true` oldugunda 2 ve 3 kabul edilmez; fail-visible donus uretilir.
 
 ## Sender Path Secimi ve Fallback Karar Agaci (trex_path)
 
