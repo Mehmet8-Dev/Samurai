@@ -3603,6 +3603,14 @@ async def quic_sender(
     l7_fallback_policy="allow",
     l7_capability_strict=False,
     lab_profile="off",
+    quic_streams_per_conn=0,
+    quic_requests_per_conn=0,
+    quic_conn_pool_size=1,
+    quic_expect_status_min=200,
+    quic_expect_status_max=399,
+    quic_require_response_headers=True,
+    quic_require_response_body=False,
+    quic_min_response_body_bytes=0,
     live_sent=None,
     live_errors=None,
     live_progress=None,
@@ -3623,27 +3631,63 @@ async def quic_sender(
             lab_profile=str(lab_profile or "off"),
         )
     )
+    lab_profile_norm = str(lab_profile or "off").strip().lower()
+    require_native_effective = bool(l7_quic_require_native) or (
+        lab_profile_norm == "dedicated" and bool(l7_capability_strict)
+    )
     c_fallback_reason = "none"
     verify_tls = bool(quic_verify and ssl_context is None)
+    if require_native_effective and route.engine != "c_state":
+        return _stats(
+            **_normalize_l7_output(
+                {
+                    "attempted": count,
+                    "sent": 0,
+                    "errors": count,
+                    "sender_path": "C_STATE_QUIC_NATIVE_REQUIRED",
+                    "sender_fallback_reason": "quic_native_required_route_mismatch",
+                },
+                attempted_default=count,
+                sender_path="C_STATE_QUIC_NATIVE_REQUIRED",
+                engine_path_used=route.l7_engine_path_used,
+                fallback_reason="quic_native_required_route_mismatch",
+                route=route,
+            )
+        )
+
     if route.engine == "c_state":
+        c_extra = {
+            "quic_path": str(quic_path or "/"),
+            "quic_method": str(quic_method or "GET"),
+            "scheme": "https",
+            "verify": bool(verify_tls),
+            "require_native_quic": 1 if bool(require_native_effective) else 0,
+            "retries": int(retries or 0),
+            "timeout_s": float(timeout_s or 3.0),
+            "quic_streams_per_conn": int(quic_streams_per_conn or 0),
+            "quic_requests_per_conn": int(quic_requests_per_conn or 0),
+            "quic_conn_pool_size": int(quic_conn_pool_size or 1),
+            "quic_expect_status_min": int(quic_expect_status_min or 200),
+            "quic_expect_status_max": int(quic_expect_status_max or 399),
+            "quic_require_response_headers": 1 if bool(quic_require_response_headers) else 0,
+            "quic_require_response_body": 1 if bool(quic_require_response_body) else 0,
+            "quic_min_response_body_bytes": int(quic_min_response_body_bytes or 0),
+        }
+        if require_native_effective:
+            c_extra["enable_quic_py_bridge"] = 0
         c_cfg = l7_c_adapter.make_config(
             target_ip=str(target_ip),
             target_port=int(target_port or 0),
             count=int(count or 0),
             concurrency=int(concurrency or 1),
             mode="quic_stateful",
-            extra={
-                "quic_path": str(quic_path or "/"),
-                "quic_method": str(quic_method or "GET"),
-                "scheme": "https",
-                "verify": bool(verify_tls),
-                "require_native_quic": 1 if bool(l7_quic_require_native) else 0,
-                "retries": int(retries or 0),
-                "timeout_s": float(timeout_s or 3.0),
-            },
+            extra=c_extra,
         )
         c_res = await l7_c_adapter.run("quic", c_cfg)
-        if l7_legacy.should_return_c_result(c_res, allow_python_fallback=route.allow_python_fallback):
+        if l7_legacy.should_return_c_result(
+            c_res,
+            allow_python_fallback=(route.allow_python_fallback and not bool(require_native_effective)),
+        ):
             c_stats = _normalize_l7_output(
                 c_res.as_stats(),
                 attempted_default=count,
@@ -3657,6 +3701,17 @@ async def quic_sender(
             _update_live(live_errors, int(c_stats.get("errors", 0) or 0))
             return _stats(**c_stats)
         c_fallback_reason = str(getattr(c_res, "sender_fallback_reason", "none") or "none")
+        if require_native_effective:
+            return _stats(
+                **_normalize_l7_output(
+                    c_res.as_stats(),
+                    attempted_default=count,
+                    sender_path="C_STATE_QUIC_NATIVE_REQUIRED",
+                    engine_path_used=route.l7_engine_path_used,
+                    fallback_reason=c_fallback_reason,
+                    route=route,
+                )
+            )
         log_warning(
             "L7 c_state QUIC engine unavailable/failed; "
             f"Python QUIC path fallback enabled (reason={c_fallback_reason})."

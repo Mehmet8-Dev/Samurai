@@ -71,6 +71,14 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--ninja-mode", opts)
         self.assertIn("--ws-path", opts)
         self.assertIn("--quic-path", opts)
+        self.assertIn("--quic-streams-per-conn", opts)
+        self.assertIn("--quic-requests-per-conn", opts)
+        self.assertIn("--quic-conn-pool-size", opts)
+        self.assertIn("--quic-expect-status-min", opts)
+        self.assertIn("--quic-expect-status-max", opts)
+        self.assertIn("--quic-require-response-headers", opts)
+        self.assertIn("--quic-require-response-body", opts)
+        self.assertIn("--quic-min-response-body-bytes", opts)
         self.assertIn("--tls-profile", opts)
         self.assertIn("--h2-profile", opts)
         self.assertIn("--ja3-profile", opts)
@@ -128,6 +136,14 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.l7_http2_engine, "auto")
         self.assertEqual(args.l7_quic_engine, "auto")
         self.assertFalse(args.l7_quic_require_native)
+        self.assertEqual(args.quic_streams_per_conn, 0)
+        self.assertEqual(args.quic_requests_per_conn, 0)
+        self.assertEqual(args.quic_conn_pool_size, 1)
+        self.assertEqual(args.quic_expect_status_min, 200)
+        self.assertEqual(args.quic_expect_status_max, 399)
+        self.assertTrue(args.quic_require_response_headers)
+        self.assertFalse(args.quic_require_response_body)
+        self.assertEqual(args.quic_min_response_body_bytes, 0)
         self.assertEqual(args.l7_fallback_policy, "allow")
         self.assertFalse(args.l7_capability_strict)
         self.assertFalse(args.legacy_path_enable)
@@ -310,6 +326,16 @@ class TestSenderRouteValidation(unittest.TestCase):
         )
         self._assert_validation_fails(parser, args)
 
+    def test_quic_expect_status_range_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--quic-expect-status-min", "500", "--quic-expect-status-max", "399"])
+        self._assert_validation_fails(parser, args)
+
+    def test_quic_conn_pool_size_must_be_positive(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--quic-conn-pool-size", "0"])
+        self._assert_validation_fails(parser, args)
+
     def test_sender_route_accepts_explicit_xdp_config(self):
         parser = cli.build_parser()
         args = parser.parse_args(
@@ -401,6 +427,25 @@ class TestL7CapabilityPreflight(unittest.TestCase):
             },
         ):
             cli._preflight_l7_capabilities(parser, args)
+
+    def test_dedicated_strict_quic_rejects_h3_stateful_py_without_explicit_flag(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            ["--attack-vector", "quic", "--lab-profile", "dedicated", "--l7-capability-strict", "--l7-quic-engine", "c_state"]
+        )
+        with patch(
+            "ddos_samurai.l7.c_adapter.capability_map",
+            return_value={
+                "core_available": True,
+                "http1": True,
+                "ws": True,
+                "http2": True,
+                "quic": True,
+                "quic_stack_mode": "h3_stateful_py",
+                "quic_h3_stateful": True,
+            },
+        ):
+            self._assert_preflight_fails(parser, args)
 
     def test_capability_strict_quic_require_native_rejects_h3_stateful_py_mode(self):
         parser = cli.build_parser()

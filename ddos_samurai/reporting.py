@@ -638,6 +638,14 @@ def build_live_attack_report(
     quic_stream_fail_ratio_weight = 0
     quic_handshake_fail_ratio_weighted_sum = 0.0
     quic_handshake_fail_ratio_weight = 0
+    quic_response_headers_ok_count_total = 0
+    quic_response_body_ok_count_total = 0
+    quic_response_validation_fail_count_total = 0
+    quic_response_validation_fail_ratio_weighted_sum = 0.0
+    quic_response_validation_fail_ratio_weight = 0
+    quic_connection_attempts_total = 0
+    quic_conn_pool_size_max = 1
+    quic_stack_mode = ""
     dp_queue_ids_used: set[int] = set()
     dp_affinity_cpus_used: set[int] = set()
     dp_queue_strategy = "unknown"
@@ -1078,17 +1086,43 @@ def build_live_attack_report(
         quic_stream_fail_count_total += int(
             ev.get("quic_stream_fail_count", st.get("quic_stream_fail_count", 0)) or 0
         )
+        quic_response_headers_ok_count_total += int(
+            ev.get("quic_response_headers_ok_count", st.get("quic_response_headers_ok_count", 0)) or 0
+        )
+        quic_response_body_ok_count_total += int(
+            ev.get("quic_response_body_ok_count", st.get("quic_response_body_ok_count", 0)) or 0
+        )
+        quic_response_validation_fail_count_total += int(
+            ev.get("quic_response_validation_fail_count", st.get("quic_response_validation_fail_count", 0)) or 0
+        )
+        quic_connection_attempts_total += int(
+            ev.get("quic_connection_attempts", st.get("quic_connection_attempts", 0)) or 0
+        )
+        _quic_pool = int(ev.get("quic_conn_pool_size", st.get("quic_conn_pool_size", 1)) or 1)
+        if _quic_pool > quic_conn_pool_size_max:
+            quic_conn_pool_size_max = _quic_pool
+        _quic_stack_mode_item = str(ev.get("quic_stack_mode", st.get("quic_stack_mode", "")) or "").strip()
+        if _quic_stack_mode_item:
+            if not quic_stack_mode:
+                quic_stack_mode = _quic_stack_mode_item
+            elif quic_stack_mode != _quic_stack_mode_item and quic_stack_mode != "mixed":
+                quic_stack_mode = "mixed"
         _quic_stream_fail_ratio = float(
             ev.get("quic_stream_fail_ratio", st.get("quic_stream_fail_ratio", 0.0)) or 0.0
         )
         _quic_handshake_fail_ratio = float(
             ev.get("quic_handshake_fail_ratio", st.get("quic_handshake_fail_ratio", 0.0)) or 0.0
         )
+        _quic_validation_fail_ratio = float(
+            ev.get("quic_response_validation_fail_ratio", st.get("quic_response_validation_fail_ratio", 0.0)) or 0.0
+        )
         if attempted > 0:
             quic_stream_fail_ratio_weighted_sum += (_quic_stream_fail_ratio * attempted)
             quic_stream_fail_ratio_weight += attempted
             quic_handshake_fail_ratio_weighted_sum += (_quic_handshake_fail_ratio * attempted)
             quic_handshake_fail_ratio_weight += attempted
+            quic_response_validation_fail_ratio_weighted_sum += (_quic_validation_fail_ratio * attempted)
+            quic_response_validation_fail_ratio_weight += attempted
         _bp = int(ev.get("queue_backlog_peak", 0) or 0)
         if _bp > backlog_peak_max:
             backlog_peak_max = _bp
@@ -1156,6 +1190,14 @@ def build_live_attack_report(
     quic_handshake_fail_ratio = (
         float(quic_handshake_fail_ratio_weighted_sum) / float(quic_handshake_fail_ratio_weight)
     ) if quic_handshake_fail_ratio_weight > 0 else 0.0
+    quic_response_validation_fail_ratio = (
+        float(quic_response_validation_fail_ratio_weighted_sum) / float(quic_response_validation_fail_ratio_weight)
+    ) if quic_response_validation_fail_ratio_weight > 0 else 0.0
+    l7_fail_budget_pct = (
+        max(0.0, (1.0 - float(session_success_rate)) * 100.0)
+        if session_success_rate_weight > 0
+        else 0.0
+    )
     txring_tp_drops_bounded_total = min(
         int(txring_tp_drops_total),
         int(txring_tp_packets_total),
@@ -1405,6 +1447,7 @@ def build_live_attack_report(
             "l7_step_fail_ratio": round(float(l7_step_fail_ratio), 6),
             "session_success_rate": round(float(session_success_rate), 6),
             "retry_success_rate": round(float(retry_success_rate), 6),
+            "l7_fail_budget_pct": round(float(l7_fail_budget_pct), 6),
             "l7_engine_path_used": str(l7_engine_path_used),
             "l7_fallback_reason": str(l7_fallback_reason),
             "l7_capability_status": str(l7_capability_status),
@@ -1421,6 +1464,13 @@ def build_live_attack_report(
             "quic_stream_fail_count": int(quic_stream_fail_count_total),
             "quic_stream_fail_ratio": round(float(quic_stream_fail_ratio), 6),
             "quic_handshake_fail_ratio": round(float(quic_handshake_fail_ratio), 6),
+            "quic_response_headers_ok_count": int(quic_response_headers_ok_count_total),
+            "quic_response_body_ok_count": int(quic_response_body_ok_count_total),
+            "quic_response_validation_fail_count": int(quic_response_validation_fail_count_total),
+            "quic_response_validation_fail_ratio": round(float(quic_response_validation_fail_ratio), 6),
+            "quic_connection_attempts": int(quic_connection_attempts_total),
+            "quic_conn_pool_size": int(quic_conn_pool_size_max),
+            "quic_stack_mode": str(quic_stack_mode),
             "dp_queue_ids_used": sorted(int(x) for x in list(dp_queue_ids_used)),
             "dp_affinity_cpus_used": sorted(int(x) for x in list(dp_affinity_cpus_used)),
             "dp_queue_strategy": str(dp_queue_strategy or "unknown"),

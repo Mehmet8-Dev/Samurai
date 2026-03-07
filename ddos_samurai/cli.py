@@ -52,6 +52,18 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _arg_bool(value):
+    """argparse bool parser that accepts common true/false spellings."""
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("Boolean değer bekleniyor: true/false")
+
+
 def _is_cuda_raw_vector(args: argparse.Namespace) -> bool:
     """Return True when the selected route uses raw socket sending on CUDA path."""
     if str(getattr(args, "compute_backend", "cpu") or "cpu").strip().lower() != "cuda":
@@ -295,6 +307,14 @@ def _report_inputs_from_args(args) -> dict:
         "l7_http2_engine": str(getattr(args, "l7_http2_engine", "auto")),
         "l7_quic_engine": str(getattr(args, "l7_quic_engine", "auto")),
         "l7_quic_require_native": bool(getattr(args, "l7_quic_require_native", False)),
+        "quic_streams_per_conn": int(getattr(args, "quic_streams_per_conn", 0) or 0),
+        "quic_requests_per_conn": int(getattr(args, "quic_requests_per_conn", 0) or 0),
+        "quic_conn_pool_size": int(getattr(args, "quic_conn_pool_size", 1) or 1),
+        "quic_expect_status_min": int(getattr(args, "quic_expect_status_min", 200) or 200),
+        "quic_expect_status_max": int(getattr(args, "quic_expect_status_max", 399) or 399),
+        "quic_require_response_headers": bool(getattr(args, "quic_require_response_headers", True)),
+        "quic_require_response_body": bool(getattr(args, "quic_require_response_body", False)),
+        "quic_min_response_body_bytes": int(getattr(args, "quic_min_response_body_bytes", 0) or 0),
         "l7_fallback_policy": str(getattr(args, "l7_fallback_policy", "allow")),
         "l7_capability_strict": bool(getattr(args, "l7_capability_strict", False)),
         "legacy_path_enable": bool(getattr(args, "legacy_path_enable", False)),
@@ -413,6 +433,22 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: --l7-session-repeats >= 1 olmalıdır.")
     if int(getattr(args, "l7_max_active_sessions", 0) or 0) < 0:
         parser.error("Hata: --l7-max-active-sessions >= 0 olmalıdır.")
+    if int(getattr(args, "quic_streams_per_conn", 0) or 0) < 0:
+        parser.error("Hata: --quic-streams-per-conn >= 0 olmalıdır.")
+    if int(getattr(args, "quic_requests_per_conn", 0) or 0) < 0:
+        parser.error("Hata: --quic-requests-per-conn >= 0 olmalıdır.")
+    if int(getattr(args, "quic_conn_pool_size", 1) or 0) < 1:
+        parser.error("Hata: --quic-conn-pool-size >= 1 olmalıdır.")
+    q_status_min = int(getattr(args, "quic_expect_status_min", 200) or 0)
+    q_status_max = int(getattr(args, "quic_expect_status_max", 399) or 0)
+    if q_status_min < 100 or q_status_min > 599:
+        parser.error("Hata: --quic-expect-status-min 100..599 aralığında olmalıdır.")
+    if q_status_max < 100 or q_status_max > 599:
+        parser.error("Hata: --quic-expect-status-max 100..599 aralığında olmalıdır.")
+    if q_status_max < q_status_min:
+        parser.error("Hata: --quic-expect-status-max, --quic-expect-status-min değerinden küçük olamaz.")
+    if int(getattr(args, "quic_min_response_body_bytes", 0) or 0) < 0:
+        parser.error("Hata: --quic-min-response-body-bytes >= 0 olmalıdır.")
     if (xdp_enable or sender_backend == "xdp") and not xdp_interface:
         parser.error("Hata: XDP yolu için --xdp-interface zorunludur.")
     if fallback_policy == "fail" and sender_backend == "auto":
@@ -511,6 +547,12 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
     if not bool(getattr(args, "l7_capability_strict", False)):
         args.l7_capability_strict = True
         utils.log_info("lab-profile=dedicated için --l7-capability-strict otomatik etkinleştirildi.")
+    if (
+        str(getattr(args, "attack_vector", "basic") or "basic").strip().lower() == "quic"
+        and not bool(getattr(args, "l7_quic_require_native", False))
+    ):
+        args.l7_quic_require_native = True
+        utils.log_info("lab-profile=dedicated + QUIC için --l7-quic-require-native otomatik etkinleştirildi.")
 
     workers = int(getattr(args, "workers", multiprocessing.cpu_count()) or 0)
     dp_queues = int(getattr(args, "dp_queues", 1) or 1)
@@ -562,7 +604,7 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
     capability_strict = bool(getattr(args, "l7_capability_strict", False))
     legacy_path_enable = bool(getattr(args, "legacy_path_enable", False))
     lab_profile = str(getattr(args, "lab_profile", "off") or "off")
-    quic_require_native = bool(getattr(args, "l7_quic_require_native", False))
+    quic_require_native = bool(getattr(args, "l7_quic_require_native", False)) or (dedicated and capability_strict)
 
     def _check(protocol: str, *, protocol_engine: str, global_engine: str, legacy: bool, hint: str) -> None:
         route = _l7_dispatch.build_route_decision(
@@ -730,6 +772,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quic-path", type=str, default="/", help="QUIC/HTTP3 vektörü için istek yolu")
     parser.add_argument("--quic-method", type=str, default="GET", help="QUIC/HTTP3 vektörü için HTTP metodu")
     parser.add_argument("--quic-concurrency", type=int, default=50, help="QUIC/HTTP3 vektörü eşzamanlı istek sayısı")
+    parser.add_argument("--quic-streams-per-conn", type=int, default=0, help="Native QUIC için bağlantı başına eşzamanlı stream (0=concurrency tabanlı auto)")
+    parser.add_argument("--quic-requests-per-conn", type=int, default=0, help="Native QUIC için bağlantı başına toplam istek (0=tek bağlantıda mümkün olduğunca çok)")
+    parser.add_argument("--quic-conn-pool-size", type=int, default=1, help="Worker başına native QUIC bağlantı havuzu boyutu")
+    parser.add_argument("--quic-expect-status-min", type=int, default=200, help="Native QUIC response status alt sınırı")
+    parser.add_argument("--quic-expect-status-max", type=int, default=399, help="Native QUIC response status üst sınırı")
+    parser.add_argument("--quic-require-response-headers", type=_arg_bool, nargs="?", const=True, default=True, help="Native QUIC response header/status doğrulaması zorunlu (true/false)")
+    parser.add_argument("--quic-require-response-body", action="store_true", help="Native QUIC için response body gelmesi zorunlu")
+    parser.add_argument("--quic-min-response-body-bytes", type=int, default=0, help="Native QUIC response body minimum byte eşiği")
     parser.add_argument("--slowloris-concurrency", type=int, default=200, help="Slowloris vektörü eşzamanlı bağlantı sayısı")
     parser.add_argument("--stealth-mode", action="store_true", help="DEPRECATED (no-op): kaldırılacak")
     parser.add_argument("--payload-mutation", action="store_true", help="Payload mutation - her istekte payload'u değiştir")

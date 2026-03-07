@@ -156,6 +156,13 @@ def _empty_stats() -> dict:
         "quic_stream_fail_count": 0,
         "quic_stream_fail_ratio": 0.0,
         "quic_handshake_fail_ratio": 0.0,
+        "quic_response_headers_ok_count": 0,
+        "quic_response_body_ok_count": 0,
+        "quic_response_validation_fail_count": 0,
+        "quic_response_validation_fail_ratio": 0.0,
+        "quic_connection_attempts": 0,
+        "quic_conn_pool_size": 1,
+        "quic_stack_mode": "",
         "dp_queue_id": -1,
         "dp_queue_strategy": "unknown",
         "dp_affinity_cpu": -1,
@@ -526,12 +533,33 @@ def _add_stats(acc: dict, item: dict) -> dict:
     acc["quic_tls_fail_count"] = int(acc.get("quic_tls_fail_count", 0)) + int(item.get("quic_tls_fail_count", 0) or 0)
     acc["quic_handshake_timeout_count"] = int(acc.get("quic_handshake_timeout_count", 0)) + int(item.get("quic_handshake_timeout_count", 0) or 0)
     acc["quic_stream_fail_count"] = int(acc.get("quic_stream_fail_count", 0)) + int(item.get("quic_stream_fail_count", 0) or 0)
+    acc["quic_response_headers_ok_count"] = int(acc.get("quic_response_headers_ok_count", 0)) + int(item.get("quic_response_headers_ok_count", 0) or 0)
+    acc["quic_response_body_ok_count"] = int(acc.get("quic_response_body_ok_count", 0)) + int(item.get("quic_response_body_ok_count", 0) or 0)
+    acc["quic_response_validation_fail_count"] = int(acc.get("quic_response_validation_fail_count", 0)) + int(item.get("quic_response_validation_fail_count", 0) or 0)
+    acc["quic_connection_attempts"] = int(acc.get("quic_connection_attempts", 0)) + int(item.get("quic_connection_attempts", 0) or 0)
+    acc["quic_conn_pool_size"] = max(
+        int(acc.get("quic_conn_pool_size", 1) or 1),
+        int(item.get("quic_conn_pool_size", 1) or 1),
+    )
     item_quic_stream_fail_ratio = float(item.get("quic_stream_fail_ratio", 0.0) or 0.0)
     if item_quic_stream_fail_ratio > 0.0 or float(acc.get("quic_stream_fail_ratio", 0.0) or 0.0) == 0.0:
         acc["quic_stream_fail_ratio"] = item_quic_stream_fail_ratio
     item_quic_handshake_fail_ratio = float(item.get("quic_handshake_fail_ratio", 0.0) or 0.0)
     if item_quic_handshake_fail_ratio > 0.0 or float(acc.get("quic_handshake_fail_ratio", 0.0) or 0.0) == 0.0:
         acc["quic_handshake_fail_ratio"] = item_quic_handshake_fail_ratio
+    item_quic_response_validation_fail_ratio = float(item.get("quic_response_validation_fail_ratio", 0.0) or 0.0)
+    if (
+        item_quic_response_validation_fail_ratio > 0.0
+        or float(acc.get("quic_response_validation_fail_ratio", 0.0) or 0.0) == 0.0
+    ):
+        acc["quic_response_validation_fail_ratio"] = item_quic_response_validation_fail_ratio
+    item_quic_stack_mode = str(item.get("quic_stack_mode", "") or "").strip()
+    if item_quic_stack_mode:
+        current_quic_stack_mode = str(acc.get("quic_stack_mode", "") or "").strip()
+        if not current_quic_stack_mode:
+            acc["quic_stack_mode"] = item_quic_stack_mode
+        elif current_quic_stack_mode != item_quic_stack_mode and current_quic_stack_mode != "mixed":
+            acc["quic_stack_mode"] = "mixed"
     item_dp_queue_id = int(item.get("dp_queue_id", -1) or -1)
     if item_dp_queue_id >= 0:
         current_dp_queue_id = int(acc.get("dp_queue_id", -1) or -1)
@@ -2042,6 +2070,14 @@ async def worker_process(
                 l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
                 l7_capability_strict=bool(args.get("l7_capability_strict", False)),
                 lab_profile=args.get("lab_profile", "off"),
+                quic_streams_per_conn=int(args.get("quic_streams_per_conn", 0) or 0),
+                quic_requests_per_conn=int(args.get("quic_requests_per_conn", 0) or 0),
+                quic_conn_pool_size=int(args.get("quic_conn_pool_size", 1) or 1),
+                quic_expect_status_min=int(args.get("quic_expect_status_min", 200) or 200),
+                quic_expect_status_max=int(args.get("quic_expect_status_max", 399) or 399),
+                quic_require_response_headers=bool(args.get("quic_require_response_headers", True)),
+                quic_require_response_body=bool(args.get("quic_require_response_body", False)),
+                quic_min_response_body_bytes=int(args.get("quic_min_response_body_bytes", 0) or 0),
                 live_sent=sent_total,
                 live_errors=errors_total,
                 live_progress=progress
@@ -2563,6 +2599,15 @@ async def worker_process(
                 _quic_stream_fail_count = int(worker_stats.get("quic_stream_fail_count", 0) or 0)
                 _quic_stream_fail_ratio = float(worker_stats.get("quic_stream_fail_ratio", 0.0) or 0.0)
                 _quic_handshake_fail_ratio = float(worker_stats.get("quic_handshake_fail_ratio", 0.0) or 0.0)
+                _quic_response_headers_ok_count = int(worker_stats.get("quic_response_headers_ok_count", 0) or 0)
+                _quic_response_body_ok_count = int(worker_stats.get("quic_response_body_ok_count", 0) or 0)
+                _quic_response_validation_fail_count = int(worker_stats.get("quic_response_validation_fail_count", 0) or 0)
+                _quic_response_validation_fail_ratio = float(
+                    worker_stats.get("quic_response_validation_fail_ratio", 0.0) or 0.0
+                )
+                _quic_connection_attempts = int(worker_stats.get("quic_connection_attempts", 0) or 0)
+                _quic_conn_pool_size = int(worker_stats.get("quic_conn_pool_size", 1) or 1)
+                _quic_stack_mode = str(worker_stats.get("quic_stack_mode", "") or "")
                 _dp_queue_id = int(worker_stats.get("dp_queue_id", -1) or -1)
                 _dp_queue_strategy = str(worker_stats.get("dp_queue_strategy", "rr") or "rr")
                 _dp_affinity_cpu = int(worker_stats.get("dp_affinity_cpu", -1) or -1)
@@ -2693,6 +2738,13 @@ async def worker_process(
                         "quic_stream_fail_count": _quic_stream_fail_count,
                         "quic_stream_fail_ratio": _quic_stream_fail_ratio,
                         "quic_handshake_fail_ratio": _quic_handshake_fail_ratio,
+                        "quic_response_headers_ok_count": _quic_response_headers_ok_count,
+                        "quic_response_body_ok_count": _quic_response_body_ok_count,
+                        "quic_response_validation_fail_count": _quic_response_validation_fail_count,
+                        "quic_response_validation_fail_ratio": _quic_response_validation_fail_ratio,
+                        "quic_connection_attempts": _quic_connection_attempts,
+                        "quic_conn_pool_size": _quic_conn_pool_size,
+                        "quic_stack_mode": _quic_stack_mode,
                         "dp_queue_id": _dp_queue_id,
                         "dp_queue_strategy": _dp_queue_strategy,
                         "dp_affinity_cpu": _dp_affinity_cpu,
