@@ -46,6 +46,11 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "session_success_rate_min": 95.0,
         "retry_success_rate_min": 70.0,
         "l7_step_fail_ratio_max": 0.05,
+        "l7_handshake_p99_ms_max": 750.0,
+        "l7_fail_budget_pct_max": 5.0,
+        "quic_stream_fail_ratio_max": 0.10,
+        "quic_handshake_fail_ratio_max": 0.10,
+        "quic_response_validation_fail_ratio_max": 0.10,
     },
     "dedicated_lab": {
         "run_quality": "valid",
@@ -58,6 +63,12 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "session_success_rate_min": 99.0,
         "retry_success_rate_min": 90.0,
         "l7_step_fail_ratio_max": 0.01,
+        "l7_handshake_p99_ms_max": 250.0,
+        "l7_fail_budget_pct_max": 1.0,
+        "quic_stream_fail_ratio_max": 0.01,
+        "quic_handshake_fail_ratio_max": 0.01,
+        "quic_response_validation_fail_ratio_max": 0.01,
+        "quic_stack_mode_required": "h3_stateful",
     },
 }
 
@@ -116,6 +127,18 @@ def _merge_gate_defaults(profile: str, parity_matrix_path: Optional[str] = None)
         base["txring_hold_block_pressure_pct_max"] = parity["txring_hold_block_pressure_pct_max"]
     if "l7_step_fail_ratio_max" in parity:
         base["l7_step_fail_ratio_max"] = parity["l7_step_fail_ratio_max"]
+    if "l7_handshake_p99_ms_max" in parity:
+        base["l7_handshake_p99_ms_max"] = parity["l7_handshake_p99_ms_max"]
+    if "l7_fail_budget_pct_max" in parity:
+        base["l7_fail_budget_pct_max"] = parity["l7_fail_budget_pct_max"]
+    if "quic_stream_fail_ratio_max" in parity:
+        base["quic_stream_fail_ratio_max"] = parity["quic_stream_fail_ratio_max"]
+    if "quic_handshake_fail_ratio_max" in parity:
+        base["quic_handshake_fail_ratio_max"] = parity["quic_handshake_fail_ratio_max"]
+    if "quic_response_validation_fail_ratio_max" in parity:
+        base["quic_response_validation_fail_ratio_max"] = parity["quic_response_validation_fail_ratio_max"]
+    if "quic_stack_mode_required" in parity:
+        base["quic_stack_mode_required"] = parity["quic_stack_mode_required"]
     return base
 
 
@@ -127,7 +150,7 @@ def _to_float(value: Any) -> Optional[float]:
 
 
 def _build_rules(gates: Dict[str, Any]) -> List[KpiGateRule]:
-    return [
+    rules: List[KpiGateRule] = [
         KpiGateRule("run_quality", "run_quality", "eq", gates.get("run_quality", "valid"), required=True),
         KpiGateRule(
             "send_success_ratio_pct",
@@ -192,7 +215,54 @@ def _build_rules(gates: Dict[str, Any]) -> List[KpiGateRule]:
             float(gates.get("l7_step_fail_ratio_max", 0.01) or 0.01),
             required=False,
         ),
+        KpiGateRule(
+            "l7_handshake_p99_ms",
+            "l7_handshake_p99_ms",
+            "max",
+            float(gates.get("l7_handshake_p99_ms_max", 250.0) or 250.0),
+            required=False,
+        ),
+        KpiGateRule(
+            "l7_fail_budget_pct",
+            "l7_fail_budget_pct",
+            "max",
+            float(gates.get("l7_fail_budget_pct_max", 1.0) or 1.0),
+            required=False,
+        ),
+        KpiGateRule(
+            "quic_stream_fail_ratio",
+            "quic_stream_fail_ratio",
+            "max",
+            float(gates.get("quic_stream_fail_ratio_max", 0.01) or 0.01),
+            required=False,
+        ),
+        KpiGateRule(
+            "quic_handshake_fail_ratio",
+            "quic_handshake_fail_ratio",
+            "max",
+            float(gates.get("quic_handshake_fail_ratio_max", 0.01) or 0.01),
+            required=False,
+        ),
+        KpiGateRule(
+            "quic_response_validation_fail_ratio",
+            "quic_response_validation_fail_ratio",
+            "max",
+            float(gates.get("quic_response_validation_fail_ratio_max", 0.01) or 0.01),
+            required=False,
+        ),
     ]
+    quic_mode_required = str(gates.get("quic_stack_mode_required", "") or "").strip()
+    if quic_mode_required:
+        rules.append(
+            KpiGateRule(
+                "quic_stack_mode",
+                "quic_stack_mode",
+                "eq",
+                quic_mode_required,
+                required=False,
+            )
+        )
+    return rules
 
 
 def evaluate(

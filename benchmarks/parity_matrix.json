@@ -14,7 +14,13 @@
         "txring_hold_block_pressure_pct_max": 35.0,
         "session_success_rate_min": 99.0,
         "retry_success_rate_min": 90.0,
-        "l7_step_fail_ratio_max": 0.01
+        "l7_step_fail_ratio_max": 0.01,
+        "l7_handshake_p99_ms_max": 250.0,
+        "l7_fail_budget_pct_max": 1.0,
+        "quic_stream_fail_ratio_max": 0.01,
+        "quic_handshake_fail_ratio_max": 0.01,
+        "quic_response_validation_fail_ratio_max": 0.01,
+        "quic_stack_mode_required": "h3_stateful"
       }
     },
     "developer_fallback": {
@@ -29,7 +35,12 @@
         "txring_hold_block_pressure_pct_max": 60.0,
         "session_success_rate_min": 95.0,
         "retry_success_rate_min": 70.0,
-        "l7_step_fail_ratio_max": 0.05
+        "l7_step_fail_ratio_max": 0.05,
+        "l7_handshake_p99_ms_max": 750.0,
+        "l7_fail_budget_pct_max": 5.0,
+        "quic_stream_fail_ratio_max": 0.1,
+        "quic_handshake_fail_ratio_max": 0.1,
+        "quic_response_validation_fail_ratio_max": 0.1
       }
     }
   },
