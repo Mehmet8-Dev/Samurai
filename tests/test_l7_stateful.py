@@ -147,6 +147,58 @@ class TestWebSocketScenarioEngine(unittest.TestCase):
         self.assertEqual(ws_mock.send.call_count, 10)
         self.assertEqual(ws_mock.recv.call_count, 10)
 
+    @patch.object(senders_module, "WEBSOCKETS_AVAILABLE", True)
+    @patch("ddos_samurai.senders.websockets", create=True)
+    def test_websocket_scenario_request_plan_paths_are_used(self, mock_ws_module):
+        ws_mock = AsyncMock()
+        ws_mock.send = AsyncMock()
+        ws_mock.recv = AsyncMock(return_value="ok")
+
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=ws_mock)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        mock_ws_module.connect = MagicMock(return_value=cm)
+
+        class _PlanItem:
+            def __init__(self, path):
+                self.path = path
+                self.method = "GET"
+                self.user_agent = ""
+                self.ws_auth_message = f"AUTH:{path}"
+                self.ws_subscribe_message = f"SUB:{path}"
+                self.ws_ping_message = f"PING:{path}"
+
+        class _Plan:
+            def __init__(self, items):
+                self.items = items
+
+        plan = _Plan([_PlanItem("/ws/a"), _PlanItem("/ws/b")])
+
+        stats = _run(senders_module.websocket_scenario_sender(
+            target_ip="127.0.0.1",
+            target_port=8080,
+            count=2,
+            concurrency=1,
+            ws_path="/ws/default",
+            verbose=False,
+            auth_message="AUTH",
+            subscribe_messages=[],
+            ping_message="PING",
+            ping_count=1,
+            await_response=False,
+            request_plan=plan,
+        ))
+
+        self.assertEqual(stats["attempted"], 2)
+        self.assertEqual(stats["sent"], 2)
+        called_uris = [str(c.args[0]) for c in mock_ws_module.connect.call_args_list]
+        self.assertIn("ws://127.0.0.1:8080/ws/a", called_uris)
+        self.assertIn("ws://127.0.0.1:8080/ws/b", called_uris)
+        sent_values = [str(c.args[0]) for c in ws_mock.send.call_args_list if c.args]
+        self.assertTrue(any(v.startswith("AUTH:/ws/a") for v in sent_values))
+        self.assertTrue(any(v.startswith("SUB:/ws/b") for v in sent_values))
+        self.assertTrue(any(v.startswith("PING:/ws/a") for v in sent_values))
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  PHASE 1 — HTTP Retry Implementation
@@ -303,6 +355,61 @@ class TestQuicSenderSemantics(unittest.TestCase):
         self.assertEqual(first_req[b":method"], b"POST")
         self.assertEqual(first_req[b":path"], b"/api/test")
         self.assertEqual(first_req[b":scheme"], b"https")
+
+    @patch.object(senders_module, "AIOQUIC_AVAILABLE", True)
+    def test_quic_request_plan_overrides_method_and_path(self):
+        captured_headers = []
+
+        mock_h3 = MagicMock()
+        _stream_id = 0
+
+        def _next_stream():
+            nonlocal _stream_id
+            _stream_id += 4
+            return _stream_id
+
+        def _capture_send_headers(stream_id, headers, end_stream=True):
+            del stream_id, end_stream
+            captured_headers.append(dict(headers))
+
+        mock_h3.get_next_available_stream_id = MagicMock(side_effect=_next_stream)
+        mock_h3.send_headers = MagicMock(side_effect=_capture_send_headers)
+
+        mock_protocol = MagicMock()
+        mock_protocol._quic = mock_h3
+
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=mock_protocol)
+        cm.__aexit__ = AsyncMock(return_value=False)
+
+        class _PlanItem:
+            def __init__(self, method, path):
+                self.method = method
+                self.path = path
+                self.user_agent = ""
+
+        class _Plan:
+            def __init__(self, items):
+                self.items = items
+
+        plan = _Plan([_PlanItem("POST", "/gpu/a"), _PlanItem("PUT", "/gpu/b")])
+
+        with patch("ddos_samurai.senders.connect", return_value=cm):
+            with patch("ddos_samurai.senders.QuicConfiguration"):
+                stats = _run(senders_module.quic_sender(
+                    target_ip="10.0.0.1", target_port=443,
+                    count=2, concurrency=1,
+                    quic_path="/ignored", quic_method="GET",
+                    verbose=False,
+                    request_plan=plan,
+                ))
+
+        self.assertEqual(stats["attempted"], 2)
+        self.assertEqual(stats["sent"], 2)
+        self.assertEqual(captured_headers[0][b":method"], b"POST")
+        self.assertEqual(captured_headers[0][b":path"], b"/gpu/a")
+        self.assertEqual(captured_headers[1][b":method"], b"PUT")
+        self.assertEqual(captured_headers[1][b":path"], b"/gpu/b")
 
     @patch.object(senders_module, "AIOQUIC_AVAILABLE", True)
     def test_quic_count_honored_not_concurrency(self):
@@ -499,6 +606,41 @@ class TestVirtualUserEngine(unittest.TestCase):
         self.assertEqual(metrics.workflows_completed, 25)
         self.assertEqual(metrics.workflows_failed, 0)
 
+    def test_run_vu_pool_applies_steps_provider(self):
+        seen_paths = []
+
+        async def _fake_exec(self, steps):
+            seen_paths.append((int(self.user_id), [str(s.path) for s in list(steps or [])]))
+            return vu_module.WorkflowResult(
+                user_id=self.user_id,
+                steps_total=1,
+                steps_ok=1,
+                steps_failed=0,
+            )
+
+        async def _fake_close(self):
+            return None
+
+        def _provider(uid, rep_idx):
+            return [vu_module.WorkflowStep(name="x", path=f"/u{uid}/r{rep_idx}")]
+
+        with patch.object(vu_module.VirtualUser, "execute_workflow", _fake_exec):
+            with patch.object(vu_module.VirtualUser, "close", _fake_close):
+                results, metrics = _run(vu_module.run_vu_pool(
+                    vu_count=2,
+                    base_url="http://127.0.0.1:8080",
+                    steps=[vu_module.WorkflowStep(name="fallback", path="/default")],
+                    steps_provider=_provider,
+                    session_repeats=2,
+                    concurrency=2,
+                ))
+
+        self.assertEqual(len(results), 4)
+        self.assertEqual(metrics.workflows_completed, 4)
+        flat_paths = [p for _uid, plist in seen_paths for p in plist]
+        self.assertIn("/u0/r0", flat_paths)
+        self.assertIn("/u1/r1", flat_paths)
+
 
 class TestHttpStatefulSender(unittest.TestCase):
     """Verifies senders.http_stateful_sender integration and metric propagation."""
@@ -548,6 +690,58 @@ class TestHttpStatefulSender(unittest.TestCase):
         self.assertEqual(len(captured["steps"]), 3)
         self.assertEqual(captured["steps"][2].method, "POST")
         self.assertEqual(captured["steps"][2].path, "/submit")
+
+    def test_http_stateful_sender_request_plan_shapes_default_workflow(self):
+        captured = {"steps": None, "steps_provider": None}
+
+        async def _fake_run_vu_pool(**kwargs):
+            captured["steps"] = kwargs.get("steps")
+            captured["steps_provider"] = kwargs.get("steps_provider")
+            metrics = vu_module.L7Metrics(total_vus=1)
+            metrics.workflows_completed = 1
+            metrics.steps_ok = 3
+            results = [vu_module.WorkflowResult(user_id=0, steps_total=3, steps_ok=3, steps_failed=0)]
+            return results, metrics
+
+        class _PlanItem:
+            def __init__(self, method, path):
+                self.method = method
+                self.path = path
+                self.user_agent = "GPU-UA/1.0"
+                self.headers = {"accept": "application/json", "x-gpu-plan-seed": "deadbeef"}
+                self.body = b'{"source":"gpu"}'
+                self.content_type = "application/json"
+
+        class _Plan:
+            def __init__(self, items):
+                self.items = items
+
+        plan = _Plan([_PlanItem("PATCH", "/gpu/bootstrap"), _PlanItem("PATCH", "/gpu/action")])
+
+        with patch("ddos_samurai.virtual_user.run_vu_pool", side_effect=_fake_run_vu_pool):
+            stats = _run(senders_module.http_stateful_sender(
+                target_ip="127.0.0.1",
+                target_port=8080,
+                vu_count=1,
+                concurrency=1,
+                workflow_steps=None,
+                verbose=False,
+                scheme="http",
+                retries=0,
+                http_method="GET",
+                http_path="/legacy",
+                payloads=[],
+                request_plan=plan,
+            ))
+
+        self.assertEqual(stats["sent"], 3)
+        self.assertEqual(captured["steps"][0].path, "/gpu/bootstrap")
+        self.assertEqual(captured["steps"][2].method, "PATCH")
+        self.assertTrue(callable(captured["steps_provider"]))
+        planned_steps = captured["steps_provider"](0, 0)
+        self.assertEqual(planned_steps[2].body, b'{"source":"gpu"}')
+        self.assertEqual(planned_steps[2].headers.get("Content-Type"), "application/json")
+        self.assertEqual(planned_steps[2].headers.get("x-gpu-plan-seed"), "deadbeef")
 
 
 if __name__ == "__main__":

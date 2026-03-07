@@ -406,3 +406,128 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(getattr(plan, "items", [])), int(args["count"]))
         self.assertEqual(call_kwargs["count"], int(args["count"]))
         mock_paced.assert_not_awaited()
+
+    async def test_cuda_quic_path_uses_quic_sender_with_request_plan(self):
+        args = _base_args()
+        args["attack_vector"] = "quic"
+        args["count"] = 3
+        args["port"] = 443
+        args["quic_concurrency"] = 2
+        args["quic_path"] = "/h3"
+        args["quic_method"] = "GET"
+        args["l7_quic_engine"] = "auto"
+        args["l7_quic_require_native"] = False
+        args["l7_fallback_policy"] = "allow"
+        args["l7_capability_strict"] = False
+        args["lab_profile"] = "off"
+        args["quic_streams_per_conn"] = 0
+        args["quic_requests_per_conn"] = 0
+        args["quic_conn_pool_size"] = 1
+        args["quic_expect_status_min"] = 200
+        args["quic_expect_status_max"] = 399
+        args["quic_require_response_headers"] = True
+        args["quic_require_response_body"] = False
+        args["quic_min_response_body_bytes"] = 0
+
+        fake_gpu_packet = _build_fake_gpu_packet_module()
+        fake_gpu_payload = _build_fake_gpu_payload_module()
+        fake_cupy = _build_fake_cupy_module()
+        fake_numba, fake_numba_cuda = _build_fake_numba_modules()
+
+        mock_quic = AsyncMock(return_value={
+            "attempted": 3,
+            "sent": 3,
+            "errors": 0,
+            "bytes_sent_est": 0,
+        })
+
+        with patch.dict(
+            sys.modules,
+            {
+                "cupy": fake_cupy,
+                "numba": fake_numba,
+                "numba.cuda": fake_numba_cuda,
+                "ddos_samurai.gpu_packet": fake_gpu_packet,
+                "ddos_samurai.gpu_payload": fake_gpu_payload,
+            },
+            clear=False,
+        ), patch.object(
+            ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
+        ), patch.object(
+            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
+        ), patch.object(
+            senders, "FAST_SENDER_AVAILABLE", False
+        ), patch.object(
+            senders, "quic_sender", mock_quic
+        ), patch.dict(
+            os.environ, {"SAMURAI_GPU_BATCH": "16"}, clear=False
+        ):
+            await orchestrator.worker_process(worker_id=0, args=args, ssl_context=None, run_events=None)
+
+        mock_quic.assert_awaited()
+        self.assertEqual(mock_quic.await_count, 1)
+        _, call_kwargs = mock_quic.call_args
+        self.assertIn("request_plan", call_kwargs)
+        plan = call_kwargs["request_plan"]
+        self.assertEqual(len(getattr(plan, "items", [])), int(args["count"]))
+
+    async def test_cuda_websocket_scenario_uses_ws_sender_with_request_plan(self):
+        args = _base_args()
+        args["attack_vector"] = "websocket"
+        args["count"] = 3
+        args["port"] = 8080
+        args["ws_scenario"] = True
+        args["ws_concurrency"] = 2
+        args["ws_path"] = "/ws"
+        args["ws_auth_message"] = "AUTH"
+        args["ws_subscribe_message"] = ["SUB"]
+        args["ws_message"] = "PING"
+        args["ws_ping_count"] = 1
+        args["ws_await_response"] = False
+        args["l7_engine"] = "python"
+        args["legacy_path_enable"] = True
+        args["l7_fallback_policy"] = "allow"
+        args["l7_capability_strict"] = False
+        args["lab_profile"] = "off"
+
+        fake_gpu_packet = _build_fake_gpu_packet_module()
+        fake_gpu_payload = _build_fake_gpu_payload_module()
+        fake_cupy = _build_fake_cupy_module()
+        fake_numba, fake_numba_cuda = _build_fake_numba_modules()
+
+        mock_ws_scenario = AsyncMock(return_value={
+            "attempted": 3,
+            "sent": 3,
+            "errors": 0,
+            "bytes_sent_est": 0,
+        })
+
+        with patch.dict(
+            sys.modules,
+            {
+                "cupy": fake_cupy,
+                "numba": fake_numba,
+                "numba.cuda": fake_numba_cuda,
+                "ddos_samurai.gpu_packet": fake_gpu_packet,
+                "ddos_samurai.gpu_payload": fake_gpu_payload,
+            },
+            clear=False,
+        ), patch.object(
+            ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
+        ), patch.object(
+            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
+        ), patch.object(
+            senders, "FAST_SENDER_AVAILABLE", False
+        ), patch.object(
+            senders, "websocket_scenario_sender", mock_ws_scenario
+        ), patch.dict(
+            os.environ, {"SAMURAI_GPU_BATCH": "16"}, clear=False
+        ):
+            await orchestrator.worker_process(worker_id=0, args=args, ssl_context=None, run_events=None)
+
+        mock_ws_scenario.assert_awaited()
+        self.assertEqual(mock_ws_scenario.await_count, 1)
+        _, call_kwargs = mock_ws_scenario.call_args
+        self.assertIn("request_plan", call_kwargs)
+        plan = call_kwargs["request_plan"]
+        self.assertEqual(len(getattr(plan, "items", [])), int(args["count"]))
