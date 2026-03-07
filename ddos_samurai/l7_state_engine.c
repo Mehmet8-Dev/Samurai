@@ -2500,40 +2500,53 @@ static PyObject *l7_h2_supported(PyObject *self, PyObject *args) {
 }
 
 static PyObject *l7_quic_supported(PyObject *self, PyObject *args) {
+    const char *bridge_mode = "unavailable";
+    const char *bridge_reason = "unknown";
     (void)self;
     (void)args;
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
     if (_quic_stack_probe(NULL, NULL)) {
         Py_RETURN_TRUE;
     }
-    Py_RETURN_FALSE;
-#else
-    Py_RETURN_FALSE;
 #endif
+    if (_quic_bridge_supported(&bridge_mode, &bridge_reason)) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
 }
 
 static PyObject *l7_quic_stack_mode(PyObject *self, PyObject *args) {
+    const char *mode = "unavailable";
+    const char *reason = "unknown";
     (void)self;
     (void)args;
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
-    const char *mode = "unavailable";
     (void)_quic_stack_probe(NULL, &mode);
-    return PyUnicode_FromString(mode != NULL ? mode : "unavailable");
-#else
-    return PyUnicode_FromString("unavailable");
 #endif
+    if (!_str_starts_with(mode, "h3_stateful")) {
+        if (_quic_bridge_supported(&mode, &reason)) {
+            (void)reason;
+        }
+    }
+    return PyUnicode_FromString(mode != NULL ? mode : "unavailable");
 }
 
 static PyObject *l7_quic_stack_probe_reason(PyObject *self, PyObject *args) {
+    const char *reason = "unknown";
+    const char *mode = "unavailable";
     (void)self;
     (void)args;
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3)
-    const char *reason = "unknown";
-    (void)_quic_stack_probe(&reason, NULL);
-    return PyUnicode_FromString(reason != NULL ? reason : "unknown");
-#else
-    return PyUnicode_FromString("quic_build_disabled");
+    (void)_quic_stack_probe(&reason, &mode);
 #endif
+    if (!_str_starts_with(mode, "h3_stateful")) {
+        if (_quic_bridge_supported(&mode, &reason)) {
+            /* bridge reason becomes probe reason when native stack is unavailable */
+        } else if (reason == NULL || reason[0] == '\0' || strcmp(reason, "unknown") == 0) {
+            reason = "quic_build_disabled";
+        }
+    }
+    return PyUnicode_FromString(reason != NULL ? reason : "unknown");
 }
 
 static PyObject *l7_run_http1_stateful(PyObject *self, PyObject *args) {
