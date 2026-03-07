@@ -1514,10 +1514,21 @@ def build_live_attack_report(
         )
         report.results.update(gate_result.as_report_fields())
         report.results["kpi_evaluated_rules"] = list(gate_result.evaluated_rules)
-    except Exception:
-        report.results.setdefault("kpi_gate_profile", "off")
-        report.results.setdefault("kpi_gate_status", "pass")
-        report.results.setdefault("kpi_gate_hard_fail", 0)
-        report.results.setdefault("kpi_violations", [])
-        report.results.setdefault("score_eligible", 1 if str(report.results.get("run_quality", "")) == "valid" else 0)
+    except Exception as exc:
+        gate_profile = str(
+            (args or {}).get("kpi_gate_profile", os.environ.get("SAMURAI_KPI_GATE_PROFILE", "off")) or "off"
+        )
+        gate_hard_fail = bool(
+            (args or {}).get("kpi_hard_fail", str(os.environ.get("SAMURAI_KPI_HARD_FAIL", "0")) in {"1", "true"})
+        )
+        gate_profile_norm = str(gate_profile).strip().lower()
+        hard_fail_flag = int(bool(gate_hard_fail) and gate_profile_norm == "dedicated_lab")
+        reason = f"kpi_gate_exception:{type(exc).__name__}"
+        report.results["kpi_gate_profile"] = gate_profile
+        report.results["kpi_gate_status"] = "fail"
+        report.results["kpi_gate_hard_fail"] = hard_fail_flag
+        report.results["kpi_violations"] = [reason]
+        report.results["kpi_evaluated_rules"] = []
+        report.results["kpi_gate_error"] = str(exc)
+        report.results["score_eligible"] = 0
     return report

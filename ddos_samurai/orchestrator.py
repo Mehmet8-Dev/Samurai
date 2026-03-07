@@ -836,6 +836,7 @@ async def worker_process(
     sender_context_cache = {}
     sender_backend_cfg = str(args.get("sender_backend", "auto") or "auto")
     sender_fallback_policy_cfg = str(args.get("sender_fallback_policy", "allow") or "allow")
+    dataplane_core_mode_cfg = str(args.get("dataplane_core_mode", "off") or "off")
     lab_profile_cfg = str(args.get("lab_profile", "off") or "off")
     dp_queue_strategy_cfg = str(args.get("dp_queue_strategy", "rr") or "rr")
     dp_queue_id_cfg = int(args.get("dp_queue_id", args.get("xdp_queue_id", 0)) or 0)
@@ -847,19 +848,23 @@ async def worker_process(
     worker_stats["dp_affinity_cpu"] = int(args.get("dp_affinity_cpu", -1) or -1)
     worker_stats["sender_backend_requested"] = str(sender_backend_cfg)
     worker_stats["sender_fallback_policy"] = str(sender_fallback_policy_cfg)
+    worker_stats["dataplane_core_mode"] = str(dataplane_core_mode_cfg)
 
     try:
         dp_cfg = dataplane.build_dataplane_config(args, queue_id=dp_queue_id_cfg)
         sender_context_cache["dataplane_config"] = dp_cfg.as_dict()
         sender_context_cache["lab_profile"] = str(lab_profile_cfg)
+        sender_context_cache["dataplane_hot_path_only"] = bool(dp_cfg.use_core and str(dp_cfg.core_mode or "off") == "required")
         if bool(dp_cfg.use_core):
             dp_session = dataplane.DataplaneSession(dp_cfg)
             sender_context_cache["dataplane_session"] = dp_session
             sender_context_cache["dataplane_opened"] = int(dp_session.open())
-            if not sender_context_cache["dataplane_opened"] and str(lab_profile_cfg).strip().lower() == "dedicated":
-                log_warning(
-                    f"[Worker {worker_id}] dataplane core open failed in dedicated mode: {dp_session.open_error or 'unknown'}"
-                )
+            if not sender_context_cache["dataplane_opened"]:
+                sender_context_cache["dataplane_open_error"] = str(dp_session.open_error or "dataplane_open_failed")
+                if bool(sender_context_cache.get("dataplane_hot_path_only", False)):
+                    log_warning(
+                        f"[Worker {worker_id}] dataplane core open failed (required mode): {dp_session.open_error or 'unknown'}"
+                    )
     except Exception as e:
         log_warning(f"[Worker {worker_id}] dataplane init failed: {e}")
 

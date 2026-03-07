@@ -52,6 +52,11 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    raw = str(os.environ.get(name, default) or default).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _arg_bool(value):
     """argparse bool parser that accepts common true/false spellings."""
     if isinstance(value, bool):
@@ -80,6 +85,29 @@ def _is_cuda_raw_vector(args: argparse.Namespace) -> bool:
         "memcached-amp",
         "ldap-amp",
     }
+
+
+def _normalize_dataplane_core_mode(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "on": "auto",
+        "enable": "auto",
+        "enabled": "auto",
+        "true": "auto",
+        "1": "auto",
+        "off": "off",
+        "disable": "off",
+        "disabled": "off",
+        "false": "off",
+        "0": "off",
+        "must": "required",
+        "strict": "required",
+        "hard": "required",
+    }
+    norm = aliases.get(raw, raw)
+    if norm in {"off", "auto", "required"}:
+        return norm
+    return "off"
 
 _SOAK_PROFILE_PRESETS = {
     "none": {
@@ -298,6 +326,7 @@ def _report_inputs_from_args(args) -> dict:
         "loss_fail_pct": float(getattr(args, "loss_fail_pct", 5.0) or 5.0),
         "sender_backend": str(getattr(args, "sender_backend", "auto")),
         "sender_fallback_policy": str(getattr(args, "sender_fallback_policy", "allow")),
+        "dataplane_core_mode": str(getattr(args, "dataplane_core_mode", "off")),
         "lab_profile": str(getattr(args, "lab_profile", "off")),
         "dp_queue_strategy": str(getattr(args, "dp_queue_strategy", "rr")),
         "dp_queues": int(getattr(args, "dp_queues", 1) or 1),
@@ -311,6 +340,8 @@ def _report_inputs_from_args(args) -> dict:
         "l7_http2_engine": str(getattr(args, "l7_http2_engine", "auto")),
         "l7_quic_engine": str(getattr(args, "l7_quic_engine", "auto")),
         "l7_quic_require_native": bool(getattr(args, "l7_quic_require_native", False)),
+        "l7_quic_auto_bridge": bool(getattr(args, "l7_quic_auto_bridge", False)),
+        "l7_quic_bridge_autopromote": bool(getattr(args, "l7_quic_bridge_autopromote", False)),
         "quic_streams_per_conn": int(getattr(args, "quic_streams_per_conn", 0) or 0),
         "quic_requests_per_conn": int(getattr(args, "quic_requests_per_conn", 0) or 0),
         "quic_conn_pool_size": int(getattr(args, "quic_conn_pool_size", 1) or 1),
@@ -423,6 +454,7 @@ def _validate_hybrid_cuda_args(parser: argparse.ArgumentParser, args: argparse.N
 def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     sender_backend = str(getattr(args, "sender_backend", "auto") or "auto").strip().lower()
     fallback_policy = str(getattr(args, "sender_fallback_policy", "allow") or "allow").strip().lower()
+    dataplane_core_mode = _normalize_dataplane_core_mode(getattr(args, "dataplane_core_mode", "off"))
     xdp_enable = bool(getattr(args, "xdp_enable", False))
     xdp_interface = str(getattr(args, "xdp_interface", "") or "").strip()
     lab_profile = str(getattr(args, "lab_profile", "off") or "off").strip().lower()
@@ -430,6 +462,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
     dp_queue_map = str(getattr(args, "dp_queue_map", "") or "").strip()
     l7_quic_require_native = bool(getattr(args, "l7_quic_require_native", False))
     l7_quic_engine = str(getattr(args, "l7_quic_engine", "auto") or "auto").strip().lower()
+    l7_quic_auto_bridge = bool(getattr(args, "l7_quic_auto_bridge", False))
+    l7_quic_bridge_autopromote = bool(getattr(args, "l7_quic_bridge_autopromote", False))
 
     if int(getattr(args, "xdp_queue_id", 0) or 0) < 0:
         parser.error("Hata: --xdp-queue-id >= 0 olmalıdır.")
@@ -469,6 +503,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: XDP yolu için --xdp-interface zorunludur.")
     if fallback_policy == "fail" and sender_backend == "auto":
         parser.error("Hata: --sender-fallback-policy fail için --sender-backend auto kullanılamaz.")
+    if dataplane_core_mode == "required" and fallback_policy != "fail":
+        parser.error("Hata: --dataplane-core-mode required için --sender-fallback-policy fail zorunludur.")
     if dp_queue_strategy == "map":
         if not dp_queue_map:
             parser.error("Hata: --dp-queue-strategy map için --dp-queue-map zorunludur.")
@@ -487,6 +523,10 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
             parser.error("Hata: --l7-quic-require-native için --l7-capability-strict zorunludur.")
         if l7_quic_engine == "python":
             parser.error("Hata: --l7-quic-require-native ile --l7-quic-engine python kullanılamaz.")
+        if l7_quic_auto_bridge:
+            parser.error("Hata: --l7-quic-require-native ile --l7-quic-auto-bridge birlikte kullanılamaz.")
+        if l7_quic_bridge_autopromote:
+            parser.error("Hata: --l7-quic-require-native ile --l7-quic-bridge-autopromote birlikte kullanılamaz.")
     if lab_profile == "dedicated":
         if sender_backend == "auto":
             parser.error("Hata: --lab-profile dedicated için --sender-backend explicit olmalıdır (auto kullanılamaz).")
@@ -554,6 +594,10 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
     lab_profile = str(getattr(args, "lab_profile", "off") or "off").strip().lower()
     if lab_profile != "dedicated":
         return
+    dp_core_mode = _normalize_dataplane_core_mode(getattr(args, "dataplane_core_mode", "off"))
+    if dp_core_mode != "required":
+        args.dataplane_core_mode = "required"
+        utils.log_info("lab-profile=dedicated için --dataplane-core-mode otomatik required olarak ayarlandı.")
     if str(getattr(args, "kpi_gate_profile", "off") or "off").strip().lower() == "off":
         args.kpi_gate_profile = "dedicated_lab"
         utils.log_info("lab-profile=dedicated için --kpi-gate-profile otomatik dedicated_lab olarak ayarlandı.")
@@ -569,6 +613,13 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
     ):
         args.l7_quic_require_native = True
         utils.log_info("lab-profile=dedicated + QUIC için --l7-quic-require-native otomatik etkinleştirildi.")
+    if bool(getattr(args, "l7_quic_require_native", False)):
+        if bool(getattr(args, "l7_quic_auto_bridge", False)):
+            args.l7_quic_auto_bridge = False
+            utils.log_info("native QUIC zorunlu olduğu için --l7-quic-auto-bridge kapatıldı.")
+        if bool(getattr(args, "l7_quic_bridge_autopromote", False)):
+            args.l7_quic_bridge_autopromote = False
+            utils.log_info("native QUIC zorunlu olduğu için --l7-quic-bridge-autopromote kapatıldı.")
 
     workers = int(getattr(args, "workers", multiprocessing.cpu_count()) or 0)
     dp_queues = int(getattr(args, "dp_queues", 1) or 1)
@@ -823,6 +874,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="allow",
         help="Backend fallback politikası: allow=alt yola düş, fail=run'ı fail-visible bitir.",
     )
+    _dp_mode_env_default = _normalize_dataplane_core_mode(
+        os.environ.get(
+            "SAMURAI_DATAPLANE_CORE_MODE",
+            "auto" if _env_flag("SAMURAI_DATAPLANE_CORE_ENABLE", "0") else "off",
+        )
+    )
+    parser.add_argument(
+        "--dataplane-core-mode",
+        choices=["off", "auto", "required"],
+        default=_dp_mode_env_default,
+        help="Dataplane core kullanım modu: off|auto|required (required=tek hot-path, legacy zincir kapalı).",
+    )
     parser.add_argument(
         "--lab-profile",
         choices=["off", "dedicated"],
@@ -884,6 +947,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=str(os.environ.get("SAMURAI_L7_QUIC_REQUIRE_NATIVE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
         help="QUIC için yalnızca native C h3_stateful modunu kabul et (py-bridge kabul edilmez).",
+    )
+    parser.add_argument(
+        "--l7-quic-auto-bridge",
+        action="store_true",
+        default=str(os.environ.get("SAMURAI_L7_QUIC_AUTO_BRIDGE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
+        help="Native QUIC yoksa py-bridge yolunu otomatik etkinleştir.",
+    )
+    parser.add_argument(
+        "--l7-quic-bridge-autopromote",
+        action="store_true",
+        default=str(os.environ.get("SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
+        help="Capability map içinde py-bridge'i otomatik h3_stateful olarak terfi ettir.",
     )
     parser.add_argument(
         "--l7-fallback-policy",
@@ -1436,6 +1511,9 @@ def main(argv=None):
     os.environ["SAMURAI_SENDER_FALLBACK_POLICY"] = str(
         getattr(args, "sender_fallback_policy", "allow") or "allow"
     )
+    _dp_mode = _normalize_dataplane_core_mode(getattr(args, "dataplane_core_mode", "off"))
+    os.environ["SAMURAI_DATAPLANE_CORE_MODE"] = _dp_mode
+    os.environ["SAMURAI_DATAPLANE_CORE_ENABLE"] = "1" if _dp_mode in {"auto", "required"} else "0"
     os.environ["SAMURAI_LAB_PROFILE"] = str(getattr(args, "lab_profile", "off") or "off")
     os.environ["SAMURAI_DP_QUEUE_STRATEGY"] = str(getattr(args, "dp_queue_strategy", "rr") or "rr")
     os.environ["SAMURAI_DP_QUEUES"] = str(int(getattr(args, "dp_queues", 1) or 1))
@@ -1449,6 +1527,8 @@ def main(argv=None):
     os.environ["SAMURAI_L7_HTTP2_ENGINE"] = str(getattr(args, "l7_http2_engine", "auto") or "auto")
     os.environ["SAMURAI_L7_QUIC_ENGINE"] = str(getattr(args, "l7_quic_engine", "auto") or "auto")
     os.environ["SAMURAI_L7_QUIC_REQUIRE_NATIVE"] = "1" if bool(getattr(args, "l7_quic_require_native", False)) else "0"
+    os.environ["SAMURAI_L7_QUIC_AUTO_BRIDGE"] = "1" if bool(getattr(args, "l7_quic_auto_bridge", False)) else "0"
+    os.environ["SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE"] = "1" if bool(getattr(args, "l7_quic_bridge_autopromote", False)) else "0"
     os.environ["SAMURAI_L7_FALLBACK_POLICY"] = str(getattr(args, "l7_fallback_policy", "allow") or "allow")
     os.environ["SAMURAI_L7_CAPABILITY_STRICT"] = "1" if bool(getattr(args, "l7_capability_strict", False)) else "0"
     os.environ["SAMURAI_LEGACY_PATH_ENABLE"] = "1" if bool(getattr(args, "legacy_path_enable", False)) else "0"

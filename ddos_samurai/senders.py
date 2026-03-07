@@ -1566,9 +1566,14 @@ async def raw_socket_sender(
     loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
 
     allow_fallback = (fallback_policy == "allow")
+    dp_hot_path_only = bool(isinstance(ctx, dict) and ctx.get("dataplane_hot_path_only", False))
+    dp_open_error = ""
+    if isinstance(ctx, dict):
+        dp_open_error = str(ctx.get("dataplane_open_error", "") or "").strip()
 
-    # Optional in-proc dataplane core path (scaffold). If it handles the batch,
-    # we return immediately; otherwise we continue with legacy TX_RING/C/Python chain.
+    # In-proc dataplane core path.
+    # required mode: always return dataplane outcome (single hot-path).
+    # auto mode: if dataplane cannot send, legacy TX_RING/C/Python chain may continue.
     dp_session = ctx.get("dataplane_session") if isinstance(ctx, dict) else None
     if dp_session is not None and hasattr(dp_session, "send_batch"):
         dp_out = None
@@ -1582,6 +1587,26 @@ async def raw_socket_sender(
             )
         except Exception as e:
             _register_fallback(f"dataplane_exception:{type(e).__name__}")
+            if dp_hot_path_only:
+                if owns_socket and s is not None:
+                    s.close()
+                _update_live(live_progress, int(count))
+                _update_live(live_errors, int(count))
+                return _stats(
+                    attempted=count,
+                    sent=0,
+                    errors=count,
+                    sender_path="DP_SEND_FAILED",
+                    permission_error_count=0,
+                    fallback_count=max(1, int(fallback_count)),
+                    sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "dataplane_exception",
+                    sender_backend_requested=requested_backend,
+                    sender_fallback_policy=fallback_policy,
+                    buffer_copy_count=buffer_copy_count,
+                    buffer_copy_bytes=buffer_copy_bytes,
+                    eagain_retry_count=0,
+                    partial_send_retry_count=0,
+                )
         if dp_out is not None:
             if hasattr(dp_out, "to_stats"):
                 dp_stats = dict(dp_out.to_stats() or {})
@@ -1593,37 +1618,60 @@ async def raw_socket_sender(
             dp_sent = int(dp_stats.get("sent", 0) or 0)
             dp_errors = int(dp_stats.get("errors", max(0, dp_attempted - dp_sent)) or 0)
             dp_reason = str(dp_stats.get("sender_fallback_reason", "none") or "none").strip()
-            if dp_sent > 0 or not allow_fallback:
-                if owns_socket and s is not None:
-                    s.close()
-                _update_live(live_progress, int(dp_attempted))
-                _update_live(live_sent, int(dp_sent))
-                _update_live(live_errors, int(max(dp_errors, dp_attempted - dp_sent)))
-                out = _stats(
-                    attempted=dp_attempted,
-                    sent=dp_sent,
-                    errors=max(dp_errors, dp_attempted - dp_sent),
-                    bytes_sent_est=int(
-                        dp_stats.get("bytes_sent_est", int(dp_sent) * int(max(0, int(packet_size or 0)))) or 0
-                    ),
-                    sender_path=str(dp_stats.get("sender_path", "DP_CORE") or "DP_CORE"),
-                    fallback_count=int(dp_stats.get("fallback_count", 0) or 0),
-                    sender_fallback_reason=str(dp_reason or "none"),
-                    sender_backend_requested=requested_backend,
-                    sender_fallback_policy=fallback_policy,
-                    buffer_copy_count=buffer_copy_count,
-                    buffer_copy_bytes=buffer_copy_bytes,
-                    eagain_retry_count=0,
-                    partial_send_retry_count=0,
-                )
-                for k in ("dp_queue_id", "dp_queue_strategy", "dp_affinity_cpu", "session_success_rate", "retry_success_rate"):
-                    if k in dp_stats:
-                        out[k] = dp_stats[k]
-                return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
             if dp_reason and dp_reason.lower() != "none":
                 _register_fallback(dp_reason)
-            else:
-                _register_fallback("dataplane_unhandled")
+            if owns_socket and s is not None:
+                s.close()
+            _update_live(live_progress, int(dp_attempted))
+            _update_live(live_sent, int(dp_sent))
+            _update_live(live_errors, int(max(dp_errors, dp_attempted - dp_sent)))
+            out = _stats(
+                attempted=dp_attempted,
+                sent=dp_sent,
+                errors=max(dp_errors, dp_attempted - dp_sent),
+                bytes_sent_est=int(
+                    dp_stats.get("bytes_sent_est", int(dp_sent) * int(max(0, int(packet_size or 0)))) or 0
+                ),
+                sender_path=str(dp_stats.get("sender_path", "DP_CORE") or "DP_CORE"),
+                fallback_count=max(
+                    int(dp_stats.get("fallback_count", 0) or 0),
+                    int(fallback_count or 0),
+                ),
+                sender_fallback_reason=(
+                    ";".join(fallback_reasons) if fallback_reasons else str(dp_reason or "none")
+                ),
+                sender_backend_requested=requested_backend,
+                sender_fallback_policy=fallback_policy,
+                buffer_copy_count=buffer_copy_count,
+                buffer_copy_bytes=buffer_copy_bytes,
+                eagain_retry_count=0,
+                partial_send_retry_count=0,
+            )
+            for k in ("dp_queue_id", "dp_queue_strategy", "dp_affinity_cpu", "session_success_rate", "retry_success_rate"):
+                if k in dp_stats:
+                    out[k] = dp_stats[k]
+            return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
+    elif dp_hot_path_only:
+        if owns_socket and s is not None:
+            s.close()
+        _update_live(live_progress, int(count))
+        _update_live(live_errors, int(count))
+        reason = dp_open_error or "dataplane_session_missing"
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="DP_UNAVAILABLE",
+            permission_error_count=0,
+            fallback_count=1,
+            sender_fallback_reason=reason,
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=buffer_copy_count,
+            buffer_copy_bytes=buffer_copy_bytes,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
 
     try_txring = bool(force_l2) or requested_backend in {"auto", "txring"}
     try_c_ext_l3 = requested_backend in {"auto", "txring", "c_ext_l3"}
