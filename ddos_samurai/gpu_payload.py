@@ -23,7 +23,7 @@ import random
 import string
 import time
 import ipaddress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Any, Sequence, Union, TypeAlias
 
 from numba import cuda, uint8, uint16, uint32, uint64
@@ -110,6 +110,12 @@ class H2RequestPlanItem:
     method: str
     path: str
     user_agent: Optional[str] = None
+    headers: Dict[str, str] = field(default_factory=dict)
+    body: Optional[bytes] = None
+    content_type: Optional[str] = None
+    ws_auth_message: Optional[str] = None
+    ws_subscribe_message: Optional[str] = None
+    ws_ping_message: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -846,6 +852,8 @@ def generate_h2_request_plan_kernel(
     num_methods,
     num_paths,
     num_uas,
+    num_accepts,
+    num_langs,
     session_steps,
     session_active_paths,
     session_timers,
@@ -853,6 +861,10 @@ def generate_h2_request_plan_kernel(
     out_method_idx,
     out_path_idx,
     out_ua_idx,
+    out_accept_idx,
+    out_lang_idx,
+    out_body_kind,
+    out_msg_seed,
     out_step_used,
     out_valid_flags,
 ):
@@ -862,7 +874,7 @@ def generate_h2_request_plan_kernel(
         return
     out_valid_flags[idx] = 0
     out_step_used[idx] = 0
-    if num_methods <= 0 or num_paths <= 0 or num_uas <= 0:
+    if num_methods <= 0 or num_paths <= 0 or num_uas <= 0 or num_accepts <= 0 or num_langs <= 0:
         return
     if current_time < session_timers[idx]:
         return
@@ -888,15 +900,33 @@ def generate_h2_request_plan_kernel(
     method_idx = int(rand_tmp * num_methods)
     rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
     ua_idx = int(rand_tmp * num_uas)
+    rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
+    accept_idx = int(rand_tmp * num_accepts)
+    rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
+    lang_idx = int(rand_tmp * num_langs)
+    rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
+    body_kind = int(rand_tmp * 5.0)
+    rand_tmp = xoroshiro128p_uniform_float32(rng_states, idx)
+    msg_seed = int(rand_tmp * 4294967295.0)
 
     if method_idx >= num_methods:
         method_idx = num_methods - 1
     if ua_idx >= num_uas:
         ua_idx = num_uas - 1
+    if accept_idx >= num_accepts:
+        accept_idx = num_accepts - 1
+    if lang_idx >= num_langs:
+        lang_idx = num_langs - 1
+    if body_kind > 4:
+        body_kind = 4
 
     out_method_idx[idx] = method_idx
     out_path_idx[idx] = path_idx
     out_ua_idx[idx] = ua_idx
+    out_accept_idx[idx] = accept_idx
+    out_lang_idx[idx] = lang_idx
+    out_body_kind[idx] = body_kind
+    out_msg_seed[idx] = msg_seed
     out_valid_flags[idx] = 1
 
     new_step = step + 1
@@ -1020,6 +1050,87 @@ def _apply_session_suffix(
     return f"{path}{suffix}"
 
 
+def _content_type_from_kind(kind: int) -> str:
+    kind_id = int(kind) % 5
+    if kind_id == CONTENT_TYPE_FORM:
+        return "application/x-www-form-urlencoded"
+    if kind_id == CONTENT_TYPE_JSON:
+        return "application/json"
+    if kind_id == CONTENT_TYPE_XML:
+        return "application/xml"
+    if kind_id == CONTENT_TYPE_MULTIPART:
+        return "multipart/form-data"
+    return "text/plain"
+
+
+def _build_plan_body(method: str, path: str, body_kind: int, seed: int) -> tuple[Optional[bytes], Optional[str]]:
+    method_u = str(method or "GET").upper()
+    if method_u not in {"POST", "PUT", "PATCH"}:
+        return None, None
+    content_type = _content_type_from_kind(body_kind)
+    rng = random.Random(int(seed) & 0xFFFFFFFF)
+    token = "".join(rng.choice("abcdef0123456789") for _ in range(20))
+    safe_path = str(path or "/").replace('"', "_")
+    seed_num = int(seed) & 0xFFFFFFFF
+    if content_type == "application/x-www-form-urlencoded":
+        body_text = f"path={safe_path}&token={token}&nonce={seed_num % 1000000}"
+    elif content_type == "application/json":
+        body_text = (
+            '{"path":"%s","token":"%s","nonce":%d,"source":"gpu-plan"}'
+            % (safe_path, token, seed_num)
+        )
+    elif content_type == "application/xml":
+        body_text = (
+            '<request><path>%s</path><token>%s</token><nonce>%d</nonce></request>'
+            % (safe_path, token, seed_num)
+        )
+    elif content_type == "multipart/form-data":
+        boundary = f"----samurai{seed_num:08x}"
+        body_text = (
+            f"--{boundary}\r\n"
+            "Content-Disposition: form-data; name=\"path\"\r\n\r\n"
+            f"{safe_path}\r\n"
+            f"--{boundary}\r\n"
+            "Content-Disposition: form-data; name=\"token\"\r\n\r\n"
+            f"{token}\r\n"
+            f"--{boundary}--\r\n"
+        )
+        content_type = f"multipart/form-data; boundary={boundary}"
+    else:
+        body_text = f"path={safe_path};token={token};nonce={seed_num};source=gpu-plan"
+    return body_text.encode("utf-8"), content_type
+
+
+def _build_plan_headers(
+    *,
+    accept_value: str,
+    accept_language: str,
+    content_type: Optional[str],
+    body_len: int,
+    seed: int,
+    step: int,
+) -> Dict[str, str]:
+    headers: Dict[str, str] = {
+        "accept": str(accept_value or "*/*"),
+        "accept-language": str(accept_language or "en-US,en;q=0.9"),
+        "x-gpu-plan-seed": f"{int(seed) & 0xFFFFFFFF:08x}",
+        "x-gpu-plan-step": str(int(step)),
+    }
+    if content_type:
+        headers["content-type"] = str(content_type)
+        headers["content-length"] = str(max(0, int(body_len)))
+    return headers
+
+
+def _build_ws_plan_messages(path: str, seed: int) -> tuple[str, str, str]:
+    token = f"{int(seed) & 0xFFFFFFFF:08x}"
+    ws_path = str(path or "/")
+    auth = f'{{"op":"auth","token":"{token}"}}'
+    sub = f'{{"op":"subscribe","channel":"{ws_path}"}}'
+    ping = f'{{"op":"ping","seq":{int(seed) & 0xFFFF}}}'
+    return auth, sub, ping
+
+
 class GPUPayloadEngine:
     def __init__(self, count, max_packet_size=512, rng_seed: Optional[int] = 1234):
         """
@@ -1046,6 +1157,10 @@ class GPUPayloadEngine:
         self.h2_method_idx = cp.zeros(self.capacity, dtype=cp.uint16)
         self.h2_path_idx = cp.zeros(self.capacity, dtype=cp.uint16)
         self.h2_ua_idx = cp.zeros(self.capacity, dtype=cp.uint16)
+        self.h2_accept_idx = cp.zeros(self.capacity, dtype=cp.uint16)
+        self.h2_lang_idx = cp.zeros(self.capacity, dtype=cp.uint16)
+        self.h2_body_kind = cp.zeros(self.capacity, dtype=cp.uint8)
+        self.h2_msg_seed = cp.zeros(self.capacity, dtype=cp.uint32)
         self.h2_step_used = cp.zeros(self.capacity, dtype=cp.uint8)
         self.h2_valid_flags = cp.zeros(self.capacity, dtype=cp.uint8)
         # Slot-specific output buffers for overlapping multi-stream pipelines.
@@ -1060,6 +1175,8 @@ class GPUPayloadEngine:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         ]) or []
+        self.accept_headers = list(ACCEPT_HEADERS)
+        self.accept_languages = list(ACCEPT_LANGUAGES)
         
         # Session State Buffers
         self.session_steps = cp.zeros(self.count, dtype=cp.uint8)
@@ -1182,6 +1299,8 @@ class GPUPayloadEngine:
             self.n_methods,
             self.n_paths,
             self.n_uas,
+            len(self.accept_headers),
+            len(self.accept_languages),
             self.session_steps,
             self.session_active_paths,
             self.session_timers,
@@ -1189,6 +1308,10 @@ class GPUPayloadEngine:
             self.h2_method_idx,
             self.h2_path_idx,
             self.h2_ua_idx,
+            self.h2_accept_idx,
+            self.h2_lang_idx,
+            self.h2_body_kind,
+            self.h2_msg_seed,
             self.h2_step_used,
             self.h2_valid_flags,
         )
@@ -1197,6 +1320,10 @@ class GPUPayloadEngine:
         method_idx = cp.asnumpy(self.h2_method_idx[:plan_count])
         path_idx = cp.asnumpy(self.h2_path_idx[:plan_count])
         ua_idx = cp.asnumpy(self.h2_ua_idx[:plan_count])
+        accept_idx = cp.asnumpy(self.h2_accept_idx[:plan_count])
+        lang_idx = cp.asnumpy(self.h2_lang_idx[:plan_count])
+        body_kind = cp.asnumpy(self.h2_body_kind[:plan_count])
+        msg_seed = cp.asnumpy(self.h2_msg_seed[:plan_count])
         step_used = cp.asnumpy(self.h2_step_used[:plan_count])
         resource_chain = _resolve_resource_chain()
         step_rng = random.Random((int(self.rng_seed) << 32) ^ int(current_time) ^ int(plan_count))
@@ -1208,8 +1335,34 @@ class GPUPayloadEngine:
             m = self._to_text(self.methods[int(method_idx[i]) % self.n_methods])
             p = self._to_text(self.paths[int(path_idx[i]) % self.n_paths])
             u = self._to_text(self.uas[int(ua_idx[i]) % self.n_uas])
+            accept_v = str(self.accept_headers[int(accept_idx[i]) % len(self.accept_headers)])
+            lang_v = str(self.accept_languages[int(lang_idx[i]) % len(self.accept_languages)])
+            seed_v = int(msg_seed[i]) & 0xFFFFFFFF
+            kind_v = int(body_kind[i]) % 5
             p = _apply_session_suffix(p, int(step_used[i]), rng=step_rng, chain=resource_chain)
-            items.append(H2RequestPlanItem(method=m, path=p, user_agent=u))
+            body_v, content_type_v = _build_plan_body(m, p, kind_v, seed_v)
+            headers_v = _build_plan_headers(
+                accept_value=accept_v,
+                accept_language=lang_v,
+                content_type=content_type_v,
+                body_len=len(body_v) if body_v is not None else 0,
+                seed=seed_v,
+                step=int(step_used[i]),
+            )
+            ws_auth, ws_subscribe, ws_ping = _build_ws_plan_messages(p, seed_v)
+            items.append(
+                H2RequestPlanItem(
+                    method=m,
+                    path=p,
+                    user_agent=u,
+                    headers=headers_v,
+                    body=body_v,
+                    content_type=content_type_v,
+                    ws_auth_message=ws_auth,
+                    ws_subscribe_message=ws_subscribe,
+                    ws_ping_message=ws_ping,
+                )
+            )
         return H2RequestPlan(items=items)
 
     def generate_payloads(self, packets_buffer, target_ip, max_packet_size, stream=None):

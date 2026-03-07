@@ -66,6 +66,7 @@ class WorkflowStep:
     branch_on: dict[int, int] | None = None     # status_code → step_index
     timeout_s: float = 10.0
     max_retries: int = 0
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -236,6 +237,10 @@ class VirtualUser:
 
         # Inject tokens as headers
         request_headers = {}
+        if isinstance(step.headers, dict):
+            for h_key, h_val in step.headers.items():
+                if h_key and h_val is not None:
+                    request_headers[str(h_key)] = str(h_val)
         for token_spec in step.inject_tokens:
             header_name = str(token_spec).strip()
             token_key = header_name
@@ -373,6 +378,7 @@ async def run_vu_pool(
     vu_count: int,
     base_url: str,
     steps: list[WorkflowStep],
+    steps_provider: Optional[Callable[[int, int], list[WorkflowStep]]] = None,
     concurrency: int = 10,
     verify: bool = False,
     timeout_s: float = 10.0,
@@ -416,7 +422,7 @@ async def run_vu_pool(
             item = await id_queue.get()
             if item is None:
                 break
-            uid, _rep_idx = item
+            uid, rep_idx = item
             vu: VirtualUser | None = None
             if session_keepalive:
                 vu = vu_cache.get(int(uid))
@@ -435,7 +441,13 @@ async def run_vu_pool(
             if metrics.active_sessions > metrics.active_sessions_peak:
                 metrics.active_sessions_peak = metrics.active_sessions
             try:
-                result = await vu.execute_workflow(steps)
+                if callable(steps_provider):
+                    run_steps = steps_provider(int(uid), int(rep_idx))
+                    if not isinstance(run_steps, list) or len(run_steps) == 0:
+                        run_steps = steps
+                else:
+                    run_steps = steps
+                result = await vu.execute_workflow(run_steps)
                 if result.error is None and result.steps_failed == 0:
                     metrics.workflows_completed += 1
                 else:

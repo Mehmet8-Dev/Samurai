@@ -96,6 +96,13 @@ async def send_h2_requests(
                 method = str(item.get("method", "GET") or "GET").upper()
                 path = str(item.get("path", "/") or "/")
                 headers_in = dict(item.get("headers", {}) or {})
+                body_obj = item.get("body", b"")
+                if body_obj is None:
+                    body_bytes = b""
+                elif isinstance(body_obj, bytes):
+                    body_bytes = body_obj
+                else:
+                    body_bytes = str(body_obj).encode("utf-8")
                 headers = [
                     (":method", method),
                     (":path", path),
@@ -110,7 +117,9 @@ async def send_h2_requests(
                 stream_id = conn.get_next_available_stream_id()
                 stream_status[stream_id] = 0
                 inflight.add(stream_id)
-                conn.send_headers(stream_id=stream_id, headers=headers, end_stream=True)
+                conn.send_headers(stream_id=stream_id, headers=headers, end_stream=(len(body_bytes) == 0))
+                if body_bytes:
+                    conn.send_data(stream_id=stream_id, data=body_bytes, end_stream=True)
                 if window_update > 0:
                     try:
                         conn.increment_flow_control_window(int(window_update), stream_id=stream_id)
