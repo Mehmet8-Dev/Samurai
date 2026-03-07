@@ -66,6 +66,67 @@ def _pkg_config_tokens(flag: str, packages: List[str]) -> List[str]:
         return []
 
 
+def _normalize_quic_crypto_backend(raw: str | None) -> str:
+    val = str(raw or "auto").strip().lower()
+    aliases = {
+        "ossl": "openssl",
+        "open_ssl": "openssl",
+        "tls": "openssl",
+        "qtls": "quictls",
+        "none": "none",
+        "off": "none",
+        "disabled": "none",
+    }
+    val = aliases.get(val, val)
+    if val in {"auto", "gnutls", "openssl", "quictls", "none"}:
+        return val
+    return "auto"
+
+
+def _resolve_quic_crypto_backend() -> Tuple[str, str, str]:
+    """
+    Resolve QUIC crypto backend with deterministic preference and optional override.
+
+    Returns:
+        backend: resolved backend name (gnutls|openssl|quictls|none)
+        pkg_name: matching pkg-config module when available, else ""
+        link_name: fallback -l<name> library name when pkg-config module is missing, else ""
+    """
+    requested = _normalize_quic_crypto_backend(os.environ.get("SAMURAI_QUIC_CRYPTO_BACKEND", "auto"))
+    candidates_by_backend = {
+        "gnutls": [
+            ("ngtcp2_crypto_gnutls", "ngtcp2_crypto_gnutls"),
+            ("libngtcp2_crypto_gnutls", "ngtcp2_crypto_gnutls"),
+        ],
+        "openssl": [
+            ("ngtcp2_crypto_ossl", "ngtcp2_crypto_ossl"),
+            ("ngtcp2_crypto_openssl", "ngtcp2_crypto_openssl"),
+            ("libngtcp2_crypto_ossl", "ngtcp2_crypto_ossl"),
+            ("libngtcp2_crypto_openssl", "ngtcp2_crypto_openssl"),
+        ],
+        "quictls": [
+            ("ngtcp2_crypto_quictls", "ngtcp2_crypto_quictls"),
+            ("libngtcp2_crypto_quictls", "ngtcp2_crypto_quictls"),
+        ],
+    }
+    ordered_backends = (
+        ["gnutls", "openssl", "quictls"]
+        if requested == "auto"
+        else ([requested] if requested in candidates_by_backend else [])
+    )
+    if requested == "none":
+        return "none", "", ""
+
+    for backend in ordered_backends:
+        for pkg_name, link_name in candidates_by_backend.get(backend, []):
+            if _pkg_config_exists(pkg_name):
+                return backend, pkg_name, ""
+        for _, link_name in candidates_by_backend.get(backend, []):
+            if ctypes.util.find_library(link_name) is not None:
+                return backend, "", link_name
+    return "none", "", ""
+
+
 def _dedupe(seq: List[str]) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -198,55 +259,34 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
             pkg_names.append(ngtcp2_pkg)
         if nghttp3_pkg:
             pkg_names.append(nghttp3_pkg)
-        crypto_pkg = None
-        for candidate in (
-            "ngtcp2_crypto_gnutls",
-            "libngtcp2_crypto_gnutls",
-            "ngtcp2_crypto_ossl",
-            "ngtcp2_crypto_openssl",
-            "ngtcp2_crypto_quictls",
-            "libngtcp2_crypto_ossl",
-            "libngtcp2_crypto_openssl",
-            "libngtcp2_crypto_quictls",
-        ):
-            if _pkg_config_exists(candidate):
-                crypto_pkg = candidate
-                break
+        crypto_backend, crypto_pkg, crypto_link_name = _resolve_quic_crypto_backend()
         if crypto_pkg:
             pkg_names.append(crypto_pkg)
             quic_crypto_linked = True
-            if "gnutls" in str(crypto_pkg):
-                quic_crypto_is_gnutls = True
-        else:
-            crypto_link_name = None
-            for candidate in (
-                "ngtcp2_crypto_gnutls",
-                "ngtcp2_crypto_ossl",
-                "ngtcp2_crypto_openssl",
-                "ngtcp2_crypto_quictls",
-            ):
-                if ctypes.util.find_library(candidate) is not None:
-                    crypto_link_name = candidate
-                    break
-            if crypto_link_name:
-                link_args.append(f"-l{crypto_link_name}")
-                quic_crypto_linked = True
-                if "gnutls" in str(crypto_link_name):
-                    quic_crypto_is_gnutls = True
+        elif crypto_link_name:
+            link_args.append(f"-l{crypto_link_name}")
             # Fallback linker names when pkg-config modules are unavailable.
             link_args.extend(["-lngtcp2", "-lnghttp3"])
-        if quic_crypto_linked:
+            quic_crypto_linked = True
+        if quic_crypto_linked and crypto_backend == "gnutls":
+            quic_crypto_is_gnutls = True
             macros.append(("SAMURAI_WITH_NGTCP2_CRYPTO", "1"))
-        else:
-            print(
-                "Warning: ngtcp2 crypto backend not found; native C QUIC loop disabled "
-                "(py bridge/fallback paths remain available)."
-            )
-        if quic_crypto_is_gnutls:
             macros.append(("SAMURAI_WITH_GNUTLS", "1"))
             macros.append(("SAMURAI_WITH_NGTCP2_GNUTLS", "1"))
             if not crypto_pkg:
                 link_args.append("-lgnutls")
+        elif quic_crypto_linked:
+            print(
+                "Warning: ngtcp2 crypto backend resolved but non-gnutls "
+                f"({crypto_backend}); native C QUIC loop requires gnutls and will stay disabled."
+            )
+        else:
+            requested_backend = _normalize_quic_crypto_backend(os.environ.get("SAMURAI_QUIC_CRYPTO_BACKEND", "auto"))
+            print(
+                "Warning: ngtcp2 crypto backend not found "
+                f"(requested={requested_backend}); native C QUIC loop disabled "
+                "(py bridge/fallback paths remain available)."
+            )
     else:
         print(
             "Warning: ngtcp2/nghttp3 dev metadata not found/disabled; "
