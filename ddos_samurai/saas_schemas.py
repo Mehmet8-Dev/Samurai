@@ -107,6 +107,9 @@ class TestStartRequest(BaseModel):
     ja3_profile: str = "none"
     h2_profile: str = "none"
     l7_quic_require_native: bool = False
+    quic_expect_header_name: str = ""
+    quic_expect_header_value_contains: str = ""
+    quic_expect_body_substring: str = ""
     ninja_mode: bool = False
 
     anomaly_types: list[int] = []

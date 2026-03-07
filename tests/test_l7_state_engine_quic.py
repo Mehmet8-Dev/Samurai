@@ -40,6 +40,9 @@ class TestL7StateEngineQuic(unittest.TestCase):
                     "quic_path": "/",
                     "quic_streams_per_conn": 2,
                     "quic_requests_per_conn": 3,
+                    "quic_expect_header_name": "Server",
+                    "quic_expect_header_value_contains": "nginx",
+                    "quic_expect_body_substring": "ok",
                     "enable_quic_py_bridge": 0,
                 },
             )
@@ -52,6 +55,9 @@ class TestL7StateEngineQuic(unittest.TestCase):
         self.assertEqual(int(out.get("quic_requests_per_conn", -1)), 3)
         self.assertGreaterEqual(int(out.get("quic_connection_attempts", -1)), 1)
         self.assertEqual(int(out.get("retry_attempts", -1)), 6)
+        self.assertEqual(str(out.get("quic_expect_header_name", "")), "server")
+        self.assertEqual(str(out.get("quic_expect_header_value_contains", "")), "nginx")
+        self.assertEqual(str(out.get("quic_expect_body_substring", "")), "ok")
 
     def test_quic_unavailable_result_contract(self):
         mode = str(l7_core.quic_stack_mode() or "")

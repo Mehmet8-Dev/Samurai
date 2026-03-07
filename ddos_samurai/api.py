@@ -374,6 +374,12 @@ def _build_test_command(payload: TestStartRequest) -> list[str]:
         cmd.extend(["--h2-profile", h2_profile])
     if bool(getattr(payload, "l7_quic_require_native", False)):
         cmd.append("--l7-quic-require-native")
+    if str(getattr(payload, "quic_expect_header_name", "") or "").strip():
+        cmd.extend(["--quic-expect-header-name", str(payload.quic_expect_header_name)])
+    if str(getattr(payload, "quic_expect_header_value_contains", "") or "").strip():
+        cmd.extend(["--quic-expect-header-value-contains", str(payload.quic_expect_header_value_contains)])
+    if str(getattr(payload, "quic_expect_body_substring", "") or "").strip():
+        cmd.extend(["--quic-expect-body-substring", str(payload.quic_expect_body_substring)])
 
     if payload.ninja_mode:
         cmd.append("--ninja-mode")

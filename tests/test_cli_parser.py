@@ -122,6 +122,9 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--http2-streams-per-conn", opts)
         self.assertIn("--l7-session-repeats", opts)
         self.assertIn("--l7-max-active-sessions", opts)
+        self.assertIn("--quic-expect-header-name", opts)
+        self.assertIn("--quic-expect-header-value-contains", opts)
+        self.assertIn("--quic-expect-body-substring", opts)
 
     def test_sender_route_defaults(self):
         parser = cli.build_parser()
@@ -149,6 +152,9 @@ class TestCliParser(unittest.TestCase):
         self.assertTrue(args.quic_require_response_headers)
         self.assertFalse(args.quic_require_response_body)
         self.assertEqual(args.quic_min_response_body_bytes, 0)
+        self.assertEqual(args.quic_expect_header_name, "")
+        self.assertEqual(args.quic_expect_header_value_contains, "")
+        self.assertEqual(args.quic_expect_body_substring, "")
         self.assertEqual(args.l7_fallback_policy, "allow")
         self.assertFalse(args.l7_capability_strict)
         self.assertFalse(args.legacy_path_enable)
@@ -351,6 +357,21 @@ class TestSenderRouteValidation(unittest.TestCase):
     def test_quic_conn_pool_size_must_be_positive(self):
         parser = cli.build_parser()
         args = parser.parse_args(["--quic-conn-pool-size", "0"])
+        self._assert_validation_fails(parser, args)
+
+    def test_quic_expect_header_name_length_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--quic-expect-header-name", "x" * 64])
+        self._assert_validation_fails(parser, args)
+
+    def test_quic_expect_header_value_contains_length_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--quic-expect-header-value-contains", "x" * 160])
+        self._assert_validation_fails(parser, args)
+
+    def test_quic_expect_body_substring_length_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--quic-expect-body-substring", "x" * 160])
         self._assert_validation_fails(parser, args)
 
     def test_sender_route_accepts_explicit_xdp_config(self):
@@ -628,3 +649,20 @@ class TestBuildTestCommandRegression(unittest.TestCase):
         )
         cmd = _build_test_command(payload)
         self.assertIn("--l7-quic-require-native", cmd)
+
+    def test_quic_response_match_flags_are_forwarded(self):
+        from ddos_samurai.saas_schemas import TestStartRequest
+        from ddos_samurai.api import _build_test_command
+
+        payload = TestStartRequest(
+            target="127.0.0.1",
+            port=443,
+            attack_vector="quic",
+            quic_expect_header_name="server",
+            quic_expect_header_value_contains="nginx",
+            quic_expect_body_substring="ok",
+        )
+        cmd = _build_test_command(payload)
+        self.assertIn("--quic-expect-header-name", cmd)
+        self.assertIn("--quic-expect-header-value-contains", cmd)
+        self.assertIn("--quic-expect-body-substring", cmd)
