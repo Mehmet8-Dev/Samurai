@@ -75,6 +75,13 @@ TX_RING yolunda explicit HugePage policy first-class olarak desteklenir:
 - `--afpacket-hugepage-mode {off,auto,required}`
 - `--afpacket-hugepage-size-kb` (default: `2048`)
 - `--afpacket-ring-target-mb` (default: `64`)
+- `--afpacket-block-size-kb` (default: `0`, auto)
+- `--afpacket-frame-size` (default: `0`, auto)
+- `--afpacket-frames-per-block` (default: `64`)
+- `--afpacket-poll-timeout-ms` (default: `1`)
+- `--afpacket-spin-limit` (default: `2000`)
+- `--afpacket-busy-poll-us` (default: `0`)
+- `--afpacket-qdisc-bypass` / `--no-afpacket-qdisc-bypass`
 - `--afpacket-mlock-ring` / `--no-afpacket-mlock-ring`
 - `--afpacket-prefault-ring` / `--no-afpacket-prefault-ring`
 

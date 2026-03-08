@@ -14,6 +14,13 @@ CLI tarafi artik yalniz parser degil, ayni zamanda profile-aware preflight katma
   - `--afpacket-hugepage-mode {off,auto,required}`
   - `--afpacket-hugepage-size-kb` (default: `2048`)
   - `--afpacket-ring-target-mb` (default: `64`)
+  - `--afpacket-block-size-kb` (default: `0`, auto)
+  - `--afpacket-frame-size` (default: `0`, auto)
+  - `--afpacket-frames-per-block` (default: `64`)
+  - `--afpacket-poll-timeout-ms` (default: `1`)
+  - `--afpacket-spin-limit` (default: `2000`)
+  - `--afpacket-busy-poll-us` (default: `0`)
+  - `--afpacket-qdisc-bypass` / `--no-afpacket-qdisc-bypass`
   - `--afpacket-mlock-ring` / `--no-afpacket-mlock-ring`
   - `--afpacket-prefault-ring` / `--no-afpacket-prefault-ring`
   - `--lab-profile {off,dedicated}`
@@ -53,6 +60,13 @@ Ortama yansitilan env anahtarlari:
 - `SAMURAI_AF_PACKET_HUGEPAGE_MODE`
 - `SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB`
 - `SAMURAI_AF_PACKET_RING_TARGET_MB`
+- `SAMURAI_AF_PACKET_BLOCK_SIZE_KB`
+- `SAMURAI_AF_PACKET_FRAME_SIZE`
+- `SAMURAI_AF_PACKET_FRAMES_PER_BLOCK`
+- `SAMURAI_AF_PACKET_POLL_TIMEOUT_MS`
+- `SAMURAI_AF_PACKET_SPIN_LIMIT`
+- `SAMURAI_AF_PACKET_BUSY_POLL_US`
+- `SAMURAI_AF_PACKET_QDISC_BYPASS`
 - `SAMURAI_AF_PACKET_MLOCK_RING`
 - `SAMURAI_AF_PACKET_PREFAULT_RING`
 

@@ -27,6 +27,13 @@ Bu dokuman AF_PACKET/TX_RING yolunda explicit HugePage policy davranisini, telem
 - `--afpacket-hugepage-mode {off,auto,required}`
 - `--afpacket-hugepage-size-kb <int>` (varsayilan: `2048`)
 - `--afpacket-ring-target-mb <int>` (varsayilan: `64`)
+- `--afpacket-block-size-kb <int>` (varsayilan: `0`, auto)
+- `--afpacket-frame-size <int>` (varsayilan: `0`, auto)
+- `--afpacket-frames-per-block <int>` (varsayilan: `64`)
+- `--afpacket-poll-timeout-ms <int>` (varsayilan: `1`)
+- `--afpacket-spin-limit <int>` (varsayilan: `2000`)
+- `--afpacket-busy-poll-us <int>` (varsayilan: `0`)
+- `--afpacket-qdisc-bypass` / `--no-afpacket-qdisc-bypass`
 - `--afpacket-mlock-ring` / `--no-afpacket-mlock-ring`
 - `--afpacket-prefault-ring` / `--no-afpacket-prefault-ring`
 
@@ -35,8 +42,23 @@ Bu dokuman AF_PACKET/TX_RING yolunda explicit HugePage policy davranisini, telem
 - `SAMURAI_AF_PACKET_HUGEPAGE_MODE`
 - `SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB`
 - `SAMURAI_AF_PACKET_RING_TARGET_MB`
+- `SAMURAI_AF_PACKET_BLOCK_SIZE_KB`
+- `SAMURAI_AF_PACKET_FRAME_SIZE`
+- `SAMURAI_AF_PACKET_FRAMES_PER_BLOCK`
+- `SAMURAI_AF_PACKET_POLL_TIMEOUT_MS`
+- `SAMURAI_AF_PACKET_SPIN_LIMIT`
+- `SAMURAI_AF_PACKET_BUSY_POLL_US`
+- `SAMURAI_AF_PACKET_QDISC_BYPASS`
 - `SAMURAI_AF_PACKET_MLOCK_RING`
 - `SAMURAI_AF_PACKET_PREFAULT_RING`
+
+## Ring Tuning Notlari
+
+- Ring geometrisi: `frame_size`, `frames_per_block`, `block_size`, `block_nr`.
+- Auto modda geometri paket boyuna gore hizalama/pow2 kurallariyla secilir.
+- `poll_timeout_ms` + `spin_limit` TX frame bekleme stratejisini belirler.
+- `busy_poll_us` ve `qdisc_bypass` best-effort kernel tuning knob'laridir.
+- `tp_retire_blk_tov` TX_RING icin RX-ozel bir alan oldugu icin sifir tutulur.
 
 ## Runtime Telemetry Alanlari
 

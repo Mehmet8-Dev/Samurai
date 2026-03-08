@@ -106,6 +106,14 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--afpacket-hugepage-mode", opts)
         self.assertIn("--afpacket-hugepage-size-kb", opts)
         self.assertIn("--afpacket-ring-target-mb", opts)
+        self.assertIn("--afpacket-block-size-kb", opts)
+        self.assertIn("--afpacket-frame-size", opts)
+        self.assertIn("--afpacket-frames-per-block", opts)
+        self.assertIn("--afpacket-poll-timeout-ms", opts)
+        self.assertIn("--afpacket-spin-limit", opts)
+        self.assertIn("--afpacket-busy-poll-us", opts)
+        self.assertIn("--afpacket-qdisc-bypass", opts)
+        self.assertIn("--no-afpacket-qdisc-bypass", opts)
         self.assertIn("--afpacket-mlock-ring", opts)
         self.assertIn("--no-afpacket-mlock-ring", opts)
         self.assertIn("--afpacket-prefault-ring", opts)
@@ -145,6 +153,13 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.afpacket_hugepage_mode, "off")
         self.assertEqual(args.afpacket_hugepage_size_kb, 2048)
         self.assertEqual(args.afpacket_ring_target_mb, 64)
+        self.assertEqual(args.afpacket_block_size_kb, 0)
+        self.assertEqual(args.afpacket_frame_size, 0)
+        self.assertEqual(args.afpacket_frames_per_block, 64)
+        self.assertEqual(args.afpacket_poll_timeout_ms, 1)
+        self.assertEqual(args.afpacket_spin_limit, 2000)
+        self.assertEqual(args.afpacket_busy_poll_us, 0)
+        self.assertTrue(args.afpacket_qdisc_bypass)
         self.assertFalse(args.afpacket_mlock_ring)
         self.assertTrue(args.afpacket_prefault_ring)
         self.assertEqual(args.lab_profile, "off")
@@ -348,6 +363,36 @@ class TestSenderRouteValidation(unittest.TestCase):
     def test_afpacket_hugepage_size_validation(self):
         parser = cli.build_parser()
         args = parser.parse_args(["--afpacket-hugepage-size-kb", "0", "--sender-backend", "txring"])
+        self._assert_validation_fails(parser, args)
+
+    def test_afpacket_block_size_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--afpacket-block-size-kb", "-1", "--sender-backend", "txring"])
+        self._assert_validation_fails(parser, args)
+
+    def test_afpacket_frame_size_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--afpacket-frame-size", "-1", "--sender-backend", "txring"])
+        self._assert_validation_fails(parser, args)
+
+    def test_afpacket_frames_per_block_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--afpacket-frames-per-block", "0", "--sender-backend", "txring"])
+        self._assert_validation_fails(parser, args)
+
+    def test_afpacket_poll_timeout_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--afpacket-poll-timeout-ms", "-1", "--sender-backend", "txring"])
+        self._assert_validation_fails(parser, args)
+
+    def test_afpacket_spin_limit_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--afpacket-spin-limit", "-1", "--sender-backend", "txring"])
+        self._assert_validation_fails(parser, args)
+
+    def test_afpacket_busy_poll_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--afpacket-busy-poll-us", "-1", "--sender-backend", "txring"])
         self._assert_validation_fails(parser, args)
 
     def test_dataplane_required_requires_fail_policy(self):
