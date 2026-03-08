@@ -68,6 +68,19 @@ pip install cupy-cuda12x numba-cuda[cu13]
 - `--state-timeout-sec` (vars: `60`, env: `SAMURAI_STATE_TIMEOUT_SEC`)
 - `--state-sweep-interval-ms` (vars: `1000`, env: `SAMURAI_STATE_SWEEP_INTERVAL_MS`)
 
+### AF_PACKET HugePage Policy (Yeni)
+
+TX_RING yolunda explicit HugePage policy first-class olarak desteklenir:
+
+- `--afpacket-hugepage-mode {off,auto,required}`
+- `--afpacket-hugepage-size-kb` (default: `2048`)
+- `--afpacket-ring-target-mb` (default: `64`)
+- `--afpacket-mlock-ring` / `--no-afpacket-mlock-ring`
+- `--afpacket-prefault-ring` / `--no-afpacket-prefault-ring`
+
+`--lab-profile dedicated` + `--sender-backend txring` kombinasyonunda mode otomatik `required` olur.
+Detay: `docs/18-afpacket-hugepage-policy.md`
+
 ### 4) Opsiyonel browser automation (Ninja)
 
 ```bash
@@ -162,6 +175,18 @@ Detayli teknik dokumantasyon:
 - `docs/05-gpu.md`
 - `docs/12-dashboard.md`
 - `docs/13-api.md`
+- `docs/18-afpacket-hugepage-policy.md`
+
+## AF_PACKET HugePage Hizli Ornek
+
+```bash
+python -m ddos_samurai.cli \
+  --target 127.0.0.1 --port 80 --protocol tcp \
+  --attack-vector basic --count 100000 --confirm \
+  --sender-backend txring --sender-fallback-policy fail \
+  --afpacket-hugepage-mode auto \
+  --run-report --run-report-out artifacts/live_run_hp
+```
 
 ## Proje Dizini (kisa)
 
