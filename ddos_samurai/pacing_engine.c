@@ -1880,80 +1880,116 @@ static PyObject *py_get_pacing_stats(PyObject *self, PyObject *args)
         packet_version_name(snap.txring_packet_version);
     const char *last_errno_name = flush_errno_name(snap.txring_flush_last_errno);
 
-    return Py_BuildValue(
-        "{s:K, s:K, s:d, s:d, s:d, s:d,"
-        " s:K, s:K, s:d, s:d,"
-        " s:d, s:d, s:d, s:d,"
-        " s:d, s:d, s:d,"
-        " s:K, s:K,"
-        " s:i, s:K,"
-        " s:K, s:K, s:K, s:K, s:K, s:K, s:i, s:s, s:K, s:K,"
-        " s:K, s:K, s:K, s:i, s:s,"
-        " s:s, s:i, s:s, s:i, s:i, s:i, s:K, s:K, s:K, s:K, s:K,"
-        " s:K, s:K, s:K, s:K,"
-        " s:O}",
-        "total_packets",      snap.total_packets,
-        "total_bytes",        snap.total_bytes,
-        "elapsed_ns",         snap.elapsed_ns,
-        "target_rps",         snap.target_rps,
-        "actual_rps",         snap.actual_rps,
-        "rate_accuracy_pct",  snap.rate_accuracy_pct,
+    PyObject *out = PyDict_New();
+    PyObject *tmp = NULL;
+    if (!out) {
+        Py_DECREF(hist);
+        return NULL;
+    }
 
-        "ipg_min_ns",         snap.ipg_min_ns == UINT64_MAX ? 0ULL : snap.ipg_min_ns,
-        "ipg_max_ns",         snap.ipg_max_ns,
-        "ipg_mean_ns",        ipg_mean,
-        "ipg_stddev_ns",      ipg_stddev,
+#define SET_U64(_k, _v) do { \
+    tmp = PyLong_FromUnsignedLongLong((unsigned long long)(_v)); \
+    if (!tmp || PyDict_SetItemString(out, (_k), tmp) < 0) { \
+        Py_XDECREF(tmp); Py_DECREF(hist); Py_DECREF(out); return NULL; \
+    } \
+    Py_DECREF(tmp); \
+} while (0)
 
-        "jitter_min_ns",      snap.jitter_min_ns > 1e17 ? 0.0 : snap.jitter_min_ns,
-        "jitter_max_ns",      snap.jitter_max_ns,
-        "jitter_mean_ns",     j_mean,
-        "jitter_stddev_ns",   j_stddev,
+#define SET_I64(_k, _v) do { \
+    tmp = PyLong_FromLongLong((long long)(_v)); \
+    if (!tmp || PyDict_SetItemString(out, (_k), tmp) < 0) { \
+        Py_XDECREF(tmp); Py_DECREF(hist); Py_DECREF(out); return NULL; \
+    } \
+    Py_DECREF(tmp); \
+} while (0)
 
-        "jitter_p50_ns",      p50,
-        "jitter_p95_ns",      p95,
-        "jitter_p99_ns",      p99,
+#define SET_DBL(_k, _v) do { \
+    tmp = PyFloat_FromDouble((double)(_v)); \
+    if (!tmp || PyDict_SetItemString(out, (_k), tmp) < 0) { \
+        Py_XDECREF(tmp); Py_DECREF(hist); Py_DECREF(out); return NULL; \
+    } \
+    Py_DECREF(tmp); \
+} while (0)
 
-        "busywait_cycles",    snap.busywait_cycles,
-        "sleep_calls",        snap.sleep_calls,
+#define SET_STR(_k, _v) do { \
+    tmp = PyUnicode_FromString((_v)); \
+    if (!tmp || PyDict_SetItemString(out, (_k), tmp) < 0) { \
+        Py_XDECREF(tmp); Py_DECREF(hist); Py_DECREF(out); return NULL; \
+    } \
+    Py_DECREF(tmp); \
+} while (0)
 
-        "so_txtime_active",   snap.so_txtime_active,
-        "txtime_errors",      snap.txtime_errors,
+    SET_U64("total_packets", snap.total_packets);
+    SET_U64("total_bytes", snap.total_bytes);
+    SET_DBL("elapsed_ns", snap.elapsed_ns);
+    SET_DBL("target_rps", snap.target_rps);
+    SET_DBL("actual_rps", snap.actual_rps);
+    SET_DBL("rate_accuracy_pct", snap.rate_accuracy_pct);
 
-        "txring_flush_call_count", snap.txring_flush_call_count,
-        "txring_flush_error_count", snap.txring_flush_error_count,
-        "txring_flush_eagain_count", snap.txring_flush_eagain_count,
-        "txring_flush_enobufs_count", snap.txring_flush_enobufs_count,
-        "txring_flush_ebusy_count", snap.txring_flush_ebusy_count,
-        "txring_flush_other_errno_count", snap.txring_flush_other_errno_count,
-        "txring_flush_last_errno", snap.txring_flush_last_errno,
-        "txring_flush_last_errno_name", last_errno_name,
-        "txring_frame_wait_ns", snap.txring_frame_wait_ns,
-        "txring_poll_count", snap.txring_poll_count,
-        "txring_tp_packets", snap.txring_tp_packets,
-        "txring_tp_drops", snap.txring_tp_drops,
-        "txring_tp_freeze_q_cnt", snap.txring_tp_freeze_q_cnt,
-        "txring_packet_version", snap.txring_packet_version,
-        "txring_packet_version_name", txring_packet_version_name,
+    SET_U64("ipg_min_ns", (snap.ipg_min_ns == UINT64_MAX ? 0ULL : snap.ipg_min_ns));
+    SET_U64("ipg_max_ns", snap.ipg_max_ns);
+    SET_DBL("ipg_mean_ns", ipg_mean);
+    SET_DBL("ipg_stddev_ns", ipg_stddev);
 
-        "afpacket_hugepage_mode", afpacket_hp_mode_name(snap.afpacket_hugepage_mode),
-        "afpacket_hugepage_effective", snap.afpacket_hugepage_effective,
-        "afpacket_hugepage_reason", snap.afpacket_hugepage_reason,
-        "afpacket_hugepage_size_kb", snap.afpacket_hugepage_size_kb,
-        "afpacket_madvise_hugepage_ok", snap.afpacket_madvise_hugepage_ok,
-        "afpacket_mlock_ok", snap.afpacket_mlock_ok,
-        "afpacket_prefault_pages", snap.afpacket_prefault_pages,
-        "afpacket_smaps_kernel_page_kb", snap.afpacket_smaps_kernel_page_kb,
-        "afpacket_smaps_anon_hugepages_kb", snap.afpacket_smaps_anon_hugepages_kb,
-        "afpacket_ring_block_size", snap.afpacket_ring_block_size,
-        "afpacket_ring_block_nr", snap.afpacket_ring_block_nr,
-        "afpacket_ring_size_bytes", snap.afpacket_ring_size_bytes,
+    SET_DBL("jitter_min_ns", (snap.jitter_min_ns > 1e17 ? 0.0 : snap.jitter_min_ns));
+    SET_DBL("jitter_max_ns", snap.jitter_max_ns);
+    SET_DBL("jitter_mean_ns", j_mean);
+    SET_DBL("jitter_stddev_ns", j_stddev);
+    SET_DBL("jitter_p50_ns", p50);
+    SET_DBL("jitter_p95_ns", p95);
+    SET_DBL("jitter_p99_ns", p99);
 
-        "syscall_overhead_ns", snap.syscall_overhead_ns,
-        "sleep_overhead_ns",   snap.sleep_overhead_ns,
-        "spin_threshold_ns",   g_spin_threshold_ns,
+    SET_U64("busywait_cycles", snap.busywait_cycles);
+    SET_U64("sleep_calls", snap.sleep_calls);
+    SET_I64("so_txtime_active", snap.so_txtime_active);
+    SET_U64("txtime_errors", snap.txtime_errors);
 
-        "ipg_histogram",       hist
-    );
+    SET_U64("txring_flush_call_count", snap.txring_flush_call_count);
+    SET_U64("txring_flush_error_count", snap.txring_flush_error_count);
+    SET_U64("txring_flush_eagain_count", snap.txring_flush_eagain_count);
+    SET_U64("txring_flush_enobufs_count", snap.txring_flush_enobufs_count);
+    SET_U64("txring_flush_ebusy_count", snap.txring_flush_ebusy_count);
+    SET_U64("txring_flush_other_errno_count", snap.txring_flush_other_errno_count);
+    SET_I64("txring_flush_last_errno", snap.txring_flush_last_errno);
+    SET_STR("txring_flush_last_errno_name", last_errno_name);
+    SET_U64("txring_frame_wait_ns", snap.txring_frame_wait_ns);
+    SET_U64("txring_poll_count", snap.txring_poll_count);
+    SET_U64("txring_tp_packets", snap.txring_tp_packets);
+    SET_U64("txring_tp_drops", snap.txring_tp_drops);
+    SET_U64("txring_tp_freeze_q_cnt", snap.txring_tp_freeze_q_cnt);
+    SET_I64("txring_packet_version", snap.txring_packet_version);
+    SET_STR("txring_packet_version_name", txring_packet_version_name);
+
+    SET_STR("afpacket_hugepage_mode", afpacket_hp_mode_name(snap.afpacket_hugepage_mode));
+    SET_I64("afpacket_hugepage_effective", snap.afpacket_hugepage_effective);
+    SET_STR("afpacket_hugepage_reason", snap.afpacket_hugepage_reason);
+    SET_I64("afpacket_hugepage_size_kb", snap.afpacket_hugepage_size_kb);
+    SET_I64("afpacket_madvise_hugepage_ok", snap.afpacket_madvise_hugepage_ok);
+    SET_I64("afpacket_mlock_ok", snap.afpacket_mlock_ok);
+    SET_U64("afpacket_prefault_pages", snap.afpacket_prefault_pages);
+    SET_U64("afpacket_smaps_kernel_page_kb", snap.afpacket_smaps_kernel_page_kb);
+    SET_U64("afpacket_smaps_anon_hugepages_kb", snap.afpacket_smaps_anon_hugepages_kb);
+    SET_U64("afpacket_ring_block_size", snap.afpacket_ring_block_size);
+    SET_U64("afpacket_ring_block_nr", snap.afpacket_ring_block_nr);
+    SET_U64("afpacket_ring_size_bytes", snap.afpacket_ring_size_bytes);
+
+    SET_U64("syscall_overhead_ns", snap.syscall_overhead_ns);
+    SET_U64("sleep_overhead_ns", snap.sleep_overhead_ns);
+    SET_U64("spin_threshold_ns", g_spin_threshold_ns);
+
+    if (PyDict_SetItemString(out, "ipg_histogram", hist) < 0) {
+        Py_DECREF(hist);
+        Py_DECREF(out);
+        return NULL;
+    }
+    Py_DECREF(hist);
+
+#undef SET_STR
+#undef SET_DBL
+#undef SET_I64
+#undef SET_U64
+
+    return out;
 }
 
 /* ========================================================================== */
