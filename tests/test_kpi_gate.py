@@ -13,6 +13,8 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
             "txring_flush_error_ratio_pct": 0.1,
             "txring_flush_eagain_ratio_pct": 0.2,
             "txring_hold_block_pressure_pct": 10.0,
+            "sender_paths_used": {"C_EXT_L3": 1},
+            "sender_fallback_reason": "none",
         }
 
     def test_dedicated_non_quic_run_does_not_require_quic_metrics(self):
@@ -95,6 +97,20 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
         out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
         self.assertEqual(out.status, "fail")
         self.assertTrue(any(v.startswith("txring_flush_error_ratio_pct:missing_metric") for v in out.violations))
+
+    def test_dedicated_fails_when_sender_fallback_reason_not_none(self):
+        results = self._base_results()
+        results["sender_fallback_reason"] = "txring_unavailable"
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertEqual(out.status, "fail")
+        self.assertTrue(any(v.startswith("sender_fallback_reason:") for v in out.violations))
+
+    def test_dedicated_fails_when_sender_path_drift_detected(self):
+        results = self._base_results()
+        results["sender_paths_used"] = {"TX_RING_L2": 1, "C_EXT_L3": 1}
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertEqual(out.status, "fail")
+        self.assertTrue(any(v.startswith("sender_paths_used:") for v in out.violations))
 
     def test_dev_profile_is_supported(self):
         results = self._base_results()

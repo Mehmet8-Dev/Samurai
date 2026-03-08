@@ -84,6 +84,8 @@ Runner artik zorunlu olarak su kurali uygular:
 
 - `parity.normalized_results.kpi_gate_status == pass`
 - `parity.normalized_results.score_eligible == 1`
+- `dedicated_lab` icin `sender_fallback_reason == none`
+- `dedicated_lab` icin `sender_paths_used` tek aktif path icermeli (`MIXED` veya coklu path drift fail).
 
 Bu sartlardan biri saglanmazsa profile run pipeline sonucu fail olur.
 

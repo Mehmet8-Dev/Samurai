@@ -59,3 +59,18 @@ class TestDataplaneCoreIntegration(unittest.TestCase):
         self.assertEqual(str(snap.get("afpacket_hugepage_mode", "")), "required")
         self.assertEqual(int(snap.get("afpacket_hugepage_size_kb", 0) or 0), 2048)
         self.assertEqual(int(snap.get("afpacket_ring_target_mb", 0) or 0), 64)
+
+    def test_required_mode_does_not_resolve_to_python_backend(self):
+        handle = dataplane_core.open(
+            {
+                "backend": "auto",
+                "fallback_policy": "allow",
+                "core_mode": "required",
+                "allow_python_fallback": 1,
+            }
+        )
+        try:
+            snap = dict(dataplane_core.snapshot(handle) or {})
+        finally:
+            dataplane_core.close(handle)
+        self.assertNotEqual(str(snap.get("backend", "") or ""), "python")

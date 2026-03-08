@@ -2819,6 +2819,28 @@ async def worker_process(
                 if not worker_error:
                     worker_error = f"high error rate: {_ws_errors}/{_ws_attempted}"
 
+        # Dedicated + required dataplane policy:
+        # Any sender fallback or sender-path drift is considered a hard failure.
+        if worker_status == "ok":
+            _lab_profile = str(args.get("lab_profile", "off") or "off").strip().lower()
+            _core_mode = str(args.get("dataplane_core_mode", "off") or "off").strip().lower()
+            _hot_path_strict = (_lab_profile == "dedicated" and _core_mode == "required")
+            if _hot_path_strict:
+                _ws_sender_path = str(worker_stats.get("sender_path", "") or "").strip()
+                _ws_fallback_reason = str(worker_stats.get("sender_fallback_reason", "none") or "none").strip().lower()
+                _ws_fallback_count = int(worker_stats.get("fallback_count", 0) or 0)
+                _has_sender_drift = bool(_ws_sender_path.upper() == "MIXED")
+                _has_sender_fallback = bool(_ws_fallback_reason not in {"", "none"} or _ws_fallback_count > 0)
+                if _has_sender_drift or _has_sender_fallback:
+                    worker_status = "failed"
+                    if not worker_error:
+                        worker_error = (
+                            "hot_path_policy_violation: "
+                            f"sender_path={_ws_sender_path or 'unknown'} "
+                            f"fallback_reason={_ws_fallback_reason or 'none'} "
+                            f"fallback_count={_ws_fallback_count}"
+                        )
+
         # NOTE:
         # Live counters are already streamed incrementally by sender functions
         # through live_progress/live_sent/live_errors. Adding worker_stats again

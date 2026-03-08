@@ -63,7 +63,9 @@
         "quic_stream_fail_ratio_max": 0.01,
         "quic_handshake_fail_ratio_max": 0.01,
         "quic_response_validation_fail_ratio_max": 0.01,
-        "quic_stack_mode_required": "h3_stateful"
+        "quic_stack_mode_required": "h3_stateful",
+        "sender_fallback_reason_required": "none",
+        "sender_path_single_required": 1
       }
     },
     "developer_fallback": {

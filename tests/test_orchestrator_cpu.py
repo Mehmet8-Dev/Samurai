@@ -412,6 +412,60 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["status"], "interrupted")
 
+    async def test_dedicated_required_fails_when_sender_fallback_detected(self):
+        args = _base_args()
+        args["attack_vector"] = "basic"
+        args["count"] = 10
+        args["lab_profile"] = "dedicated"
+        args["dataplane_core_mode"] = "required"
+
+        events = []
+        mock_sender = AsyncMock(
+            return_value={
+                "attempted": 10,
+                "sent": 10,
+                "errors": 0,
+                "bytes_sent_est": 640,
+                "sender_path": "DP_TX_RING",
+                "fallback_count": 1,
+                "sender_fallback_reason": "txring_unavailable",
+            }
+        )
+        with patch.object(orchestrator.senders, "packet_sender", mock_sender):
+            await orchestrator.worker_process(
+                worker_id=1, args=args, ssl_context=None, run_events=events,
+            )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["status"], "failed")
+        self.assertIn("hot_path_policy_violation", str(events[0].get("error", "")))
+
+    async def test_dedicated_required_fails_when_sender_path_drift_detected(self):
+        args = _base_args()
+        args["attack_vector"] = "basic"
+        args["count"] = 10
+        args["lab_profile"] = "dedicated"
+        args["dataplane_core_mode"] = "required"
+
+        events = []
+        mock_sender = AsyncMock(
+            return_value={
+                "attempted": 10,
+                "sent": 10,
+                "errors": 0,
+                "bytes_sent_est": 640,
+                "sender_path": "MIXED",
+                "fallback_count": 0,
+                "sender_fallback_reason": "none",
+            }
+        )
+        with patch.object(orchestrator.senders, "packet_sender", mock_sender):
+            await orchestrator.worker_process(
+                worker_id=1, args=args, ssl_context=None, run_events=events,
+            )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["status"], "failed")
+        self.assertIn("hot_path_policy_violation", str(events[0].get("error", "")))
+
 
 class TestStatsAggregateHelpers(unittest.TestCase):
     def test_add_stats_aggregates_pacing_fields(self):

@@ -107,6 +107,8 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "quic_handshake_fail_ratio_max": 0.01,
         "quic_response_validation_fail_ratio_max": 0.01,
         "quic_stack_mode_required": "h3_stateful",
+        "sender_fallback_reason_required": "none",
+        "sender_path_single_required": 1,
     },
 }
 
@@ -181,6 +183,10 @@ def _merge_gate_defaults(profile: str, parity_matrix_path: Optional[str] = None)
         base["quic_response_validation_fail_ratio_max"] = parity["quic_response_validation_fail_ratio_max"]
     if "quic_stack_mode_required" in parity:
         base["quic_stack_mode_required"] = parity["quic_stack_mode_required"]
+    if "sender_fallback_reason_required" in parity:
+        base["sender_fallback_reason_required"] = parity["sender_fallback_reason_required"]
+    if "sender_path_single_required" in parity:
+        base["sender_path_single_required"] = parity["sender_path_single_required"]
     return base
 
 
@@ -410,6 +416,28 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
                 required=bool(quic_scope),
             )
         )
+    sender_fallback_required = str(gates.get("sender_fallback_reason_required", "") or "").strip()
+    if sender_fallback_required:
+        rules.append(
+            KpiGateRule(
+                "sender_fallback_reason",
+                "sender_fallback_reason",
+                "eq",
+                sender_fallback_required,
+                required=bool(dedicated_strict),
+            )
+        )
+    sender_path_single_required = int(gates.get("sender_path_single_required", 0) or 0)
+    if sender_path_single_required > 0:
+        rules.append(
+            KpiGateRule(
+                "sender_paths_used",
+                "sender_paths_used",
+                "single_path",
+                "single_path",
+                required=bool(dedicated_strict),
+            )
+        )
     return rules
 
 
@@ -474,6 +502,27 @@ def evaluate(
                 passed = fv <= float(rule.threshold)
                 if not passed:
                     detail = f"expected<={float(rule.threshold):.6g} actual={fv:.6g}"
+        elif rule.op == "single_path":
+            if not isinstance(value, dict):
+                passed = False
+                detail = "non_dict"
+            else:
+                active_paths: List[str] = []
+                for key, raw_count in value.items():
+                    fv = _to_float(raw_count)
+                    if fv is None:
+                        continue
+                    if fv > 0.0:
+                        active_paths.append(str(key or "").strip())
+                active_paths = [p for p in active_paths if p]
+                if len(active_paths) != 1:
+                    passed = False
+                    detail = f"expected_single_path actual={len(active_paths)}"
+                elif str(active_paths[0] or "").strip().upper() == "MIXED":
+                    passed = False
+                    detail = "drift_mixed"
+                else:
+                    detail = f"path={active_paths[0]}"
 
         evaluated.append(
             {

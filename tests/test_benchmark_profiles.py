@@ -95,6 +95,56 @@ class TestBenchmarkProfiles(unittest.TestCase):
             self.assertTrue(any("kpi_gate_status" in str(item) for item in missing))
             self.assertTrue(any("score_eligible" in str(item) for item in missing))
 
+    def test_dedicated_artifact_validation_fails_on_sender_path_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            artifact_dir = Path(td).resolve()
+            payload = {
+                "parity": {
+                    "normalized_results": {
+                        "kpi_gate_status": "pass",
+                        "score_eligible": 1,
+                        "sender_fallback_reason": "none",
+                        "sender_paths_used": {"TX_RING_L2": 1, "C_EXT_L3": 1},
+                    }
+                }
+            }
+            (artifact_dir / "benchmark_summary.json").write_text(json.dumps(payload), encoding="utf-8")
+            (artifact_dir / "benchmark_meta.json").write_text("{}", encoding="utf-8")
+            runtime = {
+                "profile": "dedicated_lab",
+                "artifact_dir": str(artifact_dir),
+                "required_files": ["benchmark_summary.json", "benchmark_meta.json"],
+                "required_summary_fields": [],
+            }
+            ok_full, missing = benchmark_profiles._validate_artifacts(runtime, ignore_meta=False)
+            self.assertFalse(ok_full)
+            self.assertTrue(any("sender_path_drift" in str(item) for item in missing))
+
+    def test_dedicated_artifact_validation_fails_on_sender_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            artifact_dir = Path(td).resolve()
+            payload = {
+                "parity": {
+                    "normalized_results": {
+                        "kpi_gate_status": "pass",
+                        "score_eligible": 1,
+                        "sender_fallback_reason": "txring_unavailable",
+                        "sender_paths_used": {"TX_RING_L2": 1},
+                    }
+                }
+            }
+            (artifact_dir / "benchmark_summary.json").write_text(json.dumps(payload), encoding="utf-8")
+            (artifact_dir / "benchmark_meta.json").write_text("{}", encoding="utf-8")
+            runtime = {
+                "profile": "dedicated_lab",
+                "artifact_dir": str(artifact_dir),
+                "required_files": ["benchmark_summary.json", "benchmark_meta.json"],
+                "required_summary_fields": [],
+            }
+            ok_full, missing = benchmark_profiles._validate_artifacts(runtime, ignore_meta=False)
+            self.assertFalse(ok_full)
+            self.assertTrue(any("sender_fallback_reason" in str(item) for item in missing))
+
 
 if __name__ == "__main__":
     unittest.main()

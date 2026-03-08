@@ -148,6 +148,28 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                 missing.append(f"{summary_path}::kpi_gate_status::{gate_status or 'missing'}")
             if score_eligible != 1:
                 missing.append(f"{summary_path}::score_eligible::{score_eligible_raw}")
+            profile_name = str(runtime.get("profile", "") or "").strip().lower()
+            if profile_name == "dedicated_lab":
+                sender_fallback_reason = str(normalized.get("sender_fallback_reason", "") or "").strip().lower()
+                if sender_fallback_reason not in {"", "none"}:
+                    missing.append(f"{summary_path}::sender_fallback_reason::{sender_fallback_reason}")
+                sender_paths_used = normalized.get("sender_paths_used")
+                if not isinstance(sender_paths_used, dict):
+                    missing.append(f"{summary_path}::sender_paths_used::non_dict")
+                else:
+                    active_paths = []
+                    for key, raw_count in sender_paths_used.items():
+                        try:
+                            cnt = float(raw_count)
+                        except Exception:
+                            continue
+                        if cnt > 0:
+                            active_paths.append(str(key or "").strip())
+                    active_paths = [p for p in active_paths if p]
+                    if len(active_paths) != 1:
+                        missing.append(f"{summary_path}::sender_path_drift::{len(active_paths)}")
+                    elif str(active_paths[0]).upper() == "MIXED":
+                        missing.append(f"{summary_path}::sender_path_drift::MIXED")
         except Exception as exc:
             missing.append(f"{summary_path}::pipeline_parse_error::{type(exc).__name__}: {exc}")
 
