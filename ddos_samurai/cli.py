@@ -353,6 +353,13 @@ def _report_inputs_from_args(args) -> dict:
         "afpacket_hugepage_mode": str(getattr(args, "afpacket_hugepage_mode", "off")),
         "afpacket_hugepage_size_kb": int(getattr(args, "afpacket_hugepage_size_kb", 2048) or 2048),
         "afpacket_ring_target_mb": int(getattr(args, "afpacket_ring_target_mb", 64) or 64),
+        "afpacket_block_size_kb": int(getattr(args, "afpacket_block_size_kb", 0) or 0),
+        "afpacket_frame_size": int(getattr(args, "afpacket_frame_size", 0) or 0),
+        "afpacket_frames_per_block": int(getattr(args, "afpacket_frames_per_block", 64) or 64),
+        "afpacket_poll_timeout_ms": int(getattr(args, "afpacket_poll_timeout_ms", 1) or 1),
+        "afpacket_spin_limit": int(getattr(args, "afpacket_spin_limit", 2000) or 2000),
+        "afpacket_busy_poll_us": int(getattr(args, "afpacket_busy_poll_us", 0) or 0),
+        "afpacket_qdisc_bypass": bool(getattr(args, "afpacket_qdisc_bypass", True)),
         "afpacket_mlock_ring": bool(getattr(args, "afpacket_mlock_ring", False)),
         "afpacket_prefault_ring": bool(getattr(args, "afpacket_prefault_ring", True)),
         "lab_profile": str(getattr(args, "lab_profile", "off")),
@@ -505,6 +512,18 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: --afpacket-hugepage-size-kb >= 1 olmalıdır.")
     if int(getattr(args, "afpacket_ring_target_mb", 64) or 0) <= 0:
         parser.error("Hata: --afpacket-ring-target-mb >= 1 olmalıdır.")
+    if int(getattr(args, "afpacket_block_size_kb", 0) or 0) < 0:
+        parser.error("Hata: --afpacket-block-size-kb >= 0 olmalıdır (0=auto).")
+    if int(getattr(args, "afpacket_frame_size", 0) or 0) < 0:
+        parser.error("Hata: --afpacket-frame-size >= 0 olmalıdır (0=auto).")
+    if int(getattr(args, "afpacket_frames_per_block", 64) or 0) <= 0:
+        parser.error("Hata: --afpacket-frames-per-block >= 1 olmalıdır.")
+    if int(getattr(args, "afpacket_poll_timeout_ms", 1) or 0) < 0:
+        parser.error("Hata: --afpacket-poll-timeout-ms >= 0 olmalıdır.")
+    if int(getattr(args, "afpacket_spin_limit", 2000) or 0) < 0:
+        parser.error("Hata: --afpacket-spin-limit >= 0 olmalıdır.")
+    if int(getattr(args, "afpacket_busy_poll_us", 0) or 0) < 0:
+        parser.error("Hata: --afpacket-busy-poll-us >= 0 olmalıdır.")
     if int(getattr(args, "http2_connections", 1) or 0) <= 0:
         parser.error("Hata: --http2-connections >= 1 olmalıdır.")
     if int(getattr(args, "http2_streams_per_conn", 100) or 0) <= 0:
@@ -958,6 +977,57 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_env_int("SAMURAI_AF_PACKET_RING_TARGET_MB", 64),
         help="AF_PACKET TX_RING hedef toplam boyutu (MB), varsayılan: 64.",
+    )
+    parser.add_argument(
+        "--afpacket-block-size-kb",
+        type=int,
+        default=_env_int("SAMURAI_AF_PACKET_BLOCK_SIZE_KB", 0),
+        help="AF_PACKET TX_RING block boyutu (kB). 0=auto (frame-size ve frames-per-block'e gore).",
+    )
+    parser.add_argument(
+        "--afpacket-frame-size",
+        type=int,
+        default=_env_int("SAMURAI_AF_PACKET_FRAME_SIZE", 0),
+        help="AF_PACKET TX_RING frame boyutu (byte). 0=auto.",
+    )
+    parser.add_argument(
+        "--afpacket-frames-per-block",
+        type=int,
+        default=_env_int("SAMURAI_AF_PACKET_FRAMES_PER_BLOCK", 64),
+        help="AF_PACKET block basina hedef frame sayisi (block-size auto modunda kullanilir).",
+    )
+    parser.add_argument(
+        "--afpacket-poll-timeout-ms",
+        type=int,
+        default=_env_int("SAMURAI_AF_PACKET_POLL_TIMEOUT_MS", 1),
+        help="AF_PACKET frame bekleme poll timeout tabani (ms).",
+    )
+    parser.add_argument(
+        "--afpacket-spin-limit",
+        type=int,
+        default=_env_int("SAMURAI_AF_PACKET_SPIN_LIMIT", 2000),
+        help="AF_PACKET frame bekleme spin sayisi limiti.",
+    )
+    parser.add_argument(
+        "--afpacket-busy-poll-us",
+        type=int,
+        default=_env_int("SAMURAI_AF_PACKET_BUSY_POLL_US", 0),
+        help="SO_BUSY_POLL mikro saniye degeri (0=kapali, best-effort).",
+    )
+    parser.add_argument(
+        "--afpacket-qdisc-bypass",
+        dest="afpacket_qdisc_bypass",
+        action="store_true",
+        help="AF_PACKET TX yolu icin PACKET_QDISC_BYPASS kullan (varsayilan: acik).",
+    )
+    parser.add_argument(
+        "--no-afpacket-qdisc-bypass",
+        dest="afpacket_qdisc_bypass",
+        action="store_false",
+        help="AF_PACKET TX yolu icin PACKET_QDISC_BYPASS kapat.",
+    )
+    parser.set_defaults(
+        afpacket_qdisc_bypass=_env_flag("SAMURAI_AF_PACKET_QDISC_BYPASS", "1")
     )
     parser.add_argument(
         "--afpacket-mlock-ring",
@@ -1627,6 +1697,27 @@ def main(argv=None):
     os.environ["SAMURAI_AF_PACKET_RING_TARGET_MB"] = str(
         int(getattr(args, "afpacket_ring_target_mb", 64) or 64)
     )
+    os.environ["SAMURAI_AF_PACKET_BLOCK_SIZE_KB"] = str(
+        int(getattr(args, "afpacket_block_size_kb", 0) or 0)
+    )
+    os.environ["SAMURAI_AF_PACKET_FRAME_SIZE"] = str(
+        int(getattr(args, "afpacket_frame_size", 0) or 0)
+    )
+    os.environ["SAMURAI_AF_PACKET_FRAMES_PER_BLOCK"] = str(
+        int(getattr(args, "afpacket_frames_per_block", 64) or 64)
+    )
+    os.environ["SAMURAI_AF_PACKET_POLL_TIMEOUT_MS"] = str(
+        int(getattr(args, "afpacket_poll_timeout_ms", 1) or 1)
+    )
+    os.environ["SAMURAI_AF_PACKET_SPIN_LIMIT"] = str(
+        int(getattr(args, "afpacket_spin_limit", 2000) or 2000)
+    )
+    os.environ["SAMURAI_AF_PACKET_BUSY_POLL_US"] = str(
+        int(getattr(args, "afpacket_busy_poll_us", 0) or 0)
+    )
+    os.environ["SAMURAI_AF_PACKET_QDISC_BYPASS"] = "1" if bool(
+        getattr(args, "afpacket_qdisc_bypass", True)
+    ) else "0"
     os.environ["SAMURAI_AF_PACKET_MLOCK_RING"] = "1" if bool(getattr(args, "afpacket_mlock_ring", False)) else "0"
     os.environ["SAMURAI_AF_PACKET_PREFAULT_RING"] = "1" if bool(
         getattr(args, "afpacket_prefault_ring", True)

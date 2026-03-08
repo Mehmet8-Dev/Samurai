@@ -98,6 +98,13 @@ typedef struct {
     int ring_target_mb;
     int mlock_ring;
     int prefault_ring;
+    int block_size_kb;
+    int frame_size;
+    int frames_per_block;
+    int poll_timeout_ms;
+    int spin_limit;
+    int busy_poll_us;
+    int qdisc_bypass;
 } txring_hugepage_policy_t;
 
 typedef struct {
@@ -117,6 +124,13 @@ static txring_hugepage_policy_t g_txring_hp_policy = {
     .ring_target_mb = 64,
     .mlock_ring = 0,
     .prefault_ring = 1,
+    .block_size_kb = 0,
+    .frame_size = 0,
+    .frames_per_block = 64,
+    .poll_timeout_ms = 0,
+    .spin_limit = 64,
+    .busy_poll_us = 0,
+    .qdisc_bypass = 1,
 };
 
 static afpacket_hp_mode_t parse_afpacket_hp_mode(const char* raw) {
@@ -160,12 +174,47 @@ static int env_int_default(const char* name, int fallback) {
     return (int)v;
 }
 
+static int env_int_range(const char* name, int fallback, int min_v, int max_v) {
+    const char* raw = getenv(name);
+    char* endptr = NULL;
+    long v;
+    if (!raw || !raw[0]) return fallback;
+    errno = 0;
+    v = strtol(raw, &endptr, 10);
+    if (errno != 0 || endptr == raw || (endptr && *endptr != '\0')) return fallback;
+    if (v < (long)min_v || v > (long)max_v) return fallback;
+    return (int)v;
+}
+
+static inline unsigned int align_up_u32(unsigned int value, unsigned int align) {
+    if (align == 0U) return value;
+    return ((value + align - 1U) / align) * align;
+}
+
+static unsigned int next_pow2_u32(unsigned int value) {
+    if (value <= 1U) return 1U;
+    value--;
+    value |= value >> 1U;
+    value |= value >> 2U;
+    value |= value >> 4U;
+    value |= value >> 8U;
+    value |= value >> 16U;
+    return value + 1U;
+}
+
 static void load_txring_hugepage_policy_from_env(void) {
     g_txring_hp_policy.mode = parse_afpacket_hp_mode(getenv("SAMURAI_AF_PACKET_HUGEPAGE_MODE"));
     g_txring_hp_policy.hugepage_size_kb = env_int_default("SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB", 2048);
     g_txring_hp_policy.ring_target_mb = env_int_default("SAMURAI_AF_PACKET_RING_TARGET_MB", 64);
     g_txring_hp_policy.mlock_ring = env_truthy(getenv("SAMURAI_AF_PACKET_MLOCK_RING")) ? 1 : 0;
     g_txring_hp_policy.prefault_ring = env_truthy(getenv("SAMURAI_AF_PACKET_PREFAULT_RING")) ? 1 : 0;
+    g_txring_hp_policy.block_size_kb = env_int_range("SAMURAI_AF_PACKET_BLOCK_SIZE_KB", 0, 0, 262144);
+    g_txring_hp_policy.frame_size = env_int_range("SAMURAI_AF_PACKET_FRAME_SIZE", 0, 0, 262144);
+    g_txring_hp_policy.frames_per_block = env_int_range("SAMURAI_AF_PACKET_FRAMES_PER_BLOCK", 64, 1, 4096);
+    g_txring_hp_policy.poll_timeout_ms = env_int_range("SAMURAI_AF_PACKET_POLL_TIMEOUT_MS", 0, 0, 1000);
+    g_txring_hp_policy.spin_limit = env_int_range("SAMURAI_AF_PACKET_SPIN_LIMIT", 64, 0, 1000000);
+    g_txring_hp_policy.busy_poll_us = env_int_range("SAMURAI_AF_PACKET_BUSY_POLL_US", 0, 0, 1000000);
+    g_txring_hp_policy.qdisc_bypass = env_int_range("SAMURAI_AF_PACKET_QDISC_BYPASS", 1, 0, 1);
 }
 
 static inline uint64_t monotonic_ns_now(void) {
@@ -590,21 +639,58 @@ static int fill_ring_request_for_version(
     if (packet_size <= 0) return -1;
 
     size_t frame_header_size = frame_header_size_for_version(packet_version);
-    unsigned int block_size = (unsigned int)getpagesize();
+    unsigned int page_size = (unsigned int)getpagesize();
+    unsigned int frame_min_size = (unsigned int)(packet_size + frame_header_size);
+    unsigned int frame_size = 0U;
+    unsigned int block_size = 0U;
+    unsigned int frames_per_block = 0U;
+    unsigned int block_nr = 0U;
     unsigned int target_mb = (unsigned int)(g_txring_hp_policy.ring_target_mb > 0 ? g_txring_hp_policy.ring_target_mb : 64);
     unsigned long long target_bytes = (unsigned long long)target_mb * 1024ULL * 1024ULL;
-    while (block_size < (unsigned int)(packet_size + frame_header_size)) {
-        block_size <<= 1;
+    if (page_size == 0U) page_size = 4096U;
+
+    if (g_txring_hp_policy.frame_size > 0) {
+        frame_size = (unsigned int)g_txring_hp_policy.frame_size;
+    } else {
+        frame_size = next_pow2_u32(frame_min_size);
     }
+    frame_size = align_up_u32(frame_size, 64U);
+    frame_size = (unsigned int)TPACKET_ALIGN(frame_size);
+    if (frame_size < frame_min_size) {
+        frame_size = align_up_u32(frame_min_size, 64U);
+        frame_size = (unsigned int)TPACKET_ALIGN(frame_size);
+    }
+
+    if (g_txring_hp_policy.block_size_kb > 0) {
+        block_size = (unsigned int)g_txring_hp_policy.block_size_kb * 1024U;
+    } else {
+        unsigned int auto_frames = (unsigned int)(
+            g_txring_hp_policy.frames_per_block > 0 ? g_txring_hp_policy.frames_per_block : 64
+        );
+        block_size = frame_size * auto_frames;
+    }
+    if (block_size < frame_size) block_size = frame_size;
+    block_size = align_up_u32(block_size, page_size);
+    while (block_size % frame_size != 0U) {
+        block_size += page_size;
+    }
+    frames_per_block = block_size / frame_size;
+    if (frames_per_block == 0U) {
+        frames_per_block = 1U;
+        block_size = frame_size;
+    }
+
     if (target_bytes < (unsigned long long)block_size) {
         target_bytes = (unsigned long long)block_size;
     }
-    unsigned int block_nr = (unsigned int)((target_bytes + (unsigned long long)block_size - 1ULL) / (unsigned long long)block_size);
+    block_nr = (unsigned int)((target_bytes + (unsigned long long)block_size - 1ULL) / (unsigned long long)block_size);
     if (block_nr < 64U) {
         block_nr = 64U;
     }
-    unsigned int frame_size = block_size;
-    unsigned int frame_nr = block_nr;
+    unsigned int frame_nr = block_nr * frames_per_block;
+    if (frame_nr < block_nr) {
+        frame_nr = block_nr; /* overflow guard */
+    }
 
     if (packet_version == TPACKET_V3) {
         memset(req_v3, 0, sizeof(*req_v3));
@@ -1463,9 +1549,17 @@ static int try_setup_tx_ring_version(const char* iface, int packet_size, const u
         return -1;
     }
 
-    // Best effort; not fatal if unavailable
-    int qdisc_bypass = 1;
-    (void)setsockopt(sock, SOL_PACKET, PACKET_QDISC_BYPASS, &qdisc_bypass, sizeof(qdisc_bypass));
+    /* Best effort tuning knobs; not fatal if unavailable */
+    {
+        int qdisc_bypass = g_txring_hp_policy.qdisc_bypass ? 1 : 0;
+        (void)setsockopt(sock, SOL_PACKET, PACKET_QDISC_BYPASS, &qdisc_bypass, sizeof(qdisc_bypass));
+    }
+#ifdef SO_BUSY_POLL
+    if (g_txring_hp_policy.busy_poll_us > 0) {
+        int busy_poll_us = g_txring_hp_policy.busy_poll_us;
+        (void)setsockopt(sock, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
+    }
+#endif
 
     tx_ring_ctx.sock = sock;
     tx_ring_ctx.map = map;
@@ -1764,7 +1858,8 @@ static int send_ring_optimized_core(
     const unsigned int adaptive_batch_max = 512U;
     const unsigned long long adaptive_backoff_min_ns = 1000ULL;
     const unsigned long long adaptive_backoff_max_ns = 500000ULL;
-    const int spin_limit = 64;
+    const int spin_limit = g_txring_hp_policy.spin_limit >= 0 ? g_txring_hp_policy.spin_limit : 64;
+    const int poll_timeout_base_ms = g_txring_hp_policy.poll_timeout_ms >= 0 ? g_txring_hp_policy.poll_timeout_ms : 0;
     unsigned int pending_since_flush = 0U;
     unsigned int adaptive_batch_target = legacy_batch;
     unsigned long long adaptive_backoff_ns = 0ULL;
@@ -1775,7 +1870,7 @@ static int send_ring_optimized_core(
         char* frame_base = tx_ring_ctx.map + ((size_t)tx_ring_ctx.frame_idx * frame_size);
 
         int spins = 0;
-        int poll_timeout_ms = 0;
+        int poll_timeout_ms = poll_timeout_base_ms;
         uint64_t wait_start_ns = 0ULL;
         while (tx_frame_status(frame_base, packet_version) != TP_STATUS_AVAILABLE) {
             if (wait_start_ns == 0ULL) {
@@ -1829,8 +1924,8 @@ static int send_ring_optimized_core(
                 } else {
                     last_flush_errno = txring_flush_socket(tx_ring_ctx.sock, metrics);
                 }
-                if (poll_timeout_ms < 8) {
-                    poll_timeout_ms = (poll_timeout_ms == 0) ? 1 : (poll_timeout_ms << 1);
+                if (poll_timeout_ms < 16) {
+                    poll_timeout_ms = (poll_timeout_ms <= 0) ? 1 : (poll_timeout_ms << 1);
                 } else {
                     sched_yield();
                 }
