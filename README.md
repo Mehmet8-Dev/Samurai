@@ -169,6 +169,8 @@ Profil ciktilari:
 - `artifacts/benchmarks/<profile>/benchmark_meta.json`
 - `artifacts/benchmarks/dedicated_lab/loss_telemetry_full.json` (dedicated_lab)
 
+Pipeline kurali: `kpi_gate_status=pass` ve `score_eligible=1` olmayan benchmark kosulari fail edilir.
+
 Frontend test:
 
 ```bash

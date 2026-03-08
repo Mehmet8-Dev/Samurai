@@ -78,6 +78,15 @@ Artifact standardi:
 - `artifacts/benchmarks/dedicated_lab/loss_telemetry_full.json`
 - `artifacts/benchmarks/dedicated_lab/benchmark_meta.json`
 
+## Pipeline Enforcement
+
+Runner artik zorunlu olarak su kurali uygular:
+
+- `parity.normalized_results.kpi_gate_status == pass`
+- `parity.normalized_results.score_eligible == 1`
+
+Bu sartlardan biri saglanmazsa profile run pipeline sonucu fail olur.
+
 ## Referans Dosyalar
 
 - Profil tanimlari: `benchmarks/benchmark_profiles.json`

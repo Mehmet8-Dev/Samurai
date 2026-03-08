@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+import json
 
 from ddos_samurai import benchmark_profiles
 
@@ -49,7 +50,15 @@ class TestBenchmarkProfiles(unittest.TestCase):
     def test_artifact_validation_meta_flow(self):
         with tempfile.TemporaryDirectory() as td:
             artifact_dir = Path(td).resolve()
-            (artifact_dir / "benchmark_summary.json").write_text("{}", encoding="utf-8")
+            payload = {
+                "parity": {
+                    "normalized_results": {
+                        "kpi_gate_status": "pass",
+                        "score_eligible": 1,
+                    }
+                }
+            }
+            (artifact_dir / "benchmark_summary.json").write_text(json.dumps(payload), encoding="utf-8")
             runtime = {
                 "artifact_dir": str(artifact_dir),
                 "required_files": ["benchmark_summary.json", "benchmark_meta.json"],
@@ -62,6 +71,29 @@ class TestBenchmarkProfiles(unittest.TestCase):
             (artifact_dir / "benchmark_meta.json").write_text("{}", encoding="utf-8")
             ok_full_after, _missing_after = benchmark_profiles._validate_artifacts(runtime, ignore_meta=False)
             self.assertTrue(ok_full_after)
+
+    def test_artifact_validation_requires_pass_and_score_eligible(self):
+        with tempfile.TemporaryDirectory() as td:
+            artifact_dir = Path(td).resolve()
+            payload = {
+                "parity": {
+                    "normalized_results": {
+                        "kpi_gate_status": "warn",
+                        "score_eligible": 0,
+                    }
+                }
+            }
+            (artifact_dir / "benchmark_summary.json").write_text(json.dumps(payload), encoding="utf-8")
+            (artifact_dir / "benchmark_meta.json").write_text("{}", encoding="utf-8")
+            runtime = {
+                "artifact_dir": str(artifact_dir),
+                "required_files": ["benchmark_summary.json", "benchmark_meta.json"],
+                "required_summary_fields": [],
+            }
+            ok_full, missing = benchmark_profiles._validate_artifacts(runtime, ignore_meta=False)
+            self.assertFalse(ok_full)
+            self.assertTrue(any("kpi_gate_status" in str(item) for item in missing))
+            self.assertTrue(any("score_eligible" in str(item) for item in missing))
 
 
 if __name__ == "__main__":

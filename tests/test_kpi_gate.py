@@ -81,6 +81,21 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
         out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
         self.assertEqual(out.status, "pass")
 
+    def test_dedicated_requires_rate_accuracy_metric(self):
+        results = self._base_results()
+        results.pop("rate_accuracy_pct", None)
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertEqual(out.status, "fail")
+        self.assertTrue(any(v.startswith("rate_accuracy_pct:missing_metric") for v in out.violations))
+
+    def test_dedicated_txring_scope_requires_flush_metrics(self):
+        results = self._base_results()
+        results.update({"sender_paths_used": {"TX_RING_L2": 1}})
+        results.pop("txring_flush_error_ratio_pct", None)
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertEqual(out.status, "fail")
+        self.assertTrue(any(v.startswith("txring_flush_error_ratio_pct:missing_metric") for v in out.violations))
+
     def test_dev_profile_is_supported(self):
         results = self._base_results()
         out = kpi_gate.evaluate(results, profile="dev", hard_fail=False)

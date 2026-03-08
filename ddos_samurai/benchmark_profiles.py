@@ -134,6 +134,22 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                     missing.append(f"{summary_path}::field::{field}")
         except Exception as exc:
             missing.append(f"{summary_path}::parse_error::{type(exc).__name__}: {exc}")
+    if summary_path.exists():
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            normalized = ((payload.get("parity") or {}).get("normalized_results") or {})
+            gate_status = str(normalized.get("kpi_gate_status", "") or "").strip().lower()
+            score_eligible_raw = normalized.get("score_eligible", 0)
+            try:
+                score_eligible = int(score_eligible_raw)
+            except Exception:
+                score_eligible = -1
+            if gate_status != "pass":
+                missing.append(f"{summary_path}::kpi_gate_status::{gate_status or 'missing'}")
+            if score_eligible != 1:
+                missing.append(f"{summary_path}::score_eligible::{score_eligible_raw}")
+        except Exception as exc:
+            missing.append(f"{summary_path}::pipeline_parse_error::{type(exc).__name__}: {exc}")
 
     return len(missing) == 0, missing
 

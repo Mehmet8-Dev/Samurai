@@ -286,10 +286,11 @@ def _infer_txring_scope(results: Dict[str, Any]) -> bool:
     return any(_metric_gt_zero(results, key) for key in txring_metric_keys)
 
 
-def _build_rules(gates: Dict[str, Any], results: Dict[str, Any]) -> List[KpiGateRule]:
+def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str) -> List[KpiGateRule]:
     quic_scope = _infer_quic_scope(results)
     l7_scope = _infer_l7_scope(results, quic_scope=quic_scope)
     txring_scope = _infer_txring_scope(results)
+    dedicated_strict = str(profile or "").strip().lower() == "dedicated_lab"
     rules: List[KpiGateRule] = [
         KpiGateRule("run_quality", "run_quality", "eq", gates.get("run_quality", "valid"), required=True),
         KpiGateRule(
@@ -311,28 +312,28 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any]) -> List[KpiGate
             "rate_accuracy_pct",
             "min",
             float(gates.get("rate_accuracy_pct_min", 98.0) or 98.0),
-            required=False,
+            required=bool(dedicated_strict),
         ),
         KpiGateRule(
             "txring_flush_error_ratio_pct",
             "txring_flush_error_ratio_pct",
             "max",
             float(gates.get("txring_flush_error_ratio_pct_max", 0.5) or 0.5),
-            required=False,
+            required=bool(txring_scope and dedicated_strict),
         ),
         KpiGateRule(
             "txring_flush_eagain_ratio_pct",
             "txring_flush_eagain_ratio_pct",
             "max",
             float(gates.get("txring_flush_eagain_ratio_pct_max", 2.0) or 2.0),
-            required=False,
+            required=bool(txring_scope and dedicated_strict),
         ),
         KpiGateRule(
             "txring_hold_block_pressure_pct",
             "txring_hold_block_pressure_pct",
             "max",
             float(gates.get("txring_hold_block_pressure_pct_max", 35.0) or 35.0),
-            required=False,
+            required=bool(txring_scope and dedicated_strict),
         ),
         KpiGateRule(
             "afpacket_hugepage_effective",
@@ -433,7 +434,7 @@ def evaluate(
         )
 
     gates = _merge_gate_defaults(profile_norm, parity_matrix_path=parity_matrix_path)
-    rules = _build_rules(gates, results or {})
+    rules = _build_rules(gates, results or {}, profile=profile_norm)
 
     violations: List[str] = []
     evaluated: List[Dict[str, Any]] = []
