@@ -1,7 +1,49 @@
 {
   "schema": "samurai.parity.matrix.v1",
-  "updated_utc": "2026-03-05T00:00:00Z",
+  "updated_utc": "2026-03-08T00:00:00Z",
   "profiles": {
+    "dev": {
+      "description": "Local developer smoke benchmark profile.",
+      "gates": {
+        "run_quality": "valid",
+        "send_success_ratio_pct_min": 90.0,
+        "wire_loss_est_pct_max": 10.0,
+        "rate_accuracy_pct_min": 85.0,
+        "txring_flush_error_ratio_pct_max": 3.0,
+        "txring_flush_eagain_ratio_pct_max": 10.0,
+        "txring_hold_block_pressure_pct_max": 80.0,
+        "afpacket_hugepage_effective_required": 1,
+        "session_success_rate_min": 90.0,
+        "retry_success_rate_min": 60.0,
+        "l7_step_fail_ratio_max": 0.1,
+        "l7_handshake_p99_ms_max": 1000.0,
+        "l7_fail_budget_pct_max": 10.0,
+        "quic_stream_fail_ratio_max": 0.25,
+        "quic_handshake_fail_ratio_max": 0.25,
+        "quic_response_validation_fail_ratio_max": 0.25
+      }
+    },
+    "ci_safe": {
+      "description": "CI-safe benchmark profile for deterministic non-privileged runners.",
+      "gates": {
+        "run_quality": "valid",
+        "send_success_ratio_pct_min": 95.0,
+        "wire_loss_est_pct_max": 5.0,
+        "rate_accuracy_pct_min": 90.0,
+        "txring_flush_error_ratio_pct_max": 2.0,
+        "txring_flush_eagain_ratio_pct_max": 5.0,
+        "txring_hold_block_pressure_pct_max": 60.0,
+        "afpacket_hugepage_effective_required": 1,
+        "session_success_rate_min": 95.0,
+        "retry_success_rate_min": 70.0,
+        "l7_step_fail_ratio_max": 0.05,
+        "l7_handshake_p99_ms_max": 750.0,
+        "l7_fail_budget_pct_max": 5.0,
+        "quic_stream_fail_ratio_max": 0.1,
+        "quic_handshake_fail_ratio_max": 0.1,
+        "quic_response_validation_fail_ratio_max": 0.1
+      }
+    },
     "dedicated_lab": {
       "description": "Lab NIC queue/IRQ affinity pinned, privileged datapath enabled.",
       "gates": {
@@ -25,7 +67,7 @@
       }
     },
     "developer_fallback": {
-      "description": "General developer workstation fallback profile.",
+      "description": "Backward-compatible alias profile for existing flows (mirrors ci_safe thresholds).",
       "gates": {
         "run_quality": "valid",
         "send_success_ratio_pct_min": 95.0,

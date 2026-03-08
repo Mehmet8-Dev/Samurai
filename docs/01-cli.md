@@ -26,7 +26,7 @@ CLI tarafi artik yalniz parser degil, ayni zamanda profile-aware preflight katma
   - `--lab-profile {off,dedicated}`
   - `--dp-queue-strategy {rr,pin,map}`, `--dp-queues`, `--dp-queue-map`
 - KPI gate:
-  - `--kpi-gate-profile {off,developer_fallback,dedicated_lab}`
+  - `--kpi-gate-profile {off,dev,ci_safe,developer_fallback,dedicated_lab}`
   - `--kpi-hard-fail`
 - L7 engine route:
   - `--l7-engine {python,c_state}`

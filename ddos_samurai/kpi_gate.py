@@ -35,6 +35,42 @@ class KpiGateResult:
 
 
 _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
+    "dev": {
+        "run_quality": "valid",
+        "send_success_ratio_pct_min": 90.0,
+        "wire_loss_est_pct_max": 10.0,
+        "rate_accuracy_pct_min": 85.0,
+        "txring_flush_error_ratio_pct_max": 3.0,
+        "txring_flush_eagain_ratio_pct_max": 10.0,
+        "txring_hold_block_pressure_pct_max": 80.0,
+        "afpacket_hugepage_effective_required": 1,
+        "session_success_rate_min": 90.0,
+        "retry_success_rate_min": 60.0,
+        "l7_step_fail_ratio_max": 0.10,
+        "l7_handshake_p99_ms_max": 1000.0,
+        "l7_fail_budget_pct_max": 10.0,
+        "quic_stream_fail_ratio_max": 0.25,
+        "quic_handshake_fail_ratio_max": 0.25,
+        "quic_response_validation_fail_ratio_max": 0.25,
+    },
+    "ci_safe": {
+        "run_quality": "valid",
+        "send_success_ratio_pct_min": 95.0,
+        "wire_loss_est_pct_max": 5.0,
+        "rate_accuracy_pct_min": 90.0,
+        "txring_flush_error_ratio_pct_max": 2.0,
+        "txring_flush_eagain_ratio_pct_max": 5.0,
+        "txring_hold_block_pressure_pct_max": 60.0,
+        "afpacket_hugepage_effective_required": 1,
+        "session_success_rate_min": 95.0,
+        "retry_success_rate_min": 70.0,
+        "l7_step_fail_ratio_max": 0.05,
+        "l7_handshake_p99_ms_max": 750.0,
+        "l7_fail_budget_pct_max": 5.0,
+        "quic_stream_fail_ratio_max": 0.10,
+        "quic_handshake_fail_ratio_max": 0.10,
+        "quic_response_validation_fail_ratio_max": 0.10,
+    },
     "developer_fallback": {
         "run_quality": "valid",
         "send_success_ratio_pct_min": 99.0,
@@ -81,8 +117,10 @@ def _normalize_profile(profile: str | None) -> str:
         return "off"
     if p in {"dedicated", "dedicated-lab", "dedicated_lab"}:
         return "dedicated_lab"
+    if p in {"ci", "ci-safe", "ci_safe"}:
+        return "ci_safe"
     if p in {"developer", "dev", "developer_fallback", "developer-fallback"}:
-        return "developer_fallback"
+        return "dev" if p == "dev" else "developer_fallback"
     return "off"
 
 

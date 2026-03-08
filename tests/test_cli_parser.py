@@ -415,6 +415,13 @@ class TestSenderRouteValidation(unittest.TestCase):
         args = parser.parse_args(["--kpi-hard-fail"])
         self._assert_validation_fails(parser, args)
 
+    def test_kpi_gate_profile_accepts_dev_and_ci_safe(self):
+        parser = cli.build_parser()
+        args_dev = parser.parse_args(["--kpi-gate-profile", "dev"])
+        args_ci = parser.parse_args(["--kpi-gate-profile", "ci_safe"])
+        cli._validate_sender_route_args(parser, args_dev)
+        cli._validate_sender_route_args(parser, args_ci)
+
     def test_l7_quic_require_native_requires_capability_strict(self):
         parser = cli.build_parser()
         args = parser.parse_args(["--l7-quic-require-native"])

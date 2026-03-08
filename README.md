@@ -153,6 +153,22 @@ Detay: `monitoring/README.md`
 pytest tests -q -rs
 ```
 
+### Benchmark Profilleri (Urunlesmis)
+
+Tek komutla benchmark profili calistirma:
+
+```bash
+python -m ddos_samurai.benchmark_profiles --profile dev --run
+python -m ddos_samurai.benchmark_profiles --profile ci_safe --run
+sudo python -m ddos_samurai.benchmark_profiles --profile dedicated_lab --run
+```
+
+Profil ciktilari:
+
+- `artifacts/benchmarks/<profile>/benchmark_summary.json`
+- `artifacts/benchmarks/<profile>/benchmark_meta.json`
+- `artifacts/benchmarks/dedicated_lab/loss_telemetry_full.json` (dedicated_lab)
+
 Frontend test:
 
 ```bash

@@ -1,0 +1,100 @@
+{
+  "schema": "samurai.benchmark.profiles.v1",
+  "updated_utc": "2026-03-08T00:00:00Z",
+  "profiles": {
+    "dev": {
+      "description": "Local developer smoke benchmark profile.",
+      "parity_profile": "dev",
+      "kpi_gate_profile": "dev",
+      "test_profile": "ci_safe",
+      "pytest_args": [
+        "-m",
+        "pytest",
+        "tests/test_benchmark_ci.py",
+        "-q",
+        "-rs"
+      ],
+      "env": {
+        "SAMURAI_BENCH_BASELINE": "benchmarks/benchmark_baseline_ci.json",
+        "SAMURAI_BENCH_UPDATE_BASELINE": "0"
+      },
+      "artifact_standard": {
+        "required_files": [
+          "benchmark_summary.json",
+          "benchmark_meta.json"
+        ],
+        "required_summary_fields": [
+          "schema",
+          "profile",
+          "generated_utc",
+          "thresholds",
+          "scenarios",
+          "parity"
+        ]
+      }
+    },
+    "ci_safe": {
+      "description": "CI-safe deterministic benchmark profile.",
+      "parity_profile": "ci_safe",
+      "kpi_gate_profile": "ci_safe",
+      "test_profile": "ci_safe",
+      "pytest_args": [
+        "-m",
+        "pytest",
+        "tests/test_benchmark_ci.py",
+        "-q",
+        "-rs"
+      ],
+      "env": {
+        "SAMURAI_BENCH_BASELINE": "benchmarks/benchmark_baseline_ci.json",
+        "SAMURAI_BENCH_UPDATE_BASELINE": "0"
+      },
+      "artifact_standard": {
+        "required_files": [
+          "benchmark_summary.json",
+          "benchmark_meta.json"
+        ],
+        "required_summary_fields": [
+          "schema",
+          "profile",
+          "generated_utc",
+          "thresholds",
+          "scenarios",
+          "parity"
+        ]
+      }
+    },
+    "dedicated_lab": {
+      "description": "Privileged lab benchmark profile with strict KPI expectation.",
+      "parity_profile": "dedicated_lab",
+      "kpi_gate_profile": "dedicated_lab",
+      "test_profile": "full",
+      "pytest_args": [
+        "-m",
+        "pytest",
+        "tests/test_benchmark_full.py",
+        "tests/test_pacing_root.py",
+        "tests/test_loss_telemetry_full.py",
+        "-q",
+        "-rs"
+      ],
+      "env": {
+        "SAMURAI_LOSS_FAIL_PCT": "1"
+      },
+      "artifact_standard": {
+        "required_files": [
+          "benchmark_summary.json",
+          "benchmark_meta.json",
+          "loss_telemetry_full.json"
+        ],
+        "required_summary_fields": [
+          "schema",
+          "profile",
+          "generated_utc",
+          "sections",
+          "parity"
+        ]
+      }
+    }
+  }
+}

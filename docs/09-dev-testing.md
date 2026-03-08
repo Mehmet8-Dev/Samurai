@@ -76,15 +76,21 @@ Uretilen dosyalar:
 
 ## Benchmark Suite
 
-CI-safe benchmark:
+Urunlesmis benchmark profilleri icin tek komut runner:
+
+```bash
+python -m ddos_samurai.benchmark_profiles --profile dev --run
+python -m ddos_samurai.benchmark_profiles --profile ci_safe --run
+sudo python -m ddos_samurai.benchmark_profiles --profile dedicated_lab --run
+```
+
+Runner; profil bazli `pytest` komutunu cagirir, artifact standardini dogrular ve
+`benchmark_meta.json` yazar.
+
+Legacy dogrudan benchmark komutlari:
 
 ```bash
 python3 -m pytest tests/test_benchmark_ci.py -q -rs
-```
-
-Full benchmark:
-
-```bash
 SAMURAI_TEST_PROFILE=full python3 -m pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
 ```
 
@@ -142,7 +148,7 @@ tests/test_loss_telemetry_full.py -rs
 Parite profili secimi:
 
 ```bash
-SAMURAI_PARITY_PROFILE=developer_fallback python3 -m pytest tests/test_benchmark_ci.py -q -rs
+SAMURAI_PARITY_PROFILE=ci_safe python3 -m pytest tests/test_benchmark_ci.py -q -rs
 SAMURAI_PARITY_PROFILE=dedicated_lab SAMURAI_TEST_PROFILE=full python3 -m pytest tests/test_benchmark_full.py -q -rs
 ```
 

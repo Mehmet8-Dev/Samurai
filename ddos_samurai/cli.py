@@ -1088,9 +1088,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xdp-queue-id", type=int, default=0, help="AF_XDP queue id (varsayılan: 0).")
     parser.add_argument(
         "--kpi-gate-profile",
-        choices=["off", "developer_fallback", "dedicated_lab"],
+        choices=["off", "dev", "ci_safe", "developer_fallback", "dedicated_lab"],
         default=str(os.environ.get("SAMURAI_KPI_GATE_PROFILE", "off") or "off"),
-        help="KPI gate profili: off|developer_fallback|dedicated_lab.",
+        help="KPI gate profili: off|dev|ci_safe|developer_fallback|dedicated_lab.",
     )
     parser.add_argument(
         "--kpi-hard-fail",

@@ -236,7 +236,7 @@ class TestCISafeBenchmarks(unittest.TestCase):
             "l7_step_fail_ratio": 0.0,
             "session_success_rate": 1.0,
             "retry_success_rate": 1.0,
-            "kpi_gate_profile": "developer_fallback",
+            "kpi_gate_profile": "ci_safe",
             "kpi_gate_status": "pass",
             "kpi_gate_hard_fail": 0,
             "kpi_violations": [],
@@ -244,7 +244,7 @@ class TestCISafeBenchmarks(unittest.TestCase):
             "effective_pps": float(throughput_core["effective_pps"]),
         }
         parity_matrix_path, parity_matrix = _load_parity_matrix()
-        parity_profile = str(os.environ.get("SAMURAI_PARITY_PROFILE", "developer_fallback") or "developer_fallback")
+        parity_profile = str(os.environ.get("SAMURAI_PARITY_PROFILE", "ci_safe") or "ci_safe")
         parity_gates = (
             ((parity_matrix.get("profiles") or {}).get(parity_profile) or {}).get("gates") or {}
         )

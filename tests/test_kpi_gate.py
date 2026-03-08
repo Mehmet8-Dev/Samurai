@@ -81,6 +81,20 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
         out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
         self.assertEqual(out.status, "pass")
 
+    def test_dev_profile_is_supported(self):
+        results = self._base_results()
+        out = kpi_gate.evaluate(results, profile="dev", hard_fail=False)
+        self.assertEqual(out.profile, "dev")
+        self.assertEqual(out.status, "pass")
+
+    def test_ci_safe_profile_warns_without_hard_fail(self):
+        results = self._base_results()
+        results["send_success_ratio_pct"] = 90.0
+        out = kpi_gate.evaluate(results, profile="ci_safe", hard_fail=True)
+        self.assertEqual(out.profile, "ci_safe")
+        self.assertEqual(out.status, "warn")
+        self.assertEqual(out.hard_fail, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

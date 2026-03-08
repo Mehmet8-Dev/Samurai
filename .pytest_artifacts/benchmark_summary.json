@@ -4,16 +4,16 @@
     "loaded": false,
     "path": ""
   },
-  "generated_utc": "2026-03-08T14:29:55+00:00",
+  "generated_utc": "2026-03-08T14:51:33+00:00",
   "memory": {
-    "pool_buffer_len": 1280000,
-    "pool_peak_bytes": 2560251,
-    "pool_peak_over_buffer_ratio": 2.00019609375
+    "pool_buffer_len": 1840000,
+    "pool_peak_bytes": 3680271,
+    "pool_peak_over_buffer_ratio": 2.0001472826086957
   },
   "params": {
     "n_flags": 1000000,
     "n_packets": 20000,
-    "pool_pkt_size": 64
+    "pool_pkt_size": 92
   },
   "parity": {
     "gates": {
@@ -40,9 +40,9 @@
       "afpacket_hugepage_effective": 0,
       "afpacket_hugepage_mode": "off",
       "afpacket_hugepage_reason": "not_applicable",
-      "effective_pps": 121456.33751859107,
+      "effective_pps": 122136.13237583365,
       "kpi_gate_hard_fail": 0,
-      "kpi_gate_profile": "developer_fallback",
+      "kpi_gate_profile": "ci_safe",
       "kpi_gate_status": "pass",
       "kpi_violations": [],
       "l7_active_sessions_peak": 0,
@@ -63,7 +63,7 @@
       "wire_counter_confidence": 0.0,
       "wire_loss_est_pct": 0.0
     },
-    "profile": "developer_fallback",
+    "profile": "ci_safe",
     "required_result_fields": [
       "run_quality",
       "sender_paths_used",
@@ -94,7 +94,7 @@
         "id": "l4_top_speed",
         "layer": "L4",
         "samurai_field": "effective_pps",
-        "samurai_value": 121456.33751859107,
+        "samurai_value": 122136.13237583365,
         "status": "measured"
       },
       {
@@ -141,122 +141,122 @@
     "schema": "samurai.parity.matrix.v1"
   },
   "profile": "ci_safe",
-  "results_create_packet_tcp_pa_rate_per_s": 104293.40741919157,
-  "results_create_packet_tcp_syn_rate_per_s": 120286.67321405804,
-  "results_create_packet_udp_rate_per_s": 155872.4355584069,
-  "results_effective_pps": 121456.33751859107,
-  "results_generate_packet_pool_rate_per_s": 121456.33751859107,
+  "results_create_packet_tcp_pa_rate_per_s": 107070.38387626113,
+  "results_create_packet_tcp_syn_rate_per_s": 125010.48264924598,
+  "results_create_packet_udp_rate_per_s": 158480.3810716554,
+  "results_effective_pps": 122136.13237583365,
+  "results_generate_packet_pool_rate_per_s": 122136.13237583365,
   "results_txring_flush_eagain_ratio_pct": 0.0,
   "results_wire_loss_est_pct": 0.0,
   "scenarios": {
     "create_packet_tcp_pa": {
-      "cv_pct": 0.4642434444744231,
+      "cv_pct": 0.41570223293870984,
       "effective_samples_s": [
-        0.19051297699843417,
-        0.19229334500050754,
-        0.19249370400211774
+        0.18587036800090573,
+        0.18673861400020542,
+        0.18777006800155505
       ],
-      "mean_s": 0.1917666753336865,
+      "mean_s": 0.1867930166675554,
       "name": "create_packet_tcp_pa",
-      "p95_s": 0.20389621800131863,
-      "rate_per_s": 104293.40741919157,
+      "p95_s": 0.19080637300066883,
+      "rate_per_s": 107070.38387626113,
       "rounds": 5,
       "samples_s": [
-        0.20389621800131863,
-        0.19051297699843417,
-        0.19229334500050754,
-        0.19249370400211774,
-        0.18896521899660002
+        0.19080637300066883,
+        0.18542992299990146,
+        0.18673861400020542,
+        0.18587036800090573,
+        0.18777006800155505
       ],
-      "stdev_s": 0.0008902642189231901,
+      "stdev_s": 0.0007765027412606042,
       "units": 20000
     },
     "create_packet_tcp_syn": {
-      "cv_pct": 0.477562141899453,
+      "cv_pct": 0.12511578650051966,
       "effective_samples_s": [
-        0.1656173739975202,
-        0.16580376900310512,
-        0.16738723199887318
+        0.1597493539993593,
+        0.15997143400090863,
+        0.16023896200204035
       ],
-      "mean_s": 0.16626945833316617,
+      "mean_s": 0.15998658333410276,
       "name": "create_packet_tcp_syn",
-      "p95_s": 0.17865539999911562,
-      "rate_per_s": 120286.67321405804,
+      "p95_s": 0.17006144700280856,
+      "rate_per_s": 125010.48264924598,
       "rounds": 5,
       "samples_s": [
-        0.17865539999911562,
-        0.16738723199887318,
-        0.16527433399824076,
-        0.16580376900310512,
-        0.1656173739975202
+        0.17006144700280856,
+        0.1597493539993593,
+        0.16023896200204035,
+        0.15997143400090863,
+        0.15865353800109006
       ],
-      "stdev_s": 0.0007940399865404869,
+      "stdev_s": 0.00020016847203377199,
       "units": 20000
     },
     "create_packet_udp": {
-      "cv_pct": 0.09233295295692746,
+      "cv_pct": 0.21802058289728393,
       "effective_samples_s": [
-        0.12821004400029778,
-        0.12824363699837704,
-        0.128476468998997
+        0.12595799300106592,
+        0.1260540459988988,
+        0.12658371900033671
       ],
-      "mean_s": 0.12831004999922394,
+      "mean_s": 0.12619858600010048,
       "name": "create_packet_udp",
-      "p95_s": 0.1301626979984576,
-      "rate_per_s": 155872.4355584069,
+      "p95_s": 0.12982426100279554,
+      "rate_per_s": 158480.3810716554,
       "rounds": 5,
       "samples_s": [
-        0.1301626979984576,
-        0.12821004400029778,
-        0.12743454199880944,
-        0.128476468998997,
-        0.12824363699837704
+        0.12982426100279554,
+        0.12594422699839924,
+        0.12658371900033671,
+        0.1260540459988988,
+        0.12595799300106592
       ],
-      "stdev_s": 0.00011847245810479353,
+      "stdev_s": 0.00027513889280554924,
       "units": 20000
     },
     "generate_packet_pool": {
-      "cv_pct": 0.8746488278924776,
+      "cv_pct": 1.1726663162347417,
       "effective_samples_s": [
-        0.1627899390005041,
-        0.1649250390000816,
-        0.166289708999102
+        0.16163298299943563,
+        0.1633398890007811,
+        0.16628224499800126
       ],
-      "mean_s": 0.1646682289998959,
+      "mean_s": 0.16375170566607267,
       "name": "generate_packet_pool",
-      "p95_s": 0.16705204500249238,
-      "rate_per_s": 121456.33751859107,
+      "p95_s": 0.17777000599744497,
+      "rate_per_s": 122136.13237583365,
       "rounds": 5,
       "samples_s": [
-        0.166289708999102,
-        0.16705204500249238,
-        0.1649250390000816,
-        0.1627899390005041,
-        0.1611531130001822
+        0.17777000599744497,
+        0.1633398890007811,
+        0.16628224499800126,
+        0.16163298299943563,
+        0.15985160800119047
       ],
-      "stdev_s": 0.0014402687348588903,
+      "stdev_s": 0.001920261094605891,
       "units": 20000
     },
     "parse_tcp_flags": {
-      "cv_pct": 0.24840519080439205,
+      "cv_pct": 0.4889818017209585,
       "effective_samples_s": [
-        0.3452659020003921,
-        0.3462095630020485,
-        0.3473692139996274
+        0.34715076300199144,
+        0.34782804700080305,
+        0.3510583300012513
       ],
-      "mean_s": 0.346281559667356,
+      "mean_s": 0.34867904666801525,
       "name": "parse_tcp_flags",
-      "p95_s": 0.35766029899969,
-      "rate_per_s": 2887823.4260022887,
+      "p95_s": 0.35846229100206983,
+      "rate_per_s": 2867967.0016194615,
       "rounds": 5,
       "samples_s": [
-        0.35766029899969,
-        0.3473692139996274,
-        0.34524730699922657,
-        0.3452659020003921,
-        0.3462095630020485
+        0.35846229100206983,
+        0.3510583300012513,
+        0.34364216399990255,
+        0.34715076300199144,
+        0.34782804700080305
       ],
-      "stdev_s": 0.0008601813690121205,
+      "stdev_s": 0.0017049770846207226,
       "units": 1000000
     }
   },
@@ -267,11 +267,11 @@
       "wire_loss_est_pct": 0.0
     },
     "throughput_core": {
-      "create_packet_tcp_pa_rate_per_s": 104293.40741919157,
-      "create_packet_tcp_syn_rate_per_s": 120286.67321405804,
-      "create_packet_udp_rate_per_s": 155872.4355584069,
-      "effective_pps": 121456.33751859107,
-      "generate_packet_pool_rate_per_s": 121456.33751859107
+      "create_packet_tcp_pa_rate_per_s": 107070.38387626113,
+      "create_packet_tcp_syn_rate_per_s": 125010.48264924598,
+      "create_packet_udp_rate_per_s": 158480.3810716554,
+      "effective_pps": 122136.13237583365,
+      "generate_packet_pool_rate_per_s": 122136.13237583365
     }
   },
   "thresholds": {
