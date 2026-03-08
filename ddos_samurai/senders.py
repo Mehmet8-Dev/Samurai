@@ -1590,7 +1590,12 @@ async def raw_socket_sender(
             partial_send_retry_count=0,
         )
 
-    log_info(f"Raw socket sender initialized. Sending {count} packets...")
+    _ctx_dp_session = ctx.get("dataplane_session") if isinstance(ctx, dict) else None
+    _has_dp_session = bool(_ctx_dp_session is not None and hasattr(_ctx_dp_session, "send_batch"))
+    log_info(
+        f"Packet sender context initialized. backend={requested_backend}, "
+        f"dataplane_session={'on' if _has_dp_session else 'off'}."
+    )
     
     packet_size = len(packets_buffer) // count if count > 0 else 0
     if packet_size == 0 and count > 0:
@@ -2122,6 +2127,7 @@ async def raw_socket_sender(
         )
 
     try:
+        log_info(f"Raw socket sender (Python L3) active. Sending {count} packets...")
         # Create memoryview to avoid copying
         mv = memoryview(packets_buffer)
         
@@ -2247,7 +2253,7 @@ async def raw_socket_sender(
             s.close()
         if FAST_SENDER_AVAILABLE and hasattr(fast_sender, 'cleanup_ring'):
             fast_sender.cleanup_ring()
-        log_info(f"Raw socket sender finished sending {count} packets.")
+        log_info(f"Raw socket sender (Python L3) finished sending {count} packets.")
     out = _stats(
         attempted=count,
         sent=sent_total,
