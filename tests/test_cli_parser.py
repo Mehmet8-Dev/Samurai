@@ -103,6 +103,13 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--sender-backend", opts)
         self.assertIn("--sender-fallback-policy", opts)
         self.assertIn("--dataplane-core-mode", opts)
+        self.assertIn("--afpacket-hugepage-mode", opts)
+        self.assertIn("--afpacket-hugepage-size-kb", opts)
+        self.assertIn("--afpacket-ring-target-mb", opts)
+        self.assertIn("--afpacket-mlock-ring", opts)
+        self.assertIn("--no-afpacket-mlock-ring", opts)
+        self.assertIn("--afpacket-prefault-ring", opts)
+        self.assertIn("--no-afpacket-prefault-ring", opts)
         self.assertIn("--lab-profile", opts)
         self.assertIn("--dp-queue-strategy", opts)
         self.assertIn("--dp-queues", opts)
@@ -135,6 +142,11 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.sender_backend, "auto")
         self.assertEqual(args.sender_fallback_policy, "allow")
         self.assertEqual(args.dataplane_core_mode, "off")
+        self.assertEqual(args.afpacket_hugepage_mode, "off")
+        self.assertEqual(args.afpacket_hugepage_size_kb, 2048)
+        self.assertEqual(args.afpacket_ring_target_mb, 64)
+        self.assertFalse(args.afpacket_mlock_ring)
+        self.assertTrue(args.afpacket_prefault_ring)
         self.assertEqual(args.lab_profile, "off")
         self.assertEqual(args.dp_queue_strategy, "rr")
         self.assertEqual(args.dp_queues, 1)
@@ -328,6 +340,16 @@ class TestSenderRouteValidation(unittest.TestCase):
         args = parser.parse_args(["--sender-backend", "auto", "--sender-fallback-policy", "fail"])
         self._assert_validation_fails(parser, args)
 
+    def test_afpacket_required_requires_txring_backend(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--afpacket-hugepage-mode", "required", "--sender-backend", "python"])
+        self._assert_validation_fails(parser, args)
+
+    def test_afpacket_hugepage_size_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--afpacket-hugepage-size-kb", "0", "--sender-backend", "txring"])
+        self._assert_validation_fails(parser, args)
+
     def test_dataplane_required_requires_fail_policy(self):
         parser = cli.build_parser()
         args = parser.parse_args(["--dataplane-core-mode", "required"])
@@ -414,6 +436,24 @@ class TestSenderRouteValidation(unittest.TestCase):
             ]
         )
         cli._validate_sender_route_args(parser, args)
+
+    def test_dedicated_profile_autopromotes_afpacket_required_for_txring(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--lab-profile",
+                "dedicated",
+                "--sender-backend",
+                "txring",
+                "--sender-fallback-policy",
+                "fail",
+                "--xdp-interface",
+                "eth0",
+            ]
+        )
+        with patch("ddos_samurai.af_xdp_sender.get_interface_queue_count", return_value=8):
+            cli._preflight_lab_profile(parser, args)
+        self.assertEqual(args.afpacket_hugepage_mode, "required")
 
 
 class TestL7CapabilityPreflight(unittest.TestCase):

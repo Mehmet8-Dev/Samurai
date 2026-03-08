@@ -20,6 +20,9 @@ class TestPacingWrapper(unittest.TestCase):
         self.assertIn("jitter_p99_ns", out)
         self.assertIn("txring_flush_enobufs_count", out)
         self.assertIn("txring_frame_wait_ns", out)
+        self.assertIn("afpacket_hugepage_mode", out)
+        self.assertIn("afpacket_hugepage_effective", out)
+        self.assertIn("afpacket_ring_size_bytes", out)
 
     def test_pacing_config_validate_enforces_mode_constraints(self):
         cfg = pacing.PacingConfig(
@@ -48,3 +51,14 @@ class TestPacingWrapper(unittest.TestCase):
         cfg = pacing.PacingConfig(burst_gap_ns=-1)
         with self.assertRaises(ValueError):
             cfg.validate()
+
+    def test_get_stats_contract_when_engine_available(self):
+        if not pacing.PACING_ENGINE_AVAILABLE:
+            self.skipTest("pacing engine extension unavailable")
+        pacing.reset_stats()
+        out = pacing.get_stats()
+        self.assertIsInstance(out, dict)
+        self.assertIn("spin_threshold_ns", out)
+        self.assertIn("afpacket_hugepage_mode", out)
+        self.assertIn("afpacket_hugepage_effective", out)
+        self.assertIn("afpacket_ring_size_bytes", out)

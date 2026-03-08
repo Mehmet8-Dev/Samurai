@@ -61,6 +61,26 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
         self.assertEqual(out.hard_fail, 0)
         self.assertEqual(out.score_eligible, 1)
 
+    def test_dedicated_txring_scope_requires_afpacket_hugepage_effective(self):
+        results = self._base_results()
+        results.update(
+            {
+                "sender_paths_used": {"TX_RING_L2": 1},
+                "afpacket_hugepage_mode": "required",
+                "afpacket_hugepage_effective": 0,
+            }
+        )
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertEqual(out.status, "fail")
+        self.assertEqual(out.hard_fail, 1)
+        self.assertTrue(any(v.startswith("afpacket_hugepage_effective:") for v in out.violations))
+
+    def test_dedicated_non_txring_scope_does_not_require_afpacket_hugepage(self):
+        results = self._base_results()
+        results.update({"sender_paths_used": {"PYTHON_SENDMMSG": 1}})
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertEqual(out.status, "pass")
+
 
 if __name__ == "__main__":
     unittest.main()

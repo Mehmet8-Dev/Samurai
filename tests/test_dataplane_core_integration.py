@@ -40,3 +40,22 @@ class TestDataplaneCoreIntegration(unittest.TestCase):
         self.assertNotIn("raw_socket", reason)
         self.assertNotIn(";", reason)
 
+    def test_snapshot_exposes_afpacket_hugepage_policy(self):
+        handle = dataplane_core.open(
+            {
+                "backend": "txring",
+                "fallback_policy": "fail",
+                "afpacket_hugepage_mode": "required",
+                "afpacket_hugepage_size_kb": 2048,
+                "afpacket_ring_target_mb": 64,
+                "afpacket_mlock_ring": 0,
+                "afpacket_prefault_ring": 1,
+            }
+        )
+        try:
+            snap = dict(dataplane_core.snapshot(handle) or {})
+        finally:
+            dataplane_core.close(handle)
+        self.assertEqual(str(snap.get("afpacket_hugepage_mode", "")), "required")
+        self.assertEqual(int(snap.get("afpacket_hugepage_size_kb", 0) or 0), 2048)
+        self.assertEqual(int(snap.get("afpacket_ring_target_mb", 0) or 0), 64)

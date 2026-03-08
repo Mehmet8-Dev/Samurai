@@ -448,6 +448,18 @@ class TestReporting(unittest.TestCase):
                     "l7_capability_status": "ok",
                     "txring_batch_target": 128,
                     "txring_backoff_ns": 2000,
+                    "afpacket_hugepage_mode": "required",
+                    "afpacket_hugepage_effective": 1,
+                    "afpacket_hugepage_reason": "effective",
+                    "afpacket_hugepage_size_kb": 2048,
+                    "afpacket_madvise_hugepage_ok": 1,
+                    "afpacket_mlock_ok": 0,
+                    "afpacket_prefault_pages": 8,
+                    "afpacket_smaps_kernel_page_kb": 2048,
+                    "afpacket_smaps_anon_hugepages_kb": 2048,
+                    "afpacket_ring_block_size": 4096,
+                    "afpacket_ring_block_nr": 64,
+                    "afpacket_ring_size_bytes": 262144,
                     "l7_active_sessions_peak": 50,
                     "l7_conn_rate": 1234.5,
                     "l7_handshake_p99_ms": 44.0,
@@ -480,6 +492,18 @@ class TestReporting(unittest.TestCase):
                     "l7_capability_status": "partial",
                     "txring_batch_target": 256,
                     "txring_backoff_ns": 4000,
+                    "afpacket_hugepage_mode": "required",
+                    "afpacket_hugepage_effective": 1,
+                    "afpacket_hugepage_reason": "effective",
+                    "afpacket_hugepage_size_kb": 2048,
+                    "afpacket_madvise_hugepage_ok": 1,
+                    "afpacket_mlock_ok": 0,
+                    "afpacket_prefault_pages": 8,
+                    "afpacket_smaps_kernel_page_kb": 2048,
+                    "afpacket_smaps_anon_hugepages_kb": 4096,
+                    "afpacket_ring_block_size": 4096,
+                    "afpacket_ring_block_nr": 128,
+                    "afpacket_ring_size_bytes": 524288,
                     "l7_active_sessions_peak": 60,
                     "l7_conn_rate": 1000.0,
                     "l7_handshake_p99_ms": 50.0,
@@ -513,6 +537,13 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["sender_fallback_reason"], "txring_unavailable")
         self.assertEqual(rr.results["txring_batch_target"], 256)
         self.assertEqual(rr.results["txring_backoff_ns"], 6000)
+        self.assertEqual(rr.results["afpacket_hugepage_mode"], "required")
+        self.assertEqual(rr.results["afpacket_hugepage_effective"], 1)
+        self.assertEqual(rr.results["afpacket_hugepage_reason"], "effective")
+        self.assertEqual(rr.results["afpacket_hugepage_size_kb"], 2048)
+        self.assertEqual(rr.results["afpacket_ring_block_size"], 4096)
+        self.assertEqual(rr.results["afpacket_ring_block_nr"], 128)
+        self.assertEqual(rr.results["afpacket_ring_size_bytes"], 524288)
         self.assertEqual(rr.results["l7_active_sessions_peak"], 60)
         self.assertAlmostEqual(rr.results["l7_handshake_p99_ms"], 50.0, places=4)
         self.assertGreater(rr.results["session_success_rate"], 0.0)
@@ -561,6 +592,36 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["kpi_gate_status"], "fail")
         self.assertEqual(rr.results["kpi_gate_hard_fail"], 1)
         self.assertEqual(rr.results["score_eligible"], 0)
+
+    def test_live_attack_report_kpi_gate_dedicated_fails_on_afpacket_hugepage(self):
+        from ddos_samurai import reporting
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1", "kpi_gate_profile": "dedicated_lab", "kpi_hard_fail": True},
+            worker_events=[
+                {
+                    "status": "ok",
+                    "attack_vector": "basic",
+                    "compute_backend": "cpu",
+                    "sender_path": "TX_RING_L2",
+                    "afpacket_hugepage_mode": "required",
+                    "afpacket_hugepage_effective": 0,
+                    "afpacket_hugepage_reason": "hinted_not_realized",
+                    "txring_tp_packets": 100,
+                    "stats": {"attempted": 100, "sent": 100, "errors": 0, "bytes_sent_est": 6400},
+                }
+            ],
+            duration_s=1.0,
+            progress_total=100,
+            total_count=100,
+            metrics={},
+            warnings=[],
+        )
+        self.assertEqual(rr.results["kpi_gate_status"], "fail")
+        self.assertEqual(rr.results["kpi_gate_hard_fail"], 1)
+        self.assertTrue(
+            any(str(v).startswith("afpacket_hugepage_effective:") for v in rr.results.get("kpi_violations", []))
+        )
 
     def test_live_attack_report_kpi_gate_exception_is_fail_closed(self):
         from ddos_samurai import reporting
