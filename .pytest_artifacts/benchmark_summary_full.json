@@ -1,16 +1,143 @@
 {
-  "generated_utc": "2026-02-24T23:57:37+00:00",
+  "generated_utc": "2026-03-08T10:59:25+00:00",
+  "parity": {
+    "gates": {
+      "afpacket_hugepage_effective_required": 1,
+      "l7_fail_budget_pct_max": 1.0,
+      "l7_handshake_p99_ms_max": 250.0,
+      "l7_step_fail_ratio_max": 0.01,
+      "quic_handshake_fail_ratio_max": 0.01,
+      "quic_response_validation_fail_ratio_max": 0.01,
+      "quic_stack_mode_required": "h3_stateful",
+      "quic_stream_fail_ratio_max": 0.01,
+      "rate_accuracy_pct_min": 98.0,
+      "retry_success_rate_min": 90.0,
+      "run_quality": "valid",
+      "send_success_ratio_pct_min": 99.0,
+      "session_success_rate_min": 99.0,
+      "txring_flush_eagain_ratio_pct_max": 2.0,
+      "txring_flush_error_ratio_pct_max": 0.5,
+      "txring_hold_block_pressure_pct_max": 35.0,
+      "wire_loss_est_pct_max": 1.0
+    },
+    "matrix_path": "/home/mehmet/Masa\u00fcst\u00fc/Python/v11/DDoSamurai/benchmarks/parity_matrix.json",
+    "missing_result_fields": [
+      "afpacket_hugepage_mode",
+      "afpacket_hugepage_effective",
+      "afpacket_hugepage_reason"
+    ],
+    "normalized_results": {
+      "effective_pps": 5004.821369642338,
+      "kpi_gate_hard_fail": 0,
+      "kpi_gate_profile": "dedicated_lab",
+      "kpi_gate_status": "pass",
+      "kpi_violations": [],
+      "l7_active_sessions_peak": 0,
+      "l7_conn_rate": 0.0,
+      "l7_handshake_p99_ms": 0.0,
+      "l7_step_fail_ratio": 0.0,
+      "rate_accuracy_pct": 100.09642739284676,
+      "retry_success_rate": 1.0,
+      "run_quality": "valid",
+      "score_eligible": 1,
+      "sender_fallback_reason": "none",
+      "sender_paths_used": {
+        "PACED_L3": 1
+      },
+      "session_success_rate": 1.0,
+      "txring_backoff_ns": 0,
+      "txring_batch_target": 0,
+      "wire_counter_confidence": 0.0,
+      "wire_loss_est_pct": 0.0
+    },
+    "profile": "dedicated_lab",
+    "required_result_fields": [
+      "run_quality",
+      "sender_paths_used",
+      "sender_fallback_reason",
+      "wire_counter_confidence",
+      "wire_loss_est_pct",
+      "rate_accuracy_pct",
+      "txring_batch_target",
+      "txring_backoff_ns",
+      "afpacket_hugepage_mode",
+      "afpacket_hugepage_effective",
+      "afpacket_hugepage_reason",
+      "l7_active_sessions_peak",
+      "l7_conn_rate",
+      "l7_handshake_p99_ms",
+      "l7_step_fail_ratio",
+      "session_success_rate",
+      "retry_success_rate",
+      "kpi_gate_profile",
+      "kpi_gate_status",
+      "kpi_gate_hard_fail",
+      "kpi_violations",
+      "score_eligible"
+    ],
+    "rows": [
+      {
+        "comparison": "higher_is_better",
+        "id": "l4_top_speed",
+        "layer": "L4",
+        "samurai_field": "effective_pps",
+        "samurai_value": 5004.821369642338,
+        "status": "measured"
+      },
+      {
+        "comparison": "lower_is_better",
+        "id": "l4_wire_loss",
+        "layer": "L4",
+        "samurai_field": "wire_loss_est_pct",
+        "samurai_value": 0.0,
+        "status": "measured"
+      },
+      {
+        "comparison": "higher_is_better",
+        "id": "l4_pacing_accuracy",
+        "layer": "L4",
+        "samurai_field": "rate_accuracy_pct",
+        "samurai_value": 100.09642739284676,
+        "status": "measured"
+      },
+      {
+        "comparison": "higher_is_better",
+        "id": "l7_stateful_scale",
+        "layer": "L7",
+        "samurai_field": "l7_active_sessions_peak",
+        "samurai_value": 0,
+        "status": "measured"
+      },
+      {
+        "comparison": "higher_is_better",
+        "id": "l7_conn_rate",
+        "layer": "L7",
+        "samurai_field": "l7_conn_rate",
+        "samurai_value": 0.0,
+        "status": "measured"
+      },
+      {
+        "comparison": "lower_is_better",
+        "id": "l7_handshake_latency",
+        "layer": "L7",
+        "samurai_field": "l7_handshake_p99_ms",
+        "samurai_value": 0.0,
+        "status": "measured"
+      }
+    ],
+    "schema": "samurai.parity.matrix.v1"
+  },
   "profile": "full",
   "schema": "samurai.benchmark.summary.v1",
   "sections": {
     "gpu_template": {
       "constant": {
-        "avg_ms": 3.1388923331784704,
+        "avg_ms": 3.0678506670180163,
         "cache_hit": 3,
         "cache_miss": 0,
         "h2d_copy_bytes": 0,
         "h2d_copy_count": 0,
-        "pps": 15929186.060794113,
+        "pps": 16298055.35762943,
         "rng_alloc": 1,
         "rng_reuse": 2
       },
@@ -23,12 +150,12 @@
         "gpu_template_h2d_copy_count": 1
       },
       "global": {
-        "avg_ms": 0.8440096692841811,
+        "avg_ms": 0.8469806665137488,
         "cache_hit": 3,
         "cache_miss": 0,
         "h2d_copy_bytes": 0,
         "h2d_copy_count": 0,
-        "pps": 59241027.46643394,
+        "pps": 59033224.69662106,
         "rng_alloc": 0,
         "rng_reuse": 3
       }
@@ -51,9 +178,9 @@
       "wire_loss_status": "ok"
     },
     "pacing": {
-      "actual_rps": 5003.587346966345,
-      "jitter_p99_ns": 70.0,
-      "rate_accuracy_pct": 100.0717469393269,
+      "actual_rps": 5004.821369642338,
+      "jitter_p99_ns": 28.0,
+      "rate_accuracy_pct": 100.09642739284676,
       "sent": 1000,
       "target_rps": 5000.0,
       "txring_flush_call_count": 0,

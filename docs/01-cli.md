@@ -11,6 +11,11 @@ CLI tarafi artik yalniz parser degil, ayni zamanda profile-aware preflight katma
 - Dataplane route kontrolu:
   - `--sender-backend {auto,txring,c_ext_l3,python,xdp}`
   - `--sender-fallback-policy {allow,fail}`
+  - `--afpacket-hugepage-mode {off,auto,required}`
+  - `--afpacket-hugepage-size-kb` (default: `2048`)
+  - `--afpacket-ring-target-mb` (default: `64`)
+  - `--afpacket-mlock-ring` / `--no-afpacket-mlock-ring`
+  - `--afpacket-prefault-ring` / `--no-afpacket-prefault-ring`
   - `--lab-profile {off,dedicated}`
   - `--dp-queue-strategy {rr,pin,map}`, `--dp-queues`, `--dp-queue-map`
 - KPI gate:
@@ -33,8 +38,23 @@ Dedicated profil (`--lab-profile dedicated`) secildiginde CLI otomatik olarak:
 - `kpi_hard_fail=true`
 - `l7_capability_strict=true`
 - QUIC vektorunde `l7_quic_require_native=true`
+- TX_RING backend seciliyse `afpacket_hugepage_mode=required`
 
 ve queue/NIC preflight kontrollerini kosmadan run baslatmaz.
+
+## AF_PACKET HugePage Politikasi
+
+- `off`: hugepage policy kapali, mevcut davranis.
+- `auto`: `madvise(MADV_HUGEPAGE)` + opsiyonel `mlock/prefault`, basarisizlik run'i durdurmaz.
+- `required`: TX_RING sonucu `afpacket_hugepage_effective!=1` ise fail-visible.
+
+Ortama yansitilan env anahtarlari:
+
+- `SAMURAI_AF_PACKET_HUGEPAGE_MODE`
+- `SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB`
+- `SAMURAI_AF_PACKET_RING_TARGET_MB`
+- `SAMURAI_AF_PACKET_MLOCK_RING`
+- `SAMURAI_AF_PACKET_PREFAULT_RING`
 
 ## Onemli Fonksiyonlar
 

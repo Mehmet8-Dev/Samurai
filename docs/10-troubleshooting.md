@@ -112,3 +112,24 @@ Kontrol listesi:
 Not:
 
 - Deterministik benchmark icin `--sender-backend` explicit secilmeli, `auto` yalnizca genel fallback modunda kullanilmalidir.
+
+## 8) AF_PACKET HugePage `required` Modunda Run Fail
+
+Belirti:
+
+- `sender_fallback_reason=afpacket_hugepage_required_not_met`
+- KPI gate tarafinda `afpacket_hugepage_effective` ihlali
+
+Kontrol listesi:
+
+- Run TX_RING ile mi calisiyor (`sender_path` / `sender_paths_used`)?
+- `afpacket_hugepage_mode=required` aktif mi?
+- Rapordaki alanlar:
+  - `afpacket_hugepage_effective`
+  - `afpacket_hugepage_reason`
+  - `afpacket_smaps_kernel_page_kb`
+  - `afpacket_smaps_anon_hugepages_kb`
+
+Not:
+
+- AF_PACKET ring bellegi kernel tarafinda ayrildigi icin bu policy "enforce edilebilir hugepage policy" saglar; mutlak hugetlb garantisi degildir.
