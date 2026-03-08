@@ -142,6 +142,18 @@ _PACER_STATS_DEFAULTS = {
     "txring_tp_freeze_q_cnt": 0,
     "txring_packet_version": 0,
     "txring_packet_version_name": "TPACKET_UNKNOWN",
+    "afpacket_hugepage_mode": "off",
+    "afpacket_hugepage_effective": 0,
+    "afpacket_hugepage_reason": "disabled",
+    "afpacket_hugepage_size_kb": 0,
+    "afpacket_madvise_hugepage_ok": 0,
+    "afpacket_mlock_ok": 0,
+    "afpacket_prefault_pages": 0,
+    "afpacket_smaps_kernel_page_kb": 0,
+    "afpacket_smaps_anon_hugepages_kb": 0,
+    "afpacket_ring_block_size": 0,
+    "afpacket_ring_block_nr": 0,
+    "afpacket_ring_size_bytes": 0,
     "syscall_overhead_ns": 0,
     "sleep_overhead_ns": 0,
     "spin_threshold_ns": 0,
@@ -157,6 +169,8 @@ def normalize_stats(stats: Optional[dict]) -> dict:
     out["so_txtime_active"] = int(bool(out.get("so_txtime_active", 0)))
     out["txring_flush_last_errno_name"] = str(out.get("txring_flush_last_errno_name", "NONE") or "NONE")
     out["txring_packet_version_name"] = str(out.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN")
+    out["afpacket_hugepage_mode"] = str(out.get("afpacket_hugepage_mode", "off") or "off")
+    out["afpacket_hugepage_reason"] = str(out.get("afpacket_hugepage_reason", "disabled") or "disabled")
     hist = out.get("ipg_histogram")
     out["ipg_histogram"] = list(hist) if isinstance(hist, (list, tuple)) else []
     return out

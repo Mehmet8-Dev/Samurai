@@ -43,6 +43,7 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "txring_flush_error_ratio_pct_max": 2.0,
         "txring_flush_eagain_ratio_pct_max": 5.0,
         "txring_hold_block_pressure_pct_max": 60.0,
+        "afpacket_hugepage_effective_required": 1,
         "session_success_rate_min": 95.0,
         "retry_success_rate_min": 70.0,
         "l7_step_fail_ratio_max": 0.05,
@@ -60,6 +61,7 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "txring_flush_error_ratio_pct_max": 0.5,
         "txring_flush_eagain_ratio_pct_max": 2.0,
         "txring_hold_block_pressure_pct_max": 35.0,
+        "afpacket_hugepage_effective_required": 1,
         "session_success_rate_min": 99.0,
         "retry_success_rate_min": 90.0,
         "l7_step_fail_ratio_max": 0.01,
@@ -125,6 +127,8 @@ def _merge_gate_defaults(profile: str, parity_matrix_path: Optional[str] = None)
         base["txring_flush_eagain_ratio_pct_max"] = parity["txring_flush_eagain_ratio_pct_max"]
     if "txring_hold_block_pressure_pct_max" in parity:
         base["txring_hold_block_pressure_pct_max"] = parity["txring_hold_block_pressure_pct_max"]
+    if "afpacket_hugepage_effective_required" in parity:
+        base["afpacket_hugepage_effective_required"] = parity["afpacket_hugepage_effective_required"]
     if "l7_step_fail_ratio_max" in parity:
         base["l7_step_fail_ratio_max"] = parity["l7_step_fail_ratio_max"]
     if "l7_handshake_p99_ms_max" in parity:
@@ -231,9 +235,23 @@ def _infer_l7_scope(results: Dict[str, Any], quic_scope: bool) -> bool:
     return any(_metric_gt_zero(results, key) for key in l7_metric_keys)
 
 
+def _infer_txring_scope(results: Dict[str, Any]) -> bool:
+    if _sender_path_has(results, "TX_RING") or _sender_path_has(results, "PACED_L2"):
+        return True
+    txring_metric_keys = (
+        "txring_flush_call_count",
+        "txring_tp_packets",
+        "txring_packet_version",
+        "afpacket_ring_size_bytes",
+        "afpacket_ring_block_nr",
+    )
+    return any(_metric_gt_zero(results, key) for key in txring_metric_keys)
+
+
 def _build_rules(gates: Dict[str, Any], results: Dict[str, Any]) -> List[KpiGateRule]:
     quic_scope = _infer_quic_scope(results)
     l7_scope = _infer_l7_scope(results, quic_scope=quic_scope)
+    txring_scope = _infer_txring_scope(results)
     rules: List[KpiGateRule] = [
         KpiGateRule("run_quality", "run_quality", "eq", gates.get("run_quality", "valid"), required=True),
         KpiGateRule(
@@ -277,6 +295,13 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any]) -> List[KpiGate
             "max",
             float(gates.get("txring_hold_block_pressure_pct_max", 35.0) or 35.0),
             required=False,
+        ),
+        KpiGateRule(
+            "afpacket_hugepage_effective",
+            "afpacket_hugepage_effective",
+            "eq",
+            int(gates.get("afpacket_hugepage_effective_required", 1) or 1),
+            required=bool(txring_scope),
         ),
         KpiGateRule(
             "session_success_rate",

@@ -23,6 +23,11 @@ class DataplaneConfig:
     queue_id: int = 0
     interface: str = ""
     xdp_enable: bool = False
+    afpacket_hugepage_mode: str = "off"
+    afpacket_hugepage_size_kb: int = 2048
+    afpacket_ring_target_mb: int = 64
+    afpacket_mlock_ring: bool = False
+    afpacket_prefault_ring: bool = True
     use_core: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -36,6 +41,11 @@ class DataplaneConfig:
             "queue_id": int(self.queue_id or 0),
             "interface": str(self.interface or ""),
             "xdp_enable": bool(self.xdp_enable),
+            "afpacket_hugepage_mode": str(self.afpacket_hugepage_mode or "off"),
+            "afpacket_hugepage_size_kb": int(self.afpacket_hugepage_size_kb or 2048),
+            "afpacket_ring_target_mb": int(self.afpacket_ring_target_mb or 64),
+            "afpacket_mlock_ring": bool(self.afpacket_mlock_ring),
+            "afpacket_prefault_ring": bool(self.afpacket_prefault_ring),
             "use_core": bool(self.use_core),
         }
         if self.extra:
@@ -239,6 +249,28 @@ def _normalize_core_mode(value: str | None) -> str:
     return "off"
 
 
+def _normalize_afpacket_hugepage_mode(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "on": "auto",
+        "enable": "auto",
+        "enabled": "auto",
+        "1": "auto",
+        "true": "auto",
+        "off": "off",
+        "disable": "off",
+        "disabled": "off",
+        "0": "off",
+        "false": "off",
+        "strict": "required",
+        "must": "required",
+    }
+    mode = aliases.get(raw, raw)
+    if mode in {"off", "auto", "required"}:
+        return mode
+    return "off"
+
+
 def build_dataplane_config(args: Dict[str, Any], queue_id: Optional[int] = None) -> DataplaneConfig:
     backend = str(args.get("sender_backend", "auto") or "auto").strip().lower()
     fallback_policy = str(args.get("sender_fallback_policy", "allow") or "allow").strip().lower()
@@ -249,6 +281,21 @@ def build_dataplane_config(args: Dict[str, Any], queue_id: Optional[int] = None)
     qid = int(queue_id if queue_id is not None else (args.get("dp_queue_id", args.get("xdp_queue_id", 0)) or 0))
     interface = str(args.get("xdp_interface", "") or "")
     xdp_enable = bool(args.get("xdp_enable", False))
+    afpacket_hugepage_mode = _normalize_afpacket_hugepage_mode(
+        args.get("afpacket_hugepage_mode", os.environ.get("SAMURAI_AF_PACKET_HUGEPAGE_MODE", "off"))
+    )
+    afpacket_hugepage_size_kb = int(
+        args.get("afpacket_hugepage_size_kb", os.environ.get("SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB", 2048)) or 2048
+    )
+    afpacket_ring_target_mb = int(
+        args.get("afpacket_ring_target_mb", os.environ.get("SAMURAI_AF_PACKET_RING_TARGET_MB", 64)) or 64
+    )
+    afpacket_mlock_ring = bool(
+        args.get("afpacket_mlock_ring", _env_truthy("SAMURAI_AF_PACKET_MLOCK_RING", False))
+    )
+    afpacket_prefault_ring = bool(
+        args.get("afpacket_prefault_ring", _env_truthy("SAMURAI_AF_PACKET_PREFAULT_RING", True))
+    )
     if "dataplane_core_enable" in args:
         use_core_legacy = bool(args.get("dataplane_core_enable", False))
         if use_core_legacy and core_mode == "off":
@@ -259,6 +306,8 @@ def build_dataplane_config(args: Dict[str, Any], queue_id: Optional[int] = None)
         core_mode = "auto"
     if lab_profile == "dedicated" and core_mode != "required":
         core_mode = "required"
+    if lab_profile == "dedicated" and backend == "txring" and afpacket_hugepage_mode != "required":
+        afpacket_hugepage_mode = "required"
     use_core = core_mode in {"auto", "required"}
     allow_python_fallback = _env_truthy("SAMURAI_DP_ALLOW_PY_FALLBACK", False)
     if core_mode == "required":
@@ -277,6 +326,11 @@ def build_dataplane_config(args: Dict[str, Any], queue_id: Optional[int] = None)
         queue_id=qid,
         interface=interface,
         xdp_enable=xdp_enable,
+        afpacket_hugepage_mode=afpacket_hugepage_mode,
+        afpacket_hugepage_size_kb=max(1, afpacket_hugepage_size_kb),
+        afpacket_ring_target_mb=max(1, afpacket_ring_target_mb),
+        afpacket_mlock_ring=afpacket_mlock_ring,
+        afpacket_prefault_ring=afpacket_prefault_ring,
         use_core=use_core,
         extra=extra,
     )

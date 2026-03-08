@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <time.h>
 #include <linux/net_tstamp.h>
 #include <linux/errqueue.h>
@@ -83,6 +84,88 @@ static const char* txring_flush_errno_name(int err) {
     if (err == ENOBUFS) return "ENOBUFS";
     if (err == EBUSY) return "EBUSY";
     return "OTHER";
+}
+
+typedef enum {
+    AFPKT_HP_OFF = 0,
+    AFPKT_HP_AUTO = 1,
+    AFPKT_HP_REQUIRED = 2,
+} afpacket_hp_mode_t;
+
+typedef struct {
+    afpacket_hp_mode_t mode;
+    int hugepage_size_kb;
+    int ring_target_mb;
+    int mlock_ring;
+    int prefault_ring;
+} txring_hugepage_policy_t;
+
+typedef struct {
+    int mode;
+    int effective;
+    int madvise_ok;
+    int mlock_ok;
+    unsigned long long prefault_pages;
+    unsigned long long smaps_kernel_page_kb;
+    unsigned long long smaps_anon_hugepages_kb;
+    char reason[96];
+} txring_hugepage_runtime_t;
+
+static txring_hugepage_policy_t g_txring_hp_policy = {
+    .mode = AFPKT_HP_OFF,
+    .hugepage_size_kb = 2048,
+    .ring_target_mb = 64,
+    .mlock_ring = 0,
+    .prefault_ring = 1,
+};
+
+static afpacket_hp_mode_t parse_afpacket_hp_mode(const char* raw) {
+    if (!raw || !raw[0]) return AFPKT_HP_OFF;
+    if (
+        strcasecmp(raw, "required") == 0 ||
+        strcasecmp(raw, "strict") == 0 ||
+        strcasecmp(raw, "must") == 0 ||
+        strcasecmp(raw, "hard") == 0
+    ) {
+        return AFPKT_HP_REQUIRED;
+    }
+    if (
+        strcasecmp(raw, "auto") == 0 ||
+        strcasecmp(raw, "on") == 0 ||
+        strcasecmp(raw, "enable") == 0 ||
+        strcmp(raw, "1") == 0
+    ) {
+        return AFPKT_HP_AUTO;
+    }
+    return AFPKT_HP_OFF;
+}
+
+static const char* afpacket_hp_mode_name(int mode) {
+    switch (mode) {
+        case AFPKT_HP_REQUIRED: return "required";
+        case AFPKT_HP_AUTO: return "auto";
+        default: return "off";
+    }
+}
+
+static int env_int_default(const char* name, int fallback) {
+    const char* raw = getenv(name);
+    char* endptr = NULL;
+    long v;
+    if (!raw || !raw[0]) return fallback;
+    errno = 0;
+    v = strtol(raw, &endptr, 10);
+    if (errno != 0 || endptr == raw || (endptr && *endptr != '\0')) return fallback;
+    if (v <= 0 || v > 1 << 20) return fallback;
+    return (int)v;
+}
+
+static void load_txring_hugepage_policy_from_env(void) {
+    g_txring_hp_policy.mode = parse_afpacket_hp_mode(getenv("SAMURAI_AF_PACKET_HUGEPAGE_MODE"));
+    g_txring_hp_policy.hugepage_size_kb = env_int_default("SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB", 2048);
+    g_txring_hp_policy.ring_target_mb = env_int_default("SAMURAI_AF_PACKET_RING_TARGET_MB", 64);
+    g_txring_hp_policy.mlock_ring = env_truthy(getenv("SAMURAI_AF_PACKET_MLOCK_RING")) ? 1 : 0;
+    g_txring_hp_policy.prefault_ring = env_truthy(getenv("SAMURAI_AF_PACKET_PREFAULT_RING")) ? 1 : 0;
 }
 
 static inline uint64_t monotonic_ns_now(void) {
@@ -276,6 +359,7 @@ typedef struct {
     char iface[IFNAMSIZ];
     int is_setup;
     unsigned int frame_idx;
+    txring_hugepage_runtime_t hp_runtime;
 } ring_context_t;
 
 static ring_context_t tx_ring_ctx = {
@@ -284,6 +368,16 @@ static ring_context_t tx_ring_ctx = {
     .map = MAP_FAILED,
     .packet_version = TPACKET_V2,
     .frame_header_size = 0,
+    .hp_runtime = {
+        .mode = AFPKT_HP_OFF,
+        .effective = 0,
+        .madvise_ok = 0,
+        .mlock_ok = 0,
+        .prefault_pages = 0ULL,
+        .smaps_kernel_page_kb = 0ULL,
+        .smaps_anon_hugepages_kb = 0ULL,
+        .reason = "disabled",
+    },
 };
 
 static const char* packet_version_name(int version) {
@@ -333,6 +427,14 @@ static void reset_tx_ring_context(void) {
     tx_ring_ctx.is_setup = 0;
     tx_ring_ctx.map = MAP_FAILED;
     tx_ring_ctx.sock = -1;
+    tx_ring_ctx.hp_runtime.mode = AFPKT_HP_OFF;
+    tx_ring_ctx.hp_runtime.effective = 0;
+    tx_ring_ctx.hp_runtime.madvise_ok = 0;
+    tx_ring_ctx.hp_runtime.mlock_ok = 0;
+    tx_ring_ctx.hp_runtime.prefault_pages = 0ULL;
+    tx_ring_ctx.hp_runtime.smaps_kernel_page_kb = 0ULL;
+    tx_ring_ctx.hp_runtime.smaps_anon_hugepages_kb = 0ULL;
+    (void)snprintf(tx_ring_ctx.hp_runtime.reason, sizeof(tx_ring_ctx.hp_runtime.reason), "%s", "disabled");
 }
 
 static void cleanup_tx_ring_internal(void) {
@@ -359,6 +461,125 @@ static int set_packet_version_or_fallback(int sock, int preferred_v3) {
     return -1;
 }
 
+static int probe_smaps_hugepage_info(
+    const void* addr,
+    unsigned long long* out_kernel_page_kb,
+    unsigned long long* out_anon_hugepages_kb
+) {
+    FILE* fp = NULL;
+    char line[256];
+    unsigned long long a = (unsigned long long)(uintptr_t)addr;
+    int in_region = 0;
+    int found = 0;
+
+    if (out_kernel_page_kb) *out_kernel_page_kb = 0ULL;
+    if (out_anon_hugepages_kb) *out_anon_hugepages_kb = 0ULL;
+
+    fp = fopen("/proc/self/smaps", "r");
+    if (!fp) return 0;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        unsigned long long start = 0ULL;
+        unsigned long long end = 0ULL;
+        if (sscanf(line, "%llx-%llx", &start, &end) == 2) {
+            in_region = (a >= start && a < end) ? 1 : 0;
+            if (in_region) found = 1;
+            continue;
+        }
+        if (!in_region) continue;
+        if (strncmp(line, "KernelPageSize:", 15) == 0) {
+            unsigned long long kb = 0ULL;
+            if (sscanf(line + 15, "%llu", &kb) == 1 && out_kernel_page_kb) {
+                *out_kernel_page_kb = kb;
+            }
+        } else if (strncmp(line, "AnonHugePages:", 14) == 0) {
+            unsigned long long kb = 0ULL;
+            if (sscanf(line + 14, "%llu", &kb) == 1 && out_anon_hugepages_kb) {
+                *out_anon_hugepages_kb = kb;
+            }
+        }
+    }
+
+    fclose(fp);
+    return found;
+}
+
+static void apply_txring_hugepage_policy(ring_context_t* ctx) {
+    txring_hugepage_runtime_t* rt = &ctx->hp_runtime;
+    unsigned long long huge_kb = 0ULL;
+    unsigned long long anon_huge_kb = 0ULL;
+    int madvise_rc = -1;
+    int mlock_rc = -1;
+    size_t page_size;
+    size_t i;
+    volatile unsigned char sink = 0;
+
+    rt->mode = g_txring_hp_policy.mode;
+    rt->effective = 0;
+    rt->madvise_ok = 0;
+    rt->mlock_ok = 0;
+    rt->prefault_pages = 0ULL;
+    rt->smaps_kernel_page_kb = 0ULL;
+    rt->smaps_anon_hugepages_kb = 0ULL;
+    (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "disabled");
+
+    if (!ctx->is_setup || ctx->map == MAP_FAILED || ctx->ring_size == 0) {
+        (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "ring_unavailable");
+        return;
+    }
+
+    if (g_txring_hp_policy.mode == AFPKT_HP_OFF) {
+        (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "disabled");
+        return;
+    }
+
+#ifdef MADV_HUGEPAGE
+    madvise_rc = madvise((void*)ctx->map, ctx->ring_size, MADV_HUGEPAGE);
+    if (madvise_rc == 0) {
+        rt->madvise_ok = 1;
+    }
+#else
+    madvise_rc = -1;
+#endif
+
+    if (g_txring_hp_policy.prefault_ring) {
+        page_size = (size_t)getpagesize();
+        if (page_size == 0) page_size = 4096;
+        for (i = 0; i < ctx->ring_size; i += page_size) {
+            sink ^= ctx->map[i];
+            rt->prefault_pages++;
+        }
+        (void)sink;
+    }
+
+    if (g_txring_hp_policy.mlock_ring) {
+        mlock_rc = mlock((void*)ctx->map, ctx->ring_size);
+        rt->mlock_ok = (mlock_rc == 0) ? 1 : 0;
+    } else {
+        mlock_rc = 0;
+        rt->mlock_ok = 0;
+    }
+
+    (void)probe_smaps_hugepage_info(ctx->map, &huge_kb, &anon_huge_kb);
+    rt->smaps_kernel_page_kb = huge_kb;
+    rt->smaps_anon_hugepages_kb = anon_huge_kb;
+
+    if (anon_huge_kb > 0ULL || huge_kb >= (unsigned long long)g_txring_hp_policy.hugepage_size_kb) {
+        rt->effective = 1;
+        (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "effective");
+        return;
+    }
+
+    if (madvise_rc == 0) {
+        (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "hinted_not_realized");
+    } else {
+        (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "madvise_failed");
+    }
+    if (g_txring_hp_policy.mlock_ring && mlock_rc != 0) {
+        (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "mlock_failed");
+    }
+}
+
 static int fill_ring_request_for_version(
     int packet_version,
     int packet_size,
@@ -370,10 +591,18 @@ static int fill_ring_request_for_version(
 
     size_t frame_header_size = frame_header_size_for_version(packet_version);
     unsigned int block_size = (unsigned int)getpagesize();
+    unsigned int target_mb = (unsigned int)(g_txring_hp_policy.ring_target_mb > 0 ? g_txring_hp_policy.ring_target_mb : 64);
+    unsigned long long target_bytes = (unsigned long long)target_mb * 1024ULL * 1024ULL;
     while (block_size < (unsigned int)(packet_size + frame_header_size)) {
         block_size <<= 1;
     }
-    unsigned int block_nr = 4096;
+    if (target_bytes < (unsigned long long)block_size) {
+        target_bytes = (unsigned long long)block_size;
+    }
+    unsigned int block_nr = (unsigned int)((target_bytes + (unsigned long long)block_size - 1ULL) / (unsigned long long)block_size);
+    if (block_nr < 64U) {
+        block_nr = 64U;
+    }
     unsigned int frame_size = block_size;
     unsigned int frame_nr = block_nr;
 
@@ -1248,10 +1477,12 @@ static int try_setup_tx_ring_version(const char* iface, int packet_size, const u
     snprintf(tx_ring_ctx.iface, IFNAMSIZ, "%s", iface);
     tx_ring_ctx.is_setup = 1;
     tx_ring_ctx.frame_idx = 0;
+    apply_txring_hugepage_policy(&tx_ring_ctx);
     return 0;
 }
 
 static int setup_tx_ring(const char* iface, int packet_size, const uint8_t* mac) {
+    load_txring_hugepage_policy_from_env();
     if (tx_ring_ctx.is_setup) {
         unsigned int current_frame_size = tx_ring_frame_size(&tx_ring_ctx);
         size_t current_frame_header_size = tx_ring_ctx.frame_header_size;
@@ -1260,6 +1491,7 @@ static int setup_tx_ring(const char* iface, int packet_size, const uint8_t* mac)
         }
         if (strcmp(tx_ring_ctx.iface, iface) == 0 &&
             current_frame_size >= (unsigned int)(packet_size + current_frame_header_size)) {
+            apply_txring_hugepage_policy(&tx_ring_ctx);
             return 0;
         }
         cleanup_tx_ring_internal();
@@ -1285,6 +1517,38 @@ static PyObject* cleanup_ring(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* configure_txring_hugepage_policy(PyObject* self, PyObject* args) {
+    const char* mode = NULL;
+    int hugepage_size_kb = 2048;
+    int ring_target_mb = 64;
+    int mlock_ring = 0;
+    int prefault_ring = 1;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "siiii", &mode, &hugepage_size_kb, &ring_target_mb, &mlock_ring, &prefault_ring)) {
+        return NULL;
+    }
+
+    g_txring_hp_policy.mode = parse_afpacket_hp_mode(mode);
+    g_txring_hp_policy.hugepage_size_kb = (hugepage_size_kb > 0) ? hugepage_size_kb : 2048;
+    g_txring_hp_policy.ring_target_mb = (ring_target_mb > 0) ? ring_target_mb : 64;
+    g_txring_hp_policy.mlock_ring = mlock_ring ? 1 : 0;
+    g_txring_hp_policy.prefault_ring = prefault_ring ? 1 : 0;
+
+    if (tx_ring_ctx.is_setup) {
+        apply_txring_hugepage_policy(&tx_ring_ctx);
+    }
+
+    return Py_BuildValue(
+        "{s:s,s:i,s:i,s:i,s:i}",
+        "afpacket_hugepage_mode", afpacket_hp_mode_name(g_txring_hp_policy.mode),
+        "afpacket_hugepage_size_kb", g_txring_hp_policy.hugepage_size_kb,
+        "afpacket_ring_target_mb", g_txring_hp_policy.ring_target_mb,
+        "afpacket_mlock_ring", g_txring_hp_policy.mlock_ring,
+        "afpacket_prefault_ring", g_txring_hp_policy.prefault_ring
+    );
+}
+
 static PyObject* get_ring_info(PyObject* self, PyObject* args) {
     (void)self;
     (void)args;
@@ -1299,9 +1563,17 @@ static PyObject* get_ring_info(PyObject* self, PyObject* args) {
     unsigned int tp_frame_nr = is_setup ? tx_ring_frame_nr(&tx_ring_ctx) : 0;
     unsigned long long ring_size = is_setup ? (unsigned long long)tx_ring_ctx.ring_size : 0ULL;
     unsigned long long frame_header_size = is_setup ? (unsigned long long)tx_ring_ctx.frame_header_size : 0ULL;
+    const char* hp_mode = is_setup ? afpacket_hp_mode_name(tx_ring_ctx.hp_runtime.mode) : "off";
+    int hp_effective = is_setup ? tx_ring_ctx.hp_runtime.effective : 0;
+    int hp_madvise_ok = is_setup ? tx_ring_ctx.hp_runtime.madvise_ok : 0;
+    int hp_mlock_ok = is_setup ? tx_ring_ctx.hp_runtime.mlock_ok : 0;
+    unsigned long long hp_prefault_pages = is_setup ? tx_ring_ctx.hp_runtime.prefault_pages : 0ULL;
+    unsigned long long hp_kernel_page_kb = is_setup ? tx_ring_ctx.hp_runtime.smaps_kernel_page_kb : 0ULL;
+    unsigned long long hp_anon_huge_kb = is_setup ? tx_ring_ctx.hp_runtime.smaps_anon_hugepages_kb : 0ULL;
+    const char* hp_reason = is_setup ? tx_ring_ctx.hp_runtime.reason : "disabled";
 
     return Py_BuildValue(
-        "{s:i,s:i,s:s,s:s,s:I,s:I,s:I,s:I,s:K,s:K}",
+        "{s:i,s:i,s:s,s:s,s:I,s:I,s:I,s:I,s:K,s:K,s:s,s:i,s:s,s:i,s:i,s:K,s:K,s:K}",
         "is_setup", is_setup,
         "packet_version", packet_version,
         "packet_version_name", version_name,
@@ -1311,7 +1583,15 @@ static PyObject* get_ring_info(PyObject* self, PyObject* args) {
         "tp_block_nr", tp_block_nr,
         "tp_frame_nr", tp_frame_nr,
         "ring_size", ring_size,
-        "frame_header_size", frame_header_size
+        "frame_header_size", frame_header_size,
+        "afpacket_hugepage_mode", hp_mode,
+        "afpacket_hugepage_effective", hp_effective,
+        "afpacket_hugepage_reason", hp_reason,
+        "afpacket_madvise_hugepage_ok", hp_madvise_ok,
+        "afpacket_mlock_ok", hp_mlock_ok,
+        "afpacket_prefault_pages", hp_prefault_pages,
+        "afpacket_smaps_kernel_page_kb", hp_kernel_page_kb,
+        "afpacket_smaps_anon_hugepages_kb", hp_anon_huge_kb
     );
 }
 
@@ -1333,6 +1613,18 @@ typedef struct {
     unsigned int txring_batch_target;
     unsigned long long txring_backoff_ns;
     int flush_mode;
+    int afpacket_hugepage_mode;
+    int afpacket_hugepage_effective;
+    int afpacket_madvise_hugepage_ok;
+    int afpacket_mlock_ok;
+    unsigned long long afpacket_prefault_pages;
+    unsigned long long afpacket_smaps_kernel_page_kb;
+    unsigned long long afpacket_smaps_anon_hugepages_kb;
+    int afpacket_hugepage_size_kb;
+    unsigned int afpacket_ring_block_size;
+    unsigned int afpacket_ring_block_nr;
+    unsigned long long afpacket_ring_size_bytes;
+    char afpacket_hugepage_reason[96];
 } txring_send_metrics_t;
 
 static void drain_txring_packet_stats(const ring_context_t* ctx) {
@@ -1422,10 +1714,35 @@ static int send_ring_optimized_core(
     memset(metrics, 0, sizeof(*metrics));
     metrics->attempted = count;
     metrics->flush_mode = (int)txring_flush_mode_from_env();
+    (void)snprintf(metrics->afpacket_hugepage_reason, sizeof(metrics->afpacket_hugepage_reason), "%s", "none");
+
+    load_txring_hugepage_policy_from_env();
 
     if (setup_tx_ring(iface, packet_size, mac) < 0) {
         PyErr_SetString(PyExc_OSError, "Failed to setup TX_RING");
         return -1;
+    }
+
+    metrics->afpacket_hugepage_mode = tx_ring_ctx.hp_runtime.mode;
+    metrics->afpacket_hugepage_effective = tx_ring_ctx.hp_runtime.effective;
+    metrics->afpacket_madvise_hugepage_ok = tx_ring_ctx.hp_runtime.madvise_ok;
+    metrics->afpacket_mlock_ok = tx_ring_ctx.hp_runtime.mlock_ok;
+    metrics->afpacket_prefault_pages = tx_ring_ctx.hp_runtime.prefault_pages;
+    metrics->afpacket_smaps_kernel_page_kb = tx_ring_ctx.hp_runtime.smaps_kernel_page_kb;
+    metrics->afpacket_smaps_anon_hugepages_kb = tx_ring_ctx.hp_runtime.smaps_anon_hugepages_kb;
+    metrics->afpacket_hugepage_size_kb = g_txring_hp_policy.hugepage_size_kb;
+    metrics->afpacket_ring_block_size = tx_ring_block_size(&tx_ring_ctx);
+    metrics->afpacket_ring_block_nr = tx_ring_block_nr(&tx_ring_ctx);
+    metrics->afpacket_ring_size_bytes = (unsigned long long)tx_ring_ctx.ring_size;
+    (void)snprintf(
+        metrics->afpacket_hugepage_reason,
+        sizeof(metrics->afpacket_hugepage_reason),
+        "%s",
+        tx_ring_ctx.hp_runtime.reason
+    );
+    if (metrics->afpacket_hugepage_mode == AFPKT_HP_REQUIRED && metrics->afpacket_hugepage_effective <= 0) {
+        metrics->sent = 0;
+        return 0;
     }
 
     drain_txring_packet_stats(&tx_ring_ctx);
@@ -1628,6 +1945,9 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
     int errors = 0;
     int packet_version = 0;
     const char* packet_version_str = "TPACKET_UNKNOWN";
+    const char* afpacket_hp_mode = "off";
+    const char* sender_fallback_reason = "none";
+    int fallback_count = 0;
 
     (void)self;
     if (!PyArg_ParseTuple(args, "sy*iiy*", &iface, &view, &packet_size, &count, &mac_view)) {
@@ -1655,9 +1975,14 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
     if (errors < 0) errors = 0;
     packet_version = tx_ring_ctx.packet_version;
     packet_version_str = packet_version_name(packet_version);
+    afpacket_hp_mode = afpacket_hp_mode_name(metrics.afpacket_hugepage_mode);
+    if (metrics.afpacket_hugepage_mode == AFPKT_HP_REQUIRED && metrics.afpacket_hugepage_effective <= 0) {
+        sender_fallback_reason = "afpacket_hugepage_required_not_met";
+        fallback_count = 1;
+    }
 
     return Py_BuildValue(
-        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:i,s:s,s:K,s:K,s:K,s:K,s:K,s:I,s:K,s:s,s:i,s:s}",
+        "{s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:i,s:s,s:K,s:K,s:K,s:K,s:K,s:I,s:K,s:s,s:i,s:s,s:s,s:i,s:s,s:i,s:s,s:i,s:i,s:K,s:K,s:K,s:I,s:I,s:K}",
         "attempted", metrics.attempted,
         "sent", metrics.sent,
         "errors", errors,
@@ -1678,7 +2003,21 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
         "txring_backoff_ns", metrics.txring_backoff_ns,
         "flush_mode", txring_flush_mode_name(metrics.flush_mode),
         "txring_packet_version", packet_version,
-        "txring_packet_version_name", packet_version_str
+        "txring_packet_version_name", packet_version_str,
+        "sender_fallback_reason", sender_fallback_reason,
+        "fallback_count", fallback_count,
+        "afpacket_hugepage_mode", afpacket_hp_mode,
+        "afpacket_hugepage_effective", metrics.afpacket_hugepage_effective,
+        "afpacket_hugepage_reason", metrics.afpacket_hugepage_reason,
+        "afpacket_hugepage_size_kb", metrics.afpacket_hugepage_size_kb,
+        "afpacket_madvise_hugepage_ok", metrics.afpacket_madvise_hugepage_ok,
+        "afpacket_mlock_ok", metrics.afpacket_mlock_ok,
+        "afpacket_prefault_pages", metrics.afpacket_prefault_pages,
+        "afpacket_smaps_kernel_page_kb", metrics.afpacket_smaps_kernel_page_kb,
+        "afpacket_smaps_anon_hugepages_kb", metrics.afpacket_smaps_anon_hugepages_kb,
+        "afpacket_ring_block_size", metrics.afpacket_ring_block_size,
+        "afpacket_ring_block_nr", metrics.afpacket_ring_block_nr,
+        "afpacket_ring_size_bytes", metrics.afpacket_ring_size_bytes
     );
 }
 
@@ -1692,6 +2031,8 @@ static PyMethodDef FastSenderMethods[] = {
     {"send_ring_optimized", send_ring_optimized, METH_VARARGS, "Send packets using AF_PACKET TX_RING (L2 Zero-Copy)"},
     {"send_ring_optimized_ex", send_ring_optimized_ex, METH_VARARGS,
      "Send packets using AF_PACKET TX_RING (L2 Zero-Copy) and return detailed counters."},
+    {"configure_txring_hugepage_policy", configure_txring_hugepage_policy, METH_VARARGS,
+     "Configure AF_PACKET hugepage policy for TX_RING path."},
     {"cleanup_ring", cleanup_ring, METH_VARARGS, "Cleanup persistent TX_RING context"},
     {"get_ring_info", get_ring_info, METH_NOARGS, "Return active TX_RING setup details including packet version."},
     {"configure_state_engine", configure_state_engine, METH_VARARGS, "Configure state table size/locks/timeout."},
@@ -1740,5 +2081,6 @@ PyMODINIT_FUNC PyInit_fast_sender(void) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to initialize state engine");
         return NULL;
     }
+    load_txring_hugepage_policy_from_env();
     return PyModule_Create(&fastsendermodule);
 }

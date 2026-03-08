@@ -34,9 +34,16 @@ typedef struct {
     int xdp_mode;
     int raw_sockfd;
     int allow_python_fallback;
+    int afpacket_hugepage_size_kb;
+    int afpacket_ring_target_mb;
+    int afpacket_mlock_ring;
+    int afpacket_prefault_ring;
+    int afpacket_hugepage_effective;
     char auto_resolve_reason[96];
     char backend[32];
     char fallback_policy[16];
+    char afpacket_hugepage_mode[16];
+    char afpacket_hugepage_reason[96];
     char interface[IFNAMSIZ];
     PyObject *xdp_mod;
     PyObject *fast_mod;
@@ -517,14 +524,19 @@ static PyObject *_run_txring_backend(
     int target_port
 ) {
     PyObject *fast_mod = NULL;
+    PyObject *cfg_ret = NULL;
     PyObject *mac_obj = NULL;
     PyObject *tx_result = NULL;
     PyObject *out = NULL;
     char iface[IFNAMSIZ];
     char reason[96];
+    const char *tx_reason = "none";
+    const char *hp_reason = "none";
     long attempted;
     long sent;
     long errors;
+    long tx_fallback_count = 0;
+    long hp_effective = 0;
 
     reason[0] = '\0';
     iface[0] = '\0';
@@ -542,6 +554,24 @@ static PyObject *_run_txring_backend(
     if (_resolve_txring_target(h, target_ip, iface, sizeof(iface), &mac_obj) < 0) {
         Py_DECREF(fast_mod);
         return _build_result(count, 0, count, packet_size, target_ip, target_port, "DP_TX_RING_FAILED", "txring_target_unresolved", 1);
+    }
+
+    if (PyObject_HasAttrString(fast_mod, "configure_txring_hugepage_policy")) {
+        cfg_ret = PyObject_CallMethod(
+            fast_mod,
+            "configure_txring_hugepage_policy",
+            "siiii",
+            h->afpacket_hugepage_mode,
+            h->afpacket_hugepage_size_kb,
+            h->afpacket_ring_target_mb,
+            h->afpacket_mlock_ring,
+            h->afpacket_prefault_ring
+        );
+        if (cfg_ret != NULL) {
+            Py_DECREF(cfg_ret);
+        } else {
+            PyErr_Clear();
+        }
     }
 
     tx_result = PyObject_CallMethod(
@@ -585,6 +615,26 @@ static PyObject *_run_txring_backend(
     if (errors < 0) {
         errors = 0;
     }
+    tx_reason = _py_dict_cstr(tx_result, "sender_fallback_reason", "none");
+    tx_fallback_count = _py_dict_long(tx_result, "fallback_count", 0);
+    hp_effective = _py_dict_long(tx_result, "afpacket_hugepage_effective", 0);
+    hp_reason = _py_dict_cstr(tx_result, "afpacket_hugepage_reason", "none");
+    h->afpacket_hugepage_effective = (hp_effective > 0) ? 1 : 0;
+    (void)snprintf(
+        h->afpacket_hugepage_reason,
+        sizeof(h->afpacket_hugepage_reason),
+        "%s",
+        (hp_reason != NULL && hp_reason[0] != '\0') ? hp_reason : "none"
+    );
+    if (strcmp(h->afpacket_hugepage_mode, "required") == 0 && h->afpacket_hugepage_effective == 0) {
+        if (tx_reason == NULL || tx_reason[0] == '\0' || strcmp(tx_reason, "none") == 0) {
+            tx_reason = "afpacket_hugepage_required_not_met";
+            tx_fallback_count = 1;
+        }
+    }
+    if (tx_fallback_count < 0) {
+        tx_fallback_count = 0;
+    }
 
     out = _build_result(
         attempted,
@@ -604,8 +654,8 @@ static PyObject *_run_txring_backend(
 
     if (_merge_dict(out, tx_result) < 0 ||
         _set_str(out, "sender_path", "DP_TX_RING") < 0 ||
-        _set_str(out, "sender_fallback_reason", "none") < 0 ||
-        _set_long(out, "fallback_count", 0) < 0) {
+        _set_str(out, "sender_fallback_reason", tx_reason) < 0 ||
+        _set_long(out, "fallback_count", tx_fallback_count) < 0) {
         Py_DECREF(tx_result);
         Py_DECREF(out);
         return NULL;
@@ -1171,10 +1221,17 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
     h->xdp_initialized = 0;
     h->raw_sockfd = -1;
     h->allow_python_fallback = 0;
+    h->afpacket_hugepage_size_kb = 2048;
+    h->afpacket_ring_target_mb = 64;
+    h->afpacket_mlock_ring = 0;
+    h->afpacket_prefault_ring = 1;
+    h->afpacket_hugepage_effective = 0;
     h->auto_resolve_reason[0] = '\0';
+    (void)snprintf(h->afpacket_hugepage_reason, sizeof(h->afpacket_hugepage_reason), "%s", "none");
 
     _copy_lower(h->backend, sizeof(h->backend), "auto", "auto");
     _copy_lower(h->fallback_policy, sizeof(h->fallback_policy), "allow", "allow");
+    _copy_lower(h->afpacket_hugepage_mode, sizeof(h->afpacket_hugepage_mode), "off", "off");
     h->interface[0] = '\0';
 
     if (PyDict_Check(cfg)) {
@@ -1186,6 +1243,16 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
         h->xdp_enable = _dict_bool(cfg, "xdp_enable", 0);
         h->xdp_mode = (int)_dict_long(cfg, "xdp_mode", 0);
         h->allow_python_fallback = _dict_bool(cfg, "allow_python_fallback", 0);
+        _copy_lower(
+            h->afpacket_hugepage_mode,
+            sizeof(h->afpacket_hugepage_mode),
+            _dict_cstr(cfg, "afpacket_hugepage_mode", "off"),
+            "off"
+        );
+        h->afpacket_hugepage_size_kb = (int)_dict_long(cfg, "afpacket_hugepage_size_kb", 2048);
+        h->afpacket_ring_target_mb = (int)_dict_long(cfg, "afpacket_ring_target_mb", 64);
+        h->afpacket_mlock_ring = _dict_bool(cfg, "afpacket_mlock_ring", 0);
+        h->afpacket_prefault_ring = _dict_bool(cfg, "afpacket_prefault_ring", 1);
     }
 
     _copy_lower(h->backend, sizeof(h->backend), backend, "auto");
@@ -1197,6 +1264,17 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
     }
     if (strcmp(core_mode, "required") == 0) {
         h->allow_python_fallback = 0;
+    }
+    if (strcmp(h->afpacket_hugepage_mode, "off") != 0 &&
+        strcmp(h->afpacket_hugepage_mode, "auto") != 0 &&
+        strcmp(h->afpacket_hugepage_mode, "required") != 0) {
+        (void)snprintf(h->afpacket_hugepage_mode, sizeof(h->afpacket_hugepage_mode), "%s", "off");
+    }
+    if (h->afpacket_hugepage_size_kb <= 0) {
+        h->afpacket_hugepage_size_kb = 2048;
+    }
+    if (h->afpacket_ring_target_mb <= 0) {
+        h->afpacket_ring_target_mb = 64;
     }
     (void)snprintf(h->interface, sizeof(h->interface), "%s", iface != NULL ? iface : "");
     _resolve_auto_backend(h);
@@ -1292,7 +1370,14 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
     if (_set_long(out, "dp_queue_id", h->queue_id) < 0 ||
         _set_str(out, "dp_backend", backend) < 0 ||
         _set_long(out, "xdp_enabled", h->xdp_enable ? 1 : 0) < 0 ||
-        _set_str(out, "dp_interface", h->interface) < 0) {
+        _set_str(out, "dp_interface", h->interface) < 0 ||
+        _set_str(out, "afpacket_hugepage_mode", h->afpacket_hugepage_mode) < 0 ||
+        _set_long(out, "afpacket_hugepage_size_kb", h->afpacket_hugepage_size_kb) < 0 ||
+        _set_long(out, "afpacket_ring_target_mb", h->afpacket_ring_target_mb) < 0 ||
+        _set_long(out, "afpacket_mlock_ring", h->afpacket_mlock_ring) < 0 ||
+        _set_long(out, "afpacket_prefault_ring", h->afpacket_prefault_ring) < 0 ||
+        _set_long(out, "afpacket_hugepage_effective", h->afpacket_hugepage_effective) < 0 ||
+        _set_str(out, "afpacket_hugepage_reason", h->afpacket_hugepage_reason) < 0) {
         Py_DECREF(out);
         return NULL;
     }
@@ -1367,6 +1452,13 @@ static PyObject *dp_snapshot(PyObject *self, PyObject *args) {
         _set_str(out, "fallback_policy", h->fallback_policy) < 0 ||
         _set_str(out, "interface", h->interface) < 0 ||
         _set_long(out, "queue_id", h->queue_id) < 0 ||
+        _set_str(out, "afpacket_hugepage_mode", h->afpacket_hugepage_mode) < 0 ||
+        _set_long(out, "afpacket_hugepage_size_kb", h->afpacket_hugepage_size_kb) < 0 ||
+        _set_long(out, "afpacket_ring_target_mb", h->afpacket_ring_target_mb) < 0 ||
+        _set_long(out, "afpacket_mlock_ring", h->afpacket_mlock_ring) < 0 ||
+        _set_long(out, "afpacket_prefault_ring", h->afpacket_prefault_ring) < 0 ||
+        _set_long(out, "afpacket_hugepage_effective", h->afpacket_hugepage_effective) < 0 ||
+        _set_str(out, "afpacket_hugepage_reason", h->afpacket_hugepage_reason) < 0 ||
         _set_long(out, "xdp_enable", h->xdp_enable ? 1 : 0) < 0 ||
         _set_long(out, "xdp_initialized", h->xdp_initialized ? 1 : 0) < 0 ||
         _set_long(out, "closed", h->closed ? 1 : 0) < 0) {
