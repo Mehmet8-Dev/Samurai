@@ -109,6 +109,29 @@ def _normalize_dataplane_core_mode(value: str | None) -> str:
         return norm
     return "off"
 
+
+def _normalize_afpacket_hugepage_mode(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "on": "auto",
+        "enable": "auto",
+        "enabled": "auto",
+        "true": "auto",
+        "1": "auto",
+        "off": "off",
+        "disable": "off",
+        "disabled": "off",
+        "false": "off",
+        "0": "off",
+        "must": "required",
+        "strict": "required",
+        "hard": "required",
+    }
+    norm = aliases.get(raw, raw)
+    if norm in {"off", "auto", "required"}:
+        return norm
+    return "off"
+
 _SOAK_PROFILE_PRESETS = {
     "none": {
         "duration_s": 0,
@@ -327,6 +350,11 @@ def _report_inputs_from_args(args) -> dict:
         "sender_backend": str(getattr(args, "sender_backend", "auto")),
         "sender_fallback_policy": str(getattr(args, "sender_fallback_policy", "allow")),
         "dataplane_core_mode": str(getattr(args, "dataplane_core_mode", "off")),
+        "afpacket_hugepage_mode": str(getattr(args, "afpacket_hugepage_mode", "off")),
+        "afpacket_hugepage_size_kb": int(getattr(args, "afpacket_hugepage_size_kb", 2048) or 2048),
+        "afpacket_ring_target_mb": int(getattr(args, "afpacket_ring_target_mb", 64) or 64),
+        "afpacket_mlock_ring": bool(getattr(args, "afpacket_mlock_ring", False)),
+        "afpacket_prefault_ring": bool(getattr(args, "afpacket_prefault_ring", True)),
         "lab_profile": str(getattr(args, "lab_profile", "off")),
         "dp_queue_strategy": str(getattr(args, "dp_queue_strategy", "rr")),
         "dp_queues": int(getattr(args, "dp_queues", 1) or 1),
@@ -455,6 +483,10 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
     sender_backend = str(getattr(args, "sender_backend", "auto") or "auto").strip().lower()
     fallback_policy = str(getattr(args, "sender_fallback_policy", "allow") or "allow").strip().lower()
     dataplane_core_mode = _normalize_dataplane_core_mode(getattr(args, "dataplane_core_mode", "off"))
+    afpacket_hugepage_mode = _normalize_afpacket_hugepage_mode(
+        getattr(args, "afpacket_hugepage_mode", "off")
+    )
+    args.afpacket_hugepage_mode = afpacket_hugepage_mode
     xdp_enable = bool(getattr(args, "xdp_enable", False))
     xdp_interface = str(getattr(args, "xdp_interface", "") or "").strip()
     lab_profile = str(getattr(args, "lab_profile", "off") or "off").strip().lower()
@@ -469,6 +501,10 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: --xdp-queue-id >= 0 olmalıdır.")
     if int(getattr(args, "dp_queues", 1) or 0) <= 0:
         parser.error("Hata: --dp-queues >= 1 olmalıdır.")
+    if int(getattr(args, "afpacket_hugepage_size_kb", 2048) or 0) <= 0:
+        parser.error("Hata: --afpacket-hugepage-size-kb >= 1 olmalıdır.")
+    if int(getattr(args, "afpacket_ring_target_mb", 64) or 0) <= 0:
+        parser.error("Hata: --afpacket-ring-target-mb >= 1 olmalıdır.")
     if int(getattr(args, "http2_connections", 1) or 0) <= 0:
         parser.error("Hata: --http2-connections >= 1 olmalıdır.")
     if int(getattr(args, "http2_streams_per_conn", 100) or 0) <= 0:
@@ -505,6 +541,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: --sender-fallback-policy fail için --sender-backend auto kullanılamaz.")
     if dataplane_core_mode == "required" and fallback_policy != "fail":
         parser.error("Hata: --dataplane-core-mode required için --sender-fallback-policy fail zorunludur.")
+    if afpacket_hugepage_mode == "required" and sender_backend not in {"txring"}:
+        parser.error("Hata: --afpacket-hugepage-mode required yalnızca --sender-backend txring ile kullanılabilir.")
     if dp_queue_strategy == "map":
         if not dp_queue_map:
             parser.error("Hata: --dp-queue-strategy map için --dp-queue-map zorunludur.")
@@ -624,6 +662,16 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
         if quic_build_mode != "native_required":
             os.environ["SAMURAI_QUIC_BUILD_MODE"] = "native_required"
             utils.log_info("native QUIC zorunluluğu için SAMURAI_QUIC_BUILD_MODE=native_required ayarlandı.")
+
+    sender_backend = str(getattr(args, "sender_backend", "auto") or "auto").strip().lower()
+    afpacket_hugepage_mode = _normalize_afpacket_hugepage_mode(
+        getattr(args, "afpacket_hugepage_mode", "off")
+    )
+    if sender_backend == "txring" and afpacket_hugepage_mode != "required":
+        args.afpacket_hugepage_mode = "required"
+        utils.log_info(
+            "lab-profile=dedicated + txring için --afpacket-hugepage-mode otomatik required olarak ayarlandı."
+        )
 
     workers = int(getattr(args, "workers", multiprocessing.cpu_count()) or 0)
     dp_queues = int(getattr(args, "dp_queues", 1) or 1)
@@ -889,6 +937,57 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["off", "auto", "required"],
         default=_dp_mode_env_default,
         help="Dataplane core kullanım modu: off|auto|required (required=tek hot-path, legacy zincir kapalı).",
+    )
+    _afpacket_hp_env_default = _normalize_afpacket_hugepage_mode(
+        os.environ.get("SAMURAI_AF_PACKET_HUGEPAGE_MODE", "off")
+    )
+    parser.add_argument(
+        "--afpacket-hugepage-mode",
+        choices=["off", "auto", "required"],
+        default=_afpacket_hp_env_default,
+        help="AF_PACKET TX_RING hugepage politikası: off|auto|required.",
+    )
+    parser.add_argument(
+        "--afpacket-hugepage-size-kb",
+        type=int,
+        default=_env_int("SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB", 2048),
+        help="AF_PACKET hugepage hedef boyutu (kB), varsayılan: 2048.",
+    )
+    parser.add_argument(
+        "--afpacket-ring-target-mb",
+        type=int,
+        default=_env_int("SAMURAI_AF_PACKET_RING_TARGET_MB", 64),
+        help="AF_PACKET TX_RING hedef toplam boyutu (MB), varsayılan: 64.",
+    )
+    parser.add_argument(
+        "--afpacket-mlock-ring",
+        dest="afpacket_mlock_ring",
+        action="store_true",
+        help="AF_PACKET ring bellek sayfalarını mlock ile sabitlemeyi dene.",
+    )
+    parser.add_argument(
+        "--no-afpacket-mlock-ring",
+        dest="afpacket_mlock_ring",
+        action="store_false",
+        help="AF_PACKET ring mlock denemesini kapat.",
+    )
+    parser.set_defaults(
+        afpacket_mlock_ring=_env_flag("SAMURAI_AF_PACKET_MLOCK_RING", "0")
+    )
+    parser.add_argument(
+        "--afpacket-prefault-ring",
+        dest="afpacket_prefault_ring",
+        action="store_true",
+        help="AF_PACKET ring mmap sonrası sayfaları prefault et.",
+    )
+    parser.add_argument(
+        "--no-afpacket-prefault-ring",
+        dest="afpacket_prefault_ring",
+        action="store_false",
+        help="AF_PACKET ring prefault davranışını kapat.",
+    )
+    parser.set_defaults(
+        afpacket_prefault_ring=_env_flag("SAMURAI_AF_PACKET_PREFAULT_RING", "1")
     )
     parser.add_argument(
         "--lab-profile",
@@ -1518,6 +1617,20 @@ def main(argv=None):
     _dp_mode = _normalize_dataplane_core_mode(getattr(args, "dataplane_core_mode", "off"))
     os.environ["SAMURAI_DATAPLANE_CORE_MODE"] = _dp_mode
     os.environ["SAMURAI_DATAPLANE_CORE_ENABLE"] = "1" if _dp_mode in {"auto", "required"} else "0"
+    _afpacket_hp_mode = _normalize_afpacket_hugepage_mode(
+        getattr(args, "afpacket_hugepage_mode", "off")
+    )
+    os.environ["SAMURAI_AF_PACKET_HUGEPAGE_MODE"] = _afpacket_hp_mode
+    os.environ["SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB"] = str(
+        int(getattr(args, "afpacket_hugepage_size_kb", 2048) or 2048)
+    )
+    os.environ["SAMURAI_AF_PACKET_RING_TARGET_MB"] = str(
+        int(getattr(args, "afpacket_ring_target_mb", 64) or 64)
+    )
+    os.environ["SAMURAI_AF_PACKET_MLOCK_RING"] = "1" if bool(getattr(args, "afpacket_mlock_ring", False)) else "0"
+    os.environ["SAMURAI_AF_PACKET_PREFAULT_RING"] = "1" if bool(
+        getattr(args, "afpacket_prefault_ring", True)
+    ) else "0"
     os.environ["SAMURAI_LAB_PROFILE"] = str(getattr(args, "lab_profile", "off") or "off")
     os.environ["SAMURAI_DP_QUEUE_STRATEGY"] = str(getattr(args, "dp_queue_strategy", "rr") or "rr")
     os.environ["SAMURAI_DP_QUEUES"] = str(int(getattr(args, "dp_queues", 1) or 1))

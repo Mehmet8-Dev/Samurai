@@ -123,6 +123,18 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "txring_tp_freeze_q_cnt": 0,
         "txring_packet_version": 0,
         "txring_packet_version_name": "TPACKET_UNKNOWN",
+        "afpacket_hugepage_mode": "off",
+        "afpacket_hugepage_effective": 0,
+        "afpacket_hugepage_reason": "none",
+        "afpacket_hugepage_size_kb": 0,
+        "afpacket_madvise_hugepage_ok": 0,
+        "afpacket_mlock_ok": 0,
+        "afpacket_prefault_pages": 0,
+        "afpacket_smaps_kernel_page_kb": 0,
+        "afpacket_smaps_anon_hugepages_kb": 0,
+        "afpacket_ring_block_size": 0,
+        "afpacket_ring_block_nr": 0,
+        "afpacket_ring_size_bytes": 0,
         "txring_batch_target": 0,
         "txring_backoff_ns": 0,
         "host_tx_packets_delta": 0,
@@ -543,6 +555,26 @@ def _apply_pacing_stats(out: dict, stats: dict | None) -> dict:
     d["txring_packet_version_name"] = str(
         st.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
     )
+    d["afpacket_hugepage_mode"] = str(st.get("afpacket_hugepage_mode", "off") or "off")
+    d["afpacket_hugepage_effective"] = int(st.get("afpacket_hugepage_effective", 0) or 0)
+    d["afpacket_hugepage_reason"] = str(st.get("afpacket_hugepage_reason", "none") or "none")
+    d["afpacket_hugepage_size_kb"] = int(st.get("afpacket_hugepage_size_kb", 0) or 0)
+    d["afpacket_madvise_hugepage_ok"] = int(st.get("afpacket_madvise_hugepage_ok", 0) or 0)
+    d["afpacket_mlock_ok"] = int(st.get("afpacket_mlock_ok", 0) or 0)
+    d["afpacket_prefault_pages"] = int(st.get("afpacket_prefault_pages", 0) or 0)
+    d["afpacket_smaps_kernel_page_kb"] = int(st.get("afpacket_smaps_kernel_page_kb", 0) or 0)
+    d["afpacket_smaps_anon_hugepages_kb"] = int(st.get("afpacket_smaps_anon_hugepages_kb", 0) or 0)
+    d["afpacket_ring_block_size"] = int(st.get("afpacket_ring_block_size", 0) or 0)
+    d["afpacket_ring_block_nr"] = int(st.get("afpacket_ring_block_nr", 0) or 0)
+    d["afpacket_ring_size_bytes"] = int(st.get("afpacket_ring_size_bytes", 0) or 0)
+    if (
+        str(d.get("afpacket_hugepage_mode", "off") or "off").strip().lower() == "required"
+        and int(d.get("afpacket_hugepage_effective", 0) or 0) <= 0
+    ):
+        curr_reason = str(d.get("sender_fallback_reason", "none") or "none").strip().lower()
+        if curr_reason in {"", "none"}:
+            d["sender_fallback_reason"] = "afpacket_hugepage_required_not_met"
+        d["fallback_count"] = max(1, int(d.get("fallback_count", 0) or 0))
     return d
 
 
@@ -745,6 +777,65 @@ def _merge_stats(*items):
                 acc["txring_packet_version_name"] = "MIXED"
             elif not current_ver_name:
                 acc["txring_packet_version_name"] = item_txring_ver_name or "TPACKET_UNKNOWN"
+        item_hp_mode = str(it.get("afpacket_hugepage_mode", "") or "").strip().lower()
+        if item_hp_mode:
+            current_hp_mode = str(acc.get("afpacket_hugepage_mode", "") or "").strip().lower()
+            if not current_hp_mode or current_hp_mode in {"off", "none", "unknown"}:
+                acc["afpacket_hugepage_mode"] = item_hp_mode
+                acc["afpacket_hugepage_effective"] = int(it.get("afpacket_hugepage_effective", 0) or 0)
+                acc["afpacket_hugepage_reason"] = str(it.get("afpacket_hugepage_reason", "none") or "none")
+            elif current_hp_mode != item_hp_mode and current_hp_mode != "mixed":
+                acc["afpacket_hugepage_mode"] = "mixed"
+                acc["afpacket_hugepage_reason"] = "mixed"
+                acc["afpacket_hugepage_effective"] = min(
+                    int(acc.get("afpacket_hugepage_effective", 0) or 0),
+                    int(it.get("afpacket_hugepage_effective", 0) or 0),
+                )
+            else:
+                acc["afpacket_hugepage_effective"] = min(
+                    int(acc.get("afpacket_hugepage_effective", 0) or 0),
+                    int(it.get("afpacket_hugepage_effective", 0) or 0),
+                )
+                item_hp_reason = str(it.get("afpacket_hugepage_reason", "") or "").strip()
+                curr_hp_reason = str(acc.get("afpacket_hugepage_reason", "") or "").strip()
+                if item_hp_reason:
+                    if not curr_hp_reason or curr_hp_reason in {"none", "disabled"}:
+                        acc["afpacket_hugepage_reason"] = item_hp_reason
+                    elif curr_hp_reason != item_hp_reason and curr_hp_reason != "mixed":
+                        acc["afpacket_hugepage_reason"] = "mixed"
+        acc["afpacket_hugepage_size_kb"] = max(
+            int(acc.get("afpacket_hugepage_size_kb", 0) or 0),
+            int(it.get("afpacket_hugepage_size_kb", 0) or 0),
+        )
+        acc["afpacket_madvise_hugepage_ok"] = max(
+            int(acc.get("afpacket_madvise_hugepage_ok", 0) or 0),
+            int(it.get("afpacket_madvise_hugepage_ok", 0) or 0),
+        )
+        acc["afpacket_mlock_ok"] = max(
+            int(acc.get("afpacket_mlock_ok", 0) or 0),
+            int(it.get("afpacket_mlock_ok", 0) or 0),
+        )
+        acc["afpacket_prefault_pages"] += int(it.get("afpacket_prefault_pages", 0) or 0)
+        acc["afpacket_smaps_kernel_page_kb"] = max(
+            int(acc.get("afpacket_smaps_kernel_page_kb", 0) or 0),
+            int(it.get("afpacket_smaps_kernel_page_kb", 0) or 0),
+        )
+        acc["afpacket_smaps_anon_hugepages_kb"] = max(
+            int(acc.get("afpacket_smaps_anon_hugepages_kb", 0) or 0),
+            int(it.get("afpacket_smaps_anon_hugepages_kb", 0) or 0),
+        )
+        acc["afpacket_ring_block_size"] = max(
+            int(acc.get("afpacket_ring_block_size", 0) or 0),
+            int(it.get("afpacket_ring_block_size", 0) or 0),
+        )
+        acc["afpacket_ring_block_nr"] = max(
+            int(acc.get("afpacket_ring_block_nr", 0) or 0),
+            int(it.get("afpacket_ring_block_nr", 0) or 0),
+        )
+        acc["afpacket_ring_size_bytes"] = max(
+            int(acc.get("afpacket_ring_size_bytes", 0) or 0),
+            int(it.get("afpacket_ring_size_bytes", 0) or 0),
+        )
         acc["host_tx_packets_delta"] += int(it.get("host_tx_packets_delta", 0) or 0)
         acc["host_tx_dropped_delta"] += int(it.get("host_tx_dropped_delta", 0) or 0)
         acc["host_tx_errors_delta"] += int(it.get("host_tx_errors_delta", 0) or 0)
@@ -1551,6 +1642,18 @@ async def raw_socket_sender(
     txring_tp_freeze_q_cnt = 0
     txring_packet_version = 0
     txring_packet_version_name = "TPACKET_UNKNOWN"
+    afpacket_hugepage_mode = "off"
+    afpacket_hugepage_effective = 0
+    afpacket_hugepage_reason = "none"
+    afpacket_hugepage_size_kb = 0
+    afpacket_madvise_hugepage_ok = 0
+    afpacket_mlock_ok = 0
+    afpacket_prefault_pages = 0
+    afpacket_smaps_kernel_page_kb = 0
+    afpacket_smaps_anon_hugepages_kb = 0
+    afpacket_ring_block_size = 0
+    afpacket_ring_block_nr = 0
+    afpacket_ring_size_bytes = 0
     txring_batch_target = 0
     txring_backoff_ns = 0
     buffer_reuse_hits = 0
@@ -1647,9 +1750,13 @@ async def raw_socket_sender(
                 eagain_retry_count=0,
                 partial_send_retry_count=0,
             )
-            for k in ("dp_queue_id", "dp_queue_strategy", "dp_affinity_cpu", "session_success_rate", "retry_success_rate"):
-                if k in dp_stats:
-                    out[k] = dp_stats[k]
+            for k, v in dp_stats.items():
+                if k in {"attempted", "sent", "errors", "bytes_sent_est"}:
+                    continue
+                if isinstance(v, bool):
+                    out[k] = int(v)
+                elif isinstance(v, (int, float, str)):
+                    out[k] = v
             return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
     elif dp_hot_path_only:
         if owns_socket and s is not None:
@@ -1725,6 +1832,13 @@ async def raw_socket_sender(
                         )
                         if isinstance(tx_result, dict):
                             sent = int(tx_result.get("sent", 0) or 0)
+                            _tx_reason = str(tx_result.get("sender_fallback_reason", "none") or "none").strip()
+                            if _tx_reason and _tx_reason.lower() != "none":
+                                _register_fallback(_tx_reason)
+                            fallback_count = max(
+                                int(fallback_count or 0),
+                                int(tx_result.get("fallback_count", 0) or 0),
+                            )
                             txring_flush_call_count += int(tx_result.get("txring_flush_call_count", 0) or 0)
                             txring_flush_error_count += int(tx_result.get("txring_flush_error_count", 0) or 0)
                             txring_flush_eagain_count += int(tx_result.get("txring_flush_eagain_count", 0) or 0)
@@ -1751,6 +1865,50 @@ async def raw_socket_sender(
                             txring_packet_version = int(tx_result.get("txring_packet_version", 0) or 0)
                             txring_packet_version_name = str(
                                 tx_result.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
+                            )
+                            afpacket_hugepage_mode = str(
+                                tx_result.get("afpacket_hugepage_mode", afpacket_hugepage_mode) or afpacket_hugepage_mode
+                            )
+                            afpacket_hugepage_effective = int(
+                                tx_result.get("afpacket_hugepage_effective", afpacket_hugepage_effective)
+                                or afpacket_hugepage_effective
+                            )
+                            afpacket_hugepage_reason = str(
+                                tx_result.get("afpacket_hugepage_reason", afpacket_hugepage_reason) or afpacket_hugepage_reason
+                            )
+                            afpacket_hugepage_size_kb = int(
+                                tx_result.get("afpacket_hugepage_size_kb", afpacket_hugepage_size_kb)
+                                or afpacket_hugepage_size_kb
+                            )
+                            afpacket_madvise_hugepage_ok = int(
+                                tx_result.get("afpacket_madvise_hugepage_ok", afpacket_madvise_hugepage_ok)
+                                or afpacket_madvise_hugepage_ok
+                            )
+                            afpacket_mlock_ok = int(
+                                tx_result.get("afpacket_mlock_ok", afpacket_mlock_ok) or afpacket_mlock_ok
+                            )
+                            afpacket_prefault_pages += int(
+                                tx_result.get("afpacket_prefault_pages", 0) or 0
+                            )
+                            afpacket_smaps_kernel_page_kb = max(
+                                int(afpacket_smaps_kernel_page_kb or 0),
+                                int(tx_result.get("afpacket_smaps_kernel_page_kb", 0) or 0),
+                            )
+                            afpacket_smaps_anon_hugepages_kb = max(
+                                int(afpacket_smaps_anon_hugepages_kb or 0),
+                                int(tx_result.get("afpacket_smaps_anon_hugepages_kb", 0) or 0),
+                            )
+                            afpacket_ring_block_size = max(
+                                int(afpacket_ring_block_size or 0),
+                                int(tx_result.get("afpacket_ring_block_size", 0) or 0),
+                            )
+                            afpacket_ring_block_nr = max(
+                                int(afpacket_ring_block_nr or 0),
+                                int(tx_result.get("afpacket_ring_block_nr", 0) or 0),
+                            )
+                            afpacket_ring_size_bytes = max(
+                                int(afpacket_ring_size_bytes or 0),
+                                int(tx_result.get("afpacket_ring_size_bytes", 0) or 0),
                             )
                             txring_batch_target = int(tx_result.get("txring_batch_target", 0) or 0)
                             txring_backoff_ns += int(tx_result.get("txring_backoff_ns", 0) or 0)
@@ -1802,6 +1960,18 @@ async def raw_socket_sender(
                         txring_tp_freeze_q_cnt=txring_tp_freeze_q_cnt,
                         txring_packet_version=txring_packet_version,
                         txring_packet_version_name=txring_packet_version_name,
+                        afpacket_hugepage_mode=afpacket_hugepage_mode,
+                        afpacket_hugepage_effective=afpacket_hugepage_effective,
+                        afpacket_hugepage_reason=afpacket_hugepage_reason,
+                        afpacket_hugepage_size_kb=afpacket_hugepage_size_kb,
+                        afpacket_madvise_hugepage_ok=afpacket_madvise_hugepage_ok,
+                        afpacket_mlock_ok=afpacket_mlock_ok,
+                        afpacket_prefault_pages=afpacket_prefault_pages,
+                        afpacket_smaps_kernel_page_kb=afpacket_smaps_kernel_page_kb,
+                        afpacket_smaps_anon_hugepages_kb=afpacket_smaps_anon_hugepages_kb,
+                        afpacket_ring_block_size=afpacket_ring_block_size,
+                        afpacket_ring_block_nr=afpacket_ring_block_nr,
+                        afpacket_ring_size_bytes=afpacket_ring_size_bytes,
                         txring_batch_target=txring_batch_target,
                         txring_backoff_ns=txring_backoff_ns,
                     )

@@ -79,6 +79,18 @@ def _empty_stats() -> dict:
         "txring_tp_freeze_q_cnt": 0,
         "txring_packet_version": 0,
         "txring_packet_version_name": "TPACKET_UNKNOWN",
+        "afpacket_hugepage_mode": "off",
+        "afpacket_hugepage_effective": 0,
+        "afpacket_hugepage_reason": "none",
+        "afpacket_hugepage_size_kb": 0,
+        "afpacket_madvise_hugepage_ok": 0,
+        "afpacket_mlock_ok": 0,
+        "afpacket_prefault_pages": 0,
+        "afpacket_smaps_kernel_page_kb": 0,
+        "afpacket_smaps_anon_hugepages_kb": 0,
+        "afpacket_ring_block_size": 0,
+        "afpacket_ring_block_nr": 0,
+        "afpacket_ring_size_bytes": 0,
         "txring_batch_target": 0,
         "txring_backoff_ns": 0,
         "host_tx_packets_delta": 0,
@@ -394,6 +406,67 @@ def _add_stats(acc: dict, item: dict) -> dict:
             acc["txring_packet_version_name"] = "MIXED"
         elif not current_ver_name:
             acc["txring_packet_version_name"] = item_txring_ver_name or "TPACKET_UNKNOWN"
+    item_hp_mode = str(item.get("afpacket_hugepage_mode", "") or "").strip().lower()
+    if item_hp_mode:
+        current_hp_mode = str(acc.get("afpacket_hugepage_mode", "") or "").strip().lower()
+        if not current_hp_mode or current_hp_mode in {"off", "none", "unknown"}:
+            acc["afpacket_hugepage_mode"] = item_hp_mode
+            acc["afpacket_hugepage_effective"] = int(item.get("afpacket_hugepage_effective", 0) or 0)
+            acc["afpacket_hugepage_reason"] = str(item.get("afpacket_hugepage_reason", "none") or "none")
+        elif current_hp_mode != item_hp_mode and current_hp_mode != "mixed":
+            acc["afpacket_hugepage_mode"] = "mixed"
+            acc["afpacket_hugepage_reason"] = "mixed"
+            acc["afpacket_hugepage_effective"] = min(
+                int(acc.get("afpacket_hugepage_effective", 0) or 0),
+                int(item.get("afpacket_hugepage_effective", 0) or 0),
+            )
+        else:
+            acc["afpacket_hugepage_effective"] = min(
+                int(acc.get("afpacket_hugepage_effective", 0) or 0),
+                int(item.get("afpacket_hugepage_effective", 0) or 0),
+            )
+            item_hp_reason = str(item.get("afpacket_hugepage_reason", "") or "").strip()
+            curr_hp_reason = str(acc.get("afpacket_hugepage_reason", "") or "").strip()
+            if item_hp_reason:
+                if not curr_hp_reason or curr_hp_reason in {"none", "disabled"}:
+                    acc["afpacket_hugepage_reason"] = item_hp_reason
+                elif curr_hp_reason != item_hp_reason and curr_hp_reason != "mixed":
+                    acc["afpacket_hugepage_reason"] = "mixed"
+    acc["afpacket_hugepage_size_kb"] = max(
+        int(acc.get("afpacket_hugepage_size_kb", 0) or 0),
+        int(item.get("afpacket_hugepage_size_kb", 0) or 0),
+    )
+    acc["afpacket_madvise_hugepage_ok"] = max(
+        int(acc.get("afpacket_madvise_hugepage_ok", 0) or 0),
+        int(item.get("afpacket_madvise_hugepage_ok", 0) or 0),
+    )
+    acc["afpacket_mlock_ok"] = max(
+        int(acc.get("afpacket_mlock_ok", 0) or 0),
+        int(item.get("afpacket_mlock_ok", 0) or 0),
+    )
+    acc["afpacket_prefault_pages"] = int(acc.get("afpacket_prefault_pages", 0)) + int(
+        item.get("afpacket_prefault_pages", 0) or 0
+    )
+    acc["afpacket_smaps_kernel_page_kb"] = max(
+        int(acc.get("afpacket_smaps_kernel_page_kb", 0) or 0),
+        int(item.get("afpacket_smaps_kernel_page_kb", 0) or 0),
+    )
+    acc["afpacket_smaps_anon_hugepages_kb"] = max(
+        int(acc.get("afpacket_smaps_anon_hugepages_kb", 0) or 0),
+        int(item.get("afpacket_smaps_anon_hugepages_kb", 0) or 0),
+    )
+    acc["afpacket_ring_block_size"] = max(
+        int(acc.get("afpacket_ring_block_size", 0) or 0),
+        int(item.get("afpacket_ring_block_size", 0) or 0),
+    )
+    acc["afpacket_ring_block_nr"] = max(
+        int(acc.get("afpacket_ring_block_nr", 0) or 0),
+        int(item.get("afpacket_ring_block_nr", 0) or 0),
+    )
+    acc["afpacket_ring_size_bytes"] = max(
+        int(acc.get("afpacket_ring_size_bytes", 0) or 0),
+        int(item.get("afpacket_ring_size_bytes", 0) or 0),
+    )
     acc["host_tx_packets_delta"] = int(acc.get("host_tx_packets_delta", 0)) + int(item.get("host_tx_packets_delta", 0) or 0)
     acc["host_tx_dropped_delta"] = int(acc.get("host_tx_dropped_delta", 0)) + int(item.get("host_tx_dropped_delta", 0) or 0)
     acc["host_tx_errors_delta"] = int(acc.get("host_tx_errors_delta", 0)) + int(item.get("host_tx_errors_delta", 0) or 0)

@@ -565,6 +565,19 @@ def build_live_attack_report(
     txring_tp_freeze_q_cnt_total = 0
     txring_packet_version = 0
     txring_packet_version_name = "TPACKET_UNKNOWN"
+    afpacket_hugepage_mode = "off"
+    afpacket_hugepage_effective = 0
+    afpacket_hugepage_reason = "none"
+    afpacket_hugepage_size_kb = 0
+    afpacket_madvise_hugepage_ok = 0
+    afpacket_mlock_ok = 0
+    afpacket_prefault_pages_total = 0
+    afpacket_smaps_kernel_page_kb = 0
+    afpacket_smaps_anon_hugepages_kb = 0
+    afpacket_ring_block_size = 0
+    afpacket_ring_block_nr = 0
+    afpacket_ring_size_bytes = 0
+    afpacket_hugepage_samples = 0
     txring_batch_target_max = 0
     txring_backoff_ns_total = 0
     host_tx_packets_delta_total = 0
@@ -805,6 +818,66 @@ def build_live_attack_report(
                 txring_packet_version_name = "MIXED"
             elif txring_packet_version_name in ("", "TPACKET_UNKNOWN"):
                 txring_packet_version_name = _tp_ver_name or "TPACKET_UNKNOWN"
+        _hp_mode_item = str(
+            ev.get("afpacket_hugepage_mode", st.get("afpacket_hugepage_mode", "")) or ""
+        ).strip().lower()
+        if _hp_mode_item:
+            if afpacket_hugepage_mode in ("", "off", "none", "unknown"):
+                afpacket_hugepage_mode = _hp_mode_item
+            elif afpacket_hugepage_mode != _hp_mode_item and afpacket_hugepage_mode != "mixed":
+                afpacket_hugepage_mode = "mixed"
+        _hp_effective_item = int(
+            ev.get("afpacket_hugepage_effective", st.get("afpacket_hugepage_effective", 0)) or 0
+        )
+        if _hp_mode_item and _hp_mode_item != "off":
+            if afpacket_hugepage_samples <= 0:
+                afpacket_hugepage_effective = int(_hp_effective_item)
+            else:
+                afpacket_hugepage_effective = min(int(afpacket_hugepage_effective), int(_hp_effective_item))
+            afpacket_hugepage_samples += 1
+            _hp_reason_item = str(
+                ev.get("afpacket_hugepage_reason", st.get("afpacket_hugepage_reason", "")) or ""
+            ).strip()
+            if _hp_reason_item:
+                if afpacket_hugepage_reason in ("", "none", "disabled"):
+                    afpacket_hugepage_reason = _hp_reason_item
+                elif afpacket_hugepage_reason != _hp_reason_item and afpacket_hugepage_reason != "mixed":
+                    afpacket_hugepage_reason = "mixed"
+        afpacket_hugepage_size_kb = max(
+            int(afpacket_hugepage_size_kb),
+            int(ev.get("afpacket_hugepage_size_kb", st.get("afpacket_hugepage_size_kb", 0)) or 0),
+        )
+        afpacket_madvise_hugepage_ok = max(
+            int(afpacket_madvise_hugepage_ok),
+            int(ev.get("afpacket_madvise_hugepage_ok", st.get("afpacket_madvise_hugepage_ok", 0)) or 0),
+        )
+        afpacket_mlock_ok = max(
+            int(afpacket_mlock_ok),
+            int(ev.get("afpacket_mlock_ok", st.get("afpacket_mlock_ok", 0)) or 0),
+        )
+        afpacket_prefault_pages_total += int(
+            ev.get("afpacket_prefault_pages", st.get("afpacket_prefault_pages", 0)) or 0
+        )
+        afpacket_smaps_kernel_page_kb = max(
+            int(afpacket_smaps_kernel_page_kb),
+            int(ev.get("afpacket_smaps_kernel_page_kb", st.get("afpacket_smaps_kernel_page_kb", 0)) or 0),
+        )
+        afpacket_smaps_anon_hugepages_kb = max(
+            int(afpacket_smaps_anon_hugepages_kb),
+            int(ev.get("afpacket_smaps_anon_hugepages_kb", st.get("afpacket_smaps_anon_hugepages_kb", 0)) or 0),
+        )
+        afpacket_ring_block_size = max(
+            int(afpacket_ring_block_size),
+            int(ev.get("afpacket_ring_block_size", st.get("afpacket_ring_block_size", 0)) or 0),
+        )
+        afpacket_ring_block_nr = max(
+            int(afpacket_ring_block_nr),
+            int(ev.get("afpacket_ring_block_nr", st.get("afpacket_ring_block_nr", 0)) or 0),
+        )
+        afpacket_ring_size_bytes = max(
+            int(afpacket_ring_size_bytes),
+            int(ev.get("afpacket_ring_size_bytes", st.get("afpacket_ring_size_bytes", 0)) or 0),
+        )
         host_tx_packets_delta_total += int(
             ev.get("host_tx_packets_delta", st.get("host_tx_packets_delta", 0)) or 0
         )
@@ -1393,6 +1466,18 @@ def build_live_attack_report(
             "txring_hold_block_freeze_ratio_pct": round(float(freeze_ratio_pct), 4),
             "txring_packet_version": int(txring_packet_version),
             "txring_packet_version_name": str(txring_packet_version_name),
+            "afpacket_hugepage_mode": str(afpacket_hugepage_mode),
+            "afpacket_hugepage_effective": int(afpacket_hugepage_effective),
+            "afpacket_hugepage_reason": str(afpacket_hugepage_reason),
+            "afpacket_hugepage_size_kb": int(afpacket_hugepage_size_kb),
+            "afpacket_madvise_hugepage_ok": int(afpacket_madvise_hugepage_ok),
+            "afpacket_mlock_ok": int(afpacket_mlock_ok),
+            "afpacket_prefault_pages": int(afpacket_prefault_pages_total),
+            "afpacket_smaps_kernel_page_kb": int(afpacket_smaps_kernel_page_kb),
+            "afpacket_smaps_anon_hugepages_kb": int(afpacket_smaps_anon_hugepages_kb),
+            "afpacket_ring_block_size": int(afpacket_ring_block_size),
+            "afpacket_ring_block_nr": int(afpacket_ring_block_nr),
+            "afpacket_ring_size_bytes": int(afpacket_ring_size_bytes),
             "host_tx_packets_delta": int(host_tx_packets_delta_total),
             "host_tx_dropped_delta": int(host_tx_dropped_delta_total),
             "host_tx_errors_delta": int(host_tx_errors_delta_total),
