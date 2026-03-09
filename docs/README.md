@@ -34,3 +34,4 @@ Onemli not:
 18. `docs/17-gpu-ai-dataplane-research-validation-roadmap.md`: GPU+AI dataplane icin research roadmap, maturity matrisi ve sistematik validation checklist'i
 19. `docs/18-afpacket-hugepage-policy.md`: AF_PACKET/TX_RING HugePage policy, dedicated strict davranis, telemetry ve KPI gate baglantisi
 20. `docs/19-benchmark-profiles.md`: Urunlestirilmis benchmark profilleri (`dev`, `ci_safe`, `dedicated_lab`), tek komut ve artifact standardi
+21. `docs/20-env-cli-reference.md`: CLI argumanlari + `SAMURAI_*` environment degiskenleri icin detayli teknik referans
