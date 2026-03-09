@@ -62,6 +62,10 @@ jobs:
           mkdir -p artifacts
           pytest tests -q -rs
 
+      - name: RFC Gate
+        run: |
+          python tests/test_rfc_gate_ci.py --report artifacts/rfc_negative_report.json --min-score 100
+
       - name: Upload backend reports
         if: always()
         uses: actions/upload-artifact@v4

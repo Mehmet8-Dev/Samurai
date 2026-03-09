@@ -69,6 +69,28 @@ Rapor cikti dizini/dosyasi:
 
 - `SAMURAI_RFC_REPORT_OUT`
 
+## RFC Gate (CI Fail Kapisi)
+
+RFC negatif raporu artik pipeline'da gate edilir:
+
+```bash
+python tests/test_rfc_gate_ci.py --report artifacts/rfc_negative_report.json --min-score 100
+```
+
+Gate kurallari:
+
+- Rapor dosyasi bulunmali ve JSON parse edilebilmeli.
+- `score >= min-score` (varsayilan: `100`).
+- `passed == total` (default strict).
+- Kritik check isimleri `passed=true` olmali:
+  - `checksum_invalid_detected`
+  - `tcp_data_offset_invalid_detected`
+  - `total_length_mismatch_detected`
+  - `ttl_zero_detected`
+  - `udp_length_mismatch_detected`
+
+Bu kosullardan biri saglanmazsa script non-zero exit dondurur ve CI fail olur.
+
 Uretilen dosyalar:
 
 - `rfc_positive_report.json`
