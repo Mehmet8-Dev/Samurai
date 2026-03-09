@@ -1010,6 +1010,8 @@ static PyObject* py_xdp_send_udp(PyObject* self, PyObject* args)
     
     // Build and send packets
     int total_sent = 0;
+    const size_t udp_payload_cap =
+        (size_t)MAX_PACKET_SIZE - sizeof(struct iphdr) - sizeof(struct udphdr);
     
     for (Py_ssize_t i = 0; i < count; i++) {
         PyObject *payload_obj = PyList_GetItem(payloads_list, i);
@@ -1017,6 +1019,17 @@ static PyObject* py_xdp_send_udp(PyObject* self, PyObject* args)
         
         const uint8_t *payload = (const uint8_t*)PyBytes_AS_STRING(payload_obj);
         Py_ssize_t payload_len = PyBytes_GET_SIZE(payload_obj);
+        if (payload_len < 0 || (size_t)payload_len > udp_payload_cap) {
+            pthread_mutex_unlock(&xdp_ctx.lock);
+            PyErr_Format(
+                PyExc_ValueError,
+                "payload[%zd] too large for XDP UDP frame: %zd > %zu",
+                i,
+                payload_len,
+                udp_payload_cap
+            );
+            return NULL;
+        }
         
         // Get source port
         uint16_t src_port = 10000 + (rand() % 55000);
@@ -1037,7 +1050,7 @@ static PyObject* py_xdp_send_udp(PyObject* self, PyObject* args)
         iph->version = 4;
         iph->ihl = 5;
         iph->tos = 0;
-        iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct udphdr) + payload_len);
+        iph->tot_len = htons((uint16_t)(sizeof(struct iphdr) + sizeof(struct udphdr) + (size_t)payload_len));
         iph->id = htons(rand() & 0xFFFF);
         iph->frag_off = 0;
         iph->ttl = 64;
@@ -1052,16 +1065,16 @@ static PyObject* py_xdp_send_udp(PyObject* self, PyObject* args)
         struct udphdr *udph = (struct udphdr*)(pkt_buffer + pkt_offset);
         udph->source = htons(src_port);
         udph->dest = htons(target_port);
-        udph->len = htons(sizeof(struct udphdr) + payload_len);
+        udph->len = htons((uint16_t)(sizeof(struct udphdr) + (size_t)payload_len));
         udph->check = 0;
         pkt_offset += sizeof(struct udphdr);
         
         // Payload
-        memcpy(pkt_buffer + pkt_offset, payload, payload_len);
-        pkt_offset += payload_len;
+        memcpy(pkt_buffer + pkt_offset, payload, (size_t)payload_len);
+        pkt_offset += (size_t)payload_len;
         
         // Calculate UDP checksum
-        udph->check = udp_checksum(iph, udph, payload, payload_len);
+        udph->check = udp_checksum(iph, udph, payload, (size_t)payload_len);
         
         // Send single packet
         const uint8_t *pkt_ptr = pkt_buffer;

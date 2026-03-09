@@ -7,6 +7,15 @@ from typing import Any, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
+_H2_FORBIDDEN_HEADERS = {
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+}
+
 try:
     from h2.config import H2Configuration
     from h2.connection import H2Connection
@@ -25,6 +34,27 @@ def _make_ssl_context(verify: bool, ssl_context: Optional[ssl.SSLContext]) -> ss
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def _sanitize_h2_headers(headers_in: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return RFC-compliant extension headers for an H2 request."""
+    out: list[tuple[str, str]] = []
+    for hk, hv in dict(headers_in or {}).items():
+        if hk is None or hv is None:
+            continue
+        raw_name = str(hk).strip()
+        if not raw_name or raw_name.startswith(":"):
+            continue
+        name = raw_name.lower()
+        if name in _H2_FORBIDDEN_HEADERS:
+            continue
+        value = str(hv)
+        if ("\r" in value) or ("\n" in value):
+            continue
+        if name == "te" and value.strip().lower() != "trailers":
+            continue
+        out.append((name, value))
+    return out
 
 
 async def send_h2_requests(
@@ -103,16 +133,22 @@ async def send_h2_requests(
                     body_bytes = body_obj
                 else:
                     body_bytes = str(body_obj).encode("utf-8")
+                user_agent = "DDoSamurai-H2/3.0"
+                ua_seen = False
+                for hk in list(headers_in.keys()):
+                    if str(hk).strip().lower() == "user-agent":
+                        if not ua_seen:
+                            user_agent = str(headers_in[hk])
+                            ua_seen = True
+                        headers_in.pop(hk, None)
                 headers = [
                     (":method", method),
                     (":path", path),
                     (":scheme", "https"),
                     (":authority", str(host)),
-                    ("user-agent", str(headers_in.pop("user-agent", headers_in.pop("User-Agent", "DDoSamurai-H2/3.0")))),
+                    ("user-agent", user_agent),
                 ]
-                for hk, hv in headers_in.items():
-                    if hk and hv is not None:
-                        headers.append((str(hk), str(hv)))
+                headers.extend(_sanitize_h2_headers(headers_in))
 
                 stream_id = conn.get_next_available_stream_id()
                 stream_status[stream_id] = 0

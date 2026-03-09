@@ -91,6 +91,7 @@ typedef struct {
     unsigned char ws_frame[512];
     size_t ws_recv_len;
     unsigned char ws_recv[1024];
+    char ws_expected_accept[64];
 #ifdef SAMURAI_WITH_OPENSSL
     SSL *ssl;
     size_t tls_pending_len;
@@ -2239,6 +2240,420 @@ static int _http_headers_complete(const char *buf, size_t len, size_t *header_en
     return 0;
 }
 
+static int _base64_encode(const unsigned char *src, size_t src_len, char *dst, size_t dst_cap) {
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0;
+    size_t out_len;
+    size_t out_idx = 0;
+
+    if (src == NULL || dst == NULL || dst_cap == 0) {
+        return -1;
+    }
+    out_len = ((src_len + 2) / 3) * 4;
+    if (out_len + 1 > dst_cap) {
+        return -1;
+    }
+
+    while (i + 3 <= src_len) {
+        unsigned int v = ((unsigned int)src[i] << 16) |
+                         ((unsigned int)src[i + 1] << 8) |
+                         (unsigned int)src[i + 2];
+        dst[out_idx++] = table[(v >> 18) & 0x3F];
+        dst[out_idx++] = table[(v >> 12) & 0x3F];
+        dst[out_idx++] = table[(v >> 6) & 0x3F];
+        dst[out_idx++] = table[v & 0x3F];
+        i += 3;
+    }
+
+    if (i < src_len) {
+        unsigned int v = (unsigned int)src[i] << 16;
+        dst[out_idx++] = table[(v >> 18) & 0x3F];
+        if (i + 1 < src_len) {
+            v |= (unsigned int)src[i + 1] << 8;
+            dst[out_idx++] = table[(v >> 12) & 0x3F];
+            dst[out_idx++] = table[(v >> 6) & 0x3F];
+            dst[out_idx++] = '=';
+        } else {
+            dst[out_idx++] = table[(v >> 12) & 0x3F];
+            dst[out_idx++] = '=';
+            dst[out_idx++] = '=';
+        }
+    }
+
+    dst[out_idx] = '\0';
+    return (int)out_idx;
+}
+
+typedef struct {
+    uint32_t h[5];
+    uint64_t bit_count;
+    unsigned char block[64];
+    size_t block_len;
+} WsSha1Ctx;
+
+static uint32_t _rol32(uint32_t v, unsigned int n) {
+    return (v << n) | (v >> (32U - n));
+}
+
+static void _ws_sha1_transform(WsSha1Ctx *ctx, const unsigned char block[64]) {
+    uint32_t w[80];
+    uint32_t a;
+    uint32_t b;
+    uint32_t c;
+    uint32_t d;
+    uint32_t e;
+    size_t i;
+
+    for (i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)block[i * 4] << 24) |
+               ((uint32_t)block[i * 4 + 1] << 16) |
+               ((uint32_t)block[i * 4 + 2] << 8) |
+               (uint32_t)block[i * 4 + 3];
+    }
+    for (i = 16; i < 80; i++) {
+        w[i] = _rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+
+    a = ctx->h[0];
+    b = ctx->h[1];
+    c = ctx->h[2];
+    d = ctx->h[3];
+    e = ctx->h[4];
+
+    for (i = 0; i < 80; i++) {
+        uint32_t f;
+        uint32_t k;
+        uint32_t temp;
+        if (i < 20) {
+            f = (b & c) | ((~b) & d);
+            k = 0x5A827999u;
+        } else if (i < 40) {
+            f = b ^ c ^ d;
+            k = 0x6ED9EBA1u;
+        } else if (i < 60) {
+            f = (b & c) | (b & d) | (c & d);
+            k = 0x8F1BBCDCu;
+        } else {
+            f = b ^ c ^ d;
+            k = 0xCA62C1D6u;
+        }
+        temp = _rol32(a, 5) + f + e + k + w[i];
+        e = d;
+        d = c;
+        c = _rol32(b, 30);
+        b = a;
+        a = temp;
+    }
+
+    ctx->h[0] += a;
+    ctx->h[1] += b;
+    ctx->h[2] += c;
+    ctx->h[3] += d;
+    ctx->h[4] += e;
+}
+
+static void _ws_sha1_init(WsSha1Ctx *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->h[0] = 0x67452301u;
+    ctx->h[1] = 0xEFCDAB89u;
+    ctx->h[2] = 0x98BADCFEu;
+    ctx->h[3] = 0x10325476u;
+    ctx->h[4] = 0xC3D2E1F0u;
+    ctx->bit_count = 0;
+    ctx->block_len = 0;
+}
+
+static void _ws_sha1_update(WsSha1Ctx *ctx, const unsigned char *data, size_t len) {
+    size_t i = 0;
+    if (ctx == NULL || data == NULL || len == 0) {
+        return;
+    }
+    while (i < len) {
+        size_t copy = 64 - ctx->block_len;
+        if (copy > (len - i)) {
+            copy = len - i;
+        }
+        memcpy(ctx->block + ctx->block_len, data + i, copy);
+        ctx->block_len += copy;
+        i += copy;
+        if (ctx->block_len == 64) {
+            _ws_sha1_transform(ctx, ctx->block);
+            ctx->bit_count += 512;
+            ctx->block_len = 0;
+        }
+    }
+}
+
+static void _ws_sha1_final(WsSha1Ctx *ctx, unsigned char out[20]) {
+    uint64_t total_bits;
+    size_t i;
+    if (ctx == NULL || out == NULL) {
+        return;
+    }
+    total_bits = ctx->bit_count + (uint64_t)ctx->block_len * 8u;
+    ctx->block[ctx->block_len++] = 0x80;
+    if (ctx->block_len > 56) {
+        while (ctx->block_len < 64) {
+            ctx->block[ctx->block_len++] = 0;
+        }
+        _ws_sha1_transform(ctx, ctx->block);
+        ctx->block_len = 0;
+    }
+    while (ctx->block_len < 56) {
+        ctx->block[ctx->block_len++] = 0;
+    }
+    for (i = 0; i < 8; i++) {
+        ctx->block[56 + i] = (unsigned char)((total_bits >> (56 - (i * 8))) & 0xFFu);
+    }
+    _ws_sha1_transform(ctx, ctx->block);
+
+    for (i = 0; i < 5; i++) {
+        out[i * 4] = (unsigned char)((ctx->h[i] >> 24) & 0xFFu);
+        out[i * 4 + 1] = (unsigned char)((ctx->h[i] >> 16) & 0xFFu);
+        out[i * 4 + 2] = (unsigned char)((ctx->h[i] >> 8) & 0xFFu);
+        out[i * 4 + 3] = (unsigned char)(ctx->h[i] & 0xFFu);
+    }
+}
+
+static void _ws_fill_random(unsigned char *dst, size_t len) {
+    size_t off = 0;
+    int fd = -1;
+    static int seeded = 0;
+
+    if (dst == NULL || len == 0) {
+        return;
+    }
+
+    fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        while (off < len) {
+            ssize_t rd = read(fd, dst + off, len - off);
+            if (rd <= 0) {
+                break;
+            }
+            off += (size_t)rd;
+        }
+        close(fd);
+    }
+
+    if (off >= len) {
+        return;
+    }
+    if (!seeded) {
+        unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)getpid();
+        srand(seed);
+        seeded = 1;
+    }
+    while (off < len) {
+        dst[off++] = (unsigned char)(rand() & 0xFF);
+    }
+}
+
+static int _ws_compute_accept(const char *key_b64, char *accept_out, size_t accept_cap) {
+    static const char ws_magic_guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    unsigned char digest[20];
+    WsSha1Ctx ctx;
+    size_t key_len;
+
+    if (key_b64 == NULL || accept_out == NULL || accept_cap == 0) {
+        return -1;
+    }
+    key_len = strlen(key_b64);
+    if (key_len == 0) {
+        return -1;
+    }
+
+    _ws_sha1_init(&ctx);
+    _ws_sha1_update(&ctx, (const unsigned char *)key_b64, key_len);
+    _ws_sha1_update(&ctx, (const unsigned char *)ws_magic_guid, sizeof(ws_magic_guid) - 1);
+    _ws_sha1_final(&ctx, digest);
+
+    if (_base64_encode(digest, sizeof(digest), accept_out, accept_cap) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int _ws_generate_handshake_values(
+    char *key_out,
+    size_t key_cap,
+    char *accept_out,
+    size_t accept_cap
+) {
+    unsigned char nonce[16];
+    if (key_out == NULL || accept_out == NULL) {
+        return -1;
+    }
+    _ws_fill_random(nonce, sizeof(nonce));
+    if (_base64_encode(nonce, sizeof(nonce), key_out, key_cap) < 0) {
+        return -1;
+    }
+    if (_ws_compute_accept(key_out, accept_out, accept_cap) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int _http_get_header_value(
+    const char *buf,
+    size_t len,
+    const char *header_name,
+    char *value_out,
+    size_t value_cap
+) {
+    size_t header_end = 0;
+    size_t pos = 0;
+    size_t name_len;
+
+    if (buf == NULL || header_name == NULL || value_out == NULL || value_cap == 0) {
+        return -1;
+    }
+    value_out[0] = '\0';
+    name_len = strlen(header_name);
+    if (name_len == 0) {
+        return -1;
+    }
+
+    if (!_http_headers_complete(buf, len, &header_end)) {
+        return 0;
+    }
+
+    while (pos + 1 < header_end) {
+        if (buf[pos] == '\r' && buf[pos + 1] == '\n') {
+            pos += 2;
+            break;
+        }
+        pos += 1;
+    }
+
+    while (pos + 1 < header_end) {
+        size_t line_start = pos;
+        size_t line_end = pos;
+        const char *colon;
+        size_t key_len;
+        size_t value_start;
+        size_t value_end;
+        size_t value_len;
+
+        while (line_end + 1 < header_end && !(buf[line_end] == '\r' && buf[line_end + 1] == '\n')) {
+            line_end += 1;
+        }
+        if (line_end + 1 >= header_end) {
+            break;
+        }
+        if (line_end == line_start) {
+            break;
+        }
+
+        colon = memchr(buf + line_start, ':', line_end - line_start);
+        if (colon != NULL) {
+            key_len = (size_t)(colon - (buf + line_start));
+            while (key_len > 0 && (buf[line_start + key_len - 1] == ' ' || buf[line_start + key_len - 1] == '\t')) {
+                key_len -= 1;
+            }
+            if (key_len == name_len && strncasecmp(buf + line_start, header_name, name_len) == 0) {
+                value_start = (size_t)(colon - buf) + 1;
+                while (value_start < line_end && (buf[value_start] == ' ' || buf[value_start] == '\t')) {
+                    value_start += 1;
+                }
+                value_end = line_end;
+                while (value_end > value_start &&
+                       (buf[value_end - 1] == ' ' || buf[value_end - 1] == '\t')) {
+                    value_end -= 1;
+                }
+                value_len = value_end - value_start;
+                if (value_len + 1 > value_cap) {
+                    return -1;
+                }
+                memcpy(value_out, buf + value_start, value_len);
+                value_out[value_len] = '\0';
+                return 1;
+            }
+        }
+        pos = line_end + 2;
+    }
+    return 0;
+}
+
+static int _http_header_has_token(const char *header_value, const char *token) {
+    const char *cursor;
+    size_t token_len;
+    if (header_value == NULL || token == NULL) {
+        return 0;
+    }
+    token_len = strlen(token);
+    if (token_len == 0) {
+        return 0;
+    }
+    cursor = header_value;
+    while (*cursor != '\0') {
+        const char *start = cursor;
+        const char *end;
+        while (*start == ' ' || *start == '\t') {
+            start += 1;
+        }
+        end = start;
+        while (*end != '\0' && *end != ',') {
+            end += 1;
+        }
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+            end -= 1;
+        }
+        if ((size_t)(end - start) == token_len && strncasecmp(start, token, token_len) == 0) {
+            return 1;
+        }
+        cursor = (*end == ',') ? (end + 1) : end;
+    }
+    return 0;
+}
+
+static int _ws_validate_upgrade_response(
+    const Session *s,
+    const char *buf,
+    size_t len,
+    size_t *header_end_out
+) {
+    char accept_val[64];
+    char upgrade_val[128];
+    char connection_val[128];
+    size_t header_end = 0;
+
+    if (s == NULL || buf == NULL || s->ws_expected_accept[0] == '\0') {
+        return -1;
+    }
+    if (!_http_headers_complete(buf, len, &header_end)) {
+        return 0;
+    }
+    if (_parse_http_status(buf, len) != 101) {
+        return -1;
+    }
+    if (_http_get_header_value(buf, len, "Upgrade", upgrade_val, sizeof(upgrade_val)) != 1) {
+        return -1;
+    }
+    if (!_http_header_has_token(upgrade_val, "websocket")) {
+        return -1;
+    }
+    if (_http_get_header_value(buf, len, "Connection", connection_val, sizeof(connection_val)) != 1) {
+        return -1;
+    }
+    if (!_http_header_has_token(connection_val, "Upgrade")) {
+        return -1;
+    }
+    if (_http_get_header_value(buf, len, "Sec-WebSocket-Accept", accept_val, sizeof(accept_val)) != 1) {
+        return -1;
+    }
+    if (strcmp(accept_val, s->ws_expected_accept) != 0) {
+        return -1;
+    }
+    if (header_end_out != NULL) {
+        *header_end_out = header_end;
+    }
+    return 1;
+}
+
 static int _ws_parse_subscribe_messages(WsScenarioConfig *cfg, const char *raw, long requested_count) {
     const char *cursor;
     int parsed = 0;
@@ -2429,16 +2844,26 @@ static int _build_request(
     int websocket_mode
 ) {
     int n;
+    char ws_key[64];
 
     if (s == NULL) {
         return -1;
     }
+    s->ws_expected_accept[0] = '\0';
 
     if (path == NULL || path[0] == '\0') {
         path = "/";
     }
 
     if (websocket_mode) {
+        if (_ws_generate_handshake_values(
+                ws_key,
+                sizeof(ws_key),
+                s->ws_expected_accept,
+                sizeof(s->ws_expected_accept)
+            ) < 0) {
+            return -1;
+        }
         n = snprintf(
             s->req,
             sizeof(s->req),
@@ -2446,13 +2871,14 @@ static int _build_request(
             "Host: %s:%d\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Key: c2FtdXJhaS1zdGF0ZS1rZXk=\r\n"
+            "Sec-WebSocket-Key: %s\r\n"
             "Sec-WebSocket-Version: 13\r\n"
             "User-Agent: DDoSamurai-L7/1.0\r\n"
             "\r\n",
             path,
             target_ip,
-            target_port
+            target_port,
+            ws_key
         );
     } else {
         if (http_method == NULL || http_method[0] == '\0') {
@@ -2923,6 +3349,8 @@ static int _session_progress(
     socklen_t sock_err_len = sizeof(sock_err);
     ssize_t n;
     int status;
+    int ws_status;
+    size_t header_end;
 
     if (s == NULL || !s->in_use) {
         return 0;
@@ -3064,26 +3492,21 @@ static int _session_progress(
                             if (!websocket_mode) {
                                 return 1;
                             }
-                            if (status != 101) {
+                            header_end = 0;
+                            ws_status = _ws_validate_upgrade_response(s, s->resp, s->resp_len, &header_end);
+                            if (ws_status <= 0) {
                                 return -1;
                             }
                             if (!s->ws_scenario_enabled) {
                                 return 1;
                             }
-                            {
-                                size_t header_end = 0;
-                                int headers_done = _http_headers_complete(s->resp, s->resp_len, &header_end);
-                                if (!headers_done) {
+                            if (s->resp_len > header_end) {
+                                size_t leftover = s->resp_len - header_end;
+                                if (leftover > sizeof(s->ws_recv)) {
                                     return -1;
                                 }
-                                if (s->resp_len > header_end) {
-                                    size_t leftover = s->resp_len - header_end;
-                                    if (leftover > sizeof(s->ws_recv)) {
-                                        return -1;
-                                    }
-                                    memcpy(s->ws_recv, s->resp + header_end, leftover);
-                                    s->ws_recv_len = leftover;
-                                }
+                                memcpy(s->ws_recv, s->resp + header_end, leftover);
+                                s->ws_recv_len = leftover;
                             }
                             s->resp_len = 0;
                             s->state = SESSION_WEBSOCKET_SCENARIO;
@@ -3109,29 +3532,27 @@ static int _session_progress(
                     if (!websocket_mode) {
                         return 1;
                     }
-                    if (status != 101) {
+                    header_end = 0;
+                    ws_status = _ws_validate_upgrade_response(s, s->resp, s->resp_len, &header_end);
+                    if (ws_status < 0) {
                         return -1;
+                    }
+                    if (ws_status == 0) {
+                        if (s->resp_len + 1 >= sizeof(s->resp)) {
+                            return -1;
+                        }
+                        return 0;
                     }
                     if (!s->ws_scenario_enabled) {
                         return 1;
                     }
-                    {
-                        size_t header_end = 0;
-                        int headers_done = _http_headers_complete(s->resp, s->resp_len, &header_end);
-                        if (!headers_done) {
-                            if (s->resp_len + 1 >= sizeof(s->resp)) {
-                                return -1;
-                            }
-                            return 0;
+                    if (s->resp_len > header_end) {
+                        size_t leftover = s->resp_len - header_end;
+                        if (leftover > sizeof(s->ws_recv)) {
+                            return -1;
                         }
-                        if (s->resp_len > header_end) {
-                            size_t leftover = s->resp_len - header_end;
-                            if (leftover > sizeof(s->ws_recv)) {
-                                return -1;
-                            }
-                            memcpy(s->ws_recv, s->resp + header_end, leftover);
-                            s->ws_recv_len = leftover;
-                        }
+                        memcpy(s->ws_recv, s->resp + header_end, leftover);
+                        s->ws_recv_len = leftover;
                     }
                     s->resp_len = 0;
                     s->state = SESSION_WEBSOCKET_SCENARIO;
@@ -3149,7 +3570,8 @@ static int _session_progress(
                     if (!websocket_mode) {
                         return 1;
                     }
-                    if (status == 101 && !s->ws_scenario_enabled) {
+                    ws_status = _ws_validate_upgrade_response(s, s->resp, s->resp_len, &header_end);
+                    if (ws_status == 1 && !s->ws_scenario_enabled) {
                         return 1;
                     }
                 }

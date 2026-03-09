@@ -211,12 +211,8 @@ def _randomize_http_headers(target_ip, path="/", method="GET", user_agent=None):
             key = key.lower()
         final_headers.append(f"{key}: {value}")
         
-    # 3. Method Polymorphism (Whitespace)
-    # GET / HTTP/1.1 -> GET   /  HTTP/1.1
-    space1 = " " * random.randint(1, 3)
-    space2 = " " * random.randint(1, 3)
-    
-    request_line = f"{method}{space1}{path}{space2}HTTP/1.1"
+    # RFC 7230 request-line: method SP request-target SP HTTP-version
+    request_line = f"{method} {path} HTTP/1.1"
     
     payload = request_line + "\r\n" + "\r\n".join(final_headers) + "\r\n\r\n"
     return payload.encode()

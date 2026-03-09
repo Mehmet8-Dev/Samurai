@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import socket
 import threading
 import unittest
@@ -10,10 +12,11 @@ except Exception:  # pragma: no cover
 
 
 class _SimpleWebSocketScenarioServer:
-    def __init__(self, expected_messages, *, path="/ws", send_ack=True):
+    def __init__(self, expected_messages, *, path="/ws", send_ack=True, force_invalid_accept=False):
         self.expected_messages = [str(x) for x in list(expected_messages or [])]
         self.path = str(path or "/ws")
         self.send_ack = bool(send_ack)
+        self.force_invalid_accept = bool(force_invalid_accept)
         self.received_messages = []
         self.validation_failures = 0
         self._sock = None
@@ -99,11 +102,25 @@ class _SimpleWebSocketScenarioServer:
                 if (f"GET {self.path} HTTP/1.1".encode() not in req) or (b"Upgrade: websocket" not in req):
                     self.validation_failures += 1
                     continue
+                ws_key = b""
+                for line in req.split(b"\r\n"):
+                    if line.lower().startswith(b"sec-websocket-key:"):
+                        ws_key = line.split(b":", 1)[1].strip()
+                        break
+                if not ws_key:
+                    self.validation_failures += 1
+                    continue
+                if self.force_invalid_accept:
+                    accept = b"invalidaccept=="
+                else:
+                    accept = base64.b64encode(
+                        hashlib.sha1(ws_key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest()
+                    )
                 conn.sendall(
                     b"HTTP/1.1 101 Switching Protocols\r\n"
                     b"Upgrade: websocket\r\n"
                     b"Connection: Upgrade\r\n"
-                    b"Sec-WebSocket-Accept: x3JJHMbDL1EzLkh9GBhXDw==\r\n\r\n"
+                    b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
                 )
                 try:
                     for idx in range(len(self.expected_messages)):
@@ -162,3 +179,33 @@ class TestL7StateEngineWebSocketScenario(unittest.TestCase):
         self.assertEqual(int(out.get("ws_step_count", -1)), 5)
         self.assertEqual(srv.validation_failures, 0)
         self.assertEqual(srv.received_messages, expected)
+
+    def test_ws_upgrade_rejects_invalid_accept_header(self):
+        srv = _SimpleWebSocketScenarioServer(
+            expected_messages=[],
+            path="/ws",
+            send_ack=False,
+            force_invalid_accept=True,
+        )
+        srv.start()
+        handle = l7_core.open({})
+        try:
+            out = l7_core.run_websocket_stateful(
+                handle,
+                {
+                    "target_ip": "127.0.0.1",
+                    "target_port": int(srv.port),
+                    "count": 1,
+                    "concurrency": 1,
+                    "scheme": "ws",
+                    "timeout_s": 2.0,
+                    "ws_path": "/ws",
+                    "ws_scenario_enabled": False,
+                },
+            )
+        finally:
+            l7_core.close(handle)
+            srv.stop()
+
+        self.assertEqual(int(out.get("sent", -1)), 0, msg=f"unexpected ws result: {out}")
+        self.assertEqual(int(out.get("errors", -1)), 1, msg=f"unexpected ws result: {out}")

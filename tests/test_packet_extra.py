@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 
-from ddos_samurai.packet import PacketConfig, SpoofingOptions, create_packet
+from ddos_samurai.packet import PacketConfig, SpoofingOptions, _randomize_http_headers, create_packet
 from ddos_samurai.scapy_support import is_scapy_available
 
 
@@ -46,3 +46,7 @@ class TestPacketExtra(unittest.TestCase):
             pkt = create_packet(cfg)
             self.assertIsNotNone(pkt)
 
+    def test_http_request_line_uses_single_spaces(self):
+        payload = _randomize_http_headers("198.51.100.10", path="/rfc", method="GET").decode("ascii", errors="replace")
+        first_line = payload.split("\r\n", 1)[0]
+        self.assertEqual(first_line, "GET /rfc HTTP/1.1")

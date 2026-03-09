@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import os
 import shutil
 import socket
@@ -79,7 +81,8 @@ class _SimpleTLSServer:
                 if self.validator is not None and not self.validator(data):
                     self.validation_failures += 1
                 try:
-                    tls_conn.sendall(self.response)
+                    resp = self.response(data) if callable(self.response) else self.response
+                    tls_conn.sendall(resp)
                 except OSError:
                     pass
                 self.handled += 1
@@ -146,15 +149,26 @@ class TestL7StateEngineTLS(unittest.TestCase):
         self.assertEqual(str(out.get("sender_fallback_reason", "")), "none")
 
     def test_wss_upgrade_success(self):
-        srv = _SimpleTLSServer(
-            self._cert,
-            self._key,
-            (
+        def _ws_upgrade_response(req: bytes) -> bytes:
+            ws_key = b""
+            for line in req.split(b"\r\n"):
+                if line.lower().startswith(b"sec-websocket-key:"):
+                    ws_key = line.split(b":", 1)[1].strip()
+                    break
+            accept = base64.b64encode(
+                hashlib.sha1(ws_key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest()
+            )
+            return (
                 b"HTTP/1.1 101 Switching Protocols\r\n"
                 b"Upgrade: websocket\r\n"
                 b"Connection: Upgrade\r\n"
-                b"Sec-WebSocket-Accept: x3JJHMbDL1EzLkh9GBhXDw==\r\n\r\n"
-            ),
+                b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+            )
+
+        srv = _SimpleTLSServer(
+            self._cert,
+            self._key,
+            _ws_upgrade_response,
             expected_connections=1,
             validator=lambda req: b"Upgrade: websocket" in req and b"GET /ws HTTP/1.1" in req,
         )

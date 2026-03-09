@@ -597,6 +597,7 @@ class TestFullPackets(unittest.TestCase):
         pkt = create_packet(cfg)
         self.assertTrue(_verify_ip_checksum(pkt))
         # Should contain HTTP request
+        self.assertIn(b"GET / HTTP/1.1\r\n", pkt)
         self.assertIn(b"HTTP/1.1", pkt)
 
     def test_spoofed_packet(self):

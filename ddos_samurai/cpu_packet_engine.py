@@ -1186,10 +1186,8 @@ def _build_polymorphic_http_payload(
             key = key.lower()
         final_headers.append(f"{key}: {value}")
 
-    # Whitespace polymorphism in request line
-    sp1 = " " * random.randint(1, 3)
-    sp2 = " " * random.randint(1, 3)
-    request_line = f"{method}{sp1}{path}{sp2}HTTP/1.1"
+    # RFC 7230 request-line: method SP request-target SP HTTP-version
+    request_line = f"{method} {path} HTTP/1.1"
 
     payload = request_line + "\r\n" + "\r\n".join(final_headers) + "\r\n\r\n"
     return payload.encode("ascii", errors="replace")
