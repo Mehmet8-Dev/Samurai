@@ -2156,7 +2156,7 @@ static void fast_sender_free(void* module) {
 static struct PyModuleDef fastsendermodule = {
     PyModuleDef_HEAD_INIT,
     "fast_sender",
-    "High performance packet sender module for DDoSamurai",
+    "High performance packet sender module for Samurai",
     -1,
     FastSenderMethods,
     NULL,

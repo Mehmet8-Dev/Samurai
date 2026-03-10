@@ -9,7 +9,7 @@ def test_cli_help():
         result = subprocess.run([sys.executable, "-m", "ddos_samurai.cli", "--help"], 
                                 capture_output=True, text=True, timeout=10)
         assert result.returncode == 0
-        assert "DDoSamurai" in result.stdout
+        assert "Samurai" in result.stdout
     except subprocess.TimeoutExpired:
         pytest.fail("CLI help command timed out")
 

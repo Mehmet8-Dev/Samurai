@@ -2,7 +2,7 @@
 
 ## Hedef
 
-DDoSamurai, farkli "attack vector" (L4 ve L7) akislari icin ortak bir calistirma modeli sunar:
+Samurai, farkli "attack vector" (L4 ve L7) akislari icin ortak bir calistirma modeli sunar:
 
 - Tek bir CLI arayuzu (`ddos_samurai/cli.py`)
 - Bir worker/process modeli (`ddos_samurai/orchestrator.py`)

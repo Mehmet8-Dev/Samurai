@@ -405,7 +405,7 @@ def build_setup_kwargs() -> Dict[str, object]:
         "name": "ddos_samurai",
         "version": "2.0.0",
         "description": "High-Performance Network Testing Tool with GPU Acceleration and AF_XDP Support",
-        "author": "DDoSamurai Team",
+        "author": "Samurai Team",
         "packages": find_packages(include=["ddos_samurai", "ddos_samurai.*"]),
         "ext_modules": get_extensions(),
         "cmdclass": {"build_ext": OptionalBuildExt},

@@ -1,5 +1,5 @@
 """
-DDoSamurai — Deterministic Pacing Engine (Python Wrapper)
+Samurai — Deterministic Pacing Engine (Python Wrapper)
 =========================================================
 
 Thin Python interface around the C ``pacing_engine`` extension.

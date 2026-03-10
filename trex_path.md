@@ -1,7 +1,7 @@
 # TRex Path (30 Gunluk Teknik Yol Haritasi)
 
 Tarih: 2026-02-20  
-Kapsam: `DDoSamurai` kod tabanini, TRex'e yakinlasacak sekilde performans/stabilite acisindan adim adim iyilestirmek.
+Kapsam: `Samurai` kod tabanini, TRex'e yakinlasacak sekilde performans/stabilite acisindan adim adim iyilestirmek.
 
 ## 1) Baslangic Durumu (Mevcut Kanitlar)
 

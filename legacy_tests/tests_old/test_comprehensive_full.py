@@ -1,5 +1,5 @@
 """
-COMPREHENSIVE UNIT TESTS - DDoSamurai Full Stack Testing
+COMPREHENSIVE UNIT TESTS - Samurai Full Stack Testing
 Her bir parçayı detaylı kontrol eden testler
 """
 

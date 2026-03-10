@@ -265,7 +265,7 @@ async def quic_sender(
                             (b":path", req_path.encode()),
                             (b":scheme", b"https"),
                             (b":authority", target_ip.encode() if isinstance(target_ip, str) else target_ip),
-                            (b"user-agent", b"DDoSamurai/2.0"),
+                            (b"user-agent", b"Samurai/2.0"),
                         ]
                         for hk, hv in dict(req_headers or {}).items():
                             if hk is None or hv is None:

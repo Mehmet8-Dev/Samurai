@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MASTER TEST RUNNER - Complete DDoSamurai Test Suite
+MASTER TEST RUNNER - Complete Samurai Test Suite
 Tüm test setlerini çalıştıran kapsamlı test kontrol merkezi
 """
 
@@ -146,7 +146,7 @@ def main():
         print("  ✓ Network interface TX")
         
         print(f"\nEnd time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print("\n✓ Your DDoSamurai implementation is FULLY VALIDATED and WORKING CORRECTLY")
+        print("\n✓ Your Samurai implementation is FULLY VALIDATED and WORKING CORRECTLY")
         print("\nNote: The 'Bogus IPv4' error in Wireshark is from INCOMING ARP packets,")
         print("not your outgoing TCP/UDP packets. This is normal network behavior.\n")
         

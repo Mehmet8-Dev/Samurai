@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DDoSamurai Comprehensive Unit Test Suite
+Samurai Comprehensive Unit Test Suite
 Tüm kritik bileşenleri test eder.
 """
 

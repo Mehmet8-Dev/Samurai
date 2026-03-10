@@ -1,6 +1,6 @@
-# DDoSamurai — Detaylı Proje Analizi ve Cisco TRex Karşılaştırması
+# Samurai — Detaylı Proje Analizi ve Cisco TRex Karşılaştırması
 
-Bu doküman DDoSamurai v2.0 projesinin kapsamlı analizini ve Cisco TRex ile detaylı karşılaştırma/puanlamasını içerir.
+Bu doküman Samurai v2.0 projesinin kapsamlı analizini ve Cisco TRex ile detaylı karşılaştırma/puanlamasını içerir.
 
 ## Guncel Durum Ozeti (2026-03-07)
 
@@ -14,7 +14,7 @@ Bu dosyadaki asagidaki bolumler tarihsel analiz kaydi olarak korunmustur. Guncel
 
 Mimari-temelli guncel puan (benchmark degil, kod/entegrasyon odakli):
 
-| Boyut | DDoSamurai | TRex |
+| Boyut | Samurai | TRex |
 |---|---:|---:|
 | Control-plane / dataplane ayrimi | 8.2 | 9.6 |
 | L4 hot-path determinism | 7.4 | 9.7 |
@@ -24,16 +24,16 @@ Mimari-temelli guncel puan (benchmark degil, kod/entegrasyon odakli):
 | Genel teknik olgunluk | 7.9 | 9.3 |
 
 Not:
-- DDoSamurai'nin guclu farki GPU-assisted generation ve vektor cesitliligidir.
+- Samurai'nin guclu farki GPU-assisted generation ve vektor cesitliligidir.
 - TRex'in guclu farki tek dataplane disiplini ve olgun L4 performans hattidir.
 
 ---
 
-## BÖLÜM 1: DDoSamurai Proje Analizi
+## BÖLÜM 1: Samurai Proje Analizi
 
 ### 1.1 Amaç ve Kapsam
 
-**DDoSamurai**, izinli ortamlarda WAF/IPS ve benzeri savunma sistemlerini test etmek için tasarlanmış, yüksek performanslı ve modüler bir **ağ stres testi ve sızma testi** aracıdır. Temel özellikleri:
+**Samurai**, izinli ortamlarda WAF/IPS ve benzeri savunma sistemlerini test etmek için tasarlanmış, yüksek performanslı ve modüler bir **ağ stres testi ve sızma testi** aracıdır. Temel özellikleri:
 
 - **Hedef kitle:** Güvenlik testçileri, DevOps/SRE, stres testi ekipleri
 - **Kullanım:** Yalnızca yetkili sistemlerde (allowlist, etik uyarı mekanizması)
@@ -199,22 +199,22 @@ Buffer formatı: Çoklu paket ardışık byte buffer; `packet_size = len(buffer)
 
 ### 2.2 Karşılaştırma Matrisi
 
-| Kriter | DDoSamurai | Cisco TRex | Notlar |
+| Kriter | Samurai | Cisco TRex | Notlar |
 |--------|------------|------------|--------|
-| **Temel teknoloji** | Python + C ext (sendmmsg/TX_RING) + opsiyonel AF_XDP | DPDK (user-space driver) | TRex ağ stack’i tamamen bypass; DDoSamurai kernel + C/GPU hızlandırma |
+| **Temel teknoloji** | Python + C ext (sendmmsg/TX_RING) + opsiyonel AF_XDP | DPDK (user-space driver) | TRex ağ stack’i tamamen bypass; Samurai kernel + C/GPU hızlandırma |
 | **L4 throughput** | C ext + GPU ile yüksek PPS; dokümanda “milyonlarca PPS” | ~10–30 Mpps/çekirdek, 200 Gb/s’e kadar | TRex L4’te tipik olarak daha yüksek ham throughput |
-| **L7 stateful** | HTTP/1.1, HTTP/2, WebSocket, QUIC (gerçek kütüphaneler) | ASTF: HTTP/HTTPS, Citrix; milyonlarca akış, MCPS | TRex L7’de çok yüksek ölçek; DDoSamurai gerçek stack + Ninja (WAF bypass) |
-| **GPU kullanımı** | Evet (CuPy/Numba): paket/payload üretimi | Hayır (CPU/DPDK) | DDoSamurai farklılaştırıcı özellik |
-| **WAF bypass / Ninja** | Evet (Playwright, JS challenge) | Yok (genel L7 emülasyon) | DDoSamurai Cloudflare/Akamai benzeri senaryolar için |
-| **Amplification** | DNS, NTP, SSDP, Memcached, LDAP (CPU+GPU) | Trafik şablonu ile mümkün; özel “amplification modu” vurgusu yok | DDoSamurai hazır amplification vektörleri |
-| **Slowloris / slow-* ** | Evet (slowloris, slow-post, slow-read) | Profil ile benzeri yapılabilir; hazır modül vurgusu sınırlı | DDoSamurai hazır |
-| **Anomaly / malformed** | Evet (GPU anomaly_packet) | Özel paket şablonları ile | DDoSamurai özelleşmiş modül |
+| **L7 stateful** | HTTP/1.1, HTTP/2, WebSocket, QUIC (gerçek kütüphaneler) | ASTF: HTTP/HTTPS, Citrix; milyonlarca akış, MCPS | TRex L7’de çok yüksek ölçek; Samurai gerçek stack + Ninja (WAF bypass) |
+| **GPU kullanımı** | Evet (CuPy/Numba): paket/payload üretimi | Hayır (CPU/DPDK) | Samurai farklılaştırıcı özellik |
+| **WAF bypass / Ninja** | Evet (Playwright, JS challenge) | Yok (genel L7 emülasyon) | Samurai Cloudflare/Akamai benzeri senaryolar için |
+| **Amplification** | DNS, NTP, SSDP, Memcached, LDAP (CPU+GPU) | Trafik şablonu ile mümkün; özel “amplification modu” vurgusu yok | Samurai hazır amplification vektörleri |
+| **Slowloris / slow-* ** | Evet (slowloris, slow-post, slow-read) | Profil ile benzeri yapılabilir; hazır modül vurgusu sınırlı | Samurai hazır |
+| **Anomaly / malformed** | Evet (GPU anomaly_packet) | Özel paket şablonları ile | Samurai özelleşmiş modül |
 | **PCAP replay** | Evet (pcap_replay, gpu_pcap_gen) | Evet (büyük dosya, 1 TB vb.) | İkisi de var; TRex ölçek vurgusu |
-| **Kurulum / taşınabilirlik** | pip + CUDA (opsiyonel) + Linux headers (XDP); Python merkezli | DPDK, NIC binding, büyük sayfa, root; daha ağır | DDoSamurai daha hafif kurulum |
-| **API / otomasyon** | FastAPI (REST), dashboard (React), JWT, billing | Python API, 1 ms test çalıştırma; GUI/konsol | DDoSamurai SaaS tarafı (abonelik, dashboard); TRex test odaklı API |
-| **Güvenlik kapıları** | Allowlist, public blok, etik uyarı | Kullanıcı sorumluluğunda | DDoSamurai yerleşik safety |
+| **Kurulum / taşınabilirlik** | pip + CUDA (opsiyonel) + Linux headers (XDP); Python merkezli | DPDK, NIC binding, büyük sayfa, root; daha ağır | Samurai daha hafif kurulum |
+| **API / otomasyon** | FastAPI (REST), dashboard (React), JWT, billing | Python API, 1 ms test çalıştırma; GUI/konsol | Samurai SaaS tarafı (abonelik, dashboard); TRex test odaklı API |
+| **Güvenlik kapıları** | Allowlist, public blok, etik uyarı | Kullanıcı sorumluluğunda | Samurai yerleşik safety |
 | **Lisans** | MIT | BSD benzeri (Cisco) | İkisi de açık kaynak |
-| **Dokümantasyon** | İç doküman (00–13), README, profil açıklamaları | Geniş resmi doküman, FAQ | TRex daha geniş; DDoSamurai iyi yapılandırılmış iç doküman |
+| **Dokümantasyon** | İç doküman (00–13), README, profil açıklamaları | Geniş resmi doküman, FAQ | TRex daha geniş; Samurai iyi yapılandırılmış iç doküman |
 
 ---
 
@@ -222,21 +222,21 @@ Buffer formatı: Çoklu paket ardışık byte buffer; `packet_size = len(buffer)
 
 Ortak kriterler üzerinden 1 (zayıf) – 10 (mükemmel) arası değerlendirme.
 
-| Kriter | Ağırlık | DDoSamurai | TRex | Kısa gerekçe |
+| Kriter | Ağırlık | Samurai | TRex | Kısa gerekçe |
 |--------|---------|------------|------|----------------------|
-| **L4 ham throughput** | 20% | 7 | 9 | TRex DPDK ile çekirdek başı 10–30 Mpps; DDoSamurai C+GPU ile güçlü ama TRex seviyesinde değil. |
-| **L7 gerçekçilik ve ölçek** | 15% | 7 | 9 | TRex ASTF milyonlarca akış/MCPS; DDoSamurai gerçek HTTP/2/QUIC ve Ninja ile WAF senaryolarında güçlü. |
-| **WAF / saldırı senaryoları** | 15% | 9 | 5 | DDoSamurai: Ninja, amplification, slowloris, anomaly; TRex genel trafik, özel “saldırı modu” vurgusu az. |
-| **Kurulum ve taşınabilirlik** | 10% | 8 | 6 | DDoSamurai: pip + opsiyonel GPU; TRex: DPDK, NIC binding, daha fazla sistem gereksinimi. |
-| **Gözlemlenebilirlik / raporlama** | 10% | 8 | 9 | TRex donanım istatistik, BPF, mikro gecikme; DDoSamurai Rich, Prometheus, run/self-test raporları iyi. |
-| **API ve otomasyon** | 10% | 8 | 8 | DDoSamurai: REST + dashboard + billing; TRex: güçlü Python API ve hızlı test çalıştırma. |
-| **Güvenlik ve güvenli kullanım** | 10% | 9 | 6 | DDoSamurai: allowlist, public blok, etik uyarı; TRex’te bu tür yerleşik kapılar belirgin değil. |
-| **Dokümantasyon** | 5% | 7 | 9 | DDoSamurai iyi iç doküman; TRex çok geniş resmi doküman. |
-| **Esneklik (protokol / vektör)** | 5% | 9 | 8 | DDoSamurai: çok sayıda hazır vektör (amplification, anomaly, slow-*, Ninja); TRex Scapy ile esnek. |
+| **L4 ham throughput** | 20% | 7 | 9 | TRex DPDK ile çekirdek başı 10–30 Mpps; Samurai C+GPU ile güçlü ama TRex seviyesinde değil. |
+| **L7 gerçekçilik ve ölçek** | 15% | 7 | 9 | TRex ASTF milyonlarca akış/MCPS; Samurai gerçek HTTP/2/QUIC ve Ninja ile WAF senaryolarında güçlü. |
+| **WAF / saldırı senaryoları** | 15% | 9 | 5 | Samurai: Ninja, amplification, slowloris, anomaly; TRex genel trafik, özel “saldırı modu” vurgusu az. |
+| **Kurulum ve taşınabilirlik** | 10% | 8 | 6 | Samurai: pip + opsiyonel GPU; TRex: DPDK, NIC binding, daha fazla sistem gereksinimi. |
+| **Gözlemlenebilirlik / raporlama** | 10% | 8 | 9 | TRex donanım istatistik, BPF, mikro gecikme; Samurai Rich, Prometheus, run/self-test raporları iyi. |
+| **API ve otomasyon** | 10% | 8 | 8 | Samurai: REST + dashboard + billing; TRex: güçlü Python API ve hızlı test çalıştırma. |
+| **Güvenlik ve güvenli kullanım** | 10% | 9 | 6 | Samurai: allowlist, public blok, etik uyarı; TRex’te bu tür yerleşik kapılar belirgin değil. |
+| **Dokümantasyon** | 5% | 7 | 9 | Samurai iyi iç doküman; TRex çok geniş resmi doküman. |
+| **Esneklik (protokol / vektör)** | 5% | 9 | 8 | Samurai: çok sayıda hazır vektör (amplification, anomaly, slow-*, Ninja); TRex Scapy ile esnek. |
 
 **Ağırlıklı ortalama (örnek formül):**
 
-- **DDoSamurai:**  
+- **Samurai:**  
   (7×0.20 + 7×0.15 + 9×0.15 + 8×0.10 + 8×0.10 + 8×0.10 + 9×0.10 + 7×0.05 + 9×0.05) = **7.95 ≈ 8.0**
 
 - **TRex:**  
@@ -248,7 +248,7 @@ Ortak kriterler üzerinden 1 (zayıf) – 10 (mükemmel) arası değerlendirme.
 
 ## BÖLÜM 4: Sonuç ve Öneriler
 
-### 4.1 DDoSamurai Ne Zaman Tercih Edilmeli?
+### 4.1 Samurai Ne Zaman Tercih Edilmeli?
 
 - **WAF/IPS testi:** Ninja (Playwright), JA3/JA4 taklidi, polymorphic HTTP, slowloris/slow-*.
 - **Hazır saldırı vektörleri:** Amplification (DNS/NTP/SSDP/Memcached/LDAP), anomaly (malformed), DNS flood.
@@ -267,10 +267,10 @@ Ortak kriterler üzerinden 1 (zayıf) – 10 (mükemmel) arası değerlendirme.
 
 | İhtiyaç | Daha uygun |
 |---------|------------|
-| WAF bypass, Cloudflare/Akamai benzeri test | **DDoSamurai** |
-| Amplification / anomaly / slow-* hazır modüller | **DDoSamurai** |
-| Yerleşik safety (allowlist, etik uyarı) | **DDoSamurai** |
-| Hafif kurulum, Python odaklı | **DDoSamurai** |
+| WAF bypass, Cloudflare/Akamai benzeri test | **Samurai** |
+| Amplification / anomaly / slow-* hazır modüller | **Samurai** |
+| Yerleşik safety (allowlist, etik uyarı) | **Samurai** |
+| Hafif kurulum, Python odaklı | **Samurai** |
 | Maksimum ham throughput (L4/L7), 200 Gb/s | **TRex** |
 | Mikrosaniye gecikme ölçümü, donanım istatistik | **TRex** |
 | Çok büyük ölçekte stateful L7 (ASTF) | **TRex** |
@@ -294,4 +294,4 @@ Parity raporunda normalize edilen ana alanlar:
 
 ---
 
-*DDoSamurai Team — 2026*
+*Samurai Team — 2026*

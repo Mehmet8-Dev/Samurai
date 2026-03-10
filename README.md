@@ -1,6 +1,6 @@
-# DDoSamurai v2.0
+# Samurai v2.0
 
-DDoSamurai, **yalnizca yetkili ortamlarda** kullanilmak uzere tasarlanmis, moduler bir ag stres ve guvenlik test platformudur.
+Samurai, **yalnizca yetkili ortamlarda** kullanilmak uzere tasarlanmis, moduler bir ag stres ve guvenlik test platformudur.
 
 Proje; tek bir CLI uzerinden CPU/GPU veri yollari, C hizlandirma katmanlari, opsiyonel SaaS API + dashboard ve dis monitoring yiginini birlestirir.
 

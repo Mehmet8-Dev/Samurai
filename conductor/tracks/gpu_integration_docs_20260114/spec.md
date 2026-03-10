@@ -1,7 +1,7 @@
 # Specification: GPU Integration Tests, Dependency Optimization & Documentation
 
 ## 1. Overview
-This track focuses on solidifying the core high-performance components of DDoSamurai v2.0 without altering the main logic. The goal is to ensure that the GPU (CUDA) and C (`fast_sender`) extensions are robustly tested, dependencies are managed efficiently (lazy loading), and documentation reflects the current state of the project.
+This track focuses on solidifying the core high-performance components of Samurai v2.0 without altering the main logic. The goal is to ensure that the GPU (CUDA) and C (`fast_sender`) extensions are robustly tested, dependencies are managed efficiently (lazy loading), and documentation reflects the current state of the project.
 
 ## 2. Goals
 1.  **Verify High-Performance Modules:** Create and run integration tests for `fast_sender` (C extension) and `gpu_packet.py` (CUDA kernels).

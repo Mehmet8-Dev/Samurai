@@ -138,7 +138,7 @@ TRex tarafi icin repodaki referans tabani:
 - `docs/14-project-analysis-and-trex-comparison.md`
 - `trex_path.md`
 
-| Boyut | DDoSamurai Durumu | TRex Durumu (repo referansi) | Fark Etiketi | Parite Hedefi | Kapatma Aksiyonu |
+| Boyut | Samurai Durumu | TRex Durumu (repo referansi) | Fark Etiketi | Parite Hedefi | Kapatma Aksiyonu |
 |---|---|---|---|---|---|
 | L4 throughput | Hibrit Python+C+GPU hizli yollar | DPDK merkezli cok yuksek PPS tabani | geride | Tekrarlanabilir lab matrisinde CPU basic `send success >=99%` ve daha yuksek surekli PPS | Sender path metriklerini stabilize et, fallback belirsizligini azalt. |
 | L7 stateful olcek | Gercek protokol kutuphaneleri, coklu vektor, SaaS kontrolu | ASTF olceginde stateful trafik vurgusu | geride | Yuksek baglanti olcegi benchmarklarini standartlastirip limitleri yayinla | Profil bazli kapasite zarfini olcen stateful benchmark seti ekle. |

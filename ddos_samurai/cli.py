@@ -800,7 +800,7 @@ def build_parser() -> argparse.ArgumentParser:
     Kept separate to make testing and maintenance easier.
     """
     parser = argparse.ArgumentParser(
-        description="Modüler ve yüksek performanslı ağ stres testi aracı - DDoSamurai",
+        description="Modüler ve yüksek performanslı ağ stres testi aracı - Samurai",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 

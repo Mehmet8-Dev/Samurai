@@ -1,5 +1,5 @@
 /**
- * DDoSamurai — Deterministic Pacing Engine (C Extension)
+ * Samurai — Deterministic Pacing Engine (C Extension)
  * ======================================================
  *
  * Nanosecond-precision packet pacing using:
@@ -15,7 +15,7 @@
  *       -o pacing_engine$(python3-config --extension-suffix) \
  *       pacing_engine.c -lpthread -lm $(python3-config --ldflags)
  *
- * Copyright (c) 2026 DDoSamurai — research / authorised testing only.
+ * Copyright (c) 2026 Samurai — research / authorised testing only.
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -2137,7 +2137,7 @@ static PyMethodDef PacingMethods[] = {
 static struct PyModuleDef pacing_module = {
     PyModuleDef_HEAD_INIT,
     "pacing_engine",
-    "DDoSamurai Deterministic Pacing Engine\n\n"
+    "Samurai Deterministic Pacing Engine\n\n"
     "Nanosecond-precision packet pacing with:\n"
     "  - Hybrid busy-wait / clock_nanosleep timing\n"
     "  - Token bucket rate limiter\n"

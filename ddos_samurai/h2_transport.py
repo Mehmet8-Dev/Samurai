@@ -133,7 +133,7 @@ async def send_h2_requests(
                     body_bytes = body_obj
                 else:
                     body_bytes = str(body_obj).encode("utf-8")
-                user_agent = "DDoSamurai-H2/3.0"
+                user_agent = "Samurai-H2/3.0"
                 ua_seen = False
                 for hk in list(headers_in.keys()):
                     if str(hk).strip().lower() == "user-agent":

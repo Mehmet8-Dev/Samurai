@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MASTER TEST RUNNER - DDoSamurai Full Stack Verification
+MASTER TEST RUNNER - Samurai Full Stack Verification
 Tüm testleri çalıştırır ve detaylı rapor üretir
 """
 
@@ -160,7 +160,7 @@ def main():
     
     if failed == 0:
         print(f"{Colors.OKGREEN}{Colors.BOLD}✓ ALL TESTS PASSED!{Colors.ENDC}")
-        print(f"\n{Colors.OKGREEN}Your DDoSamurai implementation is correct and ready for deployment.{Colors.ENDC}\n")
+        print(f"\n{Colors.OKGREEN}Your Samurai implementation is correct and ready for deployment.{Colors.ENDC}\n")
         return 0
     else:
         print(f"{Colors.FAIL}{Colors.BOLD}✗ SOME TESTS FAILED{Colors.ENDC}")

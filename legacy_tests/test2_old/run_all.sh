@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# DDoSamurai Comprehensive Test Runner
+# Samurai Comprehensive Test Runner
 # This script runs all tests in the test2 directory.
 
 # Colors for output
@@ -8,7 +8,7 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting DDoSamurai Test Suite...${NC}"
+echo -e "${GREEN}Starting Samurai Test Suite...${NC}"
 
 # Check for root privileges
 if [[ $EUID -ne 0 ]]; then

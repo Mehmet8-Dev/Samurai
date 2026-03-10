@@ -177,7 +177,7 @@ class VirtualUser:
         if user_agent:
             self.headers["User-Agent"] = user_agent
         else:
-            self.headers["User-Agent"] = f"DDoSamurai-VU/{user_id}"
+            self.headers["User-Agent"] = f"Samurai-VU/{user_id}"
         self.redirect_history: list[str] = []
         self.tokens: dict[str, str] = {}
         self._client: Optional[httpx.AsyncClient] = None

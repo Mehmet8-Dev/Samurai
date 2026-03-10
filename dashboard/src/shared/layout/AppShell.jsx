@@ -60,7 +60,7 @@ export function AppShell({ isAuthenticated, username, apiHealth, onLogout, child
 
       <aside className="left-rail" aria-label="Ana menü">
         <div className="rail-brand">
-          <span className="app-kicker">DDoSamurai</span>
+          <span className="app-kicker">Samurai</span>
           <h1 className="rail-title">Samurai Console</h1>
           <p className="rail-subtitle">Operasyon yüzeyi</p>
         </div>

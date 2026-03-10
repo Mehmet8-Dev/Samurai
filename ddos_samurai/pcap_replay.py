@@ -1,5 +1,5 @@
 """
-DDoSamurai — PCAP Replay Engine
+Samurai — PCAP Replay Engine
 ================================
 
 Reads a PCAP (or PCAP-NG) capture file and replays its packets on the network.
@@ -16,7 +16,7 @@ Features
 - Per-packet IP rewriting  (destination IP + port override)
 - Lightweight BPF-like filter (protocol / src-ip / dst-ip / port)
 - L2 (Ethernet) and L3 (raw IP) output depending on sender backend
-- Full integration with DDoSamurai pacing engine & live metrics
+- Full integration with Samurai pacing engine & live metrics
 
 Usage (programmatic)::
 
@@ -36,7 +36,7 @@ CLI::
         --pcap-file capture.pcap --pcap-timing original \\
         -t 10.0.0.1 -p 80
 
-Author: DDoSamurai Team
+Author: Samurai Team
 """
 
 from __future__ import annotations
@@ -1204,7 +1204,7 @@ async def replay_pcap(
     Main PCAP replay entry point.
 
     Parses the PCAP file, prepares packets, and sends them using the
-    DDoSamurai sender infrastructure.
+    Samurai sender infrastructure.
 
     Returns:
         Statistics dictionary with attempted, sent, errors, etc.

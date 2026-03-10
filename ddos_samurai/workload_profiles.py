@@ -1,5 +1,5 @@
 """
-DDoSamurai — Corporate Test Profiles
+Samurai — Corporate Test Profiles
 ====================================
 
 Professional, pre-defined test profiles for corporate clients.
@@ -108,7 +108,7 @@ TEST_PROFILES = {
 def print_profiles():
     """Prints a beautifully formatted table of available profiles."""
     print("\n" + "="*80)
-    print(" DDoSamurai — Corporate Test Profiles ".center(80, " "))
+    print(" Samurai — Corporate Test Profiles ".center(80, " "))
     print("="*80)
     print(f" {'PROFILE NAME':<25} | {'DESCRIPTION'}")
     print("-" * 80)

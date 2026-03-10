@@ -141,7 +141,7 @@ except Exception:
         _FORMDATA_AVAILABLE = False
 
 
-app = FastAPI(title="DDoSamurai SaaS API", version="3.0.0")
+app = FastAPI(title="Samurai SaaS API", version="3.0.0")
 
 CORS_ORIGINS = [o.strip() for o in os.getenv("SAMURAI_CORS_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(

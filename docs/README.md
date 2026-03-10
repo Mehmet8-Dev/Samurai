@@ -1,4 +1,4 @@
-# DDoSamurai Documentation Index
+# Samurai Documentation Index
 
 Bu dizin, kod tabanini "modul modul" ve gelistirici dostu sekilde anlatan ic dokumantasyondur.
 Amac:

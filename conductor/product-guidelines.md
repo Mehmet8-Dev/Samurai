@@ -1,4 +1,4 @@
-# Product Guidelines: DDoSamurai v2.0
+# Product Guidelines: Samurai v2.0
 
 ## Core Philosophy
 *   **Modularity & Extensibility:** The `ddos_samurai` package structure (packet, senders, orchestrator, stealth, utils) must be preserved. New attack vectors should be pluggable.

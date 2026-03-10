@@ -1,6 +1,6 @@
-# AF_XDP Entegrasyonu - DDoSamurai v2.0 🚀
+# AF_XDP Entegrasyonu - Samurai v2.0 🚀
 
-Bu belge, DDoSamurai'nin yeni **AF_XDP** (Address Family XDP) entegrasyonunu açıklar.
+Bu belge, Samurai'nin yeni **AF_XDP** (Address Family XDP) entegrasyonunu açıklar.
 
 ## 📌 AF_XDP Nedir?
 
@@ -88,7 +88,7 @@ sudo dnf install -y \
 ### 2. Modülü Derle
 
 ```bash
-cd /path/to/DDoSamurai
+cd /path/to/Samurai
 
 # Bağımlılıkları kontrol et
 cd ddos_samurai && make check

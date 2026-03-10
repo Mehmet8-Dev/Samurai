@@ -131,7 +131,7 @@ Benchmark environment degiskenleri:
 Repo baseline dosyasi:
 
 - `benchmarks/benchmark_baseline_ci.json`
-- `benchmarks/parity_matrix.json` (DDoSamurai + TRex ortak benchmark sozlesmesi)
+- `benchmarks/parity_matrix.json` (Samurai + TRex ortak benchmark sozlesmesi)
 
 Ornek:
 

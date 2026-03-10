@@ -1,5 +1,5 @@
 /**
- * AF_XDP High-Performance Packet Sender for DDoSamurai
+ * AF_XDP High-Performance Packet Sender for Samurai
  * =====================================================
  * 
  * This module implements AF_XDP (Address Family XDP) socket for
@@ -1229,7 +1229,7 @@ static PyMethodDef XdpSenderMethods[] = {
 static struct PyModuleDef xdpsendermodule = {
     PyModuleDef_HEAD_INIT,
     "xdp_sender",
-    "AF_XDP High-Performance Packet Sender for DDoSamurai\n\n"
+    "AF_XDP High-Performance Packet Sender for Samurai\n\n"
     "This module provides high-performance packet transmission using\n"
     "Linux AF_XDP sockets. Works in Copy Mode (SKB/Generic) for\n"
     "maximum compatibility with standard Linux systems.\n\n"

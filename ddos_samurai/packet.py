@@ -1,4 +1,4 @@
-"""Packet utilities for DDoSamurai.
+"""Packet utilities for Samurai.
 
 Contains functions for packet creation, sending, and advanced IP spoofing.
 """

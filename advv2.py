@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
 """
-DDoSamurai v2.0 - Main Entry Point
+Samurai v2.0 - Main Entry Point
 
-This script serves as the primary entry point for the DDoSamurai application.
+This script serves as the primary entry point for the Samurai application.
 It initializes the command-line interface and delegates execution to the
 core application logic within the 'ddos_samur ai' package.
 

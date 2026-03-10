@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SIMPLIFIED COMPREHENSIVE UNIT TESTS - DDoSamurai Full Stack
+SIMPLIFIED COMPREHENSIVE UNIT TESTS - Samurai Full Stack
 Gerçek codebase ile uyumlu, her bir parçayı detaylı kontrol eden testler
 """
 

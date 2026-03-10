@@ -1,10 +1,10 @@
-# Product Guide: DDoSamurai v2.0
+# Product Guide: Samurai v2.0
 
 ## Initial Concept
-DDoSamurai v2.0, ağ güvenliği uzmanları ve sistem yöneticileri için geliştirilmiş, yüksek performanslı, modüler ve gizlilik odaklı bir ağ stres testi ve sızma testi aracıdır. Geleneksel araçların aksine, sadece hacimsel yük oluşturmayı değil, aynı zamanda modern WAF ve IPS sistemlerini atlatmayı (bypass) hedefler.
+Samurai v2.0, ağ güvenliği uzmanları ve sistem yöneticileri için geliştirilmiş, yüksek performanslı, modüler ve gizlilik odaklı bir ağ stres testi ve sızma testi aracıdır. Geleneksel araçların aksine, sadece hacimsel yük oluşturmayı değil, aynı zamanda modern WAF ve IPS sistemlerini atlatmayı (bypass) hedefler.
 
 ## Vision
-Projenin vizyonu, GPU paralelizminin gücünü kullanarak saniyede milyonlarca paket üretebilen, aynı zamanda "Ninja Mode" gibi özelliklerle gerçek bir kullanıcı davranışını taklit ederek tespit edilmesi zor saldırı vektörleri sunan nihai stres testi platformu olmaktır. Hız, gizlilik ve akıllı davranış, DDoSamurai'ın temel taşlarıdır.
+Projenin vizyonu, GPU paralelizminin gücünü kullanarak saniyede milyonlarca paket üretebilen, aynı zamanda "Ninja Mode" gibi özelliklerle gerçek bir kullanıcı davranışını taklit ederek tespit edilmesi zor saldırı vektörleri sunan nihai stres testi platformu olmaktır. Hız, gizlilik ve akıllı davranış, Samurai'ın temel taşlarıdır.
 
 ## Core Features
 *   **High-Performance Packet Generation:**

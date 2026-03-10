@@ -1,4 +1,4 @@
-# AF_XDP Sender & Pacing Engine Build Makefile for DDoSamurai
+# AF_XDP Sender & Pacing Engine Build Makefile for Samurai
 # ============================================================
 #
 # Usage:
@@ -181,7 +181,7 @@ clean:
 # Help
 help:
 	@echo ""
-	@echo "$(BLUE)AF_XDP Build System for DDoSamurai$(NC)"
+	@echo "$(BLUE)AF_XDP Build System for Samurai$(NC)"
 	@echo "====================================="
 	@echo ""
 	@echo "Targets:"

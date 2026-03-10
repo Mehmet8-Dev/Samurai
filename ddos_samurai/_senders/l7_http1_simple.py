@@ -46,7 +46,7 @@ async def http_app_sender(
         headers["User-Agent"] = user_agent
     else:
         headers["User-Agent"] = (
-            random.choice(utils_mod.USER_AGENTS) if hasattr(utils_mod, "USER_AGENTS") else "DDoSamurai/2.0"
+            random.choice(utils_mod.USER_AGENTS) if hasattr(utils_mod, "USER_AGENTS") else "Samurai/2.0"
         )
 
     ok = 0

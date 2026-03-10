@@ -51,7 +51,7 @@ class _H3ClientProtocol(QuicConnectionProtocol):
                 (b":path", str(path or "/").encode()),
                 (b":scheme", b"https"),
                 (b":authority", str(authority or "").encode()),
-                (b"user-agent", b"DDoSamurai/2.0"),
+                (b"user-agent", b"Samurai/2.0"),
             ],
             end_stream=True,
         )

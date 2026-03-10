@@ -1,4 +1,4 @@
-# Tech Stack: DDoSamurai v2.0
+# Tech Stack: Samurai v2.0
 
 ## Programming Languages
 *   **Python:** The core language for orchestration, CLI, logic, and general application flow.

@@ -1,5 +1,5 @@
 """
-DDoSamurai: High-Performance Network Stress Testing Tool
+Samurai: High-Performance Network Stress Testing Tool
 
 Features:
     - GPU-accelerated packet generation (CUDA)
@@ -25,7 +25,7 @@ except Exception:
     conf = None
 
 __version__ = "2.0.0"
-__author__ = "DDoSamurai Team"
+__author__ = "Samurai Team"
 
 # Feature availability flags
 GPU_AVAILABLE = False

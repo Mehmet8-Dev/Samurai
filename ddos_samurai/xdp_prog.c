@@ -1,5 +1,5 @@
 /**
- * XDP Kernel Program for DDoSamurai
+ * XDP Kernel Program for Samurai
  * ==================================
  * 
  * This eBPF/XDP program is loaded into the kernel to redirect

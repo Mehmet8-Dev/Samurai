@@ -1,5 +1,5 @@
 """
-DDoSamurai — RFC Compliance Scoring Suite
+Samurai — RFC Compliance Scoring Suite
 =========================================
 
 Validates packet correctness against:
@@ -649,7 +649,7 @@ class TestZZ_FinalReport(unittest.TestCase):
         r = _ScoreBoard.report()
         print("\n")
         print("╔════════════════════════════════════════════════════════════╗")
-        print("║        DDoSamurai — RFC Compliance Score Report           ║")
+        print("║        Samurai — RFC Compliance Score Report           ║")
         print("╠════════════════════════════════════════════════════════════╣")
         print(f"║  Score:  {r['score']:6.2f} / 100         Grade: {r['grade']:<4s}              ║")
         print(f"║  Passed: {r['passed']:3d} / {r['total']:3d} weighted checks                    ║")

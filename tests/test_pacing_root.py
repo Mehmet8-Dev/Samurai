@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DDoSamurai — Root-Level Pacing Engine Test Suite
+Samurai — Root-Level Pacing Engine Test Suite
 =================================================
 
 Tests that require root (sudo) privileges to exercise:
@@ -525,7 +525,7 @@ def test_accuracy_benchmark():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="DDoSamurai Pacing Engine Root Tests")
+    parser = argparse.ArgumentParser(description="Samurai Pacing Engine Root Tests")
     parser.add_argument("--skip-so-txtime", action="store_true", help="Skip SO_TXTIME test")
     parser.add_argument("--skip-sched", action="store_true", help="Skip SCHED_FIFO test")
     parser.add_argument("--only", type=int, help="Run only test N (1-7)")
@@ -535,7 +535,7 @@ def main():
 
     print(f"""
 {C.BOLD}╔══════════════════════════════════════════════════════════════╗
-║       DDoSamurai — Pacing Engine Root Test Suite             ║
+║       Samurai — Pacing Engine Root Test Suite             ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Root : {'YES ✅' if is_root else 'NO ❌ (some tests will be skipped)':54s}║
 ║  PID  : {os.getpid():<55d}║

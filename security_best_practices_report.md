@@ -1,4 +1,4 @@
-# Security Best Practices Report - DDoSamurai
+# Security Best Practices Report - Samurai
 
 ## Executive Summary
 This repository has a strong functional baseline (JWT auth, password hashing, ownership checks on run/log endpoints), but there are multiple high-impact security risks around secret management, privileged bootstrap, abuse controls, and production hardening. The most urgent issues are insecure JWT secret defaults, first-user-admin bootstrap takeover risk, and unconstrained workload parameters that can be abused for resource exhaustion.
