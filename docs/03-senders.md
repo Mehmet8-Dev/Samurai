@@ -1,229 +1,99 @@
-# 03 - Senders (ddos_samurai/senders.py)
+# 03 - Senders (Strict Facade + Internal Modules)
 
 ## Rol
 
-Sender katmani, "uretilmis bir seyi hedefe iletme" sorumlulugunu tasir.
-Bu, iki ana gruba ayrilir:
+`ddos_samurai/senders.py` artik bir "strict facade" katmanidir.
+Dis API'yi sabit tutar, asil implementasyon ise `ddos_samurai/_senders/*` modullerine dagitilmistir.
 
-- Paket tabanli (L3/L2): Scapy / raw socket / C extension / AF_XDP
-- Uygulama tabanli (L7): c_state engine + Python legacy (httpx/websockets/aioquic)
+Amac:
 
-## Guncel Durum (2026-03-07)
+- dis bagimliliklari ve test monkey-patch noktalarini korumak
+- buyuk/monolith dosya riskini azaltmak
+- L2/L3, L7, stats, runtime import ve context sorumluluklarini ayirmak
 
-L4 tarafinda oncelik artik `dataplane_core` + explicit backend politikasidir.
-L7 tarafinda oncelik `l7.dispatch` ile c_state route edilmis engine yoludur.
+## Public API (Degismeyen Yuzey)
 
-Ana semantik:
+Facade'de korunmus fonksiyonlar:
 
-- Route karari `allow/fail` fallback policy ile birlikte degerlendirilir.
-- Dedicated + strict profilde fallback kapisi kapanir.
-- Sonuc metrikleri `sender_path`, `sender_fallback_reason`, `l7_engine_path_used`, `quic_stack_mode` alanlariyla rapora tasinir.
+- `send_packet_async`, `packet_sender`
+- `get_gateway_info`, `xdp_sender`, `raw_socket_sender`, `paced_raw_socket_sender`
+- `http_app_sender`, `http_stateful_sender`, `http2_sender`
+- `websocket_sender`, `websocket_scenario_sender`
+- `quic_sender`
+- `slow_attack_sender`, `amplification_sender`
+- `close_sender_context`
 
-## CPU Paket Sender (Scapy)
+Korunan patch/test noktalarindan ornekler:
 
-- `packet_sender(packet_config, count, delay, rps, jitter, ramp, verbose)`
-  - Her iterasyonda `packet_utils.create_packet(cfg)` cagrilir.
-  - Fragmentation aciksa `scapy.fragment()` ile paket listeye genisler.
-  - `send_packet_async` ile thread executor uzerinden gonderilir.
+- `FAST_SENDER_AVAILABLE`, `HTTPX_AVAILABLE`, `WEBSOCKETS_AVAILABLE`, `AIOQUIC_AVAILABLE`, `HYPER_H2_AVAILABLE`
+- `_estimate_paced_packets`, `_apply_pacing_stats`, `_scapy`
 
-Not: Fragmentation karari builder'da degil sender'da uygulanir (builder tek paket dondurur).
+## Icerik Haritasi (`_senders/*`)
 
-## Raw Socket Sender (L3/L2 Fast Path)
+| Modul | Sorumluluk |
+|---|---|
+| `_senders/runtime.py` | Lazy import, backend/fallback policy resolve, opsiyonel bagimlilik yukleme |
+| `_senders/stats_core.py` | `_stats`, pacing/loss metrikleri, normalize/merge yardimcilari |
+| `_senders/buffer_norm.py` | GPU/CPU buffer normalize ve pinned-copy yardimcilari |
+| `_senders/context.py` | sender context lifecycle (`close_sender_context`) |
+| `_senders/l2l3_entry.py` | `get_gateway_info`, `xdp_sender` giris noktalari |
+| `_senders/l2l3_raw.py` | `raw_socket_sender`, `paced_raw_socket_sender` ve L2/L3 fallback zinciri |
+| `_senders/l7_http1_simple.py` | HTTP/1.1 legacy/simple sender |
+| `_senders/l7_http1_stateful.py` | HTTP stateful sender (VU/workflow) |
+| `_senders/l7_http2.py` | HTTP/2 sender (c_state route + python/hyper-h2) |
+| `_senders/l7_ws_simple.py` | Basit websocket sender |
+| `_senders/l7_ws_scenario.py` | Stateful websocket scenario sender |
+| `_senders/l7_quic.py` | QUIC sender (native/bridge/legacy route semantigi) |
+| `_senders/legacy_packet.py` | Scapy tabanli packet sender yollari |
+| `_senders/legacy_attacks.py` | slow-* ve amplification legacy akislari |
 
-- `raw_socket_sender(packets_buffer, target_ip, target_port, count, verbose, ..., force_l2=False)`
-  - Varsa once worker context icindeki `dataplane_session.send_batch(...)` cagrilir.
-  - Batch dataplane core tarafinda handle edilirse Python zinciri calistirilmaz.
-  - `socket.SOCK_RAW` uzerinden L3 gonderim (genelde root ister).
-  - Varsa `fast_sender` C eklentisi ile hizli gonderim:
-    - `send_ring_optimized`: L2 TX_RING (Ether header gerekir)
-    - `send_optimized`: L3 sendmmsg benzeri hizlandirma
-  - Yoksa Python `sendmmsg` veya `sendto` fallback.
+Not: `senders.py` facade bu modulleri cagirirken log/stats/runtime bagimliliklarini parametre olarak enjekte eder.
 
-`force_l2=True` davranisi:
+## L2/L3 Akis Ozeti
 
-- L2 yolu kullanilamazsa sessiz L3 fallback yapmaz.
-- `sender_path=L2_UNAVAILABLE` ile fail-visible sonuc doner.
+`raw_socket_sender` ve `paced_raw_socket_sender`:
 
-Fallback zinciri (ozet):
+1. policy (`sender_backend`, `sender_fallback_policy`) normalize edilir
+2. varsa dataplane session yolu denenir
+3. L2/L3 hizli yollar sirayla denenir (TX_RING, C_EXT_L3, Python)
+4. sonuc `_stats` semasi ile normalize edilip doner
 
-1. `dataplane_core` (enable ise)
-2. `TX_RING_L2`
-3. `C_EXT_L3`
-4. `PYTHON_SENDMMSG`/`PYTHON_SENDTO`
+Temel gozlemlenebilirlik alanlari:
 
-`sender_fallback_policy=fail` oldugunda zincir erken kesilir.
+- `sender_path`, `sender_fallback_reason`, `fallback_count`
+- `permission_error_count`
+- pacing aktifse `actual_rps`, `rate_accuracy_pct`, `jitter_p99_ns`
+- TX_RING/PACKET istatistik alanlari (flush counters, tp_packets/tp_drops, vb.)
 
-`packets_buffer` beklenen format:
+## L7 Akis Ozeti
 
-- Birden fazla paketin ardarda dizildigi "contiguous bytes buffer"
-- `packet_size = len(buffer) // count` varsayimi ile dilimlenir.
+L7 sender fonksiyonlari facade'de kalir, fakat uygulama `_senders/l7_*` dosyalarinda:
 
-Bu sebeple GPU tarafinda paketlerin sabit boyda uretilmesi kritik.
+- `http_stateful_sender`, `http2_sender`, `websocket_scenario_sender`, `quic_sender`
+  once `l7.dispatch` + `l7.c_adapter` ile route edilir
+- profile/capability kurali fallback'i kisitlayabilir (`l7_capability_strict`, dedicated profile)
+- QUIC icin `l7_quic_require_native=true` oldugunda native disi yollar fail-visible olur
 
-## AF_XDP Sender
+## AF_XDP ve Raw Backend Iliskisi
 
-- `xdp_sender(...)` fonksiyonu AF_XDP uygun degilse `raw_socket_sender`'a geri duser.
-- Asil AF_XDP implementasyonu `ddos_samurai/af_xdp_sender.py` icindedir.
+- `xdp_sender` giris noktasi `_senders/l2l3_entry.py` icindedir
+- AF_XDP uygun degilse policy'ye gore raw sender'a geri doner
+- runtime bagimliliklar (`XDP_AVAILABLE`, `XDPSender`, `check_xdp_available`) facade'den enjekte edilir
 
-## L7 Sender'lar
+## Context ve Kaynak Yonetimi
 
-- HTTP/1.1: `http_app_sender` (httpx)
-- HTTP/1.1 Stateful: `http_stateful_sender` (VirtualUser pool)
-- HTTP/2: `http2_sender` (`httpx` veya `hyper-h2`)
-- WebSocket: `websocket_sender` (websockets)
-- WebSocket Stateful Scenario: `websocket_scenario_sender` (auth -> subscribe -> ping/pong)
-- QUIC/HTTP3: `quic_sender` (aioquic)
-- Slow-* akislari: `slow_attack_sender` (baglanti/soket davranisi)
+- Public kapanis fonksiyonu: `senders.close_sender_context(...)`
+- implementasyon: `_senders/context.py`
+- amac: persistent sender/dataplane kaynaklarini worker kapanisinda deterministik temizlemek
 
-Guncel route modeli:
+## Katki Kurallari (Yeni Yapi)
 
-- `http_stateful_sender`, `websocket_scenario_sender`, `http2_sender`, `quic_sender`
-  once `l7.dispatch` + `l7.c_adapter` ile c_state yolunu dener.
-- `l7_capability_strict=true` veya dedicated profile altinda Python fallback kapatilabilir.
-- QUIC icin `l7_quic_require_native` etkinse py bridge kabul edilmez.
-
-Bu akislarda profil semantigi aciktir:
-
-- TLS profili: `tls_profile` -> orchestrator tarafinda `stealth.create_ja3_context(...)`
-- HTTP/2 profili: `h2_profile` -> `h2_mimic.apply_h2_profile(...)`
-
-`h2_profile=none` ise profil uygulanmaz ve sender istatistiklerinde gorunur:
-
-- `h2_profile_disabled`
-- `h2_profile_applied`
-- `h2_profile_apply_failed`
-
-Ek HTTP/2 transport metri gi:
-
-- `h2_transport=httpx|hyper-h2`
-
-### HTTP/2 Transport Secimi (Faz 3)
-
-`http2_sender` icinde iki yol vardir:
-
-1. `hyper-h2` yolu
-   - Profil ayarlari gercek transport seviyesinde uygulanir.
-   - `h2_profile_applied=1` ve `h2_transport=hyper-h2` doner.
-   - Hata durumunda:
-     - `h2_transport=hyper-h2` zorlandiysa fail-visible cikis
-     - `auto` modda `httpx` fallback
-
-2. `httpx` yolu (geri uyum)
-   - Mevcut request-plan / status counter davranisi korunur.
-   - `h2_transport=httpx` olarak raporlanir.
-
-Not: `hyper-h2` implementation detaylari `ddos_samurai/h2_transport.py` icindedir.
-
-Not: C state engine secildiginde HTTP/2 sender route karari Python transporttan once yapilir.
-
-### HTTP Stateful Sender (Faz 2)
-
-`http_stateful_sender`:
-
-- Per-VU workflow zinciri calistirir.
-- Varsayilan chain: `bootstrap -> prefetch -> action`.
-- `run_vu_pool(...)` ile cookie/token/redirect izolasyonu saglar.
-- L7 metrikleri (`session_success_rate`, `cookie_set_apply_rate`, `redirect_follow_ratio`, `retry_success_rate`) stats icinde doner.
-
-### WebSocket Scenario Sender (Faz 3)
-
-`websocket_scenario_sender` adimlari:
-
-1. connect
-2. optional auth message
-3. 0..N subscribe message
-4. ping adimi (`ws_ping_count`)
-5. optional recv/ack (`ws_await_response`)
-
-Ek stats:
-
-- `ws_sessions_ok`
-- `ws_auth_sent`
-- `ws_subscribe_sent`
-- `ws_ping_sent`
-- `ws_pong_received`
-- `ws_scenario_enabled`
-
-C state mode'da ayni senaryo semantigi C engine'e aktarilir; C fail durumunda policy izin verirse Python path'e donulur.
-
-### QUIC Sender (Native/Bridge/Legacy)
-
-`quic_sender` icinde uc durum vardir:
-
-1. C native `h3_stateful` (tercihli)
-2. C route + py bridge (`h3_stateful_py`) sadece policy izin veriyorsa
-3. Python legacy aioquic path
-
-`l7_quic_require_native=true` oldugunda 2 ve 3 kabul edilmez; fail-visible donus uretilir.
-
-## Sender Path Secimi ve Fallback Karar Agaci (trex_path)
-
-`raw_socket_sender` ve `paced_raw_socket_sender` su oncelik sirasini izler:
-
-```
-1. TX_RING_L2 (en hizli)
-   |-- Kosul: fast_sender C extension yuklu + send_ring_optimized mevcut
-   |          + gateway MAC bulundu + MAC uzunlugu 6 byte
-   |-- Not: C extension TX_RING kurulumunda once TPACKET_V3 dener, gerekirse TPACKET_V2'ye otomatik duser
-   |-- Basarisiz olursa -> fallback_count++
-   |
-2. C_EXT_L3 (sendmmsg via C)
-   |-- Kosul: fast_sender C extension yuklu + send_optimized mevcut
-   |-- Basarisiz olursa -> fallback_count++
-   |
-3. PYTHON_SENDMMSG (Python sendmmsg wrapper)
-   |-- Kosul: socket nesnesi sendmmsg destekliyor (Linux)
-   |-- PermissionError -> permission_error_count++
-   |
-4. PYTHON_SENDTO (en yavas fallback)
-   |-- Her paket icin sendto() cagrisi
-   |-- PermissionError -> permission_error_count++
-```
-
-Ek gozlemlenebilirlik:
-
-- `fast_sender.get_ring_info()` ile aktif TX_RING versiyonu (`TPACKET_V3` / `TPACKET_V2`) ve ring boyutlari okunabilir.
-- Bu introspection API sender path ismini degistirmez; `sender_path=TX_RING_L2` semantigi ayni kalir.
-
-### Stats Dict Yeni Alanlari
-
-Her sender donusunde su ek alanlar bulunur:
-
-| Alan | Tip | Aciklama |
-|---|---|---|
-| `sender_path` | string | Kullanilan TX yolu (`TX_RING_L2`, `C_EXT_L3`, `PYTHON_SENDMMSG`, `PYTHON_SENDTO`, `NONE`) |
-| `fallback_count` | int | Kac kez daha yavas bir yola geri donuldugu |
-| `permission_error_count` | int | PermissionError kaynakli hata sayisi |
-
-`sender_path=NONE` durumu: raw socket olusturma asamasinda hata (ornegin PermissionError) olustu, hicbir yol denenmedi.
-
-### Raporlama
-
-Bu alanlar `orchestrator.py` -> `reporting.py` -> run report JSON/MD/Prom zinciri ile disari aktarilir.
-Run report seviyesinde toplanir:
-
-- `sender_paths_used`: `{"TX_RING_L2": 4, "C_EXT_L3": 2}` seklinde worker bazli dagilim
-- `fallback_count`: Toplam fallback sayisi
-- `permission_error_count`: Toplam yetki hatasi
-- `send_success_ratio_pct`: `sent / attempted * 100`
-
-## Pacing V2 Alanlari
-
-`paced_raw_socket_sender` L2/L3 yollarinda ayni semayi dondurur (additive/backward-compatible).
-Ek olarak `force_l2=True` ile L2 zorlamasi desteklenir.
-
-- `actual_rps`
-- `rate_accuracy_pct`
-- `jitter_p99_ns`
-- `ipg_mean_ns`
-- `sleep_calls`
-- `busywait_cycles`
-- `so_txtime_active`
-- `txtime_errors`
-- `txring_flush_enobufs_count`
-- `txring_flush_ebusy_count`
-- `txring_flush_other_errno_count`
-- `txring_flush_last_errno`
-- `txring_flush_last_errno_name`
-- `txring_frame_wait_ns`
-- `txring_poll_count`
+- disaridan cagri semasi degistirilmemeli; degisiklik once facade uyumlulugu uzerinden degerlendirilmeli
+- yeni helper/sorumluluk eklenirse once `_senders/*` icine alinmali
+- `senders.py` icinde is kurali yazmak yerine delege eden ince wrapper tercih edilmeli
+- regresyonlarda oncelikli testler:
+  - `tests/test_senders_import_fallback.py`
+  - `tests/test_senders_facade_runtime_forwarding.py`
+  - `tests/test_senders_http2.py`
+  - `tests/test_senders_pacing_progress.py`
+  - `tests/test_afpacket_hugepage_policy.py`

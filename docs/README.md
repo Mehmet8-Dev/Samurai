@@ -17,7 +17,7 @@ Onemli not:
 1. `docs/00-overview.md`: Sistem genel bakis + veri akisi
 2. `docs/01-cli.md`: CLI ve config birlestirme mantigi
 3. `docs/02-orchestrator.md`: Worker modeli, backend secimi, vektor dispatch
-4. `docs/03-senders.md`: CPU/L7 sender'lar, raw socket/fast path, XDP entegrasyonu
+4. `docs/03-senders.md`: `senders.py` strict facade modeli, `_senders/*` ic modul haritasi, L2/L3-L7 sender akislari
 5. `docs/04-packet-builder.md`: Scapy tabanli paket ureti mi (CPU yolu)
 6. `docs/05-gpu.md`: GPU paket/payload engine (CuPy/Numba) ve template pool yaklasimi
 7. `docs/06-af_xdp-fast_sender.md`: AF_XDP ve fast_sender C eklentileri (konsept + entegrasyon)

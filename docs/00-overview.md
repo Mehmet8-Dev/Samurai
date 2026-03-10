@@ -52,12 +52,11 @@ Detay:
 - Tek bir "args dict" uzerinden backend/vektor secimi
 - Backend'e gore uygun sender/engine cagrisi
 
-### Sender katmani (`ddos_samurai/senders.py`)
+### Sender katmani (`ddos_samurai/senders.py` + `ddos_samurai/_senders/*`)
 
-- CPU tabanli Scapy gonderimi
-- Raw socket gonderimi (Linux'ta hizli yol: sendmmsg / C extension)
-- L7 istek gonderimleri (httpx/websockets/aioquic)
-- AF_XDP entegrasyon noktasi
+- `senders.py`: strict facade (public API + compatibility/patch noktalarini korur)
+- `_senders/*`: asıl implementasyon modulleri (L2/L3, L7, stats, runtime, context)
+- CPU tabanli Scapy, raw socket hizli yollari, L7 sender'lar ve AF_XDP bu ic modullere dagitilmistir
 
 ### Paket/payload ureti mi
 
