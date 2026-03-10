@@ -1,0 +1,1155 @@
+import asyncio
+import errno
+import os
+import socket
+import traceback
+from typing import Any, Dict
+
+
+async def raw_socket_sender(
+    packets_buffer,
+    target_ip,
+    target_port,
+    count,
+    verbose,
+    live_sent=None,
+    live_errors=None,
+    live_progress=None,
+    force_l2=False,
+    sender_backend=None,
+    sender_fallback_policy=None,
+    sender_context: Dict[str, Any] | None = None,
+    xdp_enable: bool = False,
+    xdp_interface: str | None = None,
+    xdp_queue_id: int = 0,
+    *,
+    resolve_sender_backend_fn,
+    resolve_sender_fallback_policy_fn,
+    xdp_sender_fn,
+    normalize_packets_buffer_fn,
+    resolve_loss_iface_fn,
+    take_loss_snapshot_fn,
+    attach_loss_telemetry_fn,
+    update_live_fn,
+    stats_fn,
+    get_gateway_info_fn,
+    FAST_SENDER_AVAILABLE_flag,
+    fast_sender_module,
+    log_info,
+    log_error,
+):
+    """
+    Sends a buffer of pre-created raw packets using a raw socket.
+    Optimized with C extension (fast_sender) or sendmmsg for Linux.
+    """
+    _resolve_sender_backend = resolve_sender_backend_fn
+    _resolve_sender_fallback_policy = resolve_sender_fallback_policy_fn
+    xdp_sender = xdp_sender_fn
+    _normalize_packets_buffer = normalize_packets_buffer_fn
+    _resolve_loss_iface = resolve_loss_iface_fn
+    _take_loss_snapshot = take_loss_snapshot_fn
+    _attach_loss_telemetry = attach_loss_telemetry_fn
+    _update_live = update_live_fn
+    _stats = stats_fn
+    get_gateway_info = get_gateway_info_fn
+    FAST_SENDER_AVAILABLE = bool(FAST_SENDER_AVAILABLE_flag)
+    fast_sender = fast_sender_module
+
+    requested_backend = _resolve_sender_backend(sender_backend)
+    if bool(xdp_enable) and requested_backend == "auto":
+        requested_backend = "xdp"
+    fallback_policy = _resolve_sender_fallback_policy(sender_fallback_policy)
+
+    if requested_backend == "xdp":
+        return await xdp_sender(
+            packets_buffer=packets_buffer,
+            target_ip=target_ip,
+            target_port=target_port,
+            count=count,
+            verbose=verbose,
+            interface=xdp_interface,
+            queue_id=int(xdp_queue_id or 0),
+            sender_fallback_policy=fallback_policy,
+            fallback_backend="auto",
+            sender_context=sender_context,
+        )
+
+    s = None
+    owns_socket = False
+    ctx = sender_context if isinstance(sender_context, dict) else None
+    try:
+        cached_socket = None
+        if isinstance(ctx, dict):
+            cached_socket = ctx.get("raw_socket")
+            if cached_socket is not None and getattr(cached_socket, "fileno", lambda: -1)() < 0:
+                cached_socket = None
+                ctx.pop("raw_socket", None)
+        if cached_socket is not None:
+            s = cached_socket
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+            owns_socket = True
+            if isinstance(ctx, dict):
+                ctx["raw_socket"] = s
+    except PermissionError:
+        log_error("Raw socket creation failed. Please run the script with sudo/root privileges.")
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="NONE",
+            permission_error_count=1,
+            fallback_count=0,
+            sender_fallback_reason="raw_socket_permission_denied",
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=0,
+            buffer_copy_bytes=0,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+    except Exception as e:
+        log_error(f"Failed to create raw socket: {e}")
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="NONE",
+            permission_error_count=0,
+            fallback_count=0,
+            sender_fallback_reason="raw_socket_init_failed",
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=0,
+            buffer_copy_bytes=0,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+
+    _ctx_dp_session = ctx.get("dataplane_session") if isinstance(ctx, dict) else None
+    _has_dp_session = bool(_ctx_dp_session is not None and hasattr(_ctx_dp_session, "send_batch"))
+    log_info(
+        f"Packet sender context initialized. backend={requested_backend}, "
+        f"dataplane_session={'on' if _has_dp_session else 'off'}."
+    )
+
+    packet_size = len(packets_buffer) // count if count > 0 else 0
+    if packet_size == 0 and count > 0:
+        log_error("Packet buffer is empty or count is zero, cannot determine packet size.")
+        if owns_socket and s is not None:
+            s.close()
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="NONE",
+            sender_fallback_reason="invalid_packet_buffer",
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=0,
+            buffer_copy_bytes=0,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+    packets_buffer, normalize_meta = _normalize_packets_buffer(
+        packets_buffer,
+        required_bytes=packet_size * count,
+        pool_key="senders_raw_tx",
+        return_meta=True,
+    )
+
+    sent_total = 0
+    sender_path = "PYTHON_SENDTO"
+    fallback_count = 0
+    fallback_reasons = []
+    permission_error_count = 0
+    eagain_retry_count = 0
+    partial_send_retry_count = 0
+    buffer_copy_count = int(normalize_meta.get("buffer_copy_count", 0) or 0)
+    buffer_copy_bytes = int(normalize_meta.get("buffer_copy_bytes", 0) or 0)
+    txring_flush_call_count = 0
+    txring_flush_error_count = 0
+    txring_flush_eagain_count = 0
+    txring_flush_enobufs_count = 0
+    txring_flush_ebusy_count = 0
+    txring_flush_other_errno_count = 0
+    txring_flush_last_errno = 0
+    txring_flush_last_errno_name = "NONE"
+    txring_frame_wait_ns = 0
+    txring_poll_count = 0
+    flush_mode = "unknown"
+    txring_tp_packets = 0
+    txring_tp_drops = 0
+    txring_tp_freeze_q_cnt = 0
+    txring_packet_version = 0
+    txring_packet_version_name = "TPACKET_UNKNOWN"
+    afpacket_hugepage_mode = "off"
+    afpacket_hugepage_effective = 0
+    afpacket_hugepage_reason = "none"
+    afpacket_hugepage_size_kb = 0
+    afpacket_madvise_hugepage_ok = 0
+    afpacket_mlock_ok = 0
+    afpacket_prefault_pages = 0
+    afpacket_smaps_kernel_page_kb = 0
+    afpacket_smaps_anon_hugepages_kb = 0
+    afpacket_ring_block_size = 0
+    afpacket_ring_block_nr = 0
+    afpacket_ring_size_bytes = 0
+    txring_batch_target = 0
+    txring_backoff_ns = 0
+    buffer_reuse_hits = 0
+
+    def _register_fallback(reason: str) -> None:
+        nonlocal fallback_count
+        fallback_count += 1
+        r = str(reason or "").strip()
+        if r and r not in fallback_reasons:
+            fallback_reasons.append(r)
+
+    loss_iface_hint = _resolve_loss_iface(None)
+    loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
+
+    allow_fallback = fallback_policy == "allow"
+    dp_hot_path_only = bool(isinstance(ctx, dict) and ctx.get("dataplane_hot_path_only", False))
+    dp_open_error = ""
+    if isinstance(ctx, dict):
+        dp_open_error = str(ctx.get("dataplane_open_error", "") or "").strip()
+
+    dp_session = ctx.get("dataplane_session") if isinstance(ctx, dict) else None
+    if dp_session is not None and hasattr(dp_session, "send_batch"):
+        dp_out = None
+        try:
+            dp_out = dp_session.send_batch(
+                packets_buffer=packets_buffer,
+                packet_size=packet_size,
+                count=count,
+                target_ip=target_ip,
+                target_port=target_port,
+            )
+        except Exception as e:
+            _register_fallback(f"dataplane_exception:{type(e).__name__}")
+            if dp_hot_path_only:
+                if owns_socket and s is not None:
+                    s.close()
+                _update_live(live_progress, int(count))
+                _update_live(live_errors, int(count))
+                return _stats(
+                    attempted=count,
+                    sent=0,
+                    errors=count,
+                    sender_path="DP_SEND_FAILED",
+                    permission_error_count=0,
+                    fallback_count=max(1, int(fallback_count)),
+                    sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "dataplane_exception",
+                    sender_backend_requested=requested_backend,
+                    sender_fallback_policy=fallback_policy,
+                    buffer_copy_count=buffer_copy_count,
+                    buffer_copy_bytes=buffer_copy_bytes,
+                    eagain_retry_count=0,
+                    partial_send_retry_count=0,
+                )
+        if dp_out is not None:
+            if hasattr(dp_out, "to_stats"):
+                dp_stats = dict(dp_out.to_stats() or {})
+            elif isinstance(dp_out, dict):
+                dp_stats = dict(dp_out or {})
+            else:
+                dp_stats = {}
+            dp_attempted = int(dp_stats.get("attempted", count) or count)
+            dp_sent = int(dp_stats.get("sent", 0) or 0)
+            dp_errors = int(dp_stats.get("errors", max(0, dp_attempted - dp_sent)) or 0)
+            dp_reason = str(dp_stats.get("sender_fallback_reason", "none") or "none").strip()
+            if dp_reason and dp_reason.lower() != "none":
+                _register_fallback(dp_reason)
+            if owns_socket and s is not None:
+                s.close()
+            _update_live(live_progress, int(dp_attempted))
+            _update_live(live_sent, int(dp_sent))
+            _update_live(live_errors, int(max(dp_errors, dp_attempted - dp_sent)))
+            out = _stats(
+                attempted=dp_attempted,
+                sent=dp_sent,
+                errors=max(dp_errors, dp_attempted - dp_sent),
+                bytes_sent_est=int(
+                    dp_stats.get("bytes_sent_est", int(dp_sent) * int(max(0, int(packet_size or 0)))) or 0
+                ),
+                sender_path=str(dp_stats.get("sender_path", "DP_CORE") or "DP_CORE"),
+                fallback_count=max(int(dp_stats.get("fallback_count", 0) or 0), int(fallback_count or 0)),
+                sender_fallback_reason=(
+                    ";".join(fallback_reasons) if fallback_reasons else str(dp_reason or "none")
+                ),
+                sender_backend_requested=requested_backend,
+                sender_fallback_policy=fallback_policy,
+                buffer_copy_count=buffer_copy_count,
+                buffer_copy_bytes=buffer_copy_bytes,
+                eagain_retry_count=0,
+                partial_send_retry_count=0,
+            )
+            for k, v in dp_stats.items():
+                if k in {"attempted", "sent", "errors", "bytes_sent_est"}:
+                    continue
+                if isinstance(v, bool):
+                    out[k] = int(v)
+                elif isinstance(v, (int, float, str)):
+                    out[k] = v
+            return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
+    elif dp_hot_path_only:
+        if owns_socket and s is not None:
+            s.close()
+        _update_live(live_progress, int(count))
+        _update_live(live_errors, int(count))
+        reason = dp_open_error or "dataplane_session_missing"
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="DP_UNAVAILABLE",
+            permission_error_count=0,
+            fallback_count=1,
+            sender_fallback_reason=reason,
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=buffer_copy_count,
+            buffer_copy_bytes=buffer_copy_bytes,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+
+    try_txring = bool(force_l2) or requested_backend in {"auto", "txring"}
+    try_c_ext_l3 = requested_backend in {"auto", "txring", "c_ext_l3"}
+    try_python = requested_backend in {"auto", "txring", "c_ext_l3", "python"}
+    if not allow_fallback:
+        if requested_backend in {"auto", "txring"}:
+            try_c_ext_l3 = False
+            try_python = False
+        elif requested_backend == "c_ext_l3":
+            try_python = False
+
+    if bool(force_l2) and not FAST_SENDER_AVAILABLE:
+        _register_fallback("txring_unavailable")
+        if not allow_fallback:
+            if owns_socket and s is not None:
+                s.close()
+            _update_live(live_progress, int(count))
+            _update_live(live_errors, int(count))
+            return _stats(
+                attempted=count,
+                sent=0,
+                errors=count,
+                sender_path="L2_UNAVAILABLE",
+                permission_error_count=0,
+                fallback_count=fallback_count,
+                sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "txring_unavailable",
+                sender_backend_requested=requested_backend,
+                sender_fallback_policy=fallback_policy,
+                buffer_copy_count=buffer_copy_count,
+                buffer_copy_bytes=buffer_copy_bytes,
+                eagain_retry_count=0,
+                partial_send_retry_count=0,
+            )
+
+    if FAST_SENDER_AVAILABLE and try_txring and hasattr(fast_sender, "send_ring_optimized"):
+        try:
+            iface, gateway_mac = get_gateway_info(target_ip)
+            if iface and gateway_mac:
+                if not str(os.environ.get("SAMURAI_LOSS_IFACE", "") or "").strip():
+                    loss_iface_hint = str(iface)
+                    loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
+                if len(gateway_mac) != 6:
+                    log_error(f"Invalid MAC address length: {len(gateway_mac)} (expected 6)")
+                    _register_fallback("txring_invalid_gateway_mac")
+                else:
+                    log_info(f"[TX_RING] Starting zero-copy L2 send with MAC: {gateway_mac.hex()}")
+                    if hasattr(fast_sender, "send_ring_optimized_ex"):
+                        tx_result = fast_sender.send_ring_optimized_ex(
+                            iface, packets_buffer, packet_size, count, gateway_mac
+                        )
+                        if isinstance(tx_result, dict):
+                            sent = int(tx_result.get("sent", 0) or 0)
+                            _tx_reason = str(tx_result.get("sender_fallback_reason", "none") or "none").strip()
+                            if _tx_reason and _tx_reason.lower() != "none":
+                                _register_fallback(_tx_reason)
+                            fallback_count = max(int(fallback_count or 0), int(tx_result.get("fallback_count", 0) or 0))
+                            txring_flush_call_count += int(tx_result.get("txring_flush_call_count", 0) or 0)
+                            txring_flush_error_count += int(tx_result.get("txring_flush_error_count", 0) or 0)
+                            txring_flush_eagain_count += int(tx_result.get("txring_flush_eagain_count", 0) or 0)
+                            txring_flush_enobufs_count += int(tx_result.get("txring_flush_enobufs_count", 0) or 0)
+                            txring_flush_ebusy_count += int(tx_result.get("txring_flush_ebusy_count", 0) or 0)
+                            txring_flush_other_errno_count += int(tx_result.get("txring_flush_other_errno_count", 0) or 0)
+                            txring_flush_last_errno = int(tx_result.get("txring_flush_last_errno", 0) or 0)
+                            txring_flush_last_errno_name = str(
+                                tx_result.get("txring_flush_last_errno_name", "NONE") or "NONE"
+                            )
+                            txring_frame_wait_ns += int(tx_result.get("txring_frame_wait_ns", 0) or 0)
+                            txring_poll_count += int(tx_result.get("txring_poll_count", 0) or 0)
+                            _tx_flush_mode = str(tx_result.get("flush_mode", "") or "").strip()
+                            if _tx_flush_mode:
+                                if flush_mode in ("", "unknown"):
+                                    flush_mode = _tx_flush_mode
+                                elif flush_mode != _tx_flush_mode:
+                                    flush_mode = "mixed"
+                            txring_tp_packets += int(tx_result.get("txring_tp_packets", 0) or 0)
+                            txring_tp_drops += int(tx_result.get("txring_tp_drops", 0) or 0)
+                            txring_tp_freeze_q_cnt += int(tx_result.get("txring_tp_freeze_q_cnt", 0) or 0)
+                            txring_packet_version = int(tx_result.get("txring_packet_version", 0) or 0)
+                            txring_packet_version_name = str(
+                                tx_result.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN"
+                            )
+                            afpacket_hugepage_mode = str(tx_result.get("afpacket_hugepage_mode", afpacket_hugepage_mode) or afpacket_hugepage_mode)
+                            afpacket_hugepage_effective = int(
+                                tx_result.get("afpacket_hugepage_effective", afpacket_hugepage_effective) or afpacket_hugepage_effective
+                            )
+                            afpacket_hugepage_reason = str(
+                                tx_result.get("afpacket_hugepage_reason", afpacket_hugepage_reason) or afpacket_hugepage_reason
+                            )
+                            afpacket_hugepage_size_kb = int(
+                                tx_result.get("afpacket_hugepage_size_kb", afpacket_hugepage_size_kb) or afpacket_hugepage_size_kb
+                            )
+                            afpacket_madvise_hugepage_ok = int(
+                                tx_result.get("afpacket_madvise_hugepage_ok", afpacket_madvise_hugepage_ok) or afpacket_madvise_hugepage_ok
+                            )
+                            afpacket_mlock_ok = int(tx_result.get("afpacket_mlock_ok", afpacket_mlock_ok) or afpacket_mlock_ok)
+                            afpacket_prefault_pages += int(tx_result.get("afpacket_prefault_pages", 0) or 0)
+                            afpacket_smaps_kernel_page_kb = max(
+                                int(afpacket_smaps_kernel_page_kb or 0), int(tx_result.get("afpacket_smaps_kernel_page_kb", 0) or 0)
+                            )
+                            afpacket_smaps_anon_hugepages_kb = max(
+                                int(afpacket_smaps_anon_hugepages_kb or 0), int(tx_result.get("afpacket_smaps_anon_hugepages_kb", 0) or 0)
+                            )
+                            afpacket_ring_block_size = max(
+                                int(afpacket_ring_block_size or 0), int(tx_result.get("afpacket_ring_block_size", 0) or 0)
+                            )
+                            afpacket_ring_block_nr = max(
+                                int(afpacket_ring_block_nr or 0), int(tx_result.get("afpacket_ring_block_nr", 0) or 0)
+                            )
+                            afpacket_ring_size_bytes = max(
+                                int(afpacket_ring_size_bytes or 0), int(tx_result.get("afpacket_ring_size_bytes", 0) or 0)
+                            )
+                            txring_batch_target = int(tx_result.get("txring_batch_target", 0) or 0)
+                            txring_backoff_ns += int(tx_result.get("txring_backoff_ns", 0) or 0)
+                        else:
+                            sent = int(tx_result or 0)
+                    else:
+                        sent = int(fast_sender.send_ring_optimized(iface, packets_buffer, packet_size, count, gateway_mac) or 0)
+                    log_info(f"Fast Sender (TX_RING L2) finished. Sent {sent} packets via {iface}.")
+                    if owns_socket and s is not None:
+                        s.close()
+                    sent_total = int(sent or 0)
+                    _update_live(live_progress, count)
+                    _update_live(live_sent, sent_total)
+                    _update_live(live_errors, max(0, count - sent_total))
+                    out = _stats(
+                        attempted=count,
+                        sent=sent_total,
+                        errors=max(0, count - sent_total),
+                        bytes_sent_est=sent_total * packet_size,
+                        sender_path="TX_RING_L2",
+                        permission_error_count=0,
+                        fallback_count=fallback_count,
+                        sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "none",
+                        sender_backend_requested=requested_backend,
+                        sender_fallback_policy=fallback_policy,
+                        buffer_copy_count=buffer_copy_count,
+                        buffer_copy_bytes=buffer_copy_bytes,
+                        eagain_retry_count=eagain_retry_count,
+                        partial_send_retry_count=partial_send_retry_count,
+                        buffer_reuse_hits=buffer_reuse_hits,
+                        txring_flush_call_count=txring_flush_call_count,
+                        txring_flush_error_count=txring_flush_error_count,
+                        txring_flush_eagain_count=txring_flush_eagain_count,
+                        txring_flush_enobufs_count=txring_flush_enobufs_count,
+                        txring_flush_ebusy_count=txring_flush_ebusy_count,
+                        txring_flush_other_errno_count=txring_flush_other_errno_count,
+                        txring_flush_last_errno=txring_flush_last_errno,
+                        txring_flush_last_errno_name=txring_flush_last_errno_name,
+                        txring_frame_wait_ns=txring_frame_wait_ns,
+                        txring_poll_count=txring_poll_count,
+                        flush_mode=flush_mode,
+                        txring_tp_packets=txring_tp_packets,
+                        txring_tp_drops=txring_tp_drops,
+                        txring_tp_freeze_q_cnt=txring_tp_freeze_q_cnt,
+                        txring_packet_version=txring_packet_version,
+                        txring_packet_version_name=txring_packet_version_name,
+                        afpacket_hugepage_mode=afpacket_hugepage_mode,
+                        afpacket_hugepage_effective=afpacket_hugepage_effective,
+                        afpacket_hugepage_reason=afpacket_hugepage_reason,
+                        afpacket_hugepage_size_kb=afpacket_hugepage_size_kb,
+                        afpacket_madvise_hugepage_ok=afpacket_madvise_hugepage_ok,
+                        afpacket_mlock_ok=afpacket_mlock_ok,
+                        afpacket_prefault_pages=afpacket_prefault_pages,
+                        afpacket_smaps_kernel_page_kb=afpacket_smaps_kernel_page_kb,
+                        afpacket_smaps_anon_hugepages_kb=afpacket_smaps_anon_hugepages_kb,
+                        afpacket_ring_block_size=afpacket_ring_block_size,
+                        afpacket_ring_block_nr=afpacket_ring_block_nr,
+                        afpacket_ring_size_bytes=afpacket_ring_size_bytes,
+                        txring_batch_target=txring_batch_target,
+                        txring_backoff_ns=txring_backoff_ns,
+                    )
+                    return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
+            else:
+                _register_fallback("txring_gateway_not_found")
+                if verbose:
+                    log_error("Gateway MAC not found for TX_RING, falling back to L3.")
+        except Exception as e:
+            _register_fallback("txring_error")
+            if verbose:
+                log_error(f"TX_RING failed, falling back to L3: {e}")
+    elif try_txring and requested_backend == "txring":
+        _register_fallback("txring_unavailable")
+
+    if requested_backend == "auto" and (not allow_fallback) and fallback_count > 0:
+        if owns_socket and s is not None:
+            s.close()
+        _update_live(live_progress, int(count))
+        _update_live(live_errors, int(count))
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="AUTO_PRIMARY_FAILED",
+            permission_error_count=0,
+            fallback_count=max(1, fallback_count),
+            sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "auto_primary_failed",
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=buffer_copy_count,
+            buffer_copy_bytes=buffer_copy_bytes,
+            eagain_retry_count=eagain_retry_count,
+            partial_send_retry_count=partial_send_retry_count,
+            buffer_reuse_hits=buffer_reuse_hits,
+        )
+
+    if bool(force_l2) or requested_backend == "txring":
+        if not allow_fallback:
+            if owns_socket and s is not None:
+                s.close()
+            _update_live(live_progress, int(count))
+            _update_live(live_errors, int(count))
+            return _stats(
+                attempted=count,
+                sent=0,
+                errors=count,
+                sender_path="L2_UNAVAILABLE",
+                permission_error_count=0,
+                fallback_count=max(1, fallback_count),
+                sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "l2_unavailable",
+                sender_backend_requested=requested_backend,
+                sender_fallback_policy=fallback_policy,
+                buffer_copy_count=buffer_copy_count,
+                buffer_copy_bytes=buffer_copy_bytes,
+                eagain_retry_count=eagain_retry_count,
+                partial_send_retry_count=partial_send_retry_count,
+                buffer_reuse_hits=buffer_reuse_hits,
+            )
+        try_c_ext_l3 = True
+        try_python = True
+
+    if FAST_SENDER_AVAILABLE and try_c_ext_l3 and hasattr(fast_sender, "send_optimized"):
+        try:
+            cext_result = fast_sender.send_optimized(
+                s.fileno(), packets_buffer, target_ip, target_port, packet_size, count
+            )
+            if isinstance(cext_result, dict):
+                sent = int(cext_result.get("sent", 0) or 0)
+                eagain_retry_count += int(cext_result.get("eagain_retry_count", 0) or 0)
+                partial_send_retry_count += int(cext_result.get("partial_send_retry_count", 0) or 0)
+            else:
+                sent = int(cext_result or 0)
+            log_info(f"Fast Sender (C Ext L3) finished. Sent {sent} packets.")
+            if owns_socket and s is not None:
+                s.close()
+            sent_total = sent
+            _update_live(live_progress, count)
+            _update_live(live_sent, sent_total)
+            _update_live(live_errors, max(0, count - sent_total))
+            out = _stats(
+                attempted=count,
+                sent=sent_total,
+                errors=max(0, count - sent_total),
+                bytes_sent_est=sent_total * packet_size,
+                sender_path="C_EXT_L3",
+                permission_error_count=0,
+                fallback_count=fallback_count,
+                sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "none",
+                sender_backend_requested=requested_backend,
+                sender_fallback_policy=fallback_policy,
+                buffer_copy_count=buffer_copy_count,
+                buffer_copy_bytes=buffer_copy_bytes,
+                eagain_retry_count=eagain_retry_count,
+                partial_send_retry_count=partial_send_retry_count,
+                buffer_reuse_hits=buffer_reuse_hits,
+            )
+            return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
+        except Exception as e:
+            _register_fallback("c_ext_l3_error")
+            log_error(f"Fast Sender failed, falling back to Python: {e}")
+    elif try_c_ext_l3 and requested_backend == "c_ext_l3":
+        _register_fallback("c_ext_l3_unavailable")
+        if not allow_fallback:
+            if owns_socket and s is not None:
+                s.close()
+            _update_live(live_progress, int(count))
+            _update_live(live_errors, int(count))
+            return _stats(
+                attempted=count,
+                sent=0,
+                errors=count,
+                sender_path="C_EXT_UNAVAILABLE",
+                permission_error_count=0,
+                fallback_count=max(1, fallback_count),
+                sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "c_ext_l3_unavailable",
+                sender_backend_requested=requested_backend,
+                sender_fallback_policy=fallback_policy,
+                buffer_copy_count=buffer_copy_count,
+                buffer_copy_bytes=buffer_copy_bytes,
+                eagain_retry_count=eagain_retry_count,
+                partial_send_retry_count=partial_send_retry_count,
+                buffer_reuse_hits=buffer_reuse_hits,
+            )
+
+    if not try_python:
+        _register_fallback("python_sender_disabled")
+        if owns_socket and s is not None:
+            s.close()
+        _update_live(live_progress, int(count))
+        _update_live(live_errors, int(count))
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="PYTHON_DISABLED",
+            permission_error_count=permission_error_count,
+            fallback_count=max(1, fallback_count),
+            sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "python_sender_disabled",
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=buffer_copy_count,
+            buffer_copy_bytes=buffer_copy_bytes,
+            eagain_retry_count=eagain_retry_count,
+            partial_send_retry_count=partial_send_retry_count,
+            buffer_reuse_hits=buffer_reuse_hits,
+        )
+
+    try:
+        log_info(f"Raw socket sender (Python L3) active. Sending {count} packets...")
+        mv = memoryview(packets_buffer)
+        BATCH_SIZE = 512
+        address = (target_ip, target_port)
+        total_sent = 0
+
+        if hasattr(s, "sendmmsg"):
+            sender_path = "PYTHON_SENDMMSG"
+            prebuilt_datagrams = None
+            reuse_sendmmsg = str(os.environ.get("SAMURAI_SENDMMSG_REUSE", "1") or "1").strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+            try:
+                max_reuse_count = int(os.environ.get("SAMURAI_SENDMMSG_REUSE_MAX", "131072") or 131072)
+            except Exception:
+                max_reuse_count = 131072
+            if reuse_sendmmsg and 0 < count <= max_reuse_count:
+                try:
+                    packet_views = [mv[(idx * packet_size) : ((idx + 1) * packet_size)] for idx in range(count)]
+                    prebuilt_datagrams = [(pkt_view, []) for pkt_view in packet_views]
+                    buffer_reuse_hits += 1
+                except Exception:
+                    prebuilt_datagrams = None
+
+            for i in range(0, count, BATCH_SIZE):
+                batch_end = min(i + BATCH_SIZE, count)
+                batch_count = batch_end - i
+                if prebuilt_datagrams is not None:
+                    datagrams = prebuilt_datagrams[i:batch_end]
+                else:
+                    datagrams = []
+                    for j in range(batch_count):
+                        idx = i + j
+                        start = idx * packet_size
+                        end = start + packet_size
+                        datagrams.append((mv[start:end], []))
+
+                batch_progress = 0
+                batch_index = 0
+                consecutive_eagain = 0
+                while batch_index < batch_count:
+                    pending = batch_count - batch_index
+                    try:
+                        sent_msgs = s.sendmmsg(datagrams[batch_index:], 0, address)
+                        sent_msgs = int(sent_msgs or 0)
+                        if sent_msgs <= 0:
+                            eagain_retry_count += 1
+                            consecutive_eagain += 1
+                            if consecutive_eagain >= 1024:
+                                _update_live(live_errors, pending)
+                                batch_progress += pending
+                                batch_index = batch_count
+                            continue
+
+                        total_sent += sent_msgs
+                        batch_index += sent_msgs
+                        batch_progress += sent_msgs
+                        _update_live(live_sent, sent_msgs)
+                        consecutive_eagain = 0
+                        if sent_msgs < pending:
+                            partial_send_retry_count += 1
+                    except PermissionError:
+                        permission_error_count += 1
+                        _update_live(live_errors, pending)
+                        batch_progress += pending
+                        batch_index = batch_count
+                    except OSError as exc:
+                        if exc.errno == errno.EINTR:
+                            continue
+                        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                            eagain_retry_count += 1
+                            consecutive_eagain += 1
+                            if consecutive_eagain >= 1024:
+                                _update_live(live_errors, pending)
+                                batch_progress += pending
+                                batch_index = batch_count
+                            continue
+                        _update_live(live_errors, pending)
+                        batch_progress += pending
+                        batch_index = batch_count
+                    except Exception:
+                        _update_live(live_errors, pending)
+                        batch_progress += pending
+                        batch_index = batch_count
+
+                _update_live(live_progress, batch_progress)
+                if verbose and total_sent % 10000 < BATCH_SIZE:
+                    log_info(f"Sent {total_sent}/{count} raw packets (sendmmsg)...")
+        else:
+            sender_path = "PYTHON_SENDTO"
+            for i in range(count):
+                _update_live(live_progress, 1)
+                start = i * packet_size
+                end = start + packet_size
+                try:
+                    s.sendto(mv[start:end], address)
+                    total_sent += 1
+                    _update_live(live_sent, 1)
+                except PermissionError:
+                    permission_error_count += 1
+                    _update_live(live_errors, 1)
+                except Exception:
+                    _update_live(live_errors, 1)
+                if verbose and i % 10000 == 0:
+                    log_info(f"Sent {i}/{count} raw packets...")
+        sent_total = int(total_sent)
+
+    except Exception as e:
+        log_error(f"Error during raw socket sending: {e}")
+        if verbose:
+            traceback.print_exc()
+    finally:
+        if owns_socket and s is not None:
+            s.close()
+        if FAST_SENDER_AVAILABLE and hasattr(fast_sender, "cleanup_ring"):
+            fast_sender.cleanup_ring()
+        log_info(f"Raw socket sender (Python L3) finished sending {count} packets.")
+    out = _stats(
+        attempted=count,
+        sent=sent_total,
+        errors=max(0, count - sent_total),
+        bytes_sent_est=sent_total * packet_size,
+        sender_path=sender_path,
+        permission_error_count=permission_error_count,
+        fallback_count=fallback_count,
+        sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "none",
+        sender_backend_requested=requested_backend,
+        sender_fallback_policy=fallback_policy,
+        buffer_copy_count=buffer_copy_count,
+        buffer_copy_bytes=buffer_copy_bytes,
+        eagain_retry_count=eagain_retry_count,
+        partial_send_retry_count=partial_send_retry_count,
+        buffer_reuse_hits=buffer_reuse_hits,
+        txring_flush_call_count=txring_flush_call_count,
+        txring_flush_error_count=txring_flush_error_count,
+        txring_flush_eagain_count=txring_flush_eagain_count,
+        txring_flush_enobufs_count=txring_flush_enobufs_count,
+        txring_flush_ebusy_count=txring_flush_ebusy_count,
+        txring_flush_other_errno_count=txring_flush_other_errno_count,
+        txring_flush_last_errno=txring_flush_last_errno,
+        txring_flush_last_errno_name=txring_flush_last_errno_name,
+        txring_frame_wait_ns=txring_frame_wait_ns,
+        txring_poll_count=txring_poll_count,
+        flush_mode=flush_mode,
+        txring_tp_packets=txring_tp_packets,
+        txring_tp_drops=txring_tp_drops,
+        txring_tp_freeze_q_cnt=txring_tp_freeze_q_cnt,
+        txring_packet_version=txring_packet_version,
+        txring_packet_version_name=txring_packet_version_name,
+        txring_batch_target=txring_batch_target,
+        txring_backoff_ns=txring_backoff_ns,
+    )
+    return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
+
+
+async def paced_raw_socket_sender(
+    packets_buffer,
+    target_ip,
+    target_port,
+    count,
+    verbose,
+    pacing_config=None,
+    force_l2=False,
+    live_sent=None,
+    live_errors=None,
+    live_progress=None,
+    sender_backend=None,
+    sender_fallback_policy=None,
+    sender_context: Dict[str, Any] | None = None,
+    xdp_enable: bool = False,
+    xdp_interface: str | None = None,
+    xdp_queue_id: int = 0,
+    *,
+    resolve_sender_backend_fn,
+    resolve_sender_fallback_policy_fn,
+    xdp_sender_fn,
+    raw_socket_sender_fn,
+    normalize_packets_buffer_fn,
+    resolve_loss_iface_fn,
+    take_loss_snapshot_fn,
+    attach_loss_telemetry_fn,
+    update_live_fn,
+    stats_fn,
+    apply_pacing_stats_fn,
+    run_paced_send_with_live_progress_fn,
+    PacedSendRuntimeError_cls,
+    get_gateway_info_fn,
+    FAST_SENDER_AVAILABLE_flag,
+    PACING_ENGINE_AVAILABLE_flag,
+    reset_stats_fn,
+    paced_send_l2_fn,
+    paced_send_fn,
+    get_stats_fn,
+    format_stats_fn,
+    cleanup_l2_fn,
+    log_info,
+    log_error,
+    log_warning,
+):
+    _resolve_sender_backend = resolve_sender_backend_fn
+    _resolve_sender_fallback_policy = resolve_sender_fallback_policy_fn
+    xdp_sender = xdp_sender_fn
+    raw_socket_sender = raw_socket_sender_fn
+    _normalize_packets_buffer = normalize_packets_buffer_fn
+    _resolve_loss_iface = resolve_loss_iface_fn
+    _take_loss_snapshot = take_loss_snapshot_fn
+    _attach_loss_telemetry = attach_loss_telemetry_fn
+    _update_live = update_live_fn
+    _stats = stats_fn
+    _apply_pacing_stats = apply_pacing_stats_fn
+    _run_paced_send_with_live_progress = run_paced_send_with_live_progress_fn
+    _PacedSendRuntimeError = PacedSendRuntimeError_cls
+    get_gateway_info = get_gateway_info_fn
+    FAST_SENDER_AVAILABLE = bool(FAST_SENDER_AVAILABLE_flag)
+    PACING_ENGINE_AVAILABLE = bool(PACING_ENGINE_AVAILABLE_flag)
+    reset_stats = reset_stats_fn
+    paced_send_l2 = paced_send_l2_fn
+    paced_send = paced_send_fn
+    get_stats = get_stats_fn
+    format_stats = format_stats_fn
+    cleanup_l2 = cleanup_l2_fn
+
+    requested_backend = _resolve_sender_backend(sender_backend)
+    if bool(xdp_enable) and requested_backend == "auto":
+        requested_backend = "xdp"
+    fallback_policy = _resolve_sender_fallback_policy(sender_fallback_policy)
+
+    if requested_backend == "xdp":
+        if pacing_config is not None and int(getattr(pacing_config, "pacing_mode", 0) or 0) != 0:
+            log_warning("[Pacing] sender-backend=xdp selected; C pacing is bypassed for this path.")
+        return await xdp_sender(
+            packets_buffer=packets_buffer,
+            target_ip=target_ip,
+            target_port=target_port,
+            count=count,
+            verbose=verbose,
+            interface=xdp_interface,
+            queue_id=int(xdp_queue_id or 0),
+            sender_fallback_policy=fallback_policy,
+            fallback_backend="python",
+            sender_context=sender_context,
+        )
+
+    if pacing_config is None or pacing_config.pacing_mode == 0 or not PACING_ENGINE_AVAILABLE:
+        return await raw_socket_sender(
+            packets_buffer,
+            target_ip,
+            target_port,
+            count,
+            verbose,
+            live_sent=live_sent,
+            live_errors=live_errors,
+            live_progress=live_progress,
+            force_l2=force_l2,
+            sender_backend=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            sender_context=sender_context,
+            xdp_enable=xdp_enable,
+            xdp_interface=xdp_interface,
+            xdp_queue_id=xdp_queue_id,
+        )
+
+    packet_size = len(packets_buffer) // count if count > 0 else 0
+    if packet_size == 0:
+        log_error("[Pacing] Invalid packet buffer (size=0)")
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_fallback_reason="invalid_packet_buffer",
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=0,
+            buffer_copy_bytes=0,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+    packets_buffer, normalize_meta = _normalize_packets_buffer(
+        packets_buffer,
+        required_bytes=packet_size * count,
+        pool_key="senders_pacing_tx",
+        return_meta=True,
+    )
+    buffer_copy_count = int(normalize_meta.get("buffer_copy_count", 0) or 0)
+    buffer_copy_bytes = int(normalize_meta.get("buffer_copy_bytes", 0) or 0)
+    loss_iface_hint = _resolve_loss_iface(None)
+    loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
+    progress_reported = 0
+    fallback_count = 0
+    fallback_reasons = []
+
+    def _register_fallback(reason: str) -> None:
+        nonlocal fallback_count
+        fallback_count += 1
+        r = str(reason or "").strip()
+        if r and r not in fallback_reasons:
+            fallback_reasons.append(r)
+
+    log_info(
+        f"[Pacing] C engine: mode={pacing_config.pacing_mode.name}, "
+        f"rps={pacing_config.target_rps:.0f}, ipg={pacing_config.ipg_ns}ns, "
+        f"burst={pacing_config.burst_size}, jitter={pacing_config.jitter_model.name} "
+        f"±{pacing_config.jitter_pct*100:.0f}%"
+    )
+
+    if FAST_SENDER_AVAILABLE and requested_backend in {"auto", "txring"}:
+        try:
+            iface, gateway_mac = get_gateway_info(target_ip)
+            if iface and gateway_mac and len(gateway_mac) == 6:
+                if not str(os.environ.get("SAMURAI_LOSS_IFACE", "") or "").strip():
+                    loss_iface_hint = str(iface)
+                    loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
+                log_info(f"[Pacing] Using L2 paced sender on {iface}")
+                try:
+                    if callable(reset_stats):
+                        reset_stats()
+                except Exception:
+                    pass
+                progress_budget = max(0, int(count) - int(progress_reported))
+                try:
+                    sent, progress_emitted = await _run_paced_send_with_live_progress(
+                        lambda: paced_send_l2(
+                            iface,
+                            packets_buffer,
+                            packet_size,
+                            count,
+                            gateway_mac,
+                            config=pacing_config,
+                        ),
+                        pacing_config=pacing_config,
+                        progress_budget=progress_budget,
+                        live_progress=live_progress,
+                    )
+                    progress_reported += int(progress_emitted)
+                except _PacedSendRuntimeError as exc:
+                    progress_reported += int(exc.progress_emitted)
+                    raise exc.cause
+                stats = get_stats()
+                if stats:
+                    log_info(
+                        f"[Pacing] L2 done: {sent:,} pkts, "
+                        f"rate={stats.get('actual_rps',0):,.0f} pps, "
+                        f"accuracy={stats.get('rate_accuracy_pct',0):.1f}%, "
+                        f"jitter_p99={stats.get('jitter_p99_ns',0):,.0f}ns"
+                    )
+                    if verbose:
+                        log_info(f"\n{format_stats(stats)}")
+                cleanup_l2()
+                progress_tail = max(0, int(count) - int(progress_reported))
+                _update_live(live_progress, progress_tail)
+                progress_reported += int(progress_tail)
+                _update_live(live_sent, int(sent or 0))
+                _update_live(live_errors, max(0, count - int(sent or 0)))
+
+                out = _stats(
+                    attempted=count,
+                    sent=int(sent or 0),
+                    errors=max(0, count - int(sent or 0)),
+                    bytes_sent_est=int(sent or 0) * packet_size,
+                    sender_path="PACED_L2",
+                    fallback_count=fallback_count,
+                    sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "none",
+                    sender_backend_requested=requested_backend,
+                    sender_fallback_policy=fallback_policy,
+                    buffer_copy_count=buffer_copy_count,
+                    buffer_copy_bytes=buffer_copy_bytes,
+                    eagain_retry_count=0,
+                    partial_send_retry_count=0,
+                )
+                if stats:
+                    out = _apply_pacing_stats(out, stats)
+                return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
+            else:
+                _register_fallback("paced_l2_gateway_not_found")
+        except Exception as e:
+            try:
+                cleanup_l2()
+            except Exception:
+                pass
+            _register_fallback("paced_l2_error")
+            if verbose:
+                log_error(f"[Pacing] L2 paced send failed, falling back to L3: {e}")
+
+    if bool(force_l2) or (requested_backend == "txring" and fallback_policy == "fail"):
+        _update_live(live_progress, int(count))
+        _update_live(live_errors, int(count))
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="L2_UNAVAILABLE",
+            fallback_count=max(1, fallback_count),
+            sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "l2_unavailable",
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=buffer_copy_count,
+            buffer_copy_bytes=buffer_copy_bytes,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+
+    if requested_backend == "python":
+        _register_fallback("pacing_bypassed_for_python_backend")
+        return await raw_socket_sender(
+            packets_buffer,
+            target_ip,
+            target_port,
+            count,
+            verbose,
+            live_sent=live_sent,
+            live_errors=live_errors,
+            live_progress=live_progress,
+            force_l2=force_l2,
+            sender_backend="python",
+            sender_fallback_policy=fallback_policy,
+            sender_context=sender_context,
+            xdp_enable=xdp_enable,
+            xdp_interface=xdp_interface,
+            xdp_queue_id=xdp_queue_id,
+        )
+
+    try:
+        log_info("[Pacing] Using L3 paced sender")
+        try:
+            if callable(reset_stats):
+                reset_stats()
+        except Exception:
+            pass
+        progress_budget = max(0, int(count) - int(progress_reported))
+        try:
+            sent, progress_emitted = await _run_paced_send_with_live_progress(
+                lambda: paced_send(
+                    packets_buffer,
+                    target_ip,
+                    target_port,
+                    packet_size,
+                    count,
+                    config=pacing_config,
+                ),
+                pacing_config=pacing_config,
+                progress_budget=progress_budget,
+                live_progress=live_progress,
+            )
+            progress_reported += int(progress_emitted)
+        except _PacedSendRuntimeError as exc:
+            progress_reported += int(exc.progress_emitted)
+            raise exc.cause
+        stats = get_stats()
+        progress_tail = max(0, int(count) - int(progress_reported))
+        _update_live(live_progress, progress_tail)
+        progress_reported += int(progress_tail)
+        _update_live(live_sent, int(sent or 0))
+        _update_live(live_errors, max(0, count - int(sent or 0)))
+
+        out = _stats(
+            attempted=count,
+            sent=int(sent or 0),
+            errors=max(0, count - int(sent or 0)),
+            bytes_sent_est=int(sent or 0) * packet_size,
+            sender_path="PACED_L3",
+            fallback_count=fallback_count,
+            sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "none",
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=buffer_copy_count,
+            buffer_copy_bytes=buffer_copy_bytes,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+        if stats:
+            out = _apply_pacing_stats(out, stats)
+        return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
+    except PermissionError:
+        log_error("[Pacing] Raw socket requires root. Falling back to unpaced.")
+        fallback_live_progress = None if progress_reported > 0 else live_progress
+        out = await raw_socket_sender(
+            packets_buffer,
+            target_ip,
+            target_port,
+            count,
+            verbose,
+            live_sent=live_sent,
+            live_errors=live_errors,
+            live_progress=fallback_live_progress,
+            force_l2=force_l2,
+            sender_backend=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            sender_context=sender_context,
+            xdp_enable=xdp_enable,
+            xdp_interface=xdp_interface,
+            xdp_queue_id=xdp_queue_id,
+        )
+        if progress_reported > 0:
+            _update_live(live_progress, max(0, int(count) - int(progress_reported)))
+        return out
+    except Exception as e:
+        log_error(f"[Pacing] L3 paced send failed: {e}. Falling back to unpaced.")
+        fallback_live_progress = None if progress_reported > 0 else live_progress
+        out = await raw_socket_sender(
+            packets_buffer,
+            target_ip,
+            target_port,
+            count,
+            verbose,
+            live_sent=live_sent,
+            live_errors=live_errors,
+            live_progress=fallback_live_progress,
+            force_l2=force_l2,
+            sender_backend=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            sender_context=sender_context,
+            xdp_enable=xdp_enable,
+            xdp_interface=xdp_interface,
+            xdp_queue_id=xdp_queue_id,
+        )
+        if progress_reported > 0:
+            _update_live(live_progress, max(0, int(count) - int(progress_reported)))
+        return out
+
