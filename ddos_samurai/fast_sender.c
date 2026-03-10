@@ -621,11 +621,14 @@ static void apply_txring_hugepage_policy(ring_context_t* ctx) {
 
     if (madvise_rc == 0) {
         (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "hinted_not_realized");
-    } else {
-        (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "madvise_failed");
+        return;
     }
-    if (g_txring_hp_policy.mlock_ring && mlock_rc != 0) {
-        (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "mlock_failed");
+
+    {
+        (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "madvise_failed");
+        if (g_txring_hp_policy.mlock_ring && mlock_rc != 0) {
+            (void)snprintf(rt->reason, sizeof(rt->reason), "%s", "mlock_failed");
+        }
     }
 }
 
