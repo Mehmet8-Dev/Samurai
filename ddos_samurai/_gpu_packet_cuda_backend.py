@@ -225,10 +225,18 @@ _SYNC_SYMBOLS = [
     "amplification_kernel_v2",
 ]
 
+
+def _safe_legacy_getattr(name: str, default: Any = None):
+    try:
+        return getattr(_legacy, name)
+    except Exception:
+        return default
+
+
 # Preserve original legacy symbol bindings so facade monkeypatching can
 # deterministically disable native path even if sync helpers overwrite legacy.
 _LEGACY_BASE_SYMBOLS = {
-    name: getattr(_legacy, name, None)
+    name: _safe_legacy_getattr(name, None)
     for name in _SYNC_SYMBOLS
 }
 
@@ -261,7 +269,7 @@ def _temporary_synced_legacy_symbols():
     for name in _SYNC_SYMBOLS:
         if not hasattr(facade, name):
             continue
-        previous[name] = getattr(_legacy, name, None)
+        previous[name] = _safe_legacy_getattr(name, None)
         try:
             setattr(_legacy, name, getattr(facade, name))
         except Exception:
