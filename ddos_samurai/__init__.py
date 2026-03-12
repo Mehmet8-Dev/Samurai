@@ -24,7 +24,7 @@ except Exception:
     # Scapy may fail to initialize in restricted/sandboxed environments.
     conf = None
 
-__version__ = "2.0.0"
+__version__ = "Ronin"
 __author__ = "Samurai Team"
 
 # Feature availability flags

@@ -1,4 +1,4 @@
-# AF_XDP Entegrasyonu - Samurai v2.0 🚀
+# AF_XDP Entegrasyonu - Samurai (Ronin) 🚀
 
 Bu belge, Samurai'nin yeni **AF_XDP** (Address Family XDP) entegrasyonunu açıklar.
 

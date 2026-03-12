@@ -1,5 +1,5 @@
 """
-AF_XDP High-Performance Sender Module for Samurai v2.0
+AF_XDP High-Performance Sender Module for Samurai (Ronin)
 =====================================================
 
 This module provides a high-level Python interface for the AF_XDP C extension,

@@ -1,5 +1,7 @@
 # 00 - Genel Bakis
 
+Release modeli: `Samurai (Ronin)`
+
 ## Hedef
 
 Samurai, farkli "attack vector" (L4 ve L7) akislari icin ortak bir calistirma modeli sunar:

@@ -1,4 +1,4 @@
-# Samurai Documentation Index
+# Samurai (Ronin) Documentation Index
 
 Bu dizin, kod tabanini "modul modul" ve gelistirici dostu sekilde anlatan ic dokumantasyondur.
 Amac:
@@ -11,6 +11,10 @@ Onemli not:
 
 - Bu proje yalnizca yetkili/test ortamlarinda kullanilmalidir.
 - Dokumantasyon, mimari ve gelistirme odaklidir; operasyonel "saldiri nasil yapilir" tarzi yonlendirme amaclamaz.
+
+Release notu:
+
+- Mevcut release modeli: `Samurai (Ronin)`.
 
 ## Icerik
 

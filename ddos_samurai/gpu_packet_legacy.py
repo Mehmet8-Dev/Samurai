@@ -1,4 +1,4 @@
-"""GPU Packet Generation Module for Samurai v2.0
+"""GPU Packet Generation Module for Samurai (Ronin)
 
 This module provides high-performance GPU-accelerated packet generation
 using CUDA kernels via Numba and CuPy.

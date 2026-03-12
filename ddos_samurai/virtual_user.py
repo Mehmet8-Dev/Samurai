@@ -1,5 +1,5 @@
 """
-VirtualUser (VU) Engine — Per-User Isolated L7 Session State | Samurai v2.0
+VirtualUser (VU) Engine — Per-User Isolated L7 Session State | Samurai (Ronin)
 Each VirtualUser maintains its own:
   - Cookie jar (httpx.Cookies)
   - Header state (dynamic headers like CSRF tokens)

@@ -1,12 +1,19 @@
-# Samurai v2.0
+# Samurai (Ronin)
 
 Samurai, **yalnizca yetkili ortamlarda** kullanilmak uzere tasarlanmis, moduler bir ag stres ve guvenlik test platformudur.
 
 Proje; tek bir CLI uzerinden CPU/GPU veri yollari, C hizlandirma katmanlari, opsiyonel SaaS API + dashboard ve dis monitoring yiginini birlestirir.
 
+## Release Model
+
+- Mevcut release: `Samurai (Ronin)`.
+- Test vektorleri: L4/L3 (TCP/UDP/ICMP/PCAP) ve L7 (HTTP/HTTP2/WebSocket/QUIC), ayrica slow/anomaly/amplification senaryolari.
+- Performans odagi: C hizlandirma + opsiyonel CUDA ile yuksek PPS ve daha stabil pacing/TX pipeline.
+
 ## Durum Ozeti
 
 - Mimari: Python + C extension + opsiyonel CUDA + FastAPI + React
+- Release: `Ronin`
 - Olgunluk: Guclu teknik beta / pilot-ready
 - Odak: Yetkili ortamlarda L4/L7 yuk testi, davranis testi, gozlemlenebilirlik
 

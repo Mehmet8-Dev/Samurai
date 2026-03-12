@@ -1,4 +1,4 @@
-"""Anomaly Packet Generation Module for Samurai v2.0
+"""Anomaly Packet Generation Module for Samurai (Ronin)
 
 GPU-accelerated generation of anomalous/malformed packets for IDS/IPS/WAF
 stress testing and security validation.

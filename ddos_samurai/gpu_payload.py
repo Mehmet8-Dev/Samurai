@@ -1,4 +1,4 @@
-"""GPU Payload Generation Module for Samurai v2.0
+"""GPU Payload Generation Module for Samurai (Ronin)
 
 This module provides high-performance GPU-accelerated HTTP payload generation
 using CUDA kernels for L7 attack simulation.

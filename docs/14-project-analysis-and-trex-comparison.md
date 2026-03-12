@@ -1,6 +1,6 @@
 # Samurai — Detaylı Proje Analizi ve Cisco TRex Karşılaştırması
 
-Bu doküman Samurai v2.0 projesinin kapsamlı analizini ve Cisco TRex ile detaylı karşılaştırma/puanlamasını içerir.
+Bu doküman Samurai (Ronin) projesinin kapsamlı analizini ve Cisco TRex ile detaylı karşılaştırma/puanlamasını içerir.
 
 ## Guncel Durum Ozeti (2026-03-07)
 
@@ -38,7 +38,7 @@ Not:
 - **Hedef kitle:** Güvenlik testçileri, DevOps/SRE, stres testi ekipleri
 - **Kullanım:** Yalnızca yetkili sistemlerde (allowlist, etik uyarı mekanizması)
 - **Lisans:** MIT
-- **Sürüm:** 2.0.0
+- **Release modeli:** Ronin
 
 ---
 
