@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import contextlib
 from typing import Any
 
 from . import gpu_packet_legacy as _legacy
@@ -59,6 +60,9 @@ def _resolve_backend() -> tuple[str, Any]:
 
 ACTIVE_GPU_PACKET_BACKEND, _ACTIVE_BACKEND = _resolve_backend()
 
+# Backward-compatibility for tests and callers that introspect legacy internals.
+_CONST_FINGERPRINTS = getattr(_legacy, "_CONST_FINGERPRINTS", {})
+
 
 # Keep monkeypatch-based legacy tests compatible after facade split.
 # These symbols are patched on ddos_samurai.gpu_packet in existing tests.
@@ -78,29 +82,42 @@ _SYNC_SYMBOLS = [
 ]
 
 
-def _sync_legacy_compat() -> None:
+@contextlib.contextmanager
+def _temporary_synced_legacy_symbols():
     if _legacy is None:
+        yield
         return
     g = globals()
+    previous = {}
     for name in _SYNC_SYMBOLS:
-        if name in g:
+        if name not in g:
+            continue
+        previous[name] = getattr(_legacy, name, None)
+        try:
+            setattr(_legacy, name, g[name])
+        except Exception:
+            pass
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
             try:
-                setattr(_legacy, name, g[name])
+                setattr(_legacy, name, value)
             except Exception:
                 pass
 
 
 def _backend_call(name: str, *args, **kwargs):
     if ACTIVE_GPU_PACKET_BACKEND == "legacy":
-        _sync_legacy_compat()
-        return getattr(_legacy, name)(*args, **kwargs)
+        with _temporary_synced_legacy_symbols():
+            return getattr(_legacy, name)(*args, **kwargs)
 
     fn = getattr(_ACTIVE_BACKEND, name, None)
     if callable(fn):
         return fn(*args, **kwargs)
 
-    _sync_legacy_compat()
-    return getattr(_legacy, name)(*args, **kwargs)
+    with _temporary_synced_legacy_symbols():
+        return getattr(_legacy, name)(*args, **kwargs)
 
 
 def get_active_backend_name() -> str:
@@ -204,8 +221,8 @@ def get_gpu_info() -> dict:
 
 def _update_gpu_constant(*args, **kwargs):
     # Compatibility: tests patch template_kernel on this facade.
-    _sync_legacy_compat()
-    return _legacy._update_gpu_constant(*args, **kwargs)
+    with _temporary_synced_legacy_symbols():
+        return _legacy._update_gpu_constant(*args, **kwargs)
 
 
 def is_gpu_available() -> bool:

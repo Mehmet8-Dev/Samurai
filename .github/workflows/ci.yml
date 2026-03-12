@@ -23,6 +23,7 @@ jobs:
       SAMURAI_BENCH_UPDATE_BASELINE: "0"
       SAMURAI_BENCH_REPORT_OUT: "${{ github.workspace }}/artifacts/benchmark_summary.json"
       SAMURAI_PARITY_PROFILE: "ci_safe"
+      SAMURAI_SKIP_CUDA_BUILD: "1"
 
     steps:
       - name: Checkout

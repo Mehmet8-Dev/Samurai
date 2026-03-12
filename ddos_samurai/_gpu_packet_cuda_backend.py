@@ -7,6 +7,7 @@ optional native path via ``libgpu_packet_cuda.so`` C ABI.
 from __future__ import annotations
 
 import ctypes
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -14,7 +15,28 @@ from typing import Any
 
 import numpy as np
 
-from . import gpu_packet_legacy as _legacy
+try:
+    from . import gpu_packet_legacy as _legacy
+    _LEGACY_IMPORT_ERROR: Exception | None = None
+except ModuleNotFoundError as exc:
+    _LEGACY_IMPORT_ERROR = exc
+
+    class _LegacyShim:
+        class GPUPacketError(RuntimeError):
+            pass
+
+        class GPUMemoryError(GPUPacketError):
+            pass
+
+        cp = np
+
+        def __getattr__(self, name: str):
+            raise ModuleNotFoundError(
+                "gpu_packet_legacy is unavailable (missing optional CUDA Python "
+                f"dependencies): {_LEGACY_IMPORT_ERROR}"
+            ) from _LEGACY_IMPORT_ERROR
+
+    _legacy = _LegacyShim()
 
 
 _LIB_PATH = Path(__file__).with_name("libgpu_packet_cuda.so")
@@ -203,6 +225,13 @@ _SYNC_SYMBOLS = [
     "amplification_kernel_v2",
 ]
 
+# Preserve original legacy symbol bindings so facade monkeypatching can
+# deterministically disable native path even if sync helpers overwrite legacy.
+_LEGACY_BASE_SYMBOLS = {
+    name: getattr(_legacy, name, None)
+    for name in _SYNC_SYMBOLS
+}
+
 
 def _sync_facade_patches_to_legacy() -> None:
     facade = sys.modules.get("ddos_samurai.gpu_packet")
@@ -216,9 +245,46 @@ def _sync_facade_patches_to_legacy() -> None:
                 pass
 
 
+@contextlib.contextmanager
+def _temporary_synced_legacy_symbols():
+    """Temporarily mirror facade monkeypatches onto legacy symbols.
+
+    Tests patch symbols on ``ddos_samurai.gpu_packet``. Legacy calls should
+    observe those patches, but mutations must not leak into subsequent tests.
+    """
+    facade = sys.modules.get("ddos_samurai.gpu_packet")
+    if facade is None:
+        yield
+        return
+
+    previous = {}
+    for name in _SYNC_SYMBOLS:
+        if not hasattr(facade, name):
+            continue
+        previous[name] = getattr(_legacy, name, None)
+        try:
+            setattr(_legacy, name, getattr(facade, name))
+        except Exception:
+            pass
+
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            try:
+                setattr(_legacy, name, value)
+            except Exception:
+                pass
+
+
 def _call_legacy(name: str, *args, **kwargs):
-    _sync_facade_patches_to_legacy()
-    return getattr(_legacy, name)(*args, **kwargs)
+    if _LEGACY_IMPORT_ERROR is not None:
+        raise ModuleNotFoundError(
+            "Legacy CUDA Python backend is unavailable because optional "
+            f"dependencies are missing: {_LEGACY_IMPORT_ERROR}"
+        ) from _LEGACY_IMPORT_ERROR
+    with _temporary_synced_legacy_symbols():
+        return getattr(_legacy, name)(*args, **kwargs)
 
 
 def _last_error() -> str:
@@ -320,7 +386,9 @@ def _native_ready() -> bool:
     for name in _SYNC_SYMBOLS:
         if not hasattr(facade, name):
             continue
-        if getattr(facade, name) is not getattr(_legacy, name, None):
+        # Compare against original legacy bindings (not mutable current values)
+        # so sync calls done by compatibility helpers do not re-enable native.
+        if getattr(facade, name) is not _LEGACY_BASE_SYMBOLS.get(name):
             return False
     return True
 

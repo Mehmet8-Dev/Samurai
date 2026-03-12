@@ -175,6 +175,10 @@ class OptionalBuildExt(build_ext):
                 raise
 
     def _build_cuda_module(self) -> None:
+        if _env_flag("SAMURAI_SKIP_CUDA_BUILD", "0"):
+            print("\nInfo: SAMURAI_SKIP_CUDA_BUILD=1; skipping gpu_packet_cuda.cu build.\n")
+            return
+
         project_root = os.path.abspath(os.path.dirname(__file__))
         src_path = os.path.join(project_root, "ddos_samurai", "gpu_packet_cuda.cu")
         if not os.path.exists(src_path):
