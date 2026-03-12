@@ -12,6 +12,7 @@ import ctypes.util
 import os
 import platform
 import shlex
+import shutil
 import subprocess
 from typing import Dict, List, Tuple
 
@@ -159,6 +160,10 @@ def _dedupe(seq: List[str]) -> List[str]:
 class OptionalBuildExt(build_ext):
     """Custom build_ext that makes XDP extension optional."""
 
+    def run(self):
+        super().run()
+        self._build_cuda_module()
+
     def build_extension(self, ext):
         try:
             super().build_extension(ext)
@@ -168,6 +173,68 @@ class OptionalBuildExt(build_ext):
                 print("XDP functionality will not be available.\n")
             else:
                 raise
+
+    def _build_cuda_module(self) -> None:
+        project_root = os.path.abspath(os.path.dirname(__file__))
+        src_path = os.path.join(project_root, "ddos_samurai", "gpu_packet_cuda.cu")
+        if not os.path.exists(src_path):
+            return
+
+        nvcc = str(os.environ.get("SAMURAI_NVCC", "") or "").strip()
+        if not nvcc:
+            nvcc = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+        if not os.path.exists(nvcc):
+            print("\nWarning: nvcc not found; skipping gpu_packet_cuda.cu build.\n")
+            return
+
+        cuda_home = str(os.environ.get("CUDA_HOME", "") or "").strip()
+        if not cuda_home:
+            cuda_home = os.path.dirname(os.path.dirname(nvcc))
+        cuda_include = os.path.join(cuda_home, "include")
+
+        build_temp = os.path.abspath(self.build_temp or os.path.join(project_root, "build", "temp"))
+        os.makedirs(build_temp, exist_ok=True)
+
+        if bool(getattr(self, "inplace", False)):
+            out_dir = os.path.join(project_root, "ddos_samurai")
+        else:
+            out_dir = os.path.join(os.path.abspath(self.build_lib), "ddos_samurai")
+        os.makedirs(out_dir, exist_ok=True)
+
+        obj_path = os.path.join(build_temp, "gpu_packet_cuda.o")
+        lib_path = os.path.join(out_dir, "libgpu_packet_cuda.so")
+
+        compile_cmd = [
+            nvcc,
+            "-std=c++20",
+            "-O3",
+            "-Xcompiler",
+            "-fPIC",
+            "-diag-suppress=177",
+            "-I",
+            project_root,
+            "-I",
+            cuda_include,
+            "-c",
+            src_path,
+            "-o",
+            obj_path,
+        ]
+        link_cmd = [
+            nvcc,
+            "-shared",
+            obj_path,
+            "-o",
+            lib_path,
+        ]
+
+        try:
+            print(f"\nBuilding CUDA module: {src_path}")
+            subprocess.run(compile_cmd, check=True)
+            subprocess.run(link_cmd, check=True)
+            print(f"Built CUDA library: {lib_path}\n")
+        except subprocess.CalledProcessError as exc:
+            print(f"\nWarning: CUDA module build failed: {exc}\n")
 
 
 def detect_l7_capabilities() -> Dict[str, bool]:

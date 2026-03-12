@@ -613,6 +613,10 @@ def build_live_attack_report(
     wire_loss_raw_packets_total = 0
     wire_loss_raw_uncapped_packets_total = 0
     wire_loss_estimation_capped_total = 0
+    gpu_packet_backend_name = ""
+    gpu_packet_native_enabled_any = 0
+    gpu_packet_native_library_available_any = 0
+    gpu_packet_native_active_any = 0
     gpu_template_h2d_copy_count_total = 0
     gpu_template_h2d_copy_bytes_total = 0
     gpu_rng_state_alloc_count_total = 0
@@ -1048,6 +1052,32 @@ def build_live_attack_report(
         )
         wire_loss_estimation_capped_total += int(
             ev.get("wire_loss_estimation_capped", st.get("wire_loss_estimation_capped", 0)) or 0
+        )
+        _gpu_backend_item = str(
+            ev.get("gpu_packet_backend_name", st.get("gpu_packet_backend_name", "")) or ""
+        ).strip()
+        if _gpu_backend_item:
+            if not gpu_packet_backend_name:
+                gpu_packet_backend_name = _gpu_backend_item
+            elif gpu_packet_backend_name != _gpu_backend_item and gpu_packet_backend_name != "mixed":
+                gpu_packet_backend_name = "mixed"
+        gpu_packet_native_enabled_any = max(
+            int(gpu_packet_native_enabled_any),
+            int(ev.get("gpu_packet_native_enabled", st.get("gpu_packet_native_enabled", 0)) or 0),
+        )
+        gpu_packet_native_library_available_any = max(
+            int(gpu_packet_native_library_available_any),
+            int(
+                ev.get(
+                    "gpu_packet_native_library_available",
+                    st.get("gpu_packet_native_library_available", 0),
+                )
+                or 0
+            ),
+        )
+        gpu_packet_native_active_any = max(
+            int(gpu_packet_native_active_any),
+            int(ev.get("gpu_packet_native_active", st.get("gpu_packet_native_active", 0)) or 0),
         )
         gpu_template_h2d_copy_count_total += int(
             ev.get("gpu_template_h2d_copy_count", st.get("gpu_template_h2d_copy_count", 0)) or 0
@@ -1529,6 +1559,10 @@ def build_live_attack_report(
             "txring_flush_enobufs_ratio_pct": round(float(txring_flush_enobufs_ratio_pct), 4),
             "txring_flush_ebusy_ratio_pct": round(float(txring_flush_ebusy_ratio_pct), 4),
             "txring_flush_other_errno_ratio_pct": round(float(txring_flush_other_errno_ratio_pct), 4),
+            "gpu_packet_backend_name": str(gpu_packet_backend_name),
+            "gpu_packet_native_enabled": int(gpu_packet_native_enabled_any),
+            "gpu_packet_native_library_available": int(gpu_packet_native_library_available_any),
+            "gpu_packet_native_active": int(gpu_packet_native_active_any),
             "gpu_template_h2d_copy_count": int(gpu_template_h2d_copy_count_total),
             "gpu_template_h2d_copy_bytes": int(gpu_template_h2d_copy_bytes_total),
             "gpu_rng_state_alloc_count": int(gpu_rng_state_alloc_count_total),

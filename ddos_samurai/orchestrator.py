@@ -137,6 +137,10 @@ def _empty_stats() -> dict:
         "txring_flush_ebusy_ratio_pct": 0.0,
         "txring_flush_other_errno_ratio_pct": 0.0,
         "sender_path": "",
+        "gpu_packet_backend_name": "",
+        "gpu_packet_native_enabled": 0,
+        "gpu_packet_native_library_available": 0,
+        "gpu_packet_native_active": 0,
         "gpu_template_h2d_copy_count": 0,
         "gpu_template_h2d_copy_bytes": 0,
         "gpu_rng_state_alloc_count": 0,
@@ -365,6 +369,25 @@ def _add_stats(acc: dict, item: dict) -> dict:
             acc["sender_fallback_policy"] = item_sender_fallback_policy
         elif curr_policy != item_sender_fallback_policy and curr_policy != "mixed":
             acc["sender_fallback_policy"] = "mixed"
+    item_gpu_packet_backend_name = str(item.get("gpu_packet_backend_name", "") or "").strip()
+    if item_gpu_packet_backend_name:
+        curr_gpu_backend = str(acc.get("gpu_packet_backend_name", "") or "").strip()
+        if not curr_gpu_backend:
+            acc["gpu_packet_backend_name"] = item_gpu_packet_backend_name
+        elif curr_gpu_backend != item_gpu_packet_backend_name and curr_gpu_backend != "mixed":
+            acc["gpu_packet_backend_name"] = "mixed"
+    acc["gpu_packet_native_enabled"] = max(
+        int(acc.get("gpu_packet_native_enabled", 0) or 0),
+        int(item.get("gpu_packet_native_enabled", 0) or 0),
+    )
+    acc["gpu_packet_native_library_available"] = max(
+        int(acc.get("gpu_packet_native_library_available", 0) or 0),
+        int(item.get("gpu_packet_native_library_available", 0) or 0),
+    )
+    acc["gpu_packet_native_active"] = max(
+        int(acc.get("gpu_packet_native_active", 0) or 0),
+        int(item.get("gpu_packet_native_active", 0) or 0),
+    )
     acc["txring_flush_call_count"] = int(acc.get("txring_flush_call_count", 0)) + int(item.get("txring_flush_call_count", 0) or 0)
     acc["txring_flush_error_count"] = int(acc.get("txring_flush_error_count", 0)) + int(item.get("txring_flush_error_count", 0) or 0)
     acc["txring_flush_eagain_count"] = int(acc.get("txring_flush_eagain_count", 0)) + int(item.get("txring_flush_eagain_count", 0) or 0)
@@ -1080,6 +1103,22 @@ async def worker_process(
             from .utils import get_gateway_mac, mac_to_int
             # numba_cuda is imported above
             import cupy as cp
+
+            try:
+                worker_stats["gpu_packet_backend_name"] = str(
+                    getattr(gpu_packet, "get_active_backend_name", lambda: "unknown")()
+                )
+                worker_stats["gpu_packet_native_enabled"] = int(
+                    bool(getattr(gpu_packet, "is_native_path_enabled", lambda: False)())
+                )
+                worker_stats["gpu_packet_native_library_available"] = int(
+                    bool(getattr(gpu_packet, "is_native_library_available", lambda: False)())
+                )
+                worker_stats["gpu_packet_native_active"] = int(
+                    bool(getattr(gpu_packet, "is_native_path_active", lambda: False)())
+                )
+            except Exception:
+                pass
 
             def _gpu_to_host(gpu_arr, key: str, stream=None, blocking: bool = True):
                 """Copy GPU array to host via shared pinned-memory pool."""
@@ -2941,6 +2980,12 @@ async def worker_process(
                 _txring_flush_other_errno_ratio_pct = float(
                     worker_stats.get("txring_flush_other_errno_ratio_pct", 0.0) or 0.0
                 )
+                _gpu_packet_backend_name = str(worker_stats.get("gpu_packet_backend_name", "") or "")
+                _gpu_packet_native_enabled = int(worker_stats.get("gpu_packet_native_enabled", 0) or 0)
+                _gpu_packet_native_library_available = int(
+                    worker_stats.get("gpu_packet_native_library_available", 0) or 0
+                )
+                _gpu_packet_native_active = int(worker_stats.get("gpu_packet_native_active", 0) or 0)
                 _gpu_template_h2d_copy_count = int(worker_stats.get("gpu_template_h2d_copy_count", 0) or 0)
                 _gpu_template_h2d_copy_bytes = int(worker_stats.get("gpu_template_h2d_copy_bytes", 0) or 0)
                 _gpu_rng_state_alloc_count = int(worker_stats.get("gpu_rng_state_alloc_count", 0) or 0)
@@ -3086,6 +3131,10 @@ async def worker_process(
                         "txring_flush_enobufs_ratio_pct": _txring_flush_enobufs_ratio_pct,
                         "txring_flush_ebusy_ratio_pct": _txring_flush_ebusy_ratio_pct,
                         "txring_flush_other_errno_ratio_pct": _txring_flush_other_errno_ratio_pct,
+                        "gpu_packet_backend_name": _gpu_packet_backend_name,
+                        "gpu_packet_native_enabled": _gpu_packet_native_enabled,
+                        "gpu_packet_native_library_available": _gpu_packet_native_library_available,
+                        "gpu_packet_native_active": _gpu_packet_native_active,
                         "gpu_template_h2d_copy_count": _gpu_template_h2d_copy_count,
                         "gpu_template_h2d_copy_bytes": _gpu_template_h2d_copy_bytes,
                         "gpu_rng_state_alloc_count": _gpu_rng_state_alloc_count,
