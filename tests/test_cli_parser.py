@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 import io
 import os
@@ -5,6 +6,11 @@ from contextlib import redirect_stderr
 from unittest.mock import patch
 
 from ddos_samurai import cli
+
+_SAAS_MODULES_AVAILABLE = (
+    importlib.util.find_spec("ddos_samurai.saas_schemas") is not None
+    and importlib.util.find_spec("ddos_samurai.api") is not None
+)
 
 
 def _all_option_strings(parser):
@@ -698,6 +704,10 @@ class TestRootGateRegression(unittest.TestCase):
         self.assertFalse(cli._is_cuda_raw_vector(args))
 
 
+@unittest.skipUnless(
+    _SAAS_MODULES_AVAILABLE,
+    "SaaS modules removed from this profile; skipping SaaS command mapping tests",
+)
 class TestBuildTestCommandRegression(unittest.TestCase):
     """Regression tests for _build_test_command API->CLI mapping (trex_path Görev #3)."""
 
