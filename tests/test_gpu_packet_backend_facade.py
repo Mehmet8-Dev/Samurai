@@ -1,7 +1,18 @@
 import importlib
+import importlib.util
 import os
 
 import numpy as np
+import pytest
+
+
+_NUMBA_AVAILABLE = importlib.util.find_spec("numba") is not None
+pytestmark = [
+    pytest.mark.skipif(
+        not _NUMBA_AVAILABLE,
+        reason="numba not installed in CI-safe environment; skipping GPU backend facade tests",
+    )
+]
 
 
 class _FakeKernel:
