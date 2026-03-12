@@ -139,6 +139,26 @@ def is_native_path_active() -> bool:
     return bool(fn()) if callable(fn) else False
 
 
+def get_native_policy() -> str:
+    fn = getattr(_ACTIVE_BACKEND, "get_native_policy", None)
+    if callable(fn):
+        try:
+            return str(fn() or "allow")
+        except Exception:
+            return "allow"
+    return "allow"
+
+
+def is_native_policy_require() -> bool:
+    fn = getattr(_ACTIVE_BACKEND, "is_native_policy_require", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+    return False
+
+
 def init_gpu():
     return _backend_call("init_gpu")
 

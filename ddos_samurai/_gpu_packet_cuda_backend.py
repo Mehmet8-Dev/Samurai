@@ -41,6 +41,7 @@ except ModuleNotFoundError as exc:
 
 _LIB_PATH = Path(__file__).with_name("libgpu_packet_cuda.so")
 _NATIVE_ENV = "SAMURAI_GPU_PACKET_CUDA_CPP_NATIVE"
+_NATIVE_POLICY_ENV = "SAMURAI_GPU_PACKET_NATIVE_POLICY"
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -49,6 +50,24 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 _NATIVE_ENABLED = _env_flag(_NATIVE_ENV, "1")
+
+
+def _normalize_native_policy(raw: str | None) -> str:
+    val = str(raw or "allow").strip().lower()
+    aliases = {
+        "strict": "require",
+        "required": "require",
+        "fail": "require",
+        "off": "allow",
+        "auto": "allow",
+    }
+    norm = aliases.get(val, val)
+    if norm in {"allow", "require"}:
+        return norm
+    return "allow"
+
+
+_NATIVE_POLICY = _normalize_native_policy(os.environ.get(_NATIVE_POLICY_ENV, "allow"))
 
 
 def _load_lib() -> ctypes.CDLL | None:
@@ -69,6 +88,7 @@ def _load_lib() -> ctypes.CDLL | None:
         ctypes.c_int64,  # tcp_flags
         ctypes.c_int,  # has_ethernet
         ctypes.c_int64,  # window
+        ctypes.c_uint64,  # stream_handle
         ctypes.c_uint64,  # gateway_mac
         ctypes.c_char_p,  # spoof_subnet
         ctypes.POINTER(ctypes.c_void_p),  # out_data
@@ -84,6 +104,7 @@ def _load_lib() -> ctypes.CDLL | None:
         ctypes.c_char_p,  # real_src_ip
         ctypes.c_int,  # spoof_ip
         ctypes.c_int,  # has_ethernet
+        ctypes.c_uint64,  # stream_handle
         ctypes.c_uint64,  # gateway_mac
         ctypes.c_char_p,  # spoof_subnet
         ctypes.c_int,  # force_global_fallback
@@ -104,6 +125,7 @@ def _load_lib() -> ctypes.CDLL | None:
         ctypes.c_int,  # spoof_ip
         ctypes.c_int64,  # specific_src_port
         ctypes.c_int,  # has_ethernet
+        ctypes.c_uint64,  # stream_handle
         ctypes.c_uint64,  # gateway_mac
         ctypes.c_char_p,  # spoof_subnet
         ctypes.c_int,  # force_global_fallback
@@ -124,6 +146,7 @@ def _load_lib() -> ctypes.CDLL | None:
         ctypes.c_char_p,  # real_src_ip
         ctypes.c_int64,  # specific_src_port
         ctypes.c_int,  # has_ethernet
+        ctypes.c_uint64,  # stream_handle
         ctypes.c_uint64,  # gateway_mac
         ctypes.c_char_p,  # spoof_subnet
         ctypes.POINTER(ctypes.c_uint32),  # seq_list
@@ -159,6 +182,7 @@ def _load_lib() -> ctypes.CDLL | None:
         ctypes.c_int,  # has_ethernet
         ctypes.c_int64,  # frag1_size
         ctypes.c_int64,  # frag2_size
+        ctypes.c_uint64,  # stream_handle
         ctypes.c_uint64,  # gateway_mac
         ctypes.c_char_p,  # spoof_subnet
         ctypes.POINTER(ctypes.c_void_p),  # out_data
@@ -175,6 +199,7 @@ def _load_lib() -> ctypes.CDLL | None:
         ctypes.c_char_p,  # victim_ip
         ctypes.c_int64,  # count
         ctypes.c_int,  # has_ethernet
+        ctypes.c_uint64,  # stream_handle
         ctypes.c_uint64,  # gateway_mac
         ctypes.POINTER(ctypes.c_void_p),  # out_data
         ctypes.POINTER(ctypes.c_size_t),  # out_size
@@ -191,6 +216,7 @@ def _load_lib() -> ctypes.CDLL | None:
         ctypes.c_int64,  # icmp_type
         ctypes.c_int64,  # icmp_code
         ctypes.c_int64,  # payload_size
+        ctypes.c_uint64,  # stream_handle
         ctypes.c_uint64,  # gateway_mac
         ctypes.c_char_p,  # spoof_subnet
         ctypes.POINTER(ctypes.c_void_p),  # out_data
@@ -417,6 +443,66 @@ def is_native_path_active() -> bool:
     return bool(_native_ready())
 
 
+def get_native_policy() -> str:
+    return str(_NATIVE_POLICY)
+
+
+def is_native_policy_require() -> bool:
+    return str(_NATIVE_POLICY) == "require"
+
+
+def _fallback_to_legacy_allowed() -> bool:
+    return not is_native_policy_require()
+
+
+def _extract_stream_handle(stream: Any) -> int | None:
+    if stream is None:
+        return 0
+    if isinstance(stream, (int, np.integer)):
+        h = int(stream)
+        return h if h >= 0 else None
+    for attr in ("ptr", "cuda_stream", "handle"):
+        if hasattr(stream, attr):
+            try:
+                h = int(getattr(stream, attr))
+                return h if h >= 0 else None
+            except Exception:
+                pass
+    nested = getattr(stream, "stream", None)
+    if nested is not None and nested is not stream:
+        return _extract_stream_handle(nested)
+    return None
+
+
+def _resolve_stream_handle(op_name: str, stream) -> int:
+    h = _extract_stream_handle(stream)
+    if h is not None:
+        return int(h)
+    if not _fallback_to_legacy_allowed():
+        _raise_native_policy_violation(
+            op_name,
+            stream=stream,
+            reason_override="stream object cannot be converted to cudaStream_t handle",
+        )
+    return -1
+
+
+def _raise_native_policy_violation(op_name: str, *, stream=None, reason_override: str | None = None):
+    if reason_override:
+        reason = reason_override
+    elif _LIB is None:
+        reason = "native library unavailable"
+    elif not _NATIVE_ENABLED:
+        reason = "native path disabled by env"
+    elif stream is not None:
+        reason = "streamed native call is unsupported"
+    else:
+        reason = "native path not ready"
+    raise _legacy.GPUPacketError(
+        f"cuda_cpp native policy=require: {op_name} cannot fallback to legacy ({reason})"
+    )
+
+
 def init_gpu():
     return _call_legacy("init_gpu")
 
@@ -435,7 +521,10 @@ def generate_packets(
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
 ):
-    if not _native_ready() or stream is not None:
+    stream_handle = _resolve_stream_handle("generate_packets", stream)
+    if not _native_ready() or stream_handle < 0:
+        if not _fallback_to_legacy_allowed():
+            _raise_native_policy_violation("generate_packets", stream=stream)
         return _call_legacy(
             "generate_packets",
             count,
@@ -465,6 +554,7 @@ def generate_packets(
         ctypes.c_int64(int(tcp_flags)),
         ctypes.c_int(1 if has_ethernet else 0),
         ctypes.c_int64(int(window)),
+        ctypes.c_uint64(int(stream_handle)),
         ctypes.c_uint64(int(gateway_mac)),
         ctypes.c_char_p(_as_bytes(spoof_subnet, "1.0.0.0/8")),
         ctypes.byref(out_ptr),
@@ -489,7 +579,10 @@ def generate_packets_from_template(
     spoof_subnet="1.0.0.0/8",
     force_global_fallback=False,
 ):
-    if not _native_ready() or stream is not None:
+    stream_handle = _resolve_stream_handle("generate_packets_from_template", stream)
+    if not _native_ready() or stream_handle < 0:
+        if not _fallback_to_legacy_allowed():
+            _raise_native_policy_violation("generate_packets_from_template", stream=stream)
         return _call_legacy(
             "generate_packets_from_template",
             template_bytes,
@@ -519,6 +612,7 @@ def generate_packets_from_template(
         ctypes.c_char_p(_as_bytes(real_src_ip, "192.168.1.100")),
         ctypes.c_int(1 if spoof_ip else 0),
         ctypes.c_int(1 if has_ethernet else 0),
+        ctypes.c_uint64(int(stream_handle)),
         ctypes.c_uint64(int(gateway_mac)),
         ctypes.c_char_p(_as_bytes(spoof_subnet, "1.0.0.0/8")),
         ctypes.c_int(1 if force_global_fallback else 0),
@@ -546,7 +640,10 @@ def generate_packets_from_template_pool(
     spoof_subnet="1.0.0.0/8",
     force_global_fallback=False,
 ):
-    if not _native_ready() or stream is not None:
+    stream_handle = _resolve_stream_handle("generate_packets_from_template_pool", stream)
+    if not _native_ready() or stream_handle < 0:
+        if not _fallback_to_legacy_allowed():
+            _raise_native_policy_violation("generate_packets_from_template_pool", stream=stream)
         return _call_legacy(
             "generate_packets_from_template_pool",
             templates_bytes_list,
@@ -582,6 +679,7 @@ def generate_packets_from_template_pool(
         ctypes.c_int(1 if spoof_ip else 0),
         ctypes.c_int64(int(specific_src_port)),
         ctypes.c_int(1 if has_ethernet else 0),
+        ctypes.c_uint64(int(stream_handle)),
         ctypes.c_uint64(int(gateway_mac)),
         ctypes.c_char_p(_as_bytes(spoof_subnet, "1.0.0.0/8")),
         ctypes.c_int(1 if force_global_fallback else 0),
@@ -611,7 +709,10 @@ def generate_fragmented_packets(
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
 ):
-    if not _native_ready() or stream is not None:
+    stream_handle = _resolve_stream_handle("generate_fragmented_packets", stream)
+    if not _native_ready() or stream_handle < 0:
+        if not _fallback_to_legacy_allowed():
+            _raise_native_policy_violation("generate_fragmented_packets", stream=stream)
         return _call_legacy(
             "generate_fragmented_packets",
             payload_bytes,
@@ -651,6 +752,7 @@ def generate_fragmented_packets(
         ctypes.c_int(1 if has_ethernet else 0),
         ctypes.c_int64(int(frag1_size)),
         ctypes.c_int64(int(frag2_size)),
+        ctypes.c_uint64(int(stream_handle)),
         ctypes.c_uint64(int(gateway_mac)),
         ctypes.c_char_p(_as_bytes(spoof_subnet, "1.0.0.0/8")),
         ctypes.byref(out_ptr),
@@ -673,7 +775,10 @@ def generate_amplification_packets(
     stream=None,
     gateway_mac=0xFFFFFFFFFFFF,
 ):
-    if not _native_ready() or stream is not None:
+    stream_handle = _resolve_stream_handle("generate_amplification_packets", stream)
+    if not _native_ready() or stream_handle < 0:
+        if not _fallback_to_legacy_allowed():
+            _raise_native_policy_violation("generate_amplification_packets", stream=stream)
         return _call_legacy(
             "generate_amplification_packets",
             template_bytes,
@@ -707,6 +812,7 @@ def generate_amplification_packets(
         ctypes.c_char_p(_as_bytes(victim_ip)),
         ctypes.c_int64(int(count)),
         ctypes.c_int(1 if has_ethernet else 0),
+        ctypes.c_uint64(int(stream_handle)),
         ctypes.c_uint64(int(gateway_mac)),
         ctypes.byref(out_ptr),
         ctypes.byref(out_size),
@@ -739,7 +845,10 @@ def generate_stateful_packets(
     ttls=None,
     force_global_fallback=False,
 ):
-    if not _native_ready() or stream is not None:
+    stream_handle = _resolve_stream_handle("generate_stateful_packets", stream)
+    if not _native_ready() or stream_handle < 0:
+        if not _fallback_to_legacy_allowed():
+            _raise_native_policy_violation("generate_stateful_packets", stream=stream)
         return _call_legacy(
             "generate_stateful_packets",
             templates_bytes_list,
@@ -799,6 +908,7 @@ def generate_stateful_packets(
         ctypes.c_char_p(_as_bytes(real_src_ip, "192.168.1.100")),
         ctypes.c_int64(int(specific_src_port)),
         ctypes.c_int(1 if has_ethernet else 0),
+        ctypes.c_uint64(int(stream_handle)),
         ctypes.c_uint64(int(gateway_mac)),
         ctypes.c_char_p(_as_bytes(spoof_subnet, "1.0.0.0/8")),
         seq_ptr,
@@ -844,7 +954,10 @@ def generate_icmp_packets(
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
 ):
-    if not _native_ready() or stream is not None:
+    stream_handle = _resolve_stream_handle("generate_icmp_packets", stream)
+    if not _native_ready() or stream_handle < 0:
+        if not _fallback_to_legacy_allowed():
+            _raise_native_policy_violation("generate_icmp_packets", stream=stream)
         return _call_legacy(
             "generate_icmp_packets",
             count,
@@ -872,6 +985,7 @@ def generate_icmp_packets(
         ctypes.c_int64(int(icmp_type)),
         ctypes.c_int64(int(icmp_code)),
         ctypes.c_int64(int(payload_size)),
+        ctypes.c_uint64(int(stream_handle)),
         ctypes.c_uint64(int(gateway_mac)),
         ctypes.c_char_p(_as_bytes(spoof_subnet, "1.0.0.0/8")),
         ctypes.byref(out_ptr),

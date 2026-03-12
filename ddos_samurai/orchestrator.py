@@ -1117,8 +1117,21 @@ async def worker_process(
                 worker_stats["gpu_packet_native_active"] = int(
                     bool(getattr(gpu_packet, "is_native_path_active", lambda: False)())
                 )
+                worker_stats["gpu_packet_native_policy"] = str(
+                    getattr(gpu_packet, "get_native_policy", lambda: "allow")()
+                )
+                _gpu_native_policy_require = bool(
+                    getattr(gpu_packet, "is_native_policy_require", lambda: False)()
+                )
             except Exception:
+                _gpu_native_policy_require = False
                 pass
+
+            if _gpu_native_policy_require and int(worker_stats.get("gpu_packet_native_active", 0) or 0) != 1:
+                raise RuntimeError(
+                    "GPU native policy=require but native path is not active. "
+                    "Set CUDA backend/native env and disable stream fallback."
+                )
 
             def _gpu_to_host(gpu_arr, key: str, stream=None, blocking: bool = True):
                 """Copy GPU array to host via shared pinned-memory pool."""
@@ -1165,6 +1178,12 @@ async def worker_process(
             )
             _gpu_pipeline_depth = min(_gpu_pipeline_depth, _gpu_ring_capacity)
             _gpu_full_variation = bool(args.get("gpu_full_variation", True))
+            if _gpu_native_policy_require:
+                # Native strict mode forbids fallback; CLI queue/depth/stream knobs stay active.
+                log_info(
+                    f"[Worker {worker_id}] GPU native strict mode active "
+                    f"(streams={_gpu_stream_count}, depth={_gpu_pipeline_depth}, ring={_gpu_ring_capacity})"
+                )
             _gpu_ring_depth_peak = 0
             _gpu_ring_block_wait_ns = 0
             worker_stats["gpu_batch_size"] = int(_gpu_batch_size)
@@ -1174,6 +1193,13 @@ async def worker_process(
 
             def _build_stream_ring():
                 return [cp.cuda.Stream(non_blocking=True) for _ in range(_gpu_stream_count)]
+
+            def _make_ready_event(stream):
+                if stream is None:
+                    return None
+                evt = cp.cuda.Event()
+                evt.record(stream)
+                return evt
 
             _state_engine_ready = False
             _state_sweep_interval_s = max(
@@ -1263,7 +1289,9 @@ async def worker_process(
                 if ring_q.empty():
                     return
                 send_batch = await ring_q.get()
-                await _await_cuda_event(send_batch["ready_event"])
+                _evt = send_batch.get("ready_event")
+                if _evt is not None:
+                    await _await_cuda_event(_evt)
                 send_stats = await senders.paced_raw_socket_sender(
                     packets_buffer=send_batch["cpu"],
                     target_ip=args['target'],
@@ -1452,16 +1480,17 @@ async def worker_process(
                         "packet_size": packet_size_int,
                         "stream": stream_ring[stream_idx],
                         "slot": stream_idx,
-                        "ready_event": cp.cuda.Event(),
+                        "ready_event": _make_ready_event(stream_ring[stream_idx]),
                     }
-                    current_batch["ready_event"].record(current_batch["stream"])
                     ready_queue.append(current_batch)
                     stream_idx = (stream_idx + 1) % len(stream_ring)
                     remaining -= batch_count
 
                     while len(ready_queue) >= _gpu_pipeline_depth:
                         send_batch = ready_queue.pop(0)
-                        await _await_cuda_event(send_batch["ready_event"])
+                        _evt = send_batch.get("ready_event")
+                        if _evt is not None:
+                            await _await_cuda_event(_evt)
                         send_buf = send_batch["cpu"]
                         send_count = int(send_batch["count"])
                         if send_count <= 0:
@@ -1482,7 +1511,9 @@ async def worker_process(
 
                 while ready_queue:
                     send_batch = ready_queue.pop(0)
-                    await _await_cuda_event(send_batch["ready_event"])
+                    _evt = send_batch.get("ready_event")
+                    if _evt is not None:
+                        await _await_cuda_event(_evt)
                     send_buf = send_batch["cpu"]
                     send_count = int(send_batch["count"])
                     if send_count <= 0:
@@ -1794,9 +1825,8 @@ async def worker_process(
                         "packet_size": int(packet_size),
                         "stream": stream_ring[stream_idx],
                         "slot": stream_idx,
-                        "ready_event": cp.cuda.Event(),
+                        "ready_event": _make_ready_event(stream_ring[stream_idx]),
                     }
-                    current_batch["ready_event"].record(current_batch["stream"])
                     if ring_q.full():
                         await _consume_one_ring_batch(ring_q, 0, ingest_state=True)
                     await _enqueue_with_backpressure(ring_q, current_batch)
@@ -1936,9 +1966,8 @@ async def worker_process(
                         "packet_size": int(packet_size),
                         "stream": stream_ring[stream_idx],
                         "slot": stream_idx,
-                        "ready_event": cp.cuda.Event(),
+                        "ready_event": _make_ready_event(stream_ring[stream_idx]),
                     }
-                    current_batch["ready_event"].record(current_batch["stream"])
                     if ring_q.full():
                         await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
                     await _enqueue_with_backpressure(ring_q, current_batch)
@@ -2050,16 +2079,17 @@ async def worker_process(
                                 "count": std_count,
                                 "stream": stream_ring_std[std_idx],
                                 "slot": std_idx,
-                                "ready_event": cp.cuda.Event(),
+                                "ready_event": _make_ready_event(stream_ring_std[std_idx]),
                             }
-                            std_current["ready_event"].record(std_current["stream"])
                             std_ready_queue.append(std_current)
                             std_idx = (std_idx + 1) % len(stream_ring_std)
                             std_remaining -= std_count
 
                             while len(std_ready_queue) >= _gpu_pipeline_depth:
                                 std_send = std_ready_queue.pop(0)
-                                await _await_cuda_event(std_send["ready_event"])
+                                _evt = std_send.get("ready_event")
+                                if _evt is not None:
+                                    await _await_cuda_event(_evt)
                                 worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
                                     packets_buffer=std_send["cpu"],
                                     target_ip=args['target'],
@@ -2076,7 +2106,9 @@ async def worker_process(
 
                         while std_ready_queue:
                             std_send = std_ready_queue.pop(0)
-                            await _await_cuda_event(std_send["ready_event"])
+                            _evt = std_send.get("ready_event")
+                            if _evt is not None:
+                                await _await_cuda_event(_evt)
                             worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
                                 packets_buffer=std_send["cpu"],
                                 target_ip=args['target'],
@@ -2227,9 +2259,8 @@ async def worker_process(
                         "packet_size": int(packet_size),
                         "stream": stream_ring[stream_idx],
                         "slot": stream_idx,
-                        "ready_event": cp.cuda.Event(),
+                        "ready_event": _make_ready_event(stream_ring[stream_idx]),
                     }
-                    current_batch["ready_event"].record(current_batch["stream"])
                     if ring_q.full():
                         await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
                     await _enqueue_with_backpressure(ring_q, current_batch)
@@ -2371,9 +2402,8 @@ async def worker_process(
                     "packet_size": int(packet_size),
                     "stream": stream_ring[stream_idx],
                     "slot": stream_idx,
-                    "ready_event": cp.cuda.Event(),
+                    "ready_event": _make_ready_event(stream_ring[stream_idx]),
                 }
-                current_batch["ready_event"].record(current_batch["stream"])
                 if ring_q.full():
                     await _consume_one_ring_batch(ring_q, args['port'], ingest_state=True)
                 await _enqueue_with_backpressure(ring_q, current_batch)

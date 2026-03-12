@@ -751,11 +751,12 @@ static int init_c_api_outputs(uint8_t** out_data, size_t* out_size, int* out_pac
 static int export_packet_result(
     const ddos_samurai::gpu_packet_cuda::PacketResult& res,
     const char* key,
+    cudaStream_t stream,
     uint8_t** out_data,
     size_t* out_size,
     int* out_packet_size) {
   std::vector<uint8_t> host = ddos_samurai::gpu_packet_cuda::copy_gpu_to_host_pinned(
-      res.packets_gpu, key ? std::string(key) : std::string("c_api"), nullptr, true);
+      res.packets_gpu, key ? std::string(key) : std::string("c_api"), stream, true);
 
   uint8_t* buf = nullptr;
   if (!host.empty()) {
@@ -770,6 +771,10 @@ static int export_packet_result(
   *out_packet_size = res.packet_size;
   g_samurai_gpu_packet_last_error.clear();
   return 0;
+}
+
+static cudaStream_t decode_stream_handle(uint64_t stream_handle) {
+  return reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_handle));
 }
 
 static std::vector<std::vector<uint8_t>> decode_flat_templates(
@@ -831,6 +836,7 @@ extern "C" int samurai_gpu_packet_generate_packets(
     int64_t tcp_flags,
     int has_ethernet,
     int64_t window,
+    uint64_t stream_handle,
     uint64_t gateway_mac,
     const char* spoof_subnet,
     uint8_t** out_data,
@@ -845,6 +851,7 @@ extern "C" int samurai_gpu_packet_generate_packets(
     const std::string proto = protocol ? std::string(protocol) : std::string("tcp");
     const std::string src = real_src_ip ? std::string(real_src_ip) : std::string("192.168.1.100");
     const std::string subnet = spoof_subnet ? std::string(spoof_subnet) : std::string("1.0.0.0/8");
+    cudaStream_t stream = decode_stream_handle(stream_handle);
     if (target.empty()) {
       return set_c_api_error("target_ip must not be empty");
     }
@@ -860,11 +867,12 @@ extern "C" int samurai_gpu_packet_generate_packets(
             tcp_flags,
             has_ethernet != 0,
             window,
-            nullptr,
+            stream,
             gateway_mac,
             subnet);
 
-    return export_packet_result(res, "c_api_generate_packets", out_data, out_size, out_packet_size);
+    return export_packet_result(
+        res, "c_api_generate_packets", stream, out_data, out_size, out_packet_size);
   } catch (const std::exception& e) {
     return set_c_api_error(e.what());
   } catch (...) {
@@ -879,6 +887,7 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template(
     const char* real_src_ip,
     int spoof_ip,
     int has_ethernet,
+    uint64_t stream_handle,
     uint64_t gateway_mac,
     const char* spoof_subnet,
     int force_global_fallback,
@@ -895,6 +904,7 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template(
 
     const std::string src = real_src_ip ? std::string(real_src_ip) : std::string("192.168.1.100");
     const std::string subnet = spoof_subnet ? std::string(spoof_subnet) : std::string("1.0.0.0/8");
+    cudaStream_t stream = decode_stream_handle(stream_handle);
     std::vector<uint8_t> tpl(template_bytes, template_bytes + template_len);
 
     ddos_samurai::gpu_packet_cuda::PacketResult res =
@@ -904,13 +914,13 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template(
             src,
             spoof_ip != 0,
             has_ethernet != 0,
-            nullptr,
+            stream,
             gateway_mac,
             subnet,
             force_global_fallback != 0);
 
     return export_packet_result(
-        res, "c_api_generate_from_template", out_data, out_size, out_packet_size);
+        res, "c_api_generate_from_template", stream, out_data, out_size, out_packet_size);
   } catch (const std::exception& e) {
     return set_c_api_error(e.what());
   } catch (...) {
@@ -929,6 +939,7 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template_pool(
     int spoof_ip,
     int64_t specific_src_port,
     int has_ethernet,
+    uint64_t stream_handle,
     uint64_t gateway_mac,
     const char* spoof_subnet,
     int force_global_fallback,
@@ -952,6 +963,7 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template_pool(
     }
     const std::string src = real_src_ip ? std::string(real_src_ip) : std::string("192.168.1.100");
     const std::string subnet = spoof_subnet ? std::string(spoof_subnet) : std::string("1.0.0.0/8");
+    cudaStream_t stream = decode_stream_handle(stream_handle);
 
     ddos_samurai::gpu_packet_cuda::PacketResult res =
         ddos_samurai::gpu_packet_cuda::generate_packets_from_template_pool(
@@ -962,13 +974,13 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template_pool(
             spoof_ip != 0,
             specific_src_port,
             has_ethernet != 0,
-            nullptr,
+            stream,
             gateway_mac,
             subnet,
             force_global_fallback != 0);
 
     return export_packet_result(
-        res, "c_api_generate_from_template_pool", out_data, out_size, out_packet_size);
+        res, "c_api_generate_from_template_pool", stream, out_data, out_size, out_packet_size);
   } catch (const std::exception& e) {
     return set_c_api_error(e.what());
   } catch (...) {
@@ -987,6 +999,7 @@ extern "C" int samurai_gpu_packet_generate_stateful_packets(
     const char* real_src_ip,
     int64_t specific_src_port,
     int has_ethernet,
+    uint64_t stream_handle,
     uint64_t gateway_mac,
     const char* spoof_subnet,
     const uint32_t* seq_list,
@@ -1024,6 +1037,7 @@ extern "C" int samurai_gpu_packet_generate_stateful_packets(
     }
     const std::string src = real_src_ip ? std::string(real_src_ip) : std::string("192.168.1.100");
     const std::string subnet = spoof_subnet ? std::string(spoof_subnet) : std::string("1.0.0.0/8");
+    cudaStream_t stream = decode_stream_handle(stream_handle);
 
     const std::vector<uint32_t> seq = vector_from_c_array(seq_list, seq_len, "seq_list");
     const std::vector<uint32_t> ack = vector_from_c_array(ack_list, ack_len, "ack_list");
@@ -1044,7 +1058,7 @@ extern "C" int samurai_gpu_packet_generate_stateful_packets(
             src,
             specific_src_port,
             has_ethernet != 0,
-            nullptr,
+            stream,
             gateway_mac,
             subnet,
             seq,
@@ -1056,7 +1070,8 @@ extern "C" int samurai_gpu_packet_generate_stateful_packets(
             ttlv,
             force_global_fallback != 0);
 
-    return export_packet_result(res, "c_api_generate_stateful", out_data, out_size, out_packet_size);
+    return export_packet_result(
+        res, "c_api_generate_stateful", stream, out_data, out_size, out_packet_size);
   } catch (const std::exception& e) {
     return set_c_api_error(e.what());
   } catch (...) {
@@ -1076,6 +1091,7 @@ extern "C" int samurai_gpu_packet_generate_fragmented_packets(
     int has_ethernet,
     int64_t frag1_size,
     int64_t frag2_size,
+    uint64_t stream_handle,
     uint64_t gateway_mac,
     const char* spoof_subnet,
     uint8_t** out_data,
@@ -1100,6 +1116,7 @@ extern "C" int samurai_gpu_packet_generate_fragmented_packets(
     const std::string proto = protocol ? std::string(protocol) : std::string("udp");
     const std::string src = real_src_ip ? std::string(real_src_ip) : std::string("192.168.1.100");
     const std::string subnet = spoof_subnet ? std::string(spoof_subnet) : std::string("1.0.0.0/8");
+    cudaStream_t stream = decode_stream_handle(stream_handle);
 
     ddos_samurai::gpu_packet_cuda::PacketResult res =
         ddos_samurai::gpu_packet_cuda::generate_fragmented_packets(
@@ -1113,11 +1130,12 @@ extern "C" int samurai_gpu_packet_generate_fragmented_packets(
             has_ethernet != 0,
             frag1_size,
             frag2_size,
-            nullptr,
+            stream,
             gateway_mac,
             subnet);
 
-    return export_packet_result(res, "c_api_generate_fragmented", out_data, out_size, out_packet_size);
+    return export_packet_result(
+        res, "c_api_generate_fragmented", stream, out_data, out_size, out_packet_size);
   } catch (const std::exception& e) {
     return set_c_api_error(e.what());
   } catch (...) {
@@ -1133,6 +1151,7 @@ extern "C" int samurai_gpu_packet_generate_amplification_packets(
     const char* victim_ip,
     int64_t count,
     int has_ethernet,
+    uint64_t stream_handle,
     uint64_t gateway_mac,
     uint8_t** out_data,
     size_t* out_size,
@@ -1153,6 +1172,7 @@ extern "C" int samurai_gpu_packet_generate_amplification_packets(
     }
 
     std::vector<uint8_t> tpl(template_bytes, template_bytes + template_len);
+    cudaStream_t stream = decode_stream_handle(stream_handle);
     std::vector<std::string> reflectors;
     reflectors.reserve(reflectors_count);
     for (size_t i = 0; i < reflectors_count; ++i) {
@@ -1169,11 +1189,11 @@ extern "C" int samurai_gpu_packet_generate_amplification_packets(
             victim,
             count,
             has_ethernet != 0,
-            nullptr,
+            stream,
             gateway_mac);
 
     return export_packet_result(
-        res, "c_api_generate_amplification", out_data, out_size, out_packet_size);
+        res, "c_api_generate_amplification", stream, out_data, out_size, out_packet_size);
   } catch (const std::exception& e) {
     return set_c_api_error(e.what());
   } catch (...) {
@@ -1190,6 +1210,7 @@ extern "C" int samurai_gpu_packet_generate_icmp_packets(
     int64_t icmp_type,
     int64_t icmp_code,
     int64_t payload_size,
+    uint64_t stream_handle,
     uint64_t gateway_mac,
     const char* spoof_subnet,
     uint8_t** out_data,
@@ -1205,6 +1226,7 @@ extern "C" int samurai_gpu_packet_generate_icmp_packets(
     }
     const std::string src = real_src_ip ? std::string(real_src_ip) : std::string("192.168.1.100");
     const std::string subnet = spoof_subnet ? std::string(spoof_subnet) : std::string("1.0.0.0/8");
+    cudaStream_t stream = decode_stream_handle(stream_handle);
 
     ddos_samurai::gpu_packet_cuda::PacketResult res =
         ddos_samurai::gpu_packet_cuda::generate_icmp_packets(
@@ -1216,11 +1238,12 @@ extern "C" int samurai_gpu_packet_generate_icmp_packets(
             icmp_type,
             icmp_code,
             payload_size,
-            nullptr,
+            stream,
             gateway_mac,
             subnet);
 
-    return export_packet_result(res, "c_api_generate_icmp", out_data, out_size, out_packet_size);
+    return export_packet_result(
+        res, "c_api_generate_icmp", stream, out_data, out_size, out_packet_size);
   } catch (const std::exception& e) {
     return set_c_api_error(e.what());
   } catch (...) {

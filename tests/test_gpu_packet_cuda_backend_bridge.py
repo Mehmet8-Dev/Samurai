@@ -54,6 +54,7 @@ class _FakeLib:
         _tcp_flags,
         _has_ethernet,
         _window,
+        _stream_handle,
         _gateway_mac,
         _spoof_subnet,
         out_data,
@@ -72,6 +73,7 @@ class _FakeLib:
         _real_src_ip,
         _spoof_ip,
         _has_ethernet,
+        _stream_handle,
         _gateway_mac,
         _spoof_subnet,
         _force_global_fallback,
@@ -95,6 +97,7 @@ class _FakeLib:
         _spoof_ip,
         _specific_src_port,
         _has_ethernet,
+        _stream_handle,
         _gateway_mac,
         _spoof_subnet,
         _force_global_fallback,
@@ -118,6 +121,7 @@ class _FakeLib:
         _real_src_ip,
         _specific_src_port,
         _has_ethernet,
+        _stream_handle,
         _gateway_mac,
         _spoof_subnet,
         _seq_list,
@@ -156,6 +160,7 @@ class _FakeLib:
         _has_ethernet,
         _frag1_size,
         _frag2_size,
+        _stream_handle,
         _gateway_mac,
         _spoof_subnet,
         out_data,
@@ -175,6 +180,7 @@ class _FakeLib:
         _victim_ip,
         _count,
         _has_ethernet,
+        _stream_handle,
         _gateway_mac,
         out_data,
         out_size,
@@ -194,6 +200,7 @@ class _FakeLib:
         _icmp_type,
         _icmp_code,
         _payload_size,
+        _stream_handle,
         _gateway_mac,
         _spoof_subnet,
         out_data,
@@ -358,3 +365,55 @@ def test_generate_icmp_native_success(monkeypatch):
     assert packet_size == 2
     assert _to_bytes(packets) == b"\x50\x51"
     assert fake.free_called == 1
+
+
+def test_native_policy_require_accepts_stream_when_native_available(monkeypatch):
+    fake = _FakeLib(payload=b"\x00\x01", packet_size=2, rc=0)
+    monkeypatch.setattr(backend, "_LIB", fake, raising=True)
+    monkeypatch.setattr(backend, "_NATIVE_ENABLED", True, raising=True)
+    monkeypatch.setattr(backend, "_NATIVE_POLICY", "require", raising=True)
+
+    class _S:
+        ptr = 1234
+
+    packets, packet_size = backend.generate_packets(
+        count=1,
+        target_ip="203.0.113.1",
+        target_port=80,
+        protocol="tcp",
+        spoof_ip=False,
+        stream=_S(),
+    )
+    assert packet_size == 2
+    assert _to_bytes(packets) == b"\x00\x01"
+    assert fake.free_called == 1
+
+
+def test_native_policy_require_blocks_unresolvable_stream(monkeypatch):
+    fake = _FakeLib(payload=b"\x00\x01", packet_size=2, rc=0)
+    monkeypatch.setattr(backend, "_LIB", fake, raising=True)
+    monkeypatch.setattr(backend, "_NATIVE_ENABLED", True, raising=True)
+    monkeypatch.setattr(backend, "_NATIVE_POLICY", "require", raising=True)
+    with pytest.raises(backend._legacy.GPUPacketError, match="policy=require"):
+        backend.generate_packets(
+            count=1,
+            target_ip="203.0.113.1",
+            target_port=80,
+            protocol="tcp",
+            spoof_ip=False,
+            stream=object(),
+        )
+
+
+def test_native_policy_require_blocks_when_native_unavailable(monkeypatch):
+    monkeypatch.setattr(backend, "_LIB", None, raising=True)
+    monkeypatch.setattr(backend, "_NATIVE_ENABLED", True, raising=True)
+    monkeypatch.setattr(backend, "_NATIVE_POLICY", "require", raising=True)
+    with pytest.raises(backend._legacy.GPUPacketError, match="policy=require"):
+        backend.generate_packets(
+            count=1,
+            target_ip="203.0.113.1",
+            target_port=80,
+            protocol="udp",
+            spoof_ip=False,
+        )
