@@ -169,12 +169,12 @@
       },
       "targets": [
         {
-          "expr": "sum by (device) (rate(node_network_transmit_bytes_total{device!~\"lo|docker.*|veth.*\"}[1m]))",
+          "expr": "rate(node_network_transmit_bytes_total{device=\"enp2s0\"}[1m])",
           "legendFormat": "tx {{device}}",
           "refId": "A"
         },
         {
-          "expr": "sum by (device) (rate(node_network_receive_bytes_total{device!~\"lo|docker.*|veth.*\"}[1m]))",
+          "expr": "rate(node_network_receive_bytes_total{device=\"enp2s0\"}[1m])",
           "legendFormat": "rx {{device}}",
           "refId": "B"
         }
@@ -226,12 +226,12 @@
       },
       "targets": [
         {
-          "expr": "sum by (device) (rate(node_network_transmit_dropped_total{device!~\"lo|docker.*|veth.*\"}[1m]))",
+          "expr": "rate(node_network_transmit_dropped_total{device=\"enp2s0\"}[1m])",
           "legendFormat": "tx_drop {{device}}",
           "refId": "A"
         },
         {
-          "expr": "sum by (device) (rate(node_network_receive_dropped_total{device!~\"lo|docker.*|veth.*\"}[1m]))",
+          "expr": "rate(node_network_receive_dropped_total{device=\"enp2s0\"}[1m])",
           "legendFormat": "rx_drop {{device}}",
           "refId": "B"
         },
@@ -271,4 +271,3 @@
   "version": 1,
   "weekStart": ""
 }
-

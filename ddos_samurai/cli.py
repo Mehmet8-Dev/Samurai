@@ -9,6 +9,7 @@ import os
 import sys
 import ctypes
 import multiprocessing
+import shutil
 import yaml
 from datetime import datetime, timezone
 
@@ -55,6 +56,32 @@ def _env_int(name: str, default: int) -> int:
 def _env_flag(name: str, default: str = "0") -> bool:
     raw = str(os.environ.get(name, default) or default).strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _publish_metrics_prom_to_textfile(metrics_prom_path: str) -> None:
+    """Best-effort publish for run metrics into node-exporter textfile collector."""
+    src = str(metrics_prom_path or "").strip()
+    if not src:
+        return
+    if not os.path.isfile(src):
+        return
+    dest = str(
+        os.environ.get(
+            "SAMURAI_PROM_TEXTFILE_RESULTS",
+            os.path.join("monitoring", "textfile", "samurai_results.prom"),
+        )
+        or ""
+    ).strip()
+    if not dest:
+        return
+    try:
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        tmp = dest + ".tmp"
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dest)
+        utils.log_info(f"Prom textfile güncellendi: {dest}")
+    except Exception as e:
+        utils.log_warning(f"Prom textfile güncellenemedi ({dest}): {e}")
 
 
 def _arg_bool(value):
@@ -1799,6 +1826,7 @@ def main(argv=None):
                 extra = reporting.write_metrics_files(rr, base_path)
                 utils.log_info(f"Self-test metrikleri: {extra['metrics_json']}")
                 utils.log_info(f"Self-test metrikleri (Prom): {extra['metrics_prom']}")
+                _publish_metrics_prom_to_textfile(extra.get("metrics_prom", ""))
 
             if not bool(summary.get("successful", False)):
                 utils.log_critical("Self-test basarisiz (fail/error var).")
@@ -1909,6 +1937,7 @@ def main(argv=None):
                 extra = reporting.write_metrics_files(rr, base_path)
                 utils.log_info(f"Run metrikleri: {extra['metrics_json']}")
                 utils.log_info(f"Run metrikleri (Prom): {extra['metrics_prom']}")
+                _publish_metrics_prom_to_textfile(extra.get("metrics_prom", ""))
             sys.exit(0)
         except Exception as e:
             utils.log_critical(f"GPU PCAP üretimi başarısız: {e}")
@@ -2052,6 +2081,7 @@ def main(argv=None):
                 extra = reporting.write_metrics_files(rr, base_path)
                 utils.log_info(f"Dry-run metrikleri: {extra['metrics_json']}")
                 utils.log_info(f"Dry-run metrikleri (Prom): {extra['metrics_prom']}")
+                _publish_metrics_prom_to_textfile(extra.get("metrics_prom", ""))
             sys.exit(0)
         except SystemExit:
             raise
@@ -2409,6 +2439,7 @@ def main(argv=None):
             extra = reporting.write_metrics_files(rr, base_path)
             utils.log_info(f"Run metrikleri: {extra['metrics_json']}")
             utils.log_info(f"Run metrikleri (Prom): {extra['metrics_prom']}")
+            _publish_metrics_prom_to_textfile(extra.get("metrics_prom", ""))
             if loss_report_out:
                 loss_summary = {
                     "schema_version": "1",

@@ -1,11 +1,11 @@
 global:
-  scrape_interval: 5s
-  evaluation_interval: 5s
+  scrape_interval: 1s
+  evaluation_interval: 1s
 
 scrape_configs:
   - job_name: "node"
     static_configs:
-      - targets: ["node-exporter:9100"]
+      - targets: ["host.docker.internal:9100"]
 
   # SaaS API monitoring. If you run the main docker-compose stack,
   # expose API metrics at /metrics (port 5099).

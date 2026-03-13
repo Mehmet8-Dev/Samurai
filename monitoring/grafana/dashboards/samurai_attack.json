@@ -68,9 +68,19 @@
             },
             "targets": [
                 {
-                    "expr": "samurai_attack_pps",
-                    "legendFormat": "Packets Per Second",
+                    "expr": "samurai_attack_pps_inst or samurai_attack_pps or samurai_metrics_gauges_live_effective_pps or samurai_results_effective_pps",
+                    "legendFormat": "PPS current",
                     "refId": "A"
+                },
+                {
+                    "expr": "samurai_attack_pps_avg or avg_over_time(samurai_attack_pps_inst[1m]) or avg_over_time(samurai_attack_pps[1m]) or avg_over_time(samurai_metrics_gauges_live_effective_pps[1m]) or avg_over_time(samurai_results_effective_pps[1m])",
+                    "legendFormat": "PPS avg (1m)",
+                    "refId": "B"
+                },
+                {
+                    "expr": "max_over_time(samurai_attack_pps_inst[1m]) or max_over_time(samurai_attack_pps[1m]) or max_over_time(samurai_metrics_gauges_live_effective_pps[1m]) or max_over_time(samurai_results_effective_pps[1m])",
+                    "legendFormat": "PPS max (1m)",
+                    "refId": "C"
                 }
             ],
             "title": "Attack Throughput (PPS)",
