@@ -96,15 +96,20 @@ struct DeviceArray {
   size_t count = 0;
 
   DeviceArray() = default;
-  explicit DeviceArray(const std::vector<T>& data, cudaStream_t stream = nullptr) {
-    if (data.empty()) {
+  DeviceArray(const T* data, size_t data_count, cudaStream_t stream = nullptr) {
+    if (data_count == 0) {
       return;
     }
-    count = data.size();
+    if (!data) {
+      throw std::invalid_argument("DeviceArray source pointer is null");
+    }
+    count = data_count;
     throw_if_cuda(cudaMalloc(&ptr, sizeof(T) * count), "cudaMalloc DeviceArray failed");
-    throw_if_cuda(cudaMemcpyAsync(ptr, data.data(), sizeof(T) * count, cudaMemcpyHostToDevice, stream),
+    throw_if_cuda(cudaMemcpyAsync(ptr, data, sizeof(T) * count, cudaMemcpyHostToDevice, stream),
                   "cudaMemcpyAsync DeviceArray failed");
   }
+  explicit DeviceArray(const std::vector<T>& data, cudaStream_t stream = nullptr)
+      : DeviceArray(data.data(), data.size(), stream) {}
 
   DeviceArray(const DeviceArray&) = delete;
   DeviceArray& operator=(const DeviceArray&) = delete;
@@ -493,4 +498,3 @@ std::pair<uint32_t, uint32_t> parse_subnet(const std::string& subnet) {
   uint32_t base = ip & mask;
   return {base, mask_bits};
 }
-

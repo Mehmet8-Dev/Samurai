@@ -140,11 +140,15 @@ inline ConstantFingerprint const_payload_fingerprint(const uint8_t* data, size_t
   return ConstantFingerprint{n, fnv1a_64(data, n)};
 }
 
-inline std::string template_digest(const std::vector<uint8_t>& data) {
-  uint64_t h = fnv1a_64(data.data(), data.size());
+inline std::string template_digest(const uint8_t* data, size_t size) {
+  uint64_t h = fnv1a_64(data, size);
   std::ostringstream oss;
   oss << std::hex << h;
   return oss.str();
+}
+
+inline std::string template_digest(const std::vector<uint8_t>& data) {
+  return template_digest(data.data(), data.size());
 }
 
 inline uint64_t now_seed() {
@@ -504,11 +508,16 @@ bool update_gpu_constant_pool(const uint8_t* host_data, size_t nbytes) {
   return true;
 }
 
-TemplateAcquisition acquire_template_gpu(const std::vector<uint8_t>& host_array,
+TemplateAcquisition acquire_template_gpu(const uint8_t* host_data,
+                                         size_t nbytes,
                                          int packet_size,
                                          cudaStream_t stream) {
+  if (nbytes > 0 && !host_data) {
+    throw std::invalid_argument("template data pointer is null");
+  }
   const int dev = active_device_id();
-  const std::string key = std::to_string(dev) + ":" + template_digest(host_array) + ":" + std::to_string(packet_size);
+  const std::string key =
+      std::to_string(dev) + ":" + template_digest(host_data, nbytes) + ":" + std::to_string(packet_size);
   const int limit = gpu_cache_limit();
 
   {
@@ -532,9 +541,8 @@ TemplateAcquisition acquire_template_gpu(const std::vector<uint8_t>& host_array,
   }
 
   uint8_t* dptr = nullptr;
-  const size_t nbytes = host_array.size();
   throw_if_cuda(cudaMalloc(&dptr, nbytes), "cudaMalloc template_gpu failed");
-  throw_if_cuda(cudaMemcpyAsync(dptr, host_array.data(), nbytes, cudaMemcpyHostToDevice, stream),
+  throw_if_cuda(cudaMemcpyAsync(dptr, host_data, nbytes, cudaMemcpyHostToDevice, stream),
                 "cudaMemcpyAsync template_gpu failed");
 
   TemplateAcquisition out{dptr, nbytes, false};
@@ -566,6 +574,12 @@ TemplateAcquisition acquire_template_gpu(const std::vector<uint8_t>& host_array,
   }
 
   return out;
+}
+
+TemplateAcquisition acquire_template_gpu(const std::vector<uint8_t>& host_array,
+                                         int packet_size,
+                                         cudaStream_t stream) {
+  return acquire_template_gpu(host_array.data(), host_array.size(), packet_size, stream);
 }
 
 RNGAcquisition acquire_rng_states(int64_t count, cudaStream_t stream) {

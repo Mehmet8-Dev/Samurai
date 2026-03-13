@@ -143,7 +143,8 @@ PacketResult generate_packets(
 }
 
 PacketResult generate_packets_from_template(
-    const std::vector<uint8_t>& template_bytes,
+    const uint8_t* template_bytes,
+    size_t template_len,
     int64_t count,
     const std::string& real_src_ip,
     bool spoof_ip,
@@ -153,9 +154,12 @@ PacketResult generate_packets_from_template(
     const std::string& spoof_subnet,
     bool force_global_fallback) {
   auto [spoof_base_ip, spoof_mask] = parse_subnet(spoof_subnet.empty() ? "1.0.0.0/8" : spoof_subnet);
+  if (!template_bytes || template_len == 0) {
+    throw std::invalid_argument("template_bytes must not be empty");
+  }
 
-  int packet_size = static_cast<int>(template_bytes.size());
-  TemplateAcquisition template_acq = acquire_template_gpu(template_bytes, packet_size, stream);
+  int packet_size = static_cast<int>(template_len);
+  TemplateAcquisition template_acq = acquire_template_gpu(template_bytes, template_len, packet_size, stream);
   uint8_t* template_gpu = template_acq.ptr;
 
   DeviceBuffer out;
@@ -170,8 +174,8 @@ PacketResult generate_packets_from_template(
 
   int64_t use_constant = 0;
   if (!force_global_fallback) {
-    if (can_use_constant_memory(template_bytes.size(), TEMPLATE_CONST_MAX)) {
-      if (update_gpu_constant_template(template_bytes.data(), template_bytes.size())) {
+    if (can_use_constant_memory(template_len, TEMPLATE_CONST_MAX)) {
+      if (update_gpu_constant_template(template_bytes, template_len)) {
         use_constant = 1;
       } else {
         if (!g_warned_template_const_fallback.exchange(true)) {
@@ -207,8 +211,63 @@ PacketResult generate_packets_from_template(
   return PacketResult{std::move(out), packet_size};
 }
 
+PacketResult generate_packets_from_template(
+    const std::vector<uint8_t>& template_bytes,
+    int64_t count,
+    const std::string& real_src_ip,
+    bool spoof_ip,
+    bool has_ethernet,
+    cudaStream_t stream,
+    uint64_t gateway_mac,
+    const std::string& spoof_subnet,
+    bool force_global_fallback) {
+  return generate_packets_from_template(
+      template_bytes.data(),
+      template_bytes.size(),
+      count,
+      real_src_ip,
+      spoof_ip,
+      has_ethernet,
+      stream,
+      gateway_mac,
+      spoof_subnet,
+      force_global_fallback);
+}
+
+static void validate_flat_templates_input(
+    const uint8_t* templates_flat,
+    size_t templates_flat_len,
+    int64_t packet_size,
+    int64_t num_templates) {
+  if (packet_size < 0 || num_templates < 0) {
+    throw std::invalid_argument("packet_size and num_templates must be >= 0");
+  }
+  const size_t ps = static_cast<size_t>(packet_size);
+  const size_t nt = static_cast<size_t>(num_templates);
+  if (nt == 0) {
+    return;
+  }
+  if (ps == 0) {
+    throw std::invalid_argument("packet_size must be > 0 when num_templates > 0");
+  }
+  const size_t kMaxSize = static_cast<size_t>(-1);
+  if (ps > (kMaxSize / nt)) {
+    throw std::invalid_argument("templates size overflow");
+  }
+  const size_t expected = ps * nt;
+  if (expected != templates_flat_len) {
+    throw std::invalid_argument("templates_flat_len does not match packet_size*num_templates");
+  }
+  if (!templates_flat) {
+    throw std::invalid_argument("templates_flat must not be null");
+  }
+}
+
 PacketResult generate_packets_from_template_pool(
-    const std::vector<std::vector<uint8_t>>& templates_bytes_list,
+    const uint8_t* templates_flat,
+    size_t templates_flat_len,
+    int64_t packet_size,
+    int64_t num_templates,
     int64_t count,
     const std::string& target_ip,
     const std::string& real_src_ip,
@@ -221,23 +280,16 @@ PacketResult generate_packets_from_template_pool(
     bool force_global_fallback) {
   auto [spoof_base_ip, spoof_mask] = parse_subnet(spoof_subnet.empty() ? "1.0.0.0/8" : spoof_subnet);
 
-  if (templates_bytes_list.empty()) {
+  validate_flat_templates_input(templates_flat, templates_flat_len, packet_size, num_templates);
+  if (num_templates == 0) {
     return PacketResult{};
-  }
-
-  int64_t num_templates = templates_bytes_list.size();
-  int packet_size = static_cast<int>(templates_bytes_list[0].size());
-  for (size_t i = 0; i < templates_bytes_list.size(); ++i) {
-    if (static_cast<int>(templates_bytes_list[i].size()) != packet_size) {
-      throw std::invalid_argument("All templates must be same size. Mismatch at index " + std::to_string(i));
-    }
   }
 
   uint32_t target_ip_int = ip_to_int(target_ip);
   uint32_t real_src_ip_int = real_src_ip.empty() ? 0u : ip_to_int(real_src_ip);
 
-  std::vector<uint8_t> flat_templates = to_bytes_flat(templates_bytes_list);
-  TemplateAcquisition templates_acq = acquire_template_gpu(flat_templates, packet_size, stream);
+  TemplateAcquisition templates_acq =
+      acquire_template_gpu(templates_flat, templates_flat_len, static_cast<int>(packet_size), stream);
   uint8_t* templates_gpu = templates_acq.ptr;
 
   DeviceBuffer out;
@@ -251,8 +303,8 @@ PacketResult generate_packets_from_template_pool(
 
   int64_t use_constant = 0;
   if (!force_global_fallback) {
-    if (can_use_constant_memory(flat_templates.size(), POOL_CONST_MAX)) {
-      if (update_gpu_constant_pool(flat_templates.data(), flat_templates.size())) {
+    if (can_use_constant_memory(templates_flat_len, POOL_CONST_MAX)) {
+      if (update_gpu_constant_pool(templates_flat, templates_flat_len)) {
         use_constant = 1;
       } else {
         if (!g_warned_pool_const_fallback.exchange(true)) {
@@ -265,7 +317,7 @@ PacketResult generate_packets_from_template_pool(
   CUDA_KERNEL_LAUNCH(pool_kernel, blocks, kThreadsPerBlock, stream,
       out.ptr,
       templates_gpu,
-      static_cast<int64_t>(flat_templates.size()),
+      static_cast<int64_t>(templates_flat_len),
       use_constant,
       count,
       packet_size,
@@ -288,7 +340,49 @@ PacketResult generate_packets_from_template_pool(
     cudaFree(rng_acq.ptr);
   }
 
-  return PacketResult{std::move(out), packet_size};
+  return PacketResult{std::move(out), static_cast<int>(packet_size)};
+}
+
+PacketResult generate_packets_from_template_pool(
+    const std::vector<std::vector<uint8_t>>& templates_bytes_list,
+    int64_t count,
+    const std::string& target_ip,
+    const std::string& real_src_ip,
+    bool spoof_ip,
+    int64_t specific_src_port,
+    bool has_ethernet,
+    cudaStream_t stream,
+    uint64_t gateway_mac,
+    const std::string& spoof_subnet,
+    bool force_global_fallback) {
+  if (templates_bytes_list.empty()) {
+    return PacketResult{};
+  }
+
+  int64_t num_templates = templates_bytes_list.size();
+  int packet_size = static_cast<int>(templates_bytes_list[0].size());
+  for (size_t i = 0; i < templates_bytes_list.size(); ++i) {
+    if (static_cast<int>(templates_bytes_list[i].size()) != packet_size) {
+      throw std::invalid_argument("All templates must be same size. Mismatch at index " + std::to_string(i));
+    }
+  }
+
+  std::vector<uint8_t> flat_templates = to_bytes_flat(templates_bytes_list);
+  return generate_packets_from_template_pool(
+      flat_templates.data(),
+      flat_templates.size(),
+      packet_size,
+      num_templates,
+      count,
+      target_ip,
+      real_src_ip,
+      spoof_ip,
+      specific_src_port,
+      has_ethernet,
+      stream,
+      gateway_mac,
+      spoof_subnet,
+      force_global_fallback);
 }
 
 PacketResult generate_fragmented_packets(
@@ -422,6 +516,178 @@ PacketResult generate_amplification_packets(
 }
 
 PacketResult generate_stateful_packets(
+    const uint8_t* templates_flat,
+    size_t templates_flat_len,
+    int64_t packet_size,
+    int64_t num_templates,
+    int64_t count,
+    const std::string& target_ip,
+    bool spoof_ip,
+    const std::string& real_src_ip,
+    int64_t specific_src_port,
+    bool has_ethernet,
+    cudaStream_t stream,
+    uint64_t gateway_mac,
+    const std::string& spoof_subnet,
+    const uint32_t* seq_list,
+    size_t seq_len,
+    const uint32_t* ack_list,
+    size_t ack_len,
+    const uint8_t* state_list,
+    size_t state_len,
+    const uint32_t* actual_lengths,
+    size_t actual_lengths_len,
+    const uint16_t* window_sizes,
+    size_t window_sizes_len,
+    const uint16_t* mss_values,
+    size_t mss_values_len,
+    const uint8_t* ttls,
+    size_t ttls_len,
+    bool force_global_fallback) {
+  validate_flat_templates_input(templates_flat, templates_flat_len, packet_size, num_templates);
+  if (num_templates == 0) {
+    return PacketResult{};
+  }
+
+  TemplateAcquisition templates_acq =
+      acquire_template_gpu(templates_flat, templates_flat_len, static_cast<int>(packet_size), stream);
+  uint8_t* templates_gpu = templates_acq.ptr;
+
+  DeviceBuffer out;
+  size_t total_size = static_cast<size_t>(count) * static_cast<size_t>(packet_size);
+  throw_if_cuda(cudaMalloc(&out.ptr, total_size), "cudaMalloc stateful output failed");
+  out.size = total_size;
+  throw_if_cuda(cudaMemsetAsync(out.ptr, 0, total_size, stream), "cudaMemsetAsync stateful output failed");
+
+  RNGAcquisition rng_acq = acquire_rng_states(count, stream);
+  curandStatePhilox4_32_10_t* rng_states = rng_acq.ptr;
+
+  uint32_t target_ip_int = ip_to_int(target_ip);
+  uint32_t real_src_ip_int = ip_to_int(real_src_ip);
+  auto [spoof_base_ip, spoof_mask] = parse_subnet(spoof_subnet.empty() ? "1.0.0.0/8" : spoof_subnet);
+
+  std::vector<uint32_t> seq_default;
+  std::vector<uint32_t> ack_default;
+  std::vector<uint8_t> state_default;
+  std::vector<uint32_t> lengths_default;
+  std::vector<uint16_t> wins_default;
+  std::vector<uint16_t> msss_default;
+  std::vector<uint8_t> ttl_default;
+
+  const uint32_t* seq_ptr = seq_list;
+  size_t seq_count = seq_len;
+  if (seq_count == 0) {
+    seq_default.assign(static_cast<size_t>(count), 0);
+    seq_ptr = seq_default.data();
+    seq_count = seq_default.size();
+  }
+
+  const uint32_t* ack_ptr = ack_list;
+  size_t ack_count = ack_len;
+  if (ack_count == 0) {
+    ack_default.assign(static_cast<size_t>(count), 0);
+    ack_ptr = ack_default.data();
+    ack_count = ack_default.size();
+  }
+
+  const uint8_t* state_ptr = state_list;
+  size_t state_count = state_len;
+  if (state_count == 0) {
+    state_default.assign(static_cast<size_t>(count), 0);
+    state_ptr = state_default.data();
+    state_count = state_default.size();
+  }
+
+  const uint32_t* lengths_ptr = actual_lengths;
+  size_t lengths_count = actual_lengths_len;
+  if (lengths_count == 0) {
+    lengths_default.assign(static_cast<size_t>(num_templates), static_cast<uint32_t>(packet_size));
+    lengths_ptr = lengths_default.data();
+    lengths_count = lengths_default.size();
+  }
+
+  const uint16_t* win_ptr = window_sizes;
+  size_t win_count = window_sizes_len;
+  if (win_count == 0) {
+    wins_default.assign(static_cast<size_t>(count), 0);
+    win_ptr = wins_default.data();
+    win_count = wins_default.size();
+  }
+
+  const uint16_t* mss_ptr = mss_values;
+  size_t mss_count = mss_values_len;
+  if (mss_count == 0) {
+    msss_default.assign(static_cast<size_t>(count), 0);
+    mss_ptr = msss_default.data();
+    mss_count = msss_default.size();
+  }
+
+  const uint8_t* ttl_ptr = ttls;
+  size_t ttl_count = ttls_len;
+  if (ttl_count == 0) {
+    ttl_default.assign(static_cast<size_t>(count), 0);
+    ttl_ptr = ttl_default.data();
+    ttl_count = ttl_default.size();
+  }
+
+  DeviceArray<uint32_t> d_seq(seq_ptr, seq_count, stream);
+  DeviceArray<uint32_t> d_ack(ack_ptr, ack_count, stream);
+  DeviceArray<uint8_t> d_state(state_ptr, state_count, stream);
+  DeviceArray<uint32_t> d_lengths(lengths_ptr, lengths_count, stream);
+  DeviceArray<uint16_t> d_win(win_ptr, win_count, stream);
+  DeviceArray<uint16_t> d_mss(mss_ptr, mss_count, stream);
+  DeviceArray<uint8_t> d_ttl(ttl_ptr, ttl_count, stream);
+
+  int64_t use_constant = 0;
+  if (!force_global_fallback) {
+    if (can_use_constant_memory(templates_flat_len, POOL_CONST_MAX)) {
+      if (update_gpu_constant_pool(templates_flat, templates_flat_len)) {
+        use_constant = 1;
+      } else {
+        if (!g_warned_pool_const_stateful_fallback.exchange(true)) {
+        }
+      }
+    }
+  }
+
+  int blocks = blocks_for_count(count);
+  CUDA_KERNEL_LAUNCH(stateful_pool_kernel, blocks, kThreadsPerBlock, stream,
+      out.ptr,
+      templates_gpu,
+      static_cast<int64_t>(templates_flat_len),
+      use_constant,
+      count,
+      packet_size,
+      num_templates,
+      target_ip_int,
+      real_src_ip_int,
+      spoof_ip ? 1 : 0,
+      specific_src_port,
+      has_ethernet ? 1 : 0,
+      rng_states,
+      gateway_mac,
+      spoof_base_ip,
+      spoof_mask,
+      d_seq.ptr,
+      d_ack.ptr,
+      d_state.ptr,
+      d_lengths.ptr,
+      d_win.ptr,
+      d_mss.ptr,
+      d_ttl.ptr);
+  safe_kernel_launch("stateful_pool_kernel", cudaPeekAtLastError(), stream, false);
+
+  if (templates_acq.temporary && templates_acq.ptr) {
+    cudaFree(templates_acq.ptr);
+  }
+  if (rng_acq.temporary && rng_acq.ptr) {
+    cudaFree(rng_acq.ptr);
+  }
+
+  return PacketResult{std::move(out), static_cast<int>(packet_size)};
+}
+
+PacketResult generate_stateful_packets(
     const std::vector<std::vector<uint8_t>>& templates_bytes_list,
     int64_t count,
     const std::string& target_ip,
@@ -453,85 +719,35 @@ PacketResult generate_stateful_packets(
   }
 
   std::vector<uint8_t> flat_templates = to_bytes_flat(templates_bytes_list);
-  TemplateAcquisition templates_acq = acquire_template_gpu(flat_templates, packet_size, stream);
-  uint8_t* templates_gpu = templates_acq.ptr;
-
-  DeviceBuffer out;
-  size_t total_size = static_cast<size_t>(count) * static_cast<size_t>(packet_size);
-  throw_if_cuda(cudaMalloc(&out.ptr, total_size), "cudaMalloc stateful output failed");
-  out.size = total_size;
-  throw_if_cuda(cudaMemsetAsync(out.ptr, 0, total_size, stream), "cudaMemsetAsync stateful output failed");
-
-  RNGAcquisition rng_acq = acquire_rng_states(count, stream);
-  curandStatePhilox4_32_10_t* rng_states = rng_acq.ptr;
-
-  uint32_t target_ip_int = ip_to_int(target_ip);
-  uint32_t real_src_ip_int = ip_to_int(real_src_ip);
-  auto [spoof_base_ip, spoof_mask] = parse_subnet(spoof_subnet.empty() ? "1.0.0.0/8" : spoof_subnet);
-
-  std::vector<uint32_t> seq = seq_list.empty() ? std::vector<uint32_t>(count, 0) : seq_list;
-  std::vector<uint32_t> ack = ack_list.empty() ? std::vector<uint32_t>(count, 0) : ack_list;
-  std::vector<uint8_t> state = state_list.empty() ? std::vector<uint8_t>(count, 0) : state_list;
-  std::vector<uint32_t> lengths = actual_lengths.empty() ? std::vector<uint32_t>(num_templates, packet_size) : actual_lengths;
-  std::vector<uint16_t> wins = window_sizes.empty() ? std::vector<uint16_t>(count, 0) : window_sizes;
-  std::vector<uint16_t> msss = mss_values.empty() ? std::vector<uint16_t>(count, 0) : mss_values;
-  std::vector<uint8_t> ttlv = ttls.empty() ? std::vector<uint8_t>(count, 0) : ttls;
-
-  DeviceArray<uint32_t> d_seq(seq, stream);
-  DeviceArray<uint32_t> d_ack(ack, stream);
-  DeviceArray<uint8_t> d_state(state, stream);
-  DeviceArray<uint32_t> d_lengths(lengths, stream);
-  DeviceArray<uint16_t> d_win(wins, stream);
-  DeviceArray<uint16_t> d_mss(msss, stream);
-  DeviceArray<uint8_t> d_ttl(ttlv, stream);
-
-  int64_t use_constant = 0;
-  if (!force_global_fallback) {
-    if (can_use_constant_memory(flat_templates.size(), POOL_CONST_MAX)) {
-      if (update_gpu_constant_pool(flat_templates.data(), flat_templates.size())) {
-        use_constant = 1;
-      } else {
-        if (!g_warned_pool_const_stateful_fallback.exchange(true)) {
-        }
-      }
-    }
-  }
-
-  int blocks = blocks_for_count(count);
-  CUDA_KERNEL_LAUNCH(stateful_pool_kernel, blocks, kThreadsPerBlock, stream,
-      out.ptr,
-      templates_gpu,
-      static_cast<int64_t>(flat_templates.size()),
-      use_constant,
-      count,
+  return generate_stateful_packets(
+      flat_templates.data(),
+      flat_templates.size(),
       packet_size,
       num_templates,
-      target_ip_int,
-      real_src_ip_int,
-      spoof_ip ? 1 : 0,
+      count,
+      target_ip,
+      spoof_ip,
+      real_src_ip,
       specific_src_port,
-      has_ethernet ? 1 : 0,
-      rng_states,
+      has_ethernet,
+      stream,
       gateway_mac,
-      spoof_base_ip,
-      spoof_mask,
-      d_seq.ptr,
-      d_ack.ptr,
-      d_state.ptr,
-      d_lengths.ptr,
-      d_win.ptr,
-      d_mss.ptr,
-      d_ttl.ptr);
-  safe_kernel_launch("stateful_pool_kernel", cudaPeekAtLastError(), stream, false);
-
-  if (templates_acq.temporary && templates_acq.ptr) {
-    cudaFree(templates_acq.ptr);
-  }
-  if (rng_acq.temporary && rng_acq.ptr) {
-    cudaFree(rng_acq.ptr);
-  }
-
-  return PacketResult{std::move(out), packet_size};
+      spoof_subnet,
+      seq_list.data(),
+      seq_list.size(),
+      ack_list.data(),
+      ack_list.size(),
+      state_list.data(),
+      state_list.size(),
+      actual_lengths.data(),
+      actual_lengths.size(),
+      window_sizes.data(),
+      window_sizes.size(),
+      mss_values.data(),
+      mss_values.size(),
+      ttls.data(),
+      ttls.size(),
+      force_global_fallback);
 }
 
 PacketResult generate_icmp_packets(
@@ -846,54 +1062,6 @@ static int export_packet_result(
 static cudaStream_t decode_stream_handle(uint64_t stream_handle) {
   return reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_handle));
 }
-
-static std::vector<std::vector<uint8_t>> decode_flat_templates(
-    const uint8_t* templates_flat,
-    size_t templates_flat_len,
-    int64_t packet_size,
-    int64_t num_templates) {
-  if (packet_size < 0 || num_templates < 0) {
-    throw std::invalid_argument("packet_size and num_templates must be >= 0");
-  }
-  const size_t ps = static_cast<size_t>(packet_size);
-  const size_t nt = static_cast<size_t>(num_templates);
-  if (nt == 0) {
-    return {};
-  }
-  if (ps == 0) {
-    throw std::invalid_argument("packet_size must be > 0 when num_templates > 0");
-  }
-  const size_t kMaxSize = static_cast<size_t>(-1);
-  if (ps > (kMaxSize / nt)) {
-    throw std::invalid_argument("templates size overflow");
-  }
-  const size_t expected = ps * nt;
-  if (expected != templates_flat_len) {
-    throw std::invalid_argument("templates_flat_len does not match packet_size*num_templates");
-  }
-  if (!templates_flat) {
-    throw std::invalid_argument("templates_flat must not be null");
-  }
-
-  std::vector<std::vector<uint8_t>> out;
-  out.reserve(nt);
-  for (size_t i = 0; i < nt; ++i) {
-    const size_t start = i * ps;
-    out.emplace_back(templates_flat + start, templates_flat + start + ps);
-  }
-  return out;
-}
-
-template <typename T>
-static std::vector<T> vector_from_c_array(const T* ptr, size_t len, const char* name) {
-  if (len == 0) {
-    return {};
-  }
-  if (!ptr) {
-    throw std::invalid_argument(std::string(name ? name : "array") + " pointer is null");
-  }
-  return std::vector<T>(ptr, ptr + len);
-}
 }  // namespace
 
 extern "C" int samurai_gpu_packet_generate_packets(
@@ -975,11 +1143,10 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template(
     const std::string src = real_src_ip ? std::string(real_src_ip) : std::string("192.168.1.100");
     const std::string subnet = spoof_subnet ? std::string(spoof_subnet) : std::string("1.0.0.0/8");
     cudaStream_t stream = decode_stream_handle(stream_handle);
-    std::vector<uint8_t> tpl(template_bytes, template_bytes + template_len);
-
     ddos_samurai::gpu_packet_cuda::PacketResult res =
         ddos_samurai::gpu_packet_cuda::generate_packets_from_template(
-            tpl,
+            template_bytes,
+            template_len,
             count,
             src,
             spoof_ip != 0,
@@ -1020,9 +1187,7 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template_pool(
     if (init_c_api_outputs(out_data, out_size, out_packet_size) != 0) {
       return -1;
     }
-    const std::vector<std::vector<uint8_t>> templates =
-        decode_flat_templates(templates_flat, templates_flat_len, packet_size, num_templates);
-    if (templates.empty()) {
+    if (num_templates == 0) {
       g_samurai_gpu_packet_last_error.clear();
       return 0;
     }
@@ -1037,7 +1202,10 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template_pool(
 
     ddos_samurai::gpu_packet_cuda::PacketResult res =
         ddos_samurai::gpu_packet_cuda::generate_packets_from_template_pool(
-            templates,
+            templates_flat,
+            templates_flat_len,
+            packet_size,
+            num_templates,
             count,
             target,
             src,
@@ -1094,9 +1262,7 @@ extern "C" int samurai_gpu_packet_generate_stateful_packets(
     if (init_c_api_outputs(out_data, out_size, out_packet_size) != 0) {
       return -1;
     }
-    const std::vector<std::vector<uint8_t>> templates =
-        decode_flat_templates(templates_flat, templates_flat_len, packet_size, num_templates);
-    if (templates.empty()) {
+    if (num_templates == 0) {
       g_samurai_gpu_packet_last_error.clear();
       return 0;
     }
@@ -1109,19 +1275,12 @@ extern "C" int samurai_gpu_packet_generate_stateful_packets(
     const std::string subnet = spoof_subnet ? std::string(spoof_subnet) : std::string("1.0.0.0/8");
     cudaStream_t stream = decode_stream_handle(stream_handle);
 
-    const std::vector<uint32_t> seq = vector_from_c_array(seq_list, seq_len, "seq_list");
-    const std::vector<uint32_t> ack = vector_from_c_array(ack_list, ack_len, "ack_list");
-    const std::vector<uint8_t> state = vector_from_c_array(state_list, state_len, "state_list");
-    const std::vector<uint32_t> lengths =
-        vector_from_c_array(actual_lengths, actual_lengths_len, "actual_lengths");
-    const std::vector<uint16_t> wins =
-        vector_from_c_array(window_sizes, window_sizes_len, "window_sizes");
-    const std::vector<uint16_t> msss = vector_from_c_array(mss_values, mss_values_len, "mss_values");
-    const std::vector<uint8_t> ttlv = vector_from_c_array(ttls, ttls_len, "ttls");
-
     ddos_samurai::gpu_packet_cuda::PacketResult res =
         ddos_samurai::gpu_packet_cuda::generate_stateful_packets(
-            templates,
+            templates_flat,
+            templates_flat_len,
+            packet_size,
+            num_templates,
             count,
             target,
             spoof_ip != 0,
@@ -1131,13 +1290,20 @@ extern "C" int samurai_gpu_packet_generate_stateful_packets(
             stream,
             gateway_mac,
             subnet,
-            seq,
-            ack,
-            state,
-            lengths,
-            wins,
-            msss,
-            ttlv,
+            seq_list,
+            seq_len,
+            ack_list,
+            ack_len,
+            state_list,
+            state_len,
+            actual_lengths,
+            actual_lengths_len,
+            window_sizes,
+            window_sizes_len,
+            mss_values,
+            mss_values_len,
+            ttls,
+            ttls_len,
             force_global_fallback != 0);
 
     return export_packet_result(
