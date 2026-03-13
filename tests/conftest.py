@@ -2,6 +2,9 @@ import os
 
 import pytest
 
+os.environ.setdefault("SAMURAI_GPU_PACKET_BACKEND", "cuda_cpp")
+os.environ.setdefault("SAMURAI_GPU_PACKET_CUDA_CPP_NATIVE", "1")
+
 
 def _test_profile() -> str:
     raw = str(os.environ.get("SAMURAI_TEST_PROFILE", "ci_safe") or "ci_safe").strip().lower()

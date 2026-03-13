@@ -685,6 +685,31 @@ BenchmarkResult benchmark_template_generation_paths(
   return out;
 }
 
+void copy_device_buffer_to_host(
+    void* dst,
+    size_t dst_size,
+    const DeviceBuffer& gpu_arr,
+    cudaStream_t stream) {
+  if (!dst || dst_size == 0 || !gpu_arr.valid()) {
+    return;
+  }
+  if (dst_size < gpu_arr.size) {
+    throw std::invalid_argument("destination buffer is smaller than device buffer");
+  }
+  if (stream) {
+    throw_if_cuda(
+        cudaMemcpyAsync(dst, gpu_arr.ptr, gpu_arr.size, cudaMemcpyDeviceToHost, stream),
+        "cudaMemcpyAsync copy_device_buffer_to_host failed");
+    throw_if_cuda(cudaStreamSynchronize(stream), "copy_device_buffer_to_host synchronize failed");
+  } else {
+    throw_if_cuda(
+        cudaMemcpy(dst, gpu_arr.ptr, gpu_arr.size, cudaMemcpyDeviceToHost),
+        "cudaMemcpy copy_device_buffer_to_host failed");
+  }
+  g_d2h_transfer_count.fetch_add(1);
+  g_d2h_transfer_bytes.fetch_add(gpu_arr.size);
+}
+
 GPUPacketGenerator::GPUPacketGenerator(
     int max_batch_size,
     std::string real_src_ip,
@@ -733,6 +758,20 @@ std::vector<std::vector<uint8_t>> GPUPacketGenerator::generate_batch(
 namespace {
 thread_local std::string g_samurai_gpu_packet_last_error;
 
+constexpr uint64_t kExportHostBufferMagic = 0x53414d5552414931ull;  // SAMURAI1
+
+enum class ExportHostAllocKind : uint32_t {
+  kMalloc = 1u,
+  kCudaHost = 2u,
+};
+
+struct ExportHostBufferHeader {
+  uint64_t magic = kExportHostBufferMagic;
+  uint32_t alloc_kind = static_cast<uint32_t>(ExportHostAllocKind::kMalloc);
+  uint32_t reserved = 0u;
+  size_t size = 0u;
+};
+
 static int set_c_api_error(const std::string& msg) {
   g_samurai_gpu_packet_last_error = msg;
   return -1;
@@ -755,19 +794,50 @@ static int export_packet_result(
     uint8_t** out_data,
     size_t* out_size,
     int* out_packet_size) {
-  std::vector<uint8_t> host = ddos_samurai::gpu_packet_cuda::copy_gpu_to_host_pinned(
-      res.packets_gpu, key ? std::string(key) : std::string("c_api"), stream, true);
+  (void)key;
+  uint8_t* payload = nullptr;
+  ExportHostBufferHeader* header = nullptr;
+  try {
+    if (res.packets_gpu.valid()) {
+      const size_t total = sizeof(ExportHostBufferHeader) + res.packets_gpu.size;
+      void* raw = nullptr;
+      ExportHostAllocKind alloc_kind = ExportHostAllocKind::kCudaHost;
+      cudaError_t alloc_rc = cudaHostAlloc(&raw, total, cudaHostAllocPortable);
+      if (alloc_rc != cudaSuccess || !raw) {
+        raw = std::malloc(total);
+        alloc_kind = ExportHostAllocKind::kMalloc;
+        if (!raw) {
+          return set_c_api_error("host export allocation failed");
+        }
+      }
 
-  uint8_t* buf = nullptr;
-  if (!host.empty()) {
-    buf = static_cast<uint8_t*>(std::malloc(host.size()));
-    if (!buf) {
-      return set_c_api_error("malloc failed");
+      header = static_cast<ExportHostBufferHeader*>(raw);
+      header->magic = kExportHostBufferMagic;
+      header->alloc_kind = static_cast<uint32_t>(alloc_kind);
+      header->reserved = 0u;
+      header->size = res.packets_gpu.size;
+      payload = reinterpret_cast<uint8_t*>(header + 1);
+
+      if (res.packets_gpu.size > 0) {
+        ddos_samurai::gpu_packet_cuda::copy_device_buffer_to_host(
+            payload,
+            res.packets_gpu.size,
+            res.packets_gpu,
+            stream);
+      }
     }
-    std::memcpy(buf, host.data(), host.size());
+  } catch (const std::exception& e) {
+    if (header) {
+      if (static_cast<ExportHostAllocKind>(header->alloc_kind) == ExportHostAllocKind::kCudaHost) {
+        cudaFreeHost(static_cast<void*>(header));
+      } else {
+        std::free(static_cast<void*>(header));
+      }
+    }
+    return set_c_api_error(e.what());
   }
-  *out_data = buf;
-  *out_size = host.size();
+  *out_data = payload;
+  *out_size = res.packets_gpu.size;
   *out_packet_size = res.packet_size;
   g_samurai_gpu_packet_last_error.clear();
   return 0;
@@ -1252,9 +1322,21 @@ extern "C" int samurai_gpu_packet_generate_icmp_packets(
 }
 
 extern "C" void samurai_gpu_packet_free(void* ptr) {
-  if (ptr) {
-    std::free(ptr);
+  if (!ptr) {
+    return;
   }
+  auto* payload = static_cast<uint8_t*>(ptr);
+  auto* header = reinterpret_cast<ExportHostBufferHeader*>(payload) - 1;
+  if (header->magic != kExportHostBufferMagic) {
+    std::free(ptr);
+    return;
+  }
+  const auto kind = static_cast<ExportHostAllocKind>(header->alloc_kind);
+  if (kind == ExportHostAllocKind::kCudaHost) {
+    cudaFreeHost(static_cast<void*>(header));
+    return;
+  }
+  std::free(static_cast<void*>(header));
 }
 
 extern "C" const char* samurai_gpu_packet_last_error() {

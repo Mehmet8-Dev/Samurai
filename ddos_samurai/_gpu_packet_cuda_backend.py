@@ -10,6 +10,7 @@ import ctypes
 import contextlib
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,8 @@ def _normalize_native_policy(raw: str | None) -> str:
 
 
 _NATIVE_POLICY = _normalize_native_policy(os.environ.get(_NATIVE_POLICY_ENV, "allow"))
+_HOST_INPUT_CACHE: dict[tuple[int, str, str, int], np.ndarray] = {}
+_HOST_INPUT_CACHE_LOCK = threading.Lock()
 
 
 def _load_lib() -> ctypes.CDLL | None:
@@ -344,37 +347,88 @@ def _as_bytes(value: Any, default: str = "") -> bytes:
     return str(value).encode("utf-8")
 
 
-def _copy_host_array(out_ptr: ctypes.c_void_p, out_size: int, *, pool_key: str) -> np.ndarray:
+def _cached_host_array(cache_name: str, dtype: np.dtype, size: int) -> np.ndarray:
+    key = (int(threading.get_ident()), str(cache_name), np.dtype(dtype).str, int(size))
+    with _HOST_INPUT_CACHE_LOCK:
+        arr = _HOST_INPUT_CACHE.get(key)
+        if arr is None:
+            arr = np.empty((int(size),), dtype=dtype)
+            _HOST_INPUT_CACHE[key] = arr
+        return arr
+
+
+def _coerce_numeric_array(data: Any, dtype, *, cache_name: str | None = None) -> np.ndarray | None:
+    if data is None:
+        return None
+    want = np.dtype(dtype)
+    if isinstance(data, np.ndarray):
+        arr = np.ravel(data)
+        if arr.dtype != want:
+            arr = arr.astype(want, copy=False)
+        if arr.flags.c_contiguous:
+            return arr
+        out = _cached_host_array(cache_name or "numeric", want, int(arr.size))
+        out[: arr.size] = arr
+        return out[: arr.size]
+    if want == np.dtype(np.uint8) and isinstance(data, memoryview):
+        view = data if data.itemsize == 1 else data.cast("B")
+        arr = np.frombuffer(view, dtype=np.uint8)
+        if arr.flags.c_contiguous:
+            return arr
+    if want == np.dtype(np.uint8) and isinstance(data, (bytes, bytearray)):
+        return np.frombuffer(data, dtype=np.uint8)
+    arr = np.asarray(data, dtype=want).reshape(-1)
+    if arr.flags.c_contiguous and cache_name is None:
+        return arr
+    if arr.flags.c_contiguous and isinstance(data, np.ndarray):
+        return arr
+    out = _cached_host_array(cache_name or "numeric", want, int(arr.size))
+    out[: arr.size] = arr
+    return out[: arr.size]
+
+
+class _NativeHostAllocation:
+    __slots__ = ("_ptr", "_lib", "_lock", "_released")
+
+    def __init__(self, ptr: ctypes.c_void_p, lib):
+        self._ptr = ctypes.c_void_p(int(ptr.value or 0))
+        self._lib = lib
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            if self._lib is not None and bool(self._ptr):
+                try:
+                    self._lib.samurai_gpu_packet_free(self._ptr)
+                except Exception:
+                    pass
+
+    def __del__(self):
+        self.release()
+
+
+class _NativeHostArray(np.ndarray):
+    pass
+
+
+def _wrap_host_array(out_ptr: ctypes.c_void_p, out_size: int, *, pool_key: str) -> np.ndarray:
+    del pool_key
     size = int(out_size)
     if size <= 0:
         return np.empty((0,), dtype=np.uint8)
     if not bool(out_ptr):
         raise _legacy.GPUMemoryError("cuda_cpp backend returned null pointer with non-zero size")
-    out = None
-    try:
-        pool_getter = _safe_legacy_getattr("get_pinned_host_pool", None)
-        if callable(pool_getter):
-            try:
-                candidate = pool_getter().acquire(size, dtype=np.uint8, key=pool_key)
-                candidate = np.asarray(candidate)
-                if (
-                    candidate.dtype == np.uint8
-                    and candidate.ndim == 1
-                    and candidate.flags.c_contiguous
-                    and int(candidate.size) >= size
-                ):
-                    out = candidate[:size]
-            except Exception:
-                out = None
-        if out is None:
-            out = np.empty((size,), dtype=np.uint8)
-        ctypes.memmove(int(out.ctypes.data), int(out_ptr.value), size)
-        return out
-    finally:
-        try:
-            _LIB.samurai_gpu_packet_free(out_ptr)
-        except Exception:
-            pass
+    owner = _NativeHostAllocation(out_ptr, _LIB)
+    buf_type = ctypes.c_uint8 * size
+    buf = buf_type.from_address(int(out_ptr.value))
+    arr = np.ctypeslib.as_array(buf).view(_NativeHostArray)
+    arr._owner = owner
+    arr._ctypes_buf = buf
+    return arr
 
 
 def _raise_native_error(default_message: str):
@@ -407,26 +461,49 @@ def _materialize_native_output(
     pool_key: str,
     return_host_ready: bool = False,
 ):
-    host = _copy_host_array(out_ptr, out_size, pool_key=pool_key)
+    host = _wrap_host_array(out_ptr, out_size, pool_key=pool_key)
     if return_host_ready:
         return host
     try:
-        return _legacy.cp.asarray(host, dtype=_legacy.cp.uint8)
+        out = _legacy.cp.asarray(host, dtype=_legacy.cp.uint8)
     except Exception:
         return host
+    if isinstance(out, np.ndarray):
+        return host
+    owner = getattr(host, "_owner", None)
+    if owner is not None and hasattr(owner, "release"):
+        owner.release()
+        host._owner = None
+    return out
 
 
 def _flatten_templates(templates_bytes_list):
     if not templates_bytes_list:
-        return b"", 0, 0
-    normalized = [memoryview(t).tobytes() for t in templates_bytes_list]
-    packet_size = len(normalized[0])
-    for i, tpl in enumerate(normalized):
-        if len(tpl) != packet_size:
+        return np.empty((0,), dtype=np.uint8), 0, 0
+    first = _coerce_numeric_array(
+        templates_bytes_list[0],
+        np.uint8,
+        cache_name="template:first",
+    )
+    packet_size = int(first.size)
+    if packet_size <= 0:
+        return np.empty((0,), dtype=np.uint8), 0, int(len(templates_bytes_list))
+    num_templates = int(len(templates_bytes_list))
+    flat = _cached_host_array("templates_flat", np.uint8, packet_size * num_templates)
+    flat[:packet_size] = first[:packet_size]
+    for i, tpl_in in enumerate(templates_bytes_list[1:], start=1):
+        tpl = _coerce_numeric_array(
+            tpl_in,
+            np.uint8,
+            cache_name=f"template:{i}",
+        )
+        if int(tpl.size) != packet_size:
             raise ValueError(
-                f"All templates must be same size! Template {i} is {len(tpl)} bytes, expected {packet_size}"
+                f"All templates must be same size! Template {i} is {int(tpl.size)} bytes, expected {packet_size}"
             )
-    return b"".join(normalized), int(packet_size), int(len(normalized))
+        start = i * packet_size
+        flat[start : start + packet_size] = tpl[:packet_size]
+    return flat[: packet_size * num_templates], packet_size, num_templates
 
 
 def _array_ptr(arr: np.ndarray | None, ptr_type):
@@ -630,18 +707,21 @@ def generate_packets_from_template(
             force_global_fallback=force_global_fallback,
         )
 
-    template_view = memoryview(template_bytes).tobytes()
-    if not template_view:
+    template_arr = _coerce_numeric_array(
+        template_bytes,
+        np.uint8,
+        cache_name="generate_packets_from_template:template",
+    )
+    if template_arr is None or int(template_arr.size) <= 0:
         raise ValueError("template_bytes must not be empty")
-
-    tpl_buf = (ctypes.c_uint8 * len(template_view)).from_buffer_copy(template_view)
+    tpl_ptr, tpl_len = _array_ptr(template_arr, ctypes.POINTER(ctypes.c_uint8))
     out_ptr = ctypes.c_void_p()
     out_size = ctypes.c_size_t(0)
     out_packet_size = ctypes.c_int(0)
 
     rc = _LIB.samurai_gpu_packet_generate_packets_from_template(
-        tpl_buf,
-        ctypes.c_size_t(len(template_view)),
+        tpl_ptr,
+        ctypes.c_size_t(tpl_len),
         ctypes.c_int64(int(count)),
         ctypes.c_char_p(_as_bytes(real_src_ip, "192.168.1.100")),
         ctypes.c_int(1 if spoof_ip else 0),
@@ -703,14 +783,14 @@ def generate_packets_from_template_pool(
     if num_templates == 0:
         return None, 0
 
-    flat_buf = (ctypes.c_uint8 * len(flat)).from_buffer_copy(flat)
+    flat_ptr, flat_len = _array_ptr(flat, ctypes.POINTER(ctypes.c_uint8))
     out_ptr = ctypes.c_void_p()
     out_size = ctypes.c_size_t(0)
     out_packet_size = ctypes.c_int(0)
 
     rc = _LIB.samurai_gpu_packet_generate_packets_from_template_pool(
-        flat_buf,
-        ctypes.c_size_t(len(flat)),
+        flat_ptr,
+        ctypes.c_size_t(flat_len),
         ctypes.c_int64(packet_size),
         ctypes.c_int64(num_templates),
         ctypes.c_int64(int(count)),
@@ -776,19 +856,19 @@ def generate_fragmented_packets(
             spoof_subnet=spoof_subnet,
         )
 
-    payload_view = memoryview(payload_bytes).tobytes()
-    payload_buf = None
-    payload_ptr = None
-    if payload_view:
-        payload_buf = (ctypes.c_uint8 * len(payload_view)).from_buffer_copy(payload_view)
-        payload_ptr = payload_buf
+    payload_arr = _coerce_numeric_array(
+        payload_bytes,
+        np.uint8,
+        cache_name="generate_fragmented_packets:payload",
+    )
+    payload_ptr, payload_len = _array_ptr(payload_arr, ctypes.POINTER(ctypes.c_uint8))
 
     out_ptr = ctypes.c_void_p()
     out_size = ctypes.c_size_t(0)
     out_packet_size = ctypes.c_int(0)
     rc = _LIB.samurai_gpu_packet_generate_fragmented_packets(
         payload_ptr,
-        ctypes.c_size_t(len(payload_view)),
+        ctypes.c_size_t(payload_len),
         ctypes.c_int64(int(count)),
         ctypes.c_char_p(_as_bytes(target_ip)),
         ctypes.c_int64(int(target_port)),
@@ -845,10 +925,14 @@ def generate_amplification_packets(
     if not reflectors_ips:
         raise ValueError("reflectors_ips must not be empty")
 
-    template_view = memoryview(template_bytes).tobytes()
-    if not template_view:
+    template_arr = _coerce_numeric_array(
+        template_bytes,
+        np.uint8,
+        cache_name="generate_amplification_packets:template",
+    )
+    if template_arr is None or int(template_arr.size) <= 0:
         raise ValueError("template_bytes must not be empty")
-    tpl_buf = (ctypes.c_uint8 * len(template_view)).from_buffer_copy(template_view)
+    tpl_ptr, tpl_len = _array_ptr(template_arr, ctypes.POINTER(ctypes.c_uint8))
 
     reflector_bytes = [_as_bytes(ip) for ip in reflectors_ips]
     reflectors_arr = (ctypes.c_char_p * len(reflector_bytes))(*reflector_bytes)
@@ -857,8 +941,8 @@ def generate_amplification_packets(
     out_size = ctypes.c_size_t(0)
     out_packet_size = ctypes.c_int(0)
     rc = _LIB.samurai_gpu_packet_generate_amplification_packets(
-        tpl_buf,
-        ctypes.c_size_t(len(template_view)),
+        tpl_ptr,
+        ctypes.c_size_t(tpl_len),
         reflectors_arr,
         ctypes.c_size_t(len(reflector_bytes)),
         ctypes.c_char_p(_as_bytes(victim_ip)),
@@ -932,17 +1016,15 @@ def generate_stateful_packets(
     flat, packet_size, num_templates = _flatten_templates(templates_bytes_list)
     if num_templates == 0:
         return None
-    flat_buf = (ctypes.c_uint8 * len(flat)).from_buffer_copy(flat)
+    flat_ptr, flat_len = _array_ptr(flat, ctypes.POINTER(ctypes.c_uint8))
 
-    seq_arr = None if seq_list is None else np.asarray(seq_list, dtype=np.uint32).reshape(-1)
-    ack_arr = None if ack_list is None else np.asarray(ack_list, dtype=np.uint32).reshape(-1)
-    state_arr = None if state_list is None else np.asarray(state_list, dtype=np.uint8).reshape(-1)
-    lengths_arr = (
-        None if actual_lengths is None else np.asarray(actual_lengths, dtype=np.uint32).reshape(-1)
-    )
-    wins_arr = None if window_sizes is None else np.asarray(window_sizes, dtype=np.uint16).reshape(-1)
-    msss_arr = None if mss_values is None else np.asarray(mss_values, dtype=np.uint16).reshape(-1)
-    ttl_arr = None if ttls is None else np.asarray(ttls, dtype=np.uint8).reshape(-1)
+    seq_arr = _coerce_numeric_array(seq_list, np.uint32, cache_name="stateful:seq")
+    ack_arr = _coerce_numeric_array(ack_list, np.uint32, cache_name="stateful:ack")
+    state_arr = _coerce_numeric_array(state_list, np.uint8, cache_name="stateful:state")
+    lengths_arr = _coerce_numeric_array(actual_lengths, np.uint32, cache_name="stateful:lengths")
+    wins_arr = _coerce_numeric_array(window_sizes, np.uint16, cache_name="stateful:wins")
+    msss_arr = _coerce_numeric_array(mss_values, np.uint16, cache_name="stateful:mss")
+    ttl_arr = _coerce_numeric_array(ttls, np.uint8, cache_name="stateful:ttl")
 
     seq_ptr, seq_len = _array_ptr(seq_arr, ctypes.POINTER(ctypes.c_uint32))
     ack_ptr, ack_len = _array_ptr(ack_arr, ctypes.POINTER(ctypes.c_uint32))
@@ -956,8 +1038,8 @@ def generate_stateful_packets(
     out_size = ctypes.c_size_t(0)
     out_packet_size = ctypes.c_int(0)
     rc = _LIB.samurai_gpu_packet_generate_stateful_packets(
-        flat_buf,
-        ctypes.c_size_t(len(flat)),
+        flat_ptr,
+        ctypes.c_size_t(flat_len),
         ctypes.c_int64(packet_size),
         ctypes.c_int64(num_templates),
         ctypes.c_int64(int(count)),

@@ -1,4 +1,5 @@
 import ctypes
+import gc
 import importlib.util
 import types
 
@@ -247,6 +248,29 @@ def test_generate_packets_native_success(monkeypatch):
     monkeypatch.setattr(backend, "_LIB", fake, raising=True)
     monkeypatch.setattr(backend, "_NATIVE_ENABLED", True, raising=True)
 
+    class _FakeDeviceArray:
+        def __init__(self, arr):
+            self._arr = np.asarray(arr, dtype=np.uint8)
+
+        def __array__(self, dtype=None):
+            return np.asarray(self._arr, dtype=(dtype if dtype is not None else self._arr.dtype))
+
+    monkeypatch.setattr(
+        backend,
+        "_legacy",
+        types.SimpleNamespace(
+            GPUPacketError=backend._legacy.GPUPacketError,
+            GPUMemoryError=backend._legacy.GPUMemoryError,
+            cp=types.SimpleNamespace(
+                uint8=np.uint8,
+                asarray=lambda arr, dtype=None: _FakeDeviceArray(
+                    np.asarray(arr, dtype=(dtype if dtype is not None else np.uint8))
+                ),
+            ),
+        ),
+        raising=True,
+    )
+
     packets, packet_size = backend.generate_packets(
         count=2,
         target_ip="203.0.113.1",
@@ -304,6 +328,9 @@ def test_generate_packets_native_host_ready_skips_cp_asarray(monkeypatch):
     assert isinstance(packets, np.ndarray)
     assert packets.dtype == np.uint8
     assert _to_bytes(packets) == b"\x01\x02\x03\x04"
+    assert fake.free_called == 0
+    del packets
+    gc.collect()
     assert fake.free_called == 1
 
 
