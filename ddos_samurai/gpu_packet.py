@@ -109,6 +109,7 @@ def _temporary_synced_legacy_symbols():
 
 def _backend_call(name: str, *args, **kwargs):
     if ACTIVE_GPU_PACKET_BACKEND == "legacy":
+        kwargs.pop("return_host_ready", None)
         with _temporary_synced_legacy_symbols():
             return getattr(_legacy, name)(*args, **kwargs)
 

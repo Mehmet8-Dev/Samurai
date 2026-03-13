@@ -4,6 +4,8 @@ import types
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import numpy as np
+
 import ddos_samurai as ddos_pkg
 from ddos_samurai import orchestrator
 from ddos_samurai import senders
@@ -130,12 +132,13 @@ def _build_fake_gpu_payload_module():
     return mod
 
 
-def _build_fake_gpu_packet_module():
+def _build_fake_gpu_packet_module(*, host_ready_numpy=False):
     mod = types.ModuleType("ddos_samurai.gpu_packet")
     state = {
         "pinned_mb": 0,
         "h2d_count": 0,
         "h2d_bytes": 0,
+        "copy_calls": 0,
     }
 
     def configure_pinned_host_pool(max_mb=None, max_bytes=None):
@@ -156,12 +159,15 @@ def _build_fake_gpu_packet_module():
         gateway_mac=0,
         spoof_subnet="1.0.0.0/8",
         force_global_fallback=False,
+        return_host_ready=False,
     ):
         del target_ip, real_src_ip, spoof_ip, specific_src_port, has_ethernet, stream, gateway_mac, spoof_subnet, force_global_fallback
         packet_size = len(templates_bytes_list[0]) if templates_bytes_list else 54
         buf = bytearray(packet_size * int(count))
         state["h2d_count"] += 1
         state["h2d_bytes"] += len(buf)
+        if host_ready_numpy or return_host_ready:
+            return np.frombuffer(bytes(buf), dtype=np.uint8), packet_size
         return buf, packet_size
 
     def generate_packets(
@@ -177,16 +183,20 @@ def _build_fake_gpu_packet_module():
         stream=None,
         gateway_mac=0xFFFFFFFFFFFF,
         spoof_subnet="1.0.0.0/8",
+        return_host_ready=False,
     ):
         del target_ip, target_port, protocol, spoof_ip, real_src_ip, tcp_flags, has_ethernet, window, stream, gateway_mac, spoof_subnet
         packet_size = 54
         buf = bytearray(packet_size * int(count))
         state["h2d_count"] += 1
         state["h2d_bytes"] += len(buf)
+        if host_ready_numpy or return_host_ready:
+            return np.frombuffer(bytes(buf), dtype=np.uint8), packet_size
         return buf, packet_size
 
     def copy_gpu_to_host_pinned(gpu_arr, key="default", stream=None, blocking=True):
         del key, stream, blocking
+        state["copy_calls"] += 1
         return bytes(gpu_arr)
 
     class _PoolStats:
@@ -348,6 +358,76 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(ev["state_timeout_evictions"]), 0)
         self.assertEqual(int(ev["state_overwrites"]), 0)
         self.assertEqual(int(fake_gpu_packet._state["pinned_mb"]), int(args["gpu_pinned_max_mb"]))
+
+    async def test_cuda_pipeline_skips_d2h_copy_for_host_ready_native_buffers(self):
+        args = _base_args()
+        events = []
+        fake_gpu_packet = _build_fake_gpu_packet_module(host_ready_numpy=True)
+        fake_gpu_payload = _build_fake_gpu_payload_module()
+        fake_cupy = _build_fake_cupy_module()
+        fake_numba, fake_numba_cuda = _build_fake_numba_modules()
+
+        async def _fake_paced_sender(
+            *,
+            packets_buffer,
+            target_ip,
+            target_port,
+            count,
+            verbose,
+            pacing_config=None,
+            live_sent=None,
+            live_errors=None,
+            live_progress=None,
+        ):
+            del target_ip, target_port, verbose, pacing_config, live_sent, live_errors, live_progress
+            self.assertIsInstance(packets_buffer, np.ndarray)
+            return {
+                "attempted": int(count),
+                "sent": int(count),
+                "errors": 0,
+                "bytes_sent_est": int(count) * 54,
+                "sender_path": "PACED_L2",
+            }
+
+        template_bytes = (
+            b"\xaa\xaa\xaa\xaa\xaa\xaa"
+            b"\xbb\xbb\xbb\xbb\xbb\xbb"
+            b"\x08\x00"
+            b"\x45\x00\x00\x28\x00\x00\x00\x00\x40\x06\x00\x00"
+            b"\x01\x01\x01\x01\x02\x02\x02\x02"
+            b"\x04\xd2\x00\x50\x00\x00\x00\x01\x00\x00\x00\x00\x50\x02\x20\x00\x00\x00\x00\x00"
+        )
+
+        with patch.dict(
+            sys.modules,
+            {
+                "cupy": fake_cupy,
+                "numba": fake_numba,
+                "numba.cuda": fake_numba_cuda,
+                "ddos_samurai.gpu_packet": fake_gpu_packet,
+                "ddos_samurai.gpu_payload": fake_gpu_payload,
+            },
+            clear=False,
+        ), patch.object(
+            ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
+        ), patch.object(
+            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
+        ), patch.object(
+            orchestrator.packet, "create_packet", lambda _cfg: template_bytes
+        ), patch.object(
+            utils, "get_gateway_mac", lambda _target: "aa:bb:cc:dd:ee:ff"
+        ), patch.object(
+            senders, "FAST_SENDER_AVAILABLE", False
+        ), patch.object(
+            senders, "paced_raw_socket_sender", AsyncMock(side_effect=_fake_paced_sender)
+        ), patch.dict(
+            os.environ, {"SAMURAI_GPU_BATCH": "2"}, clear=False
+        ):
+            await orchestrator.worker_process(worker_id=0, args=args, ssl_context=None, run_events=events)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["status"], "ok")
+        self.assertEqual(int(fake_gpu_packet._state["copy_calls"]), 0)
 
     async def test_cuda_http2_path_uses_http2_sender_with_request_plan(self):
         args = _base_args()

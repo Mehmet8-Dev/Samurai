@@ -344,13 +344,32 @@ def _as_bytes(value: Any, default: str = "") -> bytes:
     return str(value).encode("utf-8")
 
 
-def _copy_host_bytes(out_ptr: ctypes.c_void_p, out_size: int) -> bytes:
-    if int(out_size) <= 0:
-        return b""
+def _copy_host_array(out_ptr: ctypes.c_void_p, out_size: int, *, pool_key: str) -> np.ndarray:
+    size = int(out_size)
+    if size <= 0:
+        return np.empty((0,), dtype=np.uint8)
     if not bool(out_ptr):
         raise _legacy.GPUMemoryError("cuda_cpp backend returned null pointer with non-zero size")
+    out = None
     try:
-        return ctypes.string_at(out_ptr, int(out_size))
+        pool_getter = _safe_legacy_getattr("get_pinned_host_pool", None)
+        if callable(pool_getter):
+            try:
+                candidate = pool_getter().acquire(size, dtype=np.uint8, key=pool_key)
+                candidate = np.asarray(candidate)
+                if (
+                    candidate.dtype == np.uint8
+                    and candidate.ndim == 1
+                    and candidate.flags.c_contiguous
+                    and int(candidate.size) >= size
+                ):
+                    out = candidate[:size]
+            except Exception:
+                out = None
+        if out is None:
+            out = np.empty((size,), dtype=np.uint8)
+        ctypes.memmove(int(out.ctypes.data), int(out_ptr.value), size)
+        return out
     finally:
         try:
             _LIB.samurai_gpu_packet_free(out_ptr)
@@ -381,12 +400,20 @@ def _raise_native_error(default_message: str):
     raise _legacy.GPUPacketError(msg)
 
 
-def _host_to_device_like(host_bytes: bytes):
-    arr = np.frombuffer(host_bytes, dtype=np.uint8).copy()
+def _materialize_native_output(
+    out_ptr: ctypes.c_void_p,
+    out_size: int,
+    *,
+    pool_key: str,
+    return_host_ready: bool = False,
+):
+    host = _copy_host_array(out_ptr, out_size, pool_key=pool_key)
+    if return_host_ready:
+        return host
     try:
-        return _legacy.cp.asarray(arr, dtype=_legacy.cp.uint8)
+        return _legacy.cp.asarray(host, dtype=_legacy.cp.uint8)
     except Exception:
-        return arr
+        return host
 
 
 def _flatten_templates(templates_bytes_list):
@@ -520,6 +547,7 @@ def generate_packets(
     stream=None,
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
+    return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_packets", stream)
     if not _native_ready() or stream_handle < 0:
@@ -564,8 +592,13 @@ def generate_packets(
     if int(rc) != 0:
         _raise_native_error("samurai_gpu_packet_generate_packets failed")
 
-    host = _copy_host_bytes(out_ptr, int(out_size.value))
-    return _host_to_device_like(host), int(out_packet_size.value)
+    out = _materialize_native_output(
+        out_ptr,
+        int(out_size.value),
+        pool_key="cuda_cpp:generate_packets",
+        return_host_ready=bool(return_host_ready),
+    )
+    return out, int(out_packet_size.value)
 
 
 def generate_packets_from_template(
@@ -578,6 +611,7 @@ def generate_packets_from_template(
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
     force_global_fallback=False,
+    return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_packets_from_template", stream)
     if not _native_ready() or stream_handle < 0:
@@ -623,8 +657,13 @@ def generate_packets_from_template(
     if int(rc) != 0:
         _raise_native_error("samurai_gpu_packet_generate_packets_from_template failed")
 
-    host = _copy_host_bytes(out_ptr, int(out_size.value))
-    return _host_to_device_like(host), int(out_packet_size.value)
+    out = _materialize_native_output(
+        out_ptr,
+        int(out_size.value),
+        pool_key="cuda_cpp:generate_packets_from_template",
+        return_host_ready=bool(return_host_ready),
+    )
+    return out, int(out_packet_size.value)
 
 
 def generate_packets_from_template_pool(
@@ -639,6 +678,7 @@ def generate_packets_from_template_pool(
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
     force_global_fallback=False,
+    return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_packets_from_template_pool", stream)
     if not _native_ready() or stream_handle < 0:
@@ -690,8 +730,13 @@ def generate_packets_from_template_pool(
     if int(rc) != 0:
         _raise_native_error("samurai_gpu_packet_generate_packets_from_template_pool failed")
 
-    host = _copy_host_bytes(out_ptr, int(out_size.value))
-    return _host_to_device_like(host), int(out_packet_size.value)
+    out = _materialize_native_output(
+        out_ptr,
+        int(out_size.value),
+        pool_key="cuda_cpp:generate_packets_from_template_pool",
+        return_host_ready=bool(return_host_ready),
+    )
+    return out, int(out_packet_size.value)
 
 
 def generate_fragmented_packets(
@@ -708,6 +753,7 @@ def generate_fragmented_packets(
     stream=None,
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
+    return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_fragmented_packets", stream)
     if not _native_ready() or stream_handle < 0:
@@ -762,8 +808,13 @@ def generate_fragmented_packets(
     if int(rc) != 0:
         _raise_native_error("samurai_gpu_packet_generate_fragmented_packets failed")
 
-    host = _copy_host_bytes(out_ptr, int(out_size.value))
-    return _host_to_device_like(host), int(out_packet_size.value)
+    out = _materialize_native_output(
+        out_ptr,
+        int(out_size.value),
+        pool_key="cuda_cpp:generate_fragmented_packets",
+        return_host_ready=bool(return_host_ready),
+    )
+    return out, int(out_packet_size.value)
 
 
 def generate_amplification_packets(
@@ -774,6 +825,7 @@ def generate_amplification_packets(
     has_ethernet=True,
     stream=None,
     gateway_mac=0xFFFFFFFFFFFF,
+    return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_amplification_packets", stream)
     if not _native_ready() or stream_handle < 0:
@@ -821,8 +873,13 @@ def generate_amplification_packets(
     if int(rc) != 0:
         _raise_native_error("samurai_gpu_packet_generate_amplification_packets failed")
 
-    host = _copy_host_bytes(out_ptr, int(out_size.value))
-    return _host_to_device_like(host), int(out_packet_size.value)
+    out = _materialize_native_output(
+        out_ptr,
+        int(out_size.value),
+        pool_key="cuda_cpp:generate_amplification_packets",
+        return_host_ready=bool(return_host_ready),
+    )
+    return out, int(out_packet_size.value)
 
 
 def generate_stateful_packets(
@@ -844,6 +901,7 @@ def generate_stateful_packets(
     mss_values=None,
     ttls=None,
     force_global_fallback=False,
+    return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_stateful_packets", stream)
     if not _native_ready() or stream_handle < 0:
@@ -933,8 +991,13 @@ def generate_stateful_packets(
     if int(rc) != 0:
         _raise_native_error("samurai_gpu_packet_generate_stateful_packets failed")
 
-    host = _copy_host_bytes(out_ptr, int(out_size.value))
-    return _host_to_device_like(host), int(out_packet_size.value)
+    out = _materialize_native_output(
+        out_ptr,
+        int(out_size.value),
+        pool_key="cuda_cpp:generate_stateful_packets",
+        return_host_ready=bool(return_host_ready),
+    )
+    return out, int(out_packet_size.value)
 
 
 def benchmark_template_generation_paths(*args, **kwargs):
@@ -953,6 +1016,7 @@ def generate_icmp_packets(
     stream=None,
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
+    return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_icmp_packets", stream)
     if not _native_ready() or stream_handle < 0:
@@ -995,8 +1059,13 @@ def generate_icmp_packets(
     if int(rc) != 0:
         _raise_native_error("samurai_gpu_packet_generate_icmp_packets failed")
 
-    host = _copy_host_bytes(out_ptr, int(out_size.value))
-    return _host_to_device_like(host), int(out_packet_size.value)
+    out = _materialize_native_output(
+        out_ptr,
+        int(out_size.value),
+        pool_key="cuda_cpp:generate_icmp_packets",
+        return_host_ready=bool(return_host_ready),
+    )
+    return out, int(out_packet_size.value)
 
 
 def get_generation_telemetry() -> dict:
@@ -1023,8 +1092,24 @@ def configure_pinned_host_pool(*args, **kwargs):
     return _call_legacy("configure_pinned_host_pool", *args, **kwargs)
 
 
-def copy_gpu_to_host_pinned(*args, **kwargs):
-    return _call_legacy("copy_gpu_to_host_pinned", *args, **kwargs)
+def copy_gpu_to_host_pinned(gpu_arr, *args, **kwargs):
+    if isinstance(gpu_arr, memoryview):
+        return gpu_arr if gpu_arr.itemsize == 1 else gpu_arr.cast("B")
+    if isinstance(gpu_arr, np.ndarray):
+        if gpu_arr.dtype == np.uint8 and gpu_arr.ndim == 1 and gpu_arr.flags.c_contiguous:
+            return gpu_arr
+        flat = np.ravel(gpu_arr)
+        if flat.dtype != np.uint8:
+            if flat.dtype.itemsize == 1:
+                flat = flat.view(np.uint8)
+            else:
+                flat = flat.astype(np.uint8, copy=False)
+        if flat.flags.c_contiguous:
+            return flat
+        return np.ascontiguousarray(flat)
+    if isinstance(gpu_arr, (bytes, bytearray)):
+        return gpu_arr
+    return _call_legacy("copy_gpu_to_host_pinned", gpu_arr, *args, **kwargs)
 
 
 def get_pool_telemetry() -> dict:

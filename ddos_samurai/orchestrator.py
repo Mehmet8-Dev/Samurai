@@ -1135,6 +1135,16 @@ async def worker_process(
 
             def _gpu_to_host(gpu_arr, key: str, stream=None, blocking: bool = True):
                 """Copy GPU array to host via shared pinned-memory pool."""
+                if isinstance(gpu_arr, memoryview):
+                    return gpu_arr if gpu_arr.itemsize == 1 else gpu_arr.cast("B")
+                if isinstance(gpu_arr, (bytes, bytearray)):
+                    return gpu_arr
+                try:
+                    import numpy as _np
+                except Exception:
+                    _np = None
+                if _np is not None and isinstance(gpu_arr, _np.ndarray):
+                    return gpu_arr
                 pool_key = f"worker{worker_id}:{key}"
                 return gpu_packet.copy_gpu_to_host_pinned(
                     gpu_arr,
@@ -1813,6 +1823,7 @@ async def worker_process(
                         has_ethernet=True,
                         stream=stream_ring[stream_idx],
                         gateway_mac=gw_mac_int,
+                        return_host_ready=True,
                     )
                     current_batch = {
                         "cpu": _gpu_to_host(
@@ -1953,7 +1964,8 @@ async def worker_process(
                         specific_src_port=start_port,
                         window_sizes=win_list,
                         mss_values=mss_list,
-                        ttls=ttl_list
+                        ttls=ttl_list,
+                        return_host_ready=True,
                     )
                     current_batch = {
                         "cpu": _gpu_to_host(
@@ -2241,6 +2253,7 @@ async def worker_process(
                         stream=stream_ring[stream_idx],
                         gateway_mac=gw_mac_int,
                         spoof_subnet=args.get('spoof_subnet', '1.0.0.0/8'),
+                        return_host_ready=True,
                     )
                     if gpu_res is None:
                         log_error("GPU full-variation packet generation failed.")
@@ -2382,7 +2395,8 @@ async def worker_process(
                     has_ethernet=True,
                     stream=stream_ring[stream_idx],
                     gateway_mac=gw_mac_int,
-                    spoof_subnet=args.get('spoof_subnet', '1.0.0.0/8')
+                    spoof_subnet=args.get('spoof_subnet', '1.0.0.0/8'),
+                    return_host_ready=True,
                 )
                 if gpu_res is None:
                     log_error("GPU packet generation failed.")

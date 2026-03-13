@@ -1,5 +1,6 @@
 import ctypes
 import importlib.util
+import types
 
 import numpy as np
 import pytest
@@ -255,6 +256,53 @@ def test_generate_packets_native_success(monkeypatch):
         has_ethernet=True,
     )
     assert packet_size == 2
+    assert _to_bytes(packets) == b"\x01\x02\x03\x04"
+    assert fake.free_called == 1
+
+
+def test_copy_gpu_to_host_pinned_passthroughs_host_array_without_legacy_copy(monkeypatch):
+    monkeypatch.setattr(
+        backend,
+        "_call_legacy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy copy path should not run")),
+        raising=True,
+    )
+    arr = np.arange(8, dtype=np.uint8)
+    out = backend.copy_gpu_to_host_pinned(arr, key="unused")
+    assert out is arr
+    assert out.dtype == np.uint8
+
+
+def test_generate_packets_native_host_ready_skips_cp_asarray(monkeypatch):
+    fake = _FakeLib(payload=b"\x01\x02\x03\x04", packet_size=2, rc=0)
+    monkeypatch.setattr(backend, "_LIB", fake, raising=True)
+    monkeypatch.setattr(backend, "_NATIVE_ENABLED", True, raising=True)
+    monkeypatch.setattr(
+        backend,
+        "_legacy",
+        types.SimpleNamespace(
+            GPUPacketError=backend._legacy.GPUPacketError,
+            GPUMemoryError=backend._legacy.GPUMemoryError,
+            cp=types.SimpleNamespace(
+                uint8=np.uint8,
+                asarray=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cp.asarray must not run")),
+            ),
+        ),
+        raising=True,
+    )
+
+    packets, packet_size = backend.generate_packets(
+        count=2,
+        target_ip="203.0.113.1",
+        target_port=80,
+        protocol="tcp",
+        spoof_ip=False,
+        has_ethernet=True,
+        return_host_ready=True,
+    )
+    assert packet_size == 2
+    assert isinstance(packets, np.ndarray)
+    assert packets.dtype == np.uint8
     assert _to_bytes(packets) == b"\x01\x02\x03\x04"
     assert fake.free_called == 1
 
