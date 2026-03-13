@@ -1348,21 +1348,9 @@ def build_live_attack_report(
         wire_tx_over_attempted_packets_total = int(
             max(wire_tx_over_attempted_packets_total, _wire_over_attempted_derived)
         )
-        wire_loss_raw_uncapped_packets_total = int(
-            max(
-                0,
-                wire_loss_raw_uncapped_packets_total,
-                wire_loss_raw_packets_total,
-                _wire_loss_derived,
-            )
-        )
+        wire_loss_raw_uncapped_packets_total = int(max(0, _wire_loss_derived))
         wire_loss_raw_packets_total = int(wire_loss_raw_uncapped_packets_total)
-        wire_loss_est_packets_total = int(
-            min(
-                max(0, attempted_total),
-                max(0, int(wire_loss_est_packets_total), int(wire_loss_raw_packets_total)),
-            )
-        )
+        wire_loss_est_packets_total = int(min(max(0, attempted_total), int(wire_loss_raw_packets_total)))
     else:
         # Legacy fallback when explicit wire counters are unavailable.
         wire_loss_raw_uncapped_packets_total = int(

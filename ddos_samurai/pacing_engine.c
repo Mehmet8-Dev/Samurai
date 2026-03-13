@@ -1377,6 +1377,11 @@ static PyObject *py_paced_send_l3(PyObject *self,
     else if (pacing_mode == PACING_BURST)
         eff_ipg = 0;  /* no gap inside burst; burst_gap_ns between bursts */
 
+    double stats_target_rps = target_rps;
+    if (stats_target_rps <= 0.0 && pacing_mode == PACING_IPG && eff_ipg > 0) {
+        stats_target_rps = 1e9 / (double)eff_ipg;
+    }
+
     /* token bucket (RPS mode fallback if precision_wait isn't used) */
     token_bucket_t tb = {0};
     if (pacing_mode == PACING_RPS && target_rps > 0)
@@ -1384,7 +1389,7 @@ static PyObject *py_paced_send_l3(PyObject *self,
 
     /* stats reset */
     pthread_mutex_lock(&g_stats_lock);
-    stats_reset(target_rps);
+    stats_reset(stats_target_rps);
     g_stats.so_txtime_active = txtime_ok;
     pthread_mutex_unlock(&g_stats_lock);
 
@@ -1627,12 +1632,17 @@ static PyObject *py_paced_send_l2(PyObject *self,
     if      (pacing_mode == PACING_IPG   && ipg_ns > 0)      eff_ipg = (uint64_t)ipg_ns;
     else if (pacing_mode == PACING_RPS   && target_rps > 0)   eff_ipg = (uint64_t)(1e9 / target_rps);
 
+    double stats_target_rps = target_rps;
+    if (stats_target_rps <= 0.0 && pacing_mode == PACING_IPG && eff_ipg > 0) {
+        stats_target_rps = 1e9 / (double)eff_ipg;
+    }
+
     token_bucket_t tb = {0};
     if (pacing_mode == PACING_RPS && target_rps > 0)
         tb_init(&tb, target_rps, (double)(burst_size > 0 ? burst_size : 1));
 
     pthread_mutex_lock(&g_stats_lock);
-    stats_reset(target_rps);
+    stats_reset(stats_target_rps);
     g_stats.txring_packet_version = g_ring.packet_version;
     g_stats.afpacket_hugepage_mode = g_ring.hp_runtime.mode;
     g_stats.afpacket_hugepage_effective = g_ring.hp_runtime.effective;

@@ -356,6 +356,65 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["wire_loss_raw_gt_attempted"], 0)
         self.assertEqual(rr.results["txring_kernel_raw_tp_drops"], 400)
 
+    def test_live_attack_report_derives_wire_loss_once_for_shared_interface_counters(self):
+        from ddos_samurai import reporting
+
+        events = [
+            {
+                "status": "ok",
+                "attack_vector": "basic",
+                "compute_backend": "cuda",
+                "sender_path": "PACED_L2",
+                "wire_counter_available": 1,
+                "wire_counter_source": "sysfs_netdev_stats",
+                "wire_counter_confidence": 1.0,
+                "wire_tx_packets_delta": 45,
+                "wire_loss_est_packets": 10,
+                "wire_loss_raw_packets": 10,
+                "stats": {
+                    "attempted": 50,
+                    "sent": 50,
+                    "errors": 0,
+                    "bytes_sent_est": 3200,
+                },
+            },
+            {
+                "status": "ok",
+                "attack_vector": "basic",
+                "compute_backend": "cuda",
+                "sender_path": "PACED_L2",
+                "wire_counter_available": 1,
+                "wire_counter_source": "sysfs_netdev_stats",
+                "wire_counter_confidence": 1.0,
+                "wire_tx_packets_delta": 45,
+                "wire_loss_est_packets": 10,
+                "wire_loss_raw_packets": 10,
+                "stats": {
+                    "attempted": 50,
+                    "sent": 50,
+                    "errors": 0,
+                    "bytes_sent_est": 3200,
+                },
+            },
+        ]
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1"},
+            worker_events=events,
+            duration_s=1.0,
+            progress_total=100,
+            total_count=100,
+            metrics={},
+            warnings=[],
+        )
+
+        self.assertEqual(rr.results["wire_tx_packets_delta"], 90)
+        self.assertEqual(rr.results["wire_tx_accounted_packets"], 90)
+        self.assertEqual(rr.results["wire_loss_raw_packets"], 10)
+        self.assertEqual(rr.results["wire_loss_est_packets"], 10)
+        self.assertAlmostEqual(rr.results["wire_loss_est_pct"], 10.0, places=4)
+        self.assertEqual(rr.results["wire_loss_status"], "fail")
+
     def test_live_attack_report_computes_hold_block_pressure(self):
         from ddos_samurai import reporting
 
