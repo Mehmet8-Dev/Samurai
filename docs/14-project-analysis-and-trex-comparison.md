@@ -1,5 +1,9 @@
 # Samurai — Detaylı Proje Analizi ve Cisco TRex Karşılaştırması
 
+> Legacy notu (2026-03-14): Bu belge tarihsel analiz icerir. Bu checkout'ta
+> `dashboard/` ve `ddos_samurai/api.py` bulunmadigi icin UI/API kisimlari
+> aktif runtime yerine arsiv baglam olarak degerlendirilmelidir.
+
 Bu doküman Samurai (Ronin) projesinin kapsamlı analizini ve Cisco TRex ile detaylı karşılaştırma/puanlamasını içerir.
 
 ## Guncel Durum Ozeti (2026-03-07)

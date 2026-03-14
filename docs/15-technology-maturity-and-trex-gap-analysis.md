@@ -1,5 +1,9 @@
 # 15 - Teknoloji Olgunluk ve Cisco TRex Fark Analizi
 
+> Legacy notu (2026-03-14): Bu belge tarihsel analiz icerir. Bu checkout'ta
+> `dashboard/` ve `ddos_samurai/api.py` bulunmadigi icin UI/API/SaaS ile ilgili
+> bolumler aktif runtime yerine arsiv baglam olarak okunmalidir.
+
 Tarih: 2026-03-07  
 Kapsam: Tam stack (`ddos_samurai/` + API + dashboard + monitoring + testler + raporlar)
 

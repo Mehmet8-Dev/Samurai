@@ -45,22 +45,21 @@ Ek tanilama:
 
 - GPU modulleri icinde `cuda.is_available()` ve memory info raporlari mevcut.
 
-## 4) Dashboard "Disconnected" / API Offline
+## 4) Legacy API/Dashboard Referanslari
 
 Belirti:
 
-- UI ust bar'da API Offline gorunur
-- Console'da `API unreachable` uyarisi gorunebilir
+- Dokumanlarda API/dashboard adimlari gorunuyor ama repoda ilgili kaynaklar yok.
 
 Kontrol listesi:
 
-- API gercekten ayakta mi?
-  - Docker: `docker compose logs -f api`
-- Port mapping dogru mu?
-  - Beklenen: host `5099` -> api container `5099`
-- Dashboard hangi API base URL'i kullaniyor?
-  - Dev mod: `dashboard/.env` icindeki `VITE_API_BASE_URL`
-  - Production build: Vite env degeri build-time'da embed edilir; degistirdiyseniz yeniden build gerekir.
+- Bu checkout'ta `dashboard/` dizini var mi?
+- Bu checkout'ta `ddos_samurai/api.py` var mi?
+
+Not:
+
+- 2026-03-14 itibariyla bu checkout'ta API/dashboard kaynaklari bulunmuyor.
+- Bu nedenle `docs/11-docker.md`, `docs/12-dashboard.md`, `docs/13-api.md` belgeleri legacy baglamdadir.
 
 ## 5) Docker icinde "Operation not permitted" (NET_RAW / NET_ADMIN)
 

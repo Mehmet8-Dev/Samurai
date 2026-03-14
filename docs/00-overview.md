@@ -4,69 +4,70 @@ Release modeli: `Samurai (Ronin)`
 
 ## Hedef
 
-Samurai, farkli "attack vector" (L4 ve L7) akislari icin ortak bir calistirma modeli sunar:
+Samurai, farkli trafik vektorleri (L3/L4/L7) icin ortak bir calistirma modeli sunar:
 
-- Tek bir CLI arayuzu (`ddos_samurai/cli.py`)
-- Bir worker/process modeli (`ddos_samurai/orchestrator.py`)
-- Birden fazla gonderim motoru ("sender") ve paket/payload ureti mi ("builder/engine")
+- Tek CLI arayuzu (`ddos_samurai/cli.py`)
+- Worker/process modeli (`ddos_samurai/orchestrator.py`)
+- Birden fazla sender ve paket/payload engine
 
-Bu dokuman, kod tabaninda degisiklik yapacak kisi icin "nereden baslamali" ve "hangi katman ne is yapar" sorularini cevaplar.
+Bu dokuman, kod tabaninda degisiklik yapacak kisi icin "nereden baslamali" sorusuna cevap verir.
 
 ## Yuksek Seviyede Veri Akisi
 
 1. Giris noktasi: `advv2.py`
 2. CLI parse + config merge: `ddos_samurai/cli.py`
-3. Guvenlik kapilari (target allowlist/public block): `ddos_samurai/utils.py`
+3. Guvenlik kapilari: `ddos_samurai/utils.py`
 4. Worker spawn: `multiprocessing.Process(... orchestrator.start_worker ...)`
-5. Worker icinde async dispatch: `ddos_samurai/orchestrator.py:worker_process()`
-6. Vektore gore:
-   - CPU L4: `ddos_samurai/senders.py:packet_sender()` + `ddos_samurai/packet.py:create_packet()`
-   - GPU L4: `ddos_samurai/gpu_packet.py` + `ddos_samurai/senders.py:raw_socket_sender()`
-   - L7: `ddos_samurai/senders.py:http_app_sender/http2_sender/websocket_sender/quic_sender/...`
-   - AF_XDP (opsiyonel): `ddos_samurai/af_xdp_sender.py` uzerinden
-
-## Dashboard + API (Opsiyonel Kontrol Yuzeyi)
-
-Bu repoda "UI ile kontrol" icin opsiyonel iki katman vardir:
-
-- API: `ddos_samurai/api.py` (FastAPI)
-- UI: `dashboard/` (React)
-
-UI, API'yi poll ederek log/stats goruntuler ve start/stop komutlarini gonderir.
-Detay:
-
-- `docs/12-dashboard.md`
-- `docs/13-api.md`
+5. Worker async dispatch: `ddos_samurai/orchestrator.py:worker_process()`
+6. Vektore gore yol secimi:
+   - CPU L4/L3: `ddos_samurai/senders.py` + `ddos_samurai/packet.py`
+   - GPU L4/L3: `ddos_samurai/gpu_packet.py` + native CUDA backend + sender
+   - L7: `ddos_samurai/senders.py` ve `ddos_samurai/l7_state_engine.c`
+   - AF_XDP/TX_RING: `ddos_samurai/af_xdp_sender.py`, `fast_sender.c`, `dataplane_core.c`
 
 ## Katmanlar ve Sorumluluklar
 
-### CLI katmani (`ddos_samurai/cli.py`)
+### CLI (`ddos_samurai/cli.py`)
 
 - Arg parse (argparse)
-- YAML config'ten default set etme
-- "dry-run" (packet builder dogrulama) gibi calistirma modlari
-- Safety gate'leri calistirma
-- Worker/process sayisi ve is bolumu
+- Config/default birlestirme
+- Dry-run / self-test / benchmark-run girisleri
+- Safety gate ve profile preflight
+- Runtime env bridge (`SAMURAI_*` export)
 
 ### Orkestrator (`ddos_samurai/orchestrator.py`)
 
-- Worker process entrypoint + CPU affinity denemesi
-- Tek bir "args dict" uzerinden backend/vektor secimi
-- Backend'e gore uygun sender/engine cagrisi
+- Worker process entrypoint + affinity denemesi
+- Backend/vektor dispatch
+- L4/L7 sender akislari arasinda route
 
 ### Sender katmani (`ddos_samurai/senders.py` + `ddos_samurai/_senders/*`)
 
-- `senders.py`: strict facade (public API + compatibility/patch noktalarini korur)
-- `_senders/*`: asıl implementasyon modulleri (L2/L3, L7, stats, runtime, context)
-- CPU tabanli Scapy, raw socket hizli yollari, L7 sender'lar ve AF_XDP bu ic modullere dagitilmistir
+- `senders.py`: public facade + uyumluluk noktasi
+- `_senders/*`: L2/L3, L7, stats, runtime/context implementasyonlari
 
-### Paket/payload ureti mi
+### Paket/Payload Uretimi
 
 - CPU (Scapy): `ddos_samurai/packet.py`
-- GPU (Numba/CuPy): `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_payload.py`, anomaly icin `ddos_samurai/anomaly_packet.py`
+- GPU (Numba/CuPy + native CUDA bridge): `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_payload.py`, `ddos_samurai/anomaly_packet.py`
+
+## GPU-CPU Is Bolumu (pratik)
+
+- GPU: header/payload varyasyon, checksum/mutasyon, paralel random/template coguletme
+- CPU: stateful takip, timer/timeout, TX path (socket/TX_RING/AF_XDP), raporlama
+
+Stateful TCP/L7 session tarafi agirlikli olarak CPU/C state engine uzerindedir.
+
+## Repo Gercegi Notu (2026-03-14)
+
+Bu checkout'ta:
+- `dashboard/` dizini yok
+- `ddos_samurai/api.py` yok
+
+Bu nedenle UI/API odakli belgeler tarihsel/legacy baglam olarak okunmalidir.
 
 ## Calisma Ortami Notlari
 
-- Raw socket, AF_XDP, TX_RING gibi yollar genelde root/uygun capability ister.
-- Baz ortamlarda Scapy, interface listesi icin netlink soketi acmaya calisir. Bu, sandbox/CI ortamina gore PermissionError uretebilir.
-- Bu repo, "lazy import" kullanarak GPU init'ini geciktirmeye calisir (ornek: CLI'da orchestrator importu parse sonrasina atilmis).
+- Raw socket, AF_XDP, TX_RING gibi yollar root/capability isteyebilir.
+- CUDA yolu driver/runtime uyumuna baglidir.
+- CI/sandbox ortamlarinda Scapy/GPU/root gereksinimleri nedeniyle skip veya permission hatalari gorulebilir.

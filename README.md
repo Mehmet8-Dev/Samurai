@@ -1,21 +1,21 @@
 # Samurai (Ronin)
 
-Samurai, **yalnizca yetkili ortamlarda** kullanilmak uzere tasarlanmis, moduler bir ag stres ve guvenlik test platformudur.
+Samurai, **yalnizca yetkili ortamlarda** kullanilmak uzere tasarlanmis moduler bir ag stres ve guvenlik test platformudur.
 
-Proje; tek bir CLI uzerinden CPU/GPU veri yollari, C hizlandirma katmanlari, opsiyonel SaaS API + dashboard ve dis monitoring yiginini birlestirir.
+Odak alanlari:
+- L3/L4/L7 trafik ve davranis testleri
+- CPU + C extension + opsiyonel CUDA hizlandirma
+- Profil tabanli benchmark, run-report ve telemetry
 
-## Release Model
+## Durum (2026-03-14)
 
-- Mevcut release: `Samurai (Ronin)`.
-- Test vektorleri: L4/L3 (TCP/UDP/ICMP/PCAP) ve L7 (HTTP/HTTP2/WebSocket/QUIC), ayrica slow/anomaly/amplification senaryolari.
-- Performans odagi: C hizlandirma + opsiyonel CUDA ile yuksek PPS ve daha stabil pacing/TX pipeline.
+- Aktif cekirdek: `advv2.py` + `ddos_samurai/cli.py` + `orchestrator/senders`
+- Aktif hizli yollar: `fast_sender.c`, `pacing_engine.c`, `xdp_sender.c`, `dataplane_core.c`
+- Aktif GPU yolu: Python bridge + native CUDA (`ddos_samurai/libgpu_packet_cuda.so`)
+- Repo kokunde `dashboard/` dizini yok.
+- Repo icinde `ddos_samurai/api.py` yok.
 
-## Durum Ozeti
-
-- Mimari: Python + C extension + opsiyonel CUDA + FastAPI + React
-- Release: `Ronin`
-- Olgunluk: Guclu teknik beta / pilot-ready
-- Odak: Yetkili ortamlarda L4/L7 yuk testi, davranis testi, gozlemlenebilirlik
+Not: `docker-compose.yml` icinde `api`/`dashboard` servis tanimlari var; bu checkout'ta ilgili kaynaklar bulunmadigi icin dogrudan calismaz.
 
 ## Yasal ve Etik Sinir
 
@@ -24,85 +24,56 @@ Yetkisiz sistemlere trafik gondermek yasa disi olabilir ve tum sorumluluk kullan
 
 ## Ana Bilesenler
 
-- CLI giris noktasi: `advv2.py`, `ddos_samurai/cli.py`
-- Worker / dispatch: `ddos_samurai/orchestrator.py`
-- Sender katmani: `ddos_samurai/senders.py`
-- CPU paket uretimi: `ddos_samurai/packet.py`, `ddos_samurai/cpu_packet_engine.py`
+- CLI giris: `advv2.py`, `ddos_samurai/cli.py`
+- Worker/dispatch: `ddos_samurai/orchestrator.py`
+- Sender facade + ic moduller: `ddos_samurai/senders.py`, `ddos_samurai/_senders/*`
+- CPU paket yolu: `ddos_samurai/packet.py`, `ddos_samurai/cpu_packet_engine.py`
 - GPU paket/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_payload.py`, `ddos_samurai/anomaly_packet.py`
-- C hizlandirma: `ddos_samurai/fast_sender.c`, `ddos_samurai/pacing_engine.c`, `ddos_samurai/xdp_sender.c`
-- API/SaaS: `ddos_samurai/api.py`
-- Dashboard: `dashboard/`
+- Native CUDA ABI: `ddos_samurai/gpu_packet_cuda.hpp`, `ddos_samurai/gpu_packet_cuda/*`, `ddos_samurai/libgpu_packet_cuda.so`
+- C hizlandirma: `ddos_samurai/fast_sender.c`, `ddos_samurai/pacing_engine.c`, `ddos_samurai/xdp_sender.c`, `ddos_samurai/dataplane_core.c`
 - Monitoring stack: `monitoring/`
 
-## Desteklenen Modlar ve Vektorler
+## Desteklenen Yol ve Vektorler (aktif kod)
 
-- Backend: `cpu`, `cuda`
-- L4/L3: TCP, UDP, ICMP, spoofing, pcap replay
-- L7: HTTP, HTTP/2, WebSocket, QUIC
-- Diger: slow-* senaryolari, amplification simule akislari, anomaly paket akislari
-- Yardimci modlar: `--dry-run`, `--self-test`, run report, soak profile
+- Compute backend: `cpu`, `cuda`
+- L3/L4: TCP, UDP, ICMP, spoofing, fragment, pcap replay
+- L7: HTTP/HTTP2/WebSocket/QUIC (engine: `python` / `c_state` secimli)
+- Diger: anomaly/fuzz benzeri malformed paket varyasyonlari, amplification senaryolari
 
 ## Kurulum
 
-### 1) Temel kurulum (CPU odakli)
+### 1) Python bagimliliklari
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2) C extension build (onerilen)
+### 2) C extension build
 
 ```bash
 python setup.py build_ext --inplace
 ```
 
-### 3) Opsiyonel GPU kurulum
-
-GPU kullaniminda CUDA uyumlu ortama ihtiyac vardir.
+### 3) Opsiyonel CUDA
 
 ```bash
 pip install cupy-cuda12x numba-cuda[cu13]
+python setup.py build_ext --inplace
 ```
 
-### CUDA Hybrid Raw Knob'lari (Yeni)
+## GPU Native Path Knob'lari
 
-- `--gpu-template-pool-size-l4` (vars: `10`, env: `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4`)
-- `--gpu-template-pool-size-l7` (vars: `50`, env: `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7`)
-- `--gpu-ring-capacity` (vars: `3`, env: `SAMURAI_GPU_RING_CAPACITY`)
-- `--gpu-pinned-max-mb` (vars: `512`, env: `SAMURAI_GPU_PINNED_MAX_MB`)
-- `--state-table-size` (vars: `65536`, env: `SAMURAI_STATE_TABLE_SIZE`)
-- `--state-lock-count` (vars: `256`, env: `SAMURAI_STATE_LOCK_COUNT`)
-- `--state-timeout-sec` (vars: `60`, env: `SAMURAI_STATE_TIMEOUT_SEC`)
-- `--state-sweep-interval-ms` (vars: `1000`, env: `SAMURAI_STATE_SWEEP_INTERVAL_MS`)
+- `--gpu-template-pool-size-l4` (`SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4`)
+- `--gpu-template-pool-size-l7` (`SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7`)
+- `--gpu-ring-capacity` (`SAMURAI_GPU_RING_CAPACITY`)
+- `--gpu-stream-count` (`SAMURAI_GPU_STREAMS`)
+- `--gpu-pipeline-depth` (`SAMURAI_GPU_PIPELINE_DEPTH`)
+- `--gpu-pinned-max-mb` (`SAMURAI_GPU_PINNED_MAX_MB`)
+- `--gpu-packet-zerocopy-output` (`SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT`)
 
-### AF_PACKET HugePage Policy (Yeni)
+`--gpu-packet-zerocopy-output` acikken native CUDA output buffer mapped host memory'e alinabilir; bu mod her topolojide daha hizli olmak zorunda degildir, benchmark ile dogrulanmalidir.
 
-TX_RING yolunda explicit HugePage policy first-class olarak desteklenir:
-
-- `--afpacket-hugepage-mode {off,auto,required}`
-- `--afpacket-hugepage-size-kb` (default: `2048`)
-- `--afpacket-ring-target-mb` (default: `64`)
-- `--afpacket-block-size-kb` (default: `0`, auto)
-- `--afpacket-frame-size` (default: `0`, auto)
-- `--afpacket-frames-per-block` (default: `64`)
-- `--afpacket-poll-timeout-ms` (default: `1`)
-- `--afpacket-spin-limit` (default: `2000`)
-- `--afpacket-busy-poll-us` (default: `0`)
-- `--afpacket-qdisc-bypass` / `--no-afpacket-qdisc-bypass`
-- `--afpacket-mlock-ring` / `--no-afpacket-mlock-ring`
-- `--afpacket-prefault-ring` / `--no-afpacket-prefault-ring`
-
-`--lab-profile dedicated` + `--sender-backend txring` kombinasyonunda mode otomatik `required` olur.
-Detay: `docs/18-afpacket-hugepage-policy.md`
-
-### 4) Opsiyonel browser automation (Ninja)
-
-```bash
-pip install playwright
-playwright install chromium
-```
-
-## Hizli Baslangic (Guvenli)
+## Hizli Baslangic
 
 ### Self-test (trafik gondermez)
 
@@ -110,7 +81,7 @@ playwright install chromium
 python -m ddos_samurai.cli --self-test
 ```
 
-### Dry-run (konfig dogrular, gonderim yapmaz)
+### Dry-run (gonderim yapmaz)
 
 ```bash
 python -m ddos_samurai.cli \
@@ -125,22 +96,7 @@ python -m ddos_samurai.cli \
 python -m ddos_samurai.cli --list-profiles
 ```
 
-## SaaS Stack (Opsiyonel)
-
-```bash
-docker compose up -d --build
-```
-
-Servisler:
-
-- API: `http://localhost:5099`
-- Dashboard: `http://localhost:8080`
-- PostgreSQL: `localhost:5432` (`samurai/samurai`)
-- Metrics endpoint: `http://localhost:5099/metrics`
-
-Not: Varsayilan compose ayarlari gelistirme odaklidir. Uretimde secret, CORS, auth policy ve rate-limit hardening gereklidir.
-
-## Monitoring (Opsiyonel, uygulama disi)
+## Monitoring (opsiyonel)
 
 ```bash
 cd monitoring
@@ -150,19 +106,20 @@ docker compose up -d
 - Prometheus: `http://localhost:9090`
 - Grafana: `http://localhost:3000`
 
-Detay: `monitoring/README.md`
-
-## Test ve CI
-
-### Lokal test
+## Test
 
 ```bash
 pytest tests -q -rs
 ```
 
-### Benchmark Profilleri (Urunlesmis)
+Ornek hedefli testler:
 
-Tek komutla benchmark profili calistirma:
+```bash
+PYTHONPATH=. pytest -q tests/test_cli_parser.py
+PYTHONPATH=. pytest -q tests/test_gpu_packet_cuda_backend_bridge.py
+```
+
+## Benchmark Profilleri
 
 ```bash
 python -m ddos_samurai.benchmark_profiles --profile dev --run
@@ -170,55 +127,15 @@ python -m ddos_samurai.benchmark_profiles --profile ci_safe --run
 sudo python -m ddos_samurai.benchmark_profiles --profile dedicated_lab --run
 ```
 
-Profil ciktilari:
-
-- `artifacts/benchmarks/<profile>/benchmark_summary.json`
-- `artifacts/benchmarks/<profile>/benchmark_meta.json`
-- `artifacts/benchmarks/dedicated_lab/loss_telemetry_full.json` (dedicated_lab)
-
-Pipeline kurali: `kpi_gate_status=pass` ve `score_eligible=1` olmayan benchmark kosulari fail edilir.
-
-Frontend test:
-
-```bash
-cd dashboard
-npm ci
-npm run test -- --run
-```
-
-### GitHub Actions
-
-Workflow: `.github/workflows/ci.yml`
-
-- `Backend Tests (Python 3.11)`
-- `Dashboard Tests (Node 20)`
-
-CI ortaminda GPU/root gerektiren testler otomatik olarak skip olabilir.
-
-## Dokumantasyon Haritasi
-
-Detayli teknik dokumantasyon:
+## Dokumantasyon
 
 - `docs/README.md`
 - `docs/00-overview.md`
 - `docs/01-cli.md`
-- `docs/02-orchestrator.md`
 - `docs/03-senders.md`
 - `docs/05-gpu.md`
-- `docs/12-dashboard.md`
-- `docs/13-api.md`
 - `docs/18-afpacket-hugepage-policy.md`
-
-## AF_PACKET HugePage Hizli Ornek
-
-```bash
-python -m ddos_samurai.cli \
-  --target 127.0.0.1 --port 80 --protocol tcp \
-  --attack-vector basic --count 100000 --confirm \
-  --sender-backend txring --sender-fallback-policy fail \
-  --afpacket-hugepage-mode auto \
-  --run-report --run-report-out artifacts/live_run_hp
-```
+- `docs/20-env-cli-reference.md`
 
 ## Proje Dizini (kisa)
 
@@ -227,21 +144,13 @@ python -m ddos_samurai.cli \
 ├── advv2.py
 ├── ddos_samurai/
 ├── tests/
-├── dashboard/
-├── monitoring/
 ├── docs/
+├── monitoring/
 ├── Dockerfile
 ├── docker-compose.yml
 └── .github/workflows/ci.yml
 ```
 
-## Bilinen Operasyon Notlari
-
-- Bazi sender yollari root/capability gerektirir.
-- GPU yolu, CUDA surucu/runtime uyumuna baglidir.
-- CI ortaminda Scapy/GPU/root kosullarina bagli skip beklenir.
-- Uretim kullaniminda varsayilan ayarlarin hardening'i zorunludur.
-
 ## Lisans
 
-Bu repoda `setup.py` siniflandirmasinda MIT lisansi belirtilmistir.
+`setup.py` siniflandirmasinda MIT lisansi belirtilmistir.

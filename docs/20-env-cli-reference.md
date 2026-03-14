@@ -17,7 +17,7 @@ Bu dokuman su kaynaklardan derlendi:
 - `ddos_samurai/senders.py`
 - `ddos_samurai/orchestrator.py`
 - `ddos_samurai/l7_state_engine.c`
-- API/SaaS katmanlari (`api.py`, `saas_auth.py`, `saas_db.py`)
+- Not: Bu checkout'ta API/dashboard kaynaklari olmadigi icin API/SaaS env'leri aktif runtime'in parcasi degildir; tarihsel referanstir.
 
 Not: Buradaki tablo ve envanterler kod bazli bir referanstir; davranis dogrulamada yine calisma ortami/runtime sonuclari esas alinmalidir.
 
@@ -57,11 +57,11 @@ Pratikte genel kural:
 | `SAMURAI_DP_QUEUE_STRATEGY` | `cli.py:1071` | Parser default/preflight |
 | `SAMURAI_GPU_BATCH` | `cli.py:1176` | Parser default/preflight |
 | `SAMURAI_GPU_FULL_VARIATION` | `cli.py:1194` | Parser default/preflight |
-| `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT` | `cli.py:1206` | Parser default/preflight |
+| `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT` | `cli.py:1303` | Parser default/preflight |
 | `SAMURAI_GPU_PINNED_MAX_MB` | `cli.py:1200` | Parser default/preflight |
 | `SAMURAI_GPU_PIPELINE_DEPTH` | `cli.py:1188` | Parser default/preflight |
 | `SAMURAI_GPU_RING_CAPACITY` | `cli.py:1170` | Parser default/preflight |
-| `SAMURAI_GPU_RNG_SEED` | `cli.py:1206` | Parser default/preflight |
+| `SAMURAI_GPU_RNG_SEED` | `cli.py:1309` | Parser default/preflight |
 | `SAMURAI_GPU_STREAMS` | `cli.py:1182` | Parser default/preflight |
 | `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4` | `cli.py:1158` | Parser default/preflight |
 | `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7` | `cli.py:1164` | Parser default/preflight |
@@ -103,7 +103,7 @@ Pratikte genel kural:
 | `SAMURAI_DP_QUEUE_STRATEGY` | `cli.py:1726` | `os.environ["SAMURAI_DP_QUEUE_STRATEGY"] = str(getattr(args, "dp_queue_strategy", "rr") or "rr")` |
 | `SAMURAI_GPU_BATCH` | `cli.py:1673` | `os.environ["SAMURAI_GPU_BATCH"] = str(int(getattr(args, "gpu_batch_size", 100000) or 100000))` |
 | `SAMURAI_GPU_FULL_VARIATION` | `cli.py:1676` | `os.environ["SAMURAI_GPU_FULL_VARIATION"] = "1" if bool(getattr(args, "gpu_full_variation", True)) else "0"` |
-| `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT` | `cli.py:1778` | `os.environ["SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT"] = "1" if bool(getattr(args, "gpu_packet_zerocopy_output", False)) else "0"` |
+| `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT` | `cli.py:1781` | `os.environ["SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT"] = "1" if bool(getattr(args, "gpu_packet_zerocopy_output", False)) else "0"` |
 | `SAMURAI_GPU_PINNED_MAX_MB` | `cli.py:1677` | `os.environ["SAMURAI_GPU_PINNED_MAX_MB"] = str(int(getattr(args, "gpu_pinned_max_mb", 512) or 512))` |
 | `SAMURAI_GPU_PIPELINE_DEPTH` | `cli.py:1675` | `os.environ["SAMURAI_GPU_PIPELINE_DEPTH"] = str(int(getattr(args, "gpu_pipeline_depth", 2) or 2))` |
 | `SAMURAI_GPU_RING_CAPACITY` | `cli.py:1672` | `os.environ["SAMURAI_GPU_RING_CAPACITY"] = str(int(getattr(args, "gpu_ring_capacity", 3) or 3))` |
@@ -146,9 +146,7 @@ Pratikte genel kural:
 | `SAMURAI_AF_PACKET_MLOCK_RING` | `ddos_samurai/fast_sender.c`, `ddos_samurai/pacing_engine.c` | TX_RING/AF_PACKET C yolu tuning |
 | `SAMURAI_AF_PACKET_PREFAULT_RING` | `ddos_samurai/fast_sender.c`, `ddos_samurai/pacing_engine.c` | TX_RING/AF_PACKET C yolu tuning |
 | `SAMURAI_AF_PACKET_RING_TARGET_MB` | `ddos_samurai/dataplane.py` | TX_RING/AF_PACKET C yolu tuning |
-| `SAMURAI_CORS_ORIGINS` | `ddos_samurai/api.py` | API/SaaS konfigürasyonu |
 | `SAMURAI_CPU_FIXED_OS_PROFILE` | `ddos_samurai/cpu_packet_engine.py` | Runtime override / internal tuning |
-| `SAMURAI_DATABASE_URL` | `ddos_samurai/saas_db.py` | API/SaaS konfigürasyonu |
 | `SAMURAI_DATAPLANE_CORE_MODE` | `ddos_samurai/dataplane.py` | Runtime override / internal tuning |
 | `SAMURAI_ENABLE_BROWSER_AUTOMATION` | `ddos_samurai/stealth.py` | Stealth/browser automation davranışı |
 | `SAMURAI_GATEWAY_CACHE_TTL_SEC` | `ddos_samurai/senders.py` | Runtime override / internal tuning |
@@ -157,9 +155,6 @@ Pratikte genel kural:
 | `SAMURAI_GPU_SESSION_CHAIN` | `ddos_samurai/gpu_payload.py` | GPU dataplane/payload tuning |
 | `SAMURAI_GPU_SESSION_CHAIN_PROFILE` | `ddos_samurai/gpu_payload.py` | GPU dataplane/payload tuning |
 | `SAMURAI_GPU_STREAMS` | `ddos_samurai/orchestrator.py` | GPU dataplane/payload tuning |
-| `SAMURAI_JWT_ALGORITHM` | `ddos_samurai/saas_auth.py` | API/SaaS konfigürasyonu |
-| `SAMURAI_JWT_EXPIRES_MINUTES` | `ddos_samurai/saas_auth.py` | API/SaaS konfigürasyonu |
-| `SAMURAI_JWT_SECRET` | `ddos_samurai/saas_auth.py` | API/SaaS konfigürasyonu |
 | `SAMURAI_KPI_GATE_PROFILE` | `ddos_samurai/reporting.py` | Runtime override / internal tuning |
 | `SAMURAI_KPI_HARD_FAIL` | `ddos_samurai/reporting.py` | Runtime override / internal tuning |
 | `SAMURAI_L7_MAX_ACTIVE_SESSIONS` | `ddos_samurai/senders.py` | L7 route/capability davranışı |
@@ -170,7 +165,6 @@ Pratikte genel kural:
 | `SAMURAI_LOSS_TELEMETRY` | `ddos_samurai/loss_telemetry.py`, `ddos_samurai/senders.py` | Loss telemetry / KPI akışı |
 | `SAMURAI_PACING_AUTO_PIN` | `ddos_samurai/orchestrator.py` | Runtime override / internal tuning |
 | `SAMURAI_PACING_PROGRESS_REFRESH_MS` | `ddos_samurai/senders.py` | Runtime override / internal tuning |
-| `SAMURAI_SECURITY_LOG_COMMIT_MODE` | `ddos_samurai/api.py` | API/SaaS konfigürasyonu |
 | `SAMURAI_SENDER_BACKEND` | `ddos_samurai/senders.py` | Runtime override / internal tuning |
 | `SAMURAI_SENDER_FALLBACK_POLICY` | `ddos_samurai/senders.py` | Runtime override / internal tuning |
 | `SAMURAI_SENDMMSG_REUSE` | `ddos_samurai/senders.py` | sendmmsg buffer reuse tuning |
