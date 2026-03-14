@@ -71,6 +71,57 @@ def _normalize_native_policy(raw: str | None) -> str:
 _NATIVE_POLICY = _normalize_native_policy(os.environ.get(_NATIVE_POLICY_ENV, "allow"))
 _HOST_INPUT_CACHE: dict[tuple[int, str, str, int], np.ndarray] = {}
 _HOST_INPUT_CACHE_LOCK = threading.Lock()
+_NATIVE_GENERATION_TELEMETRY_KEYS = (
+    "gpu_native_h2d_copy_count",
+    "gpu_native_h2d_copy_bytes",
+    "gpu_native_d2h_copy_count",
+    "gpu_native_d2h_copy_bytes",
+    "gpu_native_host_pack_copy_count",
+    "gpu_native_host_pack_copy_bytes",
+)
+_NATIVE_GENERATION_TELEMETRY_LOCK = threading.Lock()
+_NATIVE_GENERATION_TELEMETRY: dict[str, int] = {
+    k: 0 for k in _NATIVE_GENERATION_TELEMETRY_KEYS
+}
+
+
+def _native_telemetry_inc(key: str, delta: int = 1) -> None:
+    if key not in _NATIVE_GENERATION_TELEMETRY:
+        return
+    with _NATIVE_GENERATION_TELEMETRY_LOCK:
+        _NATIVE_GENERATION_TELEMETRY[key] = int(_NATIVE_GENERATION_TELEMETRY.get(key, 0)) + int(delta)
+
+
+def _native_telemetry_snapshot() -> dict[str, int]:
+    with _NATIVE_GENERATION_TELEMETRY_LOCK:
+        return {k: int(_NATIVE_GENERATION_TELEMETRY.get(k, 0)) for k in _NATIVE_GENERATION_TELEMETRY_KEYS}
+
+
+def _native_telemetry_reset() -> None:
+    with _NATIVE_GENERATION_TELEMETRY_LOCK:
+        for key in _NATIVE_GENERATION_TELEMETRY_KEYS:
+            _NATIVE_GENERATION_TELEMETRY[key] = 0
+
+
+def _native_track_h2d_copy(nbytes: int) -> None:
+    if int(nbytes) <= 0:
+        return
+    _native_telemetry_inc("gpu_native_h2d_copy_count", 1)
+    _native_telemetry_inc("gpu_native_h2d_copy_bytes", int(nbytes))
+
+
+def _native_track_d2h_copy(nbytes: int) -> None:
+    if int(nbytes) <= 0:
+        return
+    _native_telemetry_inc("gpu_native_d2h_copy_count", 1)
+    _native_telemetry_inc("gpu_native_d2h_copy_bytes", int(nbytes))
+
+
+def _native_track_host_pack_copy(nbytes: int) -> None:
+    if int(nbytes) <= 0:
+        return
+    _native_telemetry_inc("gpu_native_host_pack_copy_count", 1)
+    _native_telemetry_inc("gpu_native_host_pack_copy_bytes", int(nbytes))
 
 
 def _load_lib() -> ctypes.CDLL | None:
@@ -461,6 +512,7 @@ def _materialize_native_output(
     pool_key: str,
     return_host_ready: bool = False,
 ):
+    _native_track_d2h_copy(int(out_size))
     host = _wrap_host_array(out_ptr, out_size, pool_key=pool_key)
     if return_host_ready:
         return host
@@ -503,6 +555,7 @@ def _flatten_templates(templates_bytes_list):
             )
         start = i * packet_size
         flat[start : start + packet_size] = tpl[:packet_size]
+    _native_track_host_pack_copy(int(packet_size * num_templates))
     return flat[: packet_size * num_templates], packet_size, num_templates
 
 
@@ -715,6 +768,7 @@ def generate_packets_from_template(
     if template_arr is None or int(template_arr.size) <= 0:
         raise ValueError("template_bytes must not be empty")
     tpl_ptr, tpl_len = _array_ptr(template_arr, ctypes.POINTER(ctypes.c_uint8))
+    _native_track_h2d_copy(int(tpl_len))
     out_ptr = ctypes.c_void_p()
     out_size = ctypes.c_size_t(0)
     out_packet_size = ctypes.c_int(0)
@@ -784,6 +838,7 @@ def generate_packets_from_template_pool(
         return None, 0
 
     flat_ptr, flat_len = _array_ptr(flat, ctypes.POINTER(ctypes.c_uint8))
+    _native_track_h2d_copy(int(flat_len))
     out_ptr = ctypes.c_void_p()
     out_size = ctypes.c_size_t(0)
     out_packet_size = ctypes.c_int(0)
@@ -862,6 +917,7 @@ def generate_fragmented_packets(
         cache_name="generate_fragmented_packets:payload",
     )
     payload_ptr, payload_len = _array_ptr(payload_arr, ctypes.POINTER(ctypes.c_uint8))
+    _native_track_h2d_copy(int(payload_len))
 
     out_ptr = ctypes.c_void_p()
     out_size = ctypes.c_size_t(0)
@@ -933,6 +989,7 @@ def generate_amplification_packets(
     if template_arr is None or int(template_arr.size) <= 0:
         raise ValueError("template_bytes must not be empty")
     tpl_ptr, tpl_len = _array_ptr(template_arr, ctypes.POINTER(ctypes.c_uint8))
+    _native_track_h2d_copy(int(tpl_len))
 
     reflector_bytes = [_as_bytes(ip) for ip in reflectors_ips]
     reflectors_arr = (ctypes.c_char_p * len(reflector_bytes))(*reflector_bytes)
@@ -1033,6 +1090,22 @@ def generate_stateful_packets(
     wins_ptr, wins_len = _array_ptr(wins_arr, ctypes.POINTER(ctypes.c_uint16))
     msss_ptr, msss_len = _array_ptr(msss_arr, ctypes.POINTER(ctypes.c_uint16))
     ttl_ptr, ttl_len = _array_ptr(ttl_arr, ctypes.POINTER(ctypes.c_uint8))
+    h2d_bytes = int(flat_len)
+    if seq_arr is not None:
+        h2d_bytes += int(seq_arr.nbytes)
+    if ack_arr is not None:
+        h2d_bytes += int(ack_arr.nbytes)
+    if state_arr is not None:
+        h2d_bytes += int(state_arr.nbytes)
+    if lengths_arr is not None:
+        h2d_bytes += int(lengths_arr.nbytes)
+    if wins_arr is not None:
+        h2d_bytes += int(wins_arr.nbytes)
+    if msss_arr is not None:
+        h2d_bytes += int(msss_arr.nbytes)
+    if ttl_arr is not None:
+        h2d_bytes += int(ttl_arr.nbytes)
+    _native_track_h2d_copy(h2d_bytes)
 
     out_ptr = ctypes.c_void_p()
     out_size = ctypes.c_size_t(0)
@@ -1151,11 +1224,23 @@ def generate_icmp_packets(
 
 
 def get_generation_telemetry() -> dict:
-    return _call_legacy("get_generation_telemetry")
+    legacy = _call_legacy("get_generation_telemetry")
+    out = dict(legacy or {})
+    native = _native_telemetry_snapshot()
+    out.update(native)
+    out["gpu_native_copy_metrics_estimated"] = 1
+    out["gpu_template_h2d_copy_count"] = int(out.get("gpu_template_h2d_copy_count", 0) or 0) + int(
+        native.get("gpu_native_h2d_copy_count", 0) or 0
+    )
+    out["gpu_template_h2d_copy_bytes"] = int(out.get("gpu_template_h2d_copy_bytes", 0) or 0) + int(
+        native.get("gpu_native_h2d_copy_bytes", 0) or 0
+    )
+    return out
 
 
 def reset_generation_telemetry() -> None:
     _call_legacy("reset_generation_telemetry")
+    _native_telemetry_reset()
 
 
 def clear_generation_caches() -> None:
