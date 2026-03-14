@@ -23,6 +23,24 @@ GPU yolu iki farkli seviyede kullaniliyor:
 
 Yani L7 icin "tam GPU network stack" yok; GPU burada planlama/uretme hizlandiricisi.
 
+## D2H ve Zero-Copy Output (2026-03-14)
+
+Varsayilan (default) davranis:
+
+- Native CUDA path cikti buffer'i `cudaMalloc` ile device memory'de olusur.
+- C ABI export asamasinda host'a tasima `D2H copy` ile yapilir.
+
+Opsiyonel davranis:
+
+- `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT=1` (veya CLI: `--gpu-packet-zerocopy-output`) acildiginda
+  native CUDA path cikti buffer'i `cudaHostAllocMapped` ile olusturulur.
+- Kernel dogrudan mapped host alana yazar; C ABI export'ta ekstra D2H kopyasi atlanir.
+
+Notlar:
+
+- Bu mod sadece native CUDA C++ path icin gecerlidir.
+- Her GPU/PCIe topolojisinde performans kazanci garanti degildir; A/B benchmark onerilir.
+
 ## Hybrid CUDA Raw Pipeline (v11)
 
 CUDA raw hattinda guncel model:
@@ -39,6 +57,7 @@ Pipeline overlap kontrol bayraklari:
 - `--gpu-pipeline-depth`
 - `--gpu-ring-capacity`
 - `--gpu-full-variation`
+- `--gpu-packet-zerocopy-output`
 
 ### Backpressure ve Ring
 

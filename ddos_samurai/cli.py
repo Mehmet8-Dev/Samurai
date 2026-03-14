@@ -366,6 +366,7 @@ def _report_inputs_from_args(args) -> dict:
         "gpu_pipeline_depth": int(getattr(args, "gpu_pipeline_depth", 2) or 2),
         "gpu_full_variation": bool(getattr(args, "gpu_full_variation", True)),
         "gpu_pinned_max_mb": int(getattr(args, "gpu_pinned_max_mb", 512) or 512),
+        "gpu_packet_zerocopy_output": bool(getattr(args, "gpu_packet_zerocopy_output", False)),
         "gpu_rng_seed": int(getattr(args, "gpu_rng_seed", 1234) or 0) if getattr(args, "gpu_rng_seed", None) is not None else None,
         "state_table_size": int(getattr(args, "state_table_size", 65536) or 65536),
         "state_lock_count": int(getattr(args, "state_lock_count", 256) or 256),
@@ -1297,6 +1298,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pinned host buffer pool üst sınırı MB (env: SAMURAI_GPU_PINNED_MAX_MB).",
     )
     parser.add_argument(
+        "--gpu-packet-zerocopy-output",
+        action=argparse.BooleanOptionalAction,
+        default=str(os.environ.get("SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
+        help="CUDA native path çıktı tamponu için mapped host zero-copy yolunu aç/kapat (env: SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT).",
+    )
+    parser.add_argument(
         "--gpu-rng-seed",
         type=int,
         default=_env_int("SAMURAI_GPU_RNG_SEED", 1234),
@@ -1771,6 +1778,7 @@ def main(argv=None):
     os.environ["SAMURAI_GPU_PIPELINE_DEPTH"] = str(int(getattr(args, "gpu_pipeline_depth", 2) or 2))
     os.environ["SAMURAI_GPU_FULL_VARIATION"] = "1" if bool(getattr(args, "gpu_full_variation", True)) else "0"
     os.environ["SAMURAI_GPU_PINNED_MAX_MB"] = str(int(getattr(args, "gpu_pinned_max_mb", 512) or 512))
+    os.environ["SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT"] = "1" if bool(getattr(args, "gpu_packet_zerocopy_output", False)) else "0"
     os.environ["SAMURAI_GPU_RNG_SEED"] = str(int(getattr(args, "gpu_rng_seed", 1234) or 0))
     os.environ["SAMURAI_STATE_TABLE_SIZE"] = str(int(getattr(args, "state_table_size", 65536) or 65536))
     os.environ["SAMURAI_STATE_LOCK_COUNT"] = str(int(getattr(args, "state_lock_count", 256) or 256))

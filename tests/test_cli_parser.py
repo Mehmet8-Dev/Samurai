@@ -201,6 +201,7 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.gpu_stream_count, 3)
         self.assertEqual(args.gpu_pipeline_depth, 2)
         self.assertTrue(args.gpu_full_variation)
+        self.assertFalse(args.gpu_packet_zerocopy_output)
         self.assertEqual(args.http2_connections, 1)
         self.assertEqual(args.http2_streams_per_conn, 100)
         self.assertEqual(args.l7_session_repeats, 1)
@@ -241,6 +242,7 @@ class TestCliParser(unittest.TestCase):
                 "SAMURAI_GPU_PIPELINE_DEPTH": "3",
                 "SAMURAI_GPU_FULL_VARIATION": "0",
                 "SAMURAI_GPU_PINNED_MAX_MB": "256",
+                "SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT": "1",
                 "SAMURAI_GPU_RNG_SEED": "987654",
                 "SAMURAI_STATE_TABLE_SIZE": "32768",
                 "SAMURAI_STATE_LOCK_COUNT": "128",
@@ -259,6 +261,7 @@ class TestCliParser(unittest.TestCase):
             self.assertEqual(args.gpu_pipeline_depth, 3)
             self.assertFalse(args.gpu_full_variation)
             self.assertEqual(args.gpu_pinned_max_mb, 256)
+            self.assertTrue(args.gpu_packet_zerocopy_output)
             self.assertEqual(args.gpu_rng_seed, 987654)
             self.assertEqual(args.state_table_size, 32768)
             self.assertEqual(args.state_lock_count, 128)

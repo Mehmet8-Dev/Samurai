@@ -57,6 +57,7 @@ Pratikte genel kural:
 | `SAMURAI_DP_QUEUE_STRATEGY` | `cli.py:1071` | Parser default/preflight |
 | `SAMURAI_GPU_BATCH` | `cli.py:1176` | Parser default/preflight |
 | `SAMURAI_GPU_FULL_VARIATION` | `cli.py:1194` | Parser default/preflight |
+| `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT` | `cli.py:1206` | Parser default/preflight |
 | `SAMURAI_GPU_PINNED_MAX_MB` | `cli.py:1200` | Parser default/preflight |
 | `SAMURAI_GPU_PIPELINE_DEPTH` | `cli.py:1188` | Parser default/preflight |
 | `SAMURAI_GPU_RING_CAPACITY` | `cli.py:1170` | Parser default/preflight |
@@ -102,6 +103,7 @@ Pratikte genel kural:
 | `SAMURAI_DP_QUEUE_STRATEGY` | `cli.py:1726` | `os.environ["SAMURAI_DP_QUEUE_STRATEGY"] = str(getattr(args, "dp_queue_strategy", "rr") or "rr")` |
 | `SAMURAI_GPU_BATCH` | `cli.py:1673` | `os.environ["SAMURAI_GPU_BATCH"] = str(int(getattr(args, "gpu_batch_size", 100000) or 100000))` |
 | `SAMURAI_GPU_FULL_VARIATION` | `cli.py:1676` | `os.environ["SAMURAI_GPU_FULL_VARIATION"] = "1" if bool(getattr(args, "gpu_full_variation", True)) else "0"` |
+| `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT` | `cli.py:1778` | `os.environ["SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT"] = "1" if bool(getattr(args, "gpu_packet_zerocopy_output", False)) else "0"` |
 | `SAMURAI_GPU_PINNED_MAX_MB` | `cli.py:1677` | `os.environ["SAMURAI_GPU_PINNED_MAX_MB"] = str(int(getattr(args, "gpu_pinned_max_mb", 512) or 512))` |
 | `SAMURAI_GPU_PIPELINE_DEPTH` | `cli.py:1675` | `os.environ["SAMURAI_GPU_PIPELINE_DEPTH"] = str(int(getattr(args, "gpu_pipeline_depth", 2) or 2))` |
 | `SAMURAI_GPU_RING_CAPACITY` | `cli.py:1672` | `os.environ["SAMURAI_GPU_RING_CAPACITY"] = str(int(getattr(args, "gpu_ring_capacity", 3) or 3))` |
@@ -436,9 +438,9 @@ Asagidaki envanter dogrudan `build_parser()` aksiyonlarindan cikarilmistir.
 | `--gpu-pipeline-depth` | `2` |  | GPU pipeline overlap derinliği (ready batch kuyruk eşiği). |
 | `--gpu-full-variation`, `--no-gpu-full-variation` | `True` |  | Basic L4 akışında varyasyonları tamamen GPU hot-path üzerinden üret. |
 | `--gpu-pinned-max-mb` | `512` |  | Pinned host buffer pool üst sınırı MB (env: SAMURAI_GPU_PINNED_MAX_MB). |
+| `--gpu-packet-zerocopy-output`, `--no-gpu-packet-zerocopy-output` | `False` |  | CUDA native path çıktı tamponu için mapped host zero-copy yolunu aç/kapat (env: SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT). |
 | `--gpu-rng-seed` | `1234` |  | GPU payload RNG seed (varsayılan: deterministik 1234, env: SAMURAI_GPU_RNG_SEED). |
 | `--state-table-size` | `65536` |  | State engine tablosu kapasitesi (env: SAMURAI_STATE_TABLE_SIZE). |
 | `--state-lock-count` | `256` |  | State engine lock segment sayısı (env: SAMURAI_STATE_LOCK_COUNT). |
 | `--state-timeout-sec` | `60` |  | State timeout süresi saniye (env: SAMURAI_STATE_TIMEOUT_SEC). |
 | `--state-sweep-interval-ms` | `1000` |  | State cleanup sweep periyodu ms (env: SAMURAI_STATE_SWEEP_INTERVAL_MS). |
-
