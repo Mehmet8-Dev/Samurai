@@ -190,18 +190,30 @@ BenchmarkPathResult telemetry_delta_to_path(const GenerationTelemetry& before,
 
 DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept {
   ptr = other.ptr;
+  host_ptr = other.host_ptr;
+  host_base_ptr = other.host_base_ptr;
   size = other.size;
+  alloc_kind = other.alloc_kind;
   other.ptr = nullptr;
+  other.host_ptr = nullptr;
+  other.host_base_ptr = nullptr;
   other.size = 0;
+  other.alloc_kind = AllocKind::kDevice;
 }
 
 DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
   if (this != &other) {
     reset();
     ptr = other.ptr;
+    host_ptr = other.host_ptr;
+    host_base_ptr = other.host_base_ptr;
     size = other.size;
+    alloc_kind = other.alloc_kind;
     other.ptr = nullptr;
+    other.host_ptr = nullptr;
+    other.host_base_ptr = nullptr;
     other.size = 0;
+    other.alloc_kind = AllocKind::kDevice;
   }
   return *this;
 }
@@ -212,9 +224,19 @@ DeviceBuffer::~DeviceBuffer() {
 
 void DeviceBuffer::reset() {
   if (ptr) {
-    cudaFree(ptr);
+    if (alloc_kind == AllocKind::kMappedHost) {
+      void* base = static_cast<void*>(host_base_ptr ? host_base_ptr : host_ptr);
+      if (base) {
+        cudaFreeHost(base);
+      }
+    } else {
+      cudaFree(ptr);
+    }
     ptr = nullptr;
+    host_ptr = nullptr;
+    host_base_ptr = nullptr;
     size = 0;
+    alloc_kind = AllocKind::kDevice;
   }
 }
 

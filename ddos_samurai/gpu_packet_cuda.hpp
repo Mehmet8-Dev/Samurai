@@ -83,11 +83,20 @@ struct PoolTelemetry {
 };
 
 struct DeviceBuffer {
+  enum class AllocKind : uint8_t {
+    kDevice = 0,
+    kMappedHost = 1,
+  };
+
   uint8_t* ptr = nullptr;
+  uint8_t* host_ptr = nullptr;
+  uint8_t* host_base_ptr = nullptr;
   size_t size = 0;
+  AllocKind alloc_kind = AllocKind::kDevice;
 
   DeviceBuffer() = default;
-  DeviceBuffer(uint8_t* p, size_t n) : ptr(p), size(n) {}
+  DeviceBuffer(uint8_t* p, size_t n)
+      : ptr(p), host_ptr(nullptr), host_base_ptr(nullptr), size(n), alloc_kind(AllocKind::kDevice) {}
 
   DeviceBuffer(const DeviceBuffer&) = delete;
   DeviceBuffer& operator=(const DeviceBuffer&) = delete;

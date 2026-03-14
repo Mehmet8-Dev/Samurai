@@ -11,6 +11,69 @@
 #undef SAMURAI_GPU_PACKET_CUDA_FRAGMENT_CHAIN
 #endif
 
+namespace {
+constexpr uint64_t kMappedExportHeaderMagic = 0x53414d5552414931ull;  // SAMURAI1
+constexpr uint32_t kMappedExportAllocKindCudaHost = 2u;
+
+struct MappedExportHeader {
+  uint64_t magic = kMappedExportHeaderMagic;
+  uint32_t alloc_kind = kMappedExportAllocKindCudaHost;
+  uint32_t reserved = 0u;
+  size_t size = 0u;
+};
+
+inline bool zero_copy_output_enabled() {
+  return env_int("SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT", 0) > 0;
+}
+
+inline DeviceBuffer allocate_packet_output_buffer(
+    size_t payload_size,
+    cudaStream_t stream,
+    const char* cuda_malloc_error,
+    const char* cuda_memset_error) {
+  DeviceBuffer out;
+  if (payload_size == 0) {
+    return out;
+  }
+
+  if (zero_copy_output_enabled()) {
+    const size_t total = sizeof(MappedExportHeader) + payload_size;
+    void* raw = nullptr;
+    cudaError_t rc = cudaHostAlloc(&raw, total, cudaHostAllocPortable | cudaHostAllocMapped);
+    if (rc == cudaSuccess && raw) {
+      auto* header = static_cast<MappedExportHeader*>(raw);
+      header->magic = kMappedExportHeaderMagic;
+      header->alloc_kind = kMappedExportAllocKindCudaHost;
+      header->reserved = 0u;
+      header->size = payload_size;
+
+      auto* host_payload = reinterpret_cast<uint8_t*>(header + 1);
+      uint8_t* dev_base = nullptr;
+      cudaError_t map_rc = cudaHostGetDevicePointer(reinterpret_cast<void**>(&dev_base), raw, 0);
+      if (map_rc == cudaSuccess && dev_base) {
+        auto* dev_payload = dev_base + sizeof(MappedExportHeader);
+        out.ptr = dev_payload;
+        out.host_ptr = host_payload;
+        out.host_base_ptr = static_cast<uint8_t*>(raw);
+        out.size = payload_size;
+        out.alloc_kind = DeviceBuffer::AllocKind::kMappedHost;
+        throw_if_cuda(cudaMemsetAsync(out.ptr, 0, payload_size, stream), cuda_memset_error);
+        return out;
+      }
+      cudaFreeHost(raw);
+    }
+  }
+
+  throw_if_cuda(cudaMalloc(&out.ptr, payload_size), cuda_malloc_error);
+  out.size = payload_size;
+  out.host_ptr = nullptr;
+  out.host_base_ptr = nullptr;
+  out.alloc_kind = DeviceBuffer::AllocKind::kDevice;
+  throw_if_cuda(cudaMemsetAsync(out.ptr, 0, payload_size, stream), cuda_memset_error);
+  return out;
+}
+}  // namespace
+
 PacketResult generate_packets(
     int64_t count,
     const std::string& target_ip,
@@ -52,10 +115,11 @@ PacketResult generate_packets(
   int packet_size = static_cast<int>(eth_len + IP_HEADER_LEN + transport_len);
   size_t total_size = static_cast<size_t>(count) * static_cast<size_t>(packet_size);
 
-  DeviceBuffer out;
-  throw_if_cuda(cudaMalloc(&out.ptr, total_size), "cudaMalloc generate_packets output failed");
-  out.size = total_size;
-  throw_if_cuda(cudaMemsetAsync(out.ptr, 0, total_size, stream), "cudaMemsetAsync generate_packets failed");
+  DeviceBuffer out = allocate_packet_output_buffer(
+      total_size,
+      stream,
+      "cudaMalloc generate_packets output failed",
+      "cudaMemsetAsync generate_packets failed");
 
   RNGAcquisition rng_acq = acquire_rng_states(count, stream);
   curandStatePhilox4_32_10_t* rng_states = rng_acq.ptr;
@@ -162,11 +226,12 @@ PacketResult generate_packets_from_template(
   TemplateAcquisition template_acq = acquire_template_gpu(template_bytes, template_len, packet_size, stream);
   uint8_t* template_gpu = template_acq.ptr;
 
-  DeviceBuffer out;
   size_t total_size = static_cast<size_t>(count) * static_cast<size_t>(packet_size);
-  throw_if_cuda(cudaMalloc(&out.ptr, total_size), "cudaMalloc template output failed");
-  out.size = total_size;
-  throw_if_cuda(cudaMemsetAsync(out.ptr, 0, total_size, stream), "cudaMemsetAsync template output failed");
+  DeviceBuffer out = allocate_packet_output_buffer(
+      total_size,
+      stream,
+      "cudaMalloc template output failed",
+      "cudaMemsetAsync template output failed");
 
   uint32_t real_src_ip_int = ip_to_int(real_src_ip);
   RNGAcquisition rng_acq = acquire_rng_states(count, stream);
@@ -292,11 +357,12 @@ PacketResult generate_packets_from_template_pool(
       acquire_template_gpu(templates_flat, templates_flat_len, static_cast<int>(packet_size), stream);
   uint8_t* templates_gpu = templates_acq.ptr;
 
-  DeviceBuffer out;
   size_t total_size = static_cast<size_t>(count) * static_cast<size_t>(packet_size);
-  throw_if_cuda(cudaMalloc(&out.ptr, total_size), "cudaMalloc pool output failed");
-  out.size = total_size;
-  throw_if_cuda(cudaMemsetAsync(out.ptr, 0, total_size, stream), "cudaMemsetAsync pool output failed");
+  DeviceBuffer out = allocate_packet_output_buffer(
+      total_size,
+      stream,
+      "cudaMalloc pool output failed",
+      "cudaMemsetAsync pool output failed");
 
   RNGAcquisition rng_acq = acquire_rng_states(count, stream);
   curandStatePhilox4_32_10_t* rng_states = rng_acq.ptr;
@@ -425,10 +491,11 @@ PacketResult generate_fragmented_packets(
   uint32_t real_src_ip_int = ip_to_int(real_src_ip);
 
   size_t total_buf_size = static_cast<size_t>(count) * static_cast<size_t>(frag1_size + frag2_size);
-  DeviceBuffer out;
-  throw_if_cuda(cudaMalloc(&out.ptr, total_buf_size), "cudaMalloc fragmented output failed");
-  out.size = total_buf_size;
-  throw_if_cuda(cudaMemsetAsync(out.ptr, 0, total_buf_size, stream), "cudaMemsetAsync fragmented output failed");
+  DeviceBuffer out = allocate_packet_output_buffer(
+      total_buf_size,
+      stream,
+      "cudaMalloc fragmented output failed",
+      "cudaMemsetAsync fragmented output failed");
 
   RNGAcquisition rng_acq = acquire_rng_states(count, stream);
   curandStatePhilox4_32_10_t* rng_states = rng_acq.ptr;
@@ -485,11 +552,12 @@ PacketResult generate_amplification_packets(
   uint32_t victim_ip_int = ip_to_int(victim_ip);
   int64_t num_reflectors = static_cast<int64_t>(reflectors_ips.size());
 
-  DeviceBuffer out;
   size_t total_size = static_cast<size_t>(count) * static_cast<size_t>(packet_size);
-  throw_if_cuda(cudaMalloc(&out.ptr, total_size), "cudaMalloc amplification output failed");
-  out.size = total_size;
-  throw_if_cuda(cudaMemsetAsync(out.ptr, 0, total_size, stream), "cudaMemsetAsync amplification output failed");
+  DeviceBuffer out = allocate_packet_output_buffer(
+      total_size,
+      stream,
+      "cudaMalloc amplification output failed",
+      "cudaMemsetAsync amplification output failed");
 
   RNGAcquisition rng_acq = acquire_rng_states(count, stream);
   curandStatePhilox4_32_10_t* rng_states = rng_acq.ptr;
@@ -553,11 +621,12 @@ PacketResult generate_stateful_packets(
       acquire_template_gpu(templates_flat, templates_flat_len, static_cast<int>(packet_size), stream);
   uint8_t* templates_gpu = templates_acq.ptr;
 
-  DeviceBuffer out;
   size_t total_size = static_cast<size_t>(count) * static_cast<size_t>(packet_size);
-  throw_if_cuda(cudaMalloc(&out.ptr, total_size), "cudaMalloc stateful output failed");
-  out.size = total_size;
-  throw_if_cuda(cudaMemsetAsync(out.ptr, 0, total_size, stream), "cudaMemsetAsync stateful output failed");
+  DeviceBuffer out = allocate_packet_output_buffer(
+      total_size,
+      stream,
+      "cudaMalloc stateful output failed",
+      "cudaMemsetAsync stateful output failed");
 
   RNGAcquisition rng_acq = acquire_rng_states(count, stream);
   curandStatePhilox4_32_10_t* rng_states = rng_acq.ptr;
@@ -771,11 +840,12 @@ PacketResult generate_icmp_packets(
   int64_t icmp_len = ICMP_HEADER_LEN + payload_size;
   int packet_size = static_cast<int>(eth_len + IP_HEADER_LEN + icmp_len);
 
-  DeviceBuffer out;
   size_t total_size = static_cast<size_t>(count) * static_cast<size_t>(packet_size);
-  throw_if_cuda(cudaMalloc(&out.ptr, total_size), "cudaMalloc icmp output failed");
-  out.size = total_size;
-  throw_if_cuda(cudaMemsetAsync(out.ptr, 0, total_size, stream), "cudaMemsetAsync icmp output failed");
+  DeviceBuffer out = allocate_packet_output_buffer(
+      total_size,
+      stream,
+      "cudaMalloc icmp output failed",
+      "cudaMemsetAsync icmp output failed");
 
   RNGAcquisition rng_acq = acquire_rng_states(count, stream);
   curandStatePhilox4_32_10_t* rng_states = rng_acq.ptr;
@@ -1004,7 +1074,7 @@ static int init_c_api_outputs(uint8_t** out_data, size_t* out_size, int* out_pac
 }
 
 static int export_packet_result(
-    const ddos_samurai::gpu_packet_cuda::PacketResult& res,
+    ddos_samurai::gpu_packet_cuda::PacketResult& res,
     const char* key,
     cudaStream_t stream,
     uint8_t** out_data,
@@ -1012,34 +1082,52 @@ static int export_packet_result(
     int* out_packet_size) {
   (void)key;
   uint8_t* payload = nullptr;
+  size_t exported_size = 0;
   ExportHostBufferHeader* header = nullptr;
   try {
     if (res.packets_gpu.valid()) {
-      const size_t total = sizeof(ExportHostBufferHeader) + res.packets_gpu.size;
-      void* raw = nullptr;
-      ExportHostAllocKind alloc_kind = ExportHostAllocKind::kCudaHost;
-      cudaError_t alloc_rc = cudaHostAlloc(&raw, total, cudaHostAllocPortable);
-      if (alloc_rc != cudaSuccess || !raw) {
-        raw = std::malloc(total);
-        alloc_kind = ExportHostAllocKind::kMalloc;
-        if (!raw) {
-          return set_c_api_error("host export allocation failed");
+      exported_size = res.packets_gpu.size;
+      if (res.packets_gpu.alloc_kind == ddos_samurai::gpu_packet_cuda::DeviceBuffer::AllocKind::kMappedHost &&
+          res.packets_gpu.host_ptr != nullptr) {
+        if (stream) {
+          cudaError_t st = cudaStreamSynchronize(stream);
+          if (st != cudaSuccess) {
+            return set_c_api_error(std::string("zero-copy stream synchronize failed: ") + cudaGetErrorString(st));
+          }
         }
-      }
+        payload = res.packets_gpu.host_ptr;
+        res.packets_gpu.ptr = nullptr;
+        res.packets_gpu.host_ptr = nullptr;
+        res.packets_gpu.host_base_ptr = nullptr;
+        res.packets_gpu.size = 0;
+        res.packets_gpu.alloc_kind = ddos_samurai::gpu_packet_cuda::DeviceBuffer::AllocKind::kDevice;
+      } else {
+        const size_t total = sizeof(ExportHostBufferHeader) + res.packets_gpu.size;
+        void* raw = nullptr;
+        ExportHostAllocKind alloc_kind = ExportHostAllocKind::kCudaHost;
+        cudaError_t alloc_rc = cudaHostAlloc(&raw, total, cudaHostAllocPortable);
+        if (alloc_rc != cudaSuccess || !raw) {
+          raw = std::malloc(total);
+          alloc_kind = ExportHostAllocKind::kMalloc;
+          if (!raw) {
+            return set_c_api_error("host export allocation failed");
+          }
+        }
 
-      header = static_cast<ExportHostBufferHeader*>(raw);
-      header->magic = kExportHostBufferMagic;
-      header->alloc_kind = static_cast<uint32_t>(alloc_kind);
-      header->reserved = 0u;
-      header->size = res.packets_gpu.size;
-      payload = reinterpret_cast<uint8_t*>(header + 1);
+        header = static_cast<ExportHostBufferHeader*>(raw);
+        header->magic = kExportHostBufferMagic;
+        header->alloc_kind = static_cast<uint32_t>(alloc_kind);
+        header->reserved = 0u;
+        header->size = res.packets_gpu.size;
+        payload = reinterpret_cast<uint8_t*>(header + 1);
 
-      if (res.packets_gpu.size > 0) {
-        ddos_samurai::gpu_packet_cuda::copy_device_buffer_to_host(
-            payload,
-            res.packets_gpu.size,
-            res.packets_gpu,
-            stream);
+        if (res.packets_gpu.size > 0) {
+          ddos_samurai::gpu_packet_cuda::copy_device_buffer_to_host(
+              payload,
+              res.packets_gpu.size,
+              res.packets_gpu,
+              stream);
+        }
       }
     }
   } catch (const std::exception& e) {
@@ -1053,7 +1141,7 @@ static int export_packet_result(
     return set_c_api_error(e.what());
   }
   *out_data = payload;
-  *out_size = res.packets_gpu.size;
+  *out_size = exported_size;
   *out_packet_size = res.packet_size;
   g_samurai_gpu_packet_last_error.clear();
   return 0;
