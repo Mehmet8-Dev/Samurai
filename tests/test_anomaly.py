@@ -56,6 +56,12 @@ class TestAnomalyPacket(unittest.TestCase):
         except ImportError:
             pass
         except Exception as e:
+            msg = str(e)
+            if (
+                "CUDA_ERROR_UNSUPPORTED_PTX_VERSION" in msg
+                or "Unsupported .version" in msg
+            ):
+                self.skipTest("CUDA driver/PTX version mismatch in runtime environment")
             self.fail(f"Anomaly generation raised exception: {e}")
 
     def test_anomaly_flags(self):

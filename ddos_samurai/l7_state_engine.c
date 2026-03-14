@@ -1346,7 +1346,9 @@ static void _quic_native_cleanup(QuicNativeSession *s) {
     if (s == NULL) {
         return;
     }
-    PyMem_Free(s->stream_states);
+    /* This buffer is allocated from _quic_native_run_batch while GIL is released,
+       so use libc allocator pair (calloc/free), not PyMem_* APIs. */
+    free(s->stream_states);
     s->stream_states = NULL;
     s->stream_cap = 0;
     if (s->h3_conn != NULL) {
@@ -1871,7 +1873,9 @@ static QuicNativeResultCode _quic_native_run_batch(
     if (s.stream_cap > 2048) {
         s.stream_cap = 2048;
     }
-    s.stream_states = (QuicNativeStreamState *)PyMem_Calloc(s.stream_cap, sizeof(QuicNativeStreamState));
+    /* _quic_native_run_batch runs under Py_BEGIN_ALLOW_THREADS in caller.
+       Avoid Python memory APIs here because GIL is not held. */
+    s.stream_states = (QuicNativeStreamState *)calloc(s.stream_cap, sizeof(QuicNativeStreamState));
     if (s.stream_states == NULL) {
         if (out != NULL) {
             out->stream_fail = request_count;
