@@ -9,7 +9,7 @@ GPU yolu iki ana hedefe hizmet eder:
 
 Kod tabaninda hem Python tarafi (Numba/CuPy) hem native CUDA C++ ABI yolu vardir.
 
-## Guncel Durum (2026-03-14)
+## Guncel Durum (2026-03-15)
 
 1. L3/L4 paket uretim hot-path:
    - GPU generate (header/checksum/random/template mutate)
@@ -25,17 +25,23 @@ Yani L7 icin tam bir GPU network stack yok; GPU burada generator/planner rolu oy
 Varsayilan davranis:
 - Native CUDA cikti device memory'de olusur
 - Export asamasinda host tarafa D2H copy yapilir
+- Stream verildiginde D2H `cudaMemcpyAsync` ile queue'lanir (hemen stream sync yok)
+- Senkronizasyon bariyeri:
+  - `return_host_ready=True`: orchestrator `ready_event` ile bekler
+  - `return_host_ready=False`: Python bridge `samurai_gpu_packet_wait()` ile bekler
 
 Opsiyonel davranis:
 - `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT=1`
 - veya CLI: `--gpu-packet-zerocopy-output`
 - Native output buffer `cudaHostAllocMapped` ile acilir
 - Kernel mapped host alana yazar; export'ta ekstra D2H adimi atlanir
+- Hazirlik senkronu yine stream event/wait bariyerleri ile yapilir
 
 Notlar:
 - Bu knob native CUDA path icindir.
 - Her GPU/PCIe topolojisinde performans kazanci garanti degildir.
 - A/B benchmark ile karar verilmelidir.
+- AF_PACKET TX_RING kullaniminda son adimda ring frame'e `memcpy` halen vardir (UMEM/XDP degilse tam wire-level zero-copy olmaz).
 
 ## Pipeline Knob'lari
 

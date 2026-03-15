@@ -73,6 +73,11 @@ python setup.py build_ext --inplace
 
 `--gpu-packet-zerocopy-output` acikken native CUDA output buffer mapped host memory'e alinabilir; bu mod her topolojide daha hizli olmak zorunda degildir, benchmark ile dogrulanmalidir.
 
+Native CUDA bridge akisi:
+- `device mem -> (async D2H veya mapped host) -> host-ready buffer`
+- `--gpu-stream-count` + `--gpu-pipeline-depth` ile double-buffer/queue overlap
+- Host-ready olmayan native cagrilarda `samurai_gpu_packet_wait()` bariyeri uygulanir
+
 ## Hizli Baslangic
 
 ### Self-test (trafik gondermez)

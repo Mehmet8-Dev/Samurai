@@ -30,13 +30,23 @@ def _scalar(value):
 
 
 class _FakeLib:
-    def __init__(self, payload: bytes = b"", packet_size: int = 0, rc: int = 0, err: bytes = b""):
+    def __init__(
+        self,
+        payload: bytes = b"",
+        packet_size: int = 0,
+        rc: int = 0,
+        err: bytes = b"",
+        wait_rc: int = 0,
+    ):
         self.payload = bytes(payload)
         self.packet_size = int(packet_size)
         self.rc = int(rc)
         self.err = bytes(err)
+        self.wait_rc = int(wait_rc)
         self._buffers = []
         self.free_called = 0
+        self.wait_called = 0
+        self.wait_ptrs = []
         self.calls = []
 
     def _set_out(self, out_data, out_size, out_packet_size):
@@ -288,6 +298,11 @@ class _FakeLib:
     def samurai_gpu_packet_free(self, _ptr):
         self.free_called += 1
 
+    def samurai_gpu_packet_wait(self, ptr):
+        self.wait_called += 1
+        self.wait_ptrs.append(int(getattr(ptr, "value", ptr) or 0))
+        return self.wait_rc
+
     def samurai_gpu_packet_last_error(self):
         return self.err
 
@@ -353,6 +368,7 @@ def test_generate_packets_native_success(monkeypatch):
     )
     assert packet_size == 2
     assert _to_bytes(packets) == b"\x01\x02\x03\x04"
+    assert fake.wait_called == 1
     assert fake.free_called == 1
 
 
@@ -400,9 +416,38 @@ def test_generate_packets_native_host_ready_skips_cp_asarray(monkeypatch):
     assert isinstance(packets, np.ndarray)
     assert packets.dtype == np.uint8
     assert _to_bytes(packets) == b"\x01\x02\x03\x04"
+    assert fake.wait_called == 0
     assert fake.free_called == 0
     del packets
     gc.collect()
+    assert fake.free_called == 1
+
+
+def test_generate_packets_native_wait_error_releases_host_buffer(monkeypatch):
+    fake = _FakeLib(payload=b"\x01\x02\x03\x04", packet_size=2, rc=0, wait_rc=-1, err=b"wait failed")
+    monkeypatch.setattr(backend, "_LIB", fake, raising=True)
+    monkeypatch.setattr(backend, "_NATIVE_ENABLED", True, raising=True)
+    monkeypatch.setattr(
+        backend,
+        "_legacy",
+        types.SimpleNamespace(
+            GPUPacketError=backend._legacy.GPUPacketError,
+            GPUMemoryError=backend._legacy.GPUMemoryError,
+            cp=types.SimpleNamespace(uint8=np.uint8, asarray=np.asarray),
+        ),
+        raising=True,
+    )
+
+    with pytest.raises(backend._legacy.GPUPacketError, match="wait failed"):
+        backend.generate_packets(
+            count=2,
+            target_ip="203.0.113.1",
+            target_port=80,
+            protocol="tcp",
+            spoof_ip=False,
+            has_ethernet=True,
+        )
+    assert fake.wait_called == 1
     assert fake.free_called == 1
 
 

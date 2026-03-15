@@ -282,6 +282,13 @@ def _load_lib() -> ctypes.CDLL | None:
     lib.samurai_gpu_packet_free.argtypes = [ctypes.c_void_p]
     lib.samurai_gpu_packet_free.restype = None
 
+    try:
+        lib.samurai_gpu_packet_wait.argtypes = [ctypes.c_void_p]
+        lib.samurai_gpu_packet_wait.restype = ctypes.c_int
+    except Exception:
+        # Backward-compat: older native libs may not expose wait API.
+        pass
+
     lib.samurai_gpu_packet_last_error.argtypes = []
     lib.samurai_gpu_packet_last_error.restype = ctypes.c_char_p
     return lib
@@ -513,6 +520,16 @@ def _materialize_native_output(
     return_host_ready: bool = False,
 ):
     _native_track_d2h_copy(int(out_size))
+    if not return_host_ready:
+        wait_fn = getattr(_LIB, "samurai_gpu_packet_wait", None)
+        if callable(wait_fn) and bool(out_ptr):
+            rc = int(wait_fn(ctypes.c_void_p(int(out_ptr.value or 0))) or 0)
+            if rc != 0:
+                try:
+                    _LIB.samurai_gpu_packet_free(ctypes.c_void_p(int(out_ptr.value or 0)))
+                except Exception:
+                    pass
+                _raise_native_error("samurai_gpu_packet_wait failed")
     host = _wrap_host_array(out_ptr, out_size, pool_key=pool_key)
     if return_host_ready:
         return host

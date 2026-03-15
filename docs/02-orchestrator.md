@@ -77,6 +77,8 @@ CUDA raw/template-pool ve stateful hatlarinda worker su akisi kullanir:
 - consumer: `senders.paced_raw_socket_sender` ile NIC aktarimi
 - queue: bounded ring (`--gpu-ring-capacity`, env: `SAMURAI_GPU_RING_CAPACITY`)
 - politika: queue dolunca producer block olur (drop yok)
+- readiness: her batch icin `cp.cuda.Event` kaydedilir; gonderimden once event query/sync ile GPU tamamlanmasi beklenir
+- native bridge: `return_host_ready=True` ile host-ready numpy buffer kullanilir; `return_host_ready=False` yolunda native `samurai_gpu_packet_wait()` bariyeri calisir
 
 Ek overlap kontrolu:
 

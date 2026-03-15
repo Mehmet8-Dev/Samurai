@@ -20,6 +20,8 @@ struct MappedExportHeader {
   uint32_t alloc_kind = kMappedExportAllocKindCudaHost;
   uint32_t reserved = 0u;
   size_t size = 0u;
+  uint64_t pending_stream_handle = 0u;
+  uint64_t pending_device_ptr = 0u;
 };
 
 inline bool zero_copy_output_enabled() {
@@ -46,6 +48,8 @@ inline DeviceBuffer allocate_packet_output_buffer(
       header->alloc_kind = kMappedExportAllocKindCudaHost;
       header->reserved = 0u;
       header->size = payload_size;
+      header->pending_stream_handle = 0u;
+      header->pending_device_ptr = 0u;
 
       auto* host_payload = reinterpret_cast<uint8_t*>(header + 1);
       uint8_t* dev_base = nullptr;
@@ -975,6 +979,12 @@ void copy_device_buffer_to_host(
     void* dst,
     size_t dst_size,
     const DeviceBuffer& gpu_arr,
+    cudaStream_t stream);
+
+void enqueue_device_buffer_to_host_copy(
+    void* dst,
+    size_t dst_size,
+    const DeviceBuffer& gpu_arr,
     cudaStream_t stream) {
   if (!dst || dst_size == 0 || !gpu_arr.valid()) {
     return;
@@ -985,15 +995,25 @@ void copy_device_buffer_to_host(
   if (stream) {
     throw_if_cuda(
         cudaMemcpyAsync(dst, gpu_arr.ptr, gpu_arr.size, cudaMemcpyDeviceToHost, stream),
-        "cudaMemcpyAsync copy_device_buffer_to_host failed");
-    throw_if_cuda(cudaStreamSynchronize(stream), "copy_device_buffer_to_host synchronize failed");
+        "cudaMemcpyAsync enqueue_device_buffer_to_host_copy failed");
   } else {
     throw_if_cuda(
         cudaMemcpy(dst, gpu_arr.ptr, gpu_arr.size, cudaMemcpyDeviceToHost),
-        "cudaMemcpy copy_device_buffer_to_host failed");
+        "cudaMemcpy enqueue_device_buffer_to_host_copy failed");
   }
   g_d2h_transfer_count.fetch_add(1);
   g_d2h_transfer_bytes.fetch_add(gpu_arr.size);
+}
+
+void copy_device_buffer_to_host(
+    void* dst,
+    size_t dst_size,
+    const DeviceBuffer& gpu_arr,
+    cudaStream_t stream) {
+  enqueue_device_buffer_to_host_copy(dst, dst_size, gpu_arr, stream);
+  if (stream) {
+    throw_if_cuda(cudaStreamSynchronize(stream), "copy_device_buffer_to_host synchronize failed");
+  }
 }
 
 GPUPacketGenerator::GPUPacketGenerator(
@@ -1056,6 +1076,8 @@ struct ExportHostBufferHeader {
   uint32_t alloc_kind = static_cast<uint32_t>(ExportHostAllocKind::kMalloc);
   uint32_t reserved = 0u;
   size_t size = 0u;
+  uint64_t pending_stream_handle = 0u;
+  uint64_t pending_device_ptr = 0u;
 };
 
 static int set_c_api_error(const std::string& msg) {
@@ -1089,10 +1111,16 @@ static int export_packet_result(
       exported_size = res.packets_gpu.size;
       if (res.packets_gpu.alloc_kind == ddos_samurai::gpu_packet_cuda::DeviceBuffer::AllocKind::kMappedHost &&
           res.packets_gpu.host_ptr != nullptr) {
-        if (stream) {
-          cudaError_t st = cudaStreamSynchronize(stream);
+        auto* mapped_header = reinterpret_cast<ExportHostBufferHeader*>(
+            res.packets_gpu.host_base_ptr ? res.packets_gpu.host_base_ptr : (res.packets_gpu.host_ptr - sizeof(ExportHostBufferHeader)));
+        if (mapped_header && mapped_header->magic == kExportHostBufferMagic) {
+          mapped_header->pending_stream_handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(stream));
+          mapped_header->pending_device_ptr = 0u;
+        }
+        if (!stream) {
+          cudaError_t st = cudaDeviceSynchronize();
           if (st != cudaSuccess) {
-            return set_c_api_error(std::string("zero-copy stream synchronize failed: ") + cudaGetErrorString(st));
+            return set_c_api_error(std::string("zero-copy device synchronize failed: ") + cudaGetErrorString(st));
           }
         }
         payload = res.packets_gpu.host_ptr;
@@ -1119,14 +1147,31 @@ static int export_packet_result(
         header->alloc_kind = static_cast<uint32_t>(alloc_kind);
         header->reserved = 0u;
         header->size = res.packets_gpu.size;
+        header->pending_stream_handle = 0u;
+        header->pending_device_ptr = 0u;
         payload = reinterpret_cast<uint8_t*>(header + 1);
 
         if (res.packets_gpu.size > 0) {
-          ddos_samurai::gpu_packet_cuda::copy_device_buffer_to_host(
-              payload,
-              res.packets_gpu.size,
-              res.packets_gpu,
-              stream);
+          if (stream) {
+            ddos_samurai::gpu_packet_cuda::enqueue_device_buffer_to_host_copy(
+                payload,
+                res.packets_gpu.size,
+                res.packets_gpu,
+                stream);
+            header->pending_stream_handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(stream));
+            header->pending_device_ptr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(res.packets_gpu.ptr));
+            res.packets_gpu.ptr = nullptr;
+            res.packets_gpu.host_ptr = nullptr;
+            res.packets_gpu.host_base_ptr = nullptr;
+            res.packets_gpu.size = 0;
+            res.packets_gpu.alloc_kind = ddos_samurai::gpu_packet_cuda::DeviceBuffer::AllocKind::kDevice;
+          } else {
+            ddos_samurai::gpu_packet_cuda::copy_device_buffer_to_host(
+                payload,
+                res.packets_gpu.size,
+                res.packets_gpu,
+                stream);
+          }
         }
       }
     }
@@ -1585,12 +1630,47 @@ extern "C" void samurai_gpu_packet_free(void* ptr) {
     std::free(ptr);
     return;
   }
+  if (header->pending_stream_handle != 0u) {
+    cudaStream_t stream = decode_stream_handle(header->pending_stream_handle);
+    if (stream) {
+      (void)cudaStreamSynchronize(stream);
+    } else {
+      (void)cudaDeviceSynchronize();
+    }
+    header->pending_stream_handle = 0u;
+  }
+  if (header->pending_device_ptr != 0u) {
+    auto* dptr = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(header->pending_device_ptr));
+    (void)cudaFree(dptr);
+    header->pending_device_ptr = 0u;
+  }
   const auto kind = static_cast<ExportHostAllocKind>(header->alloc_kind);
   if (kind == ExportHostAllocKind::kCudaHost) {
     cudaFreeHost(static_cast<void*>(header));
     return;
   }
   std::free(static_cast<void*>(header));
+}
+
+extern "C" int samurai_gpu_packet_wait(void* ptr) {
+  if (!ptr) {
+    return 0;
+  }
+  auto* payload = static_cast<uint8_t*>(ptr);
+  auto* header = reinterpret_cast<ExportHostBufferHeader*>(payload) - 1;
+  if (header->magic != kExportHostBufferMagic) {
+    return 0;
+  }
+  if (header->pending_stream_handle == 0u) {
+    return 0;
+  }
+  cudaStream_t stream = decode_stream_handle(header->pending_stream_handle);
+  cudaError_t st = stream ? cudaStreamSynchronize(stream) : cudaDeviceSynchronize();
+  if (st != cudaSuccess) {
+    return set_c_api_error(std::string("samurai_gpu_packet_wait synchronize failed: ") + cudaGetErrorString(st));
+  }
+  header->pending_stream_handle = 0u;
+  return 0;
 }
 
 extern "C" const char* samurai_gpu_packet_last_error() {
