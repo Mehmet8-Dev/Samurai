@@ -682,6 +682,41 @@ class XDPSender:
         except Exception as e:
             utils.log_error(f"[XDP] Send buffer error: {e}")
             return 0
+
+    def acquire_tx_frame(self):
+        """
+        Acquire a writable UMEM frame for in-place packet build.
+
+        Returns:
+            Tuple[frame_id, memoryview] or None when no frame is available.
+        """
+        if not self._is_running:
+            raise RuntimeError("XDP sender not started")
+        if self._use_fallback:
+            raise RuntimeError("UMEM frame API not available in fallback mode")
+        if not hasattr(self._xdp, "xdp_acquire_tx_frame"):
+            raise RuntimeError("xdp_acquire_tx_frame API not available")
+        return self._xdp.xdp_acquire_tx_frame()
+
+    def submit_tx_frame(self, frame_id: int, length: int) -> bool:
+        """Submit a previously acquired TX frame."""
+        if not self._is_running:
+            raise RuntimeError("XDP sender not started")
+        if self._use_fallback:
+            raise RuntimeError("UMEM frame API not available in fallback mode")
+        if not hasattr(self._xdp, "xdp_submit_tx_frame"):
+            raise RuntimeError("xdp_submit_tx_frame API not available")
+        return bool(self._xdp.xdp_submit_tx_frame(int(frame_id), int(length)))
+
+    def release_tx_frame(self, frame_id: int) -> bool:
+        """Release a previously acquired TX frame without transmit."""
+        if not self._is_running:
+            raise RuntimeError("XDP sender not started")
+        if self._use_fallback:
+            raise RuntimeError("UMEM frame API not available in fallback mode")
+        if not hasattr(self._xdp, "xdp_release_tx_frame"):
+            raise RuntimeError("xdp_release_tx_frame API not available")
+        return bool(self._xdp.xdp_release_tx_frame(int(frame_id)))
     
     def send_udp(
         self,

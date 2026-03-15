@@ -113,8 +113,8 @@ struct xsk_socket_info {
     int ifindex;
     int queue_id;
     uint32_t outstanding_tx;
-    uint32_t frame_head;
-    uint32_t frame_tail;
+    uint32_t free_frames[XDP_NUM_FRAMES];
+    uint32_t free_count;
     int need_wakeup;
     char ifname[IFNAMSIZ];
 };
@@ -581,8 +581,10 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
     }
     
     // Initialize frame allocation tracking
-    xsk->frame_head = 0;
-    xsk->frame_tail = XDP_NUM_FRAMES;
+    xsk->free_count = XDP_NUM_FRAMES;
+    for (uint32_t i = 0; i < XDP_NUM_FRAMES; i++) {
+        xsk->free_frames[i] = i;
+    }
     xsk->outstanding_tx = 0;
     
     // Pre-populate the fill ring
@@ -615,22 +617,28 @@ static void destroy_xsk_socket(struct xsk_socket_info *xsk)
 
 static uint64_t alloc_frame(struct xsk_socket_info *xsk)
 {
-    if (xsk->frame_head == xsk->frame_tail) {
+    if (xsk->free_count == 0) {
         // No free frames available
         return UINT64_MAX;
     }
-    
-    uint64_t frame = xsk->frame_head * XDP_FRAME_SIZE;
-    xsk->frame_head = (xsk->frame_head + 1) % XDP_NUM_FRAMES;
-    return frame;
+
+    uint32_t idx = xsk->free_frames[--xsk->free_count];
+    return (uint64_t)idx * XDP_FRAME_SIZE;
 }
 
 static void free_frame(struct xsk_socket_info *xsk, uint64_t frame)
 {
-    // Return frame to the pool
-    // In copy mode, this is managed by completion ring
-    (void)xsk;
-    (void)frame;
+    uint64_t base = frame;
+    if (base >= XDP_HEADROOM) {
+        base -= XDP_HEADROOM;
+    }
+    uint32_t idx = (uint32_t)(base / XDP_FRAME_SIZE);
+    if (idx >= XDP_NUM_FRAMES) {
+        return;
+    }
+    if (xsk->free_count < XDP_NUM_FRAMES) {
+        xsk->free_frames[xsk->free_count++] = idx;
+    }
 }
 
 static void complete_tx(struct xsk_socket_info *xsk)
@@ -1083,6 +1091,123 @@ static PyObject* py_xdp_send_buffer(PyObject* self, PyObject* args)
 }
 
 /**
+ * Acquire a writable UMEM TX frame for user-space in-place packet build.
+ * Python: xdp_acquire_tx_frame() -> (frame_id:int, view:memoryview) | None
+ */
+static PyObject* py_xdp_acquire_tx_frame(PyObject* self, PyObject* args)
+{
+    (void)self;
+    (void)args;
+
+    pthread_mutex_lock(&xdp_ctx.lock);
+    if (!xdp_ctx.is_initialized || !xdp_ctx.is_running) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
+        return NULL;
+    }
+
+    complete_tx(xdp_ctx.xsk);
+    uint64_t frame_addr = alloc_frame(xdp_ctx.xsk);
+    if (frame_addr == UINT64_MAX) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        Py_RETURN_NONE;
+    }
+
+    uint32_t frame_id = (uint32_t)(frame_addr / XDP_FRAME_SIZE);
+    char *frame_ptr = (char*)xdp_ctx.xsk->umem->buffer + frame_addr + XDP_HEADROOM;
+    PyObject *view = PyMemoryView_FromMemory(frame_ptr, MAX_PACKET_SIZE, PyBUF_WRITE);
+    pthread_mutex_unlock(&xdp_ctx.lock);
+
+    if (view == NULL) {
+        pthread_mutex_lock(&xdp_ctx.lock);
+        free_frame(xdp_ctx.xsk, frame_addr);
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        return NULL;
+    }
+    return Py_BuildValue("IO", frame_id, view);
+}
+
+/**
+ * Submit a previously acquired TX frame.
+ * Python: xdp_submit_tx_frame(frame_id:int, length:int) -> bool
+ */
+static PyObject* py_xdp_submit_tx_frame(PyObject* self, PyObject* args)
+{
+    int frame_id = -1;
+    int length = 0;
+    (void)self;
+
+    if (!PyArg_ParseTuple(args, "ii", &frame_id, &length)) {
+        return NULL;
+    }
+    if (frame_id < 0 || frame_id >= XDP_NUM_FRAMES) {
+        PyErr_SetString(PyExc_ValueError, "frame_id out of range");
+        return NULL;
+    }
+    if (length <= 0 || length > MAX_PACKET_SIZE) {
+        PyErr_SetString(PyExc_ValueError, "length must be in range 1..MAX_PACKET_SIZE");
+        return NULL;
+    }
+
+    pthread_mutex_lock(&xdp_ctx.lock);
+    if (!xdp_ctx.is_initialized || !xdp_ctx.is_running) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
+        return NULL;
+    }
+
+    complete_tx(xdp_ctx.xsk);
+    uint32_t tx_idx;
+    if (xsk_ring_prod__reserve(&xdp_ctx.xsk->tx, 1, &tx_idx) == 0) {
+        kick_tx(xdp_ctx.xsk);
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        Py_RETURN_FALSE;
+    }
+
+    uint64_t frame_addr = (uint64_t)frame_id * XDP_FRAME_SIZE;
+    struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xdp_ctx.xsk->tx, tx_idx);
+    tx_desc->addr = frame_addr + XDP_HEADROOM;
+    tx_desc->len = (uint32_t)length;
+    tx_desc->options = 0;
+
+    xsk_ring_prod__submit(&xdp_ctx.xsk->tx, 1);
+    xdp_ctx.xsk->outstanding_tx += 1;
+    xdp_ctx.tx_packets += 1;
+    xdp_ctx.tx_bytes += (uint64_t)length;
+    kick_tx(xdp_ctx.xsk);
+    pthread_mutex_unlock(&xdp_ctx.lock);
+    Py_RETURN_TRUE;
+}
+
+/**
+ * Release an acquired TX frame without transmitting.
+ * Python: xdp_release_tx_frame(frame_id:int) -> bool
+ */
+static PyObject* py_xdp_release_tx_frame(PyObject* self, PyObject* args)
+{
+    int frame_id = -1;
+    (void)self;
+
+    if (!PyArg_ParseTuple(args, "i", &frame_id)) {
+        return NULL;
+    }
+    if (frame_id < 0 || frame_id >= XDP_NUM_FRAMES) {
+        PyErr_SetString(PyExc_ValueError, "frame_id out of range");
+        return NULL;
+    }
+
+    pthread_mutex_lock(&xdp_ctx.lock);
+    if (!xdp_ctx.is_initialized || !xdp_ctx.is_running) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
+        return NULL;
+    }
+    free_frame(xdp_ctx.xsk, (uint64_t)frame_id * XDP_FRAME_SIZE);
+    pthread_mutex_unlock(&xdp_ctx.lock);
+    Py_RETURN_TRUE;
+}
+
+/**
  * Send a batch of UDP packets (helper function)
  * Python: xdp_send_udp(target_ip, target_port, payloads, source_ports) -> int
  */
@@ -1348,6 +1473,20 @@ static PyMethodDef XdpSenderMethods[] = {
      "Send raw packets from contiguous buffer through AF_XDP.\n"
      "Args: buffer (bytes-like), packet_size (int), count (int)\n"
      "Returns: int (number of packets sent)"},
+
+    {"xdp_acquire_tx_frame", py_xdp_acquire_tx_frame, METH_NOARGS,
+     "Acquire writable UMEM TX frame.\n"
+     "Returns: (frame_id, memoryview) or None when no frame is available."},
+
+    {"xdp_submit_tx_frame", py_xdp_submit_tx_frame, METH_VARARGS,
+     "Submit previously acquired TX frame.\n"
+     "Args: frame_id (int), length (int)\n"
+     "Returns: bool"},
+
+    {"xdp_release_tx_frame", py_xdp_release_tx_frame, METH_VARARGS,
+     "Release previously acquired TX frame without sending.\n"
+     "Args: frame_id (int)\n"
+     "Returns: bool"},
     
     {"xdp_send_udp", py_xdp_send_udp, METH_VARARGS, 
      "Send UDP packets through AF_XDP (helper).\n"

@@ -40,6 +40,32 @@ class TestAFXDPZeroCopy(unittest.TestCase):
         sent = sender.send_udp("127.0.0.1", 9999, [b"x"])
         self.assertEqual(sent, 0)
 
+    def test_acquire_submit_release_tx_frame_wrappers(self):
+        sender = self._mk_sender()
+        xdp_mod = Mock()
+        xdp_mod.xdp_acquire_tx_frame.return_value = (12, memoryview(bytearray(64)))
+        xdp_mod.xdp_submit_tx_frame.return_value = True
+        xdp_mod.xdp_release_tx_frame.return_value = True
+        sender._xdp = xdp_mod
+
+        frame_id, view = sender.acquire_tx_frame()
+        self.assertEqual(frame_id, 12)
+        self.assertEqual(len(view), 64)
+        self.assertTrue(sender.submit_tx_frame(frame_id, 32))
+        self.assertTrue(sender.release_tx_frame(frame_id))
+
+    def test_tx_frame_wrappers_fail_in_fallback_mode(self):
+        sender = self._mk_sender()
+        sender._use_fallback = True
+        sender._xdp = Mock()
+
+        with self.assertRaises(RuntimeError):
+            sender.acquire_tx_frame()
+        with self.assertRaises(RuntimeError):
+            sender.submit_tx_frame(1, 64)
+        with self.assertRaises(RuntimeError):
+            sender.release_tx_frame(1)
+
 
 if __name__ == "__main__":
     unittest.main()
