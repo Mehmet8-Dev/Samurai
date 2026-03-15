@@ -264,14 +264,20 @@ class TestFullGpuBenchmark(unittest.TestCase):
             raise unittest.SkipTest("CUDA device unavailable")
 
         template = bytes([0x45]) + bytes([0x00] * 63)
-        out = gpu_packet.benchmark_template_generation_paths(
-            template_bytes=template,
-            count=50000,
-            iterations=3,
-            real_src_ip="192.168.1.100",
-            spoof_ip=True,
-            has_ethernet=False,
-        )
+        try:
+            out = gpu_packet.benchmark_template_generation_paths(
+                template_bytes=template,
+                count=50000,
+                iterations=3,
+                real_src_ip="192.168.1.100",
+                spoof_ip=True,
+                has_ethernet=False,
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if "CUDA_ERROR_UNSUPPORTED_PTX_VERSION" in msg or "Unsupported .version" in msg:
+                raise unittest.SkipTest(f"CUDA PTX/driver mismatch: {exc}")
+            raise
 
         global_stats = out.get("global") or {}
         pps = float(global_stats.get("pps", 0.0) or 0.0)
