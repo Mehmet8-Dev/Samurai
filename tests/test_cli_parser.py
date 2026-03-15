@@ -498,6 +498,39 @@ class TestSenderRouteValidation(unittest.TestCase):
         )
         cli._validate_sender_route_args(parser, args)
 
+    def test_sender_route_rejects_empty_xdp_bpf_section_when_attach_enabled(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--sender-backend",
+                "xdp",
+                "--sender-fallback-policy",
+                "fail",
+                "--xdp-interface",
+                "eth0",
+                "--xdp-bpf-section",
+                "",
+            ]
+        )
+        self._assert_validation_fails(parser, args)
+
+    def test_sender_route_accepts_empty_xdp_bpf_section_when_attach_disabled(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--sender-backend",
+                "xdp",
+                "--sender-fallback-policy",
+                "fail",
+                "--xdp-interface",
+                "eth0",
+                "--no-xdp-attach-bpf",
+                "--xdp-bpf-section",
+                "",
+            ]
+        )
+        cli._validate_sender_route_args(parser, args)
+
     def test_dedicated_profile_autopromotes_afpacket_required_for_txring(self):
         parser = cli.build_parser()
         args = parser.parse_args(

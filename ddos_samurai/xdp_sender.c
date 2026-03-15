@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -39,7 +40,9 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <linux/bpf.h>
 #include <linux/if_xdp.h>
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
@@ -138,13 +141,89 @@ typedef struct {
     
     // Configuration
     int xdp_mode;  // 0 = SKB/Generic, 1 = Native (DRV)
+    int xsks_map_fd;
+    int xsks_map_key;
+    int xsks_map_registered;
 } xdp_context_t;
 
 static xdp_context_t xdp_ctx = {
     .is_initialized = 0,
     .is_running = 0,
+    .xsks_map_fd = -1,
+    .xsks_map_key = 0,
+    .xsks_map_registered = 0,
     .lock = PTHREAD_MUTEX_INITIALIZER
 };
+
+// ============================================================================
+// BPF helpers (XSKMAP update/delete)
+// ============================================================================
+
+static int bpf_syscall(enum bpf_cmd cmd, union bpf_attr *attr, unsigned int size)
+{
+    return (int)syscall(__NR_bpf, cmd, attr, size);
+}
+
+static int bpf_obj_get_path(const char *path)
+{
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.pathname = (uint64_t)(uintptr_t)path;
+    return bpf_syscall(BPF_OBJ_GET, &attr, sizeof(attr));
+}
+
+static int bpf_map_update_elem_fd(int map_fd, const void *key, const void *value, uint64_t flags)
+{
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = map_fd;
+    attr.key = (uint64_t)(uintptr_t)key;
+    attr.value = (uint64_t)(uintptr_t)value;
+    attr.flags = flags;
+    return bpf_syscall(BPF_MAP_UPDATE_ELEM, &attr, sizeof(attr));
+}
+
+static int bpf_map_delete_elem_fd(int map_fd, const void *key)
+{
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = map_fd;
+    attr.key = (uint64_t)(uintptr_t)key;
+    return bpf_syscall(BPF_MAP_DELETE_ELEM, &attr, sizeof(attr));
+}
+
+static int register_xsk_in_xsks_map(int queue_id, int xsk_fd, char *reason, size_t reason_len)
+{
+    const char *map_path = getenv("SAMURAI_XDP_XSKMAP_PIN");
+    int map_fd;
+    int key = queue_id;
+    int value = xsk_fd;
+
+    if (map_path == NULL || map_path[0] == '\0') {
+        return 0;
+    }
+
+    map_fd = bpf_obj_get_path(map_path);
+    if (map_fd < 0) {
+        if (reason != NULL && reason_len > 0) {
+            (void)snprintf(reason, reason_len, "BPF_OBJ_GET(%s) failed: %s", map_path, strerror(errno));
+        }
+        return -1;
+    }
+
+    if (bpf_map_update_elem_fd(map_fd, &key, &value, BPF_ANY) < 0) {
+        if (reason != NULL && reason_len > 0) {
+            (void)snprintf(reason, reason_len, "xsks_map update failed: %s", strerror(errno));
+        }
+        close(map_fd);
+        return -1;
+    }
+
+    xdp_ctx.xsks_map_fd = map_fd;
+    xdp_ctx.xsks_map_key = key;
+    xdp_ctx.xsks_map_registered = 1;
+    return 0;
+}
 
 // ============================================================================
 // Memory Barrier Helpers (for lock-free ring buffers)
@@ -761,6 +840,7 @@ static PyObject* py_xdp_init(PyObject* self, PyObject* args)
     char *ifname;
     int queue_id = 0;
     int mode = 0;  // 0 = SKB/Copy, 1 = Native
+    char map_reason[256];
     
     if (!PyArg_ParseTuple(args, "s|ii", &ifname, &queue_id, &mode)) {
         return NULL;
@@ -812,7 +892,27 @@ static PyObject* py_xdp_init(PyObject* self, PyObject* args)
     xdp_ctx.tx_bytes = 0;
     xdp_ctx.tx_errors = 0;
     xdp_ctx.tx_wakeups = 0;
+    xdp_ctx.xsks_map_fd = -1;
+    xdp_ctx.xsks_map_key = queue_id;
+    xdp_ctx.xsks_map_registered = 0;
     clock_gettime(CLOCK_MONOTONIC, &xdp_ctx.start_time);
+
+    map_reason[0] = '\0';
+    if (register_xsk_in_xsks_map(queue_id, xdp_ctx.xsk->fd, map_reason, sizeof(map_reason)) < 0) {
+        destroy_xsk_socket(xdp_ctx.xsk);
+        xdp_ctx.xsk = NULL;
+        destroy_umem(xdp_ctx.umem);
+        xdp_ctx.umem = NULL;
+        xdp_ctx.is_initialized = 0;
+        xdp_ctx.is_running = 0;
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        if (map_reason[0] != '\0') {
+            PyErr_SetString(PyExc_RuntimeError, map_reason);
+        } else {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to register AF_XDP socket into xsks_map");
+        }
+        return NULL;
+    }
     
     pthread_mutex_unlock(&xdp_ctx.lock);
     
@@ -835,6 +935,13 @@ static PyObject* py_xdp_cleanup(PyObject* self, PyObject* args)
     }
     
     xdp_ctx.is_running = 0;
+
+    if (xdp_ctx.xsks_map_registered && xdp_ctx.xsks_map_fd >= 0) {
+        (void)bpf_map_delete_elem_fd(xdp_ctx.xsks_map_fd, &xdp_ctx.xsks_map_key);
+        close(xdp_ctx.xsks_map_fd);
+        xdp_ctx.xsks_map_fd = -1;
+        xdp_ctx.xsks_map_registered = 0;
+    }
     
     destroy_xsk_socket(xdp_ctx.xsk);
     xdp_ctx.xsk = NULL;
@@ -979,14 +1086,14 @@ static PyObject* py_xdp_send_buffer(PyObject* self, PyObject* args)
  * Send a batch of UDP packets (helper function)
  * Python: xdp_send_udp(target_ip, target_port, payloads, source_ports) -> int
  */
-static PyObject* py_xdp_send_udp(PyObject* self, PyObject* args)
+static PyObject* xdp_send_udp_common(PyObject* args)
 {
     char *target_ip;
     int target_port;
     PyObject *payloads_list;
     PyObject *src_ports_list = NULL;
     
-    if (!PyArg_ParseTuple(args, "siO|O", &target_ip, &target_port, 
+    if (!PyArg_ParseTuple(args, "siO|O", &target_ip, &target_port,
                           &payloads_list, &src_ports_list)) {
         return NULL;
     }
@@ -1008,7 +1115,8 @@ static PyObject* py_xdp_send_udp(PyObject* self, PyObject* args)
     struct in_addr dst_addr;
     inet_pton(AF_INET, target_ip, &dst_addr);
     
-    // Build and send packets
+    // Build packets directly in UMEM and submit descriptors.
+    // This removes the intermediate stack packet buffer copy.
     int total_sent = 0;
     const size_t udp_payload_cap =
         (size_t)MAX_PACKET_SIZE - sizeof(struct iphdr) - sizeof(struct udphdr);
@@ -1041,8 +1149,22 @@ static PyObject* py_xdp_send_udp(PyObject* self, PyObject* args)
             }
         }
         
-        // Build IP + UDP packet
-        uint8_t pkt_buffer[MAX_PACKET_SIZE];
+        // Complete pending TX to recover frames when possible.
+        complete_tx(xdp_ctx.xsk);
+
+        uint32_t tx_idx;
+        if (xsk_ring_prod__reserve(&xdp_ctx.xsk->tx, 1, &tx_idx) == 0) {
+            kick_tx(xdp_ctx.xsk);
+            continue;
+        }
+
+        uint64_t frame_addr = alloc_frame(xdp_ctx.xsk);
+        if (frame_addr == UINT64_MAX) {
+            xdp_ctx.tx_errors++;
+            continue;
+        }
+
+        uint8_t *pkt_buffer = (uint8_t*)xdp_ctx.xsk->umem->buffer + frame_addr + XDP_HEADROOM;
         size_t pkt_offset = 0;
         
         // IP Header
@@ -1074,19 +1196,40 @@ static PyObject* py_xdp_send_udp(PyObject* self, PyObject* args)
         pkt_offset += (size_t)payload_len;
         
         // Calculate UDP checksum
-        udph->check = udp_checksum(iph, udph, payload, (size_t)payload_len);
-        
-        // Send single packet
-        const uint8_t *pkt_ptr = pkt_buffer;
-        uint16_t pkt_len = pkt_offset;
-        
-        int sent = xdp_send_batch(xdp_ctx.xsk, &pkt_ptr, &pkt_len, 1);
-        total_sent += sent;
+        udph->check = udp_checksum(iph, udph, pkt_buffer + sizeof(struct iphdr) + sizeof(struct udphdr), (size_t)payload_len);
+
+        struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xdp_ctx.xsk->tx, tx_idx);
+        tx_desc->addr = frame_addr + XDP_HEADROOM;
+        tx_desc->len = (uint32_t)pkt_offset;
+        tx_desc->options = 0;
+
+        xsk_ring_prod__submit(&xdp_ctx.xsk->tx, 1);
+        xdp_ctx.xsk->outstanding_tx += 1;
+        xdp_ctx.tx_packets += 1;
+        xdp_ctx.tx_bytes += (uint64_t)pkt_offset;
+        total_sent += 1;
+        kick_tx(xdp_ctx.xsk);
     }
     
     pthread_mutex_unlock(&xdp_ctx.lock);
     
     return PyLong_FromLong(total_sent);
+}
+
+static PyObject* py_xdp_send_udp(PyObject* self, PyObject* args)
+{
+    (void)self;
+    return xdp_send_udp_common(args);
+}
+
+/**
+ * Zero-copy oriented UDP helper: directly builds packets into UMEM frames.
+ * Python: xdp_send_udp_zc(target_ip, target_port, payloads, source_ports) -> int
+ */
+static PyObject* py_xdp_send_udp_zc(PyObject* self, PyObject* args)
+{
+    (void)self;
+    return xdp_send_udp_common(args);
 }
 
 /**
@@ -1208,6 +1351,11 @@ static PyMethodDef XdpSenderMethods[] = {
     
     {"xdp_send_udp", py_xdp_send_udp, METH_VARARGS, 
      "Send UDP packets through AF_XDP (helper).\n"
+     "Args: target_ip, target_port, payloads (list), src_ports (list, optional)\n"
+     "Returns: int (number of packets sent)"},
+
+    {"xdp_send_udp_zc", py_xdp_send_udp_zc, METH_VARARGS,
+     "Send UDP packets by building directly in UMEM frames.\n"
      "Args: target_ip, target_port, payloads (list), src_ports (list, optional)\n"
      "Returns: int (number of packets sent)"},
     

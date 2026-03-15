@@ -44,6 +44,7 @@ import struct
 import logging
 import subprocess
 import threading
+import shutil
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Callable, Any
 from pathlib import Path
@@ -82,6 +83,13 @@ XDP_MODE_OFFLOAD = 2  # Offload Mode (Hardware) - Requires NIC support
 
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_QUEUE_ID = 0
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ============================================================================
@@ -290,7 +298,10 @@ class XDPSender:
         queue_id: int = DEFAULT_QUEUE_ID,
         mode: int = XDP_MODE_SKB,
         batch_size: int = DEFAULT_BATCH_SIZE,
-        auto_fallback: bool = True
+        auto_fallback: bool = True,
+        attach_bpf: Optional[bool] = None,
+        bpf_section: Optional[str] = None,
+        bpf_obj_path: Optional[str] = None,
     ):
         """
         Initialize XDP sender.
@@ -301,16 +312,29 @@ class XDPSender:
             mode: XDP mode (0=SKB/Copy, 1=Native)
             batch_size: Batch size for packet transmission
             auto_fallback: Fall back to raw sockets if XDP unavailable
+            attach_bpf: Auto attach XDP BPF program on start
+            bpf_section: BPF section name to attach
+            bpf_obj_path: Path to xdp_prog.o object file
         """
         self.interface = interface or get_default_interface()
         self.queue_id = queue_id
         self.mode = mode
         self.batch_size = batch_size
         self.auto_fallback = auto_fallback
+        self.attach_bpf = _env_truthy("SAMURAI_XDP_ATTACH_BPF", True) if attach_bpf is None else bool(attach_bpf)
+        self.bpf_section = str(
+            bpf_section or os.environ.get("SAMURAI_XDP_BPF_SECTION", "xdp_sock")
+        ).strip() or "xdp_sock"
+        self.bpf_obj_path = str(
+            bpf_obj_path or os.environ.get("SAMURAI_XDP_BPF_OBJ", str(Path(__file__).with_name("xdp_prog.o")))
+        ).strip()
         
         self._xdp = None
         self._is_running = False
         self._use_fallback = False
+        self._bpf_attached = False
+        self._xskmap_pin_path = ""
+        self._bpffs_root = ""
         self._lock = threading.Lock()
         
         # Statistics tracking
@@ -324,6 +348,166 @@ class XDPSender:
         
         if not os.path.exists(f'/sys/class/net/{self.interface}'):
             raise ValueError(f"Interface '{self.interface}' does not exist")
+
+    def _attach_bpf_program(self) -> Tuple[bool, str]:
+        if not self.attach_bpf:
+            return True, "BPF attach disabled"
+        if not self.bpf_obj_path:
+            return False, "BPF object path is empty"
+        if not os.path.exists(self.bpf_obj_path):
+            src_path = str(Path(__file__).with_name("xdp_prog.c"))
+            if os.path.exists(src_path):
+                try:
+                    compile_result = subprocess.run(
+                        ["clang", "-O2", "-target", "bpf", "-c", src_path, "-o", self.bpf_obj_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    if compile_result.returncode != 0:
+                        details = (compile_result.stderr or compile_result.stdout or "").strip()
+                        return False, f"BPF object compile failed: {details or f'exit={compile_result.returncode}'}"
+                    utils.log_info(f"[XDP] Compiled BPF object: {self.bpf_obj_path}")
+                except FileNotFoundError:
+                    return False, "BPF object missing and `clang` not found"
+                except Exception as e:
+                    return False, f"BPF object compile exception: {e}"
+            else:
+                return False, f"BPF object not found: {self.bpf_obj_path}"
+        bpftool_path = shutil.which("bpftool")
+        if bpftool_path:
+            bpffs_root = None
+            try:
+                bpffs_root = Path(f"/sys/fs/bpf/samurai_{self.interface}_q{self.queue_id}_{os.getpid()}")
+                prog_pin = bpffs_root / "progs"
+                maps_pin = bpffs_root / "maps"
+                prog_pin.mkdir(parents=True, exist_ok=True)
+                maps_pin.mkdir(parents=True, exist_ok=True)
+                load_result = subprocess.run(
+                    [
+                        bpftool_path,
+                        "prog",
+                        "loadall",
+                        self.bpf_obj_path,
+                        str(prog_pin),
+                        "type",
+                        "xdp",
+                        "pinmaps",
+                        str(maps_pin),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                if load_result.returncode == 0:
+                    prog_path = prog_pin / self.bpf_section
+                    if not prog_path.exists():
+                        candidates = sorted(p for p in prog_pin.iterdir() if p.is_file())
+                        if not candidates:
+                            return False, "BPF load succeeded but no pinned program found"
+                        prog_path = candidates[0]
+                        utils.log_warning(
+                            f"[XDP] Requested section '{self.bpf_section}' not pinned; using '{prog_path.name}'."
+                        )
+                    attach_result = subprocess.run(
+                        [
+                            bpftool_path,
+                            "net",
+                            "attach",
+                            "xdp",
+                            "pinned",
+                            str(prog_path),
+                            "dev",
+                            self.interface,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    if attach_result.returncode == 0:
+                        xsks_map_pin = maps_pin / "xsks_map"
+                        if xsks_map_pin.exists():
+                            self._xskmap_pin_path = str(xsks_map_pin)
+                            os.environ["SAMURAI_XDP_XSKMAP_PIN"] = self._xskmap_pin_path
+                            utils.log_info(f"[XDP] XSKMAP pinned at: {self._xskmap_pin_path}")
+                        self._bpffs_root = str(bpffs_root)
+                        self._bpf_attached = True
+                        return True, "BPF attached via bpftool"
+                    details = (attach_result.stderr or attach_result.stdout or "").strip()
+                    return False, f"BPF attach (bpftool) failed: {details or f'exit={attach_result.returncode}'}"
+                details = (load_result.stderr or load_result.stdout or "").strip()
+                return False, f"BPF load (bpftool) failed: {details or f'exit={load_result.returncode}'}"
+            except Exception as e:
+                return False, f"BPF attach via bpftool exception: {e}"
+            finally:
+                if not self._bpf_attached and bpffs_root is not None:
+                    try:
+                        shutil.rmtree(bpffs_root, ignore_errors=True)
+                    except Exception:
+                        pass
+        try:
+            result = subprocess.run(
+                [
+                    "ip", "link", "set", "dev", self.interface,
+                    "xdp", "obj", self.bpf_obj_path, "sec", self.bpf_section,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except FileNotFoundError:
+            return False, "`ip` command not found (iproute2 missing)"
+        except Exception as e:
+            return False, f"BPF attach command failed: {e}"
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            details = stderr or stdout or f"exit={result.returncode}"
+            return False, f"BPF attach failed: {details}"
+        self._bpf_attached = True
+        return True, "BPF attached"
+
+    def _detach_bpf_program(self) -> None:
+        if not self._bpf_attached:
+            return
+        try:
+            bpftool_path = shutil.which("bpftool")
+            if bpftool_path:
+                result = subprocess.run(
+                    [bpftool_path, "net", "detach", "xdp", "dev", self.interface],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            else:
+                result = subprocess.run(
+                    ["ip", "link", "set", "dev", self.interface, "xdp", "off"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            if result.returncode != 0:
+                details = (result.stderr or result.stdout or "").strip() or f"exit={result.returncode}"
+                utils.log_warning(f"[XDP] BPF detach failed on {self.interface}: {details}")
+        except Exception as e:
+            utils.log_warning(f"[XDP] BPF detach exception on {self.interface}: {e}")
+        finally:
+            if self._xskmap_pin_path and os.environ.get("SAMURAI_XDP_XSKMAP_PIN", "") == self._xskmap_pin_path:
+                os.environ.pop("SAMURAI_XDP_XSKMAP_PIN", None)
+            self._xskmap_pin_path = ""
+            if self._bpffs_root:
+                try:
+                    shutil.rmtree(self._bpffs_root, ignore_errors=True)
+                except Exception:
+                    pass
+            self._bpffs_root = ""
+            self._bpf_attached = False
     
     def _check_requirements(self) -> Tuple[bool, str]:
         """Check if all requirements are met for XDP."""
@@ -384,6 +568,16 @@ class XDPSender:
             self._xdp = _load_xdp_extension()
             
             try:
+                if self.attach_bpf:
+                    attached, attach_msg = self._attach_bpf_program()
+                    if attached:
+                        utils.log_info(
+                            f"[XDP] BPF program attached: iface={self.interface}, "
+                            f"section={self.bpf_section}, obj={self.bpf_obj_path}"
+                        )
+                    else:
+                        raise RuntimeError(attach_msg)
+
                 result = self._xdp.xdp_init(self.interface, self.queue_id, self.mode)
                 
                 if result:
@@ -397,6 +591,7 @@ class XDPSender:
                     
             except Exception as e:
                 utils.log_error(f"[XDP] Failed to initialize: {e}")
+                self._detach_bpf_program()
                 
                 if self.auto_fallback:
                     utils.log_info("[XDP] Falling back to standard sender")
@@ -423,6 +618,10 @@ class XDPSender:
                     self._xdp.xdp_cleanup()
                 except Exception as e:
                     utils.log_error(f"[XDP] Cleanup error: {e}")
+                finally:
+                    self._detach_bpf_program()
+            else:
+                self._detach_bpf_program()
             
             self._is_running = False
             self._use_fallback = False
@@ -513,10 +712,17 @@ class XDPSender:
             return self._send_udp_fallback(target_ip, target_port, payloads)
         
         try:
+            send_udp_fn = getattr(
+                self._xdp,
+                "xdp_send_udp_zc",
+                getattr(self._xdp, "xdp_send_udp", None),
+            )
+            if send_udp_fn is None:
+                raise RuntimeError("xdp_send_udp API not available in extension")
             if source_ports:
-                sent = self._xdp.xdp_send_udp(target_ip, target_port, payloads, source_ports)
+                sent = send_udp_fn(target_ip, target_port, payloads, source_ports)
             else:
-                sent = self._xdp.xdp_send_udp(target_ip, target_port, payloads)
+                sent = send_udp_fn(target_ip, target_port, payloads)
             return sent
         except Exception as e:
             utils.log_error(f"[XDP] Send UDP error: {e}")

@@ -137,6 +137,10 @@ Pratikte genel kural:
 | `SAMURAI_XDP_ENABLE` | `cli.py:1729` | `os.environ["SAMURAI_XDP_ENABLE"] = "1" if bool(getattr(args, "xdp_enable", False)) else "0"` |
 | `SAMURAI_XDP_INTERFACE` | `cli.py:1730` | `os.environ["SAMURAI_XDP_INTERFACE"] = str(getattr(args, "xdp_interface", "") or "")` |
 | `SAMURAI_XDP_QUEUE_ID` | `cli.py:1731` | `os.environ["SAMURAI_XDP_QUEUE_ID"] = str(int(getattr(args, "xdp_queue_id", 0) or 0))` |
+| `SAMURAI_XDP_ATTACH_BPF` | `cli.py` | `os.environ["SAMURAI_XDP_ATTACH_BPF"] = "1" if bool(getattr(args, "xdp_attach_bpf", True)) else "0"` |
+| `SAMURAI_XDP_BPF_SECTION` | `cli.py` | `os.environ["SAMURAI_XDP_BPF_SECTION"] = str(getattr(args, "xdp_bpf_section", "xdp_sock") or "xdp_sock")` |
+| `SAMURAI_XDP_BPF_OBJ` | `cli.py` | `os.environ["SAMURAI_XDP_BPF_OBJ"] = str(getattr(args, "xdp_bpf_obj", "") or "")` |
+| `SAMURAI_XDP_XSKMAP_PIN` | `cli.py` | `os.environ["SAMURAI_XDP_XSKMAP_PIN"] = str(getattr(args, "xdp_xskmap_pin", "") or "")` |
 
 ## CLI Disi / Ileri Seviye Env Degiskenleri
 | Env | Tuketici Moduller | Aciklama |
@@ -411,6 +415,11 @@ Asagidaki envanter dogrudan `build_parser()` aksiyonlarindan cikarilmistir.
 | `--xdp-enable` | `False` |  | AF_XDP sender yolunu etkinleştir (xdp backend). |
 | `--xdp-interface` | `` |  | AF_XDP için NIC adı (örn: eth0). |
 | `--xdp-queue-id` | `0` |  | AF_XDP queue id (varsayılan: 0). |
+| `--xdp-attach-bpf` | `True` |  | XDP backend start anında eBPF programı attach et. |
+| `--no-xdp-attach-bpf` | `True` |  | XDP backend için eBPF attach adımını kapat. |
+| `--xdp-bpf-section` | `xdp_sock` |  | Attach edilecek BPF section adı. |
+| `--xdp-bpf-obj` | `` |  | XDP BPF object yolu (boşsa varsayılan `xdp_prog.o`). |
+| `--xdp-xskmap-pin` | `` |  | Pinned xsks_map yolu (queue->xsk fd map update). |
 | `--kpi-gate-profile` | `off` | `off|dev|ci_safe|developer_fallback|dedicated_lab` | KPI gate profili: off\|dev\|ci_safe\|developer_fallback\|dedicated_lab. |
 | `--kpi-hard-fail` | `False` |  | Dedicated gate ihlalinde non-zero exit döndür. |
 | `--l7-engine` | `python` | `python|c_state` | L7 state engine seçimi: python\|c_state. |

@@ -593,6 +593,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
     args.afpacket_hugepage_mode = afpacket_hugepage_mode
     xdp_enable = bool(getattr(args, "xdp_enable", False))
     xdp_interface = str(getattr(args, "xdp_interface", "") or "").strip()
+    xdp_attach_bpf = bool(getattr(args, "xdp_attach_bpf", True))
+    xdp_bpf_section = str(getattr(args, "xdp_bpf_section", "xdp_sock") or "").strip()
     lab_profile = str(getattr(args, "lab_profile", "off") or "off").strip().lower()
     dp_queue_strategy = str(getattr(args, "dp_queue_strategy", "rr") or "rr").strip().lower()
     dp_queue_map = str(getattr(args, "dp_queue_map", "") or "").strip()
@@ -653,6 +655,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: --quic-expect-body-substring en fazla 159 karakter olmalıdır.")
     if (xdp_enable or sender_backend == "xdp") and not xdp_interface:
         parser.error("Hata: XDP yolu için --xdp-interface zorunludur.")
+    if (xdp_enable or sender_backend == "xdp") and xdp_attach_bpf and not xdp_bpf_section:
+        parser.error("Hata: --xdp-attach-bpf açıkken --xdp-bpf-section boş olamaz.")
     if fallback_policy == "fail" and sender_backend == "auto":
         parser.error("Hata: --sender-fallback-policy fail için --sender-backend auto kullanılamaz.")
     if dataplane_core_mode == "required" and fallback_policy != "fail":
@@ -1183,6 +1187,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xdp-enable", action="store_true", help="AF_XDP sender yolunu etkinleştir (xdp backend).")
     parser.add_argument("--xdp-interface", type=str, default="", help="AF_XDP için NIC adı (örn: eth0).")
     parser.add_argument("--xdp-queue-id", type=int, default=0, help="AF_XDP queue id (varsayılan: 0).")
+    parser.add_argument(
+        "--xdp-attach-bpf",
+        dest="xdp_attach_bpf",
+        action="store_true",
+        help="XDP backend start anında eBPF programı attach et (varsayılan: açık).",
+    )
+    parser.add_argument(
+        "--no-xdp-attach-bpf",
+        dest="xdp_attach_bpf",
+        action="store_false",
+        help="XDP backend için eBPF attach adımını kapat.",
+    )
+    parser.set_defaults(
+        xdp_attach_bpf=_env_flag("SAMURAI_XDP_ATTACH_BPF", "1")
+    )
+    parser.add_argument(
+        "--xdp-bpf-section",
+        type=str,
+        default=str(os.environ.get("SAMURAI_XDP_BPF_SECTION", "xdp_sock") or "xdp_sock"),
+        help="Attach edilecek BPF section adı (örn: xdp_sock, xdp_sock_filter).",
+    )
+    parser.add_argument(
+        "--xdp-bpf-obj",
+        type=str,
+        default=str(os.environ.get("SAMURAI_XDP_BPF_OBJ", "") or ""),
+        help="XDP BPF object yolu (boşsa ddos_samurai/xdp_prog.o varsayımı).",
+    )
+    parser.add_argument(
+        "--xdp-xskmap-pin",
+        type=str,
+        default=str(os.environ.get("SAMURAI_XDP_XSKMAP_PIN", "") or ""),
+        help="Pinned xsks_map yolu (opsiyonel, queue->xsk fd map update için).",
+    )
     parser.add_argument(
         "--kpi-gate-profile",
         choices=["off", "dev", "ci_safe", "developer_fallback", "dedicated_lab"],
@@ -1833,6 +1870,10 @@ def main(argv=None):
     os.environ["SAMURAI_XDP_ENABLE"] = "1" if bool(getattr(args, "xdp_enable", False)) else "0"
     os.environ["SAMURAI_XDP_INTERFACE"] = str(getattr(args, "xdp_interface", "") or "")
     os.environ["SAMURAI_XDP_QUEUE_ID"] = str(int(getattr(args, "xdp_queue_id", 0) or 0))
+    os.environ["SAMURAI_XDP_ATTACH_BPF"] = "1" if bool(getattr(args, "xdp_attach_bpf", True)) else "0"
+    os.environ["SAMURAI_XDP_BPF_SECTION"] = str(getattr(args, "xdp_bpf_section", "xdp_sock") or "xdp_sock")
+    os.environ["SAMURAI_XDP_BPF_OBJ"] = str(getattr(args, "xdp_bpf_obj", "") or "")
+    os.environ["SAMURAI_XDP_XSKMAP_PIN"] = str(getattr(args, "xdp_xskmap_pin", "") or "")
     os.environ["SAMURAI_KPI_GATE_PROFILE"] = str(getattr(args, "kpi_gate_profile", "off") or "off")
     os.environ["SAMURAI_KPI_HARD_FAIL"] = "1" if bool(getattr(args, "kpi_hard_fail", False)) else "0"
     os.environ["SAMURAI_L7_ENGINE"] = str(getattr(args, "l7_engine", "python") or "python")
