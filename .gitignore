@@ -54,3 +54,10 @@ Papers/
 
 # Keep local Codacy instruction file out of repository history
 .github/instructions/codacy.instructions.md
+
+# Local web stacks/assets (temporary)
+/Web_Site/
+/web_site_backend/
+/Görseller/
+/kenjaku.glb
+/Kenjaku.glb
