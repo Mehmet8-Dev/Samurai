@@ -24,3 +24,6 @@ httpx[http2]
 playwright
 rich
 pytest
+
+# ML planner dependencies are optional and intentionally not listed here.
+# Use project-level extras: `pip install ".[ml]"`.

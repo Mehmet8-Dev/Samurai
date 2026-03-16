@@ -1339,12 +1339,55 @@ async def worker_process(
             real_src_ip = args.get('spoof_ip', "192.168.1.100")
             if not real_src_ip: real_src_ip = "192.168.1.100"
             real_src_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(real_src_ip.split('.'))]))
+            traffic_model_sessions = list(args.get("traffic_model_sessions", []) or [])
+            traffic_model_mode = str(args.get("traffic_model", "none") or "none").strip().lower()
+            traffic_model_enabled = traffic_model_mode != "none" and len(traffic_model_sessions) > 0
+
+            def _iter_model_plans():
+                for session_plan in traffic_model_sessions:
+                    try:
+                        rp = gpu_payload.build_request_plan_from_session_plan(session_plan)
+                    except Exception:
+                        continue
+                    if int(len(getattr(rp, "items", []) or [])) > 0:
+                        yield rp
+            traffic_model_request_plans = list(_iter_model_plans()) if traffic_model_enabled else []
 
             if args['attack_vector'] == 'http' and bool(args.get('stateful', False)):
                 log_info("Initializing GPU L7 planner + CPU Stateful HTTP engine...")
                 verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
                 BATCH_SIZE = int(_gpu_batch_size)
                 remaining = int(args['count'])
+                if traffic_model_request_plans:
+                    for request_plan in traffic_model_request_plans:
+                        batch_count = int(len(request_plan.items))
+                        worker_stats = _add_stats(worker_stats, await senders.http_stateful_sender(
+                            args['target'], args['port'],
+                            batch_count, args['http_concurrency'],
+                            workflow_steps=None,
+                            verbose=args['verbose'],
+                            scheme=args['http_scheme'],
+                            verify=verify_ssl,
+                            timeout_s=args['http_timeout'],
+                            ssl_context=ssl_context,
+                            user_agent=args.get('user_agent'),
+                            retries=args.get('http_retries', 0),
+                            http_method=args.get('http_method', 'GET'),
+                            http_path=args.get('http_path', ['/']),
+                            payloads=args.get('payloads', []),
+                            session_repeats=args.get('l7_session_repeats', 1),
+                            max_active_sessions=args.get('l7_max_active_sessions', 0),
+                            l7_engine=args.get('l7_engine', 'python'),
+                            legacy_path_enable=bool(args.get('legacy_path_enable', False)),
+                            lab_profile=args.get('lab_profile', 'off'),
+                            l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
+                            l7_capability_strict=bool(args.get("l7_capability_strict", False)),
+                            request_plan=request_plan,
+                            live_sent=sent_total,
+                            live_errors=errors_total,
+                            live_progress=progress,
+                        ))
+                    return
                 payload_engine = gpu_payload.GPUPayloadEngine(
                     BATCH_SIZE,
                     rng_seed=args.get("gpu_rng_seed", 1234),
@@ -1546,6 +1589,33 @@ async def worker_process(
                 verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
                 BATCH_SIZE = int(_gpu_batch_size)
                 remaining = int(args['count'])
+                if traffic_model_request_plans:
+                    for request_plan in traffic_model_request_plans:
+                        plan_count = int(len(request_plan.items))
+                        worker_stats = _add_stats(worker_stats, await senders.http2_sender(
+                            target_ip=args['target'],
+                            target_port=args['port'],
+                            count=plan_count,
+                            concurrency=args['http2_concurrency'],
+                            http_path=args['http_path'],
+                            http_method=args['http_method'],
+                            verbose=args['verbose'],
+                            scheme=args['http_scheme'],
+                            cookies=args.get('cookies'),
+                            user_agent=args.get('user_agent'),
+                            ssl_context=ssl_context,
+                            verify=verify_ssl,
+                            h2_profile_name=args.get("h2_profile", args.get("ja3_profile", "none")),
+                            l7_http2_engine=args.get("l7_http2_engine", "auto"),
+                            l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
+                            l7_capability_strict=bool(args.get("l7_capability_strict", False)),
+                            lab_profile=args.get("lab_profile", "off"),
+                            request_plan=request_plan,
+                            live_sent=sent_total,
+                            live_errors=errors_total,
+                            live_progress=progress,
+                        ))
+                    return
                 payload_engine = gpu_payload.GPUPayloadEngine(
                     BATCH_SIZE,
                     rng_seed=args.get("gpu_rng_seed", 1234),
@@ -1604,6 +1674,33 @@ async def worker_process(
                     log_info("Initializing GPU L7 planner + CPU WebSocket scenario engine...")
                     BATCH_SIZE = int(_gpu_batch_size)
                     remaining = int(args['count'])
+                    if traffic_model_request_plans:
+                        for request_plan in traffic_model_request_plans:
+                            batch_count = int(len(request_plan.items))
+                            worker_stats = _add_stats(worker_stats, await senders.websocket_scenario_sender(
+                                target_ip=args['target'],
+                                target_port=args['port'],
+                                count=batch_count,
+                                concurrency=args['ws_concurrency'],
+                                ws_path=args['ws_path'],
+                                verbose=args['verbose'],
+                                auth_message=args.get("ws_auth_message", ""),
+                                subscribe_messages=args.get("ws_subscribe_message"),
+                                ping_message=args.get("ws_message", "ping"),
+                                ping_count=args.get("ws_ping_count", 1),
+                                await_response=bool(args.get("ws_await_response", False)),
+                                l7_engine=args.get('l7_engine', 'python'),
+                                legacy_path_enable=bool(args.get('legacy_path_enable', False)),
+                                lab_profile=args.get('lab_profile', 'off'),
+                                l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
+                                l7_capability_strict=bool(args.get("l7_capability_strict", False)),
+                                request_plan=request_plan,
+                                ssl_context=ssl_context,
+                                live_sent=sent_total,
+                                live_errors=errors_total,
+                                live_progress=progress,
+                            ))
+                        return
                     payload_engine = gpu_payload.GPUPayloadEngine(
                         BATCH_SIZE,
                         rng_seed=args.get("gpu_rng_seed", 1234),
@@ -1667,6 +1764,40 @@ async def worker_process(
                 log_info("Initializing GPU L7 planner + CPU QUIC engine...")
                 BATCH_SIZE = int(_gpu_batch_size)
                 remaining = int(args['count'])
+                if traffic_model_request_plans:
+                    for request_plan in traffic_model_request_plans:
+                        batch_count = int(len(request_plan.items))
+                        worker_stats = _add_stats(worker_stats, await senders.quic_sender(
+                            target_ip=args['target'],
+                            target_port=args['port'],
+                            count=batch_count,
+                            concurrency=args['quic_concurrency'],
+                            quic_path=args['quic_path'],
+                            quic_method=args['quic_method'],
+                            verbose=args['verbose'],
+                            ssl_context=ssl_context,
+                            l7_quic_engine=args.get("l7_quic_engine", "auto"),
+                            l7_quic_require_native=bool(args.get("l7_quic_require_native", False)),
+                            l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
+                            l7_capability_strict=bool(args.get("l7_capability_strict", False)),
+                            lab_profile=args.get("lab_profile", "off"),
+                            quic_streams_per_conn=int(args.get("quic_streams_per_conn", 0) or 0),
+                            quic_requests_per_conn=int(args.get("quic_requests_per_conn", 0) or 0),
+                            quic_conn_pool_size=int(args.get("quic_conn_pool_size", 1) or 1),
+                            quic_expect_status_min=int(args.get("quic_expect_status_min", 200) or 200),
+                            quic_expect_status_max=int(args.get("quic_expect_status_max", 399) or 399),
+                            quic_require_response_headers=bool(args.get("quic_require_response_headers", True)),
+                            quic_require_response_body=bool(args.get("quic_require_response_body", False)),
+                            quic_min_response_body_bytes=int(args.get("quic_min_response_body_bytes", 0) or 0),
+                            quic_expect_header_name=str(args.get("quic_expect_header_name", "") or ""),
+                            quic_expect_header_value_contains=str(args.get("quic_expect_header_value_contains", "") or ""),
+                            quic_expect_body_substring=str(args.get("quic_expect_body_substring", "") or ""),
+                            request_plan=request_plan,
+                            live_sent=sent_total,
+                            live_errors=errors_total,
+                            live_progress=progress,
+                        ))
+                    return
                 payload_engine = gpu_payload.GPUPayloadEngine(
                     BATCH_SIZE,
                     rng_seed=args.get("gpu_rng_seed", 1234),

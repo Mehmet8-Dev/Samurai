@@ -424,6 +424,20 @@ def _report_inputs_from_args(args) -> dict:
         "l7_session_repeats": int(getattr(args, "l7_session_repeats", 1) or 1),
         "l7_max_active_sessions": int(getattr(args, "l7_max_active_sessions", 0) or 0),
         "fault_inject": list(getattr(args, "fault_inject", []) or []),
+        "traffic_model": str(getattr(args, "traffic_model", "none") or "none"),
+        "traffic_model_checkpoint": str(getattr(args, "traffic_model_checkpoint", "") or ""),
+        "traffic_model_config": str(getattr(args, "traffic_model_config", "") or ""),
+        "traffic_model_device": str(getattr(args, "traffic_model_device", "cpu") or "cpu"),
+        "traffic_model_seed": int(getattr(args, "traffic_model_seed", 1337) or 1337),
+        "traffic_model_label_mix": str(getattr(args, "traffic_model_label_mix", "") or ""),
+        "traffic_model_session_len": int(getattr(args, "traffic_model_session_len", 24) or 24),
+        "traffic_model_planner_batch": int(getattr(args, "traffic_model_planner_batch", 128) or 128),
+        "traffic_model_timeout_ms": int(getattr(args, "traffic_model_timeout_ms", 2500) or 2500),
+        "traffic_model_fallback": str(getattr(args, "traffic_model_fallback", "static") or "static"),
+        "traffic_model_export_events": str(getattr(args, "traffic_model_export_events", "") or ""),
+        "traffic_model_dataset_capture": str(getattr(args, "traffic_model_dataset_capture", "") or ""),
+        "traffic_model_pcap_profile": str(getattr(args, "traffic_model_pcap_profile", "") or ""),
+        "traffic_model_dry_validate": bool(getattr(args, "traffic_model_dry_validate", False)),
     }
 
 
@@ -895,6 +909,40 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
     elif attack_vector == "quic":
         _check("quic", protocol_engine=str(getattr(args, "l7_quic_engine", "auto") or "auto"), global_engine="python", legacy=True, hint="--l7-quic-engine c_state")
 
+
+def _parse_label_mix(raw: str) -> dict:
+    out = {}
+    text = str(raw or "").strip()
+    if not text:
+        return out
+    for chunk in [x.strip() for x in text.split(",") if x.strip()]:
+        if "=" not in chunk:
+            raise ValueError(f"invalid label-mix entry: {chunk}")
+        k, v = chunk.split("=", 1)
+        key = str(k or "").strip().lower()
+        val = float(v)
+        if val < 0.0:
+            raise ValueError(f"negative label weight: {chunk}")
+        out[key] = val
+    if out:
+        s = sum(float(v) for v in out.values())
+        if s > 0:
+            out = {k: float(v) / float(s) for k, v in out.items()}
+    return out
+
+
+def _traffic_model_protocols_for_attack_vector(attack_vector: str) -> list[str]:
+    vec = str(attack_vector or "").strip().lower()
+    if vec == "http":
+        return ["http1"]
+    if vec == "http2":
+        return ["http2"]
+    if vec == "websocket":
+        return ["websocket"]
+    if vec == "quic":
+        return ["quic"]
+    return []
+
 def build_parser() -> argparse.ArgumentParser:
     """
     Build the CLI argument parser.
@@ -1286,6 +1334,75 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--l7-session-repeats", type=int, default=1, help="Stateful L7 oturumlarını kullanıcı başına tekrar sayısı.")
     parser.add_argument("--l7-max-active-sessions", type=int, default=0, help="Stateful L7 için eşzamanlı aktif session üst limiti (0=sınırsız).")
+    ml_group = parser.add_argument_group("Traffic Model (Mamba-2 Planner v1)")
+    ml_group.add_argument(
+        "--traffic-model",
+        choices=["none", "mamba2"],
+        default="none",
+        help="Stateful trafik planner seçimi: none|mamba2.",
+    )
+    ml_group.add_argument("--traffic-model-checkpoint", type=str, default="", help="Planner checkpoint dosya yolu.")
+    ml_group.add_argument("--traffic-model-config", type=str, default="", help="Planner config dosya yolu (opsiyonel).")
+    ml_group.add_argument(
+        "--traffic-model-device",
+        choices=["cpu"],
+        default="cpu",
+        help="Planner device (v1: sadece cpu).",
+    )
+    ml_group.add_argument("--traffic-model-seed", type=int, default=1337, help="Deterministic planner seed.")
+    ml_group.add_argument(
+        "--traffic-model-label-mix",
+        type=str,
+        default="benign=0.4,evasive=0.4,aggressive=0.2",
+        help="Label dağılımı: benign=0.4,evasive=0.4,aggressive=0.2",
+    )
+    ml_group.add_argument(
+        "--traffic-model-session-len",
+        type=int,
+        default=24,
+        help="Session başına maksimum event sayısı.",
+    )
+    ml_group.add_argument(
+        "--traffic-model-planner-batch",
+        type=int,
+        default=128,
+        help="Tek plan üretim çağrısındaki session batch boyutu.",
+    )
+    ml_group.add_argument(
+        "--traffic-model-timeout-ms",
+        type=int,
+        default=2500,
+        help="Planner inference timeout (ms).",
+    )
+    ml_group.add_argument(
+        "--traffic-model-fallback",
+        choices=["static", "fail"],
+        default="static",
+        help="Planner fail olduğunda davranış: static|fail.",
+    )
+    ml_group.add_argument(
+        "--traffic-model-export-events",
+        type=str,
+        default="",
+        help="Generated planner event log JSONL yolu (opsiyonel).",
+    )
+    ml_group.add_argument(
+        "--traffic-model-dataset-capture",
+        type=str,
+        default="",
+        help="Runtime worker event'lerini JSONL dataset olarak yaz.",
+    )
+    ml_group.add_argument(
+        "--traffic-model-pcap-profile",
+        type=str,
+        default="",
+        help="PCAP extractor profile adı (dataset pipeline için).",
+    )
+    ml_group.add_argument(
+        "--traffic-model-dry-validate",
+        action="store_true",
+        help="Sadece planner üretimi+validation çalıştır, trafik gönderme.",
+    )
     parser.add_argument(
         "--gpu-template-pool-size-l4",
         type=int,
@@ -1780,6 +1897,17 @@ def main(argv=None):
     _validate_sender_route_args(parser, args)
     _preflight_lab_profile(parser, args)
     _preflight_l7_capabilities(parser, args)
+    traffic_model_mode = str(getattr(args, "traffic_model", "none") or "none").strip().lower()
+    if traffic_model_mode == "mamba2":
+        allowed = {"http", "http2", "websocket", "quic"}
+        if str(getattr(args, "attack_vector", "") or "").strip().lower() not in allowed:
+            parser.error("--traffic-model mamba2 yalnızca http/http2/websocket/quic attack_vector ile kullanılabilir.")
+        if str(getattr(args, "traffic_model_device", "cpu") or "cpu").strip().lower() != "cpu":
+            parser.error("--traffic-model-device v1 için yalnızca 'cpu' desteklenir.")
+        try:
+            _ = _parse_label_mix(getattr(args, "traffic_model_label_mix", ""))
+        except Exception as exc:
+            parser.error(f"--traffic-model-label-mix hatalı: {exc}")
 
     global CONNECTION_POOL
     try:
@@ -1885,6 +2013,19 @@ def main(argv=None):
     os.environ["SAMURAI_L7_FALLBACK_POLICY"] = str(getattr(args, "l7_fallback_policy", "allow") or "allow")
     os.environ["SAMURAI_L7_CAPABILITY_STRICT"] = "1" if bool(getattr(args, "l7_capability_strict", False)) else "0"
     os.environ["SAMURAI_LEGACY_PATH_ENABLE"] = "1" if bool(getattr(args, "legacy_path_enable", False)) else "0"
+    traffic_model_runtime = {
+        "mode": str(getattr(args, "traffic_model", "none") or "none"),
+        "model_name": "none",
+        "checkpoint_id": "",
+        "seed": int(getattr(args, "traffic_model_seed", 1337) or 1337),
+        "plan_id": "",
+        "session_count": 0,
+        "event_count": 0,
+        "fallback_used": False,
+        "fallback_reason": "none",
+        "validation_errors": [],
+    }
+    traffic_model_plan = None
 
     # Live mode reporting is supported as well (aggregated worker events).
 
@@ -2207,6 +2348,113 @@ def main(argv=None):
             utils.log_critical(f"Dry-run hata: {e}")
             sys.exit(1)
 
+    def _generate_traffic_plan(total_sessions: int):
+        nonlocal traffic_model_plan, traffic_model_runtime
+        mode = str(getattr(args, "traffic_model", "none") or "none").strip().lower()
+        if mode == "none":
+            return None
+        from .ml.fallback_profiles import generate_deterministic_plan
+        from .ml.plan_validator import validate as validate_plan
+        from .ml.planner import MambaPlanner
+        from .ml.types import PlanRequest
+
+        protocols = _traffic_model_protocols_for_attack_vector(getattr(args, "attack_vector", ""))
+        request = PlanRequest(
+            session_count=max(1, int(total_sessions or 1)),
+            session_len=max(3, int(getattr(args, "traffic_model_session_len", 24) or 24)),
+            seed=int(getattr(args, "traffic_model_seed", 1337) or 1337),
+            protocols=protocols,
+            label_mix=_parse_label_mix(str(getattr(args, "traffic_model_label_mix", "") or "")),
+        )
+        fallback_policy = str(getattr(args, "traffic_model_fallback", "static") or "static").strip().lower()
+        ckpt = str(getattr(args, "traffic_model_checkpoint", "") or "").strip()
+        timeout_ms = int(getattr(args, "traffic_model_timeout_ms", 2500) or 2500)
+
+        def _apply_fallback(reason: str):
+            if fallback_policy == "fail":
+                raise RuntimeError(reason)
+            plan = generate_deterministic_plan(
+                request,
+                model_name="static-fallback",
+                checkpoint_id=(ckpt or "none"),
+            )
+            traffic_model_runtime["fallback_used"] = True
+            traffic_model_runtime["fallback_reason"] = str(reason)
+            return plan
+
+        try:
+            t0 = time.perf_counter()
+            planner = MambaPlanner.load(ckpt, device=str(getattr(args, "traffic_model_device", "cpu") or "cpu"))
+            plan = planner.generate(request)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if timeout_ms > 0 and elapsed_ms > float(timeout_ms):
+                plan = _apply_fallback("inference_timeout")
+            vr = validate_plan(plan)
+            if not bool(vr.valid):
+                traffic_model_runtime["validation_errors"] = list(vr.errors)
+                plan = _apply_fallback("invalid_plan_emitted")
+                vr2 = validate_plan(plan)
+                if not bool(vr2.valid):
+                    raise RuntimeError("fallback plan invalid")
+            traffic_model_runtime["model_name"] = str(getattr(plan, "model_name", "mamba2"))
+            traffic_model_runtime["checkpoint_id"] = str(getattr(plan, "checkpoint_id", ckpt))
+            traffic_model_runtime["plan_id"] = str(getattr(plan, "plan_id", ""))
+            traffic_model_runtime["session_count"] = int(len(getattr(plan, "session_plans", []) or []))
+            traffic_model_runtime["event_count"] = int(
+                sum(len(getattr(sp, "events", []) or []) for sp in list(getattr(plan, "session_plans", []) or []))
+            )
+            traffic_model_plan = plan
+            return plan
+        except Exception as exc:
+            plan = _apply_fallback(str(exc))
+            vr = validate_plan(plan)
+            if not bool(vr.valid):
+                raise RuntimeError(f"fallback validation failed: {vr.errors}")
+            traffic_model_runtime["model_name"] = str(getattr(plan, "model_name", "static-fallback"))
+            traffic_model_runtime["checkpoint_id"] = str(getattr(plan, "checkpoint_id", ckpt or "none"))
+            traffic_model_runtime["plan_id"] = str(getattr(plan, "plan_id", ""))
+            traffic_model_runtime["session_count"] = int(len(getattr(plan, "session_plans", []) or []))
+            traffic_model_runtime["event_count"] = int(
+                sum(len(getattr(sp, "events", []) or []) for sp in list(getattr(plan, "session_plans", []) or []))
+            )
+            traffic_model_plan = plan
+            return plan
+
+    if bool(getattr(args, "traffic_model_dry_validate", False)):
+        if str(getattr(args, "traffic_model", "none") or "none").strip().lower() == "none":
+            parser.error("--traffic-model-dry-validate için --traffic-model mamba2 gereklidir.")
+        try:
+            plan = _generate_traffic_plan(max(1, int(getattr(args, "count", 1) or 1)))
+            export_path = str(getattr(args, "traffic_model_export_events", "") or "").strip()
+            if export_path and plan is not None:
+                from .ml.dataset.export_parquet import export_jsonl
+                rows = []
+                for sp in list(getattr(plan, "session_plans", []) or []):
+                    for ev in list(getattr(sp, "events", []) or []):
+                        rows.append(
+                            {
+                                "plan_id": str(getattr(plan, "plan_id", "")),
+                                "session_id": str(getattr(sp, "session_id", "")),
+                                "protocol": str(getattr(sp, "protocol", "")),
+                                "label": str(getattr(sp, "label", "")),
+                                "event": ev.to_dict() if hasattr(ev, "to_dict") else dict(ev),
+                            }
+                        )
+                out = export_jsonl(rows, export_path)
+                utils.log_info(f"Traffic model dry-validate event export: {out}")
+            utils.log_info(
+                "Traffic model dry-validate OK: "
+                f"plan_id={traffic_model_runtime.get('plan_id')} "
+                f"sessions={traffic_model_runtime.get('session_count')} "
+                f"events={traffic_model_runtime.get('event_count')} "
+                f"fallback={int(bool(traffic_model_runtime.get('fallback_used', False)))} "
+                f"reason={traffic_model_runtime.get('fallback_reason', 'none')}"
+            )
+            sys.exit(0)
+        except Exception as exc:
+            utils.log_critical(f"Traffic model dry-validate failed: {exc}")
+            sys.exit(1)
+
     if args.target is None or args.port is None:
         parser.error("Hata: 'target' ve 'port' argümanları ya komut satırında ya da konfigürasyon dosyasında belirtilmelidir.")
 
@@ -2377,6 +2625,40 @@ def main(argv=None):
     remainder = total_count % workers if workers > 0 else 0
     for i in range(remainder):
         worker_counts[i] += 1
+    traffic_model_sessions_by_worker = [[] for _ in range(workers)]
+    if str(getattr(args, "traffic_model", "none") or "none").strip().lower() == "mamba2":
+        try:
+            plan = _generate_traffic_plan(max(1, int(total_count or 1)))
+            session_dicts = [
+                sp.to_dict() if hasattr(sp, "to_dict") else dict(sp)  # type: ignore[arg-type]
+                for sp in list(getattr(plan, "session_plans", []) or [])
+            ] if plan is not None else []
+            cursor = 0
+            for wi in range(workers):
+                wc = int(worker_counts[wi] or 0)
+                traffic_model_sessions_by_worker[wi] = list(session_dicts[cursor : cursor + wc])
+                cursor += wc
+            export_path = str(getattr(args, "traffic_model_export_events", "") or "").strip()
+            if export_path and plan is not None:
+                from .ml.dataset.export_parquet import export_jsonl
+
+                rows = []
+                for sp in list(getattr(plan, "session_plans", []) or []):
+                    for ev in list(getattr(sp, "events", []) or []):
+                        rows.append(
+                            {
+                                "plan_id": str(getattr(plan, "plan_id", "")),
+                                "session_id": str(getattr(sp, "session_id", "")),
+                                "protocol": str(getattr(sp, "protocol", "")),
+                                "label": str(getattr(sp, "label", "")),
+                                "event": ev.to_dict() if hasattr(ev, "to_dict") else dict(ev),
+                            }
+                        )
+                out = export_jsonl(rows, export_path)
+                utils.log_info(f"Traffic model event export: {out}")
+        except Exception as exc:
+            utils.log_critical(f"Traffic model planner failed: {exc}")
+            sys.exit(1)
 
     utils.log_info(f"{workers} adet işçi (worker) süreci başlatılıyor...")
     
@@ -2400,6 +2682,8 @@ def main(argv=None):
         worker_args.dp_queue_id = worker_queue_id
         worker_args.xdp_queue_id = worker_queue_id
         worker_args.dp_worker_queue_map = json.dumps(worker_queue_map, sort_keys=True)
+        worker_args.traffic_model = str(getattr(args, "traffic_model", "none") or "none")
+        worker_args.traffic_model_sessions = list(traffic_model_sessions_by_worker[i] or [])
         if soak_deadline_ts > 0.0:
             worker_args.soak_deadline_ts = float(soak_deadline_ts)
 
@@ -2520,6 +2804,23 @@ def main(argv=None):
             )
             rr.started_utc = started_utc
             rr.finished_utc = finished_utc
+            rr.results["traffic_model"] = str(traffic_model_runtime.get("mode", "none") or "none")
+            rr.results["traffic_model_name"] = str(traffic_model_runtime.get("model_name", "none") or "none")
+            rr.results["traffic_model_checkpoint"] = str(
+                traffic_model_runtime.get("checkpoint_id", "") or ""
+            )
+            rr.results["traffic_model_plan_id"] = str(traffic_model_runtime.get("plan_id", "") or "")
+            rr.results["traffic_model_seed"] = int(traffic_model_runtime.get("seed", 0) or 0)
+            rr.results["traffic_model_session_count"] = int(
+                traffic_model_runtime.get("session_count", 0) or 0
+            )
+            rr.results["traffic_model_event_count"] = int(traffic_model_runtime.get("event_count", 0) or 0)
+            rr.results["traffic_model_fallback_used"] = int(
+                bool(traffic_model_runtime.get("fallback_used", False))
+            )
+            rr.results["traffic_model_fallback_reason"] = str(
+                traffic_model_runtime.get("fallback_reason", "none") or "none"
+            )
             if soak_cfg is not None:
                 rr.results["soak_profile"] = str(soak_cfg.get("profile", "custom"))
                 rr.results["soak_passed"] = bool((monitor_summary or {}).get("passed", False))
@@ -2546,6 +2847,30 @@ def main(argv=None):
                         kind="soak_snapshots_json",
                         path=snapshots_out,
                         meta={"snapshots": int((monitor_summary or {}).get("snapshot_count", 0) or 0)},
+                    )
+                )
+            dataset_capture_out = str(getattr(args, "traffic_model_dataset_capture", "") or "").strip()
+            if dataset_capture_out:
+                from .ml.dataset.export_parquet import export_jsonl
+
+                rows = []
+                for ev in events_local:
+                    rows.append(
+                        {
+                            "timestamp_utc": finished_utc,
+                            "worker_id": int(ev.get("worker_id", 0) or 0),
+                            "attack_vector": str(ev.get("attack_vector", "")),
+                            "status": str(ev.get("status", "")),
+                            "error": str(ev.get("error", "")),
+                            "stats": dict(ev.get("stats", {}) or {}),
+                        }
+                    )
+                dataset_path = export_jsonl(rows, dataset_capture_out)
+                rr.artifacts.append(
+                    reporting.Artifact(
+                        kind="traffic_model_dataset_capture_jsonl",
+                        path=dataset_path,
+                        meta={"rows": int(len(rows))},
                     )
                 )
             if report_fmt in ("json", "both"):

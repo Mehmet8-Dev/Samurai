@@ -124,6 +124,46 @@ class H2RequestPlan:
     items: List[H2RequestPlanItem]
 
 
+def build_request_plan_from_session_plan(session_plan: Any) -> H2RequestPlan:
+    """
+    Convert a ML SessionPlan-like object (dict/dataclass) into H2RequestPlan.
+    Unknown event fields are ignored safely.
+    """
+    events = []
+    if isinstance(session_plan, dict):
+        events = list(session_plan.get("events", []) or [])
+    else:
+        events = list(getattr(session_plan, "events", []) or [])
+    items: List[H2RequestPlanItem] = []
+    for ev in events:
+        if isinstance(ev, dict):
+            event_type = str(ev.get("event_type", "") or "")
+            method = str(ev.get("method", "GET") or "GET")
+            path = str(ev.get("path", "/") or "/")
+            header_profile = str(ev.get("header_profile", "") or "")
+            payload_class = str(ev.get("payload_class", "") or "")
+        else:
+            event_type = str(getattr(ev, "event_type", "") or "")
+            method = str(getattr(ev, "method", "GET") or "GET")
+            path = str(getattr(ev, "path", "/") or "/")
+            header_profile = str(getattr(ev, "header_profile", "") or "")
+            payload_class = str(getattr(ev, "payload_class", "") or "")
+        if event_type not in {"http_request", "http2_headers", "quic_request", "ws_open", "ws_frame"}:
+            continue
+        headers: Dict[str, str] = {}
+        if header_profile:
+            headers["x-header-profile"] = header_profile
+        if payload_class:
+            headers["x-payload-class"] = payload_class
+        item = H2RequestPlanItem(
+            method=method if method else "GET",
+            path=path if path else "/",
+            headers=headers,
+        )
+        items.append(item)
+    return H2RequestPlan(items=items)
+
+
 def _as_component_bytes(value: Union[str, bytes], component_name: str, index: int) -> bytes:
     if isinstance(value, str):
         out = value.encode("utf-8")
