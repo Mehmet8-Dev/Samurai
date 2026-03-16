@@ -38,3 +38,9 @@ PyYAML
 
 # Testing
 # unittest is in the Python standard library
+
+# ML planner dependencies are intentionally excluded from default install.
+# Install with:
+#   pip install ".[ml]"
+# or:
+#   pip install -r requirements-ml.txt

@@ -497,7 +497,21 @@ def build_setup_kwargs() -> Dict[str, object]:
         "extras_require": {
             "gpu": ["cupy>=9.0.0"],
             "http2": ["httpx[http2]>=0.20.0"],
-            "all": ["cupy>=9.0.0", "httpx[http2]>=0.20.0", "h2>=4.0.0"],
+            "ml": [
+                "torch>=2.2.0",
+                "mamba-ssm>=2.2.2",
+                "pandas>=2.0.0",
+                "pyarrow>=14.0.0",
+            ],
+            "all": [
+                "cupy>=9.0.0",
+                "httpx[http2]>=0.20.0",
+                "h2>=4.0.0",
+                "torch>=2.2.0",
+                "mamba-ssm>=2.2.2",
+                "pandas>=2.0.0",
+                "pyarrow>=14.0.0",
+            ],
         },
         "classifiers": [
             "Development Status :: 4 - Beta",
