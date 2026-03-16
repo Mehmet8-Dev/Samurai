@@ -1,0 +1,5 @@
+torch>=2.2.0
+mamba-ssm>=2.2.2
+pandas>=2.0.0
+pyarrow>=14.0.0
+

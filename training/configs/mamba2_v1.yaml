@@ -1,0 +1,23 @@
+model:
+  name: mamba2-small
+  max_sequence_length: 128
+  hidden_size: 512
+  num_layers: 12
+
+training:
+  epochs: 10
+  batch_size: 64
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  seed: 1337
+  teacher_forcing: true
+  class_balanced_sampling: true
+  protocol_aware_batching: true
+
+objective:
+  next_event_classification: 1.0
+  delay_bucket_prediction: 0.5
+  payload_class_prediction: 0.3
+  header_class_prediction: 0.3
+  stop_event_prediction: 0.4
+
