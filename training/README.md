@@ -16,6 +16,10 @@ Current model contract:
 - runtime materialization: token-conditioned expansion (`token_conditioned_v2`)
 - still deterministic mapping layer: `delay_bucket -> delay_ms` and `path_bucket -> concrete path`
 
+Feature engineering (CICIDS2017 CSV):
+- Training now fits quantile-based flow statistics from train CSV only (`feature_engineering` block in checkpoint config).
+- The same fitted stats are reused for val/eval/resume to avoid leakage and keep bucketization stable.
+
 ### Kaggle / Notebook-Friendly Commands
 
 1. Build dataset:

@@ -139,7 +139,18 @@ KNOWN_METHODS = ['none', 'get', 'post', 'put', 'patch', 'delete', 'head', 'optio
 KNOWN_PATH_BUCKETS = ['root', 'api', 'ws', 'static', 'auth', 'search', 'media', 'other']
 KNOWN_HEADER_PROFILES = ['none', 'unknown', 'modern_browser', 'api_json', 'generic_http', 'http_csv', 'h2_csv', 'quic_csv', 'quic']
 KNOWN_PAYLOAD_CLASSES = ['none', 'empty', 'tiny', 'small', 'medium', 'large']
-KNOWN_MUTATION_SIGNATURES = ['none', 'csv_attack_label', 'header_shuffle', 'retry_burst', 'header_shuffle|retry_burst']
+KNOWN_MUTATION_SIGNATURES = [
+    'none',
+    'csv_attack_label',
+    'header_shuffle',
+    'retry_burst',
+    'fe_balanced',
+    'fe_bursty',
+    'fe_long_lived',
+    'fe_sparse',
+    'fe_variable_payload',
+    'header_shuffle|retry_burst',
+]
 
 
 @dataclass(frozen=True)
@@ -351,6 +362,18 @@ def _to_int(v, default: int = 0) -> int:
         return int(default)
 
 
+def _to_float(v, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return float(default)
+        s = str(v).strip()
+        if not s:
+            return float(default)
+        return float(s)
+    except Exception:
+        return float(default)
+
+
 def _payload_class_bytes(total_bytes: int) -> str:
     n = int(total_bytes or 0)
     if n <= 0:
@@ -420,11 +443,140 @@ def _first_non_empty(row: dict, colmap: Dict[str, str], keys: List[str], default
     return str(default or '')
 
 
+def _extract_csv_row_metrics(row: dict, colmap: Dict[str, str]) -> Dict[str, float]:
+    fwd_pkts = _to_int(_first_non_empty(row, colmap, ['total fwd packets', 'total forward packets', 'tot fwd pkts', 'totfwdpkts'], default='0'), default=0)
+    bwd_pkts = _to_int(_first_non_empty(row, colmap, ['total backward packets', 'tot bwd pkts', 'totbwdpkts'], default='0'), default=0)
+    fwd_bytes = _to_int(_first_non_empty(row, colmap, ['total length of fwd packets', 'totallengthoffwdpackets', 'fwd packet length total', 'fwdpacketlengthtotal'], default='0'), default=0)
+    bwd_bytes = _to_int(_first_non_empty(row, colmap, ['total length of bwd packets', 'totallengthofbwdpackets', 'bwd packet length total', 'bwdpacketlengthtotal'], default='0'), default=0)
+    flow_duration_us = _to_float(_first_non_empty(row, colmap, ['flow duration', 'flowduration'], default='0'), default=0.0)
+    flow_iat_mean_us = _to_float(_first_non_empty(row, colmap, ['flow iat mean', 'flowiatmean'], default='0'), default=0.0)
+    flow_iat_max_us = _to_float(_first_non_empty(row, colmap, ['flow iat max', 'flowiatmax'], default='0'), default=0.0)
+    packet_len_std = _to_float(_first_non_empty(row, colmap, ['packet length std', 'packetlengthstd'], default='0'), default=0.0)
+    total_pkts = max(0, int(fwd_pkts)) + max(0, int(bwd_pkts))
+    total_bytes = max(0, int(fwd_bytes)) + max(0, int(bwd_bytes))
+    flow_duration_ms = max(0.0, float(flow_duration_us) / 1000.0)
+    iat_mean_ms = max(0.0, float(flow_iat_mean_us) / 1000.0)
+    iat_max_ms = max(0.0, float(flow_iat_max_us) / 1000.0)
+    pps = 0.0
+    if flow_duration_ms > 0.0:
+        pps = float(total_pkts) / max(1e-6, float(flow_duration_ms) / 1000.0)
+    return {
+        'fwd_pkts': float(fwd_pkts),
+        'bwd_pkts': float(bwd_pkts),
+        'fwd_bytes': float(fwd_bytes),
+        'bwd_bytes': float(bwd_bytes),
+        'total_pkts': float(total_pkts),
+        'total_bytes': float(total_bytes),
+        'flow_duration_ms': float(flow_duration_ms),
+        'iat_mean_ms': float(iat_mean_ms),
+        'iat_max_ms': float(iat_max_ms),
+        'pps': float(pps),
+        'packet_len_std': float(max(0.0, packet_len_std)),
+    }
+
+
+def _percentile_cut(values: Sequence[float], p: float, default: float) -> float:
+    arr = sorted(float(x) for x in values if math.isfinite(float(x)))
+    if not arr:
+        return float(default)
+    idx = int(round((len(arr) - 1) * float(p)))
+    idx = max(0, min(len(arr) - 1, idx))
+    return float(arr[idx])
+
+
+def _fit_feature_engineering_stats(
+    sources: Sequence[Tuple[str, Path]],
+    *,
+    csv_chunksize: int = 50000,
+    max_rows_per_file: int = 0,
+    sample_rows_cap: int = 200000,
+) -> Dict[str, Any]:
+    samples: Dict[str, List[float]] = {
+        'flow_duration_ms': [],
+        'pps': [],
+        'iat_mean_ms': [],
+        'packet_len_std': [],
+    }
+    seen = 0
+    cap = max(1000, int(sample_rows_cap or 200000))
+    for _label_hint, csv_path in list(sources or []):
+        reader = pd.read_csv(str(csv_path), low_memory=False, chunksize=max(1, int(csv_chunksize or 50000)))
+        row_count = 0
+        stop = False
+        for chunk in reader:
+            colmap = _build_colmap(list(chunk.columns))
+            for row in chunk.to_dict(orient='records'):
+                row_count += 1
+                if int(max_rows_per_file or 0) > 0 and row_count > int(max_rows_per_file):
+                    stop = True
+                    break
+                feats = _extract_csv_row_metrics(row, colmap)
+                for k in samples:
+                    samples[k].append(float(feats[k]))
+                seen += 1
+                if seen >= cap:
+                    stop = True
+                    break
+            if stop:
+                break
+        if seen >= cap:
+            break
+
+    defaults = {
+        'flow_duration_ms': [20.0, 120.0, 800.0],
+        'pps': [20.0, 120.0, 800.0],
+        'iat_mean_ms': [2.0, 15.0, 80.0],
+        'packet_len_std': [20.0, 80.0, 240.0],
+    }
+    cuts: Dict[str, List[float]] = {}
+    for key, vals in samples.items():
+        if len(vals) < 16:
+            cuts[key] = list(defaults[key])
+            continue
+        q1 = _percentile_cut(vals, 0.25, defaults[key][0])
+        q2 = _percentile_cut(vals, 0.50, defaults[key][1])
+        q3 = _percentile_cut(vals, 0.75, defaults[key][2])
+        cuts[key] = [float(q1), float(q2), float(q3)]
+    return {'version': 1, 'n_samples': int(seen), 'cuts': cuts}
+
+
+def _bucket4(value: float, cuts: Sequence[float]) -> int:
+    c = list(cuts or [0.0, 0.0, 0.0])[:3]
+    while len(c) < 3:
+        c.append(c[-1] if c else 0.0)
+    v = float(value)
+    if v <= float(c[0]):
+        return 1
+    if v <= float(c[1]):
+        return 2
+    if v <= float(c[2]):
+        return 3
+    return 4
+
+
+def _flow_profile_from_metrics(feats: Mapping[str, float], fe_stats: Optional[Mapping[str, Any]]) -> str:
+    cuts = dict((fe_stats or {}).get('cuts', {}) or {})
+    dur_b = _bucket4(float(feats.get('flow_duration_ms', 0.0)), list(cuts.get('flow_duration_ms', [20.0, 120.0, 800.0])))
+    pps_b = _bucket4(float(feats.get('pps', 0.0)), list(cuts.get('pps', [20.0, 120.0, 800.0])))
+    iat_b = _bucket4(float(feats.get('iat_mean_ms', 0.0)), list(cuts.get('iat_mean_ms', [2.0, 15.0, 80.0])))
+    std_b = _bucket4(float(feats.get('packet_len_std', 0.0)), list(cuts.get('packet_len_std', [20.0, 80.0, 240.0])))
+    if pps_b >= 4 and dur_b <= 2:
+        return 'bursty'
+    if dur_b >= 4 and iat_b >= 3:
+        return 'long_lived'
+    if pps_b <= 2 and iat_b >= 4:
+        return 'sparse'
+    if std_b >= 4:
+        return 'variable_payload'
+    return 'balanced'
+
+
 def iter_csv_normalized_events(
     csv_path: str,
     protocol_profile: str = '',
     *,
     default_label: str = 'benign',
+    fe_stats: Optional[Mapping[str, Any]] = None,
     max_rows: int = 0,
     chunksize: int = 200000,
     progress_every: int = 0,
@@ -508,11 +660,14 @@ def iter_csv_normalized_events(
             base_rel_ms = int(max(0.0, (float(ts_val) - float(first_ts)) * 1000.0))
 
             syn_cnt = _to_int(_first_non_empty(row, colmap, ['syn flag cnt', 'synflagcnt'], default='0'), default=0)
+            ack_cnt = _to_int(_first_non_empty(row, colmap, ['ack flag cnt', 'ackflagcnt'], default='0'), default=0)
+            psh_cnt = _to_int(_first_non_empty(row, colmap, ['psh flag cnt', 'pshflagcnt'], default='0'), default=0)
             rst_cnt = _to_int(_first_non_empty(row, colmap, ['rst flag cnt', 'rstflagcnt'], default='0'), default=0)
             fin_cnt = _to_int(_first_non_empty(row, colmap, ['fin flag cnt', 'finflagcnt'], default='0'), default=0)
-            fwd_bytes = _to_int(_first_non_empty(row, colmap, ['total length of fwd packets', 'totallengthoffwdpackets', 'fwd packet length total', 'fwdpacketlengthtotal'], default='0'), default=0)
-            bwd_bytes = _to_int(_first_non_empty(row, colmap, ['total length of bwd packets', 'totallengthofbwdpackets', 'bwd packet length total', 'bwdpacketlengthtotal'], default='0'), default=0)
-            payload_class = _payload_class_bytes(fwd_bytes + bwd_bytes)
+            feats = _extract_csv_row_metrics(row, colmap)
+            fwd_pkts = int(feats['fwd_pkts'])
+            bwd_pkts = int(feats['bwd_pkts'])
+            payload_class = _payload_class_bytes(int(feats['total_bytes']))
 
             if protocol == 'quic':
                 req_event_type = 'quic_request'
@@ -533,33 +688,98 @@ def iter_csv_normalized_events(
                 h2_profile = 'none'
                 quic_mode = 'none'
 
-            mutation_flags = 'csv_attack_label' if label != 'benign' else ''
-            sequence = ['connect_open', req_event_type, 'close']
-            if rst_cnt > 0:
-                sequence[-1] = 'reset'
-            elif fin_cnt > 0:
-                sequence[-1] = 'close'
-            elif syn_cnt > 0:
-                sequence[-1] = 'close'
+            # Flow-level CSV kaydini daha gercekci bir olay zincirine aciyoruz:
+            # handshake -> (retry)? -> request burst -> (idle)? -> close/reset
+            total_pkts = max(0, fwd_pkts) + max(0, bwd_pkts)
+            flow_duration_ms = max(0, int(float(feats['flow_duration_ms'])))
+            iat_mean_ms = max(0, int(float(feats['iat_mean_ms'])))
+            iat_max_ms = max(0, int(float(feats['iat_max_ms'])))
+            retry_count = max(0, syn_cnt - 1)
+            if retry_count == 0 and rst_cnt > 0:
+                retry_count = 1
+
+            if payload_class in {'medium', 'large'}:
+                header_profile = 'api_json'
+            if psh_cnt > 0 and header_profile == 'http_csv':
+                header_profile = 'generic_http'
+
+            flow_profile = _flow_profile_from_metrics(feats, fe_stats)
+            if label != 'benign' and psh_cnt > 0:
+                mutation_flags = 'header_shuffle'
+            elif label != 'benign':
+                mutation_flags = 'csv_attack_label'
+            elif retry_count > 0:
+                mutation_flags = 'retry_burst'
+            else:
+                mutation_flags = f'fe_{flow_profile}'
+
+            if flow_duration_ms >= 1500:
+                response_bucket = 'slow'
+            elif flow_duration_ms >= 300:
+                response_bucket = 'medium'
+            elif flow_duration_ms > 0:
+                response_bucket = 'fast'
+            else:
+                response_bucket = 'unknown'
+
+            req_count = int(round(math.log2(max(2, fwd_pkts + 1))))
+            req_count = max(1, min(6, req_count))
+            if total_pkts >= 40:
+                req_count = min(8, req_count + 1)
+            if label == 'aggressive' and total_pkts >= 20:
+                req_count = min(10, req_count + 1)
+
+            sequence: List[str] = ['connect_open']
+            if protocol == 'quic':
+                sequence.append('quic_open')
+            elif protocol in {'http1', 'http2'} and (src_port == 443 or dst_port == 443):
+                sequence.append('tls_client_hello')
+            for _ in range(retry_count):
+                sequence.append('retry')
+            for _ in range(req_count):
+                sequence.append(req_event_type)
+            if iat_max_ms >= 200 or iat_mean_ms >= 80 or flow_duration_ms >= 1000:
+                sequence.append('idle_wait')
+            sequence.append('reset' if rst_cnt > 0 else 'close')
+
+            if req_event_type == 'http2_headers':
+                method = 'GET' if label == 'benign' else ('POST' if payload_class in {'medium', 'large'} else 'GET')
+            elif req_event_type == 'quic_request':
+                method = 'GET' if payload_class in {'empty', 'tiny', 'small'} else 'POST'
+            else:
+                method = 'GET' if ack_cnt >= psh_cnt else 'POST'
+
+            if label == 'aggressive':
+                path = '/api/v1/bulk'
+            elif label == 'evasive':
+                path = '/search?q=health'
+            elif payload_class in {'medium', 'large'}:
+                path = '/api/v1/resource'
+            else:
+                path = '/'
+
+            step_ms = 1
+            if len(sequence) > 1 and flow_duration_ms > 0:
+                step_ms = max(1, int(flow_duration_ms / max(1, len(sequence) - 1)))
 
             for offset, ev_type in enumerate(sequence):
                 idx = int(session_next_idx.get(session_id, 0))
                 session_next_idx[session_id] = idx + 1
-                method = 'GET' if ev_type in {'http_request', 'http2_headers', 'quic_request'} else ''
-                path = '/' if method else ''
+                ev_method = method if ev_type in {'http_request', 'http2_headers', 'quic_request'} else ''
+                ev_path = path if ev_method else ''
                 close_reason = 'rst' if ev_type == 'reset' else ('fin' if ev_type == 'close' else '')
                 emitted_events += 1
                 yield NormalizedWireEvent(
                     trace_id=trace_id,
                     session_id=session_id,
                     event_index=idx,
-                    timestamp_rel_ms=int(base_rel_ms + offset),
+                    timestamp_rel_ms=int(base_rel_ms + (offset * step_ms)),
                     protocol=protocol,
                     event_type=ev_type,
                     label=label,
                     src_role='client',
-                    method=method,
-                    path=path,
+                    method=ev_method,
+                    path=ev_path,
                     status_class='',
                     payload_class=payload_class,
                     header_profile=header_profile,
@@ -567,8 +787,8 @@ def iter_csv_normalized_events(
                     tls_profile=tls_profile,
                     h2_profile=h2_profile,
                     quic_mode=quic_mode,
-                    response_time_bucket='unknown',
-                    retry_count=0,
+                    response_time_bucket=response_bucket,
+                    retry_count=retry_count,
                     close_reason=close_reason,
                 )
             _emit_progress()
@@ -651,6 +871,7 @@ def collect_csv_sources(*, csv_dir: str = '', csv_glob: str = '*.csv', csv_files
 def load_sessions_from_csv_sources(
     sources: Sequence[Tuple[str, Path]],
     *,
+    fe_stats: Optional[Mapping[str, Any]] = None,
     max_sessions: int = 0,
     max_rows_per_file: int = 0,
     csv_chunksize: int = 50000,
@@ -680,6 +901,7 @@ def load_sessions_from_csv_sources(
             str(csv_path),
             protocol_profile=profile,
             default_label=label_for_profile or 'benign',
+            fe_stats=fe_stats,
             max_rows=int(max_rows_per_file or 0),
             chunksize=max(1, int(csv_chunksize or 50000)),
         ):
@@ -1726,8 +1948,9 @@ def train_from_csv_dirs(*, train_csv_dir: str, val_csv_dir: str, out_dir: str, c
     if not val_sources:
         raise RuntimeError('No val CSV source found.')
 
-    train_sessions, train_rows_seen, train_files_seen = load_sessions_from_csv_sources(train_sources, max_sessions=int(max_train_sessions or 0), max_rows_per_file=int(max_train_rows_per_file or 0), csv_chunksize=int(csv_chunksize or 50000))
-    val_sessions, val_rows_seen, val_files_seen = load_sessions_from_csv_sources(val_sources, max_sessions=int(max_val_sessions or 0), max_rows_per_file=int(max_val_rows_per_file or 0), csv_chunksize=int(csv_chunksize or 50000))
+    fe_stats = _fit_feature_engineering_stats(train_sources, csv_chunksize=int(csv_chunksize or 50000), max_rows_per_file=int(max_train_rows_per_file or 0))
+    train_sessions, train_rows_seen, train_files_seen = load_sessions_from_csv_sources(train_sources, fe_stats=fe_stats, max_sessions=int(max_train_sessions or 0), max_rows_per_file=int(max_train_rows_per_file or 0), csv_chunksize=int(csv_chunksize or 50000))
+    val_sessions, val_rows_seen, val_files_seen = load_sessions_from_csv_sources(val_sources, fe_stats=fe_stats, max_sessions=int(max_val_sessions or 0), max_rows_per_file=int(max_val_rows_per_file or 0), csv_chunksize=int(csv_chunksize or 50000))
     if not train_sessions:
         raise RuntimeError('No train sessions extracted from CSV sources.')
     if not val_sessions:
@@ -1779,6 +2002,9 @@ def train_from_csv_dirs(*, train_csv_dir: str, val_csv_dir: str, out_dir: str, c
     best_state_dict: Optional[Dict[str, Any]] = None
     best_optimizer_state: Optional[Dict[str, Any]] = None
 
+    config = dict(config or {})
+    config.setdefault('feature_engineering', {})
+    config['feature_engineering'] = dict(fe_stats)
     run_meta = {
         'status': 'starting',
         'device': str(torch_device),
@@ -1793,6 +2019,7 @@ def train_from_csv_dirs(*, train_csv_dir: str, val_csv_dir: str, out_dir: str, c
         'sessions_val': int(len(val_sessions)),
         'train_csv_files': [str(p) for _lbl, p in train_sources],
         'val_csv_files': [str(p) for _lbl, p in val_sources],
+        'feature_engineering': dict(fe_stats),
     }
     print(json.dumps(run_meta, sort_keys=True), flush=True)
 
@@ -1873,7 +2100,8 @@ def eval_checkpoint_on_csv_dir(*, checkpoint_path: str, eval_csv_dir: str, devic
         raise RuntimeError('No eval CSV source found.')
     torch_device = training_device(device)
     model, codec, loaded = build_model_and_codec_from_checkpoint(str(ckpt), device=str(torch_device))
-    sessions, rows_seen, files_seen = load_sessions_from_csv_sources(eval_sources, max_sessions=int(max_eval_sessions or 0), max_rows_per_file=int(max_eval_rows_per_file or 0), csv_chunksize=int(csv_chunksize or 50000))
+    fe_stats = dict(((loaded.get('config', {}) or {}).get('feature_engineering', {}) or {}))
+    sessions, rows_seen, files_seen = load_sessions_from_csv_sources(eval_sources, fe_stats=fe_stats, max_sessions=int(max_eval_sessions or 0), max_rows_per_file=int(max_eval_rows_per_file or 0), csv_chunksize=int(csv_chunksize or 50000))
     eval_labels = sorted({str(s.label or 'benign') for s in sessions})
     known_labels = {tok[len(LABEL_PREFIX):] for tok in codec.vocab if tok.startswith(LABEL_PREFIX)}
     missing_eval_labels = sorted(set(eval_labels) - known_labels)
@@ -1897,6 +2125,7 @@ def eval_checkpoint_on_csv_dir(*, checkpoint_path: str, eval_csv_dir: str, devic
         'eval_csv_files': [str(p) for _lbl, p in eval_sources],
         'eval_rows_seen': int(rows_seen),
         'eval_files_seen': int(files_seen),
+        'feature_engineering': dict(fe_stats),
         'sessions_eval': int(len(sessions)),
         'transitions_eval': int(metrics['transitions_eval']),
         'next_event_top1_accuracy': float(round(metrics['next_event_top1_accuracy'], 6)),
@@ -1929,8 +2158,12 @@ def resume_training_from_checkpoint(*, checkpoint_path: str, train_csv_dir: str,
     if not val_sources:
         raise RuntimeError('No val CSV source found.')
 
-    train_sessions, train_rows_seen, train_files_seen = load_sessions_from_csv_sources(train_sources, max_sessions=int(max_train_sessions or 0), max_rows_per_file=int(max_train_rows_per_file or 0), csv_chunksize=int(csv_chunksize or 50000))
-    val_sessions, val_rows_seen, val_files_seen = load_sessions_from_csv_sources(val_sources, max_sessions=int(max_val_sessions or 0), max_rows_per_file=int(max_val_rows_per_file or 0), csv_chunksize=int(csv_chunksize or 50000))
+    fe_stats = dict((config.get('feature_engineering', {}) or {}))
+    if not fe_stats:
+        fe_stats = _fit_feature_engineering_stats(train_sources, csv_chunksize=int(csv_chunksize or 50000), max_rows_per_file=int(max_train_rows_per_file or 0))
+        config['feature_engineering'] = dict(fe_stats)
+    train_sessions, train_rows_seen, train_files_seen = load_sessions_from_csv_sources(train_sources, fe_stats=fe_stats, max_sessions=int(max_train_sessions or 0), max_rows_per_file=int(max_train_rows_per_file or 0), csv_chunksize=int(csv_chunksize or 50000))
+    val_sessions, val_rows_seen, val_files_seen = load_sessions_from_csv_sources(val_sources, fe_stats=fe_stats, max_sessions=int(max_val_sessions or 0), max_rows_per_file=int(max_val_rows_per_file or 0), csv_chunksize=int(csv_chunksize or 50000))
     if not train_sessions:
         raise RuntimeError('No train sessions extracted from CSV sources.')
     if not val_sessions:
@@ -2036,6 +2269,7 @@ def resume_training_from_checkpoint(*, checkpoint_path: str, train_csv_dir: str,
         'status': 'ok',
         'mode': 'resume',
         'config': config,
+        'feature_engineering': dict(fe_stats),
         'device': str(torch_device),
         'checkpoint_path': str(ckpt_path),
         'checkpoint_sha1': hashlib.sha1(ckpt_path.read_bytes()).hexdigest(),
