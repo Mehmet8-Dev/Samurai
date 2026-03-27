@@ -42,6 +42,8 @@ attack_log*.txt
 *.realism.json
 samurai_local.db
 *.db
+data/**/*.csv
+notebook_runs/
 
 # Large docs/assets not needed in source repo
 Papers/

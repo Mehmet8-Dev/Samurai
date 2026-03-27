@@ -3,6 +3,9 @@ model:
   max_sequence_length: 128
   hidden_size: 512
   num_layers: 12
+  d_state: 16
+  d_conv: 4
+  expand: 2
 
 training:
   epochs: 10
@@ -10,14 +13,14 @@ training:
   learning_rate: 0.0003
   weight_decay: 0.01
   seed: 1337
-  teacher_forcing: true
-  class_balanced_sampling: true
-  protocol_aware_batching: true
 
 objective:
-  next_event_classification: 1.0
-  delay_bucket_prediction: 0.5
-  payload_class_prediction: 0.3
-  header_class_prediction: 0.3
-  stop_event_prediction: 0.4
-
+  type: autoregressive_multi_field_sequence
+  fields:
+    - event_type
+    - delay_bucket
+    - method
+    - path_bucket
+    - header_profile
+    - payload_class
+    - mutation_signature

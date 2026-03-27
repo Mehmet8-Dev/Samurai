@@ -1339,7 +1339,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--traffic-model",
         choices=["none", "mamba2"],
         default="none",
-        help="Stateful trafik planner seçimi: none|mamba2.",
+        help="Stateful trafik planner seçimi: none|mamba2. Not: mamba2 runtime entegrasyonu devre dışıdır; training/mamba2_monolith.py kullanın.",
     )
     ml_group.add_argument("--traffic-model-checkpoint", type=str, default="", help="Planner checkpoint dosya yolu.")
     ml_group.add_argument("--traffic-model-config", type=str, default="", help="Planner config dosya yolu (opsiyonel).")
@@ -1899,15 +1899,10 @@ def main(argv=None):
     _preflight_l7_capabilities(parser, args)
     traffic_model_mode = str(getattr(args, "traffic_model", "none") or "none").strip().lower()
     if traffic_model_mode == "mamba2":
-        allowed = {"http", "http2", "websocket", "quic"}
-        if str(getattr(args, "attack_vector", "") or "").strip().lower() not in allowed:
-            parser.error("--traffic-model mamba2 yalnızca http/http2/websocket/quic attack_vector ile kullanılabilir.")
-        if str(getattr(args, "traffic_model_device", "cpu") or "cpu").strip().lower() != "cpu":
-            parser.error("--traffic-model-device v1 için yalnızca 'cpu' desteklenir.")
-        try:
-            _ = _parse_label_mix(getattr(args, "traffic_model_label_mix", ""))
-        except Exception as exc:
-            parser.error(f"--traffic-model-label-mix hatalı: {exc}")
+        parser.error(
+            "--traffic-model mamba2 runtime entegrasyonu geçici olarak devre dışı. "
+            "Ayrı eğitim/çıkarım akışı için training/mamba2_monolith.py train|eval|infer-plan kullanın."
+        )
 
     global CONNECTION_POOL
     try:
@@ -2348,77 +2343,22 @@ def main(argv=None):
             utils.log_critical(f"Dry-run hata: {e}")
             sys.exit(1)
 
+    def _export_jsonl_rows(rows, out_path: str) -> str:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            for row in list(rows or []):
+                f.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
+        return out_path
+
     def _generate_traffic_plan(total_sessions: int):
         nonlocal traffic_model_plan, traffic_model_runtime
         mode = str(getattr(args, "traffic_model", "none") or "none").strip().lower()
         if mode == "none":
             return None
-        from .ml.fallback_profiles import generate_deterministic_plan
-        from .ml.plan_validator import validate as validate_plan
-        from .ml.planner import MambaPlanner
-        from .ml.types import PlanRequest
-
-        protocols = _traffic_model_protocols_for_attack_vector(getattr(args, "attack_vector", ""))
-        request = PlanRequest(
-            session_count=max(1, int(total_sessions or 1)),
-            session_len=max(3, int(getattr(args, "traffic_model_session_len", 24) or 24)),
-            seed=int(getattr(args, "traffic_model_seed", 1337) or 1337),
-            protocols=protocols,
-            label_mix=_parse_label_mix(str(getattr(args, "traffic_model_label_mix", "") or "")),
+        raise RuntimeError(
+            "Legacy ddos_samurai.ml traffic model stack was removed. "
+            "Use training/mamba2_monolith.py for train/eval/infer workflows."
         )
-        fallback_policy = str(getattr(args, "traffic_model_fallback", "static") or "static").strip().lower()
-        ckpt = str(getattr(args, "traffic_model_checkpoint", "") or "").strip()
-        timeout_ms = int(getattr(args, "traffic_model_timeout_ms", 2500) or 2500)
-
-        def _apply_fallback(reason: str):
-            if fallback_policy == "fail":
-                raise RuntimeError(reason)
-            plan = generate_deterministic_plan(
-                request,
-                model_name="static-fallback",
-                checkpoint_id=(ckpt or "none"),
-            )
-            traffic_model_runtime["fallback_used"] = True
-            traffic_model_runtime["fallback_reason"] = str(reason)
-            return plan
-
-        try:
-            t0 = time.perf_counter()
-            planner = MambaPlanner.load(ckpt, device=str(getattr(args, "traffic_model_device", "cpu") or "cpu"))
-            plan = planner.generate(request)
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            if timeout_ms > 0 and elapsed_ms > float(timeout_ms):
-                plan = _apply_fallback("inference_timeout")
-            vr = validate_plan(plan)
-            if not bool(vr.valid):
-                traffic_model_runtime["validation_errors"] = list(vr.errors)
-                plan = _apply_fallback("invalid_plan_emitted")
-                vr2 = validate_plan(plan)
-                if not bool(vr2.valid):
-                    raise RuntimeError("fallback plan invalid")
-            traffic_model_runtime["model_name"] = str(getattr(plan, "model_name", "mamba2"))
-            traffic_model_runtime["checkpoint_id"] = str(getattr(plan, "checkpoint_id", ckpt))
-            traffic_model_runtime["plan_id"] = str(getattr(plan, "plan_id", ""))
-            traffic_model_runtime["session_count"] = int(len(getattr(plan, "session_plans", []) or []))
-            traffic_model_runtime["event_count"] = int(
-                sum(len(getattr(sp, "events", []) or []) for sp in list(getattr(plan, "session_plans", []) or []))
-            )
-            traffic_model_plan = plan
-            return plan
-        except Exception as exc:
-            plan = _apply_fallback(str(exc))
-            vr = validate_plan(plan)
-            if not bool(vr.valid):
-                raise RuntimeError(f"fallback validation failed: {vr.errors}")
-            traffic_model_runtime["model_name"] = str(getattr(plan, "model_name", "static-fallback"))
-            traffic_model_runtime["checkpoint_id"] = str(getattr(plan, "checkpoint_id", ckpt or "none"))
-            traffic_model_runtime["plan_id"] = str(getattr(plan, "plan_id", ""))
-            traffic_model_runtime["session_count"] = int(len(getattr(plan, "session_plans", []) or []))
-            traffic_model_runtime["event_count"] = int(
-                sum(len(getattr(sp, "events", []) or []) for sp in list(getattr(plan, "session_plans", []) or []))
-            )
-            traffic_model_plan = plan
-            return plan
 
     if bool(getattr(args, "traffic_model_dry_validate", False)):
         if str(getattr(args, "traffic_model", "none") or "none").strip().lower() == "none":
@@ -2427,7 +2367,6 @@ def main(argv=None):
             plan = _generate_traffic_plan(max(1, int(getattr(args, "count", 1) or 1)))
             export_path = str(getattr(args, "traffic_model_export_events", "") or "").strip()
             if export_path and plan is not None:
-                from .ml.dataset.export_parquet import export_jsonl
                 rows = []
                 for sp in list(getattr(plan, "session_plans", []) or []):
                     for ev in list(getattr(sp, "events", []) or []):
@@ -2440,7 +2379,7 @@ def main(argv=None):
                                 "event": ev.to_dict() if hasattr(ev, "to_dict") else dict(ev),
                             }
                         )
-                out = export_jsonl(rows, export_path)
+                out = _export_jsonl_rows(rows, export_path)
                 utils.log_info(f"Traffic model dry-validate event export: {out}")
             utils.log_info(
                 "Traffic model dry-validate OK: "
@@ -2640,8 +2579,6 @@ def main(argv=None):
                 cursor += wc
             export_path = str(getattr(args, "traffic_model_export_events", "") or "").strip()
             if export_path and plan is not None:
-                from .ml.dataset.export_parquet import export_jsonl
-
                 rows = []
                 for sp in list(getattr(plan, "session_plans", []) or []):
                     for ev in list(getattr(sp, "events", []) or []):
@@ -2654,7 +2591,7 @@ def main(argv=None):
                                 "event": ev.to_dict() if hasattr(ev, "to_dict") else dict(ev),
                             }
                         )
-                out = export_jsonl(rows, export_path)
+                out = _export_jsonl_rows(rows, export_path)
                 utils.log_info(f"Traffic model event export: {out}")
         except Exception as exc:
             utils.log_critical(f"Traffic model planner failed: {exc}")
@@ -2851,8 +2788,6 @@ def main(argv=None):
                 )
             dataset_capture_out = str(getattr(args, "traffic_model_dataset_capture", "") or "").strip()
             if dataset_capture_out:
-                from .ml.dataset.export_parquet import export_jsonl
-
                 rows = []
                 for ev in events_local:
                     rows.append(
@@ -2865,7 +2800,7 @@ def main(argv=None):
                             "stats": dict(ev.get("stats", {}) or {}),
                         }
                     )
-                dataset_path = export_jsonl(rows, dataset_capture_out)
+                dataset_path = _export_jsonl_rows(rows, dataset_capture_out)
                 rr.artifacts.append(
                     reporting.Artifact(
                         kind="traffic_model_dataset_capture_jsonl",

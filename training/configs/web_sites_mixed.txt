@@ -1,0 +1,23 @@
+# One URL per line. Keep HTTPS to maximize HTTP/2 + HTTP/3 opportunities.
+https://www.cloudflare.com
+https://www.google.com
+https://www.youtube.com
+https://www.wikipedia.org
+https://www.bbc.com
+https://www.mozilla.org
+https://www.github.com
+https://www.python.org
+https://www.stackoverflow.com
+https://www.reddit.com
+https://www.nytimes.com
+https://www.cnn.com
+https://www.amazon.com
+https://www.microsoft.com
+https://www.apple.com
+https://www.linkedin.com
+https://www.booking.com
+https://www.netflix.com
+https://www.spotify.com
+https://www.fastly.com
+https://www.digitalocean.com
+https://www.heroku.com
