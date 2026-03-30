@@ -1814,6 +1814,231 @@ static PyObject *py_paced_send_l2(PyObject *self,
 }
 
 /* ========================================================================== */
+/* Python: paced_send_xdp                                                     */
+/*   Paced sender that drives pre-initialized AF_XDP xdp_send_buffer()       */
+/* ========================================================================== */
+
+PyDoc_STRVAR(doc_paced_send_xdp,
+"paced_send_xdp(buffer, packet_size, count, *,\n"
+"               target_rps=0, ipg_ns=0, burst_size=1, burst_gap_ns=0,\n"
+"               jitter_model=0, jitter_pct=0.0, pacing_mode=0,\n"
+"               pin_cpu=-1) -> int\n"
+"\n"
+"Paced sender for AF_XDP path.\n"
+"Requires xdp_sender.xdp_init() to be active beforehand.\n");
+
+static PyObject *py_paced_send_xdp(PyObject *self,
+                                   PyObject *args,
+                                   PyObject *kw)
+{
+    (void)self;
+    Py_buffer view;
+    int packet_size, count;
+
+    double  target_rps   = 0.0;
+    int64_t ipg_ns       = 0;
+    int     burst_size   = 1;
+    int64_t burst_gap_ns = 0;
+    int     jitter_model = JITTER_NONE;
+    double  jitter_pct   = 0.0;
+    int     pacing_mode  = PACING_NONE;
+    int     pin_cpu      = -1;
+
+    static char *kwl[] = {
+        "buffer", "packet_size", "count",
+        "target_rps", "ipg_ns", "burst_size", "burst_gap_ns",
+        "jitter_model", "jitter_pct", "pacing_mode",
+        "pin_cpu", NULL
+    };
+
+    if (!PyArg_ParseTupleAndKeywords(
+            args, kw, "y*ii|dLiLidii", kwl,
+            &view, &packet_size, &count,
+            &target_rps, &ipg_ns, &burst_size, &burst_gap_ns,
+            &jitter_model, &jitter_pct, &pacing_mode, &pin_cpu))
+        return NULL;
+
+    if (packet_size <= 0 || count < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size must be > 0 and count must be >= 0");
+        return NULL;
+    }
+    if (count == 0) {
+        PyBuffer_Release(&view);
+        return PyLong_FromLong(0);
+    }
+    if ((uint64_t)view.len < ((uint64_t)packet_size * (uint64_t)count)) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "buffer too small for packet_size * count");
+        return NULL;
+    }
+
+    if (pin_cpu >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(pin_cpu, &cpuset);
+        sched_setaffinity(0, sizeof(cpuset), &cpuset);
+        struct sched_param sp = { .sched_priority = 50 };
+        sched_setscheduler(0, SCHED_FIFO, &sp);
+    }
+
+    PyObject *xdp_mod = PyImport_ImportModule("ddos_samurai.xdp_sender");
+    if (!xdp_mod) {
+        PyErr_Clear();
+        xdp_mod = PyImport_ImportModule("xdp_sender");
+    }
+    if (!xdp_mod) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "xdp_sender module not importable");
+        return NULL;
+    }
+
+    PyObject *send_buffer_fn = PyObject_GetAttrString(xdp_mod, "xdp_send_buffer");
+    Py_DECREF(xdp_mod);
+    if (!send_buffer_fn || !PyCallable_Check(send_buffer_fn)) {
+        Py_XDECREF(send_buffer_fn);
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "xdp_sender.xdp_send_buffer unavailable");
+        return NULL;
+    }
+
+    PyObject *py_packet_size = PyLong_FromLong(packet_size);
+    PyObject *py_one = PyLong_FromLong(1);
+    if (!py_packet_size || !py_one) {
+        Py_XDECREF(py_packet_size);
+        Py_XDECREF(py_one);
+        Py_DECREF(send_buffer_fn);
+        PyBuffer_Release(&view);
+        return PyErr_NoMemory();
+    }
+
+    uint64_t eff_ipg = 0;
+    if      (pacing_mode == PACING_IPG   && ipg_ns > 0)    eff_ipg = (uint64_t)ipg_ns;
+    else if (pacing_mode == PACING_RPS   && target_rps > 0) eff_ipg = (uint64_t)(1e9 / target_rps);
+
+    double stats_target_rps = target_rps;
+    if (stats_target_rps <= 0.0 && pacing_mode == PACING_IPG && eff_ipg > 0) {
+        stats_target_rps = 1e9 / (double)eff_ipg;
+    }
+
+    token_bucket_t tb = {0};
+    if (pacing_mode == PACING_RPS && target_rps > 0)
+        tb_init(&tb, target_rps, (double)(burst_size > 0 ? burst_size : 1));
+
+    rng_seed();
+
+    int total_sent = 0;
+    int burst_ctr = 0;
+    int burst_limit = burst_size > 0 ? burst_size : 1;
+    int stats_locked = 0;
+
+    pthread_mutex_lock(&g_stats_lock);
+    stats_locked = 1;
+    stats_reset(stats_target_rps);
+
+    uint64_t t_start = time_ns();
+    uint64_t t_last = t_start;
+    uint64_t t_deadline = t_start;
+    uint64_t t_burst_deadline = t_start;
+
+    for (int i = 0; i < count; i++) {
+        switch (pacing_mode) {
+        case PACING_IPG:
+            if (i > 0) {
+                int64_t j = calc_jitter_ns(eff_ipg, jitter_model, jitter_pct);
+                t_deadline = add_saturating_u64(t_deadline, eff_ipg);
+                t_deadline = add_jitter_saturating_u64(t_deadline, j);
+                precision_wait(t_deadline);
+            }
+            break;
+        case PACING_RPS:
+            if (eff_ipg > 0 && i > 0) {
+                int64_t j = calc_jitter_ns(eff_ipg, jitter_model, jitter_pct);
+                t_deadline = add_saturating_u64(t_deadline, eff_ipg);
+                t_deadline = add_jitter_saturating_u64(t_deadline, j);
+                precision_wait(t_deadline);
+            } else {
+                uint64_t now;
+                while (1) {
+                    now = time_ns();
+                    if (tb_try_consume(&tb, now)) break;
+#if defined(__x86_64__) || defined(__i386__)
+                    __asm__ volatile("pause" ::: "memory");
+#endif
+                }
+            }
+            break;
+        case PACING_BURST:
+            burst_ctr++;
+            if (burst_ctr >= burst_limit && burst_gap_ns > 0) {
+                burst_ctr = 0;
+                int64_t j = calc_jitter_ns((uint64_t)burst_gap_ns, jitter_model, jitter_pct);
+                t_burst_deadline = add_saturating_u64(t_burst_deadline, (uint64_t)burst_gap_ns);
+                t_burst_deadline = add_jitter_saturating_u64(t_burst_deadline, j);
+                precision_wait(t_burst_deadline);
+            }
+            break;
+        default:
+            break;
+        }
+
+        uint64_t t_pre = time_ns();
+        char *pkt_ptr = (char *)view.buf + ((size_t)i * (size_t)packet_size);
+        PyObject *pkt_view = PyMemoryView_FromMemory(pkt_ptr, (Py_ssize_t)packet_size, PyBUF_READ);
+        if (!pkt_view) {
+            goto error;
+        }
+
+        PyObject *ret = PyObject_CallFunctionObjArgs(
+            send_buffer_fn, pkt_view, py_packet_size, py_one, NULL
+        );
+        Py_DECREF(pkt_view);
+
+        if (!ret) {
+            goto error;
+        }
+
+        long sent = PyLong_AsLong(ret);
+        Py_DECREF(ret);
+        if (sent == -1 && PyErr_Occurred()) {
+            goto error;
+        }
+
+        if (sent > 0) {
+            total_sent++;
+            g_stats.total_packets++;
+            g_stats.total_bytes += (uint64_t)packet_size;
+            if (total_sent > 1) {
+                uint64_t actual_ipg = t_pre - t_last;
+                stats_record_ipg(actual_ipg, eff_ipg);
+            }
+            t_last = t_pre;
+        }
+    }
+
+    g_stats.elapsed_ns = (double)(time_ns() - t_start);
+    stats_finalize();
+    pthread_mutex_unlock(&g_stats_lock);
+
+    Py_DECREF(py_one);
+    Py_DECREF(py_packet_size);
+    Py_DECREF(send_buffer_fn);
+    PyBuffer_Release(&view);
+
+    return PyLong_FromLong(total_sent);
+
+error:
+    g_stats.elapsed_ns = (double)(time_ns() - t_start);
+    stats_finalize();
+    if (stats_locked) pthread_mutex_unlock(&g_stats_lock);
+    Py_DECREF(py_one);
+    Py_DECREF(py_packet_size);
+    Py_DECREF(send_buffer_fn);
+    PyBuffer_Release(&view);
+    return NULL;
+}
+
+/* ========================================================================== */
 /* Python: get_pacing_stats                                                   */
 /* ========================================================================== */
 
@@ -2128,6 +2353,9 @@ static PyMethodDef PacingMethods[] = {
 
     {"paced_send_l2", (PyCFunction)(void(*)(void))py_paced_send_l2,
      METH_VARARGS | METH_KEYWORDS, doc_paced_send_l2},
+
+    {"paced_send_xdp", (PyCFunction)(void(*)(void))py_paced_send_xdp,
+     METH_VARARGS | METH_KEYWORDS, doc_paced_send_xdp},
 
     {"get_pacing_stats", py_get_pacing_stats, METH_NOARGS, doc_get_stats},
 

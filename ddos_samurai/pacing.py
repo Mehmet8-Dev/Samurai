@@ -233,6 +233,36 @@ def paced_send_l2(
     )
 
 
+def paced_send_xdp(
+    buffer: bytes,
+    packet_size: int,
+    count: int,
+    config: Optional[PacingConfig] = None,
+) -> int:
+    """
+    Send *count* packets via AF_XDP with deterministic pacing.
+
+    Notes:
+        - Requires a pre-initialized ``xdp_sender`` session (``xdp_init`` called).
+        - This function paces transmission and delegates packet submission to
+          ``xdp_sender.xdp_send_buffer`` one packet at a time.
+    """
+    if config is None:
+        config = PacingConfig()
+    config.validate()
+
+    if not PACING_ENGINE_AVAILABLE:
+        log.warning("Pacing engine unavailable — XDP paced send not possible")
+        return 0
+
+    kw = config.as_kwargs()
+    kw.pop("use_so_txtime", None)   # XDP path does not use SO_TXTIME
+    return _eng.paced_send_xdp(
+        buffer, int(packet_size), int(count),
+        **kw,
+    )
+
+
 # ── Statistics ───────────────────────────────────────────────────────────────
 
 def get_stats() -> dict:

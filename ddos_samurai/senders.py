@@ -105,6 +105,7 @@ PacingMode = _pacing.get("PacingMode")
 JitterModel = _pacing.get("JitterModel")
 paced_send = _pacing.get("paced_send")
 paced_send_l2 = _pacing.get("paced_send_l2")
+paced_send_xdp = _pacing.get("paced_send_xdp")
 get_stats = _pacing.get("get_stats")
 reset_stats = _pacing.get("reset_stats")
 format_stats = _pacing.get("format_stats")
@@ -147,6 +148,8 @@ async def xdp_sender(
     sender_fallback_policy: str = "allow",
     fallback_backend: str = "python",
     sender_context: Dict[str, Any] | None = None,
+    pacing_config=None,
+    paced_send_xdp_fn=None,
 ) -> dict:
     from ._senders import l2l3_entry as _l2l3_entry
 
@@ -163,6 +166,8 @@ async def xdp_sender(
         sender_fallback_policy=sender_fallback_policy,
         fallback_backend=fallback_backend,
         sender_context=sender_context,
+        pacing_config=pacing_config,
+        paced_send_xdp_fn=paced_send_xdp_fn,
         resolve_sender_fallback_policy_fn=_resolve_sender_fallback_policy,
         resolve_sender_backend_fn=_resolve_sender_backend,
         raw_socket_sender_fn=raw_socket_sender,
@@ -288,6 +293,7 @@ async def paced_raw_socket_sender(
         PACING_ENGINE_AVAILABLE_flag=bool(PACING_ENGINE_AVAILABLE),
         reset_stats_fn=reset_stats,
         paced_send_l2_fn=paced_send_l2 if PACING_ENGINE_AVAILABLE else None,
+        paced_send_xdp_fn=paced_send_xdp if PACING_ENGINE_AVAILABLE else None,
         paced_send_fn=paced_send if PACING_ENGINE_AVAILABLE else None,
         get_stats_fn=get_stats if PACING_ENGINE_AVAILABLE else None,
         format_stats_fn=format_stats if PACING_ENGINE_AVAILABLE else None,
