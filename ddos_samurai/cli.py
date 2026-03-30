@@ -397,6 +397,7 @@ def _report_inputs_from_args(args) -> dict:
         "xdp_enable": bool(getattr(args, "xdp_enable", False)),
         "xdp_interface": str(getattr(args, "xdp_interface", "")),
         "xdp_queue_id": int(getattr(args, "xdp_queue_id", 0) or 0),
+        "xdp_mode": int(getattr(args, "xdp_mode", 0) or 0),
         "kpi_gate_profile": str(getattr(args, "kpi_gate_profile", "off")),
         "kpi_hard_fail": bool(getattr(args, "kpi_hard_fail", False)),
         "l7_engine": str(getattr(args, "l7_engine", "python")),
@@ -619,6 +620,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
 
     if int(getattr(args, "xdp_queue_id", 0) or 0) < 0:
         parser.error("Hata: --xdp-queue-id >= 0 olmalıdır.")
+    if int(getattr(args, "xdp_mode", 0) or 0) not in {0, 1, 2}:
+        parser.error("Hata: --xdp-mode 0(SKB), 1(Native), 2(Offload) olmalıdır.")
     if int(getattr(args, "dp_queues", 1) or 0) <= 0:
         parser.error("Hata: --dp-queues >= 1 olmalıdır.")
     if int(getattr(args, "afpacket_hugepage_size_kb", 2048) or 0) <= 0:
@@ -1235,6 +1238,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xdp-enable", action="store_true", help="AF_XDP sender yolunu etkinleştir (xdp backend).")
     parser.add_argument("--xdp-interface", type=str, default="", help="AF_XDP için NIC adı (örn: eth0).")
     parser.add_argument("--xdp-queue-id", type=int, default=0, help="AF_XDP queue id (varsayılan: 0).")
+    parser.add_argument(
+        "--xdp-mode",
+        type=int,
+        choices=[0, 1, 2],
+        default=_env_int("SAMURAI_XDP_MODE", 0),
+        help="AF_XDP mode: 0=SKB/Copy, 1=Native/DRV, 2=Offload.",
+    )
     parser.add_argument(
         "--xdp-attach-bpf",
         dest="xdp_attach_bpf",
@@ -1993,6 +2003,7 @@ def main(argv=None):
     os.environ["SAMURAI_XDP_ENABLE"] = "1" if bool(getattr(args, "xdp_enable", False)) else "0"
     os.environ["SAMURAI_XDP_INTERFACE"] = str(getattr(args, "xdp_interface", "") or "")
     os.environ["SAMURAI_XDP_QUEUE_ID"] = str(int(getattr(args, "xdp_queue_id", 0) or 0))
+    os.environ["SAMURAI_XDP_MODE"] = str(int(getattr(args, "xdp_mode", 0) or 0))
     os.environ["SAMURAI_XDP_ATTACH_BPF"] = "1" if bool(getattr(args, "xdp_attach_bpf", True)) else "0"
     os.environ["SAMURAI_XDP_BPF_SECTION"] = str(getattr(args, "xdp_bpf_section", "xdp_sock") or "xdp_sock")
     os.environ["SAMURAI_XDP_BPF_OBJ"] = str(getattr(args, "xdp_bpf_obj", "") or "")

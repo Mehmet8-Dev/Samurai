@@ -939,12 +939,14 @@ async def worker_process(
     xdp_enable_cfg = bool(args.get("xdp_enable", False))
     xdp_interface_cfg = str(args.get("xdp_interface", "") or "").strip() or None
     xdp_queue_id_cfg = int(dp_queue_id_cfg)
+    xdp_mode_cfg = int(args.get("xdp_mode", 0) or 0)
     worker_stats["dp_queue_id"] = int(dp_queue_id_cfg)
     worker_stats["dp_queue_strategy"] = str(dp_queue_strategy_cfg)
     worker_stats["dp_affinity_cpu"] = int(args.get("dp_affinity_cpu", -1) or -1)
     worker_stats["sender_backend_requested"] = str(sender_backend_cfg)
     worker_stats["sender_fallback_policy"] = str(sender_fallback_policy_cfg)
     worker_stats["dataplane_core_mode"] = str(dataplane_core_mode_cfg)
+    worker_stats["xdp_mode"] = int(xdp_mode_cfg)
 
     try:
         dp_cfg = dataplane.build_dataplane_config(args, queue_id=dp_queue_id_cfg)
@@ -981,6 +983,7 @@ async def worker_process(
         xdp_enable=None,
         xdp_interface=None,
         xdp_queue_id=None,
+        xdp_mode=None,
     ):
         elapsed = max(0.0, time.time() - worker_started)
         can_inject = fault_after_s > 0 and elapsed >= fault_after_s
@@ -1026,6 +1029,7 @@ async def worker_process(
             "xdp_enable": bool(xdp_enable if xdp_enable is not None else xdp_enable_cfg),
             "xdp_interface": xdp_interface if xdp_interface is not None else xdp_interface_cfg,
             "xdp_queue_id": int(xdp_queue_id if xdp_queue_id is not None else xdp_queue_id_cfg),
+            "xdp_mode": int(xdp_mode if xdp_mode is not None else xdp_mode_cfg),
         }
         try:
             sig_target = _orig_paced_sender

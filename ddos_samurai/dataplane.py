@@ -23,6 +23,8 @@ class DataplaneConfig:
     queue_id: int = 0
     interface: str = ""
     xdp_enable: bool = False
+    xdp_mode: int = 0
+    xdp_mode2_policy: str = "soft"
     afpacket_hugepage_mode: str = "off"
     afpacket_hugepage_size_kb: int = 2048
     afpacket_ring_target_mb: int = 64
@@ -41,6 +43,8 @@ class DataplaneConfig:
             "queue_id": int(self.queue_id or 0),
             "interface": str(self.interface or ""),
             "xdp_enable": bool(self.xdp_enable),
+            "xdp_mode": int(self.xdp_mode or 0),
+            "xdp_mode2_policy": str(self.xdp_mode2_policy or "soft"),
             "afpacket_hugepage_mode": str(self.afpacket_hugepage_mode or "off"),
             "afpacket_hugepage_size_kb": int(self.afpacket_hugepage_size_kb or 2048),
             "afpacket_ring_target_mb": int(self.afpacket_ring_target_mb or 64),
@@ -281,6 +285,16 @@ def build_dataplane_config(args: Dict[str, Any], queue_id: Optional[int] = None)
     qid = int(queue_id if queue_id is not None else (args.get("dp_queue_id", args.get("xdp_queue_id", 0)) or 0))
     interface = str(args.get("xdp_interface", "") or "")
     xdp_enable = bool(args.get("xdp_enable", False))
+    xdp_mode = int(args.get("xdp_mode", 0) or 0)
+    xdp_mode2_policy = str(
+        args.get(
+            "xdp_mode2_policy",
+            "hard" if fallback_policy == "fail" else "soft",
+        )
+        or ("hard" if fallback_policy == "fail" else "soft")
+    ).strip().lower()
+    if xdp_mode2_policy not in {"soft", "hard"}:
+        xdp_mode2_policy = "hard" if fallback_policy == "fail" else "soft"
     afpacket_hugepage_mode = _normalize_afpacket_hugepage_mode(
         args.get("afpacket_hugepage_mode", os.environ.get("SAMURAI_AF_PACKET_HUGEPAGE_MODE", "off"))
     )
@@ -326,6 +340,8 @@ def build_dataplane_config(args: Dict[str, Any], queue_id: Optional[int] = None)
         queue_id=qid,
         interface=interface,
         xdp_enable=xdp_enable,
+        xdp_mode=xdp_mode,
+        xdp_mode2_policy=xdp_mode2_policy,
         afpacket_hugepage_mode=afpacket_hugepage_mode,
         afpacket_hugepage_size_kb=max(1, afpacket_hugepage_size_kb),
         afpacket_ring_target_mb=max(1, afpacket_ring_target_mb),

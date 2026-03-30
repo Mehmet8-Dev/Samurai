@@ -142,6 +142,7 @@ async def xdp_sender(
     verbose: bool = False,
     interface: str = None,
     queue_id: int = 0,
+    xdp_mode: int = 0,
     batch_size: int = 64,
     sender_fallback_policy: str = "allow",
     fallback_backend: str = "python",
@@ -157,6 +158,7 @@ async def xdp_sender(
         verbose=verbose,
         interface=interface,
         queue_id=queue_id,
+        xdp_mode=xdp_mode,
         batch_size=batch_size,
         sender_fallback_policy=sender_fallback_policy,
         fallback_backend=fallback_backend,
@@ -191,6 +193,7 @@ async def raw_socket_sender(
     xdp_enable: bool = False,
     xdp_interface: str | None = None,
     xdp_queue_id: int = 0,
+    xdp_mode: int = 0,
 ):
     from ._senders import l2l3_raw as _l2l3_raw
 
@@ -210,6 +213,7 @@ async def raw_socket_sender(
         xdp_enable=xdp_enable,
         xdp_interface=xdp_interface,
         xdp_queue_id=xdp_queue_id,
+        xdp_mode=xdp_mode,
         resolve_sender_backend_fn=_resolve_sender_backend,
         resolve_sender_fallback_policy_fn=_resolve_sender_fallback_policy,
         xdp_sender_fn=xdp_sender,
@@ -244,6 +248,7 @@ async def paced_raw_socket_sender(
     xdp_enable: bool = False,
     xdp_interface: str | None = None,
     xdp_queue_id: int = 0,
+    xdp_mode: int = 0,
 ):
     from ._senders import l2l3_raw as _l2l3_raw
 
@@ -264,6 +269,7 @@ async def paced_raw_socket_sender(
         xdp_enable=xdp_enable,
         xdp_interface=xdp_interface,
         xdp_queue_id=xdp_queue_id,
+        xdp_mode=xdp_mode,
         resolve_sender_backend_fn=_resolve_sender_backend,
         resolve_sender_fallback_policy_fn=_resolve_sender_fallback_policy,
         xdp_sender_fn=xdp_sender,
