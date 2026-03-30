@@ -85,6 +85,77 @@ DEFAULT_BATCH_SIZE = 64
 DEFAULT_QUEUE_ID = 0
 
 
+def _mode_name(mode: int) -> str:
+    if int(mode) == XDP_MODE_SKB:
+        return "SKB/Copy"
+    if int(mode) == XDP_MODE_NATIVE:
+        return "Native/Zero-Copy"
+    if int(mode) == XDP_MODE_OFFLOAD:
+        return "Offload(Requested)"
+    return "Unknown"
+
+
+def _normalize_mode2_policy(value: Optional[str]) -> str:
+    policy = str(value or "soft").strip().lower()
+    if policy not in {"soft", "hard"}:
+        raise ValueError("mode2_policy must be 'soft' or 'hard'")
+    return policy
+
+
+def probe_xdp_mode2_capability(interface: str) -> Tuple[str, str]:
+    """
+    Probe XDP offload capability for interface.
+    Returns: ("supported"|"unsupported"|"unknown", reason)
+    """
+    iface = str(interface or "").strip()
+    if not iface:
+        return "unknown", "interface is empty"
+
+    if iface == "lo":
+        return "unsupported", "loopback interface does not support XDP HW offload"
+
+    ethtool_bin = shutil.which("ethtool")
+    if ethtool_bin:
+        try:
+            out = subprocess.run(
+                [ethtool_bin, "-i", iface],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if out.returncode == 0:
+                text = (out.stdout or "").lower()
+                driver = ""
+                for line in text.splitlines():
+                    if line.startswith("driver:"):
+                        driver = line.split(":", 1)[1].strip()
+                        break
+                if driver in {"veth", "tun", "tap", "loopback"}:
+                    return "unsupported", f"driver={driver} has no XDP HW offload"
+        except Exception:
+            pass
+
+    ip_bin = shutil.which("ip")
+    if ip_bin:
+        try:
+            out = subprocess.run(
+                [ip_bin, "-details", "link", "show", "dev", iface],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if out.returncode == 0:
+                text = ((out.stdout or "") + "\n" + (out.stderr or "")).lower()
+                if "xdpoffload" in text:
+                    return "supported", "interface reports xdpoffload"
+        except Exception:
+            pass
+
+    return "unknown", "offload capability could not be proven from local probes"
+
+
 def _env_truthy(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -299,6 +370,7 @@ class XDPSender:
         mode: int = XDP_MODE_SKB,
         batch_size: int = DEFAULT_BATCH_SIZE,
         auto_fallback: bool = True,
+        mode2_policy: str = "soft",
         attach_bpf: Optional[bool] = None,
         bpf_section: Optional[str] = None,
         bpf_obj_path: Optional[str] = None,
@@ -309,9 +381,12 @@ class XDPSender:
         Args:
             interface: Network interface to use (auto-detected if None)
             queue_id: Queue ID to use (default: 0)
-            mode: XDP mode (0=SKB/Copy, 1=Native)
+            mode: XDP mode (0=SKB/Copy, 1=Native/Zero-Copy, 2=Offload request)
             batch_size: Batch size for packet transmission
             auto_fallback: Fall back to raw sockets if XDP unavailable
+            mode2_policy: mode=2 için davranış:
+                "soft" => unsupported ise mode=1'e düş
+                "hard" => unsupported/unknown ise hata ver
             attach_bpf: Auto attach XDP BPF program on start
             bpf_section: BPF section name to attach
             bpf_obj_path: Path to xdp_prog.o object file
@@ -321,6 +396,7 @@ class XDPSender:
         self.mode = mode
         self.batch_size = batch_size
         self.auto_fallback = auto_fallback
+        self.mode2_policy = _normalize_mode2_policy(mode2_policy)
         self.attach_bpf = _env_truthy("SAMURAI_XDP_ATTACH_BPF", True) if attach_bpf is None else bool(attach_bpf)
         self.bpf_section = str(
             bpf_section or os.environ.get("SAMURAI_XDP_BPF_SECTION", "xdp_sock")
@@ -332,6 +408,9 @@ class XDPSender:
         self._xdp = None
         self._is_running = False
         self._use_fallback = False
+        self._effective_mode = int(mode)
+        self._mode2_probe_status = "not_run"
+        self._mode2_probe_reason = ""
         self._bpf_attached = False
         self._xskmap_pin_path = ""
         self._bpffs_root = ""
@@ -536,6 +615,15 @@ class XDPSender:
             return False, msg
         
         return True, "All requirements met"
+
+    def _probe_mode2_capability(self) -> Tuple[str, str]:
+        """
+        Probe offload capability for mode=2.
+        Returns: ("supported"|"unsupported"|"unknown", reason)
+        """
+        if self.mode != XDP_MODE_OFFLOAD:
+            return "not_applicable", "mode!=2"
+        return probe_xdp_mode2_capability(self.interface)
     
     def start(self) -> bool:
         """
@@ -566,8 +654,25 @@ class XDPSender:
             
             # Load and initialize XDP
             self._xdp = _load_xdp_extension()
+            self._effective_mode = int(self.mode)
             
             try:
+                if self.mode == XDP_MODE_OFFLOAD:
+                    probe_status, probe_reason = self._probe_mode2_capability()
+                    self._mode2_probe_status = probe_status
+                    self._mode2_probe_reason = probe_reason
+
+                    if self.mode2_policy == "hard" and probe_status != "supported":
+                        raise RuntimeError(
+                            f"mode=2 hard policy violated: {probe_status} ({probe_reason})"
+                        )
+
+                    if self.mode2_policy == "soft" and probe_status == "unsupported":
+                        self._effective_mode = XDP_MODE_NATIVE
+                        utils.log_warning(
+                            f"[XDP] mode=2 probe unsupported ({probe_reason}); soft fallback -> mode=1"
+                        )
+
                 if self.attach_bpf:
                     attached, attach_msg = self._attach_bpf_program()
                     if attached:
@@ -578,11 +683,11 @@ class XDPSender:
                     else:
                         raise RuntimeError(attach_msg)
 
-                result = self._xdp.xdp_init(self.interface, self.queue_id, self.mode)
+                result = self._xdp.xdp_init(self.interface, self.queue_id, self._effective_mode)
                 
                 if result:
                     utils.log_info(f"[XDP] Started on {self.interface} "
-                                  f"(queue={self.queue_id}, mode={'Copy' if self.mode == 0 else 'Native'})")
+                                  f"(queue={self.queue_id}, mode={_mode_name(self._effective_mode)})")
                     self._is_running = True
                     self._start_time = time.time()
                     return True
@@ -626,6 +731,9 @@ class XDPSender:
             self._is_running = False
             self._use_fallback = False
             self._xdp = None
+            self._effective_mode = int(self.mode)
+            self._mode2_probe_status = "not_run"
+            self._mode2_probe_reason = ""
             
             utils.log_info("[XDP] Stopped")
     
@@ -864,6 +972,7 @@ class XDPSender:
                 elapsed_seconds=elapsed,
                 packets_per_second=pps,
                 mbps=mbps,
+                mode=int(self._effective_mode),
                 mode_name="Fallback (Raw Socket)"
             )
         

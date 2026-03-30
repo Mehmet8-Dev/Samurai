@@ -101,6 +101,10 @@ struct xsk_umem_info {
     uint64_t size;
     struct xsk_ring_prod fill;
     struct xsk_ring_cons comp;
+    void *fill_map;
+    size_t fill_map_len;
+    void *comp_map;
+    size_t comp_map_len;
     int fd;
 };
 
@@ -108,6 +112,8 @@ struct xsk_umem_info {
 struct xsk_socket_info {
     struct xsk_ring_prod tx;
     struct xsk_ring_cons rx;
+    void *tx_map;
+    size_t tx_map_len;
     struct xsk_umem_info *umem;
     int fd;
     int ifindex;
@@ -232,10 +238,47 @@ static int register_xsk_in_xsks_map(int queue_id, int xsk_fd, char *reason, size
 #define xsk_ring_prod__needs_wakeup(r) \
     (*((r)->flags) & XDP_RING_NEED_WAKEUP)
 
+static inline const char *xdp_mode_name(int mode)
+{
+    switch (mode) {
+        case 0: return "SKB/Copy";
+        case 1: return "Native/Zero-Copy";
+        case 2: return "Offload(Requested)";
+        default: return "Unknown";
+    }
+}
+
+static inline uint16_t xdp_bind_mode_flags(int mode)
+{
+    switch (mode) {
+        case 0:
+            return XDP_COPY;
+        case 1:
+            return XDP_ZEROCOPY;
+        case 2:
+            /* AF_XDP has no dedicated HW-offload bind flag. */
+            return XDP_ZEROCOPY;
+        default:
+            return XDP_COPY;
+    }
+}
+
 static inline void xsk_ring_prod__submit(struct xsk_ring_prod *r, uint32_t nb)
 {
     __sync_synchronize();
     *r->producer += nb;
+}
+
+static inline void xsk_ring_prod__cancel(struct xsk_ring_prod *r, uint32_t nb)
+{
+    if (nb == 0) {
+        return;
+    }
+    if (r->cached_prod >= nb) {
+        r->cached_prod -= nb;
+    } else {
+        r->cached_prod = 0;
+    }
 }
 
 static inline uint32_t xsk_ring_prod__reserve(struct xsk_ring_prod *r,
@@ -445,6 +488,8 @@ static struct xsk_umem_info *create_umem(void)
     umem->fill.flags = (uint32_t*)(fill_map + offsets.fr.flags);
     umem->fill.ring = fill_map + offsets.fr.desc;
     umem->fill.cached_cons = XDP_FILL_RING_SIZE;
+    umem->fill_map = fill_map;
+    umem->fill_map_len = offsets.fr.desc + XDP_FILL_RING_SIZE * sizeof(uint64_t);
     
     // Map Completion Ring
     void *comp_map = mmap(NULL,
@@ -465,6 +510,8 @@ static struct xsk_umem_info *create_umem(void)
     umem->comp.consumer = (uint32_t*)(comp_map + offsets.cr.consumer);
     umem->comp.flags = (uint32_t*)(comp_map + offsets.cr.flags);
     umem->comp.ring = comp_map + offsets.cr.desc;
+    umem->comp_map = comp_map;
+    umem->comp_map_len = offsets.cr.desc + XDP_COMP_RING_SIZE * sizeof(uint64_t);
     
     return umem;
 }
@@ -472,8 +519,17 @@ static struct xsk_umem_info *create_umem(void)
 static void destroy_umem(struct xsk_umem_info *umem)
 {
     if (!umem) return;
-    
-    // Note: In a full implementation, we would unmap the rings here
+
+    if (umem->fill_map && umem->fill_map_len > 0) {
+        munmap(umem->fill_map, umem->fill_map_len);
+        umem->fill_map = NULL;
+        umem->fill_map_len = 0;
+    }
+    if (umem->comp_map && umem->comp_map_len > 0) {
+        munmap(umem->comp_map, umem->comp_map_len);
+        umem->comp_map = NULL;
+        umem->comp_map_len = 0;
+    }
     if (umem->fd >= 0) close(umem->fd);
     if (umem->buffer) free(umem->buffer);
     free(umem);
@@ -553,6 +609,8 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
     xsk->tx.consumer = (uint32_t*)(tx_map + offsets.tx.consumer);
     xsk->tx.flags = (uint32_t*)(tx_map + offsets.tx.flags);
     xsk->tx.ring = tx_map + offsets.tx.desc;
+    xsk->tx_map = tx_map;
+    xsk->tx_map_len = offsets.tx.desc + XDP_TX_RING_SIZE * sizeof(struct xdp_desc);
     
     // Bind socket to interface
     struct sockaddr_xdp sxdp = {
@@ -562,10 +620,8 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
         .sxdp_flags = XDP_USE_NEED_WAKEUP
     };
     
-    // Use Copy Mode (SKB) for maximum compatibility
-    if (xdp_mode == 0) {
-        sxdp.sxdp_flags |= XDP_COPY;
-    }
+    // AF_XDP socket mode hint for bind (copy/zerocopy).
+    sxdp.sxdp_flags |= xdp_bind_mode_flags(xdp_mode);
     
     // Share UMEM with the socket
     sxdp.sxdp_shared_umem_fd = umem->fd;
@@ -597,8 +653,13 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
         xsk_ring_prod__submit(&umem->fill, XDP_NUM_FRAMES);
     }
     
+    if (xdp_mode == 2) {
+        fprintf(stderr,
+                "[XDP] Note: mode=2 (offload) requested; AF_XDP bind uses zerocopy hint, true HW offload depends on XDP program/NIC path.\n");
+    }
+
     fprintf(stderr, "[XDP] Socket created on %s (queue %d, mode: %s)\n",
-            ifname, queue_id, xdp_mode == 0 ? "SKB/Copy" : "Native");
+            ifname, queue_id, xdp_mode_name(xdp_mode));
     
     return xsk;
 }
@@ -606,7 +667,12 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
 static void destroy_xsk_socket(struct xsk_socket_info *xsk)
 {
     if (!xsk) return;
-    
+
+    if (xsk->tx_map && xsk->tx_map_len > 0) {
+        munmap(xsk->tx_map, xsk->tx_map_len);
+        xsk->tx_map = NULL;
+        xsk->tx_map_len = 0;
+    }
     if (xsk->fd >= 0) close(xsk->fd);
     free(xsk);
 }
@@ -725,6 +791,10 @@ static int xdp_send_batch(struct xsk_socket_info *xsk,
         xdp_ctx.tx_bytes += pkt_len;
     }
     
+    if (submitted < (int)reserved) {
+        xsk_ring_prod__cancel(&xsk->tx, reserved - (uint32_t)submitted);
+    }
+
     // Submit TX descriptors
     if (submitted > 0) {
         xsk_ring_prod__submit(&xsk->tx, submitted);
@@ -847,12 +917,13 @@ static PyObject* py_xdp_init(PyObject* self, PyObject* args)
 {
     char *ifname;
     int queue_id = 0;
-    int mode = 0;  // 0 = SKB/Copy, 1 = Native
+    int mode = 0;  // 0 = SKB/Copy, 1 = Native/Zero-Copy, 2 = Offload(request)
     char map_reason[256];
     
     if (!PyArg_ParseTuple(args, "s|ii", &ifname, &queue_id, &mode)) {
         return NULL;
     }
+    (void)self;
     
     pthread_mutex_lock(&xdp_ctx.lock);
     
@@ -866,6 +937,12 @@ static PyObject* py_xdp_init(PyObject* self, PyObject* args)
     if (geteuid() != 0) {
         pthread_mutex_unlock(&xdp_ctx.lock);
         PyErr_SetString(PyExc_PermissionError, "Root privileges required for AF_XDP");
+        return NULL;
+    }
+
+    if (mode < 0 || mode > 2) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyErr_SetString(PyExc_ValueError, "mode must be one of 0(SKB/Copy), 1(Native/Zero-Copy), 2(Offload)");
         return NULL;
     }
     
@@ -933,6 +1010,7 @@ static PyObject* py_xdp_init(PyObject* self, PyObject* args)
  */
 static PyObject* py_xdp_cleanup(PyObject* self, PyObject* args)
 {
+    (void)self;
     (void)args;
     
     pthread_mutex_lock(&xdp_ctx.lock);
@@ -976,6 +1054,7 @@ static PyObject* py_xdp_cleanup(PyObject* self, PyObject* args)
 static PyObject* py_xdp_send(PyObject* self, PyObject* args)
 {
     PyObject *packets_list;
+    (void)self;
     
     if (!PyArg_ParseTuple(args, "O", &packets_list)) {
         return NULL;
@@ -1286,6 +1365,7 @@ static PyObject* xdp_send_udp_common(PyObject* args)
         uint64_t frame_addr = alloc_frame(xdp_ctx.xsk);
         if (frame_addr == UINT64_MAX) {
             xdp_ctx.tx_errors++;
+            xsk_ring_prod__cancel(&xdp_ctx.xsk->tx, 1);
             continue;
         }
 
@@ -1363,6 +1443,7 @@ static PyObject* py_xdp_send_udp_zc(PyObject* self, PyObject* args)
  */
 static PyObject* py_xdp_stats(PyObject* self, PyObject* args)
 {
+    (void)self;
     (void)args;
     
     pthread_mutex_lock(&xdp_ctx.lock);
@@ -1398,7 +1479,7 @@ static PyObject* py_xdp_stats(PyObject* self, PyObject* args)
                          "packets_per_second", pps,
                          "mbps", mbps,
                          "mode", xdp_mode,
-                         "mode_name", xdp_mode == 0 ? "SKB/Copy" : "Native");
+                         "mode_name", xdp_mode_name(xdp_mode));
 }
 
 /**
@@ -1407,6 +1488,7 @@ static PyObject* py_xdp_stats(PyObject* self, PyObject* args)
  */
 static PyObject* py_xdp_available(PyObject* self, PyObject* args)
 {
+    (void)self;
     (void)args;
     
     // Try to create AF_XDP socket to check availability
@@ -1425,6 +1507,7 @@ static PyObject* py_xdp_available(PyObject* self, PyObject* args)
  */
 static PyObject* py_xdp_info(PyObject* self, PyObject* args)
 {
+    (void)self;
     (void)args;
     
     int af_xdp_available = 0;
@@ -1514,9 +1597,9 @@ static PyMethodDef XdpSenderMethods[] = {
 };
 
 static struct PyModuleDef xdpsendermodule = {
-    PyModuleDef_HEAD_INIT,
-    "xdp_sender",
-    "AF_XDP High-Performance Packet Sender for Samurai\n\n"
+    .m_base = PyModuleDef_HEAD_INIT,
+    .m_name = "xdp_sender",
+    .m_doc = "AF_XDP High-Performance Packet Sender for Samurai\n\n"
     "This module provides high-performance packet transmission using\n"
     "Linux AF_XDP sockets. Works in Copy Mode (SKB/Generic) for\n"
     "maximum compatibility with standard Linux systems.\n\n"
@@ -1530,8 +1613,8 @@ static struct PyModuleDef xdpsendermodule = {
     "  xdp_sender.xdp_send([packet1, packet2, ...])\n"
     "  stats = xdp_sender.xdp_stats()\n"
     "  xdp_sender.xdp_cleanup()",
-    -1,
-    XdpSenderMethods
+    .m_size = -1,
+    .m_methods = XdpSenderMethods,
 };
 
 PyMODINIT_FUNC PyInit_xdp_sender(void)

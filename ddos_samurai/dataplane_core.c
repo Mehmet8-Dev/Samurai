@@ -32,6 +32,8 @@ typedef struct {
     int xdp_initialized;
     int queue_id;
     int xdp_mode;
+    int xdp_effective_mode;
+    int xdp_mode2_policy_hard;
     int raw_sockfd;
     int allow_python_fallback;
     int afpacket_hugepage_size_kb;
@@ -45,7 +47,11 @@ typedef struct {
     char afpacket_hugepage_mode[16];
     char afpacket_hugepage_reason[96];
     char interface[IFNAMSIZ];
+    char xdp_mode2_policy[8];
+    char xdp_mode2_probe_status[16];
+    char xdp_mode2_probe_reason[96];
     PyObject *xdp_mod;
+    PyObject *af_xdp_sender_mod;
     PyObject *fast_mod;
     PyObject *senders_mod;
 } DpHandle;
@@ -275,6 +281,91 @@ static PyObject *_import_cached(PyObject **slot, const char *module_name) {
     *slot = mod;
     Py_INCREF(mod);
     return mod;
+}
+
+static int _probe_mode2_capability(
+    DpHandle *h,
+    const char *iface,
+    char *status_out,
+    size_t status_out_len,
+    char *reason_out,
+    size_t reason_out_len
+) {
+    PyObject *af_mod = NULL;
+    PyObject *probe_fn = NULL;
+    PyObject *ret = NULL;
+    PyObject *status_obj = NULL;
+    PyObject *reason_obj = NULL;
+    const char *status_s = "unknown";
+    const char *reason_s = "probe_unavailable";
+
+    if (status_out != NULL && status_out_len > 0) {
+        (void)snprintf(status_out, status_out_len, "%s", "unknown");
+    }
+    if (reason_out != NULL && reason_out_len > 0) {
+        (void)snprintf(reason_out, reason_out_len, "%s", "probe_unavailable");
+    }
+
+    if (h == NULL || iface == NULL || iface[0] == '\0') {
+        return -1;
+    }
+
+    af_mod = _import_cached(&h->af_xdp_sender_mod, "ddos_samurai.af_xdp_sender");
+    if (af_mod == NULL) {
+        PyErr_Clear();
+        return -1;
+    }
+
+    probe_fn = PyObject_GetAttrString(af_mod, "probe_xdp_mode2_capability");
+    Py_DECREF(af_mod);
+    if (probe_fn == NULL) {
+        PyErr_Clear();
+        return -1;
+    }
+    if (!PyCallable_Check(probe_fn)) {
+        Py_DECREF(probe_fn);
+        return -1;
+    }
+
+    ret = PyObject_CallFunction(probe_fn, "s", iface);
+    Py_DECREF(probe_fn);
+    if (ret == NULL) {
+        PyErr_Clear();
+        return -1;
+    }
+    if (!PyTuple_Check(ret) || PyTuple_Size(ret) < 2) {
+        Py_DECREF(ret);
+        return -1;
+    }
+
+    status_obj = PyTuple_GetItem(ret, 0); /* borrowed */
+    reason_obj = PyTuple_GetItem(ret, 1); /* borrowed */
+    if (status_obj != NULL && PyUnicode_Check(status_obj)) {
+        const char *tmp = PyUnicode_AsUTF8(status_obj);
+        if (tmp != NULL && tmp[0] != '\0') {
+            status_s = tmp;
+        } else {
+            PyErr_Clear();
+        }
+    }
+    if (reason_obj != NULL && PyUnicode_Check(reason_obj)) {
+        const char *tmp = PyUnicode_AsUTF8(reason_obj);
+        if (tmp != NULL && tmp[0] != '\0') {
+            reason_s = tmp;
+        } else {
+            PyErr_Clear();
+        }
+    }
+
+    if (status_out != NULL && status_out_len > 0) {
+        (void)snprintf(status_out, status_out_len, "%s", status_s);
+    }
+    if (reason_out != NULL && reason_out_len > 0) {
+        (void)snprintf(reason_out, reason_out_len, "%s", reason_s);
+    }
+
+    Py_DECREF(ret);
+    return 0;
 }
 
 static void _resolve_auto_backend(DpHandle *h) {
@@ -679,11 +770,16 @@ static PyObject *_run_xdp_backend(
     PyObject *out = NULL;
     char iface[IFNAMSIZ];
     char reason[96];
+    char probe_status[16];
+    char probe_reason[96];
+    int effective_mode = 0;
     long sent = 0;
     long errors;
 
     reason[0] = '\0';
     iface[0] = '\0';
+    probe_status[0] = '\0';
+    probe_reason[0] = '\0';
 
     xdp_mod = _import_cached(&h->xdp_mod, "ddos_samurai.xdp_sender");
     if (xdp_mod == NULL) {
@@ -700,8 +796,38 @@ static PyObject *_run_xdp_backend(
         return _build_result(count, 0, count, packet_size, target_ip, target_port, "DP_XDP_FAILED", "xdp_interface_missing", 1);
     }
 
+    effective_mode = h->xdp_mode;
+    if (!h->xdp_initialized && h->xdp_mode == 2) {
+        if (_probe_mode2_capability(h, iface, probe_status, sizeof(probe_status), probe_reason, sizeof(probe_reason)) < 0) {
+            (void)snprintf(probe_status, sizeof(probe_status), "%s", "unknown");
+            (void)snprintf(probe_reason, sizeof(probe_reason), "%s", "probe_unavailable");
+        }
+        (void)snprintf(h->xdp_mode2_probe_status, sizeof(h->xdp_mode2_probe_status), "%s", probe_status);
+        (void)snprintf(h->xdp_mode2_probe_reason, sizeof(h->xdp_mode2_probe_reason), "%s", probe_reason);
+
+        if (h->xdp_mode2_policy_hard) {
+            if (strcmp(probe_status, "supported") != 0) {
+                PyObject *hard_fail_out = NULL;
+                Py_DECREF(xdp_mod);
+                hard_fail_out = _build_result(
+                    count, 0, count, packet_size, target_ip, target_port,
+                    "DP_XDP_FAILED", "xdp_mode2_hard_probe_not_supported", 1
+                );
+                if (hard_fail_out != NULL) {
+                    if (_set_str(hard_fail_out, "sender_fallback_reason_detail", probe_reason) < 0) {
+                        Py_DECREF(hard_fail_out);
+                        return NULL;
+                    }
+                }
+                return hard_fail_out;
+            }
+        } else if (strcmp(probe_status, "unsupported") == 0) {
+            effective_mode = 1;
+        }
+    }
+
     if (!h->xdp_initialized) {
-        ret = PyObject_CallMethod(xdp_mod, "xdp_init", "sii", iface, h->queue_id, h->xdp_mode);
+        ret = PyObject_CallMethod(xdp_mod, "xdp_init", "sii", iface, h->queue_id, effective_mode);
         if (ret == NULL) {
             _capture_exception_type(reason, sizeof(reason), "xdp_init_failed");
             Py_DECREF(xdp_mod);
@@ -714,6 +840,7 @@ static PyObject *_run_xdp_backend(
         }
         Py_DECREF(ret);
         h->xdp_initialized = 1;
+        h->xdp_effective_mode = effective_mode;
     }
 
     ret = PyObject_CallMethod(xdp_mod, "xdp_send_buffer", "Oii", buffer_obj, packet_size, count);
@@ -755,6 +882,16 @@ static PyObject *_run_xdp_backend(
     );
     if (out == NULL) {
         Py_DECREF(xdp_mod);
+        return NULL;
+    }
+
+    if (_set_long(out, "xdp_mode_requested", h->xdp_mode) < 0 ||
+        _set_long(out, "xdp_mode_effective", h->xdp_effective_mode) < 0 ||
+        _set_str(out, "xdp_mode2_policy", h->xdp_mode2_policy) < 0 ||
+        _set_str(out, "xdp_mode2_probe_status", h->xdp_mode2_probe_status) < 0 ||
+        _set_str(out, "xdp_mode2_probe_reason", h->xdp_mode2_probe_reason) < 0) {
+        Py_DECREF(xdp_mod);
+        Py_DECREF(out);
         return NULL;
     }
 
@@ -1170,9 +1307,11 @@ static void _cleanup_handle(DpHandle *h) {
     }
 
     Py_XDECREF(h->xdp_mod);
+    Py_XDECREF(h->af_xdp_sender_mod);
     Py_XDECREF(h->fast_mod);
     Py_XDECREF(h->senders_mod);
     h->xdp_mod = NULL;
+    h->af_xdp_sender_mod = NULL;
     h->fast_mod = NULL;
     h->senders_mod = NULL;
     if (h->raw_sockfd >= 0) {
@@ -1217,6 +1356,8 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
     h->id = g_next_id++;
     h->queue_id = 0;
     h->xdp_mode = 0;
+    h->xdp_effective_mode = 0;
+    h->xdp_mode2_policy_hard = 0;
     h->xdp_enable = 0;
     h->xdp_initialized = 0;
     h->raw_sockfd = -1;
@@ -1231,7 +1372,10 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
 
     _copy_lower(h->backend, sizeof(h->backend), "auto", "auto");
     _copy_lower(h->fallback_policy, sizeof(h->fallback_policy), "allow", "allow");
+    _copy_lower(h->xdp_mode2_policy, sizeof(h->xdp_mode2_policy), "soft", "soft");
     _copy_lower(h->afpacket_hugepage_mode, sizeof(h->afpacket_hugepage_mode), "off", "off");
+    (void)snprintf(h->xdp_mode2_probe_status, sizeof(h->xdp_mode2_probe_status), "%s", "not_run");
+    (void)snprintf(h->xdp_mode2_probe_reason, sizeof(h->xdp_mode2_probe_reason), "%s", "not_run");
     h->interface[0] = '\0';
 
     if (PyDict_Check(cfg)) {
@@ -1243,6 +1387,12 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
         h->xdp_enable = _dict_bool(cfg, "xdp_enable", 0);
         h->xdp_mode = (int)_dict_long(cfg, "xdp_mode", 0);
         h->allow_python_fallback = _dict_bool(cfg, "allow_python_fallback", 0);
+        _copy_lower(
+            h->xdp_mode2_policy,
+            sizeof(h->xdp_mode2_policy),
+            _dict_cstr(cfg, "xdp_mode2_policy", "soft"),
+            "soft"
+        );
         _copy_lower(
             h->afpacket_hugepage_mode,
             sizeof(h->afpacket_hugepage_mode),
@@ -1265,6 +1415,10 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
     if (strcmp(core_mode, "required") == 0) {
         h->allow_python_fallback = 0;
     }
+    if (strcmp(h->xdp_mode2_policy, "hard") != 0 && strcmp(h->xdp_mode2_policy, "soft") != 0) {
+        (void)snprintf(h->xdp_mode2_policy, sizeof(h->xdp_mode2_policy), "%s", "soft");
+    }
+    h->xdp_mode2_policy_hard = (strcmp(h->xdp_mode2_policy, "hard") == 0) ? 1 : 0;
     if (strcmp(h->afpacket_hugepage_mode, "off") != 0 &&
         strcmp(h->afpacket_hugepage_mode, "auto") != 0 &&
         strcmp(h->afpacket_hugepage_mode, "required") != 0) {
@@ -1450,6 +1604,9 @@ static PyObject *dp_snapshot(PyObject *self, PyObject *args) {
         _set_long(out, "backend_fallback_batches", h->backend_fallback_batches) < 0 ||
         _set_str(out, "backend", h->backend) < 0 ||
         _set_str(out, "fallback_policy", h->fallback_policy) < 0 ||
+        _set_str(out, "xdp_mode2_policy", h->xdp_mode2_policy) < 0 ||
+        _set_str(out, "xdp_mode2_probe_status", h->xdp_mode2_probe_status) < 0 ||
+        _set_str(out, "xdp_mode2_probe_reason", h->xdp_mode2_probe_reason) < 0 ||
         _set_str(out, "interface", h->interface) < 0 ||
         _set_long(out, "queue_id", h->queue_id) < 0 ||
         _set_str(out, "afpacket_hugepage_mode", h->afpacket_hugepage_mode) < 0 ||
@@ -1460,6 +1617,8 @@ static PyObject *dp_snapshot(PyObject *self, PyObject *args) {
         _set_long(out, "afpacket_hugepage_effective", h->afpacket_hugepage_effective) < 0 ||
         _set_str(out, "afpacket_hugepage_reason", h->afpacket_hugepage_reason) < 0 ||
         _set_long(out, "xdp_enable", h->xdp_enable ? 1 : 0) < 0 ||
+        _set_long(out, "xdp_mode", h->xdp_mode) < 0 ||
+        _set_long(out, "xdp_effective_mode", h->xdp_effective_mode) < 0 ||
         _set_long(out, "xdp_initialized", h->xdp_initialized ? 1 : 0) < 0 ||
         _set_long(out, "closed", h->closed ? 1 : 0) < 0) {
         Py_DECREF(out);
