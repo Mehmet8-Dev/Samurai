@@ -23,6 +23,9 @@ class TestPacingWrapper(unittest.TestCase):
         self.assertIn("afpacket_hugepage_mode", out)
         self.assertIn("afpacket_hugepage_effective", out)
         self.assertIn("afpacket_ring_size_bytes", out)
+        self.assertIn("xdp_mode_requested", out)
+        self.assertIn("xdp_mode_effective", out)
+        self.assertIn("xdp_mode2_probe_status", out)
 
     def test_pacing_config_validate_enforces_mode_constraints(self):
         cfg = pacing.PacingConfig(
