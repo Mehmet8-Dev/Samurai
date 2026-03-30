@@ -69,6 +69,7 @@ async def xdp_sender(
     verbose: bool = False,
     interface: str = None,
     queue_id: int = 0,
+    xdp_mode: int = 0,
     batch_size: int = 64,
     sender_fallback_policy: str = "allow",
     fallback_backend: str = "python",
@@ -91,6 +92,7 @@ async def xdp_sender(
     """
     fallback_policy = resolve_sender_fallback_policy_fn(sender_fallback_policy)
     fallback_backend = resolve_sender_backend_fn(fallback_backend)
+    xdp_mode = int(xdp_mode or 0)
 
     async def _fallback(reason: str, details: str = "") -> dict:
         if details:
@@ -154,23 +156,91 @@ async def xdp_sender(
         pool_key="senders_xdp_tx",
         return_meta=True,
     )
+    first_packet = memoryview(packets_buffer)[:packet_size] if packet_size > 0 else memoryview(b"")
+    has_l2_ipv4 = (
+        packet_size >= 34
+        and ((int(first_packet[14]) >> 4) in (4, 6))
+    )
+    l3_only_candidate = (
+        packet_size >= 20
+        and ((int(first_packet[0]) >> 4) in (4, 6))
+        and not has_l2_ipv4
+    )
+    if l3_only_candidate:
+        return await _fallback(
+            reason="xdp_l2_header_missing",
+            details=(
+                "AF_XDP TX yolu Ethernet(L2) frame bekliyor; gelen buffer L3-only görünüyor. "
+                "Raw sender fallback uygulanıyor."
+            ),
+        )
 
     log_info(f"[XDP] Initializing AF_XDP sender for {target_ip}:{target_port}")
-    log_info(f"[XDP] Packets: {count}, Packet Size: {packet_size} bytes, Batch Size: {batch_size}")
+    log_info(
+        f"[XDP] Packets: {count}, Packet Size: {packet_size} bytes, "
+        f"Batch Size: {batch_size}, Mode: {xdp_mode}"
+    )
 
     total_sent = 0
     sender_path = "XDP_L2"
     fallback_reason = "none"
     fallback_count = 0
+    mode2_policy = "hard" if fallback_policy == "fail" else "soft"
+    persistent_sender = False
+    sender = None
 
     try:
-        sender = XDPSender(
-            interface=interface,
-            queue_id=int(queue_id or 0),
-            batch_size=batch_size,
-            auto_fallback=True,
-        )
-        sender.start()
+        if isinstance(sender_context, dict):
+            cached = sender_context.get("xdp_sender_instance")
+            cached_cfg = dict(sender_context.get("xdp_sender_cfg") or {})
+            wanted_cfg = {
+                "interface": str(interface or ""),
+                "queue_id": int(queue_id or 0),
+                "mode": int(xdp_mode or 0),
+                "batch_size": int(batch_size or 64),
+            }
+            if cached is not None and hasattr(cached, "is_running"):
+                if (
+                    cached_cfg.get("interface") == wanted_cfg["interface"]
+                    and int(cached_cfg.get("queue_id", -1)) == wanted_cfg["queue_id"]
+                    and int(cached_cfg.get("mode", -1)) == wanted_cfg["mode"]
+                    and int(cached_cfg.get("batch_size", -1)) == wanted_cfg["batch_size"]
+                ):
+                    sender = cached
+                    if not bool(getattr(sender, "is_running", False)):
+                        sender.start()
+                    persistent_sender = True
+                else:
+                    try:
+                        cached.stop()
+                    except Exception:
+                        pass
+                    sender_context.pop("xdp_sender_instance", None)
+                    sender_context.pop("xdp_sender_cfg", None)
+
+            if sender is None:
+                sender = XDPSender(
+                    interface=interface,
+                    queue_id=int(queue_id or 0),
+                    mode=int(xdp_mode or 0),
+                    batch_size=batch_size,
+                    auto_fallback=True,
+                    mode2_policy=mode2_policy,
+                )
+                sender.start()
+                sender_context["xdp_sender_instance"] = sender
+                sender_context["xdp_sender_cfg"] = wanted_cfg
+                persistent_sender = True
+        else:
+            sender = XDPSender(
+                interface=interface,
+                queue_id=int(queue_id or 0),
+                mode=int(xdp_mode or 0),
+                batch_size=batch_size,
+                auto_fallback=True,
+                mode2_policy=mode2_policy,
+            )
+            sender.start()
 
         if sender.is_using_xdp:
             log_info(f"[XDP] Using AF_XDP on interface: {sender.interface}")
@@ -180,7 +250,8 @@ async def xdp_sender(
             fallback_reason = "xdp_internal_fallback"
             fallback_count = 1
             if fallback_policy == "fail":
-                sender.stop()
+                if not persistent_sender:
+                    sender.stop()
                 return stats_fn(
                     attempted=count,
                     sent=0,
@@ -235,13 +306,19 @@ async def xdp_sender(
             f"{stats.packets_per_second:,.0f} pps, "
             f"{stats.mbps:.2f} Mbps"
         )
-        sender.stop()
+        if not persistent_sender:
+            sender.stop()
 
     except Exception as e:
         log_error(f"[XDP] Error: {e}")
         if verbose:
             import traceback
             traceback.print_exc()
+        if sender is not None and not persistent_sender:
+            try:
+                sender.stop()
+            except Exception:
+                pass
         return await _fallback(reason="xdp_runtime_error", details=f"Runtime error: {e}")
 
     return stats_fn(
@@ -259,4 +336,3 @@ async def xdp_sender(
         eagain_retry_count=0,
         partial_send_retry_count=0,
     )
-

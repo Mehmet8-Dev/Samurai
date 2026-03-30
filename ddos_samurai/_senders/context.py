@@ -17,4 +17,10 @@ def close_sender_context(sender_context: Dict[str, Any] | None) -> None:
             raw_sock.close()
         except Exception:
             pass
-
+    xdp_sender = sender_context.pop("xdp_sender_instance", None)
+    sender_context.pop("xdp_sender_cfg", None)
+    if xdp_sender is not None and hasattr(xdp_sender, "stop"):
+        try:
+            xdp_sender.stop()
+        except Exception:
+            pass

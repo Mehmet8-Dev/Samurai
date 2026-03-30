@@ -22,6 +22,7 @@ async def raw_socket_sender(
     xdp_enable: bool = False,
     xdp_interface: str | None = None,
     xdp_queue_id: int = 0,
+    xdp_mode: int = 0,
     *,
     resolve_sender_backend_fn,
     resolve_sender_fallback_policy_fn,
@@ -69,6 +70,7 @@ async def raw_socket_sender(
             verbose=verbose,
             interface=xdp_interface,
             queue_id=int(xdp_queue_id or 0),
+            xdp_mode=int(xdp_mode or 0),
             sender_fallback_policy=fallback_policy,
             fallback_backend="auto",
             sender_context=sender_context,
@@ -806,6 +808,7 @@ async def paced_raw_socket_sender(
     xdp_enable: bool = False,
     xdp_interface: str | None = None,
     xdp_queue_id: int = 0,
+    xdp_mode: int = 0,
     *,
     resolve_sender_backend_fn,
     resolve_sender_fallback_policy_fn,
@@ -864,7 +867,7 @@ async def paced_raw_socket_sender(
     if requested_backend == "xdp":
         if pacing_config is not None and int(getattr(pacing_config, "pacing_mode", 0) or 0) != 0:
             log_warning("[Pacing] sender-backend=xdp selected; C pacing is bypassed for this path.")
-        return await xdp_sender(
+        out = await xdp_sender(
             packets_buffer=packets_buffer,
             target_ip=target_ip,
             target_port=target_port,
@@ -872,10 +875,15 @@ async def paced_raw_socket_sender(
             verbose=verbose,
             interface=xdp_interface,
             queue_id=int(xdp_queue_id or 0),
+            xdp_mode=int(xdp_mode or 0),
             sender_fallback_policy=fallback_policy,
             fallback_backend="python",
             sender_context=sender_context,
         )
+        out = dict(out or {})
+        if pacing_config is not None and int(getattr(pacing_config, "pacing_mode", 0) or 0) != 0:
+            out["pacing_bypassed_for_xdp"] = 1
+        return out
 
     if pacing_config is None or pacing_config.pacing_mode == 0 or not PACING_ENGINE_AVAILABLE:
         return await raw_socket_sender(
@@ -894,6 +902,7 @@ async def paced_raw_socket_sender(
             xdp_enable=xdp_enable,
             xdp_interface=xdp_interface,
             xdp_queue_id=xdp_queue_id,
+            xdp_mode=xdp_mode,
         )
 
     packet_size = len(packets_buffer) // count if count > 0 else 0
@@ -1053,6 +1062,7 @@ async def paced_raw_socket_sender(
             xdp_enable=xdp_enable,
             xdp_interface=xdp_interface,
             xdp_queue_id=xdp_queue_id,
+            xdp_mode=xdp_mode,
         )
 
     try:
@@ -1125,6 +1135,7 @@ async def paced_raw_socket_sender(
             xdp_enable=xdp_enable,
             xdp_interface=xdp_interface,
             xdp_queue_id=xdp_queue_id,
+            xdp_mode=xdp_mode,
         )
         if progress_reported > 0:
             _update_live(live_progress, max(0, int(count) - int(progress_reported)))
@@ -1148,8 +1159,8 @@ async def paced_raw_socket_sender(
             xdp_enable=xdp_enable,
             xdp_interface=xdp_interface,
             xdp_queue_id=xdp_queue_id,
+            xdp_mode=xdp_mode,
         )
         if progress_reported > 0:
             _update_live(live_progress, max(0, int(count) - int(progress_reported)))
         return out
-
