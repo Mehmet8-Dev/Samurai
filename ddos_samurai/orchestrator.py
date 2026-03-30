@@ -1212,6 +1212,12 @@ async def worker_process(
                 return evt
 
             _state_engine_ready = False
+            _state_engine_mode = str(
+                args.get("engine_mode", os.environ.get("SAMURAI_STATE_ENGINE_MODE", "auto")) or "auto"
+            ).strip().lower()
+            if _state_engine_mode not in {"auto", "required"}:
+                _state_engine_mode = "auto"
+            _state_engine_required = _state_engine_mode == "required"
             _state_sweep_interval_s = max(
                 0.05,
                 float(int(args.get("state_sweep_interval_ms", 1000) or 1000)) / 1000.0,
@@ -1230,6 +1236,17 @@ async def worker_process(
                         _state_engine_ready = True
                     except Exception as e:
                         log_warning(f"[Worker {worker_id}] state engine configure failed: {e}")
+            elif _state_engine_required:
+                log_error(
+                    f"[Worker {worker_id}] state engine mode='required' but fast_sender extension is unavailable."
+                )
+                return
+
+            if _state_engine_required and not _state_engine_ready:
+                log_error(
+                    f"[Worker {worker_id}] state engine mode='required' and initialization failed; aborting worker."
+                )
+                return
 
             def _update_state_engine_stats():
                 nonlocal worker_stats
