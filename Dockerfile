@@ -42,9 +42,6 @@ COPY . .
 # Build C extensions in-place
 RUN python setup.py build_ext --inplace
 
-# Expose API port (dashboard currently calls http://localhost:5099)
-EXPOSE 5099
-
-# Run the API server
-# Using --proxy-headers not strictly necessary but good practice behind proxies/docker
-CMD ["uvicorn", "ddos_samurai.api:app", "--host", "0.0.0.0", "--port", "5099", "--proxy-headers"]
+# Default to CLI entrypoint for this repository profile.
+ENTRYPOINT ["python", "-m", "ddos_samurai.cli"]
+CMD ["--help"]
