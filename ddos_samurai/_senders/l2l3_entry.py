@@ -274,7 +274,27 @@ async def xdp_sender(
         )
 
         if sender.is_using_xdp and pacing_active:
-            sent = paced_send_xdp_fn(packets_buffer, packet_size, count, config=pacing_config)
+            # Prefer explicit iface/queue/mode for robust AF_XDP pacing integration.
+            # Keep backward compatibility with legacy callables that only accept
+            # (buffer, packet_size, count, config=...).
+            try:
+                sent = paced_send_xdp_fn(
+                    sender.interface,
+                    packets_buffer,
+                    packet_size,
+                    count,
+                    config=pacing_config,
+                    queue_id=int(queue_id or 0),
+                    xdp_mode=int(xdp_mode or 0),
+                    xdp_mode2_policy=mode2_policy,
+                )
+            except TypeError:
+                sent = paced_send_xdp_fn(
+                    packets_buffer,
+                    packet_size,
+                    count,
+                    config=pacing_config,
+                )
             total_sent = int(sent or 0)
             sender_path = "PACED_XDP"
         elif hasattr(sender, "send_buffer"):
