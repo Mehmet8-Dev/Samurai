@@ -50,6 +50,36 @@ class TestAfpacketHugepagePolicy(unittest.TestCase):
         self.assertEqual(out["sender_fallback_reason"], "afpacket_hugepage_required_not_met")
         self.assertGreaterEqual(int(out.get("fallback_count", 0) or 0), 1)
 
+    def test_dataplane_config_maps_mode2_policy_from_fallback_policy(self):
+        cfg_fail = dataplane.build_dataplane_config(
+            {
+                "sender_backend": "xdp",
+                "sender_fallback_policy": "fail",
+                "xdp_mode": 2,
+            }
+        )
+        self.assertEqual(cfg_fail.xdp_mode2_policy, "hard")
+
+        cfg_allow = dataplane.build_dataplane_config(
+            {
+                "sender_backend": "xdp",
+                "sender_fallback_policy": "allow",
+                "xdp_mode": 2,
+            }
+        )
+        self.assertEqual(cfg_allow.xdp_mode2_policy, "soft")
+
+    def test_dataplane_config_mode2_policy_invalid_value_is_normalized(self):
+        cfg = dataplane.build_dataplane_config(
+            {
+                "sender_backend": "xdp",
+                "sender_fallback_policy": "fail",
+                "xdp_mode": 2,
+                "xdp_mode2_policy": "invalid",
+            }
+        )
+        self.assertEqual(cfg.xdp_mode2_policy, "hard")
+
 
 if __name__ == "__main__":
     unittest.main()

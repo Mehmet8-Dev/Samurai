@@ -1,8 +1,8 @@
 import types
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from ddos_samurai.af_xdp_sender import XDPSender
+from ddos_samurai.af_xdp_sender import XDP_MODE_OFFLOAD, XDPSender
 
 
 class TestAFXDPZeroCopy(unittest.TestCase):
@@ -65,6 +65,44 @@ class TestAFXDPZeroCopy(unittest.TestCase):
             sender.submit_tx_frame(1, 64)
         with self.assertRaises(RuntimeError):
             sender.release_tx_frame(1)
+
+    def test_mode2_hard_policy_raises_when_probe_not_supported(self):
+        sender = XDPSender(
+            interface="lo",
+            mode=XDP_MODE_OFFLOAD,
+            auto_fallback=False,
+            mode2_policy="hard",
+            attach_bpf=False,
+        )
+        sender._check_requirements = Mock(return_value=(True, "ok"))
+        sender._probe_mode2_capability = Mock(return_value=("unsupported", "no hw offload"))
+        xdp_mod = Mock()
+        xdp_mod.xdp_init.return_value = True
+
+        with patch("ddos_samurai.af_xdp_sender._load_xdp_extension", return_value=xdp_mod):
+            with self.assertRaises(RuntimeError):
+                sender.start()
+
+        xdp_mod.xdp_init.assert_not_called()
+
+    def test_mode2_soft_policy_downgrades_to_native_mode(self):
+        sender = XDPSender(
+            interface="lo",
+            mode=XDP_MODE_OFFLOAD,
+            auto_fallback=False,
+            mode2_policy="soft",
+            attach_bpf=False,
+        )
+        sender._check_requirements = Mock(return_value=(True, "ok"))
+        sender._probe_mode2_capability = Mock(return_value=("unsupported", "no hw offload"))
+        xdp_mod = Mock()
+        xdp_mod.xdp_init.return_value = True
+
+        with patch("ddos_samurai.af_xdp_sender._load_xdp_extension", return_value=xdp_mod):
+            started = sender.start()
+
+        self.assertTrue(started)
+        xdp_mod.xdp_init.assert_called_once_with("lo", 0, 1)
 
 
 if __name__ == "__main__":

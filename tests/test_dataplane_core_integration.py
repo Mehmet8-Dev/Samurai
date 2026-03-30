@@ -74,3 +74,40 @@ class TestDataplaneCoreIntegration(unittest.TestCase):
         finally:
             dataplane_core.close(handle)
         self.assertNotEqual(str(snap.get("backend", "") or ""), "python")
+
+    def test_snapshot_exposes_xdp_mode2_policy_fields(self):
+        handle = dataplane_core.open(
+            {
+                "backend": "xdp",
+                "fallback_policy": "allow",
+                "xdp_enable": 1,
+                "interface": "lo",
+                "xdp_mode": 2,
+                "xdp_mode2_policy": "hard",
+            }
+        )
+        try:
+            snap = dict(dataplane_core.snapshot(handle) or {})
+        finally:
+            dataplane_core.close(handle)
+        self.assertEqual(str(snap.get("xdp_mode2_policy", "")), "hard")
+        self.assertEqual(int(snap.get("xdp_mode", 0) or 0), 2)
+        self.assertEqual(str(snap.get("xdp_mode2_probe_status", "")), "not_run")
+
+    def test_xdp_mode2_hard_fail_includes_detail(self):
+        handle = dataplane_core.open(
+            {
+                "backend": "xdp",
+                "fallback_policy": "fail",
+                "xdp_enable": 1,
+                "interface": "lo",
+                "xdp_mode": 2,
+                "xdp_mode2_policy": "hard",
+            }
+        )
+        try:
+            out = dict(dataplane_core.send_batch(handle, b"A", 1, 1, "127.0.0.1", 80) or {})
+        finally:
+            dataplane_core.close(handle)
+        self.assertEqual(str(out.get("sender_fallback_reason", "")), "xdp_mode2_hard_probe_not_supported")
+        self.assertIn("loopback", str(out.get("sender_fallback_reason_detail", "")).lower())

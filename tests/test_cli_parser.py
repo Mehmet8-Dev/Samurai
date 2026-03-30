@@ -131,6 +131,7 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--xdp-enable", opts)
         self.assertIn("--xdp-interface", opts)
         self.assertIn("--xdp-queue-id", opts)
+        self.assertIn("--xdp-mode", opts)
         self.assertIn("--kpi-gate-profile", opts)
         self.assertIn("--kpi-hard-fail", opts)
         self.assertIn("--l7-engine", opts)
@@ -189,6 +190,7 @@ class TestCliParser(unittest.TestCase):
         self.assertFalse(args.xdp_enable)
         self.assertEqual(args.xdp_interface, "")
         self.assertEqual(args.xdp_queue_id, 0)
+        self.assertEqual(args.xdp_mode, 0)
         self.assertEqual(args.kpi_gate_profile, "off")
         self.assertFalse(args.kpi_hard_fail)
         self.assertEqual(args.l7_engine, "python")
@@ -386,6 +388,11 @@ class TestSenderRouteValidation(unittest.TestCase):
         parser = cli.build_parser()
         args = parser.parse_args(["--xdp-enable"])
         self._assert_validation_fails(parser, args)
+
+    def test_xdp_mode_validation(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--xdp-mode", "2"])
+        cli._validate_sender_route_args(parser, args)
 
     def test_sender_fallback_fail_forbids_auto_backend(self):
         parser = cli.build_parser()
