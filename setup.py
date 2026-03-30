@@ -417,6 +417,20 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
 
 def get_extensions() -> List[Extension]:
     extensions: List[Extension] = []
+    l4se_std_flag = "-std=c++23" if _env_flag("SAMURAI_L4SE_CXX23", "0") else "-std=c++20"
+
+    l4_state_engine = Extension(
+        "ddos_samurai.l4.state_engine",
+        sources=[
+            "ddos_samurai/l4/state_engine_module.cpp",
+            "ddos_samurai/l4/l4_state_engine_ffi.cpp",
+            "ddos_samurai/l4/l4_state_engine_core.cpp",
+        ],
+        language="c++",
+        extra_compile_args=["-O2", "-Wall", "-fPIC", l4se_std_flag],
+        extra_link_args=["-lpthread", "-lm"],
+    )
+    extensions.append(l4_state_engine)
 
     fast_sender = Extension(
         "ddos_samurai.fast_sender",
