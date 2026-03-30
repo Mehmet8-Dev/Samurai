@@ -24,6 +24,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional
@@ -154,6 +155,12 @@ _PACER_STATS_DEFAULTS = {
     "afpacket_ring_block_size": 0,
     "afpacket_ring_block_nr": 0,
     "afpacket_ring_size_bytes": 0,
+    "xdp_mode_requested": 0,
+    "xdp_mode_effective": 0,
+    "xdp_mode2_policy": "soft",
+    "xdp_mode2_probe_status": "not_run",
+    "xdp_mode2_probe_reason": "not_run",
+    "xdp_sender_fallback_reason_detail": "",
     "syscall_overhead_ns": 0,
     "sleep_overhead_ns": 0,
     "spin_threshold_ns": 0,
@@ -171,6 +178,12 @@ def normalize_stats(stats: Optional[dict]) -> dict:
     out["txring_packet_version_name"] = str(out.get("txring_packet_version_name", "TPACKET_UNKNOWN") or "TPACKET_UNKNOWN")
     out["afpacket_hugepage_mode"] = str(out.get("afpacket_hugepage_mode", "off") or "off")
     out["afpacket_hugepage_reason"] = str(out.get("afpacket_hugepage_reason", "disabled") or "disabled")
+    out["xdp_mode2_policy"] = str(out.get("xdp_mode2_policy", "soft") or "soft")
+    out["xdp_mode2_probe_status"] = str(out.get("xdp_mode2_probe_status", "not_run") or "not_run")
+    out["xdp_mode2_probe_reason"] = str(out.get("xdp_mode2_probe_reason", "not_run") or "not_run")
+    out["xdp_sender_fallback_reason_detail"] = str(
+        out.get("xdp_sender_fallback_reason_detail", "") or ""
+    )
     hist = out.get("ipg_histogram")
     out["ipg_histogram"] = list(hist) if isinstance(hist, (list, tuple)) else []
     return out
@@ -234,19 +247,36 @@ def paced_send_l2(
 
 
 def paced_send_xdp(
-    buffer: bytes,
-    packet_size: int,
-    count: int,
+    *args,
     config: Optional[PacingConfig] = None,
+    iface: Optional[str] = None,
+    queue_id: int = 0,
+    xdp_mode: int = 0,
+    xdp_mode2_policy: str = "soft",
 ) -> int:
     """
     Send *count* packets via AF_XDP with deterministic pacing.
 
     Notes:
-        - Requires a pre-initialized ``xdp_sender`` session (``xdp_init`` called).
-        - This function paces transmission and delegates packet submission to
-          ``xdp_sender.xdp_send_buffer`` one packet at a time.
+        - Preferred call shape:
+          ``paced_send_xdp(iface, buffer, packet_size, count, ...)``
+        - Backward-compatible shape:
+          ``paced_send_xdp(buffer, packet_size, count, ...)``
+          (interface is then resolved from ``iface=...`` or env
+          ``SAMURAI_XDP_INTERFACE``).
     """
+    if len(args) == 4:
+        iface_arg, buffer, packet_size, count = args
+        if iface is None:
+            iface = str(iface_arg or "")
+    elif len(args) == 3:
+        buffer, packet_size, count = args
+    else:
+        raise TypeError(
+            "paced_send_xdp expects (iface, buffer, packet_size, count) "
+            "or (buffer, packet_size, count)"
+        )
+
     if config is None:
         config = PacingConfig()
     config.validate()
@@ -257,8 +287,23 @@ def paced_send_xdp(
 
     kw = config.as_kwargs()
     kw.pop("use_so_txtime", None)   # XDP path does not use SO_TXTIME
+
+    iface_raw = str(iface or "").strip()
+    if not iface_raw:
+        iface_raw = str(os.environ.get("SAMURAI_XDP_INTERFACE", "") or "").strip()
+    if not iface_raw:
+        raise ValueError("iface is required for paced_send_xdp")
+
+    kw.update(
+        queue_id=int(queue_id or 0),
+        xdp_mode=int(xdp_mode or 0),
+        xdp_mode2_policy=str(xdp_mode2_policy or "soft"),
+    )
     return _eng.paced_send_xdp(
-        buffer, int(packet_size), int(count),
+        iface_raw,
+        buffer,
+        int(packet_size),
+        int(count),
         **kw,
     )
 

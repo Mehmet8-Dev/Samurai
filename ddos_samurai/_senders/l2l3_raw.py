@@ -867,6 +867,20 @@ async def paced_raw_socket_sender(
     fallback_policy = _resolve_sender_fallback_policy(sender_fallback_policy)
 
     if requested_backend == "xdp":
+        def _xdp_pacing_v2_enabled() -> bool:
+            raw = str(os.environ.get("SAMURAI_XDP_PACING_V2", "0") or "0").strip().lower()
+            return raw not in {"0", "false", "no", "off", ""}
+
+        def _xdp_pacing_fail_reason(detail: str) -> str:
+            d = str(detail or "").strip().lower()
+            if "xdp_mode2_hard_probe_not_supported" in d:
+                return "xdp_mode2_hard_probe_not_supported"
+            if "xdp_init" in d:
+                return "xdp_init_failed"
+            if "xdp_send" in d:
+                return "xdp_send_failed"
+            return "xdp_paced_send_failed"
+
         pacing_active = (
             pacing_config is not None
             and int(getattr(pacing_config, "pacing_mode", 0) or 0) != 0
@@ -876,8 +890,235 @@ async def paced_raw_socket_sender(
             and PACING_ENGINE_AVAILABLE
             and callable(paced_send_xdp)
         )
+        pacing_v2_active = pacing_via_xdp and _xdp_pacing_v2_enabled()
+
+        if pacing_v2_active:
+            packet_size = len(packets_buffer) // count if count > 0 else 0
+            if packet_size == 0:
+                log_error("[Pacing][XDP] Invalid packet buffer (size=0)")
+                return _stats(
+                    attempted=count,
+                    sent=0,
+                    errors=count,
+                    sender_fallback_reason="invalid_packet_buffer",
+                    sender_backend_requested=requested_backend,
+                    sender_fallback_policy=fallback_policy,
+                    buffer_copy_count=0,
+                    buffer_copy_bytes=0,
+                    eagain_retry_count=0,
+                    partial_send_retry_count=0,
+                )
+
+            packets_buffer, normalize_meta = _normalize_packets_buffer(
+                packets_buffer,
+                required_bytes=packet_size * count,
+                pool_key="senders_pacing_xdp_tx",
+                return_meta=True,
+            )
+            buffer_copy_count = int(normalize_meta.get("buffer_copy_count", 0) or 0)
+            buffer_copy_bytes = int(normalize_meta.get("buffer_copy_bytes", 0) or 0)
+
+            iface = str(xdp_interface or "").strip()
+            if not iface:
+                try:
+                    iface, _gw_mac = get_gateway_info(target_ip)
+                    iface = str(iface or "").strip()
+                except Exception:
+                    iface = ""
+
+            if callable(reset_stats):
+                try:
+                    reset_stats()
+                except Exception:
+                    pass
+
+            if not iface:
+                reason = "xdp_interface_unresolved"
+                detail = "could not resolve interface for paced XDP path"
+                if fallback_policy == "fail":
+                    return _stats(
+                        attempted=count,
+                        sent=0,
+                        errors=count,
+                        sender_path="XDP_UNAVAILABLE",
+                        fallback_count=1,
+                        sender_fallback_reason=reason,
+                        sender_fallback_reason_detail=detail,
+                        sender_backend_requested="xdp",
+                        sender_fallback_policy=fallback_policy,
+                        buffer_copy_count=buffer_copy_count,
+                        buffer_copy_bytes=buffer_copy_bytes,
+                        eagain_retry_count=0,
+                        partial_send_retry_count=0,
+                    )
+                out = await xdp_sender(
+                    packets_buffer=packets_buffer,
+                    target_ip=target_ip,
+                    target_port=target_port,
+                    count=count,
+                    verbose=verbose,
+                    interface=xdp_interface,
+                    queue_id=int(xdp_queue_id or 0),
+                    xdp_mode=int(xdp_mode or 0),
+                    sender_fallback_policy=fallback_policy,
+                    fallback_backend="python",
+                    sender_context=sender_context,
+                    pacing_config=None,
+                    paced_send_xdp_fn=None,
+                )
+                out = dict(out or {})
+                out["fallback_count"] = int(out.get("fallback_count", 0) or 0) + 1
+                existing_reason = str(out.get("sender_fallback_reason", "none") or "none").strip().lower()
+                if existing_reason in {"", "none"}:
+                    out["sender_fallback_reason"] = reason
+                out["sender_fallback_reason_detail"] = detail
+                return out
+
+            mode2_policy = "hard" if fallback_policy == "fail" else "soft"
+            progress_reported = 0
+
+            send_call = lambda: paced_send_xdp(
+                iface,
+                packets_buffer,
+                packet_size,
+                count,
+                config=pacing_config,
+                queue_id=int(xdp_queue_id or 0),
+                xdp_mode=int(xdp_mode or 0),
+                xdp_mode2_policy=mode2_policy,
+            )
+
+            try:
+                if callable(_run_paced_send_with_live_progress):
+                    total_sent, progress_reported = await _run_paced_send_with_live_progress(
+                        send_call,
+                        pacing_config=pacing_config,
+                        progress_budget=count,
+                        live_progress=live_progress,
+                    )
+                else:
+                    total_sent = int(send_call() or 0)
+            except _PacedSendRuntimeError as exc:
+                progress_reported = int(getattr(exc, "progress_emitted", 0) or 0)
+                _update_live(live_sent, progress_reported)
+                _update_live(live_errors, max(0, count - progress_reported))
+                detail = str(getattr(exc, "cause", exc) or exc)
+                reason = _xdp_pacing_fail_reason(detail)
+                if fallback_policy == "fail":
+                    return _stats(
+                        attempted=count,
+                        sent=progress_reported,
+                        errors=max(0, count - progress_reported),
+                        bytes_sent_est=progress_reported * packet_size,
+                        sender_path="PACED_XDP",
+                        fallback_count=1,
+                        sender_fallback_reason=reason,
+                        sender_fallback_reason_detail=detail,
+                        sender_backend_requested="xdp",
+                        sender_fallback_policy=fallback_policy,
+                        buffer_copy_count=buffer_copy_count,
+                        buffer_copy_bytes=buffer_copy_bytes,
+                        eagain_retry_count=0,
+                        partial_send_retry_count=0,
+                    )
+                out = await xdp_sender(
+                    packets_buffer=packets_buffer,
+                    target_ip=target_ip,
+                    target_port=target_port,
+                    count=count,
+                    verbose=verbose,
+                    interface=iface,
+                    queue_id=int(xdp_queue_id or 0),
+                    xdp_mode=int(xdp_mode or 0),
+                    sender_fallback_policy=fallback_policy,
+                    fallback_backend="python",
+                    sender_context=sender_context,
+                    pacing_config=None,
+                    paced_send_xdp_fn=None,
+                )
+                out = dict(out or {})
+                out["fallback_count"] = int(out.get("fallback_count", 0) or 0) + 1
+                existing_reason = str(out.get("sender_fallback_reason", "none") or "none").strip().lower()
+                if existing_reason in {"", "none"}:
+                    out["sender_fallback_reason"] = reason
+                out["sender_fallback_reason_detail"] = detail
+                return out
+            except Exception as exc:
+                detail = str(exc)
+                reason = _xdp_pacing_fail_reason(detail)
+                _update_live(live_sent, progress_reported)
+                _update_live(live_errors, max(0, count - progress_reported))
+                if fallback_policy == "fail":
+                    return _stats(
+                        attempted=count,
+                        sent=progress_reported,
+                        errors=max(0, count - progress_reported),
+                        bytes_sent_est=progress_reported * packet_size,
+                        sender_path="PACED_XDP",
+                        fallback_count=1,
+                        sender_fallback_reason=reason,
+                        sender_fallback_reason_detail=detail,
+                        sender_backend_requested="xdp",
+                        sender_fallback_policy=fallback_policy,
+                        buffer_copy_count=buffer_copy_count,
+                        buffer_copy_bytes=buffer_copy_bytes,
+                        eagain_retry_count=0,
+                        partial_send_retry_count=0,
+                    )
+                out = await xdp_sender(
+                    packets_buffer=packets_buffer,
+                    target_ip=target_ip,
+                    target_port=target_port,
+                    count=count,
+                    verbose=verbose,
+                    interface=iface,
+                    queue_id=int(xdp_queue_id or 0),
+                    xdp_mode=int(xdp_mode or 0),
+                    sender_fallback_policy=fallback_policy,
+                    fallback_backend="python",
+                    sender_context=sender_context,
+                    pacing_config=None,
+                    paced_send_xdp_fn=None,
+                )
+                out = dict(out or {})
+                out["fallback_count"] = int(out.get("fallback_count", 0) or 0) + 1
+                existing_reason = str(out.get("sender_fallback_reason", "none") or "none").strip().lower()
+                if existing_reason in {"", "none"}:
+                    out["sender_fallback_reason"] = reason
+                out["sender_fallback_reason_detail"] = detail
+                return out
+
+            _update_live(live_sent, total_sent)
+            _update_live(live_errors, max(0, count - total_sent))
+            out = _stats(
+                attempted=count,
+                sent=total_sent,
+                errors=max(0, count - total_sent),
+                bytes_sent_est=total_sent * packet_size,
+                sender_path="PACED_XDP",
+                sender_backend_requested=requested_backend,
+                sender_fallback_policy=fallback_policy,
+                fallback_count=0,
+                sender_fallback_reason="none",
+                buffer_copy_count=buffer_copy_count,
+                buffer_copy_bytes=buffer_copy_bytes,
+                eagain_retry_count=0,
+                partial_send_retry_count=0,
+            )
+            if callable(get_stats):
+                try:
+                    stats = get_stats()
+                    if stats:
+                        out = _apply_pacing_stats(out, stats)
+                except Exception:
+                    pass
+            return out
+
         if pacing_active and not pacing_via_xdp:
             log_warning("[Pacing] sender-backend=xdp selected; C pacing is bypassed for this path.")
+        elif pacing_active and not pacing_v2_active:
+            log_info("[Pacing][XDP] SAMURAI_XDP_PACING_V2=0, legacy XDP pacing route active.")
+
         if pacing_via_xdp and callable(reset_stats):
             try:
                 reset_stats()

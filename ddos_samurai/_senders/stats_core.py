@@ -279,6 +279,14 @@ def _apply_pacing_stats(out: dict, stats: dict | None) -> dict:
     d["afpacket_ring_block_size"] = int(st.get("afpacket_ring_block_size", 0) or 0)
     d["afpacket_ring_block_nr"] = int(st.get("afpacket_ring_block_nr", 0) or 0)
     d["afpacket_ring_size_bytes"] = int(st.get("afpacket_ring_size_bytes", 0) or 0)
+    d["xdp_mode_requested"] = int(st.get("xdp_mode_requested", 0) or 0)
+    d["xdp_mode_effective"] = int(st.get("xdp_mode_effective", 0) or 0)
+    d["xdp_mode2_policy"] = str(st.get("xdp_mode2_policy", "soft") or "soft")
+    d["xdp_mode2_probe_status"] = str(st.get("xdp_mode2_probe_status", "not_run") or "not_run")
+    d["xdp_mode2_probe_reason"] = str(st.get("xdp_mode2_probe_reason", "not_run") or "not_run")
+    d["xdp_sender_fallback_reason_detail"] = str(
+        st.get("xdp_sender_fallback_reason_detail", "") or ""
+    )
     if (
         str(d.get("afpacket_hugepage_mode", "off") or "off").strip().lower() == "required"
         and int(d.get("afpacket_hugepage_effective", 0) or 0) <= 0
