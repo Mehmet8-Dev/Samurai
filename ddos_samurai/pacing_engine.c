@@ -50,6 +50,8 @@
 #include <sys/mman.h>
 #include <poll.h>
 
+#include "xdp_core.h"
+
 /* ========================================================================== */
 /* Constants                                                                  */
 /* ========================================================================== */
@@ -306,6 +308,12 @@ typedef struct {
     uint64_t afpacket_ring_block_nr;
     uint64_t afpacket_ring_size_bytes;
     char     afpacket_hugepage_reason[96];
+    int      xdp_mode_requested;
+    int      xdp_mode_effective;
+    char     xdp_mode2_policy[8];
+    char     xdp_mode2_probe_status[16];
+    char     xdp_mode2_probe_reason[96];
+    char     xdp_sender_fallback_reason_detail[160];
 
     /* calibration */
     uint64_t syscall_overhead_ns;
@@ -638,6 +646,17 @@ static void stats_reset(double target_rps)
     g_stats.afpacket_ring_block_nr = 0ULL;
     g_stats.afpacket_ring_size_bytes = 0ULL;
     (void)snprintf(g_stats.afpacket_hugepage_reason, sizeof(g_stats.afpacket_hugepage_reason), "%s", "disabled");
+    g_stats.xdp_mode_requested = 0;
+    g_stats.xdp_mode_effective = 0;
+    (void)snprintf(g_stats.xdp_mode2_policy, sizeof(g_stats.xdp_mode2_policy), "%s", "soft");
+    (void)snprintf(g_stats.xdp_mode2_probe_status, sizeof(g_stats.xdp_mode2_probe_status), "%s", "not_run");
+    (void)snprintf(g_stats.xdp_mode2_probe_reason, sizeof(g_stats.xdp_mode2_probe_reason), "%s", "not_run");
+    (void)snprintf(
+        g_stats.xdp_sender_fallback_reason_detail,
+        sizeof(g_stats.xdp_sender_fallback_reason_detail),
+        "%s",
+        "none"
+    );
     g_stats.syscall_overhead_ns = g_calib_syscall_overhead_ns;
     g_stats.sleep_overhead_ns = g_calib_sleep_overhead_ns;
 }
@@ -1815,25 +1834,30 @@ static PyObject *py_paced_send_l2(PyObject *self,
 
 /* ========================================================================== */
 /* Python: paced_send_xdp                                                     */
-/*   Paced sender that drives pre-initialized AF_XDP xdp_send_buffer()       */
+/*   Paced sender that uses xdp_core-managed AF_XDP open/send/close          */
 /* ========================================================================== */
 
 PyDoc_STRVAR(doc_paced_send_xdp,
-"paced_send_xdp(buffer, packet_size, count, *,\n"
+"paced_send_xdp(iface, buffer, packet_size, count, *,\n"
+"               queue_id=0, xdp_mode=0, xdp_mode2_policy='soft',\n"
 "               target_rps=0, ipg_ns=0, burst_size=1, burst_gap_ns=0,\n"
 "               jitter_model=0, jitter_pct=0.0, pacing_mode=0,\n"
 "               pin_cpu=-1) -> int\n"
 "\n"
 "Paced sender for AF_XDP path.\n"
-"Requires xdp_sender.xdp_init() to be active beforehand.\n");
+"Opens/closes an AF_XDP session via xdp_core for this send.\n");
 
 static PyObject *py_paced_send_xdp(PyObject *self,
                                    PyObject *args,
                                    PyObject *kw)
 {
     (void)self;
+    const char *iface = NULL;
     Py_buffer view;
     int packet_size, count;
+    int queue_id = 0;
+    int xdp_mode = 0;
+    const char *xdp_mode2_policy = "soft";
 
     double  target_rps   = 0.0;
     int64_t ipg_ns       = 0;
@@ -1845,15 +1869,17 @@ static PyObject *py_paced_send_xdp(PyObject *self,
     int     pin_cpu      = -1;
 
     static char *kwl[] = {
-        "buffer", "packet_size", "count",
+        "iface", "buffer", "packet_size", "count",
+        "queue_id", "xdp_mode", "xdp_mode2_policy",
         "target_rps", "ipg_ns", "burst_size", "burst_gap_ns",
         "jitter_model", "jitter_pct", "pacing_mode",
         "pin_cpu", NULL
     };
 
     if (!PyArg_ParseTupleAndKeywords(
-            args, kw, "y*ii|dLiLidii", kwl,
-            &view, &packet_size, &count,
+            args, kw, "sy*ii|iisdLiLidii", kwl,
+            &iface, &view, &packet_size, &count,
+            &queue_id, &xdp_mode, &xdp_mode2_policy,
             &target_rps, &ipg_ns, &burst_size, &burst_gap_ns,
             &jitter_model, &jitter_pct, &pacing_mode, &pin_cpu))
         return NULL;
@@ -1882,36 +1908,6 @@ static PyObject *py_paced_send_xdp(PyObject *self,
         sched_setscheduler(0, SCHED_FIFO, &sp);
     }
 
-    PyObject *xdp_mod = PyImport_ImportModule("ddos_samurai.xdp_sender");
-    if (!xdp_mod) {
-        PyErr_Clear();
-        xdp_mod = PyImport_ImportModule("xdp_sender");
-    }
-    if (!xdp_mod) {
-        PyBuffer_Release(&view);
-        PyErr_SetString(PyExc_RuntimeError, "xdp_sender module not importable");
-        return NULL;
-    }
-
-    PyObject *send_buffer_fn = PyObject_GetAttrString(xdp_mod, "xdp_send_buffer");
-    Py_DECREF(xdp_mod);
-    if (!send_buffer_fn || !PyCallable_Check(send_buffer_fn)) {
-        Py_XDECREF(send_buffer_fn);
-        PyBuffer_Release(&view);
-        PyErr_SetString(PyExc_RuntimeError, "xdp_sender.xdp_send_buffer unavailable");
-        return NULL;
-    }
-
-    PyObject *py_packet_size = PyLong_FromLong(packet_size);
-    PyObject *py_one = PyLong_FromLong(1);
-    if (!py_packet_size || !py_one) {
-        Py_XDECREF(py_packet_size);
-        Py_XDECREF(py_one);
-        Py_DECREF(send_buffer_fn);
-        PyBuffer_Release(&view);
-        return PyErr_NoMemory();
-    }
-
     uint64_t eff_ipg = 0;
     if      (pacing_mode == PACING_IPG   && ipg_ns > 0)    eff_ipg = (uint64_t)ipg_ns;
     else if (pacing_mode == PACING_RPS   && target_rps > 0) eff_ipg = (uint64_t)(1e9 / target_rps);
@@ -1927,21 +1923,115 @@ static PyObject *py_paced_send_xdp(PyObject *self,
 
     rng_seed();
 
+    xdp_core_handle *xh = NULL;
+    xdp_core_open_cfg xcfg;
+    xdp_core_err xerr;
+    xdp_probe_result xprobe;
+    int stats_locked = 0;
+    int batch_target = 8;
+    int batch_min = 1;
+    int batch_max = 64;
+    const char *batch_env = getenv("SAMURAI_XDP_PACING_BATCH_INITIAL");
+
     int total_sent = 0;
     int burst_ctr = 0;
     int burst_limit = burst_size > 0 ? burst_size : 1;
-    int stats_locked = 0;
+    uint64_t t_start;
+    uint64_t t_last;
+    uint64_t t_deadline;
+    uint64_t t_burst_deadline;
+
+    memset(&xcfg, 0, sizeof(xcfg));
+    memset(&xerr, 0, sizeof(xerr));
+    memset(&xprobe, 0, sizeof(xprobe));
+    xcfg.interface = iface;
+    xcfg.queue_id = queue_id;
+    xcfg.mode = xdp_mode;
+    xcfg.mode2_policy = xdp_mode2_policy;
+    xcfg.need_wakeup = 1;
+    xcfg.batch_size = batch_target;
+
+    if (batch_env && batch_env[0]) {
+        long raw = strtol(batch_env, NULL, 10);
+        if (raw >= batch_min && raw <= batch_max) {
+            batch_target = (int)raw;
+        }
+    }
+    xcfg.batch_size = batch_target;
 
     pthread_mutex_lock(&g_stats_lock);
     stats_locked = 1;
     stats_reset(stats_target_rps);
+    g_stats.xdp_mode_requested = xdp_mode;
+    g_stats.xdp_mode_effective = xdp_mode;
+    (void)snprintf(g_stats.xdp_mode2_policy, sizeof(g_stats.xdp_mode2_policy), "%s", xdp_mode2_policy ? xdp_mode2_policy : "soft");
+    (void)snprintf(g_stats.xdp_mode2_probe_status, sizeof(g_stats.xdp_mode2_probe_status), "%s", "not_run");
+    (void)snprintf(g_stats.xdp_mode2_probe_reason, sizeof(g_stats.xdp_mode2_probe_reason), "%s", "not_run");
+    (void)snprintf(
+        g_stats.xdp_sender_fallback_reason_detail,
+        sizeof(g_stats.xdp_sender_fallback_reason_detail),
+        "%s",
+        "none"
+    );
+    pthread_mutex_unlock(&g_stats_lock);
+    stats_locked = 0;
 
-    uint64_t t_start = time_ns();
-    uint64_t t_last = t_start;
-    uint64_t t_deadline = t_start;
-    uint64_t t_burst_deadline = t_start;
+    if (!iface || !iface[0]) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "iface is required for paced_send_xdp");
+        return NULL;
+    }
 
-    for (int i = 0; i < count; i++) {
+    if (xdp_mode == 2) {
+        if (xdp_core_probe_mode2(iface, &xprobe, NULL) == 0) {
+            pthread_mutex_lock(&g_stats_lock);
+            stats_locked = 1;
+            (void)snprintf(g_stats.xdp_mode2_probe_status, sizeof(g_stats.xdp_mode2_probe_status), "%s", xprobe.status);
+            (void)snprintf(g_stats.xdp_mode2_probe_reason, sizeof(g_stats.xdp_mode2_probe_reason), "%s", xprobe.reason);
+            pthread_mutex_unlock(&g_stats_lock);
+            stats_locked = 0;
+        }
+    }
+
+    xh = xdp_core_open(&xcfg, &xerr);
+    if (!xh) {
+        pthread_mutex_lock(&g_stats_lock);
+        stats_locked = 1;
+        if (xerr.message[0]) {
+            (void)snprintf(
+                g_stats.xdp_sender_fallback_reason_detail,
+                sizeof(g_stats.xdp_sender_fallback_reason_detail),
+                "%s",
+                xerr.message
+            );
+        }
+        g_stats.elapsed_ns = 0.0;
+        stats_finalize();
+        pthread_mutex_unlock(&g_stats_lock);
+        stats_locked = 0;
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, xerr.message[0] ? xerr.message : "xdp_core_open_failed");
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_stats_lock);
+    stats_locked = 1;
+    g_stats.xdp_mode_requested = xdp_core_mode_requested(xh);
+    g_stats.xdp_mode_effective = xdp_core_mode_effective(xh);
+    (void)snprintf(g_stats.xdp_mode2_policy, sizeof(g_stats.xdp_mode2_policy), "%s", xdp_core_mode2_policy(xh));
+    (void)snprintf(g_stats.xdp_mode2_probe_status, sizeof(g_stats.xdp_mode2_probe_status), "%s", xdp_core_mode2_probe_status(xh));
+    (void)snprintf(g_stats.xdp_mode2_probe_reason, sizeof(g_stats.xdp_mode2_probe_reason), "%s", xdp_core_mode2_probe_reason(xh));
+
+    t_start = time_ns();
+    t_last = t_start;
+    t_deadline = t_start;
+    t_burst_deadline = t_start;
+
+    for (int i = 0; i < count;) {
+        int want = 1;
+        int sent = 0;
+        uint64_t t_pre = 0;
+
         switch (pacing_mode) {
         case PACING_IPG:
             if (i > 0) {
@@ -1969,7 +2059,6 @@ static PyObject *py_paced_send_xdp(PyObject *self,
             }
             break;
         case PACING_BURST:
-            burst_ctr++;
             if (burst_ctr >= burst_limit && burst_gap_ns > 0) {
                 burst_ctr = 0;
                 int64_t j = calc_jitter_ns((uint64_t)burst_gap_ns, jitter_model, jitter_pct);
@@ -1982,59 +2071,100 @@ static PyObject *py_paced_send_xdp(PyObject *self,
             break;
         }
 
-        uint64_t t_pre = time_ns();
-        char *pkt_ptr = (char *)view.buf + ((size_t)i * (size_t)packet_size);
-        PyObject *pkt_view = PyMemoryView_FromMemory(pkt_ptr, (Py_ssize_t)packet_size, PyBUF_READ);
-        if (!pkt_view) {
-            goto error;
+        if (pacing_mode == PACING_NONE) {
+            want = batch_target;
+        } else if (pacing_mode == PACING_BURST) {
+            int remaining = burst_limit - burst_ctr;
+            if (remaining < 1) remaining = 1;
+            want = remaining < batch_target ? remaining : batch_target;
+        } else if ((pacing_mode == PACING_IPG || pacing_mode == PACING_RPS) &&
+                   eff_ipg > 0 && eff_ipg <= 10000ULL) {
+            want = batch_target;
+        } else {
+            want = 1;
         }
+        if (want < batch_min) want = batch_min;
+        if (want > batch_max) want = batch_max;
+        if (i + want > count) want = count - i;
 
-        PyObject *ret = PyObject_CallFunctionObjArgs(
-            send_buffer_fn, pkt_view, py_packet_size, py_one, NULL
+        t_pre = time_ns();
+        sent = xdp_core_send_buffer(
+            xh,
+            (const uint8_t *)view.buf + ((size_t)i * (size_t)packet_size),
+            packet_size,
+            want,
+            &xerr
         );
-        Py_DECREF(pkt_view);
-
-        if (!ret) {
+        if (sent < 0) {
+            (void)snprintf(
+                g_stats.xdp_sender_fallback_reason_detail,
+                sizeof(g_stats.xdp_sender_fallback_reason_detail),
+                "%s",
+                xerr.message[0] ? xerr.message : "xdp_send_failed"
+            );
+            PyErr_SetString(PyExc_RuntimeError, xerr.message[0] ? xerr.message : "xdp_send_failed");
+            goto error;
+        }
+        if (sent <= 0) {
+            (void)snprintf(
+                g_stats.xdp_sender_fallback_reason_detail,
+                sizeof(g_stats.xdp_sender_fallback_reason_detail),
+                "%s",
+                "xdp_send_zero_progress"
+            );
+            PyErr_SetString(PyExc_RuntimeError, "xdp_send_zero_progress");
             goto error;
         }
 
-        long sent = PyLong_AsLong(ret);
-        Py_DECREF(ret);
-        if (sent == -1 && PyErr_Occurred()) {
-            goto error;
-        }
+        total_sent += sent;
+        g_stats.total_packets += (uint64_t)sent;
+        g_stats.total_bytes += (uint64_t)packet_size * (uint64_t)sent;
 
-        if (sent > 0) {
-            total_sent++;
-            g_stats.total_packets++;
-            g_stats.total_bytes += (uint64_t)packet_size;
-            if (total_sent > 1) {
-                uint64_t actual_ipg = t_pre - t_last;
-                stats_record_ipg(actual_ipg, eff_ipg);
+        if (total_sent > sent) {
+            uint64_t actual_ipg = t_pre - t_last;
+            stats_record_ipg(actual_ipg, eff_ipg);
+        }
+        if (eff_ipg > 0 && sent > 1) {
+            for (int k = 1; k < sent; k++) {
+                stats_record_ipg(eff_ipg, eff_ipg);
             }
+            t_last = t_pre + ((uint64_t)(sent - 1) * eff_ipg);
+        } else {
             t_last = t_pre;
         }
+
+        if (pacing_mode == PACING_BURST) {
+            burst_ctr += sent;
+            if (burst_ctr > burst_limit) burst_ctr = burst_limit;
+        }
+
+        if (sent == want && want == batch_target && batch_target < batch_max) {
+            batch_target++;
+        } else if (sent < want && batch_target > batch_min) {
+            batch_target /= 2;
+            if (batch_target < batch_min) batch_target = batch_min;
+        }
+
+        i += sent;
     }
 
     g_stats.elapsed_ns = (double)(time_ns() - t_start);
     stats_finalize();
     pthread_mutex_unlock(&g_stats_lock);
 
-    Py_DECREF(py_one);
-    Py_DECREF(py_packet_size);
-    Py_DECREF(send_buffer_fn);
     PyBuffer_Release(&view);
+    xdp_core_close(xh, NULL);
 
     return PyLong_FromLong(total_sent);
 
 error:
-    g_stats.elapsed_ns = (double)(time_ns() - t_start);
+    if (xdp_core_mode_requested(xh) >= 0) {
+        g_stats.elapsed_ns = (double)(time_ns() - t_start);
+    }
     stats_finalize();
     if (stats_locked) pthread_mutex_unlock(&g_stats_lock);
-    Py_DECREF(py_one);
-    Py_DECREF(py_packet_size);
-    Py_DECREF(send_buffer_fn);
     PyBuffer_Release(&view);
+    xdp_core_close(xh, NULL);
     return NULL;
 }
 
@@ -2065,6 +2195,9 @@ PyDoc_STRVAR(doc_get_stats,
 "afpacket_prefault_pages, afpacket_smaps_kernel_page_kb,\n"
 "afpacket_smaps_anon_hugepages_kb, afpacket_ring_block_size,\n"
 "afpacket_ring_block_nr, afpacket_ring_size_bytes,\n"
+"xdp_mode_requested, xdp_mode_effective, xdp_mode2_policy,\n"
+"xdp_mode2_probe_status, xdp_mode2_probe_reason,\n"
+"xdp_sender_fallback_reason_detail,\n"
 "syscall_overhead_ns, sleep_overhead_ns, spin_threshold_ns,\n"
 "ipg_histogram (list of 128 bin counts, 500 ns/bin).\n");
 
@@ -2207,6 +2340,12 @@ static PyObject *py_get_pacing_stats(PyObject *self, PyObject *args)
     SET_U64("afpacket_ring_block_size", snap.afpacket_ring_block_size);
     SET_U64("afpacket_ring_block_nr", snap.afpacket_ring_block_nr);
     SET_U64("afpacket_ring_size_bytes", snap.afpacket_ring_size_bytes);
+    SET_I64("xdp_mode_requested", snap.xdp_mode_requested);
+    SET_I64("xdp_mode_effective", snap.xdp_mode_effective);
+    SET_STR("xdp_mode2_policy", snap.xdp_mode2_policy);
+    SET_STR("xdp_mode2_probe_status", snap.xdp_mode2_probe_status);
+    SET_STR("xdp_mode2_probe_reason", snap.xdp_mode2_probe_reason);
+    SET_STR("xdp_sender_fallback_reason_detail", snap.xdp_sender_fallback_reason_detail);
 
     SET_U64("syscall_overhead_ns", snap.syscall_overhead_ns);
     SET_U64("sleep_overhead_ns", snap.sleep_overhead_ns);

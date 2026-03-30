@@ -442,7 +442,10 @@ def get_extensions() -> List[Extension]:
 
     pacing_engine = Extension(
         "ddos_samurai.pacing_engine",
-        sources=["ddos_samurai/pacing_engine.c"],
+        sources=[
+            "ddos_samurai/pacing_engine.c",
+            "ddos_samurai/xdp_core.c",
+        ],
         extra_compile_args=["-O2", "-Wall", "-fPIC"],
         extra_link_args=["-lpthread", "-lm"],
     )
