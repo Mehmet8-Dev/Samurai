@@ -828,6 +828,7 @@ async def paced_raw_socket_sender(
     PACING_ENGINE_AVAILABLE_flag,
     reset_stats_fn,
     paced_send_l2_fn,
+    paced_send_xdp_fn,
     paced_send_fn,
     get_stats_fn,
     format_stats_fn,
@@ -854,6 +855,7 @@ async def paced_raw_socket_sender(
     PACING_ENGINE_AVAILABLE = bool(PACING_ENGINE_AVAILABLE_flag)
     reset_stats = reset_stats_fn
     paced_send_l2 = paced_send_l2_fn
+    paced_send_xdp = paced_send_xdp_fn
     paced_send = paced_send_fn
     get_stats = get_stats_fn
     format_stats = format_stats_fn
@@ -865,8 +867,22 @@ async def paced_raw_socket_sender(
     fallback_policy = _resolve_sender_fallback_policy(sender_fallback_policy)
 
     if requested_backend == "xdp":
-        if pacing_config is not None and int(getattr(pacing_config, "pacing_mode", 0) or 0) != 0:
+        pacing_active = (
+            pacing_config is not None
+            and int(getattr(pacing_config, "pacing_mode", 0) or 0) != 0
+        )
+        pacing_via_xdp = (
+            pacing_active
+            and PACING_ENGINE_AVAILABLE
+            and callable(paced_send_xdp)
+        )
+        if pacing_active and not pacing_via_xdp:
             log_warning("[Pacing] sender-backend=xdp selected; C pacing is bypassed for this path.")
+        if pacing_via_xdp and callable(reset_stats):
+            try:
+                reset_stats()
+            except Exception:
+                pass
         out = await xdp_sender(
             packets_buffer=packets_buffer,
             target_ip=target_ip,
@@ -879,9 +895,18 @@ async def paced_raw_socket_sender(
             sender_fallback_policy=fallback_policy,
             fallback_backend="python",
             sender_context=sender_context,
+            pacing_config=pacing_config if pacing_via_xdp else None,
+            paced_send_xdp_fn=paced_send_xdp if pacing_via_xdp else None,
         )
         out = dict(out or {})
-        if pacing_config is not None and int(getattr(pacing_config, "pacing_mode", 0) or 0) != 0:
+        if pacing_via_xdp and callable(get_stats):
+            try:
+                stats = get_stats()
+                if stats:
+                    out = _apply_pacing_stats(out, stats)
+            except Exception:
+                pass
+        elif pacing_active:
             out["pacing_bypassed_for_xdp"] = 1
         return out
 

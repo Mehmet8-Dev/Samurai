@@ -74,6 +74,8 @@ async def xdp_sender(
     sender_fallback_policy: str = "allow",
     fallback_backend: str = "python",
     sender_context: Dict[str, Any] | None = None,
+    pacing_config=None,
+    paced_send_xdp_fn=None,
     *,
     resolve_sender_fallback_policy_fn,
     resolve_sender_backend_fn,
@@ -265,7 +267,17 @@ async def xdp_sender(
                     buffer_copy_bytes=int(normalize_meta.get("buffer_copy_bytes", 0) or 0),
                 )
 
-        if hasattr(sender, "send_buffer"):
+        pacing_active = (
+            pacing_config is not None
+            and int(getattr(pacing_config, "pacing_mode", 0) or 0) != 0
+            and callable(paced_send_xdp_fn)
+        )
+
+        if sender.is_using_xdp and pacing_active:
+            sent = paced_send_xdp_fn(packets_buffer, packet_size, count, config=pacing_config)
+            total_sent = int(sent or 0)
+            sender_path = "PACED_XDP"
+        elif hasattr(sender, "send_buffer"):
             sent = sender.send_buffer(packets_buffer, packet_size, count)
             total_sent = int(sent or 0)
         else:
