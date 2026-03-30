@@ -249,6 +249,70 @@ static unsigned long long state_overwrites = 0ULL;
 static unsigned long long state_sweeps = 0ULL;
 static unsigned long long state_last_sweep_removed = 0ULL;
 static unsigned long long state_active_entries = 0ULL;
+static PyObject* l4se_module = NULL;
+static int l4se_checked = 0;
+static int l4se_available = 0;
+
+static int ensure_l4se_module(void) {
+    if (l4se_checked) {
+        return l4se_available;
+    }
+    l4se_checked = 1;
+    l4se_module = PyImport_ImportModule("ddos_samurai.l4.state_engine");
+    if (!l4se_module) {
+        PyErr_Clear();
+        l4se_module = PyImport_ImportModule("ddos_samurai.l4_state_engine");
+    }
+    if (!l4se_module) {
+        PyErr_Clear();
+        l4se_module = PyImport_ImportModule("l4_state_engine");
+    }
+    if (!l4se_module) {
+        PyErr_Clear();
+        l4se_available = 0;
+        return 0;
+    }
+    l4se_available = 1;
+    return 1;
+}
+
+static PyObject* call_l4se_method(const char* name, PyObject* args) {
+    PyObject* fn = NULL;
+    PyObject* result = NULL;
+    PyObject* call_args = args;
+    int owns_call_args = 0;
+    if (!name) {
+        PyErr_SetString(PyExc_RuntimeError, "l4se delegate call argument error");
+        return NULL;
+    }
+    if (!call_args) {
+        call_args = PyTuple_New(0);
+        if (!call_args) {
+            return NULL;
+        }
+        owns_call_args = 1;
+    }
+    if (!ensure_l4se_module()) {
+        if (owns_call_args) Py_DECREF(call_args);
+        PyErr_SetString(PyExc_RuntimeError, "l4_state_engine module is not available");
+        return NULL;
+    }
+    fn = PyObject_GetAttrString(l4se_module, name);
+    if (!fn) {
+        if (owns_call_args) Py_DECREF(call_args);
+        return NULL;
+    }
+    if (!PyCallable_Check(fn)) {
+        Py_DECREF(fn);
+        if (owns_call_args) Py_DECREF(call_args);
+        PyErr_Format(PyExc_RuntimeError, "l4_state_engine.%s is not callable", name);
+        return NULL;
+    }
+    result = PyObject_CallObject(fn, call_args);
+    Py_DECREF(fn);
+    if (owns_call_args) Py_DECREF(call_args);
+    return result;
+}
 
 static uint32_t env_uint(const char* name, uint32_t fallback) {
     const char* raw = getenv(name);
@@ -800,6 +864,9 @@ static uint16_t tcp_checksum(uint8_t *ip_header, uint8_t *tcp_header, int tcp_le
 }
 
 static PyObject* get_states_batch(PyObject* self, PyObject* args) {
+    if (ensure_l4se_module()) {
+        return call_l4se_method("get_states_batch", args);
+    }
     uint32_t src_ip;
     uint16_t start_port;
     uint32_t count;
@@ -863,6 +930,9 @@ static PyObject* get_states_batch(PyObject* self, PyObject* args) {
 }
 
 static PyObject* get_tcp_state(PyObject* self, PyObject* args) {
+    if (ensure_l4se_module()) {
+        return call_l4se_method("get_tcp_state", args);
+    }
     uint32_t src_ip;
     uint16_t src_port;
     if (!PyArg_ParseTuple(args, "IH", &src_ip, &src_port)) return NULL;
@@ -916,10 +986,21 @@ static PyObject* set_mimicry_settings(PyObject* self, PyObject* args) {
     uint16_t window;
     uint16_t mss;
     uint8_t ttl;
+    PyObject* delegate_args = NULL;
+    PyObject* delegate_result = NULL;
     if (!PyArg_ParseTuple(args, "HHb", &window, &mss, &ttl)) return NULL;
+    (void)self;
     global_window_size = window;
     global_mss = mss;
     global_ttl = ttl;
+    if (ensure_l4se_module()) {
+        delegate_args = Py_BuildValue("(HHb)", window, mss, ttl);
+        if (!delegate_args) return NULL;
+        delegate_result = call_l4se_method("set_mimicry_settings", delegate_args);
+        Py_DECREF(delegate_args);
+        if (!delegate_result) return NULL;
+        Py_DECREF(delegate_result);
+    }
     Py_RETURN_NONE;
 }
 
@@ -959,6 +1040,9 @@ static inline uint32_t read_be32(const uint8_t* p) {
 }
 
 static PyObject* configure_state_engine(PyObject* self, PyObject* args) {
+    if (ensure_l4se_module()) {
+        return call_l4se_method("configure_state_engine", args);
+    }
     unsigned int table_size = DEFAULT_STATE_TABLE_SIZE;
     unsigned int lock_count = DEFAULT_NUM_LOCKS;
     unsigned int timeout_sec = DEFAULT_STATE_TIMEOUT_SEC;
@@ -984,6 +1068,9 @@ static PyObject* configure_state_engine(PyObject* self, PyObject* args) {
 }
 
 static PyObject* get_state_engine_stats(PyObject* self, PyObject* args) {
+    if (ensure_l4se_module()) {
+        return call_l4se_method("get_state_engine_stats", args);
+    }
     (void)self;
     (void)args;
     return Py_BuildValue(
@@ -1001,6 +1088,9 @@ static PyObject* get_state_engine_stats(PyObject* self, PyObject* args) {
 }
 
 static PyObject* sweep_state_table(PyObject* self, PyObject* args) {
+    if (ensure_l4se_module()) {
+        return call_l4se_method("sweep_state_table", args);
+    }
     unsigned int max_scan = 0;
     int removed = 0;
     (void)self;
@@ -1010,6 +1100,9 @@ static PyObject* sweep_state_table(PyObject* self, PyObject* args) {
 }
 
 static PyObject* ingest_tx_packets(PyObject* self, PyObject* args) {
+    if (ensure_l4se_module()) {
+        return call_l4se_method("ingest_tx_packets", args);
+    }
     Py_buffer view;
     int packet_size = 0;
     int count = 0;
@@ -1246,6 +1339,9 @@ static void* rx_thread_func(void* arg) {
 }
 
 static PyObject* start_rx_handler(PyObject* self, PyObject* args) {
+    if (ensure_l4se_module()) {
+        return call_l4se_method("start_rx_handler", args);
+    }
     char* iface;
     if (!PyArg_ParseTuple(args, "s", &iface)) return NULL;
 
@@ -1255,6 +1351,15 @@ static PyObject* start_rx_handler(PyObject* self, PyObject* args) {
         return NULL;
     }
     pthread_detach(thread);
+    Py_RETURN_NONE;
+}
+
+static PyObject* stop_rx_handler(PyObject* self, PyObject* args) {
+    if (ensure_l4se_module()) {
+        return call_l4se_method("stop_rx_handler", args);
+    }
+    (void)self;
+    (void)args;
     Py_RETURN_NONE;
 }
 
@@ -2140,6 +2245,7 @@ static PyMethodDef FastSenderMethods[] = {
     {"get_tcp_state", get_tcp_state, METH_VARARGS, "Get TCP state from the state table"},
     {"get_states_batch", get_states_batch, METH_VARARGS, "Get multiple TCP states in one call"},
     {"start_rx_handler", start_rx_handler, METH_VARARGS, "Start the background RX handler thread"},
+    {"stop_rx_handler", stop_rx_handler, METH_VARARGS, "Stop the background RX handler thread"},
     {"set_mimicry_settings", set_mimicry_settings, METH_VARARGS, "Set global TCP mimicry settings (Window, MSS, TTL)"},
     {"check_so_txtime", check_so_txtime, METH_NOARGS,
      "Check SO_TXTIME / CLOCK_TAI availability.\n"
@@ -2151,6 +2257,12 @@ static void fast_sender_free(void* module) {
     (void)module;
     cleanup_tx_ring_internal();
     destroy_state_engine();
+    if (l4se_module) {
+        Py_DECREF(l4se_module);
+        l4se_module = NULL;
+    }
+    l4se_checked = 0;
+    l4se_available = 0;
 }
 
 static struct PyModuleDef fastsendermodule = {
@@ -2169,16 +2281,41 @@ PyMODINIT_FUNC PyInit_fast_sender(void) {
     uint32_t cfg_table = env_uint("SAMURAI_STATE_TABLE_SIZE", DEFAULT_STATE_TABLE_SIZE);
     uint32_t cfg_locks = env_uint("SAMURAI_STATE_LOCK_COUNT", DEFAULT_NUM_LOCKS);
     uint32_t cfg_timeout = env_uint("SAMURAI_STATE_TIMEOUT_SEC", DEFAULT_STATE_TIMEOUT_SEC);
+    int delegated_configured = 0;
+    PyObject* cfg_args = NULL;
+    PyObject* cfg_result = NULL;
+    PyObject* module = NULL;
 
     if (cfg_table == 0 || cfg_locks == 0 || cfg_timeout == 0 || (cfg_table % cfg_locks) != 0) {
         cfg_table = DEFAULT_STATE_TABLE_SIZE;
         cfg_locks = DEFAULT_NUM_LOCKS;
         cfg_timeout = DEFAULT_STATE_TIMEOUT_SEC;
     }
-    if (init_state_engine(cfg_table, cfg_locks, cfg_timeout) != 0) {
-        PyErr_SetString(PyExc_RuntimeError, "Failed to initialize state engine");
-        return NULL;
+    if (ensure_l4se_module()) {
+        cfg_args = Py_BuildValue("(III)", (unsigned int)cfg_table, (unsigned int)cfg_locks, (unsigned int)cfg_timeout);
+        if (cfg_args) {
+            cfg_result = call_l4se_method("configure_state_engine", cfg_args);
+            Py_DECREF(cfg_args);
+            if (cfg_result) {
+                delegated_configured = 1;
+                Py_DECREF(cfg_result);
+            } else {
+                PyErr_Clear();
+            }
+        } else {
+            PyErr_Clear();
+        }
+    }
+    if (!delegated_configured) {
+        if (init_state_engine(cfg_table, cfg_locks, cfg_timeout) != 0) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to initialize state engine");
+            return NULL;
+        }
     }
     load_txring_hugepage_policy_from_env();
-    return PyModule_Create(&fastsendermodule);
+    module = PyModule_Create(&fastsendermodule);
+    if (!module) {
+        return NULL;
+    }
+    return module;
 }
