@@ -130,18 +130,21 @@ async def packet_sender(
         pkt_bytes = b""
 
         try:
-            for i in range(count):
-                pkt_bytes = cpu_packet_engine.create_packet(engine_cfg)
+            if not engine_cfg.fragment_enabled:
+                packet_view, packet_size = cpu_packet_engine.generate_packet_pool_view(
+                    engine_cfg,
+                    count,
+                    uniform_size=True,
+                    low_peak_memory=True,
+                )
+                if packet_size <= 0 or len(packet_view) < packet_size * count:
+                    raise ValueError("invalid packet pool returned from cpu packet engine")
 
-                if engine_cfg.fragment_enabled:
-                    fragments = cpu_packet_engine.fragment_packet(
-                        pkt_bytes,
-                        fragment_size=max(8, engine_cfg.fragment_size),
-                    )
-                else:
-                    fragments = [pkt_bytes]
-
-                for frag in fragments:
+                pkt_bytes = bytes(packet_view[:packet_size]) if count > 0 else b""
+                for i in range(count):
+                    start = i * packet_size
+                    end = start + packet_size
+                    frag = packet_view[start:end]
                     packet_no += 1
                     try:
                         sock.sendto(frag, dst_addr)
@@ -149,27 +152,64 @@ async def packet_sender(
                     except Exception:
                         send_err += 1
 
-                update_live_fn(live_progress, 1)
+                    update_live_fn(live_progress, 1)
 
-                base_delay = 0.0
-                if rps and rps > 0:
-                    base_delay = 1.0 / float(rps)
-                elif delay and delay > 0:
-                    base_delay = float(delay)
+                    base_delay = 0.0
+                    if rps and rps > 0:
+                        base_delay = 1.0 / float(rps)
+                    elif delay and delay > 0:
+                        base_delay = float(delay)
 
-                if base_delay > 0:
-                    if jitter and jitter > 0:
-                        j = base_delay * float(jitter)
-                        await asyncio.sleep(max(0.0, base_delay + random.uniform(-j, j)))
-                    else:
-                        await asyncio.sleep(base_delay)
+                    if base_delay > 0:
+                        if jitter and jitter > 0:
+                            j = base_delay * float(jitter)
+                            await asyncio.sleep(max(0.0, base_delay + random.uniform(-j, j)))
+                        else:
+                            await asyncio.sleep(base_delay)
 
-                if (i + 1) % BATCH_SIZE == 0:
-                    update_live_fn(live_sent, sent_ok - sent_ok_snapshot)
-                    update_live_fn(live_errors, send_err - send_err_snapshot)
-                    sent_ok_snapshot = sent_ok
-                    send_err_snapshot = send_err
-                    await asyncio.sleep(0)
+                    if (i + 1) % BATCH_SIZE == 0:
+                        update_live_fn(live_sent, sent_ok - sent_ok_snapshot)
+                        update_live_fn(live_errors, send_err - send_err_snapshot)
+                        sent_ok_snapshot = sent_ok
+                        send_err_snapshot = send_err
+                        await asyncio.sleep(0)
+            else:
+                for i in range(count):
+                    pkt_bytes = cpu_packet_engine.create_packet(engine_cfg)
+                    fragments = cpu_packet_engine.fragment_packet(
+                        pkt_bytes,
+                        fragment_size=max(8, engine_cfg.fragment_size),
+                    )
+
+                    for frag in fragments:
+                        packet_no += 1
+                        try:
+                            sock.sendto(frag, dst_addr)
+                            sent_ok += 1
+                        except Exception:
+                            send_err += 1
+
+                    update_live_fn(live_progress, 1)
+
+                    base_delay = 0.0
+                    if rps and rps > 0:
+                        base_delay = 1.0 / float(rps)
+                    elif delay and delay > 0:
+                        base_delay = float(delay)
+
+                    if base_delay > 0:
+                        if jitter and jitter > 0:
+                            j = base_delay * float(jitter)
+                            await asyncio.sleep(max(0.0, base_delay + random.uniform(-j, j)))
+                        else:
+                            await asyncio.sleep(base_delay)
+
+                    if (i + 1) % BATCH_SIZE == 0:
+                        update_live_fn(live_sent, sent_ok - sent_ok_snapshot)
+                        update_live_fn(live_errors, send_err - send_err_snapshot)
+                        sent_ok_snapshot = sent_ok
+                        send_err_snapshot = send_err
+                        await asyncio.sleep(0)
 
         except KeyboardInterrupt:
             pass
@@ -260,4 +300,3 @@ async def packet_sender(
         sent=sent_ok,
         errors=max(0, packet_no - sent_ok) if send_err <= 0 else send_err,
     )
-

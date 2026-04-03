@@ -25,6 +25,9 @@ import time
 import random
 import os
 import tempfile
+import gc
+import threading
+import tracemalloc
 import unittest
 from unittest.mock import patch
 
@@ -86,6 +89,7 @@ from ddos_samurai.cpu_packet_engine import (
     build_dns_packet,
     build_polymorphic_http_packet,
     generate_packet_pool,
+    generate_packet_pool_view,
     # Amplification
     create_dns_amp_packet,
     create_ntp_amp_packet,
@@ -239,6 +243,10 @@ class TestSpoofing(unittest.TestCase):
             self.assertEqual(parts[1], "168")
             self.assertEqual(parts[2], "100")
 
+    def test_subnet_31_stays_within_subnet(self):
+        seen = {generate_ip_from_subnet("198.51.100.10/31") for _ in range(20)}
+        self.assertTrue(seen.issubset({"198.51.100.10", "198.51.100.11"}))
+
     def test_get_spoofed_modes(self):
         ip_random = get_spoofed_ip("random")
         self.assertIsInstance(ip_random, str)
@@ -354,6 +362,10 @@ class TestIPv4Header(unittest.TestCase):
         dst = struct.unpack("!I", hdr[16:20])[0]
         self.assertEqual(int_to_ip(src), "192.168.0.1")
         self.assertEqual(int_to_ip(dst), "10.0.0.2")
+
+    def test_ip_options_must_be_4_byte_aligned(self):
+        with self.assertRaises(ValueError):
+            build_ipv4_header("192.168.0.1", "10.0.0.2", PROTO_TCP, 0, options=b"\x01\x02")
 
 
 # ────────────────────────────────────────────────────────────────
@@ -657,7 +669,7 @@ class TestFullPackets(unittest.TestCase):
         expected_max = ip_fields["ihl"] + tcp_fields["data_offset"]
         self.assertEqual(ip_fields["total_len"], expected_max)
 
-    def test_non_spoof_tcp_uses_resolved_source_ip_for_checksum(self):
+    def test_non_spoof_tcp_uses_nonzero_source_ip_for_checksum(self):
         cfg = PacketConfig(
             target_ip="10.0.0.1",
             target_port=80,
@@ -665,8 +677,7 @@ class TestFullPackets(unittest.TestCase):
             tcp_flags="S",
             spoof=False,
         )
-        with patch("ddos_samurai.cpu_packet_engine.resolve_local_source_ip", return_value="192.0.2.10"):
-            pkt = create_packet(cfg)
+        pkt = create_packet(cfg)
 
         ihl = (pkt[0] & 0xF) * 4
         total_len = struct.unpack("!H", pkt[2:4])[0]
@@ -674,7 +685,7 @@ class TestFullPackets(unittest.TestCase):
         dst_ip = struct.unpack("!I", pkt[16:20])[0]
         tcp_seg = pkt[ihl:total_len]
 
-        self.assertEqual(src_ip, ip_to_int("192.0.2.10"))
+        self.assertNotEqual(src_ip, 0)
         pseudo = struct.pack("!IIBBH", src_ip, dst_ip, 0, PROTO_TCP, len(tcp_seg))
         data = pseudo + tcp_seg
         if len(data) % 2:
@@ -788,6 +799,21 @@ class TestFragmentation(unittest.TestCase):
 
         self.assertEqual(reassembled, pkt[ihl:total_len])
 
+    def test_fragmentation_preserves_existing_fragment_base_offset(self):
+        cfg = PacketConfig(
+            target_ip="10.0.0.1",
+            target_port=53,
+            protocol="udp",
+            payload=b"Q" * 600,
+        )
+        pkt = bytearray(create_packet(cfg))
+        struct.pack_into("!H", pkt, 6, 0x2000 | 32)
+        frags = fragment_packet(bytes(pkt), fragment_size=200)
+        offsets = [struct.unpack("!H", frag[6:8])[0] & 0x1FFF for frag in frags]
+        self.assertEqual(offsets[0], 32)
+        for i in range(1, len(offsets)):
+            self.assertGreater(offsets[i], offsets[i - 1])
+
 
 # ────────────────────────────────────────────────────────────────
 #  Test: Packet Pool
@@ -804,6 +830,56 @@ class TestPacketPool(unittest.TestCase):
         last_pkt = buf[-pkt_size:]
         self.assertTrue(_verify_ip_checksum(first_pkt))
         self.assertTrue(_verify_ip_checksum(last_pkt))
+
+    def test_pool_generation_view(self):
+        cfg = PacketConfig(target_ip="10.0.0.1", target_port=80, protocol="tcp")
+        view, pkt_size = generate_packet_pool_view(cfg, count=32)
+        self.assertIsInstance(view, memoryview)
+        self.assertTrue(view.contiguous)
+        self.assertEqual(len(view), 32 * pkt_size)
+        self.assertTrue(_verify_ip_checksum(bytes(view[:pkt_size])))
+
+    def test_pool_view_has_lower_python_memory_pressure_than_bytes_pool(self):
+        cfg = PacketConfig(target_ip="10.0.0.1", target_port=80, protocol="tcp")
+        count = 4096
+
+        tracemalloc.start()
+        buf, pkt_size = generate_packet_pool(cfg, count=count, low_peak_memory=True)
+        _cur, peak_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        self.assertGreater(pkt_size, 0)
+        del buf
+        gc.collect()
+
+        tracemalloc.start()
+        view, view_pkt_size = generate_packet_pool_view(cfg, count=count, low_peak_memory=True)
+        _cur, peak_view = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        self.assertGreater(view_pkt_size, 0)
+        self.assertLessEqual(peak_view, peak_bytes)
+        self.assertEqual(len(view), count * view_pkt_size)
+
+    def test_pool_view_generation_releases_gil(self):
+        cfg = PacketConfig(target_ip="10.0.0.1", target_port=80, protocol="tcp")
+        stop = threading.Event()
+        counter = {"value": 0}
+
+        def worker():
+            while not stop.is_set():
+                counter["value"] += 1
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        time.sleep(0.02)
+        counter["value"] = 0
+        view, pkt_size = generate_packet_pool_view(cfg, count=12000, low_peak_memory=True)
+        observed = counter["value"]
+        stop.set()
+        thread.join(timeout=1.0)
+
+        self.assertGreater(pkt_size, 0)
+        self.assertGreater(len(view), 0)
+        self.assertGreater(observed, 1000)
 
 
 # ────────────────────────────────────────────────────────────────

@@ -418,6 +418,8 @@ def _resolve_l7_flags() -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
 def get_extensions() -> List[Extension]:
     extensions: List[Extension] = []
     l4se_std_flag = "-std=c++23" if _env_flag("SAMURAI_L4SE_CXX23", "0") else "-std=c++20"
+    project_root = os.path.abspath(os.path.dirname(__file__))
+    pybind11_include = os.path.join(project_root, "third_party", "pybind11", "include")
 
     l4_state_engine = Extension(
         "ddos_samurai.l4.state_engine",
@@ -431,6 +433,23 @@ def get_extensions() -> List[Extension]:
         extra_link_args=["-lpthread", "-lm"],
     )
     extensions.append(l4_state_engine)
+
+    cpu_packet_engine_native = Extension(
+        "ddos_samurai._cpu_packet_engine_native",
+        sources=[
+            "ddos_samurai/cpu_native/module.cpp",
+            "ddos_samurai/cpu_native/common.cpp",
+            "ddos_samurai/cpu_native/spoofing.cpp",
+            "ddos_samurai/cpu_native/packets.cpp",
+            "ddos_samurai/cpu_native/pool.cpp",
+            "ddos_samurai/cpu_native/amp.cpp",
+        ],
+        include_dirs=[pybind11_include],
+        language="c++",
+        extra_compile_args=["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"],
+        extra_link_args=["-lpthread", "-lm"],
+    )
+    extensions.append(cpu_packet_engine_native)
 
     fast_sender = Extension(
         "ddos_samurai.fast_sender",

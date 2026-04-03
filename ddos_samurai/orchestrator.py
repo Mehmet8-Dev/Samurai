@@ -2887,7 +2887,7 @@ async def worker_process(
 
                     while remaining > 0:
                         batch_count = min(remaining, cpu_pacing_batch)
-                        packets_buffer, packet_size = cpu_packet_engine.generate_packet_pool(
+                        packets_buffer, packet_size = cpu_packet_engine.generate_packet_pool_view(
                             engine_cfg,
                             batch_count,
                             uniform_size=True,
@@ -2943,7 +2943,7 @@ async def worker_process(
                         dns_edns=args['dns_edns'],
                         dns_recursive=not args['dns_nord'],
                     )
-                    packets_buffer, packet_size = cpu_packet_engine.generate_packet_pool(
+                    packets_buffer, packet_size = cpu_packet_engine.generate_packet_pool_view(
                         engine_cfg,
                         int(args['count'] or 0),
                         uniform_size=True,

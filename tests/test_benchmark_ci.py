@@ -15,7 +15,13 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ddos_samurai.cpu_packet_engine import PacketConfig, create_packet, generate_packet_pool, parse_tcp_flags
+from ddos_samurai.cpu_packet_engine import (
+    PacketConfig,
+    create_packet,
+    generate_packet_pool,
+    generate_packet_pool_view,
+    parse_tcp_flags,
+)
 
 try:
     import pytest
@@ -182,6 +188,10 @@ class TestCISafeBenchmarks(unittest.TestCase):
                 "generate_packet_pool", n_packets,
                 lambda: generate_packet_pool(cfg_syn, n_packets, low_peak_memory=True),
             ),
+            "generate_packet_pool_view": _scenario(
+                "generate_packet_pool_view", n_packets,
+                lambda: generate_packet_pool_view(cfg_syn, n_packets, low_peak_memory=True),
+            ),
             "parse_tcp_flags": _scenario(
                 "parse_tcp_flags", n_flags,
                 lambda: [parse_tcp_flags("SYNACK") for _ in range(n_flags)],
@@ -209,6 +219,9 @@ class TestCISafeBenchmarks(unittest.TestCase):
             ),
             "generate_packet_pool_rate_per_s": float(
                 scenarios["generate_packet_pool"].get("rate_per_s", 0.0) or 0.0
+            ),
+            "generate_packet_pool_view_rate_per_s": float(
+                scenarios["generate_packet_pool_view"].get("rate_per_s", 0.0) or 0.0
             ),
             # CI-safe profile does not run privileged TX path; use CPU send-rate proxy.
             "effective_pps": float(scenarios["generate_packet_pool"].get("rate_per_s", 0.0) or 0.0),

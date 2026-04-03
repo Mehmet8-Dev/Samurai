@@ -174,7 +174,7 @@ class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
         mock_pkt = AsyncMock()
         mock_paced = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
         with patch.object(orchestrator, "PACING_ENGINE_AVAILABLE", True):
-            with patch.object(orchestrator.cpu_packet_engine, "generate_packet_pool", return_value=(b"x" * 320, 64)):
+            with patch.object(orchestrator.cpu_packet_engine, "generate_packet_pool_view", return_value=(memoryview(b"x" * 320), 64)):
                 with patch.object(orchestrator.senders, "packet_sender", mock_pkt):
                     with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_paced):
                         await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
