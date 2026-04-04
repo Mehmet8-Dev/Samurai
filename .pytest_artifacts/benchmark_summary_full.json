@@ -1,5 +1,5 @@
 {
-  "generated_utc": "2026-04-04T22:14:31+00:00",
+  "generated_utc": "2026-04-04T22:43:46+00:00",
   "parity": {
     "gates": {
       "afpacket_hugepage_effective_required": 1,
@@ -29,7 +29,7 @@
       "afpacket_hugepage_reason"
     ],
     "normalized_results": {
-      "effective_pps": 5004.815959229008,
+      "effective_pps": 5004.821544980003,
       "kpi_gate_hard_fail": 0,
       "kpi_gate_profile": "dedicated_lab",
       "kpi_gate_status": "pass",
@@ -38,7 +38,7 @@
       "l7_conn_rate": 0.0,
       "l7_handshake_p99_ms": 0.0,
       "l7_step_fail_ratio": 0.0,
-      "rate_accuracy_pct": 100.09631918458015,
+      "rate_accuracy_pct": 100.09643089960005,
       "retry_success_rate": 1.0,
       "run_quality": "valid",
       "score_eligible": 1,
@@ -83,7 +83,7 @@
         "id": "l4_top_speed",
         "layer": "L4",
         "samurai_field": "effective_pps",
-        "samurai_value": 5004.815959229008,
+        "samurai_value": 5004.821544980003,
         "status": "measured"
       },
       {
@@ -99,7 +99,7 @@
         "id": "l4_pacing_accuracy",
         "layer": "L4",
         "samurai_field": "rate_accuracy_pct",
-        "samurai_value": 100.09631918458015,
+        "samurai_value": 100.09643089960005,
         "status": "measured"
       },
       {
@@ -134,12 +134,12 @@
   "sections": {
     "gpu_template": {
       "constant": {
-        "avg_ms": 4.351112667791313,
+        "avg_ms": 3.275832666986389,
         "cache_hit": 3,
         "cache_miss": 0,
         "h2d_copy_bytes": 0,
         "h2d_copy_count": 0,
-        "pps": 11491313.559890123,
+        "pps": 15263294.8880132,
         "rng_alloc": 1,
         "rng_reuse": 2
       },
@@ -152,12 +152,12 @@
         "gpu_template_h2d_copy_count": 1
       },
       "global": {
-        "avg_ms": 0.9447033323037127,
+        "avg_ms": 0.8468643342591046,
         "cache_hit": 3,
         "cache_miss": 0,
         "h2d_copy_bytes": 0,
         "h2d_copy_count": 0,
-        "pps": 52926668.39448122,
+        "pps": 59041333.98620861,
         "rng_alloc": 0,
         "rng_reuse": 3
       }
@@ -180,9 +180,9 @@
       "wire_loss_status": "ok"
     },
     "pacing": {
-      "actual_rps": 5004.815959229008,
-      "jitter_p99_ns": 40.0,
-      "rate_accuracy_pct": 100.09631918458015,
+      "actual_rps": 5004.821544980003,
+      "jitter_p99_ns": 34.0,
+      "rate_accuracy_pct": 100.09643089960005,
       "sent": 1000,
       "target_rps": 5000.0,
       "txring_flush_call_count": 0,

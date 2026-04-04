@@ -469,6 +469,33 @@ class XDPSender:
         if not os.path.exists(f'/sys/class/net/{self.interface}'):
             raise ValueError(f"Interface '{self.interface}' does not exist")
 
+    def _cleanup_stale_bpffs_roots(self) -> None:
+        """
+        Remove stale bpffs pin directories for the same interface/queue.
+        Only directories with dead PID suffix are removed.
+        """
+        base_dir = Path("/sys/fs/bpf")
+        if not base_dir.exists():
+            return
+        prefix = f"samurai_{self.interface}_q{self.queue_id}_"
+        try:
+            for entry in base_dir.iterdir():
+                name = entry.name
+                if not entry.is_dir() or not name.startswith(prefix):
+                    continue
+                pid_str = name[len(prefix):]
+                if not pid_str.isdigit():
+                    continue
+                pid = int(pid_str)
+                if pid <= 0:
+                    continue
+                if os.path.exists(f"/proc/{pid}"):
+                    # Live process owns this pin root; do not touch.
+                    continue
+                shutil.rmtree(entry, ignore_errors=True)
+        except Exception as e:
+            utils.log_warning(f"[XDP] stale bpffs cleanup skipped: {e}")
+
     def _attach_bpf_program(self) -> Tuple[bool, str]:
         if not self.attach_bpf:
             return True, "BPF attach disabled"
@@ -499,6 +526,7 @@ class XDPSender:
         if bpftool_path:
             bpffs_root = None
             try:
+                self._cleanup_stale_bpffs_roots()
                 bpffs_root = Path(f"/sys/fs/bpf/samurai_{self.interface}_q{self.queue_id}_{os.getpid()}")
                 prog_pin = bpffs_root / "progs"
                 maps_pin = bpffs_root / "maps"
