@@ -1,5 +1,5 @@
 {
-  "generated_utc": "2026-03-08T14:51:33+00:00",
+  "generated_utc": "2026-04-04T22:14:31+00:00",
   "parity": {
     "gates": {
       "afpacket_hugepage_effective_required": 1,
@@ -14,6 +14,8 @@
       "retry_success_rate_min": 90.0,
       "run_quality": "valid",
       "send_success_ratio_pct_min": 99.0,
+      "sender_fallback_reason_required": "none",
+      "sender_path_single_required": 1,
       "session_success_rate_min": 99.0,
       "txring_flush_eagain_ratio_pct_max": 2.0,
       "txring_flush_error_ratio_pct_max": 0.5,
@@ -27,7 +29,7 @@
       "afpacket_hugepage_reason"
     ],
     "normalized_results": {
-      "effective_pps": 5004.776709034403,
+      "effective_pps": 5004.815959229008,
       "kpi_gate_hard_fail": 0,
       "kpi_gate_profile": "dedicated_lab",
       "kpi_gate_status": "pass",
@@ -36,7 +38,7 @@
       "l7_conn_rate": 0.0,
       "l7_handshake_p99_ms": 0.0,
       "l7_step_fail_ratio": 0.0,
-      "rate_accuracy_pct": 100.09553418068806,
+      "rate_accuracy_pct": 100.09631918458015,
       "retry_success_rate": 1.0,
       "run_quality": "valid",
       "score_eligible": 1,
@@ -81,7 +83,7 @@
         "id": "l4_top_speed",
         "layer": "L4",
         "samurai_field": "effective_pps",
-        "samurai_value": 5004.776709034403,
+        "samurai_value": 5004.815959229008,
         "status": "measured"
       },
       {
@@ -97,7 +99,7 @@
         "id": "l4_pacing_accuracy",
         "layer": "L4",
         "samurai_field": "rate_accuracy_pct",
-        "samurai_value": 100.09553418068806,
+        "samurai_value": 100.09631918458015,
         "status": "measured"
       },
       {
@@ -132,12 +134,12 @@
   "sections": {
     "gpu_template": {
       "constant": {
-        "avg_ms": 3.2040320014251242,
+        "avg_ms": 4.351112667791313,
         "cache_hit": 3,
         "cache_miss": 0,
         "h2d_copy_bytes": 0,
         "h2d_copy_count": 0,
-        "pps": 15605337.268092345,
+        "pps": 11491313.559890123,
         "rng_alloc": 1,
         "rng_reuse": 2
       },
@@ -150,12 +152,12 @@
         "gpu_template_h2d_copy_count": 1
       },
       "global": {
-        "avg_ms": 0.845198333990993,
+        "avg_ms": 0.9447033323037127,
         "cache_hit": 3,
         "cache_miss": 0,
         "h2d_copy_bytes": 0,
         "h2d_copy_count": 0,
-        "pps": 59157712.44354208,
+        "pps": 52926668.39448122,
         "rng_alloc": 0,
         "rng_reuse": 3
       }
@@ -178,9 +180,9 @@
       "wire_loss_status": "ok"
     },
     "pacing": {
-      "actual_rps": 5004.776709034403,
-      "jitter_p99_ns": 31.0,
-      "rate_accuracy_pct": 100.09553418068806,
+      "actual_rps": 5004.815959229008,
+      "jitter_p99_ns": 40.0,
+      "rate_accuracy_pct": 100.09631918458015,
       "sent": 1000,
       "target_rps": 5000.0,
       "txring_flush_call_count": 0,
