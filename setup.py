@@ -169,6 +169,15 @@ class OptionalBuildExt(build_ext):
             super().build_extension(ext)
         except Exception as exc:
             if "xdp_sender" in ext.name:
+                strict_raw = os.environ.get("SAMURAI_REQUIRE_XDP_BUILD")
+                if strict_raw is not None:
+                    strict_xdp = str(strict_raw).strip().lower() in {"1", "true", "yes", "on"}
+                else:
+                    env_name = str(os.environ.get("SAMURAI_ENV", "") or "").strip().lower()
+                    ci_mode = str(os.environ.get("CI", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+                    strict_xdp = ci_mode or env_name in {"prod", "production"}
+                if strict_xdp:
+                    raise
                 print(f"\nWarning: Could not build {ext.name}: {exc}")
                 print("XDP functionality will not be available.\n")
             else:
