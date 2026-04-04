@@ -8,10 +8,22 @@
 #include <string.h>
 
 #include "xdp_core.h"
+#include "xdp_native_api.h"
 
 struct xdp_core_handle {
     PyObject *xdp_mod;
+    const xdp_native_api_v1 *native_api;
+    PyObject *fn_init;
+    PyObject *fn_send_buffer;
+    PyObject *fn_send;
+    PyObject *fn_stats;
+    PyObject *fn_cleanup;
+    PyObject *fn_create;
+    PyObject *fn_destroy;
     int initialized;
+    int use_ctx_api;
+    int use_native_api;
+    int ctx_handle;
     int mode_requested;
     int mode_effective;
     char mode2_policy[8];
@@ -50,6 +62,22 @@ static int _as_long(PyObject *obj, const char *key, long *out) {
         *out = 0;
     }
     return 0;
+}
+
+static void _release_handle_refs(xdp_core_handle *h) {
+    if (!h) return;
+    Py_XDECREF(h->fn_init); h->fn_init = NULL;
+    Py_XDECREF(h->fn_send_buffer); h->fn_send_buffer = NULL;
+    Py_XDECREF(h->fn_send); h->fn_send = NULL;
+    Py_XDECREF(h->fn_stats); h->fn_stats = NULL;
+    Py_XDECREF(h->fn_cleanup); h->fn_cleanup = NULL;
+    Py_XDECREF(h->fn_create); h->fn_create = NULL;
+    Py_XDECREF(h->fn_destroy); h->fn_destroy = NULL;
+    Py_XDECREF(h->xdp_mod); h->xdp_mod = NULL;
+    h->native_api = NULL;
+    h->use_ctx_api = 0;
+    h->use_native_api = 0;
+    h->ctx_handle = 0;
 }
 
 int xdp_core_probe_mode2(const char *iface, xdp_probe_result *out, xdp_core_err *err) {
@@ -152,13 +180,119 @@ xdp_core_handle *xdp_core_open(const xdp_core_open_cfg *cfg, xdp_core_err *err) 
         _err_set(err, 12, "xdp_sender module not importable");
         return NULL;
     }
-    if (!PyObject_HasAttrString(h->xdp_mod, "xdp_init") ||
-        !PyObject_HasAttrString(h->xdp_mod, "xdp_send_buffer") ||
-        !PyObject_HasAttrString(h->xdp_mod, "xdp_cleanup")) {
-        Py_DECREF(h->xdp_mod);
-        free(h);
-        _err_set(err, 13, "xdp_sender required API missing");
-        return NULL;
+
+    {
+        PyObject *cap = PyObject_GetAttrString(h->xdp_mod, "xdp_get_native_api");
+        if (cap && PyCallable_Check(cap)) {
+            PyObject *cap_obj = PyObject_CallNoArgs(cap);
+            if (cap_obj) {
+                void *ptr = PyCapsule_GetPointer(cap_obj, XDP_NATIVE_API_CAPSULE_NAME);
+                if (ptr) {
+                    const xdp_native_api_v1 *api = (const xdp_native_api_v1*)ptr;
+                    if (api->version == XDP_NATIVE_API_VERSION &&
+                        api->create_ctx && api->destroy_ctx &&
+                        api->send_buffer && api->send_vector && api->get_stats) {
+                        h->native_api = api;
+                        h->use_native_api = 1;
+                    }
+                } else {
+                    PyErr_Clear();
+                }
+                Py_DECREF(cap_obj);
+            } else {
+                PyErr_Clear();
+            }
+        }
+        Py_XDECREF(cap);
+    }
+
+    if (h->use_native_api) {
+        char nerr[160];
+        if (h->mode_requested == 2) {
+            if (xdp_core_probe_mode2(cfg->interface, &probe, NULL) == 0) {
+                (void)snprintf(h->mode2_probe_status, sizeof(h->mode2_probe_status), "%s", probe.status);
+                (void)snprintf(h->mode2_probe_reason, sizeof(h->mode2_probe_reason), "%s", probe.reason);
+            } else {
+                (void)snprintf(h->mode2_probe_status, sizeof(h->mode2_probe_status), "%s", "unknown");
+                (void)snprintf(h->mode2_probe_reason, sizeof(h->mode2_probe_reason), "%s", "probe_unavailable");
+            }
+            if (hard_policy && strcmp(h->mode2_probe_status, "supported") != 0) {
+                char msg[160];
+                (void)snprintf(msg, sizeof(msg), "xdp_mode2_hard_probe_not_supported: %s", h->mode2_probe_reason);
+                _release_handle_refs(h);
+                free(h);
+                _err_set(err, 14, msg);
+                return NULL;
+            }
+            if (!hard_policy &&
+                (strcmp(h->mode2_probe_status, "unsupported") == 0 ||
+                 strcmp(h->mode2_probe_status, "unknown") == 0)) {
+                h->mode_effective = 1;
+            }
+        }
+
+        nerr[0] = '\0';
+        h->ctx_handle = h->native_api->create_ctx(
+            cfg->interface,
+            cfg->queue_id,
+            h->mode_effective,
+            nerr,
+            sizeof(nerr)
+        );
+        if (h->ctx_handle <= 0) {
+            _release_handle_refs(h);
+            free(h);
+            _err_set(err, 15, nerr[0] ? nerr : "xdp_native_create_failed");
+            return NULL;
+        }
+        h->initialized = 1;
+        _err_set(err, 0, "");
+        return h;
+    }
+
+    h->fn_create = PyObject_GetAttrString(h->xdp_mod, "xdp_create");
+    h->fn_destroy = PyObject_GetAttrString(h->xdp_mod, "xdp_destroy");
+    if (h->fn_create && PyCallable_Check(h->fn_create) &&
+        h->fn_destroy && PyCallable_Check(h->fn_destroy) &&
+        PyObject_HasAttrString(h->xdp_mod, "xdp_send_buffer_ctx") &&
+        PyObject_HasAttrString(h->xdp_mod, "xdp_send_ctx") &&
+        PyObject_HasAttrString(h->xdp_mod, "xdp_stats_ctx")) {
+        h->use_ctx_api = 1;
+        h->fn_send_buffer = PyObject_GetAttrString(h->xdp_mod, "xdp_send_buffer_ctx");
+        h->fn_send = PyObject_GetAttrString(h->xdp_mod, "xdp_send_ctx");
+        h->fn_stats = PyObject_GetAttrString(h->xdp_mod, "xdp_stats_ctx");
+    } else {
+        PyErr_Clear();
+        h->use_ctx_api = 0;
+        Py_XDECREF(h->fn_create); h->fn_create = NULL;
+        Py_XDECREF(h->fn_destroy); h->fn_destroy = NULL;
+        h->fn_init = PyObject_GetAttrString(h->xdp_mod, "xdp_init");
+        h->fn_send_buffer = PyObject_GetAttrString(h->xdp_mod, "xdp_send_buffer");
+        h->fn_send = PyObject_GetAttrString(h->xdp_mod, "xdp_send");
+        h->fn_stats = PyObject_GetAttrString(h->xdp_mod, "xdp_stats");
+        h->fn_cleanup = PyObject_GetAttrString(h->xdp_mod, "xdp_cleanup");
+    }
+
+    if (h->use_ctx_api) {
+        if (!h->fn_send_buffer || !PyCallable_Check(h->fn_send_buffer) ||
+            !h->fn_send || !PyCallable_Check(h->fn_send) ||
+            !h->fn_stats || !PyCallable_Check(h->fn_stats)) {
+            _release_handle_refs(h);
+            free(h);
+            _err_set(err, 13, "xdp_sender context API missing callable methods");
+            return NULL;
+        }
+    } else {
+        if (!h->fn_init || !PyCallable_Check(h->fn_init) ||
+            !h->fn_send_buffer || !PyCallable_Check(h->fn_send_buffer) ||
+            !h->fn_send || !PyCallable_Check(h->fn_send) ||
+            !h->fn_stats || !PyCallable_Check(h->fn_stats) ||
+            !h->fn_cleanup || !PyCallable_Check(h->fn_cleanup)) {
+            _release_handle_refs(h);
+            free(h);
+            _err_set(err, 13, "xdp_sender required API missing");
+            return NULL;
+        }
     }
 
     if (h->mode_requested == 2) {
@@ -177,39 +311,70 @@ xdp_core_handle *xdp_core_open(const xdp_core_open_cfg *cfg, xdp_core_err *err) 
                 "xdp_mode2_hard_probe_not_supported: %s",
                 h->mode2_probe_reason
             );
-            Py_DECREF(h->xdp_mod);
+            _release_handle_refs(h);
             free(h);
             _err_set(err, 14, msg);
             return NULL;
         }
-        if (!hard_policy && strcmp(h->mode2_probe_status, "unsupported") == 0) {
+        if (!hard_policy &&
+            (strcmp(h->mode2_probe_status, "unsupported") == 0 ||
+             strcmp(h->mode2_probe_status, "unknown") == 0)) {
             h->mode_effective = 1;
         }
     }
 
-    ret = PyObject_CallMethod(
-        h->xdp_mod,
-        "xdp_init",
-        "sii",
-        cfg->interface,
-        cfg->queue_id,
-        h->mode_effective
-    );
+    if (h->use_ctx_api) {
+        ret = PyObject_CallFunction(
+            h->fn_create,
+            "sii",
+            cfg->interface,
+            cfg->queue_id,
+            h->mode_effective
+        );
+    } else {
+        ret = PyObject_CallFunction(
+            h->fn_init,
+            "sii",
+            cfg->interface,
+            cfg->queue_id,
+            h->mode_effective
+        );
+    }
     if (!ret) {
         PyErr_Clear();
-        Py_DECREF(h->xdp_mod);
+        _release_handle_refs(h);
         free(h);
         _err_set(err, 15, "xdp_init_failed");
         return NULL;
     }
-    if (!PyObject_IsTrue(ret)) {
+
+    if (h->use_ctx_api) {
+        long handle = PyLong_AsLong(ret);
         Py_DECREF(ret);
-        Py_DECREF(h->xdp_mod);
-        free(h);
-        _err_set(err, 16, "xdp_init_rejected");
-        return NULL;
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            _release_handle_refs(h);
+            free(h);
+            _err_set(err, 16, "xdp_create_handle_invalid");
+            return NULL;
+        }
+        if (handle <= 0) {
+            _release_handle_refs(h);
+            free(h);
+            _err_set(err, 16, "xdp_create_rejected");
+            return NULL;
+        }
+        h->ctx_handle = (int)handle;
+    } else {
+        if (!PyObject_IsTrue(ret)) {
+            Py_DECREF(ret);
+            _release_handle_refs(h);
+            free(h);
+            _err_set(err, 16, "xdp_init_rejected");
+            return NULL;
+        }
+        Py_DECREF(ret);
     }
-    Py_DECREF(ret);
 
     h->initialized = 1;
     _err_set(err, 0, "");
@@ -227,6 +392,7 @@ int xdp_core_send_buffer(
     PyObject *ret = NULL;
     long sent = 0;
     Py_ssize_t nbytes;
+    char nerr[160];
 
     if (!h || !h->xdp_mod || !h->initialized) {
         _err_set(err, 20, "xdp_core handle not initialized");
@@ -237,6 +403,25 @@ int xdp_core_send_buffer(
         return -1;
     }
 
+    if (h->use_native_api && h->native_api) {
+        nerr[0] = '\0';
+        sent = (long)h->native_api->send_buffer(
+            h->ctx_handle,
+            buf,
+            pkt_size,
+            count,
+            nerr,
+            sizeof(nerr)
+        );
+        if (sent < 0) {
+            _err_set(err, 23, nerr[0] ? nerr : "xdp_native_send_failed");
+            return -1;
+        }
+        if (sent > count) sent = count;
+        _err_set(err, 0, "");
+        return (int)sent;
+    }
+
     nbytes = (Py_ssize_t)pkt_size * (Py_ssize_t)count;
     mv = PyMemoryView_FromMemory((char *)buf, nbytes, PyBUF_READ);
     if (!mv) {
@@ -244,7 +429,11 @@ int xdp_core_send_buffer(
         return -1;
     }
 
-    ret = PyObject_CallMethod(h->xdp_mod, "xdp_send_buffer", "Oii", mv, pkt_size, count);
+    if (h->use_ctx_api) {
+        ret = PyObject_CallFunction(h->fn_send_buffer, "iOii", h->ctx_handle, mv, pkt_size, count);
+    } else {
+        ret = PyObject_CallFunction(h->fn_send_buffer, "Oii", mv, pkt_size, count);
+    }
     Py_DECREF(mv);
     if (!ret) {
         PyErr_Clear();
@@ -277,6 +466,7 @@ int xdp_core_send_vector(
     PyObject *ret = NULL;
     long sent = 0;
     int i;
+    char nerr[160];
 
     if (!h || !h->xdp_mod || !h->initialized) {
         _err_set(err, 30, "xdp_core handle not initialized");
@@ -285,6 +475,25 @@ int xdp_core_send_vector(
     if (!pkts || !lens || count <= 0) {
         _err_set(err, 31, "invalid vector arguments");
         return -1;
+    }
+
+    if (h->use_native_api && h->native_api) {
+        nerr[0] = '\0';
+        sent = (long)h->native_api->send_vector(
+            h->ctx_handle,
+            pkts,
+            lens,
+            count,
+            nerr,
+            sizeof(nerr)
+        );
+        if (sent < 0) {
+            _err_set(err, 34, nerr[0] ? nerr : "xdp_native_send_failed");
+            return -1;
+        }
+        if (sent > count) sent = count;
+        _err_set(err, 0, "");
+        return (int)sent;
     }
 
     lst = PyList_New((Py_ssize_t)count);
@@ -302,7 +511,11 @@ int xdp_core_send_vector(
         PyList_SET_ITEM(lst, i, b); /* steals */
     }
 
-    ret = PyObject_CallMethod(h->xdp_mod, "xdp_send", "O", lst);
+    if (h->use_ctx_api) {
+        ret = PyObject_CallFunction(h->fn_send, "iO", h->ctx_handle, lst);
+    } else {
+        ret = PyObject_CallFunction(h->fn_send, "O", lst);
+    }
     Py_DECREF(lst);
     if (!ret) {
         PyErr_Clear();
@@ -326,6 +539,8 @@ int xdp_core_send_vector(
 int xdp_core_stats(xdp_core_handle *h, xdp_core_stats_snapshot *out, xdp_core_err *err) {
     PyObject *ret = NULL;
     long v = 0;
+    xdp_native_stats nstats;
+    char nerr[160];
 
     if (!out) {
         _err_set(err, 40, "stats output is null");
@@ -338,7 +553,25 @@ int xdp_core_stats(xdp_core_handle *h, xdp_core_stats_snapshot *out, xdp_core_er
         return -1;
     }
 
-    ret = PyObject_CallMethod(h->xdp_mod, "xdp_stats", NULL);
+    if (h->use_native_api && h->native_api) {
+        nerr[0] = '\0';
+        if (h->native_api->get_stats(h->ctx_handle, &nstats, nerr, sizeof(nerr)) < 0) {
+            _err_set(err, 42, nerr[0] ? nerr : "xdp_native_stats_failed");
+            return -1;
+        }
+        out->tx_packets = nstats.tx_packets;
+        out->tx_bytes = nstats.tx_bytes;
+        out->tx_errors = nstats.tx_errors;
+        out->tx_wakeups = nstats.tx_wakeups;
+        _err_set(err, 0, "");
+        return 0;
+    }
+
+    if (h->use_ctx_api) {
+        ret = PyObject_CallFunction(h->fn_stats, "i", h->ctx_handle);
+    } else {
+        ret = PyObject_CallNoArgs(h->fn_stats);
+    }
     if (!ret) {
         PyErr_Clear();
         _err_set(err, 42, "xdp_stats_failed");
@@ -362,13 +595,23 @@ int xdp_core_stats(xdp_core_handle *h, xdp_core_stats_snapshot *out, xdp_core_er
 
 int xdp_core_close(xdp_core_handle *h, xdp_core_err *err) {
     PyObject *ret = NULL;
+    char nerr[160];
 
     if (!h) {
         _err_set(err, 0, "");
         return 0;
     }
-    if (h->xdp_mod && h->initialized) {
-        ret = PyObject_CallMethod(h->xdp_mod, "xdp_cleanup", NULL);
+    if (h->initialized) {
+        if (h->use_native_api && h->native_api) {
+            nerr[0] = '\0';
+            (void)h->native_api->destroy_ctx(h->ctx_handle, nerr, sizeof(nerr));
+        } else if (h->use_ctx_api) {
+            if (h->fn_destroy) {
+                ret = PyObject_CallFunction(h->fn_destroy, "i", h->ctx_handle);
+            }
+        } else if (h->fn_cleanup) {
+            ret = PyObject_CallNoArgs(h->fn_cleanup);
+        }
         if (!ret) {
             PyErr_Clear();
         } else {
@@ -376,8 +619,7 @@ int xdp_core_close(xdp_core_handle *h, xdp_core_err *err) {
         }
         h->initialized = 0;
     }
-    Py_XDECREF(h->xdp_mod);
-    h->xdp_mod = NULL;
+    _release_handle_refs(h);
     free(h);
     _err_set(err, 0, "");
     return 0;

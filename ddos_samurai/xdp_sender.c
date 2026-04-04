@@ -52,6 +52,8 @@
 #include <net/if.h>
 #include <arpa/inet.h>
 
+#include "xdp_native_api.h"
+
 // ============================================================================
 // Configuration Constants
 // ============================================================================
@@ -2356,10 +2358,300 @@ static PyObject* py_xdp_stats_ctx(PyObject* self, PyObject* args)
 }
 
 // ============================================================================
+// Native Capsule API (C-to-C Fast Path)
+// ============================================================================
+
+static void xdp_native_set_err(char *err, size_t err_len, const char *msg)
+{
+    if (err == NULL || err_len == 0) {
+        return;
+    }
+    (void)snprintf(err, err_len, "%s", msg ? msg : "xdp_native_error");
+}
+
+static int xdp_native_create_ctx(
+    const char *ifname,
+    int queue_id,
+    int mode,
+    char *err,
+    size_t err_len
+)
+{
+    char map_reason[256];
+    xdp_context_t *ctx = NULL;
+    int handle = -1;
+
+    if (ifname == NULL || ifname[0] == '\0') {
+        xdp_native_set_err(err, err_len, "interface is required");
+        return -1;
+    }
+    if (geteuid() != 0) {
+        xdp_native_set_err(err, err_len, "root privileges required for AF_XDP");
+        return -1;
+    }
+    if (mode < 0 || mode > 2) {
+        xdp_native_set_err(err, err_len, "mode must be 0/1/2");
+        return -1;
+    }
+
+    ctx = (xdp_context_t*)calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        xdp_native_set_err(err, err_len, "out of memory");
+        return -1;
+    }
+    pthread_mutex_init(&ctx->lock, NULL);
+    pthread_mutex_lock(&ctx->lock);
+
+    struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
+    if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
+        fprintf(stderr, "[XDP][native] Warning: Could not increase MEMLOCK limit\n");
+    }
+
+    ctx->umem = create_umem();
+    if (!ctx->umem) {
+        pthread_mutex_unlock(&ctx->lock);
+        pthread_mutex_destroy(&ctx->lock);
+        free(ctx);
+        xdp_native_set_err(err, err_len, "create_umem failed");
+        return -1;
+    }
+
+    ctx->xsk = create_xsk_socket(ctx->umem, (char*)ifname, queue_id, mode);
+    if (!ctx->xsk) {
+        destroy_umem(ctx->umem);
+        ctx->umem = NULL;
+        pthread_mutex_unlock(&ctx->lock);
+        pthread_mutex_destroy(&ctx->lock);
+        free(ctx);
+        xdp_native_set_err(err, err_len, "create_xsk_socket failed");
+        return -1;
+    }
+
+    ctx->xdp_mode = mode;
+    ctx->is_initialized = 1;
+    ctx->is_running = 1;
+    ctx->tx_packets = 0;
+    ctx->tx_bytes = 0;
+    ctx->tx_errors = 0;
+    ctx->tx_wakeups = 0;
+    ctx->tx_desc_reserve_failures = 0;
+    ctx->tx_frame_alloc_failures = 0;
+    ctx->tx_partial_batches = 0;
+    ctx->tx_retry_loops = 0;
+    ctx->tx_completion_events = 0;
+    ctx->tx_completed_desc = 0;
+    ctx->tx_invalid_packets = 0;
+    ctx->tx_backpressure_events = 0;
+    ctx->tx_send_calls = 0;
+    ctx->tx_send_ns_total = 0;
+    ctx->tx_send_ns_max = 0;
+    ctx->queue_id = queue_id;
+    ctx->xsks_map_fd = -1;
+    ctx->xsks_map_key = queue_id;
+    ctx->xsks_map_registered = 0;
+    clock_gettime(CLOCK_MONOTONIC, &ctx->start_time);
+
+    map_reason[0] = '\0';
+    if (register_xsk_in_xsks_map_ctx(ctx, queue_id, ctx->xsk->fd, map_reason, sizeof(map_reason)) < 0) {
+        cleanup_ctx_locked(ctx);
+        pthread_mutex_unlock(&ctx->lock);
+        pthread_mutex_destroy(&ctx->lock);
+        free(ctx);
+        if (map_reason[0] != '\0') {
+            xdp_native_set_err(err, err_len, map_reason);
+        } else {
+            xdp_native_set_err(err, err_len, "xsks_map registration failed");
+        }
+        return -1;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+    handle = register_ctx_handle(ctx);
+    if (handle < 0) {
+        pthread_mutex_lock(&ctx->lock);
+        cleanup_ctx_locked(ctx);
+        pthread_mutex_unlock(&ctx->lock);
+        pthread_mutex_destroy(&ctx->lock);
+        free(ctx);
+        xdp_native_set_err(err, err_len, "no free context slots");
+        return -1;
+    }
+
+    xdp_native_set_err(err, err_len, "");
+    return handle;
+}
+
+static int xdp_native_destroy_ctx(int handle, char *err, size_t err_len)
+{
+    xdp_context_t *ctx = remove_ctx_by_handle_locked(handle);
+    if (!ctx) {
+        xdp_native_set_err(err, err_len, "invalid context handle");
+        return -1;
+    }
+
+    cleanup_ctx_locked(ctx);
+    pthread_mutex_unlock(&ctx->lock);
+    pthread_mutex_destroy(&ctx->lock);
+    free(ctx);
+    xdp_native_set_err(err, err_len, "");
+    return 0;
+}
+
+static int xdp_native_send_buffer(
+    int handle,
+    const uint8_t *buffer,
+    int packet_size,
+    int count,
+    char *err,
+    size_t err_len
+)
+{
+    xdp_context_t *ctx = NULL;
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+
+    if (buffer == NULL || packet_size <= 0 || count < 0) {
+        xdp_native_set_err(err, err_len, "invalid send_buffer arguments");
+        return -1;
+    }
+    if (count == 0) {
+        xdp_native_set_err(err, err_len, "");
+        return 0;
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        xdp_native_set_err(err, err_len, "invalid context handle");
+        return -1;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "context not initialized");
+        return -1;
+    }
+
+    if (ensure_ctx_send_scratch_capacity(ctx, (Py_ssize_t)count) < 0) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "scratch allocation failed");
+        return -1;
+    }
+    const uint8_t *base = buffer;
+    for (int i = 0; i < count; i++) {
+        ctx->scratch_packets[i] = base + ((size_t)i * (size_t)packet_size);
+        ctx->scratch_lengths[i] = (uint16_t)packet_size;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_vector_ctx(ctx, ctx->scratch_packets, ctx->scratch_lengths, (Py_ssize_t)count);
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    xdp_record_send_timing(ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+    pthread_mutex_unlock(&ctx->lock);
+
+    xdp_native_set_err(err, err_len, "");
+    return total_sent;
+}
+
+static int xdp_native_send_vector(
+    int handle,
+    const uint8_t **packets,
+    const uint16_t *lengths,
+    int count,
+    char *err,
+    size_t err_len
+)
+{
+    xdp_context_t *ctx = NULL;
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+
+    if (packets == NULL || lengths == NULL || count < 0) {
+        xdp_native_set_err(err, err_len, "invalid send_vector arguments");
+        return -1;
+    }
+    if (count == 0) {
+        xdp_native_set_err(err, err_len, "");
+        return 0;
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        xdp_native_set_err(err, err_len, "invalid context handle");
+        return -1;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "context not initialized");
+        return -1;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_vector_ctx(ctx, packets, (uint16_t*)lengths, (Py_ssize_t)count);
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    xdp_record_send_timing(ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+    pthread_mutex_unlock(&ctx->lock);
+
+    xdp_native_set_err(err, err_len, "");
+    return total_sent;
+}
+
+static int xdp_native_get_stats(int handle, xdp_native_stats *out, char *err, size_t err_len)
+{
+    xdp_context_t *ctx = NULL;
+
+    if (out == NULL) {
+        xdp_native_set_err(err, err_len, "stats output is null");
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        xdp_native_set_err(err, err_len, "invalid context handle");
+        return -1;
+    }
+    if (!ctx->is_initialized) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "context not initialized");
+        return -1;
+    }
+
+    out->tx_packets = ctx->tx_packets;
+    out->tx_bytes = ctx->tx_bytes;
+    out->tx_errors = ctx->tx_errors;
+    out->tx_wakeups = ctx->tx_wakeups;
+    out->mode = ctx->xdp_mode;
+    out->queue_id = ctx->queue_id;
+    pthread_mutex_unlock(&ctx->lock);
+
+    xdp_native_set_err(err, err_len, "");
+    return 0;
+}
+
+static xdp_native_api_v1 g_xdp_native_api = {
+    .version = XDP_NATIVE_API_VERSION,
+    .create_ctx = xdp_native_create_ctx,
+    .destroy_ctx = xdp_native_destroy_ctx,
+    .send_buffer = xdp_native_send_buffer,
+    .send_vector = xdp_native_send_vector,
+    .get_stats = xdp_native_get_stats,
+};
+
+static PyObject* py_xdp_get_native_api(PyObject* self, PyObject* args)
+{
+    (void)self;
+    (void)args;
+    return PyCapsule_New((void*)&g_xdp_native_api, XDP_NATIVE_API_CAPSULE_NAME, NULL);
+}
+
+// ============================================================================
 // Module Definition
 // ============================================================================
 
 static PyMethodDef XdpSenderMethods[] = {
+    {"xdp_get_native_api", py_xdp_get_native_api, METH_NOARGS,
+     "Return native C API capsule for xdp_core fast path."},
     {"xdp_create", py_xdp_create, METH_VARARGS,
      "Create independent AF_XDP context.\n"
      "Args: interface (str), queue_id (int, default=0), mode (int, default=0=Copy)\n"
