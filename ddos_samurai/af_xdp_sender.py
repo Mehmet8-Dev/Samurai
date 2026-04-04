@@ -44,6 +44,7 @@ import struct
 import logging
 import subprocess
 import threading
+import queue
 import shutil
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Callable, Any
@@ -174,6 +175,20 @@ class XDPStats:
     tx_bytes: int = 0
     tx_errors: int = 0
     tx_wakeups: int = 0
+    tx_desc_reserve_failures: int = 0
+    tx_frame_alloc_failures: int = 0
+    tx_partial_batches: int = 0
+    tx_retry_loops: int = 0
+    tx_completion_events: int = 0
+    tx_completed_desc: int = 0
+    tx_invalid_packets: int = 0
+    tx_backpressure_events: int = 0
+    tx_send_calls: int = 0
+    tx_send_ns_total: int = 0
+    tx_send_ns_max: int = 0
+    tx_send_avg_us: float = 0.0
+    tx_send_max_us: float = 0.0
+    queue_id: int = 0
     elapsed_seconds: float = 0.0
     packets_per_second: float = 0.0
     mbps: float = 0.0
@@ -188,6 +203,20 @@ class XDPStats:
             tx_bytes=data.get('tx_bytes', 0),
             tx_errors=data.get('tx_errors', 0),
             tx_wakeups=data.get('tx_wakeups', 0),
+            tx_desc_reserve_failures=data.get('tx_desc_reserve_failures', 0),
+            tx_frame_alloc_failures=data.get('tx_frame_alloc_failures', 0),
+            tx_partial_batches=data.get('tx_partial_batches', 0),
+            tx_retry_loops=data.get('tx_retry_loops', 0),
+            tx_completion_events=data.get('tx_completion_events', 0),
+            tx_completed_desc=data.get('tx_completed_desc', 0),
+            tx_invalid_packets=data.get('tx_invalid_packets', 0),
+            tx_backpressure_events=data.get('tx_backpressure_events', 0),
+            tx_send_calls=data.get('tx_send_calls', 0),
+            tx_send_ns_total=data.get('tx_send_ns_total', 0),
+            tx_send_ns_max=data.get('tx_send_ns_max', 0),
+            tx_send_avg_us=data.get('tx_send_avg_us', 0.0),
+            tx_send_max_us=data.get('tx_send_max_us', 0.0),
+            queue_id=data.get('queue_id', 0),
             elapsed_seconds=data.get('elapsed_seconds', 0.0),
             packets_per_second=data.get('packets_per_second', 0.0),
             mbps=data.get('mbps', 0.0),
@@ -199,7 +228,11 @@ class XDPStats:
         return (f"XDP Stats: {self.tx_packets:,} packets, "
                 f"{self.tx_bytes:,} bytes, "
                 f"{self.packets_per_second:,.0f} pps, "
-                f"{self.mbps:.2f} Mbps "
+                f"{self.mbps:.2f} Mbps, "
+                f"reserve_fail={self.tx_desc_reserve_failures:,}, "
+                f"alloc_fail={self.tx_frame_alloc_failures:,}, "
+                f"backpressure={self.tx_backpressure_events:,}, "
+                f"avg_send={self.tx_send_avg_us:.2f}us "
                 f"[{self.mode_name}]")
 
 
@@ -374,6 +407,7 @@ class XDPSender:
         attach_bpf: Optional[bool] = None,
         bpf_section: Optional[str] = None,
         bpf_obj_path: Optional[str] = None,
+        use_multi_ctx: Optional[bool] = None,
     ):
         """
         Initialize XDP sender.
@@ -390,6 +424,8 @@ class XDPSender:
             attach_bpf: Auto attach XDP BPF program on start
             bpf_section: BPF section name to attach
             bpf_obj_path: Path to xdp_prog.o object file
+            use_multi_ctx: Force enable/disable multi-context API usage.
+                None => controlled by SAMURAI_XDP_MULTI_CTX env.
         """
         self.interface = interface or get_default_interface()
         self.queue_id = queue_id
@@ -408,6 +444,11 @@ class XDPSender:
         self._xdp = None
         self._is_running = False
         self._use_fallback = False
+        self._ctx_handle: Optional[int] = None
+        if use_multi_ctx is None:
+            self._use_multi_ctx = _env_truthy("SAMURAI_XDP_MULTI_CTX", True)
+        else:
+            self._use_multi_ctx = bool(use_multi_ctx)
         self._effective_mode = int(mode)
         self._mode2_probe_status = "not_run"
         self._mode2_probe_reason = ""
@@ -667,10 +708,10 @@ class XDPSender:
                             f"mode=2 hard policy violated: {probe_status} ({probe_reason})"
                         )
 
-                    if self.mode2_policy == "soft" and probe_status == "unsupported":
+                    if self.mode2_policy == "soft" and probe_status in {"unsupported", "unknown"}:
                         self._effective_mode = XDP_MODE_NATIVE
                         utils.log_warning(
-                            f"[XDP] mode=2 probe unsupported ({probe_reason}); soft fallback -> mode=1"
+                            f"[XDP] mode=2 probe {probe_status} ({probe_reason}); soft fallback -> mode=1"
                         )
 
                 if self.attach_bpf:
@@ -683,7 +724,22 @@ class XDPSender:
                     else:
                         raise RuntimeError(attach_msg)
 
-                result = self._xdp.xdp_init(self.interface, self.queue_id, self._effective_mode)
+                use_ctx_api = (
+                    self._use_multi_ctx
+                    and "xdp_create" in dir(self._xdp)
+                    and "xdp_destroy" in dir(self._xdp)
+                    and "xdp_send_ctx" in dir(self._xdp)
+                )
+
+                if use_ctx_api:
+                    handle = int(self._xdp.xdp_create(self.interface, self.queue_id, self._effective_mode) or 0)
+                    if handle <= 0:
+                        raise RuntimeError("xdp_create returned invalid handle")
+                    self._ctx_handle = handle
+                    result = True
+                    utils.log_info(f"[XDP] Multi-context handle allocated: {self._ctx_handle}")
+                else:
+                    result = self._xdp.xdp_init(self.interface, self.queue_id, self._effective_mode)
                 
                 if result:
                     utils.log_info(f"[XDP] Started on {self.interface} "
@@ -715,12 +771,23 @@ class XDPSender:
             
             if not self._use_fallback and self._xdp:
                 try:
-                    stats = self._xdp.xdp_stats()
+                    stats = None
+                    if self._ctx_handle is not None:
+                        if "xdp_stats_ctx" in dir(self._xdp):
+                            stats = self._xdp.xdp_stats_ctx(int(self._ctx_handle))
+                    if stats is None:
+                        stats = self._xdp.xdp_stats()
                     if stats:
                         self._total_packets = stats.get('tx_packets', 0)
                         self._total_bytes = stats.get('tx_bytes', 0)
-                    
-                    self._xdp.xdp_cleanup()
+
+                    if self._ctx_handle is not None:
+                        if "xdp_destroy" in dir(self._xdp):
+                            self._xdp.xdp_destroy(int(self._ctx_handle))
+                        else:
+                            self._xdp.xdp_cleanup()
+                    else:
+                        self._xdp.xdp_cleanup()
                 except Exception as e:
                     utils.log_error(f"[XDP] Cleanup error: {e}")
                 finally:
@@ -731,6 +798,7 @@ class XDPSender:
             self._is_running = False
             self._use_fallback = False
             self._xdp = None
+            self._ctx_handle = None
             self._effective_mode = int(self.mode)
             self._mode2_probe_status = "not_run"
             self._mode2_probe_reason = ""
@@ -757,7 +825,13 @@ class XDPSender:
             return self._send_fallback(packets)
         
         try:
-            sent = self._xdp.xdp_send(packets)
+            if self._ctx_handle is not None:
+                if "xdp_send_ctx" in dir(self._xdp):
+                    sent = self._xdp.xdp_send_ctx(int(self._ctx_handle), packets)
+                else:
+                    raise RuntimeError("xdp_send_ctx API not available for multi-context mode")
+            else:
+                sent = self._xdp.xdp_send(packets)
             return sent
         except Exception as e:
             utils.log_error(f"[XDP] Send error: {e}")
@@ -781,6 +855,15 @@ class XDPSender:
             return self._send_buffer_fallback(packet_buffer, packet_size, count)
 
         try:
+            if self._ctx_handle is not None:
+                if "xdp_send_buffer_ctx" in dir(self._xdp):
+                    return int(
+                        self._xdp.xdp_send_buffer_ctx(
+                            int(self._ctx_handle), packet_buffer, int(packet_size), int(count)
+                        ) or 0
+                    )
+                raise RuntimeError("xdp_send_buffer_ctx API not available for multi-context mode")
+
             if hasattr(self._xdp, "xdp_send_buffer"):
                 return int(self._xdp.xdp_send_buffer(packet_buffer, int(packet_size), int(count)) or 0)
 
@@ -802,6 +885,8 @@ class XDPSender:
             raise RuntimeError("XDP sender not started")
         if self._use_fallback:
             raise RuntimeError("UMEM frame API not available in fallback mode")
+        if self._ctx_handle is not None:
+            raise RuntimeError("UMEM frame API not available in multi-context mode")
         if not hasattr(self._xdp, "xdp_acquire_tx_frame"):
             raise RuntimeError("xdp_acquire_tx_frame API not available")
         return self._xdp.xdp_acquire_tx_frame()
@@ -812,6 +897,8 @@ class XDPSender:
             raise RuntimeError("XDP sender not started")
         if self._use_fallback:
             raise RuntimeError("UMEM frame API not available in fallback mode")
+        if self._ctx_handle is not None:
+            raise RuntimeError("UMEM frame API not available in multi-context mode")
         if not hasattr(self._xdp, "xdp_submit_tx_frame"):
             raise RuntimeError("xdp_submit_tx_frame API not available")
         return bool(self._xdp.xdp_submit_tx_frame(int(frame_id), int(length)))
@@ -822,6 +909,8 @@ class XDPSender:
             raise RuntimeError("XDP sender not started")
         if self._use_fallback:
             raise RuntimeError("UMEM frame API not available in fallback mode")
+        if self._ctx_handle is not None:
+            raise RuntimeError("UMEM frame API not available in multi-context mode")
         if not hasattr(self._xdp, "xdp_release_tx_frame"):
             raise RuntimeError("xdp_release_tx_frame API not available")
         return bool(self._xdp.xdp_release_tx_frame(int(frame_id)))
@@ -853,6 +942,9 @@ class XDPSender:
         
         if self._use_fallback:
             return self._send_udp_fallback(target_ip, target_port, payloads)
+        if self._ctx_handle is not None:
+            utils.log_error("[XDP] send_udp is not yet supported in multi-context mode")
+            return 0
         
         try:
             send_udp_fn = getattr(
@@ -977,7 +1069,13 @@ class XDPSender:
             )
         
         try:
-            stats_dict = self._xdp.xdp_stats()
+            if self._ctx_handle is not None:
+                if "xdp_stats_ctx" in dir(self._xdp):
+                    stats_dict = self._xdp.xdp_stats_ctx(int(self._ctx_handle))
+                else:
+                    raise RuntimeError("xdp_stats_ctx API not available for multi-context mode")
+            else:
+                stats_dict = self._xdp.xdp_stats()
             if stats_dict:
                 return XDPStats.from_dict(stats_dict)
         except Exception:
@@ -1024,7 +1122,10 @@ class XDPBulkSender:
         self,
         interface: Optional[str] = None,
         threads: int = 1,
-        batch_size: int = 256
+        batch_size: int = 256,
+        queue_id_base: int = DEFAULT_QUEUE_ID,
+        queue_count: Optional[int] = None,
+        use_multi_ctx: Optional[bool] = True,
     ):
         """
         Initialize bulk sender.
@@ -1033,41 +1134,185 @@ class XDPBulkSender:
             interface: Network interface
             threads: Number of sender threads
             batch_size: Packets per batch
+            queue_id_base: First queue id for affinity mapping
+            queue_count: Number of queues to distribute over (auto-detected if None)
+            use_multi_ctx: Force enable/disable context-handle API per sender.
+                Default True for queue-affinity context isolation.
         """
         self.interface = interface or get_default_interface()
-        self.threads = threads
-        self.batch_size = batch_size
-        
-        self._sender = None
+        self.threads = max(1, int(threads))
+        self.batch_size = max(1, int(batch_size))
+        self.queue_id_base = int(queue_id_base)
+        auto_queue_count = int(queue_count) if queue_count is not None else int(get_interface_queue_count(self.interface))
+        self.queue_count = max(1, auto_queue_count)
+        self.use_multi_ctx = use_multi_ctx
+
         self._is_running = False
-        self._packet_queue = []
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._senders: List[XDPSender] = []
+        self._sender_queues: List[queue.Queue] = []
         self._workers = []
+        self._dropped_batches = 0
+        self._dispatch_index = 0
+        self._start_time: Optional[float] = None
+
+    def _queue_id_for_worker(self, worker_index: int) -> int:
+        return int(self.queue_id_base + (worker_index % self.queue_count))
+
+    def _worker_loop(self, worker_index: int) -> None:
+        sender_queue = self._sender_queues[worker_index]
+        sender = self._senders[worker_index]
+        while not self._stop_event.is_set():
+            try:
+                batch = sender_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if batch is None:
+                sender_queue.task_done()
+                break
+
+            try:
+                if batch:
+                    sender.send(batch)
+            finally:
+                sender_queue.task_done()
+
+    def _aggregate_stats(self) -> XDPStats:
+        if not self._senders:
+            return XDPStats()
+
+        sender_stats = [s.get_stats() for s in self._senders]
+        aggregate = XDPStats(
+            tx_packets=sum(st.tx_packets for st in sender_stats),
+            tx_bytes=sum(st.tx_bytes for st in sender_stats),
+            tx_errors=sum(st.tx_errors for st in sender_stats),
+            tx_wakeups=sum(st.tx_wakeups for st in sender_stats),
+            tx_desc_reserve_failures=sum(st.tx_desc_reserve_failures for st in sender_stats),
+            tx_frame_alloc_failures=sum(st.tx_frame_alloc_failures for st in sender_stats),
+            tx_partial_batches=sum(st.tx_partial_batches for st in sender_stats),
+            tx_retry_loops=sum(st.tx_retry_loops for st in sender_stats),
+            tx_completion_events=sum(st.tx_completion_events for st in sender_stats),
+            tx_completed_desc=sum(st.tx_completed_desc for st in sender_stats),
+            tx_invalid_packets=sum(st.tx_invalid_packets for st in sender_stats),
+            tx_backpressure_events=sum(st.tx_backpressure_events for st in sender_stats),
+            tx_send_calls=sum(st.tx_send_calls for st in sender_stats),
+            tx_send_ns_total=sum(st.tx_send_ns_total for st in sender_stats),
+            tx_send_ns_max=max((st.tx_send_ns_max for st in sender_stats), default=0),
+            mode=sender_stats[0].mode if sender_stats else 0,
+            mode_name=sender_stats[0].mode_name if sender_stats else "Unknown",
+        )
+
+        elapsed = 0.0
+        now = time.time()
+        if self._start_time is not None and self._is_running:
+            elapsed = max(0.0, now - self._start_time)
+        if elapsed <= 0.0:
+            elapsed = max((st.elapsed_seconds for st in sender_stats), default=0.0)
+
+        aggregate.elapsed_seconds = elapsed
+        if elapsed > 0:
+            aggregate.packets_per_second = aggregate.tx_packets / elapsed
+            aggregate.mbps = (aggregate.tx_bytes * 8) / (elapsed * 1e6)
+        else:
+            aggregate.packets_per_second = 0.0
+            aggregate.mbps = 0.0
+        aggregate.tx_send_avg_us = (
+            (float(aggregate.tx_send_ns_total) / float(aggregate.tx_send_calls)) / 1000.0
+            if aggregate.tx_send_calls > 0 else 0.0
+        )
+        aggregate.tx_send_max_us = float(aggregate.tx_send_ns_max) / 1000.0
+        return aggregate
+
+    def _enqueue_batch(self, packets: List[bytes], timeout: float = 0.2) -> bool:
+        if not packets or not self._sender_queues:
+            return False
+
+        start_idx = self._dispatch_index % len(self._sender_queues)
+        for attempt in range(len(self._sender_queues)):
+            idx = (start_idx + attempt) % len(self._sender_queues)
+            try:
+                self._sender_queues[idx].put(packets, timeout=timeout)
+                self._dispatch_index = (idx + 1) % len(self._sender_queues)
+                return True
+            except queue.Full:
+                continue
+        self._dropped_batches += 1
+        self._dispatch_index = (start_idx + 1) % len(self._sender_queues)
+        return False
     
     def start(self) -> None:
         """Start bulk sender."""
-        self._sender = XDPSender(
-            interface=self.interface,
-            batch_size=self.batch_size
-        )
-        self._sender.start()
-        self._is_running = True
+        if self._is_running:
+            return
+
+        self._senders = []
+        self._sender_queues = []
+        self._workers = []
         self._stop_event.clear()
+        self._dropped_batches = 0
+        self._dispatch_index = 0
+
+        try:
+            for worker_index in range(self.threads):
+                sender = XDPSender(
+                    interface=self.interface,
+                    queue_id=self._queue_id_for_worker(worker_index),
+                    batch_size=self.batch_size,
+                    use_multi_ctx=self.use_multi_ctx,
+                )
+                sender.start()
+                self._senders.append(sender)
+                self._sender_queues.append(queue.Queue(maxsize=16))
+        except Exception:
+            for sender in self._senders:
+                try:
+                    sender.stop()
+                except Exception:
+                    pass
+            self._senders = []
+            self._sender_queues = []
+            self._workers = []
+            raise
+
+        for worker_index in range(self.threads):
+            worker = threading.Thread(
+                target=self._worker_loop,
+                args=(worker_index,),
+                daemon=True,
+            )
+            worker.start()
+            self._workers.append(worker)
+
+        self._is_running = True
+        self._start_time = time.time()
     
     def stop(self) -> XDPStats:
         """Stop bulk sender and return final stats."""
+        if not self._is_running:
+            return self._aggregate_stats()
+
         self._stop_event.set()
+        for sender_queue in self._sender_queues:
+            try:
+                sender_queue.put_nowait(None)
+            except queue.Full:
+                sender_queue.put(None)
         
         for worker in self._workers:
             worker.join(timeout=5.0)
+        self._workers = []
         
-        stats = self._sender.get_stats() if self._sender else XDPStats()
+        stats = self._aggregate_stats()
         
-        if self._sender:
-            self._sender.stop()
+        for sender in self._senders:
+            sender.stop()
         
         self._is_running = False
+        self._senders = []
+        self._sender_queues = []
+        self._start_time = None
         return stats
     
     def send_continuous(
@@ -1103,18 +1348,47 @@ class XDPBulkSender:
                 # Generate and send packets
                 packets = packet_generator()
                 if packets:
-                    self._sender.send(packets)
+                    self._enqueue_batch(packets, timeout=0.2)
                 
                 # Periodic stats callback
                 if on_stats and time.time() - last_stats_time >= stats_interval:
-                    stats = self._sender.get_stats()
+                    stats = self._aggregate_stats()
+                    if self._dropped_batches:
+                        utils.log_warning(
+                            f"[XDP Bulk] Dropped batches due to full queue: {self._dropped_batches}"
+                        )
                     on_stats(stats)
                     last_stats_time = time.time()
         
         except KeyboardInterrupt:
             pass
         
-        return self._sender.get_stats()
+        return self._aggregate_stats()
+
+    def get_stats(self) -> XDPStats:
+        """Get aggregated statistics across all sender contexts."""
+        return self._aggregate_stats()
+
+    def get_queue_stats(self) -> List[Dict[str, Any]]:
+        """Get per-queue statistics for each sender context."""
+        out: List[Dict[str, Any]] = []
+        for idx, sender in enumerate(self._senders):
+            st = sender.get_stats()
+            out.append(
+                {
+                    "worker_index": idx,
+                    "queue_id": int(st.queue_id),
+                    "tx_packets": int(st.tx_packets),
+                    "tx_bytes": int(st.tx_bytes),
+                    "tx_errors": int(st.tx_errors),
+                    "tx_backpressure_events": int(st.tx_backpressure_events),
+                    "tx_send_avg_us": float(st.tx_send_avg_us),
+                    "tx_send_max_us": float(st.tx_send_max_us),
+                    "packets_per_second": float(st.packets_per_second),
+                    "mbps": float(st.mbps),
+                }
+            )
+        return out
 
 
 # ============================================================================

@@ -141,25 +141,117 @@ typedef struct {
     uint64_t tx_bytes;
     uint64_t tx_errors;
     uint64_t tx_wakeups;
+    uint64_t tx_desc_reserve_failures;
+    uint64_t tx_frame_alloc_failures;
+    uint64_t tx_partial_batches;
+    uint64_t tx_retry_loops;
+    uint64_t tx_completion_events;
+    uint64_t tx_completed_desc;
+    uint64_t tx_invalid_packets;
+    uint64_t tx_backpressure_events;
+    uint64_t tx_send_calls;
+    uint64_t tx_send_ns_total;
+    uint64_t tx_send_ns_max;
     
     // Timing
     struct timespec start_time;
     
     // Configuration
     int xdp_mode;  // 0 = SKB/Generic, 1 = Native (DRV)
+    int queue_id;
     int xsks_map_fd;
     int xsks_map_key;
     int xsks_map_registered;
+
+    // Reusable send scratch buffers for context API paths.
+    const uint8_t **scratch_packets;
+    uint16_t *scratch_lengths;
+    PyObject **scratch_owners;
+    Py_ssize_t scratch_capacity;
 } xdp_context_t;
 
 static xdp_context_t xdp_ctx = {
     .is_initialized = 0,
     .is_running = 0,
+    .queue_id = 0,
     .xsks_map_fd = -1,
     .xsks_map_key = 0,
     .xsks_map_registered = 0,
     .lock = PTHREAD_MUTEX_INITIALIZER
 };
+
+static inline uint64_t xdp_timespec_diff_ns(const struct timespec *start, const struct timespec *end)
+{
+    uint64_t sec_ns = (uint64_t)(end->tv_sec - start->tv_sec) * 1000000000ULL;
+    if (end->tv_nsec >= start->tv_nsec) {
+        return sec_ns + (uint64_t)(end->tv_nsec - start->tv_nsec);
+    }
+    return sec_ns - (uint64_t)(start->tv_nsec - end->tv_nsec);
+}
+
+static inline void xdp_record_send_timing(xdp_context_t *ctx, uint64_t elapsed_ns)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->tx_send_calls += 1;
+    ctx->tx_send_ns_total += elapsed_ns;
+    if (elapsed_ns > ctx->tx_send_ns_max) {
+        ctx->tx_send_ns_max = elapsed_ns;
+    }
+}
+
+#define XDP_MAX_CONTEXTS 64
+static xdp_context_t *g_ctx_table[XDP_MAX_CONTEXTS] = {0};
+static pthread_mutex_t g_ctx_table_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int register_ctx_handle(xdp_context_t *ctx)
+{
+    int handle = -1;
+    pthread_mutex_lock(&g_ctx_table_lock);
+    for (int i = 1; i < XDP_MAX_CONTEXTS; i++) {
+        if (g_ctx_table[i] == NULL) {
+            g_ctx_table[i] = ctx;
+            handle = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_ctx_table_lock);
+    return handle;
+}
+
+static xdp_context_t *lock_ctx_by_handle(int handle)
+{
+    xdp_context_t *ctx = NULL;
+    if (handle <= 0 || handle >= XDP_MAX_CONTEXTS) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_ctx_table_lock);
+    ctx = g_ctx_table[handle];
+    if (ctx != NULL) {
+        pthread_mutex_lock(&ctx->lock);
+    }
+    pthread_mutex_unlock(&g_ctx_table_lock);
+    return ctx;
+}
+
+static xdp_context_t *remove_ctx_by_handle_locked(int handle)
+{
+    xdp_context_t *ctx = NULL;
+    if (handle <= 0 || handle >= XDP_MAX_CONTEXTS) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_ctx_table_lock);
+    ctx = g_ctx_table[handle];
+    if (ctx != NULL) {
+        pthread_mutex_lock(&ctx->lock);
+        g_ctx_table[handle] = NULL;
+    }
+    pthread_mutex_unlock(&g_ctx_table_lock);
+    return ctx;
+}
 
 // ============================================================================
 // BPF helpers (XSKMAP update/delete)
@@ -228,6 +320,45 @@ static int register_xsk_in_xsks_map(int queue_id, int xsk_fd, char *reason, size
     xdp_ctx.xsks_map_fd = map_fd;
     xdp_ctx.xsks_map_key = key;
     xdp_ctx.xsks_map_registered = 1;
+    return 0;
+}
+
+static int register_xsk_in_xsks_map_ctx(
+    xdp_context_t *ctx,
+    int queue_id,
+    int xsk_fd,
+    char *reason,
+    size_t reason_len
+)
+{
+    const char *map_path = getenv("SAMURAI_XDP_XSKMAP_PIN");
+    int map_fd;
+    int key = queue_id;
+    int value = xsk_fd;
+
+    if (map_path == NULL || map_path[0] == '\0') {
+        return 0;
+    }
+
+    map_fd = bpf_obj_get_path(map_path);
+    if (map_fd < 0) {
+        if (reason != NULL && reason_len > 0) {
+            (void)snprintf(reason, reason_len, "BPF_OBJ_GET(%s) failed: %s", map_path, strerror(errno));
+        }
+        return -1;
+    }
+
+    if (bpf_map_update_elem_fd(map_fd, &key, &value, BPF_ANY) < 0) {
+        if (reason != NULL && reason_len > 0) {
+            (void)snprintf(reason, reason_len, "xsks_map update failed: %s", strerror(errno));
+        }
+        close(map_fd);
+        return -1;
+    }
+
+    ctx->xsks_map_fd = map_fd;
+    ctx->xsks_map_key = key;
+    ctx->xsks_map_registered = 1;
     return 0;
 }
 
@@ -716,6 +847,8 @@ static void complete_tx(struct xsk_socket_info *xsk)
                                               xsk->outstanding_tx, &idx);
     
     if (completed > 0) {
+        xdp_ctx.tx_completion_events += 1;
+        xdp_ctx.tx_completed_desc += completed;
         for (uint32_t i = 0; i < completed; i++) {
             uint64_t *addr = xsk_ring_cons__comp_addr(&xsk->umem->comp, idx + i);
             free_frame(xsk, *addr);
@@ -758,6 +891,8 @@ static int xdp_send_batch(struct xsk_socket_info *xsk,
     
     uint32_t reserved = xsk_ring_prod__reserve(&xsk->tx, batch_size, &tx_idx);
     if (reserved == 0) {
+        xdp_ctx.tx_desc_reserve_failures += 1;
+        xdp_ctx.tx_backpressure_events += 1;
         kick_tx(xsk);
         return 0;
     }
@@ -767,6 +902,8 @@ static int xdp_send_batch(struct xsk_socket_info *xsk,
     for (uint32_t i = 0; i < reserved && submitted < count; i++) {
         uint64_t frame_addr = alloc_frame(xsk);
         if (frame_addr == UINT64_MAX) {
+            xdp_ctx.tx_frame_alloc_failures += 1;
+            xdp_ctx.tx_backpressure_events += 1;
             break;  // No more frames
         }
         
@@ -792,6 +929,7 @@ static int xdp_send_batch(struct xsk_socket_info *xsk,
     }
     
     if (submitted < (int)reserved) {
+        xdp_ctx.tx_partial_batches += 1;
         xsk_ring_prod__cancel(&xsk->tx, reserved - (uint32_t)submitted);
     }
 
@@ -811,6 +949,7 @@ static int xdp_send_batch(struct xsk_socket_info *xsk,
 typedef struct {
     const uint8_t **packets;
     uint16_t *lengths;
+    PyObject **owners;
     Py_ssize_t capacity;
 } xdp_send_scratch_t;
 
@@ -848,19 +987,123 @@ static int ensure_send_scratch_capacity(Py_ssize_t needed)
         return -1;
     }
 
+    PyObject **new_owners = (PyObject**)realloc(
+        g_send_scratch.owners, (size_t)new_cap * sizeof(PyObject*)
+    );
+    if (!new_owners) {
+        g_send_scratch.packets = new_packets;
+        g_send_scratch.lengths = new_lengths;
+        return -1;
+    }
+    for (Py_ssize_t i = g_send_scratch.capacity; i < new_cap; i++) {
+        new_owners[i] = NULL;
+    }
+
     g_send_scratch.packets = new_packets;
     g_send_scratch.lengths = new_lengths;
+    g_send_scratch.owners = new_owners;
     g_send_scratch.capacity = new_cap;
     return 0;
 }
 
+static void release_send_scratch_owners(Py_ssize_t count)
+{
+    if (count <= 0 || g_send_scratch.owners == NULL) {
+        return;
+    }
+    for (Py_ssize_t i = 0; i < count; i++) {
+        Py_XDECREF(g_send_scratch.owners[i]);
+        g_send_scratch.owners[i] = NULL;
+    }
+}
+
 static void clear_send_scratch(void)
 {
+    release_send_scratch_owners(g_send_scratch.capacity);
     free((void*)g_send_scratch.packets);
     free((void*)g_send_scratch.lengths);
+    free((void*)g_send_scratch.owners);
     g_send_scratch.packets = NULL;
     g_send_scratch.lengths = NULL;
+    g_send_scratch.owners = NULL;
     g_send_scratch.capacity = 0;
+}
+
+static void release_ctx_send_scratch_owners(xdp_context_t *ctx, Py_ssize_t count)
+{
+    if (ctx == NULL || count <= 0 || ctx->scratch_owners == NULL) {
+        return;
+    }
+    for (Py_ssize_t i = 0; i < count; i++) {
+        Py_XDECREF(ctx->scratch_owners[i]);
+        ctx->scratch_owners[i] = NULL;
+    }
+}
+
+static int ensure_ctx_send_scratch_capacity(xdp_context_t *ctx, Py_ssize_t needed)
+{
+    if (ctx == NULL || needed <= 0) {
+        return 0;
+    }
+    if (ctx->scratch_capacity >= needed &&
+        ctx->scratch_packets != NULL &&
+        ctx->scratch_lengths != NULL &&
+        ctx->scratch_owners != NULL) {
+        return 0;
+    }
+
+    Py_ssize_t new_cap = ctx->scratch_capacity > 0 ? ctx->scratch_capacity : 64;
+    while (new_cap < needed) {
+        new_cap <<= 1;
+    }
+
+    const uint8_t **new_packets = (const uint8_t**)realloc(
+        (void*)ctx->scratch_packets, (size_t)new_cap * sizeof(uint8_t*)
+    );
+    if (!new_packets) {
+        return -1;
+    }
+
+    uint16_t *new_lengths = (uint16_t*)realloc(
+        ctx->scratch_lengths, (size_t)new_cap * sizeof(uint16_t)
+    );
+    if (!new_lengths) {
+        ctx->scratch_packets = new_packets;
+        return -1;
+    }
+
+    PyObject **new_owners = (PyObject**)realloc(
+        ctx->scratch_owners, (size_t)new_cap * sizeof(PyObject*)
+    );
+    if (!new_owners) {
+        ctx->scratch_packets = new_packets;
+        ctx->scratch_lengths = new_lengths;
+        return -1;
+    }
+    for (Py_ssize_t i = ctx->scratch_capacity; i < new_cap; i++) {
+        new_owners[i] = NULL;
+    }
+
+    ctx->scratch_packets = new_packets;
+    ctx->scratch_lengths = new_lengths;
+    ctx->scratch_owners = new_owners;
+    ctx->scratch_capacity = new_cap;
+    return 0;
+}
+
+static void clear_ctx_send_scratch(xdp_context_t *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    release_ctx_send_scratch_owners(ctx, ctx->scratch_capacity);
+    free((void*)ctx->scratch_packets);
+    free(ctx->scratch_lengths);
+    free(ctx->scratch_owners);
+    ctx->scratch_packets = NULL;
+    ctx->scratch_lengths = NULL;
+    ctx->scratch_owners = NULL;
+    ctx->scratch_capacity = 0;
 }
 
 static int xdp_send_vector_locked(const uint8_t **packets, uint16_t *lengths, Py_ssize_t valid_count)
@@ -882,6 +1125,8 @@ static int xdp_send_vector_locked(const uint8_t **packets, uint16_t *lengths, Py
         );
 
         if (sent <= 0) {
+            xdp_ctx.tx_retry_loops += 1;
+            xdp_ctx.tx_backpressure_events += 1;
             complete_tx(xdp_ctx.xsk);
             sent = xdp_send_batch(
                 xdp_ctx.xsk,
@@ -891,6 +1136,131 @@ static int xdp_send_vector_locked(const uint8_t **packets, uint16_t *lengths, Py
             );
         }
 
+        if (sent <= 0) {
+            break;
+        }
+        if (sent > batch) {
+            sent = batch;
+        }
+
+        total_sent += sent;
+        offset += sent;
+    }
+
+    return total_sent;
+}
+
+static void complete_tx_ctx(xdp_context_t *ctx, struct xsk_socket_info *xsk)
+{
+    if (!xsk->outstanding_tx) return;
+
+    uint32_t idx;
+    uint32_t completed = xsk_ring_cons__peek(&xsk->umem->comp, xsk->outstanding_tx, &idx);
+
+    if (completed > 0) {
+        ctx->tx_completion_events += 1;
+        ctx->tx_completed_desc += completed;
+        for (uint32_t i = 0; i < completed; i++) {
+            uint64_t *addr = xsk_ring_cons__comp_addr(&xsk->umem->comp, idx + i);
+            free_frame(xsk, *addr);
+        }
+        xsk_ring_cons__release(&xsk->umem->comp, completed);
+        xsk->outstanding_tx -= completed;
+    }
+}
+
+static void kick_tx_ctx(xdp_context_t *ctx, struct xsk_socket_info *xsk)
+{
+    if (xsk_ring_prod__needs_wakeup(&xsk->tx)) {
+        sendto(xsk->fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+        ctx->tx_wakeups++;
+    }
+}
+
+static int xdp_send_batch_ctx(
+    xdp_context_t *ctx,
+    struct xsk_socket_info *xsk,
+    const uint8_t **packets,
+    const uint16_t *lengths,
+    int count
+)
+{
+    complete_tx_ctx(ctx, xsk);
+
+    uint32_t tx_idx;
+    int batch_size = count < XDP_BATCH_SIZE ? count : XDP_BATCH_SIZE;
+    uint32_t reserved = xsk_ring_prod__reserve(&xsk->tx, batch_size, &tx_idx);
+    if (reserved == 0) {
+        ctx->tx_desc_reserve_failures += 1;
+        ctx->tx_backpressure_events += 1;
+        kick_tx_ctx(ctx, xsk);
+        return 0;
+    }
+
+    int submitted = 0;
+    for (uint32_t i = 0; i < reserved && submitted < count; i++) {
+        uint64_t frame_addr = alloc_frame(xsk);
+        if (frame_addr == UINT64_MAX) {
+            ctx->tx_frame_alloc_failures += 1;
+            ctx->tx_backpressure_events += 1;
+            break;
+        }
+
+        uint16_t pkt_len = lengths[submitted];
+        if (pkt_len > MAX_PACKET_SIZE) {
+            pkt_len = MAX_PACKET_SIZE;
+        }
+
+        void *pkt_buffer = xsk->umem->buffer + frame_addr + XDP_HEADROOM;
+        memcpy(pkt_buffer, packets[submitted], pkt_len);
+
+        struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx + i);
+        tx_desc->addr = frame_addr + XDP_HEADROOM;
+        tx_desc->len = pkt_len;
+        tx_desc->options = 0;
+
+        submitted++;
+        ctx->tx_bytes += pkt_len;
+    }
+
+    if (submitted < (int)reserved) {
+        ctx->tx_partial_batches += 1;
+        xsk_ring_prod__cancel(&xsk->tx, reserved - (uint32_t)submitted);
+    }
+
+    if (submitted > 0) {
+        xsk_ring_prod__submit(&xsk->tx, submitted);
+        xsk->outstanding_tx += submitted;
+        ctx->tx_packets += submitted;
+    }
+
+    kick_tx_ctx(ctx, xsk);
+    return submitted;
+}
+
+static int xdp_send_vector_ctx(
+    xdp_context_t *ctx,
+    const uint8_t **packets,
+    uint16_t *lengths,
+    Py_ssize_t valid_count
+)
+{
+    int total_sent = 0;
+    Py_ssize_t offset = 0;
+
+    while (offset < valid_count) {
+        int batch = (int)(valid_count - offset);
+        if (batch > XDP_BATCH_SIZE) {
+            batch = XDP_BATCH_SIZE;
+        }
+
+        int sent = xdp_send_batch_ctx(ctx, ctx->xsk, packets + offset, lengths + offset, batch);
+        if (sent <= 0) {
+            ctx->tx_retry_loops += 1;
+            ctx->tx_backpressure_events += 1;
+            complete_tx_ctx(ctx, ctx->xsk);
+            sent = xdp_send_batch_ctx(ctx, ctx->xsk, packets + offset, lengths + offset, batch);
+        }
         if (sent <= 0) {
             break;
         }
@@ -977,6 +1347,18 @@ static PyObject* py_xdp_init(PyObject* self, PyObject* args)
     xdp_ctx.tx_bytes = 0;
     xdp_ctx.tx_errors = 0;
     xdp_ctx.tx_wakeups = 0;
+    xdp_ctx.tx_desc_reserve_failures = 0;
+    xdp_ctx.tx_frame_alloc_failures = 0;
+    xdp_ctx.tx_partial_batches = 0;
+    xdp_ctx.tx_retry_loops = 0;
+    xdp_ctx.tx_completion_events = 0;
+    xdp_ctx.tx_completed_desc = 0;
+    xdp_ctx.tx_invalid_packets = 0;
+    xdp_ctx.tx_backpressure_events = 0;
+    xdp_ctx.tx_send_calls = 0;
+    xdp_ctx.tx_send_ns_total = 0;
+    xdp_ctx.tx_send_ns_max = 0;
+    xdp_ctx.queue_id = queue_id;
     xdp_ctx.xsks_map_fd = -1;
     xdp_ctx.xsks_map_key = queue_id;
     xdp_ctx.xsks_map_registered = 0;
@@ -1090,16 +1472,30 @@ static PyObject* py_xdp_send(PyObject* self, PyObject* args)
     
     // Extract packet data from Python list
     Py_ssize_t valid_count = 0;
+    release_send_scratch_owners(count);
     for (Py_ssize_t i = 0; i < count; i++) {
         PyObject *item = PyList_GetItem(packets_list, i);
         if (PyBytes_Check(item)) {
+            Py_INCREF(item);
+            g_send_scratch.owners[valid_count] = item;
             packets[valid_count] = (const uint8_t*)PyBytes_AS_STRING(item);
             lengths[valid_count] = (uint16_t)PyBytes_GET_SIZE(item);
             valid_count++;
+        } else {
+            xdp_ctx.tx_invalid_packets += 1;
         }
     }
 
-    int total_sent = xdp_send_vector_locked(packets, lengths, valid_count);
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+    Py_BEGIN_ALLOW_THREADS
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_vector_locked(packets, lengths, valid_count);
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    Py_END_ALLOW_THREADS
+    xdp_record_send_timing(&xdp_ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+    release_send_scratch_owners(valid_count);
     
     pthread_mutex_unlock(&xdp_ctx.lock);
     
@@ -1163,7 +1559,15 @@ static PyObject* py_xdp_send_buffer(PyObject* self, PyObject* args)
         g_send_scratch.lengths[i] = (uint16_t)packet_size;
     }
 
-    int total_sent = xdp_send_vector_locked(g_send_scratch.packets, g_send_scratch.lengths, (Py_ssize_t)count);
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+    Py_BEGIN_ALLOW_THREADS
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_vector_locked(g_send_scratch.packets, g_send_scratch.lengths, (Py_ssize_t)count);
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    Py_END_ALLOW_THREADS
+    xdp_record_send_timing(&xdp_ctx, xdp_timespec_diff_ns(&send_start, &send_end));
     pthread_mutex_unlock(&xdp_ctx.lock);
     PyBuffer_Release(&view);
     return PyLong_FromLong(total_sent);
@@ -1238,6 +1642,7 @@ static PyObject* py_xdp_submit_tx_frame(PyObject* self, PyObject* args)
     complete_tx(xdp_ctx.xsk);
     uint32_t tx_idx;
     if (xsk_ring_prod__reserve(&xdp_ctx.xsk->tx, 1, &tx_idx) == 0) {
+        xdp_ctx.tx_backpressure_events += 1;
         kick_tx(xdp_ctx.xsk);
         pthread_mutex_unlock(&xdp_ctx.lock);
         Py_RETURN_FALSE;
@@ -1358,6 +1763,8 @@ static PyObject* xdp_send_udp_common(PyObject* args)
 
         uint32_t tx_idx;
         if (xsk_ring_prod__reserve(&xdp_ctx.xsk->tx, 1, &tx_idx) == 0) {
+            xdp_ctx.tx_desc_reserve_failures += 1;
+            xdp_ctx.tx_backpressure_events += 1;
             kick_tx(xdp_ctx.xsk);
             continue;
         }
@@ -1365,6 +1772,8 @@ static PyObject* xdp_send_udp_common(PyObject* args)
         uint64_t frame_addr = alloc_frame(xdp_ctx.xsk);
         if (frame_addr == UINT64_MAX) {
             xdp_ctx.tx_errors++;
+            xdp_ctx.tx_frame_alloc_failures += 1;
+            xdp_ctx.tx_backpressure_events += 1;
             xsk_ring_prod__cancel(&xdp_ctx.xsk->tx, 1);
             continue;
         }
@@ -1466,18 +1875,48 @@ static PyObject* py_xdp_stats(PyObject* self, PyObject* args)
     uint64_t tx_bytes = xdp_ctx.tx_bytes;
     uint64_t tx_errors = xdp_ctx.tx_errors;
     uint64_t tx_wakeups = xdp_ctx.tx_wakeups;
+    uint64_t tx_desc_reserve_failures = xdp_ctx.tx_desc_reserve_failures;
+    uint64_t tx_frame_alloc_failures = xdp_ctx.tx_frame_alloc_failures;
+    uint64_t tx_partial_batches = xdp_ctx.tx_partial_batches;
+    uint64_t tx_retry_loops = xdp_ctx.tx_retry_loops;
+    uint64_t tx_completion_events = xdp_ctx.tx_completion_events;
+    uint64_t tx_completed_desc = xdp_ctx.tx_completed_desc;
+    uint64_t tx_invalid_packets = xdp_ctx.tx_invalid_packets;
+    uint64_t tx_backpressure_events = xdp_ctx.tx_backpressure_events;
+    uint64_t tx_send_calls = xdp_ctx.tx_send_calls;
+    uint64_t tx_send_ns_total = xdp_ctx.tx_send_ns_total;
+    uint64_t tx_send_ns_max = xdp_ctx.tx_send_ns_max;
     int xdp_mode = xdp_ctx.xdp_mode;
+    int queue_id = xdp_ctx.queue_id;
     
     pthread_mutex_unlock(&xdp_ctx.lock);
+    double tx_send_avg_us = tx_send_calls > 0
+        ? ((double)tx_send_ns_total / (double)tx_send_calls) / 1000.0
+        : 0.0;
+    double tx_send_max_us = ((double)tx_send_ns_max) / 1000.0;
     
-    return Py_BuildValue("{s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:i,s:s}",
+    return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d,s:d,s:i,s:i,s:s}",
                          "tx_packets", tx_packets,
                          "tx_bytes", tx_bytes,
                          "tx_errors", tx_errors,
                          "tx_wakeups", tx_wakeups,
+                         "tx_desc_reserve_failures", tx_desc_reserve_failures,
+                         "tx_frame_alloc_failures", tx_frame_alloc_failures,
+                         "tx_partial_batches", tx_partial_batches,
+                         "tx_retry_loops", tx_retry_loops,
+                         "tx_completion_events", tx_completion_events,
+                         "tx_completed_desc", tx_completed_desc,
+                         "tx_invalid_packets", tx_invalid_packets,
+                         "tx_backpressure_events", tx_backpressure_events,
+                         "tx_send_calls", tx_send_calls,
+                         "tx_send_ns_total", tx_send_ns_total,
+                         "tx_send_ns_max", tx_send_ns_max,
                          "elapsed_seconds", elapsed,
                          "packets_per_second", pps,
                          "mbps", mbps,
+                         "tx_send_avg_us", tx_send_avg_us,
+                         "tx_send_max_us", tx_send_max_us,
+                         "queue_id", queue_id,
                          "mode", xdp_mode,
                          "mode_name", xdp_mode_name(xdp_mode));
 }
@@ -1534,11 +1973,413 @@ static PyObject* py_xdp_info(PyObject* self, PyObject* args)
                          "headroom", XDP_HEADROOM);
 }
 
+static void cleanup_ctx_locked(xdp_context_t *ctx)
+{
+    clear_ctx_send_scratch(ctx);
+
+    if (!ctx->is_initialized) {
+        return;
+    }
+
+    ctx->is_running = 0;
+
+    if (ctx->xsks_map_registered && ctx->xsks_map_fd >= 0) {
+        (void)bpf_map_delete_elem_fd(ctx->xsks_map_fd, &ctx->xsks_map_key);
+        close(ctx->xsks_map_fd);
+        ctx->xsks_map_fd = -1;
+        ctx->xsks_map_registered = 0;
+    }
+
+    destroy_xsk_socket(ctx->xsk);
+    ctx->xsk = NULL;
+
+    destroy_umem(ctx->umem);
+    ctx->umem = NULL;
+
+    ctx->is_initialized = 0;
+}
+
+static PyObject* py_xdp_create(PyObject* self, PyObject* args)
+{
+    char *ifname;
+    int queue_id = 0;
+    int mode = 0;
+    char map_reason[256];
+    xdp_context_t *ctx = NULL;
+    int handle = -1;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "s|ii", &ifname, &queue_id, &mode)) {
+        return NULL;
+    }
+
+    if (geteuid() != 0) {
+        PyErr_SetString(PyExc_PermissionError, "Root privileges required for AF_XDP");
+        return NULL;
+    }
+    if (mode < 0 || mode > 2) {
+        PyErr_SetString(PyExc_ValueError, "mode must be one of 0(SKB/Copy), 1(Native/Zero-Copy), 2(Offload)");
+        return NULL;
+    }
+
+    ctx = (xdp_context_t*)calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    pthread_mutex_init(&ctx->lock, NULL);
+    pthread_mutex_lock(&ctx->lock);
+
+    struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
+    if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
+        fprintf(stderr, "[XDP][ctx] Warning: Could not increase MEMLOCK limit\n");
+    }
+
+    ctx->umem = create_umem();
+    if (!ctx->umem) {
+        pthread_mutex_unlock(&ctx->lock);
+        pthread_mutex_destroy(&ctx->lock);
+        free(ctx);
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
+
+    ctx->xsk = create_xsk_socket(ctx->umem, ifname, queue_id, mode);
+    if (!ctx->xsk) {
+        destroy_umem(ctx->umem);
+        ctx->umem = NULL;
+        pthread_mutex_unlock(&ctx->lock);
+        pthread_mutex_destroy(&ctx->lock);
+        free(ctx);
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
+
+    ctx->xdp_mode = mode;
+    ctx->is_initialized = 1;
+    ctx->is_running = 1;
+    ctx->tx_packets = 0;
+    ctx->tx_bytes = 0;
+    ctx->tx_errors = 0;
+    ctx->tx_wakeups = 0;
+    ctx->tx_desc_reserve_failures = 0;
+    ctx->tx_frame_alloc_failures = 0;
+    ctx->tx_partial_batches = 0;
+    ctx->tx_retry_loops = 0;
+    ctx->tx_completion_events = 0;
+    ctx->tx_completed_desc = 0;
+    ctx->tx_invalid_packets = 0;
+    ctx->tx_backpressure_events = 0;
+    ctx->tx_send_calls = 0;
+    ctx->tx_send_ns_total = 0;
+    ctx->tx_send_ns_max = 0;
+    ctx->queue_id = queue_id;
+    ctx->xsks_map_fd = -1;
+    ctx->xsks_map_key = queue_id;
+    ctx->xsks_map_registered = 0;
+    clock_gettime(CLOCK_MONOTONIC, &ctx->start_time);
+
+    map_reason[0] = '\0';
+    if (register_xsk_in_xsks_map_ctx(ctx, queue_id, ctx->xsk->fd, map_reason, sizeof(map_reason)) < 0) {
+        cleanup_ctx_locked(ctx);
+        pthread_mutex_unlock(&ctx->lock);
+        pthread_mutex_destroy(&ctx->lock);
+        free(ctx);
+        if (map_reason[0] != '\0') {
+            PyErr_SetString(PyExc_RuntimeError, map_reason);
+        } else {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to register AF_XDP socket into xsks_map");
+        }
+        return NULL;
+    }
+
+    pthread_mutex_unlock(&ctx->lock);
+    handle = register_ctx_handle(ctx);
+    if (handle < 0) {
+        pthread_mutex_lock(&ctx->lock);
+        cleanup_ctx_locked(ctx);
+        pthread_mutex_unlock(&ctx->lock);
+        pthread_mutex_destroy(&ctx->lock);
+        free(ctx);
+        PyErr_SetString(PyExc_RuntimeError, "No free XDP context slots");
+        return NULL;
+    }
+
+    return PyLong_FromLong(handle);
+}
+
+static PyObject* py_xdp_destroy(PyObject* self, PyObject* args)
+{
+    int handle = 0;
+    xdp_context_t *ctx = NULL;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "i", &handle)) {
+        return NULL;
+    }
+
+    ctx = remove_ctx_by_handle_locked(handle);
+    if (!ctx) {
+        PyErr_SetString(PyExc_KeyError, "Invalid XDP context handle");
+        return NULL;
+    }
+
+    cleanup_ctx_locked(ctx);
+    pthread_mutex_unlock(&ctx->lock);
+    pthread_mutex_destroy(&ctx->lock);
+    free(ctx);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_xdp_send_ctx(PyObject* self, PyObject* args)
+{
+    int handle = 0;
+    PyObject *packets_list;
+    xdp_context_t *ctx = NULL;
+    const uint8_t **packets = NULL;
+    uint16_t *lengths = NULL;
+    Py_ssize_t count = 0;
+    Py_ssize_t valid_count = 0;
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "iO", &handle, &packets_list)) {
+        return NULL;
+    }
+    if (!PyList_Check(packets_list)) {
+        PyErr_SetString(PyExc_TypeError, "Expected list of bytes objects");
+        return NULL;
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        PyErr_SetString(PyExc_KeyError, "Invalid XDP context handle");
+        return NULL;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        PyErr_SetString(PyExc_RuntimeError, "XDP context not initialized");
+        return NULL;
+    }
+
+    count = PyList_Size(packets_list);
+    if (count == 0) {
+        pthread_mutex_unlock(&ctx->lock);
+        return PyLong_FromLong(0);
+    }
+
+    if (ensure_ctx_send_scratch_capacity(ctx, count) < 0) {
+        pthread_mutex_unlock(&ctx->lock);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    packets = ctx->scratch_packets;
+    lengths = ctx->scratch_lengths;
+    release_ctx_send_scratch_owners(ctx, count);
+
+    for (Py_ssize_t i = 0; i < count; i++) {
+        PyObject *item = PyList_GetItem(packets_list, i);
+        if (PyBytes_Check(item)) {
+            Py_INCREF(item);
+            ctx->scratch_owners[valid_count] = item;
+            packets[valid_count] = (const uint8_t*)PyBytes_AS_STRING(item);
+            lengths[valid_count] = (uint16_t)PyBytes_GET_SIZE(item);
+            valid_count++;
+        } else {
+            ctx->tx_invalid_packets += 1;
+        }
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_vector_ctx(ctx, packets, lengths, valid_count);
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    Py_END_ALLOW_THREADS
+    xdp_record_send_timing(ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+
+    release_ctx_send_scratch_owners(ctx, valid_count);
+    pthread_mutex_unlock(&ctx->lock);
+    return PyLong_FromLong(total_sent);
+}
+
+static PyObject* py_xdp_send_buffer_ctx(PyObject* self, PyObject* args)
+{
+    int handle = 0;
+    Py_buffer view;
+    int packet_size = 0;
+    int count = 0;
+    xdp_context_t *ctx = NULL;
+    const uint8_t **packets = NULL;
+    uint16_t *lengths = NULL;
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "iy*ii", &handle, &view, &packet_size, &count)) {
+        return NULL;
+    }
+
+    if (packet_size <= 0 || count < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size must be > 0 and count must be >= 0");
+        return NULL;
+    }
+    if ((size_t)view.len < ((size_t)packet_size * (size_t)count)) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "buffer smaller than packet_size * count");
+        return NULL;
+    }
+    if (count == 0) {
+        PyBuffer_Release(&view);
+        return PyLong_FromLong(0);
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_KeyError, "Invalid XDP context handle");
+        return NULL;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "XDP context not initialized");
+        return NULL;
+    }
+
+    if (ensure_ctx_send_scratch_capacity(ctx, (Py_ssize_t)count) < 0) {
+        pthread_mutex_unlock(&ctx->lock);
+        PyBuffer_Release(&view);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    packets = ctx->scratch_packets;
+    lengths = ctx->scratch_lengths;
+    release_ctx_send_scratch_owners(ctx, (Py_ssize_t)count);
+
+    const uint8_t *base = (const uint8_t*)view.buf;
+    for (int i = 0; i < count; i++) {
+        packets[i] = base + ((size_t)i * (size_t)packet_size);
+        lengths[i] = (uint16_t)packet_size;
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_vector_ctx(ctx, packets, lengths, (Py_ssize_t)count);
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    Py_END_ALLOW_THREADS
+    xdp_record_send_timing(ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+
+    pthread_mutex_unlock(&ctx->lock);
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(total_sent);
+}
+
+static PyObject* py_xdp_stats_ctx(PyObject* self, PyObject* args)
+{
+    int handle = 0;
+    xdp_context_t *ctx = NULL;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "i", &handle)) {
+        return NULL;
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        PyErr_SetString(PyExc_KeyError, "Invalid XDP context handle");
+        return NULL;
+    }
+    if (!ctx->is_initialized) {
+        pthread_mutex_unlock(&ctx->lock);
+        Py_RETURN_NONE;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed = (now.tv_sec - ctx->start_time.tv_sec) +
+                     (now.tv_nsec - ctx->start_time.tv_nsec) / 1e9;
+    double pps = elapsed > 0 ? ctx->tx_packets / elapsed : 0;
+    double mbps = elapsed > 0 ? (ctx->tx_bytes * 8) / (elapsed * 1e6) : 0;
+
+    uint64_t tx_packets = ctx->tx_packets;
+    uint64_t tx_bytes = ctx->tx_bytes;
+    uint64_t tx_errors = ctx->tx_errors;
+    uint64_t tx_wakeups = ctx->tx_wakeups;
+    uint64_t tx_desc_reserve_failures = ctx->tx_desc_reserve_failures;
+    uint64_t tx_frame_alloc_failures = ctx->tx_frame_alloc_failures;
+    uint64_t tx_partial_batches = ctx->tx_partial_batches;
+    uint64_t tx_retry_loops = ctx->tx_retry_loops;
+    uint64_t tx_completion_events = ctx->tx_completion_events;
+    uint64_t tx_completed_desc = ctx->tx_completed_desc;
+    uint64_t tx_invalid_packets = ctx->tx_invalid_packets;
+    uint64_t tx_backpressure_events = ctx->tx_backpressure_events;
+    uint64_t tx_send_calls = ctx->tx_send_calls;
+    uint64_t tx_send_ns_total = ctx->tx_send_ns_total;
+    uint64_t tx_send_ns_max = ctx->tx_send_ns_max;
+    int xdp_mode = ctx->xdp_mode;
+    int queue_id = ctx->queue_id;
+
+    pthread_mutex_unlock(&ctx->lock);
+    double tx_send_avg_us = tx_send_calls > 0
+        ? ((double)tx_send_ns_total / (double)tx_send_calls) / 1000.0
+        : 0.0;
+    double tx_send_max_us = ((double)tx_send_ns_max) / 1000.0;
+
+    return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d,s:d,s:i,s:i,s:s}",
+                         "tx_packets", tx_packets,
+                         "tx_bytes", tx_bytes,
+                         "tx_errors", tx_errors,
+                         "tx_wakeups", tx_wakeups,
+                         "tx_desc_reserve_failures", tx_desc_reserve_failures,
+                         "tx_frame_alloc_failures", tx_frame_alloc_failures,
+                         "tx_partial_batches", tx_partial_batches,
+                         "tx_retry_loops", tx_retry_loops,
+                         "tx_completion_events", tx_completion_events,
+                         "tx_completed_desc", tx_completed_desc,
+                         "tx_invalid_packets", tx_invalid_packets,
+                         "tx_backpressure_events", tx_backpressure_events,
+                         "tx_send_calls", tx_send_calls,
+                         "tx_send_ns_total", tx_send_ns_total,
+                         "tx_send_ns_max", tx_send_ns_max,
+                         "elapsed_seconds", elapsed,
+                         "packets_per_second", pps,
+                         "mbps", mbps,
+                         "tx_send_avg_us", tx_send_avg_us,
+                         "tx_send_max_us", tx_send_max_us,
+                         "queue_id", queue_id,
+                         "mode", xdp_mode,
+                         "mode_name", xdp_mode_name(xdp_mode));
+}
+
 // ============================================================================
 // Module Definition
 // ============================================================================
 
 static PyMethodDef XdpSenderMethods[] = {
+    {"xdp_create", py_xdp_create, METH_VARARGS,
+     "Create independent AF_XDP context.\n"
+     "Args: interface (str), queue_id (int, default=0), mode (int, default=0=Copy)\n"
+     "Returns: int handle (>0)"},
+    {"xdp_destroy", py_xdp_destroy, METH_VARARGS,
+     "Destroy AF_XDP context by handle.\n"
+     "Args: handle (int)"},
+    {"xdp_send_ctx", py_xdp_send_ctx, METH_VARARGS,
+     "Send packets through AF_XDP context.\n"
+     "Args: handle (int), packets (list of bytes)\n"
+     "Returns: int (number of packets sent)"},
+    {"xdp_send_buffer_ctx", py_xdp_send_buffer_ctx, METH_VARARGS,
+     "Send contiguous packet buffer through AF_XDP context.\n"
+     "Args: handle (int), buffer (bytes-like), packet_size (int), count (int)\n"
+     "Returns: int (number of packets sent)"},
+    {"xdp_stats_ctx", py_xdp_stats_ctx, METH_VARARGS,
+     "Get stats for AF_XDP context.\n"
+     "Args: handle (int)\n"
+     "Returns: dict"},
+
     {"xdp_init", py_xdp_init, METH_VARARGS, 
      "Initialize AF_XDP socket on interface.\n"
      "Args: interface (str), queue_id (int, default=0), mode (int, default=0=Copy)\n"
