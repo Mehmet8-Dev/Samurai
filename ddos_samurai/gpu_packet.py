@@ -1,25 +1,16 @@
-"""GPU packet facade with selectable backend.
+"""Native CUDA packet facade.
 
 Public import path remains ``ddos_samurai.gpu_packet``.
-Backend selection is controlled by ``SAMURAI_GPU_PACKET_BACKEND``:
-  - ``cuda_cpp`` (default)
-  - ``legacy``
 
-When ``cuda_cpp`` is active, native C ABI packet generation is controlled by
-``SAMURAI_GPU_PACKET_CUDA_CPP_NATIVE`` (default: enabled).
-
-If ``cuda_cpp`` is requested but unavailable, the module falls back to legacy.
+Packet generation is native-only and routed through the CUDA C++ bridge.
+Shared constants, validation helpers, and diagnostics are re-exported from
+``gpu_packet_py_backend`` to preserve the public module surface.
 """
 
 from __future__ import annotations
 
-import logging
-import os
-import contextlib
-from typing import Any
-
-from . import gpu_packet_legacy as _legacy
-from .gpu_packet_legacy import *  # noqa: F401,F403 - compatibility re-export
+from . import gpu_packet_py_backend as _support
+from .gpu_packet_py_backend import *  # noqa: F401,F403 - public compatibility surface
 
 try:
     from . import _gpu_packet_cuda_backend as _cuda_cpp_backend
@@ -29,96 +20,42 @@ except Exception as _cuda_import_exc:  # pragma: no cover - depends on runtime
 else:
     _CUDA_IMPORT_ERROR = None
 
-_BACKEND_ENV = "SAMURAI_GPU_PACKET_BACKEND"
+
+ACTIVE_GPU_PACKET_BACKEND = "cuda_cpp"
+_ACTIVE_BACKEND = _cuda_cpp_backend
+
+# Backward-compatible aliases used by tests and by anomaly_packet imports.
+GPUPacketError = _support.GPUPacketError
+GPUMemoryError = _support.GPUMemoryError
+cp = _support.cp
+_CONST_FINGERPRINTS = _support._CONST_FINGERPRINTS
+TEMPLATE_CONST_HOST = _support.TEMPLATE_CONST_HOST
+POOL_CONST_HOST = _support.POOL_CONST_HOST
+create_xoroshiro128p_states = _support.create_xoroshiro128p_states
+template_kernel = _support.template_kernel
+pool_kernel = _support.pool_kernel
+stateful_pool_kernel = _support.stateful_pool_kernel
+create_tcp_packets_kernel_spoof = _support.create_tcp_packets_kernel_spoof
+create_tcp_packets_kernel_nospoof = _support.create_tcp_packets_kernel_nospoof
+create_udp_packets_kernel_spoof = _support.create_udp_packets_kernel_spoof
+create_udp_packets_kernel_nospoof = _support.create_udp_packets_kernel_nospoof
+create_icmp_packets_kernel = _support.create_icmp_packets_kernel
+create_fragmented_packets_kernel = _support.create_fragmented_packets_kernel
+amplification_kernel_v2 = _support.amplification_kernel_v2
 
 
-def _normalize_backend(raw: str | None) -> str:
-    val = str(raw or "cuda_cpp").strip().lower()
-    if val in {"legacy", "cuda_cpp"}:
-        return val
-    return "cuda_cpp"
-
-
-def _resolve_backend() -> tuple[str, Any]:
-    requested = _normalize_backend(os.environ.get(_BACKEND_ENV, "cuda_cpp"))
-    if requested == "legacy":
-        return "legacy", _legacy
-
-    if _cuda_cpp_backend is not None:
-        try:
-            if bool(getattr(_cuda_cpp_backend, "is_available", lambda: True)()):
-                return "cuda_cpp", _cuda_cpp_backend
-        except Exception:
-            pass
-
-    if _CUDA_IMPORT_ERROR is not None:
-        logging.warning("gpu_packet: cuda_cpp backend import failed, using legacy: %s", _CUDA_IMPORT_ERROR)
-    else:
-        logging.warning("gpu_packet: cuda_cpp backend unavailable, using legacy")
-    return "legacy", _legacy
-
-
-ACTIVE_GPU_PACKET_BACKEND, _ACTIVE_BACKEND = _resolve_backend()
-
-# Backward-compatibility for tests and callers that introspect legacy internals.
-_CONST_FINGERPRINTS = getattr(_legacy, "_CONST_FINGERPRINTS", {})
-
-
-# Keep monkeypatch-based legacy tests compatible after facade split.
-# These symbols are patched on ddos_samurai.gpu_packet in existing tests.
-_SYNC_SYMBOLS = [
-    "cp",
-    "create_xoroshiro128p_states",
-    "template_kernel",
-    "pool_kernel",
-    "stateful_pool_kernel",
-    "create_tcp_packets_kernel_spoof",
-    "create_tcp_packets_kernel_nospoof",
-    "create_udp_packets_kernel_spoof",
-    "create_udp_packets_kernel_nospoof",
-    "create_icmp_packets_kernel",
-    "create_fragmented_packets_kernel",
-    "amplification_kernel_v2",
-]
-
-
-@contextlib.contextmanager
-def _temporary_synced_legacy_symbols():
-    if _legacy is None:
-        yield
-        return
-    g = globals()
-    previous = {}
-    for name in _SYNC_SYMBOLS:
-        if name not in g:
-            continue
-        previous[name] = getattr(_legacy, name, None)
-        try:
-            setattr(_legacy, name, g[name])
-        except Exception:
-            pass
-    try:
-        yield
-    finally:
-        for name, value in previous.items():
-            try:
-                setattr(_legacy, name, value)
-            except Exception:
-                pass
+def _require_native_backend():
+    if _ACTIVE_BACKEND is None:
+        raise GPUPacketError(f"cuda_cpp backend import failed: {_CUDA_IMPORT_ERROR}")
+    return _ACTIVE_BACKEND
 
 
 def _backend_call(name: str, *args, **kwargs):
-    if ACTIVE_GPU_PACKET_BACKEND == "legacy":
-        kwargs.pop("return_host_ready", None)
-        with _temporary_synced_legacy_symbols():
-            return getattr(_legacy, name)(*args, **kwargs)
-
-    fn = getattr(_ACTIVE_BACKEND, name, None)
-    if callable(fn):
-        return fn(*args, **kwargs)
-
-    with _temporary_synced_legacy_symbols():
-        return getattr(_legacy, name)(*args, **kwargs)
+    backend = _require_native_backend()
+    fn = getattr(backend, name, None)
+    if not callable(fn):
+        raise AttributeError(f"cuda_cpp backend does not expose {name}")
+    return fn(*args, **kwargs)
 
 
 def get_active_backend_name() -> str:
@@ -126,38 +63,27 @@ def get_active_backend_name() -> str:
 
 
 def is_native_path_enabled() -> bool:
-    fn = getattr(_ACTIVE_BACKEND, "is_native_path_enabled", None)
-    return bool(fn()) if callable(fn) else False
+    return True
 
 
 def is_native_library_available() -> bool:
-    fn = getattr(_ACTIVE_BACKEND, "is_native_library_available", None)
+    backend = _require_native_backend()
+    fn = getattr(backend, "is_native_library_available", None)
     return bool(fn()) if callable(fn) else False
 
 
 def is_native_path_active() -> bool:
-    fn = getattr(_ACTIVE_BACKEND, "is_native_path_active", None)
+    backend = _require_native_backend()
+    fn = getattr(backend, "is_native_path_active", None)
     return bool(fn()) if callable(fn) else False
 
 
 def get_native_policy() -> str:
-    fn = getattr(_ACTIVE_BACKEND, "get_native_policy", None)
-    if callable(fn):
-        try:
-            return str(fn() or "allow")
-        except Exception:
-            return "allow"
-    return "allow"
+    return "require"
 
 
 def is_native_policy_require() -> bool:
-    fn = getattr(_ACTIVE_BACKEND, "is_native_policy_require", None)
-    if callable(fn):
-        try:
-            return bool(fn())
-        except Exception:
-            return False
-    return False
+    return True
 
 
 def init_gpu():
@@ -241,17 +167,15 @@ def get_gpu_info() -> dict:
 
 
 def _update_gpu_constant(*args, **kwargs):
-    # Compatibility: tests patch template_kernel on this facade.
-    with _temporary_synced_legacy_symbols():
-        return _legacy._update_gpu_constant(*args, **kwargs)
+    return _support._update_gpu_constant(*args, **kwargs)
 
 
 def is_gpu_available() -> bool:
     return bool(_backend_call("is_gpu_available"))
 
 
-class GPUPacketGenerator(_legacy.GPUPacketGenerator):
-    """Facade-aware wrapper preserving legacy constructor contract."""
+class GPUPacketGenerator(_support.GPUPacketGenerator):
+    """Native-only wrapper preserving the public constructor contract."""
 
     def generate_batch(self, template_bytes: bytes, batch_size: int):
         count = int(batch_size or 0)

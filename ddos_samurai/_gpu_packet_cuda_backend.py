@@ -1,48 +1,26 @@
 """CUDA C++ backend bridge for ``ddos_samurai.gpu_packet``.
 
-This module keeps API parity with ``gpu_packet_legacy`` and provides an
-optional native path via ``libgpu_packet_cuda.so`` C ABI.
+This module is native-only and routes packet generation exclusively through
+``libgpu_packet_cuda.so``. Python helpers from ``gpu_packet_py_backend`` are
+used only for shared constants, telemetry, and utility surfaces.
 """
 
 from __future__ import annotations
 
 import ctypes
-import contextlib
 import os
-import sys
+import time
 import threading
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-try:
-    from . import gpu_packet_legacy as _legacy
-    _LEGACY_IMPORT_ERROR: Exception | None = None
-except ModuleNotFoundError as exc:
-    _LEGACY_IMPORT_ERROR = exc
-
-    class _LegacyShim:
-        class GPUPacketError(RuntimeError):
-            pass
-
-        class GPUMemoryError(GPUPacketError):
-            pass
-
-        cp = np
-
-        def __getattr__(self, name: str):
-            raise ModuleNotFoundError(
-                "gpu_packet_legacy is unavailable (missing optional CUDA Python "
-                f"dependencies): {_LEGACY_IMPORT_ERROR}"
-            ) from _LEGACY_IMPORT_ERROR
-
-    _legacy = _LegacyShim()
+from . import gpu_packet_py_backend as _support
 
 
 _LIB_PATH = Path(__file__).with_name("libgpu_packet_cuda.so")
 _NATIVE_ENV = "SAMURAI_GPU_PACKET_CUDA_CPP_NATIVE"
-_NATIVE_POLICY_ENV = "SAMURAI_GPU_PACKET_NATIVE_POLICY"
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -51,24 +29,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 _NATIVE_ENABLED = _env_flag(_NATIVE_ENV, "1")
-
-
-def _normalize_native_policy(raw: str | None) -> str:
-    val = str(raw or "allow").strip().lower()
-    aliases = {
-        "strict": "require",
-        "required": "require",
-        "fail": "require",
-        "off": "allow",
-        "auto": "allow",
-    }
-    norm = aliases.get(val, val)
-    if norm in {"allow", "require"}:
-        return norm
-    return "allow"
-
-
-_NATIVE_POLICY = _normalize_native_policy(os.environ.get(_NATIVE_POLICY_ENV, "allow"))
+_NATIVE_POLICY = "require"
 _HOST_INPUT_CACHE: dict[tuple[int, str, str, int], np.ndarray] = {}
 _HOST_INPUT_CACHE_LOCK = threading.Lock()
 _NATIVE_GENERATION_TELEMETRY_KEYS = (
@@ -296,90 +257,9 @@ def _load_lib() -> ctypes.CDLL | None:
 
 _LIB = _load_lib()
 
-
-_SYNC_SYMBOLS = [
-    "cp",
-    "create_xoroshiro128p_states",
-    "template_kernel",
-    "pool_kernel",
-    "stateful_pool_kernel",
-    "create_tcp_packets_kernel_spoof",
-    "create_tcp_packets_kernel_nospoof",
-    "create_udp_packets_kernel_spoof",
-    "create_udp_packets_kernel_nospoof",
-    "create_icmp_packets_kernel",
-    "create_fragmented_packets_kernel",
-    "amplification_kernel_v2",
-]
-
-
-def _safe_legacy_getattr(name: str, default: Any = None):
-    try:
-        return getattr(_legacy, name)
-    except Exception:
-        return default
-
-
-# Preserve original legacy symbol bindings so facade monkeypatching can
-# deterministically disable native path even if sync helpers overwrite legacy.
-_LEGACY_BASE_SYMBOLS = {
-    name: _safe_legacy_getattr(name, None)
-    for name in _SYNC_SYMBOLS
-}
-
-
-def _sync_facade_patches_to_legacy() -> None:
-    facade = sys.modules.get("ddos_samurai.gpu_packet")
-    if facade is None:
-        return
-    for name in _SYNC_SYMBOLS:
-        if hasattr(facade, name):
-            try:
-                setattr(_legacy, name, getattr(facade, name))
-            except Exception:
-                pass
-
-
-@contextlib.contextmanager
-def _temporary_synced_legacy_symbols():
-    """Temporarily mirror facade monkeypatches onto legacy symbols.
-
-    Tests patch symbols on ``ddos_samurai.gpu_packet``. Legacy calls should
-    observe those patches, but mutations must not leak into subsequent tests.
-    """
-    facade = sys.modules.get("ddos_samurai.gpu_packet")
-    if facade is None:
-        yield
-        return
-
-    previous = {}
-    for name in _SYNC_SYMBOLS:
-        if not hasattr(facade, name):
-            continue
-        previous[name] = _safe_legacy_getattr(name, None)
-        try:
-            setattr(_legacy, name, getattr(facade, name))
-        except Exception:
-            pass
-
-    try:
-        yield
-    finally:
-        for name, value in previous.items():
-            try:
-                setattr(_legacy, name, value)
-            except Exception:
-                pass
-
-
-def _call_legacy(name: str, *args, **kwargs):
-    if _LEGACY_IMPORT_ERROR is not None:
-        raise ModuleNotFoundError(
-            "Legacy CUDA Python backend is unavailable because optional "
-            f"dependencies are missing: {_LEGACY_IMPORT_ERROR}"
-        ) from _LEGACY_IMPORT_ERROR
-    with _temporary_synced_legacy_symbols():
-        return getattr(_legacy, name)(*args, **kwargs)
+GPUPacketError = _support.GPUPacketError
+GPUMemoryError = _support.GPUMemoryError
+cp = _support.cp
 
 
 def _last_error() -> str:
@@ -479,7 +359,7 @@ def _wrap_host_array(out_ptr: ctypes.c_void_p, out_size: int, *, pool_key: str) 
     if size <= 0:
         return np.empty((0,), dtype=np.uint8)
     if not bool(out_ptr):
-        raise _legacy.GPUMemoryError("cuda_cpp backend returned null pointer with non-zero size")
+        raise GPUMemoryError("cuda_cpp backend returned null pointer with non-zero size")
     owner = _NativeHostAllocation(out_ptr, _LIB)
     buf_type = ctypes.c_uint8 * size
     buf = buf_type.from_address(int(out_ptr.value))
@@ -509,7 +389,7 @@ def _raise_native_error(default_message: str):
         )
     ):
         raise ValueError(msg)
-    raise _legacy.GPUPacketError(msg)
+    raise GPUPacketError(msg)
 
 
 def _materialize_native_output(
@@ -534,7 +414,7 @@ def _materialize_native_output(
     if return_host_ready:
         return host
     try:
-        out = _legacy.cp.asarray(host, dtype=_legacy.cp.uint8)
+        out = cp.asarray(host, dtype=cp.uint8)
     except Exception:
         return host
     if isinstance(out, np.ndarray):
@@ -583,22 +463,7 @@ def _array_ptr(arr: np.ndarray | None, ptr_type):
 
 
 def _native_ready() -> bool:
-    if _LIB is None or not _NATIVE_ENABLED:
-        return False
-    # Test doubles (non-ctypes libraries) should not be gated by facade patch checks.
-    if not isinstance(_LIB, ctypes.CDLL):
-        return True
-    facade = sys.modules.get("ddos_samurai.gpu_packet")
-    if facade is None:
-        return True
-    for name in _SYNC_SYMBOLS:
-        if not hasattr(facade, name):
-            continue
-        # Compare against original legacy bindings (not mutable current values)
-        # so sync calls done by compatibility helpers do not re-enable native.
-        if getattr(facade, name) is not _LEGACY_BASE_SYMBOLS.get(name):
-            return False
-    return True
+    return bool(_LIB is not None and _NATIVE_ENABLED)
 
 
 def is_available() -> bool:
@@ -618,15 +483,11 @@ def is_native_path_active() -> bool:
 
 
 def get_native_policy() -> str:
-    return str(_NATIVE_POLICY)
+    return "require"
 
 
 def is_native_policy_require() -> bool:
-    return str(_NATIVE_POLICY) == "require"
-
-
-def _fallback_to_legacy_allowed() -> bool:
-    return not is_native_policy_require()
+    return True
 
 
 def _extract_stream_handle(stream: Any) -> int | None:
@@ -652,13 +513,11 @@ def _resolve_stream_handle(op_name: str, stream) -> int:
     h = _extract_stream_handle(stream)
     if h is not None:
         return int(h)
-    if not _fallback_to_legacy_allowed():
-        _raise_native_policy_violation(
-            op_name,
-            stream=stream,
-            reason_override="stream object cannot be converted to cudaStream_t handle",
-        )
-    return -1
+    _raise_native_policy_violation(
+        op_name,
+        stream=stream,
+        reason_override="stream object cannot be converted to cudaStream_t handle",
+    )
 
 
 def _raise_native_policy_violation(op_name: str, *, stream=None, reason_override: str | None = None):
@@ -669,16 +528,16 @@ def _raise_native_policy_violation(op_name: str, *, stream=None, reason_override
     elif not _NATIVE_ENABLED:
         reason = "native path disabled by env"
     elif stream is not None:
-        reason = "streamed native call is unsupported"
+        reason = "invalid or unsupported stream handle"
     else:
         reason = "native path not ready"
-    raise _legacy.GPUPacketError(
-        f"cuda_cpp native policy=require: {op_name} cannot fallback to legacy ({reason})"
-    )
+    raise GPUPacketError(f"cuda_cpp native path unavailable for {op_name} ({reason})")
 
 
 def init_gpu():
-    return _call_legacy("init_gpu")
+    if not _native_ready():
+        _raise_native_policy_violation("init_gpu")
+    return True
 
 
 def generate_packets(
@@ -697,24 +556,8 @@ def generate_packets(
     return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_packets", stream)
-    if not _native_ready() or stream_handle < 0:
-        if not _fallback_to_legacy_allowed():
-            _raise_native_policy_violation("generate_packets", stream=stream)
-        return _call_legacy(
-            "generate_packets",
-            count,
-            target_ip,
-            target_port,
-            protocol=protocol,
-            spoof_ip=spoof_ip,
-            real_src_ip=real_src_ip,
-            tcp_flags=tcp_flags,
-            has_ethernet=has_ethernet,
-            window=window,
-            stream=stream,
-            gateway_mac=gateway_mac,
-            spoof_subnet=spoof_subnet,
-        )
+    if not _native_ready():
+        _raise_native_policy_violation("generate_packets", stream=stream)
 
     out_ptr = ctypes.c_void_p()
     out_size = ctypes.c_size_t(0)
@@ -761,21 +604,8 @@ def generate_packets_from_template(
     return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_packets_from_template", stream)
-    if not _native_ready() or stream_handle < 0:
-        if not _fallback_to_legacy_allowed():
-            _raise_native_policy_violation("generate_packets_from_template", stream=stream)
-        return _call_legacy(
-            "generate_packets_from_template",
-            template_bytes,
-            count,
-            real_src_ip=real_src_ip,
-            spoof_ip=spoof_ip,
-            has_ethernet=has_ethernet,
-            stream=stream,
-            gateway_mac=gateway_mac,
-            spoof_subnet=spoof_subnet,
-            force_global_fallback=force_global_fallback,
-        )
+    if not _native_ready():
+        _raise_native_policy_violation("generate_packets_from_template", stream=stream)
 
     template_arr = _coerce_numeric_array(
         template_bytes,
@@ -832,23 +662,8 @@ def generate_packets_from_template_pool(
     return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_packets_from_template_pool", stream)
-    if not _native_ready() or stream_handle < 0:
-        if not _fallback_to_legacy_allowed():
-            _raise_native_policy_violation("generate_packets_from_template_pool", stream=stream)
-        return _call_legacy(
-            "generate_packets_from_template_pool",
-            templates_bytes_list,
-            count,
-            target_ip,
-            real_src_ip=real_src_ip,
-            spoof_ip=spoof_ip,
-            specific_src_port=specific_src_port,
-            has_ethernet=has_ethernet,
-            stream=stream,
-            gateway_mac=gateway_mac,
-            spoof_subnet=spoof_subnet,
-            force_global_fallback=force_global_fallback,
-        )
+    if not _native_ready():
+        _raise_native_policy_violation("generate_packets_from_template_pool", stream=stream)
 
     flat, packet_size, num_templates = _flatten_templates(templates_bytes_list)
     if num_templates == 0:
@@ -908,25 +723,8 @@ def generate_fragmented_packets(
     return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_fragmented_packets", stream)
-    if not _native_ready() or stream_handle < 0:
-        if not _fallback_to_legacy_allowed():
-            _raise_native_policy_violation("generate_fragmented_packets", stream=stream)
-        return _call_legacy(
-            "generate_fragmented_packets",
-            payload_bytes,
-            count,
-            target_ip,
-            target_port,
-            protocol=protocol,
-            spoof_ip=spoof_ip,
-            real_src_ip=real_src_ip,
-            has_ethernet=has_ethernet,
-            frag1_size=frag1_size,
-            frag2_size=frag2_size,
-            stream=stream,
-            gateway_mac=gateway_mac,
-            spoof_subnet=spoof_subnet,
-        )
+    if not _native_ready():
+        _raise_native_policy_violation("generate_fragmented_packets", stream=stream)
 
     payload_arr = _coerce_numeric_array(
         payload_bytes,
@@ -981,19 +779,8 @@ def generate_amplification_packets(
     return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_amplification_packets", stream)
-    if not _native_ready() or stream_handle < 0:
-        if not _fallback_to_legacy_allowed():
-            _raise_native_policy_violation("generate_amplification_packets", stream=stream)
-        return _call_legacy(
-            "generate_amplification_packets",
-            template_bytes,
-            reflectors_ips,
-            victim_ip,
-            count,
-            has_ethernet=has_ethernet,
-            stream=stream,
-            gateway_mac=gateway_mac,
-        )
+    if not _native_ready():
+        _raise_native_policy_violation("generate_amplification_packets", stream=stream)
 
     if not reflectors_ips:
         raise ValueError("reflectors_ips must not be empty")
@@ -1062,30 +849,8 @@ def generate_stateful_packets(
     return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_stateful_packets", stream)
-    if not _native_ready() or stream_handle < 0:
-        if not _fallback_to_legacy_allowed():
-            _raise_native_policy_violation("generate_stateful_packets", stream=stream)
-        return _call_legacy(
-            "generate_stateful_packets",
-            templates_bytes_list,
-            count,
-            target_ip,
-            spoof_ip=spoof_ip,
-            real_src_ip=real_src_ip,
-            specific_src_port=specific_src_port,
-            has_ethernet=has_ethernet,
-            stream=stream,
-            gateway_mac=gateway_mac,
-            spoof_subnet=spoof_subnet,
-            seq_list=seq_list,
-            ack_list=ack_list,
-            state_list=state_list,
-            actual_lengths=actual_lengths,
-            window_sizes=window_sizes,
-            mss_values=mss_values,
-            ttls=ttls,
-            force_global_fallback=force_global_fallback,
-        )
+    if not _native_ready():
+        _raise_native_policy_violation("generate_stateful_packets", stream=stream)
 
     flat, packet_size, num_templates = _flatten_templates(templates_bytes_list)
     if num_templates == 0:
@@ -1172,8 +937,61 @@ def generate_stateful_packets(
     return out, int(out_packet_size.value)
 
 
-def benchmark_template_generation_paths(*args, **kwargs):
-    return _call_legacy("benchmark_template_generation_paths", *args, **kwargs)
+def benchmark_template_generation_paths(
+    template_bytes,
+    count=200000,
+    iterations=5,
+    real_src_ip="192.168.1.100",
+    spoof_ip=True,
+    has_ethernet=True,
+    gateway_mac=0xFFFFFFFFFFFF,
+    spoof_subnet="1.0.0.0/8",
+):
+    if not _native_ready():
+        _raise_native_policy_violation("benchmark_template_generation_paths")
+
+    def _run(force_global_fallback: bool) -> dict[str, float | int]:
+        durations: list[float] = []
+        packet_size = 0
+        for _ in range(max(1, int(iterations))):
+            started = time.perf_counter()
+            packets, packet_size = generate_packets_from_template(
+                template_bytes=template_bytes,
+                count=count,
+                real_src_ip=real_src_ip,
+                spoof_ip=spoof_ip,
+                has_ethernet=has_ethernet,
+                gateway_mac=gateway_mac,
+                spoof_subnet=spoof_subnet,
+                force_global_fallback=force_global_fallback,
+                return_host_ready=True,
+            )
+            durations.append(time.perf_counter() - started)
+            del packets
+        mean_seconds = sum(durations) / float(len(durations))
+        pps = float(count) / mean_seconds if mean_seconds > 0 else 0.0
+        return {
+            "avg_ms": mean_seconds * 1000.0,
+            "pps": pps,
+            "packet_size": int(packet_size),
+            "iterations": int(len(durations)),
+            "path": "global_memory" if force_global_fallback else "constant_memory",
+        }
+
+    constant_result = _run(force_global_fallback=False)
+    global_result = _run(force_global_fallback=True)
+    runs = [constant_result, global_result]
+
+    return {
+        "count": int(count),
+        "iterations": int(iterations),
+        "template_size": int(len(template_bytes)),
+        "constant": constant_result,
+        "global": global_result,
+        "native_only": True,
+        "runs": runs,
+        "generation_telemetry": get_generation_telemetry(),
+    }
 
 
 def generate_icmp_packets(
@@ -1191,23 +1009,8 @@ def generate_icmp_packets(
     return_host_ready=False,
 ):
     stream_handle = _resolve_stream_handle("generate_icmp_packets", stream)
-    if not _native_ready() or stream_handle < 0:
-        if not _fallback_to_legacy_allowed():
-            _raise_native_policy_violation("generate_icmp_packets", stream=stream)
-        return _call_legacy(
-            "generate_icmp_packets",
-            count,
-            target_ip,
-            real_src_ip=real_src_ip,
-            spoof_ip=spoof_ip,
-            has_ethernet=has_ethernet,
-            icmp_type=icmp_type,
-            icmp_code=icmp_code,
-            payload_size=payload_size,
-            stream=stream,
-            gateway_mac=gateway_mac,
-            spoof_subnet=spoof_subnet,
-        )
+    if not _native_ready():
+        _raise_native_policy_violation("generate_icmp_packets", stream=stream)
 
     out_ptr = ctypes.c_void_p()
     out_size = ctypes.c_size_t(0)
@@ -1241,8 +1044,7 @@ def generate_icmp_packets(
 
 
 def get_generation_telemetry() -> dict:
-    legacy = _call_legacy("get_generation_telemetry")
-    out = dict(legacy or {})
+    out = dict(_support.get_generation_telemetry() or {})
     native = _native_telemetry_snapshot()
     out.update(native)
     out["gpu_native_copy_metrics_estimated"] = 1
@@ -1256,24 +1058,24 @@ def get_generation_telemetry() -> dict:
 
 
 def reset_generation_telemetry() -> None:
-    _call_legacy("reset_generation_telemetry")
+    _support.reset_generation_telemetry()
     _native_telemetry_reset()
 
 
 def clear_generation_caches() -> None:
-    _call_legacy("clear_generation_caches")
+    _support.clear_generation_caches()
 
 
 def get_memory_pool():
-    return _call_legacy("get_memory_pool")
+    return _support.get_memory_pool()
 
 
 def get_pinned_host_pool():
-    return _call_legacy("get_pinned_host_pool")
+    return _support.get_pinned_host_pool()
 
 
 def configure_pinned_host_pool(*args, **kwargs):
-    return _call_legacy("configure_pinned_host_pool", *args, **kwargs)
+    return _support.configure_pinned_host_pool(*args, **kwargs)
 
 
 def copy_gpu_to_host_pinned(gpu_arr, *args, **kwargs):
@@ -1293,24 +1095,37 @@ def copy_gpu_to_host_pinned(gpu_arr, *args, **kwargs):
         return np.ascontiguousarray(flat)
     if isinstance(gpu_arr, (bytes, bytearray)):
         return gpu_arr
-    return _call_legacy("copy_gpu_to_host_pinned", gpu_arr, *args, **kwargs)
+    return _support.copy_gpu_to_host_pinned(gpu_arr, *args, **kwargs)
 
 
 def get_pool_telemetry() -> dict:
-    return _call_legacy("get_pool_telemetry")
+    return _support.get_pool_telemetry()
 
 
 def safe_kernel_launch(*args, **kwargs):
-    return _call_legacy("safe_kernel_launch", *args, **kwargs)
+    return _support.safe_kernel_launch(*args, **kwargs)
 
 
 def check_gpu_available():
-    return _call_legacy("check_gpu_available")
+    if not _NATIVE_ENABLED:
+        return False, "cuda_cpp native path disabled by env"
+    if _LIB is None:
+        return False, "libgpu_packet_cuda.so not found"
+    return True, f"cuda_cpp native library ready: {_LIB_PATH.name}"
 
 
 def get_gpu_info() -> dict:
-    return _call_legacy("get_gpu_info")
+    available, message = check_gpu_available()
+    return {
+        "available": bool(available),
+        "message": str(message),
+        "native_enabled": bool(_NATIVE_ENABLED),
+        "library_path": str(_LIB_PATH),
+        "library_loaded": bool(_LIB is not None),
+        "policy": get_native_policy(),
+    }
 
 
 def is_gpu_available() -> bool:
-    return bool(_call_legacy("is_gpu_available"))
+    available, _message = check_gpu_available()
+    return bool(available)
