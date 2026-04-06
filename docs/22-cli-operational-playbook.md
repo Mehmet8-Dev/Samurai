@@ -52,6 +52,7 @@ Kisa kural:
 | Gercek trafikten bagimsiz sentetik test verisi uretmek | GPU PCAP |
 | Elinizdeki PCAP'i kontrollu sekilde tekrar oynatmak | PCAP replay |
 | Planner/veri modeli entegrasyonunu trafiksiz dogrulamak | Traffic-model dry-validate |
+| GPU paket uretim zincirini devreye alip throughput calismak | GPU compute backend workflow |
 
 ## Ortam Hazirlik Kontrol Listesi
 
@@ -375,6 +376,338 @@ Not:
 
 - `--xdp-mode 1` native/driver mod icin uygundur
 - BPF object/section gerekiyorsa bunlari acikca override edin
+
+## Katman 5B: GPU Compute Backend Operasyon Akislari
+
+Bu katman, `--compute-backend cuda` ile gercek paket uretim zincirini calistirmak icindir.
+Burada odak sadece "GPU acik mi?" sorusu degil, su butun zincirdir:
+
+- GPU packet/template uretimi
+- host-ready buffer akis modeli
+- stream overlap
+- pinned memory kullanimi
+- sender/backend ile birlesik throughput davranisi
+
+Pratik kural:
+
+- once GPU dry-run
+- sonra kisa smoke/baseline
+- sonra tuning
+- sonra soak
+- en sonunda CPU ile A/B karsilastirma
+
+### Akis A: GPU readiness dry-run
+
+```bash
+python -m ddos_samurai.cli \
+  --target 10.21.10.10 \
+  --port 443 \
+  --protocol tcp \
+  --attack-vector basic \
+  --compute-backend cuda \
+  --workers 4 \
+  --count 20000 \
+  --gpu-template-pool-size-l4 16 \
+  --gpu-ring-capacity 4 \
+  --gpu-batch-size 65536 \
+  --gpu-stream-count 2 \
+  --gpu-pipeline-depth 2 \
+  --gpu-pinned-max-mb 256 \
+  --dry-run \
+  --confirm \
+  --log artifacts/logs/gpu_readiness_dry_run.log
+```
+
+Bu komut neyi dogrular:
+
+- CUDA backend parse ediliyor mu
+- GPU tuning bayraklari validation'dan geciyor mu
+- worker/batch/stream kombinasyonu kabul ediliyor mu
+
+### Akis B: GPU smoke run
+
+Bu, tam benchmark degil; amac GPU zincirinin gercek kosuda ayaga kalktigini gormektir.
+
+```bash
+python -m ddos_samurai.cli \
+  --target 10.21.10.10 \
+  --port 443 \
+  --protocol tcp \
+  --attack-vector basic \
+  --compute-backend cuda \
+  --sender-backend auto \
+  --workers 4 \
+  --count 100000 \
+  --rps 2000 \
+  --gpu-template-pool-size-l4 16 \
+  --gpu-ring-capacity 4 \
+  --gpu-batch-size 65536 \
+  --gpu-stream-count 2 \
+  --gpu-pipeline-depth 2 \
+  --gpu-pinned-max-mb 256 \
+  --run-report \
+  --run-report-dir artifacts/reports \
+  --confirm \
+  --log artifacts/logs/gpu_smoke.log
+```
+
+Ne zaman kullanilir:
+
+- yeni CUDA runtime kurulumundan sonra
+- surucu veya native bridge degisikliginden sonra
+- CI disi lab smoke testi olarak
+
+### Akis C: GPU baseline throughput
+
+Bu, GPU'nun varsayilan tuning ile verdigi ilk anlamli referans kosudur.
+
+```bash
+python -m ddos_samurai.cli \
+  --target 10.21.20.20 \
+  --port 53 \
+  --protocol udp \
+  --attack-vector basic \
+  --compute-backend cuda \
+  --workers 6 \
+  --count 1500000 \
+  --gpu-template-pool-size-l4 24 \
+  --gpu-ring-capacity 4 \
+  --gpu-batch-size 100000 \
+  --gpu-stream-count 3 \
+  --gpu-pipeline-depth 2 \
+  --gpu-pinned-max-mb 512 \
+  --run-report \
+  --run-report-format both \
+  --run-report-dir artifacts/reports \
+  --confirm \
+  --log artifacts/logs/gpu_baseline_udp.log
+```
+
+Bu kosudan beklenen:
+
+- ilk throughput referansi
+- GPU batch boyutunun sistemde rahat calisip calismadigi
+- pinned memory limiti ile darboz olusup olusmadigi
+
+### Akis D: GPU tuned benchmark
+
+Bu senaryo, throughput odakli laboratuvar tuning icindir.
+
+```bash
+python -m ddos_samurai.cli \
+  --target 10.21.30.30 \
+  --port 443 \
+  --protocol tcp \
+  --attack-vector basic \
+  --compute-backend cuda \
+  --sender-backend c_ext_l3 \
+  --sender-fallback-policy fail \
+  --workers 8 \
+  --count 4000000 \
+  --gpu-template-pool-size-l4 32 \
+  --gpu-ring-capacity 6 \
+  --gpu-batch-size 150000 \
+  --gpu-stream-count 4 \
+  --gpu-pipeline-depth 3 \
+  --gpu-pinned-max-mb 1024 \
+  --gpu-full-variation \
+  --run-report \
+  --run-report-format both \
+  --run-report-dir artifacts/reports \
+  --confirm \
+  --log artifacts/logs/gpu_tuned_benchmark.log
+```
+
+Neden bu komut profesyonel is akisina uygundur:
+
+- sender backend'i acikca belirler
+- fallback'i kapatir
+- tuning parametrelerini raporla birlikte kaydeder
+- daha sonra ayni parametre seti tekrar kosulabilir
+
+### Akis E: GPU + TX_RING kombinasyonu
+
+GPU uretim ve TX path tuning'i birlikte gormek istediginizde bu akis daha anlamlidir.
+
+```bash
+sudo python -m ddos_samurai.cli \
+  --target 10.21.40.40 \
+  --port 443 \
+  --protocol tcp \
+  --attack-vector basic \
+  --compute-backend cuda \
+  --sender-backend txring \
+  --sender-fallback-policy fail \
+  --dataplane-core-mode required \
+  --afpacket-hugepage-mode required \
+  --afpacket-ring-target-mb 256 \
+  --lab-profile dedicated \
+  --dp-queue-strategy pin \
+  --dp-queues 8 \
+  --workers 8 \
+  --count 5000000 \
+  --gpu-template-pool-size-l4 32 \
+  --gpu-ring-capacity 6 \
+  --gpu-batch-size 150000 \
+  --gpu-stream-count 4 \
+  --gpu-pipeline-depth 3 \
+  --gpu-pinned-max-mb 1024 \
+  --kpi-gate-profile dedicated_lab \
+  --kpi-hard-fail \
+  --run-report \
+  --run-report-dir artifacts/reports \
+  --confirm \
+  --log artifacts/logs/gpu_txring_dedicated.log
+```
+
+Bu senaryo hangi sorulara cevap verir:
+
+- darboz GPU tarafinda mi, TX tarafinda mi
+- queue pinning ile throughput fark ediyor mu
+- dedicated lab profile altinda stabilite korunuyor mu
+
+### Akis F: GPU soak
+
+GPU yolu icin soak kosularinda sadece throughput degil, bellek davranisi da onemlidir.
+
+```bash
+python -m ddos_samurai.cli \
+  --target 10.21.50.50 \
+  --port 443 \
+  --protocol tcp \
+  --attack-vector basic \
+  --compute-backend cuda \
+  --workers 8 \
+  --count 100000000 \
+  --rps 4000 \
+  --gpu-template-pool-size-l4 24 \
+  --gpu-ring-capacity 5 \
+  --gpu-batch-size 120000 \
+  --gpu-stream-count 3 \
+  --gpu-pipeline-depth 3 \
+  --gpu-pinned-max-mb 1024 \
+  --soak-profile 1h \
+  --soak-warmup-s 180 \
+  --soak-snapshot-interval 15 \
+  --soak-max-error-rate-pct 0.5 \
+  --soak-max-pps-drop-pct 10 \
+  --soak-max-vram-growth-mb 256 \
+  --soak-max-pinned-growth-mb 256 \
+  --soak-max-backlog 12000 \
+  --run-report \
+  --run-report-dir artifacts/reports \
+  --loss-telemetry auto \
+  --confirm \
+  --log artifacts/logs/gpu_soak_1h.log
+```
+
+GPU soak'ta ozellikle izlenecek alanlar:
+
+- VRAM growth
+- pinned memory growth
+- backlog birikimi
+- uzun kosuda PPS drift
+
+### Akis G: GPU fault-injection soak
+
+```bash
+python -m ddos_samurai.cli \
+  --target 10.21.60.60 \
+  --port 443 \
+  --protocol tcp \
+  --attack-vector basic \
+  --compute-backend cuda \
+  --workers 8 \
+  --count 100000000 \
+  --rps 3500 \
+  --gpu-template-pool-size-l4 24 \
+  --gpu-ring-capacity 5 \
+  --gpu-batch-size 120000 \
+  --gpu-stream-count 3 \
+  --gpu-pipeline-depth 3 \
+  --gpu-pinned-max-mb 1024 \
+  --soak-profile 6h \
+  --fault-inject gpu-stream-error \
+  --fault-after-s 1200 \
+  --fault-duration-s 5 \
+  --run-report \
+  --run-report-dir artifacts/reports \
+  --confirm \
+  --log artifacts/logs/gpu_fault_soak.log
+```
+
+Bu senaryonun amaci:
+
+- stream hatasi benzeri bozulmalarda toparlanma davranisini gozlemek
+- uzun kosuda GPU yolunun ne kadar dayanikli oldugunu olcmek
+
+### Akis H: CPU vs GPU A/B karsilastirma
+
+Bu kalip, tek seferde hizli karar vermek icin degil, kontrollu benchmark karsilastirmasi icin kullanilmalidir.
+
+CPU referans kosu:
+
+```bash
+python -m ddos_samurai.cli \
+  --target 10.21.70.70 \
+  --port 53 \
+  --protocol udp \
+  --attack-vector basic \
+  --compute-backend cpu \
+  --workers 8 \
+  --count 2000000 \
+  --run-report \
+  --run-report-out artifacts/reports/cpu_udp_ab \
+  --confirm \
+  --log artifacts/logs/cpu_udp_ab.log
+```
+
+GPU karsilik kosusu:
+
+```bash
+python -m ddos_samurai.cli \
+  --target 10.21.70.70 \
+  --port 53 \
+  --protocol udp \
+  --attack-vector basic \
+  --compute-backend cuda \
+  --workers 8 \
+  --count 2000000 \
+  --gpu-template-pool-size-l4 24 \
+  --gpu-ring-capacity 4 \
+  --gpu-batch-size 100000 \
+  --gpu-stream-count 3 \
+  --gpu-pipeline-depth 2 \
+  --gpu-pinned-max-mb 512 \
+  --run-report \
+  --run-report-out artifacts/reports/gpu_udp_ab \
+  --confirm \
+  --log artifacts/logs/gpu_udp_ab.log
+```
+
+Bu karsilastirmayi dogru yapmak icin:
+
+- ayni hedef
+- ayni count veya ayni rps
+- ayni worker sayisi
+- ayni run-report formati
+
+### GPU Is Akisinda Yorumlama Rehberi
+
+Eger GPU throughput artmiyorsa once su sirayla bak:
+
+1. sender backend darboz mu
+2. `gpu-batch-size` fazla buyuk oldugu icin latency artiyor mu
+3. `gpu-stream-count` sisteminize gore fazla mi az mi
+4. `gpu-pinned-max-mb` host tarafinda baski olusturuyor mu
+5. `gpu-full-variation` acik oldugunda varyasyon maliyeti mi artiyor
+
+Tipik tuning stratejisi:
+
+1. `gpu-stream-count` icin 2 -> 3 -> 4 deneyin
+2. `gpu-pipeline-depth` icin 2 -> 3 deneyin
+3. `gpu-batch-size` icin orta buyuklukte artan seriler deneyin
+4. Her degisimi ayri run-report ile kaydedin
 
 ## Katman 6: Soak ve Uzun Sureli Stabilite Kosulari
 
