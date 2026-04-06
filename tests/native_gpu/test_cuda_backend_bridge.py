@@ -5,16 +5,14 @@ import importlib.util
 import numpy as np
 import pytest
 
-import ddos_samurai._gpu_packet_cuda_backend as backend
-
-
 _NUMBA_AVAILABLE = importlib.util.find_spec("numba") is not None
-pytestmark = [
-    pytest.mark.skipif(
-        not _NUMBA_AVAILABLE,
-        reason="numba not installed in CI-safe environment; skipping native CUDA bridge tests",
+if not _NUMBA_AVAILABLE:
+    pytest.skip(
+        "numba not installed in CI-safe environment; skipping native CUDA bridge tests",
+        allow_module_level=True,
     )
-]
+
+import ddos_samurai._gpu_packet_cuda_backend as backend
 
 
 def _to_bytes(arr) -> bytes:
