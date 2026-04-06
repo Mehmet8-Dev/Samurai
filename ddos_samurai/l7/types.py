@@ -11,7 +11,6 @@ class L7RouteRequest:
     protocol_engine: str = "auto"
     fallback_policy: str = "allow"
     capability_strict: bool = False
-    legacy_path_enable: bool = False
     lab_profile: str = "off"
 
 
@@ -22,7 +21,6 @@ class L7RouteDecision:
     fallback_policy: str
     capability_strict: bool
     allow_python_fallback: bool
-    legacy_path_enable: bool
     l7_engine_path_used: str
 
     def as_stats(self) -> Dict[str, Any]:
@@ -60,4 +58,3 @@ class L7NormalizedResult:
             elif isinstance(v, (int, float, str)):
                 out[str(k)] = v
         return out
-

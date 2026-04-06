@@ -14,7 +14,6 @@ async def websocket_scenario_sender(
     ping_count=1,
     await_response=False,
     l7_engine="python",
-    legacy_path_enable=False,
     lab_profile="off",
     l7_fallback_policy="allow",
     l7_capability_strict=False,
@@ -50,7 +49,6 @@ async def websocket_scenario_sender(
             protocol_engine="auto",
             fallback_policy=str(l7_fallback_policy or "allow"),
             capability_strict=bool(l7_capability_strict),
-            legacy_path_enable=bool(legacy_path_enable),
             lab_profile=str(lab_profile or "off"),
         )
     )
@@ -270,4 +268,3 @@ async def websocket_scenario_sender(
     py_stats.update(route.as_stats())
     py_stats["l7_engine_path_used"] = "PY_WS"
     return stats_fn(**py_stats)
-

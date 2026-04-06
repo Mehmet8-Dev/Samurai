@@ -27,7 +27,6 @@ async def http_stateful_sender(
     max_active_sessions=None,
     session_keepalive=True,
     l7_engine="python",
-    legacy_path_enable=False,
     lab_profile="off",
     l7_fallback_policy="allow",
     l7_capability_strict=False,
@@ -76,7 +75,6 @@ async def http_stateful_sender(
             protocol_engine="auto",
             fallback_policy=str(l7_fallback_policy or "allow"),
             capability_strict=bool(l7_capability_strict),
-            legacy_path_enable=bool(legacy_path_enable),
             lab_profile=str(lab_profile or "off"),
         )
     )

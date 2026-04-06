@@ -45,11 +45,9 @@ def allow_python_fallback(
     *,
     fallback_policy: str | None,
     capability_strict: bool,
-    legacy_path_enable: bool = True,
 ) -> bool:
     if bool(capability_strict):
         return False
     if normalize_fallback_policy(fallback_policy) == "fail":
         return False
-    return bool(legacy_path_enable)
-
+    return True

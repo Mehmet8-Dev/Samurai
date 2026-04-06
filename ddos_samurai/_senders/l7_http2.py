@@ -86,7 +86,6 @@ async def http2_sender(
             protocol_engine=str(l7_http2_engine or "auto"),
             fallback_policy=str(l7_fallback_policy or "allow"),
             capability_strict=bool(l7_capability_strict),
-            legacy_path_enable=True,
             lab_profile=str(lab_profile or "off"),
         )
     )
@@ -541,4 +540,3 @@ async def http2_sender(
             route=route,
         )
     )
-

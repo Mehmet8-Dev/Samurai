@@ -45,19 +45,10 @@ def build_route_decision(req: L7RouteRequest) -> L7RouteDecision:
         protocol_engine=req.protocol_engine,
     )
 
-    # http1/ws fallback uses explicit legacy gate; http2/quic fallback policy is global.
-    if protocol_name in {"http1", "ws"}:
-        allow_fallback = policy.allow_python_fallback(
-            fallback_policy=fallback_policy,
-            capability_strict=strict,
-            legacy_path_enable=bool(req.legacy_path_enable),
-        )
-    else:
-        allow_fallback = policy.allow_python_fallback(
-            fallback_policy=fallback_policy,
-            capability_strict=strict,
-            legacy_path_enable=True,
-        )
+    allow_fallback = policy.allow_python_fallback(
+        fallback_policy=fallback_policy,
+        capability_strict=strict,
+    )
 
     path_map = _C_ENGINE_PATHS if engine == "c_state" else _PY_ENGINE_PATHS
     return L7RouteDecision(
@@ -66,7 +57,5 @@ def build_route_decision(req: L7RouteRequest) -> L7RouteDecision:
         fallback_policy=fallback_policy,
         capability_strict=bool(strict),
         allow_python_fallback=bool(allow_fallback),
-        legacy_path_enable=bool(req.legacy_path_enable),
         l7_engine_path_used=str(path_map.get(protocol_name, "PY_UNKNOWN")),
     )
-

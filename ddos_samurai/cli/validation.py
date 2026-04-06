@@ -322,11 +322,10 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
     dedicated = str(getattr(args, "lab_profile", "off") or "off").strip().lower() == "dedicated"
     fallback_policy = str(getattr(args, "l7_fallback_policy", "allow") or "allow")
     capability_strict = bool(getattr(args, "l7_capability_strict", False))
-    legacy_path_enable = bool(getattr(args, "legacy_path_enable", False))
     lab_profile = str(getattr(args, "lab_profile", "off") or "off")
     quic_require_native = bool(getattr(args, "l7_quic_require_native", False)) or (dedicated and capability_strict)
 
-    def _check(protocol: str, *, protocol_engine: str, global_engine: str, legacy: bool, hint: str) -> None:
+    def _check(protocol: str, *, protocol_engine: str, global_engine: str, hint: str) -> None:
         route = _l7_dispatch.build_route_decision(
             L7RouteRequest(
                 protocol=str(protocol),
@@ -334,7 +333,6 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
                 protocol_engine=str(protocol_engine),
                 fallback_policy=str(fallback_policy),
                 capability_strict=capability_strict,
-                legacy_path_enable=bool(legacy),
                 lab_profile=lab_profile,
             )
         )
@@ -368,13 +366,13 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
 
     attack_vector = str(getattr(args, "attack_vector", "basic") or "basic").strip().lower()
     if attack_vector == "http" and bool(getattr(args, "stateful", False)):
-        _check("http1", protocol_engine="auto", global_engine=str(getattr(args, "l7_engine", "python") or "python"), legacy=legacy_path_enable, hint="--l7-engine c_state")
+        _check("http1", protocol_engine="auto", global_engine=str(getattr(args, "l7_engine", "python") or "python"), hint="--l7-engine c_state")
     elif attack_vector == "websocket" and bool(getattr(args, "ws_scenario", False)):
-        _check("ws", protocol_engine="auto", global_engine=str(getattr(args, "l7_engine", "python") or "python"), legacy=legacy_path_enable, hint="--l7-engine c_state --ws-scenario")
+        _check("ws", protocol_engine="auto", global_engine=str(getattr(args, "l7_engine", "python") or "python"), hint="--l7-engine c_state --ws-scenario")
     elif attack_vector == "http2":
-        _check("http2", protocol_engine=str(getattr(args, "l7_http2_engine", "auto") or "auto"), global_engine="python", legacy=True, hint="--l7-http2-engine c_state")
+        _check("http2", protocol_engine=str(getattr(args, "l7_http2_engine", "auto") or "auto"), global_engine="python", hint="--l7-http2-engine c_state")
     elif attack_vector == "quic":
-        _check("quic", protocol_engine=str(getattr(args, "l7_quic_engine", "auto") or "auto"), global_engine="python", legacy=True, hint="--l7-quic-engine c_state")
+        _check("quic", protocol_engine=str(getattr(args, "l7_quic_engine", "auto") or "auto"), global_engine="python", hint="--l7-quic-engine c_state")
 
 
 def _parse_label_mix(raw: str) -> dict:

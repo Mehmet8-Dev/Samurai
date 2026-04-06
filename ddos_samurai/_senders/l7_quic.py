@@ -61,7 +61,6 @@ async def quic_sender(
             protocol_engine=str(l7_quic_engine or "auto"),
             fallback_policy=str(l7_fallback_policy or "allow"),
             capability_strict=bool(l7_capability_strict),
-            legacy_path_enable=True,
             lab_profile=str(lab_profile or "off"),
         )
     )
@@ -324,4 +323,3 @@ async def quic_sender(
             route=route,
         )
     )
-

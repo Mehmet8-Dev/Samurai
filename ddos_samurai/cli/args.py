@@ -399,11 +399,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(os.environ.get("SAMURAI_L7_CAPABILITY_STRICT", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
         help="L7 capability strict modu: eksik capability varsa fallback yerine preflight/run fail.",
     )
-    parser.add_argument(
-        "--legacy-path-enable",
-        action="store_true",
-        help="Yeni engine yolu başarısız olursa legacy Python L7 yoluna dönüşe izin ver.",
-    )
     parser.add_argument("--l7-session-repeats", type=int, default=1, help="Stateful L7 oturumlarını kullanıcı başına tekrar sayısı.")
     parser.add_argument("--l7-max-active-sessions", type=int, default=0, help="Stateful L7 için eşzamanlı aktif session üst limiti (0=sınırsız).")
     ml_group = parser.add_argument_group("Traffic Model (Mamba-2 Planner v1)")
