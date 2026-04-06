@@ -32,28 +32,17 @@ class TestL7Policy(unittest.TestCase):
             policy.allow_python_fallback(
                 fallback_policy="allow",
                 capability_strict=False,
-                legacy_path_enable=True,
             )
         )
         self.assertFalse(
             policy.allow_python_fallback(
                 fallback_policy="fail",
                 capability_strict=False,
-                legacy_path_enable=True,
             )
         )
         self.assertFalse(
             policy.allow_python_fallback(
                 fallback_policy="allow",
                 capability_strict=True,
-                legacy_path_enable=True,
             )
         )
-        self.assertFalse(
-            policy.allow_python_fallback(
-                fallback_policy="allow",
-                capability_strict=False,
-                legacy_path_enable=False,
-            )
-        )
-

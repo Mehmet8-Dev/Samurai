@@ -565,7 +565,6 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         args["ws_ping_count"] = 1
         args["ws_await_response"] = False
         args["l7_engine"] = "python"
-        args["legacy_path_enable"] = True
         args["l7_fallback_policy"] = "allow"
         args["l7_capability_strict"] = False
         args["lab_profile"] = "off"

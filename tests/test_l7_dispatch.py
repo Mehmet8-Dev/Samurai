@@ -11,7 +11,6 @@ class TestL7Dispatch(unittest.TestCase):
                 protocol="http1",
                 l7_engine="c_state",
                 fallback_policy="allow",
-                legacy_path_enable=True,
             )
         )
         self.assertEqual(route.engine, "c_state")
@@ -30,17 +29,16 @@ class TestL7Dispatch(unittest.TestCase):
         self.assertEqual(route.l7_engine_path_used, "C_STATE_H2")
         self.assertTrue(route.allow_python_fallback)
 
-    def test_http1_fallback_requires_legacy_gate(self):
+    def test_http1_allow_policy_keeps_python_fallback_open(self):
         route = build_route_decision(
             L7RouteRequest(
                 protocol="http1",
                 l7_engine="c_state",
                 protocol_engine="auto",
                 fallback_policy="allow",
-                legacy_path_enable=False,
             )
         )
-        self.assertFalse(route.allow_python_fallback)
+        self.assertTrue(route.allow_python_fallback)
 
     def test_capability_strict_disables_fallback(self):
         route = build_route_decision(
@@ -53,4 +51,3 @@ class TestL7Dispatch(unittest.TestCase):
         )
         self.assertEqual(route.engine, "c_state")
         self.assertFalse(route.allow_python_fallback)
-

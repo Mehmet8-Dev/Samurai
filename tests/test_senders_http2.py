@@ -329,7 +329,6 @@ class TestHttp2Sender(unittest.IsolatedAsyncioTestCase):
             fallback_policy="allow",
             capability_strict=False,
             allow_python_fallback=True,
-            legacy_path_enable=True,
             l7_engine_path_used="C_STATE_H2",
         )
         mock_run = AsyncMock(return_value=_FakeCResult())

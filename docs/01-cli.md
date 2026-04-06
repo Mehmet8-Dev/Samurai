@@ -59,7 +59,6 @@ CLI tarafi artik yalniz parser degil, ayni zamanda profile-aware preflight katma
   - `--l7-quic-engine {python,c_state,auto}`
   - `--l7-capability-strict`
   - `--l7-quic-require-native`
-  - `--legacy-path-enable`
 - GPU pipeline:
   - `--gpu-ring-capacity`, `--gpu-stream-count`, `--gpu-pipeline-depth`
   - `--gpu-full-variation`

@@ -167,7 +167,6 @@ Asagidaki env anahtarlari `env.py` icindeki `sync_runtime_env(args)` ile runtime
 - `SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE`
 - `SAMURAI_L7_FALLBACK_POLICY`
 - `SAMURAI_L7_CAPABILITY_STRICT`
-- `SAMURAI_LEGACY_PATH_ENABLE`
 
 ## CLI Disi / Ileri Seviye Env Degiskenleri
 
