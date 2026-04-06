@@ -1,8 +1,9 @@
-# GPU Packet CUDA Kernel Mapping (Legacy -> CUDA C++)
+# GPU Packet CUDA Kernel Mapping (Python Reference -> CUDA C++)
 
-This table locks field-level parity targets between `gpu_packet_legacy.py` and CUDA C++ implementation.
+This table locks field-level parity targets between the Python reference backend
+(`gpu_packet_py_backend.py`) and the CUDA C++ implementation.
 
-| Legacy Kernel/Function | CUDA C++ Kernel/Function | Parity-Critical Fields |
+| Python Reference Kernel/Function | CUDA C++ Kernel/Function | Parity-Critical Fields |
 |---|---|---|
 | `create_tcp_packets_kernel_spoof` | `create_tcp_packets_kernel_spoof` | src/dst IP, src/dst port, TTL, IP ID, seq, TCP opts, IP/TCP checksum |
 | `create_tcp_packets_kernel_nospoof` | `create_tcp_packets_kernel_nospoof` | src IP fixed, TTL, IP ID, seq, TCP opts, checksums |
@@ -17,7 +18,8 @@ This table locks field-level parity targets between `gpu_packet_legacy.py` and C
 
 ## RNG Consumption Order
 
-For byte-byte parity, each kernel must keep the same RNG draw order as legacy Python implementation.
+For byte-byte parity, each kernel must keep the same RNG draw order as the
+Python reference implementation.
 
 ## Constant-Memory Rules
 

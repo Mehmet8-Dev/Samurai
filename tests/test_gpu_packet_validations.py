@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 MODULES_IMPORTABLE = False
 try:
     from ddos_samurai import gpu_packet
+    from ddos_samurai import gpu_packet_py_backend as gpu_packet_ref
     MODULES_IMPORTABLE = True
 except Exception:
     MODULES_IMPORTABLE = False
@@ -91,62 +92,62 @@ class TestGpuPacketValidations(unittest.TestCase):
 
     def test_update_gpu_constant_keeps_constant_path_for_same_payload_after_compile(self):
         payload = np.arange(16, dtype=np.uint8)
-        orig_backing = gpu_packet.TEMPLATE_CONST_HOST.copy()
-        orig_fp = gpu_packet._CONST_FINGERPRINTS.get("TEMPLATE_CONST_HOST")
+        orig_backing = gpu_packet_ref.TEMPLATE_CONST_HOST.copy()
+        orig_fp = gpu_packet_ref._CONST_FINGERPRINTS.get("TEMPLATE_CONST_HOST")
         try:
-            gpu_packet._CONST_FINGERPRINTS["TEMPLATE_CONST_HOST"] = None
-            with patch.object(gpu_packet, "template_kernel", _FakeDispatcher(compiled=False)):
-                self.assertTrue(gpu_packet._update_gpu_constant("TEMPLATE_CONST_HOST", payload))
-            with patch.object(gpu_packet, "template_kernel", _FakeDispatcher(compiled=True)):
-                self.assertTrue(gpu_packet._update_gpu_constant("TEMPLATE_CONST_HOST", payload))
+            gpu_packet_ref._CONST_FINGERPRINTS["TEMPLATE_CONST_HOST"] = None
+            with patch.object(gpu_packet_ref, "template_kernel", _FakeDispatcher(compiled=False)):
+                self.assertTrue(gpu_packet_ref._update_gpu_constant("TEMPLATE_CONST_HOST", payload))
+            with patch.object(gpu_packet_ref, "template_kernel", _FakeDispatcher(compiled=True)):
+                self.assertTrue(gpu_packet_ref._update_gpu_constant("TEMPLATE_CONST_HOST", payload))
         finally:
-            gpu_packet.TEMPLATE_CONST_HOST[:] = orig_backing
-            gpu_packet._CONST_FINGERPRINTS["TEMPLATE_CONST_HOST"] = orig_fp
+            gpu_packet_ref.TEMPLATE_CONST_HOST[:] = orig_backing
+            gpu_packet_ref._CONST_FINGERPRINTS["TEMPLATE_CONST_HOST"] = orig_fp
 
     def test_update_gpu_constant_falls_back_when_payload_changes_after_compile(self):
         payload_a = np.arange(16, dtype=np.uint8)
         payload_b = np.arange(16, dtype=np.uint8) + 1
-        orig_backing = gpu_packet.TEMPLATE_CONST_HOST.copy()
-        orig_fp = gpu_packet._CONST_FINGERPRINTS.get("TEMPLATE_CONST_HOST")
+        orig_backing = gpu_packet_ref.TEMPLATE_CONST_HOST.copy()
+        orig_fp = gpu_packet_ref._CONST_FINGERPRINTS.get("TEMPLATE_CONST_HOST")
         try:
-            gpu_packet._CONST_FINGERPRINTS["TEMPLATE_CONST_HOST"] = None
-            with patch.object(gpu_packet, "template_kernel", _FakeDispatcher(compiled=False)):
-                self.assertTrue(gpu_packet._update_gpu_constant("TEMPLATE_CONST_HOST", payload_a))
-            with patch.object(gpu_packet, "template_kernel", _FakeDispatcher(compiled=True)):
-                self.assertFalse(gpu_packet._update_gpu_constant("TEMPLATE_CONST_HOST", payload_b))
-            np.testing.assert_array_equal(gpu_packet.TEMPLATE_CONST_HOST[:16], payload_a)
+            gpu_packet_ref._CONST_FINGERPRINTS["TEMPLATE_CONST_HOST"] = None
+            with patch.object(gpu_packet_ref, "template_kernel", _FakeDispatcher(compiled=False)):
+                self.assertTrue(gpu_packet_ref._update_gpu_constant("TEMPLATE_CONST_HOST", payload_a))
+            with patch.object(gpu_packet_ref, "template_kernel", _FakeDispatcher(compiled=True)):
+                self.assertFalse(gpu_packet_ref._update_gpu_constant("TEMPLATE_CONST_HOST", payload_b))
+            np.testing.assert_array_equal(gpu_packet_ref.TEMPLATE_CONST_HOST[:16], payload_a)
         finally:
-            gpu_packet.TEMPLATE_CONST_HOST[:] = orig_backing
-            gpu_packet._CONST_FINGERPRINTS["TEMPLATE_CONST_HOST"] = orig_fp
+            gpu_packet_ref.TEMPLATE_CONST_HOST[:] = orig_backing
+            gpu_packet_ref._CONST_FINGERPRINTS["TEMPLATE_CONST_HOST"] = orig_fp
 
     def test_template_generation_cache_reduces_h2d_copy_count(self):
         fake_kernel = _FakeKernel()
         template = bytes([0x45]) + bytes([0x00] * 63)
         with patch.dict(os.environ, {"SAMURAI_GPU_CACHE_MAX_ENTRIES": "8"}, clear=False), \
-             patch.object(gpu_packet, "template_kernel", fake_kernel), \
-             patch.object(gpu_packet.cp, "zeros", side_effect=lambda shape, dtype: np.zeros(shape, dtype=np.uint8)), \
-             patch.object(gpu_packet.cp, "array", side_effect=lambda arr, dtype=None: np.array(arr, dtype=np.uint8)), \
-             patch.object(gpu_packet, "create_xoroshiro128p_states", side_effect=lambda _c, seed=None: {"count": _c}):
-            gpu_packet.clear_generation_caches()
-            gpu_packet.reset_generation_telemetry()
+             patch.object(gpu_packet_ref, "template_kernel", fake_kernel), \
+             patch.object(gpu_packet_ref.cp, "zeros", side_effect=lambda shape, dtype: np.zeros(shape, dtype=np.uint8)), \
+             patch.object(gpu_packet_ref.cp, "array", side_effect=lambda arr, dtype=None: np.array(arr, dtype=np.uint8)), \
+             patch.object(gpu_packet_ref, "create_xoroshiro128p_states", side_effect=lambda _c, seed=None: {"count": _c}):
+            gpu_packet_ref.clear_generation_caches()
+            gpu_packet_ref.reset_generation_telemetry()
 
-            gpu_packet.generate_packets_from_template(
+            gpu_packet_ref.generate_packets_from_template(
                 template_bytes=template,
                 count=8,
                 real_src_ip="192.168.1.10",
                 spoof_ip=False,
                 has_ethernet=False,
             )
-            first = gpu_packet.get_generation_telemetry()
+            first = gpu_packet_ref.get_generation_telemetry()
 
-            gpu_packet.generate_packets_from_template(
+            gpu_packet_ref.generate_packets_from_template(
                 template_bytes=template,
                 count=8,
                 real_src_ip="192.168.1.10",
                 spoof_ip=False,
                 has_ethernet=False,
             )
-            second = gpu_packet.get_generation_telemetry()
+            second = gpu_packet_ref.get_generation_telemetry()
 
         self.assertEqual(int(first.get("gpu_template_h2d_copy_count", 0)), 1)
         self.assertEqual(int(second.get("gpu_template_h2d_copy_count", 0)), 1)
@@ -162,28 +163,28 @@ class TestGpuPacketValidations(unittest.TestCase):
 
         template = bytes([0x45]) + bytes([0x00] * 63)
         with patch.dict(os.environ, {"SAMURAI_GPU_RNG_POOL_MAX_ENTRIES": "8"}, clear=False), \
-             patch.object(gpu_packet, "template_kernel", fake_kernel), \
-             patch.object(gpu_packet.cp, "zeros", side_effect=lambda shape, dtype: np.zeros(shape, dtype=np.uint8)), \
-             patch.object(gpu_packet.cp, "array", side_effect=lambda arr, dtype=None: np.array(arr, dtype=np.uint8)), \
-             patch.object(gpu_packet, "create_xoroshiro128p_states", side_effect=_fake_states):
-            gpu_packet.clear_generation_caches()
-            gpu_packet.reset_generation_telemetry()
+             patch.object(gpu_packet_ref, "template_kernel", fake_kernel), \
+             patch.object(gpu_packet_ref.cp, "zeros", side_effect=lambda shape, dtype: np.zeros(shape, dtype=np.uint8)), \
+             patch.object(gpu_packet_ref.cp, "array", side_effect=lambda arr, dtype=None: np.array(arr, dtype=np.uint8)), \
+             patch.object(gpu_packet_ref, "create_xoroshiro128p_states", side_effect=_fake_states):
+            gpu_packet_ref.clear_generation_caches()
+            gpu_packet_ref.reset_generation_telemetry()
 
-            gpu_packet.generate_packets_from_template(
+            gpu_packet_ref.generate_packets_from_template(
                 template_bytes=template,
                 count=16,
                 real_src_ip="192.168.1.10",
                 spoof_ip=False,
                 has_ethernet=False,
             )
-            gpu_packet.generate_packets_from_template(
+            gpu_packet_ref.generate_packets_from_template(
                 template_bytes=template,
                 count=16,
                 real_src_ip="192.168.1.10",
                 spoof_ip=False,
                 has_ethernet=False,
             )
-            tel = gpu_packet.get_generation_telemetry()
+            tel = gpu_packet_ref.get_generation_telemetry()
 
         self.assertEqual(int(tel.get("gpu_rng_state_alloc_count", 0)), 1)
         self.assertGreaterEqual(int(tel.get("gpu_rng_state_reuse_count", 0)), 1)

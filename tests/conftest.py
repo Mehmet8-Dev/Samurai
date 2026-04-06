@@ -2,7 +2,6 @@ import os
 
 import pytest
 
-os.environ.setdefault("SAMURAI_GPU_PACKET_BACKEND", "cuda_cpp")
 os.environ.setdefault("SAMURAI_GPU_PACKET_CUDA_CPP_NATIVE", "1")
 
 
