@@ -52,7 +52,7 @@ Not:
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  Giriş: advv2.py → ddos_samurai.cli.main()                              │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  CLI (cli.py)                                                            │
+│  CLI (cli/)                                                              │
 │  • Argparse + YAML config merge                                          │
 │  • Safety gate (allowlist, public block)                                 │
 │  • Dry-run, self-test, profile uygulama                                 │
@@ -77,7 +77,7 @@ Veri akışı: **CLI → Safety → Worker spawn → Orchestrator (per-worker) �
 
 ### 1.3 Ana Bileşenler (Detay)
 
-#### 1.3.1 CLI Katmanı (`ddos_samurai/cli.py`)
+#### 1.3.1 CLI Katmanı (`ddos_samurai/cli/`)
 
 - **Argparse** ile tüm parametreler; `--config <YAML>` ile varsayılanlar yüklenir, CLI değerleri override eder.
 - **Safety:** `utils.validate_target_safety()` — IPv4, multicast/unspecified blok; allowlist yoksa sadece private/loopback; `--allow-target`, `--allow-public-target` ile gevşetme.

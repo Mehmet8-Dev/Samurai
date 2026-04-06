@@ -6,7 +6,7 @@ Release modeli: `Samurai (Ronin)`
 
 Samurai, farkli trafik vektorleri (L3/L4/L7) icin ortak bir calistirma modeli sunar:
 
-- Tek CLI arayuzu (`ddos_samurai/cli.py`)
+- Tek CLI arayuzu (`ddos_samurai/cli/` paketi)
 - Worker/process modeli (`ddos_samurai/orchestrator.py`)
 - Birden fazla sender ve paket/payload engine
 
@@ -15,7 +15,7 @@ Bu dokuman, kod tabaninda degisiklik yapacak kisi icin "nereden baslamali" sorus
 ## Yuksek Seviyede Veri Akisi
 
 1. Giris noktasi: `advv2.py`
-2. CLI parse + config merge: `ddos_samurai/cli.py`
+2. CLI parse + config merge: `ddos_samurai/cli/app.py`
 3. Guvenlik kapilari: `ddos_samurai/utils.py`
 4. Worker spawn: `multiprocessing.Process(... orchestrator.start_worker ...)`
 5. Worker async dispatch: `ddos_samurai/orchestrator.py:worker_process()`
@@ -27,13 +27,24 @@ Bu dokuman, kod tabaninda degisiklik yapacak kisi icin "nereden baslamali" sorus
 
 ## Katmanlar ve Sorumluluklar
 
-### CLI (`ddos_samurai/cli.py`)
+### CLI (`ddos_samurai/cli/`)
 
 - Arg parse (argparse)
 - Config/default birlestirme
 - Dry-run / self-test / benchmark-run girisleri
 - Safety gate ve profile preflight
 - Runtime env bridge (`SAMURAI_*` export)
+
+Paket ici ayrim:
+
+- `app.py`: ince orchestration katmani
+- `__main__.py`: `python -m ddos_samurai.cli` bootstrap
+- `args.py`: `build_parser()`
+- `config.py`: YAML config merge + soak config
+- `profile_resolver.py`: profil uygulama ve alias normalization
+- `validation.py`: parser/preflight guard'lari
+- `offline_modes.py`: self-test, dry-run, gpu-pcap, pcap-info
+- `runtime.py`: live run, worker spawn, monitor, final report
 
 ### Orkestrator (`ddos_samurai/orchestrator.py`)
 
@@ -58,11 +69,12 @@ Bu dokuman, kod tabaninda degisiklik yapacak kisi icin "nereden baslamali" sorus
 
 Stateful TCP/L7 session tarafi agirlikli olarak CPU/C state engine uzerindedir.
 
-## Repo Gercegi Notu (2026-03-14)
+## Repo Gercegi Notu (2026-04-06)
 
 Bu checkout'ta:
 - `dashboard/` dizini yok
 - `ddos_samurai/api.py` yok
+- `ddos_samurai/cli.py` yok; CLI artik `ddos_samurai/cli/` paketi olarak tutuluyor
 
 Bu nedenle UI/API odakli belgeler tarihsel/legacy baglam olarak okunmalidir.
 

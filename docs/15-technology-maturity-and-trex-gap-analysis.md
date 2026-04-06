@@ -53,7 +53,7 @@ Puanlama modeli:
 ### 2.1 Katmanlama ve Kritik Akis
 
 Gozlenen uctan uca akis:
-1. CLI/config/safety: `ddos_samurai/cli.py`
+1. CLI/config/safety: `ddos_samurai/cli/`
 2. Worker ve dispatch: `ddos_samurai/orchestrator.py`
 3. Transport backend'leri: `ddos_samurai/senders.py`
 4. Paket/payload uretimi: CPU/GPU modulleri (`packet.py`, `cpu_packet_engine.py`, `gpu_packet.py`, `gpu_payload.py`)
@@ -66,7 +66,7 @@ Mimari acisindan guclu yonler:
 - API/dashboard/monitoring katmanlari opsiyonel kullanilabiliyor.
 
 Karmasiklik gostergeleri:
-- Kritik yollarda buyuk moduller var (`gpu_packet.py`, `orchestrator.py`, `cli.py`, `senders.py`, `pcap_replay.py`).
+- Kritik yollarda buyuk moduller var (`gpu_packet.py`, `orchestrator.py`, `senders.py`, `pcap_replay.py`); CLI artik paketlesmis olsa da `args.py` ve `runtime.py` halen buyuk alanlar tasiyor.
 - Hizli yol fallback davranislari, derin metrikleme olmadan kok nedeni gizleyebiliyor.
 - SaaS tarafinda production hardening icin daha siki guvenlik/politika bariyerleri gerekiyor.
 

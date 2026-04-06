@@ -24,7 +24,7 @@ Bu key'ler argparse tarafinda su sekle map edilir:
 - `http_scheme`
 - `http_timeout`
 
-Kod: `ddos_samurai/cli.py` icindeki flatten dongusu.
+Kod: `ddos_samurai/cli/config.py` icindeki flatten dongusu.
 
 ## Oneri: Semayi Netlestirme
 

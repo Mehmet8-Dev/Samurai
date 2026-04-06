@@ -122,7 +122,7 @@ Konfig guard:
 
 ## 7) CLI ve Orchestrator Entegrasyonu
 
-### CLI (`ddos_samurai/cli.py`)
+### CLI (`ddos_samurai/cli/`)
 
 Yeni flagler:
 

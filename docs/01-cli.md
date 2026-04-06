@@ -1,10 +1,35 @@
-# 01 - CLI (ddos_samurai/cli.py)
+# 01 - CLI (`ddos_samurai/cli/`)
 
 ## Rol
 
-`ddos_samurai/cli.py`, tum calistirma parametrelerini tek yerde toplar ve worker'lara dagitilacak "args snapshot" olusturur.
+CLI artik tek bir `cli.py` dosyasi degil, `ddos_samurai/cli/` paketi altinda moduler bir yapi olarak tutulur. Bu paket, tum calistirma parametrelerini toplar ve worker'lara dagitilacak "args snapshot" olusturur.
 
-## Guncel Durum (2026-03-07)
+Ana moduller:
+
+- `app.py`: `main(argv=None)` orchestration
+- `args.py`: `build_parser()`
+- `config.py`: YAML config merge + soak config
+- `profile_resolver.py`: `apply_profile()` ve `_resolve_profile_args()`
+- `validation.py`: `_validate_*` ve `_preflight_*`
+- `env.py`: `args -> os.environ` bridge
+- `offline_modes.py`: self-test, dry-run, gpu-pcap, pcap-info
+- `runtime.py`: live attack akisi
+- `reporting.py`: CLI-specific report glue helper'lari
+
+## Guncel Durum (2026-04-06)
+
+Refactor sonrasi beklenen giris noktasi:
+
+- `python -m ddos_samurai.cli ...`
+- `from ddos_samurai import cli`
+- `cli.build_parser()`
+- `cli.main()`
+
+Uyumluluk notu:
+
+- `ddos_samurai/cli.py` artik yoktur.
+- `ddos_samurai.cli` artik bir dosya degil, paket olarak cozulur.
+- Testlerin ve dis importlarin kullandigi bazi internal helper'lar `ddos_samurai/cli/__init__.py` uzerinden bilincli olarak re-export edilir.
 
 CLI tarafi artik yalniz parser degil, ayni zamanda profile-aware preflight katmanidir.
 
@@ -70,10 +95,11 @@ Ortama yansitilan env anahtarlari:
 - `SAMURAI_AF_PACKET_MLOCK_RING`
 - `SAMURAI_AF_PACKET_PREFAULT_RING`
 
-## Onemli Fonksiyonlar
+## Onemli Giris Noktalari
 
-- `build_parser()`: tum bayraklari/opsiyonlari tanimlar.
-- `main()`: config merge, safety gate, dry-run, worker spawn.
+- `ddos_samurai.cli.build_parser()`: tum bayraklari/opsiyonlari tanimlar.
+- `ddos_samurai.cli.main()`: config merge, safety gate, offline mode dispatch ve live worker spawn akisini baslatir.
+- `ddos_samurai.cli.__main__`: `python -m ddos_samurai.cli` icin module execution bootstrap'i saglar.
 
 ## YAML Config Merge Mantigi
 
@@ -83,6 +109,8 @@ Akis:
 2. YAML icindeki key'ler argparse dest isimlerine map edilir:
    - Ust seviye dict -> dogrudan `set_defaults`.
    - Ic dict (nested) -> `"{main_key}_{sub_key}"` seklinde flatten edilip `set_defaults`'a eklenir.
+
+Kod: `ddos_samurai/cli/config.py` icindeki flatten dongusu.
 
 Not: Bu flatten kuralini degistirirken testler ve mevcut config dosyalariyla uyumu gozden gecirin.
 

@@ -7,9 +7,9 @@ Odak alanlari:
 - CPU + C extension + opsiyonel CUDA hizlandirma
 - Profil tabanli benchmark, run-report ve telemetry
 
-## Durum (2026-03-14)
+## Durum (2026-04-06)
 
-- Aktif cekirdek: `advv2.py` + `ddos_samurai/cli.py` + `orchestrator/senders`
+- Aktif cekirdek: `advv2.py` + `ddos_samurai/cli/` + `orchestrator/senders`
 - Aktif hizli yollar: `fast_sender.c`, `pacing_engine.c`, `xdp_sender.c`, `dataplane_core.c`
 - Aktif GPU yolu: Python bridge + native CUDA (`ddos_samurai/libgpu_packet_cuda.so`)
 - Repo kokunde `dashboard/` dizini yok.
@@ -24,7 +24,8 @@ Yetkisiz sistemlere trafik gondermek yasa disi olabilir ve tum sorumluluk kullan
 
 ## Ana Bilesenler
 
-- CLI giris: `advv2.py`, `ddos_samurai/cli.py`
+- CLI giris: `advv2.py`, `ddos_samurai/cli/`
+- CLI paket yapisi: `app.py`, `args.py`, `config.py`, `profile_resolver.py`, `validation.py`, `offline_modes.py`, `runtime.py`
 - Worker/dispatch: `ddos_samurai/orchestrator.py`
 - Sender facade + ic moduller: `ddos_samurai/senders.py`, `ddos_samurai/_senders/*`
 - CPU paket yolu: `ddos_samurai/packet.py`, `ddos_samurai/cpu_packet_engine.py`
