@@ -748,12 +748,10 @@ class TestRootGateRegression(unittest.TestCase):
     }
 
     def test_root_required_vectors_match(self):
-        """The CPU raw-socket vector set should match those in cli.py."""
-        import inspect
-        src = inspect.getsource(cli.main)
-        self.assertIn("_CPU_RAW_SOCKET_VECTORS", src)
-        for v in self.EXPECTED_CPU_RAW_VECTORS:
-            self.assertIn(f'"{v}"', src, f"Vector '{v}' should be in _CPU_RAW_SOCKET_VECTORS")
+        """The CPU raw-socket vector set should match the live runtime gate."""
+        from ddos_samurai.cli.runtime import _CPU_RAW_SOCKET_VECTORS
+
+        self.assertEqual(set(_CPU_RAW_SOCKET_VECTORS), self.EXPECTED_CPU_RAW_VECTORS)
 
     def test_http_vectors_not_in_root_gate(self):
         """HTTP-layer vectors should not be considered raw on CPU backend."""
