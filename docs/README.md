@@ -32,6 +32,7 @@ Release notu:
 12. `docs/18-afpacket-hugepage-policy.md`: AF_PACKET/TX_RING HugePage policy
 13. `docs/19-benchmark-profiles.md`: Benchmark profilleri ve artifact standardi
 14. `docs/20-env-cli-reference.md`: CLI + `SAMURAI_*` env referansi
+15. `docs/22-cli-operational-playbook.md`: Gercek is akislari icin katmanli CLI egitim/playbook dokumani
 
 ## Tarihsel/Legacy Dokumanlar
 
