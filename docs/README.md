@@ -34,6 +34,7 @@ Release notu:
 14. `docs/20-env-cli-reference.md`: CLI + `SAMURAI_*` env referansi
 15. `docs/22-cli-operational-playbook.md`: Gercek is akislari icin katmanli CLI egitim/playbook dokumani
 16. `docs/23-benchmark-acceptance-handbook.md`: Benchmark sonucunu yorumlama, acceptance ve yayin standardi el kitabi
+17. `docs/24-enterprise-test-scenarios-handbook.md`: Kurumsal seviye test programi, is senaryolari, guardrail ve raporlama rehberi
 
 ## Tarihsel/Legacy Dokumanlar
 
