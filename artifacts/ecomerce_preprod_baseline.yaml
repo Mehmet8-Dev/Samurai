@@ -1,0 +1,24 @@
+target: 192.168.1.1
+port: 443
+attack_vector: http
+http_scheme: https
+http_method: GET
+http_path:
+  - /
+  - /category/kampanya
+  - /product/sku-1001
+  - /login
+  - /cart
+  - /api/checkout/health
+http_concurrency: 120
+workers: 1
+count: 80000
+sender-backend: txring
+afpacket-ring-target-mb: 1024
+rps: 2000
+pacing-mode: rps
+profile: web-stress
+run_report: true
+run_report_format: both
+run_report_dir: artifacts/reports/ecommerce_preprod
+log: artifacts/logs/ecommerce_preprod_baseline.log
