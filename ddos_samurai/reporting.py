@@ -636,6 +636,19 @@ def build_live_attack_report(
     session_success_rate_weight = 0
     retry_success_rate_weighted_sum = 0.0
     retry_success_rate_weight = 0
+    l7_flow_attempted_total = 0
+    l7_flow_completed_total = 0
+    l7_conn_attempted_total = 0
+    l7_conn_established_total = 0
+    l7_conn_reused_total = 0
+    l7_rx_bytes_total = 0
+    l7_tx_bytes_total = 0
+    l7_status_2xx_total = 0
+    l7_status_3xx_total = 0
+    l7_status_4xx_total = 0
+    l7_status_5xx_total = 0
+    l7_expectation_failures_total = 0
+    l7_scheduler_backpressure_count_total = 0
     l7_engine_path_used = ""
     l7_fallback_reason = "none"
     l7_capability_status = "ok"
@@ -1127,6 +1140,23 @@ def build_live_attack_report(
         if _retry_success_rate > 0.0:
             retry_success_rate_weighted_sum += (_retry_success_rate * max(1, attempted))
             retry_success_rate_weight += max(1, attempted)
+        l7_flow_attempted_total += int(ev.get("l7_flow_attempted", st.get("l7_flow_attempted", 0)) or 0)
+        l7_flow_completed_total += int(ev.get("l7_flow_completed", st.get("l7_flow_completed", 0)) or 0)
+        l7_conn_attempted_total += int(ev.get("l7_conn_attempted", st.get("l7_conn_attempted", 0)) or 0)
+        l7_conn_established_total += int(ev.get("l7_conn_established", st.get("l7_conn_established", 0)) or 0)
+        l7_conn_reused_total += int(ev.get("l7_conn_reused", st.get("l7_conn_reused", 0)) or 0)
+        l7_rx_bytes_total += int(ev.get("l7_rx_bytes", st.get("l7_rx_bytes", 0)) or 0)
+        l7_tx_bytes_total += int(ev.get("l7_tx_bytes", st.get("l7_tx_bytes", 0)) or 0)
+        l7_status_2xx_total += int(ev.get("l7_status_2xx", st.get("l7_status_2xx", 0)) or 0)
+        l7_status_3xx_total += int(ev.get("l7_status_3xx", st.get("l7_status_3xx", 0)) or 0)
+        l7_status_4xx_total += int(ev.get("l7_status_4xx", st.get("l7_status_4xx", 0)) or 0)
+        l7_status_5xx_total += int(ev.get("l7_status_5xx", st.get("l7_status_5xx", 0)) or 0)
+        l7_expectation_failures_total += int(
+            ev.get("l7_expectation_failures", st.get("l7_expectation_failures", 0)) or 0
+        )
+        l7_scheduler_backpressure_count_total += int(
+            ev.get("l7_scheduler_backpressure_count", st.get("l7_scheduler_backpressure_count", 0)) or 0
+        )
         _l7_engine_path_item = str(
             ev.get("l7_engine_path_used", st.get("l7_engine_path_used", ""))
             or ""
@@ -1564,6 +1594,19 @@ def build_live_attack_report(
             "l7_conn_rate": round(float(l7_conn_rate), 4),
             "l7_handshake_p99_ms": round(float(l7_handshake_p99_ms_max), 4),
             "l7_step_fail_ratio": round(float(l7_step_fail_ratio), 6),
+            "l7_flow_attempted": int(l7_flow_attempted_total),
+            "l7_flow_completed": int(l7_flow_completed_total),
+            "l7_conn_attempted": int(l7_conn_attempted_total),
+            "l7_conn_established": int(l7_conn_established_total),
+            "l7_conn_reused": int(l7_conn_reused_total),
+            "l7_rx_bytes": int(l7_rx_bytes_total),
+            "l7_tx_bytes": int(l7_tx_bytes_total),
+            "l7_status_2xx": int(l7_status_2xx_total),
+            "l7_status_3xx": int(l7_status_3xx_total),
+            "l7_status_4xx": int(l7_status_4xx_total),
+            "l7_status_5xx": int(l7_status_5xx_total),
+            "l7_expectation_failures": int(l7_expectation_failures_total),
+            "l7_scheduler_backpressure_count": int(l7_scheduler_backpressure_count_total),
             "session_success_rate": round(float(session_success_rate), 6),
             "retry_success_rate": round(float(retry_success_rate), 6),
             "l7_fail_budget_pct": round(float(l7_fail_budget_pct), 6),

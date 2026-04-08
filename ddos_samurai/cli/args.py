@@ -113,6 +113,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--http2-concurrency", type=int, default=100, help="HTTP/2 vektörü için eşzamanlı stream sayısı")
     parser.add_argument("--http2-connections", type=int, default=1, help="HTTP/2 için bağlantı sayısı (connection pool).")
     parser.add_argument("--http2-streams-per-conn", type=int, default=100, help="HTTP/2 bağlantı başına maksimum eşzamanlı stream.")
+    parser.add_argument("--l7-profile-file", type=str, default="", help="Yeni L7 emulation engine için JSON profile dosyası.")
+    parser.add_argument(
+        "--l7-template-mode",
+        choices=["compat", "profile"],
+        default="compat",
+        help="L7 emulation compiler modu: compat|profile.",
+    )
     parser.add_argument("--ws-path", type=str, default="/", help="WebSocket vektörü için bağlantı yolu")
     parser.add_argument("--ws-message", type=str, default="ping", help="WebSocket vektörü için gönderilecek mesaj")
     parser.add_argument("--ws-concurrency", type=int, default=50, help="WebSocket vektörü eşzamanlı bağlantı sayısı")

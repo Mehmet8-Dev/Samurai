@@ -81,6 +81,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
     l7_quic_engine = str(getattr(args, "l7_quic_engine", "auto") or "auto").strip().lower()
     l7_quic_auto_bridge = bool(getattr(args, "l7_quic_auto_bridge", False))
     l7_quic_bridge_autopromote = bool(getattr(args, "l7_quic_bridge_autopromote", False))
+    attack_vector = str(getattr(args, "attack_vector", "basic") or "basic").strip().lower()
+    l7_template_mode = str(getattr(args, "l7_template_mode", "compat") or "compat").strip().lower()
 
     if int(getattr(args, "xdp_queue_id", 0) or 0) < 0:
         parser.error("Hata: --xdp-queue-id >= 0 olmalıdır.")
@@ -151,6 +153,10 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
             _ = _parse_dp_queue_map(dp_queue_map)
         except Exception as exc:
             parser.error(f"Hata: --dp-queue-map formatı geçersiz: {exc}")
+    if l7_template_mode not in {"compat", "profile"}:
+        parser.error("Hata: --l7-template-mode compat veya profile olmalıdır.")
+    if attack_vector in {"websocket", "quic"}:
+        parser.error("Hata: unsupported_in_l7_emu_v1 - V1 yalnızca HTTP/1.1 ve HTTP/2 destekler.")
     if (
         bool(getattr(args, "kpi_hard_fail", False))
         and str(getattr(args, "kpi_gate_profile", "off") or "off") == "off"
@@ -310,69 +316,9 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
     if not bool(getattr(args, "l7_capability_strict", False)):
         return
 
-    try:
-        from ..l7 import c_adapter as _l7_c_adapter
-        from ..l7 import dispatch as _l7_dispatch
-        from ..l7 import quic_mode as _l7_quic_mode
-        from ..l7.types import L7RouteRequest
-    except Exception as exc:
-        parser.error(f"Hata: L7 capability preflight başlatılamadı: {exc}")
-
-    caps = _l7_c_adapter.capability_map()
-    dedicated = str(getattr(args, "lab_profile", "off") or "off").strip().lower() == "dedicated"
-    fallback_policy = str(getattr(args, "l7_fallback_policy", "allow") or "allow")
-    capability_strict = bool(getattr(args, "l7_capability_strict", False))
-    lab_profile = str(getattr(args, "lab_profile", "off") or "off")
-    quic_require_native = bool(getattr(args, "l7_quic_require_native", False)) or (dedicated and capability_strict)
-
-    def _check(protocol: str, *, protocol_engine: str, global_engine: str, hint: str) -> None:
-        route = _l7_dispatch.build_route_decision(
-            L7RouteRequest(
-                protocol=str(protocol),
-                l7_engine=str(global_engine),
-                protocol_engine=str(protocol_engine),
-                fallback_policy=str(fallback_policy),
-                capability_strict=capability_strict,
-                lab_profile=lab_profile,
-            )
-        )
-        if dedicated and route.engine != "c_state":
-            parser.error(
-                f"Hata: --lab-profile dedicated için {protocol} vektöründe C engine zorunlu "
-                f"(mevcut={route.engine}). İpucu: {hint}"
-            )
-        if route.engine != "c_state":
-            return
-        if bool(caps.get(str(protocol), False)):
-            if str(protocol) == "quic":
-                mode = _l7_quic_mode.normalize(caps.get("quic_stack_mode", "unavailable"))
-                if quic_require_native and not _l7_quic_mode.is_native_h3_stateful(mode):
-                    probe_reason = str(caps.get("quic_stack_probe_reason", "unknown") or "unknown")
-                    parser.error(
-                        "Hata: --l7-quic-require-native aktifken QUIC mode native h3_stateful olmalıdır. "
-                        f"mevcut_quic_mode={mode} probe_reason={probe_reason}"
-                    )
-                if not _l7_quic_mode.is_h3_stateful(mode):
-                    parser.error(
-                        "Hata: L7 capability strict aktifken C QUIC engine yalnızca tam H3 stateful modda kabul edilir. "
-                        f"mevcut_quic_mode={mode}"
-                    )
-            return
-        parser.error(
-            "Hata: L7 capability strict aktifken seçili C engine mevcut değil: "
-            f"protocol={protocol} core_available={int(bool(caps.get('core_available', False)))} "
-            f"hint={hint}"
-        )
-
     attack_vector = str(getattr(args, "attack_vector", "basic") or "basic").strip().lower()
-    if attack_vector == "http" and bool(getattr(args, "stateful", False)):
-        _check("http1", protocol_engine="auto", global_engine=str(getattr(args, "l7_engine", "python") or "python"), hint="--l7-engine c_state")
-    elif attack_vector == "websocket" and bool(getattr(args, "ws_scenario", False)):
-        _check("ws", protocol_engine="auto", global_engine=str(getattr(args, "l7_engine", "python") or "python"), hint="--l7-engine c_state --ws-scenario")
-    elif attack_vector == "http2":
-        _check("http2", protocol_engine=str(getattr(args, "l7_http2_engine", "auto") or "auto"), global_engine="python", hint="--l7-http2-engine c_state")
-    elif attack_vector == "quic":
-        _check("quic", protocol_engine=str(getattr(args, "l7_quic_engine", "auto") or "auto"), global_engine="python", hint="--l7-quic-engine c_state")
+    if attack_vector in {"websocket", "quic"}:
+        parser.error("Hata: L7 capability strict yalnızca HTTP/1.1 ve HTTP/2 için kullanılabilir.")
 
 
 def _parse_label_mix(raw: str) -> dict:
