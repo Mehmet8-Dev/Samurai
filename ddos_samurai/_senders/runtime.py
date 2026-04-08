@@ -69,13 +69,8 @@ def load_aioquic():
 
 
 def load_h2_transport(*, package: str = "ddos_samurai"):
-    try:
-        import importlib
-
-        h2_transport = importlib.import_module(".h2_transport", package=package)
-        return bool(getattr(h2_transport, "HYPER_H2_AVAILABLE", False)), h2_transport
-    except Exception:
-        return False, None
+    _ = package
+    return False, None
 
 
 def load_fast_sender(*, package: str = "ddos_samurai"):

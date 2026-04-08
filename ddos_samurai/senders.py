@@ -7,11 +7,10 @@ if TYPE_CHECKING:
 from . import utils
 from . import packet as packet_utils
 from . import cpu_packet_engine
-from .l7 import c_adapter as l7_c_adapter
-from .l7 import dispatch as l7_dispatch
-from .l7 import legacy as l7_legacy
 from .l7 import telemetry as l7_telemetry
-from .l7.types import L7RouteRequest
+from .l7_emu import compile_l7_profile as _compile_l7_profile
+from .l7_emu import load_l7_profile_file, run_l7_profile as _run_l7_profile
+from .l7_emu.types import RuntimeConfig
 from .scapy_support import ScapyUnavailableError, require_scapy
 
 log_info = utils.log_info
@@ -28,17 +27,6 @@ from ._senders import stats_core as _sender_stats_core
 from ._senders.buffer_norm import _normalize_packets_buffer as _normalize_packets_buffer
 # Public compat re-export: external callers import close_sender_context from facade.
 from ._senders.context import close_sender_context as close_sender_context
-
-HTTPX_AVAILABLE, httpx = _sender_runtime.load_httpx()
-WEBSOCKETS_AVAILABLE, websockets = _sender_runtime.load_websockets()
-_aioquic = _sender_runtime.load_aioquic()
-AIOQUIC_AVAILABLE = bool(_aioquic.get("AIOQUIC_AVAILABLE", False))
-connect = _aioquic.get("connect")
-QuicConfiguration = _aioquic.get("QuicConfiguration")
-H3_ALPN = _aioquic.get("H3_ALPN")
-H3Connection = _aioquic.get("H3Connection")
-StreamDataReceived = _aioquic.get("StreamDataReceived")
-HYPER_H2_AVAILABLE, _h2_transport = _sender_runtime.load_h2_transport(package=__package__)
 
 _resolve_sender_backend = _sender_runtime.resolve_sender_backend
 _resolve_sender_fallback_policy = _sender_runtime.resolve_sender_fallback_policy
@@ -59,6 +47,57 @@ _take_loss_snapshot = _sender_stats_core._take_loss_snapshot
 _take_loss_delta = _sender_stats_core._take_loss_delta
 _attach_loss_telemetry = _sender_stats_core._attach_loss_telemetry
 _merge_stats = _sender_stats_core._merge_stats
+
+
+def compile_l7_profile_public(**kwargs):
+    return _compile_l7_profile(**kwargs)
+
+
+async def run_l7_profile_public(profile, **kwargs):
+    runtime_cfg = RuntimeConfig(
+        concurrency=max(1, int(kwargs.get("concurrency", 1) or 1)),
+        live_progress=kwargs.get("live_progress") is not None,
+        live_sent=kwargs.get("live_sent") is not None,
+        live_errors=kwargs.get("live_errors") is not None,
+    )
+    result = await _run_l7_profile(profile, runtime_cfg)
+    return result.as_dict()
+
+
+compile_l7_profile = compile_l7_profile_public
+run_l7_profile = run_l7_profile_public
+
+
+def _unsupported_l7_v1_stats(sender_path: str, count: int) -> Dict[str, Any]:
+    attempted = max(0, int(count or 0))
+    return _normalize_l7_output(
+        {
+            "attempted": attempted,
+            "sent": 0,
+            "errors": attempted,
+            "sender_path": str(sender_path),
+            "sender_fallback_reason": "unsupported_in_l7_emu_v1",
+            "l7_engine_path_used": "L7_EMU_NATIVE",
+            "l7_fallback_reason": "unsupported_in_l7_emu_v1",
+            "l7_flow_attempted": attempted,
+            "l7_flow_completed": 0,
+            "l7_conn_attempted": 0,
+            "l7_conn_established": 0,
+            "l7_conn_reused": 0,
+            "l7_rx_bytes": 0,
+            "l7_tx_bytes": 0,
+            "l7_status_2xx": 0,
+            "l7_status_3xx": 0,
+            "l7_status_4xx": 0,
+            "l7_status_5xx": 0,
+            "l7_expectation_failures": attempted,
+            "l7_scheduler_backpressure_count": 0,
+        },
+        attempted_default=attempted,
+        sender_path=str(sender_path),
+        engine_path_used="L7_EMU_NATIVE",
+        fallback_reason="unsupported_in_l7_emu_v1",
+    )
 
 async def send_packet_async(packet, verbose, packet_no, loop, protocol):
     from ._senders import legacy_packet as _legacy_packet
@@ -328,84 +367,119 @@ async def http2_sender(
     live_sent=None,
     live_errors=None,
     live_progress=None,
+    l7_profile_file="",
+    l7_template_mode="compat",
 ):
-    from ._senders import l7_http2 as _l7_http2
-
-    return await _l7_http2.http2_sender(
-        target_ip,
-        target_port,
-        count,
-        concurrency,
-        http_path,
-        http_method,
-        verbose,
-        scheme=scheme,
-        cookies=cookies,
-        user_agent=user_agent,
-        ssl_context=ssl_context,
-        h2_profile_name=h2_profile_name,
-        h2_transport_name=h2_transport_name,
-        request_plan=request_plan,
-        verify=verify,
-        http2_connections=http2_connections,
-        http2_streams_per_conn=http2_streams_per_conn,
-        l7_http2_engine=l7_http2_engine,
-        l7_fallback_policy=l7_fallback_policy,
-        l7_capability_strict=l7_capability_strict,
-        lab_profile=lab_profile,
+    if l7_profile_file:
+        loaded = load_l7_profile_file(l7_profile_file)
+        profile = compile_l7_profile(
+            protocol=str(loaded.get("protocol", "http2") or "http2"),
+            target_ip=str(loaded.get("target_ip", target_ip) or target_ip),
+            target_port=int(loaded.get("target_port", target_port) or target_port),
+            scheme=str(loaded.get("scheme", scheme) or scheme),
+            template_mode=str(loaded.get("template_mode", l7_template_mode) or l7_template_mode),
+            compat_mode=str(loaded.get("compat_mode", "http2") or "http2"),
+            verify=bool(loaded.get("verify", verify)),
+            timeout_s=float(loaded.get("timeout_s", 5.0) or 5.0),
+            concurrency=int(loaded.get("http2_connections", http2_connections) or http2_connections),
+            http_method=str(loaded.get("http_method", http_method) or http_method),
+            http_path=loaded.get("http_path", http_path),
+            request_plan=request_plan,
+            profile_data=loaded,
+            tls_profile_name=str(loaded.get("tls_profile_name", h2_profile_name or "none") or (h2_profile_name or "none")),
+            max_streams_per_connection=int(loaded.get("http2_streams_per_conn", http2_streams_per_conn) or http2_streams_per_conn),
+        )
+    else:
+        profile = compile_l7_profile(
+            protocol="http2",
+            target_ip=target_ip,
+            target_port=target_port,
+            scheme=scheme,
+            template_mode=l7_template_mode,
+            compat_mode="http2",
+            verify=verify,
+            timeout_s=5.0,
+            concurrency=http2_connections,
+            http_method=http_method,
+            http_path=http_path,
+            request_plan=request_plan,
+            tls_profile_name=h2_profile_name or "none",
+            max_streams_per_connection=http2_streams_per_conn,
+        )
+    out = await run_l7_profile_public(
+        profile,
+        concurrency=max(1, int(concurrency or http2_connections or 1)),
         live_sent=live_sent,
         live_errors=live_errors,
         live_progress=live_progress,
-        stats_fn=_stats,
-        normalize_l7_output_fn=_normalize_l7_output,
-        update_live_fn=_update_live,
-        log_info=log_info,
-        log_error=log_error,
-        log_warning=log_warning,
-        l7_dispatch_mod=l7_dispatch,
-        L7RouteRequest_cls=L7RouteRequest,
-        l7_c_adapter_mod=l7_c_adapter,
-        l7_legacy_mod=l7_legacy,
-        HTTPX_AVAILABLE=bool(HTTPX_AVAILABLE),
-        httpx_module=httpx if HTTPX_AVAILABLE else None,
-        HYPER_H2_AVAILABLE=bool(HYPER_H2_AVAILABLE),
-        h2_transport_module=_h2_transport,
+    )
+    out.setdefault("sender_path", "L7_EMU_H2")
+    out.setdefault("l7_engine_path_used", "L7_EMU_NATIVE")
+    out.setdefault("h2_transport", "native")
+    out.setdefault("h2_request_plan_used", int(bool(request_plan)))
+    out.setdefault("h2_request_plan_items", int(len(getattr(request_plan, "items", []) or [])))
+    return _normalize_l7_output(
+        out,
+        attempted_default=int(out.get("attempted", count) or count),
+        sender_path="L7_EMU_H2",
+        engine_path_used="L7_EMU_NATIVE",
+        fallback_reason=str(out.get("l7_fallback_reason", "none") or "none"),
     )
 
 async def http_app_sender(
     target_ip, target_port, count, concurrency, http_method, http_path, payloads, verbose,
     scheme="http", verify=True, timeout_s=5.0, retries=0, ssl_context=None,
     cookies=None, user_agent=None,
-    live_sent=None, live_errors=None, live_progress=None
+    live_sent=None, live_errors=None, live_progress=None,
+    l7_profile_file="", l7_template_mode="compat",
 ):
-    from ._senders import l7_http1_simple as _l7_http1_simple
-
-    return await _l7_http1_simple.http_app_sender(
-        target_ip,
-        target_port,
-        count,
-        concurrency,
-        http_method,
-        http_path,
-        payloads,
-        verbose,
-        scheme=scheme,
-        verify=verify,
-        timeout_s=timeout_s,
-        retries=retries,
-        ssl_context=ssl_context,
-        cookies=cookies,
-        user_agent=user_agent,
+    if l7_profile_file:
+        loaded = load_l7_profile_file(l7_profile_file)
+        profile = compile_l7_profile(
+            protocol=str(loaded.get("protocol", "http1") or "http1"),
+            target_ip=str(loaded.get("target_ip", target_ip) or target_ip),
+            target_port=int(loaded.get("target_port", target_port) or target_port),
+            scheme=str(loaded.get("scheme", scheme) or scheme),
+            template_mode=str(loaded.get("template_mode", l7_template_mode) or l7_template_mode),
+            compat_mode=str(loaded.get("compat_mode", "http1_simple") or "http1_simple"),
+            verify=bool(loaded.get("verify", verify)),
+            timeout_s=float(loaded.get("timeout_s", timeout_s) or timeout_s),
+            concurrency=int(loaded.get("concurrency", concurrency) or concurrency),
+            http_method=str(loaded.get("http_method", http_method) or http_method),
+            http_path=loaded.get("http_path", http_path),
+            payloads=loaded.get("payloads", payloads),
+            profile_data=loaded,
+            tls_profile_name=str(loaded.get("tls_profile_name", "none") or "none"),
+        )
+    else:
+        profile = compile_l7_profile(
+            protocol="http1",
+            target_ip=target_ip,
+            target_port=target_port,
+            scheme=scheme,
+            template_mode=l7_template_mode,
+            compat_mode="http1_simple",
+            verify=verify,
+            timeout_s=timeout_s,
+            concurrency=concurrency,
+            http_method=http_method,
+            http_path=http_path,
+            payloads=payloads,
+            tls_profile_name="none",
+        )
+    out = await run_l7_profile_public(
+        profile,
+        concurrency=max(1, int(concurrency or 1)),
         live_sent=live_sent,
         live_errors=live_errors,
         live_progress=live_progress,
-        HTTPX_AVAILABLE=bool(HTTPX_AVAILABLE),
-        httpx_module=httpx if HTTPX_AVAILABLE else None,
-        stats_fn=_stats,
-        update_live_fn=_update_live,
-        log_info=log_info,
-        log_error=log_error,
-        utils_mod=utils,
+    )
+    return _normalize_l7_output(
+        out,
+        attempted_default=int(out.get("attempted", count) or count),
+        sender_path="L7_EMU_HTTP1",
+        engine_path_used="L7_EMU_NATIVE",
+        fallback_reason=str(out.get("l7_fallback_reason", "none") or "none"),
     )
 
 async def http_stateful_sender(
@@ -426,45 +500,62 @@ async def http_stateful_sender(
     l7_capability_strict=False,
     request_plan: "H2RequestPlan | None" = None,
     live_sent=None, live_errors=None, live_progress=None,
+    l7_profile_file="", l7_template_mode="compat",
 ):
-    from ._senders import l7_http1_stateful as _l7_http1_stateful
-
-    return await _l7_http1_stateful.http_stateful_sender(
-        target_ip,
-        target_port,
-        vu_count,
-        concurrency,
-        workflow_steps,
-        verbose,
-        scheme=scheme,
-        verify=verify,
-        timeout_s=timeout_s,
-        user_agent=user_agent,
-        ssl_context=ssl_context,
-        retries=retries,
-        http_method=http_method,
-        http_path=http_path,
-        payloads=payloads,
-        session_repeats=session_repeats,
-        max_active_sessions=max_active_sessions,
-        session_keepalive=session_keepalive,
-        l7_engine=l7_engine,
-        lab_profile=lab_profile,
-        l7_fallback_policy=l7_fallback_policy,
-        l7_capability_strict=l7_capability_strict,
-        request_plan=request_plan,
+    if l7_profile_file:
+        loaded = load_l7_profile_file(l7_profile_file)
+        profile = compile_l7_profile(
+            protocol=str(loaded.get("protocol", "http1") or "http1"),
+            target_ip=str(loaded.get("target_ip", target_ip) or target_ip),
+            target_port=int(loaded.get("target_port", target_port) or target_port),
+            scheme=str(loaded.get("scheme", scheme) or scheme),
+            template_mode=str(loaded.get("template_mode", l7_template_mode) or l7_template_mode),
+            compat_mode=str(loaded.get("compat_mode", "http1_stateful") or "http1_stateful"),
+            verify=bool(loaded.get("verify", verify)),
+            timeout_s=float(loaded.get("timeout_s", timeout_s) or timeout_s),
+            concurrency=int(loaded.get("concurrency", concurrency) or concurrency),
+            http_method=str(loaded.get("http_method", http_method) or http_method),
+            http_path=loaded.get("http_path", http_path),
+            payloads=loaded.get("payloads", payloads),
+            request_plan=request_plan,
+            profile_data=loaded,
+            session_repeats=int(loaded.get("session_repeats", session_repeats) or session_repeats),
+        )
+    else:
+        profile = compile_l7_profile(
+            protocol="http1",
+            target_ip=target_ip,
+            target_port=target_port,
+            scheme=scheme,
+            template_mode=l7_template_mode,
+            compat_mode="http1_stateful",
+            verify=verify,
+            timeout_s=timeout_s,
+            concurrency=concurrency,
+            http_method=http_method,
+            http_path=http_path,
+            payloads=payloads,
+            request_plan=request_plan,
+            session_repeats=session_repeats,
+        )
+    out = await run_l7_profile_public(
+        profile,
+        concurrency=max(1, int(concurrency or 1)),
         live_sent=live_sent,
         live_errors=live_errors,
         live_progress=live_progress,
-        stats_fn=_stats,
-        update_live_fn=_update_live,
-        log_info=log_info,
-        log_warning=log_warning,
-        l7_dispatch_mod=l7_dispatch,
-        L7RouteRequest_cls=L7RouteRequest,
-        l7_c_adapter_mod=l7_c_adapter,
-        l7_legacy_mod=l7_legacy,
-        l7_telemetry_mod=l7_telemetry,
+    )
+    out.setdefault("total_vus", int(vu_count))
+    if int(out.get("attempted", 0) or 0) > 0:
+        out.setdefault("session_success_rate", float(out.get("sent", 0) or 0) / float(out.get("attempted", 1) or 1))
+        out.setdefault("cookie_set_apply_rate", 0.0)
+        out.setdefault("retries_used", int(retries or 0))
+    return _normalize_l7_output(
+        out,
+        attempted_default=int(out.get("attempted", vu_count) or vu_count),
+        sender_path="L7_EMU_HTTP1",
+        engine_path_used="L7_EMU_NATIVE",
+        fallback_reason=str(out.get("l7_fallback_reason", "none") or "none"),
     )
 
 
@@ -530,66 +621,10 @@ async def websocket_scenario_sender(
     live_errors=None,
     live_progress=None,
 ):
-    from ._senders import l7_ws_scenario as _l7_ws_scenario
-
-    return await _l7_ws_scenario.websocket_scenario_sender(
-        target_ip,
-        target_port,
-        count,
-        concurrency,
-        ws_path,
-        verbose,
-        auth_message=auth_message,
-        subscribe_messages=subscribe_messages,
-        ping_message=ping_message,
-        ping_count=ping_count,
-        await_response=await_response,
-        l7_engine=l7_engine,
-        lab_profile=lab_profile,
-        l7_fallback_policy=l7_fallback_policy,
-        l7_capability_strict=l7_capability_strict,
-        request_plan=request_plan,
-        ssl_context=ssl_context,
-        live_sent=live_sent,
-        live_errors=live_errors,
-        live_progress=live_progress,
-        stats_fn=_stats,
-        normalize_l7_output_fn=_normalize_l7_output,
-        update_live_fn=_update_live,
-        log_info=log_info,
-        log_error=log_error,
-        log_warning=log_warning,
-        l7_dispatch_mod=l7_dispatch,
-        L7RouteRequest_cls=L7RouteRequest,
-        l7_c_adapter_mod=l7_c_adapter,
-        l7_legacy_mod=l7_legacy,
-        l7_telemetry_mod=l7_telemetry,
-        WEBSOCKETS_AVAILABLE=bool(WEBSOCKETS_AVAILABLE),
-        websockets_module=websockets if WEBSOCKETS_AVAILABLE else None,
-    )
+    return _unsupported_l7_v1_stats("L7_EMU_WS_UNSUPPORTED", count)
 
 async def websocket_sender(target_ip, target_port, count, concurrency, ws_path, ws_message, verbose, ssl_context=None, live_sent=None, live_errors=None, live_progress=None):
-    from ._senders import l7_ws_simple as _l7_ws_simple
-
-    return await _l7_ws_simple.websocket_sender(
-        target_ip,
-        target_port,
-        count,
-        concurrency,
-        ws_path,
-        ws_message,
-        verbose,
-        ssl_context=ssl_context,
-        live_sent=live_sent,
-        live_errors=live_errors,
-        live_progress=live_progress,
-        WEBSOCKETS_AVAILABLE=bool(WEBSOCKETS_AVAILABLE),
-        websockets_module=websockets if WEBSOCKETS_AVAILABLE else None,
-        stats_fn=_stats,
-        update_live_fn=_update_live,
-        log_info=log_info,
-        log_error=log_error,
-    )
+    return _unsupported_l7_v1_stats("L7_EMU_WS_UNSUPPORTED", count)
 
 async def quic_sender(
     target_ip,
@@ -624,53 +659,4 @@ async def quic_sender(
     live_errors=None,
     live_progress=None,
 ):
-    from ._senders import l7_quic as _l7_quic
-
-    return await _l7_quic.quic_sender(
-        target_ip,
-        target_port,
-        count,
-        concurrency,
-        quic_path,
-        quic_method,
-        verbose,
-        ssl_context=ssl_context,
-        retries=retries,
-        timeout_s=timeout_s,
-        quic_verify=quic_verify,
-        l7_quic_engine=l7_quic_engine,
-        l7_quic_require_native=l7_quic_require_native,
-        l7_fallback_policy=l7_fallback_policy,
-        l7_capability_strict=l7_capability_strict,
-        lab_profile=lab_profile,
-        quic_streams_per_conn=quic_streams_per_conn,
-        quic_requests_per_conn=quic_requests_per_conn,
-        quic_conn_pool_size=quic_conn_pool_size,
-        quic_expect_status_min=quic_expect_status_min,
-        quic_expect_status_max=quic_expect_status_max,
-        quic_require_response_headers=quic_require_response_headers,
-        quic_require_response_body=quic_require_response_body,
-        quic_min_response_body_bytes=quic_min_response_body_bytes,
-        quic_expect_header_name=quic_expect_header_name,
-        quic_expect_header_value_contains=quic_expect_header_value_contains,
-        quic_expect_body_substring=quic_expect_body_substring,
-        request_plan=request_plan,
-        live_sent=live_sent,
-        live_errors=live_errors,
-        live_progress=live_progress,
-        stats_fn=_stats,
-        normalize_l7_output_fn=_normalize_l7_output,
-        update_live_fn=_update_live,
-        log_info=log_info,
-        log_error=log_error,
-        log_warning=log_warning,
-        l7_dispatch_mod=l7_dispatch,
-        L7RouteRequest_cls=L7RouteRequest,
-        l7_c_adapter_mod=l7_c_adapter,
-        l7_legacy_mod=l7_legacy,
-        AIOQUIC_AVAILABLE=bool(AIOQUIC_AVAILABLE),
-        connect_fn=connect if AIOQUIC_AVAILABLE else None,
-        QuicConfiguration_cls=QuicConfiguration if AIOQUIC_AVAILABLE else None,
-        H3_ALPN_val=H3_ALPN if AIOQUIC_AVAILABLE else None,
-        H3Connection_cls=H3Connection if AIOQUIC_AVAILABLE else None,
-    )
+    return _unsupported_l7_v1_stats("L7_EMU_QUIC_UNSUPPORTED", count)

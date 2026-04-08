@@ -16,6 +16,19 @@ _DEFAULTS: Dict[str, Any] = {
     "session_success_rate": 0.0,
     "retry_success_rate": 0.0,
     "l7_step_fail_ratio": 0.0,
+    "l7_flow_attempted": 0,
+    "l7_flow_completed": 0,
+    "l7_conn_attempted": 0,
+    "l7_conn_established": 0,
+    "l7_conn_reused": 0,
+    "l7_rx_bytes": 0,
+    "l7_tx_bytes": 0,
+    "l7_status_2xx": 0,
+    "l7_status_3xx": 0,
+    "l7_status_4xx": 0,
+    "l7_status_5xx": 0,
+    "l7_expectation_failures": 0,
+    "l7_scheduler_backpressure_count": 0,
     "l7_handshake_p99_ms": 0.0,
     "h2_stream_reset_ratio": 0.0,
     "h2_goaway_count": 0,
@@ -81,6 +94,19 @@ def aggregate_l7_stats(items: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     total_sent = 0
     total_errors = 0
     total_h2_goaway = 0
+    total_l7_flow_attempted = 0
+    total_l7_flow_completed = 0
+    total_l7_conn_attempted = 0
+    total_l7_conn_established = 0
+    total_l7_conn_reused = 0
+    total_l7_rx_bytes = 0
+    total_l7_tx_bytes = 0
+    total_l7_status_2xx = 0
+    total_l7_status_3xx = 0
+    total_l7_status_4xx = 0
+    total_l7_status_5xx = 0
+    total_l7_expectation_failures = 0
+    total_l7_scheduler_backpressure_count = 0
     weighted_h2_reset = 0.0
     weighted_quic_stream_fail = 0.0
     weighted_quic_hs_fail = 0.0
@@ -97,6 +123,19 @@ def aggregate_l7_stats(items: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         total_sent += sent
         total_errors += errors
         total_h2_goaway += max(0, int(row.get("h2_goaway_count", 0) or 0))
+        total_l7_flow_attempted += max(0, int(row.get("l7_flow_attempted", 0) or 0))
+        total_l7_flow_completed += max(0, int(row.get("l7_flow_completed", 0) or 0))
+        total_l7_conn_attempted += max(0, int(row.get("l7_conn_attempted", 0) or 0))
+        total_l7_conn_established += max(0, int(row.get("l7_conn_established", 0) or 0))
+        total_l7_conn_reused += max(0, int(row.get("l7_conn_reused", 0) or 0))
+        total_l7_rx_bytes += max(0, int(row.get("l7_rx_bytes", 0) or 0))
+        total_l7_tx_bytes += max(0, int(row.get("l7_tx_bytes", 0) or 0))
+        total_l7_status_2xx += max(0, int(row.get("l7_status_2xx", row.get("status_2xx", 0)) or 0))
+        total_l7_status_3xx += max(0, int(row.get("l7_status_3xx", row.get("status_3xx", 0)) or 0))
+        total_l7_status_4xx += max(0, int(row.get("l7_status_4xx", row.get("status_4xx", 0)) or 0))
+        total_l7_status_5xx += max(0, int(row.get("l7_status_5xx", row.get("status_5xx", 0)) or 0))
+        total_l7_expectation_failures += max(0, int(row.get("l7_expectation_failures", 0) or 0))
+        total_l7_scheduler_backpressure_count += max(0, int(row.get("l7_scheduler_backpressure_count", 0) or 0))
         weighted_h2_reset += float(row.get("h2_stream_reset_ratio", 0.0) or 0.0) * attempted
         weighted_quic_stream_fail += float(row.get("quic_stream_fail_ratio", 0.0) or 0.0) * attempted
         weighted_quic_hs_fail += float(row.get("quic_handshake_fail_ratio", 0.0) or 0.0) * attempted
@@ -117,6 +156,19 @@ def aggregate_l7_stats(items: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "attempted": int(total_attempted),
         "sent": int(total_sent),
         "errors": int(max(total_errors, total_attempted - total_sent)),
+        "l7_flow_attempted": int(total_l7_flow_attempted),
+        "l7_flow_completed": int(total_l7_flow_completed),
+        "l7_conn_attempted": int(total_l7_conn_attempted),
+        "l7_conn_established": int(total_l7_conn_established),
+        "l7_conn_reused": int(total_l7_conn_reused),
+        "l7_rx_bytes": int(total_l7_rx_bytes),
+        "l7_tx_bytes": int(total_l7_tx_bytes),
+        "l7_status_2xx": int(total_l7_status_2xx),
+        "l7_status_3xx": int(total_l7_status_3xx),
+        "l7_status_4xx": int(total_l7_status_4xx),
+        "l7_status_5xx": int(total_l7_status_5xx),
+        "l7_expectation_failures": int(total_l7_expectation_failures),
+        "l7_scheduler_backpressure_count": int(total_l7_scheduler_backpressure_count),
         "h2_goaway_count": int(total_h2_goaway),
         "h2_stream_reset_ratio": float(weighted_h2_reset / denom),
         "quic_stream_fail_ratio": float(weighted_quic_stream_fail / denom),
