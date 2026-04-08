@@ -460,6 +460,21 @@ def get_extensions() -> List[Extension]:
     )
     extensions.append(cpu_packet_engine_native)
 
+    l7_compile_args, l7_link_args, l7_macros = _resolve_l7_flags()
+    l7_emu_native = Extension(
+        "ddos_samurai._l7_emu_native",
+        sources=[
+            "ddos_samurai/l7_emu_native/module.cpp",
+            "ddos_samurai/l7_emu_native/engine.cpp",
+        ],
+        include_dirs=[pybind11_include],
+        language="c++",
+        extra_compile_args=_dedupe(["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"] + l7_compile_args),
+        extra_link_args=_dedupe(["-lpthread", "-lm"] + l7_link_args),
+        define_macros=l7_macros,
+    )
+    extensions.append(l7_emu_native)
+
     fast_sender = Extension(
         "ddos_samurai.fast_sender",
         sources=["ddos_samurai/fast_sender.c"],
@@ -486,16 +501,6 @@ def get_extensions() -> List[Extension]:
         extra_link_args=["-lpthread", "-lm"],
     )
     extensions.append(dataplane_core)
-
-    l7_compile_args, l7_link_args, l7_macros = _resolve_l7_flags()
-    l7_state_engine = Extension(
-        "ddos_samurai.l7_state_engine",
-        sources=["ddos_samurai/l7_state_engine.c"],
-        extra_compile_args=l7_compile_args,
-        extra_link_args=l7_link_args,
-        define_macros=l7_macros,
-    )
-    extensions.append(l7_state_engine)
 
     if platform.system() == "Linux":
         xdp_compile_args = ["-O2", "-Wall", "-Wextra"]

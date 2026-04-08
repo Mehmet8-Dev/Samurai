@@ -589,145 +589,25 @@ class TestL7CapabilityPreflight(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cli._preflight_l7_capabilities(parser, args)
 
-    def test_capability_strict_http2_fails_when_c_capability_missing(self):
+    def test_capability_strict_http2_allows_native_single_path(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--attack-vector", "http2", "--l7-capability-strict", "--l7-http2-engine", "c_state"])
-        with patch("ddos_samurai.l7.c_adapter.capability_map", return_value={"core_available": True, "http1": True, "ws": True, "http2": False, "quic": True}):
-            self._assert_preflight_fails(parser, args)
+        args = parser.parse_args(["--attack-vector", "http2", "--l7-capability-strict"])
+        cli._preflight_l7_capabilities(parser, args)
 
-    def test_capability_strict_http2_passes_when_capability_present(self):
+    def test_capability_strict_http_stateful_allows_native_single_path(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--attack-vector", "http2", "--l7-capability-strict", "--l7-http2-engine", "c_state"])
-        with patch("ddos_samurai.l7.c_adapter.capability_map", return_value={"core_available": True, "http1": True, "ws": True, "http2": True, "quic": True}):
-            cli._preflight_l7_capabilities(parser, args)
+        args = parser.parse_args(["--attack-vector", "http", "--stateful", "--l7-capability-strict"])
+        cli._preflight_l7_capabilities(parser, args)
 
-    def test_dedicated_profile_rejects_python_engine_for_http2(self):
+    def test_capability_strict_websocket_rejected_in_v1(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--attack-vector", "http2", "--lab-profile", "dedicated", "--l7-capability-strict", "--l7-http2-engine", "python"])
-        with patch("ddos_samurai.l7.c_adapter.capability_map", return_value={"core_available": True, "http1": True, "ws": True, "http2": True, "quic": True}):
-            self._assert_preflight_fails(parser, args)
+        args = parser.parse_args(["--attack-vector", "websocket", "--l7-capability-strict"])
+        self._assert_preflight_fails(parser, args)
 
-    def test_capability_strict_quic_rejects_probe_only_mode(self):
+    def test_capability_strict_quic_rejected_in_v1(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--attack-vector", "quic", "--l7-capability-strict", "--l7-quic-engine", "c_state"])
-        with patch(
-            "ddos_samurai.l7.c_adapter.capability_map",
-            return_value={
-                "core_available": True,
-                "http1": True,
-                "ws": True,
-                "http2": True,
-                "quic": True,
-                "quic_stack_mode": "probe_udp",
-                "quic_h3_stateful": False,
-            },
-        ):
-            self._assert_preflight_fails(parser, args)
-
-    def test_capability_strict_quic_accepts_h3_stateful_mode(self):
-        parser = cli.build_parser()
-        args = parser.parse_args(["--attack-vector", "quic", "--l7-capability-strict", "--l7-quic-engine", "c_state"])
-        with patch(
-            "ddos_samurai.l7.c_adapter.capability_map",
-            return_value={
-                "core_available": True,
-                "http1": True,
-                "ws": True,
-                "http2": True,
-                "quic": True,
-                "quic_stack_mode": "h3_stateful",
-                "quic_h3_stateful": True,
-            },
-        ):
-            cli._preflight_l7_capabilities(parser, args)
-
-    def test_capability_strict_quic_accepts_h3_stateful_py_mode(self):
-        parser = cli.build_parser()
-        args = parser.parse_args(["--attack-vector", "quic", "--l7-capability-strict", "--l7-quic-engine", "c_state"])
-        with patch(
-            "ddos_samurai.l7.c_adapter.capability_map",
-            return_value={
-                "core_available": True,
-                "http1": True,
-                "ws": True,
-                "http2": True,
-                "quic": True,
-                "quic_stack_mode": "h3_stateful_py",
-                "quic_h3_stateful": True,
-            },
-        ):
-            cli._preflight_l7_capabilities(parser, args)
-
-    def test_dedicated_strict_quic_rejects_h3_stateful_py_without_explicit_flag(self):
-        parser = cli.build_parser()
-        args = parser.parse_args(
-            ["--attack-vector", "quic", "--lab-profile", "dedicated", "--l7-capability-strict", "--l7-quic-engine", "c_state"]
-        )
-        with patch(
-            "ddos_samurai.l7.c_adapter.capability_map",
-            return_value={
-                "core_available": True,
-                "http1": True,
-                "ws": True,
-                "http2": True,
-                "quic": True,
-                "quic_stack_mode": "h3_stateful_py",
-                "quic_h3_stateful": True,
-            },
-        ):
-            self._assert_preflight_fails(parser, args)
-
-    def test_capability_strict_quic_require_native_rejects_h3_stateful_py_mode(self):
-        parser = cli.build_parser()
-        args = parser.parse_args(
-            [
-                "--attack-vector",
-                "quic",
-                "--l7-capability-strict",
-                "--l7-quic-engine",
-                "c_state",
-                "--l7-quic-require-native",
-            ]
-        )
-        with patch(
-            "ddos_samurai.l7.c_adapter.capability_map",
-            return_value={
-                "core_available": True,
-                "http1": True,
-                "ws": True,
-                "http2": True,
-                "quic": True,
-                "quic_stack_mode": "h3_stateful_py",
-                "quic_h3_stateful": True,
-            },
-        ):
-            self._assert_preflight_fails(parser, args)
-
-    def test_capability_strict_quic_require_native_accepts_native_mode(self):
-        parser = cli.build_parser()
-        args = parser.parse_args(
-            [
-                "--attack-vector",
-                "quic",
-                "--l7-capability-strict",
-                "--l7-quic-engine",
-                "c_state",
-                "--l7-quic-require-native",
-            ]
-        )
-        with patch(
-            "ddos_samurai.l7.c_adapter.capability_map",
-            return_value={
-                "core_available": True,
-                "http1": True,
-                "ws": True,
-                "http2": True,
-                "quic": True,
-                "quic_stack_mode": "h3_stateful",
-                "quic_h3_stateful": True,
-            },
-        ):
-            cli._preflight_l7_capabilities(parser, args)
+        args = parser.parse_args(["--attack-vector", "quic", "--l7-capability-strict"])
+        self._assert_preflight_fails(parser, args)
 
 
 class TestRootGateRegression(unittest.TestCase):
