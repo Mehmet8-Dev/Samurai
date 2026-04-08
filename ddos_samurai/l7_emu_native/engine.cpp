@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -49,15 +50,46 @@ struct ResponseInfo {
   std::size_t consumed_bytes{0};
 };
 
-struct NativeRuntime {
-  RuntimeCapabilities caps{};
-  std::vector<ShardState> shards{};
-};
+#ifdef SAMURAI_WITH_NGHTTP2
+struct H2ClientSession;
+#endif
 
 struct Http1Connection {
   int fd{-1};
   int shard_id{0};
   std::string read_buffer;
+  long long idle_deadline_ms{0};
+  std::size_t timer_slot{0};
+  std::uint64_t timer_generation{0};
+  bool timer_armed{false};
+};
+
+struct NativeRuntime {
+  RuntimeCapabilities caps{};
+  std::vector<ShardState> shards{};
+  std::deque<std::size_t> ready_shards{};
+  struct LocalShard {
+    struct TimerEntry {
+      Http1Connection* conn{nullptr};
+      std::uint64_t generation{0};
+    };
+    std::vector<std::unique_ptr<Http1Connection>> http1_idle{};
+    std::vector<Http1Connection*> http1_active{};
+    std::vector<std::vector<TimerEntry>> timer_slots{};
+    long long last_timer_tick_ms{0};
+    long long dispatch_ready_ms{0};
+    bool in_ready_queue{false};
+#ifdef SAMURAI_WITH_NGHTTP2
+    std::vector<std::unique_ptr<H2ClientSession>> h2_sessions{};
+#endif
+  };
+  std::vector<LocalShard> local_shards{};
+};
+
+struct H1RequestSpec {
+  FlowOp send_headers{};
+  std::optional<FlowOp> body_op{};
+  std::vector<FlowOp> follow_ops{};
 };
 
 struct H2RequestSpec {
@@ -121,6 +153,7 @@ struct H2ConnectionContext {
   int status_5xx{0};
   int completed_success{0};
   int failed_streams{0};
+  int max_think_time_ms{0};
   std::size_t bytes_sent{0};
   std::size_t bytes_received{0};
   std::map<std::string, std::string>* captures{nullptr};
@@ -130,6 +163,20 @@ struct H2ConnectionContext {
   SSL* ssl{nullptr};
 #endif
 };
+
+struct H2ClientSession {
+  H2ConnectionContext ctx{};
+  nghttp2_session_callbacks* callbacks{nullptr};
+  nghttp2_session* session{nullptr};
+  bool ready{false};
+  long long idle_deadline_ms{0};
+  long long unhealthy_until_ms{0};
+  long long dispatch_ready_ms{0};
+  int consecutive_failures{0};
+};
+
+void cleanup_tls(H2ConnectionContext& ctx);
+void close_h2_client_session(H2ClientSession& client);
 #endif
 
 int connect_socket(const Profile& profile) {
@@ -162,6 +209,12 @@ int connect_socket(const Profile& profile) {
     ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
   }
   return fd;
+}
+
+long long monotonic_ms_now() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
 }
 
 bool wait_for_fd(int epoll_fd, int fd, uint32_t events, int timeout_ms) {
@@ -464,6 +517,7 @@ NativeRuntime build_runtime(const Profile& profile, const RuntimeConfig& cfg) {
   runtime.caps = detect_capabilities();
   const int shard_count = std::max(1, std::min(cfg.concurrency, profile.max_connections));
   runtime.shards.reserve(static_cast<std::size_t>(shard_count));
+  runtime.local_shards.reserve(static_cast<std::size_t>(shard_count));
   for (int i = 0; i < shard_count; ++i) {
     ShardState shard;
     shard.shard_id = i;
@@ -474,11 +528,39 @@ NativeRuntime build_runtime(const Profile& profile, const RuntimeConfig& cfg) {
     shard.connection_pool.active_connections = 0;
     shard.connection_pool.reused_connections = 0;
     runtime.shards.push_back(shard);
+    NativeRuntime::LocalShard local;
+    local.timer_slots.resize(shard.timer_wheel.slot_count);
+    local.last_timer_tick_ms = monotonic_ms_now();
+    local.dispatch_ready_ms = local.last_timer_tick_ms;
+    runtime.local_shards.push_back(std::move(local));
   }
   return runtime;
 }
 
 void destroy_runtime(NativeRuntime& runtime) {
+#ifdef SAMURAI_WITH_NGHTTP2
+  for (auto& local_shard : runtime.local_shards) {
+    for (auto& session : local_shard.h2_sessions) {
+      if (!session) {
+        continue;
+      }
+      if (session->session != nullptr) {
+        nghttp2_session_del(session->session);
+        session->session = nullptr;
+      }
+      if (session->callbacks != nullptr) {
+        nghttp2_session_callbacks_del(session->callbacks);
+        session->callbacks = nullptr;
+      }
+      cleanup_tls(session->ctx);
+      if (session->ctx.fd >= 0) {
+        ::close(session->ctx.fd);
+        session->ctx.fd = -1;
+      }
+      session->ready = false;
+    }
+  }
+#endif
   for (auto& shard : runtime.shards) {
     if (shard.epoll_fd >= 0) {
       ::close(shard.epoll_fd);
@@ -487,22 +569,182 @@ void destroy_runtime(NativeRuntime& runtime) {
   }
 }
 
-std::vector<H2RequestSpec> build_h2_requests(const Profile& profile) {
-  std::vector<H2RequestSpec> requests;
+void enqueue_ready_shard(NativeRuntime& runtime, std::size_t shard_idx) {
+  if (shard_idx >= runtime.local_shards.size()) {
+    return;
+  }
+  auto& local_shard = runtime.local_shards[shard_idx];
+  if (local_shard.in_ready_queue || local_shard.dispatch_ready_ms > monotonic_ms_now()) {
+    return;
+  }
+  runtime.ready_shards.push_back(shard_idx);
+  local_shard.in_ready_queue = true;
+}
+
+void refresh_ready_queue(NativeRuntime& runtime) {
+  const long long now_ms = monotonic_ms_now();
+  for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
+    if (runtime.local_shards[shard_idx].dispatch_ready_ms <= now_ms) {
+      enqueue_ready_shard(runtime, shard_idx);
+    }
+  }
+}
+
+std::optional<std::size_t> pop_ready_shard(NativeRuntime& runtime) {
+  refresh_ready_queue(runtime);
+  if (runtime.ready_shards.empty()) {
+    return std::nullopt;
+  }
+  const std::size_t shard_idx = runtime.ready_shards.front();
+  runtime.ready_shards.pop_front();
+  runtime.local_shards[shard_idx].in_ready_queue = false;
+  return shard_idx;
+}
+
+void erase_active_http1(NativeRuntime::LocalShard& local_shard, Http1Connection* conn) {
+  local_shard.http1_active.erase(
+      std::remove(local_shard.http1_active.begin(), local_shard.http1_active.end(), conn),
+      local_shard.http1_active.end());
+}
+
+void close_http1_connection(
+    std::unique_ptr<Http1Connection>& conn,
+    ShardState& shard,
+    NativeRuntime::LocalShard& local_shard) {
+  if (!conn) {
+    return;
+  }
+  erase_active_http1(local_shard, conn.get());
+  if (conn->fd >= 0) {
+    ::close(conn->fd);
+    conn->fd = -1;
+  }
+  conn->read_buffer.clear();
+  if (conn->timer_armed && shard.timer_wheel.active_timers > 0) {
+    shard.timer_wheel.active_timers -= 1;
+  }
+  conn->timer_armed = false;
+  shard.connection_pool.active_connections =
+      std::max(0, shard.connection_pool.active_connections - 1);
+}
+
+void schedule_http1_idle(
+    Http1Connection& conn,
+    ShardState& shard,
+    NativeRuntime::LocalShard& local_shard,
+    int timeout_ms) {
+  const long long now_ms = monotonic_ms_now();
+  conn.idle_deadline_ms = now_ms + std::max(1, timeout_ms);
+  conn.timer_slot = static_cast<std::size_t>(conn.idle_deadline_ms % static_cast<long long>(shard.timer_wheel.slot_count));
+  conn.timer_generation += 1;
+  conn.timer_armed = true;
+  local_shard.timer_slots[conn.timer_slot].push_back({&conn, conn.timer_generation});
+  shard.timer_wheel.active_timers += 1;
+}
+
+void expire_http1_idle(
+    ShardState& shard,
+    NativeRuntime::LocalShard& local_shard) {
+  if (local_shard.timer_slots.empty()) {
+    return;
+  }
+  const long long now_ms = monotonic_ms_now();
+  const long long start_tick = local_shard.last_timer_tick_ms;
+  const long long slot_count = static_cast<long long>(shard.timer_wheel.slot_count);
+  if (now_ms < start_tick) {
+    return;
+  }
+  const long long tick_span = std::min(now_ms - start_tick + 1, slot_count);
+  for (long long delta = 0; delta < tick_span; ++delta) {
+    const std::size_t slot = static_cast<std::size_t>((start_tick + delta) % slot_count);
+    auto& bucket = local_shard.timer_slots[slot];
+    for (const auto& entry : bucket) {
+      Http1Connection* conn_ptr = entry.conn;
+      if (conn_ptr == nullptr || !conn_ptr->timer_armed ||
+          conn_ptr->timer_generation != entry.generation ||
+          conn_ptr->idle_deadline_ms > now_ms) {
+        continue;
+      }
+      for (auto it = local_shard.http1_idle.begin(); it != local_shard.http1_idle.end(); ++it) {
+        if (it->get() == conn_ptr) {
+          close_http1_connection(*it, shard, local_shard);
+          local_shard.http1_idle.erase(it);
+          break;
+        }
+      }
+      if (shard.timer_wheel.active_timers > 0) {
+        shard.timer_wheel.active_timers -= 1;
+      }
+    }
+    bucket.clear();
+  }
+  local_shard.last_timer_tick_ms = now_ms;
+}
+
+void expire_all_http1_idle(NativeRuntime& runtime) {
+  for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
+    expire_http1_idle(runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
+  }
+}
+
+#ifdef SAMURAI_WITH_NGHTTP2
+void expire_h2_idle(
+    const Profile& profile,
+    NativeRuntime::LocalShard& local_shard) {
+  const long long now_ms = monotonic_ms_now();
+  for (auto& session : local_shard.h2_sessions) {
+    if (!session) {
+      continue;
+    }
+    if (session->ready && session->idle_deadline_ms > 0 && session->idle_deadline_ms <= now_ms) {
+      close_h2_client_session(*session);
+    }
+    if (session->unhealthy_until_ms > now_ms && local_shard.dispatch_ready_ms < session->unhealthy_until_ms) {
+      local_shard.dispatch_ready_ms = session->unhealthy_until_ms;
+    }
+  }
+  (void)profile;
+}
+#endif
+
+void expire_all_lane_idle(NativeRuntime& runtime, const Profile& profile) {
+  expire_all_http1_idle(runtime);
+#ifdef SAMURAI_WITH_NGHTTP2
+  for (auto& local_shard : runtime.local_shards) {
+    expire_h2_idle(profile, local_shard);
+  }
+#else
+  (void)profile;
+#endif
+}
+
+void advance_runtime_until(NativeRuntime& runtime, const Profile& profile, long long deadline_ms) {
+  const int slice_ms = 32;
+  while (true) {
+    expire_all_lane_idle(runtime, profile);
+    refresh_ready_queue(runtime);
+    const long long now_ms = monotonic_ms_now();
+    if (now_ms >= deadline_ms) {
+      break;
+    }
+    const long long remaining_ms = deadline_ms - now_ms;
+    const int step_ms = static_cast<int>(std::min<long long>(remaining_ms, slice_ms));
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1, step_ms)));
+  }
+}
+
+std::vector<H1RequestSpec> build_h1_requests(const Profile& profile) {
+  std::vector<H1RequestSpec> requests;
   for (std::size_t idx = 0; idx < profile.ops.size(); ++idx) {
     const FlowOp& op = profile.ops[idx];
     if (op.opcode != "SEND_HEADERS") {
       continue;
     }
-    H2RequestSpec spec;
-    spec.method = op.method.empty() ? "GET" : op.method;
-    spec.path = op.path.empty() ? "/" : op.path;
-    spec.headers = op.headers;
+    H1RequestSpec spec;
+    spec.send_headers = op;
     std::size_t j = idx + 1;
     if (j < profile.ops.size() && profile.ops[j].opcode == "SEND_BODY") {
-      spec.body.assign(
-          reinterpret_cast<const char*>(profile.ops[j].body.data()),
-          profile.ops[j].body.size());
+      spec.body_op = profile.ops[j];
       ++j;
     }
     while (j < profile.ops.size()) {
@@ -513,6 +755,35 @@ std::vector<H2RequestSpec> build_h2_requests(const Profile& profile) {
       spec.follow_ops.push_back(follow);
       ++j;
     }
+    requests.push_back(std::move(spec));
+  }
+  return requests;
+}
+
+std::vector<std::vector<H1RequestSpec>> bucket_h1_requests_by_shard(
+    const std::vector<H1RequestSpec>& requests,
+    std::size_t shard_count) {
+  const std::size_t count = std::max<std::size_t>(1, shard_count);
+  std::vector<std::vector<H1RequestSpec>> buckets(count);
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    buckets[i % count].push_back(requests[i]);
+  }
+  return buckets;
+}
+
+std::vector<H2RequestSpec> build_h2_requests(const Profile& profile) {
+  std::vector<H2RequestSpec> requests;
+  for (const H1RequestSpec& h1_spec : build_h1_requests(profile)) {
+    H2RequestSpec spec;
+    spec.method = h1_spec.send_headers.method.empty() ? "GET" : h1_spec.send_headers.method;
+    spec.path = h1_spec.send_headers.path.empty() ? "/" : h1_spec.send_headers.path;
+    spec.headers = h1_spec.send_headers.headers;
+    if (h1_spec.body_op.has_value()) {
+      spec.body.assign(
+          reinterpret_cast<const char*>(h1_spec.body_op->body.data()),
+          h1_spec.body_op->body.size());
+    }
+    spec.follow_ops = h1_spec.follow_ops;
     requests.push_back(std::move(spec));
   }
   return requests;
@@ -540,7 +811,8 @@ void evaluate_response_ops(
     const std::map<std::string, std::string>& headers,
     const std::string& body,
     std::map<std::string, std::string>& captures,
-    int& expectation_failures) {
+    int& expectation_failures,
+    int& think_time_total_ms) {
   for (const FlowOp& follow : follow_ops) {
     if (follow.opcode == "EXPECT_STATUS" && follow.has_expect) {
       if (status_code < follow.expect.status_min || status_code > follow.expect.status_max) {
@@ -579,12 +851,34 @@ void evaluate_response_ops(
       continue;
     }
     if (follow.opcode == "THINK_TIME") {
-      std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, follow.think_time_ms)));
+      think_time_total_ms += std::max(0, follow.think_time_ms);
     }
   }
 }
 
 #ifdef SAMURAI_WITH_NGHTTP2
+std::vector<std::vector<H2RequestSpec>> bucket_h2_requests_by_shard(
+    const std::vector<H2RequestSpec>& requests,
+    std::size_t shard_count) {
+  const std::size_t count = std::max<std::size_t>(1, shard_count);
+  std::vector<std::vector<H2RequestSpec>> buckets(count);
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    buckets[i % count].push_back(requests[i]);
+  }
+  return buckets;
+}
+
+std::vector<std::vector<H2RequestSpec>> bucket_h2_requests_by_connection(
+    const std::vector<H2RequestSpec>& requests,
+    std::size_t connection_count) {
+  const std::size_t count = std::max<std::size_t>(1, connection_count);
+  std::vector<std::vector<H2RequestSpec>> buckets(count);
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    buckets[i % count].push_back(requests[i]);
+  }
+  return buckets;
+}
+
 ssize_t h2_send_callback(
     nghttp2_session* session,
     const uint8_t* data,
@@ -768,13 +1062,16 @@ int h2_on_stream_close_callback(
     ctx->expectation_failures += 1;
     ctx->failed_streams += 1;
   } else {
+    int think_time_total_ms = 0;
     evaluate_response_ops(
         stream.follow_ops,
         stream.status_code,
         stream.response_headers,
         stream.response_body,
         *ctx->captures,
-        ctx->expectation_failures);
+        ctx->expectation_failures,
+        think_time_total_ms);
+    ctx->max_think_time_ms = std::max(ctx->max_think_time_ms, think_time_total_ms);
     if (stream.status_code > 0) {
       if (stream.status_code >= 200 && stream.status_code <= 299) {
         ctx->status_2xx += 1;
@@ -940,100 +1237,147 @@ bool submit_h2_request(
   return true;
 }
 
-bool run_h2_connection(
+void close_h2_client_session(H2ClientSession& client) {
+  if (client.session != nullptr) {
+    nghttp2_session_del(client.session);
+    client.session = nullptr;
+  }
+  if (client.callbacks != nullptr) {
+    nghttp2_session_callbacks_del(client.callbacks);
+    client.callbacks = nullptr;
+  }
+  cleanup_tls(client.ctx);
+  if (client.ctx.fd >= 0) {
+    ::close(client.ctx.fd);
+    client.ctx.fd = -1;
+  }
+  client.ctx.active_streams.clear();
+  client.ready = false;
+  client.idle_deadline_ms = 0;
+  client.dispatch_ready_ms = monotonic_ms_now();
+}
+
+bool open_h2_client_session(
     const Profile& profile,
     int epoll_fd,
-    const std::vector<H2RequestSpec>& requests,
-    std::size_t begin,
-    std::size_t end,
-    std::map<std::string, std::string>& captures,
-    H2RunStats& stats) {
-  if (begin >= end) {
-    return true;
-  }
-
-  H2ConnectionContext ctx;
-  ctx.epoll_fd = epoll_fd;
-  ctx.use_tls = profile.scheme == "https";
-  ctx.verify_peer = profile.verify != 0;
-  ctx.captures = &captures;
-  ctx.timeout_ms = profile.timeout_ms;
-  ctx.authority = profile.host_header.empty() ? profile.target_ip : profile.host_header;
-  if (ctx.authority.find(':') == std::string::npos && profile.target_port > 0) {
-    ctx.authority += ":" + std::to_string(profile.target_port);
+    H2ClientSession& client,
+    H2RunStats& stats,
+    std::size_t request_count) {
+  close_h2_client_session(client);
+  client.ctx = H2ConnectionContext{};
+  client.ctx.epoll_fd = epoll_fd;
+  client.ctx.use_tls = profile.scheme == "https";
+  client.ctx.verify_peer = profile.verify != 0;
+  client.ctx.timeout_ms = profile.timeout_ms;
+  client.ctx.authority = profile.host_header.empty() ? profile.target_ip : profile.host_header;
+  if (client.ctx.authority.find(':') == std::string::npos && profile.target_port > 0) {
+    client.ctx.authority += ":" + std::to_string(profile.target_port);
   }
 
   stats.conn_attempted += 1;
-  ctx.fd = connect_socket(profile);
-  if (ctx.fd < 0) {
-    stats.errors += static_cast<int>(end - begin);
-    stats.expectation_failures += static_cast<int>(end - begin);
+  client.ctx.fd = connect_socket(profile);
+  if (client.ctx.fd < 0) {
+    stats.errors += static_cast<int>(request_count);
+    stats.expectation_failures += static_cast<int>(request_count);
     return false;
   }
-  if (!setup_tls(ctx, profile)) {
-    cleanup_tls(ctx);
-    ::close(ctx.fd);
-    ctx.fd = -1;
-    stats.errors += static_cast<int>(end - begin);
-    stats.expectation_failures += static_cast<int>(end - begin);
+  if (!setup_tls(client.ctx, profile)) {
+    cleanup_tls(client.ctx);
+    ::close(client.ctx.fd);
+    client.ctx.fd = -1;
+    stats.errors += static_cast<int>(request_count);
+    stats.expectation_failures += static_cast<int>(request_count);
     return false;
   }
   stats.conn_established += 1;
+  if (nghttp2_session_callbacks_new(&client.callbacks) != 0 || client.callbacks == nullptr) {
+    close_h2_client_session(client);
+    stats.errors += static_cast<int>(request_count);
+    stats.expectation_failures += static_cast<int>(request_count);
+    return false;
+  }
+  nghttp2_session_callbacks_set_send_callback(client.callbacks, h2_send_callback);
+  nghttp2_session_callbacks_set_on_frame_recv_callback(client.callbacks, h2_on_frame_recv_callback);
+  nghttp2_session_callbacks_set_on_header_callback(client.callbacks, h2_on_header_callback);
+  nghttp2_session_callbacks_set_on_data_chunk_recv_callback(client.callbacks, h2_on_data_chunk_recv_callback);
+  nghttp2_session_callbacks_set_on_stream_close_callback(client.callbacks, h2_on_stream_close_callback);
+  if (nghttp2_session_client_new(&client.session, client.callbacks, &client.ctx) != 0 || client.session == nullptr) {
+    close_h2_client_session(client);
+    stats.errors += static_cast<int>(request_count);
+    stats.expectation_failures += static_cast<int>(request_count);
+    return false;
+  }
+  nghttp2_submit_settings(client.session, NGHTTP2_FLAG_NONE, nullptr, 0);
+  client.ready = true;
+  client.idle_deadline_ms = monotonic_ms_now() + std::max(1, profile.timeout_ms);
+  client.dispatch_ready_ms = monotonic_ms_now();
+  client.consecutive_failures = 0;
+  return true;
+}
 
-  nghttp2_session_callbacks* callbacks = nullptr;
-  nghttp2_session* session = nullptr;
-  if (nghttp2_session_callbacks_new(&callbacks) != 0 || callbacks == nullptr) {
-    cleanup_tls(ctx);
-    ::close(ctx.fd);
-    stats.errors += static_cast<int>(end - begin);
-    stats.expectation_failures += static_cast<int>(end - begin);
+bool run_h2_connection(
+    const Profile& profile,
+    H2ClientSession& client,
+    int epoll_fd,
+    const std::vector<H2RequestSpec>& requests,
+    std::map<std::string, std::string>& captures,
+    H2RunStats& stats) {
+  if (requests.empty()) {
+    return true;
+  }
+
+  if (client.ready && client.ctx.fd >= 0) {
+    stats.conn_reused += 1;
+  } else if (!open_h2_client_session(profile, epoll_fd, client, stats, requests.size())) {
     return false;
   }
-  nghttp2_session_callbacks_set_send_callback(callbacks, h2_send_callback);
-  nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, h2_on_frame_recv_callback);
-  nghttp2_session_callbacks_set_on_header_callback(callbacks, h2_on_header_callback);
-  nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, h2_on_data_chunk_recv_callback);
-  nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, h2_on_stream_close_callback);
-  if (nghttp2_session_client_new(&session, callbacks, &ctx) != 0 || session == nullptr) {
-    nghttp2_session_callbacks_del(callbacks);
-    cleanup_tls(ctx);
-    ::close(ctx.fd);
-    stats.errors += static_cast<int>(end - begin);
-    stats.expectation_failures += static_cast<int>(end - begin);
-    return false;
-  }
-  nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, nullptr, 0);
+
+  H2ConnectionContext& ctx = client.ctx;
+  ctx.epoll_fd = epoll_fd;
+  ctx.captures = &captures;
 
   const std::size_t stream_budget = static_cast<std::size_t>(std::max(1, profile.max_streams_per_connection));
-  std::size_t next = begin;
+  std::size_t next = 0;
   unsigned char read_buf[16384];
+  const int completed_before = ctx.completed_success;
+  const int failed_before = ctx.failed_streams;
+  const int status_2xx_before = ctx.status_2xx;
+  const int status_3xx_before = ctx.status_3xx;
+  const int status_4xx_before = ctx.status_4xx;
+  const int status_5xx_before = ctx.status_5xx;
+  const int expectation_before = ctx.expectation_failures;
+  const int goaway_before = ctx.goaway;
+  const int rst_before = ctx.rst_stream;
+  const int think_before = ctx.max_think_time_ms;
+  const std::size_t rx_before = ctx.bytes_received;
+  const std::size_t tx_before = ctx.bytes_sent;
 
-  while (next < end || !ctx.active_streams.empty()) {
-    while (next < end && ctx.active_streams.size() < stream_budget) {
-      if (!submit_h2_request(session, ctx, profile, requests[next], captures)) {
+  while (next < requests.size() || !ctx.active_streams.empty()) {
+    while (next < requests.size() && ctx.active_streams.size() < stream_budget) {
+      if (!submit_h2_request(client.session, ctx, profile, requests[next], captures)) {
         ctx.protocol_error = 1;
-        stats.errors += static_cast<int>(end - next);
-        stats.expectation_failures += static_cast<int>(end - next);
-        next = end;
+        stats.errors += static_cast<int>(requests.size() - next);
+        stats.expectation_failures += static_cast<int>(requests.size() - next);
+        next = requests.size();
         break;
       }
       next += 1;
     }
-    if (next < end && ctx.active_streams.size() >= stream_budget) {
+    if (next < requests.size() && ctx.active_streams.size() >= stream_budget) {
       stats.scheduler_backpressure += 1;
     }
 
-    if (nghttp2_session_send(session) < 0) {
+    if (nghttp2_session_send(client.session) < 0) {
       ctx.protocol_error = 1;
       break;
     }
-    if (ctx.active_streams.empty() && next >= end) {
+    if (ctx.active_streams.empty() && next >= requests.size()) {
       break;
     }
 
     const ssize_t rd = h2_socket_read(ctx, read_buf, sizeof(read_buf));
     if (rd > 0) {
-      const ssize_t recv_rc = nghttp2_session_mem_recv(session, read_buf, static_cast<size_t>(rd));
+      const ssize_t recv_rc = nghttp2_session_mem_recv(client.session, read_buf, static_cast<size_t>(rd));
       if (recv_rc < 0) {
         ctx.protocol_error = 1;
         break;
@@ -1050,35 +1394,38 @@ bool run_h2_connection(
     break;
   }
 
+  const int dangling_streams = static_cast<int>(ctx.active_streams.size());
   for (auto it = ctx.active_streams.begin(); it != ctx.active_streams.end(); ++it) {
     stats.errors += 1;
     stats.expectation_failures += 1;
   }
   ctx.active_streams.clear();
 
-  stats.sent += ctx.completed_success;
-  stats.errors += ctx.failed_streams;
-  stats.status_2xx += ctx.status_2xx;
-  stats.status_3xx += ctx.status_3xx;
-  stats.status_4xx += ctx.status_4xx;
-  stats.status_5xx += ctx.status_5xx;
-  stats.rx_bytes += ctx.bytes_received;
-  stats.tx_bytes += ctx.bytes_sent;
-  stats.expectation_failures += ctx.expectation_failures;
-  stats.goaway_count += ctx.goaway;
-  stats.rst_stream_count += ctx.rst_stream;
+  stats.sent += ctx.completed_success - completed_before;
+  stats.errors += ctx.failed_streams - failed_before;
+  stats.status_2xx += ctx.status_2xx - status_2xx_before;
+  stats.status_3xx += ctx.status_3xx - status_3xx_before;
+  stats.status_4xx += ctx.status_4xx - status_4xx_before;
+  stats.status_5xx += ctx.status_5xx - status_5xx_before;
+  stats.rx_bytes += ctx.bytes_received - rx_before;
+  stats.tx_bytes += ctx.bytes_sent - tx_before;
+  stats.expectation_failures += ctx.expectation_failures - expectation_before;
+  stats.goaway_count += ctx.goaway - goaway_before;
+  stats.rst_stream_count += ctx.rst_stream - rst_before;
 
-  if (session != nullptr) {
-    nghttp2_session_del(session);
+  const bool ok = !(ctx.transport_error || ctx.protocol_error);
+  const int think_delta_ms = std::max(0, ctx.max_think_time_ms - think_before);
+  if (!ok || ctx.goaway > goaway_before || dangling_streams > 0) {
+    client.consecutive_failures += 1;
+    client.unhealthy_until_ms = monotonic_ms_now() + std::max(1, profile.timeout_ms / 4);
+    close_h2_client_session(client);
+  } else {
+    client.ready = true;
+    client.consecutive_failures = 0;
+    client.idle_deadline_ms = monotonic_ms_now() + std::max(1, profile.timeout_ms);
+    client.dispatch_ready_ms = monotonic_ms_now() + think_delta_ms;
   }
-  if (callbacks != nullptr) {
-    nghttp2_session_callbacks_del(callbacks);
-  }
-  cleanup_tls(ctx);
-  if (ctx.fd >= 0) {
-    ::close(ctx.fd);
-  }
-  return !(ctx.transport_error || ctx.protocol_error);
+  return ok;
 }
 #endif
 
@@ -1109,32 +1456,89 @@ std::map<std::string, double> run_http2_profile(
     return out;
   }
 
-  const int max_streams = std::max(1, profile.max_streams_per_connection);
-  const int desired_connections = std::max(
-      1,
-      std::min(
-          profile.max_connections,
-          static_cast<int>((requests.size() + static_cast<std::size_t>(max_streams) - 1) /
-                           static_cast<std::size_t>(max_streams))));
+  const auto shard_buckets = bucket_h2_requests_by_shard(requests, runtime.shards.size());
+  std::vector<std::vector<std::vector<H2RequestSpec>>> shard_lanes(shard_buckets.size());
+  std::vector<std::size_t> lane_offsets(shard_buckets.size(), 0);
   std::map<std::string, std::string> captures;
-  std::size_t begin = 0;
-  for (int conn_idx = 0; conn_idx < desired_connections && begin < requests.size(); ++conn_idx) {
-    const std::size_t remaining = requests.size() - begin;
-    const std::size_t planned = std::min(
-        remaining,
-        static_cast<std::size_t>(
-            std::max(max_streams, static_cast<int>((remaining + (desired_connections - conn_idx) - 1) /
-                                                   static_cast<std::size_t>(desired_connections - conn_idx)))));
-    const std::size_t end = std::min(requests.size(), begin + planned);
-    const int shard_epoll_fd = runtime.shards.empty()
-        ? -1
-        : runtime.shards[static_cast<std::size_t>(conn_idx) % runtime.shards.size()].epoll_fd;
-    run_h2_connection(profile, shard_epoll_fd, requests, begin, end, captures, stats);
-    begin = end;
+  for (std::size_t shard_idx = 0; shard_idx < shard_buckets.size(); ++shard_idx) {
+    const auto& bucket = shard_buckets[shard_idx];
+    auto& local_shard = runtime.local_shards[shard_idx];
+    const std::size_t shard_conn_budget = static_cast<std::size_t>(
+        std::max(1, runtime.shards.empty() ? profile.max_connections : runtime.shards[shard_idx].connection_pool.max_connections));
+    while (local_shard.h2_sessions.size() < shard_conn_budget) {
+      local_shard.h2_sessions.push_back(std::make_unique<H2ClientSession>());
+    }
+    shard_lanes[shard_idx] = bucket_h2_requests_by_connection(bucket, shard_conn_budget);
+    if (!bucket.empty()) {
+      enqueue_ready_shard(runtime, shard_idx);
+    }
+  }
+
+  while (true) {
+    expire_all_lane_idle(runtime, profile);
+    auto ready_shard = pop_ready_shard(runtime);
+    if (!ready_shard.has_value()) {
+      bool pending = false;
+      for (std::size_t shard_idx = 0; shard_idx < shard_lanes.size(); ++shard_idx) {
+        if (lane_offsets[shard_idx] < shard_lanes[shard_idx].size()) {
+          pending = true;
+          break;
+        }
+      }
+      if (!pending) {
+        break;
+      }
+      std::optional<long long> next_deadline;
+      for (std::size_t idx = 0; idx < shard_lanes.size(); ++idx) {
+        if (lane_offsets[idx] >= shard_lanes[idx].size()) {
+          continue;
+        }
+        const long long candidate = runtime.local_shards[idx].dispatch_ready_ms;
+        if (!next_deadline.has_value() || candidate < *next_deadline) {
+          next_deadline = candidate;
+        }
+      }
+      if (!next_deadline.has_value()) {
+        break;
+      }
+      advance_runtime_until(runtime, profile, *next_deadline);
+      continue;
+    }
+
+    const std::size_t shard_idx = *ready_shard;
+    auto& local_shard = runtime.local_shards[shard_idx];
+    if (lane_offsets[shard_idx] >= shard_lanes[shard_idx].size()) {
+      continue;
+    }
+    const std::size_t lane_idx = lane_offsets[shard_idx];
+    const auto& conn_requests = shard_lanes[shard_idx][lane_idx];
+    if (conn_requests.empty()) {
+      lane_offsets[shard_idx] += 1;
+      if (lane_offsets[shard_idx] < shard_lanes[shard_idx].size()) {
+        enqueue_ready_shard(runtime, shard_idx);
+      }
+      continue;
+    }
+
+    auto& client = *local_shard.h2_sessions[lane_idx];
+    const long long now_ms = monotonic_ms_now();
+    if (!client.ready && client.unhealthy_until_ms > now_ms) {
+      local_shard.dispatch_ready_ms = client.unhealthy_until_ms;
+      stats.scheduler_backpressure += 1;
+      enqueue_ready_shard(runtime, shard_idx);
+      continue;
+    }
+
+    const int shard_epoll_fd = runtime.shards.empty() ? -1 : runtime.shards[shard_idx].epoll_fd;
+    run_h2_connection(profile, client, shard_epoll_fd, conn_requests, captures, stats);
+    lane_offsets[shard_idx] += 1;
+    local_shard.dispatch_ready_ms = std::max(monotonic_ms_now(), client.dispatch_ready_ms);
+    if (lane_offsets[shard_idx] < shard_lanes[shard_idx].size()) {
+      enqueue_ready_shard(runtime, shard_idx);
+    }
   }
 
   stats.errors += std::max(0, stats.attempted - stats.sent - stats.errors);
-  stats.conn_reused = std::max(0, stats.attempted - stats.conn_established);
   out["attempted"] = static_cast<double>(stats.attempted);
   out["sent"] = static_cast<double>(stats.sent);
   out["errors"] = static_cast<double>(stats.errors);
@@ -1198,103 +1602,129 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
   std::size_t tx_bytes = 0;
   std::map<std::string, std::string> captures;
 
-  const int request_attempts = profile.flow_attempted;
+  const auto request_specs = build_h1_requests(profile);
+  const int request_attempts = static_cast<int>(request_specs.size());
   NativeRuntime runtime = build_runtime(profile, cfg);
   out["runtime_shards"] = static_cast<double>(runtime.shards.size());
-  std::vector<std::unique_ptr<Http1Connection>> connection_pool;
-  connection_pool.reserve(static_cast<std::size_t>(std::max(1, profile.max_connections)));
-
-  auto close_connection = [](std::unique_ptr<Http1Connection>& conn) {
-    if (conn && conn->fd >= 0) {
-      ::close(conn->fd);
-      conn->fd = -1;
-      conn->read_buffer.clear();
-    }
-  };
-
-  auto acquire_connection = [&](int request_index) -> Http1Connection* {
-    const std::size_t shard_count = std::max<std::size_t>(1, runtime.shards.size());
-    const int shard_id = static_cast<int>(static_cast<std::size_t>(request_index) % shard_count);
-    for (auto& existing : connection_pool) {
-      if (existing && existing->fd >= 0 && existing->shard_id == shard_id) {
-        conn_reused += 1;
-        return existing.get();
+  auto acquire_connection = [&](int shard_id) -> std::unique_ptr<Http1Connection> {
+    ShardState& shard = runtime.shards[static_cast<std::size_t>(shard_id)];
+    auto& local_shard = runtime.local_shards[static_cast<std::size_t>(shard_id)];
+    expire_http1_idle(shard, local_shard);
+    while (!local_shard.http1_idle.empty()) {
+      std::unique_ptr<Http1Connection> reused = std::move(local_shard.http1_idle.back());
+      local_shard.http1_idle.pop_back();
+      if (!reused || reused->fd < 0) {
+        continue;
       }
-    }
-    if (static_cast<int>(connection_pool.size()) >= std::max(1, profile.max_connections)) {
-      for (auto& existing : connection_pool) {
-        close_connection(existing);
+      if (reused->timer_armed && shard.timer_wheel.active_timers > 0) {
+        shard.timer_wheel.active_timers -= 1;
       }
-      connection_pool.clear();
+      reused->timer_armed = false;
+      local_shard.http1_active.push_back(reused.get());
+      shard.connection_pool.active_connections += 1;
+      shard.connection_pool.reused_connections += 1;
+      conn_reused += 1;
+      return reused;
     }
     auto created = std::make_unique<Http1Connection>();
     created->fd = connect_socket(profile);
     created->shard_id = shard_id;
     conn_attempted += 1;
     if (created->fd < 0) {
-      return nullptr;
+      return {};
     }
     conn_established += 1;
-    connection_pool.push_back(std::move(created));
-    return connection_pool.back().get();
+    local_shard.http1_active.push_back(created.get());
+    shard.connection_pool.active_connections += 1;
+    return created;
   };
+  const auto shard_buckets = bucket_h1_requests_by_shard(request_specs, runtime.shards.size());
+  std::vector<std::size_t> shard_offsets(shard_buckets.size(), 0);
+  for (std::size_t shard_idx = 0; shard_idx < shard_buckets.size(); ++shard_idx) {
+    if (!shard_buckets[shard_idx].empty()) {
+      enqueue_ready_shard(runtime, shard_idx);
+    }
+  }
 
-  for (std::size_t idx = 0; idx < profile.ops.size(); ++idx) {
-    const FlowOp& op = profile.ops[idx];
-    if (op.opcode != "SEND_HEADERS") {
+  while (true) {
+    expire_all_lane_idle(runtime, profile);
+    auto ready_shard = pop_ready_shard(runtime);
+    if (!ready_shard.has_value()) {
+      bool pending = false;
+      for (std::size_t shard_idx = 0; shard_idx < shard_buckets.size(); ++shard_idx) {
+        if (shard_offsets[shard_idx] < shard_buckets[shard_idx].size()) {
+          pending = true;
+          break;
+        }
+      }
+      if (!pending) {
+        break;
+      }
+      std::optional<long long> next_deadline;
+      for (std::size_t idx = 0; idx < shard_buckets.size(); ++idx) {
+        if (shard_offsets[idx] >= shard_buckets[idx].size()) {
+          continue;
+        }
+        const long long candidate = runtime.local_shards[idx].dispatch_ready_ms;
+        if (!next_deadline.has_value() || candidate < *next_deadline) {
+          next_deadline = candidate;
+        }
+      }
+      if (!next_deadline.has_value()) {
+        break;
+      }
+      advance_runtime_until(runtime, profile, *next_deadline);
       continue;
     }
 
-    const FlowOp* body_op = nullptr;
-    if ((idx + 1) < profile.ops.size() && profile.ops[idx + 1].opcode == "SEND_BODY") {
-      body_op = &profile.ops[idx + 1];
+    const std::size_t ready_shard_idx = *ready_shard;
+    ShardState& shard = runtime.shards[ready_shard_idx];
+    auto& local_shard = runtime.local_shards[ready_shard_idx];
+    if (shard_offsets[ready_shard_idx] >= shard_buckets[ready_shard_idx].size()) {
+      continue;
     }
-    Http1Connection* conn = acquire_connection(sent);
-    if (conn == nullptr || conn->fd < 0) {
+    const H1RequestSpec& request_spec = shard_buckets[ready_shard_idx][shard_offsets[ready_shard_idx]];
+    local_shard.dispatch_ready_ms = monotonic_ms_now();
+
+    std::unique_ptr<Http1Connection> conn = acquire_connection(static_cast<int>(ready_shard_idx));
+    if (!conn || conn->fd < 0) {
       expectation_failures += 1;
+      shard_offsets[ready_shard_idx] += 1;
+      if (shard_offsets[ready_shard_idx] < shard_buckets[ready_shard_idx].size()) {
+        enqueue_ready_shard(runtime, ready_shard_idx);
+      }
       continue;
     }
-    const int shard_epoll_fd = runtime.shards.empty()
-        ? -1
-        : runtime.shards[static_cast<std::size_t>(conn->shard_id) % runtime.shards.size()].epoll_fd;
-
-    const std::string request = build_http1_request(profile, op, body_op, captures);
+    const int shard_epoll_fd = shard.epoll_fd;
+    const FlowOp* body_op = request_spec.body_op.has_value() ? &*request_spec.body_op : nullptr;
+    const std::string request = build_http1_request(profile, request_spec.send_headers, body_op, captures);
     tx_bytes += request.size();
     if (!send_all(shard_epoll_fd, conn->fd, request, profile.timeout_ms)) {
       expectation_failures += 1;
-      for (auto& pooled : connection_pool) {
-        if (pooled.get() == conn) {
-          close_connection(pooled);
-          break;
-        }
+      close_http1_connection(conn, shard, local_shard);
+      shard_offsets[ready_shard_idx] += 1;
+      if (shard_offsets[ready_shard_idx] < shard_buckets[ready_shard_idx].size()) {
+        enqueue_ready_shard(runtime, ready_shard_idx);
       }
       continue;
     }
+
     const ResponseInfo response = read_response(shard_epoll_fd, *conn, profile.timeout_ms);
     rx_bytes += response.bytes_received;
+    int think_time_total_ms = 0;
     if (response.status_code <= 0) {
       expectation_failures += 1;
-      for (auto& pooled : connection_pool) {
-        if (pooled.get() == conn) {
-          close_connection(pooled);
-          break;
-        }
+      close_http1_connection(conn, shard, local_shard);
+      shard_offsets[ready_shard_idx] += 1;
+      if (shard_offsets[ready_shard_idx] < shard_buckets[ready_shard_idx].size()) {
+        enqueue_ready_shard(runtime, ready_shard_idx);
       }
       continue;
     }
-    std::size_t j = idx + 1;
-    if (body_op != nullptr) {
-      j += 1;
-    }
-    while (j < profile.ops.size()) {
-      const FlowOp& follow = profile.ops[j];
-      if (follow.opcode == "SEND_HEADERS" || follow.opcode == "CONNECT" || follow.opcode == "CLOSE") {
-        break;
-      }
+
+    for (const FlowOp& follow : request_spec.follow_ops) {
       if (follow.opcode == "EXPECT_STATUS" && follow.has_expect) {
-        const int status_min = follow.expect.status_min;
-        const int status_max = follow.expect.status_max;
-        if (response.status_code < status_min || response.status_code > status_max) {
+        if (response.status_code < follow.expect.status_min || response.status_code > follow.expect.status_max) {
           expectation_failures += 1;
         }
       } else if (follow.opcode == "EXPECT_HEADER" && follow.has_expect) {
@@ -1319,22 +1749,26 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
           capture_cookie(it->second, follow.capture_name, captures);
         }
       } else if (follow.opcode == "THINK_TIME") {
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, follow.think_time_ms)));
+        think_time_total_ms += std::max(0, follow.think_time_ms);
       }
-      ++j;
     }
+
     if (!response.keep_alive || !profile.keepalive) {
-      for (auto& pooled : connection_pool) {
-        if (pooled.get() == conn) {
-          close_connection(pooled);
-          break;
-        }
-      }
-    } else if (!runtime.shards.empty()) {
-      runtime.shards[static_cast<std::size_t>(conn->shard_id) % runtime.shards.size()]
-          .connection_pool.reused_connections += 1;
+      close_http1_connection(conn, shard, local_shard);
+    } else {
+      erase_active_http1(local_shard, conn.get());
+      shard.connection_pool.active_connections =
+          std::max(0, shard.connection_pool.active_connections - 1);
+      schedule_http1_idle(*conn, shard, local_shard, profile.timeout_ms);
+      local_shard.http1_idle.push_back(std::move(conn));
     }
+
+    shard_offsets[ready_shard_idx] += 1;
     sent += 1;
+    local_shard.dispatch_ready_ms = monotonic_ms_now() + think_time_total_ms;
+    if (shard_offsets[ready_shard_idx] < shard_buckets[ready_shard_idx].size()) {
+      enqueue_ready_shard(runtime, ready_shard_idx);
+    }
     if (response.status_code >= 200 && response.status_code <= 299) {
       status_2xx += 1;
     } else if (response.status_code >= 300 && response.status_code <= 399) {
@@ -1345,8 +1779,13 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       status_5xx += 1;
     }
   }
-  for (auto& conn : connection_pool) {
-    close_connection(conn);
+  for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
+    auto& local_shard = runtime.local_shards[shard_idx];
+    auto& shard = runtime.shards[shard_idx];
+    for (auto& conn : local_shard.http1_idle) {
+      close_http1_connection(conn, shard, local_shard);
+    }
+    local_shard.http1_idle.clear();
   }
   destroy_runtime(runtime);
 
