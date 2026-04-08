@@ -64,6 +64,35 @@
         ]
       }
     },
+    "l7_dataplane_ci": {
+      "description": "CI-safe native L7 dataplane benchmark contract and parity profile.",
+      "parity_profile": "ci_safe",
+      "kpi_gate_profile": "ci_safe",
+      "test_profile": "ci_safe",
+      "pytest_args": [
+        "-m",
+        "pytest",
+        "tests/test_benchmark_l7_ci.py",
+        "-q",
+        "-rs"
+      ],
+      "env": {
+        "SAMURAI_BENCH_UPDATE_BASELINE": "0"
+      },
+      "artifact_standard": {
+        "required_files": [
+          "benchmark_l7_summary.json"
+        ],
+        "required_summary_fields": [
+          "schema",
+          "profile",
+          "generated_utc",
+          "scenarios",
+          "parity",
+          "acceptance"
+        ]
+      }
+    },
     "dedicated_lab": {
       "description": "Privileged lab benchmark profile with strict KPI expectation.",
       "parity_profile": "dedicated_lab",

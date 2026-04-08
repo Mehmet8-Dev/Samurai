@@ -106,6 +106,11 @@
     "l7_conn_rate",
     "l7_handshake_p99_ms",
     "l7_step_fail_ratio",
+    "l7_h1_conn_reuse_ratio",
+    "l7_h2_lane_reuse_ratio",
+    "l7_epoll_wakeups",
+    "l7_scheduler_queue_depth_peak",
+    "l7_alloc_count",
     "session_success_rate",
     "retry_success_rate",
     "kpi_gate_profile",
@@ -191,6 +196,71 @@
       "trex": {
         "report_field": "handshake_p99_ms",
         "unit": "milliseconds"
+      }
+    },
+    {
+      "id": "l7_h1_reuse_ratio",
+      "layer": "L7",
+      "comparison": "higher_is_better",
+      "ddos_samurai": {
+        "report_field": "l7_h1_conn_reuse_ratio",
+        "unit": "ratio"
+      },
+      "trex": {
+        "report_field": "http_reuse_ratio",
+        "unit": "ratio"
+      }
+    },
+    {
+      "id": "l7_h2_reuse_ratio",
+      "layer": "L7",
+      "comparison": "higher_is_better",
+      "ddos_samurai": {
+        "report_field": "l7_h2_lane_reuse_ratio",
+        "unit": "ratio"
+      },
+      "trex": {
+        "report_field": "http2_reuse_ratio",
+        "unit": "ratio"
+      }
+    },
+    {
+      "id": "l7_epoll_wakeup_efficiency",
+      "layer": "L7",
+      "comparison": "lower_is_better",
+      "ddos_samurai": {
+        "report_field": "l7_epoll_wakeups",
+        "unit": "wakeups"
+      },
+      "trex": {
+        "report_field": "scheduler_wakeups",
+        "unit": "wakeups"
+      }
+    },
+    {
+      "id": "l7_scheduler_queue_depth",
+      "layer": "L7",
+      "comparison": "lower_is_better",
+      "ddos_samurai": {
+        "report_field": "l7_scheduler_queue_depth_peak",
+        "unit": "queue_depth"
+      },
+      "trex": {
+        "report_field": "scheduler_queue_depth_peak",
+        "unit": "queue_depth"
+      }
+    },
+    {
+      "id": "l7_alloc_pressure",
+      "layer": "L7",
+      "comparison": "lower_is_better",
+      "ddos_samurai": {
+        "report_field": "l7_alloc_count",
+        "unit": "allocations"
+      },
+      "trex": {
+        "report_field": "alloc_count",
+        "unit": "allocations"
       }
     }
   ]
