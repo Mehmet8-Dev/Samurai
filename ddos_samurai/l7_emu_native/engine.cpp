@@ -704,22 +704,6 @@ struct H2ClientSession {
   int drain_evictions{0};
 };
 
-struct H1TransportOps {
-  int (*connect_fn)(Http1Connection& conn, const Profile& profile);
-  ssize_t (*send_fn)(Http1Connection& conn, const void* buf, std::size_t len);
-  ssize_t (*recv_fn)(Http1Connection& conn, void* buf, std::size_t len);
-  int (*close_fn)(Http1Connection& conn);
-  const char* name;
-};
-
-TransportBackend parse_transport_backend(const Profile& profile) {
-  const std::string normalized = lower_copy(profile.transport_backend);
-  if (normalized == "custom_tcp") {
-    return TransportBackend::CustomTcp;
-  }
-  return TransportBackend::KernelSocket;
-}
-
 void cleanup_tls(H2ConnectionContext& ctx);
 void close_h2_client_session(H2ClientSession& client);
 
@@ -776,6 +760,22 @@ void recycle_h2_stream_state(H2ClientSession& client, std::unique_ptr<H2StreamSt
   client.free_streams.push_back(std::move(stream));
 }
 #endif
+
+struct H1TransportOps {
+  int (*connect_fn)(Http1Connection& conn, const Profile& profile);
+  ssize_t (*send_fn)(Http1Connection& conn, const void* buf, std::size_t len);
+  ssize_t (*recv_fn)(Http1Connection& conn, void* buf, std::size_t len);
+  int (*close_fn)(Http1Connection& conn);
+  const char* name;
+};
+
+TransportBackend parse_transport_backend(const Profile& profile) {
+  const std::string normalized = lower_copy(profile.transport_backend);
+  if (normalized == "custom_tcp") {
+    return TransportBackend::CustomTcp;
+  }
+  return TransportBackend::KernelSocket;
+}
 
 int connect_socket(Http1Connection& conn, const Profile& profile) {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
