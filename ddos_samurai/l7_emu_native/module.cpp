@@ -169,7 +169,7 @@ PYBIND11_MODULE(_l7_emu_native, m) {
     }
     if (profile.protocol == "http2") {
       result["h2_transport"] = py::str("nghttp2_native");
-      if (!(caps.openssl && caps.nghttp2)) {
+      if (transport_backend != TransportBackend::CustomTcp && !(caps.openssl && caps.nghttp2)) {
         result["sender_fallback_reason"] = py::str("capability_unavailable:nghttp2_native");
         result["l7_fallback_reason"] = py::str("capability_unavailable:nghttp2_native");
       }
