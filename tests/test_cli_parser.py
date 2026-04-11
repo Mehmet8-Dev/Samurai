@@ -108,6 +108,7 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--state-sweep-interval-ms", opts)
         self.assertIn("--sender-backend", opts)
         self.assertIn("--sender-fallback-policy", opts)
+        self.assertIn("--stateful-runtime-backend", opts)
         self.assertIn("--dataplane-core-mode", opts)
         self.assertIn("--afpacket-hugepage-mode", opts)
         self.assertIn("--afpacket-hugepage-size-kb", opts)
@@ -169,6 +170,7 @@ class TestCliParser(unittest.TestCase):
         args = parser.parse_args([])
         self.assertEqual(args.sender_backend, "auto")
         self.assertEqual(args.sender_fallback_policy, "allow")
+        self.assertEqual(args.stateful_runtime_backend, "afxdp")
         self.assertEqual(args.dataplane_core_mode, "off")
         self.assertEqual(args.afpacket_hugepage_mode, "off")
         self.assertEqual(args.afpacket_hugepage_size_kb, 2048)
@@ -582,6 +584,32 @@ class TestSenderRouteValidation(unittest.TestCase):
             cli._preflight_lab_profile(parser, args)
         self.assertEqual(args.afpacket_hugepage_mode, "required")
 
+    def test_dedicated_profile_autopromotes_stateful_runtime_and_custom_tcp(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--lab-profile",
+                "dedicated",
+                "--sender-backend",
+                "txring",
+                "--sender-fallback-policy",
+                "fail",
+                "--xdp-interface",
+                "eth0",
+                "--stateful-runtime-backend",
+                "afxdp",
+                "--custom-tcp-mode",
+                "off",
+                "--custom-tcp-backend",
+                "txring",
+            ]
+        )
+        with patch("ddos_samurai.af_xdp_sender.get_interface_queue_count", return_value=8):
+            cli._preflight_lab_profile(parser, args)
+        self.assertEqual(args.stateful_runtime_backend, "afxdp")
+        self.assertEqual(args.custom_tcp_mode, "required")
+        self.assertEqual(args.custom_tcp_backend, "af_xdp")
+
 
 class TestL7CapabilityPreflight(unittest.TestCase):
     def _assert_preflight_fails(self, parser, args):
@@ -591,13 +619,39 @@ class TestL7CapabilityPreflight(unittest.TestCase):
 
     def test_capability_strict_http2_allows_native_single_path(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--attack-vector", "http2", "--l7-capability-strict"])
+        args = parser.parse_args(
+            ["--attack-vector", "http2", "--l7-capability-strict", "--xdp-interface", "eth0"]
+        )
         cli._preflight_l7_capabilities(parser, args)
 
     def test_capability_strict_http_stateful_allows_native_single_path(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--attack-vector", "http", "--stateful", "--l7-capability-strict"])
+        args = parser.parse_args(
+            [
+                "--attack-vector",
+                "http",
+                "--stateful",
+                "--l7-capability-strict",
+                "--xdp-interface",
+                "eth0",
+                "--custom-tcp-mode",
+                "auto",
+            ]
+        )
         cli._preflight_l7_capabilities(parser, args)
+
+    def test_capability_strict_afxdp_requires_xdp_interface(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--attack-vector",
+                "http",
+                "--l7-capability-strict",
+                "--stateful-runtime-backend",
+                "afxdp",
+            ]
+        )
+        self._assert_preflight_fails(parser, args)
 
     def test_capability_strict_websocket_rejected_in_v1(self):
         parser = cli.build_parser()

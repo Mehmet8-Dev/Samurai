@@ -708,3 +708,90 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["kpi_gate_hard_fail"], 1)
         self.assertEqual(rr.results["score_eligible"], 0)
         self.assertIn("kpi_gate_exception:RuntimeError", rr.results.get("kpi_violations", []))
+
+    def test_live_attack_report_kpi_gate_dedicated_fails_on_runtime_hot_path_drift(self):
+        from ddos_samurai import reporting
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1", "kpi_gate_profile": "dedicated_lab", "kpi_hard_fail": True},
+            worker_events=[
+                {
+                    "status": "ok",
+                    "attack_vector": "http",
+                    "compute_backend": "cpu",
+                    "sender_path": "C_STATE_HTTP",
+                    "runtime_backend": "legacy",
+                    "runtime_hot_path_level": "legacy_compat",
+                    "legacy_path_used": 1,
+                    "custom_tcp_bridge_xdp_enabled": 0,
+                    "custom_tcp_bridge_backend_match": 0,
+                    "sender_fallback_reason": "none",
+                    "stats": {"attempted": 100, "sent": 100, "errors": 0, "bytes_sent_est": 6400},
+                    "session_success_rate": 100.0,
+                    "retry_success_rate": 100.0,
+                    "l7_step_fail_ratio": 0.0,
+                    "l7_handshake_p99_ms": 10.0,
+                    "l7_fail_budget_pct": 0.0,
+                }
+            ],
+            duration_s=1.0,
+            progress_total=100,
+            total_count=100,
+            metrics={},
+            warnings=[],
+        )
+        self.assertEqual(rr.results["kpi_gate_status"], "fail")
+        self.assertEqual(rr.results["kpi_gate_hard_fail"], 1)
+        self.assertTrue(any(str(v).startswith("runtime_backend:") for v in rr.results.get("kpi_violations", [])))
+        self.assertTrue(any(str(v).startswith("runtime_hot_path_level:") for v in rr.results.get("kpi_violations", [])))
+        self.assertTrue(any(str(v).startswith("legacy_path_used:") for v in rr.results.get("kpi_violations", [])))
+
+    def test_live_attack_report_surfaces_stateful_runtime_preflight_and_transport_fields(self):
+        from ddos_samurai import reporting
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1"},
+            worker_events=[
+                {
+                    "status": "ok",
+                    "attack_vector": "http",
+                    "compute_backend": "cpu",
+                    "sender_path": "C_STATE_HTTP",
+                    "runtime_backend": "afxdp",
+                    "runtime_hot_path_level": "phase1_hybrid_afxdp_custom_tcp",
+                    "legacy_path_used": 0,
+                    "stateful_runtime_status": "ready",
+                    "stateful_runtime_reason": "none",
+                    "stateful_runtime_detail": "",
+                    "stateful_runtime_preflight_status": "passed",
+                    "stateful_runtime_preflight_reason": "none",
+                    "stateful_runtime_preflight_detail": "AF_XDP strict runtime preflight passed",
+                    "stateful_runtime_preflight_backend_requested": "af_xdp",
+                    "stateful_runtime_preflight_backend_used": "xdp",
+                    "stateful_runtime_preflight_backend_match": 1,
+                    "stateful_runtime_preflight_xdp_interface": "eth0",
+                    "stateful_runtime_preflight_xdp_queue_id": 2,
+                    "stateful_runtime_preflight_xdp_available": 1,
+                    "stateful_runtime_preflight_xdp_enabled": 1,
+                    "runtime_transport_service": "native_custom_tcp_runtime_service",
+                    "runtime_transport_contract": "custom_tcp_runtime_bridge",
+                    "runtime_transport_poll_calls": 3,
+                    "runtime_transport_poll_actions": 7,
+                    "runtime_transport_rx_poll_enabled": 1,
+                    "runtime_transport_snapshot_available": 1,
+                    "runtime_transport_service_loops": 4,
+                    "stats": {"attempted": 10, "sent": 10, "errors": 0, "bytes_sent_est": 640},
+                }
+            ],
+            duration_s=1.0,
+            progress_total=10,
+            total_count=10,
+            metrics={},
+            warnings=[],
+        )
+        self.assertEqual(rr.results["stateful_runtime_preflight_status"], "passed")
+        self.assertEqual(rr.results["stateful_runtime_preflight_backend_used"], "xdp")
+        self.assertEqual(rr.results["stateful_runtime_preflight_xdp_enabled"], 1)
+        self.assertEqual(rr.results["runtime_transport_service"], "native_custom_tcp_runtime_service")
+        self.assertEqual(rr.results["runtime_transport_contract"], "custom_tcp_runtime_bridge")
+        self.assertEqual(rr.results["runtime_transport_poll_calls"], 3)

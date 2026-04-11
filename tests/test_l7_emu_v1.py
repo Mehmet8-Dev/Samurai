@@ -1,10 +1,18 @@
 import asyncio
+import json
+import os
 import socket
+import subprocess
+import sys
+import textwrap
+import threading
 import unittest
 from unittest.mock import patch
 
 from ddos_samurai import senders
 from ddos_samurai.cli.args import build_parser
+from ddos_samurai.l7_emu.runtime import run_l7_profile
+from ddos_samurai.l7_emu.types import RuntimeConfig
 
 
 def _sandbox_allows_sockets() -> bool:
@@ -17,6 +25,73 @@ def _sandbox_allows_sockets() -> bool:
         return True
     except OSError:
         return False
+
+
+def _live_l7_socket_tests_enabled() -> bool:
+    return str(os.environ.get("SAMURAI_L7_LIVE_SOCKET_TESTS", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+class _KeepAliveHttpServer:
+    def __init__(self, expected_requests: int):
+        self.expected_requests = expected_requests
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(1)
+        self.port = int(self._sock.getsockname()[1])
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._done = threading.Event()
+        self._error = None
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def close(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=2.0)
+        if self._error is not None:
+            raise self._error
+
+    def _serve(self):
+        try:
+            conn, _addr = self._sock.accept()
+        except OSError:
+            return
+        with conn:
+            conn.settimeout(2.0)
+            buffer = b""
+            served = 0
+            try:
+                while served < self.expected_requests:
+                    while b"\r\n\r\n" not in buffer:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            return
+                        buffer += chunk
+                    _request, buffer = buffer.split(b"\r\n\r\n", 1)
+                    served += 1
+                    response = (
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Length: 2\r\n"
+                        b"Connection: keep-alive\r\n"
+                        b"X-Arena: warm\r\n"
+                        b"\r\n"
+                        b"ok"
+                    )
+                    conn.sendall(response)
+            except Exception as exc:  # pragma: no cover
+                self._error = exc
+            finally:
+                self._done.set()
 
 
 class TestL7EmuV1(unittest.TestCase):
@@ -201,6 +276,77 @@ class TestL7EmuV1(unittest.TestCase):
         self.assertEqual(out["errors"], 0)
         self.assertEqual(out["h2_transport"], "native")
 
+    @unittest.skipUnless(_sandbox_allows_sockets(), "socket sandbox unavailable")
+    def test_native_http1_keepalive_arena_metrics_surface_reuse(self):
+        paths = [f"/arena/{idx}/{'x' * 48}" for idx in range(6)]
+        server = _KeepAliveHttpServer(expected_requests=len(paths)).start()
+        try:
+            child_env = os.environ.copy()
+            child_env["SAMURAI_KEEPALIVE_PORT"] = str(server.port)
+            child_env["SAMURAI_KEEPALIVE_PATHS_JSON"] = json.dumps(paths)
+            child = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    textwrap.dedent(
+                        """
+                        import asyncio
+                        import json
+                        import os
+
+                        from ddos_samurai import senders
+                        from ddos_samurai.l7_emu.runtime import run_l7_profile
+                        from ddos_samurai.l7_emu.types import RuntimeConfig
+
+                        profile = senders.compile_l7_profile(
+                            protocol="http1",
+                            target_ip="127.0.0.1",
+                            target_port=int(os.environ["SAMURAI_KEEPALIVE_PORT"]),
+                            scheme="http",
+                            http_method="GET",
+                            http_path=json.loads(os.environ["SAMURAI_KEEPALIVE_PATHS_JSON"]),
+                            payloads=[],
+                            concurrency=1,
+                            timeout_s=1.0,
+                        )
+                        result = asyncio.run(
+                            run_l7_profile(
+                                profile,
+                                RuntimeConfig(concurrency=1, profile_l7=True, profile_sample_limit=64),
+                            )
+                        ).as_dict()
+                        print(json.dumps(result))
+                        """
+                    ),
+                ],
+                env=child_env,
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        finally:
+            server.close()
+
+        if child.returncode != 0:
+            self.fail(
+                "native keepalive arena probe failed "
+                f"(returncode={child.returncode}, stdout={child.stdout!r}, stderr={child.stderr!r})"
+            )
+        try:
+            result = json.loads(child.stdout.strip())
+        except json.JSONDecodeError as exc:
+            self.fail(f"native keepalive arena probe emitted invalid JSON: stdout={child.stdout!r}, stderr={child.stderr!r}, error={exc}")
+
+        self.assertEqual(result["attempted"], len(paths))
+        self.assertEqual(result["sent"], len(paths))
+        self.assertEqual(result["errors"], 0)
+        self.assertGreaterEqual(result["l7_conn_reused"], len(paths) - 1)
+        self.assertEqual(result["runtime_native_hot_path_level"], "userspace_reactor_templates")
+        self.assertGreater(float(result["l7_alloc_count"]), 0.0)
+        self.assertLess(float(result["l7_alloc_count"]), float(len(paths) * 3))
+        self.assertLess(float(result["l7_alloc_bytes"]), 262144.0)
+
     def test_ws_and_quic_fail_fast(self):
         ws = asyncio.run(senders.websocket_sender("127.0.0.1", 80, 2, 1, "/", "ping", False))
         quic = asyncio.run(senders.quic_sender("127.0.0.1", 443, 2, 1, "/", "GET", False))
@@ -217,7 +363,10 @@ class TestL7EmuV1(unittest.TestCase):
 
             _validate_sender_route_args(parser, args)
 
-    @unittest.skipUnless(_sandbox_allows_sockets(), "sandbox blocks local sockets")
+    @unittest.skipUnless(
+        _sandbox_allows_sockets() and _live_l7_socket_tests_enabled(),
+        "live L7 socket tests disabled by default",
+    )
     def test_native_http1_runtime_fails_visible_without_listener(self):
         out = asyncio.run(
             senders.http_app_sender(
@@ -231,6 +380,7 @@ class TestL7EmuV1(unittest.TestCase):
                 verbose=False,
                 scheme="http",
                 verify=False,
+                timeout_s=0.2,
             )
         )
         self.assertEqual(out["sender_path"], "L7_EMU_HTTP1")
@@ -239,7 +389,10 @@ class TestL7EmuV1(unittest.TestCase):
         self.assertEqual(out["sent"], 0)
         self.assertEqual(out["errors"], 1)
 
-    @unittest.skipUnless(_sandbox_allows_sockets(), "sandbox blocks local sockets")
+    @unittest.skipUnless(
+        _sandbox_allows_sockets() and _live_l7_socket_tests_enabled(),
+        "live L7 socket tests disabled by default",
+    )
     def test_native_http2_runtime_fails_visible_without_listener(self):
         out = asyncio.run(
             senders.http2_sender(
@@ -254,6 +407,7 @@ class TestL7EmuV1(unittest.TestCase):
                 verify=False,
                 http2_connections=1,
                 http2_streams_per_conn=4,
+                timeout_s=0.2,
             )
         )
         self.assertEqual(out["sender_path"], "L7_EMU_H2")

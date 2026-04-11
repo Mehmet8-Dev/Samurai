@@ -15,6 +15,16 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
             "txring_hold_block_pressure_pct": 10.0,
             "sender_paths_used": {"C_EXT_L3": 1},
             "sender_fallback_reason": "none",
+            "runtime_backend": "afxdp",
+            "runtime_hot_path_level": "phase1_hybrid_afxdp_custom_tcp",
+            "legacy_path_used": 0,
+            "runtime_transport_backend": "custom_tcp",
+            "stateful_runtime_status": "ready",
+            "custom_tcp_bridge_xdp_enabled": 1,
+            "custom_tcp_bridge_backend_match": 1,
+            "stateful_runtime_preflight_status": "passed",
+            "stateful_runtime_preflight_xdp_enabled": 1,
+            "l7_conn_rate_cv_pct": 1.0,
         }
 
     def test_dedicated_non_quic_run_does_not_require_quic_metrics(self):
@@ -82,6 +92,50 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
         results.update({"sender_paths_used": {"PYTHON_SENDMMSG": 1}})
         out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
         self.assertEqual(out.status, "pass")
+
+    def test_dedicated_l7_run_requires_afxdp_runtime_backend(self):
+        results = self._base_results()
+        results.update(
+            {
+                "by_vector": {"http": {"attempted": 100, "sent": 100, "errors": 0}},
+                "session_success_rate": 99.5,
+                "retry_success_rate": 95.0,
+                "l7_step_fail_ratio": 0.0,
+                "l7_handshake_p99_ms": 20.0,
+                "l7_fail_budget_pct": 0.0,
+                "runtime_backend": "legacy",
+            }
+        )
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertEqual(out.status, "fail")
+        self.assertTrue(any(v.startswith("runtime_backend:") for v in out.violations))
+
+    def test_dedicated_l7_run_requires_native_runtime_hot_path_and_bridge(self):
+        results = self._base_results()
+        results.update(
+            {
+                "by_vector": {"http": {"attempted": 100, "sent": 100, "errors": 0}},
+                "session_success_rate": 99.5,
+                "retry_success_rate": 95.0,
+                "l7_step_fail_ratio": 0.0,
+                "l7_handshake_p99_ms": 20.0,
+                "l7_fail_budget_pct": 0.0,
+                "runtime_hot_path_level": "legacy_compat",
+                "legacy_path_used": 1,
+                "custom_tcp_bridge_xdp_enabled": 0,
+                "custom_tcp_bridge_backend_match": 0,
+                "stateful_runtime_preflight_status": "failed",
+                "stateful_runtime_preflight_xdp_enabled": 0,
+            }
+        )
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertEqual(out.status, "fail")
+        self.assertTrue(any(v.startswith("runtime_hot_path_level:") for v in out.violations))
+        self.assertTrue(any(v.startswith("legacy_path_used:") for v in out.violations))
+        self.assertTrue(any(v.startswith("custom_tcp_bridge_xdp_enabled:") for v in out.violations))
+        self.assertTrue(any(v.startswith("custom_tcp_bridge_backend_match:") for v in out.violations))
+        self.assertTrue(any(v.startswith("stateful_runtime_preflight_status:") for v in out.violations))
+        self.assertTrue(any(v.startswith("stateful_runtime_preflight_xdp_enabled:") for v in out.violations))
 
     def test_dedicated_requires_rate_accuracy_metric(self):
         results = self._base_results()

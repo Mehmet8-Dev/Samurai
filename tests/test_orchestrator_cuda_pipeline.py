@@ -5,11 +5,14 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
+import pytest
 
 import ddos_samurai as ddos_pkg
 from ddos_samurai import orchestrator
 from ddos_samurai import senders
 from ddos_samurai import utils
+
+pytestmark = [pytest.mark.gpu]
 
 
 def _base_args():
@@ -274,6 +277,67 @@ class _FakeFastSender:
         }
 
 
+class _FakeCustomTcpDataplane:
+    def __init__(self):
+        self.configured = False
+        self.ingest_calls = 0
+        self.ingest_packets = 0
+        self.poll_calls = 0
+        self.drain_calls = 0
+
+    def configure_tcp_dataplane(self, mode, backend, initial_rto_ms, max_retransmits, connect_timeout_ms, idle_timeout_ms):
+        self.configured = True
+        self.mode = str(mode)
+        self.backend = str(backend)
+        self.initial_rto_ms = int(initial_rto_ms)
+        self.max_retransmits = int(max_retransmits)
+        self.connect_timeout_ms = int(connect_timeout_ms)
+        self.idle_timeout_ms = int(idle_timeout_ms)
+        return {"mode": self.mode, "backend": self.backend}
+
+    def ingest_tcp_tx_packets(self, _buf, _packet_size, count):
+        self.ingest_calls += 1
+        self.ingest_packets += int(count)
+        return int(count)
+
+    def poll_tcp_dataplane(self, _now_ns=0, _budget=0):
+        self.poll_calls += 1
+        return 0
+
+    def drain_tcp_tx_packets(self):
+        self.drain_calls += 1
+        if self.drain_calls == 1:
+            pkt = (
+                b"\xaa\xaa\xaa\xaa\xaa\xaa"
+                b"\xbb\xbb\xbb\xbb\xbb\xbb"
+                b"\x08\x00"
+                b"\x45\x00\x00\x28\x00\x00\x00\x00\x40\x06\x00\x00"
+                b"\x01\x01\x01\x01\x02\x02\x02\x02"
+                b"\x04\xd2\x00\x50\x00\x00\x00\x01\x00\x00\x00\x00\x50\x10\x20\x00\x00\x00\x00\x00"
+            )
+            return [pkt]
+        return []
+
+    def snapshot_tcp_dataplane(self):
+        return {
+            "tcp_flows_active": int(self.ingest_packets),
+            "tcp_connect_attempts": int(self.ingest_packets),
+            "tcp_connect_established": 0,
+            "tcp_retransmit_count": 0,
+            "tcp_timeout_close_count": 0,
+            "tcp_connect_timeout_count": 0,
+            "tcp_idle_timeout_count": 0,
+            "tcp_retransmit_exhausted_count": 0,
+            "tcp_rx_ack_count": 0,
+            "tcp_dup_ack_count": 0,
+            "tcp_unexpected_ack_count": 0,
+            "tcp_tx_data_bytes": 0,
+            "tcp_rx_data_bytes": 0,
+            "tcp_peer_rst_count": 0,
+            "tcp_peer_fin_count": 0,
+        }
+
+
 class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
     async def test_cuda_pipeline_respects_ring_capacity_and_updates_state_hooks(self):
         args = _base_args()
@@ -428,6 +492,201 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["status"], "ok")
         self.assertEqual(int(fake_gpu_packet._state["copy_calls"]), 0)
+
+    async def test_cuda_pipeline_updates_custom_tcp_stats_when_enabled(self):
+        args = _base_args()
+        args["custom_tcp_mode"] = "required"
+        args["custom_tcp_backend"] = "af_xdp"
+        args["custom_tcp_initial_rto_ms"] = 100
+        args["custom_tcp_max_retransmits"] = 4
+        args["custom_tcp_connect_timeout_ms"] = 1200
+        args["custom_tcp_idle_timeout_ms"] = 3000
+
+        events = []
+        fake_gpu_packet = _build_fake_gpu_packet_module()
+        fake_gpu_payload = _build_fake_gpu_payload_module()
+        fake_cupy = _build_fake_cupy_module()
+        fake_numba, fake_numba_cuda = _build_fake_numba_modules()
+        fake_custom_tcp = _FakeCustomTcpDataplane()
+
+        async def _fake_paced_sender(
+            *,
+            packets_buffer,
+            target_ip,
+            target_port,
+            count,
+            verbose,
+            pacing_config=None,
+            live_sent=None,
+            live_errors=None,
+            live_progress=None,
+        ):
+            del packets_buffer, target_ip, target_port, verbose, pacing_config, live_sent, live_errors, live_progress
+            return {
+                "attempted": int(count),
+                "sent": int(count),
+                "errors": 0,
+                "bytes_sent_est": int(count) * 54,
+                "sender_path": "PACED_L2",
+            }
+
+        template_bytes = (
+            b"\xaa\xaa\xaa\xaa\xaa\xaa"
+            b"\xbb\xbb\xbb\xbb\xbb\xbb"
+            b"\x08\x00"
+            b"\x45\x00\x00\x28\x00\x00\x00\x00\x40\x06\x00\x00"
+            b"\x01\x01\x01\x01\x02\x02\x02\x02"
+            b"\x04\xd2\x00\x50\x00\x00\x00\x01\x00\x00\x00\x00\x50\x02\x20\x00\x00\x00\x00\x00"
+        )
+
+        with patch.dict(
+            sys.modules,
+            {
+                "cupy": fake_cupy,
+                "numba": fake_numba,
+                "numba.cuda": fake_numba_cuda,
+                "ddos_samurai.gpu_packet": fake_gpu_packet,
+                "ddos_samurai.gpu_payload": fake_gpu_payload,
+            },
+            clear=False,
+        ), patch.object(
+            ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
+        ), patch.object(
+            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
+        ), patch.object(
+            orchestrator.packet, "create_packet", lambda _cfg: template_bytes
+        ), patch.object(
+            utils, "get_gateway_mac", lambda _target: "aa:bb:cc:dd:ee:ff"
+        ), patch.object(
+            senders, "FAST_SENDER_AVAILABLE", False
+        ), patch.object(
+            senders, "CUSTOM_TCP_DATAPLANE_AVAILABLE", True
+        ), patch.object(
+            senders, "custom_tcp_dataplane", fake_custom_tcp, create=True
+        ), patch.object(
+            senders, "paced_raw_socket_sender", AsyncMock(side_effect=_fake_paced_sender)
+        ), patch.dict(
+            os.environ, {"SAMURAI_GPU_BATCH": "2"}, clear=False
+        ):
+            await orchestrator.worker_process(worker_id=0, args=args, ssl_context=None, run_events=events)
+
+        self.assertEqual(len(events), 1)
+        ev = events[0]
+        self.assertEqual(ev["status"], "ok")
+        self.assertTrue(fake_custom_tcp.configured)
+        self.assertGreaterEqual(fake_custom_tcp.ingest_calls, 1)
+        self.assertGreaterEqual(int(ev["stats"]["tcp_flows_active"]), int(args["count"]))
+        self.assertGreaterEqual(int(ev["stats"]["tcp_connect_attempts"]), int(args["count"]))
+        self.assertGreaterEqual(int(ev["stats"].get("runtime_transport_service_loops", 0)), 1)
+        self.assertEqual(ev["stats"]["custom_tcp_bridge_backend_requested"], "af_xdp")
+        self.assertEqual(ev["stats"]["custom_tcp_bridge_backend_used"], "txring")
+        self.assertEqual(int(ev["stats"]["custom_tcp_bridge_backend_match"]), 0)
+        self.assertEqual(int(ev["stats"]["custom_tcp_bridge_degraded"]), 1)
+        self.assertEqual(ev["stats"]["custom_tcp_bridge_fallback_reason"], "custom_tcp_xdp_interface_missing")
+        self.assertEqual(int(ev["stats"]["custom_tcp_bridge_xdp_enabled"]), 0)
+        self.assertEqual(ev["stats"].get("runtime_transport_service"), "native_custom_tcp_runtime_service")
+
+    async def test_cuda_pipeline_uses_xdp_bridge_when_capability_is_available(self):
+        args = _base_args()
+        args["custom_tcp_mode"] = "required"
+        args["custom_tcp_backend"] = "af_xdp"
+        args["xdp_interface"] = "eth0"
+        args["xdp_queue_id"] = 2
+
+        events = []
+        fake_gpu_packet = _build_fake_gpu_packet_module()
+        fake_gpu_payload = _build_fake_gpu_payload_module()
+        fake_cupy = _build_fake_cupy_module()
+        fake_numba, fake_numba_cuda = _build_fake_numba_modules()
+        fake_custom_tcp = _FakeCustomTcpDataplane()
+
+        async def _fake_paced_sender(
+            *,
+            packets_buffer,
+            target_ip,
+            target_port,
+            count,
+            verbose,
+            pacing_config=None,
+            live_sent=None,
+            live_errors=None,
+            live_progress=None,
+            sender_backend=None,
+            xdp_enable=None,
+            xdp_interface=None,
+            xdp_queue_id=None,
+            xdp_mode=None,
+        ):
+            del packets_buffer, target_ip, target_port, verbose, pacing_config, live_sent, live_errors, live_progress, xdp_mode
+            return {
+                "attempted": int(count),
+                "sent": int(count),
+                "errors": 0,
+                "bytes_sent_est": int(count) * 54,
+                "sender_path": "PACED_L2",
+                "sender_backend_requested": str(sender_backend or ""),
+                "xdp_enable_effective": int(bool(xdp_enable)),
+                "xdp_interface_effective": str(xdp_interface or ""),
+                "xdp_queue_effective": int(xdp_queue_id or 0),
+            }
+
+        template_bytes = (
+            b"\xaa\xaa\xaa\xaa\xaa\xaa"
+            b"\xbb\xbb\xbb\xbb\xbb\xbb"
+            b"\x08\x00"
+            b"\x45\x00\x00\x28\x00\x00\x00\x00\x40\x06\x00\x00"
+            b"\x01\x01\x01\x01\x02\x02\x02\x02"
+            b"\x04\xd2\x00\x50\x00\x00\x00\x01\x00\x00\x00\x00\x50\x02\x20\x00\x00\x00\x00\x00"
+        )
+
+        with patch.dict(
+            sys.modules,
+            {
+                "cupy": fake_cupy,
+                "numba": fake_numba,
+                "numba.cuda": fake_numba_cuda,
+                "ddos_samurai.gpu_packet": fake_gpu_packet,
+                "ddos_samurai.gpu_payload": fake_gpu_payload,
+            },
+            clear=False,
+        ), patch.object(
+            ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
+        ), patch.object(
+            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
+        ), patch.object(
+            orchestrator.packet, "create_packet", lambda _cfg: template_bytes
+        ), patch.object(
+            utils, "get_gateway_mac", lambda _target: "aa:bb:cc:dd:ee:ff"
+        ), patch.object(
+            senders, "FAST_SENDER_AVAILABLE", False
+        ), patch.object(
+            senders, "CUSTOM_TCP_DATAPLANE_AVAILABLE", True
+        ), patch.object(
+            senders, "custom_tcp_dataplane", fake_custom_tcp, create=True
+        ), patch.object(
+            senders, "XDP_AVAILABLE", True
+        ), patch.object(
+            senders, "check_xdp_available", side_effect=lambda: (True, "AF_XDP is available")
+        ), patch.object(
+            senders, "paced_raw_socket_sender", AsyncMock(side_effect=_fake_paced_sender)
+        ), patch.dict(
+            os.environ, {"SAMURAI_GPU_BATCH": "2"}, clear=False
+        ):
+            await orchestrator.worker_process(worker_id=0, args=args, ssl_context=None, run_events=events)
+
+        self.assertEqual(len(events), 1)
+        ev = events[0]
+        self.assertEqual(ev["status"], "ok")
+        self.assertEqual(ev["stats"]["custom_tcp_bridge_backend_requested"], "af_xdp")
+        self.assertEqual(ev["stats"]["custom_tcp_bridge_backend_used"], "xdp")
+        self.assertEqual(int(ev["stats"]["custom_tcp_bridge_backend_match"]), 1)
+        self.assertEqual(int(ev["stats"]["custom_tcp_bridge_degraded"]), 0)
+        self.assertEqual(ev["stats"]["custom_tcp_bridge_fallback_reason"], "none")
+        self.assertEqual(int(ev["stats"]["custom_tcp_bridge_xdp_enabled"]), 1)
+        self.assertEqual(int(ev["stats"]["custom_tcp_bridge_xdp_available"]), 1)
+        self.assertEqual(ev["stats"]["custom_tcp_bridge_xdp_interface"], "eth0")
+        self.assertEqual(int(ev["stats"]["custom_tcp_bridge_xdp_queue_id"]), 2)
+        self.assertEqual(ev["stats"].get("runtime_transport_service"), "native_custom_tcp_runtime_service")
 
     async def test_cuda_http2_path_uses_http2_sender_with_request_plan(self):
         args = _base_args()
