@@ -166,6 +166,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="allow",
         help="Backend fallback politikası: allow=alt yola düş, fail=run'ı fail-visible bitir.",
     )
+    _stateful_runtime_backend_env = str(
+        os.environ.get("SAMURAI_STATEFUL_RUNTIME_BACKEND", "afxdp") or "afxdp"
+    ).strip().lower()
+    if _stateful_runtime_backend_env not in {"afxdp", "dpdk"}:
+        _stateful_runtime_backend_env = "afxdp"
+    parser.add_argument(
+        "--stateful-runtime-backend",
+        choices=["afxdp", "dpdk"],
+        default=_stateful_runtime_backend_env,
+        help="Yeni stateful runtime backend seçimi: afxdp|dpdk.",
+    )
     _dp_mode_env_default = _normalize_dataplane_core_mode(
         os.environ.get(
             "SAMURAI_DATAPLANE_CORE_MODE",
@@ -346,6 +357,74 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=str(os.environ.get("SAMURAI_XDP_XSKMAP_PIN", "") or ""),
         help="Pinned xsks_map yolu (opsiyonel, queue->xsk fd map update için).",
+    )
+    parser.add_argument(
+        "--state-engine-mode",
+        "--engine-mode",
+        dest="engine_mode",
+        choices=["auto", "required"],
+        default=str(os.environ.get("SAMURAI_STATE_ENGINE_MODE", "auto") or "auto"),
+        help="Legacy L4 state engine modu: auto|required.",
+    )
+    parser.add_argument(
+        "--state-table-size",
+        type=int,
+        default=_env_int("SAMURAI_STATE_TABLE_SIZE", 65536),
+        help="Legacy L4 state engine tablo boyutu.",
+    )
+    parser.add_argument(
+        "--state-lock-count",
+        type=int,
+        default=_env_int("SAMURAI_STATE_LOCK_COUNT", 256),
+        help="Legacy L4 state engine shard/lock sayısı.",
+    )
+    parser.add_argument(
+        "--state-timeout-sec",
+        type=int,
+        default=_env_int("SAMURAI_STATE_TIMEOUT_SEC", 60),
+        help="Legacy L4 state engine timeout süresi (saniye).",
+    )
+    parser.add_argument(
+        "--state-sweep-interval-ms",
+        type=int,
+        default=_env_int("SAMURAI_STATE_SWEEP_INTERVAL_MS", 1000),
+        help="Legacy L4 state engine sweep aralığı (ms).",
+    )
+    parser.add_argument(
+        "--custom-tcp-mode",
+        choices=["off", "auto", "required"],
+        default=str(os.environ.get("SAMURAI_CUSTOM_TCP_MODE", "off") or "off"),
+        help="Custom TCP dataplane modu: off|auto|required.",
+    )
+    parser.add_argument(
+        "--custom-tcp-backend",
+        choices=["af_xdp", "txring"],
+        default=str(os.environ.get("SAMURAI_CUSTOM_TCP_BACKEND", "af_xdp") or "af_xdp"),
+        help="Custom TCP dataplane backend hedefi: af_xdp|txring.",
+    )
+    parser.add_argument(
+        "--custom-tcp-initial-rto-ms",
+        type=int,
+        default=_env_int("SAMURAI_CUSTOM_TCP_INITIAL_RTO_MS", 250),
+        help="Custom TCP başlangıç RTO değeri (ms).",
+    )
+    parser.add_argument(
+        "--custom-tcp-max-retransmits",
+        type=int,
+        default=_env_int("SAMURAI_CUSTOM_TCP_MAX_RETRANSMITS", 5),
+        help="Custom TCP maksimum retransmit sayısı.",
+    )
+    parser.add_argument(
+        "--custom-tcp-connect-timeout-ms",
+        type=int,
+        default=_env_int("SAMURAI_CUSTOM_TCP_CONNECT_TIMEOUT_MS", 3000),
+        help="Custom TCP connect timeout değeri (ms).",
+    )
+    parser.add_argument(
+        "--custom-tcp-idle-timeout-ms",
+        type=int,
+        default=_env_int("SAMURAI_CUSTOM_TCP_IDLE_TIMEOUT_MS", 30000),
+        help="Custom TCP idle timeout değeri (ms).",
     )
     parser.add_argument(
         "--kpi-gate-profile",
@@ -537,31 +616,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_int("SAMURAI_GPU_RNG_SEED", 1234),
         help="GPU payload RNG seed (varsayılan: deterministik 1234, env: SAMURAI_GPU_RNG_SEED).",
     )
+    _gpu_vector_engine_default = str(os.environ.get("SAMURAI_GPU_VECTOR_ENGINE", "gpu_cuda") or "gpu_cuda").strip().lower()
+    if _gpu_vector_engine_default != "gpu_cuda":
+        _gpu_vector_engine_default = "gpu_cuda"
     parser.add_argument(
-        "--state-table-size",
-        type=int,
-        default=_env_int("SAMURAI_STATE_TABLE_SIZE", 65536),
-        help="State engine tablosu kapasitesi (env: SAMURAI_STATE_TABLE_SIZE).",
+        "--gpu-vector-engine",
+        choices=["gpu_cuda"],
+        default=_gpu_vector_engine_default,
+        help="GPU vector planner engine: gpu_cuda (legacy planner kaldırıldı).",
     )
-    parser.add_argument(
-        "--state-lock-count",
-        type=int,
-        default=_env_int("SAMURAI_STATE_LOCK_COUNT", 256),
-        help="State engine lock segment sayısı (env: SAMURAI_STATE_LOCK_COUNT).",
-    )
-    parser.add_argument(
-        "--state-timeout-sec",
-        type=int,
-        default=_env_int("SAMURAI_STATE_TIMEOUT_SEC", 60),
-        help="State timeout süresi saniye (env: SAMURAI_STATE_TIMEOUT_SEC).",
-    )
-    parser.add_argument(
-        "--state-sweep-interval-ms",
-        type=int,
-        default=_env_int("SAMURAI_STATE_SWEEP_INTERVAL_MS", 1000),
-        help="State cleanup sweep periyodu ms (env: SAMURAI_STATE_SWEEP_INTERVAL_MS).",
-    )
-
     pcap_group = parser.add_argument_group("GPU PCAP Generator (Test)")
     pcap_group.add_argument(
         "--gpu-pcap",

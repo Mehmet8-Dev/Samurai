@@ -91,6 +91,12 @@ def sync_runtime_env(args) -> dict[str, object]:
     os.environ["SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE"] = "1" if bool(getattr(args, "l7_quic_bridge_autopromote", False)) else "0"
     os.environ["SAMURAI_L7_FALLBACK_POLICY"] = str(getattr(args, "l7_fallback_policy", "allow") or "allow")
     os.environ["SAMURAI_L7_CAPABILITY_STRICT"] = "1" if bool(getattr(args, "l7_capability_strict", False)) else "0"
+    stateful_runtime_backend = str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower()
+    if stateful_runtime_backend not in {"afxdp", "dpdk"}:
+        stateful_runtime_backend = "afxdp"
+    os.environ["SAMURAI_STATEFUL_RUNTIME_BACKEND"] = stateful_runtime_backend
+    os.environ["SAMURAI_CUSTOM_TCP_MODE"] = str(getattr(args, "custom_tcp_mode", "off") or "off")
+    os.environ["SAMURAI_CUSTOM_TCP_BACKEND"] = str(getattr(args, "custom_tcp_backend", "af_xdp") or "af_xdp")
 
     return {
         "loss_report_out": loss_report_out,

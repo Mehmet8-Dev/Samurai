@@ -252,6 +252,17 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
     if not bool(getattr(args, "l7_capability_strict", False)):
         args.l7_capability_strict = True
         utils.log_info("lab-profile=dedicated için --l7-capability-strict otomatik etkinleştirildi.")
+    if str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower() != "afxdp":
+        args.stateful_runtime_backend = "afxdp"
+        utils.log_info(
+            "lab-profile=dedicated için --stateful-runtime-backend otomatik afxdp olarak ayarlandı."
+        )
+    if str(getattr(args, "custom_tcp_mode", "off") or "off").strip().lower() != "required":
+        args.custom_tcp_mode = "required"
+        utils.log_info("lab-profile=dedicated için --custom-tcp-mode otomatik required olarak ayarlandı.")
+    if str(getattr(args, "custom_tcp_backend", "af_xdp") or "af_xdp").strip().lower() != "af_xdp":
+        args.custom_tcp_backend = "af_xdp"
+        utils.log_info("lab-profile=dedicated için --custom-tcp-backend otomatik af_xdp olarak ayarlandı.")
     if (
         str(getattr(args, "attack_vector", "basic") or "basic").strip().lower() == "quic"
         and not bool(getattr(args, "l7_quic_require_native", False))
@@ -319,6 +330,26 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
     attack_vector = str(getattr(args, "attack_vector", "basic") or "basic").strip().lower()
     if attack_vector in {"websocket", "quic"}:
         parser.error("Hata: L7 capability strict yalnızca HTTP/1.1 ve HTTP/2 için kullanılabilir.")
+
+    runtime_backend = str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower()
+    if runtime_backend not in {"afxdp", "dpdk"}:
+        parser.error("Hata: --stateful-runtime-backend yalnızca afxdp|dpdk olabilir.")
+    if runtime_backend == "afxdp":
+        xdp_iface = str(getattr(args, "xdp_interface", "") or "").strip()
+        if not xdp_iface:
+            parser.error(
+                "Hata: stateful-runtime-backend=afxdp + l7-capability-strict için --xdp-interface zorunludur."
+            )
+        if attack_vector == "http":
+            custom_tcp_mode = str(getattr(args, "custom_tcp_mode", "off") or "off").strip().lower()
+            if custom_tcp_mode not in {"auto", "required"}:
+                parser.error(
+                    "Hata: HTTP strict AF_XDP runtime için --custom-tcp-mode auto|required olmalıdır."
+                )
+    if runtime_backend == "dpdk":
+        parser.error(
+            "Hata: stateful-runtime-backend=dpdk strict modda henüz desteklenmiyor (fail-visible)."
+        )
 
 
 def _parse_label_mix(raw: str) -> dict:
