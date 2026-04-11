@@ -5,6 +5,9 @@ Thumbs.db
 .vscode/
 .codacy/
 
+PLAN.md
+PLAN_l7_CUSTOM_STACK_FULL.md
+
 # Python cache / build
 __pycache__/
 **/__pycache__/
