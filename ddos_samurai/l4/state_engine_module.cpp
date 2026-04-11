@@ -2,6 +2,7 @@
 #include <Python.h>
 
 #include "l4_state_engine_ffi.h"
+#include "tcp_dataplane_ffi.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -293,6 +294,342 @@ PyObject* sweep_state_table(PyObject* self, PyObject* args) {
   return PyLong_FromUnsignedLong(removed);
 }
 
+PyObject* configure_tcp_dataplane(PyObject* self, PyObject* args) {
+  (void)self;
+  const char* mode = "off";
+  const char* backend = "af_xdp";
+  unsigned int initial_rto_ms = 250;
+  unsigned int max_retransmits = 5;
+  unsigned int connect_timeout_ms = 3000;
+  unsigned int idle_timeout_ms = 30000;
+  if (!PyArg_ParseTuple(args, "ssIIII", &mode, &backend, &initial_rto_ms, &max_retransmits, &connect_timeout_ms, &idle_timeout_ms)) {
+    return nullptr;
+  }
+  tcpdp_config_t cfg{};
+  cfg.mode = mode;
+  cfg.backend = backend;
+  cfg.initial_rto_ms = static_cast<uint32_t>(initial_rto_ms);
+  cfg.max_retransmits = static_cast<uint32_t>(max_retransmits);
+  cfg.connect_timeout_ms = static_cast<uint32_t>(connect_timeout_ms);
+  cfg.idle_timeout_ms = static_cast<uint32_t>(idle_timeout_ms);
+  if (tcpdp_configure(&cfg) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to configure custom TCP dataplane");
+    return nullptr;
+  }
+  return Py_BuildValue(
+      "{s:s,s:s,s:I,s:I,s:I,s:I}",
+      "mode",
+      mode,
+      "backend",
+      backend,
+      "initial_rto_ms",
+      initial_rto_ms,
+      "max_retransmits",
+      max_retransmits,
+      "connect_timeout_ms",
+      connect_timeout_ms,
+      "idle_timeout_ms",
+      idle_timeout_ms);
+}
+
+PyObject* enqueue_tcp_connect(PyObject* self, PyObject* args) {
+  (void)self;
+  uint32_t src_ip = 0;
+  uint32_t dst_ip = 0;
+  uint16_t src_port = 0;
+  uint16_t dst_port = 0;
+  if (!PyArg_ParseTuple(args, "IIHH", &src_ip, &dst_ip, &src_port, &dst_port)) {
+    return nullptr;
+  }
+  uint64_t flow_id = 0;
+  if (tcpdp_enqueue_connect(src_ip, dst_ip, src_port, dst_port, &flow_id) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to enqueue TCP connect");
+    return nullptr;
+  }
+  return PyLong_FromUnsignedLongLong(flow_id);
+}
+
+PyObject* ingest_tcp_tx_packets(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer view;
+  int packet_size = 0;
+  int count = 0;
+  if (!PyArg_ParseTuple(args, "y*ii", &view, &packet_size, &count)) {
+    return nullptr;
+  }
+  if (packet_size <= 0 || count <= 0) {
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(0);
+  }
+  uint32_t updated = 0;
+  const int rc = tcpdp_ingest_tx_packets(
+      static_cast<const uint8_t*>(view.buf), static_cast<size_t>(packet_size), static_cast<size_t>(count), &updated);
+  PyBuffer_Release(&view);
+  if (rc != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to ingest TX packets in custom TCP dataplane");
+    return nullptr;
+  }
+  return PyLong_FromUnsignedLong(updated);
+}
+
+PyObject* enqueue_tcp_send(PyObject* self, PyObject* args) {
+  (void)self;
+  unsigned long long flow_id = 0;
+  Py_buffer payload;
+  if (!PyArg_ParseTuple(args, "Ky*", &flow_id, &payload)) {
+    return nullptr;
+  }
+  uint32_t queued = 0;
+  const int rc = tcpdp_enqueue_send(
+      static_cast<uint64_t>(flow_id), static_cast<const uint8_t*>(payload.buf), static_cast<size_t>(payload.len), &queued);
+  PyBuffer_Release(&payload);
+  if (rc != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to enqueue TCP payload");
+    return nullptr;
+  }
+  return PyLong_FromUnsignedLong(queued);
+}
+
+PyObject* ingest_tcp_rx_frame(PyObject* self, PyObject* args) {
+  (void)self;
+  Py_buffer view;
+  if (!PyArg_ParseTuple(args, "y*", &view)) {
+    return nullptr;
+  }
+  uint32_t updated = 0;
+  const int rc = tcpdp_ingest_rx_frame(static_cast<const uint8_t*>(view.buf), static_cast<size_t>(view.len), &updated);
+  PyBuffer_Release(&view);
+  if (rc != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to ingest RX frame in custom TCP dataplane");
+    return nullptr;
+  }
+  return PyLong_FromUnsignedLong(updated);
+}
+
+PyObject* poll_tcp_dataplane(PyObject* self, PyObject* args) {
+  (void)self;
+  unsigned long long now_ns = 0;
+  unsigned int budget = 0;
+  if (!PyArg_ParseTuple(args, "|KI", &now_ns, &budget)) {
+    return nullptr;
+  }
+  uint32_t actions = 0;
+  if (tcpdp_poll(static_cast<uint64_t>(now_ns), static_cast<uint32_t>(budget), &actions) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to poll custom TCP dataplane");
+    return nullptr;
+  }
+  return PyLong_FromUnsignedLong(actions);
+}
+
+PyObject* drain_tcp_tx_packets(PyObject* self, PyObject* args) {
+  (void)self;
+  unsigned int max_packets = 0;
+  if (!PyArg_ParseTuple(args, "|I", &max_packets)) {
+    return nullptr;
+  }
+  const uint8_t** packets = nullptr;
+  size_t* lens = nullptr;
+  uint32_t count = 0;
+  if (tcpdp_drain_tx_packets(static_cast<uint32_t>(max_packets), &packets, &lens, &count) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to drain custom TCP dataplane TX packets");
+    return nullptr;
+  }
+  PyObject* out = PyList_New(static_cast<Py_ssize_t>(count));
+  if (!out) {
+    tcpdp_free_drained_packets(packets, lens, count);
+    return nullptr;
+  }
+  for (Py_ssize_t i = 0; i < static_cast<Py_ssize_t>(count); ++i) {
+    PyObject* pkt = PyBytes_FromStringAndSize(reinterpret_cast<const char*>(packets[i]), static_cast<Py_ssize_t>(lens[i]));
+    if (!pkt) {
+      tcpdp_free_drained_packets(packets, lens, count);
+      Py_DECREF(out);
+      return nullptr;
+    }
+    PyList_SET_ITEM(out, i, pkt);
+  }
+  tcpdp_free_drained_packets(packets, lens, count);
+  return out;
+}
+
+PyObject* collect_tcp_completions(PyObject* self, PyObject* args) {
+  (void)self;
+  (void)args;
+  tcpdp_completion_t* items = nullptr;
+  uint32_t count = 0;
+  if (tcpdp_collect_completions(&items, &count) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to collect TCP dataplane completions");
+    return nullptr;
+  }
+  PyObject* out = PyList_New(static_cast<Py_ssize_t>(count));
+  if (!out) {
+    tcpdp_free_completions(items, count);
+    return nullptr;
+  }
+  for (Py_ssize_t i = 0; i < static_cast<Py_ssize_t>(count); ++i) {
+    PyObject* item = Py_BuildValue(
+        "{s:K,s:i,s:i,s:s}",
+        "flow_id",
+        static_cast<unsigned long long>(items[i].flow_id),
+        "state",
+        static_cast<int>(items[i].state),
+        "success",
+        static_cast<int>(items[i].success),
+        "event",
+        items[i].event ? items[i].event : "");
+    if (!item) {
+      tcpdp_free_completions(items, count);
+      Py_DECREF(out);
+      return nullptr;
+    }
+    PyList_SET_ITEM(out, i, item);
+  }
+  tcpdp_free_completions(items, count);
+  return out;
+}
+
+PyObject* collect_tcp_rx_payloads(PyObject* self, PyObject* args) {
+  (void)self;
+  (void)args;
+  tcpdp_rx_payload_t* items = nullptr;
+  uint32_t count = 0;
+  if (tcpdp_collect_rx_payloads(&items, &count) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to collect TCP dataplane RX payloads");
+    return nullptr;
+  }
+  PyObject* out = PyList_New(static_cast<Py_ssize_t>(count));
+  if (!out) {
+    tcpdp_free_rx_payloads(items, count);
+    return nullptr;
+  }
+  for (Py_ssize_t i = 0; i < static_cast<Py_ssize_t>(count); ++i) {
+    PyObject* item = Py_BuildValue(
+        "{s:K,s:y#}",
+        "flow_id",
+        static_cast<unsigned long long>(items[i].flow_id),
+        "payload",
+        reinterpret_cast<const char*>(items[i].payload),
+        static_cast<Py_ssize_t>(items[i].payload_len));
+    if (!item) {
+      tcpdp_free_rx_payloads(items, count);
+      Py_DECREF(out);
+      return nullptr;
+    }
+    PyList_SET_ITEM(out, i, item);
+  }
+  tcpdp_free_rx_payloads(items, count);
+  return out;
+}
+
+PyObject* snapshot_tcp_dataplane(PyObject* self, PyObject* args) {
+  (void)self;
+  (void)args;
+  tcpdp_stats_snapshot_t st{};
+  if (tcpdp_snapshot_stats(&st) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to snapshot TCP dataplane stats");
+    return nullptr;
+  }
+  return Py_BuildValue(
+      "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
+      "tcp_flows_active",
+      st.flows_active,
+      "tcp_connect_attempts",
+      st.connect_attempts,
+      "tcp_connect_established",
+      st.connect_established,
+      "tcp_retransmit_count",
+      st.retransmit_count,
+      "tcp_timeout_close_count",
+      st.timeout_close_count,
+      "tcp_connect_timeout_count",
+      st.connect_timeout_count,
+      "tcp_idle_timeout_count",
+      st.idle_timeout_count,
+      "tcp_retransmit_exhausted_count",
+      st.retransmit_exhausted_count,
+      "tcp_rx_ack_count",
+      st.rx_ack_count,
+      "tcp_dup_ack_count",
+      st.dup_ack_count,
+      "tcp_partial_ack_count",
+      st.partial_ack_count,
+      "tcp_fast_retransmit_count",
+      st.fast_retransmit_count,
+      "tcp_unexpected_ack_count",
+      st.unexpected_ack_count,
+      "tcp_tx_data_bytes",
+      st.tx_data_bytes,
+      "tcp_rx_data_bytes",
+      st.rx_data_bytes,
+      "tcp_tx_packets_queued",
+      st.tx_packets_queued,
+      "tcp_tx_packets_drained",
+      st.tx_packets_drained,
+      "tcp_tx_packets_sent",
+      st.tx_packets_sent,
+      "tcp_poll_calls",
+      st.poll_calls,
+      "tcp_rx_frames",
+      st.rx_frames,
+      "tcp_unexpected_rx",
+      st.unexpected_rx,
+      "tcp_out_of_order_rx_count",
+      st.out_of_order_rx_count,
+      "tcp_peer_rst_count",
+      st.peer_rst_count,
+      "tcp_peer_fin_count",
+      st.peer_fin_count);
+}
+
+PyObject* get_tcp_flow(PyObject* self, PyObject* args) {
+  (void)self;
+  unsigned long long flow_id = 0;
+  if (!PyArg_ParseTuple(args, "K", &flow_id)) {
+    return nullptr;
+  }
+  tcpdp_flow_snapshot_t flow{};
+  if (tcpdp_get_flow(static_cast<uint64_t>(flow_id), &flow) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to read TCP dataplane flow");
+    return nullptr;
+  }
+  return Py_BuildValue(
+      "{s:K,s:I,s:I,s:H,s:H,s:I,s:I,s:I,s:I,s:H,s:H,s:H,s:i,s:I,s:K,s:K,s:i}",
+      "flow_id",
+      static_cast<unsigned long long>(flow.flow_id),
+      "src_ip",
+      flow.src_ip,
+      "dst_ip",
+      flow.dst_ip,
+      "src_port",
+      flow.src_port,
+      "dst_port",
+      flow.dst_port,
+      "iss",
+      flow.iss,
+      "snd_una",
+      flow.snd_una,
+      "snd_nxt",
+      flow.snd_nxt,
+      "rcv_nxt",
+      flow.rcv_nxt,
+      "peer_window",
+      flow.peer_window,
+      "local_window",
+      flow.local_window,
+      "mss",
+      flow.mss,
+      "state",
+      static_cast<int>(flow.state),
+      "retransmit_count",
+      flow.retransmit_count,
+      "rto_deadline_ns",
+      static_cast<unsigned long long>(flow.rto_deadline_ns),
+      "last_activity_ns",
+      static_cast<unsigned long long>(flow.last_activity_ns),
+      "found",
+      static_cast<int>(flow.found));
+}
+
 PyObject* start_rx_handler(PyObject* self, PyObject* args) {
   (void)self;
   const char* iface = nullptr;
@@ -326,6 +663,17 @@ PyMethodDef kMethods[] = {
     {"ingest_tx_packets", ingest_tx_packets, METH_VARARGS, "Ingest transmitted packets and update state table."},
     {"ingest_rx_frame", ingest_rx_frame, METH_VARARGS, "Ingest an RX frame and update state table."},
     {"sweep_state_table", sweep_state_table, METH_VARARGS, "Sweep stale state entries by timeout and return removed count."},
+    {"configure_tcp_dataplane", configure_tcp_dataplane, METH_VARARGS, "Configure custom TCP dataplane runtime."},
+    {"enqueue_tcp_connect", enqueue_tcp_connect, METH_VARARGS, "Queue a new custom TCP connect flow."},
+    {"ingest_tcp_tx_packets", ingest_tcp_tx_packets, METH_VARARGS, "Ingest TX packets into custom TCP dataplane."},
+    {"enqueue_tcp_send", enqueue_tcp_send, METH_VARARGS, "Queue payload for a custom TCP flow."},
+    {"ingest_tcp_rx_frame", ingest_tcp_rx_frame, METH_VARARGS, "Ingest RX frame into custom TCP dataplane."},
+    {"poll_tcp_dataplane", poll_tcp_dataplane, METH_VARARGS, "Advance custom TCP timers and retransmits."},
+    {"drain_tcp_tx_packets", drain_tcp_tx_packets, METH_VARARGS, "Drain queued custom TCP TX packets."},
+    {"collect_tcp_completions", collect_tcp_completions, METH_NOARGS, "Collect custom TCP flow completions."},
+    {"collect_tcp_rx_payloads", collect_tcp_rx_payloads, METH_NOARGS, "Collect custom TCP RX payload events."},
+    {"snapshot_tcp_dataplane", snapshot_tcp_dataplane, METH_NOARGS, "Snapshot custom TCP dataplane metrics."},
+    {"get_tcp_flow", get_tcp_flow, METH_VARARGS, "Read a custom TCP dataplane flow by flow id."},
     {"get_tcp_state", get_tcp_state, METH_VARARGS, "Get TCP state from the state table."},
     {"get_states_batch", get_states_batch, METH_VARARGS, "Get multiple TCP states in one call."},
     {"start_rx_handler", start_rx_handler, METH_VARARGS, "Start background RX handler thread and return handler id."},
