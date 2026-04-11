@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .types import ConnectionTemplate, Expectation, FlowOp, FlowOpcode, FlowProgram, L7EmuProfile
 
@@ -194,6 +194,10 @@ def compile_l7_profile(
     target_ip: str,
     target_port: int,
     scheme: str,
+    transport_backend: str = "kernel_socket",
+    stateful_runtime_backend: Optional[str] = None,
+    stateful_runtime_strict: bool = False,
+    legacy_mode: bool = True,
     template_mode: str = "compat",
     compat_mode: str = "http1",
     verify: bool = True,
@@ -211,6 +215,15 @@ def compile_l7_profile(
     proto = str(protocol or "").strip().lower()
     if proto not in {"http1", "http2"}:
         raise ValueError(f"unsupported L7 emulation protocol: {protocol!r}")
+    runtime_backend_explicit = stateful_runtime_backend is not None and str(stateful_runtime_backend).strip() != ""
+    runtime_backend = str(stateful_runtime_backend or "afxdp").strip().lower()
+    if runtime_backend not in {"afxdp", "dpdk"}:
+        raise ValueError(f"unsupported stateful runtime backend: {stateful_runtime_backend!r}")
+    backend = str(transport_backend or "kernel_socket").strip().lower()
+    if backend == "kernel_socket" and (runtime_backend_explicit or not bool(legacy_mode)):
+        backend = "custom_tcp"
+    if backend not in {"kernel_socket", "custom_tcp"}:
+        raise ValueError(f"unsupported L7 transport backend: {transport_backend!r}")
     paths = _coerce_paths(http_path)
     method = str(http_method or "GET").upper()
     if str(template_mode or "compat").strip().lower() == "profile":
@@ -245,6 +258,10 @@ def compile_l7_profile(
         target_port=int(target_port),
         scheme=str((profile_data or {}).get("scheme", scheme) or scheme),
         host_header=str((profile_data or {}).get("host_header", target_ip) or target_ip),
+        transport_backend=backend,
+        stateful_runtime_backend=runtime_backend,
+        stateful_runtime_strict=bool(stateful_runtime_strict),
+        legacy_mode=bool(legacy_mode),
         verify=bool(verify),
         tls_profile_name=str(tls_profile_name or "none"),
         max_connections=max(1, int(concurrency or 1)),

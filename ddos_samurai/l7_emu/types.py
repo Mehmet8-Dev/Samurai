@@ -80,6 +80,10 @@ class ConnectionTemplate:
     target_port: int
     scheme: str
     host_header: str
+    transport_backend: str = "kernel_socket"
+    stateful_runtime_backend: str = "afxdp"
+    stateful_runtime_strict: bool = False
+    legacy_mode: bool = False
     verify: bool = True
     tls_profile_name: str = "none"
     max_connections: int = 1
@@ -95,6 +99,10 @@ class ConnectionTemplate:
             "target_port": int(self.target_port),
             "scheme": str(self.scheme),
             "host_header": str(self.host_header),
+            "transport_backend": str(self.transport_backend),
+            "stateful_runtime_backend": str(self.stateful_runtime_backend),
+            "stateful_runtime_strict": int(bool(self.stateful_runtime_strict)),
+            "legacy_mode": int(bool(self.legacy_mode)),
             "verify": int(bool(self.verify)),
             "tls_profile_name": str(self.tls_profile_name),
             "max_connections": int(self.max_connections),
@@ -130,16 +138,26 @@ class L7EmuProfile:
 @dataclass(frozen=True)
 class RuntimeConfig:
     concurrency: int
+    stateful_runtime_backend: str = "afxdp"
+    stateful_runtime_strict: bool = False
+    legacy_mode: bool = False
     live_progress: bool = False
     live_sent: bool = False
     live_errors: bool = False
+    profile_l7: bool = False
+    profile_sample_limit: int = 0
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "concurrency": int(self.concurrency),
+            "stateful_runtime_backend": str(self.stateful_runtime_backend),
+            "stateful_runtime_strict": int(bool(self.stateful_runtime_strict)),
+            "legacy_mode": int(bool(self.legacy_mode)),
             "live_progress": int(bool(self.live_progress)),
             "live_sent": int(bool(self.live_sent)),
             "live_errors": int(bool(self.live_errors)),
+            "profile_l7": int(bool(self.profile_l7)),
+            "profile_sample_limit": int(self.profile_sample_limit),
         }
 
 

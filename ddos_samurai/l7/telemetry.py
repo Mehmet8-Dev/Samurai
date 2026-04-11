@@ -35,6 +35,9 @@ _DEFAULTS: Dict[str, Any] = {
     "quic_stream_fail_ratio": 0.0,
     "quic_handshake_fail_ratio": 0.0,
     "l7_capability_status": "ok",
+    "retransmit_count": 0,
+    "dup_ack_count": 0,
+    "timeout_close_count": 0,
 }
 
 
@@ -85,6 +88,10 @@ def normalize_l7_stats(
         out["l7_engine_path_used"] = str(out.get("sender_path", ""))
     if str(out.get("l7_fallback_reason", "none")).strip().lower() == "none":
         out["l7_fallback_reason"] = str(out.get("sender_fallback_reason", "none") or "none")
+    # Canonical ASTF-parity aliases (keep tcp_* for backward compatibility).
+    out["retransmit_count"] = int(out.get("retransmit_count", out.get("tcp_retransmit_count", 0)) or 0)
+    out["dup_ack_count"] = int(out.get("dup_ack_count", out.get("tcp_dup_ack_count", 0)) or 0)
+    out["timeout_close_count"] = int(out.get("timeout_close_count", out.get("tcp_timeout_close_count", 0)) or 0)
     out["l7_capability_status"] = _infer_capability_status(out)
     return out
 

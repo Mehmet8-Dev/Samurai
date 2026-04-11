@@ -32,6 +32,10 @@ struct FlowOp {
 struct Profile {
   std::string protocol;
   std::string sender_path;
+  std::string transport_backend{"kernel_socket"};
+  std::string stateful_runtime_backend{"afxdp"};
+  int stateful_runtime_strict{0};
+  int legacy_mode{0};
   std::string target_ip;
   int target_port{0};
   std::string scheme;
@@ -48,12 +52,89 @@ struct Profile {
 
 struct RuntimeConfig {
   int concurrency{1};
+  int profile_l7{0};
+  int profile_sample_limit{0};
 };
 
 struct RuntimeCapabilities {
   bool openssl{false};
   bool nghttp2{false};
 };
+
+enum class ReactorBackend {
+  SocketEpoll = 0,
+};
+
+enum class TransportBackend {
+  KernelSocket = 0,
+  CustomTcp = 1,
+};
+
+enum class TlsBackend {
+  Unavailable = 0,
+  OpenSSL = 1,
+};
+
+enum class Http2Backend {
+  Unavailable = 0,
+  Nghttp2Native = 1,
+};
+
+enum class NativeHotPathLevel {
+  Basic = 0,
+  UserspaceReactor = 1,
+  UserspaceReactorTemplates = 2,
+};
+
+inline const char* reactor_backend_name(ReactorBackend backend) {
+  switch (backend) {
+    case ReactorBackend::SocketEpoll:
+      return "socket_epoll";
+  }
+  return "unknown";
+}
+
+inline const char* transport_backend_name(TransportBackend backend) {
+  switch (backend) {
+    case TransportBackend::KernelSocket:
+      return "kernel_socket";
+    case TransportBackend::CustomTcp:
+      return "custom_tcp";
+  }
+  return "unknown";
+}
+
+inline const char* tls_backend_name(TlsBackend backend) {
+  switch (backend) {
+    case TlsBackend::OpenSSL:
+      return "openssl";
+    case TlsBackend::Unavailable:
+      return "unavailable";
+  }
+  return "unknown";
+}
+
+inline const char* http2_backend_name(Http2Backend backend) {
+  switch (backend) {
+    case Http2Backend::Nghttp2Native:
+      return "nghttp2_native";
+    case Http2Backend::Unavailable:
+      return "unavailable";
+  }
+  return "unknown";
+}
+
+inline const char* native_hot_path_level_name(NativeHotPathLevel level) {
+  switch (level) {
+    case NativeHotPathLevel::UserspaceReactorTemplates:
+      return "userspace_reactor_templates";
+    case NativeHotPathLevel::UserspaceReactor:
+      return "userspace_reactor";
+    case NativeHotPathLevel::Basic:
+      return "basic";
+  }
+  return "unknown";
+}
 
 struct TimerWheel {
   std::size_t slot_count{1024};
@@ -64,6 +145,7 @@ struct ConnectionPool {
   int max_connections{1};
   int active_connections{0};
   int reused_connections{0};
+  int active_connections_peak{0};
 };
 
 struct ShardState {
