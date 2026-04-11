@@ -69,6 +69,7 @@
       "parity_profile": "ci_safe",
       "kpi_gate_profile": "ci_safe",
       "test_profile": "ci_safe",
+      "summary_file": "benchmark_l7_summary.json",
       "pytest_args": [
         "-m",
         "pytest",
@@ -77,7 +78,13 @@
         "-rs"
       ],
       "env": {
-        "SAMURAI_BENCH_UPDATE_BASELINE": "0"
+        "SAMURAI_BENCH_UPDATE_BASELINE": "0",
+        "SAMURAI_STATEFUL_RUNTIME_BACKEND": "afxdp",
+        "SAMURAI_L7_CAPABILITY_STRICT": "1",
+        "SAMURAI_CUSTOM_TCP_MODE": "required",
+        "SAMURAI_CUSTOM_TCP_BACKEND": "af_xdp",
+        "SAMURAI_SENDER_FALLBACK_POLICY": "fail",
+        "SAMURAI_L7_FALLBACK_POLICY": "fail"
       },
       "artifact_standard": {
         "required_files": [
@@ -108,7 +115,11 @@
         "-rs"
       ],
       "env": {
-        "SAMURAI_LOSS_FAIL_PCT": "1"
+        "SAMURAI_LOSS_FAIL_PCT": "1",
+        "SAMURAI_STATEFUL_RUNTIME_BACKEND": "afxdp",
+        "SAMURAI_L7_CAPABILITY_STRICT": "1",
+        "SAMURAI_CUSTOM_TCP_MODE": "required",
+        "SAMURAI_CUSTOM_TCP_BACKEND": "af_xdp"
       },
       "artifact_standard": {
         "required_files": [

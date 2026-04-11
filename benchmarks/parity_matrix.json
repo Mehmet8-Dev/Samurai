@@ -41,7 +41,8 @@
         "l7_fail_budget_pct_max": 5.0,
         "quic_stream_fail_ratio_max": 0.1,
         "quic_handshake_fail_ratio_max": 0.1,
-        "quic_response_validation_fail_ratio_max": 0.1
+        "quic_response_validation_fail_ratio_max": 0.1,
+        "l7_conn_rate_cv_pct_max": 5.0
       }
     },
     "dedicated_lab": {
@@ -65,7 +66,17 @@
         "quic_response_validation_fail_ratio_max": 0.01,
         "quic_stack_mode_required": "h3_stateful",
         "sender_fallback_reason_required": "none",
-        "sender_path_single_required": 1
+        "sender_path_single_required": 1,
+        "runtime_backend_required": "afxdp",
+        "runtime_hot_path_level_required": "phase1_hybrid_afxdp_custom_tcp",
+        "legacy_path_used_required": 0,
+        "custom_tcp_bridge_xdp_enabled_required": 1,
+        "custom_tcp_bridge_backend_match_required": 1,
+        "runtime_transport_backend_required": "custom_tcp",
+        "stateful_runtime_status_required": "ready",
+        "l7_conn_rate_cv_pct_max": 5.0,
+        "stateful_runtime_preflight_status_required": "passed",
+        "stateful_runtime_preflight_xdp_enabled_required": 1
       }
     },
     "developer_fallback": {
@@ -108,16 +119,49 @@
     "l7_step_fail_ratio",
     "l7_h1_conn_reuse_ratio",
     "l7_h2_lane_reuse_ratio",
+    "l7_h2_active_streams_peak",
     "l7_epoll_wakeups",
     "l7_scheduler_queue_depth_peak",
     "l7_alloc_count",
+    "h2_goaway_replacements",
+    "h2_drain_evictions",
+    "h2_replace_now_decisions",
+    "h2_replace_after_idle_decisions",
+    "h2_stream_pool_reuse_hits",
     "session_success_rate",
     "retry_success_rate",
     "kpi_gate_profile",
     "kpi_gate_status",
     "kpi_gate_hard_fail",
     "kpi_violations",
-    "score_eligible"
+    "score_eligible",
+    "runtime_backend",
+    "runtime_hot_path_level",
+    "runtime_transport_backend",
+    "legacy_path_used",
+    "stateful_runtime_status",
+    "stateful_runtime_reason",
+    "stateful_runtime_detail",
+    "stateful_runtime_preflight_status",
+    "stateful_runtime_preflight_reason",
+    "stateful_runtime_preflight_detail",
+    "stateful_runtime_preflight_backend_requested",
+    "stateful_runtime_preflight_backend_used",
+    "stateful_runtime_preflight_backend_match",
+    "stateful_runtime_preflight_xdp_interface",
+    "stateful_runtime_preflight_xdp_queue_id",
+    "stateful_runtime_preflight_xdp_available",
+    "stateful_runtime_preflight_xdp_enabled",
+    "runtime_transport_service",
+    "runtime_transport_contract",
+    "runtime_transport_poll_calls",
+    "runtime_transport_poll_actions",
+    "runtime_transport_rx_poll_enabled",
+    "runtime_transport_snapshot_available",
+    "runtime_transport_service_loops"
+    ,"l7_conn_rate_cv_pct",
+    "h1_conn_rate_cv_pct",
+    "h2_conn_rate_cv_pct"
   ],
   "scenarios": [
     {
@@ -225,6 +269,19 @@
       }
     },
     {
+      "id": "l7_h2_active_streams_peak",
+      "layer": "L7",
+      "comparison": "higher_is_better",
+      "ddos_samurai": {
+        "report_field": "l7_h2_active_streams_peak",
+        "unit": "streams"
+      },
+      "trex": {
+        "report_field": "h2_active_streams_peak",
+        "unit": "streams"
+      }
+    },
+    {
       "id": "l7_epoll_wakeup_efficiency",
       "layer": "L7",
       "comparison": "lower_is_better",
@@ -261,6 +318,45 @@
       "trex": {
         "report_field": "alloc_count",
         "unit": "allocations"
+      }
+    },
+    {
+      "id": "h2_goaway_replacements",
+      "layer": "L7",
+      "comparison": "lower_is_better",
+      "ddos_samurai": {
+        "report_field": "h2_goaway_replacements",
+        "unit": "replacements"
+      },
+      "trex": {
+        "report_field": "goaway_replacements",
+        "unit": "replacements"
+      }
+    },
+    {
+      "id": "h2_drain_evictions",
+      "layer": "L7",
+      "comparison": "lower_is_better",
+      "ddos_samurai": {
+        "report_field": "h2_drain_evictions",
+        "unit": "evictions"
+      },
+      "trex": {
+        "report_field": "drain_evictions",
+        "unit": "evictions"
+      }
+    },
+    {
+      "id": "h2_stream_pool_reuse_hits",
+      "layer": "L7",
+      "comparison": "higher_is_better",
+      "ddos_samurai": {
+        "report_field": "h2_stream_pool_reuse_hits",
+        "unit": "hits"
+      },
+      "trex": {
+        "report_field": "stream_pool_reuse_hits",
+        "unit": "hits"
       }
     }
   ]

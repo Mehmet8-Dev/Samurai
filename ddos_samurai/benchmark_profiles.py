@@ -58,6 +58,11 @@ def _artifact_dir(profile_name: str, artifact_root: str | Path) -> Path:
     return (Path(artifact_root).resolve() / profile_name).resolve()
 
 
+def _summary_filename(profile_spec: Dict[str, Any]) -> str:
+    raw = str(profile_spec.get("summary_file", "") or "").strip()
+    return raw or "benchmark_summary.json"
+
+
 def build_profile_runtime(
     profile_name: str,
     profile_spec: Dict[str, Any],
@@ -67,12 +72,14 @@ def build_profile_runtime(
 ) -> Dict[str, Any]:
     adir = _artifact_dir(profile_name, artifact_root)
     required_files = list(((profile_spec.get("artifact_standard") or {}).get("required_files") or []))
+    summary_file = _summary_filename(profile_spec)
+    summary_path = (adir / summary_file).resolve()
 
     env = dict(os.environ)
     env["SAMURAI_TEST_PROFILE"] = str(profile_spec.get("test_profile", "ci_safe") or "ci_safe")
     env["SAMURAI_PARITY_PROFILE"] = str(profile_spec.get("parity_profile", profile_name) or profile_name)
     env["SAMURAI_KPI_GATE_PROFILE"] = str(profile_spec.get("kpi_gate_profile", profile_name) or profile_name)
-    env["SAMURAI_BENCH_REPORT_OUT"] = str((adir / "benchmark_summary.json").resolve())
+    env["SAMURAI_BENCH_REPORT_OUT"] = str(summary_path)
 
     for key, value in dict(profile_spec.get("env") or {}).items():
         env[str(key)] = str(value)
@@ -95,6 +102,10 @@ def build_profile_runtime(
         "SAMURAI_BENCH_UPDATE_BASELINE",
         "SAMURAI_LOSS_FAIL_PCT",
         "SAMURAI_LOSS_REPORT_OUT",
+        "SAMURAI_STATEFUL_RUNTIME_BACKEND",
+        "SAMURAI_L7_CAPABILITY_STRICT",
+        "SAMURAI_CUSTOM_TCP_MODE",
+        "SAMURAI_CUSTOM_TCP_BACKEND",
     ]
     export_env = {k: env[k] for k in export_keys if k in env}
 
@@ -105,6 +116,8 @@ def build_profile_runtime(
     return {
         "profile": profile_name,
         "artifact_dir": str(adir),
+        "summary_file": summary_file,
+        "summary_path": str(summary_path),
         "required_files": required_files,
         "required_summary_fields": list(((profile_spec.get("artifact_standard") or {}).get("required_summary_fields") or [])),
         "command": command,
@@ -125,7 +138,12 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
             missing.append(str(f))
 
     summary_fields = list(runtime.get("required_summary_fields") or [])
-    summary_path = (adir / "benchmark_summary.json").resolve()
+    summary_path_raw = str(runtime.get("summary_path", "") or "").strip()
+    if summary_path_raw:
+        summary_path = Path(summary_path_raw).resolve()
+    else:
+        summary_file = str(runtime.get("summary_file", "") or "").strip() or "benchmark_summary.json"
+        summary_path = (adir / summary_file).resolve()
     if summary_fields and summary_path.exists():
         try:
             payload = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -138,6 +156,7 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
         try:
             payload = json.loads(summary_path.read_text(encoding="utf-8"))
             normalized = ((payload.get("parity") or {}).get("normalized_results") or {})
+            acceptance = (payload.get("acceptance") or {})
             gate_status = str(normalized.get("kpi_gate_status", "") or "").strip().lower()
             score_eligible_raw = normalized.get("score_eligible", 0)
             try:
@@ -148,11 +167,46 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                 missing.append(f"{summary_path}::kpi_gate_status::{gate_status or 'missing'}")
             if score_eligible != 1:
                 missing.append(f"{summary_path}::score_eligible::{score_eligible_raw}")
+            live_perf_status = str(acceptance.get("live_perf_gate_status", "") or "").strip().lower()
+            live_perf_required = int(acceptance.get("live_perf_required", 0) or 0)
+            if live_perf_required == 1 and live_perf_status != "pass":
+                missing.append(f"{summary_path}::live_perf_gate_status::{live_perf_status or 'missing'}")
             profile_name = str(runtime.get("profile", "") or "").strip().lower()
             if profile_name == "dedicated_lab":
                 sender_fallback_reason = str(normalized.get("sender_fallback_reason", "") or "").strip().lower()
                 if sender_fallback_reason not in {"", "none"}:
                     missing.append(f"{summary_path}::sender_fallback_reason::{sender_fallback_reason}")
+                runtime_backend = str(normalized.get("runtime_backend", "") or "").strip().lower()
+                if runtime_backend != "afxdp":
+                    missing.append(f"{summary_path}::runtime_backend::{runtime_backend or 'missing'}")
+                runtime_hot_path_level = str(normalized.get("runtime_hot_path_level", "") or "").strip()
+                if runtime_hot_path_level != "phase1_hybrid_afxdp_custom_tcp":
+                    missing.append(f"{summary_path}::runtime_hot_path_level::{runtime_hot_path_level or 'missing'}")
+                legacy_path_used_raw = normalized.get("legacy_path_used", 1)
+                try:
+                    legacy_path_used = int(legacy_path_used_raw)
+                except Exception:
+                    legacy_path_used = 1
+                if legacy_path_used != 0:
+                    missing.append(f"{summary_path}::legacy_path_used::{legacy_path_used_raw}")
+                preflight_status = str(normalized.get("stateful_runtime_preflight_status", "") or "").strip().lower()
+                if preflight_status != "passed":
+                    missing.append(f"{summary_path}::stateful_runtime_preflight_status::{preflight_status or 'missing'}")
+                runtime_transport_backend = str(normalized.get("runtime_transport_backend", "") or "").strip().lower()
+                if runtime_transport_backend != "custom_tcp":
+                    missing.append(f"{summary_path}::runtime_transport_backend::{runtime_transport_backend or 'missing'}")
+                stateful_runtime_status = str(normalized.get("stateful_runtime_status", "") or "").strip().lower()
+                if stateful_runtime_status != "ready":
+                    missing.append(f"{summary_path}::stateful_runtime_status::{stateful_runtime_status or 'missing'}")
+                preflight_xdp_enabled_raw = normalized.get("stateful_runtime_preflight_xdp_enabled", 0)
+                try:
+                    preflight_xdp_enabled = int(preflight_xdp_enabled_raw)
+                except Exception:
+                    preflight_xdp_enabled = 0
+                if preflight_xdp_enabled != 1:
+                    missing.append(
+                        f"{summary_path}::stateful_runtime_preflight_xdp_enabled::{preflight_xdp_enabled_raw}"
+                    )
                 sender_paths_used = normalized.get("sender_paths_used")
                 if not isinstance(sender_paths_used, dict):
                     missing.append(f"{summary_path}::sender_paths_used::non_dict")
@@ -170,6 +224,73 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                         missing.append(f"{summary_path}::sender_path_drift::{len(active_paths)}")
                     elif str(active_paths[0]).upper() == "MIXED":
                         missing.append(f"{summary_path}::sender_path_drift::MIXED")
+            elif profile_name == "l7_dataplane_ci":
+                required_h2_fields = (
+                    "l7_h2_lane_reuse_ratio",
+                    "l7_h2_active_streams_peak",
+                    "h2_goaway_replacements",
+                    "h2_drain_evictions",
+                    "h2_replace_now_decisions",
+                    "h2_replace_after_idle_decisions",
+                    "h2_stream_pool_reuse_hits",
+                    "runtime_backend",
+                    "runtime_hot_path_level",
+                    "legacy_path_used",
+                    "runtime_transport_backend",
+                    "h1_conn_rate_cv_pct",
+                    "h2_conn_rate_cv_pct",
+                    "l7_conn_rate_cv_pct",
+                )
+                for key in required_h2_fields:
+                    if key not in normalized:
+                        missing.append(f"{summary_path}::{key}::missing")
+                numeric_h2_fields = (
+                    "l7_h2_lane_reuse_ratio",
+                    "l7_h2_active_streams_peak",
+                    "h2_goaway_replacements",
+                    "h2_drain_evictions",
+                    "h2_replace_now_decisions",
+                    "h2_replace_after_idle_decisions",
+                    "h2_stream_pool_reuse_hits",
+                    "h1_conn_rate_cv_pct",
+                    "h2_conn_rate_cv_pct",
+                    "l7_conn_rate_cv_pct",
+                )
+                for key in numeric_h2_fields:
+                    if key not in normalized:
+                        continue
+                    raw = normalized.get(key, 0)
+                    try:
+                        value = float(raw)
+                    except Exception:
+                        missing.append(f"{summary_path}::{key}::non_numeric::{raw}")
+                        continue
+                    if value < 0:
+                        missing.append(f"{summary_path}::{key}::negative::{raw}")
+                runtime_backend = str(normalized.get("runtime_backend", "") or "").strip().lower()
+                if runtime_backend != "afxdp":
+                    missing.append(f"{summary_path}::runtime_backend::{runtime_backend or 'missing'}")
+                runtime_hot_path_level = str(normalized.get("runtime_hot_path_level", "") or "").strip()
+                if runtime_hot_path_level != "phase1_hybrid_afxdp_custom_tcp":
+                    missing.append(f"{summary_path}::runtime_hot_path_level::{runtime_hot_path_level or 'missing'}")
+                runtime_transport_backend = str(normalized.get("runtime_transport_backend", "") or "").strip().lower()
+                if runtime_transport_backend != "custom_tcp":
+                    missing.append(f"{summary_path}::runtime_transport_backend::{runtime_transport_backend or 'missing'}")
+                legacy_path_used_raw = normalized.get("legacy_path_used", 1)
+                try:
+                    legacy_path_used = int(legacy_path_used_raw)
+                except Exception:
+                    legacy_path_used = 1
+                if legacy_path_used != 0:
+                    missing.append(f"{summary_path}::legacy_path_used::{legacy_path_used_raw}")
+                for key in ("h1_conn_rate_cv_pct", "h2_conn_rate_cv_pct", "l7_conn_rate_cv_pct"):
+                    try:
+                        cv = float(normalized.get(key, 100.0) or 100.0)
+                    except Exception:
+                        missing.append(f"{summary_path}::{key}::non_numeric")
+                        continue
+                    if cv > 5.0:
+                        missing.append(f"{summary_path}::{key}::too_high::{cv}")
         except Exception as exc:
             missing.append(f"{summary_path}::pipeline_parse_error::{type(exc).__name__}: {exc}")
 

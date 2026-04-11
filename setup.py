@@ -436,6 +436,8 @@ def get_extensions() -> List[Extension]:
             "ddos_samurai/l4/state_engine_module.cpp",
             "ddos_samurai/l4/l4_state_engine_ffi.cpp",
             "ddos_samurai/l4/l4_state_engine_core.cpp",
+            "ddos_samurai/l4/tcp_dataplane_ffi.cpp",
+            "ddos_samurai/l4/tcp_dataplane_core.cpp",
         ],
         language="c++",
         extra_compile_args=["-O2", "-Wall", "-fPIC", l4se_std_flag],
@@ -466,6 +468,8 @@ def get_extensions() -> List[Extension]:
         sources=[
             "ddos_samurai/l7_emu_native/module.cpp",
             "ddos_samurai/l7_emu_native/engine.cpp",
+            "ddos_samurai/l4/tcp_dataplane_ffi.cpp",
+            "ddos_samurai/l4/tcp_dataplane_core.cpp",
         ],
         include_dirs=[pybind11_include],
         language="c++",
@@ -474,6 +478,25 @@ def get_extensions() -> List[Extension]:
         define_macros=l7_macros,
     )
     extensions.append(l7_emu_native)
+
+    gpu_cuda_payload_native = Extension(
+        "ddos_samurai._gpu_cuda_payload_native",
+        sources=[
+            "ddos_samurai/gpu_cuda_payload/src/bridge_pybind.cpp",
+            "ddos_samurai/gpu_cuda_payload/src/compiler.cpp",
+            "ddos_samurai/gpu_cuda_payload/src/vector_spec_parser.cpp",
+            "ddos_samurai/gpu_cuda_payload/src/plan_batch.cpp",
+            "ddos_samurai/gpu_cuda_payload/src/oracle.cpp",
+        ],
+        include_dirs=[
+            pybind11_include,
+            os.path.join(project_root, "ddos_samurai", "gpu_cuda_payload", "include"),
+        ],
+        language="c++",
+        extra_compile_args=["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"],
+        extra_link_args=["-lpthread", "-lm"],
+    )
+    extensions.append(gpu_cuda_payload_native)
 
     fast_sender = Extension(
         "ddos_samurai.fast_sender",

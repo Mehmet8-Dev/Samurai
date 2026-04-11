@@ -70,6 +70,7 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "quic_stream_fail_ratio_max": 0.10,
         "quic_handshake_fail_ratio_max": 0.10,
         "quic_response_validation_fail_ratio_max": 0.10,
+        "l7_conn_rate_cv_pct_max": 5.0,
     },
     "developer_fallback": {
         "run_quality": "valid",
@@ -88,6 +89,7 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "quic_stream_fail_ratio_max": 0.10,
         "quic_handshake_fail_ratio_max": 0.10,
         "quic_response_validation_fail_ratio_max": 0.10,
+        "l7_conn_rate_cv_pct_max": 5.0,
     },
     "dedicated_lab": {
         "run_quality": "valid",
@@ -109,6 +111,14 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "quic_stack_mode_required": "h3_stateful",
         "sender_fallback_reason_required": "none",
         "sender_path_single_required": 1,
+        "runtime_backend_required": "afxdp",
+        "runtime_hot_path_level_required": "phase1_hybrid_afxdp_custom_tcp",
+        "legacy_path_used_required": 0,
+        "custom_tcp_bridge_xdp_enabled_required": 1,
+        "custom_tcp_bridge_backend_match_required": 1,
+        "runtime_transport_backend_required": "custom_tcp",
+        "stateful_runtime_status_required": "ready",
+        "l7_conn_rate_cv_pct_max": 5.0,
     },
 }
 
@@ -187,6 +197,26 @@ def _merge_gate_defaults(profile: str, parity_matrix_path: Optional[str] = None)
         base["sender_fallback_reason_required"] = parity["sender_fallback_reason_required"]
     if "sender_path_single_required" in parity:
         base["sender_path_single_required"] = parity["sender_path_single_required"]
+    if "runtime_backend_required" in parity:
+        base["runtime_backend_required"] = parity["runtime_backend_required"]
+    if "runtime_hot_path_level_required" in parity:
+        base["runtime_hot_path_level_required"] = parity["runtime_hot_path_level_required"]
+    if "legacy_path_used_required" in parity:
+        base["legacy_path_used_required"] = parity["legacy_path_used_required"]
+    if "custom_tcp_bridge_xdp_enabled_required" in parity:
+        base["custom_tcp_bridge_xdp_enabled_required"] = parity["custom_tcp_bridge_xdp_enabled_required"]
+    if "custom_tcp_bridge_backend_match_required" in parity:
+        base["custom_tcp_bridge_backend_match_required"] = parity["custom_tcp_bridge_backend_match_required"]
+    if "runtime_transport_backend_required" in parity:
+        base["runtime_transport_backend_required"] = parity["runtime_transport_backend_required"]
+    if "stateful_runtime_status_required" in parity:
+        base["stateful_runtime_status_required"] = parity["stateful_runtime_status_required"]
+    if "l7_conn_rate_cv_pct_max" in parity:
+        base["l7_conn_rate_cv_pct_max"] = parity["l7_conn_rate_cv_pct_max"]
+    if "stateful_runtime_preflight_status_required" in parity:
+        base["stateful_runtime_preflight_status_required"] = parity["stateful_runtime_preflight_status_required"]
+    if "stateful_runtime_preflight_xdp_enabled_required" in parity:
+        base["stateful_runtime_preflight_xdp_enabled_required"] = parity["stateful_runtime_preflight_xdp_enabled_required"]
     return base
 
 
@@ -436,6 +466,111 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
                 "single_path",
                 "single_path",
                 required=bool(dedicated_strict),
+            )
+        )
+    runtime_backend_required = str(gates.get("runtime_backend_required", "") or "").strip()
+    if runtime_backend_required:
+        rules.append(
+            KpiGateRule(
+                "runtime_backend",
+                "runtime_backend",
+                "eq",
+                runtime_backend_required,
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    runtime_hot_path_level_required = str(gates.get("runtime_hot_path_level_required", "") or "").strip()
+    if runtime_hot_path_level_required:
+        rules.append(
+            KpiGateRule(
+                "runtime_hot_path_level",
+                "runtime_hot_path_level",
+                "eq",
+                runtime_hot_path_level_required,
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    if "legacy_path_used_required" in gates:
+        rules.append(
+            KpiGateRule(
+                "legacy_path_used",
+                "legacy_path_used",
+                "eq",
+                int(gates.get("legacy_path_used_required", 0) or 0),
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    if "custom_tcp_bridge_xdp_enabled_required" in gates:
+        rules.append(
+            KpiGateRule(
+                "custom_tcp_bridge_xdp_enabled",
+                "custom_tcp_bridge_xdp_enabled",
+                "eq",
+                int(gates.get("custom_tcp_bridge_xdp_enabled_required", 0) or 0),
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    if "custom_tcp_bridge_backend_match_required" in gates:
+        rules.append(
+            KpiGateRule(
+                "custom_tcp_bridge_backend_match",
+                "custom_tcp_bridge_backend_match",
+                "eq",
+                int(gates.get("custom_tcp_bridge_backend_match_required", 0) or 0),
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    preflight_status_required = str(gates.get("stateful_runtime_preflight_status_required", "") or "").strip()
+    if preflight_status_required:
+        rules.append(
+            KpiGateRule(
+                "stateful_runtime_preflight_status",
+                "stateful_runtime_preflight_status",
+                "eq",
+                preflight_status_required,
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    if "stateful_runtime_preflight_xdp_enabled_required" in gates:
+        rules.append(
+            KpiGateRule(
+                "stateful_runtime_preflight_xdp_enabled",
+                "stateful_runtime_preflight_xdp_enabled",
+                "eq",
+                int(gates.get("stateful_runtime_preflight_xdp_enabled_required", 0) or 0),
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    runtime_transport_backend_required = str(gates.get("runtime_transport_backend_required", "") or "").strip()
+    if runtime_transport_backend_required:
+        rules.append(
+            KpiGateRule(
+                "runtime_transport_backend",
+                "runtime_transport_backend",
+                "eq",
+                runtime_transport_backend_required,
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    stateful_runtime_status_required = str(gates.get("stateful_runtime_status_required", "") or "").strip()
+    if stateful_runtime_status_required:
+        rules.append(
+            KpiGateRule(
+                "stateful_runtime_status",
+                "stateful_runtime_status",
+                "eq",
+                stateful_runtime_status_required,
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    if "l7_conn_rate_cv_pct_max" in gates:
+        rules.append(
+            KpiGateRule(
+                "l7_conn_rate_cv_pct",
+                "l7_conn_rate_cv_pct",
+                "max",
+                float(gates.get("l7_conn_rate_cv_pct_max", 5.0) or 5.0),
+                required=bool(l7_scope),
             )
         )
     return rules
