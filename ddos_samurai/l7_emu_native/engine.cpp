@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "custom_quic_stack/quic_stack.hpp"
 #include "../l4/tcp_dataplane_ffi.h"
 
 #include <arpa/inet.h>
@@ -3748,12 +3749,21 @@ RuntimeCapabilities detect_capabilities() {
 #ifdef SAMURAI_WITH_NGHTTP2
   caps.nghttp2 = true;
 #endif
+#ifdef SAMURAI_WITH_NGTCP2
+  caps.ngtcp2 = true;
+#endif
+#ifdef SAMURAI_WITH_NGHTTP3
+  caps.nghttp3 = true;
+#endif
   return caps;
 }
 
 std::map<std::string, double> run_profile(const Profile& profile, const RuntimeConfig& cfg) {
   const RuntimeCapabilities caps = detect_capabilities();
   const TransportBackend transport_backend = parse_transport_backend(profile);
+  if (profile.protocol == "quic") {
+    return custom_quic_stack::run_quic_profile(profile, cfg, caps, transport_backend);
+  }
   if (profile.protocol == "http2") {
     return run_http2_profile(profile, cfg, caps);
   }
