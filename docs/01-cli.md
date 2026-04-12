@@ -8,10 +8,12 @@ Ana moduller:
 
 - `app.py`: `main(argv=None)` orchestration
 - `args.py`: `build_parser()`
+- `constants.py`: `CONNECTION_POOL`, `USER_AGENTS`, soak presetleri
 - `config.py`: YAML config merge + soak config
 - `profile_resolver.py`: `apply_profile()` ve `_resolve_profile_args()`
 - `validation.py`: `_validate_*` ve `_preflight_*`
 - `env.py`: `args -> os.environ` bridge
+- `helpers.py`: normalize/privilege/uvloop yardimcilari
 - `offline_modes.py`: self-test, dry-run, gpu-pcap, pcap-info
 - `runtime.py`: live attack akisi
 - `reporting.py`: CLI-specific report glue helper'lari
@@ -100,6 +102,20 @@ Ortama yansitilan env anahtarlari:
 - `ddos_samurai.cli.main()`: config merge, safety gate, offline mode dispatch ve live worker spawn akisini baslatir.
 - `ddos_samurai.cli.__main__`: `python -m ddos_samurai.cli` icin module execution bootstrap'i saglar.
 
+## Stateful + Topology + Custom TCP Alanlari
+
+Guncel CLI'da stateful runtime'i etkileyen ana bayraklar:
+
+- `--stateful-runtime-backend {afxdp,dpdk}`
+- `--custom-tcp-mode {off,auto,required}`
+- `--custom-tcp-backend {af_xdp,txring}`
+- `--topo-spec-json`, `--topo-seed`, `--topo-strict`
+
+Preflight notu:
+
+- topology acikken legacy spoofing bayraklari fail edilir.
+- websocket attack-vector, L7 emu V1'de fail-visible kapatilmistir.
+
 ## YAML Config Merge Mantigi
 
 Akis:
@@ -173,3 +189,7 @@ Bu dosyada listelenen eski bayraklar halen gecerli olsa da, benchmark/disiplinli
 - lab profile + queue strategy
 - KPI gate profile + hard fail
 - L7 capability strict + native QUIC zorunlulugu
+
+CLI paketinin tum modullerini tek yerde gormek icin:
+
+- `docs/26-cli-package-deep-map.md`

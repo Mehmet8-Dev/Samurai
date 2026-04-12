@@ -78,3 +78,27 @@ Pinned host buffer pool limit-aware calisir:
 - `copy_gpu_to_host_pinned(...)` (D2H/pinned copy yolu)
 
 Native CUDA export yolunda zero-copy aciksa ek D2H atlanabilir; bu, `gpu_packet.py` tarafindaki genel pinned-copy API'sini tamamen ortadan kaldirmaz.
+
+## Yeni Paket: `gpu_cuda_payload/`
+
+`gpu_packet.py` hattindan ayri olarak yeni bir planner/payload katmani vardir:
+
+- dizin: `ddos_samurai/gpu_cuda_payload/`
+- extension: `ddos_samurai._gpu_cuda_payload_native`
+
+Ust seviye API:
+
+- `compile_vector_spec(...)`
+- `plan_batch_to_h2_request_plan(...)`
+- `execute_plan_batch(...)`
+- `evaluate_oracle(...)`
+- `D2HTransferEngine`
+
+Kisa rol ayrimi:
+
+- `gpu_packet.py`: packet generation + native CUDA packet hot-path
+- `gpu_cuda_payload/`: vector plan derleme + stateful L7 request plan entegrasyonu
+
+Detayli referans:
+
+- `docs/27-gpu-cuda-payload.md`

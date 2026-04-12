@@ -1,6 +1,7 @@
 # 00 - Genel Bakis
 
-Release modeli: `Samurai (Ronin)`
+Release modeli: `Samurai (Kenjaku)`
+Eski release modeli: `Samurai (Ronin)`
 
 ## Hedef
 
@@ -22,7 +23,7 @@ Bu dokuman, kod tabaninda degisiklik yapacak kisi icin "nereden baslamali" sorus
 6. Vektore gore yol secimi:
    - CPU L4/L3: `ddos_samurai/senders.py` + `ddos_samurai/packet.py`
    - GPU L4/L3: `ddos_samurai/gpu_packet.py` + native CUDA backend + sender
-   - L7: `ddos_samurai/senders.py` ve `ddos_samurai/l7_state_engine.c`
+   - L7: `ddos_samurai/senders.py` ve `ddos_samurai/l7_emu/*` + `ddos_samurai/l7_emu_native/*`
    - AF_XDP/TX_RING: `ddos_samurai/af_xdp_sender.py`, `fast_sender.c`, `dataplane_core.c`
 
 ## Katmanlar ve Sorumluluklar
@@ -61,6 +62,25 @@ Paket ici ayrim:
 
 - CPU (Scapy): `ddos_samurai/packet.py`
 - GPU (Numba/CuPy + native CUDA bridge): `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_payload.py`, `ddos_samurai/anomaly_packet.py`
+
+### Runtime Governance, Telemetry ve Profil Katmani
+
+- Benchmark runner: `ddos_samurai/benchmark_profiles.py`
+- KPI gate karar katmani: `ddos_samurai/kpi_gate.py`
+- Stateful runtime session/hot-path sozlesmesi: `ddos_samurai/stateful_runtime.py`
+- In-process metrics store: `ddos_samurai/metrics.py`
+- Live textfile exporter: `ddos_samurai/live_metrics.py`
+- Workload profile registry: `ddos_samurai/workload_profiles.py`
+- TLS/H2 profile adlari: `ddos_samurai/profile_names.py`
+
+Geriye donuk facade/adapter notlari:
+
+- `ddos_samurai/custom_tcp_dataplane.py` -> `l4.state_engine` additive API facade
+- `ddos_samurai/l4_state_engine.py` -> backward-compat import facade
+- `ddos_samurai/topology_native.py` -> native topology compile/preview bridge
+- `ddos_samurai/gpu_cuda_payload/` -> GPU vector plan + stateful request-plan bridge
+
+Bu katmanlarin detayli dokumu: `docs/25-core-runtime-modules.md`.
 
 ## GPU-CPU Is Bolumu (pratik)
 

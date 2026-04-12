@@ -254,28 +254,31 @@ Bu senaryo ne zaman mantikli:
 
 ## Katman 4: Stateful ve Ozel L7 Senaryolari
 
-### Akis A: WebSocket senaryo testi
+Not:
+
+- `websocket` attack-vector, mevcut L7 emu V1 strict yolunda destekli degildir.
+- Bu nedenle WebSocket senaryo komutlari fail-visible preflight hatasi uretir.
+
+### Akis A: HTTP2 Stateful Profile + Custom TCP
 
 ```bash
 python -m ddos_samurai.cli \
   --target 10.10.60.15 \
   --port 443 \
-  --attack-vector websocket \
+  --attack-vector http2 \
   --http-scheme https \
-  --ws-path /ws/stream \
-  --ws-scenario \
-  --ws-auth-message '{"type":"auth","token":"lab-token-001"}' \
-  --ws-subscribe-message '{"type":"subscribe","channel":"prices"}' \
-  --ws-subscribe-message '{"type":"subscribe","channel":"orders"}' \
-  --ws-ping-count 3 \
-  --ws-await-response \
-  --ws-concurrency 120 \
+  --l7-template-mode profile \
+  --l7-profile-file artifacts/configs/l7_http2_profile.json \
+  --stateful-runtime-backend afxdp \
+  --custom-tcp-mode required \
+  --custom-tcp-backend af_xdp \
+  --http2-concurrency 120 \
   --workers 6 \
   --count 15000 \
   --run-report \
   --run-report-dir artifacts/reports \
   --confirm \
-  --log artifacts/logs/ws_scenario.log
+  --log artifacts/logs/http2_stateful_profile.log
 ```
 
 ### Akis B: QUIC native capability gate

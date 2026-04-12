@@ -1,171 +1,141 @@
-# 16 - L7 Stateful / Faz 2-3 Degisiklik Ozeti
+# 16 - L7 Stateful Runtime V1 (Guncel Mimari)
 
-Bu dokuman, son refactor turunda eklenen Faz 2 ve Faz 3 degisikliklerini tek yerde toplar.
+Bu dokuman, mevcut checkout'taki stateful L7 yolunu guncel kodla birebir eslestirir.
+Eski `virtual_user.py` / `h2_transport.py` anlatimi bu repoda gecerli degildir.
 
 ## Kapsam
 
-- HTTP stateful workflow motoru
-- HTTP/2 transport secimi (`httpx` + `hyper-h2`)
-- WebSocket senaryo motoru (state machine)
-- PCAP replay flow-aware rewrite (TCP seq/ack delta)
-- PCAP replay L2 (`use_l2`) aktif yol
-- Ilgili test ve CLI/orchestrator entegrasyonu
+- `ddos_samurai/l7_emu/*` profile compiler + runtime bridge
+- `ddos_samurai/senders.py` stateful sender entrypoint'leri
+- `ddos_samurai/stateful_runtime.py` session + hot-path contract
+- `ddos_samurai/topology_native.py` topology compile/preview bridge
+- `ddos_samurai/custom_tcp_dataplane.py` facade
 
-## 1) Yeni Modul: VirtualUser Engine
+## 1) Stateful L7 Cekirdegi (`l7_emu`)
 
-Dosya: `ddos_samurai/virtual_user.py`
+Temel moduller:
 
-Eklenenler:
+- `l7_emu/types.py`
+  - `FlowOpcode`, `FlowOp`, `FlowProgram`
+  - `ConnectionTemplate`, `L7EmuProfile`, `RuntimeConfig`, `RunResult`
+- `l7_emu/compiler.py`
+  - `compile_l7_profile(...)`
+  - `load_l7_profile_file(path)`
+- `l7_emu/runtime.py`
+  - `run_l7_profile(profile, runtime_cfg)`
+  - native modul yoksa fail-visible `_unavailable_stats(...)`
 
-- `WorkflowStep`, `ExtractRule`, `WorkflowResult`, `L7Metrics`
-- `VirtualUser`:
-  - Per-user cookie jar
-  - Token extraction/injection
-  - Redirect takibi
-  - Retry/backoff
-- `run_vu_pool(...)`:
-  - Concurrency-limitli VU havuzu
-  - Aggregate L7 metric toplama
+Desteklenen protocol seti:
 
-## 2) HTTP Stateful Sender
+- `http1`
+- `http2`
+- `quic` (minimal HTTP/3 semantigi)
 
-Dosya: `ddos_samurai/senders.py`
+Not:
 
-Eklenen fonksiyon:
+- `websocket` bu V1 stateful runtime'da destekli degildir.
+- CLI tarafinda `--attack-vector websocket` v1 icin preflight hatasi uretir.
 
+## 2) Sender Entegrasyonu (`senders.py`)
+
+Guncel stateful sender fonksiyonlari:
+
+- `http_app_sender(...)`
+- `http2_sender(...)`
 - `http_stateful_sender(...)`
-  - Varsayilan workflow: `bootstrap -> prefetch -> action`
-  - `run_vu_pool(...)` entegrasyonu
-  - L7 metriclerini sender stats'a ekler
+- `quic_sender(...)`
 
-Ek iyilestirme:
+Bu fonksiyonlarin ortak yolu:
 
-- `http_app_sender(...)` icine retry/backoff sayaclari eklendi:
-  - `retry_attempt_total`
-  - `retry_success_count`
+1. `compile_l7_profile(...)` ile profile derlenir.
+2. `run_l7_profile_public(...)` ile native runtime'a cagrilir.
+3. Sonuc `l7/telemetry.py` normalize/aggregate kurallariyla uyumlu hale getirilir.
 
-## 3) HTTP/2 Transport (Faz 3.1)
+Onemli parametre eksenleri:
 
-Yeni dosya:
+- `l7_profile_file`
+- `l7_template_mode` (`compat|profile`)
+- `stateful_runtime_backend` (`afxdp|dpdk`)
+- `custom_tcp_backend` (`af_xdp|txring`)
 
-- `ddos_samurai/h2_transport.py`
-  - `hyper-h2` tabanli minimal H2 transport
-  - Profile settings + window update uygulama
-  - status kodu sayaclari
+## 3) Custom TCP Runtime Bridge
 
-Guncellenen sender:
+Stateful strict yolda beklenen transport:
 
-- `http2_sender(..., h2_transport_name="auto")`
-  - `auto|httpx|hyper-h2` secimi
-  - `hyper-h2` hata verirse:
-    - `hyper-h2` zorlamada fail-visible
-    - `auto` modda `httpx` fallback
+- `runtime_transport_backend=custom_tcp`
 
-Yeni stats alani:
+Bridge akisinda kritik fonksiyonlar:
 
-- `h2_transport`
+- `_resolve_custom_tcp_flush_transport(...)`
+- `_flush_custom_tcp_tx_packets(...)`
+- `_service_custom_tcp_runtime(...)`
 
-## 4) WebSocket Scenario Motoru (Faz 3.2)
+Contract kurali:
 
-Dosya: `ddos_samurai/senders.py`
+- fallback veya MIXED path strict profilde kabul edilmez.
+- `evaluate_hot_path_contract(...)` ile fail-visible kosullar uretilir.
 
-Yeni fonksiyon:
+## 4) `stateful_runtime.py` Rolu
 
-- `websocket_scenario_sender(...)`
-  - Akis: connect -> auth -> subscribe -> ping/pong
-  - `await_response` ile adim bazli recv opsiyonu
+Bu modulde:
 
-Yeni stats alanlari:
+- `StatefulRuntimeSessionConfig`
+- `StatefulRuntimeSession`
+- `open_session(...)`
+- `evaluate_hot_path_contract(...)`
 
-- `ws_sessions_ok`
-- `ws_auth_sent`
-- `ws_subscribe_sent`
-- `ws_ping_sent`
-- `ws_pong_received`
-- `ws_scenario_enabled`
+`snapshot()` alanlari runtime kanitini tasir:
 
-## 5) PCAP Replay Flow-aware Rewrite (Faz 3.3)
+- `runtime_backend`
+- `runtime_hot_path_level`
+- `runtime_transport_backend`
+- `legacy_path_used`
 
-Dosya: `ddos_samurai/pcap_replay.py`
+## 5) Topology Modu (`--topo-*`)
 
-Eklenenler:
+CLI tarafinda topology aktif oldugunda:
 
-- `PcapReplayConfig.flow_aware_rewrite` (default `True`)
-- TCP flow collision algilama
-- 5-tuple yon bazli deterministic seq delta
-- Reverse akista ACK duzeltme
+- `--topo-spec-json`
+- `--topo-seed`
+- `--topo-strict`
 
-Yeni prep metrikleri:
+Validation akisi:
 
-- `flow_aware_rewrite`
-- `flow_rewrite_direction_count`
-- `flow_collision_count`
-- `tcp_seq_adjusted`
-- `tcp_ack_adjusted`
+1. `validation._validate_sender_route_args(...)`
+2. `topology_native.parse_compile_topology_spec(...)`
+3. `topology_tuple_preview(...)`
 
-## 6) PCAP Replay L2 Yolunun Aktif Edilmesi (Faz 3.4)
+Derlenen plan bilgisi args'a islenir:
 
-Dosyalar:
+- `topology_plan_id`
+- `topology_client_pool_size`
+- `topology_server_pool_size`
+- `topology_compiled_plan_json`
+- `topology_tuple_preview_json`
 
-- `ddos_samurai/pcap_replay.py`
-- `ddos_samurai/senders.py`
+## 6) Dedicated Lab ve Strict Davranis
 
-Degisiklik:
+`--lab-profile dedicated` seciminde preflight:
 
-- `use_l2=True` artik yalnizca "informational" degil.
-- Replay path sender'a `force_l2=True` geciriyor.
-- L2 kullanilamazsa fail-visible `sender_path=L2_UNAVAILABLE`.
+- `dataplane_core_mode=required`
+- `kpi_gate_profile=dedicated_lab`
+- `kpi_hard_fail=true`
+- `l7_capability_strict=true`
+- `stateful_runtime_backend=afxdp`
+- `custom_tcp_mode=required`
+- `custom_tcp_backend=af_xdp`
 
-Konfig guard:
+QUIC icin ek kural:
 
-- `use_l2=True` ve `strip_ethernet=True` birlikte verilirse config hatasi.
+- native zorunlulukta py-bridge/autopromote kapanir.
 
-## 7) CLI ve Orchestrator Entegrasyonu
+## 7) Guncel Test Referanslari
 
-### CLI (`ddos_samurai/cli/`)
+Stateful/topology/custom tcp kapsaminda:
 
-Yeni flagler:
+- `tests/test_l7_emu_v1.py`
+- `tests/test_l7_dataplane_contract.py`
+- `tests/test_stateful_topology_contract.py`
+- `tests/test_custom_tcp_dataplane.py`
 
-- `--h2-transport {auto,httpx,hyper-h2}`
-- `--ws-scenario`
-- `--ws-auth-message`
-- `--ws-subscribe-message`
-- `--ws-ping-count`
-- `--ws-await-response`
-- `--pcap-use-l2`
-- `--pcap-no-flow-aware`
-
-### Orchestrator (`ddos_samurai/orchestrator.py`)
-
-Yeni dispatch davranislari:
-
-- `http + stateful=true` -> `http_stateful_sender`
-- `websocket + ws_scenario=true` -> `websocket_scenario_sender`
-- `http2` -> `h2_transport_name` passthrough
-- `pcap-replay` -> `use_l2` + `flow_aware_rewrite` passthrough
-
-## 8) Test Guncellemeleri (Faz 3.5)
-
-Guncellenen test dosyalari:
-
-- `tests/test_l7_stateful.py`
-  - WS scenario testleri
-- `tests/test_senders_http2.py`
-  - `hyper-h2` path testi
-- `tests/test_pcap_replay.py`
-  - flow-aware seq rewrite testi
-  - `use_l2` replay forwarding testi
-  - `use_l2 + strip_eth` conflict testi
-- `tests/test_orchestrator_cpu.py`
-  - websocket scenario dispatch testi
-  - stateful http dispatch testi
-
-Onerilen hedefli komut:
-
-```bash
-PYTHONPATH=. python3 -m pytest -q \
-  tests/test_l7_stateful.py \
-  tests/test_senders_http2.py \
-  tests/test_orchestrator_cpu.py \
-  tests/test_pcap_replay.py
-```
+Bu set, eski Faz 2/3 dokumanindaki dosya adlarindan daha guncel referanstir.

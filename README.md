@@ -1,17 +1,24 @@
-# Samurai (Ronin)
+# Samurai (Kenjaku)
 
 Samurai, **yalnizca yetkili ortamlarda** kullanilmak uzere tasarlanmis moduler bir ag stres ve guvenlik test platformudur.
+
+## Surum Isimleri
+
+- Mevcut surum: `Kenjaku`
+- Eski surum: `Ronin`
 
 Odak alanlari:
 - L3/L4/L7 trafik ve davranis testleri
 - CPU + C extension + opsiyonel CUDA hizlandirma
 - Profil tabanli benchmark, run-report ve telemetry
 
-## Durum (2026-04-06)
+## Durum (2026-04-12)
 
 - Aktif cekirdek: `advv2.py` + `ddos_samurai/cli/` + `orchestrator/senders`
 - Aktif hizli yollar: `fast_sender.c`, `pacing_engine.c`, `xdp_sender.c`, `dataplane_core.c`
 - Aktif GPU yolu: Python bridge + native CUDA (`ddos_samurai/libgpu_packet_cuda.so`)
+- Aktif stateful L7 yolu: `ddos_samurai/l7_emu/*` + `ddos_samurai/l7_emu_native/*`
+- Aktif GPU vector planner yolu: `ddos_samurai/gpu_cuda_payload/*` + `_gpu_cuda_payload_native`
 - Repo kokunde `dashboard/` dizini yok.
 - Repo icinde `ddos_samurai/api.py` yok.
 
@@ -28,8 +35,10 @@ Yetkisiz sistemlere trafik gondermek yasa disi olabilir ve tum sorumluluk kullan
 - CLI paket yapisi: `app.py`, `args.py`, `config.py`, `profile_resolver.py`, `validation.py`, `offline_modes.py`, `runtime.py`
 - Worker/dispatch: `ddos_samurai/orchestrator.py`
 - Sender facade + ic moduller: `ddos_samurai/senders.py`, `ddos_samurai/_senders/*`
+- Stateful runtime + topology: `ddos_samurai/stateful_runtime.py`, `ddos_samurai/topology_native.py`, `ddos_samurai/custom_tcp_dataplane.py`
 - CPU paket yolu: `ddos_samurai/packet.py`, `ddos_samurai/cpu_packet_engine.py`
 - GPU paket/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_payload.py`, `ddos_samurai/anomaly_packet.py`
+- GPU CUDA payload planner: `ddos_samurai/gpu_cuda_payload/`
 - Native CUDA ABI: `ddos_samurai/gpu_packet_cuda.hpp`, `ddos_samurai/gpu_packet_cuda/*`, `ddos_samurai/libgpu_packet_cuda.so`
 - C hizlandirma: `ddos_samurai/fast_sender.c`, `ddos_samurai/pacing_engine.c`, `ddos_samurai/xdp_sender.c`, `ddos_samurai/dataplane_core.c`
 - Monitoring stack: `monitoring/`
@@ -38,8 +47,12 @@ Yetkisiz sistemlere trafik gondermek yasa disi olabilir ve tum sorumluluk kullan
 
 - Compute backend: `cpu`, `cuda`
 - L3/L4: TCP, UDP, ICMP, spoofing, fragment, pcap replay
-- L7: HTTP/HTTP2/WebSocket/QUIC (engine: `python` / `c_state` secimli)
+- L7: HTTP/HTTP2/QUIC (`python` / `c_state` secimli, stateful runtime V1)
 - Diger: anomaly/fuzz benzeri malformed paket varyasyonlari, amplification senaryolari
+
+Not:
+
+- `websocket` attack-vector mevcut checkout'ta L7 emu V1 strict yolunda fail-visible kapatilidir.
 
 ## Kurulum
 
@@ -122,7 +135,9 @@ Ornek hedefli testler:
 
 ```bash
 PYTHONPATH=. pytest -q tests/test_cli_parser.py
-PYTHONPATH=. pytest -q tests/test_gpu_packet_cuda_backend_bridge.py
+PYTHONPATH=. pytest -q tests/native_gpu/test_cuda_backend_bridge.py
+PYTHONPATH=. pytest -q tests/test_l7_emu_v1.py tests/test_stateful_topology_contract.py
+PYTHONPATH=. pytest -q tests/test_gpu_cuda_payload_facade.py
 ```
 
 ## Benchmark Profilleri
@@ -140,8 +155,11 @@ sudo python -m ddos_samurai.benchmark_profiles --profile dedicated_lab --run
 - `docs/01-cli.md`
 - `docs/03-senders.md`
 - `docs/05-gpu.md`
+- `docs/16-l7-stateful-phase2-phase3-update.md`
 - `docs/18-afpacket-hugepage-policy.md`
 - `docs/20-env-cli-reference.md`
+- `docs/26-cli-package-deep-map.md`
+- `docs/27-gpu-cuda-payload.md`
 
 ## Proje Dizini (kisa)
 

@@ -21,7 +21,8 @@ Bu dokuman su kaynaklardan derlendi:
 - `ddos_samurai/pacing_engine.c`
 - `ddos_samurai/senders.py`
 - `ddos_samurai/orchestrator.py`
-- `ddos_samurai/l7_state_engine.c`
+- `ddos_samurai/l7_emu/runtime.py`
+- `ddos_samurai/l7_emu/compiler.py`
 
 Not: Eskiden bu akisin tamami `ddos_samurai/cli.py` icindeydi. 2026-04-06 itibariyla ayni davranis `ddos_samurai/cli/` paketine dagitilmistir.
 
@@ -51,10 +52,12 @@ Pratik kural:
 |---|---|
 | `ddos_samurai/cli/app.py` | main orchestration, parse sirasi, offline/live dispatch |
 | `ddos_samurai/cli/args.py` | `build_parser()` ve tum CLI option tanimlari |
+| `ddos_samurai/cli/constants.py` | `CONNECTION_POOL`, user-agent havuzu, soak presetleri |
 | `ddos_samurai/cli/config.py` | `--config` YAML merge ve soak config uretimi |
 | `ddos_samurai/cli/profile_resolver.py` | profil uygulama ve TLS/H2 alias normalization |
 | `ddos_samurai/cli/validation.py` | `_validate_*`, `_preflight_*`, queue map ve capability guard'lari |
 | `ddos_samurai/cli/env.py` | parser default env okumasi ve `args -> os.environ` bridge |
+| `ddos_samurai/cli/helpers.py` | normalize ve privilege yardimcilari (`_normalize_*`, `is_admin`) |
 | `ddos_samurai/cli/offline_modes.py` | self-test, dry-run, gpu-pcap, pcap-info, traffic-model dry-validate |
 | `ddos_samurai/cli/runtime.py` | live run, root gate, ninja mode, worker spawn, monitor, final report |
 | `ddos_samurai/cli/reporting.py` | CLI-specific report helper'lari |
@@ -91,6 +94,9 @@ Bu env anahtarlari parser defaultlari icin agirlikla `args.py` ve `env.py` taraf
 - `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7`
 - `SAMURAI_KPI_GATE_PROFILE`
 - `SAMURAI_L7_CAPABILITY_STRICT`
+- `SAMURAI_STATEFUL_RUNTIME_BACKEND`
+- `SAMURAI_CUSTOM_TCP_MODE`
+- `SAMURAI_CUSTOM_TCP_BACKEND`
 - `SAMURAI_L7_ENGINE`
 - `SAMURAI_L7_FALLBACK_POLICY`
 - `SAMURAI_L7_HTTP2_ENGINE`
@@ -188,12 +194,32 @@ Asagidaki env anahtarlari parser tarafinda degil, downstream runtime modullerind
 | `SAMURAI_GPU_STREAMS` | `ddos_samurai/orchestrator.py` | GPU dataplane/payload tuning |
 | `SAMURAI_KPI_GATE_PROFILE` | `ddos_samurai/reporting.py` | Runtime override / internal tuning |
 | `SAMURAI_KPI_HARD_FAIL` | `ddos_samurai/reporting.py` | Runtime override / internal tuning |
-| `SAMURAI_L7_QUIC_REQUIRE_NATIVE` | `ddos_samurai/l7_state_engine.c` | L7 capability policy |
+| `SAMURAI_L7_QUIC_REQUIRE_NATIVE` | `ddos_samurai/senders.py`, `ddos_samurai/l7/quic_mode.py` | L7 QUIC native capability policy |
 | `SAMURAI_LOSS_FAIL_PCT` | `ddos_samurai/reporting.py` | Loss telemetry / KPI akisi |
 | `SAMURAI_LOSS_IFACE` | `ddos_samurai/loss_telemetry.py`, `ddos_samurai/senders.py` | Loss telemetry / KPI akisi |
 | `SAMURAI_LOSS_TELEMETRY` | `ddos_samurai/loss_telemetry.py`, `ddos_samurai/senders.py` | Loss telemetry / KPI akisi |
 | `SAMURAI_SENDER_BACKEND` | `ddos_samurai/senders.py` | Runtime override / internal tuning |
 | `SAMURAI_SENDER_FALLBACK_POLICY` | `ddos_samurai/senders.py` | Runtime override / internal tuning |
+| `SAMURAI_STATEFUL_RUNTIME_BACKEND` | `ddos_samurai/senders.py`, `ddos_samurai/stateful_runtime.py` | Stateful runtime backend secimi |
+| `SAMURAI_CUSTOM_TCP_MODE` | `ddos_samurai/orchestrator.py`, `ddos_samurai/senders.py` | Custom TCP strict/auto/off davranisi |
+| `SAMURAI_CUSTOM_TCP_BACKEND` | `ddos_samurai/orchestrator.py`, `ddos_samurai/senders.py` | Custom TCP flush backend secimi |
+
+## Topology ve Stateful Runtime Bayraklari (CLI)
+
+Bu bayraklar parser tarafinda dogrudan tanimlidir:
+
+- `--topo-spec-json`
+- `--topo-seed`
+- `--topo-strict`
+- `--stateful-runtime-backend`
+- `--custom-tcp-mode`
+- `--custom-tcp-backend`
+
+Topology acikken:
+
+- native parser (`topology_native.parse_compile_topology_spec`) cagrilir.
+- `topology_plan_id/topology_*` alanlari args'a yazilir.
+- legacy spoofing bayraklari fail edilir.
 
 ## Tum CLI Argumanlari
 

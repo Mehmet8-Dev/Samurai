@@ -109,6 +109,19 @@ sudo python -m ddos_samurai.benchmark_profiles --profile dedicated_lab --run
 Runner; profil bazli `pytest` komutunu cagirir, artifact standardini dogrular ve
 `benchmark_meta.json` yazar.
 
+Benchmark profile alias notlari:
+
+- `developer_fallback` -> `ci_safe`
+- `full` -> `dedicated_lab`
+
+Runner yardimci bayraklari:
+
+```bash
+python -m ddos_samurai.benchmark_profiles --list
+python -m ddos_samurai.benchmark_profiles --profile ci_safe --run --artifact-root artifacts/benchmarks
+python -m ddos_samurai.benchmark_profiles --profile ci_safe --run --python-bin "$(which python3)"
+```
+
 Legacy dogrudan benchmark komutlari:
 
 ```bash
@@ -203,3 +216,18 @@ Repo bu riski azaltmak icin lazy import kullanir:
 - `ddos_samurai/scapy_support.py`
 
 Bu sayede non-root/sandbox ortamlarda test collection daha stabil calisir.
+
+## Self-Test Yardimcisi (Programatik)
+
+`ddos_samurai/selftest.py` icindeki `run_unittest_discover(...)` fonksiyonu,
+CLI disinda da self-diagnostic ihtiyaclari icin structured ozet doner:
+
+- `tests_run`
+- `failures`
+- `errors`
+- `skipped`
+- `successful`
+- `output`
+
+Bu ozellik, CI diagnostic script'lerinde veya lokal "tek komutla saglik kontrolu"
+akislari icin dogrudan yeniden kullanilabilir.
