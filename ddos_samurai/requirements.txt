@@ -19,7 +19,6 @@ numpy
 requests
 websockets
 aiohttp
-aioquic
 httpx[http2]
 playwright
 rich

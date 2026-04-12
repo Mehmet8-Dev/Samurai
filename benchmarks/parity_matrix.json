@@ -20,7 +20,16 @@
         "l7_fail_budget_pct_max": 10.0,
         "quic_stream_fail_ratio_max": 0.25,
         "quic_handshake_fail_ratio_max": 0.25,
-        "quic_response_validation_fail_ratio_max": 0.25
+        "quic_response_validation_fail_ratio_max": 0.25,
+        "sender_fallback_reason_required": "none",
+        "sender_path_single_required": 1,
+        "runtime_backend_required": "afxdp",
+        "runtime_hot_path_level_required": "phase1_hybrid_afxdp_custom_tcp",
+        "legacy_path_used_required": 0,
+        "custom_tcp_bridge_xdp_enabled_required": 1,
+        "custom_tcp_bridge_backend_match_required": 1,
+        "runtime_transport_backend_required": "custom_tcp",
+        "stateful_runtime_status_required": "ready"
       }
     },
     "ci_safe": {
@@ -42,7 +51,16 @@
         "quic_stream_fail_ratio_max": 0.1,
         "quic_handshake_fail_ratio_max": 0.1,
         "quic_response_validation_fail_ratio_max": 0.1,
-        "l7_conn_rate_cv_pct_max": 5.0
+        "l7_conn_rate_cv_pct_max": 5.0,
+        "sender_fallback_reason_required": "none",
+        "sender_path_single_required": 1,
+        "runtime_backend_required": "afxdp",
+        "runtime_hot_path_level_required": "phase1_hybrid_afxdp_custom_tcp",
+        "legacy_path_used_required": 0,
+        "custom_tcp_bridge_xdp_enabled_required": 1,
+        "custom_tcp_bridge_backend_match_required": 1,
+        "runtime_transport_backend_required": "custom_tcp",
+        "stateful_runtime_status_required": "ready"
       }
     },
     "dedicated_lab": {
@@ -64,7 +82,7 @@
         "quic_stream_fail_ratio_max": 0.01,
         "quic_handshake_fail_ratio_max": 0.01,
         "quic_response_validation_fail_ratio_max": 0.01,
-        "quic_stack_mode_required": "h3_stateful",
+        "quic_stack_mode_required": "custom_native",
         "sender_fallback_reason_required": "none",
         "sender_path_single_required": 1,
         "runtime_backend_required": "afxdp",
@@ -97,7 +115,16 @@
         "l7_fail_budget_pct_max": 5.0,
         "quic_stream_fail_ratio_max": 0.1,
         "quic_handshake_fail_ratio_max": 0.1,
-        "quic_response_validation_fail_ratio_max": 0.1
+        "quic_response_validation_fail_ratio_max": 0.1,
+        "sender_fallback_reason_required": "none",
+        "sender_path_single_required": 1,
+        "runtime_backend_required": "afxdp",
+        "runtime_hot_path_level_required": "phase1_hybrid_afxdp_custom_tcp",
+        "legacy_path_used_required": 0,
+        "custom_tcp_bridge_xdp_enabled_required": 1,
+        "custom_tcp_bridge_backend_match_required": 1,
+        "runtime_transport_backend_required": "custom_tcp",
+        "stateful_runtime_status_required": "ready"
       }
     }
   },
@@ -158,8 +185,16 @@
     "runtime_transport_poll_actions",
     "runtime_transport_rx_poll_enabled",
     "runtime_transport_snapshot_available",
-    "runtime_transport_service_loops"
-    ,"l7_conn_rate_cv_pct",
+    "runtime_transport_service_loops",
+    "hot_path_contract_status",
+    "hot_path_contract_violation_reason",
+    "sender_path_single_required",
+    "topo_plan_id",
+    "topo_seed",
+    "topo_client_pool_size",
+    "topo_server_pool_size",
+    "topo_tuple_alloc_fail",
+    "l7_conn_rate_cv_pct",
     "h1_conn_rate_cv_pct",
     "h2_conn_rate_cv_pct"
   ],

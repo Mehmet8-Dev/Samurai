@@ -3,7 +3,6 @@ scapy
 uvloop
 aiohttp
 websockets
-aioquic
 httpx[http2]
 
 # Web Automation & WAF Bypass
