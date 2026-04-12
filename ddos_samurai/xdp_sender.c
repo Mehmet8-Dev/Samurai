@@ -1576,6 +1576,84 @@ static PyObject* py_xdp_send_buffer(PyObject* self, PyObject* args)
 }
 
 /**
+ * Send packets from a strided contiguous buffer.
+ * Python: xdp_send_buffer_strided(buffer, packet_size, stride, count) -> int
+ */
+static PyObject* py_xdp_send_buffer_strided(PyObject* self, PyObject* args)
+{
+    Py_buffer view;
+    int packet_size = 0;
+    int stride = 0;
+    int count = 0;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*iii", &view, &packet_size, &stride, &count)) {
+        return NULL;
+    }
+
+    if (packet_size <= 0 || stride <= 0 || count < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size/stride must be > 0 and count must be >= 0");
+        return NULL;
+    }
+    if (stride < packet_size) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "stride must be >= packet_size");
+        return NULL;
+    }
+    if (count == 0) {
+        PyBuffer_Release(&view);
+        return PyLong_FromLong(0);
+    }
+
+    const size_t needed = ((size_t)(count - 1) * (size_t)stride) + (size_t)packet_size;
+    if ((size_t)view.len < needed) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "buffer smaller than strided packet range");
+        return NULL;
+    }
+    if (packet_size > 65535) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size exceeds uint16_t limit");
+        return NULL;
+    }
+
+    pthread_mutex_lock(&xdp_ctx.lock);
+    if (!xdp_ctx.is_initialized || !xdp_ctx.is_running) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
+        return NULL;
+    }
+
+    if (ensure_send_scratch_capacity((Py_ssize_t)count) < 0) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyBuffer_Release(&view);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    const uint8_t *base = (const uint8_t*)view.buf;
+    for (int i = 0; i < count; i++) {
+        g_send_scratch.packets[i] = base + ((size_t)i * (size_t)stride);
+        g_send_scratch.lengths[i] = (uint16_t)packet_size;
+    }
+
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+    Py_BEGIN_ALLOW_THREADS
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_vector_locked(g_send_scratch.packets, g_send_scratch.lengths, (Py_ssize_t)count);
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    Py_END_ALLOW_THREADS
+    xdp_record_send_timing(&xdp_ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+    pthread_mutex_unlock(&xdp_ctx.lock);
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(total_sent);
+}
+
+/**
  * Acquire a writable UMEM TX frame for user-space in-place packet build.
  * Python: xdp_acquire_tx_frame() -> (frame_id:int, view:memoryview) | None
  */
@@ -2280,6 +2358,94 @@ static PyObject* py_xdp_send_buffer_ctx(PyObject* self, PyObject* args)
     return PyLong_FromLong(total_sent);
 }
 
+static PyObject* py_xdp_send_buffer_strided_ctx(PyObject* self, PyObject* args)
+{
+    int handle = 0;
+    Py_buffer view;
+    int packet_size = 0;
+    int stride = 0;
+    int count = 0;
+    xdp_context_t *ctx = NULL;
+    const uint8_t **packets = NULL;
+    uint16_t *lengths = NULL;
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "iy*iii", &handle, &view, &packet_size, &stride, &count)) {
+        return NULL;
+    }
+
+    if (packet_size <= 0 || stride <= 0 || count < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size/stride must be > 0 and count must be >= 0");
+        return NULL;
+    }
+    if (stride < packet_size) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "stride must be >= packet_size");
+        return NULL;
+    }
+    if (count == 0) {
+        PyBuffer_Release(&view);
+        return PyLong_FromLong(0);
+    }
+    if (packet_size > 65535) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size exceeds uint16_t limit");
+        return NULL;
+    }
+    {
+        const size_t needed = ((size_t)(count - 1) * (size_t)stride) + (size_t)packet_size;
+        if ((size_t)view.len < needed) {
+            PyBuffer_Release(&view);
+            PyErr_SetString(PyExc_ValueError, "buffer smaller than strided packet range");
+            return NULL;
+        }
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_KeyError, "Invalid XDP context handle");
+        return NULL;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "XDP context not initialized");
+        return NULL;
+    }
+
+    if (ensure_ctx_send_scratch_capacity(ctx, (Py_ssize_t)count) < 0) {
+        pthread_mutex_unlock(&ctx->lock);
+        PyBuffer_Release(&view);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    packets = ctx->scratch_packets;
+    lengths = ctx->scratch_lengths;
+    release_ctx_send_scratch_owners(ctx, (Py_ssize_t)count);
+
+    const uint8_t *base = (const uint8_t*)view.buf;
+    for (int i = 0; i < count; i++) {
+        packets[i] = base + ((size_t)i * (size_t)stride);
+        lengths[i] = (uint16_t)packet_size;
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_vector_ctx(ctx, packets, lengths, (Py_ssize_t)count);
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    Py_END_ALLOW_THREADS
+    xdp_record_send_timing(ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+
+    pthread_mutex_unlock(&ctx->lock);
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(total_sent);
+}
+
 static PyObject* py_xdp_stats_ctx(PyObject* self, PyObject* args)
 {
     int handle = 0;
@@ -2667,6 +2833,10 @@ static PyMethodDef XdpSenderMethods[] = {
      "Send contiguous packet buffer through AF_XDP context.\n"
      "Args: handle (int), buffer (bytes-like), packet_size (int), count (int)\n"
      "Returns: int (number of packets sent)"},
+    {"xdp_send_buffer_strided_ctx", py_xdp_send_buffer_strided_ctx, METH_VARARGS,
+     "Send strided packet buffer through AF_XDP context.\n"
+     "Args: handle (int), buffer (bytes-like), packet_size (int), stride (int), count (int)\n"
+     "Returns: int (number of packets sent)"},
     {"xdp_stats_ctx", py_xdp_stats_ctx, METH_VARARGS,
      "Get stats for AF_XDP context.\n"
      "Args: handle (int)\n"
@@ -2688,6 +2858,10 @@ static PyMethodDef XdpSenderMethods[] = {
     {"xdp_send_buffer", py_xdp_send_buffer, METH_VARARGS,
      "Send raw packets from contiguous buffer through AF_XDP.\n"
      "Args: buffer (bytes-like), packet_size (int), count (int)\n"
+     "Returns: int (number of packets sent)"},
+    {"xdp_send_buffer_strided", py_xdp_send_buffer_strided, METH_VARARGS,
+     "Send raw packets from strided buffer through AF_XDP.\n"
+     "Args: buffer (bytes-like), packet_size (int), stride (int), count (int)\n"
      "Returns: int (number of packets sent)"},
 
     {"xdp_acquire_tx_frame", py_xdp_acquire_tx_frame, METH_NOARGS,

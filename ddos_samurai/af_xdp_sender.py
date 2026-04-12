@@ -902,6 +902,58 @@ class XDPSender:
             utils.log_error(f"[XDP] Send buffer error: {e}")
             return 0
 
+    def send_buffer_strided(self, packet_buffer, packet_size: int, stride: int, count: int) -> int:
+        """
+        Send packets from a strided buffer.
+
+        Args:
+            packet_buffer: bytes-like object
+            packet_size: logical packet length
+            stride: distance between packet starts in buffer
+            count: number of packets
+        """
+        if not self._is_running:
+            raise RuntimeError("XDP sender not started")
+        if packet_size <= 0 or stride <= 0 or count <= 0:
+            return 0
+
+        if self._use_fallback:
+            # Fallback sender expects materialized packets.
+            mv = memoryview(packet_buffer)
+            packets = [bytes(mv[i * stride:(i * stride) + packet_size]) for i in range(count)]
+            return self._send_fallback(packets)
+
+        try:
+            if self._ctx_handle is not None:
+                if "xdp_send_buffer_strided_ctx" in dir(self._xdp):
+                    return int(
+                        self._xdp.xdp_send_buffer_strided_ctx(
+                            int(self._ctx_handle),
+                            packet_buffer,
+                            int(packet_size),
+                            int(stride),
+                            int(count),
+                        ) or 0
+                    )
+                raise RuntimeError("xdp_send_buffer_strided_ctx API not available for multi-context mode")
+
+            if hasattr(self._xdp, "xdp_send_buffer_strided"):
+                return int(
+                    self._xdp.xdp_send_buffer_strided(
+                        packet_buffer,
+                        int(packet_size),
+                        int(stride),
+                        int(count),
+                    ) or 0
+                )
+
+            mv = memoryview(packet_buffer)
+            packets = [bytes(mv[i * stride:(i * stride) + packet_size]) for i in range(count)]
+            return int(self._xdp.xdp_send(packets) or 0)
+        except Exception as e:
+            utils.log_error(f"[XDP] Send strided buffer error: {e}")
+            return 0
+
     def acquire_tx_frame(self):
         """
         Acquire a writable UMEM frame for in-place packet build.
