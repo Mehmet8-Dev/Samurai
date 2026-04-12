@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 extern "C" void l4se_shutdown_all_handlers(void);
@@ -452,6 +453,132 @@ PyObject* drain_tcp_tx_packets(PyObject* self, PyObject* args) {
   return out;
 }
 
+PyObject* drain_tcp_tx_buffer(PyObject* self, PyObject* args) {
+  (void)self;
+  unsigned int max_packets = 0;
+  if (!PyArg_ParseTuple(args, "|I", &max_packets)) {
+    return nullptr;
+  }
+  uint8_t* buffer = nullptr;
+  size_t total_len = 0;
+  uint32_t count = 0;
+  size_t packet_size = 0;
+  if (tcpdp_drain_tx_packets_concat(
+          static_cast<uint32_t>(max_packets),
+          &buffer,
+          &total_len,
+          &count,
+          &packet_size) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to drain custom TCP dataplane TX buffer");
+    return nullptr;
+  }
+
+  PyObject* owner = nullptr;
+  if (buffer != nullptr) {
+    owner = PyCapsule_New(
+        reinterpret_cast<void*>(buffer),
+        "samurai.tcpdp.drain_buffer",
+        [](PyObject* capsule) {
+          void* ptr = PyCapsule_GetPointer(capsule, "samurai.tcpdp.drain_buffer");
+          if (ptr != nullptr) {
+            tcpdp_free_drained_buffer(reinterpret_cast<uint8_t*>(ptr));
+          }
+        });
+    if (!owner) {
+      tcpdp_free_drained_buffer(buffer);
+      return nullptr;
+    }
+  } else {
+    owner = Py_NewRef(Py_None);
+  }
+
+  PyObject* payload = nullptr;
+  if (total_len > 0 && buffer != nullptr) {
+    payload = PyMemoryView_FromMemory(reinterpret_cast<char*>(buffer), static_cast<Py_ssize_t>(total_len), PyBUF_READ);
+  } else {
+    payload = PyMemoryView_FromMemory(const_cast<char*>(""), 0, PyBUF_READ);
+  }
+  if (!payload) {
+    Py_DECREF(owner);
+    return nullptr;
+  }
+
+  const int uniform = (count == 0 || (packet_size > 0 && (static_cast<size_t>(count) * packet_size) == total_len)) ? 1 : 0;
+  return Py_BuildValue(
+      "{s:N,s:N,s:I,s:n,s:i}",
+      "buffer",
+      payload,
+      "owner",
+      owner,
+      "count",
+      count,
+      "packet_size",
+      static_cast<Py_ssize_t>(packet_size),
+      "uniform",
+      uniform);
+}
+
+PyObject* peek_tcp_tx_buffer_strided(PyObject* self, PyObject* args) {
+  (void)self;
+  unsigned int max_packets = 0;
+  if (!PyArg_ParseTuple(args, "|I", &max_packets)) {
+    return nullptr;
+  }
+
+  const uint8_t* base = nullptr;
+  uint32_t count = 0;
+  size_t packet_size = 0;
+  size_t stride = 0;
+  if (tcpdp_peek_tx_packets_strided(
+          static_cast<uint32_t>(max_packets), &base, &count, &packet_size, &stride) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to peek custom TCP dataplane TX buffer");
+    return nullptr;
+  }
+
+  PyObject* payload = nullptr;
+  if (base != nullptr && count > 0 && stride > 0) {
+    const size_t total_len = stride * static_cast<size_t>(count);
+    payload = PyMemoryView_FromMemory(
+        const_cast<char*>(reinterpret_cast<const char*>(base)),
+        static_cast<Py_ssize_t>(total_len),
+        PyBUF_READ);
+  } else {
+    payload = PyMemoryView_FromMemory(const_cast<char*>(""), 0, PyBUF_READ);
+  }
+  if (!payload) {
+    return nullptr;
+  }
+
+  return Py_BuildValue(
+      "{s:N,s:N,s:I,s:n,s:n,s:i}",
+      "buffer",
+      payload,
+      "owner",
+      Py_NewRef(Py_None),
+      "count",
+      count,
+      "packet_size",
+      static_cast<Py_ssize_t>(packet_size),
+      "stride",
+      static_cast<Py_ssize_t>(stride),
+      "uniform",
+      1);
+}
+
+PyObject* consume_tcp_tx_packets(PyObject* self, PyObject* args) {
+  (void)self;
+  unsigned int max_packets = 0;
+  if (!PyArg_ParseTuple(args, "I", &max_packets)) {
+    return nullptr;
+  }
+  uint32_t consumed = 0;
+  if (tcpdp_consume_tx_packets(static_cast<uint32_t>(max_packets), &consumed) != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "Failed to consume custom TCP dataplane TX packets");
+    return nullptr;
+  }
+  return PyLong_FromUnsignedLong(consumed);
+}
+
 PyObject* collect_tcp_completions(PyObject* self, PyObject* args) {
   (void)self;
   (void)args;
@@ -670,6 +797,9 @@ PyMethodDef kMethods[] = {
     {"ingest_tcp_rx_frame", ingest_tcp_rx_frame, METH_VARARGS, "Ingest RX frame into custom TCP dataplane."},
     {"poll_tcp_dataplane", poll_tcp_dataplane, METH_VARARGS, "Advance custom TCP timers and retransmits."},
     {"drain_tcp_tx_packets", drain_tcp_tx_packets, METH_VARARGS, "Drain queued custom TCP TX packets."},
+    {"drain_tcp_tx_buffer", drain_tcp_tx_buffer, METH_VARARGS, "Drain queued custom TCP TX packets as a contiguous buffer."},
+    {"peek_tcp_tx_buffer_strided", peek_tcp_tx_buffer_strided, METH_VARARGS, "Peek queued custom TCP TX packets as a strided non-owning buffer."},
+    {"consume_tcp_tx_packets", consume_tcp_tx_packets, METH_VARARGS, "Consume already-sent custom TCP TX packets from queue head."},
     {"collect_tcp_completions", collect_tcp_completions, METH_NOARGS, "Collect custom TCP flow completions."},
     {"collect_tcp_rx_payloads", collect_tcp_rx_payloads, METH_NOARGS, "Collect custom TCP RX payload events."},
     {"snapshot_tcp_dataplane", snapshot_tcp_dataplane, METH_NOARGS, "Snapshot custom TCP dataplane metrics."},

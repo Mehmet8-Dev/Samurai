@@ -104,6 +104,21 @@ class TcpDataplaneCore {
   uint32_t EnqueueSend(uint64_t flow_id, const uint8_t* payload, size_t payload_len);
   uint32_t IngestRxFrame(const uint8_t* frame, size_t frame_len);
   uint32_t Poll(uint64_t now_ns, uint32_t budget);
+  bool DrainTxPacketsConcatAlloc(
+      uint32_t max_packets,
+      uint8_t** out_buffer,
+      size_t* out_total_len,
+      uint32_t* out_count,
+      size_t* out_packet_size,
+      bool* out_uniform,
+      bool require_uniform);
+  bool PeekTxPacketsStrided(
+      uint32_t max_packets,
+      const uint8_t** out_base,
+      uint32_t* out_count,
+      size_t* out_packet_size,
+      size_t* out_stride);
+  uint32_t ConsumeTxPackets(uint32_t max_packets);
   std::vector<std::vector<uint8_t>> DrainTxPackets(uint32_t max_packets);
   std::vector<TcpDpCompletion> CollectCompletions();
   std::vector<TcpDpRxPayload> CollectRxPayloads();
@@ -177,6 +192,7 @@ class TcpDataplaneCore {
       uint8_t flags,
       const uint8_t* payload,
       size_t payload_len) const;
+  bool EnqueueTxPacketBytes(const uint8_t* data, size_t len);
   void QueuePacket(FlowEntry& flow, std::vector<uint8_t>&& packet, uint32_t seq, uint32_t ack, uint32_t payload_len, bool arm_rto);
   void PushCompletion(uint64_t flow_id, TcpDpState state, bool success, const char* event);
   void HandleAck(FlowEntry& flow, uint32_t ack_value);
@@ -191,7 +207,14 @@ class TcpDataplaneCore {
   uint32_t seq_seed_ = 0x10203040U;
   std::unordered_map<uint64_t, FlowEntry> flows_by_id_;
   std::unordered_map<FlowKey, uint64_t, FlowKeyHash> flow_index_;
-  std::deque<std::vector<uint8_t>> tx_packets_;
+  size_t tx_ring_slot_size_ = 2048;
+  size_t tx_ring_capacity_ = 8192;
+  std::vector<uint8_t> tx_ring_storage_;
+  std::vector<uint16_t> tx_ring_lengths_;
+  uint32_t tx_ring_head_ = 0;
+  uint32_t tx_ring_tail_ = 0;
+  uint32_t tx_ring_count_ = 0;
+  std::deque<std::vector<uint8_t>> tx_packets_overflow_;
   std::deque<TcpDpCompletion> completions_;
   std::deque<TcpDpRxPayload> rx_payloads_;
   TcpDpStatsSnapshot stats_{};

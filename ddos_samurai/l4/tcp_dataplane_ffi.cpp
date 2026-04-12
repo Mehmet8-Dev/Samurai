@@ -157,6 +157,65 @@ void tcpdp_free_drained_packets(const uint8_t** packets, size_t* packet_lens, ui
   delete[] packet_lens;
 }
 
+int tcpdp_drain_tx_packets_concat(
+    uint32_t max_packets,
+    uint8_t** out_buffer,
+    size_t* out_total_len,
+    uint32_t* out_count,
+    size_t* out_packet_size) {
+  if (!out_buffer || !out_total_len || !out_count || !out_packet_size) {
+    return -1;
+  }
+  *out_buffer = nullptr;
+  *out_total_len = 0;
+  *out_count = 0;
+  *out_packet_size = 0;
+  bool uniform = false;
+  if (!ddos_samurai::tcpdp::Core().DrainTxPacketsConcatAlloc(
+          max_packets, out_buffer, out_total_len, out_count, out_packet_size, &uniform, true)) {
+    *out_buffer = nullptr;
+    *out_total_len = 0;
+    *out_count = 0;
+    *out_packet_size = 0;
+    return -1;
+  }
+  return 0;
+}
+
+void tcpdp_free_drained_buffer(uint8_t* buffer) { delete[] buffer; }
+
+int tcpdp_peek_tx_packets_strided(
+    uint32_t max_packets,
+    const uint8_t** out_base,
+    uint32_t* out_count,
+    size_t* out_packet_size,
+    size_t* out_stride) {
+  if (!out_base || !out_count || !out_packet_size || !out_stride) {
+    return -1;
+  }
+  *out_base = nullptr;
+  *out_count = 0;
+  *out_packet_size = 0;
+  *out_stride = 0;
+  if (!ddos_samurai::tcpdp::Core().PeekTxPacketsStrided(
+          max_packets, out_base, out_count, out_packet_size, out_stride)) {
+    *out_base = nullptr;
+    *out_count = 0;
+    *out_packet_size = 0;
+    *out_stride = 0;
+    return -1;
+  }
+  return 0;
+}
+
+int tcpdp_consume_tx_packets(uint32_t max_packets, uint32_t* out_consumed) {
+  if (!out_consumed) {
+    return -1;
+  }
+  *out_consumed = ddos_samurai::tcpdp::Core().ConsumeTxPackets(max_packets);
+  return 0;
+}
+
 int tcpdp_collect_completions(tcpdp_completion_t** out_items, uint32_t* out_count) {
   if (!out_items || !out_count) {
     return -1;

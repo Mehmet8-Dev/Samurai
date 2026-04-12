@@ -85,6 +85,20 @@ int tcpdp_ingest_rx_frame(const uint8_t* frame, size_t frame_len, uint32_t* out_
 int tcpdp_poll(uint64_t now_ns, uint32_t budget, uint32_t* out_actions);
 int tcpdp_drain_tx_packets(uint32_t max_packets, const uint8_t*** out_packets, size_t** out_packet_lens, uint32_t* out_count);
 void tcpdp_free_drained_packets(const uint8_t** packets, size_t* packet_lens, uint32_t count);
+int tcpdp_drain_tx_packets_concat(
+    uint32_t max_packets,
+    uint8_t** out_buffer,
+    size_t* out_total_len,
+    uint32_t* out_count,
+    size_t* out_packet_size);
+void tcpdp_free_drained_buffer(uint8_t* buffer);
+int tcpdp_peek_tx_packets_strided(
+    uint32_t max_packets,
+    const uint8_t** out_base,
+    uint32_t* out_count,
+    size_t* out_packet_size,
+    size_t* out_stride);
+int tcpdp_consume_tx_packets(uint32_t max_packets, uint32_t* out_consumed);
 int tcpdp_collect_completions(tcpdp_completion_t** out_items, uint32_t* out_count);
 void tcpdp_free_completions(tcpdp_completion_t* items, uint32_t count);
 int tcpdp_collect_rx_payloads(tcpdp_rx_payload_t** out_items, uint32_t* out_count);
