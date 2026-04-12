@@ -107,7 +107,7 @@ Veri akışı: **CLI → Safety → Worker spawn → Orchestrator (per-worker) �
 | **raw_socket_sender** | Contiguous buffer (sabit `packet_size`); `fast_sender` C eklentisi (sendmmsg / TX_RING) varsa kullanır; yoksa Python sendmmsg/sendto. |
 | **paced_raw_socket_sender** | Aynı buffer + C `pacing_engine` ile deterministik pacing. |
 | **xdp_sender** | AF_XDP uygunsa `af_xdp_sender`; değilse raw_socket_sender fallback. |
-| **L7** | httpx (HTTP/1.1, HTTP/2), websockets, aioquic (QUIC/HTTP3), slow_* (keep-alive/slow read/post). |
+| **L7** | httpx (HTTP/1.1, HTTP/2), websockets, native custom QUIC stack (minimal H3), slow_* (keep-alive/slow read/post). |
 
 Buffer formatı: Çoklu paket ardışık byte buffer; `packet_size = len(buffer) // count`.
 
@@ -172,7 +172,7 @@ Buffer formatı: Çoklu paket ardışık byte buffer; `packet_size = len(buffer)
 
 ### 1.7 Bağımlılıklar (Özet)
 
-- **Ağ/taşıma:** scapy, uvloop, aiohttp, websockets, aioquic, httpx[http2]
+- **Ağ/taşıma:** scapy, uvloop, aiohttp, websockets, httpx[http2]
 - **Otomasyon:** playwright, requests
 - **API:** fastapi, uvicorn, prometheus-client, psutil
 - **Auth/DB:** SQLAlchemy, psycopg[binary], python-jose, passlib[bcrypt], email-validator
