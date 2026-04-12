@@ -67,6 +67,26 @@ bool is_write_heavy_method(const std::string& method_raw) {
   return m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE";
 }
 
+std::uint8_t state_op_from_name(const std::string& raw) {
+  std::string n = raw;
+  std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (n == "open") {
+    return static_cast<std::uint8_t>(1);
+  }
+  if (n == "send") {
+    return static_cast<std::uint8_t>(2);
+  }
+  if (n == "expect") {
+    return static_cast<std::uint8_t>(3);
+  }
+  if (n == "close") {
+    return static_cast<std::uint8_t>(4);
+  }
+  return static_cast<std::uint8_t>(0);
+}
+
 }  // namespace
 
 PlanBatchV1 compile_vector_spec(
@@ -81,7 +101,7 @@ PlanBatchV1 compile_vector_spec(
   }
 
   PlanBatchV1 out;
-  out.schema_version = 1;
+  out.schema_version = static_cast<std::uint64_t>(spec.schema_version);
   out.seed = seed;
   out.count = static_cast<std::uint32_t>(batch_size);
   out.method_idx.resize(batch_size);
@@ -91,8 +111,19 @@ PlanBatchV1 compile_vector_spec(
   out.step_id.resize(batch_size);
   out.think_time_ms.resize(batch_size);
   out.flags.resize(batch_size);
+  out.template_id.resize(batch_size);
+  out.flow_id.resize(batch_size);
+  out.client_idx.resize(batch_size);
+  out.server_idx.resize(batch_size);
+  out.tuple_hash.resize(batch_size);
+  out.state_op.resize(batch_size);
 
   Xoroshiro128Plus rng(seed);
+  const std::size_t total_template_count =
+      static_cast<std::size_t>(spec.l4_templates.size() + spec.l7_templates.size());
+  const std::uint32_t flow_count = std::max<std::uint32_t>(1U, spec.flow_count == 0U ? static_cast<std::uint32_t>(batch_size) : spec.flow_count);
+  const std::uint32_t client_pool_size = std::max<std::uint32_t>(1U, spec.client_pool_size);
+  const std::uint32_t server_pool_size = std::max<std::uint32_t>(1U, spec.server_pool_size);
 
   for (std::size_t i = 0; i < batch_size; ++i) {
     const std::size_t m_idx = rng.bounded(spec.methods.size());
@@ -130,10 +161,32 @@ PlanBatchV1 compile_vector_spec(
     flags |= (((r >> 6U) & 0x3U) << 6U);
     flags |= (((r >> 8U) & 0x1U) << 8U);
     out.flags[i] = flags;
+
+    if (total_template_count > 0U) {
+      out.template_id[i] = static_cast<std::uint16_t>(rng.bounded(total_template_count));
+    } else {
+      out.template_id[i] = 0U;
+    }
+    out.flow_id[i] = static_cast<std::uint32_t>(rng.bounded(flow_count));
+    out.client_idx[i] = static_cast<std::uint16_t>(rng.bounded(client_pool_size));
+    out.server_idx[i] = static_cast<std::uint16_t>(rng.bounded(server_pool_size));
+    out.tuple_hash[i] = static_cast<std::uint32_t>(
+        (static_cast<std::uint32_t>(out.flow_id[i] * 0x9E37U) ^
+         static_cast<std::uint32_t>(out.client_idx[i] * 0x85EBU) ^
+         static_cast<std::uint32_t>(out.server_idx[i] * 0xC2B2U) ^
+         rng.next_u32()));
+
+    if (!spec.step_graph.empty()) {
+      const std::size_t op_idx = static_cast<std::size_t>(out.step_id[i]) % spec.step_graph.size();
+      out.state_op[i] = state_op_from_name(spec.step_graph[op_idx]);
+    } else {
+      out.state_op[i] = 0U;
+    }
   }
 
   py::dict meta;
   meta["mode"] = py::str(spec.mode);
+  meta["schema_version"] = py::int_(spec.schema_version);
   py::list methods;
   for (const auto& v : spec.methods) {
     methods.append(py::str(v));
@@ -155,6 +208,28 @@ PlanBatchV1 compile_vector_spec(
   meta["header_profiles"] = header_profiles;
   meta["body_profiles"] = body_profiles;
   meta["max_steps"] = py::int_(spec.max_steps);
+  meta["topology_enabled"] = py::bool_(spec.topology_enabled);
+  meta["topology_plan_id"] = py::str(spec.topology_plan_id);
+  meta["client_pool_size"] = py::int_(spec.client_pool_size);
+  meta["server_pool_size"] = py::int_(spec.server_pool_size);
+  py::list l4_templates;
+  for (const auto& v : spec.l4_templates) {
+    l4_templates.append(py::str(v));
+  }
+  py::list l7_templates;
+  for (const auto& v : spec.l7_templates) {
+    l7_templates.append(py::str(v));
+  }
+  py::list step_graph;
+  for (const auto& v : spec.step_graph) {
+    step_graph.append(py::str(v));
+  }
+  meta["l4_templates"] = l4_templates;
+  meta["l7_templates"] = l7_templates;
+  meta["flow_count"] = py::int_(spec.flow_count);
+  meta["tuple_seed"] = py::int_(spec.tuple_seed);
+  meta["step_graph"] = step_graph;
+  meta["transport"] = py::str(spec.transport);
   meta["planner_rng"] = py::str("xoroshiro128plus");
   meta["planner_polymorphic_http"] = py::bool_(true);
   out.metadata = std::move(meta);

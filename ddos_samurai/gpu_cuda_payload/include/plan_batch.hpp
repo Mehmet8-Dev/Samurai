@@ -20,6 +20,12 @@ struct PlanBatchV1 {
   std::vector<std::uint8_t> step_id{};
   std::vector<std::uint16_t> think_time_ms{};
   std::vector<std::uint32_t> flags{};
+  std::vector<std::uint16_t> template_id{};
+  std::vector<std::uint32_t> flow_id{};
+  std::vector<std::uint16_t> client_idx{};
+  std::vector<std::uint16_t> server_idx{};
+  std::vector<std::uint32_t> tuple_hash{};
+  std::vector<std::uint8_t> state_op{};
 
   pybind11::dict metadata{};
 };
@@ -28,4 +34,3 @@ pybind11::dict plan_batch_to_dict(const PlanBatchV1& batch);
 PlanBatchV1 plan_batch_from_dict(const pybind11::dict& payload);
 
 }  // namespace ddos_samurai::gpu_cuda_payload
-

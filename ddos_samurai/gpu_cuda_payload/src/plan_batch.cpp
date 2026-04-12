@@ -33,11 +33,29 @@ std::vector<T> py_list_to_vector(const py::dict& payload, const char* key) {
   return out;
 }
 
+template <typename T>
+std::vector<T> py_list_to_vector_optional(const py::dict& payload, const char* key, std::size_t fill_size, T fill_value) {
+  if (!payload.contains(py::str(key))) {
+    return std::vector<T>(fill_size, fill_value);
+  }
+  py::object raw = payload[py::str(key)];
+  if (!py::isinstance<py::list>(raw) && !py::isinstance<py::tuple>(raw)) {
+    throw std::runtime_error(std::string("plan batch field must be list: ") + key);
+  }
+  std::vector<T> out;
+  for (const auto& item : raw) {
+    out.push_back(py::cast<T>(item));
+  }
+  return out;
+}
+
 void validate_size_match(const PlanBatchV1& batch) {
   const std::size_t n = static_cast<std::size_t>(batch.count);
   if (batch.method_idx.size() != n || batch.path_idx.size() != n || batch.header_profile_idx.size() != n ||
       batch.body_kind.size() != n || batch.step_id.size() != n || batch.think_time_ms.size() != n ||
-      batch.flags.size() != n) {
+      batch.flags.size() != n || batch.template_id.size() != n || batch.flow_id.size() != n ||
+      batch.client_idx.size() != n || batch.server_idx.size() != n || batch.tuple_hash.size() != n ||
+      batch.state_op.size() != n) {
     throw std::runtime_error("plan batch column size mismatch");
   }
 }
@@ -57,6 +75,12 @@ py::dict plan_batch_to_dict(const PlanBatchV1& batch) {
   out["step_id"] = vector_to_py_list(batch.step_id);
   out["think_time_ms"] = vector_to_py_list(batch.think_time_ms);
   out["flags"] = vector_to_py_list(batch.flags);
+  out["template_id"] = vector_to_py_list(batch.template_id);
+  out["flow_id"] = vector_to_py_list(batch.flow_id);
+  out["client_idx"] = vector_to_py_list(batch.client_idx);
+  out["server_idx"] = vector_to_py_list(batch.server_idx);
+  out["tuple_hash"] = vector_to_py_list(batch.tuple_hash);
+  out["state_op"] = vector_to_py_list(batch.state_op);
   out["metadata"] = batch.metadata;
   return out;
 }
@@ -73,6 +97,13 @@ PlanBatchV1 plan_batch_from_dict(const py::dict& payload) {
   out.step_id = py_list_to_vector<std::uint8_t>(payload, "step_id");
   out.think_time_ms = py_list_to_vector<std::uint16_t>(payload, "think_time_ms");
   out.flags = py_list_to_vector<std::uint32_t>(payload, "flags");
+  const std::size_t n = static_cast<std::size_t>(out.count);
+  out.template_id = py_list_to_vector_optional<std::uint16_t>(payload, "template_id", n, static_cast<std::uint16_t>(0));
+  out.flow_id = py_list_to_vector_optional<std::uint32_t>(payload, "flow_id", n, static_cast<std::uint32_t>(0));
+  out.client_idx = py_list_to_vector_optional<std::uint16_t>(payload, "client_idx", n, static_cast<std::uint16_t>(0));
+  out.server_idx = py_list_to_vector_optional<std::uint16_t>(payload, "server_idx", n, static_cast<std::uint16_t>(0));
+  out.tuple_hash = py_list_to_vector_optional<std::uint32_t>(payload, "tuple_hash", n, static_cast<std::uint32_t>(0));
+  out.state_op = py_list_to_vector_optional<std::uint8_t>(payload, "state_op", n, static_cast<std::uint8_t>(0));
   if (payload.contains(py::str("metadata")) && py::isinstance<py::dict>(payload[py::str("metadata")])) {
     out.metadata = py::cast<py::dict>(payload[py::str("metadata")]);
   }
@@ -81,4 +112,3 @@ PlanBatchV1 plan_batch_from_dict(const py::dict& payload) {
 }
 
 }  // namespace ddos_samurai::gpu_cuda_payload
-
