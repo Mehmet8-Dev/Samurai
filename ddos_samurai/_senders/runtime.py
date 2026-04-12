@@ -15,11 +15,11 @@ def resolve_sender_backend(value) -> str:
 
 def resolve_sender_fallback_policy(value) -> str:
     raw = str(
-        value if value is not None else os.environ.get("SAMURAI_SENDER_FALLBACK_POLICY", "allow") or "allow"
+        value if value is not None else os.environ.get("SAMURAI_SENDER_FALLBACK_POLICY", "fail") or "fail"
     )
     policy = raw.strip().lower()
     if policy not in _SENDER_FALLBACK_POLICY_CHOICES:
-        policy = "allow"
+        policy = "fail"
     return policy
 
 
@@ -43,29 +43,14 @@ def load_websockets():
         return False, None
 
 
-def load_aioquic():
+def has_l7_native_quic(*, package: str = "ddos_samurai") -> bool:
     try:
-        from aioquic.asyncio.client import connect
-        from aioquic.quic.configuration import QuicConfiguration
-        from aioquic.h3.connection import H3_ALPN, H3Connection
-        from aioquic.quic.events import StreamDataReceived
-        return {
-            "AIOQUIC_AVAILABLE": True,
-            "connect": connect,
-            "QuicConfiguration": QuicConfiguration,
-            "H3_ALPN": H3_ALPN,
-            "H3Connection": H3Connection,
-            "StreamDataReceived": StreamDataReceived,
-        }
-    except ImportError:
-        return {
-            "AIOQUIC_AVAILABLE": False,
-            "connect": None,
-            "QuicConfiguration": None,
-            "H3_ALPN": None,
-            "H3Connection": None,
-            "StreamDataReceived": None,
-        }
+        import importlib
+
+        mod = importlib.import_module("._l7_emu_native", package=package)
+        return bool(mod is not None and hasattr(mod, "run_profile"))
+    except Exception:
+        return False
 
 
 def load_h2_transport(*, package: str = "ddos_samurai"):

@@ -25,7 +25,7 @@ Facade'de korunmus fonksiyonlar:
 
 Korunan patch/test noktalarindan ornekler:
 
-- `FAST_SENDER_AVAILABLE`, `HTTPX_AVAILABLE`, `WEBSOCKETS_AVAILABLE`, `AIOQUIC_AVAILABLE`, `HYPER_H2_AVAILABLE`
+- `FAST_SENDER_AVAILABLE`, `HTTPX_AVAILABLE`, `WEBSOCKETS_AVAILABLE`, `HYPER_H2_AVAILABLE`
 - `_estimate_paced_packets`, `_apply_pacing_stats`, `_scapy`
 
 ## Icerik Haritasi (`_senders/*`)

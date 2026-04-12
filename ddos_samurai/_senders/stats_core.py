@@ -22,7 +22,7 @@ def _stats(attempted: int = 0, sent: int = 0, errors: int = 0, bytes_sent_est: i
         "buffer_reuse_hits": 0,
         "sender_fallback_reason": "none",
         "sender_backend_requested": "auto",
-        "sender_fallback_policy": "allow",
+        "sender_fallback_policy": "fail",
         "actual_rps": 0.0,
         "rate_accuracy_pct": 0.0,
         "jitter_p99_ns": 0.0,
