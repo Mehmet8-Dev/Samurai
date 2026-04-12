@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .l7 import quic_mode
 
 @dataclass
 class KpiGateRule:
@@ -52,6 +53,15 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "quic_stream_fail_ratio_max": 0.25,
         "quic_handshake_fail_ratio_max": 0.25,
         "quic_response_validation_fail_ratio_max": 0.25,
+        "sender_fallback_reason_required": "none",
+        "sender_path_single_required": 1,
+        "runtime_backend_required": "afxdp",
+        "runtime_hot_path_level_required": "phase1_hybrid_afxdp_custom_tcp",
+        "legacy_path_used_required": 0,
+        "custom_tcp_bridge_xdp_enabled_required": 1,
+        "custom_tcp_bridge_backend_match_required": 1,
+        "runtime_transport_backend_required": "custom_tcp",
+        "stateful_runtime_status_required": "ready",
     },
     "ci_safe": {
         "run_quality": "valid",
@@ -71,6 +81,15 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "quic_handshake_fail_ratio_max": 0.10,
         "quic_response_validation_fail_ratio_max": 0.10,
         "l7_conn_rate_cv_pct_max": 5.0,
+        "sender_fallback_reason_required": "none",
+        "sender_path_single_required": 1,
+        "runtime_backend_required": "afxdp",
+        "runtime_hot_path_level_required": "phase1_hybrid_afxdp_custom_tcp",
+        "legacy_path_used_required": 0,
+        "custom_tcp_bridge_xdp_enabled_required": 1,
+        "custom_tcp_bridge_backend_match_required": 1,
+        "runtime_transport_backend_required": "custom_tcp",
+        "stateful_runtime_status_required": "ready",
     },
     "developer_fallback": {
         "run_quality": "valid",
@@ -90,6 +109,15 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "quic_handshake_fail_ratio_max": 0.10,
         "quic_response_validation_fail_ratio_max": 0.10,
         "l7_conn_rate_cv_pct_max": 5.0,
+        "sender_fallback_reason_required": "none",
+        "sender_path_single_required": 1,
+        "runtime_backend_required": "afxdp",
+        "runtime_hot_path_level_required": "phase1_hybrid_afxdp_custom_tcp",
+        "legacy_path_used_required": 0,
+        "custom_tcp_bridge_xdp_enabled_required": 1,
+        "custom_tcp_bridge_backend_match_required": 1,
+        "runtime_transport_backend_required": "custom_tcp",
+        "stateful_runtime_status_required": "ready",
     },
     "dedicated_lab": {
         "run_quality": "valid",
@@ -108,7 +136,7 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "quic_stream_fail_ratio_max": 0.01,
         "quic_handshake_fail_ratio_max": 0.01,
         "quic_response_validation_fail_ratio_max": 0.01,
-        "quic_stack_mode_required": "h3_stateful",
+        "quic_stack_mode_required": "custom_native",
         "sender_fallback_reason_required": "none",
         "sender_path_single_required": 1,
         "runtime_backend_required": "afxdp",
@@ -326,7 +354,7 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
     quic_scope = _infer_quic_scope(results)
     l7_scope = _infer_l7_scope(results, quic_scope=quic_scope)
     txring_scope = _infer_txring_scope(results)
-    dedicated_strict = str(profile or "").strip().lower() == "dedicated_lab"
+    dedicated_strict = str(profile or "").strip().lower() != "off"
     rules: List[KpiGateRule] = [
         KpiGateRule("run_quality", "run_quality", "eq", gates.get("run_quality", "valid"), required=True),
         KpiGateRule(
@@ -616,6 +644,9 @@ def evaluate(
         elif rule.op == "eq":
             lhs = str(value).strip().lower()
             rhs = str(rule.threshold).strip().lower()
+            if rule.metric == "quic_stack_mode":
+                lhs = quic_mode.normalize(lhs)
+                rhs = quic_mode.normalize(rhs)
             passed = lhs == rhs
             if not passed:
                 detail = f"expected={rhs} actual={lhs}"

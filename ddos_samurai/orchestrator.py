@@ -14,6 +14,8 @@ from ddos_samurai import senders
 from ddos_samurai import stealth
 from ddos_samurai import cpu_packet_engine
 from ddos_samurai import dataplane
+from ddos_samurai.stateful_runtime import evaluate_hot_path_contract
+from ddos_samurai.topology_native import compiled_topology_plan_from_dict, topology_tuple_for_index
 
 
 from ddos_samurai import utils
@@ -54,7 +56,7 @@ def _empty_stats() -> dict:
         "buffer_reuse_hits": 0,
         "sender_fallback_reason": "none",
         "sender_backend_requested": "auto",
-        "sender_fallback_policy": "allow",
+        "sender_fallback_policy": "fail",
         "actual_rps": 0.0,
         "rate_accuracy_pct": 0.0,
         "jitter_p99_ns": 0.0,
@@ -201,6 +203,16 @@ def _empty_stats() -> dict:
         "runtime_transport_rx_poll_enabled": 0,
         "runtime_transport_snapshot_available": 0,
         "runtime_transport_service_loops": 0,
+        "hot_path_contract_status": "unknown",
+        "hot_path_contract_violation_reason": "none",
+        "sender_path_single_required": 1,
+        "topo_plan_id": "",
+        "topo_seed": -1,
+        "topo_client_pool_size": 0,
+        "topo_server_pool_size": 0,
+        "topo_tuple_alloc_fail": 0,
+        "topology_tuple_index": -1,
+        "topology_tuple_row_json": "",
     }
 
 
@@ -716,6 +728,13 @@ def _add_stats(acc: dict, item: dict) -> dict:
             acc["custom_tcp_bridge_backend_used"] = item_custom_backend_used
         elif current != item_custom_backend_used and current != "mixed":
             acc["custom_tcp_bridge_backend_used"] = "mixed"
+    item_runtime_transport_backend = str(item.get("runtime_transport_backend", "") or "").strip()
+    if item_runtime_transport_backend:
+        current_runtime_backend = str(acc.get("runtime_transport_backend", "") or "").strip()
+        if not current_runtime_backend:
+            acc["runtime_transport_backend"] = item_runtime_transport_backend
+        elif current_runtime_backend != item_runtime_transport_backend and current_runtime_backend != "mixed":
+            acc["runtime_transport_backend"] = "mixed"
     acc["custom_tcp_bridge_backend_match"] = min(
         int(acc.get("custom_tcp_bridge_backend_match", 1) or 0),
         int(item.get("custom_tcp_bridge_backend_match", 1) or 0),
@@ -807,6 +826,53 @@ def _build_pacing_config(args: dict) -> PacingConfig:
     )
 
 
+def _apply_topology_binding(args: dict, worker_id: int) -> None:
+    if not bool(args.get("topology_enabled", False)):
+        return
+    raw_plan = str(args.get("topology_compiled_plan_json", "") or "").strip()
+    if not raw_plan:
+        args["topology_tuple_alloc_fail"] = int(args.get("topology_tuple_alloc_fail", 0) or 0) + 1
+        return
+    try:
+        compiled = compiled_topology_plan_from_dict(json.loads(raw_plan))
+        tuple_idx = max(0, int(worker_id) - 1)
+        row = topology_tuple_for_index(compiled, tuple_index=tuple_idx)
+
+        server_ip = str(row.get("server_ip", "") or "").strip()
+        server_port = int(row.get("server_port", args.get("port", 0)) or args.get("port", 0))
+        client_ip = str(row.get("client_ip", "") or "").strip()
+        template_protocol = str(row.get("template_protocol", "") or "").strip().lower()
+        template_method = str(row.get("template_method", "") or "").strip().upper()
+        template_path = str(row.get("template_path", "") or "").strip()
+        template_flags = str(row.get("template_flags", "") or "").strip().upper()
+
+        if server_ip:
+            args["target"] = server_ip
+        if 1 <= server_port <= 65535:
+            args["port"] = server_port
+        if client_ip:
+            args["spoof"] = True
+            if ":" in client_ip:
+                args["spoof_mode"] = "realistic"
+            else:
+                args["spoof_mode"] = "subnet"
+                args["spoof_subnet"] = f"{client_ip}/32"
+                args["spoof_list_file"] = None
+                args["spoof_ip"] = client_ip
+        if template_protocol == "l4" and template_flags:
+            args["tcp_flags"] = template_flags
+        if template_protocol == "l7":
+            if template_method:
+                args["http_method"] = template_method
+            if template_path:
+                args["http_path"] = [template_path]
+
+        args["topology_tuple_index"] = int(tuple_idx)
+        args["topology_tuple_row_json"] = json.dumps(row, sort_keys=True)
+    except Exception:
+        args["topology_tuple_alloc_fail"] = int(args.get("topology_tuple_alloc_fail", 0) or 0) + 1
+
+
 def start_worker(
     worker_id,
     args,
@@ -896,6 +962,15 @@ async def worker_process(
     worker_error = ""
     backend_used = "cpu"
     worker_stats = _empty_stats()
+    worker_stats["topo_plan_id"] = str(args.get("topology_plan_id", "") or "")
+    worker_stats["topo_seed"] = int(args.get("topology_seed", -1) or -1)
+    worker_stats["topo_client_pool_size"] = int(args.get("topology_client_pool_size", 0) or 0)
+    worker_stats["topo_server_pool_size"] = int(args.get("topology_server_pool_size", 0) or 0)
+    worker_stats["topo_tuple_alloc_fail"] = int(args.get("topology_tuple_alloc_fail", 0) or 0)
+    _apply_topology_binding(args, worker_id)
+    worker_stats["topo_tuple_alloc_fail"] = int(args.get("topology_tuple_alloc_fail", 0) or 0)
+    worker_stats["topology_tuple_index"] = int(args.get("topology_tuple_index", -1) or -1)
+    worker_stats["topology_tuple_row_json"] = str(args.get("topology_tuple_row_json", "") or "")
     _gpu_packet_mod = None
     _gpu_ring_depth_peak = 0
     _gpu_ring_block_wait_ns = 0
@@ -3149,27 +3224,25 @@ async def worker_process(
                 if not worker_error:
                     worker_error = f"high error rate: {_ws_errors}/{_ws_attempted}"
 
-        # Dedicated + required dataplane policy:
-        # Any sender fallback or sender-path drift is considered a hard failure.
-        if worker_status == "ok":
-            _lab_profile = str(args.get("lab_profile", "off") or "off").strip().lower()
-            _core_mode = str(args.get("dataplane_core_mode", "off") or "off").strip().lower()
-            _hot_path_strict = (_lab_profile == "dedicated" and _core_mode == "required")
-            if _hot_path_strict:
-                _ws_sender_path = str(worker_stats.get("sender_path", "") or "").strip()
-                _ws_fallback_reason = str(worker_stats.get("sender_fallback_reason", "none") or "none").strip().lower()
-                _ws_fallback_count = int(worker_stats.get("fallback_count", 0) or 0)
-                _has_sender_drift = bool(_ws_sender_path.upper() == "MIXED")
-                _has_sender_fallback = bool(_ws_fallback_reason not in {"", "none"} or _ws_fallback_count > 0)
-                if _has_sender_drift or _has_sender_fallback:
-                    worker_status = "failed"
-                    if not worker_error:
-                        worker_error = (
-                            "hot_path_policy_violation: "
-                            f"sender_path={_ws_sender_path or 'unknown'} "
-                            f"fallback_reason={_ws_fallback_reason or 'none'} "
-                            f"fallback_count={_ws_fallback_count}"
-                        )
+        # Global strict hot-path contract: single sender path, no fallback, L7 custom_tcp+xdp.
+        _contract = evaluate_hot_path_contract(
+            attack_vector=str(args.get("attack_vector", "basic") or "basic"),
+            sender_path=str(worker_stats.get("sender_path", "") or ""),
+            sender_fallback_reason=str(worker_stats.get("sender_fallback_reason", "none") or "none"),
+            fallback_count=int(worker_stats.get("fallback_count", 0) or 0),
+            runtime_transport_backend=str(worker_stats.get("runtime_transport_backend", "") or ""),
+            custom_tcp_bridge_backend_used=str(worker_stats.get("custom_tcp_bridge_backend_used", "") or ""),
+        )
+        worker_stats.update(_contract.as_dict())
+        if worker_status == "ok" and str(_contract.status or "failed") != "passed":
+            worker_status = "failed"
+            if not worker_error:
+                worker_error = (
+                    "hot_path_contract_violation: "
+                    f"reason={worker_stats.get('hot_path_contract_violation_reason', 'unknown')} "
+                    f"sender_path={worker_stats.get('sender_path', 'unknown')} "
+                    f"fallback_reason={worker_stats.get('sender_fallback_reason', 'none')}"
+                )
 
         # NOTE:
         # Live counters are already streamed incrementally by sender functions

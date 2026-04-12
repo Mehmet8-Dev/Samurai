@@ -223,8 +223,8 @@ def _stateful_runtime_preflight(
         return _stateful_runtime_fail_visible_stats(
             profile,
             runtime_cfg,
-            reason="stateful_runtime_dpdk_unavailable",
-            detail="DPDK transport backend is not implemented yet",
+            reason="not_implemented_hard_fail",
+            detail="stateful_runtime_backend=dpdk strict path is not implemented",
         )
 
     if runtime_backend != "afxdp":
@@ -240,7 +240,10 @@ def _stateful_runtime_preflight(
         xdp_interface=custom_tcp_xdp_interface,
         xdp_queue_id=0,
     )
-    if str(transport_plan.get("custom_tcp_bridge_backend_used", "") or "") != "xdp":
+    if (
+        str(transport_plan.get("custom_tcp_bridge_backend_used", "") or "") != "xdp"
+        or int(transport_plan.get("custom_tcp_bridge_degraded", 0) or 0) == 1
+    ):
         return _stateful_runtime_fail_visible_stats(
             profile,
             runtime_cfg,
@@ -405,8 +408,12 @@ def _resolve_custom_tcp_flush_transport(
     xdp_available = 0
     fallback_reason = "none"
     fallback_detail = ""
+    hard_fail_required = False
 
     if backend_requested == "af_xdp":
+        sender_backend = "xdp"
+        xdp_enabled = True
+        hard_fail_required = True
         if not iface:
             fallback_reason = "custom_tcp_xdp_interface_missing"
             fallback_detail = "custom_tcp_backend=af_xdp but no xdp interface was provided"
@@ -423,8 +430,6 @@ def _resolve_custom_tcp_flush_transport(
                     available = False
                     detail = str(exc)
             if available:
-                sender_backend = "xdp"
-                xdp_enabled = True
                 xdp_available = 1
             else:
                 fallback_reason = "custom_tcp_xdp_unavailable"
@@ -441,6 +446,7 @@ def _resolve_custom_tcp_flush_transport(
         "custom_tcp_bridge_xdp_queue_id": int(xdp_queue_id or 0),
         "custom_tcp_bridge_xdp_available": int(xdp_available),
         "custom_tcp_bridge_xdp_enabled": int(xdp_enabled),
+        "custom_tcp_bridge_hard_fail_required": int(hard_fail_required),
         "sender_backend": sender_backend,
         "xdp_enable": bool(xdp_enabled),
     }
@@ -489,6 +495,30 @@ async def _flush_custom_tcp_tx_packets(
         xdp_interface=xdp_interface,
         xdp_queue_id=custom_tcp_xdp_queue_id,
     )
+    if int(transport_plan.get("custom_tcp_bridge_hard_fail_required", 0) or 0) == 1 and int(
+        transport_plan.get("custom_tcp_bridge_degraded", 0) or 0
+    ) == 1:
+        reason = str(transport_plan.get("custom_tcp_bridge_fallback_reason", "custom_tcp_bridge_unavailable") or "custom_tcp_bridge_unavailable")
+        detail = str(transport_plan.get("custom_tcp_bridge_fallback_detail", "") or "custom_tcp bridge strict transport preflight failed")
+        return {
+            "attempted": int(packet_count),
+            "sent": 0,
+            "errors": int(packet_count),
+            "sender_fallback_reason": reason,
+            "custom_tcp_tx_flush_packets": int(packet_count),
+            "custom_tcp_tx_flush_bytes": int(len(tx_buffer)),
+            "custom_tcp_bridge_fallback_reason": reason,
+            "custom_tcp_bridge_fallback_detail": detail,
+            "custom_tcp_bridge_degraded": 1,
+            "custom_tcp_bridge_backend_requested": transport_plan.get("custom_tcp_bridge_backend_requested", "af_xdp"),
+            "custom_tcp_bridge_backend_used": transport_plan.get("custom_tcp_bridge_backend_used", "xdp"),
+            "custom_tcp_bridge_backend_match": 0,
+            "custom_tcp_bridge_xdp_interface": transport_plan.get("custom_tcp_bridge_xdp_interface", ""),
+            "custom_tcp_bridge_xdp_queue_id": int(transport_plan.get("custom_tcp_bridge_xdp_queue_id", 0) or 0),
+            "custom_tcp_bridge_xdp_available": int(transport_plan.get("custom_tcp_bridge_xdp_available", 0) or 0),
+            "custom_tcp_bridge_xdp_enabled": int(transport_plan.get("custom_tcp_bridge_xdp_enabled", 0) or 0),
+            "runtime_transport_contract": "custom_tcp_runtime_bridge",
+        }
     send_stats = await paced_raw_socket_sender(
         packets_buffer=tx_buffer,
         target_ip=target_ip,
@@ -617,8 +647,17 @@ async def run_l7_profile_public(profile, **kwargs):
     )
     if preflight is not None and str(preflight.get("stateful_runtime_preflight_status", "")) == "failed":
         session.close()
-        preflight.update(session.snapshot())
-        return preflight
+        reason = str(preflight.get("stateful_runtime_preflight_reason", "stateful_runtime_preflight_failed") or "stateful_runtime_preflight_failed")
+        detail = str(preflight.get("stateful_runtime_preflight_detail", "") or "")
+        fail_stats = _stateful_runtime_fail_visible_stats(
+            profile,
+            runtime_cfg,
+            reason=reason,
+            detail=detail,
+        )
+        fail_stats.update(preflight)
+        fail_stats.update(session.snapshot())
+        return fail_stats
     if not _profile_uses_custom_tcp(profile):
         try:
             result = await _run_l7_profile(profile, runtime_cfg)
@@ -1386,4 +1425,41 @@ async def quic_sender(
     live_errors=None,
     live_progress=None,
 ):
-    return _unsupported_l7_v1_stats("L7_EMU_QUIC_UNSUPPORTED", count)
+    from ._senders import l7_quic as _l7_quic
+
+    return await _l7_quic.quic_sender(
+        target_ip,
+        target_port,
+        count,
+        concurrency,
+        quic_path,
+        quic_method,
+        verbose,
+        ssl_context=ssl_context,
+        retries=retries,
+        timeout_s=timeout_s,
+        quic_verify=quic_verify,
+        l7_quic_engine=l7_quic_engine,
+        l7_quic_require_native=l7_quic_require_native,
+        l7_fallback_policy=l7_fallback_policy,
+        l7_capability_strict=l7_capability_strict,
+        lab_profile=lab_profile,
+        quic_streams_per_conn=quic_streams_per_conn,
+        quic_requests_per_conn=quic_requests_per_conn,
+        quic_conn_pool_size=quic_conn_pool_size,
+        quic_expect_status_min=quic_expect_status_min,
+        quic_expect_status_max=quic_expect_status_max,
+        quic_require_response_headers=quic_require_response_headers,
+        quic_require_response_body=quic_require_response_body,
+        quic_min_response_body_bytes=quic_min_response_body_bytes,
+        quic_expect_header_name=quic_expect_header_name,
+        quic_expect_header_value_contains=quic_expect_header_value_contains,
+        quic_expect_body_substring=quic_expect_body_substring,
+        request_plan=request_plan,
+        live_sent=live_sent,
+        live_errors=live_errors,
+        live_progress=live_progress,
+        stats_fn=_stats,
+        normalize_l7_output_fn=_normalize_l7_output,
+        update_live_fn=_update_live,
+    )

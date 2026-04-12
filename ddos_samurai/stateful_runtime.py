@@ -107,3 +107,53 @@ def open_session(config: StatefulRuntimeSessionConfig | Dict[str, Any] | None = 
             profile_sample_limit=max(0, int(raw.get("profile_sample_limit", 0) or 0)),
         )
     return StatefulRuntimeSession(session_config)
+
+
+@dataclass(frozen=True)
+class HotPathContractResult:
+    status: str
+    violation_reason: str
+    sender_path_single_required: int
+    sender_fallback_reason: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "hot_path_contract_status": str(self.status or "failed"),
+            "hot_path_contract_violation_reason": str(self.violation_reason or "unknown"),
+            "sender_path_single_required": int(self.sender_path_single_required),
+            "sender_fallback_reason": str(self.sender_fallback_reason or "none"),
+        }
+
+
+def evaluate_hot_path_contract(
+    *,
+    attack_vector: str,
+    sender_path: str,
+    sender_fallback_reason: str,
+    fallback_count: int = 0,
+    runtime_transport_backend: str = "",
+    custom_tcp_bridge_backend_used: str = "",
+) -> HotPathContractResult:
+    vec = str(attack_vector or "basic").strip().lower()
+    path = str(sender_path or "").strip().upper()
+    fallback_reason = str(sender_fallback_reason or "none").strip().lower() or "none"
+    fallback_count_i = int(fallback_count or 0)
+    rt_backend = str(runtime_transport_backend or "").strip().lower()
+    bridge_backend = str(custom_tcp_bridge_backend_used or "").strip().lower()
+
+    if path == "MIXED":
+        return HotPathContractResult("failed", "sender_path_mixed_forbidden", 1, fallback_reason)
+    if fallback_reason not in {"none", ""} or fallback_count_i > 0:
+        return HotPathContractResult("failed", "sender_fallback_forbidden", 1, fallback_reason or "unknown")
+
+    is_l7 = vec in {"http", "http2", "quic", "websocket", "slowloris", "slow-post", "slow-read"}
+    if is_l7:
+        if rt_backend != "custom_tcp":
+            return HotPathContractResult("failed", "l7_runtime_transport_must_be_custom_tcp", 1, "none")
+        if bridge_backend and bridge_backend != "xdp":
+            return HotPathContractResult("failed", "l7_custom_tcp_bridge_backend_must_be_xdp", 1, "none")
+        return HotPathContractResult("passed", "none", 1, "none")
+
+    if path and path != "DP_TX_RING":
+        return HotPathContractResult("failed", "l4_sender_path_must_be_dp_tx_ring", 1, "none")
+    return HotPathContractResult("passed", "none", 1, "none")
