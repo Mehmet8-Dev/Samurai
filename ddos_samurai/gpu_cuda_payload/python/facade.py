@@ -24,6 +24,17 @@ def _python_compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int
     header_profiles = list(spec["header_profiles"])
     body_profiles = list(spec["body_profiles"])
     max_steps = int(spec["max_steps"])
+    topology = dict(spec.get("topology") or {})
+    template_catalog = dict(spec.get("template_catalog") or {})
+    flow = dict(spec.get("flow") or {})
+    l4_templates = list(template_catalog.get("l4_templates") or [])
+    l7_templates = list(template_catalog.get("l7_templates") or [])
+    total_template_count = max(1, len(l4_templates) + len(l7_templates))
+    flow_count = max(1, int(flow.get("flow_count", 0) or n))
+    client_pool_size = max(1, int(topology.get("client_pool_size", 1) or 1))
+    server_pool_size = max(1, int(topology.get("server_pool_size", 1) or 1))
+    step_graph = list(flow.get("step_graph") or ["open", "send", "expect", "close"])
+    state_op_map = {"open": 1, "send": 2, "expect": 3, "close": 4}
     method_idx: List[int] = []
     path_idx: List[int] = []
     header_profile_idx: List[int] = []
@@ -31,6 +42,12 @@ def _python_compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int
     step_id: List[int] = []
     think_time_ms: List[int] = []
     flags: List[int] = []
+    template_id: List[int] = []
+    flow_id: List[int] = []
+    client_idx: List[int] = []
+    server_idx: List[int] = []
+    tuple_hash: List[int] = []
+    state_op: List[int] = []
     for i in range(n):
         method_idx.append(rng.randrange(len(methods)))
         path_idx.append(rng.randrange(len(paths)))
@@ -40,8 +57,19 @@ def _python_compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int
         step_id.append(step)
         think_time_ms.append(2000 + rng.randrange(5000) if step == 0 else 50 + rng.randrange(200))
         flags.append(rng.getrandbits(31))
+        tid = rng.randrange(total_template_count)
+        fid = rng.randrange(flow_count)
+        cid = rng.randrange(client_pool_size)
+        sid = rng.randrange(server_pool_size)
+        template_id.append(tid)
+        flow_id.append(fid)
+        client_idx.append(cid)
+        server_idx.append(sid)
+        tuple_hash.append(((fid * 0x9E37) ^ (cid * 0x85EB) ^ (sid * 0xC2B2) ^ rng.getrandbits(32)) & 0xFFFFFFFF)
+        step_name = str(step_graph[step % len(step_graph)]).strip().lower() if step_graph else ""
+        state_op.append(int(state_op_map.get(step_name, 0)))
     return {
-        "schema_version": 1,
+        "schema_version": int(spec.get("schema_version", 1) or 1),
         "seed": int(seed),
         "count": n,
         "method_idx": method_idx,
@@ -51,13 +79,32 @@ def _python_compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int
         "step_id": step_id,
         "think_time_ms": think_time_ms,
         "flags": flags,
+        "template_id": template_id,
+        "flow_id": flow_id,
+        "client_idx": client_idx,
+        "server_idx": server_idx,
+        "tuple_hash": tuple_hash,
+        "state_op": state_op,
         "metadata": {
             "mode": spec["mode"],
+            "schema_version": int(spec.get("schema_version", 1) or 1),
             "methods": methods,
             "paths": paths,
             "header_profiles": header_profiles,
             "body_profiles": body_profiles,
             "max_steps": max_steps,
+            "topology_enabled": bool(topology.get("enabled", False)),
+            "topology_plan_id": str(topology.get("plan_id", "") or ""),
+            "client_pool_size": client_pool_size,
+            "server_pool_size": server_pool_size,
+            "l4_templates": l4_templates,
+            "l7_templates": l7_templates,
+            "flow_count": int(flow.get("flow_count", 0) or 0),
+            "tuple_seed": int(flow.get("tuple_seed", 0) or 0),
+            "step_graph": step_graph,
+            "transport": str(flow.get("transport", "custom_tcp") or "custom_tcp"),
+            "planner_rng": "xoroshiro128plus",
+            "planner_polymorphic_http": True,
         },
     }
 
@@ -65,7 +112,15 @@ def _python_compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int
 def compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int) -> Dict[str, Any]:
     normalized = normalize_vector_spec(spec)
     if _native is not None:
-        return dict(_native.compile_vector_spec(normalized, int(seed), int(batch_size)))
+        native_out = dict(_native.compile_vector_spec(normalized, int(seed), int(batch_size)))
+        requested_schema = int(normalized.get("schema_version", 1) or 1)
+        if requested_schema >= 2:
+            required_cols = {"template_id", "flow_id", "client_idx", "server_idx", "tuple_hash", "state_op"}
+            native_schema = int(native_out.get("schema_version", 1) or 1)
+            if native_schema < 2 or not required_cols.issubset(native_out.keys()):
+                # Native module may be older than schema v2; keep runtime functional via Python fallback.
+                return _python_compile_vector_spec(normalized, int(seed), int(batch_size))
+        return native_out
     return _python_compile_vector_spec(normalized, int(seed), int(batch_size))
 
 
@@ -98,7 +153,16 @@ def plan_batch_to_h2_request_plan(plan_batch: Dict[str, Any]) -> Any:
     method_idx = list(plan_batch.get("method_idx") or [])
     path_idx = list(plan_batch.get("path_idx") or [])
     step_id = list(plan_batch.get("step_id") or [])
+    template_id = list(plan_batch.get("template_id") or [])
+    flow_id = list(plan_batch.get("flow_id") or [])
+    client_idx = list(plan_batch.get("client_idx") or [])
+    server_idx = list(plan_batch.get("server_idx") or [])
+    tuple_hash = list(plan_batch.get("tuple_hash") or [])
+    state_op = list(plan_batch.get("state_op") or [])
+    schema_version = int(plan_batch.get("schema_version", metadata.get("schema_version", 1)) or 1)
     count = int(plan_batch.get("count", 0) or 0)
+    source_tag = "gpu_cuda_payload_v2" if schema_version >= 2 else "gpu_cuda_payload_v1"
+    op_names = {0: "none", 1: "open", 2: "send", 3: "expect", 4: "close"}
 
     items: List[Any] = []
     for i in range(count):
@@ -107,8 +171,20 @@ def plan_batch_to_h2_request_plan(plan_batch: Dict[str, Any]) -> Any:
         step = int(step_id[i]) if i < len(step_id) else 0
         headers = {
             "x-gpu-vector-step": str(step),
-            "x-gpu-vector-source": "gpu_cuda_payload_v1",
+            "x-gpu-vector-source": source_tag,
         }
+        if i < len(template_id):
+            headers["x-gpu-template-id"] = str(int(template_id[i]))
+        if i < len(flow_id):
+            headers["x-gpu-flow-id"] = str(int(flow_id[i]))
+        if i < len(client_idx):
+            headers["x-gpu-client-idx"] = str(int(client_idx[i]))
+        if i < len(server_idx):
+            headers["x-gpu-server-idx"] = str(int(server_idx[i]))
+        if i < len(tuple_hash):
+            headers["x-gpu-tuple-hash"] = str(int(tuple_hash[i]))
+        if i < len(state_op):
+            headers["x-gpu-state-op"] = op_names.get(int(state_op[i]), "none")
         items.append(_PlanItem(method=str(m).upper(), path=str(p), headers=headers))
     return _Plan(items=items)
 
