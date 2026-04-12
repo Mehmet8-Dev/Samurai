@@ -705,6 +705,21 @@ class TestL7DataplaneContract(unittest.TestCase):
                 "sender_path": "XDP_L2",
             }
 
+        async def _fake_xdp_sender(**kwargs):
+            bridged_kwargs = {
+                "packets_buffer": kwargs.get("packets_buffer", b""),
+                "target_ip": kwargs.get("target_ip"),
+                "target_port": kwargs.get("target_port"),
+                "count": int(kwargs.get("count", 0) or 0),
+                "verbose": bool(kwargs.get("verbose", False)),
+                "sender_backend": "xdp",
+                "xdp_enable": True,
+                "xdp_interface": kwargs.get("interface"),
+                "xdp_queue_id": int(kwargs.get("queue_id", 0) or 0),
+                "xdp_mode": int(kwargs.get("xdp_mode", 0) or 0),
+            }
+            return await _fake_paced_raw_socket_sender(**bridged_kwargs)
+
         async def _run_smoke():
             stop_event = asyncio.Event()
             bridge_task = asyncio.create_task(
@@ -770,7 +785,11 @@ class TestL7DataplaneContract(unittest.TestCase):
                     "ddos_samurai.senders.paced_raw_socket_sender",
                     side_effect=_fake_paced_raw_socket_sender,
                 ):
-                    bridge_stats = asyncio.run(_run_smoke())
+                    with patch(
+                        "ddos_samurai.senders.xdp_sender",
+                        side_effect=_fake_xdp_sender,
+                    ):
+                        bridge_stats = asyncio.run(_run_smoke())
 
         self.assertGreaterEqual(len(calls), 2)
         self.assertTrue(all(call["sender_backend"] == "xdp" for call in calls))
