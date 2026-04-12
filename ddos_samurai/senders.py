@@ -29,6 +29,7 @@ _GATEWAY_CACHE_TTL_SEC = float(os.environ.get("SAMURAI_GATEWAY_CACHE_TTL_SEC", "
 # Internal modularization bindings (strict public API compatibility).
 from ._senders import runtime as _sender_runtime
 from ._senders import stats_core as _sender_stats_core
+from ._senders import custom_tcp_bridge as _custom_tcp_bridge
 from ._senders.buffer_norm import _normalize_packets_buffer as _normalize_packets_buffer
 # Public compat re-export: external callers import close_sender_context from facade.
 from ._senders.context import close_sender_context as close_sender_context
@@ -51,7 +52,6 @@ _resolve_loss_iface = _sender_stats_core._resolve_loss_iface
 _take_loss_snapshot = _sender_stats_core._take_loss_snapshot
 _take_loss_delta = _sender_stats_core._take_loss_delta
 _attach_loss_telemetry = _sender_stats_core._attach_loss_telemetry
-_merge_stats = _sender_stats_core._merge_stats
 
 
 def _resolve_l7_transport_backend(
@@ -354,45 +354,15 @@ def _custom_tcp_runtime_poll_snapshot(runtime_api: Any = None) -> Dict[str, Any]
 
 
 def _merge_bridge_stats(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(base or {})
-    merged.update(_merge_stats(base, extra))
-    for key, value in (base or {}).items():
-        if (
-            key.startswith("runtime_")
-            or key.startswith("l7_")
-            or key.startswith("tcp_")
-            or key.startswith("h2_")
-            or key.startswith("status_")
-            or key in {"responses_total", "l7_engine_path_used"}
-        ):
-            merged[key] = value
-    for key in ("attempted", "sent", "errors"):
-        if key in base:
-            merged[key] = base[key]
-    for key, value in (extra or {}).items():
-        if key not in merged:
-            merged[key] = value
-    for key in (
-        "custom_tcp_tx_flush_packets",
-        "custom_tcp_tx_flush_bytes",
-        "custom_tcp_bridge_backend_requested",
-        "custom_tcp_bridge_backend_used",
-        "custom_tcp_bridge_backend_match",
-        "custom_tcp_bridge_degraded",
-        "custom_tcp_bridge_fallback_reason",
-        "custom_tcp_bridge_fallback_detail",
-        "custom_tcp_bridge_xdp_interface",
-        "custom_tcp_bridge_xdp_queue_id",
-        "custom_tcp_bridge_xdp_available",
-        "custom_tcp_bridge_xdp_enabled",
-    ):
-        if key in extra:
-            merged[key] = extra[key]
-        elif key in base:
-            merged[key] = base[key]
-    for key in ("custom_tcp_tx_flush_packets", "custom_tcp_tx_flush_bytes"):
-        merged[key] = int(base.get(key, 0) or 0) + int(extra.get(key, 0) or 0)
-    return merged
+    return _custom_tcp_bridge.merge_bridge_stats(base, extra)
+
+
+def _extract_contiguous_drain_batch(value: Any) -> tuple[Any, Any, int, int, int]:
+    return _custom_tcp_bridge.extract_contiguous_drain_batch(value)
+
+
+def _extract_strided_peek_batch(value: Any) -> tuple[Any, Any, int, int, int, int]:
+    return _custom_tcp_bridge.extract_strided_peek_batch(value)
 
 
 def _resolve_custom_tcp_flush_transport(
@@ -401,55 +371,14 @@ def _resolve_custom_tcp_flush_transport(
     xdp_interface: Any = None,
     xdp_queue_id: Any = 0,
 ) -> Dict[str, Any]:
-    backend_requested = _resolve_custom_tcp_backend(requested_backend)
-    iface = str(xdp_interface or "").strip()
-    sender_backend = "txring"
-    xdp_enabled = False
-    xdp_available = 0
-    fallback_reason = "none"
-    fallback_detail = ""
-    hard_fail_required = False
-
-    if backend_requested == "af_xdp":
-        sender_backend = "xdp"
-        xdp_enabled = True
-        hard_fail_required = True
-        if not iface:
-            fallback_reason = "custom_tcp_xdp_interface_missing"
-            fallback_detail = "custom_tcp_backend=af_xdp but no xdp interface was provided"
-        elif not bool(XDP_AVAILABLE):
-            fallback_reason = "custom_tcp_xdp_module_unavailable"
-            fallback_detail = "AF_XDP sender module is unavailable"
-        else:
-            available = True
-            detail = ""
-            if callable(check_xdp_available):
-                try:
-                    available, detail = check_xdp_available()
-                except Exception as exc:
-                    available = False
-                    detail = str(exc)
-            if available:
-                xdp_available = 1
-            else:
-                fallback_reason = "custom_tcp_xdp_unavailable"
-                fallback_detail = str(detail or "AF_XDP runtime reported unavailable")
-
-    return {
-        "custom_tcp_bridge_backend_requested": backend_requested,
-        "custom_tcp_bridge_backend_used": sender_backend,
-        "custom_tcp_bridge_backend_match": int(sender_backend == ("xdp" if backend_requested == "af_xdp" else backend_requested)),
-        "custom_tcp_bridge_degraded": int(fallback_reason != "none" or sender_backend != ("xdp" if backend_requested == "af_xdp" else backend_requested)),
-        "custom_tcp_bridge_fallback_reason": fallback_reason,
-        "custom_tcp_bridge_fallback_detail": fallback_detail,
-        "custom_tcp_bridge_xdp_interface": iface,
-        "custom_tcp_bridge_xdp_queue_id": int(xdp_queue_id or 0),
-        "custom_tcp_bridge_xdp_available": int(xdp_available),
-        "custom_tcp_bridge_xdp_enabled": int(xdp_enabled),
-        "custom_tcp_bridge_hard_fail_required": int(hard_fail_required),
-        "sender_backend": sender_backend,
-        "xdp_enable": bool(xdp_enabled),
-    }
+    return _custom_tcp_bridge.resolve_custom_tcp_flush_transport(
+        requested_backend=requested_backend,
+        xdp_interface=xdp_interface,
+        xdp_queue_id=xdp_queue_id,
+        resolve_custom_tcp_backend_fn=_resolve_custom_tcp_backend,
+        xdp_available_flag=bool(XDP_AVAILABLE),
+        check_xdp_available_fn=check_xdp_available,
+    )
 
 
 async def _flush_custom_tcp_tx_packets(
@@ -467,91 +396,27 @@ async def _flush_custom_tcp_tx_packets(
     custom_tcp_xdp_mode: Any = 0,
     custom_tcp_bridge_strict: bool = True,
 ) -> Dict[str, Any]:
-    bridge = bridge_api if bridge_api is not None else custom_tcp_dataplane
-    if bridge is None:
-        return {}
-    drain_fn = getattr(bridge, "drain_custom_tcp_tx_packets", None)
-    if drain_fn is None:
-        drain_fn = getattr(bridge, "drain_tcp_tx_packets", None)
-    if drain_fn is None:
-        return {}
-    try:
-        drained = drain_fn()
-    except Exception:
-        return {}
-    if not drained:
-        return {}
-
-    packet_count = len(drained)
-    packet_size = len(drained[0]) if packet_count > 0 else 0
-    if packet_count <= 0 or packet_size <= 0:
-        return {}
-
-    target_ip = str(getattr(profile.connection_template, "target_ip", "") or "")
-    target_port = int(getattr(profile.connection_template, "target_port", 0) or 0)
-    tx_buffer = b"".join(bytes(pkt) for pkt in drained)
-    xdp_interface = str(custom_tcp_xdp_interface or "").strip()
-    transport_plan = _resolve_custom_tcp_flush_transport(
-        requested_backend=custom_tcp_backend,
-        xdp_interface=xdp_interface,
-        xdp_queue_id=custom_tcp_xdp_queue_id,
-    )
-    if int(transport_plan.get("custom_tcp_bridge_hard_fail_required", 0) or 0) == 1 and int(
-        transport_plan.get("custom_tcp_bridge_degraded", 0) or 0
-    ) == 1:
-        if not bool(custom_tcp_bridge_strict):
-            transport_plan = dict(transport_plan)
-            transport_plan["sender_backend"] = "txring"
-            transport_plan["xdp_enable"] = False
-            transport_plan["custom_tcp_bridge_backend_used"] = "txring"
-            transport_plan["custom_tcp_bridge_xdp_enabled"] = 0
-            transport_plan["custom_tcp_bridge_backend_match"] = 0
-        else:
-            reason = str(transport_plan.get("custom_tcp_bridge_fallback_reason", "custom_tcp_bridge_unavailable") or "custom_tcp_bridge_unavailable")
-            detail = str(transport_plan.get("custom_tcp_bridge_fallback_detail", "") or "custom_tcp bridge strict transport preflight failed")
-            return {
-                "attempted": int(packet_count),
-                "sent": 0,
-                "errors": int(packet_count),
-                "sender_fallback_reason": reason,
-                "custom_tcp_tx_flush_packets": int(packet_count),
-                "custom_tcp_tx_flush_bytes": int(len(tx_buffer)),
-                "custom_tcp_bridge_fallback_reason": reason,
-                "custom_tcp_bridge_fallback_detail": detail,
-                "custom_tcp_bridge_degraded": 1,
-                "custom_tcp_bridge_backend_requested": transport_plan.get("custom_tcp_bridge_backend_requested", "af_xdp"),
-                "custom_tcp_bridge_backend_used": transport_plan.get("custom_tcp_bridge_backend_used", "xdp"),
-                "custom_tcp_bridge_backend_match": 0,
-                "custom_tcp_bridge_xdp_interface": transport_plan.get("custom_tcp_bridge_xdp_interface", ""),
-                "custom_tcp_bridge_xdp_queue_id": int(transport_plan.get("custom_tcp_bridge_xdp_queue_id", 0) or 0),
-                "custom_tcp_bridge_xdp_available": int(transport_plan.get("custom_tcp_bridge_xdp_available", 0) or 0),
-                "custom_tcp_bridge_xdp_enabled": int(transport_plan.get("custom_tcp_bridge_xdp_enabled", 0) or 0),
-                "runtime_transport_contract": "custom_tcp_runtime_bridge",
-            }
-    send_stats = await paced_raw_socket_sender(
-        packets_buffer=tx_buffer,
-        target_ip=target_ip,
-        target_port=target_port,
-        count=packet_count,
+    return await _custom_tcp_bridge.flush_custom_tcp_tx_packets(
+        profile=profile,
         verbose=verbose,
         pacing_config=pacing_config,
+        bridge_api=bridge_api,
+        default_bridge_api=custom_tcp_dataplane,
         live_sent=live_sent,
         live_errors=live_errors,
         live_progress=live_progress,
-        sender_backend=transport_plan["sender_backend"],
-        xdp_enable=bool(transport_plan["xdp_enable"]),
-        xdp_interface=xdp_interface if bool(transport_plan["xdp_enable"]) else None,
-        xdp_queue_id=int(custom_tcp_xdp_queue_id or 0),
-        xdp_mode=int(custom_tcp_xdp_mode or 0),
+        custom_tcp_backend=custom_tcp_backend,
+        custom_tcp_xdp_interface=custom_tcp_xdp_interface,
+        custom_tcp_xdp_queue_id=custom_tcp_xdp_queue_id,
+        custom_tcp_xdp_mode=custom_tcp_xdp_mode,
+        custom_tcp_bridge_strict=custom_tcp_bridge_strict,
+        resolve_transport_fn=_resolve_custom_tcp_flush_transport,
+        paced_raw_socket_sender_fn=paced_raw_socket_sender,
+        xdp_sender_fn=xdp_sender,
+        update_live_fn=_update_live,
+        paced_send_xdp_fn=paced_send_xdp,
+        pacing_engine_available=bool(PACING_ENGINE_AVAILABLE),
     )
-    send_stats = dict(send_stats or {})
-    send_stats.setdefault("custom_tcp_tx_flush_packets", packet_count)
-    send_stats.setdefault("custom_tcp_tx_flush_bytes", len(tx_buffer))
-    for key, value in transport_plan.items():
-        if key in {"sender_backend", "xdp_enable"}:
-            continue
-        send_stats.setdefault(key, value)
-    return send_stats
 
 
 async def _service_custom_tcp_runtime(
@@ -568,62 +433,22 @@ async def _service_custom_tcp_runtime(
     custom_tcp_xdp_queue_id: Any = 0,
     custom_tcp_xdp_mode: Any = 0,
 ) -> Dict[str, Any]:
-    aggregate: Dict[str, Any] = {}
-    service_loops = 0
-    while not stop_event.is_set():
-        service_loops += 1
-        polled = _custom_tcp_runtime_poll_snapshot(custom_tcp_dataplane)
-        if polled:
-            polled.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
-            polled.setdefault("runtime_transport_contract", "custom_tcp_runtime_bridge")
-            aggregate = _merge_bridge_stats(aggregate, polled)
-        flushed = await _flush_custom_tcp_tx_packets(
-            profile=profile,
-            verbose=verbose,
-            pacing_config=None,
-            bridge_api=bridge_api,
-            live_sent=live_sent,
-            live_errors=live_errors,
-            live_progress=live_progress,
-            custom_tcp_backend=custom_tcp_backend,
-            custom_tcp_xdp_interface=custom_tcp_xdp_interface,
-            custom_tcp_xdp_queue_id=custom_tcp_xdp_queue_id,
-            custom_tcp_xdp_mode=custom_tcp_xdp_mode,
-        )
-        if flushed:
-            flushed.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
-            flushed.setdefault("runtime_transport_contract", "custom_tcp_runtime_bridge")
-            aggregate = _merge_bridge_stats(aggregate, flushed)
-            continue
-        await asyncio.sleep(0.001)
-
-    for _ in range(8):
-        service_loops += 1
-        polled = _custom_tcp_runtime_poll_snapshot(custom_tcp_dataplane)
-        if polled:
-            polled.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
-            polled.setdefault("runtime_transport_contract", "custom_tcp_runtime_bridge")
-            aggregate = _merge_bridge_stats(aggregate, polled)
-        flushed = await _flush_custom_tcp_tx_packets(
-            profile=profile,
-            verbose=verbose,
-            pacing_config=None,
-            bridge_api=bridge_api,
-            live_sent=live_sent,
-            live_errors=live_errors,
-            live_progress=live_progress,
-            custom_tcp_backend=custom_tcp_backend,
-            custom_tcp_xdp_interface=custom_tcp_xdp_interface,
-            custom_tcp_xdp_queue_id=custom_tcp_xdp_queue_id,
-            custom_tcp_xdp_mode=custom_tcp_xdp_mode,
-        )
-        if not flushed:
-            break
-        flushed.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
-        flushed.setdefault("runtime_transport_contract", "custom_tcp_runtime_bridge")
-        aggregate = _merge_bridge_stats(aggregate, flushed)
-    aggregate["runtime_transport_service_loops"] = int(service_loops)
-    return aggregate
+    return await _custom_tcp_bridge.service_custom_tcp_runtime(
+        stop_event,
+        profile=profile,
+        verbose=verbose,
+        bridge_api=bridge_api,
+        default_bridge_api=custom_tcp_dataplane,
+        live_sent=live_sent,
+        live_errors=live_errors,
+        live_progress=live_progress,
+        custom_tcp_backend=custom_tcp_backend,
+        custom_tcp_xdp_interface=custom_tcp_xdp_interface,
+        custom_tcp_xdp_queue_id=custom_tcp_xdp_queue_id,
+        custom_tcp_xdp_mode=custom_tcp_xdp_mode,
+        runtime_poll_snapshot_fn=_custom_tcp_runtime_poll_snapshot,
+        flush_fn=_flush_custom_tcp_tx_packets,
+    )
 
 
 def compile_l7_profile_public(**kwargs):
@@ -888,6 +713,8 @@ async def xdp_sender(
     sender_context: Dict[str, Any] | None = None,
     pacing_config=None,
     paced_send_xdp_fn=None,
+    packet_size_override: int | None = None,
+    packet_stride: int = 0,
 ) -> dict:
     from ._senders import l2l3_entry as _l2l3_entry
 
@@ -906,6 +733,8 @@ async def xdp_sender(
         sender_context=sender_context,
         pacing_config=pacing_config,
         paced_send_xdp_fn=paced_send_xdp_fn,
+        packet_size_override=packet_size_override,
+        packet_stride=packet_stride,
         resolve_sender_fallback_policy_fn=_resolve_sender_fallback_policy,
         resolve_sender_backend_fn=_resolve_sender_backend,
         raw_socket_sender_fn=raw_socket_sender,

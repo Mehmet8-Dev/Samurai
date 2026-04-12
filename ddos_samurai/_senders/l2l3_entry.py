@@ -76,6 +76,8 @@ async def xdp_sender(
     sender_context: Dict[str, Any] | None = None,
     pacing_config=None,
     paced_send_xdp_fn=None,
+    packet_size_override: int | None = None,
+    packet_stride: int = 0,
     *,
     resolve_sender_fallback_policy_fn,
     resolve_sender_backend_fn,
@@ -140,7 +142,9 @@ async def xdp_sender(
     if not available:
         return await _fallback(reason="xdp_unavailable", details=f"Not available: {msg}")
 
-    packet_size = len(packets_buffer) // count if count > 0 else 0
+    packet_size = int(packet_size_override or 0)
+    if packet_size <= 0:
+        packet_size = len(packets_buffer) // count if count > 0 else 0
     if packet_size == 0:
         log_error("[XDP] Invalid packet buffer")
         return stats_fn(
@@ -152,9 +156,13 @@ async def xdp_sender(
             sender_backend_requested="xdp",
             sender_fallback_policy=fallback_policy,
         )
+    packet_stride = int(packet_stride or 0)
+    if packet_stride > 0 and packet_stride < packet_size:
+        packet_stride = packet_size
+    required_bytes = (packet_stride * count) if packet_stride > 0 else (packet_size * count)
     packets_buffer, normalize_meta = normalize_packets_buffer_fn(
         packets_buffer,
-        required_bytes=packet_size * count,
+        required_bytes=required_bytes,
         pool_key="senders_xdp_tx",
         return_meta=True,
     )
@@ -271,6 +279,7 @@ async def xdp_sender(
             pacing_config is not None
             and int(getattr(pacing_config, "pacing_mode", 0) or 0) != 0
             and callable(paced_send_xdp_fn)
+            and packet_stride <= 0
         )
 
         if sender.is_using_xdp and pacing_active:
@@ -298,7 +307,10 @@ async def xdp_sender(
             total_sent = int(sent or 0)
             sender_path = "PACED_XDP"
         elif hasattr(sender, "send_buffer"):
-            sent = sender.send_buffer(packets_buffer, packet_size, count)
+            if packet_stride > 0 and hasattr(sender, "send_buffer_strided"):
+                sent = sender.send_buffer_strided(packets_buffer, packet_size, packet_stride, count)
+            else:
+                sent = sender.send_buffer(packets_buffer, packet_size, count)
             total_sent = int(sent or 0)
         else:
             mv = memoryview(packets_buffer)
@@ -308,7 +320,7 @@ async def xdp_sender(
                 batch_end = min(batch_start + batch_size, count)
                 batch_views = []
                 for i in range(batch_start, batch_end):
-                    start = i * packet_size
+                    start = i * (packet_stride if packet_stride > 0 else packet_size)
                     end = start + packet_size
                     batch_views.append(mv[start:end])
 
