@@ -59,6 +59,8 @@ struct RuntimeConfig {
 struct RuntimeCapabilities {
   bool openssl{false};
   bool nghttp2{false};
+  bool ngtcp2{false};
+  bool nghttp3{false};
 };
 
 enum class ReactorBackend {
@@ -157,5 +159,13 @@ struct ShardState {
 
 RuntimeCapabilities detect_capabilities();
 std::map<std::string, double> run_profile(const Profile& profile, const RuntimeConfig& cfg);
+
+namespace custom_quic_stack {
+std::map<std::string, double> run_quic_profile(
+    const Profile& profile,
+    const RuntimeConfig& cfg,
+    const RuntimeCapabilities& caps,
+    TransportBackend transport_backend);
+}  // namespace custom_quic_stack
 
 }  // namespace ddos_samurai::l7_emu_native

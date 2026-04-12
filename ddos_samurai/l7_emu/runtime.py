@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover
 
 def _unavailable_stats(profile: L7EmuProfile) -> Dict[str, Any]:
     attempted = int(profile.flow_attempted)
-    return {
+    out = {
         "attempted": attempted,
         "sent": 0,
         "errors": attempted,
@@ -68,6 +68,27 @@ def _unavailable_stats(profile: L7EmuProfile) -> Dict[str, Any]:
         "h2_replace_after_idle_decisions": 0,
         "h2_stream_pool_reuse_hits": 0,
     }
+    if str(profile.protocol or "").strip().lower() == "quic":
+        out.update(
+            {
+                "sender_path": "L7_QUIC_CUSTOM",
+                "sender_fallback_reason": "quic_capability_unavailable",
+                "l7_engine_path_used": "L7_QUIC_CUSTOM",
+                "l7_fallback_reason": "quic_capability_unavailable",
+                "quic_stack_mode": "unavailable",
+                "quic_capability_available": 0,
+                "quic_conn_pool_size": max(1, int(getattr(profile.connection_template, "max_connections", 1) or 1)),
+                "quic_connection_attempts": attempted,
+                "quic_connection_success": 0,
+                "quic_requests_sent": attempted,
+                "quic_responses_received": 0,
+                "quic_timeouts": attempted,
+                "quic_errors": attempted,
+                "quic_handshake_success_ratio": 0.0,
+                "quic_alpn_h3_ratio": 0.0,
+            }
+        )
+    return out
 
 
 async def run_l7_profile(

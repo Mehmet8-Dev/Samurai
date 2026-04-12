@@ -213,7 +213,7 @@ def compile_l7_profile(
     max_streams_per_connection: int = 1,
 ) -> L7EmuProfile:
     proto = str(protocol or "").strip().lower()
-    if proto not in {"http1", "http2"}:
+    if proto not in {"http1", "http2", "quic"}:
         raise ValueError(f"unsupported L7 emulation protocol: {protocol!r}")
     runtime_backend_explicit = stateful_runtime_backend is not None and str(stateful_runtime_backend).strip() != ""
     runtime_backend = str(stateful_runtime_backend or "afxdp").strip().lower()
@@ -224,13 +224,32 @@ def compile_l7_profile(
         backend = "custom_tcp"
     if backend not in {"kernel_socket", "custom_tcp"}:
         raise ValueError(f"unsupported L7 transport backend: {transport_backend!r}")
+    alpn_values: List[str] = []
+    if profile_data and "alpn" in profile_data:
+        raw_alpn = profile_data.get("alpn")
+        if isinstance(raw_alpn, str):
+            alpn_values = [str(raw_alpn).strip().lower()]
+        else:
+            alpn_values = [str(x or "").strip().lower() for x in list(raw_alpn or [])]
+        alpn_values = [x for x in alpn_values if x]
     paths = _coerce_paths(http_path)
     method = str(http_method or "GET").upper()
+    scheme_norm = str((profile_data or {}).get("scheme", scheme) or scheme).strip().lower()
     if str(template_mode or "compat").strip().lower() == "profile":
         if not profile_data:
             raise ValueError("profile mode requires profile_data")
         flow_program = _build_profile_program(profile_data)
-        sender_path = "L7_EMU_HTTP1" if proto == "http1" else "L7_EMU_H2"
+        if proto == "http1":
+            sender_path = "L7_EMU_HTTP1"
+        elif proto == "http2":
+            sender_path = "L7_EMU_H2"
+        else:
+            if scheme_norm not in {"https", "quic"}:
+                raise ValueError("quic protocol requires scheme 'https' or 'quic'")
+            effective_alpn = tuple(dict.fromkeys(alpn_values or ["h3"]))
+            if "h3" not in effective_alpn:
+                raise ValueError("quic protocol requires ALPN to include 'h3' for minimal HTTP/3")
+            sender_path = "L7_QUIC_CUSTOM"
         flow_attempted = _flow_attempted(flow_program)
         max_streams = 1 if proto == "http1" else max(1, int(max_streams_per_connection or concurrency or 1))
     elif proto == "http1":
@@ -243,13 +262,27 @@ def compile_l7_profile(
         sender_path = "L7_EMU_HTTP1"
         flow_attempted = _flow_attempted(flow_program)
         max_streams = 1
-    else:
+    elif proto == "http2":
         flow_program = _build_http2_compat_program(
             http_method=method,
             http_paths=paths,
             request_plan=request_plan,
         )
         sender_path = "L7_EMU_H2"
+        flow_attempted = _flow_attempted(flow_program)
+        max_streams = max(1, int(max_streams_per_connection or concurrency or 1))
+    else:
+        if scheme_norm not in {"https", "quic"}:
+            raise ValueError("quic protocol requires scheme 'https' or 'quic'")
+        effective_alpn = tuple(dict.fromkeys(alpn_values or ["h3"]))
+        if "h3" not in effective_alpn:
+            raise ValueError("quic protocol requires ALPN to include 'h3' for minimal HTTP/3")
+        flow_program = _build_http2_compat_program(
+            http_method=method,
+            http_paths=paths,
+            request_plan=request_plan,
+        )
+        sender_path = "L7_QUIC_CUSTOM"
         flow_attempted = _flow_attempted(flow_program)
         max_streams = max(1, int(max_streams_per_connection or concurrency or 1))
     conn_template = ConnectionTemplate(
@@ -269,6 +302,8 @@ def compile_l7_profile(
         session_repeats=max(1, int(session_repeats or 1)),
         keepalive=True,
         timeout_ms=max(1, int(float(timeout_s or 5.0) * 1000.0)),
+        alpn=tuple(dict.fromkeys(alpn_values or (["h3"] if proto == "quic" else []))),
+        quic_minimal_http3=bool(proto == "quic"),
     )
     return L7EmuProfile(
         protocol=proto,

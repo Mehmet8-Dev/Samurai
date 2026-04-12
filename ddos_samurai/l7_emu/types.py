@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class FlowOpcode(str, Enum):
@@ -91,6 +91,8 @@ class ConnectionTemplate:
     session_repeats: int = 1
     keepalive: bool = True
     timeout_ms: int = 5000
+    alpn: Tuple[str, ...] = field(default_factory=tuple)
+    quic_minimal_http3: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -110,6 +112,8 @@ class ConnectionTemplate:
             "session_repeats": int(self.session_repeats),
             "keepalive": int(bool(self.keepalive)),
             "timeout_ms": int(self.timeout_ms),
+            "alpn": [str(x) for x in tuple(self.alpn or ())],
+            "quic_minimal_http3": int(bool(self.quic_minimal_http3)),
         }
 
 
