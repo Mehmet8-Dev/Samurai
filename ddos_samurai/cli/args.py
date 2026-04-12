@@ -157,13 +157,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sender-backend",
         choices=["auto", "txring", "c_ext_l3", "python", "xdp"],
-        default="auto",
+        default="txring",
         help="Raw sender backend seçimi: auto|txring|c_ext_l3|python|xdp.",
     )
     parser.add_argument(
         "--sender-fallback-policy",
         choices=["allow", "fail"],
-        default="allow",
+        default="fail",
         help="Backend fallback politikası: allow=alt yola düş, fail=run'ı fail-visible bitir.",
     )
     _stateful_runtime_backend_env = str(
@@ -180,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     _dp_mode_env_default = _normalize_dataplane_core_mode(
         os.environ.get(
             "SAMURAI_DATAPLANE_CORE_MODE",
-            "auto" if _env_flag("SAMURAI_DATAPLANE_CORE_ENABLE", "0") else "off",
+            "required",
         )
     )
     parser.add_argument(
@@ -393,8 +393,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--custom-tcp-mode",
         choices=["off", "auto", "required"],
-        default=str(os.environ.get("SAMURAI_CUSTOM_TCP_MODE", "off") or "off"),
+        default=str(os.environ.get("SAMURAI_CUSTOM_TCP_MODE", "required") or "required"),
         help="Custom TCP dataplane modu: off|auto|required.",
+    )
+    parser.add_argument(
+        "--topo-spec-json",
+        type=str,
+        default="",
+        help="ASTF-benzeri topology JSON tanımı (CLI-only).",
+    )
+    parser.add_argument(
+        "--topo-seed",
+        type=int,
+        default=-1,
+        help="Topology tuple üretimi için deterministik seed (topology açıkken zorunlu).",
+    )
+    parser.add_argument(
+        "--topo-strict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Topology schema/semantic strict validation (varsayılan: açık).",
     )
     parser.add_argument(
         "--custom-tcp-backend",
@@ -459,7 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--l7-quic-require-native",
         action="store_true",
         default=str(os.environ.get("SAMURAI_L7_QUIC_REQUIRE_NATIVE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
-        help="QUIC için yalnızca native C h3_stateful modunu kabul et (py-bridge kabul edilmez).",
+        help="QUIC için yalnızca native C custom_native modunu kabul et (py-bridge kabul edilmez).",
     )
     parser.add_argument(
         "--l7-quic-auto-bridge",
@@ -471,7 +489,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--l7-quic-bridge-autopromote",
         action="store_true",
         default=str(os.environ.get("SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
-        help="Capability map içinde py-bridge'i otomatik h3_stateful olarak terfi ettir.",
+        help="Capability map içinde py-bridge'i otomatik custom_native olarak terfi ettir.",
     )
     parser.add_argument(
         "--l7-fallback-policy",

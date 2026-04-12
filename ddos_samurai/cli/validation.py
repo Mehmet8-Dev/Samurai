@@ -7,6 +7,7 @@ import os
 
 from .. import utils
 from ..profile_names import PROFILE_NONE
+from ..topology_native import parse_compile_topology_spec, topology_tuple_preview
 from .helpers import _normalize_afpacket_hugepage_mode, _normalize_dataplane_core_mode
 def _validate_pacing_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     mode = str(getattr(args, "pacing_mode", "none") or "none").strip().lower()
@@ -83,6 +84,10 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
     l7_quic_bridge_autopromote = bool(getattr(args, "l7_quic_bridge_autopromote", False))
     attack_vector = str(getattr(args, "attack_vector", "basic") or "basic").strip().lower()
     l7_template_mode = str(getattr(args, "l7_template_mode", "compat") or "compat").strip().lower()
+    runtime_backend = str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower()
+    topo_spec_json = str(getattr(args, "topo_spec_json", "") or "").strip()
+    topo_seed = int(getattr(args, "topo_seed", -1) or -1)
+    topo_strict = bool(getattr(args, "topo_strict", True))
 
     if int(getattr(args, "xdp_queue_id", 0) or 0) < 0:
         parser.error("Hata: --xdp-queue-id >= 0 olmalıdır.")
@@ -155,8 +160,50 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
             parser.error(f"Hata: --dp-queue-map formatı geçersiz: {exc}")
     if l7_template_mode not in {"compat", "profile"}:
         parser.error("Hata: --l7-template-mode compat veya profile olmalıdır.")
-    if attack_vector in {"websocket", "quic"}:
-        parser.error("Hata: unsupported_in_l7_emu_v1 - V1 yalnızca HTTP/1.1 ve HTTP/2 destekler.")
+    if runtime_backend == "dpdk" and bool(getattr(args, "l7_capability_strict", False)):
+        parser.error(
+            "Hata: stateful-runtime-backend=dpdk strict modda not_implemented_hard_fail (sessiz fallback yok)."
+        )
+    if topo_spec_json:
+        if topo_seed < 0:
+            parser.error("Hata: --topo-spec-json ile birlikte --topo-seed zorunludur (>=0).")
+        spoof_enabled = bool(getattr(args, "spoof", False)) or bool(getattr(args, "realistic_spoof", False))
+        spoof_mode = str(getattr(args, "spoof_mode", "realistic") or "realistic").strip().lower()
+        spoof_subnet = str(getattr(args, "spoof_subnet", "") or "").strip()
+        spoof_list = str(getattr(args, "spoof_list_file", "") or "").strip()
+        spoof_ip = str(getattr(args, "spoof_ip", "") or "").strip()
+        if spoof_enabled or spoof_subnet or spoof_list or spoof_ip or spoof_mode != "realistic":
+            parser.error("Hata: topology aktifken legacy spoofing argümanları (--spoof*) kullanılamaz.")
+        try:
+            compiled_topology = parse_compile_topology_spec(
+                topo_spec_json=topo_spec_json,
+                topo_seed=topo_seed,
+                topo_strict=topo_strict,
+            )
+        except Exception as exc:
+            parser.error(f"Hata: topology spec geçersiz: {exc}")
+        args.topology_enabled = True
+        args.topology_plan_id = str(compiled_topology.plan_id)
+        args.topology_seed = int(compiled_topology.seed)
+        args.topology_client_pool_size = int(compiled_topology.client_pool_size)
+        args.topology_server_pool_size = int(compiled_topology.server_pool_size)
+        args.topology_tuple_alloc_fail = 0
+        args.topology_compiled_plan_json = json.dumps(compiled_topology.as_dict(), sort_keys=True)
+        args.topology_tuple_preview_json = json.dumps(
+            topology_tuple_preview(compiled_topology, sample_size=8),
+            sort_keys=True,
+        )
+    else:
+        args.topology_enabled = False
+        args.topology_plan_id = ""
+        args.topology_seed = -1
+        args.topology_client_pool_size = 0
+        args.topology_server_pool_size = 0
+        args.topology_tuple_alloc_fail = 0
+        args.topology_compiled_plan_json = ""
+        args.topology_tuple_preview_json = "[]"
+    if attack_vector == "websocket":
+        parser.error("Hata: unsupported_in_l7_emu_v1 - V1 WebSocket desteği henüz etkin değil.")
     if (
         bool(getattr(args, "kpi_hard_fail", False))
         and str(getattr(args, "kpi_gate_profile", "off") or "off") == "off"
@@ -348,7 +395,7 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
                 )
     if runtime_backend == "dpdk":
         parser.error(
-            "Hata: stateful-runtime-backend=dpdk strict modda henüz desteklenmiyor (fail-visible)."
+            "Hata: stateful-runtime-backend=dpdk strict modda not_implemented_hard_fail."
         )
 
 
