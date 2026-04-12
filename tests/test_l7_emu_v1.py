@@ -111,6 +111,42 @@ class TestL7EmuV1(unittest.TestCase):
         send_ops = [op for op in profile.flow_program.ops if op.opcode.value == "SEND_HEADERS"]
         self.assertEqual([op.path for op in send_ops], ["/login", "/submit"])
 
+    def test_compile_quic_profile_requires_https_or_quic_scheme(self):
+        with self.assertRaises(ValueError):
+            senders.compile_l7_profile(
+                protocol="quic",
+                target_ip="127.0.0.1",
+                target_port=443,
+                scheme="http",
+                http_method="GET",
+                http_path=["/"],
+                payloads=[],
+                concurrency=1,
+            )
+
+    def test_compile_quic_profile_requires_h3_alpn(self):
+        with self.assertRaises(ValueError):
+            senders.compile_l7_profile(
+                protocol="quic",
+                target_ip="127.0.0.1",
+                target_port=443,
+                scheme="https",
+                template_mode="profile",
+                profile_data={
+                    "scheme": "https",
+                    "alpn": ["h2"],
+                    "ops": [
+                        {"opcode": "CONNECT"},
+                        {"opcode": "SEND_HEADERS", "method": "GET", "path": "/"},
+                        {"opcode": "CLOSE"},
+                    ],
+                },
+                http_method="GET",
+                http_path=["/"],
+                payloads=[],
+                concurrency=1,
+            )
+
     def test_compile_profile_mode_unrolls_loop_and_preserves_expectations(self):
         profile = senders.compile_l7_profile(
             protocol="http1",
@@ -347,21 +383,30 @@ class TestL7EmuV1(unittest.TestCase):
         self.assertLess(float(result["l7_alloc_count"]), float(len(paths) * 3))
         self.assertLess(float(result["l7_alloc_bytes"]), 262144.0)
 
-    def test_ws_and_quic_fail_fast(self):
+    def test_ws_fail_fast_and_quic_is_runtime_path(self):
         ws = asyncio.run(senders.websocket_sender("127.0.0.1", 80, 2, 1, "/", "ping", False))
         quic = asyncio.run(senders.quic_sender("127.0.0.1", 443, 2, 1, "/", "GET", False))
         self.assertEqual(ws["sender_fallback_reason"], "unsupported_in_l7_emu_v1")
-        self.assertEqual(quic["sender_fallback_reason"], "unsupported_in_l7_emu_v1")
         self.assertEqual(ws["errors"], 2)
-        self.assertEqual(quic["errors"], 2)
+        self.assertEqual(quic["attempted"], 2)
+        self.assertEqual(quic.get("sender_path", ""), "L7_QUIC_CUSTOM")
+        self.assertEqual(quic.get("l7_engine_path_used", ""), "L7_QUIC_CUSTOM")
+        self.assertIn("quic_stack_mode", quic)
 
-    def test_cli_rejects_ws_and_quic_for_v1(self):
+    def test_cli_rejects_websocket_for_v1(self):
         parser = build_parser()
         with self.assertRaises(SystemExit):
             args = parser.parse_args(["--attack-vector", "websocket"])
             from ddos_samurai.cli.validation import _validate_sender_route_args
 
             _validate_sender_route_args(parser, args)
+
+    def test_cli_allows_quic_for_custom_stack(self):
+        parser = build_parser()
+        args = parser.parse_args(["--attack-vector", "quic"])
+        from ddos_samurai.cli.validation import _validate_sender_route_args
+
+        _validate_sender_route_args(parser, args)
 
     @unittest.skipUnless(
         _sandbox_allows_sockets() and _live_l7_socket_tests_enabled(),

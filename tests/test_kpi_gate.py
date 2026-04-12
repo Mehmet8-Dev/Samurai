@@ -65,7 +65,7 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
                 "quic_stream_fail_ratio": 0.0,
                 "quic_handshake_fail_ratio": 0.0,
                 "quic_response_validation_fail_ratio": 0.0,
-                "quic_stack_mode": "h3_stateful",
+                "quic_stack_mode": "custom_native",
             }
         )
         out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)

@@ -164,14 +164,18 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--traffic-model-dataset-capture", opts)
         self.assertIn("--traffic-model-pcap-profile", opts)
         self.assertIn("--traffic-model-dry-validate", opts)
+        self.assertIn("--topo-spec-json", opts)
+        self.assertIn("--topo-seed", opts)
+        self.assertIn("--topo-strict", opts)
+        self.assertIn("--no-topo-strict", opts)
 
     def test_sender_route_defaults(self):
         parser = cli.build_parser()
         args = parser.parse_args([])
-        self.assertEqual(args.sender_backend, "auto")
-        self.assertEqual(args.sender_fallback_policy, "allow")
+        self.assertEqual(args.sender_backend, "txring")
+        self.assertEqual(args.sender_fallback_policy, "fail")
         self.assertEqual(args.stateful_runtime_backend, "afxdp")
-        self.assertEqual(args.dataplane_core_mode, "off")
+        self.assertEqual(args.dataplane_core_mode, "required")
         self.assertEqual(args.afpacket_hugepage_mode, "off")
         self.assertEqual(args.afpacket_hugepage_size_kb, 2048)
         self.assertEqual(args.afpacket_ring_target_mb, 64)
@@ -192,6 +196,9 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.xdp_interface, "")
         self.assertEqual(args.xdp_queue_id, 0)
         self.assertEqual(args.xdp_mode, 0)
+        self.assertEqual(args.topo_spec_json, "")
+        self.assertEqual(args.topo_seed, -1)
+        self.assertTrue(args.topo_strict)
         self.assertEqual(args.kpi_gate_profile, "off")
         self.assertFalse(args.kpi_hard_fail)
         self.assertEqual(args.l7_engine, "python")
@@ -439,10 +446,10 @@ class TestSenderRouteValidation(unittest.TestCase):
         args = parser.parse_args(["--afpacket-busy-poll-us", "-1", "--sender-backend", "txring"])
         self._assert_validation_fails(parser, args)
 
-    def test_dataplane_required_requires_fail_policy(self):
+    def test_dataplane_required_with_default_fail_policy_is_valid(self):
         parser = cli.build_parser()
         args = parser.parse_args(["--dataplane-core-mode", "required"])
-        self._assert_validation_fails(parser, args)
+        cli._validate_sender_route_args(parser, args)
 
     def test_dp_queue_map_requires_map_spec(self):
         parser = cli.build_parser()

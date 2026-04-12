@@ -280,7 +280,7 @@ class TestL7DataplaneContract(unittest.TestCase):
         self.assertEqual(out["stateful_runtime_reason"], "custom_tcp_xdp_interface_missing")
         self.assertEqual(out["stateful_runtime_preflight_status"], "failed")
         self.assertEqual(out["stateful_runtime_preflight_reason"], "custom_tcp_xdp_interface_missing")
-        self.assertEqual(out["stateful_runtime_preflight_xdp_enabled"], 0)
+        self.assertEqual(out["stateful_runtime_preflight_xdp_enabled"], 1)
 
     def test_strict_dpdk_runtime_fails_visible_until_backend_exists(self):
         profile = senders.compile_l7_profile(
@@ -310,7 +310,7 @@ class TestL7DataplaneContract(unittest.TestCase):
         self.assertEqual(out["runtime_backend"], "dpdk")
         self.assertEqual(out["legacy_path_used"], 0)
         self.assertEqual(out["stateful_runtime_status"], "unavailable")
-        self.assertEqual(out["stateful_runtime_reason"], "stateful_runtime_dpdk_unavailable")
+        self.assertEqual(out["stateful_runtime_reason"], "not_implemented_hard_fail")
         self.assertEqual(out["stateful_runtime_preflight_status"], "failed")
 
     def test_custom_tcp_transport_fails_visible_until_wired(self):
@@ -571,14 +571,13 @@ class TestL7DataplaneContract(unittest.TestCase):
                         )
                     )
 
-        self.assertEqual(captured["sender_backend"], "txring")
-        self.assertFalse(bool(captured["xdp_enable"]))
+        self.assertEqual(captured, {})
         self.assertEqual(out["custom_tcp_bridge_backend_requested"], "af_xdp")
-        self.assertEqual(out["custom_tcp_bridge_backend_used"], "txring")
+        self.assertEqual(out["custom_tcp_bridge_backend_used"], "xdp")
         self.assertEqual(out["custom_tcp_bridge_backend_match"], 0)
         self.assertEqual(out["custom_tcp_bridge_degraded"], 1)
         self.assertEqual(out["custom_tcp_bridge_fallback_reason"], "custom_tcp_xdp_interface_missing")
-        self.assertEqual(out["custom_tcp_bridge_xdp_enabled"], 0)
+        self.assertEqual(out["custom_tcp_bridge_xdp_enabled"], 1)
         self.assertEqual(out["stateful_runtime_preflight_status"], "skipped")
 
     def test_public_sender_facade_uses_xdp_bridge_when_capability_is_available(self):

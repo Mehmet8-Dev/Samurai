@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 import os
+import json
 
 from ddos_samurai import orchestrator
 
@@ -66,7 +67,68 @@ def _base_args():
         "h2_profile": "none",
         "stateful": False,
         "source_port": 0,
+        "topology_enabled": False,
+        "topology_compiled_plan_json": "",
+        "topology_tuple_alloc_fail": 0,
     }
+
+
+def _topology_args(seed: int = 99):
+    spec = {
+        "clients": [
+            {
+                "name": "cg",
+                "ip_ranges": {"v4": ["10.0.0.8/30"]},
+                "port_ranges": ["20000-20003"],
+                "dist": "seq",
+            }
+        ],
+        "servers": [
+            {
+                "name": "sg",
+                "ip_ranges": {"v4": ["198.51.100.7/32"]},
+                "ports": [8080],
+                "weight": 1,
+            }
+        ],
+        "templates": [
+            {
+                "name": "tmpl",
+                "protocol": "l7",
+                "method": "POST",
+                "path": "/topology",
+                "cps_weight": 1,
+                "think_time": 0,
+                "retries": 0,
+            }
+        ],
+        "links": [
+            {
+                "client_group": "cg",
+                "server_group": "sg",
+                "template": "tmpl",
+                "conn_rate": 100,
+                "max_active": 100,
+                "reuse_policy": "keepalive",
+            }
+        ],
+        "constraints": {"max_flows": 1000, "max_new_conn_per_sec": 1000, "fail_policy": "hard_fail"},
+        "tuple_gen": {
+            "client_pool_strategy": "sequential",
+            "server_pool_strategy": "sequential",
+            "port_allocator": "sequential",
+            "flow_affinity_5tuple": True,
+            "stickiness": True,
+        },
+    }
+    compiled = {
+        "plan_id": "test-plan-1",
+        "seed": int(seed),
+        "client_pool_size": 4,
+        "server_pool_size": 1,
+        "spec": spec,
+    }
+    return json.dumps(compiled, sort_keys=True)
 
 class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
     async def test_worker_process_http_path_calls_http_sender(self):
@@ -202,6 +264,59 @@ class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
         mock_pkt.assert_awaited_once()
         mock_paced.assert_not_awaited()
 
+    async def test_worker_process_http_uses_topology_binding_for_l7_compile_inputs(self):
+        args = _base_args()
+        args["attack_vector"] = "http"
+        args["topology_enabled"] = True
+        args["topology_compiled_plan_json"] = _topology_args()
+
+        mock_http = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
+        tuple_row = {
+            "client_ip": "10.0.0.9",
+            "server_ip": "198.51.100.7",
+            "server_port": 8080,
+            "template_protocol": "l7",
+            "template_method": "POST",
+            "template_path": "/topology",
+            "template_flags": "",
+        }
+        with patch.object(orchestrator, "compiled_topology_plan_from_dict", return_value={"dummy": 1}):
+            with patch.object(orchestrator, "topology_tuple_for_index", return_value=tuple_row):
+                with patch.object(orchestrator.senders, "http_app_sender", mock_http):
+                    await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
+                    call_args, _kwargs = mock_http.call_args
+                    self.assertEqual(call_args[0], "198.51.100.7")
+                    self.assertEqual(int(call_args[1]), 8080)
+                    self.assertEqual(call_args[4], "POST")
+                    self.assertEqual(call_args[5], ["/topology"])
+
+    async def test_worker_process_basic_uses_topology_binding_for_l4_packet_pool(self):
+        args = _base_args()
+        args["attack_vector"] = "basic"
+        args["topology_enabled"] = True
+        args["topology_compiled_plan_json"] = _topology_args()
+
+        mock_pkt = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
+        tuple_row = {
+            "client_ip": "10.0.0.9",
+            "server_ip": "198.51.100.7",
+            "server_port": 8080,
+            "template_protocol": "l4",
+            "template_method": "",
+            "template_path": "",
+            "template_flags": "S",
+        }
+        with patch.object(orchestrator, "compiled_topology_plan_from_dict", return_value={"dummy": 1}):
+            with patch.object(orchestrator, "topology_tuple_for_index", return_value=tuple_row):
+                with patch.object(orchestrator.senders, "packet_sender", mock_pkt):
+                    await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
+                    _call_args, kwargs = mock_pkt.call_args
+                    cfg = kwargs["packet_config"]
+                    self.assertEqual(getattr(cfg, "target_ip"), "198.51.100.7")
+                    self.assertEqual(int(getattr(cfg, "target_port")), 8080)
+                    self.assertTrue(bool(getattr(cfg, "spoof")))
+                    self.assertEqual(str(getattr(cfg.spoof_opts, "mode")), "subnet")
+
 
 class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
     """Tests for the worker_status derivation logic (trex_path Görev #6).
@@ -260,6 +375,10 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
         events = []
         mock_http = AsyncMock(return_value={
             "attempted": 100, "sent": 100, "errors": 0, "bytes_sent_est": 5000,
+            "sender_fallback_reason": "none",
+            "fallback_count": 0,
+            "runtime_transport_backend": "custom_tcp",
+            "custom_tcp_bridge_backend_used": "xdp",
         })
         with patch.object(orchestrator.senders, "http_app_sender", mock_http):
             await orchestrator.worker_process(
@@ -437,7 +556,7 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["status"], "failed")
-        self.assertIn("hot_path_policy_violation", str(events[0].get("error", "")))
+        self.assertIn("hot_path_contract_violation", str(events[0].get("error", "")))
 
     async def test_dedicated_required_fails_when_sender_path_drift_detected(self):
         args = _base_args()
@@ -464,7 +583,7 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["status"], "failed")
-        self.assertIn("hot_path_policy_violation", str(events[0].get("error", "")))
+        self.assertIn("hot_path_contract_violation", str(events[0].get("error", "")))
 
 
 class TestStatsAggregateHelpers(unittest.TestCase):

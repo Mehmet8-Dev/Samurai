@@ -778,7 +778,12 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
             "sent": 3,
             "errors": 0,
             "bytes_sent_est": 0,
+            "quic_stack_mode": "custom_native",
+            "quic_connection_attempts": 3,
+            "quic_response_validation_fail_count": 0,
+            "quic_response_validation_fail_ratio": 0.0,
         })
+        run_events = []
 
         with patch.dict(
             sys.modules,
@@ -801,7 +806,7 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         ), patch.dict(
             os.environ, {"SAMURAI_GPU_BATCH": "16"}, clear=False
         ):
-            await orchestrator.worker_process(worker_id=0, args=args, ssl_context=None, run_events=None)
+            await orchestrator.worker_process(worker_id=0, args=args, ssl_context=None, run_events=run_events)
 
         mock_quic.assert_awaited()
         self.assertEqual(mock_quic.await_count, 1)
@@ -809,6 +814,9 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertIn("request_plan", call_kwargs)
         plan = call_kwargs["request_plan"]
         self.assertEqual(len(getattr(plan, "items", [])), int(args["count"]))
+        self.assertEqual(len(run_events), 1)
+        self.assertEqual(str(run_events[0].get("quic_stack_mode", "")), "custom_native")
+        self.assertEqual(int(run_events[0].get("quic_connection_attempts", 0) or 0), 3)
 
     async def test_cuda_websocket_scenario_uses_ws_sender_with_request_plan(self):
         args = _base_args()
