@@ -54,6 +54,48 @@ def test_plan_batch_to_h2_request_plan_shapes_items():
     assert request_plan.items[0].headers.get("x-gpu-vector-source") == "gpu_cuda_payload_v1"
 
 
+def test_normalize_vector_spec_v2_with_topology_and_flow():
+    out = normalize_vector_spec(
+        {
+            "schema_version": 2,
+            "mode": "program",
+            "topology": {"enabled": True, "plan_id": "p1", "client_pool_size": 8, "server_pool_size": 4},
+            "template_catalog": {"l4_templates": ["l4:syn"], "l7_templates": ["l7:get:/"]},
+            "flow": {"flow_count": 32, "tuple_seed": 77, "step_graph": ["open", "send", "close"], "transport": "custom_tcp"},
+        }
+    )
+    assert int(out["schema_version"]) == 2
+    assert bool(out["topology"]["enabled"]) is True
+    assert int(out["topology"]["client_pool_size"]) == 8
+    assert out["template_catalog"]["l7_templates"] == ["l7:get:/"]
+    assert int(out["flow"]["flow_count"]) == 32
+    assert out["flow"]["step_graph"] == ["open", "send", "close"]
+
+
+def test_plan_batch_to_h2_request_plan_emits_v2_headers():
+    plan = compile_vector_spec(
+        spec={
+            "schema_version": 2,
+            "mode": "program",
+            "methods": ["GET"],
+            "paths": ["/v2"],
+            "header_profiles": ["d"],
+            "body_profiles": ["n"],
+            "topology": {"enabled": True, "client_pool_size": 2, "server_pool_size": 2},
+            "template_catalog": {"l4_templates": ["l4:syn"], "l7_templates": ["l7:get:/v2"]},
+            "flow": {"flow_count": 4, "step_graph": ["open", "send"], "transport": "custom_tcp"},
+        },
+        seed=11,
+        batch_size=2,
+    )
+    request_plan = plan_batch_to_h2_request_plan(plan)
+    headers = request_plan.items[0].headers
+    assert headers.get("x-gpu-vector-source") == "gpu_cuda_payload_v2"
+    assert "x-gpu-flow-id" in headers
+    assert "x-gpu-template-id" in headers
+    assert "x-gpu-state-op" in headers
+
+
 def test_execute_plan_batch_strict_precheck_fail_visible():
     plan = compile_vector_spec(spec={"mode": "program"}, seed=7, batch_size=2)
     out = execute_plan_batch(

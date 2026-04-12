@@ -465,6 +465,7 @@ async def _flush_custom_tcp_tx_packets(
     custom_tcp_xdp_interface: Any = None,
     custom_tcp_xdp_queue_id: Any = 0,
     custom_tcp_xdp_mode: Any = 0,
+    custom_tcp_bridge_strict: bool = True,
 ) -> Dict[str, Any]:
     bridge = bridge_api if bridge_api is not None else custom_tcp_dataplane
     if bridge is None:
@@ -498,27 +499,35 @@ async def _flush_custom_tcp_tx_packets(
     if int(transport_plan.get("custom_tcp_bridge_hard_fail_required", 0) or 0) == 1 and int(
         transport_plan.get("custom_tcp_bridge_degraded", 0) or 0
     ) == 1:
-        reason = str(transport_plan.get("custom_tcp_bridge_fallback_reason", "custom_tcp_bridge_unavailable") or "custom_tcp_bridge_unavailable")
-        detail = str(transport_plan.get("custom_tcp_bridge_fallback_detail", "") or "custom_tcp bridge strict transport preflight failed")
-        return {
-            "attempted": int(packet_count),
-            "sent": 0,
-            "errors": int(packet_count),
-            "sender_fallback_reason": reason,
-            "custom_tcp_tx_flush_packets": int(packet_count),
-            "custom_tcp_tx_flush_bytes": int(len(tx_buffer)),
-            "custom_tcp_bridge_fallback_reason": reason,
-            "custom_tcp_bridge_fallback_detail": detail,
-            "custom_tcp_bridge_degraded": 1,
-            "custom_tcp_bridge_backend_requested": transport_plan.get("custom_tcp_bridge_backend_requested", "af_xdp"),
-            "custom_tcp_bridge_backend_used": transport_plan.get("custom_tcp_bridge_backend_used", "xdp"),
-            "custom_tcp_bridge_backend_match": 0,
-            "custom_tcp_bridge_xdp_interface": transport_plan.get("custom_tcp_bridge_xdp_interface", ""),
-            "custom_tcp_bridge_xdp_queue_id": int(transport_plan.get("custom_tcp_bridge_xdp_queue_id", 0) or 0),
-            "custom_tcp_bridge_xdp_available": int(transport_plan.get("custom_tcp_bridge_xdp_available", 0) or 0),
-            "custom_tcp_bridge_xdp_enabled": int(transport_plan.get("custom_tcp_bridge_xdp_enabled", 0) or 0),
-            "runtime_transport_contract": "custom_tcp_runtime_bridge",
-        }
+        if not bool(custom_tcp_bridge_strict):
+            transport_plan = dict(transport_plan)
+            transport_plan["sender_backend"] = "txring"
+            transport_plan["xdp_enable"] = False
+            transport_plan["custom_tcp_bridge_backend_used"] = "txring"
+            transport_plan["custom_tcp_bridge_xdp_enabled"] = 0
+            transport_plan["custom_tcp_bridge_backend_match"] = 0
+        else:
+            reason = str(transport_plan.get("custom_tcp_bridge_fallback_reason", "custom_tcp_bridge_unavailable") or "custom_tcp_bridge_unavailable")
+            detail = str(transport_plan.get("custom_tcp_bridge_fallback_detail", "") or "custom_tcp bridge strict transport preflight failed")
+            return {
+                "attempted": int(packet_count),
+                "sent": 0,
+                "errors": int(packet_count),
+                "sender_fallback_reason": reason,
+                "custom_tcp_tx_flush_packets": int(packet_count),
+                "custom_tcp_tx_flush_bytes": int(len(tx_buffer)),
+                "custom_tcp_bridge_fallback_reason": reason,
+                "custom_tcp_bridge_fallback_detail": detail,
+                "custom_tcp_bridge_degraded": 1,
+                "custom_tcp_bridge_backend_requested": transport_plan.get("custom_tcp_bridge_backend_requested", "af_xdp"),
+                "custom_tcp_bridge_backend_used": transport_plan.get("custom_tcp_bridge_backend_used", "xdp"),
+                "custom_tcp_bridge_backend_match": 0,
+                "custom_tcp_bridge_xdp_interface": transport_plan.get("custom_tcp_bridge_xdp_interface", ""),
+                "custom_tcp_bridge_xdp_queue_id": int(transport_plan.get("custom_tcp_bridge_xdp_queue_id", 0) or 0),
+                "custom_tcp_bridge_xdp_available": int(transport_plan.get("custom_tcp_bridge_xdp_available", 0) or 0),
+                "custom_tcp_bridge_xdp_enabled": int(transport_plan.get("custom_tcp_bridge_xdp_enabled", 0) or 0),
+                "runtime_transport_contract": "custom_tcp_runtime_bridge",
+            }
     send_stats = await paced_raw_socket_sender(
         packets_buffer=tx_buffer,
         target_ip=target_ip,

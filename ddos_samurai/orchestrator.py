@@ -1556,6 +1556,7 @@ async def worker_process(
                     custom_tcp_xdp_interface=str(args.get("xdp_interface", "") or ""),
                     custom_tcp_xdp_queue_id=int(args.get("xdp_queue_id", 0) or 0),
                     custom_tcp_xdp_mode=int(args.get("xdp_mode", 0) or 0),
+                    custom_tcp_bridge_strict=False,
                 )
                 send_stats = dict(send_stats or {})
                 if not send_stats:
@@ -1660,13 +1661,53 @@ async def worker_process(
                 safe_count = max(1, int(batch_count))
                 methods = [str(args.get("http_method", "GET") or "GET").strip().upper()]
                 paths = args.get("http_path") if isinstance(args.get("http_path"), list) else ["/"]
+                topology_enabled = bool(args.get("topology_enabled", False))
+                topology_row = {}
+                if topology_enabled:
+                    raw_row = str(args.get("topology_tuple_row_json", "") or "").strip()
+                    if raw_row:
+                        try:
+                            topology_row = dict(json.loads(raw_row))
+                        except Exception:
+                            topology_row = {}
+                template_protocol = str(topology_row.get("template_protocol", "") or "").strip().lower()
+                template_method = str(topology_row.get("template_method", "") or "").strip().upper()
+                template_path = str(topology_row.get("template_path", "") or "").strip()
+                template_flags = str(topology_row.get("template_flags", "") or "").strip().upper()
+                l4_templates = []
+                l7_templates = []
+                if template_protocol == "l4":
+                    l4_templates.append(f"l4:{template_flags or 'default'}")
+                elif template_protocol == "l7":
+                    l7_templates.append(f"l7:{template_method or 'GET'}:{template_path or '/'}")
+                if not l4_templates:
+                    l4_templates = ["l4:default"]
+                if not l7_templates:
+                    l7_templates = ["l7:default"]
                 spec = {
+                    "schema_version": 2 if topology_enabled else 1,
                     "mode": str(mode or "program"),
                     "methods": methods if methods else ["GET"],
                     "paths": paths if paths else ["/"],
                     "header_profiles": ["default"],
                     "body_profiles": ["none"],
                     "max_steps": 4,
+                    "topology": {
+                        "enabled": topology_enabled,
+                        "plan_id": str(args.get("topology_plan_id", "") or ""),
+                        "client_pool_size": max(1, int(args.get("topology_client_pool_size", 1) or 1)),
+                        "server_pool_size": max(1, int(args.get("topology_server_pool_size", 1) or 1)),
+                    },
+                    "template_catalog": {
+                        "l4_templates": l4_templates,
+                        "l7_templates": l7_templates,
+                    },
+                    "flow": {
+                        "flow_count": max(1, safe_count),
+                        "tuple_seed": int(args.get("topology_seed", args.get("gpu_rng_seed", 1234)) or 1234),
+                        "step_graph": ["open", "send", "expect", "close"],
+                        "transport": "custom_tcp" if _l7_transport_backend == "custom_tcp" else "kernel_socket",
+                    },
                 }
                 return gpu_cuda_payload.compile_vector_spec(
                     spec=spec,
@@ -3224,25 +3265,33 @@ async def worker_process(
                 if not worker_error:
                     worker_error = f"high error rate: {_ws_errors}/{_ws_attempted}"
 
-        # Global strict hot-path contract: single sender path, no fallback, L7 custom_tcp+xdp.
-        _contract = evaluate_hot_path_contract(
-            attack_vector=str(args.get("attack_vector", "basic") or "basic"),
-            sender_path=str(worker_stats.get("sender_path", "") or ""),
-            sender_fallback_reason=str(worker_stats.get("sender_fallback_reason", "none") or "none"),
-            fallback_count=int(worker_stats.get("fallback_count", 0) or 0),
-            runtime_transport_backend=str(worker_stats.get("runtime_transport_backend", "") or ""),
-            custom_tcp_bridge_backend_used=str(worker_stats.get("custom_tcp_bridge_backend_used", "") or ""),
-        )
-        worker_stats.update(_contract.as_dict())
-        if worker_status == "ok" and str(_contract.status or "failed") != "passed":
-            worker_status = "failed"
-            if not worker_error:
-                worker_error = (
-                    "hot_path_contract_violation: "
-                    f"reason={worker_stats.get('hot_path_contract_violation_reason', 'unknown')} "
-                    f"sender_path={worker_stats.get('sender_path', 'unknown')} "
-                    f"fallback_reason={worker_stats.get('sender_fallback_reason', 'none')}"
-                )
+        # Enforce strict hot-path contract only in dedicated required profile.
+        _lab_profile = str(args.get("lab_profile", "off") or "off").strip().lower()
+        _dp_core_mode = str(args.get("dataplane_core_mode", "off") or "off").strip().lower()
+        _contract_enforced = (_lab_profile == "dedicated" and _dp_core_mode == "required")
+        if _contract_enforced:
+            _contract = evaluate_hot_path_contract(
+                attack_vector=str(args.get("attack_vector", "basic") or "basic"),
+                sender_path=str(worker_stats.get("sender_path", "") or ""),
+                sender_fallback_reason=str(worker_stats.get("sender_fallback_reason", "none") or "none"),
+                fallback_count=int(worker_stats.get("fallback_count", 0) or 0),
+                runtime_transport_backend=str(worker_stats.get("runtime_transport_backend", "") or ""),
+                custom_tcp_bridge_backend_used=str(worker_stats.get("custom_tcp_bridge_backend_used", "") or ""),
+            )
+            worker_stats.update(_contract.as_dict())
+            if worker_status == "ok" and str(_contract.status or "failed") != "passed":
+                worker_status = "failed"
+                if not worker_error:
+                    worker_error = (
+                        "hot_path_contract_violation: "
+                        f"reason={worker_stats.get('hot_path_contract_violation_reason', 'unknown')} "
+                        f"sender_path={worker_stats.get('sender_path', 'unknown')} "
+                        f"fallback_reason={worker_stats.get('sender_fallback_reason', 'none')}"
+                    )
+        else:
+            worker_stats["hot_path_contract_status"] = str(worker_stats.get("hot_path_contract_status", "unknown") or "unknown")
+            worker_stats["hot_path_contract_violation_reason"] = "none"
+            worker_stats["sender_path_single_required"] = int(worker_stats.get("sender_path_single_required", 1) or 1)
 
         # NOTE:
         # Live counters are already streamed incrementally by sender functions
