@@ -203,6 +203,54 @@ class TcpDataplaneCore {
     }
   };
 
+  struct TcpDpStatsCounters {
+    std::atomic<uint64_t> flows_active{0};
+    std::atomic<uint64_t> connect_attempts{0};
+    std::atomic<uint64_t> connect_established{0};
+    std::atomic<uint64_t> retransmit_count{0};
+    std::atomic<uint64_t> timeout_close_count{0};
+    std::atomic<uint64_t> connect_timeout_count{0};
+    std::atomic<uint64_t> idle_timeout_count{0};
+    std::atomic<uint64_t> retransmit_exhausted_count{0};
+    std::atomic<uint64_t> rx_ack_count{0};
+    std::atomic<uint64_t> dup_ack_count{0};
+    std::atomic<uint64_t> partial_ack_count{0};
+    std::atomic<uint64_t> fast_retransmit_count{0};
+    std::atomic<uint64_t> unexpected_ack_count{0};
+    std::atomic<uint64_t> tx_data_bytes{0};
+    std::atomic<uint64_t> rx_data_bytes{0};
+    std::atomic<uint64_t> poll_calls{0};
+    std::atomic<uint64_t> rx_frames{0};
+    std::atomic<uint64_t> unexpected_rx{0};
+    std::atomic<uint64_t> out_of_order_rx_count{0};
+    std::atomic<uint64_t> peer_rst_count{0};
+    std::atomic<uint64_t> peer_fin_count{0};
+
+    void Reset() {
+      flows_active.store(0, std::memory_order_relaxed);
+      connect_attempts.store(0, std::memory_order_relaxed);
+      connect_established.store(0, std::memory_order_relaxed);
+      retransmit_count.store(0, std::memory_order_relaxed);
+      timeout_close_count.store(0, std::memory_order_relaxed);
+      connect_timeout_count.store(0, std::memory_order_relaxed);
+      idle_timeout_count.store(0, std::memory_order_relaxed);
+      retransmit_exhausted_count.store(0, std::memory_order_relaxed);
+      rx_ack_count.store(0, std::memory_order_relaxed);
+      dup_ack_count.store(0, std::memory_order_relaxed);
+      partial_ack_count.store(0, std::memory_order_relaxed);
+      fast_retransmit_count.store(0, std::memory_order_relaxed);
+      unexpected_ack_count.store(0, std::memory_order_relaxed);
+      tx_data_bytes.store(0, std::memory_order_relaxed);
+      rx_data_bytes.store(0, std::memory_order_relaxed);
+      poll_calls.store(0, std::memory_order_relaxed);
+      rx_frames.store(0, std::memory_order_relaxed);
+      unexpected_rx.store(0, std::memory_order_relaxed);
+      out_of_order_rx_count.store(0, std::memory_order_relaxed);
+      peer_rst_count.store(0, std::memory_order_relaxed);
+      peer_fin_count.store(0, std::memory_order_relaxed);
+    }
+  };
+
 
   static bool ParseIpv4TcpFrame(
       const uint8_t* pkt,
@@ -268,7 +316,7 @@ class TcpDataplaneCore {
   std::atomic<uint64_t> tx_packets_queued_{0};
   std::atomic<uint64_t> tx_packets_drained_{0};
   std::atomic<uint64_t> tx_packets_sent_{0};
-  TcpDpStatsSnapshot stats_{};
+  TcpDpStatsCounters stats_{};
 };
 
 }  // namespace ddos_samurai::tcpdp

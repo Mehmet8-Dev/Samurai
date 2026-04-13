@@ -65,6 +65,15 @@ uint16_t TcpChecksum(const uint8_t* ip_header, const uint8_t* tcp_header, size_t
   }
   return static_cast<uint16_t>(~sum);
 }
+
+inline void SaturatingDecrement(std::atomic<uint64_t>& counter) {
+  uint64_t cur = counter.load(std::memory_order_relaxed);
+  while (cur > 0) {
+    if (counter.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return;
+    }
+  }
+}
 }  // namespace
 
 TcpDataplaneCore::TcpDataplaneCore() = default;
@@ -113,7 +122,7 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   tx_packets_overflow_.clear();
   completions_.clear();
   rx_payloads_.clear();
-  stats_ = TcpDpStatsSnapshot{};
+  stats_.Reset();
   tx_packets_queued_.store(0, std::memory_order_relaxed);
   tx_packets_drained_.store(0, std::memory_order_relaxed);
   tx_packets_sent_.store(0, std::memory_order_relaxed);
@@ -202,10 +211,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       out.packet.assign(pkt, pkt + packet_size);
       flow->outstanding = std::move(out);
       flow->rto_deadline_ns = flow->outstanding->deadline_ns;
-      {
-        std::lock_guard<std::mutex> sguard(state_mu_);
-        stats_.connect_attempts++;
-      }
+      stats_.connect_attempts.fetch_add(1, std::memory_order_relaxed);
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
@@ -217,10 +223,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       flow->snd_nxt = seq;
       flow->outstanding.reset();
       flow->rto_deadline_ns = 0;
-      {
-        std::lock_guard<std::mutex> sguard(state_mu_);
-        stats_.connect_established++;
-      }
+      stats_.connect_established.fetch_add(1, std::memory_order_relaxed);
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
@@ -242,10 +245,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       out.packet.assign(pkt, pkt + packet_size);
       flow->outstanding = std::move(out);
       flow->rto_deadline_ns = flow->outstanding->deadline_ns;
-      {
-        std::lock_guard<std::mutex> sguard(state_mu_);
-        stats_.tx_data_bytes += payload_len;
-      }
+      stats_.tx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
@@ -310,11 +310,8 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
   flows_by_id_shard_[flow_shard][flow_id] = flow;
   flow_index_shard_[index_shard][flow.key] = flow_id;
-  {
-    std::lock_guard<std::mutex> sguard(state_mu_);
-    stats_.flows_active++;
-    stats_.connect_attempts++;
-  }
+  stats_.flows_active.fetch_add(1, std::memory_order_relaxed);
+  stats_.connect_attempts.fetch_add(1, std::memory_order_relaxed);
   return flow_id;
 }
 
@@ -340,10 +337,7 @@ uint32_t TcpDataplaneCore::EnqueueSend(uint64_t flow_id, const uint8_t* payload,
   QueuePacket(*flow, std::move(pkt), seq, flow->rcv_nxt, static_cast<uint32_t>(payload_len), true);
   flow->rto_deadline_ns = flow->outstanding ? flow->outstanding->deadline_ns : 0;
   ScheduleFlowTimers(*flow, flow->last_activity_ns);
-  {
-    std::lock_guard<std::mutex> sguard(state_mu_);
-    stats_.tx_data_bytes += static_cast<uint64_t>(payload_len);
-  }
+  stats_.tx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
   return static_cast<uint32_t>(payload_len);
 }
 
@@ -367,18 +361,14 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
   }
 
   uint64_t flow_id = 0;
-  {
-    std::lock_guard<std::mutex> sguard(state_mu_);
-    stats_.rx_frames++;
-  }
+  stats_.rx_frames.fetch_add(1, std::memory_order_relaxed);
   const FlowKey key{dst_ip, src_ip, dst_port, src_port};
   const size_t index_shard = FlowIndexShardForKey(key);
   {
     std::lock_guard<std::mutex> iguard(flow_index_shard_mu_[index_shard]);
     auto idx = flow_index_shard_[index_shard].find(key);
     if (idx == flow_index_shard_[index_shard].end()) {
-      std::lock_guard<std::mutex> sguard(state_mu_);
-      stats_.unexpected_rx++;
+      stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
       return 0;
     }
     flow_id = idx->second;
@@ -388,8 +378,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
   std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
   auto it = flows_by_id_shard_[flow_shard].find(flow_id);
   if (it == flows_by_id_shard_[flow_shard].end()) {
-    std::lock_guard<std::mutex> sguard(state_mu_);
-    stats_.unexpected_rx++;
+    stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
     return 0;
   }
   FlowEntry* flow = &it->second;
@@ -407,18 +396,14 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     SetFlowState(*flow, TcpDpState::kRstSeen);
     flow->outstanding.reset();
     flow->rto_deadline_ns = 0;
-    {
-      std::lock_guard<std::mutex> sguard(state_mu_);
-      stats_.peer_rst_count++;
-    }
+    stats_.peer_rst_count.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, false, "peer_rst");
     return finish(1);
   }
 
   if ((flags & (kTcpFlagSyn | kTcpFlagAck)) == (kTcpFlagSyn | kTcpFlagAck) && flow->state == TcpDpState::kSynSent) {
     if (ack != flow->snd_nxt) {
-      std::lock_guard<std::mutex> sguard(state_mu_);
-      stats_.unexpected_rx++;
+      stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
       return finish(0);
     }
     flow->snd_una = ack;
@@ -429,36 +414,26 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
     QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
     SetFlowState(*flow, TcpDpState::kEstablished);
-    {
-      std::lock_guard<std::mutex> sguard(state_mu_);
-      stats_.connect_established++;
-    }
+    stats_.connect_established.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, true, "connect_established");
     return finish(1);
   }
 
   if ((flags & kTcpFlagAck) != 0) {
     HandleAck(*flow, ack);
-    std::lock_guard<std::mutex> sguard(state_mu_);
-    stats_.rx_ack_count++;
+    stats_.rx_ack_count.fetch_add(1, std::memory_order_relaxed);
   }
 
   if (payload_len > 0) {
     if (flow->rcv_nxt != 0 && seq != flow->rcv_nxt) {
-      {
-        std::lock_guard<std::mutex> sguard(state_mu_);
-        stats_.out_of_order_rx_count++;
-        stats_.unexpected_rx++;
-      }
+      stats_.out_of_order_rx_count.fetch_add(1, std::memory_order_relaxed);
+      stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
       auto dup_ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
       QueuePacket(*flow, std::move(dup_ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
       return finish(1);
     }
     flow->rcv_nxt = AdvanceSeq(seq, payload_len);
-    {
-      std::lock_guard<std::mutex> sguard(state_mu_);
-      stats_.rx_data_bytes += payload_len;
-    }
+    stats_.rx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> qguard(tx_mu_);
       rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, ExtractIpv4TcpPayload(frame, frame_len)});
@@ -472,10 +447,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
     QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
     SetFlowState(*flow, TcpDpState::kTimeWait);
-    {
-      std::lock_guard<std::mutex> sguard(state_mu_);
-      stats_.peer_fin_count++;
-    }
+    stats_.peer_fin_count.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, true, "peer_fin");
   }
   (void)ttl;
@@ -489,10 +461,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
   if (now_ns == 0) {
     now_ns = DefaultNowNs();
   }
-  {
-    std::lock_guard<std::mutex> sguard(state_mu_);
-    stats_.poll_calls++;
-  }
+  stats_.poll_calls.fetch_add(1, std::memory_order_relaxed);
   uint32_t actions = 0;
   while (actions < budget) {
     TimerEntry entry{};
@@ -548,10 +517,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
           break;
         }
         flow->retransmit_count++;
-        {
-          std::lock_guard<std::mutex> sguard(state_mu_);
-          stats_.retransmit_count++;
-        }
+        stats_.retransmit_count.fetch_add(1, std::memory_order_relaxed);
         flow->outstanding->rto_ms = std::min(flow->outstanding->rto_ms * 2U, config_.connect_timeout_ms);
         flow->outstanding->deadline_ns = now_ns + NsFromMs(flow->outstanding->rto_ms);
         flow->rto_deadline_ns = flow->outstanding->deadline_ns;
@@ -860,8 +826,28 @@ std::vector<TcpDpRxPayload> TcpDataplaneCore::CollectRxPayloads() {
 }
 
 TcpDpStatsSnapshot TcpDataplaneCore::SnapshotStats() const {
-  std::lock_guard<std::mutex> guard(state_mu_);
-  TcpDpStatsSnapshot out = stats_;
+  TcpDpStatsSnapshot out;
+  out.flows_active = stats_.flows_active.load(std::memory_order_relaxed);
+  out.connect_attempts = stats_.connect_attempts.load(std::memory_order_relaxed);
+  out.connect_established = stats_.connect_established.load(std::memory_order_relaxed);
+  out.retransmit_count = stats_.retransmit_count.load(std::memory_order_relaxed);
+  out.timeout_close_count = stats_.timeout_close_count.load(std::memory_order_relaxed);
+  out.connect_timeout_count = stats_.connect_timeout_count.load(std::memory_order_relaxed);
+  out.idle_timeout_count = stats_.idle_timeout_count.load(std::memory_order_relaxed);
+  out.retransmit_exhausted_count = stats_.retransmit_exhausted_count.load(std::memory_order_relaxed);
+  out.rx_ack_count = stats_.rx_ack_count.load(std::memory_order_relaxed);
+  out.dup_ack_count = stats_.dup_ack_count.load(std::memory_order_relaxed);
+  out.partial_ack_count = stats_.partial_ack_count.load(std::memory_order_relaxed);
+  out.fast_retransmit_count = stats_.fast_retransmit_count.load(std::memory_order_relaxed);
+  out.unexpected_ack_count = stats_.unexpected_ack_count.load(std::memory_order_relaxed);
+  out.tx_data_bytes = stats_.tx_data_bytes.load(std::memory_order_relaxed);
+  out.rx_data_bytes = stats_.rx_data_bytes.load(std::memory_order_relaxed);
+  out.poll_calls = stats_.poll_calls.load(std::memory_order_relaxed);
+  out.rx_frames = stats_.rx_frames.load(std::memory_order_relaxed);
+  out.unexpected_rx = stats_.unexpected_rx.load(std::memory_order_relaxed);
+  out.out_of_order_rx_count = stats_.out_of_order_rx_count.load(std::memory_order_relaxed);
+  out.peer_rst_count = stats_.peer_rst_count.load(std::memory_order_relaxed);
+  out.peer_fin_count = stats_.peer_fin_count.load(std::memory_order_relaxed);
   out.tx_packets_queued = tx_packets_queued_.load(std::memory_order_relaxed);
   out.tx_packets_drained = tx_packets_drained_.load(std::memory_order_relaxed);
   out.tx_packets_sent = tx_packets_sent_.load(std::memory_order_relaxed);
@@ -1204,9 +1190,9 @@ void TcpDataplaneCore::SetFlowState(FlowEntry& flow, TcpDpState next_state) {
     return;
   }
   if (now_active) {
-    stats_.flows_active++;
-  } else if (stats_.flows_active > 0) {
-    stats_.flows_active--;
+    stats_.flows_active.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    SaturatingDecrement(stats_.flows_active);
   }
 }
 
@@ -1215,12 +1201,12 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value) {
     return;
   }
   if (ack_value == flow.snd_una) {
-    stats_.dup_ack_count++;
+    stats_.dup_ack_count.fetch_add(1, std::memory_order_relaxed);
     flow.dup_ack_streak++;
     if (flow.dup_ack_streak == 3 && flow.outstanding->packet.size() > 0) {
       (void)EnqueueTxPacketBytes(flow.outstanding->packet.data(), flow.outstanding->packet.size());
-      stats_.retransmit_count++;
-      stats_.fast_retransmit_count++;
+      stats_.retransmit_count.fetch_add(1, std::memory_order_relaxed);
+      stats_.fast_retransmit_count.fetch_add(1, std::memory_order_relaxed);
       flow.retransmit_count++;
       flow.outstanding->deadline_ns = DefaultNowNs() + NsFromMs(flow.outstanding->rto_ms);
       flow.rto_deadline_ns = flow.outstanding->deadline_ns;
@@ -1231,26 +1217,26 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value) {
   const uint32_t covered = flow.outstanding->payload_len == 0 ? 1U : flow.outstanding->payload_len;
   const uint32_t outstanding_end = AdvanceSeq(flow.outstanding->seq, covered);
   if (ack_value > flow.snd_nxt) {
-    stats_.unexpected_ack_count++;
-    stats_.unexpected_rx++;
+    stats_.unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
+    stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   if (ack_value <= flow.outstanding->seq) {
-    stats_.unexpected_ack_count++;
-    stats_.unexpected_rx++;
+    stats_.unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
+    stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   if (ack_value < outstanding_end && flow.outstanding->payload_len > 1U) {
     const uint32_t newly_acked = ack_value - flow.outstanding->seq;
     if (newly_acked == 0 || newly_acked >= flow.outstanding->payload_len) {
-      stats_.unexpected_ack_count++;
-      stats_.unexpected_rx++;
+      stats_.unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
+      stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     auto payload = ExtractIpv4TcpPayload(flow.outstanding->packet.data(), flow.outstanding->packet.size());
     if (payload.size() != flow.outstanding->payload_len) {
-      stats_.unexpected_ack_count++;
-      stats_.unexpected_rx++;
+      stats_.unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
+      stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     const uint8_t* unacked_payload = payload.data() + newly_acked;
@@ -1263,7 +1249,7 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value) {
     flow.rto_deadline_ns = flow.outstanding->deadline_ns;
     flow.snd_una = ack_value;
     flow.retransmit_count = 0;
-    stats_.partial_ack_count++;
+    stats_.partial_ack_count.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   flow.snd_una = ack_value;
@@ -1276,14 +1262,14 @@ void TcpDataplaneCore::CloseTimedOutFlow(FlowEntry& flow, TcpDpState terminal_st
   SetFlowState(flow, terminal_state);
   flow.outstanding.reset();
   flow.rto_deadline_ns = 0;
-  stats_.timeout_close_count++;
+  stats_.timeout_close_count.fetch_add(1, std::memory_order_relaxed);
   if (event != nullptr) {
     if (std::strcmp(event, "connect_timeout") == 0) {
-      stats_.connect_timeout_count++;
+      stats_.connect_timeout_count.fetch_add(1, std::memory_order_relaxed);
     } else if (std::strcmp(event, "idle_timeout") == 0) {
-      stats_.idle_timeout_count++;
+      stats_.idle_timeout_count.fetch_add(1, std::memory_order_relaxed);
     } else if (std::strcmp(event, "retransmit_exhausted") == 0) {
-      stats_.retransmit_exhausted_count++;
+      stats_.retransmit_exhausted_count.fetch_add(1, std::memory_order_relaxed);
     }
   }
   PushCompletion(flow.flow_id, flow.state, false, event);
