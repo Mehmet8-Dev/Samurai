@@ -240,6 +240,7 @@ class TcpDataplaneCore {
 
   mutable std::mutex state_mu_;
   mutable std::mutex tx_mu_;
+  mutable std::mutex timer_mu_;
   TcpDpConfig config_;
   uint64_t next_flow_id_ = 1;
   uint32_t next_ephemeral_port_ = 40000;

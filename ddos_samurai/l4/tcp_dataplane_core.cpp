@@ -86,7 +86,9 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
       config.idle_timeout_ms == 0) {
     return false;
   }
-  std::scoped_lock<std::mutex, std::mutex> guard(state_mu_, tx_mu_);
+  std::lock_guard<std::mutex> sguard(state_mu_);
+  std::lock_guard<std::mutex> qguard(tx_mu_);
+  std::lock_guard<std::mutex> tguard(timer_mu_);
   config_ = config;
   next_flow_id_ = 1;
   next_ephemeral_port_ = 40000;
@@ -253,7 +255,10 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   flow.snd_nxt = AdvanceSeq(flow.snd_nxt, 1);
   QueuePacket(flow, std::move(syn), flow.iss, 0, 0, true);
   flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
-  active_flow_ids_.insert(flow_id);
+  {
+    std::lock_guard<std::mutex> tguard(timer_mu_);
+    active_flow_ids_.insert(flow_id);
+  }
   ScheduleFlowTimers(flow, now_ns);
 
   flows_by_id_[flow_id] = flow;
@@ -390,21 +395,32 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
   if (budget == 0) {
     budget = 1024;
   }
-  std::lock_guard<std::mutex> guard(state_mu_);
   if (now_ns == 0) {
     now_ns = DefaultNowNs();
   }
-  stats_.poll_calls++;
+  {
+    std::lock_guard<std::mutex> sguard(state_mu_);
+    stats_.poll_calls++;
+  }
   uint32_t actions = 0;
-  while (actions < budget && !timer_heap_.empty()) {
-    const TimerEntry entry = timer_heap_.top();
-    if (entry.due_ns == 0 || entry.due_ns > now_ns) {
-      break;
+  while (actions < budget) {
+    TimerEntry entry{};
+    {
+      std::lock_guard<std::mutex> tguard(timer_mu_);
+      if (timer_heap_.empty()) {
+        break;
+      }
+      entry = timer_heap_.top();
+      if (entry.due_ns == 0 || entry.due_ns > now_ns) {
+        break;
+      }
+      timer_heap_.pop();
+      if (active_flow_ids_.find(entry.flow_id) == active_flow_ids_.end()) {
+        continue;
+      }
     }
-    timer_heap_.pop();
-    if (active_flow_ids_.find(entry.flow_id) == active_flow_ids_.end()) {
-      continue;
-    }
+
+    std::lock_guard<std::mutex> sguard(state_mu_);
     auto it = flows_by_id_.find(entry.flow_id);
     if (it == flows_by_id_.end()) {
       continue;
@@ -961,6 +977,7 @@ void TcpDataplaneCore::PushTimer(uint64_t flow_id, TimerKind kind, uint64_t due_
 }
 
 void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
+  std::lock_guard<std::mutex> tguard(timer_mu_);
   if (now_ns == 0) {
     now_ns = DefaultNowNs();
   }
@@ -1051,10 +1068,13 @@ void TcpDataplaneCore::SetFlowState(FlowEntry& flow, TcpDpState next_state) {
   const bool was_active = IsCountedActive(flow.state);
   const bool now_active = IsCountedActive(next_state);
   flow.state = next_state;
-  if (now_active) {
-    active_flow_ids_.insert(flow.flow_id);
-  } else {
-    active_flow_ids_.erase(flow.flow_id);
+  {
+    std::lock_guard<std::mutex> tguard(timer_mu_);
+    if (now_active) {
+      active_flow_ids_.insert(flow.flow_id);
+    } else {
+      active_flow_ids_.erase(flow.flow_id);
+    }
   }
   if (was_active == now_active) {
     return;
