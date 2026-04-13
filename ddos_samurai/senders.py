@@ -70,11 +70,11 @@ def _resolve_l7_transport_backend(
 def _resolve_custom_tcp_backend(requested_backend: Any = None) -> str:
     backend = str(
         requested_backend
-        or os.environ.get("SAMURAI_CUSTOM_TCP_BACKEND", "txring")
-        or "txring"
+        or os.environ.get("SAMURAI_CUSTOM_TCP_BACKEND", "af_xdp")
+        or "af_xdp"
     ).strip().lower()
-    if backend not in {"af_xdp", "txring"}:
-        return "txring"
+    if backend not in {"af_xdp"}:
+        return "af_xdp"
     return backend
 
 
@@ -101,7 +101,7 @@ def _resolve_stateful_runtime_backend(requested_backend: Any = None) -> str:
         or os.environ.get("SAMURAI_STATEFUL_RUNTIME_BACKEND", "afxdp")
         or "afxdp"
     ).strip().lower()
-    if backend not in {"afxdp", "dpdk"}:
+    if backend not in {"afxdp"}:
         return "afxdp"
     return backend
 

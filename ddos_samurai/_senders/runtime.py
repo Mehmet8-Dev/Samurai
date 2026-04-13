@@ -1,15 +1,15 @@
 import os
 
 
-_SENDER_BACKEND_CHOICES = {"auto", "txring", "c_ext_l3", "python", "xdp"}
-_SENDER_FALLBACK_POLICY_CHOICES = {"allow", "fail"}
+_SENDER_BACKEND_CHOICES = {"xdp"}
+_SENDER_FALLBACK_POLICY_CHOICES = {"fail"}
 
 
 def resolve_sender_backend(value) -> str:
-    raw = str(value if value is not None else os.environ.get("SAMURAI_SENDER_BACKEND", "auto") or "auto")
+    raw = str(value if value is not None else os.environ.get("SAMURAI_SENDER_BACKEND", "xdp") or "xdp")
     backend = raw.strip().lower()
     if backend not in _SENDER_BACKEND_CHOICES:
-        backend = "auto"
+        backend = "xdp"
     return backend
 
 

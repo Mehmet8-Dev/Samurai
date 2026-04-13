@@ -56,7 +56,10 @@ async def raw_socket_sender(
     FAST_SENDER_AVAILABLE = bool(FAST_SENDER_AVAILABLE_flag)
     fast_sender = fast_sender_module
 
-    requested_backend = _resolve_sender_backend(sender_backend)
+    if sender_backend is None:
+        requested_backend = "python"
+    else:
+        requested_backend = _resolve_sender_backend(sender_backend)
     if bool(xdp_enable) and requested_backend == "auto":
         requested_backend = "xdp"
     fallback_policy = _resolve_sender_fallback_policy(sender_fallback_policy)

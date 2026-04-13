@@ -181,7 +181,7 @@ async def quic_sender(
             target_ip=str(target_ip),
             target_port=int(target_port),
             scheme="https",
-            transport_backend="kernel_socket",
+            transport_backend="custom_tcp",
             stateful_runtime_backend="afxdp",
             stateful_runtime_strict=False,
             legacy_mode=True,
