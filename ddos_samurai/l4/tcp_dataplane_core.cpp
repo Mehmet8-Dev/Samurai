@@ -92,8 +92,14 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   next_flow_id_ = 1;
   next_ephemeral_port_ = 40000;
   seq_seed_ = 0x10203040U;
-  flows_by_id_.clear();
-  flow_index_.clear();
+  for (size_t i = 0; i < kFlowLockShards; ++i) {
+    std::lock_guard<std::mutex> fguard(flow_shard_mu_[i]);
+    flows_by_id_shard_[i].clear();
+  }
+  for (size_t i = 0; i < kFlowLockShards; ++i) {
+    std::lock_guard<std::mutex> iguard(flow_index_shard_mu_[i]);
+    flow_index_shard_[i].clear();
+  }
   for (size_t i = 0; i < kFlowLockShards; ++i) {
     std::lock_guard<std::mutex> tguard(timer_shard_mu_[i]);
     active_flow_ids_shard_[i].clear();
@@ -119,7 +125,6 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
   if (!packets || packet_size == 0 || count == 0) {
     return 0;
   }
-  std::lock_guard<std::mutex> guard(state_mu_);
   uint32_t updated = 0;
   for (size_t i = 0; i < count; ++i) {
     const uint8_t* pkt = packets + (i * packet_size);
@@ -139,28 +144,47 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
     }
 
     const FlowKey key{src_ip, dst_ip, src_port, dst_port};
-    auto idx = flow_index_.find(key);
-    FlowEntry* flow = nullptr;
-    if (idx == flow_index_.end()) {
-      FlowEntry created;
-      created.flow_id = next_flow_id_++;
-      created.key = key;
-      created.iss = seq;
-      created.snd_una = seq;
-      created.snd_nxt = seq;
-      created.rcv_nxt = ack;
-      created.peer_window = 0;
-      created.local_window = window > 0 ? window : config_.local_window;
-      created.mss = config_.default_mss;
-      created.ttl = ttl > 0 ? ttl : config_.default_ttl;
-      created.last_activity_ns = DefaultNowNs();
-      const auto inserted = flows_by_id_.emplace(created.flow_id, created);
-      flow_index_[key] = created.flow_id;
-      flow = &inserted.first->second;
-    } else {
-      flow = &flows_by_id_[idx->second];
-      flow->last_activity_ns = DefaultNowNs();
+    const size_t index_shard = FlowIndexShardForKey(key);
+    uint64_t flow_id = 0;
+    {
+      std::lock_guard<std::mutex> iguard(flow_index_shard_mu_[index_shard]);
+      auto idx = flow_index_shard_[index_shard].find(key);
+      if (idx == flow_index_shard_[index_shard].end()) {
+        FlowEntry created;
+        {
+          std::lock_guard<std::mutex> sguard(state_mu_);
+          created.flow_id = next_flow_id_++;
+        }
+        created.key = key;
+        created.iss = seq;
+        created.snd_una = seq;
+        created.snd_nxt = seq;
+        created.rcv_nxt = ack;
+        created.peer_window = 0;
+        created.local_window = window > 0 ? window : config_.local_window;
+        created.mss = config_.default_mss;
+        created.ttl = ttl > 0 ? ttl : config_.default_ttl;
+        created.last_activity_ns = DefaultNowNs();
+        const size_t flow_shard = FlowLockShardForFlowId(created.flow_id);
+        {
+          std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+          flows_by_id_shard_[flow_shard].emplace(created.flow_id, created);
+        }
+        flow_index_shard_[index_shard][key] = created.flow_id;
+        flow_id = created.flow_id;
+      } else {
+        flow_id = idx->second;
+      }
     }
+
+    const size_t flow_shard = FlowLockShardForFlowId(flow_id);
+    std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+    auto it = flows_by_id_shard_[flow_shard].find(flow_id);
+    if (it == flows_by_id_shard_[flow_shard].end()) {
+      continue;
+    }
+    FlowEntry* flow = &it->second;
+    flow->last_activity_ns = DefaultNowNs();
 
     if ((flags & kTcpFlagSyn) != 0 && (flags & kTcpFlagAck) == 0) {
       SetFlowState(*flow, TcpDpState::kSynSent);
@@ -178,7 +202,10 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       out.packet.assign(pkt, pkt + packet_size);
       flow->outstanding = std::move(out);
       flow->rto_deadline_ns = flow->outstanding->deadline_ns;
-      stats_.connect_attempts++;
+      {
+        std::lock_guard<std::mutex> sguard(state_mu_);
+        stats_.connect_attempts++;
+      }
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
@@ -190,7 +217,10 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       flow->snd_nxt = seq;
       flow->outstanding.reset();
       flow->rto_deadline_ns = 0;
-      stats_.connect_established++;
+      {
+        std::lock_guard<std::mutex> sguard(state_mu_);
+        stats_.connect_established++;
+      }
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
@@ -212,7 +242,10 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       out.packet.assign(pkt, pkt + packet_size);
       flow->outstanding = std::move(out);
       flow->rto_deadline_ns = flow->outstanding->deadline_ns;
-      stats_.tx_data_bytes += payload_len;
+      {
+        std::lock_guard<std::mutex> sguard(state_mu_);
+        stats_.tx_data_bytes += payload_len;
+      }
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
@@ -233,18 +266,25 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   if (src_ip == 0 || dst_ip == 0 || dst_port == 0) {
     return 0;
   }
-  std::lock_guard<std::mutex> guard(state_mu_);
+  uint64_t flow_id = 0;
+  uint32_t flow_iss = 0;
   if (src_port == 0) {
+    std::lock_guard<std::mutex> sguard(state_mu_);
     src_port = static_cast<uint16_t>(next_ephemeral_port_++);
   }
-  const uint64_t flow_id = next_flow_id_++;
+  {
+    std::lock_guard<std::mutex> sguard(state_mu_);
+    flow_id = next_flow_id_++;
+    flow_iss = seq_seed_;
+    seq_seed_ += 0x01010101U;
+  }
   const uint64_t now_ns = DefaultNowNs();
   FlowEntry flow;
   flow.flow_id = flow_id;
   flow.key = FlowKey{src_ip, dst_ip, src_port, dst_port};
-  flow.iss = seq_seed_;
-  flow.snd_una = seq_seed_;
-  flow.snd_nxt = seq_seed_;
+  flow.iss = flow_iss;
+  flow.snd_una = flow_iss;
+  flow.snd_nxt = flow_iss;
   flow.rcv_nxt = 0;
   flow.peer_window = 0;
   flow.local_window = config_.local_window;
@@ -252,7 +292,6 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   flow.ttl = config_.default_ttl;
   flow.state = TcpDpState::kSynSent;
   flow.last_activity_ns = now_ns;
-  seq_seed_ += 0x01010101U;
 
   auto syn = BuildPacket(flow, flow.snd_nxt, 0, kTcpFlagSyn, nullptr, 0);
   flow.snd_nxt = AdvanceSeq(flow.snd_nxt, 1);
@@ -265,10 +304,17 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   }
   ScheduleFlowTimers(flow, now_ns);
 
-  flows_by_id_[flow_id] = flow;
-  flow_index_[flow.key] = flow_id;
-  stats_.flows_active++;
-  stats_.connect_attempts++;
+  const size_t index_shard = FlowIndexShardForKey(flow.key);
+  const size_t flow_shard = FlowLockShardForFlowId(flow_id);
+  std::lock_guard<std::mutex> iguard(flow_index_shard_mu_[index_shard]);
+  std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+  flows_by_id_shard_[flow_shard][flow_id] = flow;
+  flow_index_shard_[index_shard][flow.key] = flow_id;
+  {
+    std::lock_guard<std::mutex> sguard(state_mu_);
+    stats_.flows_active++;
+    stats_.connect_attempts++;
+  }
   return flow_id;
 }
 
@@ -276,16 +322,13 @@ uint32_t TcpDataplaneCore::EnqueueSend(uint64_t flow_id, const uint8_t* payload,
   if (!payload || payload_len == 0 || payload_len > 65535U) {
     return 0;
   }
-  FlowEntry* flow = nullptr;
-  {
-    std::lock_guard<std::mutex> sguard(state_mu_);
-    auto it = flows_by_id_.find(flow_id);
-    if (it == flows_by_id_.end()) {
-      return 0;
-    }
-    flow = &it->second;
+  const size_t flow_shard = FlowLockShardForFlowId(flow_id);
+  std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+  auto it = flows_by_id_shard_[flow_shard].find(flow_id);
+  if (it == flows_by_id_shard_[flow_shard].end()) {
+    return 0;
   }
-  std::lock_guard<std::mutex> fguard(flow_shard_mu_[FlowLockShardForFlowId(flow_id)]);
+  FlowEntry* flow = &it->second;
   if (flow->state != TcpDpState::kEstablished || flow->outstanding.has_value()) {
     return 0;
   }
@@ -327,26 +370,29 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
   {
     std::lock_guard<std::mutex> sguard(state_mu_);
     stats_.rx_frames++;
-    const FlowKey key{dst_ip, src_ip, dst_port, src_port};
-    auto idx = flow_index_.find(key);
-    if (idx == flow_index_.end()) {
+  }
+  const FlowKey key{dst_ip, src_ip, dst_port, src_port};
+  const size_t index_shard = FlowIndexShardForKey(key);
+  {
+    std::lock_guard<std::mutex> iguard(flow_index_shard_mu_[index_shard]);
+    auto idx = flow_index_shard_[index_shard].find(key);
+    if (idx == flow_index_shard_[index_shard].end()) {
+      std::lock_guard<std::mutex> sguard(state_mu_);
       stats_.unexpected_rx++;
       return 0;
     }
     flow_id = idx->second;
   }
 
-  std::lock_guard<std::mutex> fguard(flow_shard_mu_[FlowLockShardForFlowId(flow_id)]);
-  FlowEntry* flow = nullptr;
-  {
+  const size_t flow_shard = FlowLockShardForFlowId(flow_id);
+  std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+  auto it = flows_by_id_shard_[flow_shard].find(flow_id);
+  if (it == flows_by_id_shard_[flow_shard].end()) {
     std::lock_guard<std::mutex> sguard(state_mu_);
-    auto it = flows_by_id_.find(flow_id);
-    if (it == flows_by_id_.end()) {
-      stats_.unexpected_rx++;
-      return 0;
-    }
-    flow = &it->second;
+    stats_.unexpected_rx++;
+    return 0;
   }
+  FlowEntry* flow = &it->second;
 
   flow->last_activity_ns = DefaultNowNs();
   const auto finish = [&](uint32_t rc) -> uint32_t {
@@ -484,15 +530,11 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
     }
 
     std::lock_guard<std::mutex> fguard(flow_shard_mu_[selected_shard]);
-    FlowEntry* flow = nullptr;
-    {
-      std::lock_guard<std::mutex> sguard(state_mu_);
-      auto it = flows_by_id_.find(entry.flow_id);
-      if (it == flows_by_id_.end()) {
-        continue;
-      }
-      flow = &it->second;
+    auto it = flows_by_id_shard_[selected_shard].find(entry.flow_id);
+    if (it == flows_by_id_shard_[selected_shard].end()) {
+      continue;
     }
+    FlowEntry* flow = &it->second;
     switch (entry.kind) {
       case TimerKind::kRto: {
         if (entry.generation != flow->rto_timer_gen || !flow->outstanding.has_value() || flow->rto_deadline_ns == 0 ||
@@ -569,7 +611,7 @@ bool TcpDataplaneCore::DrainTxPacketsConcatAlloc(
   *out_packet_size = 0;
   *out_uniform = false;
 
-  std::lock_guard<std::mutex> guard(state_mu_);
+  std::lock_guard<std::mutex> guard(tx_mu_);
 
   const uint32_t total_available =
       tx_ring_count_ + static_cast<uint32_t>(tx_packets_overflow_.size());
@@ -686,7 +728,7 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
   *out_packet_size = 0;
   *out_stride = 0;
 
-  std::lock_guard<std::mutex> guard(state_mu_);
+  std::lock_guard<std::mutex> guard(tx_mu_);
   if (tx_ring_count_ == 0 || !tx_packets_overflow_.empty()) {
     return true;
   }
@@ -827,10 +869,11 @@ TcpDpStatsSnapshot TcpDataplaneCore::SnapshotStats() const {
 }
 
 TcpDpFlowSnapshot TcpDataplaneCore::GetFlow(uint64_t flow_id) const {
-  std::lock_guard<std::mutex> guard(state_mu_);
   TcpDpFlowSnapshot out;
-  auto it = flows_by_id_.find(flow_id);
-  if (it == flows_by_id_.end()) {
+  const size_t flow_shard = FlowLockShardForFlowId(flow_id);
+  std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+  auto it = flows_by_id_shard_[flow_shard].find(flow_id);
+  if (it == flows_by_id_shard_[flow_shard].end()) {
     return out;
   }
   const FlowEntry& flow = it->second;
@@ -932,6 +975,10 @@ uint32_t TcpDataplaneCore::AdvanceSeq(uint32_t seq, uint32_t amount) { return se
 
 size_t TcpDataplaneCore::FlowLockShardForFlowId(uint64_t flow_id) const {
   return static_cast<size_t>(flow_id % static_cast<uint64_t>(kFlowLockShards));
+}
+
+size_t TcpDataplaneCore::FlowIndexShardForKey(const FlowKey& key) const {
+  return FlowKeyHash{}(key) % kFlowLockShards;
 }
 
 std::vector<uint8_t> TcpDataplaneCore::ExtractIpv4TcpPayload(const uint8_t* pkt, size_t pkt_len) {

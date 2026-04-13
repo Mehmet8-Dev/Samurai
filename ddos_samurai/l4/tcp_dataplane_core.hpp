@@ -223,6 +223,7 @@ class TcpDataplaneCore {
   static std::vector<uint8_t> ExtractIpv4TcpPayload(const uint8_t* pkt, size_t pkt_len);
   static constexpr size_t kFlowLockShards = 16;
   size_t FlowLockShardForFlowId(uint64_t flow_id) const;
+  size_t FlowIndexShardForKey(const FlowKey& key) const;
   std::vector<uint8_t> BuildPacket(
       const FlowEntry& flow,
       uint32_t seq,
@@ -242,8 +243,9 @@ class TcpDataplaneCore {
 
   mutable std::mutex state_mu_;
   mutable std::mutex tx_mu_;
-  std::array<std::mutex, kFlowLockShards> flow_shard_mu_{};
-  std::array<std::mutex, kFlowLockShards> timer_shard_mu_{};
+  mutable std::array<std::mutex, kFlowLockShards> flow_shard_mu_{};
+  mutable std::array<std::mutex, kFlowLockShards> flow_index_shard_mu_{};
+  mutable std::array<std::mutex, kFlowLockShards> timer_shard_mu_{};
   std::array<std::set<uint64_t>, kFlowLockShards> active_flow_ids_shard_{};
   std::array<std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>, kFlowLockShards> timer_heap_shard_{};
   uint32_t poll_rr_shard_ = 0;
@@ -251,8 +253,8 @@ class TcpDataplaneCore {
   uint64_t next_flow_id_ = 1;
   uint32_t next_ephemeral_port_ = 40000;
   uint32_t seq_seed_ = 0x10203040U;
-  std::unordered_map<uint64_t, FlowEntry> flows_by_id_;
-  std::unordered_map<FlowKey, uint64_t, FlowKeyHash> flow_index_;
+  std::array<std::unordered_map<uint64_t, FlowEntry>, kFlowLockShards> flows_by_id_shard_{};
+  std::array<std::unordered_map<FlowKey, uint64_t, FlowKeyHash>, kFlowLockShards> flow_index_shard_{};
   size_t tx_ring_slot_size_ = 2048;
   size_t tx_ring_capacity_ = 8192;
   std::vector<uint8_t> tx_ring_storage_;
