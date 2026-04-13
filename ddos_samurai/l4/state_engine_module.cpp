@@ -242,6 +242,64 @@ PyObject* get_states_batch(PyObject* self, PyObject* args) {
   return Py_BuildValue("NNNNNN", seq_list, ack_list, state_list, win_list, mss_list, ttl_list);
 }
 
+PyObject* get_states_batch_packed(PyObject* self, PyObject* args) {
+  (void)self;
+  uint32_t src_ip = 0;
+  uint16_t start_port = 0;
+  uint32_t count = 0;
+  if (!PyArg_ParseTuple(args, "IHI", &src_ip, &start_port, &count)) {
+    return nullptr;
+  }
+
+  const Py_ssize_t n_seq = static_cast<Py_ssize_t>(count) * static_cast<Py_ssize_t>(sizeof(uint32_t));
+  const Py_ssize_t n_ack = static_cast<Py_ssize_t>(count) * static_cast<Py_ssize_t>(sizeof(uint32_t));
+  const Py_ssize_t n_state = static_cast<Py_ssize_t>(count) * static_cast<Py_ssize_t>(sizeof(uint8_t));
+  const Py_ssize_t n_win = static_cast<Py_ssize_t>(count) * static_cast<Py_ssize_t>(sizeof(uint16_t));
+  const Py_ssize_t n_mss = static_cast<Py_ssize_t>(count) * static_cast<Py_ssize_t>(sizeof(uint16_t));
+  const Py_ssize_t n_ttl = static_cast<Py_ssize_t>(count) * static_cast<Py_ssize_t>(sizeof(uint8_t));
+
+  PyObject* seq_bytes = PyBytes_FromStringAndSize(nullptr, n_seq);
+  PyObject* ack_bytes = PyBytes_FromStringAndSize(nullptr, n_ack);
+  PyObject* state_bytes = PyBytes_FromStringAndSize(nullptr, n_state);
+  PyObject* win_bytes = PyBytes_FromStringAndSize(nullptr, n_win);
+  PyObject* mss_bytes = PyBytes_FromStringAndSize(nullptr, n_mss);
+  PyObject* ttl_bytes = PyBytes_FromStringAndSize(nullptr, n_ttl);
+  if (!seq_bytes || !ack_bytes || !state_bytes || !win_bytes || !mss_bytes || !ttl_bytes) {
+    Py_XDECREF(seq_bytes);
+    Py_XDECREF(ack_bytes);
+    Py_XDECREF(state_bytes);
+    Py_XDECREF(win_bytes);
+    Py_XDECREF(mss_bytes);
+    Py_XDECREF(ttl_bytes);
+    return nullptr;
+  }
+
+  uint32_t found = 0;
+  if (l4se_get_states_batch(
+          src_ip,
+          start_port,
+          count,
+          reinterpret_cast<uint32_t*>(PyBytes_AS_STRING(seq_bytes)),
+          reinterpret_cast<uint32_t*>(PyBytes_AS_STRING(ack_bytes)),
+          reinterpret_cast<uint8_t*>(PyBytes_AS_STRING(state_bytes)),
+          reinterpret_cast<uint16_t*>(PyBytes_AS_STRING(win_bytes)),
+          reinterpret_cast<uint16_t*>(PyBytes_AS_STRING(mss_bytes)),
+          reinterpret_cast<uint8_t*>(PyBytes_AS_STRING(ttl_bytes)),
+          &found) != 0) {
+    Py_DECREF(seq_bytes);
+    Py_DECREF(ack_bytes);
+    Py_DECREF(state_bytes);
+    Py_DECREF(win_bytes);
+    Py_DECREF(mss_bytes);
+    Py_DECREF(ttl_bytes);
+    PyErr_SetString(PyExc_RuntimeError, "Failed to read packed states batch from L4 state engine");
+    return nullptr;
+  }
+
+  (void)found;
+  return Py_BuildValue("NNNNNN", seq_bytes, ack_bytes, state_bytes, win_bytes, mss_bytes, ttl_bytes);
+}
+
 PyObject* get_tcp_state(PyObject* self, PyObject* args) {
   (void)self;
   uint32_t src_ip = 0;
@@ -806,6 +864,7 @@ PyMethodDef kMethods[] = {
     {"get_tcp_flow", get_tcp_flow, METH_VARARGS, "Read a custom TCP dataplane flow by flow id."},
     {"get_tcp_state", get_tcp_state, METH_VARARGS, "Get TCP state from the state table."},
     {"get_states_batch", get_states_batch, METH_VARARGS, "Get multiple TCP states in one call."},
+    {"get_states_batch_packed", get_states_batch_packed, METH_VARARGS, "Get multiple TCP states as packed bytes."},
     {"start_rx_handler", start_rx_handler, METH_VARARGS, "Start background RX handler thread and return handler id."},
     {"stop_rx_handler", stop_rx_handler, METH_VARARGS, "Stop background RX handler by handler id."},
     {"set_mimicry_settings", set_mimicry_settings, METH_VARARGS, "Set global TCP mimicry settings (Window, MSS, TTL)."},

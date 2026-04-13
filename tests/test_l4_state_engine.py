@@ -3,6 +3,7 @@ import struct
 import threading
 import time
 import unittest
+import array
 
 try:
     from ddos_samurai import l4_state_engine as l4se
@@ -173,6 +174,46 @@ class TestL4StateEngine(unittest.TestCase):
         self.assertEqual(errors, [])
         stats = l4se.get_state_engine_stats()
         self.assertGreater(int(stats.get("active_entries", 0)), 0)
+
+    def test_get_states_batch_packed_matches_legacy(self):
+        if not hasattr(l4se, "get_states_batch_packed"):
+            self.skipTest("packed batch API unavailable")
+        l4se.configure_state_engine(2048, 32, 10)
+        l4se.set_mimicry_settings(62000, 1460, 61)
+
+        local_ip = "10.20.30.40"
+        remote_ip = "10.20.30.1"
+        local_port = 41000
+        remote_port = 443
+
+        syn = _build_tcp_ipv4_frame(local_ip, remote_ip, local_port, remote_port, seq=5000, ack=0, flags=0x02)
+        updated = l4se.ingest_tx_packets(syn, len(syn), 1)
+        self.assertEqual(updated, 1)
+
+        src_ip_i = _ip_to_int(local_ip)
+        seq_list, ack_list, state_list, win_list, mss_list, ttl_list = l4se.get_states_batch(src_ip_i, local_port, 8)
+        seq_raw, ack_raw, state_raw, win_raw, mss_raw, ttl_raw = l4se.get_states_batch_packed(src_ip_i, local_port, 8)
+
+        self.assertEqual(len(seq_raw), 8 * 4)
+        self.assertEqual(len(ack_raw), 8 * 4)
+        self.assertEqual(len(state_raw), 8)
+        self.assertEqual(len(win_raw), 8 * 2)
+        self.assertEqual(len(mss_raw), 8 * 2)
+        self.assertEqual(len(ttl_raw), 8)
+
+        seq_arr = array.array("I"); seq_arr.frombytes(seq_raw)
+        ack_arr = array.array("I"); ack_arr.frombytes(ack_raw)
+        state_arr = array.array("B"); state_arr.frombytes(state_raw)
+        win_arr = array.array("H"); win_arr.frombytes(win_raw)
+        mss_arr = array.array("H"); mss_arr.frombytes(mss_raw)
+        ttl_arr = array.array("B"); ttl_arr.frombytes(ttl_raw)
+
+        self.assertEqual(list(seq_arr), [int(x) for x in seq_list])
+        self.assertEqual(list(ack_arr), [int(x) for x in ack_list])
+        self.assertEqual(list(state_arr), [int(x) for x in state_list])
+        self.assertEqual(list(win_arr), [int(x) for x in win_list])
+        self.assertEqual(list(mss_arr), [int(x) for x in mss_list])
+        self.assertEqual(list(ttl_arr), [int(x) for x in ttl_list])
 
 
 if __name__ == "__main__":
