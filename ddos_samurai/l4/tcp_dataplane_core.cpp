@@ -86,7 +86,7 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
       config.idle_timeout_ms == 0) {
     return false;
   }
-  std::lock_guard<std::mutex> guard(mu_);
+  std::scoped_lock<std::mutex, std::mutex> guard(state_mu_, tx_mu_);
   config_ = config;
   next_flow_id_ = 1;
   next_ephemeral_port_ = 40000;
@@ -104,6 +104,9 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   completions_.clear();
   rx_payloads_.clear();
   stats_ = TcpDpStatsSnapshot{};
+  tx_packets_queued_.store(0, std::memory_order_relaxed);
+  tx_packets_drained_.store(0, std::memory_order_relaxed);
+  tx_packets_sent_.store(0, std::memory_order_relaxed);
   return true;
 }
 
@@ -111,7 +114,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
   if (!packets || packet_size == 0 || count == 0) {
     return 0;
   }
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(tx_mu_);
   uint32_t updated = 0;
   for (size_t i = 0; i < count; ++i) {
     const uint8_t* pkt = packets + (i * packet_size);
@@ -225,7 +228,7 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   if (src_ip == 0 || dst_ip == 0 || dst_port == 0) {
     return 0;
   }
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(state_mu_);
   if (src_port == 0) {
     src_port = static_cast<uint16_t>(next_ephemeral_port_++);
   }
@@ -264,7 +267,7 @@ uint32_t TcpDataplaneCore::EnqueueSend(uint64_t flow_id, const uint8_t* payload,
   if (!payload || payload_len == 0 || payload_len > 65535U) {
     return 0;
   }
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(state_mu_);
   auto it = flows_by_id_.find(flow_id);
   if (it == flows_by_id_.end()) {
     return 0;
@@ -303,7 +306,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     return 0;
   }
 
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(state_mu_);
   stats_.rx_frames++;
   const FlowKey key{dst_ip, src_ip, dst_port, src_port};
   auto idx = flow_index_.find(key);
@@ -363,7 +366,10 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     }
     flow.rcv_nxt = AdvanceSeq(seq, payload_len);
     stats_.rx_data_bytes += payload_len;
-    rx_payloads_.push_back(TcpDpRxPayload{flow.flow_id, ExtractIpv4TcpPayload(frame, frame_len)});
+    {
+      std::lock_guard<std::mutex> qguard(tx_mu_);
+      rx_payloads_.push_back(TcpDpRxPayload{flow.flow_id, ExtractIpv4TcpPayload(frame, frame_len)});
+    }
     auto ack_pkt = BuildPacket(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0);
     QueuePacket(flow, std::move(ack_pkt), flow.snd_nxt, flow.rcv_nxt, 0, false);
   }
@@ -384,7 +390,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
   if (budget == 0) {
     budget = 1024;
   }
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(state_mu_);
   if (now_ns == 0) {
     now_ns = DefaultNowNs();
   }
@@ -476,7 +482,7 @@ bool TcpDataplaneCore::DrainTxPacketsConcatAlloc(
   *out_packet_size = 0;
   *out_uniform = false;
 
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(state_mu_);
 
   const uint32_t total_available =
       tx_ring_count_ + static_cast<uint32_t>(tx_packets_overflow_.size());
@@ -568,8 +574,8 @@ bool TcpDataplaneCore::DrainTxPacketsConcatAlloc(
   }
   tx_ring_count_ -= take_ring;
 
-  stats_.tx_packets_drained += max_packets;
-  stats_.tx_packets_sent += max_packets;
+  tx_packets_drained_.fetch_add(max_packets, std::memory_order_relaxed);
+  tx_packets_sent_.fetch_add(max_packets, std::memory_order_relaxed);
 
   *out_buffer = buffer;
   *out_total_len = total_len;
@@ -593,7 +599,7 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
   *out_packet_size = 0;
   *out_stride = 0;
 
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(tx_mu_);
   if (tx_ring_count_ == 0 || !tx_packets_overflow_.empty()) {
     return true;
   }
@@ -637,7 +643,7 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
 }
 
 uint32_t TcpDataplaneCore::ConsumeTxPackets(uint32_t max_packets) {
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(tx_mu_);
   if (max_packets == 0) {
     return 0;
   }
@@ -663,13 +669,13 @@ uint32_t TcpDataplaneCore::ConsumeTxPackets(uint32_t max_packets) {
     tx_packets_overflow_.pop_front();
   }
 
-  stats_.tx_packets_drained += max_packets;
-  stats_.tx_packets_sent += max_packets;
+  tx_packets_drained_.fetch_add(max_packets, std::memory_order_relaxed);
+  tx_packets_sent_.fetch_add(max_packets, std::memory_order_relaxed);
   return max_packets;
 }
 
 std::vector<std::vector<uint8_t>> TcpDataplaneCore::DrainTxPackets(uint32_t max_packets) {
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(tx_mu_);
   const uint32_t total_available = tx_ring_count_ + static_cast<uint32_t>(tx_packets_overflow_.size());
   if (max_packets == 0 || max_packets > total_available) {
     max_packets = total_available;
@@ -697,15 +703,13 @@ std::vector<std::vector<uint8_t>> TcpDataplaneCore::DrainTxPackets(uint32_t max_
     tx_packets_overflow_.pop_front();
     drained++;
   }
-  for (uint32_t i = 0; i < drained; ++i) {
-    stats_.tx_packets_drained++;
-    stats_.tx_packets_sent++;
-  }
+  tx_packets_drained_.fetch_add(static_cast<uint64_t>(drained), std::memory_order_relaxed);
+  tx_packets_sent_.fetch_add(static_cast<uint64_t>(drained), std::memory_order_relaxed);
   return out;
 }
 
 std::vector<TcpDpCompletion> TcpDataplaneCore::CollectCompletions() {
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(tx_mu_);
   std::vector<TcpDpCompletion> out;
   out.reserve(completions_.size());
   while (!completions_.empty()) {
@@ -716,7 +720,7 @@ std::vector<TcpDpCompletion> TcpDataplaneCore::CollectCompletions() {
 }
 
 std::vector<TcpDpRxPayload> TcpDataplaneCore::CollectRxPayloads() {
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(tx_mu_);
   std::vector<TcpDpRxPayload> out;
   out.reserve(rx_payloads_.size());
   while (!rx_payloads_.empty()) {
@@ -727,12 +731,16 @@ std::vector<TcpDpRxPayload> TcpDataplaneCore::CollectRxPayloads() {
 }
 
 TcpDpStatsSnapshot TcpDataplaneCore::SnapshotStats() const {
-  std::lock_guard<std::mutex> guard(mu_);
-  return stats_;
+  std::lock_guard<std::mutex> guard(state_mu_);
+  TcpDpStatsSnapshot out = stats_;
+  out.tx_packets_queued = tx_packets_queued_.load(std::memory_order_relaxed);
+  out.tx_packets_drained = tx_packets_drained_.load(std::memory_order_relaxed);
+  out.tx_packets_sent = tx_packets_sent_.load(std::memory_order_relaxed);
+  return out;
 }
 
 TcpDpFlowSnapshot TcpDataplaneCore::GetFlow(uint64_t flow_id) const {
-  std::lock_guard<std::mutex> guard(mu_);
+  std::lock_guard<std::mutex> guard(state_mu_);
   TcpDpFlowSnapshot out;
   auto it = flows_by_id_.find(flow_id);
   if (it == flows_by_id_.end()) {
@@ -928,6 +936,7 @@ bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len) {
   if (!data || len == 0) {
     return false;
   }
+  std::lock_guard<std::mutex> guard(tx_mu_);
   if (len <= tx_ring_slot_size_ && tx_ring_count_ < static_cast<uint32_t>(tx_ring_capacity_)) {
     const uint32_t idx = tx_ring_tail_;
     const size_t base = static_cast<size_t>(idx) * tx_ring_slot_size_;
@@ -935,12 +944,12 @@ bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len) {
     tx_ring_lengths_[idx] = static_cast<uint16_t>(len);
     tx_ring_tail_ = (tx_ring_tail_ + 1U) % static_cast<uint32_t>(tx_ring_capacity_);
     tx_ring_count_++;
-    stats_.tx_packets_queued++;
+    tx_packets_queued_.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
   std::vector<uint8_t> pkt(data, data + len);
   tx_packets_overflow_.push_back(std::move(pkt));
-  stats_.tx_packets_queued++;
+  tx_packets_queued_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -1019,6 +1028,7 @@ void TcpDataplaneCore::QueuePacket(
 }
 
 void TcpDataplaneCore::PushCompletion(uint64_t flow_id, TcpDpState state, bool success, const char* event) {
+  std::lock_guard<std::mutex> guard(tx_mu_);
   completions_.push_back(TcpDpCompletion{flow_id, static_cast<uint8_t>(state), static_cast<uint8_t>(success ? 1 : 0), event});
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -237,7 +238,8 @@ class TcpDataplaneCore {
   bool IsCountedActive(TcpDpState state) const;
   void SetFlowState(FlowEntry& flow, TcpDpState next_state);
 
-  mutable std::mutex mu_;
+  mutable std::mutex state_mu_;
+  mutable std::mutex tx_mu_;
   TcpDpConfig config_;
   uint64_t next_flow_id_ = 1;
   uint32_t next_ephemeral_port_ = 40000;
@@ -256,6 +258,9 @@ class TcpDataplaneCore {
   std::deque<std::vector<uint8_t>> tx_packets_overflow_;
   std::deque<TcpDpCompletion> completions_;
   std::deque<TcpDpRxPayload> rx_payloads_;
+  std::atomic<uint64_t> tx_packets_queued_{0};
+  std::atomic<uint64_t> tx_packets_drained_{0};
+  std::atomic<uint64_t> tx_packets_sent_{0};
   TcpDpStatsSnapshot stats_{};
 };
 
