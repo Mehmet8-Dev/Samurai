@@ -1489,20 +1489,22 @@ async def worker_process(
                         pass
 
             def _ingest_state_from_batch(batch, sent_count: int):
-                if sent_count <= 0 or not _state_engine_ready:
-                    pass
-                else:
-                    if getattr(senders, "FAST_SENDER_AVAILABLE", False) and hasattr(senders, "fast_sender"):
-                        fs = senders.fast_sender
-                        if hasattr(fs, "ingest_tx_packets"):
-                            try:
-                                fs.ingest_tx_packets(
-                                    batch.get("cpu"),
-                                    int(batch.get("packet_size", 0) or 0),
-                                    int(sent_count),
-                                )
-                            except Exception:
-                                pass
+                if sent_count <= 0:
+                    return
+                # Avoid double parser cost: choose one ingest backend per batch.
+                if _state_engine_ready and getattr(senders, "FAST_SENDER_AVAILABLE", False) and hasattr(senders, "fast_sender"):
+                    fs = senders.fast_sender
+                    if hasattr(fs, "ingest_tx_packets"):
+                        try:
+                            fs.ingest_tx_packets(
+                                batch.get("cpu"),
+                                int(batch.get("packet_size", 0) or 0),
+                                int(sent_count),
+                            )
+                            worker_stats["state_ingest_backend"] = "fast_sender_state_engine"
+                        except Exception:
+                            pass
+                    return
                 if _custom_tcp_ready and getattr(senders, "custom_tcp_dataplane", None) is not None:
                     tcpdp = senders.custom_tcp_dataplane
                     if hasattr(tcpdp, "ingest_tcp_tx_packets"):
@@ -1512,6 +1514,7 @@ async def worker_process(
                                 int(batch.get("packet_size", 0) or 0),
                                 int(sent_count),
                             )
+                            worker_stats["state_ingest_backend"] = "custom_tcp_dataplane"
                         except Exception:
                             pass
 
