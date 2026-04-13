@@ -157,12 +157,68 @@ def _dedupe(seq: List[str]) -> List[str]:
     return out
 
 
+def _resolve_nvcc_path() -> str:
+    nvcc = str(os.environ.get("SAMURAI_NVCC", "") or "").strip()
+    if nvcc:
+        return nvcc if os.path.exists(nvcc) else ""
+    auto = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    return auto if os.path.exists(auto) else ""
+
+
+def _resolve_cuda_home(nvcc_path: str) -> str:
+    cuda_home = str(os.environ.get("CUDA_HOME", "") or "").strip()
+    if cuda_home:
+        return cuda_home
+    if nvcc_path:
+        return os.path.dirname(os.path.dirname(nvcc_path))
+    return ""
+
+
+def _resolve_cuda_runtime_lib_dir(cuda_home: str) -> str:
+    for candidate in [
+        os.path.join(cuda_home, "lib64"),
+        os.path.join(cuda_home, "targets", "x86_64-linux", "lib"),
+    ]:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return ""
+
+
 class OptionalBuildExt(build_ext):
     """Custom build_ext that makes XDP extension optional."""
 
     def run(self):
         super().run()
         self._build_cuda_module()
+
+    def build_extensions(self):
+        nvcc = _resolve_nvcc_path()
+        if nvcc and hasattr(self.compiler, "src_extensions") and hasattr(self.compiler, "_compile"):
+            if ".cu" not in self.compiler.src_extensions:
+                self.compiler.src_extensions.append(".cu")
+
+            default_compiler_so = self.compiler.compiler_so
+            default_compile = self.compiler._compile
+
+            def _compile(obj, src, ext, cc_args, extra_postargs, pp_opts):
+                if os.path.splitext(src)[1] == ".cu":
+                    cuda_postargs = []
+                    if isinstance(extra_postargs, dict):
+                        cuda_postargs = list(extra_postargs.get("nvcc", []))
+                    elif isinstance(extra_postargs, list):
+                        cuda_postargs = list(extra_postargs)
+                    self.compiler.set_executable("compiler_so", nvcc)
+                    try:
+                        return default_compile(obj, src, ext, cc_args, cuda_postargs, pp_opts)
+                    finally:
+                        self.compiler.compiler_so = default_compiler_so
+                cxx_postargs = extra_postargs
+                if isinstance(extra_postargs, dict):
+                    cxx_postargs = list(extra_postargs.get("cxx", []))
+                return default_compile(obj, src, ext, cc_args, cxx_postargs, pp_opts)
+
+            self.compiler._compile = _compile
+        super().build_extensions()
 
     def build_extension(self, ext):
         try:
@@ -193,16 +249,12 @@ class OptionalBuildExt(build_ext):
         if not os.path.exists(src_path):
             return
 
-        nvcc = str(os.environ.get("SAMURAI_NVCC", "") or "").strip()
-        if not nvcc:
-            nvcc = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+        nvcc = _resolve_nvcc_path()
         if not os.path.exists(nvcc):
             print("\nWarning: nvcc not found; skipping gpu_packet_cuda.cu build.\n")
             return
 
-        cuda_home = str(os.environ.get("CUDA_HOME", "") or "").strip()
-        if not cuda_home:
-            cuda_home = os.path.dirname(os.path.dirname(nvcc))
+        cuda_home = _resolve_cuda_home(nvcc)
         cuda_include = os.path.join(cuda_home, "include")
 
         build_temp = os.path.abspath(self.build_temp or os.path.join(project_root, "build", "temp"))
@@ -487,22 +539,59 @@ def get_extensions() -> List[Extension]:
     )
     extensions.append(l7_emu_native)
 
+    gpu_cuda_payload_sources = [
+        "ddos_samurai/gpu_cuda_payload/src/bridge_pybind.cpp",
+        "ddos_samurai/gpu_cuda_payload/src/compiler.cpp",
+        "ddos_samurai/gpu_cuda_payload/src/vector_spec_parser.cpp",
+        "ddos_samurai/gpu_cuda_payload/src/plan_batch.cpp",
+        "ddos_samurai/gpu_cuda_payload/src/oracle.cpp",
+    ]
+    gpu_cuda_payload_include_dirs = [
+        pybind11_include,
+        os.path.join(project_root, "ddos_samurai", "gpu_cuda_payload", "include"),
+    ]
+    gpu_cuda_payload_compile_args: List[str] | Dict[str, List[str]] = ["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"]
+    gpu_cuda_payload_link_args = ["-lpthread", "-lm"]
+    gpu_cuda_payload_macros: List[Tuple[str, str]] = []
+    gpu_cuda_payload_library_dirs: List[str] = []
+
+    nvcc_path = _resolve_nvcc_path()
+    cuda_home = _resolve_cuda_home(nvcc_path)
+    cuda_include = os.path.join(cuda_home, "include") if cuda_home else ""
+    cuda_lib_dir = _resolve_cuda_runtime_lib_dir(cuda_home) if cuda_home else ""
+    enable_payload_cuda = (
+        (not _env_flag("SAMURAI_SKIP_CUDA_BUILD", "0"))
+        and bool(nvcc_path)
+        and bool(cuda_include)
+        and os.path.exists(cuda_include)
+    )
+    if enable_payload_cuda:
+        gpu_cuda_payload_sources.extend([
+            "ddos_samurai/gpu_cuda_payload/cuda/planner_kernels.cu",
+            "ddos_samurai/gpu_cuda_payload/cuda/rng_kernels.cu",
+            "ddos_samurai/gpu_cuda_payload/cuda/template_expand_kernels.cu",
+        ])
+        gpu_cuda_payload_include_dirs.append(cuda_include)
+        if cuda_lib_dir:
+            gpu_cuda_payload_library_dirs.append(cuda_lib_dir)
+        gpu_cuda_payload_link_args.append("-lcudart")
+        gpu_cuda_payload_macros.append(("SAMURAI_GPU_CUDA_PAYLOAD_KERNELS", "1"))
+        gpu_cuda_payload_compile_args = {
+            "cxx": ["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"],
+            "nvcc": ["-O3", "-std=c++20", "-Xcompiler", "-fPIC", "-diag-suppress=177"],
+        }
+    else:
+        print("Info: CUDA planner kernels disabled for _gpu_cuda_payload_native (nvcc/CUDA headers not found).")
+
     gpu_cuda_payload_native = Extension(
         "ddos_samurai._gpu_cuda_payload_native",
-        sources=[
-            "ddos_samurai/gpu_cuda_payload/src/bridge_pybind.cpp",
-            "ddos_samurai/gpu_cuda_payload/src/compiler.cpp",
-            "ddos_samurai/gpu_cuda_payload/src/vector_spec_parser.cpp",
-            "ddos_samurai/gpu_cuda_payload/src/plan_batch.cpp",
-            "ddos_samurai/gpu_cuda_payload/src/oracle.cpp",
-        ],
-        include_dirs=[
-            pybind11_include,
-            os.path.join(project_root, "ddos_samurai", "gpu_cuda_payload", "include"),
-        ],
+        sources=gpu_cuda_payload_sources,
+        include_dirs=gpu_cuda_payload_include_dirs,
+        library_dirs=gpu_cuda_payload_library_dirs,
         language="c++",
-        extra_compile_args=["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"],
-        extra_link_args=["-lpthread", "-lm"],
+        extra_compile_args=gpu_cuda_payload_compile_args,
+        extra_link_args=gpu_cuda_payload_link_args,
+        define_macros=gpu_cuda_payload_macros,
     )
     extensions.append(gpu_cuda_payload_native)
 
