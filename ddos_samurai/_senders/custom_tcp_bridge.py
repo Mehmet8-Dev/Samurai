@@ -411,13 +411,17 @@ async def service_custom_tcp_runtime(
 ) -> Dict[str, Any]:
     aggregate: Dict[str, Any] = {}
     service_loops = 0
+    idle_sleep_s = 0.00005
+    idle_sleep_max_s = 0.001
     while not stop_event.is_set():
         service_loops += 1
+        did_work = False
         polled = runtime_poll_snapshot_fn(default_bridge_api)
         if polled:
             polled.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
             polled.setdefault("runtime_transport_contract", "custom_tcp_runtime_bridge")
             aggregate = merge_bridge_stats(aggregate, polled)
+            did_work = did_work or bool(int(polled.get("runtime_transport_poll_actions", 0) or 0))
         flushed = await flush_fn(
             profile=profile,
             verbose=verbose,
@@ -435,11 +439,19 @@ async def service_custom_tcp_runtime(
             flushed.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
             flushed.setdefault("runtime_transport_contract", "custom_tcp_runtime_bridge")
             aggregate = merge_bridge_stats(aggregate, flushed)
+            did_work = did_work or bool(
+                int(flushed.get("custom_tcp_tx_flush_packets", 0) or 0)
+                or int(flushed.get("sent", 0) or 0)
+                or int(flushed.get("attempted", 0) or 0)
+            )
             # Ensure cooperative scheduling even when flush path returns
             # immediately (e.g., strict preflight fallback).
             await asyncio.sleep(0)
+        if did_work:
+            idle_sleep_s = 0.00005
             continue
-        await asyncio.sleep(0.001)
+        await asyncio.sleep(idle_sleep_s)
+        idle_sleep_s = min(idle_sleep_max_s, idle_sleep_s * 2.0)
 
     for _ in range(8):
         service_loops += 1
