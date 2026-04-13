@@ -156,26 +156,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stateful", action="store_true", help="Enable Stateful TCP Engine (Viper-State) for full 3-way handshake.")
     parser.add_argument(
         "--sender-backend",
-        choices=["auto", "txring", "c_ext_l3", "python", "xdp"],
-        default="txring",
-        help="Raw sender backend seçimi: auto|txring|c_ext_l3|python|xdp.",
+        choices=["xdp"],
+        default="xdp",
+        help="Raw sender backend seçimi: xdp (zorunlu).",
     )
     parser.add_argument(
         "--sender-fallback-policy",
-        choices=["allow", "fail"],
+        choices=["fail"],
         default="fail",
-        help="Backend fallback politikası: allow=alt yola düş, fail=run'ı fail-visible bitir.",
+        help="Backend fallback politikası: fail (zorunlu).",
     )
     _stateful_runtime_backend_env = str(
         os.environ.get("SAMURAI_STATEFUL_RUNTIME_BACKEND", "afxdp") or "afxdp"
     ).strip().lower()
-    if _stateful_runtime_backend_env not in {"afxdp", "dpdk"}:
+    if _stateful_runtime_backend_env not in {"afxdp"}:
         _stateful_runtime_backend_env = "afxdp"
     parser.add_argument(
         "--stateful-runtime-backend",
-        choices=["afxdp", "dpdk"],
+        choices=["afxdp"],
         default=_stateful_runtime_backend_env,
-        help="Yeni stateful runtime backend seçimi: afxdp|dpdk.",
+        help="Yeni stateful runtime backend seçimi: afxdp (zorunlu).",
     )
     _dp_mode_env_default = _normalize_dataplane_core_mode(
         os.environ.get(
@@ -416,9 +416,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--custom-tcp-backend",
-        choices=["af_xdp", "txring"],
+        choices=["af_xdp"],
         default=str(os.environ.get("SAMURAI_CUSTOM_TCP_BACKEND", "af_xdp") or "af_xdp"),
-        help="Custom TCP dataplane backend hedefi: af_xdp|txring.",
+        help="Custom TCP dataplane backend hedefi: af_xdp (zorunlu).",
     )
     parser.add_argument(
         "--custom-tcp-initial-rto-ms",

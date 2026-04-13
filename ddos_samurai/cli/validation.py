@@ -64,8 +64,8 @@ def _validate_hybrid_cuda_args(parser: argparse.ArgumentParser, args: argparse.N
 
 
 def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    sender_backend = str(getattr(args, "sender_backend", "auto") or "auto").strip().lower()
-    fallback_policy = str(getattr(args, "sender_fallback_policy", "allow") or "allow").strip().lower()
+    sender_backend = str(getattr(args, "sender_backend", "xdp") or "xdp").strip().lower()
+    fallback_policy = str(getattr(args, "sender_fallback_policy", "fail") or "fail").strip().lower()
     dataplane_core_mode = _normalize_dataplane_core_mode(getattr(args, "dataplane_core_mode", "off"))
     afpacket_hugepage_mode = _normalize_afpacket_hugepage_mode(
         getattr(args, "afpacket_hugepage_mode", "off")
@@ -141,16 +141,18 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: --quic-expect-header-value-contains en fazla 159 karakter olmalıdır.")
     if len(str(getattr(args, "quic_expect_body_substring", "") or "")) > 159:
         parser.error("Hata: --quic-expect-body-substring en fazla 159 karakter olmalıdır.")
-    if (xdp_enable or sender_backend == "xdp") and not xdp_interface:
+    if sender_backend != "xdp":
+        parser.error("Hata: kernel/legacy sender backend kaldırıldı; yalnızca --sender-backend xdp desteklenir.")
+    if fallback_policy != "fail":
+        parser.error("Hata: fallback kaldırıldı; yalnızca --sender-fallback-policy fail desteklenir.")
+    if runtime_backend != "afxdp":
+        parser.error("Hata: stateful runtime yalnızca afxdp desteklenir.")
+    if xdp_enable and not xdp_interface:
         parser.error("Hata: XDP yolu için --xdp-interface zorunludur.")
     if (xdp_enable or sender_backend == "xdp") and xdp_attach_bpf and not xdp_bpf_section:
         parser.error("Hata: --xdp-attach-bpf açıkken --xdp-bpf-section boş olamaz.")
-    if fallback_policy == "fail" and sender_backend == "auto":
-        parser.error("Hata: --sender-fallback-policy fail için --sender-backend auto kullanılamaz.")
     if dataplane_core_mode == "required" and fallback_policy != "fail":
         parser.error("Hata: --dataplane-core-mode required için --sender-fallback-policy fail zorunludur.")
-    if afpacket_hugepage_mode == "required" and sender_backend not in {"txring"}:
-        parser.error("Hata: --afpacket-hugepage-mode required yalnızca --sender-backend txring ile kullanılabilir.")
     if dp_queue_strategy == "map":
         if not dp_queue_map:
             parser.error("Hata: --dp-queue-strategy map için --dp-queue-map zorunludur.")
@@ -160,10 +162,6 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
             parser.error(f"Hata: --dp-queue-map formatı geçersiz: {exc}")
     if l7_template_mode not in {"compat", "profile"}:
         parser.error("Hata: --l7-template-mode compat veya profile olmalıdır.")
-    if runtime_backend == "dpdk" and bool(getattr(args, "l7_capability_strict", False)):
-        parser.error(
-            "Hata: stateful-runtime-backend=dpdk strict modda not_implemented_hard_fail (sessiz fallback yok)."
-        )
     if topo_spec_json:
         if topo_seed < 0:
             parser.error("Hata: --topo-spec-json ile birlikte --topo-seed zorunludur (>=0).")
@@ -220,8 +218,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         if l7_quic_bridge_autopromote:
             parser.error("Hata: --l7-quic-require-native ile --l7-quic-bridge-autopromote birlikte kullanılamaz.")
     if lab_profile == "dedicated":
-        if sender_backend == "auto":
-            parser.error("Hata: --lab-profile dedicated için --sender-backend explicit olmalıdır (auto kullanılamaz).")
+        if sender_backend != "xdp":
+            parser.error("Hata: --lab-profile dedicated için yalnızca --sender-backend xdp desteklenir.")
         if fallback_policy != "fail":
             parser.error("Hata: --lab-profile dedicated için --sender-fallback-policy fail zorunludur.")
         if int(getattr(args, "dp_queues", 1) or 1) < 1:
@@ -328,15 +326,9 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
             os.environ["SAMURAI_QUIC_BUILD_MODE"] = "native_required"
             utils.log_info("native QUIC zorunluluğu için SAMURAI_QUIC_BUILD_MODE=native_required ayarlandı.")
 
-    sender_backend = str(getattr(args, "sender_backend", "auto") or "auto").strip().lower()
-    afpacket_hugepage_mode = _normalize_afpacket_hugepage_mode(
-        getattr(args, "afpacket_hugepage_mode", "off")
-    )
-    if sender_backend == "txring" and afpacket_hugepage_mode != "required":
-        args.afpacket_hugepage_mode = "required"
-        utils.log_info(
-            "lab-profile=dedicated + txring için --afpacket-hugepage-mode otomatik required olarak ayarlandı."
-        )
+    sender_backend = str(getattr(args, "sender_backend", "xdp") or "xdp").strip().lower()
+    if sender_backend != "xdp":
+        parser.error("Hata: dedicated profilde yalnızca xdp backend desteklenir.")
 
     workers = int(getattr(args, "workers", multiprocessing.cpu_count()) or 0)
     dp_queues = int(getattr(args, "dp_queues", 1) or 1)
@@ -379,24 +371,19 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
         parser.error("Hata: L7 capability strict yalnızca HTTP/1.1 ve HTTP/2 için kullanılabilir.")
 
     runtime_backend = str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower()
-    if runtime_backend not in {"afxdp", "dpdk"}:
-        parser.error("Hata: --stateful-runtime-backend yalnızca afxdp|dpdk olabilir.")
-    if runtime_backend == "afxdp":
-        xdp_iface = str(getattr(args, "xdp_interface", "") or "").strip()
-        if not xdp_iface:
-            parser.error(
-                "Hata: stateful-runtime-backend=afxdp + l7-capability-strict için --xdp-interface zorunludur."
-            )
-        if attack_vector == "http":
-            custom_tcp_mode = str(getattr(args, "custom_tcp_mode", "off") or "off").strip().lower()
-            if custom_tcp_mode not in {"auto", "required"}:
-                parser.error(
-                    "Hata: HTTP strict AF_XDP runtime için --custom-tcp-mode auto|required olmalıdır."
-                )
-    if runtime_backend == "dpdk":
+    if runtime_backend != "afxdp":
+        parser.error("Hata: --stateful-runtime-backend yalnızca afxdp olabilir.")
+    xdp_iface = str(getattr(args, "xdp_interface", "") or "").strip()
+    if not xdp_iface:
         parser.error(
-            "Hata: stateful-runtime-backend=dpdk strict modda not_implemented_hard_fail."
+            "Hata: stateful-runtime-backend=afxdp + l7-capability-strict için --xdp-interface zorunludur."
         )
+    if attack_vector == "http":
+        custom_tcp_mode = str(getattr(args, "custom_tcp_mode", "off") or "off").strip().lower()
+        if custom_tcp_mode not in {"auto", "required"}:
+            parser.error(
+                "Hata: HTTP strict AF_XDP runtime için --custom-tcp-mode auto|required olmalıdır."
+            )
 
 
 def _parse_label_mix(raw: str) -> dict:
