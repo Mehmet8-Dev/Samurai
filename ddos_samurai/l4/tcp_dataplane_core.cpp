@@ -88,15 +88,17 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   }
   std::lock_guard<std::mutex> sguard(state_mu_);
   std::lock_guard<std::mutex> qguard(tx_mu_);
-  std::lock_guard<std::mutex> tguard(timer_mu_);
   config_ = config;
   next_flow_id_ = 1;
   next_ephemeral_port_ = 40000;
   seq_seed_ = 0x10203040U;
   flows_by_id_.clear();
   flow_index_.clear();
-  active_flow_ids_.clear();
-  timer_heap_ = std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>();
+  for (size_t i = 0; i < kFlowLockShards; ++i) {
+    std::lock_guard<std::mutex> tguard(timer_shard_mu_[i]);
+    active_flow_ids_shard_[i].clear();
+    timer_heap_shard_[i] = std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>();
+  }
   tx_ring_storage_.assign(tx_ring_capacity_ * tx_ring_slot_size_, 0U);
   tx_ring_lengths_.assign(tx_ring_capacity_, 0U);
   tx_ring_head_ = 0;
@@ -109,6 +111,7 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   tx_packets_queued_.store(0, std::memory_order_relaxed);
   tx_packets_drained_.store(0, std::memory_order_relaxed);
   tx_packets_sent_.store(0, std::memory_order_relaxed);
+  poll_rr_shard_ = 0;
   return true;
 }
 
@@ -256,8 +259,9 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   QueuePacket(flow, std::move(syn), flow.iss, 0, 0, true);
   flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
   {
-    std::lock_guard<std::mutex> tguard(timer_mu_);
-    active_flow_ids_.insert(flow_id);
+    const size_t shard = FlowLockShardForFlowId(flow_id);
+    std::lock_guard<std::mutex> tguard(timer_shard_mu_[shard]);
+    active_flow_ids_shard_[shard].insert(flow_id);
   }
   ScheduleFlowTimers(flow, now_ns);
 
@@ -446,73 +450,99 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
   uint32_t actions = 0;
   while (actions < budget) {
     TimerEntry entry{};
+    size_t selected_shard = kFlowLockShards;
+    bool have_entry = false;
     {
-      std::lock_guard<std::mutex> tguard(timer_mu_);
-      if (timer_heap_.empty()) {
+      bool scanned_any = false;
+      for (size_t probe = 0; probe < kFlowLockShards; ++probe) {
+        const size_t shard = static_cast<size_t>((poll_rr_shard_ + probe) % static_cast<uint32_t>(kFlowLockShards));
+        std::lock_guard<std::mutex> tguard(timer_shard_mu_[shard]);
+        if (timer_heap_shard_[shard].empty()) {
+          continue;
+        }
+        scanned_any = true;
+        const TimerEntry top = timer_heap_shard_[shard].top();
+        if (top.due_ns == 0 || top.due_ns > now_ns) {
+          continue;
+        }
+        timer_heap_shard_[shard].pop();
+        if (active_flow_ids_shard_[shard].find(top.flow_id) == active_flow_ids_shard_[shard].end()) {
+          continue;
+        }
+        entry = top;
+        selected_shard = shard;
+        have_entry = true;
+        poll_rr_shard_ = static_cast<uint32_t>((shard + 1) % kFlowLockShards);
         break;
       }
-      entry = timer_heap_.top();
-      if (entry.due_ns == 0 || entry.due_ns > now_ns) {
+      if (!scanned_any || !have_entry) {
         break;
       }
-      timer_heap_.pop();
-      if (active_flow_ids_.find(entry.flow_id) == active_flow_ids_.end()) {
-        continue;
-      }
+    }
+    if (selected_shard >= kFlowLockShards) {
+      break;
     }
 
-    std::lock_guard<std::mutex> sguard(state_mu_);
-    auto it = flows_by_id_.find(entry.flow_id);
-    if (it == flows_by_id_.end()) {
-      continue;
+    std::lock_guard<std::mutex> fguard(flow_shard_mu_[selected_shard]);
+    FlowEntry* flow = nullptr;
+    {
+      std::lock_guard<std::mutex> sguard(state_mu_);
+      auto it = flows_by_id_.find(entry.flow_id);
+      if (it == flows_by_id_.end()) {
+        continue;
+      }
+      flow = &it->second;
     }
-    FlowEntry& flow = it->second;
     switch (entry.kind) {
       case TimerKind::kRto: {
-        if (entry.generation != flow.rto_timer_gen || !flow.outstanding.has_value() || flow.rto_deadline_ns == 0 ||
-            flow.rto_deadline_ns != entry.due_ns) {
+        if (entry.generation != flow->rto_timer_gen || !flow->outstanding.has_value() || flow->rto_deadline_ns == 0 ||
+            flow->rto_deadline_ns != entry.due_ns) {
           break;
         }
-        if (flow.retransmit_count >= config_.max_retransmits) {
-          CloseTimedOutFlow(flow, TcpDpState::kClosed, "retransmit_exhausted");
-          ScheduleFlowTimers(flow, now_ns);
+        if (flow->retransmit_count >= config_.max_retransmits) {
+          CloseTimedOutFlow(*flow, TcpDpState::kClosed, "retransmit_exhausted");
+          ScheduleFlowTimers(*flow, now_ns);
           actions++;
           break;
         }
-        flow.retransmit_count++;
-        stats_.retransmit_count++;
-        flow.outstanding->rto_ms = std::min(flow.outstanding->rto_ms * 2U, config_.connect_timeout_ms);
-        flow.outstanding->deadline_ns = now_ns + NsFromMs(flow.outstanding->rto_ms);
-        flow.rto_deadline_ns = flow.outstanding->deadline_ns;
-        (void)EnqueueTxPacketBytes(flow.outstanding->packet.data(), flow.outstanding->packet.size());
-        ScheduleFlowTimers(flow, now_ns);
+        flow->retransmit_count++;
+        {
+          std::lock_guard<std::mutex> sguard(state_mu_);
+          stats_.retransmit_count++;
+        }
+        flow->outstanding->rto_ms = std::min(flow->outstanding->rto_ms * 2U, config_.connect_timeout_ms);
+        flow->outstanding->deadline_ns = now_ns + NsFromMs(flow->outstanding->rto_ms);
+        flow->rto_deadline_ns = flow->outstanding->deadline_ns;
+        (void)EnqueueTxPacketBytes(flow->outstanding->packet.data(), flow->outstanding->packet.size());
+        ScheduleFlowTimers(*flow, now_ns);
         actions++;
         break;
       }
       case TimerKind::kConnectTimeout: {
-        if (entry.generation != flow.connect_timer_gen || flow.connect_deadline_ns == 0 ||
-            flow.connect_deadline_ns != entry.due_ns) {
+        if (entry.generation != flow->connect_timer_gen || flow->connect_deadline_ns == 0 ||
+            flow->connect_deadline_ns != entry.due_ns) {
           break;
         }
         // Preserve legacy precedence: when both RTO and connect-timeout are due,
         // retransmit/retransmit-exhausted path must run first.
-        if (flow.rto_deadline_ns > 0 && now_ns >= flow.rto_deadline_ns) {
+        if (flow->rto_deadline_ns > 0 && now_ns >= flow->rto_deadline_ns) {
           break;
         }
-        if (flow.state == TcpDpState::kSynSent && flow.outstanding.has_value() && now_ns >= flow.connect_deadline_ns) {
-          CloseTimedOutFlow(flow, TcpDpState::kClosed, "connect_timeout");
-          ScheduleFlowTimers(flow, now_ns);
+        if (flow->state == TcpDpState::kSynSent && flow->outstanding.has_value() && now_ns >= flow->connect_deadline_ns) {
+          CloseTimedOutFlow(*flow, TcpDpState::kClosed, "connect_timeout");
+          ScheduleFlowTimers(*flow, now_ns);
           actions++;
         }
         break;
       }
       case TimerKind::kIdleTimeout: {
-        if (entry.generation != flow.idle_timer_gen || flow.idle_deadline_ns == 0 || flow.idle_deadline_ns != entry.due_ns) {
+        if (entry.generation != flow->idle_timer_gen || flow->idle_deadline_ns == 0 ||
+            flow->idle_deadline_ns != entry.due_ns) {
           break;
         }
-        if (flow.state == TcpDpState::kEstablished && !flow.outstanding.has_value() && now_ns >= flow.idle_deadline_ns) {
-          CloseTimedOutFlow(flow, TcpDpState::kTimeWait, "idle_timeout");
-          ScheduleFlowTimers(flow, now_ns);
+        if (flow->state == TcpDpState::kEstablished && !flow->outstanding.has_value() && now_ns >= flow->idle_deadline_ns) {
+          CloseTimedOutFlow(*flow, TcpDpState::kTimeWait, "idle_timeout");
+          ScheduleFlowTimers(*flow, now_ns);
           actions++;
         }
         break;
@@ -656,7 +686,7 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
   *out_packet_size = 0;
   *out_stride = 0;
 
-  std::lock_guard<std::mutex> guard(tx_mu_);
+  std::lock_guard<std::mutex> guard(state_mu_);
   if (tx_ring_count_ == 0 || !tx_packets_overflow_.empty()) {
     return true;
   }
@@ -1018,11 +1048,12 @@ void TcpDataplaneCore::PushTimer(uint64_t flow_id, TimerKind kind, uint64_t due_
   if (flow_id == 0 || due_ns == 0 || generation == 0) {
     return;
   }
-  timer_heap_.push(TimerEntry{due_ns, flow_id, kind, generation});
+  const size_t shard = FlowLockShardForFlowId(flow_id);
+  std::lock_guard<std::mutex> tguard(timer_shard_mu_[shard]);
+  timer_heap_shard_[shard].push(TimerEntry{due_ns, flow_id, kind, generation});
 }
 
 void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
-  std::lock_guard<std::mutex> tguard(timer_mu_);
   if (now_ns == 0) {
     now_ns = DefaultNowNs();
   }
@@ -1114,11 +1145,12 @@ void TcpDataplaneCore::SetFlowState(FlowEntry& flow, TcpDpState next_state) {
   const bool now_active = IsCountedActive(next_state);
   flow.state = next_state;
   {
-    std::lock_guard<std::mutex> tguard(timer_mu_);
+    const size_t shard = FlowLockShardForFlowId(flow.flow_id);
+    std::lock_guard<std::mutex> tguard(timer_shard_mu_[shard]);
     if (now_active) {
-      active_flow_ids_.insert(flow.flow_id);
+      active_flow_ids_shard_[shard].insert(flow.flow_id);
     } else {
-      active_flow_ids_.erase(flow.flow_id);
+      active_flow_ids_shard_[shard].erase(flow.flow_id);
     }
   }
   if (was_active == now_active) {
