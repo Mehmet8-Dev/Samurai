@@ -203,6 +203,7 @@ class TcpDataplaneCore {
     }
   };
 
+
   static bool ParseIpv4TcpFrame(
       const uint8_t* pkt,
       size_t pkt_len,
@@ -220,7 +221,8 @@ class TcpDataplaneCore {
   static uint64_t NsFromMs(uint32_t ms);
   static uint32_t AdvanceSeq(uint32_t seq, uint32_t amount);
   static std::vector<uint8_t> ExtractIpv4TcpPayload(const uint8_t* pkt, size_t pkt_len);
-
+  static constexpr size_t kFlowLockShards = 16;
+  size_t FlowLockShardForFlowId(uint64_t flow_id) const;
   std::vector<uint8_t> BuildPacket(
       const FlowEntry& flow,
       uint32_t seq,
@@ -241,6 +243,7 @@ class TcpDataplaneCore {
   mutable std::mutex state_mu_;
   mutable std::mutex tx_mu_;
   mutable std::mutex timer_mu_;
+  std::array<std::mutex, kFlowLockShards> flow_shard_mu_{};
   TcpDpConfig config_;
   uint64_t next_flow_id_ = 1;
   uint32_t next_ephemeral_port_ = 40000;

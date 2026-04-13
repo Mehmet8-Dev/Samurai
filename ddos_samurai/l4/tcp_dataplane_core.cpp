@@ -116,7 +116,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
   if (!packets || packet_size == 0 || count == 0) {
     return 0;
   }
-  std::lock_guard<std::mutex> guard(tx_mu_);
+  std::lock_guard<std::mutex> guard(state_mu_);
   uint32_t updated = 0;
   for (size_t i = 0; i < count; ++i) {
     const uint8_t* pkt = packets + (i * packet_size);
@@ -272,23 +272,31 @@ uint32_t TcpDataplaneCore::EnqueueSend(uint64_t flow_id, const uint8_t* payload,
   if (!payload || payload_len == 0 || payload_len > 65535U) {
     return 0;
   }
-  std::lock_guard<std::mutex> guard(state_mu_);
-  auto it = flows_by_id_.find(flow_id);
-  if (it == flows_by_id_.end()) {
+  FlowEntry* flow = nullptr;
+  {
+    std::lock_guard<std::mutex> sguard(state_mu_);
+    auto it = flows_by_id_.find(flow_id);
+    if (it == flows_by_id_.end()) {
+      return 0;
+    }
+    flow = &it->second;
+  }
+  std::lock_guard<std::mutex> fguard(flow_shard_mu_[FlowLockShardForFlowId(flow_id)]);
+  if (flow->state != TcpDpState::kEstablished || flow->outstanding.has_value()) {
     return 0;
   }
-  FlowEntry& flow = it->second;
-  if (flow.state != TcpDpState::kEstablished || flow.outstanding.has_value()) {
-    return 0;
+  auto pkt =
+      BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh), payload, payload_len);
+  const uint32_t seq = flow->snd_nxt;
+  flow->snd_nxt = AdvanceSeq(flow->snd_nxt, static_cast<uint32_t>(payload_len));
+  flow->last_activity_ns = DefaultNowNs();
+  QueuePacket(*flow, std::move(pkt), seq, flow->rcv_nxt, static_cast<uint32_t>(payload_len), true);
+  flow->rto_deadline_ns = flow->outstanding ? flow->outstanding->deadline_ns : 0;
+  ScheduleFlowTimers(*flow, flow->last_activity_ns);
+  {
+    std::lock_guard<std::mutex> sguard(state_mu_);
+    stats_.tx_data_bytes += static_cast<uint64_t>(payload_len);
   }
-  auto pkt = BuildPacket(flow, flow.snd_nxt, flow.rcv_nxt, static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh), payload, payload_len);
-  const uint32_t seq = flow.snd_nxt;
-  flow.snd_nxt = AdvanceSeq(flow.snd_nxt, static_cast<uint32_t>(payload_len));
-  flow.last_activity_ns = DefaultNowNs();
-  QueuePacket(flow, std::move(pkt), seq, flow.rcv_nxt, static_cast<uint32_t>(payload_len), true);
-  flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
-  ScheduleFlowTimers(flow, flow.last_activity_ns);
-  stats_.tx_data_bytes += static_cast<uint64_t>(payload_len);
   return static_cast<uint32_t>(payload_len);
 }
 
@@ -311,81 +319,114 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     return 0;
   }
 
-  std::lock_guard<std::mutex> guard(state_mu_);
-  stats_.rx_frames++;
-  const FlowKey key{dst_ip, src_ip, dst_port, src_port};
-  auto idx = flow_index_.find(key);
-  if (idx == flow_index_.end()) {
-    stats_.unexpected_rx++;
-    return 0;
+  uint64_t flow_id = 0;
+  {
+    std::lock_guard<std::mutex> sguard(state_mu_);
+    stats_.rx_frames++;
+    const FlowKey key{dst_ip, src_ip, dst_port, src_port};
+    auto idx = flow_index_.find(key);
+    if (idx == flow_index_.end()) {
+      stats_.unexpected_rx++;
+      return 0;
+    }
+    flow_id = idx->second;
   }
-  FlowEntry& flow = flows_by_id_[idx->second];
-  flow.last_activity_ns = DefaultNowNs();
+
+  std::lock_guard<std::mutex> fguard(flow_shard_mu_[FlowLockShardForFlowId(flow_id)]);
+  FlowEntry* flow = nullptr;
+  {
+    std::lock_guard<std::mutex> sguard(state_mu_);
+    auto it = flows_by_id_.find(flow_id);
+    if (it == flows_by_id_.end()) {
+      stats_.unexpected_rx++;
+      return 0;
+    }
+    flow = &it->second;
+  }
+
+  flow->last_activity_ns = DefaultNowNs();
   const auto finish = [&](uint32_t rc) -> uint32_t {
-    ScheduleFlowTimers(flow, flow.last_activity_ns);
+    ScheduleFlowTimers(*flow, flow->last_activity_ns);
     return rc;
   };
   if (window > 0) {
-    flow.peer_window = window;
+    flow->peer_window = window;
   }
 
   if ((flags & kTcpFlagRst) != 0) {
-    SetFlowState(flow, TcpDpState::kRstSeen);
-    flow.outstanding.reset();
-    flow.rto_deadline_ns = 0;
-    stats_.peer_rst_count++;
-    PushCompletion(flow.flow_id, flow.state, false, "peer_rst");
+    SetFlowState(*flow, TcpDpState::kRstSeen);
+    flow->outstanding.reset();
+    flow->rto_deadline_ns = 0;
+    {
+      std::lock_guard<std::mutex> sguard(state_mu_);
+      stats_.peer_rst_count++;
+    }
+    PushCompletion(flow->flow_id, flow->state, false, "peer_rst");
     return finish(1);
   }
 
-  if ((flags & (kTcpFlagSyn | kTcpFlagAck)) == (kTcpFlagSyn | kTcpFlagAck) && flow.state == TcpDpState::kSynSent) {
-    if (ack != flow.snd_nxt) {
+  if ((flags & (kTcpFlagSyn | kTcpFlagAck)) == (kTcpFlagSyn | kTcpFlagAck) && flow->state == TcpDpState::kSynSent) {
+    if (ack != flow->snd_nxt) {
+      std::lock_guard<std::mutex> sguard(state_mu_);
       stats_.unexpected_rx++;
       return finish(0);
     }
-    flow.snd_una = ack;
-    flow.rcv_nxt = seq + 1U;
-    SetFlowState(flow, TcpDpState::kSynAckRcvd);
-    flow.outstanding.reset();
-    flow.rto_deadline_ns = 0;
-    auto ack_pkt = BuildPacket(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0);
-    QueuePacket(flow, std::move(ack_pkt), flow.snd_nxt, flow.rcv_nxt, 0, false);
-    SetFlowState(flow, TcpDpState::kEstablished);
-    stats_.connect_established++;
-    PushCompletion(flow.flow_id, flow.state, true, "connect_established");
+    flow->snd_una = ack;
+    flow->rcv_nxt = seq + 1U;
+    SetFlowState(*flow, TcpDpState::kSynAckRcvd);
+    flow->outstanding.reset();
+    flow->rto_deadline_ns = 0;
+    auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
+    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
+    SetFlowState(*flow, TcpDpState::kEstablished);
+    {
+      std::lock_guard<std::mutex> sguard(state_mu_);
+      stats_.connect_established++;
+    }
+    PushCompletion(flow->flow_id, flow->state, true, "connect_established");
     return finish(1);
   }
 
   if ((flags & kTcpFlagAck) != 0) {
-    HandleAck(flow, ack);
+    HandleAck(*flow, ack);
+    std::lock_guard<std::mutex> sguard(state_mu_);
     stats_.rx_ack_count++;
   }
 
   if (payload_len > 0) {
-    if (flow.rcv_nxt != 0 && seq != flow.rcv_nxt) {
-      stats_.out_of_order_rx_count++;
-      stats_.unexpected_rx++;
-      auto dup_ack_pkt = BuildPacket(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0);
-      QueuePacket(flow, std::move(dup_ack_pkt), flow.snd_nxt, flow.rcv_nxt, 0, false);
+    if (flow->rcv_nxt != 0 && seq != flow->rcv_nxt) {
+      {
+        std::lock_guard<std::mutex> sguard(state_mu_);
+        stats_.out_of_order_rx_count++;
+        stats_.unexpected_rx++;
+      }
+      auto dup_ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
+      QueuePacket(*flow, std::move(dup_ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
       return finish(1);
     }
-    flow.rcv_nxt = AdvanceSeq(seq, payload_len);
-    stats_.rx_data_bytes += payload_len;
+    flow->rcv_nxt = AdvanceSeq(seq, payload_len);
+    {
+      std::lock_guard<std::mutex> sguard(state_mu_);
+      stats_.rx_data_bytes += payload_len;
+    }
     {
       std::lock_guard<std::mutex> qguard(tx_mu_);
-      rx_payloads_.push_back(TcpDpRxPayload{flow.flow_id, ExtractIpv4TcpPayload(frame, frame_len)});
+      rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, ExtractIpv4TcpPayload(frame, frame_len)});
     }
-    auto ack_pkt = BuildPacket(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0);
-    QueuePacket(flow, std::move(ack_pkt), flow.snd_nxt, flow.rcv_nxt, 0, false);
+    auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
+    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
   }
 
   if ((flags & kTcpFlagFin) != 0) {
-    flow.rcv_nxt = AdvanceSeq(flow.rcv_nxt, 1U);
-    auto ack_pkt = BuildPacket(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0);
-    QueuePacket(flow, std::move(ack_pkt), flow.snd_nxt, flow.rcv_nxt, 0, false);
-    SetFlowState(flow, TcpDpState::kTimeWait);
-    stats_.peer_fin_count++;
-    PushCompletion(flow.flow_id, flow.state, true, "peer_fin");
+    flow->rcv_nxt = AdvanceSeq(flow->rcv_nxt, 1U);
+    auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
+    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
+    SetFlowState(*flow, TcpDpState::kTimeWait);
+    {
+      std::lock_guard<std::mutex> sguard(state_mu_);
+      stats_.peer_fin_count++;
+    }
+    PushCompletion(flow->flow_id, flow->state, true, "peer_fin");
   }
   (void)ttl;
   return finish(1);
@@ -858,6 +899,10 @@ uint64_t TcpDataplaneCore::DefaultNowNs() {
 uint64_t TcpDataplaneCore::NsFromMs(uint32_t ms) { return static_cast<uint64_t>(ms) * 1000000ULL; }
 
 uint32_t TcpDataplaneCore::AdvanceSeq(uint32_t seq, uint32_t amount) { return seq + amount; }
+
+size_t TcpDataplaneCore::FlowLockShardForFlowId(uint64_t flow_id) const {
+  return static_cast<size_t>(flow_id % static_cast<uint64_t>(kFlowLockShards));
+}
 
 std::vector<uint8_t> TcpDataplaneCore::ExtractIpv4TcpPayload(const uint8_t* pkt, size_t pkt_len) {
   if (!pkt || pkt_len < 20) {
