@@ -410,13 +410,14 @@ async def service_custom_tcp_runtime(
     flush_fn,
 ) -> Dict[str, Any]:
     aggregate: Dict[str, Any] = {}
+    runtime_api = bridge_api if bridge_api is not None else default_bridge_api
     service_loops = 0
     idle_sleep_s = 0.00005
     idle_sleep_max_s = 0.001
     while not stop_event.is_set():
         service_loops += 1
         did_work = False
-        polled = runtime_poll_snapshot_fn(default_bridge_api)
+        polled = runtime_poll_snapshot_fn(runtime_api)
         if polled:
             polled.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
             polled.setdefault("runtime_transport_contract", "custom_tcp_runtime_bridge")
@@ -455,7 +456,7 @@ async def service_custom_tcp_runtime(
 
     for _ in range(8):
         service_loops += 1
-        polled = runtime_poll_snapshot_fn(default_bridge_api)
+        polled = runtime_poll_snapshot_fn(runtime_api)
         if polled:
             polled.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
             polled.setdefault("runtime_transport_contract", "custom_tcp_runtime_bridge")
