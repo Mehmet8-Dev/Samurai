@@ -307,10 +307,10 @@ class TestL7DataplaneContract(unittest.TestCase):
 
         self.assertEqual(out["sent"], 0)
         self.assertEqual(out["errors"], 1)
-        self.assertEqual(out["runtime_backend"], "dpdk")
+        self.assertEqual(out["runtime_backend"], "afxdp")
         self.assertEqual(out["legacy_path_used"], 0)
         self.assertEqual(out["stateful_runtime_status"], "unavailable")
-        self.assertEqual(out["stateful_runtime_reason"], "not_implemented_hard_fail")
+        self.assertEqual(out["stateful_runtime_reason"], "custom_tcp_xdp_interface_missing")
         self.assertEqual(out["stateful_runtime_preflight_status"], "failed")
 
     def test_custom_tcp_transport_fails_visible_until_wired(self):
@@ -489,27 +489,27 @@ class TestL7DataplaneContract(unittest.TestCase):
 
             return _Result()
 
-        async def _fake_paced_raw_socket_sender(**kwargs):
+        async def _fake_xdp_sender(**kwargs):
             captured.update(kwargs)
             return {"sent": 1, "errors": 0}
 
         with patch("ddos_samurai.senders._run_l7_profile", side_effect=_fake_run):
             with patch("ddos_samurai.senders.custom_tcp_dataplane", _FakeTcpDp(), create=True):
-                with patch(
-                    "ddos_samurai.senders.paced_raw_socket_sender",
-                    side_effect=_fake_paced_raw_socket_sender,
-                ):
-                    out = asyncio.run(
-                        senders.run_l7_profile_public(
-                            profile,
-                            concurrency=1,
-                            verbose=False,
-                            custom_tcp_backend="txring",
-                        )
-                    )
+                with patch("ddos_samurai.senders.XDP_AVAILABLE", True):
+                    with patch("ddos_samurai.senders.check_xdp_available", side_effect=lambda: (True, "AF_XDP is available")):
+                        with patch("ddos_samurai.senders.xdp_sender", side_effect=_fake_xdp_sender):
+                            out = asyncio.run(
+                                senders.run_l7_profile_public(
+                                    profile,
+                                    concurrency=1,
+                                    verbose=False,
+                                    custom_tcp_backend="af_xdp",
+                                    custom_tcp_xdp_interface="eth0",
+                                )
+                            )
 
-        self.assertEqual(captured["sender_backend"], "txring")
         self.assertEqual(captured["target_ip"], "127.0.0.1")
+        self.assertEqual(captured["interface"], "eth0")
         self.assertEqual(out["custom_tcp_tx_flush_packets"], 1)
         self.assertEqual(out["custom_tcp_tx_flush_bytes"], 4)
         self.assertEqual(out["runtime_transport_service"], "native_custom_tcp_runtime_service")
@@ -885,18 +885,27 @@ class TestL7DataplaneContract(unittest.TestCase):
                 "sender_path": "PACED_L2",
             }
 
-        with patch(
-            "ddos_samurai.senders.paced_raw_socket_sender",
-            side_effect=_fake_paced_raw_socket_sender,
-        ):
-            out = asyncio.run(
-                senders.run_l7_profile_public(
-                    profile,
-                    concurrency=1,
-                    verbose=False,
-                    custom_tcp_backend="txring",
-                )
+        async def _fake_xdp_sender(**kwargs):
+            return await _fake_paced_raw_socket_sender(
+                packets_buffer=kwargs.get("packets_buffer", b""),
+                target_ip=kwargs.get("target_ip"),
+                target_port=kwargs.get("target_port"),
+                count=kwargs.get("count", 0),
+                verbose=kwargs.get("verbose", False),
             )
+
+        with patch("ddos_samurai.senders.XDP_AVAILABLE", True):
+            with patch("ddos_samurai.senders.check_xdp_available", side_effect=lambda: (True, "AF_XDP is available")):
+                with patch("ddos_samurai.senders.xdp_sender", side_effect=_fake_xdp_sender):
+                    out = asyncio.run(
+                        senders.run_l7_profile_public(
+                            profile,
+                            concurrency=1,
+                            verbose=False,
+                            custom_tcp_backend="af_xdp",
+                            custom_tcp_xdp_interface="eth0",
+                        )
+                    )
 
         self.assertEqual(out["runtime_transport_backend"], "custom_tcp")
         self.assertEqual(out["runtime_transport_custom_tcp_requested"], 1)
@@ -976,7 +985,7 @@ class TestL7DataplaneContract(unittest.TestCase):
                     scheme="http",
                     verify=False,
                     transport_backend="custom_tcp",
-                    custom_tcp_backend="txring",
+                    custom_tcp_backend="af_xdp",
                 )
             )
 
@@ -984,4 +993,4 @@ class TestL7DataplaneContract(unittest.TestCase):
             captured["profile"].connection_template.transport_backend,
             "custom_tcp",
         )
-        self.assertEqual(captured["kwargs"]["custom_tcp_backend"], "txring")
+        self.assertEqual(captured["kwargs"]["custom_tcp_backend"], "af_xdp")

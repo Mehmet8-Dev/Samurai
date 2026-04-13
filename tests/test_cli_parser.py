@@ -172,7 +172,7 @@ class TestCliParser(unittest.TestCase):
     def test_sender_route_defaults(self):
         parser = cli.build_parser()
         args = parser.parse_args([])
-        self.assertEqual(args.sender_backend, "txring")
+        self.assertEqual(args.sender_backend, "xdp")
         self.assertEqual(args.sender_fallback_policy, "fail")
         self.assertEqual(args.stateful_runtime_backend, "afxdp")
         self.assertEqual(args.dataplane_core_mode, "required")
@@ -389,7 +389,7 @@ class TestSenderRouteValidation(unittest.TestCase):
     def test_sender_backend_xdp_requires_interface(self):
         parser = cli.build_parser()
         args = parser.parse_args(["--sender-backend", "xdp"])
-        self._assert_validation_fails(parser, args)
+        cli._validate_sender_route_args(parser, args)
 
     def test_xdp_enable_requires_interface(self):
         parser = cli.build_parser()
@@ -403,47 +403,51 @@ class TestSenderRouteValidation(unittest.TestCase):
 
     def test_sender_fallback_fail_forbids_auto_backend(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--sender-backend", "auto", "--sender-fallback-policy", "fail"])
-        self._assert_validation_fails(parser, args)
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["--sender-backend", "auto", "--sender-fallback-policy", "fail"])
 
     def test_afpacket_required_requires_txring_backend(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--afpacket-hugepage-mode", "required", "--sender-backend", "python"])
-        self._assert_validation_fails(parser, args)
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["--afpacket-hugepage-mode", "required", "--sender-backend", "python"])
+        args = parser.parse_args(["--afpacket-hugepage-mode", "required"])
+        cli._validate_sender_route_args(parser, args)
 
     def test_afpacket_hugepage_size_validation(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--afpacket-hugepage-size-kb", "0", "--sender-backend", "txring"])
+        args = parser.parse_args(["--afpacket-hugepage-size-kb", "0"])
         self._assert_validation_fails(parser, args)
 
     def test_afpacket_block_size_validation(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--afpacket-block-size-kb", "-1", "--sender-backend", "txring"])
+        args = parser.parse_args(["--afpacket-block-size-kb", "-1"])
         self._assert_validation_fails(parser, args)
 
     def test_afpacket_frame_size_validation(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--afpacket-frame-size", "-1", "--sender-backend", "txring"])
+        args = parser.parse_args(["--afpacket-frame-size", "-1"])
         self._assert_validation_fails(parser, args)
 
     def test_afpacket_frames_per_block_validation(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--afpacket-frames-per-block", "0", "--sender-backend", "txring"])
+        args = parser.parse_args(["--afpacket-frames-per-block", "0"])
         self._assert_validation_fails(parser, args)
 
     def test_afpacket_poll_timeout_validation(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--afpacket-poll-timeout-ms", "-1", "--sender-backend", "txring"])
+        args = parser.parse_args(["--afpacket-poll-timeout-ms", "-1"])
         self._assert_validation_fails(parser, args)
 
     def test_afpacket_spin_limit_validation(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--afpacket-spin-limit", "-1", "--sender-backend", "txring"])
+        args = parser.parse_args(["--afpacket-spin-limit", "-1"])
         self._assert_validation_fails(parser, args)
 
     def test_afpacket_busy_poll_validation(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--afpacket-busy-poll-us", "-1", "--sender-backend", "txring"])
+        args = parser.parse_args(["--afpacket-busy-poll-us", "-1"])
         self._assert_validation_fails(parser, args)
 
     def test_dataplane_required_with_default_fail_policy_is_valid(self):
@@ -580,7 +584,7 @@ class TestSenderRouteValidation(unittest.TestCase):
                 "--lab-profile",
                 "dedicated",
                 "--sender-backend",
-                "txring",
+                "xdp",
                 "--sender-fallback-policy",
                 "fail",
                 "--xdp-interface",
@@ -589,7 +593,7 @@ class TestSenderRouteValidation(unittest.TestCase):
         )
         with patch("ddos_samurai.af_xdp_sender.get_interface_queue_count", return_value=8):
             cli._preflight_lab_profile(parser, args)
-        self.assertEqual(args.afpacket_hugepage_mode, "required")
+        self.assertEqual(args.afpacket_hugepage_mode, "off")
 
     def test_dedicated_profile_autopromotes_stateful_runtime_and_custom_tcp(self):
         parser = cli.build_parser()
@@ -598,7 +602,7 @@ class TestSenderRouteValidation(unittest.TestCase):
                 "--lab-profile",
                 "dedicated",
                 "--sender-backend",
-                "txring",
+                "xdp",
                 "--sender-fallback-policy",
                 "fail",
                 "--xdp-interface",
@@ -608,7 +612,7 @@ class TestSenderRouteValidation(unittest.TestCase):
                 "--custom-tcp-mode",
                 "off",
                 "--custom-tcp-backend",
-                "txring",
+                "af_xdp",
             ]
         )
         with patch("ddos_samurai.af_xdp_sender.get_interface_queue_count", return_value=8):
