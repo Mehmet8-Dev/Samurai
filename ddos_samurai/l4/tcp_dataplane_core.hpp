@@ -6,6 +6,8 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <queue>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -163,8 +165,41 @@ class TcpDataplaneCore {
     uint32_t retransmit_count = 0;
     uint32_t dup_ack_streak = 0;
     uint64_t rto_deadline_ns = 0;
+    uint64_t connect_deadline_ns = 0;
+    uint64_t idle_deadline_ns = 0;
+    uint32_t rto_timer_gen = 0;
+    uint32_t connect_timer_gen = 0;
+    uint32_t idle_timer_gen = 0;
     uint64_t last_activity_ns = 0;
     std::optional<OutstandingTx> outstanding;
+  };
+
+  enum class TimerKind : uint8_t {
+    kRto = 1,
+    kConnectTimeout = 2,
+    kIdleTimeout = 3,
+  };
+
+  struct TimerEntry {
+    uint64_t due_ns = 0;
+    uint64_t flow_id = 0;
+    TimerKind kind = TimerKind::kRto;
+    uint32_t generation = 0;
+  };
+
+  struct TimerEntryMin {
+    bool operator()(const TimerEntry& lhs, const TimerEntry& rhs) const {
+      if (lhs.due_ns != rhs.due_ns) {
+        return lhs.due_ns > rhs.due_ns;
+      }
+      if (lhs.flow_id != rhs.flow_id) {
+        return lhs.flow_id > rhs.flow_id;
+      }
+      if (lhs.kind != rhs.kind) {
+        return static_cast<uint8_t>(lhs.kind) > static_cast<uint8_t>(rhs.kind);
+      }
+      return lhs.generation > rhs.generation;
+    }
   };
 
   static bool ParseIpv4TcpFrame(
@@ -193,6 +228,8 @@ class TcpDataplaneCore {
       const uint8_t* payload,
       size_t payload_len) const;
   bool EnqueueTxPacketBytes(const uint8_t* data, size_t len);
+  void PushTimer(uint64_t flow_id, TimerKind kind, uint64_t due_ns, uint32_t generation);
+  void ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns);
   void QueuePacket(FlowEntry& flow, std::vector<uint8_t>&& packet, uint32_t seq, uint32_t ack, uint32_t payload_len, bool arm_rto);
   void PushCompletion(uint64_t flow_id, TcpDpState state, bool success, const char* event);
   void HandleAck(FlowEntry& flow, uint32_t ack_value);
@@ -207,6 +244,8 @@ class TcpDataplaneCore {
   uint32_t seq_seed_ = 0x10203040U;
   std::unordered_map<uint64_t, FlowEntry> flows_by_id_;
   std::unordered_map<FlowKey, uint64_t, FlowKeyHash> flow_index_;
+  std::set<uint64_t> active_flow_ids_;
+  std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin> timer_heap_;
   size_t tx_ring_slot_size_ = 2048;
   size_t tx_ring_capacity_ = 8192;
   std::vector<uint8_t> tx_ring_storage_;

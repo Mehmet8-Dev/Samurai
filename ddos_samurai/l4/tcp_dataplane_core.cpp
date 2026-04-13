@@ -93,6 +93,8 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   seq_seed_ = 0x10203040U;
   flows_by_id_.clear();
   flow_index_.clear();
+  active_flow_ids_.clear();
+  timer_heap_ = std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>();
   tx_ring_storage_.assign(tx_ring_capacity_ * tx_ring_slot_size_, 0U);
   tx_ring_lengths_.assign(tx_ring_capacity_, 0U);
   tx_ring_head_ = 0;
@@ -169,6 +171,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       flow->outstanding = std::move(out);
       flow->rto_deadline_ns = flow->outstanding->deadline_ns;
       stats_.connect_attempts++;
+      ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
     }
@@ -180,6 +183,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       flow->outstanding.reset();
       flow->rto_deadline_ns = 0;
       stats_.connect_established++;
+      ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
     }
@@ -201,6 +205,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       flow->outstanding = std::move(out);
       flow->rto_deadline_ns = flow->outstanding->deadline_ns;
       stats_.tx_data_bytes += payload_len;
+      ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
     }
@@ -208,6 +213,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
     if ((flags & kTcpFlagFin) != 0) {
       SetFlowState(*flow, TcpDpState::kFinWait);
       flow->snd_nxt = AdvanceSeq(seq, 1U);
+      ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
     }
@@ -244,6 +250,8 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   flow.snd_nxt = AdvanceSeq(flow.snd_nxt, 1);
   QueuePacket(flow, std::move(syn), flow.iss, 0, 0, true);
   flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
+  active_flow_ids_.insert(flow_id);
+  ScheduleFlowTimers(flow, now_ns);
 
   flows_by_id_[flow_id] = flow;
   flow_index_[flow.key] = flow_id;
@@ -271,6 +279,7 @@ uint32_t TcpDataplaneCore::EnqueueSend(uint64_t flow_id, const uint8_t* payload,
   flow.last_activity_ns = DefaultNowNs();
   QueuePacket(flow, std::move(pkt), seq, flow.rcv_nxt, static_cast<uint32_t>(payload_len), true);
   flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
+  ScheduleFlowTimers(flow, flow.last_activity_ns);
   stats_.tx_data_bytes += static_cast<uint64_t>(payload_len);
   return static_cast<uint32_t>(payload_len);
 }
@@ -304,6 +313,10 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
   }
   FlowEntry& flow = flows_by_id_[idx->second];
   flow.last_activity_ns = DefaultNowNs();
+  const auto finish = [&](uint32_t rc) -> uint32_t {
+    ScheduleFlowTimers(flow, flow.last_activity_ns);
+    return rc;
+  };
   if (window > 0) {
     flow.peer_window = window;
   }
@@ -314,13 +327,13 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     flow.rto_deadline_ns = 0;
     stats_.peer_rst_count++;
     PushCompletion(flow.flow_id, flow.state, false, "peer_rst");
-    return 1;
+    return finish(1);
   }
 
   if ((flags & (kTcpFlagSyn | kTcpFlagAck)) == (kTcpFlagSyn | kTcpFlagAck) && flow.state == TcpDpState::kSynSent) {
     if (ack != flow.snd_nxt) {
       stats_.unexpected_rx++;
-      return 0;
+      return finish(0);
     }
     flow.snd_una = ack;
     flow.rcv_nxt = seq + 1U;
@@ -332,7 +345,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     SetFlowState(flow, TcpDpState::kEstablished);
     stats_.connect_established++;
     PushCompletion(flow.flow_id, flow.state, true, "connect_established");
-    return 1;
+    return finish(1);
   }
 
   if ((flags & kTcpFlagAck) != 0) {
@@ -346,7 +359,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
       stats_.unexpected_rx++;
       auto dup_ack_pkt = BuildPacket(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0);
       QueuePacket(flow, std::move(dup_ack_pkt), flow.snd_nxt, flow.rcv_nxt, 0, false);
-      return 1;
+      return finish(1);
     }
     flow.rcv_nxt = AdvanceSeq(seq, payload_len);
     stats_.rx_data_bytes += payload_len;
@@ -364,7 +377,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     PushCompletion(flow.flow_id, flow.state, true, "peer_fin");
   }
   (void)ttl;
-  return 1;
+  return finish(1);
 }
 
 uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
@@ -377,35 +390,70 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
   }
   stats_.poll_calls++;
   uint32_t actions = 0;
-  for (auto& [flow_id, flow] : flows_by_id_) {
-    (void)flow_id;
-    if (actions >= budget) {
+  while (actions < budget && !timer_heap_.empty()) {
+    const TimerEntry entry = timer_heap_.top();
+    if (entry.due_ns == 0 || entry.due_ns > now_ns) {
       break;
     }
-    if (flow.state == TcpDpState::kClosed || flow.state == TcpDpState::kRstSeen || flow.state == TcpDpState::kTimeWait) {
+    timer_heap_.pop();
+    if (active_flow_ids_.find(entry.flow_id) == active_flow_ids_.end()) {
       continue;
     }
-    if (flow.outstanding.has_value() && flow.outstanding->deadline_ns > 0 && now_ns >= flow.outstanding->deadline_ns) {
-      if (flow.retransmit_count >= config_.max_retransmits) {
-        CloseTimedOutFlow(flow, TcpDpState::kClosed, "retransmit_exhausted");
+    auto it = flows_by_id_.find(entry.flow_id);
+    if (it == flows_by_id_.end()) {
+      continue;
+    }
+    FlowEntry& flow = it->second;
+    switch (entry.kind) {
+      case TimerKind::kRto: {
+        if (entry.generation != flow.rto_timer_gen || !flow.outstanding.has_value() || flow.rto_deadline_ns == 0 ||
+            flow.rto_deadline_ns != entry.due_ns) {
+          break;
+        }
+        if (flow.retransmit_count >= config_.max_retransmits) {
+          CloseTimedOutFlow(flow, TcpDpState::kClosed, "retransmit_exhausted");
+          ScheduleFlowTimers(flow, now_ns);
+          actions++;
+          break;
+        }
+        flow.retransmit_count++;
+        stats_.retransmit_count++;
+        flow.outstanding->rto_ms = std::min(flow.outstanding->rto_ms * 2U, config_.connect_timeout_ms);
+        flow.outstanding->deadline_ns = now_ns + NsFromMs(flow.outstanding->rto_ms);
+        flow.rto_deadline_ns = flow.outstanding->deadline_ns;
+        (void)EnqueueTxPacketBytes(flow.outstanding->packet.data(), flow.outstanding->packet.size());
+        ScheduleFlowTimers(flow, now_ns);
         actions++;
-        continue;
+        break;
       }
-      flow.retransmit_count++;
-      stats_.retransmit_count++;
-      flow.outstanding->rto_ms = std::min(flow.outstanding->rto_ms * 2U, config_.connect_timeout_ms);
-      flow.outstanding->deadline_ns = now_ns + NsFromMs(flow.outstanding->rto_ms);
-      flow.rto_deadline_ns = flow.outstanding->deadline_ns;
-      (void)EnqueueTxPacketBytes(flow.outstanding->packet.data(), flow.outstanding->packet.size());
-      actions++;
-    } else if (flow.outstanding.has_value() && flow.state == TcpDpState::kSynSent &&
-               now_ns - flow.last_activity_ns >= NsFromMs(config_.connect_timeout_ms)) {
-      CloseTimedOutFlow(flow, TcpDpState::kClosed, "connect_timeout");
-      actions++;
-    } else if (!flow.outstanding.has_value() && flow.state == TcpDpState::kEstablished &&
-               now_ns - flow.last_activity_ns >= NsFromMs(config_.idle_timeout_ms)) {
-      CloseTimedOutFlow(flow, TcpDpState::kTimeWait, "idle_timeout");
-      actions++;
+      case TimerKind::kConnectTimeout: {
+        if (entry.generation != flow.connect_timer_gen || flow.connect_deadline_ns == 0 ||
+            flow.connect_deadline_ns != entry.due_ns) {
+          break;
+        }
+        // Preserve legacy precedence: when both RTO and connect-timeout are due,
+        // retransmit/retransmit-exhausted path must run first.
+        if (flow.rto_deadline_ns > 0 && now_ns >= flow.rto_deadline_ns) {
+          break;
+        }
+        if (flow.state == TcpDpState::kSynSent && flow.outstanding.has_value() && now_ns >= flow.connect_deadline_ns) {
+          CloseTimedOutFlow(flow, TcpDpState::kClosed, "connect_timeout");
+          ScheduleFlowTimers(flow, now_ns);
+          actions++;
+        }
+        break;
+      }
+      case TimerKind::kIdleTimeout: {
+        if (entry.generation != flow.idle_timer_gen || flow.idle_deadline_ns == 0 || flow.idle_deadline_ns != entry.due_ns) {
+          break;
+        }
+        if (flow.state == TcpDpState::kEstablished && !flow.outstanding.has_value() && now_ns >= flow.idle_deadline_ns) {
+          CloseTimedOutFlow(flow, TcpDpState::kTimeWait, "idle_timeout");
+          ScheduleFlowTimers(flow, now_ns);
+          actions++;
+        }
+        break;
+      }
     }
   }
   return actions;
@@ -896,6 +944,56 @@ bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len) {
   return true;
 }
 
+void TcpDataplaneCore::PushTimer(uint64_t flow_id, TimerKind kind, uint64_t due_ns, uint32_t generation) {
+  if (flow_id == 0 || due_ns == 0 || generation == 0) {
+    return;
+  }
+  timer_heap_.push(TimerEntry{due_ns, flow_id, kind, generation});
+}
+
+void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
+  if (now_ns == 0) {
+    now_ns = DefaultNowNs();
+  }
+  const bool active = IsCountedActive(flow.state);
+  if (!active) {
+    flow.rto_deadline_ns = 0;
+    flow.connect_deadline_ns = 0;
+    flow.idle_deadline_ns = 0;
+    flow.rto_timer_gen++;
+    flow.connect_timer_gen++;
+    flow.idle_timer_gen++;
+    return;
+  }
+
+  if (flow.outstanding.has_value() && flow.outstanding->deadline_ns > 0) {
+    flow.rto_deadline_ns = flow.outstanding->deadline_ns;
+    flow.rto_timer_gen++;
+    PushTimer(flow.flow_id, TimerKind::kRto, flow.rto_deadline_ns, flow.rto_timer_gen);
+  } else {
+    flow.rto_deadline_ns = 0;
+    flow.rto_timer_gen++;
+  }
+
+  if (flow.state == TcpDpState::kSynSent && flow.outstanding.has_value()) {
+    flow.connect_deadline_ns = flow.last_activity_ns + NsFromMs(config_.connect_timeout_ms);
+    flow.connect_timer_gen++;
+    PushTimer(flow.flow_id, TimerKind::kConnectTimeout, flow.connect_deadline_ns, flow.connect_timer_gen);
+  } else {
+    flow.connect_deadline_ns = 0;
+    flow.connect_timer_gen++;
+  }
+
+  if (flow.state == TcpDpState::kEstablished && !flow.outstanding.has_value()) {
+    flow.idle_deadline_ns = flow.last_activity_ns + NsFromMs(config_.idle_timeout_ms);
+    flow.idle_timer_gen++;
+    PushTimer(flow.flow_id, TimerKind::kIdleTimeout, flow.idle_deadline_ns, flow.idle_timer_gen);
+  } else {
+    flow.idle_deadline_ns = 0;
+    flow.idle_timer_gen++;
+  }
+}
+
 void TcpDataplaneCore::QueuePacket(
     FlowEntry& flow,
     std::vector<uint8_t>&& packet,
@@ -917,6 +1015,7 @@ void TcpDataplaneCore::QueuePacket(
   out.deadline_ns = DefaultNowNs() + NsFromMs(out.rto_ms);
   out.packet = std::move(packet);
   flow.outstanding = std::move(out);
+  flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
 }
 
 void TcpDataplaneCore::PushCompletion(uint64_t flow_id, TcpDpState state, bool success, const char* event) {
@@ -942,6 +1041,11 @@ void TcpDataplaneCore::SetFlowState(FlowEntry& flow, TcpDpState next_state) {
   const bool was_active = IsCountedActive(flow.state);
   const bool now_active = IsCountedActive(next_state);
   flow.state = next_state;
+  if (now_active) {
+    active_flow_ids_.insert(flow.flow_id);
+  } else {
+    active_flow_ids_.erase(flow.flow_id);
+  }
   if (was_active == now_active) {
     return;
   }
