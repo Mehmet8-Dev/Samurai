@@ -929,6 +929,96 @@ static PyObject* get_states_batch(PyObject* self, PyObject* args) {
     return Py_BuildValue("OOOOOO", seq_list, ack_list, state_list, window_list, mss_list, ttl_list);
 }
 
+static PyObject* get_states_batch_packed(PyObject* self, PyObject* args) {
+    if (ensure_l4se_module()) {
+        return call_l4se_method("get_states_batch_packed", args);
+    }
+    uint32_t src_ip;
+    uint16_t start_port;
+    uint32_t count;
+    if (!PyArg_ParseTuple(args, "IHI", &src_ip, &start_port, &count)) return NULL;
+    (void)self;
+    if (!state_table || !state_locks || state_table_size == 0 || state_lock_count == 0) {
+        PyErr_SetString(PyExc_RuntimeError, "state engine is not initialized");
+        return NULL;
+    }
+
+    Py_ssize_t n_seq = (Py_ssize_t)count * (Py_ssize_t)sizeof(uint32_t);
+    Py_ssize_t n_ack = (Py_ssize_t)count * (Py_ssize_t)sizeof(uint32_t);
+    Py_ssize_t n_state = (Py_ssize_t)count * (Py_ssize_t)sizeof(uint8_t);
+    Py_ssize_t n_window = (Py_ssize_t)count * (Py_ssize_t)sizeof(uint16_t);
+    Py_ssize_t n_mss = (Py_ssize_t)count * (Py_ssize_t)sizeof(uint16_t);
+    Py_ssize_t n_ttl = (Py_ssize_t)count * (Py_ssize_t)sizeof(uint8_t);
+
+    PyObject* seq_bytes = PyBytes_FromStringAndSize(NULL, n_seq);
+    PyObject* ack_bytes = PyBytes_FromStringAndSize(NULL, n_ack);
+    PyObject* state_bytes = PyBytes_FromStringAndSize(NULL, n_state);
+    PyObject* window_bytes = PyBytes_FromStringAndSize(NULL, n_window);
+    PyObject* mss_bytes = PyBytes_FromStringAndSize(NULL, n_mss);
+    PyObject* ttl_bytes = PyBytes_FromStringAndSize(NULL, n_ttl);
+    if (!seq_bytes || !ack_bytes || !state_bytes || !window_bytes || !mss_bytes || !ttl_bytes) {
+        Py_XDECREF(seq_bytes);
+        Py_XDECREF(ack_bytes);
+        Py_XDECREF(state_bytes);
+        Py_XDECREF(window_bytes);
+        Py_XDECREF(mss_bytes);
+        Py_XDECREF(ttl_bytes);
+        return NULL;
+    }
+
+    uint32_t* seq = (uint32_t*)PyBytes_AS_STRING(seq_bytes);
+    uint32_t* ack = (uint32_t*)PyBytes_AS_STRING(ack_bytes);
+    uint8_t* state = (uint8_t*)PyBytes_AS_STRING(state_bytes);
+    uint16_t* window = (uint16_t*)PyBytes_AS_STRING(window_bytes);
+    uint16_t* mss = (uint16_t*)PyBytes_AS_STRING(mss_bytes);
+    uint8_t* ttl = (uint8_t*)PyBytes_AS_STRING(ttl_bytes);
+    uint32_t segment_size = state_segment_size();
+    if (segment_size == 0) {
+        Py_DECREF(seq_bytes);
+        Py_DECREF(ack_bytes);
+        Py_DECREF(state_bytes);
+        Py_DECREF(window_bytes);
+        Py_DECREF(mss_bytes);
+        Py_DECREF(ttl_bytes);
+        PyErr_SetString(PyExc_RuntimeError, "invalid state engine segment size");
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t port = start_port + (i % 64512);
+        uint32_t h = hash_state(src_ip, port);
+        uint32_t segment = h % state_lock_count;
+        uint32_t segment_start = segment * segment_size;
+        uint32_t start_idx = segment_start + ((h / state_lock_count) % segment_size);
+
+        seq[i] = 0;
+        ack[i] = 0;
+        state[i] = 0;
+        window[i] = 0;
+        mss[i] = 0;
+        ttl[i] = 0;
+
+        pthread_mutex_lock(&state_locks[segment]);
+        uint32_t idx = start_idx;
+        for (uint32_t j = 0; j < segment_size; j++) {
+            if (state_table[idx].state != 0 && state_table[idx].src_ip == src_ip && state_table[idx].src_port == port) {
+                seq[i] = state_table[idx].seq;
+                ack[i] = state_table[idx].ack;
+                state[i] = state_table[idx].state;
+                window[i] = state_table[idx].window_size;
+                mss[i] = state_table[idx].mss;
+                ttl[i] = state_table[idx].ttl;
+                break;
+            }
+            if (state_table[idx].state == 0) break;
+            idx = segment_start + ((idx - segment_start + 1) % segment_size);
+        }
+        pthread_mutex_unlock(&state_locks[segment]);
+    }
+
+    return Py_BuildValue("NNNNNN", seq_bytes, ack_bytes, state_bytes, window_bytes, mss_bytes, ttl_bytes);
+}
+
 static PyObject* get_tcp_state(PyObject* self, PyObject* args) {
     if (ensure_l4se_module()) {
         return call_l4se_method("get_tcp_state", args);
@@ -2244,6 +2334,7 @@ static PyMethodDef FastSenderMethods[] = {
     {"sweep_state_table", sweep_state_table, METH_VARARGS, "Sweep stale state entries by timeout and return removed count."},
     {"get_tcp_state", get_tcp_state, METH_VARARGS, "Get TCP state from the state table"},
     {"get_states_batch", get_states_batch, METH_VARARGS, "Get multiple TCP states in one call"},
+    {"get_states_batch_packed", get_states_batch_packed, METH_VARARGS, "Get multiple TCP states as packed bytes"},
     {"start_rx_handler", start_rx_handler, METH_VARARGS, "Start the background RX handler thread"},
     {"stop_rx_handler", stop_rx_handler, METH_VARARGS, "Stop the background RX handler thread"},
     {"set_mimicry_settings", set_mimicry_settings, METH_VARARGS, "Set global TCP mimicry settings (Window, MSS, TTL)"},

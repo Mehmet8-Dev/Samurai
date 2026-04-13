@@ -2281,9 +2281,15 @@ async def worker_process(
                 while True:
                     # Poll State Table in BATCH (C Extension)
                     # We use local_ip_int for lookup and the worker's specific start_port
-                    seq_list, ack_list, state_list, win_list, mss_list, ttl_list = senders.fast_sender.get_states_batch(
+                    seq_raw, ack_raw, state_raw, win_raw, mss_raw, ttl_raw = senders.fast_sender.get_states_batch_packed(
                         local_ip_int, start_port, args['count']
                     )
+                    seq_list = memoryview(seq_raw).cast("I")
+                    ack_list = memoryview(ack_raw).cast("I")
+                    state_list = memoryview(state_raw)
+                    win_list = memoryview(win_raw).cast("H")
+                    mss_list = memoryview(mss_raw).cast("H")
+                    ttl_list = memoryview(ttl_raw)
 
                     # Generate next batch first so GPU can run while previous batch is sent.
                     packets_gpu_array, packet_size = gpu_packet.generate_stateful_packets(
