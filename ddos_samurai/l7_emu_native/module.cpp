@@ -484,9 +484,18 @@ PYBIND11_MODULE(_l7_emu_native, m) {
     const std::string runtime_backend = normalize_runtime_backend(profile.stateful_runtime_backend);
     const bool strict_runtime = profile.stateful_runtime_strict != 0;
     const bool runtime_requires_custom_tcp = strict_runtime;
-    const TransportBackend transport_backend =
-        profile.transport_backend == "custom_tcp" ? TransportBackend::CustomTcp : TransportBackend::KernelSocket;
-    if (runtime_requires_custom_tcp && transport_backend != TransportBackend::CustomTcp) {
+    auto lower_copy = [](std::string s) {
+      for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') {
+          c = static_cast<char>(c - 'A' + 'a');
+        }
+      }
+      return s;
+    };
+    const std::string requested_transport = lower_copy(profile.transport_backend);
+    const bool requested_custom_tcp = requested_transport == "custom_tcp";
+    const TransportBackend transport_backend = TransportBackend::CustomTcp;
+    if (runtime_requires_custom_tcp && !requested_custom_tcp) {
       py::dict failed;
       failed["sender_path"] = py::str(profile.sender_path);
       failed["sender_fallback_reason"] = py::str("stateful_runtime_transport_unavailable");
@@ -494,7 +503,7 @@ PYBIND11_MODULE(_l7_emu_native, m) {
       failed["l7_fallback_reason"] = py::str("stateful_runtime_transport_unavailable");
       failed["stateful_runtime_reason"] = py::str("stateful_runtime_transport_unavailable");
       failed["stateful_runtime_detail"] =
-          py::str("strict stateful runtime requires custom_tcp transport; kernel_socket fallback is disabled");
+          py::str("kernel_socket fallback is disabled; strict stateful runtime requires custom_tcp transport.");
       failed["attempted"] = py::int_(profile.flow_attempted);
       failed["sent"] = py::int_(0);
       failed["errors"] = py::int_(profile.flow_attempted);
@@ -543,7 +552,8 @@ PYBIND11_MODULE(_l7_emu_native, m) {
       result["stateful_runtime_detail"] = py::str("custom TCP bridge is not ready in native runtime");
     }
     if (profile.protocol == "http2") {
-      result["h2_transport"] = py::str("nghttp2_native");
+      result["h2_transport"] = py::str(
+          transport_backend == TransportBackend::CustomTcp ? "custom_tcp_native" : "nghttp2_native");
       if (transport_backend != TransportBackend::CustomTcp && !(caps.openssl && caps.nghttp2)) {
         result["sender_fallback_reason"] = py::str("capability_unavailable:nghttp2_native");
         result["l7_fallback_reason"] = py::str("capability_unavailable:nghttp2_native");

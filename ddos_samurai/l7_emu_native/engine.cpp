@@ -21,6 +21,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <cstdlib>
 #include <sstream>
@@ -113,7 +114,7 @@ struct ReactorLaneState {
 struct Http1Connection {
   int fd{-1};
   int shard_id{0};
-  TransportBackend transport_backend{TransportBackend::KernelSocket};
+  TransportBackend transport_backend{TransportBackend::CustomTcp};
   uint64_t custom_flow_id{0};
   bool custom_connect_ready{false};
   bool custom_send_enqueued{false};
@@ -175,7 +176,7 @@ struct H1Lane {
   std::size_t write_offset{0};
   long long request_start_ms{0};
   H1RequestSpec request_spec{};
-  TransportBackend transport_backend{TransportBackend::KernelSocket};
+  TransportBackend transport_backend{TransportBackend::CustomTcp};
   H1LanePhase phase{H1LanePhase::Idle};
   int think_time_total_ms{0};
   int expectation_failures{0};
@@ -644,10 +645,16 @@ struct H2StreamState {
 struct H2ConnectionContext {
   int fd{-1};
   int epoll_fd{-1};
+  TransportBackend transport_backend{TransportBackend::CustomTcp};
   bool use_tls{false};
   bool verify_peer{true};
   std::string authority;
   int timeout_ms{5000};
+  uint64_t custom_flow_id{0};
+  bool custom_connect_ready{false};
+  bool custom_terminal{false};
+  bool tls_handshake_complete{false};
+  std::string read_buffer;
   int transport_error{0};
   int protocol_error{0};
   int goaway{0};
@@ -771,103 +778,8 @@ struct H1TransportOps {
 };
 
 TransportBackend parse_transport_backend(const Profile& profile) {
-  const std::string normalized = lower_copy(profile.transport_backend);
-  if (normalized == "custom_tcp") {
-    return TransportBackend::CustomTcp;
-  }
-  return TransportBackend::KernelSocket;
-}
-
-int connect_socket(Http1Connection& conn, const Profile& profile) {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) {
-    return -1;
-  }
-
-  const int one = 1;
-  ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-  // Important: SO_RCVTIMEO/SO_SNDTIMEO do NOT reliably apply to connect().
-  // Use a non-blocking connect with an explicit epoll wait to guarantee
-  // fail-fast semantics for "no listener" and "blackhole" targets.
-  int flags = ::fcntl(fd, F_GETFL, 0);
-  if (flags >= 0) {
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-  }
-
-  sockaddr_in addr {};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(profile.target_port));
-  if (::inet_pton(AF_INET, profile.target_ip.c_str(), &addr.sin_addr) != 1) {
-    ::close(fd);
-    return -1;
-  }
-
-  const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-  if (rc == 0) {
-    return fd;
-  }
-  if (rc != 0 && errno != EINPROGRESS) {
-    ::close(fd);
-    return -1;
-  }
-
-  const int timeout_ms = std::max(1, profile.timeout_ms);
-  const int ep = ::epoll_create1(EPOLL_CLOEXEC);
-  if (ep < 0) {
-    ::close(fd);
-    return -1;
-  }
-  epoll_event ev {};
-  ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
-  ev.data.fd = fd;
-  if (::epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev) != 0) {
-    ::close(ep);
-    ::close(fd);
-    return -1;
-  }
-  epoll_event out {};
-  const int wr = ::epoll_wait(ep, &out, 1, timeout_ms);
-  if (g_perf_stats != nullptr) {
-    g_perf_stats->epoll_wakeups += 1;
-  }
-  if (wr <= 0) {
-    ::close(ep);
-    ::close(fd);
-    return -1;
-  }
-
-  int so_error = 0;
-  socklen_t slen = sizeof(so_error);
-  if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &slen) != 0) {
-    ::close(ep);
-    ::close(fd);
-    return -1;
-  }
-  ::close(ep);
-  if (so_error != 0) {
-    ::close(fd);
-    return -1;
-  }
-  conn.fd = fd;
-  return fd;
-}
-
-int connect_socket(const Profile& profile) {
-  Http1Connection conn;
-  return connect_socket(conn, profile);
-}
-
-ssize_t kernel_socket_send(Http1Connection& conn, const void* buf, std::size_t len) {
-  return ::send(conn.fd, buf, len, MSG_NOSIGNAL);
-}
-
-ssize_t kernel_socket_recv(Http1Connection& conn, void* buf, std::size_t len) {
-  return ::recv(conn.fd, buf, len, 0);
-}
-
-int kernel_socket_close(Http1Connection& conn) {
-  return ::close(conn.fd);
+  (void)profile;
+  return TransportBackend::CustomTcp;
 }
 
 uint32_t synthetic_custom_tcp_src_ip() {
@@ -959,13 +871,6 @@ int custom_tcp_close_bridge(Http1Connection& conn) {
 }
 
 const H1TransportOps& resolve_h1_transport_ops(TransportBackend backend) {
-  static const H1TransportOps kernel_ops{
-      connect_socket,
-      kernel_socket_send,
-      kernel_socket_recv,
-      kernel_socket_close,
-      "kernel_socket",
-  };
   static const H1TransportOps custom_tcp_ops{
       custom_tcp_connect_bridge,
       custom_tcp_send_bridge,
@@ -973,13 +878,8 @@ const H1TransportOps& resolve_h1_transport_ops(TransportBackend backend) {
       custom_tcp_close_bridge,
       "custom_tcp",
   };
-  switch (backend) {
-    case TransportBackend::CustomTcp:
-      return custom_tcp_ops;
-    case TransportBackend::KernelSocket:
-      return kernel_ops;
-  }
-  return kernel_ops;
+  (void)backend;
+  return custom_tcp_ops;
 }
 
 long long monotonic_ms_now() {
@@ -1493,6 +1393,26 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
             lane_ptr->phase = H1LanePhase::Failed;
           }
         }
+        for (auto& session_ptr : local_shard.h2_sessions) {
+          if (!session_ptr) {
+            continue;
+          }
+          auto& session = *session_ptr;
+          auto& ctx = session.ctx;
+          if (ctx.transport_backend != TransportBackend::CustomTcp) {
+            continue;
+          }
+          if (ctx.custom_flow_id != item.flow_id) {
+            continue;
+          }
+          if (item.event != nullptr && std::strcmp(item.event, "connect_established") == 0) {
+            ctx.custom_connect_ready = true;
+          } else {
+            ctx.custom_terminal = true;
+            ctx.transport_error = 1;
+          }
+          break;
+        }
       }
     }
     tcpdp_free_completions(items, item_count);
@@ -1519,6 +1439,23 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
               item.payload_len);
           lane_ptr->response.bytes_received += item.payload_len;
           lane_ptr->rx_bytes += item.payload_len;
+          break;
+        }
+        for (auto& session_ptr : local_shard.h2_sessions) {
+          if (!session_ptr) {
+            continue;
+          }
+          auto& session = *session_ptr;
+          auto& ctx = session.ctx;
+          if (ctx.transport_backend != TransportBackend::CustomTcp) {
+            continue;
+          }
+          if (ctx.custom_flow_id != item.flow_id) {
+            continue;
+          }
+          ctx.read_buffer.append(
+              reinterpret_cast<const char*>(item.payload),
+              item.payload_len);
           break;
         }
       }
@@ -2644,6 +2581,117 @@ std::vector<std::vector<H2RequestSpec>> bucket_h2_requests_by_shard(
   return buckets;
 }
 
+#ifdef SAMURAI_WITH_OPENSSL
+bool h2_custom_queue_ciphertext(H2ConnectionContext& ctx, const uint8_t* data, std::size_t len) {
+  if (len == 0) {
+    return true;
+  }
+  if (ctx.custom_flow_id == 0 || !ctx.custom_connect_ready) {
+    errno = EAGAIN;
+    return false;
+  }
+  uint32_t queued = 0;
+  const int rc = tcpdp_enqueue_send(ctx.custom_flow_id, data, len, &queued);
+  if (rc != 0 || queued != len) {
+    errno = EAGAIN;
+    return false;
+  }
+  return true;
+}
+
+bool h2_custom_flush_tls_wbio(H2ConnectionContext& ctx) {
+  if (ctx.ssl == nullptr) {
+    errno = EIO;
+    return false;
+  }
+  BIO* wbio = SSL_get_wbio(ctx.ssl);
+  if (wbio == nullptr) {
+    errno = EIO;
+    return false;
+  }
+  uint8_t out[8192];
+  while (true) {
+    const int n = BIO_read(wbio, out, static_cast<int>(sizeof(out)));
+    if (n > 0) {
+      if (!h2_custom_queue_ciphertext(ctx, out, static_cast<std::size_t>(n))) {
+        return false;
+      }
+      ctx.bytes_sent += static_cast<std::size_t>(n);
+      continue;
+    }
+    if (n == 0) {
+      break;
+    }
+    if (!BIO_should_retry(wbio)) {
+      errno = EIO;
+      return false;
+    }
+    break;
+  }
+  return true;
+}
+
+void h2_custom_feed_tls_rbio(H2ConnectionContext& ctx) {
+  if (ctx.ssl == nullptr || ctx.read_buffer.empty()) {
+    return;
+  }
+  BIO* rbio = SSL_get_rbio(ctx.ssl);
+  if (rbio == nullptr) {
+    return;
+  }
+  const int to_write = static_cast<int>(std::min<std::size_t>(
+      ctx.read_buffer.size(),
+      static_cast<std::size_t>(std::numeric_limits<int>::max())));
+  if (to_write <= 0) {
+    return;
+  }
+  const int written = BIO_write(rbio, ctx.read_buffer.data(), to_write);
+  if (written > 0) {
+    ctx.read_buffer.erase(0, static_cast<std::size_t>(written));
+  }
+}
+
+bool h2_custom_advance_tls(H2ConnectionContext& ctx) {
+  if (!ctx.use_tls) {
+    return true;
+  }
+  if (ctx.ssl == nullptr) {
+    errno = EIO;
+    return false;
+  }
+  if (!ctx.custom_connect_ready) {
+    errno = EAGAIN;
+    return false;
+  }
+  h2_custom_feed_tls_rbio(ctx);
+  if (!ctx.tls_handshake_complete) {
+    const int hs = SSL_do_handshake(ctx.ssl);
+    if (hs == 1) {
+      const unsigned char* alpn = nullptr;
+      unsigned int alpn_len = 0;
+      SSL_get0_alpn_selected(ctx.ssl, &alpn, &alpn_len);
+      if (alpn == nullptr || alpn_len != 2 || std::memcmp(alpn, "h2", 2) != 0) {
+        errno = EPROTO;
+        ctx.transport_error = 1;
+        return false;
+      }
+      ctx.tls_handshake_complete = true;
+    } else {
+      const int err = SSL_get_error(ctx.ssl, hs);
+      if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+        errno = EIO;
+        ctx.transport_error = 1;
+        return false;
+      }
+    }
+  }
+  if (!h2_custom_flush_tls_wbio(ctx)) {
+    return false;
+  }
+  return ctx.tls_handshake_complete;
+}
+#endif
+
 ssize_t h2_send_callback(
     nghttp2_session* session,
     const uint8_t* data,
@@ -2662,7 +2710,65 @@ ssize_t h2_send_callback(
     if (g_perf_stats != nullptr) {
       g_perf_stats->tx_syscalls += 1;
     }
-    if (ctx->use_tls) {
+    if (ctx->transport_backend == TransportBackend::CustomTcp) {
+      if (!ctx->custom_connect_ready) {
+        errno = EAGAIN;
+        return NGHTTP2_ERR_WOULDBLOCK;
+      }
+      if (ctx->use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+        if (!h2_custom_advance_tls(*ctx)) {
+          if (ctx->transport_error != 0) {
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+          }
+          errno = EAGAIN;
+          return NGHTTP2_ERR_WOULDBLOCK;
+        }
+        const int tls_wr = SSL_write(
+            ctx->ssl,
+            data + off,
+            static_cast<int>(std::min<std::size_t>(length - off, static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+        if (tls_wr > 0) {
+          if (!h2_custom_flush_tls_wbio(*ctx)) {
+            if (ctx->transport_error != 0) {
+              return NGHTTP2_ERR_CALLBACK_FAILURE;
+            }
+            errno = EAGAIN;
+            return NGHTTP2_ERR_WOULDBLOCK;
+          }
+          wr = static_cast<ssize_t>(tls_wr);
+        } else {
+          const int err = SSL_get_error(ctx->ssl, tls_wr);
+          if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            if (!h2_custom_flush_tls_wbio(*ctx)) {
+              if (ctx->transport_error != 0) {
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+              }
+            }
+            errno = EAGAIN;
+            return NGHTTP2_ERR_WOULDBLOCK;
+          }
+          ctx->transport_error = 1;
+          return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+#else
+        ctx->transport_error = 1;
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+#endif
+      } else {
+        uint32_t queued = 0;
+        const int rc = tcpdp_enqueue_send(
+            ctx->custom_flow_id,
+            data + off,
+            length - off,
+            &queued);
+        if (rc != 0 || queued == 0) {
+          errno = EAGAIN;
+          return NGHTTP2_ERR_WOULDBLOCK;
+        }
+        wr = static_cast<ssize_t>(queued);
+      }
+    } else if (ctx->use_tls) {
 #ifdef SAMURAI_WITH_OPENSSL
       if (ctx->ssl == nullptr) {
         ctx->transport_error = 1;
@@ -2879,6 +2985,56 @@ ssize_t h2_socket_read(H2ConnectionContext& ctx, unsigned char* buf, size_t cap)
   if (g_perf_stats != nullptr) {
     g_perf_stats->rx_syscalls += 1;
   }
+  if (ctx.transport_backend == TransportBackend::CustomTcp) {
+    if (ctx.use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+      if (!h2_custom_advance_tls(ctx)) {
+        if (ctx.transport_error != 0) {
+          errno = EIO;
+        } else {
+          errno = EAGAIN;
+        }
+        return -1;
+      }
+      h2_custom_feed_tls_rbio(ctx);
+      const int rd = SSL_read(
+          ctx.ssl,
+          buf,
+          static_cast<int>(std::min<std::size_t>(cap, static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+      if (rd > 0) {
+        return static_cast<ssize_t>(rd);
+      }
+      if (rd == 0) {
+        return 0;
+      }
+      const int err = SSL_get_error(ctx.ssl, rd);
+      if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        (void)h2_custom_flush_tls_wbio(ctx);
+        errno = EAGAIN;
+        return -1;
+      }
+      if (err == SSL_ERROR_ZERO_RETURN) {
+        return 0;
+      }
+      errno = EIO;
+      return -1;
+#else
+      errno = EIO;
+      return -1;
+#endif
+    }
+    if (!ctx.read_buffer.empty()) {
+      const std::size_t n = std::min<std::size_t>(cap, ctx.read_buffer.size());
+      std::memcpy(buf, ctx.read_buffer.data(), n);
+      ctx.read_buffer.erase(0, n);
+      return static_cast<ssize_t>(n);
+    }
+    if (ctx.custom_terminal) {
+      return 0;
+    }
+    errno = EAGAIN;
+    return -1;
+  }
   if (ctx.use_tls) {
 #ifdef SAMURAI_WITH_OPENSSL
     if (ctx.ssl == nullptr) {
@@ -2918,7 +3074,6 @@ bool setup_tls(H2ConnectionContext& ctx, const Profile& profile) {
   if (!ctx.use_tls) {
     return true;
   }
-  const long long start_ms = monotonic_ms_now();
   ctx.tls_ctx = SSL_CTX_new(TLS_client_method());
   if (ctx.tls_ctx == nullptr) {
     return false;
@@ -2932,11 +3087,31 @@ bool setup_tls(H2ConnectionContext& ctx, const Profile& profile) {
   if (ctx.ssl == nullptr) {
     return false;
   }
-  if (SSL_set_fd(ctx.ssl, ctx.fd) != 1) {
-    return false;
-  }
   if (!profile.host_header.empty()) {
     SSL_set_tlsext_host_name(ctx.ssl, profile.host_header.c_str());
+  }
+  if (ctx.transport_backend == TransportBackend::CustomTcp) {
+    BIO* rbio = BIO_new(BIO_s_mem());
+    BIO* wbio = BIO_new(BIO_s_mem());
+    if (rbio == nullptr || wbio == nullptr) {
+      if (rbio != nullptr) {
+        BIO_free(rbio);
+      }
+      if (wbio != nullptr) {
+        BIO_free(wbio);
+      }
+      return false;
+    }
+    BIO_set_mem_eof_return(rbio, -1);
+    BIO_set_mem_eof_return(wbio, -1);
+    SSL_set_bio(ctx.ssl, rbio, wbio);
+    SSL_set_connect_state(ctx.ssl);
+    ctx.tls_handshake_complete = false;
+    return true;
+  }
+  const long long start_ms = monotonic_ms_now();
+  if (SSL_set_fd(ctx.ssl, ctx.fd) != 1) {
+    return false;
   }
   if (SSL_connect(ctx.ssl) != 1) {
     return false;
@@ -2950,6 +3125,7 @@ bool setup_tls(H2ConnectionContext& ctx, const Profile& profile) {
         static_cast<double>(std::max<long long>(0, monotonic_ms_now() - start_ms)),
         0);
   }
+  ctx.tls_handshake_complete = ok;
   return ok;
 #else
   (void)ctx;
@@ -2969,6 +3145,7 @@ void cleanup_tls(H2ConnectionContext& ctx) {
     SSL_CTX_free(ctx.tls_ctx);
     ctx.tls_ctx = nullptr;
   }
+  ctx.tls_handshake_complete = false;
 #else
   (void)ctx;
 #endif
@@ -3096,6 +3273,10 @@ void close_h2_client_session(H2ClientSession& client) {
     client.ctx.fd = -1;
   }
   client.ctx.active_streams.clear();
+  client.ctx.custom_flow_id = 0;
+  client.ctx.custom_connect_ready = false;
+  client.ctx.custom_terminal = false;
+  client.ctx.read_buffer.clear();
   client.pending_requests.clear();
   client.completed_streams.clear();
   client.ready = false;
@@ -3134,6 +3315,7 @@ bool open_h2_client_session(
   client.ctx.use_tls = profile.scheme == "https";
   client.ctx.verify_peer = profile.verify != 0;
   client.ctx.timeout_ms = profile.timeout_ms;
+  client.ctx.transport_backend = parse_transport_backend(profile);
   client.ctx.owner_session = &client;
   client.ctx.authority = profile.host_header.empty() ? profile.target_ip : profile.host_header;
   if (client.ctx.authority.find(':') == std::string::npos && profile.target_port > 0) {
@@ -3141,20 +3323,43 @@ bool open_h2_client_session(
   }
 
   stats.conn_attempted += 1;
-  client.ctx.fd = connect_socket(profile);
-  if (client.ctx.fd < 0) {
-    stats.errors += static_cast<int>(request_count);
-    stats.expectation_failures += static_cast<int>(request_count);
-    return false;
+  if (client.ctx.transport_backend == TransportBackend::CustomTcp) {
+    uint32_t dst_ip = 0;
+    if (!parse_ipv4_u32(profile.target_ip, &dst_ip)) {
+      errno = EINVAL;
+      stats.errors += static_cast<int>(request_count);
+      stats.expectation_failures += static_cast<int>(request_count);
+      return false;
+    }
+    uint64_t flow_id = 0;
+    const int rc = tcpdp_enqueue_connect(
+        synthetic_custom_tcp_src_ip(),
+        dst_ip,
+        0,
+        static_cast<uint16_t>(profile.target_port),
+        &flow_id);
+    if (rc != 0 || flow_id == 0) {
+      errno = ENOTSUP;
+      stats.errors += static_cast<int>(request_count);
+      stats.expectation_failures += static_cast<int>(request_count);
+      return false;
+    }
+    client.ctx.custom_flow_id = flow_id;
+    client.ctx.custom_connect_ready = false;
+    client.ctx.custom_terminal = false;
+    client.ctx.tls_handshake_complete = !client.ctx.use_tls;
+    client.ctx.fd = 1;
+  } else {
+    client.ctx.fd = -1;
+    client.ctx.tls_handshake_complete = !client.ctx.use_tls;
   }
   if (!setup_tls(client.ctx, profile)) {
-    cleanup_tls(client.ctx);
-    ::close(client.ctx.fd);
-    client.ctx.fd = -1;
+    close_h2_client_session(client);
     stats.errors += static_cast<int>(request_count);
     stats.expectation_failures += static_cast<int>(request_count);
     return false;
   }
+
   stats.conn_established += 1;
   shard.connection_pool.active_connections += 1;
   shard.connection_pool.active_connections_peak = std::max(
@@ -3182,7 +3387,9 @@ bool open_h2_client_session(
     return false;
   }
   nghttp2_submit_settings(client.session, NGHTTP2_FLAG_NONE, nullptr, 0);
-  register_h2_lane_fd(shard, local_shard, &client);
+  if (client.ctx.transport_backend != TransportBackend::CustomTcp) {
+    register_h2_lane_fd(shard, local_shard, &client);
+  }
   client.ready = true;
   client.replacement_mode = H2LaneReplacementMode::Ready;
   client.idle_deadline_ms = monotonic_ms_now() + std::max(1, profile.timeout_ms);
@@ -3262,6 +3469,15 @@ void service_h2_session_io(
   ctx.epoll_fd = shard.epoll_fd;
   const long long now_ms = monotonic_ms_now();
 
+#ifdef SAMURAI_WITH_OPENSSL
+  if (ctx.transport_backend == TransportBackend::CustomTcp && ctx.use_tls && !ctx.tls_handshake_complete) {
+    const bool ready = h2_custom_advance_tls(ctx);
+    if (!ready && ctx.transport_error == 0) {
+      return;
+    }
+  }
+#endif
+
   while (ctx.goaway == 0 &&
          !local_shard.pending_h2_requests.empty() &&
          client.pending_requests.size() + ctx.active_streams.size() < stream_budget) {
@@ -3292,7 +3508,8 @@ void service_h2_session_io(
 
   if ((ctx.protocol_error == 0 && ctx.transport_error == 0) &&
       (!ctx.active_streams.empty() || !client.pending_requests.empty())) {
-    if (nghttp2_session_send(client.session) < 0) {
+    const int send_rc = nghttp2_session_send(client.session);
+    if (send_rc < 0 && send_rc != NGHTTP2_ERR_WOULDBLOCK) {
       ctx.protocol_error = 1;
     }
   }
@@ -3337,7 +3554,9 @@ void service_h2_session_io(
     client.unhealthy_until_ms = monotonic_ms_now() + std::max(1, profile.timeout_ms / 4);
     shard.connection_pool.active_connections =
         std::max(0, shard.connection_pool.active_connections - 1);
-    unregister_lane_fd(shard, local_shard, client.ctx.fd);
+    if (ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
+      unregister_lane_fd(shard, local_shard, client.ctx.fd);
+    }
     close_h2_client_session(client);
     local_shard.dispatch_ready_ms = client.unhealthy_until_ms;
     return;
@@ -3351,7 +3570,9 @@ void service_h2_session_io(
     requeue_h2_pending_front(local_shard, client);
     shard.connection_pool.active_connections =
         std::max(0, shard.connection_pool.active_connections - 1);
-    unregister_lane_fd(shard, local_shard, client.ctx.fd);
+    if (ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
+      unregister_lane_fd(shard, local_shard, client.ctx.fd);
+    }
     close_h2_client_session(client);
     local_shard.dispatch_ready_ms = now_ms;
     return;
@@ -3470,7 +3691,9 @@ std::map<std::string, double> run_http2_profile(
     if (decision.action == ConnectionDispositionAction::Close) {
       shard.connection_pool.active_connections =
           std::max(0, shard.connection_pool.active_connections - 1);
-      unregister_lane_fd(shard, local_shard, client.ctx.fd);
+      if (client.ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
+        unregister_lane_fd(shard, local_shard, client.ctx.fd);
+      }
       close_h2_client_session(client);
       return;
     }
@@ -3554,7 +3777,7 @@ std::map<std::string, double> run_http2_profile(
       }
       if (client.replacement_mode == H2LaneReplacementMode::ReplaceNow) {
         stats.replace_now_decisions += 1;
-        if (client.ctx.fd >= 0) {
+        if (client.ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
           shard.connection_pool.active_connections =
               std::max(0, shard.connection_pool.active_connections - 1);
           unregister_lane_fd(shard, local_shard, client.ctx.fd);

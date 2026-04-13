@@ -32,7 +32,7 @@ struct FlowOp {
 struct Profile {
   std::string protocol;
   std::string sender_path;
-  std::string transport_backend{"kernel_socket"};
+  std::string transport_backend{"custom_tcp"};
   std::string stateful_runtime_backend{"afxdp"};
   int stateful_runtime_strict{0};
   int legacy_mode{0};
@@ -68,8 +68,7 @@ enum class ReactorBackend {
 };
 
 enum class TransportBackend {
-  KernelSocket = 0,
-  CustomTcp = 1,
+  CustomTcp = 0,
 };
 
 enum class TlsBackend {
@@ -98,8 +97,6 @@ inline const char* reactor_backend_name(ReactorBackend backend) {
 
 inline const char* transport_backend_name(TransportBackend backend) {
   switch (backend) {
-    case TransportBackend::KernelSocket:
-      return "kernel_socket";
     case TransportBackend::CustomTcp:
       return "custom_tcp";
   }
