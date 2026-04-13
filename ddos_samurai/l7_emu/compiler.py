@@ -194,7 +194,7 @@ def compile_l7_profile(
     target_ip: str,
     target_port: int,
     scheme: str,
-    transport_backend: str = "kernel_socket",
+    transport_backend: str = "custom_tcp",
     stateful_runtime_backend: Optional[str] = None,
     stateful_runtime_strict: bool = False,
     legacy_mode: bool = True,
@@ -219,10 +219,10 @@ def compile_l7_profile(
     runtime_backend = str(stateful_runtime_backend or "afxdp").strip().lower()
     if runtime_backend not in {"afxdp", "dpdk"}:
         raise ValueError(f"unsupported stateful runtime backend: {stateful_runtime_backend!r}")
-    backend = str(transport_backend or "kernel_socket").strip().lower()
-    if backend == "kernel_socket" and (runtime_backend_explicit or not bool(legacy_mode)):
+    backend = str(transport_backend or "custom_tcp").strip().lower()
+    if backend == "kernel_socket":
         backend = "custom_tcp"
-    if backend not in {"kernel_socket", "custom_tcp"}:
+    if backend not in {"custom_tcp"}:
         raise ValueError(f"unsupported L7 transport backend: {transport_backend!r}")
     alpn_values: List[str] = []
     if profile_data and "alpn" in profile_data:

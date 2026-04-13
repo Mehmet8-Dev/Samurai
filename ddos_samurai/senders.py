@@ -59,18 +59,12 @@ def _resolve_l7_transport_backend(
     *,
     protocol: str = "http1",
 ) -> str:
-    explicit = str(requested_backend or "").strip().lower()
-    backend = explicit
-    if not backend:
-        backend = str(os.environ.get("SAMURAI_L7_TRANSPORT_BACKEND", "") or "").strip().lower()
-    if not backend:
-        custom_tcp_mode = str(os.environ.get("SAMURAI_CUSTOM_TCP_MODE", "off") or "off").strip().lower()
-        runtime_backend = _resolve_stateful_runtime_backend(os.environ.get("SAMURAI_STATEFUL_RUNTIME_BACKEND", "afxdp"))
-        if custom_tcp_mode in {"auto", "required"} or runtime_backend in {"afxdp", "dpdk"}:
-            backend = "custom_tcp"
-    if backend not in {"kernel_socket", "custom_tcp"}:
-        backend = "kernel_socket"
-    return backend
+    backend = str(requested_backend or "").strip().lower()
+    if backend and backend != "custom_tcp":
+        log_warning(
+            f"[L7] transport_backend={backend!r} is removed; using mandatory 'custom_tcp'"
+        )
+    return "custom_tcp"
 
 
 def _resolve_custom_tcp_backend(requested_backend: Any = None) -> str:
@@ -97,8 +91,8 @@ def _resolve_custom_tcp_rx_iface(requested_iface: Any = None, xdp_interface: Any
 
 def _profile_uses_custom_tcp(profile: Any) -> bool:
     conn = getattr(profile, "connection_template", None)
-    backend = getattr(conn, "transport_backend", "kernel_socket")
-    return str(backend or "kernel_socket").strip().lower() == "custom_tcp"
+    backend = getattr(conn, "transport_backend", "custom_tcp")
+    return str(backend or "custom_tcp").strip().lower() == "custom_tcp"
 
 
 def _resolve_stateful_runtime_backend(requested_backend: Any = None) -> str:
@@ -117,7 +111,7 @@ def _stateful_runtime_metadata(profile: Any, runtime_cfg: RuntimeConfig) -> Dict
     runtime_backend = _resolve_stateful_runtime_backend(
         runtime_cfg.stateful_runtime_backend or getattr(conn, "stateful_runtime_backend", "afxdp")
     )
-    transport_backend = str(getattr(conn, "transport_backend", "kernel_socket") or "kernel_socket")
+    transport_backend = str(getattr(conn, "transport_backend", "custom_tcp") or "custom_tcp")
     legacy_mode = bool(runtime_cfg.legacy_mode)
     hot_path_level = "phase1_hybrid_afxdp"
     if runtime_backend == "afxdp":
@@ -210,7 +204,7 @@ def _stateful_runtime_preflight(
         return None
 
     conn = getattr(profile, "connection_template", None)
-    transport_backend = str(getattr(conn, "transport_backend", "kernel_socket") or "kernel_socket").strip().lower()
+    transport_backend = str(getattr(conn, "transport_backend", "custom_tcp") or "custom_tcp").strip().lower()
     if transport_backend != "custom_tcp":
         return _stateful_runtime_fail_visible_stats(
             profile,
@@ -282,9 +276,9 @@ def _enforce_phase3_strict_h1_contract(
     if observed_runtime_transport_backend is None:
         observed_runtime_transport_backend = stats.get(
             "runtime_transport_backend",
-            getattr(conn, "transport_backend", "kernel_socket"),
+            getattr(conn, "transport_backend", "custom_tcp"),
         )
-    runtime_transport_backend = str(observed_runtime_transport_backend or "kernel_socket").strip().lower()
+    runtime_transport_backend = str(observed_runtime_transport_backend or "custom_tcp").strip().lower()
     if runtime_transport_backend == "custom_tcp":
         return stats
     return _stateful_runtime_fail_visible_stats(
@@ -493,25 +487,13 @@ async def run_l7_profile_public(profile, **kwargs):
         fail_stats.update(session.snapshot())
         return fail_stats
     if not _profile_uses_custom_tcp(profile):
-        try:
-            result = await _run_l7_profile(profile, runtime_cfg)
-            stats = result.as_dict()
-        finally:
-            session.close()
-        observed_transport_backend = stats.get("runtime_transport_backend")
-        stats.update(runtime_metadata)
-        if preflight:
-            stats.update(preflight)
-        else:
-            stats.update(_stateful_runtime_preflight_fields(status="skipped"))
-        stats.update(session.snapshot())
-        stats = _enforce_phase3_strict_h1_contract(
-            stats,
+        session.close()
+        return _stateful_runtime_fail_visible_stats(
             profile,
             runtime_cfg,
-            observed_runtime_transport_backend=observed_transport_backend,
+            reason="kernel_socket_transport_disabled",
+            detail="L7 kernel_socket transport path is disabled; custom_tcp is mandatory.",
         )
-        return stats
 
     rx_iface = _resolve_custom_tcp_rx_iface(
         kwargs.get("custom_tcp_rx_interface"),

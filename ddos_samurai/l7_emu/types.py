@@ -80,7 +80,7 @@ class ConnectionTemplate:
     target_port: int
     scheme: str
     host_header: str
-    transport_backend: str = "kernel_socket"
+    transport_backend: str = "custom_tcp"
     stateful_runtime_backend: str = "afxdp"
     stateful_runtime_strict: bool = False
     legacy_mode: bool = False

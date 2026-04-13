@@ -1091,7 +1091,7 @@ async def worker_process(
     # Keep L7 transport selection in worker scope so both CPU and CUDA branches
     # use the same resolved contract values.
     _l7_custom_tcp_mode = str(args.get("custom_tcp_mode", "off") or "off").strip().lower()
-    _l7_transport_backend = "custom_tcp" if _l7_custom_tcp_mode in {"auto", "required"} else None
+    _l7_transport_backend = "custom_tcp"
     _l7_custom_tcp_rx_interface = str(
         args.get("custom_tcp_rx_interface", "") or args.get("xdp_interface", "") or ""
     ).strip()
@@ -1655,7 +1655,7 @@ async def worker_process(
                         yield rp
             traffic_model_request_plans = list(_iter_model_plans()) if traffic_model_enabled else []
             _l7_custom_tcp_mode = str(args.get("custom_tcp_mode", "off") or "off").strip().lower()
-            _l7_transport_backend = "custom_tcp" if _l7_custom_tcp_mode in {"auto", "required"} else None
+            _l7_transport_backend = "custom_tcp"
             _l7_custom_tcp_rx_interface = str(
                 args.get("custom_tcp_rx_interface", "") or args.get("xdp_interface", "") or ""
             ).strip()
@@ -1709,7 +1709,7 @@ async def worker_process(
                         "flow_count": max(1, safe_count),
                         "tuple_seed": int(args.get("topology_seed", args.get("gpu_rng_seed", 1234)) or 1234),
                         "step_graph": ["open", "send", "expect", "close"],
-                        "transport": "custom_tcp" if _l7_transport_backend == "custom_tcp" else "kernel_socket",
+                        "transport": "custom_tcp",
                     },
                 }
                 return gpu_cuda_payload.compile_vector_spec(

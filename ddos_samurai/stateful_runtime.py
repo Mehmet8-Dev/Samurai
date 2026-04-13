@@ -67,7 +67,7 @@ class StatefulRuntimeSession:
         runtime_backend = _normalize_runtime_backend(
             self._config.stateful_runtime_backend or getattr(conn, "stateful_runtime_backend", "afxdp")
         )
-        transport_backend = str(getattr(conn, "transport_backend", "kernel_socket") or "kernel_socket")
+        transport_backend = str(getattr(conn, "transport_backend", "custom_tcp") or "custom_tcp")
         legacy_mode = bool(self._config.legacy_mode)
         runtime_hot_path_level = "phase1_hybrid_afxdp"
         if runtime_backend == "afxdp":
