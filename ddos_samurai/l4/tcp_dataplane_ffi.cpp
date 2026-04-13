@@ -2,22 +2,10 @@
 
 #include "tcp_dataplane_core.hpp"
 
-#include <arpa/inet.h>
-#include <linux/if_packet.h>
-#include <net/ethernet.h>
-#include <net/if.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
+#include <errno.h>
 
-#include <array>
-#include <atomic>
 #include <cstring>
-#include <mutex>
-#include <memory>
 #include <string>
-#include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace ddos_samurai::tcpdp {
@@ -26,39 +14,6 @@ namespace {
 TcpDataplaneCore& Core() {
   static TcpDataplaneCore* core = new TcpDataplaneCore();
   return *core;
-}
-
-struct RxHandlerContext {
-  int32_t id = 0;
-  int sockfd = -1;
-  std::string iface;
-  std::atomic<bool> running{false};
-  std::thread worker;
-};
-
-std::atomic<int32_t> g_next_handler_id{1};
-std::mutex g_handlers_mu;
-std::unordered_map<int32_t, std::unique_ptr<RxHandlerContext>> g_handlers;
-
-void RxLoop(RxHandlerContext* ctx) {
-  if (!ctx) {
-    return;
-  }
-  std::array<uint8_t, 2048> frame{};
-  while (ctx->running.load(std::memory_order_acquire)) {
-    ssize_t n = recvfrom(ctx->sockfd, frame.data(), frame.size(), 0, nullptr, nullptr);
-    if (n <= 0) {
-      if (!ctx->running.load(std::memory_order_acquire)) {
-        break;
-      }
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-        continue;
-      }
-      continue;
-    }
-    uint32_t updated = 0;
-    (void)tcpdp_ingest_rx_frame(frame.data(), static_cast<size_t>(n), &updated);
-  }
 }
 
 }  // namespace
@@ -352,72 +307,16 @@ int tcpdp_start_rx_handler(const char* iface, int32_t* out_handler_id) {
   if (!iface || !iface[0] || !out_handler_id) {
     return -1;
   }
-  int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-  if (sock < 0) {
-    return -1;
-  }
-
-  struct timeval tv {};
-  tv.tv_sec = 0;
-  tv.tv_usec = 200000;
-  (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  int ignore_outgoing = 1;
-  (void)setsockopt(sock, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore_outgoing, sizeof(ignore_outgoing));
-
-  struct sockaddr_ll sll {};
-  sll.sll_family = AF_PACKET;
-  sll.sll_protocol = htons(ETH_P_ALL);
-  sll.sll_ifindex = if_nametoindex(iface);
-  if (sll.sll_ifindex <= 0) {
-    close(sock);
-    return -1;
-  }
-  if (bind(sock, reinterpret_cast<struct sockaddr*>(&sll), sizeof(sll)) < 0) {
-    close(sock);
-    return -1;
-  }
-
-  auto ctx = std::make_unique<ddos_samurai::tcpdp::RxHandlerContext>();
-  ctx->id = ddos_samurai::tcpdp::g_next_handler_id.fetch_add(1, std::memory_order_relaxed);
-  ctx->sockfd = sock;
-  ctx->iface = iface;
-  ctx->running.store(true, std::memory_order_release);
-  ddos_samurai::tcpdp::RxHandlerContext* raw = ctx.get();
-  ctx->worker = std::thread([raw]() { ddos_samurai::tcpdp::RxLoop(raw); });
-
-  {
-    std::lock_guard<std::mutex> guard(ddos_samurai::tcpdp::g_handlers_mu);
-    ddos_samurai::tcpdp::g_handlers.emplace(ctx->id, std::move(ctx));
-  }
-
-  *out_handler_id = raw->id;
-  return 0;
+  errno = ENOTSUP;
+  (void)iface;
+  (void)out_handler_id;
+  return -1;
 }
 
 int tcpdp_stop_rx_handler(int32_t handler_id) {
-  std::unique_ptr<ddos_samurai::tcpdp::RxHandlerContext> ctx;
-  {
-    std::lock_guard<std::mutex> guard(ddos_samurai::tcpdp::g_handlers_mu);
-    auto it = ddos_samurai::tcpdp::g_handlers.find(handler_id);
-    if (it == ddos_samurai::tcpdp::g_handlers.end()) {
-      return -1;
-    }
-    ctx = std::move(it->second);
-    ddos_samurai::tcpdp::g_handlers.erase(it);
-  }
-
-  if (ctx) {
-    ctx->running.store(false, std::memory_order_release);
-    if (ctx->sockfd >= 0) {
-      shutdown(ctx->sockfd, SHUT_RDWR);
-      close(ctx->sockfd);
-      ctx->sockfd = -1;
-    }
-    if (ctx->worker.joinable()) {
-      ctx->worker.join();
-    }
-  }
-  return 0;
+  (void)handler_id;
+  errno = ENOTSUP;
+  return -1;
 }
 
 }
