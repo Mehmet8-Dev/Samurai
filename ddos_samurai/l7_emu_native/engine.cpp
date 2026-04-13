@@ -1393,6 +1393,7 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
             lane_ptr->phase = H1LanePhase::Failed;
           }
         }
+#ifdef SAMURAI_WITH_NGHTTP2
         for (auto& session_ptr : local_shard.h2_sessions) {
           if (!session_ptr) {
             continue;
@@ -1413,6 +1414,7 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
           }
           break;
         }
+#endif
       }
     }
     tcpdp_free_completions(items, item_count);
@@ -1441,6 +1443,7 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
           lane_ptr->rx_bytes += item.payload_len;
           break;
         }
+#ifdef SAMURAI_WITH_NGHTTP2
         for (auto& session_ptr : local_shard.h2_sessions) {
           if (!session_ptr) {
             continue;
@@ -1458,6 +1461,7 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
               item.payload_len);
           break;
         }
+#endif
       }
     }
     tcpdp_free_rx_payloads(payload_items, payload_count);
