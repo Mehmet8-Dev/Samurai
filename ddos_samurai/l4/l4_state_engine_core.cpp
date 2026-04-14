@@ -599,26 +599,46 @@ uint32_t L4StateEngineCore::Sweep(uint32_t max_scan) {
   }
   const uint32_t now = MonotonicSeconds();
   uint32_t removed = 0;
-  for (uint32_t i = 0; i < max_scan; ++i) {
-    const uint32_t idx = sweep_cursor_ % table_size_;
-    const uint32_t segment = idx / segment_size;
-    sweep_cursor_ = (sweep_cursor_ + 1U) % table_size_;
-    std::lock_guard<std::mutex> guard(locks_[segment]);
-    Entry& e = table_[idx];
-    if (!e.in_use) {
-      continue;
-    }
-    if (static_cast<uint32_t>(now - e.last_seen) > timeout_sec_) {
-      const auto cur_idx = static_cast<size_t>(e.state);
-      if (cur_idx < state_counts_.size()) {
-        SaturatingDecrement(state_counts_[cur_idx]);
+  uint32_t remaining = max_scan;
+  uint32_t cursor = sweep_cursor_ % table_size_;
+  constexpr uint32_t kSweepChunkMax = 64;
+
+  while (remaining > 0) {
+    const uint32_t segment = cursor / segment_size;
+    const uint32_t segment_start = segment * segment_size;
+    const uint32_t segment_offset = cursor - segment_start;
+    const uint32_t segment_remaining = segment_size - segment_offset;
+    const uint32_t run_len = std::min<uint32_t>(remaining, std::min<uint32_t>(segment_remaining, kSweepChunkMax));
+
+    {
+      std::lock_guard<std::mutex> guard(locks_[segment]);
+      for (uint32_t j = 0; j < run_len; ++j) {
+        const uint32_t idx = cursor + j;
+        Entry& e = table_[idx];
+        if (!e.in_use) {
+          continue;
+        }
+        if (static_cast<uint32_t>(now - e.last_seen) > timeout_sec_) {
+          const auto cur_idx = static_cast<size_t>(e.state);
+          if (cur_idx < state_counts_.size()) {
+            SaturatingDecrement(state_counts_[cur_idx]);
+          }
+          e = Entry{};
+          removed++;
+          SaturatingDecrement(active_entries_);
+          timeout_evictions_.fetch_add(1, std::memory_order_relaxed);
+        }
       }
-      e = Entry{};
-      removed++;
-      SaturatingDecrement(active_entries_);
-      timeout_evictions_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    remaining -= run_len;
+    cursor += run_len;
+    if (cursor >= table_size_) {
+      cursor -= table_size_;
     }
   }
+
+  sweep_cursor_ = cursor;
   sweeps_.fetch_add(1, std::memory_order_relaxed);
   last_sweep_removed_.store(removed, std::memory_order_relaxed);
   return removed;
