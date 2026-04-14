@@ -480,19 +480,42 @@ void reset_h1_lane_io(H1Lane& lane) {
   lane.rx_bytes = 0;
 }
 
-double percentile_ms(const std::vector<double>& values, double pct) {
+std::size_t percentile_index(std::size_t sample_count, double pct) {
+  if (sample_count <= 1) {
+    return 0;
+  }
+  return std::min(
+      sample_count - 1,
+      static_cast<std::size_t>((pct / 100.0) * static_cast<double>(sample_count - 1) + 0.5));
+}
+
+struct PercentileTripletMs {
+  double p50{0.0};
+  double p95{0.0};
+  double p99{0.0};
+};
+
+PercentileTripletMs percentile_triplet_ms(const std::vector<double>& values) {
   if (values.empty()) {
-    return 0.0;
+    return {};
   }
   if (values.size() == 1) {
-    return values.front();
+    const double only = values.front();
+    return PercentileTripletMs{only, only, only};
   }
-  std::vector<double> sorted = values;
-  std::sort(sorted.begin(), sorted.end());
-  const std::size_t idx = std::min(
-      sorted.size() - 1,
-      static_cast<std::size_t>((pct / 100.0) * static_cast<double>(sorted.size() - 1) + 0.5));
-  return sorted[idx];
+  std::vector<double> work = values;
+  const std::size_t idx50 = percentile_index(work.size(), 50.0);
+  const std::size_t idx95 = percentile_index(work.size(), 95.0);
+  const std::size_t idx99 = percentile_index(work.size(), 99.0);
+  auto select = [&](std::size_t idx) {
+    std::nth_element(work.begin(), work.begin() + static_cast<std::ptrdiff_t>(idx), work.end());
+    return work[idx];
+  };
+  return PercentileTripletMs{
+      select(idx50),
+      select(idx95),
+      select(idx99),
+  };
 }
 
 int runtime_active_conn_peak(const NativeRuntime& runtime) {
@@ -612,12 +635,14 @@ void apply_perf_outputs(
   out["l7_tx_syscalls"] = static_cast<double>(runtime.perf.tx_syscalls);
   out["l7_alloc_bytes"] = static_cast<double>(runtime.perf.alloc_bytes);
   out["l7_alloc_count"] = static_cast<double>(runtime.perf.alloc_count);
-  out["l7_tls_handshake_p50_ms"] = percentile_ms(runtime.perf.tls_handshake_samples_ms, 50.0);
-  out["l7_tls_handshake_p95_ms"] = percentile_ms(runtime.perf.tls_handshake_samples_ms, 95.0);
-  out["l7_tls_handshake_p99_ms"] = percentile_ms(runtime.perf.tls_handshake_samples_ms, 99.0);
-  out["l7_request_latency_p50_ms"] = percentile_ms(runtime.perf.request_latency_samples_ms, 50.0);
-  out["l7_request_latency_p95_ms"] = percentile_ms(runtime.perf.request_latency_samples_ms, 95.0);
-  out["l7_request_latency_p99_ms"] = percentile_ms(runtime.perf.request_latency_samples_ms, 99.0);
+  const auto tls_pct = percentile_triplet_ms(runtime.perf.tls_handshake_samples_ms);
+  out["l7_tls_handshake_p50_ms"] = tls_pct.p50;
+  out["l7_tls_handshake_p95_ms"] = tls_pct.p95;
+  out["l7_tls_handshake_p99_ms"] = tls_pct.p99;
+  const auto req_pct = percentile_triplet_ms(runtime.perf.request_latency_samples_ms);
+  out["l7_request_latency_p50_ms"] = req_pct.p50;
+  out["l7_request_latency_p95_ms"] = req_pct.p95;
+  out["l7_request_latency_p99_ms"] = req_pct.p99;
   out["l7_profile_enabled"] = cfg.profile_l7 != 0 ? 1.0 : 0.0;
   out["l7_profile_snapshot_count"] = static_cast<double>(runtime.perf.profile_snapshot_count);
 }
