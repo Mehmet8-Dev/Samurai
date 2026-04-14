@@ -296,7 +296,9 @@ def _native_custom_tcp_bridge_api():
     native = getattr(_l7_runtime, "_native", None)
     if native is None:
         return None
-    if not hasattr(native, "drain_custom_tcp_tx_packets"):
+    if not hasattr(native, "peek_custom_tcp_tx_buffer_strided"):
+        return None
+    if not hasattr(native, "consume_custom_tcp_tx_packets"):
         return None
     if not hasattr(native, "ingest_custom_tcp_rx_frame"):
         return None
