@@ -137,9 +137,11 @@ class TcpDataplaneCore {
     uint32_t seq = 0;
     uint32_t ack = 0;
     uint32_t payload_len = 0;
+    uint8_t flags = 0;
     uint32_t rto_ms = 0;
     uint64_t deadline_ns = 0;
-    std::vector<uint8_t> packet;
+    uint32_t payload_offset = 0;
+    std::vector<uint8_t> payload;
   };
 
   struct FlowEntry {
@@ -270,10 +272,19 @@ class TcpDataplaneCore {
       uint8_t flags,
       const uint8_t* payload,
       size_t payload_len) const;
+  std::vector<uint8_t> BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out) const;
   bool EnqueueTxPacketBytes(const uint8_t* data, size_t len);
   void PushTimer(uint64_t flow_id, TimerKind kind, uint64_t due_ns, uint32_t generation);
   void ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns);
-  void QueuePacket(FlowEntry& flow, std::vector<uint8_t>&& packet, uint32_t seq, uint32_t ack, uint32_t payload_len, bool arm_rto);
+  void QueuePacket(
+      FlowEntry& flow,
+      std::vector<uint8_t>&& packet,
+      uint32_t seq,
+      uint32_t ack,
+      uint8_t flags,
+      const uint8_t* payload,
+      uint32_t payload_len,
+      bool arm_rto);
   void PushCompletion(uint64_t flow_id, TcpDpState state, bool success, const char* event);
   void HandleAck(FlowEntry& flow, uint32_t ack_value);
   void CloseTimedOutFlow(FlowEntry& flow, TcpDpState terminal_state, const char* event);

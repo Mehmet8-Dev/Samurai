@@ -212,9 +212,10 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       out.seq = seq;
       out.ack = 0;
       out.payload_len = 0;
+      out.flags = kTcpFlagSyn;
       out.rto_ms = config_.initial_rto_ms;
       out.deadline_ns = DefaultNowNs() + NsFromMs(out.rto_ms);
-      out.packet.assign(pkt, pkt + packet_size);
+      out.payload_offset = 0;
       flow->outstanding = std::move(out);
       flow->rto_deadline_ns = flow->outstanding->deadline_ns;
       stats_.connect_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -246,9 +247,16 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       out.seq = seq;
       out.ack = ack;
       out.payload_len = payload_len;
+      out.flags = static_cast<uint8_t>(flags & static_cast<uint8_t>(kTcpFlagFin | kTcpFlagPsh | kTcpFlagAck));
       out.rto_ms = config_.initial_rto_ms;
       out.deadline_ns = DefaultNowNs() + NsFromMs(out.rto_ms);
-      out.packet.assign(pkt, pkt + packet_size);
+      out.payload_offset = 0;
+      const uint8_t* ip = pkt + 14;
+      const size_t ihl = static_cast<size_t>(ip[0] & 0x0F) * 4U;
+      const uint8_t* tcp = ip + ihl;
+      const size_t data_off = static_cast<size_t>((tcp[12] >> 4) & 0x0F) * 4U;
+      const uint8_t* payload = tcp + data_off;
+      out.payload.assign(payload, payload + payload_len);
       flow->outstanding = std::move(out);
       flow->rto_deadline_ns = flow->outstanding->deadline_ns;
       stats_.tx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
@@ -301,7 +309,7 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
 
   auto syn = BuildPacket(flow, flow.snd_nxt, 0, kTcpFlagSyn, nullptr, 0);
   flow.snd_nxt = AdvanceSeq(flow.snd_nxt, 1);
-  QueuePacket(flow, std::move(syn), flow.iss, 0, 0, true);
+  QueuePacket(flow, std::move(syn), flow.iss, 0, kTcpFlagSyn, nullptr, 0, true);
   flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
   {
     const size_t shard = FlowLockShardForFlowId(flow_id);
@@ -340,7 +348,15 @@ uint32_t TcpDataplaneCore::EnqueueSend(uint64_t flow_id, const uint8_t* payload,
   const uint32_t seq = flow->snd_nxt;
   flow->snd_nxt = AdvanceSeq(flow->snd_nxt, static_cast<uint32_t>(payload_len));
   flow->last_activity_ns = DefaultNowNs();
-  QueuePacket(*flow, std::move(pkt), seq, flow->rcv_nxt, static_cast<uint32_t>(payload_len), true);
+  QueuePacket(
+      *flow,
+      std::move(pkt),
+      seq,
+      flow->rcv_nxt,
+      static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh),
+      payload,
+      static_cast<uint32_t>(payload_len),
+      true);
   flow->rto_deadline_ns = flow->outstanding ? flow->outstanding->deadline_ns : 0;
   ScheduleFlowTimers(*flow, flow->last_activity_ns);
   stats_.tx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
@@ -418,7 +434,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     flow->outstanding.reset();
     flow->rto_deadline_ns = 0;
     auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
-    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
+    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
     SetFlowState(*flow, TcpDpState::kEstablished);
     stats_.connect_established.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, true, "connect_established");
@@ -435,7 +451,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
       stats_.out_of_order_rx_count.fetch_add(1, std::memory_order_relaxed);
       stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
       auto dup_ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
-      QueuePacket(*flow, std::move(dup_ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
+      QueuePacket(*flow, std::move(dup_ack_pkt), flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
       return finish(1);
     }
     flow->rcv_nxt = AdvanceSeq(seq, payload_len);
@@ -445,13 +461,13 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
       rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, ExtractIpv4TcpPayload(frame, frame_len)});
     }
     auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
-    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
+    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
   }
 
   if ((flags & kTcpFlagFin) != 0) {
     flow->rcv_nxt = AdvanceSeq(flow->rcv_nxt, 1U);
     auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
-    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, 0, false);
+    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
     SetFlowState(*flow, TcpDpState::kTimeWait);
     stats_.peer_fin_count.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, true, "peer_fin");
@@ -527,7 +543,8 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
         flow->outstanding->rto_ms = std::min(flow->outstanding->rto_ms * 2U, config_.connect_timeout_ms);
         flow->outstanding->deadline_ns = now_ns + NsFromMs(flow->outstanding->rto_ms);
         flow->rto_deadline_ns = flow->outstanding->deadline_ns;
-        (void)EnqueueTxPacketBytes(flow->outstanding->packet.data(), flow->outstanding->packet.size());
+        auto pkt = BuildOutstandingPacket(*flow, *flow->outstanding);
+        (void)EnqueueTxPacketBytes(pkt.data(), pkt.size());
         ScheduleFlowTimers(*flow, now_ns);
         actions++;
         break;
@@ -1047,6 +1064,8 @@ void TcpDataplaneCore::QueuePacket(
     std::vector<uint8_t>&& packet,
     uint32_t seq,
     uint32_t ack,
+    uint8_t flags,
+    const uint8_t* payload,
     uint32_t payload_len,
     bool arm_rto) {
   if (!packet.empty()) {
@@ -1058,12 +1077,27 @@ void TcpDataplaneCore::QueuePacket(
   OutstandingTx out;
   out.seq = seq;
   out.ack = ack;
+  out.flags = flags;
   out.payload_len = payload_len;
   out.rto_ms = config_.initial_rto_ms;
   out.deadline_ns = DefaultNowNs() + NsFromMs(out.rto_ms);
-  out.packet = std::move(packet);
+  out.payload_offset = 0;
+  if (payload != nullptr && payload_len > 0) {
+    out.payload.assign(payload, payload + payload_len);
+  }
   flow.outstanding = std::move(out);
   flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
+}
+
+std::vector<uint8_t> TcpDataplaneCore::BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out) const {
+  const uint8_t* payload_ptr = nullptr;
+  size_t payload_size = 0;
+  if (out.payload_len > 0 &&
+      out.payload.size() >= static_cast<size_t>(out.payload_offset) + static_cast<size_t>(out.payload_len)) {
+    payload_ptr = out.payload.data() + out.payload_offset;
+    payload_size = static_cast<size_t>(out.payload_len);
+  }
+  return BuildPacket(flow, out.seq, out.ack, out.flags, payload_ptr, payload_size);
 }
 
 void TcpDataplaneCore::PushCompletion(uint64_t flow_id, TcpDpState state, bool success, const char* event) {
@@ -1116,8 +1150,9 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value) {
   if (ack_value == flow.snd_una) {
     stats_.dup_ack_count.fetch_add(1, std::memory_order_relaxed);
     flow.dup_ack_streak++;
-    if (flow.dup_ack_streak == 3 && flow.outstanding->packet.size() > 0) {
-      (void)EnqueueTxPacketBytes(flow.outstanding->packet.data(), flow.outstanding->packet.size());
+    if (flow.dup_ack_streak == 3) {
+      auto pkt = BuildOutstandingPacket(flow, *flow.outstanding);
+      (void)EnqueueTxPacketBytes(pkt.data(), pkt.size());
       stats_.retransmit_count.fetch_add(1, std::memory_order_relaxed);
       stats_.fast_retransmit_count.fetch_add(1, std::memory_order_relaxed);
       flow.retransmit_count++;
@@ -1146,17 +1181,17 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value) {
       stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
       return;
     }
-    auto payload = ExtractIpv4TcpPayload(flow.outstanding->packet.data(), flow.outstanding->packet.size());
-    if (payload.size() != flow.outstanding->payload_len) {
+    if (flow.outstanding->payload.size() <
+        static_cast<size_t>(flow.outstanding->payload_offset) + static_cast<size_t>(flow.outstanding->payload_len)) {
       stats_.unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
       stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
       return;
     }
-    const uint8_t* unacked_payload = payload.data() + newly_acked;
     const uint32_t unacked_len = flow.outstanding->payload_len - newly_acked;
-    flow.outstanding->packet =
-        BuildPacket(flow, ack_value, flow.rcv_nxt, static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh), unacked_payload, unacked_len);
+    flow.outstanding->payload_offset += newly_acked;
     flow.outstanding->seq = ack_value;
+    flow.outstanding->ack = flow.rcv_nxt;
+    flow.outstanding->flags = static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh);
     flow.outstanding->payload_len = unacked_len;
     flow.outstanding->deadline_ns = DefaultNowNs() + NsFromMs(flow.outstanding->rto_ms);
     flow.rto_deadline_ns = flow.outstanding->deadline_ns;
