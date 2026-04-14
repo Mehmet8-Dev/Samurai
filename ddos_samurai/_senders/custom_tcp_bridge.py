@@ -238,11 +238,6 @@ async def flush_custom_tcp_tx_packets(
         xdp_queue_id=custom_tcp_xdp_queue_id,
     )
 
-    tx_buffer = None
-    tx_buffer_owner = None
-    packet_count = 0
-    packet_size = 0
-
     if int(transport_plan.get("custom_tcp_bridge_hard_fail_required", 0) or 0) == 1 and int(
         transport_plan.get("custom_tcp_bridge_degraded", 0) or 0
     ) == 1:
@@ -276,115 +271,99 @@ async def flush_custom_tcp_tx_packets(
                 "runtime_transport_contract": "custom_tcp_runtime_bridge",
             }
 
-    if str(transport_plan.get("sender_backend", "")) == "xdp":
-        peek_fn = getattr(bridge, "peek_custom_tcp_tx_buffer_strided", None)
-        if peek_fn is None:
-            peek_fn = getattr(bridge, "peek_tcp_tx_buffer_strided", None)
-        consume_fn = getattr(bridge, "consume_custom_tcp_tx_packets", None)
-        if consume_fn is None:
-            consume_fn = getattr(bridge, "consume_tcp_tx_packets", None)
-        if callable(peek_fn) and callable(consume_fn):
-            try:
-                sx_buf, sx_owner, sx_count, sx_pkt_size, sx_stride, sx_uniform = extract_strided_peek_batch(peek_fn())
-            except Exception:
-                sx_buf, sx_owner, sx_count, sx_pkt_size, sx_stride, sx_uniform = (None, None, 0, 0, 0, 0)
-            if sx_buf is not None and sx_count > 0 and sx_uniform == 1:
-                send_stats = await xdp_sender_fn(
-                    packets_buffer=sx_buf,
-                    target_ip=target_ip,
-                    target_port=target_port,
-                    count=sx_count,
-                    verbose=verbose,
-                    interface=xdp_interface,
-                    queue_id=int(custom_tcp_xdp_queue_id or 0),
-                    xdp_mode=int(custom_tcp_xdp_mode or 0),
-                    sender_fallback_policy="fail" if bool(custom_tcp_bridge_strict) else "allow",
-                    fallback_backend="python",
-                    sender_context=None,
-                    pacing_config=pacing_config,
-                    paced_send_xdp_fn=paced_send_xdp_fn if pacing_engine_available else None,
-                    packet_size_override=sx_pkt_size,
-                    packet_stride=sx_stride,
-                )
-                _ = sx_owner
-                send_stats = dict(send_stats or {})
-                sent = int(send_stats.get("sent", 0) or 0)
-                consumed = 0
-                if sent > 0:
-                    try:
-                        consumed = int(consume_fn(min(sent, sx_count)) or 0)
-                    except Exception:
-                        consumed = 0
-                if consumed > 0:
-                    update_live_fn(live_progress, consumed)
-                    update_live_fn(live_sent, consumed)
-                if sent < sx_count:
-                    update_live_fn(live_errors, max(0, sx_count - sent))
-                send_stats["custom_tcp_tx_flush_packets"] = int(consumed)
-                send_stats["custom_tcp_tx_flush_bytes"] = int(consumed) * int(sx_pkt_size)
-                for key, value in transport_plan.items():
-                    if key in {"sender_backend", "xdp_enable"}:
-                        continue
-                    send_stats.setdefault(key, value)
-                return send_stats
+    if str(transport_plan.get("sender_backend", "")) != "xdp":
+        reason = "custom_tcp_zero_copy_requires_xdp_sender_backend"
+        detail = f"unsupported sender_backend={transport_plan.get('sender_backend', '')}"
+        return {
+            "attempted": 0,
+            "sent": 0,
+            "errors": 0,
+            "sender_fallback_reason": reason,
+            "custom_tcp_tx_flush_packets": 0,
+            "custom_tcp_tx_flush_bytes": 0,
+            "custom_tcp_bridge_fallback_reason": reason,
+            "custom_tcp_bridge_fallback_detail": detail,
+            "custom_tcp_bridge_degraded": 1,
+            **transport_plan,
+        }
 
-    drain_buffer_fn = getattr(bridge, "drain_custom_tcp_tx_buffer", None)
-    if drain_buffer_fn is None:
-        drain_buffer_fn = getattr(bridge, "drain_tcp_tx_buffer", None)
-    if callable(drain_buffer_fn):
-        try:
-            tx_buffer, tx_buffer_owner, packet_count, packet_size, uniform = extract_contiguous_drain_batch(drain_buffer_fn())
-            if uniform == 0:
-                tx_buffer = None
-                tx_buffer_owner = None
-                packet_count = 0
-                packet_size = 0
-        except Exception:
-            tx_buffer = None
-            tx_buffer_owner = None
-            packet_count = 0
-            packet_size = 0
+    peek_fn = getattr(bridge, "peek_custom_tcp_tx_buffer_strided", None)
+    if peek_fn is None:
+        peek_fn = getattr(bridge, "peek_tcp_tx_buffer_strided", None)
+    consume_fn = getattr(bridge, "consume_custom_tcp_tx_packets", None)
+    if consume_fn is None:
+        consume_fn = getattr(bridge, "consume_tcp_tx_packets", None)
+    if not callable(peek_fn) or not callable(consume_fn):
+        reason = "custom_tcp_zero_copy_api_unavailable"
+        detail = "peek/consume strided api not callable"
+        return {
+            "attempted": 0,
+            "sent": 0,
+            "errors": 0,
+            "sender_fallback_reason": reason,
+            "custom_tcp_tx_flush_packets": 0,
+            "custom_tcp_tx_flush_bytes": 0,
+            "custom_tcp_bridge_fallback_reason": reason,
+            "custom_tcp_bridge_fallback_detail": detail,
+            "custom_tcp_bridge_degraded": 1,
+            **transport_plan,
+        }
 
-    if tx_buffer is None:
-        drain_fn = getattr(bridge, "drain_custom_tcp_tx_packets", None)
-        if drain_fn is None:
-            drain_fn = getattr(bridge, "drain_tcp_tx_packets", None)
-        if drain_fn is None:
-            return {}
-        try:
-            drained = drain_fn()
-        except Exception:
-            return {}
-        if not drained:
-            return {}
+    try:
+        sx_buf, sx_owner, sx_count, sx_pkt_size, sx_stride, sx_uniform = extract_strided_peek_batch(peek_fn())
+    except Exception:
+        sx_buf, sx_owner, sx_count, sx_pkt_size, sx_stride, sx_uniform = (None, None, 0, 0, 0, 0)
+    if sx_buf is None or sx_count <= 0:
+        return {}
+    if sx_uniform != 1 or sx_pkt_size <= 0 or sx_stride <= 0:
+        reason = "custom_tcp_zero_copy_non_uniform_batch_forbidden"
+        detail = f"uniform={sx_uniform},packet_size={sx_pkt_size},stride={sx_stride},count={sx_count}"
+        return {
+            "attempted": int(sx_count),
+            "sent": 0,
+            "errors": int(sx_count),
+            "sender_fallback_reason": reason,
+            "custom_tcp_tx_flush_packets": 0,
+            "custom_tcp_tx_flush_bytes": 0,
+            "custom_tcp_bridge_fallback_reason": reason,
+            "custom_tcp_bridge_fallback_detail": detail,
+            "custom_tcp_bridge_degraded": 1,
+            **transport_plan,
+        }
 
-        packet_count = len(drained)
-        packet_size = len(drained[0]) if packet_count > 0 else 0
-        if packet_count <= 0 or packet_size <= 0:
-            return {}
-        tx_buffer = b"".join(bytes(pkt) for pkt in drained)
-        tx_buffer_owner = None
-
-    send_stats = await paced_raw_socket_sender_fn(
-        packets_buffer=tx_buffer,
+    send_stats = await xdp_sender_fn(
+        packets_buffer=sx_buf,
         target_ip=target_ip,
         target_port=target_port,
-        count=packet_count,
+        count=sx_count,
         verbose=verbose,
-        pacing_config=pacing_config,
-        live_sent=live_sent,
-        live_errors=live_errors,
-        live_progress=live_progress,
-        sender_backend=transport_plan["sender_backend"],
-        xdp_enable=bool(transport_plan["xdp_enable"]),
-        xdp_interface=xdp_interface if bool(transport_plan["xdp_enable"]) else None,
-        xdp_queue_id=int(custom_tcp_xdp_queue_id or 0),
+        interface=xdp_interface,
+        queue_id=int(custom_tcp_xdp_queue_id or 0),
         xdp_mode=int(custom_tcp_xdp_mode or 0),
+        sender_fallback_policy="fail",
+        fallback_backend="python",
+        sender_context=None,
+        pacing_config=pacing_config,
+        paced_send_xdp_fn=paced_send_xdp_fn if pacing_engine_available else None,
+        packet_size_override=sx_pkt_size,
+        packet_stride=sx_stride,
     )
-    _ = tx_buffer_owner
+    _ = sx_owner
     send_stats = dict(send_stats or {})
-    send_stats.setdefault("custom_tcp_tx_flush_packets", packet_count)
-    send_stats.setdefault("custom_tcp_tx_flush_bytes", len(tx_buffer))
+    sent = int(send_stats.get("sent", 0) or 0)
+    consumed = 0
+    if sent > 0:
+        try:
+            consumed = int(consume_fn(min(sent, sx_count)) or 0)
+        except Exception:
+            consumed = 0
+    if consumed > 0:
+        update_live_fn(live_progress, consumed)
+        update_live_fn(live_sent, consumed)
+    if sent < sx_count:
+        update_live_fn(live_errors, max(0, sx_count - sent))
+    send_stats["custom_tcp_tx_flush_packets"] = int(consumed)
+    send_stats["custom_tcp_tx_flush_bytes"] = int(consumed) * int(sx_pkt_size)
     for key, value in transport_plan.items():
         if key in {"sender_backend", "xdp_enable"}:
             continue

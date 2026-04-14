@@ -469,13 +469,25 @@ class TestL7DataplaneContract(unittest.TestCase):
 
         class _FakeTcpDp:
             def __init__(self):
-                self.calls = 0
+                self._buf = bytearray(b"pkt0")
+                self._count = 1
 
-            def drain_tcp_tx_packets(self):
-                self.calls += 1
-                if self.calls == 1:
-                    return [b"pkt0"]
-                return []
+            def peek_tcp_tx_buffer_strided(self):
+                if self._count <= 0:
+                    return None
+                return {
+                    "buffer": memoryview(self._buf),
+                    "owner": self._buf,
+                    "count": self._count,
+                    "packet_size": 4,
+                    "stride": 4,
+                    "uniform": 1,
+                }
+
+            def consume_tcp_tx_packets(self, count):
+                take = min(int(count or 0), self._count)
+                self._count -= take
+                return take
 
         async def _fake_run(profile_arg, runtime_cfg):
             self.assertIs(profile_arg, profile)
@@ -532,13 +544,25 @@ class TestL7DataplaneContract(unittest.TestCase):
 
         class _FakeTcpDp:
             def __init__(self):
-                self.calls = 0
+                self._buf = bytearray(b"pkt0")
+                self._count = 1
 
-            def drain_tcp_tx_packets(self):
-                self.calls += 1
-                if self.calls == 1:
-                    return [b"pkt0"]
-                return []
+            def peek_tcp_tx_buffer_strided(self):
+                if self._count <= 0:
+                    return None
+                return {
+                    "buffer": memoryview(self._buf),
+                    "owner": self._buf,
+                    "count": self._count,
+                    "packet_size": 4,
+                    "stride": 4,
+                    "uniform": 1,
+                }
+
+            def consume_tcp_tx_packets(self, count):
+                take = min(int(count or 0), self._count)
+                self._count -= take
+                return take
 
         async def _fake_run(profile_arg, runtime_cfg):
             self.assertIs(profile_arg, profile)
@@ -552,16 +576,13 @@ class TestL7DataplaneContract(unittest.TestCase):
 
             return _Result()
 
-        async def _fake_paced_raw_socket_sender(**kwargs):
+        async def _fake_xdp_sender(**kwargs):
             captured.update(kwargs)
             return {"sent": 1, "errors": 0}
 
         with patch("ddos_samurai.senders._run_l7_profile", side_effect=_fake_run):
             with patch("ddos_samurai.senders.custom_tcp_dataplane", _FakeTcpDp(), create=True):
-                with patch(
-                    "ddos_samurai.senders.paced_raw_socket_sender",
-                    side_effect=_fake_paced_raw_socket_sender,
-                ):
+                with patch("ddos_samurai.senders.xdp_sender", side_effect=_fake_xdp_sender):
                     out = asyncio.run(
                         senders.run_l7_profile_public(
                             profile,
@@ -596,13 +617,25 @@ class TestL7DataplaneContract(unittest.TestCase):
 
         class _FakeTcpDp:
             def __init__(self):
-                self.calls = 0
+                self._buf = bytearray(b"pkt0")
+                self._count = 1
 
-            def drain_tcp_tx_packets(self):
-                self.calls += 1
-                if self.calls == 1:
-                    return [b"pkt0"]
-                return []
+            def peek_tcp_tx_buffer_strided(self):
+                if self._count <= 0:
+                    return None
+                return {
+                    "buffer": memoryview(self._buf),
+                    "owner": self._buf,
+                    "count": self._count,
+                    "packet_size": 4,
+                    "stride": 4,
+                    "uniform": 1,
+                }
+
+            def consume_tcp_tx_packets(self, count):
+                take = min(int(count or 0), self._count)
+                self._count -= take
+                return take
 
         async def _fake_run(profile_arg, runtime_cfg):
             self.assertIs(profile_arg, profile)
@@ -616,7 +649,7 @@ class TestL7DataplaneContract(unittest.TestCase):
 
             return _Result()
 
-        async def _fake_paced_raw_socket_sender(**kwargs):
+        async def _fake_xdp_sender(**kwargs):
             captured.update(kwargs)
             return {"sent": 1, "errors": 0}
 
@@ -624,10 +657,7 @@ class TestL7DataplaneContract(unittest.TestCase):
             with patch("ddos_samurai.senders.custom_tcp_dataplane", _FakeTcpDp(), create=True):
                 with patch("ddos_samurai.senders.XDP_AVAILABLE", True):
                     with patch("ddos_samurai.senders.check_xdp_available", side_effect=lambda: (True, "AF_XDP is available")):
-                        with patch(
-                            "ddos_samurai.senders.paced_raw_socket_sender",
-                            side_effect=_fake_paced_raw_socket_sender,
-                        ):
+                        with patch("ddos_samurai.senders.xdp_sender", side_effect=_fake_xdp_sender):
                             out = asyncio.run(
                                 senders.run_l7_profile_public(
                                     profile,
@@ -639,9 +669,9 @@ class TestL7DataplaneContract(unittest.TestCase):
                                 )
                             )
 
-        self.assertEqual(captured["sender_backend"], "xdp")
-        self.assertTrue(bool(captured["xdp_enable"]))
-        self.assertEqual(captured["xdp_interface"], "eth0")
+        self.assertEqual(captured["target_ip"], "127.0.0.1")
+        self.assertEqual(captured["interface"], "eth0")
+        self.assertEqual(int(captured["queue_id"]), 3)
         self.assertEqual(out["custom_tcp_bridge_backend_requested"], "af_xdp")
         self.assertEqual(out["custom_tcp_bridge_backend_used"], "xdp")
         self.assertEqual(out["custom_tcp_bridge_backend_match"], 1)
