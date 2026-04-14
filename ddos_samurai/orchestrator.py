@@ -216,8 +216,43 @@ def _empty_stats() -> dict:
     }
 
 
-def _recompute_loss_metrics(d: dict) -> dict:
-    out = dict(d or {})
+_LOSS_RECOMPUTE_INPUT_KEYS = frozenset(
+    {
+        "attempted",
+        "txring_tp_packets",
+        "txring_tp_drops",
+        "wire_tx_packets_delta",
+        "wire_counter_available",
+        "wire_counter_confidence",
+        "wire_counter_source",
+        "wire_counter_reason",
+        "host_tx_packets_delta",
+        "host_tx_dropped_delta",
+        "wire_loss_est_packets",
+        "wire_loss_raw_packets",
+        "wire_loss_raw_uncapped_packets",
+        "txring_flush_call_count",
+        "txring_flush_error_count",
+        "txring_flush_eagain_count",
+        "txring_flush_enobufs_count",
+        "txring_flush_ebusy_count",
+        "txring_flush_other_errno_count",
+        "nicq_counter_available",
+        "nicq_counter_confidence",
+        "nicq_counter_source",
+        "nicq_counter_reason",
+        "nicq_drop_delta",
+        "nicq_fifo_delta",
+        "nicq_timeout_delta",
+        "nicq_restart_delta",
+        "nicq_busy_delta",
+        "nicq_pressure_delta",
+    }
+)
+
+
+def _recompute_loss_metrics(d: dict, *, inplace: bool = False) -> dict:
+    out = d if inplace else dict(d or {})
     attempted = max(0, int(out.get("attempted", 0) or 0))
     tx_packets = max(0, int(out.get("txring_tp_packets", 0) or 0))
     tx_drops = max(0, int(out.get("txring_tp_drops", 0) or 0))
@@ -349,6 +384,7 @@ def _recompute_loss_metrics(d: dict) -> dict:
 def _add_stats(acc: dict, item: dict) -> dict:
     if not isinstance(item, dict):
         return acc
+    needs_loss_recompute = any((k in item) for k in _LOSS_RECOMPUTE_INPUT_KEYS)
     acc["attempted"] = int(acc.get("attempted", 0)) + int(item.get("attempted", 0) or 0)
     acc["sent"] = int(acc.get("sent", 0)) + int(item.get("sent", 0) or 0)
     acc["errors"] = int(acc.get("errors", 0)) + int(item.get("errors", 0) or 0)
@@ -791,7 +827,9 @@ def _add_stats(acc: dict, item: dict) -> dict:
             acc["sender_path"] = item_sender_path
         elif current != item_sender_path and current != "MIXED":
             acc["sender_path"] = "MIXED"
-    return _recompute_loss_metrics(acc)
+    if not needs_loss_recompute:
+        return acc
+    return _recompute_loss_metrics(acc, inplace=True)
 
 
 def _build_pacing_config(args: dict) -> PacingConfig:
@@ -3256,7 +3294,7 @@ async def worker_process(
             _update_state_engine_stats()
 
             # Recompute bounded loss metrics at worker finalization.
-            worker_stats = _recompute_loss_metrics(worker_stats)
+            worker_stats = _recompute_loss_metrics(worker_stats, inplace=True)
         except Exception:
             pass
 
