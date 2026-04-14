@@ -310,12 +310,18 @@ class TcpDataplaneCore {
   uint32_t tx_ring_head_ = 0;
   uint32_t tx_ring_tail_ = 0;
   uint32_t tx_ring_count_ = 0;
+  bool tx_pin_active_ = false;
+  uint32_t tx_pin_head_ = 0;
+  uint32_t tx_pin_count_ = 0;
+  size_t tx_pin_packet_size_ = 0;
+  size_t tx_pin_stride_ = 0;
   std::deque<std::vector<uint8_t>> tx_packets_overflow_;
   std::deque<TcpDpCompletion> completions_;
   std::deque<TcpDpRxPayload> rx_payloads_;
   std::atomic<uint64_t> tx_packets_queued_{0};
   std::atomic<uint64_t> tx_packets_drained_{0};
   std::atomic<uint64_t> tx_packets_sent_{0};
+  std::atomic<uint64_t> tx_queue_epoch_{0};
   TcpDpStatsCounters stats_{};
 };
 

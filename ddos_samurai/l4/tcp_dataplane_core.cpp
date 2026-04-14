@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <new>
 
 namespace ddos_samurai::tcpdp {
@@ -119,6 +120,11 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   tx_ring_head_ = 0;
   tx_ring_tail_ = 0;
   tx_ring_count_ = 0;
+  tx_pin_active_ = false;
+  tx_pin_head_ = 0;
+  tx_pin_count_ = 0;
+  tx_pin_packet_size_ = 0;
+  tx_pin_stride_ = 0;
   tx_packets_overflow_.clear();
   completions_.clear();
   rx_payloads_.clear();
@@ -126,6 +132,7 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   tx_packets_queued_.store(0, std::memory_order_relaxed);
   tx_packets_drained_.store(0, std::memory_order_relaxed);
   tx_packets_sent_.store(0, std::memory_order_relaxed);
+  tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
   poll_rr_shard_ = 0;
   return true;
 }
@@ -577,107 +584,131 @@ bool TcpDataplaneCore::DrainTxPacketsConcatAlloc(
   *out_packet_size = 0;
   *out_uniform = false;
 
-  std::lock_guard<std::mutex> guard(tx_mu_);
+  const uint32_t requested_max = max_packets;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    uint64_t epoch = 0;
+    uint32_t drain_count = 0;
+    uint32_t take_ring = 0;
+    uint32_t take_overflow = 0;
+    size_t total_len = 0;
+    size_t first_len = 0;
+    bool uniform = true;
+    bool first_seen = false;
 
-  const uint32_t total_available =
-      tx_ring_count_ + static_cast<uint32_t>(tx_packets_overflow_.size());
-  if (total_available == 0) {
-    return true;
-  }
+    {
+      std::lock_guard<std::mutex> guard(tx_mu_);
+      if (tx_pin_active_) {
+        return false;
+      }
+      epoch = tx_queue_epoch_.load(std::memory_order_relaxed);
+      const uint32_t total_available =
+          tx_ring_count_ + static_cast<uint32_t>(tx_packets_overflow_.size());
+      if (total_available == 0) {
+        return true;
+      }
+      drain_count = requested_max;
+      if (drain_count == 0 || drain_count > total_available) {
+        drain_count = total_available;
+      }
+      if (drain_count == 0) {
+        return true;
+      }
+      take_ring = std::min<uint32_t>(drain_count, tx_ring_count_);
+      take_overflow = drain_count - take_ring;
 
-  if (max_packets == 0 || max_packets > total_available) {
-    max_packets = total_available;
-  }
-  if (max_packets == 0) {
-    return true;
-  }
-
-  const uint32_t take_ring = std::min<uint32_t>(max_packets, tx_ring_count_);
-  const uint32_t take_overflow = max_packets - take_ring;
-
-  size_t total_len = 0;
-  size_t first_len = 0;
-  bool uniform = true;
-  bool first_seen = false;
-
-  for (uint32_t i = 0; i < take_ring; ++i) {
-    const uint32_t idx = (tx_ring_head_ + i) % static_cast<uint32_t>(tx_ring_capacity_);
-    const size_t len = static_cast<size_t>(tx_ring_lengths_[idx]);
-    total_len += len;
-    if (!first_seen) {
-      first_len = len;
-      first_seen = true;
-    } else if (len != first_len) {
-      uniform = false;
+      for (uint32_t i = 0; i < take_ring; ++i) {
+        const uint32_t idx = (tx_ring_head_ + i) % static_cast<uint32_t>(tx_ring_capacity_);
+        const size_t len = static_cast<size_t>(tx_ring_lengths_[idx]);
+        total_len += len;
+        if (!first_seen) {
+          first_len = len;
+          first_seen = true;
+        } else if (len != first_len) {
+          uniform = false;
+        }
+      }
+      for (uint32_t i = 0; i < take_overflow; ++i) {
+        const size_t len = tx_packets_overflow_[static_cast<size_t>(i)].size();
+        total_len += len;
+        if (!first_seen) {
+          first_len = len;
+          first_seen = true;
+        } else if (len != first_len) {
+          uniform = false;
+        }
+      }
     }
-  }
-  for (uint32_t i = 0; i < take_overflow; ++i) {
-    const size_t len = tx_packets_overflow_[static_cast<size_t>(i)].size();
-    total_len += len;
-    if (!first_seen) {
-      first_len = len;
-      first_seen = true;
-    } else if (len != first_len) {
-      uniform = false;
+
+    if (require_uniform && !uniform) {
+      *out_buffer = nullptr;
+      *out_total_len = 0;
+      *out_count = 0;
+      *out_packet_size = 0;
+      *out_uniform = false;
+      return true;
     }
-  }
 
-  if (require_uniform && !uniform) {
-    // Keep queue intact for legacy list-drain fallback path.
-    *out_buffer = nullptr;
-    *out_total_len = 0;
-    *out_count = 0;
-    *out_packet_size = 0;
-    *out_uniform = false;
-    return true;
-  }
+    if (total_len == 0) {
+      *out_count = drain_count;
+      *out_packet_size = uniform ? first_len : 0;
+      *out_uniform = uniform;
+      return true;
+    }
 
-  if (total_len == 0) {
-    *out_count = max_packets;
+    auto buffer = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[total_len]);
+    if (!buffer) {
+      return false;
+    }
+
+    {
+      std::lock_guard<std::mutex> guard(tx_mu_);
+      if (tx_queue_epoch_.load(std::memory_order_relaxed) != epoch) {
+        continue;
+      }
+      const uint32_t total_available =
+          tx_ring_count_ + static_cast<uint32_t>(tx_packets_overflow_.size());
+      if (drain_count > total_available) {
+        continue;
+      }
+
+      size_t cursor = 0;
+      for (uint32_t i = 0; i < take_ring; ++i) {
+        const uint32_t idx = (tx_ring_head_ + i) % static_cast<uint32_t>(tx_ring_capacity_);
+        const size_t len = static_cast<size_t>(tx_ring_lengths_[idx]);
+        if (len > 0) {
+          const size_t base = static_cast<size_t>(idx) * tx_ring_slot_size_;
+          std::memcpy(buffer.get() + cursor, tx_ring_storage_.data() + base, len);
+          cursor += len;
+        }
+      }
+      for (uint32_t i = 0; i < take_overflow; ++i) {
+        const auto& pkt = tx_packets_overflow_.front();
+        if (!pkt.empty()) {
+          std::memcpy(buffer.get() + cursor, pkt.data(), pkt.size());
+          cursor += pkt.size();
+        }
+        tx_packets_overflow_.pop_front();
+      }
+
+      for (uint32_t i = 0; i < take_ring; ++i) {
+        tx_ring_lengths_[tx_ring_head_] = 0;
+        tx_ring_head_ = (tx_ring_head_ + 1U) % static_cast<uint32_t>(tx_ring_capacity_);
+      }
+      tx_ring_count_ -= take_ring;
+
+      tx_packets_drained_.fetch_add(drain_count, std::memory_order_relaxed);
+      tx_packets_sent_.fetch_add(drain_count, std::memory_order_relaxed);
+      tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    *out_buffer = buffer.release();
+    *out_total_len = total_len;
+    *out_count = drain_count;
     *out_packet_size = uniform ? first_len : 0;
     *out_uniform = uniform;
     return true;
   }
-
-  auto* buffer = new (std::nothrow) uint8_t[total_len];
-  if (!buffer) {
-    return false;
-  }
-
-  size_t cursor = 0;
-  for (uint32_t i = 0; i < take_ring; ++i) {
-    const uint32_t idx = (tx_ring_head_ + i) % static_cast<uint32_t>(tx_ring_capacity_);
-    const size_t len = static_cast<size_t>(tx_ring_lengths_[idx]);
-    if (len > 0) {
-      const size_t base = static_cast<size_t>(idx) * tx_ring_slot_size_;
-      std::memcpy(buffer + cursor, tx_ring_storage_.data() + base, len);
-      cursor += len;
-    }
-  }
-  for (uint32_t i = 0; i < take_overflow; ++i) {
-    const auto& pkt = tx_packets_overflow_.front();
-    if (!pkt.empty()) {
-      std::memcpy(buffer + cursor, pkt.data(), pkt.size());
-      cursor += pkt.size();
-    }
-    tx_packets_overflow_.pop_front();
-  }
-
-  for (uint32_t i = 0; i < take_ring; ++i) {
-    tx_ring_lengths_[tx_ring_head_] = 0;
-    tx_ring_head_ = (tx_ring_head_ + 1U) % static_cast<uint32_t>(tx_ring_capacity_);
-  }
-  tx_ring_count_ -= take_ring;
-
-  tx_packets_drained_.fetch_add(max_packets, std::memory_order_relaxed);
-  tx_packets_sent_.fetch_add(max_packets, std::memory_order_relaxed);
-
-  *out_buffer = buffer;
-  *out_total_len = total_len;
-  *out_count = max_packets;
-  *out_packet_size = uniform ? first_len : 0;
-  *out_uniform = uniform;
-  return true;
+  return false;
 }
 
 bool TcpDataplaneCore::PeekTxPacketsStrided(
@@ -695,6 +726,21 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
   *out_stride = 0;
 
   std::lock_guard<std::mutex> guard(tx_mu_);
+  if (tx_pin_active_) {
+    if (tx_pin_count_ == 0) {
+      tx_pin_active_ = false;
+      tx_pin_head_ = 0;
+      tx_pin_packet_size_ = 0;
+      tx_pin_stride_ = 0;
+      return true;
+    }
+    const size_t base = static_cast<size_t>(tx_pin_head_) * tx_ring_slot_size_;
+    *out_base = tx_ring_storage_.data() + base;
+    *out_count = tx_pin_count_;
+    *out_packet_size = tx_pin_packet_size_;
+    *out_stride = tx_pin_stride_;
+    return true;
+  }
   if (tx_ring_count_ == 0 || !tx_packets_overflow_.empty()) {
     return true;
   }
@@ -734,6 +780,11 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
   *out_count = uniform_count;
   *out_packet_size = first_len;
   *out_stride = tx_ring_slot_size_;
+  tx_pin_active_ = true;
+  tx_pin_head_ = tx_ring_head_;
+  tx_pin_count_ = uniform_count;
+  tx_pin_packet_size_ = first_len;
+  tx_pin_stride_ = tx_ring_slot_size_;
   return true;
 }
 
@@ -741,6 +792,37 @@ uint32_t TcpDataplaneCore::ConsumeTxPackets(uint32_t max_packets) {
   std::lock_guard<std::mutex> guard(tx_mu_);
   if (max_packets == 0) {
     return 0;
+  }
+
+  if (tx_pin_active_) {
+    if (tx_pin_count_ == 0) {
+      tx_pin_active_ = false;
+      tx_pin_head_ = 0;
+      tx_pin_packet_size_ = 0;
+      tx_pin_stride_ = 0;
+      return 0;
+    }
+    if (max_packets > tx_pin_count_) {
+      max_packets = tx_pin_count_;
+    }
+    for (uint32_t i = 0; i < max_packets; ++i) {
+      tx_ring_lengths_[tx_ring_head_] = 0;
+      tx_ring_head_ = (tx_ring_head_ + 1U) % static_cast<uint32_t>(tx_ring_capacity_);
+    }
+    tx_ring_count_ -= max_packets;
+    tx_pin_count_ -= max_packets;
+    if (tx_pin_count_ == 0) {
+      tx_pin_active_ = false;
+      tx_pin_head_ = 0;
+      tx_pin_packet_size_ = 0;
+      tx_pin_stride_ = 0;
+    } else {
+      tx_pin_head_ = tx_ring_head_;
+    }
+    tx_packets_drained_.fetch_add(max_packets, std::memory_order_relaxed);
+    tx_packets_sent_.fetch_add(max_packets, std::memory_order_relaxed);
+    tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
+    return max_packets;
   }
 
   const uint32_t total_available =
@@ -766,40 +848,57 @@ uint32_t TcpDataplaneCore::ConsumeTxPackets(uint32_t max_packets) {
 
   tx_packets_drained_.fetch_add(max_packets, std::memory_order_relaxed);
   tx_packets_sent_.fetch_add(max_packets, std::memory_order_relaxed);
+  tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
   return max_packets;
 }
 
 std::vector<std::vector<uint8_t>> TcpDataplaneCore::DrainTxPackets(uint32_t max_packets) {
-  std::lock_guard<std::mutex> guard(tx_mu_);
-  const uint32_t total_available = tx_ring_count_ + static_cast<uint32_t>(tx_packets_overflow_.size());
-  if (max_packets == 0 || max_packets > total_available) {
-    max_packets = total_available;
-  }
   std::vector<std::vector<uint8_t>> out;
-  out.reserve(max_packets);
-  uint32_t drained = 0;
-  while (drained < max_packets && tx_ring_count_ > 0) {
-    const uint32_t idx = tx_ring_head_;
-    const size_t len = static_cast<size_t>(tx_ring_lengths_[idx]);
-    std::vector<uint8_t> pkt;
-    pkt.resize(len);
-    if (len > 0) {
-      const size_t base = static_cast<size_t>(idx) * tx_ring_slot_size_;
-      std::memcpy(pkt.data(), tx_ring_storage_.data() + base, len);
+  if (max_packets > 0) {
+    out.reserve(max_packets);
+  }
+  std::deque<std::vector<uint8_t>> overflow_moved;
+  {
+    std::lock_guard<std::mutex> guard(tx_mu_);
+    if (tx_pin_active_) {
+      return out;
     }
-    out.push_back(std::move(pkt));
-    tx_ring_lengths_[idx] = 0;
-    tx_ring_head_ = (tx_ring_head_ + 1U) % static_cast<uint32_t>(tx_ring_capacity_);
-    tx_ring_count_--;
-    drained++;
+    const uint32_t total_available = tx_ring_count_ + static_cast<uint32_t>(tx_packets_overflow_.size());
+    if (max_packets == 0 || max_packets > total_available) {
+      max_packets = total_available;
+    }
+    out.reserve(max_packets);
+    uint32_t drained = 0;
+    while (drained < max_packets && tx_ring_count_ > 0) {
+      const uint32_t idx = tx_ring_head_;
+      const size_t len = static_cast<size_t>(tx_ring_lengths_[idx]);
+      std::vector<uint8_t> pkt;
+      pkt.resize(len);
+      if (len > 0) {
+        const size_t base = static_cast<size_t>(idx) * tx_ring_slot_size_;
+        std::memcpy(pkt.data(), tx_ring_storage_.data() + base, len);
+      }
+      out.push_back(std::move(pkt));
+      tx_ring_lengths_[idx] = 0;
+      tx_ring_head_ = (tx_ring_head_ + 1U) % static_cast<uint32_t>(tx_ring_capacity_);
+      tx_ring_count_--;
+      drained++;
+    }
+    while (drained < max_packets && !tx_packets_overflow_.empty()) {
+      overflow_moved.push_back(std::move(tx_packets_overflow_.front()));
+      tx_packets_overflow_.pop_front();
+      drained++;
+    }
+    tx_packets_drained_.fetch_add(static_cast<uint64_t>(drained), std::memory_order_relaxed);
+    tx_packets_sent_.fetch_add(static_cast<uint64_t>(drained), std::memory_order_relaxed);
+    if (drained > 0) {
+      tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
-  while (drained < max_packets && !tx_packets_overflow_.empty()) {
-    out.push_back(std::move(tx_packets_overflow_.front()));
-    tx_packets_overflow_.pop_front();
-    drained++;
+  while (!overflow_moved.empty()) {
+    out.push_back(std::move(overflow_moved.front()));
+    overflow_moved.pop_front();
   }
-  tx_packets_drained_.fetch_add(static_cast<uint64_t>(drained), std::memory_order_relaxed);
-  tx_packets_sent_.fetch_add(static_cast<uint64_t>(drained), std::memory_order_relaxed);
   return out;
 }
 
@@ -1060,6 +1159,10 @@ bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len) {
   if (!data || len == 0) {
     return false;
   }
+  std::vector<uint8_t> pkt_prebuilt;
+  if (len > tx_ring_slot_size_) {
+    pkt_prebuilt.assign(data, data + len);
+  }
   std::lock_guard<std::mutex> guard(tx_mu_);
   if (len <= tx_ring_slot_size_ && tx_ring_count_ < static_cast<uint32_t>(tx_ring_capacity_)) {
     const uint32_t idx = tx_ring_tail_;
@@ -1069,11 +1172,16 @@ bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len) {
     tx_ring_tail_ = (tx_ring_tail_ + 1U) % static_cast<uint32_t>(tx_ring_capacity_);
     tx_ring_count_++;
     tx_packets_queued_.fetch_add(1, std::memory_order_relaxed);
+    tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
-  std::vector<uint8_t> pkt(data, data + len);
+  std::vector<uint8_t> pkt = std::move(pkt_prebuilt);
+  if (pkt.empty()) {
+    pkt.assign(data, data + len);
+  }
   tx_packets_overflow_.push_back(std::move(pkt));
   tx_packets_queued_.fetch_add(1, std::memory_order_relaxed);
+  tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
