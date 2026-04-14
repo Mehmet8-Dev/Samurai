@@ -34,6 +34,15 @@ inline uint32_t ReadUnalignedU32(const uint8_t* p) {
   std::memcpy(&v, p, sizeof(v));
   return v;
 }
+
+inline void SaturatingDecrement(std::atomic<uint64_t>& counter) {
+  uint64_t cur = counter.load(std::memory_order_relaxed);
+  while (cur > 0) {
+    if (counter.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return;
+    }
+  }
+}
 }  // namespace
 
 L4StateEngineCore::L4StateEngineCore() { ResetStorage(table_size_, lock_count_, timeout_sec_); }
@@ -129,13 +138,15 @@ void L4StateEngineCore::ResetStorage(uint32_t table_size, uint32_t lock_count, u
   std::vector<std::mutex> new_locks(static_cast<size_t>(lock_count_));
   locks_.swap(new_locks);
   sweep_cursor_ = 0;
-  active_entries_ = 0;
-  timeout_evictions_ = 0;
-  overwrites_ = 0;
-  sweeps_ = 0;
-  last_sweep_removed_ = 0;
-  transition_total_ = 0;
-  state_counts_.fill(0);
+  active_entries_.store(0, std::memory_order_relaxed);
+  timeout_evictions_.store(0, std::memory_order_relaxed);
+  overwrites_.store(0, std::memory_order_relaxed);
+  sweeps_.store(0, std::memory_order_relaxed);
+  last_sweep_removed_.store(0, std::memory_order_relaxed);
+  transition_total_.store(0, std::memory_order_relaxed);
+  for (auto& v : state_counts_) {
+    v.store(0, std::memory_order_relaxed);
+  }
 }
 
 bool L4StateEngineCore::Configure(uint32_t table_size, uint32_t lock_count, uint32_t timeout_sec) {
@@ -189,11 +200,9 @@ void L4StateEngineCore::UpsertState(
     const bool same_key = e.in_use && e.src_ip == src_ip && e.src_port == src_port;
     if (!e.in_use || timed_out || same_key) {
       if (!e.in_use) {
-        std::lock_guard<std::mutex> stats_guard(meta_mu_);
-        active_entries_++;
+        active_entries_.fetch_add(1, std::memory_order_relaxed);
       } else if (timed_out && !same_key) {
-        std::lock_guard<std::mutex> stats_guard(meta_mu_);
-        timeout_evictions_++;
+        timeout_evictions_.fetch_add(1, std::memory_order_relaxed);
       }
       chosen = &e;
       break;
@@ -203,11 +212,10 @@ void L4StateEngineCore::UpsertState(
 
   if (chosen == nullptr) {
     Entry& e = table_[start_idx];
-    std::lock_guard<std::mutex> stats_guard(meta_mu_);
     if (e.in_use) {
-      overwrites_++;
+      overwrites_.fetch_add(1, std::memory_order_relaxed);
     } else {
-      active_entries_++;
+      active_entries_.fetch_add(1, std::memory_order_relaxed);
     }
     chosen = &e;
   }
@@ -221,9 +229,8 @@ void L4StateEngineCore::UpsertState(
 
   if (chosen->in_use) {
     const auto cur_idx = static_cast<size_t>(chosen->state);
-    std::lock_guard<std::mutex> stats_guard(meta_mu_);
-    if (cur_idx < state_counts_.size() && state_counts_[cur_idx] > 0) {
-      state_counts_[cur_idx]--;
+    if (cur_idx < state_counts_.size()) {
+      SaturatingDecrement(state_counts_[cur_idx]);
     }
   }
 
@@ -240,13 +247,10 @@ void L4StateEngineCore::UpsertState(
   chosen->in_use = true;
 
   const auto next_idx = static_cast<size_t>(next_state);
-  {
-    std::lock_guard<std::mutex> stats_guard(meta_mu_);
-    if (next_idx < state_counts_.size()) {
-      state_counts_[next_idx]++;
-    }
-    transition_total_++;
+  if (next_idx < state_counts_.size()) {
+    state_counts_[next_idx].fetch_add(1, std::memory_order_relaxed);
   }
+  transition_total_.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool L4StateEngineCore::ParseIpv4TcpView(
@@ -606,28 +610,17 @@ uint32_t L4StateEngineCore::Sweep(uint32_t max_scan) {
     }
     if (static_cast<uint32_t>(now - e.last_seen) > timeout_sec_) {
       const auto cur_idx = static_cast<size_t>(e.state);
-      {
-        std::lock_guard<std::mutex> stats_guard(meta_mu_);
-        if (cur_idx < state_counts_.size() && state_counts_[cur_idx] > 0) {
-          state_counts_[cur_idx]--;
-        }
+      if (cur_idx < state_counts_.size()) {
+        SaturatingDecrement(state_counts_[cur_idx]);
       }
       e = Entry{};
       removed++;
-      {
-        std::lock_guard<std::mutex> stats_guard(meta_mu_);
-        if (active_entries_ > 0) {
-          active_entries_--;
-        }
-        timeout_evictions_++;
-      }
+      SaturatingDecrement(active_entries_);
+      timeout_evictions_.fetch_add(1, std::memory_order_relaxed);
     }
   }
-  {
-    std::lock_guard<std::mutex> stats_guard(meta_mu_);
-    sweeps_++;
-    last_sweep_removed_ = removed;
-  }
+  sweeps_.fetch_add(1, std::memory_order_relaxed);
+  last_sweep_removed_.store(removed, std::memory_order_relaxed);
   return removed;
 }
 
@@ -637,14 +630,16 @@ EngineStatsSnapshot L4StateEngineCore::Snapshot() const {
   out.table_size = table_size_;
   out.lock_count = lock_count_;
   out.timeout_sec = timeout_sec_;
-  out.active_entries = active_entries_;
-  out.timeout_evictions = timeout_evictions_;
-  out.overwrites = overwrites_;
-  out.sweeps = sweeps_;
-  out.last_sweep_removed = last_sweep_removed_;
+  out.active_entries = active_entries_.load(std::memory_order_relaxed);
+  out.timeout_evictions = timeout_evictions_.load(std::memory_order_relaxed);
+  out.overwrites = overwrites_.load(std::memory_order_relaxed);
+  out.sweeps = sweeps_.load(std::memory_order_relaxed);
+  out.last_sweep_removed = last_sweep_removed_.load(std::memory_order_relaxed);
   out.sweep_cursor = sweep_cursor_;
-  out.transition_total = transition_total_;
-  out.state_counts = state_counts_;
+  out.transition_total = transition_total_.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < out.state_counts.size(); ++i) {
+    out.state_counts[i] = state_counts_[i].load(std::memory_order_relaxed);
+  }
   return out;
 }
 

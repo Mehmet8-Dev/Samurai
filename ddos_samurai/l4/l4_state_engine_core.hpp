@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -139,17 +140,16 @@ class L4StateEngineCore {
   uint32_t lock_count_ = 256;
   uint32_t timeout_sec_ = 60;
   uint32_t sweep_cursor_ = 0;
-  uint64_t active_entries_ = 0;
-  uint64_t timeout_evictions_ = 0;
-  uint64_t overwrites_ = 0;
-  uint64_t sweeps_ = 0;
-  uint64_t last_sweep_removed_ = 0;
-  uint64_t transition_total_ = 0;
-  std::array<uint64_t, 7> state_counts_{};
+  std::atomic<uint64_t> active_entries_{0};
+  std::atomic<uint64_t> timeout_evictions_{0};
+  std::atomic<uint64_t> overwrites_{0};
+  std::atomic<uint64_t> sweeps_{0};
+  std::atomic<uint64_t> last_sweep_removed_{0};
+  std::atomic<uint64_t> transition_total_{0};
+  std::array<std::atomic<uint64_t>, 7> state_counts_{};
   uint16_t mimicry_window_ = 64240;
   uint16_t mimicry_mss_ = 1460;
   uint8_t mimicry_ttl_ = 64;
 };
 
 }  // namespace ddos_samurai::l4se
-
