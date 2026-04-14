@@ -16,15 +16,6 @@ using namespace ddos_samurai::l7_emu_native;
 
 namespace {
 
-constexpr const char* kDrainBufferCapsuleName = "samurai.tcpdp.drain_buffer";
-
-void drain_buffer_capsule_destructor(PyObject* capsule) {
-  void* ptr = PyCapsule_GetPointer(capsule, kDrainBufferCapsuleName);
-  if (ptr != nullptr) {
-    tcpdp_free_drained_buffer(reinterpret_cast<uint8_t*>(ptr));
-  }
-}
-
 std::vector<unsigned char> pybytes_to_vec(const py::object& obj) {
   if (obj.is_none()) return {};
   std::string s = py::cast<std::string>(py::bytes(obj));
@@ -598,57 +589,6 @@ PYBIND11_MODULE(_l7_emu_native, m) {
   });
   m.def("topology_tuple_preview", [](const py::dict& compiled_plan, int sample_size) {
     return topology_tuple_preview_native(compiled_plan, sample_size);
-  });
-  m.def("drain_custom_tcp_tx_packets", []() {
-    const uint8_t** packets = nullptr;
-    size_t* packet_lens = nullptr;
-    uint32_t count = 0;
-    if (tcpdp_drain_tx_packets(0, &packets, &packet_lens, &count) != 0) {
-      throw std::runtime_error("failed to drain custom TCP TX packets");
-    }
-    py::list out;
-    for (uint32_t i = 0; i < count; ++i) {
-      out.append(py::bytes(reinterpret_cast<const char*>(packets[i]), static_cast<py::ssize_t>(packet_lens[i])));
-    }
-    tcpdp_free_drained_packets(packets, packet_lens, count);
-    return out;
-  });
-  m.def("drain_custom_tcp_tx_buffer", []() {
-    uint8_t* buffer = nullptr;
-    size_t total_len = 0;
-    uint32_t count = 0;
-    size_t packet_size = 0;
-    if (tcpdp_drain_tx_packets_concat(0, &buffer, &total_len, &count, &packet_size) != 0) {
-      throw std::runtime_error("failed to drain custom TCP TX buffer");
-    }
-    py::object owner;
-    if (buffer != nullptr) {
-      PyObject* owner_raw = PyCapsule_New(reinterpret_cast<void*>(buffer), kDrainBufferCapsuleName, drain_buffer_capsule_destructor);
-      if (!owner_raw) {
-        tcpdp_free_drained_buffer(buffer);
-        throw py::error_already_set();
-      }
-      owner = py::reinterpret_steal<py::object>(owner_raw);
-    } else {
-      owner = py::none();
-    }
-    PyObject* payload_raw = nullptr;
-    if (total_len > 0 && buffer != nullptr) {
-      payload_raw = PyMemoryView_FromMemory(reinterpret_cast<char*>(buffer), static_cast<Py_ssize_t>(total_len), PyBUF_READ);
-    } else {
-      payload_raw = PyMemoryView_FromMemory(const_cast<char*>(""), 0, PyBUF_READ);
-    }
-    if (!payload_raw) {
-      throw py::error_already_set();
-    }
-    py::object payload = py::reinterpret_steal<py::object>(payload_raw);
-    py::dict out;
-    out["buffer"] = payload;
-    out["owner"] = owner;
-    out["count"] = py::int_(static_cast<long long>(count));
-    out["packet_size"] = py::int_(static_cast<long long>(packet_size));
-    out["uniform"] = py::int_((count == 0 || (packet_size > 0 && (packet_size * static_cast<size_t>(count)) == total_len)) ? 1 : 0);
-    return out;
   });
   m.def("peek_custom_tcp_tx_buffer_strided", []() {
     const uint8_t* base = nullptr;

@@ -107,14 +107,6 @@ class TcpDataplaneCore {
   uint32_t EnqueueSend(uint64_t flow_id, const uint8_t* payload, size_t payload_len);
   uint32_t IngestRxFrame(const uint8_t* frame, size_t frame_len);
   uint32_t Poll(uint64_t now_ns, uint32_t budget);
-  bool DrainTxPacketsConcatAlloc(
-      uint32_t max_packets,
-      uint8_t** out_buffer,
-      size_t* out_total_len,
-      uint32_t* out_count,
-      size_t* out_packet_size,
-      bool* out_uniform,
-      bool require_uniform);
   bool PeekTxPacketsStrided(
       uint32_t max_packets,
       const uint8_t** out_base,
@@ -122,7 +114,6 @@ class TcpDataplaneCore {
       size_t* out_packet_size,
       size_t* out_stride);
   uint32_t ConsumeTxPackets(uint32_t max_packets);
-  std::vector<std::vector<uint8_t>> DrainTxPackets(uint32_t max_packets);
   std::vector<TcpDpCompletion> CollectCompletions();
   std::vector<TcpDpRxPayload> CollectRxPayloads();
   TcpDpStatsSnapshot SnapshotStats() const;

@@ -1914,14 +1914,18 @@ std::map<std::string, double> run_http2_custom_tcp_profile(
     uint32_t actions = 0;
     (void)tcpdp_poll(0, 2048, &actions);
 
-    const uint8_t** packets = nullptr;
-    size_t* packet_lens = nullptr;
-    uint32_t packet_count = 0;
-    if (tcpdp_drain_tx_packets(0, &packets, &packet_lens, &packet_count) == 0) {
-      for (uint32_t i = 0; i < packet_count; ++i) {
-        tx_bytes += packet_lens[i];
+    const uint8_t* tx_base = nullptr;
+    uint32_t tx_count = 0;
+    size_t tx_packet_size = 0;
+    size_t tx_stride = 0;
+    if (tcpdp_peek_tx_packets_strided(0, &tx_base, &tx_count, &tx_packet_size, &tx_stride) == 0) {
+      uint32_t consumed = 0;
+      if (tx_base != nullptr && tx_count > 0 && tx_packet_size > 0) {
+        tx_bytes += static_cast<uint64_t>(tx_packet_size) * static_cast<uint64_t>(tx_count);
+        (void)tcpdp_consume_tx_packets(tx_count, &consumed);
+      } else {
+        (void)tcpdp_consume_tx_packets(2048, &consumed);
       }
-      tcpdp_free_drained_packets(packets, packet_lens, packet_count);
     }
 
     tcpdp_completion_t* comps = nullptr;

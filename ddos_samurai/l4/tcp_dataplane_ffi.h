@@ -83,15 +83,6 @@ int tcpdp_enqueue_connect(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, u
 int tcpdp_enqueue_send(uint64_t flow_id, const uint8_t* payload, size_t payload_len, uint32_t* out_queued_bytes);
 int tcpdp_ingest_rx_frame(const uint8_t* frame, size_t frame_len, uint32_t* out_updated);
 int tcpdp_poll(uint64_t now_ns, uint32_t budget, uint32_t* out_actions);
-int tcpdp_drain_tx_packets(uint32_t max_packets, const uint8_t*** out_packets, size_t** out_packet_lens, uint32_t* out_count);
-void tcpdp_free_drained_packets(const uint8_t** packets, size_t* packet_lens, uint32_t count);
-int tcpdp_drain_tx_packets_concat(
-    uint32_t max_packets,
-    uint8_t** out_buffer,
-    size_t* out_total_len,
-    uint32_t* out_count,
-    size_t* out_packet_size);
-void tcpdp_free_drained_buffer(uint8_t* buffer);
 int tcpdp_peek_tx_packets_strided(
     uint32_t max_packets,
     const uint8_t** out_base,
