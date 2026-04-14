@@ -283,7 +283,15 @@ class _FakeCustomTcpDataplane:
         self.ingest_calls = 0
         self.ingest_packets = 0
         self.poll_calls = 0
-        self.drain_calls = 0
+        self._tx_buf = (
+            b"\xaa\xaa\xaa\xaa\xaa\xaa"
+            b"\xbb\xbb\xbb\xbb\xbb\xbb"
+            b"\x08\x00"
+            b"\x45\x00\x00\x28\x00\x00\x00\x00\x40\x06\x00\x00"
+            b"\x01\x01\x01\x01\x02\x02\x02\x02"
+            b"\x04\xd2\x00\x50\x00\x00\x00\x01\x00\x00\x00\x00\x50\x10\x20\x00\x00\x00\x00\x00"
+        )
+        self._tx_count = 1
 
     def configure_tcp_dataplane(self, mode, backend, initial_rto_ms, max_retransmits, connect_timeout_ms, idle_timeout_ms):
         self.configured = True
@@ -304,19 +312,30 @@ class _FakeCustomTcpDataplane:
         self.poll_calls += 1
         return 0
 
-    def drain_tcp_tx_packets(self):
-        self.drain_calls += 1
-        if self.drain_calls == 1:
-            pkt = (
-                b"\xaa\xaa\xaa\xaa\xaa\xaa"
-                b"\xbb\xbb\xbb\xbb\xbb\xbb"
-                b"\x08\x00"
-                b"\x45\x00\x00\x28\x00\x00\x00\x00\x40\x06\x00\x00"
-                b"\x01\x01\x01\x01\x02\x02\x02\x02"
-                b"\x04\xd2\x00\x50\x00\x00\x00\x01\x00\x00\x00\x00\x50\x10\x20\x00\x00\x00\x00\x00"
-            )
-            return [pkt]
-        return []
+    def peek_tcp_tx_buffer_strided(self, _max_packets=0):
+        if self._tx_count <= 0:
+            return {
+                "buffer": memoryview(b""),
+                "owner": None,
+                "count": 0,
+                "packet_size": 0,
+                "stride": 0,
+                "uniform": 1,
+            }
+        pkt_len = len(self._tx_buf)
+        return {
+            "buffer": memoryview(self._tx_buf),
+            "owner": self._tx_buf,
+            "count": int(self._tx_count),
+            "packet_size": pkt_len,
+            "stride": pkt_len,
+            "uniform": 1,
+        }
+
+    def consume_tcp_tx_packets(self, count):
+        take = min(int(count or 0), int(self._tx_count))
+        self._tx_count -= take
+        return take
 
     def snapshot_tcp_dataplane(self):
         return {

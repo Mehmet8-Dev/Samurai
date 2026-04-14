@@ -57,6 +57,31 @@ def _build_tcp_ipv4_frame(
     return eth + ip_hdr + tcp_hdr + payload
 
 
+def _drain_packets(tcpdp_module, max_packets: int = 0):
+    peek = getattr(tcpdp_module, "peek_tcp_tx_buffer_strided", None)
+    consume = getattr(tcpdp_module, "consume_tcp_tx_packets", None)
+    if not callable(peek) or not callable(consume):
+        raise RuntimeError("custom tcp dataplane requires peek/consume zero-copy api")
+    batch = peek(int(max_packets or 0))
+    if not isinstance(batch, dict):
+        return []
+    buf = batch.get("buffer")
+    count = int(batch.get("count", 0) or 0)
+    pkt_size = int(batch.get("packet_size", 0) or 0)
+    stride = int(batch.get("stride", 0) or 0)
+    if buf is None or count <= 0 or pkt_size <= 0 or stride < pkt_size:
+        return []
+    mv = memoryview(buf)
+    out = []
+    for i in range(count):
+        start = i * stride
+        out.append(bytes(mv[start : start + pkt_size]))
+    consumed = int(consume(count) or 0)
+    if consumed < count:
+        out = out[:consumed]
+    return out
+
+
 class TestCustomTcpDataplane(unittest.TestCase):
     def setUp(self):
         if not TCPDP_AVAILABLE:
@@ -65,7 +90,7 @@ class TestCustomTcpDataplane(unittest.TestCase):
 
     def test_connect_flow_tracks_full_tuple_and_establishes(self):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("10.0.0.2"), _ip_to_int("10.0.0.1"), 40000, 443)
-        tx = tcpdp.drain_tcp_tx_packets()
+        tx = _drain_packets(tcpdp)
         self.assertEqual(len(tx), 1)
 
         flow = tcpdp.get_tcp_flow(flow_id)
@@ -83,7 +108,7 @@ class TestCustomTcpDataplane(unittest.TestCase):
             flags=0x12,
         )
         self.assertEqual(tcpdp.ingest_tcp_rx_frame(synack), 1)
-        tx = tcpdp.drain_tcp_tx_packets()
+        tx = _drain_packets(tcpdp)
         self.assertEqual(len(tx), 1)
         flow = tcpdp.get_tcp_flow(flow_id)
         self.assertEqual(int(flow["state"]), 3)
@@ -95,16 +120,16 @@ class TestCustomTcpDataplane(unittest.TestCase):
     def test_ack_advances_snd_una_for_payload(self):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("10.1.0.2"), _ip_to_int("10.1.0.1"), 41000, 80)
         syn_flow = tcpdp.get_tcp_flow(flow_id)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         synack = _build_tcp_ipv4_frame(
             "10.1.0.1", "10.1.0.2", 80, 41000, seq=7000, ack=int(syn_flow["snd_nxt"]), flags=0x12
         )
         tcpdp.ingest_tcp_rx_frame(synack)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
 
         queued = tcpdp.enqueue_tcp_send(flow_id, b"GET / HTTP/1.1\r\n\r\n")
         self.assertGreater(queued, 0)
-        tx = tcpdp.drain_tcp_tx_packets()
+        tx = _drain_packets(tcpdp)
         self.assertEqual(len(tx), 1)
         before = tcpdp.get_tcp_flow(flow_id)
         self.assertGreater(int(before["snd_nxt"]), int(before["snd_una"]))
@@ -124,11 +149,11 @@ class TestCustomTcpDataplane(unittest.TestCase):
 
     def test_poll_schedules_retransmit_after_timeout(self):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("192.0.2.10"), _ip_to_int("198.51.100.20"), 42000, 443)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         flow = tcpdp.get_tcp_flow(flow_id)
         actions = tcpdp.poll_tcp_dataplane(int(flow["rto_deadline_ns"]) + 1, 64)
         self.assertGreaterEqual(actions, 1)
-        tx = tcpdp.drain_tcp_tx_packets()
+        tx = _drain_packets(tcpdp)
         self.assertEqual(len(tx), 1)
         stats = tcpdp.snapshot_tcp_dataplane()
         self.assertGreaterEqual(int(stats["tcp_retransmit_count"]), 1)
@@ -138,10 +163,10 @@ class TestCustomTcpDataplane(unittest.TestCase):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("203.0.113.10"), _ip_to_int("203.0.113.20"), 43000, 443)
         stats = tcpdp.snapshot_tcp_dataplane()
         self.assertEqual(int(stats["tcp_flows_active"]), 1)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         flow = tcpdp.get_tcp_flow(flow_id)
         tcpdp.poll_tcp_dataplane(int(flow["rto_deadline_ns"]) + 1, 64)
-        tx = tcpdp.drain_tcp_tx_packets()
+        tx = _drain_packets(tcpdp)
         self.assertEqual(len(tx), 1)
         flow = tcpdp.get_tcp_flow(flow_id)
         tcpdp.poll_tcp_dataplane(int(flow["rto_deadline_ns"]) + 1, 64)
@@ -156,15 +181,15 @@ class TestCustomTcpDataplane(unittest.TestCase):
     def test_wrong_ack_increments_unexpected_ack_counter(self):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("10.6.0.2"), _ip_to_int("10.6.0.1"), 48000, 80)
         syn_flow = tcpdp.get_tcp_flow(flow_id)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         synack = _build_tcp_ipv4_frame(
             "10.6.0.1", "10.6.0.2", 80, 48000, seq=7100, ack=int(syn_flow["snd_nxt"]), flags=0x12
         )
         tcpdp.ingest_tcp_rx_frame(synack)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         queued = tcpdp.enqueue_tcp_send(flow_id, b"abc")
         self.assertEqual(queued, 3)
-        tx = tcpdp.drain_tcp_tx_packets()
+        tx = _drain_packets(tcpdp)
         self.assertEqual(len(tx), 1)
         before = tcpdp.get_tcp_flow(flow_id)
 
@@ -185,17 +210,17 @@ class TestCustomTcpDataplane(unittest.TestCase):
     def test_partial_ack_keeps_outstanding_and_advances_snd_una(self):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("10.9.0.2"), _ip_to_int("10.9.0.1"), 51000, 80)
         syn_flow = tcpdp.get_tcp_flow(flow_id)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         synack = _build_tcp_ipv4_frame(
             "10.9.0.1", "10.9.0.2", 80, 51000, seq=9100, ack=int(syn_flow["snd_nxt"]), flags=0x12
         )
         tcpdp.ingest_tcp_rx_frame(synack)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
 
         payload = b"abcdef"
         queued = tcpdp.enqueue_tcp_send(flow_id, payload)
         self.assertEqual(queued, len(payload))
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         before = tcpdp.get_tcp_flow(flow_id)
 
         partial_ack_value = int(before["snd_una"]) + 3
@@ -232,16 +257,16 @@ class TestCustomTcpDataplane(unittest.TestCase):
     def test_three_dup_ack_triggers_fast_retransmit(self):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("10.10.0.2"), _ip_to_int("10.10.0.1"), 52000, 80)
         syn_flow = tcpdp.get_tcp_flow(flow_id)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         synack = _build_tcp_ipv4_frame(
             "10.10.0.1", "10.10.0.2", 80, 52000, seq=10100, ack=int(syn_flow["snd_nxt"]), flags=0x12
         )
         tcpdp.ingest_tcp_rx_frame(synack)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
 
         queued = tcpdp.enqueue_tcp_send(flow_id, b"hello-world")
         self.assertEqual(queued, len(b"hello-world"))
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         before = tcpdp.get_tcp_flow(flow_id)
 
         dup_ack = _build_tcp_ipv4_frame(
@@ -254,11 +279,11 @@ class TestCustomTcpDataplane(unittest.TestCase):
             flags=0x10,
         )
         self.assertEqual(tcpdp.ingest_tcp_rx_frame(dup_ack), 1)
-        self.assertEqual(len(tcpdp.drain_tcp_tx_packets()), 0)
+        self.assertEqual(len(_drain_packets(tcpdp)), 0)
         self.assertEqual(tcpdp.ingest_tcp_rx_frame(dup_ack), 1)
-        self.assertEqual(len(tcpdp.drain_tcp_tx_packets()), 0)
+        self.assertEqual(len(_drain_packets(tcpdp)), 0)
         self.assertEqual(tcpdp.ingest_tcp_rx_frame(dup_ack), 1)
-        self.assertEqual(len(tcpdp.drain_tcp_tx_packets()), 1)
+        self.assertEqual(len(_drain_packets(tcpdp)), 1)
         stats = tcpdp.snapshot_tcp_dataplane()
         self.assertGreaterEqual(int(stats["tcp_fast_retransmit_count"]), 1)
         self.assertGreaterEqual(int(stats["tcp_retransmit_count"]), 1)
@@ -279,12 +304,12 @@ class TestCustomTcpDataplane(unittest.TestCase):
         tcpdp.configure_tcp_dataplane("required", "af_xdp", 50, 3, 250, 25)
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("10.8.0.2"), _ip_to_int("10.8.0.1"), 50000, 80)
         syn_flow = tcpdp.get_tcp_flow(flow_id)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         synack = _build_tcp_ipv4_frame(
             "10.8.0.1", "10.8.0.2", 80, 50000, seq=8100, ack=int(syn_flow["snd_nxt"]), flags=0x12
         )
         tcpdp.ingest_tcp_rx_frame(synack)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         flow = tcpdp.get_tcp_flow(flow_id)
         actions = tcpdp.poll_tcp_dataplane(int(flow["last_activity_ns"]) + 26_000_000, 64)
         self.assertGreaterEqual(actions, 1)
@@ -299,12 +324,12 @@ class TestCustomTcpDataplane(unittest.TestCase):
     def test_rx_payloads_are_collectable_for_l7_bridge(self):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("10.2.0.2"), _ip_to_int("10.2.0.1"), 44000, 80)
         syn_flow = tcpdp.get_tcp_flow(flow_id)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         synack = _build_tcp_ipv4_frame(
             "10.2.0.1", "10.2.0.2", 80, 44000, seq=8100, ack=int(syn_flow["snd_nxt"]), flags=0x12
         )
         tcpdp.ingest_tcp_rx_frame(synack)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         before = tcpdp.get_tcp_flow(flow_id)
 
         payload = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
@@ -328,12 +353,12 @@ class TestCustomTcpDataplane(unittest.TestCase):
     def test_out_of_order_rx_increments_counter_and_emits_dup_ack(self):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("10.11.0.2"), _ip_to_int("10.11.0.1"), 53000, 80)
         syn_flow = tcpdp.get_tcp_flow(flow_id)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         synack = _build_tcp_ipv4_frame(
             "10.11.0.1", "10.11.0.2", 80, 53000, seq=11100, ack=int(syn_flow["snd_nxt"]), flags=0x12
         )
         tcpdp.ingest_tcp_rx_frame(synack)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         before = tcpdp.get_tcp_flow(flow_id)
 
         out_of_order = _build_tcp_ipv4_frame(
@@ -347,7 +372,7 @@ class TestCustomTcpDataplane(unittest.TestCase):
             payload=b"late",
         )
         self.assertEqual(tcpdp.ingest_tcp_rx_frame(out_of_order), 1)
-        tx = tcpdp.drain_tcp_tx_packets()
+        tx = _drain_packets(tcpdp)
         self.assertEqual(len(tx), 1)
         after = tcpdp.get_tcp_flow(flow_id)
         self.assertEqual(int(after["rcv_nxt"]), int(before["rcv_nxt"]))
@@ -357,7 +382,7 @@ class TestCustomTcpDataplane(unittest.TestCase):
 
     def test_peer_rst_marks_flow_inactive_and_emits_completion(self):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("10.3.0.2"), _ip_to_int("10.3.0.1"), 45000, 443)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         flow = tcpdp.get_tcp_flow(flow_id)
         rst = _build_tcp_ipv4_frame(
             "10.3.0.1",
@@ -380,12 +405,12 @@ class TestCustomTcpDataplane(unittest.TestCase):
     def test_peer_fin_moves_flow_to_timewait_and_drops_active_count(self):
         flow_id = tcpdp.enqueue_tcp_connect(_ip_to_int("10.4.0.2"), _ip_to_int("10.4.0.1"), 46000, 80)
         syn_flow = tcpdp.get_tcp_flow(flow_id)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         synack = _build_tcp_ipv4_frame(
             "10.4.0.1", "10.4.0.2", 80, 46000, seq=6100, ack=int(syn_flow["snd_nxt"]), flags=0x12
         )
         tcpdp.ingest_tcp_rx_frame(synack)
-        tcpdp.drain_tcp_tx_packets()
+        _drain_packets(tcpdp)
         before = tcpdp.get_tcp_flow(flow_id)
 
         fin = _build_tcp_ipv4_frame(
@@ -398,7 +423,7 @@ class TestCustomTcpDataplane(unittest.TestCase):
             flags=0x11,
         )
         self.assertEqual(tcpdp.ingest_tcp_rx_frame(fin), 1)
-        tx = tcpdp.drain_tcp_tx_packets()
+        tx = _drain_packets(tcpdp)
         self.assertEqual(len(tx), 1)
         flow = tcpdp.get_tcp_flow(flow_id)
         self.assertEqual(int(flow["state"]), 5)
