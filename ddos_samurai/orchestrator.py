@@ -1364,8 +1364,20 @@ async def worker_process(
             async def _await_cuda_event(evt):
                 """Async wait for CUDA event without hard CPU blocking."""
                 try:
+                    # Hot path: first few polls are pure yields to keep low latency,
+                    # then back off progressively to avoid scheduler churn.
+                    spin = 0
+                    sleep_s = 0.0
                     while not evt.query():
-                        await asyncio.sleep(0)
+                        if spin < 8:
+                            spin += 1
+                            await asyncio.sleep(0)
+                            continue
+                        if sleep_s <= 0.0:
+                            sleep_s = 5e-5  # 50us
+                        else:
+                            sleep_s = min(sleep_s * 2.0, 1e-3)  # cap at 1ms
+                        await asyncio.sleep(sleep_s)
                 except Exception:
                     # Conservative fallback for environments without query()
                     evt.synchronize()
