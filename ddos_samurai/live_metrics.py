@@ -28,6 +28,7 @@ class LiveMetricsExporter:
         self._last_stats: Dict[str, Any] = {}
         self._last_time = time.time()
         self._write_errors = 0  # track consecutive write failures
+        self._write_error_total = 0
 
         # Ensure directory exists
         try:
@@ -64,24 +65,45 @@ class LiveMetricsExporter:
         for k, v in stats.items():
             if k == "sender_paths_used":
                 continue  # handled separately below
-            name = f"{self.prefix}_{k}"
+            name = self._sanitize_metric_name(f"{self.prefix}_{k}")
             if isinstance(v, (int, float)):
+                mtype = self._metric_type_for_name(name)
+                lines.append(f"# HELP {name} Live exporter metric for {k}.")
+                lines.append(f"# TYPE {name} {mtype}")
                 lines.append(f"{name} {v}")
             elif k == "run_quality" and isinstance(v, str):
                 safe_quality = str(v).replace('"', '\\"')
+                name = self._sanitize_metric_name(f"{self.prefix}_run_quality")
+                lines.append(f"# HELP {name} Current run quality status.")
+                lines.append(f"# TYPE {name} gauge")
                 lines.append(f'{self.prefix}_run_quality{{quality="{safe_quality}"}} 1')
             elif k == "kpi_gate_status" and isinstance(v, str):
                 safe_status = str(v).replace('"', '\\"')
+                name = self._sanitize_metric_name(f"{self.prefix}_kpi_gate_status")
+                lines.append(f"# HELP {name} Current KPI gate status.")
+                lines.append(f"# TYPE {name} gauge")
                 lines.append(f'{self.prefix}_kpi_gate_status{{status="{safe_status}"}} 1')
 
         # Sender path breakdown (labelled gauge)
         sender_paths = stats.get("sender_paths_used")
         if isinstance(sender_paths, dict):
-            for path_name, path_count in sender_paths.items():
-                safe_name = str(path_name).replace('"', '\\"')
+            path_name = self._sanitize_metric_name(f"{self.prefix}_sender_path")
+            lines.append(f"# HELP {path_name} Sender backend path counters.")
+            lines.append(f"# TYPE {path_name} gauge")
+            for sender_path_name, path_count in sender_paths.items():
+                safe_name = str(sender_path_name).replace('"', '\\"')
                 lines.append(
-                    f'{self.prefix}_sender_path{{path="{safe_name}"}} {int(path_count)}'
+                    f"{path_name}" + f'{{path="{safe_name}"}} {int(path_count)}'
                 )
+
+        export_ts_name = self._sanitize_metric_name(f"{self.prefix}_export_timestamp_seconds")
+        lines.append(f"# HELP {export_ts_name} Last successful metrics export attempt timestamp.")
+        lines.append(f"# TYPE {export_ts_name} gauge")
+        lines.append(f"{export_ts_name} {now}")
+        write_err_name = self._sanitize_metric_name(f"{self.prefix}_write_error_total")
+        lines.append(f"# HELP {write_err_name} Total number of exporter write errors.")
+        lines.append(f"# TYPE {write_err_name} counter")
+        lines.append(f"{write_err_name} {int(self._write_error_total)}")
 
         # Atomic write with visible error reporting
         tmp_file = self.prom_file + ".tmp"
@@ -100,6 +122,7 @@ class LiveMetricsExporter:
                 self._write_errors = 0
         except Exception as e:
             self._write_errors += 1
+            self._write_error_total += 1
             # Log only first failure and then every 10th to avoid spam
             if self._write_errors == 1 or self._write_errors % 10 == 0:
                 log.warning(
@@ -111,3 +134,24 @@ class LiveMetricsExporter:
 
         self._last_stats = stats.copy()
         self._last_time = now
+
+    @staticmethod
+    def _sanitize_metric_name(name: str) -> str:
+        out = []
+        for ch in str(name):
+            if ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9") or ch in ("_", ":"):
+                out.append(ch)
+            else:
+                out.append("_")
+        metric = "".join(out)
+        if not metric:
+            return "samurai_attack_unknown"
+        if not (metric[0].isalpha() or metric[0] in ("_", ":")):
+            return f"m_{metric}"
+        return metric
+
+    @staticmethod
+    def _metric_type_for_name(metric_name: str) -> str:
+        if metric_name.endswith("_total") or metric_name.endswith("_count"):
+            return "counter"
+        return "gauge"

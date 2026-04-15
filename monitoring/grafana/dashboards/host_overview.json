@@ -28,9 +28,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "color": { "mode": "palette-classic" },
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
@@ -44,33 +42,20 @@
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 0
-      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "id": 1,
       "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
       },
       "targets": [
         {
-          "expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[1m]))",
+          "expr": "1 - avg by(instance) (rate(node_cpu_seconds_total{instance=~\"$instance\",mode=\"idle\"}[1m]))",
           "legendFormat": "CPU busy",
           "refId": "A"
         }
       ],
-      "title": "CPU Busy",
+      "title": "CPU Busy Ratio",
       "type": "timeseries"
     },
     {
@@ -80,9 +65,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "color": { "mode": "palette-classic" },
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
@@ -92,37 +75,24 @@
             "showPoints": "never",
             "spanNulls": true
           },
-          "unit": "bytes"
+          "unit": "percentunit"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 0
-      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "id": 2,
       "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
       },
       "targets": [
         {
-          "expr": "node_memory_MemAvailable_bytes",
-          "legendFormat": "MemAvailable",
+          "expr": "1 - (node_memory_MemAvailable_bytes{instance=~\"$instance\"} / node_memory_MemTotal_bytes{instance=~\"$instance\"})",
+          "legendFormat": "Memory used",
           "refId": "A"
         }
       ],
-      "title": "Memory Available",
+      "title": "Memory Pressure",
       "type": "timeseries"
     },
     {
@@ -132,9 +102,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "color": { "mode": "palette-classic" },
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
@@ -144,42 +112,29 @@
             "showPoints": "never",
             "spanNulls": true
           },
-          "unit": "bytes"
+          "unit": "binBps"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 8
-      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "id": 3,
       "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
       },
       "targets": [
         {
-          "expr": "rate(node_network_transmit_bytes_total{device=\"enp2s0\"}[1m])",
+          "expr": "sum by(device) (rate(node_network_transmit_bytes_total{instance=~\"$instance\",device=~\"$device\"}[1m]))",
           "legendFormat": "tx {{device}}",
           "refId": "A"
         },
         {
-          "expr": "rate(node_network_receive_bytes_total{device=\"enp2s0\"}[1m])",
+          "expr": "sum by(device) (rate(node_network_receive_bytes_total{instance=~\"$instance\",device=~\"$device\"}[1m]))",
           "legendFormat": "rx {{device}}",
           "refId": "B"
         }
       ],
-      "title": "Network Throughput (Bytes/s)",
+      "title": "Network Throughput",
       "type": "timeseries"
     },
     {
@@ -189,9 +144,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "color": { "mode": "palette-classic" },
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
@@ -205,33 +158,20 @@
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 8
-      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "id": 4,
       "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
       },
       "targets": [
         {
-          "expr": "rate(node_network_transmit_dropped_total{device=\"enp2s0\"}[1m])",
+          "expr": "sum by(device) (rate(node_network_transmit_dropped_total{instance=~\"$instance\",device=~\"$device\"}[1m]))",
           "legendFormat": "tx_drop {{device}}",
           "refId": "A"
         },
         {
-          "expr": "rate(node_network_receive_dropped_total{device=\"enp2s0\"}[1m])",
+          "expr": "sum by(device) (rate(node_network_receive_dropped_total{instance=~\"$instance\",device=~\"$device\"}[1m]))",
           "legendFormat": "rx_drop {{device}}",
           "refId": "B"
         },
@@ -246,28 +186,93 @@
           "refId": "D"
         }
       ],
-      "title": "Drops (Kernel + NIC)",
+      "title": "Drops (NIC + Kernel)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "id": 5,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "expr": "up{job=~\"node|cadvisor|samurai_api|samurai_textfile\"}",
+          "legendFormat": "{{job}} @ {{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Target Health",
       "type": "timeseries"
     }
   ],
   "refresh": "5s",
   "schemaVersion": 39,
   "style": "dark",
-  "tags": [
-    "host",
-    "network"
-  ],
+  "tags": ["host", "network", "sre"],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": { "selected": true, "text": "All", "value": ".*" },
+        "datasource": { "type": "prometheus", "uid": "Prometheus" },
+        "definition": "label_values(up{job=\"node\"}, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Instance",
+        "multi": false,
+        "name": "instance",
+        "options": [],
+        "query": "label_values(up{job=\"node\"}, instance)",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": { "selected": true, "text": "All", "value": ".*" },
+        "datasource": { "type": "prometheus", "uid": "Prometheus" },
+        "definition": "label_values(node_network_transmit_bytes_total{instance=~\"$instance\"}, device)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Device",
+        "multi": true,
+        "name": "device",
+        "options": [],
+        "query": "label_values(node_network_transmit_bytes_total{instance=~\"$instance\"}, device)",
+        "refresh": 1,
+        "regex": "^(?!lo$).+",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
   },
-  "time": {
-    "from": "now-15m",
-    "to": "now"
-  },
+  "time": { "from": "now-15m", "to": "now" },
   "timepicker": {},
   "timezone": "",
   "title": "Host Overview",
   "uid": "samurai-host-overview",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

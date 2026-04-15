@@ -1,0 +1,42 @@
+groups:
+  - name: samurai_recording_rules
+    interval: 5s
+    rules:
+      - record: samurai:attack_send_success_ratio
+        expr: |
+          clamp_max(
+            samurai_attack_sent_total / clamp_min(samurai_attack_attempted_total, 1),
+            1
+          )
+
+      - record: samurai:attack_error_ratio
+        expr: |
+          clamp_max(
+            samurai_attack_errors_total / clamp_min(samurai_attack_attempted_total, 1),
+            1
+          )
+
+      - record: samurai:host_cpu_busy_ratio
+        expr: |
+          1 - avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[1m]))
+
+      - record: samurai:host_mem_used_ratio
+        expr: |
+          1 - (
+            node_memory_MemAvailable_bytes / clamp_min(node_memory_MemTotal_bytes, 1)
+          )
+
+      - record: samurai:host_network_drop_total_rate
+        expr: |
+          sum by(instance) (
+            rate(node_network_receive_dropped_total[1m]) +
+            rate(node_network_transmit_dropped_total[1m])
+          )
+
+      - record: samurai:softnet_dropped_rate
+        expr: |
+          rate(samurai_softnet_dropped_total[1m])
+
+      - record: samurai:softnet_time_squeeze_rate
+        expr: |
+          rate(samurai_softnet_time_squeeze_total[1m])

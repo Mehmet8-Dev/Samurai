@@ -5,11 +5,31 @@ services:
     restart: unless-stopped
     ports:
       - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
       - prometheus_data:/prometheus
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: samurai-alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
 
   grafana:
     image: grafana/grafana:latest
@@ -21,6 +41,7 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_UNIFIED_ALERTING_ENABLED=true
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
@@ -45,6 +66,38 @@ services:
       - /sys:/host/sys:ro
       - /:/rootfs:ro
       - ./textfile:/textfile:rw
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: samurai-cadvisor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+
+  softnet-collector:
+    image: python:3.12-alpine
+    container_name: samurai-softnet-collector
+    restart: unless-stopped
+    command: >
+      sh -c "while true; do
+      python3 /opt/collect_softnet_textfile.py
+      --softnet-path /host/proc/net/softnet_stat
+      --out /textfile/samurai_softnet.prom
+      --prefix samurai || true;
+      sleep ${SOFTNET_SCRAPE_INTERVAL:-5};
+      done"
+    volumes:
+      - /proc:/host/proc:ro
+      - ./textfile:/textfile:rw
+      - ./bin/collect_softnet_textfile.py:/opt/collect_softnet_textfile.py:ro
 
 volumes:
   prometheus_data:

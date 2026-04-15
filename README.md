@@ -123,7 +123,7 @@ docker compose up -d
 ```
 
 - Prometheus: `http://localhost:9090`
-- Grafana: `http://localhost:3000`
+- Grafana: `http://localhost:3001`
 
 ## Test
 

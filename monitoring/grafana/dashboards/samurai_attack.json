@@ -1,269 +1,283 @@
 {
-    "annotations": {
-        "list": [
-            {
-                "builtIn": 1,
-                "datasource": {
-                    "type": "grafana",
-                    "uid": "-- Grafana --"
-                },
-                "enable": true,
-                "hide": true,
-                "iconColor": "rgba(0, 211, 255, 1)",
-                "name": "Annotations & Alerts",
-                "type": "dashboard"
-            }
-        ]
-    },
-    "editable": true,
-    "fiscalYearStartMonth": 0,
-    "graphTooltip": 0,
-    "id": null,
-    "links": [],
-    "panels": [
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
         {
-            "datasource": {
-                "type": "prometheus",
-                "uid": "Prometheus"
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "color": {
-                        "mode": "palette-classic"
-                    },
-                    "custom": {
-                        "drawStyle": "line",
-                        "fillOpacity": 10,
-                        "lineInterpolation": "smooth",
-                        "lineWidth": 2,
-                        "pointSize": 2,
-                        "showPoints": "never",
-                        "spanNulls": true
-                    },
-                    "unit": "pps"
-                },
-                "overrides": []
-            },
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 0,
-                "y": 0
-            },
-            "id": 1,
-            "options": {
-                "legend": {
-                    "calcs": [
-                        "mean",
-                        "max"
-                    ],
-                    "displayMode": "table",
-                    "placement": "bottom",
-                    "showLegend": true
-                },
-                "tooltip": {
-                    "mode": "single",
-                    "sort": "none"
-                }
-            },
-            "targets": [
-                {
-                    "expr": "samurai_attack_pps_inst or samurai_attack_pps or samurai_metrics_gauges_live_effective_pps or samurai_results_effective_pps",
-                    "legendFormat": "PPS current",
-                    "refId": "A"
-                },
-                {
-                    "expr": "samurai_attack_pps_avg or avg_over_time(samurai_attack_pps_inst[1m]) or avg_over_time(samurai_attack_pps[1m]) or avg_over_time(samurai_metrics_gauges_live_effective_pps[1m]) or avg_over_time(samurai_results_effective_pps[1m])",
-                    "legendFormat": "PPS avg (1m)",
-                    "refId": "B"
-                },
-                {
-                    "expr": "max_over_time(samurai_attack_pps_inst[1m]) or max_over_time(samurai_attack_pps[1m]) or max_over_time(samurai_metrics_gauges_live_effective_pps[1m]) or max_over_time(samurai_results_effective_pps[1m])",
-                    "legendFormat": "PPS max (1m)",
-                    "refId": "C"
-                }
-            ],
-            "title": "Attack Throughput (PPS)",
-            "type": "timeseries"
+          "expr": "samurai_attack_pps_inst or samurai_attack_pps or samurai_results_effective_pps",
+          "legendFormat": "PPS current",
+          "refId": "A"
         },
         {
-            "datasource": {
-                "type": "prometheus",
-                "uid": "Prometheus"
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "color": {
-                        "mode": "palette-classic"
-                    },
-                    "custom": {
-                        "drawStyle": "line",
-                        "fillOpacity": 10,
-                        "lineInterpolation": "smooth",
-                        "lineWidth": 2,
-                        "pointSize": 2,
-                        "showPoints": "never",
-                        "spanNulls": true
-                    },
-                    "unit": "percent"
-                },
-                "overrides": []
-            },
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 12,
-                "y": 0
-            },
-            "id": 2,
-            "options": {
-                "legend": {
-                    "calcs": [],
-                    "displayMode": "list",
-                    "placement": "bottom",
-                    "showLegend": true
-                },
-                "tooltip": {
-                    "mode": "single",
-                    "sort": "none"
-                }
-            },
-            "targets": [
-                {
-                    "expr": "samurai_attack_progress_pct",
-                    "legendFormat": "Progress %",
-                    "refId": "A"
-                }
-            ],
-            "title": "Attack Progress",
-            "type": "timeseries"
-        },
-        {
-            "datasource": {
-                "type": "prometheus",
-                "uid": "Prometheus"
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "color": {
-                        "mode": "palette-classic"
-                    },
-                    "custom": {
-                        "drawStyle": "line",
-                        "fillOpacity": 10,
-                        "lineInterpolation": "smooth",
-                        "lineWidth": 2,
-                        "pointSize": 2,
-                        "showPoints": "never",
-                        "spanNulls": true
-                    }
-                },
-                "overrides": []
-            },
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 0,
-                "y": 8
-            },
-            "id": 3,
-            "options": {
-                "legend": {
-                    "calcs": [],
-                    "displayMode": "list",
-                    "placement": "bottom",
-                    "showLegend": true
-                },
-                "tooltip": {
-                    "mode": "multi",
-                    "sort": "none"
-                }
-            },
-            "targets": [
-                {
-                    "expr": "samurai_attack_workers_active",
-                    "legendFormat": "Active Workers",
-                    "refId": "A"
-                }
-            ],
-            "title": "Active Workers",
-            "type": "timeseries"
-        },
-        {
-            "datasource": {
-                "type": "prometheus",
-                "uid": "Prometheus"
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "color": {
-                        "mode": "palette-classic"
-                    },
-                    "custom": {
-                        "drawStyle": "line",
-                        "fillOpacity": 10,
-                        "lineInterpolation": "smooth",
-                        "lineWidth": 2,
-                        "pointSize": 2,
-                        "showPoints": "never",
-                        "spanNulls": true
-                    }
-                },
-                "overrides": []
-            },
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 12,
-                "y": 8
-            },
-            "id": 4,
-            "options": {
-                "legend": {
-                    "calcs": [],
-                    "displayMode": "table",
-                    "placement": "bottom",
-                    "showLegend": true
-                },
-                "tooltip": {
-                    "mode": "multi",
-                    "sort": "none"
-                }
-            },
-            "targets": [
-                {
-                    "expr": "samurai_attack_sent_total",
-                    "legendFormat": "Sent Total",
-                    "refId": "A"
-                },
-                {
-                    "expr": "samurai_attack_errors_total",
-                    "legendFormat": "Errors Total",
-                    "refId": "B"
-                }
-            ],
-            "title": "Cumulative Packet Stats",
-            "type": "timeseries"
+          "expr": "avg_over_time((samurai_attack_pps_inst or samurai_attack_pps or samurai_results_effective_pps)[1m])",
+          "legendFormat": "PPS avg (1m)",
+          "refId": "B"
         }
-    ],
-    "refresh": "5s",
-    "schemaVersion": 39,
-    "style": "dark",
-    "tags": [
-        "attack",
-        "samurai"
-    ],
-    "templating": {
-        "list": []
+      ],
+      "title": "Attack Throughput (PPS)",
+      "type": "timeseries"
     },
-    "time": {
-        "from": "now-15m",
-        "to": "now"
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "options": {
+        "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "expr": "samurai_attack_sent_total / clamp_min(samurai_attack_attempted_total, 1)",
+          "legendFormat": "Send success ratio",
+          "refId": "A"
+        },
+        {
+          "expr": "samurai_attack_errors_total / clamp_min(samurai_attack_attempted_total, 1)",
+          "legendFormat": "Error ratio",
+          "refId": "B"
+        }
+      ],
+      "title": "Quality Ratios",
+      "type": "timeseries"
     },
-    "timepicker": {},
-    "timezone": "",
-    "title": "Samurai Attack Monitor",
-    "uid": "samurai-attack-monitor",
-    "version": 1,
-    "weekStart": ""
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "expr": "samurai_attack_progress_pct",
+          "legendFormat": "Progress",
+          "refId": "A"
+        },
+        {
+          "expr": "samurai_attack_rate_accuracy_pct",
+          "legendFormat": "Rate accuracy",
+          "refId": "B"
+        }
+      ],
+      "title": "Progress + Rate Accuracy",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "expr": "samurai_attack_workers_active",
+          "legendFormat": "Active workers",
+          "refId": "A"
+        },
+        {
+          "expr": "samurai_attack_sleep_calls",
+          "legendFormat": "Sleep calls",
+          "refId": "B"
+        },
+        {
+          "expr": "samurai_attack_busywait_cycles",
+          "legendFormat": "Busywait cycles",
+          "refId": "C"
+        }
+      ],
+      "title": "Worker Runtime Signals",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 5,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "expr": "samurai_attack_wire_loss_est_pct",
+          "legendFormat": "Wire loss est %",
+          "refId": "A"
+        },
+        {
+          "expr": "samurai_attack_wire_loss_raw_pct",
+          "legendFormat": "Wire loss raw %",
+          "refId": "B"
+        },
+        {
+          "expr": "samurai_attack_txring_drop_ratio_pct",
+          "legendFormat": "TX ring drop ratio %",
+          "refId": "C"
+        }
+      ],
+      "title": "Loss & TX-Ring",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 6,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "expr": "samurai_attack_sender_path",
+          "legendFormat": "path={{path}}",
+          "refId": "A"
+        },
+        {
+          "expr": "samurai_attack_kpi_gate_status",
+          "legendFormat": "kpi status={{status}}",
+          "refId": "B"
+        },
+        {
+          "expr": "samurai_attack_run_quality",
+          "legendFormat": "run quality={{quality}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Status Labels",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["attack", "samurai", "sre"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Samurai Attack Overview",
+  "uid": "samurai-attack-overview",
+  "version": 2,
+  "weekStart": ""
 }

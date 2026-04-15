@@ -53,8 +53,8 @@ def _prom(lines: List[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_softnet_prom(prefix: str = "samurai") -> Tuple[str, Dict[str, int]]:
-    rows = _read_softnet_stat()
+def build_softnet_prom(prefix: str = "samurai", softnet_path: str = "/proc/net/softnet_stat") -> Tuple[str, Dict[str, int]]:
+    rows = _read_softnet_stat(path=softnet_path)
     sums = _sum_fields(rows)
 
     p = prefix.strip() or "samurai"
@@ -79,9 +79,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Write /proc/net/softnet_stat counters to a node-exporter textfile.")
     ap.add_argument("--out", required=True, help="Output .prom file path (textfile collector directory).")
     ap.add_argument("--prefix", default="samurai", help="Metric prefix (default: samurai).")
+    ap.add_argument(
+        "--softnet-path",
+        default="/proc/net/softnet_stat",
+        help="Path to softnet stats file (default: /proc/net/softnet_stat).",
+    )
     args = ap.parse_args()
 
-    payload, _sums = build_softnet_prom(prefix=str(args.prefix))
+    payload, _sums = build_softnet_prom(prefix=str(args.prefix), softnet_path=str(args.softnet_path))
     out_path = Path(str(args.out))
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -93,4 +98,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -1,0 +1,73 @@
+groups:
+  - name: samurai_alert_rules
+    interval: 5s
+    rules:
+      - alert: SamuraiPrometheusTargetDown
+        expr: up{job=~"node|cadvisor|samurai_api|samurai_textfile"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          team: observability
+        annotations:
+          summary: "Prometheus target down ({{ $labels.job }})"
+          description: "{{ $labels.instance }} has been unreachable for more than 2 minutes."
+
+      - alert: SamuraiHighHostCpu
+        expr: samurai:host_cpu_busy_ratio > 0.90
+        for: 3m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Host CPU is saturated"
+          description: "Host CPU busy ratio is above 90% for 3m (instance={{ $labels.instance }})."
+
+      - alert: SamuraiHighHostMemory
+        expr: samurai:host_mem_used_ratio > 0.92
+        for: 3m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Host memory pressure"
+          description: "Memory used ratio is above 92% for 3m (instance={{ $labels.instance }})."
+
+      - alert: SamuraiSoftnetDropsBurst
+        expr: samurai:softnet_dropped_rate > 0
+        for: 2m
+        labels:
+          severity: warning
+          team: dataplane
+        annotations:
+          summary: "Softnet drops detected"
+          description: "Kernel softnet drops are non-zero for 2m. RX pressure likely increased."
+
+      - alert: SamuraiAttackErrorRatioHigh
+        expr: samurai:attack_error_ratio > 0.20 and samurai_attack_attempted_total > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: attack-runtime
+        annotations:
+          summary: "Attack error ratio is high"
+          description: "Error ratio >20% for 1m (current={{ $value | humanizePercentage }})."
+
+      - alert: SamuraiAttackSendSuccessLow
+        expr: samurai:attack_send_success_ratio < 0.70 and samurai_attack_attempted_total > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: attack-runtime
+        annotations:
+          summary: "Attack send success ratio is low"
+          description: "Send success ratio is below 70% for 1m (current={{ $value | humanizePercentage }})."
+
+      - alert: SamuraiWireLossFailStatus
+        expr: samurai_attack_wire_loss_status{status="fail"} > 0
+        for: 30s
+        labels:
+          severity: critical
+          team: dataplane
+        annotations:
+          summary: "Wire loss status reached FAIL"
+          description: "wire_loss_status=fail is active in live exporter metrics."
