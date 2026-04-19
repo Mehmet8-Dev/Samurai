@@ -2196,6 +2196,94 @@ static int send_ring_optimized_core(
     return 0;
 }
 
+static int send_ring_optimized_core_raw(
+    const char* iface,
+    const uint8_t* buffer,
+    size_t buffer_len,
+    int packet_size,
+    int count,
+    const uint8_t* mac,
+    txring_send_metrics_t* metrics,
+    char* err_msg,
+    size_t err_msg_len
+) {
+    Py_buffer view;
+    memset(&view, 0, sizeof(view));
+    view.buf = (void*)buffer;
+    view.len = (Py_ssize_t)buffer_len;
+
+    if (!iface || !buffer || !mac || !metrics) {
+        if (err_msg && err_msg_len > 0) (void)snprintf(err_msg, err_msg_len, "%s", "invalid arguments");
+        return -1;
+    }
+    if (packet_size <= 0 || count < 0) {
+        if (err_msg && err_msg_len > 0) (void)snprintf(err_msg, err_msg_len, "%s", "invalid packet_size/count");
+        return -1;
+    }
+    if (buffer_len < ((size_t)packet_size * (size_t)count)) {
+        if (err_msg && err_msg_len > 0) (void)snprintf(err_msg, err_msg_len, "%s", "buffer too small");
+        return -1;
+    }
+
+    if (send_ring_optimized_core(iface, &view, packet_size, count, mac, metrics) < 0) {
+        if (err_msg && err_msg_len > 0) {
+            const char* py_err = NULL;
+            if (PyErr_Occurred()) {
+                py_err = "python_error";
+                PyErr_Clear();
+            }
+            (void)snprintf(err_msg, err_msg_len, "%s", py_err ? py_err : "send_ring_optimized_core failed");
+        }
+        return -1;
+    }
+    if (err_msg && err_msg_len > 0) {
+        err_msg[0] = '\0';
+    }
+    return 0;
+}
+
+int samurai_fast_sender_send_ring_bridge(
+    const char* iface,
+    const uint8_t* buffer,
+    size_t buffer_len,
+    int packet_size,
+    int count,
+    const uint8_t mac[6],
+    int* out_sent,
+    int* out_errors,
+    char* err_msg,
+    size_t err_msg_len
+) {
+    txring_send_metrics_t metrics;
+    memset(&metrics, 0, sizeof(metrics));
+    if (send_ring_optimized_core_raw(
+            iface,
+            buffer,
+            buffer_len,
+            packet_size,
+            count,
+            mac,
+            &metrics,
+            err_msg,
+            err_msg_len) < 0) {
+        if (out_sent) *out_sent = 0;
+        if (out_errors) *out_errors = count > 0 ? count : 0;
+        return -1;
+    }
+    if (out_sent) *out_sent = metrics.sent;
+    if (out_errors) {
+        int errs = metrics.attempted - metrics.sent;
+        if (errs < 0) errs = 0;
+        *out_errors = errs;
+    }
+    return 0;
+}
+
+int samurai_fast_sender_cleanup_ring_bridge(void) {
+    cleanup_tx_ring_internal();
+    return 0;
+}
+
 static PyObject* send_ring_optimized(PyObject* self, PyObject* args) {
     char* iface;
     Py_buffer view;
