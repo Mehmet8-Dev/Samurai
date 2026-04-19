@@ -394,6 +394,17 @@ static inline void precision_wait(uint64_t target_ns)
     }
 }
 
+/* Public C ABI hooks for native callers (e.g., persistent GPU bridge). */
+uint64_t samurai_pacing_time_ns(void)
+{
+    return time_ns();
+}
+
+void samurai_pacing_precision_wait_ns(uint64_t target_ns)
+{
+    precision_wait(target_ns);
+}
+
 /* ========================================================================== */
 /* PRNG — Xorshift128+ (fast, sufficient quality for jitter)                  */
 /* ========================================================================== */
