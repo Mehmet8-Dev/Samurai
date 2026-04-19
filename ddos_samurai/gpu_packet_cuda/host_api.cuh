@@ -1314,6 +1314,7 @@ struct PersistentRuntimeControl {
   uint64_t runtime_restarts = 0;
   uint64_t tx_bridge_sent = 0;
   uint64_t ring_occupancy_peak = 0;
+  uint64_t ring_released = 0;
   uint64_t bridge_drain_batches = 0;
   uint64_t bridge_drain_packets = 0;
   uint64_t ring_drop_events = 0;
@@ -1358,6 +1359,21 @@ struct PersistentDeviceStreamState {
   uint8_t src_mac[6]{0, 0, 0, 0, 0, 0};
   uint8_t dst_mac[6]{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   uint8_t payload[kPersistentPayloadCapacity]{};
+  uint16_t template_len = 0;
+  uint16_t template_ip_off = 0;
+  uint16_t template_l4_off = 0;
+  uint16_t template_l4_len = 0;
+  uint16_t template_base_ip_csum = 0;
+  uint16_t template_base_l4_csum = 0;
+  uint16_t template_base_ip_id = 0;
+  uint16_t template_base_ttl_proto = 0;
+  uint16_t template_base_src_port = 0;
+  uint32_t template_base_src_ip = 0;
+  uint32_t template_base_dst_ip = 0;
+  uint32_t template_base_tcp_seq = 0;
+  uint32_t template_base_tcp_ack = 0;
+  uint8_t template_valid = 0;
+  uint8_t template_packet[kPersistentMaxPacketBytes]{};
 };
 
 struct PersistentStreamState {
@@ -1543,6 +1559,15 @@ inline void host_u64_add(volatile uint64_t* p, uint64_t v) {
   (void)__atomic_fetch_add(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(p)),
                            static_cast<unsigned long long>(v),
                            __ATOMIC_RELAXED);
+}
+
+inline uint64_t host_u64_load(const volatile uint64_t* p) {
+  if (!p) {
+    return 0u;
+  }
+  return static_cast<uint64_t>(__atomic_load_n(
+      reinterpret_cast<const volatile unsigned long long*>(p),
+      __ATOMIC_RELAXED));
 }
 
 inline std::string json_escape_string(const std::string& in) {
@@ -1932,6 +1957,206 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   return (b.requested == "auto");
 }
 
+inline uint16_t host_checksum(const uint8_t* data, int len) {
+  uint32_t sum = 0u;
+  int i = 0;
+  for (; i + 1 < len; i += 2) {
+    sum += (static_cast<uint32_t>(data[i]) << 8) | static_cast<uint32_t>(data[i + 1]);
+  }
+  if (i < len) {
+    sum += static_cast<uint32_t>(data[i]) << 8;
+  }
+  while (sum >> 16u) {
+    sum = (sum & 0xFFFFu) + (sum >> 16u);
+  }
+  return static_cast<uint16_t>((~sum) & 0xFFFFu);
+}
+
+inline uint16_t host_l4_checksum(
+    uint32_t src_ip,
+    uint32_t dst_ip,
+    uint8_t protocol,
+    const uint8_t* l4,
+    int l4_len) {
+  uint32_t sum = 0u;
+  sum += (src_ip >> 16) & 0xFFFFu;
+  sum += src_ip & 0xFFFFu;
+  sum += (dst_ip >> 16) & 0xFFFFu;
+  sum += dst_ip & 0xFFFFu;
+  sum += static_cast<uint32_t>(protocol);
+  sum += static_cast<uint32_t>(l4_len);
+  int i = 0;
+  for (; i + 1 < l4_len; i += 2) {
+    sum += (static_cast<uint32_t>(l4[i]) << 8) | static_cast<uint32_t>(l4[i + 1]);
+  }
+  if (i < l4_len) {
+    sum += static_cast<uint32_t>(l4[i]) << 8;
+  }
+  while (sum >> 16u) {
+    sum = (sum & 0xFFFFu) + (sum >> 16u);
+  }
+  return static_cast<uint16_t>((~sum) & 0xFFFFu);
+}
+
+inline void persistent_build_stream_template(volatile PersistentDeviceStreamState* sv) {
+  if (!sv) {
+    return;
+  }
+  auto w16 = [&](uint8_t* buf, int off, uint16_t v) {
+    buf[off] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    buf[off + 1] = static_cast<uint8_t>(v & 0xFFu);
+  };
+  auto w32 = [&](uint8_t* buf, int off, uint32_t v) {
+    buf[off] = static_cast<uint8_t>((v >> 24) & 0xFFu);
+    buf[off + 1] = static_cast<uint8_t>((v >> 16) & 0xFFu);
+    buf[off + 2] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    buf[off + 3] = static_cast<uint8_t>(v & 0xFFu);
+  };
+  auto r16 = [&](const uint8_t* buf, int off) -> uint16_t {
+    return static_cast<uint16_t>((static_cast<uint16_t>(buf[off]) << 8) | static_cast<uint16_t>(buf[off + 1]));
+  };
+  auto r32 = [&](const uint8_t* buf, int off) -> uint32_t {
+    return (static_cast<uint32_t>(buf[off]) << 24) | (static_cast<uint32_t>(buf[off + 1]) << 16) |
+           (static_cast<uint32_t>(buf[off + 2]) << 8) | static_cast<uint32_t>(buf[off + 3]);
+  };
+
+  const int protocol = static_cast<int>(sv->protocol);
+  const bool is_tcp = (protocol == 6);
+  const bool is_udp = (protocol == 17);
+  const bool is_icmp = (protocol == 1);
+  if (!is_tcp && !is_udp && !is_icmp) {
+    sv->template_valid = 0;
+    sv->template_len = 0;
+    return;
+  }
+
+  int payload_len = static_cast<int>(sv->payload_len);
+  if (payload_len < 0) {
+    payload_len = 0;
+  }
+  if (payload_len > kPersistentPayloadCapacity) {
+    payload_len = kPersistentPayloadCapacity;
+  }
+  const int has_eth = (sv->has_ethernet != 0) ? 1 : 0;
+  const int ip_off = has_eth ? 14 : 0;
+  const int ip_len = 20;
+  const int tcp_len = 20;
+  const int udp_len = 8;
+  const int icmp_len = 8;
+  const int l4_len = (is_tcp ? tcp_len : (is_udp ? udp_len : icmp_len)) + payload_len;
+  const int total_len = ip_off + ip_len + l4_len;
+  if (total_len <= 0 || total_len > kPersistentMaxPacketBytes) {
+    sv->template_valid = 0;
+    sv->template_len = 0;
+    return;
+  }
+
+  uint8_t* out = const_cast<uint8_t*>(sv->template_packet);
+  std::memset(out, 0, static_cast<size_t>(total_len));
+
+  if (has_eth) {
+    if (sv->has_custom_mac != 0) {
+      for (int i = 0; i < 6; ++i) {
+        out[i] = sv->dst_mac[i];
+        out[6 + i] = sv->src_mac[i];
+      }
+    } else {
+      for (int i = 0; i < 6; ++i) {
+        out[i] = 0xFFu;
+        out[6 + i] = 0x00u;
+      }
+    }
+    out[12] = 0x08u;
+    out[13] = 0x00u;
+  }
+
+  const int ip = ip_off;
+  const uint16_t ip_total_len = static_cast<uint16_t>(ip_len + l4_len);
+  const uint16_t ip_id = 0u;
+  const uint8_t ttl = 64u;
+  out[ip + 0] = 0x45u;
+  out[ip + 1] = 0x00u;
+  w16(out, ip + 2, ip_total_len);
+  w16(out, ip + 4, ip_id);
+  w16(out, ip + 6, 0x4000u);
+  out[ip + 8] = ttl;
+  out[ip + 9] = static_cast<uint8_t>(protocol & 0xFF);
+  w16(out, ip + 10, 0u);
+
+  uint32_t src_ip = sv->src_ip;
+  const uint32_t spoof_mask = sv->spoof_mask;
+  if (sv->spoof_enabled != 0 && spoof_mask < 32u) {
+    src_ip = sv->spoof_base_ip;
+  }
+  w32(out, ip + 12, src_ip);
+  w32(out, ip + 16, sv->target_ip);
+  const uint16_t ip_csum = host_checksum(out + ip, ip_len);
+  w16(out, ip + 10, ip_csum);
+
+  const int t_off = ip_off + ip_len;
+  const uint16_t src_port =
+      (sv->source_port_mode != 0 && sv->source_port != 0) ? sv->source_port : static_cast<uint16_t>(1024u);
+  if (is_tcp) {
+    const uint32_t tcp_seq = 0u;
+    const uint32_t tcp_ack = 0u;
+    w16(out, t_off + 0, src_port);
+    w16(out, t_off + 2, sv->target_port);
+    w32(out, t_off + 4, tcp_seq);
+    w32(out, t_off + 8, tcp_ack);
+    out[t_off + 12] = 0x50;
+    out[t_off + 13] = static_cast<uint8_t>(sv->tcp_flags & 0xFFu);
+    w16(out, t_off + 14, sv->tcp_window);
+    w16(out, t_off + 16, 0u);
+    w16(out, t_off + 18, 0u);
+  } else if (is_udp) {
+    w16(out, t_off + 0, src_port);
+    w16(out, t_off + 2, sv->target_port);
+    w16(out, t_off + 4, static_cast<uint16_t>(udp_len + payload_len));
+    w16(out, t_off + 6, 0u);
+  } else {
+    out[t_off + 0] = static_cast<uint8_t>(sv->icmp_type & 0xFF);
+    out[t_off + 1] = static_cast<uint8_t>(sv->icmp_code & 0xFF);
+    w16(out, t_off + 2, 0u);
+    w16(out, t_off + 4, 0u);
+    w16(out, t_off + 6, static_cast<uint16_t>(sv->stream_id & 0xFFFF));
+  }
+
+  const int data_off = t_off + (is_tcp ? tcp_len : (is_udp ? udp_len : icmp_len));
+  for (int i = 0; i < payload_len; ++i) {
+    out[data_off + i] = (i < static_cast<int>(sv->payload_len)) ? sv->payload[i] : sv->payload_byte;
+  }
+
+  uint16_t l4_csum = 0u;
+  if (is_tcp) {
+    l4_csum = host_l4_checksum(src_ip, sv->target_ip, 6, out + t_off, tcp_len + payload_len);
+    w16(out, t_off + 16, l4_csum);
+  } else if (is_udp) {
+    l4_csum = host_l4_checksum(src_ip, sv->target_ip, 17, out + t_off, udp_len + payload_len);
+    if (l4_csum == 0u) {
+      l4_csum = 0xFFFFu;
+    }
+    w16(out, t_off + 6, l4_csum);
+  } else {
+    l4_csum = host_checksum(out + t_off, icmp_len + payload_len);
+    w16(out, t_off + 2, l4_csum);
+  }
+
+  sv->template_len = static_cast<uint16_t>(total_len);
+  sv->template_ip_off = static_cast<uint16_t>(ip_off);
+  sv->template_l4_off = static_cast<uint16_t>(t_off);
+  sv->template_l4_len = static_cast<uint16_t>(l4_len);
+  sv->template_base_ip_csum = ip_csum;
+  sv->template_base_l4_csum = l4_csum;
+  sv->template_base_ip_id = ip_id;
+  sv->template_base_ttl_proto = r16(out, ip + 8);
+  sv->template_base_src_port = src_port;
+  sv->template_base_src_ip = src_ip;
+  sv->template_base_dst_ip = r32(out, ip + 16);
+  sv->template_base_tcp_seq = is_tcp ? r32(out, t_off + 4) : 0u;
+  sv->template_base_tcp_ack = is_tcp ? r32(out, t_off + 8) : 0u;
+  sv->template_valid = 1;
+}
+
 __device__ inline uint16_t persistent_checksum(const uint8_t* data, int len) {
   uint32_t sum = 0u;
   int i = 0;
@@ -1994,6 +2219,95 @@ __device__ inline void persistent_write_packet(
     return;
   }
 
+  auto w16 = [&](int off, uint16_t v) {
+    payload[off] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    payload[off + 1] = static_cast<uint8_t>(v & 0xFFu);
+  };
+  auto w32 = [&](int off, uint32_t v) {
+    payload[off] = static_cast<uint8_t>((v >> 24) & 0xFFu);
+    payload[off + 1] = static_cast<uint8_t>((v >> 16) & 0xFFu);
+    payload[off + 2] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    payload[off + 3] = static_cast<uint8_t>(v & 0xFFu);
+  };
+  auto r16 = [&](int off) -> uint16_t {
+    return static_cast<uint16_t>((static_cast<uint16_t>(payload[off]) << 8) | static_cast<uint16_t>(payload[off + 1]));
+  };
+  auto r32 = [&](int off) -> uint32_t {
+    return (static_cast<uint32_t>(payload[off]) << 24) | (static_cast<uint32_t>(payload[off + 1]) << 16) |
+           (static_cast<uint32_t>(payload[off + 2]) << 8) | static_cast<uint32_t>(payload[off + 3]);
+  };
+
+  if (sv->template_valid != 0 && sv->template_len > 0 &&
+      sv->template_len <= static_cast<uint16_t>(max_packet_bytes) &&
+      sv->template_len <= static_cast<uint16_t>(kPersistentMaxPacketBytes)) {
+    const int total_len = static_cast<int>(sv->template_len);
+    for (int i = 0; i < total_len; ++i) {
+      payload[i] = sv->template_packet[i];
+    }
+
+    const int ip_off_t = static_cast<int>(sv->template_ip_off);
+    const int t_off_t = static_cast<int>(sv->template_l4_off);
+    const int l4_len_t = static_cast<int>(sv->template_l4_len);
+    if (ip_off_t < 0 || t_off_t <= ip_off_t || l4_len_t <= 0) {
+      slot->len = 0;
+      return;
+    }
+
+    uint32_t src_ip = sv->src_ip;
+    const uint32_t spoof_mask = sv->spoof_mask;
+    if (sv->spoof_enabled != 0 && spoof_mask < 32u) {
+      const uint32_t hosts = (1u << (32u - spoof_mask));
+      src_ip = sv->spoof_base_ip + (hosts > 0 ? (seq % hosts) : 0u);
+    }
+    const uint16_t ip_id = static_cast<uint16_t>(seq & 0xFFFFu);
+    const uint16_t new_ttl_proto =
+        static_cast<uint16_t>((static_cast<uint16_t>(48u + (seq % 64u)) << 8) |
+                              static_cast<uint16_t>(protocol & 0xFF));
+    const uint16_t auto_src_port = static_cast<uint16_t>(1024u + (seq % 64511u));
+    const uint16_t src_port = (sv->source_port_mode != 0 && sv->source_port != 0) ? sv->source_port : auto_src_port;
+
+    w32(ip_off_t + 12, src_ip);
+    w16(ip_off_t + 4, ip_id);
+    payload[ip_off_t + 8] = static_cast<uint8_t>((new_ttl_proto >> 8) & 0xFFu);
+    payload[ip_off_t + 9] = static_cast<uint8_t>(new_ttl_proto & 0xFFu);
+
+    uint16_t ip_csum = sv->template_base_ip_csum;
+    ip_csum = rfc1624_update_dword(ip_csum, sv->template_base_src_ip, src_ip);
+    ip_csum = rfc1624_update_word(ip_csum, sv->template_base_ip_id, ip_id);
+    ip_csum = rfc1624_update_word(ip_csum, sv->template_base_ttl_proto, new_ttl_proto);
+    w16(ip_off_t + 10, ip_csum);
+
+    if (is_tcp) {
+      w16(t_off_t + 0, src_port);
+      const uint32_t tcp_seq = seq * 2654435761u;
+      w32(t_off_t + 4, tcp_seq);
+      uint16_t tcp_csum = sv->template_base_l4_csum;
+      tcp_csum = rfc1624_update_dword(tcp_csum, sv->template_base_src_ip, src_ip);
+      tcp_csum = rfc1624_update_word(tcp_csum, sv->template_base_src_port, src_port);
+      tcp_csum = rfc1624_update_dword(tcp_csum, sv->template_base_tcp_seq, tcp_seq);
+      w16(t_off_t + 16, tcp_csum);
+    } else if (is_udp) {
+      w16(t_off_t + 0, src_port);
+      uint16_t udp_csum = sv->template_base_l4_csum;
+      udp_csum = rfc1624_update_dword(udp_csum, sv->template_base_src_ip, src_ip);
+      udp_csum = rfc1624_update_word(udp_csum, sv->template_base_src_port, src_port);
+      if (udp_csum == 0u) {
+        udp_csum = 0xFFFFu;
+      }
+      w16(t_off_t + 6, udp_csum);
+    } else {
+      const uint16_t old_id_seq = r16(t_off_t + 4);
+      const uint16_t new_id_seq = static_cast<uint16_t>(seq & 0xFFFFu);
+      w16(t_off_t + 4, new_id_seq);
+      uint16_t icmp_csum = sv->template_base_l4_csum;
+      icmp_csum = rfc1624_update_word(icmp_csum, old_id_seq, new_id_seq);
+      w16(t_off_t + 2, icmp_csum);
+    }
+
+    slot->len = total_len;
+    return;
+  }
+
   int payload_len = static_cast<int>(sv->payload_len);
   if (payload_len < 0) {
     payload_len = 0;
@@ -2014,17 +2328,6 @@ __device__ inline void persistent_write_packet(
     const uint32_t hosts = (1u << (32u - spoof_mask));
     src_ip = sv->spoof_base_ip + (hosts > 0 ? (seq % hosts) : 0u);
   }
-
-  auto w16 = [&](int off, uint16_t v) {
-    payload[off] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-    payload[off + 1] = static_cast<uint8_t>(v & 0xFFu);
-  };
-  auto w32 = [&](int off, uint32_t v) {
-    payload[off] = static_cast<uint8_t>((v >> 24) & 0xFFu);
-    payload[off + 1] = static_cast<uint8_t>((v >> 16) & 0xFFu);
-    payload[off + 2] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-    payload[off + 3] = static_cast<uint8_t>(v & 0xFFu);
-  };
 
   if (has_eth) {
     if (sv->has_custom_mac != 0) {
@@ -2328,17 +2631,12 @@ __global__ void persistent_dataplane_kernel(
 }
 
 inline int ring_occupancy_now(const PersistentRuntime& rt) {
-  if (!rt.rings_host || !rt.ctrl || rt.queue_count <= 0 || rt.ring_slots <= 0) {
+  if (!rt.ctrl) {
     return 0;
   }
-  const int total = rt.queue_count * rt.ring_slots;
-  int occ = 0;
-  for (int i = 0; i < total; ++i) {
-    if (rt.rings_host[i].state != 0) {
-      ++occ;
-    }
-  }
-  return occ;
+  const uint64_t produced = host_u64_load(&rt.ctrl->produced);
+  const uint64_t released = host_u64_load(&rt.ctrl->ring_released);
+  return static_cast<int>(produced > released ? (produced - released) : 0u);
 }
 
 inline void persistent_bridge_loop(int worker_idx, int worker_count) {
@@ -2350,6 +2648,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
     uint64_t local_sent = 0u;
     uint64_t local_batches = 0u;
     uint64_t local_drops = 0u;
+    uint64_t local_released = 0u;
     if (rt.rings_host && rt.ctrl) {
       for (int q = worker; q < rt.queue_count; q += workers) {
         uint32_t& cursor = rt.queue_drain_cursor[static_cast<size_t>(q)];
@@ -2361,9 +2660,14 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
         std::vector<uint32_t> submit_frame_ids;
         std::vector<uint16_t> submit_lengths;
         std::vector<uint32_t> completion_frame_ids;
+        std::vector<uint32_t> afpacket_slot_ids;
+        std::vector<int32_t> afpacket_stream_slots;
+        std::vector<uint8_t> afpacket_batch_payload;
         submit_frame_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
         submit_lengths.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
         completion_frame_ids.resize(static_cast<size_t>(std::max(64, rt.bridge_max_burst)));
+        afpacket_slot_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
+        afpacket_stream_slots.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
         while (drained < static_cast<uint64_t>(std::max(1, rt.bridge_max_burst))) {
           if (rt.bridge_drain_budget_ns > 0) {
             const uint64_t elapsed = now_ns_steady() - t0;
@@ -2401,6 +2705,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                 slot.stream_id = 0;
                 slot.stream_slot = -1;
                 slot.protocol = 0;
+                local_released += 1u;
                 if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
                   rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
                 }
@@ -2432,6 +2737,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                   slot.stream_slot = -1;
                   slot.protocol = 0;
                   local_drops += 1u;
+                  local_released += 1u;
                   cursor = (cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
                   break;
                 }
@@ -2485,66 +2791,117 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 
           if (rt.tx_bridge.kind == PersistentTxBackendKind::kAfPacket && rt.tx_bridge.afpacket_send_bridge &&
               !rt.tx_bridge.iface.empty()) {
-            const int idx = q * rt.ring_slots + static_cast<int>(cursor);
-            PersistentRingSlot& slot = rt.rings_host[idx];
-            if (slot.state != 1) {
+            const int max_packet = (rt.ctrl && rt.ctrl->max_packet_bytes > 0) ? rt.ctrl->max_packet_bytes : kPersistentMaxPacketBytes;
+            const int burst_limit = std::max(1, rt.bridge_max_burst);
+            const int remaining_budget = std::max(1, burst_limit - static_cast<int>(drained));
+            afpacket_slot_ids.clear();
+            afpacket_stream_slots.clear();
+            int packet_size = 0;
+            for (int i = 0; i < remaining_budget; ++i) {
+              const uint32_t slot_id = (cursor + static_cast<uint32_t>(i)) % static_cast<uint32_t>(rt.ring_slots);
+              const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
+              PersistentRingSlot& slot = rt.rings_host[idx];
+              if (slot.state != 1) {
+                break;
+              }
+              if (slot.len <= 0 || slot.len > max_packet) {
+                slot.state = 0;
+                slot.len = 0;
+                slot.stream_id = 0;
+                slot.stream_slot = -1;
+                slot.protocol = 0;
+                local_drops += 1u;
+                local_released += 1u;
+                if (i == 0) {
+                  cursor = (cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
+                }
+                break;
+              }
+              if (packet_size == 0) {
+                packet_size = slot.len;
+              } else if (slot.len != packet_size) {
+                break;
+              }
+              afpacket_slot_ids.push_back(slot_id);
+              afpacket_stream_slots.push_back(slot.stream_slot);
+            }
+            if (afpacket_slot_ids.empty() || packet_size <= 0) {
               break;
             }
-            const int max_packet = (rt.ctrl && rt.ctrl->max_packet_bytes > 0) ? rt.ctrl->max_packet_bytes : kPersistentMaxPacketBytes;
-            if (slot.len <= 0 || slot.len > max_packet) {
-              slot.state = 0;
-              slot.len = 0;
-              slot.stream_id = 0;
-              slot.stream_slot = -1;
-              slot.protocol = 0;
-              local_drops += 1u;
-              cursor = (cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
-              continue;
+
+            const size_t batch_count = afpacket_slot_ids.size();
+            const size_t batch_bytes = static_cast<size_t>(packet_size) * batch_count;
+            if (afpacket_batch_payload.size() < batch_bytes) {
+              afpacket_batch_payload.resize(batch_bytes);
             }
+            for (size_t bi = 0; bi < batch_count; ++bi) {
+              const uint32_t slot_id = afpacket_slot_ids[bi];
+              const uint8_t* payload =
+                  rt.payload_host +
+                  ((static_cast<size_t>(q) * static_cast<size_t>(rt.ring_slots) + static_cast<size_t>(slot_id)) *
+                   static_cast<size_t>(kPersistentUmemFrameSize)) +
+                  static_cast<size_t>(kPersistentUmemHeadroom);
+              std::memcpy(
+                  afpacket_batch_payload.data() + (bi * static_cast<size_t>(packet_size)),
+                  payload,
+                  static_cast<size_t>(packet_size));
+            }
+
             int sent = 0;
             int errors = 0;
             char errbuf[160];
             errbuf[0] = '\0';
-            uint8_t* payload =
-                rt.payload_host +
-                ((static_cast<size_t>(q) * static_cast<size_t>(rt.ring_slots) + static_cast<size_t>(cursor)) *
-                 static_cast<size_t>(kPersistentUmemFrameSize)) +
-                static_cast<size_t>(kPersistentUmemHeadroom);
             const int rc = rt.tx_bridge.afpacket_send_bridge(
                 rt.tx_bridge.iface.c_str(),
-                payload,
-                static_cast<size_t>(slot.len),
-                slot.len,
-                1,
+                afpacket_batch_payload.data(),
+                batch_bytes,
+                packet_size,
+                static_cast<int>(batch_count),
                 rt.tx_bridge.afpacket_mac.data(),
                 &sent,
                 &errors,
                 errbuf,
                 sizeof(errbuf));
+            if (sent < 0) {
+              sent = 0;
+            }
+            if (sent > static_cast<int>(batch_count)) {
+              sent = static_cast<int>(batch_count);
+            }
             if (rc < 0 || sent <= 0) {
-              local_drops += 1u;
+              local_drops += static_cast<uint64_t>(batch_count);
               break;
             }
-            const int slot_idx = slot.stream_slot;
-            slot.state = 0;
-            slot.len = 0;
-            slot.stream_id = 0;
-            slot.stream_slot = -1;
-            slot.protocol = 0;
-            if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
-              rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+            for (int i = 0; i < sent; ++i) {
+              const uint32_t slot_id = afpacket_slot_ids[static_cast<size_t>(i)];
+              const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
+              PersistentRingSlot& slot = rt.rings_host[idx];
+              slot.state = 0;
+              slot.len = 0;
+              slot.stream_id = 0;
+              slot.stream_slot = -1;
+              slot.protocol = 0;
+              local_released += 1u;
+              const int32_t slot_idx = afpacket_stream_slots[static_cast<size_t>(i)];
+              if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
+                rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+              }
             }
-            drained += 1u;
+            drained += static_cast<uint64_t>(sent);
             progressed = true;
-            local_sent += 1u;
-            rt.queue_sent_counts[static_cast<size_t>(q)] += 1u;
+            local_sent += static_cast<uint64_t>(sent);
+            rt.queue_sent_counts[static_cast<size_t>(q)] += static_cast<uint64_t>(sent);
             if (rt.bridge_ipg_ns > 0) {
               const uint64_t base = (rt.bridge_next_send_ns > 0u ? rt.bridge_next_send_ns : now_ns_steady());
-              const uint64_t target = base + static_cast<uint64_t>(rt.bridge_ipg_ns);
+              const uint64_t target =
+                  base + (static_cast<uint64_t>(rt.bridge_ipg_ns) * static_cast<uint64_t>(sent));
               bridge_wait_until_ns(target);
               rt.bridge_next_send_ns = target;
             }
-            cursor = (cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
+            cursor = (cursor + static_cast<uint32_t>(sent)) % static_cast<uint32_t>(rt.ring_slots);
+            if (sent < static_cast<int>(batch_count)) {
+              break;
+            }
             continue;
           }
 
@@ -2560,6 +2917,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
           slot.stream_id = 0;
           slot.stream_slot = -1;
           slot.protocol = 0;
+          local_released += 1u;
           local_sent += 1u;
           rt.queue_sent_counts[static_cast<size_t>(q)] += 1u;
           if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
@@ -2582,6 +2940,9 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
       }
       if (local_drops > 0u) {
         host_u64_add(&rt.ctrl->ring_drop_events, local_drops);
+      }
+      if (local_released > 0u) {
+        host_u64_add(&rt.ctrl->ring_released, local_released);
       }
       if (worker == 0) {
         const int occ = ring_occupancy_now(rt);
@@ -3631,6 +3992,7 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   d.spoof_mask = spoof_mask;
   st.spoof_base_ip = spoof_base;
   st.spoof_mask = spoof_mask;
+  persistent_build_stream_template(&d);
 
   g_persistent_streams[stream_id] = std::move(st);
   *out_stream_id = stream_id;
@@ -3777,6 +4139,7 @@ extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* u
     d.ramp_epoch_counter = 0u;
   }
   st.pcap_file = json_get_string(st.update_json, "pcap_file", st.pcap_file);
+  persistent_build_stream_template(&d);
 
   st.submitted = d.produced;
   st.quota_left = d.quota_left;
