@@ -2198,6 +2198,42 @@ __device__ inline uint16_t persistent_l4_checksum(
   return static_cast<uint16_t>((~sum) & 0xFFFFu);
 }
 
+__device__ __forceinline__ uint16_t persistent_fold_ones_complement(uint64_t sum32) {
+  uint64_t acc = sum32 & 0xFFFFFFFFull;
+  while ((acc >> 16) > 0u) {
+    acc = (acc & 0xFFFFull) + (acc >> 16);
+  }
+  return static_cast<uint16_t>(acc & 0xFFFFull);
+}
+
+__device__ __forceinline__ uint16_t persistent_rfc1624_update_word(
+    uint16_t old_checksum,
+    uint16_t old_word,
+    uint16_t new_word) {
+  const uint64_t old_c = old_checksum & 0xFFFFu;
+  const uint64_t old_w = old_word & 0xFFFFu;
+  const uint64_t new_w = new_word & 0xFFFFu;
+  const uint64_t sum32 = (old_c ^ 0xFFFFu) + (old_w ^ 0xFFFFu) + new_w;
+  const uint16_t folded = persistent_fold_ones_complement(sum32);
+  return static_cast<uint16_t>((folded ^ 0xFFFFu) & 0xFFFFu);
+}
+
+__device__ __forceinline__ uint16_t persistent_rfc1624_update_dword(
+    uint16_t old_checksum,
+    uint32_t old_dword,
+    uint32_t new_dword) {
+  uint16_t csum = old_checksum;
+  csum = persistent_rfc1624_update_word(
+      csum,
+      static_cast<uint16_t>((old_dword >> 16) & 0xFFFFu),
+      static_cast<uint16_t>((new_dword >> 16) & 0xFFFFu));
+  csum = persistent_rfc1624_update_word(
+      csum,
+      static_cast<uint16_t>(old_dword & 0xFFFFu),
+      static_cast<uint16_t>(new_dword & 0xFFFFu));
+  return csum;
+}
+
 __device__ inline void persistent_write_packet(
     PersistentRingSlot* slot,
     uint8_t* payload,
@@ -2272,9 +2308,9 @@ __device__ inline void persistent_write_packet(
     payload[ip_off_t + 9] = static_cast<uint8_t>(new_ttl_proto & 0xFFu);
 
     uint16_t ip_csum = sv->template_base_ip_csum;
-    ip_csum = rfc1624_update_dword(ip_csum, sv->template_base_src_ip, src_ip);
-    ip_csum = rfc1624_update_word(ip_csum, sv->template_base_ip_id, ip_id);
-    ip_csum = rfc1624_update_word(ip_csum, sv->template_base_ttl_proto, new_ttl_proto);
+    ip_csum = persistent_rfc1624_update_dword(ip_csum, sv->template_base_src_ip, src_ip);
+    ip_csum = persistent_rfc1624_update_word(ip_csum, sv->template_base_ip_id, ip_id);
+    ip_csum = persistent_rfc1624_update_word(ip_csum, sv->template_base_ttl_proto, new_ttl_proto);
     w16(ip_off_t + 10, ip_csum);
 
     if (is_tcp) {
@@ -2282,15 +2318,15 @@ __device__ inline void persistent_write_packet(
       const uint32_t tcp_seq = seq * 2654435761u;
       w32(t_off_t + 4, tcp_seq);
       uint16_t tcp_csum = sv->template_base_l4_csum;
-      tcp_csum = rfc1624_update_dword(tcp_csum, sv->template_base_src_ip, src_ip);
-      tcp_csum = rfc1624_update_word(tcp_csum, sv->template_base_src_port, src_port);
-      tcp_csum = rfc1624_update_dword(tcp_csum, sv->template_base_tcp_seq, tcp_seq);
+      tcp_csum = persistent_rfc1624_update_dword(tcp_csum, sv->template_base_src_ip, src_ip);
+      tcp_csum = persistent_rfc1624_update_word(tcp_csum, sv->template_base_src_port, src_port);
+      tcp_csum = persistent_rfc1624_update_dword(tcp_csum, sv->template_base_tcp_seq, tcp_seq);
       w16(t_off_t + 16, tcp_csum);
     } else if (is_udp) {
       w16(t_off_t + 0, src_port);
       uint16_t udp_csum = sv->template_base_l4_csum;
-      udp_csum = rfc1624_update_dword(udp_csum, sv->template_base_src_ip, src_ip);
-      udp_csum = rfc1624_update_word(udp_csum, sv->template_base_src_port, src_port);
+      udp_csum = persistent_rfc1624_update_dword(udp_csum, sv->template_base_src_ip, src_ip);
+      udp_csum = persistent_rfc1624_update_word(udp_csum, sv->template_base_src_port, src_port);
       if (udp_csum == 0u) {
         udp_csum = 0xFFFFu;
       }
@@ -2300,7 +2336,7 @@ __device__ inline void persistent_write_packet(
       const uint16_t new_id_seq = static_cast<uint16_t>(seq & 0xFFFFu);
       w16(t_off_t + 4, new_id_seq);
       uint16_t icmp_csum = sv->template_base_l4_csum;
-      icmp_csum = rfc1624_update_word(icmp_csum, old_id_seq, new_id_seq);
+      icmp_csum = persistent_rfc1624_update_word(icmp_csum, old_id_seq, new_id_seq);
       w16(t_off_t + 2, icmp_csum);
     }
 
