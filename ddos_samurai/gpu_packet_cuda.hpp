@@ -469,6 +469,31 @@ int samurai_gpu_packet_start_stream(const char* profile_json, int64_t* out_strea
 int samurai_gpu_packet_update_stream(int64_t stream_id, const char* update_json);
 int samurai_gpu_packet_stop_stream(int64_t stream_id);
 const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id);
+typedef struct samurai_gpu_packet_stream_stats_snapshot {
+  int64_t stream_id;
+  int32_t kernel_mode;
+  int32_t runtime_active;
+  uint64_t submitted;
+  uint64_t completed;
+  uint64_t quota_left;
+  uint64_t persistent_tx_bridge_sent;
+  uint64_t persistent_produced;
+  uint64_t queue_pressure;
+  uint64_t ring_drop_events;
+  double scheduler_fairness_cv_pct;
+  uint64_t no_progress_events;
+  uint64_t persistent_runtime_restarts;
+  uint64_t quota_stall;
+  uint64_t bridge_drain_batches;
+  uint64_t bridge_drain_packets;
+  uint64_t ring_occupancy_peak;
+  uint64_t compat_fallback_count;
+  uint64_t persistent_bridge_ipg_ns;
+  uint64_t max_packet_bytes;
+} samurai_gpu_packet_stream_stats_snapshot;
+int samurai_gpu_packet_read_stream_stats_snapshot(
+    int64_t stream_id,
+    samurai_gpu_packet_stream_stats_snapshot* out_stats);
 int samurai_gpu_packet_shutdown_runtime();
 
 void samurai_gpu_packet_free(void* ptr);

@@ -2643,6 +2643,17 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
   PersistentRuntime& rt = g_persistent_runtime;
   const int workers = std::max(1, worker_count);
   const int worker = std::max(0, worker_idx);
+  std::vector<uint32_t> submit_frame_ids;
+  std::vector<uint16_t> submit_lengths;
+  std::vector<uint32_t> completion_frame_ids;
+  std::vector<uint32_t> afpacket_slot_ids;
+  std::vector<int32_t> afpacket_stream_slots;
+  std::vector<uint8_t> afpacket_batch_payload;
+  submit_frame_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
+  submit_lengths.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
+  completion_frame_ids.resize(static_cast<size_t>(std::max(64, rt.bridge_max_burst)));
+  afpacket_slot_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
+  afpacket_stream_slots.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
   while (rt.threads_running.load(std::memory_order_relaxed)) {
     bool progressed = false;
     uint64_t local_sent = 0u;
@@ -2657,17 +2668,6 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
         }
         const uint64_t t0 = now_ns_steady();
         uint64_t drained = 0;
-        std::vector<uint32_t> submit_frame_ids;
-        std::vector<uint16_t> submit_lengths;
-        std::vector<uint32_t> completion_frame_ids;
-        std::vector<uint32_t> afpacket_slot_ids;
-        std::vector<int32_t> afpacket_stream_slots;
-        std::vector<uint8_t> afpacket_batch_payload;
-        submit_frame_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
-        submit_lengths.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
-        completion_frame_ids.resize(static_cast<size_t>(std::max(64, rt.bridge_max_burst)));
-        afpacket_slot_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
-        afpacket_stream_slots.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
         while (drained < static_cast<uint64_t>(std::max(1, rt.bridge_max_burst))) {
           if (rt.bridge_drain_budget_ns > 0) {
             const uint64_t elapsed = now_ns_steady() - t0;
@@ -4215,6 +4215,60 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
   }
   g_stream_stats_json = stream_state_to_json(it->second);
   return g_stream_stats_json.c_str();
+}
+
+extern "C" int samurai_gpu_packet_read_stream_stats_snapshot(
+    int64_t stream_id,
+    samurai_gpu_packet_stream_stats_snapshot* out_stats) {
+  if (!out_stats) {
+    return set_c_api_error("out_stats must not be null");
+  }
+  std::memset(out_stats, 0, sizeof(*out_stats));
+  out_stats->stream_id = stream_id;
+  out_stats->kernel_mode = g_kernel_mode.load(std::memory_order_relaxed);
+
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  const bool rt_active = (g_persistent_runtime.ctrl != nullptr);
+  out_stats->runtime_active = rt_active ? 1 : 0;
+  if (rt_active) {
+    out_stats->persistent_tx_bridge_sent = g_persistent_runtime.ctrl->tx_bridge_sent;
+    out_stats->persistent_produced = g_persistent_runtime.ctrl->produced;
+    out_stats->queue_pressure = g_persistent_runtime.ctrl->queue_pressure;
+    out_stats->ring_drop_events = g_persistent_runtime.ctrl->ring_drop_events;
+    out_stats->scheduler_fairness_cv_pct =
+        static_cast<double>(g_persistent_runtime.ctrl->scheduler_fairness_cv_pct_x100) / 100.0;
+    out_stats->no_progress_events = g_persistent_runtime.ctrl->no_progress_events;
+    out_stats->persistent_runtime_restarts = g_persistent_runtime.ctrl->runtime_restarts;
+    out_stats->quota_stall = g_persistent_runtime.ctrl->quota_stall;
+    out_stats->bridge_drain_batches = g_persistent_runtime.ctrl->bridge_drain_batches;
+    out_stats->bridge_drain_packets = g_persistent_runtime.ctrl->bridge_drain_packets;
+    out_stats->ring_occupancy_peak = g_persistent_runtime.ctrl->ring_occupancy_peak;
+    out_stats->persistent_bridge_ipg_ns = static_cast<uint64_t>(g_persistent_runtime.bridge_ipg_ns);
+    out_stats->max_packet_bytes = static_cast<uint64_t>(g_persistent_runtime.ctrl->max_packet_bytes);
+  } else {
+    out_stats->persistent_bridge_ipg_ns = static_cast<uint64_t>(g_persistent_runtime.bridge_ipg_ns);
+    out_stats->max_packet_bytes = static_cast<uint64_t>(kPersistentMaxPacketBytes);
+  }
+  out_stats->compat_fallback_count = g_compat_fallback_count.load(std::memory_order_relaxed);
+
+  if (stream_id != 0) {
+    auto it = g_persistent_streams.find(stream_id);
+    if (it == g_persistent_streams.end()) {
+      return set_c_api_error("stream_id not found");
+    }
+    const auto& st = it->second;
+    out_stats->submitted = st.submitted;
+    out_stats->completed = st.completed;
+    out_stats->quota_left = st.quota_left;
+    if (st.device_slot >= 0 && st.device_slot < kPersistentMaxStreams && g_persistent_runtime.streams) {
+      const PersistentDeviceStreamState& d = g_persistent_runtime.streams[st.device_slot];
+      out_stats->submitted = static_cast<uint64_t>(d.produced);
+      out_stats->quota_left = static_cast<uint64_t>(d.quota_left);
+    }
+  }
+
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
 }
 
 extern "C" int samurai_gpu_packet_shutdown_runtime() {
