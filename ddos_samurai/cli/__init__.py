@@ -10,6 +10,7 @@ from .reporting import build_loss_summary as _build_loss_summary
 from .validation import (
     _preflight_l7_capabilities,
     _preflight_lab_profile,
+    _preflight_persistent_tx_backend,
     _validate_hybrid_cuda_args,
     _validate_pacing_args,
     _validate_sender_route_args,
@@ -22,6 +23,7 @@ __all__ = [
     "_validate_hybrid_cuda_args",
     "_validate_sender_route_args",
     "_preflight_lab_profile",
+    "_preflight_persistent_tx_backend",
     "_preflight_l7_capabilities",
     "_resolve_profile_args",
     "_is_cuda_raw_vector",

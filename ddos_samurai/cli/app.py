@@ -17,6 +17,7 @@ from .runtime import run_live_mode
 from .validation import (
     _preflight_l7_capabilities,
     _preflight_lab_profile,
+    _preflight_persistent_tx_backend,
     _validate_hybrid_cuda_args,
     _validate_pacing_args,
     _validate_sender_route_args,
@@ -45,6 +46,7 @@ def main(argv=None):
     _validate_hybrid_cuda_args(parser, args)
     _validate_sender_route_args(parser, args)
     _preflight_lab_profile(parser, args)
+    _preflight_persistent_tx_backend(parser, args)
     _preflight_l7_capabilities(parser, args)
 
     traffic_model_mode = str(getattr(args, "traffic_model", "none") or "none").strip().lower()
