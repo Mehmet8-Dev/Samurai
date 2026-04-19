@@ -1,3 +1,42 @@
+__device__ __forceinline__ void copy_packet_bytes_vectorized(
+    uint8_t* dst,
+    const uint8_t* src,
+    int64_t nbytes) {
+  if (nbytes <= 0) {
+    return;
+  }
+  int64_t i = 0;
+  const uintptr_t align_mask = reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src);
+  if ((align_mask & 0x0F) == 0) {
+    auto* d16 = reinterpret_cast<uint4*>(dst);
+    auto* s16 = reinterpret_cast<const uint4*>(src);
+    const int64_t n16 = nbytes / 16;
+    for (int64_t j = 0; j < n16; ++j) {
+      d16[j] = s16[j];
+    }
+    i = n16 * 16;
+  } else if ((align_mask & 0x07) == 0) {
+    auto* d8 = reinterpret_cast<unsigned long long*>(dst);
+    auto* s8 = reinterpret_cast<const unsigned long long*>(src);
+    const int64_t n8 = nbytes / 8;
+    for (int64_t j = 0; j < n8; ++j) {
+      d8[j] = s8[j];
+    }
+    i = n8 * 8;
+  } else if ((align_mask & 0x03) == 0) {
+    auto* d4 = reinterpret_cast<uint32_t*>(dst);
+    auto* s4 = reinterpret_cast<const uint32_t*>(src);
+    const int64_t n4 = nbytes / 4;
+    for (int64_t j = 0; j < n4; ++j) {
+      d4[j] = s4[j];
+    }
+    i = n4 * 4;
+  }
+  for (; i < nbytes; ++i) {
+    dst[i] = src[i];
+  }
+}
+
 __global__ void template_kernel(
     uint8_t* packets_buffer,
     const uint8_t* template_global,
@@ -19,12 +58,17 @@ __global__ void template_kernel(
   curandStatePhilox4_32_10_t local_state = rng_states[idx];
   int64_t offset = idx * packet_size;
 
-  for (int64_t i = 0; i < packet_size; ++i) {
-    if (use_constant == 1 && i < TEMPLATE_CONST_MAX) {
-      packets_buffer[offset + i] = TEMPLATE_CONST_DEV[i];
-    } else {
-      packets_buffer[offset + i] = template_global[i];
+  if (use_constant == 1) {
+    const int64_t const_len = (packet_size < TEMPLATE_CONST_MAX) ? packet_size : TEMPLATE_CONST_MAX;
+    copy_packet_bytes_vectorized(packets_buffer + offset, TEMPLATE_CONST_DEV, const_len);
+    if (packet_size > const_len) {
+      copy_packet_bytes_vectorized(
+          packets_buffer + offset + const_len,
+          template_global + const_len,
+          packet_size - const_len);
     }
+  } else {
+    copy_packet_bytes_vectorized(packets_buffer + offset, template_global, packet_size);
   }
 
   int64_t ip_offset = 0;
@@ -123,16 +167,18 @@ __global__ void pool_kernel(
   int64_t template_offset = template_idx * packet_size;
 
   if (use_constant == 1 && template_offset + packet_size <= POOL_CONST_MAX) {
-    for (int64_t i = 0; i < packet_size; ++i) {
-      packets_buffer[offset + i] = POOL_CONST_DEV[template_offset + i];
-    }
+    copy_packet_bytes_vectorized(
+        packets_buffer + offset,
+        POOL_CONST_DEV + template_offset,
+        packet_size);
   } else {
     if (template_offset + packet_size > templates_global_len) {
       return;
     }
-    for (int64_t i = 0; i < packet_size; ++i) {
-      packets_buffer[offset + i] = templates_global[template_offset + i];
-    }
+    copy_packet_bytes_vectorized(
+        packets_buffer + offset,
+        templates_global + template_offset,
+        packet_size);
   }
 
   int64_t ip_offset = 0;
@@ -261,16 +307,18 @@ __global__ void stateful_pool_kernel(
   int64_t template_offset = template_idx * packet_size;
 
   if (use_constant == 1 && template_offset + packet_size <= POOL_CONST_MAX) {
-    for (int64_t i = 0; i < packet_size; ++i) {
-      packets_buffer[offset + i] = POOL_CONST_DEV[template_offset + i];
-    }
+    copy_packet_bytes_vectorized(
+        packets_buffer + offset,
+        POOL_CONST_DEV + template_offset,
+        packet_size);
   } else {
     if (template_offset + packet_size > templates_global_len) {
       return;
     }
-    for (int64_t i = 0; i < packet_size; ++i) {
-      packets_buffer[offset + i] = templates_global[template_offset + i];
-    }
+    copy_packet_bytes_vectorized(
+        packets_buffer + offset,
+        templates_global + template_offset,
+        packet_size);
   }
 
   int64_t ip_offset;
@@ -412,4 +460,3 @@ __global__ void stateful_pool_kernel(
 
   rng_states[idx] = local_state;
 }
-
