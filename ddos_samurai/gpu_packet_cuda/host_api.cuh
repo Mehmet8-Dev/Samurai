@@ -3226,9 +3226,41 @@ inline bool persistent_runtime_ensure_started_unlocked() {
       return defv;
     }
   };
-  rt.queue_count = clamp_i(env_int_local("SAMURAI_GPU_QUEUE_COUNT", 1), 1, 64);
-  rt.ring_slots = clamp_i(env_int_local("SAMURAI_GPU_RING_SLOTS", 2048), 64, 65536);
-  rt.ring_slots = std::min(rt.ring_slots, 4096);
+  auto env_has = [](const char* name) -> bool {
+    const char* v = std::getenv(name);
+    return (v && *v);
+  };
+  auto round_up_pow2 = [](int v, int cap) -> int {
+    if (v <= 1) {
+      return 1;
+    }
+    int p = 1;
+    while (p < v && p < cap) {
+      p <<= 1;
+    }
+    if (p > cap) {
+      p = cap;
+    }
+    return p;
+  };
+
+  const int hw_threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+  cudaDeviceProp dev_prop{};
+  std::memset(&dev_prop, 0, sizeof(dev_prop));
+  int dev_id = 0;
+  int gpu_sms = 0;
+  if (cudaGetDevice(&dev_id) == cudaSuccess && cudaGetDeviceProperties(&dev_prop, dev_id) == cudaSuccess) {
+    gpu_sms = std::max(1, dev_prop.multiProcessorCount);
+  } else {
+    gpu_sms = 1;
+  }
+
+  int auto_queue_count = std::max(hw_threads / 4, gpu_sms / 12);
+  auto_queue_count = clamp_i(auto_queue_count, 1, 16);
+  rt.queue_count = env_has("SAMURAI_GPU_QUEUE_COUNT")
+      ? clamp_i(env_int_local("SAMURAI_GPU_QUEUE_COUNT", auto_queue_count), 1, 64)
+      : auto_queue_count;
+
   rt.epoch_ms = clamp_i(env_int_local("SAMURAI_GPU_EPOCH_MS", 50), 1, 5000);
   rt.heartbeat_ms = clamp_i(env_int_local("SAMURAI_GPU_HEARTBEAT_MS", 500), 10, 10000);
   rt.no_progress_ms = clamp_i(env_int_local("SAMURAI_GPU_NO_PROGRESS_MS", 2000), 100, 60000);
@@ -3236,7 +3268,11 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   rt.bridge_idle_sleep_us = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_IDLE_SLEEP_US", 200), 0, 100000);
   rt.bridge_drain_budget_ns = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_DRAIN_BUDGET_NS", 200000), 1000, 100000000);
   rt.bridge_ipg_ns = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_IPG_NS", 0), 0, 1000000000);
-  rt.bridge_thread_count = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_THREADS", rt.queue_count), 1, 64);
+  int auto_bridge_threads = std::max(1, hw_threads / 6);
+  auto_bridge_threads = std::min(auto_bridge_threads, std::max(1, rt.queue_count));
+  rt.bridge_thread_count = env_has("SAMURAI_GPU_BRIDGE_THREADS")
+      ? clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_THREADS", auto_bridge_threads), 1, 64)
+      : auto_bridge_threads;
   if (rt.bridge_thread_count > rt.queue_count) {
     rt.bridge_thread_count = rt.queue_count;
   }
@@ -3244,6 +3280,27 @@ inline bool persistent_runtime_ensure_started_unlocked() {
     // Keep deterministic pacing order when inter-packet gap pacing is enabled.
     rt.bridge_thread_count = 1;
   }
+  int auto_ring_slots = 2048 + (rt.queue_count * 512) + (rt.bridge_thread_count * 256);
+  if (gpu_sms >= 80) {
+    auto_ring_slots += 2048;
+  } else if (gpu_sms >= 40) {
+    auto_ring_slots += 1024;
+  }
+  auto_ring_slots = round_up_pow2(auto_ring_slots, 65536);
+  const uint64_t ring_budget_mb = static_cast<uint64_t>(
+      std::max(32, env_int_local("SAMURAI_GPU_RING_BUDGET_MB", 256)));
+  const uint64_t ring_budget_bytes = ring_budget_mb * 1024ull * 1024ull;
+  const uint64_t bytes_per_slot =
+      static_cast<uint64_t>(kPersistentUmemFrameSize) + static_cast<uint64_t>(sizeof(PersistentRingSlot));
+  int budget_slots = static_cast<int>(
+      ring_budget_bytes /
+      (static_cast<uint64_t>(std::max(1, rt.queue_count)) * std::max<uint64_t>(1ull, bytes_per_slot)));
+  budget_slots = clamp_i(budget_slots, 64, 65536);
+  auto_ring_slots = std::min(auto_ring_slots, budget_slots);
+  auto_ring_slots = clamp_i(auto_ring_slots, 64, 65536);
+  rt.ring_slots = env_has("SAMURAI_GPU_RING_SLOTS")
+      ? clamp_i(env_int_local("SAMURAI_GPU_RING_SLOTS", auto_ring_slots), 64, 65536)
+      : auto_ring_slots;
   rt.bridge_next_send_ns = 0u;
   const int mtu_bytes = clamp_i(env_int_local("SAMURAI_GPU_PERSISTENT_MTU", kPersistentDefaultMtu), 576, 9000);
   const int frame_cap = kPersistentUmemFrameSize - kPersistentUmemHeadroom;
