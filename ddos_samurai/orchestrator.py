@@ -2763,7 +2763,7 @@ async def worker_process(
                     else:
                         stream_quota = max(1, min(BATCH_SIZE, total_count))
 
-                    baseline_runtime_stats = gpu_packet.read_stream_stats(0) or {}
+                    baseline_runtime_stats = gpu_packet.read_stream_stats_snapshot(0) or {}
                     bridge_sent_baseline = int(baseline_runtime_stats.get("persistent_tx_bridge_sent", 0) or 0)
                     produced_baseline = int(baseline_runtime_stats.get("persistent_produced", 0) or 0)
 
@@ -2786,6 +2786,8 @@ async def worker_process(
                     stream_id = int(gpu_packet.start_stream(stream_profile))
 
                     sent_via_stream = 0
+                    last_quota_update = int(stream_quota)
+                    last_weight_update = 1
                     no_progress_ticks = 0
                     last_sent = -1
                     poll_interval_s = max(0.01, min(0.20, float(epoch_ms) / 1000.0 / 2.0))
@@ -2800,16 +2802,15 @@ async def worker_process(
                     mitigation_cooldown_s = 0.25
 
                     while sent_via_stream < total_count and time.time() < deadline:
-                        st = gpu_packet.read_stream_stats(stream_id) or {}
-                        rt = gpu_packet.read_stream_stats(0) or {}
-                        stream_submitted = int(st.get("submitted", 0) or 0)
-                        runtime_bridge_sent = int(rt.get("persistent_tx_bridge_sent", 0) or 0) - bridge_sent_baseline
-                        runtime_produced = int(rt.get("persistent_produced", 0) or 0) - produced_baseline
+                        snap = gpu_packet.read_stream_stats_snapshot(stream_id) or {}
+                        stream_submitted = int(snap.get("submitted", 0) or 0)
+                        runtime_bridge_sent = int(snap.get("persistent_tx_bridge_sent", 0) or 0) - bridge_sent_baseline
+                        runtime_produced = int(snap.get("persistent_produced", 0) or 0) - produced_baseline
                         sent_via_stream = max(0, min(total_count, max(stream_submitted, runtime_bridge_sent, runtime_produced)))
-                        rt_qpress = int(rt.get("queue_pressure", 0) or 0)
-                        rt_ring_drop = int(rt.get("ring_drop_events", 0) or 0)
-                        rt_fairness = float(rt.get("scheduler_fairness_cv_pct", 0.0) or 0.0)
-                        rt_no_progress = int(rt.get("no_progress_events", 0) or 0)
+                        rt_qpress = int(snap.get("queue_pressure", 0) or 0)
+                        rt_ring_drop = int(snap.get("ring_drop_events", 0) or 0)
+                        rt_fairness = float(snap.get("scheduler_fairness_cv_pct", 0.0) or 0.0)
+                        rt_no_progress = int(snap.get("no_progress_events", 0) or 0)
 
                         if sent_via_stream == last_sent:
                             no_progress_ticks += 1
@@ -2820,6 +2821,8 @@ async def worker_process(
                         if sent_via_stream >= total_count:
                             break
 
+                        mitigation = {}
+                        mitigation_due = False
                         alarm_hit = (
                             (rt_qpress > qpress_slo_max)
                             or (rt_ring_drop > ring_drop_slo_max)
@@ -2830,7 +2833,6 @@ async def worker_process(
                             worker_stats["gpu_slo_alarm_count"] = int(worker_stats.get("gpu_slo_alarm_count", 0) or 0) + 1
                             now_ts = time.time()
                             if slo_policy != "off" and (now_ts - last_mitigation_ts) >= mitigation_cooldown_s:
-                                mitigation = {}
                                 if rt_qpress > qpress_slo_max or rt_ring_drop > ring_drop_slo_max:
                                     stream_quota = max(1, int(stream_quota * 0.75))
                                     mitigation["quota"] = int(stream_quota)
@@ -2843,17 +2845,7 @@ async def worker_process(
                                     mitigation["quota"] = int(stream_quota)
                                     poll_interval_s = min(0.30, poll_interval_s * 1.25)
                                 if mitigation:
-                                    gpu_packet.update_stream(stream_id, mitigation)
-                                    worker_stats["gpu_slo_mitigation_count"] = int(worker_stats.get("gpu_slo_mitigation_count", 0) or 0) + 1
-                                    last_mitigation_ts = now_ts
-                                    log_warning(
-                                        f"[Worker {worker_id}] persistent SLO alarm:"
-                                        f" queue_pressure={rt_qpress}/{qpress_slo_max}"
-                                        f" ring_drop_events={rt_ring_drop}/{ring_drop_slo_max}"
-                                        f" fairness_cv={rt_fairness:.2f}/{fairness_slo_max:.2f}"
-                                        f" no_progress_events={rt_no_progress}/{no_progress_slo_max}"
-                                        f" mitigation={mitigation}"
-                                    )
+                                    mitigation_due = True
                                 if rt_no_progress > max(no_progress_slo_max * 2, no_progress_slo_max + 2):
                                     raise RuntimeError(
                                         "persistent stream SLO hard-fail: no_progress_events exceeded hard limit"
@@ -2861,7 +2853,34 @@ async def worker_process(
 
                         remaining_now = max(0, total_count - sent_via_stream)
                         next_quota = max(1, min(stream_quota, remaining_now))
-                        gpu_packet.update_stream(stream_id, {"quota": int(next_quota)})
+                        desired_update = dict(mitigation)
+                        desired_update["quota"] = int(next_quota)
+                        send_update = False
+                        if "quota" in desired_update:
+                            next_q = int(desired_update.get("quota", 0) or 0)
+                            if next_q != last_quota_update:
+                                send_update = True
+                        if "weight" in desired_update:
+                            next_w = int(desired_update.get("weight", 1) or 1)
+                            if next_w != last_weight_update:
+                                send_update = True
+                        if send_update:
+                            gpu_packet.update_stream(stream_id, desired_update)
+                            if "quota" in desired_update:
+                                last_quota_update = int(desired_update["quota"])
+                            if "weight" in desired_update:
+                                last_weight_update = int(desired_update["weight"])
+                            if mitigation_due:
+                                worker_stats["gpu_slo_mitigation_count"] = int(worker_stats.get("gpu_slo_mitigation_count", 0) or 0) + 1
+                                last_mitigation_ts = time.time()
+                                log_warning(
+                                    f"[Worker {worker_id}] persistent SLO alarm:"
+                                    f" queue_pressure={rt_qpress}/{qpress_slo_max}"
+                                    f" ring_drop_events={rt_ring_drop}/{ring_drop_slo_max}"
+                                    f" fairness_cv={rt_fairness:.2f}/{fairness_slo_max:.2f}"
+                                    f" no_progress_events={rt_no_progress}/{no_progress_slo_max}"
+                                    f" mitigation={desired_update}"
+                                )
 
                         if no_progress_ticks >= max(20, int(2.0 / poll_interval_s)):
                             raise RuntimeError("persistent stream stalled (no progress)")
@@ -2879,7 +2898,7 @@ async def worker_process(
                     worker_stats["gpu_packet_native_active"] = 1
 
                     try:
-                        rt_final = gpu_packet.read_stream_stats(0) or {}
+                        rt_final = gpu_packet.read_stream_stats_snapshot(0) or {}
                     except Exception:
                         rt_final = {}
                     for _k in (

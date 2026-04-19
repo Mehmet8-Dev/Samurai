@@ -116,6 +116,10 @@ def read_stream_stats(stream_id=None):
     return _backend_call("read_stream_stats", stream_id)
 
 
+def read_stream_stats_snapshot(stream_id=None):
+    return _backend_call("read_stream_stats_snapshot", stream_id)
+
+
 def shutdown_persistent_runtime():
     return _backend_call("shutdown_persistent_runtime")
 

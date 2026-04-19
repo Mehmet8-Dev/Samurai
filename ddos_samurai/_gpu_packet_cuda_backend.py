@@ -69,6 +69,31 @@ _KERNEL_MODE_NAME_TO_CODE = {"batch": 0, "persistent": 1}
 _KERNEL_MODE_CODE_TO_NAME = {0: "batch", 1: "persistent"}
 
 
+class _PersistentStatsSnapshot(ctypes.Structure):
+    _fields_ = [
+        ("stream_id", ctypes.c_int64),
+        ("kernel_mode", ctypes.c_int32),
+        ("runtime_active", ctypes.c_int32),
+        ("submitted", ctypes.c_uint64),
+        ("completed", ctypes.c_uint64),
+        ("quota_left", ctypes.c_uint64),
+        ("persistent_tx_bridge_sent", ctypes.c_uint64),
+        ("persistent_produced", ctypes.c_uint64),
+        ("queue_pressure", ctypes.c_uint64),
+        ("ring_drop_events", ctypes.c_uint64),
+        ("scheduler_fairness_cv_pct", ctypes.c_double),
+        ("no_progress_events", ctypes.c_uint64),
+        ("persistent_runtime_restarts", ctypes.c_uint64),
+        ("quota_stall", ctypes.c_uint64),
+        ("bridge_drain_batches", ctypes.c_uint64),
+        ("bridge_drain_packets", ctypes.c_uint64),
+        ("ring_occupancy_peak", ctypes.c_uint64),
+        ("compat_fallback_count", ctypes.c_uint64),
+        ("persistent_bridge_ipg_ns", ctypes.c_uint64),
+        ("max_packet_bytes", ctypes.c_uint64),
+    ]
+
+
 def _native_telemetry_inc(key: str, delta: int = 1) -> None:
     if key not in _NATIVE_GENERATION_TELEMETRY:
         return
@@ -317,6 +342,12 @@ def _load_lib() -> ctypes.CDLL | None:
         lib.samurai_gpu_packet_stop_stream.restype = ctypes.c_int
         lib.samurai_gpu_packet_read_stream_stats.argtypes = [ctypes.c_int64]
         lib.samurai_gpu_packet_read_stream_stats.restype = ctypes.c_char_p
+        if hasattr(lib, "samurai_gpu_packet_read_stream_stats_snapshot"):
+            lib.samurai_gpu_packet_read_stream_stats_snapshot.argtypes = [
+                ctypes.c_int64,
+                ctypes.POINTER(_PersistentStatsSnapshot),
+            ]
+            lib.samurai_gpu_packet_read_stream_stats_snapshot.restype = ctypes.c_int
         lib.samurai_gpu_packet_shutdown_runtime.argtypes = []
         lib.samurai_gpu_packet_shutdown_runtime.restype = ctypes.c_int
     except Exception:
@@ -739,6 +770,71 @@ def read_stream_stats(stream_id: int | None = None) -> dict:
         return out
     except Exception:
         return {"raw": text}
+
+
+def read_stream_stats_snapshot(stream_id: int | None = None) -> dict:
+    if not _native_ready():
+        _raise_native_policy_violation("read_stream_stats_snapshot")
+    if not _supports_stream_lifecycle():
+        raise GPUPacketError("native stream lifecycle API unavailable")
+    stream_id_i = int(stream_id or 0)
+    if hasattr(_LIB, "samurai_gpu_packet_read_stream_stats_snapshot"):
+        snap = _PersistentStatsSnapshot()
+        rc = int(
+            _LIB.samurai_gpu_packet_read_stream_stats_snapshot(
+                ctypes.c_int64(stream_id_i),
+                ctypes.byref(snap),
+            )
+            or 0
+        )
+        if rc == 0:
+            return {
+                "stream_id": int(snap.stream_id),
+                "gpu_kernel_mode_active": int(snap.kernel_mode),
+                "runtime_active": int(snap.runtime_active),
+                "submitted": int(snap.submitted),
+                "completed": int(snap.completed),
+                "quota_left": int(snap.quota_left),
+                "persistent_tx_bridge_sent": int(snap.persistent_tx_bridge_sent),
+                "persistent_produced": int(snap.persistent_produced),
+                "queue_pressure": int(snap.queue_pressure),
+                "ring_drop_events": int(snap.ring_drop_events),
+                "scheduler_fairness_cv_pct": float(snap.scheduler_fairness_cv_pct),
+                "no_progress_events": int(snap.no_progress_events),
+                "persistent_runtime_restarts": int(snap.persistent_runtime_restarts),
+                "quota_stall": int(snap.quota_stall),
+                "bridge_drain_batches": int(snap.bridge_drain_batches),
+                "bridge_drain_packets": int(snap.bridge_drain_packets),
+                "ring_occupancy_peak": int(snap.ring_occupancy_peak),
+                "compat_fallback_count": int(snap.compat_fallback_count),
+                "persistent_bridge_ipg_ns": int(snap.persistent_bridge_ipg_ns),
+                "max_packet_bytes": int(snap.max_packet_bytes),
+            }
+    # Backward compatibility path for older native library builds.
+    if stream_id_i == 0:
+        return read_stream_stats(0)
+    out = dict(read_stream_stats(stream_id_i) or {})
+    rt = dict(read_stream_stats(0) or {})
+    if rt:
+        out.update(
+            {
+                "persistent_tx_bridge_sent": int(rt.get("persistent_tx_bridge_sent", 0) or 0),
+                "persistent_produced": int(rt.get("persistent_produced", 0) or 0),
+                "queue_pressure": int(rt.get("queue_pressure", 0) or 0),
+                "ring_drop_events": int(rt.get("ring_drop_events", 0) or 0),
+                "scheduler_fairness_cv_pct": float(rt.get("scheduler_fairness_cv_pct", 0.0) or 0.0),
+                "no_progress_events": int(rt.get("no_progress_events", 0) or 0),
+                "persistent_runtime_restarts": int(rt.get("persistent_runtime_restarts", 0) or 0),
+                "quota_stall": int(rt.get("quota_stall", 0) or 0),
+                "bridge_drain_batches": int(rt.get("bridge_drain_batches", 0) or 0),
+                "bridge_drain_packets": int(rt.get("bridge_drain_packets", 0) or 0),
+                "ring_occupancy_peak": int(rt.get("ring_occupancy_peak", 0) or 0),
+                "compat_fallback_count": int(rt.get("compat_fallback_count", 0) or 0),
+                "persistent_bridge_ipg_ns": int(rt.get("persistent_bridge_ipg_ns", 0) or 0),
+                "max_packet_bytes": int(rt.get("max_packet_bytes", 0) or 0),
+            }
+        )
+    return out
 
 
 def shutdown_persistent_runtime() -> None:
