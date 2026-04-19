@@ -180,6 +180,63 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
         self.assertEqual(out.status, "warn")
         self.assertEqual(out.hard_fail, 0)
 
+    def test_persistent_stream_strict_fails_on_noop_backend(self):
+        results = self._base_results()
+        results.update(
+            {
+                "gpu_kernel_mode": "persistent",
+                "gpu_stream_api_mode": "stream",
+                "persistent_tx_backend_strict": 1,
+                "persistent_tx_backend": "noop",
+                "persistent_tx_iface": "",
+                "persistent_tx_bridge_sent": 0,
+                "persistent_produced": 0,
+                "queue_pressure": 0,
+                "quota_stall": 0,
+                "ring_occupancy_peak": 0,
+                "persistent_runtime_restarts": 0,
+                "no_progress_events": 0,
+                "compat_fallback_count": 0,
+                "bridge_drain_batches": 0,
+                "bridge_drain_packets": 0,
+                "ring_drop_events": 0,
+                "scheduler_fairness_cv_pct": 0.0,
+                "persistent_bridge_ipg_ns": 0,
+            }
+        )
+        out = kpi_gate.evaluate(results, profile="persistent_stream_strict", hard_fail=True)
+        self.assertEqual(out.status, "fail")
+        self.assertEqual(out.hard_fail, 1)
+        self.assertTrue(any(v.startswith("persistent_tx_backend:") for v in out.violations))
+
+    def test_persistent_stream_strict_passes_with_real_backend(self):
+        results = self._base_results()
+        results.update(
+            {
+                "gpu_kernel_mode": "persistent",
+                "gpu_stream_api_mode": "stream",
+                "persistent_tx_backend_strict": 1,
+                "persistent_tx_backend": "af_xdp",
+                "persistent_tx_iface": "eth0",
+                "persistent_tx_bridge_sent": 128,
+                "persistent_produced": 128,
+                "queue_pressure": 0,
+                "quota_stall": 0,
+                "ring_occupancy_peak": 12,
+                "persistent_runtime_restarts": 0,
+                "no_progress_events": 0,
+                "compat_fallback_count": 0,
+                "bridge_drain_batches": 2,
+                "bridge_drain_packets": 64,
+                "ring_drop_events": 0,
+                "scheduler_fairness_cv_pct": 10.0,
+                "persistent_bridge_ipg_ns": 500,
+            }
+        )
+        out = kpi_gate.evaluate(results, profile="persistent_stream_strict", hard_fail=True)
+        self.assertEqual(out.status, "pass")
+        self.assertEqual(out.hard_fail, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

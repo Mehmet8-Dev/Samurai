@@ -2,6 +2,7 @@ import unittest
 import sys
 import os
 import random
+import numpy as np
 
 try:
     import pytest
@@ -86,11 +87,11 @@ class TestGPUModules(unittest.TestCase):
             self.assertIsNotNone(packets)
             self.assertGreater(size, 0)
             
-            # Verify data is on device
-            self.assertTrue(isinstance(packets, cp.ndarray))
-            
-            # Basic sanity check on CPU copy
-            cpu_packets = packets.get()
+            # New default is host-ready; accept both host ndarray and device ndarray.
+            self.assertTrue(isinstance(packets, (cp.ndarray, np.ndarray)))
+
+            # Basic sanity check on CPU copy (supports both backends).
+            cpu_packets = packets.get() if hasattr(packets, "get") else np.asarray(packets, dtype=np.uint8)
             self.assertEqual(len(cpu_packets), count * size)
             
         except Exception as e:

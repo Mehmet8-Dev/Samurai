@@ -327,6 +327,16 @@ class TestCPU_RFC793_TCP(unittest.TestCase):
             p = self._tcp(tcp_flags=flags, payload=b"test" if "P" in flags else None)
             self.assertTrue(_tcp_cksum_valid(p), f"TCP cksum invalid for flags={flags}")
 
+    @_score("RFC 793", "TCP checksum validates for deterministic payload matrix", 2)
+    def test_tcp_checksum_payload_matrix(self):
+        payloads = (b"", b"A", b"ABCD", b"payload-1234567890")
+        for payload in payloads:
+            p = self._tcp(tcp_flags="PA", payload=payload)
+            self.assertTrue(_tcp_cksum_valid(p), f"TCP cksum invalid for payload_len={len(payload)}")
+            ihl = (p[0] & 0xF) * 4
+            doff = (struct.unpack("!H", p[ihl + 12:ihl + 14])[0] >> 12) * 4
+            self.assertEqual(struct.unpack("!H", p[2:4])[0], ihl + doff + len(payload))
+
     @_score("RFC 793", "Window size > 0")
     def test_window(self):
         p = self._tcp()
@@ -385,6 +395,16 @@ class TestCPU_RFC768_UDP(unittest.TestCase):
     def test_udp_checksum(self):
         p = create_packet(PacketConfig("8.8.8.8", 53, protocol="udp", payload=b"hello"))
         self.assertTrue(_udp_cksum_valid(p))
+
+    @_score("RFC 768", "UDP checksum/length deterministic payload matrix", 2)
+    def test_udp_checksum_payload_matrix(self):
+        payloads = (b"", b"\x00", b"abc", b"0123456789abcdef")
+        for payload in payloads:
+            p = create_packet(PacketConfig("8.8.8.8", 53, protocol="udp", payload=payload))
+            ihl = (p[0] & 0xF) * 4
+            udp_len = struct.unpack("!H", p[ihl + 4:ihl + 6])[0]
+            self.assertEqual(udp_len, 8 + len(payload))
+            self.assertTrue(_udp_cksum_valid(p), f"UDP cksum invalid for payload_len={len(payload)}")
 
 
 class TestCPU_RFC792_ICMP(unittest.TestCase):
@@ -445,6 +465,16 @@ class TestCPU_RFC894_Ethernet(unittest.TestCase):
         p = create_packet(PacketConfig("10.0.0.1", 80))
         framed = add_ethernet_frame(p)
         self.assertEqual(len(framed), 14 + len(p))
+
+    @_score("RFC 894", "Custom source/destination MAC policy preserved")
+    def test_custom_mac_policy(self):
+        p = create_packet(PacketConfig("10.0.0.1", 80))
+        dst_mac = bytes.fromhex("001122334455")
+        src_mac = bytes.fromhex("aabbccddeeff")
+        framed = add_ethernet_frame(p, dst_mac=dst_mac, src_mac=src_mac)
+        self.assertEqual(framed[:6], dst_mac)
+        self.assertEqual(framed[6:12], src_mac)
+        self.assertEqual(struct.unpack("!H", framed[12:14])[0], 0x0800)
 
 
 class TestCPU_RFC1071_Checksum(unittest.TestCase):

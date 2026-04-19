@@ -795,3 +795,57 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(rr.results["runtime_transport_service"], "native_custom_tcp_runtime_service")
         self.assertEqual(rr.results["runtime_transport_contract"], "custom_tcp_runtime_bridge")
         self.assertEqual(rr.results["runtime_transport_poll_calls"], 3)
+
+    def test_live_attack_report_surfaces_persistent_runtime_metrics(self):
+        from ddos_samurai import reporting
+
+        rr = reporting.build_live_attack_report(
+            args={"target": "127.0.0.1"},
+            worker_events=[
+                {
+                    "status": "ok",
+                    "attack_vector": "basic",
+                    "compute_backend": "cuda",
+                    "sender_path": "C_EXT_L3",
+                    "gpu_kernel_mode": "persistent",
+                    "gpu_stream_api_mode": "stream",
+                    "persistent_runtime_restarts": 1,
+                    "no_progress_events": 2,
+                    "quota_stall": 3,
+                    "queue_pressure": 4,
+                    "ring_occupancy_peak": 9,
+                    "compat_fallback_count": 0,
+                    "persistent_tx_bridge_sent": 128,
+                    "persistent_produced": 128,
+                    "bridge_drain_batches": 7,
+                    "bridge_drain_packets": 64,
+                    "ring_drop_events": 1,
+                    "scheduler_fairness_cv_pct": 11.5,
+                    "persistent_tx_backend": "af_xdp",
+                    "persistent_tx_iface": "eth0",
+                    "persistent_bridge_ipg_ns": 500,
+                    "persistent_tx_backend_strict": 1,
+                    "stats": {"attempted": 100, "sent": 100, "errors": 0, "bytes_sent_est": 6400},
+                }
+            ],
+            duration_s=1.0,
+            progress_total=100,
+            total_count=100,
+            metrics={},
+            warnings=[],
+        )
+        self.assertEqual(rr.results["persistent_runtime_restarts"], 1)
+        self.assertEqual(rr.results["no_progress_events"], 2)
+        self.assertEqual(rr.results["quota_stall"], 3)
+        self.assertEqual(rr.results["queue_pressure"], 4)
+        self.assertEqual(rr.results["ring_occupancy_peak"], 9)
+        self.assertEqual(rr.results["persistent_tx_bridge_sent"], 128)
+        self.assertEqual(rr.results["persistent_produced"], 128)
+        self.assertEqual(rr.results["bridge_drain_batches"], 7)
+        self.assertEqual(rr.results["bridge_drain_packets"], 64)
+        self.assertEqual(rr.results["ring_drop_events"], 1)
+        self.assertAlmostEqual(rr.results["scheduler_fairness_cv_pct"], 11.5, places=4)
+        self.assertEqual(rr.results["persistent_tx_backend"], "af_xdp")
+        self.assertEqual(rr.results["persistent_tx_iface"], "eth0")
+        self.assertEqual(rr.results["persistent_bridge_ipg_ns"], 500)
+        self.assertEqual(rr.results["persistent_tx_backend_strict"], 1)
