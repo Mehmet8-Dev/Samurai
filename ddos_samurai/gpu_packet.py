@@ -9,6 +9,8 @@ Shared constants, validation helpers, and diagnostics are re-exported from
 
 from __future__ import annotations
 
+import numpy as np
+
 from . import gpu_packet_py_backend as _support
 from .gpu_packet_py_backend import *  # noqa: F401,F403 - public compatibility surface
 
@@ -88,6 +90,34 @@ def is_native_policy_require() -> bool:
 
 def init_gpu():
     return _backend_call("init_gpu")
+
+
+def set_kernel_mode(mode: str):
+    return _backend_call("set_kernel_mode", mode)
+
+
+def get_kernel_mode() -> str:
+    return _backend_call("get_kernel_mode")
+
+
+def start_stream(profile):
+    return _backend_call("start_stream", profile)
+
+
+def update_stream(stream_id, update):
+    return _backend_call("update_stream", stream_id, update)
+
+
+def stop_stream(stream_id):
+    return _backend_call("stop_stream", stream_id)
+
+
+def read_stream_stats(stream_id=None):
+    return _backend_call("read_stream_stats", stream_id)
+
+
+def shutdown_persistent_runtime():
+    return _backend_call("shutdown_persistent_runtime")
 
 
 def generate_packets(*args, **kwargs):
@@ -193,8 +223,12 @@ class GPUPacketGenerator(_support.GPUPacketGenerator):
             spoof_ip=self.spoof_ip,
             has_ethernet=self.has_ethernet,
             spoof_subnet=self.spoof_subnet,
+            return_host_ready=True,
         )
-        packets_host = cp.asnumpy(packets_gpu)
+        if isinstance(packets_gpu, memoryview):
+            packets_host = np.frombuffer(packets_gpu, dtype=np.uint8)
+        else:
+            packets_host = np.asarray(packets_gpu, dtype=np.uint8)
         return [
             bytes(packets_host[i * packet_size : (i + 1) * packet_size])
             for i in range(count)

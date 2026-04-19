@@ -8,6 +8,8 @@ used only for shared constants, telemetry, and utility surfaces.
 from __future__ import annotations
 
 import ctypes
+import importlib
+import json
 import os
 import time
 import threading
@@ -30,6 +32,8 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 _NATIVE_ENABLED = _env_flag(_NATIVE_ENV, "1")
 _NATIVE_POLICY = "require"
+_KERNEL_MODE_ENV = "SAMURAI_GPU_KERNEL_MODE"
+_STREAM_API_ENV = "SAMURAI_GPU_STREAM_API"
 _HOST_INPUT_CACHE: dict[tuple[int, str, str, int], np.ndarray] = {}
 _HOST_INPUT_CACHE_LOCK = threading.Lock()
 _NATIVE_GENERATION_TELEMETRY_KEYS = (
@@ -44,6 +48,25 @@ _NATIVE_GENERATION_TELEMETRY_LOCK = threading.Lock()
 _NATIVE_GENERATION_TELEMETRY: dict[str, int] = {
     k: 0 for k in _NATIVE_GENERATION_TELEMETRY_KEYS
 }
+_STREAM_RUNTIME_TELEMETRY_LOCK = threading.Lock()
+_STREAM_RUNTIME_TELEMETRY: dict[str, int] = {
+    "gpu_kernel_mode_active": 0,
+    "persistent_runtime_restarts": 0,
+    "no_progress_events": 0,
+    "quota_stall": 0,
+    "queue_pressure": 0,
+    "ring_occupancy_peak": 0,
+    "bridge_drain_batches": 0,
+    "bridge_drain_packets": 0,
+    "ring_drop_events": 0,
+    "scheduler_fairness_cv_pct": 0,
+    "compat_fallback_count": 0,
+    "gpu_persistent_cmd_submitted": 0,
+    "gpu_persistent_cmd_completed": 0,
+    "gpu_persistent_errors": 0,
+}
+_KERNEL_MODE_NAME_TO_CODE = {"batch": 0, "persistent": 1}
+_KERNEL_MODE_CODE_TO_NAME = {0: "batch", 1: "persistent"}
 
 
 def _native_telemetry_inc(key: str, delta: int = 1) -> None:
@@ -85,9 +108,37 @@ def _native_track_host_pack_copy(nbytes: int) -> None:
     _native_telemetry_inc("gpu_native_host_pack_copy_bytes", int(nbytes))
 
 
+def _stream_telemetry_inc(key: str, delta: int = 1) -> None:
+    with _STREAM_RUNTIME_TELEMETRY_LOCK:
+        _STREAM_RUNTIME_TELEMETRY[key] = int(_STREAM_RUNTIME_TELEMETRY.get(key, 0)) + int(delta)
+
+
+def _stream_telemetry_set(key: str, value: int) -> None:
+    with _STREAM_RUNTIME_TELEMETRY_LOCK:
+        _STREAM_RUNTIME_TELEMETRY[key] = int(value)
+
+
+def _stream_telemetry_snapshot() -> dict[str, int]:
+    with _STREAM_RUNTIME_TELEMETRY_LOCK:
+        return {str(k): int(v) for k, v in _STREAM_RUNTIME_TELEMETRY.items()}
+
+
+def _stream_telemetry_reset() -> None:
+    with _STREAM_RUNTIME_TELEMETRY_LOCK:
+        for key in list(_STREAM_RUNTIME_TELEMETRY.keys()):
+            _STREAM_RUNTIME_TELEMETRY[key] = 0
+
+
 def _load_lib() -> ctypes.CDLL | None:
     if not _LIB_PATH.exists():
         return None
+    # Ensure native sender/pacing extensions are loaded first so weak C symbols
+    # in libgpu_packet_cuda can resolve to AF_XDP/AF_PACKET/pacing hooks.
+    for mod_name in (".xdp_sender", ".fast_sender", ".pacing_engine"):
+        try:
+            importlib.import_module(mod_name, package=__package__)
+        except Exception:
+            pass
     try:
         lib = ctypes.CDLL(str(_LIB_PATH))
     except Exception:
@@ -252,6 +303,24 @@ def _load_lib() -> ctypes.CDLL | None:
 
     lib.samurai_gpu_packet_last_error.argtypes = []
     lib.samurai_gpu_packet_last_error.restype = ctypes.c_char_p
+
+    try:
+        lib.samurai_gpu_packet_set_kernel_mode.argtypes = [ctypes.c_int]
+        lib.samurai_gpu_packet_set_kernel_mode.restype = ctypes.c_int
+        lib.samurai_gpu_packet_get_kernel_mode.argtypes = []
+        lib.samurai_gpu_packet_get_kernel_mode.restype = ctypes.c_int
+        lib.samurai_gpu_packet_start_stream.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int64)]
+        lib.samurai_gpu_packet_start_stream.restype = ctypes.c_int
+        lib.samurai_gpu_packet_update_stream.argtypes = [ctypes.c_int64, ctypes.c_char_p]
+        lib.samurai_gpu_packet_update_stream.restype = ctypes.c_int
+        lib.samurai_gpu_packet_stop_stream.argtypes = [ctypes.c_int64]
+        lib.samurai_gpu_packet_stop_stream.restype = ctypes.c_int
+        lib.samurai_gpu_packet_read_stream_stats.argtypes = [ctypes.c_int64]
+        lib.samurai_gpu_packet_read_stream_stats.restype = ctypes.c_char_p
+        lib.samurai_gpu_packet_shutdown_runtime.argtypes = []
+        lib.samurai_gpu_packet_shutdown_runtime.restype = ctypes.c_int
+    except Exception:
+        pass
     return lib
 
 
@@ -397,7 +466,7 @@ def _materialize_native_output(
     out_size: int,
     *,
     pool_key: str,
-    return_host_ready: bool = False,
+    return_host_ready: bool = True,
 ):
     _native_track_d2h_copy(int(out_size))
     if not return_host_ready:
@@ -411,19 +480,7 @@ def _materialize_native_output(
                     pass
                 _raise_native_error("samurai_gpu_packet_wait failed")
     host = _wrap_host_array(out_ptr, out_size, pool_key=pool_key)
-    if return_host_ready:
-        return host
-    try:
-        out = cp.asarray(host, dtype=cp.uint8)
-    except Exception:
-        return host
-    if isinstance(out, np.ndarray):
-        return host
-    owner = getattr(host, "_owner", None)
-    if owner is not None and hasattr(owner, "release"):
-        owner.release()
-        host._owner = None
-    return out
+    return host
 
 
 def _flatten_templates(templates_bytes_list):
@@ -464,6 +521,27 @@ def _array_ptr(arr: np.ndarray | None, ptr_type):
 
 def _native_ready() -> bool:
     return bool(_LIB is not None and _NATIVE_ENABLED)
+
+
+def _kernel_mode_from_env() -> str:
+    raw = str(os.environ.get(_KERNEL_MODE_ENV, "batch") or "batch").strip().lower()
+    return raw if raw in _KERNEL_MODE_NAME_TO_CODE else "batch"
+
+
+def _stream_api_mode_from_env() -> str:
+    raw = str(os.environ.get(_STREAM_API_ENV, "compat") or "compat").strip().lower()
+    return raw if raw in {"compat", "stream"} else "compat"
+
+
+def _supports_stream_lifecycle() -> bool:
+    return bool(
+        _LIB is not None
+        and hasattr(_LIB, "samurai_gpu_packet_start_stream")
+        and hasattr(_LIB, "samurai_gpu_packet_update_stream")
+        and hasattr(_LIB, "samurai_gpu_packet_stop_stream")
+        and hasattr(_LIB, "samurai_gpu_packet_read_stream_stats")
+        and hasattr(_LIB, "samurai_gpu_packet_shutdown_runtime")
+    )
 
 
 def is_available() -> bool:
@@ -537,7 +615,141 @@ def _raise_native_policy_violation(op_name: str, *, stream=None, reason_override
 def init_gpu():
     if not _native_ready():
         _raise_native_policy_violation("init_gpu")
+    try:
+        set_kernel_mode(_kernel_mode_from_env())
+    except Exception:
+        pass
     return True
+
+
+def set_kernel_mode(mode: str) -> str:
+    if not _native_ready():
+        _raise_native_policy_violation("set_kernel_mode")
+    mode_name = str(mode or "batch").strip().lower()
+    if mode_name not in _KERNEL_MODE_NAME_TO_CODE:
+        raise ValueError("mode must be 'batch' or 'persistent'")
+    if hasattr(_LIB, "samurai_gpu_packet_set_kernel_mode"):
+        rc = int(_LIB.samurai_gpu_packet_set_kernel_mode(ctypes.c_int(_KERNEL_MODE_NAME_TO_CODE[mode_name])) or 0)
+        if rc != 0:
+            _stream_telemetry_inc("gpu_persistent_errors", 1)
+            _raise_native_error("samurai_gpu_packet_set_kernel_mode failed")
+    os.environ[_KERNEL_MODE_ENV] = mode_name
+    _stream_telemetry_set("gpu_kernel_mode_active", int(_KERNEL_MODE_NAME_TO_CODE[mode_name]))
+    return mode_name
+
+
+def get_kernel_mode() -> str:
+    if not _native_ready():
+        _raise_native_policy_violation("get_kernel_mode")
+    if hasattr(_LIB, "samurai_gpu_packet_get_kernel_mode"):
+        code = int(_LIB.samurai_gpu_packet_get_kernel_mode() or 0)
+        mode = _KERNEL_MODE_CODE_TO_NAME.get(code, "batch")
+        _stream_telemetry_set("gpu_kernel_mode_active", int(code if code in _KERNEL_MODE_CODE_TO_NAME else 0))
+        return mode
+    mode = _kernel_mode_from_env()
+    _stream_telemetry_set("gpu_kernel_mode_active", int(_KERNEL_MODE_NAME_TO_CODE.get(mode, 0)))
+    return mode
+
+
+def start_stream(profile) -> int:
+    if not _native_ready():
+        _raise_native_policy_violation("start_stream")
+    if not _supports_stream_lifecycle():
+        raise GPUPacketError("native stream lifecycle API unavailable")
+    payload = profile if isinstance(profile, str) else json.dumps(profile or {}, sort_keys=True)
+    out_stream_id = ctypes.c_int64(0)
+    rc = int(_LIB.samurai_gpu_packet_start_stream(ctypes.c_char_p(_as_bytes(payload, "{}")), ctypes.byref(out_stream_id)) or 0)
+    if rc != 0:
+        _stream_telemetry_inc("gpu_persistent_errors", 1)
+        _raise_native_error("samurai_gpu_packet_start_stream failed")
+    return int(out_stream_id.value)
+
+
+def update_stream(stream_id: int, update) -> None:
+    if not _native_ready():
+        _raise_native_policy_violation("update_stream")
+    if not _supports_stream_lifecycle():
+        raise GPUPacketError("native stream lifecycle API unavailable")
+    payload = update if isinstance(update, str) else json.dumps(update or {}, sort_keys=True)
+    rc = int(
+        _LIB.samurai_gpu_packet_update_stream(
+            ctypes.c_int64(int(stream_id)),
+            ctypes.c_char_p(_as_bytes(payload, "{}")),
+        )
+        or 0
+    )
+    if rc != 0:
+        _stream_telemetry_inc("gpu_persistent_errors", 1)
+        _raise_native_error("samurai_gpu_packet_update_stream failed")
+    _stream_telemetry_inc("gpu_persistent_cmd_submitted", 1)
+    _stream_telemetry_inc("gpu_persistent_cmd_completed", 1)
+
+
+def stop_stream(stream_id: int) -> None:
+    if not _native_ready():
+        _raise_native_policy_violation("stop_stream")
+    if not _supports_stream_lifecycle():
+        raise GPUPacketError("native stream lifecycle API unavailable")
+    rc = int(_LIB.samurai_gpu_packet_stop_stream(ctypes.c_int64(int(stream_id))) or 0)
+    if rc != 0:
+        _stream_telemetry_inc("gpu_persistent_errors", 1)
+        _raise_native_error("samurai_gpu_packet_stop_stream failed")
+
+
+def read_stream_stats(stream_id: int | None = None) -> dict:
+    if not _native_ready():
+        _raise_native_policy_violation("read_stream_stats")
+    if not _supports_stream_lifecycle():
+        raise GPUPacketError("native stream lifecycle API unavailable")
+    raw = _LIB.samurai_gpu_packet_read_stream_stats(ctypes.c_int64(int(stream_id or 0)))
+    if not raw:
+        return {}
+    try:
+        text = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return {}
+    try:
+        out = dict(json.loads(text))
+        if "gpu_persistent_runtime_restarts" in out and "persistent_runtime_restarts" not in out:
+            out["persistent_runtime_restarts"] = int(out.get("gpu_persistent_runtime_restarts", 0) or 0)
+        if "gpu_persistent_fallback_count" in out and "compat_fallback_count" not in out:
+            out["compat_fallback_count"] = int(out.get("gpu_persistent_fallback_count", 0) or 0)
+        telemetry = _stream_telemetry_snapshot()
+        for key in (
+            "gpu_kernel_mode_active",
+            "persistent_runtime_restarts",
+            "no_progress_events",
+            "quota_stall",
+            "queue_pressure",
+            "ring_occupancy_peak",
+            "bridge_drain_batches",
+            "bridge_drain_packets",
+            "ring_drop_events",
+            "scheduler_fairness_cv_pct",
+            "compat_fallback_count",
+            "gpu_persistent_cmd_submitted",
+            "gpu_persistent_cmd_completed",
+            "gpu_persistent_errors",
+        ):
+            if key in telemetry:
+                if key == "scheduler_fairness_cv_pct":
+                    out[key] = max(float(out.get(key, 0.0) or 0.0), float(telemetry.get(key, 0.0) or 0.0))
+                else:
+                    out[key] = max(int(out.get(key, 0) or 0), int(telemetry.get(key, 0) or 0))
+        return out
+    except Exception:
+        return {"raw": text}
+
+
+def shutdown_persistent_runtime() -> None:
+    if not _native_ready():
+        _raise_native_policy_violation("shutdown_persistent_runtime")
+    if not _supports_stream_lifecycle():
+        return
+    rc = int(_LIB.samurai_gpu_packet_shutdown_runtime() or 0)
+    if rc != 0:
+        _stream_telemetry_inc("gpu_persistent_errors", 1)
+        _raise_native_error("samurai_gpu_packet_shutdown_runtime failed")
 
 
 def generate_packets(
@@ -553,12 +765,11 @@ def generate_packets(
     stream=None,
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
-    return_host_ready=False,
+    return_host_ready=True,
 ):
     stream_handle = _resolve_stream_handle("generate_packets", stream)
     if not _native_ready():
         _raise_native_policy_violation("generate_packets", stream=stream)
-
     out_ptr = ctypes.c_void_p()
     out_size = ctypes.c_size_t(0)
     out_packet_size = ctypes.c_int(0)
@@ -601,12 +812,11 @@ def generate_packets_from_template(
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
     force_global_fallback=False,
-    return_host_ready=False,
+    return_host_ready=True,
 ):
     stream_handle = _resolve_stream_handle("generate_packets_from_template", stream)
     if not _native_ready():
         _raise_native_policy_violation("generate_packets_from_template", stream=stream)
-
     template_arr = _coerce_numeric_array(
         template_bytes,
         np.uint8,
@@ -659,16 +869,14 @@ def generate_packets_from_template_pool(
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
     force_global_fallback=False,
-    return_host_ready=False,
+    return_host_ready=True,
 ):
     stream_handle = _resolve_stream_handle("generate_packets_from_template_pool", stream)
     if not _native_ready():
         _raise_native_policy_violation("generate_packets_from_template_pool", stream=stream)
-
     flat, packet_size, num_templates = _flatten_templates(templates_bytes_list)
     if num_templates == 0:
         return None, 0
-
     flat_ptr, flat_len = _array_ptr(flat, ctypes.POINTER(ctypes.c_uint8))
     _native_track_h2d_copy(int(flat_len))
     out_ptr = ctypes.c_void_p()
@@ -720,7 +928,7 @@ def generate_fragmented_packets(
     stream=None,
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
-    return_host_ready=False,
+    return_host_ready=True,
 ):
     stream_handle = _resolve_stream_handle("generate_fragmented_packets", stream)
     if not _native_ready():
@@ -776,7 +984,7 @@ def generate_amplification_packets(
     has_ethernet=True,
     stream=None,
     gateway_mac=0xFFFFFFFFFFFF,
-    return_host_ready=False,
+    return_host_ready=True,
 ):
     stream_handle = _resolve_stream_handle("generate_amplification_packets", stream)
     if not _native_ready():
@@ -846,7 +1054,7 @@ def generate_stateful_packets(
     mss_values=None,
     ttls=None,
     force_global_fallback=False,
-    return_host_ready=False,
+    return_host_ready=True,
 ):
     stream_handle = _resolve_stream_handle("generate_stateful_packets", stream)
     if not _native_ready():
@@ -1006,7 +1214,7 @@ def generate_icmp_packets(
     stream=None,
     gateway_mac=0xFFFFFFFFFFFF,
     spoof_subnet="1.0.0.0/8",
-    return_host_ready=False,
+    return_host_ready=True,
 ):
     stream_handle = _resolve_stream_handle("generate_icmp_packets", stream)
     if not _native_ready():
@@ -1046,7 +1254,35 @@ def generate_icmp_packets(
 def get_generation_telemetry() -> dict:
     out = dict(_support.get_generation_telemetry() or {})
     native = _native_telemetry_snapshot()
+    stream_rt = _stream_telemetry_snapshot()
     out.update(native)
+    out.update(stream_rt)
+    if _native_ready() and _supports_stream_lifecycle():
+        try:
+            runtime_stats = read_stream_stats(0)
+        except Exception:
+            runtime_stats = {}
+        if isinstance(runtime_stats, dict):
+            for key in (
+                "gpu_kernel_mode_active",
+                "persistent_runtime_restarts",
+                "no_progress_events",
+                "quota_stall",
+                "queue_pressure",
+                "ring_occupancy_peak",
+                "bridge_drain_batches",
+                "bridge_drain_packets",
+                "ring_drop_events",
+                "scheduler_fairness_cv_pct",
+                "compat_fallback_count",
+            ):
+                if key in runtime_stats:
+                    if key == "scheduler_fairness_cv_pct":
+                        out[key] = float(runtime_stats.get(key, 0.0) or 0.0)
+                    else:
+                        out[key] = int(runtime_stats.get(key, 0) or 0)
+    out["gpu_kernel_mode"] = get_kernel_mode() if _native_ready() else _kernel_mode_from_env()
+    out["gpu_stream_api_mode"] = _stream_api_mode_from_env()
     out["gpu_native_copy_metrics_estimated"] = 1
     out["gpu_template_h2d_copy_count"] = int(out.get("gpu_template_h2d_copy_count", 0) or 0) + int(
         native.get("gpu_native_h2d_copy_count", 0) or 0
@@ -1060,6 +1296,7 @@ def get_generation_telemetry() -> dict:
 def reset_generation_telemetry() -> None:
     _support.reset_generation_telemetry()
     _native_telemetry_reset()
+    _stream_telemetry_reset()
 
 
 def clear_generation_caches() -> None:
