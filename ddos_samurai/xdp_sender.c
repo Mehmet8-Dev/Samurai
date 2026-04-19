@@ -101,6 +101,10 @@ struct xsk_ring_cons {
 struct xsk_umem_info {
     void *buffer;
     uint64_t size;
+    uint32_t frame_size;
+    uint32_t frame_count;
+    uint32_t headroom;
+    int external_buffer;
     struct xsk_ring_prod fill;
     struct xsk_ring_cons comp;
     void *fill_map;
@@ -164,6 +168,7 @@ typedef struct {
     int xsks_map_fd;
     int xsks_map_key;
     int xsks_map_registered;
+    int external_umem_mode;
 
     // Reusable send scratch buffers for context API paths.
     const uint8_t **scratch_packets;
@@ -537,83 +542,105 @@ static uint16_t udp_checksum(const struct iphdr *iph,
 // UMEM Management
 // ============================================================================
 
-static struct xsk_umem_info *create_umem(void)
+static struct xsk_umem_info *create_umem_with_config(
+    void *external_buffer,
+    uint32_t frame_count,
+    uint32_t frame_size,
+    uint32_t headroom,
+    int external_mode
+)
 {
     struct xsk_umem_info *umem = calloc(1, sizeof(*umem));
     if (!umem) return NULL;
-    
-    // Allocate aligned buffer
-    umem->size = XDP_NUM_FRAMES * XDP_FRAME_SIZE;
-    if (posix_memalign(&umem->buffer, getpagesize(), umem->size)) {
+
+    if (frame_count == 0) frame_count = XDP_NUM_FRAMES;
+    if (frame_size == 0) frame_size = XDP_FRAME_SIZE;
+    if (headroom == 0) headroom = XDP_HEADROOM;
+    if (frame_count > XDP_NUM_FRAMES || frame_size == 0 || headroom >= frame_size) {
         free(umem);
+        errno = EINVAL;
         return NULL;
     }
-    memset(umem->buffer, 0, umem->size);
-    
-    // Create UMEM socket
+
+    umem->frame_count = frame_count;
+    umem->frame_size = frame_size;
+    umem->headroom = headroom;
+    umem->external_buffer = external_mode ? 1 : 0;
+    umem->size = (uint64_t)frame_count * (uint64_t)frame_size;
+
+    if (umem->external_buffer) {
+        if (external_buffer == NULL) {
+            free(umem);
+            errno = EINVAL;
+            return NULL;
+        }
+        umem->buffer = external_buffer;
+    } else {
+        if (posix_memalign(&umem->buffer, getpagesize(), (size_t)umem->size)) {
+            free(umem);
+            return NULL;
+        }
+        memset(umem->buffer, 0, (size_t)umem->size);
+    }
+
     umem->fd = socket(AF_XDP, SOCK_RAW, 0);
     if (umem->fd < 0) {
-        free(umem->buffer);
+        if (!umem->external_buffer) free(umem->buffer);
         free(umem);
         return NULL;
     }
-    
-    // Register UMEM
+
     struct xdp_umem_reg mr = {
         .addr = (uint64_t)umem->buffer,
         .len = umem->size,
-        .chunk_size = XDP_FRAME_SIZE,
-        .headroom = XDP_HEADROOM,
+        .chunk_size = umem->frame_size,
+        .headroom = umem->headroom,
         .flags = 0
     };
-    
+
     if (setsockopt(umem->fd, SOL_XDP, XDP_UMEM_REG, &mr, sizeof(mr)) < 0) {
         close(umem->fd);
-        free(umem->buffer);
+        if (!umem->external_buffer) free(umem->buffer);
         free(umem);
         return NULL;
     }
-    
-    // Setup Fill Ring
+
     int fill_size = XDP_FILL_RING_SIZE;
     if (setsockopt(umem->fd, SOL_XDP, XDP_UMEM_FILL_RING, &fill_size, sizeof(fill_size)) < 0) {
         close(umem->fd);
-        free(umem->buffer);
+        if (!umem->external_buffer) free(umem->buffer);
         free(umem);
         return NULL;
     }
-    
-    // Setup Completion Ring
+
     int comp_size = XDP_COMP_RING_SIZE;
     if (setsockopt(umem->fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &comp_size, sizeof(comp_size)) < 0) {
         close(umem->fd);
-        free(umem->buffer);
+        if (!umem->external_buffer) free(umem->buffer);
         free(umem);
         return NULL;
     }
-    
-    // Get ring offsets
+
     struct xdp_mmap_offsets offsets;
     socklen_t optlen = sizeof(offsets);
     if (getsockopt(umem->fd, SOL_XDP, XDP_MMAP_OFFSETS, &offsets, &optlen) < 0) {
         close(umem->fd);
-        free(umem->buffer);
+        if (!umem->external_buffer) free(umem->buffer);
         free(umem);
         return NULL;
     }
-    
-    // Map Fill Ring
+
     void *fill_map = mmap(NULL,
                           offsets.fr.desc + XDP_FILL_RING_SIZE * sizeof(uint64_t),
                           PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
                           umem->fd, XDP_UMEM_PGOFF_FILL_RING);
     if (fill_map == MAP_FAILED) {
         close(umem->fd);
-        free(umem->buffer);
+        if (!umem->external_buffer) free(umem->buffer);
         free(umem);
         return NULL;
     }
-    
+
     umem->fill.mask = XDP_FILL_RING_SIZE - 1;
     umem->fill.size = XDP_FILL_RING_SIZE;
     umem->fill.producer = (uint32_t*)(fill_map + offsets.fr.producer);
@@ -623,8 +650,7 @@ static struct xsk_umem_info *create_umem(void)
     umem->fill.cached_cons = XDP_FILL_RING_SIZE;
     umem->fill_map = fill_map;
     umem->fill_map_len = offsets.fr.desc + XDP_FILL_RING_SIZE * sizeof(uint64_t);
-    
-    // Map Completion Ring
+
     void *comp_map = mmap(NULL,
                           offsets.cr.desc + XDP_COMP_RING_SIZE * sizeof(uint64_t),
                           PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
@@ -632,11 +658,11 @@ static struct xsk_umem_info *create_umem(void)
     if (comp_map == MAP_FAILED) {
         munmap(fill_map, offsets.fr.desc + XDP_FILL_RING_SIZE * sizeof(uint64_t));
         close(umem->fd);
-        free(umem->buffer);
+        if (!umem->external_buffer) free(umem->buffer);
         free(umem);
         return NULL;
     }
-    
+
     umem->comp.mask = XDP_COMP_RING_SIZE - 1;
     umem->comp.size = XDP_COMP_RING_SIZE;
     umem->comp.producer = (uint32_t*)(comp_map + offsets.cr.producer);
@@ -645,8 +671,13 @@ static struct xsk_umem_info *create_umem(void)
     umem->comp.ring = comp_map + offsets.cr.desc;
     umem->comp_map = comp_map;
     umem->comp_map_len = offsets.cr.desc + XDP_COMP_RING_SIZE * sizeof(uint64_t);
-    
+
     return umem;
+}
+
+static struct xsk_umem_info *create_umem(void)
+{
+    return create_umem_with_config(NULL, XDP_NUM_FRAMES, XDP_FRAME_SIZE, XDP_HEADROOM, 0);
 }
 
 static void destroy_umem(struct xsk_umem_info *umem)
@@ -664,7 +695,7 @@ static void destroy_umem(struct xsk_umem_info *umem)
         umem->comp_map_len = 0;
     }
     if (umem->fd >= 0) close(umem->fd);
-    if (umem->buffer) free(umem->buffer);
+    if (!umem->external_buffer && umem->buffer) free(umem->buffer);
     free(umem);
 }
 
@@ -770,20 +801,20 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
     }
     
     // Initialize frame allocation tracking
-    xsk->free_count = XDP_NUM_FRAMES;
-    for (uint32_t i = 0; i < XDP_NUM_FRAMES; i++) {
+    xsk->free_count = umem->frame_count;
+    for (uint32_t i = 0; i < umem->frame_count; i++) {
         xsk->free_frames[i] = i;
     }
     xsk->outstanding_tx = 0;
     
     // Pre-populate the fill ring
     uint32_t fill_idx;
-    if (xsk_ring_prod__reserve(&umem->fill, XDP_NUM_FRAMES, &fill_idx) == XDP_NUM_FRAMES) {
-        for (uint32_t i = 0; i < XDP_NUM_FRAMES; i++) {
+    if (xsk_ring_prod__reserve(&umem->fill, umem->frame_count, &fill_idx) == umem->frame_count) {
+        for (uint32_t i = 0; i < umem->frame_count; i++) {
             uint64_t *addr = xsk_ring_prod__fill_addr(&umem->fill, fill_idx + i);
-            *addr = i * XDP_FRAME_SIZE;
+            *addr = (uint64_t)i * (uint64_t)umem->frame_size;
         }
-        xsk_ring_prod__submit(&umem->fill, XDP_NUM_FRAMES);
+        xsk_ring_prod__submit(&umem->fill, umem->frame_count);
     }
     
     if (xdp_mode == 2) {
@@ -822,41 +853,82 @@ static uint64_t alloc_frame(struct xsk_socket_info *xsk)
     }
 
     uint32_t idx = xsk->free_frames[--xsk->free_count];
-    return (uint64_t)idx * XDP_FRAME_SIZE;
+    return (uint64_t)idx * (uint64_t)xsk->umem->frame_size;
 }
 
 static void free_frame(struct xsk_socket_info *xsk, uint64_t frame)
 {
     uint64_t base = frame;
-    if (base >= XDP_HEADROOM) {
-        base -= XDP_HEADROOM;
+    if (base >= xsk->umem->headroom) {
+        base -= xsk->umem->headroom;
     }
-    uint32_t idx = (uint32_t)(base / XDP_FRAME_SIZE);
-    if (idx >= XDP_NUM_FRAMES) {
+    uint32_t idx = (uint32_t)(base / xsk->umem->frame_size);
+    if (idx >= xsk->umem->frame_count) {
         return;
     }
-    if (xsk->free_count < XDP_NUM_FRAMES) {
+    if (xsk->free_count < xsk->umem->frame_count) {
         xsk->free_frames[xsk->free_count++] = idx;
     }
+}
+
+static uint32_t xdp_reap_completion_entries(
+    struct xsk_socket_info *xsk,
+    uint32_t max_count,
+    uint32_t *frame_ids_out,
+    uint32_t out_capacity,
+    int recycle_frames
+)
+{
+    if (!xsk->outstanding_tx) {
+        return 0;
+    }
+    uint32_t want = max_count;
+    if (want == 0 || want > xsk->outstanding_tx) {
+        want = xsk->outstanding_tx;
+    }
+    if (want == 0) {
+        return 0;
+    }
+
+    uint32_t idx;
+    uint32_t completed = xsk_ring_cons__peek(&xsk->umem->comp, want, &idx);
+    if (completed == 0) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < completed; i++) {
+        uint64_t *addr = xsk_ring_cons__comp_addr(&xsk->umem->comp, idx + i);
+        uint64_t base = *addr;
+        if (base >= xsk->umem->headroom) {
+            base -= xsk->umem->headroom;
+        }
+        const uint32_t frame_id = (uint32_t)(base / xsk->umem->frame_size);
+        if (frame_ids_out != NULL && i < out_capacity) {
+            frame_ids_out[i] = frame_id;
+        }
+        if (recycle_frames) {
+            free_frame(xsk, *addr);
+        }
+    }
+    xsk_ring_cons__release(&xsk->umem->comp, completed);
+    xsk->outstanding_tx -= completed;
+    return completed;
 }
 
 static void complete_tx(struct xsk_socket_info *xsk)
 {
     if (!xsk->outstanding_tx) return;
-    
-    uint32_t idx;
-    uint32_t completed = xsk_ring_cons__peek(&xsk->umem->comp, 
-                                              xsk->outstanding_tx, &idx);
-    
+
+    uint32_t completed = xdp_reap_completion_entries(
+        xsk,
+        xsk->outstanding_tx,
+        NULL,
+        0,
+        1
+    );
     if (completed > 0) {
         xdp_ctx.tx_completion_events += 1;
         xdp_ctx.tx_completed_desc += completed;
-        for (uint32_t i = 0; i < completed; i++) {
-            uint64_t *addr = xsk_ring_cons__comp_addr(&xsk->umem->comp, idx + i);
-            free_frame(xsk, *addr);
-        }
-        xsk_ring_cons__release(&xsk->umem->comp, completed);
-        xsk->outstanding_tx -= completed;
     }
 }
 
@@ -915,14 +987,14 @@ static int xdp_send_batch(struct xsk_socket_info *xsk,
         }
         
         // Get pointer to UMEM frame buffer
-        void *pkt_buffer = xsk->umem->buffer + frame_addr + XDP_HEADROOM;
+        void *pkt_buffer = (uint8_t*)xsk->umem->buffer + frame_addr + xsk->umem->headroom;
         
         // Copy packet data to UMEM (this is the "copy" in Copy Mode)
         memcpy(pkt_buffer, packets[submitted], pkt_len);
         
         // Fill TX descriptor
         struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx + i);
-        tx_desc->addr = frame_addr + XDP_HEADROOM;
+        tx_desc->addr = frame_addr + xsk->umem->headroom;
         tx_desc->len = pkt_len;
         tx_desc->options = 0;
         
@@ -1154,20 +1226,17 @@ static int xdp_send_vector_locked(const uint8_t **packets, uint16_t *lengths, Py
 
 static void complete_tx_ctx(xdp_context_t *ctx, struct xsk_socket_info *xsk)
 {
-    if (!xsk->outstanding_tx) return;
-
-    uint32_t idx;
-    uint32_t completed = xsk_ring_cons__peek(&xsk->umem->comp, xsk->outstanding_tx, &idx);
-
+    if (!xsk->outstanding_tx || ctx->external_umem_mode) return;
+    uint32_t completed = xdp_reap_completion_entries(
+        xsk,
+        xsk->outstanding_tx,
+        NULL,
+        0,
+        1
+    );
     if (completed > 0) {
         ctx->tx_completion_events += 1;
         ctx->tx_completed_desc += completed;
-        for (uint32_t i = 0; i < completed; i++) {
-            uint64_t *addr = xsk_ring_cons__comp_addr(&xsk->umem->comp, idx + i);
-            free_frame(xsk, *addr);
-        }
-        xsk_ring_cons__release(&xsk->umem->comp, completed);
-        xsk->outstanding_tx -= completed;
     }
 }
 
@@ -1213,11 +1282,11 @@ static int xdp_send_batch_ctx(
             pkt_len = MAX_PACKET_SIZE;
         }
 
-        void *pkt_buffer = xsk->umem->buffer + frame_addr + XDP_HEADROOM;
+        void *pkt_buffer = (uint8_t*)xsk->umem->buffer + frame_addr + xsk->umem->headroom;
         memcpy(pkt_buffer, packets[submitted], pkt_len);
 
         struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx + i);
-        tx_desc->addr = frame_addr + XDP_HEADROOM;
+        tx_desc->addr = frame_addr + xsk->umem->headroom;
         tx_desc->len = pkt_len;
         tx_desc->options = 0;
 
@@ -1275,6 +1344,181 @@ static int xdp_send_vector_ctx(
     }
 
     return total_sent;
+}
+
+static int xdp_send_batch_ctx_strided(
+    xdp_context_t *ctx,
+    struct xsk_socket_info *xsk,
+    const uint8_t *base,
+    uint16_t packet_size,
+    int stride,
+    Py_ssize_t start_offset,
+    int count
+)
+{
+    complete_tx_ctx(ctx, xsk);
+
+    uint32_t tx_idx;
+    int batch_size = count < XDP_BATCH_SIZE ? count : XDP_BATCH_SIZE;
+    uint32_t reserved = xsk_ring_prod__reserve(&xsk->tx, batch_size, &tx_idx);
+    if (reserved == 0) {
+        ctx->tx_desc_reserve_failures += 1;
+        ctx->tx_backpressure_events += 1;
+        kick_tx_ctx(ctx, xsk);
+        return 0;
+    }
+
+    int submitted = 0;
+    for (uint32_t i = 0; i < reserved && submitted < count; i++) {
+        uint64_t frame_addr = alloc_frame(xsk);
+        if (frame_addr == UINT64_MAX) {
+            ctx->tx_frame_alloc_failures += 1;
+            ctx->tx_backpressure_events += 1;
+            break;
+        }
+
+        const uint8_t *src = base + (((size_t)(start_offset + submitted)) * (size_t)stride);
+        uint16_t pkt_len = packet_size;
+        if (pkt_len > MAX_PACKET_SIZE) {
+            pkt_len = MAX_PACKET_SIZE;
+        }
+
+        void *pkt_buffer = (uint8_t*)xsk->umem->buffer + frame_addr + xsk->umem->headroom;
+        memcpy(pkt_buffer, src, pkt_len);
+
+        struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx + i);
+        tx_desc->addr = frame_addr + xsk->umem->headroom;
+        tx_desc->len = pkt_len;
+        tx_desc->options = 0;
+
+        submitted++;
+        ctx->tx_bytes += pkt_len;
+    }
+
+    if (submitted < (int)reserved) {
+        ctx->tx_partial_batches += 1;
+        xsk_ring_prod__cancel(&xsk->tx, reserved - (uint32_t)submitted);
+    }
+
+    if (submitted > 0) {
+        xsk_ring_prod__submit(&xsk->tx, submitted);
+        xsk->outstanding_tx += submitted;
+        ctx->tx_packets += submitted;
+    }
+
+    kick_tx_ctx(ctx, xsk);
+    return submitted;
+}
+
+static int xdp_send_strided_ctx(
+    xdp_context_t *ctx,
+    const uint8_t *base,
+    uint16_t packet_size,
+    int stride,
+    Py_ssize_t count
+)
+{
+    int total_sent = 0;
+    Py_ssize_t offset = 0;
+
+    while (offset < count) {
+        int batch = (int)(count - offset);
+        if (batch > XDP_BATCH_SIZE) {
+            batch = XDP_BATCH_SIZE;
+        }
+
+        int sent = xdp_send_batch_ctx_strided(
+            ctx,
+            ctx->xsk,
+            base,
+            packet_size,
+            stride,
+            offset,
+            batch
+        );
+        if (sent <= 0) {
+            ctx->tx_retry_loops += 1;
+            ctx->tx_backpressure_events += 1;
+            complete_tx_ctx(ctx, ctx->xsk);
+            sent = xdp_send_batch_ctx_strided(
+                ctx,
+                ctx->xsk,
+                base,
+                packet_size,
+                stride,
+                offset,
+                batch
+            );
+        }
+        if (sent <= 0) {
+            break;
+        }
+        if (sent > batch) {
+            sent = batch;
+        }
+
+        total_sent += sent;
+        offset += sent;
+    }
+
+    return total_sent;
+}
+
+static int xdp_submit_frame_ids_ctx(
+    xdp_context_t *ctx,
+    const uint32_t *frame_ids,
+    const uint16_t *lengths,
+    int count
+)
+{
+    if (ctx == NULL || ctx->xsk == NULL || frame_ids == NULL || lengths == NULL || count <= 0) {
+        return 0;
+    }
+
+    uint32_t tx_idx;
+    int batch_size = count < XDP_BATCH_SIZE ? count : XDP_BATCH_SIZE;
+    uint32_t reserved = xsk_ring_prod__reserve(&ctx->xsk->tx, (uint32_t)batch_size, &tx_idx);
+    if (reserved == 0) {
+        ctx->tx_desc_reserve_failures += 1;
+        ctx->tx_backpressure_events += 1;
+        kick_tx_ctx(ctx, ctx->xsk);
+        return 0;
+    }
+
+    int submitted = 0;
+    for (uint32_t i = 0; i < reserved && submitted < count; i++) {
+        const uint32_t frame_id = frame_ids[submitted];
+        if (frame_id >= ctx->xsk->umem->frame_count) {
+            ctx->tx_invalid_packets += 1;
+            break;
+        }
+        uint32_t pkt_len = lengths[submitted];
+        const uint32_t max_len = ctx->xsk->umem->frame_size - ctx->xsk->umem->headroom;
+        if (pkt_len == 0 || pkt_len > max_len) {
+            ctx->tx_invalid_packets += 1;
+            break;
+        }
+
+        const uint64_t frame_addr = (uint64_t)frame_id * (uint64_t)ctx->xsk->umem->frame_size;
+        struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&ctx->xsk->tx, tx_idx + i);
+        tx_desc->addr = frame_addr + ctx->xsk->umem->headroom;
+        tx_desc->len = pkt_len;
+        tx_desc->options = 0;
+        submitted++;
+        ctx->tx_bytes += pkt_len;
+    }
+
+    if (submitted < (int)reserved) {
+        ctx->tx_partial_batches += 1;
+        xsk_ring_prod__cancel(&ctx->xsk->tx, reserved - (uint32_t)submitted);
+    }
+    if (submitted > 0) {
+        xsk_ring_prod__submit(&ctx->xsk->tx, (uint32_t)submitted);
+        ctx->xsk->outstanding_tx += (uint32_t)submitted;
+        ctx->tx_packets += (uint64_t)submitted;
+    }
+    kick_tx_ctx(ctx, ctx->xsk);
+    return submitted;
 }
 
 // ============================================================================
@@ -1676,9 +1920,10 @@ static PyObject* py_xdp_acquire_tx_frame(PyObject* self, PyObject* args)
         Py_RETURN_NONE;
     }
 
-    uint32_t frame_id = (uint32_t)(frame_addr / XDP_FRAME_SIZE);
-    char *frame_ptr = (char*)xdp_ctx.xsk->umem->buffer + frame_addr + XDP_HEADROOM;
-    PyObject *view = PyMemoryView_FromMemory(frame_ptr, MAX_PACKET_SIZE, PyBUF_WRITE);
+    uint32_t frame_id = (uint32_t)(frame_addr / xdp_ctx.xsk->umem->frame_size);
+    char *frame_ptr = (char*)xdp_ctx.xsk->umem->buffer + frame_addr + xdp_ctx.xsk->umem->headroom;
+    const Py_ssize_t writable_len = (Py_ssize_t)(xdp_ctx.xsk->umem->frame_size - xdp_ctx.xsk->umem->headroom);
+    PyObject *view = PyMemoryView_FromMemory(frame_ptr, writable_len, PyBUF_WRITE);
     pthread_mutex_unlock(&xdp_ctx.lock);
 
     if (view == NULL) {
@@ -1703,12 +1948,13 @@ static PyObject* py_xdp_submit_tx_frame(PyObject* self, PyObject* args)
     if (!PyArg_ParseTuple(args, "ii", &frame_id, &length)) {
         return NULL;
     }
-    if (frame_id < 0 || frame_id >= XDP_NUM_FRAMES) {
+    if (frame_id < 0 || frame_id >= (int)xdp_ctx.xsk->umem->frame_count) {
         PyErr_SetString(PyExc_ValueError, "frame_id out of range");
         return NULL;
     }
-    if (length <= 0 || length > MAX_PACKET_SIZE) {
-        PyErr_SetString(PyExc_ValueError, "length must be in range 1..MAX_PACKET_SIZE");
+    const int max_len = (int)(xdp_ctx.xsk ? (xdp_ctx.xsk->umem->frame_size - xdp_ctx.xsk->umem->headroom) : MAX_PACKET_SIZE);
+    if (length <= 0 || length > max_len) {
+        PyErr_SetString(PyExc_ValueError, "length must be in range 1..frame_payload_capacity");
         return NULL;
     }
 
@@ -1728,9 +1974,9 @@ static PyObject* py_xdp_submit_tx_frame(PyObject* self, PyObject* args)
         Py_RETURN_FALSE;
     }
 
-    uint64_t frame_addr = (uint64_t)frame_id * XDP_FRAME_SIZE;
+    uint64_t frame_addr = (uint64_t)frame_id * (uint64_t)xdp_ctx.xsk->umem->frame_size;
     struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xdp_ctx.xsk->tx, tx_idx);
-    tx_desc->addr = frame_addr + XDP_HEADROOM;
+    tx_desc->addr = frame_addr + xdp_ctx.xsk->umem->headroom;
     tx_desc->len = (uint32_t)length;
     tx_desc->options = 0;
 
@@ -1755,7 +2001,7 @@ static PyObject* py_xdp_release_tx_frame(PyObject* self, PyObject* args)
     if (!PyArg_ParseTuple(args, "i", &frame_id)) {
         return NULL;
     }
-    if (frame_id < 0 || frame_id >= XDP_NUM_FRAMES) {
+    if (frame_id < 0 || frame_id >= (int)xdp_ctx.xsk->umem->frame_count) {
         PyErr_SetString(PyExc_ValueError, "frame_id out of range");
         return NULL;
     }
@@ -1766,7 +2012,7 @@ static PyObject* py_xdp_release_tx_frame(PyObject* self, PyObject* args)
         PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
         return NULL;
     }
-    free_frame(xdp_ctx.xsk, (uint64_t)frame_id * XDP_FRAME_SIZE);
+    free_frame(xdp_ctx.xsk, (uint64_t)frame_id * (uint64_t)xdp_ctx.xsk->umem->frame_size);
     pthread_mutex_unlock(&xdp_ctx.lock);
     Py_RETURN_TRUE;
 }
@@ -1858,7 +2104,7 @@ static PyObject* xdp_send_udp_common(PyObject* args)
             continue;
         }
 
-        uint8_t *pkt_buffer = (uint8_t*)xdp_ctx.xsk->umem->buffer + frame_addr + XDP_HEADROOM;
+        uint8_t *pkt_buffer = (uint8_t*)xdp_ctx.xsk->umem->buffer + frame_addr + xdp_ctx.xsk->umem->headroom;
         size_t pkt_offset = 0;
         
         // IP Header
@@ -1893,7 +2139,7 @@ static PyObject* xdp_send_udp_common(PyObject* args)
         udph->check = udp_checksum(iph, udph, pkt_buffer + sizeof(struct iphdr) + sizeof(struct udphdr), (size_t)payload_len);
 
         struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xdp_ctx.xsk->tx, tx_idx);
-        tx_desc->addr = frame_addr + XDP_HEADROOM;
+        tx_desc->addr = frame_addr + xdp_ctx.xsk->umem->headroom;
         tx_desc->len = (uint32_t)pkt_offset;
         tx_desc->options = 0;
 
@@ -2535,10 +2781,16 @@ static void xdp_native_set_err(char *err, size_t err_len, const char *msg)
     (void)snprintf(err, err_len, "%s", msg ? msg : "xdp_native_error");
 }
 
-static int xdp_native_create_ctx(
+static int xdp_native_create_ctx_common(
     const char *ifname,
     int queue_id,
     int mode,
+    void *external_umem,
+    size_t external_umem_len,
+    int frame_size,
+    int headroom,
+    int frame_count,
+    int use_external_umem,
     char *err,
     size_t err_len
 )
@@ -2573,13 +2825,40 @@ static int xdp_native_create_ctx(
         fprintf(stderr, "[XDP][native] Warning: Could not increase MEMLOCK limit\n");
     }
 
-    ctx->umem = create_umem();
+    if (use_external_umem) {
+        const uint32_t fc = (frame_count > 0) ? (uint32_t)frame_count : 0u;
+        const uint32_t fs = (frame_size > 0) ? (uint32_t)frame_size : 0u;
+        const uint32_t hr = (headroom > 0) ? (uint32_t)headroom : 0u;
+        if (external_umem == NULL || external_umem_len == 0) {
+            pthread_mutex_unlock(&ctx->lock);
+            pthread_mutex_destroy(&ctx->lock);
+            free(ctx);
+            xdp_native_set_err(err, err_len, "external umem buffer is required");
+            return -1;
+        }
+        ctx->umem = create_umem_with_config(external_umem, fc, fs, hr, 1);
+    } else {
+        ctx->umem = create_umem();
+    }
     if (!ctx->umem) {
         pthread_mutex_unlock(&ctx->lock);
         pthread_mutex_destroy(&ctx->lock);
         free(ctx);
         xdp_native_set_err(err, err_len, "create_umem failed");
         return -1;
+    }
+
+    if (use_external_umem) {
+        const uint64_t expected = (uint64_t)ctx->umem->frame_count * (uint64_t)ctx->umem->frame_size;
+        if (external_umem_len < expected) {
+            destroy_umem(ctx->umem);
+            ctx->umem = NULL;
+            pthread_mutex_unlock(&ctx->lock);
+            pthread_mutex_destroy(&ctx->lock);
+            free(ctx);
+            xdp_native_set_err(err, err_len, "external umem buffer too small");
+            return -1;
+        }
     }
 
     ctx->xsk = create_xsk_socket(ctx->umem, (char*)ifname, queue_id, mode);
@@ -2596,6 +2875,7 @@ static int xdp_native_create_ctx(
     ctx->xdp_mode = mode;
     ctx->is_initialized = 1;
     ctx->is_running = 1;
+    ctx->external_umem_mode = use_external_umem ? 1 : 0;
     ctx->tx_packets = 0;
     ctx->tx_bytes = 0;
     ctx->tx_errors = 0;
@@ -2645,6 +2925,29 @@ static int xdp_native_create_ctx(
 
     xdp_native_set_err(err, err_len, "");
     return handle;
+}
+
+static int xdp_native_create_ctx(
+    const char *ifname,
+    int queue_id,
+    int mode,
+    char *err,
+    size_t err_len
+)
+{
+    return xdp_native_create_ctx_common(
+        ifname,
+        queue_id,
+        mode,
+        NULL,
+        0u,
+        0,
+        0,
+        0,
+        0,
+        err,
+        err_len
+    );
 }
 
 static int xdp_native_destroy_ctx(int handle, char *err, size_t err_len)
@@ -2697,19 +3000,65 @@ static int xdp_native_send_buffer(
         return -1;
     }
 
-    if (ensure_ctx_send_scratch_capacity(ctx, (Py_ssize_t)count) < 0) {
-        pthread_mutex_unlock(&ctx->lock);
-        xdp_native_set_err(err, err_len, "scratch allocation failed");
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_strided_ctx(
+        ctx,
+        buffer,
+        (uint16_t)((packet_size > 65535) ? 65535 : packet_size),
+        packet_size,
+        (Py_ssize_t)count
+    );
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    xdp_record_send_timing(ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+    pthread_mutex_unlock(&ctx->lock);
+
+    xdp_native_set_err(err, err_len, "");
+    return total_sent;
+}
+
+static int xdp_native_send_buffer_strided(
+    int handle,
+    const uint8_t *buffer,
+    int packet_size,
+    int stride,
+    int count,
+    char *err,
+    size_t err_len
+)
+{
+    xdp_context_t *ctx = NULL;
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+
+    if (buffer == NULL || packet_size <= 0 || stride <= 0 || stride < packet_size || count < 0) {
+        xdp_native_set_err(err, err_len, "invalid send_buffer_strided arguments");
         return -1;
     }
-    const uint8_t *base = buffer;
-    for (int i = 0; i < count; i++) {
-        ctx->scratch_packets[i] = base + ((size_t)i * (size_t)packet_size);
-        ctx->scratch_lengths[i] = (uint16_t)packet_size;
+    if (count == 0) {
+        xdp_native_set_err(err, err_len, "");
+        return 0;
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        xdp_native_set_err(err, err_len, "invalid context handle");
+        return -1;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "context not initialized");
+        return -1;
     }
 
     clock_gettime(CLOCK_MONOTONIC, &send_start);
-    total_sent = xdp_send_vector_ctx(ctx, ctx->scratch_packets, ctx->scratch_lengths, (Py_ssize_t)count);
+    total_sent = xdp_send_strided_ctx(
+        ctx,
+        buffer,
+        (uint16_t)((packet_size > 65535) ? 65535 : packet_size),
+        stride,
+        (Py_ssize_t)count
+    );
     clock_gettime(CLOCK_MONOTONIC, &send_end);
     xdp_record_send_timing(ctx, xdp_timespec_diff_ns(&send_start, &send_end));
     pthread_mutex_unlock(&ctx->lock);
@@ -2762,6 +3111,146 @@ static int xdp_native_send_vector(
     return total_sent;
 }
 
+static int xdp_native_create_ctx_external_umem(
+    const char *ifname,
+    int queue_id,
+    int mode,
+    void *umem_buffer,
+    size_t umem_buffer_len,
+    int frame_size,
+    int headroom,
+    int frame_count,
+    char *err,
+    size_t err_len
+)
+{
+    return xdp_native_create_ctx_common(
+        ifname,
+        queue_id,
+        mode,
+        umem_buffer,
+        umem_buffer_len,
+        frame_size,
+        headroom,
+        frame_count,
+        1,
+        err,
+        err_len
+    );
+}
+
+static int xdp_native_submit_frame_ids(
+    int handle,
+    const uint32_t *frame_ids,
+    const uint16_t *lengths,
+    int count,
+    char *err,
+    size_t err_len
+)
+{
+    xdp_context_t *ctx = NULL;
+    int total_sent = 0;
+    int offset = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+
+    if (frame_ids == NULL || lengths == NULL || count < 0) {
+        xdp_native_set_err(err, err_len, "invalid submit_frame_ids arguments");
+        return -1;
+    }
+    if (count == 0) {
+        xdp_native_set_err(err, err_len, "");
+        return 0;
+    }
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        xdp_native_set_err(err, err_len, "invalid context handle");
+        return -1;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "context not initialized");
+        return -1;
+    }
+    if (!ctx->external_umem_mode) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "submit_frame_ids requires external_umem context");
+        return -1;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    while (offset < count) {
+        int batch = count - offset;
+        if (batch > XDP_BATCH_SIZE) {
+            batch = XDP_BATCH_SIZE;
+        }
+        int sent = xdp_submit_frame_ids_ctx(ctx, frame_ids + offset, lengths + offset, batch);
+        if (sent <= 0) {
+            ctx->tx_retry_loops += 1;
+            ctx->tx_backpressure_events += 1;
+            break;
+        }
+        total_sent += sent;
+        offset += sent;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    xdp_record_send_timing(ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+    pthread_mutex_unlock(&ctx->lock);
+    xdp_native_set_err(err, err_len, "");
+    return total_sent;
+}
+
+static int xdp_native_reap_completions(
+    int handle,
+    uint32_t *frame_ids_out,
+    int max_count,
+    char *err,
+    size_t err_len
+)
+{
+    xdp_context_t *ctx = NULL;
+    uint32_t done = 0;
+
+    if (max_count < 0) {
+        xdp_native_set_err(err, err_len, "max_count must be >= 0");
+        return -1;
+    }
+    if (max_count == 0) {
+        xdp_native_set_err(err, err_len, "");
+        return 0;
+    }
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        xdp_native_set_err(err, err_len, "invalid context handle");
+        return -1;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "context not initialized");
+        return -1;
+    }
+    if (!ctx->external_umem_mode) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "reap_completions requires external_umem context");
+        return -1;
+    }
+
+    done = xdp_reap_completion_entries(
+        ctx->xsk,
+        (uint32_t)max_count,
+        frame_ids_out,
+        (uint32_t)max_count,
+        0
+    );
+    if (done > 0) {
+        ctx->tx_completion_events += 1;
+        ctx->tx_completed_desc += done;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    xdp_native_set_err(err, err_len, "");
+    return (int)done;
+}
+
 static int xdp_native_get_stats(int handle, xdp_native_stats *out, char *err, size_t err_len)
 {
     xdp_context_t *ctx = NULL;
@@ -2800,9 +3289,19 @@ static xdp_native_api_v1 g_xdp_native_api = {
     .create_ctx = xdp_native_create_ctx,
     .destroy_ctx = xdp_native_destroy_ctx,
     .send_buffer = xdp_native_send_buffer,
+    .send_buffer_strided = xdp_native_send_buffer_strided,
     .send_vector = xdp_native_send_vector,
     .get_stats = xdp_native_get_stats,
+    .create_ctx_external_umem = xdp_native_create_ctx_external_umem,
+    .submit_frame_ids = xdp_native_submit_frame_ids,
+    .reap_completions = xdp_native_reap_completions,
 };
+
+// Public C ABI for non-Python native bridge callers (e.g., CUDA persistent bridge).
+xdp_native_api_v1* samurai_xdp_get_native_api_v1(void)
+{
+    return &g_xdp_native_api;
+}
 
 static PyObject* py_xdp_get_native_api(PyObject* self, PyObject* args)
 {
