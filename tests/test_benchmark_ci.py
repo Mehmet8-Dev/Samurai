@@ -166,7 +166,7 @@ class TestCISafeBenchmarks(unittest.TestCase):
             # per-iteration runtime and scheduler preemption.
             "max_cv_pct_create_packet_udp": _env_float("SAMURAI_BENCH_MAX_CV_PCT_CREATE_PACKET_UDP", 12.0),
             # TCP+payload packet creation is similarly sensitive on noisy runners.
-            "max_cv_pct_create_packet_tcp_pa": _env_float("SAMURAI_BENCH_MAX_CV_PCT_CREATE_PACKET_TCP_PA", 12.0),
+            "max_cv_pct_create_packet_tcp_pa": _env_float("SAMURAI_BENCH_MAX_CV_PCT_CREATE_PACKET_TCP_PA", 16.0),
             "max_regression_pct": _env_float("SAMURAI_BENCH_MAX_REGRESSION_PCT", 5.0),
             "max_pool_peak_over_buf": _env_float("SAMURAI_BENCH_MAX_POOL_PEAK_RATIO", 2.2),
         }
@@ -309,6 +309,22 @@ class TestCISafeBenchmarks(unittest.TestCase):
             "l7_conn_rate_cv_pct": 0.0,
             "h1_conn_rate_cv_pct": 0.0,
             "h2_conn_rate_cv_pct": 0.0,
+            "persistent_tx_bridge_sent": 0,
+            "persistent_produced": 0,
+            "queue_pressure": 0,
+            "quota_stall": 0,
+            "ring_occupancy_peak": 0,
+            "persistent_runtime_restarts": 0,
+            "no_progress_events": 0,
+            "compat_fallback_count": 0,
+            "bridge_drain_batches": 0,
+            "bridge_drain_packets": 0,
+            "ring_drop_events": 0,
+            "scheduler_fairness_cv_pct": 0.0,
+            "persistent_tx_backend": "noop",
+            "persistent_tx_iface": "",
+            "persistent_bridge_ipg_ns": 0,
+            "persistent_tx_backend_strict": 0,
         }
         parity_matrix_path, parity_matrix = _load_parity_matrix()
         parity_profile = str(os.environ.get("SAMURAI_PARITY_PROFILE", "ci_safe") or "ci_safe")

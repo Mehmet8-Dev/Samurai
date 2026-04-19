@@ -14,6 +14,8 @@ class TestBenchmarkProfiles(unittest.TestCase):
         self.assertIn("dev", profiles)
         self.assertIn("ci_safe", profiles)
         self.assertIn("l7_dataplane_ci", profiles)
+        self.assertIn("persistent_stream_ci", profiles)
+        self.assertIn("persistent_stream_lab_strict", profiles)
         self.assertIn("dedicated_lab", profiles)
 
     def test_resolve_profile_aliases(self):
@@ -26,7 +28,7 @@ class TestBenchmarkProfiles(unittest.TestCase):
         _path, payload = benchmark_profiles.load_profiles()
         profiles = payload.get("profiles") or {}
         with tempfile.TemporaryDirectory() as td:
-            for name in ("dev", "ci_safe", "l7_dataplane_ci", "dedicated_lab"):
+            for name in ("dev", "ci_safe", "l7_dataplane_ci", "persistent_stream_ci", "persistent_stream_lab_strict", "dedicated_lab"):
                 runtime = benchmark_profiles.build_profile_runtime(
                     name,
                     dict(profiles[name]),
@@ -54,6 +56,10 @@ class TestBenchmarkProfiles(unittest.TestCase):
             self.assertEqual(export_env["SAMURAI_L7_CAPABILITY_STRICT"], "1")
             self.assertEqual(export_env["SAMURAI_CUSTOM_TCP_MODE"], "required")
             self.assertEqual(export_env["SAMURAI_CUSTOM_TCP_BACKEND"], "af_xdp")
+            self.assertEqual(export_env["SAMURAI_GPU_KERNEL_MODE"], "persistent")
+            self.assertEqual(export_env["SAMURAI_GPU_STREAM_API"], "stream")
+            self.assertEqual(export_env["SAMURAI_GPU_TX_BACKEND_STRICT"], "1")
+            self.assertEqual(export_env["SAMURAI_GPU_TX_BACKEND"], "af_xdp")
 
     def test_l7_runtime_uses_profile_specific_summary_file(self):
         _path, payload = benchmark_profiles.load_profiles()
@@ -67,6 +73,22 @@ class TestBenchmarkProfiles(unittest.TestCase):
             )
             self.assertTrue(str(runtime.get("summary_path", "")).endswith("benchmark_l7_summary.json"))
             self.assertTrue(str(runtime["env"]["SAMURAI_BENCH_REPORT_OUT"]).endswith("benchmark_l7_summary.json"))
+
+    def test_persistent_strict_runtime_exports_strict_tx_env(self):
+        _path, payload = benchmark_profiles.load_profiles()
+        profiles = payload.get("profiles") or {}
+        with tempfile.TemporaryDirectory() as td:
+            runtime = benchmark_profiles.build_profile_runtime(
+                "persistent_stream_lab_strict",
+                dict(profiles["persistent_stream_lab_strict"]),
+                artifact_root=td,
+                python_bin="/usr/bin/python3",
+            )
+            export_env = dict(runtime.get("export_env") or {})
+            self.assertEqual(export_env["SAMURAI_GPU_KERNEL_MODE"], "persistent")
+            self.assertEqual(export_env["SAMURAI_GPU_STREAM_API"], "stream")
+            self.assertEqual(export_env["SAMURAI_GPU_TX_BACKEND_STRICT"], "1")
+            self.assertEqual(export_env["SAMURAI_GPU_TX_BACKEND"], "af_xdp")
 
     def test_expected_kpi_thresholds_exist_for_all_profiles(self):
         _path, payload = benchmark_profiles.load_profiles()

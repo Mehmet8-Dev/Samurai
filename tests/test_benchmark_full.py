@@ -124,6 +124,22 @@ def _refresh_parity_section() -> None:
         "kpi_violations": [],
         "score_eligible": 1 if attempted > 0 else 0,
         "effective_pps": float(pacing.get("actual_rps", 0.0) or 0.0),
+        "persistent_tx_bridge_sent": 0,
+        "persistent_produced": 0,
+        "queue_pressure": 0,
+        "quota_stall": 0,
+        "ring_occupancy_peak": 0,
+        "persistent_runtime_restarts": 0,
+        "no_progress_events": 0,
+        "compat_fallback_count": 0,
+        "bridge_drain_batches": 0,
+        "bridge_drain_packets": 0,
+        "ring_drop_events": 0,
+        "scheduler_fairness_cv_pct": 0.0,
+        "persistent_tx_backend": "noop",
+        "persistent_tx_iface": "",
+        "persistent_bridge_ipg_ns": 0,
+        "persistent_tx_backend_strict": 0,
     }
     matrix_path, matrix = _load_parity_matrix()
     parity_profile = str(os.environ.get("SAMURAI_PARITY_PROFILE", "dedicated_lab") or "dedicated_lab")

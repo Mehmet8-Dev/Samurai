@@ -101,6 +101,12 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--gpu-full-variation", opts)
         self.assertIn("--no-gpu-full-variation", opts)
         self.assertIn("--gpu-pinned-max-mb", opts)
+        self.assertIn("--gpu-kernel-mode", opts)
+        self.assertIn("--gpu-stream-api", opts)
+        self.assertIn("--gpu-epoch-ms", opts)
+        self.assertIn("--gpu-queue-count", opts)
+        self.assertIn("--gpu-heartbeat-ms", opts)
+        self.assertIn("--gpu-no-progress-ms", opts)
         self.assertIn("--gpu-rng-seed", opts)
         self.assertIn("--state-table-size", opts)
         self.assertIn("--state-lock-count", opts)
@@ -170,8 +176,9 @@ class TestCliParser(unittest.TestCase):
         self.assertIn("--no-topo-strict", opts)
 
     def test_sender_route_defaults(self):
-        parser = cli.build_parser()
-        args = parser.parse_args([])
+        with patch.dict(os.environ, {"SAMURAI_GPU_KERNEL_MODE": "batch", "SAMURAI_GPU_STREAM_API": "compat"}, clear=False):
+            parser = cli.build_parser()
+            args = parser.parse_args([])
         self.assertEqual(args.sender_backend, "xdp")
         self.assertEqual(args.sender_fallback_policy, "fail")
         self.assertEqual(args.stateful_runtime_backend, "afxdp")
@@ -225,6 +232,12 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.gpu_pipeline_depth, 2)
         self.assertTrue(args.gpu_full_variation)
         self.assertFalse(args.gpu_packet_zerocopy_output)
+        self.assertEqual(args.gpu_kernel_mode, "batch")
+        self.assertEqual(args.gpu_stream_api, "compat")
+        self.assertEqual(args.gpu_epoch_ms, 50)
+        self.assertEqual(args.gpu_queue_count, 1)
+        self.assertEqual(args.gpu_heartbeat_ms, 500)
+        self.assertEqual(args.gpu_no_progress_ms, 2000)
         self.assertEqual(args.http2_connections, 1)
         self.assertEqual(args.http2_streams_per_conn, 100)
         self.assertEqual(args.l7_session_repeats, 1)
@@ -280,6 +293,12 @@ class TestCliParser(unittest.TestCase):
                 "SAMURAI_GPU_FULL_VARIATION": "0",
                 "SAMURAI_GPU_PINNED_MAX_MB": "256",
                 "SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT": "1",
+                "SAMURAI_GPU_KERNEL_MODE": "persistent",
+                "SAMURAI_GPU_STREAM_API": "stream",
+                "SAMURAI_GPU_EPOCH_MS": "75",
+                "SAMURAI_GPU_QUEUE_COUNT": "4",
+                "SAMURAI_GPU_HEARTBEAT_MS": "700",
+                "SAMURAI_GPU_NO_PROGRESS_MS": "3333",
                 "SAMURAI_GPU_RNG_SEED": "987654",
                 "SAMURAI_STATE_TABLE_SIZE": "32768",
                 "SAMURAI_STATE_LOCK_COUNT": "128",
@@ -299,6 +318,12 @@ class TestCliParser(unittest.TestCase):
             self.assertFalse(args.gpu_full_variation)
             self.assertEqual(args.gpu_pinned_max_mb, 256)
             self.assertTrue(args.gpu_packet_zerocopy_output)
+            self.assertEqual(args.gpu_kernel_mode, "persistent")
+            self.assertEqual(args.gpu_stream_api, "stream")
+            self.assertEqual(args.gpu_epoch_ms, 75)
+            self.assertEqual(args.gpu_queue_count, 4)
+            self.assertEqual(args.gpu_heartbeat_ms, 700)
+            self.assertEqual(args.gpu_no_progress_ms, 3333)
             self.assertEqual(args.gpu_rng_seed, 987654)
             self.assertEqual(args.state_table_size, 32768)
             self.assertEqual(args.state_lock_count, 128)
@@ -470,12 +495,14 @@ class TestSenderRouteValidation(unittest.TestCase):
         args = parser.parse_args(["--kpi-hard-fail"])
         self._assert_validation_fails(parser, args)
 
-    def test_kpi_gate_profile_accepts_dev_and_ci_safe(self):
+    def test_kpi_gate_profile_accepts_dev_ci_safe_and_persistent_strict(self):
         parser = cli.build_parser()
         args_dev = parser.parse_args(["--kpi-gate-profile", "dev"])
         args_ci = parser.parse_args(["--kpi-gate-profile", "ci_safe"])
+        args_persistent = parser.parse_args(["--kpi-gate-profile", "persistent_stream_strict"])
         cli._validate_sender_route_args(parser, args_dev)
         cli._validate_sender_route_args(parser, args_ci)
+        cli._validate_sender_route_args(parser, args_persistent)
 
     def test_l7_quic_require_native_requires_capability_strict(self):
         parser = cli.build_parser()
@@ -673,6 +700,58 @@ class TestL7CapabilityPreflight(unittest.TestCase):
         parser = cli.build_parser()
         args = parser.parse_args(["--attack-vector", "quic", "--l7-capability-strict"])
         self._assert_preflight_fails(parser, args)
+
+
+class TestPersistentTxBackendPreflight(unittest.TestCase):
+    def _assert_preflight_fails(self, parser, args):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli._preflight_persistent_tx_backend(parser, args)
+
+    def test_persistent_stream_autopromotes_verified_backend_and_strict(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--gpu-kernel-mode",
+                "persistent",
+                "--gpu-stream-api",
+                "stream",
+                "--xdp-interface",
+                "eth0",
+            ]
+        )
+        with patch.dict(os.environ, {"SAMURAI_GPU_TX_BACKEND": "auto", "SAMURAI_GPU_TX_BACKEND_STRICT": "0"}, clear=False):
+            cli._preflight_persistent_tx_backend(parser, args)
+            self.assertEqual(os.environ.get("SAMURAI_GPU_TX_BACKEND"), "af_xdp")
+            self.assertEqual(os.environ.get("SAMURAI_GPU_TX_BACKEND_STRICT"), "1")
+
+    def test_persistent_stream_rejects_unverified_backend(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--gpu-kernel-mode",
+                "persistent",
+                "--gpu-stream-api",
+                "stream",
+                "--xdp-interface",
+                "eth0",
+            ]
+        )
+        with patch.dict(os.environ, {"SAMURAI_GPU_TX_BACKEND": "legacy", "SAMURAI_GPU_TX_BACKEND_STRICT": "1"}, clear=False):
+            self._assert_preflight_fails(parser, args)
+
+    def test_persistent_stream_afxdp_requires_xdp_interface(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--gpu-kernel-mode",
+                "persistent",
+                "--gpu-stream-api",
+                "stream",
+            ]
+        )
+        with patch.dict(os.environ, {"SAMURAI_GPU_TX_BACKEND": "af_xdp", "SAMURAI_GPU_TX_BACKEND_STRICT": "1"}, clear=False):
+            self._assert_preflight_fails(parser, args)
 
 
 class TestRootGateRegression(unittest.TestCase):

@@ -78,7 +78,11 @@ class TestHybridGeneration(unittest.TestCase):
         if gpu_packets is None:
             self.skipTest("GPU packet buffer is None (CUDA device unavailable).")
 
-        cpu_packets = np.asarray(gpu_packets.get(), dtype=np.uint8)
+        cpu_packets = (
+            np.asarray(gpu_packets.get(), dtype=np.uint8)
+            if hasattr(gpu_packets, "get")
+            else np.asarray(gpu_packets, dtype=np.uint8)
+        )
         self.assertEqual(packet_len, len(template_bytes))
         self.assertEqual(cpu_packets.size, count * packet_len)
         

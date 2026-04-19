@@ -277,6 +277,22 @@ class TestL7DataplaneBenchmarkContract(unittest.TestCase):
             "h1_conn_rate_cv_pct": h1_conn_rate_cv_pct,
             "h2_conn_rate_cv_pct": h2_conn_rate_cv_pct,
             "l7_conn_rate_cv_pct": l7_conn_rate_cv_pct,
+            "persistent_tx_bridge_sent": 0,
+            "persistent_produced": 0,
+            "queue_pressure": 0,
+            "quota_stall": 0,
+            "ring_occupancy_peak": 0,
+            "persistent_runtime_restarts": 0,
+            "no_progress_events": 0,
+            "compat_fallback_count": 0,
+            "bridge_drain_batches": 0,
+            "bridge_drain_packets": 0,
+            "ring_drop_events": 0,
+            "scheduler_fairness_cv_pct": 0.0,
+            "persistent_tx_backend": "noop",
+            "persistent_tx_iface": "",
+            "persistent_bridge_ipg_ns": 0,
+            "persistent_tx_backend_strict": 0,
         }
         baseline_diff = _compute_baseline_diff(normalized_results, _load_optional_baseline())
         live_perf = _live_perf_acceptance()
