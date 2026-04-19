@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -461,6 +462,14 @@ int samurai_gpu_packet_generate_icmp_packets(
     uint8_t** out_data,
     size_t* out_size,
     int* out_packet_size);
+
+int samurai_gpu_packet_set_kernel_mode(int mode);
+int samurai_gpu_packet_get_kernel_mode();
+int samurai_gpu_packet_start_stream(const char* profile_json, int64_t* out_stream_id);
+int samurai_gpu_packet_update_stream(int64_t stream_id, const char* update_json);
+int samurai_gpu_packet_stop_stream(int64_t stream_id);
+const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id);
+int samurai_gpu_packet_shutdown_runtime();
 
 void samurai_gpu_packet_free(void* ptr);
 const char* samurai_gpu_packet_last_error();

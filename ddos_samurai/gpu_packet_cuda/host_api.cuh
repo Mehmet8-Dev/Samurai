@@ -1,6 +1,7 @@
 // This file is included by gpu_packet_cuda.cu after prerequisite fragments.
 // When opened standalone by IDE analysis, pull required fragments here.
 #include "../gpu_packet_cuda.hpp"
+#include <cstdio>
 #ifndef SAMURAI_GPU_PACKET_CUDA_PREAMBLE_INCLUDED
 #define SAMURAI_GPU_PACKET_CUDA_FRAGMENT_CHAIN 1
 #include "preamble.cuh"
@@ -1195,6 +1196,1839 @@ static int export_packet_result(
 static cudaStream_t decode_stream_handle(uint64_t stream_handle) {
   return reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_handle));
 }
+
+enum class KernelMode : int {
+  kBatch = 0,
+  kPersistent = 1,
+};
+
+enum class PersistentStreamKind : int32_t {
+  kL4 = 0,
+  kIcmp = 1,
+  kPcapReplay = 2,
+  kRamp = 3,
+};
+
+constexpr int kPersistentUmemFrameSize = 2048;
+constexpr int kPersistentUmemHeadroom = 256;
+constexpr int kPersistentMaxStreams = 256;
+constexpr int kPersistentMaxPacketBytes = kPersistentUmemFrameSize - kPersistentUmemHeadroom;
+constexpr int kPersistentDefaultMtu = 1500;
+constexpr int kPersistentPayloadCapacity = 1460;
+constexpr int kXdpNativeApiVersion = 2;
+
+struct XdpNativeStats {
+  uint64_t tx_packets;
+  uint64_t tx_bytes;
+  uint64_t tx_errors;
+  uint64_t tx_wakeups;
+  int mode;
+  int queue_id;
+};
+
+struct XdpNativeApiV1 {
+  int version;
+  int (*create_ctx)(const char* ifname, int queue_id, int mode, char* err, size_t err_len);
+  int (*destroy_ctx)(int handle, char* err, size_t err_len);
+  int (*send_buffer)(int handle, const uint8_t* buffer, int packet_size, int count, char* err, size_t err_len);
+  int (*send_buffer_strided)(
+      int handle,
+      const uint8_t* buffer,
+      int packet_size,
+      int stride,
+      int count,
+      char* err,
+      size_t err_len);
+  int (*send_vector)(
+      int handle,
+      const uint8_t** packets,
+      const uint16_t* lengths,
+      int count,
+      char* err,
+      size_t err_len);
+  int (*get_stats)(int handle, XdpNativeStats* out, char* err, size_t err_len);
+  int (*create_ctx_external_umem)(
+      const char* ifname,
+      int queue_id,
+      int mode,
+      void* umem_buffer,
+      size_t umem_buffer_len,
+      int frame_size,
+      int headroom,
+      int frame_count,
+      char* err,
+      size_t err_len);
+  int (*submit_frame_ids)(
+      int handle,
+      const uint32_t* frame_ids,
+      const uint16_t* lengths,
+      int count,
+      char* err,
+      size_t err_len);
+  int (*reap_completions)(
+      int handle,
+      uint32_t* frame_ids_out,
+      int max_count,
+      char* err,
+      size_t err_len);
+};
+
+extern "C" __attribute__((weak)) XdpNativeApiV1* samurai_xdp_get_native_api_v1(void);
+extern "C" __attribute__((weak)) int samurai_fast_sender_send_ring_bridge(
+    const char* iface,
+    const uint8_t* buffer,
+    size_t buffer_len,
+    int packet_size,
+    int count,
+    const uint8_t mac[6],
+    int* out_sent,
+    int* out_errors,
+    char* err_msg,
+    size_t err_msg_len);
+extern "C" __attribute__((weak)) int samurai_fast_sender_cleanup_ring_bridge(void);
+extern "C" __attribute__((weak)) uint64_t samurai_pacing_time_ns(void);
+extern "C" __attribute__((weak)) void samurai_pacing_precision_wait_ns(uint64_t target_ns);
+
+struct PersistentRingSlot {
+  volatile int32_t state = 0;  // 0=free, 1=ready, 2=reserved(write in progress), 3=in-flight
+  int32_t len = 0;
+  int32_t stream_id = 0;
+  int32_t stream_slot = -1;
+  int32_t protocol = 0;
+};
+
+struct PersistentRuntimeControl {
+  volatile int32_t run = 0;
+  int32_t queue_count = 1;
+  int32_t ring_slots = 0;
+  int32_t max_streams = kPersistentMaxStreams;
+  int32_t queue_probe_span = 4;
+  int32_t max_packet_bytes = kPersistentMaxPacketBytes;
+  uint64_t heartbeat = 0;
+  uint64_t produced = 0;
+  uint64_t queue_pressure = 0;
+  uint64_t queue_spread_events = 0;
+  uint64_t quota_stall = 0;
+  uint64_t idle_gap = 0;
+  uint64_t no_progress_events = 0;
+  uint64_t runtime_restarts = 0;
+  uint64_t tx_bridge_sent = 0;
+  uint64_t ring_occupancy_peak = 0;
+  uint64_t bridge_drain_batches = 0;
+  uint64_t bridge_drain_packets = 0;
+  uint64_t ring_drop_events = 0;
+  uint64_t scheduler_fairness_cv_pct_x100 = 0;
+  uint64_t throttle_events = 0;
+  uint64_t drain_attempts = 0;
+  uint64_t native_batch_degrade_events = 0;
+};
+
+struct PersistentDeviceStreamState {
+  int32_t active = 0;
+  int32_t stream_id = 0;
+  int32_t stream_kind = static_cast<int32_t>(PersistentStreamKind::kL4);
+  int32_t protocol = 6;
+  int32_t has_ethernet = 1;
+  int32_t spoof_enabled = 0;
+  int32_t queue_affinity = -1;
+  uint32_t target_ip = 0;
+  uint32_t src_ip = 0;
+  uint32_t spoof_base_ip = 0;
+  uint32_t spoof_mask = 32;
+  uint16_t target_port = 0;
+  uint16_t tcp_flags = 0x02;
+  uint16_t tcp_window = 65535;
+  uint16_t source_port = 0;
+  int32_t icmp_type = 8;
+  int32_t icmp_code = 0;
+  uint32_t quota = 0;
+  uint32_t quota_left = 0;
+  uint32_t ramp_step = 0;
+  uint32_t ramp_interval_epochs = 0;
+  uint32_t ramp_max_quota = 0;
+  uint32_t ramp_epoch_counter = 0;
+  uint32_t produced = 0;
+  uint32_t queue_cursor = 0;
+  uint32_t weight = 1;
+  uint32_t deficit = 0;
+  uint16_t payload_len = 0;
+  uint8_t payload_byte = 0;
+  uint8_t source_port_mode = 0;  // 0=auto, 1=fixed
+  uint8_t has_custom_mac = 0;
+  uint8_t src_mac[6]{0, 0, 0, 0, 0, 0};
+  uint8_t dst_mac[6]{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  uint8_t payload[kPersistentPayloadCapacity]{};
+};
+
+struct PersistentStreamState {
+  int64_t id = 0;
+  std::string profile_json;
+  std::string update_json;
+  std::string stream_type = "l4";
+  int device_slot = -1;
+  int stream_kind = static_cast<int>(PersistentStreamKind::kL4);
+  int protocol = 6;
+  int queue_affinity = -1;
+  uint32_t target_ip_int = 0;
+  uint32_t src_ip_int = 0;
+  uint32_t spoof_base_ip = 0;
+  uint32_t spoof_mask = 32;
+  uint16_t target_port = 0;
+  uint16_t tcp_flags = 0x02;
+  uint16_t tcp_window = 65535;
+  uint16_t source_port = 0;
+  int icmp_type = 8;
+  int icmp_code = 0;
+  uint32_t base_quota = 0;
+  uint32_t quota = 0;
+  uint32_t quota_left = 0;
+  uint32_t ramp_step = 0;
+  uint32_t ramp_interval_epochs = 0;
+  uint32_t ramp_max_quota = 0;
+  uint32_t ramp_epoch_counter = 0;
+  std::string pcap_file;
+  uint64_t created_ns = 0;
+  uint64_t updated_ns = 0;
+  uint64_t heartbeat_ns = 0;
+  uint64_t progress_ns = 0;
+  uint64_t submitted = 0;
+  uint64_t completed = 0;
+  uint64_t fallback = 0;
+  uint64_t errors = 0;
+  uint64_t queue_pressure = 0;
+  uint64_t quota_stall = 0;
+  uint64_t bridge_sent = 0;
+  uint64_t occupancy_peak = 0;
+  uint64_t bridge_drain_batches = 0;
+  uint64_t bridge_drain_packets = 0;
+  uint64_t ring_drop_events = 0;
+  double scheduler_fairness_cv_pct = 0.0;
+  uint16_t payload_len = 0;
+  uint8_t payload_byte = 0;
+  uint8_t source_port_mode = 0;
+  uint8_t has_custom_mac = 0;
+  std::array<uint8_t, 6> src_mac{{0, 0, 0, 0, 0, 0}};
+  std::array<uint8_t, 6> dst_mac{{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+  int active = 1;
+};
+
+enum class PersistentTxBackendKind : int {
+  kNoop = 0,
+  kAfXdp = 1,
+  kAfPacket = 2,
+};
+
+struct PersistentTxBridgeRuntime {
+  PersistentTxBackendKind kind = PersistentTxBackendKind::kNoop;
+  std::string requested = "auto";
+  std::string active = "noop";
+  std::string iface{};
+  int xdp_mode = 0;
+  int xdp_queue_base = 0;
+  std::array<uint8_t, 6> afpacket_mac{{0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu}};
+  const XdpNativeApiV1* xdp_api = nullptr;
+  int (*afpacket_send_bridge)(
+      const char* iface,
+      const uint8_t* buffer,
+      size_t buffer_len,
+      int packet_size,
+      int count,
+      const uint8_t mac[6],
+      int* out_sent,
+      int* out_errors,
+      char* err_msg,
+      size_t err_msg_len) = nullptr;
+  int (*afpacket_cleanup_bridge)(void) = nullptr;
+  std::vector<int> xdp_handles{};
+};
+
+std::mutex g_persistent_lock;
+std::unordered_map<int64_t, PersistentStreamState> g_persistent_streams;
+std::atomic<int64_t> g_next_stream_id{1};
+std::atomic<int> g_kernel_mode{static_cast<int>(KernelMode::kBatch)};
+std::atomic<uint64_t> g_compat_fallback_count{0};
+struct PersistentRuntime {
+  cudaStream_t kernel_stream = nullptr;
+  PersistentRuntimeControl* ctrl = nullptr;                       // mapped host
+  PersistentRuntimeControl* ctrl_dev = nullptr;                   // mapped device
+  PersistentDeviceStreamState* streams = nullptr;                 // mapped host
+  PersistentDeviceStreamState* streams_dev = nullptr;             // mapped device
+  PersistentRingSlot* rings_host = nullptr;                       // mapped host
+  PersistentRingSlot* rings_dev = nullptr;                        // mapped device view
+  uint8_t* payload_host = nullptr;                                // mapped host UMEM payload
+  uint8_t* payload_dev = nullptr;                                 // mapped device UMEM payload view
+  std::vector<std::thread> bridge_threads;
+  std::thread monitor_thread;
+  std::atomic<bool> threads_running{false};
+  std::atomic<uint64_t> last_produced_seen{0};
+  std::atomic<uint64_t> last_progress_ns{0};
+  int queue_count = 1;
+  int ring_slots = 0;
+  int epoch_ms = 50;
+  int heartbeat_ms = 500;
+  int no_progress_ms = 2000;
+  int bridge_max_burst = 64;
+  int bridge_thread_count = 1;
+  int bridge_idle_sleep_us = 200;
+  int bridge_drain_budget_ns = 200000;
+  int bridge_ipg_ns = 0;
+  int max_packet_bytes = kPersistentMaxPacketBytes;
+  uint64_t bridge_next_send_ns = 0;
+  std::atomic<uint64_t> last_epoch_refill_ns{0};
+  std::vector<uint32_t> queue_drain_cursor{};
+  std::vector<uint64_t> queue_sent_counts{};
+  std::array<std::atomic<uint64_t>, kPersistentMaxStreams> completed_by_slot{};
+  PersistentTxBridgeRuntime tx_bridge{};
+
+  ~PersistentRuntime() noexcept {
+    // Process-exit safety: avoid std::terminate from joinable std::thread.
+    threads_running.store(false, std::memory_order_relaxed);
+    if (ctrl) {
+      ctrl->run = 0;
+    }
+    if (kernel_stream) {
+      (void)cudaStreamSynchronize(kernel_stream);
+    } else {
+      (void)cudaDeviceSynchronize();
+    }
+    for (auto& t : bridge_threads) {
+      if (t.joinable()) {
+        t.join();
+      }
+    }
+    bridge_threads.clear();
+    if (monitor_thread.joinable()) {
+      monitor_thread.join();
+    }
+    if (kernel_stream) {
+      (void)cudaStreamDestroy(kernel_stream);
+      kernel_stream = nullptr;
+    }
+    if (rings_host) {
+      (void)cudaFreeHost(rings_host);
+      rings_host = nullptr;
+      rings_dev = nullptr;
+    }
+    if (payload_host) {
+      (void)cudaFreeHost(payload_host);
+      payload_host = nullptr;
+      payload_dev = nullptr;
+    }
+    if (streams) {
+      (void)cudaFreeHost(streams);
+      streams = nullptr;
+      streams_dev = nullptr;
+    }
+    if (ctrl) {
+      (void)cudaFreeHost(ctrl);
+      ctrl = nullptr;
+      ctrl_dev = nullptr;
+    }
+  }
+};
+PersistentRuntime g_persistent_runtime;
+thread_local std::string g_stream_stats_json;
+
+inline uint64_t now_ns_steady() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+inline void host_u64_add(volatile uint64_t* p, uint64_t v) {
+  if (!p || v == 0u) {
+    return;
+  }
+  (void)__atomic_fetch_add(reinterpret_cast<unsigned long long*>(const_cast<uint64_t*>(p)),
+                           static_cast<unsigned long long>(v),
+                           __ATOMIC_RELAXED);
+}
+
+inline std::string json_escape_string(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 16);
+  for (char c : in) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out.push_back(c);
+        break;
+    }
+  }
+  return out;
+}
+
+inline std::string json_value_raw(const std::string& json, const char* key) {
+  if (json.empty() || !key || !*key) {
+    return {};
+  }
+  const std::string needle = "\"" + std::string(key) + "\"";
+  size_t p = json.find(needle);
+  if (p == std::string::npos) {
+    return {};
+  }
+  p = json.find(':', p + needle.size());
+  if (p == std::string::npos) {
+    return {};
+  }
+  ++p;
+  while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) {
+    ++p;
+  }
+  if (p >= json.size()) {
+    return {};
+  }
+  if (json[p] == '"') {
+    ++p;
+    size_t e = p;
+    while (e < json.size() && json[e] != '"') {
+      if (json[e] == '\\' && e + 1 < json.size()) {
+        e += 2;
+      } else {
+        ++e;
+      }
+    }
+    return json.substr(p, e - p);
+  }
+  size_t e = p;
+  while (e < json.size() && json[e] != ',' && json[e] != '}') {
+    ++e;
+  }
+  std::string raw = json.substr(p, e - p);
+  while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()))) {
+    raw.pop_back();
+  }
+  return raw;
+}
+
+inline int json_get_int(const std::string& json, const char* key, int defv) {
+  const std::string raw = json_value_raw(json, key);
+  if (raw.empty()) {
+    return defv;
+  }
+  try {
+    return std::stoi(raw);
+  } catch (...) {
+    return defv;
+  }
+}
+
+inline uint32_t json_get_ip(const std::string& json, const char* key, uint32_t defv) {
+  const std::string raw = json_value_raw(json, key);
+  if (raw.empty()) {
+    return defv;
+  }
+  try {
+    return ddos_samurai::gpu_packet_cuda::ip_to_int(raw);
+  } catch (...) {
+    return defv;
+  }
+}
+
+inline std::string json_get_string(const std::string& json, const char* key, const std::string& defv = std::string()) {
+  const std::string raw = json_value_raw(json, key);
+  return raw.empty() ? defv : raw;
+}
+
+inline bool json_get_bool(const std::string& json, const char* key, bool defv = false) {
+  std::string raw = json_value_raw(json, key);
+  std::transform(raw.begin(), raw.end(), raw.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (raw.empty()) {
+    return defv;
+  }
+  if (raw == "1" || raw == "true" || raw == "yes" || raw == "on") {
+    return true;
+  }
+  if (raw == "0" || raw == "false" || raw == "no" || raw == "off") {
+    return false;
+  }
+  return defv;
+}
+
+inline int protocol_from_string(const std::string& protocol, int defv = 6) {
+  std::string proto = protocol;
+  std::transform(proto.begin(), proto.end(), proto.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (proto == "tcp") {
+    return 6;
+  }
+  if (proto == "udp") {
+    return 17;
+  }
+  if (proto == "icmp") {
+    return 1;
+  }
+  return defv;
+}
+
+inline const char* protocol_name_from_int(int proto) {
+  if (proto == 6) {
+    return "tcp";
+  }
+  if (proto == 17) {
+    return "udp";
+  }
+  if (proto == 1) {
+    return "icmp";
+  }
+  return "unknown";
+}
+
+inline PersistentStreamKind stream_kind_from_string(const std::string& stream_type, int protocol) {
+  std::string t = stream_type;
+  std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (t == "icmp") {
+    return PersistentStreamKind::kIcmp;
+  }
+  if (t == "pcap_replay" || t == "pcap-replay" || t == "pcap") {
+    return PersistentStreamKind::kPcapReplay;
+  }
+  if (t == "ramp") {
+    return PersistentStreamKind::kRamp;
+  }
+  if (protocol == 1) {
+    return PersistentStreamKind::kIcmp;
+  }
+  return PersistentStreamKind::kL4;
+}
+
+inline int clamp_i(int v, int lo, int hi) {
+  if (v < lo) {
+    return lo;
+  }
+  if (v > hi) {
+    return hi;
+  }
+  return v;
+}
+
+inline int env_int_local(const char* name, int defv) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) {
+    return defv;
+  }
+  try {
+    return std::stoi(v);
+  } catch (...) {
+    return defv;
+  }
+}
+
+inline std::string env_string_or(const char* name, const std::string& defv = std::string()) {
+  const char* v = std::getenv(name);
+  if (!v) {
+    return defv;
+  }
+  std::string out(v);
+  if (out.empty()) {
+    return defv;
+  }
+  return out;
+}
+
+inline std::vector<uint8_t> parse_hex_payload(const std::string& hex_raw) {
+  std::string hex = hex_raw;
+  hex.erase(std::remove_if(hex.begin(), hex.end(), [](unsigned char c) { return std::isspace(c) != 0; }), hex.end());
+  if (hex.rfind("0x", 0) == 0 || hex.rfind("0X", 0) == 0) {
+    hex = hex.substr(2);
+  }
+  if (hex.empty()) {
+    return {};
+  }
+  if (hex.size() % 2 != 0) {
+    hex = "0" + hex;
+  }
+  std::vector<uint8_t> out;
+  out.reserve(hex.size() / 2);
+  auto hex_nib = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+  };
+  for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+    const int hi = hex_nib(hex[i]);
+    const int lo = hex_nib(hex[i + 1]);
+    if (hi < 0 || lo < 0) {
+      return {};
+    }
+    out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+  }
+  return out;
+}
+
+inline std::string lower_copy(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return s;
+}
+
+inline bool parse_mac_string(const std::string& mac_str, std::array<uint8_t, 6>& out) {
+  if (mac_str.empty()) {
+    return false;
+  }
+  unsigned int b[6]{0, 0, 0, 0, 0, 0};
+  if (std::sscanf(mac_str.c_str(), "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+    return false;
+  }
+  for (int i = 0; i < 6; ++i) {
+    out[static_cast<size_t>(i)] = static_cast<uint8_t>(b[i] & 0xFFu);
+  }
+  return true;
+}
+
+inline void bridge_wait_until_ns(uint64_t target_ns) {
+  if (target_ns == 0u) {
+    return;
+  }
+  if (samurai_pacing_precision_wait_ns && samurai_pacing_time_ns) {
+    samurai_pacing_precision_wait_ns(target_ns);
+    return;
+  }
+  const uint64_t now = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  if (target_ns <= now) {
+    return;
+  }
+  const uint64_t delta = target_ns - now;
+  std::this_thread::sleep_for(std::chrono::nanoseconds(delta));
+}
+
+inline void persistent_bridge_backend_shutdown_unlocked(PersistentRuntime& rt) {
+  auto& b = rt.tx_bridge;
+  if (b.xdp_api) {
+    for (int h : b.xdp_handles) {
+      if (h >= 0 && b.xdp_api->destroy_ctx) {
+        char errbuf[160];
+        errbuf[0] = '\0';
+        (void)b.xdp_api->destroy_ctx(h, errbuf, sizeof(errbuf));
+      }
+    }
+  }
+  b.xdp_handles.clear();
+  if (b.afpacket_cleanup_bridge) {
+    (void)b.afpacket_cleanup_bridge();
+  }
+  b.kind = PersistentTxBackendKind::kNoop;
+  b.active = "noop";
+  b.xdp_api = nullptr;
+  b.afpacket_send_bridge = nullptr;
+  b.afpacket_cleanup_bridge = nullptr;
+}
+
+inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
+  auto& b = rt.tx_bridge;
+  persistent_bridge_backend_shutdown_unlocked(rt);
+
+  b.requested = lower_copy(env_string_or("SAMURAI_GPU_TX_BACKEND", "auto"));
+  b.iface = env_string_or("SAMURAI_GPU_TX_INTERFACE", env_string_or("SAMURAI_XDP_INTERFACE", ""));
+  b.xdp_mode = clamp_i(env_int_local("SAMURAI_XDP_MODE", 0), 0, 2);
+  b.xdp_queue_base = std::max(0, env_int_local("SAMURAI_XDP_QUEUE_ID", 0));
+  {
+    std::array<uint8_t, 6> mac{};
+    if (parse_mac_string(env_string_or("SAMURAI_GPU_TX_MAC", "ff:ff:ff:ff:ff:ff"), mac)) {
+      b.afpacket_mac = mac;
+    }
+  }
+
+  if (b.requested != "auto" && b.requested != "af_xdp" && b.requested != "af_packet" && b.requested != "noop") {
+    b.requested = "auto";
+  }
+  if (b.requested == "noop") {
+    b.kind = PersistentTxBackendKind::kNoop;
+    b.active = "noop";
+    return true;
+  }
+
+  const bool want_xdp = (b.requested == "auto" || b.requested == "af_xdp");
+  const bool want_afpacket = (b.requested == "auto" || b.requested == "af_packet");
+  if (want_xdp && !b.iface.empty()) {
+    if (samurai_xdp_get_native_api_v1) {
+      b.xdp_api = samurai_xdp_get_native_api_v1();
+      if (b.xdp_api && b.xdp_api->version == kXdpNativeApiVersion && b.xdp_api->create_ctx_external_umem &&
+          b.xdp_api->submit_frame_ids && b.xdp_api->reap_completions && b.xdp_api->destroy_ctx) {
+        b.xdp_handles.assign(static_cast<size_t>(rt.queue_count), -1);
+        bool ok = true;
+        for (int q = 0; q < rt.queue_count; ++q) {
+          char errbuf[160];
+          errbuf[0] = '\0';
+          const int queue_id = b.xdp_queue_base + q;
+          uint8_t* q_payload = rt.payload_host +
+                               (static_cast<size_t>(q) * static_cast<size_t>(rt.ring_slots) *
+                                static_cast<size_t>(kPersistentUmemFrameSize));
+          const size_t q_payload_len =
+              static_cast<size_t>(rt.ring_slots) * static_cast<size_t>(kPersistentUmemFrameSize);
+          const int h = b.xdp_api->create_ctx_external_umem(
+              b.iface.c_str(),
+              queue_id,
+              b.xdp_mode,
+              static_cast<void*>(q_payload),
+              q_payload_len,
+              kPersistentUmemFrameSize,
+              kPersistentUmemHeadroom,
+              rt.ring_slots,
+              errbuf,
+              sizeof(errbuf));
+          if (h < 0) {
+            ok = false;
+            break;
+          }
+          b.xdp_handles[static_cast<size_t>(q)] = h;
+        }
+        if (ok) {
+          b.kind = PersistentTxBackendKind::kAfXdp;
+          b.active = "af_xdp";
+          return true;
+        }
+        for (int h : b.xdp_handles) {
+          if (h >= 0) {
+            char derr[96];
+            derr[0] = '\0';
+            (void)b.xdp_api->destroy_ctx(h, derr, sizeof(derr));
+          }
+        }
+        b.xdp_handles.clear();
+      }
+    }
+    if (b.requested == "af_xdp") {
+      b.kind = PersistentTxBackendKind::kNoop;
+      b.active = "noop";
+      return false;
+    }
+  }
+
+  if (want_afpacket && !b.iface.empty()) {
+    if (samurai_fast_sender_send_ring_bridge && samurai_fast_sender_cleanup_ring_bridge) {
+      b.afpacket_send_bridge = samurai_fast_sender_send_ring_bridge;
+      b.afpacket_cleanup_bridge = samurai_fast_sender_cleanup_ring_bridge;
+      b.kind = PersistentTxBackendKind::kAfPacket;
+      b.active = "af_packet";
+      return true;
+    }
+    if (b.requested == "af_packet") {
+      b.kind = PersistentTxBackendKind::kNoop;
+      b.active = "noop";
+      return false;
+    }
+  }
+
+  b.kind = PersistentTxBackendKind::kNoop;
+  b.active = "noop";
+  return (b.requested == "auto");
+}
+
+__device__ inline uint16_t persistent_checksum(const uint8_t* data, int len) {
+  uint32_t sum = 0u;
+  int i = 0;
+  for (; i + 1 < len; i += 2) {
+    sum += (static_cast<uint32_t>(data[i]) << 8) | static_cast<uint32_t>(data[i + 1]);
+  }
+  if (i < len) {
+    sum += static_cast<uint32_t>(data[i]) << 8;
+  }
+  while (sum >> 16u) {
+    sum = (sum & 0xFFFFu) + (sum >> 16u);
+  }
+  return static_cast<uint16_t>((~sum) & 0xFFFFu);
+}
+
+__device__ inline uint16_t persistent_l4_checksum(
+    uint32_t src_ip,
+    uint32_t dst_ip,
+    uint8_t protocol,
+    const uint8_t* l4,
+    int l4_len) {
+  uint32_t sum = 0u;
+  sum += (src_ip >> 16) & 0xFFFFu;
+  sum += src_ip & 0xFFFFu;
+  sum += (dst_ip >> 16) & 0xFFFFu;
+  sum += dst_ip & 0xFFFFu;
+  sum += static_cast<uint32_t>(protocol);
+  sum += static_cast<uint32_t>(l4_len);
+  int i = 0;
+  for (; i + 1 < l4_len; i += 2) {
+    sum += (static_cast<uint32_t>(l4[i]) << 8) | static_cast<uint32_t>(l4[i + 1]);
+  }
+  if (i < l4_len) {
+    sum += static_cast<uint32_t>(l4[i]) << 8;
+  }
+  while (sum >> 16u) {
+    sum = (sum & 0xFFFFu) + (sum >> 16u);
+  }
+  return static_cast<uint16_t>((~sum) & 0xFFFFu);
+}
+
+__device__ inline void persistent_write_packet(
+    PersistentRingSlot* slot,
+    uint8_t* payload,
+    const volatile PersistentDeviceStreamState* sv,
+    uint32_t seq,
+    uint32_t max_packet_bytes) {
+  const int protocol = static_cast<int>(sv->protocol);
+  const int has_eth = (sv->has_ethernet != 0) ? 1 : 0;
+  const int ip_off = has_eth ? 14 : 0;
+  const int ip_len = 20;
+  const int tcp_len = 20;
+  const int udp_len = 8;
+  const int icmp_len = 8;
+  const bool is_tcp = (protocol == 6);
+  const bool is_udp = (protocol == 17);
+  const bool is_icmp = (protocol == 1);
+  if (!is_tcp && !is_udp && !is_icmp) {
+    slot->len = 0;
+    return;
+  }
+
+  int payload_len = static_cast<int>(sv->payload_len);
+  if (payload_len < 0) {
+    payload_len = 0;
+  }
+  if (payload_len > kPersistentPayloadCapacity) {
+    payload_len = kPersistentPayloadCapacity;
+  }
+  const int transport_len = (is_tcp ? tcp_len : (is_udp ? udp_len : icmp_len)) + payload_len;
+  const int total_len = ip_off + ip_len + transport_len;
+  if (total_len <= 0 || total_len > static_cast<int>(max_packet_bytes)) {
+    slot->len = 0;
+    return;
+  }
+
+  uint32_t src_ip = sv->src_ip;
+  const uint32_t spoof_mask = sv->spoof_mask;
+  if (sv->spoof_enabled != 0 && spoof_mask < 32u) {
+    const uint32_t hosts = (1u << (32u - spoof_mask));
+    src_ip = sv->spoof_base_ip + (hosts > 0 ? (seq % hosts) : 0u);
+  }
+
+  auto w16 = [&](int off, uint16_t v) {
+    payload[off] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    payload[off + 1] = static_cast<uint8_t>(v & 0xFFu);
+  };
+  auto w32 = [&](int off, uint32_t v) {
+    payload[off] = static_cast<uint8_t>((v >> 24) & 0xFFu);
+    payload[off + 1] = static_cast<uint8_t>((v >> 16) & 0xFFu);
+    payload[off + 2] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    payload[off + 3] = static_cast<uint8_t>(v & 0xFFu);
+  };
+
+  if (has_eth) {
+    if (sv->has_custom_mac != 0) {
+      for (int i = 0; i < 6; ++i) {
+        payload[i] = sv->dst_mac[i];
+        payload[6 + i] = sv->src_mac[i];
+      }
+    } else {
+      for (int i = 0; i < 6; ++i) {
+        payload[i] = 0xFFu;
+        payload[6 + i] = 0x00u;
+      }
+    }
+    payload[12] = 0x08u;
+    payload[13] = 0x00u;
+  }
+
+  const int ip = ip_off;
+  payload[ip + 0] = 0x45u;
+  payload[ip + 1] = 0x00u;
+  w16(ip + 2, static_cast<uint16_t>(ip_len + transport_len));
+  w16(ip + 4, static_cast<uint16_t>(seq & 0xFFFFu));
+  w16(ip + 6, 0x4000u);
+  payload[ip + 8] = static_cast<uint8_t>(48u + (seq % 64u));
+  payload[ip + 9] = static_cast<uint8_t>(protocol & 0xFF);
+  w16(ip + 10, 0u);
+  w32(ip + 12, src_ip);
+  w32(ip + 16, sv->target_ip);
+  w16(ip + 10, persistent_checksum(payload + ip, ip_len));
+
+  const int t_off = ip_off + ip_len;
+  const uint16_t auto_src_port = static_cast<uint16_t>(1024u + (seq % 64511u));
+  const uint16_t src_port = (sv->source_port_mode != 0 && sv->source_port != 0) ? sv->source_port : auto_src_port;
+
+  if (is_tcp) {
+    w16(t_off + 0, src_port);
+    w16(t_off + 2, sv->target_port);
+    w32(t_off + 4, seq * 2654435761u);
+    w32(t_off + 8, 0u);
+    payload[t_off + 12] = 0x50;  // TCP header len 20 bytes
+    payload[t_off + 13] = static_cast<uint8_t>(sv->tcp_flags & 0xFFu);
+    w16(t_off + 14, sv->tcp_window);
+    w16(t_off + 16, 0u);
+    w16(t_off + 18, 0u);
+  } else if (is_udp) {
+    w16(t_off + 0, src_port);
+    w16(t_off + 2, sv->target_port);
+    w16(t_off + 4, static_cast<uint16_t>(udp_len + payload_len));
+    w16(t_off + 6, 0u);
+  } else {
+    payload[t_off + 0] = static_cast<uint8_t>(sv->icmp_type & 0xFF);
+    payload[t_off + 1] = static_cast<uint8_t>(sv->icmp_code & 0xFF);
+    w16(t_off + 2, 0u);
+    w16(t_off + 4, static_cast<uint16_t>(seq & 0xFFFFu));
+    w16(t_off + 6, static_cast<uint16_t>(sv->stream_id & 0xFFFF));
+  }
+
+  const int data_off = t_off + (is_tcp ? tcp_len : (is_udp ? udp_len : icmp_len));
+  for (int i = 0; i < payload_len; ++i) {
+    payload[data_off + i] = (i < static_cast<int>(sv->payload_len)) ? sv->payload[i] : sv->payload_byte;
+  }
+
+  if (is_tcp) {
+    w16(t_off + 16, 0u);
+    const uint16_t tcp_csum = persistent_l4_checksum(src_ip, sv->target_ip, 6, payload + t_off, tcp_len + payload_len);
+    w16(t_off + 16, tcp_csum);
+  } else if (is_udp) {
+    w16(t_off + 6, 0u);
+    uint16_t udp_csum = persistent_l4_checksum(src_ip, sv->target_ip, 17, payload + t_off, udp_len + payload_len);
+    if (udp_csum == 0u) {
+      udp_csum = 0xFFFFu;
+    }
+    w16(t_off + 6, udp_csum);
+  } else {
+    w16(t_off + 2, 0u);
+    const uint16_t icmp_csum = persistent_checksum(payload + t_off, icmp_len + payload_len);
+    w16(t_off + 2, icmp_csum);
+  }
+
+  slot->len = total_len;
+}
+
+__device__ inline uint32_t u32_load(const volatile uint32_t* p) {
+  return atomicAdd((unsigned int*)p, 0u);
+}
+
+__device__ inline int32_t i32_load(const volatile int32_t* p) {
+  return atomicAdd((int*)p, 0);
+}
+
+__device__ inline uint64_t u64_add(volatile uint64_t* p, uint64_t v) {
+  return atomicAdd((unsigned long long*)p, static_cast<unsigned long long>(v));
+}
+
+__device__ inline void adaptive_quota_throttle(volatile PersistentDeviceStreamState* sv) {
+  const uint32_t quota = u32_load(&sv->quota);
+  if (quota == 0u) {
+    return;
+  }
+  while (true) {
+    const uint32_t cur_left = u32_load(&sv->quota_left);
+    if (cur_left <= 1u || cur_left <= (quota / 4u)) {
+      return;
+    }
+    const uint32_t drop_step = (quota / 16u) > 0u ? (quota / 16u) : 1u;
+    const uint32_t next = (cur_left > drop_step) ? (cur_left - drop_step) : 1u;
+    if (atomicCAS(
+            (unsigned int*)&sv->quota_left,
+            cur_left,
+            next) == cur_left) {
+      return;
+    }
+  }
+}
+
+__device__ inline uint32_t reserve_stream_tokens(
+    volatile PersistentDeviceStreamState* sv,
+    uint32_t max_tokens,
+    uint32_t* slot_base_out) {
+  if (!sv || max_tokens == 0u) {
+    return 0u;
+  }
+  if (slot_base_out) {
+    *slot_base_out = 0u;
+  }
+
+  const uint32_t quota_now = u32_load(&sv->quota_left);
+  if (quota_now == 0u) {
+    return 0u;
+  }
+
+  if (u32_load(&sv->deficit) == 0u) {
+    const uint32_t weight = u32_load(&sv->weight);
+    (void)atomicCAS(
+        (unsigned int*)&sv->deficit,
+        0u,
+        weight == 0u ? 1u : weight);
+  }
+
+  const uint32_t deficit_now = u32_load(&sv->deficit);
+  if (deficit_now == 0u) {
+    return 0u;
+  }
+
+  uint32_t reserve = quota_now;
+  if (reserve > deficit_now) {
+    reserve = deficit_now;
+  }
+  if (reserve > max_tokens) {
+    reserve = max_tokens;
+  }
+  if (reserve == 0u) {
+    return 0u;
+  }
+
+  const uint32_t q_prev = atomicSub((unsigned int*)&sv->quota_left, reserve);
+  if (q_prev < reserve) {
+    (void)atomicAdd((unsigned int*)&sv->quota_left, reserve);
+    return 0u;
+  }
+
+  const uint32_t d_prev = atomicSub((unsigned int*)&sv->deficit, reserve);
+  if (d_prev < reserve) {
+    (void)atomicAdd((unsigned int*)&sv->quota_left, reserve);
+    (void)atomicAdd((unsigned int*)&sv->deficit, reserve);
+    return 0u;
+  }
+
+  if (slot_base_out) {
+    *slot_base_out = atomicAdd((unsigned int*)&sv->queue_cursor, reserve);
+  }
+  return reserve;
+}
+
+__global__ void persistent_dataplane_kernel(
+    volatile PersistentRuntimeControl* ctrl,
+    volatile PersistentDeviceStreamState* streams,
+    PersistentRingSlot* rings,
+    uint8_t* payload_base) {
+  const uint32_t tid = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const uint32_t workers = static_cast<uint32_t>(gridDim.x * blockDim.x);
+  constexpr uint32_t kTokenReserveChunk = 4u;
+  uint32_t rr = tid;
+  uint32_t throttle_gate = tid;
+  while (ctrl && ctrl->run == 1) {
+    if (tid == 0u) {
+      u64_add(&ctrl->heartbeat, 1u);
+    }
+    bool produced = false;
+    for (int i = 0; i < ctrl->max_streams; ++i) {
+      const int idx = static_cast<int>((rr + static_cast<uint32_t>(i)) % static_cast<uint32_t>(ctrl->max_streams));
+      volatile PersistentDeviceStreamState* sv = &streams[idx];
+      const int32_t proto = i32_load(&sv->protocol);
+      if (sv->active == 0 || sv->target_ip == 0u || (proto != 1 && sv->target_port == 0u)) {
+        continue;
+      }
+      uint32_t slot_seq_base = 0u;
+      const uint32_t reserved_tokens = reserve_stream_tokens(sv, kTokenReserveChunk, &slot_seq_base);
+      if (reserved_tokens == 0u) {
+        continue;
+      }
+
+      const int affinity_q = i32_load(&sv->queue_affinity);
+      const int sid = i32_load(&sv->stream_id);
+      int produced_for_stream = 0;
+
+      for (uint32_t token_i = 0; token_i < reserved_tokens; ++token_i) {
+        const uint32_t produced_now = atomicAdd(
+            (unsigned int*)&sv->produced,
+            1u) +
+            1u;
+        const uint32_t route_seed = produced_now ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
+        int q_base = affinity_q;
+        if (q_base < 0 || q_base >= ctrl->queue_count) {
+          q_base = static_cast<int>(route_seed % static_cast<uint32_t>(ctrl->queue_count));
+        }
+        int probe_span = 1;
+        if (ctrl->queue_count > 1) {
+          probe_span = ctrl->queue_probe_span;
+          if (probe_span < 1) {
+            probe_span = 1;
+          }
+          if (probe_span > ctrl->queue_count) {
+            probe_span = ctrl->queue_count;
+          }
+        }
+
+        PersistentRingSlot* slot_ptr = nullptr;
+        int q = q_base;
+        uint32_t slot_idx = 0u;
+        const uint32_t slot_seq = slot_seq_base + token_i;
+        for (int probe = 0; probe < probe_span; ++probe) {
+          const int q_try = (q_base + probe) % ctrl->queue_count;
+          const uint32_t slot_try = (slot_seq + static_cast<uint32_t>(probe)) % static_cast<uint32_t>(ctrl->ring_slots);
+          PersistentRingSlot& candidate = rings[q_try * ctrl->ring_slots + static_cast<int>(slot_try)];
+          if (atomicCAS((int*)&candidate.state, 0, 2) == 0) {
+            q = q_try;
+            slot_idx = slot_try;
+            slot_ptr = &candidate;
+            if (probe > 0) {
+              u64_add(&ctrl->queue_spread_events, 1u);
+            }
+            break;
+          }
+        }
+        if (!slot_ptr) {
+          u64_add(&ctrl->queue_pressure, 1u);
+          u64_add(&ctrl->ring_drop_events, 1u);
+          // Preserve previous semantics: return only quota token on ring miss.
+          (void)atomicAdd((unsigned int*)&sv->quota_left, 1u);
+          if ((throttle_gate++ & 0x3Fu) == 0u) {
+            adaptive_quota_throttle(sv);
+          }
+          continue;
+        }
+        PersistentRingSlot& slot = *slot_ptr;
+
+        uint8_t* slot_payload =
+            payload_base +
+            ((static_cast<size_t>(q) * static_cast<size_t>(ctrl->ring_slots) + static_cast<size_t>(slot_idx)) *
+             static_cast<size_t>(kPersistentUmemFrameSize)) +
+            static_cast<size_t>(kPersistentUmemHeadroom);
+
+        persistent_write_packet(
+            &slot,
+            slot_payload,
+            sv,
+            produced_now,
+            static_cast<uint32_t>(
+                ctrl->max_packet_bytes > 0
+                    ? ctrl->max_packet_bytes
+                    : (kPersistentUmemFrameSize - kPersistentUmemHeadroom)));
+        slot.stream_id = i32_load(&sv->stream_id);
+        slot.stream_slot = idx;
+        slot.protocol = proto;
+        __threadfence_system();
+        atomicExch((int*)&slot.state, 1);
+        u64_add(&ctrl->produced, 1u);
+        produced = true;
+        produced_for_stream += 1;
+      }
+
+      if (produced_for_stream > 0) {
+        rr = static_cast<uint32_t>(idx + 1);
+        break;
+      }
+    }
+    if (!produced) {
+      u64_add(&ctrl->quota_stall, 1u);
+      u64_add(&ctrl->idle_gap, 1u);
+      // Intentional: no GPU-side nanosleep. Idle pacing is controlled by CPU epoch/quota refill.
+      if (workers > 1u) {
+        rr += workers;
+      } else {
+        rr += 1u;
+      }
+    } else if (workers > 1u) {
+      rr += workers;
+    }
+  }
+}
+
+inline int ring_occupancy_now(const PersistentRuntime& rt) {
+  if (!rt.rings_host || !rt.ctrl || rt.queue_count <= 0 || rt.ring_slots <= 0) {
+    return 0;
+  }
+  const int total = rt.queue_count * rt.ring_slots;
+  int occ = 0;
+  for (int i = 0; i < total; ++i) {
+    if (rt.rings_host[i].state != 0) {
+      ++occ;
+    }
+  }
+  return occ;
+}
+
+inline void persistent_bridge_loop(int worker_idx, int worker_count) {
+  PersistentRuntime& rt = g_persistent_runtime;
+  const int workers = std::max(1, worker_count);
+  const int worker = std::max(0, worker_idx);
+  while (rt.threads_running.load(std::memory_order_relaxed)) {
+    bool progressed = false;
+    uint64_t local_sent = 0u;
+    uint64_t local_batches = 0u;
+    uint64_t local_drops = 0u;
+    if (rt.rings_host && rt.ctrl) {
+      for (int q = worker; q < rt.queue_count; q += workers) {
+        uint32_t& cursor = rt.queue_drain_cursor[static_cast<size_t>(q)];
+        if (cursor >= static_cast<uint32_t>(rt.ring_slots)) {
+          cursor = 0u;
+        }
+        const uint64_t t0 = now_ns_steady();
+        uint64_t drained = 0;
+        std::vector<uint32_t> submit_frame_ids;
+        std::vector<uint16_t> submit_lengths;
+        std::vector<uint32_t> completion_frame_ids;
+        submit_frame_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
+        submit_lengths.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
+        completion_frame_ids.resize(static_cast<size_t>(std::max(64, rt.bridge_max_burst)));
+        while (drained < static_cast<uint64_t>(std::max(1, rt.bridge_max_burst))) {
+          if (rt.bridge_drain_budget_ns > 0) {
+            const uint64_t elapsed = now_ns_steady() - t0;
+            if (elapsed >= static_cast<uint64_t>(rt.bridge_drain_budget_ns)) {
+              break;
+            }
+          }
+          if (rt.tx_bridge.kind == PersistentTxBackendKind::kAfXdp && rt.tx_bridge.xdp_api &&
+              rt.tx_bridge.xdp_api->submit_frame_ids && rt.tx_bridge.xdp_api->reap_completions &&
+              q < static_cast<int>(rt.tx_bridge.xdp_handles.size()) &&
+              rt.tx_bridge.xdp_handles[static_cast<size_t>(q)] >= 0) {
+            const int handle = rt.tx_bridge.xdp_handles[static_cast<size_t>(q)];
+            char errbuf[160];
+            errbuf[0] = '\0';
+            int reaped = rt.tx_bridge.xdp_api->reap_completions(
+                handle,
+                completion_frame_ids.data(),
+                static_cast<int>(completion_frame_ids.size()),
+                errbuf,
+                sizeof(errbuf));
+            if (reaped < 0) {
+              reaped = 0;
+            }
+            if (reaped > 0) {
+              for (int i = 0; i < reaped; ++i) {
+                const uint32_t fid = completion_frame_ids[static_cast<size_t>(i)];
+                if (fid >= static_cast<uint32_t>(rt.ring_slots)) {
+                  continue;
+                }
+                const int idx = q * rt.ring_slots + static_cast<int>(fid);
+                PersistentRingSlot& slot = rt.rings_host[idx];
+                const int slot_idx = slot.stream_slot;
+                slot.state = 0;
+                slot.len = 0;
+                slot.stream_id = 0;
+                slot.stream_slot = -1;
+                slot.protocol = 0;
+                if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
+                  rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+                }
+              }
+              progressed = true;
+            }
+
+            const int burst_limit = std::max(1, rt.bridge_max_burst);
+            while (drained < static_cast<uint64_t>(burst_limit)) {
+              const int run_budget = std::min<int>(
+                  burst_limit - static_cast<int>(drained),
+                  rt.ring_slots - static_cast<int>(cursor));
+              if (run_budget <= 0) {
+                break;
+              }
+              submit_frame_ids.clear();
+              submit_lengths.clear();
+              for (int i = 0; i < run_budget; ++i) {
+                const int idx = q * rt.ring_slots + static_cast<int>(cursor) + i;
+                PersistentRingSlot& slot = rt.rings_host[idx];
+                if (slot.state != 1) {
+                  break;
+                }
+                const int max_packet = (rt.ctrl && rt.ctrl->max_packet_bytes > 0) ? rt.ctrl->max_packet_bytes : kPersistentMaxPacketBytes;
+                if (slot.len <= 0 || slot.len > max_packet) {
+                  slot.state = 0;
+                  slot.len = 0;
+                  slot.stream_id = 0;
+                  slot.stream_slot = -1;
+                  slot.protocol = 0;
+                  local_drops += 1u;
+                  cursor = (cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
+                  break;
+                }
+                submit_frame_ids.push_back(static_cast<uint32_t>(cursor + static_cast<uint32_t>(i)));
+                submit_lengths.push_back(static_cast<uint16_t>(slot.len));
+              }
+              if (submit_frame_ids.empty()) {
+                break;
+              }
+              int sent = rt.tx_bridge.xdp_api->submit_frame_ids(
+                  handle,
+                  submit_frame_ids.data(),
+                  submit_lengths.data(),
+                  static_cast<int>(submit_frame_ids.size()),
+                  errbuf,
+                  sizeof(errbuf));
+              if (sent < 0) {
+                sent = 0;
+              }
+              if (sent > static_cast<int>(submit_frame_ids.size())) {
+                sent = static_cast<int>(submit_frame_ids.size());
+              }
+              for (int i = 0; i < sent; ++i) {
+                const int idx = q * rt.ring_slots + static_cast<int>(submit_frame_ids[static_cast<size_t>(i)]);
+                PersistentRingSlot& slot = rt.rings_host[idx];
+                slot.state = 3;  // in-flight, release on completion.
+              }
+              if (sent > 0) {
+                progressed = true;
+                local_sent += static_cast<uint64_t>(sent);
+                rt.queue_sent_counts[static_cast<size_t>(q)] += static_cast<uint64_t>(sent);
+                drained += static_cast<uint64_t>(sent);
+                if (rt.bridge_ipg_ns > 0) {
+                  const uint64_t base = (rt.bridge_next_send_ns > 0u ? rt.bridge_next_send_ns : now_ns_steady());
+                  const uint64_t target =
+                      base + (static_cast<uint64_t>(rt.bridge_ipg_ns) * static_cast<uint64_t>(sent));
+                  bridge_wait_until_ns(target);
+                  rt.bridge_next_send_ns = target;
+                }
+              }
+              cursor = (cursor + static_cast<uint32_t>(sent)) % static_cast<uint32_t>(rt.ring_slots);
+              if (sent == 0 || sent < static_cast<int>(submit_frame_ids.size())) {
+                break;
+              }
+            }
+            if (drained == 0u) {
+              break;
+            }
+            continue;
+          }
+
+          if (rt.tx_bridge.kind == PersistentTxBackendKind::kAfPacket && rt.tx_bridge.afpacket_send_bridge &&
+              !rt.tx_bridge.iface.empty()) {
+            const int idx = q * rt.ring_slots + static_cast<int>(cursor);
+            PersistentRingSlot& slot = rt.rings_host[idx];
+            if (slot.state != 1) {
+              break;
+            }
+            const int max_packet = (rt.ctrl && rt.ctrl->max_packet_bytes > 0) ? rt.ctrl->max_packet_bytes : kPersistentMaxPacketBytes;
+            if (slot.len <= 0 || slot.len > max_packet) {
+              slot.state = 0;
+              slot.len = 0;
+              slot.stream_id = 0;
+              slot.stream_slot = -1;
+              slot.protocol = 0;
+              local_drops += 1u;
+              cursor = (cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
+              continue;
+            }
+            int sent = 0;
+            int errors = 0;
+            char errbuf[160];
+            errbuf[0] = '\0';
+            uint8_t* payload =
+                rt.payload_host +
+                ((static_cast<size_t>(q) * static_cast<size_t>(rt.ring_slots) + static_cast<size_t>(cursor)) *
+                 static_cast<size_t>(kPersistentUmemFrameSize)) +
+                static_cast<size_t>(kPersistentUmemHeadroom);
+            const int rc = rt.tx_bridge.afpacket_send_bridge(
+                rt.tx_bridge.iface.c_str(),
+                payload,
+                static_cast<size_t>(slot.len),
+                slot.len,
+                1,
+                rt.tx_bridge.afpacket_mac.data(),
+                &sent,
+                &errors,
+                errbuf,
+                sizeof(errbuf));
+            if (rc < 0 || sent <= 0) {
+              local_drops += 1u;
+              break;
+            }
+            const int slot_idx = slot.stream_slot;
+            slot.state = 0;
+            slot.len = 0;
+            slot.stream_id = 0;
+            slot.stream_slot = -1;
+            slot.protocol = 0;
+            if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
+              rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+            }
+            drained += 1u;
+            progressed = true;
+            local_sent += 1u;
+            rt.queue_sent_counts[static_cast<size_t>(q)] += 1u;
+            if (rt.bridge_ipg_ns > 0) {
+              const uint64_t base = (rt.bridge_next_send_ns > 0u ? rt.bridge_next_send_ns : now_ns_steady());
+              const uint64_t target = base + static_cast<uint64_t>(rt.bridge_ipg_ns);
+              bridge_wait_until_ns(target);
+              rt.bridge_next_send_ns = target;
+            }
+            cursor = (cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
+            continue;
+          }
+
+          // No native sender backend available: preserve legacy noop drain for non-network test paths.
+          const int idx = q * rt.ring_slots + static_cast<int>(cursor);
+          PersistentRingSlot& slot = rt.rings_host[idx];
+          if (slot.state != 1) {
+            break;
+          }
+          const int slot_idx = slot.stream_slot;
+          slot.state = 0;
+          slot.len = 0;
+          slot.stream_id = 0;
+          slot.stream_slot = -1;
+          slot.protocol = 0;
+          local_sent += 1u;
+          rt.queue_sent_counts[static_cast<size_t>(q)] += 1u;
+          if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
+            rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+          }
+          drained += 1u;
+          progressed = true;
+          cursor = (cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
+        }
+        if (drained > 0u) {
+          local_batches += 1u;
+        }
+      }
+      if (local_sent > 0u) {
+        host_u64_add(&rt.ctrl->tx_bridge_sent, local_sent);
+        host_u64_add(&rt.ctrl->bridge_drain_packets, local_sent);
+      }
+      if (local_batches > 0u) {
+        host_u64_add(&rt.ctrl->bridge_drain_batches, local_batches);
+      }
+      if (local_drops > 0u) {
+        host_u64_add(&rt.ctrl->ring_drop_events, local_drops);
+      }
+      if (worker == 0) {
+        const int occ = ring_occupancy_now(rt);
+        if (static_cast<uint64_t>(occ) > rt.ctrl->ring_occupancy_peak) {
+          rt.ctrl->ring_occupancy_peak = static_cast<uint64_t>(occ);
+        }
+      }
+    }
+    if (!progressed) {
+      std::this_thread::sleep_for(std::chrono::microseconds(std::max(0, rt.bridge_idle_sleep_us)));
+    }
+  }
+}
+
+inline bool persistent_launch_kernel() {
+  PersistentRuntime& rt = g_persistent_runtime;
+  if (!rt.ctrl || !rt.ctrl_dev || !rt.streams || !rt.streams_dev || !rt.rings_dev || !rt.payload_dev) {
+    return false;
+  }
+  if (!rt.kernel_stream) {
+    if (cudaStreamCreateWithFlags(&rt.kernel_stream, cudaStreamNonBlocking) != cudaSuccess) {
+      return false;
+    }
+  }
+  rt.ctrl->run = 1;
+  auto env_int_local = [](const char* name, int defv) -> int {
+    const char* v = std::getenv(name);
+    if (!v || !*v) {
+      return defv;
+    }
+    try {
+      return std::stoi(v);
+    } catch (...) {
+      return defv;
+    }
+  };
+  const int threads = clamp_i(env_int_local("SAMURAI_GPU_PERSISTENT_THREADS", 128), 32, 512);
+  const int blocks_env = env_int_local("SAMURAI_GPU_PERSISTENT_BLOCKS", -1);
+  int blocks = (blocks_env > 0) ? blocks_env : (rt.queue_count * 4);
+  blocks = clamp_i(blocks, 1, 256);
+  CUDA_KERNEL_LAUNCH(
+      persistent_dataplane_kernel,
+      blocks,
+      threads,
+      rt.kernel_stream,
+      rt.ctrl_dev,
+      rt.streams_dev,
+      rt.rings_dev,
+      rt.payload_dev);
+  return (cudaPeekAtLastError() == cudaSuccess);
+}
+
+inline void persistent_stop_kernel() {
+  PersistentRuntime& rt = g_persistent_runtime;
+  if (rt.ctrl) {
+    rt.ctrl->run = 0;
+  }
+  if (rt.kernel_stream) {
+    (void)cudaStreamSynchronize(rt.kernel_stream);
+  } else {
+    (void)cudaDeviceSynchronize();
+  }
+}
+
+inline void persistent_monitor_loop() {
+  PersistentRuntime& rt = g_persistent_runtime;
+  uint64_t prev_produced = 0;
+  uint64_t last_progress = now_ns_steady();
+  while (rt.threads_running.load(std::memory_order_relaxed)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::max(10, rt.heartbeat_ms)));
+    if (!rt.ctrl) {
+      continue;
+    }
+    const uint64_t produced = rt.ctrl->produced;
+    if (produced != prev_produced) {
+      prev_produced = produced;
+      last_progress = now_ns_steady();
+      rt.last_progress_ns.store(last_progress, std::memory_order_relaxed);
+    }
+    {
+      std::lock_guard<std::mutex> g(g_persistent_lock);
+      const uint64_t now_epoch = now_ns_steady();
+      const uint64_t epoch_ns = static_cast<uint64_t>(std::max(1, rt.epoch_ms)) * 1000000ull;
+      uint64_t prev_epoch = rt.last_epoch_refill_ns.load(std::memory_order_relaxed);
+      bool do_refill = false;
+      if (now_epoch >= prev_epoch + epoch_ns) {
+        if (rt.last_epoch_refill_ns.compare_exchange_strong(prev_epoch, now_epoch, std::memory_order_relaxed)) {
+          do_refill = true;
+        }
+      }
+      std::vector<double> fairness_samples;
+      fairness_samples.reserve(g_persistent_streams.size());
+      for (auto& kv : g_persistent_streams) {
+        auto& st = kv.second;
+        if (st.active == 0 || st.device_slot < 0 || !rt.streams) {
+          continue;
+        }
+        st.heartbeat_ns = now_ns_steady();
+        PersistentDeviceStreamState& d = rt.streams[st.device_slot];
+        const uint64_t completed_delta =
+            rt.completed_by_slot[static_cast<size_t>(st.device_slot)].exchange(0u, std::memory_order_relaxed);
+        if (completed_delta > 0u) {
+          st.completed += completed_delta;
+          st.bridge_drain_packets += completed_delta;
+          st.progress_ns = now_ns_steady();
+        }
+        if (do_refill && st.base_quota > 0u) {
+          if (st.stream_kind == static_cast<int>(PersistentStreamKind::kRamp) && st.ramp_step > 0u) {
+            st.ramp_epoch_counter += 1u;
+            const uint32_t interval = std::max<uint32_t>(1u, st.ramp_interval_epochs);
+            if ((st.ramp_epoch_counter % interval) == 0u) {
+              uint64_t next_quota = static_cast<uint64_t>(st.quota) + static_cast<uint64_t>(st.ramp_step);
+              const uint32_t ramp_cap = (st.ramp_max_quota > 0u) ? st.ramp_max_quota : (st.base_quota * 4u);
+              if (ramp_cap > 0u && next_quota > static_cast<uint64_t>(ramp_cap)) {
+                next_quota = static_cast<uint64_t>(ramp_cap);
+              }
+              st.quota = static_cast<uint32_t>(next_quota);
+            }
+          } else {
+            st.quota = st.base_quota;
+          }
+          d.quota = st.quota;
+          d.ramp_epoch_counter = st.ramp_epoch_counter;
+          const uint64_t refill = st.quota;
+          uint64_t next = static_cast<uint64_t>(d.quota_left) + refill;
+          const uint64_t cap = static_cast<uint64_t>(st.quota) * 4ull;
+          if (next > cap) {
+            next = cap;
+          }
+          d.quota_left = static_cast<uint32_t>(next);
+        }
+        st.quota_left = d.quota_left;
+        st.submitted = d.produced;
+        st.queue_pressure = rt.ctrl->queue_pressure;
+        st.quota_stall = rt.ctrl->quota_stall;
+        st.bridge_sent = rt.ctrl->tx_bridge_sent;
+        st.occupancy_peak = rt.ctrl->ring_occupancy_peak;
+        st.bridge_drain_batches = rt.ctrl->bridge_drain_batches;
+        st.bridge_drain_packets = rt.ctrl->bridge_drain_packets;
+        st.ring_drop_events = rt.ctrl->ring_drop_events;
+        fairness_samples.push_back(static_cast<double>(st.submitted));
+      }
+      if (fairness_samples.size() >= 2) {
+        double mean = 0.0;
+        for (double x : fairness_samples) {
+          mean += x;
+        }
+        mean /= static_cast<double>(fairness_samples.size());
+        double cv = 0.0;
+        if (mean > 0.0) {
+          double var = 0.0;
+          for (double x : fairness_samples) {
+            const double dlt = x - mean;
+            var += dlt * dlt;
+          }
+          var /= static_cast<double>(fairness_samples.size());
+          cv = (std::sqrt(var) / mean) * 100.0;
+        }
+        rt.ctrl->scheduler_fairness_cv_pct_x100 = static_cast<uint64_t>(std::llround(cv * 100.0));
+      } else {
+        rt.ctrl->scheduler_fairness_cv_pct_x100 = 0u;
+      }
+      for (auto& kv : g_persistent_streams) {
+        kv.second.scheduler_fairness_cv_pct =
+            static_cast<double>(rt.ctrl->scheduler_fairness_cv_pct_x100) / 100.0;
+      }
+    }
+
+    const uint64_t now = now_ns_steady();
+    const uint64_t no_progress_ns = static_cast<uint64_t>(std::max(100, rt.no_progress_ms)) * 1000000ull;
+    if (now > last_progress && (now - last_progress) > no_progress_ns) {
+      rt.ctrl->no_progress_events += 1u;
+      if (rt.tx_bridge.kind == PersistentTxBackendKind::kNoop) {
+        // In generation-only validation mode there is no external NIC progress signal.
+        // Avoid punitive quota halving and kernel restarts that distort producer throughput.
+        last_progress = now_ns_steady();
+        continue;
+      }
+      {
+        std::lock_guard<std::mutex> g(g_persistent_lock);
+        rt.ctrl->throttle_events += 1u;
+        for (auto& kv : g_persistent_streams) {
+          if (kv.second.device_slot < 0 || kv.second.device_slot >= kPersistentMaxStreams || !rt.streams) {
+            continue;
+          }
+          PersistentDeviceStreamState& d = rt.streams[kv.second.device_slot];
+          if (d.active == 0) {
+            continue;
+          }
+          d.quota_left = std::max<uint32_t>(1u, d.quota_left / 2u);
+        }
+      }
+      rt.ctrl->drain_attempts += 1u;
+      std::this_thread::sleep_for(std::chrono::microseconds(std::max(50, rt.bridge_idle_sleep_us)));
+      const uint64_t tx_before = rt.ctrl->tx_bridge_sent;
+      const int occ_before = ring_occupancy_now(rt);
+
+      persistent_stop_kernel();
+      if (persistent_launch_kernel()) {
+        rt.ctrl->runtime_restarts += 1u;
+      } else {
+        rt.ctrl->native_batch_degrade_events += 1u;
+        g_compat_fallback_count.fetch_add(1u, std::memory_order_relaxed);
+      }
+      const uint64_t tx_after = rt.ctrl->tx_bridge_sent;
+      const int occ_after = ring_occupancy_now(rt);
+      if (tx_after > tx_before || occ_after < occ_before) {
+        last_progress = now_ns_steady();
+        continue;
+      }
+      last_progress = now_ns_steady();
+    }
+  }
+}
+
+inline void persistent_runtime_release_unlocked() {
+  PersistentRuntime& rt = g_persistent_runtime;
+  rt.threads_running.store(false, std::memory_order_relaxed);
+  persistent_stop_kernel();
+  for (auto& t : rt.bridge_threads) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+  rt.bridge_threads.clear();
+  if (rt.monitor_thread.joinable()) {
+    rt.monitor_thread.join();
+  }
+  if (rt.kernel_stream) {
+    (void)cudaStreamDestroy(rt.kernel_stream);
+    rt.kernel_stream = nullptr;
+  }
+  if (rt.rings_host) {
+    (void)cudaFreeHost(rt.rings_host);
+    rt.rings_host = nullptr;
+    rt.rings_dev = nullptr;
+  }
+  if (rt.payload_host) {
+    (void)cudaFreeHost(rt.payload_host);
+    rt.payload_host = nullptr;
+    rt.payload_dev = nullptr;
+  }
+  if (rt.streams) {
+    (void)cudaFreeHost(rt.streams);
+    rt.streams = nullptr;
+    rt.streams_dev = nullptr;
+  }
+  if (rt.ctrl) {
+    (void)cudaFreeHost(rt.ctrl);
+    rt.ctrl = nullptr;
+    rt.ctrl_dev = nullptr;
+  }
+  rt.queue_count = 1;
+  rt.ring_slots = 0;
+  rt.bridge_thread_count = 1;
+  rt.max_packet_bytes = kPersistentMaxPacketBytes;
+  rt.queue_drain_cursor.clear();
+  rt.queue_sent_counts.clear();
+  for (auto& c : rt.completed_by_slot) {
+    c.store(0u, std::memory_order_relaxed);
+  }
+  persistent_bridge_backend_shutdown_unlocked(rt);
+}
+
+inline bool persistent_runtime_ensure_started_unlocked() {
+  PersistentRuntime& rt = g_persistent_runtime;
+  if (rt.ctrl && rt.streams && rt.rings_host && rt.rings_dev && rt.payload_host && rt.payload_dev &&
+      rt.threads_running.load(std::memory_order_relaxed)) {
+    return true;
+  }
+  persistent_runtime_release_unlocked();
+
+  auto env_int_local = [](const char* name, int defv) -> int {
+    const char* v = std::getenv(name);
+    if (!v || !*v) {
+      return defv;
+    }
+    try {
+      return std::stoi(v);
+    } catch (...) {
+      return defv;
+    }
+  };
+  rt.queue_count = clamp_i(env_int_local("SAMURAI_GPU_QUEUE_COUNT", 1), 1, 64);
+  rt.ring_slots = clamp_i(env_int_local("SAMURAI_GPU_RING_SLOTS", 2048), 64, 65536);
+  rt.ring_slots = std::min(rt.ring_slots, 4096);
+  rt.epoch_ms = clamp_i(env_int_local("SAMURAI_GPU_EPOCH_MS", 50), 1, 5000);
+  rt.heartbeat_ms = clamp_i(env_int_local("SAMURAI_GPU_HEARTBEAT_MS", 500), 10, 10000);
+  rt.no_progress_ms = clamp_i(env_int_local("SAMURAI_GPU_NO_PROGRESS_MS", 2000), 100, 60000);
+  rt.bridge_max_burst = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_MAX_BURST", 64), 1, 4096);
+  rt.bridge_idle_sleep_us = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_IDLE_SLEEP_US", 200), 0, 100000);
+  rt.bridge_drain_budget_ns = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_DRAIN_BUDGET_NS", 200000), 1000, 100000000);
+  rt.bridge_ipg_ns = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_IPG_NS", 0), 0, 1000000000);
+  rt.bridge_thread_count = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_THREADS", rt.queue_count), 1, 64);
+  if (rt.bridge_thread_count > rt.queue_count) {
+    rt.bridge_thread_count = rt.queue_count;
+  }
+  if (rt.bridge_ipg_ns > 0) {
+    // Keep deterministic pacing order when inter-packet gap pacing is enabled.
+    rt.bridge_thread_count = 1;
+  }
+  rt.bridge_next_send_ns = 0u;
+  const int mtu_bytes = clamp_i(env_int_local("SAMURAI_GPU_PERSISTENT_MTU", kPersistentDefaultMtu), 576, 9000);
+  const int frame_cap = kPersistentUmemFrameSize - kPersistentUmemHeadroom;
+  const int cfg_packet_cap =
+      clamp_i(env_int_local("SAMURAI_GPU_PERSISTENT_MAX_PACKET_BYTES", std::min(frame_cap, mtu_bytes + 14)), 64, frame_cap);
+  rt.max_packet_bytes = std::min(frame_cap, cfg_packet_cap);
+  for (auto& c : rt.completed_by_slot) {
+    c.store(0u, std::memory_order_relaxed);
+  }
+
+  void* ctrl_host = nullptr;
+  if (cudaHostAlloc(&ctrl_host, sizeof(PersistentRuntimeControl), cudaHostAllocPortable | cudaHostAllocMapped) !=
+          cudaSuccess ||
+      !ctrl_host) {
+    return false;
+  }
+  rt.ctrl = static_cast<PersistentRuntimeControl*>(ctrl_host);
+  std::memset(rt.ctrl, 0, sizeof(PersistentRuntimeControl));
+  if (cudaHostGetDevicePointer(reinterpret_cast<void**>(&rt.ctrl_dev), ctrl_host, 0) != cudaSuccess || !rt.ctrl_dev) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  rt.ctrl->queue_count = rt.queue_count;
+  rt.ctrl->ring_slots = rt.ring_slots;
+  rt.ctrl->max_streams = kPersistentMaxStreams;
+  rt.ctrl->queue_probe_span =
+      clamp_i(env_int_local("SAMURAI_GPU_QUEUE_PROBE_SPAN", 4), 1, std::max(1, rt.queue_count));
+  rt.ctrl->max_packet_bytes = rt.max_packet_bytes;
+
+  void* streams_host = nullptr;
+  const size_t streams_bytes = sizeof(PersistentDeviceStreamState) * static_cast<size_t>(kPersistentMaxStreams);
+  if (cudaHostAlloc(&streams_host, streams_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+      !streams_host) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  rt.streams = static_cast<PersistentDeviceStreamState*>(streams_host);
+  std::memset(rt.streams, 0, streams_bytes);
+  if (cudaHostGetDevicePointer(reinterpret_cast<void**>(&rt.streams_dev), streams_host, 0) != cudaSuccess ||
+      !rt.streams_dev) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+
+  const size_t ring_count = static_cast<size_t>(rt.queue_count) * static_cast<size_t>(rt.ring_slots);
+  const size_t ring_bytes = ring_count * sizeof(PersistentRingSlot);
+  void* host_ptr = nullptr;
+  if (cudaHostAlloc(&host_ptr, ring_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess || !host_ptr) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  rt.rings_host = static_cast<PersistentRingSlot*>(host_ptr);
+  std::memset(rt.rings_host, 0, ring_bytes);
+  if (cudaHostGetDevicePointer(reinterpret_cast<void**>(&rt.rings_dev), host_ptr, 0) != cudaSuccess || !rt.rings_dev) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+
+  void* payload_host = nullptr;
+  const size_t payload_bytes = ring_count * static_cast<size_t>(kPersistentUmemFrameSize);
+  if (cudaHostAlloc(&payload_host, payload_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+      !payload_host) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  rt.payload_host = static_cast<uint8_t*>(payload_host);
+  std::memset(rt.payload_host, 0, payload_bytes);
+  if (cudaHostGetDevicePointer(reinterpret_cast<void**>(&rt.payload_dev), payload_host, 0) != cudaSuccess ||
+      !rt.payload_dev) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  rt.queue_drain_cursor.assign(static_cast<size_t>(rt.queue_count), 0u);
+  rt.queue_sent_counts.assign(static_cast<size_t>(rt.queue_count), 0u);
+  if (!persistent_bridge_backend_init_unlocked(rt)) {
+    const int strict_backend = env_int_local("SAMURAI_GPU_TX_BACKEND_STRICT", 0);
+    if (strict_backend > 0) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+  }
+
+  if (!persistent_launch_kernel()) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  rt.threads_running.store(true, std::memory_order_relaxed);
+  rt.bridge_threads.clear();
+  rt.bridge_threads.reserve(static_cast<size_t>(std::max(1, rt.bridge_thread_count)));
+  for (int worker = 0; worker < std::max(1, rt.bridge_thread_count); ++worker) {
+    rt.bridge_threads.emplace_back(persistent_bridge_loop, worker, std::max(1, rt.bridge_thread_count));
+  }
+  rt.monitor_thread = std::thread(persistent_monitor_loop);
+  rt.last_progress_ns.store(now_ns_steady(), std::memory_order_relaxed);
+  rt.last_epoch_refill_ns.store(now_ns_steady(), std::memory_order_relaxed);
+  return true;
+}
+
+inline std::string stream_state_to_json(const PersistentStreamState& st) {
+  std::ostringstream oss;
+  oss << "{"
+      << "\"stream_id\":" << st.id << ","
+      << "\"active\":" << st.active << ","
+      << "\"device_slot\":" << st.device_slot << ","
+      << "\"protocol\":" << st.protocol << ","
+      << "\"protocol_name\":\"" << protocol_name_from_int(st.protocol) << "\","
+      << "\"stream_type\":\"" << json_escape_string(st.stream_type) << "\","
+      << "\"stream_kind\":" << st.stream_kind << ","
+      << "\"queue_affinity\":" << st.queue_affinity << ","
+      << "\"source_port\":" << st.source_port << ","
+      << "\"source_port_mode\":" << static_cast<int>(st.source_port_mode) << ","
+      << "\"icmp_type\":" << st.icmp_type << ","
+      << "\"icmp_code\":" << st.icmp_code << ","
+      << "\"payload_len\":" << st.payload_len << ","
+      << "\"payload_byte\":" << static_cast<int>(st.payload_byte) << ","
+      << "\"has_custom_mac\":" << static_cast<int>(st.has_custom_mac) << ","
+      << "\"base_quota\":" << st.base_quota << ","
+      << "\"quota\":" << st.quota << ","
+      << "\"quota_left\":" << st.quota_left << ","
+      << "\"ramp_step\":" << st.ramp_step << ","
+      << "\"ramp_interval_epochs\":" << st.ramp_interval_epochs << ","
+      << "\"ramp_max_quota\":" << st.ramp_max_quota << ","
+      << "\"ramp_epoch_counter\":" << st.ramp_epoch_counter << ","
+      << "\"pcap_file\":\"" << json_escape_string(st.pcap_file) << "\","
+      << "\"created_ns\":" << st.created_ns << ","
+      << "\"updated_ns\":" << st.updated_ns << ","
+      << "\"heartbeat_ns\":" << st.heartbeat_ns << ","
+      << "\"progress_ns\":" << st.progress_ns << ","
+      << "\"submitted\":" << st.submitted << ","
+      << "\"completed\":" << st.completed << ","
+      << "\"fallback\":" << st.fallback << ","
+      << "\"errors\":" << st.errors << ","
+      << "\"queue_pressure\":" << st.queue_pressure << ","
+      << "\"quota_stall\":" << st.quota_stall << ","
+      << "\"bridge_sent\":" << st.bridge_sent << ","
+      << "\"ring_occupancy_peak\":" << st.occupancy_peak << ","
+      << "\"bridge_drain_batches\":" << st.bridge_drain_batches << ","
+      << "\"bridge_drain_packets\":" << st.bridge_drain_packets << ","
+      << "\"ring_drop_events\":" << st.ring_drop_events << ","
+      << "\"scheduler_fairness_cv_pct\":" << std::fixed << std::setprecision(2) << st.scheduler_fairness_cv_pct
+      << ","
+      << "\"profile_json\":\"" << json_escape_string(st.profile_json) << "\","
+      << "\"update_json\":\"" << json_escape_string(st.update_json) << "\""
+      << "}";
+  return oss.str();
+}
 }  // namespace
 
 extern "C" int samurai_gpu_packet_generate_packets(
@@ -1216,6 +3050,9 @@ extern "C" int samurai_gpu_packet_generate_packets(
   try {
     if (init_c_api_outputs(out_data, out_size, out_packet_size) != 0) {
       return -1;
+    }
+    if (g_kernel_mode.load(std::memory_order_relaxed) == static_cast<int>(KernelMode::kPersistent)) {
+      g_compat_fallback_count.fetch_add(1u, std::memory_order_relaxed);
     }
 
     const std::string target = target_ip ? std::string(target_ip) : std::string();
@@ -1269,6 +3106,9 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template(
     if (init_c_api_outputs(out_data, out_size, out_packet_size) != 0) {
       return -1;
     }
+    if (g_kernel_mode.load(std::memory_order_relaxed) == static_cast<int>(KernelMode::kPersistent)) {
+      g_compat_fallback_count.fetch_add(1u, std::memory_order_relaxed);
+    }
     if (!template_bytes || template_len == 0) {
       return set_c_api_error("template_bytes must not be empty");
     }
@@ -1319,6 +3159,9 @@ extern "C" int samurai_gpu_packet_generate_packets_from_template_pool(
   try {
     if (init_c_api_outputs(out_data, out_size, out_packet_size) != 0) {
       return -1;
+    }
+    if (g_kernel_mode.load(std::memory_order_relaxed) == static_cast<int>(KernelMode::kPersistent)) {
+      g_compat_fallback_count.fetch_add(1u, std::memory_order_relaxed);
     }
     if (num_templates == 0) {
       g_samurai_gpu_packet_last_error.clear();
@@ -1395,6 +3238,9 @@ extern "C" int samurai_gpu_packet_generate_stateful_packets(
     if (init_c_api_outputs(out_data, out_size, out_packet_size) != 0) {
       return -1;
     }
+    if (g_kernel_mode.load(std::memory_order_relaxed) == static_cast<int>(KernelMode::kPersistent)) {
+      g_compat_fallback_count.fetch_add(1u, std::memory_order_relaxed);
+    }
     if (num_templates == 0) {
       g_samurai_gpu_packet_last_error.clear();
       return 0;
@@ -1470,6 +3316,9 @@ extern "C" int samurai_gpu_packet_generate_fragmented_packets(
     if (init_c_api_outputs(out_data, out_size, out_packet_size) != 0) {
       return -1;
     }
+    if (g_kernel_mode.load(std::memory_order_relaxed) == static_cast<int>(KernelMode::kPersistent)) {
+      g_compat_fallback_count.fetch_add(1u, std::memory_order_relaxed);
+    }
     if (!payload_bytes && payload_len > 0) {
       return set_c_api_error("payload_bytes pointer is null");
     }
@@ -1528,6 +3377,9 @@ extern "C" int samurai_gpu_packet_generate_amplification_packets(
   try {
     if (init_c_api_outputs(out_data, out_size, out_packet_size) != 0) {
       return -1;
+    }
+    if (g_kernel_mode.load(std::memory_order_relaxed) == static_cast<int>(KernelMode::kPersistent)) {
+      g_compat_fallback_count.fetch_add(1u, std::memory_order_relaxed);
     }
     if (!template_bytes || template_len == 0) {
       return set_c_api_error("template_bytes must not be empty");
@@ -1589,6 +3441,9 @@ extern "C" int samurai_gpu_packet_generate_icmp_packets(
     if (init_c_api_outputs(out_data, out_size, out_packet_size) != 0) {
       return -1;
     }
+    if (g_kernel_mode.load(std::memory_order_relaxed) == static_cast<int>(KernelMode::kPersistent)) {
+      g_compat_fallback_count.fetch_add(1u, std::memory_order_relaxed);
+    }
     const std::string target = target_ip ? std::string(target_ip) : std::string();
     if (target.empty()) {
       return set_c_api_error("target_ip must not be empty");
@@ -1618,6 +3473,395 @@ extern "C" int samurai_gpu_packet_generate_icmp_packets(
   } catch (...) {
     return set_c_api_error("unknown error");
   }
+}
+
+extern "C" int samurai_gpu_packet_set_kernel_mode(int mode) {
+  if (mode != static_cast<int>(KernelMode::kBatch) &&
+      mode != static_cast<int>(KernelMode::kPersistent)) {
+    return set_c_api_error("kernel mode must be 0(batch) or 1(persistent)");
+  }
+  g_kernel_mode.store(mode, std::memory_order_relaxed);
+  if (mode == static_cast<int>(KernelMode::kBatch)) {
+    persistent_runtime_release_unlocked();
+  } else {
+    std::lock_guard<std::mutex> g(g_persistent_lock);
+    if (!persistent_runtime_ensure_started_unlocked()) {
+      return set_c_api_error("persistent runtime initialization failed");
+    }
+  }
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_get_kernel_mode() {
+  return g_kernel_mode.load(std::memory_order_relaxed);
+}
+
+extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t* out_stream_id) {
+  if (!out_stream_id) {
+    return set_c_api_error("out_stream_id must not be null");
+  }
+  if (g_kernel_mode.load(std::memory_order_relaxed) != static_cast<int>(KernelMode::kPersistent)) {
+    return set_c_api_error("start_stream requires kernel_mode=persistent");
+  }
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  if (!persistent_runtime_ensure_started_unlocked()) {
+    return set_c_api_error("persistent runtime is not available");
+  }
+
+  int free_slot = -1;
+  for (int i = 0; i < kPersistentMaxStreams; ++i) {
+    if (g_persistent_runtime.streams[i].active == 0) {
+      free_slot = i;
+      break;
+    }
+  }
+  if (free_slot < 0) {
+    return set_c_api_error("persistent stream capacity exceeded");
+  }
+
+  const std::string profile = profile_json ? std::string(profile_json) : std::string();
+  const int64_t stream_id = g_next_stream_id.fetch_add(1, std::memory_order_relaxed);
+  PersistentStreamState st;
+  st.id = stream_id;
+  st.profile_json = profile;
+  st.update_json.clear();
+  st.device_slot = free_slot;
+  st.created_ns = now_ns_steady();
+  st.updated_ns = st.created_ns;
+  st.heartbeat_ns = st.created_ns;
+  st.progress_ns = st.created_ns;
+  st.protocol = protocol_from_string(json_get_string(profile, "protocol", "tcp"), 6);
+  st.stream_type = lower_copy(json_get_string(profile, "stream_type", (st.protocol == 1 ? "icmp" : "l4")));
+  st.stream_kind = static_cast<int>(stream_kind_from_string(st.stream_type, st.protocol));
+  st.target_ip_int = json_get_ip(profile, "target_ip", 0u);
+  st.src_ip_int = json_get_ip(
+      profile,
+      "real_src_ip",
+      ddos_samurai::gpu_packet_cuda::ip_to_int("192.168.1.100"));
+  st.target_port = (st.protocol == 1)
+      ? static_cast<uint16_t>(0)
+      : static_cast<uint16_t>(clamp_i(json_get_int(profile, "target_port", 0), 0, 65535));
+  st.queue_affinity = json_get_int(profile, "queue_affinity", -1);
+  st.source_port = static_cast<uint16_t>(clamp_i(json_get_int(profile, "source_port", 0), 0, 65535));
+  st.source_port_mode = static_cast<uint8_t>(
+      clamp_i(json_get_int(profile, "source_port_mode", (st.source_port > 0 ? 1 : 0)), 0, 1));
+  st.tcp_flags = static_cast<uint16_t>(clamp_i(json_get_int(profile, "tcp_flags", 0x02), 0, 255));
+  st.tcp_window = static_cast<uint16_t>(clamp_i(json_get_int(profile, "window", 65535), 0, 65535));
+  st.icmp_type = clamp_i(json_get_int(profile, "icmp_type", 8), 0, 255);
+  st.icmp_code = clamp_i(json_get_int(profile, "icmp_code", 0), 0, 255);
+  st.pcap_file = json_get_string(profile, "pcap_file", std::string());
+  st.payload_byte = static_cast<uint8_t>(clamp_i(json_get_int(profile, "payload_byte", 0), 0, 255));
+  st.payload_len = static_cast<uint16_t>(clamp_i(json_get_int(profile, "payload_len", 0), 0, kPersistentPayloadCapacity));
+  const std::vector<uint8_t> payload_hex = parse_hex_payload(json_get_string(profile, "payload_hex", std::string()));
+  if (!payload_hex.empty()) {
+    st.payload_len = static_cast<uint16_t>(
+        std::min<size_t>(payload_hex.size(), static_cast<size_t>(kPersistentPayloadCapacity)));
+  }
+  {
+    std::array<uint8_t, 6> src_mac{};
+    std::array<uint8_t, 6> dst_mac{};
+    const bool src_ok = parse_mac_string(json_get_string(profile, "src_mac", std::string()), src_mac);
+    const bool dst_ok = parse_mac_string(json_get_string(profile, "dst_mac", std::string()), dst_mac);
+    const bool force_custom = json_get_bool(profile, "has_custom_mac", false);
+    if (force_custom || (src_ok && dst_ok)) {
+      st.has_custom_mac = static_cast<uint8_t>(src_ok && dst_ok ? 1 : 0);
+      if (src_ok) st.src_mac = src_mac;
+      if (dst_ok) st.dst_mac = dst_mac;
+    }
+  }
+  st.quota = static_cast<uint32_t>(std::max(0, json_get_int(profile, "quota", 0)));
+  st.base_quota = st.quota;
+  st.quota_left = st.quota;
+  st.ramp_step = static_cast<uint32_t>(std::max(0, json_get_int(profile, "ramp_step", 0)));
+  st.ramp_interval_epochs = static_cast<uint32_t>(std::max(0, json_get_int(profile, "ramp_interval_epochs", 1)));
+  st.ramp_max_quota = static_cast<uint32_t>(std::max(0, json_get_int(profile, "ramp_max_quota", 0)));
+  st.ramp_epoch_counter = 0u;
+  st.active = 1;
+
+  PersistentDeviceStreamState& d = g_persistent_runtime.streams[free_slot];
+  std::memset(&d, 0, sizeof(d));
+  g_persistent_runtime.completed_by_slot[static_cast<size_t>(free_slot)].store(0u, std::memory_order_relaxed);
+  d.active = 1;
+  d.stream_id = static_cast<int32_t>(stream_id);
+  d.stream_kind = st.stream_kind;
+  d.protocol = st.protocol;
+  d.has_ethernet = clamp_i(json_get_int(profile, "has_ethernet", 1), 0, 1);
+  d.spoof_enabled = clamp_i(json_get_int(profile, "spoof_ip", 0), 0, 1);
+  d.queue_affinity = st.queue_affinity;
+  d.target_ip = st.target_ip_int;
+  d.src_ip = st.src_ip_int;
+  d.target_port = st.target_port;
+  d.source_port = st.source_port;
+  d.source_port_mode = st.source_port_mode;
+  d.tcp_flags = st.tcp_flags;
+  d.tcp_window = st.tcp_window;
+  d.icmp_type = st.icmp_type;
+  d.icmp_code = st.icmp_code;
+  d.payload_len = st.payload_len;
+  d.payload_byte = st.payload_byte;
+  d.has_custom_mac = st.has_custom_mac;
+  for (int i = 0; i < 6; ++i) {
+    d.src_mac[i] = st.src_mac[static_cast<size_t>(i)];
+    d.dst_mac[i] = st.dst_mac[static_cast<size_t>(i)];
+  }
+  for (int i = 0; i < static_cast<int>(d.payload_len) && i < kPersistentPayloadCapacity; ++i) {
+    d.payload[i] = st.payload_byte;
+  }
+  if (!payload_hex.empty()) {
+    d.payload_len = static_cast<uint16_t>(
+        std::min<size_t>(payload_hex.size(), static_cast<size_t>(kPersistentPayloadCapacity)));
+    st.payload_len = d.payload_len;
+    for (size_t i = 0; i < static_cast<size_t>(d.payload_len); ++i) {
+      d.payload[i] = payload_hex[i];
+    }
+  }
+  d.quota = st.quota;
+  d.quota_left = st.quota_left;
+  d.ramp_step = st.ramp_step;
+  d.ramp_interval_epochs = st.ramp_interval_epochs;
+  d.ramp_max_quota = st.ramp_max_quota;
+  d.ramp_epoch_counter = st.ramp_epoch_counter;
+  d.weight = static_cast<uint32_t>(std::max(1, clamp_i(json_get_int(profile, "weight", 1), 1, 32)));
+  d.deficit = d.weight;
+
+  const std::string spoof_subnet = json_get_string(profile, "spoof_subnet", "1.0.0.0/8");
+  auto [spoof_base, spoof_mask] = ddos_samurai::gpu_packet_cuda::parse_subnet(spoof_subnet);
+  d.spoof_base_ip = spoof_base;
+  d.spoof_mask = spoof_mask;
+  st.spoof_base_ip = spoof_base;
+  st.spoof_mask = spoof_mask;
+
+  g_persistent_streams[stream_id] = std::move(st);
+  *out_stream_id = stream_id;
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* update_json) {
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  auto it = g_persistent_streams.find(stream_id);
+  if (it == g_persistent_streams.end()) {
+    return set_c_api_error("stream_id not found");
+  }
+  if (!persistent_runtime_ensure_started_unlocked()) {
+    return set_c_api_error("persistent runtime is not available");
+  }
+  auto& st = it->second;
+  st.update_json = update_json ? std::string(update_json) : std::string();
+  st.updated_ns = now_ns_steady();
+  st.heartbeat_ns = st.updated_ns;
+  if (st.device_slot < 0 || st.device_slot >= kPersistentMaxStreams) {
+    return set_c_api_error("stream has invalid device slot");
+  }
+  PersistentDeviceStreamState& d = g_persistent_runtime.streams[st.device_slot];
+  if (d.active == 0) {
+    return set_c_api_error("stream runtime slot is inactive");
+  }
+
+  const int quota_i = json_get_int(st.update_json, "quota", -1);
+  if (quota_i >= 0) {
+    st.base_quota = static_cast<uint32_t>(quota_i);
+    st.quota = st.base_quota;
+    d.quota = st.quota;
+    d.quota_left = st.quota;
+  }
+  const int queue_i = json_get_int(st.update_json, "queue_affinity", st.queue_affinity);
+  st.queue_affinity = queue_i;
+  d.queue_affinity = queue_i;
+  d.has_ethernet = clamp_i(json_get_int(st.update_json, "has_ethernet", d.has_ethernet), 0, 1);
+  d.spoof_enabled = clamp_i(json_get_int(st.update_json, "spoof_ip", d.spoof_enabled), 0, 1);
+  st.target_ip_int = json_get_ip(st.update_json, "target_ip", st.target_ip_int);
+  st.src_ip_int = json_get_ip(st.update_json, "real_src_ip", st.src_ip_int);
+  d.target_ip = st.target_ip_int;
+  d.src_ip = st.src_ip_int;
+
+  const int pps_i = json_get_int(st.update_json, "pps", -1);
+  if (pps_i > 0 && st.base_quota == 0) {
+    st.base_quota = static_cast<uint32_t>(pps_i);
+    st.quota = st.base_quota;
+    d.quota = st.quota;
+    d.quota_left = std::max<uint32_t>(d.quota_left, d.quota);
+  }
+  const int weight_i = json_get_int(st.update_json, "weight", static_cast<int>(d.weight));
+  d.weight = static_cast<uint32_t>(std::max(1, clamp_i(weight_i, 1, 32)));
+  if (d.deficit == 0) {
+    d.deficit = d.weight;
+  }
+  const std::string proto_s = json_get_string(st.update_json, "protocol", std::string(protocol_name_from_int(st.protocol)));
+  st.protocol = protocol_from_string(proto_s, st.protocol);
+  d.protocol = st.protocol;
+  const int port_i = json_get_int(st.update_json, "target_port", static_cast<int>(st.target_port));
+  st.target_port = (st.protocol == 1) ? static_cast<uint16_t>(0) : static_cast<uint16_t>(clamp_i(port_i, 0, 65535));
+  d.target_port = st.target_port;
+  st.source_port = static_cast<uint16_t>(clamp_i(
+      json_get_int(st.update_json, "source_port", static_cast<int>(st.source_port)), 0, 65535));
+  st.source_port_mode = static_cast<uint8_t>(clamp_i(
+      json_get_int(st.update_json, "source_port_mode", static_cast<int>(st.source_port_mode)), 0, 1));
+  d.source_port = st.source_port;
+  d.source_port_mode = st.source_port_mode;
+
+  st.stream_type = lower_copy(json_get_string(st.update_json, "stream_type", st.stream_type));
+  st.stream_kind = static_cast<int>(stream_kind_from_string(st.stream_type, st.protocol));
+  d.stream_kind = st.stream_kind;
+  st.tcp_flags = static_cast<uint16_t>(clamp_i(
+      json_get_int(st.update_json, "tcp_flags", static_cast<int>(st.tcp_flags)), 0, 255));
+  st.tcp_window = static_cast<uint16_t>(clamp_i(
+      json_get_int(st.update_json, "window", static_cast<int>(st.tcp_window)), 0, 65535));
+  d.tcp_flags = st.tcp_flags;
+  d.tcp_window = st.tcp_window;
+  st.icmp_type = clamp_i(json_get_int(st.update_json, "icmp_type", st.icmp_type), 0, 255);
+  st.icmp_code = clamp_i(json_get_int(st.update_json, "icmp_code", st.icmp_code), 0, 255);
+  d.icmp_type = st.icmp_type;
+  d.icmp_code = st.icmp_code;
+  st.payload_byte = static_cast<uint8_t>(clamp_i(
+      json_get_int(st.update_json, "payload_byte", static_cast<int>(st.payload_byte)), 0, 255));
+  st.payload_len = static_cast<uint16_t>(clamp_i(
+      json_get_int(st.update_json, "payload_len", static_cast<int>(st.payload_len)),
+      0,
+      kPersistentPayloadCapacity));
+  d.payload_byte = st.payload_byte;
+  d.payload_len = st.payload_len;
+  for (int i = 0; i < static_cast<int>(d.payload_len) && i < kPersistentPayloadCapacity; ++i) {
+    d.payload[i] = d.payload_byte;
+  }
+  {
+    const std::vector<uint8_t> payload_hex =
+        parse_hex_payload(json_get_string(st.update_json, "payload_hex", std::string()));
+    if (!payload_hex.empty()) {
+      d.payload_len = static_cast<uint16_t>(
+          std::min<size_t>(payload_hex.size(), static_cast<size_t>(kPersistentPayloadCapacity)));
+      st.payload_len = d.payload_len;
+      for (size_t i = 0; i < static_cast<size_t>(d.payload_len); ++i) {
+        d.payload[i] = payload_hex[i];
+      }
+    }
+  }
+  {
+    std::array<uint8_t, 6> src_mac{};
+    std::array<uint8_t, 6> dst_mac{};
+    const bool src_ok = parse_mac_string(json_get_string(st.update_json, "src_mac", std::string()), src_mac);
+    const bool dst_ok = parse_mac_string(json_get_string(st.update_json, "dst_mac", std::string()), dst_mac);
+    const bool force_custom = json_get_bool(st.update_json, "has_custom_mac", static_cast<bool>(st.has_custom_mac));
+    if (src_ok) {
+      st.src_mac = src_mac;
+    }
+    if (dst_ok) {
+      st.dst_mac = dst_mac;
+    }
+    if (force_custom) {
+      if (src_ok && dst_ok) {
+        st.has_custom_mac = 1;
+      } else if (src_ok != dst_ok) {
+        st.has_custom_mac = 0;
+      }
+    } else if (src_ok && dst_ok) {
+      st.has_custom_mac = 1;
+    }
+    d.has_custom_mac = st.has_custom_mac;
+    for (int i = 0; i < 6; ++i) {
+      d.src_mac[i] = st.src_mac[static_cast<size_t>(i)];
+      d.dst_mac[i] = st.dst_mac[static_cast<size_t>(i)];
+    }
+  }
+  st.ramp_step = static_cast<uint32_t>(std::max(0, json_get_int(st.update_json, "ramp_step", static_cast<int>(st.ramp_step))));
+  st.ramp_interval_epochs = static_cast<uint32_t>(
+      std::max(0, json_get_int(st.update_json, "ramp_interval_epochs", static_cast<int>(st.ramp_interval_epochs))));
+  st.ramp_max_quota = static_cast<uint32_t>(
+      std::max(0, json_get_int(st.update_json, "ramp_max_quota", static_cast<int>(st.ramp_max_quota))));
+  d.ramp_step = st.ramp_step;
+  d.ramp_interval_epochs = st.ramp_interval_epochs;
+  d.ramp_max_quota = st.ramp_max_quota;
+  if (st.stream_kind != static_cast<int>(PersistentStreamKind::kRamp)) {
+    st.ramp_epoch_counter = 0u;
+    d.ramp_epoch_counter = 0u;
+  }
+  st.pcap_file = json_get_string(st.update_json, "pcap_file", st.pcap_file);
+
+  st.submitted = d.produced;
+  st.quota_left = d.quota_left;
+  st.progress_ns = now_ns_steady();
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_stop_stream(int64_t stream_id) {
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  auto it = g_persistent_streams.find(stream_id);
+  if (it == g_persistent_streams.end()) {
+    return set_c_api_error("stream_id not found");
+  }
+  if (it->second.device_slot >= 0 && it->second.device_slot < kPersistentMaxStreams && g_persistent_runtime.streams) {
+    std::memset(&g_persistent_runtime.streams[it->second.device_slot], 0, sizeof(PersistentDeviceStreamState));
+    g_persistent_runtime.completed_by_slot[static_cast<size_t>(it->second.device_slot)].store(
+        0u, std::memory_order_relaxed);
+  }
+  it->second.active = 0;
+  g_persistent_streams.erase(it);
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  if (stream_id == 0) {
+    std::ostringstream oss;
+    const bool rt_active = (g_persistent_runtime.ctrl != nullptr);
+    oss << "{"
+        << "\"kernel_mode\":" << g_kernel_mode.load(std::memory_order_relaxed) << ","
+        << "\"gpu_kernel_mode_active\":"
+        << (g_kernel_mode.load(std::memory_order_relaxed) == static_cast<int>(KernelMode::kPersistent) ? 1 : 0)
+        << ","
+        << "\"stream_count\":" << g_persistent_streams.size() << ","
+        << "\"runtime_active\":" << (rt_active ? 1 : 0) << ","
+        << "\"persistent_runtime_restarts\":"
+        << (rt_active ? g_persistent_runtime.ctrl->runtime_restarts : 0u) << ","
+        << "\"no_progress_events\":" << (rt_active ? g_persistent_runtime.ctrl->no_progress_events : 0u) << ","
+        << "\"quota_stall\":" << (rt_active ? g_persistent_runtime.ctrl->quota_stall : 0u) << ","
+        << "\"queue_pressure\":" << (rt_active ? g_persistent_runtime.ctrl->queue_pressure : 0u) << ","
+        << "\"queue_probe_span\":" << (rt_active ? g_persistent_runtime.ctrl->queue_probe_span : 0) << ","
+        << "\"max_packet_bytes\":" << (rt_active ? g_persistent_runtime.ctrl->max_packet_bytes : kPersistentMaxPacketBytes)
+        << ","
+        << "\"queue_spread_events\":" << (rt_active ? g_persistent_runtime.ctrl->queue_spread_events : 0u) << ","
+        << "\"ring_occupancy_peak\":" << (rt_active ? g_persistent_runtime.ctrl->ring_occupancy_peak : 0u) << ","
+        << "\"bridge_drain_batches\":" << (rt_active ? g_persistent_runtime.ctrl->bridge_drain_batches : 0u) << ","
+        << "\"bridge_drain_packets\":" << (rt_active ? g_persistent_runtime.ctrl->bridge_drain_packets : 0u) << ","
+        << "\"ring_drop_events\":" << (rt_active ? g_persistent_runtime.ctrl->ring_drop_events : 0u) << ","
+        << "\"scheduler_fairness_cv_pct\":"
+        << (rt_active ? (static_cast<double>(g_persistent_runtime.ctrl->scheduler_fairness_cv_pct_x100) / 100.0) : 0.0)
+        << ","
+        << "\"throttle_events\":" << (rt_active ? g_persistent_runtime.ctrl->throttle_events : 0u) << ","
+        << "\"drain_attempts\":" << (rt_active ? g_persistent_runtime.ctrl->drain_attempts : 0u) << ","
+        << "\"native_batch_degrade_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->native_batch_degrade_events : 0u) << ","
+        << "\"compat_fallback_count\":" << g_compat_fallback_count.load(std::memory_order_relaxed) << ","
+        << "\"persistent_tx_backend\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.active) << "\","
+        << "\"persistent_tx_iface\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.iface) << "\","
+        << "\"persistent_bridge_ipg_ns\":" << g_persistent_runtime.bridge_ipg_ns << ","
+        << "\"persistent_tx_bridge_sent\":" << (rt_active ? g_persistent_runtime.ctrl->tx_bridge_sent : 0u) << ","
+        << "\"persistent_produced\":" << (rt_active ? g_persistent_runtime.ctrl->produced : 0u) << ","
+        << "\"persistent_heartbeat\":" << (rt_active ? g_persistent_runtime.ctrl->heartbeat : 0u)
+        << "}";
+    g_stream_stats_json = oss.str();
+    return g_stream_stats_json.c_str();
+  }
+  auto it = g_persistent_streams.find(stream_id);
+  if (it == g_persistent_streams.end()) {
+    g_stream_stats_json = "{\"error\":\"stream_id_not_found\"}";
+    return g_stream_stats_json.c_str();
+  }
+  g_stream_stats_json = stream_state_to_json(it->second);
+  return g_stream_stats_json.c_str();
+}
+
+extern "C" int samurai_gpu_packet_shutdown_runtime() {
+  {
+    std::lock_guard<std::mutex> g(g_persistent_lock);
+    g_persistent_streams.clear();
+  }
+  persistent_runtime_release_unlocked();
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
 }
 
 extern "C" void samurai_gpu_packet_free(void* ptr) {
