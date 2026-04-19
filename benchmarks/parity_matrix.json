@@ -97,6 +97,33 @@
         "stateful_runtime_preflight_xdp_enabled_required": 1
       }
     },
+    "persistent_stream_strict": {
+      "description": "Strict persistent stream KPI sign-off profile (kernel persistent+stream with strict E2E TX backend).",
+      "gates": {
+        "run_quality": "valid",
+        "send_success_ratio_pct_min": 99.0,
+        "wire_loss_est_pct_max": 1.0,
+        "rate_accuracy_pct_min": 98.0,
+        "sender_fallback_reason_required": "none",
+        "sender_path_single_required": 1,
+        "persistent_tx_backend_allowed": "af_xdp|af_packet",
+        "persistent_tx_backend_strict_required": 1,
+        "persistent_tx_iface_required": 1,
+        "persistent_tx_bridge_sent_min": 1,
+        "persistent_produced_min": 1,
+        "queue_pressure_min": 0,
+        "quota_stall_min": 0,
+        "ring_occupancy_peak_min": 0,
+        "persistent_runtime_restarts_min": 0,
+        "no_progress_events_min": 0,
+        "compat_fallback_count_min": 0,
+        "bridge_drain_batches_min": 0,
+        "bridge_drain_packets_min": 0,
+        "ring_drop_events_min": 0,
+        "scheduler_fairness_cv_pct_max": 25.0,
+        "persistent_bridge_ipg_ns_min": 0
+      }
+    },
     "developer_fallback": {
       "description": "Backward-compatible alias profile for existing flows (mirrors ci_safe thresholds).",
       "gates": {
@@ -197,6 +224,23 @@
     "l7_conn_rate_cv_pct",
     "h1_conn_rate_cv_pct",
     "h2_conn_rate_cv_pct"
+    ,
+    "persistent_tx_bridge_sent",
+    "persistent_produced",
+    "queue_pressure",
+    "quota_stall",
+    "ring_occupancy_peak",
+    "persistent_runtime_restarts",
+    "no_progress_events",
+    "compat_fallback_count",
+    "bridge_drain_batches",
+    "bridge_drain_packets",
+    "ring_drop_events",
+    "scheduler_fairness_cv_pct",
+    "persistent_tx_backend",
+    "persistent_tx_iface",
+    "persistent_bridge_ipg_ns",
+    "persistent_tx_backend_strict"
   ],
   "scenarios": [
     {

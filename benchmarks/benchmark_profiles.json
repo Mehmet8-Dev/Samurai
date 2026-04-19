@@ -100,6 +100,79 @@
         ]
       }
     },
+    "persistent_stream_ci": {
+      "description": "CI-safe persistent stream KPI contract profile (batch baseline vs persistent stream telemetry).",
+      "parity_profile": "ci_safe",
+      "kpi_gate_profile": "ci_safe",
+      "test_profile": "ci_safe",
+      "summary_file": "benchmark_persistent_stream_summary.json",
+      "pytest_args": [
+        "-m",
+        "pytest",
+        "tests/native_gpu/test_cuda_backend_bridge.py",
+        "tests/test_benchmark_ci.py",
+        "-q",
+        "-rs"
+      ],
+      "env": {
+        "SAMURAI_BENCH_UPDATE_BASELINE": "0",
+        "SAMURAI_GPU_KERNEL_MODE": "persistent",
+        "SAMURAI_GPU_STREAM_API": "stream",
+        "SAMURAI_GPU_QUEUE_COUNT": "2",
+        "SAMURAI_GPU_EPOCH_MS": "50"
+      },
+      "artifact_standard": {
+        "required_files": [
+          "benchmark_persistent_stream_summary.json",
+          "benchmark_meta.json"
+        ],
+        "required_summary_fields": [
+          "schema",
+          "profile",
+          "generated_utc",
+          "scenarios",
+          "parity"
+        ]
+      }
+    },
+    "persistent_stream_lab_strict": {
+      "description": "Strict persistent stream KPI sign-off profile (real TX backend required, noop/fallback is hard-fail).",
+      "parity_profile": "persistent_stream_strict",
+      "kpi_gate_profile": "persistent_stream_strict",
+      "test_profile": "full",
+      "summary_file": "benchmark_persistent_stream_lab_strict_summary.json",
+      "pytest_args": [
+        "-m",
+        "pytest",
+        "tests/native_gpu/test_cuda_backend_bridge.py",
+        "tests/test_benchmark_full.py",
+        "-q",
+        "-rs"
+      ],
+      "env": {
+        "SAMURAI_BENCH_UPDATE_BASELINE": "0",
+        "SAMURAI_GPU_KERNEL_MODE": "persistent",
+        "SAMURAI_GPU_STREAM_API": "stream",
+        "SAMURAI_GPU_QUEUE_COUNT": "2",
+        "SAMURAI_GPU_EPOCH_MS": "50",
+        "SAMURAI_GPU_TX_BACKEND_STRICT": "1",
+        "SAMURAI_GPU_TX_BACKEND": "af_xdp"
+      },
+      "artifact_standard": {
+        "required_files": [
+          "benchmark_persistent_stream_lab_strict_summary.json",
+          "benchmark_meta.json"
+        ],
+        "required_summary_fields": [
+          "schema",
+          "profile",
+          "generated_utc",
+          "scenarios",
+          "parity",
+          "acceptance"
+        ]
+      }
+    },
     "dedicated_lab": {
       "description": "Privileged lab benchmark profile with strict KPI expectation.",
       "parity_profile": "dedicated_lab",
@@ -119,7 +192,11 @@
         "SAMURAI_STATEFUL_RUNTIME_BACKEND": "afxdp",
         "SAMURAI_L7_CAPABILITY_STRICT": "1",
         "SAMURAI_CUSTOM_TCP_MODE": "required",
-        "SAMURAI_CUSTOM_TCP_BACKEND": "af_xdp"
+        "SAMURAI_CUSTOM_TCP_BACKEND": "af_xdp",
+        "SAMURAI_GPU_KERNEL_MODE": "persistent",
+        "SAMURAI_GPU_STREAM_API": "stream",
+        "SAMURAI_GPU_TX_BACKEND_STRICT": "1",
+        "SAMURAI_GPU_TX_BACKEND": "af_xdp"
       },
       "artifact_standard": {
         "required_files": [

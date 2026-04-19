@@ -106,6 +106,12 @@ def build_profile_runtime(
         "SAMURAI_L7_CAPABILITY_STRICT",
         "SAMURAI_CUSTOM_TCP_MODE",
         "SAMURAI_CUSTOM_TCP_BACKEND",
+        "SAMURAI_GPU_KERNEL_MODE",
+        "SAMURAI_GPU_STREAM_API",
+        "SAMURAI_GPU_TX_BACKEND_STRICT",
+        "SAMURAI_GPU_TX_BACKEND",
+        "SAMURAI_GPU_QUEUE_COUNT",
+        "SAMURAI_GPU_EPOCH_MS",
     ]
     export_env = {k: env[k] for k in export_keys if k in env}
 
@@ -172,7 +178,7 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
             if live_perf_required == 1 and live_perf_status != "pass":
                 missing.append(f"{summary_path}::live_perf_gate_status::{live_perf_status or 'missing'}")
             profile_name = str(runtime.get("profile", "") or "").strip().lower()
-            if profile_name == "dedicated_lab":
+            if profile_name in {"dedicated_lab", "persistent_stream_lab_strict"}:
                 sender_fallback_reason = str(normalized.get("sender_fallback_reason", "") or "").strip().lower()
                 if sender_fallback_reason not in {"", "none"}:
                     missing.append(f"{summary_path}::sender_fallback_reason::{sender_fallback_reason}")
@@ -224,6 +230,37 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                         missing.append(f"{summary_path}::sender_path_drift::{len(active_paths)}")
                     elif str(active_paths[0]).upper() == "MIXED":
                         missing.append(f"{summary_path}::sender_path_drift::MIXED")
+                if profile_name == "persistent_stream_lab_strict":
+                    backend = str(normalized.get("persistent_tx_backend", "") or "").strip().lower()
+                    if backend not in {"af_xdp", "af_packet"}:
+                        missing.append(f"{summary_path}::persistent_tx_backend::{backend or 'missing'}")
+                    strict_raw = normalized.get("persistent_tx_backend_strict", 0)
+                    try:
+                        strict_val = int(strict_raw)
+                    except Exception:
+                        strict_val = 0
+                    if strict_val != 1:
+                        missing.append(f"{summary_path}::persistent_tx_backend_strict::{strict_raw}")
+                    iface = str(normalized.get("persistent_tx_iface", "") or "").strip()
+                    if not iface:
+                        missing.append(f"{summary_path}::persistent_tx_iface::missing")
+                    for k in (
+                        "persistent_tx_bridge_sent",
+                        "persistent_produced",
+                        "queue_pressure",
+                        "quota_stall",
+                        "ring_occupancy_peak",
+                        "persistent_runtime_restarts",
+                        "no_progress_events",
+                        "compat_fallback_count",
+                        "bridge_drain_batches",
+                        "bridge_drain_packets",
+                        "ring_drop_events",
+                        "scheduler_fairness_cv_pct",
+                        "persistent_bridge_ipg_ns",
+                    ):
+                        if k not in normalized:
+                            missing.append(f"{summary_path}::{k}::missing")
             elif profile_name == "l7_dataplane_ci":
                 required_h2_fields = (
                     "l7_h2_lane_reuse_ratio",
@@ -400,7 +437,12 @@ def run_profile(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run productized benchmark profiles.")
-    parser.add_argument("--profile", type=str, default="ci_safe", help="Profile name: dev|ci_safe|dedicated_lab")
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default="ci_safe",
+        help="Profile name: dev|ci_safe|dedicated_lab|persistent_stream_ci|persistent_stream_lab_strict",
+    )
     parser.add_argument("--profiles-path", type=str, default="", help="Override benchmark profiles JSON path.")
     parser.add_argument("--parity-matrix-path", type=str, default="", help="Override parity matrix JSON path.")
     parser.add_argument("--artifact-root", type=str, default="artifacts/benchmarks", help="Artifact root directory.")
