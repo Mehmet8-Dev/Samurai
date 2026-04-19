@@ -42,6 +42,26 @@ def sync_runtime_env(args) -> dict[str, object]:
     os.environ["SAMURAI_GPU_FULL_VARIATION"] = "1" if bool(getattr(args, "gpu_full_variation", True)) else "0"
     os.environ["SAMURAI_GPU_PINNED_MAX_MB"] = str(int(getattr(args, "gpu_pinned_max_mb", 512) or 512))
     os.environ["SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT"] = "1" if bool(getattr(args, "gpu_packet_zerocopy_output", False)) else "0"
+    gpu_kernel_mode = str(getattr(args, "gpu_kernel_mode", "batch") or "batch").strip().lower()
+    if gpu_kernel_mode not in {"batch", "persistent"}:
+        gpu_kernel_mode = "batch"
+    gpu_stream_api = str(getattr(args, "gpu_stream_api", "compat") or "compat").strip().lower()
+    if gpu_stream_api not in {"compat", "stream"}:
+        gpu_stream_api = "compat"
+    os.environ["SAMURAI_GPU_KERNEL_MODE"] = gpu_kernel_mode
+    os.environ["SAMURAI_GPU_STREAM_API"] = gpu_stream_api
+    gpu_tx_backend = str(os.environ.get("SAMURAI_GPU_TX_BACKEND", getattr(args, "gpu_tx_backend", "auto")) or "auto").strip().lower()
+    gpu_tx_backend_strict = _env_flag("SAMURAI_GPU_TX_BACKEND_STRICT", "0")
+    if gpu_kernel_mode == "persistent" and gpu_stream_api == "stream":
+        if gpu_tx_backend in {"", "auto", "noop"}:
+            gpu_tx_backend = "af_xdp"
+        gpu_tx_backend_strict = True
+    os.environ["SAMURAI_GPU_TX_BACKEND"] = gpu_tx_backend
+    os.environ["SAMURAI_GPU_TX_BACKEND_STRICT"] = "1" if gpu_tx_backend_strict else "0"
+    os.environ["SAMURAI_GPU_EPOCH_MS"] = str(int(getattr(args, "gpu_epoch_ms", 50) or 50))
+    os.environ["SAMURAI_GPU_QUEUE_COUNT"] = str(int(getattr(args, "gpu_queue_count", 1) or 1))
+    os.environ["SAMURAI_GPU_HEARTBEAT_MS"] = str(int(getattr(args, "gpu_heartbeat_ms", 500) or 500))
+    os.environ["SAMURAI_GPU_NO_PROGRESS_MS"] = str(int(getattr(args, "gpu_no_progress_ms", 2000) or 2000))
     os.environ["SAMURAI_GPU_RNG_SEED"] = str(int(getattr(args, "gpu_rng_seed", 1234) or 0))
     os.environ["SAMURAI_STATE_TABLE_SIZE"] = str(int(getattr(args, "state_table_size", 65536) or 65536))
     os.environ["SAMURAI_STATE_LOCK_COUNT"] = str(int(getattr(args, "state_lock_count", 256) or 256))

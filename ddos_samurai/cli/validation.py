@@ -362,6 +362,44 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
             )
 
 
+def _preflight_persistent_tx_backend(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    gpu_kernel_mode = str(getattr(args, "gpu_kernel_mode", "batch") or "batch").strip().lower()
+    gpu_stream_api = str(getattr(args, "gpu_stream_api", "compat") or "compat").strip().lower()
+    if gpu_kernel_mode != "persistent" or gpu_stream_api != "stream":
+        return
+
+    raw_backend = str(os.environ.get("SAMURAI_GPU_TX_BACKEND", getattr(args, "gpu_tx_backend", "auto")) or "auto")
+    backend = raw_backend.strip().lower()
+    strict_raw = str(os.environ.get("SAMURAI_GPU_TX_BACKEND_STRICT", "0") or "0").strip().lower()
+    strict_enabled = strict_raw in {"1", "true", "yes", "on"}
+
+    # Production bootstrap default: persistent+stream must run a verified backend by default.
+    if backend in {"", "auto", "noop"}:
+        backend = "af_xdp"
+        os.environ["SAMURAI_GPU_TX_BACKEND"] = backend
+        utils.log_info(
+            "persistent+stream için SAMURAI_GPU_TX_BACKEND doğrulanmış varsayılan olarak af_xdp ayarlandı."
+        )
+
+    if backend not in {"af_xdp", "af_packet"}:
+        parser.error(
+            "Hata: persistent+stream modunda SAMURAI_GPU_TX_BACKEND yalnızca af_xdp veya af_packet olabilir."
+        )
+
+    if not strict_enabled:
+        os.environ["SAMURAI_GPU_TX_BACKEND_STRICT"] = "1"
+        utils.log_info(
+            "persistent+stream için SAMURAI_GPU_TX_BACKEND_STRICT=1 otomatik etkinleştirildi (fail-fast preflight)."
+        )
+
+    if backend == "af_xdp":
+        xdp_iface = str(getattr(args, "xdp_interface", "") or "").strip()
+        if not xdp_iface:
+            parser.error(
+                "Hata: persistent+stream + af_xdp strict backend için --xdp-interface zorunludur."
+            )
+
+
 def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if not bool(getattr(args, "l7_capability_strict", False)):
         return

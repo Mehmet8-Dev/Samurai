@@ -446,9 +446,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--kpi-gate-profile",
-        choices=["off", "dev", "ci_safe", "developer_fallback", "dedicated_lab"],
+        choices=["off", "dev", "ci_safe", "developer_fallback", "dedicated_lab", "persistent_stream_strict"],
         default=str(os.environ.get("SAMURAI_KPI_GATE_PROFILE", "off") or "off"),
-        help="KPI gate profili: off|dev|ci_safe|developer_fallback|dedicated_lab.",
+        help="KPI gate profili: off|dev|ci_safe|developer_fallback|dedicated_lab|persistent_stream_strict.",
     )
     parser.add_argument(
         "--kpi-hard-fail",
@@ -627,6 +627,48 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=str(os.environ.get("SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
         help="CUDA native path çıktı tamponu için mapped host zero-copy yolunu aç/kapat (env: SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT).",
+    )
+    _gpu_kernel_mode_default = str(os.environ.get("SAMURAI_GPU_KERNEL_MODE", "batch") or "batch").strip().lower()
+    if _gpu_kernel_mode_default not in {"batch", "persistent"}:
+        _gpu_kernel_mode_default = "batch"
+    parser.add_argument(
+        "--gpu-kernel-mode",
+        choices=["batch", "persistent"],
+        default=_gpu_kernel_mode_default,
+        help="CUDA kernel çalışma modu: batch veya persistent (env: SAMURAI_GPU_KERNEL_MODE).",
+    )
+    _gpu_stream_api_default = str(os.environ.get("SAMURAI_GPU_STREAM_API", "compat") or "compat").strip().lower()
+    if _gpu_stream_api_default not in {"compat", "stream"}:
+        _gpu_stream_api_default = "compat"
+    parser.add_argument(
+        "--gpu-stream-api",
+        choices=["compat", "stream"],
+        default=_gpu_stream_api_default,
+        help="GPU stream API modu: compat (batch wrapper) veya stream (lifecycle API) (env: SAMURAI_GPU_STREAM_API).",
+    )
+    parser.add_argument(
+        "--gpu-epoch-ms",
+        type=int,
+        default=_env_int("SAMURAI_GPU_EPOCH_MS", 50),
+        help="Persistent mode quota epoch süresi (ms).",
+    )
+    parser.add_argument(
+        "--gpu-queue-count",
+        type=int,
+        default=_env_int("SAMURAI_GPU_QUEUE_COUNT", 1),
+        help="Persistent mode per-queue ring sayısı.",
+    )
+    parser.add_argument(
+        "--gpu-heartbeat-ms",
+        type=int,
+        default=_env_int("SAMURAI_GPU_HEARTBEAT_MS", 500),
+        help="Persistent runtime heartbeat yayın periyodu (ms).",
+    )
+    parser.add_argument(
+        "--gpu-no-progress-ms",
+        type=int,
+        default=_env_int("SAMURAI_GPU_NO_PROGRESS_MS", 2000),
+        help="Persistent runtime no-progress recovery eşiği (ms).",
     )
     parser.add_argument(
         "--gpu-rng-seed",
