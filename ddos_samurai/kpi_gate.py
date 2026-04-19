@@ -148,6 +148,30 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "stateful_runtime_status_required": "ready",
         "l7_conn_rate_cv_pct_max": 5.0,
     },
+    "persistent_stream_strict": {
+        "run_quality": "valid",
+        "send_success_ratio_pct_min": 99.0,
+        "wire_loss_est_pct_max": 1.0,
+        "rate_accuracy_pct_min": 98.0,
+        "sender_fallback_reason_required": "none",
+        "sender_path_single_required": 1,
+        "persistent_tx_backend_allowed": "af_xdp|af_packet",
+        "persistent_tx_backend_strict_required": 1,
+        "persistent_tx_iface_required": 1,
+        "persistent_tx_bridge_sent_min": 1.0,
+        "persistent_produced_min": 1.0,
+        "queue_pressure_min": 0.0,
+        "quota_stall_min": 0.0,
+        "ring_occupancy_peak_min": 0.0,
+        "persistent_runtime_restarts_min": 0.0,
+        "no_progress_events_min": 0.0,
+        "compat_fallback_count_min": 0.0,
+        "bridge_drain_batches_min": 0.0,
+        "bridge_drain_packets_min": 0.0,
+        "ring_drop_events_min": 0.0,
+        "scheduler_fairness_cv_pct_max": 25.0,
+        "persistent_bridge_ipg_ns_min": 0.0,
+    },
 }
 
 
@@ -157,6 +181,8 @@ def _normalize_profile(profile: str | None) -> str:
         return "off"
     if p in {"dedicated", "dedicated-lab", "dedicated_lab"}:
         return "dedicated_lab"
+    if p in {"persistent_stream_strict", "persistent-stream-strict", "persistent_stream_lab_strict"}:
+        return "persistent_stream_strict"
     if p in {"ci", "ci-safe", "ci_safe"}:
         return "ci_safe"
     if p in {"developer", "dev", "developer_fallback", "developer-fallback"}:
@@ -245,6 +271,8 @@ def _merge_gate_defaults(profile: str, parity_matrix_path: Optional[str] = None)
         base["stateful_runtime_preflight_status_required"] = parity["stateful_runtime_preflight_status_required"]
     if "stateful_runtime_preflight_xdp_enabled_required" in parity:
         base["stateful_runtime_preflight_xdp_enabled_required"] = parity["stateful_runtime_preflight_xdp_enabled_required"]
+    for k, v in parity.items():
+        base[k] = v
     return base
 
 
@@ -350,10 +378,38 @@ def _infer_txring_scope(results: Dict[str, Any]) -> bool:
     return any(_metric_gt_zero(results, key) for key in txring_metric_keys)
 
 
+def _infer_persistent_stream_scope(results: Dict[str, Any]) -> bool:
+    if not isinstance(results, dict):
+        return False
+    if str(results.get("gpu_kernel_mode", "") or "").strip().lower() == "persistent" and str(
+        results.get("gpu_stream_api_mode", "") or ""
+    ).strip().lower() == "stream":
+        return True
+    persistent_keys = (
+        "persistent_tx_bridge_sent",
+        "persistent_produced",
+        "queue_pressure",
+        "quota_stall",
+        "ring_occupancy_peak",
+        "persistent_runtime_restarts",
+        "no_progress_events",
+        "compat_fallback_count",
+        "bridge_drain_batches",
+        "bridge_drain_packets",
+        "ring_drop_events",
+        "scheduler_fairness_cv_pct",
+        "persistent_tx_backend",
+        "persistent_tx_iface",
+        "persistent_bridge_ipg_ns",
+    )
+    return any(k in results for k in persistent_keys)
+
+
 def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str) -> List[KpiGateRule]:
     quic_scope = _infer_quic_scope(results)
     l7_scope = _infer_l7_scope(results, quic_scope=quic_scope)
     txring_scope = _infer_txring_scope(results)
+    persistent_stream_scope = _infer_persistent_stream_scope(results) or str(profile).strip().lower() == "persistent_stream_strict"
     dedicated_strict = str(profile or "").strip().lower() != "off"
     rules: List[KpiGateRule] = [
         KpiGateRule("run_quality", "run_quality", "eq", gates.get("run_quality", "valid"), required=True),
@@ -601,6 +657,89 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
                 required=bool(l7_scope),
             )
         )
+    persistent_backend_allowed = str(gates.get("persistent_tx_backend_allowed", "") or "").strip()
+    if persistent_backend_allowed:
+        rules.append(
+            KpiGateRule(
+                "persistent_tx_backend",
+                "persistent_tx_backend",
+                "in_set",
+                persistent_backend_allowed,
+                required=bool(persistent_stream_scope),
+            )
+        )
+    if "persistent_tx_backend_strict_required" in gates:
+        rules.append(
+            KpiGateRule(
+                "persistent_tx_backend_strict",
+                "persistent_tx_backend_strict",
+                "eq",
+                int(gates.get("persistent_tx_backend_strict_required", 1) or 1),
+                required=bool(persistent_stream_scope),
+            )
+        )
+    if int(gates.get("persistent_tx_iface_required", 0) or 0) == 1:
+        rules.append(
+            KpiGateRule(
+                "persistent_tx_iface",
+                "persistent_tx_iface",
+                "non_empty",
+                1,
+                required=bool(persistent_stream_scope),
+            )
+        )
+    if "persistent_tx_bridge_sent_min" in gates:
+        rules.append(
+            KpiGateRule(
+                "persistent_tx_bridge_sent",
+                "persistent_tx_bridge_sent",
+                "min",
+                float(gates.get("persistent_tx_bridge_sent_min", 0.0) or 0.0),
+                required=bool(persistent_stream_scope),
+            )
+        )
+    if "persistent_produced_min" in gates:
+        rules.append(
+            KpiGateRule(
+                "persistent_produced",
+                "persistent_produced",
+                "min",
+                float(gates.get("persistent_produced_min", 0.0) or 0.0),
+                required=bool(persistent_stream_scope),
+            )
+        )
+    for gate_key, metric_name in (
+        ("queue_pressure_min", "queue_pressure"),
+        ("quota_stall_min", "quota_stall"),
+        ("ring_occupancy_peak_min", "ring_occupancy_peak"),
+        ("persistent_runtime_restarts_min", "persistent_runtime_restarts"),
+        ("no_progress_events_min", "no_progress_events"),
+        ("compat_fallback_count_min", "compat_fallback_count"),
+        ("bridge_drain_batches_min", "bridge_drain_batches"),
+        ("bridge_drain_packets_min", "bridge_drain_packets"),
+        ("ring_drop_events_min", "ring_drop_events"),
+        ("persistent_bridge_ipg_ns_min", "persistent_bridge_ipg_ns"),
+    ):
+        if gate_key in gates:
+            rules.append(
+                KpiGateRule(
+                    metric_name,
+                    metric_name,
+                    "min",
+                    float(gates.get(gate_key, 0.0) or 0.0),
+                    required=bool(persistent_stream_scope),
+                )
+            )
+    if "scheduler_fairness_cv_pct_max" in gates:
+        rules.append(
+            KpiGateRule(
+                "scheduler_fairness_cv_pct",
+                "scheduler_fairness_cv_pct",
+                "max",
+                float(gates.get("scheduler_fairness_cv_pct_max", 25.0) or 25.0),
+                required=bool(persistent_stream_scope),
+            )
+        )
     return rules
 
 
@@ -689,6 +828,21 @@ def evaluate(
                     detail = "drift_mixed"
                 else:
                     detail = f"path={active_paths[0]}"
+        elif rule.op == "in_set":
+            lhs = str(value).strip().lower()
+            allowed = {
+                str(tok).strip().lower()
+                for tok in str(rule.threshold or "").replace(",", "|").split("|")
+                if str(tok).strip()
+            }
+            passed = lhs in allowed
+            if not passed:
+                detail = f"expected_one_of={sorted(allowed)} actual={lhs}"
+        elif rule.op == "non_empty":
+            lhs = str(value or "").strip()
+            passed = bool(lhs)
+            if not passed:
+                detail = "empty"
 
         evaluated.append(
             {
@@ -706,12 +860,13 @@ def evaluate(
         if not passed:
             violations.append(f"{rule.name}:{detail}")
 
+    strict_fail_profiles = {"dedicated_lab", "persistent_stream_strict"}
     if violations:
-        status = "fail" if profile_norm == "dedicated_lab" else "warn"
+        status = "fail" if profile_norm in strict_fail_profiles else "warn"
     else:
         status = "pass"
 
-    hard_fail_flag = int(bool(hard_fail) and profile_norm == "dedicated_lab" and status == "fail")
+    hard_fail_flag = int(bool(hard_fail) and profile_norm in strict_fail_profiles and status == "fail")
     score_eligible = int(run_quality == "valid" and status == "pass")
 
     return KpiGateResult(

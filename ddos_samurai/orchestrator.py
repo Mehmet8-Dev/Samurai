@@ -203,6 +203,13 @@ def _empty_stats() -> dict:
         "runtime_transport_rx_poll_enabled": 0,
         "runtime_transport_snapshot_available": 0,
         "runtime_transport_service_loops": 0,
+        "gpu_slo_queue_pressure_max": 0,
+        "gpu_slo_ring_drop_events_max": 0,
+        "gpu_slo_fairness_cv_pct_max": 0.0,
+        "gpu_slo_no_progress_events_max": 0,
+        "gpu_slo_alarm_count": 0,
+        "gpu_slo_mitigation_count": 0,
+        "gpu_slo_policy": "off",
         "hot_path_contract_status": "unknown",
         "hot_path_contract_violation_reason": "none",
         "sender_path_single_required": 1,
@@ -827,6 +834,35 @@ def _add_stats(acc: dict, item: dict) -> dict:
             acc["sender_path"] = item_sender_path
         elif current != item_sender_path and current != "MIXED":
             acc["sender_path"] = "MIXED"
+    acc["gpu_slo_queue_pressure_max"] = max(
+        int(acc.get("gpu_slo_queue_pressure_max", 0) or 0),
+        int(item.get("gpu_slo_queue_pressure_max", 0) or 0),
+    )
+    acc["gpu_slo_ring_drop_events_max"] = max(
+        int(acc.get("gpu_slo_ring_drop_events_max", 0) or 0),
+        int(item.get("gpu_slo_ring_drop_events_max", 0) or 0),
+    )
+    acc["gpu_slo_fairness_cv_pct_max"] = max(
+        float(acc.get("gpu_slo_fairness_cv_pct_max", 0.0) or 0.0),
+        float(item.get("gpu_slo_fairness_cv_pct_max", 0.0) or 0.0),
+    )
+    acc["gpu_slo_no_progress_events_max"] = max(
+        int(acc.get("gpu_slo_no_progress_events_max", 0) or 0),
+        int(item.get("gpu_slo_no_progress_events_max", 0) or 0),
+    )
+    acc["gpu_slo_alarm_count"] = int(acc.get("gpu_slo_alarm_count", 0) or 0) + int(
+        item.get("gpu_slo_alarm_count", 0) or 0
+    )
+    acc["gpu_slo_mitigation_count"] = int(acc.get("gpu_slo_mitigation_count", 0) or 0) + int(
+        item.get("gpu_slo_mitigation_count", 0) or 0
+    )
+    item_slo_policy = str(item.get("gpu_slo_policy", "") or "").strip().lower()
+    if item_slo_policy:
+        current_slo_policy = str(acc.get("gpu_slo_policy", "") or "").strip().lower()
+        if not current_slo_policy or current_slo_policy in {"off", "none", "unknown"}:
+            acc["gpu_slo_policy"] = item_slo_policy
+        elif current_slo_policy != item_slo_policy and current_slo_policy != "mixed":
+            acc["gpu_slo_policy"] = "mixed"
     if not needs_loss_recompute:
         return acc
     return _recompute_loss_metrics(acc, inplace=True)
@@ -1340,6 +1376,82 @@ async def worker_process(
                     "GPU native policy=require but native path is not active. "
                     "Set CUDA backend/native env and disable stream fallback."
                 )
+
+            _gpu_kernel_mode = str(
+                args.get("gpu_kernel_mode", os.environ.get("SAMURAI_GPU_KERNEL_MODE", "batch")) or "batch"
+            ).strip().lower()
+            if _gpu_kernel_mode not in {"batch", "persistent"}:
+                _gpu_kernel_mode = "batch"
+            _gpu_stream_api_mode = str(
+                args.get("gpu_stream_api", os.environ.get("SAMURAI_GPU_STREAM_API", "compat")) or "compat"
+            ).strip().lower()
+            if _gpu_stream_api_mode not in {"compat", "stream"}:
+                _gpu_stream_api_mode = "compat"
+            try:
+                gpu_packet.set_kernel_mode(_gpu_kernel_mode)
+            except Exception as e:
+                log_warning(f"[Worker {worker_id}] gpu kernel mode set failed ({_gpu_kernel_mode}): {e}")
+            try:
+                _gpu_kernel_mode = str(gpu_packet.get_kernel_mode() or _gpu_kernel_mode).strip().lower()
+            except Exception:
+                pass
+            worker_stats["gpu_kernel_mode"] = str(_gpu_kernel_mode)
+            worker_stats["gpu_stream_api_mode"] = str(_gpu_stream_api_mode)
+            worker_stats["gpu_epoch_ms"] = int(args.get("gpu_epoch_ms", os.environ.get("SAMURAI_GPU_EPOCH_MS", 50)) or 50)
+            worker_stats["gpu_queue_count"] = int(args.get("gpu_queue_count", os.environ.get("SAMURAI_GPU_QUEUE_COUNT", 1)) or 1)
+            worker_stats["gpu_heartbeat_ms"] = int(args.get("gpu_heartbeat_ms", os.environ.get("SAMURAI_GPU_HEARTBEAT_MS", 500)) or 500)
+            worker_stats["gpu_no_progress_ms"] = int(
+                args.get("gpu_no_progress_ms", os.environ.get("SAMURAI_GPU_NO_PROGRESS_MS", 2000)) or 2000
+            )
+            worker_stats["gpu_slo_queue_pressure_max"] = int(
+                args.get("gpu_slo_queue_pressure_max", os.environ.get("SAMURAI_GPU_SLO_QUEUE_PRESSURE_MAX", 8)) or 8
+            )
+            worker_stats["gpu_slo_ring_drop_events_max"] = int(
+                args.get("gpu_slo_ring_drop_events_max", os.environ.get("SAMURAI_GPU_SLO_RING_DROP_EVENTS_MAX", 0)) or 0
+            )
+            worker_stats["gpu_slo_fairness_cv_pct_max"] = float(
+                args.get("gpu_slo_fairness_cv_pct_max", os.environ.get("SAMURAI_GPU_SLO_FAIRNESS_CV_PCT_MAX", 35.0)) or 35.0
+            )
+            worker_stats["gpu_slo_no_progress_events_max"] = int(
+                args.get("gpu_slo_no_progress_events_max", os.environ.get("SAMURAI_GPU_SLO_NO_PROGRESS_EVENTS_MAX", 3)) or 3
+            )
+            worker_stats["gpu_slo_alarm_count"] = int(worker_stats.get("gpu_slo_alarm_count", 0) or 0)
+            worker_stats["gpu_slo_mitigation_count"] = int(worker_stats.get("gpu_slo_mitigation_count", 0) or 0)
+            worker_stats["gpu_slo_policy"] = str(
+                args.get("gpu_slo_mitigation", os.environ.get("SAMURAI_GPU_SLO_MITIGATION", "adaptive")) or "adaptive"
+            ).strip().lower()
+            worker_stats["gpu_kernel_mode_active"] = 1 if _gpu_kernel_mode == "persistent" else 0
+            _gpu_tx_backend_requested = str(
+                os.environ.get("SAMURAI_GPU_TX_BACKEND", args.get("gpu_tx_backend", "auto")) or "auto"
+            ).strip().lower()
+            _gpu_tx_backend_strict = int(
+                str(os.environ.get("SAMURAI_GPU_TX_BACKEND_STRICT", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+            )
+            worker_stats["persistent_tx_backend_requested"] = str(_gpu_tx_backend_requested)
+            worker_stats["persistent_tx_backend_strict"] = int(_gpu_tx_backend_strict)
+            if _gpu_kernel_mode == "persistent" and _gpu_stream_api_mode == "stream":
+                try:
+                    gtel_pre = _gpu_packet_mod.get_generation_telemetry() or {}
+                except Exception:
+                    gtel_pre = {}
+                _pre_backend = str(gtel_pre.get("persistent_tx_backend", "") or "").strip().lower()
+                _pre_iface = str(gtel_pre.get("persistent_tx_iface", "") or "").strip()
+                if _pre_backend:
+                    worker_stats["persistent_tx_backend"] = _pre_backend
+                if _pre_iface:
+                    worker_stats["persistent_tx_iface"] = _pre_iface
+                if "persistent_bridge_ipg_ns" in gtel_pre:
+                    worker_stats["persistent_bridge_ipg_ns"] = int(gtel_pre.get("persistent_bridge_ipg_ns", 0) or 0)
+                if _gpu_tx_backend_strict:
+                    _allowed = {"af_xdp", "af_packet"}
+                    _requested_ok = _gpu_tx_backend_requested in _allowed
+                    _telemetry_ok = _pre_backend in _allowed
+                    if not _requested_ok and not _telemetry_ok:
+                        raise RuntimeError(
+                            "persistent strict TX backend preflight failed: "
+                            f"requested={_gpu_tx_backend_requested!r}, telemetry={_pre_backend or 'missing'!r}; "
+                            "strict mode requires af_xdp or af_packet"
+                        )
 
             def _gpu_to_host(gpu_arr, key: str, stream=None, blocking: bool = True):
                 """Copy GPU array to host via shared pinned-memory pool."""
@@ -2615,23 +2727,210 @@ async def worker_process(
             stream_idx = 0
             ring_q = asyncio.Queue(maxsize=_gpu_ring_capacity)
             real_src_ip_for_gpu = str(args.get('spoof_ip') or utils.get_local_ip() or real_src_ip)
+            tcp_flags_raw = args.get("tcp_flags", "S")
+            if isinstance(tcp_flags_raw, str):
+                try:
+                    tcp_flags_int = int(cpu_packet_engine.parse_tcp_flags(tcp_flags_raw))
+                except Exception:
+                    tcp_flags_int = 0x02
+            else:
+                try:
+                    tcp_flags_int = int(tcp_flags_raw or 0x02)
+                except Exception:
+                    tcp_flags_int = 0x02
+            window_override = (
+                int(args.get("window", -1) if args.get("window", None) is not None else -1)
+            )
+
+            persistent_stream_hotpath_ok = (
+                full_gpu_hotpath_ok
+                and _gpu_kernel_mode == "persistent"
+                and _gpu_stream_api_mode == "stream"
+                and all(hasattr(gpu_packet, _m) for _m in ("start_stream", "update_stream", "stop_stream", "read_stream_stats"))
+            )
+
+            if persistent_stream_hotpath_ok:
+                log_info(
+                    f"[Worker {worker_id}] GPU persistent-stream hot-path aktif: "
+                    f"proto={protocol_name}, count={total_count}, epoch_ms={worker_stats.get('gpu_epoch_ms', 50)}"
+                )
+                stream_id = None
+                try:
+                    epoch_ms = max(1, int(worker_stats.get("gpu_epoch_ms", 50) or 50))
+                    target_rps = float(getattr(pacing_cfg, "target_rps", 0.0) or 0.0)
+                    if target_rps > 0.0:
+                        stream_quota = max(1, int(round(target_rps * (float(epoch_ms) / 1000.0))))
+                    else:
+                        stream_quota = max(1, min(BATCH_SIZE, total_count))
+
+                    baseline_runtime_stats = gpu_packet.read_stream_stats(0) or {}
+                    bridge_sent_baseline = int(baseline_runtime_stats.get("persistent_tx_bridge_sent", 0) or 0)
+                    produced_baseline = int(baseline_runtime_stats.get("persistent_produced", 0) or 0)
+
+                    stream_profile = {
+                        "protocol": protocol_name,
+                        "stream_type": "icmp" if protocol_name == "icmp" else "l4",
+                        "target_ip": args["target"],
+                        "target_port": int(args["port"]),
+                        "spoof_ip": 1 if bool(args.get("spoof", False)) else 0,
+                        "real_src_ip": real_src_ip_for_gpu,
+                        "source_port": int(args.get("source_port", 0) or 0),
+                        "source_port_mode": 1 if int(args.get("source_port", 0) or 0) > 0 else 0,
+                        "tcp_flags": int(tcp_flags_int),
+                        "window": int(window_override),
+                        "has_ethernet": 1,
+                        "quota": int(stream_quota),
+                        "weight": 1,
+                        "spoof_subnet": str(args.get("spoof_subnet", "1.0.0.0/8") or "1.0.0.0/8"),
+                    }
+                    stream_id = int(gpu_packet.start_stream(stream_profile))
+
+                    sent_via_stream = 0
+                    no_progress_ticks = 0
+                    last_sent = -1
+                    poll_interval_s = max(0.01, min(0.20, float(epoch_ms) / 1000.0 / 2.0))
+                    timeout_s = max(5.0, (float(total_count) / max(1.0, target_rps)) * 3.0) if target_rps > 0.0 else max(15.0, float(total_count) / 250000.0)
+                    deadline = time.time() + timeout_s
+                    qpress_slo_max = max(0, int(worker_stats.get("gpu_slo_queue_pressure_max", 8) or 8))
+                    ring_drop_slo_max = max(0, int(worker_stats.get("gpu_slo_ring_drop_events_max", 0) or 0))
+                    fairness_slo_max = max(0.0, float(worker_stats.get("gpu_slo_fairness_cv_pct_max", 35.0) or 35.0))
+                    no_progress_slo_max = max(1, int(worker_stats.get("gpu_slo_no_progress_events_max", 3) or 3))
+                    slo_policy = str(worker_stats.get("gpu_slo_policy", "adaptive") or "adaptive").strip().lower()
+                    last_mitigation_ts = 0.0
+                    mitigation_cooldown_s = 0.25
+
+                    while sent_via_stream < total_count and time.time() < deadline:
+                        st = gpu_packet.read_stream_stats(stream_id) or {}
+                        rt = gpu_packet.read_stream_stats(0) or {}
+                        stream_submitted = int(st.get("submitted", 0) or 0)
+                        runtime_bridge_sent = int(rt.get("persistent_tx_bridge_sent", 0) or 0) - bridge_sent_baseline
+                        runtime_produced = int(rt.get("persistent_produced", 0) or 0) - produced_baseline
+                        sent_via_stream = max(0, min(total_count, max(stream_submitted, runtime_bridge_sent, runtime_produced)))
+                        rt_qpress = int(rt.get("queue_pressure", 0) or 0)
+                        rt_ring_drop = int(rt.get("ring_drop_events", 0) or 0)
+                        rt_fairness = float(rt.get("scheduler_fairness_cv_pct", 0.0) or 0.0)
+                        rt_no_progress = int(rt.get("no_progress_events", 0) or 0)
+
+                        if sent_via_stream == last_sent:
+                            no_progress_ticks += 1
+                        else:
+                            no_progress_ticks = 0
+                            last_sent = sent_via_stream
+
+                        if sent_via_stream >= total_count:
+                            break
+
+                        alarm_hit = (
+                            (rt_qpress > qpress_slo_max)
+                            or (rt_ring_drop > ring_drop_slo_max)
+                            or (rt_fairness > fairness_slo_max)
+                            or (rt_no_progress > no_progress_slo_max)
+                        )
+                        if alarm_hit:
+                            worker_stats["gpu_slo_alarm_count"] = int(worker_stats.get("gpu_slo_alarm_count", 0) or 0) + 1
+                            now_ts = time.time()
+                            if slo_policy != "off" and (now_ts - last_mitigation_ts) >= mitigation_cooldown_s:
+                                mitigation = {}
+                                if rt_qpress > qpress_slo_max or rt_ring_drop > ring_drop_slo_max:
+                                    stream_quota = max(1, int(stream_quota * 0.75))
+                                    mitigation["quota"] = int(stream_quota)
+                                if rt_fairness > fairness_slo_max:
+                                    stream_quota = max(1, int(stream_quota * 0.90))
+                                    mitigation["quota"] = int(stream_quota)
+                                    mitigation["weight"] = 1
+                                if rt_no_progress > no_progress_slo_max:
+                                    stream_quota = max(1, int(stream_quota * 0.50))
+                                    mitigation["quota"] = int(stream_quota)
+                                    poll_interval_s = min(0.30, poll_interval_s * 1.25)
+                                if mitigation:
+                                    gpu_packet.update_stream(stream_id, mitigation)
+                                    worker_stats["gpu_slo_mitigation_count"] = int(worker_stats.get("gpu_slo_mitigation_count", 0) or 0) + 1
+                                    last_mitigation_ts = now_ts
+                                    log_warning(
+                                        f"[Worker {worker_id}] persistent SLO alarm:"
+                                        f" queue_pressure={rt_qpress}/{qpress_slo_max}"
+                                        f" ring_drop_events={rt_ring_drop}/{ring_drop_slo_max}"
+                                        f" fairness_cv={rt_fairness:.2f}/{fairness_slo_max:.2f}"
+                                        f" no_progress_events={rt_no_progress}/{no_progress_slo_max}"
+                                        f" mitigation={mitigation}"
+                                    )
+                                if rt_no_progress > max(no_progress_slo_max * 2, no_progress_slo_max + 2):
+                                    raise RuntimeError(
+                                        "persistent stream SLO hard-fail: no_progress_events exceeded hard limit"
+                                    )
+
+                        remaining_now = max(0, total_count - sent_via_stream)
+                        next_quota = max(1, min(stream_quota, remaining_now))
+                        gpu_packet.update_stream(stream_id, {"quota": int(next_quota)})
+
+                        if no_progress_ticks >= max(20, int(2.0 / poll_interval_s)):
+                            raise RuntimeError("persistent stream stalled (no progress)")
+
+                        await asyncio.sleep(poll_interval_s)
+
+                    if sent_via_stream < total_count:
+                        raise RuntimeError(f"persistent stream incomplete: sent={sent_via_stream}/{total_count}")
+
+                    worker_stats["attempted"] = int(worker_stats.get("attempted", 0) or 0) + int(total_count)
+                    worker_stats["sent"] = int(worker_stats.get("sent", 0) or 0) + int(sent_via_stream)
+                    worker_stats["errors"] = int(worker_stats.get("errors", 0) or 0) + max(0, int(total_count - sent_via_stream))
+                    worker_stats["bytes_sent_est"] = int(worker_stats.get("bytes_sent_est", 0) or 0) + int(sent_via_stream * 64)
+                    worker_stats["sender_path"] = "gpu_persistent_stream"
+                    worker_stats["gpu_packet_native_active"] = 1
+
+                    try:
+                        rt_final = gpu_packet.read_stream_stats(0) or {}
+                    except Exception:
+                        rt_final = {}
+                    for _k in (
+                        "persistent_runtime_restarts",
+                        "no_progress_events",
+                        "quota_stall",
+                        "queue_pressure",
+                        "compat_fallback_count",
+                        "persistent_tx_bridge_sent",
+                        "persistent_produced",
+                        "bridge_drain_batches",
+                        "bridge_drain_packets",
+                        "ring_drop_events",
+                        "persistent_bridge_ipg_ns",
+                        "max_packet_bytes",
+                    ):
+                        if _k in rt_final:
+                            worker_stats[_k] = int(rt_final.get(_k, 0) or 0)
+
+                    if progress is not None or sent_total is not None or errors_total is not None:
+                        try:
+                            if progress_lock is not None:
+                                with progress_lock:
+                                    if progress is not None:
+                                        progress.value = int(getattr(progress, "value", 0) or 0) + int(total_count)
+                                    if sent_total is not None:
+                                        sent_total.value = int(getattr(sent_total, "value", 0) or 0) + int(sent_via_stream)
+                                    if errors_total is not None:
+                                        errors_total.value = int(getattr(errors_total, "value", 0) or 0) + max(0, int(total_count - sent_via_stream))
+                            else:
+                                if progress is not None:
+                                    progress.value = int(getattr(progress, "value", 0) or 0) + int(total_count)
+                                if sent_total is not None:
+                                    sent_total.value = int(getattr(sent_total, "value", 0) or 0) + int(sent_via_stream)
+                                if errors_total is not None:
+                                    errors_total.value = int(getattr(errors_total, "value", 0) or 0) + max(0, int(total_count - sent_via_stream))
+                        except Exception:
+                            pass
+                    return
+                except Exception as _stream_hotpath_err:
+                    log_warning(
+                        f"[Worker {worker_id}] Persistent stream hot-path başarısız, batch fallback: {_stream_hotpath_err}"
+                    )
+                finally:
+                    if stream_id is not None:
+                        try:
+                            gpu_packet.stop_stream(stream_id)
+                        except Exception:
+                            pass
 
             if full_gpu_hotpath_ok:
-                tcp_flags_raw = args.get("tcp_flags", "S")
-                if isinstance(tcp_flags_raw, str):
-                    try:
-                        tcp_flags_int = int(cpu_packet_engine.parse_tcp_flags(tcp_flags_raw))
-                    except Exception:
-                        tcp_flags_int = 0x02
-                else:
-                    try:
-                        tcp_flags_int = int(tcp_flags_raw or 0x02)
-                    except Exception:
-                        tcp_flags_int = 0x02
-                window_override = (
-                    int(args.get("window", -1) if args.get("window", None) is not None else -1)
-                )
-
                 log_info(
                     f"[Worker {worker_id}] GPU full-variation hot-path aktif: "
                     f"proto={protocol_name}, batch={BATCH_SIZE}, streams={len(stream_ring)}, depth={_gpu_pipeline_depth}"
@@ -3298,6 +3597,29 @@ async def worker_process(
                     worker_stats["gpu_template_h2d_copy_bytes"] = int(worker_stats.get("gpu_template_h2d_copy_bytes", 0) or 0) + int(gtel.get("gpu_template_h2d_copy_bytes", 0) or 0)
                     worker_stats["gpu_rng_state_alloc_count"] = int(worker_stats.get("gpu_rng_state_alloc_count", 0) or 0) + int(gtel.get("gpu_rng_state_alloc_count", 0) or 0)
                     worker_stats["gpu_rng_state_reuse_count"] = int(worker_stats.get("gpu_rng_state_reuse_count", 0) or 0) + int(gtel.get("gpu_rng_state_reuse_count", 0) or 0)
+                    for _k in (
+                        "gpu_kernel_mode_active",
+                        "persistent_runtime_restarts",
+                        "no_progress_events",
+                        "quota_stall",
+                        "queue_pressure",
+                        "ring_occupancy_peak",
+                        "compat_fallback_count",
+                        "persistent_tx_bridge_sent",
+                        "persistent_produced",
+                        "bridge_drain_batches",
+                        "bridge_drain_packets",
+                        "ring_drop_events",
+                        "persistent_bridge_ipg_ns",
+                        "persistent_tx_backend_strict",
+                    ):
+                        if _k in gtel:
+                            worker_stats[_k] = int(gtel.get(_k, 0) or 0)
+                    for _k in ("persistent_tx_backend", "persistent_tx_iface"):
+                        if _k in gtel:
+                            worker_stats[_k] = str(gtel.get(_k, "") or "")
+                    if "scheduler_fairness_cv_pct" in gtel:
+                        worker_stats["scheduler_fairness_cv_pct"] = float(gtel.get("scheduler_fairness_cv_pct", 0.0) or 0.0)
                 except Exception:
                     pass
 

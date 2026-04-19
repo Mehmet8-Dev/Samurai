@@ -675,6 +675,22 @@ def build_live_attack_report(
     runtime_transport_rx_poll_enabled = 0
     runtime_transport_snapshot_available = 0
     runtime_transport_service_loops = 0
+    persistent_runtime_restarts_total = 0
+    no_progress_events_total = 0
+    quota_stall_total = 0
+    queue_pressure_total = 0
+    ring_occupancy_peak_max = 0
+    compat_fallback_count_total = 0
+    persistent_tx_bridge_sent_total = 0
+    persistent_produced_total = 0
+    bridge_drain_batches_total = 0
+    bridge_drain_packets_total = 0
+    ring_drop_events_total = 0
+    scheduler_fairness_cv_pct_max = 0.0
+    persistent_tx_backend = ""
+    persistent_tx_iface = ""
+    persistent_bridge_ipg_ns_max = 0
+    persistent_tx_backend_strict_any = 0
     h2_goaway_count_total = 0
     h2_stream_resets_total = 0
     h2_connections_used_total = 0
@@ -1420,6 +1436,68 @@ def build_live_attack_report(
         runtime_transport_service_loops += int(
             ev.get("runtime_transport_service_loops", st.get("runtime_transport_service_loops", 0)) or 0
         )
+        persistent_runtime_restarts_total += int(
+            ev.get("persistent_runtime_restarts", st.get("persistent_runtime_restarts", 0)) or 0
+        )
+        no_progress_events_total += int(
+            ev.get("no_progress_events", st.get("no_progress_events", 0)) or 0
+        )
+        quota_stall_total += int(
+            ev.get("quota_stall", st.get("quota_stall", 0)) or 0
+        )
+        queue_pressure_total += int(
+            ev.get("queue_pressure", st.get("queue_pressure", 0)) or 0
+        )
+        ring_occupancy_peak_max = max(
+            int(ring_occupancy_peak_max),
+            int(ev.get("ring_occupancy_peak", st.get("ring_occupancy_peak", 0)) or 0),
+        )
+        compat_fallback_count_total += int(
+            ev.get("compat_fallback_count", st.get("compat_fallback_count", 0)) or 0
+        )
+        persistent_tx_bridge_sent_total += int(
+            ev.get("persistent_tx_bridge_sent", st.get("persistent_tx_bridge_sent", 0)) or 0
+        )
+        persistent_produced_total += int(
+            ev.get("persistent_produced", st.get("persistent_produced", 0)) or 0
+        )
+        bridge_drain_batches_total += int(
+            ev.get("bridge_drain_batches", st.get("bridge_drain_batches", 0)) or 0
+        )
+        bridge_drain_packets_total += int(
+            ev.get("bridge_drain_packets", st.get("bridge_drain_packets", 0)) or 0
+        )
+        ring_drop_events_total += int(
+            ev.get("ring_drop_events", st.get("ring_drop_events", 0)) or 0
+        )
+        _scheduler_fairness = float(
+            ev.get("scheduler_fairness_cv_pct", st.get("scheduler_fairness_cv_pct", 0.0)) or 0.0
+        )
+        scheduler_fairness_cv_pct_max = max(float(scheduler_fairness_cv_pct_max), float(_scheduler_fairness))
+        _persistent_tx_backend_item = str(
+            ev.get("persistent_tx_backend", st.get("persistent_tx_backend", "")) or ""
+        ).strip().lower()
+        if _persistent_tx_backend_item:
+            if not persistent_tx_backend:
+                persistent_tx_backend = _persistent_tx_backend_item
+            elif persistent_tx_backend != _persistent_tx_backend_item and persistent_tx_backend != "mixed":
+                persistent_tx_backend = "mixed"
+        _persistent_tx_iface_item = str(
+            ev.get("persistent_tx_iface", st.get("persistent_tx_iface", "")) or ""
+        ).strip()
+        if _persistent_tx_iface_item:
+            if not persistent_tx_iface:
+                persistent_tx_iface = _persistent_tx_iface_item
+            elif persistent_tx_iface != _persistent_tx_iface_item and persistent_tx_iface != "mixed":
+                persistent_tx_iface = "mixed"
+        persistent_bridge_ipg_ns_max = max(
+            int(persistent_bridge_ipg_ns_max),
+            int(ev.get("persistent_bridge_ipg_ns", st.get("persistent_bridge_ipg_ns", 0)) or 0),
+        )
+        persistent_tx_backend_strict_any = max(
+            int(persistent_tx_backend_strict_any),
+            int(ev.get("persistent_tx_backend_strict", st.get("persistent_tx_backend_strict", 0)) or 0),
+        )
         h2_goaway_count_total += int(ev.get("h2_goaway_count", st.get("h2_goaway_count", 0)) or 0)
         h2_stream_resets_total += int(ev.get("h2_stream_resets", st.get("h2_stream_resets", 0)) or 0)
         h2_connections_used_total += int(ev.get("h2_connections_used", st.get("h2_connections_used", 0)) or 0)
@@ -1679,6 +1757,13 @@ def build_live_attack_report(
         run_quality = "invalid_metrics"
     else:
         run_quality = "valid"
+    if int(persistent_tx_backend_strict_any) <= 0:
+        try:
+            persistent_tx_backend_strict_any = int(
+                str(os.environ.get("SAMURAI_GPU_TX_BACKEND_STRICT", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+            )
+        except Exception:
+            persistent_tx_backend_strict_any = 0
 
     report = RunReport(
         run_id=run_id,
@@ -1873,6 +1958,22 @@ def build_live_attack_report(
             "runtime_transport_rx_poll_enabled": int(runtime_transport_rx_poll_enabled),
             "runtime_transport_snapshot_available": int(runtime_transport_snapshot_available),
             "runtime_transport_service_loops": int(runtime_transport_service_loops),
+            "persistent_runtime_restarts": int(persistent_runtime_restarts_total),
+            "no_progress_events": int(no_progress_events_total),
+            "quota_stall": int(quota_stall_total),
+            "queue_pressure": int(queue_pressure_total),
+            "ring_occupancy_peak": int(ring_occupancy_peak_max),
+            "compat_fallback_count": int(compat_fallback_count_total),
+            "persistent_tx_bridge_sent": int(persistent_tx_bridge_sent_total),
+            "persistent_produced": int(persistent_produced_total),
+            "bridge_drain_batches": int(bridge_drain_batches_total),
+            "bridge_drain_packets": int(bridge_drain_packets_total),
+            "ring_drop_events": int(ring_drop_events_total),
+            "scheduler_fairness_cv_pct": round(float(scheduler_fairness_cv_pct_max), 6),
+            "persistent_tx_backend": str(persistent_tx_backend or "noop"),
+            "persistent_tx_iface": str(persistent_tx_iface or ""),
+            "persistent_bridge_ipg_ns": int(persistent_bridge_ipg_ns_max),
+            "persistent_tx_backend_strict": int(persistent_tx_backend_strict_any),
             "h2_goaway_count": int(h2_goaway_count_total),
             "h2_stream_resets": int(h2_stream_resets_total),
             "h2_connections_used": int(h2_connections_used_total),
@@ -1932,7 +2033,7 @@ def build_live_attack_report(
             (args or {}).get("kpi_hard_fail", str(os.environ.get("SAMURAI_KPI_HARD_FAIL", "0")) in {"1", "true"})
         )
         gate_profile_norm = str(gate_profile).strip().lower()
-        hard_fail_flag = int(bool(gate_hard_fail) and gate_profile_norm == "dedicated_lab")
+        hard_fail_flag = int(bool(gate_hard_fail) and gate_profile_norm in {"dedicated_lab", "persistent_stream_strict"})
         reason = f"kpi_gate_exception:{type(exc).__name__}"
         report.results["kpi_gate_profile"] = gate_profile
         report.results["kpi_gate_status"] = "fail"
