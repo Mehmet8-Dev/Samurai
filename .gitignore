@@ -74,3 +74,7 @@ Papers/
 /Kenjaku.glb
 /Prison_Realm.glb
 .codex
+
+# Local agent/plugin metadata
+.agents/plugins/marketplace.json
+.codex-plugins/caveman/.codex-plugin/plugin.json

@@ -4,11 +4,11 @@ Samurai, **yalnizca yetkili ortamlarda** kullanilmak uzere tasarlanmis moduler b
 
 ## Surum Isimleri
 
-- Teknik surum (SemVer): `2.0.0`
+- Teknik surum (SemVer): `2.1.0`
 - Mevcut kod adi: `Kenjaku`
 - Eski kod adi: `Ronin`
 
-Not: Release/tag tarafinda SemVer (`v2.0.0`) kullanilir. Kod adlari dokumantasyon ve pazarlama dili olarak tutulabilir.
+
 
 Odak alanlari:
 - L3/L4/L7 trafik ve davranis testleri
