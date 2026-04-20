@@ -2804,9 +2804,12 @@ async def worker_process(
                     while sent_via_stream < total_count and time.time() < deadline:
                         snap = gpu_packet.read_stream_stats_snapshot(stream_id) or {}
                         stream_submitted = int(snap.get("submitted", 0) or 0)
+                        stream_completed = int(snap.get("completed", 0) or 0)
                         runtime_bridge_sent = int(snap.get("persistent_tx_bridge_sent", 0) or 0) - bridge_sent_baseline
                         runtime_produced = int(snap.get("persistent_produced", 0) or 0) - produced_baseline
-                        sent_via_stream = max(0, min(total_count, max(stream_submitted, runtime_bridge_sent, runtime_produced)))
+                        # Progress must be stream-scoped to avoid early completion under queue pressure
+                        # or when multiple streams share the same runtime.
+                        sent_via_stream = max(0, min(total_count, max(stream_completed, stream_submitted)))
                         rt_qpress = int(snap.get("queue_pressure", 0) or 0)
                         rt_ring_drop = int(snap.get("ring_drop_events", 0) or 0)
                         rt_fairness = float(snap.get("scheduler_fairness_cv_pct", 0.0) or 0.0)

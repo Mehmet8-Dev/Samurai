@@ -10,8 +10,78 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  semver-guard:
+    name: SemVer Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate package version and tag alignment
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          init_path = pathlib.Path("ddos_samurai/__init__.py")
+          content = init_path.read_text(encoding="utf-8")
+          match = re.search(r'^__version__\s*=\s*"([^"]+)"', content, flags=re.MULTILINE)
+          if not match:
+              print("Could not parse __version__ from ddos_samurai/__init__.py")
+              sys.exit(1)
+
+          version = str(match.group(1)).strip()
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              print(f"Invalid package SemVer version: {version}")
+              sys.exit(1)
+
+          ref = os.getenv("GITHUB_REF", "")
+          if ref.startswith("refs/tags/"):
+              tag = ref.split("/")[-1]
+              expected = f"v{version}"
+              if tag != expected:
+                  print(f"Tag/version mismatch: tag={tag}, expected={expected}")
+                  sys.exit(1)
+
+          event_name = os.getenv("GITHUB_EVENT_NAME", "")
+          base_ref = os.getenv("GITHUB_BASE_REF", "")
+          if event_name == "pull_request" and base_ref:
+              try:
+                  base_content = subprocess.check_output(
+                      ["git", "show", f"origin/{base_ref}:ddos_samurai/__init__.py"],
+                      text=True,
+                      stderr=subprocess.DEVNULL,
+                  )
+                  base_match = re.search(r'^__version__\s*=\s*"([^"]+)"', base_content, flags=re.MULTILINE)
+                  if base_match and re.fullmatch(r"\d+\.\d+\.\d+", base_match.group(1).strip()):
+                      base_version = tuple(int(x) for x in base_match.group(1).strip().split("."))
+                      head_version = tuple(int(x) for x in version.split("."))
+                      if head_version < base_version:
+                          print(
+                              "Version regression detected: "
+                              f"base={base_match.group(1).strip()} head={version}"
+                          )
+                          sys.exit(1)
+              except subprocess.CalledProcessError:
+                  print(f"Warning: could not resolve base version from origin/{base_ref}; skipping regression check.")
+
+          print(f"SemVer guard OK: {version}")
+          PY
+
   backend-tests:
     name: Backend Tests (Python 3.11)
+    needs: semver-guard
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:

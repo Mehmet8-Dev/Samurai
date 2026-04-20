@@ -1348,7 +1348,9 @@ struct PersistentDeviceStreamState {
   uint32_t ramp_interval_epochs = 0;
   uint32_t ramp_max_quota = 0;
   uint32_t ramp_epoch_counter = 0;
+  uint32_t seq_counter = 0;
   uint32_t produced = 0;
+  uint32_t completed = 0;
   uint32_t queue_cursor = 0;
   uint32_t weight = 1;
   uint32_t deficit = 0;
@@ -1567,6 +1569,24 @@ inline uint64_t host_u64_load(const volatile uint64_t* p) {
   }
   return static_cast<uint64_t>(__atomic_load_n(
       reinterpret_cast<const volatile unsigned long long*>(p),
+      __ATOMIC_RELAXED));
+}
+
+inline void host_u32_add(volatile uint32_t* p, uint32_t v) {
+  if (!p || v == 0u) {
+    return;
+  }
+  (void)__atomic_fetch_add(reinterpret_cast<unsigned int*>(const_cast<uint32_t*>(p)),
+                           static_cast<unsigned int>(v),
+                           __ATOMIC_RELAXED);
+}
+
+inline uint32_t host_u32_load(const volatile uint32_t* p) {
+  if (!p) {
+    return 0u;
+  }
+  return static_cast<uint32_t>(__atomic_load_n(
+      reinterpret_cast<const volatile unsigned int*>(p),
       __ATOMIC_RELAXED));
 }
 
@@ -2234,6 +2254,46 @@ __device__ __forceinline__ uint16_t persistent_rfc1624_update_dword(
   return csum;
 }
 
+__device__ __forceinline__ void persistent_copy_bytes_vectorized(
+    uint8_t* dst,
+    const volatile uint8_t* src,
+    int nbytes) {
+  if (nbytes <= 0) {
+    return;
+  }
+  int i = 0;
+  const uintptr_t align_mask = reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src);
+  const uint8_t* src_plain = const_cast<const uint8_t*>(src);
+  if ((align_mask & 0x0F) == 0) {
+    auto* d16 = reinterpret_cast<uint4*>(dst);
+    auto* s16 = reinterpret_cast<const uint4*>(src_plain);
+    const int n16 = nbytes / 16;
+    for (int j = 0; j < n16; ++j) {
+      d16[j] = s16[j];
+    }
+    i = n16 * 16;
+  } else if ((align_mask & 0x07) == 0) {
+    auto* d8 = reinterpret_cast<unsigned long long*>(dst);
+    auto* s8 = reinterpret_cast<const unsigned long long*>(src_plain);
+    const int n8 = nbytes / 8;
+    for (int j = 0; j < n8; ++j) {
+      d8[j] = s8[j];
+    }
+    i = n8 * 8;
+  } else if ((align_mask & 0x03) == 0) {
+    auto* d4 = reinterpret_cast<uint32_t*>(dst);
+    auto* s4 = reinterpret_cast<const uint32_t*>(src_plain);
+    const int n4 = nbytes / 4;
+    for (int j = 0; j < n4; ++j) {
+      d4[j] = s4[j];
+    }
+    i = n4 * 4;
+  }
+  for (; i < nbytes; ++i) {
+    dst[i] = src_plain[i];
+  }
+}
+
 __device__ inline void persistent_write_packet(
     PersistentRingSlot* slot,
     uint8_t* payload,
@@ -2277,9 +2337,7 @@ __device__ inline void persistent_write_packet(
       sv->template_len <= static_cast<uint16_t>(max_packet_bytes) &&
       sv->template_len <= static_cast<uint16_t>(kPersistentMaxPacketBytes)) {
     const int total_len = static_cast<int>(sv->template_len);
-    for (int i = 0; i < total_len; ++i) {
-      payload[i] = sv->template_packet[i];
-    }
+    persistent_copy_bytes_vectorized(payload, sv->template_packet, total_len);
 
     const int ip_off_t = static_cast<int>(sv->template_ip_off);
     const int t_off_t = static_cast<int>(sv->template_l4_off);
@@ -2571,11 +2629,11 @@ __global__ void persistent_dataplane_kernel(
       int produced_for_stream = 0;
 
       for (uint32_t token_i = 0; token_i < reserved_tokens; ++token_i) {
-        const uint32_t produced_now = atomicAdd(
-            (unsigned int*)&sv->produced,
+        const uint32_t packet_seq = atomicAdd(
+            (unsigned int*)&sv->seq_counter,
             1u) +
             1u;
-        const uint32_t route_seed = produced_now ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
+        const uint32_t route_seed = packet_seq ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
         int q_base = affinity_q;
         if (q_base < 0 || q_base >= ctrl->queue_count) {
           q_base = static_cast<int>(route_seed % static_cast<uint32_t>(ctrl->queue_count));
@@ -2631,7 +2689,7 @@ __global__ void persistent_dataplane_kernel(
             &slot,
             slot_payload,
             sv,
-            produced_now,
+            packet_seq,
             static_cast<uint32_t>(
                 ctrl->max_packet_bytes > 0
                     ? ctrl->max_packet_bytes
@@ -2641,6 +2699,7 @@ __global__ void persistent_dataplane_kernel(
         slot.protocol = proto;
         __threadfence_system();
         atomicExch((int*)&slot.state, 1);
+        (void)atomicAdd((unsigned int*)&sv->produced, 1u);
         u64_add(&ctrl->produced, 1u);
         produced = true;
         produced_for_stream += 1;
@@ -2744,6 +2803,9 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                 local_released += 1u;
                 if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
                   rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+                  if (rt.streams) {
+                    host_u32_add(&rt.streams[slot_idx].completed, 1u);
+                  }
                 }
               }
               progressed = true;
@@ -2833,12 +2895,14 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
             afpacket_slot_ids.clear();
             afpacket_stream_slots.clear();
             int packet_size = 0;
-            for (int i = 0; i < remaining_budget; ++i) {
-              const uint32_t slot_id = (cursor + static_cast<uint32_t>(i)) % static_cast<uint32_t>(rt.ring_slots);
+            const uint32_t scan_start = cursor;
+            const int scan_budget = std::min(remaining_budget, rt.ring_slots);
+            for (int i = 0; i < scan_budget; ++i) {
+              const uint32_t slot_id = (scan_start + static_cast<uint32_t>(i)) % static_cast<uint32_t>(rt.ring_slots);
               const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
               PersistentRingSlot& slot = rt.rings_host[idx];
               if (slot.state != 1) {
-                break;
+                continue;
               }
               if (slot.len <= 0 || slot.len > max_packet) {
                 slot.state = 0;
@@ -2848,39 +2912,54 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                 slot.protocol = 0;
                 local_drops += 1u;
                 local_released += 1u;
-                if (i == 0) {
-                  cursor = (cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
-                }
-                break;
+                progressed = true;
+                continue;
               }
               if (packet_size == 0) {
                 packet_size = slot.len;
               } else if (slot.len != packet_size) {
-                break;
+                continue;
               }
               afpacket_slot_ids.push_back(slot_id);
               afpacket_stream_slots.push_back(slot.stream_slot);
+              if (static_cast<int>(afpacket_slot_ids.size()) >= remaining_budget) {
+                break;
+              }
             }
             if (afpacket_slot_ids.empty() || packet_size <= 0) {
               break;
             }
 
             const size_t batch_count = afpacket_slot_ids.size();
-            const size_t batch_bytes = static_cast<size_t>(packet_size) * batch_count;
-            if (afpacket_batch_payload.size() < batch_bytes) {
-              afpacket_batch_payload.resize(batch_bytes);
-            }
-            for (size_t bi = 0; bi < batch_count; ++bi) {
-              const uint32_t slot_id = afpacket_slot_ids[bi];
-              const uint8_t* payload =
+            const uint8_t* send_buffer = nullptr;
+            size_t send_buffer_len = 0u;
+            if (batch_count == 1u) {
+              const uint32_t slot_id = afpacket_slot_ids[0];
+              send_buffer =
                   rt.payload_host +
                   ((static_cast<size_t>(q) * static_cast<size_t>(rt.ring_slots) + static_cast<size_t>(slot_id)) *
                    static_cast<size_t>(kPersistentUmemFrameSize)) +
                   static_cast<size_t>(kPersistentUmemHeadroom);
-              std::memcpy(
-                  afpacket_batch_payload.data() + (bi * static_cast<size_t>(packet_size)),
-                  payload,
-                  static_cast<size_t>(packet_size));
+              send_buffer_len = static_cast<size_t>(packet_size);
+            } else {
+              const size_t batch_bytes = static_cast<size_t>(packet_size) * batch_count;
+              if (afpacket_batch_payload.size() < batch_bytes) {
+                afpacket_batch_payload.resize(batch_bytes);
+              }
+              for (size_t bi = 0; bi < batch_count; ++bi) {
+                const uint32_t slot_id = afpacket_slot_ids[bi];
+                const uint8_t* payload =
+                    rt.payload_host +
+                    ((static_cast<size_t>(q) * static_cast<size_t>(rt.ring_slots) + static_cast<size_t>(slot_id)) *
+                     static_cast<size_t>(kPersistentUmemFrameSize)) +
+                    static_cast<size_t>(kPersistentUmemHeadroom);
+                std::memcpy(
+                    afpacket_batch_payload.data() + (bi * static_cast<size_t>(packet_size)),
+                    payload,
+                    static_cast<size_t>(packet_size));
+              }
+              send_buffer = afpacket_batch_payload.data();
+              send_buffer_len = batch_bytes;
             }
 
             int sent = 0;
@@ -2889,8 +2968,8 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
             errbuf[0] = '\0';
             const int rc = rt.tx_bridge.afpacket_send_bridge(
                 rt.tx_bridge.iface.c_str(),
-                afpacket_batch_payload.data(),
-                batch_bytes,
+                send_buffer,
+                send_buffer_len,
                 packet_size,
                 static_cast<int>(batch_count),
                 rt.tx_bridge.afpacket_mac.data(),
@@ -2921,6 +3000,9 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
               const int32_t slot_idx = afpacket_stream_slots[static_cast<size_t>(i)];
               if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
                 rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+                if (rt.streams) {
+                  host_u32_add(&rt.streams[slot_idx].completed, 1u);
+                }
               }
             }
             drained += static_cast<uint64_t>(sent);
@@ -2934,7 +3016,15 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
               bridge_wait_until_ns(target);
               rt.bridge_next_send_ns = target;
             }
-            cursor = (cursor + static_cast<uint32_t>(sent)) % static_cast<uint32_t>(rt.ring_slots);
+            uint32_t next_cursor = cursor;
+            for (int step = 0; step < rt.ring_slots; ++step) {
+              const int probe_idx = q * rt.ring_slots + static_cast<int>(next_cursor);
+              if (rt.rings_host[probe_idx].state == 1) {
+                break;
+              }
+              next_cursor = (next_cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
+            }
+            cursor = next_cursor;
             if (sent < static_cast<int>(batch_count)) {
               break;
             }
@@ -2958,6 +3048,9 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
           rt.queue_sent_counts[static_cast<size_t>(q)] += 1u;
           if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
             rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+            if (rt.streams) {
+              host_u32_add(&rt.streams[slot_idx].completed, 1u);
+            }
           }
           drained += 1u;
           progressed = true;
@@ -3112,6 +3205,7 @@ inline void persistent_monitor_loop() {
         }
         st.quota_left = d.quota_left;
         st.submitted = d.produced;
+        st.completed = std::max<uint64_t>(st.completed, static_cast<uint64_t>(host_u32_load(&d.completed)));
         st.queue_pressure = rt.ctrl->queue_pressure;
         st.quota_stall = rt.ctrl->quota_stall;
         st.bridge_sent = rt.ctrl->tx_bridge_sent;
@@ -4356,6 +4450,7 @@ extern "C" int samurai_gpu_packet_read_stream_stats_snapshot(
     if (st.device_slot >= 0 && st.device_slot < kPersistentMaxStreams && g_persistent_runtime.streams) {
       const PersistentDeviceStreamState& d = g_persistent_runtime.streams[st.device_slot];
       out_stats->submitted = static_cast<uint64_t>(d.produced);
+      out_stats->completed = static_cast<uint64_t>(host_u32_load(&d.completed));
       out_stats->quota_left = static_cast<uint64_t>(d.quota_left);
     }
   }

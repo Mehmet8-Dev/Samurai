@@ -24,9 +24,9 @@ except Exception:
     # Scapy may fail to initialize in restricted/sandboxed environments.
     conf = None
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __codename__ = "Kenjaku"
-__author__ = "Samurai Team"
+__author__ = "Mehmet Okur"
 
 # Feature availability flags
 GPU_AVAILABLE = False
