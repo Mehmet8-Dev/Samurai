@@ -11,13 +11,24 @@ from __future__ import annotations
 import ctypes.util
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
+
+
+def _read_package_version() -> str:
+    init_file = Path(__file__).resolve().parent / "ddos_samurai" / "__init__.py"
+    content = init_file.read_text(encoding="utf-8")
+    match = re.search(r'^__version__\s*=\s*"([^"]+)"', content, flags=re.MULTILINE)
+    if not match:
+        raise RuntimeError("Could not parse __version__ from ddos_samurai/__init__.py")
+    return str(match.group(1)).strip()
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -644,7 +655,7 @@ def get_extensions() -> List[Extension]:
 def build_setup_kwargs() -> Dict[str, object]:
     return {
         "name": "ddos_samurai",
-        "version": "2.0.0",
+        "version": _read_package_version(),
         "description": "High-Performance Network Testing Tool with GPU Acceleration and AF_XDP Support",
         "license": "MIT",
         "author": "Samurai Team",

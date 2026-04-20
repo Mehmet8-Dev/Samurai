@@ -24,7 +24,8 @@ except Exception:
     # Scapy may fail to initialize in restricted/sandboxed environments.
     conf = None
 
-__version__ = "Ronin"
+__version__ = "2.0.0"
+__codename__ = "Kenjaku"
 __author__ = "Samurai Team"
 
 # Feature availability flags
@@ -57,6 +58,7 @@ def get_capabilities():
         xdp_available = False
     return {
         "version": __version__,
+        "codename": __codename__,
         "gpu_acceleration": GPU_AVAILABLE,
         "af_xdp": xdp_available,
         "fast_sender": FAST_SENDER_AVAILABLE,
