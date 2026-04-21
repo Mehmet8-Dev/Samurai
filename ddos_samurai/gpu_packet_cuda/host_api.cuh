@@ -2611,7 +2611,7 @@ __global__ void persistent_dataplane_kernel(
   const uint32_t tid = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   const uint32_t workers = static_cast<uint32_t>(gridDim.x * blockDim.x);
   constexpr uint32_t kWarpWidth = 32u;
-  constexpr uint32_t kTokenReserveChunkPerLane = 2u;
+  constexpr uint32_t kTokenReserveChunkPerLane = 4u;
   constexpr uint32_t kTokenReserveChunkWarp = kTokenReserveChunkPerLane * kWarpWidth;
   const uint32_t lane = tid & (kWarpWidth - 1u);
   const uint32_t warp_id = tid / kWarpWidth;
