@@ -2548,11 +2548,6 @@ __device__ inline uint32_t reserve_stream_tokens(
     *slot_base_out = 0u;
   }
 
-  const uint32_t quota_now = u32_load(&sv->quota_left);
-  if (quota_now == 0u) {
-    return 0u;
-  }
-
   if (u32_load(&sv->deficit) == 0u) {
     const uint32_t weight = u32_load(&sv->weight);
     (void)atomicCAS(
@@ -2561,33 +2556,45 @@ __device__ inline uint32_t reserve_stream_tokens(
         weight == 0u ? 1u : weight);
   }
 
-  const uint32_t deficit_now = u32_load(&sv->deficit);
-  if (deficit_now == 0u) {
-    return 0u;
-  }
+  uint32_t reserve = 0u;
+  bool committed = false;
+  while (true) {
+    const uint32_t quota_now = u32_load(&sv->quota_left);
+    const uint32_t deficit_now = u32_load(&sv->deficit);
+    if (quota_now == 0u || deficit_now == 0u) {
+      return 0u;
+    }
+    reserve = quota_now;
+    if (reserve > deficit_now) {
+      reserve = deficit_now;
+    }
+    if (reserve > max_tokens) {
+      reserve = max_tokens;
+    }
+    if (reserve == 0u) {
+      return 0u;
+    }
 
-  uint32_t reserve = quota_now;
-  if (reserve > deficit_now) {
-    reserve = deficit_now;
-  }
-  if (reserve > max_tokens) {
-    reserve = max_tokens;
-  }
-  if (reserve == 0u) {
-    return 0u;
-  }
+    const uint32_t next_quota = quota_now - reserve;
+    if (atomicCAS((unsigned int*)&sv->quota_left, quota_now, next_quota) != quota_now) {
+      continue;
+    }
 
-  const uint32_t q_prev = atomicSub((unsigned int*)&sv->quota_left, reserve);
-  if (q_prev < reserve) {
-    (void)atomicAdd((unsigned int*)&sv->quota_left, reserve);
-    return 0u;
-  }
-
-  const uint32_t d_prev = atomicSub((unsigned int*)&sv->deficit, reserve);
-  if (d_prev < reserve) {
-    (void)atomicAdd((unsigned int*)&sv->quota_left, reserve);
-    (void)atomicAdd((unsigned int*)&sv->deficit, reserve);
-    return 0u;
+    while (true) {
+      const uint32_t d_now = u32_load(&sv->deficit);
+      if (d_now < reserve) {
+        (void)atomicAdd((unsigned int*)&sv->quota_left, reserve);
+        break;
+      }
+      const uint32_t next_deficit = d_now - reserve;
+      if (atomicCAS((unsigned int*)&sv->deficit, d_now, next_deficit) == d_now) {
+        committed = true;
+        break;
+      }
+    }
+    if (committed) {
+      break;
+    }
   }
 
   if (slot_base_out) {
@@ -2627,12 +2634,12 @@ __global__ void persistent_dataplane_kernel(
       const int affinity_q = i32_load(&sv->queue_affinity);
       const int sid = i32_load(&sv->stream_id);
       int produced_for_stream = 0;
+      const uint32_t packet_seq_base = atomicAdd(
+          (unsigned int*)&sv->seq_counter,
+          reserved_tokens);
 
       for (uint32_t token_i = 0; token_i < reserved_tokens; ++token_i) {
-        const uint32_t packet_seq = atomicAdd(
-            (unsigned int*)&sv->seq_counter,
-            1u) +
-            1u;
+        const uint32_t packet_seq = packet_seq_base + token_i + 1u;
         const uint32_t route_seed = packet_seq ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
         int q_base = affinity_q;
         if (q_base < 0 || q_base >= ctrl->queue_count) {
@@ -2694,18 +2701,18 @@ __global__ void persistent_dataplane_kernel(
                 ctrl->max_packet_bytes > 0
                     ? ctrl->max_packet_bytes
                     : (kPersistentUmemFrameSize - kPersistentUmemHeadroom)));
-        slot.stream_id = i32_load(&sv->stream_id);
+        slot.stream_id = sid;
         slot.stream_slot = idx;
         slot.protocol = proto;
         __threadfence_system();
         atomicExch((int*)&slot.state, 1);
-        (void)atomicAdd((unsigned int*)&sv->produced, 1u);
-        u64_add(&ctrl->produced, 1u);
         produced = true;
         produced_for_stream += 1;
       }
 
       if (produced_for_stream > 0) {
+        (void)atomicAdd((unsigned int*)&sv->produced, static_cast<uint32_t>(produced_for_stream));
+        u64_add(&ctrl->produced, static_cast<uint64_t>(produced_for_stream));
         rr = static_cast<uint32_t>(idx + 1);
         break;
       }
