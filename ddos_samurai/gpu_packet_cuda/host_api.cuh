@@ -2505,11 +2505,11 @@ __device__ inline void persistent_write_packet(
 }
 
 __device__ inline uint32_t u32_load(const volatile uint32_t* p) {
-  return atomicAdd((unsigned int*)p, 0u);
+  return *p;
 }
 
 __device__ inline int32_t i32_load(const volatile int32_t* p) {
-  return atomicAdd((int*)p, 0);
+  return *p;
 }
 
 __device__ inline uint64_t u64_add(volatile uint64_t* p, uint64_t v) {
@@ -2611,7 +2611,7 @@ __global__ void persistent_dataplane_kernel(
   const uint32_t tid = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   const uint32_t workers = static_cast<uint32_t>(gridDim.x * blockDim.x);
   constexpr uint32_t kWarpWidth = 32u;
-  constexpr uint32_t kTokenReserveChunkPerLane = 1u;
+  constexpr uint32_t kTokenReserveChunkPerLane = 2u;
   constexpr uint32_t kTokenReserveChunkWarp = kTokenReserveChunkPerLane * kWarpWidth;
   const uint32_t lane = tid & (kWarpWidth - 1u);
   const uint32_t warp_id = tid / kWarpWidth;
@@ -2619,6 +2619,25 @@ __global__ void persistent_dataplane_kernel(
   uint32_t rr = warp_id;
   uint32_t throttle_gate = tid;
   while (ctrl && ctrl->run == 1) {
+    const int queue_count = ctrl->queue_count;
+    const int ring_slots = ctrl->ring_slots;
+    const int queue_probe_span_cfg = ctrl->queue_probe_span;
+    if (queue_count <= 0 || ring_slots <= 0) {
+      continue;
+    }
+    const uint32_t queue_count_u = static_cast<uint32_t>(queue_count);
+    const uint32_t ring_slots_u = static_cast<uint32_t>(ring_slots);
+    const bool queue_pow2 = (queue_count_u & (queue_count_u - 1u)) == 0u;
+    const bool ring_pow2 = (ring_slots_u & (ring_slots_u - 1u)) == 0u;
+    const uint32_t queue_mask = queue_pow2 ? (queue_count_u - 1u) : 0u;
+    const uint32_t ring_mask = ring_pow2 ? (ring_slots_u - 1u) : 0u;
+
+    uint64_t local_queue_pressure = 0u;
+    uint64_t local_ring_drop_events = 0u;
+    uint64_t local_queue_spread_events = 0u;
+    uint64_t local_quota_stall = 0u;
+    uint64_t local_idle_gap = 0u;
+
     if (tid == 0u) {
       u64_add(&ctrl->heartbeat, 1u);
     }
@@ -2652,22 +2671,26 @@ __global__ void persistent_dataplane_kernel(
       }
       packet_seq_base = __shfl_sync(warp_mask, packet_seq_base, 0);
       int produced_for_stream_lane = 0;
+      PersistentRingSlot* publish_slot_0 = nullptr;
+      PersistentRingSlot* publish_slot_1 = nullptr;
 
       for (uint32_t token_i = lane; token_i < reserved_tokens; token_i += kWarpWidth) {
         const uint32_t packet_seq = packet_seq_base + token_i + 1u;
         const uint32_t route_seed = packet_seq ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
         int q_base = affinity_q;
-        if (q_base < 0 || q_base >= ctrl->queue_count) {
-          q_base = static_cast<int>(route_seed % static_cast<uint32_t>(ctrl->queue_count));
+        if (q_base < 0 || q_base >= queue_count) {
+          q_base = queue_pow2
+              ? static_cast<int>(route_seed & queue_mask)
+              : static_cast<int>(route_seed % queue_count_u);
         }
         int probe_span = 1;
-        if (ctrl->queue_count > 1) {
-          probe_span = ctrl->queue_probe_span;
+        if (queue_count > 1) {
+          probe_span = queue_probe_span_cfg;
           if (probe_span < 1) {
             probe_span = 1;
           }
-          if (probe_span > ctrl->queue_count) {
-            probe_span = ctrl->queue_count;
+          if (probe_span > queue_count) {
+            probe_span = queue_count;
           }
         }
 
@@ -2675,23 +2698,38 @@ __global__ void persistent_dataplane_kernel(
         int q = q_base;
         uint32_t slot_idx = 0u;
         const uint32_t slot_seq = slot_seq_base + token_i;
+        const uint32_t slot_hash = slot_seq ^ (route_seed * 2246822519u);
+        const uint32_t slot_probe_stride = ((route_seed >> 5u) | 1u);
         for (int probe = 0; probe < probe_span; ++probe) {
-          const int q_try = (q_base + probe) % ctrl->queue_count;
-          const uint32_t slot_try = (slot_seq + static_cast<uint32_t>(probe)) % static_cast<uint32_t>(ctrl->ring_slots);
-          PersistentRingSlot& candidate = rings[q_try * ctrl->ring_slots + static_cast<int>(slot_try)];
+          int q_try = q_base + probe;
+          if (q_try >= queue_count) {
+            q_try = queue_pow2
+                ? static_cast<int>(static_cast<uint32_t>(q_try) & queue_mask)
+                : (q_try % queue_count);
+          }
+          uint32_t slot_try = slot_hash + (static_cast<uint32_t>(probe) * slot_probe_stride);
+          if (ring_pow2) {
+            slot_try &= ring_mask;
+          } else {
+            slot_try %= ring_slots_u;
+          }
+          PersistentRingSlot& candidate = rings[q_try * ring_slots + static_cast<int>(slot_try)];
+          if (candidate.state != 0) {
+            continue;
+          }
           if (atomicCAS((int*)&candidate.state, 0, 2) == 0) {
             q = q_try;
             slot_idx = slot_try;
             slot_ptr = &candidate;
             if (probe > 0) {
-              u64_add(&ctrl->queue_spread_events, 1u);
+              local_queue_spread_events += 1u;
             }
             break;
           }
         }
         if (!slot_ptr) {
-          u64_add(&ctrl->queue_pressure, 1u);
-          u64_add(&ctrl->ring_drop_events, 1u);
+          local_queue_pressure += 1u;
+          local_ring_drop_events += 1u;
           // Preserve previous semantics: return only quota token on ring miss.
           (void)atomicAdd((unsigned int*)&sv->quota_left, 1u);
           if ((throttle_gate++ & 0x3Fu) == 0u) {
@@ -2719,10 +2757,23 @@ __global__ void persistent_dataplane_kernel(
         slot.stream_id = sid;
         slot.stream_slot = idx;
         slot.protocol = proto;
-        __threadfence_system();
-        atomicExch((int*)&slot.state, 1);
+        if (!publish_slot_0) {
+          publish_slot_0 = &slot;
+        } else {
+          publish_slot_1 = &slot;
+        }
         produced = true;
         produced_for_stream_lane += 1;
+      }
+
+      if (produced_for_stream_lane > 0) {
+        __threadfence_system();
+        if (publish_slot_0) {
+          atomicExch((int*)&publish_slot_0->state, 1);
+        }
+        if (publish_slot_1) {
+          atomicExch((int*)&publish_slot_1->state, 1);
+        }
       }
 
       int produced_for_stream = produced_for_stream_lane;
@@ -2742,8 +2793,8 @@ __global__ void persistent_dataplane_kernel(
       }
     }
     if (!produced) {
-      u64_add(&ctrl->quota_stall, 1u);
-      u64_add(&ctrl->idle_gap, 1u);
+      local_quota_stall += 1u;
+      local_idle_gap += 1u;
       // Intentional: no GPU-side nanosleep. Idle pacing is controlled by CPU epoch/quota refill.
       if (warp_workers > 1u) {
         rr += warp_workers;
@@ -2752,6 +2803,22 @@ __global__ void persistent_dataplane_kernel(
       }
     } else if (warp_workers > 1u) {
       rr += warp_workers;
+    }
+
+    if (local_queue_pressure > 0u) {
+      u64_add(&ctrl->queue_pressure, local_queue_pressure);
+    }
+    if (local_ring_drop_events > 0u) {
+      u64_add(&ctrl->ring_drop_events, local_ring_drop_events);
+    }
+    if (local_queue_spread_events > 0u) {
+      u64_add(&ctrl->queue_spread_events, local_queue_spread_events);
+    }
+    if (local_quota_stall > 0u) {
+      u64_add(&ctrl->quota_stall, local_quota_stall);
+    }
+    if (local_idle_gap > 0u) {
+      u64_add(&ctrl->idle_gap, local_idle_gap);
     }
   }
 }
