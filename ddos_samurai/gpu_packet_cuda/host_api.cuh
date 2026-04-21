@@ -2611,6 +2611,7 @@ __global__ void persistent_dataplane_kernel(
   const uint32_t tid = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   const uint32_t workers = static_cast<uint32_t>(gridDim.x * blockDim.x);
   constexpr uint32_t kWarpWidth = 32u;
+  constexpr unsigned int kFullWarpMask = 0xFFFFFFFFu;
   constexpr uint32_t kTokenReserveChunkPerLane = 4u;
   constexpr uint32_t kTokenReserveChunkWarp = kTokenReserveChunkPerLane * kWarpWidth;
   const uint32_t lane = tid & (kWarpWidth - 1u);
@@ -2642,14 +2643,29 @@ __global__ void persistent_dataplane_kernel(
       u64_add(&ctrl->heartbeat, 1u);
     }
     bool produced = false;
-    for (int i = 0; i < ctrl->max_streams; ++i) {
-      const int idx = static_cast<int>((rr + static_cast<uint32_t>(i)) % static_cast<uint32_t>(ctrl->max_streams));
+    const int max_streams = ctrl->max_streams;
+    const uint32_t max_streams_u = max_streams > 0 ? static_cast<uint32_t>(max_streams) : 0u;
+    for (int i = 0; i < max_streams; ++i) {
+      const int idx = static_cast<int>((rr + static_cast<uint32_t>(i)) % max_streams_u);
       volatile PersistentDeviceStreamState* sv = &streams[idx];
-      const int32_t proto = i32_load(&sv->protocol);
-      if (sv->active == 0 || sv->target_ip == 0u || (proto != 1 && sv->target_port == 0u)) {
+      const unsigned int warp_mask = __activemask();
+      int32_t proto = 0;
+      int active = 0;
+      uint32_t target_ip = 0u;
+      int target_port = 0;
+      if (lane == 0u) {
+        proto = i32_load(&sv->protocol);
+        active = sv->active;
+        target_ip = sv->target_ip;
+        target_port = static_cast<int>(sv->target_port);
+      }
+      proto = __shfl_sync(warp_mask, proto, 0);
+      active = __shfl_sync(warp_mask, active, 0);
+      target_ip = __shfl_sync(warp_mask, target_ip, 0);
+      target_port = __shfl_sync(warp_mask, target_port, 0);
+      if (active == 0 || target_ip == 0u || (proto != 1 && target_port == 0)) {
         continue;
       }
-      const unsigned int warp_mask = __activemask();
       uint32_t slot_seq_base = 0u;
       uint32_t reserved_tokens = 0u;
       if (lane == 0u) {
@@ -2661,8 +2677,14 @@ __global__ void persistent_dataplane_kernel(
         continue;
       }
 
-      const int affinity_q = i32_load(&sv->queue_affinity);
-      const int sid = i32_load(&sv->stream_id);
+      int affinity_q = 0;
+      int sid = 0;
+      if (lane == 0u) {
+        affinity_q = i32_load(&sv->queue_affinity);
+        sid = i32_load(&sv->stream_id);
+      }
+      affinity_q = __shfl_sync(warp_mask, affinity_q, 0);
+      sid = __shfl_sync(warp_mask, sid, 0);
       uint32_t packet_seq_base = 0u;
       if (lane == 0u) {
         packet_seq_base = atomicAdd(
@@ -2788,7 +2810,10 @@ __global__ void persistent_dataplane_kernel(
 
       if (__any_sync(warp_mask, produced_for_stream_lane > 0)) {
         produced = true;
-        rr = static_cast<uint32_t>(idx + 1);
+        if (lane == 0u) {
+          rr = static_cast<uint32_t>(idx + 1);
+        }
+        rr = __shfl_sync(warp_mask, rr, 0);
         break;
       }
     }
@@ -2796,13 +2821,19 @@ __global__ void persistent_dataplane_kernel(
       local_quota_stall += 1u;
       local_idle_gap += 1u;
       // Intentional: no GPU-side nanosleep. Idle pacing is controlled by CPU epoch/quota refill.
-      if (warp_workers > 1u) {
-        rr += warp_workers;
-      } else {
-        rr += 1u;
+      if (lane == 0u) {
+        if (warp_workers > 1u) {
+          rr += warp_workers;
+        } else {
+          rr += 1u;
+        }
       }
+      rr = __shfl_sync(kFullWarpMask, rr, 0);
     } else if (warp_workers > 1u) {
-      rr += warp_workers;
+      if (lane == 0u) {
+        rr += warp_workers;
+      }
+      rr = __shfl_sync(kFullWarpMask, rr, 0);
     }
 
     if (local_queue_pressure > 0u) {
