@@ -8,9 +8,8 @@ Samurai, **yalnizca yetkili ortamlarda** kullanilmak uzere tasarlanmis moduler b
 - Mevcut kod adi: `Kenjaku`
 - Eski kod adi: `Ronin`
 
-
-
 Odak alanlari:
+
 - L3/L4/L7 trafik ve davranis testleri
 - CPU + C extension + opsiyonel CUDA hizlandirma
 - Profil tabanli benchmark, run-report ve telemetry
@@ -20,7 +19,7 @@ Odak alanlari:
 - Aktif cekirdek: `advv2.py` + `ddos_samurai/cli/` + `orchestrator/senders`
 - Aktif hizli yollar: `fast_sender.c`, `pacing_engine.c`, `xdp_sender.c`, `dataplane_core.c`
 - Aktif GPU yolu: Python bridge + native CUDA (`ddos_samurai/libgpu_packet_cuda.so`)
-- Aktif stateful L7 yolu: `ddos_samurai/l7_emu/*` + `ddos_samurai/l7_emu_native/*`
+- Aktif stateful L7 yolu: `ddos_samurai/l7_emu/`* + `ddos_samurai/l7_emu_native/*`
 - Aktif GPU vector planner yolu: `ddos_samurai/gpu_cuda_payload/*` + `_gpu_cuda_payload_native`
 - Repo kokunde `dashboard/` dizini yok.
 - Repo icinde `ddos_samurai/api.py` yok.
@@ -91,6 +90,7 @@ python setup.py build_ext --inplace
 `--gpu-packet-zerocopy-output` acikken native CUDA output buffer mapped host memory'e alinabilir; bu mod her topolojide daha hizli olmak zorunda degildir, benchmark ile dogrulanmalidir.
 
 Native CUDA bridge akisi:
+
 - `device mem -> (async D2H veya mapped host) -> host-ready buffer`
 - `--gpu-stream-count` + `--gpu-pipeline-depth` ile double-buffer/queue overlap
 - Host-ready olmayan native cagrilarda `samurai_gpu_packet_wait()` bariyeri uygulanir
