@@ -1469,6 +1469,7 @@ struct PersistentRuntime {
   cudaStream_t kernel_stream = nullptr;
   PersistentRuntimeControl* ctrl = nullptr;                       // mapped host
   PersistentRuntimeControl* ctrl_dev = nullptr;                   // mapped device
+  int32_t* run_flag_dev = nullptr;                                // device-only hot run gate
   PersistentDeviceStreamState* streams = nullptr;                 // mapped host
   PersistentDeviceStreamState* streams_dev = nullptr;             // mapped device
   PersistentRingSlot* rings_host = nullptr;                       // mapped host
@@ -1503,6 +1504,10 @@ struct PersistentRuntime {
     threads_running.store(false, std::memory_order_relaxed);
     if (ctrl) {
       ctrl->run = 0;
+    }
+    if (run_flag_dev) {
+      const int32_t run_off = 0;
+      (void)cudaMemcpy(run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice);
     }
     if (kernel_stream) {
       (void)cudaStreamSynchronize(kernel_stream);
@@ -1541,6 +1546,10 @@ struct PersistentRuntime {
       (void)cudaFreeHost(ctrl);
       ctrl = nullptr;
       ctrl_dev = nullptr;
+    }
+    if (run_flag_dev) {
+      (void)cudaFree(run_flag_dev);
+      run_flag_dev = nullptr;
     }
   }
 };
@@ -2633,6 +2642,12 @@ __device__ inline uint32_t reserve_stream_tokens(
 }
 
 __global__ void persistent_dataplane_kernel(
+    const volatile int32_t* run_flag_dev,
+    const int32_t queue_count_cfg,
+    const int32_t ring_slots_cfg,
+    const int32_t max_streams_cfg,
+    const int32_t queue_probe_span_cfg,
+    const int32_t max_packet_bytes_cfg,
     volatile PersistentRuntimeControl* ctrl,
     volatile PersistentDeviceStreamState* streams,
     PersistentRingSlot* rings,
@@ -2648,19 +2663,21 @@ __global__ void persistent_dataplane_kernel(
   const uint32_t warp_workers = (workers + (kWarpWidth - 1u)) / kWarpWidth;
   uint32_t rr = warp_id;
   uint32_t throttle_gate = tid;
-  while (ctrl && ctrl->run == 1) {
-    const int queue_count = ctrl->queue_count;
-    const int ring_slots = ctrl->ring_slots;
-    const int queue_probe_span_cfg = ctrl->queue_probe_span;
-    if (queue_count <= 0 || ring_slots <= 0) {
-      continue;
-    }
-    const uint32_t queue_count_u = static_cast<uint32_t>(queue_count);
-    const uint32_t ring_slots_u = static_cast<uint32_t>(ring_slots);
-    const bool queue_pow2 = (queue_count_u & (queue_count_u - 1u)) == 0u;
-    const bool ring_pow2 = (ring_slots_u & (ring_slots_u - 1u)) == 0u;
-    const uint32_t queue_mask = queue_pow2 ? (queue_count_u - 1u) : 0u;
-    const uint32_t ring_mask = ring_pow2 ? (ring_slots_u - 1u) : 0u;
+  if (!ctrl || !run_flag_dev || queue_count_cfg <= 0 || ring_slots_cfg <= 0 || max_streams_cfg <= 0) {
+    return;
+  }
+  const int queue_count = queue_count_cfg;
+  const int ring_slots = ring_slots_cfg;
+  const int max_streams = max_streams_cfg;
+  const int queue_probe_span_default = queue_probe_span_cfg;
+  const int max_packet_bytes = max_packet_bytes_cfg;
+  const uint32_t queue_count_u = static_cast<uint32_t>(queue_count);
+  const uint32_t ring_slots_u = static_cast<uint32_t>(ring_slots);
+  const bool queue_pow2 = (queue_count_u & (queue_count_u - 1u)) == 0u;
+  const bool ring_pow2 = (ring_slots_u & (ring_slots_u - 1u)) == 0u;
+  const uint32_t queue_mask = queue_pow2 ? (queue_count_u - 1u) : 0u;
+  const uint32_t ring_mask = ring_pow2 ? (ring_slots_u - 1u) : 0u;
+  while (*run_flag_dev == 1) {
 
     uint64_t local_queue_pressure = 0u;
     uint64_t local_ring_drop_events = 0u;
@@ -2672,8 +2689,7 @@ __global__ void persistent_dataplane_kernel(
       u64_add(&ctrl->heartbeat, 1u);
     }
     bool produced = false;
-    const int max_streams = ctrl->max_streams;
-    const uint32_t max_streams_u = max_streams > 0 ? static_cast<uint32_t>(max_streams) : 0u;
+    const uint32_t max_streams_u = static_cast<uint32_t>(max_streams);
     for (int i = 0; i < max_streams; ++i) {
       const int idx = static_cast<int>((rr + static_cast<uint32_t>(i)) % max_streams_u);
       volatile PersistentDeviceStreamState* sv = &streams[idx];
@@ -2736,7 +2752,7 @@ __global__ void persistent_dataplane_kernel(
         }
         int probe_span = 1;
         if (queue_count > 1) {
-          probe_span = queue_probe_span_cfg;
+          probe_span = queue_probe_span_default;
           if (probe_span < 1) {
             probe_span = 1;
           }
@@ -2802,8 +2818,8 @@ __global__ void persistent_dataplane_kernel(
             sv,
             packet_seq,
             static_cast<uint32_t>(
-                ctrl->max_packet_bytes > 0
-                    ? ctrl->max_packet_bytes
+                max_packet_bytes > 0
+                    ? max_packet_bytes
                     : (kPersistentUmemFrameSize - kPersistentUmemHeadroom)));
         slot.stream_id = sid;
         slot.stream_slot = idx;
@@ -3245,7 +3261,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 
 inline bool persistent_launch_kernel() {
   PersistentRuntime& rt = g_persistent_runtime;
-  if (!rt.ctrl || !rt.ctrl_dev || !rt.streams || !rt.streams_dev || !rt.rings_dev || !rt.payload_dev) {
+  if (!rt.ctrl || !rt.ctrl_dev || !rt.run_flag_dev || !rt.streams || !rt.streams_dev || !rt.rings_dev || !rt.payload_dev) {
     return false;
   }
   if (!rt.kernel_stream) {
@@ -3254,6 +3270,12 @@ inline bool persistent_launch_kernel() {
     }
   }
   rt.ctrl->run = 1;
+  {
+    const int32_t run_on = 1;
+    if (cudaMemcpy(rt.run_flag_dev, &run_on, sizeof(run_on), cudaMemcpyHostToDevice) != cudaSuccess) {
+      return false;
+    }
+  }
   auto env_int_local = [](const char* name, int defv) -> int {
     const char* v = std::getenv(name);
     if (!v || !*v) {
@@ -3274,6 +3296,12 @@ inline bool persistent_launch_kernel() {
       blocks,
       threads,
       rt.kernel_stream,
+      rt.run_flag_dev,
+      rt.queue_count,
+      rt.ring_slots,
+      kPersistentMaxStreams,
+      rt.ctrl->queue_probe_span,
+      rt.max_packet_bytes,
       rt.ctrl_dev,
       rt.streams_dev,
       rt.rings_dev,
@@ -3285,6 +3313,10 @@ inline void persistent_stop_kernel() {
   PersistentRuntime& rt = g_persistent_runtime;
   if (rt.ctrl) {
     rt.ctrl->run = 0;
+  }
+  if (rt.run_flag_dev) {
+    const int32_t run_off = 0;
+    (void)cudaMemcpy(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice);
   }
   if (rt.kernel_stream) {
     (void)cudaStreamSynchronize(rt.kernel_stream);
@@ -3482,6 +3514,10 @@ inline void persistent_runtime_release_unlocked() {
     rt.ctrl = nullptr;
     rt.ctrl_dev = nullptr;
   }
+  if (rt.run_flag_dev) {
+    (void)cudaFree(rt.run_flag_dev);
+    rt.run_flag_dev = nullptr;
+  }
   rt.queue_count = 1;
   rt.ring_slots = 0;
   rt.bridge_thread_count = 1;
@@ -3496,7 +3532,7 @@ inline void persistent_runtime_release_unlocked() {
 
 inline bool persistent_runtime_ensure_started_unlocked() {
   PersistentRuntime& rt = g_persistent_runtime;
-  if (rt.ctrl && rt.streams && rt.rings_host && rt.rings_dev && rt.payload_host && rt.payload_dev &&
+  if (rt.ctrl && rt.run_flag_dev && rt.streams && rt.rings_host && rt.rings_dev && rt.payload_host && rt.payload_dev &&
       rt.threads_running.load(std::memory_order_relaxed)) {
     return true;
   }
@@ -3616,6 +3652,17 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   rt.ctrl->queue_probe_span =
       clamp_i(env_int_local("SAMURAI_GPU_QUEUE_PROBE_SPAN", 4), 1, std::max(1, rt.queue_count));
   rt.ctrl->max_packet_bytes = rt.max_packet_bytes;
+  if (cudaMalloc(&rt.run_flag_dev, sizeof(int32_t)) != cudaSuccess || !rt.run_flag_dev) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  {
+    const int32_t run_init = 0;
+    if (cudaMemcpy(rt.run_flag_dev, &run_init, sizeof(run_init), cudaMemcpyHostToDevice) != cudaSuccess) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+  }
 
   void* streams_host = nullptr;
   const size_t streams_bytes = sizeof(PersistentDeviceStreamState) * static_cast<size_t>(kPersistentMaxStreams);
