@@ -1514,6 +1514,7 @@ struct PersistentRuntime {
   int bridge_idle_sleep_us = 200;
   int bridge_drain_budget_ns = 200000;
   int bridge_ipg_ns = 0;
+  bool bridge_copy_overlap_reap = true;
   int max_packet_bytes = kPersistentMaxPacketBytes;
   uint64_t bridge_next_send_ns = 0;
   std::atomic<uint64_t> last_epoch_refill_ns{0};
@@ -3333,26 +3334,30 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                 break;
               }
               bool payload_ready = true;
-              for (;;) {
-                const cudaError_t query_st = cudaEventQuery(rt.bridge_copy_event);
-                if (query_st == cudaSuccess) {
-                  break;
+              if (rt.bridge_copy_overlap_reap) {
+                for (;;) {
+                  const cudaError_t query_st = cudaEventQuery(rt.bridge_copy_event);
+                  if (query_st == cudaSuccess) {
+                    break;
+                  }
+                  if (query_st != cudaErrorNotReady) {
+                    payload_ready = false;
+                    break;
+                  }
+                  const int polled = persistent_reap_xdp_completions(
+                      rt,
+                      q,
+                      handle,
+                      completion_frame_ids.data(),
+                      completion_frame_ids.size(),
+                      local_released);
+                  if (polled > 0) {
+                    progressed = true;
+                  }
+                  std::this_thread::sleep_for(std::chrono::microseconds(1));
                 }
-                if (query_st != cudaErrorNotReady) {
-                  payload_ready = false;
-                  break;
-                }
-                const int polled = persistent_reap_xdp_completions(
-                    rt,
-                    q,
-                    handle,
-                    completion_frame_ids.data(),
-                    completion_frame_ids.size(),
-                    local_released);
-                if (polled > 0) {
-                  progressed = true;
-                }
-                std::this_thread::sleep_for(std::chrono::microseconds(1));
+              } else if (!persistent_bridge_copy_wait(rt)) {
+                payload_ready = false;
               }
               if (!payload_ready) {
                 break;
@@ -4016,6 +4021,7 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   rt.bridge_idle_sleep_us = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_IDLE_SLEEP_US", 200), 0, 100000);
   rt.bridge_drain_budget_ns = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_DRAIN_BUDGET_NS", 200000), 1000, 100000000);
   rt.bridge_ipg_ns = clamp_i(env_int_local("SAMURAI_GPU_BRIDGE_IPG_NS", 0), 0, 1000000000);
+  rt.bridge_copy_overlap_reap = env_int_local("SAMURAI_GPU_BRIDGE_COPY_OVERLAP_REAP", 1) != 0;
   int auto_bridge_threads = std::max(1, hw_threads / 6);
   auto_bridge_threads = std::min(auto_bridge_threads, std::max(1, rt.queue_count));
   rt.bridge_thread_count = env_has("SAMURAI_GPU_BRIDGE_THREADS")
