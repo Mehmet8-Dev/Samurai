@@ -2177,19 +2177,47 @@ inline void persistent_build_stream_template(volatile PersistentDeviceStreamStat
   sv->template_valid = 1;
 }
 
-__device__ inline uint16_t persistent_checksum(const uint8_t* data, int len) {
-  uint32_t sum = 0u;
+__device__ __forceinline__ uint64_t persistent_accumulate_words_be(
+    const uint8_t* data,
+    int len,
+    uint64_t sum = 0u) {
   int i = 0;
+
+  // Prologue: advance in 16-bit steps until 32-bit aligned (if possible).
+  while (i + 1 < len &&
+         ((reinterpret_cast<uintptr_t>(data + i) & (sizeof(uint32_t) - 1u)) != 0u)) {
+    sum += (static_cast<uint64_t>(data[i]) << 8) | static_cast<uint64_t>(data[i + 1]);
+    i += 2;
+  }
+
+  // Vectorized path: one 32-bit load carries two checksum words.
+  for (; i + 3 < len; i += 4) {
+    const uint32_t w = *reinterpret_cast<const uint32_t*>(data + i);
+    // Memory bytes [b0 b1 b2 b3] -> words (b0<<8|b1) and (b2<<8|b3).
+    sum += ((static_cast<uint64_t>(w) & 0x000000FFu) << 8) |
+           ((static_cast<uint64_t>(w) & 0x0000FF00u) >> 8);
+    sum += ((static_cast<uint64_t>(w) & 0x00FF0000u) >> 8) |
+           ((static_cast<uint64_t>(w) & 0xFF000000u) >> 24);
+  }
+
   for (; i + 1 < len; i += 2) {
-    sum += (static_cast<uint32_t>(data[i]) << 8) | static_cast<uint32_t>(data[i + 1]);
+    sum += (static_cast<uint64_t>(data[i]) << 8) | static_cast<uint64_t>(data[i + 1]);
   }
   if (i < len) {
-    sum += static_cast<uint32_t>(data[i]) << 8;
+    sum += static_cast<uint64_t>(data[i]) << 8;
   }
+  return sum;
+}
+
+__device__ __forceinline__ uint16_t persistent_finalize_checksum(uint64_t sum) {
   while (sum >> 16u) {
     sum = (sum & 0xFFFFu) + (sum >> 16u);
   }
   return static_cast<uint16_t>((~sum) & 0xFFFFu);
+}
+
+__device__ inline uint16_t persistent_checksum(const uint8_t* data, int len) {
+  return persistent_finalize_checksum(persistent_accumulate_words_be(data, len));
 }
 
 __device__ inline uint16_t persistent_l4_checksum(
@@ -2198,24 +2226,15 @@ __device__ inline uint16_t persistent_l4_checksum(
     uint8_t protocol,
     const uint8_t* l4,
     int l4_len) {
-  uint32_t sum = 0u;
+  uint64_t sum = 0u;
   sum += (src_ip >> 16) & 0xFFFFu;
   sum += src_ip & 0xFFFFu;
   sum += (dst_ip >> 16) & 0xFFFFu;
   sum += dst_ip & 0xFFFFu;
   sum += static_cast<uint32_t>(protocol);
   sum += static_cast<uint32_t>(l4_len);
-  int i = 0;
-  for (; i + 1 < l4_len; i += 2) {
-    sum += (static_cast<uint32_t>(l4[i]) << 8) | static_cast<uint32_t>(l4[i + 1]);
-  }
-  if (i < l4_len) {
-    sum += static_cast<uint32_t>(l4[i]) << 8;
-  }
-  while (sum >> 16u) {
-    sum = (sum & 0xFFFFu) + (sum >> 16u);
-  }
-  return static_cast<uint16_t>((~sum) & 0xFFFFu);
+  sum = persistent_accumulate_words_be(l4, l4_len, sum);
+  return persistent_finalize_checksum(sum);
 }
 
 __device__ __forceinline__ uint16_t persistent_fold_ones_complement(uint64_t sum32) {
