@@ -2535,6 +2535,16 @@ __device__ inline uint64_t u64_add(volatile uint64_t* p, uint64_t v) {
   return atomicAdd((unsigned long long*)p, static_cast<unsigned long long>(v));
 }
 
+__device__ __forceinline__ void persistent_publish_slot_ready(PersistentRingSlot* slot) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 600)
+  // System-scope publish with release semantics for host-visible slot state.
+  atomicExch_system((int*)&slot->state, 1);
+#else
+  __threadfence_system();
+  atomicExch((int*)&slot->state, 1);
+#endif
+}
+
 __device__ inline void adaptive_quota_throttle(volatile PersistentDeviceStreamState* sv) {
   const uint32_t quota = u32_load(&sv->quota);
   if (quota == 0u) {
@@ -2808,12 +2818,11 @@ __global__ void persistent_dataplane_kernel(
       }
 
       if (produced_for_stream_lane > 0) {
-        __threadfence_system();
         if (publish_slot_0) {
-          atomicExch((int*)&publish_slot_0->state, 1);
+          persistent_publish_slot_ready(publish_slot_0);
         }
         if (publish_slot_1) {
-          atomicExch((int*)&publish_slot_1->state, 1);
+          persistent_publish_slot_ready(publish_slot_1);
         }
       }
 
