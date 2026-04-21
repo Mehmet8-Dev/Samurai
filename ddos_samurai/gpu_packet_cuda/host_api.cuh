@@ -1378,6 +1378,16 @@ struct PersistentDeviceStreamState {
   uint8_t template_packet[kPersistentMaxPacketBytes]{};
 };
 
+struct PersistentStreamHotState {
+  int32_t active = 0;
+  int32_t stream_id = 0;
+  int32_t protocol = 0;
+  int32_t queue_affinity = -1;
+  uint32_t target_ip = 0;
+  uint16_t target_port = 0;
+  uint16_t _pad = 0;
+};
+
 struct PersistentStreamState {
   int64_t id = 0;
   std::string profile_json;
@@ -1472,6 +1482,7 @@ struct PersistentRuntime {
   int32_t* run_flag_dev = nullptr;                                // device-only hot run gate
   PersistentDeviceStreamState* streams = nullptr;                 // mapped host
   PersistentDeviceStreamState* streams_dev = nullptr;             // mapped device
+  PersistentStreamHotState* streams_hot_dev = nullptr;            // device-only hot stream mirror
   PersistentRingSlot* rings_host = nullptr;                       // mapped host
   PersistentRingSlot* rings_dev = nullptr;                        // mapped device view
   uint8_t* payload_host = nullptr;                                // mapped host UMEM payload
@@ -1547,6 +1558,10 @@ struct PersistentRuntime {
       ctrl = nullptr;
       ctrl_dev = nullptr;
     }
+    if (streams_hot_dev) {
+      (void)cudaFree(streams_hot_dev);
+      streams_hot_dev = nullptr;
+    }
     if (run_flag_dev) {
       (void)cudaFree(run_flag_dev);
       run_flag_dev = nullptr;
@@ -1597,6 +1612,25 @@ inline uint32_t host_u32_load(const volatile uint32_t* p) {
   return static_cast<uint32_t>(__atomic_load_n(
       reinterpret_cast<const volatile unsigned int*>(p),
       __ATOMIC_RELAXED));
+}
+
+inline bool persistent_sync_hot_stream_slot(PersistentRuntime& rt, int slot) {
+  if (!rt.streams || !rt.streams_hot_dev || slot < 0 || slot >= kPersistentMaxStreams) {
+    return false;
+  }
+  const PersistentDeviceStreamState& src = rt.streams[slot];
+  PersistentStreamHotState hot{};
+  hot.active = src.active;
+  hot.stream_id = src.stream_id;
+  hot.protocol = src.protocol;
+  hot.queue_affinity = src.queue_affinity;
+  hot.target_ip = src.target_ip;
+  hot.target_port = src.target_port;
+  return cudaMemcpy(
+             rt.streams_hot_dev + static_cast<size_t>(slot),
+             &hot,
+             sizeof(hot),
+             cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
 inline std::string json_escape_string(const std::string& in) {
@@ -2650,6 +2684,7 @@ __global__ void persistent_dataplane_kernel(
     const int32_t max_packet_bytes_cfg,
     volatile PersistentRuntimeControl* ctrl,
     volatile PersistentDeviceStreamState* streams,
+    const PersistentStreamHotState* streams_hot,
     PersistentRingSlot* rings,
     uint8_t* payload_base) {
   const uint32_t tid = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -2663,7 +2698,7 @@ __global__ void persistent_dataplane_kernel(
   const uint32_t warp_workers = (workers + (kWarpWidth - 1u)) / kWarpWidth;
   uint32_t rr = warp_id;
   uint32_t throttle_gate = tid;
-  if (!ctrl || !run_flag_dev || queue_count_cfg <= 0 || ring_slots_cfg <= 0 || max_streams_cfg <= 0) {
+  if (!ctrl || !run_flag_dev || !streams_hot || queue_count_cfg <= 0 || ring_slots_cfg <= 0 || max_streams_cfg <= 0) {
     return;
   }
   const int queue_count = queue_count_cfg;
@@ -2693,16 +2728,17 @@ __global__ void persistent_dataplane_kernel(
     for (int i = 0; i < max_streams; ++i) {
       const int idx = static_cast<int>((rr + static_cast<uint32_t>(i)) % max_streams_u);
       volatile PersistentDeviceStreamState* sv = &streams[idx];
+      const PersistentStreamHotState* sh = &streams_hot[idx];
       const unsigned int warp_mask = __activemask();
       int32_t proto = 0;
       int active = 0;
       uint32_t target_ip = 0u;
       int target_port = 0;
       if (lane == 0u) {
-        proto = i32_load(&sv->protocol);
-        active = sv->active;
-        target_ip = sv->target_ip;
-        target_port = static_cast<int>(sv->target_port);
+        proto = sh->protocol;
+        active = sh->active;
+        target_ip = sh->target_ip;
+        target_port = static_cast<int>(sh->target_port);
       }
       proto = __shfl_sync(warp_mask, proto, 0);
       active = __shfl_sync(warp_mask, active, 0);
@@ -2725,8 +2761,8 @@ __global__ void persistent_dataplane_kernel(
       int affinity_q = 0;
       int sid = 0;
       if (lane == 0u) {
-        affinity_q = i32_load(&sv->queue_affinity);
-        sid = i32_load(&sv->stream_id);
+        affinity_q = sh->queue_affinity;
+        sid = sh->stream_id;
       }
       affinity_q = __shfl_sync(warp_mask, affinity_q, 0);
       sid = __shfl_sync(warp_mask, sid, 0);
@@ -3261,7 +3297,8 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 
 inline bool persistent_launch_kernel() {
   PersistentRuntime& rt = g_persistent_runtime;
-  if (!rt.ctrl || !rt.ctrl_dev || !rt.run_flag_dev || !rt.streams || !rt.streams_dev || !rt.rings_dev || !rt.payload_dev) {
+  if (!rt.ctrl || !rt.ctrl_dev || !rt.run_flag_dev || !rt.streams || !rt.streams_dev || !rt.streams_hot_dev ||
+      !rt.rings_dev || !rt.payload_dev) {
     return false;
   }
   if (!rt.kernel_stream) {
@@ -3304,6 +3341,7 @@ inline bool persistent_launch_kernel() {
       rt.max_packet_bytes,
       rt.ctrl_dev,
       rt.streams_dev,
+      rt.streams_hot_dev,
       rt.rings_dev,
       rt.payload_dev);
   return (cudaPeekAtLastError() == cudaSuccess);
@@ -3509,6 +3547,10 @@ inline void persistent_runtime_release_unlocked() {
     rt.streams = nullptr;
     rt.streams_dev = nullptr;
   }
+  if (rt.streams_hot_dev) {
+    (void)cudaFree(rt.streams_hot_dev);
+    rt.streams_hot_dev = nullptr;
+  }
   if (rt.ctrl) {
     (void)cudaFreeHost(rt.ctrl);
     rt.ctrl = nullptr;
@@ -3532,7 +3574,8 @@ inline void persistent_runtime_release_unlocked() {
 
 inline bool persistent_runtime_ensure_started_unlocked() {
   PersistentRuntime& rt = g_persistent_runtime;
-  if (rt.ctrl && rt.run_flag_dev && rt.streams && rt.rings_host && rt.rings_dev && rt.payload_host && rt.payload_dev &&
+  if (rt.ctrl && rt.run_flag_dev && rt.streams && rt.streams_hot_dev && rt.rings_host && rt.rings_dev &&
+      rt.payload_host && rt.payload_dev &&
       rt.threads_running.load(std::memory_order_relaxed)) {
     return true;
   }
@@ -3675,6 +3718,15 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   std::memset(rt.streams, 0, streams_bytes);
   if (cudaHostGetDevicePointer(reinterpret_cast<void**>(&rt.streams_dev), streams_host, 0) != cudaSuccess ||
       !rt.streams_dev) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  const size_t streams_hot_bytes = sizeof(PersistentStreamHotState) * static_cast<size_t>(kPersistentMaxStreams);
+  if (cudaMalloc(&rt.streams_hot_dev, streams_hot_bytes) != cudaSuccess || !rt.streams_hot_dev) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  if (cudaMemset(rt.streams_hot_dev, 0, streams_hot_bytes) != cudaSuccess) {
     persistent_runtime_release_unlocked();
     return false;
   }
@@ -4384,6 +4436,10 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   st.spoof_base_ip = spoof_base;
   st.spoof_mask = spoof_mask;
   persistent_build_stream_template(&d);
+  if (!persistent_sync_hot_stream_slot(g_persistent_runtime, free_slot)) {
+    std::memset(&d, 0, sizeof(d));
+    return set_c_api_error("failed to sync stream hot mirror");
+  }
 
   g_persistent_streams[stream_id] = std::move(st);
   *out_stream_id = stream_id;
@@ -4531,6 +4587,9 @@ extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* u
   }
   st.pcap_file = json_get_string(st.update_json, "pcap_file", st.pcap_file);
   persistent_build_stream_template(&d);
+  if (!persistent_sync_hot_stream_slot(g_persistent_runtime, st.device_slot)) {
+    return set_c_api_error("failed to sync stream hot mirror");
+  }
 
   st.submitted = d.produced;
   st.quota_left = d.quota_left;
@@ -4547,6 +4606,7 @@ extern "C" int samurai_gpu_packet_stop_stream(int64_t stream_id) {
   }
   if (it->second.device_slot >= 0 && it->second.device_slot < kPersistentMaxStreams && g_persistent_runtime.streams) {
     std::memset(&g_persistent_runtime.streams[it->second.device_slot], 0, sizeof(PersistentDeviceStreamState));
+    (void)persistent_sync_hot_stream_slot(g_persistent_runtime, it->second.device_slot);
     g_persistent_runtime.completed_by_slot[static_cast<size_t>(it->second.device_slot)].store(
         0u, std::memory_order_relaxed);
   }
