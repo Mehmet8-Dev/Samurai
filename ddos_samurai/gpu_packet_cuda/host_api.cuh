@@ -3016,20 +3016,52 @@ inline int ring_occupancy_now(const PersistentRuntime& rt) {
   return static_cast<int>(produced > released ? (produced - released) : 0u);
 }
 
-inline bool persistent_sync_queue_ring_to_host(PersistentRuntime& rt, int q) {
+inline bool persistent_sync_queue_ring_window_to_host(
+    PersistentRuntime& rt,
+    int q,
+    uint32_t start_slot,
+    uint32_t slot_count) {
   if (!rt.rings_host || !rt.rings_dev || !rt.bridge_copy_stream || q < 0 || q >= rt.queue_count || rt.ring_slots <= 0) {
     return false;
   }
-  const size_t queue_slots = static_cast<size_t>(rt.ring_slots);
-  const size_t queue_bytes = queue_slots * sizeof(PersistentRingSlot);
-  if (cudaMemcpyAsync(
-          rt.rings_host + (static_cast<size_t>(q) * queue_slots),
-          rt.rings_dev + (static_cast<size_t>(q) * queue_slots),
-          queue_bytes,
-          cudaMemcpyDeviceToHost,
-          rt.bridge_copy_stream) != cudaSuccess) {
+  if (slot_count == 0u) {
+    return true;
+  }
+  const uint32_t ring_slots_u = static_cast<uint32_t>(rt.ring_slots);
+  if (start_slot >= ring_slots_u) {
     return false;
   }
+  if (slot_count > ring_slots_u) {
+    slot_count = ring_slots_u;
+  }
+
+  const size_t queue_base = static_cast<size_t>(q) * static_cast<size_t>(rt.ring_slots);
+  const uint32_t first_count = std::min(slot_count, ring_slots_u - start_slot);
+  const size_t first_bytes = static_cast<size_t>(first_count) * sizeof(PersistentRingSlot);
+  if (first_bytes > 0u) {
+    if (cudaMemcpyAsync(
+            rt.rings_host + queue_base + static_cast<size_t>(start_slot),
+            rt.rings_dev + queue_base + static_cast<size_t>(start_slot),
+            first_bytes,
+            cudaMemcpyDeviceToHost,
+            rt.bridge_copy_stream) != cudaSuccess) {
+      return false;
+    }
+  }
+
+  const uint32_t remain = slot_count - first_count;
+  if (remain > 0u) {
+    const size_t remain_bytes = static_cast<size_t>(remain) * sizeof(PersistentRingSlot);
+    if (cudaMemcpyAsync(
+            rt.rings_host + queue_base,
+            rt.rings_dev + queue_base,
+            remain_bytes,
+            cudaMemcpyDeviceToHost,
+            rt.bridge_copy_stream) != cudaSuccess) {
+      return false;
+    }
+  }
+
   return cudaStreamSynchronize(rt.bridge_copy_stream) == cudaSuccess;
 }
 
@@ -3106,9 +3138,6 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
         if (cursor >= static_cast<uint32_t>(rt.ring_slots)) {
           cursor = 0u;
         }
-        if (!persistent_sync_queue_ring_to_host(rt, q)) {
-          continue;
-        }
         const uint64_t t0 = now_ns_steady();
         uint64_t drained = 0;
         while (drained < static_cast<uint64_t>(std::max(1, rt.bridge_max_burst))) {
@@ -3170,6 +3199,13 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
               }
               submit_frame_ids.clear();
               submit_lengths.clear();
+              if (!persistent_sync_queue_ring_window_to_host(
+                      rt,
+                      q,
+                      cursor,
+                      static_cast<uint32_t>(run_budget))) {
+                break;
+              }
               for (int i = 0; i < run_budget; ++i) {
                 const int idx = q * rt.ring_slots + static_cast<int>(cursor) + i;
                 PersistentRingSlot& slot = rt.rings_host[idx];
@@ -3246,19 +3282,26 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
             continue;
           }
 
-          if (rt.tx_bridge.kind == PersistentTxBackendKind::kAfPacket && rt.tx_bridge.afpacket_send_bridge &&
-              !rt.tx_bridge.iface.empty()) {
-            const int max_packet = (rt.ctrl && rt.ctrl->max_packet_bytes > 0) ? rt.ctrl->max_packet_bytes : kPersistentMaxPacketBytes;
-            const int burst_limit = std::max(1, rt.bridge_max_burst);
-            const int remaining_budget = std::max(1, burst_limit - static_cast<int>(drained));
+            if (rt.tx_bridge.kind == PersistentTxBackendKind::kAfPacket && rt.tx_bridge.afpacket_send_bridge &&
+                !rt.tx_bridge.iface.empty()) {
+              const int max_packet = (rt.ctrl && rt.ctrl->max_packet_bytes > 0) ? rt.ctrl->max_packet_bytes : kPersistentMaxPacketBytes;
+              const int burst_limit = std::max(1, rt.bridge_max_burst);
+              const int remaining_budget = std::max(1, burst_limit - static_cast<int>(drained));
             afpacket_slot_ids.clear();
             afpacket_stream_slots.clear();
-            int packet_size = 0;
-            const uint32_t scan_start = cursor;
-            const int scan_budget = std::min(remaining_budget, rt.ring_slots);
-            for (int i = 0; i < scan_budget; ++i) {
-              const uint32_t slot_id = (scan_start + static_cast<uint32_t>(i)) % static_cast<uint32_t>(rt.ring_slots);
-              const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
+              int packet_size = 0;
+              const uint32_t scan_start = cursor;
+              const int scan_budget = std::min(remaining_budget, rt.ring_slots);
+              if (!persistent_sync_queue_ring_window_to_host(
+                      rt,
+                      q,
+                      scan_start,
+                      static_cast<uint32_t>(scan_budget))) {
+                break;
+              }
+              for (int i = 0; i < scan_budget; ++i) {
+                const uint32_t slot_id = (scan_start + static_cast<uint32_t>(i)) % static_cast<uint32_t>(rt.ring_slots);
+                const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
               PersistentRingSlot& slot = rt.rings_host[idx];
               if (slot.state != 1) {
                 continue;
@@ -3386,15 +3429,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
               bridge_wait_until_ns(target);
               rt.bridge_next_send_ns = target;
             }
-            uint32_t next_cursor = cursor;
-            for (int step = 0; step < rt.ring_slots; ++step) {
-              const int probe_idx = q * rt.ring_slots + static_cast<int>(next_cursor);
-              if (rt.rings_host[probe_idx].state == 1) {
-                break;
-              }
-              next_cursor = (next_cursor + 1u) % static_cast<uint32_t>(rt.ring_slots);
-            }
-            cursor = next_cursor;
+            cursor = (cursor + static_cast<uint32_t>(sent)) % static_cast<uint32_t>(rt.ring_slots);
             if (sent < static_cast<int>(batch_count)) {
               break;
             }
@@ -3402,6 +3437,9 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
           }
 
           // No native sender backend available: preserve legacy noop drain for non-network test paths.
+          if (!persistent_sync_queue_ring_window_to_host(rt, q, cursor, 1u)) {
+            break;
+          }
           const int idx = q * rt.ring_slots + static_cast<int>(cursor);
           PersistentRingSlot& slot = rt.rings_host[idx];
           if (slot.state != 1) {
