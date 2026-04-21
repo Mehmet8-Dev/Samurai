@@ -1324,6 +1324,16 @@ struct PersistentRuntimeControl {
   uint64_t native_batch_degrade_events = 0;
 };
 
+struct PersistentKernelStaticConfig {
+  int32_t queue_count = 1;
+  int32_t ring_slots = 0;
+  int32_t max_streams = kPersistentMaxStreams;
+  int32_t queue_probe_span = 4;
+  int32_t max_packet_bytes = kPersistentMaxPacketBytes;
+};
+
+__device__ __constant__ PersistentKernelStaticConfig g_persistent_kernel_static_cfg;
+
 struct PersistentDeviceStreamState {
   int32_t active = 0;
   int32_t stream_id = 0;
@@ -1478,6 +1488,7 @@ std::atomic<uint64_t> g_compat_fallback_count{0};
 struct PersistentRuntime {
   cudaStream_t kernel_stream = nullptr;
   cudaStream_t bridge_copy_stream = nullptr;
+  cudaEvent_t bridge_copy_event = nullptr;
   PersistentRuntimeControl* ctrl = nullptr;                       // mapped host
   PersistentRuntimeControl* ctrl_dev = nullptr;                   // mapped device
   int32_t* run_flag_dev = nullptr;                                // device-only hot run gate
@@ -1528,6 +1539,10 @@ struct PersistentRuntime {
     }
     if (bridge_copy_stream) {
       (void)cudaStreamSynchronize(bridge_copy_stream);
+    }
+    if (bridge_copy_event) {
+      (void)cudaEventDestroy(bridge_copy_event);
+      bridge_copy_event = nullptr;
     }
     for (auto& t : bridge_threads) {
       if (t.joinable()) {
@@ -2750,11 +2765,6 @@ __device__ inline uint32_t reserve_stream_tokens(
 
 __global__ void persistent_dataplane_kernel(
     const volatile int32_t* run_flag_dev,
-    const int32_t queue_count_cfg,
-    const int32_t ring_slots_cfg,
-    const int32_t max_streams_cfg,
-    const int32_t queue_probe_span_cfg,
-    const int32_t max_packet_bytes_cfg,
     volatile PersistentRuntimeControl* ctrl,
     volatile PersistentDeviceStreamState* streams,
     const PersistentStreamHotState* streams_hot,
@@ -2771,20 +2781,26 @@ __global__ void persistent_dataplane_kernel(
   const uint32_t warp_workers = (workers + (kWarpWidth - 1u)) / kWarpWidth;
   uint32_t rr = warp_id;
   uint32_t throttle_gate = tid;
-  if (!ctrl || !run_flag_dev || !streams_hot || queue_count_cfg <= 0 || ring_slots_cfg <= 0 || max_streams_cfg <= 0) {
+  const PersistentKernelStaticConfig cfg = g_persistent_kernel_static_cfg;
+  if (!ctrl || !run_flag_dev || !streams_hot || cfg.queue_count <= 0 || cfg.ring_slots <= 0 || cfg.max_streams <= 0) {
     return;
   }
-  const int queue_count = queue_count_cfg;
-  const int ring_slots = ring_slots_cfg;
-  const int max_streams = max_streams_cfg;
-  const int queue_probe_span_default = queue_probe_span_cfg;
-  const int max_packet_bytes = max_packet_bytes_cfg;
+  const int queue_count = cfg.queue_count;
+  const int ring_slots = cfg.ring_slots;
+  const int max_streams = cfg.max_streams;
+  const int queue_probe_span_default = cfg.queue_probe_span;
+  const int max_packet_bytes = cfg.max_packet_bytes;
   const uint32_t queue_count_u = static_cast<uint32_t>(queue_count);
   const uint32_t ring_slots_u = static_cast<uint32_t>(ring_slots);
   const bool queue_pow2 = (queue_count_u & (queue_count_u - 1u)) == 0u;
   const bool ring_pow2 = (ring_slots_u & (ring_slots_u - 1u)) == 0u;
   const uint32_t queue_mask = queue_pow2 ? (queue_count_u - 1u) : 0u;
   const uint32_t ring_mask = ring_pow2 ? (ring_slots_u - 1u) : 0u;
+  __shared__ unsigned long long s_queue_pressure;
+  __shared__ unsigned long long s_ring_drop_events;
+  __shared__ unsigned long long s_queue_spread_events;
+  __shared__ unsigned long long s_quota_stall;
+  __shared__ unsigned long long s_idle_gap;
   while (*run_flag_dev == 1) {
 
     uint64_t local_queue_pressure = 0u;
@@ -2792,6 +2808,14 @@ __global__ void persistent_dataplane_kernel(
     uint64_t local_queue_spread_events = 0u;
     uint64_t local_quota_stall = 0u;
     uint64_t local_idle_gap = 0u;
+    if (threadIdx.x == 0) {
+      s_queue_pressure = 0u;
+      s_ring_drop_events = 0u;
+      s_queue_spread_events = 0u;
+      s_quota_stall = 0u;
+      s_idle_gap = 0u;
+    }
+    __syncthreads();
 
     if (tid == 0u) {
       u64_add(&ctrl->heartbeat, 1u);
@@ -2990,20 +3014,39 @@ __global__ void persistent_dataplane_kernel(
     }
 
     if (local_queue_pressure > 0u) {
-      u64_add(&ctrl->queue_pressure, local_queue_pressure);
+      atomicAdd(&s_queue_pressure, static_cast<unsigned long long>(local_queue_pressure));
     }
     if (local_ring_drop_events > 0u) {
-      u64_add(&ctrl->ring_drop_events, local_ring_drop_events);
+      atomicAdd(&s_ring_drop_events, static_cast<unsigned long long>(local_ring_drop_events));
     }
     if (local_queue_spread_events > 0u) {
-      u64_add(&ctrl->queue_spread_events, local_queue_spread_events);
+      atomicAdd(&s_queue_spread_events, static_cast<unsigned long long>(local_queue_spread_events));
     }
     if (local_quota_stall > 0u) {
-      u64_add(&ctrl->quota_stall, local_quota_stall);
+      atomicAdd(&s_quota_stall, static_cast<unsigned long long>(local_quota_stall));
     }
     if (local_idle_gap > 0u) {
-      u64_add(&ctrl->idle_gap, local_idle_gap);
+      atomicAdd(&s_idle_gap, static_cast<unsigned long long>(local_idle_gap));
     }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      if (s_queue_pressure > 0u) {
+        u64_add(&ctrl->queue_pressure, static_cast<uint64_t>(s_queue_pressure));
+      }
+      if (s_ring_drop_events > 0u) {
+        u64_add(&ctrl->ring_drop_events, static_cast<uint64_t>(s_ring_drop_events));
+      }
+      if (s_queue_spread_events > 0u) {
+        u64_add(&ctrl->queue_spread_events, static_cast<uint64_t>(s_queue_spread_events));
+      }
+      if (s_quota_stall > 0u) {
+        u64_add(&ctrl->quota_stall, static_cast<uint64_t>(s_quota_stall));
+      }
+      if (s_idle_gap > 0u) {
+        u64_add(&ctrl->idle_gap, static_cast<uint64_t>(s_idle_gap));
+      }
+    }
+    __syncthreads();
   }
 }
 
@@ -3062,7 +3105,7 @@ inline bool persistent_sync_queue_ring_window_to_host(
     }
   }
 
-  return cudaStreamSynchronize(rt.bridge_copy_stream) == cudaSuccess;
+  return true;
 }
 
 inline bool persistent_copy_payload_batch_to_host(
@@ -3094,7 +3137,7 @@ inline bool persistent_copy_payload_batch_to_host(
       return false;
     }
   }
-  return cudaStreamSynchronize(rt.bridge_copy_stream) == cudaSuccess;
+  return true;
 }
 
 inline bool persistent_set_device_slot_state(
@@ -3109,6 +3152,74 @@ inline bool persistent_set_device_slot_state(
       rt.rings_dev + (static_cast<size_t>(q) * static_cast<size_t>(rt.ring_slots)) + static_cast<size_t>(slot_id);
   uint8_t* state_ptr = reinterpret_cast<uint8_t*>(dev_slot) + offsetof(PersistentRingSlot, state);
   return cudaMemcpy(state_ptr, &state, sizeof(state), cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+inline bool persistent_bridge_copy_mark(PersistentRuntime& rt) {
+  if (!rt.bridge_copy_stream || !rt.bridge_copy_event) {
+    return false;
+  }
+  return cudaEventRecord(rt.bridge_copy_event, rt.bridge_copy_stream) == cudaSuccess;
+}
+
+inline bool persistent_bridge_copy_wait(PersistentRuntime& rt) {
+  if (!rt.bridge_copy_event) {
+    return false;
+  }
+  return cudaEventSynchronize(rt.bridge_copy_event) == cudaSuccess;
+}
+
+inline bool persistent_bridge_copy_fence(PersistentRuntime& rt) {
+  if (!persistent_bridge_copy_mark(rt)) {
+    return false;
+  }
+  return persistent_bridge_copy_wait(rt);
+}
+
+inline int persistent_reap_xdp_completions(
+    PersistentRuntime& rt,
+    int q,
+    int handle,
+    uint32_t* completion_frame_ids,
+    size_t completion_capacity,
+    uint64_t& local_released) {
+  if (!rt.tx_bridge.xdp_api || !rt.tx_bridge.xdp_api->reap_completions || !completion_frame_ids ||
+      completion_capacity == 0u) {
+    return 0;
+  }
+  char errbuf[160];
+  errbuf[0] = '\0';
+  int reaped = rt.tx_bridge.xdp_api->reap_completions(
+      handle,
+      completion_frame_ids,
+      static_cast<int>(completion_capacity),
+      errbuf,
+      sizeof(errbuf));
+  if (reaped <= 0) {
+    return 0;
+  }
+  for (int i = 0; i < reaped; ++i) {
+    const uint32_t fid = completion_frame_ids[static_cast<size_t>(i)];
+    if (fid >= static_cast<uint32_t>(rt.ring_slots)) {
+      continue;
+    }
+    const int idx = q * rt.ring_slots + static_cast<int>(fid);
+    PersistentRingSlot& slot = rt.rings_host[idx];
+    const int slot_idx = slot.stream_slot;
+    slot.state = 0;
+    slot.len = 0;
+    slot.stream_id = 0;
+    slot.stream_slot = -1;
+    slot.protocol = 0;
+    (void)persistent_set_device_slot_state(rt, q, fid, 0);
+    local_released += 1u;
+    if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
+      rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+      if (rt.streams) {
+        host_u32_add(&rt.streams[slot_idx].completed, 1u);
+      }
+    }
+  }
+  return reaped;
 }
 
 inline void persistent_bridge_loop(int worker_idx, int worker_count) {
@@ -3154,38 +3265,14 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
             const int handle = rt.tx_bridge.xdp_handles[static_cast<size_t>(q)];
             char errbuf[160];
             errbuf[0] = '\0';
-            int reaped = rt.tx_bridge.xdp_api->reap_completions(
+            int reaped = persistent_reap_xdp_completions(
+                rt,
+                q,
                 handle,
                 completion_frame_ids.data(),
-                static_cast<int>(completion_frame_ids.size()),
-                errbuf,
-                sizeof(errbuf));
-            if (reaped < 0) {
-              reaped = 0;
-            }
+                completion_frame_ids.size(),
+                local_released);
             if (reaped > 0) {
-              for (int i = 0; i < reaped; ++i) {
-                const uint32_t fid = completion_frame_ids[static_cast<size_t>(i)];
-                if (fid >= static_cast<uint32_t>(rt.ring_slots)) {
-                  continue;
-                }
-                const int idx = q * rt.ring_slots + static_cast<int>(fid);
-                PersistentRingSlot& slot = rt.rings_host[idx];
-                const int slot_idx = slot.stream_slot;
-                slot.state = 0;
-                slot.len = 0;
-                slot.stream_id = 0;
-                slot.stream_slot = -1;
-                slot.protocol = 0;
-                (void)persistent_set_device_slot_state(rt, q, fid, 0);
-                local_released += 1u;
-                if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
-                  rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
-                  if (rt.streams) {
-                    host_u32_add(&rt.streams[slot_idx].completed, 1u);
-                  }
-                }
-              }
               progressed = true;
             }
 
@@ -3204,6 +3291,9 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                       q,
                       cursor,
                       static_cast<uint32_t>(run_budget))) {
+                break;
+              }
+              if (!persistent_bridge_copy_fence(rt)) {
                 break;
               }
               for (int i = 0; i < run_budget; ++i) {
@@ -3237,6 +3327,34 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                       submit_frame_ids.data(),
                       submit_lengths.data(),
                       submit_frame_ids.size())) {
+                break;
+              }
+              if (!persistent_bridge_copy_mark(rt)) {
+                break;
+              }
+              bool payload_ready = true;
+              for (;;) {
+                const cudaError_t query_st = cudaEventQuery(rt.bridge_copy_event);
+                if (query_st == cudaSuccess) {
+                  break;
+                }
+                if (query_st != cudaErrorNotReady) {
+                  payload_ready = false;
+                  break;
+                }
+                const int polled = persistent_reap_xdp_completions(
+                    rt,
+                    q,
+                    handle,
+                    completion_frame_ids.data(),
+                    completion_frame_ids.size(),
+                    local_released);
+                if (polled > 0) {
+                  progressed = true;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(1));
+              }
+              if (!payload_ready) {
                 break;
               }
               int sent = rt.tx_bridge.xdp_api->submit_frame_ids(
@@ -3299,6 +3417,9 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                       static_cast<uint32_t>(scan_budget))) {
                 break;
               }
+              if (!persistent_bridge_copy_fence(rt)) {
+                break;
+              }
               for (int i = 0; i < scan_budget; ++i) {
                 const uint32_t slot_id = (scan_start + static_cast<uint32_t>(i)) % static_cast<uint32_t>(rt.ring_slots);
                 const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
@@ -3339,6 +3460,9 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                     afpacket_slot_ids.data(),
                     submit_lengths.data(),
                     afpacket_slot_ids.size())) {
+              break;
+            }
+            if (!persistent_bridge_copy_fence(rt)) {
               break;
             }
 
@@ -3440,6 +3564,9 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
           if (!persistent_sync_queue_ring_window_to_host(rt, q, cursor, 1u)) {
             break;
           }
+          if (!persistent_bridge_copy_fence(rt)) {
+            break;
+          }
           const int idx = q * rt.ring_slots + static_cast<int>(cursor);
           PersistentRingSlot& slot = rt.rings_host[idx];
           if (slot.state != 1) {
@@ -3513,6 +3640,22 @@ inline bool persistent_launch_kernel() {
       return false;
     }
   }
+  {
+    PersistentKernelStaticConfig cfg{};
+    cfg.queue_count = rt.queue_count;
+    cfg.ring_slots = rt.ring_slots;
+    cfg.max_streams = kPersistentMaxStreams;
+    cfg.queue_probe_span = rt.ctrl->queue_probe_span;
+    cfg.max_packet_bytes = rt.max_packet_bytes;
+    if (cudaMemcpyToSymbol(
+            g_persistent_kernel_static_cfg,
+            &cfg,
+            sizeof(cfg),
+            0,
+            cudaMemcpyHostToDevice) != cudaSuccess) {
+      return false;
+    }
+  }
   auto env_int_local = [](const char* name, int defv) -> int {
     const char* v = std::getenv(name);
     if (!v || !*v) {
@@ -3534,11 +3677,6 @@ inline bool persistent_launch_kernel() {
       threads,
       rt.kernel_stream,
       rt.run_flag_dev,
-      rt.queue_count,
-      rt.ring_slots,
-      kPersistentMaxStreams,
-      rt.ctrl->queue_probe_span,
-      rt.max_packet_bytes,
       rt.ctrl_dev,
       rt.streams_dev,
       rt.streams_hot_dev,
@@ -3762,6 +3900,10 @@ inline void persistent_runtime_release_unlocked() {
     (void)cudaStreamDestroy(rt.bridge_copy_stream);
     rt.bridge_copy_stream = nullptr;
   }
+  if (rt.bridge_copy_event) {
+    (void)cudaEventDestroy(rt.bridge_copy_event);
+    rt.bridge_copy_event = nullptr;
+  }
   if (rt.rings_host) {
     (void)cudaFreeHost(rt.rings_host);
     rt.rings_host = nullptr;
@@ -3815,6 +3957,7 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   PersistentRuntime& rt = g_persistent_runtime;
   if (rt.ctrl && rt.run_flag_dev && rt.streams && rt.streams_dev && rt.streams_hot_dev &&
       rt.rings_host && rt.rings_dev && rt.payload_host && rt.payload_dev && rt.bridge_copy_stream &&
+      rt.bridge_copy_event &&
       rt.threads_running.load(std::memory_order_relaxed)) {
     return true;
   }
@@ -4010,6 +4153,12 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   }
   if (!rt.bridge_copy_stream) {
     if (cudaStreamCreateWithFlags(&rt.bridge_copy_stream, cudaStreamNonBlocking) != cudaSuccess) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+  }
+  if (!rt.bridge_copy_event) {
+    if (cudaEventCreateWithFlags(&rt.bridge_copy_event, cudaEventDisableTiming) != cudaSuccess) {
       persistent_runtime_release_unlocked();
       return false;
     }
