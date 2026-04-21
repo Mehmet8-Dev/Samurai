@@ -1481,7 +1481,7 @@ struct PersistentRuntime {
   PersistentRuntimeControl* ctrl_dev = nullptr;                   // mapped device
   int32_t* run_flag_dev = nullptr;                                // device-only hot run gate
   PersistentDeviceStreamState* streams = nullptr;                 // mapped host
-  PersistentDeviceStreamState* streams_dev = nullptr;             // mapped device
+  PersistentDeviceStreamState* streams_dev = nullptr;             // device-resident authoritative state
   PersistentStreamHotState* streams_hot_dev = nullptr;            // device-only hot stream mirror
   PersistentRingSlot* rings_host = nullptr;                       // mapped host
   PersistentRingSlot* rings_dev = nullptr;                        // mapped device view
@@ -1548,11 +1548,14 @@ struct PersistentRuntime {
       payload_host = nullptr;
       payload_dev = nullptr;
     }
-    if (streams) {
-      (void)cudaFreeHost(streams);
-      streams = nullptr;
-      streams_dev = nullptr;
-    }
+  if (streams) {
+    (void)cudaFreeHost(streams);
+    streams = nullptr;
+  }
+  if (streams_dev) {
+    (void)cudaFree(streams_dev);
+    streams_dev = nullptr;
+  }
     if (ctrl) {
       (void)cudaFreeHost(ctrl);
       ctrl = nullptr;
@@ -1631,6 +1634,62 @@ inline bool persistent_sync_hot_stream_slot(PersistentRuntime& rt, int slot) {
              &hot,
              sizeof(hot),
              cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+inline bool persistent_stream_copy_slot_to_device(PersistentRuntime& rt, int slot) {
+  if (!rt.streams || !rt.streams_dev || slot < 0 || slot >= kPersistentMaxStreams) {
+    return false;
+  }
+  return cudaMemcpy(
+             rt.streams_dev + static_cast<size_t>(slot),
+             rt.streams + static_cast<size_t>(slot),
+             sizeof(PersistentDeviceStreamState),
+             cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+inline bool persistent_stream_copy_slot_to_host(PersistentRuntime& rt, int slot) {
+  if (!rt.streams || !rt.streams_dev || slot < 0 || slot >= kPersistentMaxStreams) {
+    return false;
+  }
+  PersistentDeviceStreamState* host_slot = rt.streams + static_cast<size_t>(slot);
+  const uint32_t completed_host_before = host_slot->completed;
+  if (cudaMemcpy(
+          host_slot,
+          rt.streams_dev + static_cast<size_t>(slot),
+          sizeof(PersistentDeviceStreamState),
+          cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return false;
+  }
+  if (completed_host_before > host_slot->completed) {
+    host_slot->completed = completed_host_before;
+  }
+  return true;
+}
+
+template <typename T>
+inline bool persistent_stream_read_field(
+    PersistentRuntime& rt,
+    int slot,
+    size_t field_offset,
+    T* out) {
+  if (!rt.streams_dev || !out || slot < 0 || slot >= kPersistentMaxStreams) {
+    return false;
+  }
+  const uint8_t* base = reinterpret_cast<const uint8_t*>(rt.streams_dev + static_cast<size_t>(slot));
+  return cudaMemcpy(out, base + field_offset, sizeof(T), cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+template <typename T>
+inline bool persistent_stream_write_field(
+    PersistentRuntime& rt,
+    int slot,
+    size_t field_offset,
+    const T& value) {
+  if (!rt.streams_dev || slot < 0 || slot >= kPersistentMaxStreams) {
+    return false;
+  }
+  uint8_t* base = reinterpret_cast<uint8_t*>(rt.streams_dev + static_cast<size_t>(slot));
+  return cudaMemcpy(base + field_offset, &value, sizeof(T), cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
 inline std::string json_escape_string(const std::string& in) {
@@ -3396,6 +3455,9 @@ inline void persistent_monitor_loop() {
         if (st.active == 0 || st.device_slot < 0 || !rt.streams) {
           continue;
         }
+        if (!persistent_stream_copy_slot_to_host(rt, st.device_slot)) {
+          continue;
+        }
         st.heartbeat_ns = now_ns_steady();
         PersistentDeviceStreamState& d = rt.streams[st.device_slot];
         const uint64_t completed_delta =
@@ -3429,6 +3491,21 @@ inline void persistent_monitor_loop() {
             next = cap;
           }
           d.quota_left = static_cast<uint32_t>(next);
+          (void)persistent_stream_write_field<uint32_t>(
+              rt,
+              st.device_slot,
+              offsetof(PersistentDeviceStreamState, quota),
+              d.quota);
+          (void)persistent_stream_write_field<uint32_t>(
+              rt,
+              st.device_slot,
+              offsetof(PersistentDeviceStreamState, ramp_epoch_counter),
+              d.ramp_epoch_counter);
+          (void)persistent_stream_write_field<uint32_t>(
+              rt,
+              st.device_slot,
+              offsetof(PersistentDeviceStreamState, quota_left),
+              d.quota_left);
         }
         st.quota_left = d.quota_left;
         st.submitted = d.produced;
@@ -3485,11 +3562,19 @@ inline void persistent_monitor_loop() {
           if (kv.second.device_slot < 0 || kv.second.device_slot >= kPersistentMaxStreams || !rt.streams) {
             continue;
           }
+          if (!persistent_stream_copy_slot_to_host(rt, kv.second.device_slot)) {
+            continue;
+          }
           PersistentDeviceStreamState& d = rt.streams[kv.second.device_slot];
           if (d.active == 0) {
             continue;
           }
           d.quota_left = std::max<uint32_t>(1u, d.quota_left / 2u);
+          (void)persistent_stream_write_field<uint32_t>(
+              rt,
+              kv.second.device_slot,
+              offsetof(PersistentDeviceStreamState, quota_left),
+              d.quota_left);
         }
       }
       rt.ctrl->drain_attempts += 1u;
@@ -3545,6 +3630,9 @@ inline void persistent_runtime_release_unlocked() {
   if (rt.streams) {
     (void)cudaFreeHost(rt.streams);
     rt.streams = nullptr;
+  }
+  if (rt.streams_dev) {
+    (void)cudaFree(rt.streams_dev);
     rt.streams_dev = nullptr;
   }
   if (rt.streams_hot_dev) {
@@ -3574,7 +3662,7 @@ inline void persistent_runtime_release_unlocked() {
 
 inline bool persistent_runtime_ensure_started_unlocked() {
   PersistentRuntime& rt = g_persistent_runtime;
-  if (rt.ctrl && rt.run_flag_dev && rt.streams && rt.streams_hot_dev && rt.rings_host && rt.rings_dev &&
+  if (rt.ctrl && rt.run_flag_dev && rt.streams && rt.streams_dev && rt.streams_hot_dev && rt.rings_host && rt.rings_dev &&
       rt.payload_host && rt.payload_dev &&
       rt.threads_running.load(std::memory_order_relaxed)) {
     return true;
@@ -3709,15 +3797,18 @@ inline bool persistent_runtime_ensure_started_unlocked() {
 
   void* streams_host = nullptr;
   const size_t streams_bytes = sizeof(PersistentDeviceStreamState) * static_cast<size_t>(kPersistentMaxStreams);
-  if (cudaHostAlloc(&streams_host, streams_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+  if (cudaHostAlloc(&streams_host, streams_bytes, cudaHostAllocPortable) != cudaSuccess ||
       !streams_host) {
     persistent_runtime_release_unlocked();
     return false;
   }
   rt.streams = static_cast<PersistentDeviceStreamState*>(streams_host);
   std::memset(rt.streams, 0, streams_bytes);
-  if (cudaHostGetDevicePointer(reinterpret_cast<void**>(&rt.streams_dev), streams_host, 0) != cudaSuccess ||
-      !rt.streams_dev) {
+  if (cudaMalloc(&rt.streams_dev, streams_bytes) != cudaSuccess || !rt.streams_dev) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  if (cudaMemset(rt.streams_dev, 0, streams_bytes) != cudaSuccess) {
     persistent_runtime_release_unlocked();
     return false;
   }
@@ -4436,6 +4527,10 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   st.spoof_base_ip = spoof_base;
   st.spoof_mask = spoof_mask;
   persistent_build_stream_template(&d);
+  if (!persistent_stream_copy_slot_to_device(g_persistent_runtime, free_slot)) {
+    std::memset(&d, 0, sizeof(d));
+    return set_c_api_error("failed to sync stream device state");
+  }
   if (!persistent_sync_hot_stream_slot(g_persistent_runtime, free_slot)) {
     std::memset(&d, 0, sizeof(d));
     return set_c_api_error("failed to sync stream hot mirror");
@@ -4464,6 +4559,9 @@ extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* u
     return set_c_api_error("stream has invalid device slot");
   }
   PersistentDeviceStreamState& d = g_persistent_runtime.streams[st.device_slot];
+  if (!persistent_stream_copy_slot_to_host(g_persistent_runtime, st.device_slot)) {
+    return set_c_api_error("failed to refresh stream device state");
+  }
   if (d.active == 0) {
     return set_c_api_error("stream runtime slot is inactive");
   }
@@ -4587,6 +4685,9 @@ extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* u
   }
   st.pcap_file = json_get_string(st.update_json, "pcap_file", st.pcap_file);
   persistent_build_stream_template(&d);
+  if (!persistent_stream_copy_slot_to_device(g_persistent_runtime, st.device_slot)) {
+    return set_c_api_error("failed to sync stream device state");
+  }
   if (!persistent_sync_hot_stream_slot(g_persistent_runtime, st.device_slot)) {
     return set_c_api_error("failed to sync stream hot mirror");
   }
@@ -4606,6 +4707,7 @@ extern "C" int samurai_gpu_packet_stop_stream(int64_t stream_id) {
   }
   if (it->second.device_slot >= 0 && it->second.device_slot < kPersistentMaxStreams && g_persistent_runtime.streams) {
     std::memset(&g_persistent_runtime.streams[it->second.device_slot], 0, sizeof(PersistentDeviceStreamState));
+    (void)persistent_stream_copy_slot_to_device(g_persistent_runtime, it->second.device_slot);
     (void)persistent_sync_hot_stream_slot(g_persistent_runtime, it->second.device_slot);
     g_persistent_runtime.completed_by_slot[static_cast<size_t>(it->second.device_slot)].store(
         0u, std::memory_order_relaxed);
@@ -4712,6 +4814,7 @@ extern "C" int samurai_gpu_packet_read_stream_stats_snapshot(
     out_stats->completed = st.completed;
     out_stats->quota_left = st.quota_left;
     if (st.device_slot >= 0 && st.device_slot < kPersistentMaxStreams && g_persistent_runtime.streams) {
+      (void)persistent_stream_copy_slot_to_host(g_persistent_runtime, st.device_slot);
       const PersistentDeviceStreamState& d = g_persistent_runtime.streams[st.device_slot];
       out_stats->submitted = static_cast<uint64_t>(d.produced);
       out_stats->completed = static_cast<uint64_t>(host_u32_load(&d.completed));
