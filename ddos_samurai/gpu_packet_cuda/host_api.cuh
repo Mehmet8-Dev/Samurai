@@ -1498,6 +1498,7 @@ struct PersistentRuntime {
   PersistentStreamHotState* streams_hot_dev = nullptr;            // device-only hot stream mirror
   PersistentRingSlot* rings_host = nullptr;                       // mapped host mirror
   PersistentRingSlot* rings_dev = nullptr;                        // device ring state
+  int32_t* queue_slot_hint_dev = nullptr;                         // device queue-local slot hint
   uint8_t* payload_host = nullptr;                                // mapped host UMEM payload
   uint8_t* payload_dev = nullptr;                                 // device payload buffer
   std::vector<std::thread> bridge_threads;
@@ -2789,6 +2790,7 @@ __global__ void persistent_dataplane_kernel(
     volatile PersistentDeviceStreamState* streams,
     const volatile PersistentStreamHotState* streams_hot,
     PersistentRingSlot* rings,
+    int32_t* queue_slot_hint,
     uint8_t* payload_base) {
   const uint32_t tid = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   const uint32_t workers = static_cast<uint32_t>(gridDim.x * blockDim.x);
@@ -2944,7 +2946,14 @@ __global__ void persistent_dataplane_kernel(
                 ? static_cast<int>(static_cast<uint32_t>(q_try) & queue_mask)
                 : (q_try % queue_count);
           }
-          uint32_t slot_try = slot_hash + (static_cast<uint32_t>(probe) * slot_probe_stride);
+          uint32_t hint = 0u;
+          if (queue_slot_hint) {
+            const int32_t raw_hint = i32_load(&queue_slot_hint[q_try]);
+            if (raw_hint > 0) {
+              hint = static_cast<uint32_t>(raw_hint);
+            }
+          }
+          uint32_t slot_try = slot_hash + hint + (static_cast<uint32_t>(probe) * slot_probe_stride);
           if (ring_pow2) {
             slot_try &= ring_mask;
           } else {
@@ -2958,6 +2967,12 @@ __global__ void persistent_dataplane_kernel(
             q = q_try;
             slot_idx = slot_try;
             slot_ptr = &candidate;
+            if (queue_slot_hint) {
+              const uint32_t next_hint = ring_pow2
+                  ? ((slot_try + 1u) & ring_mask)
+                  : ((slot_try + 1u) % ring_slots_u);
+              (void)atomicExch(&queue_slot_hint[q_try], static_cast<int32_t>(next_hint));
+            }
             if (probe > 0) {
               local_queue_spread_events += 1u;
             }
@@ -3663,7 +3678,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 inline bool persistent_launch_kernel() {
   PersistentRuntime& rt = g_persistent_runtime;
   if (!rt.ctrl || !rt.ctrl_dev || !rt.run_flag_dev || !rt.streams || !rt.streams_dev || !rt.streams_hot_dev ||
-      !rt.rings_dev || !rt.payload_dev) {
+      !rt.rings_dev || !rt.queue_slot_hint_dev || !rt.payload_dev) {
     return false;
   }
   if (!rt.kernel_stream) {
@@ -3719,6 +3734,7 @@ inline bool persistent_launch_kernel() {
       rt.streams_dev,
       rt.streams_hot_dev,
       rt.rings_dev,
+      rt.queue_slot_hint_dev,
       rt.payload_dev);
   return (cudaPeekAtLastError() == cudaSuccess);
 }
@@ -3951,6 +3967,10 @@ inline void persistent_runtime_release_unlocked() {
     (void)cudaFree(rt.rings_dev);
     rt.rings_dev = nullptr;
   }
+  if (rt.queue_slot_hint_dev) {
+    (void)cudaFree(rt.queue_slot_hint_dev);
+    rt.queue_slot_hint_dev = nullptr;
+  }
   if (rt.payload_host) {
     (void)cudaFreeHost(rt.payload_host);
     rt.payload_host = nullptr;
@@ -4171,6 +4191,15 @@ inline bool persistent_runtime_ensure_started_unlocked() {
     return false;
   }
   if (cudaMemset(rt.rings_dev, 0, ring_bytes) != cudaSuccess) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  const size_t queue_hint_bytes = static_cast<size_t>(rt.queue_count) * sizeof(int32_t);
+  if (cudaMalloc(&rt.queue_slot_hint_dev, queue_hint_bytes) != cudaSuccess || !rt.queue_slot_hint_dev) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
+  if (cudaMemset(rt.queue_slot_hint_dev, 0, queue_hint_bytes) != cudaSuccess) {
     persistent_runtime_release_unlocked();
     return false;
   }
