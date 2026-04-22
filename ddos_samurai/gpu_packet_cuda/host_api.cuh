@@ -1707,7 +1707,12 @@ inline void persistent_sync_active_stream_count_unlocked(PersistentRuntime& rt) 
       active += 1;
     }
   }
-  rt.ctrl->active_streams = clamp_i(active, 0, kPersistentMaxStreams);
+  if (active < 0) {
+    active = 0;
+  } else if (active > kPersistentMaxStreams) {
+    active = kPersistentMaxStreams;
+  }
+  rt.ctrl->active_streams = active;
 }
 
 template <typename T>
@@ -2898,37 +2903,40 @@ __global__ void persistent_dataplane_kernel(
             reserved_tokens);
       }
       packet_seq_base = __shfl_sync(warp_mask, packet_seq_base, 0);
-      int q_base = 0;
-      if (lane == 0u) {
-        if (affinity_q >= 0 && affinity_q < queue_count) {
-          q_base = affinity_q;
-        } else {
-          const uint32_t q_seed = packet_seq_base ^ static_cast<uint32_t>(sid) ^ rr;
-          q_base = queue_pow2
-              ? static_cast<int>(q_seed & queue_mask)
-              : static_cast<int>(q_seed % queue_count_u);
-        }
-      }
-      q_base = __shfl_sync(warp_mask, q_base, 0);
-      int probe_span = 1;
-      if (queue_count > 1) {
-        probe_span = queue_probe_span_default;
-        if (probe_span < 1) {
-          probe_span = 1;
-        } else if (probe_span > queue_count) {
-          probe_span = queue_count;
-        }
-      }
-      const int ring_probe_span = 3;
       int produced_for_stream_lane = 0;
+      PersistentRingSlot* publish_slots[kTokenReserveChunkPerLane];
+      int publish_count = 0;
+      #pragma unroll
+      for (int pi = 0; pi < static_cast<int>(kTokenReserveChunkPerLane); ++pi) {
+        publish_slots[pi] = nullptr;
+      }
 
       for (uint32_t token_i = lane; token_i < reserved_tokens; token_i += kWarpWidth) {
         const uint32_t packet_seq = packet_seq_base + token_i + 1u;
+        const uint32_t route_seed = packet_seq ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
+        int q_base = affinity_q;
+        if (q_base < 0 || q_base >= queue_count) {
+          q_base = queue_pow2
+              ? static_cast<int>(route_seed & queue_mask)
+              : static_cast<int>(route_seed % queue_count_u);
+        }
+        int probe_span = 1;
+        if (queue_count > 1) {
+          probe_span = queue_probe_span_default;
+          if (probe_span < 1) {
+            probe_span = 1;
+          }
+          if (probe_span > queue_count) {
+            probe_span = queue_count;
+          }
+        }
+
         PersistentRingSlot* slot_ptr = nullptr;
         int q = q_base;
         uint32_t slot_idx = 0u;
-        const uint32_t slot_seed = slot_seq_base + token_i;
-        const uint32_t slot_try0 = ring_pow2 ? (slot_seed & ring_mask) : (slot_seed % ring_slots_u);
+        const uint32_t slot_seq = slot_seq_base + token_i;
+        const uint32_t slot_hash = slot_seq ^ (route_seed * 2246822519u);
+        const uint32_t slot_probe_stride = ((route_seed >> 5u) | 1u);
         for (int probe = 0; probe < probe_span; ++probe) {
           int q_try = q_base + probe;
           if (q_try >= queue_count) {
@@ -2936,29 +2944,23 @@ __global__ void persistent_dataplane_kernel(
                 ? static_cast<int>(static_cast<uint32_t>(q_try) & queue_mask)
                 : (q_try % queue_count);
           }
-          for (int ring_probe = 0; ring_probe < ring_probe_span; ++ring_probe) {
-            uint32_t slot_try = slot_try0 +
-                static_cast<uint32_t>(probe * static_cast<int>(warp_workers) + ring_probe * static_cast<int>(kWarpWidth));
-            if (ring_pow2) {
-              slot_try &= ring_mask;
-            } else {
-              slot_try %= ring_slots_u;
-            }
-            PersistentRingSlot& candidate = rings[q_try * ring_slots + static_cast<int>(slot_try)];
-            if (candidate.state != 0) {
-              continue;
-            }
-            if (atomicCAS((int*)&candidate.state, 0, 2) == 0) {
-              q = q_try;
-              slot_idx = slot_try;
-              slot_ptr = &candidate;
-              if (probe > 0) {
-                local_queue_spread_events += 1u;
-              }
-              break;
-            }
+          uint32_t slot_try = slot_hash + (static_cast<uint32_t>(probe) * slot_probe_stride);
+          if (ring_pow2) {
+            slot_try &= ring_mask;
+          } else {
+            slot_try %= ring_slots_u;
           }
-          if (slot_ptr) {
+          PersistentRingSlot& candidate = rings[q_try * ring_slots + static_cast<int>(slot_try)];
+          if (candidate.state != 0) {
+            continue;
+          }
+          if (atomicCAS((int*)&candidate.state, 0, 2) == 0) {
+            q = q_try;
+            slot_idx = slot_try;
+            slot_ptr = &candidate;
+            if (probe > 0) {
+              local_queue_spread_events += 1u;
+            }
             break;
           }
         }
@@ -2992,9 +2994,19 @@ __global__ void persistent_dataplane_kernel(
         slot.stream_id = sid;
         slot.stream_slot = idx;
         slot.protocol = proto;
-        persistent_publish_slot_ready(&slot);
+        if (publish_count < static_cast<int>(kTokenReserveChunkPerLane)) {
+          publish_slots[publish_count++] = &slot;
+        } else {
+          persistent_publish_slot_ready(&slot);
+        }
         produced = true;
         produced_for_stream_lane += 1;
+      }
+      #pragma unroll
+      for (int pi = 0; pi < static_cast<int>(kTokenReserveChunkPerLane); ++pi) {
+        if (publish_slots[pi]) {
+          persistent_publish_slot_ready(publish_slots[pi]);
+        }
       }
 
       int produced_for_stream = produced_for_stream_lane;
@@ -3848,6 +3860,7 @@ inline void persistent_monitor_loop() {
         kv.second.scheduler_fairness_cv_pct =
             static_cast<double>(rt.ctrl->scheduler_fairness_cv_pct_x100) / 100.0;
       }
+      persistent_sync_active_stream_count_unlocked(rt);
     }
 
     const uint64_t now = now_ns_steady();
@@ -4193,6 +4206,7 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   }
   rt.queue_drain_cursor.assign(static_cast<size_t>(rt.queue_count), 0u);
   rt.queue_sent_counts.assign(static_cast<size_t>(rt.queue_count), 0u);
+  persistent_sync_active_stream_count_unlocked(rt);
   if (!persistent_bridge_backend_init_unlocked(rt)) {
     persistent_runtime_release_unlocked();
     return false;
@@ -5070,6 +5084,7 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << (g_kernel_mode.load(std::memory_order_relaxed) == static_cast<int>(KernelMode::kPersistent) ? 1 : 0)
         << ","
         << "\"stream_count\":" << g_persistent_streams.size() << ","
+        << "\"active_streams\":" << (rt_active ? g_persistent_runtime.ctrl->active_streams : 0) << ","
         << "\"runtime_active\":" << (rt_active ? 1 : 0) << ","
         << "\"persistent_runtime_restarts\":"
         << (rt_active ? g_persistent_runtime.ctrl->runtime_restarts : 0u) << ","

@@ -176,8 +176,6 @@ def _load_lib() -> ctypes.CDLL | None:
                     p = _LIB_PATH.parent / f"{root}{suffix}"
                     if p.exists():
                         candidates.append(p)
-                if not candidates:
-                    candidates = sorted(_LIB_PATH.parent.glob(f"{root}*.so"))
                 for p in candidates:
                     try:
                         _NATIVE_PRELOADED_LIBS.append(ctypes.CDLL(str(p), mode=mode))
