@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import ctypes
 import importlib
+import importlib.machinery
 import json
 import os
+import sys
 import time
 import threading
 from pathlib import Path
@@ -44,6 +46,7 @@ _NATIVE_GENERATION_TELEMETRY_KEYS = (
     "gpu_native_host_pack_copy_count",
     "gpu_native_host_pack_copy_bytes",
 )
+_NATIVE_PRELOADED_LIBS: list[ctypes.CDLL] = []
 _NATIVE_GENERATION_TELEMETRY_LOCK = threading.Lock()
 _NATIVE_GENERATION_TELEMETRY: dict[str, int] = {
     k: 0 for k in _NATIVE_GENERATION_TELEMETRY_KEYS
@@ -157,15 +160,62 @@ def _stream_telemetry_reset() -> None:
 def _load_lib() -> ctypes.CDLL | None:
     if not _LIB_PATH.exists():
         return None
-    # Ensure native sender/pacing extensions are loaded first so weak C symbols
-    # in libgpu_packet_cuda can resolve to AF_XDP/AF_PACKET/pacing hooks.
-    for mod_name in (".xdp_sender", ".fast_sender", ".pacing_engine"):
+
+    def _import_native_extensions_global() -> None:
+        # Ensure native sender/pacing extensions are loaded first so weak C
+        # symbols in libgpu_packet_cuda can resolve to AF_XDP/AF_PACKET/pacing
+        # hooks. Use RTLD_GLOBAL during import to expose symbols process-wide.
+        module_roots = ("xdp_sender", "fast_sender", "pacing_engine")
+
+        def _preload_native_extension_sos() -> None:
+            mode = int(getattr(ctypes, "RTLD_GLOBAL", 0)) | int(getattr(os, "RTLD_NOW", 0))
+            ext_suffixes = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+            for root in module_roots:
+                candidates: list[Path] = []
+                for suffix in ext_suffixes:
+                    p = _LIB_PATH.parent / f"{root}{suffix}"
+                    if p.exists():
+                        candidates.append(p)
+                if not candidates:
+                    candidates = sorted(_LIB_PATH.parent.glob(f"{root}*.so"))
+                for p in candidates:
+                    try:
+                        _NATIVE_PRELOADED_LIBS.append(ctypes.CDLL(str(p), mode=mode))
+                    except Exception:
+                        continue
+
+        _preload_native_extension_sos()
+
+        flags_supported = (
+            hasattr(sys, "setdlopenflags")
+            and hasattr(sys, "getdlopenflags")
+            and hasattr(os, "RTLD_GLOBAL")
+            and hasattr(os, "RTLD_NOW")
+        )
+        if not flags_supported:
+            for mod_name in tuple(f".{n}" for n in module_roots):
+                try:
+                    importlib.import_module(mod_name, package=__package__)
+                except Exception:
+                    pass
+            return
+
+        prev_flags = sys.getdlopenflags()
+        global_flags = int(prev_flags) | int(os.RTLD_GLOBAL) | int(os.RTLD_NOW)
         try:
-            importlib.import_module(mod_name, package=__package__)
-        except Exception:
-            pass
+            sys.setdlopenflags(global_flags)
+            for mod_name in tuple(f".{n}" for n in module_roots):
+                try:
+                    importlib.import_module(mod_name, package=__package__)
+                except Exception:
+                    pass
+        finally:
+            sys.setdlopenflags(prev_flags)
+
+    _import_native_extensions_global()
     try:
-        lib = ctypes.CDLL(str(_LIB_PATH))
+        mode = getattr(ctypes, "RTLD_GLOBAL", 0)
+        lib = ctypes.CDLL(str(_LIB_PATH), mode=mode)
     except Exception:
         return None
 

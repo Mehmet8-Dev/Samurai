@@ -2106,7 +2106,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
 
   b.kind = PersistentTxBackendKind::kNoop;
   b.active = "noop";
-  return (b.requested == "auto");
+  return false;
 }
 
 inline uint16_t host_checksum(const uint8_t* data, int len) {
@@ -2768,7 +2768,7 @@ __global__ void persistent_dataplane_kernel(
     const volatile int32_t* run_flag_dev,
     volatile PersistentRuntimeControl* ctrl,
     volatile PersistentDeviceStreamState* streams,
-    const PersistentStreamHotState* streams_hot,
+    const volatile PersistentStreamHotState* streams_hot,
     PersistentRingSlot* rings,
     uint8_t* payload_base) {
   const uint32_t tid = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -2824,19 +2824,19 @@ __global__ void persistent_dataplane_kernel(
     bool produced = false;
     const uint32_t max_streams_u = static_cast<uint32_t>(max_streams);
     for (int i = 0; i < max_streams; ++i) {
+      __syncwarp(kFullWarpMask);
       const int idx = static_cast<int>((rr + static_cast<uint32_t>(i)) % max_streams_u);
       volatile PersistentDeviceStreamState* sv = &streams[idx];
-      const PersistentStreamHotState* sh = &streams_hot[idx];
-      const unsigned int warp_mask = __activemask();
+      const unsigned int warp_mask = kFullWarpMask;
       int32_t proto = 0;
       int active = 0;
       uint32_t target_ip = 0u;
       int target_port = 0;
       if (lane == 0u) {
-        proto = sh->protocol;
-        active = sh->active;
-        target_ip = sh->target_ip;
-        target_port = static_cast<int>(sh->target_port);
+        proto = i32_load(&sv->protocol);
+        active = i32_load(&sv->active);
+        target_ip = u32_load(&sv->target_ip);
+        target_port = static_cast<int>(sv->target_port);
       }
       proto = __shfl_sync(warp_mask, proto, 0);
       active = __shfl_sync(warp_mask, active, 0);
@@ -2845,6 +2845,7 @@ __global__ void persistent_dataplane_kernel(
       if (active == 0 || target_ip == 0u || (proto != 1 && target_port == 0)) {
         continue;
       }
+
       uint32_t slot_seq_base = 0u;
       uint32_t reserved_tokens = 0u;
       if (lane == 0u) {
@@ -2859,8 +2860,8 @@ __global__ void persistent_dataplane_kernel(
       int affinity_q = 0;
       int sid = 0;
       if (lane == 0u) {
-        affinity_q = sh->queue_affinity;
-        sid = sh->stream_id;
+        affinity_q = i32_load(&sv->queue_affinity);
+        sid = i32_load(&sv->stream_id);
       }
       affinity_q = __shfl_sync(warp_mask, affinity_q, 0);
       sid = __shfl_sync(warp_mask, sid, 0);
@@ -4172,11 +4173,8 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   rt.queue_drain_cursor.assign(static_cast<size_t>(rt.queue_count), 0u);
   rt.queue_sent_counts.assign(static_cast<size_t>(rt.queue_count), 0u);
   if (!persistent_bridge_backend_init_unlocked(rt)) {
-    const int strict_backend = env_int_local("SAMURAI_GPU_TX_BACKEND_STRICT", 0);
-    if (strict_backend > 0) {
-      persistent_runtime_release_unlocked();
-      return false;
-    }
+    persistent_runtime_release_unlocked();
+    return false;
   }
 
   if (!persistent_launch_kernel()) {
@@ -5086,6 +5084,38 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
     return g_stream_stats_json.c_str();
   }
   g_stream_stats_json = stream_state_to_json(it->second);
+  if (g_persistent_runtime.ctrl && it->second.device_slot >= 0 && it->second.device_slot < kPersistentMaxStreams &&
+      g_persistent_runtime.streams && g_persistent_runtime.streams_hot_dev) {
+    const int slot = it->second.device_slot;
+    PersistentStreamHotState hot{};
+    if (persistent_stream_copy_slot_to_host(g_persistent_runtime, slot)) {
+      const PersistentDeviceStreamState& d = g_persistent_runtime.streams[slot];
+      (void)cudaMemcpy(
+          &hot,
+          g_persistent_runtime.streams_hot_dev + static_cast<size_t>(slot),
+          sizeof(hot),
+          cudaMemcpyDeviceToHost);
+      if (!g_stream_stats_json.empty() && g_stream_stats_json.back() == '}') {
+        g_stream_stats_json.pop_back();
+        std::ostringstream dbg;
+        dbg << ",\"device_active\":" << d.active
+            << ",\"device_protocol\":" << d.protocol
+            << ",\"device_target_ip\":" << d.target_ip
+            << ",\"device_target_port\":" << d.target_port
+            << ",\"device_quota_left\":" << d.quota_left
+            << ",\"device_weight\":" << d.weight
+            << ",\"device_deficit\":" << d.deficit
+            << ",\"device_produced\":" << d.produced
+            << ",\"hot_active\":" << hot.active
+            << ",\"hot_protocol\":" << hot.protocol
+            << ",\"hot_target_ip\":" << hot.target_ip
+            << ",\"hot_target_port\":" << hot.target_port
+            << ",\"hot_queue_affinity\":" << hot.queue_affinity
+            << "}";
+        g_stream_stats_json += dbg.str();
+      }
+    }
+  }
   return g_stream_stats_json.c_str();
 }
 

@@ -296,10 +296,17 @@ class OptionalBuildExt(build_ext):
             "-o",
             obj_path,
         ]
+        bridge_obj_paths = [
+            os.path.join(build_temp, "ddos_samurai", "xdp_sender.o"),
+            os.path.join(build_temp, "ddos_samurai", "fast_sender.o"),
+            os.path.join(build_temp, "ddos_samurai", "pacing_engine.o"),
+        ]
+        bridge_objs = [p for p in bridge_obj_paths if os.path.exists(p)]
         link_cmd = [
             nvcc,
             "-shared",
             obj_path,
+            *bridge_objs,
             "-o",
             lib_path,
         ]
