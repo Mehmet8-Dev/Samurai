@@ -2034,6 +2034,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
 
   b.requested = lower_copy(env_string_or("SAMURAI_GPU_TX_BACKEND", "auto"));
   b.iface = env_string_or("SAMURAI_GPU_TX_INTERFACE", env_string_or("SAMURAI_XDP_INTERFACE", ""));
+  const bool tx_backend_strict = env_int_local("SAMURAI_GPU_TX_BACKEND_STRICT", 0) != 0;
   b.xdp_mode = clamp_i(env_int_local("SAMURAI_XDP_MODE", 0), 0, 2);
   b.xdp_queue_base = std::max(0, env_int_local("SAMURAI_XDP_QUEUE_ID", 0));
   {
@@ -2111,16 +2112,43 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
 
   if (want_afpacket && !b.iface.empty()) {
     if (samurai_fast_sender_send_ring_bridge && samurai_fast_sender_cleanup_ring_bridge) {
+      // Validate AF_PACKET bridge with a zero-count preflight so we don't mark
+      // backend active when raw socket/ring setup is not actually available.
+      std::array<uint8_t, 64> dummy{};
+      int pre_sent = 0;
+      int pre_errors = 0;
+      char pre_err[160];
+      pre_err[0] = '\0';
+      const int pre_rc = samurai_fast_sender_send_ring_bridge(
+          b.iface.c_str(),
+          dummy.data(),
+          dummy.size(),
+          64,
+          0,
+          b.afpacket_mac.data(),
+          &pre_sent,
+          &pre_errors,
+          pre_err,
+          sizeof(pre_err));
+      (void)samurai_fast_sender_cleanup_ring_bridge();
+      if (pre_rc < 0) {
+        if (b.requested == "af_packet") {
+          b.kind = PersistentTxBackendKind::kNoop;
+          b.active = "noop";
+          return tx_backend_strict ? false : true;
+        }
+      } else {
       b.afpacket_send_bridge = samurai_fast_sender_send_ring_bridge;
       b.afpacket_cleanup_bridge = samurai_fast_sender_cleanup_ring_bridge;
       b.kind = PersistentTxBackendKind::kAfPacket;
       b.active = "af_packet";
       return true;
+      }
     }
     if (b.requested == "af_packet") {
       b.kind = PersistentTxBackendKind::kNoop;
       b.active = "noop";
-      return false;
+      return tx_backend_strict ? false : true;
     }
   }
 
@@ -3574,6 +3602,22 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
             }
             if (rc < 0 || sent <= 0) {
               local_drops += static_cast<uint64_t>(batch_count);
+              // Fail-safe: always release claimed ring slots to avoid
+              // head-of-line deadlock when AF_PACKET send path fails.
+              for (size_t i = 0; i < batch_count; ++i) {
+                const uint32_t slot_id = afpacket_slot_ids[i];
+                const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
+                PersistentRingSlot& slot = rt.rings_host[idx];
+                slot.state = 0;
+                slot.len = 0;
+                slot.stream_id = 0;
+                slot.stream_slot = -1;
+                slot.protocol = 0;
+                (void)persistent_set_device_slot_state(rt, q, slot_id, 0);
+                local_released += 1u;
+              }
+              cursor = (scan_start + static_cast<uint32_t>(batch_count)) % static_cast<uint32_t>(rt.ring_slots);
+              progressed = true;
               break;
             }
             for (int i = 0; i < sent; ++i) {
