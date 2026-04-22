@@ -1302,6 +1302,7 @@ struct PersistentRuntimeControl {
   int32_t queue_count = 1;
   int32_t ring_slots = 0;
   int32_t max_streams = kPersistentMaxStreams;
+  int32_t active_streams = 0;
   int32_t queue_probe_span = 4;
   int32_t max_packet_bytes = kPersistentMaxPacketBytes;
   uint64_t heartbeat = 0;
@@ -1694,6 +1695,19 @@ inline bool persistent_stream_copy_slot_to_host(PersistentRuntime& rt, int slot)
     host_slot->completed = completed_host_before;
   }
   return true;
+}
+
+inline void persistent_sync_active_stream_count_unlocked(PersistentRuntime& rt) {
+  if (!rt.ctrl) {
+    return;
+  }
+  int active = 0;
+  for (const auto& kv : g_persistent_streams) {
+    if (kv.second.active != 0 && kv.second.device_slot >= 0 && kv.second.device_slot < kPersistentMaxStreams) {
+      active += 1;
+    }
+  }
+  rt.ctrl->active_streams = clamp_i(active, 0, kPersistentMaxStreams);
 }
 
 template <typename T>
@@ -2822,8 +2836,20 @@ __global__ void persistent_dataplane_kernel(
       u64_add(&ctrl->heartbeat, 1u);
     }
     bool produced = false;
+    int active_streams = i32_load(&ctrl->active_streams);
+    if (active_streams < 1) {
+      active_streams = 1;
+    } else if (active_streams > max_streams) {
+      active_streams = max_streams;
+    }
+    int scan_limit = active_streams + static_cast<int>(warp_workers);
+    if (scan_limit < 32) {
+      scan_limit = 32;
+    } else if (scan_limit > max_streams) {
+      scan_limit = max_streams;
+    }
     const uint32_t max_streams_u = static_cast<uint32_t>(max_streams);
-    for (int i = 0; i < max_streams; ++i) {
+    for (int i = 0; i < scan_limit; ++i) {
       __syncwarp(kFullWarpMask);
       const int idx = static_cast<int>((rr + static_cast<uint32_t>(i)) % max_streams_u);
       volatile PersistentDeviceStreamState* sv = &streams[idx];
@@ -2872,36 +2898,37 @@ __global__ void persistent_dataplane_kernel(
             reserved_tokens);
       }
       packet_seq_base = __shfl_sync(warp_mask, packet_seq_base, 0);
+      int q_base = 0;
+      if (lane == 0u) {
+        if (affinity_q >= 0 && affinity_q < queue_count) {
+          q_base = affinity_q;
+        } else {
+          const uint32_t q_seed = packet_seq_base ^ static_cast<uint32_t>(sid) ^ rr;
+          q_base = queue_pow2
+              ? static_cast<int>(q_seed & queue_mask)
+              : static_cast<int>(q_seed % queue_count_u);
+        }
+      }
+      q_base = __shfl_sync(warp_mask, q_base, 0);
+      int probe_span = 1;
+      if (queue_count > 1) {
+        probe_span = queue_probe_span_default;
+        if (probe_span < 1) {
+          probe_span = 1;
+        } else if (probe_span > queue_count) {
+          probe_span = queue_count;
+        }
+      }
+      const int ring_probe_span = 3;
       int produced_for_stream_lane = 0;
-      PersistentRingSlot* publish_slot_0 = nullptr;
-      PersistentRingSlot* publish_slot_1 = nullptr;
 
       for (uint32_t token_i = lane; token_i < reserved_tokens; token_i += kWarpWidth) {
         const uint32_t packet_seq = packet_seq_base + token_i + 1u;
-        const uint32_t route_seed = packet_seq ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
-        int q_base = affinity_q;
-        if (q_base < 0 || q_base >= queue_count) {
-          q_base = queue_pow2
-              ? static_cast<int>(route_seed & queue_mask)
-              : static_cast<int>(route_seed % queue_count_u);
-        }
-        int probe_span = 1;
-        if (queue_count > 1) {
-          probe_span = queue_probe_span_default;
-          if (probe_span < 1) {
-            probe_span = 1;
-          }
-          if (probe_span > queue_count) {
-            probe_span = queue_count;
-          }
-        }
-
         PersistentRingSlot* slot_ptr = nullptr;
         int q = q_base;
         uint32_t slot_idx = 0u;
-        const uint32_t slot_seq = slot_seq_base + token_i;
-        const uint32_t slot_hash = slot_seq ^ (route_seed * 2246822519u);
-        const uint32_t slot_probe_stride = ((route_seed >> 5u) | 1u);
+        const uint32_t slot_seed = slot_seq_base + token_i;
+        const uint32_t slot_try0 = ring_pow2 ? (slot_seed & ring_mask) : (slot_seed % ring_slots_u);
         for (int probe = 0; probe < probe_span; ++probe) {
           int q_try = q_base + probe;
           if (q_try >= queue_count) {
@@ -2909,23 +2936,29 @@ __global__ void persistent_dataplane_kernel(
                 ? static_cast<int>(static_cast<uint32_t>(q_try) & queue_mask)
                 : (q_try % queue_count);
           }
-          uint32_t slot_try = slot_hash + (static_cast<uint32_t>(probe) * slot_probe_stride);
-          if (ring_pow2) {
-            slot_try &= ring_mask;
-          } else {
-            slot_try %= ring_slots_u;
-          }
-          PersistentRingSlot& candidate = rings[q_try * ring_slots + static_cast<int>(slot_try)];
-          if (candidate.state != 0) {
-            continue;
-          }
-          if (atomicCAS((int*)&candidate.state, 0, 2) == 0) {
-            q = q_try;
-            slot_idx = slot_try;
-            slot_ptr = &candidate;
-            if (probe > 0) {
-              local_queue_spread_events += 1u;
+          for (int ring_probe = 0; ring_probe < ring_probe_span; ++ring_probe) {
+            uint32_t slot_try = slot_try0 +
+                static_cast<uint32_t>(probe * static_cast<int>(warp_workers) + ring_probe * static_cast<int>(kWarpWidth));
+            if (ring_pow2) {
+              slot_try &= ring_mask;
+            } else {
+              slot_try %= ring_slots_u;
             }
+            PersistentRingSlot& candidate = rings[q_try * ring_slots + static_cast<int>(slot_try)];
+            if (candidate.state != 0) {
+              continue;
+            }
+            if (atomicCAS((int*)&candidate.state, 0, 2) == 0) {
+              q = q_try;
+              slot_idx = slot_try;
+              slot_ptr = &candidate;
+              if (probe > 0) {
+                local_queue_spread_events += 1u;
+              }
+              break;
+            }
+          }
+          if (slot_ptr) {
             break;
           }
         }
@@ -2959,22 +2992,9 @@ __global__ void persistent_dataplane_kernel(
         slot.stream_id = sid;
         slot.stream_slot = idx;
         slot.protocol = proto;
-        if (!publish_slot_0) {
-          publish_slot_0 = &slot;
-        } else {
-          publish_slot_1 = &slot;
-        }
+        persistent_publish_slot_ready(&slot);
         produced = true;
         produced_for_stream_lane += 1;
-      }
-
-      if (produced_for_stream_lane > 0) {
-        if (publish_slot_0) {
-          persistent_publish_slot_ready(publish_slot_0);
-        }
-        if (publish_slot_1) {
-          persistent_publish_slot_ready(publish_slot_1);
-        }
       }
 
       int produced_for_stream = produced_for_stream_lane;
@@ -4081,6 +4101,7 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   rt.ctrl->queue_count = rt.queue_count;
   rt.ctrl->ring_slots = rt.ring_slots;
   rt.ctrl->max_streams = kPersistentMaxStreams;
+  rt.ctrl->active_streams = 0;
   rt.ctrl->queue_probe_span =
       clamp_i(env_int_local("SAMURAI_GPU_QUEUE_PROBE_SPAN", 4), 1, std::max(1, rt.queue_count));
   rt.ctrl->max_packet_bytes = rt.max_packet_bytes;
@@ -4854,6 +4875,7 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   }
 
   g_persistent_streams[stream_id] = std::move(st);
+  persistent_sync_active_stream_count_unlocked(g_persistent_runtime);
   *out_stream_id = stream_id;
   g_samurai_gpu_packet_last_error.clear();
   return 0;
@@ -5008,6 +5030,7 @@ extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* u
   if (!persistent_sync_hot_stream_slot(g_persistent_runtime, st.device_slot)) {
     return set_c_api_error("failed to sync stream hot mirror");
   }
+  persistent_sync_active_stream_count_unlocked(g_persistent_runtime);
 
   st.submitted = d.produced;
   st.quota_left = d.quota_left;
@@ -5031,6 +5054,7 @@ extern "C" int samurai_gpu_packet_stop_stream(int64_t stream_id) {
   }
   it->second.active = 0;
   g_persistent_streams.erase(it);
+  persistent_sync_active_stream_count_unlocked(g_persistent_runtime);
   g_samurai_gpu_packet_last_error.clear();
   return 0;
 }
