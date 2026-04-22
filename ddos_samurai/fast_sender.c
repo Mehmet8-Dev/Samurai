@@ -1991,15 +1991,12 @@ static int send_ring_optimized_core(
     txring_send_metrics_t* metrics
 ) {
     if (!iface || !view || !mac || !metrics) {
-        PyErr_SetString(PyExc_ValueError, "invalid send_ring_optimized arguments");
         return -1;
     }
     if (packet_size <= 0 || count < 0) {
-        PyErr_SetString(PyExc_ValueError, "packet_size must be > 0 and count must be >= 0");
         return -1;
     }
     if ((size_t)view->len < ((size_t)packet_size * (size_t)count)) {
-        PyErr_SetString(PyExc_ValueError, "packets buffer is smaller than packet_size * count");
         return -1;
     }
 
@@ -2011,7 +2008,6 @@ static int send_ring_optimized_core(
     load_txring_hugepage_policy_from_env();
 
     if (setup_tx_ring(iface, packet_size, mac) < 0) {
-        PyErr_SetString(PyExc_OSError, "Failed to setup TX_RING");
         return -1;
     }
 
@@ -2227,12 +2223,7 @@ static int send_ring_optimized_core_raw(
 
     if (send_ring_optimized_core(iface, &view, packet_size, count, mac, metrics) < 0) {
         if (err_msg && err_msg_len > 0) {
-            const char* py_err = NULL;
-            if (PyErr_Occurred()) {
-                py_err = "python_error";
-                PyErr_Clear();
-            }
-            (void)snprintf(err_msg, err_msg_len, "%s", py_err ? py_err : "send_ring_optimized_core failed");
+            (void)snprintf(err_msg, err_msg_len, "%s", "send_ring_optimized_core failed");
         }
         return -1;
     }
@@ -2308,6 +2299,9 @@ static PyObject* send_ring_optimized(PyObject* self, PyObject* args) {
             iface, &view, packet_size, count, (const uint8_t*)mac_view.buf, &metrics) < 0) {
         PyBuffer_Release(&view);
         PyBuffer_Release(&mac_view);
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_RuntimeError, "send_ring_optimized_core failed");
+        }
         return NULL;
     }
 
@@ -2346,6 +2340,9 @@ static PyObject* send_ring_optimized_ex(PyObject* self, PyObject* args) {
             iface, &view, packet_size, count, (const uint8_t*)mac_view.buf, &metrics) < 0) {
         PyBuffer_Release(&view);
         PyBuffer_Release(&mac_view);
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_RuntimeError, "send_ring_optimized_core failed");
+        }
         return NULL;
     }
 

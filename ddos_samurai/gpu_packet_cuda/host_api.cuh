@@ -2978,7 +2978,7 @@ __global__ void persistent_dataplane_kernel(
 
         uint8_t* slot_payload =
             payload_base +
-            ((static_cast<size_t>(q) * static_cast<size_t>(ctrl->ring_slots) + static_cast<size_t>(slot_idx)) *
+            ((static_cast<size_t>(q) * static_cast<size_t>(ring_slots) + static_cast<size_t>(slot_idx)) *
              static_cast<size_t>(kPersistentUmemFrameSize)) +
             static_cast<size_t>(kPersistentUmemHeadroom);
 
