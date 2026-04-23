@@ -794,7 +794,11 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
         fprintf(stderr, "[XDP] Failed to bind socket to %s (queue %d): %s\n", 
                 ifname, queue_id, strerror(errno));
         fprintf(stderr, "[XDP] Hint: Try running with sudo or check if XDP is supported\n");
-        // munmap...
+        if (xsk->tx_map && xsk->tx_map_len > 0) {
+            munmap(xsk->tx_map, xsk->tx_map_len);
+            xsk->tx_map = NULL;
+            xsk->tx_map_len = 0;
+        }
         close(xsk->fd);
         free(xsk);
         return NULL;
@@ -1722,10 +1726,15 @@ static PyObject* py_xdp_send(PyObject* self, PyObject* args)
     for (Py_ssize_t i = 0; i < count; i++) {
         PyObject *item = PyList_GetItem(packets_list, i);
         if (PyBytes_Check(item)) {
+            Py_ssize_t pkt_len = PyBytes_GET_SIZE(item);
+            if (pkt_len <= 0 || pkt_len > 65535) {
+                xdp_ctx.tx_invalid_packets += 1;
+                continue;
+            }
             Py_INCREF(item);
             g_send_scratch.owners[valid_count] = item;
             packets[valid_count] = (const uint8_t*)PyBytes_AS_STRING(item);
-            lengths[valid_count] = (uint16_t)PyBytes_GET_SIZE(item);
+            lengths[valid_count] = (uint16_t)pkt_len;
             valid_count++;
         } else {
             xdp_ctx.tx_invalid_packets += 1;
@@ -1943,18 +1952,10 @@ static PyObject* py_xdp_submit_tx_frame(PyObject* self, PyObject* args)
 {
     int frame_id = -1;
     int length = 0;
+    int max_len = 0;
     (void)self;
 
     if (!PyArg_ParseTuple(args, "ii", &frame_id, &length)) {
-        return NULL;
-    }
-    if (frame_id < 0 || frame_id >= (int)xdp_ctx.xsk->umem->frame_count) {
-        PyErr_SetString(PyExc_ValueError, "frame_id out of range");
-        return NULL;
-    }
-    const int max_len = (int)(xdp_ctx.xsk ? (xdp_ctx.xsk->umem->frame_size - xdp_ctx.xsk->umem->headroom) : MAX_PACKET_SIZE);
-    if (length <= 0 || length > max_len) {
-        PyErr_SetString(PyExc_ValueError, "length must be in range 1..frame_payload_capacity");
         return NULL;
     }
 
@@ -1962,6 +1963,22 @@ static PyObject* py_xdp_submit_tx_frame(PyObject* self, PyObject* args)
     if (!xdp_ctx.is_initialized || !xdp_ctx.is_running) {
         pthread_mutex_unlock(&xdp_ctx.lock);
         PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
+        return NULL;
+    }
+    if (xdp_ctx.xsk == NULL || xdp_ctx.xsk->umem == NULL) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyErr_SetString(PyExc_RuntimeError, "XDP socket context unavailable");
+        return NULL;
+    }
+    if (frame_id < 0 || frame_id >= (int)xdp_ctx.xsk->umem->frame_count) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyErr_SetString(PyExc_ValueError, "frame_id out of range");
+        return NULL;
+    }
+    max_len = (int)(xdp_ctx.xsk->umem->frame_size - xdp_ctx.xsk->umem->headroom);
+    if (length <= 0 || length > max_len) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyErr_SetString(PyExc_ValueError, "length must be in range 1..frame_payload_capacity");
         return NULL;
     }
 
@@ -2001,15 +2018,20 @@ static PyObject* py_xdp_release_tx_frame(PyObject* self, PyObject* args)
     if (!PyArg_ParseTuple(args, "i", &frame_id)) {
         return NULL;
     }
-    if (frame_id < 0 || frame_id >= (int)xdp_ctx.xsk->umem->frame_count) {
-        PyErr_SetString(PyExc_ValueError, "frame_id out of range");
-        return NULL;
-    }
-
     pthread_mutex_lock(&xdp_ctx.lock);
     if (!xdp_ctx.is_initialized || !xdp_ctx.is_running) {
         pthread_mutex_unlock(&xdp_ctx.lock);
         PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
+        return NULL;
+    }
+    if (xdp_ctx.xsk == NULL || xdp_ctx.xsk->umem == NULL) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyErr_SetString(PyExc_RuntimeError, "XDP socket context unavailable");
+        return NULL;
+    }
+    if (frame_id < 0 || frame_id >= (int)xdp_ctx.xsk->umem->frame_count) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyErr_SetString(PyExc_ValueError, "frame_id out of range");
         return NULL;
     }
     free_frame(xdp_ctx.xsk, (uint64_t)frame_id * (uint64_t)xdp_ctx.xsk->umem->frame_size);
@@ -2508,10 +2530,15 @@ static PyObject* py_xdp_send_ctx(PyObject* self, PyObject* args)
     for (Py_ssize_t i = 0; i < count; i++) {
         PyObject *item = PyList_GetItem(packets_list, i);
         if (PyBytes_Check(item)) {
+            Py_ssize_t pkt_len = PyBytes_GET_SIZE(item);
+            if (pkt_len <= 0 || pkt_len > 65535) {
+                ctx->tx_invalid_packets += 1;
+                continue;
+            }
             Py_INCREF(item);
             ctx->scratch_owners[valid_count] = item;
             packets[valid_count] = (const uint8_t*)PyBytes_AS_STRING(item);
-            lengths[valid_count] = (uint16_t)PyBytes_GET_SIZE(item);
+            lengths[valid_count] = (uint16_t)pkt_len;
             valid_count++;
         } else {
             ctx->tx_invalid_packets += 1;
