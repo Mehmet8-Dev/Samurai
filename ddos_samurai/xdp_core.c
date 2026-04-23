@@ -644,3 +644,7 @@ const char *xdp_core_mode2_probe_status(const xdp_core_handle *h) {
 const char *xdp_core_mode2_probe_reason(const xdp_core_handle *h) {
     return h ? h->mode2_probe_reason : "not_run";
 }
+
+int xdp_core_uses_native_api(const xdp_core_handle *h) {
+    return (h && h->use_native_api) ? 1 : 0;
+}

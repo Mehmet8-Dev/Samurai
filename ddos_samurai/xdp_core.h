@@ -58,5 +58,6 @@ int xdp_core_mode_effective(const xdp_core_handle *h);
 const char *xdp_core_mode2_policy(const xdp_core_handle *h);
 const char *xdp_core_mode2_probe_status(const xdp_core_handle *h);
 const char *xdp_core_mode2_probe_reason(const xdp_core_handle *h);
+int xdp_core_uses_native_api(const xdp_core_handle *h);
 
 #endif /* SAMURAI_XDP_CORE_H */
