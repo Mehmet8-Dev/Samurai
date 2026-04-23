@@ -430,12 +430,14 @@ def _fallback_send(buffer, target_ip, target_port, packet_size, count):
         return 0
 
     mv = memoryview(buffer)
+    sent = 0
     for i in range(count):
         start = i * packet_size
         end   = start + packet_size
         try:
             s.sendto(mv[start:end], (target_ip, target_port))
+            sent += 1
         except Exception:
             break
     s.close()
-    return count
+    return sent
