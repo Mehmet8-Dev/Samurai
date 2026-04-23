@@ -1490,6 +1490,10 @@ struct PersistentRuntime {
   cudaStream_t kernel_stream = nullptr;
   cudaStream_t bridge_copy_stream = nullptr;
   cudaEvent_t bridge_copy_event = nullptr;
+  cudaStream_t quota_refill_stream = nullptr;
+  cudaGraph_t quota_refill_graph = nullptr;
+  cudaGraphExec_t quota_refill_graph_exec = nullptr;
+  bool quota_refill_graph_enabled = false;
   PersistentRuntimeControl* ctrl = nullptr;                       // mapped host
   PersistentRuntimeControl* ctrl_dev = nullptr;                   // mapped device
   int32_t* run_flag_dev = nullptr;                                // device-only hot run gate
@@ -1547,6 +1551,14 @@ struct PersistentRuntime {
       (void)cudaEventDestroy(bridge_copy_event);
       bridge_copy_event = nullptr;
     }
+    if (quota_refill_graph_exec) {
+      (void)cudaGraphExecDestroy(quota_refill_graph_exec);
+      quota_refill_graph_exec = nullptr;
+    }
+    if (quota_refill_graph) {
+      (void)cudaGraphDestroy(quota_refill_graph);
+      quota_refill_graph = nullptr;
+    }
     for (auto& t : bridge_threads) {
       if (t.joinable()) {
         t.join();
@@ -1563,6 +1575,10 @@ struct PersistentRuntime {
     if (bridge_copy_stream) {
       (void)cudaStreamDestroy(bridge_copy_stream);
       bridge_copy_stream = nullptr;
+    }
+    if (quota_refill_stream) {
+      (void)cudaStreamDestroy(quota_refill_stream);
+      quota_refill_stream = nullptr;
     }
     if (rings_host) {
       (void)cudaFreeHost(rings_host);
@@ -1694,6 +1710,37 @@ inline bool persistent_stream_copy_slot_to_host(PersistentRuntime& rt, int slot)
   }
   if (completed_host_before > host_slot->completed) {
     host_slot->completed = completed_host_before;
+  }
+  return true;
+}
+
+inline bool persistent_stream_copy_all_to_host(PersistentRuntime& rt) {
+  if (!rt.streams || !rt.streams_dev) {
+    return false;
+  }
+  if (!rt.quota_refill_stream) {
+    if (cudaStreamCreateWithFlags(&rt.quota_refill_stream, cudaStreamNonBlocking) != cudaSuccess) {
+      return false;
+    }
+  }
+  std::array<uint32_t, kPersistentMaxStreams> completed_before{};
+  for (int i = 0; i < kPersistentMaxStreams; ++i) {
+    completed_before[static_cast<size_t>(i)] = rt.streams[static_cast<size_t>(i)].completed;
+  }
+  const size_t bytes = sizeof(PersistentDeviceStreamState) * static_cast<size_t>(kPersistentMaxStreams);
+  if (cudaMemcpyAsync(rt.streams, rt.streams_dev, bytes, cudaMemcpyDeviceToHost, rt.quota_refill_stream) !=
+      cudaSuccess) {
+    return false;
+  }
+  if (cudaStreamSynchronize(rt.quota_refill_stream) != cudaSuccess) {
+    return false;
+  }
+  for (int i = 0; i < kPersistentMaxStreams; ++i) {
+    PersistentDeviceStreamState& d = rt.streams[static_cast<size_t>(i)];
+    const uint32_t prev = completed_before[static_cast<size_t>(i)];
+    if (prev > d.completed) {
+      d.completed = prev;
+    }
   }
   return true;
 }
@@ -2812,6 +2859,55 @@ __device__ inline uint32_t reserve_stream_tokens(
   return reserve;
 }
 
+__global__ void persistent_quota_refill_kernel(
+    volatile PersistentDeviceStreamState* streams,
+    int32_t max_streams) {
+  if (!streams || max_streams <= 0) {
+    return;
+  }
+  const int32_t idx = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx < 0 || idx >= max_streams) {
+    return;
+  }
+  volatile PersistentDeviceStreamState* sv = streams + static_cast<size_t>(idx);
+  if (i32_load(&sv->active) == 0) {
+    return;
+  }
+
+  uint32_t quota = u32_load(&sv->quota);
+  if (quota == 0u) {
+    return;
+  }
+
+  if (i32_load(&sv->stream_kind) == static_cast<int32_t>(PersistentStreamKind::kRamp)) {
+    const uint32_t ramp_step = u32_load(&sv->ramp_step);
+    if (ramp_step > 0u) {
+      uint32_t epoch_counter = u32_load(&sv->ramp_epoch_counter) + 1u;
+      sv->ramp_epoch_counter = epoch_counter;
+      const uint32_t interval_raw = u32_load(&sv->ramp_interval_epochs);
+      const uint32_t interval = (interval_raw > 0u) ? interval_raw : 1u;
+      if ((epoch_counter % interval) == 0u) {
+        uint64_t next_quota = static_cast<uint64_t>(quota) + static_cast<uint64_t>(ramp_step);
+        const uint32_t ramp_max_quota = u32_load(&sv->ramp_max_quota);
+        const uint32_t ramp_cap = (ramp_max_quota > 0u) ? ramp_max_quota : (quota * 4u);
+        if (ramp_cap > 0u && next_quota > static_cast<uint64_t>(ramp_cap)) {
+          next_quota = static_cast<uint64_t>(ramp_cap);
+        }
+        quota = static_cast<uint32_t>(next_quota);
+        sv->quota = quota;
+      }
+    }
+  }
+
+  const uint32_t quota_left = u32_load(&sv->quota_left);
+  uint64_t next_left = static_cast<uint64_t>(quota_left) + static_cast<uint64_t>(quota);
+  const uint64_t cap = static_cast<uint64_t>(quota) * 4ull;
+  if (next_left > cap) {
+    next_left = cap;
+  }
+  sv->quota_left = static_cast<uint32_t>(next_left);
+}
+
 __global__ void persistent_dataplane_kernel(
     const volatile int32_t* run_flag_dev,
     volatile PersistentRuntimeControl* ctrl,
@@ -3125,6 +3221,85 @@ __global__ void persistent_dataplane_kernel(
     }
     __syncthreads();
   }
+}
+
+inline void persistent_quota_refill_graph_destroy(PersistentRuntime& rt) {
+  rt.quota_refill_graph_enabled = false;
+  if (rt.quota_refill_graph_exec) {
+    (void)cudaGraphExecDestroy(rt.quota_refill_graph_exec);
+    rt.quota_refill_graph_exec = nullptr;
+  }
+  if (rt.quota_refill_graph) {
+    (void)cudaGraphDestroy(rt.quota_refill_graph);
+    rt.quota_refill_graph = nullptr;
+  }
+}
+
+inline bool persistent_quota_refill_graph_prepare(PersistentRuntime& rt) {
+  if (!rt.streams_dev) {
+    return false;
+  }
+  if (!rt.quota_refill_stream) {
+    if (cudaStreamCreateWithFlags(&rt.quota_refill_stream, cudaStreamNonBlocking) != cudaSuccess) {
+      return false;
+    }
+  }
+  persistent_quota_refill_graph_destroy(rt);
+  if (cudaStreamBeginCapture(rt.quota_refill_stream, cudaStreamCaptureModeGlobal) != cudaSuccess) {
+    return false;
+  }
+  const int threads = 128;
+  const int blocks = std::max(1, (kPersistentMaxStreams + threads - 1) / threads);
+  CUDA_KERNEL_LAUNCH(
+      persistent_quota_refill_kernel,
+      blocks,
+      threads,
+      rt.quota_refill_stream,
+      rt.streams_dev,
+      kPersistentMaxStreams);
+  if (cudaPeekAtLastError() != cudaSuccess) {
+    cudaGraph_t captured = nullptr;
+    (void)cudaStreamEndCapture(rt.quota_refill_stream, &captured);
+    if (captured) {
+      (void)cudaGraphDestroy(captured);
+    }
+    return false;
+  }
+  if (cudaStreamEndCapture(rt.quota_refill_stream, &rt.quota_refill_graph) != cudaSuccess || !rt.quota_refill_graph) {
+    persistent_quota_refill_graph_destroy(rt);
+    return false;
+  }
+  if (cudaGraphInstantiate(&rt.quota_refill_graph_exec, rt.quota_refill_graph, nullptr, nullptr, 0) != cudaSuccess ||
+      !rt.quota_refill_graph_exec) {
+    persistent_quota_refill_graph_destroy(rt);
+    return false;
+  }
+  rt.quota_refill_graph_enabled = true;
+  return true;
+}
+
+inline bool persistent_quota_refill_epoch(PersistentRuntime& rt) {
+  if (!rt.streams_dev) {
+    return false;
+  }
+  if (rt.quota_refill_graph_enabled && rt.quota_refill_graph_exec && rt.quota_refill_stream) {
+    return cudaGraphLaunch(rt.quota_refill_graph_exec, rt.quota_refill_stream) == cudaSuccess;
+  }
+  if (!rt.quota_refill_stream) {
+    if (cudaStreamCreateWithFlags(&rt.quota_refill_stream, cudaStreamNonBlocking) != cudaSuccess) {
+      return false;
+    }
+  }
+  const int threads = 128;
+  const int blocks = std::max(1, (kPersistentMaxStreams + threads - 1) / threads);
+  CUDA_KERNEL_LAUNCH(
+      persistent_quota_refill_kernel,
+      blocks,
+      threads,
+      rt.quota_refill_stream,
+      rt.streams_dev,
+      kPersistentMaxStreams);
+  return (cudaPeekAtLastError() == cudaSuccess);
 }
 
 inline int ring_occupancy_now(const PersistentRuntime& rt) {
@@ -3825,6 +4000,22 @@ inline void persistent_monitor_loop() {
           do_refill = true;
         }
       }
+      bool refill_on_device = false;
+      if (do_refill) {
+        refill_on_device = persistent_quota_refill_epoch(rt);
+        if (!refill_on_device) {
+          // Deterministic mode: never fall back to host-side quota refill writes.
+          rt.ctrl->native_batch_degrade_events += 1u;
+          rt.threads_running.store(false, std::memory_order_relaxed);
+          rt.ctrl->run = 0;
+          if (rt.run_flag_dev) {
+            const int32_t run_off = 0;
+            (void)cudaMemcpy(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice);
+          }
+          break;
+        }
+      }
+      const bool telemetry_bulk_ok = persistent_stream_copy_all_to_host(rt);
       std::vector<double> fairness_samples;
       fairness_samples.reserve(g_persistent_streams.size());
       for (auto& kv : g_persistent_streams) {
@@ -3832,7 +4023,7 @@ inline void persistent_monitor_loop() {
         if (st.active == 0 || st.device_slot < 0 || !rt.streams) {
           continue;
         }
-        if (!persistent_stream_copy_slot_to_host(rt, st.device_slot)) {
+        if (!telemetry_bulk_ok && !persistent_stream_copy_slot_to_host(rt, st.device_slot)) {
           continue;
         }
         st.heartbeat_ns = now_ns_steady();
@@ -3844,46 +4035,8 @@ inline void persistent_monitor_loop() {
           st.bridge_drain_packets += completed_delta;
           st.progress_ns = now_ns_steady();
         }
-        if (do_refill && st.base_quota > 0u) {
-          if (st.stream_kind == static_cast<int>(PersistentStreamKind::kRamp) && st.ramp_step > 0u) {
-            st.ramp_epoch_counter += 1u;
-            const uint32_t interval = std::max<uint32_t>(1u, st.ramp_interval_epochs);
-            if ((st.ramp_epoch_counter % interval) == 0u) {
-              uint64_t next_quota = static_cast<uint64_t>(st.quota) + static_cast<uint64_t>(st.ramp_step);
-              const uint32_t ramp_cap = (st.ramp_max_quota > 0u) ? st.ramp_max_quota : (st.base_quota * 4u);
-              if (ramp_cap > 0u && next_quota > static_cast<uint64_t>(ramp_cap)) {
-                next_quota = static_cast<uint64_t>(ramp_cap);
-              }
-              st.quota = static_cast<uint32_t>(next_quota);
-            }
-          } else {
-            st.quota = st.base_quota;
-          }
-          d.quota = st.quota;
-          d.ramp_epoch_counter = st.ramp_epoch_counter;
-          const uint64_t refill = st.quota;
-          uint64_t next = static_cast<uint64_t>(d.quota_left) + refill;
-          const uint64_t cap = static_cast<uint64_t>(st.quota) * 4ull;
-          if (next > cap) {
-            next = cap;
-          }
-          d.quota_left = static_cast<uint32_t>(next);
-          (void)persistent_stream_write_field<uint32_t>(
-              rt,
-              st.device_slot,
-              offsetof(PersistentDeviceStreamState, quota),
-              d.quota);
-          (void)persistent_stream_write_field<uint32_t>(
-              rt,
-              st.device_slot,
-              offsetof(PersistentDeviceStreamState, ramp_epoch_counter),
-              d.ramp_epoch_counter);
-          (void)persistent_stream_write_field<uint32_t>(
-              rt,
-              st.device_slot,
-              offsetof(PersistentDeviceStreamState, quota_left),
-              d.quota_left);
-        }
+        st.quota = d.quota;
+        st.ramp_epoch_counter = d.ramp_epoch_counter;
         st.quota_left = d.quota_left;
         st.submitted = d.produced;
         st.completed = std::max<uint64_t>(st.completed, static_cast<uint64_t>(host_u32_load(&d.completed)));
@@ -4002,6 +4155,11 @@ inline void persistent_runtime_release_unlocked() {
   if (rt.bridge_copy_event) {
     (void)cudaEventDestroy(rt.bridge_copy_event);
     rt.bridge_copy_event = nullptr;
+  }
+  persistent_quota_refill_graph_destroy(rt);
+  if (rt.quota_refill_stream) {
+    (void)cudaStreamDestroy(rt.quota_refill_stream);
+    rt.quota_refill_stream = nullptr;
   }
   if (rt.rings_host) {
     (void)cudaFreeHost(rt.rings_host);
@@ -4276,6 +4434,9 @@ inline bool persistent_runtime_ensure_started_unlocked() {
       persistent_runtime_release_unlocked();
       return false;
     }
+  }
+  if (!persistent_quota_refill_graph_prepare(rt)) {
+    rt.quota_refill_graph_enabled = false;
   }
   rt.queue_drain_cursor.assign(static_cast<size_t>(rt.queue_count), 0u);
   rt.queue_sent_counts.assign(static_cast<size_t>(rt.queue_count), 0u);
