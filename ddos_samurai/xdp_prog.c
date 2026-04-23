@@ -155,6 +155,10 @@ int xdp_sock_filter_prog(struct xdp_md *ctx)
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
         return XDP_PASS;
+    if (iph->ihl < 5)
+        return XDP_PASS;
+    if ((void *)iph + (iph->ihl * 4) > data_end)
+        return XDP_PASS;
     
     // Check protocol filter
     if (config && config->target_proto != 0 && iph->protocol != config->target_proto)
