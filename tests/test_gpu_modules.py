@@ -28,7 +28,6 @@ except Exception:
 # We still try to import the modules to check for syntax errors or non-GPU dependency issues
 try:
     from ddos_samurai import gpu_packet
-    from ddos_samurai import gpu_payload
     MODULES_IMPORTABLE = True
 except ImportError as e:
     print(f"[WARNING] Could not import GPU modules: {e}")
@@ -51,18 +50,6 @@ class TestGPUModules(unittest.TestCase):
         self.assertTrue(hasattr(gpu_packet, 'reset_generation_telemetry'), "Missing reset_generation_telemetry")
         self.assertTrue(hasattr(gpu_packet, 'clear_generation_caches'), "Missing clear_generation_caches")
         self.assertTrue(hasattr(gpu_packet, 'init_gpu'), "Missing init_gpu")
-
-    def test_gpu_payload_structure(self):
-        """Verify gpu_payload module structure."""
-        self.assertTrue(hasattr(gpu_payload, 'GPUPayloadEngine'), "Missing GPUPayloadEngine class")
-        
-        # Test class instantiation if possible (might require GPU)
-        if GPU_AVAILABLE:
-            try:
-                engine = gpu_payload.GPUPayloadEngine(count=10)
-                self.assertIsNotNone(engine.packets_gpu)
-            except Exception as e:
-                self.fail(f"GPUPayloadEngine init failed on GPU: {e}")
 
     def test_basic_kernel_call(self):
         """Attempt to call a basic generation function if GPU is available."""

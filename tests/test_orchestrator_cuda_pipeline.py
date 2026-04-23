@@ -101,40 +101,6 @@ def _build_fake_numba_modules():
     return numba_mod, cuda_mod
 
 
-def _build_fake_gpu_payload_module():
-    mod = types.ModuleType("ddos_samurai.gpu_payload")
-
-    class _DummyPayloadEngine:
-        def __init__(self, _batch, rng_seed=1234):
-            self.count = 0
-            self.rng_seed = int(rng_seed) if rng_seed is not None else None
-            self.methods = ["GET"]
-            self.paths = ["/"]
-            self.uas = ["Fake-UA/1.0"]
-
-        def load_custom_wordlists(self, methods=None, paths=None, uas=None):
-            if methods is not None:
-                self.methods = list(methods)
-            if paths is not None:
-                self.paths = list(paths)
-            if uas is not None:
-                self.uas = list(uas)
-
-        def generate_h2_request_plan(self, target_ip, count=None, current_time=0):
-            del target_ip, current_time
-            n = int(self.count if count is None else count)
-            items = []
-            for i in range(max(0, n)):
-                method = self.methods[i % len(self.methods)] if self.methods else "GET"
-                path = self.paths[i % len(self.paths)] if self.paths else "/"
-                ua = self.uas[i % len(self.uas)] if self.uas else "Fake-UA/1.0"
-                items.append(types.SimpleNamespace(method=method, path=path, user_agent=ua))
-            return types.SimpleNamespace(items=items)
-
-    mod.GPUPayloadEngine = _DummyPayloadEngine
-    return mod
-
-
 def _build_fake_gpu_packet_module(*, host_ready_numpy=False):
     mod = types.ModuleType("ddos_samurai.gpu_packet")
     state = {
@@ -362,7 +328,6 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         args = _base_args()
         events = []
         fake_gpu_packet = _build_fake_gpu_packet_module()
-        fake_gpu_payload = _build_fake_gpu_payload_module()
         fake_cupy = _build_fake_cupy_module()
         fake_numba, fake_numba_cuda = _build_fake_numba_modules()
         fake_fast_sender = _FakeFastSender()
@@ -405,13 +370,10 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
                 "numba": fake_numba,
                 "numba.cuda": fake_numba_cuda,
                 "ddos_samurai.gpu_packet": fake_gpu_packet,
-                "ddos_samurai.gpu_payload": fake_gpu_payload,
             },
             clear=False,
         ), patch.object(
             ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
-        ), patch.object(
-            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
         ), patch.object(
             orchestrator.packet, "create_packet", lambda _cfg: template_bytes
         ), patch.object(
@@ -446,7 +408,6 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         args = _base_args()
         events = []
         fake_gpu_packet = _build_fake_gpu_packet_module(host_ready_numpy=True)
-        fake_gpu_payload = _build_fake_gpu_payload_module()
         fake_cupy = _build_fake_cupy_module()
         fake_numba, fake_numba_cuda = _build_fake_numba_modules()
 
@@ -488,13 +449,10 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
                 "numba": fake_numba,
                 "numba.cuda": fake_numba_cuda,
                 "ddos_samurai.gpu_packet": fake_gpu_packet,
-                "ddos_samurai.gpu_payload": fake_gpu_payload,
             },
             clear=False,
         ), patch.object(
             ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
-        ), patch.object(
-            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
         ), patch.object(
             orchestrator.packet, "create_packet", lambda _cfg: template_bytes
         ), patch.object(
@@ -523,7 +481,6 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
 
         events = []
         fake_gpu_packet = _build_fake_gpu_packet_module()
-        fake_gpu_payload = _build_fake_gpu_payload_module()
         fake_cupy = _build_fake_cupy_module()
         fake_numba, fake_numba_cuda = _build_fake_numba_modules()
         fake_custom_tcp = _FakeCustomTcpDataplane()
@@ -565,13 +522,10 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
                 "numba": fake_numba,
                 "numba.cuda": fake_numba_cuda,
                 "ddos_samurai.gpu_packet": fake_gpu_packet,
-                "ddos_samurai.gpu_payload": fake_gpu_payload,
             },
             clear=False,
         ), patch.object(
             ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
-        ), patch.object(
-            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
         ), patch.object(
             orchestrator.packet, "create_packet", lambda _cfg: template_bytes
         ), patch.object(
@@ -614,7 +568,6 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
 
         events = []
         fake_gpu_packet = _build_fake_gpu_packet_module()
-        fake_gpu_payload = _build_fake_gpu_payload_module()
         fake_cupy = _build_fake_cupy_module()
         fake_numba, fake_numba_cuda = _build_fake_numba_modules()
         fake_custom_tcp = _FakeCustomTcpDataplane()
@@ -665,13 +618,10 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
                 "numba": fake_numba,
                 "numba.cuda": fake_numba_cuda,
                 "ddos_samurai.gpu_packet": fake_gpu_packet,
-                "ddos_samurai.gpu_payload": fake_gpu_payload,
             },
             clear=False,
         ), patch.object(
             ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
-        ), patch.object(
-            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
         ), patch.object(
             orchestrator.packet, "create_packet", lambda _cfg: template_bytes
         ), patch.object(
@@ -719,7 +669,6 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         args["gpu_rng_seed"] = 777
 
         fake_gpu_packet = _build_fake_gpu_packet_module()
-        fake_gpu_payload = _build_fake_gpu_payload_module()
         fake_cupy = _build_fake_cupy_module()
         fake_numba, fake_numba_cuda = _build_fake_numba_modules()
 
@@ -738,13 +687,10 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
                 "numba": fake_numba,
                 "numba.cuda": fake_numba_cuda,
                 "ddos_samurai.gpu_packet": fake_gpu_packet,
-                "ddos_samurai.gpu_payload": fake_gpu_payload,
             },
             clear=False,
         ), patch.object(
             ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
-        ), patch.object(
-            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
         ), patch.object(
             senders, "FAST_SENDER_AVAILABLE", False
         ), patch.object(
@@ -788,7 +734,6 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         args["quic_min_response_body_bytes"] = 0
 
         fake_gpu_packet = _build_fake_gpu_packet_module()
-        fake_gpu_payload = _build_fake_gpu_payload_module()
         fake_cupy = _build_fake_cupy_module()
         fake_numba, fake_numba_cuda = _build_fake_numba_modules()
 
@@ -811,13 +756,10 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
                 "numba": fake_numba,
                 "numba.cuda": fake_numba_cuda,
                 "ddos_samurai.gpu_packet": fake_gpu_packet,
-                "ddos_samurai.gpu_payload": fake_gpu_payload,
             },
             clear=False,
         ), patch.object(
             ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
-        ), patch.object(
-            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
         ), patch.object(
             senders, "FAST_SENDER_AVAILABLE", False
         ), patch.object(
@@ -856,7 +798,6 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
         args["lab_profile"] = "off"
 
         fake_gpu_packet = _build_fake_gpu_packet_module()
-        fake_gpu_payload = _build_fake_gpu_payload_module()
         fake_cupy = _build_fake_cupy_module()
         fake_numba, fake_numba_cuda = _build_fake_numba_modules()
 
@@ -874,13 +815,10 @@ class TestOrchestratorCudaPipeline(unittest.IsolatedAsyncioTestCase):
                 "numba": fake_numba,
                 "numba.cuda": fake_numba_cuda,
                 "ddos_samurai.gpu_packet": fake_gpu_packet,
-                "ddos_samurai.gpu_payload": fake_gpu_payload,
             },
             clear=False,
         ), patch.object(
             ddos_pkg, "gpu_packet", fake_gpu_packet, create=True
-        ), patch.object(
-            ddos_pkg, "gpu_payload", fake_gpu_payload, create=True
         ), patch.object(
             senders, "FAST_SENDER_AVAILABLE", False
         ), patch.object(
