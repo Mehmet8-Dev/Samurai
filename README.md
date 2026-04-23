@@ -4,7 +4,7 @@ Samurai, **yalnizca yetkili ortamlarda** kullanilmak uzere tasarlanmis moduler b
 
 ## Surum Isimleri
 
-- Teknik surum (SemVer): `2.1.0`
+- Teknik surum (SemVer): `2.1.1`
 - Mevcut kod adi: `Kenjaku`
 - Eski kod adi: `Ronin`
 

@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - 
 
+## [2.1.1] - 2026-04-23
+
+### Fixed
+- XDP sender safety hardening for frame submit/release validation paths.
+- XDP sender cleanup path now unmaps TX ring on bind failure.
+- Pacing engine responsiveness improvements around long-running send loops and stats lock contention.
+- Pacing fallback sender now returns the actual sent packet count instead of requested count.
+
+### Changed
+- Project SemVer bumped to `2.1.1`.
+
 ## [2.0.0] - 2026-04-20
 
 ### Added

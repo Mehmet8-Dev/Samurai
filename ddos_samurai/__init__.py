@@ -24,7 +24,7 @@ except Exception:
     # Scapy may fail to initialize in restricted/sandboxed environments.
     conf = None
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __codename__ = "Kenjaku"
 __author__ = "Mehmet Okur"
 
