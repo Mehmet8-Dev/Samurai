@@ -1,50 +1,47 @@
 import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 
-class _DummyPacket:
-    def __init__(self, has_ether: bool):
-        self._has_ether = bool(has_ether)
-
-    def haslayer(self, name: str) -> bool:
-        return bool(self._has_ether and name == "Ether")
-
-
-class _FakeScapy:
+class _DummySocket:
     def __init__(self):
-        self.sendp = Mock()
-        self.send = Mock()
+        self.sent = []
 
-    def get_working_if(self):
-        return "lo"
+    def setsockopt(self, *args, **kwargs):
+        return None
+
+    def sendto(self, data, addr):
+        self.sent.append((bytes(data), addr))
+        return len(data)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return None
 
 
 class TestSendPacketAsync(unittest.IsolatedAsyncioTestCase):
-    async def test_send_packet_async_calls_sendp_for_l2_packets(self):
+    async def test_send_packet_async_sends_raw_ipv4_packet(self):
         from ddos_samurai.senders import send_packet_async
+        from ddos_samurai.packet import PacketConfig, create_packet
 
-        fake = _FakeScapy()
-        pkt = _DummyPacket(has_ether=True)
+        pkt = create_packet(PacketConfig(target_ip="127.0.0.1", target_port=80, protocol="udp"))
+        dummy_sock = _DummySocket()
 
-        with patch("ddos_samurai.senders._scapy", return_value=fake):
+        with patch("ddos_samurai._senders.legacy_packet.socket.socket", return_value=dummy_sock):
             loop = asyncio.get_running_loop()
             ok = await send_packet_async(pkt, verbose=False, packet_no=1, loop=loop, protocol="tcp")
 
         self.assertTrue(ok)
-        fake.sendp.assert_called_once()
-        fake.send.assert_not_called()
+        self.assertEqual(len(dummy_sock.sent), 1)
+        self.assertEqual(dummy_sock.sent[0][1][0], "127.0.0.1")
 
-    async def test_send_packet_async_calls_send_for_l3_packets(self):
+    async def test_send_packet_async_rejects_non_bytes_packet(self):
         from ddos_samurai.senders import send_packet_async
 
-        fake = _FakeScapy()
-        pkt = _DummyPacket(has_ether=False)
+        pkt = object()
+        loop = asyncio.get_running_loop()
+        ok = await send_packet_async(pkt, verbose=False, packet_no=1, loop=loop, protocol="udp")
 
-        with patch("ddos_samurai.senders._scapy", return_value=fake):
-            loop = asyncio.get_running_loop()
-            ok = await send_packet_async(pkt, verbose=False, packet_no=1, loop=loop, protocol="udp")
-
-        self.assertTrue(ok)
-        fake.send.assert_called_once()
-
+        self.assertFalse(ok)

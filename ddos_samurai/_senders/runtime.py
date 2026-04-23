@@ -23,10 +23,6 @@ def resolve_sender_fallback_policy(value) -> str:
     return policy
 
 
-def scapy_getter(*, require_scapy_fn):
-    return require_scapy_fn()
-
-
 def load_httpx():
     try:
         import httpx

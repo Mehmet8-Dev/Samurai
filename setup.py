@@ -671,7 +671,6 @@ def build_setup_kwargs() -> Dict[str, object]:
         "cmdclass": {"build_ext": OptionalBuildExt},
         "python_requires": ">=3.8",
         "install_requires": [
-            "scapy>=2.4.0",
             "numpy>=1.19.0",
             "fastapi>=0.110.0",
             "uvicorn>=0.29.0",

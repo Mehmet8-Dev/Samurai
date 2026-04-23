@@ -290,16 +290,7 @@ def get_default_interface() -> Optional[str]:
         pass
     
     try:
-        # Method 2: Use scapy's get_working_if
-        from scapy.all import get_working_if
-        iface = get_working_if()
-        if iface:
-            return iface
-    except Exception:
-        pass
-    
-    try:
-        # Method 3: Find first non-loopback interface
+        # Method 2: Find first non-loopback interface
         import os
         interfaces = os.listdir('/sys/class/net/')
         for iface in interfaces:

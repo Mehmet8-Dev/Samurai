@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 from .. import utils
 from ..workload_profiles import print_profiles
 from .args import build_parser
@@ -25,8 +23,6 @@ from .validation import (
 
 
 def main(argv=None):
-    logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-
     utils.print_banner()
     _maybe_enable_uvloop()
     parser = build_parser()

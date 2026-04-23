@@ -8,22 +8,6 @@ Features:
     - Stealth and evasion capabilities
     - Real-time metrics and monitoring
 """
-try:
-    from scapy.all import conf
-
-    # Use AF_Packet sockets for sending packets. This can be more stable
-    # in some environments, especially with multiprocessing, compared to
-    # the default libpcap.
-    conf.use_pcap = False
-    try:
-        conf.L3socket = conf.L3socket or conf.L3altsocket
-        conf.L2socket = conf.L2socket or conf.L2altsocket
-    except Exception:
-        pass
-except Exception:
-    # Scapy may fail to initialize in restricted/sandboxed environments.
-    conf = None
-
 __version__ = "2.1.1"
 __codename__ = "Kenjaku"
 __author__ = "Mehmet Okur"

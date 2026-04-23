@@ -9,10 +9,10 @@ import json
 
 from datetime import datetime
 
-from ddos_samurai import packet
 from ddos_samurai import senders
 from ddos_samurai import stealth
 from ddos_samurai import cpu_packet_engine
+from ddos_samurai import cpu_packet_engine as packet
 from ddos_samurai import dataplane
 from ddos_samurai.stateful_runtime import evaluate_hot_path_contract
 from ddos_samurai.topology_native import compiled_topology_plan_from_dict, topology_tuple_for_index
@@ -26,6 +26,19 @@ from ddos_samurai.pacing import (
 log_info = utils.log_info
 log_error = utils.log_error
 log_warning = utils.log_warning
+
+
+def _read_iface_mac_bytes(iface: str | None) -> bytes:
+    if not iface:
+        return b"\x00\x00\x00\x00\x00\x00"
+    try:
+        with open(f"/sys/class/net/{iface}/address", "r", encoding="utf-8") as f:
+            mac = f.read().strip().replace(":", "").replace("-", "")
+        if len(mac) != 12:
+            return b"\x00\x00\x00\x00\x00\x00"
+        return bytes.fromhex(mac)
+    except Exception:
+        return b"\x00\x00\x00\x00\x00\x00"
 
 
 # Map CLI string values → enum values
@@ -2292,13 +2305,7 @@ async def worker_process(
                         else:
                             dst_mac_bytes = gw_mac_bytes
 
-                        from scapy.all import get_if_hwaddr
-                        try:
-                            src_mac_str = get_if_hwaddr(iface)
-                            clean_src_mac = src_mac_str.strip().replace(':', '').replace('-', '').replace(' ', '')
-                            src_mac_bytes = bytes.fromhex(clean_src_mac)
-                        except:
-                            src_mac_bytes = b'\x00\x00\x00\x00\x00\x00'
+                        src_mac_bytes = _read_iface_mac_bytes(iface)
                             
                         eth_type = b'\x08\x00'
                         t_bytes = dst_mac_bytes + src_mac_bytes + eth_type + full_bytes
@@ -3050,13 +3057,7 @@ async def worker_process(
                         else:
                             dst_mac_bytes = gw_mac_bytes
 
-                        from scapy.all import get_if_hwaddr
-                        try:
-                            src_mac_str = get_if_hwaddr(iface)
-                            clean_src_mac = src_mac_str.strip().replace(':', '').replace('-', '').replace(' ', '')
-                            src_mac_bytes = bytes.fromhex(clean_src_mac)
-                        except Exception:
-                            src_mac_bytes = b'\x00\x00\x00\x00\x00\x00'
+                        src_mac_bytes = _read_iface_mac_bytes(iface)
 
                         eth_type = b'\x08\x00'
                         ether_header = dst_mac_bytes + src_mac_bytes + eth_type

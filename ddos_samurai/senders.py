@@ -8,15 +8,14 @@ if TYPE_CHECKING:
     from .gpu_payload import H2RequestPlan
 
 from . import utils
-from . import packet as packet_utils
 from . import cpu_packet_engine
+from . import cpu_packet_engine as packet_utils
 from .l7 import telemetry as l7_telemetry
 from .l7_emu import compile_l7_profile as _compile_l7_profile
 from .l7_emu import load_l7_profile_file, run_l7_profile as _run_l7_profile
 from .l7_emu.types import RuntimeConfig
 from .l7_emu import runtime as _l7_runtime
 from .stateful_runtime import open_session as open_stateful_runtime_session
-from .scapy_support import ScapyUnavailableError, require_scapy
 
 log_info = utils.log_info
 log_error = utils.log_error
@@ -36,7 +35,6 @@ from ._senders.context import close_sender_context as close_sender_context
 
 _resolve_sender_backend = _sender_runtime.resolve_sender_backend
 _resolve_sender_fallback_policy = _sender_runtime.resolve_sender_fallback_policy
-_scapy = lambda: _sender_runtime.scapy_getter(require_scapy_fn=require_scapy)
 
 _stats = _sender_stats_core._stats
 _normalize_l7_output = _sender_stats_core._normalize_l7_output
@@ -609,8 +607,6 @@ async def send_packet_async(packet, verbose, packet_no, loop, protocol):
         packet_no,
         loop,
         protocol,
-        scapy_getter=_scapy,
-        ScapyUnavailableError=ScapyUnavailableError,
     )
 
 async def packet_sender(packet_config, count, delay=0.0, rps=0.0, jitter=0.0, ramp=0.0, verbose=False, live_sent=None, live_errors=None, live_progress=None):
@@ -627,13 +623,11 @@ async def packet_sender(packet_config, count, delay=0.0, rps=0.0, jitter=0.0, ra
         live_sent=live_sent,
         live_errors=live_errors,
         live_progress=live_progress,
-        scapy_getter=_scapy,
         stats_fn=_stats,
         update_live_fn=_update_live,
         log_error=log_error,
         cpu_packet_engine=cpu_packet_engine,
         packet_utils=packet_utils,
-        ScapyUnavailableError=ScapyUnavailableError,
     )
 
 FAST_SENDER_AVAILABLE, fast_sender = _sender_runtime.load_fast_sender(package=__package__)
@@ -672,7 +666,6 @@ def get_gateway_info(target_ip):
         target_ip,
         gateway_cache=_GATEWAY_CACHE,
         gateway_cache_ttl_sec=float(_GATEWAY_CACHE_TTL_SEC),
-        scapy_getter=_scapy,
         log_info=log_info,
         log_error=log_error,
     )

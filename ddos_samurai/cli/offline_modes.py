@@ -7,7 +7,8 @@ import os
 import time
 from datetime import datetime, timezone
 
-from .. import metrics, packet, reporting, selftest, utils
+from .. import cpu_packet_engine as packet
+from .. import metrics, reporting, selftest, utils
 from .reporting import publish_metrics_prom_to_textfile
 
 
@@ -230,7 +231,7 @@ def handle_dry_run(args, parser, report_ctx: dict) -> int:
         utils.log_info(f"Örnek paket üretildi: {len(pkt_bytes)} bayt. (attack_vector={args.attack_vector})")
     except Exception as e:
         warnings.append(f"sample_packet_unavailable: {type(e).__name__}: {e}")
-        utils.log_warning(f"Dry-run: örnek paket üretilemedi (scapy/ortam kısıtı olabilir): {e}")
+        utils.log_warning(f"Dry-run: örnek paket üretilemedi (ortam/izin kısıtı olabilir): {e}")
         if not report_ctx["want_report"]:
             raise
 

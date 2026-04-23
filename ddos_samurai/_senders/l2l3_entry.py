@@ -1,5 +1,45 @@
 import time
+import subprocess
 from typing import Any, Dict
+
+
+def _parse_route_probe(target_ip: str) -> tuple[str | None, str | None]:
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "get", str(target_ip)],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        ).strip()
+    except Exception:
+        return None, None
+    if not out:
+        return None, None
+    parts = out.split()
+    iface = None
+    gw_ip = None
+    for idx, token in enumerate(parts):
+        if token == "dev" and idx + 1 < len(parts):
+            iface = parts[idx + 1]
+        if token == "via" and idx + 1 < len(parts):
+            gw_ip = parts[idx + 1]
+    return iface, gw_ip
+
+
+def _read_arp_mac(ip_addr: str | None) -> str | None:
+    if not ip_addr:
+        return None
+    try:
+        with open("/proc/net/arp", "r", encoding="utf-8") as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 6 and parts[0] == ip_addr:
+                    mac = parts[3].strip().lower()
+                    if mac and mac != "00:00:00:00:00:00":
+                        return mac
+    except Exception:
+        return None
+    return None
 
 
 def get_gateway_info(
@@ -7,7 +47,6 @@ def get_gateway_info(
     *,
     gateway_cache: Dict[str, Any],
     gateway_cache_ttl_sec: float,
-    scapy_getter,
     log_info,
     log_error,
 ):
@@ -18,34 +57,10 @@ def get_gateway_info(
         if (time.monotonic() - ts) <= gateway_cache_ttl_sec:
             return iface, mac_bytes
     try:
-        scapy = scapy_getter()
-        conf = scapy.conf
-        getmacbyip = scapy.getmacbyip
-        # conf.route.route(target_ip) returns (iface, gw_ip, src_ip)
-        res = conf.route.route(target_ip)
-        iface = res[0]
-        gw_ip = res[1]
-
-        # Resolve gateway MAC
-        mac_str = getmacbyip(gw_ip)
-
-        if not mac_str:
-            # Fallback: /proc/net/arp
-            try:
-                with open("/proc/net/arp", "r") as f:
-                    for line in f.readlines()[1:]:
-                        parts = line.split()
-                        if len(parts) >= 4 and parts[0] == gw_ip:
-                            mac_str = parts[3]
-                            if mac_str != "00:00:00:00:00:00":
-                                break
-                            mac_str = None
-            except Exception:
-                pass
-
-        if not mac_str:
-            # Fallback: local network target MAC
-            mac_str = getmacbyip(target_ip)
+        iface, gw_ip = _parse_route_probe(str(target_ip))
+        if not gw_ip:
+            gw_ip = str(target_ip)
+        mac_str = _read_arp_mac(gw_ip) or _read_arp_mac(str(target_ip))
 
         if not mac_str:
             log_error(f"Could not resolve MAC for gateway {gw_ip} or target {target_ip}")
@@ -56,7 +71,6 @@ def get_gateway_info(
         gateway_cache[target_ip] = (time.monotonic(), iface, mac_bytes)
         return iface, mac_bytes
     except Exception as e:
-        # ScapyUnavailableError and generic failures are handled uniformly here.
         log_error(f"get_gateway_info error: {e}")
         return None, None
 

@@ -1,5 +1,4 @@
 # Core Network & Transport
-scapy
 uvloop
 aiohttp
 websockets

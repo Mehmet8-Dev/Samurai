@@ -3,6 +3,20 @@ import logging
 import random
 import socket
 import traceback
+from typing import Optional
+
+
+def _extract_ipv4_dst(packet_bytes: bytes) -> Optional[str]:
+    if len(packet_bytes) >= 34 and ((packet_bytes[14] >> 4) & 0xF) == 4:
+        off = 14
+    elif len(packet_bytes) >= 20 and ((packet_bytes[0] >> 4) & 0xF) == 4:
+        off = 0
+    else:
+        return None
+    dst = packet_bytes[off + 16 : off + 20]
+    if len(dst) != 4:
+        return None
+    return ".".join(str(int(b)) for b in dst)
 
 
 async def send_packet_async(
@@ -12,25 +26,22 @@ async def send_packet_async(
     loop,
     protocol,
     *,
-    scapy_getter,
-    ScapyUnavailableError,
+    scapy_getter=None,
+    ScapyUnavailableError=None,
 ):
-    """Asynchronously send a packet using scapy in a thread executor."""
-    del protocol
+    """Asynchronously send a raw IPv4 packet via raw socket."""
+    del protocol, scapy_getter, ScapyUnavailableError
 
     def send_pkt(pkt):
         try:
-            scapy = scapy_getter()
-            iface = scapy.get_working_if()
-            if pkt.haslayer("Ether"):
-                scapy.sendp(pkt, iface=iface, realtime=True, verbose=False, return_packets=False)
-            else:
-                # L3 send should rely on OS routing, specifying iface can cause ARP issues
-                scapy.send(pkt, realtime=True, verbose=False, return_packets=False)
+            raw = bytes(pkt)
+            target_ip = _extract_ipv4_dst(raw)
+            if not target_ip:
+                return False
+            with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as sock:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+                sock.sendto(raw, (target_ip, 0))
             return True
-        except ScapyUnavailableError:
-            logging.error("Scapy is unavailable; cannot send packets in CPU/Scapy mode.")
-            return False
         except Exception:
             logging.error(f"Packet send error for packet {packet_no}:\n{traceback.format_exc()}")
             return False
@@ -57,26 +68,26 @@ async def packet_sender(
     live_errors=None,
     live_progress=None,
     *,
-    scapy_getter,
+    scapy_getter=None,
     stats_fn,
     update_live_fn,
     log_error,
     cpu_packet_engine,
     packet_utils,
-    ScapyUnavailableError,
+    ScapyUnavailableError=None,
 ):
     """
     Sends packets based on the provided configuration.
     Uses the zero-dependency CPU Packet Engine for fast packet generation,
-    then sends via raw socket. Falls back to Scapy only if the engine fails.
+    then sends via raw socket.
     """
-    del ramp
+    del ramp, scapy_getter, ScapyUnavailableError
     loop = asyncio.get_running_loop()
     sent_ok = 0
     send_err = 0
     packet_no = 0
 
-    # Build a cpu_packet_engine.PacketConfig from the Scapy-compat config
+    # Build a cpu_packet_engine.PacketConfig from the caller config
     try:
         spoof_opts = None
         if hasattr(packet_config, "spoof_opts") and packet_config.spoof_opts:
@@ -108,7 +119,7 @@ async def packet_sender(
         )
         use_cpu_engine = True
     except Exception as e:
-        log_error(f"CPU Packet Engine config failed, falling back to Scapy: {e}")
+        log_error(f"CPU Packet Engine config failed: {e}")
         use_cpu_engine = False
 
     if use_cpu_engine:
@@ -226,77 +237,6 @@ async def packet_sender(
             bytes_sent_est=sent_ok * len(pkt_bytes) if count > 0 else 0,
         )
 
-    # Scapy fallback path
-    try:
-        scapy = scapy_getter()
-    except ScapyUnavailableError:
-        log_error("Both CPU Engine and Scapy unavailable; packet_sender cannot run.")
-        return stats_fn(attempted=count, sent=0, errors=count)
-
-    tasks = []
-    MAX_INFLIGHT_TASKS = 1024
-
-    async def _flush():
-        nonlocal sent_ok, send_err
-        if not tasks:
-            return
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        tasks.clear()
-        batch_sent = sum(1 for r in results if r is True)
-        batch_err = len(results) - batch_sent
-        sent_ok += batch_sent
-        send_err += batch_err
-        update_live_fn(live_sent, batch_sent)
-        update_live_fn(live_errors, batch_err)
-
-    for i in range(count):
-        pkt = packet_utils.create_packet(packet_config)
-        pkts_to_send = [pkt]
-
-        if getattr(packet_config, "fragment_enabled", False):
-            frag_size = int(getattr(packet_config, "fragment_size", 800) or 800)
-            frag_size = max(8, frag_size)
-            try:
-                pkts_to_send = scapy.fragment(pkt, fragsize=frag_size)
-            except Exception:
-                pkts_to_send = [pkt]
-
-        for p in pkts_to_send:
-            packet_no += 1
-            update_live_fn(live_progress, 1)
-            tasks.append(
-                loop.create_task(
-                    send_packet_async(
-                        p,
-                        verbose,
-                        packet_no,
-                        loop,
-                        packet_config.protocol,
-                        scapy_getter=scapy_getter,
-                        ScapyUnavailableError=ScapyUnavailableError,
-                    )
-                )
-            )
-            if len(tasks) >= MAX_INFLIGHT_TASKS:
-                await _flush()
-
-        base_delay = 0.0
-        if rps and rps > 0:
-            base_delay = 1.0 / float(rps)
-        elif delay and delay > 0:
-            base_delay = float(delay)
-
-        if base_delay > 0:
-            if jitter and jitter > 0:
-                j = base_delay * float(jitter)
-                await asyncio.sleep(max(0.0, base_delay + random.uniform(-j, j)))
-            else:
-                await asyncio.sleep(base_delay)
-
-    if tasks:
-        await _flush()
-    return stats_fn(
-        attempted=packet_no,
-        sent=sent_ok,
-        errors=max(0, packet_no - sent_ok) if send_err <= 0 else send_err,
-    )
+    # No Scapy fallback path anymore.
+    del packet_utils
+    return stats_fn(attempted=count, sent=0, errors=count)

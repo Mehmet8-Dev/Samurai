@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--os-fingerprint", action="store_true", help="Enable OS fingerprint randomization for packets.")
     parser.add_argument("--pad", type=int, default=0, help="Minimum paket boyutu (bayt).")
     parser.add_argument("--ninja-mode", action="store_true", help="Enable WAF Bypass (Ninja Mode) using Headless Browser.")
-    parser.add_argument("--fragment", action="store_true", help="IP fragmentasyonunu etkinleştir (Scapy/CPU yolu).")
+    parser.add_argument("--fragment", action="store_true", help="IP fragmentasyonunu etkinleştir (CPU native yol).")
     parser.add_argument("--fragment-size", type=int, default=800, help="Fragment boyutu (bayt). (Varsayılan: 800)")
 
     # NOTE: Keep this list aligned with ddos_samurai.orchestrator + ddos_samurai.senders.

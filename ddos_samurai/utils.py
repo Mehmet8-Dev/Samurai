@@ -601,35 +601,45 @@ def validate_target_safety(
     return False, "Public hedefler varsayılan olarak engellenir. (--allow-public-target ile override)"
 def get_gateway_mac(target_ip=None):
     """
-    P2 FIX #19: Resolves the gateway MAC address for the target.
-    Uses scapy for ARP resolution.
+    Resolve gateway/target MAC using route + ARP cache.
     """
     try:
-        # Import scapy components inside the try to allow graceful fallback if unavailable
-        from scapy.all import ARP, Ether, srp
         import subprocess
 
-        # 1. Get default gateway IP if not provided
+        # 1. Determine gateway IP from route table
         if not target_ip:
-            # Simple way to get gateway IP (may need refinement on non-linux systems)
             cmd = "ip route show default | awk '/default/ {print $3}'"
             gateway_ip = subprocess.check_output(cmd, shell=True).decode().strip()
         else:
-            gateway_ip = target_ip  # If we want to resolve a specific IP's MAC
+            try:
+                route = subprocess.check_output(
+                    ["ip", "route", "get", str(target_ip)],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=2,
+                ).strip()
+                parts = route.split()
+                gateway_ip = str(target_ip)
+                for idx, tok in enumerate(parts):
+                    if tok == "via" and idx + 1 < len(parts):
+                        gateway_ip = parts[idx + 1]
+                        break
+            except Exception:
+                gateway_ip = str(target_ip)
 
         if not gateway_ip:
             log_warning("Gateway IP bulunamadı, broadcast MAC kullanılacak.")
             return "ff:ff:ff:ff:ff:ff"
 
-        # 2. ARP Request
-        log_info(f"Gateway MAC çözülüyor: {gateway_ip}...")
-        ans, _unans = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=gateway_ip), timeout=2, verbose=False)
-
-        for _snd, rcv in ans:
-            # rcv may expose .src or require sprintf depending on scapy version
-            mac = getattr(rcv, "src", None) or rcv.sprintf(r"%Ether.src%")
-            log_info(f"Gateway MAC bulundu: {mac}")
-            return mac
+        # 2. Read ARP cache entry
+        with open("/proc/net/arp", "r", encoding="utf-8") as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] == gateway_ip:
+                    mac = parts[3].strip().lower()
+                    if mac and mac != "00:00:00:00:00:00":
+                        log_info(f"Gateway MAC bulundu: {mac}")
+                        return mac
 
         log_warning("ARP yanıtı alınamadı, broadcast MAC kullanılacak.")
         return "ff:ff:ff:ff:ff:ff"

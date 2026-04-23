@@ -1,7 +1,7 @@
 import asyncio
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from ddos_samurai.packet import PacketConfig, SpoofingOptions, create_packet, get_spoofed_ip
 from ddos_samurai.scapy_support import is_scapy_available
@@ -15,35 +15,16 @@ class _DummyPacket:
         return bool(self._has_ether and name == "Ether")
 
 
-class _FakeScapy:
-    def __init__(self, *, fail_send: bool = False):
-        self._fail_send = bool(fail_send)
-        self.sendp = Mock(side_effect=self._maybe_fail)
-        self.send = Mock(side_effect=self._maybe_fail)
-
-    def _maybe_fail(self, *args, **kwargs):
-        if self._fail_send:
-            raise Exception("Mocked send error")
-        return None
-
-    def get_working_if(self):
-        return "lo"
-
-
 class TestSendPacketAsync(unittest.IsolatedAsyncioTestCase):
     async def test_send_packet_async_error_handling(self):
-        """send_packet_async should return False when scapy send raises."""
+        """send_packet_async should return False when packet bytes are invalid."""
         from ddos_samurai.senders import send_packet_async
 
-        fake = _FakeScapy(fail_send=True)
         pkt = _DummyPacket(has_ether=True)
-
-        with patch("ddos_samurai.senders._scapy", return_value=fake):
-            loop = asyncio.get_running_loop()
-            ok = await send_packet_async(pkt, verbose=True, packet_no=1, loop=loop, protocol="udp")
+        loop = asyncio.get_running_loop()
+        ok = await send_packet_async(pkt, verbose=True, packet_no=1, loop=loop, protocol="udp")
 
         self.assertFalse(ok)
-        fake.sendp.assert_called_once()
 
 
 class TestSpoofedIp(unittest.TestCase):
@@ -110,4 +91,3 @@ class TestPacketCreationWithScapy(unittest.TestCase):
         self.assertTrue(pkt.haslayer(IP))
         self.assertEqual(pkt[IP].src, "10.20.30.40")
         self.assertEqual(pkt[IP].dst, "1.2.3.4")
-
