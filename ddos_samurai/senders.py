@@ -5,7 +5,7 @@ import time
 from typing import TYPE_CHECKING, Any, Dict
 
 if TYPE_CHECKING:
-    from .gpu_payload import H2RequestPlan
+    from .gpu_cuda_payload import H2RequestPlan
 
 from . import utils
 from . import cpu_packet_engine

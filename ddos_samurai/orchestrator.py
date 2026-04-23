@@ -1982,7 +1982,7 @@ async def worker_process(
                     await asyncio.sleep(0)
                 return
 
-            # Legacy gpu_payload fused HTTP yolu kaldırıldı.
+            # Legacy fused GPU HTTP yolu kaldırıldı.
             if args['attack_vector'] == 'http':
                 verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
                 worker_stats = _add_stats(worker_stats, await senders.http_app_sender(
