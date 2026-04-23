@@ -125,7 +125,7 @@ def compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int) -> Dic
 
 
 @dataclass(frozen=True)
-class _CompatPlanItem:
+class H2RequestPlanItem:
     method: str
     path: str
     user_agent: Optional[str] = None
@@ -135,18 +135,11 @@ class _CompatPlanItem:
 
 
 @dataclass(frozen=True)
-class _CompatPlan:
-    items: List[_CompatPlanItem]
+class H2RequestPlan:
+    items: List[H2RequestPlanItem]
 
 
-def plan_batch_to_h2_request_plan(plan_batch: Dict[str, Any]) -> Any:
-    try:
-        from ddos_samurai.gpu_payload import H2RequestPlan as _Plan
-        from ddos_samurai.gpu_payload import H2RequestPlanItem as _PlanItem
-    except Exception:  # pragma: no cover - fallback when GPU deps are unavailable
-        _Plan = _CompatPlan
-        _PlanItem = _CompatPlanItem
-
+def plan_batch_to_h2_request_plan(plan_batch: Dict[str, Any]) -> H2RequestPlan:
     metadata = dict(plan_batch.get("metadata") or {})
     methods = list(metadata.get("methods") or ["GET"])
     paths = list(metadata.get("paths") or ["/"])
@@ -185,24 +178,18 @@ def plan_batch_to_h2_request_plan(plan_batch: Dict[str, Any]) -> Any:
             headers["x-gpu-tuple-hash"] = str(int(tuple_hash[i]))
         if i < len(state_op):
             headers["x-gpu-state-op"] = op_names.get(int(state_op[i]), "none")
-        items.append(_PlanItem(method=str(m).upper(), path=str(p), headers=headers))
-    return _Plan(items=items)
+        items.append(H2RequestPlanItem(method=str(m).upper(), path=str(p), headers=headers))
+    return H2RequestPlan(items=items)
 
 
-def build_request_plan_from_session_plan(session_plan: Any) -> Any:
+def build_request_plan_from_session_plan(session_plan: Any) -> H2RequestPlan:
     events = []
     if isinstance(session_plan, dict):
         events = list(session_plan.get("events", []) or [])
     else:
         events = list(getattr(session_plan, "events", []) or [])
 
-    items: List[Any] = []
-    try:
-        from ddos_samurai.gpu_payload import H2RequestPlan as _Plan
-        from ddos_samurai.gpu_payload import H2RequestPlanItem as _PlanItem
-    except Exception:  # pragma: no cover - fallback when optional deps are unavailable
-        _Plan = _CompatPlan
-        _PlanItem = _CompatPlanItem
+    items: List[H2RequestPlanItem] = []
 
     for ev in events:
         if isinstance(ev, dict):
@@ -225,13 +212,13 @@ def build_request_plan_from_session_plan(session_plan: Any) -> Any:
         if payload_class:
             headers["x-payload-class"] = payload_class
         items.append(
-            _PlanItem(
+            H2RequestPlanItem(
                 method=method if method else "GET",
                 path=path if path else "/",
                 headers=headers,
             )
         )
-    return _Plan(items=items)
+    return H2RequestPlan(items=items)
 
 
 def _run_coro_sync(coro):

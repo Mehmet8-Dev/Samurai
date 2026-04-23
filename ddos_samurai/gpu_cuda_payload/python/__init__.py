@@ -1,4 +1,6 @@
 from .facade import (
+    H2RequestPlan,
+    H2RequestPlanItem,
     build_request_plan_from_session_plan,
     compile_vector_spec,
     execute_plan_batch,
@@ -8,6 +10,8 @@ from .facade import (
 from .transport import D2HTransferEngine, D2HTransferMetrics
 
 __all__ = [
+    "H2RequestPlan",
+    "H2RequestPlanItem",
     "compile_vector_spec",
     "execute_plan_batch",
     "evaluate_oracle",
