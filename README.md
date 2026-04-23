@@ -39,7 +39,7 @@ Yetkisiz sistemlere trafik gondermek yasa disi olabilir ve tum sorumluluk kullan
 - Sender facade + ic moduller: `ddos_samurai/senders.py`, `ddos_samurai/_senders/*`
 - Stateful runtime + topology: `ddos_samurai/stateful_runtime.py`, `ddos_samurai/topology_native.py`, `ddos_samurai/custom_tcp_dataplane.py`
 - CPU paket yolu: `ddos_samurai/packet.py`, `ddos_samurai/cpu_packet_engine.py`
-- GPU paket/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_payload.py`, `ddos_samurai/anomaly_packet.py`
+- GPU paket/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_cuda_payload/`, `ddos_samurai/anomaly_packet.py`
 - GPU CUDA payload planner: `ddos_samurai/gpu_cuda_payload/`
 - Native CUDA ABI: `ddos_samurai/gpu_packet_cuda.hpp`, `ddos_samurai/gpu_packet_cuda/*`, `ddos_samurai/libgpu_packet_cuda.so`
 - C hizlandirma: `ddos_samurai/fast_sender.c`, `ddos_samurai/pacing_engine.c`, `ddos_samurai/xdp_sender.c`, `ddos_samurai/dataplane_core.c`
