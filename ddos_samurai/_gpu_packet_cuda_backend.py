@@ -1,8 +1,7 @@
 """CUDA C++ backend bridge for ``ddos_samurai.gpu_packet``.
 
 This module is native-only and routes packet generation exclusively through
-``libgpu_packet_cuda.so``. Python helpers from ``gpu_packet_py_backend`` are
-used only for shared constants, telemetry, and utility surfaces.
+``libgpu_packet_cuda.so``.
 """
 
 from __future__ import annotations
@@ -19,8 +18,18 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+try:
+    import cupy as cp
+except Exception:  # pragma: no cover - depends on runtime
+    cp = None
 
-from . import gpu_packet_py_backend as _support
+
+class GPUPacketError(Exception):
+    pass
+
+
+class GPUMemoryError(GPUPacketError):
+    pass
 
 
 _LIB_PATH = Path(__file__).with_name("libgpu_packet_cuda.so")
@@ -70,6 +79,100 @@ _STREAM_RUNTIME_TELEMETRY: dict[str, int] = {
 }
 _KERNEL_MODE_NAME_TO_CODE = {"batch": 0, "persistent": 1}
 _KERNEL_MODE_CODE_TO_NAME = {0: "batch", 1: "persistent"}
+_PY_POOL_TELEMETRY_LOCK = threading.Lock()
+_PY_POOL_TELEMETRY = {
+    "d2h_copy_count": 0,
+    "d2h_copy_bytes": 0,
+    "pool_hits": 0,
+    "pool_misses": 0,
+}
+
+
+class _SimpleMemoryPool:
+    def get_stats(self) -> dict:
+        return {"total_bytes": 0, "used_bytes": 0, "peak_bytes": 0}
+
+
+class _SimplePinnedHostPool:
+    def __init__(self):
+        self._max_bytes = 0
+        self._slots: dict[str, np.ndarray] = {}
+        self._order: list[str] = []
+        self._total_nbytes = 0
+        self._pool_evictions = 0
+        self._oversize_bypass = 0
+
+    def _evict_until_fit(self, required_bytes: int) -> None:
+        if self._max_bytes <= 0:
+            return
+        while self._order and (self._total_nbytes + int(required_bytes)) > self._max_bytes:
+            victim = self._order.pop(0)
+            arr = self._slots.pop(victim, None)
+            if arr is not None:
+                self._total_nbytes = max(0, self._total_nbytes - int(getattr(arr, "nbytes", 0)))
+                self._pool_evictions += 1
+
+    def acquire(self, size: int, dtype=np.uint8, key: str | None = None):
+        req = max(0, int(size))
+        cache_key = str(key) if key is not None else None
+        dtype = np.dtype(dtype)
+        req_bytes = int(req) * int(dtype.itemsize)
+
+        if self._max_bytes > 0 and req_bytes > self._max_bytes:
+            self._oversize_bypass += 1
+            with _PY_POOL_TELEMETRY_LOCK:
+                _PY_POOL_TELEMETRY["pool_misses"] = int(_PY_POOL_TELEMETRY["pool_misses"]) + 1
+            return np.empty((req,), dtype=dtype)
+
+        if cache_key is not None and cache_key in self._slots:
+            arr = self._slots[cache_key]
+            if int(arr.size) >= req and arr.dtype == dtype:
+                with _PY_POOL_TELEMETRY_LOCK:
+                    _PY_POOL_TELEMETRY["pool_hits"] = int(_PY_POOL_TELEMETRY["pool_hits"]) + 1
+                if cache_key in self._order:
+                    self._order.remove(cache_key)
+                self._order.append(cache_key)
+                return arr
+
+        with _PY_POOL_TELEMETRY_LOCK:
+            _PY_POOL_TELEMETRY["pool_misses"] = int(_PY_POOL_TELEMETRY["pool_misses"]) + 1
+        self._evict_until_fit(req_bytes)
+        arr = np.empty((req,), dtype=dtype)
+        if cache_key is not None:
+            if cache_key in self._slots:
+                prev = self._slots.pop(cache_key)
+                self._total_nbytes = max(0, self._total_nbytes - int(getattr(prev, "nbytes", 0)))
+                if cache_key in self._order:
+                    self._order.remove(cache_key)
+            self._slots[cache_key] = arr
+            self._order.append(cache_key)
+            self._total_nbytes += int(arr.nbytes)
+            self._evict_until_fit(0)
+        return arr
+
+    def configure(self, max_bytes: int | None = None):
+        self._max_bytes = int(max_bytes or 0)
+        self._evict_until_fit(0)
+
+    def clear(self):
+        self._slots.clear()
+        self._order.clear()
+        self._total_nbytes = 0
+
+    def get_stats(self) -> dict:
+        with _PY_POOL_TELEMETRY_LOCK:
+            return {
+                "max_bytes": int(self._max_bytes),
+                "total_nbytes": int(self._total_nbytes),
+                "pool_evictions": int(self._pool_evictions),
+                "oversize_bypass": int(self._oversize_bypass),
+                "pool_hits": int(_PY_POOL_TELEMETRY.get("pool_hits", 0) or 0),
+                "pool_misses": int(_PY_POOL_TELEMETRY.get("pool_misses", 0) or 0),
+            }
+
+
+_SIMPLE_MEMORY_POOL = _SimpleMemoryPool()
+_SIMPLE_PINNED_POOL = _SimplePinnedHostPool()
 
 
 class _PersistentStatsSnapshot(ctypes.Structure):
@@ -404,10 +507,6 @@ def _load_lib() -> ctypes.CDLL | None:
 
 
 _LIB = _load_lib()
-
-GPUPacketError = _support.GPUPacketError
-GPUMemoryError = _support.GPUMemoryError
-cp = _support.cp
 
 
 def _last_error() -> str:
@@ -1396,7 +1495,7 @@ def generate_icmp_packets(
 
 
 def get_generation_telemetry() -> dict:
-    out = dict(_support.get_generation_telemetry() or {})
+    out = {}
     native = _native_telemetry_snapshot()
     stream_rt = _stream_telemetry_snapshot()
     out.update(native)
@@ -1438,25 +1537,38 @@ def get_generation_telemetry() -> dict:
 
 
 def reset_generation_telemetry() -> None:
-    _support.reset_generation_telemetry()
     _native_telemetry_reset()
     _stream_telemetry_reset()
+    with _PY_POOL_TELEMETRY_LOCK:
+        _PY_POOL_TELEMETRY["d2h_copy_count"] = 0
+        _PY_POOL_TELEMETRY["d2h_copy_bytes"] = 0
+        _PY_POOL_TELEMETRY["pool_hits"] = 0
+        _PY_POOL_TELEMETRY["pool_misses"] = 0
 
 
 def clear_generation_caches() -> None:
-    _support.clear_generation_caches()
+    with _HOST_INPUT_CACHE_LOCK:
+        _HOST_INPUT_CACHE.clear()
 
 
 def get_memory_pool():
-    return _support.get_memory_pool()
+    return _SIMPLE_MEMORY_POOL
 
 
 def get_pinned_host_pool():
-    return _support.get_pinned_host_pool()
+    return _SIMPLE_PINNED_POOL
 
 
 def configure_pinned_host_pool(*args, **kwargs):
-    return _support.configure_pinned_host_pool(*args, **kwargs)
+    max_mb = kwargs.get("max_mb")
+    max_bytes = kwargs.get("max_bytes")
+    if args:
+        max_mb = args[0]
+    if max_bytes is not None:
+        _SIMPLE_PINNED_POOL.configure(int(max_bytes))
+    elif max_mb is not None:
+        _SIMPLE_PINNED_POOL.configure(int(max_mb) * 1024 * 1024)
+    return None
 
 
 def copy_gpu_to_host_pinned(gpu_arr, *args, **kwargs):
@@ -1476,15 +1588,28 @@ def copy_gpu_to_host_pinned(gpu_arr, *args, **kwargs):
         return np.ascontiguousarray(flat)
     if isinstance(gpu_arr, (bytes, bytearray)):
         return gpu_arr
-    return _support.copy_gpu_to_host_pinned(gpu_arr, *args, **kwargs)
+    if cp is not None and isinstance(gpu_arr, cp.ndarray):
+        arr = cp.asnumpy(gpu_arr).reshape(-1).view(np.uint8)
+        with _PY_POOL_TELEMETRY_LOCK:
+            _PY_POOL_TELEMETRY["d2h_copy_count"] = int(_PY_POOL_TELEMETRY["d2h_copy_count"]) + 1
+            _PY_POOL_TELEMETRY["d2h_copy_bytes"] = int(_PY_POOL_TELEMETRY["d2h_copy_bytes"]) + int(arr.nbytes)
+        return arr
+    return np.asarray(gpu_arr, dtype=np.uint8).reshape(-1)
 
 
 def get_pool_telemetry() -> dict:
-    return _support.get_pool_telemetry()
+    with _PY_POOL_TELEMETRY_LOCK:
+        return {
+            "gpu_pool": _SIMPLE_MEMORY_POOL.get_stats(),
+            "pinned_host_pool": _SIMPLE_PINNED_POOL.get_stats(),
+            "d2h_copy_count": int(_PY_POOL_TELEMETRY["d2h_copy_count"]),
+            "d2h_copy_bytes": int(_PY_POOL_TELEMETRY["d2h_copy_bytes"]),
+        }
 
 
 def safe_kernel_launch(*args, **kwargs):
-    return _support.safe_kernel_launch(*args, **kwargs)
+    # Native backend owns kernel launches; this is a no-op compatibility hook.
+    return None
 
 
 def check_gpu_available():
