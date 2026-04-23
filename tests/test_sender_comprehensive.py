@@ -21,14 +21,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from ddos_samurai.packet import create_packet, PacketConfig
 from ddos_samurai import senders as senders_module
-from ddos_samurai.scapy_support import is_scapy_available
 from ddos_samurai.utils import get_gateway_mac, get_local_ip
 
 
 class _ScapyRequiredTestCase(unittest.TestCase):
-    def setUp(self):
-        if not is_scapy_available():
-            self.skipTest("Scapy unavailable; packet creation tests require scapy.")
+    pass
 
 
 class TestFastSenderInitialization(unittest.TestCase):

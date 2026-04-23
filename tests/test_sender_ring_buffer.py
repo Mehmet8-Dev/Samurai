@@ -19,7 +19,6 @@ except Exception:  # pragma: no cover - unittest-only environments
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from ddos_samurai.packet import create_packet, PacketConfig
-from ddos_samurai.scapy_support import is_scapy_available
 
 
 class TestUtilityFunctions(unittest.TestCase):
@@ -67,10 +66,6 @@ class TestEthernetFrameStructure(unittest.TestCase):
     L2 + L3 frame yapısı
     """
     
-    def setUp(self):
-        if not is_scapy_available():
-            self.skipTest("Scapy unavailable; Ethernet frame tests require scapy packet creation.")
-
     def test_ethernet_frame_layout(self):
         """Test 7.1: Ethernet frame layoutı"""
         print("\n" + "="*80)
@@ -211,10 +206,6 @@ class TestPayloadOffsets(unittest.TestCase):
     User data offset, Ethernet, IPv4, TCP positioning
     """
     
-    def setUp(self):
-        if not is_scapy_available():
-            self.skipTest("Scapy unavailable; payload offset tests require scapy packet creation.")
-
     def test_payload_offset_calculation(self):
         """Test 9.1: Payload offset hesaplanması"""
         print("\n" + "="*80)
