@@ -1,10 +1,13 @@
 import asyncio
 import tempfile
 import unittest
-from unittest.mock import patch
 
 from ddos_samurai.packet import PacketConfig, SpoofingOptions, create_packet, get_spoofed_ip
-from ddos_samurai.scapy_support import is_scapy_available
+
+
+def _ip_header(pkt) -> bytes:
+    data = bytes(pkt)
+    return data[14:] if len(data) >= 34 and data[12:14] == b"\x08\x00" else data
 
 
 class _DummyPacket:
@@ -53,41 +56,25 @@ class TestSpoofedIp(unittest.TestCase):
         self.assertIsInstance(list_ip, str)
 
 
-class TestPacketCreationWithScapy(unittest.TestCase):
-    def setUp(self):
-        if not is_scapy_available():
-            self.skipTest("Scapy unavailable; packet creation tests require scapy.")
-
+class TestPacketCreationNative(unittest.TestCase):
     def test_create_basic_udp_packet(self):
-        from scapy.all import IP, UDP
-
         config = PacketConfig(target_ip="1.2.3.4", target_port=80, protocol="udp")
         pkt = create_packet(config)
-
-        self.assertTrue(pkt.haslayer(IP))
-        self.assertTrue(pkt.haslayer(UDP))
-        self.assertEqual(pkt[IP].dst, "1.2.3.4")
-        self.assertEqual(pkt[UDP].dport, 80)
+        ip = _ip_header(pkt)
+        self.assertEqual(ip[0], 0x45)
+        self.assertEqual(ip[9], 17)
+        self.assertEqual(ip[16:20], b"\x01\x02\x03\x04")
+        self.assertEqual(int.from_bytes(ip[22:24], "big"), 80)
 
     def test_create_spoofed_udp_packet(self):
-        from scapy.all import IP
-
-        with patch("ddos_samurai.packet.get_spoofed_ip", return_value="10.20.30.40") as mocked_get_ip:
-            spoof_opts = SpoofingOptions(mode="random")
-            config = PacketConfig(
-                target_ip="1.2.3.4",
-                target_port=80,
-                protocol="udp",
-                spoof=True,
-                spoof_opts=spoof_opts,
-            )
-            pkt = create_packet(config)
-
-        mocked_get_ip.assert_called_once_with(
-            spoof_opts.mode,
-            {"subnet": spoof_opts.subnet, "file_path": spoof_opts.list_file},
+        config = PacketConfig(
+            target_ip="1.2.3.4",
+            target_port=80,
+            protocol="udp",
+            spoof=True,
+            spoof_opts=SpoofingOptions(mode="subnet", subnet="10.20.30.40/32"),
         )
-
-        self.assertTrue(pkt.haslayer(IP))
-        self.assertEqual(pkt[IP].src, "10.20.30.40")
-        self.assertEqual(pkt[IP].dst, "1.2.3.4")
+        pkt = create_packet(config)
+        ip = _ip_header(pkt)
+        self.assertEqual(ip[12:16], b"\x0a\x14\x1e\x28")
+        self.assertEqual(ip[16:20], b"\x01\x02\x03\x04")

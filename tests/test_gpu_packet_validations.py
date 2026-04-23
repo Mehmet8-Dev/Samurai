@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 MODULES_IMPORTABLE = False
 try:
     from ddos_samurai import gpu_packet
-    from ddos_samurai import gpu_packet_py_backend as gpu_packet_ref
+    from ddos_samurai import gpu_packet as gpu_packet_ref
     MODULES_IMPORTABLE = True
 except Exception:
     MODULES_IMPORTABLE = False

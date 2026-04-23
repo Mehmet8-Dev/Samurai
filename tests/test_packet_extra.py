@@ -2,14 +2,9 @@ import tempfile
 import unittest
 
 from ddos_samurai.packet import PacketConfig, SpoofingOptions, _randomize_http_headers, create_packet
-from ddos_samurai.scapy_support import is_scapy_available
 
 
 class TestPacketExtra(unittest.TestCase):
-    def setUp(self):
-        if not is_scapy_available():
-            self.skipTest("Scapy unavailable; packet creation tests require scapy.")
-
     def test_build_tcp_packet_minimal(self):
         cfg = PacketConfig(target_ip="127.0.0.1", target_port=8080)
         pkt = create_packet(cfg)
