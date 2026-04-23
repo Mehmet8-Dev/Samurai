@@ -22,20 +22,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ddos_samurai import packet
 from ddos_samurai import utils
-from ddos_samurai.scapy_support import is_scapy_available
 
-if pytest is not None:
-    SCAPY_REQUIRED = pytest.mark.skipif(
-        not is_scapy_available(),
-        reason="Scapy is unavailable in this environment.",
-    )
-else:
-    SCAPY_REQUIRED = unittest.skipUnless(
-        is_scapy_available(),
-        "Scapy is unavailable in this environment.",
-    )
 
-@SCAPY_REQUIRED
+def _ip_bytes(pkt) -> bytes:
+    data = bytes(pkt)
+    if len(data) >= 34 and data[12:14] == b"\x08\x00":
+        return data[14:]
+    return data
+
+
 class TestPacketCreation:
     """Packet oluşturma testleri"""
     
@@ -49,11 +44,7 @@ class TestPacketCreation:
         )
         pkt = packet.create_packet(cfg)
         
-        # Convert to bytes
-        if pkt.haslayer('Ether'):
-            ip_bytes = bytes(pkt)[14:]
-        else:
-            ip_bytes = bytes(pkt)
+        ip_bytes = _ip_bytes(pkt)
         
         # Validate IP header
         assert len(ip_bytes) >= 20, "Packet too short"
@@ -69,10 +60,7 @@ class TestPacketCreation:
         )
         pkt = packet.create_packet(cfg)
         
-        if pkt.haslayer('Ether'):
-            ip_bytes = bytes(pkt)[14:]
-        else:
-            ip_bytes = bytes(pkt)
+        ip_bytes = _ip_bytes(pkt)
         
         assert ip_bytes[0] == 0x45
         assert ip_bytes[9] == 17, "Protocol should be UDP (17)"
@@ -86,10 +74,7 @@ class TestPacketCreation:
         )
         pkt = packet.create_packet(cfg)
         
-        if pkt.haslayer('Ether'):
-            ip_bytes = bytes(pkt)[14:]
-        else:
-            ip_bytes = bytes(pkt)
+        ip_bytes = _ip_bytes(pkt)
         
         assert ip_bytes[0] == 0x45
         assert ip_bytes[9] == 1, "Protocol should be ICMP (1)"
@@ -104,8 +89,11 @@ class TestPacketCreation:
         )
         pkt = packet.create_packet(cfg)
         
-        # SYN paketlerde Raw layer olmamalı
-        assert not pkt.haslayer("Raw"), "SYN packet should not have payload"
+        # SYN paketlerde payload olmamalı
+        ip_bytes = _ip_bytes(pkt)
+        ihl = (ip_bytes[0] & 0x0F) * 4
+        tcp_data_offset = ((ip_bytes[ihl + 12] >> 4) & 0x0F) * 4
+        assert len(ip_bytes) == ihl + tcp_data_offset, "SYN packet should not have payload"
 
 
 class TestIPSpoofing:
@@ -136,7 +124,6 @@ class TestIPSpoofing:
         assert 0 <= last_octet <= 255
 
 
-@SCAPY_REQUIRED
 class TestTemplateExtraction:
     """Template extraction testleri (orchestrator.py logic)"""
     
@@ -152,10 +139,7 @@ class TestTemplateExtraction:
         
         # Simulate orchestrator.py logic
         full_bytes = bytes(template_pkt)
-        if template_pkt.haslayer('Ether'):
-            t_bytes = full_bytes[14:]
-        else:
-            t_bytes = full_bytes
+        t_bytes = _ip_bytes(template_pkt)
         
         # Validate
         assert len(t_bytes) >= 20
@@ -174,11 +158,7 @@ class TestTemplateExtraction:
             )
             template_pkt = packet.create_packet(cfg)
             
-            full_bytes = bytes(template_pkt)
-            if template_pkt.haslayer('Ether'):
-                t_bytes = full_bytes[14:]
-            else:
-                t_bytes = full_bytes
+            t_bytes = _ip_bytes(template_pkt)
             
             template_pool.append(t_bytes)
         
@@ -188,7 +168,6 @@ class TestTemplateExtraction:
             assert t[0] == 0x45
 
 
-@SCAPY_REQUIRED
 class TestGPUKernelSimulation:
     """GPU kernel simülasyon testleri"""
     
@@ -203,11 +182,7 @@ class TestGPUKernelSimulation:
         )
         template_pkt = packet.create_packet(cfg)
         
-        full_bytes = bytes(template_pkt)
-        if template_pkt.haslayer('Ether'):
-            template = bytearray(full_bytes[14:])
-        else:
-            template = bytearray(full_bytes)
+        template = bytearray(_ip_bytes(template_pkt))
         
         # Simulate GPU kernel copy
         packets_buffer = bytearray(len(template))
@@ -228,11 +203,7 @@ class TestGPUKernelSimulation:
         )
         template_pkt = packet.create_packet(cfg)
         
-        full_bytes = bytes(template_pkt)
-        if template_pkt.haslayer('Ether'):
-            template = bytearray(full_bytes[14:])
-        else:
-            template = bytearray(full_bytes)
+        template = bytearray(_ip_bytes(template_pkt))
         
         # Patch source IP
         new_src_ip = 0x01010102  # 1.1.1.2
@@ -262,7 +233,6 @@ class TestGPUKernelSimulation:
         assert template[12:16] == bytes([0x01, 0x01, 0x01, 0x02])
 
 
-@SCAPY_REQUIRED
 class TestEthernetFrameConstruction:
     """Ethernet frame oluşturma testleri"""
     
@@ -290,10 +260,7 @@ class TestEthernetFrameConstruction:
         )
         pkt = packet.create_packet(cfg)
         
-        if pkt.haslayer('Ether'):
-            ip_bytes = bytes(pkt)[14:]
-        else:
-            ip_bytes = bytes(pkt)
+        ip_bytes = _ip_bytes(pkt)
         
         # Build Ethernet frame
         dest_mac = bytes.fromhex("f42d0617e434")

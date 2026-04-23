@@ -21,7 +21,6 @@ except Exception:  # pragma: no cover - unittest-only environments
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from ddos_samurai.packet import create_packet, PacketConfig
-from ddos_samurai.scapy_support import is_scapy_available
 try:
     from ddos_samurai.gpu_packet import GPUPacketGenerator
 except ImportError:
@@ -38,9 +37,7 @@ def _cuda_available() -> bool:
 
 
 class _ScapyRequiredTestCase(unittest.TestCase):
-    def setUp(self):
-        if not is_scapy_available():
-            self.skipTest("Scapy unavailable; packet creation tests require scapy.")
+    pass
 
 
 class _CudaRequiredTestCase(_ScapyRequiredTestCase):
