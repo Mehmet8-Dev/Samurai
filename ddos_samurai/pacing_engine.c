@@ -327,6 +327,7 @@ typedef struct {
 
 static pacing_stats_t g_stats;
 static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_calib_syscall_overhead_ns = 0;
 static uint64_t g_calib_sleep_overhead_ns = 0;
 
@@ -1364,12 +1365,20 @@ static PyObject *py_paced_send_l3(PyObject *self,
     /* CPU pinning + real-time priority */
     if (pin_cpu >= 0) {
         cpu_set_t cpuset;
+        int rc_affinity;
+        int rc_sched;
         CPU_ZERO(&cpuset);
         CPU_SET(pin_cpu, &cpuset);
-        sched_setaffinity(0, sizeof(cpuset), &cpuset);
+        rc_affinity = sched_setaffinity(0, sizeof(cpuset), &cpuset);
 
         struct sched_param sp = { .sched_priority = 50 };
-        sched_setscheduler(0, SCHED_FIFO, &sp);  /* best-effort */
+        rc_sched = sched_setscheduler(0, SCHED_FIFO, &sp);  /* best-effort */
+        if (rc_affinity != 0) {
+            fprintf(stderr, "[PACING] sched_setaffinity failed for cpu=%d: %s\n", pin_cpu, strerror(errno));
+        }
+        if (rc_sched != 0) {
+            fprintf(stderr, "[PACING] sched_setscheduler(SCHED_FIFO) failed: %s\n", strerror(errno));
+        }
     }
 
     /* raw socket */
@@ -1417,6 +1426,8 @@ static PyObject *py_paced_send_l3(PyObject *self,
     if (pacing_mode == PACING_RPS && target_rps > 0)
         tb_init(&tb, target_rps, (double)(burst_size > 0 ? burst_size : 1));
 
+    pthread_mutex_lock(&g_send_lock);
+
     /* stats reset */
     pthread_mutex_lock(&g_stats_lock);
     stats_reset(stats_target_rps);
@@ -1433,6 +1444,7 @@ static PyObject *py_paced_send_l3(PyObject *self,
     int  total_sent = 0;
     int  burst_ctr  = 0;
     int  burst_limit = burst_size > 0 ? burst_size : 1;
+    int  stats_yield_counter = 0;
 
     Py_BEGIN_ALLOW_THREADS
 
@@ -1538,6 +1550,13 @@ static PyObject *py_paced_send_l3(PyObject *self,
                 stats_record_ipg(actual_ipg, eff_ipg);
             }
             t_last = t_pre;
+            stats_yield_counter++;
+            if (stats_yield_counter >= 256) {
+                pthread_mutex_unlock(&g_stats_lock);
+                sched_yield();
+                pthread_mutex_lock(&g_stats_lock);
+                stats_yield_counter = 0;
+            }
         }
     }
 
@@ -1550,6 +1569,7 @@ static PyObject *py_paced_send_l3(PyObject *self,
 
     close(sockfd);
     PyBuffer_Release(&view);
+    pthread_mutex_unlock(&g_send_lock);
     return PyLong_FromLong(total_sent);
 }
 
@@ -1643,12 +1663,20 @@ static PyObject *py_paced_send_l2(PyObject *self,
     /* CPU pinning */
     if (pin_cpu >= 0) {
         cpu_set_t cpuset;
+        int rc_affinity;
+        int rc_sched;
         CPU_ZERO(&cpuset);
         CPU_SET(pin_cpu, &cpuset);
-        sched_setaffinity(0, sizeof(cpuset), &cpuset);
+        rc_affinity = sched_setaffinity(0, sizeof(cpuset), &cpuset);
 
         struct sched_param sp = { .sched_priority = 50 };
-        sched_setscheduler(0, SCHED_FIFO, &sp);
+        rc_sched = sched_setscheduler(0, SCHED_FIFO, &sp);
+        if (rc_affinity != 0) {
+            fprintf(stderr, "[PACING] sched_setaffinity failed for cpu=%d: %s\n", pin_cpu, strerror(errno));
+        }
+        if (rc_sched != 0) {
+            fprintf(stderr, "[PACING] sched_setscheduler(SCHED_FIFO) failed: %s\n", strerror(errno));
+        }
     }
 
     if (setup_ring(iface, packet_size, (uint8_t *)mac_view.buf) < 0) {
@@ -1670,6 +1698,8 @@ static PyObject *py_paced_send_l2(PyObject *self,
     token_bucket_t tb = {0};
     if (pacing_mode == PACING_RPS && target_rps > 0)
         tb_init(&tb, target_rps, (double)(burst_size > 0 ? burst_size : 1));
+
+    pthread_mutex_lock(&g_send_lock);
 
     pthread_mutex_lock(&g_stats_lock);
     stats_reset(stats_target_rps);
@@ -1700,6 +1730,7 @@ static PyObject *py_paced_send_l2(PyObject *self,
     if (g_ring.hp_runtime.mode == AFPKT_HP_REQUIRED && g_ring.hp_runtime.effective <= 0) {
         PyBuffer_Release(&view);
         PyBuffer_Release(&mac_view);
+        pthread_mutex_unlock(&g_send_lock);
         return PyLong_FromLong(0);
     }
 
@@ -1716,6 +1747,7 @@ static PyObject *py_paced_send_l2(PyObject *self,
     unsigned int frame_nr = ring_frame_nr();
     int spin_limit = g_txring_hp_policy.spin_limit;
     int poll_timeout_base_ms = g_txring_hp_policy.poll_timeout_ms;
+    int stats_yield_counter = 0;
     if (spin_limit < 0) spin_limit = 0;
     if (poll_timeout_base_ms < 0) poll_timeout_base_ms = 0;
 
@@ -1828,6 +1860,13 @@ static PyObject *py_paced_send_l2(PyObject *self,
 
         g_ring.frame_idx =
             (g_ring.frame_idx + 1) % frame_nr;
+        stats_yield_counter++;
+        if (stats_yield_counter >= 256) {
+            pthread_mutex_unlock(&g_stats_lock);
+            sched_yield();
+            pthread_mutex_lock(&g_stats_lock);
+            stats_yield_counter = 0;
+        }
     }
 
     capture_ring_packet_stats();
@@ -1840,6 +1879,7 @@ static PyObject *py_paced_send_l2(PyObject *self,
 
     PyBuffer_Release(&view);
     PyBuffer_Release(&mac_view);
+    pthread_mutex_unlock(&g_send_lock);
     return PyLong_FromLong(total_sent);
 }
 
@@ -1912,11 +1952,19 @@ static PyObject *py_paced_send_xdp(PyObject *self,
 
     if (pin_cpu >= 0) {
         cpu_set_t cpuset;
+        int rc_affinity;
+        int rc_sched;
         CPU_ZERO(&cpuset);
         CPU_SET(pin_cpu, &cpuset);
-        sched_setaffinity(0, sizeof(cpuset), &cpuset);
+        rc_affinity = sched_setaffinity(0, sizeof(cpuset), &cpuset);
         struct sched_param sp = { .sched_priority = 50 };
-        sched_setscheduler(0, SCHED_FIFO, &sp);
+        rc_sched = sched_setscheduler(0, SCHED_FIFO, &sp);
+        if (rc_affinity != 0) {
+            fprintf(stderr, "[PACING] sched_setaffinity failed for cpu=%d: %s\n", pin_cpu, strerror(errno));
+        }
+        if (rc_sched != 0) {
+            fprintf(stderr, "[PACING] sched_setscheduler(SCHED_FIFO) failed: %s\n", strerror(errno));
+        }
     }
 
     uint64_t eff_ipg = 0;
@@ -1938,7 +1986,11 @@ static PyObject *py_paced_send_xdp(PyObject *self,
     xdp_core_open_cfg xcfg;
     xdp_core_err xerr;
     xdp_probe_result xprobe;
+    PyThreadState *saved_tstate = NULL;
     int stats_locked = 0;
+    int allow_no_gil = 0;
+    int loop_error = 0;
+    char loop_error_msg[160];
     int batch_target = 8;
     int batch_min = 1;
     int batch_max = 64;
@@ -1947,10 +1999,13 @@ static PyObject *py_paced_send_xdp(PyObject *self,
     int total_sent = 0;
     int burst_ctr = 0;
     int burst_limit = burst_size > 0 ? burst_size : 1;
+    int stats_yield_counter = 0;
     uint64_t t_start;
     uint64_t t_last;
     uint64_t t_deadline;
     uint64_t t_burst_deadline;
+
+    pthread_mutex_lock(&g_send_lock);
 
     memset(&xcfg, 0, sizeof(xcfg));
     memset(&xerr, 0, sizeof(xerr));
@@ -1989,6 +2044,7 @@ static PyObject *py_paced_send_xdp(PyObject *self,
 
     if (!iface || !iface[0]) {
         PyBuffer_Release(&view);
+        pthread_mutex_unlock(&g_send_lock);
         PyErr_SetString(PyExc_ValueError, "iface is required for paced_send_xdp");
         return NULL;
     }
@@ -2021,8 +2077,14 @@ static PyObject *py_paced_send_xdp(PyObject *self,
         pthread_mutex_unlock(&g_stats_lock);
         stats_locked = 0;
         PyBuffer_Release(&view);
+        pthread_mutex_unlock(&g_send_lock);
         PyErr_SetString(PyExc_RuntimeError, xerr.message[0] ? xerr.message : "xdp_core_open_failed");
         return NULL;
+    }
+
+    allow_no_gil = xdp_core_uses_native_api(xh);
+    if (allow_no_gil) {
+        saved_tstate = PyEval_SaveThread();
     }
 
     pthread_mutex_lock(&g_stats_lock);
@@ -2113,8 +2175,9 @@ static PyObject *py_paced_send_xdp(PyObject *self,
                 "%s",
                 xerr.message[0] ? xerr.message : "xdp_send_failed"
             );
-            PyErr_SetString(PyExc_RuntimeError, xerr.message[0] ? xerr.message : "xdp_send_failed");
-            goto error;
+            (void)snprintf(loop_error_msg, sizeof(loop_error_msg), "%s", xerr.message[0] ? xerr.message : "xdp_send_failed");
+            loop_error = 1;
+            break;
         }
         if (sent <= 0) {
             (void)snprintf(
@@ -2123,8 +2186,9 @@ static PyObject *py_paced_send_xdp(PyObject *self,
                 "%s",
                 "xdp_send_zero_progress"
             );
-            PyErr_SetString(PyExc_RuntimeError, "xdp_send_zero_progress");
-            goto error;
+            (void)snprintf(loop_error_msg, sizeof(loop_error_msg), "%s", "xdp_send_zero_progress");
+            loop_error = 1;
+            break;
         }
 
         total_sent += sent;
@@ -2156,26 +2220,52 @@ static PyObject *py_paced_send_xdp(PyObject *self,
             if (batch_target < batch_min) batch_target = batch_min;
         }
 
+        stats_yield_counter += sent;
+        if (stats_yield_counter >= 256) {
+            pthread_mutex_unlock(&g_stats_lock);
+            sched_yield();
+            pthread_mutex_lock(&g_stats_lock);
+            stats_yield_counter = 0;
+        }
+
         i += sent;
     }
 
     g_stats.elapsed_ns = (double)(time_ns() - t_start);
     stats_finalize();
     pthread_mutex_unlock(&g_stats_lock);
+    stats_locked = 0;
+
+    if (allow_no_gil) {
+        PyEval_RestoreThread(saved_tstate);
+        saved_tstate = NULL;
+    }
+    if (loop_error) {
+        PyErr_SetString(PyExc_RuntimeError, loop_error_msg[0] ? loop_error_msg : "xdp_send_failed");
+        goto error;
+    }
 
     PyBuffer_Release(&view);
     xdp_core_close(xh, NULL);
+    pthread_mutex_unlock(&g_send_lock);
 
     return PyLong_FromLong(total_sent);
 
 error:
-    if (xdp_core_mode_requested(xh) >= 0) {
+    if (allow_no_gil && saved_tstate != NULL) {
+        PyEval_RestoreThread(saved_tstate);
+        saved_tstate = NULL;
+    }
+    if (stats_locked && xdp_core_mode_requested(xh) >= 0) {
         g_stats.elapsed_ns = (double)(time_ns() - t_start);
     }
-    stats_finalize();
-    if (stats_locked) pthread_mutex_unlock(&g_stats_lock);
+    if (stats_locked) {
+        stats_finalize();
+        pthread_mutex_unlock(&g_stats_lock);
+    }
     PyBuffer_Release(&view);
     xdp_core_close(xh, NULL);
+    pthread_mutex_unlock(&g_send_lock);
     return NULL;
 }
 
