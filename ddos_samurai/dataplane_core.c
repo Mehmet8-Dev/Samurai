@@ -1,19 +1,13 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
-#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-#ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0
-#endif
 
 #ifndef IFNAMSIZ
 #define IFNAMSIZ 16
@@ -35,7 +29,6 @@ typedef struct {
     int xdp_effective_mode;
     int xdp_mode2_policy_hard;
     int raw_sockfd;
-    int allow_python_fallback;
     int afpacket_hugepage_size_kb;
     int afpacket_ring_target_mb;
     int afpacket_mlock_ring;
@@ -415,12 +408,6 @@ static void _resolve_auto_backend(DpHandle *h) {
         }
     } else {
         PyErr_Clear();
-    }
-
-    if (h->allow_python_fallback) {
-        (void)snprintf(h->backend, sizeof(h->backend), "%s", "python");
-        (void)snprintf(h->auto_resolve_reason, sizeof(h->auto_resolve_reason), "auto->python");
-        return;
     }
 
     (void)snprintf(h->backend, sizeof(h->backend), "%s", "unavailable");
@@ -1116,179 +1103,6 @@ static PyObject *_run_c_ext_l3_backend(
     return out;
 }
 
-static PyObject *_run_python_backend(
-    DpHandle *h,
-    PyObject *buffer_obj,
-    int packet_size,
-    int count,
-    const char *target_ip,
-    int target_port
-) {
-    Py_buffer view;
-    struct sockaddr_in addr;
-    char reason[96];
-    long sent = 0;
-    long errors;
-    PyObject *out;
-
-    reason[0] = '\0';
-
-    if (_ensure_raw_socket(h, reason, sizeof(reason)) < 0) {
-        return _build_result(
-            count,
-            0,
-            count,
-            packet_size,
-            target_ip,
-            target_port,
-            "DP_PYTHON_SENDTO_FAILED",
-            reason[0] != '\0' ? reason : "raw_socket_unavailable",
-            1
-        );
-    }
-
-    if (target_ip == NULL || target_ip[0] == '\0') {
-        return _build_result(
-            count,
-            0,
-            count,
-            packet_size,
-            target_ip,
-            target_port,
-            "DP_PYTHON_SENDTO_FAILED",
-            "target_ip_missing",
-            1
-        );
-    }
-    if (target_port <= 0 || target_port > 65535) {
-        return _build_result(
-            count,
-            0,
-            count,
-            packet_size,
-            target_ip,
-            target_port,
-            "DP_PYTHON_SENDTO_FAILED",
-            "target_port_invalid",
-            1
-        );
-    }
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)target_port);
-    if (inet_pton(AF_INET, target_ip, &addr.sin_addr) != 1) {
-        return _build_result(
-            count,
-            0,
-            count,
-            packet_size,
-            target_ip,
-            target_port,
-            "DP_PYTHON_SENDTO_FAILED",
-            "target_ip_invalid",
-            1
-        );
-    }
-
-    if (packet_size <= 0) {
-        return _build_result(
-            count,
-            0,
-            count,
-            packet_size,
-            target_ip,
-            target_port,
-            "DP_PYTHON_SENDTO_FAILED",
-            "packet_size_invalid",
-            1
-        );
-    }
-
-    if (PyObject_GetBuffer(buffer_obj, &view, PyBUF_SIMPLE) < 0) {
-        PyErr_Clear();
-        return _build_result(
-            count,
-            0,
-            count,
-            packet_size,
-            target_ip,
-            target_port,
-            "DP_PYTHON_SENDTO_FAILED",
-            "buffer_unavailable",
-            1
-        );
-    }
-
-    if ((size_t)view.len < ((size_t)packet_size * (size_t)count)) {
-        PyBuffer_Release(&view);
-        return _build_result(
-            count,
-            0,
-            count,
-            packet_size,
-            target_ip,
-            target_port,
-            "DP_PYTHON_SENDTO_FAILED",
-            "buffer_too_small",
-            1
-        );
-    }
-
-    for (int i = 0; i < count; i++) {
-        const uint8_t *pkt = (const uint8_t *)view.buf + ((size_t)i * (size_t)packet_size);
-        ssize_t n;
-        for (;;) {
-            n = sendto(
-                h->raw_sockfd,
-                pkt,
-                (size_t)packet_size,
-                MSG_NOSIGNAL,
-                (const struct sockaddr *)&addr,
-                sizeof(addr)
-            );
-            if (n >= 0) {
-                break;
-            }
-            if (errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-        if (n == (ssize_t)packet_size) {
-            sent += 1;
-        }
-    }
-
-    PyBuffer_Release(&view);
-
-    errors = count - sent;
-    if (errors < 0) {
-        errors = 0;
-    }
-
-    out = _build_result(
-        count,
-        sent,
-        errors,
-        packet_size,
-        target_ip,
-        target_port,
-        "DP_PYTHON_SENDTO",
-        (sent > 0 || count == 0) ? "none" : "python_sendto_failed",
-        (sent > 0 || count == 0) ? 0 : 1
-    );
-    if (out == NULL) {
-        return NULL;
-    }
-    if (_set_long(out, "py_sendto_fd", h->raw_sockfd) < 0) {
-        Py_DECREF(out);
-        return NULL;
-    }
-
-    return out;
-}
-
 static void _cleanup_handle(DpHandle *h) {
     PyObject *ret;
 
@@ -1361,7 +1175,6 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
     h->xdp_enable = 0;
     h->xdp_initialized = 0;
     h->raw_sockfd = -1;
-    h->allow_python_fallback = 0;
     h->afpacket_hugepage_size_kb = 2048;
     h->afpacket_ring_target_mb = 64;
     h->afpacket_mlock_ring = 0;
@@ -1386,7 +1199,6 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
         h->queue_id = (int)_dict_long(cfg, "queue_id", 0);
         h->xdp_enable = _dict_bool(cfg, "xdp_enable", 0);
         h->xdp_mode = (int)_dict_long(cfg, "xdp_mode", 0);
-        h->allow_python_fallback = _dict_bool(cfg, "allow_python_fallback", 0);
         _copy_lower(
             h->xdp_mode2_policy,
             sizeof(h->xdp_mode2_policy),
@@ -1413,7 +1225,6 @@ static PyObject *dp_open(PyObject *self, PyObject *args) {
         (void)snprintf(h->fallback_policy, sizeof(h->fallback_policy), "allow");
     }
     if (strcmp(core_mode, "required") == 0) {
-        h->allow_python_fallback = 0;
     }
     if (strcmp(h->xdp_mode2_policy, "hard") != 0 && strcmp(h->xdp_mode2_policy, "soft") != 0) {
         (void)snprintf(h->xdp_mode2_policy, sizeof(h->xdp_mode2_policy), "%s", "soft");
@@ -1488,8 +1299,6 @@ static PyObject *dp_send_batch(PyObject *self, PyObject *args) {
         out = _run_txring_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
     } else if (strcmp(backend, "c_ext_l3") == 0) {
         out = _run_c_ext_l3_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
-    } else if (strcmp(backend, "python") == 0) {
-        out = _run_python_backend(h, buffer_obj, packet_size, count, target_ip, target_port);
     } else if (strcmp(backend, "unavailable") == 0) {
         const char *reason = h->auto_resolve_reason[0] != '\0' ? h->auto_resolve_reason : "auto_no_backend";
         out = _build_result(
