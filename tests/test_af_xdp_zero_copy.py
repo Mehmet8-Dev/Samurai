@@ -10,7 +10,6 @@ class TestAFXDPZeroCopy(unittest.TestCase):
     def _mk_sender(self):
         sender = XDPSender(interface="lo", auto_fallback=True)
         sender._is_running = True
-        sender._use_fallback = False
         return sender
 
     def test_send_udp_prefers_zero_copy_symbol(self):
@@ -55,9 +54,9 @@ class TestAFXDPZeroCopy(unittest.TestCase):
         self.assertTrue(sender.submit_tx_frame(frame_id, 32))
         self.assertTrue(sender.release_tx_frame(frame_id))
 
-    def test_tx_frame_wrappers_fail_in_fallback_mode(self):
+    def test_tx_frame_wrappers_fail_in_multi_context_mode(self):
         sender = self._mk_sender()
-        sender._use_fallback = True
+        sender._ctx_handle = 7
         sender._xdp = Mock()
 
         with self.assertRaises(RuntimeError):

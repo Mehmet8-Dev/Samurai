@@ -10,7 +10,6 @@ Features:
     - Batch packet transmission
     - Real-time statistics and monitoring
     - Integration with existing packet generation (gpu_packet, packet modules)
-    - Fallback to standard senders if XDP is unavailable
 
 Requirements:
     - Linux kernel >= 4.18 (recommended: 5.10+)
@@ -39,7 +38,6 @@ Author: Samurai Team
 import os
 import sys
 import time
-import socket
 import struct
 import logging
 import subprocess
@@ -393,7 +391,7 @@ class XDPSender:
         queue_id: int = DEFAULT_QUEUE_ID,
         mode: int = XDP_MODE_SKB,
         batch_size: int = DEFAULT_BATCH_SIZE,
-        auto_fallback: bool = True,
+        auto_fallback: bool = False,
         mode2_policy: str = "soft",
         attach_bpf: Optional[bool] = None,
         bpf_section: Optional[str] = None,
@@ -408,7 +406,7 @@ class XDPSender:
             queue_id: Queue ID to use (default: 0)
             mode: XDP mode (0=SKB/Copy, 1=Native/Zero-Copy, 2=Offload request)
             batch_size: Batch size for packet transmission
-            auto_fallback: Fall back to raw sockets if XDP unavailable
+            auto_fallback: Deprecated compatibility flag (ignored, fallback removed)
             mode2_policy: mode=2 için davranış:
                 "soft" => unsupported ise mode=1'e düş
                 "hard" => unsupported/unknown ise hata ver
@@ -422,7 +420,9 @@ class XDPSender:
         self.queue_id = queue_id
         self.mode = mode
         self.batch_size = batch_size
-        self.auto_fallback = auto_fallback
+        self.auto_fallback = False
+        if auto_fallback:
+            utils.log_warning("[XDP] auto_fallback ignored: legacy raw-socket fallback removed")
         self.mode2_policy = _normalize_mode2_policy(mode2_policy)
         self.attach_bpf = _env_truthy("SAMURAI_XDP_ATTACH_BPF", True) if attach_bpf is None else bool(attach_bpf)
         self.bpf_section = str(
@@ -434,7 +434,6 @@ class XDPSender:
         
         self._xdp = None
         self._is_running = False
-        self._use_fallback = False
         self._ctx_handle: Optional[int] = None
         if use_multi_ctx is None:
             self._use_multi_ctx = _env_truthy("SAMURAI_XDP_MULTI_CTX", True)
@@ -690,27 +689,19 @@ class XDPSender:
         Start the XDP sender.
         
         Returns:
-            True if successfully started with XDP, False if using fallback
+            True if successfully started with XDP
         """
         with self._lock:
             if self._is_running:
                 utils.log_info("[XDP] Already running")
-                return not self._use_fallback
+                return True
             
             # Check requirements
             ok, msg = self._check_requirements()
             
             if not ok:
                 utils.log_error(f"[XDP] Requirements not met: {msg}")
-                
-                if self.auto_fallback:
-                    utils.log_info("[XDP] Falling back to standard sender")
-                    self._use_fallback = True
-                    self._is_running = True
-                    self._start_time = time.time()
-                    return False
-                else:
-                    raise RuntimeError(f"XDP requirements not met: {msg}")
+                raise RuntimeError(f"XDP requirements not met: {msg}")
             
             # Load and initialize XDP
             self._xdp = _load_xdp_extension()
@@ -772,15 +763,7 @@ class XDPSender:
             except Exception as e:
                 utils.log_error(f"[XDP] Failed to initialize: {e}")
                 self._detach_bpf_program()
-                
-                if self.auto_fallback:
-                    utils.log_info("[XDP] Falling back to standard sender")
-                    self._use_fallback = True
-                    self._is_running = True
-                    self._start_time = time.time()
-                    return False
-                else:
-                    raise
+                raise
     
     def stop(self) -> None:
         """Stop the XDP sender and cleanup resources."""
@@ -788,7 +771,7 @@ class XDPSender:
             if not self._is_running:
                 return
             
-            if not self._use_fallback and self._xdp:
+            if self._xdp:
                 try:
                     stats = None
                     if self._ctx_handle is not None:
@@ -815,7 +798,6 @@ class XDPSender:
                 self._detach_bpf_program()
             
             self._is_running = False
-            self._use_fallback = False
             self._xdp = None
             self._ctx_handle = None
             self._effective_mode = int(self.mode)
@@ -839,9 +821,6 @@ class XDPSender:
         
         if not packets:
             return 0
-        
-        if self._use_fallback:
-            return self._send_fallback(packets)
         
         try:
             if self._ctx_handle is not None:
@@ -869,9 +848,6 @@ class XDPSender:
             raise RuntimeError("XDP sender not started")
         if packet_size <= 0 or count <= 0:
             return 0
-
-        if self._use_fallback:
-            return self._send_buffer_fallback(packet_buffer, packet_size, count)
 
         try:
             if self._ctx_handle is not None:
@@ -907,12 +883,6 @@ class XDPSender:
             raise RuntimeError("XDP sender not started")
         if packet_size <= 0 or stride <= 0 or count <= 0:
             return 0
-
-        if self._use_fallback:
-            # Fallback sender expects materialized packets.
-            mv = memoryview(packet_buffer)
-            packets = [bytes(mv[i * stride:(i * stride) + packet_size]) for i in range(count)]
-            return self._send_fallback(packets)
 
         try:
             if self._ctx_handle is not None:
@@ -954,8 +924,6 @@ class XDPSender:
         """
         if not self._is_running:
             raise RuntimeError("XDP sender not started")
-        if self._use_fallback:
-            raise RuntimeError("UMEM frame API not available in fallback mode")
         if self._ctx_handle is not None:
             raise RuntimeError("UMEM frame API not available in multi-context mode")
         if not hasattr(self._xdp, "xdp_acquire_tx_frame"):
@@ -966,8 +934,6 @@ class XDPSender:
         """Submit a previously acquired TX frame."""
         if not self._is_running:
             raise RuntimeError("XDP sender not started")
-        if self._use_fallback:
-            raise RuntimeError("UMEM frame API not available in fallback mode")
         if self._ctx_handle is not None:
             raise RuntimeError("UMEM frame API not available in multi-context mode")
         if not hasattr(self._xdp, "xdp_submit_tx_frame"):
@@ -978,8 +944,6 @@ class XDPSender:
         """Release a previously acquired TX frame without transmit."""
         if not self._is_running:
             raise RuntimeError("XDP sender not started")
-        if self._use_fallback:
-            raise RuntimeError("UMEM frame API not available in fallback mode")
         if self._ctx_handle is not None:
             raise RuntimeError("UMEM frame API not available in multi-context mode")
         if not hasattr(self._xdp, "xdp_release_tx_frame"):
@@ -1011,8 +975,6 @@ class XDPSender:
         if not payloads:
             return 0
         
-        if self._use_fallback:
-            return self._send_udp_fallback(target_ip, target_port, payloads)
         if self._ctx_handle is not None:
             utils.log_error("[XDP] send_udp is not yet supported in multi-context mode")
             return 0
@@ -1034,111 +996,11 @@ class XDPSender:
             utils.log_error(f"[XDP] Send UDP error: {e}")
             return 0
     
-    def _send_fallback(self, packets: List[bytes]) -> int:
-        """Send packets using standard raw socket (fallback)."""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-            sock.setblocking(False)
-            
-            sent = 0
-            for pkt in packets:
-                try:
-                    # Extract destination from IP header
-                    if len(pkt) >= 20:
-                        dst_ip = socket.inet_ntoa(pkt[16:20])
-                        sock.sendto(pkt, (dst_ip, 0))
-                        sent += 1
-                        self._total_bytes += len(pkt)
-                except Exception:
-                    pass
-            
-            sock.close()
-            self._total_packets += sent
-            return sent
-            
-        except Exception as e:
-            utils.log_error(f"[XDP Fallback] Error: {e}")
-            return 0
-    
-    def _send_udp_fallback(
-        self,
-        target_ip: str,
-        target_port: int,
-        payloads: List[bytes]
-    ) -> int:
-        """Send UDP packets using standard socket (fallback)."""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setblocking(False)
-            
-            sent = 0
-            for payload in payloads:
-                try:
-                    sock.sendto(payload, (target_ip, target_port))
-                    sent += 1
-                    self._total_bytes += len(payload)
-                except Exception:
-                    pass
-            
-            sock.close()
-            self._total_packets += sent
-            return sent
-            
-        except Exception as e:
-            utils.log_error(f"[XDP Fallback] UDP error: {e}")
-            return 0
-
-    def _send_buffer_fallback(self, packet_buffer, packet_size: int, count: int) -> int:
-        """Send contiguous packet buffer using standard raw socket fallback."""
-        try:
-            mv = memoryview(packet_buffer)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-            sock.setblocking(False)
-
-            sent = 0
-            for i in range(count):
-                start = i * packet_size
-                end = start + packet_size
-                pkt = mv[start:end]
-                if len(pkt) < 20:
-                    continue
-                try:
-                    dst_ip = socket.inet_ntoa(pkt[16:20])
-                    sock.sendto(pkt, (dst_ip, 0))
-                    sent += 1
-                    self._total_bytes += len(pkt)
-                except Exception:
-                    pass
-
-            sock.close()
-            self._total_packets += sent
-            return sent
-        except Exception as e:
-            utils.log_error(f"[XDP Fallback] buffer error: {e}")
-            return 0
-    
     def get_stats(self) -> XDPStats:
         """Get current statistics."""
         if not self._is_running:
             return XDPStats()
-        
-        if self._use_fallback:
-            elapsed = time.time() - self._start_time if self._start_time else 0
-            pps = self._total_packets / elapsed if elapsed > 0 else 0
-            mbps = (self._total_bytes * 8) / (elapsed * 1e6) if elapsed > 0 else 0
-            
-            return XDPStats(
-                tx_packets=self._total_packets,
-                tx_bytes=self._total_bytes,
-                elapsed_seconds=elapsed,
-                packets_per_second=pps,
-                mbps=mbps,
-                mode=int(self._effective_mode),
-                mode_name="Fallback (Raw Socket)"
-            )
-        
+
         try:
             if self._ctx_handle is not None:
                 if "xdp_stats_ctx" in dir(self._xdp):
@@ -1161,8 +1023,8 @@ class XDPSender:
     
     @property
     def is_using_xdp(self) -> bool:
-        """Check if using actual XDP (not fallback)."""
-        return self._is_running and not self._use_fallback
+        """Check if sender is actively using XDP."""
+        return self._is_running
     
     def __enter__(self) -> 'XDPSender':
         self.start()
@@ -1173,7 +1035,7 @@ class XDPSender:
     
     def __str__(self) -> str:
         status = "running" if self._is_running else "stopped"
-        mode = "XDP" if not self._use_fallback else "Fallback"
+        mode = "XDP"
         return f"XDPSender(interface={self.interface}, status={status}, mode={mode})"
 
 
@@ -1532,7 +1394,7 @@ class XDPIntegration:
             return None
         
         try:
-            sender = XDPSender(interface=interface, auto_fallback=True)
+            sender = XDPSender(interface=interface, auto_fallback=False)
             return sender
         except Exception as e:
             utils.log_error(f"[XDP] Failed to create sender: {e}")
