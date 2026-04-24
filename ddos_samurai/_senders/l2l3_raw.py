@@ -1,8 +1,6 @@
 import asyncio
-import errno
 import os
 import socket
-import traceback
 from typing import Any, Dict
 
 
@@ -40,8 +38,8 @@ async def raw_socket_sender(
     log_error,
 ):
     """
-    Sends a buffer of pre-created raw packets using a raw socket.
-    Optimized with C extension (fast_sender) or sendmmsg for Linux.
+    Sends a buffer of pre-created raw packets using native senders.
+    Fallback chain: TX_RING (L2) -> C_EXT_L3.
     """
     _resolve_sender_backend = resolve_sender_backend_fn
     _resolve_sender_fallback_policy = resolve_sender_fallback_policy_fn
@@ -57,7 +55,7 @@ async def raw_socket_sender(
     fast_sender = fast_sender_module
 
     if sender_backend is None:
-        requested_backend = "python"
+        requested_backend = "auto"
     else:
         requested_backend = _resolve_sender_backend(sender_backend)
     if bool(xdp_enable) and requested_backend == "auto":
@@ -163,8 +161,6 @@ async def raw_socket_sender(
         return_meta=True,
     )
 
-    sent_total = 0
-    sender_path = "PYTHON_SENDTO"
     fallback_count = 0
     fallback_reasons = []
     permission_error_count = 0
@@ -322,13 +318,10 @@ async def raw_socket_sender(
 
     try_txring = bool(force_l2) or requested_backend in {"auto", "txring"}
     try_c_ext_l3 = requested_backend in {"auto", "txring", "c_ext_l3"}
-    try_python = requested_backend in {"auto", "txring", "c_ext_l3", "python"}
+    try_c_ext_l3 = requested_backend in {"auto", "txring", "c_ext_l3"}
     if not allow_fallback:
         if requested_backend in {"auto", "txring"}:
             try_c_ext_l3 = False
-            try_python = False
-        elif requested_backend == "c_ext_l3":
-            try_python = False
 
     if bool(force_l2) and not FAST_SENDER_AVAILABLE:
         _register_fallback("txring_unavailable")
@@ -547,7 +540,6 @@ async def raw_socket_sender(
                 buffer_reuse_hits=buffer_reuse_hits,
             )
         try_c_ext_l3 = True
-        try_python = True
 
     if FAST_SENDER_AVAILABLE and try_c_ext_l3 and hasattr(fast_sender, "send_optimized"):
         try:
@@ -587,7 +579,7 @@ async def raw_socket_sender(
             return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
         except Exception as e:
             _register_fallback("c_ext_l3_error")
-            log_error(f"Fast Sender failed, falling back to Python: {e}")
+            log_error(f"Fast Sender failed: {e}")
     elif try_c_ext_l3 and requested_backend == "c_ext_l3":
         _register_fallback("c_ext_l3_unavailable")
         if not allow_fallback:
@@ -612,166 +604,28 @@ async def raw_socket_sender(
                 buffer_reuse_hits=buffer_reuse_hits,
             )
 
-    if not try_python:
-        _register_fallback("python_sender_disabled")
-        if owns_socket and s is not None:
-            s.close()
-        _update_live(live_progress, int(count))
-        _update_live(live_errors, int(count))
-        return _stats(
-            attempted=count,
-            sent=0,
-            errors=count,
-            sender_path="PYTHON_DISABLED",
-            permission_error_count=permission_error_count,
-            fallback_count=max(1, fallback_count),
-            sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "python_sender_disabled",
-            sender_backend_requested=requested_backend,
-            sender_fallback_policy=fallback_policy,
-            buffer_copy_count=buffer_copy_count,
-            buffer_copy_bytes=buffer_copy_bytes,
-            eagain_retry_count=eagain_retry_count,
-            partial_send_retry_count=partial_send_retry_count,
-            buffer_reuse_hits=buffer_reuse_hits,
-        )
-
-    try:
-        log_info(f"Raw socket sender (Python L3) active. Sending {count} packets...")
-        mv = memoryview(packets_buffer)
-        BATCH_SIZE = 512
-        address = (target_ip, target_port)
-        total_sent = 0
-
-        if hasattr(s, "sendmmsg"):
-            sender_path = "PYTHON_SENDMMSG"
-            prebuilt_datagrams = None
-            reuse_sendmmsg = str(os.environ.get("SAMURAI_SENDMMSG_REUSE", "1") or "1").strip().lower() not in {
-                "0",
-                "false",
-                "no",
-                "off",
-            }
-            try:
-                max_reuse_count = int(os.environ.get("SAMURAI_SENDMMSG_REUSE_MAX", "131072") or 131072)
-            except Exception:
-                max_reuse_count = 131072
-            if reuse_sendmmsg and 0 < count <= max_reuse_count:
-                try:
-                    packet_views = [mv[(idx * packet_size) : ((idx + 1) * packet_size)] for idx in range(count)]
-                    prebuilt_datagrams = [(pkt_view, []) for pkt_view in packet_views]
-                    buffer_reuse_hits += 1
-                except Exception:
-                    prebuilt_datagrams = None
-
-            for i in range(0, count, BATCH_SIZE):
-                batch_end = min(i + BATCH_SIZE, count)
-                batch_count = batch_end - i
-                if prebuilt_datagrams is not None:
-                    datagrams = prebuilt_datagrams[i:batch_end]
-                else:
-                    datagrams = []
-                    for j in range(batch_count):
-                        idx = i + j
-                        start = idx * packet_size
-                        end = start + packet_size
-                        datagrams.append((mv[start:end], []))
-
-                batch_progress = 0
-                batch_index = 0
-                consecutive_eagain = 0
-                while batch_index < batch_count:
-                    pending = batch_count - batch_index
-                    try:
-                        sent_msgs = s.sendmmsg(datagrams[batch_index:], 0, address)
-                        sent_msgs = int(sent_msgs or 0)
-                        if sent_msgs <= 0:
-                            eagain_retry_count += 1
-                            consecutive_eagain += 1
-                            if consecutive_eagain >= 1024:
-                                _update_live(live_errors, pending)
-                                batch_progress += pending
-                                batch_index = batch_count
-                            continue
-
-                        total_sent += sent_msgs
-                        batch_index += sent_msgs
-                        batch_progress += sent_msgs
-                        _update_live(live_sent, sent_msgs)
-                        consecutive_eagain = 0
-                        if sent_msgs < pending:
-                            partial_send_retry_count += 1
-                    except PermissionError:
-                        permission_error_count += 1
-                        _update_live(live_errors, pending)
-                        batch_progress += pending
-                        batch_index = batch_count
-                    except OSError as exc:
-                        if exc.errno == errno.EINTR:
-                            continue
-                        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                            eagain_retry_count += 1
-                            consecutive_eagain += 1
-                            if consecutive_eagain >= 1024:
-                                _update_live(live_errors, pending)
-                                batch_progress += pending
-                                batch_index = batch_count
-                            continue
-                        _update_live(live_errors, pending)
-                        batch_progress += pending
-                        batch_index = batch_count
-                    except Exception:
-                        _update_live(live_errors, pending)
-                        batch_progress += pending
-                        batch_index = batch_count
-
-                _update_live(live_progress, batch_progress)
-                if verbose and total_sent % 10000 < BATCH_SIZE:
-                    log_info(f"Sent {total_sent}/{count} raw packets (sendmmsg)...")
-        else:
-            sender_path = "PYTHON_SENDTO"
-            for i in range(count):
-                _update_live(live_progress, 1)
-                start = i * packet_size
-                end = start + packet_size
-                try:
-                    s.sendto(mv[start:end], address)
-                    total_sent += 1
-                    _update_live(live_sent, 1)
-                except PermissionError:
-                    permission_error_count += 1
-                    _update_live(live_errors, 1)
-                except Exception:
-                    _update_live(live_errors, 1)
-                if verbose and i % 10000 == 0:
-                    log_info(f"Sent {i}/{count} raw packets...")
-        sent_total = int(total_sent)
-
-    except Exception as e:
-        log_error(f"Error during raw socket sending: {e}")
-        if verbose:
-            traceback.print_exc()
-    finally:
-        if owns_socket and s is not None:
-            s.close()
-        if FAST_SENDER_AVAILABLE and hasattr(fast_sender, "cleanup_ring"):
-            fast_sender.cleanup_ring()
-        log_info(f"Raw socket sender (Python L3) finished sending {count} packets.")
+    if owns_socket and s is not None:
+        s.close()
+    if FAST_SENDER_AVAILABLE and hasattr(fast_sender, "cleanup_ring"):
+        fast_sender.cleanup_ring()
+    _update_live(live_progress, int(count))
+    _update_live(live_errors, int(count))
     out = _stats(
         attempted=count,
-        sent=sent_total,
-        errors=max(0, count - sent_total),
-        bytes_sent_est=sent_total * packet_size,
-        sender_path=sender_path,
+        sent=0,
+        errors=count,
+        bytes_sent_est=0,
+        sender_path="C_EXT_UNAVAILABLE",
         permission_error_count=permission_error_count,
-        fallback_count=fallback_count,
-        sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "none",
+        fallback_count=max(1, int(fallback_count)),
+        sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "c_ext_l3_unavailable",
         sender_backend_requested=requested_backend,
         sender_fallback_policy=fallback_policy,
         buffer_copy_count=buffer_copy_count,
         buffer_copy_bytes=buffer_copy_bytes,
         eagain_retry_count=eagain_retry_count,
         partial_send_retry_count=partial_send_retry_count,
-        buffer_reuse_hits=buffer_reuse_hits,
+        buffer_reuse_hits=0,
         txring_flush_call_count=txring_flush_call_count,
         txring_flush_error_count=txring_flush_error_count,
         txring_flush_eagain_count=txring_flush_eagain_count,
@@ -964,7 +818,7 @@ async def paced_raw_socket_sender(
                     queue_id=int(xdp_queue_id or 0),
                     xdp_mode=int(xdp_mode or 0),
                     sender_fallback_policy=fallback_policy,
-                    fallback_backend="python",
+                    fallback_backend="c_ext_l3",
                     sender_context=sender_context,
                     pacing_config=None,
                     paced_send_xdp_fn=None,
@@ -1034,7 +888,7 @@ async def paced_raw_socket_sender(
                     queue_id=int(xdp_queue_id or 0),
                     xdp_mode=int(xdp_mode or 0),
                     sender_fallback_policy=fallback_policy,
-                    fallback_backend="python",
+                    fallback_backend="c_ext_l3",
                     sender_context=sender_context,
                     pacing_config=None,
                     paced_send_xdp_fn=None,
@@ -1078,7 +932,7 @@ async def paced_raw_socket_sender(
                     queue_id=int(xdp_queue_id or 0),
                     xdp_mode=int(xdp_mode or 0),
                     sender_fallback_policy=fallback_policy,
-                    fallback_backend="python",
+                    fallback_backend="c_ext_l3",
                     sender_context=sender_context,
                     pacing_config=None,
                     paced_send_xdp_fn=None,
@@ -1137,7 +991,7 @@ async def paced_raw_socket_sender(
             queue_id=int(xdp_queue_id or 0),
             xdp_mode=int(xdp_mode or 0),
             sender_fallback_policy=fallback_policy,
-            fallback_backend="python",
+            fallback_backend="c_ext_l3",
             sender_context=sender_context,
             pacing_config=pacing_config if pacing_via_xdp else None,
             paced_send_xdp_fn=paced_send_xdp if pacing_via_xdp else None,
@@ -1311,27 +1165,6 @@ async def paced_raw_socket_sender(
             buffer_copy_bytes=buffer_copy_bytes,
             eagain_retry_count=0,
             partial_send_retry_count=0,
-        )
-
-    if requested_backend == "python":
-        _register_fallback("pacing_bypassed_for_python_backend")
-        return await raw_socket_sender(
-            packets_buffer,
-            target_ip,
-            target_port,
-            count,
-            verbose,
-            live_sent=live_sent,
-            live_errors=live_errors,
-            live_progress=live_progress,
-            force_l2=force_l2,
-            sender_backend="python",
-            sender_fallback_policy=fallback_policy,
-            sender_context=sender_context,
-            xdp_enable=xdp_enable,
-            xdp_interface=xdp_interface,
-            xdp_queue_id=xdp_queue_id,
-            xdp_mode=xdp_mode,
         )
 
     try:

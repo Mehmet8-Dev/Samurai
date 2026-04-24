@@ -86,7 +86,7 @@ async def xdp_sender(
     xdp_mode: int = 0,
     batch_size: int = 64,
     sender_fallback_policy: str = "allow",
-    fallback_backend: str = "python",
+    fallback_backend: str = "c_ext_l3",
     sender_context: Dict[str, Any] | None = None,
     pacing_config=None,
     paced_send_xdp_fn=None,

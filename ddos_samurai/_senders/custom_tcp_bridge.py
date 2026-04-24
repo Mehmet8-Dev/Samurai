@@ -341,7 +341,7 @@ async def flush_custom_tcp_tx_packets(
         queue_id=int(custom_tcp_xdp_queue_id or 0),
         xdp_mode=int(custom_tcp_xdp_mode or 0),
         sender_fallback_policy="fail",
-        fallback_backend="python",
+        fallback_backend="c_ext_l3",
         sender_context=None,
         pacing_config=pacing_config,
         paced_send_xdp_fn=paced_send_xdp_fn if pacing_engine_available else None,
