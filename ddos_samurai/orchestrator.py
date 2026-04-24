@@ -1319,7 +1319,7 @@ async def worker_process(
         if PACING_ENGINE_AVAILABLE:
             log_info(f"[Worker {worker_id}] C pacing engine aktif.")
         else:
-            log_warning(f"[Worker {worker_id}] C pacing engine yok, Python fallback kullanılacak.")
+            log_warning(f"[Worker {worker_id}] C pacing engine yok, unpaced sender yolu kullanılacak.")
 
     try:
         import uvloop
@@ -3398,44 +3398,6 @@ async def worker_process(
                 live_progress=progress
             ))
         else: # This is the CPU path for raw packets
-            spoof_opts = packet.SpoofingOptions(
-                mode=args['spoof_mode'],
-                subnet=args['spoof_subnet'],
-                list_file=args['spoof_list_file']
-            )
-            p_config = packet.PacketConfig(
-                target_ip=args['target'],
-                target_port=args['port'],
-                protocol=args['protocol'],
-                spoof=args['spoof'],
-                spoof_opts=spoof_opts,
-                payload=args['payloads'][0] if args['payloads'] else None,
-                tcp_flags=args['tcp_flags'],
-                ttl=args['ttl'],
-                tos=args['tos'],
-                window=args['window'],
-                fragment_enabled=args.get('fragment', False),
-                fragment_size=args.get('fragment_size', 800),
-                pad_size=args['pad'],
-                attack_vector=args['attack_vector'],
-                dns_name=args['dns_name'],
-                dns_qtype=args['dns_qtype'],
-                dns_edns=args['dns_edns'],
-                dns_recursive=not args['dns_nord']
-            )
-            packet_sender_kwargs = {
-                "packet_config": p_config,
-                "count": args['count'],
-                "delay": args['delay'],
-                "rps": args['rps'],
-                "jitter": args['jitter'],
-                "ramp": args['ramp'],
-                "verbose": args['verbose'],
-                "live_sent": sent_total,
-                "live_errors": errors_total,
-                "live_progress": progress,
-            }
-
             use_cpu_c_pacing = (
                 pacing_cfg.pacing_mode != PacingMode.NONE
                 and PACING_ENGINE_AVAILABLE
@@ -3444,10 +3406,6 @@ async def worker_process(
             use_cpu_direct_sender = (
                 pacing_cfg.pacing_mode == PacingMode.NONE
                 and not bool(args.get("fragment", False))
-                and (
-                    str(args.get("sender_backend", "auto") or "auto").strip().lower() != "auto"
-                    or bool(args.get("xdp_enable", False))
-                )
             )
 
             if use_cpu_c_pacing:
@@ -3512,9 +3470,21 @@ async def worker_process(
                         await asyncio.sleep(0)
                 except Exception as e:
                     log_warning(
-                        f"[Worker {worker_id}] CPU paced sender pool path failed ({e}); packet_sender fallback."
+                        f"[Worker {worker_id}] CPU paced sender pool path failed ({e}); hard-fail."
                     )
-                    worker_stats = _add_stats(worker_stats, await senders.packet_sender(**packet_sender_kwargs))
+                    attempted = int(args.get("count", 0) or 0)
+                    worker_stats = _add_stats(
+                        worker_stats,
+                        {
+                            "attempted": attempted,
+                            "sent": 0,
+                            "errors": attempted,
+                            "bytes_sent_est": 0,
+                            "sender_path": "CPU_PACED_FAILED",
+                            "fallback_count": 1,
+                            "sender_fallback_reason": f"cpu_paced_sender_failed:{type(e).__name__}",
+                        },
+                    )
             elif use_cpu_direct_sender:
                 try:
                     engine_spoof_opts = cpu_packet_engine.SpoofingOptions(
@@ -3565,15 +3535,41 @@ async def worker_process(
                     ))
                 except Exception as e:
                     log_warning(
-                        f"[Worker {worker_id}] Direct sender backend path failed ({e}); packet_sender fallback."
+                        f"[Worker {worker_id}] Direct sender backend path failed ({e}); hard-fail."
                     )
-                    worker_stats = _add_stats(worker_stats, await senders.packet_sender(**packet_sender_kwargs))
+                    attempted = int(args.get("count", 0) or 0)
+                    worker_stats = _add_stats(
+                        worker_stats,
+                        {
+                            "attempted": attempted,
+                            "sent": 0,
+                            "errors": attempted,
+                            "bytes_sent_est": 0,
+                            "sender_path": "CPU_DIRECT_FAILED",
+                            "fallback_count": 1,
+                            "sender_fallback_reason": f"cpu_direct_sender_failed:{type(e).__name__}",
+                        },
+                    )
             else:
+                attempted = int(args.get("count", 0) or 0)
+                reason = "cpu_fragment_unsupported_no_legacy_path"
                 if pacing_cfg.pacing_mode != PacingMode.NONE and bool(args.get("fragment", False)):
-                    log_warning(
-                        f"[Worker {worker_id}] Fragmentation with C pacing not supported on CPU path; packet_sender fallback."
-                    )
-                worker_stats = _add_stats(worker_stats, await senders.packet_sender(**packet_sender_kwargs))
+                    reason = "cpu_fragment_with_pacing_unsupported_no_legacy_path"
+                log_warning(
+                    f"[Worker {worker_id}] CPU sender path unavailable ({reason}); hard-fail."
+                )
+                worker_stats = _add_stats(
+                    worker_stats,
+                    {
+                        "attempted": attempted,
+                        "sent": 0,
+                        "errors": attempted,
+                        "bytes_sent_est": 0,
+                        "sender_path": "CPU_PATH_UNAVAILABLE",
+                        "fallback_count": 1,
+                        "sender_fallback_reason": reason,
+                    },
+                )
     except KeyboardInterrupt:
         worker_status = "interrupted"
     except Exception as e:
