@@ -318,7 +318,6 @@ async def raw_socket_sender(
 
     try_txring = bool(force_l2) or requested_backend in {"auto", "txring"}
     try_c_ext_l3 = requested_backend in {"auto", "txring", "c_ext_l3"}
-    try_c_ext_l3 = requested_backend in {"auto", "txring", "c_ext_l3"}
     if not allow_fallback:
         if requested_backend in {"auto", "txring"}:
             try_c_ext_l3 = False
@@ -487,7 +486,7 @@ async def raw_socket_sender(
             else:
                 _register_fallback("txring_gateway_not_found")
                 if verbose:
-                    log_error("Gateway MAC not found for TX_RING, falling back to L3.")
+                    log_error("Gateway MAC not found for TX_RING, attempting C_EXT_L3 path.")
         except Exception as e:
             _register_fallback("txring_error")
             if verbose:

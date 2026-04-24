@@ -85,7 +85,7 @@ async def xdp_sender(
     queue_id: int = 0,
     xdp_mode: int = 0,
     batch_size: int = 64,
-    sender_fallback_policy: str = "allow",
+    sender_fallback_policy: str = "fail",
     fallback_backend: str = "c_ext_l3",
     sender_context: Dict[str, Any] | None = None,
     pacing_config=None,
@@ -109,7 +109,10 @@ async def xdp_sender(
     Send packets using AF_XDP (copy mode compatibility path) with fallback.
     """
     fallback_policy = resolve_sender_fallback_policy_fn(sender_fallback_policy)
-    fallback_backend = resolve_sender_backend_fn(fallback_backend)
+    fallback_backend_raw = str(fallback_backend or "c_ext_l3").strip().lower()
+    if fallback_backend_raw not in {"auto", "txring", "c_ext_l3", "xdp"}:
+        fallback_backend_raw = "c_ext_l3"
+    fallback_backend = fallback_backend_raw
     xdp_mode = int(xdp_mode or 0)
 
     async def _fallback(reason: str, details: str = "") -> dict:
@@ -248,7 +251,7 @@ async def xdp_sender(
                     queue_id=int(queue_id or 0),
                     mode=int(xdp_mode or 0),
                     batch_size=batch_size,
-                    auto_fallback=True,
+                    auto_fallback=False,
                     mode2_policy=mode2_policy,
                 )
                 sender.start()
@@ -261,7 +264,7 @@ async def xdp_sender(
                 queue_id=int(queue_id or 0),
                 mode=int(xdp_mode or 0),
                 batch_size=batch_size,
-                auto_fallback=True,
+                auto_fallback=False,
                 mode2_policy=mode2_policy,
             )
             sender.start()

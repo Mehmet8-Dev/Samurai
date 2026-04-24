@@ -599,35 +599,20 @@ def _unsupported_l7_v1_stats(sender_path: str, count: int) -> Dict[str, Any]:
     )
 
 async def send_packet_async(packet, verbose, packet_no, loop, protocol):
-    from ._senders import legacy_packet as _legacy_packet
-
-    return await _legacy_packet.send_packet_async(
-        packet,
-        verbose,
-        packet_no,
-        loop,
-        protocol,
+    del packet, verbose, packet_no, loop, protocol
+    raise RuntimeError(
+        "legacy send_packet_async path removed; use paced_raw_socket_sender/xdp sender paths"
     )
 
 async def packet_sender(packet_config, count, delay=0.0, rps=0.0, jitter=0.0, ramp=0.0, verbose=False, live_sent=None, live_errors=None, live_progress=None):
-    from ._senders import legacy_packet as _legacy_packet
-
-    return await _legacy_packet.packet_sender(
-        packet_config,
-        count,
-        delay=delay,
-        rps=rps,
-        jitter=jitter,
-        ramp=ramp,
-        verbose=verbose,
-        live_sent=live_sent,
-        live_errors=live_errors,
-        live_progress=live_progress,
-        stats_fn=_stats,
-        update_live_fn=_update_live,
-        log_error=log_error,
-        cpu_packet_engine=cpu_packet_engine,
-        packet_utils=packet_utils,
+    del packet_config, count, delay, rps, jitter, ramp, verbose, live_sent, live_errors, live_progress
+    return _stats(
+        attempted=0,
+        sent=0,
+        errors=0,
+        sender_path="LEGACY_PACKET_REMOVED",
+        fallback_count=1,
+        sender_fallback_reason="legacy_packet_sender_removed",
     )
 
 FAST_SENDER_AVAILABLE, fast_sender = _sender_runtime.load_fast_sender(package=__package__)
