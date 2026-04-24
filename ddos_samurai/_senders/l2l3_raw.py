@@ -1,6 +1,5 @@
 import asyncio
 import os
-import socket
 from typing import Any, Dict
 
 
@@ -39,7 +38,7 @@ async def raw_socket_sender(
 ):
     """
     Sends a buffer of pre-created raw packets using native senders.
-    Fallback chain: TX_RING (L2) -> C_EXT_L3.
+    Legacy Python-socket fallback is removed; dataplane session is required.
     """
     _resolve_sender_backend = resolve_sender_backend_fn
     _resolve_sender_fallback_policy = resolve_sender_fallback_policy_fn
@@ -80,54 +79,6 @@ async def raw_socket_sender(
     s = None
     owns_socket = False
     ctx = sender_context if isinstance(sender_context, dict) else None
-    try:
-        cached_socket = None
-        if isinstance(ctx, dict):
-            cached_socket = ctx.get("raw_socket")
-            if cached_socket is not None and getattr(cached_socket, "fileno", lambda: -1)() < 0:
-                cached_socket = None
-                ctx.pop("raw_socket", None)
-        if cached_socket is not None:
-            s = cached_socket
-        else:
-            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-            owns_socket = True
-            if isinstance(ctx, dict):
-                ctx["raw_socket"] = s
-    except PermissionError:
-        log_error("Raw socket creation failed. Please run the script with sudo/root privileges.")
-        return _stats(
-            attempted=count,
-            sent=0,
-            errors=count,
-            sender_path="NONE",
-            permission_error_count=1,
-            fallback_count=0,
-            sender_fallback_reason="raw_socket_permission_denied",
-            sender_backend_requested=requested_backend,
-            sender_fallback_policy=fallback_policy,
-            buffer_copy_count=0,
-            buffer_copy_bytes=0,
-            eagain_retry_count=0,
-            partial_send_retry_count=0,
-        )
-    except Exception as e:
-        log_error(f"Failed to create raw socket: {e}")
-        return _stats(
-            attempted=count,
-            sent=0,
-            errors=count,
-            sender_path="NONE",
-            permission_error_count=0,
-            fallback_count=0,
-            sender_fallback_reason="raw_socket_init_failed",
-            sender_backend_requested=requested_backend,
-            sender_fallback_policy=fallback_policy,
-            buffer_copy_count=0,
-            buffer_copy_bytes=0,
-            eagain_retry_count=0,
-            partial_send_retry_count=0,
-        )
 
     _ctx_dp_session = ctx.get("dataplane_session") if isinstance(ctx, dict) else None
     _has_dp_session = bool(_ctx_dp_session is not None and hasattr(_ctx_dp_session, "send_batch"))
@@ -139,8 +90,6 @@ async def raw_socket_sender(
     packet_size = len(packets_buffer) // count if count > 0 else 0
     if packet_size == 0 and count > 0:
         log_error("Packet buffer is empty or count is zero, cannot determine packet size.")
-        if owns_socket and s is not None:
-            s.close()
         return _stats(
             attempted=count,
             sent=0,
@@ -229,26 +178,23 @@ async def raw_socket_sender(
             )
         except Exception as e:
             _register_fallback(f"dataplane_exception:{type(e).__name__}")
-            if dp_hot_path_only:
-                if owns_socket and s is not None:
-                    s.close()
-                _update_live(live_progress, int(count))
-                _update_live(live_errors, int(count))
-                return _stats(
-                    attempted=count,
-                    sent=0,
-                    errors=count,
-                    sender_path="DP_SEND_FAILED",
-                    permission_error_count=0,
-                    fallback_count=max(1, int(fallback_count)),
-                    sender_fallback_reason=";".join(fallback_reasons) if fallback_reasons else "dataplane_exception",
-                    sender_backend_requested=requested_backend,
-                    sender_fallback_policy=fallback_policy,
-                    buffer_copy_count=buffer_copy_count,
-                    buffer_copy_bytes=buffer_copy_bytes,
-                    eagain_retry_count=0,
-                    partial_send_retry_count=0,
-                )
+            _update_live(live_progress, int(count))
+            _update_live(live_errors, int(count))
+            return _stats(
+                attempted=count,
+                sent=0,
+                errors=count,
+                sender_path="DP_SEND_FAILED",
+                permission_error_count=0,
+                fallback_count=max(1, int(fallback_count)),
+                sender_fallback_reason=";".join(fallback_reasons),
+                sender_backend_requested=requested_backend,
+                sender_fallback_policy=fallback_policy,
+                buffer_copy_count=buffer_copy_count,
+                buffer_copy_bytes=buffer_copy_bytes,
+                eagain_retry_count=0,
+                partial_send_retry_count=0,
+            )
         if dp_out is not None:
             if hasattr(dp_out, "to_stats"):
                 dp_stats = dict(dp_out.to_stats() or {})
@@ -262,8 +208,6 @@ async def raw_socket_sender(
             dp_reason = str(dp_stats.get("sender_fallback_reason", "none") or "none").strip()
             if dp_reason and dp_reason.lower() != "none":
                 _register_fallback(dp_reason)
-            if owns_socket and s is not None:
-                s.close()
             _update_live(live_progress, int(dp_attempted))
             _update_live(live_sent, int(dp_sent))
             _update_live(live_errors, int(max(dp_errors, dp_attempted - dp_sent)))
@@ -294,9 +238,24 @@ async def raw_socket_sender(
                 elif isinstance(v, (int, float, str)):
                     out[k] = v
             return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
-    elif dp_hot_path_only:
-        if owns_socket and s is not None:
-            s.close()
+        _update_live(live_progress, int(count))
+        _update_live(live_errors, int(count))
+        return _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="DP_SEND_FAILED",
+            permission_error_count=0,
+            fallback_count=max(1, int(fallback_count)),
+            sender_fallback_reason="dataplane_returned_none",
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=buffer_copy_count,
+            buffer_copy_bytes=buffer_copy_bytes,
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+    else:
         _update_live(live_progress, int(count))
         _update_live(live_errors, int(count))
         reason = dp_open_error or "dataplane_session_missing"
@@ -315,7 +274,6 @@ async def raw_socket_sender(
             eagain_retry_count=0,
             partial_send_retry_count=0,
         )
-
     try_txring = bool(force_l2) or requested_backend in {"auto", "txring"}
     try_c_ext_l3 = requested_backend in {"auto", "txring", "c_ext_l3"}
     if not allow_fallback:
