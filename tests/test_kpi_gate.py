@@ -89,7 +89,7 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
 
     def test_dedicated_non_txring_scope_does_not_require_afpacket_hugepage(self):
         results = self._base_results()
-        results.update({"sender_paths_used": {"PYTHON_SENDMMSG": 1}})
+        results.update({"sender_paths_used": {"C_EXT_L3": 1}})
         out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
         self.assertEqual(out.status, "pass")
 
