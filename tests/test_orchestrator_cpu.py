@@ -211,21 +211,20 @@ class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
             await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
             mock_amp.assert_awaited_once()
 
-    async def test_worker_process_basic_calls_packet_sender_and_passes_fragment_size(self):
+    async def test_worker_process_basic_fragment_fails_visible_without_legacy_sender(self):
         args = _base_args()
         args["attack_vector"] = "basic"
         args["fragment"] = True
         args["fragment_size"] = 256
 
+        events = []
         mock_pkt = AsyncMock()
         with patch.object(orchestrator.senders, "packet_sender", mock_pkt):
-            await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-            mock_pkt.assert_awaited_once()
-
-            _call_args, call_kwargs = mock_pkt.call_args
-            cfg = call_kwargs["packet_config"]
-            self.assertTrue(getattr(cfg, "fragment_enabled") is True)
-            self.assertEqual(getattr(cfg, "fragment_size"), 256)
+            await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None, run_events=events)
+        mock_pkt.assert_not_awaited()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["status"], "failed")
+        self.assertIn("cpu_fragment_unsupported_no_legacy_path", str(events[0].get("sender_fallback_reason", "")))
 
     async def test_worker_process_basic_with_pacing_routes_to_paced_sender(self):
         args = _base_args()
@@ -246,7 +245,7 @@ class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_kwargs["count"], 5)
         mock_pkt.assert_not_awaited()
 
-    async def test_worker_process_basic_with_pacing_and_fragment_falls_back(self):
+    async def test_worker_process_basic_with_pacing_and_fragment_fails_visible(self):
         args = _base_args()
         args["attack_vector"] = "basic"
         args["pacing_mode"] = "rps"
@@ -254,14 +253,21 @@ class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
         args["fragment"] = True
         args["fragment_size"] = 256
 
+        events = []
         mock_pkt = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
         mock_paced = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
         with patch.object(orchestrator, "PACING_ENGINE_AVAILABLE", True):
             with patch.object(orchestrator.senders, "packet_sender", mock_pkt):
                 with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_paced):
-                    await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
+                    await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None, run_events=events)
 
-        mock_pkt.assert_awaited_once()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["status"], "failed")
+        self.assertIn(
+            "cpu_fragment_with_pacing_unsupported_no_legacy_path",
+            str(events[0].get("sender_fallback_reason", "")),
+        )
+        mock_pkt.assert_not_awaited()
         mock_paced.assert_not_awaited()
 
     async def test_worker_process_http_uses_topology_binding_for_l7_compile_inputs(self):
@@ -296,7 +302,7 @@ class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
         args["topology_enabled"] = True
         args["topology_compiled_plan_json"] = _topology_args()
 
-        mock_pkt = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
+        mock_paced = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
         tuple_row = {
             "client_ip": "10.0.0.9",
             "server_ip": "198.51.100.7",
@@ -306,16 +312,21 @@ class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
             "template_path": "",
             "template_flags": "S",
         }
+        captured_cfg = {}
+        def _fake_pool(cfg, count, uniform_size=True, low_peak_memory=True):
+            captured_cfg["cfg"] = cfg
+            captured_cfg["count"] = count
+            return (memoryview(b"x" * (64 * int(count))), 64)
         with patch.object(orchestrator, "compiled_topology_plan_from_dict", return_value={"dummy": 1}):
             with patch.object(orchestrator, "topology_tuple_for_index", return_value=tuple_row):
-                with patch.object(orchestrator.senders, "packet_sender", mock_pkt):
-                    await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-                    _call_args, kwargs = mock_pkt.call_args
-                    cfg = kwargs["packet_config"]
-                    self.assertEqual(getattr(cfg, "target_ip"), "198.51.100.7")
-                    self.assertEqual(int(getattr(cfg, "target_port")), 8080)
-                    self.assertTrue(bool(getattr(cfg, "spoof")))
-                    self.assertEqual(str(getattr(cfg.spoof_opts, "mode")), "subnet")
+                with patch.object(orchestrator.cpu_packet_engine, "generate_packet_pool_view", side_effect=_fake_pool):
+                    with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_paced):
+                        await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
+                        cfg = captured_cfg["cfg"]
+                        self.assertEqual(getattr(cfg, "target_ip"), "198.51.100.7")
+                        self.assertEqual(int(getattr(cfg, "target_port")), 8080)
+                        self.assertTrue(bool(getattr(cfg, "spoof")))
+                        self.assertEqual(str(getattr(cfg.spoof_opts, "mode")), "subnet")
 
 
 class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
@@ -550,7 +561,7 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
                 "sender_fallback_reason": "txring_unavailable",
             }
         )
-        with patch.object(orchestrator.senders, "packet_sender", mock_sender):
+        with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_sender):
             await orchestrator.worker_process(
                 worker_id=1, args=args, ssl_context=None, run_events=events,
             )
@@ -577,7 +588,7 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
                 "sender_fallback_reason": "none",
             }
         )
-        with patch.object(orchestrator.senders, "packet_sender", mock_sender):
+        with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_sender):
             await orchestrator.worker_process(
                 worker_id=1, args=args, ssl_context=None, run_events=events,
             )

@@ -22,26 +22,17 @@ class _DummySocket:
 
 
 class TestSendPacketAsync(unittest.IsolatedAsyncioTestCase):
-    async def test_send_packet_async_sends_raw_ipv4_packet(self):
+    async def test_send_packet_async_is_removed(self):
         from ddos_samurai.senders import send_packet_async
-        from ddos_samurai.packet import PacketConfig, create_packet
 
-        pkt = create_packet(PacketConfig(target_ip="127.0.0.1", target_port=80, protocol="udp"))
-        dummy_sock = _DummySocket()
+        loop = asyncio.get_running_loop()
+        with self.assertRaises(RuntimeError):
+            await send_packet_async(b"X", verbose=False, packet_no=1, loop=loop, protocol="tcp")
 
-        with patch("ddos_samurai._senders.legacy_packet.socket.socket", return_value=dummy_sock):
-            loop = asyncio.get_running_loop()
-            ok = await send_packet_async(pkt, verbose=False, packet_no=1, loop=loop, protocol="tcp")
-
-        self.assertTrue(ok)
-        self.assertEqual(len(dummy_sock.sent), 1)
-        self.assertEqual(dummy_sock.sent[0][1][0], "127.0.0.1")
-
-    async def test_send_packet_async_rejects_non_bytes_packet(self):
+    async def test_send_packet_async_rejects_non_bytes_packet_via_removed_path(self):
         from ddos_samurai.senders import send_packet_async
 
         pkt = object()
         loop = asyncio.get_running_loop()
-        ok = await send_packet_async(pkt, verbose=False, packet_no=1, loop=loop, protocol="udp")
-
-        self.assertFalse(ok)
+        with self.assertRaises(RuntimeError):
+            await send_packet_async(pkt, verbose=False, packet_no=1, loop=loop, protocol="udp")

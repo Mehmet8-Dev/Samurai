@@ -54,10 +54,10 @@ def _base_args():
 
 
 class TestWorkerProcessIntegration(unittest.IsolatedAsyncioTestCase):
-    async def test_worker_process_basic_attack_flow_calls_packet_sender(self):
+    async def test_worker_process_basic_attack_flow_calls_primary_sender(self):
         args = _base_args()
 
-        mock_packet_sender = AsyncMock()
-        with patch.object(orchestrator.senders, "packet_sender", mock_packet_sender):
+        mock_sender = AsyncMock(return_value={"attempted": 100, "sent": 100, "errors": 0})
+        with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_sender):
             await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-            mock_packet_sender.assert_awaited_once()
+            mock_sender.assert_awaited_once()

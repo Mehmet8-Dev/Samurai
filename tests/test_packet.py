@@ -20,14 +20,13 @@ class _DummyPacket:
 
 class TestSendPacketAsync(unittest.IsolatedAsyncioTestCase):
     async def test_send_packet_async_error_handling(self):
-        """send_packet_async should return False when packet bytes are invalid."""
+        """legacy send_packet_async route should be disabled."""
         from ddos_samurai.senders import send_packet_async
 
         pkt = _DummyPacket(has_ether=True)
         loop = asyncio.get_running_loop()
-        ok = await send_packet_async(pkt, verbose=True, packet_no=1, loop=loop, protocol="udp")
-
-        self.assertFalse(ok)
+        with self.assertRaises(RuntimeError):
+            await send_packet_async(pkt, verbose=True, packet_no=1, loop=loop, protocol="udp")
 
 
 class TestSpoofedIp(unittest.TestCase):
