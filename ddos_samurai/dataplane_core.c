@@ -3,6 +3,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
