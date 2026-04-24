@@ -452,11 +452,9 @@ class TestSenderStatsAndPaths(unittest.TestCase):
         self.assertNotIn("some_list", result)
         self.assertNotIn("some_none", result)
 
-    def test_raw_socket_sender_permission_error_returns_sender_path_none(self):
-        """raw_socket_sender should classify PermissionError and return sender_path=NONE."""
+    def test_raw_socket_sender_without_dataplane_session_returns_dp_unavailable(self):
+        """raw_socket_sender should fail visible when dataplane session is missing."""
         import asyncio
-        import socket
-        from unittest.mock import patch
 
         async def _run():
             return await senders_module.raw_socket_sender(
@@ -467,26 +465,10 @@ class TestSenderStatsAndPaths(unittest.TestCase):
                 verbose=False,
             )
 
-        real_socket_ctor = socket.socket
-
-        def _socket_side_effect(*args, **kwargs):
-            family = args[0] if len(args) > 0 else kwargs.get("family", socket.AF_INET)
-            sock_type = args[1] if len(args) > 1 else kwargs.get("type", socket.SOCK_STREAM)
-            proto = args[2] if len(args) > 2 else kwargs.get("proto", 0)
-
-            if (
-                family == socket.AF_INET
-                and sock_type == socket.SOCK_RAW
-                and proto == socket.IPPROTO_RAW
-            ):
-                raise PermissionError("test")
-
-            return real_socket_ctor(*args, **kwargs)
-
-        with patch("socket.socket", side_effect=_socket_side_effect):
-            result = asyncio.run(_run())
-        self.assertEqual(result["sender_path"], "NONE")
-        self.assertEqual(result["permission_error_count"], 1)
+        result = asyncio.run(_run())
+        self.assertEqual(result["sender_path"], "DP_UNAVAILABLE")
+        self.assertEqual(result.get("sender_fallback_reason"), "dataplane_session_missing")
+        self.assertEqual(result["permission_error_count"], 0)
         self.assertEqual(result["sent"], 0)
         self.assertEqual(result["errors"], 1)
 
