@@ -425,7 +425,7 @@ class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
             "sent": 10,
             "errors": 0,
             "bytes_sent_est": 640,
-            "sender_path": "PYTHON_SENDMMSG",
+            "sender_path": "C_EXT_L3",
             "fallback_count": 1,
             "permission_error_count": 0,
             "buffer_copy_count": 2,
