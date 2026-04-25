@@ -24,9 +24,9 @@
 #include <limits>
 #include <optional>
 #include <cstdlib>
-#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -45,6 +45,9 @@ namespace ddos_samurai::l7_emu_native {
 
 namespace {
 
+void trim_reusable_string(std::string& value, std::size_t keep_limit);
+void ensure_reusable_string_capacity(std::string& value, std::size_t min_capacity);
+
 struct ResponseInfo {
   int status_code{0};
   std::size_t bytes_received{0};
@@ -54,6 +57,57 @@ struct ResponseInfo {
   std::string body;
   bool keep_alive{false};
   std::size_t consumed_bytes{0};
+};
+
+struct H1ReadBuffer {
+  std::string storage{};
+  std::size_t head{0};
+
+  std::size_t size() const {
+    return head <= storage.size() ? storage.size() - head : 0;
+  }
+
+  bool empty() const {
+    return size() == 0;
+  }
+
+  std::string_view view() const {
+    return std::string_view(storage.data() + head, size());
+  }
+
+  void append(const char* data, std::size_t len) {
+    storage.append(data, len);
+  }
+
+  void consume(std::size_t len) {
+    head += std::min(len, size());
+    compact_if_needed();
+  }
+
+  void clear() {
+    storage.clear();
+    head = 0;
+  }
+
+  void reset_reusable(std::size_t keep_limit, std::size_t min_capacity) {
+    clear();
+    trim_reusable_string(storage, keep_limit);
+    ensure_reusable_string_capacity(storage, min_capacity);
+  }
+
+  void compact_if_needed() {
+    if (head == 0) {
+      return;
+    }
+    if (head >= storage.size()) {
+      clear();
+      return;
+    }
+    if (head >= 32768 || head * 2 >= storage.size()) {
+      storage.erase(0, head);
+      head = 0;
+    }
+  }
 };
 
 struct DataplanePerfStats {
@@ -120,7 +174,7 @@ struct Http1Connection {
   bool custom_connect_ready{false};
   bool custom_send_enqueued{false};
   bool custom_terminal{false};
-  std::string read_buffer;
+  H1ReadBuffer read_buffer{};
   long long idle_deadline_ms{0};
   std::size_t timer_slot{0};
   std::uint64_t timer_generation{0};
@@ -370,6 +424,7 @@ struct NativeRuntime {
     struct RegisteredLaneFd {
       ReactorLaneKind kind{ReactorLaneKind::H1};
       H1Lane* h1_lane{nullptr};
+      std::size_t lane_idx{0};
 #ifdef SAMURAI_WITH_NGHTTP2
       H2ClientSession* h2_session{nullptr};
 #endif
@@ -474,8 +529,7 @@ void reset_h1_lane_io(H1Lane& lane) {
   trim_reusable_string(lane.write_buffer);
   ensure_reusable_string_capacity(lane.write_buffer, kH1SlabWriteBytes);
   if (lane.conn) {
-    trim_reusable_string(lane.conn->read_buffer);
-    ensure_reusable_string_capacity(lane.conn->read_buffer, kH1SlabReadBytes);
+    lane.conn->read_buffer.reset_reusable(kHotPathReusableBufferLimit, kH1SlabReadBytes);
     if (lane.conn->fd < 0) {
       lane.conn->custom_flow_id = 0;
       lane.conn->custom_connect_ready = false;
@@ -907,9 +961,10 @@ ssize_t custom_tcp_recv_bridge(Http1Connection& conn, void* buf, std::size_t len
     return 0;
   }
   if (!conn.read_buffer.empty()) {
-    const std::size_t copy_len = std::min(len, conn.read_buffer.size());
-    std::memcpy(buf, conn.read_buffer.data(), copy_len);
-    conn.read_buffer.erase(0, copy_len);
+    const std::string_view available = conn.read_buffer.view();
+    const std::size_t copy_len = std::min(len, available.size());
+    std::memcpy(buf, available.data(), copy_len);
+    conn.read_buffer.consume(copy_len);
     return static_cast<ssize_t>(copy_len);
   }
   if (!conn.custom_terminal) {
@@ -968,29 +1023,114 @@ bool wait_for_fd(int epoll_fd, int fd, uint32_t events, int timeout_ms) {
   return (out.events & events) != 0 || (out.events & (EPOLLERR | EPOLLHUP)) != 0;
 }
 
-std::optional<std::size_t> parse_chunked_body_length(const std::string& payload, std::size_t body_offset) {
+std::size_t find_crlf(std::string_view payload, std::size_t start) {
+  return payload.find("\r\n", start);
+}
+
+bool ascii_iequals(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const unsigned char ca = static_cast<unsigned char>(a[i]);
+    const unsigned char cb = static_cast<unsigned char>(b[i]);
+    if (std::tolower(ca) != std::tolower(cb)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ascii_icontains(std::string_view haystack, std::string_view needle) {
+  if (needle.empty()) {
+    return true;
+  }
+  if (haystack.size() < needle.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+    if (ascii_iequals(haystack.substr(i, needle.size()), needle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string lowercase_copy(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char ch : value) {
+    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  return out;
+}
+
+std::string trim_header_value_copy(std::string_view value) {
+  while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+    value.remove_prefix(1);
+  }
+  while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+    value.remove_suffix(1);
+  }
+  return std::string(value);
+}
+
+int parse_http_status_code(std::string_view status_line) {
+  const std::size_t first_space = status_line.find(' ');
+  if (first_space == std::string_view::npos) {
+    return 0;
+  }
+  std::size_t pos = first_space;
+  while (pos < status_line.size() && status_line[pos] == ' ') {
+    ++pos;
+  }
+  int status = 0;
+  int digits = 0;
+  while (pos < status_line.size() && std::isdigit(static_cast<unsigned char>(status_line[pos])) && digits < 3) {
+    status = status * 10 + static_cast<int>(status_line[pos] - '0');
+    ++pos;
+    ++digits;
+  }
+  return digits == 3 ? status : 0;
+}
+
+std::optional<std::size_t> parse_chunked_body_length(std::string_view payload, std::size_t body_offset) {
   std::size_t cursor = body_offset;
   while (true) {
-    const std::size_t line_end = payload.find("\r\n", cursor);
-    if (line_end == std::string::npos) {
+    const std::size_t line_end = find_crlf(payload, cursor);
+    if (line_end == std::string_view::npos) {
       return std::nullopt;
     }
-    const std::string size_line = payload.substr(cursor, line_end - cursor);
-    char* end_ptr = nullptr;
-    const unsigned long chunk_size = std::strtoul(size_line.c_str(), &end_ptr, 16);
-    if (end_ptr == size_line.c_str()) {
+    std::uint64_t chunk_size = 0;
+    bool saw_digit = false;
+    for (std::size_t pos = cursor; pos < line_end; ++pos) {
+      const unsigned char ch = static_cast<unsigned char>(payload[pos]);
+      if (ch == ';') {
+        break;
+      }
+      unsigned value = 0;
+      if (ch >= '0' && ch <= '9') value = ch - '0';
+      else if (ch >= 'a' && ch <= 'f') value = ch - 'a' + 10;
+      else if (ch >= 'A' && ch <= 'F') value = ch - 'A' + 10;
+      else if (ch == ' ' || ch == '\t') continue;
+      else return std::nullopt;
+      saw_digit = true;
+      chunk_size = (chunk_size << 4U) + value;
+    }
+    if (!saw_digit || chunk_size > std::numeric_limits<std::size_t>::max()) {
       return std::nullopt;
     }
     cursor = line_end + 2;
-    if (payload.size() < cursor + chunk_size + 2) {
+    const std::size_t chunk_len = static_cast<std::size_t>(chunk_size);
+    if (payload.size() < cursor + chunk_len + 2) {
       return std::nullopt;
     }
-    cursor += chunk_size;
-    if (payload.compare(cursor, 2, "\r\n") != 0) {
+    cursor += chunk_len;
+    if (payload.substr(cursor, 2) != "\r\n") {
       return std::nullopt;
     }
     cursor += 2;
-    if (chunk_size == 0) {
+    if (chunk_len == 0) {
       if (payload.size() < cursor + 2) {
         return std::nullopt;
       }
@@ -1037,48 +1177,41 @@ bool h1_lane_try_parse_response(H1Lane& lane) {
   if (!lane.conn) {
     return false;
   }
-  std::string& buffer = lane.conn->read_buffer;
+  H1ReadBuffer& buffer = lane.conn->read_buffer;
+  const std::string_view data = buffer.view();
   if (!lane.parser.header_complete) {
-    const std::size_t header_end = buffer.find("\r\n\r\n");
-    if (header_end == std::string::npos) {
+    const std::size_t header_end = data.find("\r\n\r\n");
+    if (header_end == std::string_view::npos) {
       return false;
     }
     lane.parser.header_complete = true;
     lane.parser.header_end = header_end;
     lane.parser.body_offset = header_end + 4;
-    const std::size_t line_end = buffer.find("\r\n");
-    if (line_end != std::string::npos) {
-      const std::string status_line = buffer.substr(0, line_end);
-      std::istringstream iss(status_line);
-      std::string version;
-      iss >> version;
-      iss >> lane.response.status_code;
+    const std::size_t line_end = find_crlf(data, 0);
+    if (line_end != std::string_view::npos) {
+      lane.response.status_code = parse_http_status_code(data.substr(0, line_end));
     }
-    std::size_t pos = line_end == std::string::npos ? 0 : line_end + 2;
+    std::size_t pos = line_end == std::string_view::npos ? 0 : line_end + 2;
     bool has_content_length = false;
     std::size_t content_length_value = 0;
     while (pos < header_end) {
-      const std::size_t next = buffer.find("\r\n", pos);
-      if (next == std::string::npos || next > header_end) {
+      const std::size_t next = find_crlf(data, pos);
+      if (next == std::string_view::npos || next > header_end) {
         break;
       }
-      const std::string line = buffer.substr(pos, next - pos);
+      const std::string_view line = data.substr(pos, next - pos);
       const std::size_t colon = line.find(':');
-      if (colon != std::string::npos) {
-        std::string key = line.substr(0, colon);
-        std::string value = line.substr(colon + 1);
-        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-          value.erase(value.begin());
-        }
-        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
-          return static_cast<char>(std::tolower(c));
-        });
+      if (colon != std::string_view::npos) {
+        const std::string_view key_view = line.substr(0, colon);
+        const std::string_view value_view = line.substr(colon + 1);
+        std::string key = lowercase_copy(key_view);
+        std::string value = trim_header_value_copy(value_view);
         lane.response.header_fields.emplace_back(key, value);
-        if (key == "content-length") {
+        if (ascii_iequals(key_view, "content-length")) {
           has_content_length = true;
           content_length_value = static_cast<std::size_t>(std::strtoull(value.c_str(), nullptr, 10));
-        } else if (key == "transfer-encoding" &&
-                   lower_copy(value).find("chunked") != std::string::npos) {
+        } else if (ascii_iequals(key_view, "transfer-encoding") &&
+                   ascii_icontains(value_view, "chunked")) {
           lane.parser.chunked = true;
         }
       }
@@ -1098,26 +1231,27 @@ bool h1_lane_try_parse_response(H1Lane& lane) {
   }
 
   if (lane.parser.chunked) {
-    const auto parsed = parse_chunked_body_length(buffer, lane.parser.body_offset);
+    const auto parsed = parse_chunked_body_length(data, lane.parser.body_offset);
     if (!parsed.has_value()) {
       return false;
     }
     lane.parser.expected_body_length = *parsed;
   } else if (lane.parser.close_delimited) {
     return false;
-  } else if (buffer.size() < lane.parser.body_offset + lane.parser.expected_body_length) {
+  } else if (data.size() < lane.parser.body_offset + lane.parser.expected_body_length) {
     return false;
   }
 
-  lane.response.body = buffer.substr(lane.parser.body_offset, lane.parser.expected_body_length);
+  lane.response.body.assign(
+      data.substr(lane.parser.body_offset, lane.parser.expected_body_length));
   lane.response.consumed_bytes = lane.parser.body_offset + lane.parser.expected_body_length;
   const std::string* connection_header_raw =
       find_header_value(lane.response.header_fields, "connection");
-  const std::string connection_header =
-      lower_copy(connection_header_raw != nullptr ? *connection_header_raw : "");
-  lane.response.keep_alive = !lane.parser.close_delimited && connection_header != "close";
-  if (lane.response.consumed_bytes <= buffer.size()) {
-    buffer.erase(0, lane.response.consumed_bytes);
+  lane.response.keep_alive =
+      !lane.parser.close_delimited &&
+      (connection_header_raw == nullptr || !ascii_iequals(*connection_header_raw, "close"));
+  if (lane.response.consumed_bytes <= data.size()) {
+    buffer.consume(lane.response.consumed_bytes);
   } else {
     buffer.clear();
   }
@@ -1182,13 +1316,14 @@ H1LaneIoResult h1_lane_read_step(H1Lane& lane) {
     }
     if (n == 0) {
       if (lane.parser.header_complete && lane.parser.close_delimited) {
+        const std::string_view data = lane.conn->read_buffer.view();
         lane.parser.expected_body_length =
-            lane.conn->read_buffer.size() > lane.parser.body_offset
-            ? lane.conn->read_buffer.size() - lane.parser.body_offset
+            data.size() > lane.parser.body_offset
+            ? data.size() - lane.parser.body_offset
             : 0;
-        lane.response.body = lane.conn->read_buffer.substr(
+        lane.response.body.assign(data.substr(
             lane.parser.body_offset,
-            lane.parser.expected_body_length);
+            lane.parser.expected_body_length));
         lane.response.consumed_bytes = lane.parser.body_offset + lane.parser.expected_body_length;
         lane.response.keep_alive = false;
         lane.conn->read_buffer.clear();
@@ -1273,7 +1408,11 @@ uint32_t reactor_interest_mask() {
   return EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
 }
 
-void register_h1_lane_fd(ShardState& shard, NativeRuntime::LocalShard& local_shard, H1Lane* lane) {
+void register_h1_lane_fd(
+    ShardState& shard,
+    NativeRuntime::LocalShard& local_shard,
+    H1Lane* lane,
+    std::size_t lane_idx) {
   if (lane == nullptr || lane->conn == nullptr || lane->conn->fd < 0 || shard.epoll_fd < 0 ||
       lane->transport_backend == TransportBackend::CustomTcp) {
     return;
@@ -1287,6 +1426,7 @@ void register_h1_lane_fd(ShardState& shard, NativeRuntime::LocalShard& local_sha
   local_shard.active_fd_registry[lane->conn->fd] = NativeRuntime::LocalShard::RegisteredLaneFd{
       ReactorLaneKind::H1,
       lane,
+      lane_idx,
 #ifdef SAMURAI_WITH_NGHTTP2
       nullptr,
 #endif
@@ -1320,6 +1460,7 @@ void register_h2_lane_fd(
   local_shard.active_fd_registry[session->ctx.fd] = NativeRuntime::LocalShard::RegisteredLaneFd{
       ReactorLaneKind::H2,
       nullptr,
+      0,
       session,
   };
 }
@@ -1386,13 +1527,8 @@ int service_ready_lanes(
               : H1LaneIoResult::Failed;
         }
         if (result == H1LaneIoResult::Completed || result == H1LaneIoResult::Failed) {
+          const std::size_t lane_idx = it->second.lane_idx;
           unregister_lane_fd(shard, local_shard, fd);
-          std::size_t lane_idx = 0;
-          for (; lane_idx < local_shard.h1_lanes.size(); ++lane_idx) {
-            if (local_shard.h1_lanes[lane_idx].get() == &lane) {
-              break;
-            }
-          }
           enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
         }
       }
@@ -4129,7 +4265,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
 
       if (!lane.conn) {
         lane.conn = std::make_unique<Http1Connection>();
-        ensure_reusable_string_capacity(lane.conn->read_buffer, kH1SlabReadBytes);
+        ensure_reusable_string_capacity(lane.conn->read_buffer.storage, kH1SlabReadBytes);
       }
       if (lane.conn->fd >= 0) {
         conn_reused += 1;
@@ -4155,7 +4291,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       lane.conn->read_buffer.clear();
       lane.conn->idle_deadline_ms = 0;
       sync_h1_lane_state(lane, profile);
-      register_h1_lane_fd(shard, local_shard, &lane);
+      register_h1_lane_fd(shard, local_shard, &lane, lane_idx);
 
       H1LaneIoResult immediate_result = h1_lane_write_step(lane);
       if (immediate_result == H1LaneIoResult::Pending && lane.phase == H1LanePhase::Reading) {
