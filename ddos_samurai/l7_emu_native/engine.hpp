@@ -36,6 +36,7 @@ struct Profile {
   std::string stateful_runtime_backend{"afxdp"};
   int stateful_runtime_strict{0};
   int legacy_mode{0};
+  std::string source_ip;
   std::string target_ip;
   int target_port{0};
   std::string scheme;

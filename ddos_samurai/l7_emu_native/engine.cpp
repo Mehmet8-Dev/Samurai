@@ -173,6 +173,9 @@ struct Http1Connection {
   uint64_t custom_flow_id{0};
   bool custom_connect_ready{false};
   bool custom_send_enqueued{false};
+  std::uint32_t custom_send_outstanding{0};
+  std::size_t custom_send_queued_bytes{0};
+  std::uint32_t custom_send_enqueue_count{0};
   bool custom_terminal{false};
   H1ReadBuffer read_buffer{};
   long long idle_deadline_ms{0};
@@ -414,6 +417,16 @@ struct NativeRuntime {
   std::deque<CompletionEnvelope> ready_completions{};
   DataplanePerfStats perf{};
   int32_t custom_tcp_rx_handler_id{0};
+  struct CustomTcpFlowBinding {
+    ReactorLaneKind kind{ReactorLaneKind::H1};
+    std::size_t shard_idx{0};
+    std::size_t lane_idx{0};
+    H1Lane* h1_lane{nullptr};
+#ifdef SAMURAI_WITH_NGHTTP2
+    H2ClientSession* h2_session{nullptr};
+#endif
+  };
+  std::unordered_map<uint64_t, CustomTcpFlowBinding> custom_tcp_flow_registry{};
   struct LocalShard {
     LocalShard() = default;
     LocalShard(const LocalShard&) = delete;
@@ -483,6 +496,76 @@ void enqueue_ready_shard(NativeRuntime& runtime, std::size_t shard_idx);
 
 thread_local DataplanePerfStats* g_perf_stats = nullptr;
 
+void unregister_custom_tcp_flow_binding(NativeRuntime& runtime, uint64_t flow_id) {
+  if (flow_id == 0) {
+    return;
+  }
+  runtime.custom_tcp_flow_registry.erase(flow_id);
+}
+
+void register_custom_tcp_h1_flow_binding(
+    NativeRuntime& runtime,
+    std::size_t shard_idx,
+    std::size_t lane_idx,
+    H1Lane& lane) {
+  if (!lane.conn || lane.transport_backend != TransportBackend::CustomTcp) {
+    return;
+  }
+  if (lane.conn->custom_flow_id == 0) {
+    return;
+  }
+  NativeRuntime::CustomTcpFlowBinding binding{};
+  binding.kind = ReactorLaneKind::H1;
+  binding.shard_idx = shard_idx;
+  binding.lane_idx = lane_idx;
+  binding.h1_lane = &lane;
+#ifdef SAMURAI_WITH_NGHTTP2
+  binding.h2_session = nullptr;
+#endif
+  runtime.custom_tcp_flow_registry[lane.conn->custom_flow_id] = binding;
+}
+
+#ifdef SAMURAI_WITH_NGHTTP2
+void register_custom_tcp_h2_flow_binding(
+    NativeRuntime& runtime,
+    std::size_t shard_idx,
+    H2ClientSession& client);
+void unregister_custom_tcp_h2_flow_binding(NativeRuntime& runtime, H2ClientSession& client);
+#endif
+
+NativeRuntime::CustomTcpFlowBinding* find_custom_tcp_flow_binding(
+    NativeRuntime& runtime,
+    uint64_t flow_id) {
+  if (flow_id == 0) {
+    return nullptr;
+  }
+  auto it = runtime.custom_tcp_flow_registry.find(flow_id);
+  if (it == runtime.custom_tcp_flow_registry.end()) {
+    return nullptr;
+  }
+  if (it->second.kind == ReactorLaneKind::H1) {
+    H1Lane* lane = it->second.h1_lane;
+    if (lane == nullptr || !lane->conn ||
+        lane->transport_backend != TransportBackend::CustomTcp ||
+        lane->conn->custom_flow_id != flow_id) {
+      runtime.custom_tcp_flow_registry.erase(it);
+      return nullptr;
+    }
+    return &it->second;
+  }
+#ifdef SAMURAI_WITH_NGHTTP2
+  if (it->second.kind == ReactorLaneKind::H2) {
+    if (it->second.h2_session == nullptr) {
+      runtime.custom_tcp_flow_registry.erase(it);
+      return nullptr;
+    }
+    return &it->second;
+  }
+#endif
+  runtime.custom_tcp_flow_registry.erase(it);
+  return nullptr;
+}
+
 void trim_reusable_string(std::string& value, std::size_t keep_limit = kHotPathReusableBufferLimit);
 void ensure_reusable_string_capacity(std::string& value, std::size_t min_capacity);
 void perf_alloc(std::size_t bytes) {
@@ -536,6 +619,9 @@ void reset_h1_lane_io(H1Lane& lane) {
       lane.conn->custom_connect_ready = false;
     }
     lane.conn->custom_send_enqueued = false;
+    lane.conn->custom_send_outstanding = 0;
+    lane.conn->custom_send_queued_bytes = 0;
+    lane.conn->custom_send_enqueue_count = 0;
     lane.conn->custom_terminal = false;
   }
   lane.write_offset = 0;
@@ -824,6 +910,34 @@ struct H2ClientSession {
   int drain_evictions{0};
 };
 
+#ifdef SAMURAI_WITH_NGHTTP2
+void register_custom_tcp_h2_flow_binding(
+    NativeRuntime& runtime,
+    std::size_t shard_idx,
+    H2ClientSession& client) {
+  if (client.ctx.transport_backend != TransportBackend::CustomTcp) {
+    return;
+  }
+  if (client.ctx.custom_flow_id == 0) {
+    return;
+  }
+  NativeRuntime::CustomTcpFlowBinding binding{};
+  binding.kind = ReactorLaneKind::H2;
+  binding.shard_idx = shard_idx;
+  binding.lane_idx = client.session_idx;
+  binding.h1_lane = nullptr;
+  binding.h2_session = &client;
+  runtime.custom_tcp_flow_registry[client.ctx.custom_flow_id] = binding;
+}
+
+void unregister_custom_tcp_h2_flow_binding(NativeRuntime& runtime, H2ClientSession& client) {
+  if (client.ctx.transport_backend != TransportBackend::CustomTcp) {
+    return;
+  }
+  unregister_custom_tcp_flow_binding(runtime, client.ctx.custom_flow_id);
+}
+#endif
+
 void cleanup_tls(H2ConnectionContext& ctx);
 void close_h2_client_session(H2ClientSession& client);
 
@@ -894,10 +1008,6 @@ TransportBackend parse_transport_backend(const Profile& profile) {
   return TransportBackend::CustomTcp;
 }
 
-uint32_t synthetic_custom_tcp_src_ip() {
-  return static_cast<uint32_t>((10U << 24U) | 1U);
-}
-
 bool parse_ipv4_u32(const std::string& text, uint32_t* out_ip) {
   if (out_ip == nullptr) {
     return false;
@@ -910,6 +1020,40 @@ bool parse_ipv4_u32(const std::string& text, uint32_t* out_ip) {
   return true;
 }
 
+uint32_t custom_tcp_src_ip(const Profile& profile) {
+  uint32_t src_ip = 0;
+  if (!profile.source_ip.empty() && parse_ipv4_u32(profile.source_ip, &src_ip)) {
+    return src_ip;
+  }
+  const char* env_src = std::getenv("SAMURAI_CUSTOM_TCP_SRC_IP");
+  if (env_src != nullptr && parse_ipv4_u32(env_src, &src_ip)) {
+    return src_ip;
+  }
+  uint32_t dst_ip = 0;
+  if (parse_ipv4_u32(profile.target_ip, &dst_ip)) {
+    const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd >= 0) {
+      sockaddr_in dst_addr{};
+      dst_addr.sin_family = AF_INET;
+      dst_addr.sin_port = htons(static_cast<uint16_t>(std::max(1, profile.target_port)));
+      dst_addr.sin_addr.s_addr = htonl(dst_ip);
+      if (::connect(fd, reinterpret_cast<const sockaddr*>(&dst_addr), sizeof(dst_addr)) == 0) {
+        sockaddr_in src_addr{};
+        socklen_t src_len = sizeof(src_addr);
+        if (::getsockname(fd, reinterpret_cast<sockaddr*>(&src_addr), &src_len) == 0) {
+          const uint32_t route_src_ip = ntohl(src_addr.sin_addr.s_addr);
+          if (route_src_ip != 0U) {
+            ::close(fd);
+            return route_src_ip;
+          }
+        }
+      }
+      ::close(fd);
+    }
+  }
+  return static_cast<uint32_t>((10U << 24U) | 1U);
+}
+
 int custom_tcp_connect_bridge(Http1Connection& conn, const Profile& profile) {
   uint32_t dst_ip = 0;
   if (!parse_ipv4_u32(profile.target_ip, &dst_ip)) {
@@ -918,7 +1062,7 @@ int custom_tcp_connect_bridge(Http1Connection& conn, const Profile& profile) {
   }
   uint64_t flow_id = 0;
   const int rc = tcpdp_enqueue_connect(
-      synthetic_custom_tcp_src_ip(),
+      custom_tcp_src_ip(profile),
       dst_ip,
       0,
       static_cast<uint16_t>(profile.target_port),
@@ -930,6 +1074,9 @@ int custom_tcp_connect_bridge(Http1Connection& conn, const Profile& profile) {
   conn.custom_flow_id = flow_id;
   conn.custom_connect_ready = false;
   conn.custom_send_enqueued = false;
+  conn.custom_send_outstanding = 0;
+  conn.custom_send_queued_bytes = 0;
+  conn.custom_send_enqueue_count = 0;
   conn.custom_terminal = false;
   conn.fd = 1;
   return conn.fd;
@@ -939,9 +1086,6 @@ ssize_t custom_tcp_send_bridge(Http1Connection& conn, const void* buf, std::size
   if (!conn.custom_connect_ready) {
     errno = EAGAIN;
     return -1;
-  }
-  if (conn.custom_send_enqueued) {
-    return static_cast<ssize_t>(len);
   }
   uint32_t queued = 0;
   const int rc = tcpdp_enqueue_send(
@@ -953,7 +1097,10 @@ ssize_t custom_tcp_send_bridge(Http1Connection& conn, const void* buf, std::size
     errno = EAGAIN;
     return -1;
   }
-  conn.custom_send_enqueued = true;
+  conn.custom_send_outstanding += 1;
+  conn.custom_send_enqueued = conn.custom_send_outstanding > 0;
+  conn.custom_send_queued_bytes += queued;
+  conn.custom_send_enqueue_count += 1;
   return static_cast<ssize_t>(queued);
 }
 
@@ -979,6 +1126,9 @@ int custom_tcp_close_bridge(Http1Connection& conn) {
   conn.custom_flow_id = 0;
   conn.custom_connect_ready = false;
   conn.custom_send_enqueued = false;
+  conn.custom_send_outstanding = 0;
+  conn.custom_send_queued_bytes = 0;
+  conn.custom_send_enqueue_count = 0;
   conn.custom_terminal = false;
   return 0;
 }
@@ -1214,6 +1364,7 @@ void requeue_h2_pending_front(
     H2ClientSession& client);
 
 void service_h2_session_io(
+    NativeRuntime& runtime,
     const Profile& profile,
     ShardState& shard,
     NativeRuntime::LocalShard& local_shard,
@@ -1585,6 +1736,7 @@ int service_ready_lanes(
 #ifdef SAMURAI_WITH_NGHTTP2
     else if (it->second.h2_session != nullptr) {
       service_h2_session_io(
+          runtime,
           profile,
           shard,
           local_shard,
@@ -1619,45 +1771,39 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
   if (tcpdp_collect_completions(&items, &item_count) == 0 && items != nullptr) {
     for (uint32_t idx = 0; idx < item_count; ++idx) {
       const auto& item = items[idx];
-      for (auto& local_shard : runtime.local_shards) {
-        for (auto& lane_ptr : local_shard.h1_lanes) {
-          if (!lane_ptr || !lane_ptr->conn || lane_ptr->transport_backend != TransportBackend::CustomTcp) {
-            continue;
-          }
-          auto& conn = *lane_ptr->conn;
-          if (conn.custom_flow_id != item.flow_id) {
-            continue;
-          }
-          if (item.event != nullptr && std::strcmp(item.event, "connect_established") == 0) {
-            conn.custom_connect_ready = true;
-          } else {
-            conn.custom_terminal = true;
-            lane_ptr->phase = H1LanePhase::Failed;
-          }
-        }
-#ifdef SAMURAI_WITH_NGHTTP2
-        for (auto& session_ptr : local_shard.h2_sessions) {
-          if (!session_ptr) {
-            continue;
-          }
-          auto& session = *session_ptr;
-          auto& ctx = session.ctx;
-          if (ctx.transport_backend != TransportBackend::CustomTcp) {
-            continue;
-          }
-          if (ctx.custom_flow_id != item.flow_id) {
-            continue;
-          }
-          if (item.event != nullptr && std::strcmp(item.event, "connect_established") == 0) {
-            ctx.custom_connect_ready = true;
-          } else {
-            ctx.custom_terminal = true;
-            ctx.transport_error = 1;
-          }
-          break;
-        }
-#endif
+      NativeRuntime::CustomTcpFlowBinding* binding =
+          find_custom_tcp_flow_binding(runtime, item.flow_id);
+      if (binding == nullptr) {
+        continue;
       }
+      const bool connect_established =
+          item.event != nullptr && std::strcmp(item.event, "connect_established") == 0;
+      if (binding->kind == ReactorLaneKind::H1 && binding->h1_lane != nullptr &&
+          binding->h1_lane->conn != nullptr) {
+        auto& lane = *binding->h1_lane;
+        auto& conn = *lane.conn;
+        if (connect_established) {
+          conn.custom_connect_ready = true;
+        } else {
+          conn.custom_terminal = true;
+          conn.custom_send_enqueued = false;
+          conn.custom_send_outstanding = 0;
+          lane.phase = H1LanePhase::Failed;
+          unregister_custom_tcp_flow_binding(runtime, item.flow_id);
+        }
+      }
+#ifdef SAMURAI_WITH_NGHTTP2
+      else if (binding->kind == ReactorLaneKind::H2 && binding->h2_session != nullptr) {
+        auto& ctx = binding->h2_session->ctx;
+        if (connect_established) {
+          ctx.custom_connect_ready = true;
+        } else {
+          ctx.custom_terminal = true;
+          ctx.transport_error = 1;
+          unregister_custom_tcp_flow_binding(runtime, item.flow_id);
+        }
+      }
+#endif
     }
     tcpdp_free_completions(items, item_count);
   }
@@ -1669,42 +1815,32 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
       if (item.payload == nullptr || item.payload_len == 0) {
         continue;
       }
-      for (auto& local_shard : runtime.local_shards) {
-        for (auto& lane_ptr : local_shard.h1_lanes) {
-          if (!lane_ptr || !lane_ptr->conn || lane_ptr->transport_backend != TransportBackend::CustomTcp) {
-            continue;
-          }
-          auto& conn = *lane_ptr->conn;
-          if (conn.custom_flow_id != item.flow_id) {
-            continue;
-          }
-          conn.read_buffer.append(
-              reinterpret_cast<const char*>(item.payload),
-              item.payload_len);
-          lane_ptr->response.bytes_received += item.payload_len;
-          lane_ptr->rx_bytes += item.payload_len;
-          break;
-        }
-#ifdef SAMURAI_WITH_NGHTTP2
-        for (auto& session_ptr : local_shard.h2_sessions) {
-          if (!session_ptr) {
-            continue;
-          }
-          auto& session = *session_ptr;
-          auto& ctx = session.ctx;
-          if (ctx.transport_backend != TransportBackend::CustomTcp) {
-            continue;
-          }
-          if (ctx.custom_flow_id != item.flow_id) {
-            continue;
-          }
-          ctx.read_buffer.append(
-              reinterpret_cast<const char*>(item.payload),
-              item.payload_len);
-          break;
-        }
-#endif
+      NativeRuntime::CustomTcpFlowBinding* binding =
+          find_custom_tcp_flow_binding(runtime, item.flow_id);
+      if (binding == nullptr) {
+        continue;
       }
+      if (binding->kind == ReactorLaneKind::H1 && binding->h1_lane != nullptr &&
+          binding->h1_lane->conn != nullptr) {
+        auto& lane = *binding->h1_lane;
+        auto& conn = *lane.conn;
+        conn.read_buffer.append(
+            reinterpret_cast<const char*>(item.payload),
+            item.payload_len);
+        lane.response.bytes_received += item.payload_len;
+        lane.rx_bytes += item.payload_len;
+        if (conn.custom_send_outstanding > 0) {
+          conn.custom_send_outstanding -= 1;
+        }
+        conn.custom_send_enqueued = conn.custom_send_outstanding > 0;
+      }
+#ifdef SAMURAI_WITH_NGHTTP2
+      else if (binding->kind == ReactorLaneKind::H2 && binding->h2_session != nullptr) {
+        binding->h2_session->ctx.read_buffer.append(
+            reinterpret_cast<const char*>(item.payload),
+            item.payload_len);
+      }
+#endif
     }
     tcpdp_free_rx_payloads(payload_items, payload_count);
   }
@@ -2065,7 +2201,7 @@ std::map<std::string, double> run_http2_custom_tcp_profile(
   auto enqueue_connect_for_lane = [&](H2CustomLane& lane) -> bool {
     uint64_t flow_id = 0;
     const int rc = tcpdp_enqueue_connect(
-        synthetic_custom_tcp_src_ip(),
+        custom_tcp_src_ip(profile),
         dst_ip,
         0,
         static_cast<uint16_t>(profile.target_port),
@@ -2393,6 +2529,7 @@ void merge_custom_tcp_stats(std::map<std::string, double>& out) {
 NativeRuntime build_runtime(const Profile& profile, const RuntimeConfig& cfg) {
   NativeRuntime runtime;
   runtime.caps = detect_capabilities();
+  runtime.custom_tcp_flow_registry.reserve(static_cast<std::size_t>(std::max(16, profile.max_connections * 2)));
   const int shard_count = std::max(1, std::min(cfg.concurrency, profile.max_connections));
   runtime.shards.reserve(static_cast<std::size_t>(shard_count));
   for (int i = 0; i < shard_count; ++i) {
@@ -2454,6 +2591,7 @@ void destroy_runtime(NativeRuntime& runtime) {
     (void)tcpdp_stop_rx_handler(runtime.custom_tcp_rx_handler_id);
     runtime.custom_tcp_rx_handler_id = 0;
   }
+  runtime.custom_tcp_flow_registry.clear();
 #ifdef SAMURAI_WITH_NGHTTP2
   for (auto& local_shard : runtime.local_shards) {
     for (auto& session : local_shard.h2_sessions) {
@@ -2526,6 +2664,7 @@ void erase_active_http1(NativeRuntime::LocalShard& local_shard, Http1Connection*
 }
 
 void close_http1_connection(
+    NativeRuntime& runtime,
     std::unique_ptr<Http1Connection>& conn,
     ShardState& shard,
     NativeRuntime::LocalShard& local_shard) {
@@ -2535,6 +2674,9 @@ void close_http1_connection(
   erase_active_http1(local_shard, conn.get());
   unregister_lane_fd(shard, local_shard, conn->fd);
   if (conn->fd >= 0) {
+    if (conn->transport_backend == TransportBackend::CustomTcp) {
+      unregister_custom_tcp_flow_binding(runtime, conn->custom_flow_id);
+    }
     const H1TransportOps& transport_ops = resolve_h1_transport_ops(conn->transport_backend);
     transport_ops.close_fn(*conn);
     conn->fd = -1;
@@ -2549,6 +2691,7 @@ void close_http1_connection(
 }
 
 void expire_http1_idle(
+    NativeRuntime& runtime,
     ShardState& shard,
     NativeRuntime::LocalShard& local_shard) {
   const long long now_ms = monotonic_ms_now();
@@ -2562,7 +2705,7 @@ void expire_http1_idle(
     if (lane->lane.idle_deadline_ms <= 0 || lane->lane.idle_deadline_ms > now_ms) {
       continue;
     }
-    close_http1_connection(lane->conn, shard, local_shard);
+    close_http1_connection(runtime, lane->conn, shard, local_shard);
     if (g_perf_stats != nullptr) {
       g_perf_stats->idle_evictions += 1;
     }
@@ -2589,7 +2732,7 @@ void expire_http1_idle(
       }
       for (auto it = local_shard.http1_idle.begin(); it != local_shard.http1_idle.end(); ++it) {
         if (it->get() == conn_ptr) {
-          close_http1_connection(*it, shard, local_shard);
+          close_http1_connection(runtime, *it, shard, local_shard);
           local_shard.http1_idle.erase(it);
           if (g_perf_stats != nullptr) {
             g_perf_stats->idle_evictions += 1;
@@ -2608,12 +2751,14 @@ void expire_http1_idle(
 
 void expire_all_http1_idle(NativeRuntime& runtime) {
   for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
-    expire_http1_idle(runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
+    expire_http1_idle(runtime, runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
   }
 }
 
 #ifdef SAMURAI_WITH_NGHTTP2
 void expire_h2_idle(
+    NativeRuntime& runtime,
+    std::size_t shard_idx,
     const Profile& profile,
     ShardState& shard,
     NativeRuntime::LocalShard& local_shard) {
@@ -2625,6 +2770,7 @@ void expire_h2_idle(
     if (session->ready && session->idle_deadline_ms > 0 && session->idle_deadline_ms <= now_ms) {
       shard.connection_pool.active_connections =
           std::max(0, shard.connection_pool.active_connections - 1);
+      unregister_custom_tcp_h2_flow_binding(runtime, *session);
       close_h2_client_session(*session);
       if (g_perf_stats != nullptr) {
         g_perf_stats->idle_evictions += 1;
@@ -2634,6 +2780,7 @@ void expire_h2_idle(
       local_shard.dispatch_ready_ms = session->unhealthy_until_ms;
     }
   }
+  (void)shard_idx;
   (void)profile;
 }
 #endif
@@ -2642,7 +2789,7 @@ void expire_all_lane_idle(NativeRuntime& runtime, const Profile& profile) {
   expire_all_http1_idle(runtime);
 #ifdef SAMURAI_WITH_NGHTTP2
   for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
-    expire_h2_idle(profile, runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
+    expire_h2_idle(runtime, shard_idx, profile, runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
   }
 #else
   (void)profile;
@@ -3559,6 +3706,8 @@ void close_h2_client_session(H2ClientSession& client) {
 }
 
 bool open_h2_client_session(
+    NativeRuntime& runtime,
+    std::size_t shard_idx,
     const Profile& profile,
     int epoll_fd,
     ShardState& shard,
@@ -3566,6 +3715,7 @@ bool open_h2_client_session(
     H2ClientSession& client,
     H2RunStats& stats,
     std::size_t request_count) {
+  unregister_custom_tcp_h2_flow_binding(runtime, client);
   close_h2_client_session(client);
   client.ctx = H2ConnectionContext{};
   client.ctx.epoll_fd = epoll_fd;
@@ -3592,7 +3742,7 @@ bool open_h2_client_session(
     }
     uint64_t flow_id = 0;
     const int rc = tcpdp_enqueue_connect(
-        synthetic_custom_tcp_src_ip(),
+        custom_tcp_src_ip(profile),
         dst_ip,
         0,
         static_cast<uint16_t>(profile.target_port),
@@ -3618,6 +3768,7 @@ bool open_h2_client_session(
     client.ctx.tls_handshake_complete = !client.ctx.use_tls;
   }
   if (!setup_tls(client.ctx, profile)) {
+    unregister_custom_tcp_h2_flow_binding(runtime, client);
     close_h2_client_session(client);
     stats.errors += static_cast<int>(request_count);
     stats.expectation_failures += static_cast<int>(request_count);
@@ -3632,6 +3783,7 @@ bool open_h2_client_session(
   if (nghttp2_session_callbacks_new(&client.callbacks) != 0 || client.callbacks == nullptr) {
     shard.connection_pool.active_connections =
         std::max(0, shard.connection_pool.active_connections - 1);
+    unregister_custom_tcp_h2_flow_binding(runtime, client);
     close_h2_client_session(client);
     stats.errors += static_cast<int>(request_count);
     stats.expectation_failures += static_cast<int>(request_count);
@@ -3645,6 +3797,7 @@ bool open_h2_client_session(
   if (nghttp2_session_client_new(&client.session, client.callbacks, &client.ctx) != 0 || client.session == nullptr) {
     shard.connection_pool.active_connections =
         std::max(0, shard.connection_pool.active_connections - 1);
+    unregister_custom_tcp_h2_flow_binding(runtime, client);
     close_h2_client_session(client);
     stats.errors += static_cast<int>(request_count);
     stats.expectation_failures += static_cast<int>(request_count);
@@ -3660,6 +3813,7 @@ bool open_h2_client_session(
   client.dispatch_ready_ms = monotonic_ms_now();
   client.active_since_ms = 0;
   client.consecutive_failures = 0;
+  register_custom_tcp_h2_flow_binding(runtime, shard_idx, client);
   return true;
 }
 
@@ -3717,6 +3871,7 @@ void requeue_h2_pending_front(
 }
 
 void service_h2_session_io(
+    NativeRuntime& runtime,
     const Profile& profile,
     ShardState& shard,
     NativeRuntime::LocalShard& local_shard,
@@ -3821,6 +3976,7 @@ void service_h2_session_io(
     if (ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
       unregister_lane_fd(shard, local_shard, client.ctx.fd);
     }
+    unregister_custom_tcp_h2_flow_binding(runtime, client);
     close_h2_client_session(client);
     local_shard.dispatch_ready_ms = client.unhealthy_until_ms;
     return;
@@ -3837,6 +3993,7 @@ void service_h2_session_io(
     if (ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
       unregister_lane_fd(shard, local_shard, client.ctx.fd);
     }
+    unregister_custom_tcp_h2_flow_binding(runtime, client);
     close_h2_client_session(client);
     local_shard.dispatch_ready_ms = now_ms;
     return;
@@ -3958,6 +4115,7 @@ std::map<std::string, double> run_http2_profile(
       if (client.ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
         unregister_lane_fd(shard, local_shard, client.ctx.fd);
       }
+      unregister_custom_tcp_h2_flow_binding(runtime, client);
       close_h2_client_session(client);
       return;
     }
@@ -4006,6 +4164,7 @@ std::map<std::string, double> run_http2_profile(
               std::max(0, shard.connection_pool.active_connections - 1);
           unregister_lane_fd(shard, local_shard, client.ctx.fd);
         }
+        unregister_custom_tcp_h2_flow_binding(runtime, client);
         close_h2_client_session(client);
       }
       if (client.ready && client.ctx.fd >= 0 && client.ctx.goaway == 0 &&
@@ -4022,6 +4181,8 @@ std::map<std::string, double> run_http2_profile(
       }
       if (!client.ready) {
         if (!open_h2_client_session(
+                runtime,
+                shard_idx,
                 profile,
                 shard.epoll_fd,
                 shard,
@@ -4041,7 +4202,7 @@ std::map<std::string, double> run_http2_profile(
       }
       const std::size_t pending_before = local_shard.pending_h2_requests.size();
       const std::size_t load_before = session_load(client);
-      service_h2_session_io(profile, shard, local_shard, client, 0, true);
+      service_h2_session_io(runtime, profile, shard, local_shard, client, 0, true);
       flush_ready_h2_completions(runtime, shard_idx, client);
       const bool progressed =
           local_shard.pending_h2_requests.size() < pending_before || session_load(client) != load_before;
@@ -4329,6 +4490,9 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
 
       lane.conn->read_buffer.clear();
       lane.conn->idle_deadline_ms = 0;
+      if (lane.transport_backend == TransportBackend::CustomTcp) {
+        register_custom_tcp_h1_flow_binding(runtime, shard_idx, lane_idx, lane);
+      }
       sync_h1_lane_state(lane, profile);
       register_h1_lane_fd(shard, local_shard, &lane, lane_idx);
 
@@ -4456,7 +4620,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
     H1Lane& lane = *local_shard.h1_lanes[decision.slot_idx];
     if (decision.action == ConnectionDispositionAction::Close) {
       lane.lane.health_state = LaneHealthState::Closed;
-      close_http1_connection(lane.conn, shard, local_shard);
+      close_http1_connection(runtime, lane.conn, shard, local_shard);
       reset_h1_lane_io(lane);
       lane.lane = ReactorLaneState{};
       return;
@@ -4584,7 +4748,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
     auto& local_shard = runtime.local_shards[shard_idx];
     auto& shard = runtime.shards[shard_idx];
     for (auto& conn : local_shard.http1_idle) {
-      close_http1_connection(conn, shard, local_shard);
+      close_http1_connection(runtime, conn, shard, local_shard);
     }
     local_shard.http1_idle.clear();
   }
