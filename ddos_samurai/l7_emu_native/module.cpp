@@ -1,11 +1,17 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 
 #include "engine.hpp"
 #include "custom_quic_stack/h3_minimal_client.hpp"
@@ -58,6 +64,325 @@ std::string normalize_runtime_backend(const std::string& raw) {
   return out;
 }
 
+std::uint32_t rotl32(std::uint32_t v, int bits) {
+  return static_cast<std::uint32_t>((v << bits) | (v >> (32 - bits)));
+}
+
+std::array<std::uint8_t, 20> sha1_digest(const std::string& input) {
+  std::uint32_t h0 = 0x67452301U;
+  std::uint32_t h1 = 0xEFCDAB89U;
+  std::uint32_t h2 = 0x98BADCFEU;
+  std::uint32_t h3 = 0x10325476U;
+  std::uint32_t h4 = 0xC3D2E1F0U;
+
+  std::vector<std::uint8_t> data(input.begin(), input.end());
+  const std::uint64_t bit_len = static_cast<std::uint64_t>(data.size()) * 8ULL;
+  data.push_back(0x80U);
+  while ((data.size() % 64U) != 56U) {
+    data.push_back(0U);
+  }
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    data.push_back(static_cast<std::uint8_t>((bit_len >> shift) & 0xFFU));
+  }
+
+  for (std::size_t offset = 0; offset < data.size(); offset += 64U) {
+    std::uint32_t w[80]{};
+    for (int i = 0; i < 16; ++i) {
+      const std::size_t pos = offset + static_cast<std::size_t>(i * 4);
+      w[i] = (static_cast<std::uint32_t>(data[pos]) << 24) |
+             (static_cast<std::uint32_t>(data[pos + 1]) << 16) |
+             (static_cast<std::uint32_t>(data[pos + 2]) << 8) |
+             static_cast<std::uint32_t>(data[pos + 3]);
+    }
+    for (int i = 16; i < 80; ++i) {
+      w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+
+    std::uint32_t a = h0;
+    std::uint32_t b = h1;
+    std::uint32_t c = h2;
+    std::uint32_t d = h3;
+    std::uint32_t e = h4;
+    for (int i = 0; i < 80; ++i) {
+      std::uint32_t f = 0;
+      std::uint32_t k = 0;
+      if (i < 20) {
+        f = (b & c) | ((~b) & d);
+        k = 0x5A827999U;
+      } else if (i < 40) {
+        f = b ^ c ^ d;
+        k = 0x6ED9EBA1U;
+      } else if (i < 60) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8F1BBCDCU;
+      } else {
+        f = b ^ c ^ d;
+        k = 0xCA62C1D6U;
+      }
+      const std::uint32_t temp = rotl32(a, 5) + f + e + k + w[i];
+      e = d;
+      d = c;
+      c = rotl32(b, 30);
+      b = a;
+      a = temp;
+    }
+    h0 += a;
+    h1 += b;
+    h2 += c;
+    h3 += d;
+    h4 += e;
+  }
+
+  std::array<std::uint8_t, 20> out{};
+  const std::uint32_t words[5] = {h0, h1, h2, h3, h4};
+  for (int i = 0; i < 5; ++i) {
+    out[static_cast<std::size_t>(i * 4)] = static_cast<std::uint8_t>((words[i] >> 24) & 0xFFU);
+    out[static_cast<std::size_t>(i * 4 + 1)] = static_cast<std::uint8_t>((words[i] >> 16) & 0xFFU);
+    out[static_cast<std::size_t>(i * 4 + 2)] = static_cast<std::uint8_t>((words[i] >> 8) & 0xFFU);
+    out[static_cast<std::size_t>(i * 4 + 3)] = static_cast<std::uint8_t>(words[i] & 0xFFU);
+  }
+  return out;
+}
+
+std::string sha1_hexdigest(const std::string& input) {
+  static constexpr char hex[] = "0123456789abcdef";
+  const auto digest = sha1_digest(input);
+  std::string out;
+  out.reserve(40);
+  for (std::uint8_t b : digest) {
+    out.push_back(hex[(b >> 4) & 0x0F]);
+    out.push_back(hex[b & 0x0F]);
+  }
+  return out;
+}
+
+bool parse_ipv4_literal(const std::string& text, std::uint32_t& out) {
+  std::uint32_t parts[4]{};
+  std::size_t start = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (start >= text.size()) return false;
+    std::size_t end = text.find('.', start);
+    if (i == 3) {
+      end = text.size();
+    } else if (end == std::string::npos) {
+      return false;
+    }
+    if (end == start) return false;
+    unsigned long value = 0;
+    for (std::size_t pos = start; pos < end; ++pos) {
+      if (!std::isdigit(static_cast<unsigned char>(text[pos]))) return false;
+      value = value * 10UL + static_cast<unsigned long>(text[pos] - '0');
+      if (value > 255UL) return false;
+    }
+    parts[i] = static_cast<std::uint32_t>(value);
+    start = end + 1;
+  }
+  out = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+  return true;
+}
+
+std::string ipv4_to_string(std::uint32_t ip) {
+  return std::to_string((ip >> 24) & 0xFFU) + "." +
+         std::to_string((ip >> 16) & 0xFFU) + "." +
+         std::to_string((ip >> 8) & 0xFFU) + "." +
+         std::to_string(ip & 0xFFU);
+}
+
+bool parse_ipv4_cidr(const std::string& text, std::uint64_t& start, std::uint64_t& end) {
+  const std::size_t slash = text.find('/');
+  const std::string ip_text = slash == std::string::npos ? text : text.substr(0, slash);
+  int prefix = 32;
+  if (slash != std::string::npos) {
+    const std::string prefix_text = text.substr(slash + 1);
+    if (prefix_text.empty()) return false;
+    prefix = std::stoi(prefix_text);
+    if (prefix < 0 || prefix > 32) return false;
+  }
+  std::uint32_t ip = 0;
+  if (!parse_ipv4_literal(ip_text, ip)) return false;
+  const std::uint32_t mask = prefix == 0 ? 0U : static_cast<std::uint32_t>(0xFFFFFFFFU << (32 - prefix));
+  const std::uint32_t network = ip & mask;
+  const std::uint32_t broadcast = network | ~mask;
+  start = static_cast<std::uint64_t>(network);
+  end = static_cast<std::uint64_t>(broadcast);
+  return true;
+}
+
+bool parse_hextet(const std::string& token, std::uint16_t& out) {
+  if (token.empty() || token.size() > 4) return false;
+  unsigned value = 0;
+  for (char ch : token) {
+    value <<= 4U;
+    if (ch >= '0' && ch <= '9') {
+      value += static_cast<unsigned>(ch - '0');
+    } else if (ch >= 'a' && ch <= 'f') {
+      value += static_cast<unsigned>(ch - 'a' + 10);
+    } else if (ch >= 'A' && ch <= 'F') {
+      value += static_cast<unsigned>(ch - 'A' + 10);
+    } else {
+      return false;
+    }
+  }
+  out = static_cast<std::uint16_t>(value);
+  return true;
+}
+
+bool parse_ipv6_literal(const std::string& text, unsigned __int128& out) {
+  if (text.empty()) return false;
+  std::vector<std::uint16_t> left;
+  std::vector<std::uint16_t> right;
+  const std::size_t compress = text.find("::");
+  if (compress != std::string::npos && text.find("::", compress + 2) != std::string::npos) return false;
+
+  auto parse_side = [](const std::string& side, std::vector<std::uint16_t>& words) -> bool {
+    if (side.empty()) return true;
+    std::size_t start = 0;
+    while (start <= side.size()) {
+      std::size_t end = side.find(':', start);
+      if (end == std::string::npos) end = side.size();
+      std::uint16_t word = 0;
+      if (!parse_hextet(side.substr(start, end - start), word)) return false;
+      words.push_back(word);
+      if (end == side.size()) break;
+      start = end + 1;
+    }
+    return true;
+  };
+
+  if (compress == std::string::npos) {
+    if (!parse_side(text, left) || left.size() != 8) return false;
+  } else {
+    if (!parse_side(text.substr(0, compress), left)) return false;
+    if (!parse_side(text.substr(compress + 2), right)) return false;
+    if (left.size() + right.size() >= 8) return false;
+  }
+
+  std::array<std::uint16_t, 8> words{};
+  std::size_t pos = 0;
+  for (std::uint16_t w : left) words[pos++] = w;
+  if (compress != std::string::npos) {
+    const std::size_t zeros = 8 - left.size() - right.size();
+    pos += zeros;
+    for (std::size_t i = 0; i < right.size(); ++i) words[pos + i] = right[i];
+  }
+
+  out = 0;
+  for (std::uint16_t w : words) {
+    out = (out << 16) | static_cast<unsigned __int128>(w);
+  }
+  return true;
+}
+
+std::string ipv6_to_string(unsigned __int128 ip) {
+  std::array<std::uint16_t, 8> words{};
+  for (int i = 7; i >= 0; --i) {
+    words[static_cast<std::size_t>(i)] = static_cast<std::uint16_t>(ip & 0xFFFFU);
+    ip >>= 16;
+  }
+
+  int best_start = -1;
+  int best_len = 0;
+  for (int i = 0; i < 8;) {
+    if (words[static_cast<std::size_t>(i)] != 0) {
+      ++i;
+      continue;
+    }
+    int j = i;
+    while (j < 8 && words[static_cast<std::size_t>(j)] == 0) ++j;
+    if (j - i > best_len && j - i >= 2) {
+      best_start = i;
+      best_len = j - i;
+    }
+    i = j;
+  }
+
+  std::ostringstream oss;
+  oss << std::hex << std::nouppercase;
+  bool just_compressed = false;
+  for (int i = 0; i < 8; ++i) {
+    if (i == best_start) {
+      oss << "::";
+      just_compressed = true;
+      i += best_len - 1;
+      if (i == 7) break;
+      continue;
+    }
+    if (i > 0 && !just_compressed) oss << ':';
+    oss << words[static_cast<std::size_t>(i)];
+    just_compressed = false;
+  }
+  return oss.str();
+}
+
+std::uint64_t clamp_u128_to_u64(unsigned __int128 value) {
+  const unsigned __int128 max_u64 = static_cast<unsigned __int128>(std::numeric_limits<std::uint64_t>::max());
+  return value > max_u64 ? std::numeric_limits<std::uint64_t>::max() : static_cast<std::uint64_t>(value);
+}
+
+bool parse_ipv6_cidr(const std::string& text, unsigned __int128& start, unsigned __int128& end) {
+  const std::size_t slash = text.find('/');
+  const std::string ip_text = slash == std::string::npos ? text : text.substr(0, slash);
+  int prefix = 128;
+  if (slash != std::string::npos) {
+    const std::string prefix_text = text.substr(slash + 1);
+    if (prefix_text.empty()) return false;
+    prefix = std::stoi(prefix_text);
+    if (prefix < 0 || prefix > 128) return false;
+  }
+  unsigned __int128 ip = 0;
+  if (!parse_ipv6_literal(ip_text, ip)) return false;
+  const unsigned __int128 all = ~static_cast<unsigned __int128>(0);
+  const unsigned __int128 mask = prefix == 0 ? 0 : (all << (128 - prefix));
+  start = ip & mask;
+  end = start | (~mask);
+  return true;
+}
+
+struct IpSpan {
+  unsigned __int128 start = 0;
+  unsigned __int128 end = 0;
+  std::uint64_t width = 0;
+  int family = 4;
+};
+
+bool parse_ip_span_string(const std::string& text, int family, IpSpan& span) {
+  if (family == 4) {
+    std::uint64_t start = 0;
+    std::uint64_t end = 0;
+    if (!parse_ipv4_cidr(text, start, end)) return false;
+    span.start = static_cast<unsigned __int128>(start);
+    span.end = static_cast<unsigned __int128>(end);
+    span.width = static_cast<std::uint64_t>(end - start + 1ULL);
+    span.family = 4;
+    return true;
+  }
+  unsigned __int128 start = 0;
+  unsigned __int128 end = 0;
+  if (!parse_ipv6_cidr(text, start, end)) return false;
+  span.start = start;
+  span.end = end;
+  span.width = clamp_u128_to_u64(end - start + 1);
+  span.family = 6;
+  return true;
+}
+
+bool parse_ip_literal_for_family(const std::string& text, int family, unsigned __int128& out) {
+  if (family == 4) {
+    std::uint32_t ip = 0;
+    if (!parse_ipv4_literal(text, ip)) return false;
+    out = static_cast<unsigned __int128>(ip);
+    return true;
+  }
+  return parse_ipv6_literal(text, out);
+}
+
+std::string ip_to_string(unsigned __int128 ip, int family) {
+  if (family == 4) {
+    return ipv4_to_string(static_cast<std::uint32_t>(ip));
+  }
+  return ipv6_to_string(ip);
+}
+
 Profile parse_profile(const py::dict& profile_dict) {
   Profile profile;
   profile.protocol = py::cast<std::string>(profile_dict["protocol"]);
@@ -102,33 +427,28 @@ RuntimeConfig parse_runtime_cfg(const py::dict& cfg_dict) {
 }
 
 std::uint64_t ip_range_size(const py::handle& entry, int family) {
-  py::module_ ip_mod = py::module_::import("ipaddress");
   if (py::isinstance<py::str>(entry)) {
-    py::object net = ip_mod.attr("ip_network")(entry, py::arg("strict") = false);
-    int version = py::cast<int>(net.attr("version"));
-    if (version != family) {
+    IpSpan span;
+    if (!parse_ip_span_string(py::cast<std::string>(entry), family, span)) {
       throw std::runtime_error("topology ip family mismatch");
     }
-    return py::cast<std::uint64_t>(net.attr("num_addresses"));
+    return span.width;
   }
   if (py::isinstance<py::dict>(entry)) {
     py::dict d = py::cast<py::dict>(entry);
     if (!d.contains("start") || !d.contains("end")) {
       throw std::runtime_error("ip range object requires start/end");
     }
-    py::object start_ip = ip_mod.attr("ip_address")(d["start"]);
-    py::object end_ip = ip_mod.attr("ip_address")(d["end"]);
-    int v_start = py::cast<int>(start_ip.attr("version"));
-    int v_end = py::cast<int>(end_ip.attr("version"));
-    if (v_start != family || v_end != family) {
+    unsigned __int128 start_i = 0;
+    unsigned __int128 end_i = 0;
+    if (!parse_ip_literal_for_family(py::cast<std::string>(d["start"]), family, start_i) ||
+        !parse_ip_literal_for_family(py::cast<std::string>(d["end"]), family, end_i)) {
       throw std::runtime_error("topology ip range wrong family");
     }
-    std::uint64_t start_i = py::cast<std::uint64_t>(py::int_(start_ip));
-    std::uint64_t end_i = py::cast<std::uint64_t>(py::int_(end_ip));
     if (end_i < start_i) {
       throw std::runtime_error("topology ip range start>end");
     }
-    return static_cast<std::uint64_t>(end_i - start_i + 1ULL);
+    return clamp_u128_to_u64(end_i - start_i + 1);
   }
   throw std::runtime_error("ip range must be cidr string or {start,end}");
 }
@@ -228,9 +548,7 @@ py::dict parse_compile_topology_json_native(const std::string& json_text, int se
   digest_payload["seed"] = py::int_(seed);
   digest_payload["spec"] = root;
   py::str normalized = py::cast<py::str>(json_mod.attr("dumps")(digest_payload, py::arg("sort_keys") = true, py::arg("separators") = py::make_tuple(",", ":")));
-  py::module_ hashlib = py::module_::import("hashlib");
-  py::object sha = hashlib.attr("sha1")(py::bytes(normalized));
-  std::string hexdigest = py::cast<std::string>(sha.attr("hexdigest")());
+  std::string hexdigest = sha1_hexdigest(py::cast<std::string>(normalized));
   std::string plan_id = hexdigest.substr(0, 16);
 
   py::dict out;
@@ -259,15 +577,12 @@ py::list topology_tuple_preview_native(const py::dict& compiled_plan, int sample
   if (tuple_gen.contains("port_allocator")) {
     allocator = py::cast<std::string>(tuple_gen["port_allocator"]);
   }
-  py::module_ hashlib = py::module_::import("hashlib");
-  py::module_ ip_mod = py::module_::import("ipaddress");
-
   auto stable_u01 = [&](int idx, const std::string& salt) -> double {
     const std::string token = std::to_string(seed) + ":" + std::to_string(idx) + ":" + salt;
-    const std::string raw = py::cast<std::string>(hashlib.attr("sha1")(py::bytes(token)).attr("digest")());
+    const auto raw = sha1_digest(token);
     std::uint64_t v = 0;
-    for (int i = 0; i < 8 && i < static_cast<int>(raw.size()); ++i) {
-      v = (v << 8) | static_cast<std::uint8_t>(raw[static_cast<std::size_t>(i)]);
+    for (int i = 0; i < 8; ++i) {
+      v = (v << 8) | static_cast<std::uint64_t>(raw[static_cast<std::size_t>(i)]);
     }
     const std::uint64_t frac = v & ((1ULL << 53) - 1ULL);
     return static_cast<double>(frac) / static_cast<double>(1ULL << 53);
@@ -305,33 +620,29 @@ py::list topology_tuple_preview_native(const py::dict& compiled_plan, int sample
     } else {
       return std::string();
     }
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::vector<IpSpan> spans;
     std::uint64_t total = 0;
     for (const auto& it : entries) {
-      std::uint64_t start_i = 0;
-      std::uint64_t end_i = 0;
+      IpSpan span;
       if (py::isinstance<py::str>(it)) {
-        py::object net = ip_mod.attr("ip_network")(it, py::arg("strict") = false);
-        int version = py::cast<int>(net.attr("version"));
-        if (version != family) continue;
-        start_i = py::cast<std::uint64_t>(py::int_(net.attr("network_address")));
-        end_i = py::cast<std::uint64_t>(py::int_(net.attr("broadcast_address")));
+        if (!parse_ip_span_string(py::cast<std::string>(it), family, span)) continue;
       } else if (py::isinstance<py::dict>(it)) {
         py::dict d = py::cast<py::dict>(it);
         if (!d.contains("start") || !d.contains("end")) continue;
-        py::object sip = ip_mod.attr("ip_address")(d["start"]);
-        py::object eip = ip_mod.attr("ip_address")(d["end"]);
-        int sv = py::cast<int>(sip.attr("version"));
-        int ev = py::cast<int>(eip.attr("version"));
-        if (sv != family || ev != family) continue;
-        start_i = py::cast<std::uint64_t>(py::int_(sip));
-        end_i = py::cast<std::uint64_t>(py::int_(eip));
+        if (!parse_ip_literal_for_family(py::cast<std::string>(d["start"]), family, span.start) ||
+            !parse_ip_literal_for_family(py::cast<std::string>(d["end"]), family, span.end)) {
+          continue;
+        }
+        if (span.end < span.start) continue;
+        span.width = clamp_u128_to_u64(span.end - span.start + 1);
+        span.family = family;
       } else {
         continue;
       }
-      if (end_i < start_i) continue;
-      spans.emplace_back(start_i, end_i);
-      total += static_cast<std::uint64_t>(end_i - start_i + 1ULL);
+      if (span.width == 0) continue;
+      spans.push_back(span);
+      const std::uint64_t remaining = std::numeric_limits<std::uint64_t>::max() - total;
+      total = span.width > remaining ? std::numeric_limits<std::uint64_t>::max() : total + span.width;
     }
     if (spans.empty() || total == 0) return std::string();
     std::uint64_t off = 0;
@@ -345,15 +656,12 @@ py::list topology_tuple_preview_native(const py::dict& compiled_plan, int sample
       off = static_cast<std::uint64_t>(u * static_cast<double>(total - 1));
     }
     for (const auto& span : spans) {
-      std::uint64_t width = static_cast<std::uint64_t>(span.second - span.first + 1ULL);
-      if (off < width) {
-        py::object ip_obj = ip_mod.attr("ip_address")(py::int_(span.first + off));
-        return py::cast<std::string>(py::str(ip_obj));
+      if (off < span.width) {
+        return ip_to_string(span.start + static_cast<unsigned __int128>(off), family);
       }
-      off -= width;
+      off -= span.width;
     }
-    py::object ip_obj = ip_mod.attr("ip_address")(py::int_(spans.back().first));
-    return py::cast<std::string>(py::str(ip_obj));
+    return ip_to_string(spans.back().start, family);
   };
 
   auto parse_port_range = [](const py::handle& item) -> std::pair<int, int> {
@@ -412,15 +720,16 @@ py::list topology_tuple_preview_native(const py::dict& compiled_plan, int sample
   auto pick_server_port = [&](const py::list& ports, int idx, const std::string& salt) -> int {
     if (ports.empty()) return 80;
     int pos = 0;
+    const int port_count = static_cast<int>(py::len(ports));
     if (allocator == "sequential") {
-      pos = idx % py::len(ports);
+      pos = idx % port_count;
     } else if (allocator == "random") {
-      pos = static_cast<int>(stable_u01(idx, salt + ":sport_random") * static_cast<double>(py::len(ports)));
+      pos = static_cast<int>(stable_u01(idx, salt + ":sport_random") * static_cast<double>(port_count));
     } else {
-      pos = static_cast<int>(stable_u01(idx, salt + ":sport_hash") * static_cast<double>(py::len(ports)));
+      pos = static_cast<int>(stable_u01(idx, salt + ":sport_hash") * static_cast<double>(port_count));
     }
     if (pos < 0) pos = 0;
-    if (pos >= py::len(ports)) pos = py::len(ports) - 1;
+    if (pos >= port_count) pos = port_count - 1;
     return py::cast<int>(ports[static_cast<std::size_t>(pos)]);
   };
 
