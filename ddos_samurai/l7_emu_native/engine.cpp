@@ -443,6 +443,7 @@ struct NativeRuntime {
     std::vector<std::vector<TimerEntry>> timer_slots{};
     long long last_timer_tick_ms{0};
     long long dispatch_ready_ms{0};
+    std::size_t h2_dispatch_cursor{0};
     bool in_ready_queue{false};
 #ifdef SAMURAI_WITH_NGHTTP2
     std::vector<std::unique_ptr<H2ClientSession>> h2_sessions{};
@@ -782,7 +783,7 @@ struct H2ConnectionContext {
   std::size_t bytes_received{0};
   std::map<std::string, std::string>* captures{nullptr};
   H2ClientSession* owner_session{nullptr};
-  std::map<int32_t, std::unique_ptr<H2StreamState>> active_streams;
+  std::unordered_map<int32_t, std::unique_ptr<H2StreamState>> active_streams;
 #ifdef SAMURAI_WITH_OPENSSL
   SSL_CTX* tls_ctx{nullptr};
   SSL* ssl{nullptr};
@@ -1021,6 +1022,54 @@ bool wait_for_fd(int epoll_fd, int fd, uint32_t events, int timeout_ms) {
     return false;
   }
   return (out.events & events) != 0 || (out.events & (EPOLLERR | EPOLLHUP)) != 0;
+}
+
+bool set_fd_nonblocking(int fd) {
+  const int flags = ::fcntl(fd, F_GETFL, 0);
+  if (flags < 0) {
+    return false;
+  }
+  return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+int connect_h2_tcp_socket(const Profile& profile, int epoll_fd) {
+  addrinfo hints {};
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_family = AF_UNSPEC;
+  addrinfo* results = nullptr;
+  const std::string port = std::to_string(profile.target_port);
+  if (::getaddrinfo(profile.target_ip.c_str(), port.c_str(), &hints, &results) != 0) {
+    return -1;
+  }
+  int fd = -1;
+  for (addrinfo* ai = results; ai != nullptr; ai = ai->ai_next) {
+    fd = ::socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+    if (fd < 0) {
+      continue;
+    }
+    if (!set_fd_nonblocking(fd)) {
+      ::close(fd);
+      fd = -1;
+      continue;
+    }
+    const int rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
+    if (rc == 0) {
+      break;
+    }
+    if (errno == EINPROGRESS) {
+      if (wait_for_fd(epoll_fd, fd, EPOLLOUT, profile.timeout_ms)) {
+        int so_error = 0;
+        socklen_t so_error_len = sizeof(so_error);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) == 0 && so_error == 0) {
+          break;
+        }
+      }
+    }
+    ::close(fd);
+    fd = -1;
+  }
+  ::freeaddrinfo(results);
+  return fd;
 }
 
 std::size_t find_crlf(std::string_view payload, std::size_t start) {
@@ -1953,17 +2002,20 @@ std::map<std::string, double> fail_visible_stats(
   return out;
 }
 
-std::string build_h2_preface_and_settings() {
-  std::string out("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-  // Empty SETTINGS frame: len=0, type=0x4, flags=0x0, stream=0.
-  const unsigned char settings_frame[9] = {
-      0x00, 0x00, 0x00,
-      0x04,
-      0x00,
-      0x00, 0x00, 0x00, 0x00,
-  };
-  out.append(reinterpret_cast<const char*>(settings_frame), sizeof(settings_frame));
-  return out;
+const std::string& build_h2_preface_and_settings() {
+  static const std::string preface = []() {
+    std::string out("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    // Empty SETTINGS frame: len=0, type=0x4, flags=0x0, stream=0.
+    const unsigned char settings_frame[9] = {
+        0x00, 0x00, 0x00,
+        0x04,
+        0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    out.append(reinterpret_cast<const char*>(settings_frame), sizeof(settings_frame));
+    return out;
+  }();
+  return preface;
 }
 
 bool configure_custom_tcp_bridge(const Profile& profile);
@@ -2058,7 +2110,7 @@ std::map<std::string, double> run_http2_custom_tcp_profile(
   int active_streams_peak = 0;
   std::size_t tx_bytes = 0;
   std::size_t rx_bytes = 0;
-  const std::string preface = build_h2_preface_and_settings();
+  const std::string& preface = build_h2_preface_and_settings();
   int rr = 0;
   std::size_t rr_cursor = 0;
 
@@ -3311,8 +3363,19 @@ bool setup_tls(H2ConnectionContext& ctx, const Profile& profile) {
   if (SSL_set_fd(ctx.ssl, ctx.fd) != 1) {
     return false;
   }
-  if (SSL_connect(ctx.ssl) != 1) {
-    return false;
+  SSL_set_connect_state(ctx.ssl);
+  while (true) {
+    const int rc = SSL_connect(ctx.ssl);
+    if (rc == 1) {
+      break;
+    }
+    const int err = SSL_get_error(ctx.ssl, rc);
+    if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+      return false;
+    }
+    if (!wait_for_fd(ctx.epoll_fd, ctx.fd, err == SSL_ERROR_WANT_WRITE ? EPOLLOUT : EPOLLIN, ctx.timeout_ms)) {
+      return false;
+    }
   }
   const unsigned char* alpn = nullptr;
   unsigned int alpn_len = 0;
@@ -3512,6 +3575,8 @@ bool open_h2_client_session(
   client.ctx.transport_backend = parse_transport_backend(profile);
   client.ctx.owner_session = &client;
   client.ctx.authority = profile.host_header.empty() ? profile.target_ip : profile.host_header;
+  client.ctx.active_streams.reserve(
+      static_cast<std::size_t>(std::max(1, profile.max_streams_per_connection)));
   if (client.ctx.authority.find(':') == std::string::npos && profile.target_port > 0) {
     client.ctx.authority += ":" + std::to_string(profile.target_port);
   }
@@ -3544,7 +3609,12 @@ bool open_h2_client_session(
     client.ctx.tls_handshake_complete = !client.ctx.use_tls;
     client.ctx.fd = 1;
   } else {
-    client.ctx.fd = -1;
+    client.ctx.fd = connect_h2_tcp_socket(profile, epoll_fd);
+    if (client.ctx.fd < 0) {
+      stats.errors += static_cast<int>(request_count);
+      stats.expectation_failures += static_cast<int>(request_count);
+      return false;
+    }
     client.ctx.tls_handshake_complete = !client.ctx.use_tls;
   }
   if (!setup_tls(client.ctx, profile)) {
@@ -3906,68 +3976,28 @@ std::map<std::string, double> run_http2_profile(
     auto session_load = [&](const H2ClientSession& client) {
       return client.pending_requests.size() + client.ctx.active_streams.size();
     };
-    auto choose_h2_session = [&]() -> H2ClientSession* {
-      H2ClientSession* best_ready = nullptr;
-      H2ClientSession* best_draining = nullptr;
-      H2ClientSession* replace_now = nullptr;
-      H2ClientSession* best_closed = nullptr;
-      for (auto& session_ptr : local_shard.h2_sessions) {
-        if (!session_ptr) {
-          continue;
-        }
-        auto& client = *session_ptr;
-        client.ctx.captures = &captures;
-        if (!client.ready && client.unhealthy_until_ms > now_ms) {
-          local_shard.dispatch_ready_ms = std::max(local_shard.dispatch_ready_ms, client.unhealthy_until_ms);
-          continue;
-        }
-        if (client.replacement_mode == H2LaneReplacementMode::ReplaceNow && replace_now == nullptr) {
-          replace_now = &client;
-          continue;
-        }
-        if (client.ready && client.ctx.fd >= 0 && client.ctx.goaway == 0 &&
-            session_load(client) < stream_budget) {
-          if (best_ready == nullptr || session_load(client) < session_load(*best_ready)) {
-            best_ready = &client;
-          }
-          continue;
-        }
-        if (client.ready && client.ctx.fd >= 0 &&
-            client.replacement_mode == H2LaneReplacementMode::Draining &&
-            session_load(client) < stream_budget) {
-          if (best_draining == nullptr || session_load(client) < session_load(*best_draining)) {
-            best_draining = &client;
-          }
-          continue;
-        }
-        if (!client.ready && best_closed == nullptr) {
-          best_closed = &client;
-        }
+    const std::size_t session_count = local_shard.h2_sessions.size();
+    if (session_count == 0) {
+      return;
+    }
+    std::size_t visited = 0;
+    bool made_progress = false;
+    while ((!local_shard.pending_h2_requests.empty() || !made_progress) && visited < session_count) {
+      const std::size_t session_idx = (local_shard.h2_dispatch_cursor + visited) % session_count;
+      auto& selected_ptr = local_shard.h2_sessions[session_idx];
+      visited += 1;
+      if (!selected_ptr) {
+        continue;
       }
-      if (best_ready != nullptr) {
-        return best_ready;
-      }
-      if (replace_now != nullptr) {
-        return replace_now;
-      }
-      if (best_draining != nullptr) {
-        return best_draining;
-      }
-      return best_closed;
-    };
-
-    std::size_t rounds = 0;
-    while ((!local_shard.pending_h2_requests.empty() || rounds == 0) &&
-           rounds < std::max<std::size_t>(1, local_shard.h2_sessions.size())) {
-      H2ClientSession* selected = choose_h2_session();
+      H2ClientSession* selected = selected_ptr.get();
       if (selected == nullptr) {
         break;
       }
       auto& client = *selected;
       client.ctx.captures = &captures;
       if (!client.ready && client.unhealthy_until_ms > now_ms) {
-        local_shard.dispatch_ready_ms = client.unhealthy_until_ms;
-        break;
+        local_shard.dispatch_ready_ms = std::max(local_shard.dispatch_ready_ms, client.unhealthy_until_ms);
+        continue;
       }
       if (client.replacement_mode == H2LaneReplacementMode::ReplaceNow) {
         stats.replace_now_decisions += 1;
@@ -3978,8 +4008,17 @@ std::map<std::string, double> run_http2_profile(
         }
         close_h2_client_session(client);
       }
+      if (client.ready && client.ctx.fd >= 0 && client.ctx.goaway == 0 &&
+          session_load(client) >= stream_budget) {
+        continue;
+      }
+      if (client.ready && client.ctx.fd >= 0 &&
+          client.replacement_mode == H2LaneReplacementMode::Draining &&
+          session_load(client) >= stream_budget) {
+        continue;
+      }
       if (!client.ready && local_shard.pending_h2_requests.empty()) {
-        break;
+        continue;
       }
       if (!client.ready) {
         if (!open_h2_client_session(
@@ -3990,7 +4029,6 @@ std::map<std::string, double> run_http2_profile(
                 client,
                 stats,
                 local_shard.pending_h2_requests.size())) {
-          rounds += 1;
           continue;
         }
         stats.goaway_replacements += 1;
@@ -4007,8 +4045,9 @@ std::map<std::string, double> run_http2_profile(
       flush_ready_h2_completions(runtime, shard_idx, client);
       const bool progressed =
           local_shard.pending_h2_requests.size() < pending_before || session_load(client) != load_before;
-      rounds += 1;
-      if (!progressed && local_shard.pending_h2_requests.empty()) {
+      made_progress = made_progress || progressed;
+      local_shard.h2_dispatch_cursor = (session_idx + 1) % session_count;
+      if (local_shard.pending_h2_requests.empty()) {
         break;
       }
     }
