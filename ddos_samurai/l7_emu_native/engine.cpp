@@ -28,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -203,18 +204,20 @@ constexpr std::size_t kArenaBucketMediumSlots = 4;
 constexpr std::size_t kArenaBucketPathSlots = 2;
 constexpr std::size_t kArenaBucketBodySlots = 2;
 constexpr std::size_t kArenaBucketLargeSlots = 1;
+constexpr std::size_t kArenaOverflowSlots = 8;
 constexpr std::size_t kReusableHeaderSlotReserve = 16;
 constexpr std::size_t kReusableResponseHeaderReserve = 16;
 constexpr std::size_t kReusableResponseBodyBytes = 4096;
 
 struct ArenaStringBucket {
   std::size_t capacity{0};
-  std::deque<std::string> slots{};
+  std::vector<std::string> slots{};
   std::vector<unsigned char> in_use{};
 };
 
 struct LaneStringArena {
   std::vector<ArenaStringBucket> buckets{};
+  ArenaStringBucket overflow{};
 };
 
 struct ArenaStringLease {
@@ -259,12 +262,23 @@ struct ArenaStringLease {
   ~ArenaStringLease() { reset(); }
 
   void reset() {
-    if (arena == nullptr || value == nullptr || bucket_idx >= arena->buckets.size()) {
+    if (arena == nullptr || value == nullptr) {
       arena = nullptr;
       value = nullptr;
       return;
     }
-    auto& bucket = arena->buckets[bucket_idx];
+    ArenaStringBucket* bucket_ptr = nullptr;
+    if (bucket_idx < arena->buckets.size()) {
+      bucket_ptr = &arena->buckets[bucket_idx];
+    } else if (bucket_idx == arena->buckets.size()) {
+      bucket_ptr = &arena->overflow;
+    }
+    if (bucket_ptr == nullptr) {
+      arena = nullptr;
+      value = nullptr;
+      return;
+    }
+    auto& bucket = *bucket_ptr;
     if (slot_idx < bucket.in_use.size()) {
       bucket.in_use[slot_idx] = 0;
     }
@@ -369,7 +383,7 @@ struct NativeRuntime {
     std::vector<std::unique_ptr<H1Lane>> h1_lanes{};
     std::deque<H1RequestSpec> pending_h1_requests{};
     std::deque<H2RequestSpec> pending_h2_requests{};
-    std::map<int, RegisteredLaneFd> active_fd_registry{};
+    std::unordered_map<int, RegisteredLaneFd> active_fd_registry{};
     std::vector<epoll_event> ready_events{};
     std::vector<std::vector<TimerEntry>> timer_slots{};
     long long last_timer_tick_ms{0};
@@ -554,11 +568,14 @@ LaneStringArena& ensure_lane_string_arena(std::unique_ptr<LaneStringArena>& aren
         ArenaStringBucket{kArenaBucketBodyBytes, {}, {}},
         ArenaStringBucket{kArenaBucketLargeBytes, {}, {}},
     };
+    arena_ptr->overflow.capacity = 0;
     auto prewarm_bucket = [](ArenaStringBucket& bucket, std::size_t slot_count) {
-      for (std::size_t slot_idx = 0; slot_idx < slot_count; ++slot_idx) {
-        bucket.slots.emplace_back();
-        bucket.in_use.push_back(0);
-        ensure_reusable_string_capacity(bucket.slots.back(), bucket.capacity);
+      bucket.slots.resize(slot_count);
+      bucket.in_use.assign(slot_count, 0);
+      for (auto& slot : bucket.slots) {
+        if (bucket.capacity > 0) {
+          ensure_reusable_string_capacity(slot, bucket.capacity);
+        }
       }
     };
     prewarm_bucket(arena_ptr->buckets[0], kArenaBucketTinySlots);
@@ -567,6 +584,7 @@ LaneStringArena& ensure_lane_string_arena(std::unique_ptr<LaneStringArena>& aren
     prewarm_bucket(arena_ptr->buckets[3], kArenaBucketPathSlots);
     prewarm_bucket(arena_ptr->buckets[4], kArenaBucketBodySlots);
     prewarm_bucket(arena_ptr->buckets[5], kArenaBucketLargeSlots);
+    prewarm_bucket(arena_ptr->overflow, kArenaOverflowSlots);
   }
   return *arena_ptr;
 }
@@ -585,12 +603,26 @@ ArenaStringLease arena_acquire_string(LaneStringArena& arena, std::size_t min_ca
       bucket.slots[slot_idx].clear();
       return ArenaStringLease{&arena, &bucket.slots[slot_idx], bucket_idx, slot_idx};
     }
-    bucket.slots.emplace_back();
-    bucket.in_use.push_back(1);
-    ensure_reusable_string_capacity(bucket.slots.back(), bucket.capacity);
-    return ArenaStringLease{&arena, &bucket.slots.back(), bucket_idx, bucket.slots.size() - 1};
+  }
+  const std::size_t overflow_bucket_idx = arena.buckets.size();
+  for (std::size_t slot_idx = 0; slot_idx < arena.overflow.in_use.size(); ++slot_idx) {
+    if (arena.overflow.in_use[slot_idx] != 0) {
+      continue;
+    }
+    arena.overflow.in_use[slot_idx] = 1;
+    auto& slot = arena.overflow.slots[slot_idx];
+    slot.clear();
+    ensure_reusable_string_capacity(slot, min_capacity);
+    return ArenaStringLease{&arena, &slot, overflow_bucket_idx, slot_idx};
   }
   return {};
+}
+
+std::string& arena_string_or_throw(ArenaStringLease& lease, const char* context) {
+  if (lease.value == nullptr) {
+    throw std::runtime_error(std::string("lane string arena exhausted: ") + context);
+  }
+  return *lease.value;
 }
 
 const std::string* find_header_value(
@@ -1238,7 +1270,7 @@ std::optional<CompletionEnvelope> pop_ready_completion(NativeRuntime& runtime) {
 }
 
 uint32_t reactor_interest_mask() {
-  return EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;
+  return EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
 }
 
 void register_h1_lane_fd(ShardState& shard, NativeRuntime::LocalShard& local_shard, H1Lane* lane) {
@@ -1619,10 +1651,8 @@ void build_http1_request_into(
   out.clear();
   auto method_lease = arena_acquire_string(arena, std::max<std::size_t>(request.method_template.static_bytes, 16));
   auto path_lease = arena_acquire_string(arena, std::max<std::size_t>(request.path_template.static_bytes, 64));
-  std::string method_fallback;
-  std::string path_fallback;
-  std::string& method = method_lease.value != nullptr ? *method_lease.value : method_fallback;
-  std::string& path = path_lease.value != nullptr ? *path_lease.value : path_fallback;
+  std::string& method = arena_string_or_throw(method_lease, "http1 method");
+  std::string& path = arena_string_or_throw(path_lease, "http1 path");
   render_capture_template_into(request.method_template, captures, method);
   render_capture_template_into(request.path_template, captures, path);
   std::size_t reserve_bytes = method.size() + path.size() + 64 +
@@ -1653,8 +1683,7 @@ void build_http1_request_into(
     auto value_lease = arena_acquire_string(
         arena,
         std::max<std::size_t>(compiled_value.static_bytes, kArenaBucketSmallBytes));
-    std::string value_fallback;
-    std::string& header_value = value_lease.value != nullptr ? *value_lease.value : value_fallback;
+    std::string& header_value = arena_string_or_throw(value_lease, "http1 header value");
     render_capture_template_into(compiled_value, captures, header_value);
     out.append(header_value);
     out.append("\r\n");
@@ -1664,21 +1693,20 @@ void build_http1_request_into(
             arena,
             std::max<std::size_t>(request.body_template->static_bytes, kArenaBucketBodyBytes))
       : ArenaStringLease{};
-  std::string body_fallback;
-  std::string& body = body_lease.value != nullptr ? *body_lease.value : body_fallback;
   if (request.body_template.has_value()) {
+    std::string& body = arena_string_or_throw(body_lease, "http1 body");
     render_capture_template_into(*request.body_template, captures, body);
-  } else {
-    body.clear();
-  }
-  if (!body.empty() && !has_content_length) {
-    out.append("Content-Length: ");
-    out.append(std::to_string(body.size()));
+    if (!body.empty() && !has_content_length) {
+      out.append("Content-Length: ");
+      out.append(std::to_string(body.size()));
+      out.append("\r\n");
+    }
     out.append("\r\n");
-  }
-  out.append("\r\n");
-  if (!body.empty()) {
-    out.append(body);
+    if (!body.empty()) {
+      out.append(body);
+    }
+  } else {
+    out.append("\r\n");
   }
   if (out.empty()) {
     std::string method_plain;
@@ -2200,6 +2228,7 @@ NativeRuntime build_runtime(const Profile& profile, const RuntimeConfig& cfg) {
         runtime.shards.empty()
             ? profile.max_connections
             : runtime.shards.back().connection_pool.max_connections));
+    local.active_fd_registry.reserve(shard_conn_budget);
     if (profile.protocol == "http2") {
 #ifdef SAMURAI_WITH_NGHTTP2
       local.h2_sessions.reserve(shard_conn_budget);
@@ -3194,15 +3223,13 @@ bool submit_h2_request(
   auto stream = acquire_h2_stream_state(client);
   {
     auto method_lease = arena_acquire_string(arena, std::max<std::size_t>(raw_request.method_template.static_bytes, 16));
-    std::string method_fallback;
-    std::string& method = method_lease.value != nullptr ? *method_lease.value : method_fallback;
+    std::string& method = arena_string_or_throw(method_lease, "http2 method");
     render_capture_template_into(raw_request.method_template, captures, method);
     stream->request_method = method;
   }
   {
     auto path_lease = arena_acquire_string(arena, std::max<std::size_t>(raw_request.path_template.static_bytes, 64));
-    std::string path_fallback;
-    std::string& path = path_lease.value != nullptr ? *path_lease.value : path_fallback;
+    std::string& path = arena_string_or_throw(path_lease, "http2 path");
     render_capture_template_into(raw_request.path_template, captures, path);
     stream->request_path = path;
   }
@@ -3220,8 +3247,7 @@ bool submit_h2_request(
     auto value_lease = arena_acquire_string(
         arena,
         std::max<std::size_t>(compiled_value.static_bytes, kArenaBucketSmallBytes));
-    std::string value_fallback;
-    std::string& value = value_lease.value != nullptr ? *value_lease.value : value_fallback;
+    std::string& value = arena_string_or_throw(value_lease, "http2 header value");
     render_capture_template_into(compiled_value, captures, value);
     stream->request_headers[idx].key = key;
     stream->request_headers[idx].value = value;
@@ -3230,8 +3256,7 @@ bool submit_h2_request(
     auto body_lease = arena_acquire_string(
         arena,
         std::max<std::size_t>(raw_request.body_template->static_bytes, kArenaBucketBodyBytes));
-    std::string body_fallback;
-    std::string& body = body_lease.value != nullptr ? *body_lease.value : body_fallback;
+    std::string& body = arena_string_or_throw(body_lease, "http2 body");
     render_capture_template_into(*raw_request.body_template, captures, body);
     stream->outbound_body = body;
   } else {
