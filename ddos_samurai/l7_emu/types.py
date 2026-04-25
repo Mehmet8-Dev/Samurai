@@ -84,6 +84,7 @@ class ConnectionTemplate:
     stateful_runtime_backend: str = "afxdp"
     stateful_runtime_strict: bool = False
     legacy_mode: bool = False
+    source_ip: str = ""
     verify: bool = True
     tls_profile_name: str = "none"
     max_connections: int = 1
@@ -105,6 +106,7 @@ class ConnectionTemplate:
             "stateful_runtime_backend": str(self.stateful_runtime_backend),
             "stateful_runtime_strict": int(bool(self.stateful_runtime_strict)),
             "legacy_mode": int(bool(self.legacy_mode)),
+            "source_ip": str(self.source_ip),
             "verify": int(bool(self.verify)),
             "tls_profile_name": str(self.tls_profile_name),
             "max_connections": int(self.max_connections),

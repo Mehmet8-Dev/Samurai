@@ -198,6 +198,7 @@ def compile_l7_profile(
     stateful_runtime_backend: Optional[str] = None,
     stateful_runtime_strict: bool = False,
     legacy_mode: bool = True,
+    source_ip: str = "",
     template_mode: str = "compat",
     compat_mode: str = "http1",
     verify: bool = True,
@@ -235,6 +236,12 @@ def compile_l7_profile(
     paths = _coerce_paths(http_path)
     method = str(http_method or "GET").upper()
     scheme_norm = str((profile_data or {}).get("scheme", scheme) or scheme).strip().lower()
+    source_ip_norm = str(
+        source_ip
+        or (profile_data or {}).get("source_ip", "")
+        or (profile_data or {}).get("client_ip", "")
+        or ""
+    ).strip()
     if str(template_mode or "compat").strip().lower() == "profile":
         if not profile_data:
             raise ValueError("profile mode requires profile_data")
@@ -295,6 +302,7 @@ def compile_l7_profile(
         stateful_runtime_backend=runtime_backend,
         stateful_runtime_strict=bool(stateful_runtime_strict),
         legacy_mode=bool(legacy_mode),
+        source_ip=source_ip_norm,
         verify=bool(verify),
         tls_profile_name=str(tls_profile_name or "none"),
         max_connections=max(1, int(concurrency or 1)),
