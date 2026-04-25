@@ -401,6 +401,11 @@ Profile parse_profile(const py::dict& profile_dict) {
   if (conn.contains("legacy_mode")) {
     profile.legacy_mode = py::cast<int>(conn["legacy_mode"]);
   }
+  if (conn.contains("source_ip")) {
+    profile.source_ip = py::cast<std::string>(conn["source_ip"]);
+  } else if (conn.contains("client_ip")) {
+    profile.source_ip = py::cast<std::string>(conn["client_ip"]);
+  }
   profile.target_ip = py::cast<std::string>(conn["target_ip"]);
   profile.target_port = py::cast<int>(conn["target_port"]);
   profile.scheme = py::cast<std::string>(conn["scheme"]);
