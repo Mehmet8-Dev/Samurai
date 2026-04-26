@@ -2200,11 +2200,16 @@ std::map<std::string, double> run_http2_custom_tcp_profile(
   out["runtime_h2_transport_mode_custom_tcp"] = 1.0;
   out["h2_native_capability_available"] = (caps.openssl && caps.nghttp2) ? 1.0 : 0.0;
   if (out["runtime_transport_custom_tcp_bridge_ready"] == 0.0) {
-    auto failed = fail_visible_stats(profile, caps, "custom_tcp_transport_not_yet_wired");
-    failed["runtime_transport_custom_tcp_bridge_ready"] = 0.0;
-    failed["runtime_h2_transport_contract"] = 0.0;
-    failed["runtime_h2_transport_mode_custom_tcp"] = 1.0;
-    return failed;
+    if (profile.stateful_runtime_strict != 0) {
+      auto failed = fail_visible_stats(profile, caps, "custom_tcp_transport_not_yet_wired");
+      failed["runtime_transport_custom_tcp_bridge_ready"] = 0.0;
+      failed["runtime_h2_transport_contract"] = 0.0;
+      failed["runtime_h2_transport_mode_custom_tcp"] = 1.0;
+      return failed;
+    }
+    // Non-strict mode keeps going best-effort even when the custom TCP bridge
+    // is not ready; downstream enqueue/runtime counters decide final outcome.
+    out["runtime_failure_reason_code"] = runtime_failure_reason_code("custom_tcp_transport_not_yet_wired");
   }
 
   uint32_t dst_ip = 0;
@@ -4410,9 +4415,13 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
   if (transport_backend == TransportBackend::CustomTcp) {
     out["runtime_transport_custom_tcp_bridge_ready"] = configure_custom_tcp_bridge(profile) ? 1.0 : 0.0;
     if (out["runtime_transport_custom_tcp_bridge_ready"] == 0.0) {
-      auto failed = fail_visible_stats(profile, caps, "custom_tcp_transport_not_yet_wired");
-      failed["runtime_transport_custom_tcp_bridge_ready"] = 0.0;
-      return failed;
+      if (profile.stateful_runtime_strict != 0) {
+        auto failed = fail_visible_stats(profile, caps, "custom_tcp_transport_not_yet_wired");
+        failed["runtime_transport_custom_tcp_bridge_ready"] = 0.0;
+        return failed;
+      }
+      // Non-strict mode keeps running best-effort without an early hard-fail.
+      out["runtime_failure_reason_code"] = runtime_failure_reason_code("custom_tcp_transport_not_yet_wired");
     }
   }
 

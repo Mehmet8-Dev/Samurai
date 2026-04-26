@@ -379,7 +379,10 @@ class TestL7EmuV1(unittest.TestCase):
         self.assertEqual(result["errors"], len(paths))
         self.assertEqual(result["runtime_native_hot_path_level"], "userspace_reactor_templates")
         self.assertEqual(result.get("runtime_transport_backend"), "custom_tcp")
-        self.assertIn(str(result.get("sender_fallback_reason", "none")), {"none", "custom_tcp_transport_not_yet_wired"})
+        self.assertIn(
+            str(result.get("sender_fallback_reason", "none")),
+            {"none", "custom_tcp_transport_not_yet_wired", "custom_tcp_connect_enqueue_failed"},
+        )
 
     def test_ws_fail_fast_and_quic_is_runtime_path(self):
         ws = asyncio.run(senders.websocket_sender("127.0.0.1", 80, 2, 1, "/", "ping", False))
