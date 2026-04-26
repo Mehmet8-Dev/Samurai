@@ -1,4 +1,5 @@
 import ipaddress
+import os
 import struct
 import time
 import unittest
@@ -457,6 +458,36 @@ class TestCustomTcpDataplane(unittest.TestCase):
             "tcp_peer_fin_count",
         }
         self.assertTrue(expected_keys.issubset(stats.keys()))
+
+    def test_tx_overflow_queue_is_bounded(self):
+        prev_ring = os.environ.get("SAMURAI_TCPDP_TX_RING_CAPACITY")
+        prev_overflow = os.environ.get("SAMURAI_TCPDP_TX_OVERFLOW_CAPACITY")
+        try:
+            os.environ["SAMURAI_TCPDP_TX_RING_CAPACITY"] = "2"
+            os.environ["SAMURAI_TCPDP_TX_OVERFLOW_CAPACITY"] = "3"
+            tcpdp.configure_tcp_dataplane("required", "af_xdp", 50, 3, 250, 500)
+
+            src_ip = _ip_to_int("10.12.0.2")
+            dst_ip = _ip_to_int("10.12.0.1")
+            for i in range(10):
+                flow_id = tcpdp.enqueue_tcp_connect(src_ip, dst_ip, 54000 + i, 443)
+                self.assertGreater(flow_id, 0)
+
+            consumed = int(tcpdp.consume_tcp_tx_packets(1024) or 0)
+            self.assertEqual(consumed, 5)  # 2 ring + 3 overflow cap
+
+            stats = tcpdp.snapshot_tcp_dataplane()
+            self.assertEqual(int(stats["tcp_tx_packets_queued"]), 10)
+            self.assertEqual(int(stats["tcp_tx_packets_drained"]), 5)
+        finally:
+            if prev_ring is None:
+                os.environ.pop("SAMURAI_TCPDP_TX_RING_CAPACITY", None)
+            else:
+                os.environ["SAMURAI_TCPDP_TX_RING_CAPACITY"] = prev_ring
+            if prev_overflow is None:
+                os.environ.pop("SAMURAI_TCPDP_TX_OVERFLOW_CAPACITY", None)
+            else:
+                os.environ["SAMURAI_TCPDP_TX_OVERFLOW_CAPACITY"] = prev_overflow
 
 
 if __name__ == "__main__":
