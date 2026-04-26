@@ -307,6 +307,7 @@ class TcpDataplaneCore {
   std::array<std::unordered_map<FlowKey, uint64_t, FlowKeyHash>, kFlowLockShards> flow_index_shard_{};
   size_t tx_ring_slot_size_ = 2048;
   size_t tx_ring_capacity_ = 8192;
+  size_t tx_overflow_capacity_ = 8192;
   std::vector<uint8_t> tx_ring_storage_;
   std::vector<uint16_t> tx_ring_lengths_;
   uint32_t tx_ring_head_ = 0;

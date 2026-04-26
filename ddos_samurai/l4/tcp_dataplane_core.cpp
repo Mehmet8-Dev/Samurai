@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 
@@ -74,6 +75,25 @@ inline void SaturatingDecrement(std::atomic<uint64_t>& counter) {
     }
   }
 }
+
+uint32_t env_u32_bounded(const char* name, uint32_t fallback, uint32_t min_value, uint32_t max_value) {
+  if (!name || min_value > max_value) {
+    return fallback;
+  }
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(raw, &end, 10);
+  if (end == raw || (end != nullptr && *end != '\0')) {
+    return fallback;
+  }
+  if (parsed < static_cast<unsigned long>(min_value) || parsed > static_cast<unsigned long>(max_value)) {
+    return fallback;
+  }
+  return static_cast<uint32_t>(parsed);
+}
 }  // namespace
 
 TcpDataplaneCore::TcpDataplaneCore() = default;
@@ -98,6 +118,16 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   std::lock_guard<std::mutex> sguard(state_mu_);
   std::lock_guard<std::mutex> qguard(tx_mu_);
   config_ = config;
+  tx_ring_capacity_ = static_cast<size_t>(env_u32_bounded(
+      "SAMURAI_TCPDP_TX_RING_CAPACITY",
+      static_cast<uint32_t>(tx_ring_capacity_),
+      1U,
+      1U << 20));
+  tx_overflow_capacity_ = static_cast<size_t>(env_u32_bounded(
+      "SAMURAI_TCPDP_TX_OVERFLOW_CAPACITY",
+      static_cast<uint32_t>(tx_overflow_capacity_),
+      1U,
+      1U << 20));
   next_flow_id_ = 1;
   next_ephemeral_port_ = 40000;
   seq_seed_ = 0x10203040U;
@@ -1000,6 +1030,9 @@ bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len) {
   std::vector<uint8_t> pkt = std::move(pkt_prebuilt);
   if (pkt.empty()) {
     pkt.assign(data, data + len);
+  }
+  if (tx_packets_overflow_.size() >= tx_overflow_capacity_) {
+    tx_packets_overflow_.pop_front();
   }
   tx_packets_overflow_.push_back(std::move(pkt));
   tx_packets_queued_.fetch_add(1, std::memory_order_relaxed);
