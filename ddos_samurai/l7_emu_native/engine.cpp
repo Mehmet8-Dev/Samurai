@@ -2102,6 +2102,7 @@ void init_stats(const Profile& profile, std::map<std::string, double>& out) {
   out["runtime_transport_seam_ready"] = 1.0;
   out["runtime_transport_custom_tcp_bridge_ready"] = 0.0;
   out["runtime_transport_custom_tcp_rx_bridge_active"] = 0.0;
+  out["runtime_failure_reason_code"] = 0.0;
   out["tcp_flows_active"] = 0.0;
   out["tcp_connect_attempts"] = 0.0;
   out["tcp_connect_established"] = 0.0;
@@ -2119,11 +2120,29 @@ void init_stats(const Profile& profile, std::map<std::string, double>& out) {
   out["tcp_peer_fin_count"] = 0.0;
 }
 
+double runtime_failure_reason_code(const std::string& reason) {
+  if (reason == "custom_tcp_transport_not_yet_wired") {
+    return 1.0;
+  }
+  if (reason == "custom_tcp_connect_enqueue_failed") {
+    return 2.0;
+  }
+  if (reason == "invalid_target_ip") {
+    return 3.0;
+  }
+  if (reason == "capability_unavailable") {
+    return 4.0;
+  }
+  if (reason == "nghttp2_not_built") {
+    return 5.0;
+  }
+  return 0.0;
+}
+
 std::map<std::string, double> fail_visible_stats(
     const Profile& profile,
     const RuntimeCapabilities& caps,
     const std::string& reason) {
-  (void)reason;
   const TransportBackend transport_backend = parse_transport_backend(profile);
   std::map<std::string, double> out;
   init_stats(profile, out);
@@ -2135,6 +2154,7 @@ std::map<std::string, double> fail_visible_stats(
   out["l7_expectation_failures"] = static_cast<double>(profile.flow_attempted);
   out["h2_native_capability_available"] = (caps.openssl && caps.nghttp2) ? 1.0 : 0.0;
   out["runtime_transport_custom_tcp_requested"] = transport_backend == TransportBackend::CustomTcp ? 1.0 : 0.0;
+  out["runtime_failure_reason_code"] = runtime_failure_reason_code(reason);
   return out;
 }
 

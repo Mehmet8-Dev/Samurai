@@ -64,6 +64,47 @@ std::string normalize_runtime_backend(const std::string& raw) {
   return out;
 }
 
+struct RuntimeFailureReason {
+  std::string reason;
+  std::string detail;
+};
+
+RuntimeFailureReason runtime_failure_reason_from_code(double raw_code) {
+  const long long code = static_cast<long long>(raw_code);
+  switch (code) {
+    case 1:
+      return RuntimeFailureReason{
+          "custom_tcp_transport_not_yet_wired",
+          "custom TCP bridge is not ready in native runtime",
+      };
+    case 2:
+      return RuntimeFailureReason{
+          "custom_tcp_connect_enqueue_failed",
+          "custom TCP connect enqueue failed in native runtime",
+      };
+    case 3:
+      return RuntimeFailureReason{
+          "invalid_target_ip",
+          "target IP is invalid for native runtime",
+      };
+    case 4:
+      return RuntimeFailureReason{
+          "capability_unavailable",
+          "required native capability is unavailable",
+      };
+    case 5:
+      return RuntimeFailureReason{
+          "nghttp2_not_built",
+          "nghttp2 support is not built in native runtime",
+      };
+    default:
+      return RuntimeFailureReason{
+          "custom_tcp_transport_unavailable",
+          "custom TCP transport is unavailable in native runtime",
+      };
+  }
+}
+
 std::uint32_t rotl32(std::uint32_t v, int bits) {
   return static_cast<std::uint32_t>((v << bits) | (v >> (32 - bits)));
 }
@@ -851,10 +892,13 @@ PYBIND11_MODULE(_l7_emu_native, m) {
         transport_backend == TransportBackend::CustomTcp &&
         custom_tcp_bridge_ready != out.end() &&
         custom_tcp_bridge_ready->second == 0.0) {
-      result["sender_fallback_reason"] = py::str("custom_tcp_transport_not_yet_wired");
-      result["l7_fallback_reason"] = py::str("custom_tcp_transport_not_yet_wired");
-      result["stateful_runtime_reason"] = py::str("custom_tcp_transport_not_yet_wired");
-      result["stateful_runtime_detail"] = py::str("custom TCP bridge is not ready in native runtime");
+      const auto reason_code_it = out.find("runtime_failure_reason_code");
+      const double reason_code = reason_code_it != out.end() ? reason_code_it->second : 0.0;
+      const RuntimeFailureReason resolved = runtime_failure_reason_from_code(reason_code);
+      result["sender_fallback_reason"] = py::str(resolved.reason);
+      result["l7_fallback_reason"] = py::str(resolved.reason);
+      result["stateful_runtime_reason"] = py::str(resolved.reason);
+      result["stateful_runtime_detail"] = py::str(resolved.detail);
     }
     if (profile.protocol == "http2") {
       result["h2_transport"] = py::str(
