@@ -12,6 +12,10 @@ class TestCliDryRunReporting(unittest.TestCase):
         metrics.reset_global_metrics()
         with tempfile.TemporaryDirectory() as td:
             out_base = os.path.join(td, "dryrun_unit")
+            env = os.environ.copy()
+            # Geliştirme/test ortamı için kullanmak amacıyla örnek bir lisans anahtarı "dev" olarak atanıyor
+            env["SAMURAI_LICENSE_KEY"] = "dev"
+            os.environ.update(env)
             argv = [
                 "--dry-run",
                 "--target",
