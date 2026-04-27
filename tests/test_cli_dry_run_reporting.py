@@ -14,7 +14,7 @@ class TestCliDryRunReporting(unittest.TestCase):
             out_base = os.path.join(td, "dryrun_unit")
             env = os.environ.copy()
             # Geliştirme/test ortamı için kullanmak amacıyla örnek bir lisans anahtarı "dev" olarak atanıyor
-            env["SAMURAI_LICENSE_KEY"] = "dev"
+            env["SAMURAI_LICENSE_DEV_MODE"] = "1"
             os.environ.update(env)
             argv = [
                 "--dry-run",
