@@ -1073,5 +1073,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Bu cihazı lisanstan kaldır ve çık.",
     )
+    license_group.add_argument(
+        "--license-activate",
+        action="store_true",
+        help="Bu cihazı lisans anahtarıyla etkinleştir ve çık.",
+    )
+    license_group.add_argument(
+        "--license-account",
+        action="store_true",
+        help="Lisans hesabı özetini göster (abonelik, cihazlar, süreler).",
+    )
+    license_group.add_argument(
+        "--license-trial",
+        action="store_true",
+        help="14 günlük Pro deneme sürümü başlat.",
+    )
 
     return parser

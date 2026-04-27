@@ -22,6 +22,121 @@ from .validation import (
 )
 
 
+def _show_account_info(license_key_arg: str) -> None:
+    """Lisans hesabı özetini göster — abonelik, cihazlar, süreler."""
+    import os
+    from ..licensing import validate_license
+    from ..licensing.hwid import get_hardware_id
+
+    key = license_key_arg or os.getenv("SAMURAI_LICENSE_KEY", "").strip()
+    if not key:
+        key_file = os.path.expanduser("~/.samurai/license.key")
+        if os.path.isfile(key_file):
+            key = open(key_file).read().strip()
+    if not key:
+        utils.log_critical("Hesap bilgisi için lisans anahtarı gerekli: --license-key")
+        return
+
+    utils.log_info("┌─── Samurai Hesap Bilgisi ───────────────────────────")
+
+    result = validate_license(key=key)
+    if not result.valid:
+        utils.log_critical(f"│  Lisans geçersiz: {result.reason}")
+        utils.log_info("└────────────────────────────────────────────────────")
+        return
+
+    utils.log_info(f"│  Durum         : {'✓ AKTİF' if result.valid else '✗ İNAKTİF'}")
+    utils.log_info(f"│  Tier          : {result.tier.value.upper()}")
+    utils.log_info(f"│  E-posta       : {result.customer_email}")
+    utils.log_info(f"│  Bitiş Tarihi  : {result.expires}")
+    utils.log_info(f"│  Offline Cache : {'Evet' if result.offline else 'Hayır'}")
+    utils.log_info("│")
+
+    if result.limits:
+        utils.log_info("│  ── Limitler ──")
+        w = result.limits.max_workers if result.limits.max_workers > 0 else "Sınırsız"
+        p = result.limits.max_pps if result.limits.max_pps > 0 else "Sınırsız"
+        d = result.limits.max_duration_s if result.limits.max_duration_s > 0 else "Sınırsız"
+        utils.log_info(f"│  Max Workers   : {w}")
+        utils.log_info(f"│  Max PPS       : {p}")
+        utils.log_info(f"│  Max Süre      : {d}")
+        utils.log_info(f"│  Max Cihaz     : {result.limits.max_devices}")
+        utils.log_info("│")
+
+    utils.log_info("│  ── Bu Cihaz ──")
+    utils.log_info(f"│  Hardware ID   : {get_hardware_id()}")
+    utils.log_info(f"│  Session ID    : {result.session_id}")
+    utils.log_info("│")
+
+    if result.features:
+        utils.log_info(f"│  ── Özellikler ({len(result.features)}) ──")
+        line = "│  "
+        for i, f in enumerate(sorted(result.features)):
+            if len(line) + len(f) > 58:
+                utils.log_info(line)
+                line = "│  "
+            line += f + ("  " if i < len(result.features) - 1 else "")
+        if line.strip("│ "):
+            utils.log_info(line)
+
+    utils.log_info("│")
+    utils.log_info("│  Portal: https://ddosamurai.com/hesap")
+    utils.log_info("└────────────────────────────────────────────────────")
+
+
+def _start_trial() -> None:
+    """14 günlük Pro deneme sürümü başlat."""
+    import json
+    import os
+    from urllib.request import Request, urlopen
+    from urllib.error import URLError
+    from ..licensing.constants import LICENSE_SERVER_URL
+
+    utils.log_info("14 günlük Pro deneme sürümü başlatılıyor...")
+    utils.log_info("")
+
+    email = input("  E-posta adresinizi girin: ").strip()
+    if not email or "@" not in email:
+        utils.log_critical("Geçerli bir e-posta adresi gerekli.")
+        return
+
+    try:
+        url = f"{LICENSE_SERVER_URL}/api/v1/auth/trial"
+        req = Request(
+            url,
+            data=json.dumps({"email": email}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        if data.get("license_key"):
+            utils.log_info("┌─── Deneme Sürümü Aktif ─────────────────────────")
+            utils.log_info(f"│  Lisans Anahtarı: {data['license_key']}")
+            utils.log_info(f"│  Tier           : PRO (14 gün)")
+            utils.log_info(f"│  Bitiş          : {data.get('expires', '—')}")
+            utils.log_info("│")
+            utils.log_info(f"│  Kullanım:")
+            utils.log_info(f"│  samurai --license-key {data['license_key']} -t HEDEF -p PORT")
+            utils.log_info("└──────────────────────────────────────────────────")
+
+            key_dir = os.path.expanduser("~/.samurai")
+            os.makedirs(key_dir, exist_ok=True)
+            key_path = os.path.join(key_dir, "license.key")
+            with open(key_path, "w") as f:
+                f.write(data["license_key"])
+            utils.log_info(f"  ✓ Anahtar otomatik kaydedildi: {key_path}")
+        else:
+            utils.log_critical(f"Trial başlatılamadı: {data.get('detail', 'Bilinmeyen hata')}")
+
+    except URLError as e:
+        utils.log_critical(f"Sunucuya bağlanılamadı: {e.reason}")
+        utils.log_info("  Sunucu: " + LICENSE_SERVER_URL)
+    except Exception as e:
+        utils.log_critical(f"Trial başlatma hatası: {e}")
+
+
 def main(argv=None):
     utils.print_banner()
     _maybe_enable_uvloop()
@@ -55,6 +170,37 @@ def main(argv=None):
         else:
             utils.log_critical(f"✗ {msg}")
             raise SystemExit(1)
+
+    # Aktivasyon komutu (açık cihaz kaydı)
+    if getattr(args, "license_activate", False):
+        key = license_key_arg or None
+        if not key:
+            import os
+            key = os.getenv("SAMURAI_LICENSE_KEY", "").strip() or None
+        if not key:
+            utils.log_critical("Aktivasyon için lisans anahtarı gerekli: --license-key")
+            raise SystemExit(1)
+        result = validate_license(key=key)
+        if result.valid:
+            utils.log_info("✓ Cihaz başarıyla etkinleştirildi!")
+            utils.log_info(f"  Tier       : {result.tier.value.upper()}")
+            utils.log_info(f"  Bitiş      : {result.expires}")
+            utils.log_info(f"  Hardware ID: {get_hardware_id()}")
+            utils.log_info(f"  Session    : {result.session_id}")
+            raise SystemExit(0)
+        else:
+            utils.log_critical(f"Aktivasyon başarısız: {result.reason}")
+            raise SystemExit(1)
+
+    # Hesap bilgisi komutu
+    if getattr(args, "license_account", False):
+        _show_account_info(license_key_arg)
+        raise SystemExit(0)
+
+    # Trial başlatma komutu
+    if getattr(args, "license_trial", False):
+        _start_trial()
+        raise SystemExit(0)
 
     # Lisans doğrulama
     license_result = validate_license(
@@ -96,6 +242,14 @@ def main(argv=None):
     # Lisans sonucunu args namespace'ine ekle (downstream feature gating için)
     args._license_result = license_result
     # ── License Gate End ────────────────────────────────────────────────
+
+    # ── Auto-Update Check ──────────────────────────────────────────────
+    try:
+        from ..licensing.updater import check_for_updates
+        check_for_updates()
+    except Exception:
+        pass  # Güncelleme kontrolü asla çalışmayı engellememeli
+    # ── Auto-Update Check End ──────────────────────────────────────────
 
     _resolve_profile_args(parser, args, argv)
 

@@ -92,6 +92,21 @@ def _validate_live_args(args, parser) -> None:
 def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: dict) -> int:
     _validate_live_args(args, parser)
 
+    # ── License Feature Gates ───────────────────────────────────────────
+    license_result = getattr(args, "_license_result", None)
+    if license_result is not None:
+        from ..licensing.gates import enforce_feature_gates, LicenseGateError
+        try:
+            gate_warnings = enforce_feature_gates(args, license_result)
+            for warn in gate_warnings:
+                utils.log_warning(f"Lisans: {warn}")
+        except LicenseGateError as exc:
+            utils.log_critical(f"Lisans kısıtlaması: {exc.message}")
+            if exc.upgrade_hint:
+                utils.log_info(f"  → {exc.upgrade_hint}")
+            return 78  # EX_CONFIG
+    # ── License Feature Gates End ───────────────────────────────────────
+
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         filename=args.log,
