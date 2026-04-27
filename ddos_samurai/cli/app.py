@@ -30,6 +30,73 @@ def main(argv=None):
     temp_args, _ = parser.parse_known_args(argv)
     parser.set_defaults(**load_config_defaults(getattr(temp_args, "config", None)))
     args = parser.parse_args(argv)
+
+    # ── License Gate ────────────────────────────────────────────────────
+    from ..licensing import validate_license, deactivate_device, LicenseResult
+    from ..licensing.features import has_feature, Tier
+    from ..licensing.hwid import get_hardware_id
+
+    license_key_arg = getattr(args, "license_key", "") or ""
+    license_file_arg = getattr(args, "license_file", "") or ""
+
+    # Deaktivasyon komutu
+    if getattr(args, "license_deactivate", False):
+        key = license_key_arg or None
+        if not key:
+            import os
+            key = os.getenv("SAMURAI_LICENSE_KEY", "").strip() or None
+        if not key:
+            utils.log_critical("Deaktivasyon için lisans anahtarı gerekli: --license-key")
+            raise SystemExit(1)
+        ok, msg = deactivate_device(key)
+        if ok:
+            utils.log_info(f"✓ {msg}")
+            raise SystemExit(0)
+        else:
+            utils.log_critical(f"✗ {msg}")
+            raise SystemExit(1)
+
+    # Lisans doğrulama
+    license_result = validate_license(
+        key=license_key_arg or None,
+        key_file=license_file_arg or None,
+    )
+
+    # Lisans bilgisi komutu
+    if getattr(args, "license_info", False):
+        if license_result.valid:
+            utils.log_info(f"Lisans Durumu  : AKTİF")
+            utils.log_info(f"Tier           : {license_result.tier.value.upper()}")
+            utils.log_info(f"Bitiş Tarihi   : {license_result.expires}")
+            utils.log_info(f"E-posta        : {license_result.customer_email}")
+            utils.log_info(f"Özellikler     : {', '.join(license_result.features)}")
+            if license_result.limits:
+                utils.log_info(f"Max Workers    : {license_result.limits.max_workers or 'Sınırsız'}")
+                utils.log_info(f"Max PPS        : {license_result.limits.max_pps or 'Sınırsız'}")
+                utils.log_info(f"Max Cihaz      : {license_result.limits.max_devices}")
+            utils.log_info(f"Offline Cache  : {'Evet' if license_result.offline else 'Hayır'}")
+            utils.log_info(f"Hardware ID    : {get_hardware_id()}")
+        else:
+            utils.log_critical(f"Lisans geçersiz: {license_result.reason}")
+        raise SystemExit(0 if license_result.valid else 1)
+
+    # Lisans kontrolü
+    if not license_result.valid:
+        utils.log_critical(f"Lisans doğrulaması başarısız:\n{license_result.reason}")
+        raise SystemExit(78)  # EX_CONFIG
+
+    # Lisans bilgisi logla
+    tier_display = license_result.tier.value.upper()
+    offline_tag = " (offline cache)" if license_result.offline else ""
+    utils.log_info(
+        f"Lisans aktif: {tier_display} | "
+        f"Bitiş: {license_result.expires}{offline_tag}"
+    )
+
+    # Lisans sonucunu args namespace'ine ekle (downstream feature gating için)
+    args._license_result = license_result
+    # ── License Gate End ────────────────────────────────────────────────
+
     _resolve_profile_args(parser, args, argv)
 
     if getattr(args, "list_profiles", False):
@@ -57,6 +124,16 @@ def main(argv=None):
         CONNECTION_POOL = max(1, int(args.connection_pool))
     except Exception:
         pass
+
+    # ── License-based Worker Limit ──────────────────────────────────────
+    if license_result.limits and license_result.limits.max_workers > 0:
+        if args.workers > license_result.limits.max_workers:
+            utils.log_warning(
+                f"Worker sayısı lisans limitine ({license_result.limits.max_workers}) "
+                f"düşürüldü. (İstenen: {args.workers})"
+            )
+            args.workers = license_result.limits.max_workers
+    # ── License-based Worker Limit End ──────────────────────────────────
 
     want_report = bool(getattr(args, "run_report", False)) or bool(getattr(args, "gpu_pcap_run_report", False))
     report_fmt = str(getattr(args, "run_report_format", getattr(args, "gpu_pcap_run_report_format", "both")))
@@ -91,3 +168,4 @@ def main(argv=None):
     if offline_result is not None:
         raise SystemExit(offline_result)
     raise SystemExit(run_live_mode(args, parser, argv, soak_cfg, report_ctx, runtime_ctx))
+

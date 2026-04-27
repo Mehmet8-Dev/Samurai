@@ -1048,4 +1048,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fault simulasyon suresi (s).",
     )
 
+    # ── License Management ──────────────────────────────────────────────────
+    license_group = parser.add_argument_group("License Management")
+    license_group.add_argument(
+        "--license-key",
+        type=str,
+        default="",
+        help="Lisans anahtarı (SAM-XXXX-XXXX-XXXX-XXXX). "
+             "Alternatif: SAMURAI_LICENSE_KEY env veya ~/.samurai/license.key dosyası.",
+    )
+    license_group.add_argument(
+        "--license-file",
+        type=str,
+        default="",
+        help="Lisans anahtarını içeren dosya yolu.",
+    )
+    license_group.add_argument(
+        "--license-info",
+        action="store_true",
+        help="Aktif lisans bilgilerini göster ve çık.",
+    )
+    license_group.add_argument(
+        "--license-deactivate",
+        action="store_true",
+        help="Bu cihazı lisanstan kaldır ve çık.",
+    )
+
     return parser
