@@ -168,6 +168,15 @@ def _dedupe(seq: List[str]) -> List[str]:
     return out
 
 
+def _assert_no_embedded_virtualenv() -> None:
+    embedded = Path(__file__).resolve().parent / "ddos_samurai" / "venv" / "pyvenv.cfg"
+    if embedded.exists() and not _env_flag("SAMURAI_ALLOW_EMBEDDED_VENV", "0"):
+        raise RuntimeError(
+            "Refusing to build/package with embedded virtualenv at ddos_samurai/venv. "
+            "Remove it or set SAMURAI_ALLOW_EMBEDDED_VENV=1 for a local-only override."
+        )
+
+
 def _resolve_nvcc_path() -> str:
     nvcc = str(os.environ.get("SAMURAI_NVCC", "") or "").strip()
     if nvcc:
@@ -660,6 +669,7 @@ def get_extensions() -> List[Extension]:
 
 
 def build_setup_kwargs() -> Dict[str, object]:
+    _assert_no_embedded_virtualenv()
     return {
         "name": "ddos_samurai",
         "version": _read_package_version(),
