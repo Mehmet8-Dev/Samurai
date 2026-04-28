@@ -20,6 +20,17 @@ from dataclasses import dataclass
 from typing import Dict, Literal, Optional, Tuple
 
 
+_RECOVERABLE_ERRORS = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    ImportError,
+    KeyError,
+    IndexError,
+)
+
 PCAP_GLOBAL_HEADER = bytes(
     [
         0xD4,
@@ -82,7 +93,7 @@ def _sanitize_output_path(filename: str, project_dir: str) -> str:
 def check_gpu_available() -> Tuple[bool, str]:
     try:
         from numba import cuda
-    except Exception as e:
+    except _RECOVERABLE_ERRORS as e:
         return False, f"Numba CUDA import failed: {e}"
 
     if not cuda.is_available():
@@ -93,13 +104,13 @@ def check_gpu_available() -> Tuple[bool, str]:
 
         # CuPy can import even if the driver/runtime isn't available.
         _ = cp.cuda.runtime.getDeviceCount()
-    except Exception as e:
+    except _RECOVERABLE_ERRORS as e:
         return False, f"CuPy CUDA runtime not available: {e}"
 
     try:
         # Confirm the active Numba context is healthy, not just present.
         cuda.current_context().synchronize()
-    except Exception as e:
+    except _RECOVERABLE_ERRORS as e:
         return False, f"Numba CUDA context is not healthy: {e}"
 
     return True, "GPU ready"
@@ -119,20 +130,20 @@ def _reset_cuda_context_best_effort() -> None:
 
         try:
             cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
+        except _RECOVERABLE_ERRORS:
             pass
         try:
             cp.get_default_pinned_memory_pool().free_all_blocks()
-        except Exception:
+        except _RECOVERABLE_ERRORS:
             pass
-    except Exception:
+    except _RECOVERABLE_ERRORS:
         pass
 
     try:
         from numba import cuda
 
         cuda.close()
-    except Exception:
+    except _RECOVERABLE_ERRORS:
         pass
 
 
@@ -795,11 +806,11 @@ def generate_pcap(config: PcapGenConfig, project_dir: Optional[str] = None) -> s
                     base_index += n
 
             return os.path.abspath(out_path)
-        except Exception as e:
+        except _RECOVERABLE_ERRORS as e:
             if os.path.exists(out_path):
                 try:
                     os.remove(out_path)
-                except Exception:
+                except _RECOVERABLE_ERRORS:
                     pass
             if attempt + 1 < max_attempts and _is_context_destroyed_error(e):
                 _reset_cuda_context_best_effort()
