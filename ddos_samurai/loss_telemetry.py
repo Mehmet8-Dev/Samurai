@@ -17,6 +17,17 @@ from pathlib import Path
 from typing import Dict, Optional
 
 
+_RECOVERABLE_ERRORS = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    ImportError,
+    KeyError,
+    IndexError,
+)
+
 _DISABLED_VALUES = {"0", "false", "off", "no", "disabled"}
 _ENABLED_VALUES = {"1", "true", "on", "yes"}
 
@@ -35,14 +46,14 @@ _NICQ_CONFIDENCE_ETHTOOL = 0.85
 def _to_int(value) -> int:
     try:
         return int(value)
-    except Exception:
+    except _RECOVERABLE_ERRORS:
         return 0
 
 
 def _to_float(value) -> float:
     try:
         return float(value)
-    except Exception:
+    except _RECOVERABLE_ERRORS:
         return 0.0
 
 
@@ -78,7 +89,7 @@ def _parse_proc_net_dev_text(text: str) -> Dict[str, Dict[str, int]]:
             continue
         try:
             vals = [int(x) for x in cols[:16]]
-        except Exception:
+        except _RECOVERABLE_ERRORS:
             continue
         out[iface] = {
             "rx_bytes": vals[0],
@@ -108,7 +119,7 @@ def _parse_softnet_stat_text(text: str) -> Dict[str, int]:
             processed += int(cols[0], 16) if len(cols) > 0 else 0
             dropped += int(cols[1], 16) if len(cols) > 1 else 0
             time_squeeze += int(cols[2], 16) if len(cols) > 2 else 0
-        except Exception:
+        except _RECOVERABLE_ERRORS:
             continue
     return {
         "processed": int(processed),
@@ -136,7 +147,7 @@ def _parse_ethtool_stats_text(text: str) -> Dict[str, int]:
             continue
         try:
             val = int(val_token[0], 0)
-        except Exception:
+        except _RECOVERABLE_ERRORS:
             continue
         out[key] = int(out.get(key, 0) or 0) + int(val)
     return out
@@ -265,7 +276,7 @@ def _read_sysfs_wire_counters(iface: str, *, sysfs_root: str = _WIRE_SYSFS_ROOT)
         try:
             raw = p.read_text(encoding="utf-8", errors="replace").strip()
             out[k] = int(raw or "0")
-        except Exception as exc:
+        except _RECOVERABLE_ERRORS as exc:
             return {}, f"sysfs_read_failed:{k}:{type(exc).__name__}"
     return out, ""
 
@@ -285,7 +296,7 @@ def _read_ethtool_stats(iface: str) -> tuple[dict, str]:
         return {}, "ethtool_not_found"
     except subprocess.TimeoutExpired:
         return {}, "ethtool_timeout"
-    except Exception as exc:
+    except _RECOVERABLE_ERRORS as exc:
         return {}, f"ethtool_exec_failed:{type(exc).__name__}"
 
     if int(proc.returncode or 0) != 0:
@@ -363,7 +374,7 @@ def snapshot(
     dev_reason = ""
     try:
         dev_stats = read_proc_net_dev(proc_net_dev_path)
-    except Exception as exc:
+    except _RECOVERABLE_ERRORS as exc:
         dev_reason = f"proc_net_dev_unavailable:{type(exc).__name__}"
 
     resolved = resolve_iface(iface=iface, dev_stats=dev_stats)
@@ -381,7 +392,7 @@ def snapshot(
     softnet_reason = ""
     try:
         softnet = read_proc_softnet_stat(softnet_path)
-    except Exception as exc:
+    except _RECOVERABLE_ERRORS as exc:
         softnet_reason = f"softnet_unavailable:{type(exc).__name__}"
 
     wire_counter_available = 0
