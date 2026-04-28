@@ -269,7 +269,7 @@ def attack_live_monitor(
                     p_val = int(getattr(progress, "value", 0) or 0)
                     s_val = int(getattr(sent_total, "value", 0) or 0) if sent_total else p_val
                     e_val = int(getattr(errors_total, "value", 0) or 0) if errors_total else 0
-            except Exception:
+            except (AttributeError, TypeError, ValueError, OSError):
                 pass
 
             pct = (p_val / total_count * 100) if has_total_target else 0.0
@@ -325,7 +325,7 @@ def attack_live_monitor(
                             int(item.get("pacing_so_txtime_active", 0) or 0),
                         )
                         pacing_txtime_errors += int(item.get("pacing_txtime_errors", 0) or 0)
-                except Exception:
+                except (AttributeError, TypeError, ValueError, OSError):
                     pass
 
             pacing_rate_accuracy_pct = (
@@ -364,7 +364,7 @@ def attack_live_monitor(
                     "pacing_so_txtime_active": pacing_so_txtime_active,
                     "pacing_txtime_errors": pacing_txtime_errors,
                 })
-            except Exception:
+            except (AttributeError, TypeError, ValueError, OSError):
                 pass
 
             # Periodic soak snapshot + threshold checks.
@@ -575,7 +575,7 @@ def validate_target_safety(
                     parsed.append(ipaddress.ip_network(item, strict=False))
                 else:
                     parsed.append(ipaddress.ip_address(item))
-            except Exception:
+            except ValueError:
                 return False, f"Geçersiz allowlist girdisi: {item!r}"
 
         for entry in parsed:
@@ -637,7 +637,7 @@ def get_gateway_mac(target_ip=None):
                     if tok == "via" and idx + 1 < len(parts):
                         gateway_ip = parts[idx + 1]
                         break
-            except Exception:
+            except (subprocess.SubprocessError, OSError, ValueError):
                 gateway_ip = str(target_ip)
 
         if not gateway_ip:
@@ -656,7 +656,7 @@ def get_gateway_mac(target_ip=None):
 
         log_warning("ARP yanıtı alınamadı, broadcast MAC kullanılacak.")
         return "ff:ff:ff:ff:ff:ff"
-    except Exception as e:
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
         log_error(f"MAC çözme hatası: {e}")
         return "ff:ff:ff:ff:ff:ff"
 
@@ -678,14 +678,14 @@ def get_local_ip() -> str:
                 return ip
         finally:
             s.close()
-    except Exception:
+    except OSError:
         pass
 
     try:
         import socket
 
         return socket.gethostbyname(socket.gethostname())
-    except Exception:
+    except OSError:
         return "127.0.0.1"
 
 def mac_to_int(mac_str):

@@ -1369,7 +1369,7 @@ async def replay_pcap(
                     stats["errors"] += prep.count
                     stop_replay = True
                     break
-                except Exception as e:
+                except OSError as e:
                     log_error(f"[PCAP Replay] Socket error: {e}")
                     stats["errors"] += prep.count
                     stop_replay = True
@@ -1418,7 +1418,7 @@ async def replay_pcap(
                                     if sent_now <= 0:
                                         break
                                     batch_sent += sent_now
-                            except Exception:
+                            except OSError:
                                 batch_sent = 0
 
                             loop_sent += int(batch_sent)
@@ -1428,17 +1428,17 @@ async def replay_pcap(
                             if live_progress:
                                 try:
                                     live_progress.value += int(batch_count)
-                                except Exception:
+                                except (AttributeError, TypeError, ValueError):
                                     pass
                             if live_sent and batch_sent > 0:
                                 try:
                                     live_sent.value += int(batch_sent)
-                                except Exception:
+                                except (AttributeError, TypeError, ValueError):
                                     pass
                             if live_errors and batch_errors > 0:
                                 try:
                                     live_errors.value += int(batch_errors)
-                                except Exception:
+                                except (AttributeError, TypeError, ValueError):
                                     pass
 
                             pkt_idx += batch_count
@@ -1453,20 +1453,20 @@ async def replay_pcap(
                                 if live_sent:
                                     try:
                                         live_sent.value += 1
-                                    except Exception:
+                                    except (AttributeError, TypeError, ValueError):
                                         pass
-                            except Exception:
+                            except OSError:
                                 loop_errors += 1
                                 if live_errors:
                                     try:
                                         live_errors.value += 1
-                                    except Exception:
+                                    except (AttributeError, TypeError, ValueError):
                                         pass
 
                             if live_progress:
                                 try:
                                     live_progress.value += 1
-                                except Exception:
+                                except (AttributeError, TypeError, ValueError):
                                     pass
                             pkt_idx += 1
 
@@ -1485,7 +1485,7 @@ async def replay_pcap(
 
     except KeyboardInterrupt:
         log_warning("[PCAP Replay] Interrupted by user (Ctrl-C)")
-    except Exception as e:
+    except (RuntimeError, OSError, ValueError, TypeError) as e:
         log_error(f"[PCAP Replay] Error: {e}")
         if cfg.verbose:
             import traceback

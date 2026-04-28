@@ -54,7 +54,7 @@ def collect_system_snapshot() -> Dict[str, Any]:
     try:
         la = os.getloadavg()
         snap["loadavg_1_5_15"] = [float(la[0]), float(la[1]), float(la[2])]
-    except Exception:
+    except OSError:
         pass
 
     # Linux-only best-effort memory info
@@ -71,7 +71,7 @@ def collect_system_snapshot() -> Dict[str, Any]:
                         continue
                     try:
                         v = int(parts[0])
-                    except Exception:
+                    except ValueError:
                         continue
                     unit = parts[1].lower() if len(parts) > 1 else ""
                     # meminfo is typically kB
@@ -82,7 +82,7 @@ def collect_system_snapshot() -> Dict[str, Any]:
             for k in ("MemTotal", "MemFree", "MemAvailable", "Buffers", "Cached", "SwapTotal", "SwapFree"):
                 if k in mem:
                     snap[k] = mem[k]
-    except Exception:
+    except OSError:
         pass
 
     return snap
@@ -97,7 +97,7 @@ def _safe_stat(path: str) -> Dict[str, Any]:
             "size_bytes": int(st.st_size),
             "mtime_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(timespec="seconds"),
         }
-    except Exception:
+    except OSError:
         return {"path": path, "exists": False}
 
 
@@ -114,7 +114,7 @@ def _try_maxrss_kb() -> Optional[int]:
         if platform.system().lower() == "darwin":
             return int(v / 1024)
         return v
-    except Exception:
+    except (ImportError, AttributeError, OSError, ValueError):
         return None
 
 
@@ -155,16 +155,16 @@ def collect_environment() -> Dict[str, Any]:
                 "device_id": int(dev.id),
                 "name": str(name),
             }
-        except Exception:
+        except (AttributeError, ValueError, RuntimeError):
             env["gpu"] = {"available": True}
-    except Exception:
+    except (ImportError, OSError, RuntimeError):
         env["gpu"] = {"available": False}
 
     try:
         from . import get_capabilities  # type: ignore
 
         env["capabilities"] = get_capabilities() or {}
-    except Exception:
+    except (ImportError, AttributeError, TypeError, ValueError):
         env["capabilities"] = {}
 
     return env
@@ -409,7 +409,7 @@ def build_gpu_pcap_report(
         pps = int(getattr(cfg, "pps", 0) or 0)
         if dur > 0 and pps > 0:
             packets_total = dur * pps
-    except Exception:
+    except (TypeError, ValueError):
         packets_total = None
 
     pcap_stat = _safe_stat(pcap_path)
@@ -1733,7 +1733,7 @@ def build_live_attack_report(
     wire_loss_estimation_capped = int(wire_loss_raw_packets_total > wire_loss_est_packets_total)
     try:
         loss_fail_pct = float(os.environ.get("SAMURAI_LOSS_FAIL_PCT", "5") or 5.0)
-    except Exception:
+    except (TypeError, ValueError):
         loss_fail_pct = 5.0
     wire_loss_policy_pct = max(float(wire_loss_est_pct), float(wire_loss_raw_pct))
     if attempted_total > 0 and (wire_counter_any == 0 or wire_counter_partial == 1):
@@ -1762,7 +1762,7 @@ def build_live_attack_report(
             persistent_tx_backend_strict_any = int(
                 str(os.environ.get("SAMURAI_GPU_TX_BACKEND_STRICT", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
             )
-        except Exception:
+        except (TypeError, ValueError):
             persistent_tx_backend_strict_any = 0
 
     report = RunReport(
