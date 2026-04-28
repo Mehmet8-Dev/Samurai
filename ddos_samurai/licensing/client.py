@@ -172,7 +172,9 @@ def validate_license(
     """
 
     # ── Dev mode ────────────────────────────────────────────────────────
-    if is_dev_mode():
+    # Explicit key verilmişse doğrulama akışını test/operasyon için koru.
+    # Dev mode yalnızca key verilmediğinde global bypass gibi davransın.
+    if is_dev_mode() and not (key and key.strip()):
         return _dev_mode_result()
 
     # ── Key resolution ──────────────────────────────────────────────────
