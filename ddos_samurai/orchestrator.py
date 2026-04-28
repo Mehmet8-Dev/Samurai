@@ -26,6 +26,11 @@ from ddos_samurai.pacing import (
 log_info = utils.log_info
 log_error = utils.log_error
 log_warning = utils.log_warning
+_LOG = logging.getLogger(__name__)
+
+
+def _debug_exception(context: str, exc: BaseException) -> None:
+    _LOG.debug("%s: %s", context, exc, exc_info=True)
 
 
 def _read_iface_mac_bytes(iface: str | None) -> bytes:
@@ -37,7 +42,8 @@ def _read_iface_mac_bytes(iface: str | None) -> bytes:
         if len(mac) != 12:
             return b"\x00\x00\x00\x00\x00\x00"
         return bytes.fromhex(mac)
-    except Exception:
+    except Exception as exc:
+        _debug_exception("failed to read interface MAC", exc)
         return b"\x00\x00\x00\x00\x00\x00"
 
 
@@ -897,7 +903,8 @@ def _build_pacing_config(args: dict) -> PacingConfig:
             aff = sorted(int(x) for x in os.sched_getaffinity(0))
             if aff:
                 pin_cpu = int(aff[0])
-        except Exception:
+        except Exception as exc:
+            _debug_exception("auto CPU affinity probe failed", exc)
             pin_cpu = -1
 
     return PacingConfig(
@@ -956,7 +963,8 @@ def _apply_topology_binding(args: dict, worker_id: int) -> None:
 
         args["topology_tuple_index"] = int(tuple_idx)
         args["topology_tuple_row_json"] = json.dumps(row, sort_keys=True)
-    except Exception:
+    except Exception as exc:
+        _debug_exception("topology binding failed", exc)
         args["topology_tuple_alloc_fail"] = int(args.get("topology_tuple_alloc_fail", 0) or 0) + 1
 
 
@@ -1083,8 +1091,8 @@ async def worker_process(
             if len(parts) >= 2:
                 rss_pages = int(parts[1])
                 return int(rss_pages * os.sysconf("SC_PAGE_SIZE"))
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception(f"[Worker {worker_id}] RSS read failed", exc)
         return 0
 
     def _shared_counters_snapshot():
@@ -1101,8 +1109,8 @@ async def worker_process(
                 p_val = int(getattr(progress, "value", 0) or 0)
                 s_val = int(getattr(sent_total, "value", 0) or 0)
                 e_val = int(getattr(errors_total, "value", 0) or 0)
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception(f"[Worker {worker_id}] shared counter snapshot failed", exc)
         return p_val, s_val, e_val
 
     _last_resource_emit = 0.0
@@ -1130,14 +1138,14 @@ async def worker_process(
                 vram_total = int(gstats.get("total_bytes", 0) or 0)
                 gpu_pool_buffers = int(gstats.get("buffers_allocated", 0) or 0)
                 gpu_pool_in_use = int(gstats.get("buffers_in_use", 0) or 0)
-            except Exception:
-                pass
+            except Exception as exc:
+                _debug_exception(f"[Worker {worker_id}] GPU memory pool stats failed", exc)
             try:
                 pstats = _gpu_packet_mod.get_pinned_host_pool().get_stats()
                 pinned_bytes = int(pstats.get("total_nbytes", 0) or 0)
                 pinned_buffers = int(pstats.get("buffers_allocated", 0) or 0)
-            except Exception:
-                pass
+            except Exception as exc:
+                _debug_exception(f"[Worker {worker_id}] pinned host pool stats failed", exc)
 
         p_val, s_val, e_val = _shared_counters_snapshot()
         backlog = max(0, int(p_val) - int(s_val) - int(e_val))
@@ -1162,8 +1170,8 @@ async def worker_process(
                 "pacing_so_txtime_active": int(worker_stats.get("so_txtime_active", 0) or 0),
                 "pacing_txtime_errors": int(worker_stats.get("txtime_errors", 0) or 0),
             }
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception(f"[Worker {worker_id}] resource stats publish failed", exc)
 
     _orig_paced_sender = senders.paced_raw_socket_sender
     sender_context_cache = {}
@@ -1288,8 +1296,8 @@ async def worker_process(
                 sender_call_kwargs = {
                     k: v for k, v in sender_call_kwargs.items() if k in sig.parameters
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception(f"[Worker {worker_id}] sender signature inspection failed", exc)
 
         out = await _orig_paced_sender(**sender_call_kwargs)
         _update_resource_stats(force=False)
@@ -1304,8 +1312,8 @@ async def worker_process(
         while not _resource_monitor_stop:
             try:
                 _update_resource_stats(force=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                _debug_exception(f"[Worker {worker_id}] resource sampler failed", exc)
             await asyncio.sleep(5.0)
 
     _resource_monitor_task = asyncio.create_task(_resource_monitor_loop())
@@ -1324,8 +1332,8 @@ async def worker_process(
     try:
         import uvloop
         uvloop.install()
-    except Exception:
-        pass
+    except Exception as exc:
+        _debug_exception("uvloop install failed", exc)
 
     try:
         use_cuda = False
@@ -1349,7 +1357,8 @@ async def worker_process(
             from . import gpu_packet
             try:
                 from . import gpu_cuda_payload
-            except Exception:
+            except Exception as exc:
+                _debug_exception(f"[Worker {worker_id}] gpu_cuda_payload import failed", exc)
                 gpu_cuda_payload = None
             _gpu_packet_mod = gpu_packet
             from .utils import get_gateway_mac, mac_to_int
@@ -1380,9 +1389,9 @@ async def worker_process(
                 _gpu_native_policy_require = bool(
                     getattr(gpu_packet, "is_native_policy_require", lambda: False)()
                 )
-            except Exception:
+            except Exception as exc:
+                _debug_exception(f"[Worker {worker_id}] GPU native policy probe failed", exc)
                 _gpu_native_policy_require = False
-                pass
 
             if _gpu_native_policy_require and int(worker_stats.get("gpu_packet_native_active", 0) or 0) != 1:
                 raise RuntimeError(
@@ -1406,8 +1415,8 @@ async def worker_process(
                 log_warning(f"[Worker {worker_id}] gpu kernel mode set failed ({_gpu_kernel_mode}): {e}")
             try:
                 _gpu_kernel_mode = str(gpu_packet.get_kernel_mode() or _gpu_kernel_mode).strip().lower()
-            except Exception:
-                pass
+            except Exception as exc:
+                _debug_exception(f"[Worker {worker_id}] gpu kernel mode read failed", exc)
             worker_stats["gpu_kernel_mode"] = str(_gpu_kernel_mode)
             worker_stats["gpu_stream_api_mode"] = str(_gpu_stream_api_mode)
             worker_stats["gpu_epoch_ms"] = int(args.get("gpu_epoch_ms", os.environ.get("SAMURAI_GPU_EPOCH_MS", 50)) or 50)
@@ -1445,7 +1454,8 @@ async def worker_process(
             if _gpu_kernel_mode == "persistent" and _gpu_stream_api_mode == "stream":
                 try:
                     gtel_pre = _gpu_packet_mod.get_generation_telemetry() or {}
-                except Exception:
+                except Exception as exc:
+                    _debug_exception(f"[Worker {worker_id}] GPU telemetry pre-read failed", exc)
                     gtel_pre = {}
                 _pre_backend = str(gtel_pre.get("persistent_tx_backend", "") or "").strip().lower()
                 _pre_iface = str(gtel_pre.get("persistent_tx_iface", "") or "").strip()
@@ -1474,7 +1484,8 @@ async def worker_process(
                     return gpu_arr
                 try:
                     import numpy as _np
-                except Exception:
+                except Exception as exc:
+                    _debug_exception(f"[Worker {worker_id}] numpy import failed", exc)
                     _np = None
                 if _np is not None and isinstance(gpu_arr, _np.ndarray):
                     return gpu_arr
@@ -1503,7 +1514,8 @@ async def worker_process(
                         else:
                             sleep_s = min(sleep_s * 2.0, 1e-3)  # cap at 1ms
                         await asyncio.sleep(sleep_s)
-                except Exception:
+                except Exception as exc:
+                    _debug_exception(f"[Worker {worker_id}] CUDA event async wait probe failed", exc)
                     # Conservative fallback for environments without query()
                     evt.synchronize()
 
@@ -1649,8 +1661,8 @@ async def worker_process(
                                 worker_stats["state_active_entries"] = int(st.get("active_entries", 0) or 0)
                                 worker_stats["state_timeout_evictions"] = int(st.get("timeout_evictions", 0) or 0)
                                 worker_stats["state_overwrites"] = int(st.get("overwrites", 0) or 0)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                _debug_exception(f"[Worker {worker_id}] state engine stats snapshot failed", exc)
                 if _custom_tcp_ready and getattr(senders, "custom_tcp_dataplane", None) is not None:
                     try:
                         st = senders.custom_tcp_dataplane.snapshot_tcp_dataplane() or {}
@@ -1660,8 +1672,8 @@ async def worker_process(
                         for key, value in st.items():
                             if str(key).startswith("tcp_"):
                                 worker_stats[str(key)] = int(value or 0)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _debug_exception(f"[Worker {worker_id}] custom TCP dataplane snapshot failed", exc)
 
             def _ingest_state_from_batch(batch, sent_count: int):
                 if sent_count <= 0:
@@ -1677,8 +1689,8 @@ async def worker_process(
                                 int(sent_count),
                             )
                             worker_stats["state_ingest_backend"] = "fast_sender_state_engine"
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _debug_exception(f"[Worker {worker_id}] fast sender state ingest failed", exc)
                     return
                 if _custom_tcp_ready and getattr(senders, "custom_tcp_dataplane", None) is not None:
                     tcpdp = senders.custom_tcp_dataplane
@@ -1690,8 +1702,8 @@ async def worker_process(
                                 int(sent_count),
                             )
                             worker_stats["state_ingest_backend"] = "custom_tcp_dataplane"
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _debug_exception(f"[Worker {worker_id}] custom TCP state ingest failed", exc)
 
             def _maybe_sweep_state():
                 nonlocal _last_state_sweep
@@ -1706,8 +1718,8 @@ async def worker_process(
                     if hasattr(fs, "sweep_state_table"):
                         try:
                             fs.sweep_state_table(4096)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _debug_exception(f"[Worker {worker_id}] state table sweep failed", exc)
                 if _custom_tcp_ready and getattr(senders, "custom_tcp_dataplane", None) is not None:
                     try:
                         poll_stats = senders._custom_tcp_runtime_poll_snapshot(senders.custom_tcp_dataplane)
@@ -1715,8 +1727,8 @@ async def worker_process(
                             poll_stats.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
                             poll_stats.setdefault("runtime_transport_contract", "custom_tcp_runtime_bridge")
                             worker_stats = _add_stats(worker_stats, poll_stats)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _debug_exception(f"[Worker {worker_id}] custom TCP runtime poll failed", exc)
 
             async def _flush_custom_tcp_tx_packets():
                 nonlocal worker_stats
@@ -1824,7 +1836,8 @@ async def worker_process(
                 for session_plan in traffic_model_sessions:
                     try:
                         rp = gpu_cuda_payload.build_request_plan_from_session_plan(session_plan)
-                    except Exception:
+                    except Exception as exc:
+                        _debug_exception(f"[Worker {worker_id}] traffic-model request-plan build failed", exc)
                         continue
                     if int(len(getattr(rp, "items", []) or [])) > 0:
                         yield rp
@@ -1846,7 +1859,8 @@ async def worker_process(
                     if raw_row:
                         try:
                             topology_row = dict(json.loads(raw_row))
-                        except Exception:
+                        except Exception as exc:
+                            _debug_exception(f"[Worker {worker_id}] topology row json parse failed", exc)
                             topology_row = {}
                 template_protocol = str(topology_row.get("template_protocol", "") or "").strip().lower()
                 template_method = str(topology_row.get("template_method", "") or "").strip().upper()
@@ -2268,8 +2282,8 @@ async def worker_process(
                     try:
                         _ = int(sum([int(x) << (24 - i*8) for i, x in enumerate(ip.split('.'))]))
                         valid_reflectors.append(ip)
-                    except:
-                        pass
+                    except Exception as exc:
+                        _debug_exception(f"[Worker {worker_id}] invalid reflector IP skipped: {ip}", exc)
                 
                 if not valid_reflectors:
                     log_error("No valid reflector IPs found!")
@@ -2316,7 +2330,8 @@ async def worker_process(
 
                 try:
                     gw_mac_int = mac_to_int(get_gateway_mac(victim_ip))
-                except Exception:
+                except Exception as exc:
+                    _debug_exception(f"[Worker {worker_id}] gateway MAC resolve failed", exc)
                     gw_mac_int = 0xFFFFFFFFFFFF
                 stream_ring = _build_stream_ring()
                 stream_idx = 0
@@ -2433,7 +2448,8 @@ async def worker_process(
                 try:
                     s.connect((args['target'], 80))
                     local_ip = s.getsockname()[0]
-                except Exception:
+                except Exception as exc:
+                    _debug_exception(f"[Worker {worker_id}] local IP autodetect failed", exc)
                     local_ip = real_src_ip
                 finally:
                     s.close()
@@ -2738,12 +2754,14 @@ async def worker_process(
             if isinstance(tcp_flags_raw, str):
                 try:
                     tcp_flags_int = int(cpu_packet_engine.parse_tcp_flags(tcp_flags_raw))
-                except Exception:
+                except Exception as exc:
+                    _debug_exception(f"[Worker {worker_id}] tcp_flags parse failed (symbolic)", exc)
                     tcp_flags_int = 0x02
             else:
                 try:
                     tcp_flags_int = int(tcp_flags_raw or 0x02)
-                except Exception:
+                except Exception as exc:
+                    _debug_exception(f"[Worker {worker_id}] tcp_flags parse failed (numeric)", exc)
                     tcp_flags_int = 0x02
             window_override = (
                 int(args.get("window", -1) if args.get("window", None) is not None else -1)
@@ -2909,7 +2927,8 @@ async def worker_process(
 
                     try:
                         rt_final = gpu_packet.read_stream_stats_snapshot(0) or {}
-                    except Exception:
+                    except Exception as exc:
+                        _debug_exception(f"[Worker {worker_id}] persistent stream stats snapshot failed", exc)
                         rt_final = {}
                     for _k in (
                         "persistent_runtime_restarts",
@@ -2945,8 +2964,8 @@ async def worker_process(
                                     sent_total.value = int(getattr(sent_total, "value", 0) or 0) + int(sent_via_stream)
                                 if errors_total is not None:
                                     errors_total.value = int(getattr(errors_total, "value", 0) or 0) + max(0, int(total_count - sent_via_stream))
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _debug_exception(f"[Worker {worker_id}] shared counters update failed", exc)
                     return
                 except Exception as _stream_hotpath_err:
                     log_warning(
@@ -2956,8 +2975,8 @@ async def worker_process(
                     if stream_id is not None:
                         try:
                             gpu_packet.stop_stream(stream_id)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _debug_exception(f"[Worker {worker_id}] stop_stream failed", exc)
 
             if full_gpu_hotpath_ok:
                 log_info(
@@ -3580,25 +3599,25 @@ async def worker_process(
         _resource_monitor_stop = True
         try:
             _resource_monitor_task.cancel()
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception(f"[Worker {worker_id}] resource monitor task cancel failed", exc)
 
         # Final resource snapshot before process teardown.
         try:
             _update_resource_stats(force=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception(f"[Worker {worker_id}] final resource snapshot failed", exc)
 
         # Restore original sender symbol for safety inside the process lifetime.
         try:
             senders.paced_raw_socket_sender = _orig_paced_sender
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception(f"[Worker {worker_id}] sender symbol restore failed", exc)
         try:
             if hasattr(senders, "close_sender_context"):
                 senders.close_sender_context(sender_context_cache)
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception(f"[Worker {worker_id}] sender context close failed", exc)
 
         try:
             if int(worker_stats.get("attempted", 0) or 0) <= 0:
@@ -3639,8 +3658,8 @@ async def worker_process(
                             worker_stats[_k] = str(gtel.get(_k, "") or "")
                     if "scheduler_fairness_cv_pct" in gtel:
                         worker_stats["scheduler_fairness_cv_pct"] = float(gtel.get("scheduler_fairness_cv_pct", 0.0) or 0.0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _debug_exception(f"[Worker {worker_id}] GPU final telemetry merge failed", exc)
 
             worker_stats["gpu_ring_depth_peak"] = int(max(0, _gpu_ring_depth_peak))
             worker_stats["gpu_ring_block_wait_ns"] = int(max(0, _gpu_ring_block_wait_ns))
@@ -3648,8 +3667,8 @@ async def worker_process(
 
             # Recompute bounded loss metrics at worker finalization.
             worker_stats = _recompute_loss_metrics(worker_stats, inplace=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception(f"[Worker {worker_id}] final worker stats normalization failed", exc)
 
         # Derive worker_status from actual send results (don't blindly report "ok")
         if worker_status == "ok":
@@ -3857,8 +3876,8 @@ async def worker_process(
                         wstats = resource_stats.get(int(worker_id))
                         if isinstance(wstats, dict):
                             _backlog_peak = int(wstats.get("backlog", 0) or 0)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _debug_exception(f"[Worker {worker_id}] queue backlog peek failed", exc)
 
                 run_events.append(
                     {
@@ -4000,6 +4019,6 @@ async def worker_process(
                         "queue_backlog_peak": _backlog_peak,
                     }
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                _debug_exception(f"[Worker {worker_id}] run event append failed", exc)
         log_info(f"[Worker {worker_id}] görevini tamamladı. status={worker_status}")
