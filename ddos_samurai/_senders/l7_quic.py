@@ -12,14 +12,14 @@ from . import runtime as _sender_runtime
 def _to_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return int(default)
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return float(default)
 
 
@@ -199,7 +199,7 @@ async def quic_sender(
         runtime_cfg = RuntimeConfig(concurrency=max(1, _to_int(concurrency, 1)))
         bounded = max(0.5, _to_float(timeout_s, 3.0)) * float(max(1, attempted))
         raw = dict((await asyncio.wait_for(_run_l7_profile(profile, runtime_cfg), timeout=bounded)).as_dict() or {})
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         raw = {
             "attempted": attempted,
             "sent": 0,

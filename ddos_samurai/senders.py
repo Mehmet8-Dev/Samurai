@@ -332,7 +332,7 @@ def _custom_tcp_runtime_poll_snapshot(runtime_api: Any = None) -> Dict[str, Any]
                 out["runtime_transport_poll_actions"] = int(actions or 0)
             out["runtime_transport_rx_poll_enabled"] = 1
             out["runtime_transport_poll_calls"] = 1
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             out["runtime_transport_rx_poll_enabled"] = 0
     snapshot_fn = getattr(api, "snapshot_tcp_dataplane", None)
     if callable(snapshot_fn):
@@ -342,7 +342,7 @@ def _custom_tcp_runtime_poll_snapshot(runtime_api: Any = None) -> Dict[str, Any]
             for key, value in snapshot.items():
                 if str(key).startswith("tcp_"):
                     out[str(key)] = value
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             out.setdefault("runtime_transport_snapshot_available", 0)
     return out
 
@@ -620,7 +620,7 @@ try:
     from . import custom_tcp_dataplane as custom_tcp_dataplane
 
     CUSTOM_TCP_DATAPLANE_AVAILABLE = True
-except Exception:
+except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
     custom_tcp_dataplane = None
     CUSTOM_TCP_DATAPLANE_AVAILABLE = False
 

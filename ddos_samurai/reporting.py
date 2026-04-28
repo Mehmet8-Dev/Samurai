@@ -2025,7 +2025,7 @@ def build_live_attack_report(
         )
         report.results.update(gate_result.as_report_fields())
         report.results["kpi_evaluated_rules"] = list(gate_result.evaluated_rules)
-    except Exception as exc:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
         gate_profile = str(
             (args or {}).get("kpi_gate_profile", os.environ.get("SAMURAI_KPI_GATE_PROFILE", "off")) or "off"
         )

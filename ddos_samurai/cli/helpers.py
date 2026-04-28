@@ -16,7 +16,7 @@ def _maybe_enable_uvloop() -> bool:
 
         uvloop.install()
         return True
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return False
 
 
@@ -102,7 +102,7 @@ def is_admin() -> bool:
         if hasattr(os, "geteuid"):
             return os.geteuid() == 0
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return False
 
 

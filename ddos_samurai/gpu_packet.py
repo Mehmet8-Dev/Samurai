@@ -15,7 +15,7 @@ import numpy as np
 try:
     from numba import cuda as _numba_cuda
     from numba.cuda.random import create_xoroshiro128p_states
-except Exception:  # pragma: no cover - depends on runtime
+except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):  # pragma: no cover - depends on runtime
     _numba_cuda = None
 
     def create_xoroshiro128p_states(*_args, **_kwargs):
@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - depends on runtime
 
 try:
     from . import _gpu_packet_cuda_backend as _backend
-except Exception as _cuda_import_exc:  # pragma: no cover - depends on runtime
+except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as _cuda_import_exc:  # pragma: no cover - depends on runtime
     _backend = None
     _CUDA_IMPORT_ERROR = _cuda_import_exc
 else:
@@ -245,7 +245,7 @@ def _cache_max_entries() -> int:
     raw = str(os.environ.get("SAMURAI_GPU_CACHE_MAX_ENTRIES", "128") or "128").strip()
     try:
         return max(1, int(raw))
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return 128
 
 
@@ -253,7 +253,7 @@ def _rng_pool_max_entries() -> int:
     raw = str(os.environ.get("SAMURAI_GPU_RNG_POOL_MAX_ENTRIES", "16") or "16").strip()
     try:
         return max(1, int(raw))
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return 16
 
 

@@ -178,7 +178,7 @@ def resolve_custom_tcp_flush_transport(
             if callable(check_xdp_available_fn):
                 try:
                     available, detail = check_xdp_available_fn()
-                except Exception as exc:
+                except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
                     available = False
                     detail = str(exc)
             if available:
@@ -311,7 +311,7 @@ async def flush_custom_tcp_tx_packets(
 
     try:
         sx_buf, sx_owner, sx_count, sx_pkt_size, sx_stride, sx_uniform = extract_strided_peek_batch(peek_fn())
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         sx_buf, sx_owner, sx_count, sx_pkt_size, sx_stride, sx_uniform = (None, None, 0, 0, 0, 0)
     if sx_buf is None or sx_count <= 0:
         return {}
@@ -355,7 +355,7 @@ async def flush_custom_tcp_tx_packets(
     if sent > 0:
         try:
             consumed = int(consume_fn(min(sent, sx_count)) or 0)
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             consumed = 0
     if consumed > 0:
         update_live_fn(live_progress, consumed)

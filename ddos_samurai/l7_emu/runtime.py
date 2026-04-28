@@ -10,7 +10,7 @@ log_warning = utils.log_warning
 
 try:
     from .. import _l7_emu_native as _native
-except Exception:  # pragma: no cover
+except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):  # pragma: no cover
     _native = None
 
 

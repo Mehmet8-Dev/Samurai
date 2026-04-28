@@ -168,7 +168,7 @@ def _update_live(val, inc):
     try:
         if val is not None and inc:
             val.value += int(inc)
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         pass
 
 
@@ -189,7 +189,7 @@ def _estimate_paced_packets(
         return 0
     try:
         cfg_mode = pacing_config.pacing_mode
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return 0
     est = 0
     try:
@@ -201,7 +201,7 @@ def _estimate_paced_packets(
             ipg_ns = int(getattr(pacing_config, "ipg_ns", 0) or 0)
             if ipg_ns > 0:
                 est = int((elapsed_s * 1_000_000_000.0) / float(ipg_ns))
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         est = 0
     if est <= 0:
         return 0
@@ -238,7 +238,7 @@ async def _run_paced_send_with_live_progress(
             break
     try:
         sent = int(future.result() or 0)
-    except Exception as exc:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
         raise _PacedSendRuntimeError(exc, progress_emitted) from exc
     sent = max(0, min(int(progress_budget), sent))
     if sent > progress_emitted:
@@ -460,7 +460,7 @@ def _take_loss_snapshot(preferred_iface=None):
     try:
         from .. import loss_telemetry
         return dict(loss_telemetry.snapshot(iface=_resolve_loss_iface(preferred_iface)) or {})
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return {}
 
 
@@ -471,7 +471,7 @@ def _take_loss_delta(before: dict, preferred_iface=None) -> dict:
         from .. import loss_telemetry
         after = dict(loss_telemetry.snapshot(iface=_resolve_loss_iface(preferred_iface)) or {})
         return dict(loss_telemetry.delta(before, after) or {})
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return {}
 
 

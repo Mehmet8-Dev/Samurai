@@ -50,7 +50,7 @@ def handle_self_test(args, report_ctx: dict) -> int:
         m.set_gauge("self_test_errors", float(summary.get("errors", 0) or 0))
         m.set_gauge("self_test_skipped", float(summary.get("skipped", 0) or 0))
         m.observe("self_test_wall_s", float(duration_wall))
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         pass
 
     if report_ctx["want_report"]:
@@ -229,7 +229,7 @@ def handle_dry_run(args, parser, report_ctx: dict) -> int:
         pkt = packet.create_packet(p_config)
         pkt_bytes = bytes(pkt)
         utils.log_info(f"Örnek paket üretildi: {len(pkt_bytes)} bayt. (attack_vector={args.attack_vector})")
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
         warnings.append(f"sample_packet_unavailable: {type(e).__name__}: {e}")
         utils.log_warning(f"Dry-run: örnek paket üretilemedi (ortam/izin kısıtı olabilir): {e}")
         if not report_ctx["want_report"]:
@@ -241,7 +241,7 @@ def handle_dry_run(args, parser, report_ctx: dict) -> int:
         m.set_gauge("dry_run_sample_packet_len", float(len(pkt_bytes)))
         m.set_gauge("dry_run_payload_len", float(payload_len))
         m.observe("dry_run_wall_s", float(duration_wall))
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         pass
 
     if report_ctx["want_report"]:

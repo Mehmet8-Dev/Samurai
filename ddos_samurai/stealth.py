@@ -294,7 +294,7 @@ class WAFBypass:
         except TimeoutError:
             logging.error("WAF bypass timed out after %.1fs.", self.timeout_s)
             return None
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
             logging.error("WAF bypass failed: %s", e)
             return None
 

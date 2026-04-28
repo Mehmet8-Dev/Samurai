@@ -73,7 +73,7 @@ def save_cache(result: LicenseResult, hwid: str) -> bool:
             fp.write(token)
         os.chmod(CACHE_FILE, 0o600)
         return True
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return False
 
 
@@ -138,7 +138,7 @@ def load_cache(hwid: str) -> Optional[LicenseResult]:
             offline=True,
         )
 
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         _remove_cache()
         return None
 

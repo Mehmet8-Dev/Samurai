@@ -19,7 +19,7 @@ def _get_cpu_id() -> str:
             for line in f:
                 if line.strip().startswith("model name"):
                     return line.split(":", 1)[1].strip()
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         pass
     return platform.processor() or platform.machine() or "unknown-cpu"
 
@@ -35,7 +35,7 @@ def _get_primary_mac() -> str:
         return ":".join(
             f"{(mac_int >> (8 * i)) & 0xFF:02x}" for i in reversed(range(6))
         )
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return "fallback-mac"
 
 

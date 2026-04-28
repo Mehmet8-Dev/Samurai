@@ -35,7 +35,7 @@ def _normalize_packets_buffer(
             meta["buffer_copy_count"] = 1
             meta["buffer_copy_bytes"] = int(required_bytes)
             return _ret(out)
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
             log_error(f"GPU->host normalize failed, using fallback copy: {e}")
             try:
                 # Fallback for CuPy-like arrays
@@ -43,7 +43,7 @@ def _normalize_packets_buffer(
                 meta["buffer_copy_count"] = 1
                 meta["buffer_copy_bytes"] = int(required_bytes)
                 return _ret(out)
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
                 pass
 
     # Normalize memoryview into byte-addressable shape if needed
@@ -76,7 +76,7 @@ def _normalize_packets_buffer(
             meta["buffer_copy_count"] = 1
             meta["buffer_copy_bytes"] = int(required_bytes)
             return _ret(out[:required_bytes])
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             out = np.ascontiguousarray(flat)
             meta["buffer_copy_count"] = 1
             meta["buffer_copy_bytes"] = int(required_bytes)

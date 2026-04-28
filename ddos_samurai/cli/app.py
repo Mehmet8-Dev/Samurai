@@ -133,7 +133,7 @@ def _start_trial() -> None:
     except URLError as e:
         utils.log_critical(f"Sunucuya bağlanılamadı: {e.reason}")
         utils.log_info("  Sunucu: " + LICENSE_SERVER_URL)
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
         utils.log_critical(f"Trial başlatma hatası: {e}")
 
 
@@ -247,7 +247,7 @@ def main(argv=None):
     try:
         from ..licensing.updater import check_for_updates
         check_for_updates()
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         pass  # Güncelleme kontrolü asla çalışmayı engellememeli
     # ── Auto-Update Check End ──────────────────────────────────────────
 
@@ -276,7 +276,7 @@ def main(argv=None):
     global CONNECTION_POOL
     try:
         CONNECTION_POOL = max(1, int(args.connection_pool))
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         pass
 
     # ── License-based Worker Limit ──────────────────────────────────────

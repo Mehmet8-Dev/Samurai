@@ -28,7 +28,7 @@ except ImportError:
 try:
     from . import fast_sender
     FAST_SENDER_AVAILABLE = True
-except Exception:
+except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
     pass
 
 def get_capabilities():
@@ -38,7 +38,7 @@ def get_capabilities():
     try:
         from .af_xdp_sender import check_xdp_available
         xdp_available, _ = check_xdp_available(quiet=True)
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         xdp_available = False
     return {
         "version": __version__,

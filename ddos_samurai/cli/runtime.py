@@ -46,7 +46,7 @@ def _load_payloads(args) -> list:
         except FileNotFoundError:
             utils.log_critical(f"Payload dosyası bulunamadı: {args.payload_file}")
             raise SystemExit(1)
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
             utils.log_critical(f"Payload dosyası okunurken hata: {e}")
             raise SystemExit(1)
     elif args.payload:
@@ -73,7 +73,7 @@ def _prepare_ninja_mode(args) -> None:
             return
         utils.log_critical("Ninja Mode: WAF Bypass başarısız oldu. Saldırı iptal ediliyor.")
         raise SystemExit(1)
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
         utils.log_critical(f"Ninja Mode Hatası: {e}")
         raise SystemExit(1)
 
@@ -177,7 +177,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             dp_queues=int(getattr(args, "dp_queues", 1) or 1),
             map_spec=str(getattr(args, "dp_queue_map", "") or ""),
         )
-    except Exception as exc:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
         utils.log_critical(f"Dataplane queue map çözümleme hatası: {exc}")
         return 1
 
@@ -238,7 +238,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                         )
                 out = export_jsonl_rows(rows, export_path)
                 utils.log_info(f"Traffic model event export: {out}")
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
             utils.log_critical(f"Traffic model planner failed: {exc}")
             return 1
 
@@ -348,7 +348,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     m.set_gauge("soak_passed", 1.0 if bool((monitor_summary or {}).get("passed", False)) else 0.0)
                     m.set_gauge("soak_alarms_total", float(len((monitor_summary or {}).get("alarms", []))))
                     m.set_gauge("soak_snapshots_total", float((monitor_summary or {}).get("snapshot_count", 0) or 0))
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
                 pass
 
             warnings = []
@@ -427,11 +427,11 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             if report_ctx["loss_report_out"]:
                 loss_summary = build_loss_summary(rr.results, finished_utc)
                 reporting.write_text(json.dumps(loss_summary, indent=2, sort_keys=True), report_ctx["loss_report_out"])
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
             utils.log_warning(f"Run raporu üretilemedi: {e}")
     try:
         manager.shutdown()
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         pass
     if kpi_hard_fail_triggered:
         return 2

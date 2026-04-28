@@ -10,7 +10,7 @@ from .helpers import _normalize_afpacket_hugepage_mode, _normalize_dataplane_cor
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)) or default)
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return int(default)
 
 

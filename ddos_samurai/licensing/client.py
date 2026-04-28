@@ -64,7 +64,7 @@ def _resolve_key(
             content = open(key_file, "r", encoding="utf-8").read().strip()
             if content:
                 return content
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             pass
 
     # 3. Ortam değişkeni
@@ -78,7 +78,7 @@ def _resolve_key(
             content = open(LICENSE_KEY_FILE, "r", encoding="utf-8").read().strip()
             if content:
                 return content
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             pass
 
     return None
@@ -114,7 +114,7 @@ def _post_json(endpoint: str, payload: dict) -> dict:
     except HTTPError as exc:
         try:
             body = json.loads(exc.read().decode("utf-8"))
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             body = {}
         return {
             "valid": False,
@@ -124,7 +124,7 @@ def _post_json(endpoint: str, payload: dict) -> dict:
         }
     except URLError:
         raise  # Network hatası → caller'da offline cache'e düş
-    except Exception as exc:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
         return {"valid": False, "error": True, "reason": str(exc)}
 
 
@@ -317,7 +317,7 @@ def send_heartbeat(
             "app_version": __version__,
         })
         return resp.get("status", "active") == "active"
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         # Network hatası → session'ı kırma, devam et
         return True
 
@@ -344,5 +344,5 @@ def deactivate_device(
 
         clear_cache()
         return True, str(resp.get("message", "Cihaz başarıyla kaldırıldı."))
-    except Exception as exc:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
         return False, f"Sunucuya ulaşılamadı: {exc}"

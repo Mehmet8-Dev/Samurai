@@ -30,7 +30,7 @@ def publish_metrics_prom_to_textfile(metrics_prom_path: str) -> None:
         shutil.copyfile(src, tmp)
         os.replace(tmp, dest)
         utils.log_info(f"Prom textfile güncellendi: {dest}")
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
         utils.log_warning(f"Prom textfile güncellenemedi ({dest}): {e}")
 
 

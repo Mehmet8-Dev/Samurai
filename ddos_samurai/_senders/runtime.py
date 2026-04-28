@@ -45,7 +45,7 @@ def has_l7_native_quic(*, package: str = "ddos_samurai") -> bool:
 
         mod = importlib.import_module("._l7_emu_native", package=package)
         return bool(mod is not None and hasattr(mod, "run_profile"))
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return False
 
 

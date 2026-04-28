@@ -11,7 +11,7 @@ def _parse_route_probe(target_ip: str) -> tuple[str | None, str | None]:
             text=True,
             timeout=2,
         ).strip()
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return None, None
     if not out:
         return None, None
@@ -37,7 +37,7 @@ def _read_arp_mac(ip_addr: str | None) -> str | None:
                     mac = parts[3].strip().lower()
                     if mac and mac != "00:00:00:00:00:00":
                         return mac
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return None
     return None
 
@@ -70,7 +70,7 @@ def get_gateway_info(
         log_info(f"Gateway MAC resolved: {mac_str} ({len(mac_bytes)} bytes) on {iface}")
         gateway_cache[target_ip] = (time.monotonic(), iface, mac_bytes)
         return iface, mac_bytes
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
         log_error(f"get_gateway_info error: {e}")
         return None, None
 
@@ -240,7 +240,7 @@ async def xdp_sender(
                 else:
                     try:
                         cached.stop()
-                    except Exception:
+                    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
                         pass
                     sender_context.pop("xdp_sender_instance", None)
                     sender_context.pop("xdp_sender_cfg", None)
@@ -370,7 +370,7 @@ async def xdp_sender(
         if not persistent_sender:
             sender.stop()
 
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
         log_error(f"[XDP] Error: {e}")
         if verbose:
             import traceback
@@ -378,7 +378,7 @@ async def xdp_sender(
         if sender is not None and not persistent_sender:
             try:
                 sender.stop()
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
                 pass
         return await _fallback(reason="xdp_runtime_error", details=f"Runtime error: {e}")
 

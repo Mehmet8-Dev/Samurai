@@ -201,7 +201,7 @@ def _load_profile_from_parity(profile: str, parity_matrix_path: Optional[str] = 
         gates = ((profiles.get(profile) or {}).get("gates") or {})
         if isinstance(gates, dict) and gates:
             return dict(gates)
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         pass
     return {}
 
@@ -279,7 +279,7 @@ def _merge_gate_defaults(profile: str, parity_matrix_path: Optional[str] = None)
 def _to_float(value: Any) -> Optional[float]:
     try:
         return float(value)
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return None
 
 

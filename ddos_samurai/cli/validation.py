@@ -158,7 +158,7 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
             parser.error("Hata: --dp-queue-strategy map için --dp-queue-map zorunludur.")
         try:
             _ = _parse_dp_queue_map(dp_queue_map)
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
             parser.error(f"Hata: --dp-queue-map formatı geçersiz: {exc}")
     if l7_template_mode not in {"compat", "profile"}:
         parser.error("Hata: --l7-template-mode compat veya profile olmalıdır.")
@@ -178,7 +178,7 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
                 topo_seed=topo_seed,
                 topo_strict=topo_strict,
             )
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
             parser.error(f"Hata: topology spec geçersiz: {exc}")
         args.topology_enabled = True
         args.topology_plan_id = str(compiled_topology.plan_id)
@@ -349,7 +349,7 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
         from ..af_xdp_sender import get_interface_queue_count
 
         nic_tx_queues = int(get_interface_queue_count(iface) or 1)
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         nic_tx_queues = 1
     if dp_queues > nic_tx_queues:
         parser.error(

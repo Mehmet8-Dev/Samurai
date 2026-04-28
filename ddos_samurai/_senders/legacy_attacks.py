@@ -24,7 +24,7 @@ async def amplification_sender(
     try:
         with open(reflector_file, "r") as f:
             reflectors = [line.strip() for line in f if line.strip()]
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
         log_error(f"Yansıtıcı dosyası okunamadı: {e}")
         return stats_fn(attempted=count, sent=0, errors=count)
 
@@ -141,7 +141,7 @@ async def slow_attack_sender(
                 await writer.wait_closed()
                 completed += 1
                 update_live_fn(live_sent, 1)
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
                 errors += 1
                 update_live_fn(live_errors, 1)
 
@@ -169,7 +169,7 @@ async def slow_attack_sender(
                 await writer.wait_closed()
                 completed += 1
                 update_live_fn(live_sent, 1)
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
                 errors += 1
                 update_live_fn(live_errors, 1)
 

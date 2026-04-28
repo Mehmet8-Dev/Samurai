@@ -9,7 +9,7 @@ log = logging.getLogger(__name__)
 
 try:
     from . import dataplane_core as _dp_core
-except Exception:
+except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
     _dp_core = None
 
 
@@ -123,7 +123,7 @@ class DataplaneSession:
             self._handle = _dp_core.open(self.config.as_dict())
             self._open_error = ""
             return True
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
             self._open_error = f"{type(exc).__name__}: {exc}"
             log.warning("DataplaneSession.open failed: %s", self._open_error)
             self._handle = None
@@ -161,7 +161,7 @@ class DataplaneSession:
                 str(target_ip or ""),
                 int(target_port or 0),
             )
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
             return DataplaneResult(
                 attempted=int(count),
                 sent=0,
@@ -209,7 +209,7 @@ class DataplaneSession:
         try:
             snap = _dp_core.snapshot(self._handle)
             return dict(snap or {})
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             return {}
 
     def close(self) -> None:
@@ -218,7 +218,7 @@ class DataplaneSession:
             return
         try:
             _dp_core.close(self._handle)
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             pass
         finally:
             self._handle = None

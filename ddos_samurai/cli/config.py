@@ -27,7 +27,7 @@ def load_config_defaults(config_path: str | None) -> dict:
     except FileNotFoundError:
         utils.log_critical(f"Konfigürasyon dosyası bulunamadı: {config_path}")
         raise SystemExit(1)
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
         utils.log_critical(f"Konfigürasyon dosyası okunurken hata: {e}")
         raise SystemExit(1)
     return defaults_from_config

@@ -156,7 +156,7 @@ class PacketConfig:
         self.protocol_int = int(_PROTO_STR_TO_INT.get(self.protocol, 0) or 0)
         try:
             self.target_ip_int = ip_to_int(self.target_ip)
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             self.target_ip_int = 0
         self.tcp_flags_int = parse_tcp_flags(self.tcp_flags) if self.protocol == "tcp" else 0
 

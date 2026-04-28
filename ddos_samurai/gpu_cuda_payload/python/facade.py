@@ -10,7 +10,7 @@ from .adapters import normalize_vector_spec
 
 try:
     from ddos_samurai import _gpu_cuda_payload_native as _native
-except Exception:  # pragma: no cover - optional native module
+except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):  # pragma: no cover - optional native module
     _native = None
 
 

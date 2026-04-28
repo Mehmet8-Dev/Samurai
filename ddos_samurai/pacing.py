@@ -437,7 +437,7 @@ def _fallback_send(buffer, target_ip, target_port, packet_size, count):
         try:
             s.sendto(mv[start:end], (target_ip, target_port))
             sent += 1
-        except Exception:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             break
     s.close()
     return sent

@@ -7,7 +7,7 @@ import numpy as np
 
 try:
     import cupy as cp
-except Exception:  # pragma: no cover - optional GPU dependency
+except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):  # pragma: no cover - optional GPU dependency
     cp = None
 
 

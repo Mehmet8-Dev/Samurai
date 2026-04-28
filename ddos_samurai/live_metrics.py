@@ -33,7 +33,7 @@ class LiveMetricsExporter:
         # Ensure directory exists
         try:
             os.makedirs(os.path.dirname(self.prom_file), exist_ok=True)
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
             log.warning("LiveMetricsExporter: cannot create prom dir %s: %s", self.prom_file, e)
 
     def export(self, stats: Dict[str, Any]) -> None:
@@ -120,7 +120,7 @@ class LiveMetricsExporter:
                     self.prom_file,
                 )
                 self._write_errors = 0
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
             self._write_errors += 1
             self._write_error_total += 1
             # Log only first failure and then every 10th to avoid spam

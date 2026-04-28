@@ -35,7 +35,7 @@ def _should_check() -> bool:
             last_check = float(_CACHE_FILE.read_text().strip())
             if (time.time() - last_check) < _CHECK_INTERVAL_S:
                 return False
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         pass
 
     return True
@@ -46,7 +46,7 @@ def _save_check_time() -> None:
     try:
         _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _CACHE_FILE.write_text(str(time.time()))
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         pass
 
 
