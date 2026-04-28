@@ -1,104 +1,33 @@
-# 05 - GPU Engine (gpu_packet.py + native CUDA backend)
+# 05 - GPU Yolları
 
-## Rol
+## Kapsam
 
-GPU yolu iki ana hedefe hizmet eder:
+Projede GPU kullanımı iki ana hatta ayrılır:
 
-- Paket/payload uretimini paralellestirmek
-- Uretilen batch'i CPU TX hattina verimli sekilde beslemek
+1. `gpu_packet.py`: L3/L4 paket üretim hızlandırması
+2. `gpu_cuda_payload/`: L7 payload/vector planlama hızlandırması
 
-Kod tabaninda hem Python tarafi (Numba/CuPy) hem native CUDA C++ ABI yolu vardir.
+## Operasyonel Gerçek
 
-## Guncel Durum (2026-03-15)
+- GPU, çoğu senaryoda üretim/planner hızlandırıcısıdır
+- Ağ I/O ve stateful kontrol akışının önemli kısmı CPU/C katmanında kalır
 
-1. L3/L4 paket uretim hot-path:
-   - GPU generate (header/checksum/random/template mutate)
-   - Cikti CPU TX hattina verilir
-2. L7 planner/payload path:
-   - GPU varyasyon/planning hizlandiricisi
-   - Gercek state + socket I/O CPU/C state engine tarafinda
-
-Yani L7 icin tam bir GPU network stack yok; GPU burada generator/planner rolu oynar.
-
-## D2H ve Zero-Copy Output
-
-Varsayilan davranis:
-- Native CUDA cikti device memory'de olusur
-- Export asamasinda host tarafa D2H copy yapilir
-- Stream verildiginde D2H `cudaMemcpyAsync` ile queue'lanir (hemen stream sync yok)
-- Senkronizasyon bariyeri:
-  - `return_host_ready=True`: orchestrator `ready_event` ile bekler
-  - `return_host_ready=False`: Python bridge `samurai_gpu_packet_wait()` ile bekler
-
-Opsiyonel davranis:
-- `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT=1`
-- veya CLI: `--gpu-packet-zerocopy-output`
-- Native output buffer `cudaHostAllocMapped` ile acilir
-- Kernel mapped host alana yazar; export'ta ekstra D2H adimi atlanir
-- Hazirlik senkronu yine stream event/wait bariyerleri ile yapilir
-
-Notlar:
-- Bu knob native CUDA path icindir.
-- Her GPU/PCIe topolojisinde performans kazanci garanti degildir.
-- A/B benchmark ile karar verilmelidir.
-- AF_PACKET TX_RING kullaniminda son adimda ring frame'e `memcpy` halen vardir (UMEM/XDP degilse tam wire-level zero-copy olmaz).
-
-## Pipeline Knob'lari
+## Kritik Knob'lar
 
 - `--gpu-template-pool-size-l4`
 - `--gpu-template-pool-size-l7`
 - `--gpu-ring-capacity`
+- `--gpu-batch-size`
 - `--gpu-stream-count`
 - `--gpu-pipeline-depth`
-- `--gpu-full-variation`
-- `--gpu-pinned-max-mb`
 - `--gpu-packet-zerocopy-output`
+- `--gpu-kernel-mode {batch,persistent}`
+- `--gpu-stream-api {compat,stream}`
 
-## Backpressure ve Ring
+## Persistent Mod Notu
 
-Producer-consumer ring kullanilir:
-- bounded queue (`SAMURAI_GPU_RING_CAPACITY`, default `3`)
-- queue doldugunda producer bekler (drop yerine backpressure)
-- telemetry: `gpu_ring_depth_peak`, `gpu_ring_block_wait_ns`
+`gpu-kernel-mode=persistent` + `gpu-stream-api=stream` kombinasyonu env tarafında daha katı TX backend davranışı tetikler (`SAMURAI_GPU_TX_BACKEND_STRICT=1`).
 
-## Pinned Host Pool Limiti
+## Doğrulama
 
-Pinned host buffer pool limit-aware calisir:
-- limit: `SAMURAI_GPU_PINNED_MAX_MB` (default `512`)
-- LRU eviction + oversize bypass
-- telemetry: `pool_evictions`, `oversize_bypass`, `high_watermark_bytes`
-
-## Cekirdek Fonksiyonlar
-
-`ddos_samurai/gpu_packet.py` tarafinda orchestrator'in kullandigi baslica API'ler:
-- `generate_packets_from_template_pool(...)`
-- `generate_amplification_packets(...)`
-- `generate_stateful_packets(...)`
-- `generate_fragmented_packets(...)`
-- `copy_gpu_to_host_pinned(...)` (D2H/pinned copy yolu)
-
-Native CUDA export yolunda zero-copy aciksa ek D2H atlanabilir; bu, `gpu_packet.py` tarafindaki genel pinned-copy API'sini tamamen ortadan kaldirmaz.
-
-## Yeni Paket: `gpu_cuda_payload/`
-
-`gpu_packet.py` hattindan ayri olarak yeni bir planner/payload katmani vardir:
-
-- dizin: `ddos_samurai/gpu_cuda_payload/`
-- extension: `ddos_samurai._gpu_cuda_payload_native`
-
-Ust seviye API:
-
-- `compile_vector_spec(...)`
-- `plan_batch_to_h2_request_plan(...)`
-- `execute_plan_batch(...)`
-- `evaluate_oracle(...)`
-- `D2HTransferEngine`
-
-Kisa rol ayrimi:
-
-- `gpu_packet.py`: packet generation + native CUDA packet hot-path
-- `gpu_cuda_payload/`: vector plan derleme + stateful L7 request plan entegrasyonu
-
-Detayli referans:
-
-- `docs/27-gpu-cuda-payload.md`
+Performans iddiaları sistemden sisteme değişir; özellikle `zerocopy-output` için benchmark karşılaştırması şarttır.
