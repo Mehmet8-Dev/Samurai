@@ -2,6 +2,17 @@ import asyncio
 import os
 from typing import Any, Dict
 
+_RECOVERABLE_ERRORS = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    ImportError,
+    KeyError,
+    IndexError,
+)
+
 
 async def raw_socket_sender(
     packets_buffer,
@@ -145,7 +156,7 @@ async def raw_socket_sender(
             target_ip=target_ip,
             target_port=target_port,
         )
-    except Exception as e:
+    except _RECOVERABLE_ERRORS as e:
         _update_live(live_progress, int(count))
         _update_live(live_errors, int(count))
         out = _stats(
@@ -355,13 +366,13 @@ async def paced_raw_socket_sender(
                 try:
                     iface, _gw_mac = get_gateway_info(target_ip)
                     iface = str(iface or "").strip()
-                except Exception:
+                except _RECOVERABLE_ERRORS:
                     iface = ""
 
             if callable(reset_stats):
                 try:
                     reset_stats()
-                except Exception:
+                except _RECOVERABLE_ERRORS:
                     pass
 
             if not iface:
@@ -475,7 +486,7 @@ async def paced_raw_socket_sender(
                     out["sender_fallback_reason"] = reason
                 out["sender_fallback_reason_detail"] = detail
                 return out
-            except Exception as exc:
+            except _RECOVERABLE_ERRORS as exc:
                 detail = str(exc)
                 reason = _xdp_pacing_fail_reason(detail)
                 _update_live(live_sent, progress_reported)
@@ -542,7 +553,7 @@ async def paced_raw_socket_sender(
                     stats = get_stats()
                     if stats:
                         out = _apply_pacing_stats(out, stats)
-                except Exception:
+                except _RECOVERABLE_ERRORS:
                     pass
             return out
 
@@ -554,7 +565,7 @@ async def paced_raw_socket_sender(
         if pacing_via_xdp and callable(reset_stats):
             try:
                 reset_stats()
-            except Exception:
+            except _RECOVERABLE_ERRORS:
                 pass
         out = await xdp_sender(
             packets_buffer=packets_buffer,
@@ -577,7 +588,7 @@ async def paced_raw_socket_sender(
                 stats = get_stats()
                 if stats:
                     out = _apply_pacing_stats(out, stats)
-            except Exception:
+            except _RECOVERABLE_ERRORS:
                 pass
         elif pacing_active:
             out["pacing_bypassed_for_xdp"] = 1
@@ -657,7 +668,7 @@ async def paced_raw_socket_sender(
                 try:
                     if callable(reset_stats):
                         reset_stats()
-                except Exception:
+                except _RECOVERABLE_ERRORS:
                     pass
                 progress_budget = max(0, int(count) - int(progress_reported))
                 try:
@@ -715,10 +726,10 @@ async def paced_raw_socket_sender(
                 return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
             else:
                 _register_fallback("paced_l2_gateway_not_found")
-        except Exception as e:
+        except _RECOVERABLE_ERRORS as e:
             try:
                 cleanup_l2()
-            except Exception:
+            except _RECOVERABLE_ERRORS:
                 pass
             _register_fallback("paced_l2_error")
             if verbose:
@@ -747,7 +758,7 @@ async def paced_raw_socket_sender(
         try:
             if callable(reset_stats):
                 reset_stats()
-        except Exception:
+        except _RECOVERABLE_ERRORS:
             pass
         progress_budget = max(0, int(count) - int(progress_reported))
         try:
@@ -817,7 +828,7 @@ async def paced_raw_socket_sender(
         if progress_reported > 0:
             _update_live(live_progress, max(0, int(count) - int(progress_reported)))
         return out
-    except Exception as e:
+    except _RECOVERABLE_ERRORS as e:
         log_error(f"[Pacing] L3 paced send failed: {e}. Falling back to unpaced.")
         fallback_live_progress = None if progress_reported > 0 else live_progress
         out = await raw_socket_sender(
