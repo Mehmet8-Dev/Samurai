@@ -18,10 +18,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-try:
-    import cupy as cp
-except _RECOVERABLE_ERRORS:  # pragma: no cover - depends on runtime
-    cp = None
 import logging
 
 _LOG = logging.getLogger(__name__)
@@ -34,6 +30,11 @@ _RECOVERABLE_ERRORS = (
     ImportError,
     json.JSONDecodeError,
 )
+
+try:
+    import cupy as cp
+except _RECOVERABLE_ERRORS:  # pragma: no cover - depends on runtime
+    cp = None
 
 
 def _debug_exception(context: str, exc: BaseException) -> None:
