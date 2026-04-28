@@ -22,6 +22,13 @@ try:
     import cupy as cp
 except Exception:  # pragma: no cover - depends on runtime
     cp = None
+import logging
+
+_LOG = logging.getLogger(__name__)
+
+
+def _debug_exception(context: str, exc: BaseException) -> None:
+    _LOG.debug("%s: %s", context, exc, exc_info=True)
 
 
 class GPUPacketError(Exception):
@@ -282,7 +289,8 @@ def _load_lib() -> ctypes.CDLL | None:
                 for p in candidates:
                     try:
                         _NATIVE_PRELOADED_LIBS.append(ctypes.CDLL(str(p), mode=mode))
-                    except Exception:
+                    except Exception as exc:
+                        _debug_exception(f"preload failed for native extension {p}", exc)
                         continue
 
         _preload_native_extension_sos()
@@ -297,8 +305,8 @@ def _load_lib() -> ctypes.CDLL | None:
             for mod_name in tuple(f".{n}" for n in module_roots):
                 try:
                     importlib.import_module(mod_name, package=__package__)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _debug_exception(f"native extension import failed ({mod_name})", exc)
             return
 
         prev_flags = sys.getdlopenflags()
@@ -308,8 +316,8 @@ def _load_lib() -> ctypes.CDLL | None:
             for mod_name in tuple(f".{n}" for n in module_roots):
                 try:
                     importlib.import_module(mod_name, package=__package__)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _debug_exception(f"native extension global import failed ({mod_name})", exc)
         finally:
             sys.setdlopenflags(prev_flags)
 
@@ -317,7 +325,8 @@ def _load_lib() -> ctypes.CDLL | None:
     try:
         mode = getattr(ctypes, "RTLD_GLOBAL", 0)
         lib = ctypes.CDLL(str(_LIB_PATH), mode=mode)
-    except Exception:
+    except Exception as exc:
+        _debug_exception(f"failed to load native CUDA bridge at {_LIB_PATH}", exc)
         return None
 
     lib.samurai_gpu_packet_generate_packets.argtypes = [
@@ -473,7 +482,8 @@ def _load_lib() -> ctypes.CDLL | None:
     try:
         lib.samurai_gpu_packet_wait.argtypes = [ctypes.c_void_p]
         lib.samurai_gpu_packet_wait.restype = ctypes.c_int
-    except Exception:
+    except Exception as exc:
+        _debug_exception("native wait API symbols unavailable", exc)
         # Backward-compat: older native libs may not expose wait API.
         pass
 
@@ -501,8 +511,8 @@ def _load_lib() -> ctypes.CDLL | None:
             lib.samurai_gpu_packet_read_stream_stats_snapshot.restype = ctypes.c_int
         lib.samurai_gpu_packet_shutdown_runtime.argtypes = []
         lib.samurai_gpu_packet_shutdown_runtime.restype = ctypes.c_int
-    except Exception:
-        pass
+    except Exception as exc:
+        _debug_exception("native stream lifecycle symbols unavailable", exc)
     return lib
 
 
@@ -514,13 +524,15 @@ def _last_error() -> str:
         return ""
     try:
         raw = _LIB.samurai_gpu_packet_last_error()
-    except Exception:
+    except Exception as exc:
+        _debug_exception("samurai_gpu_packet_last_error call failed", exc)
         return ""
     if not raw:
         return ""
     try:
         return raw.decode("utf-8", errors="replace").strip()
-    except Exception:
+    except Exception as exc:
+        _debug_exception("failed to decode native error string", exc)
         return str(raw)
 
 
@@ -589,8 +601,8 @@ class _NativeHostAllocation:
             if self._lib is not None and bool(self._ptr):
                 try:
                     self._lib.samurai_gpu_packet_free(self._ptr)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _debug_exception("native host allocation free failed", exc)
 
     def __del__(self):
         self.release()
@@ -654,8 +666,8 @@ def _materialize_native_output(
             if rc != 0:
                 try:
                     _LIB.samurai_gpu_packet_free(ctypes.c_void_p(int(out_ptr.value or 0)))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _debug_exception("native host free failed after wait error", exc)
                 _raise_native_error("samurai_gpu_packet_wait failed")
     host = _wrap_host_array(out_ptr, out_size, pool_key=pool_key)
     return host
@@ -757,8 +769,8 @@ def _extract_stream_handle(stream: Any) -> int | None:
             try:
                 h = int(getattr(stream, attr))
                 return h if h >= 0 else None
-            except Exception:
-                pass
+            except Exception as exc:
+                _debug_exception(f"stream handle conversion failed for attr {attr}", exc)
     nested = getattr(stream, "stream", None)
     if nested is not None and nested is not stream:
         return _extract_stream_handle(nested)
@@ -795,8 +807,8 @@ def init_gpu():
         _raise_native_policy_violation("init_gpu")
     try:
         set_kernel_mode(_kernel_mode_from_env())
-    except Exception:
-        pass
+    except Exception as exc:
+        _debug_exception("init_gpu kernel mode auto-set failed", exc)
     return True
 
 
@@ -884,7 +896,8 @@ def read_stream_stats(stream_id: int | None = None) -> dict:
         return {}
     try:
         text = raw.decode("utf-8", errors="replace")
-    except Exception:
+    except Exception as exc:
+        _debug_exception("failed to decode stream stats payload", exc)
         return {}
     try:
         out = dict(json.loads(text))
@@ -915,7 +928,8 @@ def read_stream_stats(stream_id: int | None = None) -> dict:
                 else:
                     out[key] = max(int(out.get(key, 0) or 0), int(telemetry.get(key, 0) or 0))
         return out
-    except Exception:
+    except Exception as exc:
+        _debug_exception("failed to parse stream stats json", exc)
         return {"raw": text}
 
 
@@ -1503,7 +1517,8 @@ def get_generation_telemetry() -> dict:
     if _native_ready() and _supports_stream_lifecycle():
         try:
             runtime_stats = read_stream_stats(0)
-        except Exception:
+        except Exception as exc:
+            _debug_exception("read_stream_stats during generation telemetry failed", exc)
             runtime_stats = {}
         if isinstance(runtime_stats, dict):
             for key in (
