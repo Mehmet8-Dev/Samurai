@@ -608,8 +608,21 @@ def get_gateway_mac(target_ip=None):
 
         # 1. Determine gateway IP from route table
         if not target_ip:
-            cmd = "ip route show default | awk '/default/ {print $3}'"
-            gateway_ip = subprocess.check_output(cmd, shell=True).decode().strip()
+            route = subprocess.check_output(
+                ["ip", "route", "show", "default"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            ).strip()
+            gateway_ip = ""
+            for line in route.splitlines():
+                parts = line.split()
+                for idx, tok in enumerate(parts):
+                    if tok == "via" and idx + 1 < len(parts):
+                        gateway_ip = parts[idx + 1]
+                        break
+                if gateway_ip:
+                    break
         else:
             try:
                 route = subprocess.check_output(

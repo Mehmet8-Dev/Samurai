@@ -1022,7 +1022,7 @@ async def http_app_sender(
 async def http_stateful_sender(
     target_ip, target_port, vu_count, concurrency,
     workflow_steps, verbose,
-    scheme="http", verify=False, timeout_s=10.0,
+    scheme="http", verify=True, timeout_s=10.0,
     user_agent=None, ssl_context=None,
     retries=0,
     http_method="GET",
