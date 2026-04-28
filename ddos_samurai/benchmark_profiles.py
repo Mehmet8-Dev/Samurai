@@ -10,6 +10,17 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 
+_RECOVERABLE_ERRORS = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    ImportError,
+    KeyError,
+    IndexError,
+)
+
 _PROFILE_ALIASES: Dict[str, str] = {
     "developer_fallback": "ci_safe",
     "full": "dedicated_lab",
@@ -156,7 +167,7 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
             for field in summary_fields:
                 if str(field) not in payload:
                     missing.append(f"{summary_path}::field::{field}")
-        except Exception as exc:
+        except _RECOVERABLE_ERRORS as exc:
             missing.append(f"{summary_path}::parse_error::{type(exc).__name__}: {exc}")
     if summary_path.exists():
         try:
@@ -167,7 +178,7 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
             score_eligible_raw = normalized.get("score_eligible", 0)
             try:
                 score_eligible = int(score_eligible_raw)
-            except Exception:
+            except _RECOVERABLE_ERRORS:
                 score_eligible = -1
             if gate_status != "pass":
                 missing.append(f"{summary_path}::kpi_gate_status::{gate_status or 'missing'}")
@@ -191,7 +202,7 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                 legacy_path_used_raw = normalized.get("legacy_path_used", 1)
                 try:
                     legacy_path_used = int(legacy_path_used_raw)
-                except Exception:
+                except _RECOVERABLE_ERRORS:
                     legacy_path_used = 1
                 if legacy_path_used != 0:
                     missing.append(f"{summary_path}::legacy_path_used::{legacy_path_used_raw}")
@@ -207,7 +218,7 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                 preflight_xdp_enabled_raw = normalized.get("stateful_runtime_preflight_xdp_enabled", 0)
                 try:
                     preflight_xdp_enabled = int(preflight_xdp_enabled_raw)
-                except Exception:
+                except _RECOVERABLE_ERRORS:
                     preflight_xdp_enabled = 0
                 if preflight_xdp_enabled != 1:
                     missing.append(
@@ -221,7 +232,7 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                     for key, raw_count in sender_paths_used.items():
                         try:
                             cnt = float(raw_count)
-                        except Exception:
+                        except _RECOVERABLE_ERRORS:
                             continue
                         if cnt > 0:
                             active_paths.append(str(key or "").strip())
@@ -237,7 +248,7 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                     strict_raw = normalized.get("persistent_tx_backend_strict", 0)
                     try:
                         strict_val = int(strict_raw)
-                    except Exception:
+                    except _RECOVERABLE_ERRORS:
                         strict_val = 0
                     if strict_val != 1:
                         missing.append(f"{summary_path}::persistent_tx_backend_strict::{strict_raw}")
@@ -299,7 +310,7 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                     raw = normalized.get(key, 0)
                     try:
                         value = float(raw)
-                    except Exception:
+                    except _RECOVERABLE_ERRORS:
                         missing.append(f"{summary_path}::{key}::non_numeric::{raw}")
                         continue
                     if value < 0:
@@ -316,19 +327,19 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                 legacy_path_used_raw = normalized.get("legacy_path_used", 1)
                 try:
                     legacy_path_used = int(legacy_path_used_raw)
-                except Exception:
+                except _RECOVERABLE_ERRORS:
                     legacy_path_used = 1
                 if legacy_path_used != 0:
                     missing.append(f"{summary_path}::legacy_path_used::{legacy_path_used_raw}")
                 for key in ("h1_conn_rate_cv_pct", "h2_conn_rate_cv_pct", "l7_conn_rate_cv_pct"):
                     try:
                         cv = float(normalized.get(key, 100.0) or 100.0)
-                    except Exception:
+                    except _RECOVERABLE_ERRORS:
                         missing.append(f"{summary_path}::{key}::non_numeric")
                         continue
                     if cv > 5.0:
                         missing.append(f"{summary_path}::{key}::too_high::{cv}")
-        except Exception as exc:
+        except _RECOVERABLE_ERRORS as exc:
             missing.append(f"{summary_path}::pipeline_parse_error::{type(exc).__name__}: {exc}")
 
     return len(missing) == 0, missing
