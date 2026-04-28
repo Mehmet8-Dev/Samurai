@@ -50,6 +50,11 @@ from pathlib import Path
 
 # Local imports
 from . import utils
+_LOG = logging.getLogger(__name__)
+
+
+def _debug_exception(context: str, exc: BaseException) -> None:
+    _LOG.debug("%s: %s", context, exc, exc_info=True)
 
 # Lazy import of C extension
 _xdp_sender = None
@@ -132,8 +137,8 @@ def probe_xdp_mode2_capability(interface: str) -> Tuple[str, str]:
                         break
                 if driver in {"veth", "tun", "tap", "loopback"}:
                     return "unsupported", f"driver={driver} has no XDP HW offload"
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception("mode2 driver probe failed", exc)
 
     ip_bin = shutil.which("ip")
     if ip_bin:
@@ -149,8 +154,8 @@ def probe_xdp_mode2_capability(interface: str) -> Tuple[str, str]:
                 text = ((out.stdout or "") + "\n" + (out.stderr or "")).lower()
                 if "xdpoffload" in text:
                     return "supported", "interface reports xdpoffload"
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception("mode2 ip-link probe failed", exc)
 
     return "unknown", "offload capability could not be proven from local probes"
 
@@ -284,8 +289,8 @@ def get_default_interface() -> Optional[str]:
             for i, part in enumerate(parts):
                 if part == 'dev' and i + 1 < len(parts):
                     return parts[i + 1]
-    except Exception:
-        pass
+    except Exception as exc:
+        _debug_exception("default interface route probe failed", exc)
     
     try:
         # Method 2: Find first non-loopback interface
@@ -294,8 +299,8 @@ def get_default_interface() -> Optional[str]:
         for iface in interfaces:
             if iface != 'lo' and iface.startswith(('eth', 'en', 'wl')):
                 return iface
-    except Exception:
-        pass
+    except Exception as exc:
+        _debug_exception("default interface sysfs probe failed", exc)
     
     return None
 
@@ -306,7 +311,8 @@ def get_interface_mac(interface: str) -> Optional[bytes]:
         with open(f'/sys/class/net/{interface}/address', 'r') as f:
             mac_str = f.read().strip()
             return bytes.fromhex(mac_str.replace(':', ''))
-    except Exception:
+    except Exception as exc:
+        _debug_exception(f"interface MAC read failed for {interface}", exc)
         return None
 
 
@@ -317,8 +323,8 @@ def get_interface_queue_count(interface: str) -> int:
         if path.exists():
             queues = [d for d in path.iterdir() if d.name.startswith('tx-')]
             return len(queues)
-    except Exception:
-        pass
+    except Exception as exc:
+        _debug_exception(f"interface queue-count probe failed for {interface}", exc)
     return 1
 
 
@@ -584,8 +590,8 @@ class XDPSender:
                 if not self._bpf_attached and bpffs_root is not None:
                     try:
                         shutil.rmtree(bpffs_root, ignore_errors=True)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _debug_exception("bpffs cleanup after failed BPF attach failed", exc)
         try:
             result = subprocess.run(
                 [
@@ -642,8 +648,8 @@ class XDPSender:
             if self._bpffs_root:
                 try:
                     shutil.rmtree(self._bpffs_root, ignore_errors=True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _debug_exception("bpffs cleanup during BPF detach failed", exc)
             self._bpffs_root = ""
             self._bpf_attached = False
     
@@ -660,8 +666,8 @@ class XDPSender:
             major, minor = map(int, kernel.split('.')[:2])
             if major < 4 or (major == 4 and minor < 18):
                 return False, f"Kernel {kernel} too old (need >= 4.18)"
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception("kernel version parse failed", exc)
         
         # Check C extension
         xdp = _load_xdp_extension()
@@ -1011,8 +1017,8 @@ class XDPSender:
                 stats_dict = self._xdp.xdp_stats()
             if stats_dict:
                 return XDPStats.from_dict(stats_dict)
-        except Exception:
-            pass
+        except Exception as exc:
+            _debug_exception("xdp stats read failed", exc)
         
         return XDPStats()
     
@@ -1198,12 +1204,13 @@ class XDPBulkSender:
                 sender.start()
                 self._senders.append(sender)
                 self._sender_queues.append(queue.Queue(maxsize=16))
-        except Exception:
+        except Exception as exc:
+            _debug_exception("XDPBulkSender start failed while initializing workers", exc)
             for sender in self._senders:
                 try:
                     sender.stop()
-                except Exception:
-                    pass
+                except Exception as stop_exc:
+                    _debug_exception("XDPBulkSender rollback stop failed", stop_exc)
             self._senders = []
             self._sender_queues = []
             self._workers = []
@@ -1384,7 +1391,8 @@ class XDPIntegration:
                         if part == 'dev' and i + 1 < len(parts):
                             interface = parts[i + 1]
                             break
-            except Exception:
+            except Exception as exc:
+                _debug_exception("route-based interface detection failed", exc)
                 interface = get_default_interface()
         else:
             interface = get_default_interface()
