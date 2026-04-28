@@ -51,6 +51,15 @@ from pathlib import Path
 # Local imports
 from . import utils
 _LOG = logging.getLogger(__name__)
+_RECOVERABLE_ERRORS = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    ImportError,
+    subprocess.SubprocessError,
+)
 
 
 def _debug_exception(context: str, exc: BaseException) -> None:
@@ -137,7 +146,7 @@ def probe_xdp_mode2_capability(interface: str) -> Tuple[str, str]:
                         break
                 if driver in {"veth", "tun", "tap", "loopback"}:
                     return "unsupported", f"driver={driver} has no XDP HW offload"
-        except Exception as exc:
+        except _RECOVERABLE_ERRORS as exc:
             _debug_exception("mode2 driver probe failed", exc)
 
     ip_bin = shutil.which("ip")
@@ -154,7 +163,7 @@ def probe_xdp_mode2_capability(interface: str) -> Tuple[str, str]:
                 text = ((out.stdout or "") + "\n" + (out.stderr or "")).lower()
                 if "xdpoffload" in text:
                     return "supported", "interface reports xdpoffload"
-        except Exception as exc:
+        except _RECOVERABLE_ERRORS as exc:
             _debug_exception("mode2 ip-link probe failed", exc)
 
     return "unknown", "offload capability could not be proven from local probes"
@@ -289,7 +298,7 @@ def get_default_interface() -> Optional[str]:
             for i, part in enumerate(parts):
                 if part == 'dev' and i + 1 < len(parts):
                     return parts[i + 1]
-    except Exception as exc:
+    except _RECOVERABLE_ERRORS as exc:
         _debug_exception("default interface route probe failed", exc)
     
     try:
@@ -299,7 +308,7 @@ def get_default_interface() -> Optional[str]:
         for iface in interfaces:
             if iface != 'lo' and iface.startswith(('eth', 'en', 'wl')):
                 return iface
-    except Exception as exc:
+    except _RECOVERABLE_ERRORS as exc:
         _debug_exception("default interface sysfs probe failed", exc)
     
     return None
@@ -311,7 +320,7 @@ def get_interface_mac(interface: str) -> Optional[bytes]:
         with open(f'/sys/class/net/{interface}/address', 'r') as f:
             mac_str = f.read().strip()
             return bytes.fromhex(mac_str.replace(':', ''))
-    except Exception as exc:
+    except _RECOVERABLE_ERRORS as exc:
         _debug_exception(f"interface MAC read failed for {interface}", exc)
         return None
 
@@ -323,7 +332,7 @@ def get_interface_queue_count(interface: str) -> int:
         if path.exists():
             queues = [d for d in path.iterdir() if d.name.startswith('tx-')]
             return len(queues)
-    except Exception as exc:
+    except _RECOVERABLE_ERRORS as exc:
         _debug_exception(f"interface queue-count probe failed for {interface}", exc)
     return 1
 
@@ -345,7 +354,7 @@ def check_xdp_available(*, quiet: bool = False) -> Tuple[bool, str]:
             return True, "AF_XDP is available"
         else:
             return False, "AF_XDP socket creation failed (kernel support missing?)"
-    except Exception as e:
+    except _RECOVERABLE_ERRORS as e:
         return False, f"Error checking XDP availability: {e}"
 
 
@@ -359,7 +368,7 @@ def get_xdp_system_info() -> Optional[XDPSystemInfo]:
     try:
         info_dict = xdp.xdp_info()
         return XDPSystemInfo.from_dict(info_dict)
-    except Exception as e:
+    except _RECOVERABLE_ERRORS as e:
         utils.log_error(f"[XDP] Error getting system info: {e}")
         return None
 
@@ -489,7 +498,7 @@ class XDPSender:
                     # Live process owns this pin root; do not touch.
                     continue
                 shutil.rmtree(entry, ignore_errors=True)
-        except Exception as e:
+        except _RECOVERABLE_ERRORS as e:
             utils.log_warning(f"[XDP] stale bpffs cleanup skipped: {e}")
 
     def _attach_bpf_program(self) -> Tuple[bool, str]:
@@ -514,7 +523,7 @@ class XDPSender:
                     utils.log_info(f"[XDP] Compiled BPF object: {self.bpf_obj_path}")
                 except FileNotFoundError:
                     return False, "BPF object missing and `clang` not found"
-                except Exception as e:
+                except _RECOVERABLE_ERRORS as e:
                     return False, f"BPF object compile exception: {e}"
             else:
                 return False, f"BPF object not found: {self.bpf_obj_path}"
@@ -584,13 +593,13 @@ class XDPSender:
                     return False, f"BPF attach (bpftool) failed: {details or f'exit={attach_result.returncode}'}"
                 details = (load_result.stderr or load_result.stdout or "").strip()
                 return False, f"BPF load (bpftool) failed: {details or f'exit={load_result.returncode}'}"
-            except Exception as e:
+            except _RECOVERABLE_ERRORS as e:
                 return False, f"BPF attach via bpftool exception: {e}"
             finally:
                 if not self._bpf_attached and bpffs_root is not None:
                     try:
                         shutil.rmtree(bpffs_root, ignore_errors=True)
-                    except Exception as exc:
+                    except _RECOVERABLE_ERRORS as exc:
                         _debug_exception("bpffs cleanup after failed BPF attach failed", exc)
         try:
             result = subprocess.run(
@@ -605,7 +614,7 @@ class XDPSender:
             )
         except FileNotFoundError:
             return False, "`ip` command not found (iproute2 missing)"
-        except Exception as e:
+        except _RECOVERABLE_ERRORS as e:
             return False, f"BPF attach command failed: {e}"
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
@@ -639,7 +648,7 @@ class XDPSender:
             if result.returncode != 0:
                 details = (result.stderr or result.stdout or "").strip() or f"exit={result.returncode}"
                 utils.log_warning(f"[XDP] BPF detach failed on {self.interface}: {details}")
-        except Exception as e:
+        except _RECOVERABLE_ERRORS as e:
             utils.log_warning(f"[XDP] BPF detach exception on {self.interface}: {e}")
         finally:
             if self._xskmap_pin_path and os.environ.get("SAMURAI_XDP_XSKMAP_PIN", "") == self._xskmap_pin_path:
@@ -648,7 +657,7 @@ class XDPSender:
             if self._bpffs_root:
                 try:
                     shutil.rmtree(self._bpffs_root, ignore_errors=True)
-                except Exception as exc:
+                except _RECOVERABLE_ERRORS as exc:
                     _debug_exception("bpffs cleanup during BPF detach failed", exc)
             self._bpffs_root = ""
             self._bpf_attached = False
@@ -666,7 +675,7 @@ class XDPSender:
             major, minor = map(int, kernel.split('.')[:2])
             if major < 4 or (major == 4 and minor < 18):
                 return False, f"Kernel {kernel} too old (need >= 4.18)"
-        except Exception as exc:
+        except _RECOVERABLE_ERRORS as exc:
             _debug_exception("kernel version parse failed", exc)
         
         # Check C extension
@@ -766,7 +775,7 @@ class XDPSender:
                 else:
                     raise RuntimeError("xdp_init returned False")
                     
-            except Exception as e:
+            except _RECOVERABLE_ERRORS as e:
                 utils.log_error(f"[XDP] Failed to initialize: {e}")
                 self._detach_bpf_program()
                 raise
@@ -796,7 +805,7 @@ class XDPSender:
                             self._xdp.xdp_cleanup()
                     else:
                         self._xdp.xdp_cleanup()
-                except Exception as e:
+                except _RECOVERABLE_ERRORS as e:
                     utils.log_error(f"[XDP] Cleanup error: {e}")
                 finally:
                     self._detach_bpf_program()
@@ -837,7 +846,7 @@ class XDPSender:
             else:
                 sent = self._xdp.xdp_send(packets)
             return sent
-        except Exception as e:
+        except _RECOVERABLE_ERRORS as e:
             utils.log_error(f"[XDP] Send error: {e}")
             return 0
 
@@ -871,7 +880,7 @@ class XDPSender:
             mv = memoryview(packet_buffer)
             packets = [bytes(mv[i * packet_size:(i + 1) * packet_size]) for i in range(count)]
             return int(self._xdp.xdp_send(packets) or 0)
-        except Exception as e:
+        except _RECOVERABLE_ERRORS as e:
             utils.log_error(f"[XDP] Send buffer error: {e}")
             return 0
 
@@ -917,7 +926,7 @@ class XDPSender:
             mv = memoryview(packet_buffer)
             packets = [bytes(mv[i * stride:(i * stride) + packet_size]) for i in range(count)]
             return int(self._xdp.xdp_send(packets) or 0)
-        except Exception as e:
+        except _RECOVERABLE_ERRORS as e:
             utils.log_error(f"[XDP] Send strided buffer error: {e}")
             return 0
 
@@ -998,7 +1007,7 @@ class XDPSender:
             else:
                 sent = send_udp_fn(target_ip, target_port, payloads)
             return sent
-        except Exception as e:
+        except _RECOVERABLE_ERRORS as e:
             utils.log_error(f"[XDP] Send UDP error: {e}")
             return 0
     
@@ -1017,7 +1026,7 @@ class XDPSender:
                 stats_dict = self._xdp.xdp_stats()
             if stats_dict:
                 return XDPStats.from_dict(stats_dict)
-        except Exception as exc:
+        except _RECOVERABLE_ERRORS as exc:
             _debug_exception("xdp stats read failed", exc)
         
         return XDPStats()
@@ -1204,12 +1213,12 @@ class XDPBulkSender:
                 sender.start()
                 self._senders.append(sender)
                 self._sender_queues.append(queue.Queue(maxsize=16))
-        except Exception as exc:
+        except _RECOVERABLE_ERRORS as exc:
             _debug_exception("XDPBulkSender start failed while initializing workers", exc)
             for sender in self._senders:
                 try:
                     sender.stop()
-                except Exception as stop_exc:
+                except _RECOVERABLE_ERRORS as stop_exc:
                     _debug_exception("XDPBulkSender rollback stop failed", stop_exc)
             self._senders = []
             self._sender_queues = []
@@ -1391,7 +1400,7 @@ class XDPIntegration:
                         if part == 'dev' and i + 1 < len(parts):
                             interface = parts[i + 1]
                             break
-            except Exception as exc:
+            except _RECOVERABLE_ERRORS as exc:
                 _debug_exception("route-based interface detection failed", exc)
                 interface = get_default_interface()
         else:
@@ -1404,7 +1413,7 @@ class XDPIntegration:
         try:
             sender = XDPSender(interface=interface, auto_fallback=False)
             return sender
-        except Exception as e:
+        except _RECOVERABLE_ERRORS as e:
             utils.log_error(f"[XDP] Failed to create sender: {e}")
             return None
     
@@ -1473,7 +1482,7 @@ def _test_xdp():
         print("✅ XDP test successful!")
         return True
         
-    except Exception as e:
+    except _RECOVERABLE_ERRORS as e:
         print(f"❌ XDP test failed: {e}")
         return False
 
