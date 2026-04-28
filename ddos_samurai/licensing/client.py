@@ -21,13 +21,13 @@ from .. import __version__
 from .cache import clear_cache, load_cache, save_cache
 from .constants import (
     DEACTIVATE_ENDPOINT,
-    DEV_MODE,
     HEARTBEAT_ENDPOINT,
     LICENSE_KEY_FILE,
     LICENSE_KEY_PATTERN,
     LICENSE_SERVER_URL,
     REQUEST_TIMEOUT_S,
     VALIDATE_ENDPOINT,
+    is_dev_mode,
 )
 from .features import (
     LicenseResult,
@@ -172,7 +172,7 @@ def validate_license(
     """
 
     # ── Dev mode ────────────────────────────────────────────────────────
-    if DEV_MODE:
+    if is_dev_mode():
         return _dev_mode_result()
 
     # ── Key resolution ──────────────────────────────────────────────────
@@ -304,7 +304,7 @@ def send_heartbeat(
     Returns:
         True — aktif, False — lisans iptal/askıya alınmış.
     """
-    if DEV_MODE:
+    if is_dev_mode():
         return True
 
     hwid = get_hardware_id()

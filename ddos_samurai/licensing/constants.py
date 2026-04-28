@@ -38,6 +38,11 @@ LICENSE_KEY_PATTERN: str = r"^SAM-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4
 # ── Dev Mode ────────────────────────────────────────────────────────────────
 # Geliştirme sırasında lisans doğrulamasını atlamak için:
 #   SAMURAI_LICENSE_DEV_MODE=1
-DEV_MODE: bool = os.getenv("SAMURAI_LICENSE_DEV_MODE", "0").strip().lower() in {
-    "1", "true", "yes", "on",
-}
+def is_dev_mode() -> bool:
+    """Resolve license dev mode at call-time (not import-time)."""
+    return os.getenv("SAMURAI_LICENSE_DEV_MODE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
