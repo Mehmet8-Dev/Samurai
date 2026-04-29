@@ -63,6 +63,28 @@ def sync_runtime_env(args) -> dict[str, object]:
     os.environ["SAMURAI_GPU_HEARTBEAT_MS"] = str(int(getattr(args, "gpu_heartbeat_ms", 500) or 500))
     os.environ["SAMURAI_GPU_NO_PROGRESS_MS"] = str(int(getattr(args, "gpu_no_progress_ms", 2000) or 2000))
     os.environ["SAMURAI_GPU_RNG_SEED"] = str(int(getattr(args, "gpu_rng_seed", 1234) or 0))
+    gpu_defense_mode = str(getattr(args, "gpu_defense_mode", "off") or "off").strip().lower()
+    if gpu_defense_mode not in {"on", "off"}:
+        gpu_defense_mode = "off"
+    os.environ["SAMURAI_GPU_DEFENSE_MODE"] = gpu_defense_mode
+    os.environ["SAMURAI_GPU_CLASSIFIER_RUNTIME"] = str(getattr(args, "gpu_classifier_runtime", "tensorrt") or "tensorrt")
+    os.environ["SAMURAI_GPU_CLASSIFIER_ENGINE_PATH"] = str(getattr(args, "gpu_classifier_engine_path", "") or "")
+    gpu_rdma_mode = str(getattr(args, "gpu_rdma_mode", "auto") or "auto").strip().lower()
+    if gpu_rdma_mode not in {"auto", "direct", "host_staging"}:
+        gpu_rdma_mode = "auto"
+    os.environ["SAMURAI_GPU_RDMA_MODE"] = gpu_rdma_mode
+    os.environ["SAMURAI_GPU_RDMA_STRICT"] = "1" if bool(getattr(args, "gpu_rdma_strict", False)) else "0"
+    os.environ["SAMURAI_GPU_BATCH_MAX"] = str(int(getattr(args, "gpu_batch_max", 1024) or 1024))
+    os.environ["SAMURAI_GPU_BATCH_FLUSH_TIMEOUT_MS"] = str(int(getattr(args, "gpu_batch_flush_timeout_ms", 2) or 2))
+    gpu_rx_pipeline = str(getattr(args, "gpu_rx_pipeline", "off") or "off").strip().lower()
+    if gpu_rx_pipeline not in {"on", "off"}:
+        gpu_rx_pipeline = "off"
+    os.environ["SAMURAI_GPU_RX_PIPELINE"] = gpu_rx_pipeline
+    os.environ["SAMURAI_GPU_RX_IFACE"] = str(getattr(args, "gpu_rx_iface", "") or "")
+    os.environ["SAMURAI_GPU_RX_DURATION_S"] = str(int(getattr(args, "gpu_rx_duration_s", 10) or 10))
+    os.environ["SAMURAI_GPU_RX_BATCH_SIZE"] = str(int(getattr(args, "gpu_rx_batch_size", 256) or 256))
+    os.environ["SAMURAI_GPU_RX_MAX_PACKETS"] = str(int(getattr(args, "gpu_rx_max_packets", 100000) or 100000))
+    os.environ["SAMURAI_GPU_RX_SNAPLEN"] = str(int(getattr(args, "gpu_rx_snaplen", 2048) or 2048))
     os.environ["SAMURAI_STATE_TABLE_SIZE"] = str(int(getattr(args, "state_table_size", 65536) or 65536))
     os.environ["SAMURAI_STATE_LOCK_COUNT"] = str(int(getattr(args, "state_lock_count", 256) or 256))
     os.environ["SAMURAI_STATE_TIMEOUT_SEC"] = str(int(getattr(args, "state_timeout_sec", 60) or 60))

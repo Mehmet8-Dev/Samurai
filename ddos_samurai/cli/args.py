@@ -676,6 +676,84 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_int("SAMURAI_GPU_RNG_SEED", 1234),
         help="GPU payload RNG seed (varsayılan: deterministik 1234, env: SAMURAI_GPU_RNG_SEED).",
     )
+    parser.add_argument(
+        "--gpu-defense-mode",
+        choices=["on", "off"],
+        default=str(os.environ.get("SAMURAI_GPU_DEFENSE_MODE", "off") or "off").strip().lower(),
+        help="GPU defense/classifier hattı: on|off (varsayılan: off).",
+    )
+    parser.add_argument(
+        "--gpu-classifier-runtime",
+        choices=["tensorrt"],
+        default=str(os.environ.get("SAMURAI_GPU_CLASSIFIER_RUNTIME", "tensorrt") or "tensorrt").strip().lower(),
+        help="GPU classifier runtime: tensorrt.",
+    )
+    parser.add_argument(
+        "--gpu-classifier-engine-path",
+        type=str,
+        default=str(os.environ.get("SAMURAI_GPU_CLASSIFIER_ENGINE_PATH", "") or ""),
+        help="Offline-build edilmiş TensorRT .engine dosya yolu.",
+    )
+    parser.add_argument(
+        "--gpu-rdma-mode",
+        choices=["auto", "direct", "host_staging"],
+        default=str(os.environ.get("SAMURAI_GPU_RDMA_MODE", "auto") or "auto").strip().lower(),
+        help="GPU RDMA modu: auto|direct|host_staging.",
+    )
+    parser.add_argument(
+        "--gpu-rdma-strict",
+        action=argparse.BooleanOptionalAction,
+        default=str(os.environ.get("SAMURAI_GPU_RDMA_STRICT", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
+        help="RDMA strict mod: fallback yerine fail-visible hard fail.",
+    )
+    parser.add_argument(
+        "--gpu-batch-max",
+        type=int,
+        default=_env_int("SAMURAI_GPU_BATCH_MAX", 1024),
+        help="Defense dinamik batching max batch boyutu.",
+    )
+    parser.add_argument(
+        "--gpu-batch-flush-timeout-ms",
+        type=int,
+        default=_env_int("SAMURAI_GPU_BATCH_FLUSH_TIMEOUT_MS", 2),
+        help="Defense batch flush timeout (ms).",
+    )
+    parser.add_argument(
+        "--gpu-rx-pipeline",
+        choices=["on", "off"],
+        default=str(os.environ.get("SAMURAI_GPU_RX_PIPELINE", "off") or "off").strip().lower(),
+        help="NIC RX -> GPU classifier pipeline modu: on|off.",
+    )
+    parser.add_argument(
+        "--gpu-rx-iface",
+        type=str,
+        default=str(os.environ.get("SAMURAI_GPU_RX_IFACE", "") or ""),
+        help="GPU RX pipeline için capture interface (boşsa default route iface).",
+    )
+    parser.add_argument(
+        "--gpu-rx-duration-s",
+        type=int,
+        default=_env_int("SAMURAI_GPU_RX_DURATION_S", 10),
+        help="GPU RX pipeline çalışma süresi (s).",
+    )
+    parser.add_argument(
+        "--gpu-rx-batch-size",
+        type=int,
+        default=_env_int("SAMURAI_GPU_RX_BATCH_SIZE", 256),
+        help="GPU RX pipeline classify batch boyutu.",
+    )
+    parser.add_argument(
+        "--gpu-rx-max-packets",
+        type=int,
+        default=_env_int("SAMURAI_GPU_RX_MAX_PACKETS", 100000),
+        help="GPU RX pipeline en fazla işlenecek paket adedi.",
+    )
+    parser.add_argument(
+        "--gpu-rx-snaplen",
+        type=int,
+        default=_env_int("SAMURAI_GPU_RX_SNAPLEN", 2048),
+        help="GPU RX pipeline packet capture snaplen (byte).",
+    )
     _gpu_vector_engine_default = str(os.environ.get("SAMURAI_GPU_VECTOR_ENGINE", "gpu_cuda") or "gpu_cuda").strip().lower()
     if _gpu_vector_engine_default != "gpu_cuda":
         _gpu_vector_engine_default = "gpu_cuda"

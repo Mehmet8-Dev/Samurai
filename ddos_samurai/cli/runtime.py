@@ -79,6 +79,8 @@ def _prepare_ninja_mode(args) -> None:
 
 
 def _validate_live_args(args, parser) -> None:
+    if str(getattr(args, "gpu_rx_pipeline", "off") or "off").strip().lower() == "on":
+        return
     if args.target is None or args.port is None:
         parser.error("Hata: 'target' ve 'port' argümanları ya komut satırında ya da konfigürasyon dosyasında belirtilmelidir.")
     if args.attack_vector == "anomaly" and args.compute_backend != "cuda":
@@ -91,6 +93,23 @@ def _validate_live_args(args, parser) -> None:
 
 def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: dict) -> int:
     _validate_live_args(args, parser)
+    if str(getattr(args, "gpu_rx_pipeline", "off") or "off").strip().lower() == "on":
+        from ..af_xdp_sender import run_gpu_rx_pipeline
+
+        out = run_gpu_rx_pipeline(
+            interface=str(getattr(args, "gpu_rx_iface", "") or ""),
+            duration_s=int(getattr(args, "gpu_rx_duration_s", 10) or 10),
+            batch_size=int(getattr(args, "gpu_rx_batch_size", 256) or 256),
+            max_packets=int(getattr(args, "gpu_rx_max_packets", 100000) or 100000),
+            snaplen=int(getattr(args, "gpu_rx_snaplen", 2048) or 2048),
+            classifier_runtime=str(getattr(args, "gpu_classifier_runtime", "tensorrt") or "tensorrt"),
+            classifier_engine_path=str(getattr(args, "gpu_classifier_engine_path", "") or ""),
+            rdma_mode=str(getattr(args, "gpu_rdma_mode", "auto") or "auto"),
+            rdma_strict=bool(getattr(args, "gpu_rdma_strict", False)),
+            flush_timeout_ms=int(getattr(args, "gpu_batch_flush_timeout_ms", 2) or 2),
+        )
+        utils.log_info(f"[GPU-RX] iface={out.get('gpu_rx_iface','')} packets={int(out.get('gpu_rx_packets_total',0))} suspicious={int(out.get('gpu_rx_suspicious_total',0))} pps={float(out.get('gpu_rx_pps',0.0)):.1f}")
+        return 0
 
     # ── License Feature Gates ───────────────────────────────────────────
     license_result = getattr(args, "_license_result", None)
