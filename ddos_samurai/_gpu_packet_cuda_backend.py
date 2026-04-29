@@ -50,6 +50,7 @@ class GPUMemoryError(GPUPacketError):
 
 
 _LIB_PATH = Path(__file__).with_name("libgpu_packet_cuda.so")
+_DEFENSE_LIB_PATH = Path(__file__).with_name("libgpu_packet_cuda_defense.so")
 _NATIVE_ENV = "SAMURAI_GPU_PACKET_CUDA_CPP_NATIVE"
 
 
@@ -527,6 +528,46 @@ def _load_lib() -> ctypes.CDLL | None:
 
 
 _LIB = _load_lib()
+
+
+def _load_defense_lib() -> ctypes.CDLL | None:
+    if not _DEFENSE_LIB_PATH.exists():
+        return None
+    try:
+        mode = getattr(ctypes, "RTLD_GLOBAL", 0)
+        lib = ctypes.CDLL(str(_DEFENSE_LIB_PATH), mode=mode)
+    except _RECOVERABLE_ERRORS as exc:
+        _debug_exception(f"failed to load defense CUDA bridge at {_DEFENSE_LIB_PATH}", exc)
+        return None
+
+    lib.samurai_gpu_packet_defense_init.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_int64,
+        ctypes.c_int64,
+    ]
+    lib.samurai_gpu_packet_defense_init.restype = ctypes.c_int
+    lib.samurai_gpu_packet_classify_batch.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_char_p),
+    ]
+    lib.samurai_gpu_packet_classify_batch.restype = ctypes.c_int
+    lib.samurai_gpu_packet_read_classifier_stats.argtypes = []
+    lib.samurai_gpu_packet_read_classifier_stats.restype = ctypes.c_char_p
+    lib.samurai_gpu_packet_defense_shutdown.argtypes = []
+    lib.samurai_gpu_packet_defense_shutdown.restype = ctypes.c_int
+    lib.samurai_gpu_packet_defense_last_error.argtypes = []
+    lib.samurai_gpu_packet_defense_last_error.restype = ctypes.c_char_p
+    return lib
+
+
+_DEFENSE_LIB = _load_defense_lib()
 
 
 def _last_error() -> str:
@@ -1660,3 +1701,86 @@ def get_gpu_info() -> dict:
 def is_gpu_available() -> bool:
     available, _message = check_gpu_available()
     return bool(available)
+
+
+class DefenseCUDABackend:
+    """Isolated defense/classifier backend bridge."""
+
+    def __init__(self) -> None:
+        self._lib = _DEFENSE_LIB
+        if self._lib is None:
+            raise GPUPacketError("libgpu_packet_cuda_defense.so not found")
+
+    def _last_error(self) -> str:
+        try:
+            raw = self._lib.samurai_gpu_packet_defense_last_error()
+        except _RECOVERABLE_ERRORS:
+            return ""
+        if not raw:
+            return ""
+        return raw.decode("utf-8", errors="replace").strip()
+
+    def init(
+        self,
+        *,
+        runtime: str = "tensorrt",
+        engine_path: str = "",
+        rdma_mode: str = "auto",
+        rdma_strict: bool = False,
+        max_batch_size: int = 1024,
+        flush_timeout_ms: int = 2,
+    ) -> None:
+        rc = int(
+            self._lib.samurai_gpu_packet_defense_init(
+                ctypes.c_char_p(_as_bytes(runtime, "tensorrt")),
+                ctypes.c_char_p(_as_bytes(engine_path, "")),
+                ctypes.c_char_p(_as_bytes(rdma_mode, "auto")),
+                ctypes.c_int(1 if rdma_strict else 0),
+                ctypes.c_int64(int(max_batch_size)),
+                ctypes.c_int64(int(flush_timeout_ms)),
+            )
+            or 0
+        )
+        if rc != 0:
+            raise GPUPacketError(self._last_error() or "samurai_gpu_packet_defense_init failed")
+
+    def classify_batch(self, packets: list[bytes] | tuple[bytes, ...]) -> tuple[np.ndarray, np.ndarray, str]:
+        if not packets:
+            return np.empty((0,), dtype=np.int32), np.empty((0,), dtype=np.float32), "none"
+        lens = np.asarray([len(p) for p in packets], dtype=np.int32)
+        flat = np.frombuffer(b"".join(packets), dtype=np.uint8)
+        labels = np.empty((len(packets),), dtype=np.int32)
+        confidences = np.empty((len(packets),), dtype=np.float32)
+        out_reason = ctypes.c_char_p()
+        rc = int(
+            self._lib.samurai_gpu_packet_classify_batch(
+                flat.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                lens.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                ctypes.c_int64(int(len(packets))),
+                labels.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                confidences.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                ctypes.byref(out_reason),
+            )
+            or 0
+        )
+        reason = ""
+        if out_reason.value:
+            reason = out_reason.value.decode("utf-8", errors="replace")
+        if rc != 0:
+            raise GPUPacketError(reason or self._last_error() or "samurai_gpu_packet_classify_batch failed")
+        return labels, confidences, (reason or "none")
+
+    def read_classifier_stats(self) -> dict[str, Any]:
+        raw = self._lib.samurai_gpu_packet_read_classifier_stats()
+        if not raw:
+            return {}
+        try:
+            text = raw.decode("utf-8", errors="replace")
+            return dict(json.loads(text))
+        except _RECOVERABLE_ERRORS:
+            return {}
+
+    def shutdown(self) -> None:
+        rc = int(self._lib.samurai_gpu_packet_defense_shutdown() or 0)
+        if rc != 0:
+            raise GPUPacketError(self._last_error() or "samurai_gpu_packet_defense_shutdown failed")

@@ -499,4 +499,23 @@ int samurai_gpu_packet_shutdown_runtime();
 void samurai_gpu_packet_free(void* ptr);
 const char* samurai_gpu_packet_last_error();
 
+// Isolated defense/classifier C ABI.
+int samurai_gpu_packet_defense_init(
+    const char* runtime,
+    const char* engine_path,
+    const char* rdma_mode,
+    int rdma_strict,
+    int64_t max_batch_size,
+    int64_t flush_timeout_ms);
+int samurai_gpu_packet_classify_batch(
+    const uint8_t* packets_flat,
+    const int32_t* packet_lengths,
+    int64_t packet_count,
+    int32_t* out_labels,
+    float* out_confidences,
+    const char** out_reason);
+const char* samurai_gpu_packet_read_classifier_stats();
+int samurai_gpu_packet_defense_shutdown();
+const char* samurai_gpu_packet_defense_last_error();
+
 }
