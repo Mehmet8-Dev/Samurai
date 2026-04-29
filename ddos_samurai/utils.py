@@ -2,189 +2,120 @@ import time
 from datetime import datetime
 import ipaddress
 import logging
+import shutil
 import sys
-import random
-from rich.console import Console
-from rich.theme import Theme
-from rich.panel import Panel
-from rich.align import Align
-from rich.text import Text
-from rich.table import Table
+from textwrap import dedent
 
-# Professional theme: Gri, Kırmızı, Beyaz
-samurai_theme = Theme({
-    "info": "white",
-    "warning": "red",
-    "error": "bold red",
-    "critical": "bold red",
-    "timestamp": "bright_black",
-    "tag": "bold red",
-    "success": "white",
-    "system": "white",
-    "title": "bold red",
-    "subtitle": "bright_black",
-    "accent": "red"
-})
+RESET = "\033[0m"
+DIM = "\033[90m"
+WHITE = "\033[37m"
+ACCENT = "\033[97m"
+MUTED = "\033[90m"
 
-console = Console(theme=samurai_theme)
+
+def _color(text: str, style: str) -> str:
+    return f"{style}{text}{RESET}"
+
+
+def _term_width() -> int:
+    return shutil.get_terminal_size((80, 20)).columns
+
+
+def _center(text: str) -> str:
+    return "\n".join(line.center(_term_width()) for line in str(text).splitlines())
+
+
+def _clear_screen():
+    print("\033[2J\033[H", end="")
 
 def get_timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def _write_python_log(level: int, message: str):
+    # Avoid Python's fallback "CRITICAL:root:..." stderr echo before the CLI
+    # configures logging; once configured, keep writing to the selected log sink.
+    root_logger = logging.getLogger()
+    if root_logger.hasHandlers():
+        root_logger.log(level, message)
+
 def log_info(msg, protocol=None):
     timestamp = get_timestamp()
     proto_str = f" [{protocol.upper()}]" if protocol else ""
-    console.print(f"[bright_black][{timestamp}][/bright_black] [bold red]●[/bold red] [white]{msg}{proto_str}[/white]")
-    logging.info(f"[{timestamp}] [INFO]{' (' + protocol.upper() + ')' if protocol else ''} {msg}")
+    print(f"{_color(f'[{timestamp}]', DIM)} {_color('●', ACCENT)} {_color(f'{msg}{proto_str}', WHITE)}")
+    _write_python_log(logging.INFO, f"[{timestamp}] [INFO]{' (' + protocol.upper() + ')' if protocol else ''} {msg}")
 
 def log_warning(msg):
     timestamp = get_timestamp()
-    console.print(f"[bright_black][{timestamp}][/bright_black] [bold red]⚠[/bold red]  [red]{msg}[/red]")
-    logging.warning(f"[{timestamp}] [WARNING] {msg}")
+    print(f"{_color(f'[{timestamp}]', DIM)} {_color('⚠', ACCENT)}  {_color(str(msg), WHITE)}")
+    _write_python_log(logging.WARNING, f"[{timestamp}] [WARNING] {msg}")
 
 def log_error(msg):
     timestamp = get_timestamp()
-    console.print(f"[bright_black][{timestamp}][/bright_black] [bold red]✗[/bold red]  [bold red]{msg}[/bold red]")
-    logging.error(f"[{timestamp}] [ERROR] {msg}")
+    print(f"{_color(f'[{timestamp}]', DIM)} {_color('✗', ACCENT)}  {_color(str(msg), ACCENT)}")
+    _write_python_log(logging.ERROR, f"[{timestamp}] [ERROR] {msg}")
 
 def log_critical(msg):
     timestamp = get_timestamp()
-    console.print(f"[bright_black][{timestamp}][/bright_black] [bold red]▲[/bold red]  [bold red]{msg}[/bold red]")
-    logging.critical(f"[{timestamp}] [CRITICAL] {msg}")
+    print(f"{_color(f'[{timestamp}]', DIM)} {_color('▲', ACCENT)}  {_color(str(msg), ACCENT)}")
+    _write_python_log(logging.CRITICAL, f"[{timestamp}] [CRITICAL] {msg}")
 
 def print_banner():
     """
     Samurai banner'ini terminal'de gosterir.
-    Profesyonel, minimalist tasarım.
+    Siyah/kirmizi odakli terminal tasarimi.
     """
-    console.clear()
-    
-    banners = [
-        # Banner 1: Samurai Mask
-        r"""
-          .                                                      .
-        .n                   .                 .                  n.
-      . .dP                  dP                   9b                 9b. .
-     4    qXb         .       dx                     xb       .        dXp    t
-    dX.    9Xb      .dXb    __                     __    dXb.     dXp     .Xb
-    9XXb._       _.dXXXXb dXXXXbo.               .odXXXXb dXXXXb._       _.dXXP
-     9XXXXXXXXXXXXXXXXXXXVXXXXXXXXOo.           .oOXXXXXXXXVXXXXXXXXXXXXXXXXXXXP
-      `9XXXXXXXXXXXXXXXXXXXXX'~   ~`OOO8b   d8OOO'~   ~`XXXXXXXXXXXXXXXXXXXXXP'
-        `9XXXXXXXXXXXP' `9XX'   DIE    `98v8P'  HONOR   `XXP' `9XXXXXXXXXXXP' 
-            ~~~~~~~       9X.          .db|db.          .XP       ~~~~~~~
-                            )b.  .dbo.dP'`v'`9b.odb.  .dX(
-                          ,dXXXXXXXXXXXb     dXXXXXXXXXXXb.
-                         dXXXXXXXXXXXP'   .   `9XXXXXXXXXXXb
-                        dXXXXXXXXXXXXb   d|b   dXXXXXXXXXXXXb
-                        9XXb'   `XXXXXb.dX|Xb.dXXXXX'   `dXXP
-                         `'      9XXXXXX(   )XXXXXXP      `'
-                                  XXXX X.`v'.X XXXX
-                                  XP^X'`b   d'`X^XX
-                                  `b  `       '  d'
-                                   `             '
+    _clear_screen()
 
-                    ███████╗███████╗█████╗ ███╗██    ██╗██╗██╗█ ████╗██╗██╗ 
-                    ██╔════╝██╔══██╗████╗ ████║██║   ██║██╔══██╗██╔══██╗██║
-                    ███████╗███████║██╔████╔██║██║   ██║██████╔╝███████║██║
-                    ╚════██║██╔══██║██║╚██╔╝██║██║   ██║██╔══██╗██╔══██║██║
-                    ███████║██║  ██║██║ ╚═╝ ██║╚██████╔╝██║  ██║██║  ██║██║
-                    ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝
-        """, 
-        # Banner 2: Börü
-        r"""
-          .                                                      .
-        .n                   .                 .                  n.
-      .  dP                  dP                   9b                 9b  .
-     4    qXb         .      dXb                 dXb      .        dXp    t
-    dX.    9Xb      .dXb   .dXXXb.             .dXXXb.   dXb.     dXp    .Xb
-    9XXb._       _.dXXXXXXXXXXXXXXXbo.       .odXXXXXXXXXXXXXXXb._       _.dXXP
-     9XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXo.   .oXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXP
-      `9XXXXXXXXXXXXXXP'  `9XXXXXXXXXXXXb dXXXXXXXXXXXP'  `9XXXXXXXXXXXXXXP'
-        `9XXXXXXXXXP'  BÖRÜ  `9XXXXXXXb.   .dXXXXXXXP'  ASENA  `9XXXXXXXXXP'
-            ~~~~~~~           9X.   `9bo. .od9'   .XP           ~~~~~~~
-                               )b.    `9bd9'    .d(
-                             ,dXXXb.   dXXb   .dXXXb.
-                            dXXXXXXXb.dXXXXb.dXXXXXXXb
-                           dXXXP' `9XXXXXXXXXXXXXXXXXXXb
-                          dXXXP     9XXb'   `dXXP `9XXXb
-                          9XXP       `9Xb   dXP'   `XXP
-                           `'          9XbdXP       `''
-                                        9XX9
-                                         `'
-        """
-    ]
-    
-    selected_banner = random.choice(banners)
-    console.print(Text(selected_banner, style="bold red"))
-    
-    # Divider with gri tone
-    divider = Text("─" * 80, style="bright_black")
-    console.print(Align.center(divider))
-    
-    quotes = [
-        "Tengri täŋri bolmış, täg täg etilse bolur",  
-        "Kut sökün, kut yaratır - kumandanıŋ kut'u cahan kut'udur",
-        "Süyü tut, su tutmaguči tut ettim seni", 
-        "Bilge tanar, buqa aç - bilgelik bozkırda açlık çekmez", 
-        "Atïm atï, atlï atï aç - atlının ünü havada yükselmek için", 
-        "Turuk könül, birle körümlätti - sabit kalp, birlikte görmüş",  
-        "Erig tutdı, erig ètdi koyun - güçü tuttu, gücü kullandı",
-        "Takï kagan, takï taŋrï - taç şahı, taç tanrı gibi",  
-        "Börï böri bilür - kurdu Kurt bilir",
-        "Yer su taŋrï kut verdi, ata taŋrï kut sïzïladï", 
-    ]
-    
-    quote = random.choice(quotes)
-    quote_text = Text(f"▐  {quote}  ▌", style="white")
-    console.print(Align.center(quote_text))
-    
-    # Divider with gri tone
-    divider_end = Text("─" * 80, style="bright_black")
-    console.print(Align.center(divider_end))
-    console.print()
+    banner = dedent(r"""
+        ███████╗ █████╗ ███╗   ███╗██╗   ██╗██████╗  █████╗ ██╗
+        ██╔════╝██╔══██╗████╗ ████║██║   ██║██╔══██╗██╔══██╗██║
+        ███████╗███████║██╔████╔██║██║   ██║██████╔╝███████║██║
+        ╚════██║██╔══██║██║╚██╔╝██║██║   ██║██╔══██╗██╔══██║██║
+        ███████║██║  ██║██║ ╚═╝ ██║╚██████╔╝██║  ██║██║  ██║██║
+        ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝
+    """).strip("\n")
+
+    print(_color(_center("Samurai"), ACCENT))
+    print(_color(_center(banner), ACCENT))
+    print()
 
 def print_system_status(args):
     """
     Sistem durumunu ve saldırı parametrelerini gösterir.
-    Gri, kırmızı, beyaz tema kullanılır.
+    Siyah zemin ve kirmizi vurgu temasi kullanilir.
     """
-    table = Table(
-        show_header=True,
-        header_style="bold red",
-        border_style="bright_black",
-        width=85
-    )
-    
-    table.add_column("Bileşen", style="white", justify="right", width=30)
-    table.add_column("Durum / Değer", style="bold white", justify="left", width=50)
-    
-    gpu_status = "[bold red]AKTİF (CUDA)[/bold red]" if 'cupy' in sys.modules else "[white]HAZIR (CPU)[/white]"
-    
-    table.add_row("[GPU]  ", gpu_status)
-    table.add_row("[WORKERS]  ", f"[bold red]{args.workers}[/bold red]")
-    table.add_row("[PROTOCOL]", f"[bold white]{args.protocol.upper()}[/bold white]")
-    table.add_row("[TARGET]  ", f"[bold red]{args.target}:{args.port}[/bold red]")
-    table.add_row("[VECTOR]  ", f"[bold white]{args.attack_vector.upper()}[/bold white]")
+    gpu_status = "AKTİF (CUDA)" if 'cupy' in sys.modules else "HAZIR (CPU)"
+    stealth_status = "AÇIK" if bool(getattr(args, "stealth_mode", False)) else "KAPALI"
+    rows = [
+        ("GPU", gpu_status),
+        ("WORKERS", str(args.workers)),
+        ("PROTOCOL", str(args.protocol).upper()),
+        ("TARGET", f"{args.target}:{args.port}"),
+        ("VECTOR", str(args.attack_vector).upper()),
+        ("STEALTH", stealth_status),
+    ]
 
-    stealth_status = "[bold red]AÇIK[/bold red]" if bool(getattr(args, "stealth_mode", False)) else "[bright_black]KAPALI[/bright_black]"
-    table.add_row("[STEALTH] ", stealth_status)
-    
-    footer = Text(
-        f"┆ {get_timestamp()} ┆ workers={args.workers} ┆", 
-        style="bright_black"
-    )
-    
-    status_panel = Panel(
-        Align.center(table),
-        title="[bold red]───── SİSTEM BİLGİLERİ ─────[/bold red]",
-        subtitle=footer,
-        border_style="bright_black",
-        padding=(1, 1),
-        expand=False
-    )
+    key_w = 18
+    val_w = min(46, max(len(v) for _, v in rows) + 2)
+    width = key_w + val_w + 7
+    lines = [
+        _color("─" * width, DIM),
+        _color("SİSTEM BİLGİLERİ".center(width), ACCENT),
+        _color("─" * width, DIM),
+    ]
+    for key, value in rows:
+        lines.append(
+            f"{_color(key.rjust(key_w), DIM)}  "
+            f"{_color('│', DIM)}  "
+            f"{_color(value.ljust(val_w), ACCENT if key in {'WORKERS', 'TARGET', 'STEALTH'} else WHITE)}"
+        )
+    lines.extend([
+        _color("─" * width, DIM),
+        _color(f"{get_timestamp()}  workers={args.workers}".center(width), DIM),
+    ])
 
-    console.print(Align.center(status_panel))
-    console.print()
+    print(_center("\n".join(lines)))
+    print()
 
 
 def attack_live_monitor(
@@ -523,21 +454,20 @@ def ethical_warning():
     """
     Etik kullanım uyarısı.
     """
-    warning_box = Panel(
-        "[bold red]Bu araç, yalnızca izin verilen sistemlerde kullanılmalıdır![/bold red]\n"
-        "[white]Yasal sorumluluk tamamen kullanıcıya aittir.[/white]",
-        title="[bold red]⚠️  YASAL UYARI ⚠️[/bold red]",
-        border_style="red",
-        padding=(1, 2),
-        expand=False
-    )
-    console.print(Align.center(warning_box))
-    console.print()
-    
-    choice = console.input("[bold red]❯[/bold red] [white]Kabul ediyor musunuz? Devam için 'YES' yazın: [/white]")
-    
+    warning = "\n".join([
+        _color("YASAL UYARI", ACCENT),
+        _color("Bu araç, yalnızca izin verilen sistemlerde kullanılmalıdır!", ACCENT),
+        _color("Yasal sorumluluk tamamen kullanıcıya aittir.", WHITE),
+    ])
+    print(_center(warning))
+    print()
+
+    prompt_text = "Kabul ediyor musunuz? Devam için 'YES' yazın: "
+    prompt = f"{_color('❯', ACCENT)} {_color(prompt_text, WHITE)}"
+    choice = input(prompt)
+
     if choice.strip().upper() != "YES":
-        console.print("[bold red]✗ Saldırı iptal edildi![/bold red]")
+        print(_color("✕ Saldırı iptal edildi!", ACCENT))
         sys.exit(0)
 
 
