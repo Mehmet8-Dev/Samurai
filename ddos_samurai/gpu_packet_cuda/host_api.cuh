@@ -3186,20 +3186,34 @@ __global__ void persistent_dataplane_kernel(
       rr = __shfl_sync(kFullWarpMask, rr, 0);
     }
 
-    if (local_queue_pressure > 0u) {
-      atomicAdd(&s_queue_pressure, static_cast<unsigned long long>(local_queue_pressure));
+    uint64_t warp_queue_pressure = local_queue_pressure;
+    uint64_t warp_ring_drop_events = local_ring_drop_events;
+    uint64_t warp_queue_spread_events = local_queue_spread_events;
+    uint64_t warp_quota_stall = local_quota_stall;
+    uint64_t warp_idle_gap = local_idle_gap;
+    for (uint32_t offset = (kWarpWidth >> 1u); offset > 0u; offset >>= 1u) {
+      warp_queue_pressure += __shfl_down_sync(kFullWarpMask, warp_queue_pressure, static_cast<int>(offset));
+      warp_ring_drop_events += __shfl_down_sync(kFullWarpMask, warp_ring_drop_events, static_cast<int>(offset));
+      warp_queue_spread_events += __shfl_down_sync(kFullWarpMask, warp_queue_spread_events, static_cast<int>(offset));
+      warp_quota_stall += __shfl_down_sync(kFullWarpMask, warp_quota_stall, static_cast<int>(offset));
+      warp_idle_gap += __shfl_down_sync(kFullWarpMask, warp_idle_gap, static_cast<int>(offset));
     }
-    if (local_ring_drop_events > 0u) {
-      atomicAdd(&s_ring_drop_events, static_cast<unsigned long long>(local_ring_drop_events));
-    }
-    if (local_queue_spread_events > 0u) {
-      atomicAdd(&s_queue_spread_events, static_cast<unsigned long long>(local_queue_spread_events));
-    }
-    if (local_quota_stall > 0u) {
-      atomicAdd(&s_quota_stall, static_cast<unsigned long long>(local_quota_stall));
-    }
-    if (local_idle_gap > 0u) {
-      atomicAdd(&s_idle_gap, static_cast<unsigned long long>(local_idle_gap));
+    if (lane == 0u) {
+      if (warp_queue_pressure > 0u) {
+        atomicAdd(&s_queue_pressure, static_cast<unsigned long long>(warp_queue_pressure));
+      }
+      if (warp_ring_drop_events > 0u) {
+        atomicAdd(&s_ring_drop_events, static_cast<unsigned long long>(warp_ring_drop_events));
+      }
+      if (warp_queue_spread_events > 0u) {
+        atomicAdd(&s_queue_spread_events, static_cast<unsigned long long>(warp_queue_spread_events));
+      }
+      if (warp_quota_stall > 0u) {
+        atomicAdd(&s_quota_stall, static_cast<unsigned long long>(warp_quota_stall));
+      }
+      if (warp_idle_gap > 0u) {
+        atomicAdd(&s_idle_gap, static_cast<unsigned long long>(warp_idle_gap));
+      }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
