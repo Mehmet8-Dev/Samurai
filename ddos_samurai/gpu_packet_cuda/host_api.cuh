@@ -2984,16 +2984,17 @@ __global__ void persistent_dataplane_kernel(
       __syncwarp(kFullWarpMask);
       const int idx = static_cast<int>((rr + static_cast<uint32_t>(i)) % max_streams_u);
       volatile PersistentDeviceStreamState* sv = &streams[idx];
+      const volatile PersistentStreamHotState* hotv = &streams_hot[idx];
       const unsigned int warp_mask = kFullWarpMask;
       int32_t proto = 0;
       int active = 0;
       uint32_t target_ip = 0u;
       int target_port = 0;
       if (lane == 0u) {
-        proto = i32_load(&sv->protocol);
-        active = i32_load(&sv->active);
-        target_ip = u32_load(&sv->target_ip);
-        target_port = static_cast<int>(sv->target_port);
+        proto = i32_load(&hotv->protocol);
+        active = i32_load(&hotv->active);
+        target_ip = u32_load(&hotv->target_ip);
+        target_port = static_cast<int>(hotv->target_port);
       }
       proto = __shfl_sync(warp_mask, proto, 0);
       active = __shfl_sync(warp_mask, active, 0);
@@ -3017,8 +3018,8 @@ __global__ void persistent_dataplane_kernel(
       int affinity_q = 0;
       int sid = 0;
       if (lane == 0u) {
-        affinity_q = i32_load(&sv->queue_affinity);
-        sid = i32_load(&sv->stream_id);
+        affinity_q = i32_load(&hotv->queue_affinity);
+        sid = i32_load(&hotv->stream_id);
       }
       affinity_q = __shfl_sync(warp_mask, affinity_q, 0);
       sid = __shfl_sync(warp_mask, sid, 0);
