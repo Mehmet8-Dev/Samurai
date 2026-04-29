@@ -1,40 +1,18 @@
-# 00 - Genel Bakış
+# Genel Bakış
 
-## Proje Kimliği
+Samurai, izinli/lab kullanım için ağ stres ve güvenlik doğrulama platformudur.
 
-- Ürün: `Samurai`
-- Kod adı: `Kenjaku`
-- Sürüm: `2.1.1`
-- Doğrulama tarihi: `2026-04-28`
+## Katmanlar
 
-## Sistem Akışı
-
-1. Giriş: `python -m ddos_samurai.cli`
-2. CLI parse + config merge: `ddos_samurai/cli/app.py`
-3. Lisans + preflight + safety gate
-4. Worker spawn: `ddos_samurai/cli/runtime.py`
-5. Worker dispatch: `ddos_samurai/orchestrator.py`
-6. Vektöre göre sender yolu: `ddos_samurai/senders.py` + `_senders/*`
-
-## Ana Katmanlar
-
-- CLI katmanı: `ddos_samurai/cli/*`
-- Orchestration: `ddos_samurai/orchestrator.py`
+- CLI: `ddos_samurai/cli/*`
+- Orkestrasyon: `ddos_samurai/orchestrator.py`
 - Sender facade: `ddos_samurai/senders.py`
-- L4/L3 dataplane: `ddos_samurai/dataplane.py`, `fast_sender.c`, `xdp_sender.c`
-- L7 emulation: `ddos_samurai/l7_emu/*`, `ddos_samurai/l7_emu_native/*`
-- GPU üretim yolları: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_cuda_payload/*`
+- Sender modülleri: `ddos_samurai/_senders/*`
+- AF_XDP native: `ddos_samurai/xdp_sender.c`, `ddos_samurai/af_xdp_sender.py`
+- GPU packet/classifier: `ddos_samurai/gpu_packet.py`, `ddos_samurai/_gpu_packet_cuda_backend.py`
 
-## Güncel Kısıtlar (Kod Gerçeği)
+## Aktif Yol
 
-- `--sender-backend` yalnızca `xdp`
-- `--sender-fallback-policy` yalnızca `fail`
-- `--stateful-runtime-backend` yalnızca `afxdp`
-- `--custom-tcp-backend` yalnızca `af_xdp`
-
-Bu nedenle eski dokümanlarda geçen `auto/txring/python/c_ext_l3` gibi sender seçimleri bu sürümde aktif kullanıcı seçimi değildir.
-
-## Repo Notu
-
-- `dashboard/` dizini yok
-- `ddos_samurai/api.py` yok
+- L2/L3 gönderim için XDP backend zorunlu/policy fail.
+- GPU defense/classifier, send-path içinde opsiyonel (`gpu_defense_mode=on`).
+- Native RX->GPU classify pipeline, `af_xdp_sender.run_gpu_rx_pipeline()` üzerinden çalışır.

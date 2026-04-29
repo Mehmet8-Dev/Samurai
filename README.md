@@ -16,6 +16,7 @@ Samurai, **yalnızca yetkili/lab ortamlarında** kullanılmak üzere geliştiril
 - `cpu` + opsiyonel `cuda` üretim yolu
 - Sender backend: **zorunlu `xdp`**, fallback policy: **zorunlu `fail`**
 - Stateful runtime backend: **zorunlu `afxdp`**
+- Native RX->GPU classify hattı: `AF_XDP RX` + `GPU defense backend`
 
 ## Yasal ve Etik Sınır
 
@@ -73,6 +74,7 @@ python -m ddos_samurai.cli --list-profiles
 - L7 stateful emulation: `ddos_samurai/l7_emu/*`, `ddos_samurai/l7_emu_native/*`
 - Dataplane / AF_PACKET / XDP: `ddos_samurai/dataplane.py`, `fast_sender.c`, `xdp_sender.c`
 - GPU paket/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_cuda_payload/*`
+- AF_XDP Python wrapper + RX pipeline bridge: `ddos_samurai/af_xdp_sender.py`
 
 ## Önemli Notlar
 

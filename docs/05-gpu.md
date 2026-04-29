@@ -1,33 +1,19 @@
-# 05 - GPU Yolları
+# GPU
 
-## Kapsam
+## Bileşenler
 
-Projede GPU kullanımı iki ana hatta ayrılır:
+- Packet üretim backend: `libgpu_packet_cuda.so`
+- Defense/classifier backend: `libgpu_packet_cuda_defense.so`
+- Python bridge: `ddos_samurai/_gpu_packet_cuda_backend.py`
 
-1. `gpu_packet.py`: L3/L4 paket üretim hızlandırması
-2. `gpu_cuda_payload/`: L7 payload/vector planlama hızlandırması
+## Classifier Akışı
 
-## Operasyonel Gerçek
+- Init: runtime/engine/rdma policy ile backend açılır.
+- Classify: batch `classify_batch()` çağrılır.
+- Stats: classifier telemetrisi `read_classifier_stats()` ile okunur.
 
-- GPU, çoğu senaryoda üretim/planner hızlandırıcısıdır
-- Ağ I/O ve stateful kontrol akışının önemli kısmı CPU/C katmanında kalır
+## Native RX->GPU
 
-## Kritik Knob'lar
-
-- `--gpu-template-pool-size-l4`
-- `--gpu-template-pool-size-l7`
-- `--gpu-ring-capacity`
-- `--gpu-batch-size`
-- `--gpu-stream-count`
-- `--gpu-pipeline-depth`
-- `--gpu-packet-zerocopy-output`
-- `--gpu-kernel-mode {batch,persistent}`
-- `--gpu-stream-api {compat,stream}`
-
-## Persistent Mod Notu
-
-`gpu-kernel-mode=persistent` + `gpu-stream-api=stream` kombinasyonu env tarafında daha katı TX backend davranışı tetikler (`SAMURAI_GPU_TX_BACKEND_STRICT=1`).
-
-## Doğrulama
-
-Performans iddiaları sistemden sisteme değişir; özellikle `zerocopy-output` için benchmark karşılaştırması şarttır.
+- AF_XDP RX API: `xdp_sender.c` (`xdp_recv_ctx`)
+- Runtime bridge: `af_xdp_sender.run_gpu_rx_pipeline()`
+- Çıktı: `gpu_rx_packets_total`, `gpu_rx_suspicious_total`, `gpu_rx_pps`, `gpu_classifier_*`
