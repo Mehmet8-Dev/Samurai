@@ -2,6 +2,8 @@ import asyncio
 import os
 from typing import Any, Dict
 
+from .gpu_defense import classify_packets_if_enabled
+
 _RECOVERABLE_ERRORS = (
     OSError,
     RuntimeError,
@@ -117,11 +119,38 @@ async def raw_socket_sender(
         pool_key="senders_raw_tx",
         return_meta=True,
     )
+    loss_iface_hint = _resolve_loss_iface(None)
+    loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
+    defense_meta = classify_packets_if_enabled(
+        packets_buffer,
+        count=int(count),
+        packet_size=int(packet_size),
+        packet_stride=0,
+        sender_context=sender_context,
+    )
+    if int(defense_meta.get("gpu_classifier_hard_fail", 0) or 0) == 1:
+        _update_live(live_progress, int(count))
+        _update_live(live_errors, int(count))
+        out = _stats(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="GPU_DEFENSE_HARD_FAIL",
+            permission_error_count=0,
+            fallback_count=1,
+            sender_fallback_reason=str(defense_meta.get("gpu_classifier_error", "gpu_classifier_hard_fail")),
+            sender_backend_requested=requested_backend,
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=int(normalize_meta.get("buffer_copy_count", 0) or 0),
+            buffer_copy_bytes=int(normalize_meta.get("buffer_copy_bytes", 0) or 0),
+            eagain_retry_count=0,
+            partial_send_retry_count=0,
+        )
+        out.update(defense_meta)
+        return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
 
     buffer_copy_count = int(normalize_meta.get("buffer_copy_count", 0) or 0)
     buffer_copy_bytes = int(normalize_meta.get("buffer_copy_bytes", 0) or 0)
-    loss_iface_hint = _resolve_loss_iface(None)
-    loss_before_snapshot = _take_loss_snapshot(loss_iface_hint)
     dp_open_error = ""
     if ctx:
         dp_open_error = str(ctx.get("dataplane_open_error", "") or "").strip()
@@ -231,6 +260,7 @@ async def raw_socket_sender(
             out[k] = int(v)
         elif isinstance(v, (int, float, str)):
             out[k] = v
+    out.update(defense_meta)
     return _attach_loss_telemetry(out, loss_before_snapshot, preferred_iface=loss_iface_hint)
 
 

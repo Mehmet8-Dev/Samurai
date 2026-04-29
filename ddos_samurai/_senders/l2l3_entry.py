@@ -2,6 +2,8 @@ import time
 import subprocess
 from typing import Any, Dict
 
+from .gpu_defense import classify_packets_if_enabled
+
 
 def _parse_route_probe(target_ip: str) -> tuple[str | None, str | None]:
     try:
@@ -183,6 +185,28 @@ async def xdp_sender(
         pool_key="senders_xdp_tx",
         return_meta=True,
     )
+    defense_meta = classify_packets_if_enabled(
+        packets_buffer,
+        count=int(count),
+        packet_size=int(packet_size),
+        packet_stride=int(packet_stride or 0),
+        sender_context=sender_context,
+    )
+    if int(defense_meta.get("gpu_classifier_hard_fail", 0) or 0) == 1:
+        out = stats_fn(
+            attempted=count,
+            sent=0,
+            errors=count,
+            sender_path="GPU_DEFENSE_HARD_FAIL",
+            fallback_count=1,
+            sender_fallback_reason=str(defense_meta.get("gpu_classifier_error", "gpu_classifier_hard_fail")),
+            sender_backend_requested="xdp",
+            sender_fallback_policy=fallback_policy,
+            buffer_copy_count=int(normalize_meta.get("buffer_copy_count", 0) or 0),
+            buffer_copy_bytes=int(normalize_meta.get("buffer_copy_bytes", 0) or 0),
+        )
+        out.update(defense_meta)
+        return out
     first_packet = memoryview(packets_buffer)[:packet_size] if packet_size > 0 else memoryview(b"")
     has_l2_ipv4 = (
         packet_size >= 34
@@ -382,7 +406,7 @@ async def xdp_sender(
                 pass
         return await _fallback(reason="xdp_runtime_error", details=f"Runtime error: {e}")
 
-    return stats_fn(
+    out = stats_fn(
         attempted=count,
         sent=total_sent,
         errors=max(0, count - total_sent),
@@ -397,3 +421,5 @@ async def xdp_sender(
         eagain_retry_count=0,
         partial_send_retry_count=0,
     )
+    out.update(defense_meta)
+    return out

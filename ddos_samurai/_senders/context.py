@@ -24,3 +24,9 @@ def close_sender_context(sender_context: Dict[str, Any] | None) -> None:
             xdp_sender.stop()
         except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             pass
+    gpu_defense_backend = sender_context.pop("gpu_defense_backend", None)
+    if gpu_defense_backend is not None and hasattr(gpu_defense_backend, "shutdown"):
+        try:
+            gpu_defense_backend.shutdown()
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+            pass
