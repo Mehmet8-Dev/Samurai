@@ -176,6 +176,136 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, str(default)) or str(default)).strip()
+    try:
+        return int(raw)
+    except _RECOVERABLE_ERRORS:
+        return int(default)
+
+
+def _resolve_gpu_rx_iface(requested_iface: str) -> str:
+    iface = str(requested_iface or os.environ.get("SAMURAI_GPU_RX_IFACE", "") or "").strip()
+    if iface:
+        return iface
+    detected = str(get_default_interface() or "").strip()
+    if detected:
+        return detected
+    raise RuntimeError("GPU RX pipeline interface could not be resolved")
+
+
+def run_gpu_rx_pipeline(
+    *,
+    interface: str = "",
+    duration_s: int = 10,
+    batch_size: int = 256,
+    max_packets: int = 100000,
+    snaplen: int = 2048,
+    classifier_runtime: str = "tensorrt",
+    classifier_engine_path: str = "",
+    rdma_mode: str = "auto",
+    rdma_strict: bool = False,
+    flush_timeout_ms: int = 2,
+) -> Dict[str, Any]:
+    from ._gpu_packet_cuda_backend import DefenseCUDABackend
+    from . import xdp_sender as native_xdp
+
+    iface = _resolve_gpu_rx_iface(interface)
+    dur = max(1, int(duration_s or _env_int("SAMURAI_GPU_RX_DURATION_S", 10)))
+    bsz = max(1, int(batch_size or _env_int("SAMURAI_GPU_RX_BATCH_SIZE", 256)))
+    cap = max(1, int(max_packets or _env_int("SAMURAI_GPU_RX_MAX_PACKETS", 100000)))
+    slen = max(64, int(snaplen or _env_int("SAMURAI_GPU_RX_SNAPLEN", 2048)))
+
+    backend = DefenseCUDABackend()
+    backend.init(
+        runtime=str(classifier_runtime or os.environ.get("SAMURAI_GPU_CLASSIFIER_RUNTIME", "tensorrt")),
+        engine_path=str(classifier_engine_path or os.environ.get("SAMURAI_GPU_CLASSIFIER_ENGINE_PATH", "")),
+        rdma_mode=str(rdma_mode or os.environ.get("SAMURAI_GPU_RDMA_MODE", "auto")),
+        rdma_strict=bool(rdma_strict or str(os.environ.get("SAMURAI_GPU_RDMA_STRICT", "0")).lower() in {"1", "true", "yes", "on"}),
+        max_batch_size=max(1, _env_int("SAMURAI_GPU_BATCH_MAX", 1024)),
+        flush_timeout_ms=max(0, int(flush_timeout_ms or _env_int("SAMURAI_GPU_BATCH_FLUSH_TIMEOUT_MS", 2))),
+    )
+
+    rx_total = 0
+    cls_total = 0
+    suspicious = 0
+    benign = 0
+    reason_last = "none"
+    conf_sum = 0.0
+    classify_calls = 0
+    batch: List[bytes] = []
+    start = time.monotonic()
+    deadline = start + float(dur)
+
+    xdp_handle = 0
+    try:
+        xdp_handle = int(native_xdp.xdp_create(iface, 0, 0) or 0)
+        if xdp_handle <= 0:
+            raise RuntimeError(f"xdp_create failed for iface={iface}")
+        while time.monotonic() < deadline and rx_total < cap:
+            max_take = min(bsz, cap - rx_total)
+            items = native_xdp.xdp_recv_ctx(int(xdp_handle), int(max_take), int(slen))
+            if not items:
+                if batch:
+                    labels, confs, reason_last = backend.classify_batch(batch)
+                    classify_calls += 1
+                    cls_total += int(labels.size)
+                    suspicious += int((labels != 0).sum())
+                    benign += int((labels == 0).sum())
+                    conf_sum += float(confs.sum()) if int(confs.size) > 0 else 0.0
+                    batch.clear()
+                time.sleep(0.001)
+                continue
+            for pkt in items:
+                rx_total += 1
+                batch.append(pkt)
+                if rx_total >= cap:
+                    break
+            if len(batch) >= bsz or rx_total >= cap:
+                labels, confs, reason_last = backend.classify_batch(batch)
+                classify_calls += 1
+                cls_total += int(labels.size)
+                suspicious += int((labels != 0).sum())
+                benign += int((labels == 0).sum())
+                conf_sum += float(confs.sum()) if int(confs.size) > 0 else 0.0
+                batch.clear()
+        if batch:
+            labels, confs, reason_last = backend.classify_batch(batch)
+            classify_calls += 1
+            cls_total += int(labels.size)
+            suspicious += int((labels != 0).sum())
+            benign += int((labels == 0).sum())
+            conf_sum += float(confs.sum()) if int(confs.size) > 0 else 0.0
+            batch.clear()
+    finally:
+        try:
+            if xdp_handle > 0:
+                native_xdp.xdp_destroy(int(xdp_handle))
+        except _RECOVERABLE_ERRORS:
+            pass
+        backend.shutdown()
+
+    elapsed = max(1e-9, time.monotonic() - start)
+    out: Dict[str, Any] = {
+        "gpu_rx_pipeline_active": 1,
+        "gpu_rx_iface": iface,
+        "gpu_rx_duration_s": int(dur),
+        "gpu_rx_packets_total": int(rx_total),
+        "gpu_rx_classified_total": int(cls_total),
+        "gpu_rx_suspicious_total": int(suspicious),
+        "gpu_rx_benign_total": int(benign),
+        "gpu_rx_classifier_calls": int(classify_calls),
+        "gpu_rx_classifier_reason_last": str(reason_last or "none"),
+        "gpu_rx_classifier_confidence_mean": float(conf_sum / max(1, cls_total)),
+        "gpu_rx_pps": float(rx_total / elapsed),
+    }
+    stats = backend.read_classifier_stats()
+    if isinstance(stats, dict):
+        for k, v in stats.items():
+            out[f"gpu_classifier_{k}"] = v
+    return out
+
+
 # ============================================================================
 # Data Classes
 # ============================================================================

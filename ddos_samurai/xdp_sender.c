@@ -120,6 +120,8 @@ struct xsk_socket_info {
     struct xsk_ring_cons rx;
     void *tx_map;
     size_t tx_map_len;
+    void *rx_map;
+    size_t rx_map_len;
     struct xsk_umem_info *umem;
     int fd;
     int ifindex;
@@ -474,6 +476,11 @@ static inline void *xsk_ring_cons__comp_addr(struct xsk_ring_cons *comp, uint32_
     return (void*)((uint64_t*)comp->ring + (idx & comp->mask));
 }
 
+static inline void *xsk_ring_cons__rx_desc(struct xsk_ring_cons *rx, uint32_t idx)
+{
+    return (void*)((struct xdp_desc*)rx->ring + (idx & rx->mask));
+}
+
 // ============================================================================
 // Checksum Helpers
 // ============================================================================
@@ -775,6 +782,25 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
     xsk->tx.ring = tx_map + offsets.tx.desc;
     xsk->tx_map = tx_map;
     xsk->tx_map_len = offsets.tx.desc + XDP_TX_RING_SIZE * sizeof(struct xdp_desc);
+
+    // Map RX Ring (optional; required for RX pipeline)
+    void *rx_map = mmap(NULL,
+                        offsets.rx.desc + XDP_RX_RING_SIZE * sizeof(struct xdp_desc),
+                        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+                        xsk->fd, XDP_PGOFF_RX_RING);
+    if (rx_map != MAP_FAILED) {
+        xsk->rx.mask = XDP_RX_RING_SIZE - 1;
+        xsk->rx.size = XDP_RX_RING_SIZE;
+        xsk->rx.producer = (uint32_t*)(rx_map + offsets.rx.producer);
+        xsk->rx.consumer = (uint32_t*)(rx_map + offsets.rx.consumer);
+        xsk->rx.flags = (uint32_t*)(rx_map + offsets.rx.flags);
+        xsk->rx.ring = rx_map + offsets.rx.desc;
+        xsk->rx_map = rx_map;
+        xsk->rx_map_len = offsets.rx.desc + XDP_RX_RING_SIZE * sizeof(struct xdp_desc);
+    } else {
+        xsk->rx.size = 0;
+        xsk->rx.ring = NULL;
+    }
     
     // Bind socket to interface
     struct sockaddr_xdp sxdp = {
@@ -841,8 +867,102 @@ static void destroy_xsk_socket(struct xsk_socket_info *xsk)
         xsk->tx_map = NULL;
         xsk->tx_map_len = 0;
     }
+    if (xsk->rx_map && xsk->rx_map_len > 0) {
+        munmap(xsk->rx_map, xsk->rx_map_len);
+        xsk->rx_map = NULL;
+        xsk->rx_map_len = 0;
+    }
     if (xsk->fd >= 0) close(xsk->fd);
     free(xsk);
+}
+
+static int refill_rx_fill_ring(struct xsk_socket_info *xsk, struct xdp_desc *descs, uint32_t count)
+{
+    if (!xsk || !xsk->umem || !descs || count == 0) {
+        return 0;
+    }
+    uint32_t fill_idx = 0;
+    uint32_t reserved = xsk_ring_prod__reserve(&xsk->umem->fill, count, &fill_idx);
+    if (reserved == 0) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < reserved; i++) {
+        uint64_t base = descs[i].addr;
+        if (base >= xsk->umem->headroom) {
+            base -= xsk->umem->headroom;
+        }
+        uint32_t frame_id = (uint32_t)(base / xsk->umem->frame_size);
+        uint64_t *fill_addr = xsk_ring_prod__fill_addr(&xsk->umem->fill, fill_idx + i);
+        *fill_addr = (uint64_t)frame_id * (uint64_t)xsk->umem->frame_size;
+    }
+    xsk_ring_prod__submit(&xsk->umem->fill, reserved);
+    return (int)reserved;
+}
+
+static int xdp_recv_packets_ctx(xdp_context_t *ctx, uint32_t max_packets, uint32_t snaplen, PyObject **out_list)
+{
+    if (!ctx || !ctx->xsk || !out_list) {
+        return -1;
+    }
+    struct xsk_socket_info *xsk = ctx->xsk;
+    if (xsk->rx.size == 0 || xsk->rx.ring == NULL) {
+        *out_list = PyList_New(0);
+        return 0;
+    }
+    if (max_packets == 0) {
+        *out_list = PyList_New(0);
+        return 0;
+    }
+    struct pollfd pfd = {.fd = xsk->fd, .events = POLLIN, .revents = 0};
+    (void)poll(&pfd, 1, 0);
+
+    uint32_t rx_idx = 0;
+    uint32_t peeked = xsk_ring_cons__peek(&xsk->rx, max_packets, &rx_idx);
+    if (peeked == 0) {
+        // Try minimum one descriptor path if producer has less than requested.
+        peeked = xsk_ring_cons__peek(&xsk->rx, 1, &rx_idx);
+        if (peeked == 0) {
+            *out_list = PyList_New(0);
+            return 0;
+        }
+    }
+
+    PyObject *items = PyList_New((Py_ssize_t)peeked);
+    if (!items) {
+        return -1;
+    }
+    struct xdp_desc *tmp_desc = calloc(peeked, sizeof(struct xdp_desc));
+    if (!tmp_desc) {
+        Py_DECREF(items);
+        return -1;
+    }
+    uint32_t produced = 0;
+    for (uint32_t i = 0; i < peeked; i++) {
+        struct xdp_desc *d = xsk_ring_cons__rx_desc(&xsk->rx, rx_idx + i);
+        tmp_desc[i] = *d;
+        uint32_t plen = d->len;
+        if (snaplen > 0 && plen > snaplen) {
+            plen = snaplen;
+        }
+        const uint8_t *src = (const uint8_t*)xsk->umem->buffer + d->addr;
+        PyObject *pkt = PyBytes_FromStringAndSize((const char*)src, (Py_ssize_t)plen);
+        if (!pkt) {
+            for (uint32_t j = 0; j < produced; j++) {
+                PyObject *old = PyList_GET_ITEM(items, (Py_ssize_t)j);
+                Py_XDECREF(old);
+            }
+            free(tmp_desc);
+            Py_DECREF(items);
+            return -1;
+        }
+        PyList_SET_ITEM(items, (Py_ssize_t)i, pkt);
+        produced += 1;
+    }
+    xsk_ring_cons__release(&xsk->rx, peeked);
+    (void)refill_rx_fill_ring(xsk, tmp_desc, peeked);
+    free(tmp_desc);
+    *out_list = items;
+    return (int)peeked;
 }
 
 // ============================================================================
@@ -2796,6 +2916,82 @@ static PyObject* py_xdp_stats_ctx(PyObject* self, PyObject* args)
                          "mode_name", xdp_mode_name(xdp_mode));
 }
 
+static PyObject* py_xdp_recv_ctx(PyObject* self, PyObject* args)
+{
+    int handle = 0;
+    int max_packets = 256;
+    int snaplen = 2048;
+    xdp_context_t *ctx = NULL;
+    PyObject *out = NULL;
+    int rc = 0;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "i|ii", &handle, &max_packets, &snaplen)) {
+        return NULL;
+    }
+    if (max_packets <= 0) {
+        max_packets = 1;
+    }
+    if (max_packets > XDP_BATCH_SIZE) {
+        max_packets = XDP_BATCH_SIZE;
+    }
+    if (snaplen <= 0) {
+        snaplen = 2048;
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        PyErr_SetString(PyExc_KeyError, "Invalid XDP context handle");
+        return NULL;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        PyErr_SetString(PyExc_RuntimeError, "XDP context not initialized");
+        return NULL;
+    }
+    rc = xdp_recv_packets_ctx(ctx, (uint32_t)max_packets, (uint32_t)snaplen, &out);
+    pthread_mutex_unlock(&ctx->lock);
+    if (rc < 0 || out == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "xdp_recv_ctx failed");
+        return NULL;
+    }
+    return out;
+}
+
+static PyObject* py_xdp_recv(PyObject* self, PyObject* args)
+{
+    int max_packets = 256;
+    int snaplen = 2048;
+    PyObject *out = NULL;
+    int rc = 0;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "|ii", &max_packets, &snaplen)) {
+        return NULL;
+    }
+    if (max_packets <= 0) {
+        max_packets = 1;
+    }
+    if (max_packets > XDP_BATCH_SIZE) {
+        max_packets = XDP_BATCH_SIZE;
+    }
+    if (snaplen <= 0) {
+        snaplen = 2048;
+    }
+    if (!xdp_ctx.is_initialized || !xdp_ctx.is_running || xdp_ctx.xsk == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
+        return NULL;
+    }
+    pthread_mutex_lock(&xdp_ctx.lock);
+    rc = xdp_recv_packets_ctx(&xdp_ctx, (uint32_t)max_packets, (uint32_t)snaplen, &out);
+    pthread_mutex_unlock(&xdp_ctx.lock);
+    if (rc < 0 || out == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "xdp_recv failed");
+        return NULL;
+    }
+    return out;
+}
+
 // ============================================================================
 // Native Capsule API (C-to-C Fast Path)
 // ============================================================================
@@ -3367,6 +3563,10 @@ static PyMethodDef XdpSenderMethods[] = {
      "Get stats for AF_XDP context.\n"
      "Args: handle (int)\n"
      "Returns: dict"},
+    {"xdp_recv_ctx", py_xdp_recv_ctx, METH_VARARGS,
+     "Receive packets from AF_XDP context RX ring.\n"
+     "Args: handle (int), max_packets (int, optional), snaplen (int, optional)\n"
+     "Returns: list[bytes]"},
 
     {"xdp_init", py_xdp_init, METH_VARARGS, 
      "Initialize AF_XDP socket on interface.\n"
@@ -3413,6 +3613,10 @@ static PyMethodDef XdpSenderMethods[] = {
      "Send UDP packets by building directly in UMEM frames.\n"
      "Args: target_ip, target_port, payloads (list), src_ports (list, optional)\n"
      "Returns: int (number of packets sent)"},
+    {"xdp_recv", py_xdp_recv, METH_VARARGS,
+     "Receive packets from global AF_XDP RX ring.\n"
+     "Args: max_packets (int, optional), snaplen (int, optional)\n"
+     "Returns: list[bytes]"},
     
     {"xdp_stats", py_xdp_stats, METH_NOARGS, 
      "Get current XDP statistics.\n"
