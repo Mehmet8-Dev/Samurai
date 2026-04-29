@@ -328,6 +328,56 @@ class OptionalBuildExt(build_ext):
         except subprocess.CalledProcessError as exc:
             print(f"\nWarning: CUDA module build failed: {exc}\n")
 
+        self._build_cuda_defense_module(project_root, nvcc, cuda_include, build_temp, out_dir)
+
+    def _build_cuda_defense_module(
+        self,
+        project_root: str,
+        nvcc: str,
+        cuda_include: str,
+        build_temp: str,
+        out_dir: str,
+    ) -> None:
+        src_path = os.path.join(project_root, "ddos_samurai", "gpu_packet_cuda", "gpu_packet_cuda_defense.cu")
+        if not os.path.exists(src_path):
+            return
+
+        with_trt = _env_flag("SAMURAI_WITH_TENSORRT", "0")
+        with_gpudirect = _env_flag("SAMURAI_WITH_GPUDIRECT_RDMA", "0")
+        compile_cmd = [
+            nvcc,
+            "-std=c++20",
+            "-O3",
+            "-Xcompiler",
+            "-fPIC",
+            "-I",
+            project_root,
+            "-I",
+            cuda_include,
+        ]
+        if with_trt:
+            compile_cmd.extend(["-DSAMURAI_WITH_TENSORRT=1"])
+        if with_gpudirect:
+            compile_cmd.extend(["-DSAMURAI_WITH_GPUDIRECT_RDMA=1"])
+        compile_cmd.extend(["-c", src_path, "-o", os.path.join(build_temp, "gpu_packet_cuda_defense.o")])
+
+        link_cmd = [
+            nvcc,
+            "-shared",
+            os.path.join(build_temp, "gpu_packet_cuda_defense.o"),
+            "-o",
+            os.path.join(out_dir, "libgpu_packet_cuda_defense.so"),
+        ]
+        if with_gpudirect:
+            link_cmd.extend(["-libverbs", "-lmlx5"])
+        try:
+            print(f"\nBuilding CUDA defense module: {src_path}")
+            subprocess.run(compile_cmd, check=True)
+            subprocess.run(link_cmd, check=True)
+            print("Built CUDA defense library: libgpu_packet_cuda_defense.so\n")
+        except subprocess.CalledProcessError as exc:
+            print(f"\nWarning: CUDA defense module build failed: {exc}\n")
+
 
 def detect_l7_capabilities() -> Dict[str, bool]:
     quic_build_mode = _normalize_quic_build_mode(os.environ.get("SAMURAI_QUIC_BUILD_MODE", "auto"))
