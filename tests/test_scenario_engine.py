@@ -6,6 +6,7 @@ from ddos_samurai.scenario_engine import load_raw_scenario, load_scenario_spec
 from ddos_samurai.scenario_engine import native as scenario_native
 from ddos_samurai.scenario_engine.runtime import (
     RampController,
+    VUPool,
     build_vu_lifecycle_batches,
     collect_per_flow_metrics,
     simulate_vu_state_machine,
@@ -276,3 +277,80 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
             ramp_step_interval_s=2,
         )
         self.assertTrue(len(batches) > 0)
+
+    def test_vu_pool_live_transitions(self):
+        sessions = [
+            {
+                "flow": "f1",
+                "events": [
+                    {"event_type": "http_request"},
+                    {"event_type": "http_request"},
+                ],
+            },
+            {
+                "flow": "f2",
+                "events": [
+                    {"event_type": "http_request"},
+                ],
+            },
+        ]
+        pool = VUPool(
+            scenario_sessions=sessions,
+            ramp_seconds=1,
+            max_session_seconds=5,
+            ramp_curve="linear",
+        )
+        pool.spawn_until(0.0)
+        pool.ingest_step_results(
+            [
+                {"vu_id": "1", "flow": "f1", "success": True, "timeout": False},
+                {"vu_id": "2", "flow": "f2", "success": False, "timeout": True},
+            ]
+        )
+        pool.ingest_step_results(
+            [
+                {"vu_id": "1", "flow": "f1", "success": True, "timeout": False},
+            ]
+        )
+        snaps = pool.snapshots()
+        s1 = [x for x in snaps if x.vu_id == 1][0]
+        s2 = [x for x in snaps if x.vu_id == 2][0]
+        self.assertEqual(str(s1.state.value), "completed")
+        self.assertEqual(str(s2.state.value), "failed")
+        summary = pool.summary_metrics()
+        self.assertEqual(int(summary["sessions_completed"]), 1)
+        self.assertEqual(int(summary["sessions_failed"]), 1)
+
+    def test_vu_pool_timeout_finalize(self):
+        sessions = [{"flow": "f1", "events": [{"event_type": "http_request"}]}]
+        pool = VUPool(
+            scenario_sessions=sessions,
+            ramp_seconds=0,
+            max_session_seconds=1,
+        )
+        pool.spawn_until(0.0)
+        marked = pool.finalize_timeouts(2.0)
+        self.assertEqual(marked, 1)
+        snaps = pool.snapshots()
+        self.assertEqual(str(snaps[0].state.value), "failed")
+
+    def test_vu_pool_drive_with_observed_ratios(self):
+        sessions = [
+            {"flow": "f1", "events": [{"event_type": "http_request"}, {"event_type": "http_request"}]},
+            {"flow": "f2", "events": [{"event_type": "http_request"}]},
+        ]
+        pool = VUPool(
+            scenario_sessions=sessions,
+            ramp_seconds=0,
+            max_session_seconds=30,
+            retry_backoff_base_ms=10,
+            retry_backoff_max_ms=20,
+        )
+        snaps = pool.drive_with_observed_ratios(
+            observed_error_ratio=0.2,
+            observed_timeout_ratio=0.1,
+            seed=123,
+            duration_s=1.0,
+        )
+        self.assertEqual(len(snaps), 2)
+        self.assertTrue(all(str(s.state.value) in {"completed", "failed"} for s in snaps))
