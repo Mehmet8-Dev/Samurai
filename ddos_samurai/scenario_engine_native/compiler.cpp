@@ -102,14 +102,35 @@ struct PackedEvents {
   std::vector<std::string> request_kind{};  // http_request | http2_headers | ""
   std::vector<std::string> method{};
   std::vector<std::string> path{};
-  std::vector<std::unordered_map<std::string, std::string>> headers{};
-  std::vector<std::unordered_map<std::string, std::string>> cookies{};
+  std::vector<int> headers_idx{};
+  std::vector<int> cookies_idx{};
+  std::vector<std::unordered_map<std::string, std::string>> headers_pool{};
+  std::vector<std::unordered_map<std::string, std::string>> cookies_pool{};
   std::vector<std::string> device_profile{};
   std::vector<int> timeout_ms{};
   std::vector<int> retry_count{};
   std::vector<int> think_min_ms{};
   std::vector<int> think_max_ms{};
 };
+
+static int intern_map(
+    const std::unordered_map<std::string, std::string>& m,
+    std::vector<std::unordered_map<std::string, std::string>>& pool) {
+  for (std::size_t i = 0; i < pool.size(); ++i) {
+    if (pool[i].size() != m.size()) continue;
+    bool same = true;
+    for (const auto& [k, v] : m) {
+      auto it = pool[i].find(k);
+      if (it == pool[i].end() || it->second != v) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return static_cast<int>(i);
+  }
+  pool.push_back(m);
+  return static_cast<int>(pool.size() - 1);
+}
 
 static void compile_flow_recursive(const ScenarioSpecNative& spec, const std::string& flow_name, CompileState& st, py::list& events) {
   if (st.depth > st.max_depth || st.emitted >= st.max_events) return;
@@ -211,8 +232,8 @@ static void compile_flow_recursive_packed(
         out.request_kind.emplace_back("");
         out.method.emplace_back("");
         out.path.emplace_back("");
-        out.headers.emplace_back();
-        out.cookies.emplace_back();
+        out.headers_idx.push_back(intern_map({}, out.headers_pool));
+        out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
         out.device_profile.emplace_back("");
         out.timeout_ms.push_back(0);
         out.retry_count.push_back(0);
@@ -260,8 +281,8 @@ static void compile_flow_recursive_packed(
         out.request_kind.push_back((st.backend == "http2") ? "http2_headers" : "http_request");
         out.method.push_back(step.method);
         out.path.push_back(step.path);
-        out.headers.push_back(std::move(headers));
-        out.cookies.push_back(std::move(cookies));
+        out.headers_idx.push_back(intern_map(headers, out.headers_pool));
+        out.cookies_idx.push_back(intern_map(cookies, out.cookies_pool));
         out.device_profile.push_back(std::move(device_profile));
         out.timeout_ms.push_back(timeout_ms);
         out.retry_count.push_back(retry_count);
@@ -310,8 +331,10 @@ py::dict compile_session_plan_packed_native(const ScenarioSpecNative& spec, cons
   out["request_kind"] = py::cast(pe.request_kind);
   out["method"] = py::cast(pe.method);
   out["path"] = py::cast(pe.path);
-  out["headers"] = py::cast(pe.headers);
-  out["cookies"] = py::cast(pe.cookies);
+  out["headers_idx"] = py::cast(pe.headers_idx);
+  out["cookies_idx"] = py::cast(pe.cookies_idx);
+  out["headers_pool"] = py::cast(pe.headers_pool);
+  out["cookies_pool"] = py::cast(pe.cookies_pool);
   out["device_profile"] = py::cast(pe.device_profile);
   out["timeout_ms"] = py::cast(pe.timeout_ms);
   out["retry_count"] = py::cast(pe.retry_count);

@@ -425,6 +425,11 @@ def build_vu_lifecycle_batches(
             methods = list((session or {}).get("method", []) or [])
             paths = list((session or {}).get("path", []) or [])
             headers_list = list((session or {}).get("headers", []) or [])
+            cookies_list = list((session or {}).get("cookies", []) or [])
+            headers_idx = list((session or {}).get("headers_idx", []) or [])
+            cookies_idx = list((session or {}).get("cookies_idx", []) or [])
+            headers_pool = list((session or {}).get("headers_pool", []) or [])
+            cookies_pool = list((session or {}).get("cookies_pool", []) or [])
             retry_list = list((session or {}).get("retry_count", []) or [])
             think_min = list((session or {}).get("think_min_ms", []) or [])
             think_max = list((session or {}).get("think_max_ms", []) or [])
@@ -457,10 +462,21 @@ def build_vu_lifecycle_batches(
                 step_attempted += 1
                 method = str(methods[i] if i < len(methods) else "GET").upper()
                 path = str(paths[i] if i < len(paths) else "/")
-                headers = dict(headers_list[i] if i < len(headers_list) else {})
+                if i < len(headers_idx) and headers_pool:
+                    hidx = int(headers_idx[i] or 0)
+                    headers = dict(headers_pool[hidx] if 0 <= hidx < len(headers_pool) else {})
+                else:
+                    headers = dict(headers_list[i] if i < len(headers_list) else {})
+                if i < len(cookies_idx) and cookies_pool:
+                    cidx = int(cookies_idx[i] or 0)
+                    cookies = dict(cookies_pool[cidx] if 0 <= cidx < len(cookies_pool) else {})
+                else:
+                    cookies = dict(cookies_list[i] if i < len(cookies_list) else {})
                 retry_count = max(0, int(retry_list[i] if i < len(retry_list) else 0))
                 headers["x-scenario-flow"] = flow
                 headers["x-scenario-vu-id"] = str(vu_id)
+                if cookies:
+                    headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
                 key = int((t * 1000.0) // bucket)
                 timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
                 for r in range(retry_count):
