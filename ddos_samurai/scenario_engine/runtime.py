@@ -415,43 +415,93 @@ def build_vu_lifecycle_batches(
         spawn_at = float(spawn_schedule[si]) if si < len(spawn_schedule) else 0.0
         t = spawn_at
         deadline = spawn_at + float(max_sess_s)
-        events = list((session or {}).get("events", []) or [])
+        packed_mode = bool((session or {}).get("packed", False))
+        events = list((session or {}).get("events", []) or []) if not packed_mode else []
         flow = str((session or {}).get("flow", "unknown") or "unknown")
         vu_flow[str(vu_id)] = flow
-        vu_expected_steps[str(vu_id)] = int(
-            sum(1 for ev in events if str((ev or {}).get("event_type", "") or "").strip().lower() in {"http_request", "http2_headers"})
-        )
+        if packed_mode:
+            ek = list((session or {}).get("event_kind", []) or [])
+            rk = list((session or {}).get("request_kind", []) or [])
+            methods = list((session or {}).get("method", []) or [])
+            paths = list((session or {}).get("path", []) or [])
+            headers_list = list((session or {}).get("headers", []) or [])
+            retry_list = list((session or {}).get("retry_count", []) or [])
+            think_min = list((session or {}).get("think_min_ms", []) or [])
+            think_max = list((session or {}).get("think_max_ms", []) or [])
+            n = len(ek)
+            req_count = 0
+            for i in range(n):
+                kind = int(ek[i] if i < len(ek) else 0)
+                if kind != 1:
+                    req_count += 1
+            vu_expected_steps[str(vu_id)] = int(req_count)
+        else:
+            vu_expected_steps[str(vu_id)] = int(
+                sum(1 for ev in events if str((ev or {}).get("event_type", "") or "").strip().lower() in {"http_request", "http2_headers"})
+            )
         active_markers.append((spawn_at, +1))
-        for ev in events:
-            et = str((ev or {}).get("event_type", "") or "").strip().lower()
-            if et == "think_time":
-                min_ms = max(0, int((ev or {}).get("min_ms", 0) or 0))
-                max_ms = max(min_ms, int((ev or {}).get("max_ms", min_ms) or min_ms))
-                t += float(rng.randint(min_ms, max_ms)) / 1000.0
-                continue
-            if et not in {"http_request", "http2_headers"}:
-                continue
-            if t > deadline:
-                step_failed += 1
-                continue
-            step_attempted += 1
-            method = str((ev or {}).get("method", "GET") or "GET").upper()
-            path = str((ev or {}).get("path", "/") or "/")
-            headers = dict((ev or {}).get("headers") or {})
-            retry_count = max(0, int((ev or {}).get("retry_count", 0) or 0))
-            headers["x-scenario-flow"] = flow
-            headers["x-scenario-vu-id"] = str(vu_id)
-            key = int((t * 1000.0) // bucket)
-            timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
-            # Model retry lifecycle deterministically as future attempts in plan timeline.
-            for r in range(retry_count):
-                t_retry = t + (0.05 * float(r + 1))
-                if t_retry > deadline:
+        if packed_mode:
+            for i in range(n):
+                kind = int(ek[i] if i < len(ek) else 0)
+                if kind == 1:
+                    min_ms = max(0, int(think_min[i] if i < len(think_min) else 0))
+                    max_ms = max(min_ms, int(think_max[i] if i < len(think_max) else min_ms))
+                    t += float(rng.randint(min_ms, max_ms)) / 1000.0
+                    continue
+                et = str(rk[i] if i < len(rk) else "http_request").strip().lower()
+                if et not in {"http_request", "http2_headers"}:
+                    continue
+                if t > deadline:
                     step_failed += 1
                     continue
                 step_attempted += 1
-                key_retry = int((t_retry * 1000.0) // bucket)
-                timeline.setdefault(key_retry, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
+                method = str(methods[i] if i < len(methods) else "GET").upper()
+                path = str(paths[i] if i < len(paths) else "/")
+                headers = dict(headers_list[i] if i < len(headers_list) else {})
+                retry_count = max(0, int(retry_list[i] if i < len(retry_list) else 0))
+                headers["x-scenario-flow"] = flow
+                headers["x-scenario-vu-id"] = str(vu_id)
+                key = int((t * 1000.0) // bucket)
+                timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
+                for r in range(retry_count):
+                    t_retry = t + (0.05 * float(r + 1))
+                    if t_retry > deadline:
+                        step_failed += 1
+                        continue
+                    step_attempted += 1
+                    key_retry = int((t_retry * 1000.0) // bucket)
+                    timeline.setdefault(key_retry, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
+        else:
+            for ev in events:
+                et = str((ev or {}).get("event_type", "") or "").strip().lower()
+                if et == "think_time":
+                    min_ms = max(0, int((ev or {}).get("min_ms", 0) or 0))
+                    max_ms = max(min_ms, int((ev or {}).get("max_ms", min_ms) or min_ms))
+                    t += float(rng.randint(min_ms, max_ms)) / 1000.0
+                    continue
+                if et not in {"http_request", "http2_headers"}:
+                    continue
+                if t > deadline:
+                    step_failed += 1
+                    continue
+                step_attempted += 1
+                method = str((ev or {}).get("method", "GET") or "GET").upper()
+                path = str((ev or {}).get("path", "/") or "/")
+                headers = dict((ev or {}).get("headers") or {})
+                retry_count = max(0, int((ev or {}).get("retry_count", 0) or 0))
+                headers["x-scenario-flow"] = flow
+                headers["x-scenario-vu-id"] = str(vu_id)
+                key = int((t * 1000.0) // bucket)
+                timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
+                # Model retry lifecycle deterministically as future attempts in plan timeline.
+                for r in range(retry_count):
+                    t_retry = t + (0.05 * float(r + 1))
+                    if t_retry > deadline:
+                        step_failed += 1
+                        continue
+                    step_attempted += 1
+                    key_retry = int((t_retry * 1000.0) // bucket)
+                    timeline.setdefault(key_retry, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
         active_markers.append((min(deadline, t), -1))
 
     batches: list[ScheduledRequestBatch] = []

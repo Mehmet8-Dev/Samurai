@@ -33,6 +33,13 @@ def compile_session_plan(spec: dict[str, Any] | ScenarioSpec, flow_name: str, se
     return dict(_native.compile_session_plan(_as_spec_dict(spec), str(flow_name), int(seed)))
 
 
+def compile_session_plan_packed(spec: dict[str, Any] | ScenarioSpec, flow_name: str, seed: int) -> dict[str, Any]:
+    require_native()
+    if hasattr(_native, "compile_session_plan_packed"):
+        return dict(_native.compile_session_plan_packed(_as_spec_dict(spec), str(flow_name), int(seed)))
+    return compile_session_plan(spec, flow_name, seed)
+
+
 def build_worker_session_plans(
     spec: dict[str, Any] | ScenarioSpec,
     worker_counts: list[int],
