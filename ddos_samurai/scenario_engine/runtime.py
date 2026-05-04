@@ -6,6 +6,7 @@ import random
 from typing import Any
 
 from ..gpu_cuda_payload import H2RequestPlan, H2RequestPlanItem
+from .metrics import FlowRuntimeMetrics
 
 
 @dataclass(frozen=True)
@@ -235,31 +236,26 @@ def simulate_vu_state_machine(
 
 
 def collect_per_flow_metrics(vus: list[VirtualUserSnapshot], duration_s: float) -> dict[str, dict[str, float]]:
-    by_flow: dict[str, dict[str, float]] = {}
+    by_flow_raw: dict[str, FlowRuntimeMetrics] = {}
     for vu in list(vus or []):
-        row = by_flow.setdefault(
-            vu.flow,
-            {
-                "sessions": 0.0,
-                "completed": 0.0,
-                "failed": 0.0,
-                "step_attempted": 0.0,
-                "step_failed": 0.0,
-                "retries_used": 0.0,
-                "timeouts": 0.0,
-                "conn_rate": 0.0,
-            },
-        )
-        row["sessions"] += 1.0
-        row["completed"] += 1.0 if vu.state == VUState.COMPLETED else 0.0
-        row["failed"] += 1.0 if vu.state == VUState.FAILED else 0.0
-        row["step_attempted"] += float(vu.step_attempted)
-        row["step_failed"] += float(vu.step_failed)
-        row["retries_used"] += float(vu.retries_used)
-        row["timeouts"] += float(vu.timeout_count)
+        row = by_flow_raw.setdefault(vu.flow, FlowRuntimeMetrics())
+        row.sessions_total += 1
+        row.sessions_completed += 1 if vu.state == VUState.COMPLETED else 0
+        row.step_attempted += int(vu.step_attempted)
+        row.step_failed += int(vu.step_failed)
     d = max(0.001, float(duration_s or 0.001))
-    for row in by_flow.values():
-        row["session_completion_rate"] = float(row["completed"] / max(1.0, row["sessions"]))
-        row["step_fail_ratio"] = float(row["step_failed"] / max(1.0, row["step_attempted"]))
-        row["conn_rate"] = float(row["sessions"] / d)
+    by_flow: dict[str, dict[str, float]] = {}
+    for name, row in by_flow_raw.items():
+        by_flow[name] = {
+            "sessions": float(row.sessions_total),
+            "completed": float(row.sessions_completed),
+            "failed": float(row.sessions_total - row.sessions_completed),
+            "step_attempted": float(row.step_attempted),
+            "step_failed": float(row.step_failed),
+            "retries_used": 0.0,
+            "timeouts": 0.0,
+            "session_completion_rate": float(row.sessions_completed / max(1, row.sessions_total)),
+            "step_fail_ratio": float(row.step_failed / max(1, row.step_attempted)),
+            "conn_rate": float(row.sessions_total / d),
+        }
     return by_flow

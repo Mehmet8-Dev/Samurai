@@ -94,8 +94,45 @@ SCENARIO_SCHEMA_V1: dict[str, Any] = {
     "additionalProperties": True,
 }
 
+SCENARIO_SCHEMA_V2_PATCH: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "schema_version": {"type": "integer", "minimum": 1},
+        "variables": {"type": "object", "additionalProperties": {"type": "string"}},
+        "flows": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "extract": {"type": "object", "additionalProperties": {"type": "string"}},
+                                "assertions": {"type": "array"},
+                                "condition": {"type": "string"},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    "additionalProperties": True,
+}
+
 
 def validate_with_json_schema(raw: dict[str, Any]) -> None:
     if jsonschema is None:
         return
-    jsonschema.validate(instance=raw, schema=SCENARIO_SCHEMA_V1)
+    schema_version = int((raw or {}).get("schema_version", 1) or 1)
+    if schema_version <= 1:
+        jsonschema.validate(instance=raw, schema=SCENARIO_SCHEMA_V1)
+        return
+    merged = dict(SCENARIO_SCHEMA_V1)
+    merged["properties"] = dict(SCENARIO_SCHEMA_V1.get("properties", {}))
+    merged["properties"].update(dict(SCENARIO_SCHEMA_V2_PATCH.get("properties", {})))
+    jsonschema.validate(instance=raw, schema=merged)

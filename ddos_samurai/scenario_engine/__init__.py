@@ -7,6 +7,8 @@ from .runtime import (
     serialize_batches,
     simulate_vu_state_machine,
 )
+from .metrics import ScenarioRuntimeMetrics, FlowRuntimeMetrics, build_flow_runtime_metrics
+from .sla import evaluate_scenario_sla, SlaEvaluation
 
 __all__ = [
     "load_raw_scenario",
@@ -20,4 +22,9 @@ __all__ = [
     "serialize_batches",
     "simulate_vu_state_machine",
     "collect_per_flow_metrics",
+    "ScenarioRuntimeMetrics",
+    "FlowRuntimeMetrics",
+    "build_flow_runtime_metrics",
+    "evaluate_scenario_sla",
+    "SlaEvaluation",
 ]

@@ -45,6 +45,13 @@ def validate_raw_schema(raw: dict[str, Any]) -> None:
             if st == "request":
                 if not str(step.get("path", "") or "").strip():
                     raise ValueError(f"flow '{fname}' step[{i}] request path is required")
+                extract = step.get("extract", {})
+                if extract is not None and not isinstance(extract, dict):
+                    raise ValueError(f"flow '{fname}' step[{i}] extract must be an object")
+                if isinstance(extract, dict):
+                    for ek, ev in extract.items():
+                        if not str(ek or "").strip() or not isinstance(ev, str):
+                            raise ValueError(f"flow '{fname}' step[{i}] extract entries must be non-empty string map")
             if st == "loop":
                 ref_flow = str(step.get("flow", "") or "").strip()
                 if ref_flow and ref_flow == fname:
@@ -55,6 +62,10 @@ def validate_raw_schema(raw: dict[str, Any]) -> None:
                 ref_flow = str(step.get("flow", "") or "").strip()
                 if ref_flow and ref_flow not in flows:
                     raise ValueError(f"flow '{fname}' step[{i}] references unknown flow '{ref_flow}'")
+            if st == "assert":
+                cond = str(step.get("condition", "") or "").strip()
+                if not cond:
+                    raise ValueError(f"flow '{fname}' step[{i}] assert requires 'condition'")
 
     _validate_flow_graph(dict(flows))
 
