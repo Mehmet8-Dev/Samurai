@@ -541,11 +541,17 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 observed_timeout_ratio = float(
                     rr.results.get("quic_connect_timeout_count", 0) or 0
                 ) / float(max(1, int(rr.results.get("attempted_total", 0) or 0)))
-                vu_snapshots = scenario_engine.simulate_vu_state_machine(
+                vu_pool = scenario_engine.VUPool(
                     scenario_sessions=all_scenario_sessions,
+                    ramp_seconds=int(getattr(args, "scenario_ramp_seconds", 0) or 0) or int((scenario_build_metrics or {}).get("scenario_ramp_seconds", 0) or 0),
+                    max_session_seconds=int(getattr(args, "scenario_max_session_seconds", 0) or 0) or int(scenario_spec.load_model.max_session_seconds),
+                    ramp_curve="linear",
+                )
+                vu_snapshots = vu_pool.drive_with_observed_ratios(
                     observed_error_ratio=observed_error_ratio,
                     observed_timeout_ratio=observed_timeout_ratio,
                     seed=int(getattr(args, "scenario_seed", 1337) or 1337),
+                    duration_s=float(duration),
                 )
                 rr.results["scenario_vu_state_counts"] = {
                     "queued": int(sum(1 for v in vu_snapshots if str(v.state.value) == "queued")),
@@ -556,10 +562,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     "failed": int(sum(1 for v in vu_snapshots if str(v.state.value) == "failed")),
                     "completed": int(sum(1 for v in vu_snapshots if str(v.state.value) == "completed")),
                 }
-                rr.results["scenario_per_flow"] = scenario_engine.collect_per_flow_metrics(
-                    vu_snapshots,
-                    duration_s=float(duration),
-                )
+                rr.results["scenario_per_flow"] = vu_pool.per_flow_metrics(duration_s=float(duration))
                 _sla_metrics = dict(sla_detail.get("metrics", {}) or {})
                 rr.results["scenario_session_completion_rate"] = float(_sla_metrics.get("session_completion_rate", 0.0) or 0.0)
                 rr.results["scenario_step_fail_ratio"] = float(_sla_metrics.get("step_fail_ratio", 0.0) or 0.0)
