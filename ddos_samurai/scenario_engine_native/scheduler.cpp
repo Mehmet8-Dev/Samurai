@@ -41,7 +41,7 @@ py::tuple build_worker_session_plans_native(
       const int wc = std::max(0, worker_counts[wi]);
       for (int i = 0; i < wc; ++i) {
         const auto idx = flow_dist(rng);
-        py::dict plan = compile_session_plan_native(spec, flow_names[idx], rng());
+        py::dict plan = compile_session_plan_packed_native(spec, flow_names[idx], rng());
         worker_plans.append(plan);
         sessions_started += 1;
         step_attempted += static_cast<std::uint64_t>(py::int_(plan["step_attempted"]));
