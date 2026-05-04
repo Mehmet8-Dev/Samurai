@@ -948,6 +948,7 @@ PYBIND11_MODULE(_l7_emu_native, m) {
       it["success"] = py::bool_(row.success);
       it["timeout"] = py::bool_(row.timeout);
       it["status_code"] = py::int_(row.status_code);
+      it["latency_ms"] = py::float_(row.latency_ms);
       it["protocol"] = py::str(row.protocol);
       step_results.append(std::move(it));
     }

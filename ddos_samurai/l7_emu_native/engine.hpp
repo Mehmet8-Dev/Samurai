@@ -70,6 +70,7 @@ struct ScenarioStepResult {
   bool success{false};
   bool timeout{false};
   int status_code{0};
+  double latency_ms{0.0};
   std::string protocol;
 };
 

@@ -371,6 +371,7 @@ struct H2CompletedStream {
   int expectation_failures{0};
   bool success{false};
   bool rst_stream{false};
+  long long request_start_ms{0};
   std::string scenario_flow{};
   std::string scenario_vu_id{};
 };
@@ -532,7 +533,8 @@ void record_scenario_step_result(
     const std::string& vu_id,
     bool success,
     bool timeout,
-    int status_code) {
+    int status_code,
+    double latency_ms) {
   ScenarioStepResult row;
   row.protocol = protocol;
   row.flow = flow.empty() ? std::string("unknown") : flow;
@@ -540,6 +542,7 @@ void record_scenario_step_result(
   row.success = success;
   row.timeout = timeout;
   row.status_code = status_code;
+  row.latency_ms = latency_ms;
   g_last_scenario_step_results.push_back(std::move(row));
 }
 
@@ -885,6 +888,7 @@ struct H2StreamState {
   std::string response_body;
   std::vector<FlowOp> follow_ops;
   bool completed{false};
+  long long request_start_ms{0};
   std::string scenario_flow;
   std::string scenario_vu_id;
 };
@@ -3422,6 +3426,7 @@ int h2_on_stream_close_callback(
   completed.response_headers = std::move(stream.response_headers);
   completed.response_header_fields = std::move(stream.response_header_fields);
   completed.response_body = std::move(stream.response_body);
+  completed.request_start_ms = stream.request_start_ms;
   completed.scenario_flow = std::move(stream.scenario_flow);
   completed.scenario_vu_id = std::move(stream.scenario_vu_id);
   if (error_code != NGHTTP2_NO_ERROR) {
@@ -3706,6 +3711,7 @@ bool submit_h2_request(
   stream->follow_ops = raw_request.follow_ops;
   stream->scenario_flow = raw_request.scenario_flow;
   stream->scenario_vu_id = raw_request.scenario_vu_id;
+  stream->request_start_ms = monotonic_ms_now();
 
   std::vector<nghttp2_nv> hdrs;
   hdrs.reserve(4 + stream->request_header_count);
@@ -4188,7 +4194,8 @@ std::map<std::string, double> run_http2_profile(
         completed.scenario_vu_id,
         ok,
         completed.status_code <= 0,
-        completed.status_code);
+        completed.status_code,
+        static_cast<double>(std::max<long long>(0, monotonic_ms_now() - completed.request_start_ms)));
     return CompletionDispositionDecision{};
   };
 
@@ -4630,7 +4637,8 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
           completed.scenario_vu_id,
           false,
           completed.status_code <= 0,
-          completed.status_code);
+          completed.status_code,
+          static_cast<double>(std::max<long long>(0, now_ms - completed.request_start_ms)));
       return CompletionDispositionDecision{
           ConnectionDispositionAction::Close,
           completed.lane_idx,
@@ -4690,7 +4698,8 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
         completed.scenario_vu_id,
         lane.expectation_failures == 0,
         false,
-        completed.status_code);
+        completed.status_code,
+        static_cast<double>(std::max<long long>(0, now_ms - completed.request_start_ms)));
     perf_request_latency(
         static_cast<double>(std::max<long long>(0, now_ms - completed.request_start_ms)),
         cfg.profile_sample_limit);
@@ -4791,7 +4800,8 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
           completed.scenario_vu_id,
           ok,
           completed.status_code <= 0,
-          completed.status_code);
+          completed.status_code,
+          static_cast<double>(std::max<long long>(0, monotonic_ms_now() - completed.request_start_ms)));
       return true;
     }
 #endif
