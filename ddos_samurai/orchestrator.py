@@ -1840,8 +1840,10 @@ async def worker_process(
             if not real_src_ip: real_src_ip = "192.168.1.100"
             real_src_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(real_src_ip.split('.'))]))
             traffic_model_sessions = list(args.get("traffic_model_sessions", []) or [])
+            scenario_sessions = list(args.get("scenario_sessions", []) or [])
             traffic_model_mode = str(args.get("traffic_model", "none") or "none").strip().lower()
             traffic_model_enabled = traffic_model_mode != "none" and len(traffic_model_sessions) > 0
+            scenario_enabled = len(scenario_sessions) > 0
 
             def _iter_model_plans():
                 for session_plan in traffic_model_sessions:
@@ -1853,6 +1855,15 @@ async def worker_process(
                     if int(len(getattr(rp, "items", []) or [])) > 0:
                         yield rp
             traffic_model_request_plans = list(_iter_model_plans()) if traffic_model_enabled else []
+            if scenario_enabled:
+                for session_plan in scenario_sessions:
+                    try:
+                        rp = gpu_cuda_payload.build_request_plan_from_session_plan(session_plan)
+                    except _RECOVERABLE_ERRORS as exc:
+                        _debug_exception(f"[Worker {worker_id}] scenario request-plan build failed", exc)
+                        continue
+                    if int(len(getattr(rp, "items", []) or [])) > 0:
+                        traffic_model_request_plans.append(rp)
             _l7_custom_tcp_mode = str(args.get("custom_tcp_mode", "off") or "off").strip().lower()
             _l7_transport_backend = "custom_tcp"
             _l7_custom_tcp_rx_interface = str(

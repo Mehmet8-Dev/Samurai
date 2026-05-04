@@ -410,6 +410,7 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
     l7_scope = _infer_l7_scope(results, quic_scope=quic_scope)
     txring_scope = _infer_txring_scope(results)
     persistent_stream_scope = _infer_persistent_stream_scope(results) or str(profile).strip().lower() == "persistent_stream_strict"
+    scenario_scope = isinstance(results, dict) and "scenario_summary" in results
     dedicated_strict = str(profile or "").strip().lower() != "off"
     rules: List[KpiGateRule] = [
         KpiGateRule("run_quality", "run_quality", "eq", gates.get("run_quality", "valid"), required=True),
@@ -624,6 +625,32 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
                 int(gates.get("stateful_runtime_preflight_xdp_enabled_required", 0) or 0),
                 required=bool(dedicated_strict and l7_scope),
             )
+        )
+    if scenario_scope:
+        rules.extend(
+            [
+                KpiGateRule(
+                    "scenario_vu_ramp_accuracy_pct",
+                    "scenario_vu_ramp_accuracy_pct",
+                    "min",
+                    float(gates.get("scenario_vu_ramp_accuracy_pct_min", 90.0) or 90.0),
+                    required=True,
+                ),
+                KpiGateRule(
+                    "scenario_session_completion_rate",
+                    "scenario_session_completion_rate",
+                    "min",
+                    float(gates.get("scenario_session_completion_rate_min", 0.95) or 0.95),
+                    required=True,
+                ),
+                KpiGateRule(
+                    "scenario_step_fail_ratio",
+                    "scenario_step_fail_ratio",
+                    "max",
+                    float(gates.get("scenario_step_fail_ratio_max", 0.05) or 0.05),
+                    required=True,
+                ),
+            ]
         )
     runtime_transport_backend_required = str(gates.get("runtime_transport_backend_required", "") or "").strip()
     if runtime_transport_backend_required:
