@@ -5,6 +5,7 @@ from pathlib import Path
 from ddos_samurai.scenario_engine import load_raw_scenario, load_scenario_spec
 from ddos_samurai.scenario_engine import native as scenario_native
 from ddos_samurai.scenario_engine.runtime import (
+    RampController,
     build_vu_lifecycle_batches,
     collect_per_flow_metrics,
     simulate_vu_state_machine,
@@ -253,3 +254,25 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         )
         self.assertTrue(ev.passed)
         self.assertEqual(ev.reasons, [])
+
+    def test_ramp_controller_curves(self):
+        linear = RampController(target_vus=100, ramp_seconds=10, curve="linear")
+        step = RampController(target_vus=100, ramp_seconds=10, curve="step", step_interval_s=2)
+        spike = RampController(target_vus=100, ramp_seconds=10, curve="spike")
+        custom = RampController(target_vus=100, ramp_seconds=10, curve="custom", custom_points=((0.0, 0), (3.0, 30), (10.0, 100)))
+        self.assertGreaterEqual(linear.active_vus_at(5.0), 45)
+        self.assertLessEqual(step.active_vus_at(1.0), 5)
+        self.assertGreaterEqual(spike.active_vus_at(2.0), 65)
+        self.assertGreaterEqual(custom.active_vus_at(3.0), 30)
+
+    def test_lifecycle_batches_with_step_curve(self):
+        sessions = [{"events": [{"event_type": "http_request", "method": "GET", "path": "/"}]} for _ in range(20)]
+        batches, _ = build_vu_lifecycle_batches(
+            scenario_sessions=sessions,
+            ramp_seconds=10,
+            max_session_seconds=30,
+            seed=7,
+            ramp_curve="step",
+            ramp_step_interval_s=2,
+        )
+        self.assertTrue(len(batches) > 0)
