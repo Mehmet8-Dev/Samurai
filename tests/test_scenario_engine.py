@@ -4,7 +4,11 @@ from pathlib import Path
 
 from ddos_samurai.scenario_engine import load_raw_scenario, load_scenario_spec
 from ddos_samurai.scenario_engine import native as scenario_native
-from ddos_samurai.scenario_engine.runtime import build_vu_lifecycle_batches
+from ddos_samurai.scenario_engine.runtime import (
+    build_vu_lifecycle_batches,
+    collect_per_flow_metrics,
+    simulate_vu_state_machine,
+)
 from ddos_samurai.scenario_engine.types import ScenarioSpec
 
 
@@ -177,3 +181,21 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         delays = [float(b.delay_s) for b in batches]
         self.assertTrue(any(d >= 1.0 for d in delays))
         self.assertEqual(int(metrics["vus_spawned"]), 2)
+
+    def test_state_machine_feedback_and_per_flow_metrics(self):
+        sessions = [
+            {"flow": "a", "events": [{"event_type": "http_request"}, {"event_type": "think_time", "min_ms": 10, "max_ms": 10}]},
+            {"flow": "a", "events": [{"event_type": "http_request"}]},
+            {"flow": "b", "events": [{"event_type": "http2_headers"}]},
+        ]
+        vus = simulate_vu_state_machine(
+            scenario_sessions=sessions,
+            observed_error_ratio=0.2,
+            observed_timeout_ratio=0.1,
+            seed=42,
+        )
+        self.assertEqual(len(vus), 3)
+        per_flow = collect_per_flow_metrics(vus, duration_s=2.0)
+        self.assertIn("a", per_flow)
+        self.assertIn("b", per_flow)
+        self.assertIn("session_completion_rate", per_flow["a"])

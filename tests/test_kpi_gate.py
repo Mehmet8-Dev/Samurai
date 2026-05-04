@@ -250,6 +250,9 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
         results["scenario_vu_ramp_accuracy_pct"] = 95.0
         results["scenario_session_completion_rate"] = 0.99
         results["scenario_step_fail_ratio"] = 0.01
+        results["scenario_flow_min_completion_rate"] = 0.95
+        results["scenario_flow_max_step_fail_ratio"] = 0.02
+        results["scenario_flow_coverage_pct"] = 100.0
         out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
         self.assertIn(out.status, {"pass", "warn"})
 
