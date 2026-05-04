@@ -64,6 +64,15 @@ struct RuntimeCapabilities {
   bool nghttp3{false};
 };
 
+struct ScenarioStepResult {
+  std::string flow;
+  std::string vu_id;
+  bool success{false};
+  bool timeout{false};
+  int status_code{0};
+  std::string protocol;
+};
+
 enum class ReactorBackend {
   SocketEpoll = 0,
 };
@@ -157,6 +166,7 @@ struct ShardState {
 
 RuntimeCapabilities detect_capabilities();
 std::map<std::string, double> run_profile(const Profile& profile, const RuntimeConfig& cfg);
+std::vector<ScenarioStepResult> consume_last_scenario_step_results();
 
 namespace custom_quic_stack {
 std::map<std::string, double> run_quic_profile(

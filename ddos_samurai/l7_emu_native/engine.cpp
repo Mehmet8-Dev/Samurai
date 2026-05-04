@@ -214,6 +214,8 @@ struct H1RequestSpec {
   CompiledCaptureTemplate path_template{};
   std::vector<std::pair<std::string, CompiledCaptureTemplate>> compiled_header_values{};
   std::optional<CompiledCaptureTemplate> body_template{};
+  std::string scenario_flow{};
+  std::string scenario_vu_id{};
 };
 
 enum class H1LanePhase {
@@ -355,6 +357,8 @@ struct H2RequestSpec {
   CompiledCaptureTemplate path_template{};
   std::vector<std::pair<std::string, CompiledCaptureTemplate>> compiled_headers{};
   std::optional<CompiledCaptureTemplate> body_template{};
+  std::string scenario_flow{};
+  std::string scenario_vu_id{};
 };
 
 struct H2CompletedStream {
@@ -367,6 +371,8 @@ struct H2CompletedStream {
   int expectation_failures{0};
   bool success{false};
   bool rst_stream{false};
+  std::string scenario_flow{};
+  std::string scenario_vu_id{};
 };
 
 struct H1CompletedRequest {
@@ -383,6 +389,8 @@ struct H1CompletedRequest {
   std::size_t tx_bytes{0};
   std::size_t rx_bytes{0};
   bool success{false};
+  std::string scenario_flow{};
+  std::string scenario_vu_id{};
 };
 
 enum class ConnectionDispositionAction {
@@ -495,6 +503,45 @@ long long monotonic_ms_now();
 void enqueue_ready_shard(NativeRuntime& runtime, std::size_t shard_idx);
 
 thread_local DataplanePerfStats* g_perf_stats = nullptr;
+thread_local std::vector<ScenarioStepResult> g_last_scenario_step_results{};
+
+const std::string* find_scenario_header(
+    const std::map<std::string, std::string>& headers,
+    const char* needle) {
+  if (needle == nullptr) {
+    return nullptr;
+  }
+  auto to_lower_ascii = [](std::string s) {
+    for (char& c : s) {
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+  };
+  const std::string wanted = to_lower_ascii(std::string(needle));
+  for (const auto& [k, v] : headers) {
+    if (to_lower_ascii(k) == wanted) {
+      return &v;
+    }
+  }
+  return nullptr;
+}
+
+void record_scenario_step_result(
+    const std::string& protocol,
+    const std::string& flow,
+    const std::string& vu_id,
+    bool success,
+    bool timeout,
+    int status_code) {
+  ScenarioStepResult row;
+  row.protocol = protocol;
+  row.flow = flow.empty() ? std::string("unknown") : flow;
+  row.vu_id = vu_id;
+  row.success = success;
+  row.timeout = timeout;
+  row.status_code = status_code;
+  g_last_scenario_step_results.push_back(std::move(row));
+}
 
 void unregister_custom_tcp_flow_binding(NativeRuntime& runtime, uint64_t flow_id) {
   if (flow_id == 0) {
@@ -838,6 +885,8 @@ struct H2StreamState {
   std::string response_body;
   std::vector<FlowOp> follow_ops;
   bool completed{false};
+  std::string scenario_flow;
+  std::string scenario_vu_id;
 };
 
 struct H2ConnectionContext {
@@ -1567,6 +1616,8 @@ void enqueue_ready_h1_lane(
   completed.tx_bytes = lane.tx_bytes;
   completed.rx_bytes = lane.rx_bytes;
   completed.success = lane.phase != H1LanePhase::Failed && lane.response.status_code > 0;
+  completed.scenario_flow = lane.request_spec.scenario_flow;
+  completed.scenario_vu_id = lane.request_spec.scenario_vu_id;
   runtime.ready_completions.push_back(CompletionEnvelope{
       CompletionKind::H1,
       shard_idx,
@@ -2858,6 +2909,12 @@ std::vector<H1RequestSpec> build_h1_requests(const Profile& profile) {
       spec.header_fields.emplace_back(key, value);
       spec.compiled_header_values.emplace_back(key, compile_capture_template(value));
     }
+    if (const std::string* f = find_scenario_header(op.headers, "x-scenario-flow")) {
+      spec.scenario_flow = *f;
+    }
+    if (const std::string* v = find_scenario_header(op.headers, "x-scenario-vu-id")) {
+      spec.scenario_vu_id = *v;
+    }
     std::size_t j = idx + 1;
     if (j < profile.ops.size() && profile.ops[j].opcode == "SEND_BODY") {
       spec.body_op = profile.ops[j];
@@ -2906,6 +2963,8 @@ std::vector<H2RequestSpec> build_h2_requests(const Profile& profile) {
     }
     spec.body_template = h1_spec.body_template;
     spec.follow_ops = h1_spec.follow_ops;
+    spec.scenario_flow = h1_spec.scenario_flow;
+    spec.scenario_vu_id = h1_spec.scenario_vu_id;
     requests.push_back(std::move(spec));
   }
   return requests;
@@ -3363,6 +3422,8 @@ int h2_on_stream_close_callback(
   completed.response_headers = std::move(stream.response_headers);
   completed.response_header_fields = std::move(stream.response_header_fields);
   completed.response_body = std::move(stream.response_body);
+  completed.scenario_flow = std::move(stream.scenario_flow);
+  completed.scenario_vu_id = std::move(stream.scenario_vu_id);
   if (error_code != NGHTTP2_NO_ERROR) {
     ctx->protocol_error = 1;
     ctx->rst_stream += 1;
@@ -3643,6 +3704,8 @@ bool submit_h2_request(
       stream->response_body,
       std::max<std::size_t>(response_reserve, kH2SlabResponseBodyBytes));
   stream->follow_ops = raw_request.follow_ops;
+  stream->scenario_flow = raw_request.scenario_flow;
+  stream->scenario_vu_id = raw_request.scenario_vu_id;
 
   std::vector<nghttp2_nv> hdrs;
   hdrs.reserve(4 + stream->request_header_count);
@@ -4102,6 +4165,8 @@ std::map<std::string, double> run_http2_profile(
   };
 
   auto finalize_h2_stream = [&](const H2CompletedStream& completed) {
+    const bool ok = !(completed.rst_stream || !completed.success || completed.status_code <= 0) &&
+                    completed.expectation_failures == 0;
     stats.expectation_failures += completed.expectation_failures;
     if (completed.rst_stream || !completed.success || completed.status_code <= 0) {
       stats.errors += 1;
@@ -4117,6 +4182,13 @@ std::map<std::string, double> run_http2_profile(
     } else if (completed.status_code >= 500 && completed.status_code <= 599) {
       stats.status_5xx += 1;
     }
+    record_scenario_step_result(
+        "http2",
+        completed.scenario_flow,
+        completed.scenario_vu_id,
+        ok,
+        completed.status_code <= 0,
+        completed.status_code);
     return CompletionDispositionDecision{};
   };
 
@@ -4401,6 +4473,7 @@ RuntimeCapabilities detect_capabilities() {
 }
 
 std::map<std::string, double> run_profile(const Profile& profile, const RuntimeConfig& cfg) {
+  g_last_scenario_step_results.clear();
   const RuntimeCapabilities caps = detect_capabilities();
   const TransportBackend transport_backend = parse_transport_backend(profile);
   if (profile.protocol == "quic") {
@@ -4551,6 +4624,13 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
 
     if (!completed.success || completed.status_code <= 0) {
       expectation_failures += std::max(1, completed.expectation_failures + (completed.status_code <= 0 ? 1 : 0));
+      record_scenario_step_result(
+          "http1",
+          completed.scenario_flow,
+          completed.scenario_vu_id,
+          false,
+          completed.status_code <= 0,
+          completed.status_code);
       return CompletionDispositionDecision{
           ConnectionDispositionAction::Close,
           completed.lane_idx,
@@ -4604,6 +4684,13 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
 
     expectation_failures += lane.expectation_failures;
     sent += 1;
+    record_scenario_step_result(
+        "http1",
+        completed.scenario_flow,
+        completed.scenario_vu_id,
+        lane.expectation_failures == 0,
+        false,
+        completed.status_code);
     perf_request_latency(
         static_cast<double>(std::max<long long>(0, now_ms - completed.request_start_ms)),
         cfg.profile_sample_limit);
@@ -4680,6 +4767,8 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
 #ifdef SAMURAI_WITH_NGHTTP2
     if (completion.kind == CompletionKind::H2 && completion.h2_completed.has_value()) {
       const H2CompletedStream& completed = *completion.h2_completed;
+      const bool ok = !(completed.rst_stream || !completed.success || completed.status_code <= 0) &&
+                      completed.expectation_failures == 0;
       expectation_failures += completed.expectation_failures;
       if (completed.rst_stream || !completed.success || completed.status_code <= 0) {
         status_4xx += completed.status_code >= 400 && completed.status_code <= 499 ? 1 : 0;
@@ -4696,6 +4785,13 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
           status_5xx += 1;
         }
       }
+      record_scenario_step_result(
+          "http2",
+          completed.scenario_flow,
+          completed.scenario_vu_id,
+          ok,
+          completed.status_code <= 0,
+          completed.status_code);
       return true;
     }
 #endif
@@ -4801,6 +4897,12 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
   out["l7_rx_bytes"] = static_cast<double>(rx_bytes);
   out["l7_tx_bytes"] = static_cast<double>(tx_bytes);
   out["l7_expectation_failures"] = static_cast<double>(expectation_failures);
+  return out;
+}
+
+std::vector<ScenarioStepResult> consume_last_scenario_step_results() {
+  std::vector<ScenarioStepResult> out = std::move(g_last_scenario_step_results);
+  g_last_scenario_step_results.clear();
   return out;
 }
 
