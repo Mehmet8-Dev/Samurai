@@ -191,6 +191,28 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         events = list(out.get("events", []) or [])
         self.assertTrue(any(dict(ev or {}).get("event_type") == "think_time" for ev in events))
 
+    def test_native_compiler_packed_mode(self):
+        try:
+            scenario_native.require_native()
+        except RuntimeError:
+            self.skipTest("scenario native module unavailable")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "pause.yaml"
+            p.write_text(_WITH_PAUSE_YAML, encoding="utf-8")
+            spec = load_raw_scenario(str(p))
+        out = scenario_native.compile_session_plan_packed(spec, "browse", 7)
+        self.assertTrue(bool(out.get("packed", False)))
+        self.assertIn("event_kind", out)
+        self.assertGreaterEqual(len(list(out.get("event_kind", []) or [])), 1)
+        batches, metrics = build_vu_lifecycle_batches(
+            scenario_sessions=[out],
+            ramp_seconds=0,
+            max_session_seconds=30,
+            seed=7,
+        )
+        self.assertTrue(len(batches) > 0)
+        self.assertGreaterEqual(int(metrics.get("step_attempted", 0) or 0), 1)
+
     def test_vu_lifecycle_batches_apply_ramp_and_think_time(self):
         sessions = [
             {
