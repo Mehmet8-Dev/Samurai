@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ddos_samurai.scenario_engine import load_raw_scenario, load_scenario_spec
 from ddos_samurai.scenario_engine import native as scenario_native
+from ddos_samurai.scenario_engine.runtime import build_vu_lifecycle_batches
 from ddos_samurai.scenario_engine.types import ScenarioSpec
 
 
@@ -149,3 +150,30 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         out = scenario_native.compile_session_plan(spec, "browse", 7)
         events = list(out.get("events", []) or [])
         self.assertTrue(any(dict(ev or {}).get("event_type") == "think_time" for ev in events))
+
+    def test_vu_lifecycle_batches_apply_ramp_and_think_time(self):
+        sessions = [
+            {
+                "events": [
+                    {"event_type": "http_request", "method": "GET", "path": "/"},
+                    {"event_type": "think_time", "min_ms": 100, "max_ms": 100},
+                    {"event_type": "http_request", "method": "GET", "path": "/x"},
+                ]
+            },
+            {
+                "events": [
+                    {"event_type": "http_request", "method": "GET", "path": "/y"},
+                ]
+            },
+        ]
+        batches, metrics = build_vu_lifecycle_batches(
+            scenario_sessions=sessions,
+            ramp_seconds=2,
+            max_session_seconds=10,
+            seed=123,
+            bucket_ms=50,
+        )
+        self.assertGreaterEqual(len(batches), 2)
+        delays = [float(b.delay_s) for b in batches]
+        self.assertTrue(any(d >= 1.0 for d in delays))
+        self.assertEqual(int(metrics["vus_spawned"]), 2)
