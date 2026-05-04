@@ -481,6 +481,9 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 _flow_min_completion_vals = []
                 _flow_max_fail_vals = []
                 _flow_cov_vals = []
+                _flow_p50_vals = []
+                _flow_p95_vals = []
+                _flow_p99_vals = []
                 for ev in events_local:
                     st = dict((ev or {}).get("stats", {}) or {})
                     if "scenario_flow_min_completion_rate" in st:
@@ -489,12 +492,24 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                         _flow_max_fail_vals.append(float(st.get("scenario_flow_max_step_fail_ratio", 0.0) or 0.0))
                     if "scenario_flow_coverage_pct" in st:
                         _flow_cov_vals.append(float(st.get("scenario_flow_coverage_pct", 0.0) or 0.0))
+                    if "scenario_flow_latency_p50_ms" in st:
+                        _flow_p50_vals.append(float(st.get("scenario_flow_latency_p50_ms", 0.0) or 0.0))
+                    if "scenario_flow_latency_p95_ms" in st:
+                        _flow_p95_vals.append(float(st.get("scenario_flow_latency_p95_ms", 0.0) or 0.0))
+                    if "scenario_flow_latency_p99_ms" in st:
+                        _flow_p99_vals.append(float(st.get("scenario_flow_latency_p99_ms", 0.0) or 0.0))
                 if _flow_min_completion_vals:
                     rr.results["scenario_flow_min_completion_rate"] = float(min(_flow_min_completion_vals))
                 if _flow_max_fail_vals:
                     rr.results["scenario_flow_max_step_fail_ratio"] = float(max(_flow_max_fail_vals))
                 if _flow_cov_vals:
                     rr.results["scenario_flow_coverage_pct"] = float(sum(_flow_cov_vals) / max(1, len(_flow_cov_vals)))
+                if _flow_p50_vals:
+                    rr.results["scenario_flow_latency_p50_ms"] = float(sum(_flow_p50_vals) / max(1, len(_flow_p50_vals)))
+                if _flow_p95_vals:
+                    rr.results["scenario_flow_latency_p95_ms"] = float(sum(_flow_p95_vals) / max(1, len(_flow_p95_vals)))
+                if _flow_p99_vals:
+                    rr.results["scenario_flow_latency_p99_ms"] = float(sum(_flow_p99_vals) / max(1, len(_flow_p99_vals)))
             if soak_cfg is not None:
                 rr.results["soak_profile"] = str(soak_cfg.get("profile", "custom"))
                 rr.results["soak_passed"] = bool((monitor_summary or {}).get("passed", False))
