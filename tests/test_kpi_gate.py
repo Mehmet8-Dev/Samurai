@@ -237,6 +237,22 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
         self.assertEqual(out.status, "pass")
         self.assertEqual(out.hard_fail, 0)
 
+    def test_scenario_scope_fails_when_scenario_metrics_missing(self):
+        results = self._base_results()
+        results["scenario_summary"] = {"mode": "enforce"}
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertEqual(out.status, "fail")
+        self.assertTrue(any(v.startswith("scenario_vu_ramp_accuracy_pct:missing_metric") for v in out.violations))
+
+    def test_scenario_scope_passes_with_good_metrics(self):
+        results = self._base_results()
+        results["scenario_summary"] = {"mode": "enforce"}
+        results["scenario_vu_ramp_accuracy_pct"] = 95.0
+        results["scenario_session_completion_rate"] = 0.99
+        results["scenario_step_fail_ratio"] = 0.01
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertIn(out.status, {"pass", "warn"})
+
 
 if __name__ == "__main__":
     unittest.main()
