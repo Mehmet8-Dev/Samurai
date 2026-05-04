@@ -52,6 +52,7 @@ def _scenario_step_results_from_plan(
                 "vu_id": vu_id,
                 "success": bool(ok),
                 "timeout": bool(is_timeout),
+                "latency_ms": 0.0,
             }
         )
     return out

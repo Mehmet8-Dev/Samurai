@@ -66,6 +66,7 @@ def _scenario_step_results_from_plan(request_plan: Any, sent: int, errors: int, 
                 "vu_id": str(headers.get("x-scenario-vu-id", "") or ""),
                 "success": bool(idx < success_count),
                 "timeout": bool(idx >= success_count and fail_idx >= 0 and fail_idx < timeout_budget),
+                "latency_ms": 0.0,
             }
         )
     return out
