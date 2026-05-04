@@ -541,11 +541,23 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 observed_timeout_ratio = float(
                     rr.results.get("quic_connect_timeout_count", 0) or 0
                 ) / float(max(1, int(rr.results.get("attempted_total", 0) or 0)))
+                flow_policies = {}
+                for fname, flow in dict((scenario_spec.flows or {})).items():
+                    persona = scenario_spec.personas.get(flow.persona) if scenario_spec.personas else None
+                    rp = dict(getattr(persona, "retry_policy", {}) or {})
+                    tp = dict(getattr(persona, "timeout_policy", {}) or {})
+                    flow_policies[str(fname)] = {
+                        "max_retries": int(rp.get("max_retries", 1) or 1),
+                        "backoff_base_ms": int(rp.get("backoff_base_ms", 50) or 50),
+                        "backoff_max_ms": int(rp.get("backoff_max_ms", 2000) or 2000),
+                        "timeout_action": str(tp.get("on_timeout", "retry") or "retry").strip().lower(),
+                    }
                 vu_pool = scenario_engine.VUPool(
                     scenario_sessions=all_scenario_sessions,
                     ramp_seconds=int(getattr(args, "scenario_ramp_seconds", 0) or 0) or int((scenario_build_metrics or {}).get("scenario_ramp_seconds", 0) or 0),
                     max_session_seconds=int(getattr(args, "scenario_max_session_seconds", 0) or 0) or int(scenario_spec.load_model.max_session_seconds),
                     ramp_curve="linear",
+                    flow_policies=flow_policies,
                 )
                 vu_snapshots = vu_pool.drive_with_observed_ratios(
                     observed_error_ratio=observed_error_ratio,
