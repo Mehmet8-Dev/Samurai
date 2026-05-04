@@ -591,6 +591,18 @@ def get_extensions() -> List[Extension]:
     )
     extensions.append(cpu_packet_engine_native)
 
+    scenario_native = Extension(
+        "ddos_samurai._scenario_native",
+        sources=[
+            "ddos_samurai/scenario_engine_native/module.cpp",
+        ],
+        include_dirs=[pybind11_include],
+        language="c++",
+        extra_compile_args=["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"],
+        extra_link_args=["-lpthread", "-lm"],
+    )
+    extensions.append(scenario_native)
+
     l7_compile_args, l7_link_args, l7_macros = _resolve_l7_flags()
     l7_emu_native = Extension(
         "ddos_samurai._l7_emu_native",
