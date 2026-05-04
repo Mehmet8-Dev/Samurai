@@ -86,6 +86,9 @@ def build_vu_lifecycle_batches(
     max_session_seconds: int,
     seed: int,
     bucket_ms: int = 50,
+    ramp_curve: str = "linear",
+    ramp_step_interval_s: int = 1,
+    ramp_custom_points: list[tuple[float, int]] | None = None,
 ) -> tuple[list[ScheduledRequestBatch], dict[str, Any]]:
     sessions = list(scenario_sessions or [])
     if not sessions:
@@ -107,9 +110,17 @@ def build_vu_lifecycle_batches(
 
     vu_expected_steps: dict[str, int] = {}
     vu_flow: dict[str, str] = {}
+    rc = RampController(
+        target_vus=total_sessions,
+        ramp_seconds=ramp_s,
+        curve=str(ramp_curve or "linear"),
+        step_interval_s=max(1, int(ramp_step_interval_s or 1)),
+        custom_points=tuple((ramp_custom_points or [])),
+    )
+    spawn_schedule = rc.spawn_schedule()
     for si, session in enumerate(sessions):
         vu_id = si + 1
-        spawn_at = 0.0 if total_sessions <= 1 else (float(ramp_s) * float(si) / float(total_sessions - 1))
+        spawn_at = float(spawn_schedule[si]) if si < len(spawn_schedule) else 0.0
         t = spawn_at
         deadline = spawn_at + float(max_sess_s)
         events = list((session or {}).get("events", []) or [])
@@ -259,3 +270,64 @@ def collect_per_flow_metrics(vus: list[VirtualUserSnapshot], duration_s: float) 
             "conn_rate": float(row.sessions_total / d),
         }
     return by_flow
+@dataclass(frozen=True)
+class RampController:
+    target_vus: int
+    ramp_seconds: int
+    curve: str = "linear"
+    step_interval_s: int = 1
+    custom_points: tuple[tuple[float, int], ...] = ()
+
+    def active_vus_at(self, elapsed_s: float) -> int:
+        total = max(1, int(self.target_vus))
+        ramp = max(0.0, float(self.ramp_seconds))
+        t = max(0.0, float(elapsed_s))
+        mode = str(self.curve or "linear").strip().lower()
+        if ramp <= 0.0:
+            return total
+        if mode == "step":
+            iv = max(1, int(self.step_interval_s or 1))
+            steps = max(1, int(ramp // float(iv)))
+            done = min(steps, int(t // float(iv)))
+            return min(total, max(1, int((done * total) / max(1, steps))))
+        if mode == "spike":
+            # Fast front-load: reach 70% by first 20% of ramp window.
+            if t >= ramp:
+                return total
+            p = t / ramp
+            if p <= 0.2:
+                return min(total, max(1, int(total * (0.7 * (p / 0.2)))))
+            return min(total, max(1, int(total * (0.7 + (0.3 * ((p - 0.2) / 0.8))))))
+        if mode == "custom" and self.custom_points:
+            pts = sorted([(max(0.0, float(x[0])), max(0, int(x[1]))) for x in self.custom_points], key=lambda x: x[0])
+            if t <= pts[0][0]:
+                return min(total, pts[0][1])
+            for i in range(1, len(pts)):
+                t0, v0 = pts[i - 1]
+                t1, v1 = pts[i]
+                if t <= t1:
+                    if t1 <= t0:
+                        return min(total, v1)
+                    frac = (t - t0) / (t1 - t0)
+                    return min(total, max(0, int(v0 + ((v1 - v0) * frac))))
+            return min(total, pts[-1][1])
+        # linear default
+        return min(total, max(1, int(total * min(1.0, t / ramp))))
+
+    def spawn_schedule(self) -> list[float]:
+        total = max(1, int(self.target_vus))
+        if total == 1:
+            return [0.0]
+        out: list[float] = []
+        last = 0
+        horizon = max(1, int(max(1, self.ramp_seconds) * 1000))
+        for ms in range(0, horizon + 1):
+            active = self.active_vus_at(float(ms) / 1000.0)
+            while last < active and len(out) < total:
+                out.append(float(ms) / 1000.0)
+                last += 1
+            if len(out) >= total:
+                break
+        while len(out) < total:
+            out.append(float(max(0, self.ramp_seconds)))
+        return out

@@ -1,6 +1,7 @@
 from .parser import load_raw_scenario, load_scenario_spec
 from .native import build_worker_session_plans, evaluate_sla, compile_session_plan, require_native
 from .runtime import (
+    RampController,
     build_vu_lifecycle_batches,
     collect_per_flow_metrics,
     deserialize_batches,
@@ -18,6 +19,7 @@ __all__ = [
     "compile_session_plan",
     "require_native",
     "build_vu_lifecycle_batches",
+    "RampController",
     "deserialize_batches",
     "serialize_batches",
     "simulate_vu_state_machine",
