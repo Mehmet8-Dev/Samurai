@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import random
 from typing import Any
 
@@ -11,6 +12,27 @@ from ..gpu_cuda_payload import H2RequestPlan, H2RequestPlanItem
 class ScheduledRequestBatch:
     delay_s: float
     request_plan: H2RequestPlan
+
+
+class VUState(str, Enum):
+    QUEUED = "queued"
+    INITIALIZING = "initializing"
+    RUNNING = "running"
+    THINK_TIME = "think_time"
+    RETRYING = "retrying"
+    FAILED = "failed"
+    COMPLETED = "completed"
+
+
+@dataclass(frozen=True)
+class VirtualUserSnapshot:
+    vu_id: int
+    flow: str
+    state: VUState
+    step_attempted: int
+    step_failed: int
+    retries_used: int
+    timeout_count: int
 
 
 def _as_item_dict(item: H2RequestPlanItem) -> dict[str, Any]:
@@ -82,11 +104,19 @@ def build_vu_lifecycle_batches(
     step_failed = 0
     active_markers: list[tuple[float, int]] = []
 
+    vu_expected_steps: dict[str, int] = {}
+    vu_flow: dict[str, str] = {}
     for si, session in enumerate(sessions):
+        vu_id = si + 1
         spawn_at = 0.0 if total_sessions <= 1 else (float(ramp_s) * float(si) / float(total_sessions - 1))
         t = spawn_at
         deadline = spawn_at + float(max_sess_s)
         events = list((session or {}).get("events", []) or [])
+        flow = str((session or {}).get("flow", "unknown") or "unknown")
+        vu_flow[str(vu_id)] = flow
+        vu_expected_steps[str(vu_id)] = int(
+            sum(1 for ev in events if str((ev or {}).get("event_type", "") or "").strip().lower() in {"http_request", "http2_headers"})
+        )
         active_markers.append((spawn_at, +1))
         for ev in events:
             et = str((ev or {}).get("event_type", "") or "").strip().lower()
@@ -105,6 +135,8 @@ def build_vu_lifecycle_batches(
             path = str((ev or {}).get("path", "/") or "/")
             headers = dict((ev or {}).get("headers") or {})
             retry_count = max(0, int((ev or {}).get("retry_count", 0) or 0))
+            headers["x-scenario-flow"] = flow
+            headers["x-scenario-vu-id"] = str(vu_id)
             key = int((t * 1000.0) // bucket)
             timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
             # Model retry lifecycle deterministically as future attempts in plan timeline.
@@ -138,5 +170,96 @@ def build_vu_lifecycle_batches(
         "vus_active_peak": int(active_peak),
         "step_attempted": int(step_attempted),
         "step_failed": int(step_failed),
+        "vu_expected_steps": dict(vu_expected_steps),
+        "vu_flow": dict(vu_flow),
     }
     return batches, metrics
+
+
+def simulate_vu_state_machine(
+    *,
+    scenario_sessions: list[dict[str, Any]],
+    observed_error_ratio: float,
+    observed_timeout_ratio: float,
+    seed: int,
+) -> list[VirtualUserSnapshot]:
+    rng = random.Random(int(seed))
+    out: list[VirtualUserSnapshot] = []
+    for i, sess in enumerate(list(scenario_sessions or []), start=1):
+        flow = str((sess or {}).get("flow", "unknown") or "unknown")
+        events = list((sess or {}).get("events", []) or [])
+        attempted = 0
+        failed = 0
+        retries = 0
+        timeouts = 0
+        state = VUState.QUEUED
+        state = VUState.INITIALIZING
+        state = VUState.RUNNING
+        for ev in events:
+            et = str((ev or {}).get("event_type", "") or "").strip().lower()
+            if et == "think_time":
+                state = VUState.THINK_TIME
+                state = VUState.RUNNING
+                continue
+            if et not in {"http_request", "http2_headers"}:
+                continue
+            attempted += 1
+            if rng.random() < max(0.0, min(1.0, observed_timeout_ratio)):
+                timeouts += 1
+                failed += 1
+                state = VUState.RETRYING
+                retries += 1
+                continue
+            if rng.random() < max(0.0, min(1.0, observed_error_ratio)):
+                failed += 1
+                state = VUState.RETRYING
+                retries += 1
+                continue
+            state = VUState.RUNNING
+        if failed > 0 and attempted == failed:
+            state = VUState.FAILED
+        else:
+            state = VUState.COMPLETED
+        out.append(
+            VirtualUserSnapshot(
+                vu_id=i,
+                flow=flow,
+                state=state,
+                step_attempted=attempted,
+                step_failed=failed,
+                retries_used=retries,
+                timeout_count=timeouts,
+            )
+        )
+    return out
+
+
+def collect_per_flow_metrics(vus: list[VirtualUserSnapshot], duration_s: float) -> dict[str, dict[str, float]]:
+    by_flow: dict[str, dict[str, float]] = {}
+    for vu in list(vus or []):
+        row = by_flow.setdefault(
+            vu.flow,
+            {
+                "sessions": 0.0,
+                "completed": 0.0,
+                "failed": 0.0,
+                "step_attempted": 0.0,
+                "step_failed": 0.0,
+                "retries_used": 0.0,
+                "timeouts": 0.0,
+                "conn_rate": 0.0,
+            },
+        )
+        row["sessions"] += 1.0
+        row["completed"] += 1.0 if vu.state == VUState.COMPLETED else 0.0
+        row["failed"] += 1.0 if vu.state == VUState.FAILED else 0.0
+        row["step_attempted"] += float(vu.step_attempted)
+        row["step_failed"] += float(vu.step_failed)
+        row["retries_used"] += float(vu.retries_used)
+        row["timeouts"] += float(vu.timeout_count)
+    d = max(0.001, float(duration_s or 0.001))
+    for row in by_flow.values():
+        row["session_completion_rate"] = float(row["completed"] / max(1.0, row["sessions"]))
+        row["step_fail_ratio"] = float(row["step_failed"] / max(1.0, row["step_attempted"]))
+        row["conn_rate"] = float(row["sessions"] / d)
+    return by_flow
