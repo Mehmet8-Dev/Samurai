@@ -476,6 +476,25 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             rr.results["traffic_model_event_count"] = int(runtime_ctx.get("event_count", 0) or 0)
             rr.results["traffic_model_fallback_used"] = int(bool(runtime_ctx.get("fallback_used", False)))
             rr.results["traffic_model_fallback_reason"] = str(runtime_ctx.get("fallback_reason", "none") or "none")
+            # Scenario closed-loop flow aggregates from worker stats
+            if scenario_enabled:
+                _flow_min_completion_vals = []
+                _flow_max_fail_vals = []
+                _flow_cov_vals = []
+                for ev in events_local:
+                    st = dict((ev or {}).get("stats", {}) or {})
+                    if "scenario_flow_min_completion_rate" in st:
+                        _flow_min_completion_vals.append(float(st.get("scenario_flow_min_completion_rate", 0.0) or 0.0))
+                    if "scenario_flow_max_step_fail_ratio" in st:
+                        _flow_max_fail_vals.append(float(st.get("scenario_flow_max_step_fail_ratio", 0.0) or 0.0))
+                    if "scenario_flow_coverage_pct" in st:
+                        _flow_cov_vals.append(float(st.get("scenario_flow_coverage_pct", 0.0) or 0.0))
+                if _flow_min_completion_vals:
+                    rr.results["scenario_flow_min_completion_rate"] = float(min(_flow_min_completion_vals))
+                if _flow_max_fail_vals:
+                    rr.results["scenario_flow_max_step_fail_ratio"] = float(max(_flow_max_fail_vals))
+                if _flow_cov_vals:
+                    rr.results["scenario_flow_coverage_pct"] = float(sum(_flow_cov_vals) / max(1, len(_flow_cov_vals)))
             if soak_cfg is not None:
                 rr.results["soak_profile"] = str(soak_cfg.get("profile", "custom"))
                 rr.results["soak_passed"] = bool((monitor_summary or {}).get("passed", False))
@@ -514,6 +533,32 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     "step_failed": step_failed,
                     **sla_detail,
                 }
+                all_scenario_sessions = []
+                for xs in list(scenario_sessions_by_worker or []):
+                    all_scenario_sessions.extend(list(xs or []))
+                observed_error_ratio = float(step_failed / max(1, step_attempted))
+                observed_timeout_ratio = float(
+                    rr.results.get("quic_connect_timeout_count", 0) or 0
+                ) / float(max(1, int(rr.results.get("attempted_total", 0) or 0)))
+                vu_snapshots = scenario_engine.simulate_vu_state_machine(
+                    scenario_sessions=all_scenario_sessions,
+                    observed_error_ratio=observed_error_ratio,
+                    observed_timeout_ratio=observed_timeout_ratio,
+                    seed=int(getattr(args, "scenario_seed", 1337) or 1337),
+                )
+                rr.results["scenario_vu_state_counts"] = {
+                    "queued": int(sum(1 for v in vu_snapshots if str(v.state.value) == "queued")),
+                    "initializing": int(sum(1 for v in vu_snapshots if str(v.state.value) == "initializing")),
+                    "running": int(sum(1 for v in vu_snapshots if str(v.state.value) == "running")),
+                    "think_time": int(sum(1 for v in vu_snapshots if str(v.state.value) == "think_time")),
+                    "retrying": int(sum(1 for v in vu_snapshots if str(v.state.value) == "retrying")),
+                    "failed": int(sum(1 for v in vu_snapshots if str(v.state.value) == "failed")),
+                    "completed": int(sum(1 for v in vu_snapshots if str(v.state.value) == "completed")),
+                }
+                rr.results["scenario_per_flow"] = scenario_engine.collect_per_flow_metrics(
+                    vu_snapshots,
+                    duration_s=float(duration),
+                )
                 rr.results["scenario_session_completion_rate"] = float(sla_detail.get("session_completion_rate", 0.0) or 0.0)
                 rr.results["scenario_step_fail_ratio"] = float(sla_detail.get("l7_step_fail_ratio", 0.0) or 0.0)
                 rr.results["scenario_vu_ramp_accuracy_pct"] = float(
