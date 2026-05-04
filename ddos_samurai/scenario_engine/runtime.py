@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import random
+import asyncio
+import inspect
 from typing import Any
 from collections import defaultdict
 
@@ -51,6 +53,14 @@ class VirtualUserInstance:
     deadline_s: float = 0.0
 
 
+@dataclass(frozen=True)
+class FlowRuntimePolicy:
+    max_retries: int = 1
+    backoff_base_ms: int = 50
+    backoff_max_ms: int = 2000
+    timeout_action: str = "retry"  # retry | abort
+
+
 class VUPool:
     def __init__(
         self,
@@ -63,6 +73,7 @@ class VUPool:
         ramp_custom_points: list[tuple[float, int]] | None = None,
         retry_backoff_base_ms: int = 50,
         retry_backoff_max_ms: int = 2000,
+        flow_policies: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         sessions = list(scenario_sessions or [])
         self._vus: dict[str, VirtualUserInstance] = {}
@@ -72,6 +83,7 @@ class VUPool:
         self._retry_backoff_base_ms = max(1, int(retry_backoff_base_ms or 50))
         self._retry_backoff_max_ms = max(self._retry_backoff_base_ms, int(retry_backoff_max_ms or 2000))
         self._next_retry_at_s: dict[str, float] = {}
+        self._flow_policies_raw = dict(flow_policies or {})
         self._controller = RampController(
             target_vus=len(sessions),
             ramp_seconds=max(0, int(ramp_seconds)),
@@ -99,6 +111,18 @@ class VUPool:
             self._vus[key] = vu
             self._spawn_order.append(key)
 
+    def _policy_for_flow(self, flow: str) -> FlowRuntimePolicy:
+        raw = dict(self._flow_policies_raw.get(str(flow or "unknown"), {}) or {})
+        return FlowRuntimePolicy(
+            max_retries=max(0, int(raw.get("max_retries", 1) or 1)),
+            backoff_base_ms=max(1, int(raw.get("backoff_base_ms", self._retry_backoff_base_ms) or self._retry_backoff_base_ms)),
+            backoff_max_ms=max(
+                max(1, int(raw.get("backoff_base_ms", self._retry_backoff_base_ms) or self._retry_backoff_base_ms)),
+                int(raw.get("backoff_max_ms", self._retry_backoff_max_ms) or self._retry_backoff_max_ms),
+            ),
+            timeout_action=str(raw.get("timeout_action", "retry") or "retry").strip().lower(),
+        )
+
     def spawn_until(self, elapsed_s: float) -> int:
         now = max(0.0, float(elapsed_s))
         spawned = 0
@@ -125,15 +149,22 @@ class VUPool:
             vu.step_attempted += 1
             ok = bool((row or {}).get("success", False))
             timeout = bool((row or {}).get("timeout", False))
+            policy = self._policy_for_flow(vu.flow)
             if not ok:
                 vu.step_failed += 1
-                vu.retries_used += 1
                 if timeout:
                     vu.timeout_count += 1
-                vu.state = VUState.RETRYING
-                # Exponential backoff with cap; retry gate is resolved by tick_retries().
-                backoff_ms = min(self._retry_backoff_max_ms, self._retry_backoff_base_ms * (2 ** max(0, vu.retries_used - 1)))
-                self._next_retry_at_s[vu_id] = max(vu.spawned_at_s, self._next_retry_at_s.get(vu_id, 0.0)) + (float(backoff_ms) / 1000.0)
+                should_retry = vu.retries_used < int(policy.max_retries)
+                if timeout and policy.timeout_action == "abort":
+                    should_retry = False
+                if should_retry:
+                    vu.retries_used += 1
+                    vu.state = VUState.RETRYING
+                    # Exponential backoff with cap; retry gate is resolved by tick_retries().
+                    backoff_ms = min(policy.backoff_max_ms, policy.backoff_base_ms * (2 ** max(0, vu.retries_used - 1)))
+                    self._next_retry_at_s[vu_id] = max(vu.spawned_at_s, self._next_retry_at_s.get(vu_id, 0.0)) + (float(backoff_ms) / 1000.0)
+                else:
+                    vu.state = VUState.FAILED
             if vu.expected_steps > 0 and vu.step_attempted >= vu.expected_steps:
                 if vu.step_failed == 0:
                     vu.state = VUState.COMPLETED
@@ -264,6 +295,35 @@ class VUPool:
                     break
             if vu.state not in {VUState.COMPLETED, VUState.FAILED}:
                 vu.state = VUState.COMPLETED if vu.step_failed == 0 else VUState.FAILED
+        self.finalize_timeouts(dur)
+        return self.snapshots()
+
+    async def drive_with_step_batches(
+        self,
+        *,
+        duration_s: float,
+        step_batch_provider: Any,
+        tick_ms: int = 20,
+    ) -> list[VirtualUserSnapshot]:
+        dur = max(0.001, float(duration_s or 0.001))
+        tick = max(1, int(tick_ms or 20))
+        elapsed = 0.0
+        while elapsed <= dur:
+            self.spawn_until(elapsed)
+            self.tick_retries(elapsed)
+            rows = []
+            if callable(step_batch_provider):
+                maybe = step_batch_provider(elapsed)
+                if inspect.isawaitable(maybe):
+                    maybe = await maybe
+                rows = list(maybe or [])
+            if rows:
+                self.ingest_step_results(rows)
+            self.finalize_timeouts(elapsed)
+            await asyncio.sleep(0)
+            elapsed += float(tick) / 1000.0
+        self.spawn_until(dur)
+        self.tick_retries(dur)
         self.finalize_timeouts(dur)
         return self.snapshots()
 
