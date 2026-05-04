@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 import random
 from typing import Any
+from collections import defaultdict
 
 from ..gpu_cuda_payload import H2RequestPlan, H2RequestPlanItem
 from .metrics import FlowRuntimeMetrics
@@ -34,6 +35,237 @@ class VirtualUserSnapshot:
     step_failed: int
     retries_used: int
     timeout_count: int
+
+
+@dataclass
+class VirtualUserInstance:
+    vu_id: int
+    flow: str
+    expected_steps: int
+    state: VUState = VUState.QUEUED
+    step_attempted: int = 0
+    step_failed: int = 0
+    retries_used: int = 0
+    timeout_count: int = 0
+    spawned_at_s: float = 0.0
+    deadline_s: float = 0.0
+
+
+class VUPool:
+    def __init__(
+        self,
+        *,
+        scenario_sessions: list[dict[str, Any]],
+        ramp_seconds: int,
+        max_session_seconds: int,
+        ramp_curve: str = "linear",
+        ramp_step_interval_s: int = 1,
+        ramp_custom_points: list[tuple[float, int]] | None = None,
+        retry_backoff_base_ms: int = 50,
+        retry_backoff_max_ms: int = 2000,
+    ) -> None:
+        sessions = list(scenario_sessions or [])
+        self._vus: dict[str, VirtualUserInstance] = {}
+        self._spawn_order: list[str] = []
+        self._spawn_schedule: list[float] = []
+        self._active_peak = 0
+        self._retry_backoff_base_ms = max(1, int(retry_backoff_base_ms or 50))
+        self._retry_backoff_max_ms = max(self._retry_backoff_base_ms, int(retry_backoff_max_ms or 2000))
+        self._next_retry_at_s: dict[str, float] = {}
+        self._controller = RampController(
+            target_vus=len(sessions),
+            ramp_seconds=max(0, int(ramp_seconds)),
+            curve=str(ramp_curve or "linear"),
+            step_interval_s=max(1, int(ramp_step_interval_s or 1)),
+            custom_points=tuple((ramp_custom_points or [])),
+        )
+        self._spawn_schedule = self._controller.spawn_schedule()
+        max_s = max(1, int(max_session_seconds))
+        for i, sess in enumerate(sessions, start=1):
+            flow = str((sess or {}).get("flow", "unknown") or "unknown")
+            events = list((sess or {}).get("events", []) or [])
+            expected = int(
+                sum(1 for ev in events if str((ev or {}).get("event_type", "") or "").strip().lower() in {"http_request", "http2_headers"})
+            )
+            spawn_at = float(self._spawn_schedule[i - 1]) if (i - 1) < len(self._spawn_schedule) else 0.0
+            vu = VirtualUserInstance(
+                vu_id=i,
+                flow=flow,
+                expected_steps=max(0, expected),
+                spawned_at_s=spawn_at,
+                deadline_s=spawn_at + float(max_s),
+            )
+            key = str(i)
+            self._vus[key] = vu
+            self._spawn_order.append(key)
+
+    def spawn_until(self, elapsed_s: float) -> int:
+        now = max(0.0, float(elapsed_s))
+        spawned = 0
+        for key in self._spawn_order:
+            vu = self._vus[key]
+            if vu.state != VUState.QUEUED:
+                continue
+            if vu.spawned_at_s <= now:
+                vu.state = VUState.INITIALIZING
+                vu.state = VUState.RUNNING
+                spawned += 1
+        self._active_peak = max(self._active_peak, self.active_count())
+        return spawned
+
+    def ingest_step_results(self, rows: list[dict[str, Any]]) -> None:
+        for row in list(rows or []):
+            vu_id = str((row or {}).get("vu_id", "") or "")
+            if not vu_id or vu_id not in self._vus:
+                continue
+            vu = self._vus[vu_id]
+            if vu.state in {VUState.COMPLETED, VUState.FAILED}:
+                continue
+            vu.state = VUState.RUNNING
+            vu.step_attempted += 1
+            ok = bool((row or {}).get("success", False))
+            timeout = bool((row or {}).get("timeout", False))
+            if not ok:
+                vu.step_failed += 1
+                vu.retries_used += 1
+                if timeout:
+                    vu.timeout_count += 1
+                vu.state = VUState.RETRYING
+                # Exponential backoff with cap; retry gate is resolved by tick_retries().
+                backoff_ms = min(self._retry_backoff_max_ms, self._retry_backoff_base_ms * (2 ** max(0, vu.retries_used - 1)))
+                self._next_retry_at_s[vu_id] = max(vu.spawned_at_s, self._next_retry_at_s.get(vu_id, 0.0)) + (float(backoff_ms) / 1000.0)
+            if vu.expected_steps > 0 and vu.step_attempted >= vu.expected_steps:
+                if vu.step_failed == 0:
+                    vu.state = VUState.COMPLETED
+                else:
+                    vu.state = VUState.FAILED
+            if vu.state in {VUState.COMPLETED, VUState.FAILED}:
+                self._next_retry_at_s.pop(vu_id, None)
+        self._active_peak = max(self._active_peak, self.active_count())
+
+    def tick_retries(self, elapsed_s: float) -> int:
+        now = max(0.0, float(elapsed_s))
+        moved = 0
+        for vu_id, when_s in list(self._next_retry_at_s.items()):
+            vu = self._vus.get(vu_id)
+            if vu is None:
+                self._next_retry_at_s.pop(vu_id, None)
+                continue
+            if vu.state == VUState.RETRYING and now >= when_s and vu.state not in {VUState.COMPLETED, VUState.FAILED}:
+                vu.state = VUState.RUNNING
+                moved += 1
+                self._next_retry_at_s.pop(vu_id, None)
+        return moved
+
+    def finalize_timeouts(self, elapsed_s: float) -> int:
+        now = max(0.0, float(elapsed_s))
+        marked = 0
+        for vu in self._vus.values():
+            if vu.state in {VUState.COMPLETED, VUState.FAILED, VUState.QUEUED}:
+                continue
+            if now > vu.deadline_s:
+                vu.state = VUState.FAILED
+                vu.step_failed += 1
+                vu.timeout_count += 1
+                marked += 1
+        return marked
+
+    def active_count(self) -> int:
+        return int(sum(1 for v in self._vus.values() if v.state in {VUState.INITIALIZING, VUState.RUNNING, VUState.THINK_TIME, VUState.RETRYING}))
+
+    def snapshots(self) -> list[VirtualUserSnapshot]:
+        out: list[VirtualUserSnapshot] = []
+        for key in sorted(self._vus.keys(), key=lambda x: int(x)):
+            v = self._vus[key]
+            out.append(
+                VirtualUserSnapshot(
+                    vu_id=v.vu_id,
+                    flow=v.flow,
+                    state=v.state,
+                    step_attempted=v.step_attempted,
+                    step_failed=v.step_failed,
+                    retries_used=v.retries_used,
+                    timeout_count=v.timeout_count,
+                )
+            )
+        return out
+
+    def summary_metrics(self) -> dict[str, Any]:
+        snaps = self.snapshots()
+        attempted = int(sum(s.step_attempted for s in snaps))
+        failed = int(sum(s.step_failed for s in snaps))
+        return {
+            "vus_spawned": int(sum(1 for s in snaps if s.state != VUState.QUEUED)),
+            "vus_active_peak": int(self._active_peak),
+            "step_attempted": attempted,
+            "step_failed": failed,
+            "sessions_completed": int(sum(1 for s in snaps if s.state == VUState.COMPLETED)),
+            "sessions_failed": int(sum(1 for s in snaps if s.state == VUState.FAILED)),
+        }
+
+    def per_flow_metrics(self, duration_s: float) -> dict[str, dict[str, float]]:
+        snaps = self.snapshots()
+        by_flow: dict[str, FlowRuntimeMetrics] = defaultdict(FlowRuntimeMetrics)
+        for s in snaps:
+            row = by_flow.setdefault(s.flow, FlowRuntimeMetrics())
+            row.sessions_total += 1
+            row.sessions_completed += 1 if s.state == VUState.COMPLETED else 0
+            row.step_attempted += s.step_attempted
+            row.step_failed += s.step_failed
+        d = max(0.001, float(duration_s or 0.001))
+        out: dict[str, dict[str, float]] = {}
+        for flow, row in by_flow.items():
+            out[flow] = {
+                "sessions": float(row.sessions_total),
+                "completed": float(row.sessions_completed),
+                "step_attempted": float(row.step_attempted),
+                "step_failed": float(row.step_failed),
+                "session_completion_rate": float(row.sessions_completed / max(1, row.sessions_total)),
+                "step_fail_ratio": float(row.step_failed / max(1, row.step_attempted)),
+                "conn_rate": float(row.sessions_total / d),
+            }
+        return out
+
+    def drive_with_observed_ratios(
+        self,
+        *,
+        observed_error_ratio: float,
+        observed_timeout_ratio: float,
+        seed: int,
+        duration_s: float,
+    ) -> list[VirtualUserSnapshot]:
+        rng = random.Random(int(seed))
+        dur = max(0.001, float(duration_s or 0.001))
+        self.spawn_until(dur)
+        for key in self._spawn_order:
+            vu = self._vus[key]
+            if vu.state == VUState.QUEUED:
+                continue
+            if vu.expected_steps <= 0:
+                vu.state = VUState.COMPLETED
+                continue
+            for _ in range(vu.expected_steps):
+                if vu.state in {VUState.COMPLETED, VUState.FAILED}:
+                    break
+                is_timeout = rng.random() < max(0.0, min(1.0, observed_timeout_ratio))
+                is_error = (not is_timeout) and (rng.random() < max(0.0, min(1.0, observed_error_ratio)))
+                self.ingest_step_results(
+                    [
+                        {
+                            "vu_id": key,
+                            "flow": vu.flow,
+                            "success": not (is_timeout or is_error),
+                            "timeout": bool(is_timeout),
+                        }
+                    ]
+                )
+                self.tick_retries(min(dur, vu.deadline_s))
+                if vu.step_attempted >= vu.expected_steps:
+                    break
+            if vu.state not in {VUState.COMPLETED, VUState.FAILED}:
+                vu.state = VUState.COMPLETED if vu.step_failed == 0 else VUState.FAILED
+        self.finalize_timeouts(dur)
+        return self.snapshots()
 
 
 def _as_item_dict(item: H2RequestPlanItem) -> dict[str, Any]:
