@@ -203,6 +203,8 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         out = scenario_native.compile_session_plan_packed(spec, "browse", 7)
         self.assertTrue(bool(out.get("packed", False)))
         self.assertIn("event_kind", out)
+        self.assertIn("headers_idx", out)
+        self.assertIn("headers_pool", out)
         self.assertGreaterEqual(len(list(out.get("event_kind", []) or [])), 1)
         batches, metrics = build_vu_lifecycle_batches(
             scenario_sessions=[out],
