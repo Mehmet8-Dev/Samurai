@@ -514,7 +514,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 )
                 sessions_completed = int(rr.results.get("sent_total", 0) or 0)
                 step_failed = int(rr.results.get("errors_total", 0) or 0) + lifecycle_step_failed
-                sla_ok, sla_detail = scenario_engine.evaluate_sla(
+                sla_eval = scenario_engine.evaluate_scenario_sla(
                     sla=scenario_spec_to_dict(scenario_spec).get("sla", {}),
                     sessions_started=sessions_started,
                     sessions_completed=sessions_completed,
@@ -522,6 +522,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     step_failed=step_failed,
                     latency_p95_ms=float(rr.results.get("l7_handshake_p99_ms", 0.0) or 0.0),
                 )
+                sla_detail = sla_eval.to_dict()
                 rr.results["scenario_summary"] = {
                     "mode": scenario_mode,
                     "vus_target": int((scenario_build_metrics or {}).get("scenario_vus_target", 0) or 0),
@@ -559,13 +560,14 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     vu_snapshots,
                     duration_s=float(duration),
                 )
-                rr.results["scenario_session_completion_rate"] = float(sla_detail.get("session_completion_rate", 0.0) or 0.0)
-                rr.results["scenario_step_fail_ratio"] = float(sla_detail.get("l7_step_fail_ratio", 0.0) or 0.0)
+                _sla_metrics = dict(sla_detail.get("metrics", {}) or {})
+                rr.results["scenario_session_completion_rate"] = float(_sla_metrics.get("session_completion_rate", 0.0) or 0.0)
+                rr.results["scenario_step_fail_ratio"] = float(_sla_metrics.get("step_fail_ratio", 0.0) or 0.0)
                 rr.results["scenario_vu_ramp_accuracy_pct"] = float(
                     (100.0 * float(rr.results["scenario_summary"]["active_vu"])) /
                     float(max(1, rr.results["scenario_summary"]["vus_target"]))
                 )
-                if scenario_mode == "enforce" and not bool(sla_ok):
+                if scenario_mode == "enforce" and not bool(sla_eval.passed):
                     utils.log_critical("Scenario SLA gate failed (enforce mode).")
                     return 3
             if int(rr.results.get("kpi_gate_hard_fail", 0) or 0) == 1:
