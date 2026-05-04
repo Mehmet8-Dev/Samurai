@@ -50,3 +50,4 @@ class TestL7NativeScenarioTrace(unittest.TestCase):
         self.assertEqual(str(rows[0].get("flow", "")), "trace_flow")
         self.assertEqual(str(rows[0].get("vu_id", "")), "42")
         self.assertIn("success", rows[0])
+        self.assertIn("latency_ms", rows[0])
