@@ -1841,9 +1841,33 @@ async def worker_process(
             real_src_ip_int = int(sum([int(x) << (24 - i*8) for i, x in enumerate(real_src_ip.split('.'))]))
             traffic_model_sessions = list(args.get("traffic_model_sessions", []) or [])
             scenario_sessions = list(args.get("scenario_sessions", []) or [])
+            scenario_runtime_batches = list(args.get("scenario_runtime_batches", []) or [])
             traffic_model_mode = str(args.get("traffic_model", "none") or "none").strip().lower()
             traffic_model_enabled = traffic_model_mode != "none" and len(traffic_model_sessions) > 0
             scenario_enabled = len(scenario_sessions) > 0
+
+            def _iter_scenario_runtime_batches():
+                for row in scenario_runtime_batches:
+                    try:
+                        delay_s = float((row or {}).get("delay_s", 0.0) or 0.0)
+                        items = list((row or {}).get("items", []) or [])
+                        rp_items = []
+                        for it in items:
+                            rp_items.append(
+                                gpu_cuda_payload.H2RequestPlanItem(
+                                    method=str((it or {}).get("method", "GET") or "GET"),
+                                    path=str((it or {}).get("path", "/") or "/"),
+                                    headers=dict((it or {}).get("headers") or {}),
+                                    user_agent=(it or {}).get("user_agent"),
+                                )
+                            )
+                        if rp_items:
+                            yield {
+                                "delay_s": max(0.0, delay_s),
+                                "request_plan": gpu_cuda_payload.H2RequestPlan(items=rp_items),
+                            }
+                    except _RECOVERABLE_ERRORS as exc:
+                        _debug_exception(f"[Worker {worker_id}] scenario runtime batch parse failed", exc)
 
             def _iter_model_plans():
                 for session_plan in traffic_model_sessions:
@@ -1864,6 +1888,7 @@ async def worker_process(
                         continue
                     if int(len(getattr(rp, "items", []) or [])) > 0:
                         traffic_model_request_plans.append(rp)
+            scenario_runtime_plan_batches = list(_iter_scenario_runtime_batches())
             _l7_custom_tcp_mode = str(args.get("custom_tcp_mode", "off") or "off").strip().lower()
             _l7_transport_backend = "custom_tcp"
             _l7_custom_tcp_rx_interface = str(
@@ -1934,6 +1959,52 @@ async def worker_process(
                 verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
                 BATCH_SIZE = int(_gpu_batch_size)
                 remaining = int(args['count'])
+                if scenario_runtime_plan_batches:
+                    last_dispatch_ts = 0.0
+                    for bundle in scenario_runtime_plan_batches:
+                        dispatch_s = float(bundle.get("delay_s", 0.0) or 0.0)
+                        if dispatch_s > last_dispatch_ts:
+                            await asyncio.sleep(max(0.0, dispatch_s - last_dispatch_ts))
+                        last_dispatch_ts = dispatch_s
+                        request_plan = bundle.get("request_plan")
+                        batch_count = int(len(getattr(request_plan, "items", []) or []))
+                        worker_stats = _add_stats(worker_stats, await senders.http_stateful_sender(
+                            args['target'], args['port'],
+                            batch_count, args['http_concurrency'],
+                            workflow_steps=None,
+                            verbose=args['verbose'],
+                            scheme=args['http_scheme'],
+                            verify=verify_ssl,
+                            timeout_s=args['http_timeout'],
+                            ssl_context=ssl_context,
+                            user_agent=args.get('user_agent'),
+                            retries=args.get('http_retries', 0),
+                            http_method=args.get('http_method', 'GET'),
+                            http_path=args.get('http_path', ['/']),
+                            payloads=args.get('payloads', []),
+                            session_repeats=args.get('l7_session_repeats', 1),
+                            max_active_sessions=args.get('l7_max_active_sessions', 0),
+                            l7_engine=args.get('l7_engine', 'python'),
+                            lab_profile=args.get('lab_profile', 'off'),
+                            l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
+                            l7_capability_strict=bool(args.get("l7_capability_strict", False)),
+                            request_plan=request_plan,
+                            l7_profile_file=args.get("l7_profile_file", ""),
+                            l7_template_mode=args.get("l7_template_mode", "compat"),
+                            transport_backend=_l7_transport_backend,
+                            stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                            stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                            legacy_mode=bool(args.get("legacy_mode", False)),
+                            custom_tcp_backend=args.get("custom_tcp_backend", "af_xdp"),
+                            custom_tcp_rx_interface=_l7_custom_tcp_rx_interface,
+                            custom_tcp_xdp_interface=str(args.get("xdp_interface", "") or ""),
+                            custom_tcp_xdp_queue_id=int(args.get("xdp_queue_id", 0) or 0),
+                            custom_tcp_xdp_mode=int(args.get("xdp_mode", 0) or 0),
+                            live_sent=sent_total,
+                            live_errors=errors_total,
+                            live_progress=progress,
+                        ))
+                    return
                 if traffic_model_request_plans:
                     for request_plan in traffic_model_request_plans:
                         batch_count = int(len(request_plan.items))
@@ -2021,6 +2092,52 @@ async def worker_process(
             # Legacy fused GPU HTTP yolu kaldırıldı.
             if args['attack_vector'] == 'http':
                 verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
+                if scenario_runtime_plan_batches:
+                    last_dispatch_ts = 0.0
+                    for bundle in scenario_runtime_plan_batches:
+                        dispatch_s = float(bundle.get("delay_s", 0.0) or 0.0)
+                        if dispatch_s > last_dispatch_ts:
+                            await asyncio.sleep(max(0.0, dispatch_s - last_dispatch_ts))
+                        last_dispatch_ts = dispatch_s
+                        request_plan = bundle.get("request_plan")
+                        batch_count = int(len(getattr(request_plan, "items", []) or []))
+                        worker_stats = _add_stats(worker_stats, await senders.http_stateful_sender(
+                            args['target'], args['port'],
+                            batch_count, args['http_concurrency'],
+                            workflow_steps=None,
+                            verbose=args['verbose'],
+                            scheme=args['http_scheme'],
+                            verify=verify_ssl,
+                            timeout_s=args['http_timeout'],
+                            ssl_context=ssl_context,
+                            user_agent=args.get('user_agent'),
+                            retries=args.get('http_retries', 0),
+                            http_method=args.get('http_method', 'GET'),
+                            http_path=args.get('http_path', ['/']),
+                            payloads=args.get('payloads', []),
+                            session_repeats=1,
+                            max_active_sessions=args.get('l7_max_active_sessions', 0),
+                            l7_engine=args.get('l7_engine', 'python'),
+                            lab_profile=args.get('lab_profile', 'off'),
+                            l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
+                            l7_capability_strict=bool(args.get("l7_capability_strict", False)),
+                            request_plan=request_plan,
+                            l7_profile_file=args.get("l7_profile_file", ""),
+                            l7_template_mode=args.get("l7_template_mode", "compat"),
+                            transport_backend=_l7_transport_backend,
+                            stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                            stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                            legacy_mode=bool(args.get("legacy_mode", False)),
+                            custom_tcp_backend=args.get("custom_tcp_backend", "af_xdp"),
+                            custom_tcp_rx_interface=_l7_custom_tcp_rx_interface,
+                            custom_tcp_xdp_interface=str(args.get("xdp_interface", "") or ""),
+                            custom_tcp_xdp_queue_id=int(args.get("xdp_queue_id", 0) or 0),
+                            custom_tcp_xdp_mode=int(args.get("xdp_mode", 0) or 0),
+                            live_sent=sent_total,
+                            live_errors=errors_total,
+                            live_progress=progress,
+                        ))
+                    return
                 worker_stats = _add_stats(worker_stats, await senders.http_app_sender(
                     args['target'], args['port'], args['count'], args['http_concurrency'],
                     args['http_method'], args['http_path'], args['payloads'], args['verbose'],
@@ -2050,6 +2167,44 @@ async def worker_process(
                 verify_ssl = (str(args.get('http_verify', 'true')).lower() != "false")
                 BATCH_SIZE = int(_gpu_batch_size)
                 remaining = int(args['count'])
+                if scenario_runtime_plan_batches:
+                    last_dispatch_ts = 0.0
+                    for bundle in scenario_runtime_plan_batches:
+                        dispatch_s = float(bundle.get("delay_s", 0.0) or 0.0)
+                        if dispatch_s > last_dispatch_ts:
+                            await asyncio.sleep(max(0.0, dispatch_s - last_dispatch_ts))
+                        last_dispatch_ts = dispatch_s
+                        request_plan = bundle.get("request_plan")
+                        plan_count = int(len(getattr(request_plan, "items", []) or []))
+                        worker_stats = _add_stats(worker_stats, await senders.http2_sender(
+                            target_ip=args['target'],
+                            target_port=args['port'],
+                            count=plan_count,
+                            concurrency=args['http2_concurrency'],
+                            http_path=args['http_path'],
+                            http_method=args['http_method'],
+                            verbose=args['verbose'],
+                            scheme=args['http_scheme'],
+                            cookies=args.get('cookies'),
+                            user_agent=args.get('user_agent'),
+                            ssl_context=ssl_context,
+                            verify=verify_ssl,
+                            h2_profile_name=args.get("h2_profile", args.get("ja3_profile", "none")),
+                            l7_http2_engine=args.get("l7_http2_engine", "auto"),
+                            l7_fallback_policy=args.get("l7_fallback_policy", "allow"),
+                            l7_capability_strict=bool(args.get("l7_capability_strict", False)),
+                            lab_profile=args.get("lab_profile", "off"),
+                            request_plan=request_plan,
+                            l7_profile_file=args.get("l7_profile_file", ""),
+                            l7_template_mode=args.get("l7_template_mode", "compat"),
+                            stateful_runtime_backend=args.get("stateful_runtime_backend", "afxdp"),
+                            stateful_runtime_strict=bool(args.get("l7_capability_strict", False)),
+                            legacy_mode=bool(args.get("legacy_mode", False)),
+                            live_sent=sent_total,
+                            live_errors=errors_total,
+                            live_progress=progress,
+                        ))
+                    return
                 if traffic_model_request_plans:
                     for request_plan in traffic_model_request_plans:
                         plan_count = int(len(request_plan.items))
