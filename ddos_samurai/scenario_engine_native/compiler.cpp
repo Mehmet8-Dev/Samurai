@@ -97,6 +97,20 @@ struct CompileState {
   int attempted{0};
 };
 
+struct PackedEvents {
+  std::vector<int> event_kind{};  // 0=request, 1=think_time
+  std::vector<std::string> request_kind{};  // http_request | http2_headers | ""
+  std::vector<std::string> method{};
+  std::vector<std::string> path{};
+  std::vector<std::unordered_map<std::string, std::string>> headers{};
+  std::vector<std::unordered_map<std::string, std::string>> cookies{};
+  std::vector<std::string> device_profile{};
+  std::vector<int> timeout_ms{};
+  std::vector<int> retry_count{};
+  std::vector<int> think_min_ms{};
+  std::vector<int> think_max_ms{};
+};
+
 static void compile_flow_recursive(const ScenarioSpecNative& spec, const std::string& flow_name, CompileState& st, py::list& events) {
   if (st.depth > st.max_depth || st.emitted >= st.max_events) return;
   auto itf = spec.flow_index.find(flow_name);
@@ -173,6 +187,93 @@ static void compile_flow_recursive(const ScenarioSpecNative& spec, const std::st
   }
 }
 
+static void compile_flow_recursive_packed(
+    const ScenarioSpecNative& spec,
+    const std::string& flow_name,
+    CompileState& st,
+    PackedEvents& out) {
+  if (st.depth > st.max_depth || st.emitted >= st.max_events) return;
+  auto itf = spec.flow_index.find(flow_name);
+  if (itf == spec.flow_index.end()) return;
+  const Flow& flow = spec.flows[itf->second];
+  const Persona* persona = nullptr;
+  auto itp = spec.personas.find(flow.persona);
+  if (itp != spec.personas.end()) persona = &itp->second;
+
+  std::uniform_real_distribution<double> uni(0.0, 1.0);
+  for (const Step& step : flow.steps) {
+    if (st.emitted >= st.max_events) break;
+    switch (step.type) {
+      case StepType::EndSession:
+        return;
+      case StepType::Pause: {
+        out.event_kind.push_back(1);
+        out.request_kind.emplace_back("");
+        out.method.emplace_back("");
+        out.path.emplace_back("");
+        out.headers.emplace_back();
+        out.cookies.emplace_back();
+        out.device_profile.emplace_back("");
+        out.timeout_ms.push_back(0);
+        out.retry_count.push_back(0);
+        out.think_min_ms.push_back(step.think_time.min_ms);
+        out.think_max_ms.push_back(std::max(step.think_time.min_ms, step.think_time.max_ms));
+        st.emitted += 1;
+        break;
+      }
+      case StepType::Assert:
+        st.attempted += 1;
+        break;
+      case StepType::Branch:
+        if (uni(*st.rng) <= step.probability && !step.flow.empty()) {
+          st.depth += 1;
+          compile_flow_recursive_packed(spec, step.flow, st, out);
+          st.depth -= 1;
+        }
+        break;
+      case StepType::Loop: {
+        const std::string target = step.flow.empty() ? flow.name : step.flow;
+        const int rep = std::max(1, step.repeat);
+        for (int i = 0; i < rep; ++i) {
+          st.depth += 1;
+          compile_flow_recursive_packed(spec, target, st, out);
+          st.depth -= 1;
+          if (st.emitted >= st.max_events) break;
+        }
+        break;
+      }
+      case StepType::Request: {
+        st.attempted += 1;
+        std::unordered_map<std::string, std::string> headers{};
+        std::unordered_map<std::string, std::string> cookies{};
+        std::string device_profile = "web";
+        int timeout_ms = 5000;
+        int retry_count = 0;
+        if (persona != nullptr) {
+          headers = persona->headers;
+          cookies = persona->cookies;
+          device_profile = persona->device_profile;
+          timeout_ms = persona->request_timeout_ms;
+          retry_count = persona->max_retries;
+        }
+        out.event_kind.push_back(0);
+        out.request_kind.push_back((st.backend == "http2") ? "http2_headers" : "http_request");
+        out.method.push_back(step.method);
+        out.path.push_back(step.path);
+        out.headers.push_back(std::move(headers));
+        out.cookies.push_back(std::move(cookies));
+        out.device_profile.push_back(std::move(device_profile));
+        out.timeout_ms.push_back(timeout_ms);
+        out.retry_count.push_back(retry_count);
+        out.think_min_ms.push_back(0);
+        out.think_max_ms.push_back(0);
+        st.emitted += 1;
+        break;
+      }
+    }
+  }
+}
+
 py::dict compile_session_plan_native(const ScenarioSpecNative& spec, const std::string& flow_name, std::uint64_t seed) {
   if (spec.flow_index.find(flow_name) == spec.flow_index.end()) {
     throw std::runtime_error("flow not found: " + flow_name);
@@ -187,6 +288,35 @@ py::dict compile_session_plan_native(const ScenarioSpecNative& spec, const std::
   out["flow"] = flow_name;
   out["persona"] = spec.flows[spec.flow_index.at(flow_name)].persona;
   out["events"] = events;
+  out["step_attempted"] = st.attempted;
+  return out;
+}
+
+py::dict compile_session_plan_packed_native(const ScenarioSpecNative& spec, const std::string& flow_name, std::uint64_t seed) {
+  if (spec.flow_index.find(flow_name) == spec.flow_index.end()) {
+    throw std::runtime_error("flow not found: " + flow_name);
+  }
+  std::mt19937_64 rng(seed);
+  CompileState st{};
+  st.rng = &rng;
+  st.backend = spec.load_model.backend;
+  PackedEvents pe{};
+  compile_flow_recursive_packed(spec, flow_name, st, pe);
+  py::dict out;
+  out["flow"] = flow_name;
+  out["persona"] = spec.flows[spec.flow_index.at(flow_name)].persona;
+  out["packed"] = py::bool_(true);
+  out["event_kind"] = py::cast(pe.event_kind);
+  out["request_kind"] = py::cast(pe.request_kind);
+  out["method"] = py::cast(pe.method);
+  out["path"] = py::cast(pe.path);
+  out["headers"] = py::cast(pe.headers);
+  out["cookies"] = py::cast(pe.cookies);
+  out["device_profile"] = py::cast(pe.device_profile);
+  out["timeout_ms"] = py::cast(pe.timeout_ms);
+  out["retry_count"] = py::cast(pe.retry_count);
+  out["think_min_ms"] = py::cast(pe.think_min_ms);
+  out["think_max_ms"] = py::cast(pe.think_max_ms);
   out["step_attempted"] = st.attempted;
   return out;
 }

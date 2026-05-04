@@ -14,5 +14,9 @@ pybind11::dict compile_session_plan_native(
     const ScenarioSpecNative& spec,
     const std::string& flow_name,
     std::uint64_t seed);
+pybind11::dict compile_session_plan_packed_native(
+    const ScenarioSpecNative& spec,
+    const std::string& flow_name,
+    std::uint64_t seed);
 
 }  // namespace ddos_samurai::scenario_native
