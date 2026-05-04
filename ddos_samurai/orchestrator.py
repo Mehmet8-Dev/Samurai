@@ -1859,8 +1859,22 @@ async def worker_process(
             _scenario_flow_failed_steps: dict[str, int] = {}
             _scenario_flow_vu_completed: dict[str, int] = {}
             _scenario_flow_vu_total: dict[str, int] = {}
+            _scenario_flow_latency_ms: dict[str, list[float]] = {}
             for _vu_id, _flow in scenario_vu_flow.items():
                 _scenario_flow_vu_total[str(_flow)] = int(_scenario_flow_vu_total.get(str(_flow), 0) or 0) + 1
+
+            def _pct(values: list[float], q: float) -> float:
+                xs = sorted(float(v) for v in list(values or []) if float(v) >= 0.0)
+                if not xs:
+                    return 0.0
+                if len(xs) == 1:
+                    return float(xs[0])
+                qn = max(0.0, min(1.0, float(q)))
+                pos = qn * float(len(xs) - 1)
+                lo = int(pos)
+                hi = min(len(xs) - 1, lo + 1)
+                frac = pos - float(lo)
+                return float(xs[lo] + ((xs[hi] - xs[lo]) * frac))
 
             def _iter_scenario_runtime_batches():
                 for row in scenario_runtime_batches:
@@ -1898,7 +1912,12 @@ async def worker_process(
                         flow = str((row or {}).get("flow", "unknown") or "unknown")
                         vu_id = str((row or {}).get("vu_id", "") or "")
                         ok = bool((row or {}).get("success", False))
+                        latency_ms = float((row or {}).get("latency_ms", 0.0) or 0.0)
                         _scenario_flow_steps[flow] = int(_scenario_flow_steps.get(flow, 0) or 0) + 1
+                        if latency_ms >= 0.0:
+                            bucket = _scenario_flow_latency_ms.setdefault(flow, [])
+                            if len(bucket) < 8192:
+                                bucket.append(latency_ms)
                         if not ok:
                             _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
                         if vu_id:
@@ -3983,6 +4002,13 @@ async def worker_process(
             worker_stats["scenario_flow_min_completion_rate"] = float(_min_completion if _flow_keys else 0.0)
             worker_stats["scenario_flow_max_step_fail_ratio"] = float(_max_step_fail_ratio if _flow_keys else 0.0)
             worker_stats["scenario_flow_coverage_pct"] = float((100.0 * _covered) / float(_flow_count))
+            _all_lat = []
+            for _flow in _flow_keys:
+                _vals = list(_scenario_flow_latency_ms.get(_flow, []) or [])
+                _all_lat.extend(_vals)
+            worker_stats["scenario_flow_latency_p50_ms"] = float(_pct(_all_lat, 0.50) if _all_lat else 0.0)
+            worker_stats["scenario_flow_latency_p95_ms"] = float(_pct(_all_lat, 0.95) if _all_lat else 0.0)
+            worker_stats["scenario_flow_latency_p99_ms"] = float(_pct(_all_lat, 0.99) if _all_lat else 0.0)
 
         if run_events is not None:
             try:
