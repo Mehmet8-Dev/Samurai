@@ -48,6 +48,29 @@ def _parity_metrics(raw: dict[str, Any] | None = None) -> dict[str, float]:
     }
 
 
+def _scenario_step_results_from_plan(request_plan: Any, sent: int, errors: int, timeouts: int = 0) -> list[dict[str, Any]]:
+    items = list(getattr(request_plan, "items", []) or [])
+    if not items:
+        return []
+    attempted = len(items)
+    success_count = min(attempted, max(0, int(sent or 0)))
+    fail_count = min(attempted - success_count, max(0, int(errors or 0)))
+    timeout_budget = min(fail_count, max(0, int(timeouts or 0)))
+    out: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        headers = dict(getattr(item, "headers", {}) or {})
+        fail_idx = idx - success_count
+        out.append(
+            {
+                "flow": str(headers.get("x-scenario-flow", "unknown") or "unknown"),
+                "vu_id": str(headers.get("x-scenario-vu-id", "") or ""),
+                "success": bool(idx < success_count),
+                "timeout": bool(idx >= success_count and fail_idx >= 0 and fail_idx < timeout_budget),
+            }
+        )
+    return out
+
+
 async def quic_sender(
     target_ip,
     target_port,
@@ -275,6 +298,13 @@ async def quic_sender(
         quic_alpn_h3_ratio=float(resp_recv / denom),
         **_parity_metrics(raw),
     )
+    if request_plan is not None and not list((out or {}).get("scenario_step_results", []) or []):
+        out["scenario_step_results"] = _scenario_step_results_from_plan(
+            request_plan,
+            sent=sent,
+            errors=errors,
+            timeouts=timeouts,
+        )
 
     for key, value in raw.items():
         if key in out and key not in {"sender_path", "sender_fallback_reason", "l7_engine_path_used", "l7_fallback_reason"}:

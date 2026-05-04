@@ -25,6 +25,38 @@ _GATEWAY_CACHE = {}
 _GATEWAY_CACHE_TTL_SEC = float(os.environ.get("SAMURAI_GATEWAY_CACHE_TTL_SEC", "60"))
 
 
+def _scenario_step_results_from_plan(
+    request_plan: "H2RequestPlan | None",
+    sent: int,
+    errors: int,
+    timeout_count: int = 0,
+) -> list[dict[str, Any]]:
+    items = list(getattr(request_plan, "items", []) or [])
+    if not items:
+        return []
+    attempted = len(items)
+    success_count = min(attempted, max(0, int(sent or 0)))
+    fail_count = min(attempted - success_count, max(0, int(errors or 0)))
+    timeout_budget = min(fail_count, max(0, int(timeout_count or 0)))
+    out: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        headers = dict(getattr(item, "headers", {}) or {})
+        flow = str(headers.get("x-scenario-flow", "unknown") or "unknown")
+        vu_id = str(headers.get("x-scenario-vu-id", "") or "")
+        ok = idx < success_count
+        fail_idx = idx - success_count
+        is_timeout = (not ok) and fail_idx >= 0 and fail_idx < timeout_budget
+        out.append(
+            {
+                "flow": flow,
+                "vu_id": vu_id,
+                "success": bool(ok),
+                "timeout": bool(is_timeout),
+            }
+        )
+    return out
+
+
 # Internal modularization bindings (strict public API compatibility).
 from ._senders import runtime as _sender_runtime
 from ._senders import stats_core as _sender_stats_core
@@ -926,6 +958,13 @@ async def http2_sender(
     out.setdefault("h2_transport", "native")
     out.setdefault("h2_request_plan_used", int(bool(request_plan)))
     out.setdefault("h2_request_plan_items", int(len(getattr(request_plan, "items", []) or [])))
+    if request_plan is not None and not list((out or {}).get("scenario_step_results", []) or []):
+        out["scenario_step_results"] = _scenario_step_results_from_plan(
+            request_plan,
+            int(out.get("sent", 0) or 0),
+            int(out.get("errors", 0) or 0),
+            int(out.get("timeout_close_count", 0) or 0),
+        )
     return _normalize_l7_output(
         out,
         attempted_default=int(out.get("attempted", count) or count),
@@ -1116,6 +1155,13 @@ async def http_stateful_sender(
         out.setdefault("session_success_rate", float(out.get("sent", 0) or 0) / float(out.get("attempted", 1) or 1))
         out.setdefault("cookie_set_apply_rate", 0.0)
         out.setdefault("retries_used", int(retries or 0))
+    if request_plan is not None and not list((out or {}).get("scenario_step_results", []) or []):
+        out["scenario_step_results"] = _scenario_step_results_from_plan(
+            request_plan,
+            int(out.get("sent", 0) or 0),
+            int(out.get("errors", 0) or 0),
+            int(out.get("timeout_close_count", 0) or 0),
+        )
     return _normalize_l7_output(
         out,
         attempted_default=int(out.get("attempted", vu_count) or vu_count),
