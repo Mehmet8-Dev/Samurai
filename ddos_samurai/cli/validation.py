@@ -83,6 +83,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
     l7_quic_auto_bridge = bool(getattr(args, "l7_quic_auto_bridge", False))
     l7_quic_bridge_autopromote = bool(getattr(args, "l7_quic_bridge_autopromote", False))
     attack_vector = str(getattr(args, "attack_vector", "basic") or "basic").strip().lower()
+    scenario_mode = str(getattr(args, "scenario_mode", "off") or "off").strip().lower()
+    scenario_file = str(getattr(args, "scenario_file", "") or "").strip()
     l7_template_mode = str(getattr(args, "l7_template_mode", "compat") or "compat").strip().lower()
     runtime_backend = str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower()
     topo_spec_json = str(getattr(args, "topo_spec_json", "") or "").strip()
@@ -162,6 +164,21 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
             parser.error(f"Hata: --dp-queue-map formatı geçersiz: {exc}")
     if l7_template_mode not in {"compat", "profile"}:
         parser.error("Hata: --l7-template-mode compat veya profile olmalıdır.")
+    if scenario_mode not in {"off", "shadow", "enforce"}:
+        parser.error("Hata: --scenario-mode off|shadow|enforce olmalıdır.")
+    if scenario_mode != "off":
+        if not scenario_file:
+            parser.error("Hata: --scenario-mode shadow/enforce için --scenario-file zorunludur.")
+        if not os.path.isfile(scenario_file):
+            parser.error("Hata: --scenario-file bulunamadı.")
+        if attack_vector not in {"http", "http2", "basic"}:
+            parser.error("Hata: scenario mode ilk fazda yalnızca HTTP/HTTP2 backend ile desteklenir.")
+    if int(getattr(args, "scenario_vus", 0) or 0) < 0:
+        parser.error("Hata: --scenario-vus >= 0 olmalıdır.")
+    if int(getattr(args, "scenario_ramp_seconds", 0) or 0) < 0:
+        parser.error("Hata: --scenario-ramp-seconds >= 0 olmalıdır.")
+    if int(getattr(args, "scenario_max_session_seconds", 0) or 0) < 0:
+        parser.error("Hata: --scenario-max-session-seconds >= 0 olmalıdır.")
     if topo_spec_json:
         if topo_seed < 0:
             parser.error("Hata: --topo-spec-json ile birlikte --topo-seed zorunludur (>=0).")

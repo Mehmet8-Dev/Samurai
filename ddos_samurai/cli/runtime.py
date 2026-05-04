@@ -11,7 +11,8 @@ import os
 import time
 from datetime import datetime, timezone
 
-from .. import metrics, reporting, stealth, utils
+from .. import metrics, reporting, scenario_engine, stealth, utils
+from ..scenario_engine.compiler import scenario_spec_from_dict, scenario_spec_to_dict
 from ..profile_names import PROFILE_NONE
 from .helpers import _is_cuda_raw_vector, is_admin, print_distributed_info
 from .offline_modes import export_jsonl_rows, generate_traffic_plan
@@ -29,6 +30,19 @@ _CPU_RAW_SOCKET_VECTORS = {
     "ntp-amp", "ssdp-amp", "dns-amp", "memcached-amp", "ldap-amp",
     "pcap-replay",
 }
+
+
+def _parse_scenario_sla_override(raw: str) -> dict:
+    txt = str(raw or "").strip()
+    if not txt:
+        return {}
+    try:
+        out = json.loads(txt)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--scenario-sla-profile JSON parse hatası: {exc}") from exc
+    if not isinstance(out, dict):
+        raise ValueError("--scenario-sla-profile JSON object olmalıdır.")
+    return dict(out)
 
 
 def _load_payloads(args) -> list:
@@ -150,7 +164,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
 
     args.payloads = _load_payloads(args)
 
-    apply_profile(args)
+    apply_profile(args, argv)
     _resolve_profile_args(parser, args, argv)
     print_distributed_info(args.role)
     utils.print_system_status(args)
@@ -222,6 +236,38 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             )
         monitor_total_count = total_count
 
+    scenario_mode = str(getattr(args, "scenario_mode", "off") or "off").strip().lower()
+    scenario_enabled = scenario_mode in {"shadow", "enforce"}
+    scenario_spec = None
+    scenario_build_metrics = {}
+    if scenario_enabled:
+        try:
+            scenario_engine.require_native()
+            scenario_spec = scenario_engine.load_scenario_spec(str(getattr(args, "scenario_file", "") or ""))
+            spec_dict = scenario_spec_to_dict(scenario_spec)
+            load_model = dict(spec_dict.get("load_model") or {})
+            scenario_vus_cfg = int(getattr(args, "scenario_vus", 0) or 0)
+            scenario_ramp_cfg = int(getattr(args, "scenario_ramp_seconds", 0) or 0)
+            scenario_max_session_cfg = int(getattr(args, "scenario_max_session_seconds", 0) or 0)
+            if scenario_vus_cfg > 0:
+                load_model["concurrent_vus"] = int(scenario_vus_cfg)
+            if scenario_ramp_cfg > 0:
+                load_model["ramp_seconds"] = int(scenario_ramp_cfg)
+            if scenario_max_session_cfg > 0:
+                load_model["max_session_seconds"] = int(scenario_max_session_cfg)
+            spec_dict["load_model"] = load_model
+            sla_override = _parse_scenario_sla_override(str(getattr(args, "scenario_sla_profile", "") or ""))
+            if sla_override:
+                merged_sla = dict(spec_dict.get("sla") or {})
+                merged_sla.update(sla_override)
+                spec_dict["sla"] = merged_sla
+            scenario_spec = scenario_spec_from_dict(spec_dict)
+            if scenario_vus_cfg > 0:
+                total_count = max(int(total_count or 0), scenario_vus_cfg)
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
+            utils.log_critical(f"Scenario load failed: {exc}")
+            return 1
+
     count_per_worker = total_count // workers if workers > 0 else 0
     worker_counts = [count_per_worker] * workers
     remainder = total_count % workers if workers > 0 else 0
@@ -260,6 +306,19 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
         except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
             utils.log_critical(f"Traffic model planner failed: {exc}")
             return 1
+    scenario_sessions_by_worker = [[] for _ in range(workers)]
+    if scenario_enabled and scenario_spec is not None:
+        try:
+            scenario_sessions_by_worker, scenario_build_metrics = scenario_engine.build_worker_session_plans(
+                scenario_spec,
+                worker_counts=[int(x or 0) for x in worker_counts],
+                seed=int(getattr(args, "scenario_seed", 1337) or 1337),
+            )
+            scenario_backend = str((scenario_build_metrics or {}).get("scenario_backend", "http") or "http").strip().lower()
+            args.attack_vector = "http2" if scenario_backend == "http2" else "http"
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
+            utils.log_critical(f"Scenario scheduler failed: {exc}")
+            return 1
 
     utils.log_info(f"{workers} adet işçi (worker) süreci başlatılıyor...")
 
@@ -283,6 +342,8 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
         worker_args.dp_worker_queue_map = json.dumps(worker_queue_map, sort_keys=True)
         worker_args.traffic_model = str(getattr(args, "traffic_model", "none") or "none")
         worker_args.traffic_model_sessions = list(traffic_model_sessions_by_worker[i] or [])
+        worker_args.scenario_mode = scenario_mode
+        worker_args.scenario_sessions = list(scenario_sessions_by_worker[i] or [])
         if soak_deadline_ts > 0.0:
             worker_args.soak_deadline_ts = float(soak_deadline_ts)
         if worker_args.rps > 0:
@@ -409,6 +470,39 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 rr.results["soak_alarms"] = list((monitor_summary or {}).get("alarms", []) or [])
                 rr.results["soak_thresholds"] = dict((monitor_summary or {}).get("thresholds", {}) or {})
                 rr.results["soak_baseline"] = dict((monitor_summary or {}).get("baseline", {}) or {})
+            if scenario_enabled and scenario_spec is not None:
+                sessions_started = int((scenario_build_metrics or {}).get("sessions_started", 0) or 0)
+                step_attempted = int((scenario_build_metrics or {}).get("step_attempted", 0) or 0)
+                sessions_completed = int(rr.results.get("sent_total", 0) or 0)
+                step_failed = int(rr.results.get("errors_total", 0) or 0)
+                sla_ok, sla_detail = scenario_engine.evaluate_sla(
+                    sla=scenario_spec_to_dict(scenario_spec).get("sla", {}),
+                    sessions_started=sessions_started,
+                    sessions_completed=sessions_completed,
+                    step_attempted=step_attempted,
+                    step_failed=step_failed,
+                    latency_p95_ms=float(rr.results.get("l7_handshake_p99_ms", 0.0) or 0.0),
+                )
+                rr.results["scenario_summary"] = {
+                    "mode": scenario_mode,
+                    "vus_target": int((scenario_build_metrics or {}).get("scenario_vus_target", 0) or 0),
+                    "active_vu": int(max(0, sessions_started - sessions_completed)),
+                    "vu_target_gap": int(max(0, int((scenario_build_metrics or {}).get("scenario_vus_target", 0) or 0) - max(0, sessions_started - sessions_completed))),
+                    "sessions_started": sessions_started,
+                    "sessions_completed": sessions_completed,
+                    "step_attempted": step_attempted,
+                    "step_failed": step_failed,
+                    **sla_detail,
+                }
+                rr.results["scenario_session_completion_rate"] = float(sla_detail.get("session_completion_rate", 0.0) or 0.0)
+                rr.results["scenario_step_fail_ratio"] = float(sla_detail.get("l7_step_fail_ratio", 0.0) or 0.0)
+                rr.results["scenario_vu_ramp_accuracy_pct"] = float(
+                    (100.0 * float(rr.results["scenario_summary"]["active_vu"])) /
+                    float(max(1, rr.results["scenario_summary"]["vus_target"]))
+                )
+                if scenario_mode == "enforce" and not bool(sla_ok):
+                    utils.log_critical("Scenario SLA gate failed (enforce mode).")
+                    return 3
             if int(rr.results.get("kpi_gate_hard_fail", 0) or 0) == 1:
                 kpi_hard_fail_triggered = True
                 utils.log_critical("KPI gate hard-fail tetiklendi: " + ", ".join([str(x) for x in list(rr.results.get("kpi_violations", []))]))

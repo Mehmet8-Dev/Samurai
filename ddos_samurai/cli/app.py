@@ -257,7 +257,7 @@ def main(argv=None):
         print_profiles()
         raise SystemExit(0)
 
-    apply_profile(args)
+    apply_profile(args, argv)
     _resolve_profile_args(parser, args, argv)
     _validate_pacing_args(parser, args)
     _validate_hybrid_cuda_args(parser, args)
@@ -322,4 +322,3 @@ def main(argv=None):
     if offline_result is not None:
         raise SystemExit(offline_result)
     raise SystemExit(run_live_mode(args, parser, argv, soak_cfg, report_ctx, runtime_ctx))
-
