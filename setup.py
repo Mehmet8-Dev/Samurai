@@ -595,6 +595,9 @@ def get_extensions() -> List[Extension]:
         "ddos_samurai._scenario_native",
         sources=[
             "ddos_samurai/scenario_engine_native/module.cpp",
+            "ddos_samurai/scenario_engine_native/compiler.cpp",
+            "ddos_samurai/scenario_engine_native/scheduler.cpp",
+            "ddos_samurai/scenario_engine_native/sla.cpp",
         ],
         include_dirs=[pybind11_include],
         language="c++",
