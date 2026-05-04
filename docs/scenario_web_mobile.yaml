@@ -1,0 +1,60 @@
+schema_version: 1
+personas:
+  web_user:
+    device_profile: web
+    headers:
+      User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36
+      Accept: text/html,application/xhtml+xml
+    cookies: {}
+    retry_policy:
+      max_retries: 1
+    timeout_policy:
+      request_timeout_ms: 4000
+    weight: 0.7
+  mobile_user:
+    device_profile: mobile
+    headers:
+      User-Agent: Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36
+      Accept: text/html,application/xhtml+xml
+    cookies: {}
+    retry_policy:
+      max_retries: 2
+    timeout_policy:
+      request_timeout_ms: 5000
+    weight: 0.3
+
+flows:
+  web_browse:
+    persona: web_user
+    steps:
+      - type: request
+        method: GET
+        path: /
+      - type: request
+        method: GET
+        path: /products
+      - type: request
+        method: GET
+        path: /cart
+      - type: end_session
+  mobile_feed:
+    persona: mobile_user
+    steps:
+      - type: request
+        method: GET
+        path: /api/feed
+      - type: request
+        method: GET
+        path: /api/recommendations
+      - type: end_session
+
+load_model:
+  concurrent_vus: 1000000
+  ramp_seconds: 300
+  max_session_seconds: 60
+  backend: http2
+
+sla:
+  min_completion_rate: 0.95
+  max_step_fail_ratio: 0.05
+  max_latency_p95_ms: 800
