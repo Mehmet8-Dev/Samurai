@@ -9,6 +9,7 @@ from ddos_samurai.scenario_engine.runtime import (
     collect_per_flow_metrics,
     simulate_vu_state_machine,
 )
+from ddos_samurai.scenario_engine.sla import evaluate_scenario_sla
 from ddos_samurai.scenario_engine.types import ScenarioSpec
 
 
@@ -54,6 +55,38 @@ flows:
       - type: pause
         think_time: {min_ms: 10, max_ms: 20}
       - {type: request, method: GET, path: /x}
+      - {type: end_session}
+load_model:
+  concurrent_vus: 10
+  ramp_seconds: 1
+  max_session_seconds: 30
+  backend: http
+sla:
+  min_completion_rate: 0.9
+  max_step_fail_ratio: 0.1
+"""
+
+_V2_YAML = """\
+schema_version: 2
+variables:
+  base_url: "https://example.test"
+personas:
+  web_user:
+    device_profile: web
+    headers: {User-Agent: UA, X-Base: "${base_url}"}
+    cookies: {}
+    retry_policy: {max_retries: 1}
+    timeout_policy: {request_timeout_ms: 4000}
+flows:
+  browse:
+    persona: web_user
+    steps:
+      - {type: request, method: GET, path: "${base_url}/"}
+      - type: request
+        method: GET
+        path: /checkout
+        extract: {order_id: "$.order_id"}
+      - {type: assert, condition: "order_id != null"}
       - {type: end_session}
 load_model:
   concurrent_vus: 10
@@ -199,3 +232,24 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         self.assertIn("a", per_flow)
         self.assertIn("b", per_flow)
         self.assertIn("session_completion_rate", per_flow["a"])
+
+    def test_schema_v2_variables_and_extract_assert(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "v2.yaml"
+            p.write_text(_V2_YAML, encoding="utf-8")
+            out = load_raw_scenario(str(p))
+        self.assertEqual(int(out["schema_version"]), 2)
+        self.assertEqual(out["flows"]["browse"]["steps"][0]["path"], "https://example.test/")
+        self.assertEqual(out["personas"]["web_user"]["headers"]["X-Base"], "https://example.test")
+
+    def test_sla_module_evaluation(self):
+        ev = evaluate_scenario_sla(
+            sessions_started=100,
+            sessions_completed=96,
+            step_attempted=1000,
+            step_failed=30,
+            sla={"min_completion_rate": 0.95, "max_step_fail_ratio": 0.05},
+            latency_p95_ms=100.0,
+        )
+        self.assertTrue(ev.passed)
+        self.assertEqual(ev.reasons, [])
