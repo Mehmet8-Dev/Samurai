@@ -307,6 +307,8 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             utils.log_critical(f"Traffic model planner failed: {exc}")
             return 1
     scenario_sessions_by_worker = [[] for _ in range(workers)]
+    scenario_runtime_batches_by_worker = [[] for _ in range(workers)]
+    scenario_runtime_metrics_by_worker = [{} for _ in range(workers)]
     if scenario_enabled and scenario_spec is not None:
         try:
             scenario_sessions_by_worker, scenario_build_metrics = scenario_engine.build_worker_session_plans(
@@ -316,6 +318,15 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             )
             scenario_backend = str((scenario_build_metrics or {}).get("scenario_backend", "http") or "http").strip().lower()
             args.attack_vector = "http2" if scenario_backend == "http2" else "http"
+            for wi in range(workers):
+                batches, sm = scenario_engine.build_vu_lifecycle_batches(
+                    scenario_sessions=list(scenario_sessions_by_worker[wi] or []),
+                    ramp_seconds=int(getattr(args, "scenario_ramp_seconds", 0) or 0) or int((scenario_build_metrics or {}).get("scenario_ramp_seconds", 0) or 0),
+                    max_session_seconds=int(getattr(args, "scenario_max_session_seconds", 0) or 0) or int(scenario_spec.load_model.max_session_seconds),
+                    seed=int(getattr(args, "scenario_seed", 1337) or 1337) + wi,
+                )
+                scenario_runtime_batches_by_worker[wi] = scenario_engine.serialize_batches(batches)
+                scenario_runtime_metrics_by_worker[wi] = dict(sm or {})
         except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
             utils.log_critical(f"Scenario scheduler failed: {exc}")
             return 1
@@ -344,6 +355,8 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
         worker_args.traffic_model_sessions = list(traffic_model_sessions_by_worker[i] or [])
         worker_args.scenario_mode = scenario_mode
         worker_args.scenario_sessions = list(scenario_sessions_by_worker[i] or [])
+        worker_args.scenario_runtime_batches = list(scenario_runtime_batches_by_worker[i] or [])
+        worker_args.scenario_runtime_metrics = dict(scenario_runtime_metrics_by_worker[i] or {})
         if soak_deadline_ts > 0.0:
             worker_args.soak_deadline_ts = float(soak_deadline_ts)
         if worker_args.rps > 0:
@@ -473,8 +486,15 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             if scenario_enabled and scenario_spec is not None:
                 sessions_started = int((scenario_build_metrics or {}).get("sessions_started", 0) or 0)
                 step_attempted = int((scenario_build_metrics or {}).get("step_attempted", 0) or 0)
+                step_attempted = max(
+                    step_attempted,
+                    int(sum(int((x or {}).get("step_attempted", 0) or 0) for x in list(scenario_runtime_metrics_by_worker or []))),
+                )
+                lifecycle_step_failed = int(
+                    sum(int((x or {}).get("step_failed", 0) or 0) for x in list(scenario_runtime_metrics_by_worker or []))
+                )
                 sessions_completed = int(rr.results.get("sent_total", 0) or 0)
-                step_failed = int(rr.results.get("errors_total", 0) or 0)
+                step_failed = int(rr.results.get("errors_total", 0) or 0) + lifecycle_step_failed
                 sla_ok, sla_detail = scenario_engine.evaluate_sla(
                     sla=scenario_spec_to_dict(scenario_spec).get("sla", {}),
                     sessions_started=sessions_started,
