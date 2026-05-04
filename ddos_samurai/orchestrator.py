@@ -1889,6 +1889,28 @@ async def worker_process(
                 items = list(getattr(request_plan, "items", []) or [])
                 if not items:
                     return
+                # Prefer granular step outcomes from transport if exposed.
+                granular = list((send_out or {}).get("scenario_step_results", []) or [])
+                if not granular:
+                    granular = list((send_out or {}).get("step_results", []) or [])
+                if granular:
+                    for row in granular:
+                        flow = str((row or {}).get("flow", "unknown") or "unknown")
+                        vu_id = str((row or {}).get("vu_id", "") or "")
+                        ok = bool((row or {}).get("success", False))
+                        _scenario_flow_steps[flow] = int(_scenario_flow_steps.get(flow, 0) or 0) + 1
+                        if not ok:
+                            _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
+                        if vu_id:
+                            _scenario_vu_progress[vu_id] = int(_scenario_vu_progress.get(vu_id, 0) or 0) + 1
+                            if not ok:
+                                _scenario_vu_failed[vu_id] = int(_scenario_vu_failed.get(vu_id, 0) or 0) + 1
+                            expected = int(scenario_vu_expected_steps.get(vu_id, 0) or 0)
+                            if expected > 0 and _scenario_vu_progress[vu_id] >= expected:
+                                if int(_scenario_vu_failed.get(vu_id, 0) or 0) == 0:
+                                    _scenario_flow_vu_completed[flow] = int(_scenario_flow_vu_completed.get(flow, 0) or 0) + 1
+                    return
+
                 attempted = len(items)
                 sent_ok = max(0, int((send_out or {}).get("sent", 0) or 0))
                 errors = max(0, int((send_out or {}).get("errors", 0) or 0))
@@ -1905,7 +1927,7 @@ async def worker_process(
                     if vu_id:
                         _scenario_vu_progress[vu_id] = int(_scenario_vu_progress.get(vu_id, 0) or 0) + 1
                         if is_failed:
-                            _scenario_vu_failed[vu_id] = 1
+                            _scenario_vu_failed[vu_id] = int(_scenario_vu_failed.get(vu_id, 0) or 0) + 1
                         expected = int(scenario_vu_expected_steps.get(vu_id, 0) or 0)
                         if expected > 0 and _scenario_vu_progress[vu_id] >= expected:
                             if int(_scenario_vu_failed.get(vu_id, 0) or 0) == 0:
