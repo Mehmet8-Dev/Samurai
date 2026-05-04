@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+import asyncio
 
 from ddos_samurai.scenario_engine import load_raw_scenario, load_scenario_spec
 from ddos_samurai.scenario_engine import native as scenario_native
@@ -354,3 +355,42 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         )
         self.assertEqual(len(snaps), 2)
         self.assertTrue(all(str(s.state.value) in {"completed", "failed"} for s in snaps))
+
+    def test_vu_pool_policy_max_retries_abort(self):
+        sessions = [{"flow": "f1", "events": [{"event_type": "http_request"}]}]
+        pool = VUPool(
+            scenario_sessions=sessions,
+            ramp_seconds=0,
+            max_session_seconds=10,
+            flow_policies={"f1": {"max_retries": 0, "timeout_action": "abort"}},
+        )
+        pool.spawn_until(0.0)
+        pool.ingest_step_results([{"vu_id": "1", "flow": "f1", "success": False, "timeout": True}])
+        snap = pool.snapshots()[0]
+        self.assertEqual(str(snap.state.value), "failed")
+        self.assertEqual(int(snap.retries_used), 0)
+
+    def test_vu_pool_async_step_batches(self):
+        sessions = [{"flow": "f1", "events": [{"event_type": "http_request"}, {"event_type": "http_request"}]}]
+        pool = VUPool(
+            scenario_sessions=sessions,
+            ramp_seconds=0,
+            max_session_seconds=5,
+            flow_policies={"f1": {"max_retries": 2, "backoff_base_ms": 1, "backoff_max_ms": 2}},
+        )
+
+        calls = {"n": 0}
+
+        async def provider(elapsed_s):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [{"vu_id": "1", "flow": "f1", "success": False, "timeout": False}]
+            if calls["n"] == 2:
+                return [{"vu_id": "1", "flow": "f1", "success": True, "timeout": False}]
+            return []
+
+        snaps = asyncio.run(
+            pool.drive_with_step_batches(duration_s=0.1, step_batch_provider=provider, tick_ms=10)
+        )
+        self.assertEqual(len(snaps), 1)
+        self.assertIn(str(snaps[0].state.value), {"completed", "failed"})
