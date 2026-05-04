@@ -650,6 +650,27 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
                     float(gates.get("scenario_step_fail_ratio_max", 0.05) or 0.05),
                     required=True,
                 ),
+                KpiGateRule(
+                    "scenario_flow_min_completion_rate",
+                    "scenario_flow_min_completion_rate",
+                    "min",
+                    float(gates.get("scenario_flow_min_completion_rate_min", 0.90) or 0.90),
+                    required=True,
+                ),
+                KpiGateRule(
+                    "scenario_flow_max_step_fail_ratio",
+                    "scenario_flow_max_step_fail_ratio",
+                    "max",
+                    float(gates.get("scenario_flow_max_step_fail_ratio_max", 0.10) or 0.10),
+                    required=True,
+                ),
+                KpiGateRule(
+                    "scenario_flow_coverage_pct",
+                    "scenario_flow_coverage_pct",
+                    "min",
+                    float(gates.get("scenario_flow_coverage_pct_min", 80.0) or 80.0),
+                    required=True,
+                ),
             ]
         )
     runtime_transport_backend_required = str(gates.get("runtime_transport_backend_required", "") or "").strip()

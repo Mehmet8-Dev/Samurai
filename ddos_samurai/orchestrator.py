@@ -1077,6 +1077,11 @@ async def worker_process(
     worker_stats["topo_tuple_alloc_fail"] = int(args.get("topology_tuple_alloc_fail", 0) or 0)
     worker_stats["topology_tuple_index"] = int(args.get("topology_tuple_index", -1) or -1)
     worker_stats["topology_tuple_row_json"] = str(args.get("topology_tuple_row_json", "") or "")
+    scenario_enabled = False
+    _scenario_flow_steps: dict[str, int] = {}
+    _scenario_flow_failed_steps: dict[str, int] = {}
+    _scenario_flow_vu_completed: dict[str, int] = {}
+    _scenario_flow_vu_total: dict[str, int] = {}
     _gpu_packet_mod = None
     _gpu_ring_depth_peak = 0
     _gpu_ring_block_wait_ns = 0
@@ -1842,9 +1847,20 @@ async def worker_process(
             traffic_model_sessions = list(args.get("traffic_model_sessions", []) or [])
             scenario_sessions = list(args.get("scenario_sessions", []) or [])
             scenario_runtime_batches = list(args.get("scenario_runtime_batches", []) or [])
+            scenario_runtime_metrics = dict(args.get("scenario_runtime_metrics", {}) or {})
             traffic_model_mode = str(args.get("traffic_model", "none") or "none").strip().lower()
             traffic_model_enabled = traffic_model_mode != "none" and len(traffic_model_sessions) > 0
             scenario_enabled = len(scenario_sessions) > 0
+            scenario_vu_expected_steps = dict(scenario_runtime_metrics.get("vu_expected_steps", {}) or {})
+            scenario_vu_flow = dict(scenario_runtime_metrics.get("vu_flow", {}) or {})
+            _scenario_vu_progress: dict[str, int] = {}
+            _scenario_vu_failed: dict[str, int] = {}
+            _scenario_flow_steps: dict[str, int] = {}
+            _scenario_flow_failed_steps: dict[str, int] = {}
+            _scenario_flow_vu_completed: dict[str, int] = {}
+            _scenario_flow_vu_total: dict[str, int] = {}
+            for _vu_id, _flow in scenario_vu_flow.items():
+                _scenario_flow_vu_total[str(_flow)] = int(_scenario_flow_vu_total.get(str(_flow), 0) or 0) + 1
 
             def _iter_scenario_runtime_batches():
                 for row in scenario_runtime_batches:
@@ -1868,6 +1884,32 @@ async def worker_process(
                             }
                     except _RECOVERABLE_ERRORS as exc:
                         _debug_exception(f"[Worker {worker_id}] scenario runtime batch parse failed", exc)
+
+            def _ingest_scenario_closed_loop(request_plan, send_out: dict):
+                items = list(getattr(request_plan, "items", []) or [])
+                if not items:
+                    return
+                attempted = len(items)
+                sent_ok = max(0, int((send_out or {}).get("sent", 0) or 0))
+                errors = max(0, int((send_out or {}).get("errors", 0) or 0))
+                success_count = min(attempted, sent_ok)
+                fail_count = min(attempted - success_count, errors if errors > 0 else max(0, attempted - success_count))
+                for idx, item in enumerate(items):
+                    headers = dict(getattr(item, "headers", {}) or {})
+                    flow = str(headers.get("x-scenario-flow", "unknown") or "unknown")
+                    vu_id = str(headers.get("x-scenario-vu-id", "") or "")
+                    _scenario_flow_steps[flow] = int(_scenario_flow_steps.get(flow, 0) or 0) + 1
+                    is_failed = idx >= success_count and (idx - success_count) < fail_count
+                    if is_failed:
+                        _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
+                    if vu_id:
+                        _scenario_vu_progress[vu_id] = int(_scenario_vu_progress.get(vu_id, 0) or 0) + 1
+                        if is_failed:
+                            _scenario_vu_failed[vu_id] = 1
+                        expected = int(scenario_vu_expected_steps.get(vu_id, 0) or 0)
+                        if expected > 0 and _scenario_vu_progress[vu_id] >= expected:
+                            if int(_scenario_vu_failed.get(vu_id, 0) or 0) == 0:
+                                _scenario_flow_vu_completed[flow] = int(_scenario_flow_vu_completed.get(flow, 0) or 0) + 1
 
             def _iter_model_plans():
                 for session_plan in traffic_model_sessions:
@@ -1968,7 +2010,7 @@ async def worker_process(
                         last_dispatch_ts = dispatch_s
                         request_plan = bundle.get("request_plan")
                         batch_count = int(len(getattr(request_plan, "items", []) or []))
-                        worker_stats = _add_stats(worker_stats, await senders.http_stateful_sender(
+                        _out = await senders.http_stateful_sender(
                             args['target'], args['port'],
                             batch_count, args['http_concurrency'],
                             workflow_steps=None,
@@ -2003,7 +2045,9 @@ async def worker_process(
                             live_sent=sent_total,
                             live_errors=errors_total,
                             live_progress=progress,
-                        ))
+                        )
+                        _ingest_scenario_closed_loop(request_plan, _out)
+                        worker_stats = _add_stats(worker_stats, _out)
                     return
                 if traffic_model_request_plans:
                     for request_plan in traffic_model_request_plans:
@@ -2101,7 +2145,7 @@ async def worker_process(
                         last_dispatch_ts = dispatch_s
                         request_plan = bundle.get("request_plan")
                         batch_count = int(len(getattr(request_plan, "items", []) or []))
-                        worker_stats = _add_stats(worker_stats, await senders.http_stateful_sender(
+                        _out = await senders.http_stateful_sender(
                             args['target'], args['port'],
                             batch_count, args['http_concurrency'],
                             workflow_steps=None,
@@ -2136,7 +2180,9 @@ async def worker_process(
                             live_sent=sent_total,
                             live_errors=errors_total,
                             live_progress=progress,
-                        ))
+                        )
+                        _ingest_scenario_closed_loop(request_plan, _out)
+                        worker_stats = _add_stats(worker_stats, _out)
                     return
                 worker_stats = _add_stats(worker_stats, await senders.http_app_sender(
                     args['target'], args['port'], args['count'], args['http_concurrency'],
@@ -2176,7 +2222,7 @@ async def worker_process(
                         last_dispatch_ts = dispatch_s
                         request_plan = bundle.get("request_plan")
                         plan_count = int(len(getattr(request_plan, "items", []) or []))
-                        worker_stats = _add_stats(worker_stats, await senders.http2_sender(
+                        _out = await senders.http2_sender(
                             target_ip=args['target'],
                             target_port=args['port'],
                             count=plan_count,
@@ -2203,7 +2249,9 @@ async def worker_process(
                             live_sent=sent_total,
                             live_errors=errors_total,
                             live_progress=progress,
-                        ))
+                        )
+                        _ingest_scenario_closed_loop(request_plan, _out)
+                        worker_stats = _add_stats(worker_stats, _out)
                     return
                 if traffic_model_request_plans:
                     for request_plan in traffic_model_request_plans:
@@ -3893,6 +3941,26 @@ async def worker_process(
         # Live counters are already streamed incrementally by sender functions
         # through live_progress/live_sent/live_errors. Adding worker_stats again
         # here causes double counting (e.g. >100% progress and inflated PPS).
+        if scenario_enabled:
+            _flow_keys = set(_scenario_flow_vu_total.keys()) | set(_scenario_flow_steps.keys()) | set(_scenario_flow_failed_steps.keys())
+            _flow_count = max(1, len(_flow_keys))
+            _covered = 0
+            _min_completion = 1.0
+            _max_step_fail_ratio = 0.0
+            for _flow in _flow_keys:
+                _tot_vu = int(_scenario_flow_vu_total.get(_flow, 0) or 0)
+                _done_vu = int(_scenario_flow_vu_completed.get(_flow, 0) or 0)
+                _steps = int(_scenario_flow_steps.get(_flow, 0) or 0)
+                _step_fail = int(_scenario_flow_failed_steps.get(_flow, 0) or 0)
+                if _tot_vu > 0:
+                    _covered += 1
+                _comp_rate = float(_done_vu / max(1, _tot_vu))
+                _fail_ratio = float(_step_fail / max(1, _steps))
+                _min_completion = min(_min_completion, _comp_rate)
+                _max_step_fail_ratio = max(_max_step_fail_ratio, _fail_ratio)
+            worker_stats["scenario_flow_min_completion_rate"] = float(_min_completion if _flow_keys else 0.0)
+            worker_stats["scenario_flow_max_step_fail_ratio"] = float(_max_step_fail_ratio if _flow_keys else 0.0)
+            worker_stats["scenario_flow_coverage_pct"] = float((100.0 * _covered) / float(_flow_count))
 
         if run_events is not None:
             try:
