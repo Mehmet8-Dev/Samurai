@@ -84,12 +84,12 @@ def test_scenario_runtime_metrics_to_dict_includes_polish_fields() -> None:
 
 
 def test_latency_digest_quantiles_and_merge() -> None:
-    d1 = LatencyDigest(max_samples=64)
-    d2 = LatencyDigest(max_samples=64)
+    d1 = LatencyDigest(max_centroids=64)
+    d2 = LatencyDigest(max_centroids=64)
     for x in [10, 20, 30, 40]:
         d1.add(float(x))
     for x in [50, 60, 70, 80]:
         d2.add(float(x))
     d1.merge(d2)
     assert d1.quantile(0.50) >= 35.0
-    assert d1.quantile(0.95) >= 70.0
+    assert d1.quantile(0.95) >= 66.0

@@ -14,6 +14,7 @@ from ddos_samurai.scenario_engine.runtime import (
     simulate_vu_state_machine,
     serialize_batches,
 )
+from ddos_samurai.scenario_engine.metrics import LatencyDigest
 from ddos_samurai.scenario_engine.sla import evaluate_scenario_sla
 from ddos_samurai.scenario_engine.types import ScenarioSpec
 
@@ -395,6 +396,21 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         )
         self.assertFalse(ev.passed)
         self.assertTrue(any(str(x).startswith("per_flow_completion_below:checkout") for x in ev.reasons))
+
+    def test_sla_module_uses_latency_digest_when_p95_missing(self):
+        d = LatencyDigest(max_centroids=64)
+        for v in [10.0, 20.0, 30.0, 40.0, 300.0]:
+            d.add(v)
+        ev = evaluate_scenario_sla(
+            sessions_started=10,
+            sessions_completed=10,
+            step_attempted=100,
+            step_failed=0,
+            sla={"min_completion_rate": 0.9, "max_step_fail_ratio": 0.1, "max_latency_p95_ms": 30.0},
+            latency_digest=d,
+        )
+        self.assertFalse(ev.passed)
+        self.assertTrue(any(str(x).startswith("latency_p95_above_threshold") for x in ev.reasons))
 
     def test_ramp_controller_curves(self):
         linear = RampController(target_vus=100, ramp_seconds=10, curve="linear")
