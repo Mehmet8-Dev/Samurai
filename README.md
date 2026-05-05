@@ -66,6 +66,30 @@ python -m ddos_samurai.cli \
 python -m ddos_samurai.cli --list-profiles
 ```
 
+## Scenario Engine (L7 Persona)
+
+Scenario Engine, web/mobile persona tabanlı L7 kullanıcı davranışı üretir.
+
+- Destek: `http` (HTTP/1.1), `http2` (HTTP/2)
+- Modlar: `off`, `shadow`, `enforce`
+- DSL: YAML (`personas`, `flows`, `load_model`, `sla`)
+
+Hızlı örnek:
+
+```bash
+python -m ddos_samurai.cli \
+  --scenario-file docs/scenario_web_mobile.yaml \
+  --scenario-mode enforce \
+  --scenario-vus 100000 \
+  --scenario-ramp-seconds 120 \
+  --scenario-max-session-seconds 60 \
+  --confirm
+```
+
+Detaylar:
+- [Scenario Engine Dokümantasyonu](docs/28-scenario-engine-web-mobile-persona.md)
+- [Scenario Örnek Dosyası](docs/scenario_web_mobile.yaml)
+
 ## Temel Mimari
 
 - CLI paketi: `ddos_samurai/cli/`
@@ -91,12 +115,8 @@ pytest tests -q -rs
 ## Dokümantasyon
 
 - [Dokümantasyon İndeksi](docs/README.md)
-- [Genel Bakış](docs/00-overview.md)
-- [CLI](docs/01-cli.md)
-- [Orchestrator](docs/02-orchestrator.md)
-- [Senders](docs/03-senders.md)
-- [GPU](docs/05-gpu.md)
-- [Env + CLI Referansı](docs/20-env-cli-reference.md)
+- [Scenario Engine (Web/Mobile Persona)](docs/28-scenario-engine-web-mobile-persona.md)
+- [L7 Native Custom QUIC/H3 Parity Planı](docs/PLAN_L7_NATIVE_CUSTOM_QUIC_H3_PARITY.md)
 
 ## Lisans
 

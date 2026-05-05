@@ -10,6 +10,7 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 *.md
 !CHANGELOG.md
 !docs/PLAN_L7_NATIVE_CUSTOM_QUIC_H3_PARITY.md
+!docs/28-scenario-engine-web-mobile-persona.md
 
 # Python cache / build
 __pycache__/
