@@ -124,6 +124,14 @@ struct PackedEvents {
   std::vector<int> think_stddev_ms{};
 };
 
+struct CompiledPackedSession {
+  std::string flow{};
+  std::string persona{};
+  int step_attempted{0};
+  int session_timeout_ms{0};
+  PackedEvents events{};
+};
+
 static int intern_map(
     const std::unordered_map<std::string, std::string>& m,
     std::vector<std::unordered_map<std::string, std::string>>& pool) {
@@ -376,6 +384,74 @@ py::dict compile_session_plan_packed_native(const ScenarioSpecNative& spec, cons
   auto itp = spec.personas.find(spec.flows[spec.flow_index.at(flow_name)].persona);
   if (itp != spec.personas.end()) persona = &itp->second;
   out["session_timeout_ms"] = py::int_(persona != nullptr ? std::max(0, persona->session_timeout_ms) : 0);
+  return out;
+}
+
+static py::dict packed_session_to_py_dict(const CompiledPackedSession& s) {
+  py::dict out;
+  out["flow"] = s.flow;
+  out["persona"] = s.persona;
+  out["packed"] = py::bool_(true);
+  out["event_kind"] = py::cast(s.events.event_kind);
+  out["request_kind"] = py::cast(s.events.request_kind);
+  out["method"] = py::cast(s.events.method);
+  out["path"] = py::cast(s.events.path);
+  out["body_template"] = py::cast(s.events.body_template);
+  out["headers_idx"] = py::cast(s.events.headers_idx);
+  out["cookies_idx"] = py::cast(s.events.cookies_idx);
+  out["headers_pool"] = py::cast(s.events.headers_pool);
+  out["cookies_pool"] = py::cast(s.events.cookies_pool);
+  out["device_profile"] = py::cast(s.events.device_profile);
+  out["timeout_ms"] = py::cast(s.events.timeout_ms);
+  out["retry_count"] = py::cast(s.events.retry_count);
+  out["on_failure"] = py::cast(s.events.on_failure);
+  out["think_min_ms"] = py::cast(s.events.think_min_ms);
+  out["think_max_ms"] = py::cast(s.events.think_max_ms);
+  out["think_distribution"] = py::cast(s.events.think_distribution);
+  out["think_mean_ms"] = py::cast(s.events.think_mean_ms);
+  out["think_stddev_ms"] = py::cast(s.events.think_stddev_ms);
+  out["step_attempted"] = s.step_attempted;
+  out["session_timeout_ms"] = s.session_timeout_ms;
+  return out;
+}
+
+py::list compile_session_plans_packed_bulk_native(
+    const ScenarioSpecNative& spec,
+    const std::vector<std::string>& flow_names,
+    const std::vector<std::uint64_t>& seeds) {
+  const std::size_t n = flow_names.size();
+  std::vector<CompiledPackedSession> compiled{};
+  compiled.resize(n);
+  {
+    py::gil_scoped_release release;
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::string& flow_name = flow_names[i];
+      auto itf = spec.flow_index.find(flow_name);
+      if (itf == spec.flow_index.end()) {
+        continue;
+      }
+      std::mt19937_64 rng((i < seeds.size()) ? seeds[i] : static_cast<std::uint64_t>(i + 1));
+      CompileState st{};
+      st.rng = &rng;
+      st.backend = spec.load_model.backend;
+      CompiledPackedSession row{};
+      row.flow = flow_name;
+      row.persona = spec.flows[itf->second].persona;
+      compile_flow_recursive_packed(spec, flow_name, st, row.events);
+      row.step_attempted = st.attempted;
+      const Persona* persona = nullptr;
+      auto itp = spec.personas.find(row.persona);
+      if (itp != spec.personas.end()) {
+        persona = &itp->second;
+      }
+      row.session_timeout_ms = (persona != nullptr) ? std::max(0, persona->session_timeout_ms) : 0;
+      compiled[i] = std::move(row);
+    }
+  }
+  py::list out;
+  for (const auto& row : compiled) {
+    out.append(packed_session_to_py_dict(row));
+  }
   return out;
 }
 
