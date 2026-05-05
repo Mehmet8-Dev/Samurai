@@ -11,7 +11,8 @@ namespace ddos_samurai::scenario_native {
 
 static py::dict compile_session_plan(const py::dict& spec, const std::string& flow_name, std::uint64_t seed) {
   const ScenarioSpecNative native = parse_spec(spec);
-  return compile_session_plan_native(native, flow_name, seed);
+  // GAP-2: legacy compile entrypoint is redirected to packed output.
+  return compile_session_plan_packed_native(native, flow_name, seed);
 }
 
 static py::dict compile_session_plan_packed(const py::dict& spec, const std::string& flow_name, std::uint64_t seed) {
