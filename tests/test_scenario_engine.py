@@ -10,7 +10,9 @@ from ddos_samurai.scenario_engine.runtime import (
     VUPool,
     build_vu_lifecycle_batches,
     collect_per_flow_metrics,
+    deserialize_batches,
     simulate_vu_state_machine,
+    serialize_batches,
 )
 from ddos_samurai.scenario_engine.sla import evaluate_scenario_sla
 from ddos_samurai.scenario_engine.types import ScenarioSpec
@@ -285,6 +287,47 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         delays = [float(b.delay_s) for b in batches]
         self.assertTrue(any(d >= 1.0 for d in delays))
         self.assertEqual(int(metrics["vus_spawned"]), 2)
+
+    def test_vu_lifecycle_batches_inject_body_template(self):
+        sessions = [
+            {
+                "events": [
+                    {"event_type": "http_request", "method": "POST", "path": "/submit", "body_template": '{"ok":true}'},
+                ]
+            }
+        ]
+        batches, _ = build_vu_lifecycle_batches(
+            scenario_sessions=sessions,
+            ramp_seconds=0,
+            max_session_seconds=10,
+            seed=3,
+            bucket_ms=50,
+        )
+        self.assertTrue(batches)
+        item = batches[0].request_plan.items[0]
+        self.assertEqual(item.method, "POST")
+        self.assertEqual(bytes(item.body or b""), b'{"ok":true}')
+        self.assertEqual(str(item.content_type or ""), "application/json")
+
+    def test_serialize_deserialize_batches_keep_body(self):
+        sessions = [
+            {
+                "events": [
+                    {"event_type": "http_request", "method": "POST", "path": "/x", "body_template": "hello"},
+                ]
+            }
+        ]
+        batches, _ = build_vu_lifecycle_batches(
+            scenario_sessions=sessions,
+            ramp_seconds=0,
+            max_session_seconds=10,
+            seed=5,
+        )
+        encoded = serialize_batches(batches)
+        restored = deserialize_batches(encoded)
+        item = restored[0].request_plan.items[0]
+        self.assertEqual(bytes(item.body or b""), b"hello")
+        self.assertEqual(str(item.content_type or ""), "text/plain; charset=utf-8")
 
     def test_state_machine_feedback_and_per_flow_metrics(self):
         sessions = [

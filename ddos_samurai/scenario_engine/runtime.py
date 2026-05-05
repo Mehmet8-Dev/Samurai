@@ -12,6 +12,15 @@ from ..gpu_cuda_payload import H2RequestPlan, H2RequestPlanItem
 from .metrics import FlowRuntimeMetrics
 
 
+def _infer_content_type_from_template(body_template: str) -> str | None:
+    text = str(body_template or "").strip()
+    if not text:
+        return None
+    if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
+        return "application/json"
+    return "text/plain; charset=utf-8"
+
+
 @dataclass(frozen=True)
 class ScheduledRequestBatch:
     delay_s: float
@@ -348,11 +357,20 @@ class VUPool:
 
 
 def _as_item_dict(item: H2RequestPlanItem) -> dict[str, Any]:
+    body = getattr(item, "body", None)
+    body_text = None
+    if body:
+        try:
+            body_text = bytes(body).decode("utf-8")
+        except Exception:
+            body_text = bytes(body).decode("latin-1")
     return {
         "method": str(item.method),
         "path": str(item.path),
         "headers": dict(item.headers or {}),
         "user_agent": item.user_agent,
+        "body": body_text,
+        "content_type": getattr(item, "content_type", None),
     }
 
 
@@ -396,12 +414,16 @@ def deserialize_batches(payload: list[dict[str, Any]]) -> list[ScheduledRequestB
     for row in list(payload or []):
         items = []
         for it in list((row or {}).get("items", []) or []):
+            raw_body = (it or {}).get("body", None)
+            body = None if raw_body is None else str(raw_body).encode("utf-8")
             items.append(
                 H2RequestPlanItem(
                     method=str((it or {}).get("method", "GET") or "GET"),
                     path=str((it or {}).get("path", "/") or "/"),
                     headers=dict((it or {}).get("headers") or {}),
                     user_agent=(it or {}).get("user_agent"),
+                    body=body,
+                    content_type=((it or {}).get("content_type") or None),
                 )
             )
         out.append(
@@ -476,6 +498,7 @@ def build_vu_lifecycle_batches(
             cookies_pool = list((session or {}).get("cookies_pool", []) or [])
             retry_list = list((session or {}).get("retry_count", []) or [])
             on_failure_list = list((session or {}).get("on_failure", []) or [])
+            body_templates = list((session or {}).get("body_template", []) or [])
             think_min = list((session or {}).get("think_min_ms", []) or [])
             think_max = list((session or {}).get("think_max_ms", []) or [])
             think_dist = list((session or {}).get("think_distribution", []) or [])
@@ -537,10 +560,21 @@ def build_vu_lifecycle_batches(
                 headers["x-scenario-flow"] = flow
                 headers["x-scenario-vu-id"] = str(vu_id)
                 headers["x-scenario-on-failure"] = on_failure
+                body_template = str(body_templates[i] if i < len(body_templates) else "")
+                body_bytes = body_template.encode("utf-8") if body_template else None
+                content_type = _infer_content_type_from_template(body_template)
                 if cookies:
                     headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
                 key = int((t * 1000.0) // bucket)
-                timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
+                timeline.setdefault(key, []).append(
+                    H2RequestPlanItem(
+                        method=method,
+                        path=path,
+                        headers=headers,
+                        body=body_bytes,
+                        content_type=content_type,
+                    )
+                )
                 if on_failure != "retry":
                     retry_count = 0
                 for r in range(retry_count):
@@ -550,7 +584,15 @@ def build_vu_lifecycle_batches(
                         continue
                     step_attempted += 1
                     key_retry = int((t_retry * 1000.0) // bucket)
-                    timeline.setdefault(key_retry, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
+                    timeline.setdefault(key_retry, []).append(
+                        H2RequestPlanItem(
+                            method=method,
+                            path=path,
+                            headers=headers,
+                            body=body_bytes,
+                            content_type=content_type,
+                        )
+                    )
         else:
             for ev in events:
                 et = str((ev or {}).get("event_type", "") or "").strip().lower()
@@ -582,8 +624,19 @@ def build_vu_lifecycle_batches(
                 headers["x-scenario-flow"] = flow
                 headers["x-scenario-vu-id"] = str(vu_id)
                 headers["x-scenario-on-failure"] = on_failure
+                body_template = str((ev or {}).get("body_template", "") or "")
+                body_bytes = body_template.encode("utf-8") if body_template else None
+                content_type = _infer_content_type_from_template(body_template)
                 key = int((t * 1000.0) // bucket)
-                timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
+                timeline.setdefault(key, []).append(
+                    H2RequestPlanItem(
+                        method=method,
+                        path=path,
+                        headers=headers,
+                        body=body_bytes,
+                        content_type=content_type,
+                    )
+                )
                 # Model retry lifecycle deterministically as future attempts in plan timeline.
                 if on_failure != "retry":
                     retry_count = 0
@@ -594,7 +647,15 @@ def build_vu_lifecycle_batches(
                         continue
                     step_attempted += 1
                     key_retry = int((t_retry * 1000.0) // bucket)
-                    timeline.setdefault(key_retry, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
+                    timeline.setdefault(key_retry, []).append(
+                        H2RequestPlanItem(
+                            method=method,
+                            path=path,
+                            headers=headers,
+                            body=body_bytes,
+                            content_type=content_type,
+                        )
+                    )
         active_markers.append((min(deadline, t), -1))
 
     batches: list[ScheduledRequestBatch] = []
