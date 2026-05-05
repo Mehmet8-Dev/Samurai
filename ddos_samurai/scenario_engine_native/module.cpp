@@ -28,6 +28,14 @@ static py::list compile_session_plans_packed_bulk(
   return compile_session_plans_packed_bulk_native(native, flow_names, seeds);
 }
 
+static py::dict compile_session_plans_packed_bulk_soa(
+    const py::dict& spec,
+    const std::vector<std::string>& flow_names,
+    const std::vector<std::uint64_t>& seeds) {
+  const ScenarioSpecNative native = parse_spec(spec);
+  return compile_session_plans_packed_bulk_soa_native(native, flow_names, seeds);
+}
+
 static py::tuple build_worker_session_plans(const py::dict& spec, const std::vector<int>& worker_counts, std::uint64_t seed) {
   const ScenarioSpecNative native = parse_spec(spec);
   return build_worker_session_plans_native(native, worker_counts, seed);
@@ -52,6 +60,12 @@ PYBIND11_MODULE(_scenario_native, m) {
   m.def(
       "compile_session_plans_packed_bulk",
       &ddos_samurai::scenario_native::compile_session_plans_packed_bulk,
+      py::arg("spec"),
+      py::arg("flow_names"),
+      py::arg("seeds"));
+  m.def(
+      "compile_session_plans_packed_bulk_soa",
+      &ddos_samurai::scenario_native::compile_session_plans_packed_bulk_soa,
       py::arg("spec"),
       py::arg("flow_names"),
       py::arg("seeds"));

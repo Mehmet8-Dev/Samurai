@@ -23,5 +23,9 @@ pybind11::list compile_session_plans_packed_bulk_native(
     const ScenarioSpecNative& spec,
     const std::vector<std::string>& flow_names,
     const std::vector<std::uint64_t>& seeds);
+pybind11::dict compile_session_plans_packed_bulk_soa_native(
+    const ScenarioSpecNative& spec,
+    const std::vector<std::string>& flow_names,
+    const std::vector<std::uint64_t>& seeds);
 
 }  // namespace ddos_samurai::scenario_native

@@ -455,4 +455,87 @@ py::list compile_session_plans_packed_bulk_native(
   return out;
 }
 
+py::dict compile_session_plans_packed_bulk_soa_native(
+    const ScenarioSpecNative& spec,
+    const std::vector<std::string>& flow_names,
+    const std::vector<std::uint64_t>& seeds) {
+  const std::size_t n = flow_names.size();
+  std::vector<std::uint32_t> session_offsets{};
+  std::vector<std::string> session_flow{};
+  std::vector<std::string> session_persona{};
+  std::vector<int> session_step_attempted{};
+  std::vector<int> session_timeout_ms{};
+  PackedEvents flat{};
+  session_offsets.reserve(n + 1);
+  session_flow.reserve(n);
+  session_persona.reserve(n);
+  session_step_attempted.reserve(n);
+  session_timeout_ms.reserve(n);
+  session_offsets.push_back(0);
+  {
+    py::gil_scoped_release release;
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::string& flow_name = flow_names[i];
+      auto itf = spec.flow_index.find(flow_name);
+      if (itf == spec.flow_index.end()) {
+        session_flow.emplace_back(flow_name);
+        session_persona.emplace_back("");
+        session_step_attempted.push_back(0);
+        session_timeout_ms.push_back(0);
+        session_offsets.push_back(static_cast<std::uint32_t>(flat.event_kind.size()));
+        continue;
+      }
+      std::mt19937_64 rng((i < seeds.size()) ? seeds[i] : static_cast<std::uint64_t>(i + 1));
+      CompileState st{};
+      st.rng = &rng;
+      st.backend = spec.load_model.backend;
+      const std::string persona_name = spec.flows[itf->second].persona;
+      const std::size_t ev_base = flat.event_kind.size();
+      const std::size_t hbase = flat.headers_pool.size();
+      const std::size_t cbase = flat.cookies_pool.size();
+      compile_flow_recursive_packed(spec, flow_name, st, flat);
+      for (std::size_t j = ev_base; j < flat.headers_idx.size(); ++j) {
+        if (flat.headers_idx[j] >= 0) flat.headers_idx[j] += static_cast<int>(hbase);
+      }
+      for (std::size_t j = ev_base; j < flat.cookies_idx.size(); ++j) {
+        if (flat.cookies_idx[j] >= 0) flat.cookies_idx[j] += static_cast<int>(cbase);
+      }
+      session_flow.push_back(flow_name);
+      session_persona.push_back(persona_name);
+      session_step_attempted.push_back(st.attempted);
+      int timeout_ms = 0;
+      auto itp = spec.personas.find(persona_name);
+      if (itp != spec.personas.end()) timeout_ms = std::max(0, itp->second.session_timeout_ms);
+      session_timeout_ms.push_back(timeout_ms);
+      session_offsets.push_back(static_cast<std::uint32_t>(flat.event_kind.size()));
+    }
+  }
+  py::dict out;
+  out["packed_soa"] = py::bool_(true);
+  out["session_offsets"] = py::cast(session_offsets);
+  out["session_flow"] = py::cast(session_flow);
+  out["session_persona"] = py::cast(session_persona);
+  out["session_step_attempted"] = py::cast(session_step_attempted);
+  out["session_timeout_ms"] = py::cast(session_timeout_ms);
+  out["event_kind"] = py::cast(flat.event_kind);
+  out["request_kind"] = py::cast(flat.request_kind);
+  out["method"] = py::cast(flat.method);
+  out["path"] = py::cast(flat.path);
+  out["body_template"] = py::cast(flat.body_template);
+  out["headers_idx"] = py::cast(flat.headers_idx);
+  out["cookies_idx"] = py::cast(flat.cookies_idx);
+  out["headers_pool"] = py::cast(flat.headers_pool);
+  out["cookies_pool"] = py::cast(flat.cookies_pool);
+  out["device_profile"] = py::cast(flat.device_profile);
+  out["timeout_ms"] = py::cast(flat.timeout_ms);
+  out["retry_count"] = py::cast(flat.retry_count);
+  out["on_failure"] = py::cast(flat.on_failure);
+  out["think_min_ms"] = py::cast(flat.think_min_ms);
+  out["think_max_ms"] = py::cast(flat.think_max_ms);
+  out["think_distribution"] = py::cast(flat.think_distribution);
+  out["think_mean_ms"] = py::cast(flat.think_mean_ms);
+  out["think_stddev_ms"] = py::cast(flat.think_stddev_ms);
+  return out;
+}
+
 }  // namespace ddos_samurai::scenario_native

@@ -47,11 +47,13 @@ py::tuple build_worker_session_plans_native(
         assigned_flows.push_back(flow_names[idx]);
         assigned_seeds.push_back(rng());
       }
-      py::list worker_plans = compile_session_plans_packed_bulk_native(spec, assigned_flows, assigned_seeds);
-      sessions_started += static_cast<std::uint64_t>(py::len(worker_plans));
-      for (auto row : worker_plans) {
-        py::dict plan = py::reinterpret_borrow<py::dict>(row);
-        step_attempted += static_cast<std::uint64_t>(py::int_(plan["step_attempted"]));
+      py::dict worker_soa = compile_session_plans_packed_bulk_soa_native(spec, assigned_flows, assigned_seeds);
+      py::list worker_plans;
+      worker_plans.append(worker_soa);
+      sessions_started += static_cast<std::uint64_t>(assigned_flows.size());
+      py::list attempts = py::reinterpret_borrow<py::list>(worker_soa["session_step_attempted"]);
+      for (auto a : attempts) {
+        step_attempted += static_cast<std::uint64_t>(py::cast<int>(a));
       }
       plans_by_worker.append(worker_plans);
     }
