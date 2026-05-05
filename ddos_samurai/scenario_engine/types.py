@@ -24,6 +24,10 @@ class StepSpec:
     probability: float = 1.0
     on_failure: str = "retry"
     conditions: dict[str, Any] = field(default_factory=dict)
+    dst_port: int = 0
+    payload_template: str = ""
+    condition: str = ""
+    timeout_ms: int = 0
     think_time: ThinkTimeSpec = field(default_factory=ThinkTimeSpec)
 
 

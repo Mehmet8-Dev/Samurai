@@ -144,6 +144,38 @@ sla:
   max_step_fail_ratio: 0.1
 """
 
+_V3_L4_TCP_YAML = """\
+schema_version: 3
+personas:
+  syn_flooder:
+    device_profile: l4_tcp
+    headers: {}
+    cookies: {}
+    retry_policy: {max_retries: 0}
+    timeout_policy: {connect_timeout_ms: 3000, idle_timeout_ms: 5000}
+    tcp_mimicry: {window: 64240, mss: 1460, ttl: 64}
+flows:
+  syn_flood:
+    persona: syn_flooder
+    steps:
+      - {type: tcp_connect, dst_port: 80}
+      - {type: pause, think_time: {min_ms: 0, max_ms: 10}}
+      - {type: tcp_send, payload_template: "GET / HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n"}
+      - {type: tcp_expect, condition: "state == established", timeout_ms: 3000}
+      - {type: tcp_close}
+      - {type: end_session}
+load_model:
+  concurrent_vus: 10
+  ramp_seconds: 1
+  max_session_seconds: 30
+  backend: l4_tcp
+sla:
+  min_completion_rate: 0.9
+  max_step_fail_ratio: 0.1
+  max_connect_timeout_ratio: 0.1
+  max_retransmit_ratio: 0.05
+"""
+
 
 class TestScenarioEngineParser(unittest.TestCase):
     def test_load_valid_yaml(self):
@@ -167,6 +199,23 @@ class TestScenarioEngineParser(unittest.TestCase):
         bad = _VALID_YAML.replace("backend: http", "backend: quic")
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "bad.yaml"
+            p.write_text(bad, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                _ = load_raw_scenario(str(p))
+
+    def test_accept_v3_l4_tcp_schema(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "v3_l4.yaml"
+            p.write_text(_V3_L4_TCP_YAML, encoding="utf-8")
+            out = load_raw_scenario(str(p))
+            spec = load_scenario_spec(str(p))
+        self.assertEqual(int(out["schema_version"]), 3)
+        self.assertEqual(str(spec.load_model.backend), "l4_tcp")
+
+    def test_reject_l4_step_with_http_backend(self):
+        bad = _V3_L4_TCP_YAML.replace("backend: l4_tcp", "backend: http")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "bad_l4_backend.yaml"
             p.write_text(bad, encoding="utf-8")
             with self.assertRaises(ValueError):
                 _ = load_raw_scenario(str(p))

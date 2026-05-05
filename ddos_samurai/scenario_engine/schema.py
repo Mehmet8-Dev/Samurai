@@ -142,6 +142,68 @@ SCENARIO_SCHEMA_V2_PATCH: dict[str, Any] = {
     "additionalProperties": True,
 }
 
+SCENARIO_SCHEMA_V3_PATCH: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "schema_version": {"type": "integer", "minimum": 1},
+        "personas": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "tcp_mimicry": {
+                        "type": "object",
+                        "properties": {
+                            "window": {"type": "integer", "minimum": 1},
+                            "mss": {"type": "integer", "minimum": 1},
+                            "ttl": {"type": "integer", "minimum": 1, "maximum": 255},
+                        },
+                        "additionalProperties": True,
+                    }
+                },
+                "additionalProperties": True,
+            },
+        },
+        "flows": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "dst_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                                "payload_template": {"type": "string"},
+                                "timeout_ms": {"type": "integer", "minimum": 1},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                },
+                "additionalProperties": True,
+            },
+        },
+        "load_model": {
+            "type": "object",
+            "properties": {
+                "backend": {"type": "string", "enum": ["http", "http2", "l4_tcp"]},
+            },
+            "additionalProperties": True,
+        },
+        "sla": {
+            "type": "object",
+            "properties": {
+                "max_connect_timeout_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+                "max_retransmit_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+            "additionalProperties": True,
+        },
+    },
+    "additionalProperties": True,
+}
+
 
 def validate_with_json_schema(raw: dict[str, Any]) -> None:
     if jsonschema is None:
@@ -153,6 +215,8 @@ def validate_with_json_schema(raw: dict[str, Any]) -> None:
     merged = dict(SCENARIO_SCHEMA_V1)
     merged["properties"] = dict(SCENARIO_SCHEMA_V1.get("properties", {}))
     merged["properties"].update(dict(SCENARIO_SCHEMA_V2_PATCH.get("properties", {})))
+    if schema_version >= 3:
+        merged["properties"].update(dict(SCENARIO_SCHEMA_V3_PATCH.get("properties", {})))
     jsonschema.validate(instance=raw, schema=merged)
 
 

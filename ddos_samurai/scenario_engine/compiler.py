@@ -39,6 +39,10 @@ def scenario_spec_to_dict(spec: ScenarioSpec) -> dict:
                         "probability": float(s.probability),
                         "on_failure": s.on_failure,
                         "conditions": dict(s.conditions),
+                        "dst_port": int(s.dst_port),
+                        "payload_template": s.payload_template,
+                        "condition": s.condition,
+                        "timeout_ms": int(s.timeout_ms),
                         "think_time": {
                             "min_ms": int(s.think_time.min_ms),
                             "max_ms": int(s.think_time.max_ms),
@@ -96,6 +100,10 @@ def scenario_spec_from_dict(raw: dict) -> ScenarioSpec:
                     probability=float((row or {}).get("probability", 1.0) or 1.0),
                     on_failure=str((row or {}).get("on_failure", "retry") or "retry").strip().lower(),
                     conditions=dict((row or {}).get("conditions") or {}),
+                    dst_port=max(0, int((row or {}).get("dst_port", 0) or 0)),
+                    payload_template=str((row or {}).get("payload_template", "") or ""),
+                    condition=str((row or {}).get("condition", "") or "").strip(),
+                    timeout_ms=max(0, int((row or {}).get("timeout_ms", 0) or 0)),
                     think_time=ThinkTimeSpec(
                         min_ms=max(0, int(tt.get("min_ms", 0) or 0)),
                         max_ms=max(0, int(tt.get("max_ms", 0) or 0)),

@@ -2,8 +2,19 @@ from __future__ import annotations
 
 from typing import Any
 
-ALLOWED_STEP_TYPES = {"request", "pause", "branch", "loop", "assert", "end_session"}
-ALLOWED_BACKENDS = {"http", "http2"}
+ALLOWED_STEP_TYPES = {
+    "request",
+    "pause",
+    "branch",
+    "loop",
+    "assert",
+    "end_session",
+    "tcp_connect",
+    "tcp_send",
+    "tcp_expect",
+    "tcp_close",
+}
+ALLOWED_BACKENDS = {"http", "http2", "l4_tcp"}
 
 
 def validate_raw_schema(raw: dict[str, Any]) -> None:
@@ -20,7 +31,7 @@ def validate_raw_schema(raw: dict[str, Any]) -> None:
     load_model = raw.get("load_model") or {}
     backend = str(load_model.get("backend", "http") or "http").strip().lower()
     if backend not in ALLOWED_BACKENDS:
-        raise ValueError("load_model.backend must be http or http2")
+        raise ValueError("load_model.backend must be http or http2 or l4_tcp")
     for pname, pdata in personas.items():
         if not isinstance(pdata, dict):
             raise ValueError(f"persona '{pname}' must be an object")
@@ -76,6 +87,27 @@ def validate_raw_schema(raw: dict[str, Any]) -> None:
                 dist = str(tt.get("distribution", "uniform") or "uniform").strip().lower()
                 if dist not in {"uniform", "gaussian"}:
                     raise ValueError(f"flow '{fname}' step[{i}] think_time.distribution must be uniform|gaussian")
+            if st == "tcp_connect":
+                dst_port = int(step.get("dst_port", 0) or 0)
+                if dst_port < 1 or dst_port > 65535:
+                    raise ValueError(f"flow '{fname}' step[{i}] tcp_connect dst_port must be 1..65535")
+            if st == "tcp_send":
+                payload_template = step.get("payload_template", "")
+                if not isinstance(payload_template, str) or not payload_template:
+                    raise ValueError(f"flow '{fname}' step[{i}] tcp_send payload_template must be a non-empty string")
+            if st == "tcp_expect":
+                cond = str(step.get("condition", "") or "").strip()
+                if not cond:
+                    raise ValueError(f"flow '{fname}' step[{i}] tcp_expect requires 'condition'")
+                timeout_ms = int(step.get("timeout_ms", 0) or 0)
+                if timeout_ms <= 0:
+                    raise ValueError(f"flow '{fname}' step[{i}] tcp_expect timeout_ms must be > 0")
+
+            if backend == "l4_tcp":
+                if st == "request":
+                    raise ValueError(f"flow '{fname}' step[{i}] request is not allowed for l4_tcp backend")
+            elif st in {"tcp_connect", "tcp_send", "tcp_expect", "tcp_close"}:
+                raise ValueError(f"flow '{fname}' step[{i}] {st} requires l4_tcp backend")
 
     _validate_flow_graph(dict(flows))
 

@@ -14,6 +14,10 @@ enum class StepType : std::uint8_t {
   Loop = 3,
   Assert = 4,
   EndSession = 5,
+  TcpConnect = 6,
+  TcpSend = 7,
+  TcpExpect = 8,
+  TcpClose = 9,
 };
 
 struct ThinkTime {
@@ -33,6 +37,10 @@ struct Step {
   int repeat{1};
   double probability{1.0};
   std::string on_failure{"retry"};
+  std::uint16_t dst_port{0};
+  std::string payload_template{};
+  std::string condition{};
+  int timeout_ms{0};
   ThinkTime think_time{};
 };
 
