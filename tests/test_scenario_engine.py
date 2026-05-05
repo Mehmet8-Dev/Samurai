@@ -421,6 +421,31 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         self.assertTrue(bool(final_meta.get("final", False)))
         self.assertEqual(int(final_meta.get("vus_spawned", 0) or 0), 2)
 
+    def test_iter_vu_lifecycle_batches_matches_build_attempt_counts(self):
+        sessions = [
+            {"events": [{"event_type": "http_request", "method": "GET", "path": "/"}, {"event_type": "think_time", "min_ms": 5, "max_ms": 5}, {"event_type": "http_request", "method": "GET", "path": "/x"}]},
+            {"events": [{"event_type": "http_request", "method": "GET", "path": "/y"}]},
+        ]
+        _, metrics_build = build_vu_lifecycle_batches(
+            scenario_sessions=sessions,
+            ramp_seconds=1,
+            max_session_seconds=10,
+            seed=9,
+            bucket_ms=50,
+        )
+        rows = list(
+            iter_vu_lifecycle_batches(
+                scenario_sessions=sessions,
+                ramp_seconds=1,
+                max_session_seconds=10,
+                seed=9,
+                window_ms=200,
+                bucket_ms=50,
+            )
+        )
+        final_meta = dict(rows[-1][1] or {})
+        self.assertEqual(int(final_meta.get("step_attempted", 0) or 0), int(metrics_build.get("step_attempted", 0) or 0))
+
     def test_state_machine_feedback_and_per_flow_metrics(self):
         sessions = [
             {"flow": "a", "events": [{"event_type": "http_request"}, {"event_type": "think_time", "min_ms": 10, "max_ms": 10}]},
@@ -545,6 +570,123 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
             ramp_step_interval_s=2,
         )
         self.assertTrue(len(batches) > 0)
+
+    def test_iter_vu_lifecycle_batches_streaming_window_correctness(self):
+        sessions = [
+            {"events": [{"event_type": "http_request", "method": "GET", "path": "/"}, {"event_type": "think_time", "min_ms": 5, "max_ms": 5}, {"event_type": "http_request", "method": "GET", "path": "/a"}]},
+            {"events": [{"event_type": "http_request", "method": "GET", "path": "/b"}]},
+            {"events": [{"event_type": "http_request", "method": "GET", "path": "/c"}]},
+        ]
+        built, built_metrics = build_vu_lifecycle_batches(
+            scenario_sessions=sessions,
+            ramp_seconds=1,
+            max_session_seconds=10,
+            seed=123,
+            bucket_ms=50,
+        )
+        streamed = list(
+            iter_vu_lifecycle_batches(
+                scenario_sessions=sessions,
+                ramp_seconds=1,
+                max_session_seconds=10,
+                seed=123,
+                window_ms=120,
+                bucket_ms=50,
+            )
+        )
+        built_items = int(sum(len(list((b.request_plan.items or []))) for b in built))
+        streamed_batches = [row[0] for row in streamed if row and row[0] is not None]
+        streamed_items = int(sum(len(list((b.request_plan.items or []))) for b in streamed_batches))
+        self.assertEqual(streamed_items, built_items)
+        self.assertEqual(int(streamed[-1][1].get("step_attempted", 0) or 0), int(built_metrics.get("step_attempted", 0) or 0))
+
+    def test_ramp_spike_curve_accuracy_checkpoints(self):
+        rc = RampController(target_vus=100, ramp_seconds=10, curve="spike")
+        self.assertEqual(rc.active_vus_at(0.0), 0)
+        self.assertEqual(rc.active_vus_at(2.0), 70)  # 20% ramp -> 70% VUs
+        self.assertEqual(rc.active_vus_at(6.0), 84)  # integer flooring on tail interpolation
+        self.assertEqual(rc.active_vus_at(10.0), 100)
+
+    def test_native_compile_invalid_flow_raises(self):
+        try:
+            scenario_native.require_native()
+        except RuntimeError:
+            self.skipTest("scenario native module unavailable")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "ok.yaml"
+            p.write_text(_VALID_YAML, encoding="utf-8")
+            spec = load_raw_scenario(str(p))
+        with self.assertRaises(RuntimeError):
+            _ = scenario_native.compile_session_plan(spec, "missing_flow", 1)
+
+    def test_native_compile_max_depth_guard_caps_recursive_expansion(self):
+        try:
+            scenario_native.require_native()
+        except RuntimeError:
+            self.skipTest("scenario native module unavailable")
+        recursive = {
+            "schema_version": 2,
+            "personas": {
+                "p1": {
+                    "device_profile": "web",
+                    "headers": {},
+                    "cookies": {},
+                    "retry_policy": {"max_retries": 0},
+                    "timeout_policy": {"request_timeout_ms": 1000},
+                }
+            },
+            "flows": {
+                "f1": {
+                    "persona": "p1",
+                    "steps": [
+                        {"type": "request", "method": "GET", "path": "/"},
+                        {"type": "loop", "flow": "f1", "repeat": 1000},
+                        {"type": "end_session"},
+                    ],
+                }
+            },
+            "load_model": {"concurrent_vus": 1, "ramp_seconds": 0, "max_session_seconds": 5, "backend": "http"},
+            "sla": {"min_completion_rate": 0.9, "max_step_fail_ratio": 0.1},
+        }
+        out = scenario_native.compile_session_plan_packed(recursive, "f1", 7)
+        kinds = list(out.get("event_kind", []) or [])
+        self.assertGreaterEqual(len(kinds), 1)
+        self.assertEqual(len(kinds), 200000)  # max_events guard cap
+
+    def test_e2e_parser_compile_runtime_metrics_sla(self):
+        try:
+            scenario_native.require_native()
+        except RuntimeError:
+            self.skipTest("scenario native module unavailable")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "ok.yaml"
+            p.write_text(_VALID_YAML, encoding="utf-8")
+            raw = load_raw_scenario(str(p))
+        packed = scenario_native.compile_session_plan_packed(raw, "browse", 42)
+        batches, batch_metrics = build_vu_lifecycle_batches(
+            scenario_sessions=[packed, packed, packed],
+            ramp_seconds=0,
+            max_session_seconds=10,
+            seed=42,
+        )
+        self.assertTrue(len(batches) >= 1)
+        vus = simulate_vu_state_machine(
+            scenario_sessions=[packed, packed, packed],
+            observed_error_ratio=0.0,
+            observed_timeout_ratio=0.0,
+            seed=42,
+        )
+        per_flow = collect_per_flow_metrics(vus, duration_s=1.0)
+        out = evaluate_scenario_sla(
+            sessions_started=3,
+            sessions_completed=3,
+            step_attempted=int(batch_metrics.get("step_attempted", 0) or 0),
+            step_failed=0,
+            per_flow_metrics=per_flow,
+            sla={"min_completion_rate": 0.9, "max_step_fail_ratio": 0.1},
+            latency_p95_ms=1.0,
+        )
+        self.assertTrue(out.passed)
 
     def test_vu_pool_live_transitions(self):
         sessions = [

@@ -29,6 +29,60 @@ def test_migrate_schema_v1_to_v2_sets_defaults() -> None:
     assert out["flows"]["f1"]["steps"][0]["on_failure"] == "retry"
 
 
+def test_migrate_schema_v2_to_v3_sets_l4_backend_when_l4_steps_exist() -> None:
+    raw = {
+        "schema_version": 2,
+        "personas": {"p1": {"device_profile": "l4_tcp", "headers": {}, "cookies": {}, "retry_policy": {}, "timeout_policy": {}}},
+        "flows": {"f1": {"persona": "p1", "steps": [{"type": "tcp_connect", "dst_port": 80}, {"type": "tcp_expect", "condition": "state == established"}]}},
+        "load_model": {"concurrent_vus": 1, "ramp_seconds": 0, "max_session_seconds": 5, "backend": "http"},
+        "sla": {"min_completion_rate": 0.9, "max_step_fail_ratio": 0.2},
+    }
+    out = migrate_schema(raw, target_version=3)
+    assert int(out["schema_version"]) == 3
+    assert str(out["load_model"]["backend"]) == "l4_tcp"
+    assert int(out["flows"]["f1"]["steps"][1]["timeout_ms"]) >= 1
+    assert int(out["personas"]["p1"]["tcp_mimicry"]["window"]) > 0
+    assert int(out["personas"]["p1"]["tcp_mimicry"]["mss"]) > 0
+    assert 1 <= int(out["personas"]["p1"]["tcp_mimicry"]["ttl"]) <= 255
+
+
+def test_load_raw_scenario_rejects_l4_tcp_without_tcp_mimicry() -> None:
+    p = _write_tmp_yaml(
+        textwrap.dedent(
+            """
+            schema_version: 3
+            personas:
+              p1:
+                device_profile: l4_tcp
+                headers: {}
+                cookies: {}
+                retry_policy: {max_retries: 0}
+                timeout_policy: {connect_timeout_ms: 1000}
+            flows:
+              f1:
+                persona: p1
+                steps:
+                  - type: tcp_connect
+                    dst_port: 80
+                  - type: end_session
+            load_model:
+              concurrent_vus: 1
+              ramp_seconds: 0
+              max_session_seconds: 5
+              backend: l4_tcp
+            sla:
+              min_completion_rate: 0.9
+              max_step_fail_ratio: 0.1
+            """
+        ).strip()
+    )
+    try:
+        _ = load_raw_scenario(p)
+        assert False, "expected ValueError for missing tcp_mimicry on l4_tcp backend"
+    except ValueError:
+        pass
+
+
 def test_load_raw_scenario_interpolates_body_template_variables() -> None:
     p = _write_tmp_yaml(
         textwrap.dedent(
@@ -127,4 +181,3 @@ def test_sla_per_flow_latency_reason() -> None:
     )
     assert not out.passed
     assert any(str(r).startswith("per_flow_latency_p95_above:checkout") for r in out.reasons)
-
