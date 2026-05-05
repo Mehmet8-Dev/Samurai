@@ -67,6 +67,7 @@ struct RuntimeCapabilities {
 struct ScenarioStepResult {
   std::string flow;
   std::string vu_id;
+  std::string on_failure;
   bool success{false};
   bool timeout{false};
   int status_code{0};

@@ -945,6 +945,7 @@ PYBIND11_MODULE(_l7_emu_native, m) {
       py::dict it;
       it["flow"] = py::str(row.flow);
       it["vu_id"] = py::str(row.vu_id);
+      it["on_failure"] = py::str(row.on_failure);
       it["success"] = py::bool_(row.success);
       it["timeout"] = py::bool_(row.timeout);
       it["status_code"] = py::int_(row.status_code);

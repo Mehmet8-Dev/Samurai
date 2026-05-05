@@ -216,6 +216,7 @@ struct H1RequestSpec {
   std::optional<CompiledCaptureTemplate> body_template{};
   std::string scenario_flow{};
   std::string scenario_vu_id{};
+  std::string scenario_on_failure{"retry"};
 };
 
 enum class H1LanePhase {
@@ -359,6 +360,7 @@ struct H2RequestSpec {
   std::optional<CompiledCaptureTemplate> body_template{};
   std::string scenario_flow{};
   std::string scenario_vu_id{};
+  std::string scenario_on_failure{"retry"};
 };
 
 struct H2CompletedStream {
@@ -374,6 +376,7 @@ struct H2CompletedStream {
   long long request_start_ms{0};
   std::string scenario_flow{};
   std::string scenario_vu_id{};
+  std::string scenario_on_failure{"retry"};
 };
 
 struct H1CompletedRequest {
@@ -392,6 +395,7 @@ struct H1CompletedRequest {
   bool success{false};
   std::string scenario_flow{};
   std::string scenario_vu_id{};
+  std::string scenario_on_failure{"retry"};
 };
 
 enum class ConnectionDispositionAction {
@@ -531,6 +535,7 @@ void record_scenario_step_result(
     const std::string& protocol,
     const std::string& flow,
     const std::string& vu_id,
+    const std::string& on_failure,
     bool success,
     bool timeout,
     int status_code,
@@ -539,6 +544,7 @@ void record_scenario_step_result(
   row.protocol = protocol;
   row.flow = flow.empty() ? std::string("unknown") : flow;
   row.vu_id = vu_id;
+  row.on_failure = on_failure.empty() ? std::string("retry") : on_failure;
   row.success = success;
   row.timeout = timeout;
   row.status_code = status_code;
@@ -891,6 +897,7 @@ struct H2StreamState {
   long long request_start_ms{0};
   std::string scenario_flow;
   std::string scenario_vu_id;
+  std::string scenario_on_failure{"retry"};
 };
 
 struct H2ConnectionContext {
@@ -1622,6 +1629,7 @@ void enqueue_ready_h1_lane(
   completed.success = lane.phase != H1LanePhase::Failed && lane.response.status_code > 0;
   completed.scenario_flow = lane.request_spec.scenario_flow;
   completed.scenario_vu_id = lane.request_spec.scenario_vu_id;
+  completed.scenario_on_failure = lane.request_spec.scenario_on_failure;
   runtime.ready_completions.push_back(CompletionEnvelope{
       CompletionKind::H1,
       shard_idx,
@@ -2919,6 +2927,9 @@ std::vector<H1RequestSpec> build_h1_requests(const Profile& profile) {
     if (const std::string* v = find_scenario_header(op.headers, "x-scenario-vu-id")) {
       spec.scenario_vu_id = *v;
     }
+    if (const std::string* of = find_scenario_header(op.headers, "x-scenario-on-failure")) {
+      spec.scenario_on_failure = *of;
+    }
     std::size_t j = idx + 1;
     if (j < profile.ops.size() && profile.ops[j].opcode == "SEND_BODY") {
       spec.body_op = profile.ops[j];
@@ -2969,6 +2980,7 @@ std::vector<H2RequestSpec> build_h2_requests(const Profile& profile) {
     spec.follow_ops = h1_spec.follow_ops;
     spec.scenario_flow = h1_spec.scenario_flow;
     spec.scenario_vu_id = h1_spec.scenario_vu_id;
+    spec.scenario_on_failure = h1_spec.scenario_on_failure;
     requests.push_back(std::move(spec));
   }
   return requests;
@@ -3429,6 +3441,7 @@ int h2_on_stream_close_callback(
   completed.request_start_ms = stream.request_start_ms;
   completed.scenario_flow = std::move(stream.scenario_flow);
   completed.scenario_vu_id = std::move(stream.scenario_vu_id);
+  completed.scenario_on_failure = std::move(stream.scenario_on_failure);
   if (error_code != NGHTTP2_NO_ERROR) {
     ctx->protocol_error = 1;
     ctx->rst_stream += 1;
@@ -3711,6 +3724,7 @@ bool submit_h2_request(
   stream->follow_ops = raw_request.follow_ops;
   stream->scenario_flow = raw_request.scenario_flow;
   stream->scenario_vu_id = raw_request.scenario_vu_id;
+  stream->scenario_on_failure = raw_request.scenario_on_failure;
   stream->request_start_ms = monotonic_ms_now();
 
   std::vector<nghttp2_nv> hdrs;
@@ -4192,6 +4206,7 @@ std::map<std::string, double> run_http2_profile(
         "http2",
         completed.scenario_flow,
         completed.scenario_vu_id,
+        completed.scenario_on_failure,
         ok,
         completed.status_code <= 0,
         completed.status_code,
@@ -4635,6 +4650,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
           "http1",
           completed.scenario_flow,
           completed.scenario_vu_id,
+          completed.scenario_on_failure,
           false,
           completed.status_code <= 0,
           completed.status_code,
@@ -4696,6 +4712,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
         "http1",
         completed.scenario_flow,
         completed.scenario_vu_id,
+        completed.scenario_on_failure,
         lane.expectation_failures == 0,
         false,
         completed.status_code,
@@ -4798,6 +4815,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
           "http2",
           completed.scenario_flow,
           completed.scenario_vu_id,
+          completed.scenario_on_failure,
           ok,
           completed.status_code <= 0,
           completed.status_code,
