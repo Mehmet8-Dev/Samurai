@@ -45,6 +45,8 @@ def validate_raw_schema(raw: dict[str, Any]) -> None:
             if st == "request":
                 if not str(step.get("path", "") or "").strip():
                     raise ValueError(f"flow '{fname}' step[{i}] request path is required")
+                if "body_template" in step and not isinstance(step.get("body_template"), str):
+                    raise ValueError(f"flow '{fname}' step[{i}] body_template must be a string")
                 on_failure = str(step.get("on_failure", "retry") or "retry").strip().lower()
                 if on_failure not in {"retry", "skip", "abort"}:
                     raise ValueError(f"flow '{fname}' step[{i}] on_failure must be retry|skip|abort")

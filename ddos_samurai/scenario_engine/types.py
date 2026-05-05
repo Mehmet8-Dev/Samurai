@@ -18,6 +18,7 @@ class StepSpec:
     step_type: str
     method: str = "GET"
     path: str = "/"
+    body_template: str = ""
     flow: str = ""
     repeat: int = 1
     probability: float = 1.0

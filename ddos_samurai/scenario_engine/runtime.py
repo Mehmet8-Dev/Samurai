@@ -456,7 +456,9 @@ def build_vu_lifecycle_batches(
         vu_id = si + 1
         spawn_at = float(spawn_schedule[si]) if si < len(spawn_schedule) else 0.0
         t = spawn_at
-        deadline = spawn_at + float(max_sess_s)
+        sess_timeout_ms = max(0, int((session or {}).get("session_timeout_ms", 0) or 0))
+        session_timeout_s = (float(sess_timeout_ms) / 1000.0) if sess_timeout_ms > 0 else float(max_sess_s)
+        deadline = spawn_at + max(0.001, session_timeout_s)
         packed_mode = bool((session or {}).get("packed", False))
         events = list((session or {}).get("events", []) or []) if not packed_mode else []
         flow = str((session or {}).get("flow", "unknown") or "unknown")

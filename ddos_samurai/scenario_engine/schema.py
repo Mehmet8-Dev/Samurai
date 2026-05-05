@@ -49,6 +49,7 @@ SCENARIO_SCHEMA_V1: dict[str, Any] = {
                                 "type": {"type": "string"},
                                 "method": {"type": "string"},
                                 "path": {"type": "string"},
+                                "body_template": {"type": "string"},
                                 "flow": {"type": "string"},
                                 "repeat": {"type": "integer", "minimum": 1},
                                 "probability": {"type": "number", "minimum": 0, "maximum": 1},
