@@ -1,9 +1,11 @@
 #include "compiler.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <random>
 #include <stdexcept>
 #include <utility>
+#include <unordered_set>
 
 #include <pybind11/stl.h>
 
@@ -124,6 +126,8 @@ struct PackedEvents {
   std::vector<int> cookies_idx{};
   std::vector<std::unordered_map<std::string, std::string>> headers_pool{};
   std::vector<std::unordered_map<std::string, std::string>> cookies_pool{};
+  std::unordered_map<std::uint64_t, std::vector<int>> headers_hash_index{};
+  std::unordered_map<std::uint64_t, std::vector<int>> cookies_hash_index{};
   std::vector<std::string> device_profile{};
   std::vector<int> timeout_ms{};
   std::vector<int> retry_count{};
@@ -147,23 +151,82 @@ struct CompiledPackedSession {
   PackedEvents events{};
 };
 
+static void reserve_packed_events(PackedEvents& pe, std::size_t event_cap) {
+  pe.event_kind.reserve(event_cap);
+  pe.request_kind.reserve(event_cap);
+  pe.method.reserve(event_cap);
+  pe.path.reserve(event_cap);
+  pe.body_template.reserve(event_cap);
+  pe.headers_idx.reserve(event_cap);
+  pe.cookies_idx.reserve(event_cap);
+  pe.device_profile.reserve(event_cap);
+  pe.timeout_ms.reserve(event_cap);
+  pe.retry_count.reserve(event_cap);
+  pe.on_failure.reserve(event_cap);
+  pe.think_min_ms.reserve(event_cap);
+  pe.think_max_ms.reserve(event_cap);
+  pe.think_distribution.reserve(event_cap);
+  pe.think_mean_ms.reserve(event_cap);
+  pe.think_stddev_ms.reserve(event_cap);
+  pe.tcp_dst_port.reserve(event_cap);
+  pe.tcp_payload.reserve(event_cap);
+  pe.tcp_expect_condition.reserve(event_cap);
+  pe.tcp_expect_timeout_ms.reserve(event_cap);
+}
+
+static std::uint64_t fnv1a_update(std::uint64_t h, const char* data, std::size_t n) {
+  constexpr std::uint64_t kPrime = 1099511628211ULL;
+  for (std::size_t i = 0; i < n; ++i) {
+    h ^= static_cast<std::uint8_t>(data[i]);
+    h *= kPrime;
+  }
+  return h;
+}
+
+static std::uint64_t stable_map_hash(const std::unordered_map<std::string, std::string>& m) {
+  // Order-independent hash composition for unordered_map.
+  std::uint64_t acc = 1469598103934665603ULL;
+  const std::size_t msize = m.size();
+  acc = fnv1a_update(acc, reinterpret_cast<const char*>(&msize), sizeof(std::size_t));
+  for (const auto& kv : m) {
+    std::uint64_t h = 1469598103934665603ULL;
+    h = fnv1a_update(h, kv.first.data(), kv.first.size());
+    h = fnv1a_update(h, "=", 1);
+    h = fnv1a_update(h, kv.second.data(), kv.second.size());
+    // commutative mix; preserves order-independence
+    acc ^= (h + 0x9e3779b97f4a7c15ULL + (acc << 6) + (acc >> 2));
+  }
+  return acc;
+}
+
+static bool maps_equal(
+    const std::unordered_map<std::string, std::string>& a,
+    const std::unordered_map<std::string, std::string>& b) {
+  if (a.size() != b.size()) return false;
+  for (const auto& [k, v] : a) {
+    auto it = b.find(k);
+    if (it == b.end() || it->second != v) return false;
+  }
+  return true;
+}
+
 static int intern_map(
     const std::unordered_map<std::string, std::string>& m,
-    std::vector<std::unordered_map<std::string, std::string>>& pool) {
-  for (std::size_t i = 0; i < pool.size(); ++i) {
-    if (pool[i].size() != m.size()) continue;
-    bool same = true;
-    for (const auto& [k, v] : m) {
-      auto it = pool[i].find(k);
-      if (it == pool[i].end() || it->second != v) {
-        same = false;
-        break;
+    std::vector<std::unordered_map<std::string, std::string>>& pool,
+    std::unordered_map<std::uint64_t, std::vector<int>>& hash_index) {
+  const std::uint64_t h = stable_map_hash(m);
+  auto hit = hash_index.find(h);
+  if (hit != hash_index.end()) {
+    for (int idx : hit->second) {
+      if (idx >= 0 && static_cast<std::size_t>(idx) < pool.size() && maps_equal(pool[static_cast<std::size_t>(idx)], m)) {
+        return idx;
       }
     }
-    if (same) return static_cast<int>(i);
   }
   pool.push_back(m);
-  return static_cast<int>(pool.size() - 1);
+  const int idx = static_cast<int>(pool.size() - 1);
+  hash_index[h].push_back(idx);
+  return idx;
 }
 
 static void compile_flow_recursive(const ScenarioSpecNative& spec, const std::string& flow_name, CompileState& st, py::list& events) {
@@ -308,8 +371,8 @@ static void compile_flow_recursive_packed(
         out.method.emplace_back("");
         out.path.emplace_back("");
         out.body_template.emplace_back("");
-        out.headers_idx.push_back(intern_map({}, out.headers_pool));
-        out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
+        out.headers_idx.push_back(intern_map({}, out.headers_pool, out.headers_hash_index));
+        out.cookies_idx.push_back(intern_map({}, out.cookies_pool, out.cookies_hash_index));
         out.device_profile.emplace_back("");
         out.timeout_ms.push_back(0);
         out.retry_count.push_back(0);
@@ -366,8 +429,8 @@ static void compile_flow_recursive_packed(
         out.method.push_back(step.method);
         out.path.push_back(step.path);
         out.body_template.push_back(step.body_template);
-        out.headers_idx.push_back(intern_map(headers, out.headers_pool));
-        out.cookies_idx.push_back(intern_map(cookies, out.cookies_pool));
+        out.headers_idx.push_back(intern_map(headers, out.headers_pool, out.headers_hash_index));
+        out.cookies_idx.push_back(intern_map(cookies, out.cookies_pool, out.cookies_hash_index));
         out.device_profile.push_back(std::move(device_profile));
         out.timeout_ms.push_back(timeout_ms);
         out.retry_count.push_back(retry_count);
@@ -391,8 +454,8 @@ static void compile_flow_recursive_packed(
         out.method.emplace_back("");
         out.path.emplace_back("");
         out.body_template.emplace_back("");
-        out.headers_idx.push_back(intern_map({}, out.headers_pool));
-        out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
+        out.headers_idx.push_back(intern_map({}, out.headers_pool, out.headers_hash_index));
+        out.cookies_idx.push_back(intern_map({}, out.cookies_pool, out.cookies_hash_index));
         out.device_profile.emplace_back("");
         out.timeout_ms.push_back(0);
         out.retry_count.push_back(0);
@@ -416,8 +479,8 @@ static void compile_flow_recursive_packed(
         out.method.emplace_back("");
         out.path.emplace_back("");
         out.body_template.emplace_back("");
-        out.headers_idx.push_back(intern_map({}, out.headers_pool));
-        out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
+        out.headers_idx.push_back(intern_map({}, out.headers_pool, out.headers_hash_index));
+        out.cookies_idx.push_back(intern_map({}, out.cookies_pool, out.cookies_hash_index));
         out.device_profile.emplace_back("");
         out.timeout_ms.push_back(0);
         out.retry_count.push_back(0);
@@ -441,8 +504,8 @@ static void compile_flow_recursive_packed(
         out.method.emplace_back("");
         out.path.emplace_back("");
         out.body_template.emplace_back("");
-        out.headers_idx.push_back(intern_map({}, out.headers_pool));
-        out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
+        out.headers_idx.push_back(intern_map({}, out.headers_pool, out.headers_hash_index));
+        out.cookies_idx.push_back(intern_map({}, out.cookies_pool, out.cookies_hash_index));
         out.device_profile.emplace_back("");
         out.timeout_ms.push_back(0);
         out.retry_count.push_back(0);
@@ -466,8 +529,8 @@ static void compile_flow_recursive_packed(
         out.method.emplace_back("");
         out.path.emplace_back("");
         out.body_template.emplace_back("");
-        out.headers_idx.push_back(intern_map({}, out.headers_pool));
-        out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
+        out.headers_idx.push_back(intern_map({}, out.headers_pool, out.headers_hash_index));
+        out.cookies_idx.push_back(intern_map({}, out.cookies_pool, out.cookies_hash_index));
         out.device_profile.emplace_back("");
         out.timeout_ms.push_back(0);
         out.retry_count.push_back(0);
@@ -515,6 +578,7 @@ py::dict compile_session_plan_packed_native(const ScenarioSpecNative& spec, cons
   st.rng = &rng;
   st.backend = spec.load_model.backend;
   PackedEvents pe{};
+  reserve_packed_events(pe, static_cast<std::size_t>(std::max(64, st.max_events / 16)));
   compile_flow_recursive_packed(spec, flow_name, st, pe);
   py::dict out;
   out["flow"] = flow_name;
@@ -604,6 +668,7 @@ py::list compile_session_plans_packed_bulk_native(
       CompiledPackedSession row{};
       row.flow = flow_name;
       row.persona = spec.flows[itf->second].persona;
+      reserve_packed_events(row.events, static_cast<std::size_t>(std::max(32, st.max_events / 32)));
       compile_flow_recursive_packed(spec, flow_name, st, row.events);
       row.step_attempted = st.attempted;
       const Persona* persona = nullptr;
@@ -633,6 +698,10 @@ py::dict compile_session_plans_packed_bulk_soa_native(
   std::vector<int> session_step_attempted{};
   std::vector<int> session_timeout_ms{};
   PackedEvents flat{};
+  // SoA path accumulates all sessions into one flat buffer; pre-reserve to reduce realloc churn.
+  reserve_packed_events(flat, n * 32U);
+  flat.headers_pool.reserve(n + 8U);
+  flat.cookies_pool.reserve(n + 8U);
   session_offsets.reserve(n + 1);
   session_flow.reserve(n);
   session_persona.reserve(n);
