@@ -21,6 +21,40 @@ def _infer_content_type_from_template(body_template: str) -> str | None:
     return "text/plain; charset=utf-8"
 
 
+def _session_count(sessions: list[dict[str, Any]]) -> int:
+    total = 0
+    for sess in list(sessions or []):
+        if bool((sess or {}).get("packed_soa", False)):
+            offs = list((sess or {}).get("session_offsets", []) or [])
+            total += max(0, len(offs) - 1)
+        else:
+            total += 1
+    return int(total)
+
+
+def _iter_session_views(sessions: list[dict[str, Any]]):
+    for sess in list(sessions or []):
+        if not bool((sess or {}).get("packed_soa", False)):
+            yield sess
+            continue
+        offsets = list((sess or {}).get("session_offsets", []) or [])
+        flows = list((sess or {}).get("session_flow", []) or [])
+        personas = list((sess or {}).get("session_persona", []) or [])
+        attempts = list((sess or {}).get("session_step_attempted", []) or [])
+        timeouts = list((sess or {}).get("session_timeout_ms", []) or [])
+        for i in range(max(0, len(offsets) - 1)):
+            yield {
+                "flow": str(flows[i] if i < len(flows) else "unknown"),
+                "persona": str(personas[i] if i < len(personas) else ""),
+                "session_timeout_ms": int(timeouts[i] if i < len(timeouts) else 0),
+                "packed": True,
+                "__soa": sess,
+                "__start": int(offsets[i]),
+                "__end": int(offsets[i + 1]),
+                "__step_attempted": int(attempts[i] if i < len(attempts) else 0),
+            }
+
+
 @dataclass(frozen=True)
 class ScheduledRequestBatch:
     delay_s: float
@@ -85,6 +119,7 @@ class VUPool:
         flow_policies: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         sessions = list(scenario_sessions or [])
+        total_sessions = _session_count(sessions)
         self._vus: dict[str, VirtualUserInstance] = {}
         self._spawn_order: list[str] = []
         self._spawn_schedule: list[float] = []
@@ -94,7 +129,7 @@ class VUPool:
         self._next_retry_at_s: dict[str, float] = {}
         self._flow_policies_raw = dict(flow_policies or {})
         self._controller = RampController(
-            target_vus=len(sessions),
+            target_vus=total_sessions,
             ramp_seconds=max(0, int(ramp_seconds)),
             curve=str(ramp_curve or "linear"),
             step_interval_s=max(1, int(ramp_step_interval_s or 1)),
@@ -103,12 +138,19 @@ class VUPool:
         self._spawn_schedule = self._controller.spawn_schedule()
         self._spawn_cursor = 0
         max_s = max(1, int(max_session_seconds))
-        for i, sess in enumerate(sessions, start=1):
+        for i, sess in enumerate(_iter_session_views(sessions), start=1):
             flow = str((sess or {}).get("flow", "unknown") or "unknown")
             packed = bool((sess or {}).get("packed", False))
             if packed:
-                kinds = list((sess or {}).get("event_kind", []) or [])
-                expected = int(sum(1 for k in kinds if int(k) != 1))
+                if "__soa" in (sess or {}):
+                    src = dict((sess or {}).get("__soa") or {})
+                    s0 = max(0, int((sess or {}).get("__start", 0) or 0))
+                    s1 = max(s0, int((sess or {}).get("__end", s0) or s0))
+                    kinds = list((src or {}).get("event_kind", []) or [])
+                    expected = int(sum(1 for j in range(s0, min(s1, len(kinds))) if int(kinds[j]) != 1))
+                else:
+                    kinds = list((sess or {}).get("event_kind", []) or [])
+                    expected = int(sum(1 for k in kinds if int(k) != 1))
             else:
                 events = list((sess or {}).get("events", []) or [])
                 expected = int(
@@ -460,7 +502,7 @@ def build_vu_lifecycle_batches(
             "step_failed": 0,
         }
     rng = random.Random(int(seed))
-    total_sessions = len(sessions)
+    total_sessions = _session_count(sessions)
     ramp_s = max(0, int(ramp_seconds))
     max_sess_s = max(1, int(max_session_seconds))
     bucket = max(1, int(bucket_ms))
@@ -479,7 +521,7 @@ def build_vu_lifecycle_batches(
         custom_points=tuple((ramp_custom_points or [])),
     )
     spawn_schedule = rc.spawn_schedule()
-    for si, session in enumerate(sessions):
+    for si, session in enumerate(_iter_session_views(sessions)):
         vu_id = si + 1
         spawn_at = float(spawn_schedule[si]) if si < len(spawn_schedule) else 0.0
         t = spawn_at
@@ -491,27 +533,30 @@ def build_vu_lifecycle_batches(
         flow = str((session or {}).get("flow", "unknown") or "unknown")
         vu_flow[str(vu_id)] = flow
         if packed_mode:
-            ek = list((session or {}).get("event_kind", []) or [])
-            rk = list((session or {}).get("request_kind", []) or [])
-            methods = list((session or {}).get("method", []) or [])
-            paths = list((session or {}).get("path", []) or [])
-            headers_list = list((session or {}).get("headers", []) or [])
-            cookies_list = list((session or {}).get("cookies", []) or [])
-            headers_idx = list((session or {}).get("headers_idx", []) or [])
-            cookies_idx = list((session or {}).get("cookies_idx", []) or [])
-            headers_pool = list((session or {}).get("headers_pool", []) or [])
-            cookies_pool = list((session or {}).get("cookies_pool", []) or [])
-            retry_list = list((session or {}).get("retry_count", []) or [])
-            on_failure_list = list((session or {}).get("on_failure", []) or [])
-            body_templates = list((session or {}).get("body_template", []) or [])
-            think_min = list((session or {}).get("think_min_ms", []) or [])
-            think_max = list((session or {}).get("think_max_ms", []) or [])
-            think_dist = list((session or {}).get("think_distribution", []) or [])
-            think_mean = list((session or {}).get("think_mean_ms", []) or [])
-            think_stddev = list((session or {}).get("think_stddev_ms", []) or [])
-            n = len(ek)
+            src = dict((session or {}).get("__soa") or {}) if "__soa" in (session or {}) else dict(session or {})
+            s0 = max(0, int((session or {}).get("__start", 0) or 0))
+            s1 = max(s0, int((session or {}).get("__end", 0) or 0)) if "__soa" in (session or {}) else len(list((src or {}).get("event_kind", []) or []))
+            ek = list((src or {}).get("event_kind", []) or [])
+            rk = list((src or {}).get("request_kind", []) or [])
+            methods = list((src or {}).get("method", []) or [])
+            paths = list((src or {}).get("path", []) or [])
+            headers_list = list((src or {}).get("headers", []) or [])
+            cookies_list = list((src or {}).get("cookies", []) or [])
+            headers_idx = list((src or {}).get("headers_idx", []) or [])
+            cookies_idx = list((src or {}).get("cookies_idx", []) or [])
+            headers_pool = list((src or {}).get("headers_pool", []) or [])
+            cookies_pool = list((src or {}).get("cookies_pool", []) or [])
+            retry_list = list((src or {}).get("retry_count", []) or [])
+            on_failure_list = list((src or {}).get("on_failure", []) or [])
+            body_templates = list((src or {}).get("body_template", []) or [])
+            think_min = list((src or {}).get("think_min_ms", []) or [])
+            think_max = list((src or {}).get("think_max_ms", []) or [])
+            think_dist = list((src or {}).get("think_distribution", []) or [])
+            think_mean = list((src or {}).get("think_mean_ms", []) or [])
+            think_stddev = list((src or {}).get("think_stddev_ms", []) or [])
+            n = max(0, min(len(ek), s1) - s0)
             req_count = 0
-            for i in range(n):
+            for i in range(s0, s0 + n):
                 kind = int(ek[i] if i < len(ek) else 0)
                 if kind != 1:
                     req_count += 1
@@ -522,7 +567,7 @@ def build_vu_lifecycle_batches(
             )
         active_markers.append((spawn_at, +1))
         if packed_mode:
-            for i in range(n):
+            for i in range(s0, s0 + n):
                 kind = int(ek[i] if i < len(ek) else 0)
                 if kind == 1:
                     min_ms = max(0, int(think_min[i] if i < len(think_min) else 0))
@@ -687,6 +732,236 @@ def build_vu_lifecycle_batches(
         "vu_flow": dict(vu_flow),
     }
     return batches, metrics
+
+
+def iter_vu_lifecycle_batches(
+    *,
+    scenario_sessions: list[dict[str, Any]],
+    ramp_seconds: int,
+    max_session_seconds: int,
+    seed: int,
+    window_ms: int = 500,
+    bucket_ms: int = 50,
+    ramp_curve: str = "linear",
+    ramp_step_interval_s: int = 1,
+    ramp_custom_points: list[tuple[float, int]] | None = None,
+):
+    """
+    Streaming batch iterator over lifecycle output.
+    Yields (ScheduledRequestBatch, delta_metrics) tuples.
+    """
+    sessions = list(scenario_sessions or [])
+    win = max(1, int(window_ms))
+    bucket = max(1, int(bucket_ms))
+    if not sessions:
+        yield ScheduledRequestBatch(delay_s=0.0, request_plan=H2RequestPlan(items=[])), {
+            "final": True,
+            "vus_spawned": 0,
+            "vus_active_peak": 0,
+            "step_attempted": 0,
+            "step_failed": 0,
+            "vu_expected_steps": {},
+            "vu_flow": {},
+        }
+        return
+
+    rng = random.Random(int(seed))
+    total_sessions = _session_count(sessions)
+    ramp_s = max(0, int(ramp_seconds))
+    max_sess_s = max(1, int(max_session_seconds))
+    timeline: dict[int, list[H2RequestPlanItem]] = {}
+    step_attempted = 0
+    step_failed = 0
+    active_markers: list[tuple[float, int]] = []
+    vu_expected_steps: dict[str, int] = {}
+    vu_flow: dict[str, str] = {}
+    rc = RampController(
+        target_vus=total_sessions,
+        ramp_seconds=ramp_s,
+        curve=str(ramp_curve or "linear"),
+        step_interval_s=max(1, int(ramp_step_interval_s or 1)),
+        custom_points=tuple((ramp_custom_points or [])),
+    )
+    spawn_schedule = rc.spawn_schedule()
+
+    def _emit_flushed(up_to_bucket_exclusive: int):
+        keys = [k for k in timeline.keys() if int(k) < int(up_to_bucket_exclusive)]
+        for k in sorted(keys):
+            items = list(timeline.pop(k, []) or [])
+            if not items:
+                continue
+            delay_s = (float(k * bucket) / 1000.0)
+            yield ScheduledRequestBatch(delay_s=delay_s, request_plan=H2RequestPlan(items=items)), {
+                "window_id": int((k * bucket) // win),
+                "window_ms": int(win),
+                "final": False,
+            }
+
+    for si, session in enumerate(_iter_session_views(sessions)):
+        vu_id = si + 1
+        spawn_at = float(spawn_schedule[si]) if si < len(spawn_schedule) else 0.0
+        next_spawn_at = float(spawn_schedule[si + 1]) if (si + 1) < len(spawn_schedule) else float("inf")
+        t = spawn_at
+        sess_timeout_ms = max(0, int((session or {}).get("session_timeout_ms", 0) or 0))
+        session_timeout_s = (float(sess_timeout_ms) / 1000.0) if sess_timeout_ms > 0 else float(max_sess_s)
+        deadline = spawn_at + max(0.001, session_timeout_s)
+        packed_mode = bool((session or {}).get("packed", False))
+        events = list((session or {}).get("events", []) or []) if not packed_mode else []
+        flow = str((session or {}).get("flow", "unknown") or "unknown")
+        vu_flow[str(vu_id)] = flow
+        if packed_mode:
+            src = dict((session or {}).get("__soa") or {}) if "__soa" in (session or {}) else dict(session or {})
+            s0 = max(0, int((session or {}).get("__start", 0) or 0))
+            s1 = max(s0, int((session or {}).get("__end", 0) or 0)) if "__soa" in (session or {}) else len(list((src or {}).get("event_kind", []) or []))
+            ek = list((src or {}).get("event_kind", []) or [])
+            rk = list((src or {}).get("request_kind", []) or [])
+            methods = list((src or {}).get("method", []) or [])
+            paths = list((src or {}).get("path", []) or [])
+            headers_list = list((src or {}).get("headers", []) or [])
+            cookies_list = list((src or {}).get("cookies", []) or [])
+            headers_idx = list((src or {}).get("headers_idx", []) or [])
+            cookies_idx = list((src or {}).get("cookies_idx", []) or [])
+            headers_pool = list((src or {}).get("headers_pool", []) or [])
+            cookies_pool = list((src or {}).get("cookies_pool", []) or [])
+            retry_list = list((src or {}).get("retry_count", []) or [])
+            on_failure_list = list((src or {}).get("on_failure", []) or [])
+            body_templates = list((src or {}).get("body_template", []) or [])
+            think_min = list((src or {}).get("think_min_ms", []) or [])
+            think_max = list((src or {}).get("think_max_ms", []) or [])
+            think_dist = list((src or {}).get("think_distribution", []) or [])
+            think_mean = list((src or {}).get("think_mean_ms", []) or [])
+            think_stddev = list((src or {}).get("think_stddev_ms", []) or [])
+            n = max(0, min(len(ek), s1) - s0)
+            vu_expected_steps[str(vu_id)] = int(sum(1 for i in range(s0, s0 + n) if int(ek[i] if i < len(ek) else 0) != 1))
+        else:
+            vu_expected_steps[str(vu_id)] = int(
+                sum(1 for ev in events if str((ev or {}).get("event_type", "") or "").strip().lower() in {"http_request", "http2_headers"})
+            )
+        active_markers.append((spawn_at, +1))
+        if packed_mode:
+            for i in range(s0, s0 + n):
+                kind = int(ek[i] if i < len(ek) else 0)
+                if kind == 1:
+                    t += _sample_think_seconds(
+                        rng=rng,
+                        distribution=str(think_dist[i] if i < len(think_dist) else "uniform"),
+                        min_ms=max(0, int(think_min[i] if i < len(think_min) else 0)),
+                        max_ms=max(0, int(think_max[i] if i < len(think_max) else 0)),
+                        mean_ms=int(think_mean[i] if i < len(think_mean) else 0),
+                        stddev_ms=int(think_stddev[i] if i < len(think_stddev) else 0),
+                    )
+                    continue
+                et = str(rk[i] if i < len(rk) else "http_request").strip().lower()
+                if et not in {"http_request", "http2_headers"}:
+                    continue
+                if t > deadline:
+                    step_failed += 1
+                    continue
+                step_attempted += 1
+                method = str(methods[i] if i < len(methods) else "GET").upper()
+                path = str(paths[i] if i < len(paths) else "/")
+                if i < len(headers_idx) and headers_pool:
+                    hidx = int(headers_idx[i] or 0)
+                    headers = dict(headers_pool[hidx] if 0 <= hidx < len(headers_pool) else {})
+                else:
+                    headers = dict(headers_list[i] if i < len(headers_list) else {})
+                if i < len(cookies_idx) and cookies_pool:
+                    cidx = int(cookies_idx[i] or 0)
+                    cookies = dict(cookies_pool[cidx] if 0 <= cidx < len(cookies_pool) else {})
+                else:
+                    cookies = dict(cookies_list[i] if i < len(cookies_list) else {})
+                retry_count = max(0, int(retry_list[i] if i < len(retry_list) else 0))
+                on_failure = str(on_failure_list[i] if i < len(on_failure_list) else "retry").strip().lower()
+                if on_failure not in {"retry", "skip", "abort"}:
+                    on_failure = "retry"
+                headers["x-scenario-flow"] = flow
+                headers["x-scenario-vu-id"] = str(vu_id)
+                headers["x-scenario-on-failure"] = on_failure
+                body_template = str(body_templates[i] if i < len(body_templates) else "")
+                body_bytes = body_template.encode("utf-8") if body_template else None
+                content_type = _infer_content_type_from_template(body_template)
+                if cookies:
+                    headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                key = int((t * 1000.0) // bucket)
+                timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers, body=body_bytes, content_type=content_type))
+                if on_failure != "retry":
+                    retry_count = 0
+                for r in range(retry_count):
+                    t_retry = t + (0.05 * float(r + 1))
+                    if t_retry > deadline:
+                        step_failed += 1
+                        continue
+                    step_attempted += 1
+                    key_retry = int((t_retry * 1000.0) // bucket)
+                    timeline.setdefault(key_retry, []).append(H2RequestPlanItem(method=method, path=path, headers=headers, body=body_bytes, content_type=content_type))
+        else:
+            for ev in events:
+                et = str((ev or {}).get("event_type", "") or "").strip().lower()
+                if et == "think_time":
+                    t += _sample_think_seconds(
+                        rng=rng,
+                        distribution=str((ev or {}).get("distribution", "uniform") or "uniform"),
+                        min_ms=max(0, int((ev or {}).get("min_ms", 0) or 0)),
+                        max_ms=max(0, int((ev or {}).get("max_ms", 0) or 0)),
+                        mean_ms=int((ev or {}).get("mean_ms", 0) or 0),
+                        stddev_ms=int((ev or {}).get("stddev_ms", 0) or 0),
+                    )
+                    continue
+                if et not in {"http_request", "http2_headers"}:
+                    continue
+                if t > deadline:
+                    step_failed += 1
+                    continue
+                step_attempted += 1
+                method = str((ev or {}).get("method", "GET") or "GET").upper()
+                path = str((ev or {}).get("path", "/") or "/")
+                headers = dict((ev or {}).get("headers") or {})
+                retry_count = max(0, int((ev or {}).get("retry_count", 0) or 0))
+                on_failure = str((ev or {}).get("on_failure", "retry") or "retry").strip().lower()
+                if on_failure not in {"retry", "skip", "abort"}:
+                    on_failure = "retry"
+                headers["x-scenario-flow"] = flow
+                headers["x-scenario-vu-id"] = str(vu_id)
+                headers["x-scenario-on-failure"] = on_failure
+                body_template = str((ev or {}).get("body_template", "") or "")
+                body_bytes = body_template.encode("utf-8") if body_template else None
+                content_type = _infer_content_type_from_template(body_template)
+                key = int((t * 1000.0) // bucket)
+                timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers, body=body_bytes, content_type=content_type))
+                if on_failure != "retry":
+                    retry_count = 0
+                for r in range(retry_count):
+                    t_retry = t + (0.05 * float(r + 1))
+                    if t_retry > deadline:
+                        step_failed += 1
+                        continue
+                    step_attempted += 1
+                    key_retry = int((t_retry * 1000.0) // bucket)
+                    timeline.setdefault(key_retry, []).append(H2RequestPlanItem(method=method, path=path, headers=headers, body=body_bytes, content_type=content_type))
+        active_markers.append((min(deadline, t), -1))
+
+        cutoff_bucket = int((next_spawn_at * 1000.0) // bucket) if next_spawn_at != float("inf") else (1 << 60)
+        for row in _emit_flushed(cutoff_bucket):
+            yield row
+
+    for row in _emit_flushed(1 << 62):
+        yield row
+
+    active_markers.sort(key=lambda x: (x[0], -x[1]))
+    active = 0
+    active_peak = 0
+    for _, d in active_markers:
+        active += int(d)
+        active_peak = max(active_peak, active)
+    yield ScheduledRequestBatch(delay_s=0.0, request_plan=H2RequestPlan(items=[])), {
+        "final": True,
+        "vus_spawned": int(total_sessions),
+        "vus_active_peak": int(active_peak),
+        "step_attempted": int(step_attempted),
+        "step_failed": int(step_failed),
+        "vu_expected_steps": dict(vu_expected_steps),
+        "vu_flow": dict(vu_flow),
+    }
 
 
 def simulate_vu_state_machine(

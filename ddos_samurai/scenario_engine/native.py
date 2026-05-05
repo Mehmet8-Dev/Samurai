@@ -63,6 +63,24 @@ def compile_session_plans_packed_bulk(
     return rows
 
 
+def compile_session_plans_packed_bulk_soa(
+    spec: dict[str, Any] | ScenarioSpec,
+    flow_names: list[str],
+    seeds: list[int],
+) -> dict[str, Any]:
+    require_native()
+    if hasattr(_native, "compile_session_plans_packed_bulk_soa"):
+        out = _native.compile_session_plans_packed_bulk_soa(
+            _as_spec_dict(spec),
+            [str(x) for x in list(flow_names or [])],
+            [int(x) for x in list(seeds or [])],
+        )
+        return dict(out or {})
+    rows = compile_session_plans_packed_bulk(spec, flow_names, seeds)
+    # Fallback: expose list form under a compatibility envelope.
+    return {"packed_soa": False, "rows": rows}
+
+
 def build_worker_session_plans(
     spec: dict[str, Any] | ScenarioSpec,
     worker_counts: list[int],
