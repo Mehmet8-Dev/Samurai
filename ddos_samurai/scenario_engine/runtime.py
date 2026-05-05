@@ -701,6 +701,19 @@ class RampController:
     step_interval_s: int = 1
     custom_points: tuple[tuple[float, int], ...] = ()
 
+    def _normalized_custom_points(self) -> list[tuple[float, int]]:
+        pts = [(max(0.0, float(x[0])), max(0, int(x[1]))) for x in self.custom_points]
+        if not pts:
+            return []
+        pts.sort(key=lambda x: x[0])
+        dedup: list[tuple[float, int]] = []
+        for t, v in pts:
+            if dedup and abs(dedup[-1][0] - t) < 1e-9:
+                dedup[-1] = (t, v)
+            else:
+                dedup.append((t, v))
+        return dedup
+
     def active_vus_at(self, elapsed_s: float) -> int:
         total = max(1, int(self.target_vus))
         ramp = max(0.0, float(self.ramp_seconds))
@@ -712,17 +725,19 @@ class RampController:
             iv = max(1, int(self.step_interval_s or 1))
             steps = max(1, int(ramp // float(iv)))
             done = min(steps, int(t // float(iv)))
-            return min(total, max(1, int((done * total) / max(1, steps))))
+            return min(total, max(0, int((done * total) / max(1, steps))))
         if mode == "spike":
             # Fast front-load: reach 70% by first 20% of ramp window.
             if t >= ramp:
                 return total
             p = t / ramp
             if p <= 0.2:
-                return min(total, max(1, int(total * (0.7 * (p / 0.2)))))
-            return min(total, max(1, int(total * (0.7 + (0.3 * ((p - 0.2) / 0.8))))))
+                return min(total, max(0, int(total * (0.7 * (p / 0.2)))))
+            return min(total, max(0, int(total * (0.7 + (0.3 * ((p - 0.2) / 0.8))))))
         if mode == "custom" and self.custom_points:
-            pts = sorted([(max(0.0, float(x[0])), max(0, int(x[1]))) for x in self.custom_points], key=lambda x: x[0])
+            pts = self._normalized_custom_points()
+            if not pts:
+                return 0
             if t <= pts[0][0]:
                 return min(total, pts[0][1])
             for i in range(1, len(pts)):
@@ -735,7 +750,11 @@ class RampController:
                     return min(total, max(0, int(v0 + ((v1 - v0) * frac))))
             return min(total, pts[-1][1])
         # linear default
-        return min(total, max(1, int(total * min(1.0, t / ramp))))
+        return min(total, max(0, int(total * min(1.0, t / ramp))))
+
+    def should_spawn(self, elapsed_s: float, current_active: int) -> int:
+        target = int(self.active_vus_at(elapsed_s))
+        return max(0, target - max(0, int(current_active)))
 
     def spawn_schedule(self) -> list[float]:
         total = max(1, int(self.target_vus))

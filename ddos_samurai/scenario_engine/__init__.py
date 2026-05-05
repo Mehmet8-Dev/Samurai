@@ -11,6 +11,7 @@ from .runtime import (
 )
 from .metrics import ScenarioRuntimeMetrics, FlowRuntimeMetrics, build_flow_runtime_metrics
 from .sla import evaluate_scenario_sla, SlaEvaluation
+from .benchmark import run_compile_benchmark, write_compile_benchmark_report
 
 __all__ = [
     "load_raw_scenario",
@@ -31,4 +32,6 @@ __all__ = [
     "build_flow_runtime_metrics",
     "evaluate_scenario_sla",
     "SlaEvaluation",
+    "run_compile_benchmark",
+    "write_compile_benchmark_report",
 ]
