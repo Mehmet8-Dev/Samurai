@@ -1848,6 +1848,7 @@ async def worker_process(
             scenario_sessions = list(args.get("scenario_sessions", []) or [])
             scenario_runtime_batches = list(args.get("scenario_runtime_batches", []) or [])
             scenario_runtime_metrics = dict(args.get("scenario_runtime_metrics", {}) or {})
+            scenario_streaming = bool(args.get("scenario_streaming", False))
             traffic_model_mode = str(args.get("traffic_model", "none") or "none").strip().lower()
             traffic_model_enabled = traffic_model_mode != "none" and len(traffic_model_sessions) > 0
             scenario_enabled = len(scenario_sessions) > 0
@@ -1869,6 +1870,27 @@ async def worker_process(
                     _scenario_pool = None
 
             def _iter_scenario_runtime_batches():
+                if scenario_streaming:
+                    it = scenario_engine.iter_vu_lifecycle_batches(
+                        scenario_sessions=list(scenario_sessions or []),
+                        ramp_seconds=int((scenario_runtime_metrics or {}).get("scenario_ramp_seconds", 0) or 0),
+                        max_session_seconds=int((scenario_runtime_metrics or {}).get("scenario_max_session_seconds", int(args.get("duration", 1) or 1)) or 1),
+                        seed=int((scenario_runtime_metrics or {}).get("scenario_seed", 1337) or 1337),
+                        window_ms=500,
+                        bucket_ms=50,
+                        ramp_curve="linear",
+                    )
+                    for b, meta in it:
+                        if bool((meta or {}).get("final", False)):
+                            scenario_runtime_metrics.update(dict(meta or {}))
+                            continue
+                        rp_items = list(getattr(getattr(b, "request_plan", None), "items", []) or [])
+                        if rp_items:
+                            yield {
+                                "delay_s": float(max(0.0, float(getattr(b, "delay_s", 0.0) or 0.0))),
+                                "request_plan": gpu_cuda_payload.H2RequestPlan(items=rp_items),
+                            }
+                    return
                 for row in scenario_runtime_batches:
                     try:
                         delay_s = float((row or {}).get("delay_s", 0.0) or 0.0)
