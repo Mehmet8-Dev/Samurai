@@ -10,6 +10,10 @@ pybind11::tuple evaluate_sla_native(
     int sessions_completed,
     int step_attempted,
     int step_failed,
-    pybind11::object latency_p95_ms);
+    pybind11::object latency_p95_ms,
+    int tcp_connect_attempts,
+    int tcp_connect_established,
+    int tcp_retransmit_count,
+    int tcp_timeout_close_count);
 
 }  // namespace ddos_samurai::scenario_native

@@ -28,6 +28,10 @@ def evaluate_scenario_sla(
     per_flow_metrics: dict[str, dict[str, float]] | None = None,
     latency_p95_ms: float | None = None,
     latency_digest: Any | None = None,
+    tcp_connect_attempts: int = 0,
+    tcp_connect_established: int = 0,
+    tcp_retransmit_count: int = 0,
+    tcp_timeout_close_count: int = 0,
 ) -> SlaEvaluation:
     min_completion_rate = float((sla or {}).get("min_completion_rate", 0.95) or 0.95)
     max_step_fail_ratio = float((sla or {}).get("max_step_fail_ratio", 0.05) or 0.05)
@@ -47,6 +51,24 @@ def evaluate_scenario_sla(
     if max_latency_p95_ms is not None and latency_p95_ms is not None:
         if float(latency_p95_ms) > float(max_latency_p95_ms):
             reasons.append("latency_p95_above_threshold")
+    connect_attempts = max(0, int(tcp_connect_attempts or 0))
+    connect_established = max(0, int(tcp_connect_established or 0))
+    retransmit_count = max(0, int(tcp_retransmit_count or 0))
+    timeout_close_count = max(0, int(tcp_timeout_close_count or 0))
+    connect_timeout_ratio = 0.0
+    retransmit_ratio = 0.0
+    if connect_attempts > 0:
+        connect_timeout_ratio = max(
+            0.0,
+            min(1.0, 1.0 - (float(connect_established) / float(connect_attempts))),
+        )
+        retransmit_ratio = max(0.0, float(retransmit_count) / float(connect_attempts))
+        max_connect_timeout = float((sla or {}).get("max_connect_timeout_ratio", 1.0) or 1.0)
+        if connect_timeout_ratio > max_connect_timeout:
+            reasons.append("tcp_connect_timeout_above_threshold")
+        max_retransmit = float((sla or {}).get("max_retransmit_ratio", 1.0) or 1.0)
+        if retransmit_ratio > max_retransmit:
+            reasons.append("tcp_retransmit_above_threshold")
     per_flow = dict((sla or {}).get("per_flow") or {})
     for flow_name, flow_sla_obj in per_flow.items():
         flow_sla = dict(flow_sla_obj or {})
@@ -70,5 +92,8 @@ def evaluate_scenario_sla(
             "session_completion_rate": completion_rate,
             "step_fail_ratio": step_fail_ratio,
             "latency_p95_ms": float(latency_p95_ms or 0.0),
+            "tcp_connect_timeout_ratio": float(connect_timeout_ratio),
+            "tcp_retransmit_ratio": float(retransmit_ratio),
+            "tcp_timeout_close_count": float(timeout_close_count),
         },
     )

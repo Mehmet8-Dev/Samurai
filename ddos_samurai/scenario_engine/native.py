@@ -103,6 +103,10 @@ def evaluate_sla(
     step_attempted: int,
     step_failed: int,
     latency_p95_ms: float | None = None,
+    tcp_connect_attempts: int = 0,
+    tcp_connect_established: int = 0,
+    tcp_retransmit_count: int = 0,
+    tcp_timeout_close_count: int = 0,
 ) -> tuple[bool, dict[str, Any]]:
     require_native()
     ok, detail = _native.evaluate_sla(
@@ -112,5 +116,9 @@ def evaluate_sla(
         int(step_attempted),
         int(step_failed),
         latency_p95_ms,
+        int(tcp_connect_attempts),
+        int(tcp_connect_established),
+        int(tcp_retransmit_count),
+        int(tcp_timeout_close_count),
     )
     return bool(ok), dict(detail or {})

@@ -503,6 +503,27 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         self.assertFalse(ev.passed)
         self.assertTrue(any(str(x).startswith("latency_p95_above_threshold") for x in ev.reasons))
 
+    def test_sla_module_l4_thresholds(self):
+        ev = evaluate_scenario_sla(
+            sessions_started=10,
+            sessions_completed=10,
+            step_attempted=100,
+            step_failed=0,
+            sla={
+                "min_completion_rate": 0.9,
+                "max_step_fail_ratio": 0.1,
+                "max_connect_timeout_ratio": 0.10,
+                "max_retransmit_ratio": 0.05,
+            },
+            tcp_connect_attempts=100,
+            tcp_connect_established=80,
+            tcp_retransmit_count=10,
+            tcp_timeout_close_count=5,
+        )
+        self.assertFalse(ev.passed)
+        self.assertTrue(any(str(x) == "tcp_connect_timeout_above_threshold" for x in ev.reasons))
+        self.assertTrue(any(str(x) == "tcp_retransmit_above_threshold" for x in ev.reasons))
+
     def test_ramp_controller_curves(self):
         linear = RampController(target_vus=100, ramp_seconds=10, curve="linear")
         step = RampController(target_vus=100, ramp_seconds=10, curve="step", step_interval_s=2)

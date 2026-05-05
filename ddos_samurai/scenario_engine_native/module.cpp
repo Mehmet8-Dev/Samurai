@@ -83,5 +83,9 @@ PYBIND11_MODULE(_scenario_native, m) {
       py::arg("sessions_completed"),
       py::arg("step_attempted"),
       py::arg("step_failed"),
-      py::arg("latency_p95_ms") = py::none());
+      py::arg("latency_p95_ms") = py::none(),
+      py::arg("tcp_connect_attempts") = 0,
+      py::arg("tcp_connect_established") = 0,
+      py::arg("tcp_retransmit_count") = 0,
+      py::arg("tcp_timeout_close_count") = 0);
 }
