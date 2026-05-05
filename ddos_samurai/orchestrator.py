@@ -1911,6 +1911,9 @@ async def worker_process(
                     for row in granular:
                         flow = str((row or {}).get("flow", "unknown") or "unknown")
                         vu_id = str((row or {}).get("vu_id", "") or "")
+                        on_failure = str((row or {}).get("on_failure", "retry") or "retry").strip().lower()
+                        if on_failure not in {"retry", "skip", "abort"}:
+                            on_failure = "retry"
                         ok = bool((row or {}).get("success", False))
                         latency_ms = float((row or {}).get("latency_ms", 0.0) or 0.0)
                         _scenario_flow_steps[flow] = int(_scenario_flow_steps.get(flow, 0) or 0) + 1
@@ -1922,7 +1925,7 @@ async def worker_process(
                             _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
                         if vu_id:
                             _scenario_vu_progress[vu_id] = int(_scenario_vu_progress.get(vu_id, 0) or 0) + 1
-                            if not ok:
+                            if (not ok) and on_failure != "skip":
                                 _scenario_vu_failed[vu_id] = int(_scenario_vu_failed.get(vu_id, 0) or 0) + 1
                             expected = int(scenario_vu_expected_steps.get(vu_id, 0) or 0)
                             if expected > 0 and _scenario_vu_progress[vu_id] >= expected:
@@ -1939,13 +1942,16 @@ async def worker_process(
                     headers = dict(getattr(item, "headers", {}) or {})
                     flow = str(headers.get("x-scenario-flow", "unknown") or "unknown")
                     vu_id = str(headers.get("x-scenario-vu-id", "") or "")
+                    on_failure = str(headers.get("x-scenario-on-failure", "retry") or "retry").strip().lower()
+                    if on_failure not in {"retry", "skip", "abort"}:
+                        on_failure = "retry"
                     _scenario_flow_steps[flow] = int(_scenario_flow_steps.get(flow, 0) or 0) + 1
                     is_failed = idx >= success_count and (idx - success_count) < fail_count
                     if is_failed:
                         _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
                     if vu_id:
                         _scenario_vu_progress[vu_id] = int(_scenario_vu_progress.get(vu_id, 0) or 0) + 1
-                        if is_failed:
+                        if is_failed and on_failure != "skip":
                             _scenario_vu_failed[vu_id] = int(_scenario_vu_failed.get(vu_id, 0) or 0) + 1
                         expected = int(scenario_vu_expected_steps.get(vu_id, 0) or 0)
                         if expected > 0 and _scenario_vu_progress[vu_id] >= expected:
