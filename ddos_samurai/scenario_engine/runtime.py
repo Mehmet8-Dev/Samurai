@@ -92,6 +92,7 @@ class VUPool:
             custom_points=tuple((ramp_custom_points or [])),
         )
         self._spawn_schedule = self._controller.spawn_schedule()
+        self._spawn_cursor = 0
         max_s = max(1, int(max_session_seconds))
         for i, sess in enumerate(sessions, start=1):
             flow = str((sess or {}).get("flow", "unknown") or "unknown")
@@ -126,14 +127,17 @@ class VUPool:
     def spawn_until(self, elapsed_s: float) -> int:
         now = max(0.0, float(elapsed_s))
         spawned = 0
-        for key in self._spawn_order:
+        total = len(self._spawn_order)
+        while self._spawn_cursor < total:
+            key = self._spawn_order[self._spawn_cursor]
             vu = self._vus[key]
-            if vu.state != VUState.QUEUED:
-                continue
-            if vu.spawned_at_s <= now:
+            if vu.spawned_at_s > now:
+                break
+            if vu.state == VUState.QUEUED:
                 vu.state = VUState.INITIALIZING
                 vu.state = VUState.RUNNING
                 spawned += 1
+            self._spawn_cursor += 1
         self._active_peak = max(self._active_peak, self.active_count())
         return spawned
 
@@ -258,6 +262,7 @@ class VUPool:
             out[flow] = {
                 "sessions": float(row.sessions_total),
                 "completed": float(row.sessions_completed),
+                "failed": float(max(0, row.sessions_total - row.sessions_completed)),
                 "step_attempted": float(row.step_attempted),
                 "step_failed": float(row.step_failed),
                 "session_completion_rate": float(row.sessions_completed / max(1, row.sessions_total)),
@@ -313,9 +318,13 @@ class VUPool:
         duration_s: float,
         step_batch_provider: Any,
         tick_ms: int = 20,
+        max_rows_per_tick: int = 100000,
+        provider_timeout_ms: int = 2000,
     ) -> list[VirtualUserSnapshot]:
         dur = max(0.001, float(duration_s or 0.001))
         tick = max(1, int(tick_ms or 20))
+        row_cap = max(1, int(max_rows_per_tick or 1))
+        provider_timeout_s = max(0.001, float(provider_timeout_ms or 2000) / 1000.0)
         elapsed = 0.0
         while elapsed <= dur:
             self.spawn_until(elapsed)
@@ -324,10 +333,11 @@ class VUPool:
             if callable(step_batch_provider):
                 maybe = step_batch_provider(elapsed)
                 if inspect.isawaitable(maybe):
-                    maybe = await maybe
+                    maybe = await asyncio.wait_for(maybe, timeout=provider_timeout_s)
                 rows = list(maybe or [])
             if rows:
-                self.ingest_step_results(rows)
+                for i in range(0, len(rows), row_cap):
+                    self.ingest_step_results(rows[i:i + row_cap])
             self.finalize_timeouts(elapsed)
             await asyncio.sleep(0)
             elapsed += float(tick) / 1000.0

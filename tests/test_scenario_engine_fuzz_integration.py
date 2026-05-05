@@ -191,6 +191,37 @@ class TestScenarioEngineFuzzIntegration(unittest.TestCase):
         snaps = asyncio.run(pool.drive_with_step_batches(duration_s=0.1, step_batch_provider=provider, tick_ms=10))
         self.assertEqual(len(snaps), 1)
 
+    def test_vu_pool_spawn_cursor_large(self):
+        sessions = [{"flow": "f1", "events": [{"event_type": "http_request"}]} for _ in range(200)]
+        pool = VUPool(
+            scenario_sessions=sessions,
+            ramp_seconds=10,
+            max_session_seconds=30,
+            ramp_curve="linear",
+        )
+        s0 = pool.spawn_until(0.0)
+        s1 = pool.spawn_until(5.0)
+        s2 = pool.spawn_until(10.0)
+        self.assertGreaterEqual(s0 + s1 + s2, 200)
+
+    def test_vu_pool_async_provider_timeout(self):
+        sessions = [{"flow": "f1", "events": [{"event_type": "http_request"}]}]
+        pool = VUPool(scenario_sessions=sessions, ramp_seconds=0, max_session_seconds=5)
+
+        async def slow_provider(_elapsed_s):
+            await asyncio.sleep(0.05)
+            return []
+
+        with self.assertRaises(asyncio.TimeoutError):
+            _ = asyncio.run(
+                pool.drive_with_step_batches(
+                    duration_s=0.05,
+                    step_batch_provider=slow_provider,
+                    tick_ms=10,
+                    provider_timeout_ms=1,
+                )
+            )
+
     def test_collect_per_flow_metrics_has_failed(self):
         sessions = [{"flow": "a", "events": [{"event_type": "http_request"}]}]
         pool = VUPool(scenario_sessions=sessions, ramp_seconds=0, max_session_seconds=10)
@@ -242,4 +273,3 @@ class TestScenarioEngineFuzzIntegration(unittest.TestCase):
         rows = list(report.get("rows", []) or [])
         self.assertEqual(len(rows), 2)
         self.assertGreaterEqual(float(rows[0].get("elapsed_s", 0.0)), 0.0)
-
