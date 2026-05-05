@@ -9,7 +9,13 @@ from .runtime import (
     serialize_batches,
     simulate_vu_state_machine,
 )
-from .metrics import ScenarioRuntimeMetrics, FlowRuntimeMetrics, build_flow_runtime_metrics
+from .metrics import (
+    ScenarioRuntimeMetrics,
+    FlowRuntimeMetrics,
+    build_flow_runtime_metrics,
+    build_scenario_summary,
+    percentile,
+)
 from .sla import evaluate_scenario_sla, SlaEvaluation
 from .benchmark import run_compile_benchmark, write_compile_benchmark_report
 
@@ -30,6 +36,8 @@ __all__ = [
     "ScenarioRuntimeMetrics",
     "FlowRuntimeMetrics",
     "build_flow_runtime_metrics",
+    "build_scenario_summary",
+    "percentile",
     "evaluate_scenario_sla",
     "SlaEvaluation",
     "run_compile_benchmark",
