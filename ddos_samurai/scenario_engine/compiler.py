@@ -3,12 +3,30 @@ from __future__ import annotations
 from .types import (
     FlowSpec,
     LoadModelSpec,
+    OnFailurePolicy,
     PersonaSpec,
     ScenarioSpec,
     SlaGateSpec,
     StepSpec,
+    StepType,
     ThinkTimeSpec,
 )
+
+
+def _parse_step_type(raw: object) -> StepType:
+    s = str(raw or "").strip().lower()
+    try:
+        return StepType(s)
+    except ValueError:
+        return StepType.END_SESSION
+
+
+def _parse_on_failure(raw: object) -> OnFailurePolicy:
+    s = str(raw or "").strip().lower()
+    try:
+        return OnFailurePolicy(s)
+    except ValueError:
+        return OnFailurePolicy.RETRY
 
 
 def scenario_spec_to_dict(spec: ScenarioSpec) -> dict:
@@ -30,14 +48,14 @@ def scenario_spec_to_dict(spec: ScenarioSpec) -> dict:
                 "persona": f.persona,
                 "steps": [
                     {
-                        "type": s.step_type,
+                        "type": s.step_type.value,
                         "method": s.method,
                         "path": s.path,
                         "body_template": s.body_template,
                         "flow": s.flow,
                         "repeat": int(s.repeat),
                         "probability": float(s.probability),
-                        "on_failure": s.on_failure,
+                        "on_failure": s.on_failure.value,
                         "conditions": dict(s.conditions),
                         "dst_port": int(s.dst_port),
                         "payload_template": s.payload_template,
@@ -71,7 +89,7 @@ def scenario_spec_to_dict(spec: ScenarioSpec) -> dict:
     }
 
 
-def scenario_spec_from_dict(raw: dict) -> ScenarioSpec:
+def scenario_spec_from_dict(raw: dict[str, object]) -> ScenarioSpec:
     personas = {
         str(name): PersonaSpec(
             name=str(name),
@@ -91,14 +109,14 @@ def scenario_spec_from_dict(raw: dict) -> ScenarioSpec:
             tt = dict((row or {}).get("think_time") or {})
             steps.append(
                 StepSpec(
-                    step_type=str((row or {}).get("type", "") or "").strip().lower(),
+                    step_type=_parse_step_type((row or {}).get("type", "")),
                     method=str((row or {}).get("method", "GET") or "GET").strip().upper(),
                     path=str((row or {}).get("path", "/") or "/").strip(),
                     body_template=str((row or {}).get("body_template", "") or ""),
                     flow=str((row or {}).get("flow", "") or "").strip(),
                     repeat=max(1, int((row or {}).get("repeat", 1) or 1)),
                     probability=float((row or {}).get("probability", 1.0) or 1.0),
-                    on_failure=str((row or {}).get("on_failure", "retry") or "retry").strip().lower(),
+                    on_failure=_parse_on_failure((row or {}).get("on_failure", "retry")),
                     conditions=dict((row or {}).get("conditions") or {}),
                     dst_port=max(0, int((row or {}).get("dst_port", 0) or 0)),
                     payload_template=str((row or {}).get("payload_template", "") or ""),

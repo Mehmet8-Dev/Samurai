@@ -201,6 +201,32 @@ SCENARIO_SCHEMA_V3_PATCH: dict[str, Any] = {
             "additionalProperties": True,
         },
     },
+    "allOf": [
+        {
+            "if": {
+                "properties": {
+                    "load_model": {
+                        "type": "object",
+                        "properties": {"backend": {"const": "l4_tcp"}},
+                        "required": ["backend"],
+                    }
+                },
+                "required": ["load_model"],
+            },
+            "then": {
+                "properties": {
+                    "personas": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "object",
+                            "required": ["tcp_mimicry"],
+                        },
+                    }
+                },
+                "required": ["personas"],
+            },
+        }
+    ],
     "additionalProperties": True,
 }
 
@@ -220,7 +246,7 @@ def validate_with_json_schema(raw: dict[str, Any]) -> None:
     jsonschema.validate(instance=raw, schema=merged)
 
 
-def migrate_schema(raw: dict[str, Any], *, target_version: int = 2) -> dict[str, Any]:
+def migrate_schema(raw: dict[str, Any], *, target_version: int = 3) -> dict[str, Any]:
     obj = deepcopy(dict(raw or {}))
     cur = int(obj.get("schema_version", 1) or 1)
     tgt = max(1, int(target_version or 1))
@@ -243,4 +269,37 @@ def migrate_schema(raw: dict[str, Any], *, target_version: int = 2) -> dict[str,
                         tt.setdefault("mean_ms", 0)
                         tt.setdefault("stddev_ms", 0)
         obj["schema_version"] = 2
+        cur = 2
+    if cur < 3 <= tgt:
+        flows = dict(obj.get("flows") or {})
+        personas = dict(obj.get("personas") or {})
+        has_l4_steps = False
+        for _, flow in flows.items():
+            steps = list((flow or {}).get("steps") or [])
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                st = str(step.get("type", "") or "").strip().lower()
+                if st in {"tcp_connect", "tcp_send", "tcp_expect", "tcp_close"}:
+                    has_l4_steps = True
+                    if st == "tcp_expect":
+                        step["timeout_ms"] = max(1, int(step.get("timeout_ms", 1000) or 1000))
+        lm = dict(obj.get("load_model") or {})
+        backend = str(lm.get("backend", "http") or "http").strip().lower()
+        if has_l4_steps and backend in {"http", "http2", ""}:
+            lm["backend"] = "l4_tcp"
+        elif backend == "":
+            lm["backend"] = "http"
+        if str(lm.get("backend", "http") or "http").strip().lower() == "l4_tcp":
+            for _pname, _pdata in personas.items():
+                if not isinstance(_pdata, dict):
+                    continue
+                tm = dict(_pdata.get("tcp_mimicry") or {})
+                tm.setdefault("window", 64240)
+                tm.setdefault("mss", 1460)
+                tm.setdefault("ttl", 64)
+                _pdata["tcp_mimicry"] = tm
+            obj["personas"] = personas
+        obj["load_model"] = lm
+        obj["schema_version"] = 3
     return obj

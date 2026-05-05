@@ -74,6 +74,7 @@ def _condition_satisfied(*, condition: str, state_name: str, event_name: str) ->
 class _PendingExpect:
     condition: str
     timeout_at_s: float
+    started_at_s: float
 
 
 @dataclass
@@ -191,16 +192,19 @@ class L4SessionDriver:
             if ctx.pending is not None and _condition_satisfied(
                 condition=ctx.pending.condition, state_name=ctx.last_state, event_name=ctx.last_event
             ):
-                rows.append(self._result_row(ctx=ctx, success=True, timeout=False, latency_ms=0.0))
+                latency_ms = max(0.0, (now_s - float(ctx.pending.started_at_s)) * 1000.0)
+                rows.append(self._result_row(ctx=ctx, success=True, timeout=False, latency_ms=latency_ms))
                 ctx.pending = None
                 self._advance_ctx(ctx, now_s=now_s, rows=rows)
             elif not success and ctx.pending is not None:
-                rows.append(self._result_row(ctx=ctx, success=False, timeout=False, latency_ms=0.0))
+                latency_ms = max(0.0, (now_s - float(ctx.pending.started_at_s)) * 1000.0)
+                rows.append(self._result_row(ctx=ctx, success=False, timeout=False, latency_ms=latency_ms))
                 ctx.pending = None
                 ctx.done = True
         for ctx in list(self._ctx_by_vu.values()):
             if ctx.pending is not None and now_s >= ctx.pending.timeout_at_s:
-                rows.append(self._result_row(ctx=ctx, success=False, timeout=True, latency_ms=0.0))
+                latency_ms = max(0.0, (now_s - float(ctx.pending.started_at_s)) * 1000.0)
+                rows.append(self._result_row(ctx=ctx, success=False, timeout=True, latency_ms=latency_ms))
                 ctx.pending = None
                 ctx.done = True
         return rows
@@ -215,6 +219,13 @@ class L4SessionDriver:
         ctx = self._ctx_by_vu.get(int(vu_id))
         if ctx is None:
             return
+        flow_id = int(ctx.flow_id or 0)
+        enqueue_close = getattr(self._dataplane, "enqueue_tcp_close", None)
+        if flow_id > 0 and callable(enqueue_close):
+            try:
+                enqueue_close(flow_id)
+            except Exception:
+                pass
         ctx.closed = True
         ctx.done = True
 
@@ -264,7 +275,11 @@ class L4SessionDriver:
                 if _condition_satisfied(condition=cond, state_name=ctx.last_state, event_name=ctx.last_event):
                     out_rows.append(self._result_row(ctx=ctx, success=True, timeout=False, latency_ms=0.0))
                     continue
-                ctx.pending = _PendingExpect(condition=cond, timeout_at_s=now_s + (float(timeout_ms) / 1000.0))
+                ctx.pending = _PendingExpect(
+                    condition=cond,
+                    timeout_at_s=now_s + (float(timeout_ms) / 1000.0),
+                    started_at_s=now_s,
+                )
                 return
             if st == "tcp_close":
                 self.close_flow(ctx.vu_id)
@@ -272,4 +287,3 @@ class L4SessionDriver:
                 return
         if ctx.idx >= len(ctx.events) and ctx.pending is None:
             ctx.done = True
-

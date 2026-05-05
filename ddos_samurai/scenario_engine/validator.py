@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 from typing import Any
+from .types import OnFailurePolicy, StepType
 
 ALLOWED_STEP_TYPES = {
-    "request",
-    "pause",
-    "branch",
-    "loop",
-    "assert",
-    "end_session",
-    "tcp_connect",
-    "tcp_send",
-    "tcp_expect",
-    "tcp_close",
+    StepType.REQUEST.value,
+    StepType.PAUSE.value,
+    StepType.BRANCH.value,
+    StepType.LOOP.value,
+    StepType.ASSERT.value,
+    StepType.END_SESSION.value,
+    StepType.TCP_CONNECT.value,
+    StepType.TCP_SEND.value,
+    StepType.TCP_EXPECT.value,
+    StepType.TCP_CLOSE.value,
 }
 ALLOWED_BACKENDS = {"http", "http2", "l4_tcp"}
 
@@ -38,6 +39,19 @@ def validate_raw_schema(raw: dict[str, Any]) -> None:
         for req_key in ("device_profile", "headers", "cookies", "retry_policy", "timeout_policy"):
             if req_key not in pdata:
                 raise ValueError(f"persona '{pname}' missing required key: {req_key}")
+        if backend == "l4_tcp":
+            tm = pdata.get("tcp_mimicry")
+            if not isinstance(tm, dict):
+                raise ValueError(f"persona '{pname}' tcp_mimicry is required for l4_tcp backend")
+            window = int(tm.get("window", 0) or 0)
+            mss = int(tm.get("mss", 0) or 0)
+            ttl = int(tm.get("ttl", 0) or 0)
+            if window <= 0:
+                raise ValueError(f"persona '{pname}' tcp_mimicry.window must be > 0")
+            if mss <= 0:
+                raise ValueError(f"persona '{pname}' tcp_mimicry.mss must be > 0")
+            if ttl <= 0 or ttl > 255:
+                raise ValueError(f"persona '{pname}' tcp_mimicry.ttl must be 1..255")
     for fname, fdata in flows.items():
         if not isinstance(fdata, dict):
             raise ValueError(f"flow '{fname}' must be an object")
@@ -59,7 +73,7 @@ def validate_raw_schema(raw: dict[str, Any]) -> None:
                 if "body_template" in step and not isinstance(step.get("body_template"), str):
                     raise ValueError(f"flow '{fname}' step[{i}] body_template must be a string")
                 on_failure = str(step.get("on_failure", "retry") or "retry").strip().lower()
-                if on_failure not in {"retry", "skip", "abort"}:
+                if on_failure not in {OnFailurePolicy.RETRY.value, OnFailurePolicy.SKIP.value, OnFailurePolicy.ABORT.value}:
                     raise ValueError(f"flow '{fname}' step[{i}] on_failure must be retry|skip|abort")
                 extract = step.get("extract", {})
                 if extract is not None and not isinstance(extract, dict):

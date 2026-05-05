@@ -1,7 +1,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from enum import Enum
+from typing import TypeAlias
+
+JsonScalar: TypeAlias = str | int | float | bool | None
+JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+JsonObject: TypeAlias = dict[str, JsonValue]
+
+
+class StepType(str, Enum):
+    REQUEST = "request"
+    PAUSE = "pause"
+    BRANCH = "branch"
+    LOOP = "loop"
+    ASSERT = "assert"
+    END_SESSION = "end_session"
+    TCP_CONNECT = "tcp_connect"
+    TCP_SEND = "tcp_send"
+    TCP_EXPECT = "tcp_expect"
+    TCP_CLOSE = "tcp_close"
+
+
+class OnFailurePolicy(str, Enum):
+    RETRY = "retry"
+    SKIP = "skip"
+    ABORT = "abort"
 
 
 @dataclass(frozen=True)
@@ -15,15 +39,15 @@ class ThinkTimeSpec:
 
 @dataclass(frozen=True)
 class StepSpec:
-    step_type: str
+    step_type: StepType
     method: str = "GET"
     path: str = "/"
     body_template: str = ""
     flow: str = ""
     repeat: int = 1
     probability: float = 1.0
-    on_failure: str = "retry"
-    conditions: dict[str, Any] = field(default_factory=dict)
+    on_failure: OnFailurePolicy = OnFailurePolicy.RETRY
+    conditions: JsonObject = field(default_factory=dict)
     dst_port: int = 0
     payload_template: str = ""
     condition: str = ""
@@ -37,8 +61,8 @@ class PersonaSpec:
     device_profile: str
     headers: dict[str, str]
     cookies: dict[str, str]
-    retry_policy: dict[str, Any]
-    timeout_policy: dict[str, Any]
+    retry_policy: JsonObject
+    timeout_policy: JsonObject
     weight: float = 1.0
 
 
