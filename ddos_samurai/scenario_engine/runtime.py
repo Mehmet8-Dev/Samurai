@@ -105,10 +105,15 @@ class VUPool:
         max_s = max(1, int(max_session_seconds))
         for i, sess in enumerate(sessions, start=1):
             flow = str((sess or {}).get("flow", "unknown") or "unknown")
-            events = list((sess or {}).get("events", []) or [])
-            expected = int(
-                sum(1 for ev in events if str((ev or {}).get("event_type", "") or "").strip().lower() in {"http_request", "http2_headers"})
-            )
+            packed = bool((sess or {}).get("packed", False))
+            if packed:
+                kinds = list((sess or {}).get("event_kind", []) or [])
+                expected = int(sum(1 for k in kinds if int(k) != 1))
+            else:
+                events = list((sess or {}).get("events", []) or [])
+                expected = int(
+                    sum(1 for ev in events if str((ev or {}).get("event_type", "") or "").strip().lower() in {"http_request", "http2_headers"})
+                )
             spawn_at = float(self._spawn_schedule[i - 1]) if (i - 1) < len(self._spawn_schedule) else 0.0
             vu = VirtualUserInstance(
                 vu_id=i,

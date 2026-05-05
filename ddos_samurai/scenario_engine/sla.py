@@ -27,6 +27,7 @@ def evaluate_scenario_sla(
     sla: dict[str, Any],
     per_flow_metrics: dict[str, dict[str, float]] | None = None,
     latency_p95_ms: float | None = None,
+    latency_digest: Any | None = None,
 ) -> SlaEvaluation:
     min_completion_rate = float((sla or {}).get("min_completion_rate", 0.95) or 0.95)
     max_step_fail_ratio = float((sla or {}).get("max_step_fail_ratio", 0.05) or 0.05)
@@ -38,6 +39,11 @@ def evaluate_scenario_sla(
         reasons.append("completion_rate_below_threshold")
     if step_fail_ratio > max_step_fail_ratio:
         reasons.append("step_fail_ratio_above_threshold")
+    if latency_p95_ms is None and latency_digest is not None and hasattr(latency_digest, "quantile"):
+        try:
+            latency_p95_ms = float(latency_digest.quantile(0.95))
+        except Exception:
+            latency_p95_ms = None
     if max_latency_p95_ms is not None and latency_p95_ms is not None:
         if float(latency_p95_ms) > float(max_latency_p95_ms):
             reasons.append("latency_p95_above_threshold")

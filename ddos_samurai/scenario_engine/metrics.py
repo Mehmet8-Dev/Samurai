@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-import bisect
+import math
 from typing import Any
 
 
@@ -97,44 +97,85 @@ def percentile(values: list[float], q: float) -> float:
 
 @dataclass
 class LatencyDigest:
-    # Lightweight fixed-size quantile sketch using reservoir+sorted snapshots.
-    max_samples: int = 2048
-    _samples: list[float] = field(default_factory=list)
+    # Constant-memory centroid sketch (t-digest-like merge/compress).
+    max_centroids: int = 200
+    _centroids: list[tuple[float, int]] = field(default_factory=list)
     _count: int = 0
+
+    def _compress(self) -> None:
+        if len(self._centroids) <= int(self.max_centroids):
+            return
+        self._centroids.sort(key=lambda x: x[0])
+        target = max(2, int(self.max_centroids))
+        merged: list[tuple[float, int]] = []
+        bucket = max(1, int(math.ceil(len(self._centroids) / float(target))))
+        for i in range(0, len(self._centroids), bucket):
+            part = self._centroids[i:i + bucket]
+            w = sum(int(c) for _, c in part)
+            if w <= 0:
+                continue
+            mu = sum(float(m) * int(c) for m, c in part) / float(w)
+            merged.append((float(mu), int(w)))
+        self._centroids = merged[:target]
 
     def add(self, value_ms: float) -> None:
         v = float(value_ms)
         if v < 0.0:
             return
         self._count += 1
-        if len(self._samples) < int(self.max_samples):
-            bisect.insort(self._samples, v)
-            return
-        # Reservoir replacement with deterministic ring-like spread.
-        idx = self._count % max(1, int(self.max_samples))
-        old = self._samples[idx]
-        del self._samples[idx]
-        bisect.insort(self._samples, v)
-        # keep bounded and avoid growth due to precision corner cases
-        if len(self._samples) > int(self.max_samples):
-            self._samples.remove(old)
+        self._centroids.append((v, 1))
+        if len(self._centroids) > int(self.max_centroids) * 2:
+            self._compress()
 
     def quantile(self, q: float) -> float:
-        return percentile(self._samples, q)
+        if not self._centroids:
+            return 0.0
+        self._compress()
+        pts = sorted(self._centroids, key=lambda x: x[0])
+        total = max(1, sum(int(c) for _, c in pts))
+        target = max(0.0, min(1.0, float(q))) * float(total - 1)
+        run = 0.0
+        prev_m = float(pts[0][0])
+        prev_r = 0.0
+        for m, c in pts:
+            cur = run + float(int(c))
+            if target <= cur:
+                if cur <= prev_r:
+                    return float(m)
+                frac = (target - prev_r) / max(1e-9, (cur - prev_r))
+                return float(prev_m + (float(m) - prev_m) * frac)
+            prev_m = float(m)
+            prev_r = cur
+            run = cur
+        return float(pts[-1][0])
 
     def merge(self, other: "LatencyDigest") -> None:
-        for v in list(getattr(other, "_samples", []) or []):
-            self.add(float(v))
+        for m, c in list(getattr(other, "_centroids", []) or []):
+            self._centroids.append((float(m), int(c)))
+            self._count += int(c)
+        self._compress()
 
     def as_dict(self) -> dict[str, Any]:
-        return {"count": int(self._count), "samples": list(self._samples)}
+        return {
+            "count": int(self._count),
+            "max_centroids": int(self.max_centroids),
+            "centroids": [[float(m), int(c)] for m, c in list(self._centroids or [])],
+        }
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "LatencyDigest":
-        d = cls(max_samples=max(8, int((raw or {}).get("max_samples", 2048) or 2048)))
+        d = cls(max_centroids=max(8, int((raw or {}).get("max_centroids", 200) or 200)))
         d._count = int((raw or {}).get("count", 0) or 0)
-        vals = [float(x) for x in list((raw or {}).get("samples", []) or []) if float(x) >= 0.0]
-        d._samples = sorted(vals)[: d.max_samples]
+        out: list[tuple[float, int]] = []
+        for row in list((raw or {}).get("centroids", []) or []):
+            if not isinstance(row, (list, tuple)) or len(row) != 2:
+                continue
+            m = float(row[0])
+            c = max(1, int(row[1]))
+            if m >= 0.0:
+                out.append((m, c))
+        d._centroids = out[: max(8, int(d.max_centroids) * 2)]
+        d._compress()
         return d
 
 
