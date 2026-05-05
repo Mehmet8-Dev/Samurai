@@ -36,6 +36,8 @@ def load_tls_server_credentials(cert_path: str, key_path: str):
 def load_tls_client_credentials(ca_path: str):
     import grpc
 
+    if not str(ca_path or "").strip():
+        return grpc.ssl_channel_credentials()
     with open(ca_path, "rb") as ca_file:
         ca = ca_file.read()
     return grpc.ssl_channel_credentials(root_certificates=ca)

@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import socket
 import time
+import base64
 
 from .. import utils
 from .. import orchestrator
@@ -85,15 +86,36 @@ def run_distributed_slave(args, parser) -> int:
         )
         return 0 if int(stats.get("exitcode", 1) or 1) == 0 else 1
 
-    # Idle heartbeat loop (master StartShard orchestration asenkron fazda eklenecek).
+    # Master heartbeat command loop.
     hb_ms = int(getattr(args, "heartbeat_interval_ms", 2000) or 2000)
     boot = int(time.time() * 1000)
-    for _ in range(3):
+    run_forever = int(getattr(args, "job_timeout_s", 0) or 0) <= 0
+    loops = 0
+    while True:
         now = int(time.time() * 1000)
         hb = client.heartbeat(worker_id=worker_id, uptime_ms=max(0, now - boot))
         cmd = str(hb.get("command", "continue") or "continue")
+        if cmd.startswith("start:"):
+            enc = cmd.split(":", 1)[1]
+            try:
+                payload = json.loads(base64.b64decode(enc.encode("ascii")).decode("utf-8"))
+            except (ValueError, TypeError, UnicodeDecodeError) as exc:
+                utils.log_warning(f"Start command parse failed: {exc}")
+                time.sleep(max(0.5, hb_ms / 1000.0))
+                continue
+            shard_id = str(payload.get("shard_id", "shard-1") or "shard-1")
+            shard_args = dict(payload.get("args_dict") or {})
+            stats = _execute_shard_locally(shard_args, shard_id)
+            client.report_stats(worker_id=worker_id, shard_id=shard_id, stats=stats, timestamp_ms=int(time.time() * 1000))
+            utils.log_info(
+                f"Shard completed: shard_id={shard_id} sent={int(stats.get('sent', 0))} "
+                f"errors={int(stats.get('errors', 0))} exitcode={int(stats.get('exitcode', 0))}"
+            )
         if cmd in {"stop", "abort"}:
             utils.log_warning(f"Master command received: {cmd}")
+            break
+        loops += 1
+        if not run_forever and loops >= max(3, int(getattr(args, "job_timeout_s", 0) or 0)):
             break
         time.sleep(max(0.5, hb_ms / 1000.0))
     return 0

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import base64
 from concurrent import futures
 
 from . import require_distributed
@@ -42,6 +43,7 @@ class _SamuraiServicer:
         self.lock = threading.Lock()
         self.workers = {}
         self.shard_stats = {}
+        self._pending_commands = {}
 
     def RegisterWorker(self, request, context):
         _ = context
@@ -60,12 +62,16 @@ class _SamuraiServicer:
 
     def Heartbeat(self, request, context):
         _ = context
+        command = "continue"
         with self.lock:
             wid = str(request.worker_id)
             if wid in self.workers:
                 self.workers[wid]["last_heartbeat_ms"] = int(time.time() * 1000)
+            pending = self._pending_commands.pop(wid, None)
+            if pending:
+                command = str(pending)
         pb2, _ = load_generated()
-        return pb2.HeartbeatResponse(acknowledged=True, command="continue")
+        return pb2.HeartbeatResponse(acknowledged=True, command=command)
 
     def StartShard(self, request, context):
         _ = context
@@ -146,6 +152,26 @@ class _SamuraiServicer:
             stats_json=bytes(rec.get("stats_json", b"{}")),
             logs_json=b"[]",
         )
+
+    def queue_start_shard(self, worker_id: str, shard_id: str, job_id: str, args_dict: dict, packet_count: int, timeout_ms: int) -> None:
+        payload = {
+            "shard_id": str(shard_id),
+            "job_id": str(job_id),
+            "args_dict": dict(args_dict or {}),
+            "packet_count": int(packet_count or 0),
+            "timeout_ms": int(timeout_ms or 0),
+        }
+        encoded = base64.b64encode(json.dumps(payload, ensure_ascii=True).encode("utf-8")).decode("ascii")
+        with self.lock:
+            self._pending_commands[str(worker_id)] = f"start:{encoded}"
+            if str(worker_id) in self.workers:
+                self.workers[str(worker_id)]["state"] = "running"
+                self.workers[str(worker_id)]["active_shard_id"] = str(shard_id)
+
+    def queue_stop_shard(self, worker_id: str, graceful: bool = True) -> None:
+        cmd = "stop" if graceful else "abort"
+        with self.lock:
+            self._pending_commands[str(worker_id)] = cmd
 
 
 class MasterControlServer:
