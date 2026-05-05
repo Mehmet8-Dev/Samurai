@@ -529,26 +529,6 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 )
                 sessions_completed = int(rr.results.get("sent_total", 0) or 0)
                 step_failed = int(rr.results.get("errors_total", 0) or 0) + lifecycle_step_failed
-                sla_eval = scenario_engine.evaluate_scenario_sla(
-                    sla=scenario_spec_to_dict(scenario_spec).get("sla", {}),
-                    sessions_started=sessions_started,
-                    sessions_completed=sessions_completed,
-                    step_attempted=step_attempted,
-                    step_failed=step_failed,
-                    latency_p95_ms=float(rr.results.get("l7_handshake_p99_ms", 0.0) or 0.0),
-                )
-                sla_detail = sla_eval.to_dict()
-                rr.results["scenario_summary"] = {
-                    "mode": scenario_mode,
-                    "vus_target": int((scenario_build_metrics or {}).get("scenario_vus_target", 0) or 0),
-                    "active_vu": int(max(0, sessions_started - sessions_completed)),
-                    "vu_target_gap": int(max(0, int((scenario_build_metrics or {}).get("scenario_vus_target", 0) or 0) - max(0, sessions_started - sessions_completed))),
-                    "sessions_started": sessions_started,
-                    "sessions_completed": sessions_completed,
-                    "step_attempted": step_attempted,
-                    "step_failed": step_failed,
-                    **sla_detail,
-                }
                 all_scenario_sessions = []
                 for xs in list(scenario_sessions_by_worker or []):
                     all_scenario_sessions.extend(list(xs or []))
@@ -590,6 +570,27 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     "completed": int(sum(1 for v in vu_snapshots if str(v.state.value) == "completed")),
                 }
                 rr.results["scenario_per_flow"] = vu_pool.per_flow_metrics(duration_s=float(duration))
+                sla_eval = scenario_engine.evaluate_scenario_sla(
+                    sla=scenario_spec_to_dict(scenario_spec).get("sla", {}),
+                    sessions_started=sessions_started,
+                    sessions_completed=sessions_completed,
+                    step_attempted=step_attempted,
+                    step_failed=step_failed,
+                    per_flow_metrics=dict(rr.results.get("scenario_per_flow", {}) or {}),
+                    latency_p95_ms=float(rr.results.get("l7_handshake_p99_ms", 0.0) or 0.0),
+                )
+                sla_detail = sla_eval.to_dict()
+                rr.results["scenario_summary"] = {
+                    "mode": scenario_mode,
+                    "vus_target": int((scenario_build_metrics or {}).get("scenario_vus_target", 0) or 0),
+                    "active_vu": int(max(0, sessions_started - sessions_completed)),
+                    "vu_target_gap": int(max(0, int((scenario_build_metrics or {}).get("scenario_vus_target", 0) or 0) - max(0, sessions_started - sessions_completed))),
+                    "sessions_started": sessions_started,
+                    "sessions_completed": sessions_completed,
+                    "step_attempted": step_attempted,
+                    "step_failed": step_failed,
+                    **sla_detail,
+                }
                 _sla_metrics = dict(sla_detail.get("metrics", {}) or {})
                 rr.results["scenario_session_completion_rate"] = float(_sla_metrics.get("session_completion_rate", 0.0) or 0.0)
                 rr.results["scenario_step_fail_ratio"] = float(_sla_metrics.get("step_fail_ratio", 0.0) or 0.0)
