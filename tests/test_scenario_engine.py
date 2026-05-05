@@ -101,6 +101,45 @@ sla:
   max_step_fail_ratio: 0.1
 """
 
+_V2_POLICY_GAUSS_YAML = """\
+schema_version: 2
+personas:
+  web_user:
+    device_profile: web
+    headers: {User-Agent: UA}
+    cookies: {}
+    retry_policy: {max_retries: 2}
+    timeout_policy: {request_timeout_ms: 4000}
+flows:
+  browse:
+    persona: web_user
+    steps:
+      - type: request
+        method: GET
+        path: /
+        on_failure: abort
+      - type: pause
+        think_time:
+          distribution: gaussian
+          min_ms: 0
+          max_ms: 1000
+          mean_ms: 500
+          stddev_ms: 1
+      - type: request
+        method: GET
+        path: /x
+        on_failure: skip
+      - {type: end_session}
+load_model:
+  concurrent_vus: 10
+  ramp_seconds: 1
+  max_session_seconds: 30
+  backend: http
+sla:
+  min_completion_rate: 0.9
+  max_step_fail_ratio: 0.1
+"""
+
 
 class TestScenarioEngineParser(unittest.TestCase):
     def test_load_valid_yaml(self):
@@ -205,6 +244,10 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         self.assertIn("event_kind", out)
         self.assertIn("headers_idx", out)
         self.assertIn("headers_pool", out)
+        self.assertIn("on_failure", out)
+        self.assertIn("think_distribution", out)
+        self.assertIn("think_mean_ms", out)
+        self.assertIn("think_stddev_ms", out)
         self.assertGreaterEqual(len(list(out.get("event_kind", []) or [])), 1)
         batches, metrics = build_vu_lifecycle_batches(
             scenario_sessions=[out],
@@ -280,6 +323,34 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         )
         self.assertTrue(ev.passed)
         self.assertEqual(ev.reasons, [])
+
+    def test_sla_module_per_flow_rules(self):
+        ev = evaluate_scenario_sla(
+            sessions_started=100,
+            sessions_completed=99,
+            step_attempted=1000,
+            step_failed=5,
+            sla={
+                "min_completion_rate": 0.95,
+                "max_step_fail_ratio": 0.05,
+                "per_flow": {
+                    "checkout": {
+                        "min_completion_rate": 0.99,
+                        "max_step_fail_ratio": 0.02,
+                    }
+                },
+            },
+            per_flow_metrics={
+                "checkout": {
+                    "session_completion_rate": 0.98,
+                    "step_fail_ratio": 0.01,
+                    "latency_p95_ms": 100.0,
+                }
+            },
+            latency_p95_ms=120.0,
+        )
+        self.assertFalse(ev.passed)
+        self.assertTrue(any(str(x).startswith("per_flow_completion_below:checkout") for x in ev.reasons))
 
     def test_ramp_controller_curves(self):
         linear = RampController(target_vus=100, ramp_seconds=10, curve="linear")
@@ -393,6 +464,47 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         snap = pool.snapshots()[0]
         self.assertEqual(str(snap.state.value), "failed")
         self.assertEqual(int(snap.retries_used), 0)
+
+    def test_vu_pool_on_failure_skip_and_abort(self):
+        sessions = [{"flow": "f1", "events": [{"event_type": "http_request"}, {"event_type": "http_request"}]}]
+        pool = VUPool(
+            scenario_sessions=sessions,
+            ramp_seconds=0,
+            max_session_seconds=10,
+            flow_policies={"f1": {"max_retries": 3}},
+        )
+        pool.spawn_until(0.0)
+        pool.ingest_step_results([{"vu_id": "1", "flow": "f1", "success": False, "timeout": False, "on_failure": "skip"}])
+        snap = pool.snapshots()[0]
+        self.assertEqual(str(snap.state.value), "running")
+        self.assertEqual(int(snap.retries_used), 0)
+        pool.ingest_step_results([{"vu_id": "1", "flow": "f1", "success": False, "timeout": False, "on_failure": "abort"}])
+        snap2 = pool.snapshots()[0]
+        self.assertEqual(str(snap2.state.value), "failed")
+        self.assertEqual(int(snap2.retries_used), 0)
+
+    def test_schema_v2_on_failure_and_gaussian_runtime(self):
+        try:
+            scenario_native.require_native()
+        except RuntimeError:
+            self.skipTest("scenario native module unavailable")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "v2_policy_gauss.yaml"
+            p.write_text(_V2_POLICY_GAUSS_YAML, encoding="utf-8")
+            spec = load_raw_scenario(str(p))
+        packed = scenario_native.compile_session_plan_packed(spec, "browse", 77)
+        batches, _ = build_vu_lifecycle_batches(
+            scenario_sessions=[packed],
+            ramp_seconds=0,
+            max_session_seconds=30,
+            seed=77,
+            bucket_ms=10,
+        )
+        self.assertGreaterEqual(len(batches), 2)
+        first_headers = dict((batches[0].request_plan.items[0].headers or {}))
+        self.assertEqual(str(first_headers.get("x-scenario-on-failure", "")), "abort")
+        delays = [float(b.delay_s) for b in batches]
+        self.assertTrue(any(d >= 0.45 for d in delays))
 
     def test_vu_pool_async_step_batches(self):
         sessions = [{"flow": "f1", "events": [{"event_type": "http_request"}, {"event_type": "http_request"}]}]

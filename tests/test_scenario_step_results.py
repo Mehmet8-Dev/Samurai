@@ -8,7 +8,7 @@ class TestScenarioStepResults(unittest.TestCase):
     def test_step_results_include_flow_vu_and_timeout(self):
         plan = H2RequestPlan(
             items=[
-                H2RequestPlanItem(method="GET", path="/a", headers={"x-scenario-flow": "f1", "x-scenario-vu-id": "1"}),
+                H2RequestPlanItem(method="GET", path="/a", headers={"x-scenario-flow": "f1", "x-scenario-vu-id": "1", "x-scenario-on-failure": "abort"}),
                 H2RequestPlanItem(method="GET", path="/b", headers={"x-scenario-flow": "f1", "x-scenario-vu-id": "1"}),
                 H2RequestPlanItem(method="GET", path="/c", headers={"x-scenario-flow": "f2", "x-scenario-vu-id": "2"}),
             ]
@@ -21,4 +21,5 @@ class TestScenarioStepResults(unittest.TestCase):
         self.assertFalse(rows[2]["success"])
         self.assertEqual(rows[2]["flow"], "f2")
         self.assertEqual(rows[2]["vu_id"], "2")
-
+        self.assertEqual(rows[0]["on_failure"], "abort")
+        self.assertEqual(rows[1]["on_failure"], "retry")

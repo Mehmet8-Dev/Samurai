@@ -18,6 +18,7 @@ class TestL7NativeScenarioTrace(unittest.TestCase):
                     headers={
                         "x-scenario-flow": "trace_flow",
                         "x-scenario-vu-id": "42",
+                        "x-scenario-on-failure": "skip",
                     },
                 )
             ]
@@ -49,5 +50,6 @@ class TestL7NativeScenarioTrace(unittest.TestCase):
         self.assertGreaterEqual(len(rows), 1)
         self.assertEqual(str(rows[0].get("flow", "")), "trace_flow")
         self.assertEqual(str(rows[0].get("vu_id", "")), "42")
+        self.assertEqual(str(rows[0].get("on_failure", "")), "skip")
         self.assertIn("success", rows[0])
         self.assertIn("latency_ms", rows[0])
