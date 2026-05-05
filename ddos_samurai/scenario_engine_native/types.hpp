@@ -19,6 +19,9 @@ enum class StepType : std::uint8_t {
 struct ThinkTime {
   int min_ms{0};
   int max_ms{0};
+  std::string distribution{"uniform"};
+  int mean_ms{0};
+  int stddev_ms{0};
 };
 
 struct Step {
@@ -28,6 +31,7 @@ struct Step {
   std::string flow{};
   int repeat{1};
   double probability{1.0};
+  std::string on_failure{"retry"};
   ThinkTime think_time{};
 };
 

@@ -72,10 +72,14 @@ ScenarioSpecNative parse_spec(const py::dict& spec) {
         if (st.contains("flow")) step.flow = py::str(st["flow"]).cast<std::string>();
         if (st.contains("repeat")) step.repeat = std::max(1, static_cast<int>(py::int_(st["repeat"])));
         if (st.contains("probability")) step.probability = std::clamp(static_cast<double>(py::float_(st["probability"])), 0.0, 1.0);
+        if (st.contains("on_failure")) step.on_failure = py::str(st["on_failure"]).cast<std::string>();
         if (st.contains("think_time")) {
           py::dict tt = py::reinterpret_borrow<py::dict>(st["think_time"]);
           if (tt.contains("min_ms")) step.think_time.min_ms = std::max(0, static_cast<int>(py::int_(tt["min_ms"])));
           if (tt.contains("max_ms")) step.think_time.max_ms = std::max(step.think_time.min_ms, static_cast<int>(py::int_(tt["max_ms"])));
+          if (tt.contains("distribution")) step.think_time.distribution = py::str(tt["distribution"]).cast<std::string>();
+          if (tt.contains("mean_ms")) step.think_time.mean_ms = std::max(0, static_cast<int>(py::int_(tt["mean_ms"])));
+          if (tt.contains("stddev_ms")) step.think_time.stddev_ms = std::max(0, static_cast<int>(py::int_(tt["stddev_ms"])));
         }
         flow.steps.push_back(std::move(step));
       }
@@ -109,8 +113,12 @@ struct PackedEvents {
   std::vector<std::string> device_profile{};
   std::vector<int> timeout_ms{};
   std::vector<int> retry_count{};
+  std::vector<std::string> on_failure{};
   std::vector<int> think_min_ms{};
   std::vector<int> think_max_ms{};
+  std::vector<std::string> think_distribution{};
+  std::vector<int> think_mean_ms{};
+  std::vector<int> think_stddev_ms{};
 };
 
 static int intern_map(
@@ -152,6 +160,9 @@ static void compile_flow_recursive(const ScenarioSpecNative& spec, const std::st
         ev["event_type"] = py::str("think_time");
         ev["min_ms"] = step.think_time.min_ms;
         ev["max_ms"] = std::max(step.think_time.min_ms, step.think_time.max_ms);
+        ev["distribution"] = step.think_time.distribution;
+        ev["mean_ms"] = step.think_time.mean_ms;
+        ev["stddev_ms"] = step.think_time.stddev_ms;
         events.append(ev);
         st.emitted += 1;
         break;
@@ -200,6 +211,7 @@ static void compile_flow_recursive(const ScenarioSpecNative& spec, const std::st
         ev["device_profile"] = device_profile;
         ev["timeout_ms"] = timeout_ms;
         ev["retry_count"] = retry_count;
+        ev["on_failure"] = step.on_failure;
         events.append(ev);
         st.emitted += 1;
         break;
@@ -237,8 +249,12 @@ static void compile_flow_recursive_packed(
         out.device_profile.emplace_back("");
         out.timeout_ms.push_back(0);
         out.retry_count.push_back(0);
+        out.on_failure.emplace_back("retry");
         out.think_min_ms.push_back(step.think_time.min_ms);
         out.think_max_ms.push_back(std::max(step.think_time.min_ms, step.think_time.max_ms));
+        out.think_distribution.push_back(step.think_time.distribution);
+        out.think_mean_ms.push_back(step.think_time.mean_ms);
+        out.think_stddev_ms.push_back(step.think_time.stddev_ms);
         st.emitted += 1;
         break;
       }
@@ -286,8 +302,12 @@ static void compile_flow_recursive_packed(
         out.device_profile.push_back(std::move(device_profile));
         out.timeout_ms.push_back(timeout_ms);
         out.retry_count.push_back(retry_count);
+        out.on_failure.push_back(step.on_failure);
         out.think_min_ms.push_back(0);
         out.think_max_ms.push_back(0);
+        out.think_distribution.emplace_back("uniform");
+        out.think_mean_ms.push_back(0);
+        out.think_stddev_ms.push_back(0);
         st.emitted += 1;
         break;
       }
@@ -338,8 +358,12 @@ py::dict compile_session_plan_packed_native(const ScenarioSpecNative& spec, cons
   out["device_profile"] = py::cast(pe.device_profile);
   out["timeout_ms"] = py::cast(pe.timeout_ms);
   out["retry_count"] = py::cast(pe.retry_count);
+  out["on_failure"] = py::cast(pe.on_failure);
   out["think_min_ms"] = py::cast(pe.think_min_ms);
   out["think_max_ms"] = py::cast(pe.think_max_ms);
+  out["think_distribution"] = py::cast(pe.think_distribution);
+  out["think_mean_ms"] = py::cast(pe.think_mean_ms);
+  out["think_stddev_ms"] = py::cast(pe.think_stddev_ms);
   out["step_attempted"] = st.attempted;
   return out;
 }
