@@ -55,6 +55,232 @@ def _iter_session_views(sessions: list[dict[str, Any]]):
             }
 
 
+def _packed_session_arrays(session: dict[str, Any]) -> dict[str, Any]:
+    src = dict((session or {}).get("__soa") or {}) if "__soa" in (session or {}) else dict(session or {})
+    s0 = max(0, int((session or {}).get("__start", 0) or 0))
+    s1 = max(s0, int((session or {}).get("__end", 0) or 0)) if "__soa" in (session or {}) else len(list((src or {}).get("event_kind", []) or []))
+    ek = list((src or {}).get("event_kind", []) or [])
+    n = max(0, min(len(ek), s1) - s0)
+    return {
+        "s0": s0,
+        "s1": s1,
+        "n": n,
+        "ek": ek,
+        "rk": list((src or {}).get("request_kind", []) or []),
+        "methods": list((src or {}).get("method", []) or []),
+        "paths": list((src or {}).get("path", []) or []),
+        "headers_list": list((src or {}).get("headers", []) or []),
+        "cookies_list": list((src or {}).get("cookies", []) or []),
+        "headers_idx": list((src or {}).get("headers_idx", []) or []),
+        "cookies_idx": list((src or {}).get("cookies_idx", []) or []),
+        "headers_pool": list((src or {}).get("headers_pool", []) or []),
+        "cookies_pool": list((src or {}).get("cookies_pool", []) or []),
+        "retry_list": list((src or {}).get("retry_count", []) or []),
+        "on_failure_list": list((src or {}).get("on_failure", []) or []),
+        "body_templates": list((src or {}).get("body_template", []) or []),
+        "think_min": list((src or {}).get("think_min_ms", []) or []),
+        "think_max": list((src or {}).get("think_max_ms", []) or []),
+        "think_dist": list((src or {}).get("think_distribution", []) or []),
+        "think_mean": list((src or {}).get("think_mean_ms", []) or []),
+        "think_stddev": list((src or {}).get("think_stddev_ms", []) or []),
+    }
+
+def _expected_steps_for_session(session: dict[str, Any]) -> int:
+    packed_mode = bool((session or {}).get("packed", False))
+    if packed_mode:
+        pa = _packed_session_arrays(session)
+        s0, n = int(pa["s0"]), int(pa["n"])
+        ek = list(pa["ek"])
+        req_count = 0
+        for i in range(s0, s0 + n):
+            if int(ek[i] if i < len(ek) else 0) != 1:
+                req_count += 1
+        return int(req_count)
+    events = list((session or {}).get("events", []) or [])
+    return int(sum(1 for ev in events if str((ev or {}).get("event_type", "") or "").strip().lower() in {"http_request", "http2_headers"}))
+
+
+def _emit_request_item(
+    *,
+    t_s: float,
+    bucket_ms: int,
+    timeline: dict[int, list[H2RequestPlanItem]],
+    method: str,
+    path: str,
+    headers: dict[str, str],
+    body_template: str,
+) -> None:
+    body_bytes = body_template.encode("utf-8") if body_template else None
+    content_type = _infer_content_type_from_template(body_template)
+    key = int((t_s * 1000.0) // max(1, int(bucket_ms)))
+    timeline.setdefault(key, []).append(
+        H2RequestPlanItem(
+            method=str(method or "GET").upper(),
+            path=str(path or "/"),
+            headers=dict(headers or {}),
+            body=body_bytes,
+            content_type=content_type,
+        )
+    )
+
+
+def _materialize_session_into_timeline(
+    *,
+    session: dict[str, Any],
+    vu_id: int,
+    flow: str,
+    spawn_at: float,
+    deadline: float,
+    rng: random.Random,
+    bucket_ms: int,
+    timeline: dict[int, list[H2RequestPlanItem]],
+) -> tuple[int, int, float]:
+    packed_mode = bool((session or {}).get("packed", False))
+    t = float(spawn_at)
+    step_attempted = 0
+    step_failed = 0
+    if packed_mode:
+        pa = _packed_session_arrays(session)
+        s0, n = int(pa["s0"]), int(pa["n"])
+        ek = list(pa["ek"])
+        rk = list(pa["rk"])
+        methods = list(pa["methods"])
+        paths = list(pa["paths"])
+        headers_list = list(pa["headers_list"])
+        cookies_list = list(pa["cookies_list"])
+        headers_idx = list(pa["headers_idx"])
+        cookies_idx = list(pa["cookies_idx"])
+        headers_pool = list(pa["headers_pool"])
+        cookies_pool = list(pa["cookies_pool"])
+        retry_list = list(pa["retry_list"])
+        on_failure_list = list(pa["on_failure_list"])
+        body_templates = list(pa["body_templates"])
+        think_min = list(pa["think_min"])
+        think_max = list(pa["think_max"])
+        think_dist = list(pa["think_dist"])
+        think_mean = list(pa["think_mean"])
+        think_stddev = list(pa["think_stddev"])
+        for i in range(s0, s0 + n):
+            kind = int(ek[i] if i < len(ek) else 0)
+            if kind == 1:
+                t += _sample_think_seconds(
+                    rng=rng,
+                    distribution=str(think_dist[i] if i < len(think_dist) else "uniform"),
+                    min_ms=max(0, int(think_min[i] if i < len(think_min) else 0)),
+                    max_ms=max(0, int(think_max[i] if i < len(think_max) else 0)),
+                    mean_ms=int(think_mean[i] if i < len(think_mean) else 0),
+                    stddev_ms=int(think_stddev[i] if i < len(think_stddev) else 0),
+                )
+                continue
+            et = str(rk[i] if i < len(rk) else "http_request").strip().lower()
+            if et not in {"http_request", "http2_headers"}:
+                continue
+            if t > deadline:
+                step_failed += 1
+                continue
+            step_attempted += 1
+            if i < len(headers_idx) and headers_pool:
+                hidx = int(headers_idx[i] or 0)
+                headers = dict(headers_pool[hidx] if 0 <= hidx < len(headers_pool) else {})
+            else:
+                headers = dict(headers_list[i] if i < len(headers_list) else {})
+            if i < len(cookies_idx) and cookies_pool:
+                cidx = int(cookies_idx[i] or 0)
+                cookies = dict(cookies_pool[cidx] if 0 <= cidx < len(cookies_pool) else {})
+            else:
+                cookies = dict(cookies_list[i] if i < len(cookies_list) else {})
+            retry_count = max(0, int(retry_list[i] if i < len(retry_list) else 0))
+            on_failure = str(on_failure_list[i] if i < len(on_failure_list) else "retry").strip().lower()
+            if on_failure not in {"retry", "skip", "abort"}:
+                on_failure = "retry"
+            headers["x-scenario-flow"] = flow
+            headers["x-scenario-vu-id"] = str(vu_id)
+            headers["x-scenario-on-failure"] = on_failure
+            if cookies:
+                headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+            _emit_request_item(
+                t_s=t,
+                bucket_ms=bucket_ms,
+                timeline=timeline,
+                method=str(methods[i] if i < len(methods) else "GET"),
+                path=str(paths[i] if i < len(paths) else "/"),
+                headers=headers,
+                body_template=str(body_templates[i] if i < len(body_templates) else ""),
+            )
+            if on_failure != "retry":
+                retry_count = 0
+            for r in range(retry_count):
+                t_retry = t + (0.05 * float(r + 1))
+                if t_retry > deadline:
+                    step_failed += 1
+                    continue
+                step_attempted += 1
+                _emit_request_item(
+                    t_s=t_retry,
+                    bucket_ms=bucket_ms,
+                    timeline=timeline,
+                    method=str(methods[i] if i < len(methods) else "GET"),
+                    path=str(paths[i] if i < len(paths) else "/"),
+                    headers=headers,
+                    body_template=str(body_templates[i] if i < len(body_templates) else ""),
+                )
+        return step_attempted, step_failed, t
+
+    for ev in list((session or {}).get("events", []) or []):
+        et = str((ev or {}).get("event_type", "") or "").strip().lower()
+        if et == "think_time":
+            t += _sample_think_seconds(
+                rng=rng,
+                distribution=str((ev or {}).get("distribution", "uniform") or "uniform"),
+                min_ms=max(0, int((ev or {}).get("min_ms", 0) or 0)),
+                max_ms=max(0, int((ev or {}).get("max_ms", 0) or 0)),
+                mean_ms=int((ev or {}).get("mean_ms", 0) or 0),
+                stddev_ms=int((ev or {}).get("stddev_ms", 0) or 0),
+            )
+            continue
+        if et not in {"http_request", "http2_headers"}:
+            continue
+        if t > deadline:
+            step_failed += 1
+            continue
+        step_attempted += 1
+        headers = dict((ev or {}).get("headers") or {})
+        retry_count = max(0, int((ev or {}).get("retry_count", 0) or 0))
+        on_failure = str((ev or {}).get("on_failure", "retry") or "retry").strip().lower()
+        if on_failure not in {"retry", "skip", "abort"}:
+            on_failure = "retry"
+        headers["x-scenario-flow"] = flow
+        headers["x-scenario-vu-id"] = str(vu_id)
+        headers["x-scenario-on-failure"] = on_failure
+        _emit_request_item(
+            t_s=t,
+            bucket_ms=bucket_ms,
+            timeline=timeline,
+            method=str((ev or {}).get("method", "GET") or "GET"),
+            path=str((ev or {}).get("path", "/") or "/"),
+            headers=headers,
+            body_template=str((ev or {}).get("body_template", "") or ""),
+        )
+        if on_failure != "retry":
+            retry_count = 0
+        for r in range(retry_count):
+            t_retry = t + (0.05 * float(r + 1))
+            if t_retry > deadline:
+                step_failed += 1
+                continue
+            step_attempted += 1
+            _emit_request_item(
+                t_s=t_retry,
+                bucket_ms=bucket_ms,
+                timeline=timeline,
+                method=str((ev or {}).get("method", "GET") or "GET"),
+                path=str((ev or {}).get("path", "/") or "/"),
+                headers=headers,
+                body_template=str((ev or {}).get("body_template", "") or ""),
+            )
+    return step_attempted, step_failed, t
+
+
 @dataclass(frozen=True)
 class ScheduledRequestBatch:
     delay_s: float
@@ -524,189 +750,26 @@ def build_vu_lifecycle_batches(
     for si, session in enumerate(_iter_session_views(sessions)):
         vu_id = si + 1
         spawn_at = float(spawn_schedule[si]) if si < len(spawn_schedule) else 0.0
-        t = spawn_at
         sess_timeout_ms = max(0, int((session or {}).get("session_timeout_ms", 0) or 0))
         session_timeout_s = (float(sess_timeout_ms) / 1000.0) if sess_timeout_ms > 0 else float(max_sess_s)
         deadline = spawn_at + max(0.001, session_timeout_s)
-        packed_mode = bool((session or {}).get("packed", False))
-        events = list((session or {}).get("events", []) or []) if not packed_mode else []
         flow = str((session or {}).get("flow", "unknown") or "unknown")
         vu_flow[str(vu_id)] = flow
-        if packed_mode:
-            src = dict((session or {}).get("__soa") or {}) if "__soa" in (session or {}) else dict(session or {})
-            s0 = max(0, int((session or {}).get("__start", 0) or 0))
-            s1 = max(s0, int((session or {}).get("__end", 0) or 0)) if "__soa" in (session or {}) else len(list((src or {}).get("event_kind", []) or []))
-            ek = list((src or {}).get("event_kind", []) or [])
-            rk = list((src or {}).get("request_kind", []) or [])
-            methods = list((src or {}).get("method", []) or [])
-            paths = list((src or {}).get("path", []) or [])
-            headers_list = list((src or {}).get("headers", []) or [])
-            cookies_list = list((src or {}).get("cookies", []) or [])
-            headers_idx = list((src or {}).get("headers_idx", []) or [])
-            cookies_idx = list((src or {}).get("cookies_idx", []) or [])
-            headers_pool = list((src or {}).get("headers_pool", []) or [])
-            cookies_pool = list((src or {}).get("cookies_pool", []) or [])
-            retry_list = list((src or {}).get("retry_count", []) or [])
-            on_failure_list = list((src or {}).get("on_failure", []) or [])
-            body_templates = list((src or {}).get("body_template", []) or [])
-            think_min = list((src or {}).get("think_min_ms", []) or [])
-            think_max = list((src or {}).get("think_max_ms", []) or [])
-            think_dist = list((src or {}).get("think_distribution", []) or [])
-            think_mean = list((src or {}).get("think_mean_ms", []) or [])
-            think_stddev = list((src or {}).get("think_stddev_ms", []) or [])
-            n = max(0, min(len(ek), s1) - s0)
-            req_count = 0
-            for i in range(s0, s0 + n):
-                kind = int(ek[i] if i < len(ek) else 0)
-                if kind != 1:
-                    req_count += 1
-            vu_expected_steps[str(vu_id)] = int(req_count)
-        else:
-            vu_expected_steps[str(vu_id)] = int(
-                sum(1 for ev in events if str((ev or {}).get("event_type", "") or "").strip().lower() in {"http_request", "http2_headers"})
-            )
+        vu_expected_steps[str(vu_id)] = _expected_steps_for_session(session)
         active_markers.append((spawn_at, +1))
-        if packed_mode:
-            for i in range(s0, s0 + n):
-                kind = int(ek[i] if i < len(ek) else 0)
-                if kind == 1:
-                    min_ms = max(0, int(think_min[i] if i < len(think_min) else 0))
-                    max_ms = max(min_ms, int(think_max[i] if i < len(think_max) else min_ms))
-                    dist = str(think_dist[i] if i < len(think_dist) else "uniform")
-                    mean_ms = int(think_mean[i] if i < len(think_mean) else 0)
-                    stddev_ms = int(think_stddev[i] if i < len(think_stddev) else 0)
-                    t += _sample_think_seconds(
-                        rng=rng,
-                        distribution=dist,
-                        min_ms=min_ms,
-                        max_ms=max_ms,
-                        mean_ms=mean_ms,
-                        stddev_ms=stddev_ms,
-                    )
-                    continue
-                et = str(rk[i] if i < len(rk) else "http_request").strip().lower()
-                if et not in {"http_request", "http2_headers"}:
-                    continue
-                if t > deadline:
-                    step_failed += 1
-                    continue
-                step_attempted += 1
-                method = str(methods[i] if i < len(methods) else "GET").upper()
-                path = str(paths[i] if i < len(paths) else "/")
-                if i < len(headers_idx) and headers_pool:
-                    hidx = int(headers_idx[i] or 0)
-                    headers = dict(headers_pool[hidx] if 0 <= hidx < len(headers_pool) else {})
-                else:
-                    headers = dict(headers_list[i] if i < len(headers_list) else {})
-                if i < len(cookies_idx) and cookies_pool:
-                    cidx = int(cookies_idx[i] or 0)
-                    cookies = dict(cookies_pool[cidx] if 0 <= cidx < len(cookies_pool) else {})
-                else:
-                    cookies = dict(cookies_list[i] if i < len(cookies_list) else {})
-                retry_count = max(0, int(retry_list[i] if i < len(retry_list) else 0))
-                on_failure = str(on_failure_list[i] if i < len(on_failure_list) else "retry").strip().lower()
-                if on_failure not in {"retry", "skip", "abort"}:
-                    on_failure = "retry"
-                headers["x-scenario-flow"] = flow
-                headers["x-scenario-vu-id"] = str(vu_id)
-                headers["x-scenario-on-failure"] = on_failure
-                body_template = str(body_templates[i] if i < len(body_templates) else "")
-                body_bytes = body_template.encode("utf-8") if body_template else None
-                content_type = _infer_content_type_from_template(body_template)
-                if cookies:
-                    headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
-                key = int((t * 1000.0) // bucket)
-                timeline.setdefault(key, []).append(
-                    H2RequestPlanItem(
-                        method=method,
-                        path=path,
-                        headers=headers,
-                        body=body_bytes,
-                        content_type=content_type,
-                    )
-                )
-                if on_failure != "retry":
-                    retry_count = 0
-                for r in range(retry_count):
-                    t_retry = t + (0.05 * float(r + 1))
-                    if t_retry > deadline:
-                        step_failed += 1
-                        continue
-                    step_attempted += 1
-                    key_retry = int((t_retry * 1000.0) // bucket)
-                    timeline.setdefault(key_retry, []).append(
-                        H2RequestPlanItem(
-                            method=method,
-                            path=path,
-                            headers=headers,
-                            body=body_bytes,
-                            content_type=content_type,
-                        )
-                    )
-        else:
-            for ev in events:
-                et = str((ev or {}).get("event_type", "") or "").strip().lower()
-                if et == "think_time":
-                    min_ms = max(0, int((ev or {}).get("min_ms", 0) or 0))
-                    max_ms = max(min_ms, int((ev or {}).get("max_ms", min_ms) or min_ms))
-                    t += _sample_think_seconds(
-                        rng=rng,
-                        distribution=str((ev or {}).get("distribution", "uniform") or "uniform"),
-                        min_ms=min_ms,
-                        max_ms=max_ms,
-                        mean_ms=int((ev or {}).get("mean_ms", 0) or 0),
-                        stddev_ms=int((ev or {}).get("stddev_ms", 0) or 0),
-                    )
-                    continue
-                if et not in {"http_request", "http2_headers"}:
-                    continue
-                if t > deadline:
-                    step_failed += 1
-                    continue
-                step_attempted += 1
-                method = str((ev or {}).get("method", "GET") or "GET").upper()
-                path = str((ev or {}).get("path", "/") or "/")
-                headers = dict((ev or {}).get("headers") or {})
-                retry_count = max(0, int((ev or {}).get("retry_count", 0) or 0))
-                on_failure = str((ev or {}).get("on_failure", "retry") or "retry").strip().lower()
-                if on_failure not in {"retry", "skip", "abort"}:
-                    on_failure = "retry"
-                headers["x-scenario-flow"] = flow
-                headers["x-scenario-vu-id"] = str(vu_id)
-                headers["x-scenario-on-failure"] = on_failure
-                body_template = str((ev or {}).get("body_template", "") or "")
-                body_bytes = body_template.encode("utf-8") if body_template else None
-                content_type = _infer_content_type_from_template(body_template)
-                key = int((t * 1000.0) // bucket)
-                timeline.setdefault(key, []).append(
-                    H2RequestPlanItem(
-                        method=method,
-                        path=path,
-                        headers=headers,
-                        body=body_bytes,
-                        content_type=content_type,
-                    )
-                )
-                # Model retry lifecycle deterministically as future attempts in plan timeline.
-                if on_failure != "retry":
-                    retry_count = 0
-                for r in range(retry_count):
-                    t_retry = t + (0.05 * float(r + 1))
-                    if t_retry > deadline:
-                        step_failed += 1
-                        continue
-                    step_attempted += 1
-                    key_retry = int((t_retry * 1000.0) // bucket)
-                    timeline.setdefault(key_retry, []).append(
-                        H2RequestPlanItem(
-                            method=method,
-                            path=path,
-                            headers=headers,
-                            body=body_bytes,
-                            content_type=content_type,
-                        )
-                    )
-        active_markers.append((min(deadline, t), -1))
+        sess_attempted, sess_failed, end_t = _materialize_session_into_timeline(
+            session=session,
+            vu_id=vu_id,
+            flow=flow,
+            spawn_at=spawn_at,
+            deadline=deadline,
+            rng=rng,
+            bucket_ms=bucket,
+            timeline=timeline,
+        )
+        step_attempted += int(sess_attempted)
+        step_failed += int(sess_failed)
+        active_markers.append((min(deadline, end_t), -1))
 
     batches: list[ScheduledRequestBatch] = []
     for k in sorted(timeline.keys()):
@@ -801,144 +864,26 @@ def iter_vu_lifecycle_batches(
         vu_id = si + 1
         spawn_at = float(spawn_schedule[si]) if si < len(spawn_schedule) else 0.0
         next_spawn_at = float(spawn_schedule[si + 1]) if (si + 1) < len(spawn_schedule) else float("inf")
-        t = spawn_at
         sess_timeout_ms = max(0, int((session or {}).get("session_timeout_ms", 0) or 0))
         session_timeout_s = (float(sess_timeout_ms) / 1000.0) if sess_timeout_ms > 0 else float(max_sess_s)
         deadline = spawn_at + max(0.001, session_timeout_s)
-        packed_mode = bool((session or {}).get("packed", False))
-        events = list((session or {}).get("events", []) or []) if not packed_mode else []
         flow = str((session or {}).get("flow", "unknown") or "unknown")
         vu_flow[str(vu_id)] = flow
-        if packed_mode:
-            src = dict((session or {}).get("__soa") or {}) if "__soa" in (session or {}) else dict(session or {})
-            s0 = max(0, int((session or {}).get("__start", 0) or 0))
-            s1 = max(s0, int((session or {}).get("__end", 0) or 0)) if "__soa" in (session or {}) else len(list((src or {}).get("event_kind", []) or []))
-            ek = list((src or {}).get("event_kind", []) or [])
-            rk = list((src or {}).get("request_kind", []) or [])
-            methods = list((src or {}).get("method", []) or [])
-            paths = list((src or {}).get("path", []) or [])
-            headers_list = list((src or {}).get("headers", []) or [])
-            cookies_list = list((src or {}).get("cookies", []) or [])
-            headers_idx = list((src or {}).get("headers_idx", []) or [])
-            cookies_idx = list((src or {}).get("cookies_idx", []) or [])
-            headers_pool = list((src or {}).get("headers_pool", []) or [])
-            cookies_pool = list((src or {}).get("cookies_pool", []) or [])
-            retry_list = list((src or {}).get("retry_count", []) or [])
-            on_failure_list = list((src or {}).get("on_failure", []) or [])
-            body_templates = list((src or {}).get("body_template", []) or [])
-            think_min = list((src or {}).get("think_min_ms", []) or [])
-            think_max = list((src or {}).get("think_max_ms", []) or [])
-            think_dist = list((src or {}).get("think_distribution", []) or [])
-            think_mean = list((src or {}).get("think_mean_ms", []) or [])
-            think_stddev = list((src or {}).get("think_stddev_ms", []) or [])
-            n = max(0, min(len(ek), s1) - s0)
-            vu_expected_steps[str(vu_id)] = int(sum(1 for i in range(s0, s0 + n) if int(ek[i] if i < len(ek) else 0) != 1))
-        else:
-            vu_expected_steps[str(vu_id)] = int(
-                sum(1 for ev in events if str((ev or {}).get("event_type", "") or "").strip().lower() in {"http_request", "http2_headers"})
-            )
+        vu_expected_steps[str(vu_id)] = _expected_steps_for_session(session)
         active_markers.append((spawn_at, +1))
-        if packed_mode:
-            for i in range(s0, s0 + n):
-                kind = int(ek[i] if i < len(ek) else 0)
-                if kind == 1:
-                    t += _sample_think_seconds(
-                        rng=rng,
-                        distribution=str(think_dist[i] if i < len(think_dist) else "uniform"),
-                        min_ms=max(0, int(think_min[i] if i < len(think_min) else 0)),
-                        max_ms=max(0, int(think_max[i] if i < len(think_max) else 0)),
-                        mean_ms=int(think_mean[i] if i < len(think_mean) else 0),
-                        stddev_ms=int(think_stddev[i] if i < len(think_stddev) else 0),
-                    )
-                    continue
-                et = str(rk[i] if i < len(rk) else "http_request").strip().lower()
-                if et not in {"http_request", "http2_headers"}:
-                    continue
-                if t > deadline:
-                    step_failed += 1
-                    continue
-                step_attempted += 1
-                method = str(methods[i] if i < len(methods) else "GET").upper()
-                path = str(paths[i] if i < len(paths) else "/")
-                if i < len(headers_idx) and headers_pool:
-                    hidx = int(headers_idx[i] or 0)
-                    headers = dict(headers_pool[hidx] if 0 <= hidx < len(headers_pool) else {})
-                else:
-                    headers = dict(headers_list[i] if i < len(headers_list) else {})
-                if i < len(cookies_idx) and cookies_pool:
-                    cidx = int(cookies_idx[i] or 0)
-                    cookies = dict(cookies_pool[cidx] if 0 <= cidx < len(cookies_pool) else {})
-                else:
-                    cookies = dict(cookies_list[i] if i < len(cookies_list) else {})
-                retry_count = max(0, int(retry_list[i] if i < len(retry_list) else 0))
-                on_failure = str(on_failure_list[i] if i < len(on_failure_list) else "retry").strip().lower()
-                if on_failure not in {"retry", "skip", "abort"}:
-                    on_failure = "retry"
-                headers["x-scenario-flow"] = flow
-                headers["x-scenario-vu-id"] = str(vu_id)
-                headers["x-scenario-on-failure"] = on_failure
-                body_template = str(body_templates[i] if i < len(body_templates) else "")
-                body_bytes = body_template.encode("utf-8") if body_template else None
-                content_type = _infer_content_type_from_template(body_template)
-                if cookies:
-                    headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
-                key = int((t * 1000.0) // bucket)
-                timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers, body=body_bytes, content_type=content_type))
-                if on_failure != "retry":
-                    retry_count = 0
-                for r in range(retry_count):
-                    t_retry = t + (0.05 * float(r + 1))
-                    if t_retry > deadline:
-                        step_failed += 1
-                        continue
-                    step_attempted += 1
-                    key_retry = int((t_retry * 1000.0) // bucket)
-                    timeline.setdefault(key_retry, []).append(H2RequestPlanItem(method=method, path=path, headers=headers, body=body_bytes, content_type=content_type))
-        else:
-            for ev in events:
-                et = str((ev or {}).get("event_type", "") or "").strip().lower()
-                if et == "think_time":
-                    t += _sample_think_seconds(
-                        rng=rng,
-                        distribution=str((ev or {}).get("distribution", "uniform") or "uniform"),
-                        min_ms=max(0, int((ev or {}).get("min_ms", 0) or 0)),
-                        max_ms=max(0, int((ev or {}).get("max_ms", 0) or 0)),
-                        mean_ms=int((ev or {}).get("mean_ms", 0) or 0),
-                        stddev_ms=int((ev or {}).get("stddev_ms", 0) or 0),
-                    )
-                    continue
-                if et not in {"http_request", "http2_headers"}:
-                    continue
-                if t > deadline:
-                    step_failed += 1
-                    continue
-                step_attempted += 1
-                method = str((ev or {}).get("method", "GET") or "GET").upper()
-                path = str((ev or {}).get("path", "/") or "/")
-                headers = dict((ev or {}).get("headers") or {})
-                retry_count = max(0, int((ev or {}).get("retry_count", 0) or 0))
-                on_failure = str((ev or {}).get("on_failure", "retry") or "retry").strip().lower()
-                if on_failure not in {"retry", "skip", "abort"}:
-                    on_failure = "retry"
-                headers["x-scenario-flow"] = flow
-                headers["x-scenario-vu-id"] = str(vu_id)
-                headers["x-scenario-on-failure"] = on_failure
-                body_template = str((ev or {}).get("body_template", "") or "")
-                body_bytes = body_template.encode("utf-8") if body_template else None
-                content_type = _infer_content_type_from_template(body_template)
-                key = int((t * 1000.0) // bucket)
-                timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers, body=body_bytes, content_type=content_type))
-                if on_failure != "retry":
-                    retry_count = 0
-                for r in range(retry_count):
-                    t_retry = t + (0.05 * float(r + 1))
-                    if t_retry > deadline:
-                        step_failed += 1
-                        continue
-                    step_attempted += 1
-                    key_retry = int((t_retry * 1000.0) // bucket)
-                    timeline.setdefault(key_retry, []).append(H2RequestPlanItem(method=method, path=path, headers=headers, body=body_bytes, content_type=content_type))
-        active_markers.append((min(deadline, t), -1))
+        sess_attempted, sess_failed, end_t = _materialize_session_into_timeline(
+            session=session,
+            vu_id=vu_id,
+            flow=flow,
+            spawn_at=spawn_at,
+            deadline=deadline,
+            rng=rng,
+            bucket_ms=bucket,
+            timeline=timeline,
+        )
+        step_attempted += int(sess_attempted)
+        step_failed += int(sess_failed)
+        active_markers.append((min(deadline, end_t), -1))
 
         cutoff_bucket = int((next_spawn_at * 1000.0) // bucket) if next_spawn_at != float("inf") else (1 << 60)
         for row in _emit_flushed(cutoff_bucket):
