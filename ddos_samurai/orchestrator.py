@@ -1858,6 +1858,14 @@ async def worker_process(
             _scenario_flow_steps: dict[str, int] = {}
             _scenario_flow_failed_steps: dict[str, int] = {}
             _scenario_flow_latency_digest: dict[str, LatencyDigest] = {}
+            _scenario_telemetry: dict[str, int] = {
+                "step_rows_total": 0,
+                "step_rows_granular": 0,
+                "step_rows_header_fallback": 0,
+                "latency_samples": 0,
+                "pool_ingest_calls": 0,
+                "pool_ingest_errors": 0,
+            }
             if scenario_enabled:
                 try:
                     _scenario_pool = scenario_engine.VUPool(
@@ -1950,6 +1958,7 @@ async def worker_process(
                         _scenario_flow_steps[flow] = int(_scenario_flow_steps.get(flow, 0) or 0) + 1
                         if latency_ms >= 0.0:
                             _scenario_flow_latency_digest.setdefault(flow, LatencyDigest()).add(latency_ms)
+                            _scenario_telemetry["latency_samples"] = int(_scenario_telemetry.get("latency_samples", 0) or 0) + 1
                         if not ok:
                             _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
                         _pool_rows.append(
@@ -1963,13 +1972,17 @@ async def worker_process(
                         )
                     if _scenario_pool is not None and _pool_rows:
                         try:
+                            _scenario_telemetry["pool_ingest_calls"] = int(_scenario_telemetry.get("pool_ingest_calls", 0) or 0) + 1
                             _elapsed = float(max(0.0, time.monotonic() - _scenario_t0))
                             _scenario_pool.spawn_until(_elapsed)
                             _scenario_pool.ingest_step_results(_pool_rows)
                             _scenario_pool.tick_retries(_elapsed)
                             _scenario_pool.finalize_timeouts(_elapsed)
                         except _RECOVERABLE_ERRORS as exc:
+                            _scenario_telemetry["pool_ingest_errors"] = int(_scenario_telemetry.get("pool_ingest_errors", 0) or 0) + 1
                             _debug_exception(f"[Worker {worker_id}] scenario VUPool ingest failed", exc)
+                    _scenario_telemetry["step_rows_total"] = int(_scenario_telemetry.get("step_rows_total", 0) or 0) + int(len(_pool_rows))
+                    _scenario_telemetry["step_rows_granular"] = int(_scenario_telemetry.get("step_rows_granular", 0) or 0) + int(len(_pool_rows))
                     return
 
                 attempted = len(items)
@@ -1999,13 +2012,17 @@ async def worker_process(
                     )
                 if _scenario_pool is not None and _pool_rows:
                     try:
+                        _scenario_telemetry["pool_ingest_calls"] = int(_scenario_telemetry.get("pool_ingest_calls", 0) or 0) + 1
                         _elapsed = float(max(0.0, time.monotonic() - _scenario_t0))
                         _scenario_pool.spawn_until(_elapsed)
                         _scenario_pool.ingest_step_results(_pool_rows)
                         _scenario_pool.tick_retries(_elapsed)
                         _scenario_pool.finalize_timeouts(_elapsed)
                     except _RECOVERABLE_ERRORS as exc:
+                        _scenario_telemetry["pool_ingest_errors"] = int(_scenario_telemetry.get("pool_ingest_errors", 0) or 0) + 1
                         _debug_exception(f"[Worker {worker_id}] scenario VUPool ingest failed", exc)
+                _scenario_telemetry["step_rows_total"] = int(_scenario_telemetry.get("step_rows_total", 0) or 0) + int(len(_pool_rows))
+                _scenario_telemetry["step_rows_header_fallback"] = int(_scenario_telemetry.get("step_rows_header_fallback", 0) or 0) + int(len(_pool_rows))
 
             def _iter_model_plans():
                 for session_plan in traffic_model_sessions:
@@ -2068,6 +2085,8 @@ async def worker_process(
                         _debug_exception(f"[Worker {worker_id}] scenario L4 tick failed", exc)
                         rows = []
                     if rows:
+                        _scenario_telemetry["step_rows_total"] = int(_scenario_telemetry.get("step_rows_total", 0) or 0) + int(len(rows))
+                        _scenario_telemetry["step_rows_granular"] = int(_scenario_telemetry.get("step_rows_granular", 0) or 0) + int(len(rows))
                         for row in rows:
                             flow = str((row or {}).get("flow", "unknown") or "unknown")
                             ok = bool((row or {}).get("success", False))
@@ -2075,15 +2094,18 @@ async def worker_process(
                             _scenario_flow_steps[flow] = int(_scenario_flow_steps.get(flow, 0) or 0) + 1
                             if latency_ms >= 0.0:
                                 _scenario_flow_latency_digest.setdefault(flow, LatencyDigest()).add(latency_ms)
+                                _scenario_telemetry["latency_samples"] = int(_scenario_telemetry.get("latency_samples", 0) or 0) + 1
                             if not ok:
                                 _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
                         if _scenario_pool is not None:
                             try:
+                                _scenario_telemetry["pool_ingest_calls"] = int(_scenario_telemetry.get("pool_ingest_calls", 0) or 0) + 1
                                 _scenario_pool.spawn_until(_elapsed)
                                 _scenario_pool.ingest_step_results(rows)
                                 _scenario_pool.tick_retries(_elapsed)
                                 _scenario_pool.finalize_timeouts(_elapsed)
                             except _RECOVERABLE_ERRORS as exc:
+                                _scenario_telemetry["pool_ingest_errors"] = int(_scenario_telemetry.get("pool_ingest_errors", 0) or 0) + 1
                                 _debug_exception(f"[Worker {worker_id}] scenario L4 VUPool ingest failed", exc)
                     _active_snapshot = len(active_vus)
                     try:
@@ -4169,6 +4191,16 @@ async def worker_process(
                 worker_stats["scenario_sessions_failed"] = int(_pool_summary.get("sessions_failed", 0) or 0)
             if _pool_per_flow:
                 worker_stats["scenario_per_flow_json"] = json.dumps(_pool_per_flow, ensure_ascii=True)
+            worker_stats["scenario_telemetry_step_rows_total"] = int(_scenario_telemetry.get("step_rows_total", 0) or 0)
+            worker_stats["scenario_telemetry_step_rows_granular"] = int(_scenario_telemetry.get("step_rows_granular", 0) or 0)
+            worker_stats["scenario_telemetry_step_rows_header_fallback"] = int(_scenario_telemetry.get("step_rows_header_fallback", 0) or 0)
+            worker_stats["scenario_telemetry_latency_samples"] = int(_scenario_telemetry.get("latency_samples", 0) or 0)
+            worker_stats["scenario_telemetry_pool_ingest_calls"] = int(_scenario_telemetry.get("pool_ingest_calls", 0) or 0)
+            worker_stats["scenario_telemetry_pool_ingest_errors"] = int(_scenario_telemetry.get("pool_ingest_errors", 0) or 0)
+            worker_stats["scenario_telemetry_granular_coverage_pct"] = float(
+                (100.0 * float(worker_stats["scenario_telemetry_step_rows_granular"]))
+                / max(1.0, float(worker_stats["scenario_telemetry_step_rows_total"]))
+            )
 
         if run_events is not None:
             try:
