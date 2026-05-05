@@ -21,6 +21,7 @@ from .metrics import (
     FlowRuntimeMetrics,
     build_flow_runtime_metrics,
     build_scenario_summary,
+    LatencyDigest,
     percentile,
 )
 from .sla import evaluate_scenario_sla, SlaEvaluation
@@ -46,6 +47,7 @@ __all__ = [
     "FlowRuntimeMetrics",
     "build_flow_runtime_metrics",
     "build_scenario_summary",
+    "LatencyDigest",
     "percentile",
     "evaluate_scenario_sla",
     "SlaEvaluation",

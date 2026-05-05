@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+import bisect
 from typing import Any
 
 
@@ -92,6 +93,49 @@ def percentile(values: list[float], q: float) -> float:
         return float(vals[lo])
     w = pos - float(lo)
     return float(vals[lo] * (1.0 - w) + vals[hi] * w)
+
+
+@dataclass
+class LatencyDigest:
+    # Lightweight fixed-size quantile sketch using reservoir+sorted snapshots.
+    max_samples: int = 2048
+    _samples: list[float] = field(default_factory=list)
+    _count: int = 0
+
+    def add(self, value_ms: float) -> None:
+        v = float(value_ms)
+        if v < 0.0:
+            return
+        self._count += 1
+        if len(self._samples) < int(self.max_samples):
+            bisect.insort(self._samples, v)
+            return
+        # Reservoir replacement with deterministic ring-like spread.
+        idx = self._count % max(1, int(self.max_samples))
+        old = self._samples[idx]
+        del self._samples[idx]
+        bisect.insort(self._samples, v)
+        # keep bounded and avoid growth due to precision corner cases
+        if len(self._samples) > int(self.max_samples):
+            self._samples.remove(old)
+
+    def quantile(self, q: float) -> float:
+        return percentile(self._samples, q)
+
+    def merge(self, other: "LatencyDigest") -> None:
+        for v in list(getattr(other, "_samples", []) or []):
+            self.add(float(v))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"count": int(self._count), "samples": list(self._samples)}
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "LatencyDigest":
+        d = cls(max_samples=max(8, int((raw or {}).get("max_samples", 2048) or 2048)))
+        d._count = int((raw or {}).get("count", 0) or 0)
+        vals = [float(x) for x in list((raw or {}).get("samples", []) or []) if float(x) >= 0.0]
+        d._samples = sorted(vals)[: d.max_samples]
+        return d
 
 
 def build_scenario_summary(
