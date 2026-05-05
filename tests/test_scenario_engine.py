@@ -227,8 +227,9 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
             p.write_text(_WITH_PAUSE_YAML, encoding="utf-8")
             spec = load_raw_scenario(str(p))
         out = scenario_native.compile_session_plan(spec, "browse", 7)
-        events = list(out.get("events", []) or [])
-        self.assertTrue(any(dict(ev or {}).get("event_type") == "think_time" for ev in events))
+        self.assertTrue(bool(out.get("packed", False)))
+        event_kind = list(out.get("event_kind", []) or [])
+        self.assertTrue(any(int(x) == 1 for x in event_kind))
 
     def test_native_compiler_packed_mode(self):
         try:
