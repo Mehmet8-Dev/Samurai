@@ -13,6 +13,7 @@ from .offline_modes import dispatch_offline_mode
 from .profile_resolver import apply_profile, _resolve_profile_args
 from .runtime import run_live_mode
 from .validation import (
+    _validate_distributed_args,
     _preflight_l7_capabilities,
     _preflight_lab_profile,
     _preflight_persistent_tx_backend,
@@ -262,6 +263,7 @@ def main(argv=None):
     _validate_pacing_args(parser, args)
     _validate_hybrid_cuda_args(parser, args)
     _validate_sender_route_args(parser, args)
+    _validate_distributed_args(parser, args)
     _preflight_lab_profile(parser, args)
     _preflight_persistent_tx_backend(parser, args)
     _preflight_l7_capabilities(parser, args)
@@ -321,4 +323,13 @@ def main(argv=None):
     offline_result = dispatch_offline_mode(args, parser, report_ctx, runtime_ctx)
     if offline_result is not None:
         raise SystemExit(offline_result)
+    role = str(getattr(args, "role", "standalone") or "standalone").strip().lower()
+    if role == "master":
+        from .distributed import run_distributed_master
+
+        raise SystemExit(run_distributed_master(args, parser, report_ctx, runtime_ctx))
+    if role == "slave":
+        from .distributed import run_distributed_slave
+
+        raise SystemExit(run_distributed_slave(args, parser))
     raise SystemExit(run_live_mode(args, parser, argv, soak_cfg, report_ctx, runtime_ctx))

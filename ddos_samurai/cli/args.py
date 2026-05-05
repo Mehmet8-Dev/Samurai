@@ -102,6 +102,78 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenario-sla-profile", type=str, default="", help="Senaryo SLA override JSON (inline) veya profile adi.")
     parser.add_argument("--scenario-seed", type=int, default=1337, help="Scenario scheduler deterministic seed.")
     parser.add_argument("--role", choices=["standalone", "master", "slave"], default="standalone", help="Distributed attack modu")
+    distributed_group = parser.add_argument_group("Distributed Control Plane")
+    distributed_group.add_argument(
+        "--control-listen",
+        type=str,
+        default="0.0.0.0:5099",
+        help="Master gRPC listen adresi (varsayılan: 0.0.0.0:5099).",
+    )
+    distributed_group.add_argument(
+        "--control-endpoints",
+        type=str,
+        default="",
+        help="Slave: master endpoint(ler). Format: host1:5099,host2:5099",
+    )
+    distributed_group.add_argument(
+        "--cluster-secret",
+        type=str,
+        default="",
+        help="Cluster authentication token (tüm node'larda aynı olmalı).",
+    )
+    distributed_group.add_argument(
+        "--control-tls-cert",
+        type=str,
+        default="",
+        help="gRPC server TLS sertifika dosyası (PEM).",
+    )
+    distributed_group.add_argument(
+        "--control-tls-key",
+        type=str,
+        default="",
+        help="gRPC server TLS private key dosyası (PEM).",
+    )
+    distributed_group.add_argument(
+        "--control-tls-ca",
+        type=str,
+        default="",
+        help="gRPC TLS CA bundle (slave tarafında server doğrulaması için).",
+    )
+    distributed_group.add_argument(
+        "--control-insecure",
+        action="store_true",
+        help="TLS olmadan plaintext gRPC (sadece dev/lab için).",
+    )
+    distributed_group.add_argument(
+        "--heartbeat-interval-ms",
+        type=int,
+        default=2000,
+        help="Slave heartbeat gönderme aralığı (ms).",
+    )
+    distributed_group.add_argument(
+        "--heartbeat-timeout-ms",
+        type=int,
+        default=6000,
+        help="Master: heartbeat timeout süresi (3x interval).",
+    )
+    distributed_group.add_argument(
+        "--job-timeout-s",
+        type=int,
+        default=0,
+        help="Dağıtık job max süresi (0=sınırsız).",
+    )
+    distributed_group.add_argument(
+        "--shard-strategy",
+        choices=["equal", "capability"],
+        default="equal",
+        help="Shard dağıtım stratejisi: equal=eşit bölme, capability=worker kapasitesine göre.",
+    )
+    distributed_group.add_argument(
+        "--on-worker-loss",
+        choices=["abort", "continue"],
+        default="continue",
+        help="Worker kaybında davranış: abort=testi durdur, continue=loss olarak raporla.",
+    )
     parser.add_argument("--confirm", action="store_true", help="Etik uyarıyı atlamak için")
     parser.add_argument("--dry-run", action="store_true", help="Ayarları doğrular, örnek bir paket oluşturur ve gönderim yapmadan çıkar.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Detaylı çıktı")

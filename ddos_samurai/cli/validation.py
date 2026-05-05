@@ -9,6 +9,60 @@ from .. import utils
 from ..profile_names import PROFILE_NONE
 from ..topology_native import parse_compile_topology_spec, topology_tuple_preview
 from .helpers import _normalize_afpacket_hugepage_mode, _normalize_dataplane_core_mode
+
+
+def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    role = str(getattr(args, "role", "standalone") or "standalone").strip().lower()
+    if role == "standalone":
+        return
+
+    try:
+        import grpc  # noqa: F401
+    except ImportError:
+        parser.error(
+            "Hata: --role master/slave için 'grpcio' gereklidir. "
+            "Kurulum: pip install 'ddos_samurai[distributed]'"
+        )
+
+    if role == "master":
+        listen = str(getattr(args, "control_listen", "") or "").strip()
+        if not listen:
+            parser.error("Hata: --role master için --control-listen zorunludur.")
+        if ":" not in listen:
+            parser.error("Hata: --control-listen formatı host:port olmalıdır.")
+    elif role == "slave":
+        endpoints = str(getattr(args, "control_endpoints", "") or "").strip()
+        if not endpoints:
+            parser.error("Hata: --role slave için --control-endpoints zorunludur.")
+        for ep in endpoints.split(","):
+            ep = ep.strip()
+            if not ep or ":" not in ep:
+                parser.error(f"Hata: --control-endpoints formatı geçersiz: '{ep}'")
+
+    insecure = bool(getattr(args, "control_insecure", False))
+    cert = str(getattr(args, "control_tls_cert", "") or "").strip()
+    key = str(getattr(args, "control_tls_key", "") or "").strip()
+    if not insecure and role == "master":
+        if not cert or not key:
+            parser.error(
+                "Hata: --role master TLS modunda --control-tls-cert ve "
+                "--control-tls-key zorunludur. Dev için --control-insecure kullanın."
+            )
+        if cert and not os.path.isfile(cert):
+            parser.error(f"Hata: --control-tls-cert dosyası bulunamadı: {cert}")
+        if key and not os.path.isfile(key):
+            parser.error(f"Hata: --control-tls-key dosyası bulunamadı: {key}")
+
+    secret = str(getattr(args, "cluster_secret", "") or "").strip()
+    if not secret and not insecure:
+        utils.log_warning("--cluster-secret boş: cluster authentication devre dışı (güvensiz).")
+
+    hb_interval = int(getattr(args, "heartbeat_interval_ms", 2000) or 2000)
+    hb_timeout = int(getattr(args, "heartbeat_timeout_ms", 6000) or 6000)
+    if hb_interval < 500:
+        parser.error("Hata: --heartbeat-interval-ms >= 500 olmalıdır.")
+    if hb_timeout <= hb_interval:
+        parser.error("Hata: --heartbeat-timeout-ms > --heartbeat-interval-ms olmalıdır.")
 def _validate_pacing_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     mode = str(getattr(args, "pacing_mode", "none") or "none").strip().lower()
     rps = float(getattr(args, "rps", 0.0) or 0.0)
