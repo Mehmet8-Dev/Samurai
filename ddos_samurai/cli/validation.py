@@ -59,10 +59,13 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
 
     hb_interval = int(getattr(args, "heartbeat_interval_ms", 2000) or 2000)
     hb_timeout = int(getattr(args, "heartbeat_timeout_ms", 6000) or 6000)
+    k8s_port = int(getattr(args, "control_k8s_port", 5099) or 5099)
     if hb_interval < 500:
         parser.error("Hata: --heartbeat-interval-ms >= 500 olmalıdır.")
     if hb_timeout <= hb_interval:
         parser.error("Hata: --heartbeat-timeout-ms > --heartbeat-interval-ms olmalıdır.")
+    if k8s_port <= 0 or k8s_port > 65535:
+        parser.error("Hata: --control-k8s-port 1..65535 aralığında olmalıdır.")
 def _validate_pacing_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     mode = str(getattr(args, "pacing_mode", "none") or "none").strip().lower()
     rps = float(getattr(args, "rps", 0.0) or 0.0)

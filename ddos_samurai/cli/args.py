@@ -174,6 +174,29 @@ def build_parser() -> argparse.ArgumentParser:
         default="continue",
         help="Worker kaybında davranış: abort=testi durdur, continue=loss olarak raporla.",
     )
+    distributed_group.add_argument(
+        "--control-discovery-k8s",
+        action="store_true",
+        help="Manual endpoint yoksa master endpointlerini Kubernetes pod discovery ile bul.",
+    )
+    distributed_group.add_argument(
+        "--control-k8s-namespace",
+        type=str,
+        default="default",
+        help="Kubernetes namespace (control discovery için).",
+    )
+    distributed_group.add_argument(
+        "--control-k8s-selector",
+        type=str,
+        default="",
+        help="Kubernetes label selector (örn: app=ddos-samurai-slave).",
+    )
+    distributed_group.add_argument(
+        "--control-k8s-port",
+        type=int,
+        default=5099,
+        help="Kubernetes discovery endpoint portu (varsayılan: 5099).",
+    )
     parser.add_argument("--confirm", action="store_true", help="Etik uyarıyı atlamak için")
     parser.add_argument("--dry-run", action="store_true", help="Ayarları doğrular, örnek bir paket oluşturur ve gönderim yapmadan çıkar.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Detaylı çıktı")
