@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from copy import deepcopy
 
 try:
     import jsonschema  # type: ignore
@@ -153,3 +154,29 @@ def validate_with_json_schema(raw: dict[str, Any]) -> None:
     merged["properties"] = dict(SCENARIO_SCHEMA_V1.get("properties", {}))
     merged["properties"].update(dict(SCENARIO_SCHEMA_V2_PATCH.get("properties", {})))
     jsonschema.validate(instance=raw, schema=merged)
+
+
+def migrate_schema(raw: dict[str, Any], *, target_version: int = 2) -> dict[str, Any]:
+    obj = deepcopy(dict(raw or {}))
+    cur = int(obj.get("schema_version", 1) or 1)
+    tgt = max(1, int(target_version or 1))
+    if cur >= tgt:
+        return obj
+    if cur < 2 <= tgt:
+        flows = dict(obj.get("flows") or {})
+        for _, flow in flows.items():
+            steps = list((flow or {}).get("steps") or [])
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                st = str(step.get("type", "") or "").strip().lower()
+                if st == "request" and "on_failure" not in step:
+                    step["on_failure"] = "retry"
+                if st in {"pause", "think_time"} and "think_time" in step:
+                    tt = step.get("think_time")
+                    if isinstance(tt, dict):
+                        tt.setdefault("distribution", "uniform")
+                        tt.setdefault("mean_ms", 0)
+                        tt.setdefault("stddev_ms", 0)
+        obj["schema_version"] = 2
+    return obj

@@ -1,4 +1,5 @@
 from .parser import load_raw_scenario, load_scenario_spec
+from .schema import migrate_schema
 from .native import build_worker_session_plans, evaluate_sla, compile_session_plan, require_native
 from .runtime import (
     RampController,
@@ -22,6 +23,7 @@ from .benchmark import run_compile_benchmark, write_compile_benchmark_report
 __all__ = [
     "load_raw_scenario",
     "load_scenario_spec",
+    "migrate_schema",
     "build_worker_session_plans",
     "evaluate_sla",
     "compile_session_plan",
