@@ -14,6 +14,7 @@ from ddos_samurai import stealth
 from ddos_samurai import cpu_packet_engine
 from ddos_samurai import cpu_packet_engine as packet
 from ddos_samurai import dataplane
+from ddos_samurai import scenario_engine
 from ddos_samurai.stateful_runtime import evaluate_hot_path_contract
 from ddos_samurai.topology_native import compiled_topology_plan_from_dict, topology_tuple_for_index
 from ddos_samurai.scenario_engine.metrics import LatencyDigest
@@ -1081,8 +1082,6 @@ async def worker_process(
     scenario_enabled = False
     _scenario_flow_steps: dict[str, int] = {}
     _scenario_flow_failed_steps: dict[str, int] = {}
-    _scenario_flow_vu_completed: dict[str, int] = {}
-    _scenario_flow_vu_total: dict[str, int] = {}
     _gpu_packet_mod = None
     _gpu_ring_depth_peak = 0
     _gpu_ring_block_wait_ns = 0
@@ -1852,17 +1851,22 @@ async def worker_process(
             traffic_model_mode = str(args.get("traffic_model", "none") or "none").strip().lower()
             traffic_model_enabled = traffic_model_mode != "none" and len(traffic_model_sessions) > 0
             scenario_enabled = len(scenario_sessions) > 0
-            scenario_vu_expected_steps = dict(scenario_runtime_metrics.get("vu_expected_steps", {}) or {})
-            scenario_vu_flow = dict(scenario_runtime_metrics.get("vu_flow", {}) or {})
-            _scenario_vu_progress: dict[str, int] = {}
-            _scenario_vu_failed: dict[str, int] = {}
+            _scenario_pool = None
+            _scenario_t0 = time.monotonic()
             _scenario_flow_steps: dict[str, int] = {}
             _scenario_flow_failed_steps: dict[str, int] = {}
-            _scenario_flow_vu_completed: dict[str, int] = {}
-            _scenario_flow_vu_total: dict[str, int] = {}
             _scenario_flow_latency_digest: dict[str, LatencyDigest] = {}
-            for _vu_id, _flow in scenario_vu_flow.items():
-                _scenario_flow_vu_total[str(_flow)] = int(_scenario_flow_vu_total.get(str(_flow), 0) or 0) + 1
+            if scenario_enabled:
+                try:
+                    _scenario_pool = scenario_engine.VUPool(
+                        scenario_sessions=list(scenario_sessions or []),
+                        ramp_seconds=int((scenario_runtime_metrics or {}).get("scenario_ramp_seconds", 0) or 0),
+                        max_session_seconds=max(1, int(args.get("duration", 1) or 1)),
+                        ramp_curve="linear",
+                    )
+                except _RECOVERABLE_ERRORS as exc:
+                    _debug_exception(f"[Worker {worker_id}] scenario VUPool init failed", exc)
+                    _scenario_pool = None
 
             def _iter_scenario_runtime_batches():
                 for row in scenario_runtime_batches:
@@ -1891,6 +1895,7 @@ async def worker_process(
                 items = list(getattr(request_plan, "items", []) or [])
                 if not items:
                     return
+                _pool_rows = []
                 # Prefer granular step outcomes from transport if exposed.
                 granular = list((send_out or {}).get("scenario_step_results", []) or [])
                 if not granular:
@@ -1909,14 +1914,24 @@ async def worker_process(
                             _scenario_flow_latency_digest.setdefault(flow, LatencyDigest()).add(latency_ms)
                         if not ok:
                             _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
-                        if vu_id:
-                            _scenario_vu_progress[vu_id] = int(_scenario_vu_progress.get(vu_id, 0) or 0) + 1
-                            if (not ok) and on_failure != "skip":
-                                _scenario_vu_failed[vu_id] = int(_scenario_vu_failed.get(vu_id, 0) or 0) + 1
-                            expected = int(scenario_vu_expected_steps.get(vu_id, 0) or 0)
-                            if expected > 0 and _scenario_vu_progress[vu_id] >= expected:
-                                if int(_scenario_vu_failed.get(vu_id, 0) or 0) == 0:
-                                    _scenario_flow_vu_completed[flow] = int(_scenario_flow_vu_completed.get(flow, 0) or 0) + 1
+                        _pool_rows.append(
+                            {
+                                "flow": flow,
+                                "vu_id": vu_id,
+                                "on_failure": on_failure,
+                                "success": bool(ok),
+                                "timeout": bool((row or {}).get("timeout", False)),
+                            }
+                        )
+                    if _scenario_pool is not None and _pool_rows:
+                        try:
+                            _elapsed = float(max(0.0, time.monotonic() - _scenario_t0))
+                            _scenario_pool.spawn_until(_elapsed)
+                            _scenario_pool.ingest_step_results(_pool_rows)
+                            _scenario_pool.tick_retries(_elapsed)
+                            _scenario_pool.finalize_timeouts(_elapsed)
+                        except _RECOVERABLE_ERRORS as exc:
+                            _debug_exception(f"[Worker {worker_id}] scenario VUPool ingest failed", exc)
                     return
 
                 attempted = len(items)
@@ -1935,14 +1950,24 @@ async def worker_process(
                     is_failed = idx >= success_count and (idx - success_count) < fail_count
                     if is_failed:
                         _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
-                    if vu_id:
-                        _scenario_vu_progress[vu_id] = int(_scenario_vu_progress.get(vu_id, 0) or 0) + 1
-                        if is_failed and on_failure != "skip":
-                            _scenario_vu_failed[vu_id] = int(_scenario_vu_failed.get(vu_id, 0) or 0) + 1
-                        expected = int(scenario_vu_expected_steps.get(vu_id, 0) or 0)
-                        if expected > 0 and _scenario_vu_progress[vu_id] >= expected:
-                            if int(_scenario_vu_failed.get(vu_id, 0) or 0) == 0:
-                                _scenario_flow_vu_completed[flow] = int(_scenario_flow_vu_completed.get(flow, 0) or 0) + 1
+                    _pool_rows.append(
+                        {
+                            "flow": flow,
+                            "vu_id": vu_id,
+                            "on_failure": on_failure,
+                            "success": bool(not is_failed),
+                            "timeout": False,
+                        }
+                    )
+                if _scenario_pool is not None and _pool_rows:
+                    try:
+                        _elapsed = float(max(0.0, time.monotonic() - _scenario_t0))
+                        _scenario_pool.spawn_until(_elapsed)
+                        _scenario_pool.ingest_step_results(_pool_rows)
+                        _scenario_pool.tick_retries(_elapsed)
+                        _scenario_pool.finalize_timeouts(_elapsed)
+                    except _RECOVERABLE_ERRORS as exc:
+                        _debug_exception(f"[Worker {worker_id}] scenario VUPool ingest failed", exc)
 
             def _iter_model_plans():
                 for session_plan in traffic_model_sessions:
@@ -3975,16 +4000,27 @@ async def worker_process(
         # through live_progress/live_sent/live_errors. Adding worker_stats again
         # here causes double counting (e.g. >100% progress and inflated PPS).
         if scenario_enabled:
-            _flow_keys = set(_scenario_flow_vu_total.keys()) | set(_scenario_flow_steps.keys()) | set(_scenario_flow_failed_steps.keys())
+            _pool_per_flow = {}
+            _pool_summary = {}
+            if _scenario_pool is not None:
+                try:
+                    _dur_s = float(max(0.0, float(args.get("duration", 1) or 1.0)))
+                    _scenario_pool.finalize_timeouts(_dur_s)
+                    _pool_summary = dict(_scenario_pool.summary_metrics() or {})
+                    _pool_per_flow = dict(_scenario_pool.per_flow_metrics(duration_s=float(max(0.001, _dur_s))) or {})
+                except _RECOVERABLE_ERRORS as exc:
+                    _debug_exception(f"[Worker {worker_id}] scenario VUPool summary failed", exc)
+            _flow_keys = set(_scenario_flow_steps.keys()) | set(_scenario_flow_failed_steps.keys()) | set(_pool_per_flow.keys())
             _flow_count = max(1, len(_flow_keys))
             _covered = 0
             _min_completion = 1.0
             _max_step_fail_ratio = 0.0
             for _flow in _flow_keys:
-                _tot_vu = int(_scenario_flow_vu_total.get(_flow, 0) or 0)
-                _done_vu = int(_scenario_flow_vu_completed.get(_flow, 0) or 0)
-                _steps = int(_scenario_flow_steps.get(_flow, 0) or 0)
-                _step_fail = int(_scenario_flow_failed_steps.get(_flow, 0) or 0)
+                _pf = dict(_pool_per_flow.get(_flow, {}) or {})
+                _tot_vu = int(_pf.get("sessions", 0) or 0)
+                _done_vu = int(_pf.get("completed", 0) or 0)
+                _steps = int(_pf.get("step_attempted", int(_scenario_flow_steps.get(_flow, 0) or 0)) or 0)
+                _step_fail = int(_pf.get("step_failed", int(_scenario_flow_failed_steps.get(_flow, 0) or 0)) or 0)
                 if _tot_vu > 0:
                     _covered += 1
                 _comp_rate = float(_done_vu / max(1, _tot_vu))
@@ -4011,6 +4047,11 @@ async def worker_process(
                     "latency_p99_ms": float(_dig.quantile(0.99)),
                 }
             worker_stats["scenario_flow_latency_by_flow_json"] = json.dumps(_lat_by_flow, ensure_ascii=True)
+            if _pool_summary:
+                worker_stats["scenario_sessions_completed"] = int(_pool_summary.get("sessions_completed", 0) or 0)
+                worker_stats["scenario_sessions_failed"] = int(_pool_summary.get("sessions_failed", 0) or 0)
+            if _pool_per_flow:
+                worker_stats["scenario_per_flow_json"] = json.dumps(_pool_per_flow, ensure_ascii=True)
 
         if run_events is not None:
             try:

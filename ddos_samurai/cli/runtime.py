@@ -485,6 +485,9 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 _flow_p95_vals = []
                 _flow_p99_vals = []
                 _lat_by_flow_agg = {}
+                _pool_sessions_completed_sum = 0
+                _pool_sessions_failed_sum = 0
+                _pool_per_flow_agg: dict[str, dict[str, float]] = {}
                 for ev in events_local:
                     st = dict((ev or {}).get("stats", {}) or {})
                     if "scenario_flow_min_completion_rate" in st:
@@ -510,6 +513,24 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                             _acc["latency_p50_ms"].append(float(dict(_frow or {}).get("latency_p50_ms", 0.0) or 0.0))
                             _acc["latency_p95_ms"].append(float(dict(_frow or {}).get("latency_p95_ms", 0.0) or 0.0))
                             _acc["latency_p99_ms"].append(float(dict(_frow or {}).get("latency_p99_ms", 0.0) or 0.0))
+                    _pool_sessions_completed_sum += int(st.get("scenario_sessions_completed", 0) or 0)
+                    _pool_sessions_failed_sum += int(st.get("scenario_sessions_failed", 0) or 0)
+                    _raw_pf = str(st.get("scenario_per_flow_json", "") or "").strip()
+                    if _raw_pf:
+                        try:
+                            _pf_obj = dict(json.loads(_raw_pf) or {})
+                        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError, json.JSONDecodeError):
+                            _pf_obj = {}
+                        for _fname, _frow in _pf_obj.items():
+                            _acc = _pool_per_flow_agg.setdefault(
+                                str(_fname),
+                                {"sessions": 0.0, "completed": 0.0, "failed": 0.0, "step_attempted": 0.0, "step_failed": 0.0},
+                            )
+                            _acc["sessions"] += float(dict(_frow or {}).get("sessions", 0.0) or 0.0)
+                            _acc["completed"] += float(dict(_frow or {}).get("completed", 0.0) or 0.0)
+                            _acc["failed"] += float(dict(_frow or {}).get("failed", 0.0) or 0.0)
+                            _acc["step_attempted"] += float(dict(_frow or {}).get("step_attempted", 0.0) or 0.0)
+                            _acc["step_failed"] += float(dict(_frow or {}).get("step_failed", 0.0) or 0.0)
                 if _flow_min_completion_vals:
                     rr.results["scenario_flow_min_completion_rate"] = float(min(_flow_min_completion_vals))
                 if _flow_max_fail_vals:
@@ -531,6 +552,21 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                         }
                         for k, v in _lat_by_flow_agg.items()
                     }
+                rr.results["scenario_sessions_completed_from_workers"] = int(_pool_sessions_completed_sum)
+                rr.results["scenario_sessions_failed_from_workers"] = int(_pool_sessions_failed_sum)
+                if _pool_per_flow_agg:
+                    rr.results["scenario_per_flow_from_workers"] = {
+                        k: {
+                            "sessions": float(v["sessions"]),
+                            "completed": float(v["completed"]),
+                            "failed": float(v["failed"]),
+                            "step_attempted": float(v["step_attempted"]),
+                            "step_failed": float(v["step_failed"]),
+                            "session_completion_rate": float(v["completed"] / max(1.0, v["sessions"])),
+                            "step_fail_ratio": float(v["step_failed"] / max(1.0, v["step_attempted"])),
+                        }
+                        for k, v in _pool_per_flow_agg.items()
+                    }
             if soak_cfg is not None:
                 rr.results["soak_profile"] = str(soak_cfg.get("profile", "custom"))
                 rr.results["soak_passed"] = bool((monitor_summary or {}).get("passed", False))
@@ -548,7 +584,12 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 lifecycle_step_failed = int(
                     sum(int((x or {}).get("step_failed", 0) or 0) for x in list(scenario_runtime_metrics_by_worker or []))
                 )
-                sessions_completed = int(rr.results.get("sent_total", 0) or 0)
+                sessions_completed = int(
+                    rr.results.get(
+                        "scenario_sessions_completed_from_workers",
+                        rr.results.get("sent_total", 0),
+                    ) or 0
+                )
                 step_failed = int(rr.results.get("errors_total", 0) or 0) + lifecycle_step_failed
                 all_scenario_sessions = []
                 for xs in list(scenario_sessions_by_worker or []):
@@ -590,7 +631,11 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     "failed": int(sum(1 for v in vu_snapshots if str(v.state.value) == "failed")),
                     "completed": int(sum(1 for v in vu_snapshots if str(v.state.value) == "completed")),
                 }
-                rr.results["scenario_per_flow"] = vu_pool.per_flow_metrics(duration_s=float(duration))
+                rr.results["scenario_per_flow"] = dict(
+                    rr.results.get("scenario_per_flow_from_workers")
+                    or vu_pool.per_flow_metrics(duration_s=float(duration))
+                    or {}
+                )
                 _lat_by_flow = dict(rr.results.get("scenario_flow_latency_by_flow", {}) or {})
                 for _fname, _frow in dict(rr.results.get("scenario_per_flow", {}) or {}).items():
                     _lat = dict(_lat_by_flow.get(str(_fname), {}) or {})
