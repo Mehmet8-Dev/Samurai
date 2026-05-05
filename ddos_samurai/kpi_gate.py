@@ -118,6 +118,8 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "custom_tcp_bridge_backend_match_required": 1,
         "runtime_transport_backend_required": "custom_tcp",
         "stateful_runtime_status_required": "ready",
+        "scenario_tcp_connect_timeout_max": 0.20,
+        "scenario_tcp_retransmit_max": 0.10,
     },
     "dedicated_lab": {
         "run_quality": "valid",
@@ -411,6 +413,16 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
     txring_scope = _infer_txring_scope(results)
     persistent_stream_scope = _infer_persistent_stream_scope(results) or str(profile).strip().lower() == "persistent_stream_strict"
     scenario_scope = isinstance(results, dict) and "scenario_summary" in results
+    scenario_summary = dict((results or {}).get("scenario_summary") or {}) if isinstance(results, dict) else {}
+    scenario_backend = str(scenario_summary.get("backend", "") or "").strip().lower()
+    l4_scenario_scope = bool(
+        scenario_scope and (
+            scenario_backend == "l4_tcp"
+            or "tcp_connect_attempts" in (results or {})
+            or "tcp_connect_established" in (results or {})
+            or "tcp_retransmit_count" in (results or {})
+        )
+    )
     dedicated_strict = str(profile or "").strip().lower() != "off"
     rules: List[KpiGateRule] = [
         KpiGateRule("run_quality", "run_quality", "eq", gates.get("run_quality", "valid"), required=True),
@@ -671,6 +683,20 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
                     float(gates.get("scenario_flow_coverage_pct_min", 80.0) or 80.0),
                     required=True,
                 ),
+                KpiGateRule(
+                    "scenario_tcp_connect_timeout_ratio",
+                    "scenario_tcp_connect_timeout_ratio",
+                    "max",
+                    float(gates.get("scenario_tcp_connect_timeout_max", 0.20) or 0.20),
+                    required=bool(l4_scenario_scope),
+                ),
+                KpiGateRule(
+                    "scenario_tcp_retransmit_ratio",
+                    "scenario_tcp_retransmit_ratio",
+                    "max",
+                    float(gates.get("scenario_tcp_retransmit_max", 0.10) or 0.10),
+                    required=bool(l4_scenario_scope),
+                ),
             ]
         )
     runtime_transport_backend_required = str(gates.get("runtime_transport_backend_required", "") or "").strip()
@@ -813,12 +839,23 @@ def evaluate(
 
     gates = _merge_gate_defaults(profile_norm, parity_matrix_path=parity_matrix_path)
     rules = _build_rules(gates, results or {}, profile=profile_norm)
+    metric_view = dict(results or {})
+    if "scenario_summary" in metric_view:
+        attempts = _to_float(metric_view.get("tcp_connect_attempts"))
+        established = _to_float(metric_view.get("tcp_connect_established"))
+        retransmit = _to_float(metric_view.get("tcp_retransmit_count"))
+        if attempts is not None and attempts > 0.0:
+            if "scenario_tcp_connect_timeout_ratio" not in metric_view:
+                est = max(0.0, established or 0.0)
+                metric_view["scenario_tcp_connect_timeout_ratio"] = max(0.0, 1.0 - (est / attempts))
+            if "scenario_tcp_retransmit_ratio" not in metric_view:
+                metric_view["scenario_tcp_retransmit_ratio"] = max(0.0, (retransmit or 0.0) / attempts)
 
     violations: List[str] = []
     evaluated: List[Dict[str, Any]] = []
 
     for rule in rules:
-        value = (results or {}).get(rule.metric)
+        value = metric_view.get(rule.metric)
         passed = True
         detail = "ok"
 

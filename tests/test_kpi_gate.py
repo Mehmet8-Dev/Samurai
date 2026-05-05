@@ -256,6 +256,23 @@ class TestKpiGateDynamicRequirements(unittest.TestCase):
         out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
         self.assertIn(out.status, {"pass", "warn"})
 
+    def test_scenario_l4_scope_fails_on_tcp_ratios(self):
+        results = self._base_results()
+        results["scenario_summary"] = {"mode": "enforce", "backend": "l4_tcp"}
+        results["scenario_vu_ramp_accuracy_pct"] = 95.0
+        results["scenario_session_completion_rate"] = 0.99
+        results["scenario_step_fail_ratio"] = 0.01
+        results["scenario_flow_min_completion_rate"] = 0.95
+        results["scenario_flow_max_step_fail_ratio"] = 0.02
+        results["scenario_flow_coverage_pct"] = 100.0
+        results["tcp_connect_attempts"] = 100
+        results["tcp_connect_established"] = 60
+        results["tcp_retransmit_count"] = 20
+        out = kpi_gate.evaluate(results, profile="dedicated_lab", hard_fail=True)
+        self.assertEqual(out.status, "fail")
+        self.assertTrue(any(v.startswith("scenario_tcp_connect_timeout_ratio:") for v in out.violations))
+        self.assertTrue(any(v.startswith("scenario_tcp_retransmit_ratio:") for v in out.violations))
+
 
 if __name__ == "__main__":
     unittest.main()
