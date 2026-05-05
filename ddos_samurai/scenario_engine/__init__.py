@@ -18,6 +18,7 @@ from .runtime import (
     serialize_batches,
     simulate_vu_state_machine,
 )
+from .l4_runtime import L4SessionDriver
 from .metrics import (
     ScenarioRuntimeMetrics,
     FlowRuntimeMetrics,
@@ -46,6 +47,7 @@ __all__ = [
     "deserialize_batches",
     "serialize_batches",
     "simulate_vu_state_machine",
+    "L4SessionDriver",
     "collect_per_flow_metrics",
     "ScenarioRuntimeMetrics",
     "FlowRuntimeMetrics",
