@@ -21,12 +21,12 @@ personas:
     headers: {User-Agent: UA}
     cookies: {}
     retry_policy: {max_retries: 1}
-    timeout_policy: {request_timeout_ms: 4000}
+    timeout_policy: {request_timeout_ms: 4000, session_timeout_ms: 1500}
 flows:
   browse:
     persona: web_user
     steps:
-      - {type: request, method: GET, path: /, on_failure: retry}
+      - {type: request, method: GET, path: /, body_template: '{"x":1}', on_failure: retry}
       - {type: pause, think_time: {distribution: uniform, min_ms: 10, max_ms: 20}}
       - {type: request, method: GET, path: /x, on_failure: skip}
       - {type: end_session}
@@ -58,6 +58,8 @@ class TestScenarioEngineUpgrade(unittest.TestCase):
         self.assertTrue(bool(out.get("packed", False)))
         self.assertIn("event_kind", out)
         self.assertNotIn("events", out)
+        self.assertIn("body_template", out)
+        self.assertIn("session_timeout_ms", out)
 
     def test_ramp_should_spawn_linear(self):
         rc = RampController(target_vus=100, ramp_seconds=10, curve="linear")
@@ -124,4 +126,3 @@ class TestScenarioEngineUpgrade(unittest.TestCase):
             out = scenario_native.compile_session_plan_packed(raw, "browse", 1337 + i)
             self.assertTrue(bool(out.get("packed", False)))
             self.assertGreaterEqual(len(list(out.get("event_kind", []) or [])), 1)
-

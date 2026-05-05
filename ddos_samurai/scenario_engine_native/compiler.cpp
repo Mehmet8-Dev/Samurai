@@ -46,6 +46,7 @@ ScenarioSpecNative parse_spec(const py::dict& spec) {
       if (pd.contains("timeout_policy")) {
         py::dict tp = py::reinterpret_borrow<py::dict>(pd["timeout_policy"]);
         if (tp.contains("request_timeout_ms")) p.request_timeout_ms = static_cast<int>(py::int_(tp["request_timeout_ms"]));
+        if (tp.contains("session_timeout_ms")) p.session_timeout_ms = std::max(0, static_cast<int>(py::int_(tp["session_timeout_ms"])));
       }
       if (pd.contains("weight")) p.weight = std::max(0.000001, static_cast<double>(py::float_(pd["weight"])));
       out.personas.emplace(pname, std::move(p));
@@ -69,6 +70,7 @@ ScenarioSpecNative parse_spec(const py::dict& spec) {
         step.type = parse_step_type(py::str(st["type"]).cast<std::string>());
         if (st.contains("method")) step.method = py::str(st["method"]).cast<std::string>();
         if (st.contains("path")) step.path = py::str(st["path"]).cast<std::string>();
+        if (st.contains("body_template")) step.body_template = py::str(st["body_template"]).cast<std::string>();
         if (st.contains("flow")) step.flow = py::str(st["flow"]).cast<std::string>();
         if (st.contains("repeat")) step.repeat = std::max(1, static_cast<int>(py::int_(st["repeat"])));
         if (st.contains("probability")) step.probability = std::clamp(static_cast<double>(py::float_(st["probability"])), 0.0, 1.0);
@@ -106,6 +108,7 @@ struct PackedEvents {
   std::vector<std::string> request_kind{};  // http_request | http2_headers | ""
   std::vector<std::string> method{};
   std::vector<std::string> path{};
+  std::vector<std::string> body_template{};
   std::vector<int> headers_idx{};
   std::vector<int> cookies_idx{};
   std::vector<std::unordered_map<std::string, std::string>> headers_pool{};
@@ -194,6 +197,7 @@ static void compile_flow_recursive(const ScenarioSpecNative& spec, const std::st
         ev["event_type"] = (st.backend == "http2") ? py::str("http2_headers") : py::str("http_request");
         ev["method"] = step.method;
         ev["path"] = step.path;
+        ev["body_template"] = step.body_template;
         py::dict headers;
         py::dict cookies;
         std::string device_profile = "web";
@@ -244,6 +248,7 @@ static void compile_flow_recursive_packed(
         out.request_kind.emplace_back("");
         out.method.emplace_back("");
         out.path.emplace_back("");
+        out.body_template.emplace_back("");
         out.headers_idx.push_back(intern_map({}, out.headers_pool));
         out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
         out.device_profile.emplace_back("");
@@ -297,6 +302,7 @@ static void compile_flow_recursive_packed(
         out.request_kind.push_back((st.backend == "http2") ? "http2_headers" : "http_request");
         out.method.push_back(step.method);
         out.path.push_back(step.path);
+        out.body_template.push_back(step.body_template);
         out.headers_idx.push_back(intern_map(headers, out.headers_pool));
         out.cookies_idx.push_back(intern_map(cookies, out.cookies_pool));
         out.device_profile.push_back(std::move(device_profile));
@@ -351,6 +357,7 @@ py::dict compile_session_plan_packed_native(const ScenarioSpecNative& spec, cons
   out["request_kind"] = py::cast(pe.request_kind);
   out["method"] = py::cast(pe.method);
   out["path"] = py::cast(pe.path);
+  out["body_template"] = py::cast(pe.body_template);
   out["headers_idx"] = py::cast(pe.headers_idx);
   out["cookies_idx"] = py::cast(pe.cookies_idx);
   out["headers_pool"] = py::cast(pe.headers_pool);
@@ -365,6 +372,10 @@ py::dict compile_session_plan_packed_native(const ScenarioSpecNative& spec, cons
   out["think_mean_ms"] = py::cast(pe.think_mean_ms);
   out["think_stddev_ms"] = py::cast(pe.think_stddev_ms);
   out["step_attempted"] = st.attempted;
+  const Persona* persona = nullptr;
+  auto itp = spec.personas.find(spec.flows[spec.flow_index.at(flow_name)].persona);
+  if (itp != spec.personas.end()) persona = &itp->second;
+  out["session_timeout_ms"] = py::int_(persona != nullptr ? std::max(0, persona->session_timeout_ms) : 0);
   return out;
 }
 

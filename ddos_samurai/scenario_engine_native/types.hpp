@@ -28,6 +28,7 @@ struct Step {
   StepType type{StepType::Request};
   std::string method{"GET"};
   std::string path{"/"};
+  std::string body_template{};
   std::string flow{};
   int repeat{1};
   double probability{1.0};
@@ -41,6 +42,7 @@ struct Persona {
   std::unordered_map<std::string, std::string> headers{};
   std::unordered_map<std::string, std::string> cookies{};
   int request_timeout_ms{5000};
+  int session_timeout_ms{0};
   int max_retries{0};
   double weight{1.0};
 };
