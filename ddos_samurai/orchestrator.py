@@ -1848,6 +1848,7 @@ async def worker_process(
             scenario_sessions = list(args.get("scenario_sessions", []) or [])
             scenario_runtime_batches = list(args.get("scenario_runtime_batches", []) or [])
             scenario_runtime_metrics = dict(args.get("scenario_runtime_metrics", {}) or {})
+            scenario_backend = str((scenario_runtime_metrics or {}).get("scenario_backend", "http") or "http").strip().lower()
             scenario_streaming = bool(args.get("scenario_streaming", False))
             traffic_model_mode = str(args.get("traffic_model", "none") or "none").strip().lower()
             traffic_model_enabled = traffic_model_mode != "none" and len(traffic_model_sessions) > 0
@@ -1912,6 +1913,21 @@ async def worker_process(
                             }
                     except _RECOVERABLE_ERRORS as exc:
                         _debug_exception(f"[Worker {worker_id}] scenario runtime batch parse failed", exc)
+
+            def _iter_scenario_session_views():
+                for sess in list(scenario_sessions or []):
+                    if not bool((sess or {}).get("packed_soa", False)):
+                        yield dict(sess or {})
+                        continue
+                    offsets = list((sess or {}).get("session_offsets", []) or [])
+                    flows = list((sess or {}).get("session_flow", []) or [])
+                    for i in range(max(0, len(offsets) - 1)):
+                        yield {
+                            "flow": str(flows[i] if i < len(flows) else "unknown"),
+                            "__soa": dict(sess or {}),
+                            "__start": int(offsets[i]),
+                            "__end": int(offsets[i + 1]),
+                        }
 
             def _ingest_scenario_closed_loop(request_plan, send_out: dict):
                 items = list(getattr(request_plan, "items", []) or [])
@@ -2011,6 +2027,85 @@ async def worker_process(
                     if int(len(getattr(rp, "items", []) or [])) > 0:
                         traffic_model_request_plans.append(rp)
             scenario_runtime_plan_batches = list(_iter_scenario_runtime_batches())
+
+            if scenario_enabled and scenario_backend == "l4_tcp":
+                if getattr(senders, "custom_tcp_dataplane", None) is None:
+                    _debug_exception(f"[Worker {worker_id}] scenario L4 dataplane unavailable", RuntimeError("custom_tcp_dataplane unavailable"))
+                    return
+                try:
+                    l4_driver = scenario_engine.L4SessionDriver(
+                        state_engine=getattr(senders, "fast_sender", None),
+                        tcp_dataplane=getattr(senders, "custom_tcp_dataplane", None),
+                        target_ip=str(args.get("target", "") or ""),
+                        source_ip=str(args.get("spoof_ip", "") or "") or None,
+                        rng_seed=int((scenario_runtime_metrics or {}).get("scenario_seed", 1337) or 1337),
+                    )
+                except _RECOVERABLE_ERRORS as exc:
+                    _debug_exception(f"[Worker {worker_id}] scenario L4SessionDriver init failed", exc)
+                    l4_driver = None
+                if l4_driver is None:
+                    return
+
+                session_views = list(_iter_scenario_session_views())
+                active_vus: set[int] = set()
+                for i, sess in enumerate(session_views, start=1):
+                    try:
+                        events = scenario_engine.L4SessionDriver.packed_events_for_session(sess)
+                        if not events:
+                            continue
+                        flow_name = str((sess or {}).get("flow", "unknown") or "unknown")
+                        l4_driver.spawn_flow(i, events, flow_name=flow_name, on_failure="retry")
+                        active_vus.add(i)
+                    except _RECOVERABLE_ERRORS as exc:
+                        _debug_exception(f"[Worker {worker_id}] scenario L4 spawn failed", exc)
+
+                _scenario_deadline_s = float(max(1, int(args.get("duration", 1) or 1)))
+                while active_vus:
+                    _elapsed = float(max(0.0, time.monotonic() - _scenario_t0))
+                    try:
+                        rows = list(l4_driver.tick(_elapsed) or [])
+                    except _RECOVERABLE_ERRORS as exc:
+                        _debug_exception(f"[Worker {worker_id}] scenario L4 tick failed", exc)
+                        rows = []
+                    if rows:
+                        for row in rows:
+                            flow = str((row or {}).get("flow", "unknown") or "unknown")
+                            ok = bool((row or {}).get("success", False))
+                            latency_ms = float((row or {}).get("latency_ms", 0.0) or 0.0)
+                            _scenario_flow_steps[flow] = int(_scenario_flow_steps.get(flow, 0) or 0) + 1
+                            if latency_ms >= 0.0:
+                                _scenario_flow_latency_digest.setdefault(flow, LatencyDigest()).add(latency_ms)
+                            if not ok:
+                                _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
+                        if _scenario_pool is not None:
+                            try:
+                                _scenario_pool.spawn_until(_elapsed)
+                                _scenario_pool.ingest_step_results(rows)
+                                _scenario_pool.tick_retries(_elapsed)
+                                _scenario_pool.finalize_timeouts(_elapsed)
+                            except _RECOVERABLE_ERRORS as exc:
+                                _debug_exception(f"[Worker {worker_id}] scenario L4 VUPool ingest failed", exc)
+                    _active_snapshot = len(active_vus)
+                    try:
+                        _l4_snap = dict(l4_driver.snapshot() or {})
+                        if _l4_snap:
+                            worker_stats = _add_stats(worker_stats, _l4_snap)
+                            _active_snapshot = int(_l4_snap.get("scenario_l4_active_vus", _active_snapshot) or _active_snapshot)
+                    except _RECOVERABLE_ERRORS as exc:
+                        _debug_exception(f"[Worker {worker_id}] scenario L4 snapshot failed", exc)
+                    await _flush_custom_tcp_tx_packets()
+                    if _active_snapshot <= 0:
+                        break
+                    if _elapsed >= _scenario_deadline_s:
+                        for vu_id in list(active_vus):
+                            try:
+                                l4_driver.close_flow(vu_id)
+                            except _RECOVERABLE_ERRORS:
+                                pass
+                        break
+                    await asyncio.sleep(0.01)
+                return
+
             _l7_custom_tcp_mode = str(args.get("custom_tcp_mode", "off") or "off").strip().lower()
             _l7_transport_backend = "custom_tcp"
             _l7_custom_tcp_rx_interface = str(
