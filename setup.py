@@ -760,6 +760,17 @@ def build_setup_kwargs() -> Dict[str, object]:
         "extras_require": {
             "gpu": ["cupy>=9.0.0"],
             "http2": ["httpx[http2]>=0.20.0"],
+            "distributed": [
+                "grpcio>=1.62",
+                "grpcio-tools>=1.62",
+                "protobuf>=4.25",
+            ],
+            "distributed-k8s": [
+                "grpcio>=1.62",
+                "grpcio-tools>=1.62",
+                "protobuf>=4.25",
+                "kubernetes>=29.0",
+            ],
             "ml": [
                 "torch>=2.2.0",
                 "mamba-ssm>=2.2.2",
@@ -770,6 +781,9 @@ def build_setup_kwargs() -> Dict[str, object]:
                 "cupy>=9.0.0",
                 "httpx[http2]>=0.20.0",
                 "h2>=4.0.0",
+                "grpcio>=1.62",
+                "grpcio-tools>=1.62",
+                "protobuf>=4.25",
                 "torch>=2.2.0",
                 "mamba-ssm>=2.2.2",
                 "pandas>=2.0.0",

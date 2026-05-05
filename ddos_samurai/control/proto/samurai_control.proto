@@ -1,0 +1,102 @@
+syntax = "proto3";
+package samurai.control.v1;
+
+service SamuraiControl {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc StartShard(StartShardRequest) returns (StartShardResponse);
+  rpc StopShard(StopShardRequest) returns (StopShardResponse);
+  rpc ReportStats(ReportStatsRequest) returns (ReportStatsResponse);
+  rpc AbortJob(AbortJobRequest) returns (AbortJobResponse);
+  rpc GetWorkerStatus(GetWorkerStatusRequest) returns (GetWorkerStatusResponse);
+  rpc ForceSync(ForceSyncRequest) returns (ForceSyncResponse);
+}
+
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string hostname = 2;
+  map<string, string> capabilities = 3;
+}
+
+message RegisterWorkerResponse {
+  bool accepted = 1;
+  string cluster_id = 2;
+  string rejection_reason = 3;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  int64 uptime_ms = 2;
+  float cpu_pct = 3;
+  float mem_pct = 4;
+  float gpu_util_pct = 5;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  string command = 2;
+}
+
+message StartShardRequest {
+  string shard_id = 1;
+  string job_id = 2;
+  bytes args_json = 3;
+  int64 packet_count = 4;
+  int64 timeout_ms = 5;
+}
+
+message StartShardResponse {
+  bool started = 1;
+  string error = 2;
+}
+
+message StopShardRequest {
+  string shard_id = 1;
+  bool graceful = 2;
+}
+
+message StopShardResponse {
+  bool stopped = 1;
+}
+
+message ReportStatsRequest {
+  string worker_id = 1;
+  string shard_id = 2;
+  bytes stats_json = 3;
+  int64 timestamp_ms = 4;
+}
+
+message ReportStatsResponse {
+  bool received = 1;
+}
+
+message AbortJobRequest {
+  string job_id = 1;
+  string reason = 2;
+}
+
+message AbortJobResponse {
+  bool aborted = 1;
+  int32 workers_notified = 2;
+}
+
+message GetWorkerStatusRequest {
+  string worker_id = 1;
+}
+
+message GetWorkerStatusResponse {
+  string worker_id = 1;
+  string state = 2;
+  string active_shard_id = 3;
+  bytes stats_json = 4;
+  int64 last_heartbeat_ms = 5;
+}
+
+message ForceSyncRequest {
+  string worker_id = 1;
+}
+
+message ForceSyncResponse {
+  bytes stats_json = 1;
+  bytes logs_json = 2;
+}
