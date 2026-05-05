@@ -1,6 +1,12 @@
 from .parser import load_raw_scenario, load_scenario_spec
 from .schema import migrate_schema
-from .native import build_worker_session_plans, evaluate_sla, compile_session_plan, require_native
+from .native import (
+    build_worker_session_plans,
+    evaluate_sla,
+    compile_session_plan,
+    compile_session_plans_packed_bulk,
+    require_native,
+)
 from .runtime import (
     RampController,
     VUPool,
@@ -27,6 +33,7 @@ __all__ = [
     "build_worker_session_plans",
     "evaluate_sla",
     "compile_session_plan",
+    "compile_session_plans_packed_bulk",
     "require_native",
     "build_vu_lifecycle_batches",
     "RampController",

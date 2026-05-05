@@ -43,6 +43,26 @@ def compile_session_plan_packed(spec: dict[str, Any] | ScenarioSpec, flow_name: 
     return dict(_native.compile_session_plan(_as_spec_dict(spec), str(flow_name), int(seed)))
 
 
+def compile_session_plans_packed_bulk(
+    spec: dict[str, Any] | ScenarioSpec,
+    flow_names: list[str],
+    seeds: list[int],
+) -> list[dict[str, Any]]:
+    require_native()
+    if hasattr(_native, "compile_session_plans_packed_bulk"):
+        out = _native.compile_session_plans_packed_bulk(
+            _as_spec_dict(spec),
+            [str(x) for x in list(flow_names or [])],
+            [int(x) for x in list(seeds or [])],
+        )
+        return [dict(row) for row in list(out or [])]
+    rows: list[dict[str, Any]] = []
+    for i, flow_name in enumerate(list(flow_names or [])):
+        seed = int(seeds[i]) if i < len(seeds) else (i + 1)
+        rows.append(compile_session_plan_packed(spec, str(flow_name), seed))
+    return rows
+
+
 def build_worker_session_plans(
     spec: dict[str, Any] | ScenarioSpec,
     worker_counts: list[int],
