@@ -150,26 +150,35 @@ class VUPool:
             ok = bool((row or {}).get("success", False))
             timeout = bool((row or {}).get("timeout", False))
             policy = self._policy_for_flow(vu.flow)
+            on_failure = str((row or {}).get("on_failure", "retry") or "retry").strip().lower()
+            if on_failure not in {"retry", "skip", "abort"}:
+                on_failure = "retry"
             if not ok:
                 vu.step_failed += 1
                 if timeout:
                     vu.timeout_count += 1
-                should_retry = vu.retries_used < int(policy.max_retries)
-                if timeout and policy.timeout_action == "abort":
+                if on_failure == "skip":
                     should_retry = False
+                    vu.state = VUState.RUNNING
+                else:
+                    should_retry = (on_failure == "retry") and (vu.retries_used < int(policy.max_retries))
+                    if timeout and policy.timeout_action == "abort":
+                        should_retry = False
+                    if on_failure == "abort":
+                        should_retry = False
                 if should_retry:
                     vu.retries_used += 1
                     vu.state = VUState.RETRYING
                     # Exponential backoff with cap; retry gate is resolved by tick_retries().
                     backoff_ms = min(policy.backoff_max_ms, policy.backoff_base_ms * (2 ** max(0, vu.retries_used - 1)))
                     self._next_retry_at_s[vu_id] = max(vu.spawned_at_s, self._next_retry_at_s.get(vu_id, 0.0)) + (float(backoff_ms) / 1000.0)
-                else:
+                elif on_failure != "skip":
                     vu.state = VUState.FAILED
             if vu.expected_steps > 0 and vu.step_attempted >= vu.expected_steps:
-                if vu.step_failed == 0:
-                    vu.state = VUState.COMPLETED
-                else:
+                if vu.state == VUState.RETRYING:
                     vu.state = VUState.FAILED
+                elif vu.state != VUState.FAILED:
+                    vu.state = VUState.COMPLETED
             if vu.state in {VUState.COMPLETED, VUState.FAILED}:
                 self._next_retry_at_s.pop(vu_id, None)
         self._active_peak = max(self._active_peak, self.active_count())
@@ -337,6 +346,29 @@ def _as_item_dict(item: H2RequestPlanItem) -> dict[str, Any]:
     }
 
 
+def _sample_think_seconds(
+    *,
+    rng: random.Random,
+    distribution: str,
+    min_ms: int,
+    max_ms: int,
+    mean_ms: int,
+    stddev_ms: int,
+) -> float:
+    dist = str(distribution or "uniform").strip().lower()
+    lo = max(0, int(min_ms or 0))
+    hi = max(lo, int(max_ms or lo))
+    if dist == "gaussian":
+        mu = float(mean_ms if int(mean_ms or 0) > 0 else ((lo + hi) / 2.0))
+        sigma = float(max(1, int(stddev_ms or 0)))
+        sampled = int(round(rng.gauss(mu, sigma)))
+        sampled = max(lo, sampled)
+        if hi > lo:
+            sampled = min(hi, sampled)
+        return float(sampled) / 1000.0
+    return float(rng.randint(lo, hi)) / 1000.0
+
+
 def serialize_batches(batches: list[ScheduledRequestBatch]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for b in list(batches or []):
@@ -431,8 +463,12 @@ def build_vu_lifecycle_batches(
             headers_pool = list((session or {}).get("headers_pool", []) or [])
             cookies_pool = list((session or {}).get("cookies_pool", []) or [])
             retry_list = list((session or {}).get("retry_count", []) or [])
+            on_failure_list = list((session or {}).get("on_failure", []) or [])
             think_min = list((session or {}).get("think_min_ms", []) or [])
             think_max = list((session or {}).get("think_max_ms", []) or [])
+            think_dist = list((session or {}).get("think_distribution", []) or [])
+            think_mean = list((session or {}).get("think_mean_ms", []) or [])
+            think_stddev = list((session or {}).get("think_stddev_ms", []) or [])
             n = len(ek)
             req_count = 0
             for i in range(n):
@@ -451,7 +487,17 @@ def build_vu_lifecycle_batches(
                 if kind == 1:
                     min_ms = max(0, int(think_min[i] if i < len(think_min) else 0))
                     max_ms = max(min_ms, int(think_max[i] if i < len(think_max) else min_ms))
-                    t += float(rng.randint(min_ms, max_ms)) / 1000.0
+                    dist = str(think_dist[i] if i < len(think_dist) else "uniform")
+                    mean_ms = int(think_mean[i] if i < len(think_mean) else 0)
+                    stddev_ms = int(think_stddev[i] if i < len(think_stddev) else 0)
+                    t += _sample_think_seconds(
+                        rng=rng,
+                        distribution=dist,
+                        min_ms=min_ms,
+                        max_ms=max_ms,
+                        mean_ms=mean_ms,
+                        stddev_ms=stddev_ms,
+                    )
                     continue
                 et = str(rk[i] if i < len(rk) else "http_request").strip().lower()
                 if et not in {"http_request", "http2_headers"}:
@@ -473,12 +519,18 @@ def build_vu_lifecycle_batches(
                 else:
                     cookies = dict(cookies_list[i] if i < len(cookies_list) else {})
                 retry_count = max(0, int(retry_list[i] if i < len(retry_list) else 0))
+                on_failure = str(on_failure_list[i] if i < len(on_failure_list) else "retry").strip().lower()
+                if on_failure not in {"retry", "skip", "abort"}:
+                    on_failure = "retry"
                 headers["x-scenario-flow"] = flow
                 headers["x-scenario-vu-id"] = str(vu_id)
+                headers["x-scenario-on-failure"] = on_failure
                 if cookies:
                     headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
                 key = int((t * 1000.0) // bucket)
                 timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
+                if on_failure != "retry":
+                    retry_count = 0
                 for r in range(retry_count):
                     t_retry = t + (0.05 * float(r + 1))
                     if t_retry > deadline:
@@ -493,7 +545,14 @@ def build_vu_lifecycle_batches(
                 if et == "think_time":
                     min_ms = max(0, int((ev or {}).get("min_ms", 0) or 0))
                     max_ms = max(min_ms, int((ev or {}).get("max_ms", min_ms) or min_ms))
-                    t += float(rng.randint(min_ms, max_ms)) / 1000.0
+                    t += _sample_think_seconds(
+                        rng=rng,
+                        distribution=str((ev or {}).get("distribution", "uniform") or "uniform"),
+                        min_ms=min_ms,
+                        max_ms=max_ms,
+                        mean_ms=int((ev or {}).get("mean_ms", 0) or 0),
+                        stddev_ms=int((ev or {}).get("stddev_ms", 0) or 0),
+                    )
                     continue
                 if et not in {"http_request", "http2_headers"}:
                     continue
@@ -505,11 +564,17 @@ def build_vu_lifecycle_batches(
                 path = str((ev or {}).get("path", "/") or "/")
                 headers = dict((ev or {}).get("headers") or {})
                 retry_count = max(0, int((ev or {}).get("retry_count", 0) or 0))
+                on_failure = str((ev or {}).get("on_failure", "retry") or "retry").strip().lower()
+                if on_failure not in {"retry", "skip", "abort"}:
+                    on_failure = "retry"
                 headers["x-scenario-flow"] = flow
                 headers["x-scenario-vu-id"] = str(vu_id)
+                headers["x-scenario-on-failure"] = on_failure
                 key = int((t * 1000.0) // bucket)
                 timeline.setdefault(key, []).append(H2RequestPlanItem(method=method, path=path, headers=headers))
                 # Model retry lifecycle deterministically as future attempts in plan timeline.
+                if on_failure != "retry":
+                    retry_count = 0
                 for r in range(retry_count):
                     t_retry = t + (0.05 * float(r + 1))
                     if t_retry > deadline:

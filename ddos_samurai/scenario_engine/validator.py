@@ -45,6 +45,9 @@ def validate_raw_schema(raw: dict[str, Any]) -> None:
             if st == "request":
                 if not str(step.get("path", "") or "").strip():
                     raise ValueError(f"flow '{fname}' step[{i}] request path is required")
+                on_failure = str(step.get("on_failure", "retry") or "retry").strip().lower()
+                if on_failure not in {"retry", "skip", "abort"}:
+                    raise ValueError(f"flow '{fname}' step[{i}] on_failure must be retry|skip|abort")
                 extract = step.get("extract", {})
                 if extract is not None and not isinstance(extract, dict):
                     raise ValueError(f"flow '{fname}' step[{i}] extract must be an object")
@@ -66,6 +69,11 @@ def validate_raw_schema(raw: dict[str, Any]) -> None:
                 cond = str(step.get("condition", "") or "").strip()
                 if not cond:
                     raise ValueError(f"flow '{fname}' step[{i}] assert requires 'condition'")
+            if st == "pause":
+                tt = dict(step.get("think_time") or {})
+                dist = str(tt.get("distribution", "uniform") or "uniform").strip().lower()
+                if dist not in {"uniform", "gaussian"}:
+                    raise ValueError(f"flow '{fname}' step[{i}] think_time.distribution must be uniform|gaussian")
 
     _validate_flow_graph(dict(flows))
 

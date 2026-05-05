@@ -52,12 +52,16 @@ SCENARIO_SCHEMA_V1: dict[str, Any] = {
                                 "flow": {"type": "string"},
                                 "repeat": {"type": "integer", "minimum": 1},
                                 "probability": {"type": "number", "minimum": 0, "maximum": 1},
+                                "on_failure": {"type": "string", "enum": ["retry", "skip", "abort"]},
                                 "conditions": {"type": "object"},
                                 "think_time": {
                                     "type": "object",
                                     "properties": {
                                         "min_ms": {"type": "integer", "minimum": 0},
                                         "max_ms": {"type": "integer", "minimum": 0},
+                                        "distribution": {"type": "string", "enum": ["uniform", "gaussian"]},
+                                        "mean_ms": {"type": "integer", "minimum": 0},
+                                        "stddev_ms": {"type": "integer", "minimum": 0},
                                     },
                                     "additionalProperties": True,
                                 },
@@ -87,6 +91,18 @@ SCENARIO_SCHEMA_V1: dict[str, Any] = {
                 "min_completion_rate": {"type": "number", "minimum": 0, "maximum": 1},
                 "max_step_fail_ratio": {"type": "number", "minimum": 0, "maximum": 1},
                 "max_latency_p95_ms": {"type": ["number", "null"], "minimum": 0},
+                "per_flow": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "min_completion_rate": {"type": "number", "minimum": 0, "maximum": 1},
+                            "max_step_fail_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+                            "max_latency_p95_ms": {"type": ["number", "null"], "minimum": 0},
+                        },
+                        "additionalProperties": True,
+                    },
+                },
             },
             "additionalProperties": True,
         },

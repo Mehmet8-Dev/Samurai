@@ -36,10 +36,14 @@ def scenario_spec_to_dict(spec: ScenarioSpec) -> dict:
                         "flow": s.flow,
                         "repeat": int(s.repeat),
                         "probability": float(s.probability),
+                        "on_failure": s.on_failure,
                         "conditions": dict(s.conditions),
                         "think_time": {
                             "min_ms": int(s.think_time.min_ms),
                             "max_ms": int(s.think_time.max_ms),
+                            "distribution": s.think_time.distribution,
+                            "mean_ms": int(s.think_time.mean_ms),
+                            "stddev_ms": int(s.think_time.stddev_ms),
                         },
                     }
                     for s in f.steps
@@ -57,6 +61,7 @@ def scenario_spec_to_dict(spec: ScenarioSpec) -> dict:
             "min_completion_rate": float(spec.sla.min_completion_rate),
             "max_step_fail_ratio": float(spec.sla.max_step_fail_ratio),
             "max_latency_p95_ms": spec.sla.max_latency_p95_ms,
+            "per_flow": dict(spec.sla.per_flow or {}),
         },
     }
 
@@ -87,10 +92,14 @@ def scenario_spec_from_dict(raw: dict) -> ScenarioSpec:
                     flow=str((row or {}).get("flow", "") or "").strip(),
                     repeat=max(1, int((row or {}).get("repeat", 1) or 1)),
                     probability=float((row or {}).get("probability", 1.0) or 1.0),
+                    on_failure=str((row or {}).get("on_failure", "retry") or "retry").strip().lower(),
                     conditions=dict((row or {}).get("conditions") or {}),
                     think_time=ThinkTimeSpec(
                         min_ms=max(0, int(tt.get("min_ms", 0) or 0)),
                         max_ms=max(0, int(tt.get("max_ms", 0) or 0)),
+                        distribution=str(tt.get("distribution", "uniform") or "uniform").strip().lower(),
+                        mean_ms=max(0, int(tt.get("mean_ms", 0) or 0)),
+                        stddev_ms=max(0, int(tt.get("stddev_ms", 0) or 0)),
                     ),
                 )
             )
@@ -119,5 +128,6 @@ def scenario_spec_from_dict(raw: dict) -> ScenarioSpec:
                 if sla.get("max_latency_p95_ms", None) is not None
                 else None
             ),
+            per_flow=dict(sla.get("per_flow") or {}),
         ),
     )

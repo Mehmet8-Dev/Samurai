@@ -8,6 +8,9 @@ from typing import Any
 class ThinkTimeSpec:
     min_ms: int = 0
     max_ms: int = 0
+    distribution: str = "uniform"
+    mean_ms: int = 0
+    stddev_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -18,6 +21,7 @@ class StepSpec:
     flow: str = ""
     repeat: int = 1
     probability: float = 1.0
+    on_failure: str = "retry"
     conditions: dict[str, Any] = field(default_factory=dict)
     think_time: ThinkTimeSpec = field(default_factory=ThinkTimeSpec)
 
@@ -53,6 +57,7 @@ class SlaGateSpec:
     min_completion_rate: float
     max_step_fail_ratio: float
     max_latency_p95_ms: float | None = None
+    per_flow: dict[str, dict[str, float | None]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
