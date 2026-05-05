@@ -37,13 +37,20 @@ py::tuple build_worker_session_plans_native(
     for (std::size_t i = 0; i < worker_counts.size(); ++i) plans_by_worker.append(py::list());
   } else {
     for (std::size_t wi = 0; wi < worker_counts.size(); ++wi) {
-      py::list worker_plans;
       const int wc = std::max(0, worker_counts[wi]);
+      std::vector<std::string> assigned_flows{};
+      std::vector<std::uint64_t> assigned_seeds{};
+      assigned_flows.reserve(static_cast<std::size_t>(wc));
+      assigned_seeds.reserve(static_cast<std::size_t>(wc));
       for (int i = 0; i < wc; ++i) {
         const auto idx = flow_dist(rng);
-        py::dict plan = compile_session_plan_packed_native(spec, flow_names[idx], rng());
-        worker_plans.append(plan);
-        sessions_started += 1;
+        assigned_flows.push_back(flow_names[idx]);
+        assigned_seeds.push_back(rng());
+      }
+      py::list worker_plans = compile_session_plans_packed_bulk_native(spec, assigned_flows, assigned_seeds);
+      sessions_started += static_cast<std::uint64_t>(py::len(worker_plans));
+      for (auto row : worker_plans) {
+        py::dict plan = py::reinterpret_borrow<py::dict>(row);
         step_attempted += static_cast<std::uint64_t>(py::int_(plan["step_attempted"]));
       }
       plans_by_worker.append(worker_plans);
