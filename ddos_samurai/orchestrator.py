@@ -4015,6 +4015,15 @@ async def worker_process(
             worker_stats["scenario_flow_latency_p50_ms"] = float(_pct(_all_lat, 0.50) if _all_lat else 0.0)
             worker_stats["scenario_flow_latency_p95_ms"] = float(_pct(_all_lat, 0.95) if _all_lat else 0.0)
             worker_stats["scenario_flow_latency_p99_ms"] = float(_pct(_all_lat, 0.99) if _all_lat else 0.0)
+            _lat_by_flow = {}
+            for _flow in _flow_keys:
+                _vals = list(_scenario_flow_latency_ms.get(_flow, []) or [])
+                _lat_by_flow[str(_flow)] = {
+                    "latency_p50_ms": float(_pct(_vals, 0.50) if _vals else 0.0),
+                    "latency_p95_ms": float(_pct(_vals, 0.95) if _vals else 0.0),
+                    "latency_p99_ms": float(_pct(_vals, 0.99) if _vals else 0.0),
+                }
+            worker_stats["scenario_flow_latency_by_flow_json"] = json.dumps(_lat_by_flow, ensure_ascii=True)
 
         if run_events is not None:
             try:

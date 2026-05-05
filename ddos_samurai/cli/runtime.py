@@ -484,6 +484,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 _flow_p50_vals = []
                 _flow_p95_vals = []
                 _flow_p99_vals = []
+                _lat_by_flow_agg = {}
                 for ev in events_local:
                     st = dict((ev or {}).get("stats", {}) or {})
                     if "scenario_flow_min_completion_rate" in st:
@@ -498,6 +499,17 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                         _flow_p95_vals.append(float(st.get("scenario_flow_latency_p95_ms", 0.0) or 0.0))
                     if "scenario_flow_latency_p99_ms" in st:
                         _flow_p99_vals.append(float(st.get("scenario_flow_latency_p99_ms", 0.0) or 0.0))
+                    _raw_lat_by_flow = str(st.get("scenario_flow_latency_by_flow_json", "") or "").strip()
+                    if _raw_lat_by_flow:
+                        try:
+                            _lat_obj = dict(json.loads(_raw_lat_by_flow) or {})
+                        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError, json.JSONDecodeError):
+                            _lat_obj = {}
+                        for _fname, _frow in _lat_obj.items():
+                            _acc = _lat_by_flow_agg.setdefault(str(_fname), {"latency_p50_ms": [], "latency_p95_ms": [], "latency_p99_ms": []})
+                            _acc["latency_p50_ms"].append(float(dict(_frow or {}).get("latency_p50_ms", 0.0) or 0.0))
+                            _acc["latency_p95_ms"].append(float(dict(_frow or {}).get("latency_p95_ms", 0.0) or 0.0))
+                            _acc["latency_p99_ms"].append(float(dict(_frow or {}).get("latency_p99_ms", 0.0) or 0.0))
                 if _flow_min_completion_vals:
                     rr.results["scenario_flow_min_completion_rate"] = float(min(_flow_min_completion_vals))
                 if _flow_max_fail_vals:
@@ -510,6 +522,15 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     rr.results["scenario_flow_latency_p95_ms"] = float(sum(_flow_p95_vals) / max(1, len(_flow_p95_vals)))
                 if _flow_p99_vals:
                     rr.results["scenario_flow_latency_p99_ms"] = float(sum(_flow_p99_vals) / max(1, len(_flow_p99_vals)))
+                if _lat_by_flow_agg:
+                    rr.results["scenario_flow_latency_by_flow"] = {
+                        k: {
+                            "latency_p50_ms": float(sum(v["latency_p50_ms"]) / max(1, len(v["latency_p50_ms"]))),
+                            "latency_p95_ms": float(sum(v["latency_p95_ms"]) / max(1, len(v["latency_p95_ms"]))),
+                            "latency_p99_ms": float(sum(v["latency_p99_ms"]) / max(1, len(v["latency_p99_ms"]))),
+                        }
+                        for k, v in _lat_by_flow_agg.items()
+                    }
             if soak_cfg is not None:
                 rr.results["soak_profile"] = str(soak_cfg.get("profile", "custom"))
                 rr.results["soak_passed"] = bool((monitor_summary or {}).get("passed", False))
@@ -570,6 +591,13 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     "completed": int(sum(1 for v in vu_snapshots if str(v.state.value) == "completed")),
                 }
                 rr.results["scenario_per_flow"] = vu_pool.per_flow_metrics(duration_s=float(duration))
+                _lat_by_flow = dict(rr.results.get("scenario_flow_latency_by_flow", {}) or {})
+                for _fname, _frow in dict(rr.results.get("scenario_per_flow", {}) or {}).items():
+                    _lat = dict(_lat_by_flow.get(str(_fname), {}) or {})
+                    if _lat:
+                        _frow["latency_p50_ms"] = float(_lat.get("latency_p50_ms", 0.0) or 0.0)
+                        _frow["latency_p95_ms"] = float(_lat.get("latency_p95_ms", 0.0) or 0.0)
+                        _frow["latency_p99_ms"] = float(_lat.get("latency_p99_ms", 0.0) or 0.0)
                 sla_eval = scenario_engine.evaluate_scenario_sla(
                     sla=scenario_spec_to_dict(scenario_spec).get("sla", {}),
                     sessions_started=sessions_started,
@@ -585,19 +613,21 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     "vus_target": int((scenario_build_metrics or {}).get("scenario_vus_target", 0) or 0),
                     "active_vu": int(max(0, sessions_started - sessions_completed)),
                     "vu_target_gap": int(max(0, int((scenario_build_metrics or {}).get("scenario_vus_target", 0) or 0) - max(0, sessions_started - sessions_completed))),
+                    "ramp_target_vus": int((scenario_build_metrics or {}).get("scenario_vus_target", 0) or 0),
+                    "ramp_actual_vus": int(sum(int((x or {}).get("vus_active_peak", 0) or 0) for x in list(scenario_runtime_metrics_by_worker or []))),
                     "sessions_started": sessions_started,
                     "sessions_completed": sessions_completed,
                     "step_attempted": step_attempted,
                     "step_failed": step_failed,
+                    "sla_status": "pass" if bool(sla_eval.passed) else "fail",
                     **sla_detail,
                 }
                 _sla_metrics = dict(sla_detail.get("metrics", {}) or {})
                 rr.results["scenario_session_completion_rate"] = float(_sla_metrics.get("session_completion_rate", 0.0) or 0.0)
                 rr.results["scenario_step_fail_ratio"] = float(_sla_metrics.get("step_fail_ratio", 0.0) or 0.0)
-                rr.results["scenario_vu_ramp_accuracy_pct"] = float(
-                    (100.0 * float(rr.results["scenario_summary"]["active_vu"])) /
-                    float(max(1, rr.results["scenario_summary"]["vus_target"]))
-                )
+                _rt = float(rr.results["scenario_summary"].get("ramp_target_vus", 0) or 0.0)
+                _ra = float(rr.results["scenario_summary"].get("ramp_actual_vus", 0) or 0.0)
+                rr.results["scenario_vu_ramp_accuracy_pct"] = float((100.0 * min(_ra, _rt)) / max(1.0, _rt))
                 if scenario_mode == "enforce" and not bool(sla_eval.passed):
                     utils.log_critical("Scenario SLA gate failed (enforce mode).")
                     return 3
