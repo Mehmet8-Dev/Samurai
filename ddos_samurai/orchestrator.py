@@ -16,6 +16,7 @@ from ddos_samurai import cpu_packet_engine as packet
 from ddos_samurai import dataplane
 from ddos_samurai.stateful_runtime import evaluate_hot_path_contract
 from ddos_samurai.topology_native import compiled_topology_plan_from_dict, topology_tuple_for_index
+from ddos_samurai.scenario_engine.metrics import LatencyDigest
 
 
 from ddos_samurai import utils
@@ -1859,22 +1860,9 @@ async def worker_process(
             _scenario_flow_failed_steps: dict[str, int] = {}
             _scenario_flow_vu_completed: dict[str, int] = {}
             _scenario_flow_vu_total: dict[str, int] = {}
-            _scenario_flow_latency_ms: dict[str, list[float]] = {}
+            _scenario_flow_latency_digest: dict[str, LatencyDigest] = {}
             for _vu_id, _flow in scenario_vu_flow.items():
                 _scenario_flow_vu_total[str(_flow)] = int(_scenario_flow_vu_total.get(str(_flow), 0) or 0) + 1
-
-            def _pct(values: list[float], q: float) -> float:
-                xs = sorted(float(v) for v in list(values or []) if float(v) >= 0.0)
-                if not xs:
-                    return 0.0
-                if len(xs) == 1:
-                    return float(xs[0])
-                qn = max(0.0, min(1.0, float(q)))
-                pos = qn * float(len(xs) - 1)
-                lo = int(pos)
-                hi = min(len(xs) - 1, lo + 1)
-                frac = pos - float(lo)
-                return float(xs[lo] + ((xs[hi] - xs[lo]) * frac))
 
             def _iter_scenario_runtime_batches():
                 for row in scenario_runtime_batches:
@@ -1918,9 +1906,7 @@ async def worker_process(
                         latency_ms = float((row or {}).get("latency_ms", 0.0) or 0.0)
                         _scenario_flow_steps[flow] = int(_scenario_flow_steps.get(flow, 0) or 0) + 1
                         if latency_ms >= 0.0:
-                            bucket = _scenario_flow_latency_ms.setdefault(flow, [])
-                            if len(bucket) < 8192:
-                                bucket.append(latency_ms)
+                            _scenario_flow_latency_digest.setdefault(flow, LatencyDigest()).add(latency_ms)
                         if not ok:
                             _scenario_flow_failed_steps[flow] = int(_scenario_flow_failed_steps.get(flow, 0) or 0) + 1
                         if vu_id:
@@ -4008,20 +3994,21 @@ async def worker_process(
             worker_stats["scenario_flow_min_completion_rate"] = float(_min_completion if _flow_keys else 0.0)
             worker_stats["scenario_flow_max_step_fail_ratio"] = float(_max_step_fail_ratio if _flow_keys else 0.0)
             worker_stats["scenario_flow_coverage_pct"] = float((100.0 * _covered) / float(_flow_count))
-            _all_lat = []
+            _all_lat = LatencyDigest()
             for _flow in _flow_keys:
-                _vals = list(_scenario_flow_latency_ms.get(_flow, []) or [])
-                _all_lat.extend(_vals)
-            worker_stats["scenario_flow_latency_p50_ms"] = float(_pct(_all_lat, 0.50) if _all_lat else 0.0)
-            worker_stats["scenario_flow_latency_p95_ms"] = float(_pct(_all_lat, 0.95) if _all_lat else 0.0)
-            worker_stats["scenario_flow_latency_p99_ms"] = float(_pct(_all_lat, 0.99) if _all_lat else 0.0)
+                _dig = _scenario_flow_latency_digest.get(_flow)
+                if _dig is not None:
+                    _all_lat.merge(_dig)
+            worker_stats["scenario_flow_latency_p50_ms"] = float(_all_lat.quantile(0.50))
+            worker_stats["scenario_flow_latency_p95_ms"] = float(_all_lat.quantile(0.95))
+            worker_stats["scenario_flow_latency_p99_ms"] = float(_all_lat.quantile(0.99))
             _lat_by_flow = {}
             for _flow in _flow_keys:
-                _vals = list(_scenario_flow_latency_ms.get(_flow, []) or [])
+                _dig = _scenario_flow_latency_digest.get(_flow) or LatencyDigest()
                 _lat_by_flow[str(_flow)] = {
-                    "latency_p50_ms": float(_pct(_vals, 0.50) if _vals else 0.0),
-                    "latency_p95_ms": float(_pct(_vals, 0.95) if _vals else 0.0),
-                    "latency_p99_ms": float(_pct(_vals, 0.99) if _vals else 0.0),
+                    "latency_p50_ms": float(_dig.quantile(0.50)),
+                    "latency_p95_ms": float(_dig.quantile(0.95)),
+                    "latency_p99_ms": float(_dig.quantile(0.99)),
                 }
             worker_stats["scenario_flow_latency_by_flow_json"] = json.dumps(_lat_by_flow, ensure_ascii=True)
 
