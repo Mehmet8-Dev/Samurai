@@ -237,7 +237,9 @@ class TestScenarioEngineFuzzIntegration(unittest.TestCase):
             self.skipTest("scenario native unavailable")
         raw = self._yaml_to_raw(_BASE_YAML)
         plans, m = scenario_native.build_worker_session_plans(raw, [2, 3], 99)
-        self.assertEqual(sum(len(x) for x in plans), 5)
+        self.assertEqual(len(plans), 2)
+        self.assertTrue(all(len(x) == 1 for x in plans))
+        self.assertTrue(all(bool(dict(x[0]).get("packed_soa", False)) for x in plans))
         self.assertEqual(int(m.get("sessions_started", 0)), 5)
 
     def test_native_compile_packed_contains_required_columns(self):

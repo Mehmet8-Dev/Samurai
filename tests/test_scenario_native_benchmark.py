@@ -23,7 +23,8 @@ class TestScenarioNativeBenchmark(unittest.TestCase):
         t0 = time.perf_counter()
         plans, metrics = build_worker_session_plans(bench_spec, worker_counts, 1337)
         elapsed = time.perf_counter() - t0
-        total_sessions = sum(len(x) for x in plans)
-        self.assertEqual(total_sessions, int(raw["load_model"]["concurrent_vus"]))
+        self.assertEqual(len(plans), workers)
+        self.assertTrue(all(len(x) == 1 for x in plans))
+        self.assertEqual(int(metrics.get("sessions_started", 0)), int(raw["load_model"]["concurrent_vus"]))
         self.assertGreaterEqual(float(elapsed), 0.0)
         self.assertIn("sessions_started", metrics)

@@ -76,6 +76,23 @@ class TestScenarioEngineUpgrade(unittest.TestCase):
         self.assertTrue(all(bool(dict(r).get("packed", False)) for r in rows))
         self.assertTrue(all("event_kind" in dict(r) for r in rows))
 
+    def test_compile_session_plan_bulk_soa_shape(self):
+        try:
+            scenario_native.require_native()
+        except RuntimeError:
+            self.skipTest("scenario native unavailable")
+        spec = self._load_spec()
+        out = scenario_native.compile_session_plans_packed_bulk_soa(
+            spec,
+            ["browse", "browse", "browse"],
+            [101, 102, 103],
+        )
+        self.assertTrue(bool(out.get("packed_soa", False)))
+        offs = list(out.get("session_offsets", []) or [])
+        self.assertEqual(len(offs), 4)
+        self.assertGreaterEqual(int(offs[-1]), int(offs[0]))
+        self.assertIn("event_kind", out)
+
     def test_ramp_should_spawn_linear(self):
         rc = RampController(target_vus=100, ramp_seconds=10, curve="linear")
         self.assertEqual(rc.should_spawn(0.0, 0), 0)

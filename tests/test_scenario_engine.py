@@ -11,6 +11,7 @@ from ddos_samurai.scenario_engine.runtime import (
     build_vu_lifecycle_batches,
     collect_per_flow_metrics,
     deserialize_batches,
+    iter_vu_lifecycle_batches,
     simulate_vu_state_machine,
     serialize_batches,
 )
@@ -329,6 +330,26 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         item = restored[0].request_plan.items[0]
         self.assertEqual(bytes(item.body or b""), b"hello")
         self.assertEqual(str(item.content_type or ""), "text/plain; charset=utf-8")
+
+    def test_iter_vu_lifecycle_batches_emits_final_metrics(self):
+        sessions = [
+            {"events": [{"event_type": "http_request", "method": "GET", "path": "/"}]},
+            {"events": [{"event_type": "http_request", "method": "GET", "path": "/x"}]},
+        ]
+        rows = list(
+            iter_vu_lifecycle_batches(
+                scenario_sessions=sessions,
+                ramp_seconds=1,
+                max_session_seconds=10,
+                seed=1,
+                window_ms=250,
+                bucket_ms=50,
+            )
+        )
+        self.assertTrue(len(rows) >= 2)
+        final_meta = dict(rows[-1][1] or {})
+        self.assertTrue(bool(final_meta.get("final", False)))
+        self.assertEqual(int(final_meta.get("vus_spawned", 0) or 0), 2)
 
     def test_state_machine_feedback_and_per_flow_metrics(self):
         sessions = [
