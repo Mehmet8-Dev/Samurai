@@ -43,6 +43,9 @@ def _scenario_step_results_from_plan(
         headers = dict(getattr(item, "headers", {}) or {})
         flow = str(headers.get("x-scenario-flow", "unknown") or "unknown")
         vu_id = str(headers.get("x-scenario-vu-id", "") or "")
+        on_failure = str(headers.get("x-scenario-on-failure", "retry") or "retry").strip().lower()
+        if on_failure not in {"retry", "skip", "abort"}:
+            on_failure = "retry"
         ok = idx < success_count
         fail_idx = idx - success_count
         is_timeout = (not ok) and fail_idx >= 0 and fail_idx < timeout_budget
@@ -50,6 +53,7 @@ def _scenario_step_results_from_plan(
             {
                 "flow": flow,
                 "vu_id": vu_id,
+                "on_failure": on_failure,
                 "success": bool(ok),
                 "timeout": bool(is_timeout),
                 "latency_ms": 0.0,

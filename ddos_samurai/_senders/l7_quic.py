@@ -64,6 +64,7 @@ def _scenario_step_results_from_plan(request_plan: Any, sent: int, errors: int, 
             {
                 "flow": str(headers.get("x-scenario-flow", "unknown") or "unknown"),
                 "vu_id": str(headers.get("x-scenario-vu-id", "") or ""),
+                "on_failure": str(headers.get("x-scenario-on-failure", "retry") or "retry").strip().lower(),
                 "success": bool(idx < success_count),
                 "timeout": bool(idx >= success_count and fail_idx >= 0 and fail_idx < timeout_budget),
                 "latency_ms": 0.0,
