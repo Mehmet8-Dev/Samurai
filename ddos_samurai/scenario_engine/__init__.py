@@ -18,7 +18,7 @@ from .metrics import (
     percentile,
 )
 from .sla import evaluate_scenario_sla, SlaEvaluation
-from .benchmark import run_compile_benchmark, write_compile_benchmark_report
+from .benchmark import run_compile_benchmark, write_compile_benchmark_report, write_memory_profile_report
 
 __all__ = [
     "load_raw_scenario",
@@ -44,4 +44,5 @@ __all__ = [
     "SlaEvaluation",
     "run_compile_benchmark",
     "write_compile_benchmark_report",
+    "write_memory_profile_report",
 ]

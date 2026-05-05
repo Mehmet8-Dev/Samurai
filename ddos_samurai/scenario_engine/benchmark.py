@@ -79,13 +79,25 @@ def run_compile_benchmark(
             )
         )
     best_1m = next((r for r in rows if int(r.vus) == 1_000_000), None)
+    derived_rows = []
+    for r in rows:
+        per_session_peak = float(r.peak_mem_bytes) / max(1.0, float(r.sessions_started))
+        derived_rows.append(
+            {
+                **r.to_dict(),
+                "per_session_peak_mem_bytes": float(per_session_peak),
+            }
+        )
     return {
         "schema": "samurai.scenario.benchmark.v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "rows": [r.to_dict() for r in rows],
+        "rows": derived_rows,
         "summary": {
             "target_1m_elapsed_s": float(best_1m.elapsed_s) if best_1m is not None else None,
             "target_1m_peak_mem_bytes": int(best_1m.peak_mem_bytes) if best_1m is not None else None,
+            "target_1m_per_session_peak_mem_bytes": (
+                float(best_1m.peak_mem_bytes) / max(1.0, float(best_1m.sessions_started))
+            ) if best_1m is not None else None,
         },
     }
 
@@ -96,3 +108,29 @@ def write_compile_benchmark_report(report: dict[str, Any], out_path: str | Path)
     p.write_text(json.dumps(report, ensure_ascii=True, indent=2), encoding="utf-8")
     return str(p)
 
+
+def write_memory_profile_report(report: dict[str, Any], out_path: str | Path) -> str:
+    p = Path(out_path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    rows = list(report.get("rows", []) or [])
+    lines = [
+        "# Scenario Compile Memory Profile",
+        "",
+        f"- schema: `{report.get('schema', '')}`",
+        f"- generated_at: `{report.get('generated_at', '')}`",
+        "",
+        "| VUs | Workers | Elapsed (s) | Peak Mem (bytes) | Per-Session Peak (bytes) |",
+        "|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            "| {vus} | {workers} | {elapsed:.6f} | {peak} | {per:.3f} |".format(
+                vus=int(row.get("vus", 0) or 0),
+                workers=int(row.get("workers", 0) or 0),
+                elapsed=float(row.get("elapsed_s", 0.0) or 0.0),
+                peak=int(row.get("peak_mem_bytes", 0) or 0),
+                per=float(row.get("per_session_peak_mem_bytes", 0.0) or 0.0),
+            )
+        )
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(p)
