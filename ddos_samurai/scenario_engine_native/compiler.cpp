@@ -17,6 +17,10 @@ static StepType parse_step_type(const std::string& s) {
   if (s == "branch") return StepType::Branch;
   if (s == "loop") return StepType::Loop;
   if (s == "assert") return StepType::Assert;
+  if (s == "tcp_connect") return StepType::TcpConnect;
+  if (s == "tcp_send") return StepType::TcpSend;
+  if (s == "tcp_expect") return StepType::TcpExpect;
+  if (s == "tcp_close") return StepType::TcpClose;
   return StepType::EndSession;
 }
 
@@ -75,6 +79,13 @@ ScenarioSpecNative parse_spec(const py::dict& spec) {
         if (st.contains("repeat")) step.repeat = std::max(1, static_cast<int>(py::int_(st["repeat"])));
         if (st.contains("probability")) step.probability = std::clamp(static_cast<double>(py::float_(st["probability"])), 0.0, 1.0);
         if (st.contains("on_failure")) step.on_failure = py::str(st["on_failure"]).cast<std::string>();
+        if (st.contains("dst_port")) {
+          const int port = static_cast<int>(py::int_(st["dst_port"]));
+          step.dst_port = static_cast<std::uint16_t>(std::clamp(port, 0, 65535));
+        }
+        if (st.contains("payload_template")) step.payload_template = py::str(st["payload_template"]).cast<std::string>();
+        if (st.contains("condition")) step.condition = py::str(st["condition"]).cast<std::string>();
+        if (st.contains("timeout_ms")) step.timeout_ms = std::max(0, static_cast<int>(py::int_(st["timeout_ms"])));
         if (st.contains("think_time")) {
           py::dict tt = py::reinterpret_borrow<py::dict>(st["think_time"]);
           if (tt.contains("min_ms")) step.think_time.min_ms = std::max(0, static_cast<int>(py::int_(tt["min_ms"])));
@@ -104,7 +115,7 @@ struct CompileState {
 };
 
 struct PackedEvents {
-  std::vector<int> event_kind{};  // 0=request, 1=think_time
+  std::vector<int> event_kind{};  // 0=request, 1=think_time, 2=tcp_connect, 3=tcp_send, 4=tcp_expect, 5=tcp_close
   std::vector<std::string> request_kind{};  // http_request | http2_headers | ""
   std::vector<std::string> method{};
   std::vector<std::string> path{};
@@ -122,6 +133,10 @@ struct PackedEvents {
   std::vector<std::string> think_distribution{};
   std::vector<int> think_mean_ms{};
   std::vector<int> think_stddev_ms{};
+  std::vector<int> tcp_dst_port{};
+  std::vector<std::string> tcp_payload{};
+  std::vector<std::string> tcp_expect_condition{};
+  std::vector<int> tcp_expect_timeout_ms{};
 };
 
 struct CompiledPackedSession {
@@ -228,6 +243,42 @@ static void compile_flow_recursive(const ScenarioSpecNative& spec, const std::st
         st.emitted += 1;
         break;
       }
+      case StepType::TcpConnect: {
+        st.attempted += 1;
+        py::dict ev;
+        ev["event_type"] = py::str("tcp_connect");
+        ev["dst_port"] = py::int_(step.dst_port);
+        events.append(ev);
+        st.emitted += 1;
+        break;
+      }
+      case StepType::TcpSend: {
+        st.attempted += 1;
+        py::dict ev;
+        ev["event_type"] = py::str("tcp_send");
+        ev["payload_template"] = step.payload_template;
+        events.append(ev);
+        st.emitted += 1;
+        break;
+      }
+      case StepType::TcpExpect: {
+        st.attempted += 1;
+        py::dict ev;
+        ev["event_type"] = py::str("tcp_expect");
+        ev["condition"] = step.condition;
+        ev["timeout_ms"] = py::int_(step.timeout_ms);
+        events.append(ev);
+        st.emitted += 1;
+        break;
+      }
+      case StepType::TcpClose: {
+        st.attempted += 1;
+        py::dict ev;
+        ev["event_type"] = py::str("tcp_close");
+        events.append(ev);
+        st.emitted += 1;
+        break;
+      }
     }
   }
 }
@@ -268,6 +319,10 @@ static void compile_flow_recursive_packed(
         out.think_distribution.push_back(step.think_time.distribution);
         out.think_mean_ms.push_back(step.think_time.mean_ms);
         out.think_stddev_ms.push_back(step.think_time.stddev_ms);
+        out.tcp_dst_port.push_back(0);
+        out.tcp_payload.emplace_back("");
+        out.tcp_expect_condition.emplace_back("");
+        out.tcp_expect_timeout_ms.push_back(0);
         st.emitted += 1;
         break;
       }
@@ -322,6 +377,110 @@ static void compile_flow_recursive_packed(
         out.think_distribution.emplace_back("uniform");
         out.think_mean_ms.push_back(0);
         out.think_stddev_ms.push_back(0);
+        out.tcp_dst_port.push_back(0);
+        out.tcp_payload.emplace_back("");
+        out.tcp_expect_condition.emplace_back("");
+        out.tcp_expect_timeout_ms.push_back(0);
+        st.emitted += 1;
+        break;
+      }
+      case StepType::TcpConnect: {
+        st.attempted += 1;
+        out.event_kind.push_back(2);
+        out.request_kind.emplace_back("");
+        out.method.emplace_back("");
+        out.path.emplace_back("");
+        out.body_template.emplace_back("");
+        out.headers_idx.push_back(intern_map({}, out.headers_pool));
+        out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
+        out.device_profile.emplace_back("");
+        out.timeout_ms.push_back(0);
+        out.retry_count.push_back(0);
+        out.on_failure.emplace_back("retry");
+        out.think_min_ms.push_back(0);
+        out.think_max_ms.push_back(0);
+        out.think_distribution.emplace_back("uniform");
+        out.think_mean_ms.push_back(0);
+        out.think_stddev_ms.push_back(0);
+        out.tcp_dst_port.push_back(static_cast<int>(step.dst_port));
+        out.tcp_payload.emplace_back("");
+        out.tcp_expect_condition.emplace_back("");
+        out.tcp_expect_timeout_ms.push_back(0);
+        st.emitted += 1;
+        break;
+      }
+      case StepType::TcpSend: {
+        st.attempted += 1;
+        out.event_kind.push_back(3);
+        out.request_kind.emplace_back("");
+        out.method.emplace_back("");
+        out.path.emplace_back("");
+        out.body_template.emplace_back("");
+        out.headers_idx.push_back(intern_map({}, out.headers_pool));
+        out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
+        out.device_profile.emplace_back("");
+        out.timeout_ms.push_back(0);
+        out.retry_count.push_back(0);
+        out.on_failure.emplace_back("retry");
+        out.think_min_ms.push_back(0);
+        out.think_max_ms.push_back(0);
+        out.think_distribution.emplace_back("uniform");
+        out.think_mean_ms.push_back(0);
+        out.think_stddev_ms.push_back(0);
+        out.tcp_dst_port.push_back(0);
+        out.tcp_payload.push_back(step.payload_template);
+        out.tcp_expect_condition.emplace_back("");
+        out.tcp_expect_timeout_ms.push_back(0);
+        st.emitted += 1;
+        break;
+      }
+      case StepType::TcpExpect: {
+        st.attempted += 1;
+        out.event_kind.push_back(4);
+        out.request_kind.emplace_back("");
+        out.method.emplace_back("");
+        out.path.emplace_back("");
+        out.body_template.emplace_back("");
+        out.headers_idx.push_back(intern_map({}, out.headers_pool));
+        out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
+        out.device_profile.emplace_back("");
+        out.timeout_ms.push_back(0);
+        out.retry_count.push_back(0);
+        out.on_failure.emplace_back("retry");
+        out.think_min_ms.push_back(0);
+        out.think_max_ms.push_back(0);
+        out.think_distribution.emplace_back("uniform");
+        out.think_mean_ms.push_back(0);
+        out.think_stddev_ms.push_back(0);
+        out.tcp_dst_port.push_back(0);
+        out.tcp_payload.emplace_back("");
+        out.tcp_expect_condition.push_back(step.condition);
+        out.tcp_expect_timeout_ms.push_back(step.timeout_ms);
+        st.emitted += 1;
+        break;
+      }
+      case StepType::TcpClose: {
+        st.attempted += 1;
+        out.event_kind.push_back(5);
+        out.request_kind.emplace_back("");
+        out.method.emplace_back("");
+        out.path.emplace_back("");
+        out.body_template.emplace_back("");
+        out.headers_idx.push_back(intern_map({}, out.headers_pool));
+        out.cookies_idx.push_back(intern_map({}, out.cookies_pool));
+        out.device_profile.emplace_back("");
+        out.timeout_ms.push_back(0);
+        out.retry_count.push_back(0);
+        out.on_failure.emplace_back("retry");
+        out.think_min_ms.push_back(0);
+        out.think_max_ms.push_back(0);
+        out.think_distribution.emplace_back("uniform");
+        out.think_mean_ms.push_back(0);
+        out.think_stddev_ms.push_back(0);
+        out.tcp_dst_port.push_back(0);
+        out.tcp_payload.emplace_back("");
+        out.tcp_expect_condition.emplace_back("");
+        out.tcp_expect_timeout_ms.push_back(0);
         st.emitted += 1;
         break;
       }
@@ -379,6 +538,10 @@ py::dict compile_session_plan_packed_native(const ScenarioSpecNative& spec, cons
   out["think_distribution"] = py::cast(pe.think_distribution);
   out["think_mean_ms"] = py::cast(pe.think_mean_ms);
   out["think_stddev_ms"] = py::cast(pe.think_stddev_ms);
+  out["tcp_dst_port"] = py::cast(pe.tcp_dst_port);
+  out["tcp_payload"] = py::cast(pe.tcp_payload);
+  out["tcp_expect_condition"] = py::cast(pe.tcp_expect_condition);
+  out["tcp_expect_timeout_ms"] = py::cast(pe.tcp_expect_timeout_ms);
   out["step_attempted"] = st.attempted;
   const Persona* persona = nullptr;
   auto itp = spec.personas.find(spec.flows[spec.flow_index.at(flow_name)].persona);
@@ -410,6 +573,10 @@ static py::dict packed_session_to_py_dict(const CompiledPackedSession& s) {
   out["think_distribution"] = py::cast(s.events.think_distribution);
   out["think_mean_ms"] = py::cast(s.events.think_mean_ms);
   out["think_stddev_ms"] = py::cast(s.events.think_stddev_ms);
+  out["tcp_dst_port"] = py::cast(s.events.tcp_dst_port);
+  out["tcp_payload"] = py::cast(s.events.tcp_payload);
+  out["tcp_expect_condition"] = py::cast(s.events.tcp_expect_condition);
+  out["tcp_expect_timeout_ms"] = py::cast(s.events.tcp_expect_timeout_ms);
   out["step_attempted"] = s.step_attempted;
   out["session_timeout_ms"] = s.session_timeout_ms;
   return out;
@@ -535,6 +702,10 @@ py::dict compile_session_plans_packed_bulk_soa_native(
   out["think_distribution"] = py::cast(flat.think_distribution);
   out["think_mean_ms"] = py::cast(flat.think_mean_ms);
   out["think_stddev_ms"] = py::cast(flat.think_stddev_ms);
+  out["tcp_dst_port"] = py::cast(flat.tcp_dst_port);
+  out["tcp_payload"] = py::cast(flat.tcp_payload);
+  out["tcp_expect_condition"] = py::cast(flat.tcp_expect_condition);
+  out["tcp_expect_timeout_ms"] = py::cast(flat.tcp_expect_timeout_ms);
   return out;
 }
 

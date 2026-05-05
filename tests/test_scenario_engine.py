@@ -312,6 +312,27 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
         self.assertTrue(len(batches) > 0)
         self.assertGreaterEqual(int(metrics.get("step_attempted", 0) or 0), 1)
 
+    def test_native_compiler_packed_l4_tcp_columns(self):
+        try:
+            scenario_native.require_native()
+        except RuntimeError:
+            self.skipTest("scenario native module unavailable")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "v3_l4.yaml"
+            p.write_text(_V3_L4_TCP_YAML, encoding="utf-8")
+            spec = load_raw_scenario(str(p))
+        out = scenario_native.compile_session_plan_packed(spec, "syn_flood", 11)
+        self.assertTrue(bool(out.get("packed", False)))
+        self.assertIn("tcp_dst_port", out)
+        self.assertIn("tcp_payload", out)
+        self.assertIn("tcp_expect_condition", out)
+        self.assertIn("tcp_expect_timeout_ms", out)
+        kinds = [int(x) for x in list(out.get("event_kind", []) or [])]
+        self.assertIn(2, kinds)
+        self.assertIn(3, kinds)
+        self.assertIn(4, kinds)
+        self.assertIn(5, kinds)
+
     def test_vu_lifecycle_batches_apply_ramp_and_think_time(self):
         sessions = [
             {
