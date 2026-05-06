@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
 
 from . import require_distributed
 from .auth import build_cluster_metadata, client_call_credentials, load_tls_client_credentials, split_endpoints
@@ -36,6 +38,7 @@ class SlaveControlClient:
             ch = self._build_channel(ep)
             self._channels[ep] = ch
             self._stubs[ep] = self._stub_cls(ch)
+        self._stream_channels = {ep: self._channels[ep] for ep in self.endpoints}
 
     def _build_channel(self, endpoint: str):
         grpc = self._grpc
@@ -111,6 +114,79 @@ class SlaveControlClient:
             ),
         )
         return bool(resp.received)
+
+    def create_stats_streamer(self):
+        pb2, _ = load_generated()
+        md = build_cluster_metadata(self.cluster_secret)
+        q: queue.Queue = queue.Queue()
+        stop_evt = threading.Event()
+        worker = {"thread": None, "active": True}
+
+        def _iter_requests():
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                yield pb2.ReportStatsRequest(
+                    worker_id=str(item.get("worker_id", "")),
+                    shard_id=str(item.get("shard_id", "")),
+                    stats_json=bytes(item.get("stats_json", b"{}")),
+                    timestamp_ms=int(item.get("timestamp_ms", 0) or 0),
+                )
+
+        def _run_stream():
+            last_err = None
+            for ep in self._iter_endpoints_for_try():
+                ch = self._stream_channels.get(ep)
+                if ch is None:
+                    continue
+                call = ch.stream_unary(
+                    "/samurai.control.v1.SamuraiControl/ReportStatsStream",
+                    request_serializer=pb2.ReportStatsRequest.SerializeToString,
+                    response_deserializer=pb2.ReportStatsResponse.FromString,
+                )
+                try:
+                    _ = call(_iter_requests(), timeout=3600.0, metadata=md)
+                    worker["active"] = False
+                    return
+                except Exception as exc:
+                    last_err = exc
+                    continue
+            worker["active"] = False
+            if last_err is not None:
+                stop_evt.set()
+
+        t = threading.Thread(target=_run_stream, daemon=True, name="StatsStreamSender")
+        t.start()
+        worker["thread"] = t
+
+        def send(worker_id: str, shard_id: str, stats: dict, timestamp_ms: int) -> bool:
+            if not worker["active"]:
+                return False
+            payload = json.dumps(stats or {}, ensure_ascii=True).encode("utf-8")
+            try:
+                q.put_nowait(
+                    {
+                        "worker_id": str(worker_id),
+                        "shard_id": str(shard_id),
+                        "stats_json": payload,
+                        "timestamp_ms": int(timestamp_ms),
+                    }
+                )
+                return True
+            except Exception:
+                return False
+
+        def close() -> None:
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+            th = worker.get("thread")
+            if th is not None:
+                th.join(timeout=2.0)
+
+        return {"send": send, "close": close, "failed": stop_evt}
 
 
 class WorkerControlClient:

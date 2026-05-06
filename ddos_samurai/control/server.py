@@ -105,6 +105,15 @@ class _SamuraiServicer:
         pb2, _ = load_generated()
         return pb2.ReportStatsResponse(received=True)
 
+    def ReportStatsStream(self, request_iterator, context):
+        _ = context
+        count = 0
+        for req in request_iterator:
+            _ = self.ReportStats(req, context=None)
+            count += 1
+        pb2, _ = load_generated()
+        return pb2.ReportStatsResponse(received=(count > 0))
+
     def AbortJob(self, request, context):
         _ = context
         _ = request
@@ -181,6 +190,20 @@ class MasterControlServer:
             interceptors=[interceptor],
         )
         pb2_grpc.add_SamuraiControlServicer_to_server(self._servicer, self._server)
+        # Custom stream-unary endpoint for high-rate stats ingestion.
+        pb2, _ = load_generated()
+        stream_handlers = {
+            "ReportStatsStream": grpc.stream_unary_rpc_method_handler(
+                self._servicer.ReportStatsStream,
+                request_deserializer=pb2.ReportStatsRequest.FromString,
+                response_serializer=pb2.ReportStatsResponse.SerializeToString,
+            )
+        }
+        stream_handler = grpc.method_handlers_generic_handler(
+            "samurai.control.v1.SamuraiControl",
+            stream_handlers,
+        )
+        self._server.add_generic_rpc_handlers((stream_handler,))
         try:
             from grpc_health.v1 import health, health_pb2
             from grpc_health.v1 import health_pb2_grpc

@@ -18,6 +18,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     _ = parser
     _ = report_ctx
     _ = runtime_ctx
+    stop_grace_s = max(0.0, float(getattr(args, "control_stop_grace_s", 1.0) or 0.0))
     discovery = EndpointDiscovery(
         manual_endpoints=str(getattr(args, "control_endpoints", "")),
         prefer_k8s=bool(getattr(args, "control_discovery_k8s", False)),
@@ -284,6 +285,8 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         "worker_ids": list(agg.get("worker_ids", [])),
         "shard_ids": list(agg.get("shard_ids", [])),
         "numeric_totals": dict(agg.get("numeric_totals", {})),
+        "top_error_shards": list(agg.get("top_error_shards", [])),
+        "worker_rollup": list(agg.get("worker_rollup", [])),
     }
     utils.log_info(f"Distributed master summary: {snapshot}")
     server.stop(stop_grace_s)

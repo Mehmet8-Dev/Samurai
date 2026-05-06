@@ -137,6 +137,30 @@ def run_distributed_slave(args, parser) -> int:
         utils.log_critical(f"Master worker kaydını reddetti: {reg.get('rejection_reason', 'unknown')}")
         return 1
     utils.log_info(f"Distributed slave connected: endpoints={','.join(client.endpoints)}")
+    stats_stream_enabled = bool(getattr(args, "stats_stream_enable", True))
+    stats_stream_interval_s = max(0.05, float(int(getattr(args, "stats_stream_interval_ms", 500) or 500)) / 1000.0)
+    if stats_stream_enabled:
+        stats_stream = client.create_stats_streamer()
+    else:
+        stats_stream = {"send": lambda *a, **k: False, "close": lambda: None, "failed": threading.Event()}
+
+    def _emit_stats(worker_id_arg: str, shard_id_arg: str, stats_arg: dict) -> None:
+        ts = int(time.time() * 1000)
+        sent = False
+        try:
+            sent = bool(stats_stream["send"](worker_id_arg, shard_id_arg, stats_arg, ts))
+        except Exception:
+            sent = False
+        if not sent:
+            try:
+                client.report_stats(
+                    worker_id=worker_id_arg,
+                    shard_id=shard_id_arg,
+                    stats=stats_arg,
+                    timestamp_ms=ts,
+                )
+            except Exception:
+                pass
 
     # Optional worker-side RPC server: enables master -> worker StartShard/StopShard direct RPC.
     grpc_server = None
@@ -189,7 +213,19 @@ def run_distributed_slave(args, parser) -> int:
                     }
                     _refresh_worker_state_locked()
                 return
-            proc.join()
+            started_ts = float(runtime.get("started_ts", time.time()) or time.time())
+            while proc.is_alive():
+                live = {
+                    "worker_id": str(worker_id),
+                    "shard_id": str(shard_id),
+                    "status": "running",
+                    "duration_s": max(0.0, float(time.time() - started_ts)),
+                    "progress": int(getattr(runtime.get("progress"), "value", 0) or 0),
+                    "sent": int(getattr(runtime.get("sent_total"), "value", 0) or 0),
+                    "errors": int(getattr(runtime.get("errors_total"), "value", 0) or 0),
+                }
+                _emit_stats(worker_id_arg=worker_id, shard_id_arg=str(shard_id), stats_arg=live)
+                proc.join(timeout=stats_stream_interval_s)
             with shard_lock:
                 latest = dict(shard_runs.get(shard_id) or {})
                 if not latest:
@@ -197,15 +233,7 @@ def run_distributed_slave(args, parser) -> int:
                 if int(latest.get("runtime_id", 0) or 0) != runtime_id:
                     return
             stats = _finalize_shard_runtime(runtime, worker_id=worker_id, shard_id=shard_id)
-            try:
-                client.report_stats(
-                    worker_id=worker_id,
-                    shard_id=str(shard_id),
-                    stats=stats,
-                    timestamp_ms=int(time.time() * 1000),
-                )
-            except Exception:
-                pass
+            _emit_stats(worker_id_arg=worker_id, shard_id_arg=str(shard_id), stats_arg=stats)
             payload = json.dumps(stats, ensure_ascii=True).encode("utf-8")
             with shard_lock:
                 shard_runs.pop(shard_id, None)
@@ -281,15 +309,7 @@ def run_distributed_slave(args, parser) -> int:
                     return pb2.StopShardResponse(stopped=False)
                 stats = _finalize_shard_runtime(runtime, worker_id=worker_id, shard_id=sid)
                 stats["status"] = "stopped"
-                try:
-                    client.report_stats(
-                        worker_id=worker_id,
-                        shard_id=sid,
-                        stats=stats,
-                        timestamp_ms=int(time.time() * 1000),
-                    )
-                except Exception:
-                    pass
+                _emit_stats(worker_id_arg=worker_id, shard_id_arg=sid, stats_arg=stats)
                 with shard_lock:
                     shard_status[sid] = {
                         "state": "error",
@@ -359,11 +379,15 @@ def run_distributed_slave(args, parser) -> int:
         shard_id = str(shard_payload.get("shard_id", "shard-1") or "shard-1")
         shard_args = dict(shard_payload.get("args_dict") or {})
         stats = _execute_shard_locally(shard_args, shard_id)
-        client.report_stats(worker_id=worker_id, shard_id=shard_id, stats=stats, timestamp_ms=int(time.time() * 1000))
+        _emit_stats(worker_id_arg=worker_id, shard_id_arg=shard_id, stats_arg=stats)
         utils.log_info(
             f"Shard completed: shard_id={shard_id} sent={int(stats.get('sent', 0))} "
             f"errors={int(stats.get('errors', 0))} exitcode={int(stats.get('exitcode', 0))}"
         )
+        try:
+            stats_stream["close"]()
+        except Exception:
+            pass
         return 0 if int(stats.get("exitcode", 1) or 1) == 0 else 1
 
     # Heartbeat health loop (no orchestration commands are consumed here).
@@ -391,4 +415,8 @@ def run_distributed_slave(args, parser) -> int:
         time.sleep(max(0.5, hb_ms / 1000.0))
     if grpc_server is not None:
         grpc_server.stop(0.0)
+    try:
+        stats_stream["close"]()
+    except Exception:
+        pass
     return 0
