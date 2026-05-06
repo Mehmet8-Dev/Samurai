@@ -18,6 +18,8 @@ class SlaveControlClient:
         cluster_secret: str = "",
         insecure: bool = False,
         tls_ca: str = "",
+        tls_client_cert: str = "",
+        tls_client_key: str = "",
     ) -> None:
         require_distributed()
         import grpc
@@ -26,6 +28,8 @@ class SlaveControlClient:
         self.cluster_secret = str(cluster_secret or "")
         self.insecure = bool(insecure)
         self.tls_ca = str(tls_ca or "")
+        self.tls_client_cert = str(tls_client_cert or "")
+        self.tls_client_key = str(tls_client_key or "")
         self._grpc = grpc
         if not self.endpoints:
             raise ValueError("no control endpoints configured")
@@ -44,7 +48,11 @@ class SlaveControlClient:
         grpc = self._grpc
         if self.insecure:
             return grpc.insecure_channel(endpoint)
-        chan_creds = load_tls_client_credentials(self.tls_ca)
+        chan_creds = load_tls_client_credentials(
+            self.tls_ca,
+            client_cert_path=self.tls_client_cert,
+            client_key_path=self.tls_client_key,
+        )
         if self.cluster_secret:
             call_creds = client_call_credentials(self.cluster_secret)
             creds = grpc.composite_channel_credentials(chan_creds, call_creds)
@@ -192,7 +200,15 @@ class SlaveControlClient:
 class WorkerControlClient:
     """Master-side RPC client used to control a worker endpoint directly."""
 
-    def __init__(self, endpoint: str, cluster_secret: str = "", insecure: bool = False, tls_ca: str = "") -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        cluster_secret: str = "",
+        insecure: bool = False,
+        tls_ca: str = "",
+        tls_client_cert: str = "",
+        tls_client_key: str = "",
+    ) -> None:
         require_distributed()
         import grpc
 
@@ -200,12 +216,18 @@ class WorkerControlClient:
         self.cluster_secret = str(cluster_secret or "")
         self.insecure = bool(insecure)
         self.tls_ca = str(tls_ca or "")
+        self.tls_client_cert = str(tls_client_cert or "")
+        self.tls_client_key = str(tls_client_key or "")
         if not self.endpoint:
             raise ValueError("worker endpoint is empty")
         if self.insecure:
             ch = grpc.insecure_channel(self.endpoint)
         else:
-            chan_creds = load_tls_client_credentials(self.tls_ca)
+            chan_creds = load_tls_client_credentials(
+                self.tls_ca,
+                client_cert_path=self.tls_client_cert,
+                client_key_path=self.tls_client_key,
+            )
             if self.cluster_secret:
                 call_creds = client_call_credentials(self.cluster_secret)
                 creds = grpc.composite_channel_credentials(chan_creds, call_creds)

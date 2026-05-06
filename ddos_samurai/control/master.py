@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -47,6 +48,49 @@ def _chunk_counts(total_count: int, unit: int) -> list[int]:
         out.append(c)
         rem -= c
     return out
+
+
+def _apply_distributed_kpi_gate(snapshot: dict, job_args: dict) -> dict:
+    profile = str(job_args.get("kpi_gate_profile", "off") or "off").strip().lower()
+    hard_fail = bool(job_args.get("kpi_hard_fail", False))
+    if profile in {"", "off", "none", "disabled"}:
+        snapshot["kpi_gate_profile"] = "off"
+        snapshot["kpi_gate_status"] = "pass"
+        snapshot["kpi_gate_hard_fail"] = 0
+        return snapshot
+    try:
+        from .. import kpi_gate
+
+        gate = kpi_gate.evaluate(snapshot, profile=profile, hard_fail=hard_fail)
+        snapshot.update(gate.as_report_fields())
+    except Exception as exc:
+        snapshot["kpi_gate_profile"] = profile
+        snapshot["kpi_gate_status"] = "fail"
+        snapshot["kpi_gate_hard_fail"] = 1 if hard_fail else 0
+        snapshot["kpi_gate_error"] = str(exc)
+    return snapshot
+
+
+def _distributed_snapshot_to_prometheus(snapshot: dict, prefix: str = "samurai_distributed") -> str:
+    lines = []
+    num_fields = {
+        "workers",
+        "shards_reported",
+        "sent",
+        "errors",
+        "pending_shards_left",
+        "inflight_shards_left",
+    }
+    for key in num_fields:
+        try:
+            value = float(snapshot.get(key, 0) or 0)
+            lines.append(f"{prefix}_{key} {value}")
+        except (TypeError, ValueError):
+            continue
+    gate_status = str(snapshot.get("kpi_gate_status", "") or "").strip().lower()
+    if gate_status:
+        lines.append(f'{prefix}_kpi_gate_status{{status="{gate_status}"}} 1')
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def _run_single_job(server: MasterControlServer, job_args: dict, job_id: str) -> tuple[int, dict]:
@@ -103,6 +147,8 @@ def _run_single_job(server: MasterControlServer, job_args: dict, job_id: str) ->
                 cluster_secret=str(job_args.get("cluster_secret", "")),
                 insecure=bool(job_args.get("control_insecure", False)),
                 tls_ca=str(job_args.get("control_tls_ca", "")),
+                tls_client_cert=str(job_args.get("control_tls_client_cert", "")),
+                tls_client_key=str(job_args.get("control_tls_client_key", "")),
             )
             resp = wc.start_shard(
                 shard_id=sid,
@@ -129,6 +175,8 @@ def _run_single_job(server: MasterControlServer, job_args: dict, job_id: str) ->
                 cluster_secret=str(job_args.get("cluster_secret", "")),
                 insecure=bool(job_args.get("control_insecure", False)),
                 tls_ca=str(job_args.get("control_tls_ca", "")),
+                tls_client_cert=str(job_args.get("control_tls_client_cert", "")),
+                tls_client_key=str(job_args.get("control_tls_client_key", "")),
             )
             st = wc.get_worker_status(worker_id=worker_id)
             return (
@@ -253,6 +301,8 @@ def _run_single_job(server: MasterControlServer, job_args: dict, job_id: str) ->
                     cluster_secret=str(job_args.get("cluster_secret", "")),
                     insecure=bool(job_args.get("control_insecure", False)),
                     tls_ca=str(job_args.get("control_tls_ca", "")),
+                    tls_client_cert=str(job_args.get("control_tls_client_cert", "")),
+                    tls_client_key=str(job_args.get("control_tls_client_key", "")),
                 )
                 fut_map[pool.submit(wc.stop_shard, sid, True)] = sid
             for fut in as_completed(fut_map):
@@ -328,6 +378,8 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         insecure=bool(getattr(args, "control_insecure", False)),
         tls_cert=str(getattr(args, "control_tls_cert", "")),
         tls_key=str(getattr(args, "control_tls_key", "")),
+        tls_client_ca=str(getattr(args, "control_tls_client_ca", "")),
+        require_client_auth=bool(getattr(args, "control_require_client_auth", False)),
         max_workers=control_max_workers,
     )
     try:
@@ -352,13 +404,27 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     jobs = _parse_job_queue(args)
     multi_summary = []
     final_rc = 0
+    distributed_metrics_textfile = str(getattr(args, "distributed_metrics_textfile", "") or "").strip()
+    distributed_metrics_prefix = str(getattr(args, "distributed_metrics_prefix", "samurai_distributed") or "samurai_distributed").strip() or "samurai_distributed"
     for idx, job in enumerate(jobs, start=1):
         job_id = f"job-{int(time.time())}-{idx}"
         rc, snap = _run_single_job(server, job, job_id=job_id)
+        snap = _apply_distributed_kpi_gate(snap, job)
         multi_summary.append(snap)
         utils.log_info(f"Distributed master summary: {snap}")
+        if distributed_metrics_textfile:
+            try:
+                parent = os.path.dirname(distributed_metrics_textfile)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(distributed_metrics_textfile, "w", encoding="utf-8") as f:
+                    f.write(_distributed_snapshot_to_prometheus(snap, prefix=distributed_metrics_prefix))
+            except Exception as exc:
+                utils.log_warning(f"Distributed metrics export failed: {exc}")
         if rc != 0:
             final_rc = rc
+        if int(snap.get("kpi_gate_hard_fail", 0) or 0) == 1:
+            final_rc = 1
 
     if len(multi_summary) > 1:
         utils.log_info(f"Distributed master multi-job summary: jobs={len(multi_summary)} rc={final_rc}")

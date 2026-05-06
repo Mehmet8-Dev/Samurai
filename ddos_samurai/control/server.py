@@ -167,6 +167,8 @@ class MasterControlServer:
         insecure: bool = False,
         tls_cert: str = "",
         tls_key: str = "",
+        tls_client_ca: str = "",
+        require_client_auth: bool = False,
         max_workers: int = 16,
     ) -> None:
         require_distributed()
@@ -175,6 +177,8 @@ class MasterControlServer:
         self.insecure = bool(insecure)
         self.tls_cert = str(tls_cert or "")
         self.tls_key = str(tls_key or "")
+        self.tls_client_ca = str(tls_client_ca or "")
+        self.require_client_auth = bool(require_client_auth)
         self.max_workers = max(4, int(max_workers or 16))
         self.running = False
         self._server = None
@@ -218,7 +222,12 @@ class MasterControlServer:
         if self.insecure:
             self._server.add_insecure_port(self.listen_addr)
         else:
-            creds = load_tls_server_credentials(self.tls_cert, self.tls_key)
+            creds = load_tls_server_credentials(
+                self.tls_cert,
+                self.tls_key,
+                client_ca_path=self.tls_client_ca,
+                require_client_auth=self.require_client_auth,
+            )
             self._server.add_secure_port(self.listen_addr, creds)
         self._server.start()
         self.running = True

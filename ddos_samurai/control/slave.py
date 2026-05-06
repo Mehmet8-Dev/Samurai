@@ -114,6 +114,8 @@ def run_distributed_slave(args, parser) -> int:
         cluster_secret=str(getattr(args, "cluster_secret", "")),
         insecure=bool(getattr(args, "control_insecure", False)),
         tls_ca=str(getattr(args, "control_tls_ca", "")),
+        tls_client_cert=str(getattr(args, "control_tls_client_cert", "")),
+        tls_client_key=str(getattr(args, "control_tls_client_key", "")),
     )
     capabilities = {
         "gpu_available": "unknown",

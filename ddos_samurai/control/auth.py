@@ -23,24 +23,52 @@ def validate_cluster_secret(expected: str, provided: Optional[str]) -> bool:
     return exp == got
 
 
-def load_tls_server_credentials(cert_path: str, key_path: str):
+def load_tls_server_credentials(
+    cert_path: str,
+    key_path: str,
+    *,
+    client_ca_path: str = "",
+    require_client_auth: bool = False,
+):
     import grpc
 
     with open(cert_path, "rb") as cert_file:
         cert = cert_file.read()
     with open(key_path, "rb") as key_file:
         key = key_file.read()
-    return grpc.ssl_server_credentials([(key, cert)])
+    root_certs = None
+    if str(client_ca_path or "").strip():
+        with open(client_ca_path, "rb") as ca_file:
+            root_certs = ca_file.read()
+    return grpc.ssl_server_credentials(
+        [(key, cert)],
+        root_certificates=root_certs,
+        require_client_auth=bool(require_client_auth),
+    )
 
 
-def load_tls_client_credentials(ca_path: str):
+def load_tls_client_credentials(ca_path: str, *, client_cert_path: str = "", client_key_path: str = ""):
     import grpc
 
+    cert_chain = None
+    private_key = None
+    if str(client_cert_path or "").strip() and str(client_key_path or "").strip():
+        with open(client_cert_path, "rb") as cert_file:
+            cert_chain = cert_file.read()
+        with open(client_key_path, "rb") as key_file:
+            private_key = key_file.read()
     if not str(ca_path or "").strip():
-        return grpc.ssl_channel_credentials()
+        return grpc.ssl_channel_credentials(
+            private_key=private_key,
+            certificate_chain=cert_chain,
+        )
     with open(ca_path, "rb") as ca_file:
         ca = ca_file.read()
-    return grpc.ssl_channel_credentials(root_certificates=ca)
+    return grpc.ssl_channel_credentials(
+        root_certificates=ca,
+        private_key=private_key,
+        certificate_chain=cert_chain,
+    )
 
 
 def ensure_tls_files_exist(*paths: str) -> None:
