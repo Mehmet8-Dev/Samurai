@@ -160,3 +160,39 @@ def test_integration_worker_control_get_status_insecure():
         assert int(status["last_heartbeat_ms"]) > 0
     finally:
         server.stop(0.0)
+
+
+def test_integration_report_stats_stream_insecure():
+    _grpc_or_skip()
+    server = MasterControlServer("127.0.0.1:55108", insecure=True)
+    server.start()
+    try:
+        client = SlaveControlClient("127.0.0.1:55108", insecure=True)
+        reg = client.register_worker("w-stream-1", "w-stream-1", {"xdp": "1"})
+        assert reg["accepted"] is True
+
+        streamer = client.create_stats_streamer()
+        ok1 = streamer["send"](
+            "w-stream-1",
+            "s-stream-1",
+            {"worker_id": "w-stream-1", "shard_id": "s-stream-1", "sent": 3, "errors": 0, "status": "running"},
+            int(time.time() * 1000),
+        )
+        ok2 = streamer["send"](
+            "w-stream-1",
+            "s-stream-1",
+            {"worker_id": "w-stream-1", "shard_id": "s-stream-1", "sent": 7, "errors": 0, "status": "done"},
+            int(time.time() * 1000),
+        )
+        assert ok1 is True and ok2 is True
+        streamer["close"]()
+
+        deadline = time.time() + 2.0
+        while time.time() < deadline and "s-stream-1" not in server.servicer.shard_stats:
+            time.sleep(0.05)
+        assert "s-stream-1" in server.servicer.shard_stats
+        payload = json.loads(bytes(server.servicer.shard_stats["s-stream-1"]).decode("utf-8"))
+        assert int(payload.get("sent", 0) or 0) == 7
+        assert str(payload.get("status", "")) == "done"
+    finally:
+        server.stop(0.0)
