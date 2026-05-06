@@ -346,13 +346,27 @@ def test_integration_report_stats_stream_insecure():
         ok1 = streamer["send"](
             "w-stream-1",
             "s-stream-1",
-            {"worker_id": "w-stream-1", "shard_id": "s-stream-1", "sent": 3, "errors": 0, "status": "running"},
+            {
+                "worker_id": "w-stream-1",
+                "shard_id": "s-stream-1",
+                "sent": 3,
+                "errors": 0,
+                "status": "running",
+                "leader_epoch": 4,
+            },
             int(time.time() * 1000),
         )
         ok2 = streamer["send"](
             "w-stream-1",
             "s-stream-1",
-            {"worker_id": "w-stream-1", "shard_id": "s-stream-1", "sent": 7, "errors": 0, "status": "done"},
+            {
+                "worker_id": "w-stream-1",
+                "shard_id": "s-stream-1",
+                "sent": 7,
+                "errors": 0,
+                "status": "done",
+                "leader_epoch": 4,
+            },
             int(time.time() * 1000),
         )
         assert ok1 is True and ok2 is True
@@ -365,7 +379,83 @@ def test_integration_report_stats_stream_insecure():
         payload = json.loads(bytes(server.servicer.shard_stats["s-stream-1"]).decode("utf-8"))
         assert int(payload.get("sent", 0) or 0) == 7
         assert str(payload.get("status", "")) == "done"
+        assert int(payload.get("leader_epoch", 0) or 0) == 4
     finally:
+        server.stop(0.0)
+
+
+def test_integration_worker_rejects_stale_leader_epoch():
+    _grpc_or_skip()
+    import multiprocessing
+    import socket as _socket
+    from ddos_samurai.control.slave import run_distributed_slave
+
+    def _free_port():
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+
+    master_port = _free_port()
+    worker_port = _free_port()
+    server = MasterControlServer(f"127.0.0.1:{master_port}", insecure=True)
+    server.start()
+    proc = None
+    try:
+        args = type(
+            "Args",
+            (),
+            {
+                "control_endpoints": f"127.0.0.1:{master_port}",
+                "control_discovery_k8s": False,
+                "control_k8s_namespace": "default",
+                "control_k8s_selector": "",
+                "control_k8s_port": 5099,
+                "cluster_secret": "",
+                "control_insecure": True,
+                "control_tls_ca": "",
+                "control_tls_client_cert": "",
+                "control_tls_client_key": "",
+                "control_listen": f"127.0.0.1:{worker_port}",
+                "heartbeat_interval_ms": 2000,
+                "slave_master_timeout_s": 10,
+                "job_timeout_s": 8,
+                "distributed_shard_json": "",
+                "stats_stream_enable": False,
+                "stats_stream_interval_ms": 500,
+            },
+        )()
+        proc = multiprocessing.Process(target=run_distributed_slave, args=(args, None), daemon=True)
+        proc.start()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not server.servicer.workers:
+            time.sleep(0.1)
+        assert server.servicer.workers
+
+        wc = WorkerControlClient(f"127.0.0.1:{worker_port}", insecure=True)
+        first = wc.start_shard(
+            shard_id="s-epoch-1",
+            job_id="j-epoch-1",
+            args_json=json.dumps({"_leader_epoch": 2, "count": 1}).encode("utf-8"),
+            packet_count=1,
+            timeout_ms=2000,
+        )
+        assert "started" in first
+
+        second = wc.start_shard(
+            shard_id="s-epoch-2",
+            job_id="j-epoch-2",
+            args_json=json.dumps({"_leader_epoch": 1, "count": 1}).encode("utf-8"),
+            packet_count=1,
+            timeout_ms=2000,
+        )
+        assert bool(second.get("started", False)) is False
+        assert "stale leader epoch" in str(second.get("error", "")).lower()
+    finally:
+        if proc is not None:
+            proc.terminate()
+            proc.join(timeout=3)
         server.stop(0.0)
 
 

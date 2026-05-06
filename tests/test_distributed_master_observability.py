@@ -83,6 +83,7 @@ def test_distributed_state_to_prometheus_includes_worker_shard_and_ha_metrics():
     assert 'samurai_distributed_worker_state{worker_id="w-1",state="running"} 1' in text
     assert 'samurai_distributed_shard_stats_size_bytes{shard_id="s-1"} 96.0' in text
     assert 'samurai_distributed_ha_is_leader{mode="static"} 1.0' in text
+    assert 'samurai_distributed_ha_leader_epoch{mode="static"} 0.0' in text
 
 
 def test_apply_per_shard_kpi_gate_flags_exitcode_and_error_rate():

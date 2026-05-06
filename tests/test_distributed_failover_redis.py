@@ -57,6 +57,8 @@ def test_failover_takeover_and_controlled_abort_path():
         )
         assert int(rc) == 1
         assert str(snap.get("error", "")) == "leadership_lost_abort"
+        assert int(snap.get("leader_epoch", 0) or 0) == 0
+        assert str((snap.get("abort_events") or [{}])[0].get("reason", "")) == "leadership_lost_abort"
         e2.stop()
     finally:
         proc.terminate()

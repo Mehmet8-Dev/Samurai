@@ -7,6 +7,7 @@ def test_telemetry_aggregate_kpis_and_ids():
         {
             "worker_id": "w1",
             "shard_id": "s1",
+            "leader_epoch": 2,
             "sent": 5,
             "errors": 1,
             "progress": 3,
@@ -18,6 +19,7 @@ def test_telemetry_aggregate_kpis_and_ids():
         {
             "worker_id": "w2",
             "shard_id": "s2",
+            "leader_epoch": 3,
             "sent": 7,
             "errors": 2,
             "progress": 4,
@@ -37,4 +39,5 @@ def test_telemetry_aggregate_kpis_and_ids():
     assert int(snap["numeric_totals"]["wire_tx_packets_delta"]) == 24
     assert len(snap["per_shard"]) == 2
     assert snap["top_error_shards"][0]["shard_id"] == "s2"
+    assert int(snap["top_error_shards"][0]["leader_epoch_max"]) == 3
     assert snap["worker_rollup"][0]["worker_id"] == "w2"
