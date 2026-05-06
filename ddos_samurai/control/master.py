@@ -233,6 +233,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         "errors": int(agg.get("errors", 0) or 0),
         "worker_ids": list(agg.get("worker_ids", [])),
         "shard_ids": list(agg.get("shard_ids", [])),
+        "numeric_totals": dict(agg.get("numeric_totals", {})),
     }
     utils.log_info(f"Distributed master summary: {snapshot}")
     server.stop(0.0)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import socket
+import threading
 import time
 from concurrent import futures
 
@@ -45,6 +46,57 @@ def _execute_shard_locally(shard_args_dict: dict, shard_id: str) -> dict:
         "errors": int(errors_total.value),
         "events": list(events),
     }
+
+
+def _start_shard_runtime(shard_args_dict: dict, shard_id: str) -> dict:
+    progress = multiprocessing.Value("L", 0)
+    sent_total = multiprocessing.Value("L", 0)
+    errors_total = multiprocessing.Value("L", 0)
+    lock = multiprocessing.Lock()
+    manager = multiprocessing.Manager()
+    events = manager.list()
+    resources = manager.dict()
+    tls_profile = str(shard_args_dict.get("tls_profile", "none") or "none")
+    started = time.time()
+    proc = multiprocessing.Process(
+        target=orchestrator.start_worker,
+        args=(1, dict(shard_args_dict), progress, lock, tls_profile, events, sent_total, errors_total, resources),
+        name=f"ShardWorker-{shard_id}",
+    )
+    proc.start()
+    return {
+        "proc": proc,
+        "progress": progress,
+        "sent_total": sent_total,
+        "errors_total": errors_total,
+        "events": events,
+        "manager": manager,
+        "started_ts": float(started),
+    }
+
+
+def _finalize_shard_runtime(runtime: dict, worker_id: str, shard_id: str) -> dict:
+    proc = runtime.get("proc")
+    started = float(runtime.get("started_ts", time.time()) or time.time())
+    exitcode = int(getattr(proc, "exitcode", 1) or 1)
+    stats = {
+        "worker_id": str(worker_id),
+        "shard_id": str(shard_id),
+        "status": "ok" if exitcode == 0 else "error",
+        "exitcode": exitcode,
+        "duration_s": max(0.0, float(time.time() - started)),
+        "progress": int(getattr(runtime.get("progress"), "value", 0) or 0),
+        "sent": int(getattr(runtime.get("sent_total"), "value", 0) or 0),
+        "errors": int(getattr(runtime.get("errors_total"), "value", 0) or 0),
+        "events": list(runtime.get("events") or []),
+    }
+    mgr = runtime.get("manager")
+    if mgr is not None:
+        try:
+            mgr.shutdown()
+        except Exception:
+            pass
+    return stats
 
 
 def run_distributed_slave(args, parser) -> int:
@@ -92,6 +144,78 @@ def run_distributed_slave(args, parser) -> int:
         import grpc
 
         pb2, pb2_grpc = load_generated()
+        shard_lock = threading.Lock()
+        shard_runs: dict[str, dict] = {}
+        shard_status: dict[str, dict] = {}
+        worker_state = {"state": "idle", "active_shard_id": ""}
+
+        def _active_count_locked() -> int:
+            return sum(1 for rec in shard_runs.values() if bool(rec.get("running", False)))
+
+        def _refresh_worker_state_locked() -> None:
+            active = [sid for sid, rec in shard_runs.items() if bool(rec.get("running", False))]
+            if active:
+                worker_state["state"] = "running"
+                worker_state["active_shard_id"] = str(active[0])
+                return
+            latest = None
+            latest_ts = 0.0
+            for sid, rec in shard_status.items():
+                ts = float(rec.get("updated_ts", 0.0) or 0.0)
+                if ts >= latest_ts:
+                    latest_ts = ts
+                    latest = (sid, rec)
+            if latest is None:
+                worker_state["state"] = "idle"
+                worker_state["active_shard_id"] = ""
+                return
+            _, rec = latest
+            worker_state["state"] = str(rec.get("state", "idle") or "idle")
+            worker_state["active_shard_id"] = str(rec.get("active_shard_id", "") or "")
+
+        def _monitor_runtime(shard_id: str) -> None:
+            with shard_lock:
+                rec = dict(shard_runs.get(shard_id) or {})
+            runtime = dict(rec.get("runtime") or {})
+            runtime_id = int(rec.get("runtime_id", 0) or 0)
+            proc = runtime.get("proc")
+            if proc is None:
+                with shard_lock:
+                    shard_status[shard_id] = {
+                        "state": "error",
+                        "active_shard_id": "",
+                        "updated_ts": time.time(),
+                        "stats_json": b"{}",
+                    }
+                    _refresh_worker_state_locked()
+                return
+            proc.join()
+            with shard_lock:
+                latest = dict(shard_runs.get(shard_id) or {})
+                if not latest:
+                    return
+                if int(latest.get("runtime_id", 0) or 0) != runtime_id:
+                    return
+            stats = _finalize_shard_runtime(runtime, worker_id=worker_id, shard_id=shard_id)
+            try:
+                client.report_stats(
+                    worker_id=worker_id,
+                    shard_id=str(shard_id),
+                    stats=stats,
+                    timestamp_ms=int(time.time() * 1000),
+                )
+            except Exception:
+                pass
+            payload = json.dumps(stats, ensure_ascii=True).encode("utf-8")
+            with shard_lock:
+                shard_runs.pop(shard_id, None)
+                shard_status[shard_id] = {
+                    "state": "done" if int(stats.get("exitcode", 1) or 1) == 0 else "error",
+                    "active_shard_id": "",
+                    "updated_ts": time.time(),
+                    "stats_json": payload,
+                }
+                _refresh_worker_state_locked()
 
         class _WorkerServicer(pb2_grpc.SamuraiControlServicer):
             def StartShard(self, request, context):
@@ -100,22 +224,112 @@ def run_distributed_slave(args, parser) -> int:
                     shard_args = json.loads(bytes(request.args_json or b"{}").decode("utf-8"))
                 except (ValueError, TypeError, UnicodeDecodeError):
                     return pb2.StartShardResponse(started=False, error="invalid args_json")
-                stats = _execute_shard_locally(shard_args, str(request.shard_id))
+                sid = str(request.shard_id)
+                with shard_lock:
+                    existing = dict(shard_runs.get(sid) or {})
+                    if bool(existing.get("running", False)):
+                        return pb2.StartShardResponse(started=False, error="shard already running")
+                    try:
+                        runtime = _start_shard_runtime(shard_args, sid)
+                    except Exception as exc:
+                        shard_status[sid] = {
+                            "state": "error",
+                            "active_shard_id": "",
+                            "updated_ts": time.time(),
+                            "stats_json": b"{}",
+                        }
+                        _refresh_worker_state_locked()
+                        return pb2.StartShardResponse(started=False, error=f"start failed: {exc}")
+                    shard_runs[sid] = {
+                        "runtime": runtime,
+                        "runtime_id": int(time.time_ns()),
+                        "running": True,
+                        "job_id": str(request.job_id or ""),
+                    }
+                    shard_status[sid] = {
+                        "state": "queued" if _active_count_locked() > 1 else "running",
+                        "active_shard_id": sid,
+                        "updated_ts": time.time(),
+                        "stats_json": b"{}",
+                    }
+                    _refresh_worker_state_locked()
+                t = threading.Thread(target=_monitor_runtime, args=(sid,), daemon=True, name=f"ShardMonitor-{sid}")
+                t.start()
+                with shard_lock:
+                    cur = dict(shard_status.get(sid) or {})
+                    if cur.get("state") == "queued":
+                        cur["state"] = "running"
+                        cur["updated_ts"] = time.time()
+                        shard_status[sid] = cur
+                        _refresh_worker_state_locked()
+                return pb2.StartShardResponse(started=True, error="")
+
+            def StopShard(self, request, context):
+                _ = context
+                sid = str(request.shard_id)
+                with shard_lock:
+                    rec = dict(shard_runs.pop(sid, {}) or {})
+                runtime = dict(rec.get("runtime") or {})
+                proc = runtime.get("proc")
+                if proc is None or not bool(rec.get("running", False)):
+                    return pb2.StopShardResponse(stopped=False)
+                try:
+                    if proc.is_alive():
+                        proc.terminate()
+                    proc.join(timeout=3.0)
+                except Exception:
+                    return pb2.StopShardResponse(stopped=False)
+                stats = _finalize_shard_runtime(runtime, worker_id=worker_id, shard_id=sid)
+                stats["status"] = "stopped"
                 try:
                     client.report_stats(
                         worker_id=worker_id,
-                        shard_id=str(request.shard_id),
+                        shard_id=sid,
                         stats=stats,
                         timestamp_ms=int(time.time() * 1000),
                     )
                 except Exception:
                     pass
-                return pb2.StartShardResponse(started=(int(stats.get("exitcode", 1) or 1) == 0), error="")
-
-            def StopShard(self, request, context):
-                _ = request
-                _ = context
+                with shard_lock:
+                    shard_status[sid] = {
+                        "state": "error",
+                        "active_shard_id": "",
+                        "updated_ts": time.time(),
+                        "stats_json": json.dumps(stats, ensure_ascii=True).encode("utf-8"),
+                    }
+                    _refresh_worker_state_locked()
                 return pb2.StopShardResponse(stopped=True)
+
+            def GetWorkerStatus(self, request, context):
+                _ = context
+                wid = str(request.worker_id or "")
+                if wid and wid != worker_id:
+                    return pb2.GetWorkerStatusResponse(
+                        worker_id=wid,
+                        state="disconnected",
+                        active_shard_id="",
+                        stats_json=b"{}",
+                        last_heartbeat_ms=0,
+                    )
+                with shard_lock:
+                    state = str(worker_state.get("state", "idle") or "idle")
+                    active_sid = str(worker_state.get("active_shard_id", "") or "")
+                    stats_json = b"{}"
+                    if active_sid:
+                        stats_json = bytes((shard_status.get(active_sid) or {}).get("stats_json", b"{}"))
+                    elif shard_status:
+                        latest_sid = max(
+                            shard_status.keys(),
+                            key=lambda sid: float((shard_status.get(sid) or {}).get("updated_ts", 0.0) or 0.0),
+                        )
+                        stats_json = bytes((shard_status.get(latest_sid) or {}).get("stats_json", b"{}"))
+                return pb2.GetWorkerStatusResponse(
+                    worker_id=worker_id,
+                    state=state,
+                    active_shard_id=active_sid,
+                    stats_json=stats_json,
+                    last_heartbeat_ms=int(time.time() * 1000),
+                )
 
         grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
         pb2_grpc.add_SamuraiControlServicer_to_server(_WorkerServicer(), grpc_server)

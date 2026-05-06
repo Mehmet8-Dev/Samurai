@@ -173,3 +173,22 @@ class WorkerControlClient:
                 f"E_RPC_STOPSHARD endpoint={self.endpoint} code={code} details={details}"
             ) from exc
         return bool(resp.stopped)
+
+    def get_worker_status(self, worker_id: str) -> dict:
+        req = self._pb2.GetWorkerStatusRequest(worker_id=str(worker_id))
+        md = build_cluster_metadata(self.cluster_secret)
+        try:
+            resp = self._stub.GetWorkerStatus(req, timeout=3.0, metadata=md)
+        except self._grpc.RpcError as exc:
+            code = str(exc.code().name if hasattr(exc, "code") else "RPC_ERROR")
+            details = str(exc.details() if hasattr(exc, "details") else str(exc))
+            raise RuntimeError(
+                f"E_RPC_GETWORKERSTATUS endpoint={self.endpoint} code={code} details={details}"
+            ) from exc
+        return {
+            "worker_id": str(resp.worker_id or ""),
+            "state": str(resp.state or ""),
+            "active_shard_id": str(resp.active_shard_id or ""),
+            "stats_json": bytes(resp.stats_json or b"{}"),
+            "last_heartbeat_ms": int(resp.last_heartbeat_ms or 0),
+        }

@@ -39,13 +39,14 @@ class _SecretServerInterceptor:
 class _SamuraiServicer:
     def __init__(self, cluster_id: str = "cluster-v1") -> None:
         self.cluster_id = cluster_id
-        self.lock = threading.Lock()
+        self._workers_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
         self.workers = {}
         self.shard_stats = {}
 
     def RegisterWorker(self, request, context):
         _ = context
-        with self.lock:
+        with self._workers_lock:
             self.workers[str(request.worker_id)] = {
                 "worker_id": str(request.worker_id),
                 "hostname": str(request.hostname),
@@ -60,7 +61,7 @@ class _SamuraiServicer:
 
     def Heartbeat(self, request, context):
         _ = context
-        with self.lock:
+        with self._workers_lock:
             wid = str(request.worker_id)
             if wid in self.workers:
                 self.workers[wid]["last_heartbeat_ms"] = int(time.time() * 1000)
@@ -75,7 +76,7 @@ class _SamuraiServicer:
             wid = str(payload.get("_worker_id", "") or "")
         except (ValueError, TypeError, UnicodeDecodeError):
             pass
-        with self.lock:
+        with self._workers_lock:
             if wid and wid in self.workers:
                 self.workers[wid]["state"] = "running"
                 self.workers[wid]["active_shard_id"] = str(request.shard_id)
@@ -85,7 +86,7 @@ class _SamuraiServicer:
     def StopShard(self, request, context):
         _ = context
         sid = str(request.shard_id)
-        with self.lock:
+        with self._workers_lock:
             for rec in self.workers.values():
                 if str(rec.get("active_shard_id", "")) == sid:
                     rec["state"] = "idle"
@@ -95,8 +96,9 @@ class _SamuraiServicer:
 
     def ReportStats(self, request, context):
         _ = context
-        with self.lock:
+        with self._stats_lock:
             self.shard_stats[str(request.shard_id)] = bytes(request.stats_json or b"{}")
+        with self._workers_lock:
             wid = str(request.worker_id)
             if wid in self.workers:
                 self.workers[wid]["stats_json"] = bytes(request.stats_json or b"{}")
@@ -106,7 +108,7 @@ class _SamuraiServicer:
     def AbortJob(self, request, context):
         _ = context
         _ = request
-        with self.lock:
+        with self._workers_lock:
             n = len(self.workers)
             for rec in self.workers.values():
                 rec["state"] = "idle"
@@ -117,7 +119,7 @@ class _SamuraiServicer:
     def GetWorkerStatus(self, request, context):
         _ = context
         wid = str(request.worker_id)
-        with self.lock:
+        with self._workers_lock:
             rec = dict(self.workers.get(wid) or {})
         pb2, _ = load_generated()
         if not rec:
@@ -139,7 +141,7 @@ class _SamuraiServicer:
     def ForceSync(self, request, context):
         _ = context
         wid = str(request.worker_id)
-        with self.lock:
+        with self._workers_lock:
             rec = dict(self.workers.get(wid) or {})
         pb2, _ = load_generated()
         return pb2.ForceSyncResponse(
