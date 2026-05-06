@@ -262,6 +262,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Distributed Prometheus metric isim prefix'i.",
     )
     distributed_group.add_argument(
+        "--management-api-enable",
+        action="store_true",
+        help="Master uzerinde runtime management REST API'yi ac.",
+    )
+    distributed_group.add_argument(
+        "--management-api-listen",
+        type=str,
+        default="127.0.0.1:8089",
+        help="Management API listen adresi (host:port).",
+    )
+    distributed_group.add_argument(
+        "--management-api-auth-token",
+        type=str,
+        default="",
+        help="Management API Bearer token (bos ise auth kapali).",
+    )
+    distributed_group.add_argument(
+        "--ha-enable",
+        action="store_true",
+        help="Master için HA leader election iskeletini etkinleştir.",
+    )
+    distributed_group.add_argument(
+        "--ha-node-id",
+        type=str,
+        default="",
+        help="HA node kimliği (boş ise hostname kullanılır).",
+    )
+    distributed_group.add_argument(
+        "--ha-peer-nodes",
+        type=str,
+        default="",
+        help="HA peer node id listesi (CSV). Static modda leader seçimi için kullanılır.",
+    )
+    distributed_group.add_argument(
         "--job-timeout-s",
         type=int,
         default=0,

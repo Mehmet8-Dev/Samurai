@@ -10,6 +10,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .. import utils
 from .client import WorkerControlClient
 from .discovery import EndpointDiscovery
+from .ha import StaticLeaderElector
+from .management_api import ManagementAPIServer, create_management_app
+from .proto import load_generated
 from .server import MasterControlServer
 from .telemetry import DistributedAggregator
 
@@ -356,6 +359,17 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     _ = report_ctx
     _ = runtime_ctx
     stop_grace_s = max(0.0, float(getattr(args, "control_stop_grace_s", 1.0) or 0.0))
+    ha_enabled = bool(getattr(args, "ha_enable", False))
+    ha_node_id = str(getattr(args, "ha_node_id", "") or "").strip()
+    ha_peers = str(getattr(args, "ha_peer_nodes", "") or "").strip()
+    ha_elector = StaticLeaderElector(node_id=ha_node_id, peers_csv=ha_peers) if ha_enabled else None
+    ha_state = dict(ha_elector.snapshot()) if ha_elector is not None else {"mode": "off", "is_leader": 1}
+    if ha_elector is not None and not ha_elector.is_leader():
+        utils.log_warning(
+            f"HA static mode: this node is follower (node_id={ha_state.get('node_id')} "
+            f"leader_id={ha_state.get('leader_id')}). Skipping master run."
+        )
+        return 0
 
     discovery = EndpointDiscovery(
         manual_endpoints=str(getattr(args, "control_endpoints", "")),
@@ -382,6 +396,45 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         require_client_auth=bool(getattr(args, "control_require_client_auth", False)),
         max_workers=control_max_workers,
     )
+    mgmt_server = None
+    latest_snapshot: dict = {}
+    current_job: dict = {"state": "idle", "job_id": ""}
+
+    def _state_provider() -> dict:
+        workers = []
+        with server.servicer._workers_lock:
+            for wid, rec in dict(server.servicer.workers).items():
+                workers.append(
+                    {
+                        "worker_id": str(wid),
+                        "state": str(rec.get("state", "")),
+                        "active_shard_id": str(rec.get("active_shard_id", "")),
+                        "last_heartbeat_ms": int(rec.get("last_heartbeat_ms", 0) or 0),
+                    }
+                )
+        shards = []
+        with server.servicer._stats_lock:
+            for sid, blob in dict(server.servicer.shard_stats).items():
+                shards.append(
+                    {
+                        "shard_id": str(sid),
+                        "stats_size_bytes": len(bytes(blob or b"")),
+                    }
+                )
+        return {
+            "workers": workers,
+            "workers_count": len(workers),
+            "shards": shards,
+            "shards_reported_count": len(shards),
+            "latest_snapshot": dict(latest_snapshot),
+            "current_job": dict(current_job),
+            "ha": dict(ha_state),
+        }
+
+    def _abort_callback() -> dict:
+        pb2, _ = load_generated()
+        resp = server.servicer.AbortJob(pb2.AbortJobRequest(job_id=str(current_job.get("job_id", ""))), context=None)
+        return {"aborted": bool(resp.aborted), "workers_notified": int(resp.workers_notified or 0)}
     try:
         server.start()
     except Exception as exc:
@@ -391,6 +444,24 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         f"Distributed master started on {server.listen_addr}. "
         f"grpc_max_workers={int(control_max_workers)}"
     )
+    if bool(getattr(args, "management_api_enable", False)):
+        mgmt_app = create_management_app(
+            state_provider=_state_provider,
+            abort_callback=_abort_callback,
+            metrics_provider=lambda: _distributed_snapshot_to_prometheus(
+                dict(latest_snapshot),
+                prefix=str(getattr(args, "distributed_metrics_prefix", "samurai_distributed") or "samurai_distributed"),
+            )
+            if latest_snapshot
+            else "",
+            auth_token=str(getattr(args, "management_api_auth_token", "")),
+        )
+        mgmt_server = ManagementAPIServer(
+            listen_addr=str(getattr(args, "management_api_listen", "127.0.0.1:8089")),
+            app=mgmt_app,
+        )
+        mgmt_server.start()
+        utils.log_info(f"Management API started on {str(getattr(args, 'management_api_listen', '127.0.0.1:8089'))}")
 
     wait_workers_s = max(1, int(getattr(args, "worker_registration_timeout_s", 30) or 30))
     worker_deadline = time.time() + float(wait_workers_s)
@@ -398,6 +469,8 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         time.sleep(0.5)
     if not server.servicer.workers:
         utils.log_warning("No slave registered; master exits without dispatch.")
+        if mgmt_server is not None:
+            mgmt_server.stop()
         server.stop(stop_grace_s)
         return 1
 
@@ -408,8 +481,12 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     distributed_metrics_prefix = str(getattr(args, "distributed_metrics_prefix", "samurai_distributed") or "samurai_distributed").strip() or "samurai_distributed"
     for idx, job in enumerate(jobs, start=1):
         job_id = f"job-{int(time.time())}-{idx}"
+        current_job["state"] = "running"
+        current_job["job_id"] = job_id
         rc, snap = _run_single_job(server, job, job_id=job_id)
         snap = _apply_distributed_kpi_gate(snap, job)
+        latest_snapshot.clear()
+        latest_snapshot.update(dict(snap))
         multi_summary.append(snap)
         utils.log_info(f"Distributed master summary: {snap}")
         if distributed_metrics_textfile:
@@ -425,9 +502,12 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             final_rc = rc
         if int(snap.get("kpi_gate_hard_fail", 0) or 0) == 1:
             final_rc = 1
+        current_job["state"] = "done" if int(rc) == 0 else "error"
 
     if len(multi_summary) > 1:
         utils.log_info(f"Distributed master multi-job summary: jobs={len(multi_summary)} rc={final_rc}")
 
+    if mgmt_server is not None:
+        mgmt_server.stop()
     server.stop(stop_grace_s)
     return int(final_rc)

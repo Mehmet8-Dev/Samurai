@@ -30,6 +30,23 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
             parser.error("Hata: --role master için --control-listen zorunludur.")
         if ":" not in listen:
             parser.error("Hata: --control-listen formatı host:port olmalıdır.")
+        mgmt_listen = str(getattr(args, "management_api_listen", "127.0.0.1:8089") or "127.0.0.1:8089").strip()
+        if bool(getattr(args, "management_api_enable", False)):
+            if ":" not in mgmt_listen:
+                parser.error("Hata: --management-api-listen formatı host:port olmalıdır.")
+            try:
+                _, p = mgmt_listen.rsplit(":", 1)
+                p_int = int(p)
+                if p_int <= 0 or p_int > 65535:
+                    raise ValueError("invalid port")
+            except Exception:
+                parser.error("Hata: --management-api-listen portu 1..65535 aralığında olmalıdır.")
+        if bool(getattr(args, "ha_enable", False)):
+            node_id = str(getattr(args, "ha_node_id", "") or "").strip()
+            if "," in node_id:
+                parser.error("Hata: --ha-node-id tek değer olmalıdır (CSV değil).")
+    elif bool(getattr(args, "ha_enable", False)):
+        parser.error("Hata: --ha-enable yalnızca --role master ile kullanılabilir.")
     elif role == "slave":
         endpoints = str(getattr(args, "control_endpoints", "") or "").strip()
         if not endpoints:
