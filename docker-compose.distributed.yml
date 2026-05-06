@@ -1,0 +1,56 @@
+services:
+  master:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: samurai-master
+    command:
+      - --role
+      - master
+      - --control-insecure
+      - --control-listen
+      - 0.0.0.0:5099
+      - --worker-registration-timeout-s
+      - "30"
+      - --job-timeout-s
+      - "120"
+      - --target
+      - 127.0.0.1
+      - --port
+      - "80"
+      - --protocol
+      - tcp
+      - --count
+      - "100000"
+      - --confirm
+    ports:
+      - "5099:5099"
+    networks:
+      - samurai-net
+
+  slave:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - --role
+      - slave
+      - --control-insecure
+      - --control-endpoints
+      - master:5099
+      - --control-listen
+      - 0.0.0.0:5099
+      - --heartbeat-interval-ms
+      - "2000"
+      - --slave-master-timeout-s
+      - "30"
+    depends_on:
+      - master
+    networks:
+      - samurai-net
+    deploy:
+      replicas: 2
+
+networks:
+  samurai-net:
+    driver: bridge

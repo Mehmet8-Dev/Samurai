@@ -196,3 +196,27 @@ def test_integration_report_stats_stream_insecure():
         assert str(payload.get("status", "")) == "done"
     finally:
         server.stop(0.0)
+
+
+def test_integration_grpc_health_serving_insecure():
+    _grpc_or_skip()
+    health_pb2 = pytest.importorskip("grpc_health.v1.health_pb2")
+    health_pb2_grpc = pytest.importorskip("grpc_health.v1.health_pb2_grpc")
+    grpc = pytest.importorskip("grpc")
+
+    server = MasterControlServer("127.0.0.1:55109", insecure=True)
+    server.start()
+    try:
+        ch = grpc.insecure_channel("127.0.0.1:55109")
+        stub = health_pb2_grpc.HealthStub(ch)
+
+        r1 = stub.Check(health_pb2.HealthCheckRequest(service=""), timeout=3.0)
+        assert int(r1.status) == int(health_pb2.HealthCheckResponse.SERVING)
+
+        r2 = stub.Check(
+            health_pb2.HealthCheckRequest(service="samurai.control.v1.SamuraiControl"),
+            timeout=3.0,
+        )
+        assert int(r2.status) == int(health_pb2.HealthCheckResponse.SERVING)
+    finally:
+        server.stop(0.0)

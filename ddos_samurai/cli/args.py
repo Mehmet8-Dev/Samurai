@@ -233,6 +233,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dağıtık job max süresi (0=sınırsız).",
     )
     distributed_group.add_argument(
+        "--job-queue-json",
+        type=str,
+        default="",
+        help="Master icin coklu job kuyrugu (JSON list/dict). Ornek: "
+             '\'[{\"count\":1000},{\"count\":2000,\"job_timeout_s\":30}]\'',
+    )
+    distributed_group.add_argument(
+        "--shard-unit-count",
+        type=int,
+        default=0,
+        help="Dynamic rebalance icin micro-shard paket boyutu (0=otomatik).",
+    )
+    distributed_group.add_argument(
         "--shard-strategy",
         choices=["equal", "capability"],
         default="equal",

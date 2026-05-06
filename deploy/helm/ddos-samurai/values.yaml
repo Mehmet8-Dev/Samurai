@@ -1,0 +1,49 @@
+image:
+  repository: ddos-samurai
+  tag: latest
+  pullPolicy: IfNotPresent
+
+master:
+  replicas: 1
+  service:
+    type: ClusterIP
+    port: 5099
+  args:
+    - --role
+    - master
+    - --control-insecure
+    - --control-listen
+    - 0.0.0.0:5099
+    - --worker-registration-timeout-s
+    - "30"
+    - --job-timeout-s
+    - "120"
+    - --target
+    - 127.0.0.1
+    - --port
+    - "80"
+    - --protocol
+    - tcp
+    - --count
+    - "100000"
+    - --confirm
+
+slave:
+  replicas: 2
+  args:
+    - --role
+    - slave
+    - --control-insecure
+    - --control-endpoints
+    - "{{ .Release.Name }}-master:5099"
+    - --control-listen
+    - 0.0.0.0:5099
+    - --heartbeat-interval-ms
+    - "2000"
+    - --slave-master-timeout-s
+    - "30"
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
