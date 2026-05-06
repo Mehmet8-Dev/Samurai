@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .. import utils
 from .client import WorkerControlClient
 from .discovery import EndpointDiscovery
-from .ha import StaticLeaderElector
+from .ha import FileLeaseLeaderElector, StaticLeaderElector
 from .management_api import ManagementAPIServer, create_management_app
 from .proto import load_generated
 from .server import MasterControlServer
@@ -94,6 +94,37 @@ def _distributed_snapshot_to_prometheus(snapshot: dict, prefix: str = "samurai_d
     if gate_status:
         lines.append(f'{prefix}_kpi_gate_status{{status="{gate_status}"}} 1')
     return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _distributed_state_to_prometheus(state: dict, prefix: str = "samurai_distributed") -> str:
+    lines = []
+    snap = dict(state.get("latest_snapshot") or {})
+    lines.append(_distributed_snapshot_to_prometheus(snap, prefix=prefix).strip())
+
+    workers = list(state.get("workers") or [])
+    shards = list(state.get("shards") or [])
+    ha = dict(state.get("ha") or {})
+
+    lines.append(f"{prefix}_workers_live {float(len(workers))}")
+    lines.append(f"{prefix}_shards_live {float(len(shards))}")
+
+    for rec in workers:
+        wid = str(rec.get("worker_id", "") or "").replace('"', '\\"')
+        wstate = str(rec.get("state", "") or "unknown").replace('"', '\\"')
+        lines.append(f'{prefix}_worker_state{{worker_id="{wid}",state="{wstate}"}} 1')
+        hb = float(rec.get("last_heartbeat_ms", 0) or 0)
+        lines.append(f'{prefix}_worker_last_heartbeat_ms{{worker_id="{wid}"}} {hb}')
+
+    for rec in shards:
+        sid = str(rec.get("shard_id", "") or "").replace('"', '\\"')
+        sz = float(rec.get("stats_size_bytes", 0) or 0)
+        lines.append(f'{prefix}_shard_stats_size_bytes{{shard_id="{sid}"}} {sz}')
+
+    mode = str(ha.get("mode", "off") or "off").replace('"', '\\"')
+    is_leader = float(ha.get("is_leader", 0) or 0)
+    lines.append(f'{prefix}_ha_is_leader{{mode="{mode}"}} {is_leader}')
+    out = "\n".join([x for x in lines if x])
+    return out + ("\n" if out else "")
 
 
 def _run_single_job(server: MasterControlServer, job_args: dict, job_id: str) -> tuple[int, dict]:
@@ -360,16 +391,39 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     _ = runtime_ctx
     stop_grace_s = max(0.0, float(getattr(args, "control_stop_grace_s", 1.0) or 0.0))
     ha_enabled = bool(getattr(args, "ha_enable", False))
+    ha_mode = str(getattr(args, "ha_mode", "static") or "static").strip().lower()
     ha_node_id = str(getattr(args, "ha_node_id", "") or "").strip()
     ha_peers = str(getattr(args, "ha_peer_nodes", "") or "").strip()
-    ha_elector = StaticLeaderElector(node_id=ha_node_id, peers_csv=ha_peers) if ha_enabled else None
+    ha_lease_path = str(getattr(args, "ha_lease_path", "/tmp/ddos_samurai_master_lease.json") or "").strip()
+    ha_lease_seconds = float(getattr(args, "ha_lease_seconds", 15.0) or 15.0)
+    ha_renew_interval = float(getattr(args, "ha_renew_interval_s", 5.0) or 5.0)
+    ha_elector = None
+    if ha_enabled:
+        if ha_mode == "file-lock":
+            e = FileLeaseLeaderElector(
+                node_id=ha_node_id,
+                lease_path=ha_lease_path,
+                lease_seconds=ha_lease_seconds,
+            )
+            if not e.try_acquire():
+                snap = e.snapshot()
+                utils.log_warning(
+                    f"HA file-lock mode: this node is follower (node_id={snap.get('node_id')} "
+                    f"leader_id={snap.get('leader_id')}). Skipping master run."
+                )
+                return 0
+            e.start_renew_loop(interval_seconds=ha_renew_interval)
+            ha_elector = e
+        else:
+            ha_elector = StaticLeaderElector(node_id=ha_node_id, peers_csv=ha_peers)
+            if not ha_elector.is_leader():
+                snap = ha_elector.snapshot()
+                utils.log_warning(
+                    f"HA static mode: this node is follower (node_id={snap.get('node_id')} "
+                    f"leader_id={snap.get('leader_id')}). Skipping master run."
+                )
+                return 0
     ha_state = dict(ha_elector.snapshot()) if ha_elector is not None else {"mode": "off", "is_leader": 1}
-    if ha_elector is not None and not ha_elector.is_leader():
-        utils.log_warning(
-            f"HA static mode: this node is follower (node_id={ha_state.get('node_id')} "
-            f"leader_id={ha_state.get('leader_id')}). Skipping master run."
-        )
-        return 0
 
     discovery = EndpointDiscovery(
         manual_endpoints=str(getattr(args, "control_endpoints", "")),
@@ -438,6 +492,11 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     try:
         server.start()
     except Exception as exc:
+        if ha_elector is not None and hasattr(ha_elector, "stop"):
+            try:
+                ha_elector.stop()
+            except Exception:
+                pass
         utils.log_critical(f"Distributed master başlatılamadı: {exc}")
         return 1
     utils.log_info(
@@ -448,12 +507,10 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         mgmt_app = create_management_app(
             state_provider=_state_provider,
             abort_callback=_abort_callback,
-            metrics_provider=lambda: _distributed_snapshot_to_prometheus(
-                dict(latest_snapshot),
+            metrics_provider=lambda: _distributed_state_to_prometheus(
+                _state_provider(),
                 prefix=str(getattr(args, "distributed_metrics_prefix", "samurai_distributed") or "samurai_distributed"),
-            )
-            if latest_snapshot
-            else "",
+            ),
             auth_token=str(getattr(args, "management_api_auth_token", "")),
         )
         mgmt_server = ManagementAPIServer(
@@ -472,6 +529,11 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         if mgmt_server is not None:
             mgmt_server.stop()
         server.stop(stop_grace_s)
+        if ha_elector is not None and hasattr(ha_elector, "stop"):
+            try:
+                ha_elector.stop()
+            except Exception:
+                pass
         return 1
 
     jobs = _parse_job_queue(args)
@@ -510,4 +572,9 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     if mgmt_server is not None:
         mgmt_server.stop()
     server.stop(stop_grace_s)
+    if ha_elector is not None and hasattr(ha_elector, "stop"):
+        try:
+            ha_elector.stop()
+        except Exception:
+            pass
     return int(final_rc)

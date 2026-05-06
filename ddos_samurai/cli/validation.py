@@ -45,6 +45,22 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
             node_id = str(getattr(args, "ha_node_id", "") or "").strip()
             if "," in node_id:
                 parser.error("Hata: --ha-node-id tek değer olmalıdır (CSV değil).")
+            ha_mode = str(getattr(args, "ha_mode", "static") or "static").strip().lower()
+            if ha_mode == "file-lock":
+                lease_path = str(
+                    getattr(args, "ha_lease_path", "/tmp/ddos_samurai_master_lease.json")
+                    or "/tmp/ddos_samurai_master_lease.json"
+                ).strip()
+                if not lease_path:
+                    parser.error("Hata: --ha-mode file-lock için --ha-lease-path zorunludur.")
+                lease_s = float(getattr(args, "ha_lease_seconds", 15.0) or 15.0)
+                renew_s = float(getattr(args, "ha_renew_interval_s", 5.0) or 5.0)
+                if lease_s <= 0:
+                    parser.error("Hata: --ha-lease-seconds > 0 olmalıdır.")
+                if renew_s <= 0:
+                    parser.error("Hata: --ha-renew-interval-s > 0 olmalıdır.")
+                if renew_s >= lease_s:
+                    parser.error("Hata: --ha-renew-interval-s, --ha-lease-seconds değerinden küçük olmalıdır.")
     elif bool(getattr(args, "ha_enable", False)):
         parser.error("Hata: --ha-enable yalnızca --role master ile kullanılabilir.")
     elif role == "slave":

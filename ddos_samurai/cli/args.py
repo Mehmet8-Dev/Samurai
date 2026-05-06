@@ -284,6 +284,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Master için HA leader election iskeletini etkinleştir.",
     )
     distributed_group.add_argument(
+        "--ha-mode",
+        choices=["static", "file-lock"],
+        default="static",
+        help="HA modu: static veya file-lock lease.",
+    )
+    distributed_group.add_argument(
         "--ha-node-id",
         type=str,
         default="",
@@ -294,6 +300,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="HA peer node id listesi (CSV). Static modda leader seçimi için kullanılır.",
+    )
+    distributed_group.add_argument(
+        "--ha-lease-path",
+        type=str,
+        default="/tmp/ddos_samurai_master_lease.json",
+        help="file-lock HA modu için lease dosya yolu.",
+    )
+    distributed_group.add_argument(
+        "--ha-lease-seconds",
+        type=float,
+        default=15.0,
+        help="file-lock HA lease TTL süresi (s).",
+    )
+    distributed_group.add_argument(
+        "--ha-renew-interval-s",
+        type=float,
+        default=5.0,
+        help="file-lock HA lease yenileme aralığı (s).",
     )
     distributed_group.add_argument(
         "--job-timeout-s",

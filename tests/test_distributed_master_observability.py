@@ -1,4 +1,8 @@
-from ddos_samurai.control.master import _apply_distributed_kpi_gate, _distributed_snapshot_to_prometheus
+from ddos_samurai.control.master import (
+    _apply_distributed_kpi_gate,
+    _distributed_snapshot_to_prometheus,
+    _distributed_state_to_prometheus,
+)
 
 
 def test_distributed_snapshot_to_prometheus_includes_core_fields_and_gate_status():
@@ -59,3 +63,18 @@ def test_apply_distributed_kpi_gate_dedicated_profile_emits_fields():
     assert out["kpi_gate_profile"] == "dedicated_lab"
     assert out["kpi_gate_status"] in {"pass", "warn", "fail"}
     assert "kpi_gate_hard_fail" in out
+
+
+def test_distributed_state_to_prometheus_includes_worker_shard_and_ha_metrics():
+    state = {
+        "latest_snapshot": {"workers": 1, "shards_reported": 2, "sent": 11, "errors": 1},
+        "workers": [{"worker_id": "w-1", "state": "running", "last_heartbeat_ms": 1234}],
+        "shards": [{"shard_id": "s-1", "stats_size_bytes": 96}],
+        "ha": {"mode": "static", "is_leader": 1},
+    }
+    text = _distributed_state_to_prometheus(state)
+    assert "samurai_distributed_workers 1.0" in text
+    assert "samurai_distributed_workers_live 1.0" in text
+    assert 'samurai_distributed_worker_state{worker_id="w-1",state="running"} 1' in text
+    assert 'samurai_distributed_shard_stats_size_bytes{shard_id="s-1"} 96.0' in text
+    assert 'samurai_distributed_ha_is_leader{mode="static"} 1.0' in text
