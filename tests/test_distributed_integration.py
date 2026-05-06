@@ -141,3 +141,22 @@ def test_integration_worker_control_client_start_stop_insecure():
         assert wc.stop_shard("sid-1", graceful=True) is True
     finally:
         server.stop(0.0)
+
+
+def test_integration_worker_control_get_status_insecure():
+    _grpc_or_skip()
+    server = MasterControlServer("127.0.0.1:55107", insecure=True)
+    server.start()
+    try:
+        slave = SlaveControlClient("127.0.0.1:55107", insecure=True)
+        reg = slave.register_worker("w-status-1", "w-status-1", {"xdp": "1"})
+        assert reg["accepted"] is True
+
+        wc = WorkerControlClient("127.0.0.1:55107", insecure=True)
+        status = wc.get_worker_status("w-status-1")
+        assert status["worker_id"] == "w-status-1"
+        assert status["state"] in {"idle", "running", "done", "error"}
+        assert isinstance(status["stats_json"], (bytes, bytearray))
+        assert int(status["last_heartbeat_ms"]) > 0
+    finally:
+        server.stop(0.0)
