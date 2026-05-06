@@ -293,13 +293,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Management API Bearer token (bos ise auth kapali).",
     )
     distributed_group.add_argument(
+        "--management-events-max",
+        type=int,
+        default=200,
+        help="Management API event timeline maksimum kayit sayisi.",
+    )
+    distributed_group.add_argument(
         "--ha-enable",
         action="store_true",
         help="Master için HA leader election iskeletini etkinleştir.",
     )
     distributed_group.add_argument(
         "--ha-mode",
-        choices=["static", "file-lock", "redis"],
+        choices=["static", "file-lock", "redis", "etcd"],
         default="static",
         help="HA modu: static veya file-lock lease.",
     )
@@ -364,6 +370,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="samurai:ha:master",
         help="ha-mode redis için lease key.",
+    )
+    distributed_group.add_argument(
+        "--ha-etcd-endpoints",
+        type=str,
+        default="127.0.0.1:2379",
+        help="ha-mode etcd için endpoint listesi (CSV, host:port).",
+    )
+    distributed_group.add_argument(
+        "--ha-etcd-key",
+        type=str,
+        default="samurai/ha/master",
+        help="ha-mode etcd için lease key yolu.",
+    )
+    distributed_group.add_argument(
+        "--ha-etcd-timeout-s",
+        type=float,
+        default=3.0,
+        help="ha-mode etcd istemci timeout (s).",
     )
     distributed_group.add_argument(
         "--job-timeout-s",

@@ -41,6 +41,9 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
                     raise ValueError("invalid port")
             except Exception:
                 parser.error("Hata: --management-api-listen portu 1..65535 aralığında olmalıdır.")
+            events_max = int(getattr(args, "management_events_max", 200) or 0)
+            if events_max < 10:
+                parser.error("Hata: --management-events-max en az 10 olmalıdır.")
         if bool(getattr(args, "ha_enable", False)):
             node_id = str(getattr(args, "ha_node_id", "") or "").strip()
             if "," in node_id:
@@ -82,6 +85,20 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
                     parser.error("Hata: --ha-renew-interval-s > 0 olmalıdır.")
                 if renew_s >= lease_s:
                     parser.error("Hata: --ha-renew-interval-s, --ha-lease-seconds değerinden küçük olmalıdır.")
+            elif ha_mode == "etcd":
+                etcd_eps = str(getattr(args, "ha_etcd_endpoints", "127.0.0.1:2379") or "").strip()
+                etcd_key = str(getattr(args, "ha_etcd_key", "samurai/ha/master") or "").strip()
+                etcd_timeout = float(getattr(args, "ha_etcd_timeout_s", 3.0) or 3.0)
+                if not etcd_eps:
+                    parser.error("Hata: --ha-mode etcd için --ha-etcd-endpoints zorunludur.")
+                if not etcd_key:
+                    parser.error("Hata: --ha-mode etcd için --ha-etcd-key zorunludur.")
+                if etcd_timeout <= 0:
+                    parser.error("Hata: --ha-etcd-timeout-s > 0 olmalıdır.")
+                for ep in etcd_eps.split(","):
+                    x = str(ep or "").strip()
+                    if not x or ":" not in x:
+                        parser.error(f"Hata: --ha-etcd-endpoints elemanı geçersiz: '{x}' (host:port)")
     elif bool(getattr(args, "ha_enable", False)):
         parser.error("Hata: --ha-enable yalnızca --role master ile kullanılabilir.")
     elif role == "slave":
