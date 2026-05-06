@@ -154,12 +154,23 @@ def run_distributed_slave(args, parser) -> int:
 
     # Heartbeat health loop (no orchestration commands are consumed here).
     hb_ms = int(getattr(args, "heartbeat_interval_ms", 2000) or 2000)
+    master_timeout_s = int(getattr(args, "slave_master_timeout_s", 30) or 0)
     boot = int(time.time() * 1000)
     run_forever = int(getattr(args, "job_timeout_s", 0) or 0) <= 0
     loops = 0
+    last_master_ok_ts = time.time()
     while True:
         now = int(time.time() * 1000)
-        _ = client.heartbeat(worker_id=worker_id, uptime_ms=max(0, now - boot))
+        try:
+            _ = client.heartbeat(worker_id=worker_id, uptime_ms=max(0, now - boot))
+            last_master_ok_ts = time.time()
+        except Exception as exc:
+            if master_timeout_s > 0 and (time.time() - last_master_ok_ts) >= float(master_timeout_s):
+                utils.log_warning(
+                    "Master heartbeat RPC unavailable for too long; slave exits "
+                    f"(timeout={master_timeout_s}s): {exc}"
+                )
+                break
         loops += 1
         if not run_forever and loops >= max(3, int(getattr(args, "job_timeout_s", 0) or 0)):
             break

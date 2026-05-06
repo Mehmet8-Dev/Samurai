@@ -149,13 +149,22 @@ class _SamuraiServicer:
 
 
 class MasterControlServer:
-    def __init__(self, listen_addr: str, cluster_secret: str = "", insecure: bool = False, tls_cert: str = "", tls_key: str = "") -> None:
+    def __init__(
+        self,
+        listen_addr: str,
+        cluster_secret: str = "",
+        insecure: bool = False,
+        tls_cert: str = "",
+        tls_key: str = "",
+        max_workers: int = 16,
+    ) -> None:
         require_distributed()
         self.listen_addr = str(listen_addr)
         self.cluster_secret = str(cluster_secret or "")
         self.insecure = bool(insecure)
         self.tls_cert = str(tls_cert or "")
         self.tls_key = str(tls_key or "")
+        self.max_workers = max(4, int(max_workers or 16))
         self.running = False
         self._server = None
         self._servicer = _SamuraiServicer()
@@ -166,7 +175,7 @@ class MasterControlServer:
         _, pb2_grpc = load_generated()
         interceptor = _SecretServerInterceptor(self.cluster_secret)
         self._server = grpc.server(
-            futures.ThreadPoolExecutor(max_workers=16),
+            futures.ThreadPoolExecutor(max_workers=self.max_workers),
             interceptors=[interceptor],
         )
         pb2_grpc.add_SamuraiControlServicer_to_server(self._servicer, self._server)

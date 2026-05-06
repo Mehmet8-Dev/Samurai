@@ -157,6 +157,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Master: heartbeat timeout süresi (3x interval).",
     )
     distributed_group.add_argument(
+        "--worker-registration-timeout-s",
+        type=int,
+        default=30,
+        help="Master: worker register bekleme süresi (s).",
+    )
+    distributed_group.add_argument(
+        "--master-poll-interval-ms",
+        type=int,
+        default=250,
+        help="Master: heartbeat/shard durum poll aralığı (ms).",
+    )
+    distributed_group.add_argument(
+        "--control-max-workers",
+        type=int,
+        default=0,
+        help="Master gRPC thread pool boyutu (0=otomatik).",
+    )
+    distributed_group.add_argument(
+        "--control-dispatch-workers",
+        type=int,
+        default=32,
+        help="Master start/stop shard RPC paralellik limiti.",
+    )
+    distributed_group.add_argument(
+        "--slave-master-timeout-s",
+        type=int,
+        default=30,
+        help="Slave: master heartbeat RPC başarısızlığında çıkış eşiği (s, 0=kapalı).",
+    )
+    distributed_group.add_argument(
         "--job-timeout-s",
         type=int,
         default=0,
