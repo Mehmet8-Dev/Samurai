@@ -765,6 +765,7 @@ def build_setup_kwargs() -> Dict[str, object]:
                 "grpcio-tools>=1.62",
                 "grpcio-health-checking>=1.62",
                 "protobuf>=4.25,<5.0",
+                "redis>=5.0.0",
             ],
             "distributed-k8s": [
                 "grpcio>=1.62",
@@ -772,6 +773,7 @@ def build_setup_kwargs() -> Dict[str, object]:
                 "grpcio-health-checking>=1.62",
                 "protobuf>=4.25,<5.0",
                 "kubernetes>=29.0",
+                "redis>=5.0.0",
             ],
             "ml": [
                 "torch>=2.2.0",
@@ -787,6 +789,7 @@ def build_setup_kwargs() -> Dict[str, object]:
                 "grpcio-tools>=1.62",
                 "grpcio-health-checking>=1.62",
                 "protobuf>=4.25,<5.0",
+                "redis>=5.0.0",
                 "torch>=2.2.0",
                 "mamba-ssm>=2.2.2",
                 "pandas>=2.0.0",
