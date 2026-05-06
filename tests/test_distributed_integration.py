@@ -62,6 +62,127 @@ def _mk_self_signed_cert(tmp_path: Path):
     return cert, key
 
 
+def _mk_mtls_materials(tmp_path: Path):
+    ca_key = tmp_path / "ca.key.pem"
+    ca_cert = tmp_path / "ca.cert.pem"
+    server_key = tmp_path / "server.key.pem"
+    server_csr = tmp_path / "server.csr.pem"
+    server_cert = tmp_path / "server.cert.pem"
+    client_key = tmp_path / "client.key.pem"
+    client_csr = tmp_path / "client.csr.pem"
+    client_cert = tmp_path / "client.cert.pem"
+    try:
+        subprocess.run(
+            ["openssl", "genrsa", "-out", str(ca_key), "2048"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-new",
+                "-key",
+                str(ca_key),
+                "-sha256",
+                "-days",
+                "1",
+                "-out",
+                str(ca_cert),
+                "-subj",
+                "/CN=Samurai-Test-CA",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["openssl", "genrsa", "-out", str(server_key), "2048"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-new",
+                "-key",
+                str(server_key),
+                "-out",
+                str(server_csr),
+                "-subj",
+                "/CN=localhost",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "x509",
+                "-req",
+                "-in",
+                str(server_csr),
+                "-CA",
+                str(ca_cert),
+                "-CAkey",
+                str(ca_key),
+                "-CAcreateserial",
+                "-out",
+                str(server_cert),
+                "-days",
+                "1",
+                "-sha256",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["openssl", "genrsa", "-out", str(client_key), "2048"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-new",
+                "-key",
+                str(client_key),
+                "-out",
+                str(client_csr),
+                "-subj",
+                "/CN=samurai-test-client",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "x509",
+                "-req",
+                "-in",
+                str(client_csr),
+                "-CA",
+                str(ca_cert),
+                "-CAkey",
+                str(ca_key),
+                "-CAcreateserial",
+                "-out",
+                str(client_cert),
+                "-days",
+                "1",
+                "-sha256",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("openssl not available for mTLS integration test")
+    return ca_cert, server_cert, server_key, client_cert, client_key
+
+
 def test_integration_tls_secret_three_workers_and_aggregate(tmp_path):
     _grpc_or_skip()
     cert, key = _mk_self_signed_cert(Path(tmp_path))
@@ -120,6 +241,43 @@ def test_integration_secret_rejects_wrong_token(tmp_path):
         )
         with pytest.raises(Exception):
             bad.register_worker("w-bad", "w-bad", {})
+    finally:
+        server.stop(0.0)
+
+
+def test_integration_mtls_requires_client_certificate(tmp_path):
+    _grpc_or_skip()
+    ca_cert, server_cert, server_key, client_cert, client_key = _mk_mtls_materials(Path(tmp_path))
+    server = MasterControlServer(
+        "localhost:55110",
+        insecure=False,
+        cluster_secret="mtls-secret",
+        tls_cert=str(server_cert),
+        tls_key=str(server_key),
+        tls_client_ca=str(ca_cert),
+        require_client_auth=True,
+    )
+    server.start()
+    try:
+        bad = SlaveControlClient(
+            "localhost:55110",
+            insecure=False,
+            cluster_secret="mtls-secret",
+            tls_ca=str(ca_cert),
+        )
+        with pytest.raises(Exception):
+            bad.register_worker("w-mtls-bad", "w-mtls-bad", {})
+
+        good = SlaveControlClient(
+            "localhost:55110",
+            insecure=False,
+            cluster_secret="mtls-secret",
+            tls_ca=str(ca_cert),
+            tls_client_cert=str(client_cert),
+            tls_client_key=str(client_key),
+        )
+        reg = good.register_worker("w-mtls-good", "w-mtls-good", {"cap": "1"})
+        assert reg["accepted"] is True
     finally:
         server.stop(0.0)
 
