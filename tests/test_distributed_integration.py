@@ -35,6 +35,19 @@ def test_integration_master_slave_insecure_register_heartbeat_stats():
         server.stop(0.0)
 
 
+def test_integration_heartbeat_unknown_worker_returns_register_command():
+    _grpc_or_skip()
+    server = MasterControlServer("127.0.0.1:55111", insecure=True)
+    server.start()
+    try:
+        client = SlaveControlClient("127.0.0.1:55111", insecure=True)
+        hb = client.heartbeat("missing-worker", 100)
+        assert hb["acknowledged"] is False
+        assert str(hb["command"]) == "register"
+    finally:
+        server.stop(0.0)
+
+
 def _mk_self_signed_cert(tmp_path: Path):
     cert = tmp_path / "cert.pem"
     key = tmp_path / "key.pem"
