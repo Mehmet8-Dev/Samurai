@@ -1,4 +1,5 @@
 from pathlib import Path
+import socket
 
 import shutil
 import subprocess
@@ -8,7 +9,15 @@ import types
 
 import pytest
 
-from ddos_samurai.control.ha import FileLeaseLeaderElector, StaticLeaderElector
+from ddos_samurai.control.ha import FileLeaseLeaderElector, NativeRaftLeaderElector, StaticLeaderElector
+
+
+def _free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    p = int(s.getsockname()[1])
+    s.close()
+    return p
 
 
 def test_static_leader_elector_selects_lexicographic_min():
@@ -174,3 +183,246 @@ def test_etcd_lease_elector_with_fake_client():
             sys.modules.pop("etcd3", None)
         else:
             sys.modules["etcd3"] = old
+
+
+def test_native_raft_elects_single_leader():
+    p1, p2, p3 = _free_port(), _free_port(), _free_port()
+    n1 = NativeRaftLeaderElector(
+        node_id="n1",
+        listen_addr=f"127.0.0.1:{p1}",
+        peers_csv=f"n2@127.0.0.1:{p2},n3@127.0.0.1:{p3}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    n2 = NativeRaftLeaderElector(
+        node_id="n2",
+        listen_addr=f"127.0.0.1:{p2}",
+        peers_csv=f"n1@127.0.0.1:{p1},n3@127.0.0.1:{p3}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    n3 = NativeRaftLeaderElector(
+        node_id="n3",
+        listen_addr=f"127.0.0.1:{p3}",
+        peers_csv=f"n1@127.0.0.1:{p1},n2@127.0.0.1:{p2}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    nodes = [n1, n2, n3]
+    try:
+        for n in nodes:
+            n.start_renew_loop(interval_seconds=0.05)
+        leader_count = 0
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            leaders = [n for n in nodes if n.is_leader()]
+            leader_count = len(leaders)
+            if leader_count == 1:
+                break
+            time.sleep(0.05)
+        assert leader_count == 1
+    finally:
+        for n in nodes:
+            n.stop()
+
+
+def test_native_raft_failover_takeover_and_epoch_advance():
+    p1, p2, p3 = _free_port(), _free_port(), _free_port()
+    n1 = NativeRaftLeaderElector(
+        node_id="n1",
+        listen_addr=f"127.0.0.1:{p1}",
+        peers_csv=f"n2@127.0.0.1:{p2},n3@127.0.0.1:{p3}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    n2 = NativeRaftLeaderElector(
+        node_id="n2",
+        listen_addr=f"127.0.0.1:{p2}",
+        peers_csv=f"n1@127.0.0.1:{p1},n3@127.0.0.1:{p3}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    n3 = NativeRaftLeaderElector(
+        node_id="n3",
+        listen_addr=f"127.0.0.1:{p3}",
+        peers_csv=f"n1@127.0.0.1:{p1},n2@127.0.0.1:{p2}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    nodes = [n1, n2, n3]
+    try:
+        for n in nodes:
+            n.start_renew_loop(interval_seconds=0.05)
+        leader = None
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            leaders = [n for n in nodes if n.is_leader()]
+            if len(leaders) == 1:
+                leader = leaders[0]
+                break
+            time.sleep(0.05)
+        assert leader is not None
+        old_id = str(leader.snapshot().get("node_id", ""))
+        old_epoch = int(leader.leader_epoch)
+        leader.stop()
+        survivors = [n for n in nodes if n is not leader]
+        new_leader = None
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            leaders = [n for n in survivors if n.is_leader()]
+            if len(leaders) == 1:
+                new_leader = leaders[0]
+                break
+            time.sleep(0.05)
+        assert new_leader is not None
+        assert str(new_leader.snapshot().get("node_id", "")) != old_id
+        assert int(new_leader.leader_epoch) > int(old_epoch)
+    finally:
+        for n in nodes:
+            try:
+                n.stop()
+            except Exception:
+                pass
+
+
+def test_native_raft_replicated_command_commits_and_applies():
+    p1, p2, p3 = _free_port(), _free_port(), _free_port()
+    n1 = NativeRaftLeaderElector(
+        node_id="n1",
+        listen_addr=f"127.0.0.1:{p1}",
+        peers_csv=f"n2@127.0.0.1:{p2},n3@127.0.0.1:{p3}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    n2 = NativeRaftLeaderElector(
+        node_id="n2",
+        listen_addr=f"127.0.0.1:{p2}",
+        peers_csv=f"n1@127.0.0.1:{p1},n3@127.0.0.1:{p3}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    n3 = NativeRaftLeaderElector(
+        node_id="n3",
+        listen_addr=f"127.0.0.1:{p3}",
+        peers_csv=f"n1@127.0.0.1:{p1},n2@127.0.0.1:{p2}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    nodes = [n1, n2, n3]
+    try:
+        for n in nodes:
+            n.start_renew_loop(interval_seconds=0.05)
+        leader = None
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            leaders = [n for n in nodes if n.is_leader()]
+            if len(leaders) == 1:
+                leader = leaders[0]
+                break
+            time.sleep(0.05)
+        assert leader is not None
+        ok = leader.replicate_command({"op": "set", "key": "x", "value": 42}, wait_commit_s=3.0)
+        assert ok is True
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            applied_counts = [len(n.get_applied_commands()) for n in nodes]
+            if min(applied_counts) >= 1:
+                break
+            time.sleep(0.05)
+        for n in nodes:
+            entries = n.get_applied_commands()
+            assert len(entries) >= 1
+            assert dict(entries[0].get("command", {}) or {}).get("op") == "set"
+            assert dict(entries[0].get("command", {}) or {}).get("key") == "x"
+    finally:
+        for n in nodes:
+            try:
+                n.stop()
+            except Exception:
+                pass
+
+
+def test_native_raft_replicated_log_survives_leader_failover():
+    p1, p2, p3 = _free_port(), _free_port(), _free_port()
+    n1 = NativeRaftLeaderElector(
+        node_id="n1",
+        listen_addr=f"127.0.0.1:{p1}",
+        peers_csv=f"n2@127.0.0.1:{p2},n3@127.0.0.1:{p3}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    n2 = NativeRaftLeaderElector(
+        node_id="n2",
+        listen_addr=f"127.0.0.1:{p2}",
+        peers_csv=f"n1@127.0.0.1:{p1},n3@127.0.0.1:{p3}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    n3 = NativeRaftLeaderElector(
+        node_id="n3",
+        listen_addr=f"127.0.0.1:{p3}",
+        peers_csv=f"n1@127.0.0.1:{p1},n2@127.0.0.1:{p2}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    nodes = [n1, n2, n3]
+    try:
+        for n in nodes:
+            n.start_renew_loop(interval_seconds=0.05)
+        leader = None
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            leaders = [n for n in nodes if n.is_leader()]
+            if len(leaders) == 1:
+                leader = leaders[0]
+                break
+            time.sleep(0.05)
+        assert leader is not None
+        assert leader.replicate_command({"seq": 1}, wait_commit_s=3.0) is True
+
+        leader.stop()
+        survivors = [n for n in nodes if n is not leader]
+        new_leader = None
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            leaders = [n for n in survivors if n.is_leader()]
+            if len(leaders) == 1:
+                new_leader = leaders[0]
+                break
+            time.sleep(0.05)
+        assert new_leader is not None
+        assert new_leader.replicate_command({"seq": 2}, wait_commit_s=3.0) is True
+
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            ok = True
+            for n in survivors:
+                seqs = [dict(x.get("command", {}) or {}).get("seq") for x in n.get_applied_commands()]
+                if 1 not in seqs or 2 not in seqs:
+                    ok = False
+                    break
+            if ok:
+                break
+            time.sleep(0.05)
+        for n in survivors:
+            seqs = [dict(x.get("command", {}) or {}).get("seq") for x in n.get_applied_commands()]
+            assert 1 in seqs and 2 in seqs
+    finally:
+        for n in nodes:
+            try:
+                n.stop()
+            except Exception:
+                pass

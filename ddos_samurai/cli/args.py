@@ -305,9 +305,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     distributed_group.add_argument(
         "--ha-mode",
-        choices=["static", "file-lock", "redis", "etcd"],
+        choices=["static", "file-lock", "redis", "etcd", "raft"],
         default="static",
-        help="HA modu: static veya file-lock lease.",
+        help="HA modu: static, file-lock, redis, etcd veya native raft.",
     )
     distributed_group.add_argument(
         "--ha-node-id",
@@ -388,6 +388,36 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=3.0,
         help="ha-mode etcd istemci timeout (s).",
+    )
+    distributed_group.add_argument(
+        "--ha-raft-listen",
+        type=str,
+        default="127.0.0.1:7000",
+        help="ha-mode raft için node içi consensus RPC listen adresi (host:port).",
+    )
+    distributed_group.add_argument(
+        "--ha-raft-peers",
+        type=str,
+        default="",
+        help="ha-mode raft peer listesi (CSV): node-id@host:port,node2@host:port",
+    )
+    distributed_group.add_argument(
+        "--ha-raft-election-timeout-min-ms",
+        type=int,
+        default=900,
+        help="ha-mode raft election timeout alt sınır (ms).",
+    )
+    distributed_group.add_argument(
+        "--ha-raft-election-timeout-max-ms",
+        type=int,
+        default=1500,
+        help="ha-mode raft election timeout üst sınır (ms).",
+    )
+    distributed_group.add_argument(
+        "--ha-raft-heartbeat-interval-ms",
+        type=int,
+        default=250,
+        help="ha-mode raft leader heartbeat aralığı (ms).",
     )
     distributed_group.add_argument(
         "--job-timeout-s",

@@ -10,7 +10,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .. import utils
 from .client import WorkerControlClient
 from .discovery import EndpointDiscovery
-from .ha import EtcdLeaseLeaderElector, FileLeaseLeaderElector, RedisLeaseLeaderElector, StaticLeaderElector
+from .ha import (
+    EtcdLeaseLeaderElector,
+    FileLeaseLeaderElector,
+    NativeRaftLeaderElector,
+    RedisLeaseLeaderElector,
+    StaticLeaderElector,
+)
 from .management_api import ManagementAPIServer, create_management_app
 from .proto import load_generated
 from .server import MasterControlServer
@@ -466,6 +472,11 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     ha_etcd_endpoints = str(getattr(args, "ha_etcd_endpoints", "127.0.0.1:2379") or "127.0.0.1:2379").strip()
     ha_etcd_key = str(getattr(args, "ha_etcd_key", "samurai/ha/master") or "samurai/ha/master").strip()
     ha_etcd_timeout_s = float(getattr(args, "ha_etcd_timeout_s", 3.0) or 3.0)
+    ha_raft_listen = str(getattr(args, "ha_raft_listen", "127.0.0.1:7000") or "127.0.0.1:7000").strip()
+    ha_raft_peers = str(getattr(args, "ha_raft_peers", "") or "").strip()
+    ha_raft_election_min_ms = int(getattr(args, "ha_raft_election_timeout_min_ms", 900) or 900)
+    ha_raft_election_max_ms = int(getattr(args, "ha_raft_election_timeout_max_ms", 1500) or 1500)
+    ha_raft_hb_ms = int(getattr(args, "ha_raft_heartbeat_interval_ms", 250) or 250)
     ha_elector = None
     ha_wait_for_leader = bool(getattr(args, "ha_wait_for_leader", True))
     ha_acquire_timeout_s = float(getattr(args, "ha_acquire_timeout_s", 0.0) or 0.0)
@@ -502,6 +513,15 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                     lease_seconds=ha_lease_seconds,
                     timeout_seconds=ha_etcd_timeout_s,
                 )
+            elif ha_mode == "raft":
+                e = NativeRaftLeaderElector(
+                    node_id=ha_node_id,
+                    listen_addr=ha_raft_listen,
+                    peers_csv=ha_raft_peers,
+                    election_timeout_min_ms=ha_raft_election_min_ms,
+                    election_timeout_max_ms=ha_raft_election_max_ms,
+                    heartbeat_interval_ms=ha_raft_hb_ms,
+                )
             else:
                 raise ValueError(f"unsupported ha mode: {ha_mode}")
 
@@ -522,7 +542,10 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                     f"leader_id={snap.get('leader_id')}). Skipping master run."
                 )
                 return 0
-            e.start_renew_loop(interval_seconds=ha_renew_interval)
+            renew_interval_s = ha_renew_interval
+            if ha_mode == "raft":
+                renew_interval_s = max(0.05, float(ha_raft_hb_ms) / 1000.0)
+            e.start_renew_loop(interval_seconds=renew_interval_s)
             ha_elector = e
     ha_state = dict(ha_elector.snapshot()) if ha_elector is not None else {"mode": "off", "is_leader": 1, "leader_epoch": 0}
 
@@ -557,12 +580,20 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     events: list[dict] = []
     events_max = max(10, int(getattr(args, "management_events_max", 200) or 200))
 
-    def _push_event(kind: str, **extra) -> None:
+    def _push_event(kind: str, replicate: bool = False, **extra) -> None:
         item = {"ts_ms": int(time.time() * 1000), "kind": str(kind)}
         item.update({str(k): v for k, v in dict(extra or {}).items()})
         events.append(item)
         if len(events) > events_max:
             del events[0 : len(events) - events_max]
+        if replicate and ha_elector is not None and hasattr(ha_elector, "replicate_command"):
+            try:
+                _ = ha_elector.replicate_command(
+                    {"type": "event", "kind": str(kind), "payload": dict(item)},
+                    wait_commit_s=0.4,
+                )
+            except Exception:
+                pass
 
     def _state_provider() -> dict:
         workers = []
@@ -607,6 +638,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         resp = server.servicer.AbortJob(pb2.AbortJobRequest(job_id=str(current_job.get("job_id", ""))), context=None)
         _push_event(
             "abort_api",
+            replicate=True,
             job_id=str(current_job.get("job_id", "")),
             workers_notified=int(resp.workers_notified or 0),
             leader_epoch=int(ha_state.get("leader_epoch", 0) or 0),
@@ -626,7 +658,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         f"Distributed master started on {server.listen_addr}. "
         f"grpc_max_workers={int(control_max_workers)}"
     )
-    _push_event("master_started", listen_addr=str(server.listen_addr))
+    _push_event("master_started", replicate=True, listen_addr=str(server.listen_addr))
     if bool(getattr(args, "management_api_enable", False)):
         mgmt_app = create_management_app(
             state_provider=_state_provider,
@@ -680,6 +712,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         current_job["job_id"] = job_id
         _push_event(
             "job_started",
+            replicate=True,
             job_id=job_id,
             leader_epoch=int(job_run.get("_leader_epoch", 0) or 0),
         )
@@ -710,6 +743,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         current_job["state"] = "done" if int(rc) == 0 else "error"
         _push_event(
             "job_finished",
+            replicate=True,
             job_id=job_id,
             rc=int(rc),
             sent=int(snap.get("sent", 0) or 0),

@@ -99,6 +99,35 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
                     x = str(ep or "").strip()
                     if not x or ":" not in x:
                         parser.error(f"Hata: --ha-etcd-endpoints elemanı geçersiz: '{x}' (host:port)")
+            elif ha_mode == "raft":
+                raft_listen = str(getattr(args, "ha_raft_listen", "127.0.0.1:7000") or "").strip()
+                raft_peers = str(getattr(args, "ha_raft_peers", "") or "").strip()
+                tmin = int(getattr(args, "ha_raft_election_timeout_min_ms", 900) or 900)
+                tmax = int(getattr(args, "ha_raft_election_timeout_max_ms", 1500) or 1500)
+                hb = int(getattr(args, "ha_raft_heartbeat_interval_ms", 250) or 250)
+                if ":" not in raft_listen:
+                    parser.error("Hata: --ha-raft-listen formatı host:port olmalıdır.")
+                try:
+                    _, p = raft_listen.rsplit(":", 1)
+                    if int(p) <= 0 or int(p) > 65535:
+                        raise ValueError("invalid port")
+                except Exception:
+                    parser.error("Hata: --ha-raft-listen portu 1..65535 aralığında olmalıdır.")
+                if tmin < 200:
+                    parser.error("Hata: --ha-raft-election-timeout-min-ms >= 200 olmalıdır.")
+                if tmax <= tmin:
+                    parser.error("Hata: --ha-raft-election-timeout-max-ms, min timeout'tan büyük olmalıdır.")
+                if hb < 50:
+                    parser.error("Hata: --ha-raft-heartbeat-interval-ms >= 50 olmalıdır.")
+                for item in raft_peers.split(","):
+                    x = str(item or "").strip()
+                    if not x:
+                        continue
+                    if "@" not in x:
+                        parser.error(f"Hata: --ha-raft-peers elemanı geçersiz: '{x}' (node-id@host:port)")
+                    nid, addr = x.split("@", 1)
+                    if not str(nid or "").strip() or ":" not in str(addr or ""):
+                        parser.error(f"Hata: --ha-raft-peers elemanı geçersiz: '{x}' (node-id@host:port)")
     elif bool(getattr(args, "ha_enable", False)):
         parser.error("Hata: --ha-enable yalnızca --role master ile kullanılabilir.")
     elif role == "slave":
