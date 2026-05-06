@@ -213,6 +213,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Slave: master heartbeat RPC başarısızlığında çıkış eşiği (s, 0=kapalı).",
     )
     distributed_group.add_argument(
+        "--stats-stream-enable",
+        type=_arg_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Slave->master stats stream RPC yolunu etkinlestir (fallback: unary ReportStats).",
+    )
+    distributed_group.add_argument(
+        "--stats-stream-interval-ms",
+        type=int,
+        default=500,
+        help="Shard calisirken stream uzerinden canli stats yayin araligi (ms).",
+    )
+    distributed_group.add_argument(
         "--job-timeout-s",
         type=int,
         default=0,
