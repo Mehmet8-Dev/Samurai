@@ -74,6 +74,42 @@ def _apply_distributed_kpi_gate(snapshot: dict, job_args: dict) -> dict:
     return snapshot
 
 
+def _apply_per_shard_kpi_gate(snapshot: dict, job_args: dict) -> dict:
+    max_err_rate = float(job_args.get("shard_kpi_max_error_rate_pct", -1.0) or -1.0)
+    fail_on_exit = bool(job_args.get("shard_kpi_fail_on_exitcode", True))
+    hard_fail = bool(job_args.get("kpi_hard_fail", False))
+    per_shard = list(snapshot.get("top_error_shards", []) or [])
+
+    failed = []
+    for rec in per_shard:
+        sid = str(rec.get("shard_id", "") or "")
+        sent = float(rec.get("sent", 0) or 0.0)
+        errs = float(rec.get("errors", 0) or 0.0)
+        exitcode = int(rec.get("last_exitcode", 0) or 0)
+        total = max(0.0, sent + errs)
+        err_rate = (errs / total * 100.0) if total > 0 else 0.0
+        reasons = []
+        if max_err_rate >= 0.0 and err_rate > max_err_rate:
+            reasons.append(f"error_rate>{max_err_rate}")
+        if fail_on_exit and exitcode != 0:
+            reasons.append("exitcode_nonzero")
+        if reasons:
+            failed.append(
+                {
+                    "shard_id": sid,
+                    "error_rate_pct": round(err_rate, 4),
+                    "last_exitcode": exitcode,
+                    "reasons": reasons,
+                }
+            )
+
+    snapshot["per_shard_kpi_status"] = "fail" if failed else "pass"
+    snapshot["per_shard_kpi_failed_count"] = int(len(failed))
+    snapshot["per_shard_kpi_failed"] = failed[:10]
+    snapshot["per_shard_kpi_hard_fail"] = 1 if (hard_fail and failed) else 0
+    return snapshot
+
+
 def _distributed_snapshot_to_prometheus(snapshot: dict, prefix: str = "samurai_distributed") -> str:
     lines = []
     num_fields = {
@@ -93,6 +129,13 @@ def _distributed_snapshot_to_prometheus(snapshot: dict, prefix: str = "samurai_d
     gate_status = str(snapshot.get("kpi_gate_status", "") or "").strip().lower()
     if gate_status:
         lines.append(f'{prefix}_kpi_gate_status{{status="{gate_status}"}} 1')
+    shard_gate_status = str(snapshot.get("per_shard_kpi_status", "") or "").strip().lower()
+    if shard_gate_status:
+        lines.append(f'{prefix}_per_shard_kpi_status{{status="{shard_gate_status}"}} 1')
+    try:
+        lines.append(f"{prefix}_per_shard_kpi_failed_count {float(snapshot.get('per_shard_kpi_failed_count', 0) or 0)}")
+    except (TypeError, ValueError):
+        pass
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -398,6 +441,9 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     ha_lease_seconds = float(getattr(args, "ha_lease_seconds", 15.0) or 15.0)
     ha_renew_interval = float(getattr(args, "ha_renew_interval_s", 5.0) or 5.0)
     ha_elector = None
+    ha_wait_for_leader = bool(getattr(args, "ha_wait_for_leader", True))
+    ha_acquire_timeout_s = float(getattr(args, "ha_acquire_timeout_s", 0.0) or 0.0)
+    ha_retry_interval_s = max(0.2, float(getattr(args, "ha_retry_interval_s", 1.0) or 1.0))
     if ha_enabled:
         if ha_mode == "file-lock":
             e = FileLeaseLeaderElector(
@@ -405,7 +451,17 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                 lease_path=ha_lease_path,
                 lease_seconds=ha_lease_seconds,
             )
-            if not e.try_acquire():
+            acquired = bool(e.try_acquire())
+            if not acquired and ha_wait_for_leader:
+                start_wait = time.time()
+                while True:
+                    if ha_acquire_timeout_s > 0 and (time.time() - start_wait) >= ha_acquire_timeout_s:
+                        break
+                    time.sleep(ha_retry_interval_s)
+                    if e.try_acquire():
+                        acquired = True
+                        break
+            if not acquired:
                 snap = e.snapshot()
                 utils.log_warning(
                     f"HA file-lock mode: this node is follower (node_id={snap.get('node_id')} "
@@ -547,6 +603,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         current_job["job_id"] = job_id
         rc, snap = _run_single_job(server, job, job_id=job_id)
         snap = _apply_distributed_kpi_gate(snap, job)
+        snap = _apply_per_shard_kpi_gate(snap, job)
         latest_snapshot.clear()
         latest_snapshot.update(dict(snap))
         multi_summary.append(snap)
@@ -563,6 +620,8 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         if rc != 0:
             final_rc = rc
         if int(snap.get("kpi_gate_hard_fail", 0) or 0) == 1:
+            final_rc = 1
+        if int(snap.get("per_shard_kpi_hard_fail", 0) or 0) == 1:
             final_rc = 1
         current_job["state"] = "done" if int(rc) == 0 else "error"
 

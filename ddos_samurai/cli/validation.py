@@ -61,6 +61,12 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
                     parser.error("Hata: --ha-renew-interval-s > 0 olmalıdır.")
                 if renew_s >= lease_s:
                     parser.error("Hata: --ha-renew-interval-s, --ha-lease-seconds değerinden küçük olmalıdır.")
+                acquire_timeout_s = float(getattr(args, "ha_acquire_timeout_s", 0.0) or 0.0)
+                retry_interval_s = float(getattr(args, "ha_retry_interval_s", 1.0) or 1.0)
+                if acquire_timeout_s < 0.0:
+                    parser.error("Hata: --ha-acquire-timeout-s >= 0 olmalıdır.")
+                if retry_interval_s <= 0.0:
+                    parser.error("Hata: --ha-retry-interval-s > 0 olmalıdır.")
     elif bool(getattr(args, "ha_enable", False)):
         parser.error("Hata: --ha-enable yalnızca --role master ile kullanılabilir.")
     elif role == "slave":
@@ -119,6 +125,11 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
         parser.error("Hata: --heartbeat-timeout-ms > --heartbeat-interval-ms olmalıdır.")
     if k8s_port <= 0 or k8s_port > 65535:
         parser.error("Hata: --control-k8s-port 1..65535 aralığında olmalıdır.")
+    shard_kpi_max_error_rate_pct = float(getattr(args, "shard_kpi_max_error_rate_pct", -1.0) or -1.0)
+    if shard_kpi_max_error_rate_pct != -1.0 and (
+        shard_kpi_max_error_rate_pct < 0.0 or shard_kpi_max_error_rate_pct > 100.0
+    ):
+        parser.error("Hata: --shard-kpi-max-error-rate-pct -1 veya 0..100 aralığında olmalıdır.")
 def _validate_pacing_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     mode = str(getattr(args, "pacing_mode", "none") or "none").strip().lower()
     rps = float(getattr(args, "rps", 0.0) or 0.0)

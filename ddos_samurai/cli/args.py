@@ -262,6 +262,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Distributed Prometheus metric isim prefix'i.",
     )
     distributed_group.add_argument(
+        "--shard-kpi-max-error-rate-pct",
+        type=float,
+        default=-1.0,
+        help="Per-shard KPI gate: maksimum hata oranı (%%). -1=kapalı.",
+    )
+    distributed_group.add_argument(
+        "--shard-kpi-fail-on-exitcode",
+        type=_arg_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Per-shard KPI gate: shard exitcode!=0 ise fail say.",
+    )
+    distributed_group.add_argument(
         "--management-api-enable",
         action="store_true",
         help="Master uzerinde runtime management REST API'yi ac.",
@@ -318,6 +332,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=5.0,
         help="file-lock HA lease yenileme aralığı (s).",
+    )
+    distributed_group.add_argument(
+        "--ha-wait-for-leader",
+        type=_arg_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="file-lock HA follower node, liderlik düşmesini bekleyip takeover denesin.",
+    )
+    distributed_group.add_argument(
+        "--ha-acquire-timeout-s",
+        type=float,
+        default=0.0,
+        help="file-lock HA liderlik bekleme timeout'u (0=sınırsız).",
+    )
+    distributed_group.add_argument(
+        "--ha-retry-interval-s",
+        type=float,
+        default=1.0,
+        help="file-lock HA liderlik acquire retry aralığı (s).",
     )
     distributed_group.add_argument(
         "--job-timeout-s",
