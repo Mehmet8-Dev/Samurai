@@ -59,7 +59,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     worker_ids = sorted(list(server.servicer.workers.keys()))
     if not worker_ids:
         utils.log_warning("No slave registered; master exits without dispatch.")
-        server.stop(0.0)
+        server.stop(stop_grace_s)
         return 1
 
     total_count = int(getattr(args, "count", 0) or 0)
@@ -138,7 +138,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             utils.log_warning(err)
         last = dispatch_failures[-1]
         utils.log_critical(f"Direct StartShard RPC failed; aborting job. {last}")
-        server.stop(0.0)
+        server.stop(stop_grace_s)
         return 1
 
     timeout_s = int(getattr(args, "job_timeout_s", 0) or 0)
@@ -189,7 +189,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                     _ = wc.stop_shard(shard_id=sid, graceful=False)
                 except Exception:
                     pass
-            server.stop(0.0)
+            server.stop(stop_grace_s)
             return 1
         if len(server.servicer.shard_stats) >= len(shards):
             break
@@ -286,5 +286,6 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         "numeric_totals": dict(agg.get("numeric_totals", {})),
     }
     utils.log_info(f"Distributed master summary: {snapshot}")
-    server.stop(0.0)
+    server.stop(stop_grace_s)
     return 0
+    stop_grace_s = max(0.0, float(getattr(args, "control_stop_grace_s", 1.0) or 0.0))

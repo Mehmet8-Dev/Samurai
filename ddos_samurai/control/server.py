@@ -181,6 +181,17 @@ class MasterControlServer:
             interceptors=[interceptor],
         )
         pb2_grpc.add_SamuraiControlServicer_to_server(self._servicer, self._server)
+        try:
+            from grpc_health.v1 import health, health_pb2
+            from grpc_health.v1 import health_pb2_grpc
+
+            hs = health.HealthServicer()
+            hs.set("", health_pb2.HealthCheckResponse.SERVING)
+            hs.set("samurai.control.v1.SamuraiControl", health_pb2.HealthCheckResponse.SERVING)
+            health_pb2_grpc.add_HealthServicer_to_server(hs, self._server)
+        except Exception:
+            # Health service is optional; server remains functional without it.
+            pass
         if self.insecure:
             self._server.add_insecure_port(self.listen_addr)
         else:

@@ -181,6 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Master start/stop shard RPC paralellik limiti.",
     )
     distributed_group.add_argument(
+        "--control-stop-grace-s",
+        type=float,
+        default=1.0,
+        help="Master gRPC server shutdown grace süresi (s).",
+    )
+    distributed_group.add_argument(
         "--worker-status-probe",
         type=_arg_bool,
         nargs="?",
