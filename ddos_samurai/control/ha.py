@@ -292,3 +292,179 @@ end
             "lease_ttl_ms": ttl_ms,
             "leader_epoch": int(self.leader_epoch),
         }
+
+
+class EtcdLeaseLeaderElector:
+    """etcd-backed lease elector with fencing epoch."""
+
+    def __init__(
+        self,
+        node_id: str,
+        endpoints_csv: str,
+        lease_key: str,
+        *,
+        lease_seconds: float = 15.0,
+        timeout_seconds: float = 3.0,
+    ) -> None:
+        self.node_id = str(node_id or "").strip() or socket.gethostname()
+        self.endpoints_csv = str(endpoints_csv or "").strip()
+        self.endpoints = [x.strip() for x in self.endpoints_csv.split(",") if x.strip()]
+        self.lease_key = str(lease_key or "").strip()
+        self.lease_seconds = max(1.0, float(lease_seconds or 15.0))
+        self.timeout_seconds = max(0.5, float(timeout_seconds or 3.0))
+        self.owner_token = f"{self.node_id}:{uuid.uuid4().hex}"
+        self._leader = False
+        self._leader_epoch = 0
+        self._lease = None
+        if not self.endpoints:
+            raise ValueError("etcd endpoints are required")
+        if not self.lease_key:
+            raise ValueError("lease_key is required")
+        try:
+            import etcd3  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError("etcd3 package is required for ha_mode=etcd") from exc
+        self._etcd3 = __import__("etcd3")
+        self._client = self._build_client()
+
+    def _build_client(self):
+        last_exc = None
+        for endpoint in self.endpoints:
+            host = endpoint
+            port = 2379
+            if ":" in endpoint:
+                host, p = endpoint.rsplit(":", 1)
+                port = int(p)
+            try:
+                cli = self._etcd3.client(host=host, port=port, timeout=self.timeout_seconds)
+                _ = cli.status()
+                return cli
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise RuntimeError(f"unable to connect any etcd endpoint: {self.endpoints}") from last_exc
+        raise RuntimeError("unable to create etcd client")
+
+    @staticmethod
+    def _to_int(raw) -> int:
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                return int(raw.decode("utf-8") or "0")
+            except Exception:
+                return 0
+        try:
+            return int(raw or 0)
+        except Exception:
+            return 0
+
+    def _epoch_key(self) -> str:
+        return f"{self.lease_key}:epoch"
+
+    def try_acquire(self) -> bool:
+        self._lease = self._client.lease(int(self.lease_seconds))
+        txn_ok, _responses = self._client.transaction(
+            compare=[self._client.transactions.version(self.lease_key) == 0],
+            success=[self._client.transactions.put(self.lease_key, self.owner_token, lease=self._lease.id)],
+            failure=[],
+        )
+        if bool(txn_ok):
+            self._leader = True
+            epoch, _meta = self._client.get(self._epoch_key())
+            cur = self._to_int(epoch)
+            nxt = cur + 1
+            self._client.put(self._epoch_key(), str(nxt))
+            self._leader_epoch = nxt
+            return True
+        val, _meta = self._client.get(self.lease_key)
+        token = (val.decode("utf-8") if isinstance(val, (bytes, bytearray)) else str(val or ""))
+        if token == self.owner_token:
+            self._leader = True
+            return True
+        self._leader = False
+        try:
+            self._lease.revoke()
+        except Exception:
+            pass
+        self._lease = None
+        return False
+
+    def renew_once(self) -> bool:
+        if self._lease is None:
+            self._leader = False
+            return False
+        try:
+            val, _meta = self._client.get(self.lease_key)
+            token = (val.decode("utf-8") if isinstance(val, (bytes, bytearray)) else str(val or ""))
+            if token != self.owner_token:
+                self._leader = False
+                return False
+            _ = self._lease.refresh()
+            self._leader = True
+            if self._leader_epoch <= 0:
+                epoch, _meta = self._client.get(self._epoch_key())
+                self._leader_epoch = self._to_int(epoch)
+            return True
+        except Exception:
+            self._leader = False
+            return False
+
+    def start_renew_loop(self, interval_seconds: float = 5.0) -> None:
+        iv = max(0.2, float(interval_seconds or 5.0))
+        self._stop_evt = threading.Event()
+
+        def _loop():
+            while not self._stop_evt.wait(iv):
+                if not self.renew_once():
+                    break
+
+        self._renew_thread = threading.Thread(target=_loop, daemon=True, name="EtcdLeaseRenew")
+        self._renew_thread.start()
+
+    def is_leader(self) -> bool:
+        return bool(self._leader)
+
+    @property
+    def leader_epoch(self) -> int:
+        return int(self._leader_epoch or 0)
+
+    def release(self) -> None:
+        try:
+            val, _meta = self._client.get(self.lease_key)
+            token = (val.decode("utf-8") if isinstance(val, (bytes, bytearray)) else str(val or ""))
+            if token == self.owner_token:
+                self._client.delete(self.lease_key)
+        except Exception:
+            pass
+        try:
+            if self._lease is not None:
+                self._lease.revoke()
+        except Exception:
+            pass
+        self._leader = False
+
+    def stop(self) -> None:
+        evt = getattr(self, "_stop_evt", None)
+        if evt is not None:
+            evt.set()
+        th = getattr(self, "_renew_thread", None)
+        if th is not None:
+            th.join(timeout=2.0)
+        self.release()
+
+    def snapshot(self) -> dict:
+        try:
+            val, _meta = self._client.get(self.lease_key)
+            token = (val.decode("utf-8") if isinstance(val, (bytes, bytearray)) else str(val or ""))
+        except Exception:
+            token = ""
+        leader_id = str(token.split(":", 1)[0] if ":" in token else token)
+        return {
+            "mode": "etcd",
+            "node_id": str(self.node_id),
+            "leader_id": leader_id,
+            "is_leader": 1 if self.is_leader() else 0,
+            "endpoints": list(self.endpoints),
+            "lease_key": str(self.lease_key),
+            "leader_epoch": int(self.leader_epoch),
+        }

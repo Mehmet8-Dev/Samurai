@@ -43,6 +43,10 @@ class _SamuraiServicer:
         self._stats_lock = threading.Lock()
         self.workers = {}
         self.shard_stats = {}
+        self._leader_epoch_min = 0
+
+    def set_leader_epoch_min(self, epoch: int) -> None:
+        self._leader_epoch_min = max(0, int(epoch or 0))
 
     def RegisterWorker(self, request, context):
         _ = context
@@ -101,12 +105,23 @@ class _SamuraiServicer:
 
     def ReportStats(self, request, context):
         _ = context
+        payload = bytes(request.stats_json or b"{}")
+        req_epoch = 0
+        if self._leader_epoch_min > 0:
+            try:
+                item = json.loads(payload.decode("utf-8"))
+                req_epoch = int((dict(item or {})).get("leader_epoch", 0) or 0)
+            except (ValueError, TypeError, UnicodeDecodeError):
+                req_epoch = 0
+            if req_epoch > 0 and req_epoch < self._leader_epoch_min:
+                pb2, _ = load_generated()
+                return pb2.ReportStatsResponse(received=False)
         with self._stats_lock:
-            self.shard_stats[str(request.shard_id)] = bytes(request.stats_json or b"{}")
+            self.shard_stats[str(request.shard_id)] = payload
         with self._workers_lock:
             wid = str(request.worker_id)
             if wid in self.workers:
-                self.workers[wid]["stats_json"] = bytes(request.stats_json or b"{}")
+                self.workers[wid]["stats_json"] = payload
         pb2, _ = load_generated()
         return pb2.ReportStatsResponse(received=True)
 

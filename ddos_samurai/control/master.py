@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .. import utils
 from .client import WorkerControlClient
 from .discovery import EndpointDiscovery
-from .ha import FileLeaseLeaderElector, RedisLeaseLeaderElector, StaticLeaderElector
+from .ha import EtcdLeaseLeaderElector, FileLeaseLeaderElector, RedisLeaseLeaderElector, StaticLeaderElector
 from .management_api import ManagementAPIServer, create_management_app
 from .proto import load_generated
 from .server import MasterControlServer
@@ -463,44 +463,15 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     ha_renew_interval = float(getattr(args, "ha_renew_interval_s", 5.0) or 5.0)
     ha_redis_url = str(getattr(args, "ha_redis_url", "redis://127.0.0.1:6379/0") or "redis://127.0.0.1:6379/0").strip()
     ha_redis_key = str(getattr(args, "ha_redis_key", "samurai:ha:master") or "samurai:ha:master").strip()
+    ha_etcd_endpoints = str(getattr(args, "ha_etcd_endpoints", "127.0.0.1:2379") or "127.0.0.1:2379").strip()
+    ha_etcd_key = str(getattr(args, "ha_etcd_key", "samurai/ha/master") or "samurai/ha/master").strip()
+    ha_etcd_timeout_s = float(getattr(args, "ha_etcd_timeout_s", 3.0) or 3.0)
     ha_elector = None
     ha_wait_for_leader = bool(getattr(args, "ha_wait_for_leader", True))
     ha_acquire_timeout_s = float(getattr(args, "ha_acquire_timeout_s", 0.0) or 0.0)
     ha_retry_interval_s = max(0.2, float(getattr(args, "ha_retry_interval_s", 1.0) or 1.0))
     if ha_enabled:
-        if ha_mode == "file-lock":
-            e = FileLeaseLeaderElector(
-                node_id=ha_node_id,
-                lease_path=ha_lease_path,
-                lease_seconds=ha_lease_seconds,
-            )
-        elif ha_mode == "redis":
-            e = RedisLeaseLeaderElector(
-                node_id=ha_node_id,
-                redis_url=ha_redis_url,
-                lease_key=ha_redis_key,
-                lease_seconds=ha_lease_seconds,
-            )
-            acquired = bool(e.try_acquire())
-            if not acquired and ha_wait_for_leader:
-                start_wait = time.time()
-                while True:
-                    if ha_acquire_timeout_s > 0 and (time.time() - start_wait) >= ha_acquire_timeout_s:
-                        break
-                    time.sleep(ha_retry_interval_s)
-                    if e.try_acquire():
-                        acquired = True
-                        break
-            if not acquired:
-                snap = e.snapshot()
-                utils.log_warning(
-                    f"HA redis mode: this node is follower (node_id={snap.get('node_id')} "
-                    f"leader_id={snap.get('leader_id')}). Skipping master run."
-                )
-                return 0
-            e.start_renew_loop(interval_seconds=ha_renew_interval)
-            ha_elector = e
-        elif ha_mode == "static":
+        if ha_mode == "static":
             ha_elector = StaticLeaderElector(node_id=ha_node_id, peers_csv=ha_peers)
             if not ha_elector.is_leader():
                 snap = ha_elector.snapshot()
@@ -510,9 +481,30 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                 )
                 return 0
         else:
-            raise ValueError(f"unsupported ha mode: {ha_mode}")
+            if ha_mode == "file-lock":
+                e = FileLeaseLeaderElector(
+                    node_id=ha_node_id,
+                    lease_path=ha_lease_path,
+                    lease_seconds=ha_lease_seconds,
+                )
+            elif ha_mode == "redis":
+                e = RedisLeaseLeaderElector(
+                    node_id=ha_node_id,
+                    redis_url=ha_redis_url,
+                    lease_key=ha_redis_key,
+                    lease_seconds=ha_lease_seconds,
+                )
+            elif ha_mode == "etcd":
+                e = EtcdLeaseLeaderElector(
+                    node_id=ha_node_id,
+                    endpoints_csv=ha_etcd_endpoints,
+                    lease_key=ha_etcd_key,
+                    lease_seconds=ha_lease_seconds,
+                    timeout_seconds=ha_etcd_timeout_s,
+                )
+            else:
+                raise ValueError(f"unsupported ha mode: {ha_mode}")
 
-        if ha_mode == "file-lock":
             acquired = bool(e.try_acquire())
             if not acquired and ha_wait_for_leader:
                 start_wait = time.time()
@@ -526,7 +518,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             if not acquired:
                 snap = e.snapshot()
                 utils.log_warning(
-                    f"HA file-lock mode: this node is follower (node_id={snap.get('node_id')} "
+                    f"HA {ha_mode} mode: this node is follower (node_id={snap.get('node_id')} "
                     f"leader_id={snap.get('leader_id')}). Skipping master run."
                 )
                 return 0
@@ -562,6 +554,15 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     mgmt_server = None
     latest_snapshot: dict = {}
     current_job: dict = {"state": "idle", "job_id": ""}
+    events: list[dict] = []
+    events_max = max(10, int(getattr(args, "management_events_max", 200) or 200))
+
+    def _push_event(kind: str, **extra) -> None:
+        item = {"ts_ms": int(time.time() * 1000), "kind": str(kind)}
+        item.update({str(k): v for k, v in dict(extra or {}).items()})
+        events.append(item)
+        if len(events) > events_max:
+            del events[0 : len(events) - events_max]
 
     def _state_provider() -> dict:
         workers = []
@@ -598,11 +599,18 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             "latest_snapshot": dict(latest_snapshot),
             "current_job": dict(current_job),
             "ha": dict(ha_state),
+            "events": list(events),
         }
 
     def _abort_callback() -> dict:
         pb2, _ = load_generated()
         resp = server.servicer.AbortJob(pb2.AbortJobRequest(job_id=str(current_job.get("job_id", ""))), context=None)
+        _push_event(
+            "abort_api",
+            job_id=str(current_job.get("job_id", "")),
+            workers_notified=int(resp.workers_notified or 0),
+            leader_epoch=int(ha_state.get("leader_epoch", 0) or 0),
+        )
         return {"aborted": bool(resp.aborted), "workers_notified": int(resp.workers_notified or 0)}
     try:
         server.start()
@@ -618,6 +626,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         f"Distributed master started on {server.listen_addr}. "
         f"grpc_max_workers={int(control_max_workers)}"
     )
+    _push_event("master_started", listen_addr=str(server.listen_addr))
     if bool(getattr(args, "management_api_enable", False)):
         mgmt_app = create_management_app(
             state_provider=_state_provider,
@@ -641,6 +650,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         time.sleep(0.5)
     if not server.servicer.workers:
         utils.log_warning("No slave registered; master exits without dispatch.")
+        _push_event("master_exit_no_workers")
         if mgmt_server is not None:
             mgmt_server.stop()
         server.stop(stop_grace_s)
@@ -668,6 +678,12 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             job_run["_leader_epoch"] = 0
         current_job["state"] = "running"
         current_job["job_id"] = job_id
+        _push_event(
+            "job_started",
+            job_id=job_id,
+            leader_epoch=int(job_run.get("_leader_epoch", 0) or 0),
+        )
+        server.servicer.set_leader_epoch_min(int(job_run.get("_leader_epoch", 0) or 0))
         guard = (lambda: bool(ha_elector.is_leader())) if ha_elector is not None else None
         rc, snap = _run_single_job(server, job_run, job_id=job_id, leadership_guard=guard)
         snap = _apply_distributed_kpi_gate(snap, job_run)
@@ -692,13 +708,24 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         if int(snap.get("per_shard_kpi_hard_fail", 0) or 0) == 1:
             final_rc = 1
         current_job["state"] = "done" if int(rc) == 0 else "error"
+        _push_event(
+            "job_finished",
+            job_id=job_id,
+            rc=int(rc),
+            sent=int(snap.get("sent", 0) or 0),
+            errors=int(snap.get("errors", 0) or 0),
+            leader_epoch=int(snap.get("leader_epoch", 0) or 0),
+            error=str(snap.get("error", "") or ""),
+        )
 
     if len(multi_summary) > 1:
         utils.log_info(f"Distributed master multi-job summary: jobs={len(multi_summary)} rc={final_rc}")
+        _push_event("multi_job_summary", jobs=int(len(multi_summary)), rc=int(final_rc))
 
     if mgmt_server is not None:
         mgmt_server.stop()
     server.stop(stop_grace_s)
+    _push_event("master_stopped", rc=int(final_rc))
     if ha_elector is not None and hasattr(ha_elector, "stop"):
         try:
             ha_elector.stop()

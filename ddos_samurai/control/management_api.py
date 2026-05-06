@@ -63,6 +63,12 @@ def create_management_app(
         st = dict(state_provider() or {})
         return {"shards": list(st.get("shards") or [])}
 
+    @app.get("/v1/cluster/events")
+    def cluster_events(authorization: str | None = Header(default=None)):
+        _guard(authorization)
+        st = dict(state_provider() or {})
+        return {"events": list(st.get("events") or [])}
+
     @app.post("/v1/jobs/abort")
     def abort_job(authorization: str | None = Header(default=None)):
         _guard(authorization)
