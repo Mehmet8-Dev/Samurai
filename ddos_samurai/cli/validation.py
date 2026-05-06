@@ -42,6 +42,10 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
     insecure = bool(getattr(args, "control_insecure", False))
     cert = str(getattr(args, "control_tls_cert", "") or "").strip()
     key = str(getattr(args, "control_tls_key", "") or "").strip()
+    client_ca = str(getattr(args, "control_tls_client_ca", "") or "").strip()
+    client_cert = str(getattr(args, "control_tls_client_cert", "") or "").strip()
+    client_key = str(getattr(args, "control_tls_client_key", "") or "").strip()
+    require_client_auth = bool(getattr(args, "control_require_client_auth", False))
     if not insecure and role == "master":
         if not cert or not key:
             parser.error(
@@ -52,6 +56,22 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
             parser.error(f"Hata: --control-tls-cert dosyası bulunamadı: {cert}")
         if key and not os.path.isfile(key):
             parser.error(f"Hata: --control-tls-key dosyası bulunamadı: {key}")
+        if require_client_auth and not client_ca:
+            parser.error(
+                "Hata: --control-require-client-auth için --control-tls-client-ca zorunludur."
+            )
+
+    if client_ca and not os.path.isfile(client_ca):
+        parser.error(f"Hata: --control-tls-client-ca dosyası bulunamadı: {client_ca}")
+
+    if bool(client_cert) ^ bool(client_key):
+        parser.error(
+            "Hata: mTLS client kimliği için --control-tls-client-cert ve --control-tls-client-key birlikte verilmelidir."
+        )
+    if client_cert and not os.path.isfile(client_cert):
+        parser.error(f"Hata: --control-tls-client-cert dosyası bulunamadı: {client_cert}")
+    if client_key and not os.path.isfile(client_key):
+        parser.error(f"Hata: --control-tls-client-key dosyası bulunamadı: {client_key}")
 
     secret = str(getattr(args, "cluster_secret", "") or "").strip()
     if not secret and not insecure:

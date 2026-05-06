@@ -140,6 +140,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="gRPC TLS CA bundle (slave tarafında server doğrulaması için).",
     )
     distributed_group.add_argument(
+        "--control-tls-client-ca",
+        type=str,
+        default="",
+        help="mTLS için client certificate CA bundle (master server doğrulaması).",
+    )
+    distributed_group.add_argument(
+        "--control-tls-client-cert",
+        type=str,
+        default="",
+        help="mTLS için client certificate dosyası (PEM, slave/master client tarafı).",
+    )
+    distributed_group.add_argument(
+        "--control-tls-client-key",
+        type=str,
+        default="",
+        help="mTLS için client private key dosyası (PEM, slave/master client tarafı).",
+    )
+    distributed_group.add_argument(
+        "--control-require-client-auth",
+        action="store_true",
+        help="Master gRPC server için mTLS client auth zorunlu kıl.",
+    )
+    distributed_group.add_argument(
         "--control-insecure",
         action="store_true",
         help="TLS olmadan plaintext gRPC (sadece dev/lab için).",
@@ -225,6 +248,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=500,
         help="Shard calisirken stream uzerinden canli stats yayin araligi (ms).",
+    )
+    distributed_group.add_argument(
+        "--distributed-metrics-textfile",
+        type=str,
+        default="",
+        help="Master distributed summary Prometheus textfile export yolu (opsiyonel).",
+    )
+    distributed_group.add_argument(
+        "--distributed-metrics-prefix",
+        type=str,
+        default="samurai_distributed",
+        help="Distributed Prometheus metric isim prefix'i.",
     )
     distributed_group.add_argument(
         "--job-timeout-s",
