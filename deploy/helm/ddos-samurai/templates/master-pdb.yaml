@@ -1,0 +1,12 @@
+{{- if .Values.master.podDisruptionBudget.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ddos-samurai.fullname" . }}-master
+spec:
+  minAvailable: {{ .Values.master.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
+      app.kubernetes.io/component: master
+{{- end -}}

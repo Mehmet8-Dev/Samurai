@@ -7,6 +7,8 @@ metadata:
     app.kubernetes.io/component: slave
 spec:
   replicas: {{ .Values.slave.replicas }}
+  strategy:
+{{ toYaml .Values.slave.updateStrategy | indent 4 }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
@@ -16,11 +18,22 @@ spec:
       labels:
         app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
         app.kubernetes.io/component: slave
+      annotations:
+{{ toYaml .Values.podAnnotations | indent 8 }}
     spec:
+      serviceAccountName: {{ include "ddos-samurai.serviceAccountName" . }}
+{{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | indent 8 }}
+{{- end }}
+      securityContext:
+{{ toYaml .Values.securityContext | indent 8 }}
       containers:
         - name: slave
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | indent 12 }}
           args:
 {{- range .Values.slave.args }}
 {{- if contains "{{ .Release.Name }}" . }}
@@ -32,6 +45,16 @@ spec:
           ports:
             - containerPort: 5099
               name: grpc
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 10
+            periodSeconds: 10
           resources:
 {{ toYaml .Values.resources | indent 12 }}
       nodeSelector:

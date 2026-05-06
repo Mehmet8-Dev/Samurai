@@ -2,7 +2,7 @@ services:
   master:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.prod
     container_name: samurai-master
     command:
       - --role
@@ -31,7 +31,7 @@ services:
   slave:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.prod
     command:
       - --role
       - slave

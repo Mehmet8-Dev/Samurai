@@ -1,4 +1,5 @@
 from ddos_samurai.control.master import (
+    _apply_per_shard_kpi_gate,
     _apply_distributed_kpi_gate,
     _distributed_snapshot_to_prometheus,
     _distributed_state_to_prometheus,
@@ -14,11 +15,15 @@ def test_distributed_snapshot_to_prometheus_includes_core_fields_and_gate_status
         "pending_shards_left": 0,
         "inflight_shards_left": 1,
         "kpi_gate_status": "pass",
+        "per_shard_kpi_status": "pass",
+        "per_shard_kpi_failed_count": 0,
     }
     text = _distributed_snapshot_to_prometheus(snap)
     assert "samurai_distributed_workers 3.0" in text
     assert "samurai_distributed_shards_reported 12.0" in text
     assert 'samurai_distributed_kpi_gate_status{status="pass"} 1' in text
+    assert 'samurai_distributed_per_shard_kpi_status{status="pass"} 1' in text
+    assert "samurai_distributed_per_shard_kpi_failed_count 0.0" in text
 
 
 def test_apply_distributed_kpi_gate_off_profile_passes():
@@ -78,3 +83,24 @@ def test_distributed_state_to_prometheus_includes_worker_shard_and_ha_metrics():
     assert 'samurai_distributed_worker_state{worker_id="w-1",state="running"} 1' in text
     assert 'samurai_distributed_shard_stats_size_bytes{shard_id="s-1"} 96.0' in text
     assert 'samurai_distributed_ha_is_leader{mode="static"} 1.0' in text
+
+
+def test_apply_per_shard_kpi_gate_flags_exitcode_and_error_rate():
+    snap = {
+        "top_error_shards": [
+            {"shard_id": "s1", "sent": 90, "errors": 20, "last_exitcode": 0},
+            {"shard_id": "s2", "sent": 100, "errors": 0, "last_exitcode": 1},
+            {"shard_id": "s3", "sent": 100, "errors": 1, "last_exitcode": 0},
+        ]
+    }
+    out = _apply_per_shard_kpi_gate(
+        snap,
+        {
+            "shard_kpi_max_error_rate_pct": 10.0,
+            "shard_kpi_fail_on_exitcode": True,
+            "kpi_hard_fail": True,
+        },
+    )
+    assert out["per_shard_kpi_status"] == "fail"
+    assert int(out["per_shard_kpi_failed_count"]) == 2
+    assert int(out["per_shard_kpi_hard_fail"]) == 1

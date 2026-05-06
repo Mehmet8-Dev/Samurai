@@ -7,6 +7,8 @@ metadata:
     app.kubernetes.io/component: master
 spec:
   replicas: {{ .Values.master.replicas }}
+  strategy:
+{{ toYaml .Values.master.updateStrategy | indent 4 }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
@@ -16,11 +18,22 @@ spec:
       labels:
         app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
         app.kubernetes.io/component: master
+      annotations:
+{{ toYaml .Values.podAnnotations | indent 8 }}
     spec:
+      serviceAccountName: {{ include "ddos-samurai.serviceAccountName" . }}
+{{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | indent 8 }}
+{{- end }}
+      securityContext:
+{{ toYaml .Values.securityContext | indent 8 }}
       containers:
         - name: master
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | indent 12 }}
           args:
 {{- range .Values.master.args }}
             - {{ . | quote }}
@@ -28,6 +41,19 @@ spec:
           ports:
             - containerPort: {{ .Values.master.service.port }}
               name: grpc
+            - containerPort: {{ .Values.master.managementPort }}
+              name: mgmt
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: mgmt
+            initialDelaySeconds: 10
+            periodSeconds: 10
           resources:
 {{ toYaml .Values.resources | indent 12 }}
       nodeSelector:

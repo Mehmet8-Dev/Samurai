@@ -2,9 +2,19 @@ image:
   repository: ddos-samurai
   tag: latest
   pullPolicy: IfNotPresent
+  pullSecrets: []
 
 master:
   replicas: 1
+  managementPort: 8089
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   service:
     type: ClusterIP
     port: 5099
@@ -14,6 +24,9 @@ master:
     - --control-insecure
     - --control-listen
     - 0.0.0.0:5099
+    - --management-api-enable
+    - --management-api-listen
+    - 0.0.0.0:8089
     - --worker-registration-timeout-s
     - "30"
     - --job-timeout-s
@@ -30,6 +43,14 @@ master:
 
 slave:
   replicas: 2
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
   args:
     - --role
     - slave
@@ -43,7 +64,27 @@ slave:
     - --slave-master-timeout-s
     - "30"
 
-resources: {}
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+serviceAccount:
+  create: true
+  name: ""
+podAnnotations: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
