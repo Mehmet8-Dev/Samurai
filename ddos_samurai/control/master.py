@@ -145,9 +145,19 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     wait_s = timeout_s if timeout_s > 0 else 120
     hb_timeout_ms = int(getattr(args, "heartbeat_timeout_ms", 6000) or 6000)
     poll_interval_s = max(0.05, float(getattr(args, "master_poll_interval_ms", 250) or 250) / 1000.0)
+    worker_status_probe = bool(getattr(args, "worker_status_probe", True))
     on_worker_loss = str(getattr(args, "on_worker_loss", "continue") or "continue").strip().lower()
     deadline = time.time() + float(wait_s)
     lost_workers = set()
+    done_shards = set()
+
+    shard_to_worker = {str(s["shard_id"]): str(s["worker_id"]) for s in shards}
+
+    def _endpoint_for_worker(worker_id: str) -> str:
+        wrec = dict(server.servicer.workers.get(worker_id) or {})
+        caps = dict(wrec.get("capabilities") or {})
+        return str(caps.get("control_endpoint", "") or "").strip()
+
     while time.time() < deadline:
         now_ms = int(time.time() * 1000)
         for wid, rec in dict(server.servicer.workers).items():
@@ -183,6 +193,35 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             return 1
         if len(server.servicer.shard_stats) >= len(shards):
             break
+        if worker_status_probe:
+            for sid, wid in shard_to_worker.items():
+                if sid in done_shards:
+                    continue
+                if sid in server.servicer.shard_stats:
+                    done_shards.add(sid)
+                    continue
+                ep = _endpoint_for_worker(wid)
+                if not ep:
+                    continue
+                try:
+                    wc = WorkerControlClient(
+                        endpoint=ep,
+                        cluster_secret=str(getattr(args, "cluster_secret", "")),
+                        insecure=bool(getattr(args, "control_insecure", False)),
+                        tls_ca=str(getattr(args, "control_tls_ca", "")),
+                    )
+                    st = wc.get_worker_status(worker_id=wid)
+                    state = str(st.get("state", "") or "").strip().lower()
+                    active_sid = str(st.get("active_shard_id", "") or "").strip()
+                    if state in {"done", "error"} and active_sid in {"", sid}:
+                        stats_json = bytes(st.get("stats_json", b"{}") or b"{}")
+                        if stats_json and stats_json != b"{}":
+                            server.servicer.shard_stats[sid] = stats_json
+                        done_shards.add(sid)
+                except Exception:
+                    continue
+            if len(done_shards) >= len(shards):
+                break
         time.sleep(poll_interval_s)
 
     def _stop_one(shard_item: dict) -> tuple[str, bool]:
@@ -205,12 +244,23 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         return sid, False
 
     stop_pool = max(1, min(len(shards), int(getattr(args, "control_dispatch_workers", 32) or 32)))
-    with ThreadPoolExecutor(max_workers=stop_pool) as pool:
-        fut_map = {pool.submit(_stop_one, shard): shard for shard in shards}
-        for fut in as_completed(fut_map):
-            sid, stopped = fut.result()
-            if not stopped:
-                utils.log_warning(f"E_STOPSHARD_FAILED shard={sid}")
+    stop_retries = max(1, int(getattr(args, "stop_shard_retries", 3) or 3))
+    stop_retry_delay_ms = max(10, int(getattr(args, "stop_shard_retry_delay_ms", 250) or 250))
+    unresolved = set(str(s["shard_id"]) for s in shards)
+    for attempt in range(stop_retries):
+        targets = [s for s in shards if str(s["shard_id"]) in unresolved]
+        if not targets:
+            break
+        with ThreadPoolExecutor(max_workers=stop_pool) as pool:
+            fut_map = {pool.submit(_stop_one, shard): shard for shard in targets}
+            for fut in as_completed(fut_map):
+                sid, stopped = fut.result()
+                if stopped:
+                    unresolved.discard(sid)
+        if unresolved:
+            time.sleep(float(stop_retry_delay_ms) / 1000.0)
+    for sid in sorted(unresolved):
+        utils.log_warning(f"E_STOPSHARD_FAILED shard={sid} retries={stop_retries}")
 
     aggregator = DistributedAggregator()
     for sid, blob in dict(server.servicer.shard_stats).items():

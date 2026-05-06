@@ -181,6 +181,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Master start/stop shard RPC paralellik limiti.",
     )
     distributed_group.add_argument(
+        "--worker-status-probe",
+        type=_arg_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Master wait-loop sırasında worker GetWorkerStatus probe ile shard completion fallback.",
+    )
+    distributed_group.add_argument(
+        "--stop-shard-retries",
+        type=int,
+        default=3,
+        help="Master graceful StopShard retry sayısı.",
+    )
+    distributed_group.add_argument(
+        "--stop-shard-retry-delay-ms",
+        type=int,
+        default=250,
+        help="Master StopShard retry denemeleri arası bekleme (ms).",
+    )
+    distributed_group.add_argument(
         "--slave-master-timeout-s",
         type=int,
         default=30,
