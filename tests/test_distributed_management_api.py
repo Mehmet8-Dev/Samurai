@@ -13,6 +13,7 @@ def test_management_api_summary_and_abort_with_auth():
         "latest_snapshot": {"sent": 10, "errors": 0},
         "current_job": {"state": "running", "job_id": "job-1"},
         "ha": {"mode": "off", "is_leader": 1},
+        "events": [{"ts_ms": 1, "kind": "master_started"}],
     }
     called = {"abort": 0}
 
@@ -59,3 +60,8 @@ def test_management_api_summary_and_abort_with_auth():
     r5 = cli.get("/metrics", headers=hdr)
     assert r5.status_code == 200
     assert "samurai_distributed_workers 1" in str(r5.text)
+
+    r6 = cli.get("/v1/cluster/events", headers=hdr)
+    assert r6.status_code == 200
+    events = list((r6.json() or {}).get("events") or [])
+    assert events and str(events[0].get("kind", "")) == "master_started"

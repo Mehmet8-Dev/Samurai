@@ -2,7 +2,9 @@ from pathlib import Path
 
 import shutil
 import subprocess
+import sys
 import time
+import types
 
 import pytest
 
@@ -82,3 +84,93 @@ def test_redis_lease_elector_acquire_and_epoch():
     finally:
         proc.terminate()
         proc.wait(timeout=3)
+
+
+def test_etcd_lease_elector_with_fake_client():
+    class _FakeLease:
+        def __init__(self, lease_id):
+            self.id = lease_id
+
+        def refresh(self):
+            return True
+
+        def revoke(self):
+            return True
+
+    class _FakeTx:
+        @staticmethod
+        def version(_k):
+            class _Cmp:
+                def __eq__(self, _v):
+                    return ("cmp",)
+
+            return _Cmp()
+
+        @staticmethod
+        def put(k, v, lease=None):
+            return ("put", k, v, lease)
+
+    class _FakeClient:
+        def __init__(self):
+            self.kv = {}
+            self.transactions = _FakeTx()
+            self._lease_id = 100
+
+        def status(self):
+            return {"version": "fake"}
+
+        def lease(self, _ttl):
+            self._lease_id += 1
+            return _FakeLease(self._lease_id)
+
+        def transaction(self, compare, success, failure):
+            _ = compare
+            _ = failure
+            if "k" not in self.kv:
+                _, k, v, _lease = success[0]
+                self.kv[k] = v
+                return True, []
+            return False, []
+
+        def get(self, key):
+            val = self.kv.get(key)
+            if val is None:
+                return None, None
+            if isinstance(val, bytes):
+                return val, None
+            return str(val).encode("utf-8"), None
+
+        def put(self, key, value):
+            self.kv[key] = str(value)
+            return True
+
+        def delete(self, key):
+            self.kv.pop(key, None)
+            return True
+
+    fake_mod = types.SimpleNamespace(client=lambda **kwargs: _FakeClient())
+    old = sys.modules.get("etcd3")
+    sys.modules["etcd3"] = fake_mod
+    try:
+        from ddos_samurai.control.ha import EtcdLeaseLeaderElector
+
+        e = EtcdLeaseLeaderElector(
+            node_id="node-a",
+            endpoints_csv="127.0.0.1:2379",
+            lease_key="k",
+            lease_seconds=3.0,
+            timeout_seconds=1.0,
+        )
+        assert e.try_acquire() is True
+        assert e.is_leader() is True
+        assert int(e.leader_epoch) >= 1
+        assert e.renew_once() is True
+        snap = e.snapshot()
+        assert snap["mode"] == "etcd"
+        assert int(snap["is_leader"]) == 1
+        e.stop()
+    finally:
+        if old is None:
+            sys.modules.pop("etcd3", None)
+        else:
+            sys.modules["etcd3"] = old
