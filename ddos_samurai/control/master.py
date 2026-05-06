@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .. import utils
 from .client import WorkerControlClient
 from .discovery import EndpointDiscovery
-from .ha import FileLeaseLeaderElector, StaticLeaderElector
+from .ha import FileLeaseLeaderElector, RedisLeaseLeaderElector, StaticLeaderElector
 from .management_api import ManagementAPIServer, create_management_app
 from .proto import load_generated
 from .server import MasterControlServer
@@ -170,7 +170,12 @@ def _distributed_state_to_prometheus(state: dict, prefix: str = "samurai_distrib
     return out + ("\n" if out else "")
 
 
-def _run_single_job(server: MasterControlServer, job_args: dict, job_id: str) -> tuple[int, dict]:
+def _run_single_job(
+    server: MasterControlServer,
+    job_args: dict,
+    job_id: str,
+    leadership_guard=None,
+) -> tuple[int, dict]:
     total_count = int(job_args.get("count", 0) or 0)
     if total_count <= 0:
         return 1, {"job_id": job_id, "error": "count<=0"}
@@ -265,6 +270,12 @@ def _run_single_job(server: MasterControlServer, job_args: dict, job_id: str) ->
             return "", "", b"{}"
 
     while time.time() < deadline:
+        if leadership_guard is not None and not bool(leadership_guard()):
+            return 1, {
+                "job_id": job_id,
+                "error": "leadership_lost_abort",
+                "dispatch_failures": list(dispatch_failures),
+            }
         now_ms = int(time.time() * 1000)
         workers_now = sorted(list(server.servicer.workers.keys()))
 
@@ -440,6 +451,8 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     ha_lease_path = str(getattr(args, "ha_lease_path", "/tmp/ddos_samurai_master_lease.json") or "").strip()
     ha_lease_seconds = float(getattr(args, "ha_lease_seconds", 15.0) or 15.0)
     ha_renew_interval = float(getattr(args, "ha_renew_interval_s", 5.0) or 5.0)
+    ha_redis_url = str(getattr(args, "ha_redis_url", "redis://127.0.0.1:6379/0") or "redis://127.0.0.1:6379/0").strip()
+    ha_redis_key = str(getattr(args, "ha_redis_key", "samurai:ha:master") or "samurai:ha:master").strip()
     ha_elector = None
     ha_wait_for_leader = bool(getattr(args, "ha_wait_for_leader", True))
     ha_acquire_timeout_s = float(getattr(args, "ha_acquire_timeout_s", 0.0) or 0.0)
@@ -451,6 +464,45 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                 lease_path=ha_lease_path,
                 lease_seconds=ha_lease_seconds,
             )
+        elif ha_mode == "redis":
+            e = RedisLeaseLeaderElector(
+                node_id=ha_node_id,
+                redis_url=ha_redis_url,
+                lease_key=ha_redis_key,
+                lease_seconds=ha_lease_seconds,
+            )
+            acquired = bool(e.try_acquire())
+            if not acquired and ha_wait_for_leader:
+                start_wait = time.time()
+                while True:
+                    if ha_acquire_timeout_s > 0 and (time.time() - start_wait) >= ha_acquire_timeout_s:
+                        break
+                    time.sleep(ha_retry_interval_s)
+                    if e.try_acquire():
+                        acquired = True
+                        break
+            if not acquired:
+                snap = e.snapshot()
+                utils.log_warning(
+                    f"HA redis mode: this node is follower (node_id={snap.get('node_id')} "
+                    f"leader_id={snap.get('leader_id')}). Skipping master run."
+                )
+                return 0
+            e.start_renew_loop(interval_seconds=ha_renew_interval)
+            ha_elector = e
+        elif ha_mode == "static":
+            ha_elector = StaticLeaderElector(node_id=ha_node_id, peers_csv=ha_peers)
+            if not ha_elector.is_leader():
+                snap = ha_elector.snapshot()
+                utils.log_warning(
+                    f"HA static mode: this node is follower (node_id={snap.get('node_id')} "
+                    f"leader_id={snap.get('leader_id')}). Skipping master run."
+                )
+                return 0
+        else:
+            raise ValueError(f"unsupported ha mode: {ha_mode}")
+
+        if ha_mode == "file-lock":
             acquired = bool(e.try_acquire())
             if not acquired and ha_wait_for_leader:
                 start_wait = time.time()
@@ -470,16 +522,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                 return 0
             e.start_renew_loop(interval_seconds=ha_renew_interval)
             ha_elector = e
-        else:
-            ha_elector = StaticLeaderElector(node_id=ha_node_id, peers_csv=ha_peers)
-            if not ha_elector.is_leader():
-                snap = ha_elector.snapshot()
-                utils.log_warning(
-                    f"HA static mode: this node is follower (node_id={snap.get('node_id')} "
-                    f"leader_id={snap.get('leader_id')}). Skipping master run."
-                )
-                return 0
-    ha_state = dict(ha_elector.snapshot()) if ha_elector is not None else {"mode": "off", "is_leader": 1}
+    ha_state = dict(ha_elector.snapshot()) if ha_elector is not None else {"mode": "off", "is_leader": 1, "leader_epoch": 0}
 
     discovery = EndpointDiscovery(
         manual_endpoints=str(getattr(args, "control_endpoints", "")),
@@ -531,6 +574,12 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                         "stats_size_bytes": len(bytes(blob or b"")),
                     }
                 )
+        if ha_elector is not None:
+            try:
+                ha_state.clear()
+                ha_state.update(dict(ha_elector.snapshot()))
+            except Exception:
+                pass
         return {
             "workers": workers,
             "workers_count": len(workers),
@@ -601,7 +650,8 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         job_id = f"job-{int(time.time())}-{idx}"
         current_job["state"] = "running"
         current_job["job_id"] = job_id
-        rc, snap = _run_single_job(server, job, job_id=job_id)
+        guard = (lambda: bool(ha_elector.is_leader())) if ha_elector is not None else None
+        rc, snap = _run_single_job(server, job, job_id=job_id, leadership_guard=guard)
         snap = _apply_distributed_kpi_gate(snap, job)
         snap = _apply_per_shard_kpi_gate(snap, job)
         latest_snapshot.clear()

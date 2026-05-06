@@ -402,8 +402,17 @@ def run_distributed_slave(args, parser) -> int:
     while True:
         now = int(time.time() * 1000)
         try:
-            _ = client.heartbeat(worker_id=worker_id, uptime_ms=max(0, now - boot))
+            hb = client.heartbeat(worker_id=worker_id, uptime_ms=max(0, now - boot))
             last_master_ok_ts = time.time()
+            if str(hb.get("command", "") or "").strip().lower() == "register":
+                try:
+                    _ = client.register_worker(
+                        worker_id=worker_id,
+                        hostname=worker_id,
+                        capabilities=capabilities,
+                    )
+                except Exception:
+                    pass
         except Exception as exc:
             if master_timeout_s > 0 and (time.time() - last_master_ok_ts) >= float(master_timeout_s):
                 utils.log_warning(

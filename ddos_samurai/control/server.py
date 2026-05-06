@@ -61,12 +61,17 @@ class _SamuraiServicer:
 
     def Heartbeat(self, request, context):
         _ = context
+        acknowledged = False
+        command = "continue"
         with self._workers_lock:
             wid = str(request.worker_id)
             if wid in self.workers:
                 self.workers[wid]["last_heartbeat_ms"] = int(time.time() * 1000)
+                acknowledged = True
+            else:
+                command = "register"
         pb2, _ = load_generated()
-        return pb2.HeartbeatResponse(acknowledged=True, command="continue")
+        return pb2.HeartbeatResponse(acknowledged=acknowledged, command=command)
 
     def StartShard(self, request, context):
         _ = context

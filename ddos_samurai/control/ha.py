@@ -7,6 +7,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 
 
@@ -170,4 +171,124 @@ class FileLeaseLeaderElector:
             "lease_path": str(self.lease_path),
             "lease_seconds": float(self.lease_seconds),
             "lease_expires_at": float(cur.get("expires_at", 0.0) or 0.0),
+        }
+
+
+class RedisLeaseLeaderElector:
+    """Redis-backed lease elector with fencing epoch."""
+
+    def __init__(
+        self,
+        node_id: str,
+        redis_url: str,
+        lease_key: str,
+        *,
+        lease_seconds: float = 15.0,
+    ) -> None:
+        self.node_id = str(node_id or "").strip() or socket.gethostname()
+        self.redis_url = str(redis_url or "").strip()
+        self.lease_key = str(lease_key or "").strip()
+        self.lease_seconds = max(1.0, float(lease_seconds or 15.0))
+        self.owner_token = f"{self.node_id}:{uuid.uuid4().hex}"
+        self._leader = False
+        self._leader_epoch = 0
+        self._stop_evt = threading.Event()
+        self._renew_thread = None
+        if not self.redis_url:
+            raise ValueError("redis_url is required")
+        if not self.lease_key:
+            raise ValueError("lease_key is required")
+        try:
+            import redis  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError("redis package is required for ha_mode=redis") from exc
+        self._redis = __import__("redis").Redis.from_url(self.redis_url, decode_responses=True)
+
+    def _epoch_key(self) -> str:
+        return f"{self.lease_key}:epoch"
+
+    def try_acquire(self) -> bool:
+        lease_ms = int(self.lease_seconds * 1000.0)
+        ok = bool(self._redis.set(self.lease_key, self.owner_token, nx=True, px=lease_ms))
+        if ok:
+            self._leader = True
+            self._leader_epoch = int(self._redis.incr(self._epoch_key()) or 0)
+            return True
+        if str(self._redis.get(self.lease_key) or "") == self.owner_token:
+            self._leader = True
+            if self._leader_epoch <= 0:
+                self._leader_epoch = int(self._redis.get(self._epoch_key()) or 0)
+            return True
+        self._leader = False
+        return False
+
+    def renew_once(self) -> bool:
+        script = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+else
+  return 0
+end
+"""
+        lease_ms = int(self.lease_seconds * 1000.0)
+        res = int(self._redis.eval(script, 1, self.lease_key, self.owner_token, str(lease_ms)) or 0)
+        self._leader = res == 1
+        if not self._leader:
+            return False
+        if self._leader_epoch <= 0:
+            self._leader_epoch = int(self._redis.get(self._epoch_key()) or 0)
+        return True
+
+    def start_renew_loop(self, interval_seconds: float = 5.0) -> None:
+        iv = max(0.2, float(interval_seconds or 5.0))
+        self._stop_evt.clear()
+
+        def _loop():
+            while not self._stop_evt.wait(iv):
+                if not self.renew_once():
+                    break
+
+        self._renew_thread = threading.Thread(target=_loop, daemon=True, name="RedisLeaseRenew")
+        self._renew_thread.start()
+
+    def is_leader(self) -> bool:
+        return bool(self._leader)
+
+    @property
+    def leader_epoch(self) -> int:
+        return int(self._leader_epoch or 0)
+
+    def release(self) -> None:
+        script = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+else
+  return 0
+end
+"""
+        try:
+            _ = self._redis.eval(script, 1, self.lease_key, self.owner_token)
+        except Exception:
+            pass
+        self._leader = False
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        th = self._renew_thread
+        if th is not None:
+            th.join(timeout=2.0)
+        self.release()
+
+    def snapshot(self) -> dict:
+        leader_token = str(self._redis.get(self.lease_key) or "")
+        leader_id = str(leader_token.split(":", 1)[0] if ":" in leader_token else leader_token)
+        ttl_ms = int(self._redis.pttl(self.lease_key) or -1)
+        return {
+            "mode": "redis",
+            "node_id": str(self.node_id),
+            "leader_id": leader_id,
+            "is_leader": 1 if self.is_leader() else 0,
+            "lease_key": str(self.lease_key),
+            "lease_ttl_ms": ttl_ms,
+            "leader_epoch": int(self.leader_epoch),
         }
