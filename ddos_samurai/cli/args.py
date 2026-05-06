@@ -299,7 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     distributed_group.add_argument(
         "--ha-mode",
-        choices=["static", "file-lock"],
+        choices=["static", "file-lock", "redis"],
         default="static",
         help="HA modu: static veya file-lock lease.",
     )
@@ -352,6 +352,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="file-lock HA liderlik acquire retry aralığı (s).",
+    )
+    distributed_group.add_argument(
+        "--ha-redis-url",
+        type=str,
+        default="redis://127.0.0.1:6379/0",
+        help="ha-mode redis için Redis bağlantı URL'i.",
+    )
+    distributed_group.add_argument(
+        "--ha-redis-key",
+        type=str,
+        default="samurai:ha:master",
+        help="ha-mode redis için lease key.",
     )
     distributed_group.add_argument(
         "--job-timeout-s",

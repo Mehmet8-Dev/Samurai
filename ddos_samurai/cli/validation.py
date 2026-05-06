@@ -67,6 +67,21 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
                     parser.error("Hata: --ha-acquire-timeout-s >= 0 olmalıdır.")
                 if retry_interval_s <= 0.0:
                     parser.error("Hata: --ha-retry-interval-s > 0 olmalıdır.")
+            elif ha_mode == "redis":
+                redis_url = str(getattr(args, "ha_redis_url", "redis://127.0.0.1:6379/0") or "").strip()
+                redis_key = str(getattr(args, "ha_redis_key", "samurai:ha:master") or "").strip()
+                if not redis_url:
+                    parser.error("Hata: --ha-mode redis için --ha-redis-url zorunludur.")
+                if not redis_key:
+                    parser.error("Hata: --ha-mode redis için --ha-redis-key zorunludur.")
+                lease_s = float(getattr(args, "ha_lease_seconds", 15.0) or 15.0)
+                renew_s = float(getattr(args, "ha_renew_interval_s", 5.0) or 5.0)
+                if lease_s <= 0:
+                    parser.error("Hata: --ha-lease-seconds > 0 olmalıdır.")
+                if renew_s <= 0:
+                    parser.error("Hata: --ha-renew-interval-s > 0 olmalıdır.")
+                if renew_s >= lease_s:
+                    parser.error("Hata: --ha-renew-interval-s, --ha-lease-seconds değerinden küçük olmalıdır.")
     elif bool(getattr(args, "ha_enable", False)):
         parser.error("Hata: --ha-enable yalnızca --role master ile kullanılabilir.")
     elif role == "slave":
