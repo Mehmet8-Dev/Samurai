@@ -39,6 +39,7 @@ class DistributedAggregator:
                     {
                         "shard_id": sid,
                         "worker_id": wid,
+                        "leader_epoch_max": 0,
                         "sent": 0,
                         "errors": 0,
                         "progress": 0,
@@ -52,6 +53,10 @@ class DistributedAggregator:
                 srec["sent"] = max(int(srec.get("sent", 0) or 0), int(item.get("sent", 0) or 0))
                 srec["errors"] = max(int(srec.get("errors", 0) or 0), int(item.get("errors", 0) or 0))
                 srec["progress"] = max(int(srec.get("progress", 0) or 0), int(item.get("progress", 0) or 0))
+                srec["leader_epoch_max"] = max(
+                    int(srec.get("leader_epoch_max", 0) or 0),
+                    int(item.get("leader_epoch", 0) or 0),
+                )
                 srec["duration_s_max"] = max(
                     float(srec.get("duration_s_max", 0.0) or 0.0),
                     float(item.get("duration_s", 0.0) or 0.0),

@@ -145,12 +145,16 @@ def run_distributed_slave(args, parser) -> int:
         stats_stream = client.create_stats_streamer()
     else:
         stats_stream = {"send": lambda *a, **k: False, "close": lambda: None, "failed": threading.Event()}
+    epoch_ctx = {"current": 0}
 
     def _emit_stats(worker_id_arg: str, shard_id_arg: str, stats_arg: dict) -> None:
         ts = int(time.time() * 1000)
+        payload = dict(stats_arg or {})
+        if "leader_epoch" not in payload:
+            payload["leader_epoch"] = int(epoch_ctx.get("current", 0) or 0)
         sent = False
         try:
-            sent = bool(stats_stream["send"](worker_id_arg, shard_id_arg, stats_arg, ts))
+            sent = bool(stats_stream["send"](worker_id_arg, shard_id_arg, payload, ts))
         except Exception:
             sent = False
         if not sent:
@@ -158,7 +162,7 @@ def run_distributed_slave(args, parser) -> int:
                 client.report_stats(
                     worker_id=worker_id_arg,
                     shard_id=shard_id_arg,
-                    stats=stats_arg,
+                    stats=payload,
                     timestamp_ms=ts,
                 )
             except Exception:
@@ -174,6 +178,7 @@ def run_distributed_slave(args, parser) -> int:
         shard_runs: dict[str, dict] = {}
         shard_status: dict[str, dict] = {}
         worker_state = {"state": "idle", "active_shard_id": ""}
+        leader_epoch_state = {"max_seen": 0}
 
         def _active_count_locked() -> int:
             return sum(1 for rec in shard_runs.values() if bool(rec.get("running", False)))
@@ -225,6 +230,7 @@ def run_distributed_slave(args, parser) -> int:
                     "progress": int(getattr(runtime.get("progress"), "value", 0) or 0),
                     "sent": int(getattr(runtime.get("sent_total"), "value", 0) or 0),
                     "errors": int(getattr(runtime.get("errors_total"), "value", 0) or 0),
+                    "leader_epoch": int(rec.get("leader_epoch", epoch_ctx.get("current", 0)) or 0),
                 }
                 _emit_stats(worker_id_arg=worker_id, shard_id_arg=str(shard_id), stats_arg=live)
                 proc.join(timeout=stats_stream_interval_s)
@@ -235,6 +241,7 @@ def run_distributed_slave(args, parser) -> int:
                 if int(latest.get("runtime_id", 0) or 0) != runtime_id:
                     return
             stats = _finalize_shard_runtime(runtime, worker_id=worker_id, shard_id=shard_id)
+            stats["leader_epoch"] = int(rec.get("leader_epoch", epoch_ctx.get("current", 0)) or 0)
             _emit_stats(worker_id_arg=worker_id, shard_id_arg=str(shard_id), stats_arg=stats)
             payload = json.dumps(stats, ensure_ascii=True).encode("utf-8")
             with shard_lock:
@@ -254,8 +261,18 @@ def run_distributed_slave(args, parser) -> int:
                     shard_args = json.loads(bytes(request.args_json or b"{}").decode("utf-8"))
                 except (ValueError, TypeError, UnicodeDecodeError):
                     return pb2.StartShardResponse(started=False, error="invalid args_json")
+                req_epoch = int(shard_args.get("_leader_epoch", 0) or 0)
                 sid = str(request.shard_id)
                 with shard_lock:
+                    max_seen = int(leader_epoch_state.get("max_seen", 0) or 0)
+                    if req_epoch < max_seen:
+                        return pb2.StartShardResponse(
+                            started=False,
+                            error=f"stale leader epoch: got={req_epoch} min={max_seen}",
+                        )
+                    if req_epoch > max_seen:
+                        leader_epoch_state["max_seen"] = req_epoch
+                    epoch_ctx["current"] = int(leader_epoch_state.get("max_seen", 0) or 0)
                     existing = dict(shard_runs.get(sid) or {})
                     if bool(existing.get("running", False)):
                         return pb2.StartShardResponse(started=False, error="shard already running")
@@ -275,6 +292,7 @@ def run_distributed_slave(args, parser) -> int:
                         "runtime_id": int(time.time_ns()),
                         "running": True,
                         "job_id": str(request.job_id or ""),
+                        "leader_epoch": int(req_epoch),
                     }
                     shard_status[sid] = {
                         "state": "queued" if _active_count_locked() > 1 else "running",
@@ -311,6 +329,7 @@ def run_distributed_slave(args, parser) -> int:
                     return pb2.StopShardResponse(stopped=False)
                 stats = _finalize_shard_runtime(runtime, worker_id=worker_id, shard_id=sid)
                 stats["status"] = "stopped"
+                stats["leader_epoch"] = int(rec.get("leader_epoch", epoch_ctx.get("current", 0)) or 0)
                 _emit_stats(worker_id_arg=worker_id, shard_id_arg=sid, stats_arg=stats)
                 with shard_lock:
                     shard_status[sid] = {

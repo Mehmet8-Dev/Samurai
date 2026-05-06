@@ -165,7 +165,9 @@ def _distributed_state_to_prometheus(state: dict, prefix: str = "samurai_distrib
 
     mode = str(ha.get("mode", "off") or "off").replace('"', '\\"')
     is_leader = float(ha.get("is_leader", 0) or 0)
+    leader_epoch = float(ha.get("leader_epoch", 0) or 0)
     lines.append(f'{prefix}_ha_is_leader{{mode="{mode}"}} {is_leader}')
+    lines.append(f'{prefix}_ha_leader_epoch{{mode="{mode}"}} {leader_epoch}')
     out = "\n".join([x for x in lines if x])
     return out + ("\n" if out else "")
 
@@ -200,6 +202,7 @@ def _run_single_job(
     dispatch_failures: list[str] = []
     lost_workers: set[str] = set()
     done_shards: set[str] = set()
+    leader_epoch = int(job_args.get("_leader_epoch", 0) or 0)
 
     pending: list[dict] = []
     for c in pending_counts:
@@ -223,6 +226,7 @@ def _run_single_job(
         shard_args["count"] = int(shard_item["packet_count"])
         shard_args["role"] = "standalone"
         shard_args["_worker_id"] = worker_id
+        shard_args["_leader_epoch"] = int(job_args.get("_leader_epoch", 0) or 0)
         try:
             wc = WorkerControlClient(
                 endpoint=ep,
@@ -274,6 +278,8 @@ def _run_single_job(
             return 1, {
                 "job_id": job_id,
                 "error": "leadership_lost_abort",
+                "leader_epoch": leader_epoch,
+                "abort_events": [{"reason": "leadership_lost_abort", "leader_epoch": leader_epoch}],
                 "dispatch_failures": list(dispatch_failures),
             }
         now_ms = int(time.time() * 1000)
@@ -301,6 +307,8 @@ def _run_single_job(
             return 1, {
                 "job_id": job_id,
                 "lost_workers": sorted(lost_workers),
+                "leader_epoch": leader_epoch,
+                "abort_events": [{"reason": "worker_loss_abort", "leader_epoch": leader_epoch}],
                 "dispatch_failures": list(dispatch_failures),
                 "error": "worker_loss_abort",
             }
@@ -421,6 +429,7 @@ def _run_single_job(
     agg = aggregator.snapshot()
     snapshot = {
         "job_id": job_id,
+        "leader_epoch": leader_epoch,
         "workers": len(server.servicer.workers),
         "shards_reported": len(agg.get("shard_ids", [])),
         "lost_workers": sorted(lost_workers),
@@ -434,6 +443,7 @@ def _run_single_job(
         "worker_rollup": list(agg.get("worker_rollup", [])),
         "pending_shards_left": len(pending),
         "inflight_shards_left": len(inflight_by_sid),
+        "abort_events": [],
     }
     rc = 0 if not pending and not inflight_by_sid else 1
     return rc, snapshot
@@ -648,12 +658,20 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     distributed_metrics_prefix = str(getattr(args, "distributed_metrics_prefix", "samurai_distributed") or "samurai_distributed").strip() or "samurai_distributed"
     for idx, job in enumerate(jobs, start=1):
         job_id = f"job-{int(time.time())}-{idx}"
+        job_run = dict(job)
+        if ha_elector is not None and hasattr(ha_elector, "leader_epoch"):
+            try:
+                job_run["_leader_epoch"] = int(getattr(ha_elector, "leader_epoch", 0) or 0)
+            except Exception:
+                job_run["_leader_epoch"] = 0
+        else:
+            job_run["_leader_epoch"] = 0
         current_job["state"] = "running"
         current_job["job_id"] = job_id
         guard = (lambda: bool(ha_elector.is_leader())) if ha_elector is not None else None
-        rc, snap = _run_single_job(server, job, job_id=job_id, leadership_guard=guard)
-        snap = _apply_distributed_kpi_gate(snap, job)
-        snap = _apply_per_shard_kpi_gate(snap, job)
+        rc, snap = _run_single_job(server, job_run, job_id=job_id, leadership_guard=guard)
+        snap = _apply_distributed_kpi_gate(snap, job_run)
+        snap = _apply_per_shard_kpi_gate(snap, job_run)
         latest_snapshot.clear()
         latest_snapshot.update(dict(snap))
         multi_summary.append(snap)
