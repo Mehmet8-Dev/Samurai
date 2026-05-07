@@ -123,8 +123,11 @@ def run_distributed_slave(args, parser) -> int:
         "xdp_available": "unknown",
     }
     tenant_namespace = str(getattr(args, "tenant_namespace", "") or "").strip()
+    worker_region = str(getattr(args, "worker_region", "") or "").strip()
     if tenant_namespace:
         capabilities["tenant_namespace"] = tenant_namespace
+    if worker_region:
+        capabilities["region"] = worker_region
     listen = str(getattr(args, "control_listen", "0.0.0.0:5099") or "0.0.0.0:5099").strip()
     try:
         host, port = listen.rsplit(":", 1)
@@ -159,6 +162,10 @@ def run_distributed_slave(args, parser) -> int:
             payload["leader_epoch"] = int(epoch_ctx.get("current", 0) or 0)
         if tenant_namespace and "tenant_namespace" not in payload:
             payload["tenant_namespace"] = tenant_namespace
+        if worker_region and "worker_region" not in payload:
+            payload["worker_region"] = worker_region
+        if worker_region and "region" not in payload:
+            payload["region"] = worker_region
         sent = False
         try:
             sent = bool(stats_stream["send"](worker_id_arg, shard_id_arg, payload, ts))

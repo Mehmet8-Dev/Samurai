@@ -19,6 +19,7 @@ class DistributedAggregator:
         numeric_totals: dict[str, float] = {}
         per_shard: dict[str, dict] = {}
         worker_rollup: dict[str, dict] = {}
+        region_rollup: dict[str, dict] = {}
         for item in self._items:
             sent += int(item.get("sent", 0) or 0)
             errors += int(item.get("errors", 0) or 0)
@@ -30,6 +31,12 @@ class DistributedAggregator:
                     numeric_totals[str(key)] = float(numeric_totals.get(str(key), 0.0) + float(value))
             wid = str(item.get("worker_id", "") or "").strip()
             sid = str(item.get("shard_id", "") or "").strip()
+            region = str(
+                item.get("region", "")
+                or item.get("worker_region", "")
+                or item.get("target_region", "")
+                or "unknown"
+            ).strip().lower() or "unknown"
             if wid:
                 workers.add(wid)
             if sid:
@@ -75,6 +82,26 @@ class DistributedAggregator:
                 if sid:
                     wrec["shard_ids"].add(sid)
                 wrec["updates"] = int(wrec.get("updates", 0) or 0) + 1
+            rrec = region_rollup.setdefault(
+                region,
+                {
+                    "region": region,
+                    "sent": 0,
+                    "errors": 0,
+                    "progress": 0,
+                    "workers": set(),
+                    "shards": set(),
+                    "updates": 0,
+                },
+            )
+            rrec["sent"] = max(int(rrec.get("sent", 0) or 0), int(item.get("sent", 0) or 0))
+            rrec["errors"] = max(int(rrec.get("errors", 0) or 0), int(item.get("errors", 0) or 0))
+            rrec["progress"] = max(int(rrec.get("progress", 0) or 0), int(item.get("progress", 0) or 0))
+            if wid:
+                rrec["workers"].add(wid)
+            if sid:
+                rrec["shards"].add(sid)
+            rrec["updates"] = int(rrec.get("updates", 0) or 0) + 1
 
         per_shard_list = sorted(
             per_shard.values(),
@@ -99,6 +126,22 @@ class DistributedAggregator:
                 }
             )
         worker_rollup_list.sort(key=lambda x: (-int(x["errors"]), -int(x["sent"]), x["worker_id"]))
+        region_rollup_list = []
+        for r in region_rollup.values():
+            region_rollup_list.append(
+                {
+                    "region": str(r.get("region", "unknown") or "unknown"),
+                    "sent": int(r.get("sent", 0) or 0),
+                    "errors": int(r.get("errors", 0) or 0),
+                    "progress": int(r.get("progress", 0) or 0),
+                    "workers": len(r.get("workers", set()) or set()),
+                    "worker_ids": sorted(list(r.get("workers", set()) or set())),
+                    "shards": len(r.get("shards", set()) or set()),
+                    "shard_ids": sorted(list(r.get("shards", set()) or set())),
+                    "updates": int(r.get("updates", 0) or 0),
+                }
+            )
+        region_rollup_list.sort(key=lambda x: (-int(x["errors"]), -int(x["sent"]), str(x["region"])))
         return {
             "sent": sent,
             "errors": errors,
@@ -111,5 +154,6 @@ class DistributedAggregator:
             "per_shard": per_shard_list,
             "top_error_shards": top_error_shards,
             "worker_rollup": worker_rollup_list,
+            "region_rollup": region_rollup_list,
             "items": list(self._items),
         }

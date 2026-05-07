@@ -144,6 +144,15 @@ def _distributed_snapshot_to_prometheus(snapshot: dict, prefix: str = "samurai_d
         lines.append(f"{prefix}_per_shard_kpi_failed_count {float(snapshot.get('per_shard_kpi_failed_count', 0) or 0)}")
     except (TypeError, ValueError):
         pass
+    for rec in list(snapshot.get("region_rollup") or []):
+        try:
+            region = str(rec.get("region", "unknown") or "unknown").replace('"', '\\"')
+            lines.append(f'{prefix}_region_sent{{region="{region}"}} {float(rec.get("sent", 0) or 0)}')
+            lines.append(f'{prefix}_region_errors{{region="{region}"}} {float(rec.get("errors", 0) or 0)}')
+            lines.append(f'{prefix}_region_workers{{region="{region}"}} {float(rec.get("workers", 0) or 0)}')
+            lines.append(f'{prefix}_region_shards{{region="{region}"}} {float(rec.get("shards", 0) or 0)}')
+        except (TypeError, ValueError):
+            continue
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -162,14 +171,18 @@ def _distributed_state_to_prometheus(state: dict, prefix: str = "samurai_distrib
     for rec in workers:
         wid = str(rec.get("worker_id", "") or "").replace('"', '\\"')
         wstate = str(rec.get("state", "") or "unknown").replace('"', '\\"')
+        wregion = str(rec.get("region", "unknown") or "unknown").replace('"', '\\"')
         lines.append(f'{prefix}_worker_state{{worker_id="{wid}",state="{wstate}"}} 1')
+        lines.append(f'{prefix}_worker_region{{worker_id="{wid}",region="{wregion}"}} 1')
         hb = float(rec.get("last_heartbeat_ms", 0) or 0)
         lines.append(f'{prefix}_worker_last_heartbeat_ms{{worker_id="{wid}"}} {hb}')
 
     for rec in shards:
         sid = str(rec.get("shard_id", "") or "").replace('"', '\\"')
+        sregion = str(rec.get("region", "unknown") or "unknown").replace('"', '\\"')
         sz = float(rec.get("stats_size_bytes", 0) or 0)
         lines.append(f'{prefix}_shard_stats_size_bytes{{shard_id="{sid}"}} {sz}')
+        lines.append(f'{prefix}_shard_region{{shard_id="{sid}",region="{sregion}"}} 1')
 
     mode = str(ha.get("mode", "off") or "off").replace('"', '\\"')
     is_leader = float(ha.get("is_leader", 0) or 0)
@@ -199,6 +212,12 @@ def _run_single_job(
     on_worker_loss = str(job_args.get("on_worker_loss", "continue") or "continue").strip().lower()
     dispatch_pool = max(1, int(job_args.get("control_dispatch_workers", 32) or 32))
     shard_unit_count = int(job_args.get("shard_unit_count", 0) or 0)
+    region_aware_routing = bool(job_args.get("region_aware_routing", False)) or (
+        str(job_args.get("shard_strategy", "equal") or "equal").strip().lower() == "region"
+    )
+    target_region = str(job_args.get("target_region", "") or "").strip().lower()
+    master_region = str(job_args.get("worker_region", "") or "").strip().lower()
+    cross_region_heartbeat_factor = max(1.0, float(job_args.get("cross_region_heartbeat_factor", 1.6) or 1.6))
 
     initial_workers = max(1, len(server.servicer.workers))
     if shard_unit_count <= 0:
@@ -217,7 +236,10 @@ def _run_single_job(
     pending: list[dict] = []
     for c in pending_counts:
         shard_seq += 1
-        pending.append({"shard_id": f"{job_id}-shard-{shard_seq}", "packet_count": int(c), "attempt": 0})
+        item = {"shard_id": f"{job_id}-shard-{shard_seq}", "packet_count": int(c), "attempt": 0}
+        if target_region:
+            item["target_region"] = target_region
+        pending.append(item)
 
     inflight_by_worker: dict[str, dict] = {}
     inflight_by_sid: dict[str, dict] = {}
@@ -226,6 +248,54 @@ def _run_single_job(
         wrec = dict(server.servicer.workers.get(worker_id) or {})
         caps = dict(wrec.get("capabilities") or {})
         return str(caps.get("control_endpoint", "") or "").strip()
+
+    def _worker_caps(worker_id: str) -> dict:
+        wrec = dict(server.servicer.workers.get(worker_id) or {})
+        return dict(wrec.get("capabilities") or {})
+
+    def _worker_region(worker_id: str) -> str:
+        caps = _worker_caps(worker_id)
+        return str(caps.get("region", "") or "").strip().lower()
+
+    def _worker_dispatch_score(worker_id: str, shard_item: dict) -> float:
+        caps = _worker_caps(worker_id)
+        tr = str((dict(shard_item or {})).get("target_region", target_region) or "").strip().lower()
+        wr = _worker_region(worker_id)
+        score = 0.0
+        if region_aware_routing and tr:
+            if wr == tr:
+                score += 100.0
+            elif wr and wr != tr:
+                score -= 20.0
+        raw_score = caps.get("capacity_score")
+        try:
+            if raw_score is not None:
+                score += float(int(raw_score))
+        except (TypeError, ValueError):
+            pass
+        if str(caps.get("gpu_available", "")).strip().lower() in {"1", "true", "yes"}:
+            score += 2.0
+        if str(caps.get("xdp_available", "")).strip().lower() in {"1", "true", "yes"}:
+            score += 1.0
+        return score
+
+    def _select_worker_for_shard(free_workers: list[str], shard_item: dict) -> str:
+        if not free_workers:
+            return ""
+        if not region_aware_routing:
+            return str(free_workers[0])
+        ranked = sorted(free_workers, key=lambda wid: _worker_dispatch_score(wid, shard_item), reverse=True)
+        return str(ranked[0] if ranked else free_workers[0])
+
+    def _heartbeat_timeout_for_worker(worker_id: str) -> int:
+        if not region_aware_routing:
+            return hb_timeout_ms
+        wr = _worker_region(worker_id)
+        if master_region and wr and wr != master_region:
+            return int(max(hb_timeout_ms, hb_timeout_ms * cross_region_heartbeat_factor))
+        if target_region and wr and wr != target_region:
+            return int(max(hb_timeout_ms, hb_timeout_ms * cross_region_heartbeat_factor))
+        return hb_timeout_ms
 
     def _dispatch_one(worker_id: str, shard_item: dict) -> tuple[bool, str]:
         sid = str(shard_item["shard_id"])
@@ -311,7 +381,8 @@ def _run_single_job(
         for wid in workers_now:
             rec = dict(server.servicer.workers.get(wid) or {})
             last_hb = int(rec.get("last_heartbeat_ms", 0) or 0)
-            if last_hb > 0 and (now_ms - last_hb) > hb_timeout_ms:
+            timeout_for_worker = _heartbeat_timeout_for_worker(wid)
+            if last_hb > 0 and (now_ms - last_hb) > timeout_for_worker:
                 lost_workers.add(wid)
 
         for wid in list(inflight_by_worker.keys()):
@@ -371,8 +442,13 @@ def _run_single_job(
 
         batch = []
         while pending and free_workers and len(batch) < dispatch_pool:
-            wid = free_workers.pop(0)
             sh = pending.pop(0)
+            wid = _select_worker_for_shard(free_workers, sh)
+            if not wid:
+                pending.insert(0, sh)
+                break
+            if wid in free_workers:
+                free_workers.remove(wid)
             batch.append((wid, sh))
 
         if batch:
@@ -464,6 +540,7 @@ def _run_single_job(
         "numeric_totals": dict(agg.get("numeric_totals", {})),
         "top_error_shards": list(agg.get("top_error_shards", [])),
         "worker_rollup": list(agg.get("worker_rollup", [])),
+        "region_rollup": list(agg.get("region_rollup", [])),
         "pending_shards_left": len(pending),
         "inflight_shards_left": len(inflight_by_sid),
         "abort_events": [],
@@ -507,6 +584,10 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     autoscale_shards_per_worker = int(getattr(args, "control_autoscale_shards_per_worker", 4) or 4)
     autoscale_idle_scale_down_s = float(getattr(args, "control_autoscale_idle_scale_down_s", 60.0) or 60.0)
     tenant_namespace = str(getattr(args, "tenant_namespace", "") or "").strip()
+    worker_region = str(getattr(args, "worker_region", "") or "").strip()
+    target_region = str(getattr(args, "target_region", "") or "").strip()
+    region_aware_routing = bool(getattr(args, "region_aware_routing", False))
+    cross_region_heartbeat_factor = float(getattr(args, "cross_region_heartbeat_factor", 1.6) or 1.6)
     control_rbac_enable = bool(getattr(args, "control_rbac_enable", False))
     control_rbac_default_role = str(getattr(args, "control_rbac_default_role", "viewer") or "viewer").strip().lower() or "viewer"
     control_rbac_role_secrets = normalize_role_secrets(
@@ -521,6 +602,17 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         "viewer": str(getattr(args, "management_api_viewer_token", "") or "").strip(),
     }
     mgmt_role_tokens = {k: v for k, v in mgmt_role_tokens.items() if v}
+    control_jwt_secret = str(getattr(args, "control_jwt_secret", "") or "").strip()
+    control_jwt_role_claim = str(getattr(args, "control_jwt_role_claim", "role") or "role").strip() or "role"
+    control_jwt_tenant_claim = str(
+        getattr(args, "control_jwt_tenant_claim", "tenant_namespace") or "tenant_namespace"
+    ).strip() or "tenant_namespace"
+    mgmt_jwt_secret = str(getattr(args, "management_api_jwt_secret", "") or "").strip()
+    mgmt_jwt_role_claim = str(getattr(args, "management_api_jwt_role_claim", "role") or "role").strip() or "role"
+    mgmt_jwt_tenant_claim = str(
+        getattr(args, "management_api_jwt_tenant_claim", "tenant_namespace") or "tenant_namespace"
+    ).strip() or "tenant_namespace"
+    mgmt_live_interval_ms = int(getattr(args, "management_api_live_interval_ms", 1000) or 1000)
     ha_elector = None
     ha_wait_for_leader = bool(getattr(args, "ha_wait_for_leader", True))
     ha_acquire_timeout_s = float(getattr(args, "ha_acquire_timeout_s", 0.0) or 0.0)
@@ -635,15 +727,25 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         rbac_role_secrets=control_rbac_role_secrets,
         rbac_default_role=control_rbac_default_role,
         tenant_namespace=tenant_namespace,
+        jwt_secret=control_jwt_secret,
+        jwt_role_claim=control_jwt_role_claim,
+        jwt_tenant_claim=control_jwt_tenant_claim,
     )
     mgmt_server = None
     latest_snapshot: dict = {}
     current_job: dict = {"state": "idle", "job_id": "", "tenant_namespace": tenant_namespace}
     events: list[dict] = []
     events_max = max(10, int(getattr(args, "management_events_max", 200) or 200))
+    event_seq = {"next": 1}
 
     def _push_event(kind: str, replicate: bool = False, **extra) -> None:
-        item = {"ts_ms": int(time.time() * 1000), "kind": str(kind), "tenant_namespace": tenant_namespace}
+        item = {
+            "event_id": int(event_seq["next"]),
+            "ts_ms": int(time.time() * 1000),
+            "kind": str(kind),
+            "tenant_namespace": tenant_namespace,
+        }
+        event_seq["next"] = int(event_seq["next"]) + 1
         item.update({str(k): v for k, v in dict(extra or {}).items()})
         events.append(item)
         if len(events) > events_max:
@@ -665,6 +767,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                     {
                         "worker_id": str(wid),
                         "tenant_namespace": str(rec.get("tenant_namespace", "") or ""),
+                        "region": str((dict(rec.get("capabilities") or {})).get("region", "") or ""),
                         "state": str(rec.get("state", "")),
                         "active_shard_id": str(rec.get("active_shard_id", "")),
                         "last_heartbeat_ms": int(rec.get("last_heartbeat_ms", 0) or 0),
@@ -673,10 +776,17 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         shards = []
         with server.servicer._stats_lock:
             for sid, blob in dict(server.servicer.shard_stats).items():
+                region = ""
+                try:
+                    item = json.loads(bytes(blob).decode("utf-8"))
+                    region = str((dict(item or {})).get("region", "") or "")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    region = ""
                 shards.append(
                     {
                         "shard_id": str(sid),
                         "tenant_namespace": tenant_namespace,
+                        "region": region,
                         "stats_size_bytes": len(bytes(blob or b"")),
                     }
                 )
@@ -734,6 +844,10 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             auth_token=str(getattr(args, "management_api_auth_token", "")),
             auth_role_tokens=mgmt_role_tokens,
             tenant_namespace=tenant_namespace,
+            jwt_secret=mgmt_jwt_secret,
+            jwt_role_claim=mgmt_jwt_role_claim,
+            jwt_tenant_claim=mgmt_jwt_tenant_claim,
+            live_interval_ms=mgmt_live_interval_ms,
         )
         mgmt_server = ManagementAPIServer(
             listen_addr=str(getattr(args, "management_api_listen", "127.0.0.1:8089")),
@@ -768,6 +882,10 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         job_id = f"job-{int(time.time())}-{idx}"
         job_run = dict(job)
         job_run["tenant_namespace"] = tenant_namespace
+        job_run.setdefault("worker_region", worker_region)
+        job_run.setdefault("target_region", target_region)
+        job_run.setdefault("region_aware_routing", region_aware_routing)
+        job_run.setdefault("cross_region_heartbeat_factor", cross_region_heartbeat_factor)
         if ha_elector is not None and hasattr(ha_elector, "leader_epoch"):
             try:
                 job_run["_leader_epoch"] = int(getattr(ha_elector, "leader_epoch", 0) or 0)

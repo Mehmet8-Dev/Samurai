@@ -24,6 +24,7 @@ def split_job_to_shards(
     worker_ids: list[str],
     strategy: str = "equal",
     worker_capabilities: dict[str, dict] | None = None,
+    target_region: str = "",
 ) -> list[dict]:
     workers = [w for w in worker_ids if str(w).strip()]
     if not workers:
@@ -34,6 +35,28 @@ def split_job_to_shards(
     if mode == "capability":
         caps_map = dict(worker_capabilities or {})
         weights = [_worker_weight(caps_map.get(wid)) for wid in workers]
+        total_weight = max(1, sum(weights))
+        counts = [(total * w) // total_weight for w in weights]
+        used = sum(counts)
+        rem = total - used
+        for i in range(rem):
+            counts[i % len(counts)] += 1
+        for idx, wid in enumerate(workers):
+            out.append({"shard_id": f"shard-{idx+1}", "worker_id": wid, "packet_count": int(counts[idx])})
+        return out
+    if mode == "region":
+        caps_map = dict(worker_capabilities or {})
+        tr = str(target_region or "").strip().lower()
+        weights = []
+        for wid in workers:
+            caps = dict(caps_map.get(wid) or {})
+            wr = str(caps.get("region", "") or "").strip().lower()
+            base = _worker_weight(caps)
+            if tr and wr == tr:
+                base += 5
+            elif tr and wr and wr != tr:
+                base = max(1, base - 1)
+            weights.append(base)
         total_weight = max(1, sum(weights))
         counts = [(total * w) // total_weight for w in weights]
         used = sum(counts)

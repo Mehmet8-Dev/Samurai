@@ -9,6 +9,7 @@ from concurrent import futures
 
 from . import require_distributed
 from .auth import load_tls_server_credentials, resolve_role_from_secret, validate_cluster_secret
+from .jwt_claims import decode_jwt_hs256
 from .proto import load_generated
 
 
@@ -20,11 +21,15 @@ class _SecretServerInterceptor:
         rbac_enabled: bool = False,
         role_secrets: dict[str, str] | None = None,
         default_role: str = "viewer",
+        jwt_secret: str = "",
+        jwt_role_claim: str = "role",
     ) -> None:
         self._expected = str(expected_secret or "").strip()
         self._rbac_enabled = bool(rbac_enabled)
         self._role_secrets = dict(role_secrets or {})
         self._default_role = str(default_role or "viewer").strip().lower() or "viewer"
+        self._jwt_secret = str(jwt_secret or "").strip()
+        self._jwt_role_claim = str(jwt_role_claim or "role").strip() or "role"
 
     @staticmethod
     def _rpc_name(method: str) -> str:
@@ -50,11 +55,20 @@ class _SecretServerInterceptor:
 
     def _authorized(self, md: dict, rpc_name: str) -> tuple[bool, str]:
         provided = md.get("x-cluster-secret")
+        jwt_claims = None
         if not validate_cluster_secret(self._expected, provided):
-            return False, "invalid cluster secret"
+            if self._jwt_secret:
+                try:
+                    jwt_claims = decode_jwt_hs256(str(provided or ""), self._jwt_secret)
+                except ValueError:
+                    return False, "invalid cluster secret"
+            else:
+                return False, "invalid cluster secret"
         if not self._rbac_enabled:
             return True, ""
         role = resolve_role_from_secret(provided, self._role_secrets)
+        if not role and isinstance(jwt_claims, dict):
+            role = str(jwt_claims.get(self._jwt_role_claim, "") or "").strip().lower()
         if not role:
             # Backward-compatible fallback:
             # - If RBAC map is empty, keep single-secret behavior via default role.
@@ -115,9 +129,18 @@ class _SecretServerInterceptor:
 
 
 class _SamuraiServicer:
-    def __init__(self, cluster_id: str = "cluster-v1", tenant_namespace: str = "") -> None:
+    def __init__(
+        self,
+        cluster_id: str = "cluster-v1",
+        tenant_namespace: str = "",
+        *,
+        jwt_secret: str = "",
+        jwt_tenant_claim: str = "tenant_namespace",
+    ) -> None:
         self.cluster_id = cluster_id
         self.tenant_namespace = str(tenant_namespace or "").strip()
+        self._jwt_secret = str(jwt_secret or "").strip()
+        self._jwt_tenant_claim = str(jwt_tenant_claim or "tenant_namespace").strip() or "tenant_namespace"
         self._workers_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self.workers = {}
@@ -134,7 +157,17 @@ class _SamuraiServicer:
             return {}
 
     def _tenant_from_context(self, context) -> str:
-        return str(self._invocation_meta(context).get("x-tenant-namespace", "") or "").strip()
+        md = self._invocation_meta(context)
+        raw = str(md.get("x-tenant-namespace", "") or "").strip()
+        if raw:
+            return raw
+        if not self._jwt_secret:
+            return ""
+        try:
+            claims = decode_jwt_hs256(str(md.get("x-cluster-secret", "") or ""), self._jwt_secret)
+        except ValueError:
+            return ""
+        return str((dict(claims or {})).get(self._jwt_tenant_claim, "") or "").strip()
 
     def _tenant_guard(self, context, *, worker_id: str = "") -> bool:
         if not self.tenant_namespace:
@@ -333,6 +366,9 @@ class MasterControlServer:
         rbac_role_secrets: dict[str, str] | None = None,
         rbac_default_role: str = "viewer",
         tenant_namespace: str = "",
+        jwt_secret: str = "",
+        jwt_role_claim: str = "role",
+        jwt_tenant_claim: str = "tenant_namespace",
     ) -> None:
         require_distributed()
         self.listen_addr = str(listen_addr)
@@ -347,9 +383,16 @@ class MasterControlServer:
         self.rbac_role_secrets = dict(rbac_role_secrets or {})
         self.rbac_default_role = str(rbac_default_role or "viewer").strip().lower() or "viewer"
         self.tenant_namespace = str(tenant_namespace or "").strip()
+        self.jwt_secret = str(jwt_secret or "").strip()
+        self.jwt_role_claim = str(jwt_role_claim or "role").strip() or "role"
+        self.jwt_tenant_claim = str(jwt_tenant_claim or "tenant_namespace").strip() or "tenant_namespace"
         self.running = False
         self._server = None
-        self._servicer = _SamuraiServicer(tenant_namespace=self.tenant_namespace)
+        self._servicer = _SamuraiServicer(
+            tenant_namespace=self.tenant_namespace,
+            jwt_secret=self.jwt_secret,
+            jwt_tenant_claim=self.jwt_tenant_claim,
+        )
 
     def start(self) -> None:
         import grpc
@@ -360,6 +403,8 @@ class MasterControlServer:
             rbac_enabled=self.rbac_enabled,
             role_secrets=self.rbac_role_secrets,
             default_role=self.rbac_default_role,
+            jwt_secret=self.jwt_secret,
+            jwt_role_claim=self.jwt_role_claim,
         )
         self._server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=self.max_workers),
