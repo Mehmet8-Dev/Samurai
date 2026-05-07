@@ -212,6 +212,7 @@ def _run_single_job(
     lost_workers: set[str] = set()
     done_shards: set[str] = set()
     leader_epoch = int(job_args.get("_leader_epoch", 0) or 0)
+    tenant_namespace = str(job_args.get("tenant_namespace", "") or "").strip()
 
     pending: list[dict] = []
     for c in pending_counts:
@@ -240,6 +241,7 @@ def _run_single_job(
             wc = WorkerControlClient(
                 endpoint=ep,
                 cluster_secret=str(job_args.get("cluster_secret", "")),
+                tenant_namespace=tenant_namespace,
                 insecure=bool(job_args.get("control_insecure", False)),
                 tls_ca=str(job_args.get("control_tls_ca", "")),
                 tls_client_cert=str(job_args.get("control_tls_client_cert", "")),
@@ -268,6 +270,7 @@ def _run_single_job(
             wc = WorkerControlClient(
                 endpoint=ep,
                 cluster_secret=str(job_args.get("cluster_secret", "")),
+                tenant_namespace=tenant_namespace,
                 insecure=bool(job_args.get("control_insecure", False)),
                 tls_ca=str(job_args.get("control_tls_ca", "")),
                 tls_client_cert=str(job_args.get("control_tls_client_cert", "")),
@@ -414,6 +417,7 @@ def _run_single_job(
                 wc = WorkerControlClient(
                     endpoint=ep,
                     cluster_secret=str(job_args.get("cluster_secret", "")),
+                    tenant_namespace=tenant_namespace,
                     insecure=bool(job_args.get("control_insecure", False)),
                     tls_ca=str(job_args.get("control_tls_ca", "")),
                     tls_client_cert=str(job_args.get("control_tls_client_cert", "")),
@@ -502,6 +506,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     autoscale_cooldown_s = float(getattr(args, "control_autoscale_cooldown_s", 15.0) or 15.0)
     autoscale_shards_per_worker = int(getattr(args, "control_autoscale_shards_per_worker", 4) or 4)
     autoscale_idle_scale_down_s = float(getattr(args, "control_autoscale_idle_scale_down_s", 60.0) or 60.0)
+    tenant_namespace = str(getattr(args, "tenant_namespace", "") or "").strip()
     control_rbac_enable = bool(getattr(args, "control_rbac_enable", False))
     control_rbac_default_role = str(getattr(args, "control_rbac_default_role", "viewer") or "viewer").strip().lower() or "viewer"
     control_rbac_role_secrets = normalize_role_secrets(
@@ -629,15 +634,16 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         rbac_enabled=control_rbac_enable,
         rbac_role_secrets=control_rbac_role_secrets,
         rbac_default_role=control_rbac_default_role,
+        tenant_namespace=tenant_namespace,
     )
     mgmt_server = None
     latest_snapshot: dict = {}
-    current_job: dict = {"state": "idle", "job_id": ""}
+    current_job: dict = {"state": "idle", "job_id": "", "tenant_namespace": tenant_namespace}
     events: list[dict] = []
     events_max = max(10, int(getattr(args, "management_events_max", 200) or 200))
 
     def _push_event(kind: str, replicate: bool = False, **extra) -> None:
-        item = {"ts_ms": int(time.time() * 1000), "kind": str(kind)}
+        item = {"ts_ms": int(time.time() * 1000), "kind": str(kind), "tenant_namespace": tenant_namespace}
         item.update({str(k): v for k, v in dict(extra or {}).items()})
         events.append(item)
         if len(events) > events_max:
@@ -658,6 +664,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                 workers.append(
                     {
                         "worker_id": str(wid),
+                        "tenant_namespace": str(rec.get("tenant_namespace", "") or ""),
                         "state": str(rec.get("state", "")),
                         "active_shard_id": str(rec.get("active_shard_id", "")),
                         "last_heartbeat_ms": int(rec.get("last_heartbeat_ms", 0) or 0),
@@ -669,6 +676,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                 shards.append(
                     {
                         "shard_id": str(sid),
+                        "tenant_namespace": tenant_namespace,
                         "stats_size_bytes": len(bytes(blob or b"")),
                     }
                 )
@@ -725,6 +733,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             ),
             auth_token=str(getattr(args, "management_api_auth_token", "")),
             auth_role_tokens=mgmt_role_tokens,
+            tenant_namespace=tenant_namespace,
         )
         mgmt_server = ManagementAPIServer(
             listen_addr=str(getattr(args, "management_api_listen", "127.0.0.1:8089")),
@@ -758,6 +767,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     for idx, job in enumerate(jobs, start=1):
         job_id = f"job-{int(time.time())}-{idx}"
         job_run = dict(job)
+        job_run["tenant_namespace"] = tenant_namespace
         if ha_elector is not None and hasattr(ha_elector, "leader_epoch"):
             try:
                 job_run["_leader_epoch"] = int(getattr(ha_elector, "leader_epoch", 0) or 0)

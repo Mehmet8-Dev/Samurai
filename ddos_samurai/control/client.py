@@ -16,6 +16,7 @@ class SlaveControlClient:
         self,
         endpoints: str,
         cluster_secret: str = "",
+        tenant_namespace: str = "",
         insecure: bool = False,
         tls_ca: str = "",
         tls_client_cert: str = "",
@@ -26,6 +27,7 @@ class SlaveControlClient:
 
         self.endpoints = split_endpoints(endpoints)
         self.cluster_secret = str(cluster_secret or "")
+        self.tenant_namespace = str(tenant_namespace or "").strip()
         self.insecure = bool(insecure)
         self.tls_ca = str(tls_ca or "")
         self.tls_client_cert = str(tls_client_cert or "")
@@ -69,7 +71,7 @@ class SlaveControlClient:
 
     def _call_with_retry(self, fn_name: str, request):
         last_err = None
-        metadata = build_cluster_metadata(self.cluster_secret)
+        metadata = build_cluster_metadata(self.cluster_secret, self.tenant_namespace)
         for idx, ep in enumerate(self._iter_endpoints_for_try()):
             stub = self._stubs[ep]
             fn = getattr(stub, fn_name)
@@ -125,7 +127,7 @@ class SlaveControlClient:
 
     def create_stats_streamer(self):
         pb2, _ = load_generated()
-        md = build_cluster_metadata(self.cluster_secret)
+        md = build_cluster_metadata(self.cluster_secret, self.tenant_namespace)
         q: queue.Queue = queue.Queue()
         stop_evt = threading.Event()
         worker = {"thread": None, "active": True}
@@ -204,6 +206,7 @@ class WorkerControlClient:
         self,
         endpoint: str,
         cluster_secret: str = "",
+        tenant_namespace: str = "",
         insecure: bool = False,
         tls_ca: str = "",
         tls_client_cert: str = "",
@@ -214,6 +217,7 @@ class WorkerControlClient:
 
         self.endpoint = str(endpoint or "").strip()
         self.cluster_secret = str(cluster_secret or "")
+        self.tenant_namespace = str(tenant_namespace or "").strip()
         self.insecure = bool(insecure)
         self.tls_ca = str(tls_ca or "")
         self.tls_client_cert = str(tls_client_cert or "")
@@ -248,7 +252,7 @@ class WorkerControlClient:
             packet_count=int(packet_count or 0),
             timeout_ms=int(timeout_ms or 0),
         )
-        md = build_cluster_metadata(self.cluster_secret)
+        md = build_cluster_metadata(self.cluster_secret, self.tenant_namespace)
         try:
             resp = self._stub.StartShard(req, timeout=5.0, metadata=md)
         except self._grpc.RpcError as exc:
@@ -261,7 +265,7 @@ class WorkerControlClient:
 
     def stop_shard(self, shard_id: str, graceful: bool = True) -> bool:
         req = self._pb2.StopShardRequest(shard_id=str(shard_id), graceful=bool(graceful))
-        md = build_cluster_metadata(self.cluster_secret)
+        md = build_cluster_metadata(self.cluster_secret, self.tenant_namespace)
         try:
             resp = self._stub.StopShard(req, timeout=3.0, metadata=md)
         except self._grpc.RpcError as exc:
@@ -274,7 +278,7 @@ class WorkerControlClient:
 
     def get_worker_status(self, worker_id: str) -> dict:
         req = self._pb2.GetWorkerStatusRequest(worker_id=str(worker_id))
-        md = build_cluster_metadata(self.cluster_secret)
+        md = build_cluster_metadata(self.cluster_secret, self.tenant_namespace)
         try:
             resp = self._stub.GetWorkerStatus(req, timeout=3.0, metadata=md)
         except self._grpc.RpcError as exc:

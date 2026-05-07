@@ -10,9 +10,15 @@ def split_endpoints(raw: str) -> list[str]:
     return [ep.strip() for ep in str(raw or "").split(",") if ep.strip()]
 
 
-def build_cluster_metadata(cluster_secret: str) -> list[tuple[str, str]]:
+def build_cluster_metadata(cluster_secret: str, tenant_namespace: str = "") -> list[tuple[str, str]]:
     secret = str(cluster_secret or "").strip()
-    return [("x-cluster-secret", secret)] if secret else []
+    tenant = str(tenant_namespace or "").strip()
+    out: list[tuple[str, str]] = []
+    if secret:
+        out.append(("x-cluster-secret", secret))
+    if tenant:
+        out.append(("x-tenant-namespace", tenant))
+    return out
 
 
 def validate_cluster_secret(expected: str, provided: Optional[str]) -> bool:

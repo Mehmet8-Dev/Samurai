@@ -34,6 +34,7 @@ def create_management_app(
     metrics_provider: Callable[[], str] | None = None,
     auth_token: str = "",
     auth_role_tokens: dict[str, str] | None = None,
+    tenant_namespace: str = "",
 ):
     from fastapi import FastAPI, Header, HTTPException
     from fastapi.responses import PlainTextResponse
@@ -41,6 +42,7 @@ def create_management_app(
     app = FastAPI(title="DDoSamurai Distributed Management API", version="1.0")
 
     role_tokens = dict(auth_role_tokens or {})
+    app_tenant = str(tenant_namespace or "").strip()
     legacy = str(auth_token or "").strip()
     if legacy and "admin" not in role_tokens:
         role_tokens["admin"] = legacy
@@ -66,44 +68,70 @@ def create_management_app(
         if role not in set(allowed_roles or set()):
             raise HTTPException(status_code=403, detail="forbidden")
 
+    def _match_tenant(item: dict, tenant: str) -> bool:
+        if not tenant:
+            return True
+        got = str((dict(item or {})).get("tenant_namespace", "") or "").strip()
+        return got == tenant
+
+    def _effective_tenant(query_tenant: str | None) -> str:
+        qt = str(query_tenant or "").strip()
+        if app_tenant and qt and qt != app_tenant:
+            raise HTTPException(status_code=403, detail="forbidden_tenant")
+        return app_tenant or qt
+
     @app.get("/healthz")
     def healthz():
         return {"status": "ok"}
 
     @app.get("/v1/cluster/summary")
-    def cluster_summary(authorization: str | None = Header(default=None)):
+    def cluster_summary(authorization: str | None = Header(default=None), tenant_namespace: str | None = None):
         _guard(authorization, {"admin", "operator", "viewer"})
+        tenant = _effective_tenant(tenant_namespace)
         st = dict(state_provider() or {})
+        workers = [x for x in list(st.get("workers") or []) if _match_tenant(x, tenant)]
+        shards = [x for x in list(st.get("shards") or []) if _match_tenant(x, tenant)]
+        current_job = dict(st.get("current_job") or {})
+        if tenant and str(current_job.get("tenant_namespace", "") or "").strip() != tenant:
+            current_job = {"state": "idle", "job_id": "", "tenant_namespace": tenant}
         return {
             "status": "ok",
-            "current_job": dict(st.get("current_job") or {}),
+            "tenant_namespace": tenant,
+            "current_job": current_job,
             "latest_snapshot": dict(st.get("latest_snapshot") or {}),
             "ha": dict(st.get("ha") or {}),
-            "workers_count": int(st.get("workers_count", 0) or 0),
-            "shards_reported_count": int(st.get("shards_reported_count", 0) or 0),
+            "workers_count": int(len(workers)),
+            "shards_reported_count": int(len(shards)),
         }
 
     @app.get("/v1/cluster/workers")
-    def cluster_workers(authorization: str | None = Header(default=None)):
+    def cluster_workers(authorization: str | None = Header(default=None), tenant_namespace: str | None = None):
         _guard(authorization, {"admin", "operator", "viewer"})
+        tenant = _effective_tenant(tenant_namespace)
         st = dict(state_provider() or {})
-        return {"workers": list(st.get("workers") or [])}
+        workers = [x for x in list(st.get("workers") or []) if _match_tenant(x, tenant)]
+        return {"tenant_namespace": tenant, "workers": workers}
 
     @app.get("/v1/cluster/shards")
-    def cluster_shards(authorization: str | None = Header(default=None)):
+    def cluster_shards(authorization: str | None = Header(default=None), tenant_namespace: str | None = None):
         _guard(authorization, {"admin", "operator", "viewer"})
+        tenant = _effective_tenant(tenant_namespace)
         st = dict(state_provider() or {})
-        return {"shards": list(st.get("shards") or [])}
+        shards = [x for x in list(st.get("shards") or []) if _match_tenant(x, tenant)]
+        return {"tenant_namespace": tenant, "shards": shards}
 
     @app.get("/v1/cluster/events")
-    def cluster_events(authorization: str | None = Header(default=None)):
+    def cluster_events(authorization: str | None = Header(default=None), tenant_namespace: str | None = None):
         _guard(authorization, {"admin", "operator", "viewer"})
+        tenant = _effective_tenant(tenant_namespace)
         st = dict(state_provider() or {})
-        return {"events": list(st.get("events") or [])}
+        events = [x for x in list(st.get("events") or []) if _match_tenant(x, tenant)]
+        return {"tenant_namespace": tenant, "events": events}
 
     @app.post("/v1/jobs/abort")
-    def abort_job(authorization: str | None = Header(default=None)):
+    def abort_job(authorization: str | None = Header(default=None), tenant_namespace: str | None = None):
         _guard(authorization, {"admin", "operator"})
+        _ = _effective_tenant(tenant_namespace)
         return dict(abort_callback() or {"aborted": False})
 
     @app.get("/metrics", response_class=PlainTextResponse)

@@ -112,6 +112,7 @@ def run_distributed_slave(args, parser) -> int:
     client = SlaveControlClient(
         endpoints=endpoints,
         cluster_secret=str(getattr(args, "cluster_secret", "")),
+        tenant_namespace=str(getattr(args, "tenant_namespace", "") or "").strip(),
         insecure=bool(getattr(args, "control_insecure", False)),
         tls_ca=str(getattr(args, "control_tls_ca", "")),
         tls_client_cert=str(getattr(args, "control_tls_client_cert", "")),
@@ -121,6 +122,9 @@ def run_distributed_slave(args, parser) -> int:
         "gpu_available": "unknown",
         "xdp_available": "unknown",
     }
+    tenant_namespace = str(getattr(args, "tenant_namespace", "") or "").strip()
+    if tenant_namespace:
+        capabilities["tenant_namespace"] = tenant_namespace
     listen = str(getattr(args, "control_listen", "0.0.0.0:5099") or "0.0.0.0:5099").strip()
     try:
         host, port = listen.rsplit(":", 1)
@@ -146,12 +150,15 @@ def run_distributed_slave(args, parser) -> int:
     else:
         stats_stream = {"send": lambda *a, **k: False, "close": lambda: None, "failed": threading.Event()}
     epoch_ctx = {"current": 0}
+    tenant_namespace = str(getattr(args, "tenant_namespace", "") or "").strip()
 
     def _emit_stats(worker_id_arg: str, shard_id_arg: str, stats_arg: dict) -> None:
         ts = int(time.time() * 1000)
         payload = dict(stats_arg or {})
         if "leader_epoch" not in payload:
             payload["leader_epoch"] = int(epoch_ctx.get("current", 0) or 0)
+        if tenant_namespace and "tenant_namespace" not in payload:
+            payload["tenant_namespace"] = tenant_namespace
         sent = False
         try:
             sent = bool(stats_stream["send"](worker_id_arg, shard_id_arg, payload, ts))

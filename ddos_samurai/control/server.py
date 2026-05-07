@@ -115,24 +115,65 @@ class _SecretServerInterceptor:
 
 
 class _SamuraiServicer:
-    def __init__(self, cluster_id: str = "cluster-v1") -> None:
+    def __init__(self, cluster_id: str = "cluster-v1", tenant_namespace: str = "") -> None:
         self.cluster_id = cluster_id
+        self.tenant_namespace = str(tenant_namespace or "").strip()
         self._workers_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self.workers = {}
         self.shard_stats = {}
         self._leader_epoch_min = 0
 
+    @staticmethod
+    def _invocation_meta(context) -> dict:
+        if context is None:
+            return {}
+        try:
+            return dict(context.invocation_metadata() or [])
+        except Exception:
+            return {}
+
+    def _tenant_from_context(self, context) -> str:
+        return str(self._invocation_meta(context).get("x-tenant-namespace", "") or "").strip()
+
+    def _tenant_guard(self, context, *, worker_id: str = "") -> bool:
+        if not self.tenant_namespace:
+            return True
+        req_tenant = self._tenant_from_context(context)
+        if context is not None:
+            if req_tenant == self.tenant_namespace:
+                return True
+        else:
+            if worker_id:
+                with self._workers_lock:
+                    rec = dict(self.workers.get(str(worker_id)) or {})
+                rec_tenant = str(rec.get("tenant_namespace", "") or "").strip()
+                if rec_tenant and rec_tenant == self.tenant_namespace:
+                    return True
+        if context is not None:
+            status = getattr(__import__("grpc"), "StatusCode").PERMISSION_DENIED
+            context.abort(status, f"tenant namespace mismatch (expected={self.tenant_namespace})")
+        return False
+
     def set_leader_epoch_min(self, epoch: int) -> None:
         self._leader_epoch_min = max(0, int(epoch or 0))
 
     def RegisterWorker(self, request, context):
-        _ = context
+        if self.tenant_namespace:
+            req_tenant = self._tenant_from_context(context)
+            if req_tenant != self.tenant_namespace:
+                pb2, _ = load_generated()
+                return pb2.RegisterWorkerResponse(
+                    accepted=False,
+                    cluster_id="",
+                    rejection_reason=f"tenant namespace mismatch (expected={self.tenant_namespace})",
+                )
         with self._workers_lock:
             self.workers[str(request.worker_id)] = {
                 "worker_id": str(request.worker_id),
                 "hostname": str(request.hostname),
                 "capabilities": dict(request.capabilities or {}),
+                "tenant_namespace": self.tenant_namespace or self._tenant_from_context(context),
                 "state": "idle",
                 "active_shard_id": "",
                 "last_heartbeat_ms": int(time.time() * 1000),
@@ -142,7 +183,9 @@ class _SamuraiServicer:
         return pb2.RegisterWorkerResponse(accepted=True, cluster_id=self.cluster_id, rejection_reason="")
 
     def Heartbeat(self, request, context):
-        _ = context
+        if not self._tenant_guard(context, worker_id=str(request.worker_id)):
+            pb2, _ = load_generated()
+            return pb2.HeartbeatResponse(acknowledged=False, command="register")
         acknowledged = False
         command = "continue"
         with self._workers_lock:
@@ -156,7 +199,9 @@ class _SamuraiServicer:
         return pb2.HeartbeatResponse(acknowledged=acknowledged, command=command)
 
     def StartShard(self, request, context):
-        _ = context
+        if not self._tenant_guard(context):
+            pb2, _ = load_generated()
+            return pb2.StartShardResponse(started=False, error="tenant namespace mismatch")
         wid = ""
         try:
             payload = json.loads(bytes(request.args_json or b"{}").decode("utf-8"))
@@ -171,7 +216,9 @@ class _SamuraiServicer:
         return pb2.StartShardResponse(started=True, error="")
 
     def StopShard(self, request, context):
-        _ = context
+        if not self._tenant_guard(context):
+            pb2, _ = load_generated()
+            return pb2.StopShardResponse(stopped=False)
         sid = str(request.shard_id)
         with self._workers_lock:
             for rec in self.workers.values():
@@ -182,7 +229,9 @@ class _SamuraiServicer:
         return pb2.StopShardResponse(stopped=True)
 
     def ReportStats(self, request, context):
-        _ = context
+        if not self._tenant_guard(context, worker_id=str(request.worker_id)):
+            pb2, _ = load_generated()
+            return pb2.ReportStatsResponse(received=False)
         payload = bytes(request.stats_json or b"{}")
         req_epoch = 0
         if self._leader_epoch_min > 0:
@@ -213,7 +262,9 @@ class _SamuraiServicer:
         return pb2.ReportStatsResponse(received=(count > 0))
 
     def AbortJob(self, request, context):
-        _ = context
+        if not self._tenant_guard(context):
+            pb2, _ = load_generated()
+            return pb2.AbortJobResponse(aborted=False, workers_notified=0)
         _ = request
         with self._workers_lock:
             n = len(self.workers)
@@ -224,7 +275,15 @@ class _SamuraiServicer:
         return pb2.AbortJobResponse(aborted=True, workers_notified=n)
 
     def GetWorkerStatus(self, request, context):
-        _ = context
+        if not self._tenant_guard(context, worker_id=str(request.worker_id)):
+            pb2, _ = load_generated()
+            return pb2.GetWorkerStatusResponse(
+                worker_id=str(request.worker_id),
+                state="forbidden",
+                active_shard_id="",
+                stats_json=b"{}",
+                last_heartbeat_ms=0,
+            )
         wid = str(request.worker_id)
         with self._workers_lock:
             rec = dict(self.workers.get(wid) or {})
@@ -246,7 +305,9 @@ class _SamuraiServicer:
         )
 
     def ForceSync(self, request, context):
-        _ = context
+        if not self._tenant_guard(context, worker_id=str(request.worker_id)):
+            pb2, _ = load_generated()
+            return pb2.ForceSyncResponse(stats_json=b"{}", logs_json=b"[]")
         wid = str(request.worker_id)
         with self._workers_lock:
             rec = dict(self.workers.get(wid) or {})
@@ -271,6 +332,7 @@ class MasterControlServer:
         rbac_enabled: bool = False,
         rbac_role_secrets: dict[str, str] | None = None,
         rbac_default_role: str = "viewer",
+        tenant_namespace: str = "",
     ) -> None:
         require_distributed()
         self.listen_addr = str(listen_addr)
@@ -284,9 +346,10 @@ class MasterControlServer:
         self.rbac_enabled = bool(rbac_enabled)
         self.rbac_role_secrets = dict(rbac_role_secrets or {})
         self.rbac_default_role = str(rbac_default_role or "viewer").strip().lower() or "viewer"
+        self.tenant_namespace = str(tenant_namespace or "").strip()
         self.running = False
         self._server = None
-        self._servicer = _SamuraiServicer()
+        self._servicer = _SamuraiServicer(tenant_namespace=self.tenant_namespace)
 
     def start(self) -> None:
         import grpc
