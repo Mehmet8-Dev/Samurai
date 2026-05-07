@@ -1,15 +1,121 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: samurai-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    networks:
+      - samurai-net
+
   master:
     build:
       context: .
       dockerfile: Dockerfile.prod
     container_name: samurai-master
+    environment:
+      SAMURAI_CLUSTER_SECRET: "samurai-cluster-secret"
+      SAMURAI_MANAGEMENT_API_ADMIN_TOKEN: "samurai-admin-token"
+      SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN: "samurai-operator-token"
+      SAMURAI_MANAGEMENT_API_VIEWER_TOKEN: "samurai-viewer-token"
+      SAMURAI_CONTROL_RBAC_ADMIN_SECRET: "samurai-cluster-secret"
+      SAMURAI_CONTROL_RBAC_OPERATOR_SECRET: "samurai-cluster-secret"
+      SAMURAI_CONTROL_RBAC_WORKER_SECRET: "samurai-cluster-secret"
+      SAMURAI_TENANT_NAMESPACE: "default"
     command:
       - --role
       - master
       - --control-insecure
       - --control-listen
       - 0.0.0.0:5099
+      - --management-api-enable
+      - --management-api-listen
+      - 0.0.0.0:8089
+      - --control-rbac-enable
+      - --ha-enable
+      - --ha-mode
+      - redis
+      - --ha-redis-url
+      - redis://redis:6379/0
+      - --ha-redis-key
+      - samurai:ha:master
+      - --ha-node-id
+      - master-1
+      - --ha-wait-for-leader
+      - --worker-registration-timeout-s
+      - "30"
+      - --job-timeout-s
+      - "120"
+      - --control-autoscale-enable
+      - --control-autoscale-target-name
+      - samurai-slave
+      - --control-autoscale-min-replicas
+      - "1"
+      - --control-autoscale-max-replicas
+      - "20"
+      - --target
+      - 127.0.0.1
+      - --port
+      - "80"
+      - --protocol
+      - tcp
+      - --count
+      - "100000"
+      - --confirm
+    ports:
+      - "5099:5099"
+      - "8089:8089"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8089/healthz', timeout=2).read()\""]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - samurai-net
+
+  master-follower:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: samurai-master-follower
+    environment:
+      SAMURAI_CLUSTER_SECRET: "samurai-cluster-secret"
+      SAMURAI_MANAGEMENT_API_ADMIN_TOKEN: "samurai-admin-token"
+      SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN: "samurai-operator-token"
+      SAMURAI_MANAGEMENT_API_VIEWER_TOKEN: "samurai-viewer-token"
+      SAMURAI_CONTROL_RBAC_ADMIN_SECRET: "samurai-cluster-secret"
+      SAMURAI_CONTROL_RBAC_OPERATOR_SECRET: "samurai-cluster-secret"
+      SAMURAI_CONTROL_RBAC_WORKER_SECRET: "samurai-cluster-secret"
+      SAMURAI_TENANT_NAMESPACE: "default"
+    command:
+      - --role
+      - master
+      - --control-insecure
+      - --control-listen
+      - 0.0.0.0:5099
+      - --management-api-enable
+      - --management-api-listen
+      - 0.0.0.0:8089
+      - --control-rbac-enable
+      - --ha-enable
+      - --ha-mode
+      - redis
+      - --ha-redis-url
+      - redis://redis:6379/0
+      - --ha-redis-key
+      - samurai:ha:master
+      - --ha-node-id
+      - master-2
+      - --ha-wait-for-leader
       - --worker-registration-timeout-s
       - "30"
       - --job-timeout-s
@@ -23,8 +129,10 @@ services:
       - --count
       - "100000"
       - --confirm
-    ports:
-      - "5099:5099"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
     networks:
       - samurai-net
 
@@ -37,19 +145,29 @@ services:
       - slave
       - --control-insecure
       - --control-endpoints
-      - master:5099
+      - master:5099,master-follower:5099
       - --control-listen
       - 0.0.0.0:5099
+      - --stats-stream-enable
       - --heartbeat-interval-ms
       - "2000"
       - --slave-master-timeout-s
       - "30"
+      - --worker-status-probe
+      - --tenant-namespace
+      - default
+    environment:
+      SAMURAI_CLUSTER_SECRET: "samurai-cluster-secret"
+      SAMURAI_CONTROL_RBAC_WORKER_SECRET: "samurai-cluster-secret"
+      SAMURAI_TENANT_NAMESPACE: "default"
     depends_on:
       - master
+      - master-follower
     networks:
       - samurai-net
     deploy:
       replicas: 2
+    restart: unless-stopped
 
 networks:
   samurai-net:

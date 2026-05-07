@@ -4,6 +4,97 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+tls:
+  enabled: false
+  existingSecret: ""
+  mountPath: /etc/ddos-samurai/tls
+  certFile: tls.crt
+  keyFile: tls.key
+  caFile: ca.crt
+  clientCaFile: client-ca.crt
+  requireClientAuth: true
+
+auth:
+  clusterSecret: "change-me"
+  management:
+    adminToken: "change-me-admin"
+    operatorToken: "change-me-operator"
+    viewerToken: "change-me-viewer"
+  rbac:
+    enabled: true
+    defaultRole: viewer
+    adminSecret: ""
+    operatorSecret: ""
+    viewerSecret: ""
+    workerSecret: ""
+  tenantNamespace: default
+
+ha:
+  enabled: true
+  mode: redis
+  nodeId: ""
+  waitForLeader: true
+  leaseSeconds: 15
+  renewIntervalS: 5
+  redis:
+    url: redis://redis-master.default.svc.cluster.local:6379/0
+    key: samurai:ha:master
+  etcd:
+    endpoints: 127.0.0.1:2379
+    key: samurai/ha/master
+    timeoutS: 3
+  raft:
+    listen: 0.0.0.0:7000
+    peers: ""
+    electionTimeoutMinMs: 900
+    electionTimeoutMaxMs: 1500
+    heartbeatIntervalMs: 250
+    snapshotThreshold: 2048
+    snapshotKeepEntries: 512
+
+autoscale:
+  enabled: true
+  targetKind: deployment
+  targetName: ddos-samurai-slave
+  minReplicas: 1
+  maxReplicas: 20
+  step: 1
+  cooldownS: 15
+  shardsPerWorker: 4
+  idleScaleDownS: 60
+
 master:
   replicas: 1
   managementPort: 8089
@@ -18,15 +109,7 @@ master:
   service:
     type: ClusterIP
     port: 5099
-  args:
-    - --role
-    - master
-    - --control-insecure
-    - --control-listen
-    - 0.0.0.0:5099
-    - --management-api-enable
-    - --management-api-listen
-    - 0.0.0.0:8089
+  extraArgs:
     - --worker-registration-timeout-s
     - "30"
     - --job-timeout-s
@@ -42,6 +125,7 @@ master:
     - --confirm
 
 slave:
+  mode: deployment # deployment|daemonset
   replicas: 2
   podDisruptionBudget:
     enabled: true
@@ -51,40 +135,14 @@ slave:
     rollingUpdate:
       maxUnavailable: 1
       maxSurge: 1
-  args:
-    - --role
-    - slave
-    - --control-insecure
-    - --control-endpoints
-    - "{{ .Release.Name }}-master:5099"
-    - --control-listen
-    - 0.0.0.0:5099
+  daemonsetUpdateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  extraArgs:
     - --heartbeat-interval-ms
     - "2000"
     - --slave-master-timeout-s
     - "30"
+    - --stats-stream-enable
 
-resources:
-  requests:
-    cpu: 250m
-    memory: 256Mi
-  limits:
-    cpu: "1"
-    memory: 1Gi
-securityContext:
-  runAsNonRoot: true
-  runAsUser: 10001
-  runAsGroup: 10001
-  fsGroup: 10001
-containerSecurityContext:
-  allowPrivilegeEscalation: false
-  readOnlyRootFilesystem: false
-  capabilities:
-    drop: ["ALL"]
-serviceAccount:
-  create: true
-  name: ""
-podAnnotations: {}
-nodeSelector: {}
-tolerations: []
-affinity: {}

@@ -34,18 +34,153 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
 {{ toYaml .Values.containerSecurityContext | indent 12 }}
+          env:
+            - name: SAMURAI_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: cluster_secret
+            - name: SAMURAI_MANAGEMENT_API_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: management_admin_token
+            - name: SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: management_operator_token
+            - name: SAMURAI_MANAGEMENT_API_VIEWER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: management_viewer_token
+            - name: SAMURAI_CONTROL_RBAC_ADMIN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: rbac_admin_secret
+            - name: SAMURAI_CONTROL_RBAC_OPERATOR_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: rbac_operator_secret
+            - name: SAMURAI_CONTROL_RBAC_VIEWER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: rbac_viewer_secret
+            - name: SAMURAI_CONTROL_RBAC_WORKER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: rbac_worker_secret
+            - name: SAMURAI_TENANT_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-config
+                  key: tenant_namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           args:
-{{- range .Values.master.args }}
+            - "--role"
+            - "master"
+            - "--control-listen"
+            - "0.0.0.0:5099"
+            - "--management-api-enable"
+            - "--management-api-listen"
+            - "0.0.0.0:{{ .Values.master.managementPort }}"
+{{- if .Values.auth.rbac.enabled }}
+            - "--control-rbac-enable"
+            - "--control-rbac-default-role"
+            - "$(control_rbac_default_role)"
+{{- end }}
+            - "--tenant-namespace"
+            - "$(SAMURAI_TENANT_NAMESPACE)"
+{{- if .Values.ha.enabled }}
+            - "--ha-enable"
+            - "--ha-node-id"
+            - "$(POD_NAME)"
+            - "--ha-mode"
+            - "$(ha_mode)"
+            - "--ha-wait-for-leader"
+            - "$(ha_wait_for_leader)"
+            - "--ha-lease-seconds"
+            - "$(ha_lease_seconds)"
+            - "--ha-renew-interval-s"
+            - "$(ha_renew_interval_s)"
+            - "--ha-redis-url"
+            - "$(ha_redis_url)"
+            - "--ha-redis-key"
+            - "$(ha_redis_key)"
+            - "--ha-etcd-endpoints"
+            - "$(ha_etcd_endpoints)"
+            - "--ha-etcd-key"
+            - "$(ha_etcd_key)"
+            - "--ha-etcd-timeout-s"
+            - "$(ha_etcd_timeout_s)"
+            - "--ha-raft-listen"
+            - "$(ha_raft_listen)"
+            - "--ha-raft-peers"
+            - "$(ha_raft_peers)"
+            - "--ha-raft-election-timeout-min-ms"
+            - "$(ha_raft_election_timeout_min_ms)"
+            - "--ha-raft-election-timeout-max-ms"
+            - "$(ha_raft_election_timeout_max_ms)"
+            - "--ha-raft-heartbeat-interval-ms"
+            - "$(ha_raft_heartbeat_interval_ms)"
+            - "--ha-raft-snapshot-threshold"
+            - "$(ha_raft_snapshot_threshold)"
+            - "--ha-raft-snapshot-keep-entries"
+            - "$(ha_raft_snapshot_keep_entries)"
+{{- end }}
+{{- if .Values.autoscale.enabled }}
+            - "--control-autoscale-enable"
+            - "--control-autoscale-target-kind"
+            - "$(autoscale_target_kind)"
+            - "--control-autoscale-target-name"
+            - "$(autoscale_target_name)"
+            - "--control-autoscale-min-replicas"
+            - "$(autoscale_min_replicas)"
+            - "--control-autoscale-max-replicas"
+            - "$(autoscale_max_replicas)"
+            - "--control-autoscale-step"
+            - "$(autoscale_step)"
+            - "--control-autoscale-cooldown-s"
+            - "$(autoscale_cooldown_s)"
+            - "--control-autoscale-shards-per-worker"
+            - "$(autoscale_shards_per_worker)"
+            - "--control-autoscale-idle-scale-down-s"
+            - "$(autoscale_idle_scale_down_s)"
+{{- end }}
+{{- if .Values.tls.enabled }}
+            - "--control-tls-cert"
+            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.certFile }}"
+            - "--control-tls-key"
+            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.keyFile }}"
+            - "--control-tls-client-ca"
+            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.clientCaFile }}"
+            - "--control-require-client-auth"
+{{- else }}
+            - "--control-insecure"
+{{- end }}
+{{- range .Values.master.extraArgs }}
             - {{ . | quote }}
 {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "ddos-samurai.fullname" . }}-config
           ports:
             - containerPort: {{ .Values.master.service.port }}
               name: grpc
             - containerPort: {{ .Values.master.managementPort }}
               name: mgmt
           readinessProbe:
-            tcpSocket:
-              port: grpc
+            httpGet:
+              path: /healthz
+              port: mgmt
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
@@ -56,9 +191,21 @@ spec:
             periodSeconds: 10
           resources:
 {{ toYaml .Values.resources | indent 12 }}
+{{- if .Values.tls.enabled }}
+          volumeMounts:
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+{{- end }}
       nodeSelector:
 {{ toYaml .Values.nodeSelector | indent 8 }}
       tolerations:
 {{ toYaml .Values.tolerations | indent 8 }}
       affinity:
 {{ toYaml .Values.affinity | indent 8 }}
+{{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret | default (printf "%s-tls" (include "ddos-samurai.fullname" .)) }}
+{{- end }}

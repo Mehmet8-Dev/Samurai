@@ -1,0 +1,216 @@
+{{- if eq .Values.slave.mode "daemonset" }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "ddos-samurai.fullname" . }}-slave
+  labels:
+    app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
+    app.kubernetes.io/component: slave
+spec:
+  updateStrategy:
+{{ toYaml .Values.slave.daemonsetUpdateStrategy | indent 4 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
+      app.kubernetes.io/component: slave
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
+        app.kubernetes.io/component: slave
+      annotations:
+{{ toYaml .Values.podAnnotations | indent 8 }}
+    spec:
+      serviceAccountName: {{ include "ddos-samurai.serviceAccountName" . }}
+{{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | indent 8 }}
+{{- end }}
+      securityContext:
+{{ toYaml .Values.securityContext | indent 8 }}
+      containers:
+        - name: slave
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | indent 12 }}
+          env:
+            - name: SAMURAI_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: cluster_secret
+            - name: SAMURAI_CONTROL_RBAC_WORKER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: rbac_worker_secret
+            - name: SAMURAI_TENANT_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-config
+                  key: tenant_namespace
+          args:
+            - "--role"
+            - "slave"
+            - "--control-endpoints"
+            - '{{ include "ddos-samurai.fullname" . }}-master:{{ .Values.master.service.port }}'
+            - "--control-listen"
+            - "0.0.0.0:5099"
+            - "--tenant-namespace"
+            - "$(SAMURAI_TENANT_NAMESPACE)"
+{{- if .Values.tls.enabled }}
+            - "--control-tls-ca"
+            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.caFile }}"
+            - "--control-tls-client-cert"
+            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.certFile }}"
+            - "--control-tls-client-key"
+            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.keyFile }}"
+{{- else }}
+            - "--control-insecure"
+{{- end }}
+{{- range .Values.slave.extraArgs }}
+            - {{ . | quote }}
+{{- end }}
+          ports:
+            - containerPort: 5099
+              name: grpc
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+{{- if .Values.tls.enabled }}
+          volumeMounts:
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+{{- end }}
+      nodeSelector:
+{{ toYaml .Values.nodeSelector | indent 8 }}
+      tolerations:
+{{ toYaml .Values.tolerations | indent 8 }}
+      affinity:
+{{ toYaml .Values.affinity | indent 8 }}
+{{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret | default (printf "%s-tls" (include "ddos-samurai.fullname" .)) }}
+{{- end }}
+{{- else }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ddos-samurai.fullname" . }}-slave
+  labels:
+    app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
+    app.kubernetes.io/component: slave
+spec:
+  replicas: {{ .Values.slave.replicas }}
+  strategy:
+{{ toYaml .Values.slave.updateStrategy | indent 4 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
+      app.kubernetes.io/component: slave
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
+        app.kubernetes.io/component: slave
+      annotations:
+{{ toYaml .Values.podAnnotations | indent 8 }}
+    spec:
+      serviceAccountName: {{ include "ddos-samurai.serviceAccountName" . }}
+{{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | indent 8 }}
+{{- end }}
+      securityContext:
+{{ toYaml .Values.securityContext | indent 8 }}
+      containers:
+        - name: slave
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | indent 12 }}
+          env:
+            - name: SAMURAI_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: cluster_secret
+            - name: SAMURAI_CONTROL_RBAC_WORKER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: rbac_worker_secret
+            - name: SAMURAI_TENANT_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-config
+                  key: tenant_namespace
+          args:
+            - "--role"
+            - "slave"
+            - "--control-endpoints"
+            - '{{ include "ddos-samurai.fullname" . }}-master:{{ .Values.master.service.port }}'
+            - "--control-listen"
+            - "0.0.0.0:5099"
+            - "--tenant-namespace"
+            - "$(SAMURAI_TENANT_NAMESPACE)"
+{{- if .Values.tls.enabled }}
+            - "--control-tls-ca"
+            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.caFile }}"
+            - "--control-tls-client-cert"
+            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.certFile }}"
+            - "--control-tls-client-key"
+            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.keyFile }}"
+{{- else }}
+            - "--control-insecure"
+{{- end }}
+{{- range .Values.slave.extraArgs }}
+            - {{ . | quote }}
+{{- end }}
+          ports:
+            - containerPort: 5099
+              name: grpc
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+{{- if .Values.tls.enabled }}
+          volumeMounts:
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+{{- end }}
+      nodeSelector:
+{{ toYaml .Values.nodeSelector | indent 8 }}
+      tolerations:
+{{ toYaml .Values.tolerations | indent 8 }}
+      affinity:
+{{ toYaml .Values.affinity | indent 8 }}
+{{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret | default (printf "%s-tls" (include "ddos-samurai.fullname" .)) }}
+{{- end }}
+{{- end }}

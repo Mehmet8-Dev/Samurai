@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ddos-samurai.fullname" . }}-config
+  labels:
+    app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
+data:
+  tenant_namespace: {{ .Values.auth.tenantNamespace | quote }}
+  ha_mode: {{ .Values.ha.mode | quote }}
+  ha_wait_for_leader: {{ ternary "true" "false" .Values.ha.waitForLeader | quote }}
+  ha_lease_seconds: {{ .Values.ha.leaseSeconds | quote }}
+  ha_renew_interval_s: {{ .Values.ha.renewIntervalS | quote }}
+  ha_redis_url: {{ .Values.ha.redis.url | quote }}
+  ha_redis_key: {{ .Values.ha.redis.key | quote }}
+  ha_etcd_endpoints: {{ .Values.ha.etcd.endpoints | quote }}
+  ha_etcd_key: {{ .Values.ha.etcd.key | quote }}
+  ha_etcd_timeout_s: {{ .Values.ha.etcd.timeoutS | quote }}
+  ha_raft_listen: {{ .Values.ha.raft.listen | quote }}
+  ha_raft_peers: {{ .Values.ha.raft.peers | quote }}
+  ha_raft_election_timeout_min_ms: {{ .Values.ha.raft.electionTimeoutMinMs | quote }}
+  ha_raft_election_timeout_max_ms: {{ .Values.ha.raft.electionTimeoutMaxMs | quote }}
+  ha_raft_heartbeat_interval_ms: {{ .Values.ha.raft.heartbeatIntervalMs | quote }}
+  ha_raft_snapshot_threshold: {{ .Values.ha.raft.snapshotThreshold | quote }}
+  ha_raft_snapshot_keep_entries: {{ .Values.ha.raft.snapshotKeepEntries | quote }}
+  control_rbac_default_role: {{ .Values.auth.rbac.defaultRole | quote }}
+  autoscale_target_kind: {{ .Values.autoscale.targetKind | quote }}
+  autoscale_target_name: {{ .Values.autoscale.targetName | quote }}
+  autoscale_min_replicas: {{ .Values.autoscale.minReplicas | quote }}
+  autoscale_max_replicas: {{ .Values.autoscale.maxReplicas | quote }}
+  autoscale_step: {{ .Values.autoscale.step | quote }}
+  autoscale_cooldown_s: {{ .Values.autoscale.cooldownS | quote }}
+  autoscale_shards_per_worker: {{ .Values.autoscale.shardsPerWorker | quote }}
+  autoscale_idle_scale_down_s: {{ .Values.autoscale.idleScaleDownS | quote }}
