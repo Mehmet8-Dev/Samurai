@@ -65,3 +65,49 @@ def test_management_api_summary_and_abort_with_auth():
     assert r6.status_code == 200
     events = list((r6.json() or {}).get("events") or [])
     assert events and str(events[0].get("kind", "")) == "master_started"
+
+
+def test_management_api_role_based_authorization():
+    fastapi_testclient = __import__("fastapi.testclient", fromlist=["TestClient"])
+    TestClient = fastapi_testclient.TestClient
+
+    state = {
+        "workers": [],
+        "workers_count": 0,
+        "shards": [],
+        "shards_reported_count": 0,
+        "latest_snapshot": {},
+        "current_job": {"state": "idle", "job_id": ""},
+        "ha": {"mode": "off", "is_leader": 1},
+        "events": [],
+    }
+    called = {"abort": 0}
+
+    def _state():
+        return dict(state)
+
+    def _abort():
+        called["abort"] += 1
+        return {"aborted": True, "workers_notified": 0}
+
+    app = create_management_app(
+        state_provider=_state,
+        abort_callback=_abort,
+        auth_role_tokens={"admin": "adm", "operator": "op", "viewer": "view"},
+    )
+    cli = TestClient(app)
+
+    viewer_hdr = {"Authorization": "Bearer view"}
+    operator_hdr = {"Authorization": "Bearer op"}
+    admin_hdr = {"Authorization": "Bearer adm"}
+    bad_hdr = {"Authorization": "Bearer nope"}
+
+    assert cli.get("/v1/cluster/summary", headers=viewer_hdr).status_code == 200
+    assert cli.get("/v1/cluster/summary", headers=operator_hdr).status_code == 200
+    assert cli.get("/v1/cluster/summary", headers=admin_hdr).status_code == 200
+    assert cli.get("/v1/cluster/summary", headers=bad_hdr).status_code == 401
+
+    assert cli.post("/v1/jobs/abort", headers=viewer_hdr).status_code == 403
+    assert cli.post("/v1/jobs/abort", headers=operator_hdr).status_code == 200
+    assert cli.post("/v1/jobs/abort", headers=admin_hdr).status_code == 200
+    assert int(called["abort"]) == 2

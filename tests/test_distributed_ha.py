@@ -426,3 +426,126 @@ def test_native_raft_replicated_log_survives_leader_failover():
                 n.stop()
             except Exception:
                 pass
+
+
+def test_native_raft_snapshot_compaction_progresses():
+    p1, p2, p3 = _free_port(), _free_port(), _free_port()
+    n1 = NativeRaftLeaderElector(
+        node_id="n1",
+        listen_addr=f"127.0.0.1:{p1}",
+        peers_csv=f"n2@127.0.0.1:{p2},n3@127.0.0.1:{p3}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+        snapshot_threshold=32,
+        snapshot_keep_entries=8,
+    )
+    n2 = NativeRaftLeaderElector(
+        node_id="n2",
+        listen_addr=f"127.0.0.1:{p2}",
+        peers_csv=f"n1@127.0.0.1:{p1},n3@127.0.0.1:{p3}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+        snapshot_threshold=32,
+        snapshot_keep_entries=8,
+    )
+    n3 = NativeRaftLeaderElector(
+        node_id="n3",
+        listen_addr=f"127.0.0.1:{p3}",
+        peers_csv=f"n1@127.0.0.1:{p1},n2@127.0.0.1:{p2}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+        snapshot_threshold=32,
+        snapshot_keep_entries=8,
+    )
+    nodes = [n1, n2, n3]
+    try:
+        for n in nodes:
+            n.start_renew_loop(interval_seconds=0.05)
+        leader = None
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            leaders = [n for n in nodes if n.is_leader()]
+            if len(leaders) == 1:
+                leader = leaders[0]
+                break
+            time.sleep(0.05)
+        assert leader is not None
+        for i in range(1, 80):
+            assert leader.replicate_command({"seq": i}, wait_commit_s=2.0) is True
+        snap = leader.snapshot()
+        assert int(snap.get("snapshot_last_index", 0) or 0) > 0
+        assert int(snap.get("last_log_index", 0) or 0) >= 79
+        assert int(snap.get("commit_index", 0) or 0) >= 79
+    finally:
+        for n in nodes:
+            try:
+                n.stop()
+            except Exception:
+                pass
+
+
+def test_native_raft_dynamic_membership_add_remove_peer():
+    p1, p2, p3 = _free_port(), _free_port(), _free_port()
+    n1 = NativeRaftLeaderElector(
+        node_id="n1",
+        listen_addr=f"127.0.0.1:{p1}",
+        peers_csv=f"n2@127.0.0.1:{p2}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    n2 = NativeRaftLeaderElector(
+        node_id="n2",
+        listen_addr=f"127.0.0.1:{p2}",
+        peers_csv=f"n1@127.0.0.1:{p1}",
+        election_timeout_min_ms=220,
+        election_timeout_max_ms=380,
+        heartbeat_interval_ms=80,
+    )
+    n3 = NativeRaftLeaderElector(
+        node_id="n3",
+        listen_addr=f"127.0.0.1:{p3}",
+        peers_csv=f"n1@127.0.0.1:{p1},n2@127.0.0.1:{p2}",
+        election_timeout_min_ms=2000,
+        election_timeout_max_ms=3000,
+        heartbeat_interval_ms=80,
+    )
+    nodes = [n1, n2, n3]
+    try:
+        for n in nodes:
+            n.start_renew_loop(interval_seconds=0.05)
+        leader = None
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            leaders = [n for n in [n1, n2] if n.is_leader()]
+            if len(leaders) == 1:
+                leader = leaders[0]
+                break
+            time.sleep(0.05)
+        assert leader is not None
+        assert leader.add_peer("n3", f"127.0.0.1:{p3}", wait_commit_s=3.0) is True
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            if int(n1.snapshot().get("peer_count", 0) or 0) == 2 and int(n2.snapshot().get("peer_count", 0) or 0) == 2:
+                break
+            time.sleep(0.05)
+        assert int(n1.snapshot().get("peer_count", 0) or 0) == 2
+        assert int(n2.snapshot().get("peer_count", 0) or 0) == 2
+
+        assert leader.remove_peer("n3", wait_commit_s=3.0) is True
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            if int(n1.snapshot().get("peer_count", 0) or 0) == 1 and int(n2.snapshot().get("peer_count", 0) or 0) == 1:
+                break
+            time.sleep(0.05)
+        assert int(n1.snapshot().get("peer_count", 0) or 0) == 1
+        assert int(n2.snapshot().get("peer_count", 0) or 0) == 1
+    finally:
+        for n in nodes:
+            try:
+                n.stop()
+            except Exception:
+                pass

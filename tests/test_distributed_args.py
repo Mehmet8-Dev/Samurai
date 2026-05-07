@@ -63,3 +63,29 @@ def test_distributed_k8s_port_bounds(monkeypatch):
     args = parser.parse_args(['--role','slave','--control-endpoints','127.0.0.1:5099','--control-insecure','--control-k8s-port','70000'])
     with pytest.raises(SystemExit):
         _validate_distributed_args(parser, args)
+
+
+def test_distributed_management_api_requires_token_when_enabled(monkeypatch):
+    monkeypatch.setitem(sys.modules, "grpc", types.SimpleNamespace())
+    parser = build_parser()
+    args = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--management-api-enable",
+    ])
+    with pytest.raises(SystemExit):
+        _validate_distributed_args(parser, args)
+
+
+def test_distributed_autoscale_requires_target_name(monkeypatch):
+    monkeypatch.setitem(sys.modules, "grpc", types.SimpleNamespace())
+    parser = build_parser()
+    args = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--control-autoscale-enable",
+    ])
+    with pytest.raises(SystemExit):
+        _validate_distributed_args(parser, args)
