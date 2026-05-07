@@ -492,9 +492,8 @@ class NativeRaftLeaderElector:
     """
     Embedded Raft leader election core (quorum/term/heartbeat based).
 
-    Scope: control-plane leadership consensus and fencing epoch.
-    This implementation focuses on leader election and liveness; it does not
-    replicate an application command log.
+    Scope: control-plane leadership consensus, fencing epoch, replicated
+    command log, and lightweight snapshot compaction.
     """
 
     def __init__(
@@ -508,6 +507,8 @@ class NativeRaftLeaderElector:
         heartbeat_interval_ms: int = 250,
         rpc_timeout_s: float = 0.35,
         append_batch_size: int = 128,
+        snapshot_threshold: int = 2048,
+        snapshot_keep_entries: int = 512,
     ) -> None:
         self.node_id = str(node_id or "").strip() or socket.gethostname()
         self.listen_addr = str(listen_addr or "").strip()
@@ -525,6 +526,8 @@ class NativeRaftLeaderElector:
         self.heartbeat_interval_ms = max(50, int(heartbeat_interval_ms or 250))
         self.rpc_timeout_s = max(0.05, float(rpc_timeout_s or 0.35))
         self.append_batch_size = max(1, int(append_batch_size or 128))
+        self.snapshot_threshold = max(64, int(snapshot_threshold or 2048))
+        self.snapshot_keep_entries = max(16, int(snapshot_keep_entries or 512))
 
         self._lock = threading.RLock()
         self._term = 0
@@ -537,6 +540,9 @@ class NativeRaftLeaderElector:
         self._election_deadline = 0.0
         self._set_new_election_deadline_locked()
         self._log: list[dict] = []
+        self._log_start_index = 1
+        self._snapshot_last_index = 0
+        self._snapshot_last_term = 0
         self._commit_index = 0
         self._last_applied = 0
         self._next_index = {nid: 1 for nid, _ in self.peer_items}
@@ -555,19 +561,55 @@ class NativeRaftLeaderElector:
         jitter_ms = random.randint(low, high)
         self._election_deadline = time.monotonic() + (float(jitter_ms) / 1000.0)
 
+    def _recompute_topology_locked(self) -> None:
+        self.peer_items = sorted(self.peers.items())
+        self.peer_count = len(self.peer_items)
+        self.cluster_size = self.peer_count + 1
+        self.quorum = (self.cluster_size // 2) + 1
+        for nid, _addr in self.peer_items:
+            self._next_index.setdefault(nid, self._last_log_index_locked() + 1)
+            self._match_index.setdefault(nid, 0)
+        known = {nid for nid, _ in self.peer_items}
+        for nid in list(self._next_index.keys()):
+            if nid not in known:
+                self._next_index.pop(nid, None)
+        for nid in list(self._match_index.keys()):
+            if nid not in known:
+                self._match_index.pop(nid, None)
+
     def _last_log_index_locked(self) -> int:
-        return int(len(self._log))
+        if not self._log:
+            return int(self._snapshot_last_index)
+        return int(self._log_start_index + len(self._log) - 1)
+
+    def _entry_pos_locked(self, index: int) -> int:
+        idx = int(index or 0)
+        return int(idx - self._log_start_index)
 
     def _log_term_at_locked(self, index: int) -> int:
         idx = int(index or 0)
         if idx <= 0:
             return 0
-        if idx > len(self._log):
+        if idx == self._snapshot_last_index:
+            return int(self._snapshot_last_term)
+        if idx < self._log_start_index:
             return 0
-        return int(dict(self._log[idx - 1] or {}).get("term", 0) or 0)
+        pos = self._entry_pos_locked(idx)
+        if pos < 0 or pos >= len(self._log):
+            return 0
+        return int(dict(self._log[pos] or {}).get("term", 0) or 0)
+
+    def _entry_at_locked(self, index: int) -> dict | None:
+        idx = int(index or 0)
+        if idx < self._log_start_index:
+            return None
+        pos = self._entry_pos_locked(idx)
+        if pos < 0 or pos >= len(self._log):
+            return None
+        return dict(self._log[pos] or {})
 
     def _append_entry_locked(self, term: int, command: dict) -> int:
-        idx = len(self._log) + 1
+        idx = self._last_log_index_locked() + 1
         self._log.append(
             {
                 "index": int(idx),
@@ -579,17 +621,61 @@ class NativeRaftLeaderElector:
 
     def _collect_apply_entries_locked(self) -> list[dict]:
         out = []
-        while self._last_applied < self._commit_index and self._last_applied < len(self._log):
+        while self._last_applied < self._commit_index:
             self._last_applied += 1
-            entry = dict(self._log[self._last_applied - 1] or {})
+            entry = self._entry_at_locked(self._last_applied)
+            if entry is None:
+                # already compacted into snapshot
+                continue
             rec = {
                 "index": int(entry.get("index", self._last_applied) or self._last_applied),
                 "term": int(entry.get("term", 0) or 0),
                 "command": dict(entry.get("command", {}) or {}),
             }
+            self._apply_membership_command_locked(rec)
             self._applied_commands.append(rec)
             out.append(rec)
+        self._maybe_compact_locked()
         return out
+
+    def _apply_membership_command_locked(self, rec: dict) -> None:
+        cmd = dict(rec.get("command", {}) or {})
+        op = str(cmd.get("type", "") or "")
+        if op == "__membership_add":
+            nid = str(cmd.get("node_id", "") or "").strip()
+            addr = str(cmd.get("addr", "") or "").strip()
+            if nid and addr and nid != self.node_id and ":" in addr:
+                self.peers[nid] = addr
+                self._recompute_topology_locked()
+        elif op == "__membership_remove":
+            nid = str(cmd.get("node_id", "") or "").strip()
+            if nid and nid != self.node_id and nid in self.peers:
+                self.peers.pop(nid, None)
+                self._recompute_topology_locked()
+
+    def _maybe_compact_locked(self) -> None:
+        if self._commit_index <= self._snapshot_last_index:
+            return
+        delta = self._commit_index - self._snapshot_last_index
+        if delta < self.snapshot_threshold:
+            return
+        target = max(self._snapshot_last_index, self._commit_index - self.snapshot_keep_entries)
+        if target <= self._snapshot_last_index:
+            return
+        target_term = self._log_term_at_locked(target)
+        if target_term <= 0:
+            return
+        if target >= self._log_start_index:
+            cut = target - self._log_start_index + 1
+            if cut > 0:
+                del self._log[:cut]
+                self._log_start_index = target + 1
+        self._snapshot_last_index = int(target)
+        self._snapshot_last_term = int(target_term)
+        floor_idx = self._snapshot_last_index + 1
+        for nid in list(self._next_index.keys()):
+            self._next_index[nid] = max(int(self._next_index.get(nid, floor_idx) or floor_idx), floor_idx)
+            self._match_index[nid] = max(0, int(self._match_index.get(nid, 0) or 0))
 
     def _become_follower_locked(self, term: int, leader_id: str = "") -> None:
         if int(term) > int(self._term):
@@ -602,6 +688,7 @@ class NativeRaftLeaderElector:
         self._set_new_election_deadline_locked()
 
     def _become_leader_locked(self) -> None:
+        self._recompute_topology_locked()
         self._role = "leader"
         self._is_leader = True
         self._leader_id = str(self.node_id)
@@ -651,6 +738,8 @@ class NativeRaftLeaderElector:
             return self._handle_request_vote(req)
         if rtype == "AppendEntries":
             return self._handle_append_entries(req)
+        if rtype == "InstallSnapshot":
+            return self._handle_install_snapshot(req)
         return {"ok": False, "error": "unknown_type"}
 
     def _handle_request_vote(self, req: dict) -> dict:
@@ -701,6 +790,13 @@ class NativeRaftLeaderElector:
                 self._last_leader_contact = time.monotonic()
                 self._set_new_election_deadline_locked()
             last_idx = self._last_log_index_locked()
+            if prev_log_index < self._snapshot_last_index:
+                return {
+                    "ok": True,
+                    "term": int(self._term),
+                    "success": False,
+                    "match_index": int(self._snapshot_last_index),
+                }
             if prev_log_index > last_idx:
                 return {"ok": True, "term": int(self._term), "success": False, "match_index": int(last_idx)}
             if prev_log_index > 0 and self._log_term_at_locked(prev_log_index) != prev_log_term:
@@ -717,10 +813,13 @@ class NativeRaftLeaderElector:
                 ins_idx += 1
                 eterm = int(dict(item or {}).get("term", 0) or 0)
                 ecmd = dict(dict(item or {}).get("command", {}) or {})
-                if ins_idx <= len(self._log):
-                    cur_term = self._log_term_at_locked(ins_idx)
+                existing = self._entry_at_locked(ins_idx)
+                if existing is not None:
+                    cur_term = int(existing.get("term", 0) or 0)
                     if cur_term != eterm:
-                        del self._log[ins_idx - 1 :]
+                        pos = self._entry_pos_locked(ins_idx)
+                        if pos >= 0:
+                            del self._log[pos:]
                         self._log.append({"index": ins_idx, "term": eterm, "command": ecmd})
                 else:
                     self._log.append({"index": ins_idx, "term": eterm, "command": ecmd})
@@ -730,6 +829,35 @@ class NativeRaftLeaderElector:
             match_index = self._last_log_index_locked()
         _ = applied
         return {"ok": True, "term": int(term), "success": True, "match_index": int(match_index)}
+
+    def _handle_install_snapshot(self, req: dict) -> dict:
+        term = int(dict(req or {}).get("term", 0) or 0)
+        leader_id = str(dict(req or {}).get("leader_id", "") or "")
+        last_idx = int(dict(req or {}).get("last_included_index", 0) or 0)
+        last_term = int(dict(req or {}).get("last_included_term", 0) or 0)
+        with self._lock:
+            if term < self._term:
+                return {"ok": True, "term": int(self._term), "success": False}
+            if term > self._term:
+                self._become_follower_locked(term, leader_id=leader_id)
+            else:
+                self._role = "follower"
+                self._is_leader = False
+                self._leader_id = leader_id
+                self._last_leader_contact = time.monotonic()
+                self._set_new_election_deadline_locked()
+
+            if last_idx > self._snapshot_last_index:
+                if last_idx >= self._log_start_index:
+                    cut = last_idx - self._log_start_index + 1
+                    if cut > 0:
+                        del self._log[:cut]
+                self._log_start_index = max(self._log_start_index, last_idx + 1)
+                self._snapshot_last_index = int(last_idx)
+                self._snapshot_last_term = int(last_term)
+            self._commit_index = max(self._commit_index, self._snapshot_last_index)
+            self._last_applied = max(self._last_applied, self._snapshot_last_index)
+        return {"ok": True, "term": int(term), "success": True, "match_index": int(last_idx)}
 
     def _send_rpc(self, addr: str, payload: dict) -> dict:
         host, port_s = str(addr).rsplit(":", 1)
@@ -756,11 +884,32 @@ class NativeRaftLeaderElector:
         with self._lock:
             next_idx = int(self._next_index.get(peer_id, self._last_log_index_locked() + 1) or 1)
             next_idx = max(1, next_idx)
+            if next_idx <= self._snapshot_last_index:
+                snap_payload = {
+                    "type": "InstallSnapshot",
+                    "term": int(term),
+                    "leader_id": str(self.node_id),
+                    "last_included_index": int(self._snapshot_last_index),
+                    "last_included_term": int(self._snapshot_last_term),
+                }
+                try:
+                    res = self._send_rpc(peer_addr, snap_payload)
+                except Exception:
+                    return False, int(term), 0
+                rterm = int(dict(res or {}).get("term", 0) or 0)
+                if rterm > term:
+                    return False, int(rterm), 0
+                if bool(dict(res or {}).get("success", False)):
+                    match_idx = int(dict(res or {}).get("match_index", self._snapshot_last_index) or self._snapshot_last_index)
+                    return True, int(term), int(match_idx)
+                return False, int(term), int(self._snapshot_last_index)
             prev_idx = next_idx - 1
             prev_term = self._log_term_at_locked(prev_idx)
             leader_commit = int(self._commit_index)
             if next_idx <= self._last_log_index_locked():
-                slice_items = self._log[next_idx - 1 : next_idx - 1 + self.append_batch_size]
+                from_pos = max(0, self._entry_pos_locked(next_idx))
+                to_pos = from_pos + self.append_batch_size
+                slice_items = self._log[from_pos:to_pos]
             else:
                 slice_items = []
             entries = [{"term": int(x.get("term", 0) or 0), "command": dict(x.get("command", {}) or {})} for x in slice_items]
@@ -812,9 +961,9 @@ class NativeRaftLeaderElector:
                 else:
                     cur = int(self._next_index.get(peer_id, self._last_log_index_locked() + 1) or 1)
                     if val > 0:
-                        self._next_index[peer_id] = max(1, int(val) + 1)
+                        self._next_index[peer_id] = max(self._snapshot_last_index + 1, int(val) + 1)
                     else:
-                        self._next_index[peer_id] = max(1, cur - 1)
+                        self._next_index[peer_id] = max(self._snapshot_last_index + 1, cur - 1)
         with self._lock:
             _ = self._advance_commit_index_locked(current_term=term)
         return int(acks)
@@ -950,6 +1099,25 @@ class NativeRaftLeaderElector:
         with self._lock:
             return [dict(x) for x in list(self._applied_commands)]
 
+    def add_peer(self, node_id: str, addr: str, *, wait_commit_s: float = 3.0) -> bool:
+        nid = str(node_id or "").strip()
+        endpoint = str(addr or "").strip()
+        if not nid or not endpoint or ":" not in endpoint or nid == self.node_id:
+            return False
+        return self.replicate_command(
+            {"type": "__membership_add", "node_id": nid, "addr": endpoint},
+            wait_commit_s=wait_commit_s,
+        )
+
+    def remove_peer(self, node_id: str, *, wait_commit_s: float = 3.0) -> bool:
+        nid = str(node_id or "").strip()
+        if not nid or nid == self.node_id:
+            return False
+        return self.replicate_command(
+            {"type": "__membership_remove", "node_id": nid},
+            wait_commit_s=wait_commit_s,
+        )
+
     def release(self) -> None:
         with self._lock:
             self._is_leader = False
@@ -991,6 +1159,9 @@ class NativeRaftLeaderElector:
                 "peer_count": int(self.peer_count),
                 "quorum": int(self.quorum),
                 "log_len": int(len(self._log)),
+                "last_log_index": int(self._last_log_index_locked()),
                 "commit_index": int(self._commit_index),
                 "last_applied": int(self._last_applied),
+                "snapshot_last_index": int(self._snapshot_last_index),
+                "snapshot_last_term": int(self._snapshot_last_term),
             }

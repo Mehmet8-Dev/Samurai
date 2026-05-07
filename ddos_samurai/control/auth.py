@@ -23,6 +23,37 @@ def validate_cluster_secret(expected: str, provided: Optional[str]) -> bool:
     return exp == got
 
 
+def normalize_role_secrets(
+    *,
+    admin_secret: str = "",
+    operator_secret: str = "",
+    viewer_secret: str = "",
+    worker_secret: str = "",
+) -> dict[str, str]:
+    out = {}
+    if str(admin_secret or "").strip():
+        out["admin"] = str(admin_secret).strip()
+    if str(operator_secret or "").strip():
+        out["operator"] = str(operator_secret).strip()
+    if str(viewer_secret or "").strip():
+        out["viewer"] = str(viewer_secret).strip()
+    if str(worker_secret or "").strip():
+        out["worker"] = str(worker_secret).strip()
+    return out
+
+
+def resolve_role_from_secret(provided_secret: Optional[str], role_secrets: dict[str, str]) -> str:
+    got = str(provided_secret or "").strip()
+    if not got:
+        return ""
+    # Prefer strongest role when secrets overlap by mistake.
+    for role in ("admin", "operator", "viewer", "worker"):
+        exp = str((role_secrets or {}).get(role, "") or "").strip()
+        if exp and exp == got:
+            return role
+    return ""
+
+
 def load_tls_server_credentials(
     cert_path: str,
     key_path: str,
