@@ -48,6 +48,11 @@ tls:
 
 auth:
   clusterSecret: "change-me"
+  jwt:
+    controlSecret: ""
+    managementSecret: ""
+    roleClaim: role
+    tenantClaim: tenant_namespace
   management:
     adminToken: "change-me-admin"
     operatorToken: "change-me-operator"
@@ -60,6 +65,12 @@ auth:
     viewerSecret: ""
     workerSecret: ""
   tenantNamespace: default
+
+region:
+  workerRegion: ""
+  targetRegion: ""
+  regionAwareRouting: false
+  crossRegionHeartbeatFactor: 1.6
 
 ha:
   enabled: true
@@ -94,10 +105,13 @@ autoscale:
   cooldownS: 15
   shardsPerWorker: 4
   idleScaleDownS: 60
+  rbac:
+    create: true
 
 master:
   replicas: 1
   managementPort: 8089
+  managementLiveIntervalMs: 1000
   podDisruptionBudget:
     enabled: true
     minAvailable: 1
@@ -145,4 +159,3 @@ slave:
     - --slave-master-timeout-s
     - "30"
     - --stats-stream-enable
-

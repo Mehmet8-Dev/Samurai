@@ -26,7 +26,11 @@ services:
       SAMURAI_CONTROL_RBAC_ADMIN_SECRET: "samurai-cluster-secret"
       SAMURAI_CONTROL_RBAC_OPERATOR_SECRET: "samurai-cluster-secret"
       SAMURAI_CONTROL_RBAC_WORKER_SECRET: "samurai-cluster-secret"
+      SAMURAI_CONTROL_JWT_SECRET: "samurai-jwt-secret"
+      SAMURAI_MANAGEMENT_API_JWT_SECRET: "samurai-jwt-secret"
       SAMURAI_TENANT_NAMESPACE: "default"
+      SAMURAI_WORKER_REGION: "eu-central"
+      SAMURAI_TARGET_REGION: "eu-central"
     command:
       - --role
       - master
@@ -36,7 +40,12 @@ services:
       - --management-api-enable
       - --management-api-listen
       - 0.0.0.0:8089
+      - --management-api-live-interval-ms
+      - "1000"
       - --control-rbac-enable
+      - --region-aware-routing
+      - --cross-region-heartbeat-factor
+      - "1.6"
       - --ha-enable
       - --ha-mode
       - redis
@@ -95,7 +104,11 @@ services:
       SAMURAI_CONTROL_RBAC_ADMIN_SECRET: "samurai-cluster-secret"
       SAMURAI_CONTROL_RBAC_OPERATOR_SECRET: "samurai-cluster-secret"
       SAMURAI_CONTROL_RBAC_WORKER_SECRET: "samurai-cluster-secret"
+      SAMURAI_CONTROL_JWT_SECRET: "samurai-jwt-secret"
+      SAMURAI_MANAGEMENT_API_JWT_SECRET: "samurai-jwt-secret"
       SAMURAI_TENANT_NAMESPACE: "default"
+      SAMURAI_WORKER_REGION: "eu-central"
+      SAMURAI_TARGET_REGION: "eu-central"
     command:
       - --role
       - master
@@ -105,7 +118,12 @@ services:
       - --management-api-enable
       - --management-api-listen
       - 0.0.0.0:8089
+      - --management-api-live-interval-ms
+      - "1000"
       - --control-rbac-enable
+      - --region-aware-routing
+      - --cross-region-heartbeat-factor
+      - "1.6"
       - --ha-enable
       - --ha-mode
       - redis
@@ -156,10 +174,13 @@ services:
       - --worker-status-probe
       - --tenant-namespace
       - default
+      - --worker-region
+      - eu-central
     environment:
       SAMURAI_CLUSTER_SECRET: "samurai-cluster-secret"
       SAMURAI_CONTROL_RBAC_WORKER_SECRET: "samurai-cluster-secret"
       SAMURAI_TENANT_NAMESPACE: "default"
+      SAMURAI_WORKER_REGION: "eu-central"
     depends_on:
       - master
       - master-follower

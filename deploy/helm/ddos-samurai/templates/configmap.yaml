@@ -6,6 +6,10 @@ metadata:
     app.kubernetes.io/name: {{ include "ddos-samurai.name" . }}
 data:
   tenant_namespace: {{ .Values.auth.tenantNamespace | quote }}
+  worker_region: {{ .Values.region.workerRegion | quote }}
+  target_region: {{ .Values.region.targetRegion | quote }}
+  region_aware_routing: {{ ternary "true" "false" .Values.region.regionAwareRouting | quote }}
+  cross_region_heartbeat_factor: {{ .Values.region.crossRegionHeartbeatFactor | quote }}
   ha_mode: {{ .Values.ha.mode | quote }}
   ha_wait_for_leader: {{ ternary "true" "false" .Values.ha.waitForLeader | quote }}
   ha_lease_seconds: {{ .Values.ha.leaseSeconds | quote }}
@@ -23,6 +27,11 @@ data:
   ha_raft_snapshot_threshold: {{ .Values.ha.raft.snapshotThreshold | quote }}
   ha_raft_snapshot_keep_entries: {{ .Values.ha.raft.snapshotKeepEntries | quote }}
   control_rbac_default_role: {{ .Values.auth.rbac.defaultRole | quote }}
+  control_jwt_role_claim: {{ .Values.auth.jwt.roleClaim | quote }}
+  control_jwt_tenant_claim: {{ .Values.auth.jwt.tenantClaim | quote }}
+  management_api_jwt_role_claim: {{ .Values.auth.jwt.roleClaim | quote }}
+  management_api_jwt_tenant_claim: {{ .Values.auth.jwt.tenantClaim | quote }}
+  management_api_live_interval_ms: {{ .Values.master.managementLiveIntervalMs | quote }}
   autoscale_target_kind: {{ .Values.autoscale.targetKind | quote }}
   autoscale_target_name: {{ .Values.autoscale.targetName | quote }}
   autoscale_min_replicas: {{ .Values.autoscale.minReplicas | quote }}

@@ -50,6 +50,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "ddos-samurai.fullname" . }}-config
                   key: tenant_namespace
+            - name: SAMURAI_WORKER_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-config
+                  key: worker_region
           args:
             - "--role"
             - "slave"
@@ -59,6 +64,8 @@ spec:
             - "0.0.0.0:5099"
             - "--tenant-namespace"
             - "$(SAMURAI_TENANT_NAMESPACE)"
+            - "--worker-region"
+            - "$(SAMURAI_WORKER_REGION)"
 {{- if .Values.tls.enabled }}
             - "--control-tls-ca"
             - "{{ .Values.tls.mountPath }}/{{ .Values.tls.caFile }}"
@@ -158,6 +165,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "ddos-samurai.fullname" . }}-config
                   key: tenant_namespace
+            - name: SAMURAI_WORKER_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-config
+                  key: worker_region
           args:
             - "--role"
             - "slave"
@@ -167,6 +179,8 @@ spec:
             - "0.0.0.0:5099"
             - "--tenant-namespace"
             - "$(SAMURAI_TENANT_NAMESPACE)"
+            - "--worker-region"
+            - "$(SAMURAI_WORKER_REGION)"
 {{- if .Values.tls.enabled }}
             - "--control-tls-ca"
             - "{{ .Values.tls.mountPath }}/{{ .Values.tls.caFile }}"

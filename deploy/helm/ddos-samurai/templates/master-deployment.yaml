@@ -55,6 +55,16 @@ spec:
                 secretKeyRef:
                   name: {{ include "ddos-samurai.fullname" . }}-auth
                   key: management_viewer_token
+            - name: SAMURAI_CONTROL_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: control_jwt_secret
+            - name: SAMURAI_MANAGEMENT_API_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: management_jwt_secret
             - name: SAMURAI_CONTROL_RBAC_ADMIN_SECRET
               valueFrom:
                 secretKeyRef:
@@ -92,6 +102,24 @@ spec:
             - "--management-api-enable"
             - "--management-api-listen"
             - "0.0.0.0:{{ .Values.master.managementPort }}"
+            - "--management-api-live-interval-ms"
+            - "$(management_api_live_interval_ms)"
+            - "--management-api-jwt-role-claim"
+            - "$(management_api_jwt_role_claim)"
+            - "--management-api-jwt-tenant-claim"
+            - "$(management_api_jwt_tenant_claim)"
+            - "--control-jwt-role-claim"
+            - "$(control_jwt_role_claim)"
+            - "--control-jwt-tenant-claim"
+            - "$(control_jwt_tenant_claim)"
+            - "--worker-region"
+            - "$(worker_region)"
+            - "--target-region"
+            - "$(target_region)"
+            - "--cross-region-heartbeat-factor"
+            - "$(cross_region_heartbeat_factor)"
+            - "--region-aware-routing"
+            - "$(region_aware_routing)"
 {{- if .Values.auth.rbac.enabled }}
             - "--control-rbac-enable"
             - "--control-rbac-default-role"
