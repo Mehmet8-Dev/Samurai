@@ -1,0 +1,33 @@
+groups:
+  - name: samurai_distributed_control_plane
+    interval: 10s
+    rules:
+      - alert: SamuraiDistributedWorkerLoss
+        expr: samurai_distributed_workers_live < 1
+        for: 1m
+        labels:
+          severity: critical
+          team: control-plane
+        annotations:
+          summary: "Distributed worker pool unavailable"
+          description: "Live worker count is below 1 for over 1 minute."
+
+      - alert: SamuraiDistributedKpiFail
+        expr: samurai_distributed_kpi_gate_status{status="fail"} > 0 or samurai_distributed_per_shard_kpi_status{status="fail"} > 0
+        for: 30s
+        labels:
+          severity: critical
+          team: runtime
+        annotations:
+          summary: "Distributed KPI gate failure"
+          description: "Global or per-shard KPI gates are failing."
+
+      - alert: SamuraiDistributedHaFailoverObserved
+        expr: changes(max(samurai_distributed_ha_leader_epoch)[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          team: control-plane
+        annotations:
+          summary: "HA leader failover detected"
+          description: "Leader epoch changed in the last 5 minutes."
