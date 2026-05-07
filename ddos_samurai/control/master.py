@@ -8,6 +8,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .. import utils
+from .autoscale import K8sAutoscaleController
+from .auth import normalize_role_secrets
 from .client import WorkerControlClient
 from .discovery import EndpointDiscovery
 from .ha import (
@@ -183,6 +185,7 @@ def _run_single_job(
     job_args: dict,
     job_id: str,
     leadership_guard=None,
+    autoscaler: K8sAutoscaleController | None = None,
 ) -> tuple[int, dict]:
     total_count = int(job_args.get("count", 0) or 0)
     if total_count <= 0:
@@ -290,6 +293,16 @@ def _run_single_job(
             }
         now_ms = int(time.time() * 1000)
         workers_now = sorted(list(server.servicer.workers.keys()))
+        if autoscaler is not None:
+            try:
+                scale_res = autoscaler.maybe_scale(
+                    pending_shards=len(pending),
+                    inflight_shards=len(inflight_by_sid),
+                    workers_count=len(workers_now),
+                )
+                _ = scale_res
+            except Exception:
+                pass
 
         # detect lost workers and rebalance inflight shard
         for wid in workers_now:
@@ -477,6 +490,32 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     ha_raft_election_min_ms = int(getattr(args, "ha_raft_election_timeout_min_ms", 900) or 900)
     ha_raft_election_max_ms = int(getattr(args, "ha_raft_election_timeout_max_ms", 1500) or 1500)
     ha_raft_hb_ms = int(getattr(args, "ha_raft_heartbeat_interval_ms", 250) or 250)
+    ha_raft_snapshot_threshold = int(getattr(args, "ha_raft_snapshot_threshold", 2048) or 2048)
+    ha_raft_snapshot_keep_entries = int(getattr(args, "ha_raft_snapshot_keep_entries", 512) or 512)
+    autoscale_enable = bool(getattr(args, "control_autoscale_enable", False))
+    autoscale_namespace = str(getattr(args, "control_autoscale_namespace", "default") or "default").strip()
+    autoscale_target_kind = str(getattr(args, "control_autoscale_target_kind", "deployment") or "deployment").strip().lower()
+    autoscale_target_name = str(getattr(args, "control_autoscale_target_name", "") or "").strip()
+    autoscale_min = int(getattr(args, "control_autoscale_min_replicas", 1) or 1)
+    autoscale_max = int(getattr(args, "control_autoscale_max_replicas", 100) or 100)
+    autoscale_step = int(getattr(args, "control_autoscale_step", 1) or 1)
+    autoscale_cooldown_s = float(getattr(args, "control_autoscale_cooldown_s", 15.0) or 15.0)
+    autoscale_shards_per_worker = int(getattr(args, "control_autoscale_shards_per_worker", 4) or 4)
+    autoscale_idle_scale_down_s = float(getattr(args, "control_autoscale_idle_scale_down_s", 60.0) or 60.0)
+    control_rbac_enable = bool(getattr(args, "control_rbac_enable", False))
+    control_rbac_default_role = str(getattr(args, "control_rbac_default_role", "viewer") or "viewer").strip().lower() or "viewer"
+    control_rbac_role_secrets = normalize_role_secrets(
+        admin_secret=str(getattr(args, "control_rbac_admin_secret", "") or ""),
+        operator_secret=str(getattr(args, "control_rbac_operator_secret", "") or ""),
+        viewer_secret=str(getattr(args, "control_rbac_viewer_secret", "") or ""),
+        worker_secret=str(getattr(args, "control_rbac_worker_secret", "") or ""),
+    )
+    mgmt_role_tokens = {
+        "admin": str(getattr(args, "management_api_admin_token", "") or "").strip(),
+        "operator": str(getattr(args, "management_api_operator_token", "") or "").strip(),
+        "viewer": str(getattr(args, "management_api_viewer_token", "") or "").strip(),
+    }
+    mgmt_role_tokens = {k: v for k, v in mgmt_role_tokens.items() if v}
     ha_elector = None
     ha_wait_for_leader = bool(getattr(args, "ha_wait_for_leader", True))
     ha_acquire_timeout_s = float(getattr(args, "ha_acquire_timeout_s", 0.0) or 0.0)
@@ -521,6 +560,8 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                     election_timeout_min_ms=ha_raft_election_min_ms,
                     election_timeout_max_ms=ha_raft_election_max_ms,
                     heartbeat_interval_ms=ha_raft_hb_ms,
+                    snapshot_threshold=ha_raft_snapshot_threshold,
+                    snapshot_keep_entries=ha_raft_snapshot_keep_entries,
                 )
             else:
                 raise ValueError(f"unsupported ha mode: {ha_mode}")
@@ -560,6 +601,18 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     expected_workers = max(1, len(discovered)) if discovered else 1
     if discovered:
         utils.log_info(f"Discovered worker endpoints: {discovered}")
+    autoscaler = K8sAutoscaleController(
+        enabled=autoscale_enable,
+        namespace=autoscale_namespace,
+        target_kind=autoscale_target_kind,
+        target_name=autoscale_target_name,
+        min_replicas=autoscale_min,
+        max_replicas=autoscale_max,
+        step=autoscale_step,
+        cooldown_s=autoscale_cooldown_s,
+        shards_per_worker=autoscale_shards_per_worker,
+        idle_scale_down_s=autoscale_idle_scale_down_s,
+    )
 
     control_max_workers = int(getattr(args, "control_max_workers", 0) or 0)
     if control_max_workers <= 0:
@@ -573,6 +626,9 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         tls_client_ca=str(getattr(args, "control_tls_client_ca", "")),
         require_client_auth=bool(getattr(args, "control_require_client_auth", False)),
         max_workers=control_max_workers,
+        rbac_enabled=control_rbac_enable,
+        rbac_role_secrets=control_rbac_role_secrets,
+        rbac_default_role=control_rbac_default_role,
     )
     mgmt_server = None
     latest_snapshot: dict = {}
@@ -668,6 +724,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                 prefix=str(getattr(args, "distributed_metrics_prefix", "samurai_distributed") or "samurai_distributed"),
             ),
             auth_token=str(getattr(args, "management_api_auth_token", "")),
+            auth_role_tokens=mgmt_role_tokens,
         )
         mgmt_server = ManagementAPIServer(
             listen_addr=str(getattr(args, "management_api_listen", "127.0.0.1:8089")),
@@ -718,7 +775,7 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         )
         server.servicer.set_leader_epoch_min(int(job_run.get("_leader_epoch", 0) or 0))
         guard = (lambda: bool(ha_elector.is_leader())) if ha_elector is not None else None
-        rc, snap = _run_single_job(server, job_run, job_id=job_id, leadership_guard=guard)
+        rc, snap = _run_single_job(server, job_run, job_id=job_id, leadership_guard=guard, autoscaler=autoscaler)
         snap = _apply_distributed_kpi_gate(snap, job_run)
         snap = _apply_per_shard_kpi_gate(snap, job_run)
         latest_snapshot.clear()

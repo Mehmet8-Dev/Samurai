@@ -18,21 +18,53 @@ def _auth_ok(header: str, expected_token: str) -> bool:
     return raw == token
 
 
+def _extract_bearer(header: str) -> str:
+    raw = str(header or "").strip()
+    if not raw:
+        return ""
+    if raw.lower().startswith("bearer "):
+        raw = raw[7:].strip()
+    return raw
+
+
 def create_management_app(
     *,
     state_provider: Callable[[], dict[str, Any]],
     abort_callback: Callable[[], dict[str, Any]],
     metrics_provider: Callable[[], str] | None = None,
     auth_token: str = "",
+    auth_role_tokens: dict[str, str] | None = None,
 ):
     from fastapi import FastAPI, Header, HTTPException
     from fastapi.responses import PlainTextResponse
 
     app = FastAPI(title="DDoSamurai Distributed Management API", version="1.0")
 
-    def _guard(authorization: str | None) -> None:
-        if not _auth_ok(str(authorization or ""), str(auth_token or "")):
+    role_tokens = dict(auth_role_tokens or {})
+    legacy = str(auth_token or "").strip()
+    if legacy and "admin" not in role_tokens:
+        role_tokens["admin"] = legacy
+    if legacy and "operator" not in role_tokens:
+        role_tokens["operator"] = legacy
+    if legacy and "viewer" not in role_tokens:
+        role_tokens["viewer"] = legacy
+
+    def _resolve_role(authorization: str | None) -> str:
+        token = _extract_bearer(str(authorization or ""))
+        if not role_tokens:
+            return "admin"
+        for role in ("admin", "operator", "viewer"):
+            exp = str(role_tokens.get(role, "") or "").strip()
+            if exp and token == exp:
+                return role
+        return ""
+
+    def _guard(authorization: str | None, allowed_roles: set[str]) -> None:
+        role = _resolve_role(authorization)
+        if not role:
             raise HTTPException(status_code=401, detail="unauthorized")
+        if role not in set(allowed_roles or set()):
+            raise HTTPException(status_code=403, detail="forbidden")
 
     @app.get("/healthz")
     def healthz():
@@ -40,7 +72,7 @@ def create_management_app(
 
     @app.get("/v1/cluster/summary")
     def cluster_summary(authorization: str | None = Header(default=None)):
-        _guard(authorization)
+        _guard(authorization, {"admin", "operator", "viewer"})
         st = dict(state_provider() or {})
         return {
             "status": "ok",
@@ -53,30 +85,30 @@ def create_management_app(
 
     @app.get("/v1/cluster/workers")
     def cluster_workers(authorization: str | None = Header(default=None)):
-        _guard(authorization)
+        _guard(authorization, {"admin", "operator", "viewer"})
         st = dict(state_provider() or {})
         return {"workers": list(st.get("workers") or [])}
 
     @app.get("/v1/cluster/shards")
     def cluster_shards(authorization: str | None = Header(default=None)):
-        _guard(authorization)
+        _guard(authorization, {"admin", "operator", "viewer"})
         st = dict(state_provider() or {})
         return {"shards": list(st.get("shards") or [])}
 
     @app.get("/v1/cluster/events")
     def cluster_events(authorization: str | None = Header(default=None)):
-        _guard(authorization)
+        _guard(authorization, {"admin", "operator", "viewer"})
         st = dict(state_provider() or {})
         return {"events": list(st.get("events") or [])}
 
     @app.post("/v1/jobs/abort")
     def abort_job(authorization: str | None = Header(default=None)):
-        _guard(authorization)
+        _guard(authorization, {"admin", "operator"})
         return dict(abort_callback() or {"aborted": False})
 
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics(authorization: str | None = Header(default=None)):
-        _guard(authorization)
+        _guard(authorization, {"admin", "operator", "viewer"})
         if metrics_provider is None:
             return ""
         return str(metrics_provider() or "")

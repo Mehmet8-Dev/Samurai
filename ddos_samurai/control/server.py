@@ -8,32 +8,110 @@ import time
 from concurrent import futures
 
 from . import require_distributed
-from .auth import load_tls_server_credentials, validate_cluster_secret
+from .auth import load_tls_server_credentials, resolve_role_from_secret, validate_cluster_secret
 from .proto import load_generated
 
 
 class _SecretServerInterceptor:
-    def __init__(self, expected_secret: str) -> None:
+    def __init__(
+        self,
+        expected_secret: str,
+        *,
+        rbac_enabled: bool = False,
+        role_secrets: dict[str, str] | None = None,
+        default_role: str = "viewer",
+    ) -> None:
         self._expected = str(expected_secret or "").strip()
+        self._rbac_enabled = bool(rbac_enabled)
+        self._role_secrets = dict(role_secrets or {})
+        self._default_role = str(default_role or "viewer").strip().lower() or "viewer"
+
+    @staticmethod
+    def _rpc_name(method: str) -> str:
+        raw = str(method or "").strip()
+        if not raw:
+            return ""
+        if "/" in raw:
+            return str(raw.rsplit("/", 1)[-1] or "").strip()
+        return raw
+
+    @staticmethod
+    def _allowed_roles_for_rpc(rpc_name: str) -> set[str]:
+        name = str(rpc_name or "").strip()
+        if name in {"AbortJob"}:
+            return {"admin"}
+        if name in {"GetWorkerStatus", "ForceSync"}:
+            return {"admin", "operator", "viewer"}
+        if name in {"RegisterWorker", "Heartbeat", "ReportStats", "ReportStatsStream"}:
+            return {"admin", "operator", "worker"}
+        if name in {"StartShard", "StopShard"}:
+            return {"admin", "operator"}
+        return {"admin"}
+
+    def _authorized(self, md: dict, rpc_name: str) -> tuple[bool, str]:
+        provided = md.get("x-cluster-secret")
+        if not validate_cluster_secret(self._expected, provided):
+            return False, "invalid cluster secret"
+        if not self._rbac_enabled:
+            return True, ""
+        role = resolve_role_from_secret(provided, self._role_secrets)
+        if not role:
+            # Backward-compatible fallback:
+            # - If RBAC map is empty, keep single-secret behavior via default role.
+            # - If cluster secret is valid but role map has no explicit match, still allow
+            #   a configured default role.
+            if not self._role_secrets:
+                role = self._default_role
+            elif self._expected and validate_cluster_secret(self._expected, provided):
+                role = self._default_role
+            else:
+                return False, "unknown role secret"
+        allowed = self._allowed_roles_for_rpc(rpc_name)
+        if role not in allowed:
+            return False, f"forbidden for role={role} rpc={rpc_name}"
+        return True, ""
 
     def intercept_service(self, continuation, handler_call_details):
         handler = continuation(handler_call_details)
-        if not self._expected or handler is None:
+        if handler is None:
+            return None
+        if not self._expected and not self._rbac_enabled:
             return handler
 
-        def _unauth(req, ctx):
+        rpc_name = self._rpc_name(getattr(handler_call_details, "method", ""))
+
+        def _check(ctx):
             md = dict(ctx.invocation_metadata() or [])
-            if not validate_cluster_secret(self._expected, md.get("x-cluster-secret")):
-                ctx.abort(getattr(__import__("grpc"), "StatusCode").UNAUTHENTICATED, "invalid cluster secret")
+            ok, err = self._authorized(md, rpc_name)
+            if not ok:
+                status = getattr(__import__("grpc"), "StatusCode").PERMISSION_DENIED
+                if "invalid cluster secret" in str(err):
+                    status = getattr(__import__("grpc"), "StatusCode").UNAUTHENTICATED
+                ctx.abort(status, str(err))
+
+        def _unary_unary(req, ctx):
+            _check(ctx)
             return handler.unary_unary(req, ctx)
+
+        def _stream_unary(req_iter, ctx):
+            _check(ctx)
+            return handler.stream_unary(req_iter, ctx)
 
         import grpc
 
-        return grpc.unary_unary_rpc_method_handler(
-            _unauth,
-            request_deserializer=handler.request_deserializer,
-            response_serializer=handler.response_serializer,
-        )
+        if handler.unary_unary:
+            return grpc.unary_unary_rpc_method_handler(
+                _unary_unary,
+                request_deserializer=handler.request_deserializer,
+                response_serializer=handler.response_serializer,
+            )
+        if handler.stream_unary:
+            return grpc.stream_unary_rpc_method_handler(
+                _stream_unary,
+                request_deserializer=handler.request_deserializer,
+                response_serializer=handler.response_serializer,
+            )
+        return handler
 
 
 class _SamuraiServicer:
@@ -190,6 +268,9 @@ class MasterControlServer:
         tls_client_ca: str = "",
         require_client_auth: bool = False,
         max_workers: int = 16,
+        rbac_enabled: bool = False,
+        rbac_role_secrets: dict[str, str] | None = None,
+        rbac_default_role: str = "viewer",
     ) -> None:
         require_distributed()
         self.listen_addr = str(listen_addr)
@@ -200,6 +281,9 @@ class MasterControlServer:
         self.tls_client_ca = str(tls_client_ca or "")
         self.require_client_auth = bool(require_client_auth)
         self.max_workers = max(4, int(max_workers or 16))
+        self.rbac_enabled = bool(rbac_enabled)
+        self.rbac_role_secrets = dict(rbac_role_secrets or {})
+        self.rbac_default_role = str(rbac_default_role or "viewer").strip().lower() or "viewer"
         self.running = False
         self._server = None
         self._servicer = _SamuraiServicer()
@@ -208,7 +292,12 @@ class MasterControlServer:
         import grpc
 
         _, pb2_grpc = load_generated()
-        interceptor = _SecretServerInterceptor(self.cluster_secret)
+        interceptor = _SecretServerInterceptor(
+            self.cluster_secret,
+            rbac_enabled=self.rbac_enabled,
+            role_secrets=self.rbac_role_secrets,
+            default_role=self.rbac_default_role,
+        )
         self._server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=self.max_workers),
             interceptors=[interceptor],
