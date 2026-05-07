@@ -4,6 +4,7 @@ import argparse
 import json
 import multiprocessing
 import os
+import re
 
 from .. import utils
 from ..profile_names import PROFILE_NONE
@@ -25,6 +26,9 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
         )
 
     if role == "master":
+        tenant_namespace = str(getattr(args, "tenant_namespace", "") or "").strip()
+        if tenant_namespace and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", tenant_namespace) is None:
+            parser.error("Hata: --tenant-namespace yalnizca [A-Za-z0-9._-] icerebilir ve 1..128 uzunlukta olmalidir.")
         listen = str(getattr(args, "control_listen", "") or "").strip()
         if not listen:
             parser.error("Hata: --role master için --control-listen zorunludur.")
@@ -178,6 +182,9 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
     elif bool(getattr(args, "ha_enable", False)):
         parser.error("Hata: --ha-enable yalnızca --role master ile kullanılabilir.")
     elif role == "slave":
+        tenant_namespace = str(getattr(args, "tenant_namespace", "") or "").strip()
+        if tenant_namespace and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", tenant_namespace) is None:
+            parser.error("Hata: --tenant-namespace yalnizca [A-Za-z0-9._-] icerebilir ve 1..128 uzunlukta olmalidir.")
         endpoints = str(getattr(args, "control_endpoints", "") or "").strip()
         if not endpoints:
             parser.error("Hata: --role slave için --control-endpoints zorunludur.")

@@ -118,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     distributed_group.add_argument(
         "--cluster-secret",
         type=str,
-        default="",
+        default=str(os.environ.get("SAMURAI_CLUSTER_SECRET", "") or ""),
         help="Cluster authentication token (tüm node'larda aynı olmalı).",
     )
     distributed_group.add_argument(
@@ -289,25 +289,25 @@ def build_parser() -> argparse.ArgumentParser:
     distributed_group.add_argument(
         "--management-api-auth-token",
         type=str,
-        default="",
+        default=str(os.environ.get("SAMURAI_MANAGEMENT_API_AUTH_TOKEN", "") or ""),
         help="Management API Bearer token (bos ise auth kapali).",
     )
     distributed_group.add_argument(
         "--management-api-admin-token",
         type=str,
-        default="",
+        default=str(os.environ.get("SAMURAI_MANAGEMENT_API_ADMIN_TOKEN", "") or ""),
         help="Management API admin rol token'i (opsiyonel).",
     )
     distributed_group.add_argument(
         "--management-api-operator-token",
         type=str,
-        default="",
+        default=str(os.environ.get("SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN", "") or ""),
         help="Management API operator rol token'i (opsiyonel).",
     )
     distributed_group.add_argument(
         "--management-api-viewer-token",
         type=str,
-        default="",
+        default=str(os.environ.get("SAMURAI_MANAGEMENT_API_VIEWER_TOKEN", "") or ""),
         help="Management API viewer rol token'i (opsiyonel).",
     )
     distributed_group.add_argument(
@@ -330,25 +330,25 @@ def build_parser() -> argparse.ArgumentParser:
     distributed_group.add_argument(
         "--control-rbac-admin-secret",
         type=str,
-        default="",
+        default=str(os.environ.get("SAMURAI_CONTROL_RBAC_ADMIN_SECRET", "") or ""),
         help="RBAC admin rol secret'i.",
     )
     distributed_group.add_argument(
         "--control-rbac-operator-secret",
         type=str,
-        default="",
+        default=str(os.environ.get("SAMURAI_CONTROL_RBAC_OPERATOR_SECRET", "") or ""),
         help="RBAC operator rol secret'i.",
     )
     distributed_group.add_argument(
         "--control-rbac-viewer-secret",
         type=str,
-        default="",
+        default=str(os.environ.get("SAMURAI_CONTROL_RBAC_VIEWER_SECRET", "") or ""),
         help="RBAC viewer rol secret'i.",
     )
     distributed_group.add_argument(
         "--control-rbac-worker-secret",
         type=str,
-        default="",
+        default=str(os.environ.get("SAMURAI_CONTROL_RBAC_WORKER_SECRET", "") or ""),
         help="RBAC worker rol secret'i.",
     )
     distributed_group.add_argument(
@@ -537,6 +537,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5099,
         help="Kubernetes discovery endpoint portu (varsayılan: 5099).",
+    )
+    distributed_group.add_argument(
+        "--tenant-namespace",
+        type=str,
+        default=str(os.environ.get("SAMURAI_TENANT_NAMESPACE", "") or ""),
+        help="Control-plane tenant namespace izolasyonu (opsiyonel).",
     )
     distributed_group.add_argument(
         "--control-autoscale-enable",
