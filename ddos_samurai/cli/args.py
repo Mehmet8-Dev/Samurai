@@ -293,10 +293,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="Management API Bearer token (bos ise auth kapali).",
     )
     distributed_group.add_argument(
+        "--management-api-admin-token",
+        type=str,
+        default="",
+        help="Management API admin rol token'i (opsiyonel).",
+    )
+    distributed_group.add_argument(
+        "--management-api-operator-token",
+        type=str,
+        default="",
+        help="Management API operator rol token'i (opsiyonel).",
+    )
+    distributed_group.add_argument(
+        "--management-api-viewer-token",
+        type=str,
+        default="",
+        help="Management API viewer rol token'i (opsiyonel).",
+    )
+    distributed_group.add_argument(
         "--management-events-max",
         type=int,
         default=200,
         help="Management API event timeline maksimum kayit sayisi.",
+    )
+    distributed_group.add_argument(
+        "--control-rbac-enable",
+        action="store_true",
+        help="gRPC control plane icin role-based authorization etkinlestir.",
+    )
+    distributed_group.add_argument(
+        "--control-rbac-default-role",
+        choices=["admin", "operator", "viewer", "worker"],
+        default="viewer",
+        help="RBAC role secret eslesmezse varsayilan rol.",
+    )
+    distributed_group.add_argument(
+        "--control-rbac-admin-secret",
+        type=str,
+        default="",
+        help="RBAC admin rol secret'i.",
+    )
+    distributed_group.add_argument(
+        "--control-rbac-operator-secret",
+        type=str,
+        default="",
+        help="RBAC operator rol secret'i.",
+    )
+    distributed_group.add_argument(
+        "--control-rbac-viewer-secret",
+        type=str,
+        default="",
+        help="RBAC viewer rol secret'i.",
+    )
+    distributed_group.add_argument(
+        "--control-rbac-worker-secret",
+        type=str,
+        default="",
+        help="RBAC worker rol secret'i.",
     )
     distributed_group.add_argument(
         "--ha-enable",
@@ -420,6 +473,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="ha-mode raft leader heartbeat aralığı (ms).",
     )
     distributed_group.add_argument(
+        "--ha-raft-snapshot-threshold",
+        type=int,
+        default=2048,
+        help="ha-mode raft compaction tetik eşiği (committed entry sayısı).",
+    )
+    distributed_group.add_argument(
+        "--ha-raft-snapshot-keep-entries",
+        type=int,
+        default=512,
+        help="ha-mode raft compaction sonrası bellekte tutulacak son entry sayısı.",
+    )
+    distributed_group.add_argument(
         "--job-timeout-s",
         type=int,
         default=0,
@@ -472,6 +537,65 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5099,
         help="Kubernetes discovery endpoint portu (varsayılan: 5099).",
+    )
+    distributed_group.add_argument(
+        "--control-autoscale-enable",
+        action="store_true",
+        help="Master pending/inflight shard durumuna gore K8s replica autoscale yap.",
+    )
+    distributed_group.add_argument(
+        "--control-autoscale-namespace",
+        type=str,
+        default="default",
+        help="Autoscale hedef namespace.",
+    )
+    distributed_group.add_argument(
+        "--control-autoscale-target-kind",
+        choices=["deployment", "statefulset"],
+        default="deployment",
+        help="Autoscale hedef resource tipi.",
+    )
+    distributed_group.add_argument(
+        "--control-autoscale-target-name",
+        type=str,
+        default="",
+        help="Autoscale hedef Deployment/StatefulSet adi.",
+    )
+    distributed_group.add_argument(
+        "--control-autoscale-min-replicas",
+        type=int,
+        default=1,
+        help="Autoscale min replica.",
+    )
+    distributed_group.add_argument(
+        "--control-autoscale-max-replicas",
+        type=int,
+        default=100,
+        help="Autoscale max replica.",
+    )
+    distributed_group.add_argument(
+        "--control-autoscale-step",
+        type=int,
+        default=1,
+        help="Scale up/down adim boyutu.",
+    )
+    distributed_group.add_argument(
+        "--control-autoscale-cooldown-s",
+        type=float,
+        default=15.0,
+        help="Scale islemleri arasinda cooldown (s).",
+    )
+    distributed_group.add_argument(
+        "--control-autoscale-shards-per-worker",
+        type=int,
+        default=4,
+        help="Autoscale kapasite modeli: worker basina shard hedefi.",
+    )
+    distributed_group.add_argument(
+        "--control-autoscale-idle-scale-down-s",
+        type=float,
+        default=60.0,
+        help="Idle sure sonunda min replica'ya inme esigi (s).",
     )
     parser.add_argument("--confirm", action="store_true", help="Etik uyarıyı atlamak için")
     parser.add_argument("--dry-run", action="store_true", help="Ayarları doğrular, örnek bir paket oluşturur ve gönderim yapmadan çıkar.")

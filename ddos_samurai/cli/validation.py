@@ -44,6 +44,45 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
             events_max = int(getattr(args, "management_events_max", 200) or 0)
             if events_max < 10:
                 parser.error("Hata: --management-events-max en az 10 olmalıdır.")
+            mat = str(getattr(args, "management_api_auth_token", "") or "").strip()
+            madm = str(getattr(args, "management_api_admin_token", "") or "").strip()
+            mop = str(getattr(args, "management_api_operator_token", "") or "").strip()
+            mview = str(getattr(args, "management_api_viewer_token", "") or "").strip()
+            if not any([mat, madm, mop, mview]):
+                parser.error(
+                    "Hata: Management API etkinse en az bir token verin "
+                    "(--management-api-auth-token veya rol tokenlari)."
+                )
+        if bool(getattr(args, "control_rbac_enable", False)):
+            r_admin = str(getattr(args, "control_rbac_admin_secret", "") or "").strip()
+            r_op = str(getattr(args, "control_rbac_operator_secret", "") or "").strip()
+            r_view = str(getattr(args, "control_rbac_viewer_secret", "") or "").strip()
+            r_worker = str(getattr(args, "control_rbac_worker_secret", "") or "").strip()
+            csec = str(getattr(args, "cluster_secret", "") or "").strip()
+            if not any([r_admin, r_op, r_view, r_worker, csec]):
+                parser.error(
+                    "Hata: --control-rbac-enable icin en az bir rol secret veya --cluster-secret gerekli."
+                )
+        if bool(getattr(args, "control_autoscale_enable", False)):
+            tname = str(getattr(args, "control_autoscale_target_name", "") or "").strip()
+            if not tname:
+                parser.error("Hata: --control-autoscale-enable icin --control-autoscale-target-name zorunlu.")
+            min_r = int(getattr(args, "control_autoscale_min_replicas", 1) or 1)
+            max_r = int(getattr(args, "control_autoscale_max_replicas", 100) or 100)
+            step = int(getattr(args, "control_autoscale_step", 1) or 1)
+            cooldown = float(getattr(args, "control_autoscale_cooldown_s", 15.0) or 15.0)
+            spw = int(getattr(args, "control_autoscale_shards_per_worker", 4) or 4)
+            idle_down = float(getattr(args, "control_autoscale_idle_scale_down_s", 60.0) or 60.0)
+            if min_r < 1 or max_r < 1 or max_r < min_r:
+                parser.error("Hata: autoscale replica araligi gecersiz (min>=1, max>=min).")
+            if step < 1:
+                parser.error("Hata: --control-autoscale-step >= 1 olmali.")
+            if cooldown < 1.0:
+                parser.error("Hata: --control-autoscale-cooldown-s >= 1.0 olmali.")
+            if spw < 1:
+                parser.error("Hata: --control-autoscale-shards-per-worker >= 1 olmali.")
+            if idle_down < 5.0:
+                parser.error("Hata: --control-autoscale-idle-scale-down-s >= 5.0 olmali.")
         if bool(getattr(args, "ha_enable", False)):
             node_id = str(getattr(args, "ha_node_id", "") or "").strip()
             if "," in node_id:
@@ -105,6 +144,8 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
                 tmin = int(getattr(args, "ha_raft_election_timeout_min_ms", 900) or 900)
                 tmax = int(getattr(args, "ha_raft_election_timeout_max_ms", 1500) or 1500)
                 hb = int(getattr(args, "ha_raft_heartbeat_interval_ms", 250) or 250)
+                snap_thr = int(getattr(args, "ha_raft_snapshot_threshold", 2048) or 2048)
+                snap_keep = int(getattr(args, "ha_raft_snapshot_keep_entries", 512) or 512)
                 if ":" not in raft_listen:
                     parser.error("Hata: --ha-raft-listen formatı host:port olmalıdır.")
                 try:
@@ -119,6 +160,12 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
                     parser.error("Hata: --ha-raft-election-timeout-max-ms, min timeout'tan büyük olmalıdır.")
                 if hb < 50:
                     parser.error("Hata: --ha-raft-heartbeat-interval-ms >= 50 olmalıdır.")
+                if snap_thr < 64:
+                    parser.error("Hata: --ha-raft-snapshot-threshold >= 64 olmalıdır.")
+                if snap_keep < 16:
+                    parser.error("Hata: --ha-raft-snapshot-keep-entries >= 16 olmalıdır.")
+                if snap_keep >= snap_thr:
+                    parser.error("Hata: --ha-raft-snapshot-keep-entries, threshold'tan küçük olmalıdır.")
                 for item in raft_peers.split(","):
                     x = str(item or "").strip()
                     if not x:
