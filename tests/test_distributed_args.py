@@ -112,3 +112,27 @@ def test_distributed_tenant_namespace_validation(monkeypatch):
         "tenant_a-1",
     ])
     _validate_distributed_args(parser, good)
+
+
+def test_distributed_region_validation(monkeypatch):
+    monkeypatch.setitem(sys.modules, "grpc", types.SimpleNamespace())
+    parser = build_parser()
+    bad = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--worker-region",
+        "bad/region",
+    ])
+    with pytest.raises(SystemExit):
+        _validate_distributed_args(parser, bad)
+
+    bad_factor = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--cross-region-heartbeat-factor",
+        "0.9",
+    ])
+    with pytest.raises(SystemExit):
+        _validate_distributed_args(parser, bad_factor)

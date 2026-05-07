@@ -29,3 +29,19 @@ def test_capability_split_prefers_higher_weight_worker():
     by_worker = {s["worker_id"]: int(s["packet_count"]) for s in shards}
     assert by_worker["w2"] > by_worker["w1"]
     assert by_worker["w1"] + by_worker["w2"] == 12
+
+
+def test_region_split_prefers_target_region_worker():
+    shards = split_job_to_shards(
+        30,
+        ["w-eu", "w-us"],
+        strategy="region",
+        target_region="eu-central",
+        worker_capabilities={
+            "w-eu": {"region": "eu-central", "capacity_score": "1"},
+            "w-us": {"region": "us-east", "capacity_score": "1"},
+        },
+    )
+    by_worker = {s["worker_id"]: int(s["packet_count"]) for s in shards}
+    assert by_worker["w-eu"] > by_worker["w-us"]
+    assert by_worker["w-eu"] + by_worker["w-us"] == 30

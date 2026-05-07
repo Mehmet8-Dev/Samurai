@@ -17,6 +17,7 @@ def test_distributed_snapshot_to_prometheus_includes_core_fields_and_gate_status
         "kpi_gate_status": "pass",
         "per_shard_kpi_status": "pass",
         "per_shard_kpi_failed_count": 0,
+        "region_rollup": [{"region": "eu-central", "sent": 10, "errors": 1, "workers": 2, "shards": 4}],
     }
     text = _distributed_snapshot_to_prometheus(snap)
     assert "samurai_distributed_workers 3.0" in text
@@ -24,6 +25,8 @@ def test_distributed_snapshot_to_prometheus_includes_core_fields_and_gate_status
     assert 'samurai_distributed_kpi_gate_status{status="pass"} 1' in text
     assert 'samurai_distributed_per_shard_kpi_status{status="pass"} 1' in text
     assert "samurai_distributed_per_shard_kpi_failed_count 0.0" in text
+    assert 'samurai_distributed_region_sent{region="eu-central"} 10.0' in text
+    assert 'samurai_distributed_region_errors{region="eu-central"} 1.0' in text
 
 
 def test_apply_distributed_kpi_gate_off_profile_passes():
@@ -73,15 +76,17 @@ def test_apply_distributed_kpi_gate_dedicated_profile_emits_fields():
 def test_distributed_state_to_prometheus_includes_worker_shard_and_ha_metrics():
     state = {
         "latest_snapshot": {"workers": 1, "shards_reported": 2, "sent": 11, "errors": 1},
-        "workers": [{"worker_id": "w-1", "state": "running", "last_heartbeat_ms": 1234}],
-        "shards": [{"shard_id": "s-1", "stats_size_bytes": 96}],
+        "workers": [{"worker_id": "w-1", "state": "running", "region": "eu-central", "last_heartbeat_ms": 1234}],
+        "shards": [{"shard_id": "s-1", "region": "eu-central", "stats_size_bytes": 96}],
         "ha": {"mode": "static", "is_leader": 1},
     }
     text = _distributed_state_to_prometheus(state)
     assert "samurai_distributed_workers 1.0" in text
     assert "samurai_distributed_workers_live 1.0" in text
     assert 'samurai_distributed_worker_state{worker_id="w-1",state="running"} 1' in text
+    assert 'samurai_distributed_worker_region{worker_id="w-1",region="eu-central"} 1' in text
     assert 'samurai_distributed_shard_stats_size_bytes{shard_id="s-1"} 96.0' in text
+    assert 'samurai_distributed_shard_region{shard_id="s-1",region="eu-central"} 1' in text
     assert 'samurai_distributed_ha_is_leader{mode="static"} 1.0' in text
     assert 'samurai_distributed_ha_leader_epoch{mode="static"} 0.0' in text
 
