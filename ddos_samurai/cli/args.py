@@ -311,6 +311,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Management API viewer rol token'i (opsiyonel).",
     )
     distributed_group.add_argument(
+        "--management-api-jwt-secret",
+        type=str,
+        default=str(os.environ.get("SAMURAI_MANAGEMENT_API_JWT_SECRET", "") or ""),
+        help="Management API JWT HS256 secret (opsiyonel).",
+    )
+    distributed_group.add_argument(
+        "--management-api-jwt-role-claim",
+        type=str,
+        default="role",
+        help="Management API JWT role claim adı.",
+    )
+    distributed_group.add_argument(
+        "--management-api-jwt-tenant-claim",
+        type=str,
+        default="tenant_namespace",
+        help="Management API JWT tenant claim adı.",
+    )
+    distributed_group.add_argument(
+        "--management-api-live-interval-ms",
+        type=int,
+        default=1000,
+        help="Management API live SSE/WS publish interval (ms).",
+    )
+    distributed_group.add_argument(
         "--management-events-max",
         type=int,
         default=200,
@@ -350,6 +374,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=str(os.environ.get("SAMURAI_CONTROL_RBAC_WORKER_SECRET", "") or ""),
         help="RBAC worker rol secret'i.",
+    )
+    distributed_group.add_argument(
+        "--control-jwt-secret",
+        type=str,
+        default=str(os.environ.get("SAMURAI_CONTROL_JWT_SECRET", "") or ""),
+        help="gRPC control-plane JWT HS256 secret (opsiyonel).",
+    )
+    distributed_group.add_argument(
+        "--control-jwt-role-claim",
+        type=str,
+        default="role",
+        help="gRPC control-plane JWT role claim adı.",
+    )
+    distributed_group.add_argument(
+        "--control-jwt-tenant-claim",
+        type=str,
+        default="tenant_namespace",
+        help="gRPC control-plane JWT tenant claim adı.",
     )
     distributed_group.add_argument(
         "--ha-enable",
@@ -505,9 +547,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     distributed_group.add_argument(
         "--shard-strategy",
-        choices=["equal", "capability"],
+        choices=["equal", "capability", "region"],
         default="equal",
-        help="Shard dağıtım stratejisi: equal=eşit bölme, capability=worker kapasitesine göre.",
+        help="Shard dağıtım stratejisi: equal=eşit, capability=kapasite, region=bölge öncelikli.",
+    )
+    distributed_group.add_argument(
+        "--region-aware-routing",
+        type=_arg_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Master dispatch worker seçimini target/worker region yakınlığına göre yap.",
+    )
+    distributed_group.add_argument(
+        "--worker-region",
+        type=str,
+        default=str(os.environ.get("SAMURAI_WORKER_REGION", "") or ""),
+        help="Node/worker bölge etiketi (örn: eu-central, us-east).",
+    )
+    distributed_group.add_argument(
+        "--target-region",
+        type=str,
+        default=str(os.environ.get("SAMURAI_TARGET_REGION", "") or ""),
+        help="İş hedef bölgesi (region-aware-routing ile birlikte kullanılır).",
+    )
+    distributed_group.add_argument(
+        "--cross-region-heartbeat-factor",
+        type=float,
+        default=1.6,
+        help="Cross-region worker heartbeat timeout çarpanı (>=1.0).",
     )
     distributed_group.add_argument(
         "--on-worker-loss",

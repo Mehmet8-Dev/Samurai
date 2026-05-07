@@ -52,11 +52,15 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
             madm = str(getattr(args, "management_api_admin_token", "") or "").strip()
             mop = str(getattr(args, "management_api_operator_token", "") or "").strip()
             mview = str(getattr(args, "management_api_viewer_token", "") or "").strip()
-            if not any([mat, madm, mop, mview]):
+            mjwt = str(getattr(args, "management_api_jwt_secret", "") or "").strip()
+            if not any([mat, madm, mop, mview, mjwt]):
                 parser.error(
                     "Hata: Management API etkinse en az bir token verin "
-                    "(--management-api-auth-token veya rol tokenlari)."
+                    "(--management-api-auth-token, rol tokenlari veya --management-api-jwt-secret)."
                 )
+            mlive = int(getattr(args, "management_api_live_interval_ms", 1000) or 1000)
+            if mlive < 100:
+                parser.error("Hata: --management-api-live-interval-ms >= 100 olmalıdır.")
         if bool(getattr(args, "control_rbac_enable", False)):
             r_admin = str(getattr(args, "control_rbac_admin_secret", "") or "").strip()
             r_op = str(getattr(args, "control_rbac_operator_secret", "") or "").strip()
@@ -67,6 +71,14 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
                 parser.error(
                     "Hata: --control-rbac-enable icin en az bir rol secret veya --cluster-secret gerekli."
                 )
+        cjclaim = str(getattr(args, "control_jwt_role_claim", "role") or "role").strip()
+        ctclaim = str(getattr(args, "control_jwt_tenant_claim", "tenant_namespace") or "tenant_namespace").strip()
+        mjclaim = str(getattr(args, "management_api_jwt_role_claim", "role") or "role").strip()
+        mtclaim = str(getattr(args, "management_api_jwt_tenant_claim", "tenant_namespace") or "tenant_namespace").strip()
+        if not cjclaim or not ctclaim or not mjclaim or not mtclaim:
+            parser.error("Hata: JWT claim adları boş olamaz.")
+        if any(" " in x for x in (cjclaim, ctclaim, mjclaim, mtclaim)):
+            parser.error("Hata: JWT claim adları boşluk içeremez.")
         if bool(getattr(args, "control_autoscale_enable", False)):
             tname = str(getattr(args, "control_autoscale_target_name", "") or "").strip()
             if not tname:
@@ -233,6 +245,7 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
 
     hb_interval = int(getattr(args, "heartbeat_interval_ms", 2000) or 2000)
     hb_timeout = int(getattr(args, "heartbeat_timeout_ms", 6000) or 6000)
+    cross_region_factor = float(getattr(args, "cross_region_heartbeat_factor", 1.6) or 1.6)
     k8s_port = int(getattr(args, "control_k8s_port", 5099) or 5099)
     if hb_interval < 500:
         parser.error("Hata: --heartbeat-interval-ms >= 500 olmalıdır.")
@@ -240,6 +253,14 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
         parser.error("Hata: --heartbeat-timeout-ms > --heartbeat-interval-ms olmalıdır.")
     if k8s_port <= 0 or k8s_port > 65535:
         parser.error("Hata: --control-k8s-port 1..65535 aralığında olmalıdır.")
+    if cross_region_factor < 1.0:
+        parser.error("Hata: --cross-region-heartbeat-factor >= 1.0 olmalıdır.")
+    worker_region = str(getattr(args, "worker_region", "") or "").strip()
+    target_region = str(getattr(args, "target_region", "") or "").strip()
+    if worker_region and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", worker_region) is None:
+        parser.error("Hata: --worker-region yalnizca [A-Za-z0-9._-] icerebilir (1..64).")
+    if target_region and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", target_region) is None:
+        parser.error("Hata: --target-region yalnizca [A-Za-z0-9._-] icerebilir (1..64).")
     shard_kpi_max_error_rate_pct = float(getattr(args, "shard_kpi_max_error_rate_pct", -1.0) or -1.0)
     if shard_kpi_max_error_rate_pct != -1.0 and (
         shard_kpi_max_error_rate_pct < 0.0 or shard_kpi_max_error_rate_pct > 100.0
