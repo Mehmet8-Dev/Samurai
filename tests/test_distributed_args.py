@@ -89,3 +89,26 @@ def test_distributed_autoscale_requires_target_name(monkeypatch):
     ])
     with pytest.raises(SystemExit):
         _validate_distributed_args(parser, args)
+
+
+def test_distributed_tenant_namespace_validation(monkeypatch):
+    monkeypatch.setitem(sys.modules, "grpc", types.SimpleNamespace())
+    parser = build_parser()
+    bad = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--tenant-namespace",
+        "bad/tenant",
+    ])
+    with pytest.raises(SystemExit):
+        _validate_distributed_args(parser, bad)
+
+    good = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--tenant-namespace",
+        "tenant_a-1",
+    ])
+    _validate_distributed_args(parser, good)

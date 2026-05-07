@@ -111,3 +111,52 @@ def test_management_api_role_based_authorization():
     assert cli.post("/v1/jobs/abort", headers=operator_hdr).status_code == 200
     assert cli.post("/v1/jobs/abort", headers=admin_hdr).status_code == 200
     assert int(called["abort"]) == 2
+
+
+def test_management_api_tenant_filter_and_guard():
+    fastapi_testclient = __import__("fastapi.testclient", fromlist=["TestClient"])
+    TestClient = fastapi_testclient.TestClient
+
+    state = {
+        "workers": [
+            {"worker_id": "w-a", "tenant_namespace": "tenant-a", "state": "running"},
+            {"worker_id": "w-b", "tenant_namespace": "tenant-b", "state": "idle"},
+        ],
+        "workers_count": 2,
+        "shards": [
+            {"shard_id": "s-a", "tenant_namespace": "tenant-a", "stats_size_bytes": 10},
+            {"shard_id": "s-b", "tenant_namespace": "tenant-b", "stats_size_bytes": 20},
+        ],
+        "shards_reported_count": 2,
+        "latest_snapshot": {"sent": 123},
+        "current_job": {"state": "running", "job_id": "job-a", "tenant_namespace": "tenant-a"},
+        "ha": {"mode": "off", "is_leader": 1},
+        "events": [
+            {"kind": "job_started", "tenant_namespace": "tenant-a"},
+            {"kind": "job_started", "tenant_namespace": "tenant-b"},
+        ],
+    }
+
+    app = create_management_app(
+        state_provider=lambda: dict(state),
+        abort_callback=lambda: {"aborted": True},
+        auth_role_tokens={"viewer": "view"},
+        tenant_namespace="tenant-a",
+    )
+    cli = TestClient(app)
+    hdr = {"Authorization": "Bearer view"}
+
+    r1 = cli.get("/v1/cluster/workers", headers=hdr)
+    assert r1.status_code == 200
+    workers = list((r1.json() or {}).get("workers") or [])
+    assert len(workers) == 1
+    assert str(workers[0].get("tenant_namespace", "")) == "tenant-a"
+
+    r2 = cli.get("/v1/cluster/events", headers=hdr)
+    assert r2.status_code == 200
+    events = list((r2.json() or {}).get("events") or [])
+    assert len(events) == 1
+    assert str(events[0].get("tenant_namespace", "")) == "tenant-a"
+
+    r3 = cli.get("/v1/cluster/workers?tenant_namespace=tenant-b", headers=hdr)
+    assert r3.status_code == 403
