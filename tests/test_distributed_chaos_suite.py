@@ -1,6 +1,8 @@
 import json
 import time
 
+import pytest
+
 from ddos_samurai.control.client import SlaveControlClient
 from ddos_samurai.control.master import _run_single_job
 
@@ -95,6 +97,9 @@ def test_chaos_worker_loss_triggers_redispatch(monkeypatch):
 
 
 def test_chaos_stream_sender_failure_sets_failed_event(monkeypatch):
+    pytest.importorskip("grpc")
+    pytest.importorskip("google.protobuf")
+
     class _FakeCall:
         def __call__(self, req_iter, timeout=None, metadata=None):
             _ = req_iter, timeout, metadata

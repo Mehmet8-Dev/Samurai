@@ -747,6 +747,7 @@ def build_setup_kwargs() -> Dict[str, object]:
         "python_requires": ">=3.8",
         "install_requires": [
             "numpy>=1.19.0",
+            "PyYAML>=6.0",
             "fastapi>=0.110.0",
             "uvicorn>=0.29.0",
             "sqlalchemy>=2.0.0",

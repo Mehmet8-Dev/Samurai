@@ -1,7 +1,12 @@
 import time
 from pathlib import Path
 
+import pytest
+
 from ddos_samurai.control.server import MasterControlServer
+
+
+pytest.importorskip("grpc")
 
 
 def test_tls_watcher_detects_file_change_and_triggers_restart(tmp_path, monkeypatch):

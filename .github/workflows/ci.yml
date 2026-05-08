@@ -149,6 +149,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -e .
           python -m pip install pytest PyYAML requests aiohttp websockets "httpx[http2]" rich colorama psutil
+          python -m pip install grpcio grpcio-tools grpcio-health-checking "protobuf>=4.25,<5.0"
 
       - name: Build C extensions (smoke)
         run: python setup.py build_ext --inplace

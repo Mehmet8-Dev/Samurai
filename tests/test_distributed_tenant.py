@@ -1,5 +1,11 @@
+import pytest
+
 from ddos_samurai.control.proto import load_generated
 from ddos_samurai.control.server import _SamuraiServicer
+
+
+pytest.importorskip("grpc")
+pytest.importorskip("google.protobuf")
 
 
 class _Ctx:

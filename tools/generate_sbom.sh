@@ -15,11 +15,15 @@ fi
 python - <<'PY' > "$OUT_DIR/sbom.fallback.json"
 from __future__ import annotations
 import json
-import pkg_resources
+from importlib import metadata
 
 rows = []
-for d in sorted(pkg_resources.working_set, key=lambda x: x.project_name.lower()):
-    rows.append({"name": d.project_name, "version": d.version})
+for d in sorted(metadata.distributions(), key=lambda x: str(x.metadata.get("Name", "")).lower()):
+    name = str(d.metadata.get("Name", "") or "").strip()
+    ver = str(getattr(d, "version", "") or "").strip()
+    if not name:
+        continue
+    rows.append({"name": name, "version": ver})
 print(json.dumps({"schema": "samurai.sbom.fallback.v1", "packages": rows}, indent=2, sort_keys=True))
 PY
 

@@ -1,7 +1,13 @@
 import json
 
+import pytest
+
 from ddos_samurai.control.server import _SamuraiServicer
 from ddos_samurai.control.proto import load_generated
+
+
+pytest.importorskip("grpc")
+pytest.importorskip("google.protobuf")
 
 
 def test_report_stats_rejects_stale_leader_epoch():

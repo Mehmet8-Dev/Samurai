@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .. import utils
-from .app import build_parser, main
+from .args import build_parser
 from .helpers import _is_cuda_raw_vector
 from .profile_resolver import _resolve_profile_args
 from .reporting import build_loss_summary as _build_loss_summary
@@ -16,6 +16,14 @@ from .validation import (
     _validate_pacing_args,
     _validate_sender_route_args,
 )
+
+
+def main(*args, **kwargs):
+    # Keep package import lightweight for parser-only consumers and tests.
+    from .app import main as _main
+
+    return _main(*args, **kwargs)
+
 
 __all__ = [
     "main",
