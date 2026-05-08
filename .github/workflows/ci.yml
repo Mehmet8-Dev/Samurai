@@ -145,6 +145,28 @@ jobs:
           path: artifacts/*.json
           if-no-files-found: ignore
 
+  distributed-deploy-smoke:
+    name: Distributed Deploy Smoke (Helm + Docker)
+    needs: semver-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Helm chart
+        run: |
+          bash tools/verify_helm.sh deploy/helm/ddos-samurai samurai
+
+      - name: Validate distributed compose
+        run: |
+          docker compose -f docker-compose.distributed.yml config > /tmp/ddos-samurai-compose.yaml
+          test -s /tmp/ddos-samurai-compose.yaml
+
+      - name: Build production image
+        run: |
+          docker build -f Dockerfile.prod -t ddos-samurai:ci .
+
   scenario-benchmark-memory:
     name: Scenario Benchmark + Memory Profile (CI smoke)
     needs: backend-tests

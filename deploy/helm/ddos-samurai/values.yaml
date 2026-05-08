@@ -95,6 +95,15 @@ ha:
     snapshotThreshold: 2048
     snapshotKeepEntries: 512
 
+multiMaster:
+  enabled: false
+  regionId: ""
+  redis:
+    url: redis://redis-master.default.svc.cluster.local:6379/0
+  namespace: default
+  heartbeatTtlS: 15
+  dequeueMax: 3
+
 autoscale:
   enabled: true
   targetKind: deployment
@@ -112,6 +121,12 @@ master:
   replicas: 1
   managementPort: 8089
   managementLiveIntervalMs: 1000
+  tlsWatchFiles: true
+  tlsReloadIntervalS: 2.0
+  rbacAudit:
+    enabled: false
+    includeSuccess: false
+    path: /var/log/ddos-samurai/rbac_audit.jsonl
   podDisruptionBudget:
     enabled: true
     minAvailable: 1

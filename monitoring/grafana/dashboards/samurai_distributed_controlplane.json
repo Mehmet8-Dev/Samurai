@@ -4,7 +4,7 @@
   "title": "Samurai Distributed Control Plane",
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "5s",
   "tags": ["samurai", "distributed", "control-plane"],
   "time": {
@@ -97,6 +97,20 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "type": "stat",
+      "title": "Multi-Master Enabled",
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 21 },
+      "targets": [{ "expr": "samurai_distributed_multi_master_enabled", "refId": "A" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Multi-Master Regions Live",
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 21 },
+      "targets": [{ "expr": "samurai_distributed_multi_master_regions_live", "refId": "A" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
     }
   ]
 }

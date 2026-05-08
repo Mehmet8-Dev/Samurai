@@ -38,13 +38,29 @@ jobs:
           python -m pip install -e '.[distributed]'
           python -m pip install pytest
 
+      - name: Verify Helm chart
+        run: |
+          bash tools/verify_helm.sh deploy/helm/ddos-samurai samurai
+
+      - name: Validate distributed compose
+        run: |
+          docker compose -f docker-compose.distributed.yml config > /tmp/ddos-samurai-compose.yaml
+          test -s /tmp/ddos-samurai-compose.yaml
+
+      - name: Build production image
+        run: |
+          docker build -f Dockerfile.prod -t ddos-samurai:distributed-ci .
+
       - name: Run distributed suite
         env:
           PYTHONPATH: .
         run: |
           pytest tests/test_distributed_args.py \
+                 tests/test_distributed_multimaster.py \
                  tests/test_distributed_e2e_timeout.py \
                  tests/test_distributed_integration.py \
                  tests/test_distributed_master_queue.py \
+                 tests/test_distributed_tls_rotation.py \
                  tests/test_distributed_telemetry.py \
+                 tests/test_distributed_rbac_audit.py \
                  tests/test_control_init.py -q -rs

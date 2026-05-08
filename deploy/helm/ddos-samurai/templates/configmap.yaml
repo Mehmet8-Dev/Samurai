@@ -26,12 +26,21 @@ data:
   ha_raft_heartbeat_interval_ms: {{ .Values.ha.raft.heartbeatIntervalMs | quote }}
   ha_raft_snapshot_threshold: {{ .Values.ha.raft.snapshotThreshold | quote }}
   ha_raft_snapshot_keep_entries: {{ .Values.ha.raft.snapshotKeepEntries | quote }}
+  multi_master_enabled: {{ ternary "true" "false" .Values.multiMaster.enabled | quote }}
+  multi_master_region_id: {{ default .Values.region.workerRegion .Values.multiMaster.regionId | quote }}
+  multi_master_redis_url: {{ .Values.multiMaster.redis.url | quote }}
+  multi_master_namespace: {{ .Values.multiMaster.namespace | quote }}
+  multi_master_heartbeat_ttl_s: {{ .Values.multiMaster.heartbeatTtlS | quote }}
+  multi_master_dequeue_max: {{ .Values.multiMaster.dequeueMax | quote }}
   control_rbac_default_role: {{ .Values.auth.rbac.defaultRole | quote }}
   control_jwt_role_claim: {{ .Values.auth.jwt.roleClaim | quote }}
   control_jwt_tenant_claim: {{ .Values.auth.jwt.tenantClaim | quote }}
   management_api_jwt_role_claim: {{ .Values.auth.jwt.roleClaim | quote }}
   management_api_jwt_tenant_claim: {{ .Values.auth.jwt.tenantClaim | quote }}
   management_api_live_interval_ms: {{ .Values.master.managementLiveIntervalMs | quote }}
+  control_tls_watch_files: {{ ternary "true" "false" .Values.master.tlsWatchFiles | quote }}
+  control_tls_reload_interval_s: {{ .Values.master.tlsReloadIntervalS | quote }}
+  control_rbac_audit_success: {{ ternary "true" "false" .Values.master.rbacAudit.includeSuccess | quote }}
   autoscale_target_kind: {{ .Values.autoscale.targetKind | quote }}
   autoscale_target_name: {{ .Values.autoscale.targetName | quote }}
   autoscale_min_replicas: {{ .Values.autoscale.minReplicas | quote }}

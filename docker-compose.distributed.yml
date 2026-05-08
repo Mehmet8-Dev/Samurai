@@ -31,6 +31,7 @@ services:
       SAMURAI_TENANT_NAMESPACE: "default"
       SAMURAI_WORKER_REGION: "eu-central"
       SAMURAI_TARGET_REGION: "eu-central"
+      SAMURAI_MULTI_MASTER_REGION_ID: "eu-central"
     command:
       - --role
       - master
@@ -43,9 +44,19 @@ services:
       - --management-api-live-interval-ms
       - "1000"
       - --control-rbac-enable
+      - --control-rbac-audit-log-path
+      - /tmp/rbac_audit.jsonl
+      - --control-rbac-audit-success
       - --region-aware-routing
       - --cross-region-heartbeat-factor
       - "1.6"
+      - --multi-master-enable
+      - --multi-master-region-id
+      - eu-central
+      - --multi-master-redis-url
+      - redis://redis:6379/0
+      - --multi-master-namespace
+      - compose-demo
       - --ha-enable
       - --ha-mode
       - redis
@@ -107,8 +118,9 @@ services:
       SAMURAI_CONTROL_JWT_SECRET: "samurai-jwt-secret"
       SAMURAI_MANAGEMENT_API_JWT_SECRET: "samurai-jwt-secret"
       SAMURAI_TENANT_NAMESPACE: "default"
-      SAMURAI_WORKER_REGION: "eu-central"
+      SAMURAI_WORKER_REGION: "us-east"
       SAMURAI_TARGET_REGION: "eu-central"
+      SAMURAI_MULTI_MASTER_REGION_ID: "us-east"
     command:
       - --role
       - master
@@ -121,9 +133,19 @@ services:
       - --management-api-live-interval-ms
       - "1000"
       - --control-rbac-enable
+      - --control-rbac-audit-log-path
+      - /tmp/rbac_audit.jsonl
+      - --control-rbac-audit-success
       - --region-aware-routing
       - --cross-region-heartbeat-factor
       - "1.6"
+      - --multi-master-enable
+      - --multi-master-region-id
+      - us-east
+      - --multi-master-redis-url
+      - redis://redis:6379/0
+      - --multi-master-namespace
+      - compose-demo
       - --ha-enable
       - --ha-mode
       - redis

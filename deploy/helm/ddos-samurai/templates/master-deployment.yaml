@@ -120,10 +120,20 @@ spec:
             - "$(cross_region_heartbeat_factor)"
             - "--region-aware-routing"
             - "$(region_aware_routing)"
+            - "--control-tls-watch-files"
+            - "$(control_tls_watch_files)"
+            - "--control-tls-reload-interval-s"
+            - "$(control_tls_reload_interval_s)"
 {{- if .Values.auth.rbac.enabled }}
             - "--control-rbac-enable"
             - "--control-rbac-default-role"
             - "$(control_rbac_default_role)"
+{{- end }}
+{{- if .Values.master.rbacAudit.enabled }}
+            - "--control-rbac-audit-log-path"
+            - {{ .Values.master.rbacAudit.path | quote }}
+            - "--control-rbac-audit-success"
+            - "$(control_rbac_audit_success)"
 {{- end }}
             - "--tenant-namespace"
             - "$(SAMURAI_TENANT_NAMESPACE)"
@@ -163,6 +173,19 @@ spec:
             - "$(ha_raft_snapshot_threshold)"
             - "--ha-raft-snapshot-keep-entries"
             - "$(ha_raft_snapshot_keep_entries)"
+{{- end }}
+{{- if .Values.multiMaster.enabled }}
+            - "--multi-master-enable"
+            - "--multi-master-region-id"
+            - "$(multi_master_region_id)"
+            - "--multi-master-redis-url"
+            - "$(multi_master_redis_url)"
+            - "--multi-master-namespace"
+            - "$(multi_master_namespace)"
+            - "--multi-master-heartbeat-ttl-s"
+            - "$(multi_master_heartbeat_ttl_s)"
+            - "--multi-master-dequeue-max"
+            - "$(multi_master_dequeue_max)"
 {{- end }}
 {{- if .Values.autoscale.enabled }}
             - "--control-autoscale-enable"
@@ -219,11 +242,17 @@ spec:
             periodSeconds: 10
           resources:
 {{ toYaml .Values.resources | indent 12 }}
-{{- if .Values.tls.enabled }}
+{{- if or .Values.tls.enabled .Values.master.rbacAudit.enabled }}
           volumeMounts:
+{{- if .Values.tls.enabled }}
             - name: tls
               mountPath: {{ .Values.tls.mountPath }}
               readOnly: true
+{{- end }}
+{{- if .Values.master.rbacAudit.enabled }}
+            - name: rbac-audit
+              mountPath: {{ dir .Values.master.rbacAudit.path | quote }}
+{{- end }}
 {{- end }}
       nodeSelector:
 {{ toYaml .Values.nodeSelector | indent 8 }}
@@ -231,9 +260,15 @@ spec:
 {{ toYaml .Values.tolerations | indent 8 }}
       affinity:
 {{ toYaml .Values.affinity | indent 8 }}
-{{- if .Values.tls.enabled }}
+{{- if or .Values.tls.enabled .Values.master.rbacAudit.enabled }}
       volumes:
+{{- if .Values.tls.enabled }}
         - name: tls
           secret:
             secretName: {{ .Values.tls.existingSecret | default (printf "%s-tls" (include "ddos-samurai.fullname" .)) }}
+{{- end }}
+{{- if .Values.master.rbacAudit.enabled }}
+        - name: rbac-audit
+          emptyDir: {}
+{{- end }}
 {{- end }}
