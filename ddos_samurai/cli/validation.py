@@ -99,6 +99,32 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
                 parser.error("Hata: --control-autoscale-shards-per-worker >= 1 olmali.")
             if idle_down < 5.0:
                 parser.error("Hata: --control-autoscale-idle-scale-down-s >= 5.0 olmali.")
+        mm_enable = bool(getattr(args, "multi_master_enable", False))
+        if mm_enable:
+            mm_region = str(getattr(args, "multi_master_region_id", "") or "").strip()
+            worker_region = str(getattr(args, "worker_region", "") or "").strip()
+            if not mm_region and not worker_region:
+                parser.error("Hata: --multi-master-enable icin --multi-master-region-id veya --worker-region zorunlu.")
+            mm_redis = str(getattr(args, "multi_master_redis_url", "") or "").strip()
+            if not mm_redis:
+                parser.error("Hata: --multi-master-enable icin --multi-master-redis-url zorunlu.")
+            mm_ns = str(getattr(args, "multi_master_namespace", "default") or "default").strip()
+            if not mm_ns:
+                parser.error("Hata: --multi-master-namespace bos olamaz.")
+            if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", mm_ns) is None:
+                parser.error("Hata: --multi-master-namespace yalnizca [A-Za-z0-9._:-] icerebilir (1..128).")
+            mm_ttl = int(getattr(args, "multi_master_heartbeat_ttl_s", 15) or 0)
+            mm_deq = int(getattr(args, "multi_master_dequeue_max", 3) or 0)
+            if mm_ttl < 5:
+                parser.error("Hata: --multi-master-heartbeat-ttl-s >= 5 olmalıdır.")
+            if mm_deq < 1:
+                parser.error("Hata: --multi-master-dequeue-max >= 1 olmalıdır.")
+        audit_path = str(getattr(args, "control_rbac_audit_log_path", "") or "").strip()
+        if audit_path and os.path.isdir(audit_path):
+            parser.error("Hata: --control-rbac-audit-log-path bir dosya yolu olmalıdır, dizin değil.")
+        tls_reload_interval_s = float(getattr(args, "control_tls_reload_interval_s", 2.0) or 0.0)
+        if tls_reload_interval_s < 0.5:
+            parser.error("Hata: --control-tls-reload-interval-s >= 0.5 olmalıdır.")
         if bool(getattr(args, "ha_enable", False)):
             node_id = str(getattr(args, "ha_node_id", "") or "").strip()
             if "," in node_id:
@@ -257,10 +283,13 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
         parser.error("Hata: --cross-region-heartbeat-factor >= 1.0 olmalıdır.")
     worker_region = str(getattr(args, "worker_region", "") or "").strip()
     target_region = str(getattr(args, "target_region", "") or "").strip()
+    mm_region = str(getattr(args, "multi_master_region_id", "") or "").strip()
     if worker_region and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", worker_region) is None:
         parser.error("Hata: --worker-region yalnizca [A-Za-z0-9._-] icerebilir (1..64).")
     if target_region and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", target_region) is None:
         parser.error("Hata: --target-region yalnizca [A-Za-z0-9._-] icerebilir (1..64).")
+    if mm_region and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", mm_region) is None:
+        parser.error("Hata: --multi-master-region-id yalnizca [A-Za-z0-9._-] icerebilir (1..64).")
     shard_kpi_max_error_rate_pct = float(getattr(args, "shard_kpi_max_error_rate_pct", -1.0) or -1.0)
     if shard_kpi_max_error_rate_pct != -1.0 and (
         shard_kpi_max_error_rate_pct < 0.0 or shard_kpi_max_error_rate_pct > 100.0

@@ -527,6 +527,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="ha-mode raft compaction sonrası bellekte tutulacak son entry sayısı.",
     )
     distributed_group.add_argument(
+        "--multi-master-enable",
+        action="store_true",
+        help="Cross-region multi-master coordinator'u etkinlestir (Redis backend).",
+    )
+    distributed_group.add_argument(
+        "--multi-master-region-id",
+        type=str,
+        default=str(os.environ.get("SAMURAI_MULTI_MASTER_REGION_ID", "") or ""),
+        help="Bu master node'un bolge kimligi (orn: eu-central). Bos ise --worker-region kullanilir.",
+    )
+    distributed_group.add_argument(
+        "--multi-master-redis-url",
+        type=str,
+        default=str(os.environ.get("SAMURAI_MULTI_MASTER_REDIS_URL", "redis://127.0.0.1:6379/0") or "redis://127.0.0.1:6379/0"),
+        help="Multi-master coordinator Redis URL.",
+    )
+    distributed_group.add_argument(
+        "--multi-master-namespace",
+        type=str,
+        default=str(os.environ.get("SAMURAI_MULTI_MASTER_NAMESPACE", "default") or "default"),
+        help="Multi-master coordinator namespace (key prefix izolasyonu).",
+    )
+    distributed_group.add_argument(
+        "--multi-master-heartbeat-ttl-s",
+        type=int,
+        default=int(os.environ.get("SAMURAI_MULTI_MASTER_HEARTBEAT_TTL_S", "15") or "15"),
+        help="Multi-master region heartbeat TTL suresi (s).",
+    )
+    distributed_group.add_argument(
+        "--multi-master-dequeue-max",
+        type=int,
+        default=int(os.environ.get("SAMURAI_MULTI_MASTER_DEQUEUE_MAX", "3") or "3"),
+        help="Bir polling turunda kuyruktan cekilecek max delegated job sayisi.",
+    )
+    distributed_group.add_argument(
+        "--control-rbac-audit-log-path",
+        type=str,
+        default=str(os.environ.get("SAMURAI_CONTROL_RBAC_AUDIT_LOG_PATH", "") or ""),
+        help="RBAC audit JSONL append-only log dosya yolu (opsiyonel).",
+    )
+    distributed_group.add_argument(
+        "--control-rbac-audit-success",
+        action="store_true",
+        help="RBAC audit log'a sadece red edilenleri degil basarili istekleri de yaz.",
+    )
+    distributed_group.add_argument(
+        "--control-tls-watch-files",
+        type=_arg_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Master TLS dosyalarini izle ve degisince gRPC listener'i hot-reload et.",
+    )
+    distributed_group.add_argument(
+        "--control-tls-reload-interval-s",
+        type=float,
+        default=float(os.environ.get("SAMURAI_CONTROL_TLS_RELOAD_INTERVAL_S", "2.0") or "2.0"),
+        help="TLS file watcher polling araligi (s).",
+    )
+    distributed_group.add_argument(
         "--job-timeout-s",
         type=int,
         default=0,
