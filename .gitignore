@@ -11,6 +11,9 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !CHANGELOG.md
 !docs/PLAN_L7_NATIVE_CUSTOM_QUIC_H3_PARITY.md
 !docs/28-scenario-engine-web-mobile-persona.md
+!policies/TERMS_OF_USE.md
+!policies/AUP.md
+!policies/UNAUTHORIZED_USE_NOTICE.md
 
 # Python cache / build
 __pycache__/
