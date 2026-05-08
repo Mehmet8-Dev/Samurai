@@ -329,6 +329,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Management API JWT tenant claim adı.",
     )
     distributed_group.add_argument(
+        "--management-api-trusted-identity-secret",
+        type=str,
+        default=str(os.environ.get("SAMURAI_MANAGEMENT_API_TRUSTED_IDENTITY_SECRET", "") or ""),
+        help="Reverse-proxy SSO headerlarini dogrulamak icin paylasimli secret (opsiyonel).",
+    )
+    distributed_group.add_argument(
+        "--management-api-trusted-identity-secret-header",
+        type=str,
+        default="x-samurai-auth-proxy-secret",
+        help="Reverse-proxy secret header adi.",
+    )
+    distributed_group.add_argument(
+        "--management-api-trusted-identity-role-header",
+        type=str,
+        default="x-auth-request-role",
+        help="Reverse-proxy role header adi (OIDC/SAML proxy).",
+    )
+    distributed_group.add_argument(
+        "--management-api-trusted-identity-tenant-header",
+        type=str,
+        default="x-auth-request-tenant",
+        help="Reverse-proxy tenant header adi.",
+    )
+    distributed_group.add_argument(
         "--management-api-live-interval-ms",
         type=int,
         default=1000,
@@ -1569,6 +1593,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-public-target",
         action="store_true",
         help="Public (internet) hedeflere izin ver (tehlikeli). Varsayılan: engelli.",
+    )
+    safety_group.add_argument(
+        "--safety-global-deny-target",
+        action="append",
+        default=[],
+        help="Her kosulda yasak hedef(ler): IP veya CIDR. Coklu kullanim desteklenir.",
+    )
+    safety_group.add_argument(
+        "--safety-auto-abort",
+        action="store_true",
+        default=True,
+        help="Canli izleme alarmi olusursa tum worker'lari otomatik sonlandir.",
+    )
+    safety_group.add_argument(
+        "--disable-safety-auto-abort",
+        action="store_true",
+        help="Canli izleme alarminda otomatik abort'u kapat.",
     )
 
     anomaly_group = parser.add_argument_group('Anomaly Packet Options')

@@ -57,3 +57,17 @@ class TestTargetSafety(unittest.TestCase):
         ok, msg = utils.validate_target_safety("10.0.0.1", allow_targets=["bad/cidr"])
         self.assertFalse(ok)
         self.assertIn("allowlist", msg.lower())
+
+    def test_global_denylist_cidr_blocks_even_when_public_allowed(self):
+        ok, msg = utils.validate_target_safety(
+            "8.8.8.8",
+            allow_public=True,
+            deny_targets=["8.8.0.0/16"],
+        )
+        self.assertFalse(ok)
+        self.assertIn("denylist", msg.lower())
+
+    def test_invalid_denylist_entry_blocks(self):
+        ok, msg = utils.validate_target_safety("10.0.0.1", deny_targets=["bad/cidr"])
+        self.assertFalse(ok)
+        self.assertIn("denylist", msg.lower())

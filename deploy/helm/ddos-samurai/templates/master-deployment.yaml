@@ -65,6 +65,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "ddos-samurai.fullname" . }}-auth
                   key: management_jwt_secret
+            - name: SAMURAI_MANAGEMENT_API_TRUSTED_IDENTITY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ddos-samurai.fullname" . }}-auth
+                  key: management_trusted_identity_secret
             - name: SAMURAI_CONTROL_RBAC_ADMIN_SECRET
               valueFrom:
                 secretKeyRef:
@@ -108,6 +113,12 @@ spec:
             - "$(management_api_jwt_role_claim)"
             - "--management-api-jwt-tenant-claim"
             - "$(management_api_jwt_tenant_claim)"
+            - "--management-api-trusted-identity-secret-header"
+            - "$(management_api_trusted_identity_secret_header)"
+            - "--management-api-trusted-identity-role-header"
+            - "$(management_api_trusted_identity_role_header)"
+            - "--management-api-trusted-identity-tenant-header"
+            - "$(management_api_trusted_identity_tenant_header)"
             - "--control-jwt-role-claim"
             - "$(control_jwt_role_claim)"
             - "--control-jwt-tenant-claim"

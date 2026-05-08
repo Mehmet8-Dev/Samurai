@@ -63,4 +63,7 @@ jobs:
                  tests/test_distributed_tls_rotation.py \
                  tests/test_distributed_telemetry.py \
                  tests/test_distributed_rbac_audit.py \
+                 tests/test_distributed_tenant.py \
+                 tests/test_distributed_jwt.py \
+                 tests/test_distributed_management_api.py \
                  tests/test_control_init.py -q -rs

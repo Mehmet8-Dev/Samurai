@@ -41,9 +41,38 @@ jobs:
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+  enterprise-acceptance:
+    name: Enterprise Acceptance Gate
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            setup.py
+            requirements.txt
+            ddos_samurai/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -e '.[distributed]'
+          python -m pip install pytest pip-audit
+
+      - name: Run enterprise acceptance
+        run: |
+          bash tools/run_enterprise_acceptance.sh
+
   publish-release:
     name: Publish GitHub Release
-    needs: validate-tag
+    needs: [validate-tag, enterprise-acceptance]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

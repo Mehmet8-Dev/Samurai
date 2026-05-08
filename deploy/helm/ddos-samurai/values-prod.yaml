@@ -1,0 +1,76 @@
+image:
+  repository: ddos-samurai
+  tag: stable
+  pullPolicy: IfNotPresent
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    cpu: "8"
+    memory: 16Gi
+
+tls:
+  enabled: true
+  existingSecret: ddos-samurai-control-tls
+  requireClientAuth: true
+
+auth:
+  clusterSecret: "__REQUIRED__"
+  jwt:
+    controlSecret: "__REQUIRED__"
+    managementSecret: "__REQUIRED__"
+    roleClaim: role
+    tenantClaim: tenant_namespace
+  management:
+    adminToken: ""
+    operatorToken: ""
+    viewerToken: ""
+    trustedIdentitySecret: "__REQUIRED__"
+    trustedIdentitySecretHeader: x-samurai-auth-proxy-secret
+    trustedIdentityRoleHeader: x-auth-request-role
+    trustedIdentityTenantHeader: x-auth-request-tenant
+  rbac:
+    enabled: true
+    defaultRole: viewer
+    adminSecret: "__REQUIRED__"
+    operatorSecret: "__REQUIRED__"
+    viewerSecret: "__REQUIRED__"
+    workerSecret: "__REQUIRED__"
+  tenantNamespace: default
+
+master:
+  replicas: 3
+  rbacAudit:
+    enabled: true
+    includeSuccess: true
+    path: /var/log/ddos-samurai/rbac_audit.jsonl
+  extraArgs:
+    - --management-api-enable
+    - --management-api-trusted-identity-secret
+    - "__REQUIRED__"
+
+slave:
+  mode: deployment
+  replicas: 6
+
+autoscale:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 50
+  step: 2
+  cooldownS: 20
+  shardsPerWorker: 4

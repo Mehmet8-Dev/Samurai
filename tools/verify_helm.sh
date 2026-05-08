@@ -4,6 +4,7 @@ set -euo pipefail
 CHART_DIR="${1:-deploy/helm/ddos-samurai}"
 RELEASE_NAME="${2:-samurai}"
 NAMESPACE="${3:-default}"
+VALUES_PROD="${4:-$CHART_DIR/values-prod.yaml}"
 
 if [[ ! -d "$CHART_DIR" ]]; then
   echo "[verify_helm] chart directory not found: $CHART_DIR" >&2
@@ -43,6 +44,14 @@ fi
 grep -q "kind: Deployment" "$TMP_OUT"
 grep -q "app.kubernetes.io/component: master" "$TMP_OUT"
 grep -Eq "kind: (Deployment|DaemonSet)" "$TMP_OUT"
+
+if [[ -f "$VALUES_PROD" ]]; then
+  echo "[verify_helm] render prod values: $VALUES_PROD"
+  TMP_OUT_PROD="$(mktemp)"
+  run_helm template "$RELEASE_NAME" "$CHART_DIR" --namespace "$NAMESPACE" -f "$VALUES_PROD" > "$TMP_OUT_PROD"
+  grep -q "kind: Deployment" "$TMP_OUT_PROD"
+  rm -f "$TMP_OUT_PROD"
+fi
 
 echo "[verify_helm] ok"
 rm -f "$TMP_OUT"

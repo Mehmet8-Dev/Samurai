@@ -57,6 +57,10 @@ auth:
     adminToken: "change-me-admin"
     operatorToken: "change-me-operator"
     viewerToken: "change-me-viewer"
+    trustedIdentitySecret: ""
+    trustedIdentitySecretHeader: x-samurai-auth-proxy-secret
+    trustedIdentityRoleHeader: x-auth-request-role
+    trustedIdentityTenantHeader: x-auth-request-tenant
   rbac:
     enabled: true
     defaultRole: viewer

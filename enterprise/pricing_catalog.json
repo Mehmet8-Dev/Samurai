@@ -1,0 +1,75 @@
+{
+  "schema": "samurai.pricing.catalog.v1",
+  "currency": "USD",
+  "plans": [
+    {
+      "slug": "community",
+      "name": "Community",
+      "price_monthly": 0,
+      "limits": {
+        "max_workers": 2,
+        "max_pps": 100,
+        "max_duration_s": 60,
+        "max_devices": 1
+      },
+      "features": []
+    },
+    {
+      "slug": "pro",
+      "name": "Professional",
+      "price_monthly": 149,
+      "limits": {
+        "max_workers": 16,
+        "max_pps": 0,
+        "max_duration_s": 0,
+        "max_devices": 3
+      },
+      "features": [
+        "gpu_engine",
+        "af_xdp",
+        "l7_http11",
+        "custom_tcp",
+        "pcap_gen",
+        "kpi_gate",
+        "reporting_json",
+        "reporting_md",
+        "soak_testing",
+        "amplification",
+        "spoofing",
+        "slowloris"
+      ]
+    },
+    {
+      "slug": "enterprise",
+      "name": "Enterprise",
+      "price_monthly": 499,
+      "limits": {
+        "max_workers": 0,
+        "max_pps": 0,
+        "max_duration_s": 0,
+        "max_devices": 10
+      },
+      "features": [
+        "gpu_engine",
+        "af_xdp",
+        "l7_http11",
+        "l7_http2",
+        "l7_quic",
+        "l7_websocket",
+        "custom_tcp",
+        "pcap_gen",
+        "kpi_gate",
+        "kpi_gate_advanced",
+        "reporting_json",
+        "reporting_md",
+        "reporting_prom",
+        "soak_testing",
+        "ninja_mode",
+        "amplification",
+        "spoofing",
+        "slowloris",
+        "api_key"
+      ]
+    }
+  ]
+}

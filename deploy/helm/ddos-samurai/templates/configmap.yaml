@@ -37,6 +37,9 @@ data:
   control_jwt_tenant_claim: {{ .Values.auth.jwt.tenantClaim | quote }}
   management_api_jwt_role_claim: {{ .Values.auth.jwt.roleClaim | quote }}
   management_api_jwt_tenant_claim: {{ .Values.auth.jwt.tenantClaim | quote }}
+  management_api_trusted_identity_secret_header: {{ .Values.auth.management.trustedIdentitySecretHeader | quote }}
+  management_api_trusted_identity_role_header: {{ .Values.auth.management.trustedIdentityRoleHeader | quote }}
+  management_api_trusted_identity_tenant_header: {{ .Values.auth.management.trustedIdentityTenantHeader | quote }}
   management_api_live_interval_ms: {{ .Values.master.managementLiveIntervalMs | quote }}
   control_tls_watch_files: {{ ternary "true" "false" .Values.master.tlsWatchFiles | quote }}
   control_tls_reload_interval_s: {{ .Values.master.tlsReloadIntervalS | quote }}

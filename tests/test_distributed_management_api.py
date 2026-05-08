@@ -164,3 +164,38 @@ def test_management_api_tenant_filter_and_guard():
 
     r3 = cli.get("/v1/cluster/workers?tenant_namespace=tenant-b", headers=hdr)
     assert r3.status_code == 403
+
+
+def test_management_api_trusted_identity_headers_override_bearer():
+    fastapi_testclient = __import__("fastapi.testclient", fromlist=["TestClient"])
+    TestClient = fastapi_testclient.TestClient
+
+    state = {
+        "workers": [{"worker_id": "w-a", "tenant_namespace": "tenant-a", "state": "running"}],
+        "workers_count": 1,
+        "shards": [],
+        "shards_reported_count": 0,
+        "latest_snapshot": {},
+        "current_job": {"state": "idle", "job_id": "", "tenant_namespace": "tenant-a"},
+        "ha": {"mode": "off", "is_leader": 1},
+        "events": [],
+    }
+
+    app = create_management_app(
+        state_provider=lambda: dict(state),
+        abort_callback=lambda: {"aborted": True},
+        auth_role_tokens={"viewer": "view"},
+        trusted_identity_header_secret="proxy-secret",
+    )
+    cli = TestClient(app)
+    hdr = {
+        "x-auth-request-role": "admin",
+        "x-auth-request-tenant": "tenant-a",
+        "x-samurai-auth-proxy-secret": "proxy-secret",
+    }
+
+    r1 = cli.get("/v1/cluster/summary", headers=hdr)
+    assert r1.status_code == 200
+    assert str((r1.json() or {}).get("tenant_namespace", "")) == "tenant-a"
+    r2 = cli.post("/v1/jobs/abort", headers=hdr)
+    assert r2.status_code == 200

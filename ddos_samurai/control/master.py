@@ -639,6 +639,21 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
     mgmt_jwt_tenant_claim = str(
         getattr(args, "management_api_jwt_tenant_claim", "tenant_namespace") or "tenant_namespace"
     ).strip() or "tenant_namespace"
+    mgmt_trusted_identity_secret = str(
+        getattr(args, "management_api_trusted_identity_secret", "") or ""
+    ).strip()
+    mgmt_trusted_identity_secret_header = str(
+        getattr(args, "management_api_trusted_identity_secret_header", "x-samurai-auth-proxy-secret")
+        or "x-samurai-auth-proxy-secret"
+    ).strip() or "x-samurai-auth-proxy-secret"
+    mgmt_trusted_identity_role_header = str(
+        getattr(args, "management_api_trusted_identity_role_header", "x-auth-request-role")
+        or "x-auth-request-role"
+    ).strip() or "x-auth-request-role"
+    mgmt_trusted_identity_tenant_header = str(
+        getattr(args, "management_api_trusted_identity_tenant_header", "x-auth-request-tenant")
+        or "x-auth-request-tenant"
+    ).strip() or "x-auth-request-tenant"
     mgmt_live_interval_ms = int(getattr(args, "management_api_live_interval_ms", 1000) or 1000)
     control_rbac_audit_log_path = str(getattr(args, "control_rbac_audit_log_path", "") or "").strip()
     control_rbac_audit_success = bool(getattr(args, "control_rbac_audit_success", False))
@@ -935,6 +950,10 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             jwt_secret=mgmt_jwt_secret,
             jwt_role_claim=mgmt_jwt_role_claim,
             jwt_tenant_claim=mgmt_jwt_tenant_claim,
+            trusted_identity_header_secret=mgmt_trusted_identity_secret,
+            trusted_identity_secret_header=mgmt_trusted_identity_secret_header,
+            trusted_identity_role_header=mgmt_trusted_identity_role_header,
+            trusted_identity_tenant_header=mgmt_trusted_identity_tenant_header,
             live_interval_ms=mgmt_live_interval_ms,
         )
         mgmt_server = ManagementAPIServer(

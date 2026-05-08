@@ -441,11 +441,13 @@ class MasterControlServer:
         self._tls_watch_stop = threading.Event()
         self._tls_mtime = (0.0, 0.0, 0.0)
         self._audit_lock = threading.Lock()
+        self._audit_prev_hash = ""
         self._servicer = _SamuraiServicer(
             tenant_namespace=self.tenant_namespace,
             jwt_secret=self.jwt_secret,
             jwt_tenant_claim=self.jwt_tenant_claim,
         )
+        self._audit_prev_hash = self._load_last_audit_hash()
 
     @staticmethod
     def _file_mtime(path: str) -> float:
@@ -470,13 +472,70 @@ class MasterControlServer:
             return
         row = dict(item or {})
         row["schema"] = "samurai.rbac.audit.v1"
-        line = json.dumps(row, ensure_ascii=True)
         with self._audit_lock:
             parent = os.path.dirname(path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
+            row["prev_hash"] = str(self._audit_prev_hash or "")
+            row_no_hash = dict(row)
+            line_no_hash = json.dumps(row_no_hash, ensure_ascii=True, sort_keys=True)
+            row_hash = hashlib.sha256(line_no_hash.encode("utf-8")).hexdigest()
+            row["entry_hash"] = row_hash
+            line = json.dumps(row, ensure_ascii=True)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+            self._audit_prev_hash = row_hash
+
+    def _load_last_audit_hash(self) -> str:
+        path = str(self.rbac_audit_log_path or "").strip()
+        if not path or not os.path.isfile(path):
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+            if not lines:
+                return ""
+            last = json.loads(lines[-1])
+            return str((dict(last or {})).get("entry_hash", "") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def verify_rbac_audit_chain(path: str) -> tuple[bool, str]:
+        p = str(path or "").strip()
+        if not p:
+            return False, "empty path"
+        if not os.path.isfile(p):
+            return False, "file not found"
+        prev = ""
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                for lineno, raw in enumerate(f, start=1):
+                    txt = str(raw or "").strip()
+                    if not txt:
+                        continue
+                    rec = json.loads(txt)
+                    if not isinstance(rec, dict):
+                        return False, f"line {lineno}: invalid json object"
+                    got_prev = str(rec.get("prev_hash", "") or "")
+                    if got_prev != prev:
+                        return False, f"line {lineno}: prev_hash mismatch"
+                    got_hash = str(rec.get("entry_hash", "") or "")
+                    if not got_hash:
+                        return False, f"line {lineno}: missing entry_hash"
+                    data = dict(rec)
+                    data.pop("entry_hash", None)
+                    calc = hashlib.sha256(
+                        json.dumps(data, ensure_ascii=True, sort_keys=True).encode("utf-8")
+                    ).hexdigest()
+                    if calc != got_hash:
+                        return False, f"line {lineno}: entry_hash mismatch"
+                    prev = got_hash
+        except json.JSONDecodeError as exc:
+            return False, f"json decode error: {exc}"
+        except OSError as exc:
+            return False, f"io error: {exc}"
+        return True, "ok"
 
     def _build_grpc_server(self):
         import grpc

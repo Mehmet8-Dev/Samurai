@@ -185,10 +185,12 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
 
     if not args.confirm:
         utils.ethical_warning()
+
     ok, msg = utils.validate_target_safety(
         target_ip=args.target,
         allow_targets=args.allow_target,
         allow_public=args.allow_public_target,
+        deny_targets=list(getattr(args, "safety_global_deny_target", []) or []),
     )
     if not ok:
         utils.log_critical(msg)
@@ -389,6 +391,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             errors_total=errors_total_shared,
             resource_stats=resource_stats,
             soak_config=soak_cfg,
+            auto_abort_on_alarm=bool(getattr(args, "safety_auto_abort", True)),
         )
         for p in processes:
             p.join()

@@ -49,6 +49,10 @@ def create_management_app(
     jwt_secret: str = "",
     jwt_role_claim: str = "role",
     jwt_tenant_claim: str = "tenant_namespace",
+    trusted_identity_header_secret: str = "",
+    trusted_identity_secret_header: str = "x-samurai-auth-proxy-secret",
+    trusted_identity_role_header: str = "x-auth-request-role",
+    trusted_identity_tenant_header: str = "x-auth-request-tenant",
     live_interval_ms: int = 1000,
 ):
     from fastapi import FastAPI, Header, HTTPException
@@ -61,6 +65,10 @@ def create_management_app(
     jwt_shared_secret = str(jwt_secret or "").strip()
     jwt_role_key = str(jwt_role_claim or "role").strip() or "role"
     jwt_tenant_key = str(jwt_tenant_claim or "tenant_namespace").strip() or "tenant_namespace"
+    trusted_secret = str(trusted_identity_header_secret or "").strip()
+    trusted_secret_header = str(trusted_identity_secret_header or "x-samurai-auth-proxy-secret").strip().lower()
+    trusted_role_header = str(trusted_identity_role_header or "x-auth-request-role").strip().lower()
+    trusted_tenant_header = str(trusted_identity_tenant_header or "x-auth-request-tenant").strip().lower()
     live_interval_s = max(0.1, float(int(live_interval_ms or 1000)) / 1000.0)
     legacy = str(auth_token or "").strip()
     if legacy and "admin" not in role_tokens:
@@ -70,7 +78,20 @@ def create_management_app(
     if legacy and "viewer" not in role_tokens:
         role_tokens["viewer"] = legacy
 
-    def _resolve_role(authorization: str | None) -> str:
+    def _trusted_identity(headers: dict[str, str] | None) -> tuple[str, str]:
+        hd = {str(k).lower(): str(v) for k, v in dict(headers or {}).items()}
+        if not trusted_secret:
+            return "", ""
+        if str(hd.get(trusted_secret_header, "") or "").strip() != trusted_secret:
+            return "", ""
+        role = str(hd.get(trusted_role_header, "") or "").strip().lower()
+        tenant = str(hd.get(trusted_tenant_header, "") or "").strip()
+        return role, tenant
+
+    def _resolve_role(authorization: str | None, headers: dict[str, str] | None = None) -> str:
+        trusted_role, _trusted_tenant = _trusted_identity(headers)
+        if trusted_role:
+            return trusted_role
         token = _extract_bearer(str(authorization or ""))
         if not role_tokens:
             if jwt_shared_secret:
@@ -94,7 +115,10 @@ def create_management_app(
                 return ""
         return ""
 
-    def _resolve_jwt_tenant(authorization: str | None) -> str:
+    def _resolve_jwt_tenant(authorization: str | None, headers: dict[str, str] | None = None) -> str:
+        _trusted_role, trusted_tenant = _trusted_identity(headers)
+        if trusted_tenant:
+            return trusted_tenant
         if not jwt_shared_secret:
             return ""
         token = _extract_bearer(str(authorization or ""))
@@ -106,8 +130,8 @@ def create_management_app(
             return ""
         return str((dict(claims or {})).get(jwt_tenant_key, "") or "").strip()
 
-    def _guard(authorization: str | None, allowed_roles: set[str]) -> None:
-        role = _resolve_role(authorization)
+    def _guard(authorization: str | None, allowed_roles: set[str], headers: dict[str, str] | None = None) -> None:
+        role = _resolve_role(authorization, headers=headers)
         if not role:
             raise HTTPException(status_code=401, detail="unauthorized")
         if role not in set(allowed_roles or set()):
@@ -125,9 +149,13 @@ def create_management_app(
             raise HTTPException(status_code=403, detail="forbidden_tenant")
         return app_tenant or qt
 
-    def _effective_tenant_with_claims(query_tenant: str | None, authorization: str | None) -> str:
+    def _effective_tenant_with_claims(
+        query_tenant: str | None,
+        authorization: str | None,
+        headers: dict[str, str] | None = None,
+    ) -> str:
         tenant = _effective_tenant(query_tenant)
-        claim_tenant = _resolve_jwt_tenant(authorization)
+        claim_tenant = _resolve_jwt_tenant(authorization, headers=headers)
         if tenant and claim_tenant and tenant != claim_tenant:
             raise HTTPException(status_code=403, detail="forbidden_tenant_claim")
         return tenant or claim_tenant
@@ -174,9 +202,20 @@ def create_management_app(
         return {"status": "ok"}
 
     @app.get("/v1/cluster/summary")
-    def cluster_summary(authorization: str | None = Header(default=None), tenant_namespace: str | None = None):
-        _guard(authorization, {"admin", "operator", "viewer"})
-        tenant = _effective_tenant_with_claims(tenant_namespace, authorization)
+    def cluster_summary(
+        authorization: str | None = Header(default=None),
+        tenant_namespace: str | None = None,
+        x_auth_request_role: str | None = Header(default=None),
+        x_auth_request_tenant: str | None = Header(default=None),
+        x_samurai_auth_proxy_secret: str | None = Header(default=None),
+    ):
+        hdr = {
+            "x-auth-request-role": str(x_auth_request_role or ""),
+            "x-auth-request-tenant": str(x_auth_request_tenant or ""),
+            "x-samurai-auth-proxy-secret": str(x_samurai_auth_proxy_secret or ""),
+        }
+        _guard(authorization, {"admin", "operator", "viewer"}, headers=hdr)
+        tenant = _effective_tenant_with_claims(tenant_namespace, authorization, headers=hdr)
         st = dict(state_provider() or {})
         workers = [x for x in list(st.get("workers") or []) if _match_tenant(x, tenant)]
         shards = [x for x in list(st.get("shards") or []) if _match_tenant(x, tenant)]
@@ -197,38 +236,90 @@ def create_management_app(
         }
 
     @app.get("/v1/cluster/workers")
-    def cluster_workers(authorization: str | None = Header(default=None), tenant_namespace: str | None = None):
-        _guard(authorization, {"admin", "operator", "viewer"})
-        tenant = _effective_tenant_with_claims(tenant_namespace, authorization)
+    def cluster_workers(
+        authorization: str | None = Header(default=None),
+        tenant_namespace: str | None = None,
+        x_auth_request_role: str | None = Header(default=None),
+        x_auth_request_tenant: str | None = Header(default=None),
+        x_samurai_auth_proxy_secret: str | None = Header(default=None),
+    ):
+        hdr = {
+            "x-auth-request-role": str(x_auth_request_role or ""),
+            "x-auth-request-tenant": str(x_auth_request_tenant or ""),
+            "x-samurai-auth-proxy-secret": str(x_samurai_auth_proxy_secret or ""),
+        }
+        _guard(authorization, {"admin", "operator", "viewer"}, headers=hdr)
+        tenant = _effective_tenant_with_claims(tenant_namespace, authorization, headers=hdr)
         st = dict(state_provider() or {})
         workers = [x for x in list(st.get("workers") or []) if _match_tenant(x, tenant)]
         return {"tenant_namespace": tenant, "workers": workers}
 
     @app.get("/v1/cluster/shards")
-    def cluster_shards(authorization: str | None = Header(default=None), tenant_namespace: str | None = None):
-        _guard(authorization, {"admin", "operator", "viewer"})
-        tenant = _effective_tenant_with_claims(tenant_namespace, authorization)
+    def cluster_shards(
+        authorization: str | None = Header(default=None),
+        tenant_namespace: str | None = None,
+        x_auth_request_role: str | None = Header(default=None),
+        x_auth_request_tenant: str | None = Header(default=None),
+        x_samurai_auth_proxy_secret: str | None = Header(default=None),
+    ):
+        hdr = {
+            "x-auth-request-role": str(x_auth_request_role or ""),
+            "x-auth-request-tenant": str(x_auth_request_tenant or ""),
+            "x-samurai-auth-proxy-secret": str(x_samurai_auth_proxy_secret or ""),
+        }
+        _guard(authorization, {"admin", "operator", "viewer"}, headers=hdr)
+        tenant = _effective_tenant_with_claims(tenant_namespace, authorization, headers=hdr)
         st = dict(state_provider() or {})
         shards = [x for x in list(st.get("shards") or []) if _match_tenant(x, tenant)]
         return {"tenant_namespace": tenant, "shards": shards}
 
     @app.get("/v1/cluster/events")
-    def cluster_events(authorization: str | None = Header(default=None), tenant_namespace: str | None = None):
-        _guard(authorization, {"admin", "operator", "viewer"})
-        tenant = _effective_tenant_with_claims(tenant_namespace, authorization)
+    def cluster_events(
+        authorization: str | None = Header(default=None),
+        tenant_namespace: str | None = None,
+        x_auth_request_role: str | None = Header(default=None),
+        x_auth_request_tenant: str | None = Header(default=None),
+        x_samurai_auth_proxy_secret: str | None = Header(default=None),
+    ):
+        hdr = {
+            "x-auth-request-role": str(x_auth_request_role or ""),
+            "x-auth-request-tenant": str(x_auth_request_tenant or ""),
+            "x-samurai-auth-proxy-secret": str(x_samurai_auth_proxy_secret or ""),
+        }
+        _guard(authorization, {"admin", "operator", "viewer"}, headers=hdr)
+        tenant = _effective_tenant_with_claims(tenant_namespace, authorization, headers=hdr)
         st = dict(state_provider() or {})
         events = [x for x in list(st.get("events") or []) if _match_tenant(x, tenant)]
         return {"tenant_namespace": tenant, "events": events}
 
     @app.post("/v1/jobs/abort")
-    def abort_job(authorization: str | None = Header(default=None), tenant_namespace: str | None = None):
-        _guard(authorization, {"admin", "operator"})
-        _ = _effective_tenant_with_claims(tenant_namespace, authorization)
+    def abort_job(
+        authorization: str | None = Header(default=None),
+        tenant_namespace: str | None = None,
+        x_auth_request_role: str | None = Header(default=None),
+        x_auth_request_tenant: str | None = Header(default=None),
+        x_samurai_auth_proxy_secret: str | None = Header(default=None),
+    ):
+        hdr = {
+            "x-auth-request-role": str(x_auth_request_role or ""),
+            "x-auth-request-tenant": str(x_auth_request_tenant or ""),
+            "x-samurai-auth-proxy-secret": str(x_samurai_auth_proxy_secret or ""),
+        }
+        _guard(authorization, {"admin", "operator"}, headers=hdr)
+        _ = _effective_tenant_with_claims(tenant_namespace, authorization, headers=hdr)
         return dict(abort_callback() or {"aborted": False})
 
     @app.get("/metrics", response_class=PlainTextResponse)
-    def metrics(authorization: str | None = Header(default=None)):
-        _guard(authorization, {"admin", "operator", "viewer"})
+    def metrics(
+        authorization: str | None = Header(default=None),
+        x_auth_request_role: str | None = Header(default=None),
+        x_samurai_auth_proxy_secret: str | None = Header(default=None),
+    ):
+        hdr = {
+            "x-auth-request-role": str(x_auth_request_role or ""),
+            "x-samurai-auth-proxy-secret": str(x_samurai_auth_proxy_secret or ""),
+        }
+        _guard(authorization, {"admin", "operator", "viewer"}, headers=hdr)
         if metrics_provider is None:
             return ""
         return str(metrics_provider() or "")
@@ -239,9 +330,17 @@ def create_management_app(
         authorization: str | None = Header(default=None),
         tenant_namespace: str | None = None,
         since_ts_ms: int = 0,
+        x_auth_request_role: str | None = Header(default=None),
+        x_auth_request_tenant: str | None = Header(default=None),
+        x_samurai_auth_proxy_secret: str | None = Header(default=None),
     ):
-        _guard(authorization, {"admin", "operator", "viewer"})
-        tenant = _effective_tenant_with_claims(tenant_namespace, authorization)
+        hdr = {
+            "x-auth-request-role": str(x_auth_request_role or ""),
+            "x-auth-request-tenant": str(x_auth_request_tenant or ""),
+            "x-samurai-auth-proxy-secret": str(x_samurai_auth_proxy_secret or ""),
+        }
+        _guard(authorization, {"admin", "operator", "viewer"}, headers=hdr)
+        tenant = _effective_tenant_with_claims(tenant_namespace, authorization, headers=hdr)
 
         async def _stream():
             cursor = int(since_ts_ms or 0)
@@ -260,12 +359,17 @@ def create_management_app(
         authz = str(ws.headers.get("authorization", "") or ws.query_params.get("token", "") or "")
         tenant_qs = str(ws.query_params.get("tenant_namespace", "") or "").strip() or None
         since_qs = int(ws.query_params.get("since_ts_ms", "0") or 0)
-        role = _resolve_role(authz)
+        hdr = {
+            "x-auth-request-role": str(ws.headers.get("x-auth-request-role", "") or ""),
+            "x-auth-request-tenant": str(ws.headers.get("x-auth-request-tenant", "") or ""),
+            "x-samurai-auth-proxy-secret": str(ws.headers.get("x-samurai-auth-proxy-secret", "") or ""),
+        }
+        role = _resolve_role(authz, headers=hdr)
         if role not in {"admin", "operator", "viewer"}:
             await ws.close(code=4401)
             return
         try:
-            tenant = _effective_tenant_with_claims(tenant_qs, authz)
+            tenant = _effective_tenant_with_claims(tenant_qs, authz, headers=hdr)
         except HTTPException:
             await ws.close(code=4403)
             return

@@ -128,6 +128,7 @@ def attack_live_monitor(
     errors_total=None,
     resource_stats=None,
     soak_config=None,
+    auto_abort_on_alarm: bool = False,
 ):
     """
     Saldırı ilerlemesini izler ve güncellemeleri loglar.
@@ -147,6 +148,7 @@ def attack_live_monitor(
     soak_snapshots = []
     soak_alarms = []
     soak_alarm_codes = set()
+    abort_triggered = False
     soak_baseline = None
     soak_baseline_pps = 0.0
     soak_baseline_source_count = 0
@@ -170,6 +172,7 @@ def attack_live_monitor(
         return float(v) / (1024.0 * 1024.0)
 
     def _emit_alarm(code: str, message: str, value=None, threshold=None):
+        nonlocal abort_triggered
         if code in soak_alarm_codes:
             return
         soak_alarm_codes.add(code)
@@ -180,6 +183,8 @@ def attack_live_monitor(
             alarm["threshold"] = float(threshold)
         soak_alarms.append(alarm)
         log_warning(f"[SOAK] {message}")
+        if bool(auto_abort_on_alarm):
+            abort_triggered = True
 
     try:
         while any(p.is_alive() for p in processes):
@@ -419,6 +424,16 @@ def attack_live_monitor(
                     f"┆ Aktif İşçi: {alive}/{len(processes)}{pps_str}{soak_str}"
                 )
 
+            if abort_triggered:
+                log_critical("[SOAK] Alarm nedeniyle güvenli otomatik sonlandirma tetiklendi.")
+                for p in list(processes or []):
+                    try:
+                        if p.is_alive():
+                            p.terminate()
+                    except (AttributeError, OSError):
+                        pass
+                break
+
             time.sleep(refresh)
     except KeyboardInterrupt:
         raise
@@ -475,6 +490,7 @@ def validate_target_safety(
     target_ip: str,
     allow_targets: list[str] | None = None,
     allow_public: bool = False,
+    deny_targets: list[str] | None = None,
 ) -> tuple[bool, str]:
     """
     Basic safety gate:
@@ -520,6 +536,23 @@ def validate_target_safety(
                     return True, "ok"
 
         return False, "Hedef IP allowlist içinde değil. (--allow-target ile izin ver)"
+
+    # Hard deny policy: blocked targets always win.
+    for item in list(deny_targets or []):
+        raw = str(item or "").strip()
+        if not raw:
+            continue
+        try:
+            if "/" in raw:
+                net = ipaddress.ip_network(raw, strict=False)
+                if ip in net:
+                    return False, f"Hedef IP global denylist içinde: {raw}"
+            else:
+                deny_ip = ipaddress.ip_address(raw)
+                if ip == deny_ip:
+                    return False, f"Hedef IP global denylist içinde: {raw}"
+        except ValueError:
+            return False, f"Geçersiz denylist girdisi: {raw!r}"
 
     # Default policy: only private/loopback unless explicitly allowed.
     if ip.is_private or ip.is_loopback:

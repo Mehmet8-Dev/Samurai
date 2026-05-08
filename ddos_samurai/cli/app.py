@@ -105,7 +105,9 @@ def _start_trial() -> None:
         url = f"{LICENSE_SERVER_URL}/api/v1/auth/trial"
         req = Request(
             url,
-            data=json.dumps({"email": email}).encode("utf-8"),
+            data=json.dumps(
+                {"email": email, "accept_terms": True, "accept_aup": True}
+            ).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -260,6 +262,8 @@ def main(argv=None):
 
     apply_profile(args, argv)
     _resolve_profile_args(parser, args, argv)
+    if bool(getattr(args, "disable_safety_auto_abort", False)):
+        args.safety_auto_abort = False
     _validate_pacing_args(parser, args)
     _validate_hybrid_cuda_args(parser, args)
     _validate_sender_route_args(parser, args)

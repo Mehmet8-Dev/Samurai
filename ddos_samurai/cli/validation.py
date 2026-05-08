@@ -14,6 +14,17 @@ from .helpers import _normalize_afpacket_hugepage_mode, _normalize_dataplane_cor
 
 def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     role = str(getattr(args, "role", "standalone") or "standalone").strip().lower()
+    for item in list(getattr(args, "safety_global_deny_target", []) or []):
+        val = str(item or "").strip()
+        if not val:
+            parser.error("Hata: --safety-global-deny-target bos olamaz.")
+        try:
+            if "/" in val:
+                __import__("ipaddress").ip_network(val, strict=False)
+            else:
+                __import__("ipaddress").ip_address(val)
+        except ValueError:
+            parser.error(f"Hata: --safety-global-deny-target gecersiz IP/CIDR: {val}")
     if role == "standalone":
         return
 
@@ -61,6 +72,25 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
             mlive = int(getattr(args, "management_api_live_interval_ms", 1000) or 1000)
             if mlive < 100:
                 parser.error("Hata: --management-api-live-interval-ms >= 100 olmalıdır.")
+            mtrust_secret = str(getattr(args, "management_api_trusted_identity_secret", "") or "").strip()
+            mtrust_secret_header = str(
+                getattr(args, "management_api_trusted_identity_secret_header", "x-samurai-auth-proxy-secret")
+                or "x-samurai-auth-proxy-secret"
+            ).strip()
+            mtrust_role_header = str(
+                getattr(args, "management_api_trusted_identity_role_header", "x-auth-request-role")
+                or "x-auth-request-role"
+            ).strip()
+            mtrust_tenant_header = str(
+                getattr(args, "management_api_trusted_identity_tenant_header", "x-auth-request-tenant")
+                or "x-auth-request-tenant"
+            ).strip()
+            if mtrust_secret and (
+                not mtrust_secret_header or not mtrust_role_header or not mtrust_tenant_header
+            ):
+                parser.error(
+                    "Hata: trusted identity secret aktifken header adlari bos olamaz."
+                )
         if bool(getattr(args, "control_rbac_enable", False)):
             r_admin = str(getattr(args, "control_rbac_admin_secret", "") or "").strip()
             r_op = str(getattr(args, "control_rbac_operator_secret", "") or "").strip()

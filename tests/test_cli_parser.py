@@ -72,6 +72,7 @@ class TestCliParser(unittest.TestCase):
         # safety
         self.assertIn("--allow-target", opts)
         self.assertIn("--allow-public-target", opts)
+        self.assertIn("--safety-auto-abort", opts)
 
         # L7 / extra
         self.assertIn("--ninja-mode", opts)
