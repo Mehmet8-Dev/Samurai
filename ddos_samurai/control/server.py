@@ -514,23 +514,38 @@ class MasterControlServer:
                     txt = str(raw or "").strip()
                     if not txt:
                         continue
-                    rec = json.loads(txt)
-                    if not isinstance(rec, dict):
-                        return False, f"line {lineno}: invalid json object"
-                    got_prev = str(rec.get("prev_hash", "") or "")
-                    if got_prev != prev:
-                        return False, f"line {lineno}: prev_hash mismatch"
-                    got_hash = str(rec.get("entry_hash", "") or "")
-                    if not got_hash:
-                        return False, f"line {lineno}: missing entry_hash"
-                    data = dict(rec)
-                    data.pop("entry_hash", None)
-                    calc = hashlib.sha256(
-                        json.dumps(data, ensure_ascii=True, sort_keys=True).encode("utf-8")
-                    ).hexdigest()
-                    if calc != got_hash:
-                        return False, f"line {lineno}: entry_hash mismatch"
-                    prev = got_hash
+                    records = [txt]
+                    try:
+                        json.loads(txt)
+                    except json.JSONDecodeError as exc:
+                        # Tolerate malformed rewrites that used literal "\\n" separators
+                        # instead of real newlines (common in ad-hoc tamper simulations).
+                        if "Extra data" in str(exc) and "\\n" in txt:
+                            parts = [part.strip() for part in txt.split("\\n") if str(part or "").strip()]
+                            if len(parts) > 1:
+                                records = parts
+                            else:
+                                raise
+                        else:
+                            raise
+                    for part_idx, rec_txt in enumerate(records, start=1):
+                        rec = json.loads(rec_txt)
+                        if not isinstance(rec, dict):
+                            return False, f"line {lineno}.{part_idx}: invalid json object"
+                        got_prev = str(rec.get("prev_hash", "") or "")
+                        if got_prev != prev:
+                            return False, f"line {lineno}.{part_idx}: prev_hash mismatch"
+                        got_hash = str(rec.get("entry_hash", "") or "")
+                        if not got_hash:
+                            return False, f"line {lineno}.{part_idx}: missing entry_hash"
+                        data = dict(rec)
+                        data.pop("entry_hash", None)
+                        calc = hashlib.sha256(
+                            json.dumps(data, ensure_ascii=True, sort_keys=True).encode("utf-8")
+                        ).hexdigest()
+                        if calc != got_hash:
+                            return False, f"line {lineno}.{part_idx}: entry_hash mismatch"
+                        prev = got_hash
         except json.JSONDecodeError as exc:
             return False, f"json decode error: {exc}"
         except OSError as exc:
