@@ -1,13 +1,27 @@
-# 12 - Dashboard (Legacy Notu)
+# Dashboard
 
-Bu belge tarihsel/arsiv baglamdadir.
+Bu repo checkout'unda bagimsiz bir React/Vite dashboard kaynagi yoktur.
 
-## Repo Durumu (2026-03-14)
+## Mevcut Gorunurluk Kaynaklari
 
-Bu checkout'ta `dashboard/` dizini bulunmuyor.
-Bu nedenle React/Vite dashboard gelistirme ve calistirma adimlari aktif degildir.
+1. Grafana/Prometheus
+- `monitoring/` altindaki stack
+- Runtime ve distributed metrikleri buradan izlenir
 
-## Ne Yapilmali?
+2. Management API live endpointleri
+- SSE: `/v1/cluster/live/sse`
+- WebSocket: `/v1/cluster/live/ws`
 
-- Dashboard kaynaklari geri eklendiginde bu dosya yeniden aktif dokuman haline getirilmeli.
-- O zamana kadar dokuman sadece tarihsel mimari referansi olarak kullanilmalidir.
+3. Run report artefaktlari
+- JSON/Markdown ciktilar (`--run-report`)
+- KPI/soak benchmark raporlari
+
+## Ne Eksik?
+
+- Dogrudan urun icinde ship edilen web UI katmani
+- Tenant bazli front-end role ekranlari
+
+## Onerilen Yol (UI sonradan)
+
+- Kisa vadede: Management API + Grafana panel setleri
+- Uzun vadede: Ayrik `web_console` paketi (OIDC + tenant aware)

@@ -1,30 +1,45 @@
-# 07 - Safety Gate'leri (ddos_samurai/utils.py)
+# Safety
 
-## Hedef
+Safety katmani, aracin yanlis hedefe veya kontrolsuz kosullarda calismasini azaltmak icin tasarlanmistir.
+Ana implementasyon: `ddos_samurai/utils.py::validate_target_safety`
 
-Kod tabaninda "yanlis hedefe calistirma" riskini dusurmek icin temel bir güvenlik kapisi vardir.
-Bu kapinin mantigi `utils.validate_target_safety()` ile uygulanir.
+## Hedef Guvenlik Politikasi
 
-## Default Politika
+Varsayilan davranis:
 
-- Sadece IPv4 desteklenir.
-- Multicast/unspecified bloklanir.
-- Allowlist verilmemisse:
-  - Private veya loopback hedefler OK
-  - Public hedefler default olarak BLOK
+- Yalnizca IPv4 desteklenir
+- Multicast ve unspecified adresler reddedilir
+- Allowlist verilmediyse sadece private/loopback kabul edilir
+- Public hedef default olarak blok
 
-## Override Mekanizmalari
+## Kontrol Bayraklari
 
-- `--allow-target` (tekrarlanabilir): IP veya CIDR allowlist
-- `--allow-public-target`: public hedef kilidini kaldirir
+- `--allow-target` (tekrarlanabilir)
+  - IP veya CIDR allowlist
+- `--allow-public-target`
+  - Public hedef kilidini bilincli olarak kaldirir
+- `--safety-global-deny-target` (tekrarlanabilir)
+  - Her kosulda yasak hedef listesi
+  - allow_public veya allowlist'ten daha onceliklidir
 
-## Etik Uyari Akisi
+## Etik Onay Akisi
 
-- `utils.ethical_warning()` interaktif onay ister.
-- CLI'da `--confirm` ile bu interaktif adim atlanabilir.
+- `utils.ethical_warning()` interaktif YES onayi ister
+- `--confirm` ile interaktif adim atlanabilir
 
-Urunlestirme icin not:
+## Runtime Emniyet Davranisi
 
-- Interaktif prompt, servis/CI calistirmalarinda problem yaratabilir.
-- Bu davranis "policy module" haline getirilip ortama gore degistirilebilir.
+Soak/monitoring alarmi geldiginde:
 
+- `--safety-auto-abort` aktifse workerlar terminate edilir
+- `--disable-safety-auto-abort` ile bu davranis kapatilabilir
+
+Bu kontrol, yanlis konfigürasyon veya bozulan kosullarda hasari sinirlamak icindir.
+
+## Operasyon Onerisi
+
+Prod benzeri ortamlarda su kombinasyon onerilir:
+
+- Public hedefte `--allow-public-target` sadece degisiklik kaydi ile
+- Kurumsal denyliste `--safety-global-deny-target` zorunlu
+- Uzun sureli kosularda auto-abort acik

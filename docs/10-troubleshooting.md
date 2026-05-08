@@ -1,134 +1,118 @@
-# 10 - Troubleshooting
+# Troubleshooting
 
-## 1) Pytest Collection Asamasinda PermissionError (Scapy / Netlink)
+Bu belge sahada en sik gorulen hata siniflarini ve hizli tani adimlarini toplar.
 
-Belirti:
-
-- `PermissionError: [Errno 1] Operation not permitted`
-- Stacktrace Scapy'nin interface reload / netlink bolumune gider
-
-Kok neden:
-
-- Ortam, `AF_NETLINK` soket acimina izin vermiyor (sandbox/container policy).
-
-Gelistirme yonu:
-
-- Scapy importunu calisma anina ertelemek (lazy import).
-- CI icin "pure unit" modunda scapy bagimliligini stub/mocking ile izole etmek.
-
-## 2) Raw Socket Hatalari
+## 1) Lisans dogrulama basarisiz
 
 Belirti:
 
-- "Raw socket creation failed. Please run ... with sudo/root privileges."
+- process `78` ile cikiyor
+- log: `Lisans doğrulaması başarısız`
 
-Kok neden:
+Kontrol:
 
-- Root/cap_net_raw yetkisi yok.
+1. `--license-key` veya `SAMURAI_LICENSE_KEY` var mi?
+2. Lisans sunucusuna erisim var mi?
+3. Sistem saati dogru mu (token/expiry etkiler)?
+
+## 2) Raw socket/XDP yetki hatalari
+
+Belirti:
+
+- `Operation not permitted`
+- root/capability uyarilari
+
+Kontrol:
+
+- root veya gerekli capability set edildi mi?
+- container ise NET_RAW/NET_ADMIN var mi?
+- XDP iface dogru mu?
+
+## 3) XDP yolu acilmiyor
+
+Belirti:
+
+- `xdp_unavailable` / module not available
+
+Kontrol:
+
+1. `python setup.py build_ext --inplace`
+2. NIC/driver XDP uygunlugu
+3. `--xdp-interface` degeri
+
+## 4) GPU classifier init hatasi
+
+Belirti:
+
+- engine load/init hatasi
+- `gpu_classifier_hard_fail`
+
+Kontrol:
+
+- `--gpu-classifier-engine-path` dogru mu?
+- TensorRT/CUDA surum uyumu var mi?
+- `--gpu-defense-mode on` gerekli mi?
+
+## 5) Soak run beklenmedik abort
+
+Belirti:
+
+- monitor tarafinda alarm + auto-abort
+
+Kontrol:
+
+- `--safety-auto-abort` aktif mi?
+- thresholdlar (error rate, backlog, growth) fazla siki mi?
+- kaynak metrikleri (RSS/VRAM/pinned) baseline'a gore normal mi?
+
+## 6) Distributed slave register olmuyor
+
+Belirti:
+
+- slave, master register reddi veya timeout
+
+Kontrol:
+
+1. `--control-endpoints` dogru mu?
+2. `--cluster-secret` uyusuyor mu?
+3. tenant namespace mismatch var mi?
+4. TLS/mTLS dosyalari dogru mu?
+
+## 7) Management API 401/403
+
+Belirti:
+
+- `/v1/cluster/*` endpointleri yetki reddi
+
+Kontrol:
+
+- bearer token/role token dogru mu?
+- JWT role/tenant claim adlari uyusuyor mu?
+- trusted identity header kullaniyorsaniz secret/header isimleri uyumlu mu?
+
+## 8) CI'da grpc/protobuf eksikligi
+
+Belirti:
+
+- distributed testlerde import hatalari
+
+Kontrol:
+
+- `pip install -e '.[distributed]'`
+- protobuf/grpc paketleri mevcut mu?
+
+## 9) Dashboard/API legacy beklentisi
 
 Not:
 
-- Bu proje, birden fazla transport yolu kullaniyor; urun senaryosuna gore hangi yollarin supported oldugu netlestirilmeli.
+- Bu checkout'ta klasik `dashboard/` ve `ddos_samurai/api.py` yok
+- Aktif API, distributed management API katmanidir (`control/management_api.py`)
 
-## 3) GPU Modunda CUDA Init / Context Hatalari
+## 10) Hizli Tani Komutlari
 
-Belirti:
-
-- CUDA context destroy / init race benzeri hatalar
-
-Yapilanlar:
-
-- Lazy import (CLI orchestrator importu geciktiriyor)
-- Multiprocessing start method `spawn`
-
-Ek tanilama:
-
-- GPU modulleri icinde `cuda.is_available()` ve memory info raporlari mevcut.
-
-## 4) Legacy API/Dashboard Referanslari
-
-Belirti:
-
-- Dokumanlarda API/dashboard adimlari gorunuyor ama repoda ilgili kaynaklar yok.
-
-Kontrol listesi:
-
-- Bu checkout'ta `dashboard/` dizini var mi?
-- Bu checkout'ta `ddos_samurai/api.py` var mi?
-
-Not:
-
-- 2026-03-14 itibariyla bu checkout'ta API/dashboard kaynaklari bulunmuyor.
-- Bu nedenle `docs/11-docker.md`, `docs/12-dashboard.md`, `docs/13-api.md` belgeleri legacy baglamdadir.
-
-## 5) Docker icinde "Operation not permitted" (NET_RAW / NET_ADMIN)
-
-Belirti:
-
-- Raw socket / netlink / low-level network operasyonlarinda `Operation not permitted`
-
-Kok neden:
-
-- Container capability/privilege yetersiz
-
-Yapilabilecekler:
-
-- `docker-compose.yml` icinde `cap_add: [NET_RAW, NET_ADMIN]` kullanmak
-- Gerekirse (izole test ortaminda) `privileged: true`
-
-Detay: `docs/11-docker.md`
-
-## 6) `run_quality` Beklenenden Farkli (`interrupted` / `invalid_metrics`)
-
-Belirti:
-
-- Run raporunda `results.run_quality` degeri `valid` degil.
-
-Kontrol listesi:
-
-- `workers_total > 0` mi?
-- `attempted_total > 0` mi?
-- `warnings` icinde `run_interrupted_by_user` var mi?
-
-Yorum:
-
-- `interrupted`: kosu kullanici veya dis etkenden erken kesildi.
-- `invalid_metrics`: metrik zemini eksik oldugu icin benchmark/parity skoruna girmemeli.
-
-## 7) Sender Backend/Fallback Sorunlari
-
-Belirti:
-
-- Beklenen backend kullanilmiyor, `sender_paths_used` farkli cikiyor.
-- `sender_fallback_reason` bos veya beklenmeyen bir deger.
-
-Kontrol listesi:
-
-- `--sender-backend` dogru secildi mi (`auto|txring|c_ext_l3|python|xdp`)?
-- `--sender-fallback-policy fail` kullaniliyorsa `--sender-backend auto` secilmemeli.
-- XDP yolu icin `--xdp-interface` zorunludur.
-
-Not:
-
-- Deterministik benchmark icin `--sender-backend` explicit secilmeli, `auto` yalnizca genel fallback modunda kullanilmalidir.
-
-## 8) AF_PACKET HugePage `required` Modunda Run Fail
-
-Belirti:
-
-- `sender_fallback_reason=afpacket_hugepage_required_not_met`
-- KPI gate tarafinda `afpacket_hugepage_effective` ihlali
-
-Kontrol listesi:
-
-- Run TX_RING ile mi calisiyor (`sender_path` / `sender_paths_used`)?
-- `afpacket_hugepage_mode=required` aktif mi?
-- Rapordaki alanlar:
-  - `afpacket_hugepage_effective`
-  - `afpacket_hugepage_reason`
-  - `afpacket_smaps_kernel_page_kb`
-  - `afpacket_smaps_anon_hugepages_kb`
-
-Not:
-
-- AF_PACKET ring bellegi kernel tarafinda ayrildigi icin bu policy "enforce edilebilir hugepage policy" saglar; mutlak hugetlb garantisi degildir.
+```bash
+python -m ddos_samurai.cli --self-test
+python -m ddos_samurai.cli --list-profiles
+pytest tests/test_cli_parser.py -q -rs
+pytest tests/test_distributed_management_api.py -q -rs
+```

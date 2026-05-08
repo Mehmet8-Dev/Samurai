@@ -1,17 +1,18 @@
-# 08 - YAML Config
+# Config
 
-CLI, `--config` ile bir YAML dosyasindan default degerleri alabilir.
+CLI, `--config` ile YAML bazli default degerleri yukler.
+Kaynak: `ddos_samurai/cli/config.py`
 
-## Precedence
+## Merge Mantigi
 
-Genel kural:
+1. Parser once bilinen argumanlarla config yolunu alir
+2. YAML okunur ve flatten edilir
+3. YAML degerleri parser defaults olarak set edilir
+4. Komut satiri explicit degerleri YAML'i override eder
 
-- YAML dosyasindan gelen degerler "default" gibi davranir.
-- Komut satirindan explicit verilen argumanlar YAML'i override eder.
+## Nested Key Mapping
 
-## Nested Dict Flatten
-
-YAML icinde nested dict varsa:
+YAML:
 
 ```yaml
 http:
@@ -19,31 +20,42 @@ http:
   timeout: 5.0
 ```
 
-Bu key'ler argparse tarafinda su sekle map edilir:
+Argparse `dest`:
 
 - `http_scheme`
 - `http_timeout`
 
-Kod: `ddos_samurai/cli/config.py` icindeki flatten dongusu.
-
-## Oneri: Semayi Netlestirme
-
-YAML semasini urun dokumani haline getirmek icin:
-
-- Tum argparse `dest` isimlerini ve YAML mapping'ini tek yerde listeleyin.
-- "deprecated" bayraklari temizlerken testleri de guncelleyin (`tests/test_cli_parser.py` gibi).
-
-## AF_PACKET HugePage Ornek YAML
+## Pratik Dosya Ornegi
 
 ```yaml
-sender_backend: txring
-sender_fallback_policy: fail
-lab_profile: dedicated
-afpacket_hugepage_mode: required
-afpacket_hugepage_size_kb: 2048
-afpacket_ring_target_mb: 64
-afpacket_mlock_ring: false
-afpacket_prefault_ring: true
+target: 10.0.0.5
+port: 443
+protocol: tcp
+attack_vector: http2
+workers: 8
+count: 200000
+allow_target:
+  - 10.0.0.0/8
+safety_global_deny_target:
+  - 10.10.10.0/24
+run_report: true
+run_report_format: both
 ```
 
-Dedicated + TX_RING profilinde `afpacket_hugepage_mode` CLI preflight tarafinda otomatik `required` olur.
+## Config Tasariminda Kural
+
+- Runtime tarafinda kritik policyleri explicit flag olarak da gecirin
+- CI run'lari icin deterministic alanlari YAML'da sabitleyin:
+  - sender backend/policy
+  - pacing mode/rps
+  - report out path
+
+## Dogrulama Onerisi
+
+Config degisikliginden sonra en az:
+
+- `--dry-run`
+- `--self-test`
+- kritik test paketleri (`tests/test_cli_parser.py`, `tests/test_profile_resolver.py`)
+
+ile smoke alin.

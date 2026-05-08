@@ -1,13 +1,49 @@
-# 13 - API (Legacy Notu)
+# API
 
-Bu belge tarihsel/arsiv baglamdadir.
+Bu checkout'ta klasik monolit `ddos_samurai/api.py` bulunmuyor.
+Aktif API katmani distributed management API'dir.
 
-## Repo Durumu (2026-03-14)
+Kaynak: `ddos_samurai/control/management_api.py`
 
-Bu checkout'ta `ddos_samurai/api.py` bulunmuyor.
-Bu nedenle FastAPI endpoint akisi aktif runtime dokumani olarak gecersizdir.
+## Endpointler
 
-## Ne Yapilmali?
+- `GET /healthz`
+- `GET /v1/cluster/summary`
+- `GET /v1/cluster/workers`
+- `GET /v1/cluster/shards`
+- `GET /v1/cluster/events`
+- `POST /v1/jobs/abort`
+- `GET /metrics`
+- `GET /v1/cluster/live/sse`
+- `WS  /v1/cluster/live/ws`
 
-- API kaynaklari geri eklendiginde endpoint sozlesmeleri tekrar koddan uretilerek bu belge guncellenmelidir.
-- O zamana kadar bu dosya yalnizca onceki mimariyi anlamak icin kullanilmalidir.
+## Auth Modelleri
+
+1. Role token
+- admin/operator/viewer tokenlari
+
+2. JWT
+- role ve tenant claim tabanli
+
+3. Trusted identity headers (reverse proxy)
+- OIDC/SAML forward-auth proxy ile
+- role + tenant headerlari + shared secret dogrulama
+
+## Tenant Izolasyonu
+
+- Query tenant + app tenant + claim tenant kontrolu birlikte yapilir
+- Tenant mismatch durumunda 403 doner
+
+## SSE/WS Live Akisi
+
+- Snapshot tabanli yayin
+- Cursor (`since_ts_ms`) destekli incremental event akisi
+
+## Metrik Export
+
+- `/metrics` endpointi plain text Prometheus formatinda cikti verir
+- Uretilecek metrikler master state aggregator tarafinda normalize edilir
+
+## Not
+
+Purchase/portal/licensing API'leri ayrik `license_server` projesindedir (`license_server/*`).

@@ -31,6 +31,56 @@ Not:
 - Samurai'nin guclu farki GPU-assisted generation ve vektor cesitliligidir.
 - TRex'in guclu farki tek dataplane disiplini ve olgun L4 performans hattidir.
 
+## Guncel Dokumantasyon Gap Haritasi (2026-05-08)
+
+Bu bolum tarihsel analizden bagimsiz olarak "bugunku checkout" icin
+dokumantasyon olgunluk durumunu ozetler.
+
+### Tamamlanan/Guclendirilen Alanlar
+
+- Cekirdek teknik set (00-13) kapsam ve detay acisindan genisletildi
+- Env/CLI referansi (20) operasyonel gruplara ayrildi
+- Distributed control-plane, licensing/commercialization, security gates,
+  production runbook belgeleri aktif hale getirildi
+
+### Acik Kalan Dokumantasyon Gap'leri
+
+1. Destek matrisi (support matrix)
+- Kernel/driver/NIC/GPU kombinasyonlarinda resmi destek tablosu eksik
+
+2. Capacity planning guide
+- PPS/RPS hedeflerine gore node, NIC queue, CPU/NUMA sizing rehberi eksik
+
+3. Upgrade/rollback playbook
+- Version gecis adimlari ve rollback karar agaci standardize degil
+
+4. Incident postmortem template
+- RCA sablonu ve aksiyon takip formati dokumante degil
+
+5. Compliance mapping
+- ISO27001/SOC2/NIS2 kontrol map'i ve kanit referanslari eksik
+
+6. Procurement cevap bankasi
+- Security questionnaire icin standart Q&A seti olgun degil
+
+7. Reference architecture seti
+- Small/Medium/Large deployment blueprint'leri netlestirilmeli
+
+8. Benchmark reproducibility kit
+- Tek komutla yeniden uretilebilir benchmark paketi eksik
+
+9. DR drill rapor formati
+- Restore tatbikatlarinda standart cikti/kanit formati yok
+
+10. KPI/SLO dashboard contract
+- SLO/SLA'da kontratsal kabul edilen metrik seti net degil
+
+### Ticari Etki
+
+Bu gap'ler, teknik yetenekten cok "satinalma guveni"ni belirler.
+Ozellikle support matrix + compliance mapping + procurement Q&A seti,
+POC'ten satisa geciste en kritik ivme carpani olur.
+
 ---
 
 ## BÖLÜM 1: Samurai Proje Analizi

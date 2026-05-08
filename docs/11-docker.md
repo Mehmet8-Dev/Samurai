@@ -1,25 +1,53 @@
-# 11 - Docker (Legacy Notu)
+# Docker
 
-Bu belge tarihsel icerik kapsamindadir.
+Bu checkout'ta container-native calisma icin birincil yol distributed compose + helm'dir.
 
-## Repo Durumu (2026-03-14)
+## 1) Docker Compose (Distributed)
 
-- Kokte `docker-compose.yml` dosyasi bulunur.
-- Compose icinde `api` ve `dashboard` servisleri tanimlidir.
-- Ancak bu checkout'ta `dashboard/` dizini ve `ddos_samurai/api.py` kaynaklari bulunmadigi icin stack dogrudan calismaz.
+Dosya: `docker-compose.distributed.yml`
 
-## Bu Checkout'ta Calisan Yol
+Calistirma:
 
-Monitoring stack ayri ve calisabilir durumdadir:
+```bash
+docker compose -f docker-compose.distributed.yml up --build --scale slave=3
+```
+
+Beklenen roller:
+
+- `master`: control-plane + management API
+- `slave`: worker execution
+
+## 2) Production Image
+
+```bash
+docker build -f Dockerfile.prod -t ddos-samurai:prod .
+```
+
+CI'da da ayni Dockerfile smoke edilir.
+
+## 3) Monitoring Stack
+
+Ayrik monitoring compose:
 
 ```bash
 cd monitoring
 docker compose up -d
 ```
 
-- Prometheus: `http://localhost:9090`
-- Grafana: `http://localhost:3000`
+- Prometheus: `:9090`
+- Grafana: `:3000`
 
-## Not
+## 4) Yetki/CAP Notlari
 
-Eger API/UI stack tekrar eklenecekse bu belge o anda guncel topolojiye gore yeniden yazilmalidir.
+Dusus seviyeli network path'ler icin container capability gerekebilir.
+Ozellikle:
+
+- `NET_RAW`
+- `NET_ADMIN`
+
+Policy geregi privileged calisma sadece izole test ortaminda onerilir.
+
+## 5) Legacy Notu
+
+Klasik api/dashboard stack referanslari tarihsel olabilir.
+Aktif runtime odagi distributed compose + management API + monitoring stack'tir.
