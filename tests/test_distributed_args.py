@@ -136,3 +136,44 @@ def test_distributed_region_validation(monkeypatch):
     ])
     with pytest.raises(SystemExit):
         _validate_distributed_args(parser, bad_factor)
+
+
+def test_distributed_multimaster_requires_region_or_worker_region(monkeypatch):
+    monkeypatch.setitem(sys.modules, "grpc", types.SimpleNamespace())
+    parser = build_parser()
+    bad = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--multi-master-enable",
+        "--multi-master-region-id",
+        "",
+        "--worker-region",
+        "",
+    ])
+    with pytest.raises(SystemExit):
+        _validate_distributed_args(parser, bad)
+
+    good = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--multi-master-enable",
+        "--worker-region",
+        "eu-central",
+    ])
+    _validate_distributed_args(parser, good)
+
+
+def test_distributed_tls_reload_interval_bounds(monkeypatch):
+    monkeypatch.setitem(sys.modules, "grpc", types.SimpleNamespace())
+    parser = build_parser()
+    bad = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--control-tls-reload-interval-s",
+        "0.1",
+    ])
+    with pytest.raises(SystemExit):
+        _validate_distributed_args(parser, bad)

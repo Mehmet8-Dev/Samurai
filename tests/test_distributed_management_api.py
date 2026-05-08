@@ -13,6 +13,9 @@ def test_management_api_summary_and_abort_with_auth():
         "latest_snapshot": {"sent": 10, "errors": 0},
         "current_job": {"state": "running", "job_id": "job-1"},
         "ha": {"mode": "off", "is_leader": 1},
+        "multi_master": {"enabled": True, "region_id": "eu-central"},
+        "multi_master_regions": [{"region_id": "eu-central", "node_id": "m1"}],
+        "multi_master_latest": [{"region_id": "eu-central", "snapshot": {"sent": 10}}],
         "events": [{"ts_ms": 1, "kind": "master_started"}],
     }
     called = {"abort": 0}
@@ -47,6 +50,7 @@ def test_management_api_summary_and_abort_with_auth():
     assert int(body.get("shards_reported_count", 0)) == 1
     assert str((body.get("current_job") or {}).get("job_id", "")) == "job-1"
     assert int((body.get("ha") or {}).get("is_leader", 0)) == 1
+    assert bool((body.get("multi_master") or {}).get("enabled", False)) is True
 
     r3 = cli.get("/v1/cluster/workers", headers=hdr)
     assert r3.status_code == 200
