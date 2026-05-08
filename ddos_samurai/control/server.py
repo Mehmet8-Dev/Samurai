@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import threading
 import time
 from concurrent import futures
@@ -23,6 +25,8 @@ class _SecretServerInterceptor:
         default_role: str = "viewer",
         jwt_secret: str = "",
         jwt_role_claim: str = "role",
+        audit_logger=None,
+        audit_success: bool = False,
     ) -> None:
         self._expected = str(expected_secret or "").strip()
         self._rbac_enabled = bool(rbac_enabled)
@@ -30,6 +34,8 @@ class _SecretServerInterceptor:
         self._default_role = str(default_role or "viewer").strip().lower() or "viewer"
         self._jwt_secret = str(jwt_secret or "").strip()
         self._jwt_role_claim = str(jwt_role_claim or "role").strip() or "role"
+        self._audit_logger = audit_logger
+        self._audit_success = bool(audit_success)
 
     @staticmethod
     def _rpc_name(method: str) -> str:
@@ -53,7 +59,7 @@ class _SecretServerInterceptor:
             return {"admin", "operator"}
         return {"admin"}
 
-    def _authorized(self, md: dict, rpc_name: str) -> tuple[bool, str]:
+    def _authorized_core(self, md: dict, rpc_name: str) -> tuple[bool, str, str]:
         provided = md.get("x-cluster-secret")
         jwt_claims = None
         if not validate_cluster_secret(self._expected, provided):
@@ -61,11 +67,11 @@ class _SecretServerInterceptor:
                 try:
                     jwt_claims = decode_jwt_hs256(str(provided or ""), self._jwt_secret)
                 except ValueError:
-                    return False, "invalid cluster secret"
+                    return False, "invalid cluster secret", ""
             else:
-                return False, "invalid cluster secret"
+                return False, "invalid cluster secret", ""
         if not self._rbac_enabled:
-            return True, ""
+            return True, "", "legacy"
         role = resolve_role_from_secret(provided, self._role_secrets)
         if not role and isinstance(jwt_claims, dict):
             role = str(jwt_claims.get(self._jwt_role_claim, "") or "").strip().lower()
@@ -79,11 +85,43 @@ class _SecretServerInterceptor:
             elif self._expected and validate_cluster_secret(self._expected, provided):
                 role = self._default_role
             else:
-                return False, "unknown role secret"
+                return False, "unknown role secret", ""
         allowed = self._allowed_roles_for_rpc(rpc_name)
         if role not in allowed:
-            return False, f"forbidden for role={role} rpc={rpc_name}"
-        return True, ""
+            return False, f"forbidden for role={role} rpc={rpc_name}", role
+        return True, "", role
+
+    # Backward-compatible API for existing tests/callers that expect 2-tuple.
+    def _authorized(self, md: dict, rpc_name: str) -> tuple[bool, str]:
+        ok, err, _role = self._authorized_core(md, rpc_name)
+        return ok, err
+
+    @staticmethod
+    def _token_fingerprint(token: str) -> str:
+        raw = str(token or "").strip().encode("utf-8")
+        if not raw:
+            return ""
+        return hashlib.sha256(raw).hexdigest()[:16]
+
+    def _audit(self, *, ctx, rpc_name: str, provided_secret: str, role: str, allowed: bool, error: str) -> None:
+        logger = self._audit_logger
+        if logger is None:
+            return
+        if allowed and not self._audit_success:
+            return
+        item = {
+            "ts_ms": int(time.time() * 1000),
+            "rpc": str(rpc_name),
+            "allowed": int(1 if allowed else 0),
+            "role": str(role or ""),
+            "error": str(error or ""),
+            "peer": str(getattr(ctx, "peer", lambda: "")() or ""),
+            "token_fp": self._token_fingerprint(provided_secret),
+        }
+        try:
+            logger(dict(item))
+        except Exception:
+            pass
 
     def intercept_service(self, continuation, handler_call_details):
         handler = continuation(handler_call_details)
@@ -96,7 +134,9 @@ class _SecretServerInterceptor:
 
         def _check(ctx):
             md = dict(ctx.invocation_metadata() or [])
-            ok, err = self._authorized(md, rpc_name)
+            provided = str(md.get("x-cluster-secret", "") or "")
+            ok, err, role = self._authorized_core(md, rpc_name)
+            self._audit(ctx=ctx, rpc_name=rpc_name, provided_secret=provided, role=role, allowed=ok, error=err)
             if not ok:
                 status = getattr(__import__("grpc"), "StatusCode").PERMISSION_DENIED
                 if "invalid cluster secret" in str(err):
@@ -369,6 +409,10 @@ class MasterControlServer:
         jwt_secret: str = "",
         jwt_role_claim: str = "role",
         jwt_tenant_claim: str = "tenant_namespace",
+        rbac_audit_log_path: str = "",
+        rbac_audit_log_success: bool = False,
+        tls_watch_files: bool = True,
+        tls_reload_interval_s: float = 2.0,
     ) -> None:
         require_distributed()
         self.listen_addr = str(listen_addr)
@@ -386,15 +430,55 @@ class MasterControlServer:
         self.jwt_secret = str(jwt_secret or "").strip()
         self.jwt_role_claim = str(jwt_role_claim or "role").strip() or "role"
         self.jwt_tenant_claim = str(jwt_tenant_claim or "tenant_namespace").strip() or "tenant_namespace"
+        self.rbac_audit_log_path = str(rbac_audit_log_path or "").strip()
+        self.rbac_audit_log_success = bool(rbac_audit_log_success)
+        self.tls_watch_files = bool(tls_watch_files)
+        self.tls_reload_interval_s = max(0.5, float(tls_reload_interval_s or 2.0))
         self.running = False
         self._server = None
+        self._server_lock = threading.Lock()
+        self._tls_watch_thread = None
+        self._tls_watch_stop = threading.Event()
+        self._tls_mtime = (0.0, 0.0, 0.0)
+        self._audit_lock = threading.Lock()
         self._servicer = _SamuraiServicer(
             tenant_namespace=self.tenant_namespace,
             jwt_secret=self.jwt_secret,
             jwt_tenant_claim=self.jwt_tenant_claim,
         )
 
-    def start(self) -> None:
+    @staticmethod
+    def _file_mtime(path: str) -> float:
+        p = str(path or "").strip()
+        if not p:
+            return 0.0
+        try:
+            return float(os.path.getmtime(p))
+        except OSError:
+            return 0.0
+
+    def _current_tls_mtime(self) -> tuple[float, float, float]:
+        return (
+            self._file_mtime(self.tls_cert),
+            self._file_mtime(self.tls_key),
+            self._file_mtime(self.tls_client_ca),
+        )
+
+    def _append_rbac_audit(self, item: dict) -> None:
+        path = str(self.rbac_audit_log_path or "").strip()
+        if not path:
+            return
+        row = dict(item or {})
+        row["schema"] = "samurai.rbac.audit.v1"
+        line = json.dumps(row, ensure_ascii=True)
+        with self._audit_lock:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def _build_grpc_server(self):
         import grpc
 
         _, pb2_grpc = load_generated()
@@ -405,12 +489,14 @@ class MasterControlServer:
             default_role=self.rbac_default_role,
             jwt_secret=self.jwt_secret,
             jwt_role_claim=self.jwt_role_claim,
+            audit_logger=self._append_rbac_audit,
+            audit_success=self.rbac_audit_log_success,
         )
-        self._server = grpc.server(
+        srv = grpc.server(
             futures.ThreadPoolExecutor(max_workers=self.max_workers),
             interceptors=[interceptor],
         )
-        pb2_grpc.add_SamuraiControlServicer_to_server(self._servicer, self._server)
+        pb2_grpc.add_SamuraiControlServicer_to_server(self._servicer, srv)
         # Custom stream-unary endpoint for high-rate stats ingestion.
         pb2, _ = load_generated()
         stream_handlers = {
@@ -424,7 +510,7 @@ class MasterControlServer:
             "samurai.control.v1.SamuraiControl",
             stream_handlers,
         )
-        self._server.add_generic_rpc_handlers((stream_handler,))
+        srv.add_generic_rpc_handlers((stream_handler,))
         try:
             from grpc_health.v1 import health, health_pb2
             from grpc_health.v1 import health_pb2_grpc
@@ -432,12 +518,12 @@ class MasterControlServer:
             hs = health.HealthServicer()
             hs.set("", health_pb2.HealthCheckResponse.SERVING)
             hs.set("samurai.control.v1.SamuraiControl", health_pb2.HealthCheckResponse.SERVING)
-            health_pb2_grpc.add_HealthServicer_to_server(hs, self._server)
+            health_pb2_grpc.add_HealthServicer_to_server(hs, srv)
         except Exception:
             # Health service is optional; server remains functional without it.
             pass
         if self.insecure:
-            self._server.add_insecure_port(self.listen_addr)
+            srv.add_insecure_port(self.listen_addr)
         else:
             creds = load_tls_server_credentials(
                 self.tls_cert,
@@ -445,13 +531,68 @@ class MasterControlServer:
                 client_ca_path=self.tls_client_ca,
                 require_client_auth=self.require_client_auth,
             )
-            self._server.add_secure_port(self.listen_addr, creds)
-        self._server.start()
+            srv.add_secure_port(self.listen_addr, creds)
+        return srv
+
+    def _restart_tls_server(self) -> bool:
+        if self.insecure:
+            return False
+        try:
+            _ = load_tls_server_credentials(
+                self.tls_cert,
+                self.tls_key,
+                client_ca_path=self.tls_client_ca,
+                require_client_auth=self.require_client_auth,
+            )
+        except Exception:
+            return False
+        with self._server_lock:
+            old = self._server
+            if old is not None:
+                old.stop(0.5)
+            new_srv = self._build_grpc_server()
+            new_srv.start()
+            self._server = new_srv
+            self._tls_mtime = self._current_tls_mtime()
+        return True
+
+    def _tls_watcher_loop(self) -> None:
+        while not self._tls_watch_stop.wait(self.tls_reload_interval_s):
+            if not self.running or self.insecure:
+                continue
+            now_mtime = self._current_tls_mtime()
+            if now_mtime != self._tls_mtime:
+                _ = self._restart_tls_server()
+
+    def _start_tls_watcher(self) -> None:
+        if self.insecure or not self.tls_watch_files:
+            return
+        self._tls_watch_stop.clear()
+        self._tls_mtime = self._current_tls_mtime()
+        th = threading.Thread(target=self._tls_watcher_loop, daemon=True, name="MasterTLSWatch")
+        self._tls_watch_thread = th
+        th.start()
+
+    def _stop_tls_watcher(self) -> None:
+        self._tls_watch_stop.set()
+        th = self._tls_watch_thread
+        if th is not None:
+            th.join(timeout=2.0)
+        self._tls_watch_thread = None
+
+    def start(self) -> None:
+        with self._server_lock:
+            self._server = self._build_grpc_server()
+            self._server.start()
         self.running = True
+        self._start_tls_watcher()
 
     def stop(self, grace: float = 0.0) -> None:
-        if self._server is not None:
-            self._server.stop(grace)
+        self._stop_tls_watcher()
+        with self._server_lock:
+            if self._server is not None:
+                self._server.stop(grace)
+                self._server = None
         self.running = False
 
     @property

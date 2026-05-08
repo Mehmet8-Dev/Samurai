@@ -20,6 +20,7 @@ from .ha import (
     StaticLeaderElector,
 )
 from .management_api import ManagementAPIServer, create_management_app
+from .multimaster import RedisMultiMasterCoordinator
 from .proto import load_generated
 from .server import MasterControlServer
 from .telemetry import DistributedAggregator
@@ -59,6 +60,20 @@ def _chunk_counts(total_count: int, unit: int) -> list[int]:
         out.append(c)
         rem -= c
     return out
+
+
+def _job_target_region(job: dict) -> str:
+    return str((dict(job or {})).get("target_region", "") or "").strip().lower()
+
+
+def _should_delegate_job(job: dict, *, multi_master_enabled: bool, region_id: str) -> bool:
+    if not multi_master_enabled:
+        return False
+    rid = str(region_id or "").strip().lower()
+    if not rid:
+        return False
+    trg = _job_target_region(job)
+    return bool(trg and trg != rid)
 
 
 def _apply_distributed_kpi_gate(snapshot: dict, job_args: dict) -> dict:
@@ -164,6 +179,8 @@ def _distributed_state_to_prometheus(state: dict, prefix: str = "samurai_distrib
     workers = list(state.get("workers") or [])
     shards = list(state.get("shards") or [])
     ha = dict(state.get("ha") or {})
+    mm = dict(state.get("multi_master") or {})
+    mm_regions = list(state.get("multi_master_regions") or [])
 
     lines.append(f"{prefix}_workers_live {float(len(workers))}")
     lines.append(f"{prefix}_shards_live {float(len(shards))}")
@@ -189,6 +206,16 @@ def _distributed_state_to_prometheus(state: dict, prefix: str = "samurai_distrib
     leader_epoch = float(ha.get("leader_epoch", 0) or 0)
     lines.append(f'{prefix}_ha_is_leader{{mode="{mode}"}} {is_leader}')
     lines.append(f'{prefix}_ha_leader_epoch{{mode="{mode}"}} {leader_epoch}')
+    lines.append(f"{prefix}_multi_master_enabled {1.0 if bool(mm.get('enabled', False)) else 0.0}")
+    lines.append(f"{prefix}_multi_master_regions_live {float(len(mm_regions))}")
+    for rec in mm_regions:
+        try:
+            region = str(rec.get("region_id", "unknown") or "unknown").replace('"', '\\"')
+            node_id = str(rec.get("node_id", "") or "").replace('"', '\\"')
+            ts_ms = float(rec.get("ts_ms", 0) or 0)
+            lines.append(f'{prefix}_multi_master_region_heartbeat_ms{{region="{region}",node_id="{node_id}"}} {ts_ms}')
+        except (TypeError, ValueError):
+            continue
     out = "\n".join([x for x in lines if x])
     return out + ("\n" if out else "")
 
@@ -613,6 +640,16 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         getattr(args, "management_api_jwt_tenant_claim", "tenant_namespace") or "tenant_namespace"
     ).strip() or "tenant_namespace"
     mgmt_live_interval_ms = int(getattr(args, "management_api_live_interval_ms", 1000) or 1000)
+    control_rbac_audit_log_path = str(getattr(args, "control_rbac_audit_log_path", "") or "").strip()
+    control_rbac_audit_success = bool(getattr(args, "control_rbac_audit_success", False))
+    control_tls_watch_files = bool(getattr(args, "control_tls_watch_files", True))
+    control_tls_reload_interval_s = float(getattr(args, "control_tls_reload_interval_s", 2.0) or 2.0)
+    multi_master_enable = bool(getattr(args, "multi_master_enable", False))
+    multi_master_region_id = str(getattr(args, "multi_master_region_id", "") or "").strip().lower() or str(worker_region or "").strip().lower()
+    multi_master_redis_url = str(getattr(args, "multi_master_redis_url", "redis://127.0.0.1:6379/0") or "redis://127.0.0.1:6379/0").strip()
+    multi_master_namespace = str(getattr(args, "multi_master_namespace", "default") or "default").strip() or "default"
+    multi_master_heartbeat_ttl_s = int(getattr(args, "multi_master_heartbeat_ttl_s", 15) or 15)
+    multi_master_dequeue_max = int(getattr(args, "multi_master_dequeue_max", 3) or 3)
     ha_elector = None
     ha_wait_for_leader = bool(getattr(args, "ha_wait_for_leader", True))
     ha_acquire_timeout_s = float(getattr(args, "ha_acquire_timeout_s", 0.0) or 0.0)
@@ -686,6 +723,19 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             e.start_renew_loop(interval_seconds=renew_interval_s)
             ha_elector = e
     ha_state = dict(ha_elector.snapshot()) if ha_elector is not None else {"mode": "off", "is_leader": 1, "leader_epoch": 0}
+    mm_coordinator = RedisMultiMasterCoordinator(
+        enabled=multi_master_enable,
+        redis_url=multi_master_redis_url,
+        namespace=multi_master_namespace,
+        region_id=multi_master_region_id,
+        node_id=ha_node_id or "master",
+        heartbeat_ttl_s=multi_master_heartbeat_ttl_s,
+    )
+    if multi_master_enable and not bool(mm_coordinator.enabled):
+        mm_snap = dict(mm_coordinator.snapshot() or {})
+        utils.log_warning(
+            f"Multi-master coordinator disabled; reason={str(mm_snap.get('error', '') or 'unknown')}"
+        )
 
     discovery = EndpointDiscovery(
         manual_endpoints=str(getattr(args, "control_endpoints", "")),
@@ -730,10 +780,19 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         jwt_secret=control_jwt_secret,
         jwt_role_claim=control_jwt_role_claim,
         jwt_tenant_claim=control_jwt_tenant_claim,
+        rbac_audit_log_path=control_rbac_audit_log_path,
+        rbac_audit_log_success=control_rbac_audit_success,
+        tls_watch_files=control_tls_watch_files,
+        tls_reload_interval_s=control_tls_reload_interval_s,
     )
     mgmt_server = None
     latest_snapshot: dict = {}
-    current_job: dict = {"state": "idle", "job_id": "", "tenant_namespace": tenant_namespace}
+    current_job: dict = {
+        "state": "idle",
+        "job_id": "",
+        "tenant_namespace": tenant_namespace,
+        "region_id": multi_master_region_id,
+    }
     events: list[dict] = []
     events_max = max(10, int(getattr(args, "management_events_max", 200) or 200))
     event_seq = {"next": 1}
@@ -756,6 +815,11 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                     {"type": "event", "kind": str(kind), "payload": dict(item)},
                     wait_commit_s=0.4,
                 )
+            except Exception:
+                pass
+        if bool(mm_coordinator.enabled):
+            try:
+                _ = mm_coordinator.publish_event(dict(item))
             except Exception:
                 pass
 
@@ -796,6 +860,27 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
                 ha_state.update(dict(ha_elector.snapshot()))
             except Exception:
                 pass
+        mm_regions = []
+        mm_latest = []
+        if bool(mm_coordinator.enabled):
+            try:
+                _ = mm_coordinator.heartbeat(
+                    {
+                        "workers_count": int(len(workers)),
+                        "shards_count": int(len(shards)),
+                        "is_leader": int(ha_state.get("is_leader", 0) or 0),
+                    }
+                )
+            except Exception:
+                pass
+            try:
+                mm_regions = list(mm_coordinator.regions_state() or [])
+            except Exception:
+                mm_regions = []
+            try:
+                mm_latest = list(mm_coordinator.latest_region_snapshots() or [])
+            except Exception:
+                mm_latest = []
         return {
             "workers": workers,
             "workers_count": len(workers),
@@ -805,6 +890,9 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             "current_job": dict(current_job),
             "ha": dict(ha_state),
             "events": list(events),
+            "multi_master": dict(mm_coordinator.snapshot()),
+            "multi_master_regions": mm_regions,
+            "multi_master_latest": mm_latest,
         }
 
     def _abort_callback() -> dict:
@@ -874,6 +962,14 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         return 1
 
     jobs = _parse_job_queue(args)
+    if bool(mm_coordinator.enabled) and multi_master_region_id:
+        try:
+            delegated = list(mm_coordinator.dequeue_jobs(max_count=multi_master_dequeue_max) or [])
+        except Exception:
+            delegated = []
+        if delegated:
+            jobs.extend(delegated)
+            _push_event("multi_master_jobs_dequeued", count=int(len(delegated)), region_id=multi_master_region_id)
     multi_summary = []
     final_rc = 0
     distributed_metrics_textfile = str(getattr(args, "distributed_metrics_textfile", "") or "").strip()
@@ -886,6 +982,22 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         job_run.setdefault("target_region", target_region)
         job_run.setdefault("region_aware_routing", region_aware_routing)
         job_run.setdefault("cross_region_heartbeat_factor", cross_region_heartbeat_factor)
+        if _should_delegate_job(job_run, multi_master_enabled=bool(mm_coordinator.enabled), region_id=multi_master_region_id):
+            trg = _job_target_region(job_run)
+            enq_ok = False
+            try:
+                enq_ok = bool(mm_coordinator.enqueue_job(trg, job_run))
+            except Exception:
+                enq_ok = False
+            _push_event(
+                "multi_master_job_delegated",
+                replicate=False,
+                job_id=job_id,
+                from_region=multi_master_region_id,
+                to_region=trg,
+                enqueued=int(1 if enq_ok else 0),
+            )
+            continue
         if ha_elector is not None and hasattr(ha_elector, "leader_epoch"):
             try:
                 job_run["_leader_epoch"] = int(getattr(ha_elector, "leader_epoch", 0) or 0)
@@ -895,6 +1007,8 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
             job_run["_leader_epoch"] = 0
         current_job["state"] = "running"
         current_job["job_id"] = job_id
+        current_job["region_id"] = multi_master_region_id
+        current_job["target_region"] = _job_target_region(job_run) or target_region
         _push_event(
             "job_started",
             replicate=True,
@@ -908,6 +1022,11 @@ def run_distributed_master(args, parser, report_ctx, runtime_ctx) -> int:
         snap = _apply_per_shard_kpi_gate(snap, job_run)
         latest_snapshot.clear()
         latest_snapshot.update(dict(snap))
+        if bool(mm_coordinator.enabled):
+            try:
+                _ = mm_coordinator.publish_snapshot(dict(snap))
+            except Exception:
+                pass
         multi_summary.append(snap)
         utils.log_info(f"Distributed master summary: {snap}")
         if distributed_metrics_textfile:
