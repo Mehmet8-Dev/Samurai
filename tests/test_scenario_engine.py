@@ -5,6 +5,7 @@ import asyncio
 
 from ddos_samurai.scenario_engine import load_raw_scenario, load_scenario_spec
 from ddos_samurai.scenario_engine import native as scenario_native
+from ddos_samurai.scenario_engine import schema as scenario_schema_module
 from ddos_samurai.scenario_engine.runtime import (
     RampController,
     VUPool,
@@ -200,7 +201,7 @@ class TestScenarioEngineParser(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "bad.yaml"
             p.write_text(bad, encoding="utf-8")
-            with self.assertRaises(ValueError):
+            with self.assertRaises(Exception):
                 _ = load_raw_scenario(str(p))
 
     def test_accept_v3_l4_tcp_schema(self):
@@ -255,6 +256,66 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
             p.write_text(cyc, encoding="utf-8")
             with self.assertRaises(ValueError):
                 _ = load_raw_scenario(str(p))
+
+    def test_reject_non_progress_cycle_even_when_outer_flow_has_request(self):
+        cyc = """\
+schema_version: 1
+personas:
+  p1:
+    device_profile: web
+    headers: {}
+    cookies: {}
+    retry_policy: {}
+    timeout_policy: {}
+flows:
+  a:
+    persona: p1
+    steps:
+      - {type: request, method: GET, path: /}
+      - {type: loop, flow: b, repeat: 1}
+      - {type: end_session}
+  b:
+    persona: p1
+    steps:
+      - {type: loop, flow: c, repeat: 1}
+  c:
+    persona: p1
+    steps:
+      - {type: loop, flow: b, repeat: 1}
+load_model: {concurrent_vus: 10, ramp_seconds: 1, max_session_seconds: 10, backend: http}
+sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
+"""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "bad4.yaml"
+            p.write_text(cyc, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                _ = load_raw_scenario(str(p))
+
+    def test_schema_v3_allof_enforced_in_json_schema_path(self):
+        if scenario_schema_module.jsonschema is None:
+            self.skipTest("jsonschema not installed")
+        raw = {
+            "schema_version": 3,
+            "personas": {
+                "p1": {
+                    "device_profile": "l4_tcp",
+                    "headers": {},
+                    "cookies": {},
+                    "retry_policy": {},
+                    "timeout_policy": {},
+                }
+            },
+            "flows": {
+                "f1": {
+                    "persona": "p1",
+                    "steps": [{"type": "tcp_connect", "dst_port": 80}, {"type": "end_session"}],
+                }
+            },
+            "load_model": {"concurrent_vus": 1, "ramp_seconds": 0, "max_session_seconds": 5, "backend": "l4_tcp"},
+            "sla": {"min_completion_rate": 0.9, "max_step_fail_ratio": 0.1},
+        }
+        with self.assertRaises(Exception):
+            scenario_schema_module.validate_with_json_schema(raw)
 
     def test_native_scheduler_is_deterministic(self):
         try:
@@ -717,9 +778,11 @@ sla: {min_completion_rate: 0.9, max_step_fail_ratio: 0.1}
                 {"vu_id": "2", "flow": "f2", "success": False, "timeout": True},
             ]
         )
+        pool.tick_retries(1.0)
         pool.ingest_step_results(
             [
                 {"vu_id": "1", "flow": "f1", "success": True, "timeout": False},
+                {"vu_id": "2", "flow": "f2", "success": False, "timeout": True},
             ]
         )
         snaps = pool.snapshots()

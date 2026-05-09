@@ -134,9 +134,14 @@ class TestScenarioEngineFuzzIntegration(unittest.TestCase):
         )
         pool.spawn_until(0.0)
         pool.ingest_step_results([{"vu_id": "1", "flow": "f1", "success": False, "timeout": False, "on_failure": "retry"}])
-        snap = pool.snapshots()[0]
-        self.assertEqual(str(snap.state.value), "failed")
-        self.assertEqual(int(snap.retries_used), 1)
+        snap_retry = pool.snapshots()[0]
+        self.assertEqual(str(snap_retry.state.value), "retrying")
+        self.assertEqual(int(snap_retry.retries_used), 1)
+        moved = pool.tick_retries(1.0)
+        self.assertGreaterEqual(moved, 1)
+        pool.ingest_step_results([{"vu_id": "1", "flow": "f1", "success": True, "timeout": False}])
+        snap_done = pool.snapshots()[0]
+        self.assertEqual(str(snap_done.state.value), "completed")
 
     def test_vu_pool_skip_path(self):
         sessions = [{"flow": "f1", "events": [{"event_type": "http_request"}, {"event_type": "http_request"}]}]
