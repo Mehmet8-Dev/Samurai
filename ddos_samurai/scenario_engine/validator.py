@@ -146,22 +146,26 @@ def _validate_flow_graph(flows: dict[str, Any]) -> None:
         terminals[fname] = has_terminal_or_request
 
     visited: set[str] = set()
-    stack: set[str] = set()
+    stack: list[str] = []
+    in_stack: dict[str, int] = {}
 
     def _dfs(node: str) -> None:
-        if node in stack:
-            # cycle detected: ensure at least one node in cycle has progress step.
-            cycle_nodes = list(stack)
+        if node in in_stack:
+            # cycle detected: ensure at least one node in the concrete cycle has progress step.
+            start = int(in_stack[node])
+            cycle_nodes = list(stack[start:])
             if not any(terminals.get(x, False) for x in cycle_nodes):
                 raise ValueError(f"flow graph contains non-progress cycle: {','.join(cycle_nodes)}")
             return
         if node in visited:
             return
         visited.add(node)
-        stack.add(node)
+        in_stack[node] = len(stack)
+        stack.append(node)
         for nxt in edges.get(node, []):
             _dfs(nxt)
-        stack.remove(node)
+        stack.pop()
+        in_stack.pop(node, None)
 
     for fname in flows.keys():
         _dfs(fname)

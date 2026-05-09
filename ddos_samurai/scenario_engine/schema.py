@@ -243,6 +243,10 @@ def validate_with_json_schema(raw: dict[str, Any]) -> None:
     merged["properties"].update(dict(SCENARIO_SCHEMA_V2_PATCH.get("properties", {})))
     if schema_version >= 3:
         merged["properties"].update(dict(SCENARIO_SCHEMA_V3_PATCH.get("properties", {})))
+        merged_allof = list(merged.get("allOf", []) or [])
+        merged_allof.extend(list(SCENARIO_SCHEMA_V3_PATCH.get("allOf", []) or []))
+        if merged_allof:
+            merged["allOf"] = merged_allof
     jsonschema.validate(instance=raw, schema=merged)
 
 

@@ -462,7 +462,8 @@ class VUPool:
                     vu.state = VUState.FAILED
             if vu.expected_steps > 0 and vu.step_attempted >= vu.expected_steps:
                 if vu.state == VUState.RETRYING:
-                    vu.state = VUState.FAILED
+                    # Do not close the session while a retry is already scheduled.
+                    pass
                 elif vu.state != VUState.FAILED:
                     vu.state = VUState.COMPLETED
             if vu.state in {VUState.COMPLETED, VUState.FAILED}:

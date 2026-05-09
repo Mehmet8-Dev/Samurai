@@ -646,10 +646,21 @@ static py::dict packed_session_to_py_dict(const CompiledPackedSession& s) {
   return out;
 }
 
+static void ensure_flows_exist(
+    const ScenarioSpecNative& spec,
+    const std::vector<std::string>& flow_names) {
+  for (const auto& flow_name : flow_names) {
+    if (spec.flow_index.find(flow_name) == spec.flow_index.end()) {
+      throw std::runtime_error("flow not found: " + flow_name);
+    }
+  }
+}
+
 py::list compile_session_plans_packed_bulk_native(
     const ScenarioSpecNative& spec,
     const std::vector<std::string>& flow_names,
     const std::vector<std::uint64_t>& seeds) {
+  ensure_flows_exist(spec, flow_names);
   const std::size_t n = flow_names.size();
   std::vector<CompiledPackedSession> compiled{};
   compiled.resize(n);
@@ -658,9 +669,6 @@ py::list compile_session_plans_packed_bulk_native(
     for (std::size_t i = 0; i < n; ++i) {
       const std::string& flow_name = flow_names[i];
       auto itf = spec.flow_index.find(flow_name);
-      if (itf == spec.flow_index.end()) {
-        continue;
-      }
       std::mt19937_64 rng((i < seeds.size()) ? seeds[i] : static_cast<std::uint64_t>(i + 1));
       CompileState st{};
       st.rng = &rng;
@@ -691,6 +699,7 @@ py::dict compile_session_plans_packed_bulk_soa_native(
     const ScenarioSpecNative& spec,
     const std::vector<std::string>& flow_names,
     const std::vector<std::uint64_t>& seeds) {
+  ensure_flows_exist(spec, flow_names);
   const std::size_t n = flow_names.size();
   std::vector<std::uint32_t> session_offsets{};
   std::vector<std::string> session_flow{};
@@ -713,14 +722,6 @@ py::dict compile_session_plans_packed_bulk_soa_native(
     for (std::size_t i = 0; i < n; ++i) {
       const std::string& flow_name = flow_names[i];
       auto itf = spec.flow_index.find(flow_name);
-      if (itf == spec.flow_index.end()) {
-        session_flow.emplace_back(flow_name);
-        session_persona.emplace_back("");
-        session_step_attempted.push_back(0);
-        session_timeout_ms.push_back(0);
-        session_offsets.push_back(static_cast<std::uint32_t>(flat.event_kind.size()));
-        continue;
-      }
       std::mt19937_64 rng((i < seeds.size()) ? seeds[i] : static_cast<std::uint64_t>(i + 1));
       CompileState st{};
       st.rng = &rng;
