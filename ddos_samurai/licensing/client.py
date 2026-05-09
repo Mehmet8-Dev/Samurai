@@ -21,6 +21,7 @@ from .. import __version__
 from .cache import clear_cache, load_cache, save_cache
 from .constants import (
     DEACTIVATE_ENDPOINT,
+    EXEC_GRANT_ENDPOINT,
     HEARTBEAT_ENDPOINT,
     LICENSE_KEY_FILE,
     LICENSE_KEY_PATTERN,
@@ -81,6 +82,17 @@ def _resolve_key(
         except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             pass
 
+    return None
+
+
+def resolve_license_key(
+    key: Optional[str] = None,
+    key_file: Optional[str] = None,
+) -> Optional[str]:
+    """Public wrapper for key resolution used by runtime gates."""
+    out = _resolve_key(key=key, key_file=key_file)
+    if out:
+        return str(out).strip().upper()
     return None
 
 
@@ -348,3 +360,40 @@ def deactivate_device(
         return True, str(resp.get("message", "Cihaz başarıyla kaldırıldı."))
     except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
         return False, f"Sunucuya ulaşılamadı: {exc}"
+
+
+def request_execution_grant(
+    *,
+    license_key: str,
+    hardware_id: str,
+    session_id: str,
+    attack_vector: str,
+    compute_backend: str,
+    role: str,
+    required_features: list[str],
+) -> tuple[bool, dict]:
+    """Request short-lived server-side execution grant for critical capabilities."""
+    if is_dev_mode():
+        return True, {
+            "grant_token": "dev-mode-grant",
+            "expires_at": "dev-mode",
+            "required_features": list(required_features or []),
+        }
+    try:
+        resp = _post_json(EXEC_GRANT_ENDPOINT, {
+            "license_key": str(license_key or "").strip().upper(),
+            "hardware_id": str(hardware_id or "").strip(),
+            "session_id": str(session_id or "").strip(),
+            "attack_vector": str(attack_vector or "").strip().lower(),
+            "compute_backend": str(compute_backend or "").strip().lower(),
+            "role": str(role or "").strip().lower(),
+            "required_features": [str(x or "").strip() for x in list(required_features or []) if str(x or "").strip()],
+            "app_version": __version__,
+        })
+    except (URLError, OSError):
+        return False, {"reason": "license_server_unreachable"}
+    if bool(resp.get("error")):
+        return False, {"reason": str(resp.get("reason", "exec_grant_failed"))}
+    if not bool(resp.get("granted", False)):
+        return False, {"reason": str(resp.get("reason", "exec_grant_denied"))}
+    return True, dict(resp or {})

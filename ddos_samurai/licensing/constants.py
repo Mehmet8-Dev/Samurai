@@ -14,6 +14,7 @@ API_VERSION: str = "v1"
 VALIDATE_ENDPOINT: str = f"/api/{API_VERSION}/license/validate"
 HEARTBEAT_ENDPOINT: str = f"/api/{API_VERSION}/license/heartbeat"
 DEACTIVATE_ENDPOINT: str = f"/api/{API_VERSION}/license/deactivate"
+EXEC_GRANT_ENDPOINT: str = f"/api/{API_VERSION}/license/exec-grant"
 
 # ── Timeouts ────────────────────────────────────────────────────────────────
 REQUEST_TIMEOUT_S: int = int(os.getenv("SAMURAI_LICENSE_TIMEOUT_S", "10"))

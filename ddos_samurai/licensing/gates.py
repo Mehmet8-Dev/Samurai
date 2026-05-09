@@ -36,6 +36,8 @@ from .features import (
     LicenseResult,
     has_feature,
 )
+from .client import request_execution_grant, resolve_license_key
+from .hwid import get_hardware_id
 
 # ── Vektör → Feature Mapping ───────────────────────────────────────────────
 
@@ -55,6 +57,18 @@ _VECTOR_FEATURE_MAP: dict[str, str] = {
 
 # Community tier'da izin verilen vektörler (feature gerekmez)
 _COMMUNITY_ALLOWED_VECTORS = {"basic", "dns"}
+
+_CRITICAL_FEATURES = {
+    FEATURE_GPU_ENGINE,
+    FEATURE_AF_XDP,
+    FEATURE_L7_HTTP2,
+    FEATURE_L7_QUIC,
+    FEATURE_L7_WEBSOCKET,
+    FEATURE_NINJA_MODE,
+    FEATURE_AMPLIFICATION,
+    FEATURE_SPOOFING,
+    FEATURE_CUSTOM_TCP,
+}
 
 
 # ── Enforcement ─────────────────────────────────────────────────────────────
@@ -227,6 +241,70 @@ def enforce_feature_gates(args, license_result: LicenseResult) -> list[str]:
                 f"PPS lisans limitine ({int(max_pps)}) düşürüldü. (İstenen: {int(requested_rps)})"
             )
             args.rps = max_pps
+
+    # ── 12. Critical Capabilities: Server-Side Control Plane Gate ──────
+    required_critical: set[str] = set()
+    if compute_backend == "cuda":
+        required_critical.add(FEATURE_GPU_ENGINE)
+    if xdp_enable or xdp_interface:
+        required_critical.add(FEATURE_AF_XDP)
+    if custom_tcp_mode in ("auto", "required"):
+        required_critical.add(FEATURE_CUSTOM_TCP)
+    if bool(getattr(args, "ninja_mode", False)):
+        required_critical.add(FEATURE_NINJA_MODE)
+    if spoof_enabled:
+        required_critical.add(FEATURE_SPOOFING)
+    if attack_vector in {"http2"}:
+        required_critical.add(FEATURE_L7_HTTP2)
+    elif attack_vector in {"quic"}:
+        required_critical.add(FEATURE_L7_QUIC)
+    elif attack_vector in {"websocket"}:
+        required_critical.add(FEATURE_L7_WEBSOCKET)
+    elif attack_vector in {"ntp-amp", "ssdp-amp", "dns-amp", "memcached-amp", "ldap-amp"}:
+        required_critical.add(FEATURE_AMPLIFICATION)
+    required_critical = {f for f in required_critical if f in _CRITICAL_FEATURES}
+
+    if required_critical:
+        if not hasattr(args, "role"):
+            return warnings
+        if bool(getattr(license_result, "offline", False)):
+            raise LicenseGateError(
+                "Kritik yetenekler offline cache ile calistirilamaz. SaaS control-plane online dogrulama zorunludur.",
+                upgrade_hint="Internete cikis + lisans sunucusu erisimi saglayip tekrar deneyin.",
+            )
+        resolved_key = resolve_license_key(
+            key=str(getattr(args, "license_key", "") or ""),
+            key_file=str(getattr(args, "license_file", "") or ""),
+        )
+        if not resolved_key:
+            raise LicenseGateError(
+                "Server-side execution grant icin lisans anahtari cozumlenemedi.",
+                upgrade_hint="--license-key / --license-file / SAMURAI_LICENSE_KEY tanimlayin.",
+            )
+        ok_grant, payload = request_execution_grant(
+            license_key=resolved_key,
+            hardware_id=get_hardware_id(),
+            session_id=str(getattr(license_result, "session_id", "") or ""),
+            attack_vector=attack_vector,
+            compute_backend=compute_backend,
+            role=str(getattr(args, "role", "standalone") or "standalone"),
+            required_features=sorted(required_critical),
+        )
+        if not ok_grant:
+            raise LicenseGateError(
+                f"Kritik yetenekler icin server-side execution grant alinamadi: {str((payload or {}).get('reason', 'denied'))}",
+                upgrade_hint="SaaS control-plane ve abonelik durumunu kontrol edin.",
+            )
+        license_result.exec_grant_token = str((payload or {}).get("grant_token", "") or "")
+        license_result.exec_grant_expires = str((payload or {}).get("expires_at", "") or "")
+        if not license_result.exec_grant_token:
+            raise LicenseGateError(
+                "Server-side execution grant token bos dondu.",
+                upgrade_hint="Lisans sunucusu execution grant endpointini kontrol edin.",
+            )
+        warnings.append(
+            f"Kritik yetenekler server-side grant ile etkinlesti (expires={license_result.exec_grant_expires or 'n/a'})."
+        )
 
     return warnings
 

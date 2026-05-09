@@ -43,6 +43,8 @@ class LicenseResult:
     reason: str = ""
     session_id: str = ""
     offline: bool = False  # Offline cache'ten mi geldi?
+    exec_grant_token: str = ""
+    exec_grant_expires: str = ""
 
 
 # ── Feature Tanımları ───────────────────────────────────────────────────────
