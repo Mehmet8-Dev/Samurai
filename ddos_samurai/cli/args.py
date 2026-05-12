@@ -1356,9 +1356,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--gpu-rdma-mode",
-        choices=["auto", "direct", "host_staging"],
+        choices=["auto", "direct", "host_staging", "doca_gpunetio"],
         default=str(os.environ.get("SAMURAI_GPU_RDMA_MODE", "auto") or "auto").strip().lower(),
-        help="GPU RDMA modu: auto|direct|host_staging.",
+        help="GPU RDMA modu: auto|direct|host_staging|doca_gpunetio.",
     )
     parser.add_argument(
         "--gpu-rdma-strict",

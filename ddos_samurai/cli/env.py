@@ -70,7 +70,7 @@ def sync_runtime_env(args) -> dict[str, object]:
     os.environ["SAMURAI_GPU_CLASSIFIER_RUNTIME"] = str(getattr(args, "gpu_classifier_runtime", "tensorrt") or "tensorrt")
     os.environ["SAMURAI_GPU_CLASSIFIER_ENGINE_PATH"] = str(getattr(args, "gpu_classifier_engine_path", "") or "")
     gpu_rdma_mode = str(getattr(args, "gpu_rdma_mode", "auto") or "auto").strip().lower()
-    if gpu_rdma_mode not in {"auto", "direct", "host_staging"}:
+    if gpu_rdma_mode not in {"auto", "direct", "host_staging", "doca_gpunetio"}:
         gpu_rdma_mode = "auto"
     os.environ["SAMURAI_GPU_RDMA_MODE"] = gpu_rdma_mode
     os.environ["SAMURAI_GPU_RDMA_STRICT"] = "1" if bool(getattr(args, "gpu_rdma_strict", False)) else "0"
