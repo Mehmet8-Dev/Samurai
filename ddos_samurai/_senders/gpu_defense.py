@@ -33,6 +33,10 @@ def _defense_strict() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _rdma_mode() -> str:
+    return str(os.environ.get("SAMURAI_GPU_RDMA_MODE", "auto") or "auto").strip().lower()
+
+
 def _build_packet_views(mv: memoryview, *, count: int, packet_size: int, packet_stride: int) -> list[memoryview]:
     out: list[memoryview] = []
     stride = int(packet_stride or 0)
@@ -90,6 +94,45 @@ def classify_packets_if_enabled(
                 "gpu_classifier_invoked": 0,
                 "gpu_classifier_status": "init_failed",
                 "gpu_classifier_error": f"init_failed:{type(exc).__name__}",
+            }
+            out["gpu_classifier_hard_fail"] = 1 if _defense_strict() else 0
+            return out
+
+    if _rdma_mode() == "doca_gpunetio":
+        batch_max = max(1, _env_int("SAMURAI_GPU_BATCH_MAX", 1024))
+        rx_packets = max(1, _env_int("SAMURAI_GPU_DOCA_RX_BURST_PACKETS", batch_max))
+        rx_max_packet_size = max(64, _env_int("SAMURAI_GPU_DOCA_RX_MAX_PACKET_SIZE", 2048))
+        try:
+            labels_np, conf_np, reason_last = backend.classify_from_ingress(
+                max_packets=min(batch_max, rx_packets),
+                max_packet_size=rx_max_packet_size,
+            )
+            suspicious = int(np.sum(labels_np != 0)) if labels_np.size > 0 else 0
+            out = {
+                "gpu_defense_mode": "on",
+                "gpu_classifier_invoked": 1,
+                "gpu_classifier_status": "ok",
+                "gpu_classifier_reason": str(reason_last or "none"),
+                "gpu_classifier_total": int(labels_np.size),
+                "gpu_classifier_suspicious": int(suspicious),
+                "gpu_classifier_benign": int(max(0, int(labels_np.size) - suspicious)),
+                "gpu_classifier_confidence_mean": float(np.mean(conf_np)) if conf_np.size > 0 else 0.0,
+                "gpu_classifier_confidence_max": float(np.max(conf_np)) if conf_np.size > 0 else 0.0,
+            }
+            stats = backend.read_classifier_stats()
+            if isinstance(stats, dict):
+                for k, v in stats.items():
+                    key = str(k).strip()
+                    if not key:
+                        continue
+                    out[f"gpu_classifier_{key}"] = v
+            return out
+        except _RECOVERABLE_ERRORS as exc:
+            out = {
+                "gpu_defense_mode": "on",
+                "gpu_classifier_invoked": 1,
+                "gpu_classifier_status": "classify_failed",
+                "gpu_classifier_error": f"classify_failed:{type(exc).__name__}",
             }
             out["gpu_classifier_hard_fail"] = 1 if _defense_strict() else 0
             return out

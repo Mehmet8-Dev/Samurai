@@ -558,6 +558,15 @@ def _load_defense_lib() -> ctypes.CDLL | None:
         ctypes.POINTER(ctypes.c_char_p),
     ]
     lib.samurai_gpu_packet_classify_batch.restype = ctypes.c_int
+    lib.samurai_gpu_packet_classify_from_ingress.argtypes = [
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_char_p),
+    ]
+    lib.samurai_gpu_packet_classify_from_ingress.restype = ctypes.c_int
     lib.samurai_gpu_packet_read_classifier_stats.argtypes = []
     lib.samurai_gpu_packet_read_classifier_stats.restype = ctypes.c_char_p
     lib.samurai_gpu_packet_defense_shutdown.argtypes = []
@@ -1769,6 +1778,37 @@ class DefenseCUDABackend:
         if rc != 0:
             raise GPUPacketError(reason or self._last_error() or "samurai_gpu_packet_classify_batch failed")
         return labels, confidences, (reason or "none")
+
+    def classify_from_ingress(
+        self,
+        *,
+        max_packets: int = 1024,
+        max_packet_size: int = 2048,
+    ) -> tuple[np.ndarray, np.ndarray, str]:
+        max_packets_i = max(1, int(max_packets))
+        max_packet_size_i = max(64, int(max_packet_size))
+        out_count = ctypes.c_int32(0)
+        labels = np.empty((max_packets_i,), dtype=np.int32)
+        confidences = np.empty((max_packets_i,), dtype=np.float32)
+        out_reason = ctypes.c_char_p()
+        rc = int(
+            self._lib.samurai_gpu_packet_classify_from_ingress(
+                ctypes.c_int32(max_packets_i),
+                ctypes.c_int32(max_packet_size_i),
+                ctypes.byref(out_count),
+                labels.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                confidences.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                ctypes.byref(out_reason),
+            )
+            or 0
+        )
+        reason = ""
+        if out_reason.value:
+            reason = out_reason.value.decode("utf-8", errors="replace")
+        if rc != 0:
+            raise GPUPacketError(reason or self._last_error() or "samurai_gpu_packet_classify_from_ingress failed")
+        n = max(0, min(int(out_count.value), max_packets_i))
+        return labels[:n].copy(), confidences[:n].copy(), (reason or "none")
 
     def read_classifier_stats(self) -> dict[str, Any]:
         raw = self._lib.samurai_gpu_packet_read_classifier_stats()
