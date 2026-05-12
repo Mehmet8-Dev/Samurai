@@ -768,6 +768,49 @@ class TestPersistentTxBackendPreflight(unittest.TestCase):
         with patch.dict(os.environ, {"SAMURAI_GPU_TX_BACKEND": "af_xdp", "SAMURAI_GPU_TX_BACKEND_STRICT": "1"}, clear=False):
             self._assert_preflight_fails(parser, args)
 
+    def test_persistent_stream_doca_requires_device_name(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--gpu-kernel-mode",
+                "persistent",
+                "--gpu-stream-api",
+                "stream",
+                "--xdp-interface",
+                "eth0",
+            ]
+        )
+        with patch.dict(
+            os.environ,
+            {"SAMURAI_GPU_TX_BACKEND": "doca_gpunetio", "SAMURAI_GPU_TX_BACKEND_STRICT": "1"},
+            clear=False,
+        ):
+            os.environ.pop("SAMURAI_GPU_DOCA_DEVICE", None)
+            self._assert_preflight_fails(parser, args)
+
+    def test_persistent_stream_doca_accepts_explicit_device_name(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--gpu-kernel-mode",
+                "persistent",
+                "--gpu-stream-api",
+                "stream",
+                "--xdp-interface",
+                "eth0",
+            ]
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "SAMURAI_GPU_TX_BACKEND": "doca_gpunetio",
+                "SAMURAI_GPU_TX_BACKEND_STRICT": "1",
+                "SAMURAI_GPU_DOCA_DEVICE": "mlx5_0",
+            },
+            clear=False,
+        ):
+            cli._preflight_persistent_tx_backend(parser, args)
+
 
 class TestRootGateRegression(unittest.TestCase):
     """Regression tests for the vector-based root privilege check (trex_path Görev #5).
