@@ -22,6 +22,7 @@ class _FakeDefenseLib:
     def __init__(self):
         self.rc_init = 0
         self.rc_classify = 0
+        self.rc_classify_ingress = 0
         self.rc_shutdown = 0
         self.last_error = b""
         self.last_reason = b"none"
@@ -61,6 +62,33 @@ class _FakeDefenseLib:
             '"gpu_rdma_direct_active":1,"gpu_rdma_fallback_reason":"none",'
             '"gpu_cls_confidence_mean":0.75}'
         ).encode("utf-8")
+
+    def samurai_gpu_packet_classify_from_ingress(
+        self,
+        max_packets,
+        max_packet_size,
+        out_packet_count,
+        out_labels,
+        out_confidences,
+        out_reason,
+    ):
+        max_n = max(0, _scalar(max_packets))
+        n = min(max_n, 3)
+        labels = np.ctypeslib.as_array(ctypes.cast(out_labels, ctypes.POINTER(ctypes.c_int32)), shape=(max_n,))
+        confidences = np.ctypeslib.as_array(ctypes.cast(out_confidences, ctypes.POINTER(ctypes.c_float)), shape=(max_n,))
+        for i in range(n):
+            labels[i] = 1 if i % 2 else 0
+            confidences[i] = np.float32(0.8 if labels[i] == 1 else 0.55)
+        ctypes.cast(out_packet_count, ctypes.POINTER(ctypes.c_int32)).contents.value = int(n)
+        ctypes.cast(out_reason, ctypes.POINTER(ctypes.c_char_p)).contents.value = self.last_reason
+        self.calls.append(
+            {
+                "name": "classify_from_ingress",
+                "max_packets": _scalar(max_packets),
+                "max_packet_size": _scalar(max_packet_size),
+            }
+        )
+        return int(self.rc_classify_ingress)
 
     def samurai_gpu_packet_defense_shutdown(self):
         self.calls.append({"name": "shutdown"})
@@ -110,6 +138,17 @@ def test_defense_backend_reason_code_on_failure(monkeypatch):
     b = backend.DefenseCUDABackend()
     with pytest.raises(backend.GPUPacketError, match="rdma_strict_fail"):
         b.classify_batch([b"x" * 60])
+
+
+def test_defense_backend_classify_from_ingress(monkeypatch):
+    fake = _FakeDefenseLib()
+    monkeypatch.setattr(backend, "_DEFENSE_LIB", fake, raising=True)
+
+    b = backend.DefenseCUDABackend()
+    labels, confidences, reason = b.classify_from_ingress(max_packets=8, max_packet_size=2048)
+    assert reason == "none"
+    assert labels.tolist() == [0, 1, 0]
+    assert np.allclose(confidences, np.array([0.55, 0.8, 0.55], dtype=np.float32), atol=1e-6)
 
 
 def test_defense_backend_requires_library(monkeypatch):
