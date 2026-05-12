@@ -514,6 +514,13 @@ int samurai_gpu_packet_classify_batch(
     int32_t* out_labels,
     float* out_confidences,
     const char** out_reason);
+int samurai_gpu_packet_classify_from_ingress(
+    int32_t max_packets,
+    int32_t max_packet_size,
+    int32_t* out_packet_count,
+    int32_t* out_labels,
+    float* out_confidences,
+    const char** out_reason);
 const char* samurai_gpu_packet_read_classifier_stats();
 int samurai_gpu_packet_defense_shutdown();
 const char* samurai_gpu_packet_defense_last_error();

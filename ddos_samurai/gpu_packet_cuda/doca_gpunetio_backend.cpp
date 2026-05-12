@@ -18,6 +18,7 @@ namespace {
 using doca_error_t = int;
 constexpr doca_error_t kDocaSuccess = 0;
 constexpr uint32_t kDocaEthTxqTypeRegular = 0u;
+constexpr uint32_t kDocaEthRxqTypeRegular = 0u;
 
 union doca_data {
   void* ptr;
@@ -35,9 +36,12 @@ struct doca_mmap;
 struct doca_eth_txq;
 struct doca_gpu_eth_txq;
 struct doca_eth_txq_task_send;
+struct doca_eth_rxq;
+struct doca_eth_rxq_task_recv;
 struct doca_task;
 
 using TxqTaskSendCb = void (*)(doca_eth_txq_task_send* task, doca_data task_user_data, doca_data ctx_user_data);
+using RxqTaskRecvCb = void (*)(doca_eth_rxq_task_recv* task, doca_data task_user_data, doca_data ctx_user_data);
 
 struct DocaApi {
   void* lib_core = nullptr;
@@ -86,6 +90,10 @@ struct DocaApi {
       size_t len,
       doca_buf** buf) = nullptr;
   doca_error_t (*doca_buf_dec_refcount)(doca_buf* buf, uint16_t* refcount) = nullptr;
+  doca_error_t (*doca_buf_get_data)(const doca_buf* buf, void** data) = nullptr;
+  doca_error_t (*doca_buf_get_data_len)(const doca_buf* buf, size_t* data_len) = nullptr;
+  doca_error_t (*doca_buf_get_head)(const doca_buf* buf, void** head) = nullptr;
+  doca_error_t (*doca_buf_get_len)(const doca_buf* buf, size_t* len) = nullptr;
 
   doca_error_t (*doca_eth_txq_create)(doca_dev* dev, uint32_t max_burst_size, doca_eth_txq** eth_txq) = nullptr;
   doca_error_t (*doca_eth_txq_destroy)(doca_eth_txq* eth_txq) = nullptr;
@@ -108,6 +116,28 @@ struct DocaApi {
       doca_eth_txq_task_send** task_send) = nullptr;
   doca_task* (*doca_eth_txq_task_send_as_doca_task)(doca_eth_txq_task_send* task) = nullptr;
   doca_error_t (*doca_eth_txq_task_send_get_pkt)(doca_eth_txq_task_send* task, doca_buf** pkt) = nullptr;
+
+  doca_error_t (*doca_eth_rxq_create)(
+      doca_dev* dev,
+      uint32_t max_burst_size,
+      uint32_t max_packet_size,
+      doca_eth_rxq** eth_rxq) = nullptr;
+  doca_error_t (*doca_eth_rxq_destroy)(doca_eth_rxq* eth_rxq) = nullptr;
+  doca_error_t (*doca_eth_rxq_set_type)(doca_eth_rxq* eth_rxq, uint32_t type) = nullptr;
+  doca_error_t (*doca_eth_rxq_apply_queue_id)(doca_eth_rxq* eth_rxq, uint16_t queue_id) = nullptr;
+  doca_ctx* (*doca_eth_rxq_as_doca_ctx)(doca_eth_rxq* eth_rxq) = nullptr;
+  doca_error_t (*doca_eth_rxq_task_recv_set_conf)(
+      doca_eth_rxq* eth_rxq,
+      RxqTaskRecvCb task_completion_cb,
+      RxqTaskRecvCb task_error_cb,
+      uint32_t task_recv_num) = nullptr;
+  doca_error_t (*doca_eth_rxq_task_recv_allocate_init)(
+      doca_eth_rxq* eth_rxq,
+      doca_buf* pkt,
+      doca_data user_data,
+      doca_eth_rxq_task_recv** task_recv) = nullptr;
+  doca_task* (*doca_eth_rxq_task_recv_as_doca_task)(doca_eth_rxq_task_recv* task_recv) = nullptr;
+  doca_error_t (*doca_eth_rxq_task_recv_get_pkt)(doca_eth_rxq_task_recv* task_recv, doca_buf** pkt) = nullptr;
 
   doca_error_t (*doca_task_submit)(doca_task* task) = nullptr;
   doca_error_t (*doca_task_get_status)(const doca_task* task) = nullptr;
@@ -140,8 +170,37 @@ struct BackendTxqHandle {
   uint64_t tx_drops = 0u;
 };
 
+struct BackendRxqHandle {
+  int handle = -1;
+  std::string iface;
+  std::string device_name;
+  int gpu_id = 0;
+  int queue_id = 0;
+
+  doca_dev* dev = nullptr;
+  doca_pe* pe = nullptr;
+  doca_eth_rxq* rxq = nullptr;
+  doca_ctx* ctx = nullptr;
+  doca_mmap* mmap = nullptr;
+  doca_buf_inventory* buf_inv = nullptr;
+
+  uint32_t inflight = 0u;
+  uint32_t task_slots = 1024u;
+  uint32_t max_progress_loops = 200000u;
+  uint32_t max_packet_size = 2048u;
+
+  std::vector<uint8_t*> pkt_storage{};
+  std::vector<doca_buf*> completed_pkts{};
+
+  uint64_t rx_packets = 0u;
+  uint64_t rx_bytes = 0u;
+  uint64_t rx_errors = 0u;
+  uint64_t rx_drops = 0u;
+};
+
 std::mutex g_lock;
 std::unordered_map<int, BackendTxqHandle> g_handles;
+std::unordered_map<int, BackendRxqHandle> g_rx_handles;
 int g_next_handle = 1;
 
 std::mutex g_api_lock;
@@ -299,6 +358,10 @@ inline bool ensure_doca_api(std::string& why) {
       !resolve_symbol(libs, "doca_buf_inventory_start", g_doca.doca_buf_inventory_start, sym_why) ||
       !resolve_symbol(libs, "doca_buf_inventory_buf_get_by_addr", g_doca.doca_buf_inventory_buf_get_by_addr, sym_why) ||
       !resolve_symbol(libs, "doca_buf_dec_refcount", g_doca.doca_buf_dec_refcount, sym_why) ||
+      !resolve_symbol(libs, "doca_buf_get_data", g_doca.doca_buf_get_data, sym_why) ||
+      !resolve_symbol(libs, "doca_buf_get_data_len", g_doca.doca_buf_get_data_len, sym_why) ||
+      !resolve_symbol(libs, "doca_buf_get_head", g_doca.doca_buf_get_head, sym_why) ||
+      !resolve_symbol(libs, "doca_buf_get_len", g_doca.doca_buf_get_len, sym_why) ||
       !resolve_symbol(libs, "doca_eth_txq_create", g_doca.doca_eth_txq_create, sym_why) ||
       !resolve_symbol(libs, "doca_eth_txq_destroy", g_doca.doca_eth_txq_destroy, sym_why) ||
       !resolve_symbol(libs, "doca_eth_txq_set_type", g_doca.doca_eth_txq_set_type, sym_why) ||
@@ -315,6 +378,18 @@ inline bool ensure_doca_api(std::string& why) {
           sym_why) ||
       !resolve_symbol(libs, "doca_eth_txq_task_send_as_doca_task", g_doca.doca_eth_txq_task_send_as_doca_task, sym_why) ||
       !resolve_symbol(libs, "doca_eth_txq_task_send_get_pkt", g_doca.doca_eth_txq_task_send_get_pkt, sym_why) ||
+      !resolve_symbol(libs, "doca_eth_rxq_create", g_doca.doca_eth_rxq_create, sym_why) ||
+      !resolve_symbol(libs, "doca_eth_rxq_destroy", g_doca.doca_eth_rxq_destroy, sym_why) ||
+      !resolve_symbol(libs, "doca_eth_rxq_set_type", g_doca.doca_eth_rxq_set_type, sym_why) ||
+      !resolve_symbol(libs, "doca_eth_rxq_as_doca_ctx", g_doca.doca_eth_rxq_as_doca_ctx, sym_why) ||
+      !resolve_symbol(libs, "doca_eth_rxq_task_recv_set_conf", g_doca.doca_eth_rxq_task_recv_set_conf, sym_why) ||
+      !resolve_symbol(
+          libs,
+          "doca_eth_rxq_task_recv_allocate_init",
+          g_doca.doca_eth_rxq_task_recv_allocate_init,
+          sym_why) ||
+      !resolve_symbol(libs, "doca_eth_rxq_task_recv_as_doca_task", g_doca.doca_eth_rxq_task_recv_as_doca_task, sym_why) ||
+      !resolve_symbol(libs, "doca_eth_rxq_task_recv_get_pkt", g_doca.doca_eth_rxq_task_recv_get_pkt, sym_why) ||
       !resolve_symbol(libs, "doca_task_submit", g_doca.doca_task_submit, sym_why) ||
       !resolve_symbol(libs, "doca_task_get_status", g_doca.doca_task_get_status, sym_why) ||
       !resolve_symbol(libs, "doca_task_free", g_doca.doca_task_free, sym_why)) {
@@ -373,6 +448,49 @@ inline void destroy_backend_txq_unlocked(BackendTxqHandle& h) {
   }
 }
 
+inline void destroy_backend_rxq_unlocked(BackendRxqHandle& h) {
+  if (!g_doca.loaded) {
+    return;
+  }
+  if (h.ctx && g_doca.doca_ctx_stop) {
+    (void)g_doca.doca_ctx_stop(h.ctx);
+  }
+  h.completed_pkts.clear();
+  if (h.buf_inv) {
+    if (g_doca.doca_buf_inventory_stop) {
+      (void)g_doca.doca_buf_inventory_stop(h.buf_inv);
+    }
+    (void)g_doca.doca_buf_inventory_destroy(h.buf_inv);
+    h.buf_inv = nullptr;
+  }
+  if (h.mmap) {
+    if (g_doca.doca_mmap_stop) {
+      (void)g_doca.doca_mmap_stop(h.mmap);
+    }
+    (void)g_doca.doca_mmap_destroy(h.mmap);
+    h.mmap = nullptr;
+  }
+  if (h.rxq) {
+    (void)g_doca.doca_eth_rxq_destroy(h.rxq);
+    h.rxq = nullptr;
+    h.ctx = nullptr;
+  }
+  if (h.pe) {
+    (void)g_doca.doca_pe_destroy(h.pe);
+    h.pe = nullptr;
+  }
+  if (h.dev) {
+    (void)g_doca.doca_dev_close(h.dev);
+    h.dev = nullptr;
+  }
+  for (uint8_t* p : h.pkt_storage) {
+    if (p) {
+      std::free(p);
+    }
+  }
+  h.pkt_storage.clear();
+}
+
 static void task_send_common_cb(
     doca_eth_txq_task_send* task_send,
     doca_data task_user_data,
@@ -396,6 +514,41 @@ static void task_send_common_cb(
       g_doca.doca_eth_txq_task_send_get_pkt(task_send, &pkt) == kDocaSuccess &&
       pkt && g_doca.doca_buf_dec_refcount) {
     (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+  }
+  if (task && g_doca.doca_task_free) {
+    g_doca.doca_task_free(task);
+  }
+  if (h->inflight > 0u) {
+    h->inflight -= 1u;
+  }
+}
+
+static void task_recv_common_cb(
+    doca_eth_rxq_task_recv* task_recv,
+    doca_data task_user_data,
+    doca_data ctx_user_data) {
+  (void)task_user_data;
+  if (!task_recv || !ctx_user_data.ptr) {
+    return;
+  }
+  auto* h = reinterpret_cast<BackendRxqHandle*>(ctx_user_data.ptr);
+  doca_task* task = g_doca.doca_eth_rxq_task_recv_as_doca_task(task_recv);
+  doca_error_t task_status = kDocaSuccess;
+  if (task && g_doca.doca_task_get_status) {
+    task_status = g_doca.doca_task_get_status(task);
+  }
+  doca_buf* pkt = nullptr;
+  if (g_doca.doca_eth_rxq_task_recv_get_pkt) {
+    (void)g_doca.doca_eth_rxq_task_recv_get_pkt(task_recv, &pkt);
+  }
+  if (task_status == kDocaSuccess && pkt) {
+    h->completed_pkts.push_back(pkt);
+  } else {
+    h->rx_errors += 1u;
+    h->rx_drops += 1u;
+    if (pkt && g_doca.doca_buf_dec_refcount) {
+      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+    }
   }
   if (task && g_doca.doca_task_free) {
     g_doca.doca_task_free(task);
@@ -827,5 +980,359 @@ extern "C" int samurai_doca_backend_get_txq_mkey_be(int handle, uint32_t* out_mk
     return -1;
   }
   *out_mkey_be = it->second.txq_mkey_be;
+  return 0;
+}
+
+extern "C" int samurai_doca_backend_create_rxq(
+    const char* iface,
+    const char* device_name,
+    int gpu_id,
+    int queue_id,
+    int* out_handle,
+    char* err,
+    size_t err_len) {
+  if (!iface || !*iface || !device_name || !*device_name || !out_handle || queue_id < 0 || gpu_id < 0) {
+    write_err(err, err_len, "invalid arguments for samurai_doca_backend_create_rxq");
+    return -1;
+  }
+  std::string why;
+  if (!ensure_doca_api(why)) {
+    write_err(err, err_len, std::string("DOCA runtime unavailable: ") + why);
+    return -1;
+  }
+
+  BackendRxqHandle tmp{};
+  tmp.iface = iface;
+  tmp.device_name = device_name;
+  tmp.gpu_id = gpu_id;
+  tmp.queue_id = queue_id;
+  tmp.task_slots = static_cast<uint32_t>(env_int("SAMURAI_GPU_DOCA_RX_TASK_SLOTS", 1024, 64, 65536));
+  tmp.max_progress_loops = static_cast<uint32_t>(env_int("SAMURAI_GPU_DOCA_RX_PROGRESS_LOOPS", 200000, 1000, 2000000));
+  tmp.max_packet_size = static_cast<uint32_t>(env_int("SAMURAI_GPU_DOCA_RX_MAX_PACKET_SIZE", 2048, 64, 9600));
+  tmp.completed_pkts.reserve(static_cast<size_t>(tmp.task_slots) * 2u);
+
+  doca_devinfo** dev_list = nullptr;
+  uint32_t nb_devs = 0u;
+  doca_error_t rc = g_doca.doca_devinfo_create_list(&dev_list, &nb_devs);
+  if (rc != kDocaSuccess || !dev_list || nb_devs == 0u) {
+    write_err(err, err_len, std::string("doca_devinfo_create_list failed: ") + doca_err(g_doca, rc));
+    return -1;
+  }
+  doca_devinfo* selected = nullptr;
+  for (uint32_t i = 0; i < nb_devs; ++i) {
+    doca_devinfo* cand = dev_list[i];
+    if (!cand) {
+      continue;
+    }
+    std::string cand_ibdev;
+    std::string cand_iface;
+    if (is_matching_dev(g_doca, cand, iface, device_name, cand_ibdev, cand_iface)) {
+      selected = cand;
+      break;
+    }
+  }
+  if (!selected) {
+    (void)g_doca.doca_devinfo_destroy_list(dev_list);
+    write_err(
+        err,
+        err_len,
+        std::string("no matching DOCA device found for iface=") + iface + " / ibdev=" + device_name);
+    return -1;
+  }
+  rc = g_doca.doca_dev_open(selected, &tmp.dev);
+  (void)g_doca.doca_devinfo_destroy_list(dev_list);
+  if (rc != kDocaSuccess || !tmp.dev) {
+    write_err(err, err_len, std::string("doca_dev_open failed: ") + doca_err(g_doca, rc));
+    return -1;
+  }
+
+  rc = g_doca.doca_eth_rxq_create(tmp.dev, tmp.task_slots, tmp.max_packet_size, &tmp.rxq);
+  if (rc != kDocaSuccess || !tmp.rxq) {
+    write_err(err, err_len, std::string("doca_eth_rxq_create failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  rc = g_doca.doca_eth_rxq_set_type(tmp.rxq, kDocaEthRxqTypeRegular);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("doca_eth_rxq_set_type failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  rc = g_doca.doca_eth_rxq_task_recv_set_conf(tmp.rxq, task_recv_common_cb, task_recv_common_cb, tmp.task_slots);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("doca_eth_rxq_task_recv_set_conf failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  tmp.ctx = g_doca.doca_eth_rxq_as_doca_ctx(tmp.rxq);
+  if (!tmp.ctx) {
+    write_err(err, err_len, "doca_eth_rxq_as_doca_ctx returned NULL");
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  rc = g_doca.doca_pe_create(&tmp.pe);
+  if (rc != kDocaSuccess || !tmp.pe) {
+    write_err(err, err_len, std::string("doca_pe_create failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  rc = g_doca.doca_pe_connect_ctx(tmp.pe, tmp.ctx);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("doca_pe_connect_ctx failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  doca_data ctx_ud{};
+  ctx_ud.ptr = &tmp;
+  rc = g_doca.doca_ctx_set_user_data(tmp.ctx, ctx_ud);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("doca_ctx_set_user_data failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  rc = g_doca.doca_ctx_start(tmp.ctx);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("doca_ctx_start failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  if (g_doca.doca_eth_rxq_apply_queue_id) {
+    rc = g_doca.doca_eth_rxq_apply_queue_id(tmp.rxq, static_cast<uint16_t>(queue_id));
+    if (rc != kDocaSuccess) {
+      write_err(err, err_len, std::string("doca_eth_rxq_apply_queue_id failed: ") + doca_err(g_doca, rc));
+      destroy_backend_rxq_unlocked(tmp);
+      return -1;
+    }
+  }
+
+  rc = g_doca.doca_mmap_create(&tmp.mmap);
+  if (rc != kDocaSuccess || !tmp.mmap) {
+    write_err(err, err_len, std::string("doca_mmap_create failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  rc = g_doca.doca_mmap_add_dev(tmp.mmap, tmp.dev);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("doca_mmap_add_dev failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  rc = g_doca.doca_mmap_set_memrange(tmp.mmap, nullptr, std::numeric_limits<size_t>::max());
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("doca_mmap_set_memrange failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  rc = g_doca.doca_mmap_start(tmp.mmap);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("doca_mmap_start failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+
+  rc = g_doca.doca_buf_inventory_create(static_cast<size_t>(tmp.task_slots) * 4u, &tmp.buf_inv);
+  if (rc != kDocaSuccess || !tmp.buf_inv) {
+    write_err(err, err_len, std::string("doca_buf_inventory_create failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+  rc = g_doca.doca_buf_inventory_start(tmp.buf_inv);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("doca_buf_inventory_start failed: ") + doca_err(g_doca, rc));
+    destroy_backend_rxq_unlocked(tmp);
+    return -1;
+  }
+
+  tmp.pkt_storage.reserve(static_cast<size_t>(tmp.task_slots));
+  for (uint32_t i = 0; i < tmp.task_slots; ++i) {
+    uint8_t* pkt_mem = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(tmp.max_packet_size)));
+    if (!pkt_mem) {
+      write_err(err, err_len, "malloc failed for rx packet buffer");
+      destroy_backend_rxq_unlocked(tmp);
+      return -1;
+    }
+    tmp.pkt_storage.push_back(pkt_mem);
+    doca_buf* pkt = nullptr;
+    rc = g_doca.doca_buf_inventory_buf_get_by_addr(
+        tmp.buf_inv,
+        tmp.mmap,
+        pkt_mem,
+        static_cast<size_t>(tmp.max_packet_size),
+        &pkt);
+    if (rc != kDocaSuccess || !pkt) {
+      write_err(err, err_len, std::string("doca_buf_inventory_buf_get_by_addr failed: ") + doca_err(g_doca, rc));
+      destroy_backend_rxq_unlocked(tmp);
+      return -1;
+    }
+    doca_data user_data{};
+    user_data.u64 = static_cast<uint64_t>(i);
+    doca_eth_rxq_task_recv* task_recv = nullptr;
+    rc = g_doca.doca_eth_rxq_task_recv_allocate_init(tmp.rxq, pkt, user_data, &task_recv);
+    if (rc != kDocaSuccess || !task_recv) {
+      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+      write_err(err, err_len, std::string("doca_eth_rxq_task_recv_allocate_init failed: ") + doca_err(g_doca, rc));
+      destroy_backend_rxq_unlocked(tmp);
+      return -1;
+    }
+    doca_task* task = g_doca.doca_eth_rxq_task_recv_as_doca_task(task_recv);
+    if (!task) {
+      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+      write_err(err, err_len, "doca_eth_rxq_task_recv_as_doca_task returned NULL");
+      destroy_backend_rxq_unlocked(tmp);
+      return -1;
+    }
+    rc = g_doca.doca_task_submit(task);
+    if (rc != kDocaSuccess) {
+      (void)g_doca.doca_task_free(task);
+      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+      write_err(err, err_len, std::string("doca_task_submit(recv) failed: ") + doca_err(g_doca, rc));
+      destroy_backend_rxq_unlocked(tmp);
+      return -1;
+    }
+    tmp.inflight += 1u;
+  }
+
+  std::lock_guard<std::mutex> guard(g_lock);
+  const int hnd = g_next_handle++;
+  tmp.handle = hnd;
+  g_rx_handles.emplace(hnd, std::move(tmp));
+  auto it = g_rx_handles.find(hnd);
+  if (it != g_rx_handles.end() && it->second.ctx) {
+    doca_data ctx_data{};
+    ctx_data.ptr = &(it->second);
+    (void)g_doca.doca_ctx_set_user_data(it->second.ctx, ctx_data);
+  }
+  *out_handle = hnd;
+  return 0;
+}
+
+extern "C" int samurai_doca_backend_destroy_rxq(int handle, char* err, size_t err_len) {
+  if (handle < 0) {
+    write_err(err, err_len, "invalid handle in samurai_doca_backend_destroy_rxq");
+    return -1;
+  }
+  std::lock_guard<std::mutex> guard(g_lock);
+  auto it = g_rx_handles.find(handle);
+  if (it == g_rx_handles.end()) {
+    return 0;
+  }
+  destroy_backend_rxq_unlocked(it->second);
+  g_rx_handles.erase(it);
+  return 0;
+}
+
+extern "C" int samurai_doca_backend_receive_burst(
+    int handle,
+    uint8_t* out_packets_flat,
+    uint32_t out_packets_flat_len,
+    uint16_t* out_lengths,
+    int max_packets,
+    int* out_received,
+    char* err,
+    size_t err_len) {
+  if (out_received) {
+    *out_received = 0;
+  }
+  if (handle < 0 || !out_packets_flat || out_packets_flat_len == 0u || !out_lengths || max_packets <= 0 ||
+      !out_received) {
+    write_err(err, err_len, "invalid arguments for samurai_doca_backend_receive_burst");
+    return -1;
+  }
+  std::lock_guard<std::mutex> guard(g_lock);
+  auto it = g_rx_handles.find(handle);
+  if (it == g_rx_handles.end()) {
+    write_err(err, err_len, "rxq handle not found");
+    return -1;
+  }
+  BackendRxqHandle& h = it->second;
+  if (!h.rxq || !h.pe || !h.buf_inv || !h.mmap) {
+    write_err(err, err_len, "DOCA rxq handle is not fully initialized");
+    return -1;
+  }
+
+  uint32_t loops = 0u;
+  while (h.completed_pkts.empty() && loops < h.max_progress_loops) {
+    (void)g_doca.doca_pe_progress(h.pe);
+    loops += 1u;
+  }
+
+  size_t out_offset = 0u;
+  int copied = 0;
+  while (!h.completed_pkts.empty() && copied < max_packets) {
+    doca_buf* pkt = h.completed_pkts.back();
+    h.completed_pkts.pop_back();
+    if (!pkt) {
+      continue;
+    }
+    void* data_ptr = nullptr;
+    size_t data_len = 0u;
+    if (g_doca.doca_buf_get_data(pkt, &data_ptr) != kDocaSuccess || !data_ptr ||
+        g_doca.doca_buf_get_data_len(pkt, &data_len) != kDocaSuccess || data_len == 0u) {
+      h.rx_errors += 1u;
+      h.rx_drops += 1u;
+      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+      continue;
+    }
+    if (data_len > static_cast<size_t>(std::numeric_limits<uint16_t>::max())) {
+      data_len = static_cast<size_t>(std::numeric_limits<uint16_t>::max());
+    }
+    if (out_offset + data_len > static_cast<size_t>(out_packets_flat_len)) {
+      h.rx_drops += 1u;
+      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+      break;
+    }
+    std::memcpy(out_packets_flat + out_offset, data_ptr, data_len);
+    out_lengths[copied] = static_cast<uint16_t>(data_len);
+    out_offset += data_len;
+    copied += 1;
+    h.rx_packets += 1u;
+    h.rx_bytes += static_cast<uint64_t>(data_len);
+
+    void* head_ptr = nullptr;
+    size_t head_len = 0u;
+    if (g_doca.doca_buf_get_head(pkt, &head_ptr) != kDocaSuccess || !head_ptr ||
+        g_doca.doca_buf_get_len(pkt, &head_len) != kDocaSuccess || head_len == 0u) {
+      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+      h.rx_errors += 1u;
+      continue;
+    }
+    (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+
+    doca_buf* next_pkt = nullptr;
+    doca_error_t rc = g_doca.doca_buf_inventory_buf_get_by_addr(h.buf_inv, h.mmap, head_ptr, head_len, &next_pkt);
+    if (rc != kDocaSuccess || !next_pkt) {
+      h.rx_errors += 1u;
+      h.rx_drops += 1u;
+      continue;
+    }
+    doca_data user_data{};
+    user_data.u64 = 0u;
+    doca_eth_rxq_task_recv* next_task_recv = nullptr;
+    rc = g_doca.doca_eth_rxq_task_recv_allocate_init(h.rxq, next_pkt, user_data, &next_task_recv);
+    if (rc != kDocaSuccess || !next_task_recv) {
+      (void)g_doca.doca_buf_dec_refcount(next_pkt, nullptr);
+      h.rx_errors += 1u;
+      h.rx_drops += 1u;
+      continue;
+    }
+    doca_task* next_task = g_doca.doca_eth_rxq_task_recv_as_doca_task(next_task_recv);
+    if (!next_task) {
+      (void)g_doca.doca_buf_dec_refcount(next_pkt, nullptr);
+      h.rx_errors += 1u;
+      h.rx_drops += 1u;
+      continue;
+    }
+    rc = g_doca.doca_task_submit(next_task);
+    if (rc != kDocaSuccess) {
+      (void)g_doca.doca_task_free(next_task);
+      (void)g_doca.doca_buf_dec_refcount(next_pkt, nullptr);
+      h.rx_errors += 1u;
+      h.rx_drops += 1u;
+      continue;
+    }
+    h.inflight += 1u;
+  }
+
+  *out_received = copied;
   return 0;
 }
