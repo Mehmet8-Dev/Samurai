@@ -287,6 +287,8 @@ class OptionalBuildExt(build_ext):
         os.makedirs(out_dir, exist_ok=True)
 
         obj_path = os.path.join(build_temp, "gpu_packet_cuda.o")
+        doca_shim_src = os.path.join(project_root, "ddos_samurai", "gpu_packet_cuda", "doca_gpunetio_shim.cpp")
+        doca_shim_obj = os.path.join(build_temp, "doca_gpunetio_shim.o")
         lib_path = os.path.join(out_dir, "libgpu_packet_cuda.so")
 
         compile_cmd = [
@@ -305,6 +307,25 @@ class OptionalBuildExt(build_ext):
             "-o",
             obj_path,
         ]
+        with_doca_gpunetio_device = _env_flag("SAMURAI_WITH_DOCA_GPUNETIO_DEVICE", "0")
+        if with_doca_gpunetio_device:
+            compile_cmd.extend(["-DSAMURAI_WITH_DOCA_GPUNETIO_DEVICE=1"])
+            doca_include = str(os.environ.get("SAMURAI_DOCA_INCLUDE", "/opt/mellanox/doca/include") or "").strip()
+            if doca_include:
+                compile_cmd.extend(["-I", doca_include])
+        cxx = str(os.environ.get("CXX", "") or "").strip() or shutil.which("c++") or shutil.which("g++") or "c++"
+        doca_compile_cmd = [
+            cxx,
+            "-std=c++20",
+            "-O2",
+            "-fPIC",
+            "-I",
+            project_root,
+            "-c",
+            doca_shim_src,
+            "-o",
+            doca_shim_obj,
+        ]
         bridge_obj_paths = [
             os.path.join(build_temp, "ddos_samurai", "xdp_sender.o"),
             os.path.join(build_temp, "ddos_samurai", "fast_sender.o"),
@@ -315,7 +336,9 @@ class OptionalBuildExt(build_ext):
             nvcc,
             "-shared",
             obj_path,
+            *( [doca_shim_obj] if os.path.exists(doca_shim_obj) else [] ),
             *bridge_objs,
+            "-ldl",
             "-o",
             lib_path,
         ]
@@ -323,12 +346,15 @@ class OptionalBuildExt(build_ext):
         try:
             print(f"\nBuilding CUDA module: {src_path}")
             subprocess.run(compile_cmd, check=True)
+            if os.path.exists(doca_shim_src):
+                subprocess.run(doca_compile_cmd, check=True)
             subprocess.run(link_cmd, check=True)
             print(f"Built CUDA library: {lib_path}\n")
         except subprocess.CalledProcessError as exc:
             print(f"\nWarning: CUDA module build failed: {exc}\n")
 
         self._build_cuda_defense_module(project_root, nvcc, cuda_include, build_temp, out_dir)
+        self._build_doca_backend_module(project_root, build_temp, out_dir)
 
     def _build_cuda_defense_module(
         self,
@@ -377,6 +403,43 @@ class OptionalBuildExt(build_ext):
             print("Built CUDA defense library: libgpu_packet_cuda_defense.so\n")
         except subprocess.CalledProcessError as exc:
             print(f"\nWarning: CUDA defense module build failed: {exc}\n")
+
+    def _build_doca_backend_module(self, project_root: str, build_temp: str, out_dir: str) -> None:
+        src_path = os.path.join(project_root, "ddos_samurai", "gpu_packet_cuda", "doca_gpunetio_backend.cpp")
+        if not os.path.exists(src_path):
+            return
+
+        cxx = str(os.environ.get("CXX", "") or "").strip() or shutil.which("c++") or shutil.which("g++") or "c++"
+        obj_path = os.path.join(build_temp, "doca_gpunetio_backend.o")
+        lib_path = os.path.join(out_dir, "libsamurai_doca_gpunetio_backend.so")
+        compile_cmd = [
+            cxx,
+            "-std=c++20",
+            "-O2",
+            "-fPIC",
+            "-I",
+            project_root,
+            "-c",
+            src_path,
+            "-o",
+            obj_path,
+        ]
+        link_cmd = [
+            cxx,
+            "-shared",
+            obj_path,
+            "-lpthread",
+            "-ldl",
+            "-o",
+            lib_path,
+        ]
+        try:
+            print(f"\nBuilding DOCA backend skeleton module: {src_path}")
+            subprocess.run(compile_cmd, check=True)
+            subprocess.run(link_cmd, check=True)
+            print(f"Built DOCA backend skeleton library: {lib_path}\n")
+        except subprocess.CalledProcessError as exc:
+            print(f"\nWarning: DOCA backend skeleton module build failed: {exc}\n")
 
 
 def detect_l7_capabilities() -> Dict[str, bool]:

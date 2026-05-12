@@ -737,6 +737,16 @@ def _preflight_persistent_tx_backend(parser: argparse.ArgumentParser, args: argp
             parser.error(
                 "Hata: persistent+stream + doca_gpunetio strict backend için --xdp-interface zorunludur."
             )
+        doca_enabled = str(os.environ.get("SAMURAI_GPU_DOCA_ENABLE", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not doca_enabled:
+            parser.error(
+                "Hata: doca_gpunetio backend için SAMURAI_GPU_DOCA_ENABLE=1 zorunludur."
+            )
         doca_device = str(os.environ.get("SAMURAI_GPU_DOCA_DEVICE", "") or "").strip()
         if not doca_device:
             parser.error(
