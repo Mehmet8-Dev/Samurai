@@ -3,6 +3,12 @@
 #include "../gpu_packet_cuda.hpp"
 #include <cstdio>
 #include "tx_backend_doca_gpunetio.cuh"
+#ifndef SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+#define SAMURAI_WITH_DOCA_GPUNETIO_DEVICE 0
+#endif
+#if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+#include <doca_gpunetio_dev_eth_txq.cuh>
+#endif
 #ifndef SAMURAI_GPU_PACKET_CUDA_PREAMBLE_INCLUDED
 #define SAMURAI_GPU_PACKET_CUDA_FRAGMENT_CHAIN 1
 #include "preamble.cuh"
@@ -1459,6 +1465,42 @@ enum class PersistentTxBackendKind : int {
   kDocaGpuNetIO = 3,
 };
 
+constexpr int kPersistentDocaGpuNetioApiVersion = 2;
+
+struct PersistentDocaGpuNetioStats {
+  uint64_t tx_packets = 0u;
+  uint64_t tx_bytes = 0u;
+  uint64_t tx_errors = 0u;
+  uint64_t tx_drops = 0u;
+  int queue_id = 0;
+};
+
+struct PersistentDocaGpuNetioApiV1 {
+  int version = 0;
+  int (*create_txq)(
+      const char* iface,
+      const char* device_name,
+      int gpu_id,
+      int queue_id,
+      int* out_handle,
+      char* err,
+      size_t err_len) = nullptr;
+  int (*destroy_txq)(int handle, char* err, size_t err_len) = nullptr;
+  int (*send_vector)(
+      int handle,
+      const uint8_t** packets,
+      const uint16_t* lengths,
+      const int32_t* stream_slots,
+      int count,
+      int* out_sent,
+      int* out_errors,
+      char* err,
+      size_t err_len) = nullptr;
+  int (*get_stats)(int handle, PersistentDocaGpuNetioStats* out, char* err, size_t err_len) = nullptr;
+  int (*get_gpu_txq_handle)(int handle, uint64_t* out_gpu_txq_handle, char* err, size_t err_len) = nullptr;
+  int (*get_txq_mkey_be)(int handle, uint32_t* out_mkey_be, char* err, size_t err_len) = nullptr;
+};
+
 struct PersistentTxBridgeRuntime {
   PersistentTxBackendKind kind = PersistentTxBackendKind::kNoop;
   std::string requested = "auto";
@@ -1468,7 +1510,7 @@ struct PersistentTxBridgeRuntime {
   int xdp_queue_base = 0;
   std::array<uint8_t, 6> afpacket_mac{{0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu}};
   const XdpNativeApiV1* xdp_api = nullptr;
-  const DocaGpuNetioApiV1* doca_api = nullptr;
+  const PersistentDocaGpuNetioApiV1* doca_api = nullptr;
   std::string doca_device{};
   int doca_gpu_id = 0;
   int (*afpacket_send_bridge)(
@@ -1485,6 +1527,9 @@ struct PersistentTxBridgeRuntime {
   int (*afpacket_cleanup_bridge)(void) = nullptr;
   std::vector<int> xdp_handles{};
   std::vector<int> doca_txq_handles{};
+  std::vector<uint64_t> doca_gpu_txq_handles{};
+  std::vector<uint32_t> doca_txq_mkeys_be{};
+  bool doca_kernel_direct_tx = false;
 };
 
 std::mutex g_persistent_lock;
@@ -1511,6 +1556,8 @@ struct PersistentRuntime {
   int32_t* queue_slot_hint_dev = nullptr;                         // device queue-local slot hint
   uint8_t* payload_host = nullptr;                                // mapped host UMEM payload
   uint8_t* payload_dev = nullptr;                                 // device payload buffer
+  uint64_t* doca_gpu_txq_handles_dev = nullptr;                   // device txq handles for kernel direct DOCA TX
+  uint32_t* doca_txq_mkeys_be_dev = nullptr;                      // device txq mkeys (big-endian) for direct DOCA TX
   std::vector<std::thread> bridge_threads;
   std::thread monitor_thread;
   std::atomic<bool> threads_running{false};
@@ -1532,6 +1579,7 @@ struct PersistentRuntime {
   std::atomic<uint64_t> last_epoch_refill_ns{0};
   std::vector<uint32_t> queue_drain_cursor{};
   std::vector<uint64_t> queue_sent_counts{};
+  bool doca_kernel_direct_tx = false;
   std::array<std::atomic<uint64_t>, kPersistentMaxStreams> completed_by_slot{};
   PersistentTxBridgeRuntime tx_bridge{};
 
@@ -1601,6 +1649,14 @@ struct PersistentRuntime {
     if (payload_dev) {
       (void)cudaFree(payload_dev);
       payload_dev = nullptr;
+    }
+    if (doca_gpu_txq_handles_dev) {
+      (void)cudaFree(doca_gpu_txq_handles_dev);
+      doca_gpu_txq_handles_dev = nullptr;
+    }
+    if (doca_txq_mkeys_be_dev) {
+      (void)cudaFree(doca_txq_mkeys_be_dev);
+      doca_txq_mkeys_be_dev = nullptr;
     }
   if (streams) {
     (void)cudaFreeHost(streams);
@@ -2081,6 +2137,9 @@ inline void persistent_bridge_backend_shutdown_unlocked(PersistentRuntime& rt) {
     }
   }
   b.doca_txq_handles.clear();
+  b.doca_gpu_txq_handles.clear();
+  b.doca_txq_mkeys_be.clear();
+  b.doca_kernel_direct_tx = false;
   if (b.afpacket_cleanup_bridge) {
     (void)b.afpacket_cleanup_bridge();
   }
@@ -2128,6 +2187,14 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   const bool want_xdp = (b.requested == "auto" || b.requested == "af_xdp");
   const bool want_afpacket = (b.requested == "auto" || b.requested == "af_packet");
   const bool want_doca = (b.requested == "auto" || b.requested == "doca_gpunetio");
+  const bool want_doca_kernel_direct = env_int_local("SAMURAI_GPU_DOCA_KERNEL_TX", 0) != 0;
+#if !SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+  if (want_doca_kernel_direct) {
+    b.kind = PersistentTxBackendKind::kNoop;
+    b.active = "noop";
+    return false;
+  }
+#endif
   if (want_xdp && !b.iface.empty()) {
     if (samurai_xdp_get_native_api_v1) {
       b.xdp_api = samurai_xdp_get_native_api_v1();
@@ -2184,11 +2251,24 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   }
 
   if (want_doca && !b.iface.empty() && !b.doca_device.empty()) {
-    if (samurai_doca_gpunetio_get_api_v1) {
-      b.doca_api = samurai_doca_gpunetio_get_api_v1();
-      if (b.doca_api && b.doca_api->version == kDocaGpuNetioApiVersion && b.doca_api->create_txq &&
+    if (ddos_samurai::gpu_packet_cuda::samurai_doca_gpunetio_get_api_v1) {
+      b.doca_api = reinterpret_cast<const PersistentDocaGpuNetioApiV1*>(
+          ddos_samurai::gpu_packet_cuda::samurai_doca_gpunetio_get_api_v1());
+      if (b.doca_api && b.doca_api->version == kPersistentDocaGpuNetioApiVersion && b.doca_api->create_txq &&
           b.doca_api->destroy_txq && b.doca_api->send_vector) {
+        const bool api_has_kernel_hooks = (b.doca_api->get_gpu_txq_handle && b.doca_api->get_txq_mkey_be);
+        if (want_doca_kernel_direct && !api_has_kernel_hooks) {
+          if (b.requested == "doca_gpunetio") {
+            b.kind = PersistentTxBackendKind::kNoop;
+            b.active = "noop";
+            return false;
+          }
+        }
         b.doca_txq_handles.assign(static_cast<size_t>(rt.queue_count), -1);
+        if (want_doca_kernel_direct) {
+          b.doca_gpu_txq_handles.assign(static_cast<size_t>(rt.queue_count), 0ull);
+          b.doca_txq_mkeys_be.assign(static_cast<size_t>(rt.queue_count), 0u);
+        }
         bool ok = true;
         for (int q = 0; q < rt.queue_count; ++q) {
           char errbuf[160];
@@ -2207,10 +2287,32 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
             break;
           }
           b.doca_txq_handles[static_cast<size_t>(q)] = handle;
+          if (want_doca_kernel_direct) {
+            uint64_t gpu_txq_handle = 0ull;
+            uint32_t mkey_be = 0u;
+            if (b.doca_api->get_gpu_txq_handle(
+                    handle,
+                    &gpu_txq_handle,
+                    errbuf,
+                    sizeof(errbuf)) < 0 ||
+                gpu_txq_handle == 0ull ||
+                b.doca_api->get_txq_mkey_be(
+                    handle,
+                    &mkey_be,
+                    errbuf,
+                    sizeof(errbuf)) < 0 ||
+                mkey_be == 0u) {
+              ok = false;
+              break;
+            }
+            b.doca_gpu_txq_handles[static_cast<size_t>(q)] = gpu_txq_handle;
+            b.doca_txq_mkeys_be[static_cast<size_t>(q)] = mkey_be;
+          }
         }
         if (ok) {
           b.kind = PersistentTxBackendKind::kDocaGpuNetIO;
           b.active = "doca_gpunetio";
+          b.doca_kernel_direct_tx = want_doca_kernel_direct;
           return true;
         }
         for (int h : b.doca_txq_handles) {
@@ -2221,6 +2323,9 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
           }
         }
         b.doca_txq_handles.clear();
+        b.doca_gpu_txq_handles.clear();
+        b.doca_txq_mkeys_be.clear();
+        b.doca_kernel_direct_tx = false;
       }
     }
     if (b.requested == "doca_gpunetio") {
@@ -2229,6 +2334,11 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
       return false;
     }
   } else if (b.requested == "doca_gpunetio") {
+    b.kind = PersistentTxBackendKind::kNoop;
+    b.active = "noop";
+    return false;
+  }
+  if (want_doca_kernel_direct) {
     b.kind = PersistentTxBackendKind::kNoop;
     b.active = "noop";
     return false;
@@ -2849,6 +2959,40 @@ __device__ __forceinline__ void persistent_publish_slot_ready(PersistentRingSlot
 #endif
 }
 
+__device__ __forceinline__ bool persistent_doca_kernel_try_send(
+    uint64_t gpu_txq_handle,
+    uint32_t mkey_be,
+    const uint8_t* packet_ptr,
+    uint32_t packet_len) {
+  if (gpu_txq_handle == 0ull || mkey_be == 0u || !packet_ptr || packet_len == 0u) {
+    return false;
+  }
+#if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+  auto* txq = reinterpret_cast<doca_gpu_eth_txq*>(gpu_txq_handle);
+  if (!txq) {
+    return false;
+  }
+  const uint64_t addr = reinterpret_cast<uint64_t>(packet_ptr);
+  const doca_error_t rc_enqueue =
+      doca_gpu_dev_eth_txq_send_enqueue_strong(txq, addr, mkey_be, packet_len, DOCA_GPU_SEND_FLAG_NONE);
+  if (rc_enqueue != DOCA_SUCCESS) {
+    return false;
+  }
+  const doca_error_t rc_commit = doca_gpu_dev_eth_txq_commit_strong(txq);
+  if (rc_commit != DOCA_SUCCESS) {
+    return false;
+  }
+  const doca_error_t rc_push = doca_gpu_dev_eth_txq_push(txq);
+  return rc_push == DOCA_SUCCESS;
+#else
+  (void)gpu_txq_handle;
+  (void)mkey_be;
+  (void)packet_ptr;
+  (void)packet_len;
+  return false;
+#endif
+}
+
 __device__ inline void adaptive_quota_throttle(volatile PersistentDeviceStreamState* sv) {
   const uint32_t quota = u32_load(&sv->quota);
   if (quota == 0u) {
@@ -2986,13 +3130,15 @@ __global__ void persistent_quota_refill_kernel(
 }
 
 __global__ void persistent_dataplane_kernel(
-    const volatile int32_t* run_flag_dev,
+    volatile int32_t* run_flag_dev,
     volatile PersistentRuntimeControl* ctrl,
     volatile PersistentDeviceStreamState* streams,
     const volatile PersistentStreamHotState* streams_hot,
     PersistentRingSlot* rings,
     int32_t* queue_slot_hint,
-    uint8_t* payload_base) {
+    uint8_t* payload_base,
+    const uint64_t* doca_gpu_txq_handles,
+    const uint32_t* doca_txq_mkeys_be) {
   const uint32_t tid = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   const uint32_t workers = static_cast<uint32_t>(gridDim.x * blockDim.x);
   constexpr uint32_t kWarpWidth = 32u;
@@ -3108,6 +3254,8 @@ __global__ void persistent_dataplane_kernel(
       }
       packet_seq_base = __shfl_sync(warp_mask, packet_seq_base, 0);
       int produced_for_stream_lane = 0;
+      int direct_sent_for_stream_lane = 0;
+      int direct_released_for_stream_lane = 0;
       PersistentRingSlot* publish_slots[kTokenReserveChunkPerLane];
       int publish_count = 0;
       #pragma unroll
@@ -3211,6 +3359,37 @@ __global__ void persistent_dataplane_kernel(
         slot.stream_id = sid;
         slot.stream_slot = idx;
         slot.protocol = proto;
+        const uint32_t slot_len_u = static_cast<uint32_t>(slot.len > 0 ? slot.len : 0);
+        if (slot_len_u > 0u && doca_gpu_txq_handles && doca_txq_mkeys_be && q >= 0 && q < queue_count) {
+          const uint64_t gpu_txq_handle = doca_gpu_txq_handles[static_cast<size_t>(q)];
+          const uint32_t mkey_be = doca_txq_mkeys_be[static_cast<size_t>(q)];
+          if (persistent_doca_kernel_try_send(gpu_txq_handle, mkey_be, slot_payload, slot_len_u)) {
+            slot.state = 0;
+            slot.len = 0;
+            slot.stream_id = 0;
+            slot.stream_slot = -1;
+            slot.protocol = 0;
+            produced = true;
+            produced_for_stream_lane += 1;
+            direct_sent_for_stream_lane += 1;
+            direct_released_for_stream_lane += 1;
+            continue;
+          }
+        }
+        if (doca_gpu_txq_handles && doca_txq_mkeys_be) {
+          // Direct-DOCA mode is fail-fast: no host fallback in this path.
+          slot.state = 0;
+          slot.len = 0;
+          slot.stream_id = 0;
+          slot.stream_slot = -1;
+          slot.protocol = 0;
+          if (lane == 0u) {
+            u64_add(&ctrl->native_batch_degrade_events, 1u);
+            ctrl->run = 0;
+            atomicExch((int*)run_flag_dev, 0);
+          }
+          return;
+        }
         if (publish_count < static_cast<int>(kTokenReserveChunkPerLane)) {
           publish_slots[publish_count++] = &slot;
         } else {
@@ -3227,13 +3406,29 @@ __global__ void persistent_dataplane_kernel(
       }
 
       int produced_for_stream = produced_for_stream_lane;
+      int direct_sent_for_stream = direct_sent_for_stream_lane;
+      int direct_released_for_stream = direct_released_for_stream_lane;
       for (uint32_t offset = (kWarpWidth >> 1u); offset > 0u; offset >>= 1u) {
         produced_for_stream += __shfl_down_sync(warp_mask, produced_for_stream, static_cast<int>(offset));
+        direct_sent_for_stream += __shfl_down_sync(warp_mask, direct_sent_for_stream, static_cast<int>(offset));
+        direct_released_for_stream +=
+            __shfl_down_sync(warp_mask, direct_released_for_stream, static_cast<int>(offset));
       }
 
       if (lane == 0u && produced_for_stream > 0) {
         (void)atomicAdd((unsigned int*)&sv->produced, static_cast<uint32_t>(produced_for_stream));
         u64_add(&ctrl->produced, static_cast<uint64_t>(produced_for_stream));
+        if (direct_sent_for_stream > 0) {
+          const uint64_t sent_u = static_cast<uint64_t>(direct_sent_for_stream);
+          u64_add(&ctrl->tx_bridge_sent, sent_u);
+          u64_add(&ctrl->bridge_drain_packets, sent_u);
+          u64_add(&ctrl->bridge_drain_batches, 1u);
+        }
+        if (direct_released_for_stream > 0) {
+          const uint32_t released_u = static_cast<uint32_t>(direct_released_for_stream);
+          (void)atomicAdd((unsigned int*)&sv->completed, released_u);
+          u64_add(&ctrl->ring_released, static_cast<uint64_t>(released_u));
+        }
       }
 
       if (__any_sync(warp_mask, produced_for_stream_lane > 0)) {
@@ -4123,6 +4318,9 @@ inline bool persistent_launch_kernel() {
       !rt.rings_dev || !rt.queue_slot_hint_dev || !rt.payload_dev) {
     return false;
   }
+  if (rt.doca_kernel_direct_tx && (!rt.doca_gpu_txq_handles_dev || !rt.doca_txq_mkeys_be_dev)) {
+    return false;
+  }
   if (!rt.kernel_stream) {
     if (cudaStreamCreateWithFlags(&rt.kernel_stream, cudaStreamNonBlocking) != cudaSuccess) {
       return false;
@@ -4177,7 +4375,9 @@ inline bool persistent_launch_kernel() {
       rt.streams_hot_dev,
       rt.rings_dev,
       rt.queue_slot_hint_dev,
-      rt.payload_dev);
+      rt.payload_dev,
+      rt.doca_gpu_txq_handles_dev,
+      rt.doca_txq_mkeys_be_dev);
   return (cudaPeekAtLastError() == cudaSuccess);
 }
 
@@ -4205,6 +4405,10 @@ inline void persistent_monitor_loop() {
     std::this_thread::sleep_for(std::chrono::milliseconds(std::max(10, rt.heartbeat_ms)));
     if (!rt.ctrl) {
       continue;
+    }
+    if (rt.doca_kernel_direct_tx && rt.ctrl->run == 0) {
+      rt.threads_running.store(false, std::memory_order_relaxed);
+      break;
     }
     const uint64_t produced = rt.ctrl->produced;
     if (produced != prev_produced) {
@@ -4404,6 +4608,14 @@ inline void persistent_runtime_release_unlocked() {
     (void)cudaFree(rt.payload_dev);
     rt.payload_dev = nullptr;
   }
+  if (rt.doca_gpu_txq_handles_dev) {
+    (void)cudaFree(rt.doca_gpu_txq_handles_dev);
+    rt.doca_gpu_txq_handles_dev = nullptr;
+  }
+  if (rt.doca_txq_mkeys_be_dev) {
+    (void)cudaFree(rt.doca_txq_mkeys_be_dev);
+    rt.doca_txq_mkeys_be_dev = nullptr;
+  }
   if (rt.streams) {
     (void)cudaFreeHost(rt.streams);
     rt.streams = nullptr;
@@ -4428,6 +4640,7 @@ inline void persistent_runtime_release_unlocked() {
   rt.queue_count = 1;
   rt.ring_slots = 0;
   rt.bridge_thread_count = 1;
+  rt.doca_kernel_direct_tx = false;
   rt.max_packet_bytes = kPersistentMaxPacketBytes;
   rt.queue_drain_cursor.clear();
   rt.queue_sent_counts.clear();
@@ -4668,6 +4881,40 @@ inline bool persistent_runtime_ensure_started_unlocked() {
     persistent_runtime_release_unlocked();
     return false;
   }
+  rt.doca_kernel_direct_tx = rt.tx_bridge.doca_kernel_direct_tx;
+  if (rt.doca_kernel_direct_tx) {
+    if (rt.tx_bridge.doca_gpu_txq_handles.size() != static_cast<size_t>(rt.queue_count) ||
+        rt.tx_bridge.doca_txq_mkeys_be.size() != static_cast<size_t>(rt.queue_count)) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+    const size_t txq_handles_bytes = sizeof(uint64_t) * static_cast<size_t>(rt.queue_count);
+    const size_t mkeys_bytes = sizeof(uint32_t) * static_cast<size_t>(rt.queue_count);
+    if (cudaMalloc(&rt.doca_gpu_txq_handles_dev, txq_handles_bytes) != cudaSuccess || !rt.doca_gpu_txq_handles_dev) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+    if (cudaMemcpy(
+            rt.doca_gpu_txq_handles_dev,
+            rt.tx_bridge.doca_gpu_txq_handles.data(),
+            txq_handles_bytes,
+            cudaMemcpyHostToDevice) != cudaSuccess) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+    if (cudaMalloc(&rt.doca_txq_mkeys_be_dev, mkeys_bytes) != cudaSuccess || !rt.doca_txq_mkeys_be_dev) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+    if (cudaMemcpy(
+            rt.doca_txq_mkeys_be_dev,
+            rt.tx_bridge.doca_txq_mkeys_be.data(),
+            mkeys_bytes,
+            cudaMemcpyHostToDevice) != cudaSuccess) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+  }
 
   if (!persistent_launch_kernel()) {
     persistent_runtime_release_unlocked();
@@ -4675,9 +4922,11 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   }
   rt.threads_running.store(true, std::memory_order_relaxed);
   rt.bridge_threads.clear();
-  rt.bridge_threads.reserve(static_cast<size_t>(std::max(1, rt.bridge_thread_count)));
-  for (int worker = 0; worker < std::max(1, rt.bridge_thread_count); ++worker) {
-    rt.bridge_threads.emplace_back(persistent_bridge_loop, worker, std::max(1, rt.bridge_thread_count));
+  if (!rt.doca_kernel_direct_tx) {
+    rt.bridge_threads.reserve(static_cast<size_t>(std::max(1, rt.bridge_thread_count)));
+    for (int worker = 0; worker < std::max(1, rt.bridge_thread_count); ++worker) {
+      rt.bridge_threads.emplace_back(persistent_bridge_loop, worker, std::max(1, rt.bridge_thread_count));
+    }
   }
   rt.monitor_thread = std::thread(persistent_monitor_loop);
   rt.last_progress_ns.store(now_ns_steady(), std::memory_order_relaxed);
@@ -5565,6 +5814,9 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << (rt_active ? g_persistent_runtime.ctrl->native_batch_degrade_events : 0u) << ","
         << "\"compat_fallback_count\":" << g_compat_fallback_count.load(std::memory_order_relaxed) << ","
         << "\"persistent_tx_backend\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.active) << "\","
+        << "\"persistent_doca_kernel_direct_tx\":"
+        << (g_persistent_runtime.doca_kernel_direct_tx ? 1 : 0) << ","
+        << "\"persistent_bridge_threads_active\":" << g_persistent_runtime.bridge_threads.size() << ","
         << "\"persistent_tx_iface\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.iface) << "\","
         << "\"persistent_tx_doca_device\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.doca_device) << "\","
         << "\"persistent_bridge_ipg_ns\":" << g_persistent_runtime.bridge_ipg_ns << ","

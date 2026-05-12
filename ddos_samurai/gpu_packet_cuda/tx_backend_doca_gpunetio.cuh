@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 
-constexpr int kDocaGpuNetioApiVersion = 1;
+#define SAMURAI_DOCA_GPUNETIO_API_DECLS 1
+
+constexpr int kDocaGpuNetioApiVersion = 2;
 
 struct DocaGpuNetioStats {
   uint64_t tx_packets = 0u;
@@ -35,6 +37,8 @@ struct DocaGpuNetioApiV1 {
       char* err,
       size_t err_len) = nullptr;
   int (*get_stats)(int handle, DocaGpuNetioStats* out, char* err, size_t err_len) = nullptr;
+  int (*get_gpu_txq_handle)(int handle, uint64_t* out_gpu_txq_handle, char* err, size_t err_len) = nullptr;
+  int (*get_txq_mkey_be)(int handle, uint32_t* out_mkey_be, char* err, size_t err_len) = nullptr;
 };
 
 extern "C" __attribute__((weak)) DocaGpuNetioApiV1* samurai_doca_gpunetio_get_api_v1(void);
