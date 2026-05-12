@@ -1482,14 +1482,14 @@ async def worker_process(
                 if "persistent_bridge_ipg_ns" in gtel_pre:
                     worker_stats["persistent_bridge_ipg_ns"] = int(gtel_pre.get("persistent_bridge_ipg_ns", 0) or 0)
                 if _gpu_tx_backend_strict:
-                    _allowed = {"af_xdp", "af_packet"}
+                    _allowed = {"af_xdp", "af_packet", "doca_gpunetio"}
                     _requested_ok = _gpu_tx_backend_requested in _allowed
                     _telemetry_ok = _pre_backend in _allowed
                     if not _requested_ok and not _telemetry_ok:
                         raise RuntimeError(
                             "persistent strict TX backend preflight failed: "
                             f"requested={_gpu_tx_backend_requested!r}, telemetry={_pre_backend or 'missing'!r}; "
-                            "strict mode requires af_xdp or af_packet"
+                            "strict mode requires af_xdp, af_packet, or doca_gpunetio"
                         )
 
             def _gpu_to_host(gpu_arr, key: str, stream=None, blocking: bool = True):

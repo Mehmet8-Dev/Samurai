@@ -243,7 +243,7 @@ def _validate_artifacts(runtime: Dict[str, Any], *, ignore_meta: bool = False) -
                         missing.append(f"{summary_path}::sender_path_drift::MIXED")
                 if profile_name == "persistent_stream_lab_strict":
                     backend = str(normalized.get("persistent_tx_backend", "") or "").strip().lower()
-                    if backend not in {"af_xdp", "af_packet"}:
+                    if backend not in {"af_xdp", "af_packet", "doca_gpunetio"}:
                         missing.append(f"{summary_path}::persistent_tx_backend::{backend or 'missing'}")
                     strict_raw = normalized.get("persistent_tx_backend_strict", 0)
                     try:

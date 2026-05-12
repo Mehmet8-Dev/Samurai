@@ -157,7 +157,7 @@ _DEFAULT_PROFILE_GATES: Dict[str, Dict[str, Any]] = {
         "rate_accuracy_pct_min": 98.0,
         "sender_fallback_reason_required": "none",
         "sender_path_single_required": 1,
-        "persistent_tx_backend_allowed": "af_xdp|af_packet",
+        "persistent_tx_backend_allowed": "af_xdp|af_packet|doca_gpunetio",
         "persistent_tx_backend_strict_required": 1,
         "persistent_tx_iface_required": 1,
         "persistent_tx_bridge_sent_min": 1.0,

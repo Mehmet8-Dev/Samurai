@@ -714,9 +714,9 @@ def _preflight_persistent_tx_backend(parser: argparse.ArgumentParser, args: argp
             "persistent+stream için SAMURAI_GPU_TX_BACKEND doğrulanmış varsayılan olarak af_xdp ayarlandı."
         )
 
-    if backend not in {"af_xdp", "af_packet"}:
+    if backend not in {"af_xdp", "af_packet", "doca_gpunetio"}:
         parser.error(
-            "Hata: persistent+stream modunda SAMURAI_GPU_TX_BACKEND yalnızca af_xdp veya af_packet olabilir."
+            "Hata: persistent+stream modunda SAMURAI_GPU_TX_BACKEND yalnızca af_xdp, af_packet veya doca_gpunetio olabilir."
         )
 
     if not strict_enabled:
@@ -730,6 +730,17 @@ def _preflight_persistent_tx_backend(parser: argparse.ArgumentParser, args: argp
         if not xdp_iface:
             parser.error(
                 "Hata: persistent+stream + af_xdp strict backend için --xdp-interface zorunludur."
+            )
+    elif backend == "doca_gpunetio":
+        tx_iface = str(getattr(args, "xdp_interface", "") or "").strip()
+        if not tx_iface:
+            parser.error(
+                "Hata: persistent+stream + doca_gpunetio strict backend için --xdp-interface zorunludur."
+            )
+        doca_device = str(os.environ.get("SAMURAI_GPU_DOCA_DEVICE", "") or "").strip()
+        if not doca_device:
+            parser.error(
+                "Hata: doca_gpunetio backend için SAMURAI_GPU_DOCA_DEVICE (örn: mlx5_0) zorunludur."
             )
 
 
