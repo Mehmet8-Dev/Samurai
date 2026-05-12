@@ -2,6 +2,7 @@
 // When opened standalone by IDE analysis, pull required fragments here.
 #include "../gpu_packet_cuda.hpp"
 #include <cstdio>
+#include "tx_backend_doca_gpunetio.cuh"
 #ifndef SAMURAI_GPU_PACKET_CUDA_PREAMBLE_INCLUDED
 #define SAMURAI_GPU_PACKET_CUDA_FRAGMENT_CHAIN 1
 #include "preamble.cuh"
@@ -1455,6 +1456,7 @@ enum class PersistentTxBackendKind : int {
   kNoop = 0,
   kAfXdp = 1,
   kAfPacket = 2,
+  kDocaGpuNetIO = 3,
 };
 
 struct PersistentTxBridgeRuntime {
@@ -1466,6 +1468,9 @@ struct PersistentTxBridgeRuntime {
   int xdp_queue_base = 0;
   std::array<uint8_t, 6> afpacket_mac{{0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu}};
   const XdpNativeApiV1* xdp_api = nullptr;
+  const DocaGpuNetioApiV1* doca_api = nullptr;
+  std::string doca_device{};
+  int doca_gpu_id = 0;
   int (*afpacket_send_bridge)(
       const char* iface,
       const uint8_t* buffer,
@@ -1479,6 +1484,7 @@ struct PersistentTxBridgeRuntime {
       size_t err_msg_len) = nullptr;
   int (*afpacket_cleanup_bridge)(void) = nullptr;
   std::vector<int> xdp_handles{};
+  std::vector<int> doca_txq_handles{};
 };
 
 std::mutex g_persistent_lock;
@@ -2065,12 +2071,23 @@ inline void persistent_bridge_backend_shutdown_unlocked(PersistentRuntime& rt) {
     }
   }
   b.xdp_handles.clear();
+  if (b.doca_api && b.doca_api->destroy_txq) {
+    for (int h : b.doca_txq_handles) {
+      if (h >= 0) {
+        char errbuf[160];
+        errbuf[0] = '\0';
+        (void)b.doca_api->destroy_txq(h, errbuf, sizeof(errbuf));
+      }
+    }
+  }
+  b.doca_txq_handles.clear();
   if (b.afpacket_cleanup_bridge) {
     (void)b.afpacket_cleanup_bridge();
   }
   b.kind = PersistentTxBackendKind::kNoop;
   b.active = "noop";
   b.xdp_api = nullptr;
+  b.doca_api = nullptr;
   b.afpacket_send_bridge = nullptr;
   b.afpacket_cleanup_bridge = nullptr;
 }
@@ -2081,6 +2098,8 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
 
   b.requested = lower_copy(env_string_or("SAMURAI_GPU_TX_BACKEND", "auto"));
   b.iface = env_string_or("SAMURAI_GPU_TX_INTERFACE", env_string_or("SAMURAI_XDP_INTERFACE", ""));
+  b.doca_device = env_string_or("SAMURAI_GPU_DOCA_DEVICE", "");
+  b.doca_gpu_id = std::max(0, env_int_local("SAMURAI_GPU_DOCA_GPU_ID", 0));
   const bool tx_backend_strict = env_int_local("SAMURAI_GPU_TX_BACKEND_STRICT", 0) != 0;
   b.xdp_mode = clamp_i(env_int_local("SAMURAI_XDP_MODE", 0), 0, 2);
   b.xdp_queue_base = std::max(0, env_int_local("SAMURAI_XDP_QUEUE_ID", 0));
@@ -2091,7 +2110,13 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
     }
   }
 
-  if (b.requested != "auto" && b.requested != "af_xdp" && b.requested != "af_packet" && b.requested != "noop") {
+  if (b.requested != "auto" && b.requested != "af_xdp" && b.requested != "af_packet" &&
+      b.requested != "doca_gpunetio" && b.requested != "noop") {
+    if (tx_backend_strict) {
+      b.kind = PersistentTxBackendKind::kNoop;
+      b.active = "noop";
+      return false;
+    }
     b.requested = "auto";
   }
   if (b.requested == "noop") {
@@ -2102,6 +2127,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
 
   const bool want_xdp = (b.requested == "auto" || b.requested == "af_xdp");
   const bool want_afpacket = (b.requested == "auto" || b.requested == "af_packet");
+  const bool want_doca = (b.requested == "auto" || b.requested == "doca_gpunetio");
   if (want_xdp && !b.iface.empty()) {
     if (samurai_xdp_get_native_api_v1) {
       b.xdp_api = samurai_xdp_get_native_api_v1();
@@ -2155,6 +2181,57 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
       b.active = "noop";
       return false;
     }
+  }
+
+  if (want_doca && !b.iface.empty() && !b.doca_device.empty()) {
+    if (samurai_doca_gpunetio_get_api_v1) {
+      b.doca_api = samurai_doca_gpunetio_get_api_v1();
+      if (b.doca_api && b.doca_api->version == kDocaGpuNetioApiVersion && b.doca_api->create_txq &&
+          b.doca_api->destroy_txq && b.doca_api->send_vector) {
+        b.doca_txq_handles.assign(static_cast<size_t>(rt.queue_count), -1);
+        bool ok = true;
+        for (int q = 0; q < rt.queue_count; ++q) {
+          char errbuf[160];
+          errbuf[0] = '\0';
+          int handle = -1;
+          const int rc = b.doca_api->create_txq(
+              b.iface.c_str(),
+              b.doca_device.c_str(),
+              b.doca_gpu_id,
+              q,
+              &handle,
+              errbuf,
+              sizeof(errbuf));
+          if (rc < 0 || handle < 0) {
+            ok = false;
+            break;
+          }
+          b.doca_txq_handles[static_cast<size_t>(q)] = handle;
+        }
+        if (ok) {
+          b.kind = PersistentTxBackendKind::kDocaGpuNetIO;
+          b.active = "doca_gpunetio";
+          return true;
+        }
+        for (int h : b.doca_txq_handles) {
+          if (h >= 0) {
+            char derr[96];
+            derr[0] = '\0';
+            (void)b.doca_api->destroy_txq(h, derr, sizeof(derr));
+          }
+        }
+        b.doca_txq_handles.clear();
+      }
+    }
+    if (b.requested == "doca_gpunetio") {
+      b.kind = PersistentTxBackendKind::kNoop;
+      b.active = "noop";
+      return false;
+    }
+  } else if (b.requested == "doca_gpunetio") {
+    b.kind = PersistentTxBackendKind::kNoop;
+    b.active = "noop";
+    return false;
   }
 
   if (want_afpacket && !b.iface.empty()) {
@@ -3498,12 +3575,14 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
   std::vector<uint32_t> completion_frame_ids;
   std::vector<uint32_t> afpacket_slot_ids;
   std::vector<int32_t> afpacket_stream_slots;
+  std::vector<const uint8_t*> doca_packet_ptrs;
   std::vector<uint8_t> afpacket_batch_payload;
   submit_frame_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
   submit_lengths.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
   completion_frame_ids.resize(static_cast<size_t>(std::max(64, rt.bridge_max_burst)));
   afpacket_slot_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
   afpacket_stream_slots.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
+  doca_packet_ptrs.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
   while (rt.threads_running.load(std::memory_order_relaxed)) {
     bool progressed = false;
     uint64_t local_sent = 0u;
@@ -3665,14 +3744,143 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                 break;
               }
             }
-            if (drained == 0u) {
-              break;
-            }
-            continue;
-          }
+	            if (drained == 0u) {
+	              break;
+	            }
+	            continue;
+	          }
 
-            if (rt.tx_bridge.kind == PersistentTxBackendKind::kAfPacket && rt.tx_bridge.afpacket_send_bridge &&
-                !rt.tx_bridge.iface.empty()) {
+	          if (rt.tx_bridge.kind == PersistentTxBackendKind::kDocaGpuNetIO && rt.tx_bridge.doca_api &&
+	              rt.tx_bridge.doca_api->send_vector && q < static_cast<int>(rt.tx_bridge.doca_txq_handles.size()) &&
+	              rt.tx_bridge.doca_txq_handles[static_cast<size_t>(q)] >= 0) {
+	            const int max_packet =
+	                (rt.ctrl && rt.ctrl->max_packet_bytes > 0) ? rt.ctrl->max_packet_bytes : kPersistentMaxPacketBytes;
+	            const int burst_limit = std::max(1, rt.bridge_max_burst);
+	            const int remaining_budget = std::max(1, burst_limit - static_cast<int>(drained));
+	            submit_frame_ids.clear();
+	            submit_lengths.clear();
+	            afpacket_stream_slots.clear();
+	            if (!persistent_sync_queue_ring_window_to_host(
+	                    rt,
+	                    q,
+	                    cursor,
+	                    static_cast<uint32_t>(std::min(remaining_budget, rt.ring_slots)))) {
+	              break;
+	            }
+	            if (!persistent_bridge_copy_fence(rt)) {
+	              break;
+	            }
+	            for (int i = 0; i < std::min(remaining_budget, rt.ring_slots); ++i) {
+	              const uint32_t slot_id = (cursor + static_cast<uint32_t>(i)) % static_cast<uint32_t>(rt.ring_slots);
+	              const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
+	              PersistentRingSlot& slot = rt.rings_host[idx];
+	              if (slot.state != 1) {
+	                continue;
+	              }
+	              if (slot.len <= 0 || slot.len > max_packet) {
+	                slot.state = 0;
+	                slot.len = 0;
+	                slot.stream_id = 0;
+	                slot.stream_slot = -1;
+	                slot.protocol = 0;
+	                (void)persistent_set_device_slot_state(rt, q, slot_id, 0);
+	                local_drops += 1u;
+	                local_released += 1u;
+	                progressed = true;
+	                continue;
+	              }
+	              submit_frame_ids.push_back(slot_id);
+	              submit_lengths.push_back(static_cast<uint16_t>(slot.len));
+	              afpacket_stream_slots.push_back(slot.stream_slot);
+	              if (static_cast<int>(submit_frame_ids.size()) >= remaining_budget) {
+	                break;
+	              }
+	            }
+	            if (submit_frame_ids.empty()) {
+	              break;
+	            }
+	            if (!persistent_copy_payload_batch_to_host(
+	                    rt,
+	                    q,
+	                    submit_frame_ids.data(),
+	                    submit_lengths.data(),
+	                    submit_frame_ids.size())) {
+	              break;
+	            }
+	            if (!persistent_bridge_copy_fence(rt)) {
+	              break;
+	            }
+	            doca_packet_ptrs.clear();
+	            for (size_t i = 0; i < submit_frame_ids.size(); ++i) {
+	              const uint32_t slot_id = submit_frame_ids[i];
+	              const uint8_t* payload =
+	                  rt.payload_host +
+	                  ((static_cast<size_t>(q) * static_cast<size_t>(rt.ring_slots) + static_cast<size_t>(slot_id)) *
+	                   static_cast<size_t>(kPersistentUmemFrameSize)) +
+	                  static_cast<size_t>(kPersistentUmemHeadroom);
+	              doca_packet_ptrs.push_back(payload);
+	            }
+	            int sent = 0;
+	            int errors = 0;
+	            char errbuf[160];
+	            errbuf[0] = '\0';
+	            const int rc = rt.tx_bridge.doca_api->send_vector(
+	                rt.tx_bridge.doca_txq_handles[static_cast<size_t>(q)],
+	                doca_packet_ptrs.data(),
+	                submit_lengths.data(),
+	                afpacket_stream_slots.data(),
+	                static_cast<int>(submit_frame_ids.size()),
+	                &sent,
+	                &errors,
+	                errbuf,
+	                sizeof(errbuf));
+	            if (sent < 0) {
+	              sent = 0;
+	            }
+	            if (sent > static_cast<int>(submit_frame_ids.size())) {
+	              sent = static_cast<int>(submit_frame_ids.size());
+	            }
+	            if (rc < 0 || sent <= 0) {
+	              rt.threads_running.store(false, std::memory_order_relaxed);
+	              rt.ctrl->run = 0;
+	              if (rt.run_flag_dev) {
+	                const int32_t run_off = 0;
+	                (void)cudaMemcpy(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice);
+	              }
+	              break;
+	            }
+	            for (int i = 0; i < sent; ++i) {
+	              const uint32_t slot_id = submit_frame_ids[static_cast<size_t>(i)];
+	              const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
+	              PersistentRingSlot& slot = rt.rings_host[idx];
+	              slot.state = 0;
+	              slot.len = 0;
+	              slot.stream_id = 0;
+	              slot.stream_slot = -1;
+	              slot.protocol = 0;
+	              (void)persistent_set_device_slot_state(rt, q, slot_id, 0);
+	              local_released += 1u;
+	              const int32_t slot_idx = afpacket_stream_slots[static_cast<size_t>(i)];
+	              if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
+	                rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+	                if (rt.streams) {
+	                  host_u32_add(&rt.streams[slot_idx].completed, 1u);
+	                }
+	              }
+	            }
+	            drained += static_cast<uint64_t>(sent);
+	            progressed = true;
+	            local_sent += static_cast<uint64_t>(sent);
+	            rt.queue_sent_counts[static_cast<size_t>(q)] += static_cast<uint64_t>(sent);
+	            cursor = (cursor + static_cast<uint32_t>(sent)) % static_cast<uint32_t>(rt.ring_slots);
+	            if (sent < static_cast<int>(submit_frame_ids.size())) {
+	              break;
+	            }
+	            continue;
+	          }
+
+	          if (rt.tx_bridge.kind == PersistentTxBackendKind::kAfPacket && rt.tx_bridge.afpacket_send_bridge &&
+	                !rt.tx_bridge.iface.empty()) {
               const int max_packet = (rt.ctrl && rt.ctrl->max_packet_bytes > 0) ? rt.ctrl->max_packet_bytes : kPersistentMaxPacketBytes;
               const int burst_limit = std::max(1, rt.bridge_max_burst);
               const int remaining_budget = std::max(1, burst_limit - static_cast<int>(drained));
@@ -5358,6 +5566,7 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << "\"compat_fallback_count\":" << g_compat_fallback_count.load(std::memory_order_relaxed) << ","
         << "\"persistent_tx_backend\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.active) << "\","
         << "\"persistent_tx_iface\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.iface) << "\","
+        << "\"persistent_tx_doca_device\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.doca_device) << "\","
         << "\"persistent_bridge_ipg_ns\":" << g_persistent_runtime.bridge_ipg_ns << ","
         << "\"persistent_tx_bridge_sent\":" << (rt_active ? g_persistent_runtime.ctrl->tx_bridge_sent : 0u) << ","
         << "\"persistent_produced\":" << (rt_active ? g_persistent_runtime.ctrl->produced : 0u) << ","
