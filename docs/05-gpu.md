@@ -22,12 +22,28 @@ Bu belge GPU packet/payload ve classifier katmaninin mevcut uygulamasini aciklar
 - `--gpu-defense-mode on|off`
 - `--gpu-classifier-runtime tensorrt`
 - `--gpu-classifier-engine-path <engine>`
-- `--gpu-rdma-mode auto|direct|host_staging`
+- `--gpu-rdma-mode auto|direct|host_staging|doca_gpunetio`
 - `--gpu-rdma-strict`
 - `--gpu-batch-max`
 - `--gpu-batch-flush-timeout-ms`
 
 Detayli env/cli mapping icin: `docs/20-env-cli-reference.md`
+
+## DOCA GPUNetIO Modu (Hybrid + Strict)
+
+`doca_gpunetio`, mevcut yapiyi kaldirmadan eklenen yeni backend hattidir.
+
+Pratik notlar:
+
+- Persistent + stream modunda backend strict preflight ile dogrulanir.
+- `doca_gpunetio` seciminde zorunlu env/parametreler:
+  - `SAMURAI_GPU_DOCA_ENABLE=1`
+  - `SAMURAI_GPU_DOCA_DEVICE` (orn: `mlx5_0`)
+  - `--xdp-interface`
+- Uygun olmayan ortamda fallback yerine fail-visible davranis beklenir.
+
+Detayli gecis durumu:
+- `docs/33-doca-gpunetio-migration-status.md`
 
 ## Send-Path Classifier Akisi
 

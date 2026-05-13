@@ -255,7 +255,7 @@ Notlar:
 | `--gpu-defense-mode` | `off` | `on, off` | `SAMURAI_GPU_DEFENSE_MODE` | GPU defense/classifier hattı: on\|off (varsayılan: off). |
 | `--gpu-classifier-runtime` | `tensorrt` | `tensorrt` | `SAMURAI_GPU_CLASSIFIER_RUNTIME` | GPU classifier runtime: tensorrt. |
 | `--gpu-classifier-engine-path` | `-` | `-` | `SAMURAI_GPU_CLASSIFIER_ENGINE_PATH` | Offline-build edilmiş TensorRT .engine dosya yolu. |
-| `--gpu-rdma-mode` | `auto` | `auto, direct, host_staging` | `SAMURAI_GPU_RDMA_MODE` | GPU RDMA modu: auto\|direct\|host_staging. |
+| `--gpu-rdma-mode` | `auto` | `auto, direct, host_staging, doca_gpunetio` | `SAMURAI_GPU_RDMA_MODE` | GPU RDMA modu: auto\|direct\|host_staging\|doca_gpunetio. |
 | `--gpu-rdma-strict, --no-gpu-rdma-strict` | `False` | `-` | `SAMURAI_GPU_RDMA_STRICT` | RDMA strict mod: fallback yerine fail-visible hard fail. |
 | `--gpu-batch-max` | `1024` | `-` | `SAMURAI_GPU_BATCH_MAX` | Defense dinamik batching max batch boyutu. |
 | `--gpu-batch-flush-timeout-ms` | `2` | `-` | `SAMURAI_GPU_BATCH_FLUSH_TIMEOUT_MS` | Defense batch flush timeout (ms). |
@@ -670,6 +670,35 @@ Lisans ozel notu: `--license-key` > `SAMURAI_LICENSE_KEY` > `~/.samurai/license.
 
 Control-plane ozel notu: bazi token/secret degerleri yalniz env uzerinden tasinmaya daha uygundur (ornek: `SAMURAI_CLUSTER_SECRET`, `SAMURAI_MANAGEMENT_API_*`).
 
-## 5) Bakim Notu
+## 5) DOCA GPUNetIO Native Env Notlari
+
+Asagidaki env adlari native CUDA/DOCA katmaninda kullanilir; hepsi parser flag'i olarak gecmeyebilir:
+
+- `SAMURAI_GPU_DOCA_ENABLE`
+- `SAMURAI_GPU_DOCA_DEVICE`
+- `SAMURAI_GPU_DOCA_GPU_ID`
+- `SAMURAI_GPU_DOCA_SHIM_SO`
+- `SAMURAI_GPU_DOCA_RX_QUEUE_ID`
+- `SAMURAI_GPU_DOCA_RX_QUEUE_COUNT`
+- `SAMURAI_GPU_DOCA_RX_DEVICE_PATH`
+- `SAMURAI_GPU_DOCA_RX_DEVICE_PATH_STRICT`
+- `SAMURAI_GPU_DOCA_FLOW_STEERING`
+- `SAMURAI_GPU_DOCA_FLOW_STEERING_STRICT`
+- `SAMURAI_GPU_DOCA_FLOW_PROTO_MASK`
+- `SAMURAI_GPU_DOCA_FLOW_PORT_DEVARGS`
+- `SAMURAI_GPU_DOCA_FLOW_STREAMS_MULTI_PIPE`
+- `SAMURAI_GPU_DOCA_FLOW_SHIM_SO`
+
+Strict calisma beklentisi:
+
+1. `SAMURAI_GPU_TX_BACKEND=doca_gpunetio`
+2. `SAMURAI_GPU_TX_BACKEND_STRICT=1`
+3. `SAMURAI_GPU_DOCA_ENABLE=1`
+4. `SAMURAI_GPU_DOCA_DEVICE` dolu
+5. `--xdp-interface` verilmis
+
+Bu kombinasyonda amac fallback degil, ortam hazir degilse net fail-visible davranistir.
+
+## 6) Bakim Notu
 
 Bu dosya `ddos_samurai.cli.args.build_parser()` introspection'i + `ddos_samurai/cli/*.py` env taramasi ile guncellenebilir. Yeni flag/env eklediginde bu referansi da birlikte guncelle.

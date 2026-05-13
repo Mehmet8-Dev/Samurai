@@ -117,6 +117,7 @@ pytest tests -q -rs
 - [Dokümantasyon İndeksi](docs/README.md)
 - [Scenario Engine (Web/Mobile Persona)](docs/28-scenario-engine-web-mobile-persona.md)
 - [L7 Native Custom QUIC/H3 Parity Planı](docs/PLAN_L7_NATIVE_CUSTOM_QUIC_H3_PARITY.md)
+- [DOCA GPUNetIO Geçiş Durumu](docs/33-doca-gpunetio-migration-status.md)
 
 ## Lisans
 
