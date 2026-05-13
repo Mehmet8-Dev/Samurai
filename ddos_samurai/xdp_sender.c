@@ -53,6 +53,7 @@
 #include <arpa/inet.h>
 
 #include "xdp_native_api.h"
+#include "samurai_tsc.h"
 
 // ============================================================================
 // Configuration Constants
@@ -69,6 +70,12 @@
 
 #define MAX_PACKET_SIZE     1500        // Maximum packet payload size
 #define POLL_TIMEOUT_MS     100         // Poll timeout in milliseconds
+
+// Pacing modes (aligned with pacing_engine)
+#define XDP_PACING_NONE     0
+#define XDP_PACING_RPS      1
+#define XDP_PACING_IPG      2
+#define XDP_PACING_BURST    3
 
 // ============================================================================
 // XDP Ring Buffer Structures
@@ -207,6 +214,334 @@ static inline void xdp_record_send_timing(xdp_context_t *ctx, uint64_t elapsed_n
     ctx->tx_send_ns_total += elapsed_ns;
     if (elapsed_ns > ctx->tx_send_ns_max) {
         ctx->tx_send_ns_max = elapsed_ns;
+    }
+}
+
+typedef struct {
+    int mode;
+    double target_rps;
+    uint64_t ipg_ns;
+    int burst_size;
+    uint64_t burst_gap_ns;
+} xdp_pacing_config_t;
+
+typedef struct {
+    double tokens;
+    double max_tokens;
+    double refill_rate;
+    uint64_t last_refill_ns;
+} xdp_token_bucket_t;
+
+static pthread_once_t g_xdp_tsc_once = PTHREAD_ONCE_INIT;
+static int g_xdp_tsc_supported = 0;
+static int g_xdp_tsc_enabled = 0;
+static uint64_t g_xdp_tsc_hz = 0;
+static __thread uint64_t g_xdp_tsc_anchor_ns = 0;
+static __thread uint64_t g_xdp_tsc_anchor_cycles = 0;
+
+static inline uint64_t xdp_time_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static inline int xdp_env_truthy(const char *name, int fallback)
+{
+    const char *raw = getenv(name);
+    if (raw == NULL || raw[0] == '\0') {
+        return fallback;
+    }
+    if (
+        strcmp(raw, "1") == 0 ||
+        strcasecmp(raw, "true") == 0 ||
+        strcasecmp(raw, "yes") == 0 ||
+        strcasecmp(raw, "on") == 0
+    ) {
+        return 1;
+    }
+    return 0;
+}
+
+static inline uint64_t xdp_tsc_cycles_to_ns(uint64_t cycles)
+{
+    if (g_xdp_tsc_hz == 0) {
+        return 0;
+    }
+    return (uint64_t)(((__uint128_t)cycles * 1000000000ULL) / g_xdp_tsc_hz);
+}
+
+static inline uint64_t xdp_tsc_ns_to_cycles(uint64_t ns)
+{
+    if (g_xdp_tsc_hz == 0) {
+        return 0;
+    }
+    return (uint64_t)(((__uint128_t)ns * g_xdp_tsc_hz) / 1000000000ULL);
+}
+
+static inline void xdp_tsc_refresh_anchor(void)
+{
+    if (!g_xdp_tsc_enabled) {
+        return;
+    }
+    g_xdp_tsc_anchor_cycles = samurai_rdtsc();
+    g_xdp_tsc_anchor_ns = xdp_time_ns();
+}
+
+static void xdp_tsc_init_once(void)
+{
+    int want_tsc = xdp_env_truthy("SAMURAI_XDP_PACING_USE_TSC", 1);
+    g_xdp_tsc_supported = samurai_tsc_invariant_supported();
+    g_xdp_tsc_enabled = 0;
+    g_xdp_tsc_hz = 0;
+    if (!want_tsc || !g_xdp_tsc_supported) {
+        return;
+    }
+
+    uint64_t c0 = samurai_rdtsc();
+    uint64_t t0 = xdp_time_ns();
+    struct timespec req;
+    uint64_t target = t0 + 25000000ULL; /* 25 ms */
+    req.tv_sec = target / 1000000000ULL;
+    req.tv_nsec = target % 1000000000ULL;
+    (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &req, NULL);
+    uint64_t c1 = samurai_rdtsc();
+    uint64_t t1 = xdp_time_ns();
+
+    if (c1 > c0 && t1 > t0) {
+        g_xdp_tsc_hz = (uint64_t)(((__uint128_t)(c1 - c0) * 1000000000ULL) / (t1 - t0));
+    }
+    if (g_xdp_tsc_hz < 1000000ULL || g_xdp_tsc_hz > 10000000000ULL) {
+        g_xdp_tsc_hz = 0;
+        return;
+    }
+
+    g_xdp_tsc_enabled = 1;
+}
+
+static inline void xdp_tsc_ensure_ready(void)
+{
+    pthread_once(&g_xdp_tsc_once, xdp_tsc_init_once);
+}
+
+static inline uint64_t xdp_time_ns_fast(void)
+{
+    xdp_tsc_ensure_ready();
+    if (!g_xdp_tsc_enabled || g_xdp_tsc_hz == 0) {
+        return xdp_time_ns();
+    }
+
+    uint64_t now_cycles = samurai_rdtsc();
+    if (g_xdp_tsc_anchor_cycles == 0 || now_cycles < g_xdp_tsc_anchor_cycles) {
+        xdp_tsc_refresh_anchor();
+        now_cycles = samurai_rdtsc();
+    }
+
+    uint64_t max_drift_cycles = g_xdp_tsc_hz / 2U;
+    if (max_drift_cycles > 0 && (now_cycles - g_xdp_tsc_anchor_cycles) > max_drift_cycles) {
+        xdp_tsc_refresh_anchor();
+        now_cycles = samurai_rdtsc();
+    }
+
+    return g_xdp_tsc_anchor_ns + xdp_tsc_cycles_to_ns(now_cycles - g_xdp_tsc_anchor_cycles);
+}
+
+static inline uint64_t xdp_tsc_deadline_from_ns(uint64_t target_ns)
+{
+    uint64_t now_ns = xdp_time_ns_fast();
+    uint64_t now_cycles = samurai_rdtsc();
+    if (target_ns <= now_ns) {
+        return now_cycles;
+    }
+    return now_cycles + xdp_tsc_ns_to_cycles(target_ns - now_ns);
+}
+
+static inline void xdp_cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("yield" ::: "memory");
+#else
+    __asm__ volatile("" ::: "memory");
+#endif
+}
+
+static inline void xdp_wait_until_ns(uint64_t target_ns)
+{
+    uint64_t now_ns = xdp_time_ns();
+    if (now_ns >= target_ns) {
+        return;
+    }
+
+    if (g_xdp_tsc_enabled) {
+        uint64_t target_cycles = xdp_tsc_deadline_from_ns(target_ns);
+        while (samurai_rdtsc() < target_cycles) {
+            xdp_cpu_relax();
+        }
+        return;
+    }
+
+    while (xdp_time_ns() < target_ns) {
+        xdp_cpu_relax();
+    }
+}
+
+static inline void xdp_tb_init(xdp_token_bucket_t *tb, double rps, double burst, uint64_t now_ns)
+{
+    tb->tokens = burst;
+    tb->max_tokens = burst;
+    tb->refill_rate = rps / 1e9;
+    tb->last_refill_ns = now_ns;
+}
+
+static inline int xdp_tb_try_consume(xdp_token_bucket_t *tb, uint64_t now_ns)
+{
+    double elapsed = (double)(now_ns - tb->last_refill_ns);
+    tb->tokens += elapsed * tb->refill_rate;
+    if (tb->tokens > tb->max_tokens) {
+        tb->tokens = tb->max_tokens;
+    }
+    tb->last_refill_ns = now_ns;
+    if (tb->tokens >= 1.0) {
+        tb->tokens -= 1.0;
+        return 1;
+    }
+    return 0;
+}
+
+static int xdp_prepare_pacing_config(
+    xdp_pacing_config_t *cfg,
+    int mode,
+    double target_rps,
+    uint64_t ipg_ns,
+    int burst_size,
+    uint64_t burst_gap_ns
+)
+{
+    if (cfg == NULL) {
+        return -1;
+    }
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->mode = mode;
+    cfg->target_rps = target_rps;
+    cfg->ipg_ns = ipg_ns;
+    cfg->burst_size = burst_size;
+    cfg->burst_gap_ns = burst_gap_ns;
+
+    switch (mode) {
+        case XDP_PACING_NONE:
+            return 0;
+        case XDP_PACING_RPS:
+            if (target_rps <= 0.0) {
+                return -1;
+            }
+            if (cfg->burst_size <= 0) {
+                cfg->burst_size = 1;
+            }
+            return 0;
+        case XDP_PACING_IPG:
+            if (ipg_ns == 0) {
+                return -1;
+            }
+            return 0;
+        case XDP_PACING_BURST:
+            if (cfg->burst_size <= 0) {
+                return -1;
+            }
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+static int xdp_wait_for_pacing_slot(
+    const xdp_pacing_config_t *cfg,
+    xdp_token_bucket_t *tb,
+    uint64_t *ipg_next_ns,
+    int *burst_counter,
+    uint64_t *burst_resume_ns
+)
+{
+    if (cfg == NULL || cfg->mode == XDP_PACING_NONE) {
+        return 0;
+    }
+
+    for (;;) {
+        uint64_t now_ns = xdp_time_ns_fast();
+        if (cfg->mode == XDP_PACING_RPS) {
+            if (xdp_tb_try_consume(tb, now_ns)) {
+                return 0;
+            }
+            if (tb->refill_rate <= 0.0) {
+                return -1;
+            }
+            double deficit = 1.0 - tb->tokens;
+            if (deficit < 0.0) {
+                deficit = 0.0;
+            }
+            uint64_t wait_ns = (uint64_t)(deficit / tb->refill_rate);
+            if (wait_ns == 0) {
+                wait_ns = 1;
+            }
+            xdp_wait_until_ns(now_ns + wait_ns);
+            continue;
+        }
+
+        if (cfg->mode == XDP_PACING_IPG) {
+            if (ipg_next_ns != NULL && *ipg_next_ns > now_ns) {
+                xdp_wait_until_ns(*ipg_next_ns);
+                continue;
+            }
+            return 0;
+        }
+
+        if (cfg->mode == XDP_PACING_BURST) {
+            if (
+                burst_counter != NULL &&
+                *burst_counter >= cfg->burst_size &&
+                cfg->burst_gap_ns > 0 &&
+                burst_resume_ns != NULL &&
+                *burst_resume_ns > now_ns
+            ) {
+                xdp_wait_until_ns(*burst_resume_ns);
+                continue;
+            }
+            if (burst_counter != NULL && *burst_counter >= cfg->burst_size) {
+                *burst_counter = 0;
+            }
+            return 0;
+        }
+
+        return -1;
+    }
+}
+
+static void xdp_update_pacing_after_send(
+    const xdp_pacing_config_t *cfg,
+    uint64_t *ipg_next_ns,
+    int *burst_counter,
+    uint64_t *burst_resume_ns
+)
+{
+    if (cfg == NULL || cfg->mode == XDP_PACING_NONE) {
+        return;
+    }
+    if (cfg->mode == XDP_PACING_IPG) {
+        if (ipg_next_ns != NULL) {
+            uint64_t now_ns = xdp_time_ns_fast();
+            if (*ipg_next_ns < now_ns) {
+                *ipg_next_ns = now_ns;
+            }
+            *ipg_next_ns += cfg->ipg_ns;
+        }
+        return;
+    }
+    if (cfg->mode == XDP_PACING_BURST && burst_counter != NULL) {
+        *burst_counter += 1;
+        if (*burst_counter >= cfg->burst_size && cfg->burst_gap_ns > 0 && burst_resume_ns != NULL) {
+            *burst_resume_ns = xdp_time_ns_fast() + cfg->burst_gap_ns;
+        }
     }
 }
 
@@ -1588,6 +1923,147 @@ static int xdp_send_strided_ctx(
     return total_sent;
 }
 
+static int xdp_send_vector_paced_ctx(
+    xdp_context_t *ctx,
+    const uint8_t **packets,
+    uint16_t *lengths,
+    Py_ssize_t valid_count,
+    const xdp_pacing_config_t *cfg
+)
+{
+    int total_sent = 0;
+    Py_ssize_t offset = 0;
+    uint64_t ipg_next_ns = xdp_time_ns_fast();
+    uint64_t burst_resume_ns = ipg_next_ns;
+    int burst_counter = 0;
+    xdp_token_bucket_t tb;
+    memset(&tb, 0, sizeof(tb));
+
+    if (cfg == NULL || cfg->mode == XDP_PACING_NONE) {
+        return xdp_send_vector_ctx(ctx, packets, lengths, valid_count);
+    }
+    if (cfg->mode == XDP_PACING_RPS) {
+        xdp_tb_init(
+            &tb,
+            cfg->target_rps,
+            (cfg->burst_size > 0) ? (double)cfg->burst_size : 1.0,
+            xdp_time_ns_fast()
+        );
+    }
+
+    while (offset < valid_count) {
+        if (
+            xdp_wait_for_pacing_slot(
+                cfg,
+                &tb,
+                &ipg_next_ns,
+                &burst_counter,
+                &burst_resume_ns
+            ) < 0
+        ) {
+            break;
+        }
+
+        int sent = xdp_send_batch_ctx(ctx, ctx->xsk, packets + offset, lengths + offset, 1);
+        if (sent <= 0) {
+            ctx->tx_retry_loops += 1;
+            ctx->tx_backpressure_events += 1;
+            complete_tx_ctx(ctx, ctx->xsk);
+            sent = xdp_send_batch_ctx(ctx, ctx->xsk, packets + offset, lengths + offset, 1);
+        }
+        if (sent <= 0) {
+            break;
+        }
+        if (sent > 1) {
+            sent = 1;
+        }
+        total_sent += sent;
+        offset += sent;
+        xdp_update_pacing_after_send(cfg, &ipg_next_ns, &burst_counter, &burst_resume_ns);
+    }
+
+    return total_sent;
+}
+
+static int xdp_send_strided_paced_ctx(
+    xdp_context_t *ctx,
+    const uint8_t *base,
+    uint16_t packet_size,
+    int stride,
+    Py_ssize_t count,
+    const xdp_pacing_config_t *cfg
+)
+{
+    int total_sent = 0;
+    Py_ssize_t offset = 0;
+    uint64_t ipg_next_ns = xdp_time_ns_fast();
+    uint64_t burst_resume_ns = ipg_next_ns;
+    int burst_counter = 0;
+    xdp_token_bucket_t tb;
+    memset(&tb, 0, sizeof(tb));
+
+    if (cfg == NULL || cfg->mode == XDP_PACING_NONE) {
+        return xdp_send_strided_ctx(ctx, base, packet_size, stride, count);
+    }
+    if (cfg->mode == XDP_PACING_RPS) {
+        xdp_tb_init(
+            &tb,
+            cfg->target_rps,
+            (cfg->burst_size > 0) ? (double)cfg->burst_size : 1.0,
+            xdp_time_ns_fast()
+        );
+    }
+
+    while (offset < count) {
+        if (
+            xdp_wait_for_pacing_slot(
+                cfg,
+                &tb,
+                &ipg_next_ns,
+                &burst_counter,
+                &burst_resume_ns
+            ) < 0
+        ) {
+            break;
+        }
+
+        int sent = xdp_send_batch_ctx_strided(
+            ctx,
+            ctx->xsk,
+            base,
+            packet_size,
+            stride,
+            offset,
+            1
+        );
+        if (sent <= 0) {
+            ctx->tx_retry_loops += 1;
+            ctx->tx_backpressure_events += 1;
+            complete_tx_ctx(ctx, ctx->xsk);
+            sent = xdp_send_batch_ctx_strided(
+                ctx,
+                ctx->xsk,
+                base,
+                packet_size,
+                stride,
+                offset,
+                1
+            );
+        }
+        if (sent <= 0) {
+            break;
+        }
+        if (sent > 1) {
+            sent = 1;
+        }
+        total_sent += sent;
+        offset += sent;
+        xdp_update_pacing_after_send(cfg, &ipg_next_ns, &burst_counter, &burst_resume_ns);
+    }
+
+    return total_sent;
+}
+
 static int xdp_submit_frame_ids_ctx(
     xdp_context_t *ctx,
     const uint32_t *frame_ids,
@@ -2018,6 +2494,203 @@ static PyObject* py_xdp_send_buffer_strided(PyObject* self, PyObject* args)
     Py_BEGIN_ALLOW_THREADS
     clock_gettime(CLOCK_MONOTONIC, &send_start);
     total_sent = xdp_send_vector_locked(g_send_scratch.packets, g_send_scratch.lengths, (Py_ssize_t)count);
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    Py_END_ALLOW_THREADS
+    xdp_record_send_timing(&xdp_ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+    pthread_mutex_unlock(&xdp_ctx.lock);
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(total_sent);
+}
+
+/**
+ * Send packets from contiguous buffer with native pacing.
+ * Python: xdp_send_buffer_paced(buffer, packet_size, count,
+ *                               pacing_mode=1, target_rps=0.0,
+ *                               ipg_ns=0, burst_size=1, burst_gap_ns=0) -> int
+ */
+static PyObject* py_xdp_send_buffer_paced(PyObject* self, PyObject* args)
+{
+    Py_buffer view;
+    int packet_size = 0;
+    int count = 0;
+    int pacing_mode = XDP_PACING_RPS;
+    double target_rps = 0.0;
+    unsigned long long ipg_ns_ull = 0;
+    int burst_size = 1;
+    unsigned long long burst_gap_ns_ull = 0;
+    xdp_pacing_config_t cfg;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*ii|idKiK",
+                          &view, &packet_size, &count,
+                          &pacing_mode, &target_rps, &ipg_ns_ull, &burst_size, &burst_gap_ns_ull)) {
+        return NULL;
+    }
+    if (packet_size <= 0 || count < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size must be > 0 and count must be >= 0");
+        return NULL;
+    }
+    if (count == 0) {
+        PyBuffer_Release(&view);
+        return PyLong_FromLong(0);
+    }
+    if ((size_t)view.len < ((size_t)packet_size * (size_t)count)) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "buffer smaller than packet_size * count");
+        return NULL;
+    }
+    if (packet_size > 65535) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size exceeds uint16_t limit");
+        return NULL;
+    }
+    if (xdp_prepare_pacing_config(
+            &cfg,
+            pacing_mode,
+            target_rps,
+            (uint64_t)ipg_ns_ull,
+            burst_size,
+            (uint64_t)burst_gap_ns_ull
+        ) != 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(
+            PyExc_ValueError,
+            "invalid pacing config (mode=0:none,1:rps,2:ipg,3:burst; validate rps/ipg/burst params)"
+        );
+        return NULL;
+    }
+
+    pthread_mutex_lock(&xdp_ctx.lock);
+    if (!xdp_ctx.is_initialized || !xdp_ctx.is_running) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
+        return NULL;
+    }
+    if (ensure_send_scratch_capacity((Py_ssize_t)count) < 0) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyBuffer_Release(&view);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    const uint8_t *base = (const uint8_t*)view.buf;
+    for (int i = 0; i < count; i++) {
+        g_send_scratch.packets[i] = base + ((size_t)i * (size_t)packet_size);
+        g_send_scratch.lengths[i] = (uint16_t)packet_size;
+    }
+
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+    Py_BEGIN_ALLOW_THREADS
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_vector_paced_ctx(
+        &xdp_ctx,
+        g_send_scratch.packets,
+        g_send_scratch.lengths,
+        (Py_ssize_t)count,
+        &cfg
+    );
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    Py_END_ALLOW_THREADS
+    xdp_record_send_timing(&xdp_ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+    pthread_mutex_unlock(&xdp_ctx.lock);
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(total_sent);
+}
+
+/**
+ * Send packets from strided buffer with native pacing.
+ * Python: xdp_send_buffer_strided_paced(buffer, packet_size, stride, count,
+ *                                       pacing_mode=1, target_rps=0.0,
+ *                                       ipg_ns=0, burst_size=1, burst_gap_ns=0) -> int
+ */
+static PyObject* py_xdp_send_buffer_strided_paced(PyObject* self, PyObject* args)
+{
+    Py_buffer view;
+    int packet_size = 0;
+    int stride = 0;
+    int count = 0;
+    int pacing_mode = XDP_PACING_RPS;
+    double target_rps = 0.0;
+    unsigned long long ipg_ns_ull = 0;
+    int burst_size = 1;
+    unsigned long long burst_gap_ns_ull = 0;
+    xdp_pacing_config_t cfg;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*iii|idKiK",
+                          &view, &packet_size, &stride, &count,
+                          &pacing_mode, &target_rps, &ipg_ns_ull, &burst_size, &burst_gap_ns_ull)) {
+        return NULL;
+    }
+    if (packet_size <= 0 || stride <= 0 || count < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size/stride must be > 0 and count must be >= 0");
+        return NULL;
+    }
+    if (stride < packet_size) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "stride must be >= packet_size");
+        return NULL;
+    }
+    if (count == 0) {
+        PyBuffer_Release(&view);
+        return PyLong_FromLong(0);
+    }
+    if (packet_size > 65535) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size exceeds uint16_t limit");
+        return NULL;
+    }
+    {
+        const size_t needed = ((size_t)(count - 1) * (size_t)stride) + (size_t)packet_size;
+        if ((size_t)view.len < needed) {
+            PyBuffer_Release(&view);
+            PyErr_SetString(PyExc_ValueError, "buffer smaller than strided packet range");
+            return NULL;
+        }
+    }
+    if (xdp_prepare_pacing_config(
+            &cfg,
+            pacing_mode,
+            target_rps,
+            (uint64_t)ipg_ns_ull,
+            burst_size,
+            (uint64_t)burst_gap_ns_ull
+        ) != 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(
+            PyExc_ValueError,
+            "invalid pacing config (mode=0:none,1:rps,2:ipg,3:burst; validate rps/ipg/burst params)"
+        );
+        return NULL;
+    }
+
+    pthread_mutex_lock(&xdp_ctx.lock);
+    if (!xdp_ctx.is_initialized || !xdp_ctx.is_running) {
+        pthread_mutex_unlock(&xdp_ctx.lock);
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "XDP not initialized");
+        return NULL;
+    }
+
+    const uint8_t *base = (const uint8_t*)view.buf;
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+    Py_BEGIN_ALLOW_THREADS
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_strided_paced_ctx(
+        &xdp_ctx,
+        base,
+        (uint16_t)packet_size,
+        stride,
+        (Py_ssize_t)count,
+        &cfg
+    );
     clock_gettime(CLOCK_MONOTONIC, &send_end);
     Py_END_ALLOW_THREADS
     xdp_record_send_timing(&xdp_ctx, xdp_timespec_diff_ns(&send_start, &send_end));
@@ -2839,6 +3512,204 @@ static PyObject* py_xdp_send_buffer_strided_ctx(PyObject* self, PyObject* args)
     return PyLong_FromLong(total_sent);
 }
 
+static PyObject* py_xdp_send_buffer_paced_ctx(PyObject* self, PyObject* args)
+{
+    int handle = 0;
+    Py_buffer view;
+    int packet_size = 0;
+    int count = 0;
+    int pacing_mode = XDP_PACING_RPS;
+    double target_rps = 0.0;
+    unsigned long long ipg_ns_ull = 0;
+    int burst_size = 1;
+    unsigned long long burst_gap_ns_ull = 0;
+    xdp_context_t *ctx = NULL;
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+    xdp_pacing_config_t cfg;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "iy*ii|idKiK",
+                          &handle, &view, &packet_size, &count,
+                          &pacing_mode, &target_rps, &ipg_ns_ull, &burst_size, &burst_gap_ns_ull)) {
+        return NULL;
+    }
+    if (packet_size <= 0 || count < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size must be > 0 and count must be >= 0");
+        return NULL;
+    }
+    if (count == 0) {
+        PyBuffer_Release(&view);
+        return PyLong_FromLong(0);
+    }
+    if ((size_t)view.len < ((size_t)packet_size * (size_t)count)) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "buffer smaller than packet_size * count");
+        return NULL;
+    }
+    if (packet_size > 65535) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size exceeds uint16_t limit");
+        return NULL;
+    }
+    if (xdp_prepare_pacing_config(
+            &cfg,
+            pacing_mode,
+            target_rps,
+            (uint64_t)ipg_ns_ull,
+            burst_size,
+            (uint64_t)burst_gap_ns_ull
+        ) != 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(
+            PyExc_ValueError,
+            "invalid pacing config (mode=0:none,1:rps,2:ipg,3:burst; validate rps/ipg/burst params)"
+        );
+        return NULL;
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_KeyError, "Invalid XDP context handle");
+        return NULL;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "XDP context not initialized");
+        return NULL;
+    }
+    if (ensure_ctx_send_scratch_capacity(ctx, (Py_ssize_t)count) < 0) {
+        pthread_mutex_unlock(&ctx->lock);
+        PyBuffer_Release(&view);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    const uint8_t *base = (const uint8_t*)view.buf;
+    for (int i = 0; i < count; i++) {
+        ctx->scratch_packets[i] = base + ((size_t)i * (size_t)packet_size);
+        ctx->scratch_lengths[i] = (uint16_t)packet_size;
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_vector_paced_ctx(
+        ctx,
+        ctx->scratch_packets,
+        ctx->scratch_lengths,
+        (Py_ssize_t)count,
+        &cfg
+    );
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    Py_END_ALLOW_THREADS
+    xdp_record_send_timing(ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+    pthread_mutex_unlock(&ctx->lock);
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(total_sent);
+}
+
+static PyObject* py_xdp_send_buffer_strided_paced_ctx(PyObject* self, PyObject* args)
+{
+    int handle = 0;
+    Py_buffer view;
+    int packet_size = 0;
+    int stride = 0;
+    int count = 0;
+    int pacing_mode = XDP_PACING_RPS;
+    double target_rps = 0.0;
+    unsigned long long ipg_ns_ull = 0;
+    int burst_size = 1;
+    unsigned long long burst_gap_ns_ull = 0;
+    xdp_context_t *ctx = NULL;
+    int total_sent = 0;
+    struct timespec send_start;
+    struct timespec send_end;
+    xdp_pacing_config_t cfg;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "iy*iii|idKiK",
+                          &handle, &view, &packet_size, &stride, &count,
+                          &pacing_mode, &target_rps, &ipg_ns_ull, &burst_size, &burst_gap_ns_ull)) {
+        return NULL;
+    }
+    if (packet_size <= 0 || stride <= 0 || count < 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size/stride must be > 0 and count must be >= 0");
+        return NULL;
+    }
+    if (stride < packet_size) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "stride must be >= packet_size");
+        return NULL;
+    }
+    if (count == 0) {
+        PyBuffer_Release(&view);
+        return PyLong_FromLong(0);
+    }
+    if (packet_size > 65535) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_ValueError, "packet_size exceeds uint16_t limit");
+        return NULL;
+    }
+    {
+        const size_t needed = ((size_t)(count - 1) * (size_t)stride) + (size_t)packet_size;
+        if ((size_t)view.len < needed) {
+            PyBuffer_Release(&view);
+            PyErr_SetString(PyExc_ValueError, "buffer smaller than strided packet range");
+            return NULL;
+        }
+    }
+    if (xdp_prepare_pacing_config(
+            &cfg,
+            pacing_mode,
+            target_rps,
+            (uint64_t)ipg_ns_ull,
+            burst_size,
+            (uint64_t)burst_gap_ns_ull
+        ) != 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(
+            PyExc_ValueError,
+            "invalid pacing config (mode=0:none,1:rps,2:ipg,3:burst; validate rps/ipg/burst params)"
+        );
+        return NULL;
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_KeyError, "Invalid XDP context handle");
+        return NULL;
+    }
+    if (!ctx->is_initialized || !ctx->is_running) {
+        pthread_mutex_unlock(&ctx->lock);
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_RuntimeError, "XDP context not initialized");
+        return NULL;
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+    clock_gettime(CLOCK_MONOTONIC, &send_start);
+    total_sent = xdp_send_strided_paced_ctx(
+        ctx,
+        (const uint8_t*)view.buf,
+        (uint16_t)packet_size,
+        stride,
+        (Py_ssize_t)count,
+        &cfg
+    );
+    clock_gettime(CLOCK_MONOTONIC, &send_end);
+    Py_END_ALLOW_THREADS
+    xdp_record_send_timing(ctx, xdp_timespec_diff_ns(&send_start, &send_end));
+    pthread_mutex_unlock(&ctx->lock);
+    PyBuffer_Release(&view);
+    return PyLong_FromLong(total_sent);
+}
+
 static PyObject* py_xdp_stats_ctx(PyObject* self, PyObject* args)
 {
     int handle = 0;
@@ -3555,9 +4426,17 @@ static PyMethodDef XdpSenderMethods[] = {
      "Send contiguous packet buffer through AF_XDP context.\n"
      "Args: handle (int), buffer (bytes-like), packet_size (int), count (int)\n"
      "Returns: int (number of packets sent)"},
+    {"xdp_send_buffer_paced_ctx", py_xdp_send_buffer_paced_ctx, METH_VARARGS,
+     "Send contiguous packet buffer through AF_XDP context with native pacing.\n"
+     "Args: handle, buffer, packet_size, count, pacing_mode, target_rps, ipg_ns, burst_size, burst_gap_ns\n"
+     "Returns: int (number of packets sent)"},
     {"xdp_send_buffer_strided_ctx", py_xdp_send_buffer_strided_ctx, METH_VARARGS,
      "Send strided packet buffer through AF_XDP context.\n"
      "Args: handle (int), buffer (bytes-like), packet_size (int), stride (int), count (int)\n"
+     "Returns: int (number of packets sent)"},
+    {"xdp_send_buffer_strided_paced_ctx", py_xdp_send_buffer_strided_paced_ctx, METH_VARARGS,
+     "Send strided packet buffer through AF_XDP context with native pacing.\n"
+     "Args: handle, buffer, packet_size, stride, count, pacing_mode, target_rps, ipg_ns, burst_size, burst_gap_ns\n"
      "Returns: int (number of packets sent)"},
     {"xdp_stats_ctx", py_xdp_stats_ctx, METH_VARARGS,
      "Get stats for AF_XDP context.\n"
@@ -3585,9 +4464,17 @@ static PyMethodDef XdpSenderMethods[] = {
      "Send raw packets from contiguous buffer through AF_XDP.\n"
      "Args: buffer (bytes-like), packet_size (int), count (int)\n"
      "Returns: int (number of packets sent)"},
+    {"xdp_send_buffer_paced", py_xdp_send_buffer_paced, METH_VARARGS,
+     "Send raw packets from contiguous buffer through AF_XDP with native pacing.\n"
+     "Args: buffer, packet_size, count, pacing_mode, target_rps, ipg_ns, burst_size, burst_gap_ns\n"
+     "Returns: int (number of packets sent)"},
     {"xdp_send_buffer_strided", py_xdp_send_buffer_strided, METH_VARARGS,
      "Send raw packets from strided buffer through AF_XDP.\n"
      "Args: buffer (bytes-like), packet_size (int), stride (int), count (int)\n"
+     "Returns: int (number of packets sent)"},
+    {"xdp_send_buffer_strided_paced", py_xdp_send_buffer_strided_paced, METH_VARARGS,
+     "Send raw packets from strided buffer through AF_XDP with native pacing.\n"
+     "Args: buffer, packet_size, stride, count, pacing_mode, target_rps, ipg_ns, burst_size, burst_gap_ns\n"
      "Returns: int (number of packets sent)"},
 
     {"xdp_acquire_tx_frame", py_xdp_acquire_tx_frame, METH_NOARGS,
