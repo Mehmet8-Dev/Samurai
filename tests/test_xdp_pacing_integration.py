@@ -188,7 +188,7 @@ class TestXdpPacingRawPath(unittest.IsolatedAsyncioTestCase):
                 log_warning=lambda *_args, **_kw: None,
             )
 
-        self.assertIsNone(seen.get("pacing_config"))
+        self.assertIsNotNone(seen.get("pacing_config"))
         self.assertIsNone(seen.get("paced_send_xdp_fn"))
         self.assertEqual(int(out.get("pacing_bypassed_for_xdp", 0) or 0), 1)
 
@@ -202,6 +202,7 @@ class _FakeStats:
 
 class _FakeXDPSender:
     send_buffer_calls = 0
+    send_buffer_paced_calls = 0
 
     def __init__(self, **kwargs):
         self.interface = kwargs.get("interface") or "lo"
@@ -217,6 +218,10 @@ class _FakeXDPSender:
 
     def send_buffer(self, *_args, **_kwargs):
         _FakeXDPSender.send_buffer_calls += 1
+        return 1
+
+    def send_buffer_paced(self, *_args, **_kwargs):
+        _FakeXDPSender.send_buffer_paced_calls += 1
         return 1
 
     def get_stats(self):
@@ -267,6 +272,45 @@ class TestXdpPacingEntry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(called["paced"], 1)
         self.assertEqual(_FakeXDPSender.send_buffer_calls, 0)
         self.assertEqual(str(out.get("sender_path", "")), "PACED_XDP")
+
+    async def test_entry_uses_native_paced_xdp_when_pacing_engine_missing(self):
+        _FakeXDPSender.send_buffer_calls = 0
+        _FakeXDPSender.send_buffer_paced_calls = 0
+
+        out = await l2l3_entry.xdp_sender(
+            packets_buffer=b"B" * 64,
+            target_ip="127.0.0.1",
+            target_port=80,
+            count=1,
+            verbose=False,
+            interface="lo",
+            queue_id=0,
+            xdp_mode=0,
+            batch_size=64,
+            sender_fallback_policy="allow",
+            fallback_backend="c_ext_l3",
+            sender_context=None,
+            pacing_config=SimpleNamespace(pacing_mode=1, target_rps=1000.0),
+            paced_send_xdp_fn=None,
+            resolve_sender_fallback_policy_fn=lambda _: "allow",
+            resolve_sender_backend_fn=lambda _: "c_ext_l3",
+            raw_socket_sender_fn=None,
+            normalize_packets_buffer_fn=lambda buf, **_: (
+                buf,
+                {"buffer_copy_count": 0, "buffer_copy_bytes": 0},
+            ),
+            stats_fn=lambda **kw: kw,
+            log_info=lambda *_args, **_kw: None,
+            log_warning=lambda *_args, **_kw: None,
+            log_error=lambda *_args, **_kw: None,
+            XDP_AVAILABLE=True,
+            XDPSender=_FakeXDPSender,
+            check_xdp_available=lambda: (True, "ok"),
+        )
+
+        self.assertEqual(_FakeXDPSender.send_buffer_paced_calls, 1)
+        self.assertEqual(_FakeXDPSender.send_buffer_calls, 0)
+        self.assertEqual(str(out.get("sender_path", "")), "PACED_XDP_NATIVE")
 
 
 if __name__ == "__main__":

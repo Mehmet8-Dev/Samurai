@@ -588,7 +588,7 @@ async def paced_raw_socket_sender(
             return out
 
         if pacing_active and not pacing_via_xdp:
-            log_warning("[Pacing] sender-backend=xdp selected; C pacing is bypassed for this path.")
+            log_info("[Pacing][XDP] pacing_engine route unavailable; native XDP pacing route will be attempted.")
         elif pacing_active and not pacing_v2_active:
             log_info("[Pacing][XDP] SAMURAI_XDP_PACING_V2=0, legacy XDP pacing route active.")
 
@@ -609,7 +609,7 @@ async def paced_raw_socket_sender(
             sender_fallback_policy=fallback_policy,
             fallback_backend="c_ext_l3",
             sender_context=sender_context,
-            pacing_config=pacing_config if pacing_via_xdp else None,
+            pacing_config=pacing_config if pacing_active else None,
             paced_send_xdp_fn=paced_send_xdp if pacing_via_xdp else None,
         )
         out = dict(out or {})
@@ -621,7 +621,9 @@ async def paced_raw_socket_sender(
             except _RECOVERABLE_ERRORS:
                 pass
         elif pacing_active:
-            out["pacing_bypassed_for_xdp"] = 1
+            sender_path = str(out.get("sender_path", "") or "")
+            if sender_path not in {"PACED_XDP", "PACED_XDP_NATIVE"}:
+                out["pacing_bypassed_for_xdp"] = 1
         return out
 
     if pacing_config is None or pacing_config.pacing_mode == 0 or not PACING_ENGINE_AVAILABLE:

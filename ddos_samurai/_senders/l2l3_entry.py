@@ -316,37 +316,64 @@ async def xdp_sender(
                     buffer_copy_bytes=int(normalize_meta.get("buffer_copy_bytes", 0) or 0),
                 )
 
-        pacing_active = (
+        pacing_requested = (
             pacing_config is not None
             and int(getattr(pacing_config, "pacing_mode", 0) or 0) != 0
-            and callable(paced_send_xdp_fn)
-            and packet_stride <= 0
         )
 
-        if sender.is_using_xdp and pacing_active:
-            # Prefer explicit iface/queue/mode for robust AF_XDP pacing integration.
-            # Keep backward compatibility with legacy callables that only accept
-            # (buffer, packet_size, count, config=...).
-            try:
-                sent = paced_send_xdp_fn(
-                    sender.interface,
+        if sender.is_using_xdp and pacing_requested:
+            if callable(paced_send_xdp_fn) and packet_stride <= 0:
+                # Prefer explicit iface/queue/mode for robust AF_XDP pacing integration.
+                # Keep backward compatibility with legacy callables that only accept
+                # (buffer, packet_size, count, config=...).
+                try:
+                    sent = paced_send_xdp_fn(
+                        sender.interface,
+                        packets_buffer,
+                        packet_size,
+                        count,
+                        config=pacing_config,
+                        queue_id=int(queue_id or 0),
+                        xdp_mode=int(xdp_mode or 0),
+                        xdp_mode2_policy=mode2_policy,
+                    )
+                except TypeError:
+                    sent = paced_send_xdp_fn(
+                        packets_buffer,
+                        packet_size,
+                        count,
+                        config=pacing_config,
+                    )
+                total_sent = int(sent or 0)
+                sender_path = "PACED_XDP"
+            elif packet_stride > 0 and hasattr(sender, "send_buffer_strided_paced"):
+                sent = sender.send_buffer_strided_paced(
+                    packets_buffer,
+                    packet_size,
+                    packet_stride,
+                    count,
+                    pacing_config,
+                )
+                total_sent = int(sent or 0)
+                sender_path = "PACED_XDP_NATIVE"
+            elif hasattr(sender, "send_buffer_paced"):
+                sent = sender.send_buffer_paced(
                     packets_buffer,
                     packet_size,
                     count,
-                    config=pacing_config,
-                    queue_id=int(queue_id or 0),
-                    xdp_mode=int(xdp_mode or 0),
-                    xdp_mode2_policy=mode2_policy,
+                    pacing_config,
                 )
-            except TypeError:
-                sent = paced_send_xdp_fn(
-                    packets_buffer,
-                    packet_size,
-                    count,
-                    config=pacing_config,
-                )
-            total_sent = int(sent or 0)
-            sender_path = "PACED_XDP"
+                total_sent = int(sent or 0)
+                sender_path = "PACED_XDP_NATIVE"
+            elif hasattr(sender, "send_buffer"):
+                if packet_stride > 0 and hasattr(sender, "send_buffer_strided"):
+                    sent = sender.send_buffer_strided(packets_buffer, packet_size, packet_stride, count)
+                else:
+                    sent = sender.send_buffer(packets_buffer, packet_size, count)
+                total_sent = int(sent or 0)
+                sender_path = "XDP_L2_PACING_BYPASSED"
+                fallback_reason = "xdp_native_pacing_api_unavailable"
+                fallback_count = 1
         elif hasattr(sender, "send_buffer"):
             if packet_stride > 0 and hasattr(sender, "send_buffer_strided"):
                 sent = sender.send_buffer_strided(packets_buffer, packet_size, packet_stride, count)
