@@ -51,6 +51,7 @@
 #include <poll.h>
 
 #include "xdp_core.h"
+#include "samurai_tsc.h"
 
 /* ========================================================================== */
 /* Constants                                                                  */
@@ -330,6 +331,13 @@ static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_calib_syscall_overhead_ns = 0;
 static uint64_t g_calib_sleep_overhead_ns = 0;
+static uint64_t g_calib_tsc_overhead_cycles = 0;
+static int g_tsc_supported = 0;
+static int g_tsc_enabled = 0;
+static uint64_t g_tsc_hz = 0;
+
+static __thread uint64_t g_tsc_anchor_ns = 0;
+static __thread uint64_t g_tsc_anchor_cycles = 0;
 
 /* ========================================================================== */
 /* High-Precision Timing                                                      */
@@ -340,6 +348,63 @@ static inline uint64_t time_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static inline uint64_t tsc_cycles_to_ns(uint64_t cycles)
+{
+    if (g_tsc_hz == 0) {
+        return 0;
+    }
+    return (uint64_t)(((__uint128_t)cycles * 1000000000ULL) / g_tsc_hz);
+}
+
+static inline uint64_t tsc_ns_to_cycles(uint64_t ns)
+{
+    if (g_tsc_hz == 0) {
+        return 0;
+    }
+    return (uint64_t)(((__uint128_t)ns * g_tsc_hz) / 1000000000ULL);
+}
+
+static inline void tsc_refresh_anchor(void)
+{
+    if (!g_tsc_enabled) {
+        return;
+    }
+    g_tsc_anchor_cycles = samurai_rdtsc();
+    g_tsc_anchor_ns = time_ns();
+}
+
+static inline uint64_t time_ns_fast(void)
+{
+    if (!g_tsc_enabled || g_tsc_hz == 0) {
+        return time_ns();
+    }
+
+    uint64_t now_cycles = samurai_rdtsc();
+    if (g_tsc_anchor_cycles == 0 || now_cycles < g_tsc_anchor_cycles) {
+        tsc_refresh_anchor();
+        now_cycles = samurai_rdtsc();
+    }
+
+    uint64_t max_drift_cycles = g_tsc_hz / 2U;
+    if (max_drift_cycles > 0 && (now_cycles - g_tsc_anchor_cycles) > max_drift_cycles) {
+        tsc_refresh_anchor();
+        now_cycles = samurai_rdtsc();
+    }
+
+    return g_tsc_anchor_ns + tsc_cycles_to_ns(now_cycles - g_tsc_anchor_cycles);
+}
+
+static inline uint64_t tsc_deadline_from_ns(uint64_t target_ns)
+{
+    uint64_t now_ns = time_ns_fast();
+    uint64_t now_cycles = samurai_rdtsc();
+    if (target_ns <= now_ns) {
+        return now_cycles;
+    }
+    uint64_t delta_ns = target_ns - now_ns;
+    return now_cycles + tsc_ns_to_cycles(delta_ns);
 }
 
 /* TAI clock for SO_TXTIME (requires CLOCK_TAI support) */
@@ -383,6 +448,21 @@ static inline void precision_wait(uint64_t target_ns)
     }
 
     /* Phase 2: spin-wait with PAUSE hint */
+    if (g_tsc_enabled) {
+        uint64_t target_cycles = tsc_deadline_from_ns(target_ns);
+        while (samurai_rdtsc() < target_cycles) {
+#if defined(__x86_64__) || defined(__i386__)
+            __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+            __asm__ volatile("yield" ::: "memory");
+#else
+            __asm__ volatile("" ::: "memory");
+#endif
+            g_stats.busywait_cycles++;
+        }
+        return;
+    }
+
     while (time_ns() < target_ns) {
 #if defined(__x86_64__) || defined(__i386__)
         __asm__ volatile("pause" ::: "memory");
@@ -714,6 +794,48 @@ static void stats_finalize(void)
 
 static void calibrate_timing(void)
 {
+    const char *tsc_env = getenv("SAMURAI_PACING_USE_TSC");
+    int want_tsc = 1;
+    if (tsc_env && tsc_env[0]) {
+        want_tsc = env_truthy(tsc_env) ? 1 : 0;
+    }
+
+    g_tsc_supported = samurai_tsc_invariant_supported();
+    g_tsc_hz = 0;
+    g_tsc_enabled = 0;
+    g_calib_tsc_overhead_cycles = 0;
+
+    if (want_tsc && g_tsc_supported) {
+        uint64_t c0 = samurai_rdtsc();
+        uint64_t t0 = time_ns();
+        struct timespec req;
+        uint64_t target = t0 + 50000000ULL; /* 50 ms */
+        req.tv_sec = target / 1000000000ULL;
+        req.tv_nsec = target % 1000000000ULL;
+        (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &req, NULL);
+        uint64_t c1 = samurai_rdtsc();
+        uint64_t t1 = time_ns();
+
+        if (c1 > c0 && t1 > t0) {
+            g_tsc_hz = (uint64_t)(((__uint128_t)(c1 - c0) * 1000000000ULL) / (t1 - t0));
+        }
+        if (g_tsc_hz < 1000000ULL || g_tsc_hz > 10000000000ULL) {
+            g_tsc_hz = 0;
+        }
+
+        if (g_tsc_hz > 0) {
+            uint64_t sum_cycles = 0;
+            for (int i = 0; i < CALIBRATION_ITERS; i++) {
+                uint64_t a = samurai_rdtsc();
+                uint64_t b = samurai_rdtsc();
+                sum_cycles += (b - a);
+            }
+            g_calib_tsc_overhead_cycles = sum_cycles / CALIBRATION_ITERS;
+            g_tsc_enabled = 1;
+            tsc_refresh_anchor();
+        }
+    }
+
     /* syscall overhead → clock_gettime latency */
     uint64_t sum = 0;
     for (int i = 0; i < CALIBRATION_ITERS; i++) {
@@ -1495,7 +1617,7 @@ static PyObject *py_paced_send_l3(PyObject *self,
                 /* fallback: spin on token bucket */
                 uint64_t now;
                 while (1) {
-                    now = time_ns();
+                    now = time_ns_fast();
                     if (tb_try_consume(&tb, now)) break;
 #if defined(__x86_64__) || defined(__i386__)
                     __asm__ volatile("pause" ::: "memory");
@@ -1783,7 +1905,7 @@ static PyObject *py_paced_send_l2(PyObject *self,
             } else {
                 uint64_t now;
                 while (1) {
-                    now = time_ns();
+                    now = time_ns_fast();
                     if (tb_try_consume(&tb, now)) break;
 #if defined(__x86_64__) || defined(__i386__)
                     __asm__ volatile("pause" ::: "memory");
@@ -2123,7 +2245,7 @@ static PyObject *py_paced_send_xdp(PyObject *self,
             } else {
                 uint64_t now;
                 while (1) {
-                    now = time_ns();
+                    now = time_ns_fast();
                     if (tb_try_consume(&tb, now)) break;
 #if defined(__x86_64__) || defined(__i386__)
                     __asm__ volatile("pause" ::: "memory");
@@ -2451,6 +2573,11 @@ static PyObject *py_get_pacing_stats(PyObject *self, PyObject *args)
     SET_U64("syscall_overhead_ns", snap.syscall_overhead_ns);
     SET_U64("sleep_overhead_ns", snap.sleep_overhead_ns);
     SET_U64("spin_threshold_ns", g_spin_threshold_ns);
+    SET_I64("tsc_supported", g_tsc_supported ? 1 : 0);
+    SET_I64("tsc_enabled", g_tsc_enabled ? 1 : 0);
+    SET_U64("tsc_hz", g_tsc_hz);
+    SET_U64("tsc_overhead_cycles", g_calib_tsc_overhead_cycles);
+    SET_STR("timing_source", g_tsc_enabled ? "rdtsc" : "clock_gettime");
 
     if (PyDict_SetItemString(out, "ipg_histogram", hist) < 0) {
         Py_DECREF(hist);
@@ -2505,10 +2632,15 @@ static PyObject *py_calibrate(PyObject *self, PyObject *args)
     pthread_mutex_unlock(&g_stats_lock);
 
     return Py_BuildValue(
-        "{s:K, s:K, s:K}",
+        "{s:K, s:K, s:K, s:i, s:i, s:K, s:K, s:s}",
         "syscall_overhead_ns", syscall_overhead_ns,
         "sleep_overhead_ns",   sleep_overhead_ns,
-        "spin_threshold_ns",   g_spin_threshold_ns
+        "spin_threshold_ns",   g_spin_threshold_ns,
+        "tsc_supported",       g_tsc_supported ? 1 : 0,
+        "tsc_enabled",         g_tsc_enabled ? 1 : 0,
+        "tsc_hz",              g_tsc_hz,
+        "tsc_overhead_cycles", g_calib_tsc_overhead_cycles,
+        "timing_source",       g_tsc_enabled ? "rdtsc" : "clock_gettime"
     );
 }
 
@@ -2520,7 +2652,8 @@ PyDoc_STRVAR(doc_check_caps,
 "check_capabilities() -> dict\n"
 "\n"
 "Probe kernel / NIC capabilities relevant to pacing:\n"
-"  so_txtime, clock_tai, sched_fifo, af_packet, tpacket_v3.\n");
+"  so_txtime, clock_tai, sched_fifo, af_packet, tpacket_v3,\n"
+"  invariant_tsc, tsc_enabled, tsc_hz.\n");
 
 static PyObject *py_check_capabilities(PyObject *self, PyObject *args)
 {
@@ -2562,13 +2695,17 @@ static PyObject *py_check_capabilities(PyObject *self, PyObject *args)
     }
 
     return Py_BuildValue(
-        "{s:i, s:i, s:i, s:i, s:i, s:i}",
+        "{s:i, s:i, s:i, s:i, s:i, s:i, s:i, s:i, s:K, s:s}",
         "so_txtime",   has_txtime,
         "clock_tai",   has_tai,
         "sched_fifo",  has_fifo,
         "af_packet",   has_af_packet,
         "tpacket_v3",  has_tpacket_v3,
-        "is_root",     geteuid() == 0
+        "is_root",     geteuid() == 0,
+        "invariant_tsc", g_tsc_supported ? 1 : 0,
+        "tsc_enabled", g_tsc_enabled ? 1 : 0,
+        "tsc_hz", g_tsc_hz,
+        "timing_source", g_tsc_enabled ? "rdtsc" : "clock_gettime"
     );
 }
 
