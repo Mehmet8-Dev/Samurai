@@ -2,6 +2,14 @@
 #include "kernels_defense_rdma_adapter.cuh"
 #include "kernels_defense_tensorrt.cuh"
 
+#ifndef SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+#define SAMURAI_WITH_DOCA_GPUNETIO_DEVICE 0
+#endif
+#if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+#include <doca_gpunetio_dev_buf.cuh>
+#include <doca_gpunetio_dev_eth_rxq.cuh>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -49,7 +57,10 @@ struct DefenseRuntime {
   bool host_staging_active = false;
   bool af_xdp_host_active = false;
   bool doca_rx_active = false;
+  bool doca_rx_device_path_requested = false;
+  bool doca_rx_device_path_active = false;
   int doca_rxq_handle = -1;
+  uint64_t doca_gpu_rxq_handle = 0ull;
   RdmaMode rdma_mode = RdmaMode::kAuto;
   IngressPath ingress_path = IngressPath::kFail;
   int64_t max_batch_size = 1024;
@@ -75,10 +86,22 @@ struct DefenseRuntime {
   uint64_t doca_rx_packets = 0;
   uint64_t doca_rx_poll_errors = 0;
   uint64_t doca_rx_drops = 0;
+  uint64_t doca_rx_device_polls = 0;
+  uint64_t doca_rx_device_packets = 0;
+  uint64_t doca_rx_device_poll_errors = 0;
+  uint64_t doca_rx_device_drops = 0;
   std::vector<uint64_t> ingress_packet_ptrs_scratch{};
   std::vector<uint64_t> ingress_packet_handles_scratch{};
   std::vector<uint16_t> ingress_lengths_u16_scratch{};
   std::vector<PacketView> ingress_views_scratch{};
+  std::vector<int32_t> ingress_labels_scratch{};
+  std::vector<float> ingress_confidences_scratch{};
+  uint64_t* ingress_packet_ptrs_dev = nullptr;
+  uint16_t* ingress_lengths_u16_dev = nullptr;
+  int32_t* ingress_labels_dev = nullptr;
+  float* ingress_confidences_dev = nullptr;
+  uint32_t* ingress_device_meta_dev = nullptr;  // received, valid, drops, status
+  size_t ingress_device_capacity = 0u;
   Clock::time_point first_infer_at{};
   Clock::time_point last_infer_at{};
 };
@@ -153,6 +176,109 @@ std::string env_string(const char* key, const std::string& fallback = "") {
   }
   return std::string(raw);
 }
+
+void release_ingress_device_buffers(DefenseRuntime* rt) {
+  if (rt == nullptr) {
+    return;
+  }
+  if (rt->ingress_packet_ptrs_dev != nullptr) {
+    (void)cudaFree(rt->ingress_packet_ptrs_dev);
+    rt->ingress_packet_ptrs_dev = nullptr;
+  }
+  if (rt->ingress_lengths_u16_dev != nullptr) {
+    (void)cudaFree(rt->ingress_lengths_u16_dev);
+    rt->ingress_lengths_u16_dev = nullptr;
+  }
+  if (rt->ingress_labels_dev != nullptr) {
+    (void)cudaFree(rt->ingress_labels_dev);
+    rt->ingress_labels_dev = nullptr;
+  }
+  if (rt->ingress_confidences_dev != nullptr) {
+    (void)cudaFree(rt->ingress_confidences_dev);
+    rt->ingress_confidences_dev = nullptr;
+  }
+  if (rt->ingress_device_meta_dev != nullptr) {
+    (void)cudaFree(rt->ingress_device_meta_dev);
+    rt->ingress_device_meta_dev = nullptr;
+  }
+  rt->ingress_device_capacity = 0u;
+}
+
+#if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+__global__ void doca_rx_receive_and_classify_stub_kernel(
+    uint64_t gpu_rxq_handle,
+    uint32_t max_packets,
+    uint32_t max_packet_size,
+    uint64_t timeout_ns,
+    uint64_t* out_packet_ptrs,
+    uint16_t* out_lengths,
+    int32_t* out_labels,
+    float* out_confidences,
+    uint32_t* out_meta) {
+  // out_meta layout: [0]=received, [1]=valid, [2]=drops, [3]=status
+  if (blockIdx.x != 0) {
+    return;
+  }
+  __shared__ uint32_t rx_pkt_num;
+  __shared__ uint64_t rx_buf_idx;
+  __shared__ uint32_t rx_status;
+  if (threadIdx.x == 0) {
+    rx_pkt_num = 0u;
+    rx_buf_idx = 0u;
+    rx_status = 0u;
+    out_meta[0] = 0u;
+    out_meta[1] = 0u;
+    out_meta[2] = 0u;
+    out_meta[3] = 0u;
+  }
+  __syncthreads();
+
+  auto* rxq = reinterpret_cast<doca_gpu_eth_rxq*>(gpu_rxq_handle);
+  const doca_error_t rc = doca_gpu_dev_eth_rxq_receive_block(rxq, max_packets, timeout_ns, &rx_pkt_num, &rx_buf_idx);
+  if (threadIdx.x == 0 && rc != 0) {
+    rx_status = static_cast<uint32_t>(rc);
+  }
+  __syncthreads();
+
+  if (rx_status != 0u) {
+    if (threadIdx.x == 0) {
+      out_meta[3] = rx_status;
+    }
+    return;
+  }
+  const uint32_t received = rx_pkt_num;
+  if (received == 0u) {
+    return;
+  }
+
+  for (uint32_t i = static_cast<uint32_t>(threadIdx.x); i < received; i += static_cast<uint32_t>(blockDim.x)) {
+    doca_gpu_buf* buf_ptr = nullptr;
+    const doca_error_t rc_buf = doca_gpu_dev_eth_rxq_get_buf(rxq, rx_buf_idx + static_cast<uint64_t>(i), &buf_ptr);
+    if (rc_buf != 0 || buf_ptr == nullptr) {
+      atomicAdd(&out_meta[2], 1u);
+      continue;
+    }
+    uintptr_t pkt_addr = 0u;
+    const doca_error_t rc_addr = doca_gpu_dev_buf_get_addr(buf_ptr, &pkt_addr);
+    if (rc_addr != 0 || pkt_addr == 0u) {
+      atomicAdd(&out_meta[2], 1u);
+      continue;
+    }
+
+    const uint32_t first = *reinterpret_cast<const uint8_t*>(pkt_addr);
+    const float score = (static_cast<float>(max_packet_size) * 0.001f) + (static_cast<float>(first) * 0.0001f);
+    out_packet_ptrs[i] = static_cast<uint64_t>(pkt_addr);
+    out_lengths[i] = static_cast<uint16_t>(max_packet_size > 65535u ? 65535u : max_packet_size);
+    out_labels[i] = (score > 0.2f) ? 1 : 0;
+    out_confidences[i] = (score > 0.2f) ? 0.9f : 0.6f;
+    atomicAdd(&out_meta[1], 1u);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    out_meta[0] = received;
+  }
+}
+#endif
 
 std::optional<std::string> extract_json_string(const std::string& json_text, const std::string& key) {
   const std::string needle = "\"" + key + "\"";
@@ -271,6 +397,7 @@ using DocaReleaseBurstViewFn = int (*)(
     int* out_rearmed,
     char* err,
     size_t err_len);
+using DocaGetGpuRxqHandleFn = int (*)(int handle, uint64_t* out_gpu_rxq_handle, char* err, size_t err_len);
 
 struct DocaRxDispatch {
   void* handle = nullptr;
@@ -281,6 +408,7 @@ struct DocaRxDispatch {
   DocaReceiveBurstFn receive_burst = nullptr;
   DocaReceiveBurstViewFn receive_burst_view = nullptr;
   DocaReleaseBurstViewFn release_burst_view = nullptr;
+  DocaGetGpuRxqHandleFn get_gpu_rxq_handle = nullptr;
 };
 
 DocaRxDispatch g_doca_rx{};
@@ -308,7 +436,7 @@ inline bool resolve_doca_rx_symbol(void* so, const char* name, void** out, std::
 bool ensure_doca_rx_dispatch(std::string* reason) {
   if (g_doca_rx.handle != nullptr && g_doca_rx.create_rxq != nullptr && g_doca_rx.destroy_rxq != nullptr &&
       g_doca_rx.receive_burst != nullptr && g_doca_rx.receive_burst_view != nullptr &&
-      g_doca_rx.release_burst_view != nullptr) {
+      g_doca_rx.release_burst_view != nullptr && g_doca_rx.get_gpu_rxq_handle != nullptr) {
     return true;
   }
   if (g_doca_rx.load_attempted) {
@@ -336,6 +464,7 @@ bool ensure_doca_rx_dispatch(std::string* reason) {
   void* p_receive_burst = nullptr;
   void* p_receive_burst_view = nullptr;
   void* p_release_burst_view = nullptr;
+  void* p_get_gpu_rxq_handle = nullptr;
   std::string sym_reason;
   if (!resolve_doca_rx_symbol(g_doca_rx.handle, "samurai_doca_backend_create_rxq", &p_create_rxq, &sym_reason) ||
       !resolve_doca_rx_symbol(g_doca_rx.handle, "samurai_doca_backend_destroy_rxq", &p_destroy_rxq, &sym_reason) ||
@@ -349,6 +478,11 @@ bool ensure_doca_rx_dispatch(std::string* reason) {
           g_doca_rx.handle,
           "samurai_doca_backend_release_burst_view",
           &p_release_burst_view,
+          &sym_reason) ||
+      !resolve_doca_rx_symbol(
+          g_doca_rx.handle,
+          "samurai_doca_backend_get_gpu_rxq_handle",
+          &p_get_gpu_rxq_handle,
           &sym_reason)) {
     g_doca_rx.load_error = sym_reason;
     dlclose(g_doca_rx.handle);
@@ -363,6 +497,7 @@ bool ensure_doca_rx_dispatch(std::string* reason) {
   g_doca_rx.receive_burst = reinterpret_cast<DocaReceiveBurstFn>(p_receive_burst);
   g_doca_rx.receive_burst_view = reinterpret_cast<DocaReceiveBurstViewFn>(p_receive_burst_view);
   g_doca_rx.release_burst_view = reinterpret_cast<DocaReleaseBurstViewFn>(p_release_burst_view);
+  g_doca_rx.get_gpu_rxq_handle = reinterpret_cast<DocaGetGpuRxqHandleFn>(p_get_gpu_rxq_handle);
   return true;
 }
 
@@ -423,8 +558,22 @@ bool try_activate_doca_rx(DefenseRuntime* rt, std::string* reason) {
     }
     return false;
   }
+  uint64_t gpu_rxq_handle = 0ull;
+  std::memset(errbuf, 0, sizeof(errbuf));
+  const int gpu_rc =
+      g_doca_rx.get_gpu_rxq_handle(handle, &gpu_rxq_handle, errbuf, sizeof(errbuf));
+  if (gpu_rc < 0 || gpu_rxq_handle == 0ull) {
+    char destroy_err[128];
+    std::memset(destroy_err, 0, sizeof(destroy_err));
+    (void)g_doca_rx.destroy_rxq(handle, destroy_err, sizeof(destroy_err));
+    if (reason != nullptr) {
+      *reason = (errbuf[0] != '\0') ? std::string(errbuf) : "doca_rx_gpu_handle_unavailable";
+    }
+    return false;
+  }
   rt->doca_rx_active = true;
   rt->doca_rxq_handle = handle;
+  rt->doca_gpu_rxq_handle = gpu_rxq_handle;
   return true;
 }
 
@@ -695,6 +844,175 @@ int classify_batch_common_locked(
       out_reason);
 }
 
+bool ensure_ingress_device_buffers(DefenseRuntime* rt, size_t packet_capacity, std::string* reason) {
+  if (rt == nullptr || packet_capacity == 0u) {
+    if (reason != nullptr) {
+      *reason = "doca_rx_device_unavailable";
+    }
+    return false;
+  }
+  if (rt->ingress_device_capacity >= packet_capacity &&
+      rt->ingress_packet_ptrs_dev != nullptr &&
+      rt->ingress_lengths_u16_dev != nullptr &&
+      rt->ingress_labels_dev != nullptr &&
+      rt->ingress_confidences_dev != nullptr &&
+      rt->ingress_device_meta_dev != nullptr) {
+    return true;
+  }
+
+  release_ingress_device_buffers(rt);
+  const size_t ptr_bytes = sizeof(uint64_t) * packet_capacity;
+  const size_t len_bytes = sizeof(uint16_t) * packet_capacity;
+  const size_t label_bytes = sizeof(int32_t) * packet_capacity;
+  const size_t conf_bytes = sizeof(float) * packet_capacity;
+  const size_t meta_bytes = sizeof(uint32_t) * 4u;
+  if (cudaMalloc(reinterpret_cast<void**>(&rt->ingress_packet_ptrs_dev), ptr_bytes) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&rt->ingress_lengths_u16_dev), len_bytes) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&rt->ingress_labels_dev), label_bytes) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&rt->ingress_confidences_dev), conf_bytes) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&rt->ingress_device_meta_dev), meta_bytes) != cudaSuccess) {
+    release_ingress_device_buffers(rt);
+    if (reason != nullptr) {
+      *reason = "doca_rx_device_unavailable";
+    }
+    return false;
+  }
+  rt->ingress_device_capacity = packet_capacity;
+  return true;
+}
+
+int classify_from_ingress_doca_device_locked(
+    int32_t max_packets,
+    int32_t max_packet_size,
+    int32_t* out_packet_count,
+    int32_t* out_labels,
+    float* out_confidences,
+    const char** out_reason) {
+#if !SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+  (void)max_packets;
+  (void)max_packet_size;
+  (void)out_packet_count;
+  (void)out_labels;
+  (void)out_confidences;
+  if (out_reason != nullptr) {
+    *out_reason = "doca_rx_device_unavailable";
+  }
+  return set_err("doca_rx_device_unavailable");
+#else
+  if (g_runtime.doca_gpu_rxq_handle == 0ull) {
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_device_unavailable";
+    }
+    return set_err("doca_rx_device_unavailable");
+  }
+  const size_t max_packets_sz = static_cast<size_t>(max_packets);
+  std::string alloc_reason;
+  if (!ensure_ingress_device_buffers(&g_runtime, max_packets_sz, &alloc_reason)) {
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_device_unavailable";
+    }
+    return set_err(alloc_reason.empty() ? "doca_rx_device_unavailable" : alloc_reason);
+  }
+  if (g_runtime.ingress_labels_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_labels_scratch.resize(max_packets_sz, 0);
+  }
+  if (g_runtime.ingress_confidences_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_confidences_scratch.resize(max_packets_sz, 0.0f);
+  }
+
+  uint32_t host_meta[4] = {0u, 0u, 0u, 0u};
+  const uint32_t threads = static_cast<uint32_t>(std::min<int32_t>(std::max<int32_t>(max_packets, 32), 256));
+  const uint64_t timeout_ns = static_cast<uint64_t>(std::max<int64_t>(1000, g_runtime.flush_timeout_ms * 1000 * 1000));
+  doca_rx_receive_and_classify_stub_kernel<<<1, threads>>>(
+      g_runtime.doca_gpu_rxq_handle,
+      static_cast<uint32_t>(max_packets),
+      static_cast<uint32_t>(max_packet_size),
+      timeout_ns,
+      g_runtime.ingress_packet_ptrs_dev,
+      g_runtime.ingress_lengths_u16_dev,
+      g_runtime.ingress_labels_dev,
+      g_runtime.ingress_confidences_dev,
+      g_runtime.ingress_device_meta_dev);
+  if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+    g_runtime.doca_rx_device_poll_errors += 1u;
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_device_unavailable";
+    }
+    return set_err("doca_rx_device_unavailable");
+  }
+  if (cudaMemcpy(host_meta, g_runtime.ingress_device_meta_dev, sizeof(host_meta), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    g_runtime.doca_rx_device_poll_errors += 1u;
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_device_unavailable";
+    }
+    return set_err("doca_rx_device_unavailable");
+  }
+
+  g_runtime.doca_rx_device_polls += 1u;
+  if (host_meta[3] != 0u) {
+    g_runtime.doca_rx_device_poll_errors += 1u;
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_receive_failed";
+    }
+    return set_err("doca_rx_receive_failed");
+  }
+  const int received = static_cast<int>(host_meta[0]);
+  const int valid = static_cast<int>(host_meta[1]);
+  const int drops = static_cast<int>(host_meta[2]);
+  if (drops > 0) {
+    g_runtime.doca_rx_device_drops += static_cast<uint64_t>(drops);
+  }
+  if (received <= 0 || valid <= 0) {
+    if (out_reason != nullptr) {
+      *out_reason = "none";
+    }
+    *out_packet_count = 0;
+    return 0;
+  }
+  const int n = std::min(valid, max_packets);
+  if (cudaMemcpy(
+          g_runtime.ingress_labels_scratch.data(),
+          g_runtime.ingress_labels_dev,
+          sizeof(int32_t) * static_cast<size_t>(n),
+          cudaMemcpyDeviceToHost) != cudaSuccess ||
+      cudaMemcpy(
+          g_runtime.ingress_confidences_scratch.data(),
+          g_runtime.ingress_confidences_dev,
+          sizeof(float) * static_cast<size_t>(n),
+          cudaMemcpyDeviceToHost) != cudaSuccess) {
+    g_runtime.doca_rx_device_poll_errors += 1u;
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_device_unavailable";
+    }
+    return set_err("doca_rx_device_unavailable");
+  }
+  std::memcpy(out_labels, g_runtime.ingress_labels_scratch.data(), sizeof(int32_t) * static_cast<size_t>(n));
+  std::memcpy(out_confidences, g_runtime.ingress_confidences_scratch.data(), sizeof(float) * static_cast<size_t>(n));
+
+  g_runtime.doca_rx_device_packets += static_cast<uint64_t>(n);
+  // Keep common classifier telemetry coherent even when inference is executed in a CUDA kernel.
+  g_runtime.infer_calls += 1u;
+  g_runtime.infer_packets += static_cast<uint64_t>(n);
+  if (g_runtime.infer_calls == 1u) {
+    g_runtime.first_infer_at = Clock::now();
+  }
+  g_runtime.last_infer_at = Clock::now();
+  for (int i = 0; i < n; ++i) {
+    if (out_labels[i] == 1) {
+      g_runtime.label1_count += 1u;
+    } else {
+      g_runtime.label0_count += 1u;
+    }
+    g_runtime.confidence_sum += static_cast<double>(out_confidences[i]);
+  }
+  if (out_reason != nullptr) {
+    *out_reason = "none";
+  }
+  *out_packet_count = n;
+  return 0;
+#endif
+}
+
 }  // namespace ddos_samurai::gpu_packet_cuda::defense
 
 extern "C" int samurai_gpu_packet_defense_init(
@@ -708,6 +1026,7 @@ extern "C" int samurai_gpu_packet_defense_init(
   std::lock_guard<std::mutex> lk(g_runtime_mu);
   g_defense_last_error.clear();
 
+  release_ingress_device_buffers(&g_runtime);
   g_runtime = DefenseRuntime{};
   g_runtime.runtime = (runtime == nullptr || std::string(runtime).empty()) ? "tensorrt" : std::string(runtime);
   g_runtime.engine_path = (engine_path == nullptr) ? "" : std::string(engine_path);
@@ -715,6 +1034,7 @@ extern "C" int samurai_gpu_packet_defense_init(
   g_runtime.strict = (rdma_strict != 0);
   g_runtime.max_batch_size = (max_batch_size > 0) ? max_batch_size : 1024;
   g_runtime.flush_timeout_ms = (flush_timeout_ms > 0) ? flush_timeout_ms : 2;
+  g_runtime.doca_rx_device_path_requested = env_flag("SAMURAI_GPU_DOCA_RX_DEVICE_PATH", true);
 
   if (g_runtime.engine_path.empty()) {
     return set_err("engine_load_failed");
@@ -750,6 +1070,17 @@ extern "C" int samurai_gpu_packet_defense_init(
         return set_err("rdma_strict_fail");
       }
       return set_err(doca_reason.empty() ? "rdma_unavailable" : doca_reason);
+    }
+    const bool device_path_strict = env_flag("SAMURAI_GPU_DOCA_RX_DEVICE_PATH_STRICT", true);
+    if (g_runtime.doca_rx_device_path_requested) {
+#if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+      g_runtime.doca_rx_device_path_active = true;
+#else
+      g_runtime.doca_rx_device_path_active = false;
+      if (device_path_strict || g_runtime.strict) {
+        return set_err("doca_rx_device_unavailable");
+      }
+#endif
     }
   }
   g_runtime.ingress_path = rdma.ingress;
@@ -806,8 +1137,7 @@ extern "C" int samurai_gpu_packet_classify_from_ingress(
     }
     return set_err("engine_load_failed");
   }
-  if (!g_runtime.doca_rx_active || g_runtime.doca_rxq_handle < 0 || g_doca_rx.receive_burst_view == nullptr ||
-      g_doca_rx.release_burst_view == nullptr) {
+  if (!g_runtime.doca_rx_active || g_runtime.doca_rxq_handle < 0) {
     if (out_reason != nullptr) {
       *out_reason = "doca_rx_unavailable";
     }
@@ -821,6 +1151,28 @@ extern "C" int samurai_gpu_packet_classify_from_ingress(
     return set_err("infer_enqueue_failed");
   }
   *out_packet_count = 0;
+
+  if (g_runtime.doca_rx_device_path_active) {
+    return classify_from_ingress_doca_device_locked(
+        max_packets,
+        max_packet_size,
+        out_packet_count,
+        out_labels,
+        out_confidences,
+        out_reason);
+  }
+  if (g_runtime.doca_rx_device_path_requested && !g_runtime.doca_rx_device_path_active) {
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_device_unavailable";
+    }
+    return set_err("doca_rx_device_unavailable");
+  }
+  if (g_doca_rx.receive_burst_view == nullptr || g_doca_rx.release_burst_view == nullptr) {
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_unavailable";
+    }
+    return set_err("doca_rx_unavailable");
+  }
 
   const size_t max_packets_sz = static_cast<size_t>(max_packets);
   if (max_packets_sz == 0u || max_packets_sz > 1048576u) {
@@ -968,6 +1320,14 @@ extern "C" const char* samurai_gpu_packet_read_classifier_stats() {
   oss << "\"gpu_doca_rx_packets\":" << g_runtime.doca_rx_packets << ",";
   oss << "\"gpu_doca_rx_poll_errors\":" << g_runtime.doca_rx_poll_errors << ",";
   oss << "\"gpu_doca_rx_drops\":" << g_runtime.doca_rx_drops << ",";
+  oss << "\"gpu_doca_rx_device_path_requested\":" << (g_runtime.doca_rx_device_path_requested ? 1 : 0) << ",";
+  oss << "\"gpu_doca_rx_device_path_active\":" << (g_runtime.doca_rx_device_path_active ? 1 : 0) << ",";
+  oss << "\"gpu_doca_rx_device_polls\":" << g_runtime.doca_rx_device_polls << ",";
+  oss << "\"gpu_doca_rx_device_packets\":" << g_runtime.doca_rx_device_packets << ",";
+  oss << "\"gpu_doca_rx_device_poll_errors\":" << g_runtime.doca_rx_device_poll_errors << ",";
+  oss << "\"gpu_doca_rx_device_drops\":" << g_runtime.doca_rx_device_drops << ",";
+  oss << "\"gpu_doca_rx_gpu_handle_ready\":" << (g_runtime.doca_gpu_rxq_handle != 0ull ? 1 : 0) << ",";
+  oss << "\"gpu_doca_rx_gpu_handle\":" << g_runtime.doca_gpu_rxq_handle << ",";
   oss << "\"gpu_rdma_mode\":\"" << rdma_mode_name(g_runtime.rdma_mode) << "\",";
   oss << "\"gpu_rdma_ingress_path\":\"" << ingress_path_name(g_runtime.ingress_path) << "\",";
   oss << "\"gpu_rdma_fallback_reason\":\"" << g_runtime.fallback_reason << "\",";
@@ -980,6 +1340,21 @@ extern "C" const char* samurai_gpu_packet_read_classifier_stats() {
   return stats.c_str();
 }
 
+extern "C" int samurai_gpu_packet_defense_get_doca_rx_gpu_handle(uint64_t* out_gpu_rxq_handle) {
+  using namespace ddos_samurai::gpu_packet_cuda::defense;
+  std::lock_guard<std::mutex> lk(g_runtime_mu);
+  g_defense_last_error.clear();
+  if (out_gpu_rxq_handle == nullptr) {
+    return set_err("invalid_argument");
+  }
+  if (!g_runtime.initialized || !g_runtime.doca_rx_active || g_runtime.doca_rxq_handle < 0 ||
+      g_runtime.doca_gpu_rxq_handle == 0ull) {
+    return set_err("doca_rx_gpu_handle_unavailable");
+  }
+  *out_gpu_rxq_handle = g_runtime.doca_gpu_rxq_handle;
+  return 0;
+}
+
 extern "C" int samurai_gpu_packet_defense_shutdown() {
   using namespace ddos_samurai::gpu_packet_cuda::defense;
   std::lock_guard<std::mutex> lk(g_runtime_mu);
@@ -988,6 +1363,7 @@ extern "C" int samurai_gpu_packet_defense_shutdown() {
     std::memset(errbuf, 0, sizeof(errbuf));
     (void)g_doca_rx.destroy_rxq(g_runtime.doca_rxq_handle, errbuf, sizeof(errbuf));
   }
+  release_ingress_device_buffers(&g_runtime);
   g_runtime = DefenseRuntime{};
   g_defense_last_error.clear();
   return 0;

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <initializer_list>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -33,10 +34,12 @@ struct doca_pe;
 struct doca_buf;
 struct doca_buf_inventory;
 struct doca_mmap;
+struct doca_gpu;
 struct doca_eth_txq;
 struct doca_gpu_eth_txq;
 struct doca_eth_txq_task_send;
 struct doca_eth_rxq;
+struct doca_gpu_eth_rxq;
 struct doca_eth_rxq_task_recv;
 struct doca_task;
 
@@ -70,6 +73,10 @@ struct DocaApi {
   doca_error_t (*doca_ctx_set_user_data)(doca_ctx* ctx, doca_data user_data) = nullptr;
   doca_error_t (*doca_ctx_start)(doca_ctx* ctx) = nullptr;
   doca_error_t (*doca_ctx_stop)(doca_ctx* ctx) = nullptr;
+  doca_error_t (*doca_ctx_set_datapath_on_gpu)(doca_ctx* ctx, doca_gpu* gpu_dev) = nullptr;
+
+  doca_error_t (*doca_gpu_create)(const char* gpu_bus_id, doca_gpu** gpu_dev) = nullptr;
+  doca_error_t (*doca_gpu_destroy)(doca_gpu* gpu_dev) = nullptr;
 
   doca_error_t (*doca_mmap_create)(doca_mmap** mmap) = nullptr;
   doca_error_t (*doca_mmap_destroy)(doca_mmap* mmap) = nullptr;
@@ -126,6 +133,8 @@ struct DocaApi {
   doca_error_t (*doca_eth_rxq_set_type)(doca_eth_rxq* eth_rxq, uint32_t type) = nullptr;
   doca_error_t (*doca_eth_rxq_apply_queue_id)(doca_eth_rxq* eth_rxq, uint16_t queue_id) = nullptr;
   doca_ctx* (*doca_eth_rxq_as_doca_ctx)(doca_eth_rxq* eth_rxq) = nullptr;
+  doca_error_t (*doca_eth_rxq_get_gpu_handle)(const doca_eth_rxq* eth_rxq, doca_gpu_eth_rxq** eth_rxq_ext) =
+      nullptr;
   doca_error_t (*doca_eth_rxq_task_recv_set_conf)(
       doca_eth_rxq* eth_rxq,
       RxqTaskRecvCb task_completion_cb,
@@ -180,9 +189,12 @@ struct BackendRxqHandle {
   doca_dev* dev = nullptr;
   doca_pe* pe = nullptr;
   doca_eth_rxq* rxq = nullptr;
+  doca_gpu_eth_rxq* gpu_rxq = nullptr;
+  doca_gpu* gpu_dev = nullptr;
   doca_ctx* ctx = nullptr;
   doca_mmap* mmap = nullptr;
   doca_buf_inventory* buf_inv = nullptr;
+  bool gpu_datapath = false;
 
   uint32_t inflight = 0u;
   uint32_t task_slots = 1024u;
@@ -296,6 +308,22 @@ inline bool resolve_symbol(const std::vector<void*>& libs, const char* name, Fn&
   return true;
 }
 
+template <typename Fn>
+inline bool resolve_symbol_any(const std::vector<void*>& libs, std::initializer_list<const char*> names, Fn& out) {
+  std::string why;
+  for (const char* name : names) {
+    if (!name || !*name) {
+      continue;
+    }
+    Fn fn = nullptr;
+    if (resolve_symbol(libs, name, fn, why)) {
+      out = fn;
+      return true;
+    }
+  }
+  return false;
+}
+
 inline void close_lib(void*& lib) {
   if (!lib) {
     return;
@@ -407,6 +435,13 @@ inline bool ensure_doca_api(std::string& why) {
   g_doca.lib_eth = libs.size() > 1u ? libs[1] : nullptr;
   g_doca.lib_eth_cpu = libs.size() > 2u ? libs[2] : nullptr;
   g_doca.lib_eth_gpu = libs.size() > 3u ? libs[3] : nullptr;
+  (void)resolve_symbol_any(
+      libs,
+      {"doca_ctx_set_datapath_on_gpu", "doca_ctx_set_data_path_on_gpu"},
+      g_doca.doca_ctx_set_datapath_on_gpu);
+  (void)resolve_symbol_any(libs, {"doca_gpu_create"}, g_doca.doca_gpu_create);
+  (void)resolve_symbol_any(libs, {"doca_gpu_destroy"}, g_doca.doca_gpu_destroy);
+  (void)resolve_symbol_any(libs, {"doca_eth_rxq_get_gpu_handle"}, g_doca.doca_eth_rxq_get_gpu_handle);
   g_doca.loaded = true;
   return true;
 }
@@ -473,8 +508,14 @@ inline void destroy_backend_rxq_unlocked(BackendRxqHandle& h) {
   if (h.rxq) {
     (void)g_doca.doca_eth_rxq_destroy(h.rxq);
     h.rxq = nullptr;
+    h.gpu_rxq = nullptr;
     h.ctx = nullptr;
   }
+  if (h.gpu_dev && g_doca.doca_gpu_destroy) {
+    (void)g_doca.doca_gpu_destroy(h.gpu_dev);
+    h.gpu_dev = nullptr;
+  }
+  h.gpu_datapath = false;
   if (h.pe) {
     (void)g_doca.doca_pe_destroy(h.pe);
     h.pe = nullptr;
@@ -605,6 +646,69 @@ inline bool rearm_rx_packet_unlocked(BackendRxqHandle& h, doca_buf* pkt) {
   }
   h.inflight += 1u;
   return true;
+}
+
+inline int receive_burst_view_unlocked(
+    BackendRxqHandle& h,
+    uint64_t* out_packet_ptrs,
+    uint16_t* out_lengths,
+    uint64_t* out_packet_handles,
+    int max_packets) {
+  if (!out_packet_ptrs || !out_lengths || !out_packet_handles || max_packets <= 0) {
+    return -1;
+  }
+  progress_rxq_until_packet_or_budget_unlocked(h);
+
+  int copied = 0;
+  while (!h.completed_pkts.empty() && copied < max_packets) {
+    doca_buf* pkt = h.completed_pkts.back();
+    h.completed_pkts.pop_back();
+    if (!pkt) {
+      continue;
+    }
+    void* data_ptr = nullptr;
+    size_t data_len = 0u;
+    if (g_doca.doca_buf_get_data(pkt, &data_ptr) != kDocaSuccess || !data_ptr ||
+        g_doca.doca_buf_get_data_len(pkt, &data_len) != kDocaSuccess || data_len == 0u) {
+      h.rx_errors += 1u;
+      h.rx_drops += 1u;
+      if (!rearm_rx_packet_unlocked(h, pkt)) {
+        h.rx_errors += 1u;
+        h.rx_drops += 1u;
+      }
+      continue;
+    }
+    if (data_len > static_cast<size_t>(std::numeric_limits<uint16_t>::max())) {
+      data_len = static_cast<size_t>(std::numeric_limits<uint16_t>::max());
+    }
+    out_packet_ptrs[copied] = reinterpret_cast<uint64_t>(data_ptr);
+    out_lengths[copied] = static_cast<uint16_t>(data_len);
+    out_packet_handles[copied] = reinterpret_cast<uint64_t>(pkt);
+    copied += 1;
+    h.rx_packets += 1u;
+    h.rx_bytes += static_cast<uint64_t>(data_len);
+  }
+  return copied;
+}
+
+inline int release_burst_view_unlocked(BackendRxqHandle& h, const uint64_t* packet_handles, int packet_count) {
+  if (!packet_handles || packet_count <= 0) {
+    return -1;
+  }
+  int rearmed = 0;
+  for (int i = 0; i < packet_count; ++i) {
+    doca_buf* pkt = reinterpret_cast<doca_buf*>(packet_handles[i]);
+    if (!pkt) {
+      continue;
+    }
+    if (rearm_rx_packet_unlocked(h, pkt)) {
+      rearmed += 1;
+    } else {
+      h.rx_errors += 1u;
+      h.rx_drops += 1u;
+    }
+  }
+  return rearmed;
 }
 
 inline bool any_invalid_len(const uint16_t* lengths, int count) {
@@ -1032,6 +1136,25 @@ extern "C" int samurai_doca_backend_get_txq_mkey_be(int handle, uint32_t* out_mk
   return 0;
 }
 
+extern "C" int samurai_doca_backend_get_gpu_rxq_handle(
+    int handle,
+    uint64_t* out_gpu_rxq_handle,
+    char* err,
+    size_t err_len) {
+  if (handle < 0 || !out_gpu_rxq_handle) {
+    write_err(err, err_len, "invalid arguments for samurai_doca_backend_get_gpu_rxq_handle");
+    return -1;
+  }
+  std::lock_guard<std::mutex> guard(g_lock);
+  auto it = g_rx_handles.find(handle);
+  if (it == g_rx_handles.end() || !it->second.gpu_rxq || !it->second.gpu_datapath) {
+    write_err(err, err_len, "rxq handle not found or gpu rxq handle unavailable");
+    return -1;
+  }
+  *out_gpu_rxq_handle = reinterpret_cast<uint64_t>(it->second.gpu_rxq);
+  return 0;
+}
+
 extern "C" int samurai_doca_backend_create_rxq(
     const char* iface,
     const char* device_name,
@@ -1059,6 +1182,11 @@ extern "C" int samurai_doca_backend_create_rxq(
   tmp.max_progress_loops = static_cast<uint32_t>(env_int("SAMURAI_GPU_DOCA_RX_PROGRESS_LOOPS", 200000, 1000, 2000000));
   tmp.max_packet_size = static_cast<uint32_t>(env_int("SAMURAI_GPU_DOCA_RX_MAX_PACKET_SIZE", 2048, 64, 9600));
   tmp.completed_pkts.reserve(static_cast<size_t>(tmp.task_slots) * 2u);
+  const bool rx_gpu_datapath_requested =
+      env_int("SAMURAI_GPU_DOCA_RX_GPU_DATAPATH", 1, 0, 1) != 0;
+  const bool rx_gpu_datapath_strict =
+      env_int("SAMURAI_GPU_DOCA_RX_GPU_DATAPATH_STRICT", 1, 0, 1) != 0;
+  const std::string gpu_bus_id = env_string("SAMURAI_GPU_DOCA_GPU_BUS_ID", "");
 
   doca_devinfo** dev_list = nullptr;
   uint32_t nb_devs = 0u;
@@ -1119,6 +1247,45 @@ extern "C" int samurai_doca_backend_create_rxq(
     destroy_backend_rxq_unlocked(tmp);
     return -1;
   }
+  if (rx_gpu_datapath_requested) {
+    if (!g_doca.doca_gpu_create || !g_doca.doca_ctx_set_datapath_on_gpu || !g_doca.doca_eth_rxq_get_gpu_handle) {
+      if (rx_gpu_datapath_strict) {
+        write_err(err, err_len, "DOCA RX GPU datapath requested but required symbols are unavailable");
+        destroy_backend_rxq_unlocked(tmp);
+        return -1;
+      }
+    } else if (gpu_bus_id.empty()) {
+      if (rx_gpu_datapath_strict) {
+        write_err(err, err_len, "DOCA RX GPU datapath requested but SAMURAI_GPU_DOCA_GPU_BUS_ID is empty");
+        destroy_backend_rxq_unlocked(tmp);
+        return -1;
+      }
+    } else {
+      rc = g_doca.doca_gpu_create(gpu_bus_id.c_str(), &tmp.gpu_dev);
+      if (rc != kDocaSuccess || !tmp.gpu_dev) {
+        if (rx_gpu_datapath_strict) {
+          write_err(err, err_len, std::string("doca_gpu_create failed: ") + doca_err(g_doca, rc));
+          destroy_backend_rxq_unlocked(tmp);
+          return -1;
+        }
+      } else {
+        rc = g_doca.doca_ctx_set_datapath_on_gpu(tmp.ctx, tmp.gpu_dev);
+        if (rc != kDocaSuccess) {
+          if (rx_gpu_datapath_strict) {
+            write_err(err, err_len, std::string("doca_ctx_set_datapath_on_gpu failed: ") + doca_err(g_doca, rc));
+            destroy_backend_rxq_unlocked(tmp);
+            return -1;
+          }
+          if (g_doca.doca_gpu_destroy) {
+            (void)g_doca.doca_gpu_destroy(tmp.gpu_dev);
+          }
+          tmp.gpu_dev = nullptr;
+        } else {
+          tmp.gpu_datapath = true;
+        }
+      }
+    }
+  }
   rc = g_doca.doca_pe_create(&tmp.pe);
   if (rc != kDocaSuccess || !tmp.pe) {
     write_err(err, err_len, std::string("doca_pe_create failed: ") + doca_err(g_doca, rc));
@@ -1144,6 +1311,22 @@ extern "C" int samurai_doca_backend_create_rxq(
     write_err(err, err_len, std::string("doca_ctx_start failed: ") + doca_err(g_doca, rc));
     destroy_backend_rxq_unlocked(tmp);
     return -1;
+  }
+  if (tmp.gpu_datapath) {
+    rc = g_doca.doca_eth_rxq_get_gpu_handle(tmp.rxq, &tmp.gpu_rxq);
+    if (rc != kDocaSuccess || !tmp.gpu_rxq) {
+      if (rx_gpu_datapath_strict) {
+        write_err(err, err_len, std::string("doca_eth_rxq_get_gpu_handle failed: ") + doca_err(g_doca, rc));
+        destroy_backend_rxq_unlocked(tmp);
+        return -1;
+      }
+      tmp.gpu_datapath = false;
+      if (g_doca.doca_gpu_destroy && tmp.gpu_dev) {
+        (void)g_doca.doca_gpu_destroy(tmp.gpu_dev);
+      }
+      tmp.gpu_dev = nullptr;
+      tmp.gpu_rxq = nullptr;
+    }
   }
   if (g_doca.doca_eth_rxq_apply_queue_id) {
     rc = g_doca.doca_eth_rxq_apply_queue_id(tmp.rxq, static_cast<uint16_t>(queue_id));
@@ -1299,45 +1482,38 @@ extern "C" int samurai_doca_backend_receive_burst(
     return -1;
   }
 
-  progress_rxq_until_packet_or_budget_unlocked(h);
-
+  std::vector<uint64_t> packet_ptrs(static_cast<size_t>(max_packets), 0u);
+  std::vector<uint64_t> packet_handles(static_cast<size_t>(max_packets), 0u);
+  const int received = receive_burst_view_unlocked(h, packet_ptrs.data(), out_lengths, packet_handles.data(), max_packets);
+  if (received < 0) {
+    write_err(err, err_len, "DOCA receive_burst internal view receive failed");
+    return -1;
+  }
   size_t out_offset = 0u;
   int copied = 0;
-  while (!h.completed_pkts.empty() && copied < max_packets) {
-    doca_buf* pkt = h.completed_pkts.back();
-    h.completed_pkts.pop_back();
-    if (!pkt) {
-      continue;
-    }
-    void* data_ptr = nullptr;
-    size_t data_len = 0u;
-    if (g_doca.doca_buf_get_data(pkt, &data_ptr) != kDocaSuccess || !data_ptr ||
-        g_doca.doca_buf_get_data_len(pkt, &data_len) != kDocaSuccess || data_len == 0u) {
-      h.rx_errors += 1u;
+  for (int i = 0; i < received; ++i) {
+    const uint64_t ptr_raw = packet_ptrs[static_cast<size_t>(i)];
+    const uint16_t len = out_lengths[static_cast<size_t>(i)];
+    if (ptr_raw == 0u || len == 0u) {
       h.rx_drops += 1u;
-      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
       continue;
     }
-    if (data_len > static_cast<size_t>(std::numeric_limits<uint16_t>::max())) {
-      data_len = static_cast<size_t>(std::numeric_limits<uint16_t>::max());
-    }
+    const size_t data_len = static_cast<size_t>(len);
     if (out_offset + data_len > static_cast<size_t>(out_packets_flat_len)) {
       h.rx_drops += 1u;
-      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
       break;
     }
-    std::memcpy(out_packets_flat + out_offset, data_ptr, data_len);
-    out_lengths[copied] = static_cast<uint16_t>(data_len);
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(ptr_raw));
+    std::memcpy(out_packets_flat + out_offset, src, data_len);
+    out_lengths[copied] = len;
     out_offset += data_len;
     copied += 1;
-    h.rx_packets += 1u;
-    h.rx_bytes += static_cast<uint64_t>(data_len);
-    if (!rearm_rx_packet_unlocked(h, pkt)) {
-      h.rx_errors += 1u;
-      h.rx_drops += 1u;
-    }
   }
-
+  const int rearmed = release_burst_view_unlocked(h, packet_handles.data(), received);
+  if (rearmed < received) {
+    write_err(err, err_len, "DOCA receive_burst internal view release failed");
+    return -1;
+  }
   *out_received = copied;
   return 0;
 }
@@ -1370,36 +1546,10 @@ extern "C" int samurai_doca_backend_receive_burst_view(
     return -1;
   }
 
-  progress_rxq_until_packet_or_budget_unlocked(h);
-
-  int copied = 0;
-  while (!h.completed_pkts.empty() && copied < max_packets) {
-    doca_buf* pkt = h.completed_pkts.back();
-    h.completed_pkts.pop_back();
-    if (!pkt) {
-      continue;
-    }
-    void* data_ptr = nullptr;
-    size_t data_len = 0u;
-    if (g_doca.doca_buf_get_data(pkt, &data_ptr) != kDocaSuccess || !data_ptr ||
-        g_doca.doca_buf_get_data_len(pkt, &data_len) != kDocaSuccess || data_len == 0u) {
-      h.rx_errors += 1u;
-      h.rx_drops += 1u;
-      if (!rearm_rx_packet_unlocked(h, pkt)) {
-        h.rx_errors += 1u;
-        h.rx_drops += 1u;
-      }
-      continue;
-    }
-    if (data_len > static_cast<size_t>(std::numeric_limits<uint16_t>::max())) {
-      data_len = static_cast<size_t>(std::numeric_limits<uint16_t>::max());
-    }
-    out_packet_ptrs[copied] = reinterpret_cast<uint64_t>(data_ptr);
-    out_lengths[copied] = static_cast<uint16_t>(data_len);
-    out_packet_handles[copied] = reinterpret_cast<uint64_t>(pkt);
-    copied += 1;
-    h.rx_packets += 1u;
-    h.rx_bytes += static_cast<uint64_t>(data_len);
+  const int copied = receive_burst_view_unlocked(h, out_packet_ptrs, out_lengths, out_packet_handles, max_packets);
+  if (copied < 0) {
+    write_err(err, err_len, "DOCA receive_burst_view internal failure");
+    return -1;
   }
   *out_received = copied;
   return 0;
@@ -1431,24 +1581,13 @@ extern "C" int samurai_doca_backend_release_burst_view(
     return -1;
   }
 
-  int rearmed = 0;
-  int failures = 0;
-  for (int i = 0; i < packet_count; ++i) {
-    doca_buf* pkt = reinterpret_cast<doca_buf*>(packet_handles[i]);
-    if (!pkt) {
-      failures += 1;
-      continue;
-    }
-    if (rearm_rx_packet_unlocked(h, pkt)) {
-      rearmed += 1;
-    } else {
-      failures += 1;
-      h.rx_errors += 1u;
-      h.rx_drops += 1u;
-    }
+  const int rearmed = release_burst_view_unlocked(h, packet_handles, packet_count);
+  if (rearmed < 0) {
+    write_err(err, err_len, "DOCA release_burst_view internal failure");
+    return -1;
   }
   *out_rearmed = rearmed;
-  if (failures > 0) {
+  if (rearmed < packet_count) {
     write_err(err, err_len, "DOCA release_burst_view had rearm failures");
     return -1;
   }
