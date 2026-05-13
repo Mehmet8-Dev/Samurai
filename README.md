@@ -4,7 +4,7 @@ Samurai, **yalnızca yetkili/lab ortamlarında** kullanılmak üzere geliştiril
 
 ## Sürüm
 
-- SemVer: `2.1.1`
+- SemVer: `2.2.0`
 - Kod adı: `Kenjaku`
 - Son doğrulama tarihi: `2026-04-28`
 

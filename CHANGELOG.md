@@ -16,6 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - 
 
+## [2.2.0] - 2026-05-13
+
+### Added
+- Scenario Engine (web/mobile persona) dokumantasyonu ve operasyonel kullanim akislari.
+- DOCA GPUNetIO native backend entegrasyonu (hybrid mimariyi koruyarak).
+- DOCA RX queue + GPU handle export hattinin defense pipeline'a baglanmasi.
+- DOCA Flow steering tarafinda stream-rule tabanli multi-pipe programlama altyapisi.
+
+### Changed
+- GPU RDMA modu secenekleri `doca_gpunetio` secenegini kapsayacak sekilde genisletildi.
+- Persistent + stream yolunda DOCA backend icin strict/fail-fast preflight kontrati sertlestirildi.
+- Dokumantasyon indeksi, ADR ve perf raporlari DOCA gecis durumunu kapsayacak sekilde guncellendi.
+
 ## [2.1.1] - 2026-04-23
 
 ### Fixed

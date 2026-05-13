@@ -8,7 +8,7 @@ Features:
     - Stealth and evasion capabilities
     - Real-time metrics and monitoring
 """
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 __codename__ = "Kenjaku"
 __author__ = "Mehmet Okur"
 
