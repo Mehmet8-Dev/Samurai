@@ -355,6 +355,7 @@ class OptionalBuildExt(build_ext):
 
         self._build_cuda_defense_module(project_root, nvcc, cuda_include, build_temp, out_dir)
         self._build_doca_backend_module(project_root, build_temp, out_dir)
+        self._build_doca_flow_backend_module(project_root, build_temp, out_dir)
 
     def _build_cuda_defense_module(
         self,
@@ -456,6 +457,45 @@ class OptionalBuildExt(build_ext):
             print(f"Built DOCA backend skeleton library: {lib_path}\n")
         except subprocess.CalledProcessError as exc:
             print(f"\nWarning: DOCA backend skeleton module build failed: {exc}\n")
+
+    def _build_doca_flow_backend_module(self, project_root: str, build_temp: str, out_dir: str) -> None:
+        src_path = os.path.join(project_root, "ddos_samurai", "gpu_packet_cuda", "doca_flow_backend_shim_stub.cpp")
+        if not os.path.exists(src_path):
+            return
+
+        cxx = str(os.environ.get("CXX", "") or "").strip() or shutil.which("c++") or shutil.which("g++") or "c++"
+        obj_path = os.path.join(build_temp, "doca_flow_backend_shim_stub.o")
+        lib_path = os.path.join(out_dir, "libsamurai_doca_flow_backend.so")
+        compile_cmd = [
+            cxx,
+            "-std=c++20",
+            "-O2",
+            "-fPIC",
+            "-I",
+            project_root,
+            "-c",
+            src_path,
+            "-o",
+            obj_path,
+        ]
+        doca_include = str(os.environ.get("SAMURAI_DOCA_INCLUDE", "/opt/mellanox/doca/include") or "").strip()
+        if doca_include and os.path.exists(doca_include):
+            compile_cmd.extend(["-I", doca_include])
+        link_cmd = [
+            cxx,
+            "-shared",
+            obj_path,
+            "-ldl",
+            "-o",
+            lib_path,
+        ]
+        try:
+            print(f"\nBuilding DOCA flow shim module: {src_path}")
+            subprocess.run(compile_cmd, check=True)
+            subprocess.run(link_cmd, check=True)
+            print(f"Built DOCA flow shim library: {lib_path}\n")
+        except subprocess.CalledProcessError as exc:
+            print(f"\nWarning: DOCA flow shim module build failed: {exc}\n")
 
 
 def detect_l7_capabilities() -> Dict[str, bool]:
