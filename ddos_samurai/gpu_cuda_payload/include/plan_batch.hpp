@@ -26,6 +26,8 @@ struct PlanBatchV1 {
   std::vector<std::uint16_t> server_idx{};
   std::vector<std::uint32_t> tuple_hash{};
   std::vector<std::uint8_t> state_op{};
+  std::vector<std::uint64_t> tx_timestamp_ns{};
+  std::vector<std::uint32_t> inter_flow_gap_ns{};
 
   pybind11::dict metadata{};
 };

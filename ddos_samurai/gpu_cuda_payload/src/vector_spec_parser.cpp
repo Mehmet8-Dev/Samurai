@@ -146,6 +146,22 @@ VectorSpecV1 parse_vector_spec(const py::dict& payload) {
     }
   }
 
+  if (payload.contains(py::str("pacing"))) {
+    py::object raw = payload[py::str("pacing")];
+    if (!py::isinstance<py::dict>(raw)) {
+      throw std::runtime_error("vector spec field 'pacing' must be an object");
+    }
+    const py::dict pacing = py::cast<py::dict>(raw);
+    spec.base_tx_timestamp_ns = parse_u64_from_dict(pacing, "base_tx_timestamp_ns", spec.base_tx_timestamp_ns);
+    spec.base_ipg_ns = parse_u32_from_dict(pacing, "base_ipg_ns", spec.base_ipg_ns);
+    spec.inter_flow_gap_ns = parse_u32_from_dict(pacing, "inter_flow_gap_ns", spec.inter_flow_gap_ns);
+  } else {
+    spec.base_tx_timestamp_ns =
+        parse_u64_from_dict(payload, "base_tx_timestamp_ns", spec.base_tx_timestamp_ns);
+    spec.base_ipg_ns = parse_u32_from_dict(payload, "base_ipg_ns", spec.base_ipg_ns);
+    spec.inter_flow_gap_ns = parse_u32_from_dict(payload, "inter_flow_gap_ns", spec.inter_flow_gap_ns);
+  }
+
   if (spec.schema_version >= 2U && spec.topology_enabled) {
     if (spec.client_pool_size == 0U || spec.server_pool_size == 0U) {
       throw std::runtime_error("vector spec v2 topology requires client_pool_size/server_pool_size > 0");

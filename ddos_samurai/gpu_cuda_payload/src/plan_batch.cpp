@@ -55,7 +55,7 @@ void validate_size_match(const PlanBatchV1& batch) {
       batch.body_kind.size() != n || batch.step_id.size() != n || batch.think_time_ms.size() != n ||
       batch.flags.size() != n || batch.template_id.size() != n || batch.flow_id.size() != n ||
       batch.client_idx.size() != n || batch.server_idx.size() != n || batch.tuple_hash.size() != n ||
-      batch.state_op.size() != n) {
+      batch.state_op.size() != n || batch.tx_timestamp_ns.size() != n || batch.inter_flow_gap_ns.size() != n) {
     throw std::runtime_error("plan batch column size mismatch");
   }
 }
@@ -81,6 +81,8 @@ py::dict plan_batch_to_dict(const PlanBatchV1& batch) {
   out["server_idx"] = vector_to_py_list(batch.server_idx);
   out["tuple_hash"] = vector_to_py_list(batch.tuple_hash);
   out["state_op"] = vector_to_py_list(batch.state_op);
+  out["tx_timestamp_ns"] = vector_to_py_list(batch.tx_timestamp_ns);
+  out["inter_flow_gap_ns"] = vector_to_py_list(batch.inter_flow_gap_ns);
   out["metadata"] = batch.metadata;
   return out;
 }
@@ -104,6 +106,10 @@ PlanBatchV1 plan_batch_from_dict(const py::dict& payload) {
   out.server_idx = py_list_to_vector_optional<std::uint16_t>(payload, "server_idx", n, static_cast<std::uint16_t>(0));
   out.tuple_hash = py_list_to_vector_optional<std::uint32_t>(payload, "tuple_hash", n, static_cast<std::uint32_t>(0));
   out.state_op = py_list_to_vector_optional<std::uint8_t>(payload, "state_op", n, static_cast<std::uint8_t>(0));
+  out.tx_timestamp_ns =
+      py_list_to_vector_optional<std::uint64_t>(payload, "tx_timestamp_ns", n, static_cast<std::uint64_t>(0));
+  out.inter_flow_gap_ns =
+      py_list_to_vector_optional<std::uint32_t>(payload, "inter_flow_gap_ns", n, static_cast<std::uint32_t>(0));
   if (payload.contains(py::str("metadata")) && py::isinstance<py::dict>(payload[py::str("metadata")])) {
     out.metadata = py::cast<py::dict>(payload[py::str("metadata")]);
   }

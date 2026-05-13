@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -90,6 +91,14 @@ std::uint8_t state_op_from_name(const std::string& raw) {
     return static_cast<std::uint8_t>(4);
   }
   return static_cast<std::uint8_t>(0);
+}
+
+std::uint64_t add_sat_u64(std::uint64_t base, std::uint64_t delta) {
+  const std::uint64_t maxv = std::numeric_limits<std::uint64_t>::max();
+  if (maxv - base < delta) {
+    return maxv;
+  }
+  return base + delta;
 }
 
 #ifdef SAMURAI_GPU_CUDA_PAYLOAD_KERNELS
@@ -263,6 +272,8 @@ PlanBatchV1 compile_vector_spec(
   out.server_idx.resize(batch_size);
   out.tuple_hash.resize(batch_size);
   out.state_op.resize(batch_size);
+  out.tx_timestamp_ns.resize(batch_size);
+  out.inter_flow_gap_ns.resize(batch_size);
 
   bool planner_cuda_kernel = false;
 #ifdef SAMURAI_GPU_CUDA_PAYLOAD_KERNELS
@@ -347,6 +358,21 @@ PlanBatchV1 compile_vector_spec(
     }
   }
 
+  std::uint64_t next_ts = spec.base_tx_timestamp_ns;
+  for (std::size_t i = 0; i < batch_size; ++i) {
+    std::uint32_t flow_gap = 0u;
+    if (i > 0) {
+      bool inter_flow = (out.flow_id[i] != out.flow_id[i - 1u]);
+      if (inter_flow) {
+        flow_gap = spec.inter_flow_gap_ns;
+      }
+      next_ts = add_sat_u64(next_ts, static_cast<std::uint64_t>(spec.base_ipg_ns));
+      next_ts = add_sat_u64(next_ts, static_cast<std::uint64_t>(flow_gap));
+    }
+    out.tx_timestamp_ns[i] = next_ts;
+    out.inter_flow_gap_ns[i] = flow_gap;
+  }
+
   py::dict meta;
   meta["mode"] = py::str(spec.mode);
   meta["schema_version"] = py::int_(spec.schema_version);
@@ -393,6 +419,9 @@ PlanBatchV1 compile_vector_spec(
   meta["tuple_seed"] = py::int_(spec.tuple_seed);
   meta["step_graph"] = step_graph;
   meta["transport"] = py::str(spec.transport);
+  meta["base_tx_timestamp_ns"] = py::int_(spec.base_tx_timestamp_ns);
+  meta["base_ipg_ns"] = py::int_(spec.base_ipg_ns);
+  meta["inter_flow_gap_ns"] = py::int_(spec.inter_flow_gap_ns);
   meta["planner_rng"] = py::str("xoroshiro128plus");
   meta["planner_polymorphic_http"] = py::bool_(true);
   meta["planner_backend"] = py::str(planner_cuda_kernel ? "cuda_kernel" : "cpu_native");

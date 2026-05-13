@@ -29,6 +29,10 @@ struct VectorSpecV1 {
   std::uint64_t tuple_seed{0};
   std::vector<std::string> step_graph{"open", "send", "expect", "close"};
   std::string transport{"custom_tcp"};
+
+  std::uint64_t base_tx_timestamp_ns{0};
+  std::uint32_t base_ipg_ns{1000};
+  std::uint32_t inter_flow_gap_ns{0};
 };
 
 VectorSpecV1 parse_vector_spec(const pybind11::dict& payload);
