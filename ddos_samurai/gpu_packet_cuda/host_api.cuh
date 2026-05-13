@@ -1727,6 +1727,18 @@ inline uint32_t host_u32_load(const volatile uint32_t* p) {
       __ATOMIC_RELAXED));
 }
 
+inline bool persistent_stream_copy_slots_to_host_batch(
+    PersistentRuntime& rt,
+    const int* slots,
+    size_t slot_count);
+
+inline bool persistent_stream_write_u32_field_batch(
+    PersistentRuntime& rt,
+    const int* slots,
+    const uint32_t* values,
+    size_t slot_count,
+    size_t field_offset);
+
 inline bool persistent_sync_hot_stream_slot(PersistentRuntime& rt, int slot) {
   if (!rt.streams || !rt.streams_hot_dev || slot < 0 || slot >= kPersistentMaxStreams) {
     return false;
@@ -1758,22 +1770,10 @@ inline bool persistent_stream_copy_slot_to_device(PersistentRuntime& rt, int slo
 }
 
 inline bool persistent_stream_copy_slot_to_host(PersistentRuntime& rt, int slot) {
-  if (!rt.streams || !rt.streams_dev || slot < 0 || slot >= kPersistentMaxStreams) {
+  if (slot < 0 || slot >= kPersistentMaxStreams) {
     return false;
   }
-  PersistentDeviceStreamState* host_slot = rt.streams + static_cast<size_t>(slot);
-  const uint32_t completed_host_before = host_slot->completed;
-  if (cudaMemcpy(
-          host_slot,
-          rt.streams_dev + static_cast<size_t>(slot),
-          sizeof(PersistentDeviceStreamState),
-          cudaMemcpyDeviceToHost) != cudaSuccess) {
-    return false;
-  }
-  if (completed_host_before > host_slot->completed) {
-    host_slot->completed = completed_host_before;
-  }
-  return true;
+  return persistent_stream_copy_slots_to_host_batch(rt, &slot, 1u);
 }
 
 inline bool persistent_stream_copy_all_to_host(PersistentRuntime& rt) {
@@ -1805,6 +1805,157 @@ inline bool persistent_stream_copy_all_to_host(PersistentRuntime& rt) {
     }
   }
   return true;
+}
+
+inline bool persistent_stream_copy_slots_to_host_batch(
+    PersistentRuntime& rt,
+    const int* slots,
+    size_t slot_count) {
+  if (!rt.streams || !rt.streams_dev) {
+    return false;
+  }
+  if (slot_count == 0u) {
+    return true;
+  }
+  if (!slots) {
+    return false;
+  }
+  if (!rt.quota_refill_stream) {
+    if (cudaStreamCreateWithFlags(&rt.quota_refill_stream, cudaStreamNonBlocking) != cudaSuccess) {
+      return false;
+    }
+  }
+
+  std::vector<int> uniq_slots;
+  uniq_slots.reserve(slot_count);
+  for (size_t i = 0; i < slot_count; ++i) {
+    const int slot = slots[i];
+    if (slot < 0 || slot >= kPersistentMaxStreams) {
+      continue;
+    }
+    uniq_slots.push_back(slot);
+  }
+  if (uniq_slots.empty()) {
+    return false;
+  }
+  std::sort(uniq_slots.begin(), uniq_slots.end());
+  uniq_slots.erase(std::unique(uniq_slots.begin(), uniq_slots.end()), uniq_slots.end());
+
+  std::vector<uint32_t> completed_before(uniq_slots.size(), 0u);
+  for (size_t i = 0; i < uniq_slots.size(); ++i) {
+    completed_before[i] = rt.streams[static_cast<size_t>(uniq_slots[i])].completed;
+  }
+
+  size_t run_begin = 0u;
+  while (run_begin < uniq_slots.size()) {
+    size_t run_end = run_begin + 1u;
+    while (run_end < uniq_slots.size() && uniq_slots[run_end] == uniq_slots[run_end - 1u] + 1) {
+      ++run_end;
+    }
+    const int slot_start = uniq_slots[run_begin];
+    const size_t run_len = run_end - run_begin;
+    const size_t bytes = run_len * sizeof(PersistentDeviceStreamState);
+    if (cudaMemcpyAsync(
+            rt.streams + static_cast<size_t>(slot_start),
+            rt.streams_dev + static_cast<size_t>(slot_start),
+            bytes,
+            cudaMemcpyDeviceToHost,
+            rt.quota_refill_stream) != cudaSuccess) {
+      return false;
+    }
+    run_begin = run_end;
+  }
+  if (cudaStreamSynchronize(rt.quota_refill_stream) != cudaSuccess) {
+    return false;
+  }
+
+  for (size_t i = 0; i < uniq_slots.size(); ++i) {
+    PersistentDeviceStreamState& d = rt.streams[static_cast<size_t>(uniq_slots[i])];
+    const uint32_t prev = completed_before[i];
+    if (prev > d.completed) {
+      d.completed = prev;
+    }
+  }
+  return true;
+}
+
+inline bool persistent_stream_write_u32_field_batch(
+    PersistentRuntime& rt,
+    const int* slots,
+    const uint32_t* values,
+    size_t slot_count,
+    size_t field_offset) {
+  if (!rt.streams_dev) {
+    return false;
+  }
+  if (slot_count == 0u) {
+    return true;
+  }
+  if (!slots || !values) {
+    return false;
+  }
+  if (!rt.quota_refill_stream) {
+    if (cudaStreamCreateWithFlags(&rt.quota_refill_stream, cudaStreamNonBlocking) != cudaSuccess) {
+      return false;
+    }
+  }
+
+  struct SlotValue {
+    int slot = -1;
+    uint32_t value = 0u;
+  };
+  std::vector<SlotValue> slot_values;
+  slot_values.reserve(slot_count);
+  for (size_t i = 0; i < slot_count; ++i) {
+    const int slot = slots[i];
+    if (slot < 0 || slot >= kPersistentMaxStreams) {
+      continue;
+    }
+    slot_values.push_back(SlotValue{slot, values[i]});
+  }
+  if (slot_values.empty()) {
+    return false;
+  }
+  std::sort(slot_values.begin(), slot_values.end(), [](const SlotValue& a, const SlotValue& b) {
+    return a.slot < b.slot;
+  });
+  std::vector<SlotValue> dedup;
+  dedup.reserve(slot_values.size());
+  for (const SlotValue& sv : slot_values) {
+    if (!dedup.empty() && dedup.back().slot == sv.slot) {
+      dedup.back().value = sv.value;
+    } else {
+      dedup.push_back(sv);
+    }
+  }
+
+  size_t run_begin = 0u;
+  while (run_begin < dedup.size()) {
+    size_t run_end = run_begin + 1u;
+    while (run_end < dedup.size() && dedup[run_end].slot == dedup[run_end - 1u].slot + 1) {
+      ++run_end;
+    }
+    const int slot_start = dedup[run_begin].slot;
+    const size_t run_len = run_end - run_begin;
+    std::vector<uint32_t> run_values(run_len, 0u);
+    for (size_t i = 0; i < run_len; ++i) {
+      run_values[i] = dedup[run_begin + i].value;
+    }
+    uint8_t* dst = reinterpret_cast<uint8_t*>(rt.streams_dev + static_cast<size_t>(slot_start)) + field_offset;
+    if (cudaMemcpy2DAsync(
+            dst,
+            sizeof(PersistentDeviceStreamState),
+            run_values.data(),
+            sizeof(uint32_t),
+            sizeof(uint32_t),
+            run_len,
+            cudaMemcpyHostToDevice,
+            rt.quota_refill_stream) != cudaSuccess) {
+      return false;
+    }
+    run_begin = run_end;
+  }
+  return cudaStreamSynchronize(rt.quota_refill_stream) == cudaSuccess;
 }
 
 inline void persistent_sync_active_stream_count_unlocked(PersistentRuntime& rt) {
@@ -3289,15 +3440,14 @@ __global__ void persistent_dataplane_kernel(
       int produced_for_stream_lane = 0;
       int direct_sent_for_stream_lane = 0;
       int direct_released_for_stream_lane = 0;
-      int direct_queue_ids[kTokenReserveChunkPerLane];
-      int direct_queue_counts[kTokenReserveChunkPerLane];
-      int direct_queue_used = 0;
+      int direct_enqueued_for_stream_lane = 0;
+      int direct_packet_qids[kTokenReserveChunkPerLane];
+      int direct_packet_count = 0;
       PersistentRingSlot* publish_slots[kTokenReserveChunkPerLane];
       int publish_count = 0;
       #pragma unroll
       for (int pi = 0; pi < static_cast<int>(kTokenReserveChunkPerLane); ++pi) {
-        direct_queue_ids[pi] = -1;
-        direct_queue_counts[pi] = 0;
+        direct_packet_qids[pi] = -1;
         publish_slots[pi] = nullptr;
       }
 
@@ -3407,20 +3557,11 @@ __global__ void persistent_dataplane_kernel(
             slot.stream_id = 0;
             slot.stream_slot = -1;
             slot.protocol = 0;
-            bool counted = false;
-            #pragma unroll
-            for (int qi = 0; qi < static_cast<int>(kTokenReserveChunkPerLane); ++qi) {
-              if (qi < direct_queue_used && direct_queue_ids[qi] == q) {
-                direct_queue_counts[qi] += 1;
-                counted = true;
-                break;
-              }
+            if (direct_packet_count < static_cast<int>(kTokenReserveChunkPerLane)) {
+              direct_packet_qids[direct_packet_count] = q;
+              direct_packet_count += 1;
             }
-            if (!counted && direct_queue_used < static_cast<int>(kTokenReserveChunkPerLane)) {
-              direct_queue_ids[direct_queue_used] = q;
-              direct_queue_counts[direct_queue_used] = 1;
-              direct_queue_used += 1;
-            }
+            direct_enqueued_for_stream_lane += 1;
             produced = true;
             produced_for_stream_lane += 1;
             continue;
@@ -3454,19 +3595,28 @@ __global__ void persistent_dataplane_kernel(
           persistent_publish_slot_ready(publish_slots[pi]);
         }
       }
-      if (doca_gpu_txq_handles && doca_txq_mkeys_be && direct_queue_used > 0) {
-        #pragma unroll
-        for (int qi = 0; qi < static_cast<int>(kTokenReserveChunkPerLane); ++qi) {
-          if (qi >= direct_queue_used) {
-            break;
+      if (doca_gpu_txq_handles && doca_txq_mkeys_be && direct_packet_count > 0) {
+        for (int qid = 0; qid < queue_count; ++qid) {
+          int local_qcount = 0;
+          #pragma unroll
+          for (int pi = 0; pi < static_cast<int>(kTokenReserveChunkPerLane); ++pi) {
+            if (pi < direct_packet_count && direct_packet_qids[pi] == qid) {
+              local_qcount += 1;
+            }
           }
-          const int qid = direct_queue_ids[qi];
-          const int qcount = direct_queue_counts[qi];
-          if (qid < 0 || qid >= queue_count || qcount <= 0) {
-            continue;
+          int warp_qcount = local_qcount;
+          for (uint32_t offset = (kWarpWidth >> 1u); offset > 0u; offset >>= 1u) {
+            warp_qcount += __shfl_down_sync(warp_mask, warp_qcount, static_cast<int>(offset));
           }
-          const uint64_t gpu_txq_handle = doca_gpu_txq_handles[static_cast<size_t>(qid)];
-          if (!persistent_doca_kernel_try_commit_push(gpu_txq_handle)) {
+          int commit_failed = 0;
+          if (lane == 0u && warp_qcount > 0) {
+            const uint64_t gpu_txq_handle = doca_gpu_txq_handles[static_cast<size_t>(qid)];
+            if (!persistent_doca_kernel_try_commit_push(gpu_txq_handle)) {
+              commit_failed = 1;
+            }
+          }
+          commit_failed = __shfl_sync(warp_mask, commit_failed, 0);
+          if (commit_failed != 0) {
             if (lane == 0u) {
               u64_add(&ctrl->native_batch_degrade_events, 1u);
               ctrl->run = 0;
@@ -3474,9 +3624,9 @@ __global__ void persistent_dataplane_kernel(
             }
             return;
           }
-          direct_sent_for_stream_lane += qcount;
-          direct_released_for_stream_lane += qcount;
         }
+        direct_sent_for_stream_lane += direct_enqueued_for_stream_lane;
+        direct_released_for_stream_lane += direct_enqueued_for_stream_lane;
       }
 
       int produced_for_stream = produced_for_stream_lane;
@@ -4517,6 +4667,22 @@ inline void persistent_monitor_loop() {
         }
       }
       const bool telemetry_bulk_ok = persistent_stream_copy_all_to_host(rt);
+      std::vector<int> telemetry_slots;
+      telemetry_slots.reserve(g_persistent_streams.size());
+      for (const auto& kv : g_persistent_streams) {
+        const auto& st = kv.second;
+        if (st.active == 0 || st.device_slot < 0 || st.device_slot >= kPersistentMaxStreams || !rt.streams) {
+          continue;
+        }
+        telemetry_slots.push_back(st.device_slot);
+      }
+      bool telemetry_slots_ok = telemetry_bulk_ok;
+      if (!telemetry_slots_ok && !telemetry_slots.empty()) {
+        telemetry_slots_ok = persistent_stream_copy_slots_to_host_batch(
+            rt,
+            telemetry_slots.data(),
+            telemetry_slots.size());
+      }
       std::vector<double> fairness_samples;
       fairness_samples.reserve(g_persistent_streams.size());
       for (auto& kv : g_persistent_streams) {
@@ -4524,7 +4690,7 @@ inline void persistent_monitor_loop() {
         if (st.active == 0 || st.device_slot < 0 || !rt.streams) {
           continue;
         }
-        if (!telemetry_bulk_ok && !persistent_stream_copy_slot_to_host(rt, st.device_slot)) {
+        if (!telemetry_slots_ok) {
           continue;
         }
         st.heartbeat_ns = now_ns_steady();
@@ -4590,11 +4756,25 @@ inline void persistent_monitor_loop() {
       {
         std::lock_guard<std::mutex> g(g_persistent_lock);
         rt.ctrl->throttle_events += 1u;
+        std::vector<int> throttle_slots;
+        throttle_slots.reserve(g_persistent_streams.size());
+        for (const auto& kv : g_persistent_streams) {
+          if (kv.second.device_slot >= 0 && kv.second.device_slot < kPersistentMaxStreams && rt.streams) {
+            throttle_slots.push_back(kv.second.device_slot);
+          }
+        }
+        const bool throttle_copy_ok = throttle_slots.empty()
+            ? true
+            : persistent_stream_copy_slots_to_host_batch(rt, throttle_slots.data(), throttle_slots.size());
+        std::vector<int> update_slots;
+        std::vector<uint32_t> update_values;
+        update_slots.reserve(throttle_slots.size());
+        update_values.reserve(throttle_slots.size());
         for (auto& kv : g_persistent_streams) {
           if (kv.second.device_slot < 0 || kv.second.device_slot >= kPersistentMaxStreams || !rt.streams) {
             continue;
           }
-          if (!persistent_stream_copy_slot_to_host(rt, kv.second.device_slot)) {
+          if (!throttle_copy_ok) {
             continue;
           }
           PersistentDeviceStreamState& d = rt.streams[kv.second.device_slot];
@@ -4602,11 +4782,16 @@ inline void persistent_monitor_loop() {
             continue;
           }
           d.quota_left = std::max<uint32_t>(1u, d.quota_left / 2u);
-          (void)persistent_stream_write_field<uint32_t>(
+          update_slots.push_back(kv.second.device_slot);
+          update_values.push_back(d.quota_left);
+        }
+        if (!update_slots.empty()) {
+          (void)persistent_stream_write_u32_field_batch(
               rt,
-              kv.second.device_slot,
-              offsetof(PersistentDeviceStreamState, quota_left),
-              d.quota_left);
+              update_slots.data(),
+              update_values.data(),
+              update_slots.size(),
+              offsetof(PersistentDeviceStreamState, quota_left));
         }
       }
       rt.ctrl->drain_attempts += 1u;

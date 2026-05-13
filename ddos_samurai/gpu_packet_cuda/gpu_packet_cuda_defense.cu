@@ -101,12 +101,8 @@ struct DefenseRuntime {
   std::vector<uint64_t> ingress_packet_handles_scratch{};
   std::vector<uint16_t> ingress_lengths_u16_scratch{};
   std::vector<PacketView> ingress_views_scratch{};
-  std::vector<int32_t> ingress_labels_scratch{};
-  std::vector<float> ingress_confidences_scratch{};
   uint64_t* ingress_packet_ptrs_dev = nullptr;
   uint16_t* ingress_lengths_u16_dev = nullptr;
-  int32_t* ingress_labels_dev = nullptr;
-  float* ingress_confidences_dev = nullptr;
   uint32_t* ingress_device_meta_dev = nullptr;  // received, valid, drops, status
   size_t ingress_device_capacity = 0u;
   Clock::time_point first_infer_at{};
@@ -231,14 +227,6 @@ void release_ingress_device_buffers(DefenseRuntime* rt) {
     (void)cudaFree(rt->ingress_lengths_u16_dev);
     rt->ingress_lengths_u16_dev = nullptr;
   }
-  if (rt->ingress_labels_dev != nullptr) {
-    (void)cudaFree(rt->ingress_labels_dev);
-    rt->ingress_labels_dev = nullptr;
-  }
-  if (rt->ingress_confidences_dev != nullptr) {
-    (void)cudaFree(rt->ingress_confidences_dev);
-    rt->ingress_confidences_dev = nullptr;
-  }
   if (rt->ingress_device_meta_dev != nullptr) {
     (void)cudaFree(rt->ingress_device_meta_dev);
     rt->ingress_device_meta_dev = nullptr;
@@ -251,7 +239,7 @@ void release_ingress_device_buffers(DefenseRuntime* rt) {
 }
 
 #if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
-__global__ void doca_rx_receive_and_classify_stub_kernel(
+__global__ void doca_rx_receive_burst_kernel(
     const uint64_t* gpu_rxq_handles,
     uint32_t gpu_rxq_handle_count,
     uint32_t rr_cursor,
@@ -260,8 +248,6 @@ __global__ void doca_rx_receive_and_classify_stub_kernel(
     uint64_t timeout_ns,
     uint64_t* out_packet_ptrs,
     uint16_t* out_lengths,
-    int32_t* out_labels,
-    float* out_confidences,
     uint32_t* out_meta) {
   // out_meta layout: [0]=received, [1]=valid, [2]=drops, [3]=status
   if (blockIdx.x != 0) {
@@ -326,12 +312,8 @@ __global__ void doca_rx_receive_and_classify_stub_kernel(
       continue;
     }
 
-    const uint32_t first = *reinterpret_cast<const uint8_t*>(pkt_addr);
-    const float score = (static_cast<float>(max_packet_size) * 0.001f) + (static_cast<float>(first) * 0.0001f);
     out_packet_ptrs[i] = static_cast<uint64_t>(pkt_addr);
     out_lengths[i] = static_cast<uint16_t>(max_packet_size > 65535u ? 65535u : max_packet_size);
-    out_labels[i] = (score > 0.2f) ? 1 : 0;
-    out_confidences[i] = (score > 0.2f) ? 0.9f : 0.6f;
     atomicAdd(&out_meta[1], 1u);
   }
   __syncthreads();
@@ -1037,8 +1019,6 @@ bool ensure_ingress_device_buffers(DefenseRuntime* rt, size_t packet_capacity, s
   if (rt->ingress_device_capacity >= packet_capacity &&
       rt->ingress_packet_ptrs_dev != nullptr &&
       rt->ingress_lengths_u16_dev != nullptr &&
-      rt->ingress_labels_dev != nullptr &&
-      rt->ingress_confidences_dev != nullptr &&
       rt->ingress_device_meta_dev != nullptr) {
     return true;
   }
@@ -1046,13 +1026,9 @@ bool ensure_ingress_device_buffers(DefenseRuntime* rt, size_t packet_capacity, s
   release_ingress_device_buffers(rt);
   const size_t ptr_bytes = sizeof(uint64_t) * packet_capacity;
   const size_t len_bytes = sizeof(uint16_t) * packet_capacity;
-  const size_t label_bytes = sizeof(int32_t) * packet_capacity;
-  const size_t conf_bytes = sizeof(float) * packet_capacity;
   const size_t meta_bytes = sizeof(uint32_t) * 4u;
   if (cudaMalloc(reinterpret_cast<void**>(&rt->ingress_packet_ptrs_dev), ptr_bytes) != cudaSuccess ||
       cudaMalloc(reinterpret_cast<void**>(&rt->ingress_lengths_u16_dev), len_bytes) != cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&rt->ingress_labels_dev), label_bytes) != cudaSuccess ||
-      cudaMalloc(reinterpret_cast<void**>(&rt->ingress_confidences_dev), conf_bytes) != cudaSuccess ||
       cudaMalloc(reinterpret_cast<void**>(&rt->ingress_device_meta_dev), meta_bytes) != cudaSuccess) {
     release_ingress_device_buffers(rt);
     if (reason != nullptr) {
@@ -1100,17 +1076,20 @@ int classify_from_ingress_doca_device_locked(
     }
     return set_err(alloc_reason.empty() ? "doca_rx_device_unavailable" : alloc_reason);
   }
-  if (g_runtime.ingress_labels_scratch.size() < max_packets_sz) {
-    g_runtime.ingress_labels_scratch.resize(max_packets_sz, 0);
+  if (g_runtime.ingress_packet_ptrs_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_packet_ptrs_scratch.resize(max_packets_sz, 0u);
   }
-  if (g_runtime.ingress_confidences_scratch.size() < max_packets_sz) {
-    g_runtime.ingress_confidences_scratch.resize(max_packets_sz, 0.0f);
+  if (g_runtime.ingress_lengths_u16_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_lengths_u16_scratch.resize(max_packets_sz, 0u);
+  }
+  if (g_runtime.ingress_views_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_views_scratch.resize(max_packets_sz);
   }
 
   uint32_t host_meta[4] = {0u, 0u, 0u, 0u};
   const uint32_t threads = static_cast<uint32_t>(std::min<int32_t>(std::max<int32_t>(max_packets, 32), 256));
   const uint64_t timeout_ns = static_cast<uint64_t>(std::max<int64_t>(1000, g_runtime.flush_timeout_ms * 1000 * 1000));
-  doca_rx_receive_and_classify_stub_kernel<<<1, threads>>>(
+  doca_rx_receive_burst_kernel<<<1, threads>>>(
       g_runtime.doca_gpu_rxq_handles_dev,
       rxq_count_u,
       rr_cursor_u,
@@ -1119,8 +1098,6 @@ int classify_from_ingress_doca_device_locked(
       timeout_ns,
       g_runtime.ingress_packet_ptrs_dev,
       g_runtime.ingress_lengths_u16_dev,
-      g_runtime.ingress_labels_dev,
-      g_runtime.ingress_confidences_dev,
       g_runtime.ingress_device_meta_dev);
   if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
     g_runtime.doca_rx_device_poll_errors += 1u;
@@ -1160,14 +1137,14 @@ int classify_from_ingress_doca_device_locked(
   }
   const int n = std::min(valid, max_packets);
   if (cudaMemcpy(
-          g_runtime.ingress_labels_scratch.data(),
-          g_runtime.ingress_labels_dev,
-          sizeof(int32_t) * static_cast<size_t>(n),
+          g_runtime.ingress_packet_ptrs_scratch.data(),
+          g_runtime.ingress_packet_ptrs_dev,
+          sizeof(uint64_t) * static_cast<size_t>(n),
           cudaMemcpyDeviceToHost) != cudaSuccess ||
       cudaMemcpy(
-          g_runtime.ingress_confidences_scratch.data(),
-          g_runtime.ingress_confidences_dev,
-          sizeof(float) * static_cast<size_t>(n),
+          g_runtime.ingress_lengths_u16_scratch.data(),
+          g_runtime.ingress_lengths_u16_dev,
+          sizeof(uint16_t) * static_cast<size_t>(n),
           cudaMemcpyDeviceToHost) != cudaSuccess) {
     g_runtime.doca_rx_device_poll_errors += 1u;
     if (out_reason != nullptr) {
@@ -1175,25 +1152,36 @@ int classify_from_ingress_doca_device_locked(
     }
     return set_err("doca_rx_device_unavailable");
   }
-  std::memcpy(out_labels, g_runtime.ingress_labels_scratch.data(), sizeof(int32_t) * static_cast<size_t>(n));
-  std::memcpy(out_confidences, g_runtime.ingress_confidences_scratch.data(), sizeof(float) * static_cast<size_t>(n));
 
-  g_runtime.doca_rx_device_packets += static_cast<uint64_t>(n);
-  // Keep common classifier telemetry coherent even when inference is executed in a CUDA kernel.
-  g_runtime.infer_calls += 1u;
-  g_runtime.infer_packets += static_cast<uint64_t>(n);
-  if (g_runtime.infer_calls == 1u) {
-    g_runtime.first_infer_at = Clock::now();
-  }
-  g_runtime.last_infer_at = Clock::now();
+  bool invalid_pkt_view = false;
   for (int i = 0; i < n; ++i) {
-    if (out_labels[i] == 1) {
-      g_runtime.label1_count += 1u;
-    } else {
-      g_runtime.label0_count += 1u;
+    const uint64_t ptr_raw = g_runtime.ingress_packet_ptrs_scratch[static_cast<size_t>(i)];
+    const uint16_t len_u16 = g_runtime.ingress_lengths_u16_scratch[static_cast<size_t>(i)];
+    if (ptr_raw == 0u || len_u16 == 0u || len_u16 > static_cast<uint16_t>(max_packet_size)) {
+      g_runtime.doca_rx_device_drops += 1u;
+      invalid_pkt_view = true;
+      break;
     }
-    g_runtime.confidence_sum += static_cast<double>(out_confidences[i]);
+    g_runtime.ingress_views_scratch[static_cast<size_t>(i)] = PacketView{
+        reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(ptr_raw)),
+        static_cast<size_t>(len_u16)};
   }
+  if (invalid_pkt_view) {
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_receive_failed";
+    }
+    return set_err("doca_rx_receive_failed");
+  }
+  const int cls_rc = classify_packet_views_common_locked(
+      g_runtime.ingress_views_scratch.data(),
+      static_cast<int64_t>(n),
+      out_labels,
+      out_confidences,
+      out_reason);
+  if (cls_rc != 0) {
+    return cls_rc;
+  }
+  g_runtime.doca_rx_device_packets += static_cast<uint64_t>(n);
   if (out_reason != nullptr) {
     *out_reason = "none";
   }
