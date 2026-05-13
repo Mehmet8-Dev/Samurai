@@ -2187,13 +2187,29 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   const bool want_xdp = (b.requested == "auto" || b.requested == "af_xdp");
   const bool want_afpacket = (b.requested == "auto" || b.requested == "af_packet");
   const bool want_doca = (b.requested == "auto" || b.requested == "doca_gpunetio");
-  const bool want_doca_kernel_direct = env_int_local("SAMURAI_GPU_DOCA_KERNEL_TX", 0) != 0;
+  const std::string doca_kernel_mode_raw = lower_copy(env_string_or("SAMURAI_GPU_DOCA_KERNEL_TX", "auto"));
+  bool want_doca_kernel_direct = false;
+  bool doca_kernel_mode_forced = false;
+  if (doca_kernel_mode_raw == "1" || doca_kernel_mode_raw == "true" || doca_kernel_mode_raw == "yes" ||
+      doca_kernel_mode_raw == "on" || doca_kernel_mode_raw == "force") {
+    want_doca_kernel_direct = true;
+    doca_kernel_mode_forced = true;
+  } else if (doca_kernel_mode_raw == "0" || doca_kernel_mode_raw == "false" || doca_kernel_mode_raw == "no" ||
+             doca_kernel_mode_raw == "off") {
+    want_doca_kernel_direct = false;
+    doca_kernel_mode_forced = true;
+  } else {
+    // auto: explicit DOCA backend seçildiyse kernel-direct yolu varsayılan olarak dene.
+    want_doca_kernel_direct = (b.requested == "doca_gpunetio");
+    doca_kernel_mode_forced = false;
+  }
 #if !SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
-  if (want_doca_kernel_direct) {
+  if (want_doca_kernel_direct && doca_kernel_mode_forced) {
     b.kind = PersistentTxBackendKind::kNoop;
     b.active = "noop";
     return false;
   }
+  want_doca_kernel_direct = false;
 #endif
   if (want_xdp && !b.iface.empty()) {
     if (samurai_xdp_get_native_api_v1) {
@@ -2263,6 +2279,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
             b.active = "noop";
             return false;
           }
+          want_doca_kernel_direct = false;
         }
         b.doca_txq_handles.assign(static_cast<size_t>(rt.queue_count), -1);
         if (want_doca_kernel_direct) {
@@ -2338,7 +2355,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
     b.active = "noop";
     return false;
   }
-  if (want_doca_kernel_direct) {
+  if (want_doca_kernel_direct && doca_kernel_mode_forced) {
     b.kind = PersistentTxBackendKind::kNoop;
     b.active = "noop";
     return false;
