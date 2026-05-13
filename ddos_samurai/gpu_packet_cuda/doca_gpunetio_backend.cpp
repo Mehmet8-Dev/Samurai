@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <cstdio>
 #include <initializer_list>
 #include <limits>
 #include <mutex>
@@ -218,6 +219,25 @@ int g_next_handle = 1;
 std::mutex g_api_lock;
 DocaApi g_doca{};
 
+using DocaFlowProgramSteeringFn = int (*)(
+    const char* iface,
+    const char* device_name,
+    const int* rxq_ids,
+    int rxq_count,
+    uint32_t proto_mask,
+    char* err,
+    size_t err_len);
+
+struct DocaFlowDispatch {
+  void* handle = nullptr;
+  bool load_attempted = false;
+  std::string load_error;
+  DocaFlowProgramSteeringFn program_steering = nullptr;
+};
+
+std::mutex g_flow_lock;
+DocaFlowDispatch g_flow{};
+
 inline void write_err(char* err, size_t err_len, const std::string& msg) {
   if (!err || err_len == 0u) {
     return;
@@ -233,6 +253,20 @@ inline std::string env_string(const char* name, const char* defv) {
     return std::string(defv ? defv : "");
   }
   return std::string(raw);
+}
+
+inline std::string join_int_csv(const int* values, int count) {
+  std::string out;
+  if (!values || count <= 0) {
+    return out;
+  }
+  for (int i = 0; i < count; ++i) {
+    if (i > 0) {
+      out.push_back(',');
+    }
+    out += std::to_string(values[static_cast<size_t>(i)]);
+  }
+  return out;
 }
 
 inline int env_int(const char* name, int defv, int minv, int maxv) {
@@ -264,6 +298,75 @@ inline std::string doca_err(const DocaApi& api, doca_error_t rc) {
     }
   }
   return std::string("doca_error=") + std::to_string(static_cast<int>(rc));
+}
+
+inline int run_flow_ctl_command(
+    const char* iface,
+    const char* device_name,
+    const int* rxq_ids,
+    int rxq_count,
+    uint32_t proto_mask,
+    char* err,
+    size_t err_len) {
+  const std::string flow_ctl = env_string("SAMURAI_GPU_DOCA_FLOW_CTL", "");
+  if (flow_ctl.empty()) {
+    return 1;
+  }
+  const std::string qcsv = join_int_csv(rxq_ids, rxq_count);
+  std::string cmd;
+  cmd.reserve(512);
+  cmd.append(flow_ctl);
+  cmd.append(" --iface ");
+  cmd.append(iface ? iface : "");
+  cmd.append(" --device ");
+  cmd.append(device_name ? device_name : "");
+  cmd.append(" --proto-mask ");
+  cmd.append(std::to_string(proto_mask));
+  cmd.append(" --queues ");
+  cmd.append(qcsv);
+  const int rc = std::system(cmd.c_str());
+  if (rc == 0) {
+    return 0;
+  }
+  write_err(err, err_len, "flow steering control command failed");
+  return -1;
+}
+
+inline bool ensure_flow_dispatch(std::string& why) {
+  std::lock_guard<std::mutex> guard(g_flow_lock);
+  if (g_flow.program_steering != nullptr) {
+    return true;
+  }
+  if (g_flow.load_attempted) {
+    why = g_flow.load_error.empty() ? "flow dispatch unavailable" : g_flow.load_error;
+    return false;
+  }
+  g_flow.load_attempted = true;
+
+  const std::string so_path =
+      env_string("SAMURAI_GPU_DOCA_FLOW_SHIM_SO", "libsamurai_doca_flow_backend.so");
+  dlerror();
+  g_flow.handle = dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (g_flow.handle == nullptr) {
+    const char* dl_err = dlerror();
+    g_flow.load_error = std::string("dlopen failed for flow steering backend: ") +
+        (dl_err ? dl_err : "unknown");
+    why = g_flow.load_error;
+    return false;
+  }
+  dlerror();
+  void* sym = dlsym(g_flow.handle, "samurai_doca_flow_program_steering_v1");
+  const char* sym_err = dlerror();
+  if (!sym || sym_err) {
+    g_flow.load_error = std::string("dlsym(samurai_doca_flow_program_steering_v1) failed: ") +
+        (sym_err ? sym_err : "unknown");
+    dlclose(g_flow.handle);
+    g_flow.handle = nullptr;
+    why = g_flow.load_error;
+    return false;
+  }
+  g_flow.program_steering = reinterpret_cast<DocaFlowProgramSteeringFn>(sym);
+  return true;
 }
 
 inline bool try_dlopen(std::vector<void*>& libs, const char* soname) {
@@ -1451,6 +1554,119 @@ extern "C" int samurai_doca_backend_destroy_rxq(int handle, char* err, size_t er
   destroy_backend_rxq_unlocked(it->second);
   g_rx_handles.erase(it);
   return 0;
+}
+
+extern "C" int samurai_doca_backend_configure_flow_steering(
+    const char* iface,
+    const char* device_name,
+    const int* rxq_handles,
+    const int* rxq_ids,
+    int rxq_count,
+    uint32_t proto_mask,
+    int strict,
+    char* err,
+    size_t err_len) {
+  if (!iface || !*iface || !device_name || !*device_name || !rxq_handles || !rxq_ids || rxq_count <= 0) {
+    write_err(err, err_len, "invalid arguments for samurai_doca_backend_configure_flow_steering");
+    return -1;
+  }
+  if (rxq_count < 2 || proto_mask == 0u) {
+    // Not an error: no meaningful multi-queue flow steering to apply.
+    return 1;
+  }
+  std::string why;
+  if (!ensure_doca_api(why)) {
+    if (strict != 0) {
+      write_err(err, err_len, std::string("DOCA runtime unavailable for flow steering: ") + why);
+      return -1;
+    }
+    return 1;
+  }
+
+  std::vector<int> seen_queue_ids;
+  seen_queue_ids.reserve(static_cast<size_t>(rxq_count));
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    for (int i = 0; i < rxq_count; ++i) {
+      const int handle = rxq_handles[static_cast<size_t>(i)];
+      const int queue_id = rxq_ids[static_cast<size_t>(i)];
+      if (handle < 0 || queue_id < 0) {
+        write_err(err, err_len, "invalid queue handle or queue id for flow steering");
+        return -1;
+      }
+      auto it = g_rx_handles.find(handle);
+      if (it == g_rx_handles.end()) {
+        write_err(err, err_len, "flow steering rxq handle not found");
+        return -1;
+      }
+      const BackendRxqHandle& h = it->second;
+      if (h.iface != iface || h.device_name != device_name) {
+        write_err(err, err_len, "flow steering queue/device mismatch");
+        return -1;
+      }
+      if (h.queue_id != queue_id) {
+        write_err(err, err_len, "flow steering queue id mismatch");
+        return -1;
+      }
+      if (std::find(seen_queue_ids.begin(), seen_queue_ids.end(), queue_id) != seen_queue_ids.end()) {
+        write_err(err, err_len, "flow steering duplicate queue id");
+        return -1;
+      }
+      seen_queue_ids.push_back(queue_id);
+    }
+  }
+
+  // Try steering programmer #1: explicit external control command.
+  {
+    const int ctl_rc = run_flow_ctl_command(
+        iface,
+        device_name,
+        seen_queue_ids.data(),
+        static_cast<int>(seen_queue_ids.size()),
+        proto_mask,
+        err,
+        err_len);
+    if (ctl_rc == 0) {
+      return 0;
+    }
+    if (ctl_rc < 0 && strict != 0) {
+      return -1;
+    }
+  }
+
+  // Try steering programmer #2: pluggable native DOCA Flow shim backend.
+  {
+    std::string flow_why;
+    if (ensure_flow_dispatch(flow_why) && g_flow.program_steering != nullptr) {
+      const int rc = g_flow.program_steering(
+          iface,
+          device_name,
+          seen_queue_ids.data(),
+          static_cast<int>(seen_queue_ids.size()),
+          proto_mask,
+          err,
+          err_len);
+      if (rc == 0) {
+        return 0;
+      }
+      if (strict != 0) {
+        if (err == nullptr || err_len == 0u || err[0] == '\0') {
+          write_err(err, err_len, "flow steering shim returned failure");
+        }
+        return -1;
+      }
+      return 1;
+    }
+    if (strict != 0) {
+      const std::string msg = flow_why.empty() ? "flow steering backend unavailable" : flow_why;
+      write_err(err, err_len, msg);
+      return -1;
+    }
+  }
+
+  // No steering programmer configured. In non-strict mode mark as not applied.
+  write_err(err, err_len, "flow steering not applied (no backend configured)");
+  return 1;
 }
 
 extern "C" int samurai_doca_backend_receive_burst(

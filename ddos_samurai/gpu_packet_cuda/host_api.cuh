@@ -2976,7 +2976,7 @@ __device__ __forceinline__ void persistent_publish_slot_ready(PersistentRingSlot
 #endif
 }
 
-__device__ __forceinline__ bool persistent_doca_kernel_try_send(
+__device__ __forceinline__ bool persistent_doca_kernel_try_enqueue(
     uint64_t gpu_txq_handle,
     uint32_t mkey_be,
     const uint8_t* packet_ptr,
@@ -2995,6 +2995,25 @@ __device__ __forceinline__ bool persistent_doca_kernel_try_send(
   if (rc_enqueue != DOCA_SUCCESS) {
     return false;
   }
+  return true;
+#else
+  (void)gpu_txq_handle;
+  (void)mkey_be;
+  (void)packet_ptr;
+  (void)packet_len;
+  return false;
+#endif
+}
+
+__device__ __forceinline__ bool persistent_doca_kernel_try_commit_push(uint64_t gpu_txq_handle) {
+  if (gpu_txq_handle == 0ull) {
+    return false;
+  }
+#if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+  auto* txq = reinterpret_cast<doca_gpu_eth_txq*>(gpu_txq_handle);
+  if (!txq) {
+    return false;
+  }
   const doca_error_t rc_commit = doca_gpu_dev_eth_txq_commit_strong(txq);
   if (rc_commit != DOCA_SUCCESS) {
     return false;
@@ -3003,9 +3022,6 @@ __device__ __forceinline__ bool persistent_doca_kernel_try_send(
   return rc_push == DOCA_SUCCESS;
 #else
   (void)gpu_txq_handle;
-  (void)mkey_be;
-  (void)packet_ptr;
-  (void)packet_len;
   return false;
 #endif
 }
@@ -3273,10 +3289,15 @@ __global__ void persistent_dataplane_kernel(
       int produced_for_stream_lane = 0;
       int direct_sent_for_stream_lane = 0;
       int direct_released_for_stream_lane = 0;
+      int direct_queue_ids[kTokenReserveChunkPerLane];
+      int direct_queue_counts[kTokenReserveChunkPerLane];
+      int direct_queue_used = 0;
       PersistentRingSlot* publish_slots[kTokenReserveChunkPerLane];
       int publish_count = 0;
       #pragma unroll
       for (int pi = 0; pi < static_cast<int>(kTokenReserveChunkPerLane); ++pi) {
+        direct_queue_ids[pi] = -1;
+        direct_queue_counts[pi] = 0;
         publish_slots[pi] = nullptr;
       }
 
@@ -3380,16 +3401,28 @@ __global__ void persistent_dataplane_kernel(
         if (slot_len_u > 0u && doca_gpu_txq_handles && doca_txq_mkeys_be && q >= 0 && q < queue_count) {
           const uint64_t gpu_txq_handle = doca_gpu_txq_handles[static_cast<size_t>(q)];
           const uint32_t mkey_be = doca_txq_mkeys_be[static_cast<size_t>(q)];
-          if (persistent_doca_kernel_try_send(gpu_txq_handle, mkey_be, slot_payload, slot_len_u)) {
+          if (persistent_doca_kernel_try_enqueue(gpu_txq_handle, mkey_be, slot_payload, slot_len_u)) {
             slot.state = 0;
             slot.len = 0;
             slot.stream_id = 0;
             slot.stream_slot = -1;
             slot.protocol = 0;
+            bool counted = false;
+            #pragma unroll
+            for (int qi = 0; qi < static_cast<int>(kTokenReserveChunkPerLane); ++qi) {
+              if (qi < direct_queue_used && direct_queue_ids[qi] == q) {
+                direct_queue_counts[qi] += 1;
+                counted = true;
+                break;
+              }
+            }
+            if (!counted && direct_queue_used < static_cast<int>(kTokenReserveChunkPerLane)) {
+              direct_queue_ids[direct_queue_used] = q;
+              direct_queue_counts[direct_queue_used] = 1;
+              direct_queue_used += 1;
+            }
             produced = true;
             produced_for_stream_lane += 1;
-            direct_sent_for_stream_lane += 1;
-            direct_released_for_stream_lane += 1;
             continue;
           }
         }
@@ -3419,6 +3452,30 @@ __global__ void persistent_dataplane_kernel(
       for (int pi = 0; pi < static_cast<int>(kTokenReserveChunkPerLane); ++pi) {
         if (publish_slots[pi]) {
           persistent_publish_slot_ready(publish_slots[pi]);
+        }
+      }
+      if (doca_gpu_txq_handles && doca_txq_mkeys_be && direct_queue_used > 0) {
+        #pragma unroll
+        for (int qi = 0; qi < static_cast<int>(kTokenReserveChunkPerLane); ++qi) {
+          if (qi >= direct_queue_used) {
+            break;
+          }
+          const int qid = direct_queue_ids[qi];
+          const int qcount = direct_queue_counts[qi];
+          if (qid < 0 || qid >= queue_count || qcount <= 0) {
+            continue;
+          }
+          const uint64_t gpu_txq_handle = doca_gpu_txq_handles[static_cast<size_t>(qid)];
+          if (!persistent_doca_kernel_try_commit_push(gpu_txq_handle)) {
+            if (lane == 0u) {
+              u64_add(&ctrl->native_batch_degrade_events, 1u);
+              ctrl->run = 0;
+              atomicExch((int*)run_flag_dev, 0);
+            }
+            return;
+          }
+          direct_sent_for_stream_lane += qcount;
+          direct_released_for_stream_lane += qcount;
         }
       }
 
