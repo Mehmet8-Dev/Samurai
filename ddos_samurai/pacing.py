@@ -25,11 +25,142 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shutil
+import subprocess
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional
+from typing import Optional, Sequence
 
 log = logging.getLogger(__name__)
+
+_COMMON_SBIN_PATHS = (
+    "/usr/sbin",
+    "/sbin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+)
+
+
+def _find_tool(name: str) -> Optional[str]:
+    path = shutil.which(name)
+    if path:
+        return path
+    for base in _COMMON_SBIN_PATHS:
+        cand = os.path.join(base, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _run_cmd_capture(cmd: Sequence[str], timeout: float = 1.5) -> tuple[int, str, str]:
+    try:
+        cp = subprocess.run(
+            list(cmd),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=float(timeout),
+        )
+        return int(cp.returncode), str(cp.stdout or ""), str(cp.stderr or "")
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
+        return 127, "", str(exc)
+
+
+def _parse_int_token(raw: str) -> int:
+    try:
+        return int(str(raw).strip())
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+        return 0
+
+
+def _probe_etf_qdisc(iface: str) -> dict:
+    out = {
+        "tc_available": 0,
+        "etf_qdisc_present": 0,
+        "etf_offload": 0,
+        "etf_clockid": "",
+        "etf_delta_ns": 0,
+        "etf_parent": "",
+        "etf_probe_error": "",
+        "etf_qdisc_raw": "",
+    }
+    tc_bin = _find_tool("tc")
+    if not tc_bin:
+        out["etf_probe_error"] = "tc_not_found"
+        return out
+    out["tc_available"] = 1
+
+    rc, stdout, stderr = _run_cmd_capture([tc_bin, "qdisc", "show", "dev", str(iface).strip()], timeout=2.0)
+    if rc != 0:
+        out["etf_probe_error"] = f"tc_qdisc_show_failed:{rc}:{(stderr or stdout).strip()}"
+        return out
+
+    for raw_line in str(stdout).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "qdisc etf " not in f" {line} ":
+            continue
+        toks = line.split()
+        out["etf_qdisc_present"] = 1
+        out["etf_qdisc_raw"] = line
+        out["etf_offload"] = 1 if "offload" in toks else 0
+        if "clockid" in toks:
+            idx = toks.index("clockid")
+            if idx + 1 < len(toks):
+                out["etf_clockid"] = toks[idx + 1]
+        if "delta" in toks:
+            idx = toks.index("delta")
+            if idx + 1 < len(toks):
+                out["etf_delta_ns"] = _parse_int_token(toks[idx + 1])
+        if "parent" in toks:
+            idx = toks.index("parent")
+            if idx + 1 < len(toks):
+                out["etf_parent"] = toks[idx + 1]
+        elif "root" in toks:
+            out["etf_parent"] = "root"
+        break
+
+    if out["etf_qdisc_present"] == 0:
+        out["etf_probe_error"] = "etf_qdisc_not_found"
+    return out
+
+
+def _probe_ethtool_tstamp(iface: str) -> dict:
+    out = {
+        "ethtool_available": 0,
+        "ethtool_tstamp_probe_error": "",
+        "ethtool_hw_tx_timestamp": 0,
+        "ethtool_tx_sched_timestamp": 0,
+        "ethtool_hwtstamp_tx_on": 0,
+    }
+    ethtool_bin = _find_tool("ethtool")
+    if not ethtool_bin:
+        out["ethtool_tstamp_probe_error"] = "ethtool_not_found"
+        return out
+    out["ethtool_available"] = 1
+
+    rc, stdout, stderr = _run_cmd_capture([ethtool_bin, "-T", str(iface).strip()], timeout=2.0)
+    if rc != 0:
+        out["ethtool_tstamp_probe_error"] = f"ethtool_tstamp_failed:{rc}:{(stderr or stdout).strip()}"
+        return out
+
+    text = str(stdout)
+    lower = text.lower()
+    out["ethtool_hw_tx_timestamp"] = int(
+        ("hardware-transmit" in lower)
+        or ("sof_timestamping_tx_hardware" in lower)
+    )
+    out["ethtool_tx_sched_timestamp"] = int(
+        ("sof_timestamping_tx_sched" in lower)
+        or ("tx-sched" in lower)
+    )
+    has_tx_modes = "hardware transmit timestamp modes" in lower
+    has_on_mode = re.search(r"^\s*on\s*$", text, flags=re.MULTILINE) is not None
+    out["ethtool_hwtstamp_tx_on"] = int(has_tx_modes and has_on_mode)
+    return out
 
 # ── Try importing the C extension ────────────────────────────────────────────
 
@@ -354,17 +485,208 @@ def calibrate() -> dict:
     }
 
 
-def check_capabilities() -> dict:
+def check_capabilities(
+    iface: Optional[str] = None,
+    *,
+    include_etf_probe: bool = True,
+) -> dict:
     """
     Probe kernel capabilities relevant to pacing.
 
     Returns dict with bool-like keys:
         so_txtime, clock_tai, sched_fifo, af_packet, is_root,
         invariant_tsc, tsc_enabled, tsc_hz, timing_source
+    Plus ETF-related keys (when ``include_etf_probe=True``):
+        tc_available, etf_qdisc_present, etf_offload, etf_clockid,
+        etf_delta_ns, etf_parent, ethtool_available, etf_ready.
     """
-    if not PACING_ENGINE_AVAILABLE:
-        return {}
-    return _eng.check_capabilities()
+    caps = {}
+    if PACING_ENGINE_AVAILABLE:
+        caps = dict(_eng.check_capabilities() or {})
+
+    out = {
+        "pacing_engine_available": int(PACING_ENGINE_AVAILABLE),
+        "so_txtime": int(caps.get("so_txtime", 0) or 0),
+        "clock_tai": int(caps.get("clock_tai", 0) or 0),
+        "sched_fifo": int(caps.get("sched_fifo", 0) or 0),
+        "af_packet": int(caps.get("af_packet", 0) or 0),
+        "tpacket_v3": int(caps.get("tpacket_v3", 0) or 0),
+        "is_root": int(caps.get("is_root", int(os.geteuid() == 0)) or 0),
+        "invariant_tsc": int(caps.get("invariant_tsc", 0) or 0),
+        "tsc_enabled": int(caps.get("tsc_enabled", 0) or 0),
+        "tsc_hz": int(caps.get("tsc_hz", 0) or 0),
+        "timing_source": str(caps.get("timing_source", "clock_gettime") or "clock_gettime"),
+    }
+
+    resolved_iface = str(
+        (iface or os.environ.get("SAMURAI_ETF_IFACE") or os.environ.get("SAMURAI_XDP_INTERFACE") or "")
+    ).strip()
+    out["etf_iface"] = resolved_iface
+
+    if include_etf_probe:
+        if resolved_iface:
+            out.update(_probe_etf_qdisc(resolved_iface))
+            out.update(_probe_ethtool_tstamp(resolved_iface))
+            out["etf_ready"] = int(
+                out.get("so_txtime", 0)
+                and out.get("clock_tai", 0)
+                and out.get("tc_available", 0)
+                and out.get("etf_qdisc_present", 0)
+                and str(out.get("etf_clockid", "")).upper() == "CLOCK_TAI"
+            )
+        else:
+            out.update(
+                {
+                    "tc_available": int(_find_tool("tc") is not None),
+                    "etf_qdisc_present": 0,
+                    "etf_offload": 0,
+                    "etf_clockid": "",
+                    "etf_delta_ns": 0,
+                    "etf_parent": "",
+                    "etf_probe_error": "iface_missing",
+                    "etf_qdisc_raw": "",
+                    "ethtool_available": int(_find_tool("ethtool") is not None),
+                    "ethtool_tstamp_probe_error": "iface_missing",
+                    "ethtool_hw_tx_timestamp": 0,
+                    "ethtool_tx_sched_timestamp": 0,
+                    "ethtool_hwtstamp_tx_on": 0,
+                    "etf_ready": 0,
+                }
+            )
+    return out
+
+
+def ensure_etf_qdisc(
+    iface: str,
+    *,
+    delta_ns: int = 200_000,
+    offload: bool = True,
+    parent: str = "root",
+    replace: bool = True,
+    strict: bool = True,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Configure ETF qdisc for SO_TXTIME pacing.
+
+    Example:
+        ensure_etf_qdisc("eth0", delta_ns=200_000, offload=True, parent="root")
+    """
+    iface_s = str(iface or "").strip()
+    parent_s = str(parent or "root").strip()
+    if not iface_s:
+        raise ValueError("iface is required")
+    if delta_ns <= 0:
+        raise ValueError("delta_ns must be > 0")
+    if not parent_s:
+        raise ValueError("parent must be non-empty")
+
+    tc_bin = _find_tool("tc")
+    if not tc_bin:
+        msg = "tc_not_found"
+        if strict:
+            raise RuntimeError(msg)
+        return {"ok": 0, "error": msg, "iface": iface_s}
+
+    action = "replace" if replace else "add"
+    cmd = [tc_bin, "qdisc", action, "dev", iface_s]
+    if parent_s.lower() == "root":
+        cmd.append("root")
+    else:
+        cmd.extend(["parent", parent_s])
+    cmd.extend(["etf", "clockid", "CLOCK_TAI", "delta", str(int(delta_ns))])
+    if bool(offload):
+        cmd.append("offload")
+
+    out = {
+        "ok": 0,
+        "iface": iface_s,
+        "parent": parent_s,
+        "action": action,
+        "offload_requested": int(bool(offload)),
+        "delta_ns": int(delta_ns),
+        "cmd": " ".join(cmd),
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "error": "",
+    }
+    if dry_run:
+        out["ok"] = 1
+        out["dry_run"] = 1
+        return out
+
+    rc, stdout, stderr = _run_cmd_capture(cmd, timeout=3.0)
+    out["returncode"] = int(rc)
+    out["stdout"] = stdout
+    out["stderr"] = stderr
+    if rc != 0:
+        out["error"] = f"tc_etf_config_failed:{rc}:{(stderr or stdout).strip()}"
+        if strict:
+            raise RuntimeError(out["error"])
+        return out
+
+    probe = check_capabilities(iface=iface_s, include_etf_probe=True)
+    out.update(
+        {
+            "etf_qdisc_present": int(probe.get("etf_qdisc_present", 0) or 0),
+            "etf_offload": int(probe.get("etf_offload", 0) or 0),
+            "etf_clockid": str(probe.get("etf_clockid", "") or ""),
+            "etf_delta_ns": int(probe.get("etf_delta_ns", 0) or 0),
+            "etf_ready": int(probe.get("etf_ready", 0) or 0),
+            "etf_probe_error": str(probe.get("etf_probe_error", "") or ""),
+        }
+    )
+    out["ok"] = int(out["etf_qdisc_present"] == 1 and out["etf_clockid"].upper() == "CLOCK_TAI")
+    if bool(offload):
+        out["ok"] = int(out["ok"] and int(out["etf_offload"]) == 1)
+    if strict and not out["ok"]:
+        raise RuntimeError(
+            f"etf_verify_failed:present={out['etf_qdisc_present']} "
+            f"clockid={out['etf_clockid']} offload={out['etf_offload']}"
+        )
+    return out
+
+
+def remove_etf_qdisc(
+    iface: str,
+    *,
+    parent: str = "root",
+    strict: bool = False,
+) -> dict:
+    """
+    Remove ETF qdisc from an interface path.
+    """
+    iface_s = str(iface or "").strip()
+    parent_s = str(parent or "root").strip()
+    if not iface_s:
+        raise ValueError("iface is required")
+    tc_bin = _find_tool("tc")
+    if not tc_bin:
+        msg = "tc_not_found"
+        if strict:
+            raise RuntimeError(msg)
+        return {"ok": 0, "error": msg, "iface": iface_s}
+    cmd = [tc_bin, "qdisc", "del", "dev", iface_s]
+    if parent_s.lower() == "root":
+        cmd.append("root")
+    else:
+        cmd.extend(["parent", parent_s])
+
+    rc, stdout, stderr = _run_cmd_capture(cmd, timeout=2.0)
+    out = {
+        "ok": int(rc == 0),
+        "iface": iface_s,
+        "parent": parent_s,
+        "cmd": " ".join(cmd),
+        "returncode": int(rc),
+        "stdout": stdout,
+        "stderr": stderr,
+        "error": "" if rc == 0 else f"tc_etf_delete_failed:{rc}:{(stderr or stdout).strip()}",
+    }
+    if strict and rc != 0:
+        raise RuntimeError(out["error"])
+    return out
 
 
 def cleanup_l2() -> None:

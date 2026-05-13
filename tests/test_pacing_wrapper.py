@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from ddos_samurai import pacing
 
@@ -65,3 +66,57 @@ class TestPacingWrapper(unittest.TestCase):
         self.assertIn("afpacket_hugepage_mode", out)
         self.assertIn("afpacket_hugepage_effective", out)
         self.assertIn("afpacket_ring_size_bytes", out)
+
+    def test_check_capabilities_etf_probe_contract(self):
+        with patch.object(pacing, "_find_tool") as m_find, patch.object(pacing, "_run_cmd_capture") as m_run:
+            def _fake_find(name):
+                if name == "tc":
+                    return "/usr/sbin/tc"
+                if name == "ethtool":
+                    return "/usr/sbin/ethtool"
+                return None
+
+            m_find.side_effect = _fake_find
+            m_run.side_effect = [
+                (
+                    0,
+                    "qdisc etf 8001: dev eth0 root refcnt 2 clockid CLOCK_TAI delta 200000 offload\n",
+                    "",
+                ),
+                (
+                    0,
+                    "Time stamping parameters for eth0\n"
+                    "Capabilities:\n"
+                    "hardware-transmit\n"
+                    "SOF_TIMESTAMPING_TX_SCHED\n"
+                    "Hardware Transmit Timestamp Modes:\n"
+                    "off\n"
+                    "on\n",
+                    "",
+                ),
+            ]
+            caps = pacing.check_capabilities(iface="eth0")
+
+        self.assertEqual(int(caps.get("tc_available", 0)), 1)
+        self.assertEqual(int(caps.get("etf_qdisc_present", 0)), 1)
+        self.assertEqual(str(caps.get("etf_clockid", "")), "CLOCK_TAI")
+        self.assertEqual(int(caps.get("etf_delta_ns", 0)), 200000)
+        self.assertEqual(int(caps.get("etf_offload", 0)), 1)
+        self.assertEqual(int(caps.get("ethtool_available", 0)), 1)
+        self.assertEqual(int(caps.get("ethtool_tx_sched_timestamp", 0)), 1)
+        self.assertIn("etf_ready", caps)
+
+    def test_ensure_etf_qdisc_dry_run(self):
+        with patch.object(pacing, "_find_tool", return_value="/usr/sbin/tc"):
+            out = pacing.ensure_etf_qdisc(
+                "eth0",
+                delta_ns=300000,
+                offload=True,
+                parent="root",
+                replace=True,
+                strict=True,
+                dry_run=True,
+            )
+        self.assertEqual(int(out.get("ok", 0)), 1)
+        self.assertEqual(int(out.get("dry_run", 0)), 1)
+        self.assertIn("qdisc replace dev eth0 root etf", str(out.get("cmd", "")))
