@@ -522,6 +522,7 @@ int samurai_gpu_packet_classify_from_ingress(
     float* out_confidences,
     const char** out_reason);
 const char* samurai_gpu_packet_read_classifier_stats();
+int samurai_gpu_packet_defense_get_doca_rx_gpu_handle(uint64_t* out_gpu_rxq_handle);
 int samurai_gpu_packet_defense_shutdown();
 const char* samurai_gpu_packet_defense_last_error();
 
