@@ -527,12 +527,14 @@ def check_capabilities(
         if resolved_iface:
             out.update(_probe_etf_qdisc(resolved_iface))
             out.update(_probe_ethtool_tstamp(resolved_iface))
+            clockid_norm = str(out.get("etf_clockid", "") or "").upper()
+            clockid_ok = clockid_norm in {"CLOCK_TAI", "TAI"}
             out["etf_ready"] = int(
                 out.get("so_txtime", 0)
                 and out.get("clock_tai", 0)
                 and out.get("tc_available", 0)
                 and out.get("etf_qdisc_present", 0)
-                and str(out.get("etf_clockid", "")).upper() == "CLOCK_TAI"
+                and clockid_ok
             )
         else:
             out.update(
@@ -637,7 +639,9 @@ def ensure_etf_qdisc(
             "etf_probe_error": str(probe.get("etf_probe_error", "") or ""),
         }
     )
-    out["ok"] = int(out["etf_qdisc_present"] == 1 and out["etf_clockid"].upper() == "CLOCK_TAI")
+    clockid_norm = str(out.get("etf_clockid", "") or "").upper()
+    clockid_ok = clockid_norm in {"CLOCK_TAI", "TAI"}
+    out["ok"] = int(out["etf_qdisc_present"] == 1 and clockid_ok)
     if bool(offload):
         out["ok"] = int(out["ok"] and int(out["etf_offload"]) == 1)
     if strict and not out["ok"]:
