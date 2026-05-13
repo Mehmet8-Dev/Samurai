@@ -558,6 +558,55 @@ static void task_recv_common_cb(
   }
 }
 
+inline void progress_rxq_until_packet_or_budget_unlocked(BackendRxqHandle& h) {
+  uint32_t loops = 0u;
+  while (h.completed_pkts.empty() && loops < h.max_progress_loops) {
+    (void)g_doca.doca_pe_progress(h.pe);
+    loops += 1u;
+  }
+}
+
+inline bool rearm_rx_packet_unlocked(BackendRxqHandle& h, doca_buf* pkt) {
+  if (!pkt || !h.rxq || !h.buf_inv || !h.mmap) {
+    return false;
+  }
+  void* head_ptr = nullptr;
+  size_t head_len = 0u;
+  if (g_doca.doca_buf_get_head(pkt, &head_ptr) != kDocaSuccess || !head_ptr ||
+      g_doca.doca_buf_get_len(pkt, &head_len) != kDocaSuccess || head_len == 0u) {
+    (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+    return false;
+  }
+  (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+
+  doca_buf* next_pkt = nullptr;
+  doca_error_t rc = g_doca.doca_buf_inventory_buf_get_by_addr(h.buf_inv, h.mmap, head_ptr, head_len, &next_pkt);
+  if (rc != kDocaSuccess || !next_pkt) {
+    return false;
+  }
+  doca_data user_data{};
+  user_data.u64 = 0u;
+  doca_eth_rxq_task_recv* next_task_recv = nullptr;
+  rc = g_doca.doca_eth_rxq_task_recv_allocate_init(h.rxq, next_pkt, user_data, &next_task_recv);
+  if (rc != kDocaSuccess || !next_task_recv) {
+    (void)g_doca.doca_buf_dec_refcount(next_pkt, nullptr);
+    return false;
+  }
+  doca_task* next_task = g_doca.doca_eth_rxq_task_recv_as_doca_task(next_task_recv);
+  if (!next_task) {
+    (void)g_doca.doca_buf_dec_refcount(next_pkt, nullptr);
+    return false;
+  }
+  rc = g_doca.doca_task_submit(next_task);
+  if (rc != kDocaSuccess) {
+    (void)g_doca.doca_task_free(next_task);
+    (void)g_doca.doca_buf_dec_refcount(next_pkt, nullptr);
+    return false;
+  }
+  h.inflight += 1u;
+  return true;
+}
+
 inline bool any_invalid_len(const uint16_t* lengths, int count) {
   if (!lengths || count <= 0) {
     return true;
@@ -1250,11 +1299,7 @@ extern "C" int samurai_doca_backend_receive_burst(
     return -1;
   }
 
-  uint32_t loops = 0u;
-  while (h.completed_pkts.empty() && loops < h.max_progress_loops) {
-    (void)g_doca.doca_pe_progress(h.pe);
-    loops += 1u;
-  }
+  progress_rxq_until_packet_or_budget_unlocked(h);
 
   size_t out_offset = 0u;
   int copied = 0;
@@ -1287,52 +1332,125 @@ extern "C" int samurai_doca_backend_receive_burst(
     copied += 1;
     h.rx_packets += 1u;
     h.rx_bytes += static_cast<uint64_t>(data_len);
-
-    void* head_ptr = nullptr;
-    size_t head_len = 0u;
-    if (g_doca.doca_buf_get_head(pkt, &head_ptr) != kDocaSuccess || !head_ptr ||
-        g_doca.doca_buf_get_len(pkt, &head_len) != kDocaSuccess || head_len == 0u) {
-      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
-      h.rx_errors += 1u;
-      continue;
-    }
-    (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
-
-    doca_buf* next_pkt = nullptr;
-    doca_error_t rc = g_doca.doca_buf_inventory_buf_get_by_addr(h.buf_inv, h.mmap, head_ptr, head_len, &next_pkt);
-    if (rc != kDocaSuccess || !next_pkt) {
+    if (!rearm_rx_packet_unlocked(h, pkt)) {
       h.rx_errors += 1u;
       h.rx_drops += 1u;
-      continue;
     }
-    doca_data user_data{};
-    user_data.u64 = 0u;
-    doca_eth_rxq_task_recv* next_task_recv = nullptr;
-    rc = g_doca.doca_eth_rxq_task_recv_allocate_init(h.rxq, next_pkt, user_data, &next_task_recv);
-    if (rc != kDocaSuccess || !next_task_recv) {
-      (void)g_doca.doca_buf_dec_refcount(next_pkt, nullptr);
-      h.rx_errors += 1u;
-      h.rx_drops += 1u;
-      continue;
-    }
-    doca_task* next_task = g_doca.doca_eth_rxq_task_recv_as_doca_task(next_task_recv);
-    if (!next_task) {
-      (void)g_doca.doca_buf_dec_refcount(next_pkt, nullptr);
-      h.rx_errors += 1u;
-      h.rx_drops += 1u;
-      continue;
-    }
-    rc = g_doca.doca_task_submit(next_task);
-    if (rc != kDocaSuccess) {
-      (void)g_doca.doca_task_free(next_task);
-      (void)g_doca.doca_buf_dec_refcount(next_pkt, nullptr);
-      h.rx_errors += 1u;
-      h.rx_drops += 1u;
-      continue;
-    }
-    h.inflight += 1u;
   }
 
   *out_received = copied;
+  return 0;
+}
+
+extern "C" int samurai_doca_backend_receive_burst_view(
+    int handle,
+    uint64_t* out_packet_ptrs,
+    uint16_t* out_lengths,
+    uint64_t* out_packet_handles,
+    int max_packets,
+    int* out_received,
+    char* err,
+    size_t err_len) {
+  if (out_received) {
+    *out_received = 0;
+  }
+  if (handle < 0 || !out_packet_ptrs || !out_lengths || !out_packet_handles || max_packets <= 0 || !out_received) {
+    write_err(err, err_len, "invalid arguments for samurai_doca_backend_receive_burst_view");
+    return -1;
+  }
+  std::lock_guard<std::mutex> guard(g_lock);
+  auto it = g_rx_handles.find(handle);
+  if (it == g_rx_handles.end()) {
+    write_err(err, err_len, "rxq handle not found");
+    return -1;
+  }
+  BackendRxqHandle& h = it->second;
+  if (!h.rxq || !h.pe || !h.buf_inv || !h.mmap) {
+    write_err(err, err_len, "DOCA rxq handle is not fully initialized");
+    return -1;
+  }
+
+  progress_rxq_until_packet_or_budget_unlocked(h);
+
+  int copied = 0;
+  while (!h.completed_pkts.empty() && copied < max_packets) {
+    doca_buf* pkt = h.completed_pkts.back();
+    h.completed_pkts.pop_back();
+    if (!pkt) {
+      continue;
+    }
+    void* data_ptr = nullptr;
+    size_t data_len = 0u;
+    if (g_doca.doca_buf_get_data(pkt, &data_ptr) != kDocaSuccess || !data_ptr ||
+        g_doca.doca_buf_get_data_len(pkt, &data_len) != kDocaSuccess || data_len == 0u) {
+      h.rx_errors += 1u;
+      h.rx_drops += 1u;
+      if (!rearm_rx_packet_unlocked(h, pkt)) {
+        h.rx_errors += 1u;
+        h.rx_drops += 1u;
+      }
+      continue;
+    }
+    if (data_len > static_cast<size_t>(std::numeric_limits<uint16_t>::max())) {
+      data_len = static_cast<size_t>(std::numeric_limits<uint16_t>::max());
+    }
+    out_packet_ptrs[copied] = reinterpret_cast<uint64_t>(data_ptr);
+    out_lengths[copied] = static_cast<uint16_t>(data_len);
+    out_packet_handles[copied] = reinterpret_cast<uint64_t>(pkt);
+    copied += 1;
+    h.rx_packets += 1u;
+    h.rx_bytes += static_cast<uint64_t>(data_len);
+  }
+  *out_received = copied;
+  return 0;
+}
+
+extern "C" int samurai_doca_backend_release_burst_view(
+    int handle,
+    const uint64_t* packet_handles,
+    int packet_count,
+    int* out_rearmed,
+    char* err,
+    size_t err_len) {
+  if (out_rearmed) {
+    *out_rearmed = 0;
+  }
+  if (handle < 0 || !packet_handles || packet_count <= 0 || !out_rearmed) {
+    write_err(err, err_len, "invalid arguments for samurai_doca_backend_release_burst_view");
+    return -1;
+  }
+  std::lock_guard<std::mutex> guard(g_lock);
+  auto it = g_rx_handles.find(handle);
+  if (it == g_rx_handles.end()) {
+    write_err(err, err_len, "rxq handle not found");
+    return -1;
+  }
+  BackendRxqHandle& h = it->second;
+  if (!h.rxq || !h.pe || !h.buf_inv || !h.mmap) {
+    write_err(err, err_len, "DOCA rxq handle is not fully initialized");
+    return -1;
+  }
+
+  int rearmed = 0;
+  int failures = 0;
+  for (int i = 0; i < packet_count; ++i) {
+    doca_buf* pkt = reinterpret_cast<doca_buf*>(packet_handles[i]);
+    if (!pkt) {
+      failures += 1;
+      continue;
+    }
+    if (rearm_rx_packet_unlocked(h, pkt)) {
+      rearmed += 1;
+    } else {
+      failures += 1;
+      h.rx_errors += 1u;
+      h.rx_drops += 1u;
+    }
+  }
+  *out_rearmed = rearmed;
+  if (failures > 0) {
+    write_err(err, err_len, "DOCA release_burst_view had rearm failures");
+    return -1;
+  }
   return 0;
 }

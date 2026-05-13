@@ -75,6 +75,10 @@ struct DefenseRuntime {
   uint64_t doca_rx_packets = 0;
   uint64_t doca_rx_poll_errors = 0;
   uint64_t doca_rx_drops = 0;
+  std::vector<uint64_t> ingress_packet_ptrs_scratch{};
+  std::vector<uint64_t> ingress_packet_handles_scratch{};
+  std::vector<uint16_t> ingress_lengths_u16_scratch{};
+  std::vector<PacketView> ingress_views_scratch{};
   Clock::time_point first_infer_at{};
   Clock::time_point last_infer_at{};
 };
@@ -251,6 +255,22 @@ using DocaReceiveBurstFn = int (*)(
     int* out_received,
     char* err,
     size_t err_len);
+using DocaReceiveBurstViewFn = int (*)(
+    int handle,
+    uint64_t* out_packet_ptrs,
+    uint16_t* out_lengths,
+    uint64_t* out_packet_handles,
+    int max_packets,
+    int* out_received,
+    char* err,
+    size_t err_len);
+using DocaReleaseBurstViewFn = int (*)(
+    int handle,
+    const uint64_t* packet_handles,
+    int packet_count,
+    int* out_rearmed,
+    char* err,
+    size_t err_len);
 
 struct DocaRxDispatch {
   void* handle = nullptr;
@@ -259,6 +279,8 @@ struct DocaRxDispatch {
   DocaCreateRxqFn create_rxq = nullptr;
   DocaDestroyRxqFn destroy_rxq = nullptr;
   DocaReceiveBurstFn receive_burst = nullptr;
+  DocaReceiveBurstViewFn receive_burst_view = nullptr;
+  DocaReleaseBurstViewFn release_burst_view = nullptr;
 };
 
 DocaRxDispatch g_doca_rx{};
@@ -285,7 +307,8 @@ inline bool resolve_doca_rx_symbol(void* so, const char* name, void** out, std::
 
 bool ensure_doca_rx_dispatch(std::string* reason) {
   if (g_doca_rx.handle != nullptr && g_doca_rx.create_rxq != nullptr && g_doca_rx.destroy_rxq != nullptr &&
-      g_doca_rx.receive_burst != nullptr) {
+      g_doca_rx.receive_burst != nullptr && g_doca_rx.receive_burst_view != nullptr &&
+      g_doca_rx.release_burst_view != nullptr) {
     return true;
   }
   if (g_doca_rx.load_attempted) {
@@ -311,10 +334,22 @@ bool ensure_doca_rx_dispatch(std::string* reason) {
   void* p_create_rxq = nullptr;
   void* p_destroy_rxq = nullptr;
   void* p_receive_burst = nullptr;
+  void* p_receive_burst_view = nullptr;
+  void* p_release_burst_view = nullptr;
   std::string sym_reason;
   if (!resolve_doca_rx_symbol(g_doca_rx.handle, "samurai_doca_backend_create_rxq", &p_create_rxq, &sym_reason) ||
       !resolve_doca_rx_symbol(g_doca_rx.handle, "samurai_doca_backend_destroy_rxq", &p_destroy_rxq, &sym_reason) ||
-      !resolve_doca_rx_symbol(g_doca_rx.handle, "samurai_doca_backend_receive_burst", &p_receive_burst, &sym_reason)) {
+      !resolve_doca_rx_symbol(g_doca_rx.handle, "samurai_doca_backend_receive_burst", &p_receive_burst, &sym_reason) ||
+      !resolve_doca_rx_symbol(
+          g_doca_rx.handle,
+          "samurai_doca_backend_receive_burst_view",
+          &p_receive_burst_view,
+          &sym_reason) ||
+      !resolve_doca_rx_symbol(
+          g_doca_rx.handle,
+          "samurai_doca_backend_release_burst_view",
+          &p_release_burst_view,
+          &sym_reason)) {
     g_doca_rx.load_error = sym_reason;
     dlclose(g_doca_rx.handle);
     g_doca_rx.handle = nullptr;
@@ -326,6 +361,8 @@ bool ensure_doca_rx_dispatch(std::string* reason) {
   g_doca_rx.create_rxq = reinterpret_cast<DocaCreateRxqFn>(p_create_rxq);
   g_doca_rx.destroy_rxq = reinterpret_cast<DocaDestroyRxqFn>(p_destroy_rxq);
   g_doca_rx.receive_burst = reinterpret_cast<DocaReceiveBurstFn>(p_receive_burst);
+  g_doca_rx.receive_burst_view = reinterpret_cast<DocaReceiveBurstViewFn>(p_receive_burst_view);
+  g_doca_rx.release_burst_view = reinterpret_cast<DocaReleaseBurstViewFn>(p_release_burst_view);
   return true;
 }
 
@@ -544,9 +581,8 @@ bool validate_engine_compat(const std::string& engine_path, std::string* out_rea
   return true;
 }
 
-int classify_batch_common_locked(
-    const uint8_t* packets_flat,
-    const int32_t* packet_lengths,
+int classify_packet_views_common_locked(
+    const PacketView* views,
     int64_t packet_count,
     int32_t* out_labels,
     float* out_confidences,
@@ -559,7 +595,7 @@ int classify_batch_common_locked(
     }
     return set_err("engine_load_failed");
   }
-  if (packets_flat == nullptr || packet_lengths == nullptr || out_labels == nullptr || out_confidences == nullptr) {
+  if (views == nullptr || out_labels == nullptr || out_confidences == nullptr) {
     if (out_reason != nullptr) {
       *out_reason = "infer_enqueue_failed";
     }
@@ -579,23 +615,9 @@ int classify_batch_common_locked(
   g_runtime.stream_overlap_events += 1;
   g_runtime.total_batches += 1;
 
-  std::vector<PacketView> views(static_cast<size_t>(packet_count));
-  size_t cursor = 0;
-  for (int64_t i = 0; i < packet_count; ++i) {
-    const int32_t len = packet_lengths[i];
-    if (len < 0) {
-      if (out_reason != nullptr) {
-        *out_reason = "infer_enqueue_failed";
-      }
-      return set_err("infer_enqueue_failed");
-    }
-    views[static_cast<size_t>(i)] = PacketView{packets_flat + cursor, static_cast<size_t>(len)};
-    cursor += static_cast<size_t>(len);
-  }
-
   constexpr size_t feature_dim = 8;
   std::vector<float> features(static_cast<size_t>(packet_count) * feature_dim, 0.0f);
-  extract_features_stub(views.data(), static_cast<size_t>(packet_count), features.data(), feature_dim);
+  extract_features_stub(views, static_cast<size_t>(packet_count), features.data(), feature_dim);
   if (enqueue_inference_stub(features.data(), static_cast<size_t>(packet_count), feature_dim, out_labels, out_confidences) != 0) {
     if (out_reason != nullptr) {
       *out_reason = "infer_enqueue_failed";
@@ -631,6 +653,46 @@ int classify_batch_common_locked(
     *out_reason = "none";
   }
   return 0;
+}
+
+int classify_batch_common_locked(
+    const uint8_t* packets_flat,
+    const int32_t* packet_lengths,
+    int64_t packet_count,
+    int32_t* out_labels,
+    float* out_confidences,
+    const char** out_reason) {
+  if (packets_flat == nullptr || packet_lengths == nullptr || out_labels == nullptr || out_confidences == nullptr) {
+    if (out_reason != nullptr) {
+      *out_reason = "infer_enqueue_failed";
+    }
+    return set_err("infer_enqueue_failed");
+  }
+  if (packet_count <= 0) {
+    if (out_reason != nullptr) {
+      *out_reason = "none";
+    }
+    return 0;
+  }
+  std::vector<PacketView> views(static_cast<size_t>(packet_count));
+  size_t cursor = 0u;
+  for (int64_t i = 0; i < packet_count; ++i) {
+    const int32_t len = packet_lengths[i];
+    if (len < 0) {
+      if (out_reason != nullptr) {
+        *out_reason = "infer_enqueue_failed";
+      }
+      return set_err("infer_enqueue_failed");
+    }
+    views[static_cast<size_t>(i)] = PacketView{packets_flat + cursor, static_cast<size_t>(len)};
+    cursor += static_cast<size_t>(len);
+  }
+  return classify_packet_views_common_locked(
+      views.data(),
+      packet_count,
+      out_labels,
+      out_confidences,
+      out_reason);
 }
 
 }  // namespace ddos_samurai::gpu_packet_cuda::defense
@@ -744,7 +806,8 @@ extern "C" int samurai_gpu_packet_classify_from_ingress(
     }
     return set_err("engine_load_failed");
   }
-  if (!g_runtime.doca_rx_active || g_runtime.doca_rxq_handle < 0 || g_doca_rx.receive_burst == nullptr) {
+  if (!g_runtime.doca_rx_active || g_runtime.doca_rxq_handle < 0 || g_doca_rx.receive_burst_view == nullptr ||
+      g_doca_rx.release_burst_view == nullptr) {
     if (out_reason != nullptr) {
       *out_reason = "doca_rx_unavailable";
     }
@@ -759,24 +822,39 @@ extern "C" int samurai_gpu_packet_classify_from_ingress(
   }
   *out_packet_count = 0;
 
-  const size_t flat_len = static_cast<size_t>(max_packets) * static_cast<size_t>(max_packet_size);
-  if (flat_len == 0u || flat_len > 1073741824u) {
+  const size_t max_packets_sz = static_cast<size_t>(max_packets);
+  if (max_packets_sz == 0u || max_packets_sz > 1048576u) {
     if (out_reason != nullptr) {
       *out_reason = "infer_enqueue_failed";
     }
     return set_err("infer_enqueue_failed");
   }
 
-  std::vector<uint8_t> flat(flat_len, 0u);
-  std::vector<uint16_t> lengths(static_cast<size_t>(max_packets), 0u);
+  if (g_runtime.ingress_packet_ptrs_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_packet_ptrs_scratch.resize(max_packets_sz, 0u);
+  }
+  if (g_runtime.ingress_packet_handles_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_packet_handles_scratch.resize(max_packets_sz, 0u);
+  }
+  if (g_runtime.ingress_lengths_u16_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_lengths_u16_scratch.resize(max_packets_sz, 0u);
+  }
+  if (g_runtime.ingress_views_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_views_scratch.resize(max_packets_sz);
+  }
+
+  std::memset(g_runtime.ingress_packet_ptrs_scratch.data(), 0, sizeof(uint64_t) * max_packets_sz);
+  std::memset(g_runtime.ingress_packet_handles_scratch.data(), 0, sizeof(uint64_t) * max_packets_sz);
+  std::memset(g_runtime.ingress_lengths_u16_scratch.data(), 0, sizeof(uint16_t) * max_packets_sz);
+
   int received = 0;
   char errbuf[192];
   std::memset(errbuf, 0, sizeof(errbuf));
-  const int rx_rc = g_doca_rx.receive_burst(
+  const int rx_rc = g_doca_rx.receive_burst_view(
       g_runtime.doca_rxq_handle,
-      flat.data(),
-      static_cast<uint32_t>(flat.size()),
-      lengths.data(),
+      g_runtime.ingress_packet_ptrs_scratch.data(),
+      g_runtime.ingress_lengths_u16_scratch.data(),
+      g_runtime.ingress_packet_handles_scratch.data(),
       static_cast<int>(max_packets),
       &received,
       errbuf,
@@ -799,19 +877,55 @@ extern "C" int samurai_gpu_packet_classify_from_ingress(
   if (received > max_packets) {
     received = max_packets;
   }
-  std::vector<int32_t> lengths32(static_cast<size_t>(received), 0);
+  bool invalid_pkt_view = false;
   for (int i = 0; i < received; ++i) {
-    lengths32[static_cast<size_t>(i)] = static_cast<int32_t>(lengths[static_cast<size_t>(i)]);
+    const uint64_t ptr_raw = g_runtime.ingress_packet_ptrs_scratch[static_cast<size_t>(i)];
+    const uint16_t len_u16 = g_runtime.ingress_lengths_u16_scratch[static_cast<size_t>(i)];
+    if (ptr_raw == 0u || len_u16 == 0u || len_u16 > static_cast<uint16_t>(max_packet_size)) {
+      g_runtime.doca_rx_drops += 1u;
+      invalid_pkt_view = true;
+      break;
+    }
+    g_runtime.ingress_views_scratch[static_cast<size_t>(i)] = PacketView{
+        reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(ptr_raw)),
+        static_cast<size_t>(len_u16)};
   }
   g_runtime.doca_rx_packets += static_cast<uint64_t>(received);
 
-  const int cls_rc = classify_batch_common_locked(
-      flat.data(),
-      lengths32.data(),
-      static_cast<int64_t>(received),
-      out_labels,
-      out_confidences,
-      out_reason);
+  int cls_rc = 0;
+  if (!invalid_pkt_view) {
+    cls_rc = classify_packet_views_common_locked(
+        g_runtime.ingress_views_scratch.data(),
+        static_cast<int64_t>(received),
+        out_labels,
+        out_confidences,
+        out_reason);
+  }
+  int rearmed = 0;
+  std::memset(errbuf, 0, sizeof(errbuf));
+  const int release_rc = g_doca_rx.release_burst_view(
+      g_runtime.doca_rxq_handle,
+      g_runtime.ingress_packet_handles_scratch.data(),
+      received,
+      &rearmed,
+      errbuf,
+      sizeof(errbuf));
+  if (release_rc != 0 || rearmed < received) {
+    g_runtime.doca_rx_poll_errors += 1u;
+    if (rearmed < received) {
+      g_runtime.doca_rx_drops += static_cast<uint64_t>(received - rearmed);
+    }
+    if (out_reason != nullptr) {
+      *out_reason = (errbuf[0] != '\0') ? errbuf : "doca_rx_receive_failed";
+    }
+    return set_err((errbuf[0] != '\0') ? std::string(errbuf) : "doca_rx_receive_failed");
+  }
+  if (invalid_pkt_view) {
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_receive_failed";
+    }
+    return set_err("doca_rx_receive_failed");
+  }
   if (cls_rc != 0) {
     return cls_rc;
   }
