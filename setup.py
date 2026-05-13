@@ -370,6 +370,7 @@ class OptionalBuildExt(build_ext):
 
         with_trt = _env_flag("SAMURAI_WITH_TENSORRT", "0")
         with_gpudirect = _env_flag("SAMURAI_WITH_GPUDIRECT_RDMA", "0")
+        with_doca_gpunetio_device = _env_flag("SAMURAI_WITH_DOCA_GPUNETIO_DEVICE", "0")
         compile_cmd = [
             nvcc,
             "-std=c++20",
@@ -385,6 +386,11 @@ class OptionalBuildExt(build_ext):
             compile_cmd.extend(["-DSAMURAI_WITH_TENSORRT=1"])
         if with_gpudirect:
             compile_cmd.extend(["-DSAMURAI_WITH_GPUDIRECT_RDMA=1"])
+        if with_doca_gpunetio_device:
+            compile_cmd.extend(["-DSAMURAI_WITH_DOCA_GPUNETIO_DEVICE=1"])
+            doca_include = str(os.environ.get("SAMURAI_DOCA_INCLUDE", "/opt/mellanox/doca/include") or "").strip()
+            if doca_include:
+                compile_cmd.extend(["-I", doca_include])
         compile_cmd.extend(["-c", src_path, "-o", os.path.join(build_temp, "gpu_packet_cuda_defense.o")])
 
         link_cmd = [
@@ -396,6 +402,16 @@ class OptionalBuildExt(build_ext):
         ]
         if with_gpudirect:
             link_cmd.extend(["-libverbs", "-lmlx5"])
+        if with_doca_gpunetio_device:
+            doca_device_lib = str(
+                os.environ.get(
+                    "SAMURAI_DOCA_GPUNETIO_DEVICE_LIB",
+                    "/opt/mellanox/doca/lib/x86_64-linux-gnu/libdoca_gpunetio_device.a",
+                )
+                or ""
+            ).strip()
+            if doca_device_lib and os.path.exists(doca_device_lib):
+                link_cmd.append(doca_device_lib)
         try:
             print(f"\nBuilding CUDA defense module: {src_path}")
             subprocess.run(compile_cmd, check=True)
