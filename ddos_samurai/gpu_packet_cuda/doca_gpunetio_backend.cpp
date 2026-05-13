@@ -1,7 +1,9 @@
 #include "tx_backend_doca_gpunetio.cuh"
+#include "doca_flow_backend_api.h"
 
 #include <arpa/inet.h>
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -227,12 +229,22 @@ using DocaFlowProgramSteeringFn = int (*)(
     uint32_t proto_mask,
     char* err,
     size_t err_len);
+using DocaFlowProgramSteeringStreamsFn = int (*)(
+    const char* iface,
+    const char* device_name,
+    const int* rxq_ids,
+    int rxq_count,
+    const samurai_doca_flow_stream_rule_v1* rules,
+    int rule_count,
+    char* err,
+    size_t err_len);
 
 struct DocaFlowDispatch {
   void* handle = nullptr;
   bool load_attempted = false;
   std::string load_error;
   DocaFlowProgramSteeringFn program_steering = nullptr;
+  DocaFlowProgramSteeringStreamsFn program_steering_streams = nullptr;
 };
 
 std::mutex g_flow_lock;
@@ -267,6 +279,196 @@ inline std::string join_int_csv(const int* values, int count) {
     out += std::to_string(values[static_cast<size_t>(i)]);
   }
   return out;
+}
+
+inline std::string trim_copy(const std::string& s) {
+  size_t b = 0u;
+  while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b])) != 0) {
+    ++b;
+  }
+  size_t e = s.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1u])) != 0) {
+    --e;
+  }
+  return s.substr(b, e - b);
+}
+
+inline std::vector<std::string> split_copy(const std::string& s, char delim) {
+  std::vector<std::string> out;
+  std::string cur;
+  cur.reserve(s.size());
+  for (char c : s) {
+    if (c == delim) {
+      out.push_back(cur);
+      cur.clear();
+      continue;
+    }
+    cur.push_back(c);
+  }
+  out.push_back(cur);
+  return out;
+}
+
+inline uint32_t parse_proto_mask_text(const std::string& raw, bool* ok) {
+  if (ok) {
+    *ok = false;
+  }
+  const std::string t = trim_copy(raw);
+  if (t.empty()) {
+    return 0u;
+  }
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(t.c_str(), &end, 0);
+  if (end != t.c_str() && end != nullptr && *end == '\0') {
+    if (ok) {
+      *ok = true;
+    }
+    return static_cast<uint32_t>(parsed);
+  }
+  uint32_t mask = 0u;
+  for (const std::string& token_raw : split_copy(t, '|')) {
+    std::string token = trim_copy(token_raw);
+    std::transform(token.begin(), token.end(), token.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    if (token.empty()) {
+      continue;
+    }
+    if (token == "tcp") {
+      mask |= (1u << 0);
+      continue;
+    }
+    if (token == "udp") {
+      mask |= (1u << 1);
+      continue;
+    }
+    if (token == "icmp") {
+      mask |= (1u << 2);
+      continue;
+    }
+    return 0u;
+  }
+  if (ok) {
+    *ok = (mask != 0u);
+  }
+  return mask;
+}
+
+inline bool queue_id_allowed(const std::vector<int>& allowed, int qid) {
+  return std::find(allowed.begin(), allowed.end(), qid) != allowed.end();
+}
+
+inline bool parse_stream_rules_env(
+    const std::string& env_value,
+    const std::vector<int>& allowed_qids,
+    std::vector<samurai_doca_flow_stream_rule_v1>& out_rules,
+    std::string& why) {
+  out_rules.clear();
+  if (env_value.empty()) {
+    return true;
+  }
+  uint32_t default_stream_id = 1u;
+  for (const std::string& rule_raw : split_copy(env_value, ';')) {
+    const std::string rule_text = trim_copy(rule_raw);
+    if (rule_text.empty()) {
+      continue;
+    }
+    samurai_doca_flow_stream_rule_v1 rule{};
+    rule.stream_id = default_stream_id++;
+    rule.proto_mask = 0u;
+    rule.ipv4_dst_be = 0u;
+    rule.l4_dst_port_be = 0u;
+    rule.rxq_id = 0u;
+    bool has_queue = false;
+    bool has_proto = false;
+    for (const std::string& field_raw : split_copy(rule_text, ',')) {
+      const std::string field = trim_copy(field_raw);
+      if (field.empty()) {
+        continue;
+      }
+      const size_t eq = field.find('=');
+      if (eq == std::string::npos) {
+        why = "invalid stream rule field (expected key=value)";
+        return false;
+      }
+      std::string key = trim_copy(field.substr(0, eq));
+      std::string value = trim_copy(field.substr(eq + 1u));
+      std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+      if (key == "stream" || key == "stream_id") {
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(value.c_str(), &end, 10);
+        if (end == value.c_str() || (end != nullptr && *end != '\0')) {
+          why = "invalid stream_id in flow stream rule";
+          return false;
+        }
+        rule.stream_id = static_cast<uint32_t>(v);
+        continue;
+      }
+      if (key == "queue" || key == "rxq" || key == "queue_id") {
+        char* end = nullptr;
+        const long q = std::strtol(value.c_str(), &end, 10);
+        if (end == value.c_str() || (end != nullptr && *end != '\0') || q < 0 || q > 65535) {
+          why = "invalid queue id in flow stream rule";
+          return false;
+        }
+        if (!queue_id_allowed(allowed_qids, static_cast<int>(q))) {
+          why = "flow stream rule queue id is not in configured RX queues";
+          return false;
+        }
+        rule.rxq_id = static_cast<uint16_t>(q);
+        has_queue = true;
+        continue;
+      }
+      if (key == "proto" || key == "proto_mask") {
+        bool ok = false;
+        const uint32_t mask = parse_proto_mask_text(value, &ok);
+        if (!ok || mask == 0u) {
+          why = "invalid proto mask in flow stream rule";
+          return false;
+        }
+        rule.proto_mask = mask;
+        has_proto = true;
+        continue;
+      }
+      if (key == "dstip" || key == "dst_ip" || key == "ipv4_dst") {
+        struct in_addr addr {};
+        if (inet_pton(AF_INET, value.c_str(), &addr) != 1) {
+          why = "invalid IPv4 destination in flow stream rule";
+          return false;
+        }
+        rule.ipv4_dst_be = static_cast<uint32_t>(addr.s_addr);
+        continue;
+      }
+      if (key == "dstport" || key == "dst_port" || key == "l4_dst_port") {
+        char* end = nullptr;
+        const long port = std::strtol(value.c_str(), &end, 10);
+        if (end == value.c_str() || (end != nullptr && *end != '\0') || port < 0 || port > 65535) {
+          why = "invalid L4 destination port in flow stream rule";
+          return false;
+        }
+        rule.l4_dst_port_be = htons(static_cast<uint16_t>(port));
+        continue;
+      }
+      why = "unknown key in flow stream rule: " + key;
+      return false;
+    }
+    if (!has_queue) {
+      why = "missing queue in flow stream rule";
+      return false;
+    }
+    if (!has_proto) {
+      why = "missing proto in flow stream rule";
+      return false;
+    }
+    out_rules.push_back(rule);
+  }
+  if (out_rules.empty()) {
+    why = "empty flow stream rules";
+    return false;
+  }
+  return true;
 }
 
 inline int env_int(const char* name, int defv, int minv, int maxv) {
@@ -366,6 +568,14 @@ inline bool ensure_flow_dispatch(std::string& why) {
     return false;
   }
   g_flow.program_steering = reinterpret_cast<DocaFlowProgramSteeringFn>(sym);
+  dlerror();
+  void* sym_streams = dlsym(g_flow.handle, "samurai_doca_flow_program_steering_streams_v1");
+  const char* sym_streams_err = dlerror();
+  if (sym_streams && !sym_streams_err) {
+    g_flow.program_steering_streams = reinterpret_cast<DocaFlowProgramSteeringStreamsFn>(sym_streams);
+  } else {
+    g_flow.program_steering_streams = nullptr;
+  }
   return true;
 }
 
@@ -1614,6 +1824,49 @@ extern "C" int samurai_doca_backend_configure_flow_steering(
       }
       seen_queue_ids.push_back(queue_id);
     }
+  }
+
+  const std::string stream_rules_env = env_string("SAMURAI_GPU_DOCA_FLOW_STREAM_RULES", "");
+  if (!stream_rules_env.empty()) {
+    std::vector<samurai_doca_flow_stream_rule_v1> stream_rules;
+    std::string parse_why;
+    if (!parse_stream_rules_env(stream_rules_env, seen_queue_ids, stream_rules, parse_why)) {
+      if (strict != 0) {
+        write_err(err, err_len, parse_why.empty() ? "invalid flow stream rules" : parse_why);
+        return -1;
+      }
+      return 1;
+    }
+    std::string flow_why;
+    if (!ensure_flow_dispatch(flow_why) || g_flow.program_steering_streams == nullptr) {
+      if (strict != 0) {
+        const std::string msg = flow_why.empty()
+            ? "flow steering streams backend unavailable"
+            : (flow_why + " (stream steering unavailable)");
+        write_err(err, err_len, msg);
+        return -1;
+      }
+      return 1;
+    }
+    const int rc = g_flow.program_steering_streams(
+        iface,
+        device_name,
+        seen_queue_ids.data(),
+        static_cast<int>(seen_queue_ids.size()),
+        stream_rules.data(),
+        static_cast<int>(stream_rules.size()),
+        err,
+        err_len);
+    if (rc == 0) {
+      return 0;
+    }
+    if (strict != 0) {
+      if (err == nullptr || err_len == 0u || err[0] == '\0') {
+        write_err(err, err_len, "flow stream steering shim returned failure");
+      }
+      return -1;
+    }
+    return 1;
   }
 
   // Try steering programmer #1: explicit external control command.
