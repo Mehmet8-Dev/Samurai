@@ -569,6 +569,11 @@ def _load_defense_lib() -> ctypes.CDLL | None:
     lib.samurai_gpu_packet_classify_from_ingress.restype = ctypes.c_int
     lib.samurai_gpu_packet_read_classifier_stats.argtypes = []
     lib.samurai_gpu_packet_read_classifier_stats.restype = ctypes.c_char_p
+    if hasattr(lib, "samurai_gpu_packet_defense_get_doca_rx_gpu_handle"):
+        lib.samurai_gpu_packet_defense_get_doca_rx_gpu_handle.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        lib.samurai_gpu_packet_defense_get_doca_rx_gpu_handle.restype = ctypes.c_int
     lib.samurai_gpu_packet_defense_shutdown.argtypes = []
     lib.samurai_gpu_packet_defense_shutdown.restype = ctypes.c_int
     lib.samurai_gpu_packet_defense_last_error.argtypes = []
@@ -1819,6 +1824,16 @@ class DefenseCUDABackend:
             return dict(json.loads(text))
         except _RECOVERABLE_ERRORS:
             return {}
+
+    def get_doca_rx_gpu_handle(self) -> int:
+        fn = getattr(self._lib, "samurai_gpu_packet_defense_get_doca_rx_gpu_handle", None)
+        if fn is None:
+            raise GPUPacketError("samurai_gpu_packet_defense_get_doca_rx_gpu_handle unavailable")
+        out_handle = ctypes.c_uint64(0)
+        rc = int(fn(ctypes.byref(out_handle)) or 0)
+        if rc != 0:
+            raise GPUPacketError(self._last_error() or "samurai_gpu_packet_defense_get_doca_rx_gpu_handle failed")
+        return int(out_handle.value)
 
     def shutdown(self) -> None:
         rc = int(self._lib.samurai_gpu_packet_defense_shutdown() or 0)
