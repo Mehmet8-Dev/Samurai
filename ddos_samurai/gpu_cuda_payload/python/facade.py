@@ -27,12 +27,16 @@ def _python_compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int
     topology = dict(spec.get("topology") or {})
     template_catalog = dict(spec.get("template_catalog") or {})
     flow = dict(spec.get("flow") or {})
+    pacing = dict(spec.get("pacing") or {})
     l4_templates = list(template_catalog.get("l4_templates") or [])
     l7_templates = list(template_catalog.get("l7_templates") or [])
     total_template_count = max(1, len(l4_templates) + len(l7_templates))
     flow_count = max(1, int(flow.get("flow_count", 0) or n))
     client_pool_size = max(1, int(topology.get("client_pool_size", 1) or 1))
     server_pool_size = max(1, int(topology.get("server_pool_size", 1) or 1))
+    base_tx_timestamp_ns = max(0, int(pacing.get("base_tx_timestamp_ns", 0) or 0))
+    base_ipg_ns = max(0, int(pacing.get("base_ipg_ns", 1000) or 1000))
+    configured_inter_flow_gap_ns = max(0, int(pacing.get("inter_flow_gap_ns", 0) or 0))
     step_graph = list(flow.get("step_graph") or ["open", "send", "expect", "close"])
     state_op_map = {"open": 1, "send": 2, "expect": 3, "close": 4}
     method_idx: List[int] = []
@@ -48,6 +52,8 @@ def _python_compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int
     server_idx: List[int] = []
     tuple_hash: List[int] = []
     state_op: List[int] = []
+    tx_timestamp_ns: List[int] = []
+    inter_flow_gap_ns: List[int] = []
     for i in range(n):
         method_idx.append(rng.randrange(len(methods)))
         path_idx.append(rng.randrange(len(paths)))
@@ -68,6 +74,17 @@ def _python_compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int
         tuple_hash.append(((fid * 0x9E37) ^ (cid * 0x85EB) ^ (sid * 0xC2B2) ^ rng.getrandbits(32)) & 0xFFFFFFFF)
         step_name = str(step_graph[step % len(step_graph)]).strip().lower() if step_graph else ""
         state_op.append(int(state_op_map.get(step_name, 0)))
+
+    next_ts = base_tx_timestamp_ns
+    prev_flow: int | None = None
+    max_u64 = (1 << 64) - 1
+    for fid in flow_id:
+        flow_gap = configured_inter_flow_gap_ns if (prev_flow is not None and fid != prev_flow) else 0
+        if prev_flow is not None:
+            next_ts = min(max_u64, next_ts + base_ipg_ns + flow_gap)
+        tx_timestamp_ns.append(int(next_ts))
+        inter_flow_gap_ns.append(int(flow_gap))
+        prev_flow = fid
     return {
         "schema_version": int(spec.get("schema_version", 1) or 1),
         "seed": int(seed),
@@ -85,6 +102,8 @@ def _python_compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int
         "server_idx": server_idx,
         "tuple_hash": tuple_hash,
         "state_op": state_op,
+        "tx_timestamp_ns": tx_timestamp_ns,
+        "inter_flow_gap_ns": inter_flow_gap_ns,
         "metadata": {
             "mode": spec["mode"],
             "schema_version": int(spec.get("schema_version", 1) or 1),
@@ -103,6 +122,9 @@ def _python_compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int
             "tuple_seed": int(flow.get("tuple_seed", 0) or 0),
             "step_graph": step_graph,
             "transport": str(flow.get("transport", "custom_tcp") or "custom_tcp"),
+            "base_tx_timestamp_ns": base_tx_timestamp_ns,
+            "base_ipg_ns": base_ipg_ns,
+            "inter_flow_gap_ns": configured_inter_flow_gap_ns,
             "planner_rng": "xoroshiro128plus",
             "planner_polymorphic_http": True,
         },
@@ -115,7 +137,16 @@ def compile_vector_spec(spec: Dict[str, Any], seed: int, batch_size: int) -> Dic
         native_out = dict(_native.compile_vector_spec(normalized, int(seed), int(batch_size)))
         requested_schema = int(normalized.get("schema_version", 1) or 1)
         if requested_schema >= 2:
-            required_cols = {"template_id", "flow_id", "client_idx", "server_idx", "tuple_hash", "state_op"}
+            required_cols = {
+                "template_id",
+                "flow_id",
+                "client_idx",
+                "server_idx",
+                "tuple_hash",
+                "state_op",
+                "tx_timestamp_ns",
+                "inter_flow_gap_ns",
+            }
             native_schema = int(native_out.get("schema_version", 1) or 1)
             if native_schema < 2 or not required_cols.issubset(native_out.keys()):
                 # Native module may be older than schema v2; keep runtime functional via Python fallback.
@@ -152,6 +183,8 @@ def plan_batch_to_h2_request_plan(plan_batch: Dict[str, Any]) -> H2RequestPlan:
     server_idx = list(plan_batch.get("server_idx") or [])
     tuple_hash = list(plan_batch.get("tuple_hash") or [])
     state_op = list(plan_batch.get("state_op") or [])
+    tx_timestamp_ns = list(plan_batch.get("tx_timestamp_ns") or [])
+    inter_flow_gap_ns = list(plan_batch.get("inter_flow_gap_ns") or [])
     schema_version = int(plan_batch.get("schema_version", metadata.get("schema_version", 1)) or 1)
     count = int(plan_batch.get("count", 0) or 0)
     source_tag = "gpu_cuda_payload_v2" if schema_version >= 2 else "gpu_cuda_payload_v1"
@@ -178,6 +211,10 @@ def plan_batch_to_h2_request_plan(plan_batch: Dict[str, Any]) -> H2RequestPlan:
             headers["x-gpu-tuple-hash"] = str(int(tuple_hash[i]))
         if i < len(state_op):
             headers["x-gpu-state-op"] = op_names.get(int(state_op[i]), "none")
+        if i < len(tx_timestamp_ns):
+            headers["x-gpu-tx-timestamp-ns"] = str(int(tx_timestamp_ns[i]))
+        if i < len(inter_flow_gap_ns):
+            headers["x-gpu-inter-flow-gap-ns"] = str(int(inter_flow_gap_ns[i]))
         items.append(H2RequestPlanItem(method=str(m).upper(), path=str(p), headers=headers))
     return H2RequestPlan(items=items)
 

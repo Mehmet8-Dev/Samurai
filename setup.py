@@ -451,12 +451,12 @@ class OptionalBuildExt(build_ext):
             lib_path,
         ]
         try:
-            print(f"\nBuilding DOCA backend skeleton module: {src_path}")
+            print(f"\nBuilding DOCA GPUNetIO backend module: {src_path}")
             subprocess.run(compile_cmd, check=True)
             subprocess.run(link_cmd, check=True)
-            print(f"Built DOCA backend skeleton library: {lib_path}\n")
+            print(f"Built DOCA GPUNetIO backend library: {lib_path}\n")
         except subprocess.CalledProcessError as exc:
-            print(f"\nWarning: DOCA backend skeleton module build failed: {exc}\n")
+            print(f"\nWarning: DOCA GPUNetIO backend module build failed: {exc}\n")
 
     def _build_doca_flow_backend_module(self, project_root: str, build_temp: str, out_dir: str) -> None:
         src_path = os.path.join(project_root, "ddos_samurai", "gpu_packet_cuda", "doca_flow_backend_shim_stub.cpp")
@@ -490,12 +490,12 @@ class OptionalBuildExt(build_ext):
             lib_path,
         ]
         try:
-            print(f"\nBuilding DOCA flow shim module: {src_path}")
+            print(f"\nBuilding DOCA Flow backend module: {src_path}")
             subprocess.run(compile_cmd, check=True)
             subprocess.run(link_cmd, check=True)
-            print(f"Built DOCA flow shim library: {lib_path}\n")
+            print(f"Built DOCA Flow backend library: {lib_path}\n")
         except subprocess.CalledProcessError as exc:
-            print(f"\nWarning: DOCA flow shim module build failed: {exc}\n")
+            print(f"\nWarning: DOCA Flow backend module build failed: {exc}\n")
 
 
 def detect_l7_capabilities() -> Dict[str, bool]:

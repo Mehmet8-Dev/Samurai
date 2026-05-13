@@ -55,6 +55,21 @@ def normalize_vector_spec(spec: Dict[str, Any] | None) -> Dict[str, Any]:
         raise ValueError("flow.step_graph must contain at least one step")
     transport = str(flow_raw.get("transport", raw.get("transport", "custom_tcp")) or "custom_tcp").strip().lower()
 
+    pacing_raw = dict(raw.get("pacing") or {})
+    base_tx_timestamp_ns = int(
+        pacing_raw.get("base_tx_timestamp_ns", raw.get("base_tx_timestamp_ns", 0)) or 0
+    )
+    base_ipg_ns = int(pacing_raw.get("base_ipg_ns", raw.get("base_ipg_ns", 1000)) or 1000)
+    inter_flow_gap_ns = int(
+        pacing_raw.get("inter_flow_gap_ns", raw.get("inter_flow_gap_ns", 0)) or 0
+    )
+    if base_tx_timestamp_ns < 0:
+        raise ValueError("base_tx_timestamp_ns must be >= 0")
+    if base_ipg_ns < 0:
+        raise ValueError("base_ipg_ns must be >= 0")
+    if inter_flow_gap_ns < 0:
+        raise ValueError("inter_flow_gap_ns must be >= 0")
+
     return {
         "schema_version": schema_version,
         "mode": mode,
@@ -78,5 +93,10 @@ def normalize_vector_spec(spec: Dict[str, Any] | None) -> Dict[str, Any]:
             "tuple_seed": tuple_seed,
             "step_graph": step_graph,
             "transport": transport,
+        },
+        "pacing": {
+            "base_tx_timestamp_ns": base_tx_timestamp_ns,
+            "base_ipg_ns": base_ipg_ns,
+            "inter_flow_gap_ns": inter_flow_gap_ns,
         },
     }
