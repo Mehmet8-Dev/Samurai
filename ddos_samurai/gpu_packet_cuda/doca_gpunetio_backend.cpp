@@ -15,6 +15,7 @@
 #include <initializer_list>
 #include <limits>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -182,6 +183,7 @@ struct BackendTxqHandle {
   uint64_t tx_bytes = 0u;
   uint64_t tx_errors = 0u;
   uint64_t tx_drops = 0u;
+  std::mutex op_lock{};
 };
 
 struct BackendRxqHandle {
@@ -216,7 +218,7 @@ struct BackendRxqHandle {
 };
 
 std::mutex g_lock;
-std::unordered_map<int, BackendTxqHandle> g_handles;
+std::unordered_map<int, std::shared_ptr<BackendTxqHandle>> g_handles;
 std::unordered_map<int, BackendRxqHandle> g_rx_handles;
 int g_next_handle = 1;
 
@@ -1038,12 +1040,33 @@ inline bool any_invalid_len(const uint16_t* lengths, int count) {
   return false;
 }
 
-inline uint64_t now_ns_monotonic() {
+enum class TimedClockDomain : int {
+  kMonotonic = 0,
+  kRealtime = 1,
+  kTai = 2,
+  kAuto = 3,
+};
+
+inline bool read_now_ns(clockid_t cid, uint64_t* out_ns) {
+  if (!out_ns) {
+    return false;
+  }
   struct timespec ts;
   ts.tv_sec = 0;
   ts.tv_nsec = 0;
-  (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (static_cast<uint64_t>(ts.tv_sec) * 1000000000ull) + static_cast<uint64_t>(ts.tv_nsec);
+  if (clock_gettime(cid, &ts) != 0) {
+    return false;
+  }
+  *out_ns = (static_cast<uint64_t>(ts.tv_sec) * 1000000000ull) + static_cast<uint64_t>(ts.tv_nsec);
+  return true;
+}
+
+inline uint64_t now_ns_monotonic() {
+  uint64_t out = 0ull;
+  if (!read_now_ns(CLOCK_MONOTONIC, &out)) {
+    return 0ull;
+  }
+  return out;
 }
 
 inline void wait_until_ns_monotonic(uint64_t target_ns) {
@@ -1069,6 +1092,112 @@ inline void wait_until_ns_monotonic(uint64_t target_ns) {
 #endif
     }
   }
+}
+
+inline TimedClockDomain timed_clock_domain_from_env() {
+  std::string mode = env_string("SAMURAI_GPU_DOCA_TIMED_TX_CLOCK", "monotonic");
+  std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (mode == "realtime" || mode == "real" || mode == "clock_realtime") {
+    return TimedClockDomain::kRealtime;
+  }
+  if (mode == "tai" || mode == "clock_tai") {
+    return TimedClockDomain::kTai;
+  }
+  if (mode == "auto") {
+    return TimedClockDomain::kAuto;
+  }
+  return TimedClockDomain::kMonotonic;
+}
+
+inline bool resolve_clockid_for_domain(TimedClockDomain domain, clockid_t* out_cid) {
+  if (!out_cid) {
+    return false;
+  }
+  switch (domain) {
+    case TimedClockDomain::kMonotonic:
+      *out_cid = CLOCK_MONOTONIC;
+      return true;
+    case TimedClockDomain::kRealtime:
+      *out_cid = CLOCK_REALTIME;
+      return true;
+    case TimedClockDomain::kTai:
+#ifdef CLOCK_TAI
+      *out_cid = CLOCK_TAI;
+      return true;
+#else
+      return false;
+#endif
+    case TimedClockDomain::kAuto:
+      break;
+  }
+  return false;
+}
+
+inline TimedClockDomain infer_auto_domain_from_samples(const uint64_t* ts, int count) {
+  if (!ts || count <= 0) {
+    return TimedClockDomain::kMonotonic;
+  }
+  // Monotonic boot clocks are typically far smaller than epoch nanoseconds.
+  constexpr uint64_t kEpochThresholdNs = 1000000000000000ull;  // ~11.5 days in ns scale from epoch discriminant
+  int epoch_like = 0;
+  int monotonic_like = 0;
+  const int sample_n = std::min(count, 32);
+  for (int i = 0; i < sample_n; ++i) {
+    if (ts[i] >= kEpochThresholdNs) {
+      epoch_like += 1;
+    } else {
+      monotonic_like += 1;
+    }
+  }
+  return (epoch_like > monotonic_like) ? TimedClockDomain::kRealtime : TimedClockDomain::kMonotonic;
+}
+
+inline bool convert_timestamps_to_monotonic(
+    const uint64_t* ts_in,
+    int count,
+    TimedClockDomain requested_domain,
+    std::vector<uint64_t>* ts_out,
+    char* err,
+    size_t err_len) {
+  if (!ts_out || !ts_in || count <= 0) {
+    write_err(err, err_len, "invalid timestamp conversion arguments");
+    return false;
+  }
+  ts_out->assign(static_cast<size_t>(count), 0ull);
+  if (requested_domain == TimedClockDomain::kMonotonic) {
+    for (int i = 0; i < count; ++i) {
+      (*ts_out)[static_cast<size_t>(i)] = ts_in[static_cast<size_t>(i)];
+    }
+    return true;
+  }
+
+  TimedClockDomain domain = requested_domain;
+  if (domain == TimedClockDomain::kAuto) {
+    domain = infer_auto_domain_from_samples(ts_in, count);
+  }
+  clockid_t src_cid = CLOCK_MONOTONIC;
+  if (!resolve_clockid_for_domain(domain, &src_cid)) {
+    write_err(err, err_len, "requested timed clock domain is unsupported on this platform");
+    return false;
+  }
+  uint64_t mono_now = 0ull;
+  uint64_t src_now = 0ull;
+  if (!read_now_ns(CLOCK_MONOTONIC, &mono_now) || !read_now_ns(src_cid, &src_now)) {
+    write_err(err, err_len, "clock_gettime failed while resolving timed clock domain");
+    return false;
+  }
+  const int64_t delta = static_cast<int64_t>(mono_now) - static_cast<int64_t>(src_now);
+  for (int i = 0; i < count; ++i) {
+    const int64_t raw = static_cast<int64_t>(ts_in[static_cast<size_t>(i)]);
+    int64_t mono_ts = raw + delta;
+    if (mono_ts < 0) {
+      mono_ts = 0;
+    }
+    (*ts_out)[static_cast<size_t>(i)] = static_cast<uint64_t>(mono_ts);
+  }
+  return true;
 }
 
 inline int send_vector_unlocked(
@@ -1383,18 +1512,39 @@ extern "C" int samurai_doca_backend_create_txq(
 
   std::lock_guard<std::mutex> guard(g_lock);
   const int hnd = g_next_handle++;
-  tmp.handle = hnd;
-  doca_data ud{};
-  ud.ptr = nullptr;
-  if (tmp.ctx) {
-    ud.ptr = &tmp;
-  }
-  g_handles.emplace(hnd, std::move(tmp));
-  auto it = g_handles.find(hnd);
-  if (it != g_handles.end() && it->second.ctx) {
+  auto sp = std::make_shared<BackendTxqHandle>();
+  sp->handle = hnd;
+  sp->iface = std::move(tmp.iface);
+  sp->device_name = std::move(tmp.device_name);
+  sp->gpu_id = tmp.gpu_id;
+  sp->queue_id = tmp.queue_id;
+  sp->dev = tmp.dev;
+  sp->pe = tmp.pe;
+  sp->txq = tmp.txq;
+  sp->ctx = tmp.ctx;
+  sp->gpu_txq = tmp.gpu_txq;
+  sp->mmap = tmp.mmap;
+  sp->buf_inv = tmp.buf_inv;
+  sp->txq_mkey_be = tmp.txq_mkey_be;
+  sp->inflight = tmp.inflight;
+  sp->task_slots = tmp.task_slots;
+  sp->max_progress_loops = tmp.max_progress_loops;
+  sp->tx_packets = tmp.tx_packets;
+  sp->tx_bytes = tmp.tx_bytes;
+  sp->tx_errors = tmp.tx_errors;
+  sp->tx_drops = tmp.tx_drops;
+  tmp.dev = nullptr;
+  tmp.pe = nullptr;
+  tmp.txq = nullptr;
+  tmp.ctx = nullptr;
+  tmp.gpu_txq = nullptr;
+  tmp.mmap = nullptr;
+  tmp.buf_inv = nullptr;
+  g_handles.emplace(hnd, sp);
+  if (sp && sp->ctx) {
     doca_data ctx_data{};
-    ctx_data.ptr = &(it->second);
-    (void)g_doca.doca_ctx_set_user_data(it->second.ctx, ctx_data);
+    ctx_data.ptr = sp.get();
+    (void)g_doca.doca_ctx_set_user_data(sp->ctx, ctx_data);
   }
   *out_handle = hnd;
   return 0;
@@ -1405,13 +1555,21 @@ extern "C" int samurai_doca_backend_destroy_txq(int handle, char* err, size_t er
     write_err(err, err_len, "invalid handle in samurai_doca_backend_destroy_txq");
     return -1;
   }
-  std::lock_guard<std::mutex> guard(g_lock);
-  auto it = g_handles.find(handle);
-  if (it == g_handles.end()) {
+  std::shared_ptr<BackendTxqHandle> h{};
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto it = g_handles.find(handle);
+    if (it == g_handles.end()) {
+      return 0;
+    }
+    h = it->second;
+    g_handles.erase(it);
+  }
+  if (!h) {
     return 0;
   }
-  destroy_backend_txq_unlocked(it->second);
-  g_handles.erase(it);
+  std::lock_guard<std::mutex> op_guard(h->op_lock);
+  destroy_backend_txq_unlocked(*h);
   return 0;
 }
 
@@ -1437,20 +1595,28 @@ extern "C" int samurai_doca_backend_send_vector(
     return -1;
   }
 
-  std::lock_guard<std::mutex> guard(g_lock);
-  auto it = g_handles.find(handle);
-  if (it == g_handles.end()) {
+  std::shared_ptr<BackendTxqHandle> h{};
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto it = g_handles.find(handle);
+    if (it == g_handles.end()) {
+      write_err(err, err_len, "txq handle not found");
+      return -1;
+    }
+    h = it->second;
+  }
+  if (!h) {
     write_err(err, err_len, "txq handle not found");
     return -1;
   }
-  BackendTxqHandle& h = it->second;
-  if (!h.txq || !h.pe || !h.mmap || !h.buf_inv) {
+  std::lock_guard<std::mutex> op_guard(h->op_lock);
+  if (!h->txq || !h->pe || !h->mmap || !h->buf_inv) {
     write_err(err, err_len, "DOCA txq handle is not fully initialized");
     return -1;
   }
 
   return send_vector_unlocked(
-      h,
+      *h,
       packets,
       lengths,
       nullptr,
@@ -1503,23 +1669,40 @@ extern "C" int samurai_doca_backend_send_vector_timed(
     return -1;
   }
 
-  std::lock_guard<std::mutex> guard(g_lock);
-  auto it = g_handles.find(handle);
-  if (it == g_handles.end()) {
+  std::shared_ptr<BackendTxqHandle> h{};
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto it = g_handles.find(handle);
+    if (it == g_handles.end()) {
+      write_err(err, err_len, "txq handle not found");
+      return -1;
+    }
+    h = it->second;
+  }
+  if (!h) {
     write_err(err, err_len, "txq handle not found");
     return -1;
   }
-  BackendTxqHandle& h = it->second;
-  if (!h.txq || !h.pe || !h.mmap || !h.buf_inv) {
+  std::lock_guard<std::mutex> op_guard(h->op_lock);
+  if (!h->txq || !h->pe || !h->mmap || !h->buf_inv) {
     write_err(err, err_len, "DOCA txq handle is not fully initialized");
     return -1;
   }
   const bool use_host_wait = host_wait_mode && !immediate_mode;
+  const TimedClockDomain requested_domain = timed_clock_domain_from_env();
+  std::vector<uint64_t> mono_ts{};
+  const uint64_t* wait_ts = tx_timestamps_ns;
+  if (use_host_wait) {
+    if (!convert_timestamps_to_monotonic(tx_timestamps_ns, count, requested_domain, &mono_ts, err, err_len)) {
+      return -1;
+    }
+    wait_ts = mono_ts.data();
+  }
   return send_vector_unlocked(
-      h,
+      *h,
       packets,
       lengths,
-      tx_timestamps_ns,
+      wait_ts,
       use_host_wait,
       count,
       out_sent,
@@ -1534,17 +1717,26 @@ extern "C" int samurai_doca_backend_get_stats(int handle, DocaGpuNetioStats* out
     write_err(err, err_len, "invalid arguments for samurai_doca_backend_get_stats");
     return -1;
   }
-  std::lock_guard<std::mutex> guard(g_lock);
-  auto it = g_handles.find(handle);
-  if (it == g_handles.end()) {
+  std::shared_ptr<BackendTxqHandle> h{};
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto it = g_handles.find(handle);
+    if (it == g_handles.end()) {
+      write_err(err, err_len, "txq handle not found");
+      return -1;
+    }
+    h = it->second;
+  }
+  if (!h) {
     write_err(err, err_len, "txq handle not found");
     return -1;
   }
-  out->tx_packets = it->second.tx_packets;
-  out->tx_bytes = it->second.tx_bytes;
-  out->tx_errors = it->second.tx_errors;
-  out->tx_drops = it->second.tx_drops;
-  out->queue_id = it->second.queue_id;
+  std::lock_guard<std::mutex> op_guard(h->op_lock);
+  out->tx_packets = h->tx_packets;
+  out->tx_bytes = h->tx_bytes;
+  out->tx_errors = h->tx_errors;
+  out->tx_drops = h->tx_drops;
+  out->queue_id = h->queue_id;
   return 0;
 }
 
@@ -1557,13 +1749,26 @@ extern "C" int samurai_doca_backend_get_gpu_txq_handle(
     write_err(err, err_len, "invalid arguments for samurai_doca_backend_get_gpu_txq_handle");
     return -1;
   }
-  std::lock_guard<std::mutex> guard(g_lock);
-  auto it = g_handles.find(handle);
-  if (it == g_handles.end() || !it->second.gpu_txq) {
+  std::shared_ptr<BackendTxqHandle> h{};
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto it = g_handles.find(handle);
+    if (it == g_handles.end()) {
+      write_err(err, err_len, "txq handle not found or gpu handle unavailable");
+      return -1;
+    }
+    h = it->second;
+  }
+  if (!h) {
     write_err(err, err_len, "txq handle not found or gpu handle unavailable");
     return -1;
   }
-  *out_gpu_txq_handle = reinterpret_cast<uint64_t>(it->second.gpu_txq);
+  std::lock_guard<std::mutex> op_guard(h->op_lock);
+  if (!h->gpu_txq) {
+    write_err(err, err_len, "txq handle not found or gpu handle unavailable");
+    return -1;
+  }
+  *out_gpu_txq_handle = reinterpret_cast<uint64_t>(h->gpu_txq);
   return 0;
 }
 
@@ -1572,13 +1777,26 @@ extern "C" int samurai_doca_backend_get_txq_mkey_be(int handle, uint32_t* out_mk
     write_err(err, err_len, "invalid arguments for samurai_doca_backend_get_txq_mkey_be");
     return -1;
   }
-  std::lock_guard<std::mutex> guard(g_lock);
-  auto it = g_handles.find(handle);
-  if (it == g_handles.end() || it->second.txq_mkey_be == 0u) {
+  std::shared_ptr<BackendTxqHandle> h{};
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto it = g_handles.find(handle);
+    if (it == g_handles.end()) {
+      write_err(err, err_len, "txq handle not found or txq mkey unavailable");
+      return -1;
+    }
+    h = it->second;
+  }
+  if (!h) {
     write_err(err, err_len, "txq handle not found or txq mkey unavailable");
     return -1;
   }
-  *out_mkey_be = it->second.txq_mkey_be;
+  std::lock_guard<std::mutex> op_guard(h->op_lock);
+  if (h->txq_mkey_be == 0u) {
+    write_err(err, err_len, "txq handle not found or txq mkey unavailable");
+    return -1;
+  }
+  *out_mkey_be = h->txq_mkey_be;
   return 0;
 }
 

@@ -1379,6 +1379,9 @@ struct PersistentDeviceStreamState {
   uint8_t has_custom_mac = 0;
   uint8_t src_mac[6]{0, 0, 0, 0, 0, 0};
   uint8_t dst_mac[6]{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  uint64_t tx_base_timestamp_ns = 0u;
+  uint32_t tx_ipg_ns = 0u;
+  uint32_t _tx_pad = 0u;
   uint8_t payload[kPersistentPayloadCapacity]{};
   uint16_t template_len = 0;
   uint16_t template_ip_off = 0;
@@ -1456,6 +1459,8 @@ struct PersistentStreamState {
   uint8_t has_custom_mac = 0;
   std::array<uint8_t, 6> src_mac{{0, 0, 0, 0, 0, 0}};
   std::array<uint8_t, 6> dst_mac{{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+  uint64_t tx_base_timestamp_ns = 0u;
+  uint32_t tx_ipg_ns = 0u;
   int active = 1;
 };
 
@@ -2094,6 +2099,18 @@ inline int json_get_int(const std::string& json, const char* key, int defv) {
   }
   try {
     return std::stoi(raw);
+  } catch (...) {
+    return defv;
+  }
+}
+
+inline uint64_t json_get_u64(const std::string& json, const char* key, uint64_t defv) {
+  const std::string raw = json_value_raw(json, key);
+  if (raw.empty()) {
+    return defv;
+  }
+  try {
+    return static_cast<uint64_t>(std::stoull(raw));
   } catch (...) {
     return defv;
   }
@@ -2945,6 +2962,20 @@ __device__ inline void persistent_write_packet(
     uint32_t seq,
     uint32_t max_packet_bytes) {
   slot->tx_timestamp_ns = 0u;
+  const uint64_t tx_base_timestamp_ns = sv->tx_base_timestamp_ns;
+  const uint32_t tx_ipg_ns = sv->tx_ipg_ns;
+  if (tx_base_timestamp_ns > 0u) {
+    if (tx_ipg_ns > 0u) {
+      const uint64_t seq_idx = (seq > 0u) ? static_cast<uint64_t>(seq - 1u) : 0u;
+      const __uint128_t ts_wide =
+          static_cast<__uint128_t>(tx_base_timestamp_ns) +
+          (static_cast<__uint128_t>(seq_idx) * static_cast<__uint128_t>(tx_ipg_ns));
+      const __uint128_t u64_max = static_cast<__uint128_t>(~static_cast<uint64_t>(0u));
+      slot->tx_timestamp_ns = static_cast<uint64_t>(ts_wide > u64_max ? u64_max : ts_wide);
+    } else {
+      slot->tx_timestamp_ns = tx_base_timestamp_ns;
+    }
+  }
   const int protocol = static_cast<int>(sv->protocol);
   const int has_eth = (sv->has_ethernet != 0) ? 1 : 0;
   const int ip_off = has_eth ? 14 : 0;
@@ -5338,6 +5369,8 @@ inline std::string stream_state_to_json(const PersistentStreamState& st) {
       << "\"ring_drop_events\":" << st.ring_drop_events << ","
       << "\"scheduler_fairness_cv_pct\":" << std::fixed << std::setprecision(2) << st.scheduler_fairness_cv_pct
       << ","
+      << "\"tx_base_timestamp_ns\":" << st.tx_base_timestamp_ns << ","
+      << "\"tx_ipg_ns\":" << st.tx_ipg_ns << ","
       << "\"profile_json\":\"" << json_escape_string(st.profile_json) << "\","
       << "\"update_json\":\"" << json_escape_string(st.update_json) << "\""
       << "}";
@@ -5891,6 +5924,16 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   st.ramp_interval_epochs = static_cast<uint32_t>(std::max(0, json_get_int(profile, "ramp_interval_epochs", 1)));
   st.ramp_max_quota = static_cast<uint32_t>(std::max(0, json_get_int(profile, "ramp_max_quota", 0)));
   st.ramp_epoch_counter = 0u;
+  st.tx_base_timestamp_ns = json_get_u64(
+      profile,
+      "tx_base_timestamp_ns",
+      json_get_u64(profile, "base_tx_timestamp_ns", 0u));
+  st.tx_ipg_ns = static_cast<uint32_t>(std::min<uint64_t>(
+      json_get_u64(
+          profile,
+          "tx_ipg_ns",
+          json_get_u64(profile, "base_ipg_ns", json_get_u64(profile, "inter_flow_gap_ns", 0u))),
+      static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
   st.active = 1;
 
   PersistentDeviceStreamState& d = g_persistent_runtime.streams[free_slot];
@@ -5936,6 +5979,8 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   d.ramp_interval_epochs = st.ramp_interval_epochs;
   d.ramp_max_quota = st.ramp_max_quota;
   d.ramp_epoch_counter = st.ramp_epoch_counter;
+  d.tx_base_timestamp_ns = st.tx_base_timestamp_ns;
+  d.tx_ipg_ns = st.tx_ipg_ns;
   d.weight = static_cast<uint32_t>(std::max(1, clamp_i(json_get_int(profile, "weight", 1), 1, 32)));
   d.deficit = d.weight;
 
@@ -6099,6 +6144,35 @@ extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* u
   d.ramp_step = st.ramp_step;
   d.ramp_interval_epochs = st.ramp_interval_epochs;
   d.ramp_max_quota = st.ramp_max_quota;
+  {
+    const std::string base_raw = json_value_raw(st.update_json, "tx_base_timestamp_ns");
+    const std::string base_alias_raw = json_value_raw(st.update_json, "base_tx_timestamp_ns");
+    if (!base_raw.empty() || !base_alias_raw.empty()) {
+      st.tx_base_timestamp_ns = json_get_u64(
+          st.update_json,
+          "tx_base_timestamp_ns",
+          json_get_u64(st.update_json, "base_tx_timestamp_ns", st.tx_base_timestamp_ns));
+    }
+  }
+  {
+    const std::string ipg_raw = json_value_raw(st.update_json, "tx_ipg_ns");
+    const std::string ipg_base_raw = json_value_raw(st.update_json, "base_ipg_ns");
+    const std::string ifg_raw = json_value_raw(st.update_json, "inter_flow_gap_ns");
+    if (!ipg_raw.empty() || !ipg_base_raw.empty() || !ifg_raw.empty()) {
+      const uint64_t ipg_u64 = json_get_u64(
+          st.update_json,
+          "tx_ipg_ns",
+          json_get_u64(
+              st.update_json,
+              "base_ipg_ns",
+              json_get_u64(st.update_json, "inter_flow_gap_ns", static_cast<uint64_t>(st.tx_ipg_ns))));
+      st.tx_ipg_ns = static_cast<uint32_t>(std::min<uint64_t>(
+          ipg_u64,
+          static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
+    }
+  }
+  d.tx_base_timestamp_ns = st.tx_base_timestamp_ns;
+  d.tx_ipg_ns = st.tx_ipg_ns;
   if (st.stream_kind != static_cast<int>(PersistentStreamKind::kRamp)) {
     st.ramp_epoch_counter = 0u;
     d.ramp_epoch_counter = 0u;
@@ -6213,6 +6287,8 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
             << ",\"device_target_ip\":" << d.target_ip
             << ",\"device_target_port\":" << d.target_port
             << ",\"device_quota_left\":" << d.quota_left
+            << ",\"device_tx_base_timestamp_ns\":" << d.tx_base_timestamp_ns
+            << ",\"device_tx_ipg_ns\":" << d.tx_ipg_ns
             << ",\"device_weight\":" << d.weight
             << ",\"device_deficit\":" << d.deficit
             << ",\"device_produced\":" << d.produced
