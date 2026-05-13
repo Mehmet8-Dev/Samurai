@@ -27,6 +27,7 @@ class _FakeDefenseLib:
         self.last_error = b""
         self.last_reason = b"none"
         self.calls = []
+        self.doca_rx_gpu_handle = 0x12345000
 
     def samurai_gpu_packet_defense_init(self, runtime, engine_path, rdma_mode, rdma_strict, max_batch_size, flush_timeout_ms):
         self.calls.append(
@@ -94,6 +95,11 @@ class _FakeDefenseLib:
         self.calls.append({"name": "shutdown"})
         return int(self.rc_shutdown)
 
+    def samurai_gpu_packet_defense_get_doca_rx_gpu_handle(self, out_gpu_rxq_handle):
+        ctypes.cast(out_gpu_rxq_handle, ctypes.POINTER(ctypes.c_uint64)).contents.value = int(self.doca_rx_gpu_handle)
+        self.calls.append({"name": "get_doca_rx_gpu_handle"})
+        return 0
+
     def samurai_gpu_packet_defense_last_error(self):
         return self.last_error
 
@@ -149,6 +155,15 @@ def test_defense_backend_classify_from_ingress(monkeypatch):
     assert reason == "none"
     assert labels.tolist() == [0, 1, 0]
     assert np.allclose(confidences, np.array([0.55, 0.8, 0.55], dtype=np.float32), atol=1e-6)
+
+
+def test_defense_backend_reads_doca_rx_gpu_handle(monkeypatch):
+    fake = _FakeDefenseLib()
+    monkeypatch.setattr(backend, "_DEFENSE_LIB", fake, raising=True)
+
+    b = backend.DefenseCUDABackend()
+    handle = b.get_doca_rx_gpu_handle()
+    assert handle == int(fake.doca_rx_gpu_handle)
 
 
 def test_defense_backend_requires_library(monkeypatch):
