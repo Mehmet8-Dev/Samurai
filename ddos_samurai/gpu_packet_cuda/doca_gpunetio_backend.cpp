@@ -3,11 +3,13 @@
 
 #include <arpa/inet.h>
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <dlfcn.h>
 #include <cstdio>
 #include <initializer_list>
@@ -1036,6 +1038,131 @@ inline bool any_invalid_len(const uint16_t* lengths, int count) {
   return false;
 }
 
+inline uint64_t now_ns_monotonic() {
+  struct timespec ts;
+  ts.tv_sec = 0;
+  ts.tv_nsec = 0;
+  (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (static_cast<uint64_t>(ts.tv_sec) * 1000000000ull) + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+inline void wait_until_ns_monotonic(uint64_t target_ns) {
+  if (target_ns == 0ull) {
+    return;
+  }
+  while (true) {
+    const uint64_t now = now_ns_monotonic();
+    if (now >= target_ns) {
+      return;
+    }
+    const uint64_t remain = target_ns - now;
+    if (remain > 50000ull) {
+      struct timespec req;
+      req.tv_sec = static_cast<time_t>(remain / 1000000000ull);
+      req.tv_nsec = static_cast<long>(remain % 1000000000ull);
+      while (clock_nanosleep(CLOCK_MONOTONIC, 0, &req, &req) == EINTR) {
+      }
+    } else {
+      // fine-grained tail spin for sub-50us windows
+#if defined(__x86_64__) || defined(__i386__)
+      __asm__ volatile("pause");
+#endif
+    }
+  }
+}
+
+inline int send_vector_unlocked(
+    BackendTxqHandle& h,
+    const uint8_t** packets,
+    const uint16_t* lengths,
+    const uint64_t* tx_timestamps_ns,
+    bool use_host_wait_timing,
+    int count,
+    int* out_sent,
+    int* out_errors,
+    char* err,
+    size_t err_len,
+    const char* op_name) {
+  int submitted = 0;
+  int failures = 0;
+  uint64_t bytes_submitted = 0u;
+  for (int i = 0; i < count; ++i) {
+    if (!packets[i] || lengths[i] == 0u) {
+      failures += 1;
+      continue;
+    }
+    if (use_host_wait_timing && tx_timestamps_ns != nullptr) {
+      const uint64_t target_ns = tx_timestamps_ns[static_cast<size_t>(i)];
+      if (target_ns > 0ull) {
+        wait_until_ns_monotonic(target_ns);
+      }
+    }
+    doca_buf* pkt = nullptr;
+    doca_error_t rc = g_doca.doca_buf_inventory_buf_get_by_addr(
+        h.buf_inv,
+        h.mmap,
+        const_cast<uint8_t*>(packets[i]),
+        static_cast<size_t>(lengths[i]),
+        &pkt);
+    if (rc != kDocaSuccess || !pkt) {
+      failures += 1;
+      continue;
+    }
+    doca_data user_data{};
+    user_data.u64 = static_cast<uint64_t>(i);
+    doca_eth_txq_task_send* task_send = nullptr;
+    rc = g_doca.doca_eth_txq_task_send_allocate_init(h.txq, pkt, user_data, &task_send);
+    if (rc != kDocaSuccess || !task_send) {
+      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+      failures += 1;
+      continue;
+    }
+    doca_task* task = g_doca.doca_eth_txq_task_send_as_doca_task(task_send);
+    if (!task) {
+      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+      failures += 1;
+      continue;
+    }
+    rc = g_doca.doca_task_submit(task);
+    if (rc != kDocaSuccess) {
+      (void)g_doca.doca_task_free(task);
+      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
+      failures += 1;
+      continue;
+    }
+    h.inflight += 1u;
+    submitted += 1;
+    bytes_submitted += static_cast<uint64_t>(lengths[i]);
+  }
+
+  uint32_t loops = 0u;
+  while (h.inflight > 0u && loops < h.max_progress_loops) {
+    (void)g_doca.doca_pe_progress(h.pe);
+    loops += 1u;
+  }
+  if (h.inflight > 0u) {
+    failures += static_cast<int>(h.inflight);
+    h.tx_errors += static_cast<uint64_t>(failures);
+    h.tx_drops += static_cast<uint64_t>(failures);
+    *out_sent = submitted;
+    *out_errors = failures;
+    write_err(err, err_len, std::string("DOCA ") + op_name + " timed out waiting for task completions");
+    return -1;
+  }
+
+  h.tx_packets += static_cast<uint64_t>(submitted);
+  h.tx_bytes += bytes_submitted;
+  h.tx_errors += static_cast<uint64_t>(failures);
+  h.tx_drops += static_cast<uint64_t>(failures);
+  *out_sent = submitted;
+  *out_errors = failures;
+  if (submitted <= 0) {
+    write_err(err, err_len, std::string("DOCA ") + op_name + " submitted zero packets");
+    return -1;
+  }
+  return 0;
+}
+
 inline bool is_matching_dev(
     DocaApi& api,
     doca_devinfo* devinfo,
@@ -1322,78 +1449,84 @@ extern "C" int samurai_doca_backend_send_vector(
     return -1;
   }
 
-  int submitted = 0;
-  int failures = 0;
-  uint64_t bytes_submitted = 0u;
-  for (int i = 0; i < count; ++i) {
-    if (!packets[i] || lengths[i] == 0u) {
-      failures += 1;
-      continue;
-    }
-    doca_buf* pkt = nullptr;
-    doca_error_t rc = g_doca.doca_buf_inventory_buf_get_by_addr(
-        h.buf_inv,
-        h.mmap,
-        const_cast<uint8_t*>(packets[i]),
-        static_cast<size_t>(lengths[i]),
-        &pkt);
-    if (rc != kDocaSuccess || !pkt) {
-      failures += 1;
-      continue;
-    }
-    doca_data user_data{};
-    user_data.u64 = static_cast<uint64_t>(i);
-    doca_eth_txq_task_send* task_send = nullptr;
-    rc = g_doca.doca_eth_txq_task_send_allocate_init(h.txq, pkt, user_data, &task_send);
-    if (rc != kDocaSuccess || !task_send) {
-      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
-      failures += 1;
-      continue;
-    }
-    doca_task* task = g_doca.doca_eth_txq_task_send_as_doca_task(task_send);
-    if (!task) {
-      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
-      failures += 1;
-      continue;
-    }
-    rc = g_doca.doca_task_submit(task);
-    if (rc != kDocaSuccess) {
-      (void)g_doca.doca_task_free(task);
-      (void)g_doca.doca_buf_dec_refcount(pkt, nullptr);
-      failures += 1;
-      continue;
-    }
-    h.inflight += 1u;
-    submitted += 1;
-    bytes_submitted += static_cast<uint64_t>(lengths[i]);
-  }
+  return send_vector_unlocked(
+      h,
+      packets,
+      lengths,
+      nullptr,
+      false,
+      count,
+      out_sent,
+      out_errors,
+      err,
+      err_len,
+      "send_vector");
+}
 
-  uint32_t loops = 0u;
-  while (h.inflight > 0u && loops < h.max_progress_loops) {
-    (void)g_doca.doca_pe_progress(h.pe);
-    loops += 1u;
+extern "C" int samurai_doca_backend_send_vector_timed(
+    int handle,
+    const uint8_t** packets,
+    const uint16_t* lengths,
+    const int32_t* stream_slots,
+    const uint64_t* tx_timestamps_ns,
+    int count,
+    int* out_sent,
+    int* out_errors,
+    char* err,
+    size_t err_len) {
+  (void)stream_slots;
+  if (out_sent) {
+    *out_sent = 0;
   }
-  if (h.inflight > 0u) {
-    failures += static_cast<int>(h.inflight);
-    h.tx_errors += static_cast<uint64_t>(failures);
-    h.tx_drops += static_cast<uint64_t>(failures);
-    *out_sent = submitted;
-    *out_errors = failures;
-    write_err(err, err_len, "DOCA send_vector timed out waiting for task completions");
+  if (out_errors) {
+    *out_errors = 0;
+  }
+  if (handle < 0 || !packets || !lengths || !tx_timestamps_ns || count <= 0 || !out_sent || !out_errors ||
+      any_invalid_len(lengths, count)) {
+    write_err(err, err_len, "invalid arguments for samurai_doca_backend_send_vector_timed");
     return -1;
   }
 
-  h.tx_packets += static_cast<uint64_t>(submitted);
-  h.tx_bytes += bytes_submitted;
-  h.tx_errors += static_cast<uint64_t>(failures);
-  h.tx_drops += static_cast<uint64_t>(failures);
-  *out_sent = submitted;
-  *out_errors = failures;
-  if (submitted <= 0) {
-    write_err(err, err_len, "DOCA send_vector submitted zero packets");
+  std::string mode = env_string("SAMURAI_GPU_DOCA_TIMED_TX_MODE", "host_wait");
+  std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  const bool strict_mode =
+      (mode == "strict" || mode == "hardware" || mode == "hw" || mode == "require_hardware");
+  const bool host_wait_mode = (mode.empty() || mode == "auto" || mode == "host_wait" || mode == "host");
+  const bool immediate_mode = (mode == "off" || mode == "none" || mode == "immediate");
+  if (strict_mode) {
+    write_err(
+        err,
+        err_len,
+        "DOCA timed TX strict mode requested but hardware-scheduled timed send is unavailable in CPU-task backend");
     return -1;
   }
-  return 0;
+
+  std::lock_guard<std::mutex> guard(g_lock);
+  auto it = g_handles.find(handle);
+  if (it == g_handles.end()) {
+    write_err(err, err_len, "txq handle not found");
+    return -1;
+  }
+  BackendTxqHandle& h = it->second;
+  if (!h.txq || !h.pe || !h.mmap || !h.buf_inv) {
+    write_err(err, err_len, "DOCA txq handle is not fully initialized");
+    return -1;
+  }
+  const bool use_host_wait = host_wait_mode && !immediate_mode;
+  return send_vector_unlocked(
+      h,
+      packets,
+      lengths,
+      tx_timestamps_ns,
+      use_host_wait,
+      count,
+      out_sent,
+      out_errors,
+      err,
+      err_len,
+      "send_vector_timed");
 }
 
 extern "C" int samurai_doca_backend_get_stats(int handle, DocaGpuNetioStats* out, char* err, size_t err_len) {

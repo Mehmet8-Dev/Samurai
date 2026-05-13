@@ -33,6 +33,17 @@ using BackendSendVectorFn = int (*)(
     int* out_errors,
     char* err,
     size_t err_len);
+using BackendSendVectorTimedFn = int (*)(
+    int handle,
+    const uint8_t** packets,
+    const uint16_t* lengths,
+    const int32_t* stream_slots,
+    const uint64_t* tx_timestamps_ns,
+    int count,
+    int* out_sent,
+    int* out_errors,
+    char* err,
+    size_t err_len);
 using BackendGetStatsFn = int (*)(int handle, DocaGpuNetioStats* out, char* err, size_t err_len);
 using BackendGetGpuTxqHandleFn =
     int (*)(int handle, uint64_t* out_gpu_txq_handle, char* err, size_t err_len);
@@ -42,6 +53,7 @@ struct BackendDispatch {
   BackendCreateTxqFn create_txq = nullptr;
   BackendDestroyTxqFn destroy_txq = nullptr;
   BackendSendVectorFn send_vector = nullptr;
+  BackendSendVectorTimedFn send_vector_timed = nullptr;
   BackendGetStatsFn get_stats = nullptr;
   BackendGetGpuTxqHandleFn get_gpu_txq_handle = nullptr;
   BackendGetTxqMkeyBeFn get_txq_mkey_be = nullptr;
@@ -144,6 +156,7 @@ inline bool ensure_backend_loaded_unlocked(std::string& why) {
   void* p_create = nullptr;
   void* p_destroy = nullptr;
   void* p_send = nullptr;
+  void* p_send_timed = nullptr;
   void* p_stats = nullptr;
   void* p_gpu_txq = nullptr;
   void* p_mkey = nullptr;
@@ -164,6 +177,13 @@ inline bool ensure_backend_loaded_unlocked(std::string& why) {
   g_backend.create_txq = reinterpret_cast<BackendCreateTxqFn>(p_create);
   g_backend.destroy_txq = reinterpret_cast<BackendDestroyTxqFn>(p_destroy);
   g_backend.send_vector = reinterpret_cast<BackendSendVectorFn>(p_send);
+  dlerror();
+  p_send_timed = dlsym(g_backend_so, "samurai_doca_backend_send_vector_timed");
+  if (dlerror() == nullptr && p_send_timed != nullptr) {
+    g_backend.send_vector_timed = reinterpret_cast<BackendSendVectorTimedFn>(p_send_timed);
+  } else {
+    g_backend.send_vector_timed = nullptr;
+  }
   g_backend.get_stats = reinterpret_cast<BackendGetStatsFn>(p_stats);
   g_backend.get_gpu_txq_handle = reinterpret_cast<BackendGetGpuTxqHandleFn>(p_gpu_txq);
   g_backend.get_txq_mkey_be = reinterpret_cast<BackendGetTxqMkeyBeFn>(p_mkey);
@@ -232,6 +252,44 @@ inline int shim_send_vector(
   return g_backend.send_vector(handle, packets, lengths, stream_slots, count, out_sent, out_errors, err, err_len);
 }
 
+inline int shim_send_vector_timed(
+    int handle,
+    const uint8_t** packets,
+    const uint16_t* lengths,
+    const int32_t* stream_slots,
+    const uint64_t* tx_timestamps_ns,
+    int count,
+    int* out_sent,
+    int* out_errors,
+    char* err,
+    size_t err_len) {
+  if (count <= 0 || !packets || !lengths || !tx_timestamps_ns || !out_sent || !out_errors) {
+    write_err(err, err_len, "invalid DOCA send_vector_timed arguments");
+    return -1;
+  }
+  std::lock_guard<std::mutex> guard(g_backend_lock);
+  std::string why;
+  if (!ensure_backend_loaded_unlocked(why)) {
+    write_err(err, err_len, why);
+    return -1;
+  }
+  if (!g_backend.send_vector_timed) {
+    write_err(err, err_len, "DOCA backend does not expose send_vector_timed");
+    return -1;
+  }
+  return g_backend.send_vector_timed(
+      handle,
+      packets,
+      lengths,
+      stream_slots,
+      tx_timestamps_ns,
+      count,
+      out_sent,
+      out_errors,
+      err,
+      err_len);
+}
+
 inline int shim_get_stats(int handle, DocaGpuNetioStats* out, char* err, size_t err_len) {
   if (!out) {
     write_err(err, err_len, "invalid DOCA get_stats output pointer");
@@ -284,6 +342,7 @@ extern "C" DocaGpuNetioApiV1* samurai_doca_gpunetio_get_api_v1(void) {
     api.create_txq = shim_create_txq;
     api.destroy_txq = shim_destroy_txq;
     api.send_vector = shim_send_vector;
+    api.send_vector_timed = shim_send_vector_timed;
     api.get_stats = shim_get_stats;
     api.get_gpu_txq_handle = shim_get_gpu_txq_handle;
     api.get_txq_mkey_be = shim_get_txq_mkey_be;

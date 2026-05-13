@@ -5,7 +5,7 @@
 
 #define SAMURAI_DOCA_GPUNETIO_API_DECLS 1
 
-constexpr int kDocaGpuNetioApiVersion = 2;
+constexpr int kDocaGpuNetioApiVersion = 3;
 
 struct DocaGpuNetioStats {
   uint64_t tx_packets = 0u;
@@ -31,6 +31,17 @@ struct DocaGpuNetioApiV1 {
       const uint8_t** packets,
       const uint16_t* lengths,
       const int32_t* stream_slots,
+      int count,
+      int* out_sent,
+      int* out_errors,
+      char* err,
+      size_t err_len) = nullptr;
+  int (*send_vector_timed)(
+      int handle,
+      const uint8_t** packets,
+      const uint16_t* lengths,
+      const int32_t* stream_slots,
+      const uint64_t* tx_timestamps_ns,
       int count,
       int* out_sent,
       int* out_errors,

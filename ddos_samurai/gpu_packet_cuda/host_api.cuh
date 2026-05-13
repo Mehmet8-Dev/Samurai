@@ -1302,6 +1302,7 @@ struct PersistentRingSlot {
   int32_t stream_id = 0;
   int32_t stream_slot = -1;
   int32_t protocol = 0;
+  uint64_t tx_timestamp_ns = 0u;
 };
 
 struct PersistentRuntimeControl {
@@ -1465,7 +1466,7 @@ enum class PersistentTxBackendKind : int {
   kDocaGpuNetIO = 3,
 };
 
-constexpr int kPersistentDocaGpuNetioApiVersion = 2;
+constexpr int kPersistentDocaGpuNetioApiVersion = 3;
 
 struct PersistentDocaGpuNetioStats {
   uint64_t tx_packets = 0u;
@@ -1491,6 +1492,17 @@ struct PersistentDocaGpuNetioApiV1 {
       const uint8_t** packets,
       const uint16_t* lengths,
       const int32_t* stream_slots,
+      int count,
+      int* out_sent,
+      int* out_errors,
+      char* err,
+      size_t err_len) = nullptr;
+  int (*send_vector_timed)(
+      int handle,
+      const uint8_t** packets,
+      const uint16_t* lengths,
+      const int32_t* stream_slots,
+      const uint64_t* tx_timestamps_ns,
       int count,
       int* out_sent,
       int* out_errors,
@@ -1530,6 +1542,8 @@ struct PersistentTxBridgeRuntime {
   std::vector<uint64_t> doca_gpu_txq_handles{};
   std::vector<uint32_t> doca_txq_mkeys_be{};
   bool doca_kernel_direct_tx = false;
+  bool doca_timed_tx_enabled = false;
+  bool doca_timed_tx_required = false;
 };
 
 std::mutex g_persistent_lock;
@@ -2291,6 +2305,8 @@ inline void persistent_bridge_backend_shutdown_unlocked(PersistentRuntime& rt) {
   b.doca_gpu_txq_handles.clear();
   b.doca_txq_mkeys_be.clear();
   b.doca_kernel_direct_tx = false;
+  b.doca_timed_tx_enabled = false;
+  b.doca_timed_tx_required = false;
   if (b.afpacket_cleanup_bridge) {
     (void)b.afpacket_cleanup_bridge();
   }
@@ -2338,6 +2354,21 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   const bool want_xdp = (b.requested == "auto" || b.requested == "af_xdp");
   const bool want_afpacket = (b.requested == "auto" || b.requested == "af_packet");
   const bool want_doca = (b.requested == "auto" || b.requested == "doca_gpunetio");
+  const std::string doca_timed_tx_raw = lower_copy(env_string_or("SAMURAI_GPU_DOCA_TIMED_TX", "auto"));
+  b.doca_timed_tx_enabled = false;
+  b.doca_timed_tx_required = false;
+  if (doca_timed_tx_raw == "1" || doca_timed_tx_raw == "true" || doca_timed_tx_raw == "yes" ||
+      doca_timed_tx_raw == "on" || doca_timed_tx_raw == "force" || doca_timed_tx_raw == "required") {
+    b.doca_timed_tx_enabled = true;
+    b.doca_timed_tx_required = true;
+  } else if (doca_timed_tx_raw == "0" || doca_timed_tx_raw == "false" || doca_timed_tx_raw == "no" ||
+             doca_timed_tx_raw == "off") {
+    b.doca_timed_tx_enabled = false;
+    b.doca_timed_tx_required = false;
+  } else {
+    b.doca_timed_tx_enabled = true;
+    b.doca_timed_tx_required = false;
+  }
   const std::string doca_kernel_mode_raw = lower_copy(env_string_or("SAMURAI_GPU_DOCA_KERNEL_TX", "auto"));
   bool want_doca_kernel_direct = false;
   bool doca_kernel_mode_forced = false;
@@ -2421,8 +2452,20 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
     if (ddos_samurai::gpu_packet_cuda::samurai_doca_gpunetio_get_api_v1) {
       b.doca_api = reinterpret_cast<const PersistentDocaGpuNetioApiV1*>(
           ddos_samurai::gpu_packet_cuda::samurai_doca_gpunetio_get_api_v1());
-      if (b.doca_api && b.doca_api->version == kPersistentDocaGpuNetioApiVersion && b.doca_api->create_txq &&
+      if (b.doca_api && b.doca_api->version >= 2 && b.doca_api->create_txq &&
           b.doca_api->destroy_txq && b.doca_api->send_vector) {
+        if (b.doca_timed_tx_required &&
+            (b.doca_api->version < kPersistentDocaGpuNetioApiVersion || !b.doca_api->send_vector_timed)) {
+          if (b.requested == "doca_gpunetio" || tx_backend_strict) {
+            b.kind = PersistentTxBackendKind::kNoop;
+            b.active = "noop";
+            return false;
+          }
+          b.doca_timed_tx_enabled = false;
+        }
+        if (b.doca_api->version < kPersistentDocaGpuNetioApiVersion || !b.doca_api->send_vector_timed) {
+          b.doca_timed_tx_enabled = false;
+        }
         const bool api_has_kernel_hooks = (b.doca_api->get_gpu_txq_handle && b.doca_api->get_txq_mkey_be);
         if (want_doca_kernel_direct && !api_has_kernel_hooks) {
           if (b.requested == "doca_gpunetio") {
@@ -2901,6 +2944,7 @@ __device__ inline void persistent_write_packet(
     const volatile PersistentDeviceStreamState* sv,
     uint32_t seq,
     uint32_t max_packet_bytes) {
+  slot->tx_timestamp_ns = 0u;
   const int protocol = static_cast<int>(sv->protocol);
   const int has_eth = (sv->has_ethernet != 0) ? 1 : 0;
   const int ip_off = has_eth ? 14 : 0;
@@ -3557,6 +3601,7 @@ __global__ void persistent_dataplane_kernel(
             slot.stream_id = 0;
             slot.stream_slot = -1;
             slot.protocol = 0;
+            slot.tx_timestamp_ns = 0u;
             if (direct_packet_count < static_cast<int>(kTokenReserveChunkPerLane)) {
               direct_packet_qids[direct_packet_count] = q;
               direct_packet_count += 1;
@@ -3574,6 +3619,7 @@ __global__ void persistent_dataplane_kernel(
           slot.stream_id = 0;
           slot.stream_slot = -1;
           slot.protocol = 0;
+          slot.tx_timestamp_ns = 0u;
           if (lane == 0u) {
             u64_add(&ctrl->native_batch_degrade_events, 1u);
             ctrl->run = 0;
@@ -3973,6 +4019,7 @@ inline int persistent_reap_xdp_completions(
     slot.stream_id = 0;
     slot.stream_slot = -1;
     slot.protocol = 0;
+    slot.tx_timestamp_ns = 0u;
     (void)persistent_set_device_slot_state(rt, q, fid, 0);
     local_released += 1u;
     if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
@@ -3995,6 +4042,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
   std::vector<uint32_t> afpacket_slot_ids;
   std::vector<int32_t> afpacket_stream_slots;
   std::vector<const uint8_t*> doca_packet_ptrs;
+  std::vector<uint64_t> doca_tx_timestamps_ns;
   std::vector<uint8_t> afpacket_batch_payload;
   submit_frame_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
   submit_lengths.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
@@ -4002,6 +4050,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
   afpacket_slot_ids.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
   afpacket_stream_slots.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
   doca_packet_ptrs.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
+  doca_tx_timestamps_ns.reserve(static_cast<size_t>(std::max(1, rt.bridge_max_burst)));
   while (rt.threads_running.load(std::memory_order_relaxed)) {
     bool progressed = false;
     uint64_t local_sent = 0u;
@@ -4074,6 +4123,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                   slot.stream_id = 0;
                   slot.stream_slot = -1;
                   slot.protocol = 0;
+                  slot.tx_timestamp_ns = 0u;
                   (void)persistent_set_device_slot_state(rt, q, static_cast<uint32_t>(cursor + static_cast<uint32_t>(i)), 0);
                   local_drops += 1u;
                   local_released += 1u;
@@ -4179,6 +4229,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 	            submit_frame_ids.clear();
 	            submit_lengths.clear();
 	            afpacket_stream_slots.clear();
+	            doca_tx_timestamps_ns.clear();
 	            if (!persistent_sync_queue_ring_window_to_host(
 	                    rt,
 	                    q,
@@ -4189,6 +4240,8 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 	            if (!persistent_bridge_copy_fence(rt)) {
 	              break;
 	            }
+	            uint64_t generated_next_ts =
+	                (rt.bridge_next_send_ns > 0u ? rt.bridge_next_send_ns : now_ns_steady());
 	            for (int i = 0; i < std::min(remaining_budget, rt.ring_slots); ++i) {
 	              const uint32_t slot_id = (cursor + static_cast<uint32_t>(i)) % static_cast<uint32_t>(rt.ring_slots);
 	              const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
@@ -4202,15 +4255,23 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 	                slot.stream_id = 0;
 	                slot.stream_slot = -1;
 	                slot.protocol = 0;
+	                slot.tx_timestamp_ns = 0u;
 	                (void)persistent_set_device_slot_state(rt, q, slot_id, 0);
 	                local_drops += 1u;
 	                local_released += 1u;
 	                progressed = true;
 	                continue;
 	              }
+	              uint64_t slot_tx_ns = slot.tx_timestamp_ns;
+	              if (slot_tx_ns == 0u && rt.bridge_ipg_ns > 0) {
+	                slot_tx_ns = generated_next_ts;
+	                generated_next_ts =
+	                    slot_tx_ns + static_cast<uint64_t>(std::max(0, rt.bridge_ipg_ns));
+	              }
 	              submit_frame_ids.push_back(slot_id);
 	              submit_lengths.push_back(static_cast<uint16_t>(slot.len));
 	              afpacket_stream_slots.push_back(slot.stream_slot);
+	              doca_tx_timestamps_ns.push_back(slot_tx_ns);
 	              if (static_cast<int>(submit_frame_ids.size()) >= remaining_budget) {
 	                break;
 	              }
@@ -4243,16 +4304,39 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 	            int errors = 0;
 	            char errbuf[160];
 	            errbuf[0] = '\0';
-	            const int rc = rt.tx_bridge.doca_api->send_vector(
-	                rt.tx_bridge.doca_txq_handles[static_cast<size_t>(q)],
-	                doca_packet_ptrs.data(),
-	                submit_lengths.data(),
-	                afpacket_stream_slots.data(),
-	                static_cast<int>(submit_frame_ids.size()),
-	                &sent,
-	                &errors,
-	                errbuf,
-	                sizeof(errbuf));
+	            const bool can_timed =
+	                (rt.tx_bridge.doca_timed_tx_enabled && rt.tx_bridge.doca_api->send_vector_timed != nullptr);
+	            if (rt.tx_bridge.doca_timed_tx_required && !can_timed) {
+	              rt.threads_running.store(false, std::memory_order_relaxed);
+	              rt.ctrl->run = 0;
+	              if (rt.run_flag_dev) {
+	                const int32_t run_off = 0;
+	                (void)cudaMemcpy(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice);
+	              }
+	              break;
+	            }
+	            const int rc = can_timed
+	                               ? rt.tx_bridge.doca_api->send_vector_timed(
+	                                     rt.tx_bridge.doca_txq_handles[static_cast<size_t>(q)],
+	                                     doca_packet_ptrs.data(),
+	                                     submit_lengths.data(),
+	                                     afpacket_stream_slots.data(),
+	                                     doca_tx_timestamps_ns.data(),
+	                                     static_cast<int>(submit_frame_ids.size()),
+	                                     &sent,
+	                                     &errors,
+	                                     errbuf,
+	                                     sizeof(errbuf))
+	                               : rt.tx_bridge.doca_api->send_vector(
+	                                     rt.tx_bridge.doca_txq_handles[static_cast<size_t>(q)],
+	                                     doca_packet_ptrs.data(),
+	                                     submit_lengths.data(),
+	                                     afpacket_stream_slots.data(),
+	                                     static_cast<int>(submit_frame_ids.size()),
+	                                     &sent,
+	                                     &errors,
+	                                     errbuf,
+	                                     sizeof(errbuf));
 	            if (sent < 0) {
 	              sent = 0;
 	            }
@@ -4277,6 +4361,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 	              slot.stream_id = 0;
 	              slot.stream_slot = -1;
 	              slot.protocol = 0;
+	              slot.tx_timestamp_ns = 0u;
 	              (void)persistent_set_device_slot_state(rt, q, slot_id, 0);
 	              local_released += 1u;
 	              const int32_t slot_idx = afpacket_stream_slots[static_cast<size_t>(i)];
@@ -4291,6 +4376,19 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 	            progressed = true;
 	            local_sent += static_cast<uint64_t>(sent);
 	            rt.queue_sent_counts[static_cast<size_t>(q)] += static_cast<uint64_t>(sent);
+	            if (can_timed && sent > 0 && static_cast<size_t>(sent) <= doca_tx_timestamps_ns.size()) {
+	              const uint64_t last_ts = doca_tx_timestamps_ns[static_cast<size_t>(sent - 1)];
+	              if (last_ts > 0u) {
+	                rt.bridge_next_send_ns =
+	                    last_ts + static_cast<uint64_t>(std::max(0, rt.bridge_ipg_ns));
+	              }
+	            } else if (!can_timed && rt.bridge_ipg_ns > 0) {
+	              const uint64_t base = (rt.bridge_next_send_ns > 0u ? rt.bridge_next_send_ns : now_ns_steady());
+	              const uint64_t target =
+	                  base + (static_cast<uint64_t>(rt.bridge_ipg_ns) * static_cast<uint64_t>(sent));
+	              bridge_wait_until_ns(target);
+	              rt.bridge_next_send_ns = target;
+	            }
 	            cursor = (cursor + static_cast<uint32_t>(sent)) % static_cast<uint32_t>(rt.ring_slots);
 	            if (sent < static_cast<int>(submit_frame_ids.size())) {
 	              break;
@@ -4331,6 +4429,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                 slot.stream_id = 0;
                 slot.stream_slot = -1;
                 slot.protocol = 0;
+                slot.tx_timestamp_ns = 0u;
                 (void)persistent_set_device_slot_state(rt, q, slot_id, 0);
                 local_drops += 1u;
                 local_released += 1u;
@@ -4430,6 +4529,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
                 slot.stream_id = 0;
                 slot.stream_slot = -1;
                 slot.protocol = 0;
+                slot.tx_timestamp_ns = 0u;
                 (void)persistent_set_device_slot_state(rt, q, slot_id, 0);
                 local_released += 1u;
               }
@@ -4446,6 +4546,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
               slot.stream_id = 0;
               slot.stream_slot = -1;
               slot.protocol = 0;
+              slot.tx_timestamp_ns = 0u;
               (void)persistent_set_device_slot_state(rt, q, slot_id, 0);
               local_released += 1u;
               const int32_t slot_idx = afpacket_stream_slots[static_cast<size_t>(i)];
@@ -4492,6 +4593,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
           slot.stream_id = 0;
           slot.stream_slot = -1;
           slot.protocol = 0;
+          slot.tx_timestamp_ns = 0u;
           (void)persistent_set_device_slot_state(rt, q, cursor, 0);
           local_released += 1u;
           local_sent += 1u;
