@@ -331,6 +331,11 @@ def calibrate() -> dict:
         syscall_overhead_ns  — clock_gettime() latency
         sleep_overhead_ns    — clock_nanosleep() wakeup overshoot
         spin_threshold_ns    — computed busy-wait→sleep crossover point
+        tsc_supported        — invariant TSC support flag (0/1)
+        tsc_enabled          — active timing source uses RDTSC (0/1)
+        tsc_hz               — calibrated TSC frequency
+        tsc_overhead_cycles  — rdtsc->rdtsc mean cycle cost
+        timing_source        — "rdtsc" | "clock_gettime"
     """
     if not PACING_ENGINE_AVAILABLE:
         return {}
@@ -341,6 +346,11 @@ def calibrate() -> dict:
         "syscall_overhead_ns": int(merged.get("syscall_overhead_ns", 0) or 0),
         "sleep_overhead_ns": int(merged.get("sleep_overhead_ns", 0) or 0),
         "spin_threshold_ns": int(merged.get("spin_threshold_ns", 0) or 0),
+        "tsc_supported": int(cal.get("tsc_supported", 0) or 0),
+        "tsc_enabled": int(cal.get("tsc_enabled", 0) or 0),
+        "tsc_hz": int(cal.get("tsc_hz", 0) or 0),
+        "tsc_overhead_cycles": int(cal.get("tsc_overhead_cycles", 0) or 0),
+        "timing_source": str(cal.get("timing_source", "clock_gettime") or "clock_gettime"),
     }
 
 
@@ -349,7 +359,8 @@ def check_capabilities() -> dict:
     Probe kernel capabilities relevant to pacing.
 
     Returns dict with bool-like keys:
-        so_txtime, clock_tai, sched_fifo, af_packet, is_root
+        so_txtime, clock_tai, sched_fifo, af_packet, is_root,
+        invariant_tsc, tsc_enabled, tsc_hz, timing_source
     """
     if not PACING_ENGINE_AVAILABLE:
         return {}

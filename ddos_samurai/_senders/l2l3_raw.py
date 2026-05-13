@@ -341,7 +341,7 @@ async def paced_raw_socket_sender(
 
     if requested_backend == "xdp":
         def _xdp_pacing_v2_enabled() -> bool:
-            raw = str(os.environ.get("SAMURAI_XDP_PACING_V2", "0") or "0").strip().lower()
+            raw = str(os.environ.get("SAMURAI_XDP_PACING_V2", "1") or "1").strip().lower()
             return raw not in {"0", "false", "no", "off", ""}
 
         def _xdp_pacing_fail_reason(detail: str) -> str:
