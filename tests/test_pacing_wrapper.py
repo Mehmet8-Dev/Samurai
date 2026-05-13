@@ -106,6 +106,30 @@ class TestPacingWrapper(unittest.TestCase):
         self.assertEqual(int(caps.get("ethtool_tx_sched_timestamp", 0)), 1)
         self.assertIn("etf_ready", caps)
 
+    def test_check_capabilities_accepts_tai_clockid_alias(self):
+        with patch.object(pacing, "_find_tool") as m_find, patch.object(pacing, "_run_cmd_capture") as m_run:
+            def _fake_find(name):
+                if name == "tc":
+                    return "/usr/sbin/tc"
+                if name == "ethtool":
+                    return "/usr/sbin/ethtool"
+                return None
+
+            m_find.side_effect = _fake_find
+            m_run.side_effect = [
+                (
+                    0,
+                    "qdisc etf 8001: dev eth0 root refcnt 2 clockid TAI delta 200000\n",
+                    "",
+                ),
+                (0, "Time stamping parameters for eth0\nCapabilities:\n", ""),
+            ]
+            caps = pacing.check_capabilities(iface="eth0")
+
+        self.assertEqual(int(caps.get("etf_qdisc_present", 0)), 1)
+        self.assertEqual(str(caps.get("etf_clockid", "")), "TAI")
+        self.assertIn("etf_ready", caps)
+
     def test_ensure_etf_qdisc_dry_run(self):
         with patch.object(pacing, "_find_tool", return_value="/usr/sbin/tc"):
             out = pacing.ensure_etf_qdisc(
