@@ -20,6 +20,7 @@ def test_normalize_vector_spec_defaults():
     assert out["methods"] == ["GET"]
     assert out["paths"] == ["/"]
     assert out["max_steps"] == 4
+    assert int(out["pacing"]["base_ipg_ns"]) == 1000
 
 
 def test_compile_vector_spec_seed_is_deterministic():
@@ -37,6 +38,9 @@ def test_compile_vector_spec_seed_is_deterministic():
     assert int(a["count"]) == 16
     assert len(a["method_idx"]) == 16
     assert len(a["flags"]) == 16
+    assert len(a["tx_timestamp_ns"]) == 16
+    assert len(a["inter_flow_gap_ns"]) == 16
+    assert int(a["tx_timestamp_ns"][0]) >= 0
     assert a["metadata"]["planner_rng"] == "xoroshiro128plus"
     assert bool(a["metadata"]["planner_polymorphic_http"]) is True
 
@@ -52,6 +56,7 @@ def test_plan_batch_to_h2_request_plan_shapes_items():
     assert request_plan.items[0].method == "GET"
     assert request_plan.items[0].path == "/x"
     assert request_plan.items[0].headers.get("x-gpu-vector-source") == "gpu_cuda_payload_v1"
+    assert "x-gpu-tx-timestamp-ns" in request_plan.items[0].headers
 
 
 def test_normalize_vector_spec_v2_with_topology_and_flow():
@@ -62,6 +67,7 @@ def test_normalize_vector_spec_v2_with_topology_and_flow():
             "topology": {"enabled": True, "plan_id": "p1", "client_pool_size": 8, "server_pool_size": 4},
             "template_catalog": {"l4_templates": ["l4:syn"], "l7_templates": ["l7:get:/"]},
             "flow": {"flow_count": 32, "tuple_seed": 77, "step_graph": ["open", "send", "close"], "transport": "custom_tcp"},
+            "pacing": {"base_tx_timestamp_ns": 10, "base_ipg_ns": 2500, "inter_flow_gap_ns": 9000},
         }
     )
     assert int(out["schema_version"]) == 2
@@ -70,6 +76,7 @@ def test_normalize_vector_spec_v2_with_topology_and_flow():
     assert out["template_catalog"]["l7_templates"] == ["l7:get:/"]
     assert int(out["flow"]["flow_count"]) == 32
     assert out["flow"]["step_graph"] == ["open", "send", "close"]
+    assert int(out["pacing"]["base_ipg_ns"]) == 2500
 
 
 def test_plan_batch_to_h2_request_plan_emits_v2_headers():
@@ -84,6 +91,7 @@ def test_plan_batch_to_h2_request_plan_emits_v2_headers():
             "topology": {"enabled": True, "client_pool_size": 2, "server_pool_size": 2},
             "template_catalog": {"l4_templates": ["l4:syn"], "l7_templates": ["l7:get:/v2"]},
             "flow": {"flow_count": 4, "step_graph": ["open", "send"], "transport": "custom_tcp"},
+            "pacing": {"base_tx_timestamp_ns": 100, "base_ipg_ns": 500, "inter_flow_gap_ns": 2000},
         },
         seed=11,
         batch_size=2,
@@ -94,6 +102,7 @@ def test_plan_batch_to_h2_request_plan_emits_v2_headers():
     assert "x-gpu-flow-id" in headers
     assert "x-gpu-template-id" in headers
     assert "x-gpu-state-op" in headers
+    assert "x-gpu-tx-timestamp-ns" in headers
 
 
 def test_execute_plan_batch_strict_precheck_fail_visible():

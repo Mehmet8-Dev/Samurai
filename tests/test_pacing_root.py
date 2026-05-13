@@ -167,10 +167,13 @@ def _probe_capabilities():
     cal = calibrate()
     print(f"\n  {C.INFO}Timing Calibration:{C.END}")
     for k, v in cal.items():
-        if v > 1000:
-            print(f"    {k:25s}: {v/1e3:>8.1f} µs")
+        if isinstance(v, (int, float)):
+            if v > 1000:
+                print(f"    {k:25s}: {v/1e3:>8.1f} µs")
+            else:
+                print(f"    {k:25s}: {v:>8,.0f} ns")
         else:
-            print(f"    {k:25s}: {v:>8,.0f} ns")
+            print(f"    {k:25s}: {v}")
 
     return caps, fs_caps, cal
 
