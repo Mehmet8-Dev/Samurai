@@ -5,10 +5,8 @@ Scenario Engine, kullanıcı davranışını persona + flow + step modeliyle ür
 ## Kapsam
 
 - Odak: **L7**
-- Desteklenen transport/backend: **HTTP/1.1 (`http`)** ve **HTTP/2 (`http2`)**
-- Destek dışı (bu faz): doğrudan L4 senaryo DSL yürütümü
-
-Not: L4 vektörleri sistemde ayrı attack/vector path’inde mevcuttur; Scenario Engine’in birincil yolu L7’dir.
+- Desteklenen transport/backend: **HTTP/1.1 (`http`)**, **HTTP/2 (`http2`)**, **L4 TCP (`l4_tcp`)**
+- Not: `l4_tcp` backend'i L4 Session Driver + custom TCP dataplane yolunu kullanır.
 
 ## Senaryo Dosyası
 
@@ -80,4 +78,3 @@ Scenario summary/per-flow seviyesinde:
 
 - Scenario benchmark smoke + memory profile CI job’u aktiftir.
 - 1M resmi benchmark koşusu env-gated olarak ayrıca tetiklenir.
-

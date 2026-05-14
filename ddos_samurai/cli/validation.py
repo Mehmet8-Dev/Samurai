@@ -11,6 +11,28 @@ from ..profile_names import PROFILE_NONE
 from ..topology_native import parse_compile_topology_spec, topology_tuple_preview
 from .helpers import _normalize_afpacket_hugepage_mode, _normalize_dataplane_core_mode
 
+_WEAK_SECRET_SENTINELS = {
+    "change-me",
+    "change-me-admin",
+    "change-me-operator",
+    "change-me-viewer",
+    "replace-me",
+    "replace-admin",
+    "replace-operator",
+    "replace-viewer",
+    "__required__",
+    "admin",
+    "password",
+    "123456",
+}
+
+
+def _is_weak_secret(value: str) -> bool:
+    s = str(value or "").strip().lower()
+    if not s:
+        return False
+    return s in _WEAK_SECRET_SENTINELS
+
 
 def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     role = str(getattr(args, "role", "standalone") or "standalone").strip().lower()
@@ -68,6 +90,23 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
                 parser.error(
                     "Hata: Management API etkinse en az bir token verin "
                     "(--management-api-auth-token, rol tokenlari veya --management-api-jwt-secret)."
+                )
+            weak_fields = []
+            if _is_weak_secret(mat):
+                weak_fields.append("--management-api-auth-token")
+            if _is_weak_secret(madm):
+                weak_fields.append("--management-api-admin-token")
+            if _is_weak_secret(mop):
+                weak_fields.append("--management-api-operator-token")
+            if _is_weak_secret(mview):
+                weak_fields.append("--management-api-viewer-token")
+            if _is_weak_secret(mjwt):
+                weak_fields.append("--management-api-jwt-secret")
+            if weak_fields:
+                parser.error(
+                    "Hata: zayıf/placeholder management secret tespit edildi: "
+                    + ", ".join(weak_fields)
+                    + ". Üretim için güçlü ve benzersiz değerler kullanın."
                 )
             mlive = int(getattr(args, "management_api_live_interval_ms", 1000) or 1000)
             if mlive < 100:
@@ -296,8 +335,16 @@ def _validate_distributed_args(parser: argparse.ArgumentParser, args: argparse.N
         parser.error(f"Hata: --control-tls-client-key dosyası bulunamadı: {client_key}")
 
     secret = str(getattr(args, "cluster_secret", "") or "").strip()
-    if not secret and not insecure:
-        utils.log_warning("--cluster-secret boş: cluster authentication devre dışı (güvensiz).")
+    if role in {"master", "slave"} and not insecure and not secret:
+        parser.error(
+            "Hata: --cluster-secret zorunludur (TLS modunda boş olamaz). "
+            "Dev/Lab için bilinçli olarak --control-insecure kullanabilirsiniz."
+        )
+    if role in {"master", "slave"} and _is_weak_secret(secret):
+        parser.error(
+            "Hata: --cluster-secret zayıf/placeholder olamaz (örn: change-me/__REQUIRED__). "
+            "Güçlü ve benzersiz bir secret verin."
+        )
 
     hb_interval = int(getattr(args, "heartbeat_interval_ms", 2000) or 2000)
     hb_timeout = int(getattr(args, "heartbeat_timeout_ms", 6000) or 6000)
@@ -488,7 +535,10 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         if not os.path.isfile(scenario_file):
             parser.error("Hata: --scenario-file bulunamadı.")
         if attack_vector not in {"http", "http2", "basic"}:
-            parser.error("Hata: scenario mode ilk fazda yalnızca HTTP/HTTP2 backend ile desteklenir.")
+            parser.error(
+                "Hata: scenario mode için --attack-vector yalnızca http, http2 veya basic olabilir "
+                "(l4_tcp backend basic yolunu kullanır)."
+            )
     if int(getattr(args, "scenario_vus", 0) or 0) < 0:
         parser.error("Hata: --scenario-vus >= 0 olmalıdır.")
     if int(getattr(args, "scenario_ramp_seconds", 0) or 0) < 0:

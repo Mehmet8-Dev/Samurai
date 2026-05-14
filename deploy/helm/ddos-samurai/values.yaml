@@ -37,7 +37,7 @@ resources:
     memory: 1Gi
 
 tls:
-  enabled: false
+  enabled: true
   existingSecret: ""
   mountPath: /etc/ddos-samurai/tls
   certFile: tls.crt
@@ -47,16 +47,16 @@ tls:
   requireClientAuth: true
 
 auth:
-  clusterSecret: "change-me"
+  clusterSecret: "__REQUIRED__"
   jwt:
     controlSecret: ""
     managementSecret: ""
     roleClaim: role
     tenantClaim: tenant_namespace
   management:
-    adminToken: "change-me-admin"
-    operatorToken: "change-me-operator"
-    viewerToken: "change-me-viewer"
+    adminToken: "__REQUIRED__"
+    operatorToken: "__REQUIRED__"
+    viewerToken: "__REQUIRED__"
     trustedIdentitySecret: ""
     trustedIdentitySecretHeader: x-samurai-auth-proxy-secret
     trustedIdentityRoleHeader: x-auth-request-role

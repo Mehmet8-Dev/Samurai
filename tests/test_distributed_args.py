@@ -177,3 +177,46 @@ def test_distributed_tls_reload_interval_bounds(monkeypatch):
     ])
     with pytest.raises(SystemExit):
         _validate_distributed_args(parser, bad)
+
+
+def test_distributed_rejects_weak_cluster_secret_even_in_insecure_mode(monkeypatch):
+    monkeypatch.setitem(sys.modules, "grpc", types.SimpleNamespace())
+    parser = build_parser()
+    bad = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--cluster-secret",
+        "change-me",
+    ])
+    with pytest.raises(SystemExit):
+        _validate_distributed_args(parser, bad)
+
+
+def test_distributed_management_api_accepts_single_strong_role_token(monkeypatch):
+    monkeypatch.setitem(sys.modules, "grpc", types.SimpleNamespace())
+    parser = build_parser()
+    good = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--management-api-enable",
+        "--management-api-admin-token",
+        "super-strong-admin-token-001",
+    ])
+    _validate_distributed_args(parser, good)
+
+
+def test_distributed_management_api_rejects_weak_role_token(monkeypatch):
+    monkeypatch.setitem(sys.modules, "grpc", types.SimpleNamespace())
+    parser = build_parser()
+    bad = parser.parse_args([
+        "--role",
+        "master",
+        "--control-insecure",
+        "--management-api-enable",
+        "--management-api-admin-token",
+        "change-me-admin",
+    ])
+    with pytest.raises(SystemExit):
+        _validate_distributed_args(parser, bad)

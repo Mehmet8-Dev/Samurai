@@ -32,6 +32,17 @@ _CPU_RAW_SOCKET_VECTORS = {
 }
 
 
+def _resolve_scenario_backend_attack_vector(raw_backend: str) -> tuple[str, str]:
+    """Map scenario backend to a compatible CLI attack vector."""
+    backend = str(raw_backend or "http").strip().lower()
+    if backend == "http2":
+        return "http2", "http2"
+    if backend == "l4_tcp":
+        # L4 scenario runtime uses custom_tcp dataplane; keep generic vector.
+        return "l4_tcp", "basic"
+    return "http", "http"
+
+
 def _parse_scenario_sla_override(raw: str) -> dict:
     txt = str(raw or "").strip()
     if not txt:
@@ -317,10 +328,14 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 worker_counts=[int(x or 0) for x in worker_counts],
                 seed=int(getattr(args, "scenario_seed", 1337) or 1337),
             )
-            scenario_backend = str((scenario_build_metrics or {}).get("scenario_backend", "http") or "http").strip().lower()
-            args.attack_vector = "http2" if scenario_backend == "http2" else "http"
+            scenario_backend_raw = str((scenario_build_metrics or {}).get("scenario_backend", "http") or "http")
+            scenario_backend, scenario_attack_vector = _resolve_scenario_backend_attack_vector(
+                scenario_backend_raw
+            )
+            args.attack_vector = scenario_attack_vector
             for wi in range(workers):
                 scenario_runtime_metrics_by_worker[wi] = {
+                    "scenario_backend": scenario_backend,
                     "scenario_streaming": 1,
                     "scenario_ramp_seconds": int(getattr(args, "scenario_ramp_seconds", 0) or 0) or int((scenario_build_metrics or {}).get("scenario_ramp_seconds", 0) or 0),
                     "scenario_max_session_seconds": int(getattr(args, "scenario_max_session_seconds", 0) or 0) or int(scenario_spec.load_model.max_session_seconds),
