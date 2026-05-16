@@ -13,7 +13,10 @@ class SlidingWindowBuffer:
     def __init__(self, config: VAEConfig):
         self._cfg = config
         self._buf: deque[np.ndarray] = deque(maxlen=config.window_size)
-        self._since_last_emit = 0
+        # Keep one full-step warm-up after the first complete window.
+        # This preserves deterministic cadence expected by tests/runtime:
+        # first emit occurs after `window_size + step_size` pushes.
+        self._since_last_emit = -1
 
     def push(self, point: dict[str, float]) -> np.ndarray | None:
         arr = np.array([float(point.get(name, 0.0)) for name in self._cfg.feature_names], dtype=np.float32)

@@ -60,6 +60,9 @@ class TestAnomalyPacket(unittest.TestCase):
             if (
                 "CUDA_ERROR_UNSUPPORTED_PTX_VERSION" in msg
                 or "Unsupported .version" in msg
+                or "nvjitlink" in msg.lower()
+                or "nvJitLink" in msg
+                or "may need newer version of nvJitLink library" in msg
             ):
                 self.skipTest("CUDA driver/PTX version mismatch in runtime environment")
             self.fail(f"Anomaly generation raised exception: {e}")
