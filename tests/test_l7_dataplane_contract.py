@@ -307,11 +307,12 @@ class TestL7DataplaneContract(unittest.TestCase):
 
         self.assertEqual(out["sent"], 0)
         self.assertEqual(out["errors"], 1)
-        self.assertEqual(out["runtime_backend"], "afxdp")
+        self.assertEqual(out["runtime_backend"], "dpdk")
         self.assertEqual(out["legacy_path_used"], 0)
         self.assertEqual(out["stateful_runtime_status"], "unavailable")
-        self.assertEqual(out["stateful_runtime_reason"], "custom_tcp_xdp_interface_missing")
+        self.assertEqual(out["stateful_runtime_reason"], "dpdk_not_enabled")
         self.assertEqual(out["stateful_runtime_preflight_status"], "failed")
+        self.assertEqual(out["stateful_runtime_preflight_reason"], "dpdk_not_enabled")
 
     def test_custom_tcp_transport_fails_visible_until_wired(self):
         try:
@@ -681,6 +682,146 @@ class TestL7DataplaneContract(unittest.TestCase):
         self.assertEqual(out["custom_tcp_bridge_xdp_available"], 1)
         self.assertEqual(out["custom_tcp_bridge_xdp_queue_id"], 3)
         self.assertEqual(out["stateful_runtime_preflight_status"], "skipped")
+
+    def test_custom_tcp_bridge_passes_dpdk_runtime_config_to_sender(self):
+        profile = senders.compile_l7_profile(
+            protocol="http1",
+            target_ip="127.0.0.1",
+            target_port=8080,
+            scheme="http",
+            transport_backend="custom_tcp",
+            http_method="GET",
+            http_path=["/"],
+            payloads=[],
+            concurrency=1,
+        )
+
+        class _FakeBridge:
+            def __init__(self):
+                self._buf = bytearray(b"pkt0")
+                self._count = 1
+
+            def peek_custom_tcp_tx_buffer_strided(self):
+                if self._count <= 0:
+                    return None
+                return {
+                    "buffer": memoryview(self._buf),
+                    "owner": self._buf,
+                    "count": self._count,
+                    "packet_size": 4,
+                    "stride": 4,
+                    "uniform": 1,
+                }
+
+            def consume_custom_tcp_tx_packets(self, count):
+                take = min(int(count or 0), self._count)
+                self._count -= take
+                return take
+
+        captured: dict[str, object] = {}
+
+        def _resolve_transport(**_kwargs):
+            return {
+                "sender_backend": "dpdk",
+                "xdp_enable": False,
+                "custom_tcp_bridge_hard_fail_required": 1,
+                "custom_tcp_bridge_degraded": 0,
+                "custom_tcp_bridge_backend_requested": "dpdk",
+                "custom_tcp_bridge_backend_used": "dpdk",
+                "custom_tcp_bridge_backend_match": 1,
+                "custom_tcp_bridge_fallback_reason": "none",
+                "custom_tcp_bridge_fallback_detail": "",
+                "custom_tcp_bridge_xdp_interface": "",
+                "custom_tcp_bridge_xdp_queue_id": 0,
+                "custom_tcp_bridge_xdp_available": 0,
+                "custom_tcp_bridge_xdp_enabled": 0,
+                "custom_tcp_bridge_dpdk_enabled": 1,
+                "custom_tcp_bridge_dpdk_available": 1,
+                "custom_tcp_bridge_dpdk_port_id": 2,
+                "custom_tcp_bridge_dpdk_queue_id": 5,
+                "custom_tcp_bridge_dpdk_burst_size": 128,
+                "custom_tcp_bridge_dpdk_mempool_size": 16384,
+                "custom_tcp_bridge_dpdk_rx_enable": 1,
+                "custom_tcp_bridge_dpdk_eal_args": "--log-level=eal,8",
+                "custom_tcp_bridge_dpdk_strict": 1,
+            }
+
+        async def _fake_dpdk_sender(**kwargs):
+            captured.update(kwargs)
+            return {
+                "attempted": int(kwargs.get("count", 0) or 0),
+                "sent": int(kwargs.get("count", 0) or 0),
+                "errors": 0,
+                "sender_path": "DPDK_PMD",
+            }
+
+        async def _run():
+            return await senders._custom_tcp_bridge.flush_custom_tcp_tx_packets(
+                profile=profile,
+                verbose=False,
+                bridge_api=_FakeBridge(),
+                custom_tcp_backend="dpdk",
+                custom_tcp_xdp_interface="",
+                custom_tcp_xdp_queue_id=0,
+                custom_tcp_xdp_mode=0,
+                custom_tcp_bridge_strict=True,
+                resolve_transport_fn=_resolve_transport,
+                paced_raw_socket_sender_fn=None,
+                xdp_sender_fn=None,
+                dpdk_sender_fn=_fake_dpdk_sender,
+                dpdk_rx_poll_fn=None,
+                sender_context={},
+                update_live_fn=lambda *_args, **_kwargs: None,
+                paced_send_xdp_fn=None,
+                pacing_engine_available=False,
+            )
+
+        out = asyncio.run(_run())
+
+        self.assertIn("dpdk_config", captured)
+        dpdk_cfg = dict(captured["dpdk_config"])
+        self.assertEqual(int(dpdk_cfg["enable"]), 1)
+        self.assertEqual(int(dpdk_cfg["strict"]), 1)
+        self.assertEqual(str(dpdk_cfg["eal_args"]), "--log-level=eal,8")
+        self.assertEqual(int(dpdk_cfg["port_id"]), 2)
+        self.assertEqual(int(dpdk_cfg["queue_id"]), 5)
+        self.assertEqual(int(dpdk_cfg["burst_size"]), 128)
+        self.assertEqual(int(dpdk_cfg["mempool_size"]), 16384)
+        self.assertEqual(int(dpdk_cfg["rx_enable"]), 1)
+        self.assertEqual(int(out["sent"]), 1)
+        self.assertEqual(int(out["custom_tcp_tx_flush_packets"]), 1)
+        self.assertEqual(out["custom_tcp_bridge_backend_used"], "dpdk")
+
+    def test_resolve_custom_tcp_dpdk_backend_runs_real_preflight_in_controlled_mode(self):
+        env = {
+            "SAMURAI_DPDK_ENABLE": "1",
+            "SAMURAI_DPDK_EAL_ARGS": "--definitely-invalid-dpdk-arg",
+            "SAMURAI_DPDK_PORT_ID": "0",
+            "SAMURAI_DPDK_QUEUE_ID": "7",
+            "SAMURAI_DPDK_BURST_SIZE": "96",
+            "SAMURAI_DPDK_MEMPOOL_SIZE": "12288",
+            "SAMURAI_DPDK_RX_ENABLE": "1",
+            "SAMURAI_DPDK_STRICT": "1",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            plan = senders._resolve_custom_tcp_flush_transport(
+                requested_backend="dpdk",
+                xdp_interface="",
+                xdp_queue_id=4,
+            )
+
+        self.assertEqual(plan["custom_tcp_bridge_backend_requested"], "dpdk")
+        self.assertEqual(plan["custom_tcp_bridge_backend_used"], "dpdk")
+        self.assertEqual(int(plan["custom_tcp_bridge_hard_fail_required"]), 1)
+        self.assertEqual(int(plan["custom_tcp_bridge_dpdk_enabled"]), 1)
+        self.assertEqual(int(plan["custom_tcp_bridge_dpdk_queue_id"]), 7)
+        self.assertEqual(int(plan["custom_tcp_bridge_dpdk_burst_size"]), 96)
+        self.assertEqual(int(plan["custom_tcp_bridge_dpdk_mempool_size"]), 12288)
+        self.assertEqual(int(plan["custom_tcp_bridge_dpdk_rx_enable"]), 1)
+        self.assertEqual(int(plan["custom_tcp_bridge_dpdk_strict"]), 1)
+        self.assertEqual(plan["custom_tcp_bridge_dpdk_eal_args"], "--definitely-invalid-dpdk-arg")
+        self.assertEqual(plan["custom_tcp_bridge_fallback_reason"], "dpdk_module_unavailable")
+        self.assertEqual(int(plan["custom_tcp_bridge_degraded"]), 1)
 
     def test_real_xdp_capability_preflight_smoke_when_environment_supports_it(self):
         if not bool(getattr(senders, "XDP_AVAILABLE", False)):

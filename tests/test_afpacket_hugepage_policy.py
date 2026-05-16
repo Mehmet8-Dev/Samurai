@@ -1,4 +1,6 @@
 import unittest
+import os
+from unittest.mock import patch
 
 from ddos_samurai import dataplane
 from ddos_samurai import senders
@@ -79,6 +81,26 @@ class TestAfpacketHugepagePolicy(unittest.TestCase):
             }
         )
         self.assertEqual(cfg.xdp_mode2_policy, "hard")
+
+    def test_dataplane_config_preserves_explicit_dpdk_queue_zero(self):
+        cfg = dataplane.build_dataplane_config(
+            {
+                "sender_backend": "dpdk",
+                "dp_queue_id": 9,
+                "dpdk_queue_id": 0,
+            }
+        )
+        self.assertEqual(int(cfg.extra["dpdk"]["queue_id"]), 0)
+
+    def test_dataplane_config_uses_dpdk_queue_env_when_not_explicit(self):
+        with patch.dict(os.environ, {"SAMURAI_DPDK_QUEUE_ID": "6"}, clear=False):
+            cfg = dataplane.build_dataplane_config(
+                {
+                    "sender_backend": "dpdk",
+                    "dp_queue_id": 3,
+                }
+            )
+        self.assertEqual(int(cfg.extra["dpdk"]["queue_id"]), 6)
 
 
 if __name__ == "__main__":

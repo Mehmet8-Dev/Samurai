@@ -586,6 +586,23 @@ class TestSenderRouteValidation(unittest.TestCase):
         )
         cli._validate_sender_route_args(parser, args)
 
+    def test_sender_route_dpdk_requires_enable_flag(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--sender-backend", "dpdk"])
+        self._assert_validation_fails(parser, args)
+
+    def test_sender_route_dpdk_accepts_non_strict_preflight(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "--sender-backend",
+                "dpdk",
+                "--dpdk-enable",
+                "--no-dpdk-strict",
+            ]
+        )
+        cli._validate_sender_route_args(parser, args)
+
     def test_sender_route_rejects_empty_xdp_bpf_section_when_attach_enabled(self):
         parser = cli.build_parser()
         args = parser.parse_args(
