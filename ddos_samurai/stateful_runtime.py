@@ -73,7 +73,7 @@ class StatefulRuntimeSession:
         if runtime_backend == "afxdp":
             runtime_hot_path_level = "phase1_hybrid_afxdp"
         elif runtime_backend == "dpdk":
-            runtime_hot_path_level = "phase1_stub_dpdk"
+            runtime_hot_path_level = "phase1_hybrid_dpdk"
         if transport_backend == "custom_tcp":
             runtime_hot_path_level = f"{runtime_hot_path_level}_custom_tcp"
         return {
@@ -150,8 +150,8 @@ def evaluate_hot_path_contract(
     if is_l7:
         if rt_backend != "custom_tcp":
             return HotPathContractResult("failed", "l7_runtime_transport_must_be_custom_tcp", 1, "none")
-        if bridge_backend and bridge_backend != "xdp":
-            return HotPathContractResult("failed", "l7_custom_tcp_bridge_backend_must_be_xdp", 1, "none")
+        if bridge_backend and bridge_backend not in {"xdp", "dpdk"}:
+            return HotPathContractResult("failed", "l7_custom_tcp_bridge_backend_must_be_xdp_or_dpdk", 1, "none")
         return HotPathContractResult("passed", "none", 1, "none")
 
     if path and path != "DP_TX_RING":
