@@ -255,12 +255,16 @@ def _merge_gate_defaults(profile: str, parity_matrix_path: Optional[str] = None)
         base["sender_path_single_required"] = parity["sender_path_single_required"]
     if "runtime_backend_required" in parity:
         base["runtime_backend_required"] = parity["runtime_backend_required"]
+    if "runtime_backend_allowed" in parity:
+        base["runtime_backend_allowed"] = parity["runtime_backend_allowed"]
     if "runtime_hot_path_level_required" in parity:
         base["runtime_hot_path_level_required"] = parity["runtime_hot_path_level_required"]
     if "legacy_path_used_required" in parity:
         base["legacy_path_used_required"] = parity["legacy_path_used_required"]
     if "custom_tcp_bridge_xdp_enabled_required" in parity:
         base["custom_tcp_bridge_xdp_enabled_required"] = parity["custom_tcp_bridge_xdp_enabled_required"]
+    if "custom_tcp_bridge_backend_allowed" in parity:
+        base["custom_tcp_bridge_backend_allowed"] = parity["custom_tcp_bridge_backend_allowed"]
     if "custom_tcp_bridge_backend_match_required" in parity:
         base["custom_tcp_bridge_backend_match_required"] = parity["custom_tcp_bridge_backend_match_required"]
     if "runtime_transport_backend_required" in parity:
@@ -273,6 +277,10 @@ def _merge_gate_defaults(profile: str, parity_matrix_path: Optional[str] = None)
         base["stateful_runtime_preflight_status_required"] = parity["stateful_runtime_preflight_status_required"]
     if "stateful_runtime_preflight_xdp_enabled_required" in parity:
         base["stateful_runtime_preflight_xdp_enabled_required"] = parity["stateful_runtime_preflight_xdp_enabled_required"]
+    if "stateful_runtime_preflight_dpdk_enabled_required" in parity:
+        base["stateful_runtime_preflight_dpdk_enabled_required"] = parity["stateful_runtime_preflight_dpdk_enabled_required"]
+    if "stateful_runtime_preflight_dpdk_available_required" in parity:
+        base["stateful_runtime_preflight_dpdk_available_required"] = parity["stateful_runtime_preflight_dpdk_available_required"]
     for k, v in parity.items():
         base[k] = v
     return base
@@ -576,6 +584,17 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
                 required=bool(dedicated_strict and l7_scope),
             )
         )
+    runtime_backend_allowed = str(gates.get("runtime_backend_allowed", "") or "").strip()
+    if runtime_backend_allowed:
+        rules.append(
+            KpiGateRule(
+                "runtime_backend_allowed",
+                "runtime_backend",
+                "in_set",
+                runtime_backend_allowed,
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
     runtime_hot_path_level_required = str(gates.get("runtime_hot_path_level_required", "") or "").strip()
     if runtime_hot_path_level_required:
         rules.append(
@@ -617,6 +636,17 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
                 required=bool(dedicated_strict and l7_scope),
             )
         )
+    custom_tcp_bridge_backend_allowed = str(gates.get("custom_tcp_bridge_backend_allowed", "") or "").strip()
+    if custom_tcp_bridge_backend_allowed:
+        rules.append(
+            KpiGateRule(
+                "custom_tcp_bridge_backend_allowed",
+                "custom_tcp_bridge_backend_used",
+                "in_set",
+                custom_tcp_bridge_backend_allowed,
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
     preflight_status_required = str(gates.get("stateful_runtime_preflight_status_required", "") or "").strip()
     if preflight_status_required:
         rules.append(
@@ -635,6 +665,26 @@ def _build_rules(gates: Dict[str, Any], results: Dict[str, Any], *, profile: str
                 "stateful_runtime_preflight_xdp_enabled",
                 "eq",
                 int(gates.get("stateful_runtime_preflight_xdp_enabled_required", 0) or 0),
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    if "stateful_runtime_preflight_dpdk_enabled_required" in gates:
+        rules.append(
+            KpiGateRule(
+                "stateful_runtime_preflight_dpdk_enabled",
+                "stateful_runtime_preflight_dpdk_enabled",
+                "eq",
+                int(gates.get("stateful_runtime_preflight_dpdk_enabled_required", 0) or 0),
+                required=bool(dedicated_strict and l7_scope),
+            )
+        )
+    if "stateful_runtime_preflight_dpdk_available_required" in gates:
+        rules.append(
+            KpiGateRule(
+                "stateful_runtime_preflight_dpdk_available",
+                "stateful_runtime_preflight_dpdk_available",
+                "eq",
+                int(gates.get("stateful_runtime_preflight_dpdk_available_required", 0) or 0),
                 required=bool(dedicated_strict and l7_scope),
             )
         )

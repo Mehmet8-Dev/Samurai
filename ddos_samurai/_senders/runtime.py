@@ -1,7 +1,7 @@
 import os
 
 
-_SENDER_BACKEND_CHOICES = {"xdp"}
+_SENDER_BACKEND_CHOICES = {"xdp", "dpdk"}
 _SENDER_FALLBACK_POLICY_CHOICES = {"fail"}
 
 

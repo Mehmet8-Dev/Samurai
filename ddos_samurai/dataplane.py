@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import importlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -11,6 +12,40 @@ try:
     from . import dataplane_core as _dp_core
 except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
     _dp_core = None
+
+def _load_dpdk_module():
+    try:
+        return importlib.import_module("ddos_samurai.dpdk_pmd_core")
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+        return None
+
+
+def _dpdk_open(config: Dict[str, Any]) -> Any:
+    mod = _load_dpdk_module()
+    if mod is None or not hasattr(mod, "dpdk_open"):
+        raise RuntimeError("dpdk_runtime_unavailable")
+    return mod.dpdk_open(dict(config or {}))
+
+
+def _dpdk_send_batch(handle: Any, packets_buffer: Any, packet_size: int, count: int) -> Dict[str, Any]:
+    mod = _load_dpdk_module()
+    if mod is None or not hasattr(mod, "dpdk_send_batch"):
+        raise RuntimeError("dpdk_runtime_unavailable")
+    return dict(mod.dpdk_send_batch(handle, packets_buffer, int(packet_size or 0), int(count or 0)) or {})
+
+
+def _dpdk_snapshot(handle: Any) -> Dict[str, Any]:
+    mod = _load_dpdk_module()
+    if mod is None or not hasattr(mod, "dpdk_snapshot"):
+        return {}
+    return dict(mod.dpdk_snapshot(handle) or {})
+
+
+def _dpdk_close(handle: Any) -> None:
+    mod = _load_dpdk_module()
+    if mod is None or not hasattr(mod, "dpdk_close"):
+        return
+    mod.dpdk_close(handle)
 
 
 @dataclass
@@ -100,7 +135,13 @@ class DataplaneSession:
         self._open_error: str = ""
 
     @property
+    def _is_dpdk_backend(self) -> bool:
+        return str(self.config.backend or "").strip().lower() == "dpdk"
+
+    @property
     def core_available(self) -> bool:
+        if self._is_dpdk_backend:
+            return _load_dpdk_module() is not None
         return _dp_core is not None
 
     @property
@@ -116,6 +157,18 @@ class DataplaneSession:
             return False
         if self._handle is not None:
             return True
+        if self._is_dpdk_backend:
+            dpdk_cfg = dict(self.config.extra.get("dpdk", {}) or {})
+            if not dpdk_cfg:
+                dpdk_cfg = {"enable": 1, "queue_id": int(self.config.queue_id or 0)}
+            try:
+                self._handle = _dpdk_open(dpdk_cfg)
+                self._open_error = ""
+                return True
+            except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
+                self._open_error = f"{type(exc).__name__}: {exc}"
+                self._handle = None
+                return False
         if _dp_core is None:
             self._open_error = "dataplane_core_extension_unavailable"
             return False
@@ -153,14 +206,22 @@ class DataplaneSession:
                 fallback_count=1,
             )
         try:
-            raw = _dp_core.send_batch(
-                self._handle,
-                packets_buffer,
-                int(packet_size or 0),
-                int(count),
-                str(target_ip or ""),
-                int(target_port or 0),
-            )
+            if self._is_dpdk_backend:
+                raw = _dpdk_send_batch(
+                    self._handle,
+                    packets_buffer,
+                    int(packet_size or 0),
+                    int(count),
+                )
+            else:
+                raw = _dp_core.send_batch(
+                    self._handle,
+                    packets_buffer,
+                    int(packet_size or 0),
+                    int(count),
+                    str(target_ip or ""),
+                    int(target_port or 0),
+                )
         except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
             return DataplaneResult(
                 attempted=int(count),
@@ -204,7 +265,11 @@ class DataplaneSession:
         )
 
     def snapshot(self) -> Dict[str, Any]:
-        if self._handle is None or _dp_core is None:
+        if self._handle is None:
+            return {}
+        if self._is_dpdk_backend:
+            return _dpdk_snapshot(self._handle)
+        if _dp_core is None:
             return {}
         try:
             snap = _dp_core.snapshot(self._handle)
@@ -213,7 +278,14 @@ class DataplaneSession:
             return {}
 
     def close(self) -> None:
-        if self._handle is None or _dp_core is None:
+        if self._handle is None:
+            self._handle = None
+            return
+        if self._is_dpdk_backend:
+            _dpdk_close(self._handle)
+            self._handle = None
+            return
+        if _dp_core is None:
             self._handle = None
             return
         try:
@@ -276,8 +348,10 @@ def _normalize_afpacket_hugepage_mode(value: str | None) -> str:
 
 
 def build_dataplane_config(args: Dict[str, Any], queue_id: Optional[int] = None) -> DataplaneConfig:
-    backend = str(args.get("sender_backend", "auto") or "auto").strip().lower()
-    fallback_policy = str(args.get("sender_fallback_policy", "allow") or "allow").strip().lower()
+    backend = str(args.get("sender_backend", "xdp") or "xdp").strip().lower()
+    if backend not in {"xdp", "dpdk", "txring", "auto"}:
+        backend = "xdp"
+    fallback_policy = str(args.get("sender_fallback_policy", "fail") or "fail").strip().lower()
     lab_profile = str(args.get("lab_profile", "off") or "off").strip().lower()
     core_mode_raw = args.get("dataplane_core_mode", os.environ.get("SAMURAI_DATAPLANE_CORE_MODE", "off"))
     core_mode = _normalize_core_mode(core_mode_raw)
@@ -326,10 +400,23 @@ def build_dataplane_config(args: Dict[str, Any], queue_id: Optional[int] = None)
     allow_python_fallback = _env_truthy("SAMURAI_DP_ALLOW_PY_FALLBACK", False)
     if core_mode == "required":
         allow_python_fallback = False
+    dpdk_queue_raw = args.get("dpdk_queue_id", os.environ.get("SAMURAI_DPDK_QUEUE_ID", qid))
+    if dpdk_queue_raw is None or str(dpdk_queue_raw).strip() == "":
+        dpdk_queue_raw = qid
     extra = {
         "dp_queues": int(args.get("dp_queues", 1) or 1),
         "dp_queue_map": str(args.get("dp_queue_map", "") or ""),
         "allow_python_fallback": int(1 if allow_python_fallback else 0),
+        "dpdk": {
+            "enable": int(bool(args.get("dpdk_enable", _env_truthy("SAMURAI_DPDK_ENABLE", False)))),
+            "strict": int(bool(args.get("dpdk_strict", _env_truthy("SAMURAI_DPDK_STRICT", False)))),
+            "eal_args": str(args.get("dpdk_eal_args", os.environ.get("SAMURAI_DPDK_EAL_ARGS", "")) or ""),
+            "port_id": int(args.get("dpdk_port_id", os.environ.get("SAMURAI_DPDK_PORT_ID", 0)) or 0),
+            "queue_id": int(dpdk_queue_raw),
+            "burst_size": int(args.get("dpdk_burst_size", os.environ.get("SAMURAI_DPDK_BURST_SIZE", 64)) or 64),
+            "mempool_size": int(args.get("dpdk_mempool_size", os.environ.get("SAMURAI_DPDK_MEMPOOL_SIZE", 8192)) or 8192),
+            "rx_enable": int(bool(args.get("dpdk_rx_enable", _env_truthy("SAMURAI_DPDK_RX_ENABLE", False)))),
+        },
     }
     return DataplaneConfig(
         backend=backend,

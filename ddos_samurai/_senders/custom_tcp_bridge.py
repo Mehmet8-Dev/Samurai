@@ -28,6 +28,9 @@ def merge_bridge_stats(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str,
             "eagain_retry_count",
             "partial_send_retry_count",
             "buffer_reuse_hits",
+            "dpdk_rx_poll_calls",
+            "dpdk_rx_polled",
+            "dpdk_rx_ingested",
         }:
             merged[key] = int(base.get(key, 0) or 0) + int(value or 0)
             continue
@@ -59,6 +62,15 @@ def merge_bridge_stats(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str,
         "custom_tcp_bridge_xdp_queue_id",
         "custom_tcp_bridge_xdp_available",
         "custom_tcp_bridge_xdp_enabled",
+        "custom_tcp_bridge_dpdk_enabled",
+        "custom_tcp_bridge_dpdk_available",
+        "custom_tcp_bridge_dpdk_port_id",
+        "custom_tcp_bridge_dpdk_queue_id",
+        "custom_tcp_bridge_dpdk_burst_size",
+        "custom_tcp_bridge_dpdk_mempool_size",
+        "custom_tcp_bridge_dpdk_rx_enable",
+        "custom_tcp_bridge_dpdk_eal_args",
+        "custom_tcp_bridge_dpdk_strict",
     ):
         if key in extra:
             merged[key] = extra[key]
@@ -152,6 +164,7 @@ def resolve_custom_tcp_flush_transport(
     resolve_custom_tcp_backend_fn,
     xdp_available_flag: bool,
     check_xdp_available_fn,
+    dpdk_preflight_fn=None,
 ) -> Dict[str, Any]:
     backend_requested = resolve_custom_tcp_backend_fn(requested_backend)
     iface = str(xdp_interface or "").strip()
@@ -161,6 +174,15 @@ def resolve_custom_tcp_flush_transport(
     fallback_reason = "none"
     fallback_detail = ""
     hard_fail_required = False
+    dpdk_enabled = 0
+    dpdk_available = 0
+    dpdk_port_id = -1
+    dpdk_queue_id = -1
+    dpdk_burst_size = 64
+    dpdk_mempool_size = 8192
+    dpdk_rx_enable = 0
+    dpdk_eal_args = ""
+    dpdk_strict = 0
 
     if backend_requested == "af_xdp":
         sender_backend = "xdp"
@@ -186,6 +208,29 @@ def resolve_custom_tcp_flush_transport(
             else:
                 fallback_reason = "custom_tcp_xdp_unavailable"
                 fallback_detail = str(detail or "AF_XDP runtime reported unavailable")
+    elif backend_requested == "dpdk":
+        sender_backend = "dpdk"
+        hard_fail_required = True
+        if callable(dpdk_preflight_fn):
+            preflight = dict(dpdk_preflight_fn() or {})
+            dpdk_enabled = int(preflight.get("dpdk_enabled", 0) or 0)
+            dpdk_available = int(preflight.get("dpdk_available", 0) or 0)
+            dpdk_port_raw = preflight.get("dpdk_port_id", -1)
+            dpdk_queue_raw = preflight.get("dpdk_queue_id", -1)
+            dpdk_port_id = int(dpdk_port_raw if dpdk_port_raw is not None else -1)
+            dpdk_queue_id = int(dpdk_queue_raw if dpdk_queue_raw is not None else -1)
+            dpdk_burst_size = int(preflight.get("dpdk_burst_size", 64) or 64)
+            dpdk_mempool_size = int(preflight.get("dpdk_mempool_size", 8192) or 8192)
+            dpdk_rx_enable = int(preflight.get("dpdk_rx_enable", 0) or 0)
+            dpdk_eal_args = str(preflight.get("dpdk_eal_args", "") or "")
+            dpdk_strict = int(preflight.get("dpdk_strict", 0) or 0)
+            ok = int(preflight.get("dpdk_preflight_ok", 0) or 0)
+            if ok != 1:
+                fallback_reason = str(preflight.get("dpdk_preflight_reason", "dpdk_preflight_failed") or "dpdk_preflight_failed")
+                fallback_detail = str(preflight.get("dpdk_preflight_detail", "") or "DPDK preflight failed")
+        else:
+            fallback_reason = "dpdk_preflight_unavailable"
+            fallback_detail = "dpdk preflight callback missing"
 
     return {
         "custom_tcp_bridge_backend_requested": backend_requested,
@@ -198,6 +243,15 @@ def resolve_custom_tcp_flush_transport(
         "custom_tcp_bridge_xdp_queue_id": int(xdp_queue_id or 0),
         "custom_tcp_bridge_xdp_available": int(xdp_available),
         "custom_tcp_bridge_xdp_enabled": int(xdp_enabled),
+        "custom_tcp_bridge_dpdk_enabled": int(dpdk_enabled),
+        "custom_tcp_bridge_dpdk_available": int(dpdk_available),
+        "custom_tcp_bridge_dpdk_port_id": int(dpdk_port_id),
+        "custom_tcp_bridge_dpdk_queue_id": int(dpdk_queue_id),
+        "custom_tcp_bridge_dpdk_burst_size": int(dpdk_burst_size),
+        "custom_tcp_bridge_dpdk_mempool_size": int(dpdk_mempool_size),
+        "custom_tcp_bridge_dpdk_rx_enable": int(dpdk_rx_enable),
+        "custom_tcp_bridge_dpdk_eal_args": str(dpdk_eal_args),
+        "custom_tcp_bridge_dpdk_strict": int(dpdk_strict),
         "custom_tcp_bridge_hard_fail_required": int(hard_fail_required),
         "sender_backend": sender_backend,
         "xdp_enable": bool(xdp_enabled),
@@ -222,6 +276,9 @@ async def flush_custom_tcp_tx_packets(
     resolve_transport_fn,
     paced_raw_socket_sender_fn,
     xdp_sender_fn,
+    dpdk_sender_fn=None,
+    dpdk_rx_poll_fn=None,
+    sender_context: Dict[str, Any] | None = None,
     update_live_fn,
     paced_send_xdp_fn,
     pacing_engine_available: bool,
@@ -271,8 +328,9 @@ async def flush_custom_tcp_tx_packets(
                 "runtime_transport_contract": "custom_tcp_runtime_bridge",
             }
 
-    if str(transport_plan.get("sender_backend", "")) != "xdp":
-        reason = "custom_tcp_zero_copy_requires_xdp_sender_backend"
+    sender_backend = str(transport_plan.get("sender_backend", "") or "")
+    if sender_backend not in {"xdp", "dpdk"}:
+        reason = "custom_tcp_zero_copy_requires_supported_sender_backend"
         detail = f"unsupported sender_backend={transport_plan.get('sender_backend', '')}"
         return {
             "attempted": 0,
@@ -331,23 +389,56 @@ async def flush_custom_tcp_tx_packets(
             **transport_plan,
         }
 
-    send_stats = await xdp_sender_fn(
-        packets_buffer=sx_buf,
-        target_ip=target_ip,
-        target_port=target_port,
-        count=sx_count,
-        verbose=verbose,
-        interface=xdp_interface,
-        queue_id=int(custom_tcp_xdp_queue_id or 0),
-        xdp_mode=int(custom_tcp_xdp_mode or 0),
-        sender_fallback_policy="fail",
-        fallback_backend="c_ext_l3",
-        sender_context=None,
-        pacing_config=pacing_config,
-        paced_send_xdp_fn=paced_send_xdp_fn if pacing_engine_available else None,
-        packet_size_override=sx_pkt_size,
-        packet_stride=sx_stride,
-    )
+    if sender_backend == "xdp":
+        send_stats = await xdp_sender_fn(
+            packets_buffer=sx_buf,
+            target_ip=target_ip,
+            target_port=target_port,
+            count=sx_count,
+            verbose=verbose,
+            interface=xdp_interface,
+            queue_id=int(custom_tcp_xdp_queue_id or 0),
+            xdp_mode=int(custom_tcp_xdp_mode or 0),
+            sender_fallback_policy="fail",
+            fallback_backend="c_ext_l3",
+            sender_context=None,
+            pacing_config=pacing_config,
+            paced_send_xdp_fn=paced_send_xdp_fn if pacing_engine_available else None,
+            packet_size_override=sx_pkt_size,
+            packet_stride=sx_stride,
+        )
+    elif sender_backend == "dpdk" and callable(dpdk_sender_fn):
+        dpdk_config = {
+            "enable": int(transport_plan.get("custom_tcp_bridge_dpdk_enabled", 0) or 0),
+            "strict": int(transport_plan.get("custom_tcp_bridge_dpdk_strict", 0) or 0),
+            "eal_args": str(transport_plan.get("custom_tcp_bridge_dpdk_eal_args", "") or ""),
+            "port_id": int(transport_plan.get("custom_tcp_bridge_dpdk_port_id", 0) or 0),
+            "queue_id": int(transport_plan.get("custom_tcp_bridge_dpdk_queue_id", 0) or 0),
+            "burst_size": int(transport_plan.get("custom_tcp_bridge_dpdk_burst_size", 64) or 64),
+            "mempool_size": int(transport_plan.get("custom_tcp_bridge_dpdk_mempool_size", 8192) or 8192),
+            "rx_enable": int(transport_plan.get("custom_tcp_bridge_dpdk_rx_enable", 0) or 0),
+        }
+        send_stats = await dpdk_sender_fn(
+            packets_buffer=sx_buf,
+            packet_size=int(sx_pkt_size),
+            packet_stride=int(sx_stride),
+            count=int(sx_count),
+            sender_context=sender_context,
+            dpdk_config=dpdk_config,
+        )
+    else:
+        return {
+            "attempted": int(sx_count),
+            "sent": 0,
+            "errors": int(sx_count),
+            "sender_fallback_reason": "custom_tcp_dpdk_sender_unavailable",
+            "custom_tcp_tx_flush_packets": 0,
+            "custom_tcp_tx_flush_bytes": 0,
+            "custom_tcp_bridge_fallback_reason": "custom_tcp_dpdk_sender_unavailable",
+            "custom_tcp_bridge_fallback_detail": "dpdk sender callback is not callable",
+            "custom_tcp_bridge_degraded": 1,
+            **transport_plan,
+        }
     _ = sx_owner
     send_stats = dict(send_stats or {})
     sent = int(send_stats.get("sent", 0) or 0)
@@ -364,6 +455,21 @@ async def flush_custom_tcp_tx_packets(
         update_live_fn(live_errors, max(0, sx_count - sent))
     send_stats["custom_tcp_tx_flush_packets"] = int(consumed)
     send_stats["custom_tcp_tx_flush_bytes"] = int(consumed) * int(sx_pkt_size)
+    if sender_backend == "dpdk" and callable(dpdk_rx_poll_fn):
+        try:
+            rx_stats = dict(
+                dpdk_rx_poll_fn(
+                    sender_context=sender_context,
+                    bridge_api=bridge,
+                    budget=max(1, int(transport_plan.get("custom_tcp_bridge_dpdk_burst_size", 64) or 64)),
+                )
+                or {}
+            )
+            for key, value in rx_stats.items():
+                if isinstance(value, (int, float, str)):
+                    send_stats[key] = value
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+            pass
     for key, value in transport_plan.items():
         if key in {"sender_backend", "xdp_enable"}:
             continue
@@ -385,6 +491,7 @@ async def service_custom_tcp_runtime(
     custom_tcp_xdp_interface: Any = None,
     custom_tcp_xdp_queue_id: Any = 0,
     custom_tcp_xdp_mode: Any = 0,
+    sender_context: Dict[str, Any] | None = None,
     runtime_poll_snapshot_fn,
     flush_fn,
 ) -> Dict[str, Any]:
@@ -414,6 +521,7 @@ async def service_custom_tcp_runtime(
             custom_tcp_xdp_interface=custom_tcp_xdp_interface,
             custom_tcp_xdp_queue_id=custom_tcp_xdp_queue_id,
             custom_tcp_xdp_mode=custom_tcp_xdp_mode,
+            sender_context=sender_context,
         )
         if flushed:
             flushed.setdefault("runtime_transport_service", "native_custom_tcp_runtime_service")
@@ -452,6 +560,7 @@ async def service_custom_tcp_runtime(
             custom_tcp_xdp_interface=custom_tcp_xdp_interface,
             custom_tcp_xdp_queue_id=custom_tcp_xdp_queue_id,
             custom_tcp_xdp_mode=custom_tcp_xdp_mode,
+            sender_context=sender_context,
         )
         if not flushed:
             break

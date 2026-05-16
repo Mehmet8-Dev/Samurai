@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import inspect
 import os
 import time
@@ -66,6 +67,7 @@ def _scenario_step_results_from_plan(
 from ._senders import runtime as _sender_runtime
 from ._senders import stats_core as _sender_stats_core
 from ._senders import custom_tcp_bridge as _custom_tcp_bridge
+from ._senders import dpdk_bridge as _dpdk_bridge
 from ._senders.buffer_norm import _normalize_packets_buffer as _normalize_packets_buffer
 # Public compat re-export: external callers import close_sender_context from facade.
 from ._senders.context import close_sender_context as close_sender_context
@@ -108,7 +110,7 @@ def _resolve_custom_tcp_backend(requested_backend: Any = None) -> str:
         or os.environ.get("SAMURAI_CUSTOM_TCP_BACKEND", "af_xdp")
         or "af_xdp"
     ).strip().lower()
-    if backend not in {"af_xdp"}:
+    if backend not in {"af_xdp", "dpdk"}:
         return "af_xdp"
     return backend
 
@@ -136,7 +138,7 @@ def _resolve_stateful_runtime_backend(requested_backend: Any = None) -> str:
         or os.environ.get("SAMURAI_STATEFUL_RUNTIME_BACKEND", "afxdp")
         or "afxdp"
     ).strip().lower()
-    if backend not in {"afxdp"}:
+    if backend not in {"afxdp", "dpdk"}:
         return "afxdp"
     return backend
 
@@ -152,7 +154,7 @@ def _stateful_runtime_metadata(profile: Any, runtime_cfg: RuntimeConfig) -> Dict
     if runtime_backend == "afxdp":
         hot_path_level = "phase1_hybrid_afxdp"
     elif runtime_backend == "dpdk":
-        hot_path_level = "phase1_stub_dpdk"
+        hot_path_level = "phase1_hybrid_dpdk"
     if transport_backend == "custom_tcp":
         hot_path_level = f"{hot_path_level}_custom_tcp"
     return {
@@ -199,6 +201,8 @@ def _stateful_runtime_preflight_fields(
     transport_plan: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     plan = dict(transport_plan or {})
+    dpdk_port_raw = plan.get("custom_tcp_bridge_dpdk_port_id", -1)
+    dpdk_queue_raw = plan.get("custom_tcp_bridge_dpdk_queue_id", -1)
     return {
         "stateful_runtime_preflight_status": str(status or "skipped"),
         "stateful_runtime_preflight_reason": str(reason or "none"),
@@ -224,6 +228,18 @@ def _stateful_runtime_preflight_fields(
         "stateful_runtime_preflight_xdp_enabled": int(
             plan.get("custom_tcp_bridge_xdp_enabled", 0) or 0
         ),
+        "stateful_runtime_preflight_dpdk_enabled": int(
+            plan.get("custom_tcp_bridge_dpdk_enabled", 0) or 0
+        ),
+        "stateful_runtime_preflight_dpdk_available": int(
+            plan.get("custom_tcp_bridge_dpdk_available", 0) or 0
+        ),
+        "stateful_runtime_preflight_dpdk_port_id": int(
+            dpdk_port_raw if dpdk_port_raw is not None else -1
+        ),
+        "stateful_runtime_preflight_dpdk_queue_id": int(
+            dpdk_queue_raw if dpdk_queue_raw is not None else -1
+        ),
     }
 
 
@@ -233,6 +249,7 @@ def _stateful_runtime_preflight(
     *,
     custom_tcp_backend: Any = None,
     custom_tcp_xdp_interface: Any = None,
+    custom_tcp_xdp_queue_id: Any = 0,
 ) -> Dict[str, Any] | None:
     runtime_backend = _resolve_stateful_runtime_backend(runtime_cfg.stateful_runtime_backend)
     if not bool(runtime_cfg.stateful_runtime_strict):
@@ -248,15 +265,7 @@ def _stateful_runtime_preflight(
             detail=f"runtime backend '{runtime_backend}' requires custom_tcp transport",
         )
 
-    if runtime_backend == "dpdk":
-        return _stateful_runtime_fail_visible_stats(
-            profile,
-            runtime_cfg,
-            reason="not_implemented_hard_fail",
-            detail="stateful_runtime_backend=dpdk strict path is not implemented",
-        )
-
-    if runtime_backend != "afxdp":
+    if runtime_backend not in {"afxdp", "dpdk"}:
         return _stateful_runtime_fail_visible_stats(
             profile,
             runtime_cfg,
@@ -264,32 +273,49 @@ def _stateful_runtime_preflight(
             detail=f"unsupported strict runtime backend '{runtime_backend}'",
         )
 
+    requested_transport_backend = "af_xdp" if runtime_backend == "afxdp" else "dpdk"
+    expected_bridge_backend = "xdp" if runtime_backend == "afxdp" else "dpdk"
     transport_plan = _resolve_custom_tcp_flush_transport(
-        requested_backend=custom_tcp_backend or "af_xdp",
+        requested_backend=custom_tcp_backend or requested_transport_backend,
         xdp_interface=custom_tcp_xdp_interface,
-        xdp_queue_id=0,
+        xdp_queue_id=custom_tcp_xdp_queue_id,
     )
     if (
-        str(transport_plan.get("custom_tcp_bridge_backend_used", "") or "") != "xdp"
+        str(transport_plan.get("custom_tcp_bridge_backend_used", "") or "") != expected_bridge_backend
         or int(transport_plan.get("custom_tcp_bridge_degraded", 0) or 0) == 1
     ):
+        fail_reason = (
+            "stateful_runtime_afxdp_unavailable"
+            if runtime_backend == "afxdp"
+            else "stateful_runtime_dpdk_unavailable"
+        )
+        fail_detail = (
+            "AF_XDP strict runtime preflight failed"
+            if runtime_backend == "afxdp"
+            else "DPDK strict runtime preflight failed"
+        )
         return _stateful_runtime_fail_visible_stats(
             profile,
             runtime_cfg,
             reason=str(
-                transport_plan.get("custom_tcp_bridge_fallback_reason", "stateful_runtime_afxdp_unavailable")
-                or "stateful_runtime_afxdp_unavailable"
+                transport_plan.get("custom_tcp_bridge_fallback_reason", fail_reason)
+                or fail_reason
             ),
             detail=str(
                 transport_plan.get("custom_tcp_bridge_fallback_detail", "")
-                or "AF_XDP strict runtime preflight failed"
+                or fail_detail
             ),
             preflight=transport_plan,
         )
+    passed_detail = (
+        "AF_XDP strict runtime preflight passed"
+        if runtime_backend == "afxdp"
+        else "DPDK strict runtime preflight passed"
+    )
     return _stateful_runtime_preflight_fields(
         status="passed",
         reason="none",
-        detail="AF_XDP strict runtime preflight passed",
+        detail=passed_detail,
         transport_plan=transport_plan,
     )
 
@@ -396,6 +422,57 @@ def _extract_strided_peek_batch(value: Any) -> tuple[Any, Any, int, int, int, in
     return _custom_tcp_bridge.extract_strided_peek_batch(value)
 
 
+def _dpdk_transport_preflight(queue_id: Any = 0) -> Dict[str, Any]:
+    enabled = str(os.environ.get("SAMURAI_DPDK_ENABLE", "0") or "0").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    strict = str(os.environ.get("SAMURAI_DPDK_STRICT", "0") or "0").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    out: Dict[str, Any] = {
+        "dpdk_enabled": int(enabled),
+        "dpdk_eal_args": str(os.environ.get("SAMURAI_DPDK_EAL_ARGS", "") or ""),
+        "dpdk_port_id": int(os.environ.get("SAMURAI_DPDK_PORT_ID", "0") or 0),
+        "dpdk_queue_id": int(queue_id if queue_id is not None else (os.environ.get("SAMURAI_DPDK_QUEUE_ID", "0") or 0)),
+        "dpdk_burst_size": int(os.environ.get("SAMURAI_DPDK_BURST_SIZE", "64") or 64),
+        "dpdk_mempool_size": int(os.environ.get("SAMURAI_DPDK_MEMPOOL_SIZE", "8192") or 8192),
+        "dpdk_rx_enable": int(
+            str(os.environ.get("SAMURAI_DPDK_RX_ENABLE", "0") or "0").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        ),
+        "dpdk_strict": int(strict),
+        "dpdk_preflight_ok": 0,
+        "dpdk_preflight_reason": "none",
+        "dpdk_preflight_detail": "",
+    }
+    if not enabled:
+        out["dpdk_preflight_reason"] = "dpdk_not_enabled"
+        out["dpdk_preflight_detail"] = "set SAMURAI_DPDK_ENABLE=1"
+        return out
+    try:
+        mod = importlib.import_module("ddos_samurai.dpdk_pmd_core")
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
+        out["dpdk_preflight_reason"] = "dpdk_module_unavailable"
+        out["dpdk_preflight_detail"] = f"{type(exc).__name__}:{exc}"
+        out["dpdk_available"] = 0
+        return out
+    probe = getattr(mod, "dpdk_available", None)
+    if not callable(probe):
+        out["dpdk_preflight_reason"] = "dpdk_available_missing"
+        out["dpdk_preflight_detail"] = "dpdk_available() missing"
+        out["dpdk_available"] = 0
+        return out
+    try:
+        available = dict(probe() or {})
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
+        out["dpdk_preflight_reason"] = "dpdk_probe_failed"
+        out["dpdk_preflight_detail"] = f"{type(exc).__name__}:{exc}"
+        out["dpdk_available"] = 0
+        return out
+    out["dpdk_available"] = int(available.get("available", 0) or 0)
+    if int(out["dpdk_available"] or 0) != 1:
+        out["dpdk_preflight_reason"] = "dpdk_module_unavailable"
+        out["dpdk_preflight_detail"] = str(available.get("error", "dpdk unavailable") or "dpdk unavailable")
+        return out
+    out["dpdk_preflight_ok"] = 1
+    return out
+
+
 def _resolve_custom_tcp_flush_transport(
     *,
     requested_backend: Any = None,
@@ -409,6 +486,8 @@ def _resolve_custom_tcp_flush_transport(
         resolve_custom_tcp_backend_fn=_resolve_custom_tcp_backend,
         xdp_available_flag=bool(XDP_AVAILABLE),
         check_xdp_available_fn=check_xdp_available,
+        # DPDK queue selection must follow DPDK config/env, not XDP queue id.
+        dpdk_preflight_fn=lambda: _dpdk_transport_preflight(None),
     )
 
 
@@ -426,6 +505,7 @@ async def _flush_custom_tcp_tx_packets(
     custom_tcp_xdp_queue_id: Any = 0,
     custom_tcp_xdp_mode: Any = 0,
     custom_tcp_bridge_strict: bool = True,
+    sender_context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     return await _custom_tcp_bridge.flush_custom_tcp_tx_packets(
         profile=profile,
@@ -444,6 +524,9 @@ async def _flush_custom_tcp_tx_packets(
         resolve_transport_fn=_resolve_custom_tcp_flush_transport,
         paced_raw_socket_sender_fn=paced_raw_socket_sender,
         xdp_sender_fn=xdp_sender,
+        dpdk_sender_fn=_dpdk_bridge.send_strided_batch,
+        dpdk_rx_poll_fn=_dpdk_bridge.poll_rx_and_ingest,
+        sender_context=sender_context,
         update_live_fn=_update_live,
         paced_send_xdp_fn=paced_send_xdp,
         pacing_engine_available=bool(PACING_ENGINE_AVAILABLE),
@@ -463,6 +546,7 @@ async def _service_custom_tcp_runtime(
     custom_tcp_xdp_interface: Any = None,
     custom_tcp_xdp_queue_id: Any = 0,
     custom_tcp_xdp_mode: Any = 0,
+    sender_context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     return await _custom_tcp_bridge.service_custom_tcp_runtime(
         stop_event,
@@ -477,6 +561,7 @@ async def _service_custom_tcp_runtime(
         custom_tcp_xdp_interface=custom_tcp_xdp_interface,
         custom_tcp_xdp_queue_id=custom_tcp_xdp_queue_id,
         custom_tcp_xdp_mode=custom_tcp_xdp_mode,
+        sender_context=sender_context,
         runtime_poll_snapshot_fn=_custom_tcp_runtime_poll_snapshot,
         flush_fn=_flush_custom_tcp_tx_packets,
     )
@@ -509,6 +594,7 @@ async def run_l7_profile_public(profile, **kwargs):
         runtime_cfg,
         custom_tcp_backend=kwargs.get("custom_tcp_backend"),
         custom_tcp_xdp_interface=kwargs.get("custom_tcp_xdp_interface"),
+        custom_tcp_xdp_queue_id=kwargs.get("custom_tcp_xdp_queue_id", 0),
     )
     if preflight is not None and str(preflight.get("stateful_runtime_preflight_status", "")) == "failed":
         session.close()
@@ -542,6 +628,7 @@ async def run_l7_profile_public(profile, **kwargs):
     if rx_iface:
         os.environ["SAMURAI_CUSTOM_TCP_RX_IFACE"] = rx_iface
     os.environ["SAMURAI_CUSTOM_TCP_BACKEND"] = custom_tcp_backend
+    bridge_sender_context: Dict[str, Any] = {}
     stop_event = asyncio.Event()
     bridge_task = asyncio.create_task(
         _service_custom_tcp_runtime(
@@ -556,6 +643,7 @@ async def run_l7_profile_public(profile, **kwargs):
             custom_tcp_xdp_interface=kwargs.get("custom_tcp_xdp_interface"),
             custom_tcp_xdp_queue_id=kwargs.get("custom_tcp_xdp_queue_id", 0),
             custom_tcp_xdp_mode=kwargs.get("custom_tcp_xdp_mode", 0),
+            sender_context=bridge_sender_context,
         )
     )
     result = None
@@ -567,6 +655,7 @@ async def run_l7_profile_public(profile, **kwargs):
         try:
             bridge_stats = await bridge_task
         finally:
+            _dpdk_bridge.close_sender_context(bridge_sender_context)
             if previous_custom_tcp_backend is None:
                 os.environ.pop("SAMURAI_CUSTOM_TCP_BACKEND", None)
             else:
