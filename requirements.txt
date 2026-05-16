@@ -4,6 +4,11 @@ aiohttp
 websockets
 httpx[http2]
 
+# Optional system dependency tree (not pip-installable):
+# - DPDK backend requires OS-level packages such as:
+#   libdpdk-dev, pkg-config, build-essential/gcc/g++
+# - Runtime also requires hugepages + DPDK-capable NIC/driver binding
+
 # Web Automation & WAF Bypass
 playwright
 requests

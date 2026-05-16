@@ -23,5 +23,10 @@ playwright
 rich
 pytest
 
+# Optional system dependency tree (not pip-installable):
+# - DPDK backend requires OS-level packages such as:
+#   libdpdk-dev, pkg-config, build-essential/gcc/g++
+# - Runtime also requires hugepages + DPDK-capable NIC/driver binding
+
 # ML planner dependencies are optional and intentionally not listed here.
 # Use project-level extras: `pip install ".[ml]"`.

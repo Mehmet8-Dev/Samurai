@@ -43,6 +43,36 @@ pip install cupy-cuda12x numba-cuda[cu13]
 python setup.py build_ext --inplace
 ```
 
+### 4) Opsiyonel DPDK (system dependency tree)
+
+DPDK backend (`ddos_samurai.dpdk_pmd_core`) Python paketi ile degil, sistem kutuphaneleri ile derlenir.
+
+- System paketleri:
+  - `libdpdk-dev` (veya dagitimdaki esdegeri)
+  - `pkg-config`
+  - `build-essential` / `gcc` / `g++`
+- Runtime gereksinimleri:
+  - hugepage konfigurasyonu
+  - DPDK-uyumlu NIC + uygun driver binding (`vfio-pci` / uygun PMD)
+
+Ornek derleme:
+
+```bash
+SAMURAI_WITH_DPDK=1 python setup.py build_ext --inplace
+```
+
+Gerekirse strict build:
+
+```bash
+SAMURAI_WITH_DPDK=1 SAMURAI_REQUIRE_DPDK_BUILD=1 python setup.py build_ext --inplace
+```
+
+Hazirlik kontrolu (tek komut):
+
+```bash
+bash tools/check_dpdk_env.sh
+```
+
 ## Çalıştırma
 
 ### Self-test (trafik göndermez)

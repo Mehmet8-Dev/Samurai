@@ -256,6 +256,13 @@ class OptionalBuildExt(build_ext):
                     raise
                 print(f"\nWarning: Could not build {ext.name}: {exc}")
                 print("XDP functionality will not be available.\n")
+            elif "dpdk_pmd_core" in ext.name:
+                strict_raw = os.environ.get("SAMURAI_REQUIRE_DPDK_BUILD")
+                strict_dpdk = str(strict_raw or "0").strip().lower() in {"1", "true", "yes", "on"}
+                if strict_dpdk:
+                    raise
+                print(f"\nWarning: Could not build {ext.name}: {exc}")
+                print("DPDK PMD functionality will not be available.\n")
             else:
                 raise
 
@@ -832,6 +839,29 @@ def get_extensions() -> List[Extension]:
         extra_link_args=["-lpthread", "-lm"],
     )
     extensions.append(dataplane_core)
+
+    with_dpdk = _env_flag("SAMURAI_WITH_DPDK", "0")
+    require_dpdk_build = _env_flag("SAMURAI_REQUIRE_DPDK_BUILD", "0")
+    if with_dpdk:
+        dpdk_pkg = _pkg_config_first(["libdpdk", "dpdk"])
+        if dpdk_pkg:
+            dpdk_cflags = _pkg_config_tokens("--cflags", [dpdk_pkg])
+            dpdk_libs = _pkg_config_tokens("--libs", [dpdk_pkg])
+            dpdk_compile_args = ["-O2", "-Wall", "-fPIC", "-std=c++17"] + dpdk_cflags
+            dpdk_link_args = ["-lpthread", "-lm"] + dpdk_libs
+            dpdk_pmd_core = Extension(
+                "ddos_samurai.dpdk_pmd_core",
+                sources=["ddos_samurai/dpdk/dpdk_pmd_core.cpp"],
+                language="c++",
+                extra_compile_args=dpdk_compile_args,
+                extra_link_args=dpdk_link_args,
+            )
+            extensions.append(dpdk_pmd_core)
+        else:
+            msg = "SAMURAI_WITH_DPDK=1 set but pkg-config could not find libdpdk."
+            if require_dpdk_build:
+                raise RuntimeError(msg)
+            print(f"Warning: {msg} Skipping ddos_samurai.dpdk_pmd_core build.")
 
     if platform.system() == "Linux":
         xdp_compile_args = ["-O2", "-Wall", "-Wextra"]
