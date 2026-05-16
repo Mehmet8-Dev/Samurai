@@ -814,11 +814,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evasion-techniques", type=str, nargs='+', choices=['case', 'url', 'comment'], help="DEPRECATED (no-op): kaldırılacak")
     parser.add_argument("--compute-backend", type=str, default="cpu", choices=["cpu", "cuda"], help="Paket oluşturma için kullanılacak işlem birimi (cpu veya cuda)")
     parser.add_argument("--stateful", action="store_true", help="Enable Stateful TCP Engine (Viper-State) for full 3-way handshake.")
+    _sender_backend_env = str(os.environ.get("SAMURAI_SENDER_BACKEND", "xdp") or "xdp").strip().lower()
+    if _sender_backend_env not in {"xdp", "dpdk"}:
+        _sender_backend_env = "xdp"
     parser.add_argument(
         "--sender-backend",
-        choices=["xdp"],
-        default="xdp",
-        help="Raw sender backend seçimi: xdp (zorunlu).",
+        choices=["xdp", "dpdk"],
+        default=_sender_backend_env,
+        help="Raw sender backend seçimi: xdp|dpdk.",
     )
     parser.add_argument(
         "--sender-fallback-policy",
@@ -829,13 +832,13 @@ def build_parser() -> argparse.ArgumentParser:
     _stateful_runtime_backend_env = str(
         os.environ.get("SAMURAI_STATEFUL_RUNTIME_BACKEND", "afxdp") or "afxdp"
     ).strip().lower()
-    if _stateful_runtime_backend_env not in {"afxdp"}:
+    if _stateful_runtime_backend_env not in {"afxdp", "dpdk"}:
         _stateful_runtime_backend_env = "afxdp"
     parser.add_argument(
         "--stateful-runtime-backend",
-        choices=["afxdp"],
+        choices=["afxdp", "dpdk"],
         default=_stateful_runtime_backend_env,
-        help="Yeni stateful runtime backend seçimi: afxdp (zorunlu).",
+        help="Yeni stateful runtime backend seçimi: afxdp|dpdk.",
     )
     _dp_mode_env_default = _normalize_dataplane_core_mode(
         os.environ.get(
@@ -1076,9 +1079,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--custom-tcp-backend",
-        choices=["af_xdp"],
+        choices=["af_xdp", "dpdk"],
         default=str(os.environ.get("SAMURAI_CUSTOM_TCP_BACKEND", "af_xdp") or "af_xdp"),
-        help="Custom TCP dataplane backend hedefi: af_xdp (zorunlu).",
+        help="Custom TCP dataplane backend hedefi: af_xdp|dpdk.",
+    )
+    parser.add_argument(
+        "--dpdk-enable",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("SAMURAI_DPDK_ENABLE", "0"),
+        help="DPDK backend kullanımını etkinleştir (SAMURAI_DPDK_ENABLE).",
+    )
+    parser.add_argument(
+        "--dpdk-eal-args",
+        type=str,
+        default=str(os.environ.get("SAMURAI_DPDK_EAL_ARGS", "") or ""),
+        help="DPDK EAL argümanları (örn: '--log-level=eal,8').",
+    )
+    parser.add_argument(
+        "--dpdk-port-id",
+        type=int,
+        default=_env_int("SAMURAI_DPDK_PORT_ID", 0),
+        help="DPDK port id.",
+    )
+    parser.add_argument(
+        "--dpdk-queue-id",
+        type=int,
+        default=_env_int("SAMURAI_DPDK_QUEUE_ID", 0),
+        help="DPDK queue id.",
+    )
+    parser.add_argument(
+        "--dpdk-burst-size",
+        type=int,
+        default=_env_int("SAMURAI_DPDK_BURST_SIZE", 64),
+        help="DPDK burst boyutu.",
+    )
+    parser.add_argument(
+        "--dpdk-mempool-size",
+        type=int,
+        default=_env_int("SAMURAI_DPDK_MEMPOOL_SIZE", 8192),
+        help="DPDK mempool boyutu.",
+    )
+    parser.add_argument(
+        "--dpdk-rx-enable",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("SAMURAI_DPDK_RX_ENABLE", "0"),
+        help="DPDK RX polling yolunu etkinleştir.",
+    )
+    parser.add_argument(
+        "--dpdk-strict",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("SAMURAI_DPDK_STRICT", "0"),
+        help="DPDK preflight/build/runtime hatalarını hard-fail yap.",
     )
     parser.add_argument(
         "--custom-tcp-initial-rto-ms",

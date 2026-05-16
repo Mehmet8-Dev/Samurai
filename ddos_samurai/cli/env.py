@@ -122,6 +122,14 @@ def sync_runtime_env(args) -> dict[str, object]:
     os.environ["SAMURAI_XDP_BPF_SECTION"] = str(getattr(args, "xdp_bpf_section", "xdp_sock") or "xdp_sock")
     os.environ["SAMURAI_XDP_BPF_OBJ"] = str(getattr(args, "xdp_bpf_obj", "") or "")
     os.environ["SAMURAI_XDP_XSKMAP_PIN"] = str(getattr(args, "xdp_xskmap_pin", "") or "")
+    os.environ["SAMURAI_DPDK_ENABLE"] = "1" if bool(getattr(args, "dpdk_enable", False)) else "0"
+    os.environ["SAMURAI_DPDK_EAL_ARGS"] = str(getattr(args, "dpdk_eal_args", "") or "")
+    os.environ["SAMURAI_DPDK_PORT_ID"] = str(int(getattr(args, "dpdk_port_id", 0) or 0))
+    os.environ["SAMURAI_DPDK_QUEUE_ID"] = str(int(getattr(args, "dpdk_queue_id", 0) or 0))
+    os.environ["SAMURAI_DPDK_BURST_SIZE"] = str(int(getattr(args, "dpdk_burst_size", 64) or 64))
+    os.environ["SAMURAI_DPDK_MEMPOOL_SIZE"] = str(int(getattr(args, "dpdk_mempool_size", 8192) or 8192))
+    os.environ["SAMURAI_DPDK_RX_ENABLE"] = "1" if bool(getattr(args, "dpdk_rx_enable", False)) else "0"
+    os.environ["SAMURAI_DPDK_STRICT"] = "1" if bool(getattr(args, "dpdk_strict", False)) else "0"
 
     os.environ["SAMURAI_KPI_GATE_PROFILE"] = str(getattr(args, "kpi_gate_profile", "off") or "off")
     os.environ["SAMURAI_KPI_HARD_FAIL"] = "1" if bool(getattr(args, "kpi_hard_fail", False)) else "0"
@@ -138,7 +146,10 @@ def sync_runtime_env(args) -> dict[str, object]:
         stateful_runtime_backend = "afxdp"
     os.environ["SAMURAI_STATEFUL_RUNTIME_BACKEND"] = stateful_runtime_backend
     os.environ["SAMURAI_CUSTOM_TCP_MODE"] = str(getattr(args, "custom_tcp_mode", "off") or "off")
-    os.environ["SAMURAI_CUSTOM_TCP_BACKEND"] = str(getattr(args, "custom_tcp_backend", "af_xdp") or "af_xdp")
+    custom_tcp_backend = str(getattr(args, "custom_tcp_backend", "af_xdp") or "af_xdp").strip().lower()
+    if custom_tcp_backend not in {"af_xdp", "dpdk"}:
+        custom_tcp_backend = "af_xdp"
+    os.environ["SAMURAI_CUSTOM_TCP_BACKEND"] = custom_tcp_backend
 
     return {
         "loss_report_out": loss_report_out,

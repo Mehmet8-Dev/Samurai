@@ -1,10 +1,12 @@
 """CLI validation and preflight checks."""
 
 import argparse
+import importlib
 import json
 import multiprocessing
 import os
 import re
+from typing import Any, Dict
 
 from .. import utils
 from ..profile_names import PROFILE_NONE
@@ -426,6 +428,57 @@ def _validate_hybrid_cuda_args(parser: argparse.ArgumentParser, args: argparse.N
         parser.error("Hata: --gpu-rng-seed 0..4294967295 aralığında olmalıdır.")
 
 
+def _validate_dpdk_requirements(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    *,
+    reason_prefix: str = "",
+) -> None:
+    if int(getattr(args, "dpdk_port_id", 0) or 0) < 0:
+        parser.error("Hata: --dpdk-port-id >= 0 olmalıdır.")
+    if int(getattr(args, "dpdk_queue_id", 0) or 0) < 0:
+        parser.error("Hata: --dpdk-queue-id >= 0 olmalıdır.")
+    if int(getattr(args, "dpdk_burst_size", 64) or 0) <= 0:
+        parser.error("Hata: --dpdk-burst-size >= 1 olmalıdır.")
+    if int(getattr(args, "dpdk_mempool_size", 8192) or 0) < 128:
+        parser.error("Hata: --dpdk-mempool-size >= 128 olmalıdır.")
+    if not bool(getattr(args, "dpdk_enable", False)):
+        parser.error(
+            f"Hata: {reason_prefix}DPDK backend seçildiğinde --dpdk-enable (veya SAMURAI_DPDK_ENABLE=1) zorunludur."
+        )
+    preflight: Dict[str, Any] = {
+        "dpdk_preflight_ok": 0,
+        "dpdk_preflight_reason": "none",
+        "dpdk_preflight_detail": "",
+    }
+    try:
+        mod = importlib.import_module("ddos_samurai.dpdk_pmd_core")
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
+        preflight["dpdk_preflight_reason"] = "dpdk_module_unavailable"
+        preflight["dpdk_preflight_detail"] = f"{type(exc).__name__}:{exc}"
+    else:
+        probe = getattr(mod, "dpdk_available", None)
+        if not callable(probe):
+            preflight["dpdk_preflight_reason"] = "dpdk_available_missing"
+            preflight["dpdk_preflight_detail"] = "dpdk_available() missing"
+        else:
+            try:
+                available = dict(probe() or {})
+                if int(available.get("available", 0) or 0) == 1:
+                    preflight["dpdk_preflight_ok"] = 1
+                else:
+                    preflight["dpdk_preflight_reason"] = "dpdk_module_unavailable"
+                    preflight["dpdk_preflight_detail"] = str(available.get("error", "dpdk unavailable") or "dpdk unavailable")
+            except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
+                preflight["dpdk_preflight_reason"] = "dpdk_probe_failed"
+                preflight["dpdk_preflight_detail"] = f"{type(exc).__name__}:{exc}"
+    strict = bool(getattr(args, "dpdk_strict", False)) or bool(getattr(args, "l7_capability_strict", False))
+    if strict and int(preflight.get("dpdk_preflight_ok", 0) or 0) != 1:
+        reason = str(preflight.get("dpdk_preflight_reason", "dpdk_preflight_failed") or "dpdk_preflight_failed")
+        detail = str(preflight.get("dpdk_preflight_detail", "") or "")
+        parser.error(f"Hata: DPDK preflight başarısız ({reason}) {detail}".strip())
+
+
 def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     sender_backend = str(getattr(args, "sender_backend", "xdp") or "xdp").strip().lower()
     fallback_policy = str(getattr(args, "sender_fallback_policy", "fail") or "fail").strip().lower()
@@ -450,6 +503,7 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
     scenario_file = str(getattr(args, "scenario_file", "") or "").strip()
     l7_template_mode = str(getattr(args, "l7_template_mode", "compat") or "compat").strip().lower()
     runtime_backend = str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower()
+    custom_tcp_backend = str(getattr(args, "custom_tcp_backend", "af_xdp") or "af_xdp").strip().lower()
     topo_spec_json = str(getattr(args, "topo_spec_json", "") or "").strip()
     topo_seed = int(getattr(args, "topo_seed", -1) or -1)
     topo_strict = bool(getattr(args, "topo_strict", True))
@@ -506,15 +560,24 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: --quic-expect-header-value-contains en fazla 159 karakter olmalıdır.")
     if len(str(getattr(args, "quic_expect_body_substring", "") or "")) > 159:
         parser.error("Hata: --quic-expect-body-substring en fazla 159 karakter olmalıdır.")
-    if sender_backend != "xdp":
-        parser.error("Hata: kernel/legacy sender backend kaldırıldı; yalnızca --sender-backend xdp desteklenir.")
+    if sender_backend not in {"xdp", "dpdk"}:
+        parser.error("Hata: --sender-backend yalnızca xdp veya dpdk olabilir.")
     if fallback_policy != "fail":
         parser.error("Hata: fallback kaldırıldı; yalnızca --sender-fallback-policy fail desteklenir.")
-    if runtime_backend != "afxdp":
-        parser.error("Hata: stateful runtime yalnızca afxdp desteklenir.")
+    if runtime_backend not in {"afxdp", "dpdk"}:
+        parser.error("Hata: --stateful-runtime-backend yalnızca afxdp veya dpdk olabilir.")
+    if custom_tcp_backend not in {"af_xdp", "dpdk"}:
+        parser.error("Hata: --custom-tcp-backend yalnızca af_xdp veya dpdk olabilir.")
+    dpdk_selected = (
+        sender_backend == "dpdk"
+        or runtime_backend == "dpdk"
+        or custom_tcp_backend == "dpdk"
+    )
+    if dpdk_selected:
+        _validate_dpdk_requirements(parser, args)
     if xdp_enable and not xdp_interface:
         parser.error("Hata: XDP yolu için --xdp-interface zorunludur.")
-    if (xdp_enable or sender_backend == "xdp") and xdp_attach_bpf and not xdp_bpf_section:
+    if (xdp_enable or sender_backend == "xdp" or runtime_backend == "afxdp" or custom_tcp_backend == "af_xdp") and xdp_attach_bpf and not xdp_bpf_section:
         parser.error("Hata: --xdp-attach-bpf açıkken --xdp-bpf-section boş olamaz.")
     if dataplane_core_mode == "required" and fallback_policy != "fail":
         parser.error("Hata: --dataplane-core-mode required için --sender-fallback-policy fail zorunludur.")
@@ -601,8 +664,8 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         if l7_quic_bridge_autopromote:
             parser.error("Hata: --l7-quic-require-native ile --l7-quic-bridge-autopromote birlikte kullanılamaz.")
     if lab_profile == "dedicated":
-        if sender_backend != "xdp":
-            parser.error("Hata: --lab-profile dedicated için yalnızca --sender-backend xdp desteklenir.")
+        if sender_backend not in {"xdp", "dpdk"}:
+            parser.error("Hata: --lab-profile dedicated için --sender-backend xdp|dpdk olmalıdır.")
         if fallback_policy != "fail":
             parser.error("Hata: --lab-profile dedicated için --sender-fallback-policy fail zorunludur.")
         if int(getattr(args, "dp_queues", 1) or 1) < 1:
@@ -680,17 +743,9 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
     if not bool(getattr(args, "l7_capability_strict", False)):
         args.l7_capability_strict = True
         utils.log_info("lab-profile=dedicated için --l7-capability-strict otomatik etkinleştirildi.")
-    if str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower() != "afxdp":
-        args.stateful_runtime_backend = "afxdp"
-        utils.log_info(
-            "lab-profile=dedicated için --stateful-runtime-backend otomatik afxdp olarak ayarlandı."
-        )
     if str(getattr(args, "custom_tcp_mode", "off") or "off").strip().lower() != "required":
         args.custom_tcp_mode = "required"
         utils.log_info("lab-profile=dedicated için --custom-tcp-mode otomatik required olarak ayarlandı.")
-    if str(getattr(args, "custom_tcp_backend", "af_xdp") or "af_xdp").strip().lower() != "af_xdp":
-        args.custom_tcp_backend = "af_xdp"
-        utils.log_info("lab-profile=dedicated için --custom-tcp-backend otomatik af_xdp olarak ayarlandı.")
     if (
         str(getattr(args, "attack_vector", "basic") or "basic").strip().lower() == "quic"
         and not bool(getattr(args, "l7_quic_require_native", False))
@@ -710,8 +765,17 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
             utils.log_info("native QUIC zorunluluğu için SAMURAI_QUIC_BUILD_MODE=native_required ayarlandı.")
 
     sender_backend = str(getattr(args, "sender_backend", "xdp") or "xdp").strip().lower()
-    if sender_backend != "xdp":
-        parser.error("Hata: dedicated profilde yalnızca xdp backend desteklenir.")
+    runtime_backend = str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower()
+    custom_tcp_backend = str(getattr(args, "custom_tcp_backend", "af_xdp") or "af_xdp").strip().lower()
+    dpdk_selected = (
+        sender_backend == "dpdk"
+        or runtime_backend == "dpdk"
+        or custom_tcp_backend == "dpdk"
+    )
+    if sender_backend not in {"xdp", "dpdk"}:
+        parser.error("Hata: dedicated profilde sender backend xdp veya dpdk olmalıdır.")
+    if dpdk_selected:
+        _validate_dpdk_requirements(parser, args, reason_prefix="dedicated profile: ")
 
     workers = int(getattr(args, "workers", multiprocessing.cpu_count()) or 0)
     dp_queues = int(getattr(args, "dp_queues", 1) or 1)
@@ -723,26 +787,28 @@ def _preflight_lab_profile(parser: argparse.ArgumentParser, args: argparse.Names
         if len(used) != len(set(used)):
             parser.error("Hata: dedicated + map stratejisinde queue çakışmaları yasak (her worker tekil queue).")
 
-    iface = str(getattr(args, "xdp_interface", "") or "").strip()
-    if not iface:
-        iface = str(getattr(args, "loss_iface", "") or "").strip()
-    if not iface:
-        parser.error("Hata: --lab-profile dedicated için --xdp-interface (veya --loss-iface) zorunludur.")
-    try:
-        from ..af_xdp_sender import get_interface_queue_count
+    needs_xdp_iface = sender_backend == "xdp" or runtime_backend == "afxdp" or custom_tcp_backend == "af_xdp"
+    if needs_xdp_iface:
+        iface = str(getattr(args, "xdp_interface", "") or "").strip()
+        if not iface:
+            iface = str(getattr(args, "loss_iface", "") or "").strip()
+        if not iface:
+            parser.error("Hata: --lab-profile dedicated için --xdp-interface (veya --loss-iface) zorunludur.")
+        try:
+            from ..af_xdp_sender import get_interface_queue_count
 
-        nic_tx_queues = int(get_interface_queue_count(iface) or 1)
-    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
-        nic_tx_queues = 1
-    if dp_queues > nic_tx_queues:
-        parser.error(
-            f"Hata: --dp-queues ({dp_queues}) interface {iface} TX queue sayısından ({nic_tx_queues}) büyük olamaz."
-        )
-    for wid, qid in qmap.items():
-        if qid >= nic_tx_queues:
+            nic_tx_queues = int(get_interface_queue_count(iface) or 1)
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+            nic_tx_queues = 1
+        if dp_queues > nic_tx_queues:
             parser.error(
-                f"Hata: worker {wid} queue_id {qid}, interface {iface} TX queue sınırını ({nic_tx_queues - 1}) aşıyor."
+                f"Hata: --dp-queues ({dp_queues}) interface {iface} TX queue sayısından ({nic_tx_queues}) büyük olamaz."
             )
+        for wid, qid in qmap.items():
+            if qid >= nic_tx_queues:
+                parser.error(
+                    f"Hata: worker {wid} queue_id {qid}, interface {iface} TX queue sınırını ({nic_tx_queues - 1}) aşıyor."
+                )
 
 
 def _preflight_persistent_tx_backend(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -813,13 +879,16 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
         parser.error("Hata: L7 capability strict yalnızca HTTP/1.1 ve HTTP/2 için kullanılabilir.")
 
     runtime_backend = str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower()
-    if runtime_backend != "afxdp":
-        parser.error("Hata: --stateful-runtime-backend yalnızca afxdp olabilir.")
-    xdp_iface = str(getattr(args, "xdp_interface", "") or "").strip()
-    if not xdp_iface:
-        parser.error(
-            "Hata: stateful-runtime-backend=afxdp + l7-capability-strict için --xdp-interface zorunludur."
-        )
+    if runtime_backend not in {"afxdp", "dpdk"}:
+        parser.error("Hata: --stateful-runtime-backend yalnızca afxdp veya dpdk olabilir.")
+    if runtime_backend == "afxdp":
+        xdp_iface = str(getattr(args, "xdp_interface", "") or "").strip()
+        if not xdp_iface:
+            parser.error(
+                "Hata: stateful-runtime-backend=afxdp + l7-capability-strict için --xdp-interface zorunludur."
+            )
+    else:
+        _validate_dpdk_requirements(parser, args, reason_prefix="l7-capability-strict: ")
     if attack_vector == "http":
         custom_tcp_mode = str(getattr(args, "custom_tcp_mode", "off") or "off").strip().lower()
         if custom_tcp_mode not in {"auto", "required"}:

@@ -364,6 +364,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
         worker_queue_id = int(worker_queue_map.get(worker_id, getattr(args, "xdp_queue_id", 0)) or 0)
         worker_args.dp_queue_id = worker_queue_id
         worker_args.xdp_queue_id = worker_queue_id
+        worker_args.dpdk_queue_id = worker_queue_id
         worker_args.dp_worker_queue_map = json.dumps(worker_queue_map, sort_keys=True)
         worker_args.traffic_model = str(getattr(args, "traffic_model", "none") or "none")
         worker_args.traffic_model_sessions = list(traffic_model_sessions_by_worker[i] or [])
