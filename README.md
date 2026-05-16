@@ -13,6 +13,7 @@ Samurai, **yalnızca yetkili/lab ortamlarında** kullanılmak üzere geliştiril
 - Tek giriş noktası: `python -m ddos_samurai.cli`
 - Katı lisans geçidi: canlı çalıştırma öncesi lisans doğrulaması zorunlu
 - L3/L4/L7 test yolları
+- Savunma odaklı VAE anomaly katmanı (60s pencere, 8 feature, JSONL event çıkışı)
 - `cpu` + opsiyonel `cuda` üretim yolu
 - Sender backend: **zorunlu `xdp`**, fallback policy: **zorunlu `fail`**
 - Stateful runtime backend: **zorunlu `afxdp`**
@@ -73,6 +74,12 @@ Hazirlik kontrolu (tek komut):
 bash tools/check_dpdk_env.sh
 ```
 
+### 5) Opsiyonel ML/VAE bağımlılıkları
+
+```bash
+pip install -r requirements-ml.txt
+```
+
 ## Çalıştırma
 
 ### Self-test (trafik göndermez)
@@ -120,6 +127,32 @@ Detaylar:
 - [Scenario Engine Dokümantasyonu](docs/28-scenario-engine-web-mobile-persona.md)
 - [Scenario Örnek Dosyası](docs/scenario_web_mobile.yaml)
 
+## VAE Defense Katmanı
+
+Canlı çalışma sırasında VAE analizi açmak için:
+
+```bash
+python -m ddos_samurai.cli \
+  --target 127.0.0.1 --port 8080 \
+  --protocol tcp --attack-vector basic \
+  --count 200000 --workers 4 --confirm \
+  --vae-enable
+```
+
+Sıfırdan model eğitimi:
+
+```bash
+python -m ddos_samurai.models.vae.train \
+  --input-glob "data/vae/*.csv" \
+  --label-col Label \
+  --normal-label BENIGN \
+  --model-version vae-loadtest-v1
+```
+
+Varsayılan artifact dizini:
+
+- `ddos_samurai/models/vae/artifacts/<model_version>/`
+
 ## Temel Mimari
 
 - CLI paketi: `ddos_samurai/cli/`
@@ -146,6 +179,7 @@ pytest tests -q -rs
 
 - [Dokümantasyon İndeksi](docs/README.md)
 - [Scenario Engine (Web/Mobile Persona)](docs/28-scenario-engine-web-mobile-persona.md)
+- [VAE Defense Integration (Mimari + Kullanim)](docs/35-vae-defense-integration.md)
 - [L7 Native Custom QUIC/H3 Parity Planı](docs/PLAN_L7_NATIVE_CUSTOM_QUIC_H3_PARITY.md)
 - [DOCA GPUNetIO Geçiş Durumu](docs/33-doca-gpunetio-migration-status.md)
 
