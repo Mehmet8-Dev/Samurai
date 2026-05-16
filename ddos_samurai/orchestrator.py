@@ -1111,6 +1111,20 @@ async def worker_process(
             _debug_exception(f"[Worker {worker_id}] RSS read failed", exc)
         return 0
 
+    def _read_cpu_time_s() -> float:
+        try:
+            with open("/proc/self/stat", "r", encoding="utf-8") as f:
+                parts = f.read().strip().split()
+            if len(parts) > 15:
+                utime = float(parts[13])
+                stime = float(parts[14])
+                hz = float(os.sysconf(os.sysconf_names.get("SC_CLK_TCK", "SC_CLK_TCK")))
+                if hz > 0.0:
+                    return float((utime + stime) / hz)
+        except _RECOVERABLE_ERRORS as exc:
+            _debug_exception(f"[Worker {worker_id}] CPU stat read failed", exc)
+        return 0.0
+
     def _shared_counters_snapshot():
         p_val = 0
         s_val = 0
@@ -1130,9 +1144,11 @@ async def worker_process(
         return p_val, s_val, e_val
 
     _last_resource_emit = 0.0
+    _last_cpu_time_s = _read_cpu_time_s()
+    _last_cpu_wall_s = time.time()
 
     def _update_resource_stats(force: bool = False):
-        nonlocal _last_resource_emit
+        nonlocal _last_resource_emit, _last_cpu_time_s, _last_cpu_wall_s
         if resource_stats is None:
             return
         now = time.time()
@@ -1165,10 +1181,17 @@ async def worker_process(
 
         p_val, s_val, e_val = _shared_counters_snapshot()
         backlog = max(0, int(p_val) - int(s_val) - int(e_val))
+        cpu_now_s = _read_cpu_time_s()
+        wall_dt = max(1e-9, now - _last_cpu_wall_s)
+        cpu_dt = max(0.0, cpu_now_s - _last_cpu_time_s)
+        cpu_usage_pct = min(100.0, max(0.0, (cpu_dt * 100.0) / wall_dt))
+        _last_cpu_time_s = cpu_now_s
+        _last_cpu_wall_s = now
         try:
             resource_stats[int(worker_id)] = {
                 "ts": float(now),
                 "rss_bytes": int(_read_rss_bytes()),
+                "cpu_usage_pct": float(cpu_usage_pct),
                 "vram_used_bytes": int(vram_used),
                 "vram_total_bytes": int(vram_total),
                 "pinned_bytes": int(pinned_bytes),
@@ -1177,6 +1200,15 @@ async def worker_process(
                 "gpu_pool_in_use": int(gpu_pool_in_use),
                 "backlog": int(backlog),
                 "backend": str(backend_used),
+                "l7_handshake_p99_ms": float(worker_stats.get("l7_handshake_p99_ms", 0.0) or 0.0),
+                "scenario_flow_latency_p95_ms": float(worker_stats.get("scenario_flow_latency_p95_ms", 0.0) or 0.0),
+                "scenario_flow_latency_p99_ms": float(worker_stats.get("scenario_flow_latency_p99_ms", 0.0) or 0.0),
+                "l7_active_sessions_peak": int(worker_stats.get("l7_active_sessions_peak", 0) or 0),
+                "scenario_sessions_completed": int(worker_stats.get("scenario_sessions_completed", 0) or 0),
+                "scenario_sessions_failed": int(worker_stats.get("scenario_sessions_failed", 0) or 0),
+                "quic_connect_timeout_count": int(worker_stats.get("quic_connect_timeout_count", 0) or 0),
+                "quic_handshake_timeout_count": int(worker_stats.get("quic_handshake_timeout_count", 0) or 0),
+                "state_timeout_evictions": int(worker_stats.get("state_timeout_evictions", 0) or 0),
                 "pacing_actual_rps": float(worker_stats.get("actual_rps", 0.0) or 0.0),
                 "pacing_rate_accuracy_pct": float(worker_stats.get("rate_accuracy_pct", 0.0) or 0.0),
                 "pacing_jitter_p99_ns": float(worker_stats.get("jitter_p99_ns", 0.0) or 0.0),

@@ -167,6 +167,9 @@ def attack_live_monitor(
         "required_duration_s": int((soak_config or {}).get("duration_s", 0) or 0),
         "warmup_s": float(soak_warmup_s),
     }
+    ai_samples = []
+    ai_last_sample_ts = start
+    ai_prev_timeout_total = 0.0
 
     def _bytes_to_mb(v: int) -> float:
         return float(v) / (1024.0 * 1024.0)
@@ -233,6 +236,12 @@ def attack_live_monitor(
             pacing_busywait_cycles = 0
             pacing_so_txtime_active = 0
             pacing_txtime_errors = 0
+            ai_cpu_usage_pct_sum = 0.0
+            ai_cpu_usage_pct_n = 0
+            ai_p95_latency_ms_max = 0.0
+            ai_p99_latency_ms_max = 0.0
+            ai_active_connections = 0.0
+            ai_timeout_total = 0.0
             if resource_stats is not None:
                 try:
                     for _, item in dict(resource_stats).items():
@@ -261,6 +270,19 @@ def attack_live_monitor(
                             int(item.get("pacing_so_txtime_active", 0) or 0),
                         )
                         pacing_txtime_errors += int(item.get("pacing_txtime_errors", 0) or 0)
+                        _cpu_pct = float(item.get("cpu_usage_pct", 0.0) or 0.0)
+                        if _cpu_pct >= 0.0:
+                            ai_cpu_usage_pct_sum += _cpu_pct
+                            ai_cpu_usage_pct_n += 1
+                        _p95 = float(item.get("scenario_flow_latency_p95_ms", 0.0) or 0.0)
+                        _p99_scenario = float(item.get("scenario_flow_latency_p99_ms", 0.0) or 0.0)
+                        _p99_l7 = float(item.get("l7_handshake_p99_ms", 0.0) or 0.0)
+                        ai_p95_latency_ms_max = max(ai_p95_latency_ms_max, _p95)
+                        ai_p99_latency_ms_max = max(ai_p99_latency_ms_max, _p99_scenario, _p99_l7)
+                        ai_active_connections += float(item.get("l7_active_sessions_peak", 0) or 0)
+                        ai_timeout_total += float(item.get("quic_connect_timeout_count", 0) or 0)
+                        ai_timeout_total += float(item.get("quic_handshake_timeout_count", 0) or 0)
+                        ai_timeout_total += float(item.get("state_timeout_evictions", 0) or 0)
                 except (AttributeError, TypeError, ValueError, OSError):
                     pass
 
@@ -304,6 +326,29 @@ def attack_live_monitor(
                 pass
 
             # Periodic soak snapshot + threshold checks.
+            if (now - ai_last_sample_ts) >= 1.0:
+                ai_last_sample_ts = now
+                cpu_usage = (
+                    ai_cpu_usage_pct_sum / ai_cpu_usage_pct_n
+                ) if ai_cpu_usage_pct_n > 0 else 0.0
+                timeout_delta = max(0.0, ai_timeout_total - ai_prev_timeout_total)
+                ai_prev_timeout_total = ai_timeout_total
+                # p95/p99 ve timeout metriği runtime hot-path'e göre her zaman
+                # bulunmayabilir; yoksa 0.0 ile doldurulur.
+                ai_samples.append(
+                    {
+                        "ts": float(now),
+                        "rps": float(pps_inst),
+                        "p95_latency": float(ai_p95_latency_ms_max),
+                        "p99_latency": float(ai_p99_latency_ms_max),
+                        "error_rate": float(error_rate_pct / 100.0),
+                        "cpu_usage": float(cpu_usage),
+                        "memory_usage": float(_bytes_to_mb(rss_bytes)),
+                        "active_connections": float(ai_active_connections),
+                        "timeout_count": float(timeout_delta),
+                    }
+                )
+
             if soak_enabled and now >= soak_next_snapshot:
                 snap = {
                     "ts": float(now),
@@ -461,6 +506,7 @@ def attack_live_monitor(
         },
         "snapshot_count": int(len(soak_snapshots)),
         "snapshots": soak_snapshots,
+        "ai_samples": ai_samples,
         "alarms": soak_alarms,
         "passed": bool(passed),
     }

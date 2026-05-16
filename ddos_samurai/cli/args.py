@@ -1673,6 +1673,49 @@ def build_parser() -> argparse.ArgumentParser:
     anomaly_group.add_argument("--anomaly-suite", action="store_true",
         help="Use full anomaly suite (standard + overlapping frags + tiny frags)")
 
+    vae_group = parser.add_argument_group("Defensive AI (VAE)")
+    vae_group.add_argument(
+        "--vae-enable",
+        action="store_true",
+        help="Savunma odakli VAE anomaly analizi etkinlestir (canli metrik pencereleri).",
+    )
+    vae_group.add_argument(
+        "--vae-model-path",
+        type=str,
+        default="ddos_samurai/models/vae/artifacts/vae-loadtest-v1/l4_vae.pt",
+        help="VAE model dosyasi yolu.",
+    )
+    vae_group.add_argument(
+        "--vae-scaler-path",
+        type=str,
+        default="ddos_samurai/models/vae/artifacts/vae-loadtest-v1/l4_scaler.npz",
+        help="VAE scaler dosyasi yolu.",
+    )
+    vae_group.add_argument(
+        "--vae-meta-path",
+        type=str,
+        default="ddos_samurai/models/vae/artifacts/vae-loadtest-v1/l4_vae_meta.json",
+        help="VAE metadata dosyasi yolu.",
+    )
+    vae_group.add_argument(
+        "--vae-model-version",
+        type=str,
+        default="vae-loadtest-v1",
+        help="Model versiyon etiketi (rapor/anomaly event kaydi icin).",
+    )
+    vae_group.add_argument(
+        "--vae-event-out",
+        type=str,
+        default="",
+        help="Anomaly event JSONL cikti dosyasi (bos ise run report path tabanli otomatik).",
+    )
+    vae_group.add_argument(
+        "--vae-threshold-override",
+        type=float,
+        default=0.0,
+        help="Meta threshold yerine override degeri (<=0 ise meta threshold kullanilir).",
+    )
+
     # ── PCAP Replay Options ──────────────────────────────────────────────────
     pcap_replay_group = parser.add_argument_group('PCAP Replay Options')
     pcap_replay_group.add_argument(

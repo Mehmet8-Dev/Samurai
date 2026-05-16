@@ -10,8 +10,10 @@ import multiprocessing
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .. import metrics, reporting, scenario_engine, stealth, utils
+from ..models.vae import VAEConfig, VAEDefenseService
 from ..scenario_engine.compiler import scenario_spec_from_dict, scenario_spec_to_dict
 from ..profile_names import PROFILE_NONE
 from .helpers import _is_cuda_raw_vector, is_admin, print_distributed_info
@@ -30,6 +32,78 @@ _CPU_RAW_SOCKET_VECTORS = {
     "ntp-amp", "ssdp-amp", "dns-amp", "memcached-amp", "ldap-amp",
     "pcap-replay",
 }
+
+
+def _write_jsonl_rows(rows: list[dict], out_path: str) -> str:
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(dict(row or {}), ensure_ascii=False) + "\n")
+    return str(p)
+
+
+def _run_vae_post_analysis(args, monitor_summary: dict, *, test_id: str) -> tuple[list[dict], dict]:
+    if not bool(getattr(args, "vae_enable", False)):
+        return [], {"enabled": False}
+
+    samples = list((monitor_summary or {}).get("ai_samples", []) or [])
+    if not samples:
+        return [], {"enabled": True, "status": "no_samples"}
+
+    cfg = VAEConfig(
+        model_path=Path(str(getattr(args, "vae_model_path", "") or "").strip()),
+        scaler_path=Path(str(getattr(args, "vae_scaler_path", "") or "").strip()),
+        meta_path=Path(str(getattr(args, "vae_meta_path", "") or "").strip()),
+        model_version=str(getattr(args, "vae_model_version", "vae-loadtest-v1") or "vae-loadtest-v1"),
+    )
+    svc = VAEDefenseService(cfg, device="cpu")
+    override_th = float(getattr(args, "vae_threshold_override", 0.0) or 0.0)
+    if override_th > 0.0:
+        svc._artifacts = svc._artifacts.__class__(  # controlled local override
+            model=svc._artifacts.model,
+            scaler=svc._artifacts.scaler,
+            threshold=float(override_th),
+            beta_kl=svc._artifacts.beta_kl,
+            hidden_dim=svc._artifacts.hidden_dim,
+        )
+
+    out_rows: list[dict] = []
+    sev_counts = {"low": 0, "medium": 0, "high": 0}
+    for s in samples:
+        point = {
+            "rps": float((s or {}).get("rps", 0.0) or 0.0),
+            "p95_latency": float((s or {}).get("p95_latency", 0.0) or 0.0),
+            "p99_latency": float((s or {}).get("p99_latency", 0.0) or 0.0),
+            "error_rate": float((s or {}).get("error_rate", 0.0) or 0.0),
+            "cpu_usage": float((s or {}).get("cpu_usage", 0.0) or 0.0),
+            "memory_usage": float((s or {}).get("memory_usage", 0.0) or 0.0),
+            "active_connections": float((s or {}).get("active_connections", 0.0) or 0.0),
+            "timeout_count": float((s or {}).get("timeout_count", 0.0) or 0.0),
+        }
+        result = svc.push_metric_point(point, test_id=test_id)
+        if result is None:
+            continue
+        row = result.to_dict()
+        row["sample_ts"] = float((s or {}).get("ts", 0.0) or 0.0)
+        out_rows.append(row)
+        if row.get("is_anomaly", False):
+            sev = str(row.get("severity", "") or "").strip().lower()
+            if sev in sev_counts:
+                sev_counts[sev] += 1
+
+    anomalies = [r for r in out_rows if bool(r.get("is_anomaly", False))]
+    summary = {
+        "enabled": True,
+        "status": "ok",
+        "samples_total": int(len(samples)),
+        "windows_evaluated": int(len(out_rows)),
+        "anomalies_total": int(len(anomalies)),
+        "severity_counts": sev_counts,
+        "model_version": str(cfg.model_version),
+        "threshold": float(svc.threshold),
+    }
+    return anomalies, summary
 
 
 def _resolve_scenario_backend_attack_vector(raw_backend: str) -> tuple[str, str]:
@@ -353,6 +427,8 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
     started_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     interrupted = False
     monitor_summary = {}
+    vae_anomaly_events: list[dict] = []
+    vae_summary: dict = {"enabled": False}
     kpi_hard_fail_triggered = False
 
     for i in range(workers):
@@ -422,6 +498,34 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
         utils.log_info("Tüm süreçler sonlandırıldı.")
 
     duration = time.time() - start_time
+    try:
+        vae_anomaly_events, vae_summary = _run_vae_post_analysis(
+            args,
+            monitor_summary,
+            test_id=f"live-{int(start_time)}",
+        )
+        if bool((vae_summary or {}).get("enabled", False)):
+            utils.log_info(
+                "VAE analiz tamamlandi: "
+                f"windows={int((vae_summary or {}).get('windows_evaluated', 0) or 0)} "
+                f"anomalies={int((vae_summary or {}).get('anomalies_total', 0) or 0)}"
+            )
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
+        vae_summary = {
+            "enabled": True,
+            "status": "error",
+            "error": str(exc),
+        }
+        utils.log_warning(f"VAE analiz atlandi/hata: {exc}")
+    if bool((vae_summary or {}).get("enabled", False)) and vae_anomaly_events and not bool(report_ctx.get("want_report", False)):
+        try:
+            out = str(getattr(args, "vae_event_out", "") or "").strip() or os.path.join(
+                os.getcwd(), "reports", "runs", f"live_{int(start_time)}.vae.anomaly_events.jsonl"
+            )
+            saved = _write_jsonl_rows(vae_anomaly_events, out)
+            utils.log_info(f"VAE anomaly event dosyasi yazildi: {saved}")
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
+            utils.log_warning(f"VAE anomaly event dosyasi yazilamadi: {exc}")
     utils.log_info(f"Tüm işçiler görevlerini tamamladı. Toplam süre: {duration:.2f} saniye.")
     if soak_cfg is not None:
         soak_passed = bool((monitor_summary or {}).get("passed", False))
@@ -493,6 +597,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             rr.results["traffic_model_event_count"] = int(runtime_ctx.get("event_count", 0) or 0)
             rr.results["traffic_model_fallback_used"] = int(bool(runtime_ctx.get("fallback_used", False)))
             rr.results["traffic_model_fallback_reason"] = str(runtime_ctx.get("fallback_reason", "none") or "none")
+            rr.results["vae_defense"] = dict(vae_summary or {})
             # Scenario closed-loop flow aggregates from worker stats
             if scenario_enabled:
                 _flow_min_completion_vals = []
@@ -706,6 +811,19 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                     base_path + ".soak.snapshots.json",
                 )
                 rr.artifacts.append(reporting.Artifact(kind="soak_snapshots_json", path=snapshots_out, meta={"snapshots": int((monitor_summary or {}).get("snapshot_count", 0) or 0)}))
+            if bool((vae_summary or {}).get("enabled", False)):
+                vae_out = str(getattr(args, "vae_event_out", "") or "").strip()
+                if not vae_out:
+                    vae_out = base_path + ".vae.anomaly_events.jsonl"
+                if vae_anomaly_events:
+                    vae_path = _write_jsonl_rows(vae_anomaly_events, vae_out)
+                    rr.artifacts.append(
+                        reporting.Artifact(
+                            kind="vae_anomaly_events_jsonl",
+                            path=vae_path,
+                            meta={"rows": int(len(vae_anomaly_events))},
+                        )
+                    )
             dataset_capture_out = str(getattr(args, "traffic_model_dataset_capture", "") or "").strip()
             if dataset_capture_out:
                 rows = []
