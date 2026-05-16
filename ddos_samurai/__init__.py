@@ -9,7 +9,7 @@ Features:
     - Real-time metrics and monitoring
 """
 __version__ = "2.2.0"
-__codename__ = "Kenjaku"
+__codename__ = "Shogun"
 __author__ = "Mehmet Okur"
 
 # Feature availability flags
