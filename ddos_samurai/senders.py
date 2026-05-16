@@ -741,6 +741,20 @@ async def packet_sender(packet_config, count, delay=0.0, rps=0.0, jitter=0.0, ra
         sender_fallback_reason="legacy_packet_sender_removed",
     )
 
+
+def _legacy_vector_removed_stats(*, vector: str, attempted: int) -> Dict[str, Any]:
+    name = str(vector or "legacy_vector").strip().lower()
+    count = max(0, int(attempted or 0))
+    return _stats(
+        attempted=count,
+        sent=0,
+        errors=count,
+        sender_path="LEGACY_ATTACK_REMOVED",
+        fallback_count=1,
+        sender_fallback_reason=f"{name}_legacy_path_removed",
+    )
+
+
 FAST_SENDER_AVAILABLE, fast_sender = _sender_runtime.load_fast_sender(package=__package__)
 try:
     from . import custom_tcp_dataplane as custom_tcp_dataplane
@@ -1266,44 +1280,18 @@ async def http_stateful_sender(
 
 
 async def amplification_sender(victim_ip, count, rps, reflector_file, amp_type, verbose, live_sent=None, live_errors=None, live_progress=None):
-    from ._senders import legacy_attacks as _legacy_attacks
-
-    return await _legacy_attacks.amplification_sender(
-        victim_ip,
-        count,
-        rps,
-        reflector_file,
-        amp_type,
-        verbose,
-        live_sent=live_sent,
-        live_errors=live_errors,
-        live_progress=live_progress,
-        stats_fn=_stats,
-        update_live_fn=_update_live,
-        log_info=log_info,
-        log_error=log_error,
-        packet_utils=packet_utils,
-        send_packet_async_fn=send_packet_async,
-    )
+    del victim_ip, rps, reflector_file, verbose
+    attempted = max(0, int(count or 0))
+    _update_live(live_errors, attempted)
+    _update_live(live_progress, attempted)
+    return _legacy_vector_removed_stats(vector=amp_type or "amplification", attempted=attempted)
 
 async def slow_attack_sender(target_ip, target_port, count, concurrency, attack_type, verbose, ssl_context=None, live_sent=None, live_errors=None, live_progress=None):
-    from ._senders import legacy_attacks as _legacy_attacks
-
-    return await _legacy_attacks.slow_attack_sender(
-        target_ip,
-        target_port,
-        count,
-        concurrency,
-        attack_type,
-        verbose,
-        ssl_context=ssl_context,
-        live_sent=live_sent,
-        live_errors=live_errors,
-        live_progress=live_progress,
-        stats_fn=_stats,
-        update_live_fn=_update_live,
-        log_info=log_info,
-    )
+    del target_ip, target_port, concurrency, verbose, ssl_context
+    attempted = max(0, int(count or 0))
+    _update_live(live_errors, attempted)
+    _update_live(live_progress, attempted)
+    return _legacy_vector_removed_stats(vector=attack_type or "slow_attack", attempted=attempted)
 
 async def websocket_scenario_sender(
     target_ip,
