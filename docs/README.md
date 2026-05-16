@@ -43,6 +43,7 @@ Bu dizin, projenin teknik ve operasyonel dokumantasyonunu 3 seviyede tutar:
 - [32 - Production Operations Runbook](./32-production-operations-runbook.md)
 - [33 - DOCA GPUNetIO Gecis Durumu ve Operasyon Notlari](./33-doca-gpunetio-migration-status.md)
 - [34 - DPDK Kurulum ve Hazirlik Rehberi](./34-dpdk-kurulum-ve-hazirlik-rehberi.md)
+- [35 - VAE Defense Integration (Mimari + Kullanim)](./35-vae-defense-integration.md)
 
 ## 4) Senaryo ve Plan Dokumanlari
 

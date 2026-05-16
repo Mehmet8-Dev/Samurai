@@ -18,6 +18,7 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !policies/AUP.md
 !policies/UNAUTHORIZED_USE_NOTICE.md
 !docs/34-dpdk-kurulum-ve-hazirlik-rehberi.md
+!docs/35-vae-defense-integration.md
 
 # Python cache / build
 __pycache__/
