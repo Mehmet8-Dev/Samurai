@@ -31,6 +31,8 @@ struct Expectations {
   std::string header_value_contains{};
   bool has_body_expect{false};
   std::string body_substring{};
+  bool require_body{false};
+  std::size_t min_body_bytes{0};
 };
 
 std::string shell_quote(const std::string& src) {
@@ -134,8 +136,20 @@ Expectations derive_expectations(const Profile& profile) {
       continue;
     }
     if (op.opcode == "EXPECT_BODY_SUBSTRING" && op.has_expect) {
-      exp.has_body_expect = true;
-      exp.body_substring = op.expect.value;
+      if (op.expect.kind == "body_required") {
+        exp.require_body = true;
+      } else if (op.expect.kind == "body_min_bytes") {
+        int min_body = 0;
+        try {
+          min_body = std::stoi(op.expect.value);
+        } catch (...) {
+          min_body = 0;
+        }
+        exp.min_body_bytes = static_cast<std::size_t>(std::max(0, min_body));
+      } else {
+        exp.has_body_expect = true;
+        exp.body_substring = op.expect.value;
+      }
       continue;
     }
   }
@@ -280,7 +294,10 @@ CurlRunResult run_curl_http3_once(
   }
   out.body_ok = !body_text.empty();
   out.expected_header_ok = !exp.has_header_expect || header_expect_ok(hdr_text, exp.header_name, exp.header_value_contains);
-  out.expected_body_ok = !exp.has_body_expect || body_expect_ok(body_text, exp.body_substring);
+  const bool body_substring_ok = !exp.has_body_expect || body_expect_ok(body_text, exp.body_substring);
+  const bool body_required_ok = !exp.require_body || !body_text.empty();
+  const bool min_body_ok = body_text.size() >= exp.min_body_bytes;
+  out.expected_body_ok = body_substring_ok && body_required_ok && min_body_ok;
   out.response_valid =
       out.http_status >= exp.status_min &&
       out.http_status <= exp.status_max &&

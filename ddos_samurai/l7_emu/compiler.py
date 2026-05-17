@@ -187,6 +187,76 @@ def _build_http2_compat_program(
     ops.append(FlowOp(opcode=FlowOpcode.CLOSE))
     return FlowProgram(ops=ops)
 
+def _with_quic_expectations(
+    flow_program: FlowProgram,
+    *,
+    quic_expect_status_min: int,
+    quic_expect_status_max: int,
+    quic_expect_header_name: str,
+    quic_expect_header_value_contains: str,
+    quic_expect_body_substring: str,
+    quic_require_response_body: bool,
+    quic_min_response_body_bytes: int,
+) -> FlowProgram:
+    ops = list(flow_program.ops)
+    tail: List[FlowOp] = []
+    if ops and ops[-1].opcode == FlowOpcode.CLOSE:
+        tail.append(ops.pop())
+
+    status_min = max(100, min(599, int(quic_expect_status_min or 100)))
+    status_max = max(100, min(599, int(quic_expect_status_max or 599)))
+    if status_max < status_min:
+        status_max = status_min
+
+    ops.append(
+        FlowOp(
+            opcode=FlowOpcode.EXPECT_STATUS,
+            expect=Expectation(kind="status", status_min=status_min, status_max=status_max),
+        )
+    )
+
+    header_name = str(quic_expect_header_name or "").strip()
+    if header_name:
+        ops.append(
+            FlowOp(
+                opcode=FlowOpcode.EXPECT_HEADER,
+                expect=Expectation(
+                    kind="header",
+                    name=header_name,
+                    value=str(quic_expect_header_value_contains or ""),
+                ),
+            )
+        )
+
+    body_substring = str(quic_expect_body_substring or "")
+    if body_substring:
+        ops.append(
+            FlowOp(
+                opcode=FlowOpcode.EXPECT_BODY_SUBSTRING,
+                expect=Expectation(kind="body_substring", value=body_substring),
+            )
+        )
+
+    if bool(quic_require_response_body):
+        ops.append(
+            FlowOp(
+                opcode=FlowOpcode.EXPECT_BODY_SUBSTRING,
+                expect=Expectation(kind="body_required", value="1"),
+            )
+        )
+
+    min_body = max(0, int(quic_min_response_body_bytes or 0))
+    if min_body > 0:
+        ops.append(
+            FlowOp(
+                opcode=FlowOpcode.EXPECT_BODY_SUBSTRING,
+                expect=Expectation(kind="body_min_bytes", value=str(min_body)),
+            )
+        )
+
+    ops.extend(tail)
+    return FlowProgram(ops=ops)
+
 
 def compile_l7_profile(
     *,
@@ -212,6 +282,13 @@ def compile_l7_profile(
     tls_profile_name: str = "none",
     session_repeats: int = 1,
     max_streams_per_connection: int = 1,
+    quic_expect_status_min: int = 100,
+    quic_expect_status_max: int = 599,
+    quic_expect_header_name: str = "",
+    quic_expect_header_value_contains: str = "",
+    quic_expect_body_substring: str = "",
+    quic_require_response_body: bool = False,
+    quic_min_response_body_bytes: int = 0,
 ) -> L7EmuProfile:
     proto = str(protocol or "").strip().lower()
     if proto not in {"http1", "http2", "quic"}:
@@ -292,6 +369,17 @@ def compile_l7_profile(
         sender_path = "L7_QUIC_CUSTOM"
         flow_attempted = _flow_attempted(flow_program)
         max_streams = max(1, int(max_streams_per_connection or concurrency or 1))
+    if proto == "quic":
+        flow_program = _with_quic_expectations(
+            flow_program,
+            quic_expect_status_min=quic_expect_status_min,
+            quic_expect_status_max=quic_expect_status_max,
+            quic_expect_header_name=quic_expect_header_name,
+            quic_expect_header_value_contains=quic_expect_header_value_contains,
+            quic_expect_body_substring=quic_expect_body_substring,
+            quic_require_response_body=quic_require_response_body,
+            quic_min_response_body_bytes=quic_min_response_body_bytes,
+        )
     conn_template = ConnectionTemplate(
         protocol=proto,
         target_ip=str(target_ip),

@@ -118,14 +118,7 @@ async def quic_sender(
         l7_capability_strict,
         lab_profile,
         quic_requests_per_conn,
-        quic_expect_status_min,
-        quic_expect_status_max,
         quic_require_response_headers,
-        quic_require_response_body,
-        quic_min_response_body_bytes,
-        quic_expect_header_name,
-        quic_expect_header_value_contains,
-        quic_expect_body_substring,
     )
     attempted = max(0, _to_int(count, 0))
     pool_size = max(1, _to_int(quic_conn_pool_size, 1))
@@ -220,6 +213,13 @@ async def quic_sender(
             payloads=[],
             request_plan=request_plan,
             max_streams_per_connection=stream_budget,
+            quic_expect_status_min=int(quic_expect_status_min or 100),
+            quic_expect_status_max=int(quic_expect_status_max or 599),
+            quic_expect_header_name=str(quic_expect_header_name or ""),
+            quic_expect_header_value_contains=str(quic_expect_header_value_contains or ""),
+            quic_expect_body_substring=str(quic_expect_body_substring or ""),
+            quic_require_response_body=bool(quic_require_response_body),
+            quic_min_response_body_bytes=int(quic_min_response_body_bytes or 0),
         )
         runtime_cfg = RuntimeConfig(concurrency=max(1, _to_int(concurrency, 1)))
         bounded = max(0.5, _to_float(timeout_s, 3.0)) * float(max(1, attempted))
