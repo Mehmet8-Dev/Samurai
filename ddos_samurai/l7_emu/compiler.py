@@ -300,7 +300,12 @@ def compile_l7_profile(
     backend = str(transport_backend or "custom_tcp").strip().lower()
     if backend == "kernel_socket":
         backend = "custom_tcp"
-    if backend not in {"custom_tcp"}:
+    if proto == "quic":
+        if backend in {"custom_tcp", "custom_quic"}:
+            backend = "custom_quic"
+        else:
+            raise ValueError(f"unsupported L7 transport backend: {transport_backend!r}")
+    elif backend not in {"custom_tcp"}:
         raise ValueError(f"unsupported L7 transport backend: {transport_backend!r}")
     alpn_values: List[str] = []
     if profile_data and "alpn" in profile_data:
