@@ -823,13 +823,26 @@ py::list topology_tuple_preview_native(const py::dict& compiled_plan, int sample
 
 PYBIND11_MODULE(_l7_emu_native, m) {
   m.doc() = "Native L7 emulation runtime";
+  m.def("runtime_capabilities", []() {
+    const RuntimeCapabilities caps = detect_capabilities();
+    bool quic_native_built = false;
+#if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_NGHTTP3) && defined(SAMURAI_WITH_GNUTLS) && defined(SAMURAI_WITH_NGTCP2_GNUTLS)
+    quic_native_built = true;
+#endif
+    py::dict out;
+    out["openssl"] = py::bool_(caps.openssl);
+    out["nghttp2"] = py::bool_(caps.nghttp2);
+    out["ngtcp2"] = py::bool_(caps.ngtcp2);
+    out["nghttp3"] = py::bool_(caps.nghttp3);
+    out["quic_native"] = py::bool_(quic_native_built);
+    return out;
+  });
   m.def("run_profile", [](const py::dict& profile_dict, const py::dict& cfg_dict) {
     const Profile profile = parse_profile(profile_dict);
     const RuntimeConfig cfg = parse_runtime_cfg(cfg_dict);
     const RuntimeCapabilities caps = detect_capabilities();
     const std::string runtime_backend = normalize_runtime_backend(profile.stateful_runtime_backend);
     const bool strict_runtime = profile.stateful_runtime_strict != 0;
-    const bool runtime_requires_custom_tcp = strict_runtime;
     auto lower_copy = [](std::string s) {
       for (char& c : s) {
         if (c >= 'A' && c <= 'Z') {
@@ -838,9 +851,15 @@ PYBIND11_MODULE(_l7_emu_native, m) {
       }
       return s;
     };
+    const bool is_quic_profile = lower_copy(profile.protocol) == "quic";
+    const bool runtime_requires_custom_tcp = strict_runtime && !is_quic_profile;
     const std::string requested_transport = lower_copy(profile.transport_backend);
     const bool requested_custom_tcp = requested_transport == "custom_tcp";
-    const TransportBackend transport_backend = TransportBackend::CustomTcp;
+    const TransportBackend transport_backend =
+        (is_quic_profile &&
+         (requested_transport.empty() || requested_transport == "custom_tcp" || requested_transport == "custom_quic"))
+            ? TransportBackend::CustomQuic
+            : TransportBackend::CustomTcp;
     if (runtime_requires_custom_tcp && !requested_custom_tcp) {
       py::dict failed;
       failed["sender_path"] = py::str(profile.sender_path);

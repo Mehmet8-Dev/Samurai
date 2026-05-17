@@ -81,6 +81,7 @@ enum class ReactorBackend {
 
 enum class TransportBackend {
   CustomTcp = 0,
+  CustomQuic = 1,
 };
 
 enum class TlsBackend {
@@ -111,6 +112,8 @@ inline const char* transport_backend_name(TransportBackend backend) {
   switch (backend) {
     case TransportBackend::CustomTcp:
       return "custom_tcp";
+    case TransportBackend::CustomQuic:
+      return "custom_quic";
   }
   return "unknown";
 }

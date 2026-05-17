@@ -1064,7 +1064,22 @@ struct H1TransportOps {
 };
 
 TransportBackend parse_transport_backend(const Profile& profile) {
-  (void)profile;
+  std::string backend = profile.transport_backend;
+  std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
+    if (c >= 'A' && c <= 'Z') {
+      return static_cast<char>(c - 'A' + 'a');
+    }
+    return static_cast<char>(c);
+  });
+  if (backend.empty() || backend == "kernel_socket") {
+    backend = "custom_tcp";
+  }
+  if (profile.protocol == "quic") {
+    if (backend == "custom_quic" || backend == "custom_tcp") {
+      return TransportBackend::CustomQuic;
+    }
+    return TransportBackend::CustomQuic;
+  }
   return TransportBackend::CustomTcp;
 }
 
