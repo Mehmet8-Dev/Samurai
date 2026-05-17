@@ -4,6 +4,7 @@
 #include <string>
 
 #include "../engine.hpp"
+#include "udp_io.hpp"
 
 namespace ddos_samurai::l7_emu_native::custom_quic_stack {
 
@@ -19,7 +20,10 @@ struct H3ParityState {
   int server_push_ready{0};
 };
 
-H3ParityState derive_h3_parity_state(const Profile& profile);
+H3ParityState derive_h3_parity_state(
+    const Profile& profile,
+    const UdpProbeCounters& udp,
+    bool runtime_handshake_ready);
 
 void apply_h3_parity_metrics(std::map<std::string, double>* out, const H3ParityState& state);
 

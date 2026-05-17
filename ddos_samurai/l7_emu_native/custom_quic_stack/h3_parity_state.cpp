@@ -4,7 +4,10 @@
 
 namespace ddos_samurai::l7_emu_native::custom_quic_stack {
 
-H3ParityState derive_h3_parity_state(const Profile& profile) {
+H3ParityState derive_h3_parity_state(
+    const Profile& profile,
+    const UdpProbeCounters& udp,
+    bool runtime_handshake_ready) {
   H3ParityState state {};
 
   bool requested_qpack_dynamic = false;
@@ -31,12 +34,18 @@ H3ParityState derive_h3_parity_state(const Profile& profile) {
     }
   }
 
-  state.qpack_dynamic_ready = requested_qpack_dynamic ? 1 : 0;
-  state.goaway_ready = requested_goaway ? 1 : 0;
-  state.priority_update_ready = requested_priority_update ? 1 : 0;
-  state.extended_connect_ready = requested_extended_connect ? 1 : 0;
-  state.datagram_ready = requested_datagram ? 1 : 0;
-  state.server_push_ready = requested_server_push ? 1 : 0;
+  const bool observed_h3_activity =
+      std::max(0, udp.responses) > 0 ||
+      std::max(0, udp.response_headers_ok) > 0 ||
+      std::max(0, udp.response_body_ok) > 0;
+  state.control_stream_ready = runtime_handshake_ready ? 1 : 0;
+  const bool feature_gate = runtime_handshake_ready && observed_h3_activity;
+  state.qpack_dynamic_ready = requested_qpack_dynamic && feature_gate ? 1 : 0;
+  state.goaway_ready = requested_goaway && feature_gate ? 1 : 0;
+  state.priority_update_ready = requested_priority_update && feature_gate ? 1 : 0;
+  state.extended_connect_ready = requested_extended_connect && feature_gate ? 1 : 0;
+  state.datagram_ready = requested_datagram && feature_gate ? 1 : 0;
+  state.server_push_ready = requested_server_push && feature_gate ? 1 : 0;
 
   // Phase model:
   // 1: minimal headers+data
@@ -45,6 +54,10 @@ H3ParityState derive_h3_parity_state(const Profile& profile) {
   // 4: priority update + extended connect
   // 5: datagram + server push parity
   int phase = 1;
+  if (!feature_gate) {
+    state.phase = 1;
+    return state;
+  }
   if (state.goaway_ready > 0) {
     phase = std::max(phase, 2);
   }

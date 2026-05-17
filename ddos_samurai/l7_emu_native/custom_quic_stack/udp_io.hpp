@@ -20,6 +20,9 @@ struct UdpProbeCounters {
   int response_expected_header_ok{0};
   int response_expected_body_match_ok{0};
   int response_validation_fail{0};
+  int tx_datagrams{0};
+  int rx_datagrams{0};
+  int pacing_wait_events{0};
   std::size_t tx_bytes{0};
   std::size_t rx_bytes{0};
 };

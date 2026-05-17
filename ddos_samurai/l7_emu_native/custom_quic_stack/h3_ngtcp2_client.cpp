@@ -10,11 +10,11 @@
 #include <cstring>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -67,6 +67,10 @@ struct Ngtcp2AttemptCtx {
   int64_t qpack_enc_stream_id{-1};
   int64_t qpack_dec_stream_id{-1};
   int64_t request_stream_id{-1};
+  int requests_planned{1};
+  int requests_completed{0};
+  int requests_succeeded{0};
+  int requests_failed{0};
 
   RequestSpec request{};
   Expectations expectations{};
@@ -99,6 +103,10 @@ uint64_t now_ns() {
   using namespace std::chrono;
   return static_cast<uint64_t>(
       duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+int64_t ns_to_ms_ceil(uint64_t delta_ns) {
+  return static_cast<int64_t>((delta_ns + 999999ull) / 1000000ull);
 }
 
 bool is_numeric_host(const std::string& host) {
@@ -723,7 +731,7 @@ bool init_quic_conn(Ngtcp2AttemptCtx* ctx) {
   return true;
 }
 
-bool init_h3_session(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
+bool init_h3_session(Ngtcp2AttemptCtx* ctx) {
   if (ctx == nullptr || ctx->conn == nullptr || ctx->h3_ready) {
     return false;
   }
@@ -771,6 +779,29 @@ bool init_h3_session(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     return false;
   }
 
+  ctx->h3_ready = true;
+  return true;
+}
+
+void reset_request_state(Ngtcp2AttemptCtx* ctx) {
+  if (ctx == nullptr) {
+    return;
+  }
+  ctx->request_stream_id = -1;
+  ctx->request_submitted = false;
+  ctx->response_complete = false;
+  ctx->response_headers_seen = false;
+  ctx->received_any_stream_data = false;
+  ctx->response_status = 0;
+  ctx->response_headers.clear();
+  ctx->response_body.clear();
+  ctx->req_body_off = 0;
+}
+
+bool submit_h3_request(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
+  if (ctx == nullptr || ctx->conn == nullptr || ctx->h3_conn == nullptr || !ctx->h3_ready) {
+    return false;
+  }
   if (ngtcp2_conn_open_bidi_stream(ctx->conn, &ctx->request_stream_id, nullptr) != 0) {
     return false;
   }
@@ -797,7 +828,6 @@ bool init_h3_session(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
   nghttp3_data_reader dr{};
   dr.read_data = read_data_cb;
   const nghttp3_data_reader* dr_ptr = ctx->request.body.empty() ? nullptr : &dr;
-
   if (nghttp3_conn_submit_request(
           ctx->h3_conn,
           ctx->request_stream_id,
@@ -807,9 +837,7 @@ bool init_h3_session(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
           nullptr) != 0) {
     return false;
   }
-
   ctx->request_submitted = true;
-  ctx->h3_ready = true;
   return true;
 }
 
@@ -865,7 +893,7 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
   return true;
 }
 
-bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns) {
+bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters* out) {
   if (ctx == nullptr || ctx->conn == nullptr) {
     return false;
   }
@@ -953,6 +981,9 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns) {
     if (wr <= 0) {
       return false;
     }
+    if (out != nullptr) {
+      out->tx_datagrams += 1;
+    }
     if (sid < 0) {
       ctx->tx_bytes += static_cast<std::size_t>(wr);
     }
@@ -964,6 +995,9 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns) {
     const ssize_t nread = ::recv(ctx->fd, rx.data(), rx.size(), MSG_DONTWAIT);
     if (nread <= 0) {
       break;
+    }
+    if (out != nullptr) {
+      out->rx_datagrams += 1;
     }
     ngtcp2_path path{};
     path.local.addr = reinterpret_cast<sockaddr*>(&ctx->local_addr);
@@ -978,6 +1012,23 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns) {
 
   if (ngtcp2_conn_handle_expiry(ctx->conn, now_ns()) != 0) {
     return false;
+  }
+  if (ctx->fd >= 0) {
+    const uint64_t now = now_ns();
+    const uint64_t expiry = ngtcp2_conn_get_expiry(ctx->conn);
+    const uint64_t next_wakeup = std::min(deadline_ns, expiry);
+    if (next_wakeup > now) {
+      const int wait_ms = static_cast<int>(std::clamp<int64_t>(ns_to_ms_ceil(next_wakeup - now), 0, 10));
+      if (wait_ms > 0) {
+        pollfd pfd{};
+        pfd.fd = ctx->fd;
+        pfd.events = POLLIN;
+        (void)::poll(&pfd, 1, wait_ms);
+        if (out != nullptr) {
+          out->pacing_wait_events += 1;
+        }
+      }
+    }
   }
   return true;
 }
@@ -998,91 +1049,132 @@ bool evaluate_response(const Ngtcp2AttemptCtx& ctx) {
   return ctx.response_headers_seen && status_ok && expected_header_ok && expected_body_ok;
 }
 
-bool run_single_attempt(const Profile& profile, int timeout_ms, UdpProbeCounters* out) {
+bool run_single_attempt(
+    const Profile& profile,
+    int timeout_ms,
+    int planned_requests,
+    UdpProbeCounters* out) {
   if (out == nullptr) {
     return false;
   }
+  const int request_budget = std::max(1, planned_requests);
   Ngtcp2AttemptCtx ctx{};
   ctx.request = derive_request_spec(profile);
   ctx.expectations = derive_expectations(profile);
+  ctx.requests_planned = request_budget;
 
-  bool ok = false;
   do {
     if (!connect_udp(&ctx, profile)) {
-      out->connect_fail += 1;
-      out->handshake_fail += 1;
+      out->connect_fail += request_budget;
+      out->handshake_fail += request_budget;
+      out->timeouts += request_budget;
+      out->errors += request_budget;
+      out->response_validation_fail += request_budget;
       break;
     }
     if (!configure_gnutls_session(&ctx, profile.target_ip)) {
-      out->handshake_fail += 1;
+      out->handshake_fail += request_budget;
+      out->timeouts += request_budget;
+      out->errors += request_budget;
+      out->response_validation_fail += request_budget;
       break;
     }
     if (!init_quic_conn(&ctx)) {
-      out->handshake_fail += 1;
+      out->handshake_fail += request_budget;
+      out->timeouts += request_budget;
+      out->errors += request_budget;
+      out->response_validation_fail += request_budget;
       break;
     }
 
-    const uint64_t deadline_ns = now_ns() + static_cast<uint64_t>(std::max(50, timeout_ms)) * 1000000ull;
-    while (now_ns() < deadline_ns) {
-      if (ctx.handshake_done && !ctx.h3_ready) {
-        if (!init_h3_session(&ctx, profile)) {
-          break;
-        }
-      }
-      if (!drive_io_once(&ctx, deadline_ns)) {
+    const uint64_t handshake_deadline_ns =
+        now_ns() + static_cast<uint64_t>(std::max(50, timeout_ms)) * 1000000ull;
+    while (now_ns() < handshake_deadline_ns && !ctx.handshake_done) {
+      if (!drive_io_once(&ctx, handshake_deadline_ns, out)) {
         break;
       }
-      if (ctx.response_complete) {
-        ok = evaluate_response(ctx);
-        break;
-      }
-      if (ctx.response_headers_seen && ctx.response_status > 0 && ctx.expectations.require_body == false &&
-          ctx.expectations.has_body_expect == false && ctx.expectations.min_body_bytes == 0) {
-        // Allow header-only completion path for no-body expectations.
-        ok = evaluate_response(ctx);
-        if (ok) {
-          break;
-        }
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!ctx.handshake_done) {
+      out->handshake_fail += request_budget;
+      out->timeouts += request_budget;
+      out->errors += request_budget;
+      out->response_validation_fail += request_budget;
+      break;
+    }
+    out->conn_established += 1;
+    if (!init_h3_session(&ctx)) {
+      out->handshake_fail += request_budget;
+      out->errors += request_budget;
+      out->response_validation_fail += request_budget;
+      break;
     }
 
-    if (ctx.handshake_done) {
-      out->conn_established += 1;
-    }
-    if (ctx.response_headers_seen || !ctx.response_body.empty() || ctx.response_complete) {
-      out->responses += 1;
-    }
-    if (ctx.response_headers_seen) {
-      out->response_headers_ok += 1;
-    }
-    if (!ctx.response_body.empty()) {
-      out->response_body_ok += 1;
-    }
-    const bool expected_header_ok =
-        !ctx.expectations.has_header_expect ||
-        header_expect_ok(ctx.response_headers, ctx.expectations.header_name, ctx.expectations.header_value_contains);
-    const bool expected_body_ok =
-        (!ctx.expectations.has_body_expect || body_expect_ok(ctx.response_body, ctx.expectations.body_substring)) &&
-        (!ctx.expectations.require_body || !ctx.response_body.empty()) &&
-        (ctx.response_body.size() >= ctx.expectations.min_body_bytes);
-    if (expected_header_ok) {
-      out->response_expected_header_ok += 1;
-    }
-    if (expected_body_ok) {
-      out->response_expected_body_match_ok += 1;
+    for (int req_i = 0; req_i < request_budget; ++req_i) {
+      reset_request_state(&ctx);
+      if (!submit_h3_request(&ctx, profile)) {
+        ctx.requests_failed += 1;
+        out->errors += 1;
+        out->response_validation_fail += 1;
+        continue;
+      }
+
+      const uint64_t request_deadline_ns =
+          now_ns() + static_cast<uint64_t>(std::max(50, timeout_ms)) * 1000000ull;
+      bool request_ok = false;
+      while (now_ns() < request_deadline_ns) {
+        if (!drive_io_once(&ctx, request_deadline_ns, out)) {
+          break;
+        }
+        if (ctx.response_complete) {
+          request_ok = evaluate_response(ctx);
+          break;
+        }
+        if (ctx.response_headers_seen && ctx.response_status > 0 && ctx.expectations.require_body == false &&
+            ctx.expectations.has_body_expect == false && ctx.expectations.min_body_bytes == 0) {
+          request_ok = evaluate_response(ctx);
+          if (request_ok) {
+            break;
+          }
+        }
+      }
+
+      if (ctx.response_headers_seen || !ctx.response_body.empty() || ctx.response_complete) {
+        out->responses += 1;
+      }
+      if (ctx.response_headers_seen) {
+        out->response_headers_ok += 1;
+      }
+      if (!ctx.response_body.empty()) {
+        out->response_body_ok += 1;
+      }
+      const bool expected_header_ok =
+          !ctx.expectations.has_header_expect ||
+          header_expect_ok(ctx.response_headers, ctx.expectations.header_name, ctx.expectations.header_value_contains);
+      const bool expected_body_ok =
+          (!ctx.expectations.has_body_expect || body_expect_ok(ctx.response_body, ctx.expectations.body_substring)) &&
+          (!ctx.expectations.require_body || !ctx.response_body.empty()) &&
+          (ctx.response_body.size() >= ctx.expectations.min_body_bytes);
+      if (expected_header_ok) {
+        out->response_expected_header_ok += 1;
+      }
+      if (expected_body_ok) {
+        out->response_expected_body_match_ok += 1;
+      }
+
+      if (request_ok) {
+        ctx.requests_succeeded += 1;
+        out->send_ok += 1;
+      } else {
+        ctx.requests_failed += 1;
+        out->errors += 1;
+        out->response_validation_fail += 1;
+        if (!ctx.response_complete) {
+          out->timeouts += 1;
+        }
+      }
+      ctx.requests_completed += 1;
     }
   } while (false);
-
-  if (ok) {
-    out->send_ok += 1;
-  } else {
-    out->errors += 1;
-    out->response_validation_fail += 1;
-    if (!ctx.handshake_done) {
-      out->timeouts += 1;
-    }
-  }
   out->tx_bytes += ctx.tx_bytes;
   out->rx_bytes += ctx.rx_bytes;
   cleanup_attempt(&ctx);
@@ -1096,7 +1188,6 @@ bool run_h3_ngtcp2_client(
     const Profile& profile,
     const RuntimeConfig& cfg,
     UdpProbeCounters* out) {
-  (void)cfg;
   if (out == nullptr) {
     return false;
   }
@@ -1116,12 +1207,32 @@ bool run_h3_ngtcp2_client(
   }
   bool ran = false;
   const int timeout_ms = std::max(50, profile.timeout_ms);
-  for (int i = 0; i < attempted; ++i) {
+  const int stream_budget = std::max(1, profile.max_streams_per_connection);
+  const int configured_conn_pool =
+      std::max(1, std::min(std::max(1, profile.max_connections), std::max(1, cfg.concurrency)));
+  int remaining = attempted;
+  int warm_conn_count = std::max(1, std::min(configured_conn_pool, attempted));
+
+  for (int i = 0; i < warm_conn_count && remaining > 0; ++i) {
+    const int remaining_conn_slots = std::max(0, warm_conn_count - i - 1);
+    const int planned_for_conn = std::min(stream_budget, std::max(1, remaining - remaining_conn_slots));
     out->conn_attempted += 1;
-    if (!run_single_attempt(profile, timeout_ms, out)) {
+    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, out)) {
       gnutls_global_deinit();
       return ran;
     }
+    remaining = std::max(0, remaining - planned_for_conn);
+    ran = true;
+  }
+
+  while (remaining > 0) {
+    const int planned_for_conn = std::min(stream_budget, remaining);
+    out->conn_attempted += 1;
+    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, out)) {
+      gnutls_global_deinit();
+      return ran;
+    }
+    remaining -= planned_for_conn;
     ran = true;
   }
   out->errors = std::max(out->errors, attempted - out->send_ok);

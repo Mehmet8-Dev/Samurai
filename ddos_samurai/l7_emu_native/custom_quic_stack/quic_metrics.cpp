@@ -2,14 +2,13 @@
 
 #include <algorithm>
 
-#include "crypto_backend.hpp"
-
 namespace ddos_samurai::l7_emu_native::custom_quic_stack {
 
 std::map<std::string, double> init_quic_stats(
     const Profile& profile,
     TransportBackend transport_backend,
     const RuntimeCapabilities& caps) {
+  (void)caps;
   const int attempted = std::max(0, profile.flow_attempted);
   std::map<std::string, double> out;
   out["attempted"] = static_cast<double>(attempted);
@@ -35,7 +34,7 @@ std::map<std::string, double> init_quic_stats(
   out["runtime_transport_custom_tcp_rx_bridge_active"] = 0.0;
   out["runtime_transport_seam_ready"] = transport_backend == TransportBackend::CustomTcp ? 0.0 : 1.0;
 
-  out["quic_capability_available"] = quic_crypto_ready(caps) ? 1.0 : 0.0;
+  out["quic_capability_available"] = 0.0;
   out["quic_connection_attempts"] = static_cast<double>(attempted);
   out["quic_connection_success"] = 0.0;
   out["quic_requests_sent"] = 0.0;
@@ -65,6 +64,11 @@ std::map<std::string, double> init_quic_stats(
   out["quic_h3_replace_after_idle"] = 0.0;
   out["quic_h3_control_plane_failures"] = 0.0;
   out["quic_h3_graceful_close_ratio"] = 0.0;
+  out["quic_tx_datagrams"] = 0.0;
+  out["quic_rx_datagrams"] = 0.0;
+  out["quic_pacing_wait_events"] = 0.0;
+  out["quic_requests_per_connection_eff"] = 0.0;
+  out["quic_retransmission_ratio"] = 0.0;
   return out;
 }
 
@@ -80,6 +84,8 @@ void apply_quic_run_metrics(
   const int sent = std::max(0, udp.responses);
   const int errors = std::max(std::max(0, udp.errors), attempted - sent);
   const double denom = static_cast<double>(std::max(1, attempted));
+  const int effective_conn_success = std::max(1, udp.conn_established);
+  const int logical_reuse = std::max(0, std::max(udp.send_ok, udp.responses) - udp.conn_established);
 
   (*out)["sent"] = static_cast<double>(sent);
   (*out)["errors"] = static_cast<double>(errors);
@@ -88,7 +94,7 @@ void apply_quic_run_metrics(
   (*out)["l7_flow_completed"] = static_cast<double>(sent);
   (*out)["l7_conn_attempted"] = static_cast<double>(udp.conn_attempted);
   (*out)["l7_conn_established"] = static_cast<double>(udp.conn_established);
-  (*out)["l7_conn_reused"] = 0.0;
+  (*out)["l7_conn_reused"] = static_cast<double>(logical_reuse);
   (*out)["l7_rx_bytes"] = static_cast<double>(udp.rx_bytes);
   (*out)["l7_tx_bytes"] = static_cast<double>(udp.tx_bytes);
   (*out)["l7_status_2xx"] = static_cast<double>(sent);
@@ -119,6 +125,13 @@ void apply_quic_run_metrics(
   (*out)["quic_alpn_h3_ratio"] = static_cast<double>(udp.responses) / denom;
   (*out)["quic_pto_count"] = static_cast<double>(recovery.pto_count);
   (*out)["quic_retransmission_count"] = static_cast<double>(recovery.retransmission_count);
+  (*out)["quic_tx_datagrams"] = static_cast<double>(udp.tx_datagrams);
+  (*out)["quic_rx_datagrams"] = static_cast<double>(udp.rx_datagrams);
+  (*out)["quic_pacing_wait_events"] = static_cast<double>(udp.pacing_wait_events);
+  (*out)["quic_requests_per_connection_eff"] =
+      static_cast<double>(std::max(0, udp.send_ok)) / static_cast<double>(effective_conn_success);
+  (*out)["quic_retransmission_ratio"] =
+      static_cast<double>(recovery.retransmission_count) / static_cast<double>(std::max(1, udp.tx_datagrams));
 }
 
 }  // namespace ddos_samurai::l7_emu_native::custom_quic_stack
