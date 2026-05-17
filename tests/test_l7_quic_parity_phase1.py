@@ -33,6 +33,8 @@ class TestL7QuicParityPhase1(unittest.TestCase):
         cpp = Path("ddos_samurai/l7_emu_native/custom_quic_stack/h3_parity_state.cpp")
         cp_hpp = Path("ddos_samurai/l7_emu_native/custom_quic_stack/h3_control_plane.hpp")
         cp_cpp = Path("ddos_samurai/l7_emu_native/custom_quic_stack/h3_control_plane.cpp")
+        real_h3_hpp = Path("ddos_samurai/l7_emu_native/custom_quic_stack/h3_real_client.hpp")
+        real_h3_cpp = Path("ddos_samurai/l7_emu_native/custom_quic_stack/h3_real_client.cpp")
         quic_stack = Path("ddos_samurai/l7_emu_native/custom_quic_stack/quic_stack.cpp")
         setup = Path("setup.py")
 
@@ -40,16 +42,22 @@ class TestL7QuicParityPhase1(unittest.TestCase):
         self.assertTrue(cpp.exists())
         self.assertTrue(cp_hpp.exists())
         self.assertTrue(cp_cpp.exists())
+        self.assertTrue(real_h3_hpp.exists())
+        self.assertTrue(real_h3_cpp.exists())
         self.assertIn("derive_h3_parity_state", cpp.read_text(encoding="utf-8"))
         self.assertIn("apply_h3_parity_metrics", cpp.read_text(encoding="utf-8"))
         self.assertIn("derive_h3_control_plane_state", cp_cpp.read_text(encoding="utf-8"))
         self.assertIn("apply_h3_control_plane_metrics", cp_cpp.read_text(encoding="utf-8"))
+        self.assertIn("run_h3_real_client", real_h3_cpp.read_text(encoding="utf-8"))
         self.assertIn("h3_control_plane.hpp", quic_stack.read_text(encoding="utf-8"))
         self.assertIn("h3_parity_state.hpp", quic_stack.read_text(encoding="utf-8"))
+        self.assertIn("h3_real_client.hpp", quic_stack.read_text(encoding="utf-8"))
         self.assertIn("apply_h3_control_plane_metrics(&out, derive_h3_control_plane_state(profile, udp));", quic_stack.read_text(encoding="utf-8"))
         self.assertIn("apply_h3_parity_metrics(&out, derive_h3_parity_state(profile));", quic_stack.read_text(encoding="utf-8"))
+        self.assertIn("run_h3_real_client(profile, cfg, &udp);", quic_stack.read_text(encoding="utf-8"))
         self.assertIn("custom_quic_stack/h3_control_plane.cpp", setup.read_text(encoding="utf-8"))
         self.assertIn("custom_quic_stack/h3_parity_state.cpp", setup.read_text(encoding="utf-8"))
+        self.assertIn("custom_quic_stack/h3_real_client.cpp", setup.read_text(encoding="utf-8"))
 
     def test_sender_surfaces_parity_metrics_without_native_runtime(self):
         async def _fake_run(profile, cfg):
