@@ -44,7 +44,13 @@ def has_l7_native_quic(*, package: str = "ddos_samurai") -> bool:
         import importlib
 
         mod = importlib.import_module("._l7_emu_native", package=package)
-        return bool(mod is not None and hasattr(mod, "run_profile"))
+        if mod is None or not hasattr(mod, "run_profile"):
+            return False
+        caps_fn = getattr(mod, "runtime_capabilities", None)
+        if not callable(caps_fn):
+            return False
+        caps = dict(caps_fn() or {})
+        return bool(caps.get("quic_native", False))
     except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
         return False
 

@@ -48,7 +48,13 @@ def _parity_metrics(raw: dict[str, Any] | None = None) -> dict[str, float]:
     }
 
 
-def _scenario_step_results_from_plan(request_plan: Any, sent: int, errors: int, timeouts: int = 0) -> list[dict[str, Any]]:
+def _scenario_step_results_from_plan(
+    request_plan: Any,
+    sent: int,
+    errors: int,
+    timeouts: int = 0,
+    timeout_latency_ms: float = 0.0,
+) -> list[dict[str, Any]]:
     items = list(getattr(request_plan, "items", []) or [])
     if not items:
         return []
@@ -67,7 +73,7 @@ def _scenario_step_results_from_plan(request_plan: Any, sent: int, errors: int, 
                 "on_failure": str(headers.get("x-scenario-on-failure", "retry") or "retry").strip().lower(),
                 "success": bool(idx < success_count),
                 "timeout": bool(idx >= success_count and fail_idx >= 0 and fail_idx < timeout_budget),
-                "latency_ms": 0.0,
+                "latency_ms": float(timeout_latency_ms if idx >= success_count and fail_idx >= 0 and fail_idx < timeout_budget else 0.0),
             }
         )
     return out
@@ -114,15 +120,28 @@ async def quic_sender(
         verbose,
         ssl_context,
         retries,
-        l7_fallback_policy,
-        l7_capability_strict,
         lab_profile,
-        quic_requests_per_conn,
-        quic_require_response_headers,
     )
     attempted = max(0, _to_int(count, 0))
     pool_size = max(1, _to_int(quic_conn_pool_size, 1))
-    stream_budget = max(1, _to_int(quic_streams_per_conn, max(1, _to_int(concurrency, 1))))
+    requested_stream_budget = _to_int(quic_streams_per_conn, 0)
+    if requested_stream_budget > 0:
+        stream_budget = max(1, requested_stream_budget)
+    else:
+        # Default to a modest multiplexing floor to amortize handshake cost.
+        stream_budget = max(4, _to_int(concurrency, 1))
+    requests_per_conn = max(0, _to_int(quic_requests_per_conn, 0))
+    if requests_per_conn > 0:
+        stream_budget = max(1, requests_per_conn) if requested_stream_budget <= 0 else max(stream_budget, requests_per_conn)
+    effective_requests_per_conn = stream_budget if requests_per_conn <= 0 else max(1, requests_per_conn)
+    session_repeats = 1
+    requests_per_wave = max(1, pool_size * max(1, effective_requests_per_conn))
+    if attempted > requests_per_wave:
+        session_repeats = max(1, int((attempted + requests_per_wave - 1) // requests_per_wave))
+    require_native = bool(l7_quic_require_native) or bool(l7_capability_strict) or str(l7_fallback_policy or "").strip().lower() == "fail"
+    header_expect_name = str(quic_expect_header_name or "")
+    if bool(quic_require_response_headers) and not header_expect_name.strip():
+        header_expect_name = ":status"
 
     if attempted <= 0:
         out = stats_fn(
@@ -153,7 +172,6 @@ async def quic_sender(
             fallback_reason="none",
         )
 
-    native_available = bool(_sender_runtime.has_l7_native_quic())
     requested_engine = str(l7_quic_engine or "auto").strip().lower()
 
     if requested_engine == "python":
@@ -199,7 +217,7 @@ async def quic_sender(
             target_ip=str(target_ip),
             target_port=int(target_port),
             scheme="https",
-            transport_backend="custom_tcp",
+            transport_backend="custom_quic",
             stateful_runtime_backend="afxdp",
             stateful_runtime_strict=False,
             legacy_mode=True,
@@ -212,10 +230,11 @@ async def quic_sender(
             http_path=str(quic_path or "/") or "/",
             payloads=[],
             request_plan=request_plan,
+            session_repeats=session_repeats,
             max_streams_per_connection=stream_budget,
             quic_expect_status_min=int(quic_expect_status_min or 100),
             quic_expect_status_max=int(quic_expect_status_max or 599),
-            quic_expect_header_name=str(quic_expect_header_name or ""),
+            quic_expect_header_name=header_expect_name,
             quic_expect_header_value_contains=str(quic_expect_header_value_contains or ""),
             quic_expect_body_substring=str(quic_expect_body_substring or ""),
             quic_require_response_body=bool(quic_require_response_body),
@@ -241,13 +260,13 @@ async def quic_sender(
             "quic_capability_available": 0,
         }
 
-    cap = _to_int(raw.get("quic_capability_available", 1 if native_available else 0), 0)
+    cap = _to_int(raw.get("quic_capability_available", 0), 0)
     stack_mode = "custom_native" if cap > 0 else "unavailable"
 
     sent = max(0, _to_int(raw.get("sent", 0), 0))
     errors = max(0, _to_int(raw.get("errors", max(0, attempted - sent)), max(0, attempted - sent)))
 
-    if bool(l7_quic_require_native) and cap <= 0:
+    if require_native and cap <= 0:
         sent = 0
         errors = attempted
         raw["sender_fallback_reason"] = "quic_capability_unavailable"
@@ -306,6 +325,7 @@ async def quic_sender(
             sent=sent,
             errors=errors,
             timeouts=timeouts,
+            timeout_latency_ms=max(0.0, _to_float(timeout_s, 0.0) * 1000.0),
         )
 
     for key, value in raw.items():
