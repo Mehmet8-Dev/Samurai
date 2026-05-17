@@ -743,6 +743,7 @@ def get_extensions() -> List[Extension]:
             "ddos_samurai/l7_emu_native/custom_quic_stack/crypto_backend.cpp",
             "ddos_samurai/l7_emu_native/custom_quic_stack/h3_minimal_client.cpp",
             "ddos_samurai/l7_emu_native/custom_quic_stack/h3_real_client.cpp",
+            "ddos_samurai/l7_emu_native/custom_quic_stack/h3_ngtcp2_client.cpp",
             "ddos_samurai/l7_emu_native/custom_quic_stack/h3_control_plane.cpp",
             "ddos_samurai/l7_emu_native/custom_quic_stack/h3_parity_state.cpp",
             "ddos_samurai/l7_emu_native/custom_quic_stack/loss_recovery.cpp",
