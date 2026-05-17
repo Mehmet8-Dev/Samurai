@@ -7,6 +7,7 @@
 
 #include "crypto_backend.hpp"
 #include "h3_control_plane.hpp"
+#include "h3_ngtcp2_client.hpp"
 #include "h3_parity_state.hpp"
 #include "h3_minimal_client.hpp"
 #include "h3_real_client.hpp"
@@ -54,10 +55,19 @@ std::map<std::string, double> run_quic_profile(
   }
 
   UdpProbeCounters udp{};
-  const bool real_client_ready = run_h3_real_client(profile, cfg, &udp);
-  bool run_ok = real_client_ready;
-  out["quic_runtime_real_client_ready"] = real_client_ready ? 1.0 : 0.0;
-  out["quic_runtime_transport_path"] = real_client_ready ? 1.0 : 0.0;
+  const bool ngtcp2_ready = run_h3_ngtcp2_client(profile, cfg, &udp);
+  bool run_ok = ngtcp2_ready;
+  out["quic_runtime_ngtcp2_ready"] = ngtcp2_ready ? 1.0 : 0.0;
+  out["quic_runtime_real_client_ready"] = 0.0;
+  out["quic_runtime_transport_path"] = ngtcp2_ready ? 2.0 : 0.0;
+  if (!run_ok) {
+    const bool real_client_ready = run_h3_real_client(profile, cfg, &udp);
+    run_ok = real_client_ready;
+    out["quic_runtime_real_client_ready"] = real_client_ready ? 1.0 : 0.0;
+    if (real_client_ready) {
+      out["quic_runtime_transport_path"] = 1.0;
+    }
+  }
   if (!run_ok) {
     const char* allow_probe_fallback_env = std::getenv("SAMURAI_QUIC_ALLOW_UDP_PROBE_FALLBACK");
     const bool allow_probe_fallback =
@@ -65,12 +75,10 @@ std::map<std::string, double> run_quic_profile(
         std::string(allow_probe_fallback_env) == "1";
     if (allow_probe_fallback) {
       run_ok = run_h3_minimal_client(profile, cfg, &udp);
-      if (run_ok) {
-        out["quic_runtime_transport_path"] = 0.0;
-      }
+      if (run_ok) out["quic_runtime_transport_path"] = 0.0;
     }
   }
-  if (!real_client_ready) {
+  if (!run_ok) {
     out["quic_capability_available"] = 0.0;
   }
   if (!run_ok) {
