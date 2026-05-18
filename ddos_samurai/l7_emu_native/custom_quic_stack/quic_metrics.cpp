@@ -64,6 +64,13 @@ std::map<std::string, double> init_quic_stats(
   out["quic_h3_replace_after_idle"] = 0.0;
   out["quic_h3_control_plane_failures"] = 0.0;
   out["quic_h3_graceful_close_ratio"] = 0.0;
+  out["quic_h3_qpack_dynamic_events"] = 0.0;
+  out["quic_h3_priority_update_events"] = 0.0;
+  out["quic_h3_extended_connect_events"] = 0.0;
+  out["quic_h3_datagram_tx_events"] = 0.0;
+  out["quic_h3_datagram_rx_events"] = 0.0;
+  out["quic_h3_server_push_events"] = 0.0;
+  out["quic_h3_feature_failures"] = 0.0;
   out["quic_tx_datagrams"] = 0.0;
   out["quic_rx_datagrams"] = 0.0;
   out["quic_pacing_wait_events"] = 0.0;
@@ -125,6 +132,13 @@ void apply_quic_run_metrics(
   (*out)["quic_alpn_h3_ratio"] = static_cast<double>(udp.responses) / denom;
   (*out)["quic_pto_count"] = static_cast<double>(recovery.pto_count);
   (*out)["quic_retransmission_count"] = static_cast<double>(recovery.retransmission_count);
+  (*out)["quic_h3_qpack_dynamic_events"] = static_cast<double>(udp.h3_qpack_dynamic_events);
+  (*out)["quic_h3_priority_update_events"] = static_cast<double>(udp.h3_priority_update_events);
+  (*out)["quic_h3_extended_connect_events"] = static_cast<double>(udp.h3_extended_connect_events);
+  (*out)["quic_h3_datagram_tx_events"] = static_cast<double>(udp.h3_datagram_tx_events);
+  (*out)["quic_h3_datagram_rx_events"] = static_cast<double>(udp.h3_datagram_rx_events);
+  (*out)["quic_h3_server_push_events"] = static_cast<double>(udp.h3_server_push_events);
+  (*out)["quic_h3_feature_failures"] = static_cast<double>(udp.h3_feature_failures);
   (*out)["quic_tx_datagrams"] = static_cast<double>(udp.tx_datagrams);
   (*out)["quic_rx_datagrams"] = static_cast<double>(udp.rx_datagrams);
   (*out)["quic_pacing_wait_events"] = static_cast<double>(udp.pacing_wait_events);
