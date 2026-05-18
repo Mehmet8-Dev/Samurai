@@ -12,11 +12,13 @@ try:
 except Exception:  # pragma: no cover
     _native = None
 
-
 @unittest.skipIf(_native is None, "native l7 module unavailable")
 class TestL7QuicNativeStack(unittest.TestCase):
-    def test_minimal_h3_request_builder_and_response_parser(self):
-        packet = _native.quic_build_minimal_h3_request("GET", "/health", b"hello")
+    def test_minimal_h3_request_builder_and_response_parser_are_diagnostic_only(self):
+        self.assertFalse(hasattr(_native, "quic_build_minimal_h3_request"))
+        self.assertFalse(hasattr(_native, "quic_parse_minimal_h3_response"))
+
+        packet = _native.diagnostics_quic_build_minimal_h3_request("GET", "/health", b"hello")
         self.assertIsInstance(packet, (bytes, bytearray))
         self.assertGreater(len(packet), 8)
         self.assertTrue(bytes(packet).startswith(b"H3Q1"))
@@ -24,7 +26,7 @@ class TestL7QuicNativeStack(unittest.TestCase):
         # Synthetic minimal H3 response wire format consumed by native parser.
         # Magic + HEADERS frame(type=1,len=11,":status=200") + DATA(type=0,len=2,"ok")
         response = b"H3R1" + bytes([1, 0, 11]) + b":status=200" + bytes([0, 0, 2]) + b"ok"
-        parsed = _native.quic_parse_minimal_h3_response(response)
+        parsed = _native.diagnostics_quic_parse_minimal_h3_response(response)
         self.assertEqual(int(parsed.get("valid", 0) or 0), 1)
         self.assertEqual(int(parsed.get("headers_ok", 0) or 0), 1)
         self.assertEqual(int(parsed.get("body_ok", 0) or 0), 1)
