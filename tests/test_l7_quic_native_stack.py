@@ -58,6 +58,13 @@ class TestL7QuicNativeStack(unittest.TestCase):
             "quic_stream_fail_ratio",
             "quic_handshake_fail_ratio",
             "quic_response_validation_fail_ratio",
+            "quic_h3_qpack_dynamic_events",
+            "quic_h3_priority_update_events",
+            "quic_h3_extended_connect_events",
+            "quic_h3_datagram_tx_events",
+            "quic_h3_datagram_rx_events",
+            "quic_h3_server_push_events",
+            "quic_h3_feature_failures",
             "quic_stack_mode",
         }
         self.assertTrue(expected.issubset(set(out.keys())))
