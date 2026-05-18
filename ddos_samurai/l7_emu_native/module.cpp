@@ -1056,14 +1056,15 @@ PYBIND11_MODULE(_l7_emu_native, m) {
     out["tcp_peer_fin_count"] = py::int_(static_cast<long long>(stats.peer_fin_count));
     return out;
   });
-  m.def("quic_build_minimal_h3_request", [](const std::string& method, const std::string& path, py::bytes body) {
+  // Diagnostic-only helpers for legacy minimal wire format inspection.
+  m.def("diagnostics_quic_build_minimal_h3_request", [](const std::string& method, const std::string& path, py::bytes body) {
     const std::string raw_body = py::cast<std::string>(body);
     const std::vector<std::uint8_t> body_vec(raw_body.begin(), raw_body.end());
     const std::vector<std::uint8_t> packet =
         custom_quic_stack::build_minimal_h3_request(method, path, body_vec);
     return py::bytes(reinterpret_cast<const char*>(packet.data()), static_cast<py::ssize_t>(packet.size()));
   });
-  m.def("quic_parse_minimal_h3_response", [](py::bytes response) {
+  m.def("diagnostics_quic_parse_minimal_h3_response", [](py::bytes response) {
     const std::string raw = py::cast<std::string>(response);
     const auto parsed = custom_quic_stack::parse_minimal_h3_response(
         reinterpret_cast<const std::uint8_t*>(raw.data()),
