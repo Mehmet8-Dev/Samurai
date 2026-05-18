@@ -65,10 +65,15 @@ class TestL7QuicNativeStack(unittest.TestCase):
             "quic_h3_datagram_rx_events",
             "quic_h3_server_push_events",
             "quic_h3_feature_failures",
+            "quic_runtime_udp_io_backend",
+            "quic_runtime_backend_requested",
+            "quic_runtime_native_hot_path_ready",
+            "quic_runtime_backend_fallback_count",
             "quic_stack_mode",
         }
         self.assertTrue(expected.issubset(set(out.keys())))
         self.assertIn(str(out.get("quic_stack_mode", "")), {"custom_native", "unavailable"})
+        self.assertIn(int(out.get("quic_runtime_udp_io_backend", 0) or 0), {0, 1, 2})
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -728,10 +728,25 @@ class TestL7CapabilityPreflight(unittest.TestCase):
         args = parser.parse_args(["--attack-vector", "websocket", "--l7-capability-strict"])
         self._assert_preflight_fails(parser, args)
 
-    def test_capability_strict_quic_rejected_in_v1(self):
+    def test_capability_strict_quic_enables_native_required_mode(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--attack-vector", "quic", "--l7-capability-strict"])
-        self._assert_preflight_fails(parser, args)
+        args = parser.parse_args(
+            [
+                "--attack-vector",
+                "quic",
+                "--l7-capability-strict",
+                "--xdp-interface",
+                "eth0",
+                "--l7-quic-auto-bridge",
+                "--l7-quic-bridge-autopromote",
+            ]
+        )
+        with patch.dict(os.environ, {"SAMURAI_QUIC_BUILD_MODE": "auto"}, clear=False):
+            cli._preflight_l7_capabilities(parser, args)
+            self.assertTrue(args.l7_quic_require_native)
+            self.assertFalse(args.l7_quic_auto_bridge)
+            self.assertFalse(args.l7_quic_bridge_autopromote)
+            self.assertEqual(os.environ.get("SAMURAI_QUIC_BUILD_MODE"), "native_required")
 
 
 class TestPersistentTxBackendPreflight(unittest.TestCase):
