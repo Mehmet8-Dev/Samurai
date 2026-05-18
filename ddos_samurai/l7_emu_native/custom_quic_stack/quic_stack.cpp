@@ -7,7 +7,6 @@
 #include "h3_control_plane.hpp"
 #include "h3_ngtcp2_client.hpp"
 #include "h3_parity_state.hpp"
-#include "h3_real_client.hpp"
 #include "loss_recovery.hpp"
 #include "quic_metrics.hpp"
 
@@ -61,18 +60,10 @@ std::map<std::string, double> run_quic_profile(
 
   UdpProbeCounters udp{};
   const bool ngtcp2_ready = run_h3_ngtcp2_client(profile, cfg, &udp);
-  bool run_ok = ngtcp2_ready;
+  const bool run_ok = ngtcp2_ready;
   out["quic_runtime_ngtcp2_ready"] = ngtcp2_ready ? 1.0 : 0.0;
-  out["quic_runtime_real_client_ready"] = 0.0;
+  out["quic_runtime_real_client_ready"] = ngtcp2_ready ? 1.0 : 0.0;
   out["quic_runtime_transport_path"] = ngtcp2_ready ? 2.0 : -1.0;
-  if (!run_ok) {
-    const bool real_client_ready = run_h3_real_client(profile, cfg, &udp);
-    run_ok = real_client_ready;
-    out["quic_runtime_real_client_ready"] = real_client_ready ? 1.0 : 0.0;
-    if (real_client_ready) {
-      out["quic_runtime_transport_path"] = 1.0;
-    }
-  }
   const bool runtime_handshake_ready = run_ok && udp.conn_established > 0;
   out["quic_capability_available"] = runtime_handshake_ready ? 1.0 : 0.0;
   apply_h3_parity_metrics(&out, derive_h3_parity_state(profile, udp, runtime_handshake_ready));

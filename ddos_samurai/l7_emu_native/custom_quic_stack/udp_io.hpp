@@ -20,6 +20,12 @@ struct UdpProbeCounters {
   int response_expected_header_ok{0};
   int response_expected_body_match_ok{0};
   int response_validation_fail{0};
+  int h3_goaway_events{0};
+  int h3_drain_cycles{0};
+  int h3_replace_now{0};
+  int h3_replace_after_idle{0};
+  int h3_control_plane_failures{0};
+  int h3_graceful_close_count{0};
   int tx_datagrams{0};
   int rx_datagrams{0};
   int pacing_wait_events{0};
