@@ -25,22 +25,45 @@ H3ControlPlaneState derive_h3_control_plane_state(
   const int established = std::max(0, udp.conn_established);
   const int hard_failures = std::max(0, udp.connect_fail + udp.handshake_fail + udp.timeouts);
   const int validation_failures = std::max(0, udp.response_validation_fail);
+  const int runtime_goaway_events = std::max(0, udp.h3_goaway_events);
+  const int runtime_drain_cycles = std::max(0, udp.h3_drain_cycles);
+  const int runtime_replace_now = std::max(0, udp.h3_replace_now);
+  const int runtime_replace_after_idle = std::max(0, udp.h3_replace_after_idle);
+  const int runtime_cp_failures = std::max(0, udp.h3_control_plane_failures);
+  const int runtime_graceful_close = std::max(0, udp.h3_graceful_close_count);
 
-  if (requested_goaway && established > 0) {
-    state.goaway_events = 1;
-    state.drain_cycles = std::max(1, std::min(established, std::max(1, udp.responses)));
+  if (runtime_goaway_events > 0) {
+    state.goaway_events = runtime_goaway_events;
+    state.drain_cycles = std::max(runtime_drain_cycles, std::min(established, std::max(1, udp.responses)));
+    state.replace_now = runtime_replace_now;
+    state.replace_after_idle = runtime_replace_after_idle;
+    state.control_plane_failures = runtime_cp_failures + validation_failures;
+  } else if (requested_goaway && established > 0) {
+    // Requested GOAWAY but not observed at runtime -> fail-visible.
+    state.goaway_events = 0;
+    state.drain_cycles = 0;
+    state.replace_now = std::max(0, hard_failures);
+    state.replace_after_idle = 0;
+    state.control_plane_failures = validation_failures + 1;
   } else if (!requested_goaway && established > 0 && hard_failures > 0) {
     // Fail-visible closure path still reports a control-plane event for observability.
     state.goaway_events = 1;
     state.drain_cycles = 1;
+    state.replace_now = hard_failures;
+    state.replace_after_idle = std::max(0, state.goaway_events - state.replace_now);
+    state.control_plane_failures = validation_failures + runtime_cp_failures;
+  } else {
+    state.goaway_events = 0;
+    state.drain_cycles = runtime_drain_cycles;
+    state.replace_now = runtime_replace_now;
+    state.replace_after_idle = runtime_replace_after_idle;
+    state.control_plane_failures = validation_failures + runtime_cp_failures;
   }
 
-  state.replace_now = hard_failures;
-  state.replace_after_idle = std::max(0, state.goaway_events - state.replace_now);
-  state.control_plane_failures = validation_failures + (requested_goaway && state.goaway_events == 0 ? 1 : 0);
-
   if (established > 0) {
-    const int graceful = std::max(0, established - state.replace_now);
+    const int graceful = runtime_graceful_close > 0
+        ? std::min(established, runtime_graceful_close)
+        : std::max(0, established - state.replace_now);
     state.graceful_close_ratio = static_cast<double>(graceful) / static_cast<double>(established);
   }
 

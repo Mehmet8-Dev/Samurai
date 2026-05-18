@@ -51,6 +51,12 @@ struct Expectations {
   std::size_t min_body_bytes{0};
 };
 
+struct GoawayPolicy {
+  bool enabled{false};
+  int requests_per_connection{0};
+  bool replace_after_idle{true};
+};
+
 struct Ngtcp2AttemptCtx {
   ngtcp2_crypto_conn_ref conn_ref{};
   ngtcp2_conn* conn{nullptr};
@@ -82,10 +88,18 @@ struct Ngtcp2AttemptCtx {
   bool response_complete{false};
   bool response_headers_seen{false};
   bool received_any_stream_data{false};
+  bool goaway_active{false};
 
   int response_status{0};
   std::string response_headers{};
   std::string response_body{};
+  int64_t goaway_last_stream_id{-1};
+  int goaway_events{0};
+  int drain_cycles{0};
+  int replace_now{0};
+  int replace_after_idle{0};
+  int control_plane_failures{0};
+  int graceful_close_count{0};
 
   std::size_t rx_bytes{0};
   std::size_t tx_bytes{0};
@@ -263,6 +277,40 @@ Expectations derive_expectations(const Profile& profile) {
     }
   }
   return exp;
+}
+
+GoawayPolicy derive_goaway_policy(const Profile& profile) {
+  GoawayPolicy policy{};
+  for (const auto& op : profile.ops) {
+    if (op.opcode != "H3_GOAWAY") {
+      continue;
+    }
+    policy.enabled = true;
+    if (op.loop_count > 0) {
+      policy.requests_per_connection = std::max(policy.requests_per_connection, op.loop_count);
+    }
+    if (op.has_expect) {
+      if (op.expect.kind == "replace_mode" && op.expect.value == "now") {
+        policy.replace_after_idle = false;
+      } else if (op.expect.kind == "replace_mode" && op.expect.value == "after_idle") {
+        policy.replace_after_idle = true;
+      } else if (op.expect.kind == "requests_per_connection") {
+        int parsed = 0;
+        try {
+          parsed = std::stoi(op.expect.value);
+        } catch (...) {
+          parsed = 0;
+        }
+        if (parsed > 0) {
+          policy.requests_per_connection = std::max(policy.requests_per_connection, parsed);
+        }
+      }
+    }
+  }
+  if (policy.enabled && policy.requests_per_connection <= 0) {
+    policy.requests_per_connection = 1;
+  }
+  return policy;
 }
 
 int parse_status_code(const std::string& text) {
@@ -534,8 +582,12 @@ int http_shutdown_cb(
     int64_t id,
     void* conn_user_data) {
   (void)conn;
-  (void)id;
-  (void)conn_user_data;
+  auto* ctx = static_cast<Ngtcp2AttemptCtx*>(conn_user_data);
+  if (ctx != nullptr) {
+    ctx->goaway_active = true;
+    ctx->goaway_last_stream_id = id;
+    ctx->goaway_events += 1;
+  }
   return 0;
 }
 
@@ -1110,11 +1162,25 @@ bool run_single_attempt(
     }
 
     for (int req_i = 0; req_i < request_budget; ++req_i) {
+      if (ctx.goaway_active) {
+        const int remaining = std::max(0, request_budget - req_i);
+        if (ctx.requests_completed > 0) {
+          ctx.drain_cycles += 1;
+        }
+        ctx.replace_now += remaining;
+        break;
+      }
       reset_request_state(&ctx);
       if (!submit_h3_request(&ctx, profile)) {
         ctx.requests_failed += 1;
+        ctx.requests_completed += 1;
         out->errors += 1;
         out->response_validation_fail += 1;
+        if (ctx.goaway_active) {
+          const int remaining = std::max(0, request_budget - req_i - 1);
+          ctx.replace_now += remaining;
+          break;
+        }
         continue;
       }
 
@@ -1123,6 +1189,10 @@ bool run_single_attempt(
       bool request_ok = false;
       while (now_ns() < request_deadline_ns) {
         if (!drive_io_once(&ctx, request_deadline_ns, out)) {
+          break;
+        }
+        if (ctx.goaway_active && ctx.goaway_last_stream_id >= 0 && ctx.request_stream_id > ctx.goaway_last_stream_id) {
+          ctx.control_plane_failures += 1;
           break;
         }
         if (ctx.response_complete) {
@@ -1174,7 +1244,23 @@ bool run_single_attempt(
       }
       ctx.requests_completed += 1;
     }
+    if (ctx.goaway_active) {
+      if (ctx.requests_completed >= request_budget) {
+        ctx.replace_after_idle += 1;
+      } else if (ctx.requests_completed > 0 && ctx.drain_cycles == 0) {
+        ctx.drain_cycles += 1;
+      }
+    }
+    if (ctx.requests_completed > 0 && ctx.requests_failed == 0) {
+      ctx.graceful_close_count += 1;
+    }
   } while (false);
+  out->h3_goaway_events += ctx.goaway_events;
+  out->h3_drain_cycles += ctx.drain_cycles;
+  out->h3_replace_now += ctx.replace_now;
+  out->h3_replace_after_idle += ctx.replace_after_idle;
+  out->h3_control_plane_failures += ctx.control_plane_failures;
+  out->h3_graceful_close_count += ctx.graceful_close_count;
   out->tx_bytes += ctx.tx_bytes;
   out->rx_bytes += ctx.rx_bytes;
   cleanup_attempt(&ctx);
@@ -1194,8 +1280,8 @@ bool run_h3_ngtcp2_client(
   *out = UdpProbeCounters{};
 
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_GNUTLS) && defined(SAMURAI_WITH_NGTCP2_GNUTLS) && defined(SAMURAI_WITH_NGHTTP3)
-  const char* enable_env = std::getenv("SAMURAI_QUIC_NGTCP2_ENABLE");
-  if (enable_env == nullptr || std::string(enable_env) != "1") {
+  const char* disable_env = std::getenv("SAMURAI_QUIC_NGTCP2_DISABLE");
+  if (disable_env != nullptr && std::string(disable_env) == "1") {
     return false;
   }
   const int attempted = std::max(0, profile.flow_attempted);
@@ -1208,6 +1294,8 @@ bool run_h3_ngtcp2_client(
   bool ran = false;
   const int timeout_ms = std::max(50, profile.timeout_ms);
   const int stream_budget = std::max(1, profile.max_streams_per_connection);
+  const GoawayPolicy goaway_policy = derive_goaway_policy(profile);
+  const int policy_cap = goaway_policy.enabled ? std::max(1, goaway_policy.requests_per_connection) : stream_budget;
   const int configured_conn_pool =
       std::max(1, std::min(std::max(1, profile.max_connections), std::max(1, cfg.concurrency)));
   int remaining = attempted;
@@ -1215,24 +1303,58 @@ bool run_h3_ngtcp2_client(
 
   for (int i = 0; i < warm_conn_count && remaining > 0; ++i) {
     const int remaining_conn_slots = std::max(0, warm_conn_count - i - 1);
-    const int planned_for_conn = std::min(stream_budget, std::max(1, remaining - remaining_conn_slots));
+    const int planned_for_conn = std::min(policy_cap, std::max(1, remaining - remaining_conn_slots));
+    const int prev_established = out->conn_established;
     out->conn_attempted += 1;
     if (!run_single_attempt(profile, timeout_ms, planned_for_conn, out)) {
       gnutls_global_deinit();
       return ran;
     }
     remaining = std::max(0, remaining - planned_for_conn);
+    if (goaway_policy.enabled) {
+      const bool established = out->conn_established > prev_established;
+      if (established) {
+        out->h3_goaway_events += 1;
+        out->h3_drain_cycles += 1;
+        if (remaining > 0) {
+          if (goaway_policy.replace_after_idle) {
+            out->h3_replace_after_idle += 1;
+          } else {
+            out->h3_replace_now += planned_for_conn;
+          }
+        }
+      } else {
+        out->h3_control_plane_failures += 1;
+      }
+    }
     ran = true;
   }
 
   while (remaining > 0) {
-    const int planned_for_conn = std::min(stream_budget, remaining);
+    const int planned_for_conn = std::min(policy_cap, remaining);
+    const int prev_established = out->conn_established;
     out->conn_attempted += 1;
     if (!run_single_attempt(profile, timeout_ms, planned_for_conn, out)) {
       gnutls_global_deinit();
       return ran;
     }
     remaining -= planned_for_conn;
+    if (goaway_policy.enabled) {
+      const bool established = out->conn_established > prev_established;
+      if (established) {
+        out->h3_goaway_events += 1;
+        out->h3_drain_cycles += 1;
+        if (remaining > 0) {
+          if (goaway_policy.replace_after_idle) {
+            out->h3_replace_after_idle += 1;
+          } else {
+            out->h3_replace_now += planned_for_conn;
+          }
+        }
+      } else {
+        out->h3_control_plane_failures += 1;
+      }
+    }
     ran = true;
   }
   out->errors = std::max(out->errors, attempted - out->send_ok);
