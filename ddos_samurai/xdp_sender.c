@@ -4378,6 +4378,91 @@ static int xdp_native_get_stats(int handle, xdp_native_stats *out, char *err, si
     return 0;
 }
 
+static int xdp_native_recv_frames(
+    int handle,
+    uint8_t *buffer,
+    int frame_stride,
+    uint16_t *lengths_out,
+    int max_count,
+    int snaplen,
+    char *err,
+    size_t err_len
+)
+{
+    xdp_context_t *ctx = NULL;
+    struct xsk_socket_info *xsk = NULL;
+    uint32_t rx_idx = 0;
+    uint32_t peeked = 0;
+    struct xdp_desc tmp_desc[XDP_BATCH_SIZE];
+    int copied = 0;
+
+    if (buffer == NULL || lengths_out == NULL || frame_stride <= 0 || max_count <= 0) {
+        xdp_native_set_err(err, err_len, "invalid recv args");
+        return -1;
+    }
+    if (max_count > XDP_BATCH_SIZE) {
+        max_count = XDP_BATCH_SIZE;
+    }
+    if (snaplen <= 0) {
+        snaplen = frame_stride;
+    }
+
+    ctx = lock_ctx_by_handle(handle);
+    if (!ctx) {
+        xdp_native_set_err(err, err_len, "invalid context handle");
+        return -1;
+    }
+    if (!ctx->is_initialized || !ctx->is_running || !ctx->xsk || !ctx->xsk->umem) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "context not initialized");
+        return -1;
+    }
+    xsk = ctx->xsk;
+    if (xsk->rx.size == 0 || xsk->rx.ring == NULL) {
+        pthread_mutex_unlock(&ctx->lock);
+        xdp_native_set_err(err, err_len, "");
+        return 0;
+    }
+
+    {
+        struct pollfd pfd = {.fd = xsk->fd, .events = POLLIN, .revents = 0};
+        (void)poll(&pfd, 1, 0);
+    }
+
+    peeked = xsk_ring_cons__peek(&xsk->rx, (uint32_t)max_count, &rx_idx);
+    if (peeked == 0) {
+        peeked = xsk_ring_cons__peek(&xsk->rx, 1, &rx_idx);
+        if (peeked == 0) {
+            pthread_mutex_unlock(&ctx->lock);
+            xdp_native_set_err(err, err_len, "");
+            return 0;
+        }
+    }
+
+    for (uint32_t i = 0; i < peeked; i++) {
+        struct xdp_desc *d = xsk_ring_cons__rx_desc(&xsk->rx, rx_idx + i);
+        tmp_desc[i] = *d;
+        uint32_t plen = d->len;
+        if (snaplen > 0 && plen > (uint32_t)snaplen) {
+            plen = (uint32_t)snaplen;
+        }
+        if (plen > (uint32_t)frame_stride) {
+            plen = (uint32_t)frame_stride;
+        }
+        const uint8_t *src = (const uint8_t*)xsk->umem->buffer + d->addr;
+        uint8_t *dst = buffer + ((size_t)i * (size_t)frame_stride);
+        memcpy(dst, src, plen);
+        lengths_out[i] = (uint16_t)plen;
+        copied += 1;
+    }
+
+    xsk_ring_cons__release(&xsk->rx, peeked);
+    (void)refill_rx_fill_ring(xsk, tmp_desc, peeked);
+    pthread_mutex_unlock(&ctx->lock);
+    xdp_native_set_err(err, err_len, "");
+    return copied;
+}
+
 static xdp_native_api_v1 g_xdp_native_api = {
     .version = XDP_NATIVE_API_VERSION,
     .create_ctx = xdp_native_create_ctx,
@@ -4389,6 +4474,7 @@ static xdp_native_api_v1 g_xdp_native_api = {
     .create_ctx_external_umem = xdp_native_create_ctx_external_umem,
     .submit_frame_ids = xdp_native_submit_frame_ids,
     .reap_completions = xdp_native_reap_completions,
+    .recv_frames = xdp_native_recv_frames,
 };
 
 // Public C ABI for non-Python native bridge callers (e.g., CUDA persistent bridge).

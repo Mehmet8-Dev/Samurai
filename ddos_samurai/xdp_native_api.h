@@ -59,6 +59,16 @@ typedef struct xdp_native_api_v1 {
         char *err,
         size_t err_len
     );
+    int (*recv_frames)(
+        int handle,
+        uint8_t *buffer,
+        int frame_stride,
+        uint16_t *lengths_out,
+        int max_count,
+        int snaplen,
+        char *err,
+        size_t err_len
+    );
 } xdp_native_api_v1;
 
 #endif /* SAMURAI_XDP_NATIVE_API_H */
