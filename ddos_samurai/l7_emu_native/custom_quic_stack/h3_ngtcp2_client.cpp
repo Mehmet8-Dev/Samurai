@@ -2,24 +2,37 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <optional>
+#include <random>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include <Python.h>
 #include <arpa/inet.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include "../../xdp_native_api.h"
 
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_GNUTLS) && defined(SAMURAI_WITH_NGTCP2_GNUTLS) && defined(SAMURAI_WITH_NGHTTP3)
 #include <gnutls/crypto.h>
@@ -85,6 +98,28 @@ struct H3FrameParseState {
   std::vector<uint8_t> buffer{};
 };
 
+enum class QuicUdpIoBackend {
+  KernelSocket = 0,
+  AfXdp = 1,
+  Dpdk = 2,
+};
+
+struct QuicXdpTransport {
+  const xdp_native_api_v1* api{nullptr};
+  int handle{0};
+  std::array<uint8_t, 6> src_mac{};
+  std::array<uint8_t, 6> dst_mac{};
+  uint32_t src_ip_nbo{0};
+  uint32_t dst_ip_nbo{0};
+  uint16_t src_port_nbo{0};
+  uint16_t dst_port_nbo{0};
+  uint16_t ip_id{1};
+  int rx_stride{2048};
+  std::vector<uint8_t> rx_frames{};
+  std::array<uint16_t, 64> rx_lens{};
+  std::array<uint8_t, 65536> udp_payload{};
+};
+
 struct Ngtcp2AttemptCtx {
   ngtcp2_crypto_conn_ref conn_ref{};
   ngtcp2_conn* conn{nullptr};
@@ -92,6 +127,11 @@ struct Ngtcp2AttemptCtx {
   gnutls_certificate_credentials_t cred{nullptr};
   gnutls_session_t session{nullptr};
   int fd{-1};
+  QuicUdpIoBackend udp_io_backend{QuicUdpIoBackend::KernelSocket};
+  QuicUdpIoBackend requested_backend{QuicUdpIoBackend::KernelSocket};
+  bool strict_runtime{false};
+  bool backend_fallback_used{false};
+  QuicXdpTransport xdp{};
   sockaddr_storage local_addr{};
   socklen_t local_addrlen{0};
   sockaddr_storage remote_addr{};
@@ -180,6 +220,274 @@ int64_t ns_to_ms_ceil(uint64_t delta_ns) {
   return static_cast<int64_t>((delta_ns + 999999ull) / 1000000ull);
 }
 
+bool env_truthy(const char* name) {
+  if (name == nullptr || name[0] == '\0') {
+    return false;
+  }
+  const char* raw = std::getenv(name);
+  if (raw == nullptr) {
+    return false;
+  }
+  std::string v(raw);
+  std::size_t b = 0;
+  while (b < v.size() && std::isspace(static_cast<unsigned char>(v[b])) != 0) {
+    ++b;
+  }
+  std::size_t e = v.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(v[e - 1])) != 0) {
+    --e;
+  }
+  v = v.substr(b, e - b);
+  std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
+QuicUdpIoBackend parse_backend_name(const std::string& raw) {
+  std::string v = raw;
+  std::size_t b = 0;
+  while (b < v.size() && std::isspace(static_cast<unsigned char>(v[b])) != 0) {
+    ++b;
+  }
+  std::size_t e = v.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(v[e - 1])) != 0) {
+    --e;
+  }
+  v = v.substr(b, e - b);
+  std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (v == "afxdp" || v == "af_xdp" || v == "xdp") {
+    return QuicUdpIoBackend::AfXdp;
+  }
+  if (v == "dpdk") {
+    return QuicUdpIoBackend::Dpdk;
+  }
+  return QuicUdpIoBackend::KernelSocket;
+}
+
+QuicUdpIoBackend resolve_requested_backend(const Profile& profile) {
+  std::string candidate = profile.stateful_runtime_backend;
+  const char* env_backend = std::getenv("SAMURAI_STATEFUL_RUNTIME_BACKEND");
+  if (env_backend != nullptr && env_backend[0] != '\0') {
+    candidate = env_backend;
+  }
+  return parse_backend_name(candidate);
+}
+
+bool parse_mac(const std::string& text, std::array<uint8_t, 6>* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  std::array<unsigned int, 6> tmp{};
+  if (std::sscanf(
+          text.c_str(),
+          "%x:%x:%x:%x:%x:%x",
+          &tmp[0],
+          &tmp[1],
+          &tmp[2],
+          &tmp[3],
+          &tmp[4],
+          &tmp[5]) != 6) {
+    return false;
+  }
+  for (std::size_t i = 0; i < out->size(); ++i) {
+    if (tmp[i] > 0xFFu) {
+      return false;
+    }
+    (*out)[i] = static_cast<uint8_t>(tmp[i]);
+  }
+  return true;
+}
+
+bool read_iface_mac(const std::string& iface, std::array<uint8_t, 6>* out) {
+  if (out == nullptr || iface.empty()) {
+    return false;
+  }
+  const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    return false;
+  }
+  ifreq ifr{};
+  std::snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", iface.c_str());
+  bool ok = false;
+  if (::ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) {
+    const unsigned char* mac = reinterpret_cast<const unsigned char*>(ifr.ifr_hwaddr.sa_data);
+    for (int i = 0; i < 6; ++i) {
+      (*out)[static_cast<std::size_t>(i)] = mac[i];
+    }
+    ok = true;
+  }
+  (void)::close(fd);
+  return ok;
+}
+
+bool read_iface_ipv4(const std::string& iface, uint32_t* out_nbo) {
+  if (out_nbo == nullptr || iface.empty()) {
+    return false;
+  }
+  const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    return false;
+  }
+  ifreq ifr{};
+  std::snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", iface.c_str());
+  bool ok = false;
+  if (::ioctl(fd, SIOCGIFADDR, &ifr) == 0) {
+    const auto* sa = reinterpret_cast<const sockaddr_in*>(&ifr.ifr_addr);
+    *out_nbo = sa->sin_addr.s_addr;
+    ok = true;
+  }
+  (void)::close(fd);
+  return ok;
+}
+
+std::optional<std::array<uint8_t, 6>> lookup_arp_mac(const std::string& iface, const std::string& target_ip) {
+  std::ifstream in("/proc/net/arp");
+  if (!in.is_open()) {
+    return std::nullopt;
+  }
+  std::string line{};
+  if (!std::getline(in, line)) {
+    return std::nullopt;
+  }
+  while (std::getline(in, line)) {
+    std::istringstream iss(line);
+    std::string ip{};
+    std::string hw_type{};
+    std::string flags{};
+    std::string mac{};
+    std::string mask{};
+    std::string dev{};
+    if (!(iss >> ip >> hw_type >> flags >> mac >> mask >> dev)) {
+      continue;
+    }
+    if (ip != target_ip) {
+      continue;
+    }
+    if (!iface.empty() && dev != iface) {
+      continue;
+    }
+    std::array<uint8_t, 6> out{};
+    if (parse_mac(mac, &out)) {
+      return out;
+    }
+  }
+  return std::nullopt;
+}
+
+uint16_t fold_checksum(uint32_t sum) {
+  while ((sum >> 16u) != 0u) {
+    sum = (sum & 0xFFFFu) + (sum >> 16u);
+  }
+  return static_cast<uint16_t>(~sum & 0xFFFFu);
+}
+
+uint16_t ipv4_header_checksum(const iphdr* ip) {
+  if (ip == nullptr) {
+    return 0;
+  }
+  const auto* words = reinterpret_cast<const uint16_t*>(ip);
+  uint32_t sum = 0;
+  for (int i = 0; i < 10; ++i) {
+    if (i == 5) {
+      continue;
+    }
+    sum += ntohs(words[i]);
+  }
+  return htons(fold_checksum(sum));
+}
+
+uint16_t udp_ipv4_checksum(
+    uint32_t src_ip_nbo,
+    uint32_t dst_ip_nbo,
+    const udphdr* udp,
+    const uint8_t* payload,
+    std::size_t payload_len) {
+  if (udp == nullptr) {
+    return 0;
+  }
+  uint32_t sum = 0;
+  const uint16_t src_hi = static_cast<uint16_t>((ntohl(src_ip_nbo) >> 16) & 0xFFFFu);
+  const uint16_t src_lo = static_cast<uint16_t>(ntohl(src_ip_nbo) & 0xFFFFu);
+  const uint16_t dst_hi = static_cast<uint16_t>((ntohl(dst_ip_nbo) >> 16) & 0xFFFFu);
+  const uint16_t dst_lo = static_cast<uint16_t>(ntohl(dst_ip_nbo) & 0xFFFFu);
+  sum += src_hi;
+  sum += src_lo;
+  sum += dst_hi;
+  sum += dst_lo;
+  sum += static_cast<uint16_t>(IPPROTO_UDP);
+  sum += ntohs(udp->len);
+
+  const auto* udp_words = reinterpret_cast<const uint16_t*>(udp);
+  sum += ntohs(udp_words[0]);
+  sum += ntohs(udp_words[1]);
+  sum += ntohs(udp_words[2]);
+  // checksum field is treated as zero
+
+  std::size_t i = 0;
+  while (i + 1 < payload_len) {
+    const uint16_t w = static_cast<uint16_t>((static_cast<uint16_t>(payload[i]) << 8u) |
+                                             static_cast<uint16_t>(payload[i + 1]));
+    sum += w;
+    i += 2;
+  }
+  if (i < payload_len) {
+    const uint16_t w = static_cast<uint16_t>(static_cast<uint16_t>(payload[i]) << 8u);
+    sum += w;
+  }
+  const uint16_t csum = fold_checksum(sum);
+  return csum == 0 ? 0xFFFFu : htons(csum);
+}
+
+const xdp_native_api_v1* load_xdp_native_api() {
+  PyGILState_STATE gil = PyGILState_Ensure();
+  PyObject* mod = PyImport_ImportModule("ddos_samurai.xdp_sender");
+  if (mod == nullptr) {
+    PyErr_Clear();
+    mod = PyImport_ImportModule("xdp_sender");
+  }
+  if (mod == nullptr) {
+    PyErr_Clear();
+    PyGILState_Release(gil);
+    return nullptr;
+  }
+  PyObject* fn = PyObject_GetAttrString(mod, "xdp_get_native_api");
+  if (fn == nullptr || !PyCallable_Check(fn)) {
+    Py_XDECREF(fn);
+    Py_DECREF(mod);
+    PyGILState_Release(gil);
+    return nullptr;
+  }
+  PyObject* cap = PyObject_CallNoArgs(fn);
+  Py_DECREF(fn);
+  Py_DECREF(mod);
+  if (cap == nullptr) {
+    PyErr_Clear();
+    PyGILState_Release(gil);
+    return nullptr;
+  }
+  void* ptr = PyCapsule_GetPointer(cap, XDP_NATIVE_API_CAPSULE_NAME);
+  Py_DECREF(cap);
+  if (ptr == nullptr) {
+    PyErr_Clear();
+    PyGILState_Release(gil);
+    return nullptr;
+  }
+  const auto* api = static_cast<const xdp_native_api_v1*>(ptr);
+  if (api->version < XDP_NATIVE_API_VERSION ||
+      api->create_ctx == nullptr ||
+      api->destroy_ctx == nullptr ||
+      api->send_buffer == nullptr ||
+      api->recv_frames == nullptr) {
+    PyGILState_Release(gil);
+    return nullptr;
+  }
+  PyGILState_Release(gil);
+  return api;
+}
+
 bool is_numeric_host(const std::string& host) {
   in_addr v4{};
   if (::inet_pton(AF_INET, host.c_str(), &v4) == 1) {
@@ -204,10 +512,14 @@ bool resolve_target(
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_DGRAM;
   hints.ai_protocol = IPPROTO_UDP;
-  hints.ai_flags = AI_NUMERICHOST;
   addrinfo* result = nullptr;
   const std::string port_s = std::to_string(std::max(1, port));
-  const int rc = ::getaddrinfo(host.c_str(), port_s.c_str(), &hints, &result);
+  int rc = ::getaddrinfo(host.c_str(), port_s.c_str(), &hints, &result);
+  if (rc != 0 || result == nullptr) {
+    // Preserve numeric-host fast path while allowing DNS hostnames.
+    hints.ai_flags = AI_NUMERICHOST;
+    rc = ::getaddrinfo(host.c_str(), port_s.c_str(), &hints, &result);
+  }
   if (rc != 0 || result == nullptr) {
     return false;
   }
@@ -242,6 +554,58 @@ std::string to_lower_ascii(std::string s) {
     return static_cast<char>(std::tolower(c));
   });
   return s;
+}
+
+std::string trim_ascii(const std::string& s) {
+  std::size_t b = 0;
+  while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b])) != 0) {
+    ++b;
+  }
+  std::size_t e = s.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1])) != 0) {
+    --e;
+  }
+  return s.substr(b, e - b);
+}
+
+std::string normalize_authority_host(std::string authority) {
+  authority = trim_ascii(authority);
+  if (authority.empty()) {
+    return authority;
+  }
+  if (authority.front() == '[') {
+    const std::size_t rb = authority.find(']');
+    if (rb != std::string::npos && rb > 1) {
+      return authority.substr(1, rb - 1);
+    }
+  }
+  const std::size_t first_colon = authority.find(':');
+  if (first_colon == std::string::npos) {
+    return authority;
+  }
+  // Single-colon host:port (IPv4/domain). Multi-colon value is likely IPv6 literal.
+  if (authority.find(':', first_colon + 1) == std::string::npos) {
+    return authority.substr(0, first_colon);
+  }
+  return authority;
+}
+
+void derive_tls_names(
+    const Profile& profile,
+    std::string* out_sni_name,
+    std::string* out_verify_name) {
+  if (out_sni_name == nullptr || out_verify_name == nullptr) {
+    return;
+  }
+  const std::string authority_host = normalize_authority_host(profile.host_header);
+  const std::string target_host = trim_ascii(profile.target_ip);
+  const std::string canonical = authority_host.empty() ? target_host : authority_host;
+  *out_verify_name = canonical;
+  if (!canonical.empty() && !is_numeric_host(canonical)) {
+    *out_sni_name = canonical;
+  } else {
+    out_sni_name->clear();
+  }
 }
 
 bool header_expect_ok(
@@ -1191,7 +1555,10 @@ int lost_datagram_cb(ngtcp2_conn* conn, uint64_t dgram_id, void* user_data) {
   return 0;
 }
 
-bool configure_gnutls_session(Ngtcp2AttemptCtx* ctx, const std::string& host) {
+bool configure_gnutls_session(
+    Ngtcp2AttemptCtx* ctx,
+    const std::string& sni_name,
+    bool verify_peer) {
   if (ctx == nullptr) {
     return false;
   }
@@ -1224,21 +1591,33 @@ bool configure_gnutls_session(Ngtcp2AttemptCtx* ctx, const std::string& host) {
   if (gnutls_credentials_set(ctx->session, GNUTLS_CRD_CERTIFICATE, ctx->cred) != 0) {
     return false;
   }
-  if (!is_numeric_host(host)) {
+  if (!sni_name.empty()) {
     (void)gnutls_server_name_set(
         ctx->session,
         GNUTLS_NAME_DNS,
-        host.data(),
-        host.size());
-  } else {
-    static constexpr std::string_view kLocal = "localhost";
-    (void)gnutls_server_name_set(
-        ctx->session,
-        GNUTLS_NAME_DNS,
-        kLocal.data(),
-        kLocal.size());
+        sni_name.data(),
+        sni_name.size());
   }
   return true;
+}
+
+bool verify_peer_certificate(
+    Ngtcp2AttemptCtx* ctx,
+    const std::string& verify_name,
+    bool verify_peer) {
+  if (!verify_peer) {
+    return true;
+  }
+  if (ctx == nullptr || ctx->session == nullptr) {
+    return false;
+  }
+  unsigned int status = 0;
+  const char* verify_host = verify_name.empty() ? nullptr : verify_name.c_str();
+  const int rc = gnutls_certificate_verify_peers3(ctx->session, verify_host, &status);
+  if (rc != 0) {
+    return false;
+  }
+  return status == 0;
 }
 
 bool init_quic_conn(Ngtcp2AttemptCtx* ctx) {
@@ -1500,32 +1879,312 @@ void cleanup_attempt(Ngtcp2AttemptCtx* ctx) {
     (void)::close(ctx->fd);
     ctx->fd = -1;
   }
+  if (ctx->xdp.api != nullptr && ctx->xdp.handle > 0) {
+    char err[160]{};
+    (void)ctx->xdp.api->destroy_ctx(ctx->xdp.handle, err, sizeof(err));
+  }
+  ctx->xdp = QuicXdpTransport{};
+  ctx->udp_io_backend = QuicUdpIoBackend::KernelSocket;
 }
 
 bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
+  auto connect_udp_kernel = [](Ngtcp2AttemptCtx* c) -> bool {
+    if (c == nullptr) {
+      return false;
+    }
+    const int family = c->remote_addr.ss_family == AF_INET6 ? AF_INET6 : AF_INET;
+    c->fd = ::socket(family, SOCK_DGRAM, 0);
+    if (c->fd < 0) {
+      return false;
+    }
+    if (::connect(c->fd, reinterpret_cast<sockaddr*>(&c->remote_addr), c->remote_addrlen) != 0) {
+      return false;
+    }
+    c->local_addrlen = sizeof(c->local_addr);
+    if (::getsockname(c->fd, reinterpret_cast<sockaddr*>(&c->local_addr), &c->local_addrlen) != 0) {
+      return false;
+    }
+    timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 20000;
+    (void)::setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    c->udp_io_backend = QuicUdpIoBackend::KernelSocket;
+    return true;
+  };
+
+  auto connect_udp_afxdp = [&](Ngtcp2AttemptCtx* c, const Profile& p) -> bool {
+    if (c == nullptr) {
+      return false;
+    }
+    if (c->remote_addr.ss_family != AF_INET || c->remote_addrlen < static_cast<socklen_t>(sizeof(sockaddr_in))) {
+      return false;
+    }
+
+    const char* iface_env = std::getenv("SAMURAI_XDP_INTERFACE");
+    const std::string iface = iface_env == nullptr ? "" : std::string(iface_env);
+    if (iface.empty()) {
+      return false;
+    }
+    const xdp_native_api_v1* api = load_xdp_native_api();
+    if (api == nullptr) {
+      return false;
+    }
+    int queue_id = 0;
+    if (const char* qenv = std::getenv("SAMURAI_XDP_QUEUE_ID"); qenv != nullptr) {
+      queue_id = std::max(0, std::atoi(qenv));
+    }
+    int mode = 1;
+    if (const char* menv = std::getenv("SAMURAI_XDP_MODE"); menv != nullptr) {
+      mode = std::clamp(std::atoi(menv), 0, 2);
+    }
+    char err[160]{};
+    const int handle = api->create_ctx(iface.c_str(), queue_id, mode, err, sizeof(err));
+    if (handle <= 0) {
+      return false;
+    }
+
+    c->xdp = QuicXdpTransport{};
+    c->xdp.api = api;
+    c->xdp.handle = handle;
+
+    sockaddr_in remote4{};
+    std::memcpy(&remote4, &c->remote_addr, sizeof(remote4));
+    c->xdp.dst_ip_nbo = remote4.sin_addr.s_addr;
+    c->xdp.dst_port_nbo = htons(static_cast<uint16_t>(std::max(1, p.target_port)));
+
+    uint32_t src_ip_nbo = 0;
+    in_addr src_ip_addr{};
+    if (!p.source_ip.empty() && ::inet_pton(AF_INET, p.source_ip.c_str(), &src_ip_addr) == 1) {
+      src_ip_nbo = src_ip_addr.s_addr;
+    } else if (!read_iface_ipv4(iface, &src_ip_nbo)) {
+      (void)api->destroy_ctx(handle, err, sizeof(err));
+      c->xdp = QuicXdpTransport{};
+      return false;
+    }
+    c->xdp.src_ip_nbo = src_ip_nbo;
+
+    if (!read_iface_mac(iface, &c->xdp.src_mac)) {
+      (void)api->destroy_ctx(handle, err, sizeof(err));
+      c->xdp = QuicXdpTransport{};
+      return false;
+    }
+
+    bool got_dst_mac = false;
+    if (const char* dst_env = std::getenv("SAMURAI_QUIC_AF_XDP_DST_MAC");
+        dst_env != nullptr && dst_env[0] != '\0') {
+      got_dst_mac = parse_mac(dst_env, &c->xdp.dst_mac);
+    }
+    const char* fallback_dst = std::getenv("SAMURAI_GPU_TX_MAC");
+    if (!got_dst_mac && fallback_dst != nullptr && fallback_dst[0] != '\0') {
+      got_dst_mac = parse_mac(fallback_dst, &c->xdp.dst_mac);
+    }
+    if (!got_dst_mac) {
+      char ipbuf[INET_ADDRSTRLEN]{};
+      const char* iptxt = ::inet_ntop(AF_INET, &remote4.sin_addr, ipbuf, sizeof(ipbuf));
+      const std::string target_ip = iptxt == nullptr ? "" : std::string(iptxt);
+      if (!target_ip.empty()) {
+        const auto arp = lookup_arp_mac(iface, target_ip);
+        if (arp.has_value()) {
+          c->xdp.dst_mac = *arp;
+          got_dst_mac = true;
+        }
+      }
+    }
+    if (!got_dst_mac) {
+      (void)api->destroy_ctx(handle, err, sizeof(err));
+      c->xdp = QuicXdpTransport{};
+      return false;
+    }
+
+    std::random_device rd{};
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> port_dist(20000, 65000);
+    c->xdp.src_port_nbo = htons(static_cast<uint16_t>(port_dist(gen)));
+
+    sockaddr_in local4{};
+    local4.sin_family = AF_INET;
+    local4.sin_port = c->xdp.src_port_nbo;
+    local4.sin_addr.s_addr = c->xdp.src_ip_nbo;
+    std::memset(&c->local_addr, 0, sizeof(c->local_addr));
+    std::memcpy(&c->local_addr, &local4, sizeof(local4));
+    c->local_addrlen = sizeof(local4);
+    c->fd = -1;
+    c->xdp.rx_frames.assign(static_cast<std::size_t>(c->xdp.rx_stride) * c->xdp.rx_lens.size(), 0);
+    c->udp_io_backend = QuicUdpIoBackend::AfXdp;
+    return true;
+  };
+
   if (ctx == nullptr) {
     return false;
   }
   if (!resolve_target(profile.target_ip, profile.target_port, &ctx->remote_addr, &ctx->remote_addrlen)) {
     return false;
   }
-  const int family = ctx->remote_addr.ss_family == AF_INET6 ? AF_INET6 : AF_INET;
-  ctx->fd = ::socket(family, SOCK_DGRAM, 0);
-  if (ctx->fd < 0) {
-    return false;
+
+  if (ctx->requested_backend == QuicUdpIoBackend::AfXdp) {
+    if (connect_udp_afxdp(ctx, profile)) {
+      return true;
+    }
+    if (ctx->strict_runtime) {
+      return false;
+    }
+    ctx->backend_fallback_used = true;
+    return connect_udp_kernel(ctx);
   }
-  if (::connect(ctx->fd, reinterpret_cast<sockaddr*>(&ctx->remote_addr), ctx->remote_addrlen) != 0) {
-    return false;
+  if (ctx->requested_backend == QuicUdpIoBackend::Dpdk) {
+    if (ctx->strict_runtime) {
+      return false;
+    }
+    ctx->backend_fallback_used = true;
+    return connect_udp_kernel(ctx);
   }
-  ctx->local_addrlen = sizeof(ctx->local_addr);
-  if (::getsockname(ctx->fd, reinterpret_cast<sockaddr*>(&ctx->local_addr), &ctx->local_addrlen) != 0) {
-    return false;
+  return connect_udp_kernel(ctx);
+}
+
+ssize_t send_udp_payload(Ngtcp2AttemptCtx* ctx, const uint8_t* payload, std::size_t payload_len) {
+  if (ctx == nullptr || payload == nullptr || payload_len == 0) {
+    return -1;
   }
-  timeval tv{};
-  tv.tv_sec = 0;
-  tv.tv_usec = 20000;
-  (void)::setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  return true;
+  if (ctx->udp_io_backend == QuicUdpIoBackend::KernelSocket) {
+    if (ctx->fd < 0) {
+      return -1;
+    }
+    return ::send(ctx->fd, payload, payload_len, 0);
+  }
+  if (ctx->udp_io_backend != QuicUdpIoBackend::AfXdp || ctx->xdp.api == nullptr || ctx->xdp.handle <= 0) {
+    return -1;
+  }
+  if (payload_len > 1400) {
+    return -1;
+  }
+  std::vector<uint8_t> frame{};
+  frame.resize(14u + sizeof(iphdr) + sizeof(udphdr) + payload_len);
+  std::size_t off = 0;
+  for (std::size_t i = 0; i < 6; ++i) {
+    frame[off + i] = ctx->xdp.dst_mac[i];
+    frame[off + 6 + i] = ctx->xdp.src_mac[i];
+  }
+  frame[off + 12] = 0x08;
+  frame[off + 13] = 0x00;
+  off += 14;
+
+  auto* ip = reinterpret_cast<iphdr*>(frame.data() + off);
+  std::memset(ip, 0, sizeof(*ip));
+  ip->version = 4;
+  ip->ihl = 5;
+  ip->ttl = 64;
+  ip->protocol = IPPROTO_UDP;
+  ip->id = htons(ctx->xdp.ip_id++);
+  ip->frag_off = htons(0x4000);
+  ip->tot_len = htons(static_cast<uint16_t>(sizeof(iphdr) + sizeof(udphdr) + payload_len));
+  ip->saddr = ctx->xdp.src_ip_nbo;
+  ip->daddr = ctx->xdp.dst_ip_nbo;
+  ip->check = ipv4_header_checksum(ip);
+  off += sizeof(iphdr);
+
+  auto* udp = reinterpret_cast<udphdr*>(frame.data() + off);
+  std::memset(udp, 0, sizeof(*udp));
+  udp->source = ctx->xdp.src_port_nbo;
+  udp->dest = ctx->xdp.dst_port_nbo;
+  udp->len = htons(static_cast<uint16_t>(sizeof(udphdr) + payload_len));
+  off += sizeof(udphdr);
+  std::memcpy(frame.data() + off, payload, payload_len);
+  udp->check = udp_ipv4_checksum(ctx->xdp.src_ip_nbo, ctx->xdp.dst_ip_nbo, udp, payload, payload_len);
+
+  char err[160]{};
+  const int sent = ctx->xdp.api->send_buffer(
+      ctx->xdp.handle,
+      frame.data(),
+      static_cast<int>(frame.size()),
+      1,
+      err,
+      sizeof(err));
+  if (sent <= 0) {
+    return -1;
+  }
+  return static_cast<ssize_t>(payload_len);
+}
+
+int recv_udp_payloads(
+    Ngtcp2AttemptCtx* ctx,
+    uint8_t* payload_buf,
+    std::size_t stride,
+    std::size_t* lens_out,
+    int max_packets) {
+  if (ctx == nullptr || payload_buf == nullptr || lens_out == nullptr || stride == 0 || max_packets <= 0) {
+    return -1;
+  }
+  if (ctx->udp_io_backend == QuicUdpIoBackend::KernelSocket) {
+    if (ctx->fd < 0) {
+      return -1;
+    }
+    const ssize_t nread = ::recv(ctx->fd, payload_buf, stride, MSG_DONTWAIT);
+    if (nread <= 0) {
+      return 0;
+    }
+    lens_out[0] = static_cast<std::size_t>(nread);
+    return 1;
+  }
+  if (ctx->udp_io_backend != QuicUdpIoBackend::AfXdp || ctx->xdp.api == nullptr || ctx->xdp.handle <= 0) {
+    return -1;
+  }
+  const int want = std::min<int>(max_packets, static_cast<int>(ctx->xdp.rx_lens.size()));
+  char err[160]{};
+  const int got = ctx->xdp.api->recv_frames(
+      ctx->xdp.handle,
+      ctx->xdp.rx_frames.data(),
+      ctx->xdp.rx_stride,
+      ctx->xdp.rx_lens.data(),
+      want,
+      ctx->xdp.rx_stride,
+      err,
+      sizeof(err));
+  if (got <= 0) {
+    return 0;
+  }
+  int accepted = 0;
+  for (int i = 0; i < got && accepted < max_packets; ++i) {
+    const std::size_t flen = ctx->xdp.rx_lens[static_cast<std::size_t>(i)];
+    if (flen < 14 + sizeof(iphdr) + sizeof(udphdr)) {
+      continue;
+    }
+    const uint8_t* frame = ctx->xdp.rx_frames.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(ctx->xdp.rx_stride);
+    const uint16_t ethertype = static_cast<uint16_t>((static_cast<uint16_t>(frame[12]) << 8u) | frame[13]);
+    if (ethertype != ETH_P_IP) {
+      continue;
+    }
+    const auto* ip = reinterpret_cast<const iphdr*>(frame + 14);
+    if (ip->version != 4 || ip->ihl < 5 || ip->protocol != IPPROTO_UDP) {
+      continue;
+    }
+    const std::size_t ihl_bytes = static_cast<std::size_t>(ip->ihl) * 4u;
+    if (14u + ihl_bytes + sizeof(udphdr) > flen) {
+      continue;
+    }
+    const auto* udp = reinterpret_cast<const udphdr*>(frame + 14u + ihl_bytes);
+    if (udp->dest != ctx->xdp.src_port_nbo) {
+      continue;
+    }
+    if (ip->daddr != ctx->xdp.src_ip_nbo) {
+      continue;
+    }
+    if (udp->source != ctx->xdp.dst_port_nbo) {
+      continue;
+    }
+    const uint16_t udp_len = ntohs(udp->len);
+    if (udp_len < sizeof(udphdr)) {
+      continue;
+    }
+    const std::size_t payload_len = static_cast<std::size_t>(udp_len - sizeof(udphdr));
+    const std::size_t payload_off = 14u + ihl_bytes + sizeof(udphdr);
+    if (payload_off + payload_len > flen || payload_len > stride) {
+      continue;
+    }
+    std::memcpy(payload_buf + static_cast<std::size_t>(accepted) * stride, frame + payload_off, payload_len);
+    lens_out[static_cast<std::size_t>(accepted)] = payload_len;
+    ++accepted;
+  }
+  return accepted;
 }
 
 bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters* out) {
@@ -1564,7 +2223,7 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
           1,
           ts);
       if (dnwrite > 0) {
-        const ssize_t dwr = ::send(ctx->fd, dpkt.data(), static_cast<std::size_t>(dnwrite), 0);
+        const ssize_t dwr = send_udp_payload(ctx, dpkt.data(), static_cast<std::size_t>(dnwrite));
         if (dwr > 0 && accepted != 0) {
           ctx->datagram_tx_events += 1;
           if (out != nullptr) {
@@ -1700,7 +2359,7 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
     if (nwrite == 0) {
       break;
     }
-    const ssize_t wr = ::send(ctx->fd, pkt.data(), static_cast<std::size_t>(nwrite), 0);
+    const ssize_t wr = send_udp_payload(ctx, pkt.data(), static_cast<std::size_t>(nwrite));
     if (wr <= 0) {
       return false;
     }
@@ -1713,30 +2372,47 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
   }
 
   // Receive packet(s)
+  std::array<uint8_t, 64 * 2048> rx_batch{};
+  std::array<std::size_t, 64> rx_lens{};
   for (int iter = 0; iter < 64; ++iter) {
-    std::array<uint8_t, 65536> rx{};
-    const ssize_t nread = ::recv(ctx->fd, rx.data(), rx.size(), MSG_DONTWAIT);
-    if (nread <= 0) {
+    const int got = recv_udp_payloads(ctx, rx_batch.data(), 2048, rx_lens.data(), 64);
+    if (got < 0) {
+      return false;
+    }
+    if (got == 0) {
       break;
     }
-    if (out != nullptr) {
-      out->rx_datagrams += 1;
-    }
-    ngtcp2_path path{};
-    path.local.addr = reinterpret_cast<sockaddr*>(&ctx->local_addr);
-    path.local.addrlen = ctx->local_addrlen;
-    path.remote.addr = reinterpret_cast<sockaddr*>(&ctx->remote_addr);
-    path.remote.addrlen = ctx->remote_addrlen;
-    ngtcp2_pkt_info pi{};
-    if (ngtcp2_conn_read_pkt(ctx->conn, &path, &pi, rx.data(), static_cast<std::size_t>(nread), now_ns()) != 0) {
-      return false;
+    for (int i = 0; i < got; ++i) {
+      const std::size_t nread = rx_lens[static_cast<std::size_t>(i)];
+      if (nread == 0) {
+        continue;
+      }
+      if (out != nullptr) {
+        out->rx_datagrams += 1;
+      }
+      ctx->rx_bytes += nread;
+      ngtcp2_path path{};
+      path.local.addr = reinterpret_cast<sockaddr*>(&ctx->local_addr);
+      path.local.addrlen = ctx->local_addrlen;
+      path.remote.addr = reinterpret_cast<sockaddr*>(&ctx->remote_addr);
+      path.remote.addrlen = ctx->remote_addrlen;
+      ngtcp2_pkt_info pi{};
+      if (ngtcp2_conn_read_pkt(
+              ctx->conn,
+              &path,
+              &pi,
+              rx_batch.data() + static_cast<std::size_t>(i) * 2048u,
+              nread,
+              now_ns()) != 0) {
+        return false;
+      }
     }
   }
 
   if (ngtcp2_conn_handle_expiry(ctx->conn, now_ns()) != 0) {
     return false;
   }
-  if (ctx->fd >= 0) {
+  if (ctx->udp_io_backend == QuicUdpIoBackend::KernelSocket && ctx->fd >= 0) {
     const uint64_t now = now_ns();
     const uint64_t expiry = ngtcp2_conn_get_expiry(ctx->conn);
     const uint64_t next_wakeup = std::min(deadline_ns, expiry);
@@ -1790,6 +2466,16 @@ bool run_single_attempt(
   ctx.feature_policy = feature_policy;
   ctx.max_push_id_advertised = feature_policy.max_push_id;
   ctx.max_push_id_set = true;
+  ctx.requested_backend = resolve_requested_backend(profile);
+  ctx.strict_runtime =
+      profile.stateful_runtime_strict != 0 ||
+      env_truthy("SAMURAI_L7_CAPABILITY_STRICT") ||
+      env_truthy("SAMURAI_L7_QUIC_REQUIRE_NATIVE");
+  out->runtime_backend_requested = static_cast<int>(ctx.requested_backend);
+  std::string tls_sni_name{};
+  std::string tls_verify_name{};
+  derive_tls_names(profile, &tls_sni_name, &tls_verify_name);
+  const bool verify_peer = profile.verify != 0;
 
   do {
     if (!connect_udp(&ctx, profile)) {
@@ -1800,7 +2486,14 @@ bool run_single_attempt(
       out->response_validation_fail += request_budget;
       break;
     }
-    if (!configure_gnutls_session(&ctx, profile.target_ip)) {
+    if (ctx.backend_fallback_used) {
+      out->backend_fallback_count += 1;
+    }
+    out->runtime_udp_io_backend = static_cast<int>(ctx.udp_io_backend);
+    out->runtime_native_hot_path_ready =
+        ctx.udp_io_backend == QuicUdpIoBackend::AfXdp || ctx.udp_io_backend == QuicUdpIoBackend::Dpdk ? 1 : 0;
+    out->runtime_backend_requested = static_cast<int>(ctx.requested_backend);
+    if (!configure_gnutls_session(&ctx, tls_sni_name, verify_peer)) {
       out->handshake_fail += request_budget;
       out->timeouts += request_budget;
       out->errors += request_budget;
@@ -1825,6 +2518,12 @@ bool run_single_attempt(
     if (!ctx.handshake_done) {
       out->handshake_fail += request_budget;
       out->timeouts += request_budget;
+      out->errors += request_budget;
+      out->response_validation_fail += request_budget;
+      break;
+    }
+    if (!verify_peer_certificate(&ctx, tls_verify_name, verify_peer)) {
+      out->handshake_fail += request_budget;
       out->errors += request_budget;
       out->response_validation_fail += request_budget;
       break;
