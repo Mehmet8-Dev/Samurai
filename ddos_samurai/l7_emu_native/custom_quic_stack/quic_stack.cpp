@@ -1,6 +1,7 @@
 #include "quic_stack.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 
 #include "crypto_backend.hpp"
@@ -19,10 +20,23 @@ std::map<std::string, double> run_quic_profile(
     TransportBackend transport_backend) {
   std::map<std::string, double> out = init_quic_stats(profile, transport_backend, caps);
 
-  // QUIC custom stack currently runs over its own UDP probe transport.
-  // Treat transport seam as ready to avoid unrelated custom-tcp fallback signaling.
+  // QUIC custom stack currently runs over a kernel UDP socket transport.
+  // Keep this explicit in metrics to avoid false "hot-path-ready" signaling.
   out["runtime_transport_custom_tcp_bridge_ready"] = 1.0;
   out["runtime_transport_seam_ready"] = 1.0;
+  std::string backend = profile.stateful_runtime_backend;
+  std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (backend == "afxdp") {
+    out["quic_runtime_backend_requested"] = 1.0;
+  } else if (backend == "dpdk") {
+    out["quic_runtime_backend_requested"] = 2.0;
+  } else {
+    out["quic_runtime_backend_requested"] = 0.0;
+  }
+  out["quic_runtime_udp_io_backend"] = 0.0;
+  out["quic_runtime_native_hot_path_ready"] = 0.0;
 
   const int attempted = std::max(0, profile.flow_attempted);
   const int conn_pool = std::max(1, std::min(std::max(1, profile.max_connections), std::max(1, cfg.concurrency)));
@@ -60,6 +74,12 @@ std::map<std::string, double> run_quic_profile(
 
   UdpProbeCounters udp{};
   const bool ngtcp2_ready = run_h3_ngtcp2_client(profile, cfg, &udp);
+  out["quic_runtime_udp_io_backend"] = static_cast<double>(udp.runtime_udp_io_backend);
+  out["quic_runtime_native_hot_path_ready"] = static_cast<double>(udp.runtime_native_hot_path_ready);
+  if (udp.runtime_backend_requested >= 0) {
+    out["quic_runtime_backend_requested"] = static_cast<double>(udp.runtime_backend_requested);
+  }
+  out["quic_runtime_backend_fallback_count"] = static_cast<double>(udp.backend_fallback_count);
   const bool run_ok = ngtcp2_ready;
   out["quic_runtime_ngtcp2_ready"] = ngtcp2_ready ? 1.0 : 0.0;
   out["quic_runtime_real_client_ready"] = ngtcp2_ready ? 1.0 : 0.0;

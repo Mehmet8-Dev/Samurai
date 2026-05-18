@@ -33,6 +33,10 @@ std::map<std::string, double> init_quic_stats(
   out["runtime_transport_custom_tcp_bridge_ready"] = transport_backend == TransportBackend::CustomTcp ? 0.0 : 1.0;
   out["runtime_transport_custom_tcp_rx_bridge_active"] = 0.0;
   out["runtime_transport_seam_ready"] = transport_backend == TransportBackend::CustomTcp ? 0.0 : 1.0;
+  out["quic_runtime_udp_io_backend"] = 0.0;  // 0=kernel_socket, 1=af_xdp, 2=dpdk
+  out["quic_runtime_backend_requested"] = 0.0;  // 0=kernel/default, 1=af_xdp, 2=dpdk
+  out["quic_runtime_native_hot_path_ready"] = 0.0;
+  out["quic_runtime_backend_fallback_count"] = 0.0;
 
   out["quic_capability_available"] = 0.0;
   out["quic_connection_attempts"] = static_cast<double>(attempted);
