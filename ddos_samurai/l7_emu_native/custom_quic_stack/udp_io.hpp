@@ -33,6 +33,10 @@ struct UdpProbeCounters {
   int h3_datagram_rx_events{0};
   int h3_server_push_events{0};
   int h3_feature_failures{0};
+  int runtime_udp_io_backend{0};  // 0=kernel_socket, 1=af_xdp, 2=dpdk
+  int runtime_native_hot_path_ready{0};
+  int runtime_backend_requested{0};  // 0=kernel_socket, 1=af_xdp, 2=dpdk
+  int backend_fallback_count{0};
   int tx_datagrams{0};
   int rx_datagrams{0};
   int pacing_wait_events{0};

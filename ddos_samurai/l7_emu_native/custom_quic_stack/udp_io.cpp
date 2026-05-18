@@ -28,11 +28,14 @@ bool resolve_udp_target(const Profile& profile, sockaddr_storage* out_addr, sock
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_DGRAM;
   hints.ai_protocol = IPPROTO_UDP;
-  hints.ai_flags = AI_NUMERICHOST;
 
   addrinfo* result = nullptr;
   const std::string port = std::to_string(std::max(1, profile.target_port));
-  const int rc = getaddrinfo(profile.target_ip.c_str(), port.c_str(), &hints, &result);
+  int rc = getaddrinfo(profile.target_ip.c_str(), port.c_str(), &hints, &result);
+  if (rc != 0 || result == nullptr) {
+    hints.ai_flags = AI_NUMERICHOST;
+    rc = getaddrinfo(profile.target_ip.c_str(), port.c_str(), &hints, &result);
+  }
   if (rc != 0 || result == nullptr) {
     return false;
   }
