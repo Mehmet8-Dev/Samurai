@@ -120,6 +120,22 @@ struct QuicXdpTransport {
   std::array<uint8_t, 65536> udp_payload{};
 };
 
+struct QuicDpdkTransport {
+  PyObject* mod{nullptr};
+  PyObject* fn_send_batch{nullptr};
+  PyObject* fn_poll_rx{nullptr};
+  PyObject* fn_close{nullptr};
+  long handle{0};
+  std::array<uint8_t, 6> src_mac{};
+  std::array<uint8_t, 6> dst_mac{};
+  uint32_t src_ip_nbo{0};
+  uint32_t dst_ip_nbo{0};
+  uint16_t src_port_nbo{0};
+  uint16_t dst_port_nbo{0};
+  uint16_t ip_id{1};
+  int rx_stride{2048};
+};
+
 struct Ngtcp2AttemptCtx {
   ngtcp2_crypto_conn_ref conn_ref{};
   ngtcp2_conn* conn{nullptr};
@@ -132,6 +148,7 @@ struct Ngtcp2AttemptCtx {
   bool strict_runtime{false};
   bool backend_fallback_used{false};
   QuicXdpTransport xdp{};
+  QuicDpdkTransport dpdk{};
   sockaddr_storage local_addr{};
   socklen_t local_addrlen{0};
   sockaddr_storage remote_addr{};
@@ -242,6 +259,17 @@ bool env_truthy(const char* name) {
     return static_cast<char>(std::tolower(c));
   });
   return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
+int env_int(const char* name, int fallback) {
+  if (name == nullptr || name[0] == '\0') {
+    return fallback;
+  }
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return fallback;
+  }
+  return std::atoi(raw);
 }
 
 QuicUdpIoBackend parse_backend_name(const std::string& raw) {
@@ -486,6 +514,27 @@ const xdp_native_api_v1* load_xdp_native_api() {
   }
   PyGILState_Release(gil);
   return api;
+}
+
+void close_dpdk_transport(QuicDpdkTransport* t) {
+  if (t == nullptr) {
+    return;
+  }
+  PyGILState_STATE gil = PyGILState_Ensure();
+  if (t->handle > 0 && t->fn_close != nullptr) {
+    PyObject* ret = PyObject_CallFunction(t->fn_close, "l", t->handle);
+    if (ret == nullptr) {
+      PyErr_Clear();
+    } else {
+      Py_DECREF(ret);
+    }
+  }
+  Py_XDECREF(t->fn_send_batch);
+  Py_XDECREF(t->fn_poll_rx);
+  Py_XDECREF(t->fn_close);
+  Py_XDECREF(t->mod);
+  *t = QuicDpdkTransport{};
+  PyGILState_Release(gil);
 }
 
 bool is_numeric_host(const std::string& host) {
@@ -1884,6 +1933,7 @@ void cleanup_attempt(Ngtcp2AttemptCtx* ctx) {
     (void)ctx->xdp.api->destroy_ctx(ctx->xdp.handle, err, sizeof(err));
   }
   ctx->xdp = QuicXdpTransport{};
+  close_dpdk_transport(&ctx->dpdk);
   ctx->udp_io_backend = QuicUdpIoBackend::KernelSocket;
 }
 
@@ -2014,6 +2064,219 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     return true;
   };
 
+  auto connect_udp_dpdk = [&](Ngtcp2AttemptCtx* c, const Profile& p) -> bool {
+    if (c == nullptr) {
+      return false;
+    }
+    if (c->remote_addr.ss_family != AF_INET || c->remote_addrlen < static_cast<socklen_t>(sizeof(sockaddr_in))) {
+      return false;
+    }
+    if (!env_truthy("SAMURAI_DPDK_ENABLE")) {
+      return false;
+    }
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    PyObject* mod = PyImport_ImportModule("ddos_samurai.dpdk_pmd_core");
+    if (mod == nullptr) {
+      PyErr_Clear();
+      mod = PyImport_ImportModule("dpdk_pmd_core");
+    }
+    if (mod == nullptr) {
+      PyErr_Clear();
+      PyGILState_Release(gil);
+      return false;
+    }
+    PyObject* fn_open = PyObject_GetAttrString(mod, "dpdk_open");
+    PyObject* fn_send_batch = PyObject_GetAttrString(mod, "dpdk_send_batch");
+    PyObject* fn_poll_rx = PyObject_GetAttrString(mod, "dpdk_poll_rx");
+    PyObject* fn_close = PyObject_GetAttrString(mod, "dpdk_close");
+    if (fn_open == nullptr || !PyCallable_Check(fn_open) ||
+        fn_send_batch == nullptr || !PyCallable_Check(fn_send_batch) ||
+        fn_poll_rx == nullptr || !PyCallable_Check(fn_poll_rx) ||
+        fn_close == nullptr || !PyCallable_Check(fn_close)) {
+      Py_XDECREF(fn_open);
+      Py_XDECREF(fn_send_batch);
+      Py_XDECREF(fn_poll_rx);
+      Py_XDECREF(fn_close);
+      Py_DECREF(mod);
+      PyGILState_Release(gil);
+      return false;
+    }
+
+    PyObject* cfg = PyDict_New();
+    if (cfg == nullptr) {
+      Py_DECREF(fn_open);
+      Py_DECREF(fn_send_batch);
+      Py_DECREF(fn_poll_rx);
+      Py_DECREF(fn_close);
+      Py_DECREF(mod);
+      PyGILState_Release(gil);
+      return false;
+    }
+    auto dict_set_long = [&](const char* key, long value) -> bool {
+      PyObject* obj = PyLong_FromLong(value);
+      if (obj == nullptr) {
+        return false;
+      }
+      const int rc = PyDict_SetItemString(cfg, key, obj);
+      Py_DECREF(obj);
+      return rc == 0;
+    };
+    if (!dict_set_long("enable", 1) ||
+        !dict_set_long("port_id", std::max(0, env_int("SAMURAI_DPDK_PORT_ID", 0))) ||
+        !dict_set_long("queue_id", std::max(0, env_int("SAMURAI_DPDK_QUEUE_ID", 0))) ||
+        !dict_set_long("burst_size", std::max(1, env_int("SAMURAI_DPDK_BURST_SIZE", 64))) ||
+        !dict_set_long("mempool_size", std::max(128, env_int("SAMURAI_DPDK_MEMPOOL_SIZE", 8192))) ||
+        !dict_set_long("rx_enable", 1)) {
+      Py_DECREF(cfg);
+      Py_DECREF(fn_open);
+      Py_DECREF(fn_send_batch);
+      Py_DECREF(fn_poll_rx);
+      Py_DECREF(fn_close);
+      Py_DECREF(mod);
+      PyGILState_Release(gil);
+      return false;
+    }
+    const char* eal_env = std::getenv("SAMURAI_DPDK_EAL_ARGS");
+    PyObject* eal = PyUnicode_FromString(eal_env == nullptr ? "" : eal_env);
+    if (eal != nullptr) {
+      PyDict_SetItemString(cfg, "eal_args", eal);
+      Py_DECREF(eal);
+    }
+
+    PyObject* handle_obj = PyObject_CallFunctionObjArgs(fn_open, cfg, nullptr);
+    Py_DECREF(cfg);
+    Py_DECREF(fn_open);
+    if (handle_obj == nullptr) {
+      PyErr_Clear();
+      Py_DECREF(fn_send_batch);
+      Py_DECREF(fn_poll_rx);
+      Py_DECREF(fn_close);
+      Py_DECREF(mod);
+      PyGILState_Release(gil);
+      return false;
+    }
+    long handle = PyLong_AsLong(handle_obj);
+    Py_DECREF(handle_obj);
+    if (PyErr_Occurred() || handle <= 0) {
+      PyErr_Clear();
+      Py_DECREF(fn_send_batch);
+      Py_DECREF(fn_poll_rx);
+      Py_DECREF(fn_close);
+      Py_DECREF(mod);
+      PyGILState_Release(gil);
+      return false;
+    }
+
+    QuicDpdkTransport dpdk{};
+    dpdk.mod = mod;
+    dpdk.fn_send_batch = fn_send_batch;
+    dpdk.fn_poll_rx = fn_poll_rx;
+    dpdk.fn_close = fn_close;
+    dpdk.handle = handle;
+
+    sockaddr_in remote4{};
+    std::memcpy(&remote4, &c->remote_addr, sizeof(remote4));
+    dpdk.dst_ip_nbo = remote4.sin_addr.s_addr;
+    dpdk.dst_port_nbo = htons(static_cast<uint16_t>(std::max(1, p.target_port)));
+
+    uint32_t src_ip_nbo = 0;
+    in_addr src_ip_addr{};
+    const char* src_ip_env = std::getenv("SAMURAI_QUIC_DPDK_SRC_IP");
+    if (src_ip_env != nullptr && src_ip_env[0] != '\0' && ::inet_pton(AF_INET, src_ip_env, &src_ip_addr) == 1) {
+      src_ip_nbo = src_ip_addr.s_addr;
+    } else if (!p.source_ip.empty() && ::inet_pton(AF_INET, p.source_ip.c_str(), &src_ip_addr) == 1) {
+      src_ip_nbo = src_ip_addr.s_addr;
+    } else {
+      const char* iface_env = std::getenv("SAMURAI_XDP_INTERFACE");
+      const std::string iface = iface_env == nullptr ? "" : std::string(iface_env);
+      if (!iface.empty()) {
+        (void)read_iface_ipv4(iface, &src_ip_nbo);
+      }
+    }
+    if (src_ip_nbo == 0) {
+      close_dpdk_transport(&dpdk);
+      PyGILState_Release(gil);
+      return false;
+    }
+    dpdk.src_ip_nbo = src_ip_nbo;
+
+    bool got_src_mac = false;
+    if (const char* src_mac_env = std::getenv("SAMURAI_QUIC_DPDK_SRC_MAC");
+        src_mac_env != nullptr && src_mac_env[0] != '\0') {
+      got_src_mac = parse_mac(src_mac_env, &dpdk.src_mac);
+    }
+    if (!got_src_mac) {
+      const char* iface_env = std::getenv("SAMURAI_XDP_INTERFACE");
+      const std::string iface = iface_env == nullptr ? "" : std::string(iface_env);
+      if (!iface.empty()) {
+        got_src_mac = read_iface_mac(iface, &dpdk.src_mac);
+      }
+    }
+    if (!got_src_mac) {
+      close_dpdk_transport(&dpdk);
+      PyGILState_Release(gil);
+      return false;
+    }
+
+    bool got_dst_mac = false;
+    if (const char* dst_mac_env = std::getenv("SAMURAI_QUIC_DPDK_DST_MAC");
+        dst_mac_env != nullptr && dst_mac_env[0] != '\0') {
+      got_dst_mac = parse_mac(dst_mac_env, &dpdk.dst_mac);
+    }
+    if (!got_dst_mac) {
+      const char* fallback_dst = std::getenv("SAMURAI_QUIC_AF_XDP_DST_MAC");
+      if (fallback_dst != nullptr && fallback_dst[0] != '\0') {
+        got_dst_mac = parse_mac(fallback_dst, &dpdk.dst_mac);
+      }
+    }
+    if (!got_dst_mac) {
+      const char* fallback_dst = std::getenv("SAMURAI_GPU_TX_MAC");
+      if (fallback_dst != nullptr && fallback_dst[0] != '\0') {
+        got_dst_mac = parse_mac(fallback_dst, &dpdk.dst_mac);
+      }
+    }
+    if (!got_dst_mac) {
+      const char* iface_env = std::getenv("SAMURAI_XDP_INTERFACE");
+      const std::string iface = iface_env == nullptr ? "" : std::string(iface_env);
+      if (!iface.empty()) {
+        char ipbuf[INET_ADDRSTRLEN]{};
+        const char* iptxt = ::inet_ntop(AF_INET, &remote4.sin_addr, ipbuf, sizeof(ipbuf));
+        const std::string target_ip = iptxt == nullptr ? "" : std::string(iptxt);
+        if (!target_ip.empty()) {
+          const auto arp = lookup_arp_mac(iface, target_ip);
+          if (arp.has_value()) {
+            dpdk.dst_mac = *arp;
+            got_dst_mac = true;
+          }
+        }
+      }
+    }
+    if (!got_dst_mac) {
+      close_dpdk_transport(&dpdk);
+      PyGILState_Release(gil);
+      return false;
+    }
+
+    std::random_device rd{};
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> port_dist(20000, 65000);
+    dpdk.src_port_nbo = htons(static_cast<uint16_t>(port_dist(gen)));
+
+    sockaddr_in local4{};
+    local4.sin_family = AF_INET;
+    local4.sin_port = dpdk.src_port_nbo;
+    local4.sin_addr.s_addr = dpdk.src_ip_nbo;
+    std::memset(&c->local_addr, 0, sizeof(c->local_addr));
+    std::memcpy(&c->local_addr, &local4, sizeof(local4));
+    c->local_addrlen = sizeof(local4);
+    c->fd = -1;
+    c->dpdk = dpdk;
+    c->udp_io_backend = QuicUdpIoBackend::Dpdk;
+    PyGILState_Release(gil);
+    return true;
+  };
+
   if (ctx == nullptr) {
     return false;
   }
@@ -2032,6 +2295,9 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     return connect_udp_kernel(ctx);
   }
   if (ctx->requested_backend == QuicUdpIoBackend::Dpdk) {
+    if (connect_udp_dpdk(ctx, profile)) {
+      return true;
+    }
     if (ctx->strict_runtime) {
       return false;
     }
@@ -2051,58 +2317,145 @@ ssize_t send_udp_payload(Ngtcp2AttemptCtx* ctx, const uint8_t* payload, std::siz
     }
     return ::send(ctx->fd, payload, payload_len, 0);
   }
-  if (ctx->udp_io_backend != QuicUdpIoBackend::AfXdp || ctx->xdp.api == nullptr || ctx->xdp.handle <= 0) {
-    return -1;
-  }
   if (payload_len > 1400) {
     return -1;
   }
-  std::vector<uint8_t> frame{};
-  frame.resize(14u + sizeof(iphdr) + sizeof(udphdr) + payload_len);
-  std::size_t off = 0;
-  for (std::size_t i = 0; i < 6; ++i) {
-    frame[off + i] = ctx->xdp.dst_mac[i];
-    frame[off + 6 + i] = ctx->xdp.src_mac[i];
+  if (ctx->udp_io_backend == QuicUdpIoBackend::AfXdp) {
+    if (ctx->xdp.api == nullptr || ctx->xdp.handle <= 0) {
+      return -1;
+    }
+    std::vector<uint8_t> frame{};
+    frame.resize(14u + sizeof(iphdr) + sizeof(udphdr) + payload_len);
+    std::size_t off = 0;
+    for (std::size_t i = 0; i < 6; ++i) {
+      frame[off + i] = ctx->xdp.dst_mac[i];
+      frame[off + 6 + i] = ctx->xdp.src_mac[i];
+    }
+    frame[off + 12] = 0x08;
+    frame[off + 13] = 0x00;
+    off += 14;
+
+    auto* ip = reinterpret_cast<iphdr*>(frame.data() + off);
+    std::memset(ip, 0, sizeof(*ip));
+    ip->version = 4;
+    ip->ihl = 5;
+    ip->ttl = 64;
+    ip->protocol = IPPROTO_UDP;
+    ip->id = htons(ctx->xdp.ip_id++);
+    ip->frag_off = htons(0x4000);
+    ip->tot_len = htons(static_cast<uint16_t>(sizeof(iphdr) + sizeof(udphdr) + payload_len));
+    ip->saddr = ctx->xdp.src_ip_nbo;
+    ip->daddr = ctx->xdp.dst_ip_nbo;
+    ip->check = ipv4_header_checksum(ip);
+    off += sizeof(iphdr);
+
+    auto* udp = reinterpret_cast<udphdr*>(frame.data() + off);
+    std::memset(udp, 0, sizeof(*udp));
+    udp->source = ctx->xdp.src_port_nbo;
+    udp->dest = ctx->xdp.dst_port_nbo;
+    udp->len = htons(static_cast<uint16_t>(sizeof(udphdr) + payload_len));
+    off += sizeof(udphdr);
+    std::memcpy(frame.data() + off, payload, payload_len);
+    udp->check = udp_ipv4_checksum(ctx->xdp.src_ip_nbo, ctx->xdp.dst_ip_nbo, udp, payload, payload_len);
+
+    char err[160]{};
+    const int sent = ctx->xdp.api->send_buffer(
+        ctx->xdp.handle,
+        frame.data(),
+        static_cast<int>(frame.size()),
+        1,
+        err,
+        sizeof(err));
+    if (sent <= 0) {
+      return -1;
+    }
+    return static_cast<ssize_t>(payload_len);
   }
-  frame[off + 12] = 0x08;
-  frame[off + 13] = 0x00;
-  off += 14;
+  if (ctx->udp_io_backend == QuicUdpIoBackend::Dpdk) {
+    if (ctx->dpdk.handle <= 0 || ctx->dpdk.fn_send_batch == nullptr) {
+      return -1;
+    }
+    std::vector<uint8_t> frame{};
+    frame.resize(14u + sizeof(iphdr) + sizeof(udphdr) + payload_len);
+    std::size_t off = 0;
+    for (std::size_t i = 0; i < 6; ++i) {
+      frame[off + i] = ctx->dpdk.dst_mac[i];
+      frame[off + 6 + i] = ctx->dpdk.src_mac[i];
+    }
+    frame[off + 12] = 0x08;
+    frame[off + 13] = 0x00;
+    off += 14;
 
-  auto* ip = reinterpret_cast<iphdr*>(frame.data() + off);
-  std::memset(ip, 0, sizeof(*ip));
-  ip->version = 4;
-  ip->ihl = 5;
-  ip->ttl = 64;
-  ip->protocol = IPPROTO_UDP;
-  ip->id = htons(ctx->xdp.ip_id++);
-  ip->frag_off = htons(0x4000);
-  ip->tot_len = htons(static_cast<uint16_t>(sizeof(iphdr) + sizeof(udphdr) + payload_len));
-  ip->saddr = ctx->xdp.src_ip_nbo;
-  ip->daddr = ctx->xdp.dst_ip_nbo;
-  ip->check = ipv4_header_checksum(ip);
-  off += sizeof(iphdr);
+    auto* ip = reinterpret_cast<iphdr*>(frame.data() + off);
+    std::memset(ip, 0, sizeof(*ip));
+    ip->version = 4;
+    ip->ihl = 5;
+    ip->ttl = 64;
+    ip->protocol = IPPROTO_UDP;
+    ip->id = htons(ctx->dpdk.ip_id++);
+    ip->frag_off = htons(0x4000);
+    ip->tot_len = htons(static_cast<uint16_t>(sizeof(iphdr) + sizeof(udphdr) + payload_len));
+    ip->saddr = ctx->dpdk.src_ip_nbo;
+    ip->daddr = ctx->dpdk.dst_ip_nbo;
+    ip->check = ipv4_header_checksum(ip);
+    off += sizeof(iphdr);
 
-  auto* udp = reinterpret_cast<udphdr*>(frame.data() + off);
-  std::memset(udp, 0, sizeof(*udp));
-  udp->source = ctx->xdp.src_port_nbo;
-  udp->dest = ctx->xdp.dst_port_nbo;
-  udp->len = htons(static_cast<uint16_t>(sizeof(udphdr) + payload_len));
-  off += sizeof(udphdr);
-  std::memcpy(frame.data() + off, payload, payload_len);
-  udp->check = udp_ipv4_checksum(ctx->xdp.src_ip_nbo, ctx->xdp.dst_ip_nbo, udp, payload, payload_len);
+    auto* udp = reinterpret_cast<udphdr*>(frame.data() + off);
+    std::memset(udp, 0, sizeof(*udp));
+    udp->source = ctx->dpdk.src_port_nbo;
+    udp->dest = ctx->dpdk.dst_port_nbo;
+    udp->len = htons(static_cast<uint16_t>(sizeof(udphdr) + payload_len));
+    off += sizeof(udphdr);
+    std::memcpy(frame.data() + off, payload, payload_len);
+    udp->check = udp_ipv4_checksum(ctx->dpdk.src_ip_nbo, ctx->dpdk.dst_ip_nbo, udp, payload, payload_len);
 
-  char err[160]{};
-  const int sent = ctx->xdp.api->send_buffer(
-      ctx->xdp.handle,
-      frame.data(),
-      static_cast<int>(frame.size()),
-      1,
-      err,
-      sizeof(err));
-  if (sent <= 0) {
-    return -1;
+    int sent = 0;
+    PyGILState_STATE gil = PyGILState_Ensure();
+    PyObject* frame_obj = PyBytes_FromStringAndSize(
+        reinterpret_cast<const char*>(frame.data()),
+        static_cast<Py_ssize_t>(frame.size()));
+    if (frame_obj != nullptr) {
+      PyObject* result = PyObject_CallFunction(
+          ctx->dpdk.fn_send_batch,
+          "lOii",
+          ctx->dpdk.handle,
+          frame_obj,
+          static_cast<int>(frame.size()),
+          1);
+      Py_DECREF(frame_obj);
+      if (result == nullptr) {
+        PyErr_Clear();
+      } else {
+        if (PyDict_Check(result)) {
+          PyObject* sent_obj = PyDict_GetItemString(result, "sent");
+          if (sent_obj != nullptr) {
+            const long raw_sent = PyLong_AsLong(sent_obj);
+            if (!PyErr_Occurred()) {
+              sent = static_cast<int>(raw_sent);
+            } else {
+              PyErr_Clear();
+            }
+          }
+        } else if (PyLong_Check(result)) {
+          const long raw_sent = PyLong_AsLong(result);
+          if (!PyErr_Occurred()) {
+            sent = static_cast<int>(raw_sent);
+          } else {
+            PyErr_Clear();
+          }
+        }
+        Py_DECREF(result);
+      }
+    } else {
+      PyErr_Clear();
+    }
+    PyGILState_Release(gil);
+    if (sent <= 0) {
+      return -1;
+    }
+    return static_cast<ssize_t>(payload_len);
   }
-  return static_cast<ssize_t>(payload_len);
+  return -1;
 }
 
 int recv_udp_payloads(
@@ -2125,66 +2478,146 @@ int recv_udp_payloads(
     lens_out[0] = static_cast<std::size_t>(nread);
     return 1;
   }
-  if (ctx->udp_io_backend != QuicUdpIoBackend::AfXdp || ctx->xdp.api == nullptr || ctx->xdp.handle <= 0) {
-    return -1;
+  if (ctx->udp_io_backend == QuicUdpIoBackend::AfXdp) {
+    if (ctx->xdp.api == nullptr || ctx->xdp.handle <= 0) {
+      return -1;
+    }
+    const int want = std::min<int>(max_packets, static_cast<int>(ctx->xdp.rx_lens.size()));
+    char err[160]{};
+    const int got = ctx->xdp.api->recv_frames(
+        ctx->xdp.handle,
+        ctx->xdp.rx_frames.data(),
+        ctx->xdp.rx_stride,
+        ctx->xdp.rx_lens.data(),
+        want,
+        ctx->xdp.rx_stride,
+        err,
+        sizeof(err));
+    if (got <= 0) {
+      return 0;
+    }
+    int accepted = 0;
+    for (int i = 0; i < got && accepted < max_packets; ++i) {
+      const std::size_t flen = ctx->xdp.rx_lens[static_cast<std::size_t>(i)];
+      if (flen < 14 + sizeof(iphdr) + sizeof(udphdr)) {
+        continue;
+      }
+      const uint8_t* frame = ctx->xdp.rx_frames.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(ctx->xdp.rx_stride);
+      const uint16_t ethertype = static_cast<uint16_t>((static_cast<uint16_t>(frame[12]) << 8u) | frame[13]);
+      if (ethertype != ETH_P_IP) {
+        continue;
+      }
+      const auto* ip = reinterpret_cast<const iphdr*>(frame + 14);
+      if (ip->version != 4 || ip->ihl < 5 || ip->protocol != IPPROTO_UDP) {
+        continue;
+      }
+      const std::size_t ihl_bytes = static_cast<std::size_t>(ip->ihl) * 4u;
+      if (14u + ihl_bytes + sizeof(udphdr) > flen) {
+        continue;
+      }
+      const auto* udp = reinterpret_cast<const udphdr*>(frame + 14u + ihl_bytes);
+      if (udp->dest != ctx->xdp.src_port_nbo) {
+        continue;
+      }
+      if (ip->daddr != ctx->xdp.src_ip_nbo) {
+        continue;
+      }
+      if (udp->source != ctx->xdp.dst_port_nbo) {
+        continue;
+      }
+      const uint16_t udp_len = ntohs(udp->len);
+      if (udp_len < sizeof(udphdr)) {
+        continue;
+      }
+      const std::size_t payload_len = static_cast<std::size_t>(udp_len - sizeof(udphdr));
+      const std::size_t payload_off = 14u + ihl_bytes + sizeof(udphdr);
+      if (payload_off + payload_len > flen || payload_len > stride) {
+        continue;
+      }
+      std::memcpy(payload_buf + static_cast<std::size_t>(accepted) * stride, frame + payload_off, payload_len);
+      lens_out[static_cast<std::size_t>(accepted)] = payload_len;
+      ++accepted;
+    }
+    return accepted;
   }
-  const int want = std::min<int>(max_packets, static_cast<int>(ctx->xdp.rx_lens.size()));
-  char err[160]{};
-  const int got = ctx->xdp.api->recv_frames(
-      ctx->xdp.handle,
-      ctx->xdp.rx_frames.data(),
-      ctx->xdp.rx_stride,
-      ctx->xdp.rx_lens.data(),
-      want,
-      ctx->xdp.rx_stride,
-      err,
-      sizeof(err));
-  if (got <= 0) {
-    return 0;
+  if (ctx->udp_io_backend == QuicUdpIoBackend::Dpdk) {
+    if (ctx->dpdk.handle <= 0 || ctx->dpdk.fn_poll_rx == nullptr) {
+      return -1;
+    }
+    const int budget = std::clamp(max_packets, 1, 64);
+    PyGILState_STATE gil = PyGILState_Ensure();
+    PyObject* frames = PyObject_CallFunction(ctx->dpdk.fn_poll_rx, "li", ctx->dpdk.handle, budget);
+    if (frames == nullptr) {
+      PyErr_Clear();
+      PyGILState_Release(gil);
+      return 0;
+    }
+    if (!PyList_Check(frames)) {
+      Py_DECREF(frames);
+      PyGILState_Release(gil);
+      return 0;
+    }
+    const Py_ssize_t list_size = PyList_GET_SIZE(frames);
+    int accepted = 0;
+    for (Py_ssize_t i = 0; i < list_size && accepted < max_packets; ++i) {
+      PyObject* item = PyList_GET_ITEM(frames, i);
+      if (item == nullptr) {
+        continue;
+      }
+      char* frame_raw = nullptr;
+      Py_ssize_t flen_raw = 0;
+      if (PyBytes_AsStringAndSize(item, &frame_raw, &flen_raw) != 0) {
+        PyErr_Clear();
+        continue;
+      }
+      if (frame_raw == nullptr || flen_raw <= 0) {
+        continue;
+      }
+      const auto* frame = reinterpret_cast<const uint8_t*>(frame_raw);
+      const std::size_t flen = static_cast<std::size_t>(flen_raw);
+      if (flen < 14 + sizeof(iphdr) + sizeof(udphdr)) {
+        continue;
+      }
+      const uint16_t ethertype = static_cast<uint16_t>((static_cast<uint16_t>(frame[12]) << 8u) | frame[13]);
+      if (ethertype != ETH_P_IP) {
+        continue;
+      }
+      const auto* ip = reinterpret_cast<const iphdr*>(frame + 14);
+      if (ip->version != 4 || ip->ihl < 5 || ip->protocol != IPPROTO_UDP) {
+        continue;
+      }
+      const std::size_t ihl_bytes = static_cast<std::size_t>(ip->ihl) * 4u;
+      if (14u + ihl_bytes + sizeof(udphdr) > flen) {
+        continue;
+      }
+      const auto* udp = reinterpret_cast<const udphdr*>(frame + 14u + ihl_bytes);
+      if (udp->dest != ctx->dpdk.src_port_nbo) {
+        continue;
+      }
+      if (ip->daddr != ctx->dpdk.src_ip_nbo) {
+        continue;
+      }
+      if (udp->source != ctx->dpdk.dst_port_nbo) {
+        continue;
+      }
+      const uint16_t udp_len = ntohs(udp->len);
+      if (udp_len < sizeof(udphdr)) {
+        continue;
+      }
+      const std::size_t payload_len = static_cast<std::size_t>(udp_len - sizeof(udphdr));
+      const std::size_t payload_off = 14u + ihl_bytes + sizeof(udphdr);
+      if (payload_off + payload_len > flen || payload_len > stride) {
+        continue;
+      }
+      std::memcpy(payload_buf + static_cast<std::size_t>(accepted) * stride, frame + payload_off, payload_len);
+      lens_out[static_cast<std::size_t>(accepted)] = payload_len;
+      ++accepted;
+    }
+    Py_DECREF(frames);
+    PyGILState_Release(gil);
+    return accepted;
   }
-  int accepted = 0;
-  for (int i = 0; i < got && accepted < max_packets; ++i) {
-    const std::size_t flen = ctx->xdp.rx_lens[static_cast<std::size_t>(i)];
-    if (flen < 14 + sizeof(iphdr) + sizeof(udphdr)) {
-      continue;
-    }
-    const uint8_t* frame = ctx->xdp.rx_frames.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(ctx->xdp.rx_stride);
-    const uint16_t ethertype = static_cast<uint16_t>((static_cast<uint16_t>(frame[12]) << 8u) | frame[13]);
-    if (ethertype != ETH_P_IP) {
-      continue;
-    }
-    const auto* ip = reinterpret_cast<const iphdr*>(frame + 14);
-    if (ip->version != 4 || ip->ihl < 5 || ip->protocol != IPPROTO_UDP) {
-      continue;
-    }
-    const std::size_t ihl_bytes = static_cast<std::size_t>(ip->ihl) * 4u;
-    if (14u + ihl_bytes + sizeof(udphdr) > flen) {
-      continue;
-    }
-    const auto* udp = reinterpret_cast<const udphdr*>(frame + 14u + ihl_bytes);
-    if (udp->dest != ctx->xdp.src_port_nbo) {
-      continue;
-    }
-    if (ip->daddr != ctx->xdp.src_ip_nbo) {
-      continue;
-    }
-    if (udp->source != ctx->xdp.dst_port_nbo) {
-      continue;
-    }
-    const uint16_t udp_len = ntohs(udp->len);
-    if (udp_len < sizeof(udphdr)) {
-      continue;
-    }
-    const std::size_t payload_len = static_cast<std::size_t>(udp_len - sizeof(udphdr));
-    const std::size_t payload_off = 14u + ihl_bytes + sizeof(udphdr);
-    if (payload_off + payload_len > flen || payload_len > stride) {
-      continue;
-    }
-    std::memcpy(payload_buf + static_cast<std::size_t>(accepted) * stride, frame + payload_off, payload_len);
-    lens_out[static_cast<std::size_t>(accepted)] = payload_len;
-    ++accepted;
-  }
-  return accepted;
+  return -1;
 }
 
 bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters* out) {
