@@ -875,8 +875,8 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
         return
 
     attack_vector = str(getattr(args, "attack_vector", "basic") or "basic").strip().lower()
-    if attack_vector in {"websocket", "quic"}:
-        parser.error("Hata: L7 capability strict yalnızca HTTP/1.1 ve HTTP/2 için kullanılabilir.")
+    if attack_vector == "websocket":
+        parser.error("Hata: L7 capability strict websocket için desteklenmiyor.")
 
     runtime_backend = str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower()
     if runtime_backend not in {"afxdp", "dpdk"}:
@@ -889,6 +889,21 @@ def _preflight_l7_capabilities(parser: argparse.ArgumentParser, args: argparse.N
             )
     else:
         _validate_dpdk_requirements(parser, args, reason_prefix="l7-capability-strict: ")
+    if attack_vector == "quic":
+        if not bool(getattr(args, "l7_quic_require_native", False)):
+            args.l7_quic_require_native = True
+            utils.log_info("l7-capability-strict + QUIC için --l7-quic-require-native otomatik etkinleştirildi.")
+        if bool(getattr(args, "l7_quic_auto_bridge", False)):
+            args.l7_quic_auto_bridge = False
+            utils.log_info("l7-capability-strict + QUIC için --l7-quic-auto-bridge kapatıldı.")
+        if bool(getattr(args, "l7_quic_bridge_autopromote", False)):
+            args.l7_quic_bridge_autopromote = False
+            utils.log_info("l7-capability-strict + QUIC için --l7-quic-bridge-autopromote kapatıldı.")
+        quic_build_mode = str(os.environ.get("SAMURAI_QUIC_BUILD_MODE", "auto") or "auto").strip().lower()
+        if quic_build_mode != "native_required":
+            os.environ["SAMURAI_QUIC_BUILD_MODE"] = "native_required"
+            utils.log_info("l7-capability-strict + QUIC için SAMURAI_QUIC_BUILD_MODE=native_required ayarlandı.")
+        return
     if attack_vector == "http":
         custom_tcp_mode = str(getattr(args, "custom_tcp_mode", "off") or "off").strip().lower()
         if custom_tcp_mode not in {"auto", "required"}:
