@@ -26,6 +26,13 @@ struct UdpProbeCounters {
   int h3_replace_after_idle{0};
   int h3_control_plane_failures{0};
   int h3_graceful_close_count{0};
+  int h3_qpack_dynamic_events{0};
+  int h3_priority_update_events{0};
+  int h3_extended_connect_events{0};
+  int h3_datagram_tx_events{0};
+  int h3_datagram_rx_events{0};
+  int h3_server_push_events{0};
+  int h3_feature_failures{0};
   int tx_datagrams{0};
   int rx_datagrams{0};
   int pacing_wait_events{0};
