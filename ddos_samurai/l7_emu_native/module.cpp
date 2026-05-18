@@ -931,8 +931,15 @@ PYBIND11_MODULE(_l7_emu_native, m) {
       const auto quic_capability_available_it = out.find("quic_capability_available");
       const bool quic_capability_available =
           quic_capability_available_it != out.end() && quic_capability_available_it->second > 0.0;
+      const auto quic_hot_path_ready_it = out.find("quic_runtime_native_hot_path_ready");
+      const bool quic_hot_path_ready =
+          quic_hot_path_ready_it != out.end() && quic_hot_path_ready_it->second > 0.0;
       result["runtime_http3_backend"] = py::str(quic_capability_available ? "nghttp3_native" : "unavailable");
-      result["runtime_quic_transport_backend"] = py::str(quic_capability_available ? "custom_quic_stack" : "unavailable");
+      result["runtime_quic_transport_backend"] = py::str(
+          quic_capability_available
+              ? (quic_hot_path_ready ? "custom_quic_stack_hotpath" : "kernel_udp_socket")
+              : "unavailable");
+      result["runtime_quic_hot_path_ready"] = py::int_(quic_hot_path_ready ? 1 : 0);
       result["quic_stack_mode"] = py::str(quic_capability_available ? "custom_native" : "unavailable");
       if (!quic_capability_available) {
         result["sender_fallback_reason"] = py::str("quic_capability_unavailable");
