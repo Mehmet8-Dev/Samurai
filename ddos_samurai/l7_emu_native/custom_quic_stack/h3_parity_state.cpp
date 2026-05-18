@@ -38,14 +38,21 @@ H3ParityState derive_h3_parity_state(
       std::max(0, udp.responses) > 0 ||
       std::max(0, udp.response_headers_ok) > 0 ||
       std::max(0, udp.response_body_ok) > 0;
+  const int qpack_events = std::max(0, udp.h3_qpack_dynamic_events);
+  const int priority_events = std::max(0, udp.h3_priority_update_events);
+  const int ext_connect_events = std::max(0, udp.h3_extended_connect_events);
+  const int datagram_tx_events = std::max(0, udp.h3_datagram_tx_events);
+  const int datagram_rx_events = std::max(0, udp.h3_datagram_rx_events);
+  const int server_push_events = std::max(0, udp.h3_server_push_events);
+  const int goaway_events = std::max(0, udp.h3_goaway_events);
   state.control_stream_ready = runtime_handshake_ready ? 1 : 0;
   const bool feature_gate = runtime_handshake_ready && observed_h3_activity;
-  state.qpack_dynamic_ready = requested_qpack_dynamic && feature_gate ? 1 : 0;
-  state.goaway_ready = requested_goaway && feature_gate ? 1 : 0;
-  state.priority_update_ready = requested_priority_update && feature_gate ? 1 : 0;
-  state.extended_connect_ready = requested_extended_connect && feature_gate ? 1 : 0;
-  state.datagram_ready = requested_datagram && feature_gate ? 1 : 0;
-  state.server_push_ready = requested_server_push && feature_gate ? 1 : 0;
+  state.qpack_dynamic_ready = requested_qpack_dynamic && feature_gate && qpack_events > 0 ? 1 : 0;
+  state.goaway_ready = requested_goaway && feature_gate && goaway_events > 0 ? 1 : 0;
+  state.priority_update_ready = requested_priority_update && feature_gate && priority_events > 0 ? 1 : 0;
+  state.extended_connect_ready = requested_extended_connect && feature_gate && ext_connect_events > 0 ? 1 : 0;
+  state.datagram_ready = requested_datagram && feature_gate && datagram_tx_events > 0 && datagram_rx_events > 0 ? 1 : 0;
+  state.server_push_ready = requested_server_push && feature_gate && server_push_events > 0 ? 1 : 0;
 
   // Phase model:
   // 1: minimal headers+data

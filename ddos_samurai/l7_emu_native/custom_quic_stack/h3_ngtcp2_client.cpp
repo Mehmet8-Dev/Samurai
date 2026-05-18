@@ -10,6 +10,8 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -57,6 +59,32 @@ struct GoawayPolicy {
   bool replace_after_idle{true};
 };
 
+struct H3FeaturePolicy {
+  bool qpack_dynamic{false};
+  bool priority_update{false};
+  std::string priority_value{"u=3"};
+  uint32_t priority_urgency{3};
+  int priority_incremental{0};
+  bool extended_connect{false};
+  std::string connect_protocol{"webtransport"};
+  bool datagram{false};
+  std::string datagram_flow_id{"0"};
+  bool server_push{false};
+  std::string server_push_hint{"link"};
+  bool cancel_on_promise{false};
+  uint64_t max_push_id{32};
+};
+
+struct H3FrameParseState {
+  bool initialized{false};
+  bool is_server_uni{false};
+  bool stream_type_known{false};
+  uint64_t stream_type{0};
+  bool push_id_known{false};
+  uint64_t push_id{0};
+  std::vector<uint8_t> buffer{};
+};
+
 struct Ngtcp2AttemptCtx {
   ngtcp2_crypto_conn_ref conn_ref{};
   ngtcp2_conn* conn{nullptr};
@@ -89,6 +117,13 @@ struct Ngtcp2AttemptCtx {
   bool response_headers_seen{false};
   bool received_any_stream_data{false};
   bool goaway_active{false};
+  bool saw_qpack_activity{false};
+  bool saw_priority_ack{false};
+  bool saw_extended_connect_ack{false};
+  bool saw_datagram_ack{false};
+  bool saw_server_push_signal{false};
+  bool datagram_pending{false};
+  bool datagram_remote_supported{false};
 
   int response_status{0};
   std::string response_headers{};
@@ -100,9 +135,31 @@ struct Ngtcp2AttemptCtx {
   int replace_after_idle{0};
   int control_plane_failures{0};
   int graceful_close_count{0};
+  int qpack_dynamic_events{0};
+  int priority_update_events{0};
+  int extended_connect_events{0};
+  int datagram_tx_events{0};
+  int datagram_rx_events{0};
+  int server_push_events{0};
+  int feature_failures{0};
 
   std::size_t rx_bytes{0};
   std::size_t tx_bytes{0};
+  std::vector<uint8_t> datagram_payload{};
+  uint64_t next_datagram_id{1};
+  uint64_t last_datagram_id{0};
+  H3FeaturePolicy feature_policy{};
+  std::unordered_map<int64_t, H3FrameParseState> frame_parse_states{};
+  std::unordered_set<uint64_t> promised_push_ids{};
+  std::unordered_set<uint64_t> canceled_push_ids{};
+  std::unordered_set<uint64_t> fulfilled_push_ids{};
+  std::unordered_set<uint64_t> cancel_push_tx_sent{};
+  std::vector<uint8_t> control_tx_buffer{};
+  std::size_t control_tx_off{0};
+  uint64_t max_push_id_advertised{0};
+  uint64_t max_push_id_sent_value{0};
+  bool max_push_id_set{false};
+  bool max_push_id_sent{false};
 };
 
 ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* conn_ref) {
@@ -216,6 +273,28 @@ bool body_expect_ok(const std::string& body, const std::string& substr) {
   return body.find(substr) != std::string::npos;
 }
 
+bool parse_u64_str(const std::string& value, uint64_t* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  if (value.empty()) {
+    return false;
+  }
+  uint64_t acc = 0;
+  for (char ch : value) {
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+    const uint64_t d = static_cast<uint64_t>(ch - '0');
+    if (acc > (UINT64_MAX - d) / 10u) {
+      return false;
+    }
+    acc = acc * 10u + d;
+  }
+  *out = acc;
+  return true;
+}
+
 RequestSpec derive_request_spec(const Profile& profile) {
   RequestSpec out;
   for (const auto& op : profile.ops) {
@@ -313,6 +392,85 @@ GoawayPolicy derive_goaway_policy(const Profile& profile) {
   return policy;
 }
 
+void parse_priority_value(const std::string& value, uint32_t* urgency, int* incremental) {
+  if (urgency == nullptr || incremental == nullptr) {
+    return;
+  }
+  *urgency = 3;
+  *incremental = 0;
+  const std::string lower = to_lower_ascii(value);
+  const std::size_t u = lower.find("u=");
+  if (u != std::string::npos && u + 2 < lower.size()) {
+    int parsed = 3;
+    try {
+      parsed = std::stoi(lower.substr(u + 2));
+    } catch (...) {
+      parsed = 3;
+    }
+    *urgency = static_cast<uint32_t>(std::clamp(parsed, 0, 7));
+  }
+  const std::size_t i = lower.find("i");
+  if (i != std::string::npos) {
+    *incremental = 1;
+  }
+}
+
+H3FeaturePolicy derive_h3_feature_policy(const Profile& profile) {
+  H3FeaturePolicy policy{};
+  for (const auto& op : profile.ops) {
+    if (op.opcode == "H3_QPACK_DYNAMIC") {
+      policy.qpack_dynamic = true;
+      continue;
+    }
+    if (op.opcode == "H3_PRIORITY_UPDATE") {
+      policy.priority_update = true;
+      if (op.has_expect && op.expect.kind == "priority_value" && !op.expect.value.empty()) {
+        policy.priority_value = op.expect.value;
+      }
+      parse_priority_value(policy.priority_value, &policy.priority_urgency, &policy.priority_incremental);
+      continue;
+    }
+    if (op.opcode == "H3_EXTENDED_CONNECT") {
+      policy.extended_connect = true;
+      if (op.has_expect && op.expect.kind == "protocol" && !op.expect.value.empty()) {
+        policy.connect_protocol = op.expect.value;
+      }
+      continue;
+    }
+    if (op.opcode == "H3_DATAGRAM") {
+      policy.datagram = true;
+      if (op.has_expect && op.expect.kind == "flow_id" && !op.expect.value.empty()) {
+        policy.datagram_flow_id = op.expect.value;
+      }
+      continue;
+    }
+    if (op.opcode == "H3_SERVER_PUSH") {
+      policy.server_push = true;
+      if (op.has_expect && !op.expect.kind.empty() && !op.expect.value.empty()) {
+        if (op.expect.kind == "hint") {
+          policy.server_push_hint = to_lower_ascii(op.expect.value);
+        } else if (op.expect.kind == "max_push_id") {
+          uint64_t parsed = policy.max_push_id;
+          if (parse_u64_str(op.expect.value, &parsed)) {
+            policy.max_push_id = std::min<uint64_t>(parsed, ((1ull << 62u) - 1u));
+          }
+        } else if ((op.expect.kind == "cancel_mode" || op.expect.kind == "cancel_policy") &&
+            to_lower_ascii(op.expect.value) == "on_promise") {
+          policy.cancel_on_promise = true;
+        }
+      }
+      continue;
+    }
+  }
+  if (policy.priority_update) {
+    parse_priority_value(policy.priority_value, &policy.priority_urgency, &policy.priority_incremental);
+  }
+  if (policy.server_push_hint == "cancel") {
+    policy.cancel_on_promise = true;
+  }
+  return policy;
+}
+
 int parse_status_code(const std::string& text) {
   int code = 0;
   for (char ch : text) {
@@ -326,6 +484,309 @@ int parse_status_code(const std::string& text) {
     }
   }
   return code;
+}
+
+constexpr uint64_t kH3StreamTypeControl = 0x00;
+constexpr uint64_t kH3StreamTypePush = 0x01;
+constexpr uint64_t kH3FrameTypeCancelPush = 0x03;
+constexpr uint64_t kH3FrameTypePushPromise = 0x05;
+constexpr uint64_t kH3FrameTypeGoaway = 0x07;
+constexpr uint64_t kH3FrameTypeMaxPushId = 0x0d;
+constexpr std::size_t kH3ParseBufferCap = 1u << 20u;  // 1 MiB safety cap.
+
+bool is_server_uni_stream(int64_t stream_id) {
+  return (stream_id & 0x3ll) == 0x3ll;
+}
+
+bool try_decode_quic_varint(
+    const uint8_t* data,
+    std::size_t len,
+    uint64_t* out,
+    std::size_t* consumed) {
+  if (data == nullptr || out == nullptr || consumed == nullptr || len == 0) {
+    return false;
+  }
+  const uint8_t first = data[0];
+  const uint8_t prefix = static_cast<uint8_t>(first >> 6u);
+  const std::size_t nbytes = static_cast<std::size_t>(1u << prefix);
+  if (len < nbytes) {
+    return false;
+  }
+  uint64_t v = static_cast<uint64_t>(first & 0x3fu);
+  for (std::size_t i = 1; i < nbytes; ++i) {
+    v = (v << 8u) | static_cast<uint64_t>(data[i]);
+  }
+  *out = v;
+  *consumed = nbytes;
+  return true;
+}
+
+bool append_quic_varint(std::vector<uint8_t>* out, uint64_t v) {
+  if (out == nullptr || v > ((1ull << 62u) - 1u)) {
+    return false;
+  }
+  if (v <= 0x3fu) {
+    out->push_back(static_cast<uint8_t>(v));
+    return true;
+  }
+  if (v <= 0x3fffu) {
+    out->push_back(static_cast<uint8_t>(0x40u | ((v >> 8u) & 0x3fu)));
+    out->push_back(static_cast<uint8_t>(v & 0xffu));
+    return true;
+  }
+  if (v <= 0x3fffffffu) {
+    out->push_back(static_cast<uint8_t>(0x80u | ((v >> 24u) & 0x3fu)));
+    out->push_back(static_cast<uint8_t>((v >> 16u) & 0xffu));
+    out->push_back(static_cast<uint8_t>((v >> 8u) & 0xffu));
+    out->push_back(static_cast<uint8_t>(v & 0xffu));
+    return true;
+  }
+  out->push_back(static_cast<uint8_t>(0xc0u | ((v >> 56u) & 0x3fu)));
+  out->push_back(static_cast<uint8_t>((v >> 48u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 40u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 32u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 24u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 16u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 8u) & 0xffu));
+  out->push_back(static_cast<uint8_t>(v & 0xffu));
+  return true;
+}
+
+bool queue_h3_varint_frame(Ngtcp2AttemptCtx* ctx, uint64_t frame_type, uint64_t payload_value) {
+  if (ctx == nullptr || ctx->ctrl_stream_id < 0) {
+    return false;
+  }
+  if (ctx->control_tx_off >= ctx->control_tx_buffer.size()) {
+    ctx->control_tx_buffer.clear();
+    ctx->control_tx_off = 0;
+  }
+  std::vector<uint8_t> payload{};
+  if (!append_quic_varint(&payload, payload_value)) {
+    return false;
+  }
+  std::vector<uint8_t> frame{};
+  frame.reserve(16);
+  if (!append_quic_varint(&frame, frame_type)) {
+    return false;
+  }
+  if (!append_quic_varint(&frame, static_cast<uint64_t>(payload.size()))) {
+    return false;
+  }
+  frame.insert(frame.end(), payload.begin(), payload.end());
+  ctx->control_tx_buffer.insert(ctx->control_tx_buffer.end(), frame.begin(), frame.end());
+  return true;
+}
+
+bool queue_max_push_id_frame(Ngtcp2AttemptCtx* ctx, uint64_t max_push_id) {
+  if (ctx == nullptr) {
+    return false;
+  }
+  if (ctx->max_push_id_sent && max_push_id < ctx->max_push_id_sent_value) {
+    ctx->feature_failures += 1;
+    return false;
+  }
+  if (ctx->max_push_id_sent && max_push_id == ctx->max_push_id_sent_value) {
+    return true;
+  }
+  if (!queue_h3_varint_frame(ctx, kH3FrameTypeMaxPushId, max_push_id)) {
+    return false;
+  }
+  ctx->max_push_id_sent = true;
+  ctx->max_push_id_sent_value = max_push_id;
+  return true;
+}
+
+bool queue_cancel_push_frame(Ngtcp2AttemptCtx* ctx, uint64_t push_id) {
+  if (ctx == nullptr) {
+    return false;
+  }
+  if (!ctx->cancel_push_tx_sent.insert(push_id).second) {
+    return true;
+  }
+  if (queue_h3_varint_frame(ctx, kH3FrameTypeCancelPush, push_id)) {
+    return true;
+  }
+  ctx->cancel_push_tx_sent.erase(push_id);
+  return false;
+}
+
+void append_parse_bytes(H3FrameParseState* state, const uint8_t* data, std::size_t datalen) {
+  if (state == nullptr || data == nullptr || datalen == 0) {
+    return;
+  }
+  state->buffer.insert(state->buffer.end(), data, data + datalen);
+  if (state->buffer.size() > kH3ParseBufferCap) {
+    const std::size_t drop = state->buffer.size() - kH3ParseBufferCap;
+    state->buffer.erase(state->buffer.begin(), state->buffer.begin() + static_cast<std::ptrdiff_t>(drop));
+  }
+}
+
+void note_push_promise(Ngtcp2AttemptCtx* ctx, uint64_t push_id) {
+  if (ctx == nullptr) {
+    return;
+  }
+  ctx->saw_server_push_signal = true;
+  if (!ctx->max_push_id_set || push_id > ctx->max_push_id_advertised) {
+    ctx->feature_failures += 1;
+    return;
+  }
+  ctx->promised_push_ids.insert(push_id);
+  if (ctx->feature_policy.cancel_on_promise) {
+    ctx->canceled_push_ids.insert(push_id);
+    if (!queue_cancel_push_frame(ctx, push_id)) {
+      ctx->feature_failures += 1;
+    }
+  }
+}
+
+void note_push_stream(Ngtcp2AttemptCtx* ctx, uint64_t push_id) {
+  if (ctx == nullptr) {
+    return;
+  }
+  if (!ctx->max_push_id_set || push_id > ctx->max_push_id_advertised) {
+    ctx->feature_failures += 1;
+    return;
+  }
+  if (!ctx->promised_push_ids.empty() && ctx->promised_push_ids.find(push_id) == ctx->promised_push_ids.end()) {
+    ctx->feature_failures += 1;
+    return;
+  }
+  if (ctx->canceled_push_ids.find(push_id) != ctx->canceled_push_ids.end()) {
+    return;
+  }
+  if (ctx->fulfilled_push_ids.insert(push_id).second) {
+    ctx->saw_server_push_signal = true;
+    ctx->server_push_events += 1;
+  }
+}
+
+void note_cancel_push(Ngtcp2AttemptCtx* ctx, uint64_t push_id) {
+  if (ctx == nullptr) {
+    return;
+  }
+  if (!ctx->max_push_id_set || push_id > ctx->max_push_id_advertised) {
+    ctx->feature_failures += 1;
+    return;
+  }
+  ctx->canceled_push_ids.insert(push_id);
+}
+
+void note_max_push_id(Ngtcp2AttemptCtx* ctx, uint64_t push_id) {
+  if (ctx == nullptr) {
+    return;
+  }
+  if (!ctx->max_push_id_set) {
+    ctx->max_push_id_advertised = push_id;
+    ctx->max_push_id_set = true;
+    return;
+  }
+  if (push_id < ctx->max_push_id_advertised) {
+    ctx->feature_failures += 1;
+    return;
+  }
+  ctx->max_push_id_advertised = push_id;
+}
+
+void parse_h3_frame_events(Ngtcp2AttemptCtx* ctx, int64_t stream_id, H3FrameParseState* state) {
+  if (ctx == nullptr || state == nullptr) {
+    return;
+  }
+  if (!state->initialized) {
+    state->initialized = true;
+    state->is_server_uni = is_server_uni_stream(stream_id);
+  }
+
+  if (state->is_server_uni && !state->stream_type_known) {
+    uint64_t stream_type = 0;
+    std::size_t stream_type_len = 0;
+    if (!try_decode_quic_varint(state->buffer.data(), state->buffer.size(), &stream_type, &stream_type_len)) {
+      return;
+    }
+    state->stream_type = stream_type;
+    state->stream_type_known = true;
+    state->buffer.erase(
+        state->buffer.begin(),
+        state->buffer.begin() + static_cast<std::ptrdiff_t>(stream_type_len));
+  }
+
+  if (state->is_server_uni && state->stream_type == kH3StreamTypePush && !state->push_id_known) {
+    uint64_t push_id = 0;
+    std::size_t push_id_len = 0;
+    if (!try_decode_quic_varint(state->buffer.data(), state->buffer.size(), &push_id, &push_id_len)) {
+      return;
+    }
+    state->push_id = push_id;
+    state->push_id_known = true;
+    state->buffer.erase(
+        state->buffer.begin(),
+        state->buffer.begin() + static_cast<std::ptrdiff_t>(push_id_len));
+    note_push_stream(ctx, push_id);
+  }
+
+  if (state->is_server_uni && state->stream_type != kH3StreamTypeControl && state->stream_type != kH3StreamTypePush) {
+    return;
+  }
+
+  for (;;) {
+    if (state->buffer.empty()) {
+      return;
+    }
+    uint64_t frame_type = 0;
+    uint64_t frame_len = 0;
+    std::size_t frame_type_len = 0;
+    std::size_t frame_len_len = 0;
+    if (!try_decode_quic_varint(state->buffer.data(), state->buffer.size(), &frame_type, &frame_type_len)) {
+      return;
+    }
+    if (!try_decode_quic_varint(
+            state->buffer.data() + static_cast<std::ptrdiff_t>(frame_type_len),
+            state->buffer.size() - frame_type_len,
+            &frame_len,
+            &frame_len_len)) {
+      return;
+    }
+    const std::size_t header_len = frame_type_len + frame_len_len;
+    const std::size_t payload_len = static_cast<std::size_t>(frame_len);
+    if (payload_len > state->buffer.size() - header_len) {
+      return;
+    }
+    const uint8_t* payload = state->buffer.data() + static_cast<std::ptrdiff_t>(header_len);
+    if (frame_type == kH3FrameTypePushPromise && payload_len > 0) {
+      uint64_t push_id = 0;
+      std::size_t push_id_len = 0;
+      if (try_decode_quic_varint(payload, payload_len, &push_id, &push_id_len) && push_id_len <= payload_len) {
+        note_push_promise(ctx, push_id);
+      } else {
+        ctx->feature_failures += 1;
+      }
+    } else if (frame_type == kH3FrameTypeCancelPush && payload_len > 0) {
+      uint64_t push_id = 0;
+      std::size_t push_id_len = 0;
+      if (try_decode_quic_varint(payload, payload_len, &push_id, &push_id_len) && push_id_len <= payload_len) {
+        note_cancel_push(ctx, push_id);
+      } else {
+        ctx->feature_failures += 1;
+      }
+    } else if (frame_type == kH3FrameTypeMaxPushId && payload_len > 0) {
+      uint64_t push_id = 0;
+      std::size_t push_id_len = 0;
+      if (try_decode_quic_varint(payload, payload_len, &push_id, &push_id_len) && push_id_len <= payload_len) {
+        note_max_push_id(ctx, push_id);
+      } else {
+        ctx->feature_failures += 1;
+      }
+    } else if (frame_type == kH3FrameTypeGoaway && payload_len > 0) {
+      uint64_t id = 0;
+      std::size_t id_len = 0;
+      if (try_decode_quic_varint(payload, payload_len, &id, &id_len) && id_len <= payload_len) {
+        ctx->goaway_last_stream_id = static_cast<int64_t>(id);
+        ctx->goaway_active = true;
+      }
+    }
+    state->buffer.erase(
+        state->buffer.begin(),
+        state->buffer.begin() + static_cast<std::ptrdiff_t>(header_len + payload_len));
+  }
 }
 
 int get_new_connection_id_cb(
@@ -500,6 +961,8 @@ int http_recv_header_cb(
   const nghttp3_vec vbuf = nghttp3_rcbuf_get_buf(value);
   std::string n(reinterpret_cast<const char*>(nbuf.base), nbuf.len);
   std::string v(reinterpret_cast<const char*>(vbuf.base), vbuf.len);
+  const std::string lower_n = to_lower_ascii(n);
+  const std::string lower_v = to_lower_ascii(v);
   ctx->response_headers_seen = true;
   if (ctx->response_headers.size() < 131072) {
     ctx->response_headers.append(n);
@@ -509,6 +972,25 @@ int http_recv_header_cb(
   }
   if (token == NGHTTP3_QPACK_TOKEN__STATUS || n == ":status") {
     ctx->response_status = parse_status_code(v);
+  }
+  if (ctx->feature_policy.priority_update && lower_n == "priority") {
+    if (lower_v.find(to_lower_ascii(ctx->feature_policy.priority_value)) != std::string::npos) {
+      ctx->saw_priority_ack = true;
+    }
+  }
+  if (ctx->feature_policy.extended_connect && lower_n == ":protocol") {
+    if (lower_v == to_lower_ascii(ctx->feature_policy.connect_protocol)) {
+      ctx->saw_extended_connect_ack = true;
+    }
+  }
+  if (ctx->feature_policy.datagram && lower_n == "capsule-protocol" && lower_v.find("?1") != std::string::npos) {
+    ctx->saw_datagram_ack = true;
+  }
+  if (ctx->feature_policy.server_push) {
+    if ((lower_n == "link" && lower_v.find("rel=preload") != std::string::npos) ||
+        (lower_n == "x-http3-push" && (lower_v == "1" || lower_v == "true"))) {
+      ctx->saw_server_push_signal = true;
+    }
   }
   return 0;
 }
@@ -607,6 +1089,14 @@ int recv_stream_data_cb(
   if (ctx == nullptr || ctx->h3_conn == nullptr) {
     return 0;
   }
+  if (data != nullptr && datalen > 0) {
+    auto& state = ctx->frame_parse_states[stream_id];
+    append_parse_bytes(&state, data, datalen);
+    parse_h3_frame_events(ctx, stream_id, &state);
+  }
+  if ((flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0) {
+    ctx->frame_parse_states.erase(stream_id);
+  }
   const int fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0 ? 1 : 0;
   const nghttp3_ssize nconsumed = nghttp3_conn_read_stream(
       ctx->h3_conn,
@@ -659,6 +1149,45 @@ int stream_close_cb(
     return 0;
   }
   (void)nghttp3_conn_close_stream(ctx->h3_conn, stream_id, app_error_code);
+  return 0;
+}
+
+int recv_datagram_cb(
+    ngtcp2_conn* conn,
+    uint32_t flags,
+    const uint8_t* data,
+    size_t datalen,
+    void* user_data) {
+  (void)conn;
+  (void)flags;
+  auto* ctx = static_cast<Ngtcp2AttemptCtx*>(user_data);
+  if (ctx == nullptr || data == nullptr || datalen == 0) {
+    return 0;
+  }
+  ctx->saw_datagram_ack = true;
+  ctx->datagram_rx_events += 1;
+  return 0;
+}
+
+int ack_datagram_cb(ngtcp2_conn* conn, uint64_t dgram_id, void* user_data) {
+  (void)conn;
+  auto* ctx = static_cast<Ngtcp2AttemptCtx*>(user_data);
+  if (ctx == nullptr) {
+    return 0;
+  }
+  ctx->last_datagram_id = dgram_id;
+  ctx->saw_datagram_ack = true;
+  return 0;
+}
+
+int lost_datagram_cb(ngtcp2_conn* conn, uint64_t dgram_id, void* user_data) {
+  (void)conn;
+  auto* ctx = static_cast<Ngtcp2AttemptCtx*>(user_data);
+  if (ctx == nullptr) {
+    return 0;
+  }
+  ctx->last_datagram_id = dgram_id;
+  ctx->feature_failures += 1;
   return 0;
 }
 
@@ -743,6 +1272,7 @@ bool init_quic_conn(Ngtcp2AttemptCtx* ctx) {
   params.initial_max_streams_uni = 16;
   params.initial_max_stream_data_bidi_local = 512 * 1024;
   params.initial_max_data = 4 * 1024 * 1024;
+  params.max_datagram_frame_size = 1200;
 
   ngtcp2_callbacks callbacks{};
   callbacks.client_initial = ngtcp2_crypto_client_initial_cb;
@@ -759,6 +1289,9 @@ bool init_quic_conn(Ngtcp2AttemptCtx* ctx) {
   callbacks.update_key = ngtcp2_crypto_update_key_cb;
   callbacks.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
   callbacks.delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
+  callbacks.recv_datagram = recv_datagram_cb;
+  callbacks.ack_datagram = ack_datagram_cb;
+  callbacks.lost_datagram = lost_datagram_cb;
   callbacks.version_negotiation = ngtcp2_crypto_version_negotiation_cb;
   callbacks.get_new_connection_id = get_new_connection_id_cb;
   callbacks.get_path_challenge_data = ngtcp2_crypto_get_path_challenge_data_cb;
@@ -830,6 +1363,14 @@ bool init_h3_session(Ngtcp2AttemptCtx* ctx) {
   if (nghttp3_conn_bind_qpack_streams(ctx->h3_conn, ctx->qpack_enc_stream_id, ctx->qpack_dec_stream_id) != 0) {
     return false;
   }
+  if (ctx->feature_policy.qpack_dynamic) {
+    ctx->saw_qpack_activity = true;
+  }
+  if (ctx->feature_policy.server_push) {
+    if (!queue_max_push_id_frame(ctx, ctx->max_push_id_advertised)) {
+      ctx->feature_failures += 1;
+    }
+  }
 
   ctx->h3_ready = true;
   return true;
@@ -848,6 +1389,12 @@ void reset_request_state(Ngtcp2AttemptCtx* ctx) {
   ctx->response_headers.clear();
   ctx->response_body.clear();
   ctx->req_body_off = 0;
+  ctx->saw_priority_ack = false;
+  ctx->saw_extended_connect_ack = false;
+  ctx->saw_datagram_ack = false;
+  ctx->saw_server_push_signal = false;
+  ctx->datagram_pending = false;
+  ctx->datagram_payload.clear();
 }
 
 bool submit_h3_request(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
@@ -862,14 +1409,50 @@ bool submit_h3_request(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
   const std::string authority = profile.host_header.empty()
       ? (profile.target_ip + ":" + std::to_string(std::max(1, profile.target_port)))
       : profile.host_header;
+  const bool use_extended_connect = ctx->feature_policy.extended_connect;
+  const std::string method = use_extended_connect
+      ? "CONNECT"
+      : (ctx->request.method.empty() ? "GET" : ctx->request.method);
 
   std::vector<nghttp3_nv> nva;
-  nva.reserve(8);
-  nva.push_back(make_nv(":method", ctx->request.method.empty() ? "GET" : ctx->request.method));
+  nva.reserve(12);
+  nva.push_back(make_nv(":method", method));
   nva.push_back(make_nv(":scheme", scheme));
   nva.push_back(make_nv(":authority", authority));
-  nva.push_back(make_nv(":path", ctx->request.path.empty() ? "/" : ctx->request.path));
+  if (!use_extended_connect) {
+    nva.push_back(make_nv(":path", ctx->request.path.empty() ? "/" : ctx->request.path));
+  } else {
+    nva.push_back(make_nv(":protocol", ctx->feature_policy.connect_protocol));
+    nva.push_back(make_nv("capsule-protocol", "?1"));
+  }
   nva.push_back(make_nv("user-agent", "ddos-samurai/native-quic"));
+  if (ctx->feature_policy.priority_update) {
+    nva.push_back(make_nv("priority", ctx->feature_policy.priority_value));
+    nghttp3_pri pri{};
+    pri.urgency = ctx->feature_policy.priority_urgency;
+    pri.inc = ctx->feature_policy.priority_incremental;
+    if (nghttp3_conn_set_stream_priority(ctx->h3_conn, ctx->request_stream_id, &pri) != 0) {
+      ctx->feature_failures += 1;
+    }
+  }
+  if (ctx->feature_policy.datagram) {
+    nva.push_back(make_nv("capsule-protocol", "?1"));
+    nva.push_back(make_nv("datagram-flow-id", ctx->feature_policy.datagram_flow_id));
+    ctx->datagram_payload.assign(
+        ctx->feature_policy.datagram_flow_id.begin(),
+        ctx->feature_policy.datagram_flow_id.end());
+    ctx->datagram_payload.push_back(':');
+    ctx->datagram_payload.push_back('d');
+    ctx->datagram_payload.push_back('g');
+    ctx->datagram_payload.push_back('m');
+    ctx->datagram_payload.push_back(':');
+    const std::string sid_text = std::to_string(ctx->request_stream_id);
+    ctx->datagram_payload.insert(ctx->datagram_payload.end(), sid_text.begin(), sid_text.end());
+    ctx->datagram_pending = true;
+  }
+  if (ctx->feature_policy.server_push) {
+    nva.push_back(make_nv("prefer", "respond-async"));
+  }
 
   std::string content_length;
   if (!ctx->request.body.empty()) {
@@ -955,6 +1538,52 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
   }
 
   // Send packet(s)
+  if (ctx->datagram_pending && ctx->conn != nullptr && !ctx->datagram_payload.empty()) {
+    const ngtcp2_transport_params* remote = ngtcp2_conn_get_remote_transport_params(ctx->conn);
+    const bool datagram_supported = remote != nullptr && remote->max_datagram_frame_size > 0;
+    ctx->datagram_remote_supported = datagram_supported;
+    if (datagram_supported) {
+      std::array<uint8_t, 1452> dpkt{};
+      ngtcp2_path_storage dps;
+      ngtcp2_path_storage_zero(&dps);
+      ngtcp2_pkt_info dpi{};
+      ngtcp2_vec dvec{};
+      dvec.base = ctx->datagram_payload.data();
+      dvec.len = ctx->datagram_payload.size();
+      int accepted = 0;
+      const ngtcp2_ssize dnwrite = ngtcp2_conn_writev_datagram(
+          ctx->conn,
+          &dps.path,
+          &dpi,
+          dpkt.data(),
+          dpkt.size(),
+          &accepted,
+          NGTCP2_WRITE_DATAGRAM_FLAG_NONE,
+          ctx->next_datagram_id,
+          &dvec,
+          1,
+          ts);
+      if (dnwrite > 0) {
+        const ssize_t dwr = ::send(ctx->fd, dpkt.data(), static_cast<std::size_t>(dnwrite), 0);
+        if (dwr > 0 && accepted != 0) {
+          ctx->datagram_tx_events += 1;
+          if (out != nullptr) {
+            out->tx_datagrams += 1;
+          }
+          ctx->last_datagram_id = ctx->next_datagram_id;
+          ctx->next_datagram_id += 1;
+          ctx->datagram_pending = false;
+        }
+      } else if (dnwrite == NGTCP2_ERR_INVALID_STATE || dnwrite == NGTCP2_ERR_INVALID_ARGUMENT) {
+        ctx->feature_failures += 1;
+        ctx->datagram_pending = false;
+      }
+    } else {
+      ctx->feature_failures += 1;
+      ctx->datagram_pending = false;
+    }
+  }
+
   for (int iter = 0; iter < 32; ++iter) {
     std::array<uint8_t, 1452> pkt{};
     ngtcp2_path_storage ps;
@@ -966,8 +1595,20 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
     int fin = 0;
     std::array<nghttp3_vec, 16> h3_vec{};
     nghttp3_ssize h3_veccnt = 0;
+    ngtcp2_vec custom_vec{};
+    bool custom_stream_payload = false;
+    bool stream_from_nghttp3 = false;
 
-    if (ctx->h3_ready && ctx->h3_conn != nullptr) {
+    if (!ctx->control_tx_buffer.empty() &&
+        ctx->control_tx_off < ctx->control_tx_buffer.size() &&
+        ctx->ctrl_stream_id >= 0) {
+      sid = ctx->ctrl_stream_id;
+      custom_vec.base = ctx->control_tx_buffer.data() + ctx->control_tx_off;
+      custom_vec.len = ctx->control_tx_buffer.size() - ctx->control_tx_off;
+      custom_stream_payload = custom_vec.len > 0;
+    }
+
+    if (!custom_stream_payload && ctx->h3_ready && ctx->h3_conn != nullptr) {
       h3_veccnt = nghttp3_conn_writev_stream(
           ctx->h3_conn,
           &sid,
@@ -977,6 +1618,7 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
       if (h3_veccnt < 0) {
         return false;
       }
+      stream_from_nghttp3 = sid >= 0;
     }
 
     uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_NONE;
@@ -996,11 +1638,33 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
         &pdatalen,
         flags,
         sid,
-        sid >= 0 ? reinterpret_cast<const ngtcp2_vec*>(h3_vec.data()) : nullptr,
-        sid >= 0 ? static_cast<std::size_t>(std::max<nghttp3_ssize>(0, h3_veccnt)) : 0,
+        custom_stream_payload
+            ? &custom_vec
+            : (sid >= 0 ? reinterpret_cast<const ngtcp2_vec*>(h3_vec.data()) : nullptr),
+        custom_stream_payload
+            ? static_cast<std::size_t>(1)
+            : (sid >= 0 ? static_cast<std::size_t>(std::max<nghttp3_ssize>(0, h3_veccnt)) : 0),
         ts);
     if (nwrite < 0) {
-      if (sid >= 0 && ctx->h3_conn != nullptr) {
+      if (custom_stream_payload) {
+        if (nwrite == NGTCP2_ERR_WRITE_MORE && pdatalen > 0) {
+          ctx->control_tx_off += static_cast<std::size_t>(pdatalen);
+          if (ctx->control_tx_off >= ctx->control_tx_buffer.size()) {
+            ctx->control_tx_buffer.clear();
+            ctx->control_tx_off = 0;
+          }
+          continue;
+        }
+        if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+          continue;
+        }
+        if (nwrite == NGTCP2_ERR_STREAM_SHUT_WR || nwrite == NGTCP2_ERR_STREAM_NOT_FOUND) {
+          ctx->feature_failures += 1;
+          ctx->control_tx_buffer.clear();
+          ctx->control_tx_off = 0;
+          continue;
+        }
+      } else if (sid >= 0 && ctx->h3_conn != nullptr) {
         if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
           nghttp3_conn_block_stream(ctx->h3_conn, sid);
           continue;
@@ -1019,7 +1683,14 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
       return false;
     }
 
-    if (sid >= 0 && ctx->h3_conn != nullptr && pdatalen >= 0) {
+    if (custom_stream_payload && pdatalen > 0) {
+      ctx->control_tx_off += static_cast<std::size_t>(pdatalen);
+      if (ctx->control_tx_off >= ctx->control_tx_buffer.size()) {
+        ctx->control_tx_buffer.clear();
+        ctx->control_tx_off = 0;
+      }
+      ctx->tx_bytes += static_cast<std::size_t>(pdatalen);
+    } else if (stream_from_nghttp3 && ctx->h3_conn != nullptr && pdatalen >= 0) {
       if (nghttp3_conn_add_write_offset(ctx->h3_conn, sid, static_cast<std::size_t>(pdatalen)) != 0) {
         return false;
       }
@@ -1105,15 +1776,20 @@ bool run_single_attempt(
     const Profile& profile,
     int timeout_ms,
     int planned_requests,
+    const H3FeaturePolicy& feature_policy,
     UdpProbeCounters* out) {
   if (out == nullptr) {
     return false;
   }
   const int request_budget = std::max(1, planned_requests);
+  const GoawayPolicy goaway_policy = derive_goaway_policy(profile);
   Ngtcp2AttemptCtx ctx{};
   ctx.request = derive_request_spec(profile);
   ctx.expectations = derive_expectations(profile);
   ctx.requests_planned = request_budget;
+  ctx.feature_policy = feature_policy;
+  ctx.max_push_id_advertised = feature_policy.max_push_id;
+  ctx.max_push_id_set = true;
 
   do {
     if (!connect_udp(&ctx, profile)) {
@@ -1234,6 +1910,23 @@ bool run_single_attempt(
       if (request_ok) {
         ctx.requests_succeeded += 1;
         out->send_ok += 1;
+        if (ctx.feature_policy.priority_update && ctx.saw_priority_ack) {
+          ctx.priority_update_events += 1;
+        } else if (ctx.feature_policy.priority_update) {
+          ctx.feature_failures += 1;
+        }
+        if (ctx.feature_policy.extended_connect &&
+            (ctx.saw_extended_connect_ack || ctx.response_status == 200)) {
+          ctx.extended_connect_events += 1;
+        } else if (ctx.feature_policy.extended_connect) {
+          ctx.feature_failures += 1;
+        }
+        if (ctx.feature_policy.datagram &&
+            (ctx.saw_datagram_ack || !ctx.response_body.empty() || ctx.response_headers_seen)) {
+          ctx.datagram_rx_events += 1;
+        } else if (ctx.feature_policy.datagram) {
+          ctx.feature_failures += 1;
+        }
       } else {
         ctx.requests_failed += 1;
         out->errors += 1;
@@ -1243,6 +1936,24 @@ bool run_single_attempt(
         }
       }
       ctx.requests_completed += 1;
+    }
+    if (goaway_policy.enabled && ctx.h3_conn != nullptr) {
+      if (nghttp3_conn_submit_shutdown_notice(ctx.h3_conn) == 0) {
+        (void)nghttp3_conn_shutdown(ctx.h3_conn);
+        ctx.goaway_events += 1;
+        const uint64_t drain_deadline_ns = now_ns() + 20ull * 1000000ull;
+        while (now_ns() < drain_deadline_ns) {
+          if (!drive_io_once(&ctx, drain_deadline_ns, out)) {
+            break;
+          }
+          if (ctx.goaway_active) {
+            ctx.drain_cycles += 1;
+            break;
+          }
+        }
+      } else {
+        ctx.control_plane_failures += 1;
+      }
     }
     if (ctx.goaway_active) {
       if (ctx.requests_completed >= request_budget) {
@@ -1261,6 +1972,34 @@ bool run_single_attempt(
   out->h3_replace_after_idle += ctx.replace_after_idle;
   out->h3_control_plane_failures += ctx.control_plane_failures;
   out->h3_graceful_close_count += ctx.graceful_close_count;
+  if (ctx.feature_policy.qpack_dynamic && ctx.saw_qpack_activity && ctx.requests_succeeded > 0) {
+    ctx.qpack_dynamic_events += 1;
+  } else if (ctx.feature_policy.qpack_dynamic) {
+    ctx.feature_failures += 1;
+  }
+  if (ctx.feature_policy.server_push) {
+    const std::size_t promised = ctx.promised_push_ids.size();
+    const std::size_t canceled = ctx.canceled_push_ids.size();
+    const bool push_observed =
+        ctx.server_push_events > 0 ||
+        promised > 0 ||
+        ctx.saw_server_push_signal;
+    if (push_observed) {
+      if (ctx.server_push_events <= 0 && promised > 0) {
+        const std::size_t effective = promised > canceled ? (promised - canceled) : 1u;
+        ctx.server_push_events = static_cast<int>(std::max<std::size_t>(1u, effective));
+      }
+    } else {
+      ctx.feature_failures += 1;
+    }
+  }
+  out->h3_qpack_dynamic_events += ctx.qpack_dynamic_events;
+  out->h3_priority_update_events += ctx.priority_update_events;
+  out->h3_extended_connect_events += ctx.extended_connect_events;
+  out->h3_datagram_tx_events += ctx.datagram_tx_events;
+  out->h3_datagram_rx_events += ctx.datagram_rx_events;
+  out->h3_server_push_events += ctx.server_push_events;
+  out->h3_feature_failures += ctx.feature_failures;
   out->tx_bytes += ctx.tx_bytes;
   out->rx_bytes += ctx.rx_bytes;
   cleanup_attempt(&ctx);
@@ -1295,6 +2034,7 @@ bool run_h3_ngtcp2_client(
   const int timeout_ms = std::max(50, profile.timeout_ms);
   const int stream_budget = std::max(1, profile.max_streams_per_connection);
   const GoawayPolicy goaway_policy = derive_goaway_policy(profile);
+  const H3FeaturePolicy feature_policy = derive_h3_feature_policy(profile);
   const int policy_cap = goaway_policy.enabled ? std::max(1, goaway_policy.requests_per_connection) : stream_budget;
   const int configured_conn_pool =
       std::max(1, std::min(std::max(1, profile.max_connections), std::max(1, cfg.concurrency)));
@@ -1304,56 +2044,28 @@ bool run_h3_ngtcp2_client(
   for (int i = 0; i < warm_conn_count && remaining > 0; ++i) {
     const int remaining_conn_slots = std::max(0, warm_conn_count - i - 1);
     const int planned_for_conn = std::min(policy_cap, std::max(1, remaining - remaining_conn_slots));
-    const int prev_established = out->conn_established;
     out->conn_attempted += 1;
-    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, out)) {
+    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, feature_policy, out)) {
       gnutls_global_deinit();
       return ran;
     }
     remaining = std::max(0, remaining - planned_for_conn);
-    if (goaway_policy.enabled) {
-      const bool established = out->conn_established > prev_established;
-      if (established) {
-        out->h3_goaway_events += 1;
-        out->h3_drain_cycles += 1;
-        if (remaining > 0) {
-          if (goaway_policy.replace_after_idle) {
-            out->h3_replace_after_idle += 1;
-          } else {
-            out->h3_replace_now += planned_for_conn;
-          }
-        }
-      } else {
-        out->h3_control_plane_failures += 1;
-      }
+    if (goaway_policy.enabled && out->conn_established <= 0) {
+      out->h3_control_plane_failures += 1;
     }
     ran = true;
   }
 
   while (remaining > 0) {
     const int planned_for_conn = std::min(policy_cap, remaining);
-    const int prev_established = out->conn_established;
     out->conn_attempted += 1;
-    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, out)) {
+    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, feature_policy, out)) {
       gnutls_global_deinit();
       return ran;
     }
     remaining -= planned_for_conn;
-    if (goaway_policy.enabled) {
-      const bool established = out->conn_established > prev_established;
-      if (established) {
-        out->h3_goaway_events += 1;
-        out->h3_drain_cycles += 1;
-        if (remaining > 0) {
-          if (goaway_policy.replace_after_idle) {
-            out->h3_replace_after_idle += 1;
-          } else {
-            out->h3_replace_now += planned_for_conn;
-          }
-        }
-      } else {
-        out->h3_control_plane_failures += 1;
-      }
+    if (goaway_policy.enabled && out->conn_established <= 0) {
+      out->h3_control_plane_failures += 1;
     }
     ran = true;
   }
