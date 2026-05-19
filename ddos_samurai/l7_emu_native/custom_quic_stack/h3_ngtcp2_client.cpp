@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -219,6 +220,12 @@ struct Ngtcp2AttemptCtx {
   bool max_push_id_sent{false};
 };
 
+struct TlsSessionCache {
+  std::string identity{};
+  std::string disk_path{};
+  std::vector<uint8_t> blob{};
+};
+
 ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* conn_ref) {
   if (conn_ref == nullptr) {
     return nullptr;
@@ -270,6 +277,30 @@ int env_int(const char* name, int fallback) {
     return fallback;
   }
   return std::atoi(raw);
+}
+
+constexpr uint32_t kTlsSessionCacheMagic = 0x31534c54u;  // "TLS1"
+constexpr std::size_t kTlsSessionCacheMaxBlob = 64u * 1024u;
+
+void append_u32_le(std::vector<uint8_t>* out, uint32_t v) {
+  if (out == nullptr) {
+    return;
+  }
+  out->push_back(static_cast<uint8_t>(v & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 8u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 16u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 24u) & 0xffu));
+}
+
+bool read_u32_le(const std::vector<uint8_t>& src, std::size_t off, uint32_t* out) {
+  if (out == nullptr || off + 4u > src.size()) {
+    return false;
+  }
+  *out = static_cast<uint32_t>(src[off]) |
+      (static_cast<uint32_t>(src[off + 1]) << 8u) |
+      (static_cast<uint32_t>(src[off + 2]) << 16u) |
+      (static_cast<uint32_t>(src[off + 3]) << 24u);
+  return true;
 }
 
 QuicUdpIoBackend parse_backend_name(const std::string& raw) {
@@ -637,6 +668,146 @@ std::string normalize_authority_host(std::string authority) {
     return authority.substr(0, first_colon);
   }
   return authority;
+}
+
+std::string build_tls_session_identity(
+    const std::string& verify_name,
+    int port) {
+  std::string host = trim_ascii(verify_name);
+  if (host.empty()) {
+    return {};
+  }
+  host = to_lower_ascii(host);
+  return host + ":" + std::to_string(std::max(1, port));
+}
+
+std::string resolve_tls_session_cache_file_path() {
+  const char* raw = std::getenv("SAMURAI_QUIC_TLS_SESSION_CACHE_FILE");
+  if (raw == nullptr) {
+    return {};
+  }
+  return trim_ascii(raw);
+}
+
+bool load_tls_session_cache_file(
+    const std::string& path,
+    const std::string& identity,
+    std::vector<uint8_t>* out_blob) {
+  if (path.empty() || identity.empty() || out_blob == nullptr) {
+    return false;
+  }
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open()) {
+    return false;
+  }
+  std::vector<uint8_t> raw{
+      std::istreambuf_iterator<char>(in),
+      std::istreambuf_iterator<char>()};
+  if (raw.size() < 12u) {
+    return false;
+  }
+  uint32_t magic = 0;
+  uint32_t identity_len = 0;
+  uint32_t blob_len = 0;
+  if (!read_u32_le(raw, 0, &magic) ||
+      !read_u32_le(raw, 4, &identity_len) ||
+      !read_u32_le(raw, 8, &blob_len)) {
+    return false;
+  }
+  if (magic != kTlsSessionCacheMagic) {
+    return false;
+  }
+  if (identity_len == 0 ||
+      blob_len == 0 ||
+      static_cast<std::size_t>(identity_len) > 1024u ||
+      static_cast<std::size_t>(blob_len) > kTlsSessionCacheMaxBlob) {
+    return false;
+  }
+  const std::size_t expected_size =
+      12u + static_cast<std::size_t>(identity_len) + static_cast<std::size_t>(blob_len);
+  if (raw.size() != expected_size) {
+    return false;
+  }
+  const std::string got_identity(
+      reinterpret_cast<const char*>(raw.data() + 12u),
+      static_cast<std::size_t>(identity_len));
+  if (got_identity != identity) {
+    return false;
+  }
+  out_blob->assign(
+      raw.begin() + static_cast<std::ptrdiff_t>(12u + identity_len),
+      raw.end());
+  return !out_blob->empty();
+}
+
+bool store_tls_session_cache_file(
+    const std::string& path,
+    const std::string& identity,
+    const std::vector<uint8_t>& blob) {
+  if (path.empty() || identity.empty() || blob.empty() || blob.size() > kTlsSessionCacheMaxBlob) {
+    return false;
+  }
+  if (identity.size() > 1024u) {
+    return false;
+  }
+  std::vector<uint8_t> raw{};
+  raw.reserve(12u + identity.size() + blob.size());
+  append_u32_le(&raw, kTlsSessionCacheMagic);
+  append_u32_le(&raw, static_cast<uint32_t>(identity.size()));
+  append_u32_le(&raw, static_cast<uint32_t>(blob.size()));
+  raw.insert(raw.end(), identity.begin(), identity.end());
+  raw.insert(raw.end(), blob.begin(), blob.end());
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out.is_open()) {
+    return false;
+  }
+  out.write(reinterpret_cast<const char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+  return out.good();
+}
+
+bool tls_ticket_ready(gnutls_session_t session) {
+  if (session == nullptr) {
+    return false;
+  }
+#ifdef GNUTLS_SFLAGS_SESSION_TICKET
+  return (gnutls_session_get_flags(session) & GNUTLS_SFLAGS_SESSION_TICKET) != 0u;
+#else
+  return true;
+#endif
+}
+
+bool apply_tls_session_cache(gnutls_session_t session, const TlsSessionCache* cache) {
+  if (session == nullptr || cache == nullptr || cache->blob.empty()) {
+    return false;
+  }
+  return gnutls_session_set_data(session, cache->blob.data(), cache->blob.size()) == GNUTLS_E_SUCCESS;
+}
+
+bool capture_tls_session_cache(gnutls_session_t session, TlsSessionCache* cache) {
+  if (session == nullptr || cache == nullptr) {
+    return false;
+  }
+  if (!tls_ticket_ready(session)) {
+    return false;
+  }
+  gnutls_datum_t data{};
+  if (gnutls_session_get_data2(session, &data) != GNUTLS_E_SUCCESS) {
+    return false;
+  }
+  if (data.data == nullptr || data.size == 0 || data.size > kTlsSessionCacheMaxBlob) {
+    if (data.data != nullptr) {
+      gnutls_free(data.data);
+    }
+    return false;
+  }
+  cache->blob.assign(
+      data.data,
+      data.data + static_cast<std::ptrdiff_t>(data.size));
+  gnutls_free(data.data);
+  if (!cache->disk_path.empty() && !cache->identity.empty()) {
+    (void)store_tls_session_cache_file(cache->disk_path, cache->identity, cache->blob);
+  }
+  return true;
 }
 
 void derive_tls_names(
@@ -1607,7 +1778,9 @@ int lost_datagram_cb(ngtcp2_conn* conn, uint64_t dgram_id, void* user_data) {
 bool configure_gnutls_session(
     Ngtcp2AttemptCtx* ctx,
     const std::string& sni_name,
-    bool verify_peer) {
+    bool verify_peer,
+    const TlsSessionCache* session_cache) {
+  (void)verify_peer;
   if (ctx == nullptr) {
     return false;
   }
@@ -1647,6 +1820,7 @@ bool configure_gnutls_session(
         sni_name.data(),
         sni_name.size());
   }
+  (void)apply_tls_session_cache(ctx->session, session_cache);
   return true;
 }
 
@@ -2886,6 +3060,7 @@ bool run_single_attempt(
     int timeout_ms,
     int planned_requests,
     const H3FeaturePolicy& feature_policy,
+    TlsSessionCache* session_cache,
     UdpProbeCounters* out) {
   if (out == nullptr) {
     return false;
@@ -2926,7 +3101,7 @@ bool run_single_attempt(
     out->runtime_native_hot_path_ready =
         ctx.udp_io_backend == QuicUdpIoBackend::AfXdp || ctx.udp_io_backend == QuicUdpIoBackend::Dpdk ? 1 : 0;
     out->runtime_backend_requested = static_cast<int>(ctx.requested_backend);
-    if (!configure_gnutls_session(&ctx, tls_sni_name, verify_peer)) {
+    if (!configure_gnutls_session(&ctx, tls_sni_name, verify_peer, session_cache)) {
       out->handshake_fail += request_budget;
       out->timeouts += request_budget;
       out->errors += request_budget;
@@ -3097,6 +3272,17 @@ bool run_single_attempt(
     if (ctx.requests_completed > 0 && ctx.requests_failed == 0) {
       ctx.graceful_close_count += 1;
     }
+    if (ctx.handshake_done && ctx.session != nullptr && session_cache != nullptr) {
+      if (!tls_ticket_ready(ctx.session)) {
+        const uint64_t ticket_deadline_ns = now_ns() + 75ull * 1000000ull;
+        while (!tls_ticket_ready(ctx.session) && now_ns() < ticket_deadline_ns) {
+          if (!drive_io_once(&ctx, ticket_deadline_ns, out)) {
+            break;
+          }
+        }
+      }
+      (void)capture_tls_session_cache(ctx.session, session_cache);
+    }
   } while (false);
   out->h3_goaway_events += ctx.goaway_events;
   out->h3_drain_cycles += ctx.drain_cycles;
@@ -3167,6 +3353,16 @@ bool run_h3_ngtcp2_client(
   const int stream_budget = std::max(1, profile.max_streams_per_connection);
   const GoawayPolicy goaway_policy = derive_goaway_policy(profile);
   const H3FeaturePolicy feature_policy = derive_h3_feature_policy(profile);
+  std::string tls_sni_name{};
+  std::string tls_verify_name{};
+  derive_tls_names(profile, &tls_sni_name, &tls_verify_name);
+  (void)tls_sni_name;
+  TlsSessionCache session_cache{};
+  session_cache.identity = build_tls_session_identity(tls_verify_name, profile.target_port);
+  session_cache.disk_path = resolve_tls_session_cache_file_path();
+  if (!session_cache.disk_path.empty() && !session_cache.identity.empty()) {
+    (void)load_tls_session_cache_file(session_cache.disk_path, session_cache.identity, &session_cache.blob);
+  }
   const int policy_cap = goaway_policy.enabled ? std::max(1, goaway_policy.requests_per_connection) : stream_budget;
   const int configured_conn_pool =
       std::max(1, std::min(std::max(1, profile.max_connections), std::max(1, cfg.concurrency)));
@@ -3177,7 +3373,7 @@ bool run_h3_ngtcp2_client(
     const int remaining_conn_slots = std::max(0, warm_conn_count - i - 1);
     const int planned_for_conn = std::min(policy_cap, std::max(1, remaining - remaining_conn_slots));
     out->conn_attempted += 1;
-    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, feature_policy, out)) {
+    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, feature_policy, &session_cache, out)) {
       gnutls_global_deinit();
       return ran;
     }
@@ -3191,7 +3387,7 @@ bool run_h3_ngtcp2_client(
   while (remaining > 0) {
     const int planned_for_conn = std::min(policy_cap, remaining);
     out->conn_attempted += 1;
-    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, feature_policy, out)) {
+    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, feature_policy, &session_cache, out)) {
       gnutls_global_deinit();
       return ran;
     }
