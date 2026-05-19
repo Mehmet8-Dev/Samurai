@@ -112,6 +112,9 @@ enum class QuicUdpIoBackend {
   Dpdk = 2,
 };
 
+constexpr std::size_t kMaxUdpPayloadBytes = 1400u;
+constexpr std::size_t kMaxL2FrameBytes = 14u + sizeof(iphdr) + sizeof(udphdr) + kMaxUdpPayloadBytes;
+
 struct QuicXdpTransport {
   const xdp_native_api_v1* api{nullptr};
   int handle{0};
@@ -126,6 +129,7 @@ struct QuicXdpTransport {
   std::vector<uint8_t> rx_frames{};
   std::array<uint16_t, 64> rx_lens{};
   std::array<uint8_t, 65536> udp_payload{};
+  std::array<uint8_t, kMaxL2FrameBytes> tx_frame{};
 };
 
 struct QuicDpdkTransport {
@@ -133,6 +137,7 @@ struct QuicDpdkTransport {
   PyObject* fn_send_batch{nullptr};
   PyObject* fn_poll_rx{nullptr};
   PyObject* fn_close{nullptr};
+  PyObject* tx_frame_obj{nullptr};
   long handle{0};
   std::array<uint8_t, 6> src_mac{};
   std::array<uint8_t, 6> dst_mac{};
@@ -521,6 +526,62 @@ uint16_t udp_ipv4_checksum(
   return csum == 0 ? 0xFFFFu : htons(csum);
 }
 
+bool build_ipv4_udp_eth_frame(
+    const std::array<uint8_t, 6>& dst_mac,
+    const std::array<uint8_t, 6>& src_mac,
+    uint32_t src_ip_nbo,
+    uint32_t dst_ip_nbo,
+    uint16_t src_port_nbo,
+    uint16_t dst_port_nbo,
+    uint16_t* ip_id,
+    const uint8_t* payload,
+    std::size_t payload_len,
+    uint8_t* out_frame,
+    std::size_t out_frame_cap,
+    std::size_t* out_frame_len) {
+  if (ip_id == nullptr || payload == nullptr || out_frame == nullptr || out_frame_len == nullptr) {
+    return false;
+  }
+  if (payload_len == 0 || payload_len > kMaxUdpPayloadBytes || out_frame_cap < kMaxL2FrameBytes) {
+    return false;
+  }
+  const std::size_t frame_len = 14u + sizeof(iphdr) + sizeof(udphdr) + payload_len;
+  std::size_t off = 0;
+  for (std::size_t i = 0; i < 6; ++i) {
+    out_frame[off + i] = dst_mac[i];
+    out_frame[off + 6 + i] = src_mac[i];
+  }
+  out_frame[off + 12] = 0x08;
+  out_frame[off + 13] = 0x00;
+  off += 14;
+
+  auto* ip = reinterpret_cast<iphdr*>(out_frame + off);
+  std::memset(ip, 0, sizeof(*ip));
+  ip->version = 4;
+  ip->ihl = 5;
+  ip->ttl = 64;
+  ip->protocol = IPPROTO_UDP;
+  ip->id = htons((*ip_id)++);
+  ip->frag_off = htons(0x4000);
+  ip->tot_len = htons(static_cast<uint16_t>(sizeof(iphdr) + sizeof(udphdr) + payload_len));
+  ip->saddr = src_ip_nbo;
+  ip->daddr = dst_ip_nbo;
+  ip->check = ipv4_header_checksum(ip);
+  off += sizeof(iphdr);
+
+  auto* udp = reinterpret_cast<udphdr*>(out_frame + off);
+  std::memset(udp, 0, sizeof(*udp));
+  udp->source = src_port_nbo;
+  udp->dest = dst_port_nbo;
+  udp->len = htons(static_cast<uint16_t>(sizeof(udphdr) + payload_len));
+  off += sizeof(udphdr);
+  std::memcpy(out_frame + off, payload, payload_len);
+  udp->check = udp_ipv4_checksum(src_ip_nbo, dst_ip_nbo, udp, payload, payload_len);
+
+  *out_frame_len = frame_len;
+  return true;
+}
+
 const xdp_native_api_v1* load_xdp_native_api() {
   PyGILState_STATE gil = PyGILState_Ensure();
   PyObject* mod = PyImport_ImportModule("ddos_samurai.xdp_sender");
@@ -584,6 +645,7 @@ void close_dpdk_transport(QuicDpdkTransport* t) {
   Py_XDECREF(t->fn_send_batch);
   Py_XDECREF(t->fn_poll_rx);
   Py_XDECREF(t->fn_close);
+  Py_XDECREF(t->tx_frame_obj);
   Py_XDECREF(t->mod);
   *t = QuicDpdkTransport{};
   PyGILState_Release(gil);
@@ -2415,6 +2477,12 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     dpdk.fn_poll_rx = fn_poll_rx;
     dpdk.fn_close = fn_close;
     dpdk.handle = handle;
+    dpdk.tx_frame_obj = PyByteArray_FromStringAndSize(nullptr, static_cast<Py_ssize_t>(kMaxL2FrameBytes));
+    if (dpdk.tx_frame_obj == nullptr) {
+      close_dpdk_transport(&dpdk);
+      PyGILState_Release(gil);
+      return false;
+    }
 
     sockaddr_in remote4{};
     std::memcpy(&remote4, &c->remote_addr, sizeof(remote4));
@@ -2558,52 +2626,35 @@ ssize_t send_udp_payload(Ngtcp2AttemptCtx* ctx, const uint8_t* payload, std::siz
     }
     return ::send(ctx->fd, payload, payload_len, 0);
   }
-  if (payload_len > 1400) {
+  if (payload_len > kMaxUdpPayloadBytes) {
     return -1;
   }
   if (ctx->udp_io_backend == QuicUdpIoBackend::AfXdp) {
     if (ctx->xdp.api == nullptr || ctx->xdp.handle <= 0) {
       return -1;
     }
-    std::vector<uint8_t> frame{};
-    frame.resize(14u + sizeof(iphdr) + sizeof(udphdr) + payload_len);
-    std::size_t off = 0;
-    for (std::size_t i = 0; i < 6; ++i) {
-      frame[off + i] = ctx->xdp.dst_mac[i];
-      frame[off + 6 + i] = ctx->xdp.src_mac[i];
+    std::size_t frame_len = 0;
+    if (!build_ipv4_udp_eth_frame(
+            ctx->xdp.dst_mac,
+            ctx->xdp.src_mac,
+            ctx->xdp.src_ip_nbo,
+            ctx->xdp.dst_ip_nbo,
+            ctx->xdp.src_port_nbo,
+            ctx->xdp.dst_port_nbo,
+            &ctx->xdp.ip_id,
+            payload,
+            payload_len,
+            ctx->xdp.tx_frame.data(),
+            ctx->xdp.tx_frame.size(),
+            &frame_len)) {
+      return -1;
     }
-    frame[off + 12] = 0x08;
-    frame[off + 13] = 0x00;
-    off += 14;
-
-    auto* ip = reinterpret_cast<iphdr*>(frame.data() + off);
-    std::memset(ip, 0, sizeof(*ip));
-    ip->version = 4;
-    ip->ihl = 5;
-    ip->ttl = 64;
-    ip->protocol = IPPROTO_UDP;
-    ip->id = htons(ctx->xdp.ip_id++);
-    ip->frag_off = htons(0x4000);
-    ip->tot_len = htons(static_cast<uint16_t>(sizeof(iphdr) + sizeof(udphdr) + payload_len));
-    ip->saddr = ctx->xdp.src_ip_nbo;
-    ip->daddr = ctx->xdp.dst_ip_nbo;
-    ip->check = ipv4_header_checksum(ip);
-    off += sizeof(iphdr);
-
-    auto* udp = reinterpret_cast<udphdr*>(frame.data() + off);
-    std::memset(udp, 0, sizeof(*udp));
-    udp->source = ctx->xdp.src_port_nbo;
-    udp->dest = ctx->xdp.dst_port_nbo;
-    udp->len = htons(static_cast<uint16_t>(sizeof(udphdr) + payload_len));
-    off += sizeof(udphdr);
-    std::memcpy(frame.data() + off, payload, payload_len);
-    udp->check = udp_ipv4_checksum(ctx->xdp.src_ip_nbo, ctx->xdp.dst_ip_nbo, udp, payload, payload_len);
 
     char err[160]{};
     const int sent = ctx->xdp.api->send_buffer(
         ctx->xdp.handle,
-        frame.data(),
-        static_cast<int>(frame.size()),
+        ctx->xdp.tx_frame.data(),
+        static_cast<int>(frame_len),
         1,
         err,
         sizeof(err));
@@ -2613,57 +2664,37 @@ ssize_t send_udp_payload(Ngtcp2AttemptCtx* ctx, const uint8_t* payload, std::siz
     return static_cast<ssize_t>(payload_len);
   }
   if (ctx->udp_io_backend == QuicUdpIoBackend::Dpdk) {
-    if (ctx->dpdk.handle <= 0 || ctx->dpdk.fn_send_batch == nullptr) {
+    if (ctx->dpdk.handle <= 0 || ctx->dpdk.fn_send_batch == nullptr || ctx->dpdk.tx_frame_obj == nullptr) {
       return -1;
     }
-    std::vector<uint8_t> frame{};
-    frame.resize(14u + sizeof(iphdr) + sizeof(udphdr) + payload_len);
-    std::size_t off = 0;
-    for (std::size_t i = 0; i < 6; ++i) {
-      frame[off + i] = ctx->dpdk.dst_mac[i];
-      frame[off + 6 + i] = ctx->dpdk.src_mac[i];
-    }
-    frame[off + 12] = 0x08;
-    frame[off + 13] = 0x00;
-    off += 14;
-
-    auto* ip = reinterpret_cast<iphdr*>(frame.data() + off);
-    std::memset(ip, 0, sizeof(*ip));
-    ip->version = 4;
-    ip->ihl = 5;
-    ip->ttl = 64;
-    ip->protocol = IPPROTO_UDP;
-    ip->id = htons(ctx->dpdk.ip_id++);
-    ip->frag_off = htons(0x4000);
-    ip->tot_len = htons(static_cast<uint16_t>(sizeof(iphdr) + sizeof(udphdr) + payload_len));
-    ip->saddr = ctx->dpdk.src_ip_nbo;
-    ip->daddr = ctx->dpdk.dst_ip_nbo;
-    ip->check = ipv4_header_checksum(ip);
-    off += sizeof(iphdr);
-
-    auto* udp = reinterpret_cast<udphdr*>(frame.data() + off);
-    std::memset(udp, 0, sizeof(*udp));
-    udp->source = ctx->dpdk.src_port_nbo;
-    udp->dest = ctx->dpdk.dst_port_nbo;
-    udp->len = htons(static_cast<uint16_t>(sizeof(udphdr) + payload_len));
-    off += sizeof(udphdr);
-    std::memcpy(frame.data() + off, payload, payload_len);
-    udp->check = udp_ipv4_checksum(ctx->dpdk.src_ip_nbo, ctx->dpdk.dst_ip_nbo, udp, payload, payload_len);
-
     int sent = 0;
     PyGILState_STATE gil = PyGILState_Ensure();
-    PyObject* frame_obj = PyBytes_FromStringAndSize(
-        reinterpret_cast<const char*>(frame.data()),
-        static_cast<Py_ssize_t>(frame.size()));
-    if (frame_obj != nullptr) {
+    char* frame_raw = PyByteArray_AsString(ctx->dpdk.tx_frame_obj);
+    if (frame_raw != nullptr) {
+      std::size_t frame_len = 0;
+      if (!build_ipv4_udp_eth_frame(
+              ctx->dpdk.dst_mac,
+              ctx->dpdk.src_mac,
+              ctx->dpdk.src_ip_nbo,
+              ctx->dpdk.dst_ip_nbo,
+              ctx->dpdk.src_port_nbo,
+              ctx->dpdk.dst_port_nbo,
+              &ctx->dpdk.ip_id,
+              payload,
+              payload_len,
+              reinterpret_cast<uint8_t*>(frame_raw),
+              static_cast<std::size_t>(PyByteArray_Size(ctx->dpdk.tx_frame_obj)),
+              &frame_len)) {
+        PyGILState_Release(gil);
+        return -1;
+      }
       PyObject* result = PyObject_CallFunction(
           ctx->dpdk.fn_send_batch,
           "lOii",
           ctx->dpdk.handle,
-          frame_obj,
-          static_cast<int>(frame.size()),
+          ctx->dpdk.tx_frame_obj,
+          static_cast<int>(frame_len),
           1);
-      Py_DECREF(frame_obj);
       if (result == nullptr) {
         PyErr_Clear();
       } else {
