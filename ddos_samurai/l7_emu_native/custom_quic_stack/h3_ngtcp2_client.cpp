@@ -99,6 +99,13 @@ struct H3FrameParseState {
   std::vector<uint8_t> buffer{};
 };
 
+struct FlowControlGuardPolicy {
+  int blocked_budget{32};
+  int blocked_streak_budget{12};
+  int blocked_window_ms{200};
+  bool fast_fail{true};
+};
+
 enum class QuicUdpIoBackend {
   KernelSocket = 0,
   AfXdp = 1,
@@ -218,6 +225,11 @@ struct Ngtcp2AttemptCtx {
   uint64_t max_push_id_sent_value{0};
   bool max_push_id_set{false};
   bool max_push_id_sent{false};
+  FlowControlGuardPolicy flow_guard{};
+  int blocked_window_events{0};
+  int blocked_streak_events{0};
+  uint64_t blocked_window_start_ns{0};
+  bool flow_control_fast_failed{false};
 };
 
 struct TlsSessionCache {
@@ -277,6 +289,15 @@ int env_int(const char* name, int fallback) {
     return fallback;
   }
   return std::atoi(raw);
+}
+
+FlowControlGuardPolicy derive_flow_control_guard_policy() {
+  FlowControlGuardPolicy policy{};
+  policy.blocked_budget = std::clamp(env_int("SAMURAI_QUIC_FLOW_BLOCKED_BUDGET", 32), 1, 4096);
+  policy.blocked_streak_budget = std::clamp(env_int("SAMURAI_QUIC_FLOW_BLOCKED_STREAK_BUDGET", 12), 1, 1024);
+  policy.blocked_window_ms = std::clamp(env_int("SAMURAI_QUIC_FLOW_BLOCKED_WINDOW_MS", 200), 10, 60000);
+  policy.fast_fail = !env_truthy("SAMURAI_QUIC_FLOW_BLOCKED_FAST_FAIL_DISABLE");
+  return policy;
 }
 
 constexpr uint32_t kTlsSessionCacheMagic = 0x31534c54u;  // "TLS1"
@@ -808,6 +829,51 @@ bool capture_tls_session_cache(gnutls_session_t session, TlsSessionCache* cache)
     (void)store_tls_session_cache_file(cache->disk_path, cache->identity, cache->blob);
   }
   return true;
+}
+
+void reset_flow_control_guard(Ngtcp2AttemptCtx* ctx) {
+  if (ctx == nullptr) {
+    return;
+  }
+  ctx->blocked_window_events = 0;
+  ctx->blocked_streak_events = 0;
+  ctx->blocked_window_start_ns = 0;
+  ctx->flow_control_fast_failed = false;
+}
+
+void note_flow_control_progress(Ngtcp2AttemptCtx* ctx) {
+  if (ctx == nullptr) {
+    return;
+  }
+  ctx->blocked_streak_events = 0;
+  ctx->flow_control_fast_failed = false;
+}
+
+bool register_stream_data_blocked(Ngtcp2AttemptCtx* ctx) {
+  if (ctx == nullptr) {
+    return false;
+  }
+  const uint64_t now = now_ns();
+  const uint64_t window_ns = static_cast<uint64_t>(std::max(1, ctx->flow_guard.blocked_window_ms)) * 1000000ull;
+  if (ctx->blocked_window_start_ns == 0 || now < ctx->blocked_window_start_ns ||
+      now - ctx->blocked_window_start_ns > window_ns) {
+    ctx->blocked_window_start_ns = now;
+    ctx->blocked_window_events = 0;
+  }
+  ctx->blocked_window_events += 1;
+  ctx->blocked_streak_events += 1;
+  const bool budget_exhausted = ctx->blocked_window_events >= ctx->flow_guard.blocked_budget;
+  const bool streak_exhausted = ctx->blocked_streak_events >= ctx->flow_guard.blocked_streak_budget;
+  if (!budget_exhausted && !streak_exhausted) {
+    return false;
+  }
+  if (ctx->flow_guard.fast_fail) {
+    ctx->flow_control_fast_failed = true;
+    ctx->feature_failures += 1;
+    ctx->control_plane_failures += 1;
+    return true;
+  }
+  return false;
 }
 
 void derive_tls_names(
@@ -1997,6 +2063,7 @@ void reset_request_state(Ngtcp2AttemptCtx* ctx) {
   ctx->saw_server_push_signal = false;
   ctx->datagram_pending = false;
   ctx->datagram_payload.clear();
+  reset_flow_control_guard(ctx);
 }
 
 bool submit_h3_request(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
@@ -2922,6 +2989,9 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
           continue;
         }
         if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+          if (register_stream_data_blocked(ctx)) {
+            return false;
+          }
           continue;
         }
         if (nwrite == NGTCP2_ERR_STREAM_SHUT_WR || nwrite == NGTCP2_ERR_STREAM_NOT_FOUND) {
@@ -2933,6 +3003,9 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
       } else if (sid >= 0 && ctx->h3_conn != nullptr) {
         if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
           nghttp3_conn_block_stream(ctx->h3_conn, sid);
+          if (register_stream_data_blocked(ctx)) {
+            return false;
+          }
           continue;
         }
         if (nwrite == NGTCP2_ERR_STREAM_SHUT_WR) {
@@ -2956,11 +3029,13 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
         ctx->control_tx_off = 0;
       }
       ctx->tx_bytes += static_cast<std::size_t>(pdatalen);
+      note_flow_control_progress(ctx);
     } else if (stream_from_nghttp3 && ctx->h3_conn != nullptr && pdatalen >= 0) {
       if (nghttp3_conn_add_write_offset(ctx->h3_conn, sid, static_cast<std::size_t>(pdatalen)) != 0) {
         return false;
       }
       ctx->tx_bytes += static_cast<std::size_t>(pdatalen);
+      note_flow_control_progress(ctx);
     }
 
     if (nwrite == 0) {
@@ -3072,6 +3147,7 @@ bool run_single_attempt(
   ctx.expectations = derive_expectations(profile);
   ctx.requests_planned = request_budget;
   ctx.feature_policy = feature_policy;
+  ctx.flow_guard = derive_flow_control_guard_policy();
   ctx.max_push_id_advertised = feature_policy.max_push_id;
   ctx.max_push_id_set = true;
   ctx.requested_backend = resolve_requested_backend(profile);
@@ -3170,8 +3246,12 @@ bool run_single_attempt(
       const uint64_t request_deadline_ns =
           now_ns() + static_cast<uint64_t>(std::max(50, timeout_ms)) * 1000000ull;
       bool request_ok = false;
+      bool flow_control_abort = false;
       while (now_ns() < request_deadline_ns) {
         if (!drive_io_once(&ctx, request_deadline_ns, out)) {
+          if (ctx.flow_control_fast_failed) {
+            flow_control_abort = true;
+          }
           break;
         }
         if (ctx.goaway_active && ctx.goaway_last_stream_id >= 0 && ctx.request_stream_id > ctx.goaway_last_stream_id) {
@@ -3238,11 +3318,18 @@ bool run_single_attempt(
         ctx.requests_failed += 1;
         out->errors += 1;
         out->response_validation_fail += 1;
-        if (!ctx.response_complete) {
+        if (!ctx.response_complete && !flow_control_abort) {
           out->timeouts += 1;
+        }
+        if (flow_control_abort) {
+          const int remaining = std::max(0, request_budget - req_i);
+          ctx.replace_now += remaining;
         }
       }
       ctx.requests_completed += 1;
+      if (flow_control_abort) {
+        break;
+      }
     }
     if (goaway_policy.enabled && ctx.h3_conn != nullptr) {
       if (nghttp3_conn_submit_shutdown_notice(ctx.h3_conn) == 0) {
