@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import multiprocessing
 import socket
 import threading
 import time
@@ -16,18 +15,56 @@ from .discovery import EndpointDiscovery
 from .proto import load_generated
 
 
+class _SharedValue:
+    def __init__(self, value: int = 0):
+        self.value = int(value)
+
+
+class _ThreadWorker:
+    def __init__(self, *, target, args: tuple, name: str):
+        self._target = target
+        self._args = tuple(args)
+        self._thread = threading.Thread(target=self._run, name=str(name), daemon=True)
+        self.exitcode = None
+        self._terminate_requested = False
+
+    def _run(self):
+        try:
+            self._target(*self._args)
+            if self.exitcode is None:
+                self.exitcode = 0
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+            self.exitcode = 1
+
+    def start(self):
+        self._thread.start()
+
+    def join(self, timeout: float | None = None):
+        self._thread.join(timeout=timeout)
+
+    def is_alive(self) -> bool:
+        if self._terminate_requested:
+            return False
+        return bool(self._thread.is_alive())
+
+    def terminate(self):
+        # Cooperative stop marker; direct STOP_JOB orchestration can be added later.
+        self._terminate_requested = True
+        if self.exitcode is None:
+            self.exitcode = -15
+
+
 def _execute_shard_locally(shard_args_dict: dict, shard_id: str) -> dict:
-    progress = multiprocessing.Value("L", 0)
-    sent_total = multiprocessing.Value("L", 0)
-    errors_total = multiprocessing.Value("L", 0)
-    lock = multiprocessing.Lock()
-    manager = multiprocessing.Manager()
-    events = manager.list()
-    resources = manager.dict()
+    progress = _SharedValue(0)
+    sent_total = _SharedValue(0)
+    errors_total = _SharedValue(0)
+    lock = threading.Lock()
+    events = []
+    resources = {}
     tls_profile = str(shard_args_dict.get("tls_profile", "none") or "none")
 
-    proc = multiprocessing.Process(
-        target=orchestrator.start_worker,
+    proc = _ThreadWorker(
+        target=orchestrator.start_worker_zmq,
         args=(1, dict(shard_args_dict), progress, lock, tls_profile, events, sent_total, errors_total, resources),
         name=f"ShardWorker-{shard_id}",
     )
@@ -49,17 +86,16 @@ def _execute_shard_locally(shard_args_dict: dict, shard_id: str) -> dict:
 
 
 def _start_shard_runtime(shard_args_dict: dict, shard_id: str) -> dict:
-    progress = multiprocessing.Value("L", 0)
-    sent_total = multiprocessing.Value("L", 0)
-    errors_total = multiprocessing.Value("L", 0)
-    lock = multiprocessing.Lock()
-    manager = multiprocessing.Manager()
-    events = manager.list()
-    resources = manager.dict()
+    progress = _SharedValue(0)
+    sent_total = _SharedValue(0)
+    errors_total = _SharedValue(0)
+    lock = threading.Lock()
+    events = []
+    resources = {}
     tls_profile = str(shard_args_dict.get("tls_profile", "none") or "none")
     started = time.time()
-    proc = multiprocessing.Process(
-        target=orchestrator.start_worker,
+    proc = _ThreadWorker(
+        target=orchestrator.start_worker_zmq,
         args=(1, dict(shard_args_dict), progress, lock, tls_profile, events, sent_total, errors_total, resources),
         name=f"ShardWorker-{shard_id}",
     )
@@ -70,7 +106,6 @@ def _start_shard_runtime(shard_args_dict: dict, shard_id: str) -> dict:
         "sent_total": sent_total,
         "errors_total": errors_total,
         "events": events,
-        "manager": manager,
         "started_ts": float(started),
     }
 
@@ -78,7 +113,8 @@ def _start_shard_runtime(shard_args_dict: dict, shard_id: str) -> dict:
 def _finalize_shard_runtime(runtime: dict, worker_id: str, shard_id: str) -> dict:
     proc = runtime.get("proc")
     started = float(runtime.get("started_ts", time.time()) or time.time())
-    exitcode = int(getattr(proc, "exitcode", 1) or 1)
+    raw_exit = getattr(proc, "exitcode", None)
+    exitcode = int(raw_exit) if raw_exit is not None else 1
     stats = {
         "worker_id": str(worker_id),
         "shard_id": str(shard_id),
@@ -90,12 +126,6 @@ def _finalize_shard_runtime(runtime: dict, worker_id: str, shard_id: str) -> dic
         "errors": int(getattr(runtime.get("errors_total"), "value", 0) or 0),
         "events": list(runtime.get("events") or []),
     }
-    mgr = runtime.get("manager")
-    if mgr is not None:
-        try:
-            mgr.shutdown()
-        except Exception:
-            pass
     return stats
 
 

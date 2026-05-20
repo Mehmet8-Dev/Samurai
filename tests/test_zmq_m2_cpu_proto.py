@@ -259,9 +259,9 @@ def test_orchestrator_start_worker_zmq_appends_event() -> None:
             return None
 
     events = []
-    with patch("ddos_samurai.zmq_runtime_manager.ZmqRuntimeManager", return_value=_FakeRuntime()), patch(
-        "ddos_samurai.zmq_dispatcher.ZmqDispatcher", return_value=_FakeDispatcher()
-    ), patch("ddos_samurai.zmq_event_collector.ZmqEventCollector", return_value=_FakeCollector()):
+    with patch("ddos_samurai.orchestrator.ZmqRuntimeManager", return_value=_FakeRuntime()), patch(
+        "ddos_samurai.orchestrator.ZmqDispatcher", return_value=_FakeDispatcher()
+    ), patch("ddos_samurai.orchestrator.ZmqEventCollector", return_value=_FakeCollector()):
         orchestrator.start_worker_zmq(
             worker_id=1,
             args={"target": "127.0.0.1", "port": 443, "count": 10, "attack_vector": "basic", "compute_backend": "cpu"},

@@ -1209,7 +1209,10 @@ async def replay_pcap(
     Returns:
         Statistics dictionary with attempted, sent, errors, etc.
     """
-    from . import senders
+    raise RuntimeError(
+        "pcap replay legacy sender path kaldırıldı (M6). "
+        "ZMQ worker execution backend kullanın."
+    )
     from .utils import log_info, log_error, log_warning
 
     _validate_replay_config(cfg)
