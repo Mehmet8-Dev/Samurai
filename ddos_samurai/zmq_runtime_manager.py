@@ -22,6 +22,16 @@ WORKER_BINARIES: dict[WorkerKind, str] = {
     WorkerKind.DEFENSE: "samurai_defense_worker",
 }
 
+WORKER_PY_MODULES: dict[WorkerKind, str] = {
+    WorkerKind.CPU: "ddos_samurai.zmq_cpu_worker",
+    WorkerKind.GPU: "ddos_samurai.zmq_gpu_worker",
+    WorkerKind.DPDK: "ddos_samurai.zmq_dpdk_worker",
+    WorkerKind.AF_XDP: "ddos_samurai.zmq_afxdp_worker",
+    WorkerKind.DOCA: "ddos_samurai.zmq_doca_worker",
+    WorkerKind.L7: "ddos_samurai.zmq_l7_worker",
+    WorkerKind.DEFENSE: "ddos_samurai.zmq_defense_worker",
+}
+
 
 @dataclass
 class WorkerProcess:
@@ -67,9 +77,10 @@ class ZmqRuntimeManager:
 
         binary = self._resolve_binary(kind, search_dir=search_dir)
         cmd = [binary, *(list(extra_args or []))]
-        if kind == WorkerKind.CPU and shutil_which(binary) is None:
-            cmd = [sys.executable, "-m", "ddos_samurai.zmq_cpu_worker", *(list(extra_args or []))]
-            binary = f"{sys.executable} -m ddos_samurai.zmq_cpu_worker"
+        if shutil_which(binary) is None:
+            py_module = WORKER_PY_MODULES[kind]
+            cmd = [sys.executable, "-m", py_module, *(list(extra_args or []))]
+            binary = f"{sys.executable} -m {py_module}"
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
