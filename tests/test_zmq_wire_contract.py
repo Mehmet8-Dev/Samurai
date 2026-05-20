@@ -29,7 +29,7 @@ from ddos_samurai.zmq_wire import (
 
 def test_wire_sizes_are_stable() -> None:
     assert HEADER_SIZE_V1 == 56
-    assert JOB_ENVELOPE_SIZE_V1 == 160
+    assert JOB_ENVELOPE_SIZE_V1 == 480
     assert METRIC_SNAPSHOT_SIZE_V1 == 64
 
 
@@ -41,7 +41,7 @@ def test_header_pack_matches_golden_vector() -> None:
         worker_kind=WorkerKind.CPU,
         job_id="job-42",
     )
-    assert header.pack().hex() == "49524d530101a000000000008877665544332211016a6f622d34320000000000000000000000000000000000000000000000000000000000"
+    assert header.pack().hex() == "49524d530101e001000000008877665544332211016a6f622d34320000000000000000000000000000000000000000000000000000000000"
 
 
 def test_job_envelope_roundtrip_and_golden_vector() -> None:
@@ -63,10 +63,29 @@ def test_job_envelope_roundtrip_and_golden_vector() -> None:
         xdp_queue_id=7,
         xdp_mode=2,
         scenario_payload_ref="/tmp/samurai_scenario_job-42.bin",
+        protocol="tcp",
+        tcp_flags="S",
+        spoof_enabled=True,
+        spoof_mode="subnet",
+        spoof_subnet="10.0.0.0/24",
+        spoof_list_file="/tmp/spoof.list",
+        has_payload=True,
+        payload_ref="/tmp/payload.bin",
+        pad_size=160,
+        ttl=64,
+        tos=16,
+        window=4096,
+        fragment_enabled=True,
+        fragment_size=800,
+        attack_vector="dns_amp",
+        dns_name="example.org",
+        dns_qtype="A,AAAA",
+        dns_edns=True,
+        dns_recursive=False,
     )
 
     payload = env.pack()
-    assert payload.hex() == "3139322e3136382e312e310000000000bb01e803000080000000010000000084840e41f40100000000000040000000e803000000000000029a9999999999a93f03000000016574683000000000000000000000000007000000020000002f746d702f73616d757261695f7363656e6172696f5f6a6f622d34322e62696e0000000000000000000000000000000000000000000000000000000000000000000000"
+    assert payload.hex() == "3139322e3136382e312e310000000000bb01e803000080000000010000000084840e41f40100000000000040000000e803000000000000029a9999999999a93f03000000016574683000000000000000000000000007000000020000002f746d702f73616d757261695f7363656e6172696f5f6a6f622d34322e62696e000000000000000000000000000000000000000000000000000000000000000074637000000000005300000000000000017375626e65740000000000000000000031302e302e302e302f32340000000000000000000000000000000000000000002f746d702f73706f6f662e6c69737400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000012f746d702f7061796c6f61642e62696e000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a000000040100010012003646e735f616d700000000000000000006578616d706c652e6f72670000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000412c414141410000000000000000000000000000000000000000000000000000010000000000"
 
     decoded = JobEnvelopeV1.unpack(payload)
     assert decoded == env
@@ -118,6 +137,24 @@ def test_build_job_envelope_maps_cli_values() -> None:
             "iface": "ens3",
             "xdp_queue_id": 2,
             "xdp_mode": 1,
+            "protocol": "udp",
+            "tcp_flags": "PA",
+            "spoof": True,
+            "spoof_mode": "subnet",
+            "spoof_subnet": "10.0.0.0/24",
+            "spoof_list_file": "/tmp/spoof.txt",
+            "payload_file": "/tmp/payload.dat",
+            "pad_size": 512,
+            "ttl": 55,
+            "tos": 24,
+            "window": 2048,
+            "fragment_enabled": True,
+            "fragment_size": 600,
+            "attack_vector": "dns_amp",
+            "dns_name": "example.org",
+            "dns_qtype": ["A", "AAAA"],
+            "dns_edns": True,
+            "dns_recursive": False,
         },
         scenario_payload_ref="/tmp/s.bin",
     )
@@ -135,6 +172,25 @@ def test_build_job_envelope_maps_cli_values() -> None:
     assert env.xdp_queue_id == 2
     assert env.xdp_mode == 1
     assert env.scenario_payload_ref == "/tmp/s.bin"
+    assert env.protocol == "udp"
+    assert env.tcp_flags == "PA"
+    assert env.spoof_enabled is True
+    assert env.spoof_mode == "subnet"
+    assert env.spoof_subnet == "10.0.0.0/24"
+    assert env.spoof_list_file == "/tmp/spoof.txt"
+    assert env.has_payload is True
+    assert env.payload_ref == "/tmp/payload.dat"
+    assert env.pad_size == 512
+    assert env.ttl == 55
+    assert env.tos == 24
+    assert env.window == 2048
+    assert env.fragment_enabled is True
+    assert env.fragment_size == 600
+    assert env.attack_vector == "dns_amp"
+    assert env.dns_name == "example.org"
+    assert env.dns_qtype == "A,AAAA"
+    assert env.dns_edns is True
+    assert env.dns_recursive is False
 
 
 def test_job_done_json_roundtrip() -> None:

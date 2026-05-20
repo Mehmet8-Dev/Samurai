@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from ddos_samurai import orchestrator
+from ddos_samurai.zmq_wire import WorkerKind
 
 
 def test_start_worker_delegates_to_zmq_path() -> None:
@@ -21,3 +22,14 @@ def test_start_worker_delegates_to_zmq_path() -> None:
     assert m.called
     kwargs = m.call_args.kwargs
     assert kwargs["tls_profile"] == "none"
+
+
+def test_resolve_worker_kind_scenario_mode_prefers_scenario_worker() -> None:
+    kind = orchestrator._resolve_worker_kind_for_zmq(
+        {
+            "scenario_mode": "enforce",
+            "attack_vector": "http",
+            "compute_backend": "cpu",
+        }
+    )
+    assert kind == WorkerKind.SCENARIO

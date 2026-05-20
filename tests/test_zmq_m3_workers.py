@@ -105,6 +105,7 @@ def test_m3_worker_sources_exist() -> None:
         root / "src" / "daemon" / "doca_gpunetio_worker.cpp",
         root / "src" / "daemon" / "l7_worker.cpp",
         root / "src" / "daemon" / "defense_worker.cpp",
+        root / "src" / "daemon" / "scenario_worker.cpp",
     ]
     for p in expected:
         assert p.exists(), str(p)
@@ -121,8 +122,13 @@ def test_m3_cmake_has_all_worker_targets() -> None:
         "samurai_doca_worker",
         "samurai_l7_worker",
         "samurai_defense_worker",
+        "samurai_scenario_worker",
     ]:
         assert target in cmake
+    assert "add_library(" in cmake
+    assert "pacing_engine_static" in cmake
+    assert "cpu_native_static" in cmake
+    assert "target_link_libraries(samurai_cpu_worker PRIVATE pacing_engine_static cpu_native_static pthread)" in cmake
 
 
 def test_m3_prototype_happy_path_for_all_workers() -> None:
