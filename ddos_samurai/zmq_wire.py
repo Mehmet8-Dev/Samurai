@@ -37,6 +37,7 @@ class WorkerKind(IntEnum):
     DOCA = 5
     L7 = 6
     DEFENSE = 7
+    SCENARIO = 8
 
 
 DEFAULT_JOB_ENDPOINTS: dict[WorkerKind, str] = {
@@ -47,6 +48,7 @@ DEFAULT_JOB_ENDPOINTS: dict[WorkerKind, str] = {
     WorkerKind.DOCA: "ipc:///tmp/samurai_jobs_doca",
     WorkerKind.L7: "ipc:///tmp/samurai_jobs_l7",
     WorkerKind.DEFENSE: "ipc:///tmp/samurai_jobs_defense",
+    WorkerKind.SCENARIO: "ipc:///tmp/samurai_jobs_scenario",
 }
 
 DEFAULT_EVENT_ENDPOINTS: dict[WorkerKind, str] = {
@@ -57,6 +59,7 @@ DEFAULT_EVENT_ENDPOINTS: dict[WorkerKind, str] = {
     WorkerKind.DOCA: "ipc:///tmp/samurai_events_doca",
     WorkerKind.L7: "ipc:///tmp/samurai_events_l7",
     WorkerKind.DEFENSE: "ipc:///tmp/samurai_events_defense",
+    WorkerKind.SCENARIO: "ipc:///tmp/samurai_events_scenario",
 }
 
 
@@ -83,7 +86,7 @@ class JitterModel(IntEnum):
 
 
 _HEADER_STRUCT = struct.Struct("<IBBIHQB32s3s")
-_JOB_ENVELOPE_STRUCT = struct.Struct("<16sHIIBdQIQBdiB16sII64s3s")
+_JOB_ENVELOPE_STRUCT = struct.Struct("<16sHIIBdQIQBdiB16sII64s8s8sB16s32s64sB64sIBBHBH16s64s32sBB4s")
 # NOTE: Field definitions naturally total 64 bytes.
 _METRIC_SNAPSHOT_STRUCT = struct.Struct("<QQQQdddII")
 
@@ -186,6 +189,25 @@ class JobEnvelopeV1:
     xdp_queue_id: int = 0
     xdp_mode: int = 0
     scenario_payload_ref: str = ""
+    protocol: str = "tcp"
+    tcp_flags: str = "S"
+    spoof_enabled: bool = False
+    spoof_mode: str = "realistic"
+    spoof_subnet: str = ""
+    spoof_list_file: str = ""
+    has_payload: bool = False
+    payload_ref: str = ""
+    pad_size: int = 0
+    ttl: int = 0
+    tos: int = 0
+    window: int = 0
+    fragment_enabled: bool = False
+    fragment_size: int = 0
+    attack_vector: str = "basic"
+    dns_name: str = "example.com"
+    dns_qtype: str = "A"
+    dns_edns: bool = False
+    dns_recursive: bool = True
 
     def pack(self) -> bytes:
         if not (0 <= int(self.target_port) <= 0xFFFF):
@@ -206,6 +228,16 @@ class JobEnvelopeV1:
             raise WireProtocolError("xdp_queue_id must fit uint32")
         if not (0 <= int(self.xdp_mode) <= 0xFFFFFFFF):
             raise WireProtocolError("xdp_mode must fit uint32")
+        if not (0 <= int(self.pad_size) <= 0xFFFFFFFF):
+            raise WireProtocolError("pad_size must fit uint32")
+        if not (0 <= int(self.ttl) <= 0xFF):
+            raise WireProtocolError("ttl must fit uint8")
+        if not (0 <= int(self.tos) <= 0xFF):
+            raise WireProtocolError("tos must fit uint8")
+        if not (0 <= int(self.window) <= 0xFFFF):
+            raise WireProtocolError("window must fit uint16")
+        if not (0 <= int(self.fragment_size) <= 0xFFFF):
+            raise WireProtocolError("fragment_size must fit uint16")
         if float(self.jitter_pct) < 0.0 or float(self.jitter_pct) > 1.0:
             raise WireProtocolError("jitter_pct must be in [0.0, 1.0]")
 
@@ -227,7 +259,26 @@ class JobEnvelopeV1:
             int(self.xdp_queue_id),
             int(self.xdp_mode),
             _pack_fixed_string(self.scenario_payload_ref, 64, "scenario_payload_ref"),
-            b"\x00\x00\x00",
+            _pack_fixed_string(self.protocol, 8, "protocol"),
+            _pack_fixed_string(self.tcp_flags, 8, "tcp_flags"),
+            1 if bool(self.spoof_enabled) else 0,
+            _pack_fixed_string(self.spoof_mode, 16, "spoof_mode"),
+            _pack_fixed_string(self.spoof_subnet, 32, "spoof_subnet"),
+            _pack_fixed_string(self.spoof_list_file, 64, "spoof_list_file"),
+            1 if bool(self.has_payload) else 0,
+            _pack_fixed_string(self.payload_ref, 64, "payload_ref"),
+            int(self.pad_size),
+            int(self.ttl),
+            int(self.tos),
+            int(self.window),
+            1 if bool(self.fragment_enabled) else 0,
+            int(self.fragment_size),
+            _pack_fixed_string(self.attack_vector, 16, "attack_vector"),
+            _pack_fixed_string(self.dns_name, 64, "dns_name"),
+            _pack_fixed_string(self.dns_qtype, 32, "dns_qtype"),
+            1 if bool(self.dns_edns) else 0,
+            1 if bool(self.dns_recursive) else 0,
+            b"\x00\x00\x00\x00",
         )
 
     @classmethod
@@ -254,6 +305,25 @@ class JobEnvelopeV1:
             xdp_queue_id,
             xdp_mode,
             scenario_payload_ref_raw,
+            protocol_raw,
+            tcp_flags_raw,
+            spoof_enabled,
+            spoof_mode_raw,
+            spoof_subnet_raw,
+            spoof_list_file_raw,
+            has_payload,
+            payload_ref_raw,
+            pad_size,
+            ttl,
+            tos,
+            window,
+            fragment_enabled,
+            fragment_size,
+            attack_vector_raw,
+            dns_name_raw,
+            dns_qtype_raw,
+            dns_edns,
+            dns_recursive,
             _,
         ) = _JOB_ENVELOPE_STRUCT.unpack(blob)
         try:
@@ -282,6 +352,25 @@ class JobEnvelopeV1:
             xdp_queue_id=int(xdp_queue_id),
             xdp_mode=int(xdp_mode),
             scenario_payload_ref=_unpack_fixed_string(scenario_payload_ref_raw),
+            protocol=_unpack_fixed_string(protocol_raw),
+            tcp_flags=_unpack_fixed_string(tcp_flags_raw),
+            spoof_enabled=bool(spoof_enabled),
+            spoof_mode=_unpack_fixed_string(spoof_mode_raw),
+            spoof_subnet=_unpack_fixed_string(spoof_subnet_raw),
+            spoof_list_file=_unpack_fixed_string(spoof_list_file_raw),
+            has_payload=bool(has_payload),
+            payload_ref=_unpack_fixed_string(payload_ref_raw),
+            pad_size=int(pad_size),
+            ttl=int(ttl),
+            tos=int(tos),
+            window=int(window),
+            fragment_enabled=bool(fragment_enabled),
+            fragment_size=int(fragment_size),
+            attack_vector=_unpack_fixed_string(attack_vector_raw),
+            dns_name=_unpack_fixed_string(dns_name_raw),
+            dns_qtype=_unpack_fixed_string(dns_qtype_raw),
+            dns_edns=bool(dns_edns),
+            dns_recursive=bool(dns_recursive),
         )
 
 
@@ -370,6 +459,17 @@ def build_pacing_config(args: Mapping[str, Any]) -> PacingConfig:
 
 def build_job_envelope(args: Mapping[str, Any], *, scenario_payload_ref: str = "") -> JobEnvelopeV1:
     pacing = build_pacing_config(args)
+    qtype_raw = args.get("dns_qtype", "A")
+    if isinstance(qtype_raw, (list, tuple)):
+        qtype = ",".join([str(x) for x in qtype_raw if str(x)])
+    else:
+        qtype = str(qtype_raw or "A")
+    payload_ref = str(args.get("payload_file", args.get("payload_ref", "")) or "")
+    dns_recursive_raw = args.get("dns_recursive", None)
+    if dns_recursive_raw is None:
+        dns_recursive = not bool(args.get("dns_nord", False))
+    else:
+        dns_recursive = bool(dns_recursive_raw)
     return JobEnvelopeV1(
         target_ip=str(args.get("target", "") or ""),
         target_port=int(args.get("port", 0) or 0),
@@ -388,6 +488,25 @@ def build_job_envelope(args: Mapping[str, Any], *, scenario_payload_ref: str = "
         xdp_queue_id=int(args.get("dpdk_queue", args.get("xdp_queue_id", 0)) or 0),
         xdp_mode=int(args.get("xdp_mode", 0) or 0),
         scenario_payload_ref=str(scenario_payload_ref or ""),
+        protocol=str(args.get("protocol", "tcp") or "tcp"),
+        tcp_flags=str(args.get("tcp_flags", "S") or "S"),
+        spoof_enabled=bool(args.get("spoof", False)),
+        spoof_mode=str(args.get("spoof_mode", "realistic") or "realistic"),
+        spoof_subnet=str(args.get("spoof_subnet", "") or ""),
+        spoof_list_file=str(args.get("spoof_list_file", "") or ""),
+        has_payload=bool(payload_ref or args.get("payload")),
+        payload_ref=payload_ref,
+        pad_size=int(args.get("pad_size", 0) or 0),
+        ttl=int(args.get("ttl", 0) or 0),
+        tos=int(args.get("tos", 0) or 0),
+        window=int(args.get("window", 0) or 0),
+        fragment_enabled=bool(args.get("fragment_enabled", args.get("fragment", False))),
+        fragment_size=int(args.get("fragment_size", 0) or 0),
+        attack_vector=str(args.get("attack_vector", "basic") or "basic"),
+        dns_name=str(args.get("dns_name", "example.com") or "example.com"),
+        dns_qtype=qtype,
+        dns_edns=bool(args.get("dns_edns", False)),
+        dns_recursive=dns_recursive,
     )
 
 

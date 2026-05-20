@@ -20,6 +20,7 @@ WORKER_BINARIES: dict[WorkerKind, str] = {
     WorkerKind.DOCA: "samurai_doca_worker",
     WorkerKind.L7: "samurai_l7_worker",
     WorkerKind.DEFENSE: "samurai_defense_worker",
+    WorkerKind.SCENARIO: "samurai_scenario_worker",
 }
 
 WORKER_PY_MODULES: dict[WorkerKind, str] = {
@@ -30,6 +31,7 @@ WORKER_PY_MODULES: dict[WorkerKind, str] = {
     WorkerKind.DOCA: "ddos_samurai.zmq_doca_worker",
     WorkerKind.L7: "ddos_samurai.zmq_l7_worker",
     WorkerKind.DEFENSE: "ddos_samurai.zmq_defense_worker",
+    WorkerKind.SCENARIO: "ddos_samurai.zmq_scenario_worker",
 }
 
 

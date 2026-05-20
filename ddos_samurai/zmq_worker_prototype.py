@@ -218,6 +218,7 @@ def parse_worker_kind(raw: str) -> WorkerKind:
         "doca": WorkerKind.DOCA,
         "l7": WorkerKind.L7,
         "defense": WorkerKind.DEFENSE,
+        "scenario": WorkerKind.SCENARIO,
     }
     if name in aliases:
         return aliases[name]
