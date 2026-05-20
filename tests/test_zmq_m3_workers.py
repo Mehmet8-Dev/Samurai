@@ -131,6 +131,7 @@ def test_m3_cmake_has_all_worker_targets() -> None:
     assert "target_link_libraries(samurai_cpu_worker PRIVATE pacing_engine_static cpu_native_static pthread)" in cmake
     assert "target_link_libraries(samurai_gpu_worker PRIVATE pacing_engine_static pthread dl)" in cmake
     assert "target_link_libraries(samurai_afxdp_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)" in cmake
+    assert "target_link_libraries(samurai_doca_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)" in cmake
     assert "pkg_check_modules(DPDK QUIET libdpdk)" in cmake
     assert "target_link_libraries(samurai_dpdk_worker PRIVATE pacing_engine_static cpu_native_static pthread)" in cmake
     assert "target_compile_definitions(samurai_dpdk_worker PRIVATE SAMURAI_WITH_DPDK=1)" in cmake
@@ -169,6 +170,20 @@ def test_m3_afxdp_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "MessageType::METRIC_SNAPSHOT" in src
     assert "xdp_native_lib_unavailable" in src
     assert "xdp_interface_required" in src
+
+
+def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "src" / "daemon" / "doca_gpunetio_worker.cpp").read_text(encoding="utf-8")
+    assert "LoadDocaNative" in src
+    assert "samurai_doca_gpunetio_get_api_v1" in src
+    assert "samurai_doca_backend_create_txq" in src
+    assert "samurai_doca_backend_send_vector" in src
+    assert "MessageType::HEARTBEAT" in src
+    assert "MessageType::METRIC_SNAPSHOT" in src
+    assert "doca_native_lib_unavailable" in src
+    assert "doca_interface_required" in src
+    assert "doca_device_required" in src
 
 
 def test_m3_prototype_happy_path_for_all_workers() -> None:
