@@ -5,10 +5,13 @@
 extern "C" {
 #include <rte_common.h>
 #include <rte_eal.h>
+#include <rte_ether.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
+#include <rte_ip.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
+#include <rte_udp.h>
 }
 
 #include <algorithm>
@@ -29,6 +32,9 @@ constexpr uint16_t kMaxBurst = 1024;
 constexpr uint16_t kMinBurst = 1;
 constexpr uint32_t kDefaultMbufDataSize = RTE_MBUF_DEFAULT_BUF_SIZE;
 constexpr uint32_t kDefaultMempoolCache = 256;
+constexpr std::size_t kMaxUdpPayloadBytes = 1400u;
+constexpr std::size_t kL2UdpFrameHdrBytes =
+    sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr) + sizeof(rte_udp_hdr);
 
 struct PortState {
     rte_mempool* mempool = nullptr;
@@ -57,6 +63,15 @@ struct Context {
     std::atomic<uint64_t> rx_bytes{0};
     std::atomic<uint64_t> rx_dropped{0};
     std::atomic<uint64_t> mbuf_alloc_failures{0};
+
+    bool udp_template_ready = false;
+    rte_ether_addr udp_src_mac{};
+    rte_ether_addr udp_dst_mac{};
+    uint32_t udp_src_ip_nbo = 0;
+    uint32_t udp_dst_ip_nbo = 0;
+    uint16_t udp_src_port_nbo = 0;
+    uint16_t udp_dst_port_nbo = 0;
+    uint16_t udp_ip_id = 1;
 };
 
 std::mutex g_mu;
@@ -507,6 +522,243 @@ static PyObject* py_dpdk_send_batch(PyObject*, PyObject* args) {
     );
 }
 
+static PyObject* py_dpdk_configure_udp_flow(PyObject*, PyObject* args) {
+    long handle = 0;
+    unsigned int src_ip_nbo_u = 0;
+    unsigned int dst_ip_nbo_u = 0;
+    int src_port_nbo_i = 0;
+    int dst_port_nbo_i = 0;
+    PyObject* src_mac_obj = nullptr;
+    PyObject* dst_mac_obj = nullptr;
+    int initial_ip_id_i = 1;
+    if (!PyArg_ParseTuple(
+            args,
+            "lIIiiOOi",
+            &handle,
+            &src_ip_nbo_u,
+            &dst_ip_nbo_u,
+            &src_port_nbo_i,
+            &dst_port_nbo_i,
+            &src_mac_obj,
+            &dst_mac_obj,
+            &initial_ip_id_i)) {
+        return nullptr;
+    }
+
+    if (src_port_nbo_i < 0 || src_port_nbo_i > 0xFFFF || dst_port_nbo_i < 0 || dst_port_nbo_i > 0xFFFF) {
+        PyErr_SetString(PyExc_ValueError, "invalid UDP port");
+        return nullptr;
+    }
+
+    Py_buffer src_mac_view{};
+    if (PyObject_GetBuffer(src_mac_obj, &src_mac_view, PyBUF_SIMPLE) != 0) {
+        return nullptr;
+    }
+    Py_buffer dst_mac_view{};
+    if (PyObject_GetBuffer(dst_mac_obj, &dst_mac_view, PyBUF_SIMPLE) != 0) {
+        PyBuffer_Release(&src_mac_view);
+        return nullptr;
+    }
+
+    if (src_mac_view.buf == nullptr ||
+        dst_mac_view.buf == nullptr ||
+        src_mac_view.len < static_cast<Py_ssize_t>(RTE_ETHER_ADDR_LEN) ||
+        dst_mac_view.len < static_cast<Py_ssize_t>(RTE_ETHER_ADDR_LEN)) {
+        PyBuffer_Release(&dst_mac_view);
+        PyBuffer_Release(&src_mac_view);
+        PyErr_SetString(PyExc_ValueError, "mac buffers must be at least 6 bytes");
+        return nullptr;
+    }
+
+    rte_ether_addr src_mac{};
+    rte_ether_addr dst_mac{};
+    std::memcpy(src_mac.addr_bytes, src_mac_view.buf, RTE_ETHER_ADDR_LEN);
+    std::memcpy(dst_mac.addr_bytes, dst_mac_view.buf, RTE_ETHER_ADDR_LEN);
+    PyBuffer_Release(&dst_mac_view);
+    PyBuffer_Release(&src_mac_view);
+
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_contexts.find(handle);
+        if (it == g_contexts.end()) {
+            PyErr_SetString(PyExc_RuntimeError, "dpdk_invalid_handle");
+            return nullptr;
+        }
+        it->second.udp_src_mac = src_mac;
+        it->second.udp_dst_mac = dst_mac;
+        it->second.udp_src_ip_nbo = static_cast<uint32_t>(src_ip_nbo_u);
+        it->second.udp_dst_ip_nbo = static_cast<uint32_t>(dst_ip_nbo_u);
+        it->second.udp_src_port_nbo = static_cast<uint16_t>(src_port_nbo_i);
+        it->second.udp_dst_port_nbo = static_cast<uint16_t>(dst_port_nbo_i);
+        it->second.udp_ip_id = static_cast<uint16_t>(initial_ip_id_i & 0xFFFF);
+        if (it->second.udp_ip_id == 0) {
+            it->second.udp_ip_id = 1;
+        }
+        it->second.udp_template_ready = true;
+    }
+
+    Py_RETURN_TRUE;
+}
+
+static PyObject* py_dpdk_send_udp_payload(PyObject*, PyObject* args) {
+    long handle = 0;
+    PyObject* payload_obj = nullptr;
+    if (!PyArg_ParseTuple(args, "lO", &handle, &payload_obj)) {
+        return nullptr;
+    }
+
+    Py_buffer payload_view{};
+    if (PyObject_GetBuffer(payload_obj, &payload_view, PyBUF_SIMPLE) != 0) {
+        return nullptr;
+    }
+    if (payload_view.buf == nullptr || payload_view.len <= 0) {
+        PyBuffer_Release(&payload_view);
+        PyErr_SetString(PyExc_ValueError, "empty payload");
+        return nullptr;
+    }
+    const std::size_t payload_len = static_cast<std::size_t>(payload_view.len);
+    if (payload_len > kMaxUdpPayloadBytes) {
+        PyBuffer_Release(&payload_view);
+        PyErr_SetString(PyExc_ValueError, "payload too large");
+        return nullptr;
+    }
+
+    uint16_t port_id = 0;
+    uint16_t queue_id = 0;
+    rte_mempool* mempool = nullptr;
+    rte_ether_addr src_mac{};
+    rte_ether_addr dst_mac{};
+    uint32_t src_ip_nbo = 0;
+    uint32_t dst_ip_nbo = 0;
+    uint16_t src_port_nbo = 0;
+    uint16_t dst_port_nbo = 0;
+    uint16_t ip_id = 1;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_contexts.find(handle);
+        if (it == g_contexts.end()) {
+            PyBuffer_Release(&payload_view);
+            PyErr_SetString(PyExc_RuntimeError, "dpdk_invalid_handle");
+            return nullptr;
+        }
+        auto pt = g_ports.find(it->second.port_id);
+        if (pt == g_ports.end() || !pt->second.mempool) {
+            PyBuffer_Release(&payload_view);
+            PyErr_SetString(PyExc_RuntimeError, "dpdk_port_not_ready");
+            return nullptr;
+        }
+        if (!it->second.udp_template_ready) {
+            PyBuffer_Release(&payload_view);
+            PyErr_SetString(PyExc_RuntimeError, "dpdk_udp_template_not_configured");
+            return nullptr;
+        }
+        port_id = it->second.port_id;
+        queue_id = it->second.queue_id;
+        mempool = pt->second.mempool;
+        src_mac = it->second.udp_src_mac;
+        dst_mac = it->second.udp_dst_mac;
+        src_ip_nbo = it->second.udp_src_ip_nbo;
+        dst_ip_nbo = it->second.udp_dst_ip_nbo;
+        src_port_nbo = it->second.udp_src_port_nbo;
+        dst_port_nbo = it->second.udp_dst_port_nbo;
+        ip_id = it->second.udp_ip_id;
+        it->second.udp_ip_id = static_cast<uint16_t>(it->second.udp_ip_id + 1);
+        if (it->second.udp_ip_id == 0) {
+            it->second.udp_ip_id = 1;
+        }
+    }
+
+    const std::size_t frame_len = kL2UdpFrameHdrBytes + payload_len;
+    rte_mbuf* mbuf = rte_pktmbuf_alloc(mempool);
+    if (mbuf == nullptr) {
+        PyBuffer_Release(&payload_view);
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_contexts.find(handle);
+        if (it != g_contexts.end()) {
+            it->second.tx_errors.fetch_add(1, std::memory_order_relaxed);
+            it->second.tx_dropped.fetch_add(1, std::memory_order_relaxed);
+            it->second.mbuf_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        return PyLong_FromLong(0);
+    }
+
+    auto* base = rte_pktmbuf_mtod(mbuf, uint8_t*);
+    auto* eth = reinterpret_cast<rte_ether_hdr*>(base);
+    rte_ether_addr_copy(&dst_mac, &eth->dst_addr);
+    rte_ether_addr_copy(&src_mac, &eth->src_addr);
+    eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+    auto* ip = reinterpret_cast<rte_ipv4_hdr*>(base + sizeof(rte_ether_hdr));
+    std::memset(ip, 0, sizeof(*ip));
+    ip->version_ihl = RTE_IPV4_VHL_DEF;
+    ip->type_of_service = 0;
+    ip->total_length = rte_cpu_to_be_16(static_cast<uint16_t>(sizeof(rte_ipv4_hdr) + sizeof(rte_udp_hdr) + payload_len));
+    ip->packet_id = rte_cpu_to_be_16(ip_id);
+    ip->fragment_offset = rte_cpu_to_be_16(static_cast<uint16_t>(0x4000u));
+    ip->time_to_live = 64;
+    ip->next_proto_id = IPPROTO_UDP;
+    ip->src_addr = src_ip_nbo;
+    ip->dst_addr = dst_ip_nbo;
+    ip->hdr_checksum = rte_ipv4_cksum(ip);
+
+    auto* udp = reinterpret_cast<rte_udp_hdr*>(base + sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr));
+    udp->src_port = src_port_nbo;
+    udp->dst_port = dst_port_nbo;
+    udp->dgram_len = rte_cpu_to_be_16(static_cast<uint16_t>(sizeof(rte_udp_hdr) + payload_len));
+    udp->dgram_cksum = 0;
+    std::memcpy(
+        base + sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr) + sizeof(rte_udp_hdr),
+        payload_view.buf,
+        payload_len);
+    udp->dgram_cksum = rte_ipv4_udptcp_cksum(ip, udp);
+    if (udp->dgram_cksum == 0) {
+        udp->dgram_cksum = 0xFFFFu;
+    }
+
+    mbuf->data_len = static_cast<uint16_t>(frame_len);
+    mbuf->pkt_len = static_cast<uint32_t>(frame_len);
+    PyBuffer_Release(&payload_view);
+
+    uint16_t sent = 0;
+    int retry = 0;
+    Py_BEGIN_ALLOW_THREADS
+    while (sent == 0 && retry < 8) {
+        sent = rte_eth_tx_burst(port_id, queue_id, &mbuf, 1);
+        if (sent == 0) {
+            ++retry;
+            rte_pause();
+        }
+    }
+    Py_END_ALLOW_THREADS
+
+    uint64_t dropped = 0;
+    uint64_t errors = 0;
+    if (sent == 0) {
+        rte_pktmbuf_free(mbuf);
+        dropped = 1;
+        errors = 1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_contexts.find(handle);
+        if (it != g_contexts.end()) {
+            if (sent > 0) {
+                it->second.tx_packets.fetch_add(1, std::memory_order_relaxed);
+                it->second.tx_bytes.fetch_add(static_cast<uint64_t>(frame_len), std::memory_order_relaxed);
+            }
+            if (errors > 0) {
+                it->second.tx_errors.fetch_add(errors, std::memory_order_relaxed);
+            }
+            if (dropped > 0) {
+                it->second.tx_dropped.fetch_add(dropped, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    return PyLong_FromLong(sent > 0 ? 1 : 0);
+}
+
 static PyObject* py_dpdk_poll_rx(PyObject*, PyObject* args) {
     long handle = 0;
     int budget_i = 0;
@@ -576,6 +828,147 @@ static PyObject* py_dpdk_poll_rx(PyObject*, PyObject* args) {
         }
     }
     return out;
+}
+
+static PyObject* py_dpdk_poll_udp_payloads(PyObject*, PyObject* args) {
+    long handle = 0;
+    unsigned int local_ip_nbo_u = 0;
+    int local_port_nbo_i = 0;
+    int remote_port_nbo_i = 0;
+    int stride_i = 0;
+    int budget_i = 0;
+    PyObject* payload_obj = nullptr;
+    PyObject* lens_obj = nullptr;
+    if (!PyArg_ParseTuple(
+            args,
+            "lIiiiiOO",
+            &handle,
+            &local_ip_nbo_u,
+            &local_port_nbo_i,
+            &remote_port_nbo_i,
+            &stride_i,
+            &budget_i,
+            &payload_obj,
+            &lens_obj)) {
+        return nullptr;
+    }
+
+    if (stride_i <= 0 || budget_i <= 0) {
+        PyErr_SetString(PyExc_ValueError, "invalid stride/budget");
+        return nullptr;
+    }
+    const uint16_t budget = static_cast<uint16_t>(std::clamp(budget_i, 1, static_cast<int>(kMaxBurst)));
+    const uint16_t local_port_nbo = static_cast<uint16_t>(local_port_nbo_i);
+    const uint16_t remote_port_nbo = static_cast<uint16_t>(remote_port_nbo_i);
+    const uint32_t local_ip_nbo = static_cast<uint32_t>(local_ip_nbo_u);
+
+    uint16_t port_id = 0;
+    uint16_t queue_id = 0;
+    bool rx_enable = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_contexts.find(handle);
+        if (it == g_contexts.end()) {
+            PyErr_SetString(PyExc_RuntimeError, "dpdk_invalid_handle");
+            return nullptr;
+        }
+        port_id = it->second.port_id;
+        queue_id = it->second.queue_id;
+        rx_enable = it->second.rx_enable;
+    }
+    if (!rx_enable) {
+        return PyLong_FromLong(0);
+    }
+
+    Py_buffer payload_view{};
+    if (PyObject_GetBuffer(payload_obj, &payload_view, PyBUF_WRITABLE) != 0) {
+        return nullptr;
+    }
+    Py_buffer lens_view{};
+    if (PyObject_GetBuffer(lens_obj, &lens_view, PyBUF_WRITABLE) != 0) {
+        PyBuffer_Release(&payload_view);
+        return nullptr;
+    }
+
+    const std::size_t stride = static_cast<std::size_t>(stride_i);
+    if (payload_view.buf == nullptr ||
+        static_cast<std::size_t>(payload_view.len) < stride * static_cast<std::size_t>(budget) ||
+        lens_view.buf == nullptr ||
+        static_cast<std::size_t>(lens_view.len) < static_cast<std::size_t>(budget) * sizeof(uint16_t)) {
+        PyBuffer_Release(&lens_view);
+        PyBuffer_Release(&payload_view);
+        PyErr_SetString(PyExc_ValueError, "output buffers too small");
+        return nullptr;
+    }
+    auto* out_payload = static_cast<uint8_t*>(payload_view.buf);
+    auto* out_lens = static_cast<uint16_t*>(lens_view.buf);
+    for (uint16_t i = 0; i < budget; ++i) {
+        out_lens[i] = 0;
+    }
+
+    rte_mbuf* mbufs[kMaxBurst];
+    uint16_t n = 0;
+    Py_BEGIN_ALLOW_THREADS
+    n = rte_eth_rx_burst(port_id, queue_id, mbufs, budget);
+    Py_END_ALLOW_THREADS
+
+    uint16_t accepted = 0;
+    uint64_t rx_bytes = 0;
+    for (uint16_t i = 0; i < n; ++i) {
+        const uint16_t pkt_len = rte_pktmbuf_pkt_len(mbufs[i]);
+        const auto* frame = static_cast<const uint8_t*>(rte_pktmbuf_mtod(mbufs[i], const void*));
+        if (frame != nullptr && pkt_len >= (sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr) + sizeof(rte_udp_hdr))) {
+            const auto* eth = reinterpret_cast<const rte_ether_hdr*>(frame);
+            if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+                const auto* ip = reinterpret_cast<const rte_ipv4_hdr*>(frame + sizeof(rte_ether_hdr));
+                const uint8_t ihl = static_cast<uint8_t>(ip->version_ihl & 0x0Fu);
+                const std::size_t ihl_bytes = static_cast<std::size_t>(ihl) * 4u;
+                if (ihl >= 5 &&
+                    ip->next_proto_id == IPPROTO_UDP &&
+                    sizeof(rte_ether_hdr) + ihl_bytes + sizeof(rte_udp_hdr) <= pkt_len) {
+                    const auto* udp = reinterpret_cast<const rte_udp_hdr*>(
+                        frame + sizeof(rte_ether_hdr) + ihl_bytes);
+                    if (udp->dst_port == local_port_nbo &&
+                        udp->src_port == remote_port_nbo &&
+                        ip->dst_addr == local_ip_nbo) {
+                        const uint16_t udp_len = rte_be_to_cpu_16(udp->dgram_len);
+                        if (udp_len >= sizeof(rte_udp_hdr)) {
+                            const std::size_t payload_len = static_cast<std::size_t>(udp_len - sizeof(rte_udp_hdr));
+                            const std::size_t payload_off = sizeof(rte_ether_hdr) + ihl_bytes + sizeof(rte_udp_hdr);
+                            if (accepted < budget &&
+                                payload_len <= stride &&
+                                payload_off + payload_len <= pkt_len) {
+                                std::memcpy(
+                                    out_payload + static_cast<std::size_t>(accepted) * stride,
+                                    frame + payload_off,
+                                    payload_len);
+                                out_lens[accepted] = static_cast<uint16_t>(payload_len);
+                                ++accepted;
+                                rx_bytes += payload_len;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        rte_pktmbuf_free(mbufs[i]);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_contexts.find(handle);
+        if (it != g_contexts.end()) {
+            it->second.rx_packets.fetch_add(accepted, std::memory_order_relaxed);
+            it->second.rx_bytes.fetch_add(rx_bytes, std::memory_order_relaxed);
+            if (n > accepted) {
+                it->second.rx_dropped.fetch_add(static_cast<uint64_t>(n - accepted), std::memory_order_relaxed);
+            }
+        }
+    }
+
+    PyBuffer_Release(&lens_view);
+    PyBuffer_Release(&payload_view);
+    return PyLong_FromLong(static_cast<long>(accepted));
 }
 
 static PyObject* py_dpdk_snapshot(PyObject*, PyObject* args) {
@@ -687,7 +1080,10 @@ PyMethodDef module_methods[] = {
     {"dpdk_available", py_dpdk_available, METH_NOARGS, "Return DPDK availability"},
     {"dpdk_open", py_dpdk_open, METH_VARARGS, "Open DPDK context"},
     {"dpdk_send_batch", py_dpdk_send_batch, METH_VARARGS, "Send fixed-size batch"},
+    {"dpdk_configure_udp_flow", py_dpdk_configure_udp_flow, METH_VARARGS, "Configure UDP flow template for payload fast path"},
+    {"dpdk_send_udp_payload", py_dpdk_send_udp_payload, METH_VARARGS, "Send one UDP payload with native header build"},
     {"dpdk_poll_rx", py_dpdk_poll_rx, METH_VARARGS, "Poll RX frames"},
+    {"dpdk_poll_udp_payloads", py_dpdk_poll_udp_payloads, METH_VARARGS, "Poll UDP payloads into writable buffers"},
     {"dpdk_snapshot", py_dpdk_snapshot, METH_VARARGS, "Snapshot DPDK counters"},
     {"dpdk_close", py_dpdk_close, METH_VARARGS, "Close DPDK context"},
     {nullptr, nullptr, 0, nullptr},
