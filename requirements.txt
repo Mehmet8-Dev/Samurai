@@ -3,6 +3,7 @@ uvloop
 aiohttp
 websockets
 httpx[http2]
+pyzmq
 
 # Optional system dependency tree (not pip-installable):
 # - DPDK backend requires OS-level packages such as:
