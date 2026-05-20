@@ -420,6 +420,10 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             return 1
 
     utils.log_info(f"{workers} adet işçi (worker) süreci başlatılıyor...")
+    _use_zmq_runtime = str(
+        os.environ.get("SAMURAI_USE_ZMQ_RUNTIME", "1")
+        or "1"
+    ).strip().lower() not in {"0", "false", "off", "no"}
 
     processes = []
     start_time = time.time()
@@ -455,7 +459,7 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
             worker_args.rps = worker_args.rps / workers
 
         p = multiprocessing.Process(
-            target=orchestrator.start_worker,
+            target=(orchestrator.start_worker_zmq if _use_zmq_runtime else orchestrator.start_worker),
             args=(
                 i + 1,
                 vars(worker_args),

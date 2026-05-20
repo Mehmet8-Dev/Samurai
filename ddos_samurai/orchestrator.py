@@ -981,6 +981,191 @@ def _apply_topology_binding(args: dict, worker_id: int) -> None:
         args["topology_tuple_alloc_fail"] = int(args.get("topology_tuple_alloc_fail", 0) or 0) + 1
 
 
+def _resolve_worker_kind_for_zmq(args: dict):
+    from .zmq_wire import WorkerKind
+
+    backend = str(args.get("compute_backend", "cpu") or "cpu").strip().lower()
+    attack_vector = str(args.get("attack_vector", "basic") or "basic").strip().lower()
+
+    if backend == "cuda":
+        if attack_vector in {"defense", "gpu-defense"}:
+            return WorkerKind.DEFENSE
+        return WorkerKind.GPU
+    if backend == "dpdk":
+        return WorkerKind.DPDK
+    if backend in {"af_xdp", "xdp"}:
+        return WorkerKind.AF_XDP
+    if attack_vector in {"http", "http2", "websocket", "slowloris", "l4_tcp"}:
+        return WorkerKind.L7
+    return WorkerKind.CPU
+
+
+def start_worker_zmq(
+    worker_id,
+    args,
+    progress=None,
+    progress_lock=None,
+    tls_profile="none",
+    run_events=None,
+    sent_total=None,
+    errors_total=None,
+    resource_stats=None,
+):
+    _ = tls_profile
+    _ = resource_stats
+    worker_started = time.time()
+    worker_status = "ok"
+    worker_error = ""
+    worker_stats = _empty_stats()
+    backend_used = "zmq"
+
+    correlation_id = int(args.get("correlation_id", 0) or 0)
+    if correlation_id <= 0:
+        correlation_id = int((time.time_ns() ^ int(worker_id)) & 0xFFFFFFFFFFFFFFFF)
+    job_id = str(args.get("job_id", "") or "").strip() or f"w{int(worker_id)}-{correlation_id:016x}"
+
+    dispatcher = None
+    collector = None
+    runtime = None
+    worker_kind = None
+    try:
+        from .zmq_dispatcher import ZmqDispatcher
+        from .zmq_event_collector import ZmqEventCollector
+        from .zmq_runtime_manager import ZmqRuntimeManager
+        from .zmq_wire import MessageType, WorkerKind, default_event_endpoint, default_job_endpoint
+
+        worker_kind = _resolve_worker_kind_for_zmq(args)
+        if worker_kind != WorkerKind.CPU:
+            raise RuntimeError(
+                f"M2 cpu_worker prototype only supports WorkerKind.CPU (resolved={worker_kind.name})"
+            )
+
+        job_endpoint = str(args.get("zmq_job_endpoint", "") or default_job_endpoint(worker_kind))
+        event_endpoint = str(args.get("zmq_event_endpoint", "") or default_event_endpoint(worker_kind))
+
+        runtime = ZmqRuntimeManager()
+        runtime.launch_worker(
+            worker_kind,
+            extra_args=[
+                "--job-endpoint",
+                job_endpoint,
+                "--event-endpoint",
+                event_endpoint,
+                "--jobs-mode",
+                "bind",
+                "--events-mode",
+                "connect",
+            ],
+        )
+
+        collector = ZmqEventCollector(bind=True)
+        collector.ensure_worker_channel(worker_kind, endpoint=event_endpoint)
+        dispatcher = ZmqDispatcher()
+        dispatcher.dispatch_start_job(
+            worker_kind=worker_kind,
+            correlation_id=correlation_id,
+            job_id=job_id,
+            args=args,
+            scenario_payload_ref=str(args.get("scenario_payload_ref", "") or ""),
+            endpoint=job_endpoint,
+        )
+        terminal = collector.wait_for_terminal_event(
+            correlation_id=correlation_id,
+            worker_kind=worker_kind,
+            ack_timeout_s=float(args.get("zmq_ack_timeout_s", 2.0) or 2.0),
+            heartbeat_timeout_s=float(args.get("zmq_heartbeat_timeout_s", 5.0) or 5.0),
+            overall_timeout_s=float(args.get("zmq_overall_timeout_s", 120.0) or 120.0),
+        )
+
+        if terminal.header.msg_type == MessageType.ERROR:
+            worker_status = "failed"
+            worker_error = str(terminal.payload_decoded or "worker_error")
+        elif terminal.header.msg_type == MessageType.JOB_DONE:
+            if isinstance(terminal.payload_decoded, dict):
+                worker_stats.update(dict(terminal.payload_decoded))
+        else:
+            worker_status = "failed"
+            worker_error = f"unexpected_terminal_msg_type:{int(terminal.header.msg_type)}"
+    except _RECOVERABLE_ERRORS as exc:
+        worker_status = "failed"
+        worker_error = str(exc)
+    finally:
+        try:
+            if dispatcher is not None and worker_kind is not None:
+                try:
+                    dispatcher.dispatch_shutdown_worker(
+                        worker_kind=worker_kind,
+                        correlation_id=(correlation_id + 1) & 0xFFFFFFFFFFFFFFFF,
+                        job_id=f"{job_id}:shutdown",
+                    )
+                except _RECOVERABLE_ERRORS as exc:
+                    _debug_exception("zmq shutdown dispatch failed", exc)
+                dispatcher.close()
+        except _RECOVERABLE_ERRORS as exc:
+            _debug_exception("dispatcher close failed", exc)
+        try:
+            if collector is not None:
+                collector.close()
+        except _RECOVERABLE_ERRORS as exc:
+            _debug_exception("collector close failed", exc)
+        try:
+            if runtime is not None and worker_kind is not None:
+                runtime.stop_worker(worker_kind, timeout_s=1.0)
+        except _RECOVERABLE_ERRORS as exc:
+            _debug_exception("runtime stop failed", exc)
+
+    attempted = int(worker_stats.get("attempted", args.get("count", 0)) or 0)
+    sent = int(worker_stats.get("sent", worker_stats.get("packets_sent", 0)) or 0)
+    errors = int(worker_stats.get("errors", worker_stats.get("packets_errors", 0)) or 0)
+    if attempted <= 0:
+        attempted = max(0, sent + errors)
+    if errors <= 0 and attempted > sent:
+        errors = max(0, attempted - sent)
+    worker_stats["attempted"] = int(attempted)
+    worker_stats["sent"] = int(sent)
+    worker_stats["errors"] = int(errors)
+    worker_stats["bytes_sent_est"] = int(
+        worker_stats.get("bytes_sent_est", worker_stats.get("bytes_sent", 0)) or 0
+    )
+
+    try:
+        if progress is not None:
+            if progress_lock is not None:
+                with progress_lock:
+                    progress.value += int(attempted)
+                    if sent_total is not None:
+                        sent_total.value += int(sent)
+                    if errors_total is not None:
+                        errors_total.value += int(errors)
+            else:
+                progress.value += int(attempted)
+                if sent_total is not None:
+                    sent_total.value += int(sent)
+                if errors_total is not None:
+                    errors_total.value += int(errors)
+    except _RECOVERABLE_ERRORS as exc:
+        _debug_exception("shared counter update failed", exc)
+
+    if run_events is not None:
+        try:
+            run_events.append(
+                {
+                    "worker_id": int(worker_id),
+                    "attack_vector": str(args.get("attack_vector", "unknown")),
+                    "compute_backend": str(backend_used),
+                    "protocol": str(args.get("protocol", "")),
+                    "target": str(args.get("target", "")),
+                    "count_cfg": int(args.get("count", 0) or 0),
+                    "status": str(worker_status),
+                    "error": str(worker_error),
+                    "duration_s": float(max(0.0, time.time() - worker_started)),
+                    "stats": dict(worker_stats),
+                }
+            )
+        except _RECOVERABLE_ERRORS as exc:
+            _debug_exception("run_events append failed", exc)
+
+
 def start_worker(
     worker_id,
     args,
