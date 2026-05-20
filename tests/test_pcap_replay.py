@@ -670,7 +670,7 @@ class TestPrepareReplay(unittest.TestCase):
 
 
 class TestReplayExecution(unittest.IsolatedAsyncioTestCase):
-    async def test_replay_use_l2_passes_force_l2_to_sender(self):
+    async def test_replay_path_removed_fail_fast(self):
         packets_data = [(1000, 0, _build_eth_tcp_packet())]
         path = _write_pcap_to_tempfile(packets_data)
         try:
@@ -681,17 +681,12 @@ class TestReplayExecution(unittest.IsolatedAsyncioTestCase):
                 target_ip_override="127.0.0.1",
                 target_port_override=80,
             )
-            mock_sender = AsyncMock(return_value={"attempted": 1, "sent": 1, "errors": 0, "bytes_sent_est": 64})
-            with patch("ddos_samurai.senders.paced_raw_socket_sender", mock_sender):
-                out = await replay_pcap(cfg)
-            self.assertEqual(out["attempted"], 1)
-            self.assertEqual(out["sent"], 1)
-            _args, kwargs = mock_sender.call_args
-            self.assertTrue(bool(kwargs.get("force_l2", False)))
+            with self.assertRaises(RuntimeError):
+                await replay_pcap(cfg)
         finally:
             os.unlink(path)
 
-    async def test_replay_use_l2_timing_aware_keeps_schedule_batches(self):
+    async def test_replay_path_removed_fail_fast_for_timing_mode(self):
         packets_data = [
             (1000, 0, _build_eth_tcp_packet()),
             (1001, 0, _build_eth_tcp_packet()),
@@ -706,17 +701,8 @@ class TestReplayExecution(unittest.IsolatedAsyncioTestCase):
                 target_port_override=80,
                 batch_size=1,
             )
-            mock_sender = AsyncMock(return_value={"attempted": 1, "sent": 1, "errors": 0, "bytes_sent_est": 64})
-            with patch("ddos_samurai.senders.paced_raw_socket_sender", mock_sender):
-                with patch("ddos_samurai.pcap_replay._wait_until", AsyncMock(return_value=0.0)):
-                    out = await replay_pcap(cfg)
-            self.assertEqual(out["attempted"], 2)
-            self.assertEqual(out["sent"], 2)
-            self.assertEqual(mock_sender.await_count, 2)
-            for _call_args, kwargs in mock_sender.call_args_list:
-                self.assertTrue(bool(kwargs.get("force_l2", False)))
-                self.assertEqual(int(kwargs.get("count", 0)), 1)
-                self.assertIsNone(kwargs.get("pacing_config"))
+            with self.assertRaises(RuntimeError):
+                await replay_pcap(cfg)
         finally:
             os.unlink(path)
 

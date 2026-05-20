@@ -240,7 +240,7 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.quic_expect_header_name, "")
         self.assertEqual(args.quic_expect_header_value_contains, "")
         self.assertEqual(args.quic_expect_body_substring, "")
-        self.assertEqual(args.l7_fallback_policy, "allow")
+        self.assertEqual(args.l7_fallback_policy, "fail")
         self.assertFalse(args.l7_capability_strict)
         self.assertEqual(args.gpu_batch_size, 100000)
         self.assertEqual(args.gpu_stream_count, 3)
@@ -737,8 +737,6 @@ class TestL7CapabilityPreflight(unittest.TestCase):
                 "--l7-capability-strict",
                 "--xdp-interface",
                 "eth0",
-                "--l7-quic-auto-bridge",
-                "--l7-quic-bridge-autopromote",
             ]
         )
         with patch.dict(os.environ, {"SAMURAI_QUIC_BUILD_MODE": "auto"}, clear=False):
