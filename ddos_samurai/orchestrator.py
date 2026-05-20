@@ -74,6 +74,11 @@ def _build_pacing_config(args: dict) -> PacingConfig:
 def _resolve_worker_kind_for_zmq(args: dict) -> WorkerKind:
     backend = str(args.get("compute_backend", "cpu") or "cpu").strip().lower()
     attack_vector = str(args.get("attack_vector", "basic") or "basic").strip().lower()
+    scenario_mode = str(args.get("scenario_mode", "off") or "off").strip().lower()
+    scenario_payload_ref = str(args.get("scenario_payload_ref", "") or "").strip()
+
+    if scenario_mode in {"shadow", "enforce"} or bool(scenario_payload_ref):
+        return WorkerKind.SCENARIO
 
     if backend == "cuda":
         if attack_vector in {"defense", "gpu-defense"}:
