@@ -65,11 +65,15 @@ class _ThreadWorker:
         self._thread.join(timeout=timeout)
 
     def is_alive(self) -> bool:
+        if self._terminate_requested:
+            return False
         return bool(self._thread.is_alive())
 
     def terminate(self):
         # Cooperative termination path can be added here by job-id stop dispatch.
         self._terminate_requested = True
+        if self.exitcode is None:
+            self.exitcode = -15
 
     @property
     def name(self) -> str:
