@@ -9,7 +9,7 @@ class L7RouteRequest:
     protocol: str
     l7_engine: str = "python"
     protocol_engine: str = "auto"
-    fallback_policy: str = "allow"
+    fallback_policy: str = "fail"
     capability_strict: bool = False
     lab_profile: str = "off"
 

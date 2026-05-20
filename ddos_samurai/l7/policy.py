@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 _ENGINE_CHOICES = {"python", "c_state"}
-_FALLBACK_POLICIES = {"allow", "fail"}
+_FALLBACK_POLICIES = {"fail"}
 _DEDICATED_KPI_PROFILES = {"dedicated_lab"}
 
 
@@ -18,10 +18,10 @@ def normalize_engine(name: str | None, *, allow_auto: bool = False, default: str
 
 
 def normalize_fallback_policy(name: str | None) -> str:
-    raw = str(name or "allow").strip().lower()
+    raw = str(name or "fail").strip().lower()
     if raw in _FALLBACK_POLICIES:
         return raw
-    return "allow"
+    return "fail"
 
 
 def is_dedicated_profile(*, lab_profile: str | None, kpi_gate_profile: str | None = None) -> bool:
@@ -46,8 +46,6 @@ def allow_python_fallback(
     fallback_policy: str | None,
     capability_strict: bool,
 ) -> bool:
-    if bool(capability_strict):
-        return False
-    if normalize_fallback_policy(fallback_policy) == "fail":
-        return False
-    return True
+    _ = fallback_policy
+    _ = capability_strict
+    return False
