@@ -1035,10 +1035,6 @@ def start_worker_zmq(
         from .zmq_wire import MessageType, WorkerKind, default_event_endpoint, default_job_endpoint
 
         worker_kind = _resolve_worker_kind_for_zmq(args)
-        if worker_kind != WorkerKind.CPU:
-            raise RuntimeError(
-                f"M2 cpu_worker prototype only supports WorkerKind.CPU (resolved={worker_kind.name})"
-            )
 
         job_endpoint = str(args.get("zmq_job_endpoint", "") or default_job_endpoint(worker_kind))
         event_endpoint = str(args.get("zmq_event_endpoint", "") or default_event_endpoint(worker_kind))
