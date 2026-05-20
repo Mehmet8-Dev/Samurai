@@ -133,6 +133,7 @@ def test_m3_cmake_has_all_worker_targets() -> None:
     assert "target_link_libraries(samurai_afxdp_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)" in cmake
     assert "target_link_libraries(samurai_doca_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)" in cmake
     assert "target_link_libraries(samurai_l7_worker PRIVATE pacing_engine_static pthread)" in cmake
+    assert "target_link_libraries(samurai_defense_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)" in cmake
     assert "pkg_check_modules(DPDK QUIET libdpdk)" in cmake
     assert "target_link_libraries(samurai_dpdk_worker PRIVATE pacing_engine_static cpu_native_static pthread)" in cmake
     assert "target_compile_definitions(samurai_dpdk_worker PRIVATE SAMURAI_WITH_DPDK=1)" in cmake
@@ -198,6 +199,21 @@ def test_m3_l7_worker_has_real_runtime_and_failfast_fallback() -> None:
     assert "scenario_payload_ref_missing" in src
     assert "l7_protocol_requires_udp_or_quic_worker" in src
     assert "target_required" in src
+
+
+def test_m3_defense_worker_has_native_bridge_and_failfast_fallback() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "src" / "daemon" / "defense_worker.cpp").read_text(encoding="utf-8")
+    assert "LoadDefenseNative" in src
+    assert "samurai_gpu_packet_defense_init" in src
+    assert "samurai_gpu_packet_classify_batch" in src
+    assert "samurai_gpu_packet_classify_from_ingress" in src
+    assert "samurai_gpu_packet_read_classifier_stats" in src
+    assert "MessageType::HEARTBEAT" in src
+    assert "MessageType::METRIC_SNAPSHOT" in src
+    assert "defense_native_lib_unavailable" in src
+    assert "defense_native_symbol_missing" in src
+    assert "defense_classify_failed" in src
 
 
 def test_m3_prototype_happy_path_for_all_workers() -> None:

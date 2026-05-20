@@ -66,4 +66,5 @@ target_link_libraries(samurai_doca_worker PRIVATE pacing_engine_static cpu_nativ
 add_samurai_worker(samurai_l7_worker daemon/l7_worker.cpp)
 target_link_libraries(samurai_l7_worker PRIVATE pacing_engine_static pthread)
 add_samurai_worker(samurai_defense_worker daemon/defense_worker.cpp)
+target_link_libraries(samurai_defense_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)
 add_samurai_worker(samurai_scenario_worker daemon/scenario_worker.cpp)
