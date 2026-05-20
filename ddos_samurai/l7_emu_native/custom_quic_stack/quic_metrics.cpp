@@ -78,6 +78,15 @@ std::map<std::string, double> init_quic_stats(
   out["quic_tx_datagrams"] = 0.0;
   out["quic_rx_datagrams"] = 0.0;
   out["quic_pacing_wait_events"] = 0.0;
+  out["quic_tls_session_resume_attempted"] = 0.0;
+  out["quic_tls_session_resume_applied"] = 0.0;
+  out["quic_tls_session_resumed"] = 0.0;
+  out["quic_tls_early_data_accepted"] = 0.0;
+  out["quic_tls_session_ticket_received"] = 0.0;
+  out["quic_tls_cache_load_hit"] = 0.0;
+  out["quic_tls_cache_store_updates"] = 0.0;
+  out["quic_tls_session_resume_hit_ratio"] = 0.0;
+  out["quic_tls_early_data_accept_ratio"] = 0.0;
   out["quic_requests_per_connection_eff"] = 0.0;
   out["quic_retransmission_ratio"] = 0.0;
   return out;
@@ -146,6 +155,19 @@ void apply_quic_run_metrics(
   (*out)["quic_tx_datagrams"] = static_cast<double>(udp.tx_datagrams);
   (*out)["quic_rx_datagrams"] = static_cast<double>(udp.rx_datagrams);
   (*out)["quic_pacing_wait_events"] = static_cast<double>(udp.pacing_wait_events);
+  (*out)["quic_tls_session_resume_attempted"] = static_cast<double>(udp.tls_session_resume_attempted);
+  (*out)["quic_tls_session_resume_applied"] = static_cast<double>(udp.tls_session_resume_applied);
+  (*out)["quic_tls_session_resumed"] = static_cast<double>(udp.tls_session_resumed);
+  (*out)["quic_tls_early_data_accepted"] = static_cast<double>(udp.tls_early_data_accepted);
+  (*out)["quic_tls_session_ticket_received"] = static_cast<double>(udp.tls_session_ticket_received);
+  (*out)["quic_tls_cache_load_hit"] = static_cast<double>(udp.tls_cache_load_hit);
+  (*out)["quic_tls_cache_store_updates"] = static_cast<double>(udp.tls_cache_store_updates);
+  (*out)["quic_tls_session_resume_hit_ratio"] =
+      static_cast<double>(udp.tls_session_resumed) /
+      static_cast<double>(std::max(1, udp.tls_session_resume_attempted));
+  (*out)["quic_tls_early_data_accept_ratio"] =
+      static_cast<double>(udp.tls_early_data_accepted) /
+      static_cast<double>(std::max(1, udp.tls_session_resume_attempted));
   (*out)["quic_requests_per_connection_eff"] =
       static_cast<double>(std::max(0, udp.send_ok)) / static_cast<double>(effective_conn_success);
   (*out)["quic_retransmission_ratio"] =

@@ -40,6 +40,13 @@ struct UdpProbeCounters {
   int tx_datagrams{0};
   int rx_datagrams{0};
   int pacing_wait_events{0};
+  int tls_session_resume_attempted{0};
+  int tls_session_resume_applied{0};
+  int tls_session_resumed{0};
+  int tls_early_data_accepted{0};
+  int tls_session_ticket_received{0};
+  int tls_cache_load_hit{0};
+  int tls_cache_store_updates{0};
   std::size_t tx_bytes{0};
   std::size_t rx_bytes{0};
 };

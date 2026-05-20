@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -22,6 +23,7 @@
 
 #include <Python.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
@@ -29,6 +31,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -135,9 +138,14 @@ struct QuicXdpTransport {
 struct QuicDpdkTransport {
   PyObject* mod{nullptr};
   PyObject* fn_send_batch{nullptr};
+  PyObject* fn_send_udp_payload{nullptr};
   PyObject* fn_poll_rx{nullptr};
+  PyObject* fn_poll_udp_payloads{nullptr};
   PyObject* fn_close{nullptr};
   PyObject* tx_frame_obj{nullptr};
+  PyObject* rx_payload_obj{nullptr};
+  PyObject* rx_lens_obj{nullptr};
+  bool udp_payload_fast_path{false};
   long handle{0};
   std::array<uint8_t, 6> src_mac{};
   std::array<uint8_t, 6> dst_mac{};
@@ -235,12 +243,21 @@ struct Ngtcp2AttemptCtx {
   int blocked_streak_events{0};
   uint64_t blocked_window_start_ns{0};
   bool flow_control_fast_failed{false};
+  bool tls_session_resume_attempted{false};
+  bool tls_session_resume_applied{false};
+  bool tls_session_resumed{false};
+  bool tls_early_data_accepted{false};
+  bool tls_session_ticket_received{false};
 };
 
 struct TlsSessionCache {
   std::string identity{};
   std::string disk_path{};
   std::vector<uint8_t> blob{};
+  int ttl_sec{3600};
+  int pool_size{64};
+  bool loaded_from_disk{false};
+  int store_updates{0};
 };
 
 ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* conn_ref) {
@@ -305,8 +322,18 @@ FlowControlGuardPolicy derive_flow_control_guard_policy() {
   return policy;
 }
 
-constexpr uint32_t kTlsSessionCacheMagic = 0x31534c54u;  // "TLS1"
+constexpr uint32_t kTlsSessionCacheMagic = 0x32534c54u;  // "TLS2"
+constexpr uint32_t kTlsSessionCacheVersion = 2u;
 constexpr std::size_t kTlsSessionCacheMaxBlob = 64u * 1024u;
+constexpr std::size_t kTlsSessionCacheMaxIdentityLen = 1024u;
+
+struct TlsSessionCacheEntry {
+  std::string identity{};
+  std::vector<uint8_t> blob{};
+  uint64_t created_s{0};
+  uint64_t expires_s{0};
+  uint64_t last_used_s{0};
+};
 
 void append_u32_le(std::vector<uint8_t>* out, uint32_t v) {
   if (out == nullptr) {
@@ -327,6 +354,39 @@ bool read_u32_le(const std::vector<uint8_t>& src, std::size_t off, uint32_t* out
       (static_cast<uint32_t>(src[off + 2]) << 16u) |
       (static_cast<uint32_t>(src[off + 3]) << 24u);
   return true;
+}
+
+void append_u64_le(std::vector<uint8_t>* out, uint64_t v) {
+  if (out == nullptr) {
+    return;
+  }
+  out->push_back(static_cast<uint8_t>(v & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 8u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 16u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 24u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 32u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 40u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 48u) & 0xffu));
+  out->push_back(static_cast<uint8_t>((v >> 56u) & 0xffu));
+}
+
+bool read_u64_le(const std::vector<uint8_t>& src, std::size_t off, uint64_t* out) {
+  if (out == nullptr || off + 8u > src.size()) {
+    return false;
+  }
+  *out = static_cast<uint64_t>(src[off]) |
+      (static_cast<uint64_t>(src[off + 1]) << 8u) |
+      (static_cast<uint64_t>(src[off + 2]) << 16u) |
+      (static_cast<uint64_t>(src[off + 3]) << 24u) |
+      (static_cast<uint64_t>(src[off + 4]) << 32u) |
+      (static_cast<uint64_t>(src[off + 5]) << 40u) |
+      (static_cast<uint64_t>(src[off + 6]) << 48u) |
+      (static_cast<uint64_t>(src[off + 7]) << 56u);
+  return true;
+}
+
+uint64_t now_epoch_s() {
+  return static_cast<uint64_t>(std::time(nullptr));
 }
 
 QuicUdpIoBackend parse_backend_name(const std::string& raw) {
@@ -643,9 +703,13 @@ void close_dpdk_transport(QuicDpdkTransport* t) {
     }
   }
   Py_XDECREF(t->fn_send_batch);
+  Py_XDECREF(t->fn_send_udp_payload);
   Py_XDECREF(t->fn_poll_rx);
+  Py_XDECREF(t->fn_poll_udp_payloads);
   Py_XDECREF(t->fn_close);
   Py_XDECREF(t->tx_frame_obj);
+  Py_XDECREF(t->rx_payload_obj);
+  Py_XDECREF(t->rx_lens_obj);
   Py_XDECREF(t->mod);
   *t = QuicDpdkTransport{};
   PyGILState_Release(gil);
@@ -772,80 +836,316 @@ std::string resolve_tls_session_cache_file_path() {
   return trim_ascii(raw);
 }
 
-bool load_tls_session_cache_file(
-    const std::string& path,
-    const std::string& identity,
-    std::vector<uint8_t>* out_blob) {
-  if (path.empty() || identity.empty() || out_blob == nullptr) {
+int resolve_tls_session_cache_ttl_sec() {
+  return std::clamp(env_int("SAMURAI_QUIC_TLS_SESSION_CACHE_TTL_SEC", 3600), 60, 7 * 24 * 3600);
+}
+
+int resolve_tls_session_cache_pool_size() {
+  return std::clamp(env_int("SAMURAI_QUIC_TLS_SESSION_CACHE_POOL_SIZE", 64), 1, 4096);
+}
+
+bool read_all_fd(int fd, std::vector<uint8_t>* out) {
+  if (fd < 0 || out == nullptr) {
     return false;
   }
-  std::ifstream in(path, std::ios::binary);
-  if (!in.is_open()) {
+  out->clear();
+  if (::lseek(fd, 0, SEEK_SET) < 0) {
     return false;
   }
-  std::vector<uint8_t> raw{
-      std::istreambuf_iterator<char>(in),
-      std::istreambuf_iterator<char>()};
+  std::array<uint8_t, 4096> buf{};
+  for (;;) {
+    const ssize_t n = ::read(fd, buf.data(), buf.size());
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    if (n == 0) {
+      break;
+    }
+    out->insert(out->end(), buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(n));
+  }
+  return true;
+}
+
+bool write_all_fd(int fd, const std::vector<uint8_t>& data) {
+  if (fd < 0) {
+    return false;
+  }
+  if (::ftruncate(fd, 0) != 0) {
+    return false;
+  }
+  if (::lseek(fd, 0, SEEK_SET) < 0) {
+    return false;
+  }
+  std::size_t off = 0;
+  while (off < data.size()) {
+    const ssize_t n = ::write(
+        fd,
+        data.data() + static_cast<std::ptrdiff_t>(off),
+        data.size() - off);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    off += static_cast<std::size_t>(n);
+  }
+  return ::fsync(fd) == 0;
+}
+
+bool parse_tls_session_cache_entries(
+    const std::vector<uint8_t>& raw,
+    std::vector<TlsSessionCacheEntry>* out_entries) {
+  if (out_entries == nullptr) {
+    return false;
+  }
+  out_entries->clear();
+  if (raw.empty()) {
+    return true;
+  }
   if (raw.size() < 12u) {
     return false;
   }
   uint32_t magic = 0;
-  uint32_t identity_len = 0;
-  uint32_t blob_len = 0;
+  uint32_t version = 0;
+  uint32_t entry_count = 0;
   if (!read_u32_le(raw, 0, &magic) ||
-      !read_u32_le(raw, 4, &identity_len) ||
-      !read_u32_le(raw, 8, &blob_len)) {
+      !read_u32_le(raw, 4, &version) ||
+      !read_u32_le(raw, 8, &entry_count)) {
     return false;
   }
-  if (magic != kTlsSessionCacheMagic) {
+  if (magic != kTlsSessionCacheMagic || version != kTlsSessionCacheVersion) {
     return false;
   }
-  if (identity_len == 0 ||
-      blob_len == 0 ||
-      static_cast<std::size_t>(identity_len) > 1024u ||
-      static_cast<std::size_t>(blob_len) > kTlsSessionCacheMaxBlob) {
+  std::size_t off = 12u;
+  out_entries->reserve(entry_count);
+  for (uint32_t i = 0; i < entry_count; ++i) {
+    uint32_t identity_len = 0;
+    uint32_t blob_len = 0;
+    uint64_t created_s = 0;
+    uint64_t expires_s = 0;
+    uint64_t last_used_s = 0;
+    if (!read_u32_le(raw, off, &identity_len)) {
+      return false;
+    }
+    off += 4u;
+    if (!read_u32_le(raw, off, &blob_len)) {
+      return false;
+    }
+    off += 4u;
+    if (!read_u64_le(raw, off, &created_s)) {
+      return false;
+    }
+    off += 8u;
+    if (!read_u64_le(raw, off, &expires_s)) {
+      return false;
+    }
+    off += 8u;
+    if (!read_u64_le(raw, off, &last_used_s)) {
+      return false;
+    }
+    off += 8u;
+    if (identity_len == 0 ||
+        blob_len == 0 ||
+        static_cast<std::size_t>(identity_len) > kTlsSessionCacheMaxIdentityLen ||
+        static_cast<std::size_t>(blob_len) > kTlsSessionCacheMaxBlob) {
+      return false;
+    }
+    if (off + static_cast<std::size_t>(identity_len) + static_cast<std::size_t>(blob_len) > raw.size()) {
+      return false;
+    }
+    TlsSessionCacheEntry entry{};
+    entry.identity.assign(
+        reinterpret_cast<const char*>(raw.data() + static_cast<std::ptrdiff_t>(off)),
+        static_cast<std::size_t>(identity_len));
+    off += static_cast<std::size_t>(identity_len);
+    entry.blob.assign(
+        raw.begin() + static_cast<std::ptrdiff_t>(off),
+        raw.begin() + static_cast<std::ptrdiff_t>(off + static_cast<std::size_t>(blob_len)));
+    off += static_cast<std::size_t>(blob_len);
+    entry.created_s = created_s;
+    entry.expires_s = expires_s;
+    entry.last_used_s = last_used_s;
+    out_entries->push_back(std::move(entry));
+  }
+  return off == raw.size();
+}
+
+void serialize_tls_session_cache_entries(
+    const std::vector<TlsSessionCacheEntry>& entries,
+    std::vector<uint8_t>* out_raw) {
+  if (out_raw == nullptr) {
+    return;
+  }
+  out_raw->clear();
+  out_raw->reserve(12u + entries.size() * 48u);
+  append_u32_le(out_raw, kTlsSessionCacheMagic);
+  append_u32_le(out_raw, kTlsSessionCacheVersion);
+  append_u32_le(out_raw, static_cast<uint32_t>(entries.size()));
+  for (const auto& entry : entries) {
+    append_u32_le(out_raw, static_cast<uint32_t>(entry.identity.size()));
+    append_u32_le(out_raw, static_cast<uint32_t>(entry.blob.size()));
+    append_u64_le(out_raw, entry.created_s);
+    append_u64_le(out_raw, entry.expires_s);
+    append_u64_le(out_raw, entry.last_used_s);
+    out_raw->insert(out_raw->end(), entry.identity.begin(), entry.identity.end());
+    out_raw->insert(out_raw->end(), entry.blob.begin(), entry.blob.end());
+  }
+}
+
+bool load_tls_session_cache_file(
+    const std::string& path,
+    const std::string& identity,
+    int ttl_sec,
+    int pool_size,
+    std::vector<uint8_t>* out_blob,
+    bool* out_hit) {
+  if (out_hit != nullptr) {
+    *out_hit = false;
+  }
+  if (path.empty() || identity.empty() || out_blob == nullptr) {
     return false;
   }
-  const std::size_t expected_size =
-      12u + static_cast<std::size_t>(identity_len) + static_cast<std::size_t>(blob_len);
-  if (raw.size() != expected_size) {
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0600);
+  if (fd < 0) {
     return false;
   }
-  const std::string got_identity(
-      reinterpret_cast<const char*>(raw.data() + 12u),
-      static_cast<std::size_t>(identity_len));
-  if (got_identity != identity) {
+  const bool lock_ok = ::flock(fd, LOCK_EX) == 0;
+  if (!lock_ok) {
+    (void)::close(fd);
     return false;
   }
-  out_blob->assign(
-      raw.begin() + static_cast<std::ptrdiff_t>(12u + identity_len),
-      raw.end());
-  return !out_blob->empty();
+  std::vector<uint8_t> raw{};
+  if (!read_all_fd(fd, &raw)) {
+    (void)::flock(fd, LOCK_UN);
+    (void)::close(fd);
+    return false;
+  }
+  std::vector<TlsSessionCacheEntry> entries{};
+  const bool parsed = parse_tls_session_cache_entries(raw, &entries);
+  if (!parsed) {
+    entries.clear();
+  }
+  const uint64_t now_s = now_epoch_s();
+  const uint64_t ttl = static_cast<uint64_t>(std::max(60, ttl_sec));
+  bool dirty = !parsed;
+  std::vector<TlsSessionCacheEntry> filtered{};
+  filtered.reserve(entries.size());
+  for (auto& entry : entries) {
+    if (entry.identity.empty() || entry.blob.empty()) {
+      dirty = true;
+      continue;
+    }
+    if (entry.expires_s > 0 && entry.expires_s <= now_s) {
+      dirty = true;
+      continue;
+    }
+    filtered.push_back(std::move(entry));
+  }
+  entries.swap(filtered);
+
+  bool hit = false;
+  for (auto& entry : entries) {
+    if (entry.identity == identity) {
+      *out_blob = entry.blob;
+      entry.last_used_s = now_s;
+      if (entry.expires_s < now_s + ttl / 2u) {
+        entry.expires_s = now_s + ttl;
+      }
+      hit = true;
+      dirty = true;
+      break;
+    }
+  }
+
+  std::stable_sort(entries.begin(), entries.end(), [](const TlsSessionCacheEntry& a, const TlsSessionCacheEntry& b) {
+    return a.last_used_s > b.last_used_s;
+  });
+  if (entries.size() > static_cast<std::size_t>(std::max(1, pool_size))) {
+    entries.resize(static_cast<std::size_t>(std::max(1, pool_size)));
+    dirty = true;
+  }
+
+  if (dirty) {
+    std::vector<uint8_t> encoded{};
+    serialize_tls_session_cache_entries(entries, &encoded);
+    (void)write_all_fd(fd, encoded);
+  }
+  (void)::flock(fd, LOCK_UN);
+  (void)::close(fd);
+  if (out_hit != nullptr) {
+    *out_hit = hit;
+  }
+  return hit;
 }
 
 bool store_tls_session_cache_file(
     const std::string& path,
     const std::string& identity,
-    const std::vector<uint8_t>& blob) {
+    const std::vector<uint8_t>& blob,
+    int ttl_sec,
+    int pool_size) {
   if (path.empty() || identity.empty() || blob.empty() || blob.size() > kTlsSessionCacheMaxBlob) {
     return false;
   }
-  if (identity.size() > 1024u) {
+  if (identity.size() > kTlsSessionCacheMaxIdentityLen) {
+    return false;
+  }
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0600);
+  if (fd < 0) {
+    return false;
+  }
+  if (::flock(fd, LOCK_EX) != 0) {
+    (void)::close(fd);
     return false;
   }
   std::vector<uint8_t> raw{};
-  raw.reserve(12u + identity.size() + blob.size());
-  append_u32_le(&raw, kTlsSessionCacheMagic);
-  append_u32_le(&raw, static_cast<uint32_t>(identity.size()));
-  append_u32_le(&raw, static_cast<uint32_t>(blob.size()));
-  raw.insert(raw.end(), identity.begin(), identity.end());
-  raw.insert(raw.end(), blob.begin(), blob.end());
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out.is_open()) {
-    return false;
+  std::vector<TlsSessionCacheEntry> entries{};
+  if (read_all_fd(fd, &raw)) {
+    (void)parse_tls_session_cache_entries(raw, &entries);
   }
-  out.write(reinterpret_cast<const char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
-  return out.good();
+
+  const uint64_t now_s = now_epoch_s();
+  const uint64_t ttl = static_cast<uint64_t>(std::max(60, ttl_sec));
+  std::vector<TlsSessionCacheEntry> next{};
+  next.reserve(entries.size() + 1u);
+  for (auto& entry : entries) {
+    if (entry.identity.empty() || entry.blob.empty()) {
+      continue;
+    }
+    if (entry.identity == identity) {
+      continue;
+    }
+    if (entry.expires_s > 0 && entry.expires_s <= now_s) {
+      continue;
+    }
+    next.push_back(std::move(entry));
+  }
+
+  TlsSessionCacheEntry fresh{};
+  fresh.identity = identity;
+  fresh.blob = blob;
+  fresh.created_s = now_s;
+  fresh.last_used_s = now_s;
+  fresh.expires_s = now_s + ttl;
+  next.push_back(std::move(fresh));
+
+  std::stable_sort(next.begin(), next.end(), [](const TlsSessionCacheEntry& a, const TlsSessionCacheEntry& b) {
+    return a.last_used_s > b.last_used_s;
+  });
+  if (next.size() > static_cast<std::size_t>(std::max(1, pool_size))) {
+    next.resize(static_cast<std::size_t>(std::max(1, pool_size)));
+  }
+
+  std::vector<uint8_t> encoded{};
+  serialize_tls_session_cache_entries(next, &encoded);
+  const bool ok = write_all_fd(fd, encoded);
+  (void)::flock(fd, LOCK_UN);
+  (void)::close(fd);
+  return ok;
 }
 
 bool tls_ticket_ready(gnutls_session_t session) {
@@ -888,7 +1188,14 @@ bool capture_tls_session_cache(gnutls_session_t session, TlsSessionCache* cache)
       data.data + static_cast<std::ptrdiff_t>(data.size));
   gnutls_free(data.data);
   if (!cache->disk_path.empty() && !cache->identity.empty()) {
-    (void)store_tls_session_cache_file(cache->disk_path, cache->identity, cache->blob);
+    if (store_tls_session_cache_file(
+            cache->disk_path,
+            cache->identity,
+            cache->blob,
+            cache->ttl_sec,
+            cache->pool_size)) {
+      cache->store_updates += 1;
+    }
   }
   return true;
 }
@@ -1948,7 +2255,10 @@ bool configure_gnutls_session(
         sni_name.data(),
         sni_name.size());
   }
-  (void)apply_tls_session_cache(ctx->session, session_cache);
+  if (session_cache != nullptr && !session_cache->blob.empty()) {
+    ctx->tls_session_resume_attempted = true;
+    ctx->tls_session_resume_applied = apply_tls_session_cache(ctx->session, session_cache);
+  }
   return true;
 }
 
@@ -2391,7 +2701,10 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     }
     PyObject* fn_open = PyObject_GetAttrString(mod, "dpdk_open");
     PyObject* fn_send_batch = PyObject_GetAttrString(mod, "dpdk_send_batch");
+    PyObject* fn_send_udp_payload = PyObject_GetAttrString(mod, "dpdk_send_udp_payload");
+    PyObject* fn_configure_udp_flow = PyObject_GetAttrString(mod, "dpdk_configure_udp_flow");
     PyObject* fn_poll_rx = PyObject_GetAttrString(mod, "dpdk_poll_rx");
+    PyObject* fn_poll_udp_payloads = PyObject_GetAttrString(mod, "dpdk_poll_udp_payloads");
     PyObject* fn_close = PyObject_GetAttrString(mod, "dpdk_close");
     if (fn_open == nullptr || !PyCallable_Check(fn_open) ||
         fn_send_batch == nullptr || !PyCallable_Check(fn_send_batch) ||
@@ -2399,18 +2712,36 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
         fn_close == nullptr || !PyCallable_Check(fn_close)) {
       Py_XDECREF(fn_open);
       Py_XDECREF(fn_send_batch);
+      Py_XDECREF(fn_send_udp_payload);
+      Py_XDECREF(fn_configure_udp_flow);
       Py_XDECREF(fn_poll_rx);
+      Py_XDECREF(fn_poll_udp_payloads);
       Py_XDECREF(fn_close);
       Py_DECREF(mod);
       PyGILState_Release(gil);
       return false;
+    }
+    if (fn_poll_udp_payloads != nullptr && !PyCallable_Check(fn_poll_udp_payloads)) {
+      Py_DECREF(fn_poll_udp_payloads);
+      fn_poll_udp_payloads = nullptr;
+    }
+    if (fn_send_udp_payload != nullptr && !PyCallable_Check(fn_send_udp_payload)) {
+      Py_DECREF(fn_send_udp_payload);
+      fn_send_udp_payload = nullptr;
+    }
+    if (fn_configure_udp_flow != nullptr && !PyCallable_Check(fn_configure_udp_flow)) {
+      Py_DECREF(fn_configure_udp_flow);
+      fn_configure_udp_flow = nullptr;
     }
 
     PyObject* cfg = PyDict_New();
     if (cfg == nullptr) {
       Py_DECREF(fn_open);
       Py_DECREF(fn_send_batch);
+      Py_XDECREF(fn_send_udp_payload);
+      Py_XDECREF(fn_configure_udp_flow);
       Py_DECREF(fn_poll_rx);
+      Py_XDECREF(fn_poll_udp_payloads);
       Py_DECREF(fn_close);
       Py_DECREF(mod);
       PyGILState_Release(gil);
@@ -2434,7 +2765,10 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
       Py_DECREF(cfg);
       Py_DECREF(fn_open);
       Py_DECREF(fn_send_batch);
+      Py_XDECREF(fn_send_udp_payload);
+      Py_XDECREF(fn_configure_udp_flow);
       Py_DECREF(fn_poll_rx);
+      Py_XDECREF(fn_poll_udp_payloads);
       Py_DECREF(fn_close);
       Py_DECREF(mod);
       PyGILState_Release(gil);
@@ -2453,7 +2787,10 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     if (handle_obj == nullptr) {
       PyErr_Clear();
       Py_DECREF(fn_send_batch);
+      Py_XDECREF(fn_send_udp_payload);
+      Py_XDECREF(fn_configure_udp_flow);
       Py_DECREF(fn_poll_rx);
+      Py_XDECREF(fn_poll_udp_payloads);
       Py_DECREF(fn_close);
       Py_DECREF(mod);
       PyGILState_Release(gil);
@@ -2464,7 +2801,10 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     if (PyErr_Occurred() || handle <= 0) {
       PyErr_Clear();
       Py_DECREF(fn_send_batch);
+      Py_XDECREF(fn_send_udp_payload);
+      Py_XDECREF(fn_configure_udp_flow);
       Py_DECREF(fn_poll_rx);
+      Py_XDECREF(fn_poll_udp_payloads);
       Py_DECREF(fn_close);
       Py_DECREF(mod);
       PyGILState_Release(gil);
@@ -2474,12 +2814,25 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     QuicDpdkTransport dpdk{};
     dpdk.mod = mod;
     dpdk.fn_send_batch = fn_send_batch;
+    dpdk.fn_send_udp_payload = fn_send_udp_payload;
     dpdk.fn_poll_rx = fn_poll_rx;
+    dpdk.fn_poll_udp_payloads = fn_poll_udp_payloads;
     dpdk.fn_close = fn_close;
     dpdk.handle = handle;
     dpdk.tx_frame_obj = PyByteArray_FromStringAndSize(nullptr, static_cast<Py_ssize_t>(kMaxL2FrameBytes));
     if (dpdk.tx_frame_obj == nullptr) {
       close_dpdk_transport(&dpdk);
+      Py_XDECREF(fn_configure_udp_flow);
+      PyGILState_Release(gil);
+      return false;
+    }
+    dpdk.rx_payload_obj = PyByteArray_FromStringAndSize(
+        nullptr,
+        static_cast<Py_ssize_t>(static_cast<std::size_t>(dpdk.rx_stride) * 64u));
+    dpdk.rx_lens_obj = PyByteArray_FromStringAndSize(nullptr, static_cast<Py_ssize_t>(64u * sizeof(uint16_t)));
+    if (dpdk.rx_payload_obj == nullptr || dpdk.rx_lens_obj == nullptr) {
+      close_dpdk_transport(&dpdk);
+      Py_XDECREF(fn_configure_udp_flow);
       PyGILState_Release(gil);
       return false;
     }
@@ -2505,6 +2858,7 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     }
     if (src_ip_nbo == 0) {
       close_dpdk_transport(&dpdk);
+      Py_XDECREF(fn_configure_udp_flow);
       PyGILState_Release(gil);
       return false;
     }
@@ -2524,6 +2878,7 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     }
     if (!got_src_mac) {
       close_dpdk_transport(&dpdk);
+      Py_XDECREF(fn_configure_udp_flow);
       PyGILState_Release(gil);
       return false;
     }
@@ -2563,6 +2918,7 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     }
     if (!got_dst_mac) {
       close_dpdk_transport(&dpdk);
+      Py_XDECREF(fn_configure_udp_flow);
       PyGILState_Release(gil);
       return false;
     }
@@ -2571,6 +2927,38 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     std::mt19937 gen(rd());
     std::uniform_int_distribution<int> port_dist(20000, 65000);
     dpdk.src_port_nbo = htons(static_cast<uint16_t>(port_dist(gen)));
+    if (fn_configure_udp_flow != nullptr && dpdk.fn_send_udp_payload != nullptr) {
+      PyObject* src_mac_obj = PyBytes_FromStringAndSize(
+          reinterpret_cast<const char*>(dpdk.src_mac.data()),
+          static_cast<Py_ssize_t>(dpdk.src_mac.size()));
+      PyObject* dst_mac_obj = PyBytes_FromStringAndSize(
+          reinterpret_cast<const char*>(dpdk.dst_mac.data()),
+          static_cast<Py_ssize_t>(dpdk.dst_mac.size()));
+      if (src_mac_obj != nullptr && dst_mac_obj != nullptr) {
+        PyObject* ok = PyObject_CallFunction(
+            fn_configure_udp_flow,
+            "lIIiiOOi",
+            dpdk.handle,
+            static_cast<unsigned int>(dpdk.src_ip_nbo),
+            static_cast<unsigned int>(dpdk.dst_ip_nbo),
+            static_cast<int>(dpdk.src_port_nbo),
+            static_cast<int>(dpdk.dst_port_nbo),
+            src_mac_obj,
+            dst_mac_obj,
+            static_cast<int>(dpdk.ip_id));
+        if (ok != nullptr) {
+          dpdk.udp_payload_fast_path = true;
+          Py_DECREF(ok);
+        } else {
+          PyErr_Clear();
+        }
+      } else {
+        PyErr_Clear();
+      }
+      Py_XDECREF(src_mac_obj);
+      Py_XDECREF(dst_mac_obj);
+    }
+    Py_XDECREF(fn_configure_udp_flow);
 
     sockaddr_in local4{};
     local4.sin_family = AF_INET;
@@ -2664,41 +3052,33 @@ ssize_t send_udp_payload(Ngtcp2AttemptCtx* ctx, const uint8_t* payload, std::siz
     return static_cast<ssize_t>(payload_len);
   }
   if (ctx->udp_io_backend == QuicUdpIoBackend::Dpdk) {
-    if (ctx->dpdk.handle <= 0 || ctx->dpdk.fn_send_batch == nullptr || ctx->dpdk.tx_frame_obj == nullptr) {
+    if (ctx->dpdk.handle <= 0) {
       return -1;
     }
     int sent = 0;
     PyGILState_STATE gil = PyGILState_Ensure();
-    char* frame_raw = PyByteArray_AsString(ctx->dpdk.tx_frame_obj);
-    if (frame_raw != nullptr) {
-      std::size_t frame_len = 0;
-      if (!build_ipv4_udp_eth_frame(
-              ctx->dpdk.dst_mac,
-              ctx->dpdk.src_mac,
-              ctx->dpdk.src_ip_nbo,
-              ctx->dpdk.dst_ip_nbo,
-              ctx->dpdk.src_port_nbo,
-              ctx->dpdk.dst_port_nbo,
-              &ctx->dpdk.ip_id,
-              payload,
-              payload_len,
-              reinterpret_cast<uint8_t*>(frame_raw),
-              static_cast<std::size_t>(PyByteArray_Size(ctx->dpdk.tx_frame_obj)),
-              &frame_len)) {
-        PyGILState_Release(gil);
-        return -1;
-      }
-      PyObject* result = PyObject_CallFunction(
-          ctx->dpdk.fn_send_batch,
-          "lOii",
-          ctx->dpdk.handle,
-          ctx->dpdk.tx_frame_obj,
-          static_cast<int>(frame_len),
-          1);
-      if (result == nullptr) {
-        PyErr_Clear();
-      } else {
-        if (PyDict_Check(result)) {
+    if (ctx->dpdk.udp_payload_fast_path && ctx->dpdk.fn_send_udp_payload != nullptr) {
+      PyObject* payload_view = PyMemoryView_FromMemory(
+          reinterpret_cast<char*>(const_cast<uint8_t*>(payload)),
+          static_cast<Py_ssize_t>(payload_len),
+          PyBUF_READ);
+      if (payload_view != nullptr) {
+        PyObject* result = PyObject_CallFunction(
+            ctx->dpdk.fn_send_udp_payload,
+            "lO",
+            ctx->dpdk.handle,
+            payload_view);
+        if (result == nullptr) {
+          PyErr_Clear();
+        } else if (PyLong_Check(result)) {
+          const long raw_sent = PyLong_AsLong(result);
+          if (!PyErr_Occurred()) {
+            sent = static_cast<int>(raw_sent);
+          } else {
+            PyErr_Clear();
+          }
+          Py_DECREF(result);
+        } else if (PyDict_Check(result)) {
           PyObject* sent_obj = PyDict_GetItemString(result, "sent");
           if (sent_obj != nullptr) {
             const long raw_sent = PyLong_AsLong(sent_obj);
@@ -2708,6 +3088,55 @@ ssize_t send_udp_payload(Ngtcp2AttemptCtx* ctx, const uint8_t* payload, std::siz
               PyErr_Clear();
             }
           }
+          Py_DECREF(result);
+        } else {
+          Py_DECREF(result);
+        }
+        Py_DECREF(payload_view);
+      } else {
+        PyErr_Clear();
+      }
+    }
+    if (sent <= 0 && ctx->dpdk.fn_send_batch != nullptr && ctx->dpdk.tx_frame_obj != nullptr) {
+      char* frame_raw = PyByteArray_AsString(ctx->dpdk.tx_frame_obj);
+      if (frame_raw != nullptr) {
+        std::size_t frame_len = 0;
+        if (!build_ipv4_udp_eth_frame(
+                ctx->dpdk.dst_mac,
+                ctx->dpdk.src_mac,
+                ctx->dpdk.src_ip_nbo,
+                ctx->dpdk.dst_ip_nbo,
+                ctx->dpdk.src_port_nbo,
+                ctx->dpdk.dst_port_nbo,
+                &ctx->dpdk.ip_id,
+                payload,
+                payload_len,
+                reinterpret_cast<uint8_t*>(frame_raw),
+                static_cast<std::size_t>(PyByteArray_Size(ctx->dpdk.tx_frame_obj)),
+                &frame_len)) {
+          PyGILState_Release(gil);
+          return -1;
+        }
+        PyObject* result = PyObject_CallFunction(
+            ctx->dpdk.fn_send_batch,
+            "lOii",
+            ctx->dpdk.handle,
+            ctx->dpdk.tx_frame_obj,
+            static_cast<int>(frame_len),
+            1);
+        if (result == nullptr) {
+          PyErr_Clear();
+        } else if (PyDict_Check(result)) {
+          PyObject* sent_obj = PyDict_GetItemString(result, "sent");
+          if (sent_obj != nullptr) {
+            const long raw_sent = PyLong_AsLong(sent_obj);
+            if (!PyErr_Occurred()) {
+              sent = static_cast<int>(raw_sent);
+            } else {
+              PyErr_Clear();
+            }
+          }
+          Py_DECREF(result);
         } else if (PyLong_Check(result)) {
           const long raw_sent = PyLong_AsLong(result);
           if (!PyErr_Occurred()) {
@@ -2715,11 +3144,13 @@ ssize_t send_udp_payload(Ngtcp2AttemptCtx* ctx, const uint8_t* payload, std::siz
           } else {
             PyErr_Clear();
           }
+          Py_DECREF(result);
+        } else {
+          Py_DECREF(result);
         }
-        Py_DECREF(result);
+      } else {
+        PyErr_Clear();
       }
-    } else {
-      PyErr_Clear();
     }
     PyGILState_Release(gil);
     if (sent <= 0) {
@@ -2813,10 +3244,64 @@ int recv_udp_payloads(
     return accepted;
   }
   if (ctx->udp_io_backend == QuicUdpIoBackend::Dpdk) {
-    if (ctx->dpdk.handle <= 0 || ctx->dpdk.fn_poll_rx == nullptr) {
+    if (ctx->dpdk.handle <= 0 ||
+        (ctx->dpdk.fn_poll_rx == nullptr && ctx->dpdk.fn_poll_udp_payloads == nullptr)) {
       return -1;
     }
     const int budget = std::clamp(max_packets, 1, 64);
+    if (ctx->dpdk.fn_poll_udp_payloads != nullptr &&
+        ctx->dpdk.rx_payload_obj != nullptr &&
+        ctx->dpdk.rx_lens_obj != nullptr &&
+        stride <= static_cast<std::size_t>(ctx->dpdk.rx_stride)) {
+      int accepted = 0;
+      PyGILState_STATE gil = PyGILState_Ensure();
+      PyObject* count_obj = PyObject_CallFunction(
+          ctx->dpdk.fn_poll_udp_payloads,
+          "lIiiiiOO",
+          ctx->dpdk.handle,
+          static_cast<unsigned int>(ctx->dpdk.src_ip_nbo),
+          static_cast<int>(ctx->dpdk.src_port_nbo),
+          static_cast<int>(ctx->dpdk.dst_port_nbo),
+          ctx->dpdk.rx_stride,
+          budget,
+          ctx->dpdk.rx_payload_obj,
+          ctx->dpdk.rx_lens_obj);
+      if (count_obj != nullptr) {
+        const long raw_count = PyLong_AsLong(count_obj);
+        Py_DECREF(count_obj);
+        if (!PyErr_Occurred()) {
+          accepted = static_cast<int>(raw_count);
+        } else {
+          PyErr_Clear();
+          accepted = 0;
+        }
+      } else {
+        PyErr_Clear();
+      }
+      if (accepted > 0) {
+        char* payload_raw = PyByteArray_AsString(ctx->dpdk.rx_payload_obj);
+        char* lens_raw = PyByteArray_AsString(ctx->dpdk.rx_lens_obj);
+        if (payload_raw != nullptr && lens_raw != nullptr) {
+          const auto* lens_u16 = reinterpret_cast<const uint16_t*>(lens_raw);
+          for (int i = 0; i < accepted && i < max_packets; ++i) {
+            const std::size_t plen = static_cast<std::size_t>(lens_u16[static_cast<std::size_t>(i)]);
+            if (plen == 0 || plen > stride) {
+              continue;
+            }
+            std::memcpy(
+                payload_buf + static_cast<std::size_t>(i) * stride,
+                payload_raw + static_cast<std::size_t>(i) * static_cast<std::size_t>(ctx->dpdk.rx_stride),
+                plen);
+            lens_out[static_cast<std::size_t>(i)] = plen;
+          }
+          PyGILState_Release(gil);
+          return std::min(accepted, max_packets);
+        }
+        PyErr_Clear();
+      }
+      PyGILState_Release(gil);
+    }
+
     PyGILState_STATE gil = PyGILState_Ensure();
     PyObject* frames = PyObject_CallFunction(ctx->dpdk.fn_poll_rx, "li", ctx->dpdk.handle, budget);
     if (frames == nullptr) {
@@ -3243,6 +3728,11 @@ bool run_single_attempt(
       out->response_validation_fail += request_budget;
       break;
     }
+    ctx.tls_session_resumed = gnutls_session_is_resumed(ctx.session) != 0;
+#ifdef GNUTLS_SFLAGS_EARLY_DATA
+    ctx.tls_early_data_accepted = (gnutls_session_get_flags(ctx.session) & GNUTLS_SFLAGS_EARLY_DATA) != 0u;
+#endif
+    ctx.tls_session_ticket_received = tls_ticket_ready(ctx.session);
     out->conn_established += 1;
     if (!init_h3_session(&ctx)) {
       out->handshake_fail += request_budget;
@@ -3399,6 +3889,7 @@ bool run_single_attempt(
           }
         }
       }
+      ctx.tls_session_ticket_received = tls_ticket_ready(ctx.session);
       (void)capture_tls_session_cache(ctx.session, session_cache);
     }
   } while (false);
@@ -3436,6 +3927,11 @@ bool run_single_attempt(
   out->h3_datagram_rx_events += ctx.datagram_rx_events;
   out->h3_server_push_events += ctx.server_push_events;
   out->h3_feature_failures += ctx.feature_failures;
+  out->tls_session_resume_attempted += ctx.tls_session_resume_attempted ? 1 : 0;
+  out->tls_session_resume_applied += ctx.tls_session_resume_applied ? 1 : 0;
+  out->tls_session_resumed += ctx.tls_session_resumed ? 1 : 0;
+  out->tls_early_data_accepted += ctx.tls_early_data_accepted ? 1 : 0;
+  out->tls_session_ticket_received += ctx.tls_session_ticket_received ? 1 : 0;
   out->tx_bytes += ctx.tx_bytes;
   out->rx_bytes += ctx.rx_bytes;
   cleanup_attempt(&ctx);
@@ -3478,8 +3974,21 @@ bool run_h3_ngtcp2_client(
   TlsSessionCache session_cache{};
   session_cache.identity = build_tls_session_identity(tls_verify_name, profile.target_port);
   session_cache.disk_path = resolve_tls_session_cache_file_path();
+  session_cache.ttl_sec = resolve_tls_session_cache_ttl_sec();
+  session_cache.pool_size = resolve_tls_session_cache_pool_size();
   if (!session_cache.disk_path.empty() && !session_cache.identity.empty()) {
-    (void)load_tls_session_cache_file(session_cache.disk_path, session_cache.identity, &session_cache.blob);
+    bool hit = false;
+    (void)load_tls_session_cache_file(
+        session_cache.disk_path,
+        session_cache.identity,
+        session_cache.ttl_sec,
+        session_cache.pool_size,
+        &session_cache.blob,
+        &hit);
+    session_cache.loaded_from_disk = hit;
+    if (hit) {
+      out->tls_cache_load_hit += 1;
+    }
   }
   const int policy_cap = goaway_policy.enabled ? std::max(1, goaway_policy.requests_per_connection) : stream_budget;
   const int configured_conn_pool =
@@ -3516,6 +4025,7 @@ bool run_h3_ngtcp2_client(
     ran = true;
   }
   out->errors = std::max(out->errors, attempted - out->send_ok);
+  out->tls_cache_store_updates += session_cache.store_updates;
   gnutls_global_deinit();
   return ran;
 #else
