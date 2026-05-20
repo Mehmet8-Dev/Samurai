@@ -40,7 +40,26 @@ struct JobEnvelopeV1 {
   std::uint32_t xdp_queue_id;
   std::uint32_t xdp_mode;
   char scenario_payload_ref[64];
-  std::uint8_t pad[3];
+  char protocol[8];
+  char tcp_flags[8];
+  std::uint8_t spoof_enabled;
+  char spoof_mode[16];
+  char spoof_subnet[32];
+  char spoof_list_file[64];
+  std::uint8_t has_payload;
+  char payload_ref[64];
+  std::uint32_t pad_size;
+  std::uint8_t ttl;
+  std::uint8_t tos;
+  std::uint16_t window;
+  std::uint8_t fragment_enabled;
+  std::uint16_t fragment_size;
+  char attack_vector[16];
+  char dns_name[64];
+  char dns_qtype[32];
+  std::uint8_t dns_edns;
+  std::uint8_t dns_recursive;
+  std::uint8_t pad[4];
 };
 
 struct MetricSnapshotV1 {
@@ -80,10 +99,11 @@ enum class WorkerKind : std::uint8_t {
   DOCA = 5,
   L7 = 6,
   DEFENSE = 7,
+  SCENARIO = 8,
 };
 
 static_assert(sizeof(SamuraiWireHeaderV1) == 56, "SamuraiWireHeaderV1 size mismatch");
-static_assert(sizeof(JobEnvelopeV1) == 160, "JobEnvelopeV1 size mismatch");
+static_assert(sizeof(JobEnvelopeV1) == 480, "JobEnvelopeV1 size mismatch");
 static_assert(sizeof(MetricSnapshotV1) == 64, "MetricSnapshotV1 size mismatch");
 
 inline constexpr bool IsHeaderV1Compatible(const SamuraiWireHeaderV1& header) {
