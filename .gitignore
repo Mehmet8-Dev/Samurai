@@ -41,6 +41,7 @@ ddos_samurai/venv/
 .venv/
 env/
 /license_server/
+/build-workers/
 
 # Node
 dashboard/node_modules/

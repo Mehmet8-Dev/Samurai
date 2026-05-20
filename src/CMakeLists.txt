@@ -28,7 +28,6 @@ add_library(
   STATIC
   ../ddos_samurai/cpu_native/amp.cpp
   ../ddos_samurai/cpu_native/common.cpp
-  ../ddos_samurai/cpu_native/engine.cpp
   ../ddos_samurai/cpu_native/packets.cpp
   ../ddos_samurai/cpu_native/pool.cpp
   ../ddos_samurai/cpu_native/spoofing.cpp

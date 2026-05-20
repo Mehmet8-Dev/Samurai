@@ -91,6 +91,13 @@ enum class MessageType : std::uint8_t {
   JOB_DONE = 40,
 };
 
+// Some Linux headers define AF_XDP as a preprocessor macro socket-family value.
+// That macro collides with our enum member name and can break parsing depending
+// on include order (e.g. when sys/socket.h is included before this header).
+#ifdef AF_XDP
+#undef AF_XDP
+#endif
+
 enum class WorkerKind : std::uint8_t {
   CPU = 1,
   GPU = 2,
