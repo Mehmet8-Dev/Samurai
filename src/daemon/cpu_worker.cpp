@@ -3,7 +3,6 @@
 #include <cstring>
 #include <iostream>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <zmq.h>
