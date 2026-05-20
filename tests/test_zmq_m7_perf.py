@@ -240,7 +240,7 @@ def test_m7_worker_crash_recovery_restart_under_budget() -> None:
             self.returncode = -9
 
     mgr = ZmqRuntimeManager()
-    with patch("ddos_samurai.zmq_runtime_manager.shutil_which", return_value=None), patch(
+    with patch("ddos_samurai.zmq_runtime_manager.shutil_which", return_value="/usr/bin/samurai_cpu_worker"), patch(
         "ddos_samurai.zmq_runtime_manager.subprocess.Popen", side_effect=_FakePopen
     ):
         wp1 = mgr.launch_worker(WorkerKind.CPU)

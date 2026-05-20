@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
 from ddos_samurai.zmq_dispatcher import ZmqDispatcher
 from ddos_samurai.zmq_event_collector import ZmqEventCollector
-from ddos_samurai.zmq_runtime_manager import WORKER_PY_MODULES, ZmqRuntimeManager
+from ddos_samurai.zmq_runtime_manager import ZmqRuntimeManager
 from ddos_samurai.zmq_wire import MessageType, WorkerKind, default_event_endpoint, default_job_endpoint
 from ddos_samurai.zmq_worker_prototype import ZmqWorkerPrototype
 
@@ -280,7 +279,7 @@ def test_m3_prototype_happy_path_for_all_workers() -> None:
             dispatcher.close()
 
 
-def test_m3_runtime_manager_fallback_all_worker_modules() -> None:
+def test_m3_runtime_manager_native_only_no_python_fallback() -> None:
     class _FakePopen:
         def __init__(self, cmd, **kwargs):
             self.cmd = list(cmd)
@@ -309,10 +308,10 @@ def test_m3_runtime_manager_fallback_all_worker_modules() -> None:
         "ddos_samurai.zmq_runtime_manager.subprocess.Popen", side_effect=_FakePopen
     ) as popen_mock:
         for kind in WorkerKind:
-            mgr.launch_worker(kind)
+            try:
+                mgr.launch_worker(kind)
+                assert False, f"expected FileNotFoundError for {kind.name}"
+            except FileNotFoundError:
+                pass
 
-    calls = [c.args[0] for c in popen_mock.call_args_list]
-    assert len(calls) == len(list(WorkerKind))
-    expected_modules = {WORKER_PY_MODULES[k] for k in WorkerKind}
-    seen_modules = {cmd[2] for cmd in calls if len(cmd) >= 3 and cmd[:2] == [sys.executable, "-m"]}
-    assert seen_modules == expected_modules
+    assert popen_mock.call_count == 0

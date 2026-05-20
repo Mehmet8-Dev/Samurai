@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from unittest.mock import patch
 
 import pytest
@@ -171,7 +170,7 @@ def test_m2_fail_fast_ack_timeout() -> None:
         )
 
 
-def test_runtime_manager_cpu_fallback_to_python_module() -> None:
+def test_runtime_manager_cpu_requires_native_binary() -> None:
     class _FakePopen:
         def __init__(self, cmd, **kwargs):
             self.cmd = list(cmd)
@@ -199,11 +198,9 @@ def test_runtime_manager_cpu_fallback_to_python_module() -> None:
     with patch("ddos_samurai.zmq_runtime_manager.shutil_which", return_value=None), patch(
         "ddos_samurai.zmq_runtime_manager.subprocess.Popen", side_effect=_FakePopen
     ) as popen_mock:
-        wp = mgr.launch_worker(WorkerKind.CPU)
-        assert wp.running is True
-        assert popen_mock.called
-        cmd = popen_mock.call_args.args[0]
-        assert cmd[:3] == [sys.executable, "-m", "ddos_samurai.zmq_cpu_worker"]
+        with pytest.raises(FileNotFoundError):
+            mgr.launch_worker(WorkerKind.CPU)
+        assert popen_mock.called is False
 
 
 def test_orchestrator_start_worker_zmq_appends_event() -> None:

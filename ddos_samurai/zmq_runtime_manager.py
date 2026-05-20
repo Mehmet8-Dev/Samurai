@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-import sys
 from shutil import which as shutil_which
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,17 +20,6 @@ WORKER_BINARIES: dict[WorkerKind, str] = {
     WorkerKind.L7: "samurai_l7_worker",
     WorkerKind.DEFENSE: "samurai_defense_worker",
     WorkerKind.SCENARIO: "samurai_scenario_worker",
-}
-
-WORKER_PY_MODULES: dict[WorkerKind, str] = {
-    WorkerKind.CPU: "ddos_samurai.zmq_cpu_worker",
-    WorkerKind.GPU: "ddos_samurai.zmq_gpu_worker",
-    WorkerKind.DPDK: "ddos_samurai.zmq_dpdk_worker",
-    WorkerKind.AF_XDP: "ddos_samurai.zmq_afxdp_worker",
-    WorkerKind.DOCA: "ddos_samurai.zmq_doca_worker",
-    WorkerKind.L7: "ddos_samurai.zmq_l7_worker",
-    WorkerKind.DEFENSE: "ddos_samurai.zmq_defense_worker",
-    WorkerKind.SCENARIO: "ddos_samurai.zmq_scenario_worker",
 }
 
 
@@ -80,9 +68,10 @@ class ZmqRuntimeManager:
         binary = self._resolve_binary(kind, search_dir=search_dir)
         cmd = [binary, *(list(extra_args or []))]
         if shutil_which(binary) is None:
-            py_module = WORKER_PY_MODULES[kind]
-            cmd = [sys.executable, "-m", py_module, *(list(extra_args or []))]
-            binary = f"{sys.executable} -m {py_module}"
+            raise FileNotFoundError(
+                f"worker binary not found in PATH: {binary}. "
+                "Build workers and set --zmq-worker-search-dir / SAMURAI_ZMQ_WORKER_DIR."
+            )
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,

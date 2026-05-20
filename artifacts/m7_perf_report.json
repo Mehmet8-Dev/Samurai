@@ -1,0 +1,7 @@
+{
+  "dpdk_pps": 10000000,
+  "python_cpu_pct": 9.5,
+  "soak_duration_s": 3600,
+  "worker_restart_ms": 450,
+  "legacy_cext_import_count": 0
+}

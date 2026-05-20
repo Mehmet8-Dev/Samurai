@@ -24,6 +24,7 @@ class WorkerEvent:
     payload: bytes
     payload_decoded: Any
     endpoint: str
+    last_metric: MetricSnapshotV1 | None = None
 
 
 class ZmqEventCollector:
@@ -48,6 +49,7 @@ class ZmqEventCollector:
         self._linger_ms = int(linger_ms)
         self._bind = bool(bind)
         self._sockets: dict[str, Any] = {}
+        self._last_metric_by_job: dict[tuple[int, int], MetricSnapshotV1] = {}
 
     def close(self) -> None:
         for socket in list(self._sockets.values()):
@@ -56,6 +58,7 @@ class ZmqEventCollector:
             except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
                 pass
         self._sockets.clear()
+        self._last_metric_by_job.clear()
 
     def ensure_worker_channel(self, worker_kind: WorkerKind, endpoint: str | None = None) -> str:
         out_endpoint = str(endpoint or default_event_endpoint(WorkerKind(worker_kind)))
@@ -116,6 +119,7 @@ class ZmqEventCollector:
         overall_timeout_s: float = 120.0,
     ) -> WorkerEvent:
         self.ensure_worker_channel(worker_kind)
+        job_key = (int(WorkerKind(worker_kind)), int(correlation_id))
         start = time.monotonic()
         ack_received = False
         last_heartbeat = start
@@ -152,8 +156,17 @@ class ZmqEventCollector:
                 continue
             if event.header.msg_type == MessageType.METRIC_SNAPSHOT:
                 last_heartbeat = time.monotonic()
+                if isinstance(event.payload_decoded, MetricSnapshotV1):
+                    self._last_metric_by_job[job_key] = event.payload_decoded
                 continue
             if event.header.msg_type in {MessageType.ERROR, MessageType.JOB_DONE}:
-                return event
+                last_metric = self._last_metric_by_job.pop(job_key, None)
+                return WorkerEvent(
+                    header=event.header,
+                    payload=event.payload,
+                    payload_decoded=event.payload_decoded,
+                    endpoint=event.endpoint,
+                    last_metric=last_metric,
+                )
 
             raise WireProtocolError(f"unexpected msg_type for job wait: {event.header.msg_type}")

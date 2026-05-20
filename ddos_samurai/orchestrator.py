@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+import os
 import time
+from pathlib import Path
 from typing import Any
 
+from .metrics_schema import build_empty_stats, recompute_loss_metrics
 from .zmq_dispatcher import ZmqDispatcher
 from .zmq_event_collector import ZmqEventCollector
 from .zmq_runtime_manager import ZmqRuntimeManager
@@ -18,13 +22,7 @@ from .zmq_wire import (
 
 
 def _empty_stats() -> dict:
-    return {
-        "attempted": 0,
-        "sent": 0,
-        "errors": 0,
-        "bytes_sent_est": 0,
-        "status": "ok",
-    }
+    return build_empty_stats(status="ok")
 
 
 def _add_stats(acc: dict, item: dict) -> dict:
@@ -111,6 +109,90 @@ def _update_shared_counters(progress, progress_lock, sent_total, errors_total, *
         errors_total.value += int(errors)
 
 
+def _coerce_bool(raw: Any, default: bool = False) -> bool:
+    if isinstance(raw, bool):
+        return bool(raw)
+    if raw is None:
+        return bool(default)
+    txt = str(raw).strip().lower()
+    if txt in {"1", "true", "yes", "on"}:
+        return True
+    if txt in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _resolve_worker_search_dir(args: dict) -> str | None:
+    explicit = str(args.get("zmq_worker_search_dir", "") or "").strip()
+    if explicit:
+        return explicit
+    env_dir = str(os.environ.get("SAMURAI_ZMQ_WORKER_DIR", "") or "").strip()
+    if env_dir:
+        return env_dir
+    repo_root = Path(__file__).resolve().parents[1]
+    auto = repo_root / "build-workers"
+    if auto.exists():
+        return str(auto)
+    return None
+
+
+def _snapshot_loss_telemetry(args: dict) -> dict[str, Any] | None:
+    try:
+        from . import loss_telemetry
+
+        iface = str(args.get("loss_iface", args.get("iface", "")) or "").strip() or None
+        return dict(loss_telemetry.snapshot(iface=iface))
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+        return None
+
+
+def _attach_loss_telemetry_delta(args: dict, worker_stats: dict, before: dict[str, Any] | None, after: dict[str, Any] | None) -> None:
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return
+    try:
+        from . import loss_telemetry
+
+        d = dict(loss_telemetry.delta(before, after) or {})
+        worker_stats.update(d)
+        iface = str(args.get("loss_iface", args.get("iface", "")) or "").strip()
+        if iface:
+            worker_stats.setdefault("iface", iface)
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+        return
+
+
+def _prepare_scenario_payload_ref(args: dict, *, worker_id: int, job_id: str) -> tuple[str, list[str]]:
+    existing = str(args.get("scenario_payload_ref", "") or "").strip()
+    if existing:
+        return existing, []
+
+    scenario_mode = str(args.get("scenario_mode", "off") or "off").strip().lower()
+    if scenario_mode not in {"shadow", "enforce"}:
+        return "", []
+
+    sessions = list(args.get("scenario_sessions") or [])
+    if not sessions:
+        return "", []
+
+    out_dir = str(args.get("scenario_payload_dir", os.environ.get("SAMURAI_SCENARIO_PAYLOAD_DIR", "/tmp")) or "/tmp").strip()
+    os.makedirs(out_dir, exist_ok=True)
+    safe_job = "".join(c if (str(c).isalnum() or str(c) in {"-", "_"}) else "_" for c in str(job_id))[:64] or "job"
+    out_path = os.path.join(out_dir, f"samurai_scenario_{safe_job}_{int(worker_id)}.json")
+    payload = {
+        "schema_version": 1,
+        "job_id": str(job_id),
+        "worker_id": int(worker_id),
+        "scenario_mode": scenario_mode,
+        "created_ts_ns": int(time.time_ns()),
+        "sessions": sessions,
+        "runtime_metrics": dict(args.get("scenario_runtime_metrics") or {}),
+        "runtime_batches": list(args.get("scenario_runtime_batches") or []),
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return str(out_path), [str(out_path)]
+
+
 def start_worker_zmq(
     worker_id,
     args,
@@ -140,15 +222,24 @@ def start_worker_zmq(
     collector: ZmqEventCollector | None = None
     runtime: ZmqRuntimeManager | None = None
     worker_kind: WorkerKind | None = None
+    telemetry_before: dict[str, Any] | None = None
+    telemetry_after: dict[str, Any] | None = None
+    scenario_payload_ref, scenario_payload_temp_paths = _prepare_scenario_payload_ref(
+        dict(args or {}),
+        worker_id=int(worker_id),
+        job_id=job_id,
+    )
 
     try:
         worker_kind = _resolve_worker_kind_for_zmq(args)
         job_endpoint = str(args.get("zmq_job_endpoint", "") or default_job_endpoint(worker_kind))
         event_endpoint = str(args.get("zmq_event_endpoint", "") or default_event_endpoint(worker_kind))
+        worker_search_dir = _resolve_worker_search_dir(args)
 
         runtime = ZmqRuntimeManager()
         runtime.launch_worker(
             worker_kind,
+            search_dir=worker_search_dir,
             extra_args=[
                 "--job-endpoint",
                 job_endpoint,
@@ -164,13 +255,15 @@ def start_worker_zmq(
         collector = ZmqEventCollector(bind=True)
         collector.ensure_worker_channel(worker_kind, endpoint=event_endpoint)
 
+        telemetry_before = _snapshot_loss_telemetry(args)
+
         dispatcher = ZmqDispatcher()
         dispatcher.dispatch_start_job(
             worker_kind=worker_kind,
             correlation_id=correlation_id,
             job_id=job_id,
             args=args,
-            scenario_payload_ref=str(args.get("scenario_payload_ref", "") or ""),
+            scenario_payload_ref=scenario_payload_ref,
             endpoint=job_endpoint,
         )
 
@@ -188,6 +281,16 @@ def start_worker_zmq(
         elif terminal.header.msg_type == MessageType.JOB_DONE:
             if isinstance(terminal.payload_decoded, dict):
                 worker_stats.update(dict(terminal.payload_decoded))
+            last_metric = getattr(terminal, "last_metric", None)
+            if last_metric is not None:
+                worker_stats.setdefault("packets_sent", int(last_metric.packets_sent))
+                worker_stats.setdefault("packets_errors", int(last_metric.packets_errors))
+                worker_stats.setdefault("bytes_sent", int(last_metric.bytes_sent))
+                worker_stats.setdefault("actual_rps", float(last_metric.actual_rps))
+                worker_stats.setdefault("jitter_p99_ns", float(last_metric.jitter_p99_ns))
+                worker_stats.setdefault("rate_accuracy_pct", float(last_metric.rate_accuracy_pct))
+                worker_stats.setdefault("busywait_cycles", int(last_metric.busywait_cycles))
+                worker_stats.setdefault("sleep_calls", int(last_metric.sleep_calls))
         else:
             worker_status = "failed"
             worker_error = f"unexpected_terminal_msg_type:{int(terminal.header.msg_type)}"
@@ -195,6 +298,7 @@ def start_worker_zmq(
         worker_status = "failed"
         worker_error = str(exc)
     finally:
+        telemetry_after = _snapshot_loss_telemetry(args)
         try:
             if dispatcher is not None and worker_kind is not None:
                 try:
@@ -218,6 +322,13 @@ def start_worker_zmq(
                 runtime.stop_worker(worker_kind, timeout_s=1.0)
         except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
             pass
+        for path in list(scenario_payload_temp_paths or []):
+            try:
+                os.remove(path)
+            except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+                pass
+
+    _attach_loss_telemetry_delta(args, worker_stats, telemetry_before, telemetry_after)
 
     attempted = int(worker_stats.get("attempted", args.get("count", 0)) or 0)
     sent = int(worker_stats.get("sent", worker_stats.get("packets_sent", 0)) or 0)
@@ -231,6 +342,9 @@ def start_worker_zmq(
     worker_stats["sent"] = int(sent)
     worker_stats["errors"] = int(errors)
     worker_stats["bytes_sent_est"] = int(worker_stats.get("bytes_sent_est", worker_stats.get("bytes_sent", 0)) or 0)
+    worker_stats["status"] = str(worker_status)
+    worker_stats["error"] = str(worker_error)
+    recompute_loss_metrics(worker_stats, inplace=True)
 
     _update_shared_counters(
         progress,
@@ -254,6 +368,7 @@ def start_worker_zmq(
                 "status": str(worker_status),
                 "error": str(worker_error),
                 "duration_s": float(max(0.0, time.time() - worker_started)),
+                "scenario_payload_ref": str(scenario_payload_ref),
                 "stats": dict(worker_stats),
             }
         )
