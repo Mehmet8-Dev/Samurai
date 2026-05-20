@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
+from shutil import which as shutil_which
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -65,6 +67,9 @@ class ZmqRuntimeManager:
 
         binary = self._resolve_binary(kind, search_dir=search_dir)
         cmd = [binary, *(list(extra_args or []))]
+        if kind == WorkerKind.CPU and shutil_which(binary) is None:
+            cmd = [sys.executable, "-m", "ddos_samurai.zmq_cpu_worker", *(list(extra_args or []))]
+            binary = f"{sys.executable} -m ddos_samurai.zmq_cpu_worker"
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,

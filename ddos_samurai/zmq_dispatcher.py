@@ -23,14 +23,21 @@ class DispatchResult:
 class ZmqDispatcher:
     """Control-plane sender for worker command channels (PUSH -> PULL)."""
 
-    def __init__(self, *, context: Any | None = None, linger_ms: int = 0) -> None:
-        try:
-            import zmq  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError("pyzmq is required for ZmqDispatcher") from exc
+    def __init__(
+        self,
+        *,
+        context: Any | None = None,
+        linger_ms: int = 0,
+        zmq_module: Any | None = None,
+    ) -> None:
+        if zmq_module is None:
+            try:
+                import zmq as zmq_module  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError("pyzmq is required for ZmqDispatcher") from exc
 
-        self._zmq = zmq
-        self._context = context if context is not None else zmq.Context.instance()
+        self._zmq = zmq_module
+        self._context = context if context is not None else self._zmq.Context.instance()
         self._linger_ms = int(linger_ms)
         self._sockets: dict[str, Any] = {}
 
