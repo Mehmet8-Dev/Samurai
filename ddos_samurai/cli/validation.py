@@ -560,6 +560,10 @@ def _validate_sender_route_args(parser: argparse.ArgumentParser, args: argparse.
         parser.error("Hata: --quic-expect-header-value-contains en fazla 159 karakter olmalıdır.")
     if len(str(getattr(args, "quic_expect_body_substring", "") or "")) > 159:
         parser.error("Hata: --quic-expect-body-substring en fazla 159 karakter olmalıdır.")
+    if l7_quic_auto_bridge:
+        parser.error("Hata: --l7-quic-auto-bridge kaldırıldı (fallback yok).")
+    if l7_quic_bridge_autopromote:
+        parser.error("Hata: --l7-quic-bridge-autopromote kaldırıldı (fallback yok).")
     if sender_backend not in {"xdp", "dpdk"}:
         parser.error("Hata: --sender-backend yalnızca xdp veya dpdk olabilir.")
     if fallback_policy != "fail":

@@ -1193,20 +1193,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--l7-quic-auto-bridge",
         action="store_true",
-        default=str(os.environ.get("SAMURAI_L7_QUIC_AUTO_BRIDGE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
-        help="Native QUIC yoksa py-bridge yolunu otomatik etkinleştir.",
+        default=False,
+        help="DEPRECATED (no-op): py-bridge fallback kaldırıldı.",
     )
     parser.add_argument(
         "--l7-quic-bridge-autopromote",
         action="store_true",
-        default=str(os.environ.get("SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
-        help="Capability map içinde py-bridge'i otomatik custom_native olarak terfi ettir.",
+        default=False,
+        help="DEPRECATED (no-op): py-bridge autopromote kaldırıldı.",
     )
     parser.add_argument(
         "--l7-fallback-policy",
-        choices=["allow", "fail"],
-        default=str(os.environ.get("SAMURAI_L7_FALLBACK_POLICY", "allow") or "allow"),
-        help="L7 C->Python fallback politikası: allow|fail.",
+        choices=["fail"],
+        default="fail",
+        help="L7 fallback policy: fail (python fallback kaldırıldı).",
     )
     parser.add_argument(
         "--l7-capability-strict",
