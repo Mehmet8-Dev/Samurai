@@ -129,6 +129,20 @@ def test_m3_cmake_has_all_worker_targets() -> None:
     assert "pacing_engine_static" in cmake
     assert "cpu_native_static" in cmake
     assert "target_link_libraries(samurai_cpu_worker PRIVATE pacing_engine_static cpu_native_static pthread)" in cmake
+    assert "pkg_check_modules(DPDK QUIET libdpdk)" in cmake
+    assert "target_link_libraries(samurai_dpdk_worker PRIVATE pacing_engine_static cpu_native_static pthread)" in cmake
+    assert "target_compile_definitions(samurai_dpdk_worker PRIVATE SAMURAI_WITH_DPDK=1)" in cmake
+
+
+def test_m3_dpdk_worker_has_native_tx_path_and_failfast_fallback() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "src" / "daemon" / "dpdk_worker.cpp").read_text(encoding="utf-8")
+    assert "EnsureEalOnce" in src
+    assert "rte_eth_tx_burst" in src
+    assert "MessageType::HEARTBEAT" in src
+    assert "MessageType::METRIC_SNAPSHOT" in src
+    assert "dpdk_not_built" in src
+    assert "SAMURAI_WITH_DPDK" in src
 
 
 def test_m3_prototype_happy_path_for_all_workers() -> None:
