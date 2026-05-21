@@ -66,7 +66,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libpcap-dev
+          sudo apt-get install -y --no-install-recommends \
+            libpcap-dev libzmq3-dev cppzmq-dev cmake build-essential
 
       - name: Install Python dependencies
         run: |
@@ -76,6 +77,11 @@ jobs:
 
       - name: Build C extensions
         run: python setup.py build_ext --inplace
+
+      - name: Build ZMQ worker binaries
+        run: |
+          cmake -S src -B build-workers
+          cmake --build build-workers -j"$(nproc)"
 
       - name: RFC Positive + Negative
         run: |
@@ -91,7 +97,7 @@ jobs:
           SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_ci.json" \
           pytest tests/test_benchmark_ci.py -q -rs
 
-      - name: Full Benchmark Summary
+      - name: Full Benchmark Summary (Current ZMQ Architecture)
         run: |
           if [ "${{ inputs.use_sudo }}" = "true" ]; then
             sudo -E env \
@@ -100,13 +106,13 @@ jobs:
               SAMURAI_LOSS_FAIL_PCT=5 \
               SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_full.json" \
               SAMURAI_LOSS_REPORT_OUT="${{ github.workspace }}/artifacts/loss_telemetry_full.json" \
-              pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
+              pytest tests/test_benchmark_ci.py tests/test_benchmark_profiles.py tests/test_zmq_m7_perf.py tests/test_loss_telemetry_full.py -q -rs
           else
             SAMURAI_LOSS_TELEMETRY=1 \
             SAMURAI_LOSS_FAIL_PCT=5 \
             SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_full.json" \
             SAMURAI_LOSS_REPORT_OUT="${{ github.workspace }}/artifacts/loss_telemetry_full.json" \
-            pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
+            pytest tests/test_benchmark_ci.py tests/test_benchmark_profiles.py tests/test_zmq_m7_perf.py tests/test_loss_telemetry_full.py -q -rs
           fi
 
       - name: Export updated baseline candidate
@@ -172,10 +178,12 @@ jobs:
           if command -v apt-get >/dev/null 2>&1; then
             if [ "$(id -u)" -eq 0 ]; then
               apt-get update
-              apt-get install -y --no-install-recommends libpcap-dev
+              apt-get install -y --no-install-recommends \
+                libpcap-dev libzmq3-dev cppzmq-dev cmake build-essential
             elif command -v sudo >/dev/null 2>&1; then
               sudo apt-get update
-              sudo apt-get install -y --no-install-recommends libpcap-dev
+              sudo apt-get install -y --no-install-recommends \
+                libpcap-dev libzmq3-dev cppzmq-dev cmake build-essential
             else
               echo "apt-get present but sudo missing and not root; skipping libpcap install"
             fi
@@ -192,6 +200,11 @@ jobs:
       - name: Build C extensions
         run: python setup.py build_ext --inplace
 
+      - name: Build ZMQ worker binaries
+        run: |
+          cmake -S src -B build-workers
+          cmake --build build-workers -j"$(nproc)"
+
       - name: RFC Positive + Negative
         run: |
           mkdir -p artifacts
@@ -206,7 +219,7 @@ jobs:
           SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_ci.json" \
           pytest tests/test_benchmark_ci.py -q -rs
 
-      - name: Full Benchmark Summary
+      - name: Full Benchmark Summary (Current ZMQ Architecture)
         run: |
           if [ "${{ inputs.use_sudo }}" = "true" ] && command -v sudo >/dev/null 2>&1; then
             sudo -E env \
@@ -215,13 +228,13 @@ jobs:
               SAMURAI_LOSS_FAIL_PCT=5 \
               SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_full.json" \
               SAMURAI_LOSS_REPORT_OUT="${{ github.workspace }}/artifacts/loss_telemetry_full.json" \
-              pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
+              pytest tests/test_benchmark_ci.py tests/test_benchmark_profiles.py tests/test_zmq_m7_perf.py tests/test_loss_telemetry_full.py -q -rs
           else
             SAMURAI_LOSS_TELEMETRY=1 \
             SAMURAI_LOSS_FAIL_PCT=5 \
             SAMURAI_BENCH_REPORT_OUT="${{ github.workspace }}/artifacts/benchmark_summary_full.json" \
             SAMURAI_LOSS_REPORT_OUT="${{ github.workspace }}/artifacts/loss_telemetry_full.json" \
-            pytest tests/test_benchmark_full.py tests/test_pacing_root.py tests/test_loss_telemetry_full.py -q -rs
+            pytest tests/test_benchmark_ci.py tests/test_benchmark_profiles.py tests/test_zmq_m7_perf.py tests/test_loss_telemetry_full.py -q -rs
           fi
 
       - name: Export updated baseline candidate

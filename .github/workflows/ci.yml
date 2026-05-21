@@ -142,25 +142,48 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libpcap-dev libssl-dev openssl \
-            libgnutls28-dev libngtcp2-dev libnghttp3-dev libngtcp2-crypto-gnutls-dev pkg-config
+            libgnutls28-dev libngtcp2-dev libnghttp3-dev libngtcp2-crypto-gnutls-dev pkg-config \
+            libzmq3-dev cppzmq-dev cmake build-essential
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -e .
           python -m pip install pytest PyYAML requests aiohttp websockets "httpx[http2]" rich colorama psutil
-          python -m pip install grpcio grpcio-tools grpcio-health-checking "protobuf>=4.25,<5.0"
+          python -m pip install "grpcio>=1.62,<1.63" "grpcio-tools>=1.62,<1.63" "grpcio-health-checking>=1.62,<1.63" "protobuf>=4.25,<5.0"
 
       - name: Build C extensions (smoke)
         run: python setup.py build_ext --inplace
 
+      - name: Build ZMQ worker binaries
+        run: |
+          cmake -S src -B build-workers
+          cmake --build build-workers -j"$(nproc)"
+
       - name: Verify benchmark baseline exists
         run: test -f benchmarks/benchmark_baseline_ci.json
 
-      - name: Run backend test suite
+      - name: Run backend test suite (ZMQ + L7 + Scenario + Telemetry)
         run: |
           mkdir -p artifacts
-          pytest tests -q -rs
+          pytest -q -rs \
+            tests/test_zmq_wire_contract.py \
+            tests/test_zmq_m2_cpu_proto.py \
+            tests/test_zmq_m3_workers.py \
+            tests/test_zmq_m4_orchestrator.py \
+            tests/test_zmq_m6_cleanup.py \
+            tests/test_zmq_m7_perf.py \
+            tests/test_l7_policy.py \
+            tests/test_l7_quic_mode.py \
+            tests/test_l7_native_scenario_trace.py \
+            tests/test_l7_result_normalization.py \
+            tests/test_cli_runtime_scenario_backend.py \
+            tests/test_scenario_engine.py \
+            tests/test_scenario_engine_upgrade.py \
+            tests/test_scenario_l4_runtime.py \
+            tests/test_reporting.py \
+            tests/test_kpi_gate.py \
+            tests/test_loss_telemetry.py
 
       - name: RFC Gate
         run: |

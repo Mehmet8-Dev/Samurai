@@ -23,14 +23,14 @@ TEST_SUITES = [
         "description": "TX_RING buffer, socket yapısı, frame positioning"
     },
     {
-        "name": "Detailed Sender & GPU Tests (Suite 11-20)",
+        "name": "Detailed GPU Contract Tests",
         "file": "test_senders_gpu_detailed.py",
-        "description": "Gateway resolution, TX_RING options, GPU batch sizing, payload offsets"
+        "description": "GPU batch sizing, payload offsets, backend contract assertions"
     },
     {
-        "name": "GPU CUDA Kernel Tests (Suite 17-20)",
-        "file": "test_gpu_cuda_details.py",
-        "description": "CUDA thread model, memory hierarchy, kernel execution, performance"
+        "name": "ZMQ Worker Contract Tests",
+        "file": "test_zmq_m3_workers.py",
+        "description": "Worker source/target wiring and M3 contract checks"
     },
 ]
 

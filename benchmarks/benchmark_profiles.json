@@ -73,7 +73,12 @@
       "pytest_args": [
         "-m",
         "pytest",
-        "tests/test_benchmark_l7_ci.py",
+        "tests/test_l7_policy.py",
+        "tests/test_l7_quic_mode.py",
+        "tests/test_l7_native_scenario_trace.py",
+        "tests/test_l7_result_normalization.py",
+        "tests/test_cli_runtime_scenario_backend.py",
+        "tests/test_benchmark_ci.py",
         "-q",
         "-rs"
       ],
@@ -145,7 +150,8 @@
         "-m",
         "pytest",
         "tests/native_gpu/test_cuda_backend_bridge.py",
-        "tests/test_benchmark_full.py",
+        "tests/test_zmq_m7_perf.py",
+        "tests/test_benchmark_ci.py",
         "-q",
         "-rs"
       ],
@@ -181,8 +187,8 @@
       "pytest_args": [
         "-m",
         "pytest",
-        "tests/test_benchmark_full.py",
-        "tests/test_pacing_root.py",
+        "tests/test_zmq_m7_perf.py",
+        "tests/test_benchmark_ci.py",
         "tests/test_loss_telemetry_full.py",
         "-q",
         "-rs"

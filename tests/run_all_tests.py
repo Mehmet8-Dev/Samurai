@@ -98,7 +98,12 @@ def main():
     # Test file'larını bul
     test_files = [
         test_dir / "test_comprehensive_full.py",
-        test_dir / "test_sender_comprehensive.py",
+        test_dir / "test_zmq_wire_contract.py",
+        test_dir / "test_zmq_m2_cpu_proto.py",
+        test_dir / "test_zmq_m3_workers.py",
+        test_dir / "test_zmq_m4_orchestrator.py",
+        test_dir / "test_zmq_m6_cleanup.py",
+        test_dir / "test_zmq_m7_perf.py",
     ]
     
     print_section("TEST FILES DETECTED")
