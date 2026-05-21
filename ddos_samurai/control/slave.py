@@ -167,13 +167,32 @@ def run_distributed_slave(args, parser) -> int:
     except Exception:
         pass
     worker_id = socket.gethostname()
-    reg = client.register_worker(
-        worker_id=worker_id,
-        hostname=worker_id,
-        capabilities=capabilities,
-    )
+    register_timeout_s = max(5, int(getattr(args, "slave_master_timeout_s", 10) or 10))
+    register_deadline = time.time() + float(register_timeout_s)
+    reg = {}
+    last_register_exc = None
+    while time.time() < register_deadline:
+        try:
+            reg = client.register_worker(
+                worker_id=worker_id,
+                hostname=worker_id,
+                capabilities=capabilities,
+            )
+            if bool(reg.get("accepted", False)):
+                last_register_exc = None
+                break
+            utils.log_critical(f"Master worker kaydını reddetti: {reg.get('rejection_reason', 'unknown')}")
+            return 1
+        except Exception as exc:
+            last_register_exc = exc
+            time.sleep(0.25)
     if not bool(reg.get("accepted", False)):
-        utils.log_critical(f"Master worker kaydını reddetti: {reg.get('rejection_reason', 'unknown')}")
+        reason = "timeout"
+        if last_register_exc is not None:
+            reason = f"{type(last_register_exc).__name__}: {last_register_exc}"
+        utils.log_critical(
+            f"Master worker kaydı başarısız: endpoint={','.join(client.endpoints)} reason={reason}"
+        )
         return 1
     utils.log_info(f"Distributed slave connected: endpoints={','.join(client.endpoints)}")
     stats_stream_enabled = bool(getattr(args, "stats_stream_enable", True))
