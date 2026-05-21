@@ -185,6 +185,11 @@ jobs:
             tests/test_kpi_gate.py \
             tests/test_loss_telemetry.py
 
+      - name: Run RFC negative suite (produce gate report)
+        run: |
+          mkdir -p artifacts
+          pytest tests/test_rfc_negative.py -q -rs
+
       - name: RFC Gate
         run: |
           python tests/test_rfc_gate_ci.py --report artifacts/rfc_negative_report.json --min-score 100
