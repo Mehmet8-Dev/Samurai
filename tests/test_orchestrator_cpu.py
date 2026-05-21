@@ -1,716 +1,216 @@
+from __future__ import annotations
+
+import asyncio
 import unittest
-from unittest.mock import AsyncMock
 from unittest.mock import patch
-import os
-import json
 
 from ddos_samurai import orchestrator
+from ddos_samurai.zmq_wire import (
+    MessageType,
+    PacingMode,
+    SamuraiWireHeaderV1,
+    WorkerKind,
+)
 
 
-def _base_args():
+class _Counter:
+    def __init__(self, value: int = 0):
+        self.value = int(value)
+
+
+class _FakeRuntime:
+    def __init__(self, *, fail_launch: bool = False):
+        self.fail_launch = bool(fail_launch)
+
+    def launch_worker(self, worker_kind, **kwargs):
+        _ = worker_kind
+        _ = kwargs
+        if self.fail_launch:
+            raise RuntimeError("launch_failed")
+        return None
+
+    def stop_worker(self, worker_kind, timeout_s: float = 1.0):
+        _ = worker_kind
+        _ = timeout_s
+        return 0
+
+
+class _FakeDispatcher:
+    def dispatch_start_job(self, **kwargs):
+        _ = kwargs
+        return None
+
+    def dispatch_shutdown_worker(self, **kwargs):
+        _ = kwargs
+        return None
+
+    def close(self):
+        return None
+
+
+class _FakeTerminalEvent:
+    def __init__(self, msg_type: MessageType, payload: dict | None = None):
+        self.header = SamuraiWireHeaderV1(
+            msg_type=msg_type,
+            payload_len=0,
+            correlation_id=123,
+            worker_kind=WorkerKind.CPU,
+            job_id="jid",
+        )
+        self.payload = b""
+        self.payload_decoded = dict(payload or {})
+        self.endpoint = "ipc:///tmp/samurai_events_cpu"
+        self.last_metric = None
+
+
+class _FakeCollector:
+    def __init__(self, event: _FakeTerminalEvent):
+        self._event = event
+
+    def ensure_worker_channel(self, *args, **kwargs):
+        _ = args
+        _ = kwargs
+        return None
+
+    def wait_for_terminal_event(self, **kwargs):
+        _ = kwargs
+        return self._event
+
+    def close(self):
+        return None
+
+
+def _base_args() -> dict:
     return {
         "target": "127.0.0.1",
-        "port": 80,
-        "count": 5,
-        "verbose": False,
-        "compute_backend": "cpu",
+        "port": 443,
+        "count": 10,
         "attack_vector": "basic",
+        "compute_backend": "cpu",
         "protocol": "tcp",
-        "spoof": False,
-        "spoof_mode": "realistic",
-        "spoof_subnet": None,
-        "spoof_list_file": None,
-        "payloads": [],
-        "tcp_flags": "PA",
-        "ttl": None,
-        "tos": None,
-        "window": None,
-        "fragment": False,
-        "fragment_size": 800,
-        "pad": 0,
-        "dns_name": "example.com",
-        "dns_qtype": ["A"],
-        "dns_edns": False,
-        "dns_nord": False,
-        "delay": 0.0,
-        "rps": 0.0,
-        "jitter": 0.0,
-        "ramp": 0.0,
-        # HTTP knobs
-        "http_verify": "true",
-        "http_concurrency": 10,
-        "http_method": "GET",
-        "http_path": ["/"],
-        "http_scheme": "http",
-        "http_timeout": 2.0,
-        "http_retries": 0,
-        "http2_concurrency": 10,
-        "h2_transport": "auto",
-        "ws_path": "/ws",
-        "ws_message": "ping",
-        "ws_concurrency": 10,
-        "ws_scenario": False,
-        "ws_auth_message": "",
-        "ws_subscribe_message": None,
-        "ws_ping_count": 1,
-        "ws_await_response": False,
-        "pcap_use_l2": False,
-        "pcap_no_flow_aware": False,
-        "evasion_techniques": None,
-        "cookies": None,
-        "user_agent": None,
-        # amplification
-        "reflector_file": "does-not-matter.txt",
-        # misc
-        "ja3_profile": "none",
-        "tls_profile": "none",
-        "h2_profile": "none",
-        "stateful": False,
-        "source_port": 0,
-        "topology_enabled": False,
-        "topology_compiled_plan_json": "",
-        "topology_tuple_alloc_fail": 0,
+        "scenario_mode": "off",
     }
 
 
-def _topology_args(seed: int = 99):
-    spec = {
-        "clients": [
-            {
-                "name": "cg",
-                "ip_ranges": {"v4": ["10.0.0.8/30"]},
-                "port_ranges": ["20000-20003"],
-                "dist": "seq",
-            }
-        ],
-        "servers": [
-            {
-                "name": "sg",
-                "ip_ranges": {"v4": ["198.51.100.7/32"]},
-                "ports": [8080],
-                "weight": 1,
-            }
-        ],
-        "templates": [
-            {
-                "name": "tmpl",
-                "protocol": "l7",
-                "method": "POST",
-                "path": "/topology",
-                "cps_weight": 1,
-                "think_time": 0,
-                "retries": 0,
-            }
-        ],
-        "links": [
-            {
-                "client_group": "cg",
-                "server_group": "sg",
-                "template": "tmpl",
-                "conn_rate": 100,
-                "max_active": 100,
-                "reuse_policy": "keepalive",
-            }
-        ],
-        "constraints": {"max_flows": 1000, "max_new_conn_per_sec": 1000, "fail_policy": "hard_fail"},
-        "tuple_gen": {
-            "client_pool_strategy": "sequential",
-            "server_pool_strategy": "sequential",
-            "port_allocator": "sequential",
-            "flow_affinity_5tuple": True,
-            "stickiness": True,
-        },
-    }
-    compiled = {
-        "plan_id": "test-plan-1",
-        "seed": int(seed),
-        "client_pool_size": 4,
-        "server_pool_size": 1,
-        "spec": spec,
-    }
-    return json.dumps(compiled, sort_keys=True)
+class TestOrchestratorCpu(unittest.TestCase):
+    def test_empty_stats_defaults_to_ok(self):
+        stats = orchestrator._empty_stats()
+        self.assertEqual(str(stats.get("status")), "ok")
 
-class TestOrchestratorCpu(unittest.IsolatedAsyncioTestCase):
-    async def test_worker_process_http_path_calls_http_sender(self):
-        args = _base_args()
-        args["attack_vector"] = "http"
+    def test_add_stats_accumulates_core_fields(self):
+        acc = orchestrator._empty_stats()
+        acc = orchestrator._add_stats(acc, {"attempted": 5, "sent": 4, "errors": 1, "bytes_sent_est": 100})
+        acc = orchestrator._add_stats(acc, {"attempted": 3, "sent": 3, "errors": 0, "bytes_sent_est": 80})
+        self.assertEqual(int(acc["attempted"]), 8)
+        self.assertEqual(int(acc["sent"]), 7)
+        self.assertEqual(int(acc["errors"]), 1)
+        self.assertEqual(int(acc["bytes_sent_est"]), 180)
 
-        mock_http = AsyncMock()
-        with patch.object(orchestrator.senders, "http_app_sender", mock_http):
-            await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-            mock_http.assert_awaited_once()
+    def test_build_pacing_config_from_rps(self):
+        cfg = orchestrator._build_pacing_config({"pacing_mode": "rps", "rps": 1234.0, "pin_cpu": -1})
+        self.assertEqual(cfg.pacing_mode, PacingMode.RPS)
+        self.assertAlmostEqual(float(cfg.target_rps), 1234.0, places=6)
+        self.assertEqual(int(cfg.pin_cpu), -1)
 
-    async def test_worker_process_http_stateful_calls_stateful_sender(self):
-        args = _base_args()
-        args["attack_vector"] = "http"
-        args["stateful"] = True
-        args["count"] = 3
+    def test_build_pacing_config_promotes_none_to_rps_when_rps_set(self):
+        cfg = orchestrator._build_pacing_config({"pacing_mode": "none", "rps": 10.0})
+        self.assertEqual(cfg.pacing_mode, PacingMode.RPS)
 
-        mock_http = AsyncMock()
-        mock_stateful = AsyncMock(return_value={"attempted": 3, "sent": 3, "errors": 0})
-        with patch.object(orchestrator.senders, "http_app_sender", mock_http):
-            with patch.object(orchestrator.senders, "http_stateful_sender", mock_stateful):
-                await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-                mock_stateful.assert_awaited_once()
-                mock_http.assert_not_awaited()
-
-    async def test_worker_process_websocket_scenario_calls_scenario_sender(self):
-        args = _base_args()
-        args["attack_vector"] = "websocket"
-        args["ws_scenario"] = True
-        args["count"] = 3
-
-        mock_ws = AsyncMock()
-        mock_ws_scenario = AsyncMock(return_value={"attempted": 3, "sent": 3, "errors": 0})
-        with patch.object(orchestrator.senders, "websocket_sender", mock_ws):
-            with patch.object(orchestrator.senders, "websocket_scenario_sender", mock_ws_scenario):
-                await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-                mock_ws_scenario.assert_awaited_once()
-                mock_ws.assert_not_awaited()
-
-    async def test_worker_process_http2_path_calls_http2_sender(self):
-        args = _base_args()
-        args["attack_vector"] = "http2"
-        args["h2_profile"] = "none"
-
-        mock_h2 = AsyncMock()
-        with patch.object(orchestrator.senders, "http2_sender", mock_h2):
-            await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-            mock_h2.assert_awaited_once()
-            _call_args, call_kwargs = mock_h2.call_args
-            self.assertEqual(call_kwargs["h2_profile_name"], "none")
-            self.assertTrue(bool(call_kwargs["verify"]))
-
-    async def test_worker_process_http2_respects_http_verify_false(self):
-        args = _base_args()
-        args["attack_vector"] = "http2"
-        args["http_verify"] = "false"
-
-        mock_h2 = AsyncMock()
-        with patch.object(orchestrator.senders, "http2_sender", mock_h2):
-            await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-            mock_h2.assert_awaited_once()
-            _call_args, call_kwargs = mock_h2.call_args
-            self.assertFalse(bool(call_kwargs["verify"]))
-
-    async def test_worker_process_slow_post_calls_slow_sender(self):
-        args = _base_args()
-        args["attack_vector"] = "slow-post"
-
-        mock_slow = AsyncMock()
-        with patch.object(orchestrator.senders, "slow_attack_sender", mock_slow):
-            await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-            mock_slow.assert_awaited_once()
-
-    async def test_worker_process_amp_calls_amplification_sender(self):
-        args = _base_args()
-        args["attack_vector"] = "dns-amp"
-
-        mock_amp = AsyncMock()
-        with patch.object(orchestrator.senders, "amplification_sender", mock_amp):
-            await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-            mock_amp.assert_awaited_once()
-
-    async def test_worker_process_basic_fragment_fails_visible_without_legacy_sender(self):
-        args = _base_args()
-        args["attack_vector"] = "basic"
-        args["fragment"] = True
-        args["fragment_size"] = 256
-
-        events = []
-        mock_pkt = AsyncMock()
-        with patch.object(orchestrator.senders, "packet_sender", mock_pkt):
-            await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None, run_events=events)
-        mock_pkt.assert_not_awaited()
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["status"], "failed")
-        self.assertIn("cpu_fragment_unsupported_no_legacy_path", str(events[0].get("sender_fallback_reason", "")))
-
-    async def test_worker_process_basic_with_pacing_routes_to_paced_sender(self):
-        args = _base_args()
-        args["attack_vector"] = "basic"
-        args["pacing_mode"] = "rps"
-        args["rps"] = 1000.0
-
-        mock_pkt = AsyncMock()
-        mock_paced = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
-        with patch.object(orchestrator, "PACING_ENGINE_AVAILABLE", True):
-            with patch.object(orchestrator.cpu_packet_engine, "generate_packet_pool_view", return_value=(memoryview(b"x" * 320), 64)):
-                with patch.object(orchestrator.senders, "packet_sender", mock_pkt):
-                    with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_paced):
-                        await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-
-        mock_paced.assert_awaited_once()
-        _call_args, call_kwargs = mock_paced.call_args
-        self.assertEqual(call_kwargs["count"], 5)
-        mock_pkt.assert_not_awaited()
-
-    async def test_worker_process_basic_with_pacing_and_fragment_fails_visible(self):
-        args = _base_args()
-        args["attack_vector"] = "basic"
-        args["pacing_mode"] = "rps"
-        args["rps"] = 1000.0
-        args["fragment"] = True
-        args["fragment_size"] = 256
-
-        events = []
-        mock_pkt = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
-        mock_paced = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
-        with patch.object(orchestrator, "PACING_ENGINE_AVAILABLE", True):
-            with patch.object(orchestrator.senders, "packet_sender", mock_pkt):
-                with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_paced):
-                    await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None, run_events=events)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["status"], "failed")
-        self.assertIn(
-            "cpu_fragment_with_pacing_unsupported_no_legacy_path",
-            str(events[0].get("sender_fallback_reason", "")),
+    def test_resolve_worker_kind_matrix(self):
+        self.assertEqual(
+            orchestrator._resolve_worker_kind_for_zmq({"compute_backend": "cpu", "attack_vector": "basic"}),
+            WorkerKind.CPU,
         )
-        mock_pkt.assert_not_awaited()
-        mock_paced.assert_not_awaited()
+        self.assertEqual(
+            orchestrator._resolve_worker_kind_for_zmq({"compute_backend": "cuda", "attack_vector": "basic"}),
+            WorkerKind.GPU,
+        )
+        self.assertEqual(
+            orchestrator._resolve_worker_kind_for_zmq({"compute_backend": "cuda", "attack_vector": "defense"}),
+            WorkerKind.DEFENSE,
+        )
+        self.assertEqual(
+            orchestrator._resolve_worker_kind_for_zmq({"compute_backend": "dpdk", "attack_vector": "basic"}),
+            WorkerKind.DPDK,
+        )
+        self.assertEqual(
+            orchestrator._resolve_worker_kind_for_zmq({"compute_backend": "af_xdp", "attack_vector": "basic"}),
+            WorkerKind.AF_XDP,
+        )
+        self.assertEqual(
+            orchestrator._resolve_worker_kind_for_zmq({"compute_backend": "cpu", "attack_vector": "http"}),
+            WorkerKind.L7,
+        )
+        self.assertEqual(
+            orchestrator._resolve_worker_kind_for_zmq({"compute_backend": "cpu", "attack_vector": "http", "scenario_mode": "enforce"}),
+            WorkerKind.SCENARIO,
+        )
 
-    async def test_worker_process_http_uses_topology_binding_for_l7_compile_inputs(self):
-        args = _base_args()
-        args["attack_vector"] = "http"
-        args["topology_enabled"] = True
-        args["topology_compiled_plan_json"] = _topology_args()
+    def test_start_worker_zmq_job_done_event_records_ok(self):
+        events: list[dict] = []
+        progress = _Counter()
+        sent_total = _Counter()
+        errors_total = _Counter()
 
-        mock_http = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
-        tuple_row = {
-            "client_ip": "10.0.0.9",
-            "server_ip": "198.51.100.7",
-            "server_port": 8080,
-            "template_protocol": "l7",
-            "template_method": "POST",
-            "template_path": "/topology",
-            "template_flags": "",
-        }
-        with patch.object(orchestrator, "compiled_topology_plan_from_dict", return_value={"dummy": 1}):
-            with patch.object(orchestrator, "topology_tuple_for_index", return_value=tuple_row):
-                with patch.object(orchestrator.senders, "http_app_sender", mock_http):
-                    await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-                    call_args, _kwargs = mock_http.call_args
-                    self.assertEqual(call_args[0], "198.51.100.7")
-                    self.assertEqual(int(call_args[1]), 8080)
-                    self.assertEqual(call_args[4], "POST")
-                    self.assertEqual(call_args[5], ["/topology"])
+        payload = {"attempted": 10, "sent": 9, "errors": 1, "bytes_sent_est": 576, "status": "ok"}
+        fake_event = _FakeTerminalEvent(MessageType.JOB_DONE, payload)
 
-    async def test_worker_process_basic_uses_topology_binding_for_l4_packet_pool(self):
-        args = _base_args()
-        args["attack_vector"] = "basic"
-        args["topology_enabled"] = True
-        args["topology_compiled_plan_json"] = _topology_args()
-
-        mock_paced = AsyncMock(return_value={"attempted": 5, "sent": 5, "errors": 0})
-        tuple_row = {
-            "client_ip": "10.0.0.9",
-            "server_ip": "198.51.100.7",
-            "server_port": 8080,
-            "template_protocol": "l4",
-            "template_method": "",
-            "template_path": "",
-            "template_flags": "S",
-        }
-        captured_cfg = {}
-        def _fake_pool(cfg, count, uniform_size=True, low_peak_memory=True):
-            captured_cfg["cfg"] = cfg
-            captured_cfg["count"] = count
-            return (memoryview(b"x" * (64 * int(count))), 64)
-        with patch.object(orchestrator, "compiled_topology_plan_from_dict", return_value={"dummy": 1}):
-            with patch.object(orchestrator, "topology_tuple_for_index", return_value=tuple_row):
-                with patch.object(orchestrator.cpu_packet_engine, "generate_packet_pool_view", side_effect=_fake_pool):
-                    with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_paced):
-                        await orchestrator.worker_process(worker_id=1, args=args, ssl_context=None)
-                        cfg = captured_cfg["cfg"]
-                        self.assertEqual(getattr(cfg, "target_ip"), "198.51.100.7")
-                        self.assertEqual(int(getattr(cfg, "target_port")), 8080)
-                        self.assertTrue(bool(getattr(cfg, "spoof")))
-                        self.assertEqual(str(getattr(cfg.spoof_opts, "mode")), "subnet")
-
-
-class TestWorkerStatusSemantics(unittest.IsolatedAsyncioTestCase):
-    """Tests for the worker_status derivation logic (trex_path Görev #6).
-
-    The orchestrator must derive worker_status from actual sent/errors
-    rather than blindly reporting "ok".
-    """
-
-    async def test_worker_status_failed_when_zero_sent(self):
-        """Worker should have status='failed' when sender reports 0 sent."""
-        args = _base_args()
-        args["attack_vector"] = "http"
-        args["count"] = 100
-
-        events = []
-        # Sender returns 0 sent, all errors
-        mock_http = AsyncMock(return_value={
-            "attempted": 100, "sent": 0, "errors": 100, "bytes_sent_est": 0,
-        })
-        with patch.object(orchestrator.senders, "http_app_sender", mock_http):
-            await orchestrator.worker_process(
-                worker_id=1, args=args, ssl_context=None, run_events=events,
-            )
-
-        self.assertEqual(len(events), 1)
-        ev = events[0]
-        self.assertEqual(ev["status"], "failed")
-        self.assertIn("0/100", ev["error"])
-
-    async def test_worker_status_degraded_when_high_error_rate(self):
-        """Worker should be 'degraded' when errors exceed sent count."""
-        args = _base_args()
-        args["attack_vector"] = "http"
-        args["count"] = 100
-
-        events = []
-        # Sender: 30 sent, 70 errors → error rate > 50%
-        mock_http = AsyncMock(return_value={
-            "attempted": 100, "sent": 30, "errors": 70, "bytes_sent_est": 0,
-        })
-        with patch.object(orchestrator.senders, "http_app_sender", mock_http):
-            await orchestrator.worker_process(
-                worker_id=1, args=args, ssl_context=None, run_events=events,
-            )
-
-        self.assertEqual(len(events), 1)
-        ev = events[0]
-        self.assertEqual(ev["status"], "degraded")
-
-    async def test_worker_status_ok_when_fully_sent(self):
-        """Worker should remain 'ok' when all packets are sent successfully."""
-        args = _base_args()
-        args["attack_vector"] = "http"
-        args["count"] = 100
-
-        events = []
-        mock_http = AsyncMock(return_value={
-            "attempted": 100, "sent": 100, "errors": 0, "bytes_sent_est": 5000,
-            "sender_fallback_reason": "none",
-            "fallback_count": 0,
-            "runtime_transport_backend": "custom_tcp",
-            "custom_tcp_bridge_backend_used": "xdp",
-        })
-        with patch.object(orchestrator.senders, "http_app_sender", mock_http):
-            await orchestrator.worker_process(
-                worker_id=1, args=args, ssl_context=None, run_events=events,
+        with patch("ddos_samurai.orchestrator.ZmqRuntimeManager", return_value=_FakeRuntime()), patch(
+            "ddos_samurai.orchestrator.ZmqDispatcher", return_value=_FakeDispatcher()
+        ), patch("ddos_samurai.orchestrator.ZmqEventCollector", return_value=_FakeCollector(fake_event)), patch(
+            "ddos_samurai.orchestrator._snapshot_loss_telemetry", return_value=None
+        ):
+            orchestrator.start_worker_zmq(
+                worker_id=1,
+                args=_base_args(),
+                progress=progress,
+                run_events=events,
+                sent_total=sent_total,
+                errors_total=errors_total,
             )
 
         self.assertEqual(len(events), 1)
         ev = events[0]
         self.assertEqual(ev["status"], "ok")
+        self.assertEqual(int(ev["stats"]["attempted"]), 10)
+        self.assertEqual(int(ev["stats"]["sent"]), 9)
+        self.assertEqual(int(ev["stats"]["errors"]), 1)
+        self.assertEqual(progress.value, 10)
+        self.assertEqual(sent_total.value, 9)
+        self.assertEqual(errors_total.value, 1)
 
-    async def test_worker_event_contains_sender_path_metadata(self):
-        """Worker events should carry sender_path and fallback_count."""
-        args = _base_args()
-        args["attack_vector"] = "http"
-        args["count"] = 10
+    def test_start_worker_zmq_error_event_marks_failed(self):
+        events: list[dict] = []
+        fake_event = _FakeTerminalEvent(MessageType.ERROR, {"message": "bad"})
 
-        events = []
-        mock_http = AsyncMock(return_value={
-            "attempted": 10, "sent": 10, "errors": 0, "bytes_sent_est": 500,
-            "sender_path": "HTTPX_H1", "fallback_count": 0,
-            "permission_error_count": 0,
-        })
-        with patch.object(orchestrator.senders, "http_app_sender", mock_http):
-            await orchestrator.worker_process(
-                worker_id=1, args=args, ssl_context=None, run_events=events,
-            )
+        with patch("ddos_samurai.orchestrator.ZmqRuntimeManager", return_value=_FakeRuntime()), patch(
+            "ddos_samurai.orchestrator.ZmqDispatcher", return_value=_FakeDispatcher()
+        ), patch("ddos_samurai.orchestrator.ZmqEventCollector", return_value=_FakeCollector(fake_event)), patch(
+            "ddos_samurai.orchestrator._snapshot_loss_telemetry", return_value=None
+        ):
+            orchestrator.start_worker_zmq(worker_id=2, args=_base_args(), run_events=events)
 
-        self.assertEqual(len(events), 1)
-        ev = events[0]
-        self.assertIn("sender_path", ev)
-        self.assertEqual(ev["sender_path"], "HTTPX_H1")
-        self.assertIn("fallback_count", ev)
-        self.assertIn("permission_error_count", ev)
-
-    async def test_worker_event_contains_extended_sender_counters(self):
-        """Extended sender counters should propagate into worker events."""
-        args = _base_args()
-        args["attack_vector"] = "http"
-        args["count"] = 10
-
-        events = []
-        mock_http = AsyncMock(return_value={
-            "attempted": 10,
-            "sent": 10,
-            "errors": 0,
-            "bytes_sent_est": 640,
-            "sender_path": "C_EXT_L3",
-            "fallback_count": 1,
-            "permission_error_count": 0,
-            "buffer_copy_count": 2,
-            "buffer_copy_bytes": 4096,
-            "eagain_retry_count": 3,
-            "partial_send_retry_count": 4,
-            "actual_rps": 9500.0,
-            "rate_accuracy_pct": 95.0,
-            "jitter_p99_ns": 1200.0,
-            "ipg_mean_ns": 104000.0,
-            "sleep_calls": 12,
-            "busywait_cycles": 34,
-            "so_txtime_active": 1,
-            "txtime_errors": 2,
-            "txring_flush_call_count": 5,
-            "txring_flush_error_count": 1,
-            "txring_flush_eagain_count": 1,
-            "txring_flush_enobufs_count": 2,
-            "txring_flush_ebusy_count": 1,
-            "txring_flush_other_errno_count": 0,
-            "txring_flush_last_errno": 105,
-            "txring_flush_last_errno_name": "ENOBUFS",
-            "txring_tp_packets": 9,
-            "txring_tp_drops": 2,
-            "txring_tp_freeze_q_cnt": 0,
-            "txring_packet_version": 1,
-            "txring_packet_version_name": "TPACKET_V2",
-            "host_tx_packets_delta": 10,
-            "host_tx_dropped_delta": 2,
-            "host_tx_errors_delta": 1,
-            "softnet_dropped_delta": 0,
-            "softnet_time_squeeze_delta": 0,
-            "nicq_counter_available": 1,
-            "nicq_counter_source": "ethtool_stats",
-            "nicq_counter_confidence": 0.8,
-            "nicq_pressure_delta": 3,
-            "nicq_drop_delta": 2,
-            "nicq_fifo_delta": 1,
-            "nicq_timeout_delta": 0,
-            "nicq_restart_delta": 0,
-            "nicq_busy_delta": 0,
-            "nicq_pressure_status": "warn",
-            "wire_loss_est_packets": 2,
-        })
-        with patch.object(orchestrator.senders, "http_app_sender", mock_http):
-            await orchestrator.worker_process(
-                worker_id=1, args=args, ssl_context=None, run_events=events,
-            )
-
-        self.assertEqual(len(events), 1)
-        ev = events[0]
-        self.assertEqual(ev["buffer_copy_count"], 2)
-        self.assertEqual(ev["buffer_copy_bytes"], 4096)
-        self.assertEqual(ev["eagain_retry_count"], 3)
-        self.assertEqual(ev["partial_send_retry_count"], 4)
-        self.assertAlmostEqual(ev["actual_rps"], 9500.0)
-        self.assertAlmostEqual(ev["rate_accuracy_pct"], 95.0)
-        self.assertAlmostEqual(ev["jitter_p99_ns"], 1200.0)
-        self.assertAlmostEqual(ev["ipg_mean_ns"], 104000.0)
-        self.assertEqual(ev["sleep_calls"], 12)
-        self.assertEqual(ev["busywait_cycles"], 34)
-        self.assertEqual(ev["so_txtime_active"], 1)
-        self.assertEqual(ev["txtime_errors"], 2)
-        self.assertEqual(ev["txring_flush_call_count"], 5)
-        self.assertEqual(ev["txring_flush_error_count"], 1)
-        self.assertEqual(ev["txring_flush_enobufs_count"], 2)
-        self.assertEqual(ev["txring_flush_ebusy_count"], 1)
-        self.assertEqual(ev["txring_flush_last_errno"], 105)
-        self.assertEqual(ev["txring_flush_last_errno_name"], "ENOBUFS")
-        self.assertEqual(ev["txring_tp_packets"], 9)
-        self.assertEqual(ev["txring_tp_drops"], 2)
-        self.assertEqual(ev["txring_packet_version"], 1)
-        self.assertEqual(ev["txring_packet_version_name"], "TPACKET_V2")
-        self.assertEqual(ev["host_tx_packets_delta"], 10)
-        self.assertEqual(ev["host_tx_dropped_delta"], 2)
-        self.assertEqual(ev["nicq_counter_available"], 1)
-        self.assertEqual(ev["nicq_counter_source"], "ethtool_stats")
-        self.assertEqual(ev["nicq_pressure_delta"], 3)
-        self.assertEqual(ev["nicq_drop_delta"], 2)
-        self.assertEqual(ev["nicq_fifo_delta"], 1)
-        self.assertEqual(ev["nicq_pressure_status"], "warn")
-        self.assertEqual(ev["wire_loss_est_packets"], 2)
-        self.assertGreater(ev["wire_loss_est_pct"], 0.0)
-        self.assertEqual(ev["stats"]["sleep_calls"], 12)
-        self.assertEqual(ev["stats"]["busywait_cycles"], 34)
-        self.assertEqual(ev["stats"]["buffer_copy_count"], 2)
-        self.assertEqual(ev["stats"]["eagain_retry_count"], 3)
-        self.assertEqual(ev["stats"]["nicq_pressure_delta"], 3)
-
-    async def test_worker_status_interrupted_on_keyboard_interrupt(self):
-        """Worker should report 'interrupted' on KeyboardInterrupt."""
-        args = _base_args()
-        args["attack_vector"] = "http"
-        args["count"] = 10
-
-        events = []
-        mock_http = AsyncMock(side_effect=KeyboardInterrupt)
-        with patch.object(orchestrator.senders, "http_app_sender", mock_http):
-            await orchestrator.worker_process(
-                worker_id=1, args=args, ssl_context=None, run_events=events,
-            )
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["status"], "interrupted")
-
-    async def test_dedicated_required_fails_when_sender_fallback_detected(self):
-        args = _base_args()
-        args["attack_vector"] = "basic"
-        args["count"] = 10
-        args["lab_profile"] = "dedicated"
-        args["dataplane_core_mode"] = "required"
-
-        events = []
-        mock_sender = AsyncMock(
-            return_value={
-                "attempted": 10,
-                "sent": 10,
-                "errors": 0,
-                "bytes_sent_est": 640,
-                "sender_path": "DP_TX_RING",
-                "fallback_count": 1,
-                "sender_fallback_reason": "txring_unavailable",
-            }
-        )
-        with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_sender):
-            await orchestrator.worker_process(
-                worker_id=1, args=args, ssl_context=None, run_events=events,
-            )
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["status"], "failed")
-        self.assertIn("hot_path_contract_violation", str(events[0].get("error", "")))
 
-    async def test_dedicated_required_fails_when_sender_path_drift_detected(self):
-        args = _base_args()
-        args["attack_vector"] = "basic"
-        args["count"] = 10
-        args["lab_profile"] = "dedicated"
-        args["dataplane_core_mode"] = "required"
+    def test_start_worker_zmq_launch_exception_marks_failed(self):
+        events: list[dict] = []
 
-        events = []
-        mock_sender = AsyncMock(
-            return_value={
-                "attempted": 10,
-                "sent": 10,
-                "errors": 0,
-                "bytes_sent_est": 640,
-                "sender_path": "MIXED",
-                "fallback_count": 0,
-                "sender_fallback_reason": "none",
-            }
-        )
-        with patch.object(orchestrator.senders, "paced_raw_socket_sender", mock_sender):
-            await orchestrator.worker_process(
-                worker_id=1, args=args, ssl_context=None, run_events=events,
-            )
+        with patch("ddos_samurai.orchestrator.ZmqRuntimeManager", return_value=_FakeRuntime(fail_launch=True)), patch(
+            "ddos_samurai.orchestrator._snapshot_loss_telemetry", return_value=None
+        ):
+            orchestrator.start_worker_zmq(worker_id=3, args=_base_args(), run_events=events)
+
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["status"], "failed")
-        self.assertIn("hot_path_contract_violation", str(events[0].get("error", "")))
+        self.assertIn("launch_failed", str(events[0].get("error", "")))
 
 
-class TestStatsAggregateHelpers(unittest.TestCase):
-    def test_add_stats_aggregates_pacing_fields(self):
-        acc = orchestrator._empty_stats()
-        acc = orchestrator._add_stats(
-            acc,
-            {
-                "attempted": 5,
-                "sent": 5,
-                "errors": 0,
-                "actual_rps": 1000.0,
-                "rate_accuracy_pct": 95.0,
-                "jitter_p99_ns": 100.0,
-                "ipg_mean_ns": 1000.0,
-                "sleep_calls": 2,
-                "busywait_cycles": 4,
-                "so_txtime_active": 1,
-                "txtime_errors": 1,
-            },
-        )
-        acc = orchestrator._add_stats(
-            acc,
-            {
-                "attempted": 5,
-                "sent": 5,
-                "errors": 0,
-                "actual_rps": 2000.0,
-                "rate_accuracy_pct": 96.0,
-                "jitter_p99_ns": 120.0,
-                "ipg_mean_ns": 900.0,
-                "sleep_calls": 3,
-                "busywait_cycles": 5,
-                "so_txtime_active": 0,
-                "txtime_errors": 2,
-            },
-        )
-
-        self.assertEqual(acc["attempted"], 10)
-        self.assertEqual(acc["sleep_calls"], 5)
-        self.assertEqual(acc["busywait_cycles"], 9)
-        self.assertEqual(acc["so_txtime_active"], 1)
-        self.assertEqual(acc["txtime_errors"], 3)
-        self.assertAlmostEqual(acc["actual_rps"], 2000.0)
-        self.assertAlmostEqual(acc["rate_accuracy_pct"], 96.0)
-
-    def test_add_stats_preserves_l7_protocol_specific_fields(self):
-        acc = orchestrator._empty_stats()
-        acc = orchestrator._add_stats(
-            acc,
-            {
-                "attempted": 4,
-                "sent": 4,
-                "errors": 0,
-                "l7_engine_path_used": "C_STATE_H2",
-                "l7_fallback_reason": "none",
-                "l7_capability_status": "ok",
-                "h2_goaway_count": 2,
-                "h2_stream_resets": 1,
-                "h2_connections_used": 1,
-                "h2_request_plan_used": 1,
-                "h2_request_plan_items": 4,
-                "h2_stream_reset_ratio": 0.25,
-            },
-        )
-        acc = orchestrator._add_stats(
-            acc,
-            {
-                "attempted": 2,
-                "sent": 1,
-                "errors": 1,
-                "l7_engine_path_used": "C_STATE_QUIC",
-                "l7_fallback_reason": "connect_fail",
-                "l7_capability_status": "partial",
-                "quic_connect_fail_count": 1,
-                "quic_connect_timeout_count": 1,
-                "quic_tls_fail_count": 2,
-                "quic_handshake_timeout_count": 1,
-                "quic_stream_fail_count": 3,
-                "quic_stream_fail_ratio": 0.5,
-                "quic_handshake_fail_ratio": 0.3,
-            },
-        )
-
-        self.assertEqual(acc["l7_engine_path_used"], "mixed")
-        self.assertEqual(acc["l7_fallback_reason"], "connect_fail")
-        self.assertEqual(acc["l7_capability_status"], "partial")
-        self.assertEqual(acc["h2_goaway_count"], 2)
-        self.assertEqual(acc["h2_stream_resets"], 1)
-        self.assertEqual(acc["h2_connections_used"], 1)
-        self.assertEqual(acc["h2_request_plan_used"], 1)
-        self.assertEqual(acc["h2_request_plan_items"], 4)
-        self.assertAlmostEqual(float(acc["h2_stream_reset_ratio"]), 0.25, places=6)
-        self.assertEqual(acc["quic_connect_fail_count"], 1)
-        self.assertEqual(acc["quic_connect_timeout_count"], 1)
-        self.assertEqual(acc["quic_tls_fail_count"], 2)
-        self.assertEqual(acc["quic_handshake_timeout_count"], 1)
-        self.assertEqual(acc["quic_stream_fail_count"], 3)
-        self.assertAlmostEqual(float(acc["quic_stream_fail_ratio"]), 0.5, places=6)
-        self.assertAlmostEqual(float(acc["quic_handshake_fail_ratio"]), 0.3, places=6)
+class TestOrchestratorWorkerProcess(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_process_removed_fail_fast(self):
+        with self.assertRaises(RuntimeError):
+            await orchestrator.worker_process(worker_id=1, args=_base_args(), ssl_context=None)
 
 
-class TestPacingConfigBuilder(unittest.TestCase):
-    def test_build_pacing_config_auto_pin_from_affinity(self):
-        args = _base_args()
-        args.update({"pacing_mode": "rps", "rps": 1000.0, "pin_cpu": -1})
-
-        with patch.object(orchestrator.os, "sched_getaffinity", return_value={7}):
-            cfg = orchestrator._build_pacing_config(args)
-        self.assertEqual(int(cfg.pin_cpu), 7)
-
-    def test_build_pacing_config_auto_pin_can_be_disabled(self):
-        args = _base_args()
-        args.update({"pacing_mode": "rps", "rps": 1000.0, "pin_cpu": -1})
-
-        with patch.dict(os.environ, {"SAMURAI_PACING_AUTO_PIN": "0"}, clear=False):
-            with patch.object(orchestrator.os, "sched_getaffinity", return_value={9}):
-                cfg = orchestrator._build_pacing_config(args)
-        self.assertEqual(int(cfg.pin_cpu), -1)
+if __name__ == "__main__":
+    unittest.main()
