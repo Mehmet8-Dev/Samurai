@@ -11,11 +11,11 @@ from unittest.mock import patch
 
 import pytest
 
-from ddos_samurai.zmq_dispatcher import ZmqDispatcher
-from ddos_samurai.zmq_event_collector import ZmqEventCollector
-from ddos_samurai.zmq_runtime_manager import ZmqRuntimeManager
-from ddos_samurai.zmq_wire import MessageType, WorkerKind
-from ddos_samurai.zmq_worker_prototype import ZmqWorkerPrototype
+from ddos_samurai.zmq.dispatcher import ZmqDispatcher
+from ddos_samurai.zmq.event_collector import ZmqEventCollector
+from ddos_samurai.zmq.runtime_manager import ZmqRuntimeManager
+from ddos_samurai.zmq.wire import MessageType, WorkerKind
+from ddos_samurai.zmq.worker_prototype import ZmqWorkerPrototype
 
 
 pytestmark = [pytest.mark.ci_safe, pytest.mark.benchmark]
@@ -240,8 +240,8 @@ def test_m7_worker_crash_recovery_restart_under_budget() -> None:
             self.returncode = -9
 
     mgr = ZmqRuntimeManager()
-    with patch("ddos_samurai.zmq_runtime_manager.shutil_which", return_value="/usr/bin/samurai_cpu_worker"), patch(
-        "ddos_samurai.zmq_runtime_manager.subprocess.Popen", side_effect=_FakePopen
+    with patch("ddos_samurai.zmq.runtime_manager.shutil_which", return_value="/usr/bin/samurai_cpu_worker"), patch(
+        "ddos_samurai.zmq.runtime_manager.subprocess.Popen", side_effect=_FakePopen
     ):
         wp1 = mgr.launch_worker(WorkerKind.CPU)
         wp1.process.returncode = -11  # crash simulation (segfault)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .zmq_wire import (
+from .wire import (
     HEADER_SIZE_V1,
     MessageType,
     SamuraiWireHeaderV1,
@@ -143,6 +143,6 @@ class ZmqDispatcher:
 
     @staticmethod
     def expected_start_job_frame_size() -> int:
-        from .zmq_wire import JOB_ENVELOPE_SIZE_V1
+        from .wire import JOB_ENVELOPE_SIZE_V1
 
         return int(HEADER_SIZE_V1 + JOB_ENVELOPE_SIZE_V1)

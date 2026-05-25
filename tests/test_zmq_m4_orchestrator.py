@@ -3,7 +3,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from ddos_samurai import orchestrator
-from ddos_samurai.zmq_wire import WorkerKind
+from ddos_samurai.zmq.wire import WorkerKind
 
 
 def test_start_worker_delegates_to_zmq_path() -> None:

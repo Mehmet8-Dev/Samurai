@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from .zmq_worker_prototype import main as _generic_main
-from .zmq_wire import WorkerKind
+from .worker_prototype import main as _generic_main
+from .wire import WorkerKind
 
 
-DEFAULT_KIND = WorkerKind.DEFENSE
+DEFAULT_KIND = WorkerKind.AF_XDP
 
 
 def main(argv: list[str] | None = None) -> int:

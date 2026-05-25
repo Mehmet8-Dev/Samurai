@@ -3,11 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-from ddos_samurai.zmq_dispatcher import ZmqDispatcher
-from ddos_samurai.zmq_event_collector import ZmqEventCollector
-from ddos_samurai.zmq_runtime_manager import ZmqRuntimeManager
-from ddos_samurai.zmq_wire import MessageType, WorkerKind, default_event_endpoint, default_job_endpoint
-from ddos_samurai.zmq_worker_prototype import ZmqWorkerPrototype
+from ddos_samurai.zmq.dispatcher import ZmqDispatcher
+from ddos_samurai.zmq.event_collector import ZmqEventCollector
+from ddos_samurai.zmq.runtime_manager import ZmqRuntimeManager
+from ddos_samurai.zmq.wire import MessageType, WorkerKind, default_event_endpoint, default_job_endpoint
+from ddos_samurai.zmq.worker_prototype import ZmqWorkerPrototype
 
 
 class _FakeSocket:
@@ -97,14 +97,14 @@ class _FakeZmq:
 def test_m3_worker_sources_exist() -> None:
     root = Path(__file__).resolve().parents[1]
     expected = [
-        root / "src" / "daemon" / "cpu_worker.cpp",
-        root / "src" / "daemon" / "gpu_worker.cpp",
-        root / "src" / "daemon" / "dpdk_worker.cpp",
-        root / "src" / "daemon" / "afxdp_worker.cpp",
-        root / "src" / "daemon" / "doca_gpunetio_worker.cpp",
-        root / "src" / "daemon" / "l7_worker.cpp",
-        root / "src" / "daemon" / "defense_worker.cpp",
-        root / "src" / "daemon" / "scenario_worker.cpp",
+        root / "ddos_samurai" / "zmq" / "daemon" / "cpu_worker.cpp",
+        root / "ddos_samurai" / "zmq" / "daemon" / "gpu_worker.cpp",
+        root / "ddos_samurai" / "zmq" / "daemon" / "dpdk_worker.cpp",
+        root / "ddos_samurai" / "zmq" / "daemon" / "afxdp_worker.cpp",
+        root / "ddos_samurai" / "zmq" / "daemon" / "doca_gpunetio_worker.cpp",
+        root / "ddos_samurai" / "zmq" / "daemon" / "l7_worker.cpp",
+        root / "ddos_samurai" / "zmq" / "daemon" / "defense_worker.cpp",
+        root / "ddos_samurai" / "zmq" / "daemon" / "scenario_worker.cpp",
     ]
     for p in expected:
         assert p.exists(), str(p)
@@ -112,7 +112,7 @@ def test_m3_worker_sources_exist() -> None:
 
 def test_m3_cmake_has_all_worker_targets() -> None:
     root = Path(__file__).resolve().parents[1]
-    cmake = (root / "src" / "CMakeLists.txt").read_text(encoding="utf-8")
+    cmake = (root / "ddos_samurai" / "zmq" / "CMakeLists.txt").read_text(encoding="utf-8")
     for target in [
         "samurai_cpu_worker",
         "samurai_gpu_worker",
@@ -141,7 +141,7 @@ def test_m3_cmake_has_all_worker_targets() -> None:
 
 def test_m3_gpu_worker_has_native_cuda_bridge_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
-    src = (root / "src" / "daemon" / "gpu_worker.cpp").read_text(encoding="utf-8")
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "gpu_worker.cpp").read_text(encoding="utf-8")
     assert "dlopen" in src
     assert "samurai_gpu_packet_generate_packets" in src
     assert "samurai_gpu_packet_generate_icmp_packets" in src
@@ -154,7 +154,7 @@ def test_m3_gpu_worker_has_native_cuda_bridge_and_failfast_fallback() -> None:
 
 def test_m3_dpdk_worker_has_native_tx_path_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
-    src = (root / "src" / "daemon" / "dpdk_worker.cpp").read_text(encoding="utf-8")
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "dpdk_worker.cpp").read_text(encoding="utf-8")
     assert "EnsureEalOnce" in src
     assert "rte_eth_tx_burst" in src
     assert "MessageType::HEARTBEAT" in src
@@ -165,7 +165,7 @@ def test_m3_dpdk_worker_has_native_tx_path_and_failfast_fallback() -> None:
 
 def test_m3_afxdp_worker_has_native_bridge_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
-    src = (root / "src" / "daemon" / "afxdp_worker.cpp").read_text(encoding="utf-8")
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "afxdp_worker.cpp").read_text(encoding="utf-8")
     assert "samurai_xdp_get_native_api_v1" in src
     assert "send_buffer_strided" in src
     assert "MessageType::HEARTBEAT" in src
@@ -176,7 +176,7 @@ def test_m3_afxdp_worker_has_native_bridge_and_failfast_fallback() -> None:
 
 def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
-    src = (root / "src" / "daemon" / "doca_gpunetio_worker.cpp").read_text(encoding="utf-8")
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "doca_gpunetio_worker.cpp").read_text(encoding="utf-8")
     assert "LoadDocaNative" in src
     assert "samurai_doca_gpunetio_get_api_v1" in src
     assert "samurai_doca_backend_create_txq" in src
@@ -190,7 +190,7 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
 
 def test_m3_l7_worker_has_real_runtime_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
-    src = (root / "src" / "daemon" / "l7_worker.cpp").read_text(encoding="utf-8")
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "l7_worker.cpp").read_text(encoding="utf-8")
     assert "ConnectWithTimeout" in src
     assert "SendAll" in src
     assert "RecvSome" in src
@@ -203,7 +203,7 @@ def test_m3_l7_worker_has_real_runtime_and_failfast_fallback() -> None:
 
 def test_m3_defense_worker_has_native_bridge_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
-    src = (root / "src" / "daemon" / "defense_worker.cpp").read_text(encoding="utf-8")
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "defense_worker.cpp").read_text(encoding="utf-8")
     assert "LoadDefenseNative" in src
     assert "samurai_gpu_packet_defense_init" in src
     assert "samurai_gpu_packet_classify_batch" in src
@@ -218,7 +218,7 @@ def test_m3_defense_worker_has_native_bridge_and_failfast_fallback() -> None:
 
 def test_m3_scenario_worker_has_real_runtime_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
-    src = (root / "src" / "daemon" / "scenario_worker.cpp").read_text(encoding="utf-8")
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "scenario_worker.cpp").read_text(encoding="utf-8")
     assert "scenario_payload_ref_missing" in src
     assert "scenario_payload_empty" in src
     assert "CountToken" in src
@@ -304,8 +304,8 @@ def test_m3_runtime_manager_native_only_no_python_fallback() -> None:
 
     mgr = ZmqRuntimeManager()
 
-    with patch("ddos_samurai.zmq_runtime_manager.shutil_which", return_value=None), patch(
-        "ddos_samurai.zmq_runtime_manager.subprocess.Popen", side_effect=_FakePopen
+    with patch("ddos_samurai.zmq.runtime_manager.shutil_which", return_value=None), patch(
+        "ddos_samurai.zmq.runtime_manager.subprocess.Popen", side_effect=_FakePopen
     ) as popen_mock:
         for kind in WorkerKind:
             try:

@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from ddos_samurai import orchestrator
-from ddos_samurai.zmq_wire import (
+from ddos_samurai.zmq.wire import (
     MessageType,
     PacingMode,
     SamuraiWireHeaderV1,

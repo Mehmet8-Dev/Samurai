@@ -80,7 +80,7 @@ jobs:
 
       - name: Build ZMQ worker binaries
         run: |
-          cmake -S src -B build-workers
+          cmake -S ddos_samurai/zmq -B build-workers
           cmake --build build-workers -j"$(nproc)"
 
       - name: RFC Positive + Negative
@@ -202,7 +202,7 @@ jobs:
 
       - name: Build ZMQ worker binaries
         run: |
-          cmake -S src -B build-workers
+          cmake -S ddos_samurai/zmq -B build-workers
           cmake --build build-workers -j"$(nproc)"
 
       - name: RFC Positive + Negative

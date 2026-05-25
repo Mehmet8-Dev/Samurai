@@ -5,11 +5,11 @@ from unittest.mock import patch
 import pytest
 
 from ddos_samurai import orchestrator
-from ddos_samurai.zmq_cpu_worker import CpuWorkerPrototype
-from ddos_samurai.zmq_dispatcher import ZmqDispatcher
-from ddos_samurai.zmq_event_collector import ZmqEventCollector
-from ddos_samurai.zmq_runtime_manager import ZmqRuntimeManager
-from ddos_samurai.zmq_wire import MessageType, WorkerKind
+from ddos_samurai.zmq.cpu_worker import CpuWorkerPrototype
+from ddos_samurai.zmq.dispatcher import ZmqDispatcher
+from ddos_samurai.zmq.event_collector import ZmqEventCollector
+from ddos_samurai.zmq.runtime_manager import ZmqRuntimeManager
+from ddos_samurai.zmq.wire import MessageType, WorkerKind
 
 
 class _FakeSocket:
@@ -195,8 +195,8 @@ def test_runtime_manager_cpu_requires_native_binary() -> None:
 
     mgr = ZmqRuntimeManager()
 
-    with patch("ddos_samurai.zmq_runtime_manager.shutil_which", return_value=None), patch(
-        "ddos_samurai.zmq_runtime_manager.subprocess.Popen", side_effect=_FakePopen
+    with patch("ddos_samurai.zmq.runtime_manager.shutil_which", return_value=None), patch(
+        "ddos_samurai.zmq.runtime_manager.subprocess.Popen", side_effect=_FakePopen
     ) as popen_mock:
         with pytest.raises(FileNotFoundError):
             mgr.launch_worker(WorkerKind.CPU)
@@ -229,7 +229,7 @@ def test_orchestrator_start_worker_zmq_appends_event() -> None:
 
     class _FakeEvent:
         def __init__(self):
-            from ddos_samurai.zmq_wire import MessageType, SamuraiWireHeaderV1, WorkerKind
+            from ddos_samurai.zmq.wire import MessageType, SamuraiWireHeaderV1, WorkerKind
 
             self.header = SamuraiWireHeaderV1(
                 msg_type=MessageType.JOB_DONE,

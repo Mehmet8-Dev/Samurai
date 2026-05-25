@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from .zmq_wire import WorkerKind
-from .zmq_worker_prototype import ZmqWorkerPrototype, main as _generic_main
+from .wire import WorkerKind
+from .worker_prototype import ZmqWorkerPrototype, main as _generic_main
 
 
 class CpuWorkerPrototype(ZmqWorkerPrototype):

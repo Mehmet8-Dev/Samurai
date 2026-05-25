@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ddos_samurai.zmq_wire import (
+from ddos_samurai.zmq.wire import (
     HEADER_SIZE_V1,
     JOB_ENVELOPE_SIZE_V1,
     METRIC_SNAPSHOT_SIZE_V1,
@@ -206,7 +206,7 @@ def test_cpp_header_compiles_with_static_asserts() -> None:
         pytest.skip("No C++ compiler found")
 
     root = Path(__file__).resolve().parents[1]
-    hdr = root / "src" / "daemon" / "wire_protocol.h"
+    hdr = root / "ddos_samurai" / "zmq" / "daemon" / "wire_protocol.h"
     source = f"""
 #include \"{hdr}\"
 #include <cstdint>

@@ -5,12 +5,7 @@ on:
     branches: [ main ]
     paths:
       - 'ddos_samurai/control/**'
-      - 'ddos_samurai/zmq_*.py'
-      - 'ddos_samurai/zmq_worker_prototype.py'
-      - 'ddos_samurai/zmq_wire.py'
-      - 'src/daemon/**'
-      - 'src/lib/**'
-      - 'src/CMakeLists.txt'
+      - 'ddos_samurai/zmq/**'
       - 'tests/test_distributed*'
       - 'tests/test_zmq_m3_workers.py'
       - 'tests/test_zmq_m4_orchestrator.py'
@@ -21,12 +16,7 @@ on:
     branches: [ main ]
     paths:
       - 'ddos_samurai/control/**'
-      - 'ddos_samurai/zmq_*.py'
-      - 'ddos_samurai/zmq_worker_prototype.py'
-      - 'ddos_samurai/zmq_wire.py'
-      - 'src/daemon/**'
-      - 'src/lib/**'
-      - 'src/CMakeLists.txt'
+      - 'ddos_samurai/zmq/**'
       - 'tests/test_distributed*'
       - 'tests/test_zmq_m3_workers.py'
       - 'tests/test_zmq_m4_orchestrator.py'
@@ -84,7 +74,7 @@ jobs:
 
       - name: Build ZMQ worker binaries
         run: |
-          cmake -S src -B build-workers
+          cmake -S ddos_samurai/zmq -B build-workers
           cmake --build build-workers -j"$(nproc)"
 
       - name: Verify Helm chart

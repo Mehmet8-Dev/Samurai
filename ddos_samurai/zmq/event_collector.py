@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .zmq_wire import (
+from .wire import (
     HEADER_SIZE_V1,
     METRIC_SNAPSHOT_SIZE_V1,
     MessageType,

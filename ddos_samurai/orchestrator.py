@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from .metrics_schema import build_empty_stats, recompute_loss_metrics
-from .zmq_dispatcher import ZmqDispatcher
-from .zmq_event_collector import ZmqEventCollector
-from .zmq_runtime_manager import ZmqRuntimeManager
-from .zmq_wire import (
+from .zmq.dispatcher import ZmqDispatcher
+from .zmq.event_collector import ZmqEventCollector
+from .zmq.runtime_manager import ZmqRuntimeManager
+from .zmq.wire import (
     JitterModel,
     MessageType,
     PacingConfig,

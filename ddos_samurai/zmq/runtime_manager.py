@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from .zmq_wire import WorkerKind
+from .wire import WorkerKind
 
 
 WORKER_BINARIES: dict[WorkerKind, str] = {

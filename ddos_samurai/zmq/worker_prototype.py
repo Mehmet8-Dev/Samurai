@@ -4,7 +4,7 @@ import argparse
 import time
 from typing import Any
 
-from .zmq_wire import (
+from .wire import (
     MessageType,
     MetricSnapshotV1,
     SamuraiWireHeaderV1,

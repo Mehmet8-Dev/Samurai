@@ -26,17 +26,17 @@ target_include_directories(pacing_engine_static PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 add_library(
   cpu_native_static
   STATIC
-  ../ddos_samurai/cpu_native/amp.cpp
-  ../ddos_samurai/cpu_native/common.cpp
-  ../ddos_samurai/cpu_native/packets.cpp
-  ../ddos_samurai/cpu_native/pool.cpp
-  ../ddos_samurai/cpu_native/spoofing.cpp
+  ../cpu_native/amp.cpp
+  ../cpu_native/common.cpp
+  ../cpu_native/packets.cpp
+  ../cpu_native/pool.cpp
+  ../cpu_native/spoofing.cpp
 )
-target_include_directories(cpu_native_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../ddos_samurai/cpu_native)
+target_include_directories(cpu_native_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../cpu_native)
 
 function(add_samurai_worker target_name source_file)
   add_executable(${target_name} ${source_file})
-  target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR}/../ddos_samurai/cpu_native ${LIBZMQ_INCLUDE_DIRS})
+  target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR}/../cpu_native ${LIBZMQ_INCLUDE_DIRS})
   target_link_directories(${target_name} PRIVATE ${LIBZMQ_LIBRARY_DIRS})
   target_link_libraries(${target_name} PRIVATE ${LIBZMQ_LIBRARIES})
   target_compile_options(${target_name} PRIVATE ${LIBZMQ_CFLAGS_OTHER})
