@@ -147,7 +147,7 @@ def report_inputs_from_args(args) -> dict:
         "loss_iface": str(getattr(args, "loss_iface", "")),
         "loss_fail_pct": float(getattr(args, "loss_fail_pct", 5.0) or 5.0),
         "sender_backend": str(getattr(args, "sender_backend", "auto")),
-        "sender_fallback_policy": str(getattr(args, "sender_fallback_policy", "allow")),
+        "sender_fallback_policy": str(getattr(args, "sender_fallback_policy", "fail")),
         "dataplane_core_mode": str(getattr(args, "dataplane_core_mode", "off")),
         "afpacket_hugepage_mode": str(getattr(args, "afpacket_hugepage_mode", "off")),
     }

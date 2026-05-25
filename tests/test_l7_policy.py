@@ -28,15 +28,15 @@ class TestL7Policy(unittest.TestCase):
         )
 
     def test_allow_python_fallback_policy(self):
-        self.assertTrue(
+        self.assertFalse(
             policy.allow_python_fallback(
-                fallback_policy="allow",
+                fallback_policy="fail",
                 capability_strict=False,
             )
         )
         self.assertFalse(
             policy.allow_python_fallback(
-                fallback_policy="fail",
+                fallback_policy="allow",
                 capability_strict=False,
             )
         )

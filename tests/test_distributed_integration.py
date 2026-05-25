@@ -428,10 +428,17 @@ def test_integration_worker_rejects_stale_leader_epoch():
         )()
         proc = multiprocessing.Process(target=run_distributed_slave, args=(args, None), daemon=True)
         proc.start()
-        deadline = time.time() + 5.0
+        # CI runners can be noisy during process spawn/import (grpc + control stack),
+        # so allow a wider bootstrap window for initial worker registration.
+        deadline = time.time() + 12.0
         while time.time() < deadline and not server.servicer.workers:
+            if proc is not None and not proc.is_alive():
+                break
             time.sleep(0.1)
-        assert server.servicer.workers
+        assert server.servicer.workers, (
+            f"worker did not register in time; proc_alive={bool(proc and proc.is_alive())} "
+            f"exitcode={None if proc is None else proc.exitcode}"
+        )
 
         wc = WorkerControlClient(f"127.0.0.1:{worker_port}", insecure=True)
         first = wc.start_shard(

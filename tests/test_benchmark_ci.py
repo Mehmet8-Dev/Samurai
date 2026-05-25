@@ -161,7 +161,9 @@ class TestCISafeBenchmarks(unittest.TestCase):
             "max_cv_pct_parse_tcp_flags": _env_float("SAMURAI_BENCH_MAX_CV_PCT_PARSE_TCP_FLAGS", 15.0),
             # Pool generation touches larger buffer allocation/reuse paths and is
             # more sensitive to allocator and scheduler jitter on shared runners.
-            "max_cv_pct_generate_packet_pool": _env_float("SAMURAI_BENCH_MAX_CV_PCT_GENERATE_PACKET_POOL", 12.0),
+            # Keep this ceiling slightly looser than packet micro-benchmarks to
+            # avoid false negatives on noisy CI while preserving regression signal.
+            "max_cv_pct_generate_packet_pool": _env_float("SAMURAI_BENCH_MAX_CV_PCT_GENERATE_PACKET_POOL", 18.0),
             # UDP packet creation can also jitter on shared runners due to short
             # per-iteration runtime and scheduler preemption.
             "max_cv_pct_create_packet_udp": _env_float("SAMURAI_BENCH_MAX_CV_PCT_CREATE_PACKET_UDP", 12.0),
@@ -174,6 +176,9 @@ class TestCISafeBenchmarks(unittest.TestCase):
         n_packets = int(_env_float("SAMURAI_BENCH_PACKET_N", 4000))
         # Slightly larger workload improves timing stability on noisy CI hosts.
         n_flags = int(_env_float("SAMURAI_BENCH_FLAGS_N", 200000))
+        # Pool generation paths are more jitter-sensitive on shared runners, so
+        # use additional rounds by default and keep it env-overridable.
+        pool_rounds = max(5, int(_env_float("SAMURAI_BENCH_POOL_ROUNDS", 7)))
 
         cfg_syn = PacketConfig("10.0.0.1", 80, protocol="tcp", tcp_flags="S")
         cfg_pa = PacketConfig("10.0.0.1", 80, protocol="tcp", tcp_flags="PA", payload=b"x" * 32)
@@ -195,10 +200,12 @@ class TestCISafeBenchmarks(unittest.TestCase):
             "generate_packet_pool": _scenario(
                 "generate_packet_pool", n_packets,
                 lambda: generate_packet_pool(cfg_syn, n_packets, low_peak_memory=True),
+                rounds=pool_rounds,
             ),
             "generate_packet_pool_view": _scenario(
                 "generate_packet_pool_view", n_packets,
                 lambda: generate_packet_pool_view(cfg_syn, n_packets, low_peak_memory=True),
+                rounds=pool_rounds,
             ),
             "parse_tcp_flags": _scenario(
                 "parse_tcp_flags", n_flags,

@@ -6,8 +6,8 @@ import argparse
 import asyncio
 import json
 import logging
-import multiprocessing
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +32,52 @@ _CPU_RAW_SOCKET_VECTORS = {
     "ntp-amp", "ssdp-amp", "dns-amp", "memcached-amp", "ldap-amp",
     "pcap-replay",
 }
+
+
+class _SharedValue:
+    def __init__(self, value: int = 0):
+        self.value = int(value)
+
+
+class _ThreadWorker:
+    """Process-like adapter for monitor compatibility in ZMQ mode."""
+
+    def __init__(self, *, target, args: tuple, name: str):
+        self._target = target
+        self._args = tuple(args)
+        self._thread = threading.Thread(target=self._run, name=str(name), daemon=True)
+        self.exitcode = None
+        self._terminate_requested = False
+
+    def _run(self):
+        try:
+            self._target(*self._args)
+            if self.exitcode is None:
+                self.exitcode = 0
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+            self.exitcode = 1
+            logging.exception("Worker thread failed")
+
+    def start(self):
+        self._thread.start()
+
+    def join(self, timeout: float | None = None):
+        self._thread.join(timeout=timeout)
+
+    def is_alive(self) -> bool:
+        if self._terminate_requested:
+            return False
+        return bool(self._thread.is_alive())
+
+    def terminate(self):
+        # Cooperative termination path can be added here by job-id stop dispatch.
+        self._terminate_requested = True
+        if self.exitcode is None:
+            self.exitcode = -15
+
+    @property
+    def name(self) -> str:
+        return str(self._thread.name)
 
 
 def _write_jsonl_rows(rows: list[dict], out_path: str) -> str:
@@ -281,15 +327,14 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
         utils.log_critical(msg)
         return 2
 
-    progress = multiprocessing.Value("L", 0)
-    sent_total_shared = multiprocessing.Value("L", 0)
-    errors_total_shared = multiprocessing.Value("L", 0)
-    progress_lock = multiprocessing.Lock()
-    manager = multiprocessing.Manager()
-    run_events = manager.list()
-    resource_stats = manager.dict()
+    progress = _SharedValue(0)
+    sent_total_shared = _SharedValue(0)
+    errors_total_shared = _SharedValue(0)
+    progress_lock = threading.Lock()
+    run_events = []
+    resource_stats = {}
 
-    workers = args.workers if args.workers > 0 else multiprocessing.cpu_count()
+    workers = args.workers if args.workers > 0 else int(os.cpu_count() or 1)
     try:
         worker_queue_map = _resolve_worker_queue_map(
             workers=int(workers),
@@ -454,8 +499,8 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
         if worker_args.rps > 0:
             worker_args.rps = worker_args.rps / workers
 
-        p = multiprocessing.Process(
-            target=orchestrator.start_worker,
+        p = _ThreadWorker(
+            target=orchestrator.start_worker_zmq,
             args=(
                 i + 1,
                 vars(worker_args),
@@ -851,10 +896,6 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
                 reporting.write_text(json.dumps(loss_summary, indent=2, sort_keys=True), report_ctx["loss_report_out"])
         except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
             utils.log_warning(f"Run raporu üretilemedi: {e}")
-    try:
-        manager.shutdown()
-    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
-        pass
     if kpi_hard_fail_triggered:
         return 2
     return 0

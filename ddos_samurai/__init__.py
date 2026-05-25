@@ -24,12 +24,8 @@ try:
 except ImportError:
     pass
 
-# Check fast_sender availability
-try:
-    from . import fast_sender
-    FAST_SENDER_AVAILABLE = True
-except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
-    pass
+# NOTE(M6): avoid importing fast_sender at module import time to keep
+# control-plane process free from dataplane C-extension side effects.
 
 def get_capabilities():
     """Get a dictionary of available capabilities."""

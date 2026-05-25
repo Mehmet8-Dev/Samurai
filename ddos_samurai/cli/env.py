@@ -90,7 +90,7 @@ def sync_runtime_env(args) -> dict[str, object]:
     os.environ["SAMURAI_STATE_TIMEOUT_SEC"] = str(int(getattr(args, "state_timeout_sec", 60) or 60))
     os.environ["SAMURAI_STATE_SWEEP_INTERVAL_MS"] = str(int(getattr(args, "state_sweep_interval_ms", 1000) or 1000))
     os.environ["SAMURAI_SENDER_BACKEND"] = str(getattr(args, "sender_backend", "auto") or "auto")
-    os.environ["SAMURAI_SENDER_FALLBACK_POLICY"] = str(getattr(args, "sender_fallback_policy", "allow") or "allow")
+    os.environ["SAMURAI_SENDER_FALLBACK_POLICY"] = "fail"
 
     dp_mode = _normalize_dataplane_core_mode(getattr(args, "dataplane_core_mode", "off"))
     os.environ["SAMURAI_DATAPLANE_CORE_MODE"] = dp_mode
@@ -137,9 +137,9 @@ def sync_runtime_env(args) -> dict[str, object]:
     os.environ["SAMURAI_L7_HTTP2_ENGINE"] = str(getattr(args, "l7_http2_engine", "auto") or "auto")
     os.environ["SAMURAI_L7_QUIC_ENGINE"] = str(getattr(args, "l7_quic_engine", "auto") or "auto")
     os.environ["SAMURAI_L7_QUIC_REQUIRE_NATIVE"] = "1" if bool(getattr(args, "l7_quic_require_native", False)) else "0"
-    os.environ["SAMURAI_L7_QUIC_AUTO_BRIDGE"] = "1" if bool(getattr(args, "l7_quic_auto_bridge", False)) else "0"
-    os.environ["SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE"] = "1" if bool(getattr(args, "l7_quic_bridge_autopromote", False)) else "0"
-    os.environ["SAMURAI_L7_FALLBACK_POLICY"] = str(getattr(args, "l7_fallback_policy", "allow") or "allow")
+    os.environ["SAMURAI_L7_QUIC_AUTO_BRIDGE"] = "0"
+    os.environ["SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE"] = "0"
+    os.environ["SAMURAI_L7_FALLBACK_POLICY"] = "fail"
     os.environ["SAMURAI_L7_CAPABILITY_STRICT"] = "1" if bool(getattr(args, "l7_capability_strict", False)) else "0"
     stateful_runtime_backend = str(getattr(args, "stateful_runtime_backend", "afxdp") or "afxdp").strip().lower()
     if stateful_runtime_backend not in {"afxdp", "dpdk"}:
