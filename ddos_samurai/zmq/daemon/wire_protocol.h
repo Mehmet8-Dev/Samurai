@@ -89,6 +89,28 @@ struct FlowUpdateEventV1 {
   std::uint64_t dpu_ts_ns;
 };
 
+struct FlowStreamUpsertV1 {
+  std::uint64_t version;
+  std::uint64_t epoch;
+  std::uint32_t flow_id;
+  std::uint32_t tcp_seq;
+  std::uint32_t tcp_ack;
+  std::uint16_t src_port;
+  std::uint16_t dst_port;
+  std::uint8_t tcp_state;
+  std::uint8_t proto;
+  std::uint16_t flags;
+  std::uint32_t rtt_us;
+  std::uint32_t quota;
+  std::uint64_t tx_ipg_ns;
+  std::uint64_t dpu_ts_ns;
+  char target_ip[16];
+  std::uint16_t payload_len;
+  std::uint8_t payload_byte;
+  std::uint8_t weight;
+  std::uint32_t template_id;
+};
+
 #pragma pack(pop)
 
 enum class MessageType : std::uint8_t {
@@ -101,6 +123,7 @@ enum class MessageType : std::uint8_t {
 
   METRIC_SNAPSHOT = 20,
   FLOW_UPDATE = 21,
+  FLOW_STREAM_UPSERT = 22,
 
   ERROR = 30,
 
@@ -129,6 +152,7 @@ static_assert(sizeof(SamuraiWireHeaderV1) == 56, "SamuraiWireHeaderV1 size misma
 static_assert(sizeof(JobEnvelopeV1) == 480, "JobEnvelopeV1 size mismatch");
 static_assert(sizeof(MetricSnapshotV1) == 64, "MetricSnapshotV1 size mismatch");
 static_assert(sizeof(FlowUpdateEventV1) == 48, "FlowUpdateEventV1 size mismatch");
+static_assert(sizeof(FlowStreamUpsertV1) == 84, "FlowStreamUpsertV1 size mismatch");
 
 inline constexpr bool IsHeaderV1Compatible(const SamuraiWireHeaderV1& header) {
   return header.magic == kMagic && header.version == kVersionV1;
