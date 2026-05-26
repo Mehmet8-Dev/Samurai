@@ -8,9 +8,11 @@ from pathlib import Path
 import pytest
 
 from ddos_samurai.zmq.wire import (
+    FLOW_UPDATE_EVENT_SIZE_V1,
     HEADER_SIZE_V1,
     JOB_ENVELOPE_SIZE_V1,
     METRIC_SNAPSHOT_SIZE_V1,
+    FlowUpdateEventV1,
     JitterModel,
     JobEnvelopeV1,
     MessageType,
@@ -31,6 +33,7 @@ def test_wire_sizes_are_stable() -> None:
     assert HEADER_SIZE_V1 == 56
     assert JOB_ENVELOPE_SIZE_V1 == 480
     assert METRIC_SNAPSHOT_SIZE_V1 == 64
+    assert FLOW_UPDATE_EVENT_SIZE_V1 == 48
 
 
 def test_header_pack_matches_golden_vector() -> None:
@@ -104,6 +107,26 @@ def test_pack_unpack_message_roundtrip() -> None:
     h2, p2 = unpack_message(msg)
     assert h2 == header
     assert p2 == payload
+
+
+def test_flow_update_event_roundtrip_and_golden_vector() -> None:
+    event = FlowUpdateEventV1(
+        version=10,
+        epoch=3,
+        flow_id=7,
+        tcp_seq=100,
+        tcp_ack=55,
+        src_port=12345,
+        dst_port=443,
+        tcp_state=4,
+        proto=6,
+        flags=0x12,
+        rtt_us=900,
+        dpu_ts_ns=123456789,
+    )
+    payload = event.pack()
+    assert payload.hex() == "0a0000000000000003000000000000000700000064000000370000003930bb01040612008403000015cd5b0700000000"
+    assert FlowUpdateEventV1.unpack(payload) == event
 
 
 def test_unpack_rejects_invalid_magic() -> None:

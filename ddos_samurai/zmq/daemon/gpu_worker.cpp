@@ -27,6 +27,7 @@ constexpr std::uint64_t kDefaultGatewayMac = 0xFFFFFFFFFFFFull;
 
 using fn_generate_packets_t = int (*)(std::int64_t, const char*, std::int64_t, const char*, int, const char*, std::int64_t, int, std::int64_t, std::uint64_t, std::uint64_t, const char*, std::uint8_t**, std::size_t*, int*);
 using fn_generate_icmp_packets_t = int (*)(std::int64_t, const char*, const char*, int, int, std::int64_t, std::int64_t, std::int64_t, std::uint64_t, std::uint64_t, const char*, std::uint8_t**, std::size_t*, int*);
+using fn_contract_publish_flow_update_t = int (*)(const samurai::wire::FlowUpdateEventV1*);
 using fn_free_t = void (*)(void*);
 using fn_last_error_t = const char* (*)();
 
@@ -34,6 +35,7 @@ struct GpuNativeApi {
   void* handle{nullptr};
   fn_generate_packets_t generate_packets{nullptr};
   fn_generate_icmp_packets_t generate_icmp_packets{nullptr};
+  fn_contract_publish_flow_update_t contract_publish_flow_update{nullptr};
   fn_free_t free_fn{nullptr};
   fn_last_error_t last_error{nullptr};
   std::string lib_path;
@@ -99,6 +101,8 @@ bool LoadGpuNative(GpuNativeApi& api, std::string& err) {
 
   api.generate_packets = reinterpret_cast<fn_generate_packets_t>(dlsym(api.handle, "samurai_gpu_packet_generate_packets"));
   api.generate_icmp_packets = reinterpret_cast<fn_generate_icmp_packets_t>(dlsym(api.handle, "samurai_gpu_packet_generate_icmp_packets"));
+  api.contract_publish_flow_update = reinterpret_cast<fn_contract_publish_flow_update_t>(
+      dlsym(api.handle, "samurai_gpu_packet_contract_publish_flow_update_v1"));
   api.free_fn = reinterpret_cast<fn_free_t>(dlsym(api.handle, "samurai_gpu_packet_free"));
   api.last_error = reinterpret_cast<fn_last_error_t>(dlsym(api.handle, "samurai_gpu_packet_last_error"));
   if (!api.generate_packets || !api.generate_icmp_packets || !api.free_fn || !api.last_error) {
@@ -407,6 +411,63 @@ int main(int argc, char** argv) {
           samurai::wire::WorkerKind::GPU,
           job_id,
           std::vector<std::uint8_t>(stopped.begin(), stopped.end()));
+      continue;
+    }
+
+    if (msg_type == samurai::wire::MessageType::FLOW_UPDATE) {
+      if (payload_len != sizeof(samurai::wire::FlowUpdateEventV1) ||
+          header.payload_len != sizeof(samurai::wire::FlowUpdateEventV1)) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError("flow_update_event_size_mismatch"));
+        zmq_msg_close(&msg);
+        continue;
+      }
+
+      samurai::wire::FlowUpdateEventV1 event{};
+      std::memcpy(&event, payload_ptr, sizeof(event));
+      zmq_msg_close(&msg);
+
+      std::string native_err;
+      if (!LoadGpuNative(api, native_err)) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError(native_err));
+        continue;
+      }
+      if (!api.contract_publish_flow_update) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError("gpu_native_contract_symbol_missing"));
+        continue;
+      }
+      if (api.contract_publish_flow_update(&event) != 0) {
+        std::string err = NativeLastError(api);
+        if (err.empty()) {
+          err = "gpu_contract_publish_failed";
+        }
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError(err));
+        continue;
+      }
+      (void)SendAck(push, header.correlation_id, job_id);
       continue;
     }
 

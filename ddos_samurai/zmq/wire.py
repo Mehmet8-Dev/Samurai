@@ -23,6 +23,7 @@ class MessageType(IntEnum):
     HEARTBEAT = 11
 
     METRIC_SNAPSHOT = 20
+    FLOW_UPDATE = 21
 
     ERROR = 30
 
@@ -89,10 +90,12 @@ _HEADER_STRUCT = struct.Struct("<IBBIHQB32s3s")
 _JOB_ENVELOPE_STRUCT = struct.Struct("<16sHIIBdQIQBdiB16sII64s8s8sB16s32s64sB64sIBBHBH16s64s32sBB4s")
 # NOTE: Field definitions naturally total 64 bytes.
 _METRIC_SNAPSHOT_STRUCT = struct.Struct("<QQQQdddII")
+_FLOW_UPDATE_EVENT_STRUCT = struct.Struct("<QQIIIHHBBHIQ")
 
 HEADER_SIZE_V1 = _HEADER_STRUCT.size
 JOB_ENVELOPE_SIZE_V1 = _JOB_ENVELOPE_STRUCT.size
 METRIC_SNAPSHOT_SIZE_V1 = _METRIC_SNAPSHOT_STRUCT.size
+FLOW_UPDATE_EVENT_SIZE_V1 = _FLOW_UPDATE_EVENT_STRUCT.size
 
 
 def _pack_fixed_string(value: str, size: int, field_name: str) -> bytes:
@@ -406,6 +409,59 @@ class MetricSnapshotV1:
                 f"metric snapshot size mismatch: {len(blob)} != {METRIC_SNAPSHOT_SIZE_V1}"
             )
         fields = _METRIC_SNAPSHOT_STRUCT.unpack(blob)
+        return cls(*fields)
+
+
+@dataclass(frozen=True)
+class FlowUpdateEventV1:
+    version: int
+    epoch: int
+    flow_id: int
+    tcp_seq: int
+    tcp_ack: int
+    src_port: int
+    dst_port: int
+    tcp_state: int
+    proto: int
+    flags: int
+    rtt_us: int
+    dpu_ts_ns: int
+
+    def pack(self) -> bytes:
+        for name in ("version", "epoch", "dpu_ts_ns"):
+            if not (0 <= int(getattr(self, name)) <= 0xFFFFFFFFFFFFFFFF):
+                raise WireProtocolError(f"{name} must fit uint64")
+        for name in ("flow_id", "tcp_seq", "tcp_ack", "rtt_us"):
+            if not (0 <= int(getattr(self, name)) <= 0xFFFFFFFF):
+                raise WireProtocolError(f"{name} must fit uint32")
+        for name in ("src_port", "dst_port", "flags"):
+            if not (0 <= int(getattr(self, name)) <= 0xFFFF):
+                raise WireProtocolError(f"{name} must fit uint16")
+        for name in ("tcp_state", "proto"):
+            if not (0 <= int(getattr(self, name)) <= 0xFF):
+                raise WireProtocolError(f"{name} must fit uint8")
+        return _FLOW_UPDATE_EVENT_STRUCT.pack(
+            int(self.version),
+            int(self.epoch),
+            int(self.flow_id),
+            int(self.tcp_seq),
+            int(self.tcp_ack),
+            int(self.src_port),
+            int(self.dst_port),
+            int(self.tcp_state),
+            int(self.proto),
+            int(self.flags),
+            int(self.rtt_us),
+            int(self.dpu_ts_ns),
+        )
+
+    @classmethod
+    def unpack(cls, blob: bytes) -> "FlowUpdateEventV1":
+        if len(blob) != FLOW_UPDATE_EVENT_SIZE_V1:
+            raise WireProtocolError(
+                f"flow update event size mismatch: {len(blob)} != {FLOW_UPDATE_EVENT_SIZE_V1}"
+            )
+        fields = _FLOW_UPDATE_EVENT_STRUCT.unpack(blob)
         return cls(*fields)
 
 

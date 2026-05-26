@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .wire import (
+    FlowUpdateEventV1,
+    FLOW_UPDATE_EVENT_SIZE_V1,
     HEADER_SIZE_V1,
     MessageType,
     SamuraiWireHeaderV1,
@@ -124,6 +126,24 @@ class ZmqDispatcher:
             endpoint=endpoint,
         )
 
+    def dispatch_flow_update(
+        self,
+        *,
+        correlation_id: int,
+        job_id: str,
+        event: FlowUpdateEventV1,
+        endpoint: str | None = None,
+    ) -> DispatchResult:
+        payload = event.pack()
+        return self.send_raw(
+            worker_kind=WorkerKind.GPU,
+            msg_type=MessageType.FLOW_UPDATE,
+            correlation_id=correlation_id,
+            job_id=job_id,
+            payload=payload,
+            endpoint=endpoint,
+        )
+
     def dispatch_shutdown_worker(
         self,
         *,
@@ -146,3 +166,7 @@ class ZmqDispatcher:
         from .wire import JOB_ENVELOPE_SIZE_V1
 
         return int(HEADER_SIZE_V1 + JOB_ENVELOPE_SIZE_V1)
+
+    @staticmethod
+    def expected_flow_update_frame_size() -> int:
+        return int(HEADER_SIZE_V1 + FLOW_UPDATE_EVENT_SIZE_V1)

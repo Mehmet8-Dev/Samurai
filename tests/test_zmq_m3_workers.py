@@ -145,6 +145,8 @@ def test_m3_gpu_worker_has_native_cuda_bridge_and_failfast_fallback() -> None:
     assert "dlopen" in src
     assert "samurai_gpu_packet_generate_packets" in src
     assert "samurai_gpu_packet_generate_icmp_packets" in src
+    assert "samurai_gpu_packet_contract_publish_flow_update_v1" in src
+    assert "MessageType::FLOW_UPDATE" in src
     assert "samurai_gpu_packet_free" in src
     assert "MessageType::HEARTBEAT" in src
     assert "MessageType::METRIC_SNAPSHOT" in src
