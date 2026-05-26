@@ -1,43 +1,29 @@
-"""Native CUDA packet facade.
+"""ZMQ-only GPU control facade.
 
-Public import path remains ``ddos_samurai.gpu_packet``.
-This module exposes the native C++/CUDA backend only.
+The old Python CUDA bridge was intentionally removed.  This module keeps the
+public import path ``ddos_samurai.gpu_packet`` for control-plane callers, but it
+never loads ``libgpu_packet_cuda.so`` directly.  GPU work is submitted to the
+native ZMQ GPU worker.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import itertools
 import os
-import random
-import threading
-import numpy as np
+import time
+from typing import Any, Mapping
 
-try:
-    from numba import cuda as _numba_cuda
-    from numba.cuda.random import create_xoroshiro128p_states
-except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):  # pragma: no cover - depends on runtime
-    _numba_cuda = None
+try:  # Optional: callers may still use the symbol for CPU-side arrays.
+    import numpy as np
+except Exception:  # pragma: no cover - import-environment dependent
+    np = None  # type: ignore
 
-    def create_xoroshiro128p_states(*_args, **_kwargs):
-        return None
+from .zmq.dispatcher import DispatchResult, ZmqDispatcher
+from .zmq.wire import FlowUpdateEventV1, WorkerKind
 
-try:
-    from . import _gpu_packet_cuda_backend as _backend
-except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as _cuda_import_exc:  # pragma: no cover - depends on runtime
-    _backend = None
-    _CUDA_IMPORT_ERROR = _cuda_import_exc
-else:
-    _CUDA_IMPORT_ERROR = None
+ACTIVE_GPU_PACKET_BACKEND = "zmq"
 
-
-ACTIVE_GPU_PACKET_BACKEND = "cuda_cpp"
-
-# Native-only public errors/types
-GPUPacketError = getattr(_backend, "GPUPacketError", RuntimeError) if _backend is not None else RuntimeError
-GPUMemoryError = getattr(_backend, "GPUMemoryError", RuntimeError) if _backend is not None else RuntimeError
-cp = getattr(_backend, "cp", None)
-
-# Shared packet constants used by anomaly helpers/tests.
 ETHERNET_HEADER_LEN = 14
 IP_HEADER_LEN = 20
 TCP_HEADER_LEN_NO_OPT = 20
@@ -62,17 +48,16 @@ DESCRIPTOR_STATE_READY_FOR_NIC = 2
 DESCRIPTOR_STATE_NIC_OWNED = 3
 DESCRIPTOR_STATE_COMPLETE = 4
 
-# Legacy constants retained as inert placeholders for callers that still import them.
 TEMPLATE_CONST_MAX = 4096
 POOL_CONST_MAX = 32768
-TEMPLATE_CONST_HOST = np.zeros(TEMPLATE_CONST_MAX, dtype=np.uint8)
-POOL_CONST_HOST = np.zeros(POOL_CONST_MAX, dtype=np.uint8)
-_CONST_FINGERPRINTS = {
-    "TEMPLATE_CONST_HOST": None,
-    "POOL_CONST_HOST": None,
-}
+if np is not None:
+    TEMPLATE_CONST_HOST = np.zeros(TEMPLATE_CONST_MAX, dtype=np.uint8)
+    POOL_CONST_HOST = np.zeros(POOL_CONST_MAX, dtype=np.uint8)
+else:  # pragma: no cover
+    TEMPLATE_CONST_HOST = bytearray(TEMPLATE_CONST_MAX)
+    POOL_CONST_HOST = bytearray(POOL_CONST_MAX)
 
-# Legacy kernel symbols are intentionally unavailable on native-only path.
+# Legacy kernel symbols are gone with the Python bridge.
 template_kernel = None
 pool_kernel = None
 stateful_pool_kernel = None
@@ -84,15 +69,35 @@ create_icmp_packets_kernel = None
 create_fragmented_packets_kernel = None
 amplification_kernel_v2 = None
 
-_PY_GPU_CACHE_LOCK = threading.Lock()
-_PY_TEMPLATE_CACHE: dict[tuple[int, bool], bool] = {}
-_PY_RNG_STATE_POOL: dict[int, object] = {}
-_PY_GPU_TELEMETRY = {
-    "gpu_template_h2d_copy_count": 0,
-    "gpu_template_cache_hit_count": 0,
-    "gpu_rng_state_alloc_count": 0,
-    "gpu_rng_state_reuse_count": 0,
-}
+_CORRELATION_IDS = itertools.count(int(time.time() * 1000) & 0x7FFFFFFF)
+_DEFAULT_DISPATCHER: ZmqDispatcher | None = None
+
+
+class GPUPacketError(RuntimeError):
+    pass
+
+
+class GPUMemoryError(GPUPacketError):
+    pass
+
+
+def _next_correlation_id() -> int:
+    return int(next(_CORRELATION_IDS))
+
+
+def _dispatcher(dispatcher: ZmqDispatcher | None = None) -> ZmqDispatcher:
+    global _DEFAULT_DISPATCHER
+    if dispatcher is not None:
+        return dispatcher
+    if _DEFAULT_DISPATCHER is None:
+        _DEFAULT_DISPATCHER = ZmqDispatcher()
+    return _DEFAULT_DISPATCHER
+
+
+def _bridge_removed(name: str):
+    raise GPUPacketError(
+        f"{name} removed: Python CUDA bridge is disabled; submit GPU work through the ZMQ GPU worker"
+    )
 
 
 def ip_to_int(ip: str) -> int:
@@ -110,59 +115,51 @@ def parse_subnet(subnet: str) -> tuple[int, int]:
     return int(net.network_address), int(net.prefixlen)
 
 
-def _device_jit(py_func):
-    if _numba_cuda is None:
-        return py_func
-    return _numba_cuda.jit(device=True)(py_func)
+def _buf_get(buffer: Any, offset: int) -> int:
+    return int(buffer[int(offset)]) & 0xFF
 
 
-@_device_jit
-def read_uint16_be(buffer, offset):
-    return ((int(buffer[offset]) & 0xFF) << 8) | (int(buffer[offset + 1]) & 0xFF)
+def read_uint16_be(buffer: Any, offset: int) -> int:
+    return (_buf_get(buffer, offset) << 8) | _buf_get(buffer, int(offset) + 1)
 
 
-@_device_jit
-def read_uint32_be(buffer, offset):
+def read_uint32_be(buffer: Any, offset: int) -> int:
     return (
-        ((int(buffer[offset]) & 0xFF) << 24)
-        | ((int(buffer[offset + 1]) & 0xFF) << 16)
-        | ((int(buffer[offset + 2]) & 0xFF) << 8)
-        | (int(buffer[offset + 3]) & 0xFF)
+        (_buf_get(buffer, offset) << 24)
+        | (_buf_get(buffer, int(offset) + 1) << 16)
+        | (_buf_get(buffer, int(offset) + 2) << 8)
+        | _buf_get(buffer, int(offset) + 3)
     )
 
 
-@_device_jit
-def write_uint16_be(buffer, offset, value):
-    buffer[offset] = (int(value) >> 8) & 0xFF
-    buffer[offset + 1] = int(value) & 0xFF
+def write_uint16_be(buffer: Any, offset: int, value: int) -> None:
+    buffer[int(offset)] = (int(value) >> 8) & 0xFF
+    buffer[int(offset) + 1] = int(value) & 0xFF
 
 
-@_device_jit
-def write_uint32_be(buffer, offset, value):
-    buffer[offset] = (int(value) >> 24) & 0xFF
-    buffer[offset + 1] = (int(value) >> 16) & 0xFF
-    buffer[offset + 2] = (int(value) >> 8) & 0xFF
-    buffer[offset + 3] = int(value) & 0xFF
+def write_uint32_be(buffer: Any, offset: int, value: int) -> None:
+    buffer[int(offset)] = (int(value) >> 24) & 0xFF
+    buffer[int(offset) + 1] = (int(value) >> 16) & 0xFF
+    buffer[int(offset) + 2] = (int(value) >> 8) & 0xFF
+    buffer[int(offset) + 3] = int(value) & 0xFF
 
 
-@_device_jit
-def calculate_checksum(buffer, offset, length):
+def calculate_checksum(buffer: Any, offset: int, length: int) -> int:
     end = int(offset) + int(length)
     s = 0
     i = int(offset)
     while i + 1 < end:
-        s += ((int(buffer[i]) & 0xFF) << 8) | (int(buffer[i + 1]) & 0xFF)
+        s += read_uint16_be(buffer, i)
         s = (s & 0xFFFF) + (s >> 16)
         i += 2
     if i < end:
-        s += (int(buffer[i]) & 0xFF) << 8
+        s += _buf_get(buffer, i) << 8
         s = (s & 0xFFFF) + (s >> 16)
     s = (s & 0xFFFF) + (s >> 16)
     return (~s) & 0xFFFF
 
 
-@_device_jit
-def _pseudo_header_sum(src_ip, dst_ip, protocol, length):
+def _pseudo_header_sum(src_ip: int, dst_ip: int, protocol: int, length: int) -> int:
     src = int(src_ip) & 0xFFFFFFFF
     dst = int(dst_ip) & 0xFFFFFFFF
     s = ((src >> 16) & 0xFFFF) + (src & 0xFFFF)
@@ -172,388 +169,314 @@ def _pseudo_header_sum(src_ip, dst_ip, protocol, length):
     return s
 
 
-@_device_jit
-def _checksum_from_words(words_sum):
+def _checksum_from_words(words_sum: int) -> int:
     s = int(words_sum)
     s = (s & 0xFFFF) + (s >> 16)
     s = (s & 0xFFFF) + (s >> 16)
     return (~s) & 0xFFFF
 
 
-@_device_jit
-def calculate_tcp_checksum_optimized(buffer, offset, length, src_ip, dst_ip):
+def calculate_tcp_checksum_optimized(buffer: Any, offset: int, length: int, src_ip: int, dst_ip: int) -> int:
     s = _pseudo_header_sum(src_ip, dst_ip, TCP_PROTOCOL, length)
     end = int(offset) + int(length)
     i = int(offset)
     while i + 1 < end:
-        s += ((int(buffer[i]) & 0xFF) << 8) | (int(buffer[i + 1]) & 0xFF)
+        s += read_uint16_be(buffer, i)
         i += 2
     if i < end:
-        s += (int(buffer[i]) & 0xFF) << 8
+        s += _buf_get(buffer, i) << 8
     return _checksum_from_words(s)
 
 
-@_device_jit
-def calculate_udp_checksum_optimized(buffer, offset, length, src_ip, dst_ip):
-    s = _pseudo_header_sum(src_ip, dst_ip, UDP_PROTOCOL, length)
-    end = int(offset) + int(length)
-    i = int(offset)
-    while i + 1 < end:
-        s += ((int(buffer[i]) & 0xFF) << 8) | (int(buffer[i + 1]) & 0xFF)
-        i += 2
-    if i < end:
-        s += (int(buffer[i]) & 0xFF) << 8
-    out = _checksum_from_words(s)
+def calculate_udp_checksum_optimized(buffer: Any, offset: int, length: int, src_ip: int, dst_ip: int) -> int:
+    out = calculate_tcp_checksum_optimized(buffer, offset, length, src_ip, dst_ip)
     return out if out != 0 else 0xFFFF
 
 
-@_device_jit
-def calculate_icmp_checksum(buffer, offset, length):
+def calculate_icmp_checksum(buffer: Any, offset: int, length: int) -> int:
     return calculate_checksum(buffer, offset, length)
 
 
-def _require_native_backend():
-    if _backend is None:
-        raise GPUPacketError(f"cuda_cpp backend import failed: {_CUDA_IMPORT_ERROR}")
-    return _backend
-
-
-def _backend_call(name: str, *args, **kwargs):
-    backend = _require_native_backend()
-    fn = getattr(backend, name, None)
-    if not callable(fn):
-        raise AttributeError(f"cuda_cpp backend does not expose {name}")
-    return fn(*args, **kwargs)
-
-
-def _telemetry_inc(key: str, delta: int = 1) -> None:
-    with _PY_GPU_CACHE_LOCK:
-        _PY_GPU_TELEMETRY[key] = int(_PY_GPU_TELEMETRY.get(key, 0) or 0) + int(delta)
-
-
-def _telemetry_snapshot() -> dict:
-    with _PY_GPU_CACHE_LOCK:
-        return {str(k): int(v) for k, v in _PY_GPU_TELEMETRY.items()}
-
-
-def _telemetry_reset() -> None:
-    with _PY_GPU_CACHE_LOCK:
-        for key in list(_PY_GPU_TELEMETRY.keys()):
-            _PY_GPU_TELEMETRY[key] = 0
-
-
-def _template_cache_key(template_bytes, has_ethernet) -> tuple[int, bool]:
-    payload = bytes(template_bytes or b"")
-    return (hash(payload), bool(has_ethernet))
-
-
-def _cache_max_entries() -> int:
-    raw = str(os.environ.get("SAMURAI_GPU_CACHE_MAX_ENTRIES", "128") or "128").strip()
-    try:
-        return max(1, int(raw))
-    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
-        return 128
-
-
-def _rng_pool_max_entries() -> int:
-    raw = str(os.environ.get("SAMURAI_GPU_RNG_POOL_MAX_ENTRIES", "16") or "16").strip()
-    try:
-        return max(1, int(raw))
-    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
-        return 16
-
-
-def _touch_template_cache(template_bytes, has_ethernet) -> None:
-    key = _template_cache_key(template_bytes, has_ethernet)
-    with _PY_GPU_CACHE_LOCK:
-        if key in _PY_TEMPLATE_CACHE:
-            _PY_GPU_TELEMETRY["gpu_template_cache_hit_count"] = int(
-                _PY_GPU_TELEMETRY.get("gpu_template_cache_hit_count", 0)
-            ) + 1
-            return
-        if len(_PY_TEMPLATE_CACHE) >= _cache_max_entries():
-            _PY_TEMPLATE_CACHE.pop(next(iter(_PY_TEMPLATE_CACHE)))
-        _PY_TEMPLATE_CACHE[key] = True
-        _PY_GPU_TELEMETRY["gpu_template_h2d_copy_count"] = int(
-            _PY_GPU_TELEMETRY.get("gpu_template_h2d_copy_count", 0)
-        ) + 1
-
-
-def _touch_rng_pool(count: int) -> None:
-    c = max(0, int(count))
-    with _PY_GPU_CACHE_LOCK:
-        if c in _PY_RNG_STATE_POOL:
-            _PY_GPU_TELEMETRY["gpu_rng_state_reuse_count"] = int(
-                _PY_GPU_TELEMETRY.get("gpu_rng_state_reuse_count", 0)
-            ) + 1
-            return
-    state = create_xoroshiro128p_states(c, seed=random.randint(0, 0xFFFFFFFF))
-    with _PY_GPU_CACHE_LOCK:
-        if len(_PY_RNG_STATE_POOL) >= _rng_pool_max_entries() and c not in _PY_RNG_STATE_POOL:
-            _PY_RNG_STATE_POOL.pop(next(iter(_PY_RNG_STATE_POOL)))
-        if c not in _PY_RNG_STATE_POOL:
-            _PY_RNG_STATE_POOL[c] = state
-            _PY_GPU_TELEMETRY["gpu_rng_state_alloc_count"] = int(
-                _PY_GPU_TELEMETRY.get("gpu_rng_state_alloc_count", 0)
-            ) + 1
-
-
-def _const_payload_fingerprint(src: np.ndarray):
-    src_bytes = src.tobytes(order="C")
-    return (int(src.size), hash(src_bytes))
-
-
-def _update_gpu_constant(symbol_name, host_data):
-    if symbol_name == "TEMPLATE_CONST_HOST":
-        backing = TEMPLATE_CONST_HOST
-        dispatcher = template_kernel
-    elif symbol_name == "POOL_CONST_HOST":
-        backing = POOL_CONST_HOST
-        dispatcher = pool_kernel
-    else:
-        raise ValueError(f"Unknown constant symbol: {symbol_name}")
-
-    src = np.asarray(host_data, dtype=np.uint8).ravel(order="A")
-    if src.nbytes > backing.nbytes:
-        return False
-
-    new_fingerprint = _const_payload_fingerprint(src)
-    old_fingerprint = _CONST_FINGERPRINTS.get(symbol_name)
-    dispatchers_compiled = bool(getattr(dispatcher, "overloads", None))
-    if dispatchers_compiled and old_fingerprint != new_fingerprint:
-        return False
-
-    if old_fingerprint == new_fingerprint:
-        return True
-
-    backing[:src.size] = src
-    if src.size < backing.size:
-        backing[src.size:] = 0
-    _CONST_FINGERPRINTS[symbol_name] = new_fingerprint
-    return True
-
-
 def get_active_backend_name() -> str:
-    return str(ACTIVE_GPU_PACKET_BACKEND)
+    return ACTIVE_GPU_PACKET_BACKEND
 
 
 def is_native_path_enabled() -> bool:
-    return True
+    return False
 
 
 def is_native_library_available() -> bool:
-    return bool(_backend_call("is_native_library_available"))
+    return False
 
 
 def is_native_path_active() -> bool:
-    return bool(_backend_call("is_native_path_active"))
+    return False
 
 
 def get_native_policy() -> str:
-    return "require"
+    return "removed"
 
 
 def is_native_policy_require() -> bool:
+    return False
+
+
+def init_gpu() -> bool:
+    _dispatcher()
     return True
 
 
-def init_gpu():
-    return _backend_call("init_gpu")
-
-
 def set_kernel_mode(mode: str):
-    return _backend_call("set_kernel_mode", mode)
+    if str(mode or "").strip().lower() != "persistent":
+        raise GPUPacketError("ZMQ GPU runtime supports persistent worker mode only")
+    return "persistent"
 
 
 def get_kernel_mode() -> str:
-    return _backend_call("get_kernel_mode")
+    return "persistent"
 
 
-def start_stream(profile):
-    return _backend_call("start_stream", profile)
+def start_stream(profile: Mapping[str, Any] | None = None, *, dispatcher: ZmqDispatcher | None = None, endpoint: str | None = None) -> DispatchResult:
+    args = dict(profile or {})
+    return _dispatcher(dispatcher).dispatch_start_job(
+        worker_kind=WorkerKind.GPU,
+        correlation_id=_next_correlation_id(),
+        job_id=str(args.get("job_id") or args.get("stream_id") or "gpu-zmq-stream"),
+        args=args,
+        endpoint=endpoint,
+    )
 
 
-def update_stream(stream_id, update):
-    return _backend_call("update_stream", stream_id, update)
+def update_stream(stream_id: Any, update: Mapping[str, Any] | None = None, *, dispatcher: ZmqDispatcher | None = None, endpoint: str | None = None) -> DispatchResult:
+    args = dict(update or {})
+    args.setdefault("stream_id", stream_id)
+    args.setdefault("op", "update_stream")
+    return _dispatcher(dispatcher).dispatch_start_job(
+        worker_kind=WorkerKind.GPU,
+        correlation_id=_next_correlation_id(),
+        job_id=str(args.get("job_id") or f"gpu-zmq-update-{stream_id}"),
+        args=args,
+        endpoint=endpoint,
+    )
 
 
-def stop_stream(stream_id):
-    return _backend_call("stop_stream", stream_id)
+def stop_stream(stream_id: Any, *, dispatcher: ZmqDispatcher | None = None, endpoint: str | None = None) -> DispatchResult:
+    return _dispatcher(dispatcher).dispatch_stop_job(
+        worker_kind=WorkerKind.GPU,
+        correlation_id=_next_correlation_id(),
+        job_id=str(stream_id or "gpu-zmq-stream"),
+        endpoint=endpoint,
+    )
 
 
-def read_stream_stats(stream_id=None):
-    return _backend_call("read_stream_stats", stream_id)
+def shutdown_persistent_runtime(*, dispatcher: ZmqDispatcher | None = None, endpoint: str | None = None) -> DispatchResult:
+    return _dispatcher(dispatcher).dispatch_shutdown_worker(
+        worker_kind=WorkerKind.GPU,
+        correlation_id=_next_correlation_id(),
+        endpoint=endpoint,
+    )
 
 
-def read_stream_stats_snapshot(stream_id=None):
-    return _backend_call("read_stream_stats_snapshot", stream_id)
+def read_stream_stats(stream_id: Any = None) -> dict[str, Any]:
+    _ = stream_id
+    return {
+        "backend": ACTIVE_GPU_PACKET_BACKEND,
+        "transport": "zmq",
+        "python_cuda_bridge_active": 0,
+        "runtime_active": 0,
+    }
 
 
-def shutdown_persistent_runtime():
-    return _backend_call("shutdown_persistent_runtime")
+def read_stream_stats_snapshot(stream_id: Any = None) -> dict[str, Any]:
+    return read_stream_stats(stream_id)
 
 
 def publication_budget_us(rtt_us: int) -> int:
-    return _backend_call("publication_budget_us", int(rtt_us))
+    return max(50, min(1000, int(rtt_us) // 10))
 
 
 def seqlock_next_versions(current_version: int) -> tuple[int, int]:
-    return _backend_call("seqlock_next_versions", int(current_version))
+    base = int(current_version)
+    if base & 1:
+        base += 1
+    return base + 1, base + 2
 
 
 def descriptor_transition_valid(from_state: int, to_state: int) -> bool:
-    return bool(_backend_call("descriptor_transition_valid", int(from_state), int(to_state)))
+    return (int(from_state), int(to_state)) in {
+        (DESCRIPTOR_STATE_FREE, DESCRIPTOR_STATE_GPU_WRITING),
+        (DESCRIPTOR_STATE_GPU_WRITING, DESCRIPTOR_STATE_READY_FOR_NIC),
+        (DESCRIPTOR_STATE_READY_FOR_NIC, DESCRIPTOR_STATE_NIC_OWNED),
+        (DESCRIPTOR_STATE_NIC_OWNED, DESCRIPTOR_STATE_COMPLETE),
+        (DESCRIPTOR_STATE_COMPLETE, DESCRIPTOR_STATE_FREE),
+    }
 
 
-def compute_flow_affinity(block_idx: int, block_dim: int, thread_idx: int, flows_per_warp: int, warp_size: int = 32):
-    return _backend_call(
-        "compute_flow_affinity",
-        int(block_idx),
-        int(block_dim),
-        int(thread_idx),
-        int(flows_per_warp),
-        int(warp_size),
+def compute_flow_affinity(block_idx: int, block_dim: int, thread_idx: int, flows_per_warp: int, warp_size: int = 32) -> dict[str, int]:
+    bd = max(1, int(block_dim))
+    ws = max(1, int(warp_size))
+    fpw = max(1, int(flows_per_warp))
+    tid = int(block_idx) * bd + int(thread_idx)
+    global_warp_id = tid // ws
+    lane = int(thread_idx) % ws
+    flow_start = global_warp_id * fpw
+    return {
+        "global_tid": tid,
+        "global_warp_id": global_warp_id,
+        "lane": lane,
+        "flow_start": flow_start,
+        "flow_id": flow_start + lane,
+    }
+
+
+def _coerce_flow_update(event: Any) -> FlowUpdateEventV1:
+    if isinstance(event, FlowUpdateEventV1):
+        return event
+    if not isinstance(event, Mapping):
+        raise TypeError("flow update event must be FlowUpdateEventV1 or mapping")
+    return FlowUpdateEventV1(
+        version=int(event.get("version", 0) or 0),
+        epoch=int(event.get("epoch", 0) or 0),
+        flow_id=int(event.get("flow_id", 0) or 0),
+        tcp_seq=int(event.get("tcp_seq", 0) or 0),
+        tcp_ack=int(event.get("tcp_ack", 0) or 0),
+        src_port=int(event.get("src_port", 0) or 0),
+        dst_port=int(event.get("dst_port", 0) or 0),
+        tcp_state=int(event.get("tcp_state", 0) or 0),
+        proto=int(event.get("proto", 0) or 0),
+        flags=int(event.get("flags", 0) or 0),
+        rtt_us=int(event.get("rtt_us", 0) or 0),
+        dpu_ts_ns=int(event.get("dpu_ts_ns", 0) or 0),
+    )
+
+
+def contract_publish_flow_update_v1(
+    event: Any,
+    *,
+    dispatcher: ZmqDispatcher | None = None,
+    endpoint: str | None = None,
+    correlation_id: int | None = None,
+    job_id: str = "flow-update",
+    allow_version_gap: bool = False,
+) -> DispatchResult:
+    ev = _coerce_flow_update(event)
+    return _dispatcher(dispatcher).dispatch_flow_update(
+        correlation_id=int(correlation_id if correlation_id is not None else _next_correlation_id()),
+        job_id=str(job_id or f"flow-{ev.flow_id}"),
+        event=ev,
+        allow_version_gap=bool(allow_version_gap),
+        endpoint=endpoint,
+    )
+
+
+def contract_read_hot_flow_v1(flow_id: int) -> dict[str, int]:
+    raise GPUPacketError(
+        f"hot-flow read for flow_id={int(flow_id)} is not available through Python; consume worker metrics/events over ZMQ"
     )
 
 
 def generate_packets(*args, **kwargs):
-    return _backend_call("generate_packets", *args, **kwargs)
+    _ = args, kwargs
+    return _bridge_removed("generate_packets")
 
 
 def generate_packets_from_template(*args, **kwargs):
-    template_bytes = kwargs.get("template_bytes")
-    if template_bytes is None and args:
-        template_bytes = args[0]
-    has_ethernet = kwargs.get("has_ethernet", False)
-    count = kwargs.get("count")
-    if count is None and len(args) > 1:
-        count = args[1]
-    _touch_template_cache(template_bytes, has_ethernet)
-    _touch_rng_pool(int(count or 0))
-    return _backend_call("generate_packets_from_template", *args, **kwargs)
+    _ = args, kwargs
+    return _bridge_removed("generate_packets_from_template")
 
 
 def generate_packets_from_template_pool(*args, **kwargs):
-    return _backend_call("generate_packets_from_template_pool", *args, **kwargs)
+    _ = args, kwargs
+    return _bridge_removed("generate_packets_from_template_pool")
 
 
 def generate_fragmented_packets(*args, **kwargs):
-    return _backend_call("generate_fragmented_packets", *args, **kwargs)
+    _ = args, kwargs
+    return _bridge_removed("generate_fragmented_packets")
 
 
 def generate_amplification_packets(*args, **kwargs):
-    return _backend_call("generate_amplification_packets", *args, **kwargs)
+    _ = args, kwargs
+    return _bridge_removed("generate_amplification_packets")
 
 
 def generate_stateful_packets(*args, **kwargs):
-    return _backend_call("generate_stateful_packets", *args, **kwargs)
+    _ = args, kwargs
+    return _bridge_removed("generate_stateful_packets")
 
 
 def benchmark_template_generation_paths(*args, **kwargs):
-    return _backend_call("benchmark_template_generation_paths", *args, **kwargs)
+    _ = args, kwargs
+    return _bridge_removed("benchmark_template_generation_paths")
 
 
 def generate_icmp_packets(*args, **kwargs):
-    return _backend_call("generate_icmp_packets", *args, **kwargs)
+    _ = args, kwargs
+    return _bridge_removed("generate_icmp_packets")
 
 
-def get_generation_telemetry() -> dict:
-    out = dict(_backend_call("get_generation_telemetry") or {})
-    py_tel = _telemetry_snapshot()
-    for key, value in py_tel.items():
-        out[key] = int(value)
-    return out
+def get_generation_telemetry() -> dict[str, Any]:
+    return {"backend": ACTIVE_GPU_PACKET_BACKEND, "python_cuda_bridge_active": 0}
 
 
 def reset_generation_telemetry() -> None:
-    _telemetry_reset()
-    _backend_call("reset_generation_telemetry")
+    return None
 
 
 def clear_generation_caches() -> None:
-    with _PY_GPU_CACHE_LOCK:
-        _PY_TEMPLATE_CACHE.clear()
-        _PY_RNG_STATE_POOL.clear()
-    _backend_call("clear_generation_caches")
+    return None
 
 
 def get_memory_pool():
-    return _backend_call("get_memory_pool")
+    return None
 
 
 def get_pinned_host_pool():
-    return _backend_call("get_pinned_host_pool")
+    return None
 
 
 def configure_pinned_host_pool(*args, **kwargs) -> None:
-    _backend_call("configure_pinned_host_pool", *args, **kwargs)
+    _ = args, kwargs
+    return None
 
 
 def copy_gpu_to_host_pinned(*args, **kwargs):
-    return _backend_call("copy_gpu_to_host_pinned", *args, **kwargs)
+    _ = args, kwargs
+    return _bridge_removed("copy_gpu_to_host_pinned")
 
 
-def get_pool_telemetry() -> dict:
-    return _backend_call("get_pool_telemetry")
+def get_pool_telemetry() -> dict[str, int]:
+    return {}
 
 
 def safe_kernel_launch(*args, **kwargs):
-    return _backend_call("safe_kernel_launch", *args, **kwargs)
+    _ = args, kwargs
+    return _bridge_removed("safe_kernel_launch")
 
 
-def check_gpu_available():
-    return _backend_call("check_gpu_available")
+def check_gpu_available() -> bool:
+    return True
 
 
-def get_gpu_info() -> dict:
-    return _backend_call("get_gpu_info")
+def get_gpu_info() -> dict[str, Any]:
+    return {"backend": ACTIVE_GPU_PACKET_BACKEND, "transport": "zmq"}
 
 
 def is_gpu_available() -> bool:
-    return bool(_backend_call("is_gpu_available"))
+    try:
+        _dispatcher()
+        return True
+    except Exception:
+        return False
 
 
 class GPUPacketGenerator:
-    """Native-only wrapper preserving the public constructor contract."""
+    """Compatibility wrapper that rejects synchronous packet generation."""
 
-    def __init__(
-        self,
-        max_batch_size: int = 100000,
-        *,
-        real_src_ip: str = "192.168.1.100",
-        spoof_ip: bool = True,
-        has_ethernet: bool = False,
-        spoof_subnet: str = "1.0.0.0/8",
-    ):
+    def __init__(self, max_batch_size: int = 100000, **kwargs: Any):
         self.max_batch_size = int(max(1, max_batch_size))
-        self.real_src_ip = str(real_src_ip)
-        self.spoof_ip = bool(spoof_ip)
-        self.has_ethernet = bool(has_ethernet)
-        self.spoof_subnet = str(spoof_subnet or "1.0.0.0/8")
+        self.options = dict(kwargs)
 
     def generate_batch(self, template_bytes: bytes, batch_size: int):
-        count = int(batch_size or 0)
-        if count < 0:
-            raise ValueError("batch_size must be >= 0")
-        if count > self.max_batch_size:
-            raise ValueError(
-                f"batch_size {count} exceeds max_batch_size {self.max_batch_size}"
-            )
-
-        packets_gpu, packet_size = generate_packets_from_template(
-            template_bytes=template_bytes,
-            count=count,
-            real_src_ip=self.real_src_ip,
-            spoof_ip=self.spoof_ip,
-            has_ethernet=self.has_ethernet,
-            spoof_subnet=self.spoof_subnet,
-            return_host_ready=True,
-        )
-        if isinstance(packets_gpu, memoryview):
-            packets_host = np.frombuffer(packets_gpu, dtype=np.uint8)
-        else:
-            packets_host = np.asarray(packets_gpu, dtype=np.uint8)
-        return [
-            bytes(packets_host[i * packet_size : (i + 1) * packet_size])
-            for i in range(count)
-        ]
+        _ = template_bytes, batch_size
+        return _bridge_removed("GPUPacketGenerator.generate_batch")

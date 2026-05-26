@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import types
-import sys
+import pytest
 
 from ddos_samurai import af_xdp_sender
 from ddos_samurai.cli.args import build_parser
@@ -46,30 +45,15 @@ class _FakeBackend:
         self.shutdown_called = True
 
 
-def test_gpu_rx_pipeline_basic(monkeypatch):
-    fake_backend_mod = types.SimpleNamespace(DefenseCUDABackend=_FakeBackend)
-    monkeypatch.setattr(af_xdp_sender, "_resolve_gpu_rx_iface", lambda _x: "lo")
-    monkeypatch.setitem(__import__("sys").modules, "ddos_samurai._gpu_packet_cuda_backend", fake_backend_mod)
-    import ddos_samurai
-
-    monkeypatch.setattr(ddos_samurai, "_gpu_packet_cuda_backend", fake_backend_mod, raising=False)
-    import ddos_samurai.xdp_sender as real_xdp
-    fake_xdp = _FakeXDP([b"a1", b"x2", b"a3"])
-    monkeypatch.setattr(real_xdp, "xdp_create", fake_xdp.xdp_create, raising=True)
-    monkeypatch.setattr(real_xdp, "xdp_destroy", fake_xdp.xdp_destroy, raising=True)
-    monkeypatch.setattr(real_xdp, "xdp_recv_ctx", fake_xdp.xdp_recv_ctx, raising=True)
-    out = af_xdp_sender.run_gpu_rx_pipeline(
-        interface="lo",
-        duration_s=1,
-        batch_size=2,
-        max_packets=3,
-        snaplen=512,
-    )
-    assert int(out["gpu_rx_pipeline_active"]) == 1
-    assert int(out["gpu_rx_packets_total"]) == 3
-    assert int(out["gpu_rx_classified_total"]) == 3
-    assert int(out["gpu_rx_suspicious_total"]) == 1
-    assert int(out["gpu_classifier_gpu_cls_infer_qps"]) == 1000
+def test_gpu_rx_pipeline_python_bridge_is_removed():
+    with pytest.raises(RuntimeError, match="Python bridge was removed"):
+        af_xdp_sender.run_gpu_rx_pipeline(
+            interface="lo",
+            duration_s=1,
+            batch_size=2,
+            max_packets=3,
+            snaplen=512,
+        )
 
 
 def test_gpu_rx_cli_args_present():

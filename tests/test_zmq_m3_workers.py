@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from ddos_samurai.zmq.dispatcher import ZmqDispatcher
 from ddos_samurai.zmq.event_collector import ZmqEventCollector
 from ddos_samurai.zmq.runtime_manager import ZmqRuntimeManager
@@ -200,6 +202,130 @@ def test_m3_dispatch_flow_update_targets_gpu_contract_channel() -> None:
         assert header.correlation_id == 77
         assert header.job_id == "contract-flow-9"
         assert FlowUpdateEventV1.unpack(payload) == event
+    finally:
+        dispatcher.close()
+
+
+def test_m3_dispatch_flow_update_contract_rejects_epoch_rollback() -> None:
+    ctx = _FakeContext()
+    zmq = _FakeZmq()
+    _FakeZmq.Context._instance = ctx
+    endpoint = "ipc:///tmp/samurai_jobs_gpu_contract_epoch_guard"
+
+    dispatcher = ZmqDispatcher(context=ctx, zmq_module=zmq)
+    try:
+        event_ok = FlowUpdateEventV1(
+            version=2,
+            epoch=7,
+            flow_id=11,
+            tcp_seq=100,
+            tcp_ack=90,
+            src_port=40001,
+            dst_port=443,
+            tcp_state=4,
+            proto=6,
+            flags=0x18,
+            rtt_us=700,
+            dpu_ts_ns=111,
+        )
+        dispatcher.dispatch_flow_update(
+            correlation_id=101,
+            job_id="epoch-ok",
+            event=event_ok,
+            endpoint=endpoint,
+        )
+
+        event_rollback = FlowUpdateEventV1(
+            version=4,
+            epoch=6,
+            flow_id=11,
+            tcp_seq=110,
+            tcp_ack=95,
+            src_port=40001,
+            dst_port=443,
+            tcp_state=4,
+            proto=6,
+            flags=0x18,
+            rtt_us=650,
+            dpu_ts_ns=222,
+        )
+        with pytest.raises(ValueError, match="epoch mismatch"):
+            dispatcher.dispatch_flow_update(
+                correlation_id=102,
+                job_id="epoch-rollback",
+                event=event_rollback,
+                endpoint=endpoint,
+            )
+
+        stats = dispatcher.flow_update_contract_stats()
+        assert stats["published"] == 1
+        assert stats["epoch_mismatch"] == 1
+    finally:
+        dispatcher.close()
+
+
+def test_m3_dispatch_flow_update_contract_detects_version_gap() -> None:
+    ctx = _FakeContext()
+    zmq = _FakeZmq()
+    _FakeZmq.Context._instance = ctx
+    endpoint = "ipc:///tmp/samurai_jobs_gpu_contract_version_gap"
+
+    dispatcher = ZmqDispatcher(context=ctx, zmq_module=zmq)
+    try:
+        first = FlowUpdateEventV1(
+            version=2,
+            epoch=3,
+            flow_id=15,
+            tcp_seq=1,
+            tcp_ack=1,
+            src_port=50000,
+            dst_port=80,
+            tcp_state=1,
+            proto=6,
+            flags=0x02,
+            rtt_us=100,
+            dpu_ts_ns=1,
+        )
+        dispatcher.dispatch_flow_update(
+            correlation_id=201,
+            job_id="v-ok",
+            event=first,
+            endpoint=endpoint,
+        )
+
+        gap = FlowUpdateEventV1(
+            version=10,
+            epoch=3,
+            flow_id=15,
+            tcp_seq=2,
+            tcp_ack=2,
+            src_port=50000,
+            dst_port=80,
+            tcp_state=1,
+            proto=6,
+            flags=0x12,
+            rtt_us=110,
+            dpu_ts_ns=2,
+        )
+        with pytest.raises(ValueError, match="version gap"):
+            dispatcher.dispatch_flow_update(
+                correlation_id=202,
+                job_id="v-gap",
+                event=gap,
+                endpoint=endpoint,
+            )
+
+        dispatcher.dispatch_flow_update(
+            correlation_id=203,
+            job_id="v-gap-allowed",
+            event=gap,
+            allow_version_gap=True,
+            endpoint=endpoint,
+        )
+        stats = dispatcher.flow_update_contract_stats()
+        assert stats["version_gap_detected"] >= 1
+        assert stats["published"] == 2
+        assert dispatcher.next_committed_flow_version(15) == 12
     finally:
         dispatcher.close()
 
