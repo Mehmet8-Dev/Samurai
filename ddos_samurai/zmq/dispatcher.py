@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .wire import (
+    FlowStreamUpsertV1,
+    FLOW_STREAM_UPSERT_SIZE_V1,
     FlowUpdateEventV1,
     FLOW_UPDATE_EVENT_SIZE_V1,
     HEADER_SIZE_V1,
@@ -159,6 +161,31 @@ class ZmqDispatcher:
         self._flow_contract_stats["published"] = int(self._flow_contract_stats.get("published", 0) or 0) + 1
         return out
 
+    def dispatch_flow_stream_upsert(
+        self,
+        *,
+        correlation_id: int,
+        job_id: str,
+        upsert: FlowStreamUpsertV1,
+        allow_version_gap: bool = False,
+        endpoint: str | None = None,
+    ) -> DispatchResult:
+        self._validate_flow_update_contract(upsert.to_flow_update(), allow_version_gap=allow_version_gap)
+        payload = upsert.pack()
+        out = self.send_raw(
+            worker_kind=WorkerKind.GPU,
+            msg_type=MessageType.FLOW_STREAM_UPSERT,
+            correlation_id=correlation_id,
+            job_id=job_id,
+            payload=payload,
+            endpoint=endpoint,
+        )
+        flow_id = int(upsert.flow_id)
+        self._flow_last_version[flow_id] = int(upsert.version)
+        self._flow_last_epoch[flow_id] = int(upsert.epoch)
+        self._flow_contract_stats["published"] = int(self._flow_contract_stats.get("published", 0) or 0) + 1
+        return out
+
     def _validate_flow_update_contract(self, event: FlowUpdateEventV1, *, allow_version_gap: bool) -> None:
         flow_id = int(event.flow_id)
         version = int(event.version)
@@ -228,3 +255,7 @@ class ZmqDispatcher:
     @staticmethod
     def expected_flow_update_frame_size() -> int:
         return int(HEADER_SIZE_V1 + FLOW_UPDATE_EVENT_SIZE_V1)
+
+    @staticmethod
+    def expected_flow_stream_upsert_frame_size() -> int:
+        return int(HEADER_SIZE_V1 + FLOW_STREAM_UPSERT_SIZE_V1)

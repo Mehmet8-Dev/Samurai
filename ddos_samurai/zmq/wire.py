@@ -24,6 +24,7 @@ class MessageType(IntEnum):
 
     METRIC_SNAPSHOT = 20
     FLOW_UPDATE = 21
+    FLOW_STREAM_UPSERT = 22
 
     ERROR = 30
 
@@ -91,11 +92,13 @@ _JOB_ENVELOPE_STRUCT = struct.Struct("<16sHIIBdQIQBdiB16sII64s8s8sB16s32s64sB64s
 # NOTE: Field definitions naturally total 64 bytes.
 _METRIC_SNAPSHOT_STRUCT = struct.Struct("<QQQQdddII")
 _FLOW_UPDATE_EVENT_STRUCT = struct.Struct("<QQIIIHHBBHIQ")
+_FLOW_STREAM_UPSERT_STRUCT = struct.Struct("<QQIIIHHBBHIIQQ16sHBBI")
 
 HEADER_SIZE_V1 = _HEADER_STRUCT.size
 JOB_ENVELOPE_SIZE_V1 = _JOB_ENVELOPE_STRUCT.size
 METRIC_SNAPSHOT_SIZE_V1 = _METRIC_SNAPSHOT_STRUCT.size
 FLOW_UPDATE_EVENT_SIZE_V1 = _FLOW_UPDATE_EVENT_STRUCT.size
+FLOW_STREAM_UPSERT_SIZE_V1 = _FLOW_STREAM_UPSERT_STRUCT.size
 
 
 def _pack_fixed_string(value: str, size: int, field_name: str) -> bytes:
@@ -465,6 +468,92 @@ class FlowUpdateEventV1:
             )
         fields = _FLOW_UPDATE_EVENT_STRUCT.unpack(blob)
         return cls(*fields)
+
+
+@dataclass(frozen=True)
+class FlowStreamUpsertV1:
+    version: int
+    epoch: int
+    flow_id: int
+    tcp_seq: int
+    tcp_ack: int
+    src_port: int
+    dst_port: int
+    tcp_state: int
+    proto: int
+    flags: int
+    rtt_us: int
+    quota: int
+    tx_ipg_ns: int
+    dpu_ts_ns: int
+    target_ip: str
+    payload_len: int = 0
+    payload_byte: int = 0
+    weight: int = 1
+    template_id: int = 0
+
+    def pack(self) -> bytes:
+        for name in ("version", "epoch", "tx_ipg_ns", "dpu_ts_ns"):
+            if not (0 <= int(getattr(self, name)) <= 0xFFFFFFFFFFFFFFFF):
+                raise WireProtocolError(f"{name} must fit uint64")
+        if int(self.version) & 1:
+            raise WireProtocolError("version must be even/committed")
+        for name in ("flow_id", "tcp_seq", "tcp_ack", "rtt_us", "quota", "template_id"):
+            if not (0 <= int(getattr(self, name)) <= 0xFFFFFFFF):
+                raise WireProtocolError(f"{name} must fit uint32")
+        for name in ("src_port", "dst_port", "flags", "payload_len"):
+            if not (0 <= int(getattr(self, name)) <= 0xFFFF):
+                raise WireProtocolError(f"{name} must fit uint16")
+        for name in ("tcp_state", "proto", "payload_byte", "weight"):
+            if not (0 <= int(getattr(self, name)) <= 0xFF):
+                raise WireProtocolError(f"{name} must fit uint8")
+        target_ip_raw = _pack_fixed_string(self.target_ip, 16, "target_ip")
+        return _FLOW_STREAM_UPSERT_STRUCT.pack(
+            int(self.version),
+            int(self.epoch),
+            int(self.flow_id),
+            int(self.tcp_seq),
+            int(self.tcp_ack),
+            int(self.src_port),
+            int(self.dst_port),
+            int(self.tcp_state),
+            int(self.proto),
+            int(self.flags),
+            int(self.rtt_us),
+            int(self.quota),
+            int(self.tx_ipg_ns),
+            int(self.dpu_ts_ns),
+            target_ip_raw,
+            int(self.payload_len),
+            int(self.payload_byte),
+            int(self.weight),
+            int(self.template_id),
+        )
+
+    @classmethod
+    def unpack(cls, blob: bytes) -> "FlowStreamUpsertV1":
+        if len(blob) != FLOW_STREAM_UPSERT_SIZE_V1:
+            raise WireProtocolError(
+                f"flow stream upsert size mismatch: {len(blob)} != {FLOW_STREAM_UPSERT_SIZE_V1}"
+            )
+        fields = _FLOW_STREAM_UPSERT_STRUCT.unpack(blob)
+        return cls(*fields[:14], _unpack_fixed_string(fields[14]), *fields[15:])
+
+    def to_flow_update(self) -> FlowUpdateEventV1:
+        return FlowUpdateEventV1(
+            version=self.version,
+            epoch=self.epoch,
+            flow_id=self.flow_id,
+            tcp_seq=self.tcp_seq,
+            tcp_ack=self.tcp_ack,
+            src_port=self.src_port,
+            dst_port=self.dst_port,
+            tcp_state=self.tcp_state,
+            proto=self.proto,
+            flags=self.flags,
+            rtt_us=self.rtt_us,
+            dpu_ts_ns=self.dpu_ts_ns,
+        )
 
 
 _PACING_MODE_MAP: dict[str, PacingMode] = {
