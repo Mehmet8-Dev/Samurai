@@ -1332,6 +1332,10 @@ struct PersistentRuntimeControl {
   uint64_t throttle_events = 0;
   uint64_t drain_attempts = 0;
   uint64_t native_batch_degrade_events = 0;
+  uint64_t contract_poll_events = 0;
+  uint64_t contract_poll_epoch_mismatch = 0;
+  uint64_t contract_poll_inactive_flow = 0;
+  uint64_t contract_poll_stale_events = 0;
 };
 
 struct PersistentKernelStaticConfig {
@@ -1850,8 +1854,6 @@ inline bool persistent_contract_runtime_sync_device_slot_unlocked(
           cudaMemcpyHostToDevice) != cudaSuccess ||
       cudaMemcpy(cr.ring_head_dev + shard, &cr.ring_head[shard], sizeof(uint64_t), cudaMemcpyHostToDevice) !=
           cudaSuccess ||
-      cudaMemcpy(cr.ring_tail_dev + shard, &cr.ring_tail[shard], sizeof(uint64_t), cudaMemcpyHostToDevice) !=
-          cudaSuccess ||
       cudaMemcpy(
           cr.hot_flow_table_dev + flow_id,
           &cr.hot_flow_table[flow_id],
@@ -1867,6 +1869,33 @@ inline bool persistent_contract_runtime_sync_device_slot_unlocked(
           &cr.hot_flow_epochs[flow_id],
           sizeof(uint64_t),
           cudaMemcpyHostToDevice) != cudaSuccess) {
+    cr.device_sync_error_count += 1u;
+    return false;
+  }
+  return true;
+}
+
+inline bool persistent_contract_runtime_refresh_device_tail_unlocked(PersistentContractRuntime& cr, size_t shard) {
+  if (!cr.device_mirror_initialized || !cr.ring_tail_dev || shard >= cr.ring_tail.size()) {
+    return true;
+  }
+  uint64_t device_tail = 0u;
+  if (cudaMemcpy(&device_tail, cr.ring_tail_dev + shard, sizeof(device_tail), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    cr.device_sync_error_count += 1u;
+    return false;
+  }
+  if (device_tail > cr.ring_tail[shard]) {
+    cr.ring_tail[shard] = device_tail;
+  }
+  return true;
+}
+
+inline bool persistent_contract_runtime_sync_device_tail_unlocked(PersistentContractRuntime& cr, size_t shard) {
+  if (!cr.device_mirror_initialized || !cr.ring_tail_dev || shard >= cr.ring_tail.size()) {
+    return true;
+  }
+  if (cudaMemcpy(cr.ring_tail_dev + shard, &cr.ring_tail[shard], sizeof(uint64_t), cudaMemcpyHostToDevice) !=
+      cudaSuccess) {
     cr.device_sync_error_count += 1u;
     return false;
   }
@@ -3442,6 +3471,10 @@ __device__ inline int32_t i32_load(const volatile int32_t* p) {
   return *p;
 }
 
+__device__ inline uint64_t u64_load(const volatile uint64_t* p) {
+  return *p;
+}
+
 __device__ inline uint64_t u64_add(volatile uint64_t* p, uint64_t v) {
   return atomicAdd((unsigned long long*)p, static_cast<unsigned long long>(v));
 }
@@ -3642,6 +3675,134 @@ __global__ void persistent_quota_refill_kernel(
   sv->quota_left = static_cast<uint32_t>(next_left);
 }
 
+__device__ inline void persistent_contract_poll_assigned_shard(
+    volatile PersistentRuntimeControl* ctrl,
+    volatile PersistentDeviceStreamState* streams,
+    const volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* contract_update_ring,
+    volatile uint64_t* contract_ring_head,
+    volatile uint64_t* contract_ring_tail,
+    volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* contract_hot_flow_table,
+    volatile uint64_t* contract_hot_flow_versions,
+    volatile uint64_t* contract_hot_flow_epochs,
+    int32_t contract_shard_count,
+    int32_t contract_ring_slots_per_shard,
+    int32_t contract_hot_flow_capacity,
+    int32_t max_streams,
+    uint32_t lane) {
+  using FlowUpdateEvent = ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1;
+  if (!ctrl || !streams || !contract_update_ring || !contract_ring_head || !contract_ring_tail ||
+      !contract_hot_flow_table || !contract_hot_flow_versions || !contract_hot_flow_epochs ||
+      contract_shard_count <= 0 || contract_ring_slots_per_shard <= 0 || contract_hot_flow_capacity <= 0 ||
+      max_streams <= 0) {
+    return;
+  }
+  // The first warp is the block-local polling scope. Lane 0 owns the shard tail,
+  // so each shard still has a single GPU-side consumer.
+  if (threadIdx.x >= 32 || lane != 0u) {
+    return;
+  }
+  const int32_t shard = static_cast<int32_t>(blockIdx.x);
+  if (shard < 0 || shard >= contract_shard_count) {
+    return;
+  }
+  const uint64_t head = u64_load(contract_ring_head + shard);
+  const uint64_t tail = u64_load(contract_ring_tail + shard);
+  if (tail >= head) {
+    return;
+  }
+
+  const uint64_t slot = tail % static_cast<uint64_t>(contract_ring_slots_per_shard);
+  const size_t ring_index =
+      (static_cast<size_t>(shard) * static_cast<size_t>(contract_ring_slots_per_shard)) +
+      static_cast<size_t>(slot);
+  const volatile FlowUpdateEvent* entry = contract_update_ring + ring_index;
+  FlowUpdateEvent ev{};
+  bool loaded = false;
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    const uint64_t v1 = u64_load(&entry->version);
+    if (v1 == 0u || (v1 & 1ull) != 0ull) {
+      return;
+    }
+    __threadfence_system();
+    ev.version = v1;
+    ev.epoch = u64_load(&entry->epoch);
+    ev.flow_id = entry->flow_id;
+    ev.tcp_seq = entry->tcp_seq;
+    ev.tcp_ack = entry->tcp_ack;
+    ev.src_port = entry->src_port;
+    ev.dst_port = entry->dst_port;
+    ev.tcp_state = entry->tcp_state;
+    ev.proto = entry->proto;
+    ev.flags = entry->flags;
+    ev.rtt_us = entry->rtt_us;
+    ev.dpu_ts_ns = u64_load(&entry->dpu_ts_ns);
+    __threadfence_system();
+    const uint64_t v2 = u64_load(&entry->version);
+    if (v1 == v2 && (v2 & 1ull) == 0ull) {
+      loaded = true;
+      break;
+    }
+  }
+  if (!loaded) {
+    return;
+  }
+
+  bool should_apply = true;
+  if (ev.flow_id >= static_cast<uint32_t>(contract_hot_flow_capacity)) {
+    should_apply = false;
+    u64_add(&ctrl->contract_poll_stale_events, 1u);
+  } else {
+    const uint64_t current_version = u64_load(contract_hot_flow_versions + ev.flow_id);
+    const uint64_t current_epoch = u64_load(contract_hot_flow_epochs + ev.flow_id);
+    if (current_version != 0u && ev.version < current_version) {
+      should_apply = false;
+      u64_add(&ctrl->contract_poll_stale_events, 1u);
+    }
+    if (current_epoch != 0u && ev.epoch < current_epoch) {
+      should_apply = false;
+      u64_add(&ctrl->contract_poll_epoch_mismatch, 1u);
+    }
+  }
+
+  if (should_apply) {
+    volatile FlowUpdateEvent* hot = contract_hot_flow_table + ev.flow_id;
+    hot->version = ev.version;
+    hot->epoch = ev.epoch;
+    hot->flow_id = ev.flow_id;
+    hot->tcp_seq = ev.tcp_seq;
+    hot->tcp_ack = ev.tcp_ack;
+    hot->src_port = ev.src_port;
+    hot->dst_port = ev.dst_port;
+    hot->tcp_state = ev.tcp_state;
+    hot->proto = ev.proto;
+    hot->flags = ev.flags;
+    hot->rtt_us = ev.rtt_us;
+    hot->dpu_ts_ns = ev.dpu_ts_ns;
+    contract_hot_flow_versions[ev.flow_id] = ev.version;
+    contract_hot_flow_epochs[ev.flow_id] = ev.epoch;
+
+    if (ev.flow_id < static_cast<uint32_t>(max_streams)) {
+      volatile PersistentDeviceStreamState* sv = streams + ev.flow_id;
+      if (i32_load(&sv->active) != 0) {
+        if (ev.src_port != 0u) {
+          sv->source_port = ev.src_port;
+          sv->source_port_mode = 1u;
+        }
+        if (ev.flags != 0u) {
+          sv->tcp_flags = ev.flags;
+        }
+        sv->seq_counter = ev.tcp_seq;
+      } else {
+        u64_add(&ctrl->contract_poll_inactive_flow, 1u);
+      }
+    }
+    u64_add(&ctrl->contract_poll_events, 1u);
+  }
+
+  __threadfence_system();
+  contract_ring_tail[shard] = tail + 1u;
+}
+
 __global__ void persistent_dataplane_kernel(
     volatile int32_t* run_flag_dev,
     volatile PersistentRuntimeControl* ctrl,
@@ -3651,7 +3812,16 @@ __global__ void persistent_dataplane_kernel(
     int32_t* queue_slot_hint,
     uint8_t* payload_base,
     const uint64_t* doca_gpu_txq_handles,
-    const uint32_t* doca_txq_mkeys_be) {
+    const uint32_t* doca_txq_mkeys_be,
+    const volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* contract_update_ring,
+    volatile uint64_t* contract_ring_head,
+    volatile uint64_t* contract_ring_tail,
+    volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* contract_hot_flow_table,
+    volatile uint64_t* contract_hot_flow_versions,
+    volatile uint64_t* contract_hot_flow_epochs,
+    int32_t contract_shard_count,
+    int32_t contract_ring_slots_per_shard,
+    int32_t contract_hot_flow_capacity) {
   const uint32_t tid = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   const uint32_t workers = static_cast<uint32_t>(gridDim.x * blockDim.x);
   constexpr uint32_t kWarpWidth = 32u;
@@ -3702,6 +3872,20 @@ __global__ void persistent_dataplane_kernel(
     if (tid == 0u) {
       u64_add(&ctrl->heartbeat, 1u);
     }
+    persistent_contract_poll_assigned_shard(
+        ctrl,
+        streams,
+        contract_update_ring,
+        contract_ring_head,
+        contract_ring_tail,
+        contract_hot_flow_table,
+        contract_hot_flow_versions,
+        contract_hot_flow_epochs,
+        contract_shard_count,
+        contract_ring_slots_per_shard,
+        contract_hot_flow_capacity,
+        max_streams,
+        lane);
     bool produced = false;
     int active_streams = i32_load(&ctrl->active_streams);
     if (active_streams < 1) {
@@ -4932,6 +5116,11 @@ inline bool persistent_launch_kernel() {
   if (rt.doca_kernel_direct_tx && (!rt.doca_gpu_txq_handles_dev || !rt.doca_txq_mkeys_be_dev)) {
     return false;
   }
+  PersistentContractRuntime& cr = g_persistent_contract_runtime;
+  if (!cr.initialized || !cr.device_mirror_initialized || !cr.update_ring_dev || !cr.ring_head_dev ||
+      !cr.ring_tail_dev || !cr.hot_flow_table_dev || !cr.hot_flow_versions_dev || !cr.hot_flow_epochs_dev) {
+    return false;
+  }
   if (!rt.kernel_stream) {
     if (cudaStreamCreateWithFlags(&rt.kernel_stream, cudaStreamNonBlocking) != cudaSuccess) {
       return false;
@@ -4988,7 +5177,16 @@ inline bool persistent_launch_kernel() {
       rt.queue_slot_hint_dev,
       rt.payload_dev,
       rt.doca_gpu_txq_handles_dev,
-      rt.doca_txq_mkeys_be_dev);
+      rt.doca_txq_mkeys_be_dev,
+      cr.update_ring_dev,
+      cr.ring_head_dev,
+      cr.ring_tail_dev,
+      cr.hot_flow_table_dev,
+      cr.hot_flow_versions_dev,
+      cr.hot_flow_epochs_dev,
+      cr.shard_count,
+      cr.ring_slots_per_shard,
+      cr.hot_flow_capacity);
   return (cudaPeekAtLastError() == cudaSuccess);
 }
 
@@ -6191,6 +6389,9 @@ extern "C" int samurai_gpu_packet_contract_publish_flow_update_v1(
   }
 
   const int shard = static_cast<int>(flow_id % static_cast<uint32_t>(cr.shard_count));
+  if (!persistent_contract_runtime_refresh_device_tail_unlocked(cr, static_cast<size_t>(shard))) {
+    return set_c_api_error("failed to refresh contract device tail");
+  }
   uint64_t& head = cr.ring_head[static_cast<size_t>(shard)];
   uint64_t& tail = cr.ring_tail[static_cast<size_t>(shard)];
   const uint64_t used = (head >= tail) ? (head - tail) : 0u;
@@ -6205,6 +6406,9 @@ extern "C" int samurai_gpu_packet_contract_publish_flow_update_v1(
       return set_c_api_error("contract ring overflow (hard fail)");
     }
     tail += 1u;
+    if (!persistent_contract_runtime_sync_device_tail_unlocked(cr, static_cast<size_t>(shard))) {
+      return set_c_api_error("failed to sync contract controlled-drop tail");
+    }
   }
 
   const size_t shard_base = static_cast<size_t>(shard) * static_cast<size_t>(cr.ring_slots_per_shard);
@@ -6720,6 +6924,14 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << "\"drain_attempts\":" << (rt_active ? g_persistent_runtime.ctrl->drain_attempts : 0u) << ","
         << "\"native_batch_degrade_events\":"
         << (rt_active ? g_persistent_runtime.ctrl->native_batch_degrade_events : 0u) << ","
+        << "\"contract_kernel_poll_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_events : 0u) << ","
+        << "\"contract_kernel_poll_epoch_mismatch_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_epoch_mismatch : 0u) << ","
+        << "\"contract_kernel_poll_inactive_flow_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_inactive_flow : 0u) << ","
+        << "\"contract_kernel_poll_stale_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_stale_events : 0u) << ","
         << "\"compat_fallback_count\":" << g_compat_fallback_count.load(std::memory_order_relaxed) << ","
         << "\"persistent_tx_backend\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.active) << "\","
         << "\"persistent_doca_kernel_direct_tx\":"

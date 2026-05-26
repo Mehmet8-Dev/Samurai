@@ -475,11 +475,33 @@ def test_m3_cuda_contract_runtime_has_device_visible_mirror() -> None:
     assert "hot_flow_epochs_dev" in src
     assert "persistent_contract_runtime_alloc_device_mirror_unlocked" in src
     assert "persistent_contract_runtime_sync_device_slot_unlocked" in src
+    assert "persistent_contract_runtime_refresh_device_tail_unlocked" in src
+    assert "persistent_contract_runtime_sync_device_tail_unlocked" in src
     assert "cudaMalloc(&cr.update_ring_dev" in src
     assert "cudaMemcpy(cr.ring_head_dev + shard" in src
     assert "failed to sync contract update into device mirror" in src
     assert "contract_device_mirror_active" in src
     assert "contract_device_sync_error_events" in src
+
+
+def test_m3_cuda_persistent_kernel_drains_contract_ring() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "gpu_packet_cuda" / "host_api.cuh").read_text(encoding="utf-8")
+    assert "persistent_contract_poll_assigned_shard" in src
+    assert "contract_update_ring" in src
+    assert "contract_ring_head" in src
+    assert "contract_ring_tail" in src
+    assert "contract_hot_flow_table" in src
+    assert "contract_hot_flow_versions" in src
+    assert "contract_hot_flow_epochs" in src
+    assert "threadIdx.x >= 32 || lane != 0u" in src
+    assert "const int32_t shard = static_cast<int32_t>(blockIdx.x)" in src
+    assert "contract_ring_tail[shard] = tail + 1u" in src
+    assert "sv->source_port = ev.src_port" in src
+    assert "sv->tcp_flags = ev.flags" in src
+    assert "sv->seq_counter = ev.tcp_seq" in src
+    assert "contract_poll_events" in src
+    assert "contract_kernel_poll_events" in src
 
 
 def test_m3_l7_worker_has_real_runtime_and_failfast_fallback() -> None:
