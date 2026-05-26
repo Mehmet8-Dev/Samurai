@@ -48,6 +48,11 @@ using BackendGetStatsFn = int (*)(int handle, DocaGpuNetioStats* out, char* err,
 using BackendGetGpuTxqHandleFn =
     int (*)(int handle, uint64_t* out_gpu_txq_handle, char* err, size_t err_len);
 using BackendGetTxqMkeyBeFn = int (*)(int handle, uint32_t* out_mkey_be, char* err, size_t err_len);
+using BackendContractWriterOpenFn =
+    int (*)(const DocaContractWriterConfigV1* cfg, int* out_handle, char* err, size_t err_len);
+using BackendContractWriterCloseFn = int (*)(int handle, char* err, size_t err_len);
+using BackendContractWriterPublishFlowUpdateFn =
+    int (*)(int handle, const DocaFlowUpdateEventV1* event, char* err, size_t err_len);
 
 struct BackendDispatch {
   BackendCreateTxqFn create_txq = nullptr;
@@ -57,6 +62,9 @@ struct BackendDispatch {
   BackendGetStatsFn get_stats = nullptr;
   BackendGetGpuTxqHandleFn get_gpu_txq_handle = nullptr;
   BackendGetTxqMkeyBeFn get_txq_mkey_be = nullptr;
+  BackendContractWriterOpenFn contract_writer_open = nullptr;
+  BackendContractWriterCloseFn contract_writer_close = nullptr;
+  BackendContractWriterPublishFlowUpdateFn contract_writer_publish_flow_update = nullptr;
 };
 
 std::mutex g_backend_lock;
@@ -187,6 +195,25 @@ inline bool ensure_backend_loaded_unlocked(std::string& why) {
   g_backend.get_stats = reinterpret_cast<BackendGetStatsFn>(p_stats);
   g_backend.get_gpu_txq_handle = reinterpret_cast<BackendGetGpuTxqHandleFn>(p_gpu_txq);
   g_backend.get_txq_mkey_be = reinterpret_cast<BackendGetTxqMkeyBeFn>(p_mkey);
+  void* p_contract_open = nullptr;
+  void* p_contract_close = nullptr;
+  void* p_contract_publish = nullptr;
+  dlerror();
+  p_contract_open = dlsym(g_backend_so, "samurai_doca_backend_contract_writer_open");
+  if (dlerror() == nullptr && p_contract_open != nullptr) {
+    g_backend.contract_writer_open = reinterpret_cast<BackendContractWriterOpenFn>(p_contract_open);
+  }
+  dlerror();
+  p_contract_close = dlsym(g_backend_so, "samurai_doca_backend_contract_writer_close");
+  if (dlerror() == nullptr && p_contract_close != nullptr) {
+    g_backend.contract_writer_close = reinterpret_cast<BackendContractWriterCloseFn>(p_contract_close);
+  }
+  dlerror();
+  p_contract_publish = dlsym(g_backend_so, "samurai_doca_backend_contract_writer_publish_flow_update_v1");
+  if (dlerror() == nullptr && p_contract_publish != nullptr) {
+    g_backend.contract_writer_publish_flow_update =
+        reinterpret_cast<BackendContractWriterPublishFlowUpdateFn>(p_contract_publish);
+  }
   return true;
 }
 
@@ -332,6 +359,68 @@ inline int shim_get_txq_mkey_be(int handle, uint32_t* out_mkey_be, char* err, si
   return g_backend.get_txq_mkey_be(handle, out_mkey_be, err, err_len);
 }
 
+inline int shim_contract_writer_open(
+    const DocaContractWriterConfigV1* cfg,
+    int* out_handle,
+    char* err,
+    size_t err_len) {
+  if (!env_flag("SAMURAI_GPU_DOCA_ENABLE", false)) {
+    write_err(err, err_len, "doca_gpunetio disabled for contract writer");
+    return -1;
+  }
+  if (!cfg || !out_handle || cfg->region_spec[0] == '\0') {
+    write_err(err, err_len, "invalid DOCA contract writer open arguments");
+    return -1;
+  }
+  std::lock_guard<std::mutex> guard(g_backend_lock);
+  std::string why;
+  if (!ensure_backend_loaded_unlocked(why)) {
+    write_err(err, err_len, why);
+    return -1;
+  }
+  if (!g_backend.contract_writer_open) {
+    write_err(err, err_len, "doca_contract_writer_unavailable");
+    return -1;
+  }
+  return g_backend.contract_writer_open(cfg, out_handle, err, err_len);
+}
+
+inline int shim_contract_writer_close(int handle, char* err, size_t err_len) {
+  std::lock_guard<std::mutex> guard(g_backend_lock);
+  std::string why;
+  if (!ensure_backend_loaded_unlocked(why)) {
+    write_err(err, err_len, why);
+    return -1;
+  }
+  if (!g_backend.contract_writer_close) {
+    write_err(err, err_len, "doca_contract_writer_unavailable");
+    return -1;
+  }
+  return g_backend.contract_writer_close(handle, err, err_len);
+}
+
+inline int shim_contract_writer_publish_flow_update(
+    int handle,
+    const DocaFlowUpdateEventV1* event,
+    char* err,
+    size_t err_len) {
+  if (!event) {
+    write_err(err, err_len, "invalid DOCA contract writer event");
+    return -1;
+  }
+  std::lock_guard<std::mutex> guard(g_backend_lock);
+  std::string why;
+  if (!ensure_backend_loaded_unlocked(why)) {
+    write_err(err, err_len, why);
+    return -1;
+  }
+  if (!g_backend.contract_writer_publish_flow_update) {
+    write_err(err, err_len, "doca_contract_writer_unavailable");
+    return -1;
+  }
+  return g_backend.contract_writer_publish_flow_update(handle, event, err, err_len);
+}
+
 }  // namespace
 
 extern "C" DocaGpuNetioApiV1* samurai_doca_gpunetio_get_api_v1(void) {
@@ -346,6 +435,9 @@ extern "C" DocaGpuNetioApiV1* samurai_doca_gpunetio_get_api_v1(void) {
     api.get_stats = shim_get_stats;
     api.get_gpu_txq_handle = shim_get_gpu_txq_handle;
     api.get_txq_mkey_be = shim_get_txq_mkey_be;
+    api.contract_writer_open = shim_contract_writer_open;
+    api.contract_writer_close = shim_contract_writer_close;
+    api.contract_writer_publish_flow_update_v1 = shim_contract_writer_publish_flow_update;
   });
   return &api;
 }
