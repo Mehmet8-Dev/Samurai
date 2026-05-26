@@ -507,6 +507,7 @@ int samurai_gpu_packet_contract_publish_flow_update_v1(
 int samurai_gpu_packet_contract_read_hot_flow_v1(
     uint32_t flow_id,
     samurai_gpu_packet_flow_update_event_v1* out_event);
+int samurai_gpu_packet_contract_export_region_v1(char* out_spec, size_t out_spec_len);
 
 int samurai_gpu_packet_set_kernel_mode(int mode);
 int samurai_gpu_packet_get_kernel_mode();
