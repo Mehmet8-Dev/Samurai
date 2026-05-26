@@ -440,6 +440,14 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "BuildFlowStreamUpsert" in src
     assert "PublishDpuFlowStreamUpsert" in src
     assert "PublishDpuFlowUpdate" in src
+    assert "DpuContractWriterGuard" in src
+    assert "OpenDpuContractRdmaWriter" in src
+    assert "PublishDpuFlowUpdateOptionalRdma" in src
+    assert "--dpu-contract-rdma" in src
+    assert "SAMURAI_DPU_CONTRACT_RDMA" in src
+    assert "SAMURAI_DPU_CONTRACT_RDMA_SPEC" in src
+    assert "dpu_contract_rdma_writer_unavailable" in src
+    assert "dpu_contract_rdma_publish_failed" in src
     assert "MessageType::FLOW_UPDATE" in src
     assert "MessageType::FLOW_STREAM_UPSERT" in src
     assert "ZMQ_DONTWAIT" in src
@@ -494,9 +502,15 @@ def test_m3_cuda_persistent_kernel_drains_contract_ring() -> None:
     assert "contract_hot_flow_table" in src
     assert "contract_hot_flow_versions" in src
     assert "contract_hot_flow_epochs" in src
-    assert "threadIdx.x >= 32 || lane != 0u" in src
+    assert "kPollWarpWidth = 32u" in src
+    assert "lane < drain_count" in src
+    assert "loaded_mask = __ballot_sync" in src
+    assert "s_contract_flow_ids" in src
+    assert "s_contract_versions" in src
+    assert "for (uint32_t other_lane = lane + 1u" in src
+    assert "contiguous_loaded" in src
     assert "const int32_t shard = static_cast<int32_t>(blockIdx.x)" in src
-    assert "contract_ring_tail[shard] = tail + 1u" in src
+    assert "contract_ring_tail[shard] = tail + static_cast<uint64_t>(contiguous_loaded)" in src
     assert "sv->source_port = ev.src_port" in src
     assert "sv->tcp_flags = ev.flags" in src
     assert "sv->seq_counter = ev.tcp_seq" in src
