@@ -2,6 +2,11 @@
 // When opened standalone by IDE analysis, pull required fragments here.
 #include "../gpu_packet_cuda.hpp"
 #include <cstdio>
+#include <fcntl.h>
+#include <limits>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "tx_backend_doca_gpunetio.cuh"
 #include "zero_copy_dataplane_contract.cuh"
 #ifndef SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
@@ -1760,6 +1765,14 @@ struct PersistentContractRuntime {
   ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* hot_flow_table_dev = nullptr;
   uint64_t* hot_flow_versions_dev = nullptr;
   uint64_t* hot_flow_epochs_dev = nullptr;
+  void* export_region_host = nullptr;
+  void* export_region_dev = nullptr;
+  size_t export_region_bytes = 0u;
+  int export_region_fd = -1;
+  std::string export_region_path{};
+  std::string export_region_spec{};
+  bool export_region_registered = false;
+  bool export_region_file_backed = false;
   uint64_t publish_count = 0u;
   uint64_t drop_count = 0u;
   uint64_t version_gap_count = 0u;
@@ -1778,32 +1791,132 @@ inline uint64_t now_ns_steady() {
           .count());
 }
 
+struct PersistentContractRegionLayout {
+  size_t ring_head_off = 0u;
+  size_t ring_tail_off = 0u;
+  size_t update_ring_off = 0u;
+  size_t hot_flow_table_off = 0u;
+  size_t hot_flow_versions_off = 0u;
+  size_t hot_flow_epochs_off = 0u;
+  size_t total_bytes = 0u;
+};
+
+inline bool persistent_checked_add_size(size_t a, size_t b, size_t* out) {
+  if (!out || a > std::numeric_limits<size_t>::max() - b) {
+    return false;
+  }
+  *out = a + b;
+  return true;
+}
+
+inline bool persistent_checked_mul_size(size_t a, size_t b, size_t* out) {
+  if (!out || (a != 0u && b > std::numeric_limits<size_t>::max() / a)) {
+    return false;
+  }
+  *out = a * b;
+  return true;
+}
+
+inline bool persistent_contract_region_layout(
+    size_t shard_count,
+    size_t ring_slots_per_shard,
+    size_t hot_flow_capacity,
+    PersistentContractRegionLayout* out) {
+  if (!out || shard_count == 0u || ring_slots_per_shard == 0u || hot_flow_capacity == 0u) {
+    return false;
+  }
+  size_t shard_bytes = 0u;
+  size_t ring_slots = 0u;
+  size_t ring_bytes = 0u;
+  size_t hot_flow_bytes = 0u;
+  size_t hot_meta_bytes = 0u;
+  const size_t event_bytes = sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1);
+  if (!persistent_checked_mul_size(shard_count, sizeof(uint64_t), &shard_bytes) ||
+      !persistent_checked_mul_size(shard_count, ring_slots_per_shard, &ring_slots) ||
+      !persistent_checked_mul_size(ring_slots, event_bytes, &ring_bytes) ||
+      !persistent_checked_mul_size(hot_flow_capacity, event_bytes, &hot_flow_bytes) ||
+      !persistent_checked_mul_size(hot_flow_capacity, sizeof(uint64_t), &hot_meta_bytes)) {
+    return false;
+  }
+  PersistentContractRegionLayout layout{};
+  size_t cur = 0u;
+  layout.ring_head_off = cur;
+  if (!persistent_checked_add_size(cur, shard_bytes, &cur)) return false;
+  layout.ring_tail_off = cur;
+  if (!persistent_checked_add_size(cur, shard_bytes, &cur)) return false;
+  layout.update_ring_off = cur;
+  if (!persistent_checked_add_size(cur, ring_bytes, &cur)) return false;
+  layout.hot_flow_table_off = cur;
+  if (!persistent_checked_add_size(cur, hot_flow_bytes, &cur)) return false;
+  layout.hot_flow_versions_off = cur;
+  if (!persistent_checked_add_size(cur, hot_meta_bytes, &cur)) return false;
+  layout.hot_flow_epochs_off = cur;
+  if (!persistent_checked_add_size(cur, hot_meta_bytes, &cur)) return false;
+  layout.total_bytes = cur;
+  *out = layout;
+  return true;
+}
+
+inline std::string persistent_contract_default_export_path() {
+  const char* env_path = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_PATH");
+  if (env_path && *env_path) {
+    return std::string(env_path);
+  }
+  const char* dir = (::access("/dev/shm", W_OK) == 0) ? "/dev/shm" : "/tmp";
+  return std::string(dir) + "/samurai_gpu_contract_" + std::to_string(static_cast<long long>(::getuid())) + ".bin";
+}
+
+inline uint8_t* persistent_contract_region_base(PersistentContractRuntime& cr) {
+  return static_cast<uint8_t*>(cr.export_region_host);
+}
+
+inline void persistent_contract_store_event_slot(
+    volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* dst,
+    const ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1& ev) {
+  const uint64_t begin_version = (ev.version > 0u && (ev.version & 1ull) == 0ull) ? (ev.version - 1ull) : (ev.version | 1ull);
+  __atomic_store_n(&dst->version, begin_version, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  dst->epoch = ev.epoch;
+  dst->flow_id = ev.flow_id;
+  dst->tcp_seq = ev.tcp_seq;
+  dst->tcp_ack = ev.tcp_ack;
+  dst->src_port = ev.src_port;
+  dst->dst_port = ev.dst_port;
+  dst->tcp_state = ev.tcp_state;
+  dst->proto = ev.proto;
+  dst->flags = ev.flags;
+  dst->rtt_us = ev.rtt_us;
+  dst->dpu_ts_ns = ev.dpu_ts_ns;
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n(&dst->version, ev.version, __ATOMIC_RELEASE);
+}
+
 inline void persistent_contract_runtime_release_unlocked() {
   auto& cr = g_persistent_contract_runtime;
-  if (cr.update_ring_dev) {
-    (void)cudaFree(cr.update_ring_dev);
-    cr.update_ring_dev = nullptr;
+  if (cr.export_region_registered && cr.export_region_host) {
+    (void)cudaHostUnregister(cr.export_region_host);
   }
-  if (cr.ring_head_dev) {
-    (void)cudaFree(cr.ring_head_dev);
-    cr.ring_head_dev = nullptr;
+  if (cr.export_region_file_backed && cr.export_region_host && cr.export_region_bytes > 0u) {
+    (void)::msync(cr.export_region_host, cr.export_region_bytes, MS_SYNC);
+    (void)::munmap(cr.export_region_host, cr.export_region_bytes);
   }
-  if (cr.ring_tail_dev) {
-    (void)cudaFree(cr.ring_tail_dev);
-    cr.ring_tail_dev = nullptr;
+  if (cr.export_region_fd >= 0) {
+    (void)::close(cr.export_region_fd);
   }
-  if (cr.hot_flow_table_dev) {
-    (void)cudaFree(cr.hot_flow_table_dev);
-    cr.hot_flow_table_dev = nullptr;
-  }
-  if (cr.hot_flow_versions_dev) {
-    (void)cudaFree(cr.hot_flow_versions_dev);
-    cr.hot_flow_versions_dev = nullptr;
-  }
-  if (cr.hot_flow_epochs_dev) {
-    (void)cudaFree(cr.hot_flow_epochs_dev);
-    cr.hot_flow_epochs_dev = nullptr;
-  }
+  cr.update_ring_dev = nullptr;
+  cr.ring_head_dev = nullptr;
+  cr.ring_tail_dev = nullptr;
+  cr.hot_flow_table_dev = nullptr;
+  cr.hot_flow_versions_dev = nullptr;
+  cr.hot_flow_epochs_dev = nullptr;
+  cr.export_region_host = nullptr;
+  cr.export_region_dev = nullptr;
+  cr.export_region_bytes = 0u;
+  cr.export_region_fd = -1;
+  cr.export_region_path.clear();
+  cr.export_region_spec.clear();
+  cr.export_region_registered = false;
+  cr.export_region_file_backed = false;
   cr.shard_count = 0;
   cr.ring_slots_per_shard = 0;
   cr.hot_flow_capacity = 0;
@@ -1829,40 +1942,59 @@ inline bool persistent_contract_runtime_alloc_device_mirror_unlocked(
     size_t ring_total,
     size_t shard_count_s,
     size_t hot_flow_capacity_s) {
-  const size_t event_bytes = sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1);
-  const size_t ring_bytes = ring_total * event_bytes;
-  const size_t shard_bytes = shard_count_s * sizeof(uint64_t);
-  const size_t hot_flow_bytes = hot_flow_capacity_s * event_bytes;
-  const size_t hot_meta_bytes = hot_flow_capacity_s * sizeof(uint64_t);
-  if (ring_bytes == 0u || shard_bytes == 0u || hot_flow_bytes == 0u || hot_meta_bytes == 0u) {
+  (void)ring_total;
+  PersistentContractRegionLayout layout{};
+  if (!persistent_contract_region_layout(
+          shard_count_s,
+          static_cast<size_t>(cr.ring_slots_per_shard),
+          hot_flow_capacity_s,
+          &layout)) {
     return false;
   }
-  if (cudaMalloc(&cr.update_ring_dev, ring_bytes) != cudaSuccess || !cr.update_ring_dev) {
+  const std::string path = persistent_contract_default_export_path();
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (fd < 0) {
     return false;
   }
-  if (cudaMalloc(&cr.ring_head_dev, shard_bytes) != cudaSuccess || !cr.ring_head_dev) {
+  if (::ftruncate(fd, static_cast<off_t>(layout.total_bytes)) != 0) {
+    (void)::close(fd);
     return false;
   }
-  if (cudaMalloc(&cr.ring_tail_dev, shard_bytes) != cudaSuccess || !cr.ring_tail_dev) {
+  void* mapped = ::mmap(nullptr, layout.total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (mapped == MAP_FAILED || !mapped) {
+    (void)::close(fd);
     return false;
   }
-  if (cudaMalloc(&cr.hot_flow_table_dev, hot_flow_bytes) != cudaSuccess || !cr.hot_flow_table_dev) {
+  std::memset(mapped, 0, layout.total_bytes);
+  if (cudaHostRegister(mapped, layout.total_bytes, cudaHostRegisterMapped) != cudaSuccess) {
+    (void)::munmap(mapped, layout.total_bytes);
+    (void)::close(fd);
     return false;
   }
-  if (cudaMalloc(&cr.hot_flow_versions_dev, hot_meta_bytes) != cudaSuccess || !cr.hot_flow_versions_dev) {
+  void* dev_base = nullptr;
+  if (cudaHostGetDevicePointer(&dev_base, mapped, 0) != cudaSuccess || !dev_base) {
+    (void)cudaHostUnregister(mapped);
+    (void)::munmap(mapped, layout.total_bytes);
+    (void)::close(fd);
     return false;
   }
-  if (cudaMalloc(&cr.hot_flow_epochs_dev, hot_meta_bytes) != cudaSuccess || !cr.hot_flow_epochs_dev) {
-    return false;
-  }
-  if (cudaMemset(cr.update_ring_dev, 0, ring_bytes) != cudaSuccess ||
-      cudaMemset(cr.ring_head_dev, 0, shard_bytes) != cudaSuccess ||
-      cudaMemset(cr.ring_tail_dev, 0, shard_bytes) != cudaSuccess ||
-      cudaMemset(cr.hot_flow_table_dev, 0, hot_flow_bytes) != cudaSuccess ||
-      cudaMemset(cr.hot_flow_versions_dev, 0, hot_meta_bytes) != cudaSuccess ||
-      cudaMemset(cr.hot_flow_epochs_dev, 0, hot_meta_bytes) != cudaSuccess) {
-    return false;
-  }
+  cr.export_region_host = mapped;
+  cr.export_region_dev = dev_base;
+  cr.export_region_bytes = layout.total_bytes;
+  cr.export_region_fd = fd;
+  cr.export_region_path = path;
+  cr.export_region_spec = std::string("file=") + path + ",size=" + std::to_string(layout.total_bytes);
+  cr.export_region_registered = true;
+  cr.export_region_file_backed = true;
+  auto* dev_u8 = static_cast<uint8_t*>(dev_base);
+  cr.ring_head_dev = reinterpret_cast<uint64_t*>(dev_u8 + layout.ring_head_off);
+  cr.ring_tail_dev = reinterpret_cast<uint64_t*>(dev_u8 + layout.ring_tail_off);
+  cr.update_ring_dev = reinterpret_cast<ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      dev_u8 + layout.update_ring_off);
+  cr.hot_flow_table_dev = reinterpret_cast<ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      dev_u8 + layout.hot_flow_table_off);
+  cr.hot_flow_versions_dev = reinterpret_cast<uint64_t*>(dev_u8 + layout.hot_flow_versions_off);
+  cr.hot_flow_epochs_dev = reinterpret_cast<uint64_t*>(dev_u8 + layout.hot_flow_epochs_off);
   cr.device_mirror_initialized = true;
   return true;
 }
@@ -1882,43 +2014,50 @@ inline bool persistent_contract_runtime_sync_device_slot_unlocked(
     cr.device_sync_error_count += 1u;
     return false;
   }
-  if (cudaMemcpy(
-          cr.update_ring_dev + ring_index,
-          &cr.update_ring[ring_index],
-          sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1),
-          cudaMemcpyHostToDevice) != cudaSuccess ||
-      cudaMemcpy(cr.ring_head_dev + shard, &cr.ring_head[shard], sizeof(uint64_t), cudaMemcpyHostToDevice) !=
-          cudaSuccess ||
-      cudaMemcpy(
-          cr.hot_flow_table_dev + flow_id,
-          &cr.hot_flow_table[flow_id],
-          sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1),
-          cudaMemcpyHostToDevice) != cudaSuccess ||
-      cudaMemcpy(
-          cr.hot_flow_versions_dev + flow_id,
-          &cr.hot_flow_versions[flow_id],
-          sizeof(uint64_t),
-          cudaMemcpyHostToDevice) != cudaSuccess ||
-      cudaMemcpy(
-          cr.hot_flow_epochs_dev + flow_id,
-          &cr.hot_flow_epochs[flow_id],
-          sizeof(uint64_t),
-          cudaMemcpyHostToDevice) != cudaSuccess) {
+  PersistentContractRegionLayout layout{};
+  if (!cr.export_region_host ||
+      !persistent_contract_region_layout(
+          static_cast<size_t>(cr.shard_count),
+          static_cast<size_t>(cr.ring_slots_per_shard),
+          static_cast<size_t>(cr.hot_flow_capacity),
+          &layout) ||
+      cr.export_region_bytes < layout.total_bytes) {
     cr.device_sync_error_count += 1u;
     return false;
   }
+  auto* base = persistent_contract_region_base(cr);
+  auto* heads = reinterpret_cast<volatile uint64_t*>(base + layout.ring_head_off);
+  auto* ring = reinterpret_cast<volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      base + layout.update_ring_off);
+  auto* hot = reinterpret_cast<volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      base + layout.hot_flow_table_off);
+  auto* hot_versions = reinterpret_cast<volatile uint64_t*>(base + layout.hot_flow_versions_off);
+  auto* hot_epochs = reinterpret_cast<volatile uint64_t*>(base + layout.hot_flow_epochs_off);
+  persistent_contract_store_event_slot(ring + ring_index, cr.update_ring[ring_index]);
+  persistent_contract_store_event_slot(hot + flow_id, cr.hot_flow_table[flow_id]);
+  __atomic_store_n(&hot_versions[flow_id], cr.hot_flow_versions[flow_id], __ATOMIC_RELEASE);
+  __atomic_store_n(&hot_epochs[flow_id], cr.hot_flow_epochs[flow_id], __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n(&heads[shard], cr.ring_head[shard], __ATOMIC_RELEASE);
   return true;
 }
 
 inline bool persistent_contract_runtime_refresh_device_tail_unlocked(PersistentContractRuntime& cr, size_t shard) {
-  if (!cr.device_mirror_initialized || !cr.ring_tail_dev || shard >= cr.ring_tail.size()) {
+  if (!cr.device_mirror_initialized || !cr.ring_tail_dev || !cr.export_region_host || shard >= cr.ring_tail.size()) {
     return true;
   }
-  uint64_t device_tail = 0u;
-  if (cudaMemcpy(&device_tail, cr.ring_tail_dev + shard, sizeof(device_tail), cudaMemcpyDeviceToHost) != cudaSuccess) {
+  PersistentContractRegionLayout layout{};
+  if (!persistent_contract_region_layout(
+          static_cast<size_t>(cr.shard_count),
+          static_cast<size_t>(cr.ring_slots_per_shard),
+          static_cast<size_t>(cr.hot_flow_capacity),
+          &layout) ||
+      cr.export_region_bytes < layout.total_bytes) {
     cr.device_sync_error_count += 1u;
     return false;
   }
+  auto* tails = reinterpret_cast<volatile uint64_t*>(persistent_contract_region_base(cr) + layout.ring_tail_off);
+  const uint64_t device_tail = __atomic_load_n(&tails[shard], __ATOMIC_ACQUIRE);
   if (device_tail > cr.ring_tail[shard]) {
     cr.ring_tail[shard] = device_tail;
   }
@@ -1926,14 +2065,21 @@ inline bool persistent_contract_runtime_refresh_device_tail_unlocked(PersistentC
 }
 
 inline bool persistent_contract_runtime_sync_device_tail_unlocked(PersistentContractRuntime& cr, size_t shard) {
-  if (!cr.device_mirror_initialized || !cr.ring_tail_dev || shard >= cr.ring_tail.size()) {
+  if (!cr.device_mirror_initialized || !cr.ring_tail_dev || !cr.export_region_host || shard >= cr.ring_tail.size()) {
     return true;
   }
-  if (cudaMemcpy(cr.ring_tail_dev + shard, &cr.ring_tail[shard], sizeof(uint64_t), cudaMemcpyHostToDevice) !=
-      cudaSuccess) {
+  PersistentContractRegionLayout layout{};
+  if (!persistent_contract_region_layout(
+          static_cast<size_t>(cr.shard_count),
+          static_cast<size_t>(cr.ring_slots_per_shard),
+          static_cast<size_t>(cr.hot_flow_capacity),
+          &layout) ||
+      cr.export_region_bytes < layout.total_bytes) {
     cr.device_sync_error_count += 1u;
     return false;
   }
+  auto* tails = reinterpret_cast<volatile uint64_t*>(persistent_contract_region_base(cr) + layout.ring_tail_off);
+  __atomic_store_n(&tails[shard], cr.ring_tail[shard], __ATOMIC_RELEASE);
   return true;
 }
 
@@ -6581,6 +6727,28 @@ extern "C" int samurai_gpu_packet_contract_read_hot_flow_v1(
   return 0;
 }
 
+extern "C" int samurai_gpu_packet_contract_export_region_v1(char* out_spec, size_t out_spec_len) {
+  if (!out_spec || out_spec_len == 0u) {
+    return set_c_api_error("out_spec must not be null or empty");
+  }
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  if (!persistent_runtime_ensure_started_unlocked()) {
+    return set_c_api_error("persistent runtime is not available");
+  }
+  if (!persistent_contract_runtime_ensure_started_unlocked(g_persistent_runtime)) {
+    return set_c_api_error("contract runtime is not available");
+  }
+  const auto& cr = g_persistent_contract_runtime;
+  if (!cr.device_mirror_initialized || cr.export_region_spec.empty()) {
+    return set_c_api_error("contract export region is not initialized");
+  }
+  const size_t n = std::min(out_spec_len - 1u, cr.export_region_spec.size());
+  std::memcpy(out_spec, cr.export_region_spec.data(), n);
+  out_spec[n] = '\0';
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
 extern "C" int samurai_gpu_packet_set_kernel_mode(int mode) {
   if (mode != static_cast<int>(KernelMode::kBatch) &&
       mode != static_cast<int>(KernelMode::kPersistent)) {
@@ -7029,6 +7197,9 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << "\"contract_shard_count\":" << g_persistent_contract_runtime.shard_count << ","
         << "\"contract_ring_slots_per_shard\":" << g_persistent_contract_runtime.ring_slots_per_shard << ","
         << "\"contract_hot_flow_capacity\":" << g_persistent_contract_runtime.hot_flow_capacity << ","
+        << "\"contract_export_region_spec\":\""
+        << json_escape_string(g_persistent_contract_runtime.export_region_spec) << "\","
+        << "\"contract_export_region_bytes\":" << g_persistent_contract_runtime.export_region_bytes << ","
         << "\"contract_flow_update_published\":" << g_persistent_contract_runtime.publish_count << ","
         << "\"contract_ring_drop_events\":" << g_persistent_contract_runtime.drop_count << ","
         << "\"contract_version_gap_events\":" << g_persistent_contract_runtime.version_gap_count << ","
