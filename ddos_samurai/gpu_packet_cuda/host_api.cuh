@@ -1714,9 +1714,11 @@ struct PersistentContractRuntime {
   std::vector<uint64_t> ring_drop_by_shard{};
   std::vector<ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1> hot_flow_table{};
   std::vector<uint64_t> hot_flow_versions{};
+  std::vector<uint64_t> hot_flow_epochs{};
   uint64_t publish_count = 0u;
   uint64_t drop_count = 0u;
   uint64_t version_gap_count = 0u;
+  uint64_t epoch_mismatch_count = 0u;
   bool initialized = false;
 };
 PersistentContractRuntime g_persistent_contract_runtime;
@@ -1741,9 +1743,11 @@ inline void persistent_contract_runtime_release_unlocked() {
   cr.ring_drop_by_shard.clear();
   cr.hot_flow_table.clear();
   cr.hot_flow_versions.clear();
+  cr.hot_flow_epochs.clear();
   cr.publish_count = 0u;
   cr.drop_count = 0u;
   cr.version_gap_count = 0u;
+  cr.epoch_mismatch_count = 0u;
   cr.initialized = false;
 }
 
@@ -1816,6 +1820,7 @@ inline bool persistent_contract_runtime_ensure_started_unlocked(const Persistent
         static_cast<size_t>(cr.hot_flow_capacity),
         ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1{});
     cr.hot_flow_versions.assign(static_cast<size_t>(cr.hot_flow_capacity), 0u);
+    cr.hot_flow_epochs.assign(static_cast<size_t>(cr.hot_flow_capacity), 0u);
   } catch (...) {
     persistent_contract_runtime_release_unlocked();
     return false;
@@ -1823,6 +1828,7 @@ inline bool persistent_contract_runtime_ensure_started_unlocked(const Persistent
   cr.publish_count = 0u;
   cr.drop_count = 0u;
   cr.version_gap_count = 0u;
+  cr.epoch_mismatch_count = 0u;
   cr.initialized = true;
   return true;
 }
@@ -6023,6 +6029,9 @@ extern "C" int samurai_gpu_packet_contract_publish_flow_update_v1(
   }
   auto& cr = g_persistent_contract_runtime;
   const uint32_t flow_id = event->flow_id;
+  if ((event->version & 1ull) != 0ull) {
+    return set_c_api_error("flow update version must be committed/even");
+  }
   if (flow_id >= static_cast<uint32_t>(cr.hot_flow_capacity)) {
     return set_c_api_error("flow_id exceeds contract hot-flow capacity");
   }
@@ -6043,6 +6052,12 @@ extern "C" int samurai_gpu_packet_contract_publish_flow_update_v1(
   ev.flags = event->flags;
   ev.rtt_us = event->rtt_us;
   ev.dpu_ts_ns = event->dpu_ts_ns;
+
+  const uint64_t prev_epoch = cr.hot_flow_epochs[static_cast<size_t>(flow_id)];
+  if (prev_epoch != 0u && ev.epoch < prev_epoch) {
+    cr.epoch_mismatch_count += 1u;
+    return set_c_api_error("contract epoch mismatch: stale flow update");
+  }
 
   const int shard = static_cast<int>(flow_id % static_cast<uint32_t>(cr.shard_count));
   uint64_t& head = cr.ring_head[static_cast<size_t>(shard)];
@@ -6072,6 +6087,7 @@ extern "C" int samurai_gpu_packet_contract_publish_flow_update_v1(
   }
   cr.hot_flow_table[static_cast<size_t>(flow_id)] = ev;
   cr.hot_flow_versions[static_cast<size_t>(flow_id)] = ev.version;
+  cr.hot_flow_epochs[static_cast<size_t>(flow_id)] = ev.epoch;
   cr.publish_count += 1u;
 
   if (flow_id < static_cast<uint32_t>(kPersistentMaxStreams) && rt.streams && rt.streams_dev && rt.streams_hot_dev) {
@@ -6582,7 +6598,8 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << "\"contract_hot_flow_capacity\":" << g_persistent_contract_runtime.hot_flow_capacity << ","
         << "\"contract_flow_update_published\":" << g_persistent_contract_runtime.publish_count << ","
         << "\"contract_ring_drop_events\":" << g_persistent_contract_runtime.drop_count << ","
-        << "\"contract_version_gap_events\":" << g_persistent_contract_runtime.version_gap_count
+        << "\"contract_version_gap_events\":" << g_persistent_contract_runtime.version_gap_count << ","
+        << "\"contract_epoch_mismatch_events\":" << g_persistent_contract_runtime.epoch_mismatch_count
         << "}";
     g_stream_stats_json = oss.str();
     return g_stream_stats_json.c_str();
