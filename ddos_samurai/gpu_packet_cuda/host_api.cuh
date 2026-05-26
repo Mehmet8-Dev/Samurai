@@ -1486,6 +1486,30 @@ struct PersistentDocaGpuNetioStats {
   int queue_id = 0;
 };
 
+struct PersistentDocaFlowUpdateEventV1 {
+  uint64_t version = 0u;
+  uint64_t epoch = 0u;
+  uint32_t flow_id = 0u;
+  uint32_t tcp_seq = 0u;
+  uint32_t tcp_ack = 0u;
+  uint16_t src_port = 0u;
+  uint16_t dst_port = 0u;
+  uint8_t tcp_state = 0u;
+  uint8_t proto = 0u;
+  uint16_t flags = 0u;
+  uint32_t rtt_us = 0u;
+  uint64_t dpu_ts_ns = 0u;
+};
+
+struct PersistentDocaContractWriterConfigV1 {
+  char region_spec[512]{};
+  char device_name[64]{};
+  uint32_t shard_count = 0u;
+  uint32_t ring_slots_per_shard = 0u;
+  uint32_t hot_flow_capacity = 0u;
+  uint32_t flags = 0u;
+};
+
 struct PersistentDocaGpuNetioApiV1 {
   int version = 0;
   int (*create_txq)(
@@ -1521,6 +1545,17 @@ struct PersistentDocaGpuNetioApiV1 {
   int (*get_stats)(int handle, PersistentDocaGpuNetioStats* out, char* err, size_t err_len) = nullptr;
   int (*get_gpu_txq_handle)(int handle, uint64_t* out_gpu_txq_handle, char* err, size_t err_len) = nullptr;
   int (*get_txq_mkey_be)(int handle, uint32_t* out_mkey_be, char* err, size_t err_len) = nullptr;
+  int (*contract_writer_open)(
+      const PersistentDocaContractWriterConfigV1* cfg,
+      int* out_handle,
+      char* err,
+      size_t err_len) = nullptr;
+  int (*contract_writer_close)(int handle, char* err, size_t err_len) = nullptr;
+  int (*contract_writer_publish_flow_update_v1)(
+      int handle,
+      const PersistentDocaFlowUpdateEventV1* event,
+      char* err,
+      size_t err_len) = nullptr;
 };
 
 struct PersistentTxBridgeRuntime {
@@ -3696,62 +3731,100 @@ __device__ inline void persistent_contract_poll_assigned_shard(
       max_streams <= 0) {
     return;
   }
-  // The first warp is the block-local polling scope. Lane 0 owns the shard tail,
-  // so each shard still has a single GPU-side consumer.
-  if (threadIdx.x >= 32 || lane != 0u) {
+  constexpr unsigned int kPollWarpMask = 0xFFFFFFFFu;
+  constexpr uint32_t kPollWarpWidth = 32u;
+  __shared__ uint32_t s_contract_flow_ids[32];
+  __shared__ uint64_t s_contract_versions[32];
+  __shared__ int32_t s_contract_loaded[32];
+  // The first warp is the block-local polling scope. Each lane drains one
+  // event, while lane 0 remains the single tail publisher for the shard.
+  if (threadIdx.x >= static_cast<int>(kPollWarpWidth)) {
     return;
   }
   const int32_t shard = static_cast<int32_t>(blockIdx.x);
   if (shard < 0 || shard >= contract_shard_count) {
     return;
   }
-  const uint64_t head = u64_load(contract_ring_head + shard);
-  const uint64_t tail = u64_load(contract_ring_tail + shard);
+  uint64_t head = 0u;
+  uint64_t tail = 0u;
+  if (lane == 0u) {
+    head = u64_load(contract_ring_head + shard);
+    tail = u64_load(contract_ring_tail + shard);
+  }
+  head = __shfl_sync(kPollWarpMask, head, 0);
+  tail = __shfl_sync(kPollWarpMask, tail, 0);
   if (tail >= head) {
     return;
   }
 
-  const uint64_t slot = tail % static_cast<uint64_t>(contract_ring_slots_per_shard);
+  uint64_t available = head - tail;
+  if (available > static_cast<uint64_t>(kPollWarpWidth)) {
+    available = static_cast<uint64_t>(kPollWarpWidth);
+  }
+  const uint32_t drain_count = static_cast<uint32_t>(available);
+  const bool lane_active = lane < drain_count;
+  const uint64_t lane_tail = tail + static_cast<uint64_t>(lane);
+  const uint64_t slot = lane_tail % static_cast<uint64_t>(contract_ring_slots_per_shard);
   const size_t ring_index =
       (static_cast<size_t>(shard) * static_cast<size_t>(contract_ring_slots_per_shard)) +
       static_cast<size_t>(slot);
   const volatile FlowUpdateEvent* entry = contract_update_ring + ring_index;
   FlowUpdateEvent ev{};
   bool loaded = false;
-  for (int attempt = 0; attempt < 4; ++attempt) {
-    const uint64_t v1 = u64_load(&entry->version);
-    if (v1 == 0u || (v1 & 1ull) != 0ull) {
-      return;
-    }
-    __threadfence_system();
-    ev.version = v1;
-    ev.epoch = u64_load(&entry->epoch);
-    ev.flow_id = entry->flow_id;
-    ev.tcp_seq = entry->tcp_seq;
-    ev.tcp_ack = entry->tcp_ack;
-    ev.src_port = entry->src_port;
-    ev.dst_port = entry->dst_port;
-    ev.tcp_state = entry->tcp_state;
-    ev.proto = entry->proto;
-    ev.flags = entry->flags;
-    ev.rtt_us = entry->rtt_us;
-    ev.dpu_ts_ns = u64_load(&entry->dpu_ts_ns);
-    __threadfence_system();
-    const uint64_t v2 = u64_load(&entry->version);
-    if (v1 == v2 && (v2 & 1ull) == 0ull) {
-      loaded = true;
-      break;
+  if (lane_active) {
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      const uint64_t v1 = u64_load(&entry->version);
+      if (v1 == 0u || (v1 & 1ull) != 0ull) {
+        break;
+      }
+      __threadfence_system();
+      ev.version = v1;
+      ev.epoch = u64_load(&entry->epoch);
+      ev.flow_id = entry->flow_id;
+      ev.tcp_seq = entry->tcp_seq;
+      ev.tcp_ack = entry->tcp_ack;
+      ev.src_port = entry->src_port;
+      ev.dst_port = entry->dst_port;
+      ev.tcp_state = entry->tcp_state;
+      ev.proto = entry->proto;
+      ev.flags = entry->flags;
+      ev.rtt_us = entry->rtt_us;
+      ev.dpu_ts_ns = u64_load(&entry->dpu_ts_ns);
+      __threadfence_system();
+      const uint64_t v2 = u64_load(&entry->version);
+      if (v1 == v2 && (v2 & 1ull) == 0ull) {
+        loaded = true;
+        break;
+      }
     }
   }
-  if (!loaded) {
-    return;
-  }
+  const unsigned int loaded_mask = __ballot_sync(kPollWarpMask, loaded);
+  s_contract_flow_ids[lane] = ev.flow_id;
+  s_contract_versions[lane] = ev.version;
+  s_contract_loaded[lane] = loaded ? 1 : 0;
+  __syncwarp(kPollWarpMask);
 
   bool should_apply = true;
-  if (ev.flow_id >= static_cast<uint32_t>(contract_hot_flow_capacity)) {
+  if (!loaded) {
+    should_apply = false;
+  } else if (lane > 0u && (loaded_mask & ((1u << lane) - 1u)) != ((1u << lane) - 1u)) {
+    should_apply = false;
+  } else if (ev.flow_id >= static_cast<uint32_t>(contract_hot_flow_capacity)) {
     should_apply = false;
     u64_add(&ctrl->contract_poll_stale_events, 1u);
   } else {
+    for (uint32_t other_lane = lane + 1u; other_lane < drain_count; ++other_lane) {
+      const bool other_loaded = s_contract_loaded[other_lane] != 0;
+      if (!other_loaded) {
+        continue;
+      }
+      const uint32_t other_flow = s_contract_flow_ids[other_lane];
+      const uint64_t other_version = s_contract_versions[other_lane];
+      if (other_flow == ev.flow_id && other_version >= ev.version) {
+        should_apply = false;
+        break;
+      }
+    }
     const uint64_t current_version = u64_load(contract_hot_flow_versions + ev.flow_id);
     const uint64_t current_epoch = u64_load(contract_hot_flow_epochs + ev.flow_id);
     if (current_version != 0u && ev.version < current_version) {
@@ -3800,7 +3873,16 @@ __device__ inline void persistent_contract_poll_assigned_shard(
   }
 
   __threadfence_system();
-  contract_ring_tail[shard] = tail + 1u;
+  __syncwarp(kPollWarpMask);
+  if (lane == 0u) {
+    uint32_t contiguous_loaded = 0u;
+    while (contiguous_loaded < drain_count && ((loaded_mask >> contiguous_loaded) & 1u) != 0u) {
+      contiguous_loaded += 1u;
+    }
+    if (contiguous_loaded > 0u) {
+      contract_ring_tail[shard] = tail + static_cast<uint64_t>(contiguous_loaded);
+    }
+  }
 }
 
 __global__ void persistent_dataplane_kernel(
