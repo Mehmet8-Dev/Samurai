@@ -114,6 +114,7 @@ def test_m3_worker_sources_exist() -> None:
         root / "ddos_samurai" / "zmq" / "daemon" / "l7_worker.cpp",
         root / "ddos_samurai" / "zmq" / "daemon" / "defense_worker.cpp",
         root / "ddos_samurai" / "zmq" / "daemon" / "scenario_worker.cpp",
+        root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp",
     ]
     for p in expected:
         assert p.exists(), str(p)
@@ -364,6 +365,18 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "doca_native_lib_unavailable" in src
     assert "doca_interface_required" in src
     assert "doca_device_required" in src
+
+
+def test_m3_dpu_state_runtime_models_authoritative_flow_updates() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp").read_text(encoding="utf-8")
+    assert "struct FlowState" in src
+    assert "class FlowStateTable" in src
+    assert "NextCommittedVersion" in src
+    assert "BuildUpdateEvent" in src
+    assert "FlowUpdateEventV1" in src
+    assert "kTcpStateMigrating" in src
+    assert "kTcpStatePoisoned" in src
 
 
 def test_m3_l7_worker_has_real_runtime_and_failfast_fallback() -> None:
