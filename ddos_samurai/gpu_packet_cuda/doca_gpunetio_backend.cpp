@@ -11,13 +11,17 @@
 #include <cstring>
 #include <ctime>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <cstdio>
 #include <initializer_list>
 #include <limits>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <mutex>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -217,9 +221,41 @@ struct BackendRxqHandle {
   uint64_t rx_drops = 0u;
 };
 
+struct alignas(64) BackendContractFlowUpdateSlot {
+  uint64_t version = 0u;
+  uint64_t epoch = 0u;
+  uint32_t flow_id = 0u;
+  uint32_t tcp_seq = 0u;
+  uint32_t tcp_ack = 0u;
+  uint16_t src_port = 0u;
+  uint16_t dst_port = 0u;
+  uint8_t tcp_state = 0u;
+  uint8_t proto = 0u;
+  uint16_t flags = 0u;
+  uint32_t rtt_us = 0u;
+  uint64_t dpu_ts_ns = 0u;
+};
+
+static_assert(sizeof(BackendContractFlowUpdateSlot) == 64, "contract update slot must be 64 bytes");
+
+struct BackendContractWriterHandle {
+  int handle = -1;
+  void* region = nullptr;
+  size_t region_len = 0u;
+  bool owns_mapping = false;
+  int fd = -1;
+  uint32_t shard_count = 0u;
+  uint32_t ring_slots_per_shard = 0u;
+  uint32_t hot_flow_capacity = 0u;
+  uint64_t publish_count = 0u;
+  uint64_t overflow_count = 0u;
+  std::mutex op_lock{};
+};
+
 std::mutex g_lock;
 std::unordered_map<int, std::shared_ptr<BackendTxqHandle>> g_handles;
 std::unordered_map<int, BackendRxqHandle> g_rx_handles;
+std::unordered_map<int, std::shared_ptr<BackendContractWriterHandle>> g_contract_writers;
 int g_next_handle = 1;
 
 std::mutex g_api_lock;
@@ -313,6 +349,116 @@ inline std::vector<std::string> split_copy(const std::string& s, char delim) {
   return out;
 }
 
+inline bool parse_u64_text(const std::string& raw, uint64_t* out) {
+  if (!out) {
+    return false;
+  }
+  const std::string t = trim_copy(raw);
+  if (t.empty()) {
+    return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long parsed = std::strtoull(t.c_str(), &end, 0);
+  if (errno != 0 || end == t.c_str() || !end || *end != '\0') {
+    return false;
+  }
+  *out = static_cast<uint64_t>(parsed);
+  return true;
+}
+
+inline bool parse_contract_region_spec(
+    const std::string& raw,
+    uintptr_t* out_addr,
+    std::string* out_file,
+    size_t* out_size,
+    std::string* why) {
+  if (out_addr) {
+    *out_addr = 0u;
+  }
+  if (out_file) {
+    out_file->clear();
+  }
+  if (out_size) {
+    *out_size = 0u;
+  }
+  const std::string spec = trim_copy(raw);
+  if (spec.empty()) {
+    if (why) *why = "contract region spec is empty";
+    return false;
+  }
+
+  if (spec.rfind("0x", 0) == 0 || spec.rfind("addr:", 0) == 0) {
+    const size_t sep = spec.find(':', spec.rfind("addr:", 0) == 0 ? 5u : 2u);
+    const std::string addr_s = spec.rfind("addr:", 0) == 0
+        ? (sep == std::string::npos ? spec.substr(5u) : spec.substr(5u, sep - 5u))
+        : (sep == std::string::npos ? spec : spec.substr(0u, sep));
+    uint64_t addr = 0u;
+    if (!parse_u64_text(addr_s, &addr) || addr == 0u) {
+      if (why) *why = "invalid contract addr region spec";
+      return false;
+    }
+    if (out_addr) {
+      *out_addr = static_cast<uintptr_t>(addr);
+    }
+    if (sep != std::string::npos && out_size) {
+      uint64_t parsed_size = 0u;
+      if (!parse_u64_text(spec.substr(sep + 1u), &parsed_size) || parsed_size == 0u) {
+        if (why) *why = "invalid contract addr size";
+        return false;
+      }
+      *out_size = static_cast<size_t>(parsed_size);
+    }
+    return true;
+  }
+
+  for (const std::string& token_raw : split_copy(spec, ',')) {
+    const std::string token = trim_copy(token_raw);
+    const size_t eq = token.find('=');
+    if (eq == std::string::npos) {
+      if (token.rfind("file:", 0) == 0 && out_file) {
+        *out_file = token.substr(5u);
+        continue;
+      }
+      if (why) *why = "invalid contract region token: " + token;
+      return false;
+    }
+    const std::string key = trim_copy(token.substr(0u, eq));
+    const std::string value = trim_copy(token.substr(eq + 1u));
+    if (key == "addr") {
+      uint64_t addr = 0u;
+      if (!parse_u64_text(value, &addr) || addr == 0u) {
+        if (why) *why = "invalid contract addr value";
+        return false;
+      }
+      if (out_addr) {
+        *out_addr = static_cast<uintptr_t>(addr);
+      }
+    } else if (key == "file" || key == "path") {
+      if (out_file) {
+        *out_file = value;
+      }
+    } else if (key == "size" || key == "len") {
+      uint64_t parsed_size = 0u;
+      if (!parse_u64_text(value, &parsed_size) || parsed_size == 0u) {
+        if (why) *why = "invalid contract region size";
+        return false;
+      }
+      if (out_size) {
+        *out_size = static_cast<size_t>(parsed_size);
+      }
+    } else {
+      if (why) *why = "unknown contract region key: " + key;
+      return false;
+    }
+  }
+  if ((!out_addr || *out_addr == 0u) && (!out_file || out_file->empty())) {
+    if (why) *why = "contract region requires addr= or file=";
+    return false;
+  }
+  return true;
+}
+
 inline uint32_t parse_proto_mask_text(const std::string& raw, bool* ok) {
   if (ok) {
     *ok = false;
@@ -356,6 +502,130 @@ inline uint32_t parse_proto_mask_text(const std::string& raw, bool* ok) {
     *ok = (mask != 0u);
   }
   return mask;
+}
+
+struct ContractRegionLayout {
+  size_t ring_head_off = 0u;
+  size_t ring_tail_off = 0u;
+  size_t update_ring_off = 0u;
+  size_t hot_flow_table_off = 0u;
+  size_t hot_flow_versions_off = 0u;
+  size_t hot_flow_epochs_off = 0u;
+  size_t total_bytes = 0u;
+};
+
+inline bool checked_add_size(size_t a, size_t b, size_t* out) {
+  if (!out || a > std::numeric_limits<size_t>::max() - b) {
+    return false;
+  }
+  *out = a + b;
+  return true;
+}
+
+inline bool checked_mul_size(size_t a, size_t b, size_t* out) {
+  if (!out || (a != 0u && b > std::numeric_limits<size_t>::max() / a)) {
+    return false;
+  }
+  *out = a * b;
+  return true;
+}
+
+inline bool contract_region_layout(
+    uint32_t shard_count,
+    uint32_t ring_slots_per_shard,
+    uint32_t hot_flow_capacity,
+    ContractRegionLayout* out,
+    std::string* why) {
+  if (!out || shard_count == 0u || ring_slots_per_shard == 0u || hot_flow_capacity == 0u) {
+    if (why) *why = "invalid contract region dimensions";
+    return false;
+  }
+  size_t shard_bytes = 0u;
+  size_t ring_slots = 0u;
+  size_t ring_bytes = 0u;
+  size_t hot_bytes = 0u;
+  size_t hot_versions_bytes = 0u;
+  if (!checked_mul_size(static_cast<size_t>(shard_count), sizeof(uint64_t), &shard_bytes) ||
+      !checked_mul_size(static_cast<size_t>(shard_count), static_cast<size_t>(ring_slots_per_shard), &ring_slots) ||
+      !checked_mul_size(ring_slots, sizeof(BackendContractFlowUpdateSlot), &ring_bytes) ||
+      !checked_mul_size(static_cast<size_t>(hot_flow_capacity), sizeof(BackendContractFlowUpdateSlot), &hot_bytes) ||
+      !checked_mul_size(static_cast<size_t>(hot_flow_capacity), sizeof(uint64_t), &hot_versions_bytes)) {
+    if (why) *why = "contract region layout overflow";
+    return false;
+  }
+  ContractRegionLayout layout{};
+  size_t cur = 0u;
+  layout.ring_head_off = cur;
+  if (!checked_add_size(cur, shard_bytes, &cur)) return false;
+  layout.ring_tail_off = cur;
+  if (!checked_add_size(cur, shard_bytes, &cur)) return false;
+  layout.update_ring_off = cur;
+  if (!checked_add_size(cur, ring_bytes, &cur)) return false;
+  layout.hot_flow_table_off = cur;
+  if (!checked_add_size(cur, hot_bytes, &cur)) return false;
+  layout.hot_flow_versions_off = cur;
+  if (!checked_add_size(cur, hot_versions_bytes, &cur)) return false;
+  layout.hot_flow_epochs_off = cur;
+  if (!checked_add_size(cur, hot_versions_bytes, &cur)) return false;
+  layout.total_bytes = cur;
+  *out = layout;
+  return true;
+}
+
+inline uint8_t* contract_base(BackendContractWriterHandle& h) {
+  return static_cast<uint8_t*>(h.region);
+}
+
+inline volatile uint64_t* contract_ring_head(BackendContractWriterHandle& h, const ContractRegionLayout& layout) {
+  return reinterpret_cast<volatile uint64_t*>(contract_base(h) + layout.ring_head_off);
+}
+
+inline volatile uint64_t* contract_ring_tail(BackendContractWriterHandle& h, const ContractRegionLayout& layout) {
+  return reinterpret_cast<volatile uint64_t*>(contract_base(h) + layout.ring_tail_off);
+}
+
+inline volatile BackendContractFlowUpdateSlot* contract_update_ring(
+    BackendContractWriterHandle& h,
+    const ContractRegionLayout& layout) {
+  return reinterpret_cast<volatile BackendContractFlowUpdateSlot*>(contract_base(h) + layout.update_ring_off);
+}
+
+inline volatile BackendContractFlowUpdateSlot* contract_hot_flow_table(
+    BackendContractWriterHandle& h,
+    const ContractRegionLayout& layout) {
+  return reinterpret_cast<volatile BackendContractFlowUpdateSlot*>(contract_base(h) + layout.hot_flow_table_off);
+}
+
+inline volatile uint64_t* contract_hot_versions(BackendContractWriterHandle& h, const ContractRegionLayout& layout) {
+  return reinterpret_cast<volatile uint64_t*>(contract_base(h) + layout.hot_flow_versions_off);
+}
+
+inline volatile uint64_t* contract_hot_epochs(BackendContractWriterHandle& h, const ContractRegionLayout& layout) {
+  return reinterpret_cast<volatile uint64_t*>(contract_base(h) + layout.hot_flow_epochs_off);
+}
+
+inline void contract_store_event_slot(
+    volatile BackendContractFlowUpdateSlot* dst,
+    const DocaFlowUpdateEventV1& ev) {
+  const uint64_t commit_version = ev.version;
+  const uint64_t begin_version = (commit_version > 0u && (commit_version & 1ull) == 0ull)
+      ? (commit_version - 1ull)
+      : (commit_version | 1ull);
+  __atomic_store_n(&dst->version, begin_version, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  dst->epoch = ev.epoch;
+  dst->flow_id = ev.flow_id;
+  dst->tcp_seq = ev.tcp_seq;
+  dst->tcp_ack = ev.tcp_ack;
+  dst->src_port = ev.src_port;
+  dst->dst_port = ev.dst_port;
+  dst->tcp_state = ev.tcp_state;
+  dst->proto = ev.proto;
+  dst->flags = ev.flags;
+  dst->rtt_us = ev.rtt_us;
+  dst->dpu_ts_ns = ev.dpu_ts_ns;
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n(&dst->version, commit_version, __ATOMIC_RELEASE);
 }
 
 inline bool queue_id_allowed(const std::vector<int>& allowed, int qid) {
@@ -1797,6 +2067,189 @@ extern "C" int samurai_doca_backend_get_txq_mkey_be(int handle, uint32_t* out_mk
     return -1;
   }
   *out_mkey_be = h->txq_mkey_be;
+  return 0;
+}
+
+extern "C" int samurai_doca_backend_contract_writer_open(
+    const DocaContractWriterConfigV1* cfg,
+    int* out_handle,
+    char* err,
+    size_t err_len) {
+  if (!cfg || !out_handle || cfg->region_spec[0] == '\0' || cfg->shard_count == 0u ||
+      cfg->ring_slots_per_shard == 0u || cfg->hot_flow_capacity == 0u) {
+    write_err(err, err_len, "invalid arguments for samurai_doca_backend_contract_writer_open");
+    return -1;
+  }
+  *out_handle = -1;
+
+  ContractRegionLayout layout{};
+  std::string why;
+  if (!contract_region_layout(cfg->shard_count, cfg->ring_slots_per_shard, cfg->hot_flow_capacity, &layout, &why)) {
+    write_err(err, err_len, why.empty() ? "invalid contract region layout" : why);
+    return -1;
+  }
+
+  uintptr_t addr = 0u;
+  std::string file_path;
+  size_t spec_size = 0u;
+  if (!parse_contract_region_spec(cfg->region_spec, &addr, &file_path, &spec_size, &why)) {
+    write_err(err, err_len, why.empty() ? "invalid contract region spec" : why);
+    return -1;
+  }
+  if (spec_size != 0u && spec_size < layout.total_bytes) {
+    write_err(err, err_len, "contract region spec size is smaller than required layout");
+    return -1;
+  }
+
+  auto writer = std::make_shared<BackendContractWriterHandle>();
+  writer->shard_count = cfg->shard_count;
+  writer->ring_slots_per_shard = cfg->ring_slots_per_shard;
+  writer->hot_flow_capacity = cfg->hot_flow_capacity;
+  writer->region_len = spec_size != 0u ? spec_size : layout.total_bytes;
+
+  if (!file_path.empty()) {
+    const int fd = ::open(file_path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+      write_err(err, err_len, std::string("contract region file open failed: ") + std::strerror(errno));
+      return -1;
+    }
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+      const std::string msg = std::string("contract region file stat failed: ") + std::strerror(errno);
+      ::close(fd);
+      write_err(err, err_len, msg);
+      return -1;
+    }
+    if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) < static_cast<uint64_t>(layout.total_bytes)) {
+      ::close(fd);
+      write_err(err, err_len, "contract region file is smaller than required layout");
+      return -1;
+    }
+    writer->region_len = spec_size != 0u ? spec_size : static_cast<size_t>(st.st_size);
+    void* mapped = ::mmap(nullptr, writer->region_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+      const std::string msg = std::string("contract region mmap failed: ") + std::strerror(errno);
+      ::close(fd);
+      write_err(err, err_len, msg);
+      return -1;
+    }
+    writer->region = mapped;
+    writer->owns_mapping = true;
+    writer->fd = fd;
+  } else {
+    writer->region = reinterpret_cast<void*>(addr);
+    writer->owns_mapping = false;
+    writer->fd = -1;
+  }
+  if (!writer->region) {
+    write_err(err, err_len, "contract region resolved to null");
+    return -1;
+  }
+
+  std::lock_guard<std::mutex> guard(g_lock);
+  const int hnd = g_next_handle++;
+  writer->handle = hnd;
+  g_contract_writers.emplace(hnd, writer);
+  *out_handle = hnd;
+  return 0;
+}
+
+extern "C" int samurai_doca_backend_contract_writer_close(int handle, char* err, size_t err_len) {
+  if (handle < 0) {
+    write_err(err, err_len, "invalid handle in samurai_doca_backend_contract_writer_close");
+    return -1;
+  }
+  std::shared_ptr<BackendContractWriterHandle> h{};
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto it = g_contract_writers.find(handle);
+    if (it == g_contract_writers.end()) {
+      return 0;
+    }
+    h = it->second;
+    g_contract_writers.erase(it);
+  }
+  if (!h) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> op_guard(h->op_lock);
+  if (h->owns_mapping && h->region && h->region_len > 0u) {
+    (void)::msync(h->region, h->region_len, MS_SYNC);
+    (void)::munmap(h->region, h->region_len);
+  }
+  if (h->fd >= 0) {
+    (void)::close(h->fd);
+  }
+  h->region = nullptr;
+  h->region_len = 0u;
+  h->fd = -1;
+  return 0;
+}
+
+extern "C" int samurai_doca_backend_contract_writer_publish_flow_update_v1(
+    int handle,
+    const DocaFlowUpdateEventV1* event,
+    char* err,
+    size_t err_len) {
+  if (handle < 0 || !event || event->version == 0u || (event->version & 1ull) != 0ull) {
+    write_err(err, err_len, "invalid arguments for samurai_doca_backend_contract_writer_publish_flow_update_v1");
+    return -1;
+  }
+
+  std::shared_ptr<BackendContractWriterHandle> h{};
+  {
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto it = g_contract_writers.find(handle);
+    if (it == g_contract_writers.end()) {
+      write_err(err, err_len, "contract writer handle not found");
+      return -1;
+    }
+    h = it->second;
+  }
+  if (!h || !h->region) {
+    write_err(err, err_len, "contract writer handle is not initialized");
+    return -1;
+  }
+
+  ContractRegionLayout layout{};
+  std::string why;
+  if (!contract_region_layout(h->shard_count, h->ring_slots_per_shard, h->hot_flow_capacity, &layout, &why)) {
+    write_err(err, err_len, why.empty() ? "invalid contract writer layout" : why);
+    return -1;
+  }
+  if (h->region_len < layout.total_bytes || event->flow_id >= h->hot_flow_capacity) {
+    write_err(err, err_len, "contract writer event exceeds mapped region");
+    return -1;
+  }
+
+  std::lock_guard<std::mutex> op_guard(h->op_lock);
+  const uint32_t shard = event->flow_id % h->shard_count;
+  volatile uint64_t* heads = contract_ring_head(*h, layout);
+  volatile uint64_t* tails = contract_ring_tail(*h, layout);
+  volatile BackendContractFlowUpdateSlot* ring = contract_update_ring(*h, layout);
+  volatile BackendContractFlowUpdateSlot* hot = contract_hot_flow_table(*h, layout);
+  volatile uint64_t* hot_versions = contract_hot_versions(*h, layout);
+  volatile uint64_t* hot_epochs = contract_hot_epochs(*h, layout);
+
+  const uint64_t head = __atomic_load_n(&heads[shard], __ATOMIC_ACQUIRE);
+  const uint64_t tail = __atomic_load_n(&tails[shard], __ATOMIC_ACQUIRE);
+  const uint64_t used = (head >= tail) ? (head - tail) : 0u;
+  if (used >= static_cast<uint64_t>(h->ring_slots_per_shard)) {
+    h->overflow_count += 1u;
+    write_err(err, err_len, "contract writer ring overflow");
+    return -1;
+  }
+
+  const size_t ring_index =
+      (static_cast<size_t>(shard) * static_cast<size_t>(h->ring_slots_per_shard)) +
+      static_cast<size_t>(head % static_cast<uint64_t>(h->ring_slots_per_shard));
+  contract_store_event_slot(ring + ring_index, *event);
+  contract_store_event_slot(hot + event->flow_id, *event);
+  __atomic_store_n(&hot_versions[event->flow_id], event->version, __ATOMIC_RELEASE);
+  __atomic_store_n(&hot_epochs[event->flow_id], event->epoch, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n(&heads[shard], head + 1u, __ATOMIC_RELEASE);
+  h->publish_count += 1u;
   return 0;
 }
 
