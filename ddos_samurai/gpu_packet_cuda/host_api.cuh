@@ -3,6 +3,7 @@
 #include "../gpu_packet_cuda.hpp"
 #include <cstdio>
 #include "tx_backend_doca_gpunetio.cuh"
+#include "zero_copy_dataplane_contract.cuh"
 #ifndef SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
 #define SAMURAI_WITH_DOCA_GPUNETIO_DEVICE 0
 #endif
@@ -5820,6 +5821,70 @@ extern "C" int samurai_gpu_packet_generate_icmp_packets(
   } catch (...) {
     return set_c_api_error("unknown error");
   }
+}
+
+extern "C" int samurai_gpu_packet_publication_budget_us(uint32_t rtt_us, uint32_t* out_budget_us) {
+  if (!out_budget_us) {
+    return set_c_api_error("out_budget_us must not be null");
+  }
+  *out_budget_us = ddos_samurai::gpu_packet_cuda::zero_copy::publication_budget_us(rtt_us);
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_seqlock_next_versions(
+    uint64_t current_version,
+    uint64_t* out_write_begin,
+    uint64_t* out_write_commit) {
+  if (!out_write_begin || !out_write_commit) {
+    return set_c_api_error("out_write_begin and out_write_commit must not be null");
+  }
+  ddos_samurai::gpu_packet_cuda::zero_copy::next_seqlock_versions(
+      current_version, out_write_begin, out_write_commit);
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_descriptor_transition_valid(
+    int32_t from_state,
+    int32_t to_state,
+    int32_t* out_valid) {
+  if (!out_valid) {
+    return set_c_api_error("out_valid must not be null");
+  }
+  using ddos_samurai::gpu_packet_cuda::zero_copy::DescriptorOwnershipState;
+  if (from_state < static_cast<int32_t>(DescriptorOwnershipState::kFree) ||
+      from_state > static_cast<int32_t>(DescriptorOwnershipState::kComplete) ||
+      to_state < static_cast<int32_t>(DescriptorOwnershipState::kFree) ||
+      to_state > static_cast<int32_t>(DescriptorOwnershipState::kComplete)) {
+    return set_c_api_error("descriptor state value is out of range");
+  }
+  const auto from = static_cast<DescriptorOwnershipState>(from_state);
+  const auto to = static_cast<DescriptorOwnershipState>(to_state);
+  *out_valid = ddos_samurai::gpu_packet_cuda::zero_copy::is_valid_descriptor_transition(from, to) ? 1 : 0;
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_compute_flow_affinity_v1(
+    int32_t block_idx,
+    int32_t block_dim,
+    int32_t thread_idx,
+    int32_t flows_per_warp,
+    int32_t warp_size,
+    samurai_gpu_packet_flow_affinity_v1* out) {
+  if (!out) {
+    return set_c_api_error("out must not be null");
+  }
+  const auto aff = ddos_samurai::gpu_packet_cuda::zero_copy::compute_flow_affinity(
+      block_idx, block_dim, thread_idx, flows_per_warp, warp_size);
+  out->global_tid = aff.global_tid;
+  out->global_warp_id = aff.global_warp_id;
+  out->lane = aff.lane;
+  out->flow_start = aff.flow_start;
+  out->flow_id = aff.flow_id;
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
 }
 
 extern "C" int samurai_gpu_packet_set_kernel_mode(int mode) {
