@@ -815,14 +815,6 @@ def get_extensions() -> List[Extension]:
     )
     extensions.append(gpu_cuda_payload_native)
 
-    fast_sender = Extension(
-        "ddos_samurai.fast_sender",
-        sources=["ddos_samurai/fast_sender.c"],
-        extra_compile_args=["-O2", "-Wall", "-fPIC"],
-        extra_link_args=["-lpthread", "-lm"],
-    )
-    extensions.append(fast_sender)
-
     pacing_engine = Extension(
         "ddos_samurai.pacing_engine",
         sources=[
@@ -833,14 +825,6 @@ def get_extensions() -> List[Extension]:
         extra_link_args=["-lpthread", "-lm"],
     )
     extensions.append(pacing_engine)
-
-    dataplane_core = Extension(
-        "ddos_samurai.dataplane_core",
-        sources=["ddos_samurai/dataplane_core.c"],
-        extra_compile_args=["-O2", "-Wall", "-fPIC"],
-        extra_link_args=["-lpthread", "-lm"],
-    )
-    extensions.append(dataplane_core)
 
     with_dpdk = _env_flag("SAMURAI_WITH_DPDK", "0")
     require_dpdk_build = _env_flag("SAMURAI_REQUIRE_DPDK_BUILD", "0")
@@ -864,22 +848,6 @@ def get_extensions() -> List[Extension]:
             if require_dpdk_build:
                 raise RuntimeError(msg)
             print(f"Warning: {msg} Skipping ddos_samurai.dpdk_pmd_core build.")
-
-    if platform.system() == "Linux":
-        xdp_compile_args = ["-O2", "-Wall", "-Wextra"]
-        xdp_link_args = ["-lpthread"]
-        if os.path.exists("/usr/include/bpf/libbpf.h"):
-            xdp_link_args.append("-lbpf")
-            xdp_compile_args.append("-DHAVE_LIBBPF")
-        xdp_sender = Extension(
-            "ddos_samurai.xdp_sender",
-            sources=["ddos_samurai/xdp_sender.c"],
-            extra_compile_args=xdp_compile_args,
-            extra_link_args=xdp_link_args,
-        )
-        extensions.append(xdp_sender)
-    else:
-        print(f"Warning: XDP sender not available on {platform.system()} (Linux only)")
 
     return extensions
 

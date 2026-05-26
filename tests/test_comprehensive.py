@@ -277,18 +277,12 @@ class TestEthernetFrameConstruction:
 
 
 class TestFastSenderModule:
-    """fast_sender C extension testleri"""
+    """fast_sender Python bridge kaldırıldı."""
     
     def test_module_import(self):
-        """Module import"""
-        try:
-            from ddos_samurai import fast_sender
-            assert hasattr(fast_sender, 'send_optimized')
-            assert hasattr(fast_sender, 'send_ring_optimized')
-        except ImportError:
-            if pytest is not None:
-                pytest.skip("fast_sender module not compiled")
-            return
+        """Module import artık başarısız olmalı."""
+        with pytest.raises(ModuleNotFoundError):
+            __import__("ddos_samurai.fast_sender")
 
 
 def run_tests():
