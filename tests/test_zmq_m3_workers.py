@@ -9,6 +9,7 @@ from ddos_samurai.zmq.dispatcher import ZmqDispatcher
 from ddos_samurai.zmq.event_collector import ZmqEventCollector
 from ddos_samurai.zmq.runtime_manager import ZmqRuntimeManager
 from ddos_samurai.zmq.wire import (
+    FlowStreamUpsertV1,
     FlowUpdateEventV1,
     MessageType,
     WorkerKind,
@@ -161,6 +162,12 @@ def test_m3_gpu_worker_has_native_cuda_bridge_and_failfast_fallback() -> None:
     assert "samurai_gpu_packet_update_stream" in src
     assert "samurai_gpu_packet_stop_stream" in src
     assert "MessageType::FLOW_UPDATE" in src
+    assert "MessageType::FLOW_STREAM_UPSERT" in src
+    assert "FlowStreamUpsertJson" in src
+    assert "UpsertFlowStreamFromStreamUpsert" in src
+    assert "FlowUpdateFromStreamUpsert" in src
+    assert "flow_stream_upsert_size_mismatch" in src
+    assert "gpu_flow_stream_upsert_target_ip_required" in src
     assert "FlowEventStreamJson" in src
     assert "UpsertFlowStreamFromEvent" in src
     assert "flow_streams" in src
@@ -217,6 +224,56 @@ def test_m3_dispatch_flow_update_targets_gpu_contract_channel() -> None:
         assert header.correlation_id == 77
         assert header.job_id == "contract-flow-9"
         assert FlowUpdateEventV1.unpack(payload) == event
+    finally:
+        dispatcher.close()
+
+
+def test_m3_dispatch_flow_stream_upsert_targets_gpu_lifecycle_channel() -> None:
+    ctx = _FakeContext()
+    zmq = _FakeZmq()
+    _FakeZmq.Context._instance = ctx
+    endpoint = "ipc:///tmp/samurai_jobs_gpu_stream_upsert_test"
+    upsert = FlowStreamUpsertV1(
+        version=14,
+        epoch=6,
+        flow_id=12,
+        tcp_seq=123,
+        tcp_ack=99,
+        src_port=40100,
+        dst_port=443,
+        tcp_state=4,
+        proto=6,
+        flags=0x18,
+        rtt_us=800,
+        quota=4096,
+        tx_ipg_ns=250,
+        dpu_ts_ns=987654322,
+        target_ip="10.0.0.9",
+        payload_len=16,
+        payload_byte=66,
+        weight=2,
+        template_id=3,
+    )
+
+    dispatcher = ZmqDispatcher(context=ctx, zmq_module=zmq)
+    try:
+        result = dispatcher.dispatch_flow_stream_upsert(
+            correlation_id=78,
+            job_id="stream-upsert-12",
+            upsert=upsert,
+            endpoint=endpoint,
+        )
+        assert result.endpoint == endpoint
+        assert result.bytes_sent == dispatcher.expected_flow_stream_upsert_frame_size()
+
+        queue = ctx.ensure(endpoint)
+        assert len(queue) == 1
+        header, payload = unpack_message(queue[0])
+        assert header.worker_kind == WorkerKind.GPU
+        assert header.msg_type == MessageType.FLOW_STREAM_UPSERT
+        assert header.correlation_id == 78
+        assert header.job_id == "stream-upsert-12"
+        assert FlowStreamUpsertV1.unpack(payload) == upsert
     finally:
         dispatcher.close()
 
@@ -380,9 +437,13 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "--dpu-state-publish" in src
     assert "SAMURAI_DPU_STATE_PUBLISH" in src
     assert "InitialFlowStateFromEnvelope" in src
+    assert "BuildFlowStreamUpsert" in src
+    assert "PublishDpuFlowStreamUpsert" in src
     assert "PublishDpuFlowUpdate" in src
     assert "MessageType::FLOW_UPDATE" in src
+    assert "MessageType::FLOW_STREAM_UPSERT" in src
     assert "ZMQ_DONTWAIT" in src
+    assert "dpu_gpu_flow_stream_upsert_publish_failed" in src
     assert "dpu_gpu_flow_update_publish_failed" in src
     assert "MessageType::HEARTBEAT" in src
     assert "MessageType::METRIC_SNAPSHOT" in src

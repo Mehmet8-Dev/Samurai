@@ -8,10 +8,12 @@ from pathlib import Path
 import pytest
 
 from ddos_samurai.zmq.wire import (
+    FLOW_STREAM_UPSERT_SIZE_V1,
     FLOW_UPDATE_EVENT_SIZE_V1,
     HEADER_SIZE_V1,
     JOB_ENVELOPE_SIZE_V1,
     METRIC_SNAPSHOT_SIZE_V1,
+    FlowStreamUpsertV1,
     FlowUpdateEventV1,
     JitterModel,
     JobEnvelopeV1,
@@ -34,6 +36,7 @@ def test_wire_sizes_are_stable() -> None:
     assert JOB_ENVELOPE_SIZE_V1 == 480
     assert METRIC_SNAPSHOT_SIZE_V1 == 64
     assert FLOW_UPDATE_EVENT_SIZE_V1 == 48
+    assert FLOW_STREAM_UPSERT_SIZE_V1 == 84
 
 
 def test_header_pack_matches_golden_vector() -> None:
@@ -146,6 +149,60 @@ def test_flow_update_event_rejects_in_progress_version() -> None:
     )
     with pytest.raises(WireProtocolError, match="even/committed"):
         event.pack()
+
+
+def test_flow_stream_upsert_roundtrip_and_flow_update_projection() -> None:
+    upsert = FlowStreamUpsertV1(
+        version=12,
+        epoch=4,
+        flow_id=99,
+        tcp_seq=1000,
+        tcp_ack=900,
+        src_port=40000,
+        dst_port=443,
+        tcp_state=4,
+        proto=6,
+        flags=0x18,
+        rtt_us=750,
+        quota=2048,
+        tx_ipg_ns=500,
+        dpu_ts_ns=987654321,
+        target_ip="10.0.0.8",
+        payload_len=32,
+        payload_byte=65,
+        weight=3,
+        template_id=7,
+    )
+    payload = upsert.pack()
+    assert len(payload) == FLOW_STREAM_UPSERT_SIZE_V1
+    assert FlowStreamUpsertV1.unpack(payload) == upsert
+    event = upsert.to_flow_update()
+    assert event.version == 12
+    assert event.flow_id == 99
+    assert event.dst_port == 443
+    assert event.dpu_ts_ns == 987654321
+
+
+def test_flow_stream_upsert_rejects_in_progress_version() -> None:
+    upsert = FlowStreamUpsertV1(
+        version=13,
+        epoch=4,
+        flow_id=99,
+        tcp_seq=1000,
+        tcp_ack=900,
+        src_port=40000,
+        dst_port=443,
+        tcp_state=4,
+        proto=6,
+        flags=0x18,
+        rtt_us=750,
+        quota=2048,
+        tx_ipg_ns=500,
+        dpu_ts_ns=987654321,
+        target_ip="10.0.0.8",
+    )
+    with pytest.raises(WireProtocolError, match="even/committed"):
+        upsert.pack()
 
 
 def test_unpack_rejects_invalid_magic() -> None:
