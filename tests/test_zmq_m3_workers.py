@@ -464,6 +464,24 @@ def test_m3_dpu_state_runtime_models_authoritative_flow_updates() -> None:
     assert "kTcpStatePoisoned" in src
 
 
+def test_m3_cuda_contract_runtime_has_device_visible_mirror() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "gpu_packet_cuda" / "host_api.cuh").read_text(encoding="utf-8")
+    assert "update_ring_dev" in src
+    assert "ring_head_dev" in src
+    assert "ring_tail_dev" in src
+    assert "hot_flow_table_dev" in src
+    assert "hot_flow_versions_dev" in src
+    assert "hot_flow_epochs_dev" in src
+    assert "persistent_contract_runtime_alloc_device_mirror_unlocked" in src
+    assert "persistent_contract_runtime_sync_device_slot_unlocked" in src
+    assert "cudaMalloc(&cr.update_ring_dev" in src
+    assert "cudaMemcpy(cr.ring_head_dev + shard" in src
+    assert "failed to sync contract update into device mirror" in src
+    assert "contract_device_mirror_active" in src
+    assert "contract_device_sync_error_events" in src
+
+
 def test_m3_l7_worker_has_real_runtime_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
     src = (root / "ddos_samurai" / "zmq" / "daemon" / "l7_worker.cpp").read_text(encoding="utf-8")
