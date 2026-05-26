@@ -471,6 +471,21 @@ typedef struct samurai_gpu_packet_flow_affinity_v1 {
   int64_t flow_id;
 } samurai_gpu_packet_flow_affinity_v1;
 
+typedef struct samurai_gpu_packet_flow_update_event_v1 {
+  uint64_t version;
+  uint64_t epoch;
+  uint32_t flow_id;
+  uint32_t tcp_seq;
+  uint32_t tcp_ack;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint8_t tcp_state;
+  uint8_t proto;
+  uint16_t flags;
+  uint32_t rtt_us;
+  uint64_t dpu_ts_ns;
+} samurai_gpu_packet_flow_update_event_v1;
+
 int samurai_gpu_packet_publication_budget_us(uint32_t rtt_us, uint32_t* out_budget_us);
 int samurai_gpu_packet_seqlock_next_versions(
     uint64_t current_version,
@@ -487,6 +502,11 @@ int samurai_gpu_packet_compute_flow_affinity_v1(
     int32_t flows_per_warp,
     int32_t warp_size,
     samurai_gpu_packet_flow_affinity_v1* out);
+int samurai_gpu_packet_contract_publish_flow_update_v1(
+    const samurai_gpu_packet_flow_update_event_v1* event);
+int samurai_gpu_packet_contract_read_hot_flow_v1(
+    uint32_t flow_id,
+    samurai_gpu_packet_flow_update_event_v1* out_event);
 
 int samurai_gpu_packet_set_kernel_mode(int mode);
 int samurai_gpu_packet_get_kernel_mode();
