@@ -129,6 +129,25 @@ def test_flow_update_event_roundtrip_and_golden_vector() -> None:
     assert FlowUpdateEventV1.unpack(payload) == event
 
 
+def test_flow_update_event_rejects_in_progress_version() -> None:
+    event = FlowUpdateEventV1(
+        version=11,
+        epoch=3,
+        flow_id=7,
+        tcp_seq=100,
+        tcp_ack=55,
+        src_port=12345,
+        dst_port=443,
+        tcp_state=4,
+        proto=6,
+        flags=0x12,
+        rtt_us=900,
+        dpu_ts_ns=123456789,
+    )
+    with pytest.raises(WireProtocolError, match="even/committed"):
+        event.pack()
+
+
 def test_unpack_rejects_invalid_magic() -> None:
     bad = bytearray(
         SamuraiWireHeaderV1(

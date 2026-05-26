@@ -6,7 +6,14 @@ from unittest.mock import patch
 from ddos_samurai.zmq.dispatcher import ZmqDispatcher
 from ddos_samurai.zmq.event_collector import ZmqEventCollector
 from ddos_samurai.zmq.runtime_manager import ZmqRuntimeManager
-from ddos_samurai.zmq.wire import MessageType, WorkerKind, default_event_endpoint, default_job_endpoint
+from ddos_samurai.zmq.wire import (
+    FlowUpdateEventV1,
+    MessageType,
+    WorkerKind,
+    default_event_endpoint,
+    default_job_endpoint,
+    unpack_message,
+)
 from ddos_samurai.zmq.worker_prototype import ZmqWorkerPrototype
 
 
@@ -152,6 +159,49 @@ def test_m3_gpu_worker_has_native_cuda_bridge_and_failfast_fallback() -> None:
     assert "MessageType::METRIC_SNAPSHOT" in src
     assert "gpu_native_lib_unavailable" in src
     assert "gpu_native_symbol_missing" in src
+
+
+def test_m3_dispatch_flow_update_targets_gpu_contract_channel() -> None:
+    ctx = _FakeContext()
+    zmq = _FakeZmq()
+    _FakeZmq.Context._instance = ctx
+    endpoint = "ipc:///tmp/samurai_jobs_gpu_contract_test"
+    event = FlowUpdateEventV1(
+        version=12,
+        epoch=5,
+        flow_id=9,
+        tcp_seq=101,
+        tcp_ack=88,
+        src_port=40000,
+        dst_port=443,
+        tcp_state=4,
+        proto=6,
+        flags=0x18,
+        rtt_us=750,
+        dpu_ts_ns=987654321,
+    )
+
+    dispatcher = ZmqDispatcher(context=ctx, zmq_module=zmq)
+    try:
+        result = dispatcher.dispatch_flow_update(
+            correlation_id=77,
+            job_id="contract-flow-9",
+            event=event,
+            endpoint=endpoint,
+        )
+        assert result.endpoint == endpoint
+        assert result.bytes_sent == dispatcher.expected_flow_update_frame_size()
+
+        queue = ctx.ensure(endpoint)
+        assert len(queue) == 1
+        header, payload = unpack_message(queue[0])
+        assert header.worker_kind == WorkerKind.GPU
+        assert header.msg_type == MessageType.FLOW_UPDATE
+        assert header.correlation_id == 77
+        assert header.job_id == "contract-flow-9"
+        assert FlowUpdateEventV1.unpack(payload) == event
+    finally:
+        dispatcher.close()
 
 
 def test_m3_dpdk_worker_has_native_tx_path_and_failfast_fallback() -> None:

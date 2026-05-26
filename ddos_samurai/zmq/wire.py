@@ -431,6 +431,8 @@ class FlowUpdateEventV1:
         for name in ("version", "epoch", "dpu_ts_ns"):
             if not (0 <= int(getattr(self, name)) <= 0xFFFFFFFFFFFFFFFF):
                 raise WireProtocolError(f"{name} must fit uint64")
+        if int(self.version) & 1:
+            raise WireProtocolError("version must be even/committed")
         for name in ("flow_id", "tcp_seq", "tcp_ack", "rtt_us"):
             if not (0 <= int(getattr(self, name)) <= 0xFFFFFFFF):
                 raise WireProtocolError(f"{name} must fit uint32")
