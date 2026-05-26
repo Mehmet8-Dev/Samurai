@@ -115,14 +115,29 @@ def parse_subnet(subnet: str) -> tuple[int, int]:
     return int(net.network_address), int(net.prefixlen)
 
 
+try:
+    from numba import cuda as _numba_cuda
+except Exception:
+    _numba_cuda = None
+
+
+def _device_jit(py_func):
+    if _numba_cuda is None:
+        return py_func
+    return _numba_cuda.jit(device=True)(py_func)
+
+
+@_device_jit
 def _buf_get(buffer: Any, offset: int) -> int:
     return int(buffer[int(offset)]) & 0xFF
 
 
+@_device_jit
 def read_uint16_be(buffer: Any, offset: int) -> int:
     return (_buf_get(buffer, offset) << 8) | _buf_get(buffer, int(offset) + 1)
 
 
+@_device_jit
 def read_uint32_be(buffer: Any, offset: int) -> int:
     return (
         (_buf_get(buffer, offset) << 24)
@@ -132,11 +147,13 @@ def read_uint32_be(buffer: Any, offset: int) -> int:
     )
 
 
+@_device_jit
 def write_uint16_be(buffer: Any, offset: int, value: int) -> None:
     buffer[int(offset)] = (int(value) >> 8) & 0xFF
     buffer[int(offset) + 1] = int(value) & 0xFF
 
 
+@_device_jit
 def write_uint32_be(buffer: Any, offset: int, value: int) -> None:
     buffer[int(offset)] = (int(value) >> 24) & 0xFF
     buffer[int(offset) + 1] = (int(value) >> 16) & 0xFF
@@ -144,6 +161,7 @@ def write_uint32_be(buffer: Any, offset: int, value: int) -> None:
     buffer[int(offset) + 3] = int(value) & 0xFF
 
 
+@_device_jit
 def calculate_checksum(buffer: Any, offset: int, length: int) -> int:
     end = int(offset) + int(length)
     s = 0
@@ -159,6 +177,7 @@ def calculate_checksum(buffer: Any, offset: int, length: int) -> int:
     return (~s) & 0xFFFF
 
 
+@_device_jit
 def _pseudo_header_sum(src_ip: int, dst_ip: int, protocol: int, length: int) -> int:
     src = int(src_ip) & 0xFFFFFFFF
     dst = int(dst_ip) & 0xFFFFFFFF
@@ -169,6 +188,7 @@ def _pseudo_header_sum(src_ip: int, dst_ip: int, protocol: int, length: int) -> 
     return s
 
 
+@_device_jit
 def _checksum_from_words(words_sum: int) -> int:
     s = int(words_sum)
     s = (s & 0xFFFF) + (s >> 16)
@@ -176,6 +196,7 @@ def _checksum_from_words(words_sum: int) -> int:
     return (~s) & 0xFFFF
 
 
+@_device_jit
 def calculate_tcp_checksum_optimized(buffer: Any, offset: int, length: int, src_ip: int, dst_ip: int) -> int:
     s = _pseudo_header_sum(src_ip, dst_ip, TCP_PROTOCOL, length)
     end = int(offset) + int(length)
@@ -188,13 +209,16 @@ def calculate_tcp_checksum_optimized(buffer: Any, offset: int, length: int, src_
     return _checksum_from_words(s)
 
 
+@_device_jit
 def calculate_udp_checksum_optimized(buffer: Any, offset: int, length: int, src_ip: int, dst_ip: int) -> int:
     out = calculate_tcp_checksum_optimized(buffer, offset, length, src_ip, dst_ip)
     return out if out != 0 else 0xFFFF
 
 
+@_device_jit
 def calculate_icmp_checksum(buffer: Any, offset: int, length: int) -> int:
     return calculate_checksum(buffer, offset, length)
+
 
 
 def get_active_backend_name() -> str:
