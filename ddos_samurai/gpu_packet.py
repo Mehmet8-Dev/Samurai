@@ -56,6 +56,12 @@ TCP_URG = 0x20
 TCP_ECE = 0x40
 TCP_CWR = 0x80
 
+DESCRIPTOR_STATE_FREE = 0
+DESCRIPTOR_STATE_GPU_WRITING = 1
+DESCRIPTOR_STATE_READY_FOR_NIC = 2
+DESCRIPTOR_STATE_NIC_OWNED = 3
+DESCRIPTOR_STATE_COMPLETE = 4
+
 # Legacy constants retained as inert placeholders for callers that still import them.
 TEMPLATE_CONST_MAX = 4096
 POOL_CONST_MAX = 32768
@@ -385,6 +391,29 @@ def read_stream_stats_snapshot(stream_id=None):
 
 def shutdown_persistent_runtime():
     return _backend_call("shutdown_persistent_runtime")
+
+
+def publication_budget_us(rtt_us: int) -> int:
+    return _backend_call("publication_budget_us", int(rtt_us))
+
+
+def seqlock_next_versions(current_version: int) -> tuple[int, int]:
+    return _backend_call("seqlock_next_versions", int(current_version))
+
+
+def descriptor_transition_valid(from_state: int, to_state: int) -> bool:
+    return bool(_backend_call("descriptor_transition_valid", int(from_state), int(to_state)))
+
+
+def compute_flow_affinity(block_idx: int, block_dim: int, thread_idx: int, flows_per_warp: int, warp_size: int = 32):
+    return _backend_call(
+        "compute_flow_affinity",
+        int(block_idx),
+        int(block_dim),
+        int(thread_idx),
+        int(flows_per_warp),
+        int(warp_size),
+    )
 
 
 def generate_packets(*args, **kwargs):

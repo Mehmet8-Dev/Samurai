@@ -218,6 +218,23 @@ class _PersistentStatsSnapshot(ctypes.Structure):
     ]
 
 
+class _FlowAffinityV1(ctypes.Structure):
+    _fields_ = [
+        ("global_tid", ctypes.c_int64),
+        ("global_warp_id", ctypes.c_int32),
+        ("lane", ctypes.c_int32),
+        ("flow_start", ctypes.c_int64),
+        ("flow_id", ctypes.c_int64),
+    ]
+
+
+DESCRIPTOR_STATE_FREE = 0
+DESCRIPTOR_STATE_GPU_WRITING = 1
+DESCRIPTOR_STATE_READY_FOR_NIC = 2
+DESCRIPTOR_STATE_NIC_OWNED = 3
+DESCRIPTOR_STATE_COMPLETE = 4
+
+
 def _native_telemetry_inc(key: str, delta: int = 1) -> None:
     if key not in _NATIVE_GENERATION_TELEMETRY:
         return
@@ -524,6 +541,40 @@ def _load_lib() -> ctypes.CDLL | None:
         lib.samurai_gpu_packet_shutdown_runtime.restype = ctypes.c_int
     except _RECOVERABLE_ERRORS as exc:
         _debug_exception("native stream lifecycle symbols unavailable", exc)
+
+    try:
+        if hasattr(lib, "samurai_gpu_packet_publication_budget_us"):
+            lib.samurai_gpu_packet_publication_budget_us.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            lib.samurai_gpu_packet_publication_budget_us.restype = ctypes.c_int
+        if hasattr(lib, "samurai_gpu_packet_seqlock_next_versions"):
+            lib.samurai_gpu_packet_seqlock_next_versions.argtypes = [
+                ctypes.c_uint64,
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            lib.samurai_gpu_packet_seqlock_next_versions.restype = ctypes.c_int
+        if hasattr(lib, "samurai_gpu_packet_descriptor_transition_valid"):
+            lib.samurai_gpu_packet_descriptor_transition_valid.argtypes = [
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.POINTER(ctypes.c_int32),
+            ]
+            lib.samurai_gpu_packet_descriptor_transition_valid.restype = ctypes.c_int
+        if hasattr(lib, "samurai_gpu_packet_compute_flow_affinity_v1"):
+            lib.samurai_gpu_packet_compute_flow_affinity_v1.argtypes = [
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.POINTER(_FlowAffinityV1),
+            ]
+            lib.samurai_gpu_packet_compute_flow_affinity_v1.restype = ctypes.c_int
+    except _RECOVERABLE_ERRORS as exc:
+        _debug_exception("native zero-copy contract symbols unavailable", exc)
     return lib
 
 
@@ -796,6 +847,16 @@ def _supports_stream_lifecycle() -> bool:
         and hasattr(_LIB, "samurai_gpu_packet_stop_stream")
         and hasattr(_LIB, "samurai_gpu_packet_read_stream_stats")
         and hasattr(_LIB, "samurai_gpu_packet_shutdown_runtime")
+    )
+
+
+def _supports_zero_copy_contract_api() -> bool:
+    return bool(
+        _LIB is not None
+        and hasattr(_LIB, "samurai_gpu_packet_publication_budget_us")
+        and hasattr(_LIB, "samurai_gpu_packet_seqlock_next_versions")
+        and hasattr(_LIB, "samurai_gpu_packet_descriptor_transition_valid")
+        and hasattr(_LIB, "samurai_gpu_packet_compute_flow_affinity_v1")
     )
 
 
@@ -1072,6 +1133,91 @@ def shutdown_persistent_runtime() -> None:
     if rc != 0:
         _stream_telemetry_inc("gpu_persistent_errors", 1)
         _raise_native_error("samurai_gpu_packet_shutdown_runtime failed")
+
+
+def publication_budget_us(rtt_us: int) -> int:
+    if not _native_ready():
+        _raise_native_policy_violation("publication_budget_us")
+    if not _supports_zero_copy_contract_api():
+        raise GPUPacketError("native zero-copy contract API unavailable")
+    out = ctypes.c_uint32(0)
+    rc = int(_LIB.samurai_gpu_packet_publication_budget_us(ctypes.c_uint32(int(rtt_us)), ctypes.byref(out)) or 0)
+    if rc != 0:
+        _raise_native_error("samurai_gpu_packet_publication_budget_us failed")
+    return int(out.value)
+
+
+def seqlock_next_versions(current_version: int) -> tuple[int, int]:
+    if not _native_ready():
+        _raise_native_policy_violation("seqlock_next_versions")
+    if not _supports_zero_copy_contract_api():
+        raise GPUPacketError("native zero-copy contract API unavailable")
+    out_begin = ctypes.c_uint64(0)
+    out_commit = ctypes.c_uint64(0)
+    rc = int(
+        _LIB.samurai_gpu_packet_seqlock_next_versions(
+            ctypes.c_uint64(int(current_version)),
+            ctypes.byref(out_begin),
+            ctypes.byref(out_commit),
+        )
+        or 0
+    )
+    if rc != 0:
+        _raise_native_error("samurai_gpu_packet_seqlock_next_versions failed")
+    return int(out_begin.value), int(out_commit.value)
+
+
+def descriptor_transition_valid(from_state: int, to_state: int) -> bool:
+    if not _native_ready():
+        _raise_native_policy_violation("descriptor_transition_valid")
+    if not _supports_zero_copy_contract_api():
+        raise GPUPacketError("native zero-copy contract API unavailable")
+    out_valid = ctypes.c_int32(0)
+    rc = int(
+        _LIB.samurai_gpu_packet_descriptor_transition_valid(
+            ctypes.c_int32(int(from_state)),
+            ctypes.c_int32(int(to_state)),
+            ctypes.byref(out_valid),
+        )
+        or 0
+    )
+    if rc != 0:
+        _raise_native_error("samurai_gpu_packet_descriptor_transition_valid failed")
+    return bool(int(out_valid.value))
+
+
+def compute_flow_affinity(
+    block_idx: int,
+    block_dim: int,
+    thread_idx: int,
+    flows_per_warp: int,
+    warp_size: int = 32,
+) -> dict[str, int]:
+    if not _native_ready():
+        _raise_native_policy_violation("compute_flow_affinity")
+    if not _supports_zero_copy_contract_api():
+        raise GPUPacketError("native zero-copy contract API unavailable")
+    out = _FlowAffinityV1()
+    rc = int(
+        _LIB.samurai_gpu_packet_compute_flow_affinity_v1(
+            ctypes.c_int32(int(block_idx)),
+            ctypes.c_int32(int(block_dim)),
+            ctypes.c_int32(int(thread_idx)),
+            ctypes.c_int32(int(flows_per_warp)),
+            ctypes.c_int32(int(warp_size)),
+            ctypes.byref(out),
+        )
+        or 0
+    )
+    if rc != 0:
+        _raise_native_error("samurai_gpu_packet_compute_flow_affinity_v1 failed")
+    return {
+        "global_tid": int(out.global_tid),
+        "global_warp_id": int(out.global_warp_id),
+        "lane": int(out.lane),
+        "flow_start": int(out.flow_start),
+        "flow_id": int(out.flow_id),
+    }
 
 
 def generate_packets(

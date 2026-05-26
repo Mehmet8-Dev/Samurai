@@ -167,6 +167,51 @@ class _FakeLib:
         self.calls.append({"name": "shutdown_runtime"})
         return self.rc
 
+    def samurai_gpu_packet_publication_budget_us(self, rtt_us, out_budget_us):
+        rtt = max(0, int(_scalar(rtt_us)))
+        budget = rtt // 10
+        if budget < 50:
+            budget = 50
+        elif budget > 1000:
+            budget = 1000
+        ctypes.cast(out_budget_us, ctypes.POINTER(ctypes.c_uint32)).contents.value = int(budget)
+        return self.rc
+
+    def samurai_gpu_packet_seqlock_next_versions(self, current_version, out_begin, out_commit):
+        cur = int(_scalar(current_version))
+        if cur & 1:
+            cur += 1
+        ctypes.cast(out_begin, ctypes.POINTER(ctypes.c_uint64)).contents.value = int(cur + 1)
+        ctypes.cast(out_commit, ctypes.POINTER(ctypes.c_uint64)).contents.value = int(cur + 2)
+        return self.rc
+
+    def samurai_gpu_packet_descriptor_transition_valid(self, from_state, to_state, out_valid):
+        f = int(_scalar(from_state))
+        t = int(_scalar(to_state))
+        valid = int((f, t) in {(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)})
+        ctypes.cast(out_valid, ctypes.POINTER(ctypes.c_int32)).contents.value = valid
+        return self.rc
+
+    def samurai_gpu_packet_compute_flow_affinity_v1(
+        self, block_idx, block_dim, thread_idx, flows_per_warp, warp_size, out_aff
+    ):
+        bi = int(_scalar(block_idx))
+        bd = max(1, int(_scalar(block_dim)))
+        ti = int(_scalar(thread_idx))
+        fpw = max(1, int(_scalar(flows_per_warp)))
+        ws = max(1, int(_scalar(warp_size)))
+        global_tid = bi * bd + ti
+        global_warp_id = global_tid // ws
+        lane = ti % ws
+        flow_start = global_warp_id * fpw
+        aff = ctypes.cast(out_aff, ctypes.POINTER(backend._FlowAffinityV1)).contents
+        aff.global_tid = int(global_tid)
+        aff.global_warp_id = int(global_warp_id)
+        aff.lane = int(lane)
+        aff.flow_start = int(flow_start)
+        aff.flow_id = int(flow_start + lane)
+        return self.rc
+
 
 @pytest.fixture(autouse=True)
 def _reset_native_telemetry():
@@ -297,6 +342,35 @@ def test_kernel_mode_and_stream_lifecycle(monkeypatch):
     backend.stop_stream(stream_id)
     backend.shutdown_persistent_runtime()
     assert any(c["name"] == "shutdown_runtime" for c in fake.calls)
+
+
+def test_zero_copy_contract_helpers(monkeypatch):
+    fake = _FakeLib(payload=b"\x01", packet_size=1)
+    monkeypatch.setattr(backend, "_LIB", fake, raising=True)
+    monkeypatch.setattr(backend, "_NATIVE_ENABLED", True, raising=True)
+
+    assert backend.publication_budget_us(300) == 50
+    assert backend.publication_budget_us(9000) == 900
+    assert backend.publication_budget_us(50000) == 1000
+
+    write_begin, write_commit = backend.seqlock_next_versions(8)
+    assert write_begin == 9
+    assert write_commit == 10
+    write_begin2, write_commit2 = backend.seqlock_next_versions(9)
+    assert write_begin2 == 11
+    assert write_commit2 == 12
+
+    assert backend.descriptor_transition_valid(backend.DESCRIPTOR_STATE_FREE, backend.DESCRIPTOR_STATE_GPU_WRITING)
+    assert not backend.descriptor_transition_valid(
+        backend.DESCRIPTOR_STATE_FREE, backend.DESCRIPTOR_STATE_READY_FOR_NIC
+    )
+
+    aff = backend.compute_flow_affinity(block_idx=2, block_dim=256, thread_idx=63, flows_per_warp=32, warp_size=32)
+    assert aff["global_tid"] == 575
+    assert aff["global_warp_id"] == 17
+    assert aff["lane"] == 31
+    assert aff["flow_start"] == 544
+    assert aff["flow_id"] == 575
 
 
 def test_invalid_stream_is_rejected(monkeypatch):
