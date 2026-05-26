@@ -427,6 +427,8 @@ def test_m3_afxdp_worker_has_native_bridge_and_failfast_fallback() -> None:
 def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
     src = (root / "ddos_samurai" / "zmq" / "daemon" / "doca_gpunetio_worker.cpp").read_text(encoding="utf-8")
+    backend = (root / "ddos_samurai" / "gpu_packet_cuda" / "doca_gpunetio_backend.cpp").read_text(encoding="utf-8")
+    api = (root / "ddos_samurai" / "gpu_packet_cuda" / "tx_backend_doca_gpunetio.cuh").read_text(encoding="utf-8")
     assert "LoadDocaNative" in src
     assert '#include "dpu_state_runtime.hpp"' in src
     assert "samurai_doca_gpunetio_get_api_v1" in src
@@ -448,6 +450,16 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "SAMURAI_DPU_CONTRACT_RDMA_SPEC" in src
     assert "dpu_contract_rdma_writer_unavailable" in src
     assert "dpu_contract_rdma_publish_failed" in src
+    assert "DocaContractWriterConfigV1" in api
+    assert "DocaFlowUpdateEventV1" in api
+    assert "contract_writer_publish_flow_update_v1" in api
+    assert "samurai_doca_backend_contract_writer_open" in backend
+    assert "samurai_doca_backend_contract_writer_close" in backend
+    assert "samurai_doca_backend_contract_writer_publish_flow_update_v1" in backend
+    assert "BackendContractFlowUpdateSlot" in backend
+    assert "contract_store_event_slot" in backend
+    assert "__atomic_store_n(&heads[shard], head + 1u, __ATOMIC_RELEASE)" in backend
+    assert "contract writer ring overflow" in backend
     assert "MessageType::FLOW_UPDATE" in src
     assert "MessageType::FLOW_STREAM_UPSERT" in src
     assert "ZMQ_DONTWAIT" in src
