@@ -249,9 +249,121 @@ std::string FlowEventStreamJson(const samurai::wire::FlowUpdateEventV1& event, c
   return oss.str();
 }
 
+std::string ReadStreamTargetIp(const samurai::wire::FlowStreamUpsertV1& upsert) {
+  return ReadFixed(upsert.target_ip, sizeof(upsert.target_ip));
+}
+
+samurai::wire::FlowUpdateEventV1 FlowUpdateFromStreamUpsert(const samurai::wire::FlowStreamUpsertV1& upsert) {
+  samurai::wire::FlowUpdateEventV1 ev{};
+  ev.version = upsert.version;
+  ev.epoch = upsert.epoch;
+  ev.flow_id = upsert.flow_id;
+  ev.tcp_seq = upsert.tcp_seq;
+  ev.tcp_ack = upsert.tcp_ack;
+  ev.src_port = upsert.src_port;
+  ev.dst_port = upsert.dst_port;
+  ev.tcp_state = upsert.tcp_state;
+  ev.proto = upsert.proto;
+  ev.flags = upsert.flags;
+  ev.rtt_us = upsert.rtt_us;
+  ev.dpu_ts_ns = upsert.dpu_ts_ns;
+  return ev;
+}
+
+std::string FlowStreamUpsertJson(const samurai::wire::FlowStreamUpsertV1& upsert, const FlowLifecycleConfig& cfg) {
+  std::ostringstream oss;
+  const bool is_icmp = upsert.proto == 1u;
+  const std::string target_ip = ReadStreamTargetIp(upsert);
+  const std::uint32_t quota = upsert.quota > 0u ? upsert.quota : static_cast<std::uint32_t>(cfg.quota);
+  const std::uint64_t tx_ipg_ns = upsert.tx_ipg_ns;
+  const std::uint16_t payload_len = upsert.payload_len;
+  const std::uint8_t weight = upsert.weight > 0u ? upsert.weight : static_cast<std::uint8_t>(cfg.weight);
+  oss << "{"
+      << "\"stream_type\":\"l4\","
+      << "\"flow_id\":" << upsert.flow_id << ","
+      << "\"template_id\":" << upsert.template_id << ","
+      << "\"dpu_epoch\":" << upsert.epoch << ","
+      << "\"dpu_version\":" << upsert.version << ","
+      << "\"protocol\":\"" << ProtocolNameFromEvent(upsert.proto) << "\","
+      << "\"target_ip\":\"" << JsonEscape(target_ip) << "\","
+      << "\"target_port\":" << (is_icmp ? 0u : static_cast<unsigned int>(upsert.dst_port)) << ","
+      << "\"source_port\":" << static_cast<unsigned int>(upsert.src_port) << ","
+      << "\"source_port_mode\":" << (upsert.src_port != 0u ? 1 : 0) << ","
+      << "\"tcp_flags\":" << static_cast<unsigned int>(upsert.flags & 0xFFu) << ","
+      << "\"quota\":" << quota << ","
+      << "\"weight\":" << static_cast<unsigned int>(weight) << ","
+      << "\"tx_ipg_ns\":" << tx_ipg_ns << ","
+      << "\"payload_len\":" << payload_len << ","
+      << "\"payload_byte\":" << static_cast<unsigned int>(upsert.payload_byte)
+      << "}";
+  return oss.str();
+}
+
 bool EnsureFlowLifecycleSymbols(const GpuNativeApi& api, bool need_stop, std::string& err) {
   if (!api.set_kernel_mode || !api.start_stream || !api.update_stream || (need_stop && !api.stop_stream)) {
     err = "gpu_native_stream_lifecycle_symbol_missing";
+    return false;
+  }
+  return true;
+}
+
+bool UpsertFlowStreamFromStreamUpsert(
+    GpuNativeApi& api,
+    const samurai::wire::FlowStreamUpsertV1& upsert,
+    const FlowLifecycleConfig& cfg,
+    std::unordered_map<std::uint32_t, std::int64_t>& flow_streams,
+    std::string& err) {
+  if (!cfg.enabled) {
+    return true;
+  }
+  const bool poison = upsert.tcp_state == 255u;
+  if (!EnsureFlowLifecycleSymbols(api, poison, err)) {
+    return false;
+  }
+  const std::string target_ip = ReadStreamTargetIp(upsert);
+  if (target_ip.empty() && !poison) {
+    err = "gpu_flow_stream_upsert_target_ip_required";
+    return false;
+  }
+  if (upsert.proto != 1u && upsert.dst_port == 0u && !poison) {
+    err = "gpu_flow_update_target_port_required";
+    return false;
+  }
+
+  auto it = flow_streams.find(upsert.flow_id);
+  if (poison) {
+    if (it != flow_streams.end()) {
+      if (api.stop_stream(it->second) != 0) {
+        err = NativeLastError(api);
+        if (err.empty()) err = "gpu_flow_update_stop_stream_failed";
+        return false;
+      }
+      flow_streams.erase(it);
+    }
+    return true;
+  }
+
+  if (api.set_kernel_mode(1) != 0) {
+    err = NativeLastError(api);
+    if (err.empty()) err = "gpu_flow_update_set_persistent_mode_failed";
+    return false;
+  }
+
+  const std::string json = FlowStreamUpsertJson(upsert, cfg);
+  if (it == flow_streams.end()) {
+    std::int64_t stream_id = 0;
+    if (api.start_stream(json.c_str(), &stream_id) != 0 || stream_id == 0) {
+      err = NativeLastError(api);
+      if (err.empty()) err = "gpu_flow_update_start_stream_failed";
+      return false;
+    }
+    flow_streams[upsert.flow_id] = stream_id;
+    return true;
+  }
+
+  if (api.update_stream(it->second, json.c_str()) != 0) {
+    err = NativeLastError(api);
+    if (err.empty()) err = "gpu_flow_update_update_stream_failed";
     return false;
   }
   return true;
@@ -663,6 +775,74 @@ int main(int argc, char** argv) {
         continue;
       }
       if (!UpsertFlowStreamFromEvent(api, event, flow_lifecycle_cfg, flow_streams, native_err)) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError(native_err));
+        continue;
+      }
+      (void)SendAck(push, header.correlation_id, job_id);
+      continue;
+    }
+
+    if (msg_type == samurai::wire::MessageType::FLOW_STREAM_UPSERT) {
+      if (payload_len != sizeof(samurai::wire::FlowStreamUpsertV1) ||
+          header.payload_len != sizeof(samurai::wire::FlowStreamUpsertV1)) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError("flow_stream_upsert_size_mismatch"));
+        zmq_msg_close(&msg);
+        continue;
+      }
+
+      samurai::wire::FlowStreamUpsertV1 upsert{};
+      std::memcpy(&upsert, payload_ptr, sizeof(upsert));
+      zmq_msg_close(&msg);
+
+      std::string native_err;
+      if (!LoadGpuNative(api, native_err)) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError(native_err));
+        continue;
+      }
+      if (!api.contract_publish_flow_update) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError("gpu_native_contract_symbol_missing"));
+        continue;
+      }
+      const samurai::wire::FlowUpdateEventV1 event = FlowUpdateFromStreamUpsert(upsert);
+      if (api.contract_publish_flow_update(&event) != 0) {
+        std::string err = NativeLastError(api);
+        if (err.empty()) {
+          err = "gpu_contract_publish_failed";
+        }
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError(err));
+        continue;
+      }
+      if (!UpsertFlowStreamFromStreamUpsert(api, upsert, flow_lifecycle_cfg, flow_streams, native_err)) {
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),

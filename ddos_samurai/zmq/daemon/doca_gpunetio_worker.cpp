@@ -313,6 +313,41 @@ std::vector<std::uint8_t> SerializeFlowUpdate(const samurai::wire::FlowUpdateEve
   return payload;
 }
 
+std::vector<std::uint8_t> SerializeFlowStreamUpsert(const samurai::wire::FlowStreamUpsertV1& ev) {
+  std::vector<std::uint8_t> payload(sizeof(ev));
+  std::memcpy(payload.data(), &ev, sizeof(ev));
+  return payload;
+}
+
+samurai::wire::FlowStreamUpsertV1 BuildFlowStreamUpsert(
+    const samurai::dpu::FlowState& st,
+    const samurai::wire::JobEnvelopeV1& env,
+    std::uint64_t dpu_ts_ns) {
+  samurai::wire::FlowStreamUpsertV1 ev{};
+  ev.version = st.version;
+  ev.epoch = st.epoch;
+  ev.flow_id = st.flow_id;
+  ev.tcp_seq = st.seq_num;
+  ev.tcp_ack = st.ack_num;
+  ev.src_port = st.src_port;
+  ev.dst_port = st.dst_port;
+  ev.tcp_state = st.tcp_state;
+  ev.proto = st.proto;
+  ev.flags = st.flags;
+  ev.rtt_us = st.rtt_us;
+  ev.quota = std::max<std::uint32_t>(1u, env.burst_size > 0u ? env.burst_size : 1024u);
+  ev.tx_ipg_ns = env.ipg_ns;
+  ev.dpu_ts_ns = dpu_ts_ns;
+  std::memset(ev.target_ip, 0, sizeof(ev.target_ip));
+  const std::string target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
+  std::memcpy(ev.target_ip, target_ip.c_str(), std::min(target_ip.size(), sizeof(ev.target_ip) - 1u));
+  ev.payload_len = static_cast<std::uint16_t>(std::min<std::uint32_t>(env.pad_size, 1460u));
+  ev.payload_byte = 0u;
+  ev.weight = 1u;
+  ev.template_id = 0u;
+  return ev;
+}
+
 bool PublishDpuFlowUpdate(
     void* gpu_push,
     const samurai::wire::FlowUpdateEventV1& ev,
@@ -332,6 +367,30 @@ bool PublishDpuFlowUpdate(
                            ZMQ_DONTWAIT);
   if (rc < 0) {
     err = "dpu_gpu_flow_update_publish_failed";
+    return false;
+  }
+  return true;
+}
+
+bool PublishDpuFlowStreamUpsert(
+    void* gpu_push,
+    const samurai::wire::FlowStreamUpsertV1& ev,
+    std::uint64_t correlation_id,
+    const std::string& job_id,
+    std::string& err) {
+  if (!gpu_push) {
+    err = "dpu_gpu_flow_stream_upsert_socket_unavailable";
+    return false;
+  }
+  const int rc = SendFrame(gpu_push,
+                           static_cast<std::uint8_t>(samurai::wire::MessageType::FLOW_STREAM_UPSERT),
+                           correlation_id,
+                           samurai::wire::WorkerKind::GPU,
+                           job_id,
+                           SerializeFlowStreamUpsert(ev),
+                           ZMQ_DONTWAIT);
+  if (rc < 0) {
+    err = "dpu_gpu_flow_stream_upsert_publish_failed";
     return false;
   }
   return true;
@@ -650,9 +709,9 @@ int main(int argc, char** argv) {
         const samurai::dpu::FlowState initial_flow = dpu_state.Upsert(InitialFlowStateFromEnvelope(header, env));
         if (dpu_state_publish) {
           std::string publish_err;
-          const samurai::wire::FlowUpdateEventV1 ev =
-              dpu_state.BuildUpdateEvent(initial_flow.flow_id, samurai_pacing_monotonic_now_ns());
-          if (!PublishDpuFlowUpdate(gpu_push, ev, header.correlation_id, job_id, publish_err)) {
+          const samurai::wire::FlowStreamUpsertV1 ev =
+              BuildFlowStreamUpsert(initial_flow, env, samurai_pacing_monotonic_now_ns());
+          if (!PublishDpuFlowStreamUpsert(gpu_push, ev, header.correlation_id, job_id, publish_err)) {
             (void)SendFrame(push,
                             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
                             header.correlation_id,
@@ -768,8 +827,8 @@ int main(int argc, char** argv) {
         const samurai::dpu::FlowState& committed_final_flow = dpu_state.Transition(final_flow);
         if (dpu_state_publish) {
           std::string publish_err;
-          const samurai::wire::FlowUpdateEventV1 ev = dpu_state.BuildUpdateEvent(committed_final_flow.flow_id, end_ns);
-          if (!PublishDpuFlowUpdate(gpu_push, ev, header.correlation_id, job_id, publish_err)) {
+          const samurai::wire::FlowStreamUpsertV1 ev = BuildFlowStreamUpsert(committed_final_flow, env, end_ns);
+          if (!PublishDpuFlowStreamUpsert(gpu_push, ev, header.correlation_id, job_id, publish_err)) {
             (void)SendFrame(push,
                             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
                             header.correlation_id,
