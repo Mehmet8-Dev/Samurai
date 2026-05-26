@@ -17,6 +17,7 @@
 #include <zmq.h>
 
 #include "../../ddos_samurai/gpu_packet_cuda/tx_backend_doca_gpunetio.cuh"
+#include "dpu_state_runtime.hpp"
 #include "engine.hpp"
 #include "pacing_engine.h"
 #include "wire_protocol.h"
@@ -29,6 +30,7 @@ using ddos_samurai::cpu_native::SpoofOptions;
 
 constexpr const char* kDefaultJobs = "ipc:///tmp/samurai_jobs_doca";
 constexpr const char* kDefaultEvents = "ipc:///tmp/samurai_events_doca";
+constexpr const char* kDefaultGpuJobs = "ipc:///tmp/samurai_jobs_gpu";
 
 using fn_get_api_t = DocaGpuNetioApiV1* (*)();
 using fn_backend_create_txq_t = int (*)(const char*, const char*, int, int, int*, char*, size_t);
@@ -220,7 +222,8 @@ int SendFrame(
     std::uint64_t correlation_id,
     samurai::wire::WorkerKind worker_kind,
     const std::string& job_id,
-    const std::vector<std::uint8_t>& payload = {}) {
+    const std::vector<std::uint8_t>& payload = {},
+    int send_flags = 0) {
   samurai::wire::SamuraiWireHeaderV1 header = samurai::daemon::MakeHeader(
       msg_type,
       static_cast<std::uint32_t>(payload.size()),
@@ -233,9 +236,105 @@ int SendFrame(
   auto* p = static_cast<std::uint8_t*>(zmq_msg_data(&msg));
   std::memcpy(p, &header, sizeof(header));
   if (!payload.empty()) std::memcpy(p + sizeof(header), payload.data(), payload.size());
-  const int rc = zmq_msg_send(&msg, event_socket, 0);
+  const int rc = zmq_msg_send(&msg, event_socket, send_flags);
   zmq_msg_close(&msg);
   return rc;
+}
+
+std::uint8_t ProtoFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
+  const std::string proto = ReadFixed(env.protocol, sizeof(env.protocol));
+  if (proto == "udp" || proto == "UDP") return samurai::dpu::kProtoUdp;
+  return samurai::dpu::kProtoTcp;
+}
+
+std::uint16_t TcpFlagsFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
+  const std::string flags = ReadFixed(env.tcp_flags, sizeof(env.tcp_flags));
+  std::uint16_t out = 0;
+  for (const char ch : flags) {
+    switch (ch) {
+      case 'F':
+      case 'f':
+        out |= 0x01u;
+        break;
+      case 'S':
+      case 's':
+        out |= 0x02u;
+        break;
+      case 'R':
+      case 'r':
+        out |= 0x04u;
+        break;
+      case 'P':
+      case 'p':
+        out |= 0x08u;
+        break;
+      case 'A':
+      case 'a':
+        out |= 0x10u;
+        break;
+      case 'U':
+      case 'u':
+        out |= 0x20u;
+        break;
+      default:
+        break;
+    }
+  }
+  return out;
+}
+
+std::uint32_t FlowIdFromHeader(const samurai::wire::SamuraiWireHeaderV1& header) {
+  const std::uint32_t low = static_cast<std::uint32_t>(header.correlation_id & 0xFFFFFFFFull);
+  return low == 0u ? 1u : low;
+}
+
+samurai::dpu::FlowState InitialFlowStateFromEnvelope(
+    const samurai::wire::SamuraiWireHeaderV1& header,
+    const samurai::wire::JobEnvelopeV1& env) {
+  samurai::dpu::FlowState st{};
+  st.flow_id = FlowIdFromHeader(header);
+  st.seq_num = 0u;
+  st.ack_num = 0u;
+  st.src_port = static_cast<std::uint16_t>(40000u + (st.flow_id % 20000u));
+  st.dst_port = env.target_port;
+  st.proto = ProtoFromEnvelope(env);
+  st.flags = TcpFlagsFromEnvelope(env);
+  st.tcp_state = (st.proto == samurai::dpu::kProtoTcp && (st.flags & 0x02u) != 0u)
+                     ? samurai::dpu::kTcpStateSynSent
+                     : samurai::dpu::kTcpStateEstablished;
+  st.rtt_us = 0u;
+  st.epoch = 1u;
+  return st;
+}
+
+std::vector<std::uint8_t> SerializeFlowUpdate(const samurai::wire::FlowUpdateEventV1& ev) {
+  std::vector<std::uint8_t> payload(sizeof(ev));
+  std::memcpy(payload.data(), &ev, sizeof(ev));
+  return payload;
+}
+
+bool PublishDpuFlowUpdate(
+    void* gpu_push,
+    const samurai::wire::FlowUpdateEventV1& ev,
+    std::uint64_t correlation_id,
+    const std::string& job_id,
+    std::string& err) {
+  if (!gpu_push) {
+    err = "dpu_gpu_flow_update_socket_unavailable";
+    return false;
+  }
+  const int rc = SendFrame(gpu_push,
+                           static_cast<std::uint8_t>(samurai::wire::MessageType::FLOW_UPDATE),
+                           correlation_id,
+                           samurai::wire::WorkerKind::GPU,
+                           job_id,
+                           SerializeFlowUpdate(ev),
+                           ZMQ_DONTWAIT);
+  if (rc < 0) {
+    err = "dpu_gpu_flow_update_publish_failed";
+    return false;
+  }
+  return true;
 }
 
 std::vector<std::uint8_t> JsonError(const std::string& reason) {
@@ -309,13 +408,23 @@ int SendAck(void* push, std::uint64_t cid, const std::string& job_id) {
 int main(int argc, char** argv) {
   std::string jobs_ep = kDefaultJobs;
   std::string events_ep = kDefaultEvents;
+  std::string gpu_jobs_ep = kDefaultGpuJobs;
   bool bind_jobs = true;
   bool bind_events = false;
+  bool dpu_state_publish = true;
   int cli_queue_id = -1;
   int cli_gpu_id = -1;
   int cli_batch_size = 1024;
   std::string cli_iface;
   std::string cli_device;
+
+  if (const char* raw = std::getenv("SAMURAI_DPU_STATE_PUBLISH")) {
+    const std::string value = raw;
+    dpu_state_publish = !(value == "0" || value == "off" || value == "false");
+  }
+  if (const char* raw = std::getenv("SAMURAI_GPU_JOB_ENDPOINT")) {
+    if (*raw) gpu_jobs_ep = raw;
+  }
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -323,10 +432,15 @@ int main(int argc, char** argv) {
       jobs_ep = argv[++i];
     } else if (arg == "--event-endpoint" && i + 1 < argc) {
       events_ep = argv[++i];
+    } else if (arg == "--gpu-job-endpoint" && i + 1 < argc) {
+      gpu_jobs_ep = argv[++i];
     } else if (arg == "--jobs-mode" && i + 1 < argc) {
       bind_jobs = std::string(argv[++i]) == "bind";
     } else if (arg == "--events-mode" && i + 1 < argc) {
       bind_events = std::string(argv[++i]) == "bind";
+    } else if (arg == "--dpu-state-publish" && i + 1 < argc) {
+      const std::string value = argv[++i];
+      dpu_state_publish = !(value == "0" || value == "off" || value == "false");
     } else if (arg == "--doca-interface" && i + 1 < argc) {
       cli_iface = argv[++i];
     } else if (arg == "--doca-device" && i + 1 < argc) {
@@ -348,10 +462,15 @@ int main(int argc, char** argv) {
 
   void* pull = zmq_socket(ctx, ZMQ_PULL);
   void* push = zmq_socket(ctx, ZMQ_PUSH);
-  if (!pull || !push) {
+  void* gpu_push = nullptr;
+  if (dpu_state_publish) {
+    gpu_push = zmq_socket(ctx, ZMQ_PUSH);
+  }
+  if (!pull || !push || (dpu_state_publish && !gpu_push)) {
     std::cerr << "zmq_socket failed\n";
     if (pull) zmq_close(pull);
     if (push) zmq_close(push);
+    if (gpu_push) zmq_close(gpu_push);
     zmq_ctx_term(ctx);
     return 1;
   }
@@ -360,6 +479,7 @@ int main(int argc, char** argv) {
     std::cerr << "jobs socket init failed: " << jobs_ep << "\n";
     zmq_close(pull);
     zmq_close(push);
+    if (gpu_push) zmq_close(gpu_push);
     zmq_ctx_term(ctx);
     return 1;
   }
@@ -367,6 +487,15 @@ int main(int argc, char** argv) {
     std::cerr << "events socket init failed: " << events_ep << "\n";
     zmq_close(pull);
     zmq_close(push);
+    if (gpu_push) zmq_close(gpu_push);
+    zmq_ctx_term(ctx);
+    return 1;
+  }
+  if (gpu_push && zmq_connect(gpu_push, gpu_jobs_ep.c_str()) != 0) {
+    std::cerr << "gpu jobs socket init failed: " << gpu_jobs_ep << "\n";
+    zmq_close(pull);
+    zmq_close(push);
+    zmq_close(gpu_push);
     zmq_ctx_term(ctx);
     return 1;
   }
@@ -374,6 +503,7 @@ int main(int argc, char** argv) {
   (void)setenv("SAMURAI_GPU_DOCA_ENABLE", "1", 0);
 
   DocaNativeBridge doca{};
+  samurai::dpu::FlowStateTable dpu_state{};
   bool running = true;
   while (running) {
     zmq_msg_t msg;
@@ -517,6 +647,22 @@ int main(int argc, char** argv) {
           continue;
         }
 
+        const samurai::dpu::FlowState initial_flow = dpu_state.Upsert(InitialFlowStateFromEnvelope(header, env));
+        if (dpu_state_publish) {
+          std::string publish_err;
+          const samurai::wire::FlowUpdateEventV1 ev =
+              dpu_state.BuildUpdateEvent(initial_flow.flow_id, samurai_pacing_monotonic_now_ns());
+          if (!PublishDpuFlowUpdate(gpu_push, ev, header.correlation_id, job_id, publish_err)) {
+            (void)SendFrame(push,
+                            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                            header.correlation_id,
+                            samurai::wire::WorkerKind::DOCA,
+                            job_id,
+                            JsonError(publish_err));
+            continue;
+          }
+        }
+
         samurai_pacing_config_t pace_cfg = PacingFromEnvelope(env);
         samurai_pacing_state_t pace_state{};
         samurai_pacing_init(&pace_state, &pace_cfg);
@@ -613,6 +759,27 @@ int main(int argc, char** argv) {
         }
 
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
+        samurai::dpu::FlowState final_flow = initial_flow;
+        final_flow.seq_num = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(initial_flow.seq_num) + packets_sent) & 0xFFFFFFFFull);
+        final_flow.last_tx_ts = end_ns;
+        final_flow.tcp_state = packets_errors == 0u ? samurai::dpu::kTcpStateEstablished : samurai::dpu::kTcpStatePoisoned;
+        final_flow.flags = packets_errors == 0u ? initial_flow.flags : static_cast<std::uint16_t>(initial_flow.flags | 0x04u);
+        const samurai::dpu::FlowState& committed_final_flow = dpu_state.Transition(final_flow);
+        if (dpu_state_publish) {
+          std::string publish_err;
+          const samurai::wire::FlowUpdateEventV1 ev = dpu_state.BuildUpdateEvent(committed_final_flow.flow_id, end_ns);
+          if (!PublishDpuFlowUpdate(gpu_push, ev, header.correlation_id, job_id, publish_err)) {
+            (void)SendFrame(push,
+                            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                            header.correlation_id,
+                            samurai::wire::WorkerKind::DOCA,
+                            job_id,
+                            JsonError(publish_err));
+            continue;
+          }
+        }
+
         const samurai::wire::MetricSnapshotV1 snap =
             BuildSnapshot(end_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
         (void)SendFrame(push,
@@ -658,6 +825,9 @@ int main(int argc, char** argv) {
 
   if (doca.handle) {
     dlclose(doca.handle);
+  }
+  if (gpu_push) {
+    zmq_close(gpu_push);
   }
   zmq_close(pull);
   zmq_close(push);
