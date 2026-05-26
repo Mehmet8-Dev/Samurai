@@ -28,6 +28,10 @@ namespace {
 using ddos_samurai::cpu_native::PacketConfig;
 using ddos_samurai::cpu_native::SpoofOptions;
 
+static_assert(
+    sizeof(DocaFlowUpdateEventV1) == sizeof(samurai::wire::FlowUpdateEventV1),
+    "DOCA contract writer event must match wire FlowUpdateEventV1");
+
 constexpr const char* kDefaultJobs = "ipc:///tmp/samurai_jobs_doca";
 constexpr const char* kDefaultEvents = "ipc:///tmp/samurai_events_doca";
 constexpr const char* kDefaultGpuJobs = "ipc:///tmp/samurai_jobs_gpu";
@@ -41,6 +45,9 @@ using fn_backend_send_vector_timed_t =
     int (*)(int, const uint8_t**, const uint16_t*, const int32_t*, const uint64_t*, int, int*, int*, char*, size_t);
 using fn_backend_get_gpu_txq_handle_t = int (*)(int, uint64_t*, char*, size_t);
 using fn_backend_get_txq_mkey_be_t = int (*)(int, uint32_t*, char*, size_t);
+using fn_contract_writer_open_t = int (*)(const DocaContractWriterConfigV1*, int*, char*, size_t);
+using fn_contract_writer_close_t = int (*)(int, char*, size_t);
+using fn_contract_writer_publish_flow_update_t = int (*)(int, const DocaFlowUpdateEventV1*, char*, size_t);
 
 struct DocaDispatch {
   int version{0};
@@ -52,6 +59,9 @@ struct DocaDispatch {
   int (*get_stats)(int, DocaGpuNetioStats*, char*, size_t){nullptr};
   int (*get_gpu_txq_handle)(int, uint64_t*, char*, size_t){nullptr};
   int (*get_txq_mkey_be)(int, uint32_t*, char*, size_t){nullptr};
+  int (*contract_writer_open)(const DocaContractWriterConfigV1*, int*, char*, size_t){nullptr};
+  int (*contract_writer_close)(int, char*, size_t){nullptr};
+  int (*contract_writer_publish_flow_update_v1)(int, const DocaFlowUpdateEventV1*, char*, size_t){nullptr};
 };
 
 struct DocaNativeBridge {
@@ -68,6 +78,18 @@ struct DocaTxqGuard {
       char err[160];
       err[0] = '\0';
       (void)bridge->api.destroy_txq(handle, err, sizeof(err));
+    }
+  }
+};
+
+struct DpuContractWriterGuard {
+  DocaNativeBridge* bridge{nullptr};
+  int handle{-1};
+  ~DpuContractWriterGuard() {
+    if (bridge && bridge->api.contract_writer_close && handle > 0) {
+      char err[160];
+      err[0] = '\0';
+      (void)bridge->api.contract_writer_close(handle, err, sizeof(err));
     }
   }
 };
@@ -177,6 +199,11 @@ bool LoadDocaNative(DocaNativeBridge& out, std::string& err) {
         api.get_stats = in->get_stats;
         api.get_gpu_txq_handle = in->get_gpu_txq_handle;
         api.get_txq_mkey_be = in->get_txq_mkey_be;
+        if (in->version >= 4) {
+          api.contract_writer_open = in->contract_writer_open;
+          api.contract_writer_close = in->contract_writer_close;
+          api.contract_writer_publish_flow_update_v1 = in->contract_writer_publish_flow_update_v1;
+        }
       }
     }
 
@@ -190,6 +217,12 @@ bool LoadDocaNative(DocaNativeBridge& out, std::string& err) {
           reinterpret_cast<fn_backend_get_gpu_txq_handle_t>(dlsym(h, "samurai_doca_backend_get_gpu_txq_handle"));
       auto get_txq_mkey_be =
           reinterpret_cast<fn_backend_get_txq_mkey_be_t>(dlsym(h, "samurai_doca_backend_get_txq_mkey_be"));
+      auto contract_writer_open =
+          reinterpret_cast<fn_contract_writer_open_t>(dlsym(h, "samurai_doca_backend_contract_writer_open"));
+      auto contract_writer_close =
+          reinterpret_cast<fn_contract_writer_close_t>(dlsym(h, "samurai_doca_backend_contract_writer_close"));
+      auto contract_writer_publish = reinterpret_cast<fn_contract_writer_publish_flow_update_t>(
+          dlsym(h, "samurai_doca_backend_contract_writer_publish_flow_update_v1"));
       if (create_txq && destroy_txq && send_vector && get_stats) {
         api.version = kDocaGpuNetioApiVersion;
         api.create_txq = create_txq;
@@ -199,6 +232,9 @@ bool LoadDocaNative(DocaNativeBridge& out, std::string& err) {
         api.get_stats = get_stats;
         api.get_gpu_txq_handle = get_gpu_txq_handle;
         api.get_txq_mkey_be = get_txq_mkey_be;
+        api.contract_writer_open = contract_writer_open;
+        api.contract_writer_close = contract_writer_close;
+        api.contract_writer_publish_flow_update_v1 = contract_writer_publish;
       }
     }
 
@@ -372,6 +408,100 @@ bool PublishDpuFlowUpdate(
   return true;
 }
 
+DocaFlowUpdateEventV1 ToDocaFlowUpdate(const samurai::wire::FlowUpdateEventV1& ev) {
+  DocaFlowUpdateEventV1 out{};
+  out.version = ev.version;
+  out.epoch = ev.epoch;
+  out.flow_id = ev.flow_id;
+  out.tcp_seq = ev.tcp_seq;
+  out.tcp_ack = ev.tcp_ack;
+  out.src_port = ev.src_port;
+  out.dst_port = ev.dst_port;
+  out.tcp_state = ev.tcp_state;
+  out.proto = ev.proto;
+  out.flags = ev.flags;
+  out.rtt_us = ev.rtt_us;
+  out.dpu_ts_ns = ev.dpu_ts_ns;
+  return out;
+}
+
+bool OpenDpuContractRdmaWriter(
+    DocaNativeBridge& doca,
+    DpuContractWriterGuard& writer,
+    const std::string& region_spec,
+    const std::string& device,
+    std::string& err) {
+  if (!doca.api.contract_writer_open || !doca.api.contract_writer_close ||
+      !doca.api.contract_writer_publish_flow_update_v1) {
+    err = "dpu_contract_rdma_writer_unavailable";
+    return false;
+  }
+  if (region_spec.empty()) {
+    err = "dpu_contract_rdma_spec_required";
+    return false;
+  }
+  DocaContractWriterConfigV1 cfg{};
+  std::memcpy(
+      cfg.region_spec,
+      region_spec.c_str(),
+      std::min(region_spec.size(), sizeof(cfg.region_spec) - 1u));
+  std::memcpy(
+      cfg.device_name,
+      device.c_str(),
+      std::min(device.size(), sizeof(cfg.device_name) - 1u));
+  cfg.shard_count = static_cast<std::uint32_t>(std::max(1, std::atoi(
+      std::getenv("SAMURAI_GPU_CONTRACT_SHARDS") ? std::getenv("SAMURAI_GPU_CONTRACT_SHARDS") : "1")));
+  cfg.ring_slots_per_shard = static_cast<std::uint32_t>(std::max(64, std::atoi(
+      std::getenv("SAMURAI_GPU_CONTRACT_RING_SLOTS") ? std::getenv("SAMURAI_GPU_CONTRACT_RING_SLOTS") : "1024")));
+  cfg.hot_flow_capacity = static_cast<std::uint32_t>(std::max(1, std::atoi(
+      std::getenv("SAMURAI_GPU_CONTRACT_HOT_FLOW_CAPACITY")
+          ? std::getenv("SAMURAI_GPU_CONTRACT_HOT_FLOW_CAPACITY")
+          : "4096")));
+  char native_err[160];
+  native_err[0] = '\0';
+  int handle = -1;
+  if (doca.api.contract_writer_open(&cfg, &handle, native_err, sizeof(native_err)) != 0 || handle <= 0) {
+    err = native_err[0] ? std::string(native_err) : "dpu_contract_rdma_writer_open_failed";
+    return false;
+  }
+  writer.bridge = &doca;
+  writer.handle = handle;
+  return true;
+}
+
+bool PublishDpuFlowUpdateRdma(
+    DpuContractWriterGuard& writer,
+    const samurai::wire::FlowUpdateEventV1& ev,
+    std::string& err) {
+  if (!writer.bridge || writer.handle <= 0 || !writer.bridge->api.contract_writer_publish_flow_update_v1) {
+    err = "dpu_contract_rdma_writer_unavailable";
+    return false;
+  }
+  const DocaFlowUpdateEventV1 native_ev = ToDocaFlowUpdate(ev);
+  char native_err[160];
+  native_err[0] = '\0';
+  if (writer.bridge->api.contract_writer_publish_flow_update_v1(
+          writer.handle,
+          &native_ev,
+          native_err,
+          sizeof(native_err)) != 0) {
+    err = native_err[0] ? std::string(native_err) : "dpu_contract_rdma_publish_failed";
+    return false;
+  }
+  return true;
+}
+
+bool PublishDpuFlowUpdateOptionalRdma(
+    bool enabled,
+    DpuContractWriterGuard& writer,
+    const samurai::wire::FlowUpdateEventV1& ev,
+    std::string& err) {
+  if (!enabled) {
+    return true;
+  }
+  return PublishDpuFlowUpdateRdma(writer, ev, err);
+}
+
 bool PublishDpuFlowStreamUpsert(
     void* gpu_push,
     const samurai::wire::FlowStreamUpsertV1& ev,
@@ -471,15 +601,24 @@ int main(int argc, char** argv) {
   bool bind_jobs = true;
   bool bind_events = false;
   bool dpu_state_publish = true;
+  bool dpu_contract_rdma = false;
   int cli_queue_id = -1;
   int cli_gpu_id = -1;
   int cli_batch_size = 1024;
   std::string cli_iface;
   std::string cli_device;
+  std::string cli_contract_rdma_spec;
 
   if (const char* raw = std::getenv("SAMURAI_DPU_STATE_PUBLISH")) {
     const std::string value = raw;
     dpu_state_publish = !(value == "0" || value == "off" || value == "false");
+  }
+  if (const char* raw = std::getenv("SAMURAI_DPU_CONTRACT_RDMA")) {
+    const std::string value = raw;
+    dpu_contract_rdma = value == "1" || value == "on" || value == "true";
+  }
+  if (const char* raw = std::getenv("SAMURAI_DPU_CONTRACT_RDMA_SPEC")) {
+    if (*raw) cli_contract_rdma_spec = raw;
   }
   if (const char* raw = std::getenv("SAMURAI_GPU_JOB_ENDPOINT")) {
     if (*raw) gpu_jobs_ep = raw;
@@ -500,6 +639,10 @@ int main(int argc, char** argv) {
     } else if (arg == "--dpu-state-publish" && i + 1 < argc) {
       const std::string value = argv[++i];
       dpu_state_publish = !(value == "0" || value == "off" || value == "false");
+    } else if (arg == "--dpu-contract-rdma") {
+      dpu_contract_rdma = true;
+    } else if (arg == "--dpu-contract-rdma-spec" && i + 1 < argc) {
+      cli_contract_rdma_spec = argv[++i];
     } else if (arg == "--doca-interface" && i + 1 < argc) {
       cli_iface = argv[++i];
     } else if (arg == "--doca-device" && i + 1 < argc) {
@@ -669,6 +812,20 @@ int main(int argc, char** argv) {
           continue;
         }
 
+        DpuContractWriterGuard contract_writer{};
+        if (dpu_contract_rdma) {
+          std::string writer_err;
+          if (!OpenDpuContractRdmaWriter(doca, contract_writer, cli_contract_rdma_spec, device, writer_err)) {
+            (void)SendFrame(push,
+                            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                            header.correlation_id,
+                            samurai::wire::WorkerKind::DOCA,
+                            job_id,
+                            JsonError(writer_err));
+            continue;
+          }
+        }
+
         const int queue_id = std::max(0, cli_queue_id >= 0 ? cli_queue_id : static_cast<int>(env.xdp_queue_id));
         const int gpu_id = (cli_gpu_id >= 0)
                                ? cli_gpu_id
@@ -707,11 +864,25 @@ int main(int argc, char** argv) {
         }
 
         const samurai::dpu::FlowState initial_flow = dpu_state.Upsert(InitialFlowStateFromEnvelope(header, env));
+        const std::uint64_t initial_publish_ns = samurai_pacing_monotonic_now_ns();
         if (dpu_state_publish) {
           std::string publish_err;
           const samurai::wire::FlowStreamUpsertV1 ev =
-              BuildFlowStreamUpsert(initial_flow, env, samurai_pacing_monotonic_now_ns());
+              BuildFlowStreamUpsert(initial_flow, env, initial_publish_ns);
           if (!PublishDpuFlowStreamUpsert(gpu_push, ev, header.correlation_id, job_id, publish_err)) {
+            (void)SendFrame(push,
+                            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                            header.correlation_id,
+                            samurai::wire::WorkerKind::DOCA,
+                            job_id,
+                            JsonError(publish_err));
+            continue;
+          }
+        }
+        {
+          std::string publish_err;
+          const samurai::wire::FlowUpdateEventV1 ev = dpu_state.BuildUpdateEvent(initial_flow.flow_id, initial_publish_ns);
+          if (!PublishDpuFlowUpdateOptionalRdma(dpu_contract_rdma, contract_writer, ev, publish_err)) {
             (void)SendFrame(push,
                             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
                             header.correlation_id,
@@ -829,6 +1000,20 @@ int main(int argc, char** argv) {
           std::string publish_err;
           const samurai::wire::FlowStreamUpsertV1 ev = BuildFlowStreamUpsert(committed_final_flow, env, end_ns);
           if (!PublishDpuFlowStreamUpsert(gpu_push, ev, header.correlation_id, job_id, publish_err)) {
+            (void)SendFrame(push,
+                            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                            header.correlation_id,
+                            samurai::wire::WorkerKind::DOCA,
+                            job_id,
+                            JsonError(publish_err));
+            continue;
+          }
+        }
+        {
+          std::string publish_err;
+          const samurai::wire::FlowUpdateEventV1 ev =
+              dpu_state.BuildUpdateEvent(committed_final_flow.flow_id, end_ns);
+          if (!PublishDpuFlowUpdateOptionalRdma(dpu_contract_rdma, contract_writer, ev, publish_err)) {
             (void)SendFrame(push,
                             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
                             header.correlation_id,
