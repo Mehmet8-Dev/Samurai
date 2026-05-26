@@ -157,6 +157,10 @@ def test_m3_gpu_worker_has_native_cuda_bridge_and_failfast_fallback() -> None:
     assert "samurai_gpu_packet_generate_packets" in src
     assert "samurai_gpu_packet_generate_icmp_packets" in src
     assert "samurai_gpu_packet_contract_publish_flow_update_v1" in src
+    assert "samurai_gpu_packet_contract_export_region_v1" in src
+    assert "TryReadContractExportRegionSpec" in src
+    assert "contract_export_region_spec" in src
+    assert "SAMURAI_GPU_CONTRACT_EXPORT_ON_JOB_DONE" in src
     assert "samurai_gpu_packet_set_kernel_mode" in src
     assert "samurai_gpu_packet_start_stream" in src
     assert "samurai_gpu_packet_update_stream" in src
@@ -445,6 +449,9 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "DpuContractWriterGuard" in src
     assert "OpenDpuContractRdmaWriter" in src
     assert "PublishDpuFlowUpdateOptionalRdma" in src
+    assert "DefaultGpuContractExportSpec" in src
+    assert "SAMURAI_GPU_CONTRACT_EXPORT_SPEC" in src
+    assert "SAMURAI_GPU_CONTRACT_EXPORT_PATH" in src
     assert "--dpu-contract-rdma" in src
     assert "SAMURAI_DPU_CONTRACT_RDMA" in src
     assert "SAMURAI_DPU_CONTRACT_RDMA_SPEC" in src
@@ -497,11 +504,17 @@ def test_m3_cuda_contract_runtime_has_device_visible_mirror() -> None:
     assert "persistent_contract_runtime_sync_device_slot_unlocked" in src
     assert "persistent_contract_runtime_refresh_device_tail_unlocked" in src
     assert "persistent_contract_runtime_sync_device_tail_unlocked" in src
-    assert "cudaMalloc(&cr.update_ring_dev" in src
-    assert "cudaMemcpy(cr.ring_head_dev + shard" in src
+    assert "persistent_contract_default_export_path" in src
+    assert "SAMURAI_GPU_CONTRACT_EXPORT_PATH" in src
+    assert "cudaHostRegister(mapped, layout.total_bytes, cudaHostRegisterMapped)" in src
+    assert "cudaHostGetDevicePointer(&dev_base, mapped, 0)" in src
+    assert "cr.export_region_spec = std::string(\"file=\") + path" in src
+    assert "samurai_gpu_packet_contract_export_region_v1" in src
     assert "failed to sync contract update into device mirror" in src
     assert "contract_device_mirror_active" in src
     assert "contract_device_sync_error_events" in src
+    assert "contract_export_region_spec" in src
+    assert "contract_export_region_bytes" in src
 
 
 def test_m3_cuda_persistent_kernel_drains_contract_ring() -> None:

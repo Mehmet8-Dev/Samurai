@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include <zmq.h>
@@ -101,6 +102,18 @@ std::string ReadFixed(const char* raw, std::size_t n) {
 std::optional<int> OptionalIntFromWire(std::uint64_t raw) {
   if (raw == 0ull) return std::nullopt;
   return static_cast<int>(raw);
+}
+
+std::string DefaultGpuContractExportSpec() {
+  if (const char* raw = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_SPEC")) {
+    if (*raw) return std::string(raw);
+  }
+  if (const char* raw = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_PATH")) {
+    if (*raw) return std::string("file=") + raw;
+  }
+  const char* dir = (::access("/dev/shm", W_OK) == 0) ? "/dev/shm" : "/tmp";
+  return std::string("file=") + dir + "/samurai_gpu_contract_" +
+      std::to_string(static_cast<long long>(::getuid())) + ".bin";
 }
 
 PacketConfig ConfigFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
@@ -436,15 +449,16 @@ bool OpenDpuContractRdmaWriter(
     err = "dpu_contract_rdma_writer_unavailable";
     return false;
   }
-  if (region_spec.empty()) {
+  const std::string effective_region_spec = region_spec.empty() ? DefaultGpuContractExportSpec() : region_spec;
+  if (effective_region_spec.empty()) {
     err = "dpu_contract_rdma_spec_required";
     return false;
   }
   DocaContractWriterConfigV1 cfg{};
   std::memcpy(
       cfg.region_spec,
-      region_spec.c_str(),
-      std::min(region_spec.size(), sizeof(cfg.region_spec) - 1u));
+      effective_region_spec.c_str(),
+      std::min(effective_region_spec.size(), sizeof(cfg.region_spec) - 1u));
   std::memcpy(
       cfg.device_name,
       device.c_str(),

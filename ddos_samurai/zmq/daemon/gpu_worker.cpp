@@ -30,6 +30,7 @@ constexpr std::uint64_t kDefaultGatewayMac = 0xFFFFFFFFFFFFull;
 using fn_generate_packets_t = int (*)(std::int64_t, const char*, std::int64_t, const char*, int, const char*, std::int64_t, int, std::int64_t, std::uint64_t, std::uint64_t, const char*, std::uint8_t**, std::size_t*, int*);
 using fn_generate_icmp_packets_t = int (*)(std::int64_t, const char*, const char*, int, int, std::int64_t, std::int64_t, std::int64_t, std::uint64_t, std::uint64_t, const char*, std::uint8_t**, std::size_t*, int*);
 using fn_contract_publish_flow_update_t = int (*)(const samurai::wire::FlowUpdateEventV1*);
+using fn_contract_export_region_t = int (*)(char*, std::size_t);
 using fn_set_kernel_mode_t = int (*)(int);
 using fn_start_stream_t = int (*)(const char*, std::int64_t*);
 using fn_update_stream_t = int (*)(std::int64_t, const char*);
@@ -42,6 +43,7 @@ struct GpuNativeApi {
   fn_generate_packets_t generate_packets{nullptr};
   fn_generate_icmp_packets_t generate_icmp_packets{nullptr};
   fn_contract_publish_flow_update_t contract_publish_flow_update{nullptr};
+  fn_contract_export_region_t contract_export_region{nullptr};
   fn_set_kernel_mode_t set_kernel_mode{nullptr};
   fn_start_stream_t start_stream{nullptr};
   fn_update_stream_t update_stream{nullptr};
@@ -113,6 +115,8 @@ bool LoadGpuNative(GpuNativeApi& api, std::string& err) {
   api.generate_icmp_packets = reinterpret_cast<fn_generate_icmp_packets_t>(dlsym(api.handle, "samurai_gpu_packet_generate_icmp_packets"));
   api.contract_publish_flow_update = reinterpret_cast<fn_contract_publish_flow_update_t>(
       dlsym(api.handle, "samurai_gpu_packet_contract_publish_flow_update_v1"));
+  api.contract_export_region = reinterpret_cast<fn_contract_export_region_t>(
+      dlsym(api.handle, "samurai_gpu_packet_contract_export_region_v1"));
   api.set_kernel_mode = reinterpret_cast<fn_set_kernel_mode_t>(dlsym(api.handle, "samurai_gpu_packet_set_kernel_mode"));
   api.start_stream = reinterpret_cast<fn_start_stream_t>(dlsym(api.handle, "samurai_gpu_packet_start_stream"));
   api.update_stream = reinterpret_cast<fn_update_stream_t>(dlsym(api.handle, "samurai_gpu_packet_update_stream"));
@@ -194,6 +198,29 @@ std::string JsonEscape(const std::string& raw) {
     }
   }
   return out;
+}
+
+std::string TryReadContractExportRegionSpec(const GpuNativeApi& api) {
+  const char* export_on_done = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_ON_JOB_DONE");
+  if (!export_on_done || !*export_on_done) {
+    return "";
+  }
+  std::string flag(export_on_done);
+  std::transform(flag.begin(), flag.end(), flag.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (flag == "0" || flag == "off" || flag == "false" || flag == "no") {
+    return "";
+  }
+  if (!api.contract_export_region) {
+    return "";
+  }
+  char spec[512];
+  spec[0] = '\0';
+  if (api.contract_export_region(spec, sizeof(spec)) != 0) {
+    return "";
+  }
+  return ReadFixed(spec, sizeof(spec));
 }
 
 const char* ProtocolNameFromEvent(std::uint8_t proto) {
@@ -468,7 +495,8 @@ std::vector<std::uint8_t> JsonDone(
     std::uint64_t bytes_sent,
     double actual_rps,
     double rate_accuracy_pct,
-    const std::string& note) {
+    const std::string& note,
+    const std::string& contract_export_region_spec) {
   const std::string json =
       "{\"status\":\"ok\",\"worker_kind\":\"gpu\",\"correlation_id\":" +
       std::to_string(correlation_id) +
@@ -478,7 +506,9 @@ std::vector<std::uint8_t> JsonDone(
       ",\"bytes_sent\":" + std::to_string(bytes_sent) +
       ",\"actual_rps\":" + std::to_string(actual_rps) +
       ",\"rate_accuracy_pct\":" + std::to_string(rate_accuracy_pct) +
-      ",\"note\":\"" + note + "\"}";
+      ",\"contract_export_region_available\":" + (contract_export_region_spec.empty() ? "0" : "1") +
+      ",\"contract_export_region_spec\":\"" + JsonEscape(contract_export_region_spec) +
+      "\",\"note\":\"" + note + "\"}";
   return std::vector<std::uint8_t>(json.begin(), json.end());
 }
 
@@ -971,7 +1001,8 @@ int main(int argc, char** argv) {
             bytes_sent,
             snap.actual_rps,
             snap.rate_accuracy_pct,
-            "gpu_native_capi+pacing_static");
+            "gpu_native_capi+pacing_static",
+            TryReadContractExportRegionSpec(api));
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
