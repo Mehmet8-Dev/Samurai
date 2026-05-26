@@ -156,7 +156,21 @@ def test_m3_gpu_worker_has_native_cuda_bridge_and_failfast_fallback() -> None:
     assert "samurai_gpu_packet_generate_packets" in src
     assert "samurai_gpu_packet_generate_icmp_packets" in src
     assert "samurai_gpu_packet_contract_publish_flow_update_v1" in src
+    assert "samurai_gpu_packet_set_kernel_mode" in src
+    assert "samurai_gpu_packet_start_stream" in src
+    assert "samurai_gpu_packet_update_stream" in src
+    assert "samurai_gpu_packet_stop_stream" in src
     assert "MessageType::FLOW_UPDATE" in src
+    assert "FlowEventStreamJson" in src
+    assert "UpsertFlowStreamFromEvent" in src
+    assert "flow_streams" in src
+    assert "SAMURAI_GPU_FLOW_UPDATE_STREAM_LIFECYCLE" in src
+    assert "SAMURAI_GPU_FLOW_UPDATE_TARGET_IP" in src
+    assert "SAMURAI_GPU_FLOW_UPDATE_STREAM_QUOTA" in src
+    assert "gpu_native_stream_lifecycle_symbol_missing" in src
+    assert "gpu_flow_update_start_stream_failed" in src
+    assert "gpu_flow_update_update_stream_failed" in src
+    assert "gpu_flow_update_stop_stream_failed" in src
     assert "samurai_gpu_packet_free" in src
     assert "MessageType::HEARTBEAT" in src
     assert "MessageType::METRIC_SNAPSHOT" in src
@@ -357,9 +371,19 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
     src = (root / "ddos_samurai" / "zmq" / "daemon" / "doca_gpunetio_worker.cpp").read_text(encoding="utf-8")
     assert "LoadDocaNative" in src
+    assert '#include "dpu_state_runtime.hpp"' in src
     assert "samurai_doca_gpunetio_get_api_v1" in src
     assert "samurai_doca_backend_create_txq" in src
     assert "samurai_doca_backend_send_vector" in src
+    assert "kDefaultGpuJobs" in src
+    assert "--gpu-job-endpoint" in src
+    assert "--dpu-state-publish" in src
+    assert "SAMURAI_DPU_STATE_PUBLISH" in src
+    assert "InitialFlowStateFromEnvelope" in src
+    assert "PublishDpuFlowUpdate" in src
+    assert "MessageType::FLOW_UPDATE" in src
+    assert "ZMQ_DONTWAIT" in src
+    assert "dpu_gpu_flow_update_publish_failed" in src
     assert "MessageType::HEARTBEAT" in src
     assert "MessageType::METRIC_SNAPSHOT" in src
     assert "doca_native_lib_unavailable" in src
