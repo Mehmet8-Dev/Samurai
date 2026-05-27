@@ -450,8 +450,12 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "OpenDpuContractRdmaWriter" in src
     assert "PublishDpuFlowUpdateOptionalRdma" in src
     assert "DefaultGpuContractExportSpec" in src
+    assert "GpuContractExportSpecWithLayout" in src
+    assert "EnvContractU32" in src
     assert "SAMURAI_GPU_CONTRACT_EXPORT_SPEC" in src
     assert "SAMURAI_GPU_CONTRACT_EXPORT_PATH" in src
+    assert "layout=1,shards=" in src
+    assert "event=\" + std::to_string(sizeof(DocaFlowUpdateEventV1))" in src
     assert "--dpu-contract-rdma" in src
     assert "SAMURAI_DPU_CONTRACT_RDMA" in src
     assert "SAMURAI_DPU_CONTRACT_RDMA_SPEC" in src
@@ -464,6 +468,12 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "samurai_doca_backend_contract_writer_close" in backend
     assert "samurai_doca_backend_contract_writer_publish_flow_update_v1" in backend
     assert "BackendContractFlowUpdateSlot" in backend
+    assert "ContractRegionSpec" in backend
+    assert "contract region layout version mismatch" in backend
+    assert "contract region shard count mismatch" in backend
+    assert "contract region ring slot count mismatch" in backend
+    assert "contract region hot-flow capacity mismatch" in backend
+    assert "contract region event size mismatch" in backend
     assert "contract_store_event_slot" in backend
     assert "__atomic_store_n(&heads[shard], head + 1u, __ATOMIC_RELEASE)" in backend
     assert "contract writer ring overflow" in backend
@@ -508,7 +518,9 @@ def test_m3_cuda_contract_runtime_has_device_visible_mirror() -> None:
     assert "SAMURAI_GPU_CONTRACT_EXPORT_PATH" in src
     assert "cudaHostRegister(mapped, layout.total_bytes, cudaHostRegisterMapped)" in src
     assert "cudaHostGetDevicePointer(&dev_base, mapped, 0)" in src
-    assert "cr.export_region_spec = std::string(\"file=\") + path" in src
+    assert "persistent_contract_export_region_spec" in src
+    assert "<< \",shards=\" << shard_count" in src
+    assert "<< \",event=\" << sizeof" in src
     assert "samurai_gpu_packet_contract_export_region_v1" in src
     assert "failed to sync contract update into device mirror" in src
     assert "contract_device_mirror_active" in src
