@@ -47,6 +47,10 @@ inline constexpr std::uint64_t kTcpTimeWaitNs = 120'000'000'000ull;
 inline constexpr std::size_t kTcpMaxRetransmitEntries = 256u;
 inline constexpr std::size_t kTcpMaxOutOfOrderSegments = 64u;
 inline constexpr std::size_t kTcpMaxSackBlocks = 4u;
+inline constexpr std::uint32_t kGpuStreamPolicyTemplateValid = 0x80000000u;
+inline constexpr std::uint32_t kGpuStreamPolicyRetransmit = 0x40000000u;
+inline constexpr std::uint32_t kGpuStreamPolicyZeroWindowProbe = 0x20000000u;
+inline constexpr std::uint32_t kGpuStreamPolicyPause = 0x10000000u;
 
 struct FlowState {
   std::uint32_t flow_id{0};
@@ -215,6 +219,8 @@ struct TcpControlBlock {
   std::uint32_t dup_ack_count{0};
   bool fast_recovery{false};
   bool zero_window{false};
+  bool retransmit_pending{false};
+  bool zero_window_probe_pending{false};
   std::uint64_t srtt_us{0};
   std::uint64_t rttvar_us{0};
   std::uint64_t rto_ns{kTcpInitialRtoNs};
@@ -223,6 +229,16 @@ struct TcpControlBlock {
   std::uint64_t time_wait_deadline_ns{0};
   std::deque<TcpRetransmitEntry> retransmit_queue{};
   std::vector<TcpOutOfOrderSegment> out_of_order{};
+};
+
+struct GpuStreamPolicy {
+  std::uint32_t quota{1};
+  std::uint16_t payload_len{0};
+  std::uint64_t tx_ipg_ns{0};
+  std::uint32_t template_id{kGpuStreamPolicyTemplateValid};
+  bool pause{false};
+  bool retransmit{false};
+  bool zero_window_probe{false};
 };
 
 inline bool ParseTcpSegmentObservation(
@@ -655,6 +671,7 @@ class FlowStateTable {
       tcb.rto_ns = std::min<std::uint64_t>(kTcpMaxRtoNs, std::max<std::uint64_t>(kTcpMinRtoNs, tcb.rto_ns * 2u));
       tcb.next_rto_deadline_ns = now_ns + tcb.rto_ns;
       MarkOldestRetransmit(tcb, now_ns);
+      tcb.retransmit_pending = true;
       next.seq_num = tcb.snd_una;
       next.flags = kTcpFlagAck | ((next.tcp_state == kTcpStateEstablished) ? kTcpFlagPsh : 0u);
       changed = true;
@@ -662,6 +679,7 @@ class FlowStateTable {
     if (tcb.zero_window && tcb.zero_window_probe_deadline_ns != 0u && now_ns >= tcb.zero_window_probe_deadline_ns) {
       next.seq_num = tcb.snd_una;
       next.flags = kTcpFlagAck;
+      tcb.zero_window_probe_pending = true;
       tcb.zero_window_probe_deadline_ns = now_ns + std::min<std::uint64_t>(kTcpMaxRtoNs, tcb.rto_ns);
       changed = true;
     }
@@ -702,6 +720,63 @@ class FlowStateTable {
       return std::min<std::uint32_t>(desired_payload_len, kTcpDefaultMss);
     }
     return std::min<std::uint32_t>(desired_payload_len, it->second.mss);
+  }
+
+  GpuStreamPolicy BuildGpuStreamPolicy(
+      std::uint32_t flow_id,
+      std::uint32_t requested_quota,
+      std::uint32_t requested_payload_len,
+      std::uint64_t requested_tx_ipg_ns) const {
+    GpuStreamPolicy policy{};
+    policy.tx_ipg_ns = requested_tx_ipg_ns;
+    const FlowState* st = Find(flow_id);
+    const TcpControlBlock* tcb = FindTcb(flow_id);
+    if (!st || !tcb || st->proto != kProtoTcp || st->tcp_state == kTcpStatePoisoned ||
+        st->tcp_state == kTcpStateMigrating || st->tcp_state == kTcpStateClosed ||
+        st->tcp_state == kTcpStateTimeWait) {
+      policy.quota = 0u;
+      policy.payload_len = 0u;
+      policy.pause = true;
+      policy.template_id |= kGpuStreamPolicyPause;
+      return policy;
+    }
+
+    std::uint32_t payload_len = std::min<std::uint32_t>(requested_payload_len, tcb->mss);
+    if (tcb->zero_window) {
+      policy.quota = 0u;
+      policy.payload_len = 0u;
+      policy.pause = true;
+      policy.template_id |= kGpuStreamPolicyPause;
+      if (tcb->zero_window_probe_pending) {
+        policy.quota = 1u;
+        policy.payload_len = static_cast<std::uint16_t>(requested_payload_len > 0u ? 1u : 0u);
+        policy.pause = false;
+        policy.zero_window_probe = true;
+        policy.template_id &= ~kGpuStreamPolicyPause;
+        policy.template_id |= kGpuStreamPolicyZeroWindowProbe;
+      }
+      return policy;
+    }
+
+    const bool retransmit = tcb->retransmit_pending;
+    const std::uint32_t window_bytes = std::min<std::uint32_t>(tcb->cwnd_bytes, tcb->snd_wnd);
+    if (window_bytes == 0u) {
+      policy.quota = 0u;
+      policy.payload_len = 0u;
+      policy.pause = true;
+      policy.template_id |= kGpuStreamPolicyPause;
+      return policy;
+    }
+    const std::uint32_t effective_payload = payload_len > 0u ? payload_len : tcb->mss;
+    const std::uint32_t window_quota = std::max<std::uint32_t>(1u, window_bytes / effective_payload);
+    policy.quota = std::max<std::uint32_t>(1u, std::min<std::uint32_t>(requested_quota, window_quota));
+    policy.payload_len = static_cast<std::uint16_t>(std::min<std::uint32_t>(payload_len, 0xFFFFu));
+    if (retransmit) {
+      policy.retransmit = true;
+      policy.quota = 1u;
+      policy.template_id |= kGpuStreamPolicyRetransmit;
+    }
+    return policy;
   }
 
   const FlowState* Find(std::uint32_t flow_id) const {
@@ -963,6 +1038,8 @@ class FlowStateTable {
       tcb.snd_una = seg.ack;
       tcb.last_ack = seg.ack;
       tcb.dup_ack_count = 0u;
+      tcb.retransmit_pending = false;
+      tcb.zero_window_probe_pending = false;
       (void)AckRetransmitQueue(tcb, seg.ack, now_ns);
       CongestionOnNewAck(tcb);
       tcb.next_rto_deadline_ns = HasUnackedData(tcb) ? now_ns + tcb.rto_ns : 0u;

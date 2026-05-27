@@ -24,6 +24,7 @@ namespace {
 
 constexpr const char* kDefaultJobs = "ipc:///tmp/samurai_jobs_gpu";
 constexpr const char* kDefaultEvents = "ipc:///tmp/samurai_events_gpu";
+constexpr std::uint32_t kGpuStreamPolicyTemplateValid = 0x80000000u;
 constexpr const char* kDefaultGpuLib = "ddos_samurai/libgpu_packet_cuda.so";
 constexpr std::uint64_t kDefaultGatewayMac = 0xFFFFFFFFFFFFull;
 
@@ -271,6 +272,9 @@ std::string FlowEventStreamJson(const samurai::wire::FlowUpdateEventV1& event, c
       << "\"source_port\":" << static_cast<unsigned int>(event.src_port) << ","
       << "\"source_port_mode\":" << (event.src_port != 0u ? 1 : 0) << ","
       << "\"tcp_flags\":" << static_cast<unsigned int>(event.flags & 0xFFu) << ","
+      << "\"tcp_seq\":" << event.tcp_seq << ","
+      << "\"tcp_ack\":" << event.tcp_ack << ","
+      << "\"tcp_state\":" << static_cast<unsigned int>(event.tcp_state) << ","
       << "\"quota\":" << cfg.quota << ","
       << "\"weight\":" << cfg.weight << ","
       << "\"tx_ipg_ns\":" << cfg.tx_ipg_ns << ","
@@ -305,7 +309,9 @@ std::string FlowStreamUpsertJson(const samurai::wire::FlowStreamUpsertV1& upsert
   std::ostringstream oss;
   const bool is_icmp = upsert.proto == 1u;
   const std::string target_ip = ReadStreamTargetIp(upsert);
-  const std::uint32_t quota = upsert.quota > 0u ? upsert.quota : static_cast<std::uint32_t>(cfg.quota);
+  const bool policy_valid = (upsert.template_id & kGpuStreamPolicyTemplateValid) != 0u;
+  const std::uint32_t quota =
+      (policy_valid || upsert.quota > 0u) ? upsert.quota : static_cast<std::uint32_t>(cfg.quota);
   const std::uint64_t tx_ipg_ns = upsert.tx_ipg_ns;
   const std::uint16_t payload_len = upsert.payload_len;
   const std::uint8_t weight = upsert.weight > 0u ? upsert.weight : static_cast<std::uint8_t>(cfg.weight);
@@ -321,6 +327,9 @@ std::string FlowStreamUpsertJson(const samurai::wire::FlowStreamUpsertV1& upsert
       << "\"source_port\":" << static_cast<unsigned int>(upsert.src_port) << ","
       << "\"source_port_mode\":" << (upsert.src_port != 0u ? 1 : 0) << ","
       << "\"tcp_flags\":" << static_cast<unsigned int>(upsert.flags & 0xFFu) << ","
+      << "\"tcp_seq\":" << upsert.tcp_seq << ","
+      << "\"tcp_ack\":" << upsert.tcp_ack << ","
+      << "\"tcp_state\":" << static_cast<unsigned int>(upsert.tcp_state) << ","
       << "\"quota\":" << quota << ","
       << "\"weight\":" << static_cast<unsigned int>(weight) << ","
       << "\"tx_ipg_ns\":" << tx_ipg_ns << ","

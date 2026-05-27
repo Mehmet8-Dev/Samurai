@@ -589,6 +589,31 @@ samurai::wire::FlowStreamUpsertV1 BuildFlowStreamUpsert(
   return ev;
 }
 
+void ApplyDpuStreamPolicyToUpsert(
+    const samurai::dpu::FlowStateTable& dpu_state,
+    const samurai::dpu::FlowState& st,
+    const samurai::wire::JobEnvelopeV1& env,
+    samurai::wire::FlowStreamUpsertV1& ev) {
+  const samurai::dpu::GpuStreamPolicy policy = dpu_state.BuildGpuStreamPolicy(
+      st.flow_id,
+      ev.quota,
+      ev.payload_len,
+      ev.tx_ipg_ns);
+  ev.quota = policy.quota;
+  ev.payload_len = policy.payload_len;
+  ev.tx_ipg_ns = policy.tx_ipg_ns;
+  ev.template_id = policy.template_id;
+  if (policy.pause) {
+    ev.payload_len = 0u;
+  }
+  if (policy.retransmit || policy.zero_window_probe) {
+    ev.tcp_seq = st.seq_num;
+    ev.tcp_ack = st.ack_num;
+    ev.flags = st.flags;
+  }
+  (void)env;
+}
+
 bool PublishDpuFlowUpdate(
     void* gpu_push,
     const samurai::wire::FlowUpdateEventV1& ev,
@@ -814,19 +839,16 @@ bool PollDpuTcpRxFeedback(
       }
       const samurai::dpu::FlowState& st = *observed;
       const samurai::dpu::FlowState* publish_state = &st;
-      bool stream_lifecycle_changed = false;
       if (established_tx_flags != 0u && st.tcp_state == samurai::dpu::kTcpStateEstablished &&
           st.flags != established_tx_flags) {
         samurai::dpu::FlowState next = st;
         next.flags = established_tx_flags;
         publish_state = &dpu_state.Transition(next);
-        stream_lifecycle_changed = true;
       }
       const samurai::wire::FlowUpdateEventV1 ev = dpu_state.BuildUpdateEvent(publish_state->flow_id, now_ns);
-      if (stream_lifecycle_changed && dpu_state_publish) {
+      if (dpu_state_publish) {
         samurai::wire::FlowStreamUpsertV1 upsert = BuildFlowStreamUpsert(*publish_state, env, now_ns);
-        upsert.payload_len = static_cast<std::uint16_t>(
-            dpu_state.ClampPayloadToMss(publish_state->flow_id, upsert.payload_len));
+        ApplyDpuStreamPolicyToUpsert(dpu_state, *publish_state, env, upsert);
         if (!PublishDpuFlowStreamUpsert(gpu_push, upsert, correlation_id, job_id, err)) {
           return false;
         }
@@ -1235,7 +1257,7 @@ int main(int argc, char** argv) {
         if (dpu_state_publish) {
           std::string publish_err;
           samurai::wire::FlowStreamUpsertV1 ev = BuildFlowStreamUpsert(initial_flow, env, initial_publish_ns);
-          ev.payload_len = static_cast<std::uint16_t>(dpu_state.ClampPayloadToMss(initial_flow.flow_id, ev.payload_len));
+          ApplyDpuStreamPolicyToUpsert(dpu_state, initial_flow, env, ev);
           if (!PublishDpuFlowStreamUpsert(gpu_push, ev, header.correlation_id, job_id, publish_err)) {
             (void)SendFrame(push,
                             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
@@ -1350,6 +1372,21 @@ int main(int argc, char** argv) {
               std::string timer_publish_err;
               const samurai::wire::FlowUpdateEventV1 timer_ev =
                   dpu_state.BuildUpdateEvent(timer_state.flow_id, now_ns);
+              if (dpu_state_publish) {
+                samurai::wire::FlowStreamUpsertV1 timer_upsert = BuildFlowStreamUpsert(timer_state, env, now_ns);
+                ApplyDpuStreamPolicyToUpsert(dpu_state, timer_state, env, timer_upsert);
+                if (!PublishDpuFlowStreamUpsert(
+                        gpu_push, timer_upsert, header.correlation_id, job_id, timer_publish_err)) {
+                  (void)SendFrame(push,
+                                  static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                                  header.correlation_id,
+                                  samurai::wire::WorkerKind::DOCA,
+                                  job_id,
+                                  JsonError(timer_publish_err));
+                  packets_errors += static_cast<std::uint64_t>(n_this);
+                  break;
+                }
+              }
               if (dpu_state_publish &&
                   !PublishDpuFlowUpdate(gpu_push, timer_ev, header.correlation_id, job_id, timer_publish_err)) {
                 (void)SendFrame(push,
@@ -1467,8 +1504,7 @@ int main(int argc, char** argv) {
         if (dpu_state_publish) {
           std::string publish_err;
           samurai::wire::FlowStreamUpsertV1 ev = BuildFlowStreamUpsert(committed_final_flow, env, end_ns);
-          ev.payload_len = static_cast<std::uint16_t>(
-              dpu_state.ClampPayloadToMss(committed_final_flow.flow_id, ev.payload_len));
+          ApplyDpuStreamPolicyToUpsert(dpu_state, committed_final_flow, env, ev);
           if (!PublishDpuFlowStreamUpsert(gpu_push, ev, header.correlation_id, job_id, publish_err)) {
             (void)SendFrame(push,
                             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
