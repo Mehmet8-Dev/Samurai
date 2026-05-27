@@ -504,16 +504,36 @@ int main() {{
   syn.flags = samurai::dpu::kTcpFlagSyn;
   syn.window = 4096;
   table.AcceptPassiveOpen(200, 201, syn, 9000, 7000000);
+  samurai::dpu::TcpSegmentObservation child_ack{{}};
+  child_ack.src_ip = 0x0a000011u;
+  child_ack.dst_ip = 0x0a000010u;
+  child_ack.src_port = 51000;
+  child_ack.dst_port = 443;
+  child_ack.seq = 8;
+  child_ack.ack = 9001;
+  child_ack.flags = samurai::dpu::kTcpFlagAck;
+  child_ack.window = 4096;
+  table.ObserveTcpSegment(201, child_ack, 7500000);
+  const samurai::dpu::TcpListenSocket* listener = table.FindListenSocket(200);
+  if (!listener || listener->pending_children != 0u || listener->accepted_count != 1u ||
+      listener->accept_queue.empty()) return 6;
+  std::uint32_t accepted = 0;
+  if (!table.PopAcceptedFlow(200, &accepted) || accepted != 201u) return 7;
+
+  table.Listen(205, 0x0a000015u, 443, 1, 1, false);
   bool overflowed = false;
+  syn.dst_ip = 0x0a000015u;
   syn.src_port = 51001;
+  table.AcceptPassiveOpen(205, 206, syn, 9100, 8000000);
+  syn.src_port = 51002;
   try {{
-    table.AcceptPassiveOpen(200, 202, syn, 9100, 8000000);
+    table.AcceptPassiveOpen(205, 207, syn, 9200, 8100000);
   }} catch (const std::overflow_error&) {{
     overflowed = true;
   }}
-  if (!overflowed) return 6;
-  const samurai::dpu::TcpListenSocket* listener = table.FindListenSocket(200);
-  if (!listener || listener->backlog_drop_count != 1u) return 7;
+  if (!overflowed) return 8;
+  listener = table.FindListenSocket(205);
+  if (!listener || listener->backlog_drop_count != 1u) return 9;
 
   table.Listen(210, 0x0a000020u, 443, 1, 1, true);
   syn.dst_ip = 0x0a000020u;
@@ -522,7 +542,41 @@ int main() {{
   syn.src_port = 52001;
   table.AcceptPassiveOpen(210, 212, syn, 9300, 10000000);
   listener = table.FindListenSocket(210);
-  if (!listener || listener->syn_cookie_issued_count != 1u) return 8;
+  if (!listener || listener->syn_cookie_issued_count != 1u) return 10;
+
+  samurai::dpu::FlowState recv{{}};
+  recv.flow_id = 300;
+  recv.src_ip = 0x0a000030u;
+  recv.dst_ip = 0x0a000031u;
+  recv.src_port = 443;
+  recv.dst_port = 53000;
+  recv.seq_num = 1;
+  recv.ack_num = 1000;
+  recv.tcp_state = samurai::dpu::kTcpStateEstablished;
+  recv.flags = samurai::dpu::kTcpFlagAck;
+  recv.proto = samurai::dpu::kProtoTcp;
+  table.Upsert(recv);
+  samurai::dpu::TcpSegmentObservation ooo{{}};
+  ooo.src_ip = 0x0a000031u;
+  ooo.dst_ip = 0x0a000030u;
+  ooo.src_port = 53000;
+  ooo.dst_port = 443;
+  ooo.flags = samurai::dpu::kTcpFlagAck;
+  ooo.window = 4096;
+  ooo.seq = 1100;
+  ooo.ack = 1;
+  ooo.payload_len = 100;
+  table.ObserveTcpSegment(300, ooo, 11000000);
+  const samurai::dpu::TcpControlBlock* recv_tcb = table.FindTcb(300);
+  if (!recv_tcb || recv_tcb->receive_ready_bytes != 0u || recv_tcb->out_of_order.size() != 1u) return 11;
+  ooo.seq = 1000;
+  table.ObserveTcpSegment(300, ooo, 12000000);
+  recv_tcb = table.FindTcb(300);
+  if (!recv_tcb || recv_tcb->rcv_nxt != 1200u || recv_tcb->receive_ready_bytes != 200u ||
+      recv_tcb->receive_queue.size() != 2u || !recv_tcb->out_of_order.empty()) return 12;
+  if (table.ConsumeReceiveBytes(300, 150) != 150u) return 13;
+  recv_tcb = table.FindTcb(300);
+  if (!recv_tcb || recv_tcb->receive_ready_bytes != 50u || recv_tcb->receive_queue.empty()) return 14;
   return 0;
 }}
 """

@@ -47,6 +47,7 @@ inline constexpr std::uint64_t kTcpTimeWaitNs = 120'000'000'000ull;
 inline constexpr std::size_t kTcpMaxRetransmitEntries = 256u;
 inline constexpr std::size_t kTcpMaxOutOfOrderSegments = 64u;
 inline constexpr std::size_t kTcpMaxSackBlocks = 4u;
+inline constexpr std::size_t kTcpMaxReceiveQueueSegments = 256u;
 inline constexpr std::uint32_t kTcpDefaultListenBacklog = 4096u;
 inline constexpr std::uint32_t kGpuStreamPolicyTemplateValid = 0x80000000u;
 inline constexpr std::uint32_t kGpuStreamPolicyRetransmit = 0x40000000u;
@@ -200,6 +201,12 @@ struct TcpOutOfOrderSegment {
   std::uint32_t end_seq{0};
 };
 
+struct TcpReceiveSegment {
+  std::uint32_t seq{0};
+  std::uint32_t end_seq{0};
+  std::uint32_t len{0};
+};
+
 struct TcpControlBlock {
   std::uint32_t iss{0};
   std::uint32_t irs{0};
@@ -234,6 +241,8 @@ struct TcpControlBlock {
   std::uint64_t old_segment_count{0};
   std::uint64_t out_of_order_drop_count{0};
   std::uint64_t retransmit_queue_overflow_count{0};
+  std::uint64_t receive_queue_overflow_count{0};
+  std::uint64_t receive_ready_bytes{0};
   std::uint64_t srtt_us{0};
   std::uint64_t rttvar_us{0};
   std::uint64_t rto_ns{kTcpInitialRtoNs};
@@ -241,6 +250,7 @@ struct TcpControlBlock {
   std::uint64_t zero_window_probe_deadline_ns{0};
   std::uint64_t time_wait_deadline_ns{0};
   std::deque<TcpRetransmitEntry> retransmit_queue{};
+  std::deque<TcpReceiveSegment> receive_queue{};
   std::vector<TcpOutOfOrderSegment> out_of_order{};
 };
 
@@ -250,6 +260,9 @@ struct TcpListenSocket {
   bool syn_cookies_enabled{true};
   std::uint64_t backlog_drop_count{0};
   std::uint64_t syn_cookie_issued_count{0};
+  std::uint64_t accept_queue_overflow_count{0};
+  std::uint64_t accepted_count{0};
+  std::deque<std::uint32_t> accept_queue{};
 };
 
 struct GpuStreamPolicy {
@@ -417,7 +430,7 @@ class FlowStateTable {
     if (out->second.tcp_state == kTcpStateListen) {
       listen_sockets_.try_emplace(out->second.flow_id);
     } else if (out->second.tcp_state == kTcpStateClosed || out->second.tcp_state == kTcpStatePoisoned) {
-      ReleasePassiveChild(out->second.flow_id);
+      ReleasePassiveChild(out->second.flow_id, false);
     }
     return out->second;
   }
@@ -611,7 +624,7 @@ class FlowStateTable {
       next.poisoned = true;
       next.migrating = false;
       next.last_ack_ts = now_ns;
-      ReleasePassiveChild(next.flow_id);
+      ReleasePassiveChild(next.flow_id, false);
     } else {
       const std::uint32_t seg_end = SegmentEndSeq(seg);
       ApplyReceiveOrdering(tcb, seg, seg_end);
@@ -631,7 +644,7 @@ class FlowStateTable {
                  TcpSeqAfterEq(seg.ack, tcb.snd_nxt)) {
         next.tcp_state = kTcpStateEstablished;
         next.flags = kTcpFlagAck;
-        ReleasePassiveChild(next.flow_id);
+        ReleasePassiveChild(next.flow_id, true);
       } else if ((seg.flags & kTcpFlagFin) != 0u) {
         if (next.tcp_state == kTcpStateFinWait) {
           next.tcp_state = kTcpStateTimeWait;
@@ -644,7 +657,7 @@ class FlowStateTable {
                  TcpSeqAfterEq(seg.ack, tcb.snd_nxt)) {
         next.tcp_state = kTcpStateClosed;
         next.flags = 0u;
-        ReleasePassiveChild(next.flow_id);
+        ReleasePassiveChild(next.flow_id, false);
       } else if (next.tcp_state != kTcpStatePoisoned) {
         next.tcp_state = kTcpStateEstablished;
         next.flags = kTcpFlagAck | (((seg.flags & kTcpFlagPsh) != 0u) ? kTcpFlagPsh : 0u);
@@ -896,6 +909,47 @@ class FlowStateTable {
     return it == listen_sockets_.end() ? nullptr : &it->second;
   }
 
+  bool PopAcceptedFlow(std::uint32_t listen_flow_id, std::uint32_t* out_child_flow_id) {
+    auto it = listen_sockets_.find(listen_flow_id);
+    if (it == listen_sockets_.end() || it->second.accept_queue.empty()) {
+      return false;
+    }
+    const std::uint32_t child = it->second.accept_queue.front();
+    it->second.accept_queue.pop_front();
+    if (out_child_flow_id) {
+      *out_child_flow_id = child;
+    }
+    return true;
+  }
+
+  std::uint64_t ConsumeReceiveBytes(std::uint32_t flow_id, std::uint64_t max_bytes) {
+    auto it = tcbs_.find(flow_id);
+    if (it == tcbs_.end() || max_bytes == 0u) {
+      return 0u;
+    }
+    TcpControlBlock& tcb = it->second;
+    std::uint64_t consumed = 0u;
+    while (!tcb.receive_queue.empty() && consumed < max_bytes) {
+      TcpReceiveSegment& seg = tcb.receive_queue.front();
+      const std::uint32_t take = static_cast<std::uint32_t>(
+          std::min<std::uint64_t>(static_cast<std::uint64_t>(seg.len), max_bytes - consumed));
+      consumed += take;
+      seg.len -= take;
+      seg.seq += take;
+      if (tcb.receive_ready_bytes >= take) {
+        tcb.receive_ready_bytes -= take;
+      } else {
+        tcb.receive_ready_bytes = 0u;
+      }
+      tcb.rcv_wnd = static_cast<std::uint32_t>(
+          std::min<std::uint64_t>(0xFFFFFFFFull, static_cast<std::uint64_t>(tcb.rcv_wnd) + take));
+      if (seg.len == 0u) {
+        tcb.receive_queue.pop_front();
+      }
+    }
+    return consumed;
+  }
+
   std::uint32_t ClampPayloadToMss(std::uint32_t flow_id, std::uint32_t desired_payload_len) const {
     auto it = tcbs_.find(flow_id);
     if (it == tcbs_.end()) {
@@ -1029,7 +1083,7 @@ class FlowStateTable {
     flow_lookup_[TcpFlowKey{st.dst_ip, st.src_ip, st.dst_port, st.src_port, st.proto}] = st.flow_id;
   }
 
-  void ReleasePassiveChild(std::uint32_t child_flow_id) {
+  void ReleasePassiveChild(std::uint32_t child_flow_id, bool enqueue_accept) {
     auto child_it = child_to_listener_.find(child_flow_id);
     if (child_it == child_to_listener_.end()) {
       return;
@@ -1043,6 +1097,15 @@ class FlowStateTable {
     auto listen_it = listen_sockets_.find(listen_flow_id);
     if (listen_it != listen_sockets_.end() && listen_it->second.pending_children > 0u) {
       listen_it->second.pending_children -= 1u;
+      if (enqueue_accept) {
+        TcpListenSocket& listener = listen_it->second;
+        if (listener.accept_queue.size() >= listener.backlog_limit) {
+          listener.accept_queue_overflow_count += 1u;
+          listener.accept_queue.pop_front();
+        }
+        listener.accept_queue.push_back(child_flow_id);
+        listener.accepted_count += 1u;
+      }
     }
   }
 
@@ -1135,6 +1198,29 @@ class FlowStateTable {
     }
   }
 
+  static std::uint32_t TcpRangeLen(std::uint32_t seq, std::uint32_t end_seq) {
+    return TcpSeqAfter(end_seq, seq) ? static_cast<std::uint32_t>(end_seq - seq) : 0u;
+  }
+
+  static void QueueReceiveRange(TcpControlBlock& tcb, std::uint32_t seq, std::uint32_t end_seq) {
+    const std::uint32_t len = TcpRangeLen(seq, end_seq);
+    if (len == 0u) {
+      return;
+    }
+    if (tcb.receive_queue.size() >= kTcpMaxReceiveQueueSegments) {
+      tcb.receive_queue_overflow_count += 1u;
+      if (tcb.receive_ready_bytes >= tcb.receive_queue.front().len) {
+        tcb.receive_ready_bytes -= tcb.receive_queue.front().len;
+      } else {
+        tcb.receive_ready_bytes = 0u;
+      }
+      tcb.receive_queue.pop_front();
+    }
+    tcb.receive_queue.push_back(TcpReceiveSegment{seq, end_seq, len});
+    tcb.receive_ready_bytes += len;
+    tcb.rcv_wnd = tcb.rcv_wnd > len ? (tcb.rcv_wnd - len) : 0u;
+  }
+
   static void InsertOutOfOrder(TcpControlBlock& tcb, std::uint32_t seq, std::uint32_t end_seq) {
     if (seq == end_seq) {
       return;
@@ -1155,7 +1241,9 @@ class FlowStateTable {
       advanced = false;
       for (auto it = tcb.out_of_order.begin(); it != tcb.out_of_order.end();) {
         if (TcpSeqBeforeEq(it->seq, tcb.rcv_nxt) && TcpSeqAfter(it->end_seq, tcb.rcv_nxt)) {
+          const std::uint32_t ready_seq = tcb.rcv_nxt;
           tcb.rcv_nxt = it->end_seq;
+          QueueReceiveRange(tcb, ready_seq, it->end_seq);
           it = tcb.out_of_order.erase(it);
           advanced = true;
         } else if (TcpSeqBeforeEq(it->end_seq, tcb.rcv_nxt)) {
@@ -1183,6 +1271,7 @@ class FlowStateTable {
     }
     if (seg.seq == tcb.rcv_nxt) {
       tcb.rcv_nxt = seg_end;
+      QueueReceiveRange(tcb, seg.seq, seg_end);
       DrainOutOfOrder(tcb);
     } else if (TcpSeqAfter(seg.seq, tcb.rcv_nxt)) {
       InsertOutOfOrder(tcb, seg.seq, seg_end);
