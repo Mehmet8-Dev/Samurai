@@ -181,12 +181,28 @@ def test_m3_gpu_worker_has_native_cuda_bridge_and_failfast_fallback() -> None:
     assert "gpu_native_stream_lifecycle_symbol_missing" in src
     assert "gpu_flow_update_start_stream_failed" in src
     assert "gpu_flow_update_update_stream_failed" in src
-    assert "gpu_flow_update_stop_stream_failed" in src
+    assert "gpu_flow_update_pause_stream_failed" in src
     assert "samurai_gpu_packet_free" in src
     assert "MessageType::HEARTBEAT" in src
     assert "MessageType::METRIC_SNAPSHOT" in src
     assert "gpu_native_lib_unavailable" in src
     assert "gpu_native_symbol_missing" in src
+
+
+def test_m3_gpu_stream_policy_accepts_zero_quota_pause_contract() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "gpu_worker.cpp").read_text(encoding="utf-8")
+
+    assert "kGpuStreamPolicyTemplateValid = 0x80000000u" in src
+    assert "policy_valid" in src
+    assert "(policy_valid || upsert.quota > 0u) ? upsert.quota : static_cast<std::uint32_t>(cfg.quota)" in src
+    assert '\\"tcp_seq\\":' in src
+    assert '\\"tcp_ack\\":' in src
+    assert '\\"tcp_state\\":' in src
+    assert '\\"tcp_mss\\":1460' in src
+    assert '\\"tcp_window_scale\\":8' in src
+    assert '\\"tcp_sack_permitted\\":true' in src
+    assert '\\"tcp_timestamp_enabled\\":true' in src
 
 
 def test_m3_dispatch_flow_update_targets_gpu_contract_channel() -> None:
@@ -454,7 +470,7 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "EnvContractU32" in src
     assert "SAMURAI_GPU_CONTRACT_EXPORT_SPEC" in src
     assert "SAMURAI_GPU_CONTRACT_EXPORT_PATH" in src
-    assert "kind=file,file=" in src
+    assert "std::string(\"kind=\") + kind + \",file=\"" in src
     assert "layout=1,shards=" in src
     assert "event=\" + std::to_string(sizeof(DocaFlowUpdateEventV1))" in src
     assert "--dpu-contract-rdma" in src
@@ -471,7 +487,9 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "BackendContractFlowUpdateSlot" in backend
     assert "ContractRegionSpec" in backend
     assert "out->kind = \"file\"" in backend
-    assert "kind=rdma requires native RDMA import backend" in backend
+    assert "contract region kind=rdma requires SAMURAI_DOCA_CONTRACT_RDMA_IMPORTER_SO" in backend
+    assert "samurai_doca_contract_rdma_import_v1" in backend
+    assert "samurai_doca_contract_rdma_release_v1" in backend
     assert "register_contract_writer_doca_mmap" in backend
     assert "contract doca_mmap_set_memrange failed" in backend
     assert "contract doca_mmap_get_mkey failed" in backend
@@ -495,6 +513,43 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     assert "doca_device_required" in src
 
 
+def test_m3_doca_worker_dpu_tcp_feedback_is_zmq_stateful_not_python_bridge() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "doca_gpunetio_worker.cpp").read_text(encoding="utf-8")
+
+    assert "SAMURAI_DPU_TCP_RX_FEEDBACK" in src
+    assert "SAMURAI_DPU_TCP_PASSIVE_OPEN" in src
+    assert "--dpu-tcp-rx-feedback" in src
+    assert "--dpu-tcp-passive-open" in src
+    assert "PollDpuTcpRxFeedback" in src
+    assert "WaitForDpuPassiveOpen" in src
+    assert "AcceptPassiveOpen" in src
+    assert "ObserveTcpPacket" in src
+    assert "ApplyDpuStreamPolicyToUpsert" in src
+    assert "BuildGpuStreamPolicy" in src
+    assert "PublishDpuFlowStreamUpsert" in src
+    assert "MessageType::FLOW_STREAM_UPSERT" in src
+    assert "python" not in src.lower()
+
+
+def test_m3_doca_worker_perf_critical_feedback_path_reuses_scratch_and_batches_tcb_tx() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "doca_gpunetio_worker.cpp").read_text(encoding="utf-8")
+    poll_body = src.split("bool PollDpuTcpRxFeedback(", 1)[1].split("bool WaitForDpuPassiveOpen(", 1)[0]
+
+    assert "struct DpuTcpRxScratch" in src
+    assert "std::vector<std::uint8_t> flat" in src
+    assert "std::vector<std::uint16_t> lengths" in src
+    assert "std::unordered_map<std::uint32_t, StreamPolicySnapshot> stream_policy_cache" in src
+    assert "DpuTcpRxScratch& scratch" in poll_body
+    assert "scratch.flat.data()" in poll_body
+    assert "scratch.lengths.data()" in poll_body
+    assert "std::vector<std::uint8_t> flat" not in poll_body
+    assert "std::vector<std::uint16_t> lengths" not in poll_body
+    assert "ShouldPublishStreamPolicy(scratch, upsert)" in poll_body
+    assert "TrackTransmitBatch(" in src
+
+
 def test_m3_dpu_state_runtime_models_authoritative_flow_updates() -> None:
     root = Path(__file__).resolve().parents[1]
     src = (root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp").read_text(encoding="utf-8")
@@ -505,6 +560,56 @@ def test_m3_dpu_state_runtime_models_authoritative_flow_updates() -> None:
     assert "FlowUpdateEventV1" in src
     assert "kTcpStateMigrating" in src
     assert "kTcpStatePoisoned" in src
+
+
+def test_m3_dpu_state_runtime_models_full_tcp_offload_control_blocks() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp").read_text(encoding="utf-8")
+
+    for token in [
+        "struct TcpControlBlock",
+        "TcpFlowKey",
+        "retransmit_queue",
+        "next_rto_deadline_ns",
+        "dup_ack_count",
+        "fast_recovery",
+        "zero_window_probe_pending",
+        "sack_permitted",
+        "timestamp_enabled",
+        "out_of_order",
+        "Listen(",
+        "AcceptPassiveOpen(",
+        "ObserveTcpPacketByTuple(",
+        "TrackTransmitBatch(",
+        "TickTcpTimers(",
+        "UpdatePathMtu(",
+        "BuildGpuStreamPolicy(",
+        "kGpuStreamPolicyPause",
+        "kGpuStreamPolicyRetransmit",
+        "kGpuStreamPolicyZeroWindowProbe",
+    ]:
+        assert token in src
+
+
+def test_m3_cuda_stream_templates_emit_negotiated_tcp_options() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "gpu_packet_cuda" / "host_api.cuh").read_text(encoding="utf-8")
+
+    for token in [
+        "tcp_mss",
+        "tcp_window_scale",
+        "tcp_sack_permitted",
+        "tcp_timestamp_enabled",
+        "tcp_opt_len",
+        "sv->tcp_sack_permitted",
+        "sv->tcp_timestamp_enabled",
+        "sv->tcp_window_scale <= 14u",
+        "json_get_int(profile, \"tcp_mss\", 1460)",
+        "json_get_bool(profile, \"tcp_sack_permitted\", true)",
+        "json_get_bool(st.update_json, \"tcp_timestamp_enabled\"",
+    ]:
+        assert token in src
+
 
 
 def test_m3_cuda_contract_runtime_has_device_visible_mirror() -> None:
@@ -525,7 +630,8 @@ def test_m3_cuda_contract_runtime_has_device_visible_mirror() -> None:
     assert "cudaHostRegister(mapped, layout.total_bytes, cudaHostRegisterMapped)" in src
     assert "cudaHostGetDevicePointer(&dev_base, mapped, 0)" in src
     assert "persistent_contract_export_region_spec" in src
-    assert "<< \"kind=file\"" in src
+    assert "std::string kind = \"file\"" in src
+    assert "<< \"kind=\" << kind" in src
     assert "<< \",shards=\" << shard_count" in src
     assert "<< \",event=\" << sizeof" in src
     assert "samurai_gpu_packet_contract_export_region_v1" in src

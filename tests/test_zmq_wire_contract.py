@@ -183,6 +183,35 @@ def test_flow_stream_upsert_roundtrip_and_flow_update_projection() -> None:
     assert event.dpu_ts_ns == 987654321
 
 
+def test_flow_stream_upsert_preserves_gpu_pause_policy_template_bit() -> None:
+    upsert = FlowStreamUpsertV1(
+        version=16,
+        epoch=4,
+        flow_id=100,
+        tcp_seq=2000,
+        tcp_ack=1900,
+        src_port=40000,
+        dst_port=443,
+        tcp_state=4,
+        proto=6,
+        flags=0x10,
+        rtt_us=650,
+        quota=0,
+        tx_ipg_ns=1000,
+        dpu_ts_ns=987654333,
+        target_ip="10.0.0.10",
+        payload_len=0,
+        payload_byte=0,
+        weight=1,
+        template_id=0x90000000,
+    )
+
+    decoded = FlowStreamUpsertV1.unpack(upsert.pack())
+    assert decoded.quota == 0
+    assert decoded.template_id == 0x90000000
+    assert decoded.to_flow_update().tcp_seq == 2000
+
+
 def test_flow_stream_upsert_rejects_in_progress_version() -> None:
     upsert = FlowStreamUpsertV1(
         version=13,
@@ -324,6 +353,76 @@ int main() {{
             check=False,
         )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_dpu_state_runtime_header_executes_tcp_policy_smoke() -> None:
+    cxx = shutil.which("g++") or shutil.which("clang++")
+    if not cxx:
+        pytest.skip("No C++ compiler found")
+
+    root = Path(__file__).resolve().parents[1]
+    hdr = root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp"
+    source = f"""
+#include \"{hdr}\"
+#include <cstdint>
+
+int main() {{
+  samurai::dpu::FlowStateTable table;
+  samurai::dpu::FlowState st{{}};
+  st.flow_id = 77;
+  st.src_ip = 0x0a000001u;
+  st.dst_ip = 0x0a000002u;
+  st.src_port = 40000;
+  st.dst_port = 443;
+  st.seq_num = 1000;
+  st.ack_num = 900;
+  st.tcp_state = samurai::dpu::kTcpStateEstablished;
+  st.flags = samurai::dpu::kTcpFlagAck;
+  st.proto = samurai::dpu::kProtoTcp;
+  table.Upsert(st);
+  table.TrackTransmitBatch(77, 1000, 100, samurai::dpu::kTcpFlagAck, 4, 100, 1000000);
+  const samurai::dpu::TcpControlBlock* tcb = table.FindTcb(77);
+  if (!tcb || tcb->retransmit_queue.size() != 4u || tcb->snd_nxt != 1400u) return 1;
+  const auto policy = table.BuildGpuStreamPolicy(77, 64, 1200, 500);
+  if (policy.pause || policy.quota == 0u || policy.payload_len != 1200u) return 2;
+
+  table.Listen(88, 0x0a000003u, 443);
+  samurai::dpu::TcpSegmentObservation syn{{}};
+  syn.src_ip = 0x0a000004u;
+  syn.dst_ip = 0x0a000003u;
+  syn.src_port = 50000;
+  syn.dst_port = 443;
+  syn.seq = 12345;
+  syn.flags = samurai::dpu::kTcpFlagSyn;
+  syn.window = 4096;
+  syn.has_mss = true;
+  syn.mss = 1200;
+  syn.has_window_scale = true;
+  syn.window_scale = 4;
+  syn.sack_permitted = true;
+  syn.has_timestamp = true;
+  syn.tsval = 11;
+  table.AcceptPassiveOpen(88, 89, syn, 7000, 2000000);
+  const samurai::dpu::FlowState* child = table.Find(89);
+  if (!child || child->tcp_state != samurai::dpu::kTcpStateSynReceived) return 3;
+  const samurai::dpu::TcpControlBlock* child_tcb = table.FindTcb(89);
+  if (!child_tcb || child_tcb->mss != 1200u || !child_tcb->sack_permitted ||
+      !child_tcb->timestamp_enabled || child_tcb->peer_window_scale != 4u) return 4;
+  return 0;
+}}
+"""
+    with tempfile.TemporaryDirectory(prefix="samurai-dpu-state-") as td:
+        out_bin = Path(td) / "dpu_state_runtime_test"
+        proc = subprocess.run(
+            [cxx, "-std=c++17", "-x", "c++", "-", "-o", str(out_bin)],
+            input=source,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        run = subprocess.run([str(out_bin)], capture_output=True, text=True, check=False)
+    assert run.returncode == 0, run.stderr
 
 
 def test_magic_constant_stable() -> None:
