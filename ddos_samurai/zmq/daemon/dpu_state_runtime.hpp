@@ -673,6 +673,58 @@ class FlowStateTable {
     return out->second;
   }
 
+  FlowState& TrackTransmitBatch(
+      std::uint32_t flow_id,
+      std::uint32_t first_seq,
+      std::uint32_t payload_len,
+      std::uint16_t flags,
+      std::uint32_t packet_count,
+      std::uint32_t seq_stride,
+      std::uint64_t now_ns) {
+    auto it = flows_.find(flow_id);
+    if (it == flows_.end()) {
+      throw std::out_of_range("unknown dpu flow_id");
+    }
+    if (packet_count == 0u) {
+      return it->second;
+    }
+    FlowState next = it->second;
+    TcpControlBlock& tcb = EnsureTcb(next);
+    const std::uint32_t control_advance =
+        (((flags & kTcpFlagSyn) != 0u) ? 1u : 0u) +
+        (((flags & kTcpFlagFin) != 0u) ? 1u : 0u);
+    const std::uint32_t segment_advance = payload_len + control_advance;
+    if (segment_advance != 0u) {
+      const std::uint32_t stride = seq_stride != 0u ? seq_stride : segment_advance;
+      const std::size_t need = std::min<std::size_t>(static_cast<std::size_t>(packet_count), kTcpMaxRetransmitEntries);
+      while (tcb.retransmit_queue.size() + need > kTcpMaxRetransmitEntries && !tcb.retransmit_queue.empty()) {
+        tcb.retransmit_queue_overflow_count += 1u;
+        tcb.retransmit_queue.pop_front();
+      }
+      const std::uint32_t tracked_count = static_cast<std::uint32_t>(need);
+      if (tracked_count < packet_count) {
+        tcb.retransmit_queue_overflow_count += static_cast<std::uint64_t>(packet_count - tracked_count);
+      }
+      for (std::uint32_t i = 0; i < tracked_count; ++i) {
+        const std::uint32_t seq = first_seq + (i * stride);
+        const std::uint32_t end_seq = seq + segment_advance;
+        tcb.snd_nxt = TcpSeqAfter(end_seq, tcb.snd_nxt) ? end_seq : tcb.snd_nxt;
+        tcb.retransmit_queue.push_back(TcpRetransmitEntry{seq, end_seq, payload_len, now_ns, now_ns, 0u, false});
+      }
+      if (tcb.next_rto_deadline_ns == 0u) {
+        tcb.next_rto_deadline_ns = now_ns + tcb.rto_ns;
+      }
+    }
+    next.seq_num = tcb.snd_nxt;
+    next.last_tx_ts = now_ns;
+    next.flags = flags;
+    next.version = NextCommittedVersion(it->second.version);
+    EraseFlowKeys(it->second);
+    auto [out, _inserted] = flows_.insert_or_assign(flow_id, next);
+    RegisterFlowKeys(out->second);
+    return out->second;
+  }
+
   FlowState& TickTcpTimers(std::uint32_t flow_id, std::uint64_t now_ns) {
     auto it = flows_.find(flow_id);
     if (it == flows_.end()) {

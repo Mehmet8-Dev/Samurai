@@ -13,6 +13,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unistd.h>
 #include <vector>
 
@@ -112,6 +113,28 @@ struct DocaRxqGuard {
       (void)bridge->api.destroy_rxq(handle, err, sizeof(err));
     }
   }
+};
+
+struct DpuTcpRxScratch {
+  static constexpr int kMaxRxPackets = 32;
+  static constexpr std::size_t kMaxPacket = 2048u;
+  struct StreamPolicySnapshot {
+    std::uint32_t quota{0};
+    std::uint16_t payload_len{0};
+    std::uint64_t tx_ipg_ns{0};
+    std::uint32_t template_id{0};
+    std::uint32_t tcp_seq{0};
+    std::uint32_t tcp_ack{0};
+    std::uint16_t flags{0};
+    std::uint8_t tcp_state{0};
+  };
+  std::vector<std::uint8_t> flat;
+  std::vector<std::uint16_t> lengths;
+  std::unordered_map<std::uint32_t, StreamPolicySnapshot> stream_policy_cache;
+
+  DpuTcpRxScratch()
+      : flat(kMaxPacket * static_cast<std::size_t>(kMaxRxPackets)),
+        lengths(static_cast<std::size_t>(kMaxRxPackets), 0u) {}
 };
 
 std::string ReadFixed(const char* raw, std::size_t n) {
@@ -636,6 +659,34 @@ void ApplyDpuStreamPolicyToUpsert(
   (void)env;
 }
 
+bool ShouldPublishStreamPolicy(
+    DpuTcpRxScratch& scratch,
+    const samurai::wire::FlowStreamUpsertV1& upsert) {
+  DpuTcpRxScratch::StreamPolicySnapshot next{};
+  next.quota = upsert.quota;
+  next.payload_len = upsert.payload_len;
+  next.tx_ipg_ns = upsert.tx_ipg_ns;
+  next.template_id = upsert.template_id;
+  next.tcp_seq = upsert.tcp_seq;
+  next.tcp_ack = upsert.tcp_ack;
+  next.flags = upsert.flags;
+  next.tcp_state = upsert.tcp_state;
+  auto it = scratch.stream_policy_cache.find(upsert.flow_id);
+  if (it != scratch.stream_policy_cache.end() &&
+      it->second.quota == next.quota &&
+      it->second.payload_len == next.payload_len &&
+      it->second.tx_ipg_ns == next.tx_ipg_ns &&
+      it->second.template_id == next.template_id &&
+      it->second.tcp_seq == next.tcp_seq &&
+      it->second.tcp_ack == next.tcp_ack &&
+      it->second.flags == next.flags &&
+      it->second.tcp_state == next.tcp_state) {
+    return false;
+  }
+  scratch.stream_policy_cache[upsert.flow_id] = next;
+  return true;
+}
+
 bool PublishDpuFlowUpdate(
     void* gpu_push,
     const samurai::wire::FlowUpdateEventV1& ev,
@@ -820,25 +871,22 @@ bool PollDpuTcpRxFeedback(
     DpuContractWriterGuard& contract_writer,
     std::uint16_t established_tx_flags,
     const samurai::wire::JobEnvelopeV1& env,
+    DpuTcpRxScratch& scratch,
     std::uint64_t correlation_id,
     const std::string& job_id,
     std::string& err) {
   if (!rxq.bridge || rxq.handle <= 0 || !rxq.bridge->api.receive_burst) {
     return true;
   }
-  constexpr int kMaxRxPackets = 32;
-  constexpr std::size_t kMaxPacket = 2048u;
-  std::vector<std::uint8_t> flat(kMaxPacket * static_cast<std::size_t>(kMaxRxPackets));
-  std::vector<std::uint16_t> lengths(static_cast<std::size_t>(kMaxRxPackets), 0u);
   int received = 0;
   char native_err[160];
   native_err[0] = '\0';
   if (rxq.bridge->api.receive_burst(
           rxq.handle,
-          flat.data(),
-          static_cast<std::uint32_t>(flat.size()),
-          lengths.data(),
-          kMaxRxPackets,
+          scratch.flat.data(),
+          static_cast<std::uint32_t>(scratch.flat.size()),
+          scratch.lengths.data(),
+          DpuTcpRxScratch::kMaxRxPackets,
           &received,
           native_err,
           sizeof(native_err)) != 0) {
@@ -847,17 +895,17 @@ bool PollDpuTcpRxFeedback(
   }
   std::size_t off = 0u;
   for (int i = 0; i < received; ++i) {
-    const std::size_t len = static_cast<std::size_t>(lengths[static_cast<std::size_t>(i)]);
-    if (len == 0u || off + len > flat.size()) {
+    const std::size_t len = static_cast<std::size_t>(scratch.lengths[static_cast<std::size_t>(i)]);
+    if (len == 0u || off + len > scratch.flat.size()) {
       break;
     }
     try {
       const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
       const samurai::dpu::FlowState* observed = nullptr;
       try {
-        observed = &dpu_state.ObserveTcpPacketByTuple(flat.data() + off, len, now_ns);
+        observed = &dpu_state.ObserveTcpPacketByTuple(scratch.flat.data() + off, len, now_ns);
       } catch (const std::out_of_range&) {
-        observed = &dpu_state.ObserveTcpPacket(flow_id, flat.data() + off, len, now_ns);
+        observed = &dpu_state.ObserveTcpPacket(flow_id, scratch.flat.data() + off, len, now_ns);
       }
       const samurai::dpu::FlowState& st = *observed;
       const samurai::dpu::FlowState* publish_state = &st;
@@ -871,7 +919,8 @@ bool PollDpuTcpRxFeedback(
       if (dpu_state_publish) {
         samurai::wire::FlowStreamUpsertV1 upsert = BuildFlowStreamUpsert(*publish_state, env, now_ns);
         ApplyDpuStreamPolicyToUpsert(dpu_state, *publish_state, env, upsert);
-        if (!PublishDpuFlowStreamUpsert(gpu_push, upsert, correlation_id, job_id, err)) {
+        if (ShouldPublishStreamPolicy(scratch, upsert) &&
+            !PublishDpuFlowStreamUpsert(gpu_push, upsert, correlation_id, job_id, err)) {
           return false;
         }
       }
@@ -1414,6 +1463,7 @@ int main(int argc, char** argv) {
         std::vector<const uint8_t*> ptrs(static_cast<std::size_t>(batch_size), nullptr);
         std::vector<uint16_t> lens(static_cast<std::size_t>(batch_size), 0u);
         std::vector<int32_t> slots(static_cast<std::size_t>(batch_size), -1);
+        DpuTcpRxScratch rx_scratch{};
 
         int offset = 0;
         while (offset < packet_count) {
@@ -1472,16 +1522,14 @@ int main(int argc, char** argv) {
             const std::uint32_t tx_seq = static_cast<std::uint32_t>(
                 (static_cast<std::uint64_t>(initial_flow.seq_num) + sent_before_batch * seq_advance) & 0xFFFFFFFFull);
             const std::uint16_t tx_flags = TcpFlagsFromEnvelope(env);
-            for (int sent_i = 0; sent_i < out_sent; ++sent_i) {
-              (void)dpu_state.TrackTransmit(
-                  initial_flow.flow_id,
-                  static_cast<std::uint32_t>(
-                      (static_cast<std::uint64_t>(tx_seq) + static_cast<std::uint64_t>(sent_i) * seq_advance) &
-                      0xFFFFFFFFull),
-                  tx_payload_len,
-                  tx_flags,
-                  now_ns);
-            }
+            (void)dpu_state.TrackTransmitBatch(
+                initial_flow.flow_id,
+                tx_seq,
+                tx_payload_len,
+                tx_flags,
+                static_cast<std::uint32_t>(out_sent),
+                seq_advance,
+                now_ns);
             const samurai::dpu::FlowState* before_timer = dpu_state.Find(initial_flow.flow_id);
             const std::uint64_t before_timer_version = before_timer ? before_timer->version : 0u;
             const samurai::dpu::FlowState& timer_state = dpu_state.TickTcpTimers(initial_flow.flow_id, now_ns);
@@ -1538,6 +1586,7 @@ int main(int argc, char** argv) {
                                       contract_writer,
                                       established_tx_flags,
                                       env,
+                                      rx_scratch,
                                       header.correlation_id,
                                       job_id,
                                       rx_err)) {
@@ -1595,6 +1644,7 @@ int main(int argc, char** argv) {
                                      contract_writer,
                                      established_tx_flags,
                                      env,
+                                     rx_scratch,
                                      header.correlation_id,
                                      job_id,
                                      rx_err);
