@@ -39,6 +39,19 @@ struct DocaContractWriterConfigV1 {
   uint32_t flags = 0u;
 };
 
+// Optional plugin ABI for kind=rdma contract regions. The importer owns any
+// provider-specific RDMA/DOCA import objects and returns a CPU-visible writer
+// mapping plus an opaque cookie that is released by the matching release hook.
+using DocaContractRdmaImportFnV1 = int (*)(
+    const char* region_spec,
+    const DocaContractWriterConfigV1* cfg,
+    void** out_addr,
+    size_t* out_len,
+    uint64_t* out_cookie,
+    char* err,
+    size_t err_len);
+using DocaContractRdmaReleaseFnV1 = int (*)(uint64_t cookie, char* err, size_t err_len);
+
 struct DocaGpuNetioApiV1 {
   int version = 0;
   int (*create_txq)(

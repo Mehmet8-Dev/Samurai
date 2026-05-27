@@ -248,6 +248,9 @@ struct BackendContractWriterHandle {
   doca_dev* dev = nullptr;
   doca_mmap* mmap = nullptr;
   uint32_t mmap_mkey = 0u;
+  void* rdma_importer_so = nullptr;
+  uint64_t rdma_import_cookie = 0u;
+  int (*rdma_release)(uint64_t cookie, char* err, size_t err_len) = nullptr;
   uint32_t shard_count = 0u;
   uint32_t ring_slots_per_shard = 0u;
   uint32_t hot_flow_capacity = 0u;
@@ -375,6 +378,7 @@ struct ContractRegionSpec {
   std::string kind{};
   uintptr_t addr = 0u;
   std::string file{};
+  std::string importer_so{};
   size_t size = 0u;
   uint32_t layout_version = 0u;
   uint32_t shard_count = 0u;
@@ -457,6 +461,8 @@ inline bool parse_contract_region_spec(
       out->addr = static_cast<uintptr_t>(addr);
     } else if (key == "file" || key == "path") {
       out->file = value;
+    } else if (key == "importer" || key == "importer_so" || key == "so") {
+      out->importer_so = value;
     } else if (key == "size" || key == "len") {
       uint64_t parsed_size = 0u;
       if (!parse_u64_text(value, &parsed_size) || parsed_size == 0u) {
@@ -513,10 +519,6 @@ inline bool parse_contract_region_spec(
   }
   if ((out->kind == "addr" || out->kind == "doca_mmap") && out->addr == 0u && out->file.empty()) {
     if (why) *why = "contract region kind requires addr= or file=";
-    return false;
-  }
-  if (out->kind == "rdma") {
-    if (why) *why = "contract region kind=rdma requires native RDMA import backend; use kind=doca_mmap with an imported addr or kind=file for local tests";
     return false;
   }
   return true;
@@ -1686,6 +1688,17 @@ inline bool open_doca_dev_by_name(const char* device_name, doca_dev** out_dev, c
 }
 
 inline void close_contract_writer_resources(BackendContractWriterHandle& h) {
+  if (h.rdma_release && h.region_kind == "rdma") {
+    char rdma_err[160];
+    rdma_err[0] = '\0';
+    (void)h.rdma_release(h.rdma_import_cookie, rdma_err, sizeof(rdma_err));
+    h.rdma_import_cookie = 0u;
+  }
+  h.rdma_release = nullptr;
+  if (h.rdma_importer_so) {
+    dlclose(h.rdma_importer_so);
+    h.rdma_importer_so = nullptr;
+  }
   if (h.mmap) {
     if (g_doca.loaded && g_doca.doca_mmap_stop) {
       (void)g_doca.doca_mmap_stop(h.mmap);
@@ -1712,6 +1725,63 @@ inline void close_contract_writer_resources(BackendContractWriterHandle& h) {
   h.region_len = 0u;
   h.fd = -1;
   h.mmap_mkey = 0u;
+}
+
+inline std::string contract_rdma_importer_path(const ContractRegionSpec& spec) {
+  if (!spec.importer_so.empty()) {
+    return spec.importer_so;
+  }
+  const char* env = std::getenv("SAMURAI_DOCA_CONTRACT_RDMA_IMPORTER_SO");
+  if (env && *env) {
+    return std::string(env);
+  }
+  return "";
+}
+
+inline bool import_contract_writer_rdma_region(
+    BackendContractWriterHandle& h,
+    const ContractRegionSpec& spec,
+    const DocaContractWriterConfigV1& cfg,
+    const ContractRegionLayout& layout,
+    char* err,
+    size_t err_len) {
+  const std::string importer_path = contract_rdma_importer_path(spec);
+  if (importer_path.empty()) {
+    write_err(
+        err,
+        err_len,
+        "contract region kind=rdma requires SAMURAI_DOCA_CONTRACT_RDMA_IMPORTER_SO or importer= in region spec");
+    return false;
+  }
+  void* so = dlopen(importer_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (!so) {
+    const char* dl_reason = dlerror();
+    write_err(err, err_len, std::string("contract RDMA importer dlopen failed: ") + (dl_reason ? dl_reason : "unknown"));
+    return false;
+  }
+  auto import_fn = reinterpret_cast<DocaContractRdmaImportFnV1>(dlsym(so, "samurai_doca_contract_rdma_import_v1"));
+  auto release_fn = reinterpret_cast<DocaContractRdmaReleaseFnV1>(dlsym(so, "samurai_doca_contract_rdma_release_v1"));
+  if (!import_fn || !release_fn) {
+    dlclose(so);
+    write_err(err, err_len, "contract RDMA importer symbols missing");
+    return false;
+  }
+  void* addr = nullptr;
+  size_t len = 0u;
+  uint64_t cookie = 0u;
+  if (import_fn(cfg.region_spec, &cfg, &addr, &len, &cookie, err, err_len) != 0 || !addr || len < layout.total_bytes) {
+    dlclose(so);
+    if (err && err_len > 0u && err[0] == '\0') {
+      write_err(err, err_len, "contract RDMA import failed");
+    }
+    return false;
+  }
+  h.region = addr;
+  h.region_len = len;
+  h.rdma_import_cookie = cookie;
+  h.rdma_release = release_fn;
+  h.rdma_importer_so = so;
+  return true;
 }
 
 inline bool register_contract_writer_doca_mmap(
@@ -2308,7 +2378,11 @@ extern "C" int samurai_doca_backend_contract_writer_open(
   writer->region_kind = spec.kind;
   writer->region_len = spec.size != 0u ? spec.size : layout.total_bytes;
 
-  if (!spec.file.empty()) {
+  if (writer->region_kind == "rdma") {
+    if (!import_contract_writer_rdma_region(*writer, spec, *cfg, layout, err, err_len)) {
+      return -1;
+    }
+  } else if (!spec.file.empty()) {
     const int fd = ::open(spec.file.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
       write_err(err, err_len, std::string("contract region file open failed: ") + std::strerror(errno));
@@ -2344,6 +2418,7 @@ extern "C" int samurai_doca_backend_contract_writer_open(
   }
   if (!writer->region) {
     write_err(err, err_len, "contract region resolved to null");
+    close_contract_writer_resources(*writer);
     return -1;
   }
   if (writer->region_kind == "doca_mmap") {

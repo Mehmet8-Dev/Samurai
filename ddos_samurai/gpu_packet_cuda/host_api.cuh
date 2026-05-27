@@ -1876,8 +1876,20 @@ inline std::string persistent_contract_export_region_spec(
     size_t shard_count,
     size_t ring_slots_per_shard,
     size_t hot_flow_capacity) {
+  std::string kind = "file";
+  if (const char* raw_kind = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_KIND")) {
+    if (*raw_kind) {
+      kind = std::string(raw_kind);
+      std::transform(kind.begin(), kind.end(), kind.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+      if (kind == "doca-mmap") {
+        kind = "doca_mmap";
+      }
+    }
+  }
   std::ostringstream oss;
-  oss << "kind=file"
+  oss << "kind=" << kind
       << ",layout=1"
       << ",file=" << path
       << ",size=" << layout.total_bytes
