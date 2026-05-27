@@ -221,6 +221,10 @@ struct TcpControlBlock {
   bool zero_window{false};
   bool retransmit_pending{false};
   bool zero_window_probe_pending{false};
+  std::uint64_t invalid_ack_count{0};
+  std::uint64_t old_segment_count{0};
+  std::uint64_t out_of_order_drop_count{0};
+  std::uint64_t retransmit_queue_overflow_count{0};
   std::uint64_t srtt_us{0};
   std::uint64_t rttvar_us{0};
   std::uint64_t rto_ns{kTcpInitialRtoNs};
@@ -570,9 +574,22 @@ class FlowStateTable {
           (seg.flags & kTcpFlagAck) != 0u) {
         next.tcp_state = kTcpStateEstablished;
         next.flags = kTcpFlagAck;
-      } else if ((seg.flags & kTcpFlagFin) != 0u) {
-        next.tcp_state = kTcpStateCloseWait;
+      } else if (next.tcp_state == kTcpStateSynReceived && (seg.flags & kTcpFlagAck) != 0u &&
+                 TcpSeqAfterEq(seg.ack, tcb.snd_nxt)) {
+        next.tcp_state = kTcpStateEstablished;
         next.flags = kTcpFlagAck;
+      } else if ((seg.flags & kTcpFlagFin) != 0u) {
+        if (next.tcp_state == kTcpStateFinWait) {
+          next.tcp_state = kTcpStateTimeWait;
+          tcb.time_wait_deadline_ns = now_ns + kTcpTimeWaitNs;
+        } else {
+          next.tcp_state = kTcpStateCloseWait;
+        }
+        next.flags = kTcpFlagAck;
+      } else if (next.tcp_state == kTcpStateLastAck && (seg.flags & kTcpFlagAck) != 0u &&
+                 TcpSeqAfterEq(seg.ack, tcb.snd_nxt)) {
+        next.tcp_state = kTcpStateClosed;
+        next.flags = 0u;
       } else if (next.tcp_state != kTcpStatePoisoned) {
         next.tcp_state = kTcpStateEstablished;
         next.flags = kTcpFlagAck | (((seg.flags & kTcpFlagPsh) != 0u) ? kTcpFlagPsh : 0u);
@@ -638,6 +655,7 @@ class FlowStateTable {
     if (end_seq != seq) {
       tcb.snd_nxt = TcpSeqAfter(end_seq, tcb.snd_nxt) ? end_seq : tcb.snd_nxt;
       if (tcb.retransmit_queue.size() >= kTcpMaxRetransmitEntries) {
+        tcb.retransmit_queue_overflow_count += 1u;
         tcb.retransmit_queue.pop_front();
       }
       tcb.retransmit_queue.push_back(TcpRetransmitEntry{seq, end_seq, payload_len, now_ns, now_ns, 0u, false});
@@ -904,6 +922,7 @@ class FlowStateTable {
       return;
     }
     if (tcb.out_of_order.size() >= kTcpMaxOutOfOrderSegments) {
+      tcb.out_of_order_drop_count += 1u;
       tcb.out_of_order.erase(tcb.out_of_order.begin());
     }
     tcb.out_of_order.push_back(TcpOutOfOrderSegment{seq, end_seq});
@@ -949,6 +968,8 @@ class FlowStateTable {
       DrainOutOfOrder(tcb);
     } else if (TcpSeqAfter(seg.seq, tcb.rcv_nxt)) {
       InsertOutOfOrder(tcb, seg.seq, seg_end);
+    } else {
+      tcb.old_segment_count += 1u;
     }
   }
 
@@ -1031,6 +1052,7 @@ class FlowStateTable {
 
   static void ApplyAck(TcpControlBlock& tcb, const TcpSegmentObservation& seg, std::uint64_t now_ns) {
     if (TcpSeqAfter(seg.ack, tcb.snd_nxt)) {
+      tcb.invalid_ack_count += 1u;
       return;
     }
     ApplySackBlocks(tcb, seg);

@@ -1380,6 +1380,11 @@ struct PersistentDeviceStreamState {
   uint16_t target_port = 0;
   uint16_t tcp_flags = 0x02;
   uint16_t tcp_window = 65535;
+  uint16_t tcp_mss = 1460;
+  uint8_t tcp_window_scale = 8;
+  uint8_t tcp_sack_permitted = 1;
+  uint8_t tcp_timestamp_enabled = 1;
+  uint8_t _tcp_options_pad = 0;
   uint16_t source_port = 0;
   int32_t icmp_type = 8;
   int32_t icmp_code = 0;
@@ -1452,6 +1457,10 @@ struct PersistentStreamState {
   uint16_t target_port = 0;
   uint16_t tcp_flags = 0x02;
   uint16_t tcp_window = 65535;
+  uint16_t tcp_mss = 1460;
+  uint8_t tcp_window_scale = 8;
+  uint8_t tcp_sack_permitted = 1;
+  uint8_t tcp_timestamp_enabled = 1;
   uint16_t source_port = 0;
   uint32_t tcp_seq = 0;
   uint32_t tcp_ack = 0;
@@ -3223,7 +3232,15 @@ inline void persistent_build_stream_template(volatile PersistentDeviceStreamStat
   const int has_eth = (sv->has_ethernet != 0) ? 1 : 0;
   const int ip_off = has_eth ? 14 : 0;
   const int ip_len = 20;
-  const int tcp_len = 20;
+  int tcp_opt_len = 0;
+  if (is_tcp && (sv->tcp_flags & 0x02u) != 0u) {
+    tcp_opt_len = 4;
+    if (sv->tcp_sack_permitted != 0u) tcp_opt_len += 2;
+    if (sv->tcp_timestamp_enabled != 0u) tcp_opt_len += 10;
+    tcp_opt_len += 3;
+    while ((tcp_opt_len & 3) != 0) ++tcp_opt_len;
+  }
+  const int tcp_len = 20 + tcp_opt_len;
   const int udp_len = 8;
   const int icmp_len = 8;
   const int l4_len = (is_tcp ? tcp_len : (is_udp ? udp_len : icmp_len)) + payload_len;
@@ -3286,11 +3303,36 @@ inline void persistent_build_stream_template(volatile PersistentDeviceStreamStat
     w16(out, t_off + 2, sv->target_port);
     w32(out, t_off + 4, tcp_seq);
     w32(out, t_off + 8, tcp_ack);
-    out[t_off + 12] = 0x50;
+    out[t_off + 12] = static_cast<uint8_t>((tcp_len / 4) << 4);
     out[t_off + 13] = static_cast<uint8_t>(sv->tcp_flags & 0xFFu);
     w16(out, t_off + 14, sv->tcp_window);
     w16(out, t_off + 16, 0u);
     w16(out, t_off + 18, 0u);
+    int opt = t_off + 20;
+    if (tcp_opt_len > 0) {
+      out[opt++] = 2u;
+      out[opt++] = 4u;
+      w16(out, opt, sv->tcp_mss);
+      opt += 2;
+      if (sv->tcp_sack_permitted != 0u) {
+        out[opt++] = 4u;
+        out[opt++] = 2u;
+      }
+      if (sv->tcp_timestamp_enabled != 0u) {
+        out[opt++] = 8u;
+        out[opt++] = 10u;
+        w32(out, opt, 1u);
+        opt += 4;
+        w32(out, opt, 0u);
+        opt += 4;
+      }
+      out[opt++] = 3u;
+      out[opt++] = 3u;
+      out[opt++] = static_cast<uint8_t>(sv->tcp_window_scale <= 14u ? sv->tcp_window_scale : 14u);
+      while (opt < t_off + tcp_len) {
+        out[opt++] = 1u;
+      }
+    }
   } else if (is_udp) {
     w16(out, t_off + 0, src_port);
     w16(out, t_off + 2, sv->target_port);
@@ -3502,7 +3544,6 @@ __device__ inline void persistent_write_packet(
   const int has_eth = (sv->has_ethernet != 0) ? 1 : 0;
   const int ip_off = has_eth ? 14 : 0;
   const int ip_len = 20;
-  const int tcp_len = 20;
   const int udp_len = 8;
   const int icmp_len = 8;
   const bool is_tcp = (protocol == 6);
@@ -3615,6 +3656,15 @@ __device__ inline void persistent_write_packet(
   if (payload_len > kPersistentPayloadCapacity) {
     payload_len = kPersistentPayloadCapacity;
   }
+  int tcp_opt_len = 0;
+  if (is_tcp && (sv->tcp_flags & 0x02u) != 0u) {
+    tcp_opt_len = 4;
+    if (sv->tcp_sack_permitted != 0u) tcp_opt_len += 2;
+    if (sv->tcp_timestamp_enabled != 0u) tcp_opt_len += 10;
+    tcp_opt_len += 3;
+    while ((tcp_opt_len & 3) != 0) ++tcp_opt_len;
+  }
+  const int tcp_len = 20 + tcp_opt_len;
   const int transport_len = (is_tcp ? tcp_len : (is_udp ? udp_len : icmp_len)) + payload_len;
   const int total_len = ip_off + ip_len + transport_len;
   if (total_len <= 0 || total_len > static_cast<int>(max_packet_bytes)) {
@@ -3667,11 +3717,36 @@ __device__ inline void persistent_write_packet(
     w16(t_off + 2, sv->target_port);
     w32(t_off + 4, seq);
     w32(t_off + 8, sv->tcp_ack_counter);
-    payload[t_off + 12] = 0x50;  // TCP header len 20 bytes
+    payload[t_off + 12] = static_cast<uint8_t>((tcp_len / 4) << 4);
     payload[t_off + 13] = static_cast<uint8_t>(sv->tcp_flags & 0xFFu);
     w16(t_off + 14, sv->tcp_window);
     w16(t_off + 16, 0u);
     w16(t_off + 18, 0u);
+    int opt = t_off + 20;
+    if (tcp_opt_len > 0) {
+      payload[opt++] = 2u;
+      payload[opt++] = 4u;
+      w16(opt, sv->tcp_mss);
+      opt += 2;
+      if (sv->tcp_sack_permitted != 0u) {
+        payload[opt++] = 4u;
+        payload[opt++] = 2u;
+      }
+      if (sv->tcp_timestamp_enabled != 0u) {
+        payload[opt++] = 8u;
+        payload[opt++] = 10u;
+        w32(opt, seq);
+        opt += 4;
+        w32(opt, sv->tcp_ack_counter);
+        opt += 4;
+      }
+      payload[opt++] = 3u;
+      payload[opt++] = 3u;
+      payload[opt++] = static_cast<uint8_t>(sv->tcp_window_scale <= 14u ? sv->tcp_window_scale : 14u);
+      while (opt < t_off + tcp_len) {
+        payload[opt++] = 1u;
+      }
+    }
   } else if (is_udp) {
     w16(t_off + 0, src_port);
     w16(t_off + 2, sv->target_port);
@@ -6232,6 +6307,10 @@ inline std::string stream_state_to_json(const PersistentStreamState& st) {
       << "\"tcp_seq\":" << st.tcp_seq << ","
       << "\"tcp_ack\":" << st.tcp_ack << ","
       << "\"tcp_state\":" << static_cast<int>(st.tcp_state) << ","
+      << "\"tcp_mss\":" << st.tcp_mss << ","
+      << "\"tcp_window_scale\":" << static_cast<int>(st.tcp_window_scale) << ","
+      << "\"tcp_sack_permitted\":" << static_cast<int>(st.tcp_sack_permitted) << ","
+      << "\"tcp_timestamp_enabled\":" << static_cast<int>(st.tcp_timestamp_enabled) << ","
       << "\"icmp_type\":" << st.icmp_type << ","
       << "\"icmp_code\":" << st.icmp_code << ","
       << "\"payload_len\":" << st.payload_len << ","
@@ -7079,6 +7158,10 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
       clamp_i(json_get_int(profile, "source_port_mode", (st.source_port > 0 ? 1 : 0)), 0, 1));
   st.tcp_flags = static_cast<uint16_t>(clamp_i(json_get_int(profile, "tcp_flags", 0x02), 0, 255));
   st.tcp_window = static_cast<uint16_t>(clamp_i(json_get_int(profile, "window", 65535), 0, 65535));
+  st.tcp_mss = static_cast<uint16_t>(clamp_i(json_get_int(profile, "tcp_mss", 1460), 536, 8960));
+  st.tcp_window_scale = static_cast<uint8_t>(clamp_i(json_get_int(profile, "tcp_window_scale", 8), 0, 14));
+  st.tcp_sack_permitted = static_cast<uint8_t>(json_get_bool(profile, "tcp_sack_permitted", true) ? 1 : 0);
+  st.tcp_timestamp_enabled = static_cast<uint8_t>(json_get_bool(profile, "tcp_timestamp_enabled", true) ? 1 : 0);
   st.tcp_seq = static_cast<uint32_t>(json_get_u64(profile, "tcp_seq", 0u));
   st.tcp_ack = static_cast<uint32_t>(json_get_u64(profile, "tcp_ack", 0u));
   st.tcp_state = static_cast<uint8_t>(clamp_i(json_get_int(profile, "tcp_state", 0), 0, 255));
@@ -7140,6 +7223,10 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   d.source_port_mode = st.source_port_mode;
   d.tcp_flags = st.tcp_flags;
   d.tcp_window = st.tcp_window;
+  d.tcp_mss = st.tcp_mss;
+  d.tcp_window_scale = st.tcp_window_scale;
+  d.tcp_sack_permitted = st.tcp_sack_permitted;
+  d.tcp_timestamp_enabled = st.tcp_timestamp_enabled;
   d.seq_counter = st.tcp_seq;
   d.tcp_ack_counter = st.tcp_ack;
   d.tcp_state = st.tcp_state;
@@ -7272,6 +7359,18 @@ extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* u
       json_get_int(st.update_json, "window", static_cast<int>(st.tcp_window)), 0, 65535));
   d.tcp_flags = st.tcp_flags;
   d.tcp_window = st.tcp_window;
+  st.tcp_mss = static_cast<uint16_t>(clamp_i(
+      json_get_int(st.update_json, "tcp_mss", static_cast<int>(st.tcp_mss)), 536, 8960));
+  st.tcp_window_scale = static_cast<uint8_t>(clamp_i(
+      json_get_int(st.update_json, "tcp_window_scale", static_cast<int>(st.tcp_window_scale)), 0, 14));
+  st.tcp_sack_permitted = static_cast<uint8_t>(
+      json_get_bool(st.update_json, "tcp_sack_permitted", static_cast<bool>(st.tcp_sack_permitted)) ? 1 : 0);
+  st.tcp_timestamp_enabled = static_cast<uint8_t>(
+      json_get_bool(st.update_json, "tcp_timestamp_enabled", static_cast<bool>(st.tcp_timestamp_enabled)) ? 1 : 0);
+  d.tcp_mss = st.tcp_mss;
+  d.tcp_window_scale = st.tcp_window_scale;
+  d.tcp_sack_permitted = st.tcp_sack_permitted;
+  d.tcp_timestamp_enabled = st.tcp_timestamp_enabled;
   st.tcp_seq = static_cast<uint32_t>(json_get_u64(st.update_json, "tcp_seq", st.tcp_seq));
   st.tcp_ack = static_cast<uint32_t>(json_get_u64(st.update_json, "tcp_ack", st.tcp_ack));
   st.tcp_state = static_cast<uint8_t>(clamp_i(
