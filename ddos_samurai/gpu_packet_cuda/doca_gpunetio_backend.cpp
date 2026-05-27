@@ -2425,7 +2425,7 @@ extern "C" int samurai_doca_backend_contract_writer_open(
     if (!register_contract_writer_doca_mmap(*writer, cfg->device_name, err, err_len)) {
       return -1;
     }
-  } else if (writer->region_kind != "file" && writer->region_kind != "addr") {
+  } else if (writer->region_kind != "file" && writer->region_kind != "addr" && writer->region_kind != "rdma") {
     write_err(err, err_len, "unsupported contract region kind");
     close_contract_writer_resources(*writer);
     return -1;

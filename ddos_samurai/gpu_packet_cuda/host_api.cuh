@@ -1341,6 +1341,16 @@ struct PersistentRuntimeControl {
   uint64_t contract_poll_epoch_mismatch = 0;
   uint64_t contract_poll_inactive_flow = 0;
   uint64_t contract_poll_stale_events = 0;
+  uint64_t contract_poll_version_gap_events = 0;
+  uint64_t contract_resync_requests = 0;
+  uint64_t contract_poll_poison_events = 0;
+  uint64_t contract_poll_migration_events = 0;
+  uint64_t contract_stale_ttl_pause_events = 0;
+  uint64_t contract_heartbeat_lost_events = 0;
+  uint64_t tx_ownership_invalid_events = 0;
+  uint64_t tx_ownership_transitions = 0;
+  volatile uint64_t host_time_ns = 0;
+  volatile uint64_t last_contract_dpu_ts_ns = 0;
 };
 
 struct PersistentKernelStaticConfig {
@@ -1349,6 +1359,8 @@ struct PersistentKernelStaticConfig {
   int32_t max_streams = kPersistentMaxStreams;
   int32_t queue_probe_span = 4;
   int32_t max_packet_bytes = kPersistentMaxPacketBytes;
+  uint64_t contract_stale_ttl_ns = 0;
+  uint64_t contract_heartbeat_timeout_ns = 0;
 };
 
 __device__ __constant__ PersistentKernelStaticConfig g_persistent_kernel_static_cfg;
@@ -1776,7 +1788,10 @@ struct PersistentContractRuntime {
   uint64_t publish_count = 0u;
   uint64_t drop_count = 0u;
   uint64_t version_gap_count = 0u;
+  uint64_t resync_request_count = 0u;
   uint64_t epoch_mismatch_count = 0u;
+  uint64_t poison_event_count = 0u;
+  uint64_t migration_event_count = 0u;
   uint64_t device_sync_error_count = 0u;
   bool device_mirror_initialized = false;
   bool initialized = false;
@@ -3891,9 +3906,54 @@ __global__ void persistent_quota_refill_kernel(
   sv->quota_left = static_cast<uint32_t>(next_left);
 }
 
+static constexpr uint8_t kPersistentContractTcpStateMigrating = 250u;
+static constexpr uint8_t kPersistentContractTcpStatePoisoned = 255u;
+
+__device__ inline void persistent_contract_pause_stream(volatile PersistentDeviceStreamState* sv) {
+  if (!sv) {
+    return;
+  }
+  sv->active = 0;
+  sv->quota_left = 0;
+  sv->quota = 0;
+}
+
+__device__ inline void persistent_contract_stop_kernel(
+    volatile PersistentRuntimeControl* ctrl,
+    volatile int32_t* run_flag_dev) {
+  if (ctrl) {
+    ctrl->run = 0;
+  }
+  if (run_flag_dev) {
+    atomicExch((int*)run_flag_dev, 0);
+  }
+}
+
+__device__ inline bool persistent_slot_transition(
+    PersistentRingSlot* slot,
+    int32_t expected,
+    int32_t next,
+    volatile PersistentRuntimeControl* ctrl) {
+  if (!slot) {
+    return false;
+  }
+  if (slot->state != expected) {
+    if (ctrl) {
+      u64_add(&ctrl->tx_ownership_invalid_events, 1u);
+    }
+    return false;
+  }
+  slot->state = next;
+  if (ctrl) {
+    u64_add(&ctrl->tx_ownership_transitions, 1u);
+  }
+  return true;
+}
+
 __device__ inline void persistent_contract_poll_assigned_shard(
     volatile PersistentRuntimeControl* ctrl,
     volatile PersistentDeviceStreamState* streams,
+    volatile int32_t* run_flag_dev,
     const volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* contract_update_ring,
     volatile uint64_t* contract_ring_head,
     volatile uint64_t* contract_ring_tail,
@@ -3904,6 +3964,8 @@ __device__ inline void persistent_contract_poll_assigned_shard(
     int32_t contract_ring_slots_per_shard,
     int32_t contract_hot_flow_capacity,
     int32_t max_streams,
+    uint64_t contract_stale_ttl_ns,
+    uint64_t contract_heartbeat_timeout_ns,
     uint32_t lane) {
   using FlowUpdateEvent = ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1;
   if (!ctrl || !streams || !contract_update_ring || !contract_ring_head || !contract_ring_tail ||
@@ -3925,6 +3987,16 @@ __device__ inline void persistent_contract_poll_assigned_shard(
   const int32_t shard = static_cast<int32_t>(blockIdx.x);
   if (shard < 0 || shard >= contract_shard_count) {
     return;
+  }
+  if (lane == 0u && contract_heartbeat_timeout_ns > 0u) {
+    const uint64_t host_now = u64_load(&ctrl->host_time_ns);
+    const uint64_t last_dpu_ts = u64_load(&ctrl->last_contract_dpu_ts_ns);
+    if (host_now > last_dpu_ts && last_dpu_ts != 0u &&
+        (host_now - last_dpu_ts) > contract_heartbeat_timeout_ns) {
+      u64_add(&ctrl->contract_heartbeat_lost_events, 1u);
+      persistent_contract_stop_kernel(ctrl, run_flag_dev);
+      return;
+    }
   }
   uint64_t head = 0u;
   uint64_t tail = 0u;
@@ -4012,13 +4084,30 @@ __device__ inline void persistent_contract_poll_assigned_shard(
       should_apply = false;
       u64_add(&ctrl->contract_poll_stale_events, 1u);
     }
+    if (current_version != 0u && ev.version > (current_version + 2u)) {
+      should_apply = false;
+      u64_add(&ctrl->contract_poll_version_gap_events, 1u);
+      u64_add(&ctrl->contract_resync_requests, 1u);
+    }
     if (current_epoch != 0u && ev.epoch < current_epoch) {
       should_apply = false;
       u64_add(&ctrl->contract_poll_epoch_mismatch, 1u);
     }
+    if (contract_stale_ttl_ns > 0u && ev.dpu_ts_ns != 0u) {
+      const uint64_t host_now = u64_load(&ctrl->host_time_ns);
+      if (host_now > ev.dpu_ts_ns && (host_now - ev.dpu_ts_ns) > contract_stale_ttl_ns) {
+        should_apply = false;
+        u64_add(&ctrl->contract_stale_ttl_pause_events, 1u);
+        if (ev.flow_id < static_cast<uint32_t>(max_streams)) {
+          persistent_contract_pause_stream(streams + ev.flow_id);
+        }
+      }
+    }
   }
 
   if (should_apply) {
+    const bool poisoned = ev.tcp_state == kPersistentContractTcpStatePoisoned;
+    const bool migrating = ev.tcp_state == kPersistentContractTcpStateMigrating;
     volatile FlowUpdateEvent* hot = contract_hot_flow_table + ev.flow_id;
     hot->version = ev.version;
     hot->epoch = ev.epoch;
@@ -4034,10 +4123,18 @@ __device__ inline void persistent_contract_poll_assigned_shard(
     hot->dpu_ts_ns = ev.dpu_ts_ns;
     contract_hot_flow_versions[ev.flow_id] = ev.version;
     contract_hot_flow_epochs[ev.flow_id] = ev.epoch;
+    if (ev.dpu_ts_ns != 0u) {
+      ctrl->last_contract_dpu_ts_ns = ev.dpu_ts_ns;
+    }
 
     if (ev.flow_id < static_cast<uint32_t>(max_streams)) {
       volatile PersistentDeviceStreamState* sv = streams + ev.flow_id;
-      if (i32_load(&sv->active) != 0) {
+      if (poisoned || migrating) {
+        persistent_contract_pause_stream(sv);
+        u64_add(
+            poisoned ? &ctrl->contract_poll_poison_events : &ctrl->contract_poll_migration_events,
+            1u);
+      } else if (i32_load(&sv->active) != 0) {
         if (ev.src_port != 0u) {
           sv->source_port = ev.src_port;
           sv->source_port_mode = 1u;
@@ -4138,6 +4235,7 @@ __global__ void persistent_dataplane_kernel(
     persistent_contract_poll_assigned_shard(
         ctrl,
         streams,
+        run_flag_dev,
         contract_update_ring,
         contract_ring_head,
         contract_ring_tail,
@@ -4148,6 +4246,8 @@ __global__ void persistent_dataplane_kernel(
         contract_ring_slots_per_shard,
         contract_hot_flow_capacity,
         max_streams,
+        cfg.contract_stale_ttl_ns,
+        cfg.contract_heartbeat_timeout_ns,
         lane);
     bool produced = false;
     int active_streams = i32_load(&ctrl->active_streams);
@@ -4218,12 +4318,14 @@ __global__ void persistent_dataplane_kernel(
       int direct_released_for_stream_lane = 0;
       int direct_enqueued_for_stream_lane = 0;
       int direct_packet_qids[kTokenReserveChunkPerLane];
+      PersistentRingSlot* direct_packet_slots[kTokenReserveChunkPerLane];
       int direct_packet_count = 0;
       PersistentRingSlot* publish_slots[kTokenReserveChunkPerLane];
       int publish_count = 0;
       #pragma unroll
       for (int pi = 0; pi < static_cast<int>(kTokenReserveChunkPerLane); ++pi) {
         direct_packet_qids[pi] = -1;
+        direct_packet_slots[pi] = nullptr;
         publish_slots[pi] = nullptr;
       }
 
@@ -4327,15 +4429,18 @@ __global__ void persistent_dataplane_kernel(
         if (slot_len_u > 0u && doca_gpu_txq_handles && doca_txq_mkeys_be && q >= 0 && q < queue_count) {
           const uint64_t gpu_txq_handle = doca_gpu_txq_handles[static_cast<size_t>(q)];
           const uint32_t mkey_be = doca_txq_mkeys_be[static_cast<size_t>(q)];
+          if (!persistent_slot_transition(&slot, 2, 1, ctrl)) {
+            persistent_contract_stop_kernel(ctrl, run_flag_dev);
+            return;
+          }
           if (persistent_doca_kernel_try_enqueue(gpu_txq_handle, mkey_be, slot_payload, slot_len_u)) {
-            slot.state = 0;
-            slot.len = 0;
-            slot.stream_id = 0;
-            slot.stream_slot = -1;
-            slot.protocol = 0;
-            slot.tx_timestamp_ns = 0u;
+            if (!persistent_slot_transition(&slot, 1, 3, ctrl)) {
+              persistent_contract_stop_kernel(ctrl, run_flag_dev);
+              return;
+            }
             if (direct_packet_count < static_cast<int>(kTokenReserveChunkPerLane)) {
               direct_packet_qids[direct_packet_count] = q;
+              direct_packet_slots[direct_packet_count] = &slot;
               direct_packet_count += 1;
             }
             direct_enqueued_for_stream_lane += 1;
@@ -4346,7 +4451,13 @@ __global__ void persistent_dataplane_kernel(
         }
         if (doca_gpu_txq_handles && doca_txq_mkeys_be) {
           // Direct-DOCA mode is fail-fast: no host fallback in this path.
-          slot.state = 0;
+          if (slot.state == 1) {
+            (void)persistent_slot_transition(&slot, 1, 0, ctrl);
+          } else if (slot.state == 2) {
+            (void)persistent_slot_transition(&slot, 2, 0, ctrl);
+          } else {
+            slot.state = 0;
+          }
           slot.len = 0;
           slot.stream_id = 0;
           slot.stream_slot = -1;
@@ -4401,6 +4512,23 @@ __global__ void persistent_dataplane_kernel(
               atomicExch((int*)run_flag_dev, 0);
             }
             return;
+          }
+        }
+        #pragma unroll
+        for (int pi = 0; pi < static_cast<int>(kTokenReserveChunkPerLane); ++pi) {
+          PersistentRingSlot* done_slot = direct_packet_slots[pi];
+          if (pi < direct_packet_count && done_slot) {
+            if (persistent_slot_transition(done_slot, 3, 4, ctrl)) {
+              done_slot->len = 0;
+              done_slot->stream_id = 0;
+              done_slot->stream_slot = -1;
+              done_slot->protocol = 0;
+              done_slot->tx_timestamp_ns = 0u;
+              (void)persistent_slot_transition(done_slot, 4, 0, ctrl);
+            } else {
+              persistent_contract_stop_kernel(ctrl, run_flag_dev);
+              return;
+            }
           }
         }
         direct_sent_for_stream_lane += direct_enqueued_for_stream_lane;
@@ -5397,12 +5525,27 @@ inline bool persistent_launch_kernel() {
     }
   }
   {
+    auto env_u64_local = [](const char* name, uint64_t defv) -> uint64_t {
+      const char* v = std::getenv(name);
+      if (!v || !*v) {
+        return defv;
+      }
+      try {
+        return static_cast<uint64_t>(std::stoull(v));
+      } catch (...) {
+        return defv;
+      }
+    };
     PersistentKernelStaticConfig cfg{};
     cfg.queue_count = rt.queue_count;
     cfg.ring_slots = rt.ring_slots;
     cfg.max_streams = kPersistentMaxStreams;
     cfg.queue_probe_span = rt.ctrl->queue_probe_span;
     cfg.max_packet_bytes = rt.max_packet_bytes;
+    cfg.contract_stale_ttl_ns = env_u64_local("SAMURAI_GPU_CONTRACT_STALE_TTL_NS", 0u);
+    cfg.contract_heartbeat_timeout_ns =
+        env_u64_local("SAMURAI_GPU_CONTRACT_HEARTBEAT_TIMEOUT_NS", 0u);
+    rt.ctrl->host_time_ns = now_ns_steady();
     if (cudaMemcpyToSymbol(
             g_persistent_kernel_static_cfg,
             &cfg,
@@ -5478,6 +5621,7 @@ inline void persistent_monitor_loop() {
     if (!rt.ctrl) {
       continue;
     }
+    rt.ctrl->host_time_ns = now_ns_steady();
     if (rt.doca_kernel_direct_tx && rt.ctrl->run == 0) {
       rt.threads_running.store(false, std::memory_order_relaxed);
       break;
@@ -6683,10 +6827,31 @@ extern "C" int samurai_gpu_packet_contract_publish_flow_update_v1(
   const uint64_t prev_version = cr.hot_flow_versions[static_cast<size_t>(flow_id)];
   if (prev_version != 0u && ev.version > (prev_version + 2u)) {
     cr.version_gap_count += 1u;
+    cr.resync_request_count += 1u;
+    if (rt.ctrl) {
+      rt.ctrl->contract_poll_version_gap_events += 1u;
+      rt.ctrl->contract_resync_requests += 1u;
+    }
+  }
+  const bool poisoned = ev.tcp_state == 255u;
+  const bool migrating = ev.tcp_state == 250u;
+  if (poisoned) {
+    cr.poison_event_count += 1u;
+    if (rt.ctrl) {
+      rt.ctrl->contract_poll_poison_events += 1u;
+    }
+  } else if (migrating) {
+    cr.migration_event_count += 1u;
+    if (rt.ctrl) {
+      rt.ctrl->contract_poll_migration_events += 1u;
+    }
   }
   cr.hot_flow_table[static_cast<size_t>(flow_id)] = ev;
   cr.hot_flow_versions[static_cast<size_t>(flow_id)] = ev.version;
   cr.hot_flow_epochs[static_cast<size_t>(flow_id)] = ev.epoch;
+  if (rt.ctrl && ev.dpu_ts_ns != 0u) {
+    rt.ctrl->last_contract_dpu_ts_ns = ev.dpu_ts_ns;
+  }
   cr.publish_count += 1u;
   if (!persistent_contract_runtime_sync_device_slot_unlocked(
           cr,
@@ -6699,7 +6864,17 @@ extern "C" int samurai_gpu_packet_contract_publish_flow_update_v1(
   if (flow_id < static_cast<uint32_t>(kPersistentMaxStreams) && rt.streams && rt.streams_dev && rt.streams_hot_dev) {
     const int slot_id = static_cast<int>(flow_id);
     PersistentDeviceStreamState& d = rt.streams[static_cast<size_t>(slot_id)];
-    if (d.active != 0) {
+    if (poisoned || migrating) {
+      d.active = 0;
+      d.quota = 0;
+      d.quota_left = 0;
+      if (!persistent_stream_copy_slot_to_device(rt, slot_id)) {
+        return set_c_api_error("failed to sync contract pause into stream state");
+      }
+      if (!persistent_sync_hot_stream_slot(rt, slot_id)) {
+        return set_c_api_error("failed to sync contract pause into hot stream table");
+      }
+    } else if (d.active != 0) {
       if (ev.proto == 1u || ev.proto == 6u || ev.proto == 17u) {
         d.protocol = static_cast<int32_t>(ev.proto);
       }
@@ -6723,6 +6898,22 @@ extern "C" int samurai_gpu_packet_contract_publish_flow_update_v1(
       }
     }
   }
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_contract_heartbeat_v1(uint64_t dpu_ts_ns) {
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  if (!persistent_runtime_ensure_started_unlocked()) {
+    return set_c_api_error("persistent runtime is not available");
+  }
+  PersistentRuntime& rt = g_persistent_runtime;
+  if (!rt.ctrl) {
+    return set_c_api_error("persistent runtime control is not available");
+  }
+  const uint64_t now = now_ns_steady();
+  rt.ctrl->host_time_ns = now;
+  rt.ctrl->last_contract_dpu_ts_ns = dpu_ts_ns != 0u ? dpu_ts_ns : now;
   g_samurai_gpu_packet_last_error.clear();
   return 0;
 }
@@ -7217,6 +7408,22 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << (rt_active ? g_persistent_runtime.ctrl->contract_poll_inactive_flow : 0u) << ","
         << "\"contract_kernel_poll_stale_events\":"
         << (rt_active ? g_persistent_runtime.ctrl->contract_poll_stale_events : 0u) << ","
+        << "\"contract_kernel_poll_version_gap_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_version_gap_events : 0u) << ","
+        << "\"contract_resync_requests\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_resync_requests : 0u) << ","
+        << "\"contract_kernel_poll_poison_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_poison_events : 0u) << ","
+        << "\"contract_kernel_poll_migration_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_migration_events : 0u) << ","
+        << "\"contract_stale_ttl_pause_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_stale_ttl_pause_events : 0u) << ","
+        << "\"contract_heartbeat_lost_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_heartbeat_lost_events : 0u) << ","
+        << "\"tx_ownership_invalid_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->tx_ownership_invalid_events : 0u) << ","
+        << "\"tx_ownership_transitions\":"
+        << (rt_active ? g_persistent_runtime.ctrl->tx_ownership_transitions : 0u) << ","
         << "\"compat_fallback_count\":" << g_compat_fallback_count.load(std::memory_order_relaxed) << ","
         << "\"persistent_tx_backend\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.active) << "\","
         << "\"persistent_doca_kernel_direct_tx\":"
@@ -7238,7 +7445,10 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << "\"contract_flow_update_published\":" << g_persistent_contract_runtime.publish_count << ","
         << "\"contract_ring_drop_events\":" << g_persistent_contract_runtime.drop_count << ","
         << "\"contract_version_gap_events\":" << g_persistent_contract_runtime.version_gap_count << ","
+        << "\"contract_resync_request_events\":" << g_persistent_contract_runtime.resync_request_count << ","
         << "\"contract_epoch_mismatch_events\":" << g_persistent_contract_runtime.epoch_mismatch_count << ","
+        << "\"contract_poison_events\":" << g_persistent_contract_runtime.poison_event_count << ","
+        << "\"contract_migration_events\":" << g_persistent_contract_runtime.migration_event_count << ","
         << "\"contract_device_mirror_active\":"
         << (g_persistent_contract_runtime.device_mirror_initialized ? 1 : 0) << ","
         << "\"contract_device_sync_error_events\":" << g_persistent_contract_runtime.device_sync_error_count
