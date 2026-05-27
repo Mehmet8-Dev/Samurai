@@ -475,6 +475,26 @@ bool PublishDpuFlowUpdate(
   return true;
 }
 
+bool PublishDpuHeartbeat(
+    void* gpu_push,
+    std::uint64_t dpu_ts_ns,
+    std::uint64_t correlation_id,
+    const std::string& job_id) {
+  if (!gpu_push) {
+    return false;
+  }
+  std::vector<std::uint8_t> payload(sizeof(dpu_ts_ns));
+  std::memcpy(payload.data(), &dpu_ts_ns, sizeof(dpu_ts_ns));
+  const int rc = SendFrame(gpu_push,
+                           static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
+                           correlation_id,
+                           samurai::wire::WorkerKind::GPU,
+                           job_id,
+                           payload,
+                           ZMQ_DONTWAIT);
+  return rc >= 0;
+}
+
 DocaFlowUpdateEventV1 ToDocaFlowUpdate(const samurai::wire::FlowUpdateEventV1& ev) {
   DocaFlowUpdateEventV1 out{};
   out.version = ev.version;
@@ -1028,6 +1048,7 @@ int main(int argc, char** argv) {
                             header.correlation_id,
                             samurai::wire::WorkerKind::DOCA,
                             job_id);
+            (void)PublishDpuHeartbeat(gpu_push, now_ns, header.correlation_id, job_id);
             last_hb_ns = now_ns;
           }
           if (now_ns - last_metric_ns >= 2'000'000'000ull) {

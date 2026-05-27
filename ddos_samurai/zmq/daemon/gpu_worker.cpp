@@ -30,6 +30,7 @@ constexpr std::uint64_t kDefaultGatewayMac = 0xFFFFFFFFFFFFull;
 using fn_generate_packets_t = int (*)(std::int64_t, const char*, std::int64_t, const char*, int, const char*, std::int64_t, int, std::int64_t, std::uint64_t, std::uint64_t, const char*, std::uint8_t**, std::size_t*, int*);
 using fn_generate_icmp_packets_t = int (*)(std::int64_t, const char*, const char*, int, int, std::int64_t, std::int64_t, std::int64_t, std::uint64_t, std::uint64_t, const char*, std::uint8_t**, std::size_t*, int*);
 using fn_contract_publish_flow_update_t = int (*)(const samurai::wire::FlowUpdateEventV1*);
+using fn_contract_heartbeat_t = int (*)(std::uint64_t);
 using fn_contract_export_region_t = int (*)(char*, std::size_t);
 using fn_set_kernel_mode_t = int (*)(int);
 using fn_start_stream_t = int (*)(const char*, std::int64_t*);
@@ -43,6 +44,7 @@ struct GpuNativeApi {
   fn_generate_packets_t generate_packets{nullptr};
   fn_generate_icmp_packets_t generate_icmp_packets{nullptr};
   fn_contract_publish_flow_update_t contract_publish_flow_update{nullptr};
+  fn_contract_heartbeat_t contract_heartbeat{nullptr};
   fn_contract_export_region_t contract_export_region{nullptr};
   fn_set_kernel_mode_t set_kernel_mode{nullptr};
   fn_start_stream_t start_stream{nullptr};
@@ -115,6 +117,8 @@ bool LoadGpuNative(GpuNativeApi& api, std::string& err) {
   api.generate_icmp_packets = reinterpret_cast<fn_generate_icmp_packets_t>(dlsym(api.handle, "samurai_gpu_packet_generate_icmp_packets"));
   api.contract_publish_flow_update = reinterpret_cast<fn_contract_publish_flow_update_t>(
       dlsym(api.handle, "samurai_gpu_packet_contract_publish_flow_update_v1"));
+  api.contract_heartbeat = reinterpret_cast<fn_contract_heartbeat_t>(
+      dlsym(api.handle, "samurai_gpu_packet_contract_heartbeat_v1"));
   api.contract_export_region = reinterpret_cast<fn_contract_export_region_t>(
       dlsym(api.handle, "samurai_gpu_packet_contract_export_region_v1"));
   api.set_kernel_mode = reinterpret_cast<fn_set_kernel_mode_t>(dlsym(api.handle, "samurai_gpu_packet_set_kernel_mode"));
@@ -343,26 +347,26 @@ bool UpsertFlowStreamFromStreamUpsert(
   if (!cfg.enabled) {
     return true;
   }
-  const bool poison = upsert.tcp_state == 255u;
-  if (!EnsureFlowLifecycleSymbols(api, poison, err)) {
+  const bool inactive_transition = upsert.tcp_state == 255u || upsert.tcp_state == 250u;
+  if (!EnsureFlowLifecycleSymbols(api, inactive_transition, err)) {
     return false;
   }
   const std::string target_ip = ReadStreamTargetIp(upsert);
-  if (target_ip.empty() && !poison) {
+  if (target_ip.empty() && !inactive_transition) {
     err = "gpu_flow_stream_upsert_target_ip_required";
     return false;
   }
-  if (upsert.proto != 1u && upsert.dst_port == 0u && !poison) {
+  if (upsert.proto != 1u && upsert.dst_port == 0u && !inactive_transition) {
     err = "gpu_flow_update_target_port_required";
     return false;
   }
 
   auto it = flow_streams.find(upsert.flow_id);
-  if (poison) {
+  if (inactive_transition) {
     if (it != flow_streams.end()) {
       if (api.stop_stream(it->second) != 0) {
         err = NativeLastError(api);
-        if (err.empty()) err = "gpu_flow_update_stop_stream_failed";
+        if (err.empty()) err = "gpu_flow_update_pause_stream_failed";
         return false;
       }
       flow_streams.erase(it);
@@ -405,25 +409,25 @@ bool UpsertFlowStreamFromEvent(
   if (!cfg.enabled) {
     return true;
   }
-  const bool poison = event.tcp_state == 255u;
-  if (!EnsureFlowLifecycleSymbols(api, poison, err)) {
+  const bool inactive_transition = event.tcp_state == 255u || event.tcp_state == 250u;
+  if (!EnsureFlowLifecycleSymbols(api, inactive_transition, err)) {
     return false;
   }
   if (cfg.require_target_ip && cfg.target_ip.empty()) {
     err = "gpu_flow_update_target_ip_required";
     return false;
   }
-  if (event.proto != 1u && event.dst_port == 0u && !poison) {
+  if (event.proto != 1u && event.dst_port == 0u && !inactive_transition) {
     err = "gpu_flow_update_target_port_required";
     return false;
   }
 
   auto it = flow_streams.find(event.flow_id);
-  if (poison) {
+  if (inactive_transition) {
     if (it != flow_streams.end()) {
       if (api.stop_stream(it->second) != 0) {
         err = NativeLastError(api);
-        if (err.empty()) err = "gpu_flow_update_stop_stream_failed";
+        if (err.empty()) err = "gpu_flow_update_pause_stream_failed";
         return false;
       }
       flow_streams.erase(it);
@@ -748,6 +752,51 @@ int main(int argc, char** argv) {
           samurai::wire::WorkerKind::GPU,
           job_id,
           std::vector<std::uint8_t>(stopped.begin(), stopped.end()));
+      continue;
+    }
+
+    if (msg_type == samurai::wire::MessageType::HEARTBEAT) {
+      std::uint64_t dpu_ts_ns = samurai_pacing_monotonic_now_ns();
+      if (payload_len == sizeof(std::uint64_t)) {
+        std::memcpy(&dpu_ts_ns, payload_ptr, sizeof(dpu_ts_ns));
+      }
+      zmq_msg_close(&msg);
+      std::string native_err;
+      if (!LoadGpuNative(api, native_err)) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError(native_err));
+        continue;
+      }
+      if (!api.contract_heartbeat) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError("gpu_native_contract_heartbeat_symbol_missing"));
+        continue;
+      }
+      if (api.contract_heartbeat(dpu_ts_ns) != 0) {
+        std::string err = NativeLastError(api);
+        if (err.empty()) {
+          err = "gpu_contract_heartbeat_failed";
+        }
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError(err));
+        continue;
+      }
+      (void)SendAck(push, header.correlation_id, job_id);
       continue;
     }
 
