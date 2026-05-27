@@ -1870,6 +1870,23 @@ inline uint8_t* persistent_contract_region_base(PersistentContractRuntime& cr) {
   return static_cast<uint8_t*>(cr.export_region_host);
 }
 
+inline std::string persistent_contract_export_region_spec(
+    const std::string& path,
+    const PersistentContractRegionLayout& layout,
+    size_t shard_count,
+    size_t ring_slots_per_shard,
+    size_t hot_flow_capacity) {
+  std::ostringstream oss;
+  oss << "layout=1"
+      << ",file=" << path
+      << ",size=" << layout.total_bytes
+      << ",shards=" << shard_count
+      << ",slots=" << ring_slots_per_shard
+      << ",hot=" << hot_flow_capacity
+      << ",event=" << sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1);
+  return oss.str();
+}
+
 inline void persistent_contract_store_event_slot(
     volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* dst,
     const ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1& ev) {
@@ -1983,7 +2000,12 @@ inline bool persistent_contract_runtime_alloc_device_mirror_unlocked(
   cr.export_region_bytes = layout.total_bytes;
   cr.export_region_fd = fd;
   cr.export_region_path = path;
-  cr.export_region_spec = std::string("file=") + path + ",size=" + std::to_string(layout.total_bytes);
+  cr.export_region_spec = persistent_contract_export_region_spec(
+      path,
+      layout,
+      shard_count_s,
+      static_cast<size_t>(cr.ring_slots_per_shard),
+      hot_flow_capacity_s);
   cr.export_region_registered = true;
   cr.export_region_file_backed = true;
   auto* dev_u8 = static_cast<uint8_t*>(dev_base);

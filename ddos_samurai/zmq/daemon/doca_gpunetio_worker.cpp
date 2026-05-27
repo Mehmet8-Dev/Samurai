@@ -104,16 +104,53 @@ std::optional<int> OptionalIntFromWire(std::uint64_t raw) {
   return static_cast<int>(raw);
 }
 
-std::string DefaultGpuContractExportSpec() {
+std::uint32_t EnvContractU32(const char* name, std::uint32_t default_value, std::uint32_t min_value) {
+  const char* raw = std::getenv(name);
+  if (!raw || !*raw) {
+    return default_value;
+  }
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(raw, &end, 10);
+  if (end == raw || (end != nullptr && *end != '\0') || parsed < min_value || parsed > UINT32_MAX) {
+    return default_value;
+  }
+  return static_cast<std::uint32_t>(parsed);
+}
+
+std::string GpuContractExportSpecWithLayout(
+    const std::string& base,
+    std::uint32_t shard_count,
+    std::uint32_t ring_slots_per_shard,
+    std::uint32_t hot_flow_capacity) {
+  return base + ",layout=1,shards=" + std::to_string(shard_count) +
+      ",slots=" + std::to_string(ring_slots_per_shard) +
+      ",hot=" + std::to_string(hot_flow_capacity) +
+      ",event=" + std::to_string(sizeof(DocaFlowUpdateEventV1));
+}
+
+std::string DefaultGpuContractExportSpec(
+    std::uint32_t shard_count,
+    std::uint32_t ring_slots_per_shard,
+    std::uint32_t hot_flow_capacity) {
   if (const char* raw = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_SPEC")) {
     if (*raw) return std::string(raw);
   }
   if (const char* raw = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_PATH")) {
-    if (*raw) return std::string("file=") + raw;
+    if (*raw) {
+      return GpuContractExportSpecWithLayout(
+          std::string("file=") + raw,
+          shard_count,
+          ring_slots_per_shard,
+          hot_flow_capacity);
+    }
   }
   const char* dir = (::access("/dev/shm", W_OK) == 0) ? "/dev/shm" : "/tmp";
-  return std::string("file=") + dir + "/samurai_gpu_contract_" +
-      std::to_string(static_cast<long long>(::getuid())) + ".bin";
+  return GpuContractExportSpecWithLayout(
+      std::string("file=") + dir + "/samurai_gpu_contract_" +
+          std::to_string(static_cast<long long>(::getuid())) + ".bin",
+      shard_count,
+      ring_slots_per_shard,
+      hot_flow_capacity);
 }
 
 PacketConfig ConfigFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
@@ -449,12 +486,17 @@ bool OpenDpuContractRdmaWriter(
     err = "dpu_contract_rdma_writer_unavailable";
     return false;
   }
-  const std::string effective_region_spec = region_spec.empty() ? DefaultGpuContractExportSpec() : region_spec;
+  DocaContractWriterConfigV1 cfg{};
+  cfg.shard_count = EnvContractU32("SAMURAI_GPU_CONTRACT_SHARDS", 1u, 1u);
+  cfg.ring_slots_per_shard = EnvContractU32("SAMURAI_GPU_CONTRACT_RING_SLOTS", 1024u, 64u);
+  cfg.hot_flow_capacity = EnvContractU32("SAMURAI_GPU_CONTRACT_HOT_FLOW_CAPACITY", 4096u, 1u);
+  const std::string effective_region_spec = region_spec.empty()
+      ? DefaultGpuContractExportSpec(cfg.shard_count, cfg.ring_slots_per_shard, cfg.hot_flow_capacity)
+      : region_spec;
   if (effective_region_spec.empty()) {
     err = "dpu_contract_rdma_spec_required";
     return false;
   }
-  DocaContractWriterConfigV1 cfg{};
   std::memcpy(
       cfg.region_spec,
       effective_region_spec.c_str(),
@@ -463,14 +505,6 @@ bool OpenDpuContractRdmaWriter(
       cfg.device_name,
       device.c_str(),
       std::min(device.size(), sizeof(cfg.device_name) - 1u));
-  cfg.shard_count = static_cast<std::uint32_t>(std::max(1, std::atoi(
-      std::getenv("SAMURAI_GPU_CONTRACT_SHARDS") ? std::getenv("SAMURAI_GPU_CONTRACT_SHARDS") : "1")));
-  cfg.ring_slots_per_shard = static_cast<std::uint32_t>(std::max(64, std::atoi(
-      std::getenv("SAMURAI_GPU_CONTRACT_RING_SLOTS") ? std::getenv("SAMURAI_GPU_CONTRACT_RING_SLOTS") : "1024")));
-  cfg.hot_flow_capacity = static_cast<std::uint32_t>(std::max(1, std::atoi(
-      std::getenv("SAMURAI_GPU_CONTRACT_HOT_FLOW_CAPACITY")
-          ? std::getenv("SAMURAI_GPU_CONTRACT_HOT_FLOW_CAPACITY")
-          : "4096")));
   char native_err[160];
   native_err[0] = '\0';
   int handle = -1;

@@ -367,21 +367,26 @@ inline bool parse_u64_text(const std::string& raw, uint64_t* out) {
   return true;
 }
 
+struct ContractRegionSpec {
+  uintptr_t addr = 0u;
+  std::string file{};
+  size_t size = 0u;
+  uint32_t layout_version = 0u;
+  uint32_t shard_count = 0u;
+  uint32_t ring_slots_per_shard = 0u;
+  uint32_t hot_flow_capacity = 0u;
+  size_t event_size = 0u;
+};
+
 inline bool parse_contract_region_spec(
     const std::string& raw,
-    uintptr_t* out_addr,
-    std::string* out_file,
-    size_t* out_size,
+    ContractRegionSpec* out,
     std::string* why) {
-  if (out_addr) {
-    *out_addr = 0u;
+  if (!out) {
+    if (why) *why = "contract region output spec is null";
+    return false;
   }
-  if (out_file) {
-    out_file->clear();
-  }
-  if (out_size) {
-    *out_size = 0u;
-  }
+  *out = ContractRegionSpec{};
   const std::string spec = trim_copy(raw);
   if (spec.empty()) {
     if (why) *why = "contract region spec is empty";
@@ -398,16 +403,14 @@ inline bool parse_contract_region_spec(
       if (why) *why = "invalid contract addr region spec";
       return false;
     }
-    if (out_addr) {
-      *out_addr = static_cast<uintptr_t>(addr);
-    }
-    if (sep != std::string::npos && out_size) {
+    out->addr = static_cast<uintptr_t>(addr);
+    if (sep != std::string::npos) {
       uint64_t parsed_size = 0u;
       if (!parse_u64_text(spec.substr(sep + 1u), &parsed_size) || parsed_size == 0u) {
         if (why) *why = "invalid contract addr size";
         return false;
       }
-      *out_size = static_cast<size_t>(parsed_size);
+      out->size = static_cast<size_t>(parsed_size);
     }
     return true;
   }
@@ -416,8 +419,8 @@ inline bool parse_contract_region_spec(
     const std::string token = trim_copy(token_raw);
     const size_t eq = token.find('=');
     if (eq == std::string::npos) {
-      if (token.rfind("file:", 0) == 0 && out_file) {
-        *out_file = token.substr(5u);
+      if (token.rfind("file:", 0) == 0) {
+        out->file = token.substr(5u);
         continue;
       }
       if (why) *why = "invalid contract region token: " + token;
@@ -431,28 +434,57 @@ inline bool parse_contract_region_spec(
         if (why) *why = "invalid contract addr value";
         return false;
       }
-      if (out_addr) {
-        *out_addr = static_cast<uintptr_t>(addr);
-      }
+      out->addr = static_cast<uintptr_t>(addr);
     } else if (key == "file" || key == "path") {
-      if (out_file) {
-        *out_file = value;
-      }
+      out->file = value;
     } else if (key == "size" || key == "len") {
       uint64_t parsed_size = 0u;
       if (!parse_u64_text(value, &parsed_size) || parsed_size == 0u) {
         if (why) *why = "invalid contract region size";
         return false;
       }
-      if (out_size) {
-        *out_size = static_cast<size_t>(parsed_size);
+      out->size = static_cast<size_t>(parsed_size);
+    } else if (key == "layout" || key == "layout_version") {
+      uint64_t v = 0u;
+      if (!parse_u64_text(value, &v) || v == 0u || v > UINT32_MAX) {
+        if (why) *why = "invalid contract layout version";
+        return false;
       }
+      out->layout_version = static_cast<uint32_t>(v);
+    } else if (key == "shards" || key == "shard_count") {
+      uint64_t v = 0u;
+      if (!parse_u64_text(value, &v) || v == 0u || v > UINT32_MAX) {
+        if (why) *why = "invalid contract shard count";
+        return false;
+      }
+      out->shard_count = static_cast<uint32_t>(v);
+    } else if (key == "slots" || key == "ring_slots" || key == "ring_slots_per_shard") {
+      uint64_t v = 0u;
+      if (!parse_u64_text(value, &v) || v == 0u || v > UINT32_MAX) {
+        if (why) *why = "invalid contract ring slot count";
+        return false;
+      }
+      out->ring_slots_per_shard = static_cast<uint32_t>(v);
+    } else if (key == "hot" || key == "hot_flows" || key == "hot_flow_capacity") {
+      uint64_t v = 0u;
+      if (!parse_u64_text(value, &v) || v == 0u || v > UINT32_MAX) {
+        if (why) *why = "invalid contract hot-flow capacity";
+        return false;
+      }
+      out->hot_flow_capacity = static_cast<uint32_t>(v);
+    } else if (key == "event" || key == "event_size") {
+      uint64_t v = 0u;
+      if (!parse_u64_text(value, &v) || v == 0u) {
+        if (why) *why = "invalid contract event size";
+        return false;
+      }
+      out->event_size = static_cast<size_t>(v);
     } else {
       if (why) *why = "unknown contract region key: " + key;
       return false;
     }
   }
-  if ((!out_addr || *out_addr == 0u) && (!out_file || out_file->empty())) {
+  if (out->addr == 0u && out->file.empty()) {
     if (why) *why = "contract region requires addr= or file=";
     return false;
   }
@@ -2089,14 +2121,32 @@ extern "C" int samurai_doca_backend_contract_writer_open(
     return -1;
   }
 
-  uintptr_t addr = 0u;
-  std::string file_path;
-  size_t spec_size = 0u;
-  if (!parse_contract_region_spec(cfg->region_spec, &addr, &file_path, &spec_size, &why)) {
+  ContractRegionSpec spec{};
+  if (!parse_contract_region_spec(cfg->region_spec, &spec, &why)) {
     write_err(err, err_len, why.empty() ? "invalid contract region spec" : why);
     return -1;
   }
-  if (spec_size != 0u && spec_size < layout.total_bytes) {
+  if (spec.layout_version != 0u && spec.layout_version != 1u) {
+    write_err(err, err_len, "contract region layout version mismatch");
+    return -1;
+  }
+  if (spec.shard_count != 0u && spec.shard_count != cfg->shard_count) {
+    write_err(err, err_len, "contract region shard count mismatch");
+    return -1;
+  }
+  if (spec.ring_slots_per_shard != 0u && spec.ring_slots_per_shard != cfg->ring_slots_per_shard) {
+    write_err(err, err_len, "contract region ring slot count mismatch");
+    return -1;
+  }
+  if (spec.hot_flow_capacity != 0u && spec.hot_flow_capacity != cfg->hot_flow_capacity) {
+    write_err(err, err_len, "contract region hot-flow capacity mismatch");
+    return -1;
+  }
+  if (spec.event_size != 0u && spec.event_size != sizeof(BackendContractFlowUpdateSlot)) {
+    write_err(err, err_len, "contract region event size mismatch");
+    return -1;
+  }
+  if (spec.size != 0u && spec.size < layout.total_bytes) {
     write_err(err, err_len, "contract region spec size is smaller than required layout");
     return -1;
   }
@@ -2105,10 +2155,10 @@ extern "C" int samurai_doca_backend_contract_writer_open(
   writer->shard_count = cfg->shard_count;
   writer->ring_slots_per_shard = cfg->ring_slots_per_shard;
   writer->hot_flow_capacity = cfg->hot_flow_capacity;
-  writer->region_len = spec_size != 0u ? spec_size : layout.total_bytes;
+  writer->region_len = spec.size != 0u ? spec.size : layout.total_bytes;
 
-  if (!file_path.empty()) {
-    const int fd = ::open(file_path.c_str(), O_RDWR | O_CLOEXEC);
+  if (!spec.file.empty()) {
+    const int fd = ::open(spec.file.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
       write_err(err, err_len, std::string("contract region file open failed: ") + std::strerror(errno));
       return -1;
@@ -2125,7 +2175,7 @@ extern "C" int samurai_doca_backend_contract_writer_open(
       write_err(err, err_len, "contract region file is smaller than required layout");
       return -1;
     }
-    writer->region_len = spec_size != 0u ? spec_size : static_cast<size_t>(st.st_size);
+    writer->region_len = spec.size != 0u ? spec.size : static_cast<size_t>(st.st_size);
     void* mapped = ::mmap(nullptr, writer->region_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) {
       const std::string msg = std::string("contract region mmap failed: ") + std::strerror(errno);
@@ -2137,7 +2187,7 @@ extern "C" int samurai_doca_backend_contract_writer_open(
     writer->owns_mapping = true;
     writer->fd = fd;
   } else {
-    writer->region = reinterpret_cast<void*>(addr);
+    writer->region = reinterpret_cast<void*>(spec.addr);
     writer->owns_mapping = false;
     writer->fd = -1;
   }
