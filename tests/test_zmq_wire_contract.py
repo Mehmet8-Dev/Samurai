@@ -425,5 +425,120 @@ int main() {{
     assert run.returncode == 0, run.stderr
 
 
+def test_dpu_state_runtime_header_executes_tcp_edge_policy_smoke() -> None:
+    cxx = shutil.which("g++") or shutil.which("clang++")
+    if not cxx:
+        pytest.skip("No C++ compiler found")
+
+    root = Path(__file__).resolve().parents[1]
+    hdr = root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp"
+    source = f"""
+#include \"{hdr}\"
+#include <cstdint>
+#include <stdexcept>
+
+int main() {{
+  samurai::dpu::FlowStateTable table;
+  samurai::dpu::FlowState st{{}};
+  st.flow_id = 77;
+  st.src_ip = 0x0a000001u;
+  st.dst_ip = 0x0a000002u;
+  st.src_port = 40000;
+  st.dst_port = 443;
+  st.seq_num = 1000;
+  st.ack_num = 900;
+  st.tcp_state = samurai::dpu::kTcpStateEstablished;
+  st.flags = samurai::dpu::kTcpFlagAck;
+  st.proto = samurai::dpu::kProtoTcp;
+  table.Upsert(st);
+  table.TrackTransmitBatch(77, 1000, 100, samurai::dpu::kTcpFlagAck, 4, 100, 1000000);
+
+  samurai::dpu::TcpSegmentObservation dup{{}};
+  dup.src_ip = 0x0a000002u;
+  dup.dst_ip = 0x0a000001u;
+  dup.src_port = 443;
+  dup.dst_port = 40000;
+  dup.seq = 900;
+  dup.ack = 1000;
+  dup.flags = samurai::dpu::kTcpFlagAck;
+  dup.window = 4096;
+  samurai::dpu::TcpSegmentObservation synack = dup;
+  synack.flags = samurai::dpu::kTcpFlagSyn | samurai::dpu::kTcpFlagAck;
+  synack.sack_permitted = true;
+  table.ObserveTcpSegment(77, synack, 1500000);
+  dup.sack_block_count = 1;
+  dup.sack_blocks[0] = {{1100, 1300}};
+  table.ObserveTcpSegment(77, dup, 2000000);
+  table.ObserveTcpSegment(77, dup, 3000000);
+  const samurai::dpu::FlowState& fast = table.ObserveTcpSegment(77, dup, 4000000);
+  const samurai::dpu::TcpControlBlock* tcb = table.FindTcb(77);
+  if (!tcb || !tcb->retransmit_pending || tcb->retransmit_seq != 1000u ||
+      tcb->retransmit_len != 100u || fast.seq_num != 1000u) return 1;
+  bool saw_sacked = false;
+  for (const auto& entry : tcb->retransmit_queue) {{
+    if (entry.seq == 1100u && entry.sacked && !entry.acked) saw_sacked = true;
+  }}
+  if (!saw_sacked) return 2;
+
+  samurai::dpu::TcpSegmentObservation ecn = dup;
+  ecn.ecn_ce = true;
+  table.ObserveTcpSegment(77, ecn, 5000000);
+  tcb = table.FindTcb(77);
+  if (!tcb || !tcb->ecn_capable || !tcb->ecn_echo_pending || !tcb->cwr_pending) return 3;
+
+  table.ApplyPacketTooBig(77, 1200);
+  tcb = table.FindTcb(77);
+  if (!tcb || tcb->mss != 1160u) return 4;
+
+  const samurai::dpu::FlowState& closing = table.InitiateClose(77, 6000000);
+  if (closing.tcp_state != samurai::dpu::kTcpStateFinWait ||
+      (closing.flags & samurai::dpu::kTcpFlagFin) == 0u) return 5;
+
+  table.Listen(200, 0x0a000010u, 443, 1, 1, false);
+  samurai::dpu::TcpSegmentObservation syn{{}};
+  syn.src_ip = 0x0a000011u;
+  syn.dst_ip = 0x0a000010u;
+  syn.src_port = 51000;
+  syn.dst_port = 443;
+  syn.seq = 7;
+  syn.flags = samurai::dpu::kTcpFlagSyn;
+  syn.window = 4096;
+  table.AcceptPassiveOpen(200, 201, syn, 9000, 7000000);
+  bool overflowed = false;
+  syn.src_port = 51001;
+  try {{
+    table.AcceptPassiveOpen(200, 202, syn, 9100, 8000000);
+  }} catch (const std::overflow_error&) {{
+    overflowed = true;
+  }}
+  if (!overflowed) return 6;
+  const samurai::dpu::TcpListenSocket* listener = table.FindListenSocket(200);
+  if (!listener || listener->backlog_drop_count != 1u) return 7;
+
+  table.Listen(210, 0x0a000020u, 443, 1, 1, true);
+  syn.dst_ip = 0x0a000020u;
+  syn.src_port = 52000;
+  table.AcceptPassiveOpen(210, 211, syn, 9200, 9000000);
+  syn.src_port = 52001;
+  table.AcceptPassiveOpen(210, 212, syn, 9300, 10000000);
+  listener = table.FindListenSocket(210);
+  if (!listener || listener->syn_cookie_issued_count != 1u) return 8;
+  return 0;
+}}
+"""
+    with tempfile.TemporaryDirectory(prefix="samurai-dpu-state-edge-") as td:
+        out_bin = Path(td) / "dpu_state_runtime_edge_test"
+        proc = subprocess.run(
+            [cxx, "-std=c++17", "-x", "c++", "-", "-o", str(out_bin)],
+            input=source,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        run = subprocess.run([str(out_bin)], capture_output=True, text=True, check=False)
+    assert run.returncode == 0, run.stderr
+
+
 def test_magic_constant_stable() -> None:
     assert SAMURAI_WIRE_MAGIC == 0x534D5249

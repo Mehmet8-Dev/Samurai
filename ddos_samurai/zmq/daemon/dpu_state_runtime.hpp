@@ -47,6 +47,7 @@ inline constexpr std::uint64_t kTcpTimeWaitNs = 120'000'000'000ull;
 inline constexpr std::size_t kTcpMaxRetransmitEntries = 256u;
 inline constexpr std::size_t kTcpMaxOutOfOrderSegments = 64u;
 inline constexpr std::size_t kTcpMaxSackBlocks = 4u;
+inline constexpr std::uint32_t kTcpDefaultListenBacklog = 4096u;
 inline constexpr std::uint32_t kGpuStreamPolicyTemplateValid = 0x80000000u;
 inline constexpr std::uint32_t kGpuStreamPolicyRetransmit = 0x40000000u;
 inline constexpr std::uint32_t kGpuStreamPolicyZeroWindowProbe = 0x20000000u;
@@ -167,8 +168,10 @@ struct TcpSegmentObservation {
   std::uint32_t seq{0};
   std::uint32_t ack{0};
   std::uint16_t flags{0};
+  std::uint8_t ip_tos{0};
   std::uint16_t window{0};
   std::uint32_t payload_len{0};
+  bool ecn_ce{false};
   bool has_mss{false};
   std::uint16_t mss{0};
   bool has_window_scale{false};
@@ -189,6 +192,7 @@ struct TcpRetransmitEntry {
   std::uint64_t last_tx_ns{0};
   std::uint32_t retransmits{0};
   bool acked{false};
+  bool sacked{false};
 };
 
 struct TcpOutOfOrderSegment {
@@ -220,7 +224,12 @@ struct TcpControlBlock {
   bool fast_recovery{false};
   bool zero_window{false};
   bool retransmit_pending{false};
+  std::uint32_t retransmit_seq{0};
+  std::uint32_t retransmit_len{0};
   bool zero_window_probe_pending{false};
+  bool ecn_capable{false};
+  bool ecn_echo_pending{false};
+  bool cwr_pending{false};
   std::uint64_t invalid_ack_count{0};
   std::uint64_t old_segment_count{0};
   std::uint64_t out_of_order_drop_count{0};
@@ -233,6 +242,14 @@ struct TcpControlBlock {
   std::uint64_t time_wait_deadline_ns{0};
   std::deque<TcpRetransmitEntry> retransmit_queue{};
   std::vector<TcpOutOfOrderSegment> out_of_order{};
+};
+
+struct TcpListenSocket {
+  std::uint32_t backlog_limit{kTcpDefaultListenBacklog};
+  std::uint32_t pending_children{0};
+  bool syn_cookies_enabled{true};
+  std::uint64_t backlog_drop_count{0};
+  std::uint64_t syn_cookie_issued_count{0};
 };
 
 struct GpuStreamPolicy {
@@ -286,6 +303,8 @@ inline bool ParseTcpSegmentObservation(
     return false;
   }
   TcpSegmentObservation obs{};
+  obs.ip_tos = packet[ip_off + 1u];
+  obs.ecn_ce = (obs.ip_tos & 0x03u) == 0x03u;
   obs.src_ip = ReadBe32(packet + ip_off + 12u);
   obs.dst_ip = ReadBe32(packet + ip_off + 16u);
   obs.src_port = ReadBe16(packet + tcp_off);
@@ -373,6 +392,9 @@ class FlowStateTable {
     auto [out, _inserted] = flows_.insert_or_assign(next.flow_id, next);
     RegisterFlowKeys(out->second);
     EnsureTcb(out->second);
+    if (out->second.tcp_state == kTcpStateListen) {
+      listen_sockets_.try_emplace(out->second.flow_id);
+    }
     return out->second;
   }
 
@@ -392,6 +414,11 @@ class FlowStateTable {
     auto [out, _inserted] = flows_.insert_or_assign(next.flow_id, next);
     RegisterFlowKeys(out->second);
     EnsureTcb(out->second);
+    if (out->second.tcp_state == kTcpStateListen) {
+      listen_sockets_.try_emplace(out->second.flow_id);
+    } else if (out->second.tcp_state == kTcpStateClosed || out->second.tcp_state == kTcpStatePoisoned) {
+      ReleasePassiveChild(out->second.flow_id);
+    }
     return out->second;
   }
 
@@ -479,7 +506,9 @@ class FlowStateTable {
       std::uint32_t flow_id,
       std::uint32_t local_ip,
       std::uint16_t local_port,
-      std::uint64_t epoch = 1u) {
+      std::uint64_t epoch = 1u,
+      std::uint32_t backlog_limit = kTcpDefaultListenBacklog,
+      bool syn_cookies_enabled = true) {
     FlowState st{};
     st.flow_id = flow_id;
     st.src_ip = local_ip;
@@ -490,7 +519,11 @@ class FlowStateTable {
     st.tcp_state = kTcpStateListen;
     st.flags = 0u;
     st.epoch = epoch;
-    return Upsert(st);
+    FlowState& out = Upsert(st);
+    TcpListenSocket& listener = listen_sockets_[flow_id];
+    listener.backlog_limit = backlog_limit == 0u ? 1u : backlog_limit;
+    listener.syn_cookies_enabled = syn_cookies_enabled;
+    return out;
   }
 
   FlowState& AcceptPassiveOpen(
@@ -505,6 +538,19 @@ class FlowStateTable {
     }
     if ((syn.flags & kTcpFlagSyn) == 0u || (syn.flags & kTcpFlagAck) != 0u) {
       throw std::invalid_argument("passive open requires inbound SYN");
+    }
+    TcpListenSocket& listen = listen_sockets_[listen_flow_id];
+    if (listen.backlog_limit == 0u) {
+      listen.backlog_limit = kTcpDefaultListenBacklog;
+    }
+    const TcpFlowKey child_key{listener->src_ip, syn.src_ip, listener->src_port, syn.src_port, kProtoTcp};
+    if (pending_open_by_key_.find(child_key) == pending_open_by_key_.end() &&
+        listen.pending_children >= listen.backlog_limit) {
+      if (!listen.syn_cookies_enabled) {
+        listen.backlog_drop_count += 1u;
+        throw std::overflow_error("passive open backlog full");
+      }
+      listen.syn_cookie_issued_count += 1u;
     }
     FlowState child{};
     child.flow_id = child_flow_id;
@@ -521,6 +567,11 @@ class FlowStateTable {
     child.epoch = listener->epoch;
     child.proto = kProtoTcp;
     FlowState& out = Upsert(child);
+    if (pending_open_by_key_.find(child_key) == pending_open_by_key_.end()) {
+      listen.pending_children += 1u;
+      pending_open_by_key_[child_key] = child_flow_id;
+      child_to_listener_[child_flow_id] = listen_flow_id;
+    }
     TcpControlBlock& tcb = EnsureTcb(out);
     tcb.iss = iss;
     tcb.snd_una = iss;
@@ -553,12 +604,14 @@ class FlowStateTable {
     TcpControlBlock& tcb = EnsureTcb(next);
     ApplyPeerOptions(tcb, seg);
     UpdatePeerWindow(tcb, seg, now_ns);
+    ApplyEcnSignal(tcb, seg);
     if ((seg.flags & kTcpFlagRst) != 0u) {
       next.tcp_state = kTcpStatePoisoned;
       next.flags = kTcpFlagRst;
       next.poisoned = true;
       next.migrating = false;
       next.last_ack_ts = now_ns;
+      ReleasePassiveChild(next.flow_id);
     } else {
       const std::uint32_t seg_end = SegmentEndSeq(seg);
       ApplyReceiveOrdering(tcb, seg, seg_end);
@@ -578,6 +631,7 @@ class FlowStateTable {
                  TcpSeqAfterEq(seg.ack, tcb.snd_nxt)) {
         next.tcp_state = kTcpStateEstablished;
         next.flags = kTcpFlagAck;
+        ReleasePassiveChild(next.flow_id);
       } else if ((seg.flags & kTcpFlagFin) != 0u) {
         if (next.tcp_state == kTcpStateFinWait) {
           next.tcp_state = kTcpStateTimeWait;
@@ -590,11 +644,20 @@ class FlowStateTable {
                  TcpSeqAfterEq(seg.ack, tcb.snd_nxt)) {
         next.tcp_state = kTcpStateClosed;
         next.flags = 0u;
+        ReleasePassiveChild(next.flow_id);
       } else if (next.tcp_state != kTcpStatePoisoned) {
         next.tcp_state = kTcpStateEstablished;
         next.flags = kTcpFlagAck | (((seg.flags & kTcpFlagPsh) != 0u) ? kTcpFlagPsh : 0u);
       }
-      next.seq_num = tcb.fast_recovery ? tcb.snd_una : tcb.snd_nxt;
+      if (tcb.ecn_echo_pending) {
+        next.flags |= kTcpFlagEce;
+      }
+      if (tcb.cwr_pending) {
+        next.flags |= kTcpFlagCwr;
+      }
+      next.seq_num = tcb.retransmit_pending && tcb.retransmit_seq != 0u
+          ? tcb.retransmit_seq
+          : (tcb.fast_recovery ? tcb.snd_una : tcb.snd_nxt);
       next.ack_num = tcb.rcv_nxt;
       next.rtt_us = static_cast<std::uint32_t>(
           std::min<std::uint64_t>(tcb.srtt_us != 0u ? tcb.srtt_us : next.rtt_us, 0xFFFFFFFFull));
@@ -740,9 +803,9 @@ class FlowStateTable {
       tcb.fast_recovery = false;
       tcb.rto_ns = std::min<std::uint64_t>(kTcpMaxRtoNs, std::max<std::uint64_t>(kTcpMinRtoNs, tcb.rto_ns * 2u));
       tcb.next_rto_deadline_ns = now_ns + tcb.rto_ns;
-      MarkOldestRetransmit(tcb, now_ns);
+      MarkNextRetransmit(tcb, now_ns);
       tcb.retransmit_pending = true;
-      next.seq_num = tcb.snd_una;
+      next.seq_num = tcb.retransmit_seq != 0u ? tcb.retransmit_seq : tcb.snd_una;
       next.flags = kTcpFlagAck | ((next.tcp_state == kTcpStateEstablished) ? kTcpFlagPsh : 0u);
       changed = true;
     }
@@ -779,9 +842,58 @@ class FlowStateTable {
     tcb.mss = std::min<std::uint32_t>(tcb.peer_mss, TcpClampMssFromPmtu(tcb.pmtu));
   }
 
+  FlowState& ApplyPacketTooBig(std::uint32_t flow_id, std::uint32_t pmtu) {
+    auto it = flows_.find(flow_id);
+    if (it == flows_.end()) {
+      throw std::out_of_range("unknown dpu flow_id");
+    }
+    FlowState next = it->second;
+    TcpControlBlock& tcb = EnsureTcb(next);
+    tcb.pmtu = std::max<std::uint32_t>(pmtu, 576u);
+    tcb.mss = std::min<std::uint32_t>(tcb.peer_mss, TcpClampMssFromPmtu(tcb.pmtu));
+    tcb.cwnd_bytes = std::max<std::uint32_t>(2u * tcb.mss, std::min<std::uint32_t>(tcb.cwnd_bytes, tcb.mss * 4u));
+    next.version = NextCommittedVersion(it->second.version);
+    EraseFlowKeys(it->second);
+    auto [out, _inserted] = flows_.insert_or_assign(flow_id, next);
+    RegisterFlowKeys(out->second);
+    return out->second;
+  }
+
+  FlowState& InitiateClose(std::uint32_t flow_id, std::uint64_t now_ns) {
+    auto it = flows_.find(flow_id);
+    if (it == flows_.end()) {
+      throw std::out_of_range("unknown dpu flow_id");
+    }
+    FlowState next = it->second;
+    TcpControlBlock& tcb = EnsureTcb(next);
+    if (next.tcp_state == kTcpStateEstablished || next.tcp_state == kTcpStateSynReceived) {
+      next.tcp_state = kTcpStateFinWait;
+      next.flags = static_cast<std::uint16_t>(kTcpFlagFin | kTcpFlagAck);
+    } else if (next.tcp_state == kTcpStateCloseWait) {
+      next.tcp_state = kTcpStateLastAck;
+      next.flags = static_cast<std::uint16_t>(kTcpFlagFin | kTcpFlagAck);
+    } else if (next.tcp_state == kTcpStateClosed || next.tcp_state == kTcpStateTimeWait) {
+      return it->second;
+    } else {
+      next.flags = kTcpFlagAck;
+    }
+    next.seq_num = tcb.snd_nxt;
+    next.last_tx_ts = now_ns;
+    next.version = NextCommittedVersion(it->second.version);
+    EraseFlowKeys(it->second);
+    auto [out, _inserted] = flows_.insert_or_assign(flow_id, next);
+    RegisterFlowKeys(out->second);
+    return out->second;
+  }
+
   const TcpControlBlock* FindTcb(std::uint32_t flow_id) const {
     auto it = tcbs_.find(flow_id);
     return it == tcbs_.end() ? nullptr : &it->second;
+  }
+
+  const TcpListenSocket* FindListenSocket(std::uint32_t flow_id) const {
+    auto it = listen_sockets_.find(flow_id);
+    return it == listen_sockets_.end() ? nullptr : &it->second;
   }
 
   std::uint32_t ClampPayloadToMss(std::uint32_t flow_id, std::uint32_t desired_payload_len) const {
@@ -844,6 +956,9 @@ class FlowStateTable {
     if (retransmit) {
       policy.retransmit = true;
       policy.quota = 1u;
+      if (tcb->retransmit_len != 0u) {
+        policy.payload_len = static_cast<std::uint16_t>(std::min<std::uint32_t>(tcb->retransmit_len, 0xFFFFu));
+      }
       policy.template_id |= kGpuStreamPolicyRetransmit;
     }
     return policy;
@@ -914,6 +1029,23 @@ class FlowStateTable {
     flow_lookup_[TcpFlowKey{st.dst_ip, st.src_ip, st.dst_port, st.src_port, st.proto}] = st.flow_id;
   }
 
+  void ReleasePassiveChild(std::uint32_t child_flow_id) {
+    auto child_it = child_to_listener_.find(child_flow_id);
+    if (child_it == child_to_listener_.end()) {
+      return;
+    }
+    const std::uint32_t listen_flow_id = child_it->second;
+    child_to_listener_.erase(child_it);
+    auto flow_it = flows_.find(child_flow_id);
+    if (flow_it != flows_.end()) {
+      pending_open_by_key_.erase(ForwardKeyFromState(flow_it->second));
+    }
+    auto listen_it = listen_sockets_.find(listen_flow_id);
+    if (listen_it != listen_sockets_.end() && listen_it->second.pending_children > 0u) {
+      listen_it->second.pending_children -= 1u;
+    }
+  }
+
   static std::uint32_t SegmentEndSeq(const TcpSegmentObservation& seg) {
     return seg.seq + seg.payload_len +
         (((seg.flags & kTcpFlagSyn) != 0u) ? 1u : 0u) +
@@ -929,14 +1061,21 @@ class FlowStateTable {
     return false;
   }
 
-  static void MarkOldestRetransmit(TcpControlBlock& tcb, std::uint64_t now_ns) {
+  static bool MarkNextRetransmit(TcpControlBlock& tcb, std::uint64_t now_ns) {
     for (TcpRetransmitEntry& entry : tcb.retransmit_queue) {
-      if (!entry.acked) {
+      if (!entry.acked && !entry.sacked) {
         entry.last_tx_ns = now_ns;
         entry.retransmits += 1u;
-        return;
+        tcb.retransmit_seq = entry.seq;
+        tcb.retransmit_len = entry.len;
+        tcb.retransmit_pending = true;
+        return true;
       }
     }
+    tcb.retransmit_seq = 0u;
+    tcb.retransmit_len = 0u;
+    tcb.retransmit_pending = false;
+    return false;
   }
 
   static void ApplyPeerOptions(TcpControlBlock& tcb, const TcpSegmentObservation& seg) {
@@ -951,10 +1090,37 @@ class FlowStateTable {
       if (seg.sack_permitted) {
         tcb.sack_permitted = true;
       }
+      if ((seg.flags & kTcpFlagEce) != 0u || (seg.flags & kTcpFlagCwr) != 0u) {
+        tcb.ecn_capable = true;
+      }
     }
     if (seg.has_timestamp) {
       tcb.timestamp_enabled = true;
       tcb.ts_recent = seg.tsval;
+    }
+  }
+
+  static void CongestionOnEcn(TcpControlBlock& tcb) {
+    if (!tcb.ecn_capable) {
+      tcb.ecn_capable = true;
+    }
+    if (!tcb.cwr_pending) {
+      tcb.ssthresh_bytes = std::max<std::uint32_t>(2u * tcb.mss, tcb.cwnd_bytes / 2u);
+      tcb.cwnd_bytes = tcb.ssthresh_bytes;
+      tcb.cwr_pending = true;
+    }
+  }
+
+  static void ApplyEcnSignal(TcpControlBlock& tcb, const TcpSegmentObservation& seg) {
+    if (seg.ecn_ce) {
+      tcb.ecn_echo_pending = true;
+      CongestionOnEcn(tcb);
+    }
+    if ((seg.flags & kTcpFlagEce) != 0u) {
+      CongestionOnEcn(tcb);
+    }
+    if ((seg.flags & kTcpFlagCwr) != 0u) {
+      tcb.ecn_echo_pending = false;
     }
   }
 
@@ -1048,6 +1214,7 @@ class FlowStateTable {
     for (TcpRetransmitEntry& entry : tcb.retransmit_queue) {
       if (!entry.acked && TcpSeqAfterEq(ack, entry.end_seq)) {
         entry.acked = true;
+        entry.sacked = false;
         advanced = true;
         if (entry.retransmits == 0u && now_ns > entry.first_tx_ns) {
           UpdateRto(tcb, (now_ns - entry.first_tx_ns) / 1000ull);
@@ -1070,8 +1237,8 @@ class FlowStateTable {
         continue;
       }
       for (TcpRetransmitEntry& entry : tcb.retransmit_queue) {
-        if (!entry.acked && TcpSeqAfterEq(left, entry.seq) && TcpSeqBeforeEq(right, entry.end_seq)) {
-          entry.acked = true;
+        if (!entry.acked && TcpSeqBeforeEq(left, entry.seq) && TcpSeqAfterEq(right, entry.end_seq)) {
+          entry.sacked = true;
         }
       }
     }
@@ -1096,7 +1263,7 @@ class FlowStateTable {
       tcb.ssthresh_bytes = std::max<std::uint32_t>(2u * tcb.mss, tcb.cwnd_bytes / 2u);
       tcb.cwnd_bytes = tcb.ssthresh_bytes + (3u * tcb.mss);
       tcb.fast_recovery = true;
-      MarkOldestRetransmit(tcb, 0u);
+      MarkNextRetransmit(tcb, 0u);
     } else if (tcb.fast_recovery) {
       tcb.cwnd_bytes += tcb.mss;
     }
@@ -1113,9 +1280,17 @@ class FlowStateTable {
       tcb.last_ack = seg.ack;
       tcb.dup_ack_count = 0u;
       tcb.retransmit_pending = false;
+      tcb.retransmit_seq = 0u;
+      tcb.retransmit_len = 0u;
       tcb.zero_window_probe_pending = false;
+      if ((seg.flags & kTcpFlagCwr) != 0u) {
+        tcb.ecn_echo_pending = false;
+      }
       (void)AckRetransmitQueue(tcb, seg.ack, now_ns);
       CongestionOnNewAck(tcb);
+      if (tcb.cwr_pending && TcpSeqAfterEq(seg.ack, tcb.snd_nxt)) {
+        tcb.cwr_pending = false;
+      }
       tcb.next_rto_deadline_ns = HasUnackedData(tcb) ? now_ns + tcb.rto_ns : 0u;
     } else if (seg.ack == tcb.snd_una) {
       CongestionOnDuplicateAck(tcb);
@@ -1124,6 +1299,9 @@ class FlowStateTable {
 
   std::unordered_map<std::uint32_t, FlowState> flows_{};
   std::unordered_map<std::uint32_t, TcpControlBlock> tcbs_{};
+  std::unordered_map<std::uint32_t, TcpListenSocket> listen_sockets_{};
+  std::unordered_map<std::uint32_t, std::uint32_t> child_to_listener_{};
+  std::unordered_map<TcpFlowKey, std::uint32_t, TcpFlowKeyHash> pending_open_by_key_{};
   std::unordered_map<TcpFlowKey, std::uint32_t, TcpFlowKeyHash> flow_lookup_{};
 };
 
