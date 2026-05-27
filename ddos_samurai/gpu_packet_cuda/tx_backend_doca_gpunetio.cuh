@@ -5,7 +5,7 @@
 
 #define SAMURAI_DOCA_GPUNETIO_API_DECLS 1
 
-constexpr int kDocaGpuNetioApiVersion = 4;
+constexpr int kDocaGpuNetioApiVersion = 5;
 
 struct DocaGpuNetioStats {
   uint64_t tx_packets = 0u;
@@ -96,6 +96,24 @@ struct DocaGpuNetioApiV1 {
   int (*contract_writer_publish_flow_update_v1)(
       int handle,
       const DocaFlowUpdateEventV1* event,
+      char* err,
+      size_t err_len) = nullptr;
+  int (*create_rxq)(
+      const char* iface,
+      const char* device_name,
+      int gpu_id,
+      int queue_id,
+      int* out_handle,
+      char* err,
+      size_t err_len) = nullptr;
+  int (*destroy_rxq)(int handle, char* err, size_t err_len) = nullptr;
+  int (*receive_burst)(
+      int handle,
+      uint8_t* out_packets_flat,
+      uint32_t out_packets_flat_len,
+      uint16_t* out_lengths,
+      int max_packets,
+      int* out_received,
       char* err,
       size_t err_len) = nullptr;
 };

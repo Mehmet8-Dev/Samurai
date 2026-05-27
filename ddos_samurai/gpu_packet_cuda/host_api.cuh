@@ -1390,6 +1390,9 @@ struct PersistentDeviceStreamState {
   uint32_t ramp_max_quota = 0;
   uint32_t ramp_epoch_counter = 0;
   uint32_t seq_counter = 0;
+  uint32_t tcp_ack_counter = 0;
+  uint8_t tcp_state = 0;
+  uint8_t _tcp_state_pad[3]{0, 0, 0};
   uint32_t produced = 0;
   uint32_t completed = 0;
   uint32_t queue_cursor = 0;
@@ -1418,6 +1421,7 @@ struct PersistentDeviceStreamState {
   uint32_t template_base_dst_ip = 0;
   uint32_t template_base_tcp_seq = 0;
   uint32_t template_base_tcp_ack = 0;
+  uint16_t template_base_tcp_flags = 0;
   uint8_t template_valid = 0;
   uint8_t template_packet[kPersistentMaxPacketBytes]{};
 };
@@ -1449,6 +1453,9 @@ struct PersistentStreamState {
   uint16_t tcp_flags = 0x02;
   uint16_t tcp_window = 65535;
   uint16_t source_port = 0;
+  uint32_t tcp_seq = 0;
+  uint32_t tcp_ack = 0;
+  uint8_t tcp_state = 0;
   int icmp_type = 8;
   int icmp_code = 0;
   uint32_t base_quota = 0;
@@ -3330,6 +3337,7 @@ inline void persistent_build_stream_template(volatile PersistentDeviceStreamStat
   sv->template_base_dst_ip = r32(out, ip + 16);
   sv->template_base_tcp_seq = is_tcp ? r32(out, t_off + 4) : 0u;
   sv->template_base_tcp_ack = is_tcp ? r32(out, t_off + 8) : 0u;
+  sv->template_base_tcp_flags = is_tcp ? r16(out, t_off + 12) : 0u;
   sv->template_valid = 1;
 }
 
@@ -3563,12 +3571,20 @@ __device__ inline void persistent_write_packet(
 
     if (is_tcp) {
       w16(t_off_t + 0, src_port);
-      const uint32_t tcp_seq = seq * 2654435761u;
+      const uint32_t tcp_seq = seq;
+      const uint32_t tcp_ack = sv->tcp_ack_counter;
       w32(t_off_t + 4, tcp_seq);
+      w32(t_off_t + 8, tcp_ack);
+      payload[t_off_t + 13] = static_cast<uint8_t>(sv->tcp_flags & 0xFFu);
+      const uint16_t tcp_flags_word =
+          static_cast<uint16_t>((static_cast<uint16_t>(payload[t_off_t + 12]) << 8) |
+                                static_cast<uint16_t>(payload[t_off_t + 13]));
       uint16_t tcp_csum = sv->template_base_l4_csum;
       tcp_csum = persistent_rfc1624_update_dword(tcp_csum, sv->template_base_src_ip, src_ip);
       tcp_csum = persistent_rfc1624_update_word(tcp_csum, sv->template_base_src_port, src_port);
       tcp_csum = persistent_rfc1624_update_dword(tcp_csum, sv->template_base_tcp_seq, tcp_seq);
+      tcp_csum = persistent_rfc1624_update_dword(tcp_csum, sv->template_base_tcp_ack, tcp_ack);
+      tcp_csum = persistent_rfc1624_update_word(tcp_csum, sv->template_base_tcp_flags, tcp_flags_word);
       w16(t_off_t + 16, tcp_csum);
     } else if (is_udp) {
       w16(t_off_t + 0, src_port);
@@ -3649,8 +3665,8 @@ __device__ inline void persistent_write_packet(
   if (is_tcp) {
     w16(t_off + 0, src_port);
     w16(t_off + 2, sv->target_port);
-    w32(t_off + 4, seq * 2654435761u);
-    w32(t_off + 8, 0u);
+    w32(t_off + 4, seq);
+    w32(t_off + 8, sv->tcp_ack_counter);
     payload[t_off + 12] = 0x50;  // TCP header len 20 bytes
     payload[t_off + 13] = static_cast<uint8_t>(sv->tcp_flags & 0xFFu);
     w16(t_off + 14, sv->tcp_window);
@@ -4143,6 +4159,8 @@ __device__ inline void persistent_contract_poll_assigned_shard(
           sv->tcp_flags = ev.flags;
         }
         sv->seq_counter = ev.tcp_seq;
+        sv->tcp_ack_counter = ev.tcp_ack;
+        sv->tcp_state = ev.tcp_state;
       } else {
         u64_add(&ctrl->contract_poll_inactive_flow, 1u);
       }
@@ -4307,12 +4325,20 @@ __global__ void persistent_dataplane_kernel(
       affinity_q = __shfl_sync(warp_mask, affinity_q, 0);
       sid = __shfl_sync(warp_mask, sid, 0);
       uint32_t packet_seq_base = 0u;
+      uint32_t packet_seq_advance = 1u;
       if (lane == 0u) {
+        if (sv->protocol == 6) {
+          const uint32_t control_advance =
+              ((sv->tcp_flags & 0x01u) != 0u ? 1u : 0u) +
+              ((sv->tcp_flags & 0x02u) != 0u ? 1u : 0u);
+          packet_seq_advance = static_cast<uint32_t>(sv->payload_len) + control_advance;
+        }
         packet_seq_base = atomicAdd(
             (unsigned int*)&sv->seq_counter,
-            reserved_tokens);
+            reserved_tokens * packet_seq_advance);
       }
       packet_seq_base = __shfl_sync(warp_mask, packet_seq_base, 0);
+      packet_seq_advance = __shfl_sync(warp_mask, packet_seq_advance, 0);
       int produced_for_stream_lane = 0;
       int direct_sent_for_stream_lane = 0;
       int direct_released_for_stream_lane = 0;
@@ -4330,8 +4356,8 @@ __global__ void persistent_dataplane_kernel(
       }
 
       for (uint32_t token_i = lane; token_i < reserved_tokens; token_i += kWarpWidth) {
-        const uint32_t packet_seq = packet_seq_base + token_i + 1u;
-        const uint32_t route_seed = packet_seq ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
+        const uint32_t packet_seq = packet_seq_base + (token_i * packet_seq_advance);
+        const uint32_t route_seed = (packet_seq + token_i + 1u) ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
         int q_base = affinity_q;
         if (q_base < 0 || q_base >= queue_count) {
           q_base = queue_pow2
@@ -6203,6 +6229,9 @@ inline std::string stream_state_to_json(const PersistentStreamState& st) {
       << "\"queue_affinity\":" << st.queue_affinity << ","
       << "\"source_port\":" << st.source_port << ","
       << "\"source_port_mode\":" << static_cast<int>(st.source_port_mode) << ","
+      << "\"tcp_seq\":" << st.tcp_seq << ","
+      << "\"tcp_ack\":" << st.tcp_ack << ","
+      << "\"tcp_state\":" << static_cast<int>(st.tcp_state) << ","
       << "\"icmp_type\":" << st.icmp_type << ","
       << "\"icmp_code\":" << st.icmp_code << ","
       << "\"payload_len\":" << st.payload_len << ","
@@ -6889,6 +6918,8 @@ extern "C" int samurai_gpu_packet_contract_publish_flow_update_v1(
         d.tcp_flags = ev.flags;
       }
       d.seq_counter = ev.tcp_seq;
+      d.tcp_ack_counter = ev.tcp_ack;
+      d.tcp_state = ev.tcp_state;
       persistent_build_stream_template(&d);
       if (!persistent_stream_copy_slot_to_device(rt, slot_id)) {
         return set_c_api_error("failed to sync flow update into stream state");
@@ -7048,6 +7079,9 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
       clamp_i(json_get_int(profile, "source_port_mode", (st.source_port > 0 ? 1 : 0)), 0, 1));
   st.tcp_flags = static_cast<uint16_t>(clamp_i(json_get_int(profile, "tcp_flags", 0x02), 0, 255));
   st.tcp_window = static_cast<uint16_t>(clamp_i(json_get_int(profile, "window", 65535), 0, 65535));
+  st.tcp_seq = static_cast<uint32_t>(json_get_u64(profile, "tcp_seq", 0u));
+  st.tcp_ack = static_cast<uint32_t>(json_get_u64(profile, "tcp_ack", 0u));
+  st.tcp_state = static_cast<uint8_t>(clamp_i(json_get_int(profile, "tcp_state", 0), 0, 255));
   st.icmp_type = clamp_i(json_get_int(profile, "icmp_type", 8), 0, 255);
   st.icmp_code = clamp_i(json_get_int(profile, "icmp_code", 0), 0, 255);
   st.pcap_file = json_get_string(profile, "pcap_file", std::string());
@@ -7106,6 +7140,9 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   d.source_port_mode = st.source_port_mode;
   d.tcp_flags = st.tcp_flags;
   d.tcp_window = st.tcp_window;
+  d.seq_counter = st.tcp_seq;
+  d.tcp_ack_counter = st.tcp_ack;
+  d.tcp_state = st.tcp_state;
   d.icmp_type = st.icmp_type;
   d.icmp_code = st.icmp_code;
   d.payload_len = st.payload_len;
@@ -7235,6 +7272,13 @@ extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* u
       json_get_int(st.update_json, "window", static_cast<int>(st.tcp_window)), 0, 65535));
   d.tcp_flags = st.tcp_flags;
   d.tcp_window = st.tcp_window;
+  st.tcp_seq = static_cast<uint32_t>(json_get_u64(st.update_json, "tcp_seq", st.tcp_seq));
+  st.tcp_ack = static_cast<uint32_t>(json_get_u64(st.update_json, "tcp_ack", st.tcp_ack));
+  st.tcp_state = static_cast<uint8_t>(clamp_i(
+      json_get_int(st.update_json, "tcp_state", static_cast<int>(st.tcp_state)), 0, 255));
+  d.seq_counter = st.tcp_seq;
+  d.tcp_ack_counter = st.tcp_ack;
+  d.tcp_state = st.tcp_state;
   st.icmp_type = clamp_i(json_get_int(st.update_json, "icmp_type", st.icmp_type), 0, 255);
   st.icmp_code = clamp_i(json_get_int(st.update_json, "icmp_code", st.icmp_code), 0, 255);
   d.icmp_type = st.icmp_type;
