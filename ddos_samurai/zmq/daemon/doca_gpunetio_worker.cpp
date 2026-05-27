@@ -148,6 +148,28 @@ bool EnvBool(const char* name, bool default_value) {
   return v == "1" || v == "true" || v == "on" || v == "yes";
 }
 
+std::uint32_t ParseIpv4HostOrder(const std::string& ip) {
+  unsigned int a = 0, b = 0, c = 0, d = 0;
+  char tail = '\0';
+  if (std::sscanf(ip.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4 ||
+      a > 255u || b > 255u || c > 255u || d > 255u) {
+    return 0u;
+  }
+  return (a << 24u) | (b << 16u) | (c << 8u) | d;
+}
+
+std::string Ipv4ToString(std::uint32_t ip) {
+  char buf[32];
+  std::snprintf(buf,
+                sizeof(buf),
+                "%u.%u.%u.%u",
+                static_cast<unsigned int>((ip >> 24u) & 0xFFu),
+                static_cast<unsigned int>((ip >> 16u) & 0xFFu),
+                static_cast<unsigned int>((ip >> 8u) & 0xFFu),
+                static_cast<unsigned int>(ip & 0xFFu));
+  return std::string(buf);
+}
+
 std::string GpuContractExportSpecWithLayout(
     const std::string& base,
     std::uint32_t shard_count,
@@ -579,7 +601,7 @@ samurai::wire::FlowStreamUpsertV1 BuildFlowStreamUpsert(
   ev.tx_ipg_ns = env.ipg_ns;
   ev.dpu_ts_ns = dpu_ts_ns;
   std::memset(ev.target_ip, 0, sizeof(ev.target_ip));
-  const std::string target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
+  const std::string target_ip = st.dst_ip != 0u ? Ipv4ToString(st.dst_ip) : ReadFixed(env.target_ip, sizeof(env.target_ip));
   std::memcpy(ev.target_ip, target_ip.c_str(), std::min(target_ip.size(), sizeof(ev.target_ip) - 1u));
   ev.payload_len = static_cast<std::uint16_t>(
       env.has_payload != 0u ? std::min<std::uint32_t>(env.pad_size, 1460u) : 0u);
@@ -867,6 +889,65 @@ bool PollDpuTcpRxFeedback(
   return true;
 }
 
+bool WaitForDpuPassiveOpen(
+    DocaRxqGuard& rxq,
+    samurai::dpu::FlowStateTable& dpu_state,
+    std::uint32_t listen_flow_id,
+    std::uint32_t child_flow_id,
+    std::uint32_t local_ip,
+    std::uint16_t local_port,
+    std::uint64_t timeout_ns,
+    samurai::dpu::FlowState& out_flow,
+    std::string& err) {
+  if (!rxq.bridge || rxq.handle <= 0 || !rxq.bridge->api.receive_burst) {
+    err = "dpu_passive_open_rxq_required";
+    return false;
+  }
+  constexpr int kMaxRxPackets = 32;
+  constexpr std::size_t kMaxPacket = 2048u;
+  std::vector<std::uint8_t> flat(kMaxPacket * static_cast<std::size_t>(kMaxRxPackets));
+  std::vector<std::uint16_t> lengths(static_cast<std::size_t>(kMaxRxPackets), 0u);
+  const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
+  while (samurai_pacing_monotonic_now_ns() - start_ns < timeout_ns) {
+    int received = 0;
+    char native_err[160];
+    native_err[0] = '\0';
+    if (rxq.bridge->api.receive_burst(
+            rxq.handle,
+            flat.data(),
+            static_cast<std::uint32_t>(flat.size()),
+            lengths.data(),
+            kMaxRxPackets,
+            &received,
+            native_err,
+            sizeof(native_err)) != 0) {
+      err = native_err[0] ? std::string(native_err) : "dpu_passive_open_receive_failed";
+      return false;
+    }
+    std::size_t off = 0u;
+    for (int i = 0; i < received; ++i) {
+      const std::size_t len = static_cast<std::size_t>(lengths[static_cast<std::size_t>(i)]);
+      if (len == 0u || off + len > flat.size()) {
+        break;
+      }
+      samurai::dpu::TcpSegmentObservation syn{};
+      if (samurai::dpu::ParseTcpSegmentObservation(flat.data() + off, len, &syn) &&
+          (syn.flags & samurai::dpu::kTcpFlagSyn) != 0u &&
+          (syn.flags & samurai::dpu::kTcpFlagAck) == 0u &&
+          syn.dst_port == local_port &&
+          (local_ip == 0u || syn.dst_ip == local_ip)) {
+        const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+        out_flow = dpu_state.AcceptPassiveOpen(listen_flow_id, child_flow_id, syn, 0u, now_ns);
+        return true;
+      }
+      off += len;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  err = "dpu_passive_open_timeout";
+  return false;
+}
+
 bool PublishDpuFlowStreamUpsert(
     void* gpu_push,
     const samurai::wire::FlowStreamUpsertV1& ev,
@@ -968,6 +1049,7 @@ int main(int argc, char** argv) {
   bool dpu_state_publish = true;
   bool dpu_contract_rdma = false;
   bool dpu_tcp_rx_feedback = EnvBool("SAMURAI_DPU_TCP_RX_FEEDBACK", false);
+  bool dpu_tcp_passive_open = EnvBool("SAMURAI_DPU_TCP_PASSIVE_OPEN", false);
   int cli_queue_id = -1;
   int cli_rx_queue_id = -1;
   int cli_gpu_id = -1;
@@ -1014,6 +1096,9 @@ int main(int argc, char** argv) {
       dpu_tcp_rx_feedback = true;
     } else if (arg == "--no-dpu-tcp-rx-feedback") {
       dpu_tcp_rx_feedback = false;
+    } else if (arg == "--dpu-tcp-passive-open") {
+      dpu_tcp_passive_open = true;
+      dpu_tcp_rx_feedback = true;
     } else if (arg == "--doca-interface" && i + 1 < argc) {
       cli_iface = argv[++i];
     } else if (arg == "--doca-device" && i + 1 < argc) {
@@ -1203,7 +1288,8 @@ int main(int argc, char** argv) {
         const int gpu_id = (cli_gpu_id >= 0)
                                ? cli_gpu_id
                                : (std::getenv("SAMURAI_GPU_DOCA_GPU_ID") ? std::atoi(std::getenv("SAMURAI_GPU_DOCA_GPU_ID")) : 0);
-        const int packet_count = std::max(1, static_cast<int>(env.packet_count));
+        const bool passive_job = dpu_tcp_passive_open && ProtoFromEnvelope(env) == samurai::dpu::kProtoTcp;
+        const int packet_count = passive_job ? 0 : std::max(1, static_cast<int>(env.packet_count));
         const int batch_size = std::max(1, cli_batch_size);
 
         char err[160];
@@ -1224,7 +1310,7 @@ int main(int argc, char** argv) {
         }
 
         DocaRxqGuard rxq{};
-        if (dpu_tcp_rx_feedback) {
+        if (dpu_tcp_rx_feedback || passive_job) {
           const int rx_queue_id = std::max(0, cli_rx_queue_id >= 0 ? cli_rx_queue_id : queue_id);
           std::string rx_err;
           if (!OpenDpuTcpRxq(doca, rxq, iface, device, gpu_id, rx_queue_id, rx_err)) {
@@ -1239,20 +1325,51 @@ int main(int argc, char** argv) {
         }
 
         PacketConfig cfg = ConfigFromEnvelope(env);
-        const auto pool = ddos_samurai::cpu_native::generate_packet_pool_view(cfg, packet_count, true, true);
-        const std::size_t stride = pool.packet_size;
-        if (stride == 0 || pool.size() < stride) {
-          (void)SendFrame(push,
-                          static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
-                          header.correlation_id,
-                          samurai::wire::WorkerKind::DOCA,
-                          job_id,
-                          JsonError("packet_pool_empty"));
-          continue;
+        ddos_samurai::cpu_native::PacketPoolBuffer pool{};
+        std::size_t stride = 0u;
+        if (!passive_job) {
+          pool = ddos_samurai::cpu_native::generate_packet_pool_view(cfg, packet_count, true, true);
+          stride = pool.packet_size;
+          if (stride == 0 || pool.size() < stride) {
+            (void)SendFrame(push,
+                            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                            header.correlation_id,
+                            samurai::wire::WorkerKind::DOCA,
+                            job_id,
+                            JsonError("packet_pool_empty"));
+            continue;
+          }
         }
 
-        const samurai::dpu::FlowState initial_flow =
-            dpu_state.Upsert(InitialFlowStateFromWirePacket(header, env, pool.data(), stride));
+        samurai::dpu::FlowState initial_flow{};
+        if (passive_job) {
+          const std::string listen_ip_s = ReadFixed(env.target_ip, sizeof(env.target_ip));
+          const std::uint32_t listen_ip = ParseIpv4HostOrder(listen_ip_s);
+          const std::uint32_t listen_flow_id = FlowIdFromHeader(header);
+          const std::uint32_t child_flow_id = listen_flow_id ^ 0x80000000u;
+          (void)dpu_state.Listen(listen_flow_id, listen_ip, env.target_port);
+          std::string passive_err;
+          if (!WaitForDpuPassiveOpen(
+                  rxq,
+                  dpu_state,
+                  listen_flow_id,
+                  child_flow_id == 0u ? 1u : child_flow_id,
+                  listen_ip,
+                  env.target_port,
+                  EnvContractU32("SAMURAI_DPU_TCP_PASSIVE_OPEN_TIMEOUT_MS", 5000u, 1u) * 1'000'000ull,
+                  initial_flow,
+                  passive_err)) {
+            (void)SendFrame(push,
+                            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                            header.correlation_id,
+                            samurai::wire::WorkerKind::DOCA,
+                            job_id,
+                            JsonError(passive_err));
+            continue;
+          }
+        } else {
+          initial_flow = dpu_state.Upsert(InitialFlowStateFromWirePacket(header, env, pool.data(), stride));
+        }
         const std::uint64_t initial_publish_ns = samurai_pacing_monotonic_now_ns();
         if (dpu_state_publish) {
           std::string publish_err;
