@@ -170,6 +170,50 @@ class DpuStateAuthority:
         self._flows[state.flow_id] = state
         return state
 
+    def complete_migration(self, flow_id: int, *, owner_epoch: int | None = None) -> DpuFlowState:
+        prev = self._require(_u32(flow_id, "flow_id"))
+        if not prev.migrating and int(prev.tcp_state) != TCP_STATE_MIGRATING:
+            raise ValueError(f"flow_id={prev.flow_id} is not migrating")
+        target_epoch = int(owner_epoch) if owner_epoch is not None else int(prev.epoch)
+        if target_epoch < int(prev.epoch):
+            raise ValueError(f"migration completion epoch rollback for flow_id={prev.flow_id}")
+        state = replace(
+            prev,
+            epoch=_u64(target_epoch, "owner_epoch"),
+            tcp_state=TCP_STATE_ESTABLISHED,
+            version=next_committed_version(prev.version),
+            poisoned=False,
+            migrating=False,
+        )
+        self._flows[state.flow_id] = state
+        return state
+
+    def resync_flow(self, snapshot: DpuFlowState) -> DpuFlowState:
+        flow_key = _u32(snapshot.flow_id, "flow_id")
+        prev = self._flows.get(flow_key)
+        if prev is not None and int(snapshot.epoch) < int(prev.epoch):
+            raise ValueError(f"resync epoch rollback for flow_id={flow_key}")
+        state = replace(
+            snapshot,
+            flow_id=flow_key,
+            seq_num=_u32(snapshot.seq_num, "seq_num"),
+            ack_num=_u32(snapshot.ack_num, "ack_num"),
+            src_port=_u16(snapshot.src_port, "src_port"),
+            dst_port=_u16(snapshot.dst_port, "dst_port"),
+            tcp_state=_u8(snapshot.tcp_state, "tcp_state"),
+            flags=_u16(snapshot.flags, "flags"),
+            rtt_us=_u32(snapshot.rtt_us, "rtt_us"),
+            last_tx_ts=_u64(snapshot.last_tx_ts, "last_tx_ts"),
+            last_ack_ts=_u64(snapshot.last_ack_ts, "last_ack_ts"),
+            epoch=_u64(snapshot.epoch, "epoch"),
+            proto=_u8(snapshot.proto, "proto"),
+            version=next_committed_version(prev.version if prev is not None else 0),
+            poisoned=int(snapshot.tcp_state) == TCP_STATE_POISONED,
+            migrating=int(snapshot.tcp_state) == TCP_STATE_MIGRATING,
+        )
+        self._flows[flow_key] = state
+        return state
+
     def poison_flow(self, flow_id: int) -> DpuFlowState:
         prev = self._require(_u32(flow_id, "flow_id"))
         state = replace(

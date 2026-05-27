@@ -93,6 +93,40 @@ class FlowStateTable {
     return out->second;
   }
 
+  FlowState& CompleteMigration(std::uint32_t flow_id, std::uint64_t owner_epoch) {
+    auto it = flows_.find(flow_id);
+    if (it == flows_.end()) {
+      throw std::out_of_range("unknown dpu flow_id");
+    }
+    if (!it->second.migrating && it->second.tcp_state != kTcpStateMigrating) {
+      throw std::invalid_argument("flow is not migrating");
+    }
+    if (owner_epoch < it->second.epoch) {
+      throw std::invalid_argument("migration completion epoch rollback");
+    }
+    FlowState next = it->second;
+    next.epoch = owner_epoch;
+    next.tcp_state = kTcpStateEstablished;
+    next.version = NextCommittedVersion(it->second.version);
+    next.migrating = false;
+    next.poisoned = false;
+    auto [out, _inserted] = flows_.insert_or_assign(flow_id, next);
+    return out->second;
+  }
+
+  FlowState& Resync(const FlowState& snapshot) {
+    auto it = flows_.find(snapshot.flow_id);
+    if (it != flows_.end() && snapshot.epoch < it->second.epoch) {
+      throw std::invalid_argument("resync epoch rollback");
+    }
+    FlowState next = snapshot;
+    next.version = NextCommittedVersion(it == flows_.end() ? 0ull : it->second.version);
+    next.poisoned = next.tcp_state == kTcpStatePoisoned;
+    next.migrating = next.tcp_state == kTcpStateMigrating;
+    auto [out, _inserted] = flows_.insert_or_assign(next.flow_id, next);
+    return out->second;
+  }
+
   FlowState& Poison(std::uint32_t flow_id) {
     auto it = flows_.find(flow_id);
     if (it == flows_.end()) {
