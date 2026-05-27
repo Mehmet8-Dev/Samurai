@@ -138,7 +138,7 @@ std::string DefaultGpuContractExportSpec(
   if (const char* raw = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_PATH")) {
     if (*raw) {
       return GpuContractExportSpecWithLayout(
-          std::string("file=") + raw,
+          std::string("kind=file,file=") + raw,
           shard_count,
           ring_slots_per_shard,
           hot_flow_capacity);
@@ -146,7 +146,7 @@ std::string DefaultGpuContractExportSpec(
   }
   const char* dir = (::access("/dev/shm", W_OK) == 0) ? "/dev/shm" : "/tmp";
   return GpuContractExportSpecWithLayout(
-      std::string("file=") + dir + "/samurai_gpu_contract_" +
+      std::string("kind=file,file=") + dir + "/samurai_gpu_contract_" +
           std::to_string(static_cast<long long>(::getuid())) + ".bin",
       shard_count,
       ring_slots_per_shard,
