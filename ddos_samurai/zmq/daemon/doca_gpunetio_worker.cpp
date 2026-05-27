@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -46,6 +47,9 @@ using fn_backend_send_vector_timed_t =
     int (*)(int, const uint8_t**, const uint16_t*, const int32_t*, const uint64_t*, int, int*, int*, char*, size_t);
 using fn_backend_get_gpu_txq_handle_t = int (*)(int, uint64_t*, char*, size_t);
 using fn_backend_get_txq_mkey_be_t = int (*)(int, uint32_t*, char*, size_t);
+using fn_backend_create_rxq_t = int (*)(const char*, const char*, int, int, int*, char*, size_t);
+using fn_backend_destroy_rxq_t = int (*)(int, char*, size_t);
+using fn_backend_receive_burst_t = int (*)(int, uint8_t*, uint32_t, uint16_t*, int, int*, char*, size_t);
 using fn_contract_writer_open_t = int (*)(const DocaContractWriterConfigV1*, int*, char*, size_t);
 using fn_contract_writer_close_t = int (*)(int, char*, size_t);
 using fn_contract_writer_publish_flow_update_t = int (*)(int, const DocaFlowUpdateEventV1*, char*, size_t);
@@ -60,6 +64,9 @@ struct DocaDispatch {
   int (*get_stats)(int, DocaGpuNetioStats*, char*, size_t){nullptr};
   int (*get_gpu_txq_handle)(int, uint64_t*, char*, size_t){nullptr};
   int (*get_txq_mkey_be)(int, uint32_t*, char*, size_t){nullptr};
+  int (*create_rxq)(const char*, const char*, int, int, int*, char*, size_t){nullptr};
+  int (*destroy_rxq)(int, char*, size_t){nullptr};
+  int (*receive_burst)(int, uint8_t*, uint32_t, uint16_t*, int, int*, char*, size_t){nullptr};
   int (*contract_writer_open)(const DocaContractWriterConfigV1*, int*, char*, size_t){nullptr};
   int (*contract_writer_close)(int, char*, size_t){nullptr};
   int (*contract_writer_publish_flow_update_v1)(int, const DocaFlowUpdateEventV1*, char*, size_t){nullptr};
@@ -95,6 +102,18 @@ struct DpuContractWriterGuard {
   }
 };
 
+struct DocaRxqGuard {
+  DocaNativeBridge* bridge{nullptr};
+  int handle{-1};
+  ~DocaRxqGuard() {
+    if (bridge && bridge->api.destroy_rxq && handle > 0) {
+      char err[160];
+      err[0] = '\0';
+      (void)bridge->api.destroy_rxq(handle, err, sizeof(err));
+    }
+  }
+};
+
 std::string ReadFixed(const char* raw, std::size_t n) {
   return std::string(raw, strnlen(raw, n));
 }
@@ -115,6 +134,18 @@ std::uint32_t EnvContractU32(const char* name, std::uint32_t default_value, std:
     return default_value;
   }
   return static_cast<std::uint32_t>(parsed);
+}
+
+bool EnvBool(const char* name, bool default_value) {
+  const char* raw = std::getenv(name);
+  if (!raw || !*raw) {
+    return default_value;
+  }
+  std::string v = raw;
+  std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return v == "1" || v == "true" || v == "on" || v == "yes";
 }
 
 std::string GpuContractExportSpecWithLayout(
@@ -271,6 +302,11 @@ bool LoadDocaNative(DocaNativeBridge& out, std::string& err) {
           api.contract_writer_close = in->contract_writer_close;
           api.contract_writer_publish_flow_update_v1 = in->contract_writer_publish_flow_update_v1;
         }
+        if (in->version >= 5) {
+          api.create_rxq = in->create_rxq;
+          api.destroy_rxq = in->destroy_rxq;
+          api.receive_burst = in->receive_burst;
+        }
       }
     }
 
@@ -284,6 +320,10 @@ bool LoadDocaNative(DocaNativeBridge& out, std::string& err) {
           reinterpret_cast<fn_backend_get_gpu_txq_handle_t>(dlsym(h, "samurai_doca_backend_get_gpu_txq_handle"));
       auto get_txq_mkey_be =
           reinterpret_cast<fn_backend_get_txq_mkey_be_t>(dlsym(h, "samurai_doca_backend_get_txq_mkey_be"));
+      auto create_rxq = reinterpret_cast<fn_backend_create_rxq_t>(dlsym(h, "samurai_doca_backend_create_rxq"));
+      auto destroy_rxq = reinterpret_cast<fn_backend_destroy_rxq_t>(dlsym(h, "samurai_doca_backend_destroy_rxq"));
+      auto receive_burst =
+          reinterpret_cast<fn_backend_receive_burst_t>(dlsym(h, "samurai_doca_backend_receive_burst"));
       auto contract_writer_open =
           reinterpret_cast<fn_contract_writer_open_t>(dlsym(h, "samurai_doca_backend_contract_writer_open"));
       auto contract_writer_close =
@@ -299,8 +339,35 @@ bool LoadDocaNative(DocaNativeBridge& out, std::string& err) {
         api.get_stats = get_stats;
         api.get_gpu_txq_handle = get_gpu_txq_handle;
         api.get_txq_mkey_be = get_txq_mkey_be;
+        api.create_rxq = create_rxq;
+        api.destroy_rxq = destroy_rxq;
+        api.receive_burst = receive_burst;
         api.contract_writer_open = contract_writer_open;
         api.contract_writer_close = contract_writer_close;
+        api.contract_writer_publish_flow_update_v1 = contract_writer_publish;
+      }
+    }
+
+    // Some backend builds expose the core TX API through the versioned table but keep
+    // newer RX/contract entrypoints as direct symbols to avoid breaking older shims.
+    if (!api.create_rxq || !api.destroy_rxq || !api.receive_burst || !api.contract_writer_open ||
+        !api.contract_writer_close || !api.contract_writer_publish_flow_update_v1) {
+      auto create_rxq = reinterpret_cast<fn_backend_create_rxq_t>(dlsym(h, "samurai_doca_backend_create_rxq"));
+      auto destroy_rxq = reinterpret_cast<fn_backend_destroy_rxq_t>(dlsym(h, "samurai_doca_backend_destroy_rxq"));
+      auto receive_burst =
+          reinterpret_cast<fn_backend_receive_burst_t>(dlsym(h, "samurai_doca_backend_receive_burst"));
+      auto contract_writer_open =
+          reinterpret_cast<fn_contract_writer_open_t>(dlsym(h, "samurai_doca_backend_contract_writer_open"));
+      auto contract_writer_close =
+          reinterpret_cast<fn_contract_writer_close_t>(dlsym(h, "samurai_doca_backend_contract_writer_close"));
+      auto contract_writer_publish = reinterpret_cast<fn_contract_writer_publish_flow_update_t>(
+          dlsym(h, "samurai_doca_backend_contract_writer_publish_flow_update_v1"));
+      if (!api.create_rxq) api.create_rxq = create_rxq;
+      if (!api.destroy_rxq) api.destroy_rxq = destroy_rxq;
+      if (!api.receive_burst) api.receive_burst = receive_burst;
+      if (!api.contract_writer_open) api.contract_writer_open = contract_writer_open;
+      if (!api.contract_writer_close) api.contract_writer_close = contract_writer_close;
+      if (!api.contract_writer_publish_flow_update_v1) {
         api.contract_writer_publish_flow_update_v1 = contract_writer_publish;
       }
     }
@@ -386,6 +453,41 @@ std::uint16_t TcpFlagsFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
   return out;
 }
 
+std::uint32_t TcpSequenceAdvanceFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
+  if (ProtoFromEnvelope(env) != samurai::dpu::kProtoTcp) {
+    return 0u;
+  }
+  const std::uint16_t flags = TcpFlagsFromEnvelope(env);
+  std::uint32_t advance = 0u;
+  if ((flags & samurai::dpu::kTcpFlagSyn) != 0u) {
+    advance += 1u;
+  }
+  if ((flags & samurai::dpu::kTcpFlagFin) != 0u) {
+    advance += 1u;
+  }
+  if (env.has_payload != 0u) {
+    advance += std::min<std::uint32_t>(env.pad_size, 1460u);
+  }
+  return advance;
+}
+
+std::uint16_t EstablishedTxFlagsFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
+  if (ProtoFromEnvelope(env) != samurai::dpu::kProtoTcp) {
+    return 0u;
+  }
+  const std::uint16_t requested = TcpFlagsFromEnvelope(env);
+  if ((requested & samurai::dpu::kTcpFlagRst) != 0u) {
+    return samurai::dpu::kTcpFlagRst;
+  }
+  if ((requested & samurai::dpu::kTcpFlagFin) != 0u) {
+    return static_cast<std::uint16_t>(samurai::dpu::kTcpFlagFin | samurai::dpu::kTcpFlagAck);
+  }
+  if (env.has_payload != 0u || (requested & samurai::dpu::kTcpFlagPsh) != 0u) {
+    return static_cast<std::uint16_t>(samurai::dpu::kTcpFlagPsh | samurai::dpu::kTcpFlagAck);
+  }
+  return samurai::dpu::kTcpFlagAck;
+}
+
 std::uint32_t FlowIdFromHeader(const samurai::wire::SamuraiWireHeaderV1& header) {
   const std::uint32_t low = static_cast<std::uint32_t>(header.correlation_id & 0xFFFFFFFFull);
   return low == 0u ? 1u : low;
@@ -407,6 +509,39 @@ samurai::dpu::FlowState InitialFlowStateFromEnvelope(
                      : samurai::dpu::kTcpStateEstablished;
   st.rtt_us = 0u;
   st.epoch = 1u;
+  return st;
+}
+
+samurai::dpu::FlowState InitialFlowStateFromWirePacket(
+    const samurai::wire::SamuraiWireHeaderV1& header,
+    const samurai::wire::JobEnvelopeV1& env,
+    const std::uint8_t* packet,
+    std::size_t len) {
+  samurai::dpu::FlowState st = InitialFlowStateFromEnvelope(header, env);
+  samurai::dpu::TcpSegmentObservation seg{};
+  if (st.proto != samurai::dpu::kProtoTcp ||
+      !samurai::dpu::ParseTcpSegmentObservation(packet, len, &seg)) {
+    return st;
+  }
+  st.src_port = seg.src_port;
+  st.dst_port = seg.dst_port;
+  st.seq_num = seg.seq;
+  st.ack_num = seg.ack;
+  st.flags = seg.flags;
+  if ((seg.flags & samurai::dpu::kTcpFlagRst) != 0u) {
+    st.tcp_state = samurai::dpu::kTcpStatePoisoned;
+    st.poisoned = true;
+  } else if ((seg.flags & samurai::dpu::kTcpFlagSyn) != 0u &&
+             (seg.flags & samurai::dpu::kTcpFlagAck) == 0u) {
+    st.tcp_state = samurai::dpu::kTcpStateSynSent;
+  } else if ((seg.flags & samurai::dpu::kTcpFlagSyn) != 0u &&
+             (seg.flags & samurai::dpu::kTcpFlagAck) != 0u) {
+    st.tcp_state = samurai::dpu::kTcpStateSynReceived;
+  } else if ((seg.flags & samurai::dpu::kTcpFlagFin) != 0u) {
+    st.tcp_state = samurai::dpu::kTcpStateFinWait;
+  } else {
+    st.tcp_state = samurai::dpu::kTcpStateEstablished;
+  }
   return st;
 }
 
@@ -444,7 +579,8 @@ samurai::wire::FlowStreamUpsertV1 BuildFlowStreamUpsert(
   std::memset(ev.target_ip, 0, sizeof(ev.target_ip));
   const std::string target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
   std::memcpy(ev.target_ip, target_ip.c_str(), std::min(target_ip.size(), sizeof(ev.target_ip) - 1u));
-  ev.payload_len = static_cast<std::uint16_t>(std::min<std::uint32_t>(env.pad_size, 1460u));
+  ev.payload_len = static_cast<std::uint16_t>(
+      env.has_payload != 0u ? std::min<std::uint32_t>(env.pad_size, 1460u) : 0u);
   ev.payload_byte = 0u;
   ev.weight = 1u;
   ev.template_id = 0u;
@@ -587,6 +723,102 @@ bool PublishDpuFlowUpdateOptionalRdma(
   return PublishDpuFlowUpdateRdma(writer, ev, err);
 }
 
+bool OpenDpuTcpRxq(
+    DocaNativeBridge& doca,
+    DocaRxqGuard& rxq,
+    const std::string& iface,
+    const std::string& device,
+    int gpu_id,
+    int queue_id,
+    std::string& err) {
+  if (!doca.api.create_rxq || !doca.api.destroy_rxq || !doca.api.receive_burst) {
+    err = "dpu_tcp_rx_feedback_unavailable";
+    return false;
+  }
+  char native_err[160];
+  native_err[0] = '\0';
+  int handle = -1;
+  if (doca.api.create_rxq(
+          iface.c_str(),
+          device.c_str(),
+          gpu_id,
+          queue_id,
+          &handle,
+          native_err,
+          sizeof(native_err)) != 0 || handle <= 0) {
+    err = native_err[0] ? std::string(native_err) : "dpu_tcp_rxq_create_failed";
+    return false;
+  }
+  rxq.bridge = &doca;
+  rxq.handle = handle;
+  return true;
+}
+
+bool PollDpuTcpRxFeedback(
+    DocaRxqGuard& rxq,
+    samurai::dpu::FlowStateTable& dpu_state,
+    std::uint32_t flow_id,
+    void* gpu_push,
+    bool dpu_state_publish,
+    bool dpu_contract_rdma,
+    DpuContractWriterGuard& contract_writer,
+    std::uint16_t established_tx_flags,
+    std::uint64_t correlation_id,
+    const std::string& job_id,
+    std::string& err) {
+  if (!rxq.bridge || rxq.handle <= 0 || !rxq.bridge->api.receive_burst) {
+    return true;
+  }
+  constexpr int kMaxRxPackets = 32;
+  constexpr std::size_t kMaxPacket = 2048u;
+  std::vector<std::uint8_t> flat(kMaxPacket * static_cast<std::size_t>(kMaxRxPackets));
+  std::vector<std::uint16_t> lengths(static_cast<std::size_t>(kMaxRxPackets), 0u);
+  int received = 0;
+  char native_err[160];
+  native_err[0] = '\0';
+  if (rxq.bridge->api.receive_burst(
+          rxq.handle,
+          flat.data(),
+          static_cast<std::uint32_t>(flat.size()),
+          lengths.data(),
+          kMaxRxPackets,
+          &received,
+          native_err,
+          sizeof(native_err)) != 0) {
+    err = native_err[0] ? std::string(native_err) : "dpu_tcp_rx_receive_failed";
+    return false;
+  }
+  std::size_t off = 0u;
+  for (int i = 0; i < received; ++i) {
+    const std::size_t len = static_cast<std::size_t>(lengths[static_cast<std::size_t>(i)]);
+    if (len == 0u || off + len > flat.size()) {
+      break;
+    }
+    try {
+      const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+      const samurai::dpu::FlowState& st = dpu_state.ObserveTcpPacket(flow_id, flat.data() + off, len, now_ns);
+      const samurai::dpu::FlowState* publish_state = &st;
+      if (established_tx_flags != 0u && st.tcp_state == samurai::dpu::kTcpStateEstablished &&
+          st.flags != established_tx_flags) {
+        samurai::dpu::FlowState next = st;
+        next.flags = established_tx_flags;
+        publish_state = &dpu_state.Transition(next);
+      }
+      const samurai::wire::FlowUpdateEventV1 ev = dpu_state.BuildUpdateEvent(publish_state->flow_id, now_ns);
+      if (dpu_state_publish && !PublishDpuFlowUpdate(gpu_push, ev, correlation_id, job_id, err)) {
+        return false;
+      }
+      if (!PublishDpuFlowUpdateOptionalRdma(dpu_contract_rdma, contract_writer, ev, err)) {
+        return false;
+      }
+    } catch (const std::exception&) {
+      // Ignore non-matching frames on the feedback queue; steering can be broad in lab setups.
+    }
+    off += len;
+  }
+  return true;
+}
+
 bool PublishDpuFlowStreamUpsert(
     void* gpu_push,
     const samurai::wire::FlowStreamUpsertV1& ev,
@@ -687,7 +919,9 @@ int main(int argc, char** argv) {
   bool bind_events = false;
   bool dpu_state_publish = true;
   bool dpu_contract_rdma = false;
+  bool dpu_tcp_rx_feedback = EnvBool("SAMURAI_DPU_TCP_RX_FEEDBACK", false);
   int cli_queue_id = -1;
+  int cli_rx_queue_id = -1;
   int cli_gpu_id = -1;
   int cli_batch_size = 1024;
   std::string cli_iface;
@@ -728,12 +962,18 @@ int main(int argc, char** argv) {
       dpu_contract_rdma = true;
     } else if (arg == "--dpu-contract-rdma-spec" && i + 1 < argc) {
       cli_contract_rdma_spec = argv[++i];
+    } else if (arg == "--dpu-tcp-rx-feedback") {
+      dpu_tcp_rx_feedback = true;
+    } else if (arg == "--no-dpu-tcp-rx-feedback") {
+      dpu_tcp_rx_feedback = false;
     } else if (arg == "--doca-interface" && i + 1 < argc) {
       cli_iface = argv[++i];
     } else if (arg == "--doca-device" && i + 1 < argc) {
       cli_device = argv[++i];
     } else if (arg == "--doca-queue-id" && i + 1 < argc) {
       cli_queue_id = std::stoi(argv[++i]);
+    } else if (arg == "--doca-rx-queue-id" && i + 1 < argc) {
+      cli_rx_queue_id = std::stoi(argv[++i]);
     } else if (arg == "--doca-gpu-id" && i + 1 < argc) {
       cli_gpu_id = std::stoi(argv[++i]);
     } else if (arg == "--doca-batch-size" && i + 1 < argc) {
@@ -935,6 +1175,21 @@ int main(int argc, char** argv) {
           continue;
         }
 
+        DocaRxqGuard rxq{};
+        if (dpu_tcp_rx_feedback) {
+          const int rx_queue_id = std::max(0, cli_rx_queue_id >= 0 ? cli_rx_queue_id : queue_id);
+          std::string rx_err;
+          if (!OpenDpuTcpRxq(doca, rxq, iface, device, gpu_id, rx_queue_id, rx_err)) {
+            (void)SendFrame(push,
+                            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                            header.correlation_id,
+                            samurai::wire::WorkerKind::DOCA,
+                            job_id,
+                            JsonError(rx_err));
+            continue;
+          }
+        }
+
         PacketConfig cfg = ConfigFromEnvelope(env);
         const auto pool = ddos_samurai::cpu_native::generate_packet_pool_view(cfg, packet_count, true, true);
         const std::size_t stride = pool.packet_size;
@@ -948,7 +1203,8 @@ int main(int argc, char** argv) {
           continue;
         }
 
-        const samurai::dpu::FlowState initial_flow = dpu_state.Upsert(InitialFlowStateFromEnvelope(header, env));
+        const samurai::dpu::FlowState initial_flow =
+            dpu_state.Upsert(InitialFlowStateFromWirePacket(header, env, pool.data(), stride));
         const std::uint64_t initial_publish_ns = samurai_pacing_monotonic_now_ns();
         if (dpu_state_publish) {
           std::string publish_err;
@@ -981,6 +1237,7 @@ int main(int argc, char** argv) {
         samurai_pacing_config_t pace_cfg = PacingFromEnvelope(env);
         samurai_pacing_state_t pace_state{};
         samurai_pacing_init(&pace_state, &pace_cfg);
+        const std::uint16_t established_tx_flags = EstablishedTxFlagsFromEnvelope(env);
 
         const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
         std::uint64_t last_hb_ns = start_ns;
@@ -1042,6 +1299,36 @@ int main(int argc, char** argv) {
           }
 
           const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+          if (out_sent > 0) {
+            if (const samurai::dpu::FlowState* current = dpu_state.Find(initial_flow.flow_id)) {
+              samurai::dpu::FlowState tx_progress = *current;
+              tx_progress.last_tx_ts = now_ns;
+              (void)dpu_state.Transition(tx_progress);
+            }
+          }
+          if (rxq.handle > 0) {
+            std::string rx_err;
+            if (!PollDpuTcpRxFeedback(rxq,
+                                      dpu_state,
+                                      initial_flow.flow_id,
+                                      gpu_push,
+                                      dpu_state_publish,
+                                      dpu_contract_rdma,
+                                      contract_writer,
+                                      established_tx_flags,
+                                      header.correlation_id,
+                                      job_id,
+                                      rx_err)) {
+              (void)SendFrame(push,
+                              static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                              header.correlation_id,
+                              samurai::wire::WorkerKind::DOCA,
+                              job_id,
+                              JsonError(rx_err));
+              packets_errors += static_cast<std::uint64_t>(n_this);
+              break;
+            }
+          }
           if (now_ns - last_hb_ns >= 1'000'000'000ull) {
             (void)SendFrame(push,
                             static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
@@ -1075,12 +1362,38 @@ int main(int argc, char** argv) {
         }
 
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
-        samurai::dpu::FlowState final_flow = initial_flow;
-        final_flow.seq_num = static_cast<std::uint32_t>(
-            (static_cast<std::uint64_t>(initial_flow.seq_num) + packets_sent) & 0xFFFFFFFFull);
+        if (rxq.handle > 0) {
+          std::string rx_err;
+          (void)PollDpuTcpRxFeedback(rxq,
+                                     dpu_state,
+                                     initial_flow.flow_id,
+                                     gpu_push,
+                                     dpu_state_publish,
+                                     dpu_contract_rdma,
+                                     contract_writer,
+                                     established_tx_flags,
+                                     header.correlation_id,
+                                     job_id,
+                                     rx_err);
+        }
+        const samurai::dpu::FlowState* observed_flow = dpu_state.Find(initial_flow.flow_id);
+        samurai::dpu::FlowState final_flow = observed_flow ? *observed_flow : initial_flow;
+        if (rxq.handle <= 0) {
+          const std::uint64_t seq_advance =
+              static_cast<std::uint64_t>(TcpSequenceAdvanceFromEnvelope(env)) * packets_sent;
+          final_flow.seq_num = static_cast<std::uint32_t>(
+              (static_cast<std::uint64_t>(initial_flow.seq_num) + seq_advance) & 0xFFFFFFFFull);
+        }
         final_flow.last_tx_ts = end_ns;
-        final_flow.tcp_state = packets_errors == 0u ? samurai::dpu::kTcpStateEstablished : samurai::dpu::kTcpStatePoisoned;
-        final_flow.flags = packets_errors == 0u ? initial_flow.flags : static_cast<std::uint16_t>(initial_flow.flags | 0x04u);
+        if (packets_errors != 0u) {
+          final_flow.tcp_state = samurai::dpu::kTcpStatePoisoned;
+          final_flow.flags = static_cast<std::uint16_t>(final_flow.flags | samurai::dpu::kTcpFlagRst);
+        } else if (rxq.handle <= 0 &&
+                   final_flow.tcp_state != samurai::dpu::kTcpStatePoisoned &&
+                   final_flow.tcp_state != samurai::dpu::kTcpStateCloseWait &&
+                   final_flow.tcp_state != samurai::dpu::kTcpStateTimeWait) {
+          final_flow.tcp_state = samurai::dpu::kTcpStateEstablished;
+        }
         const samurai::dpu::FlowState& committed_final_flow = dpu_state.Transition(final_flow);
         if (dpu_state_publish) {
           std::string publish_err;
