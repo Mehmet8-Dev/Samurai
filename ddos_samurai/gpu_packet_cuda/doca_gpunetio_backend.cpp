@@ -242,8 +242,12 @@ struct BackendContractWriterHandle {
   int handle = -1;
   void* region = nullptr;
   size_t region_len = 0u;
+  std::string region_kind{"addr"};
   bool owns_mapping = false;
   int fd = -1;
+  doca_dev* dev = nullptr;
+  doca_mmap* mmap = nullptr;
+  uint32_t mmap_mkey = 0u;
   uint32_t shard_count = 0u;
   uint32_t ring_slots_per_shard = 0u;
   uint32_t hot_flow_capacity = 0u;
@@ -368,6 +372,7 @@ inline bool parse_u64_text(const std::string& raw, uint64_t* out) {
 }
 
 struct ContractRegionSpec {
+  std::string kind{};
   uintptr_t addr = 0u;
   std::string file{};
   size_t size = 0u;
@@ -394,6 +399,7 @@ inline bool parse_contract_region_spec(
   }
 
   if (spec.rfind("0x", 0) == 0 || spec.rfind("addr:", 0) == 0) {
+    out->kind = "addr";
     const size_t sep = spec.find(':', spec.rfind("addr:", 0) == 0 ? 5u : 2u);
     const std::string addr_s = spec.rfind("addr:", 0) == 0
         ? (sep == std::string::npos ? spec.substr(5u) : spec.substr(5u, sep - 5u))
@@ -420,15 +426,29 @@ inline bool parse_contract_region_spec(
     const size_t eq = token.find('=');
     if (eq == std::string::npos) {
       if (token.rfind("file:", 0) == 0) {
+        out->kind = "file";
         out->file = token.substr(5u);
         continue;
       }
       if (why) *why = "invalid contract region token: " + token;
       return false;
     }
-    const std::string key = trim_copy(token.substr(0u, eq));
+    std::string key = trim_copy(token.substr(0u, eq));
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
     const std::string value = trim_copy(token.substr(eq + 1u));
-    if (key == "addr") {
+    if (key == "kind" || key == "type") {
+      std::string k = value;
+      std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+      if (k != "file" && k != "addr" && k != "rdma" && k != "doca_mmap" && k != "doca-mmap") {
+        if (why) *why = "unknown contract region kind: " + value;
+        return false;
+      }
+      out->kind = (k == "doca-mmap") ? "doca_mmap" : k;
+    } else if (key == "addr") {
       uint64_t addr = 0u;
       if (!parse_u64_text(value, &addr) || addr == 0u) {
         if (why) *why = "invalid contract addr value";
@@ -484,8 +504,19 @@ inline bool parse_contract_region_spec(
       return false;
     }
   }
-  if (out->addr == 0u && out->file.empty()) {
-    if (why) *why = "contract region requires addr= or file=";
+  if (out->kind.empty()) {
+    out->kind = !out->file.empty() ? "file" : "addr";
+  }
+  if (out->kind == "file" && out->file.empty()) {
+    if (why) *why = "contract region kind=file requires file=";
+    return false;
+  }
+  if ((out->kind == "addr" || out->kind == "doca_mmap") && out->addr == 0u && out->file.empty()) {
+    if (why) *why = "contract region kind requires addr= or file=";
+    return false;
+  }
+  if (out->kind == "rdma") {
+    if (why) *why = "contract region kind=rdma requires native RDMA import backend; use kind=doca_mmap with an imported addr or kind=file for local tests";
     return false;
   }
   return true;
@@ -1614,6 +1645,125 @@ inline bool is_matching_dev(
   return dev_match || iface_match;
 }
 
+inline bool open_doca_dev_by_name(const char* device_name, doca_dev** out_dev, char* err, size_t err_len) {
+  if (!device_name || !*device_name || !out_dev) {
+    write_err(err, err_len, "contract DOCA mmap requires device_name");
+    return false;
+  }
+  *out_dev = nullptr;
+  doca_devinfo** dev_list = nullptr;
+  uint32_t nb_devs = 0u;
+  doca_error_t rc = g_doca.doca_devinfo_create_list(&dev_list, &nb_devs);
+  if (rc != kDocaSuccess || !dev_list || nb_devs == 0u) {
+    write_err(err, err_len, std::string("doca_devinfo_create_list failed: ") + doca_err(g_doca, rc));
+    return false;
+  }
+  doca_devinfo* selected = nullptr;
+  for (uint32_t i = 0; i < nb_devs; ++i) {
+    doca_devinfo* cand = dev_list[i];
+    if (!cand) {
+      continue;
+    }
+    std::string cand_ibdev;
+    std::string cand_iface;
+    if (is_matching_dev(g_doca, cand, nullptr, device_name, cand_ibdev, cand_iface)) {
+      selected = cand;
+      break;
+    }
+  }
+  if (!selected) {
+    (void)g_doca.doca_devinfo_destroy_list(dev_list);
+    write_err(err, err_len, std::string("no matching DOCA device found for ibdev=") + device_name);
+    return false;
+  }
+  rc = g_doca.doca_dev_open(selected, out_dev);
+  (void)g_doca.doca_devinfo_destroy_list(dev_list);
+  if (rc != kDocaSuccess || !*out_dev) {
+    write_err(err, err_len, std::string("doca_dev_open failed: ") + doca_err(g_doca, rc));
+    return false;
+  }
+  return true;
+}
+
+inline void close_contract_writer_resources(BackendContractWriterHandle& h) {
+  if (h.mmap) {
+    if (g_doca.loaded && g_doca.doca_mmap_stop) {
+      (void)g_doca.doca_mmap_stop(h.mmap);
+    }
+    if (g_doca.loaded && g_doca.doca_mmap_destroy) {
+      (void)g_doca.doca_mmap_destroy(h.mmap);
+    }
+    h.mmap = nullptr;
+  }
+  if (h.dev) {
+    if (g_doca.loaded && g_doca.doca_dev_close) {
+      (void)g_doca.doca_dev_close(h.dev);
+    }
+    h.dev = nullptr;
+  }
+  if (h.owns_mapping && h.region && h.region_len > 0u) {
+    (void)::msync(h.region, h.region_len, MS_SYNC);
+    (void)::munmap(h.region, h.region_len);
+  }
+  if (h.fd >= 0) {
+    (void)::close(h.fd);
+  }
+  h.region = nullptr;
+  h.region_len = 0u;
+  h.fd = -1;
+  h.mmap_mkey = 0u;
+}
+
+inline bool register_contract_writer_doca_mmap(
+    BackendContractWriterHandle& h,
+    const char* device_name,
+    char* err,
+    size_t err_len) {
+  if (!h.region || h.region_len == 0u) {
+    write_err(err, err_len, "contract DOCA mmap requires a resolved region");
+    return false;
+  }
+  std::string why;
+  if (!ensure_doca_api(why)) {
+    write_err(err, err_len, std::string("DOCA runtime unavailable for contract mmap: ") + why);
+    return false;
+  }
+  if (!open_doca_dev_by_name(device_name, &h.dev, err, err_len)) {
+    return false;
+  }
+  doca_error_t rc = g_doca.doca_mmap_create(&h.mmap);
+  if (rc != kDocaSuccess || !h.mmap) {
+    write_err(err, err_len, std::string("contract doca_mmap_create failed: ") + doca_err(g_doca, rc));
+    close_contract_writer_resources(h);
+    return false;
+  }
+  rc = g_doca.doca_mmap_add_dev(h.mmap, h.dev);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("contract doca_mmap_add_dev failed: ") + doca_err(g_doca, rc));
+    close_contract_writer_resources(h);
+    return false;
+  }
+  rc = g_doca.doca_mmap_set_memrange(h.mmap, h.region, h.region_len);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("contract doca_mmap_set_memrange failed: ") + doca_err(g_doca, rc));
+    close_contract_writer_resources(h);
+    return false;
+  }
+  rc = g_doca.doca_mmap_start(h.mmap);
+  if (rc != kDocaSuccess) {
+    write_err(err, err_len, std::string("contract doca_mmap_start failed: ") + doca_err(g_doca, rc));
+    close_contract_writer_resources(h);
+    return false;
+  }
+  rc = g_doca.doca_mmap_get_mkey(h.mmap, h.dev, &h.mmap_mkey);
+  if (rc != kDocaSuccess || h.mmap_mkey == 0u) {
+    write_err(err, err_len, std::string("contract doca_mmap_get_mkey failed: ") + doca_err(g_doca, rc));
+    close_contract_writer_resources(h);
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 extern "C" int samurai_doca_backend_create_txq(
@@ -2155,6 +2305,7 @@ extern "C" int samurai_doca_backend_contract_writer_open(
   writer->shard_count = cfg->shard_count;
   writer->ring_slots_per_shard = cfg->ring_slots_per_shard;
   writer->hot_flow_capacity = cfg->hot_flow_capacity;
+  writer->region_kind = spec.kind;
   writer->region_len = spec.size != 0u ? spec.size : layout.total_bytes;
 
   if (!spec.file.empty()) {
@@ -2195,6 +2346,15 @@ extern "C" int samurai_doca_backend_contract_writer_open(
     write_err(err, err_len, "contract region resolved to null");
     return -1;
   }
+  if (writer->region_kind == "doca_mmap") {
+    if (!register_contract_writer_doca_mmap(*writer, cfg->device_name, err, err_len)) {
+      return -1;
+    }
+  } else if (writer->region_kind != "file" && writer->region_kind != "addr") {
+    write_err(err, err_len, "unsupported contract region kind");
+    close_contract_writer_resources(*writer);
+    return -1;
+  }
 
   std::lock_guard<std::mutex> guard(g_lock);
   const int hnd = g_next_handle++;
@@ -2223,16 +2383,7 @@ extern "C" int samurai_doca_backend_contract_writer_close(int handle, char* err,
     return 0;
   }
   std::lock_guard<std::mutex> op_guard(h->op_lock);
-  if (h->owns_mapping && h->region && h->region_len > 0u) {
-    (void)::msync(h->region, h->region_len, MS_SYNC);
-    (void)::munmap(h->region, h->region_len);
-  }
-  if (h->fd >= 0) {
-    (void)::close(h->fd);
-  }
-  h->region = nullptr;
-  h->region_len = 0u;
-  h->fd = -1;
+  close_contract_writer_resources(*h);
   return 0;
 }
 

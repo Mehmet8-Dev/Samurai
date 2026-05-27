@@ -1877,7 +1877,8 @@ inline std::string persistent_contract_export_region_spec(
     size_t ring_slots_per_shard,
     size_t hot_flow_capacity) {
   std::ostringstream oss;
-  oss << "layout=1"
+  oss << "kind=file"
+      << ",layout=1"
       << ",file=" << path
       << ",size=" << layout.total_bytes
       << ",shards=" << shard_count
