@@ -128,6 +128,22 @@ std::string GpuContractExportSpecWithLayout(
       ",event=" + std::to_string(sizeof(DocaFlowUpdateEventV1));
 }
 
+std::string DefaultGpuContractExportKind() {
+  std::string kind = "file";
+  if (const char* raw = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_KIND")) {
+    if (*raw) {
+      kind = std::string(raw);
+      std::transform(kind.begin(), kind.end(), kind.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+      if (kind == "doca-mmap") {
+        kind = "doca_mmap";
+      }
+    }
+  }
+  return kind;
+}
+
 std::string DefaultGpuContractExportSpec(
     std::uint32_t shard_count,
     std::uint32_t ring_slots_per_shard,
@@ -135,10 +151,11 @@ std::string DefaultGpuContractExportSpec(
   if (const char* raw = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_SPEC")) {
     if (*raw) return std::string(raw);
   }
+  const std::string kind = DefaultGpuContractExportKind();
   if (const char* raw = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_PATH")) {
     if (*raw) {
       return GpuContractExportSpecWithLayout(
-          std::string("kind=file,file=") + raw,
+          std::string("kind=") + kind + ",file=" + raw,
           shard_count,
           ring_slots_per_shard,
           hot_flow_capacity);
@@ -146,7 +163,7 @@ std::string DefaultGpuContractExportSpec(
   }
   const char* dir = (::access("/dev/shm", W_OK) == 0) ? "/dev/shm" : "/tmp";
   return GpuContractExportSpecWithLayout(
-      std::string("kind=file,file=") + dir + "/samurai_gpu_contract_" +
+      std::string("kind=") + kind + ",file=" + dir + "/samurai_gpu_contract_" +
           std::to_string(static_cast<long long>(::getuid())) + ".bin",
       shard_count,
       ring_slots_per_shard,
