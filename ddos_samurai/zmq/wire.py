@@ -617,10 +617,16 @@ def build_job_envelope(args: Mapping[str, Any], *, scenario_payload_ref: str = "
         dns_recursive = not bool(args.get("dns_nord", False))
     else:
         dns_recursive = bool(dns_recursive_raw)
+    # Backward/CLI compatibility:
+    # - CLI and runtime primarily pass "count" instead of "packets".
+    # - AF_XDP interface is exposed as "xdp_interface" (legacy: "iface").
+    packet_count = int(args.get("packets", args.get("count", 0)) or 0)
+    xdp_iface = str(args.get("xdp_interface", args.get("iface", "")) or "")
+
     return JobEnvelopeV1(
         target_ip=str(args.get("target", "") or ""),
         target_port=int(args.get("port", 0) or 0),
-        packet_count=int(args.get("packets", 0) or 0),
+        packet_count=packet_count,
         packet_size=int(args.get("size", 64) or 64),
         pacing_mode=pacing.pacing_mode,
         target_rps=pacing.target_rps,
@@ -631,7 +637,7 @@ def build_job_envelope(args: Mapping[str, Any], *, scenario_payload_ref: str = "
         jitter_pct=pacing.jitter_pct,
         pin_cpu=pacing.pin_cpu,
         use_so_txtime=pacing.use_so_txtime,
-        xdp_interface=str(args.get("iface", "") or ""),
+        xdp_interface=xdp_iface,
         xdp_queue_id=int(args.get("dpdk_queue", args.get("xdp_queue_id", 0)) or 0),
         xdp_mode=int(args.get("xdp_mode", 0) or 0),
         scenario_payload_ref=str(scenario_payload_ref or ""),

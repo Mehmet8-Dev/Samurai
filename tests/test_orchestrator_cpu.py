@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 from unittest.mock import patch
 
@@ -204,6 +205,68 @@ class TestOrchestratorCpu(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["status"], "failed")
         self.assertIn("launch_failed", str(events[0].get("error", "")))
+
+    def test_start_worker_zmq_soak_dispatches_multiple_jobs_until_deadline(self):
+        class _LoopDispatcher:
+            def __init__(self):
+                self.start_calls: list[dict] = []
+
+            def dispatch_start_job(self, **kwargs):
+                self.start_calls.append(dict(kwargs))
+                return None
+
+            def dispatch_shutdown_worker(self, **kwargs):
+                _ = kwargs
+                return None
+
+            def close(self):
+                return None
+
+        class _LoopCollector:
+            def ensure_worker_channel(self, *args, **kwargs):
+                _ = args
+                _ = kwargs
+                return None
+
+            def wait_for_terminal_event(self, **kwargs):
+                _ = kwargs
+                time.sleep(0.01)
+                return _FakeTerminalEvent(
+                    MessageType.JOB_DONE,
+                    {"attempted": 5, "sent": 5, "errors": 0, "bytes_sent_est": 320, "status": "ok"},
+                )
+
+            def close(self):
+                return None
+
+        events: list[dict] = []
+        progress = _Counter()
+        sent_total = _Counter()
+        errors_total = _Counter()
+        dispatcher = _LoopDispatcher()
+        args = _base_args()
+        args["soak_deadline_ts"] = float(time.time() + 0.035)
+
+        with patch("ddos_samurai.orchestrator.ZmqRuntimeManager", return_value=_FakeRuntime()), patch(
+            "ddos_samurai.orchestrator.ZmqDispatcher", return_value=dispatcher
+        ), patch("ddos_samurai.orchestrator.ZmqEventCollector", return_value=_LoopCollector()), patch(
+            "ddos_samurai.orchestrator._snapshot_loss_telemetry", return_value=None
+        ):
+            orchestrator.start_worker_zmq(
+                worker_id=4,
+                args=args,
+                progress=progress,
+                run_events=events,
+                sent_total=sent_total,
+                errors_total=errors_total,
+            )
+
+        self.assertGreaterEqual(len(dispatcher.start_calls), 2)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["status"], "ok")
+        self.assertEqual(progress.value, sent_total.value)
+        self.assertGreater(progress.value, 0)
+        self.assertEqual(errors_total.value, 0)
 
 
 class TestOrchestratorWorkerProcess(unittest.IsolatedAsyncioTestCase):
