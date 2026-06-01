@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .wire import (
+    FlowStreamUpsertV1,
+    FLOW_STREAM_UPSERT_SIZE_V1,
+    FlowUpdateEventV1,
+    FLOW_UPDATE_EVENT_SIZE_V1,
     HEADER_SIZE_V1,
     MessageType,
     SamuraiWireHeaderV1,
@@ -40,6 +44,14 @@ class ZmqDispatcher:
         self._context = context if context is not None else self._zmq.Context.instance()
         self._linger_ms = int(linger_ms)
         self._sockets: dict[str, Any] = {}
+        self._flow_last_version: dict[int, int] = {}
+        self._flow_last_epoch: dict[int, int] = {}
+        self._flow_contract_stats: dict[str, int] = {
+            "published": 0,
+            "version_gap_detected": 0,
+            "epoch_mismatch": 0,
+            "stale_version": 0,
+        }
 
     def close(self) -> None:
         for socket in list(self._sockets.values()):
@@ -124,6 +136,99 @@ class ZmqDispatcher:
             endpoint=endpoint,
         )
 
+    def dispatch_flow_update(
+        self,
+        *,
+        correlation_id: int,
+        job_id: str,
+        event: FlowUpdateEventV1,
+        allow_version_gap: bool = False,
+        endpoint: str | None = None,
+    ) -> DispatchResult:
+        self._validate_flow_update_contract(event, allow_version_gap=allow_version_gap)
+        payload = event.pack()
+        out = self.send_raw(
+            worker_kind=WorkerKind.GPU,
+            msg_type=MessageType.FLOW_UPDATE,
+            correlation_id=correlation_id,
+            job_id=job_id,
+            payload=payload,
+            endpoint=endpoint,
+        )
+        flow_id = int(event.flow_id)
+        self._flow_last_version[flow_id] = int(event.version)
+        self._flow_last_epoch[flow_id] = int(event.epoch)
+        self._flow_contract_stats["published"] = int(self._flow_contract_stats.get("published", 0) or 0) + 1
+        return out
+
+    def dispatch_flow_stream_upsert(
+        self,
+        *,
+        correlation_id: int,
+        job_id: str,
+        upsert: FlowStreamUpsertV1,
+        allow_version_gap: bool = False,
+        endpoint: str | None = None,
+    ) -> DispatchResult:
+        self._validate_flow_update_contract(upsert.to_flow_update(), allow_version_gap=allow_version_gap)
+        payload = upsert.pack()
+        out = self.send_raw(
+            worker_kind=WorkerKind.GPU,
+            msg_type=MessageType.FLOW_STREAM_UPSERT,
+            correlation_id=correlation_id,
+            job_id=job_id,
+            payload=payload,
+            endpoint=endpoint,
+        )
+        flow_id = int(upsert.flow_id)
+        self._flow_last_version[flow_id] = int(upsert.version)
+        self._flow_last_epoch[flow_id] = int(upsert.epoch)
+        self._flow_contract_stats["published"] = int(self._flow_contract_stats.get("published", 0) or 0) + 1
+        return out
+
+    def _validate_flow_update_contract(self, event: FlowUpdateEventV1, *, allow_version_gap: bool) -> None:
+        flow_id = int(event.flow_id)
+        version = int(event.version)
+        epoch = int(event.epoch)
+        if version & 1:
+            raise ValueError("flow update version must be even/committed")
+        prev_epoch = self._flow_last_epoch.get(flow_id)
+        prev_version = self._flow_last_version.get(flow_id)
+        if prev_epoch is None or prev_version is None:
+            return
+        if epoch < int(prev_epoch):
+            self._flow_contract_stats["epoch_mismatch"] = int(self._flow_contract_stats.get("epoch_mismatch", 0) or 0) + 1
+            raise ValueError(f"epoch mismatch detected for flow_id={flow_id}: got={epoch} prev={prev_epoch}")
+        if epoch > int(prev_epoch):
+            return
+        if version <= int(prev_version):
+            self._flow_contract_stats["stale_version"] = int(self._flow_contract_stats.get("stale_version", 0) or 0) + 1
+            raise ValueError(f"stale or duplicate version for flow_id={flow_id}: got={version} prev={prev_version}")
+        if version > int(prev_version) + 2:
+            self._flow_contract_stats["version_gap_detected"] = int(
+                self._flow_contract_stats.get("version_gap_detected", 0) or 0
+            ) + 1
+            if not bool(allow_version_gap):
+                raise ValueError(
+                    f"version gap detected for flow_id={flow_id}: got={version} expected={int(prev_version) + 2}"
+                )
+
+    def next_committed_flow_version(self, flow_id: int, *, initial_version: int = 0) -> int:
+        flow_key = int(flow_id)
+        current = int(self._flow_last_version.get(flow_key, int(initial_version)))
+        if current & 1:
+            current += 1
+        return int(current + 2)
+
+    def flow_update_contract_stats(self) -> dict[str, int]:
+        return {
+            "published": int(self._flow_contract_stats.get("published", 0) or 0),
+            "version_gap_detected": int(self._flow_contract_stats.get("version_gap_detected", 0) or 0),
+            "epoch_mismatch": int(self._flow_contract_stats.get("epoch_mismatch", 0) or 0),
+            "stale_version": int(self._flow_contract_stats.get("stale_version", 0) or 0),
+            "tracked_flows": int(len(self._flow_last_version)),
+        }
+
     def dispatch_shutdown_worker(
         self,
         *,
@@ -146,3 +251,11 @@ class ZmqDispatcher:
         from .wire import JOB_ENVELOPE_SIZE_V1
 
         return int(HEADER_SIZE_V1 + JOB_ENVELOPE_SIZE_V1)
+
+    @staticmethod
+    def expected_flow_update_frame_size() -> int:
+        return int(HEADER_SIZE_V1 + FLOW_UPDATE_EVENT_SIZE_V1)
+
+    @staticmethod
+    def expected_flow_stream_upsert_frame_size() -> int:
+        return int(HEADER_SIZE_V1 + FLOW_STREAM_UPSERT_SIZE_V1)

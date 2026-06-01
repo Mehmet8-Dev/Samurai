@@ -52,37 +52,15 @@ class TestGPUModules(unittest.TestCase):
         self.assertTrue(hasattr(gpu_packet, 'init_gpu'), "Missing init_gpu")
 
     def test_basic_kernel_call(self):
-        """Attempt to call a basic generation function if GPU is available."""
-        if not GPU_AVAILABLE:
-            self.skipTest("No CUDA-capable GPU detected, skipping kernel execution test.")
-            return
-
-        try:
-            # Try to generate a small batch of packets
-            count = 10
-            target_ip = "127.0.0.1"
-            target_port = 80
-            
-            packets, size = gpu_packet.generate_packets(
-                count=count,
-                target_ip=target_ip,
-                target_port=target_port,
+        """Synchronous Python GPU generation is intentionally removed."""
+        with self.assertRaises(gpu_packet.GPUPacketError):
+            gpu_packet.generate_packets(
+                count=10,
+                target_ip="127.0.0.1",
+                target_port=80,
                 protocol="tcp",
-                has_ethernet=False # Simpler for test
+                has_ethernet=False,
             )
-            
-            self.assertIsNotNone(packets)
-            self.assertGreater(size, 0)
-            
-            # New default is host-ready; accept both host ndarray and device ndarray.
-            self.assertTrue(isinstance(packets, (cp.ndarray, np.ndarray)))
-
-            # Basic sanity check on CPU copy (supports both backends).
-            cpu_packets = packets.get() if hasattr(packets, "get") else np.asarray(packets, dtype=np.uint8)
-            self.assertEqual(len(cpu_packets), count * size)
-            
-        except Exception as e:
-            self.fail(f"GPU Kernel execution failed: {e}")
 
 if __name__ == '__main__':
     unittest.main()

@@ -235,19 +235,22 @@ def validate_with_json_schema(raw: dict[str, Any]) -> None:
     if jsonschema is None:
         return
     schema_version = int((raw or {}).get("schema_version", 1) or 1)
-    if schema_version <= 1:
-        jsonschema.validate(instance=raw, schema=SCENARIO_SCHEMA_V1)
-        return
-    merged = dict(SCENARIO_SCHEMA_V1)
-    merged["properties"] = dict(SCENARIO_SCHEMA_V1.get("properties", {}))
-    merged["properties"].update(dict(SCENARIO_SCHEMA_V2_PATCH.get("properties", {})))
-    if schema_version >= 3:
-        merged["properties"].update(dict(SCENARIO_SCHEMA_V3_PATCH.get("properties", {})))
-        merged_allof = list(merged.get("allOf", []) or [])
-        merged_allof.extend(list(SCENARIO_SCHEMA_V3_PATCH.get("allOf", []) or []))
-        if merged_allof:
-            merged["allOf"] = merged_allof
-    jsonschema.validate(instance=raw, schema=merged)
+    try:
+        if schema_version <= 1:
+            jsonschema.validate(instance=raw, schema=SCENARIO_SCHEMA_V1)
+            return
+        merged = dict(SCENARIO_SCHEMA_V1)
+        merged["properties"] = dict(SCENARIO_SCHEMA_V1.get("properties", {}))
+        merged["properties"].update(dict(SCENARIO_SCHEMA_V2_PATCH.get("properties", {})))
+        if schema_version >= 3:
+            merged["properties"].update(dict(SCENARIO_SCHEMA_V3_PATCH.get("properties", {})))
+            merged_allof = list(merged.get("allOf", []) or [])
+            merged_allof.extend(list(SCENARIO_SCHEMA_V3_PATCH.get("allOf", []) or []))
+            if merged_allof:
+                merged["allOf"] = merged_allof
+        jsonschema.validate(instance=raw, schema=merged)
+    except jsonschema.exceptions.ValidationError as exc:
+        raise ValueError(f"Schema validation failed: {exc}") from exc
 
 
 def migrate_schema(raw: dict[str, Any], *, target_version: int = 3) -> dict[str, Any]:

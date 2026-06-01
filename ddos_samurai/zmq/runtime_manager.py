@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Sequence
 
 from .wire import WorkerKind
+
+_log = logging.getLogger(__name__)
 
 
 WORKER_BINARIES: dict[WorkerKind, str] = {
@@ -76,7 +79,7 @@ class ZmqRuntimeManager:
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             close_fds=True,
             start_new_session=True,
             env=dict(os.environ, **(env or {})),
@@ -85,6 +88,17 @@ class ZmqRuntimeManager:
         self._workers[kind] = wp
         return wp
 
+    def _drain_stderr(self, wp: WorkerProcess) -> str:
+        """Read any accumulated stderr from worker for diagnostics."""
+        try:
+            if wp.process.stderr is not None:
+                data = wp.process.stderr.read()
+                if data:
+                    return data.decode("utf-8", errors="replace").strip()
+        except (OSError, ValueError):
+            pass
+        return ""
+
     def stop_worker(self, worker_kind: WorkerKind, *, timeout_s: float = 3.0) -> int:
         kind = WorkerKind(worker_kind)
         wp = self._workers.get(kind)
@@ -92,6 +106,9 @@ class ZmqRuntimeManager:
             return 0
         proc = wp.process
         if proc.poll() is not None:
+            stderr_text = self._drain_stderr(wp)
+            if stderr_text:
+                _log.warning("[%s] worker stderr:\n%s", kind.name, stderr_text)
             self._workers.pop(kind, None)
             return int(proc.returncode or 0)
 
@@ -101,6 +118,9 @@ class ZmqRuntimeManager:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=1.0)
+        stderr_text = self._drain_stderr(wp)
+        if stderr_text:
+            _log.warning("[%s] worker stderr:\n%s", kind.name, stderr_text)
         rc = int(proc.returncode or 0)
         self._workers.pop(kind, None)
         return rc

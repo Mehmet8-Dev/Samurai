@@ -2,7 +2,13 @@
 // When opened standalone by IDE analysis, pull required fragments here.
 #include "../gpu_packet_cuda.hpp"
 #include <cstdio>
+#include <fcntl.h>
+#include <limits>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "tx_backend_doca_gpunetio.cuh"
+#include "zero_copy_dataplane_contract.cuh"
 #ifndef SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
 #define SAMURAI_WITH_DOCA_GPUNETIO_DEVICE 0
 #endif
@@ -1331,6 +1337,20 @@ struct PersistentRuntimeControl {
   uint64_t throttle_events = 0;
   uint64_t drain_attempts = 0;
   uint64_t native_batch_degrade_events = 0;
+  uint64_t contract_poll_events = 0;
+  uint64_t contract_poll_epoch_mismatch = 0;
+  uint64_t contract_poll_inactive_flow = 0;
+  uint64_t contract_poll_stale_events = 0;
+  uint64_t contract_poll_version_gap_events = 0;
+  uint64_t contract_resync_requests = 0;
+  uint64_t contract_poll_poison_events = 0;
+  uint64_t contract_poll_migration_events = 0;
+  uint64_t contract_stale_ttl_pause_events = 0;
+  uint64_t contract_heartbeat_lost_events = 0;
+  uint64_t tx_ownership_invalid_events = 0;
+  uint64_t tx_ownership_transitions = 0;
+  volatile uint64_t host_time_ns = 0;
+  volatile uint64_t last_contract_dpu_ts_ns = 0;
 };
 
 struct PersistentKernelStaticConfig {
@@ -1339,6 +1359,8 @@ struct PersistentKernelStaticConfig {
   int32_t max_streams = kPersistentMaxStreams;
   int32_t queue_probe_span = 4;
   int32_t max_packet_bytes = kPersistentMaxPacketBytes;
+  uint64_t contract_stale_ttl_ns = 0;
+  uint64_t contract_heartbeat_timeout_ns = 0;
 };
 
 __device__ __constant__ PersistentKernelStaticConfig g_persistent_kernel_static_cfg;
@@ -1358,6 +1380,11 @@ struct PersistentDeviceStreamState {
   uint16_t target_port = 0;
   uint16_t tcp_flags = 0x02;
   uint16_t tcp_window = 65535;
+  uint16_t tcp_mss = 1460;
+  uint8_t tcp_window_scale = 8;
+  uint8_t tcp_sack_permitted = 1;
+  uint8_t tcp_timestamp_enabled = 1;
+  uint8_t _tcp_options_pad = 0;
   uint16_t source_port = 0;
   int32_t icmp_type = 8;
   int32_t icmp_code = 0;
@@ -1368,6 +1395,9 @@ struct PersistentDeviceStreamState {
   uint32_t ramp_max_quota = 0;
   uint32_t ramp_epoch_counter = 0;
   uint32_t seq_counter = 0;
+  uint32_t tcp_ack_counter = 0;
+  uint8_t tcp_state = 0;
+  uint8_t _tcp_state_pad[3]{0, 0, 0};
   uint32_t produced = 0;
   uint32_t completed = 0;
   uint32_t queue_cursor = 0;
@@ -1396,6 +1426,7 @@ struct PersistentDeviceStreamState {
   uint32_t template_base_dst_ip = 0;
   uint32_t template_base_tcp_seq = 0;
   uint32_t template_base_tcp_ack = 0;
+  uint16_t template_base_tcp_flags = 0;
   uint8_t template_valid = 0;
   uint8_t template_packet[kPersistentMaxPacketBytes]{};
 };
@@ -1426,7 +1457,14 @@ struct PersistentStreamState {
   uint16_t target_port = 0;
   uint16_t tcp_flags = 0x02;
   uint16_t tcp_window = 65535;
+  uint16_t tcp_mss = 1460;
+  uint8_t tcp_window_scale = 8;
+  uint8_t tcp_sack_permitted = 1;
+  uint8_t tcp_timestamp_enabled = 1;
   uint16_t source_port = 0;
+  uint32_t tcp_seq = 0;
+  uint32_t tcp_ack = 0;
+  uint8_t tcp_state = 0;
   int icmp_type = 8;
   int icmp_code = 0;
   uint32_t base_quota = 0;
@@ -1481,6 +1519,30 @@ struct PersistentDocaGpuNetioStats {
   int queue_id = 0;
 };
 
+struct PersistentDocaFlowUpdateEventV1 {
+  uint64_t version = 0u;
+  uint64_t epoch = 0u;
+  uint32_t flow_id = 0u;
+  uint32_t tcp_seq = 0u;
+  uint32_t tcp_ack = 0u;
+  uint16_t src_port = 0u;
+  uint16_t dst_port = 0u;
+  uint8_t tcp_state = 0u;
+  uint8_t proto = 0u;
+  uint16_t flags = 0u;
+  uint32_t rtt_us = 0u;
+  uint64_t dpu_ts_ns = 0u;
+};
+
+struct PersistentDocaContractWriterConfigV1 {
+  char region_spec[512]{};
+  char device_name[64]{};
+  uint32_t shard_count = 0u;
+  uint32_t ring_slots_per_shard = 0u;
+  uint32_t hot_flow_capacity = 0u;
+  uint32_t flags = 0u;
+};
+
 struct PersistentDocaGpuNetioApiV1 {
   int version = 0;
   int (*create_txq)(
@@ -1516,6 +1578,17 @@ struct PersistentDocaGpuNetioApiV1 {
   int (*get_stats)(int handle, PersistentDocaGpuNetioStats* out, char* err, size_t err_len) = nullptr;
   int (*get_gpu_txq_handle)(int handle, uint64_t* out_gpu_txq_handle, char* err, size_t err_len) = nullptr;
   int (*get_txq_mkey_be)(int handle, uint32_t* out_mkey_be, char* err, size_t err_len) = nullptr;
+  int (*contract_writer_open)(
+      const PersistentDocaContractWriterConfigV1* cfg,
+      int* out_handle,
+      char* err,
+      size_t err_len) = nullptr;
+  int (*contract_writer_close)(int handle, char* err, size_t err_len) = nullptr;
+  int (*contract_writer_publish_flow_update_v1)(
+      int handle,
+      const PersistentDocaFlowUpdateEventV1* event,
+      char* err,
+      size_t err_len) = nullptr;
 };
 
 struct PersistentTxBridgeRuntime {
@@ -1701,6 +1774,45 @@ struct PersistentRuntime {
   }
 };
 PersistentRuntime g_persistent_runtime;
+struct PersistentContractRuntime {
+  int shard_count = 0;
+  int ring_slots_per_shard = 0;
+  int hot_flow_capacity = 0;
+  ddos_samurai::gpu_packet_cuda::zero_copy::RingOverflowPolicy overflow_policy =
+      ddos_samurai::gpu_packet_cuda::zero_copy::RingOverflowPolicy::kControlledDrop;
+  std::vector<ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1> update_ring{};
+  std::vector<uint64_t> ring_head{};
+  std::vector<uint64_t> ring_tail{};
+  std::vector<uint64_t> ring_drop_by_shard{};
+  std::vector<ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1> hot_flow_table{};
+  std::vector<uint64_t> hot_flow_versions{};
+  std::vector<uint64_t> hot_flow_epochs{};
+  ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* update_ring_dev = nullptr;
+  uint64_t* ring_head_dev = nullptr;
+  uint64_t* ring_tail_dev = nullptr;
+  ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* hot_flow_table_dev = nullptr;
+  uint64_t* hot_flow_versions_dev = nullptr;
+  uint64_t* hot_flow_epochs_dev = nullptr;
+  void* export_region_host = nullptr;
+  void* export_region_dev = nullptr;
+  size_t export_region_bytes = 0u;
+  int export_region_fd = -1;
+  std::string export_region_path{};
+  std::string export_region_spec{};
+  bool export_region_registered = false;
+  bool export_region_file_backed = false;
+  uint64_t publish_count = 0u;
+  uint64_t drop_count = 0u;
+  uint64_t version_gap_count = 0u;
+  uint64_t resync_request_count = 0u;
+  uint64_t epoch_mismatch_count = 0u;
+  uint64_t poison_event_count = 0u;
+  uint64_t migration_event_count = 0u;
+  uint64_t device_sync_error_count = 0u;
+  bool device_mirror_initialized = false;
+  bool initialized = false;
+};
+PersistentContractRuntime g_persistent_contract_runtime;
 thread_local std::string g_stream_stats_json;
 
 inline uint64_t now_ns_steady() {
@@ -1708,6 +1820,424 @@ inline uint64_t now_ns_steady() {
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch())
           .count());
+}
+
+struct PersistentContractRegionLayout {
+  size_t ring_head_off = 0u;
+  size_t ring_tail_off = 0u;
+  size_t update_ring_off = 0u;
+  size_t hot_flow_table_off = 0u;
+  size_t hot_flow_versions_off = 0u;
+  size_t hot_flow_epochs_off = 0u;
+  size_t total_bytes = 0u;
+};
+
+inline bool persistent_checked_add_size(size_t a, size_t b, size_t* out) {
+  if (!out || a > std::numeric_limits<size_t>::max() - b) {
+    return false;
+  }
+  *out = a + b;
+  return true;
+}
+
+inline bool persistent_checked_mul_size(size_t a, size_t b, size_t* out) {
+  if (!out || (a != 0u && b > std::numeric_limits<size_t>::max() / a)) {
+    return false;
+  }
+  *out = a * b;
+  return true;
+}
+
+inline bool persistent_contract_region_layout(
+    size_t shard_count,
+    size_t ring_slots_per_shard,
+    size_t hot_flow_capacity,
+    PersistentContractRegionLayout* out) {
+  if (!out || shard_count == 0u || ring_slots_per_shard == 0u || hot_flow_capacity == 0u) {
+    return false;
+  }
+  size_t shard_bytes = 0u;
+  size_t ring_slots = 0u;
+  size_t ring_bytes = 0u;
+  size_t hot_flow_bytes = 0u;
+  size_t hot_meta_bytes = 0u;
+  const size_t event_bytes = sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1);
+  if (!persistent_checked_mul_size(shard_count, sizeof(uint64_t), &shard_bytes) ||
+      !persistent_checked_mul_size(shard_count, ring_slots_per_shard, &ring_slots) ||
+      !persistent_checked_mul_size(ring_slots, event_bytes, &ring_bytes) ||
+      !persistent_checked_mul_size(hot_flow_capacity, event_bytes, &hot_flow_bytes) ||
+      !persistent_checked_mul_size(hot_flow_capacity, sizeof(uint64_t), &hot_meta_bytes)) {
+    return false;
+  }
+  PersistentContractRegionLayout layout{};
+  size_t cur = 0u;
+  layout.ring_head_off = cur;
+  if (!persistent_checked_add_size(cur, shard_bytes, &cur)) return false;
+  layout.ring_tail_off = cur;
+  if (!persistent_checked_add_size(cur, shard_bytes, &cur)) return false;
+  layout.update_ring_off = cur;
+  if (!persistent_checked_add_size(cur, ring_bytes, &cur)) return false;
+  layout.hot_flow_table_off = cur;
+  if (!persistent_checked_add_size(cur, hot_flow_bytes, &cur)) return false;
+  layout.hot_flow_versions_off = cur;
+  if (!persistent_checked_add_size(cur, hot_meta_bytes, &cur)) return false;
+  layout.hot_flow_epochs_off = cur;
+  if (!persistent_checked_add_size(cur, hot_meta_bytes, &cur)) return false;
+  layout.total_bytes = cur;
+  *out = layout;
+  return true;
+}
+
+inline std::string persistent_contract_default_export_path() {
+  const char* env_path = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_PATH");
+  if (env_path && *env_path) {
+    return std::string(env_path);
+  }
+  const char* dir = (::access("/dev/shm", W_OK) == 0) ? "/dev/shm" : "/tmp";
+  return std::string(dir) + "/samurai_gpu_contract_" + std::to_string(static_cast<long long>(::getuid())) + ".bin";
+}
+
+inline uint8_t* persistent_contract_region_base(PersistentContractRuntime& cr) {
+  return static_cast<uint8_t*>(cr.export_region_host);
+}
+
+inline std::string persistent_contract_export_region_spec(
+    const std::string& path,
+    const PersistentContractRegionLayout& layout,
+    size_t shard_count,
+    size_t ring_slots_per_shard,
+    size_t hot_flow_capacity) {
+  std::string kind = "file";
+  if (const char* raw_kind = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_KIND")) {
+    if (*raw_kind) {
+      kind = std::string(raw_kind);
+      std::transform(kind.begin(), kind.end(), kind.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+      if (kind == "doca-mmap") {
+        kind = "doca_mmap";
+      }
+    }
+  }
+  std::ostringstream oss;
+  oss << "kind=" << kind
+      << ",layout=1"
+      << ",file=" << path
+      << ",size=" << layout.total_bytes
+      << ",shards=" << shard_count
+      << ",slots=" << ring_slots_per_shard
+      << ",hot=" << hot_flow_capacity
+      << ",event=" << sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1);
+  return oss.str();
+}
+
+inline void persistent_contract_store_event_slot(
+    volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* dst,
+    const ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1& ev) {
+  const uint64_t begin_version = (ev.version > 0u && (ev.version & 1ull) == 0ull) ? (ev.version - 1ull) : (ev.version | 1ull);
+  __atomic_store_n(&dst->version, begin_version, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  dst->epoch = ev.epoch;
+  dst->flow_id = ev.flow_id;
+  dst->tcp_seq = ev.tcp_seq;
+  dst->tcp_ack = ev.tcp_ack;
+  dst->src_port = ev.src_port;
+  dst->dst_port = ev.dst_port;
+  dst->tcp_state = ev.tcp_state;
+  dst->proto = ev.proto;
+  dst->flags = ev.flags;
+  dst->rtt_us = ev.rtt_us;
+  dst->dpu_ts_ns = ev.dpu_ts_ns;
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n(&dst->version, ev.version, __ATOMIC_RELEASE);
+}
+
+inline void persistent_contract_runtime_release_unlocked() {
+  auto& cr = g_persistent_contract_runtime;
+  if (cr.export_region_registered && cr.export_region_host) {
+    (void)cudaHostUnregister(cr.export_region_host);
+  }
+  if (cr.export_region_file_backed && cr.export_region_host && cr.export_region_bytes > 0u) {
+    (void)::msync(cr.export_region_host, cr.export_region_bytes, MS_SYNC);
+    (void)::munmap(cr.export_region_host, cr.export_region_bytes);
+  }
+  if (cr.export_region_fd >= 0) {
+    (void)::close(cr.export_region_fd);
+  }
+  cr.update_ring_dev = nullptr;
+  cr.ring_head_dev = nullptr;
+  cr.ring_tail_dev = nullptr;
+  cr.hot_flow_table_dev = nullptr;
+  cr.hot_flow_versions_dev = nullptr;
+  cr.hot_flow_epochs_dev = nullptr;
+  cr.export_region_host = nullptr;
+  cr.export_region_dev = nullptr;
+  cr.export_region_bytes = 0u;
+  cr.export_region_fd = -1;
+  cr.export_region_path.clear();
+  cr.export_region_spec.clear();
+  cr.export_region_registered = false;
+  cr.export_region_file_backed = false;
+  cr.shard_count = 0;
+  cr.ring_slots_per_shard = 0;
+  cr.hot_flow_capacity = 0;
+  cr.overflow_policy = ddos_samurai::gpu_packet_cuda::zero_copy::RingOverflowPolicy::kControlledDrop;
+  cr.update_ring.clear();
+  cr.ring_head.clear();
+  cr.ring_tail.clear();
+  cr.ring_drop_by_shard.clear();
+  cr.hot_flow_table.clear();
+  cr.hot_flow_versions.clear();
+  cr.hot_flow_epochs.clear();
+  cr.publish_count = 0u;
+  cr.drop_count = 0u;
+  cr.version_gap_count = 0u;
+  cr.epoch_mismatch_count = 0u;
+  cr.device_sync_error_count = 0u;
+  cr.device_mirror_initialized = false;
+  cr.initialized = false;
+}
+
+inline bool persistent_contract_runtime_alloc_device_mirror_unlocked(
+    PersistentContractRuntime& cr,
+    size_t ring_total,
+    size_t shard_count_s,
+    size_t hot_flow_capacity_s) {
+  (void)ring_total;
+  PersistentContractRegionLayout layout{};
+  if (!persistent_contract_region_layout(
+          shard_count_s,
+          static_cast<size_t>(cr.ring_slots_per_shard),
+          hot_flow_capacity_s,
+          &layout)) {
+    return false;
+  }
+  const std::string path = persistent_contract_default_export_path();
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return false;
+  }
+  if (::ftruncate(fd, static_cast<off_t>(layout.total_bytes)) != 0) {
+    (void)::close(fd);
+    return false;
+  }
+  void* mapped = ::mmap(nullptr, layout.total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (mapped == MAP_FAILED || !mapped) {
+    (void)::close(fd);
+    return false;
+  }
+  std::memset(mapped, 0, layout.total_bytes);
+  if (cudaHostRegister(mapped, layout.total_bytes, cudaHostRegisterMapped) != cudaSuccess) {
+    (void)::munmap(mapped, layout.total_bytes);
+    (void)::close(fd);
+    return false;
+  }
+  void* dev_base = nullptr;
+  if (cudaHostGetDevicePointer(&dev_base, mapped, 0) != cudaSuccess || !dev_base) {
+    (void)cudaHostUnregister(mapped);
+    (void)::munmap(mapped, layout.total_bytes);
+    (void)::close(fd);
+    return false;
+  }
+  cr.export_region_host = mapped;
+  cr.export_region_dev = dev_base;
+  cr.export_region_bytes = layout.total_bytes;
+  cr.export_region_fd = fd;
+  cr.export_region_path = path;
+  cr.export_region_spec = persistent_contract_export_region_spec(
+      path,
+      layout,
+      shard_count_s,
+      static_cast<size_t>(cr.ring_slots_per_shard),
+      hot_flow_capacity_s);
+  cr.export_region_registered = true;
+  cr.export_region_file_backed = true;
+  auto* dev_u8 = static_cast<uint8_t*>(dev_base);
+  cr.ring_head_dev = reinterpret_cast<uint64_t*>(dev_u8 + layout.ring_head_off);
+  cr.ring_tail_dev = reinterpret_cast<uint64_t*>(dev_u8 + layout.ring_tail_off);
+  cr.update_ring_dev = reinterpret_cast<ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      dev_u8 + layout.update_ring_off);
+  cr.hot_flow_table_dev = reinterpret_cast<ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      dev_u8 + layout.hot_flow_table_off);
+  cr.hot_flow_versions_dev = reinterpret_cast<uint64_t*>(dev_u8 + layout.hot_flow_versions_off);
+  cr.hot_flow_epochs_dev = reinterpret_cast<uint64_t*>(dev_u8 + layout.hot_flow_epochs_off);
+  cr.device_mirror_initialized = true;
+  return true;
+}
+
+inline bool persistent_contract_runtime_sync_device_slot_unlocked(
+    PersistentContractRuntime& cr,
+    size_t ring_index,
+    size_t shard,
+    size_t flow_id) {
+  if (!cr.device_mirror_initialized || !cr.update_ring_dev || !cr.ring_head_dev || !cr.ring_tail_dev ||
+      !cr.hot_flow_table_dev || !cr.hot_flow_versions_dev || !cr.hot_flow_epochs_dev) {
+    cr.device_sync_error_count += 1u;
+    return false;
+  }
+  if (ring_index >= cr.update_ring.size() || shard >= cr.ring_head.size() || shard >= cr.ring_tail.size() ||
+      flow_id >= cr.hot_flow_table.size() || flow_id >= cr.hot_flow_versions.size() || flow_id >= cr.hot_flow_epochs.size()) {
+    cr.device_sync_error_count += 1u;
+    return false;
+  }
+  PersistentContractRegionLayout layout{};
+  if (!cr.export_region_host ||
+      !persistent_contract_region_layout(
+          static_cast<size_t>(cr.shard_count),
+          static_cast<size_t>(cr.ring_slots_per_shard),
+          static_cast<size_t>(cr.hot_flow_capacity),
+          &layout) ||
+      cr.export_region_bytes < layout.total_bytes) {
+    cr.device_sync_error_count += 1u;
+    return false;
+  }
+  auto* base = persistent_contract_region_base(cr);
+  auto* heads = reinterpret_cast<volatile uint64_t*>(base + layout.ring_head_off);
+  auto* ring = reinterpret_cast<volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      base + layout.update_ring_off);
+  auto* hot = reinterpret_cast<volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      base + layout.hot_flow_table_off);
+  auto* hot_versions = reinterpret_cast<volatile uint64_t*>(base + layout.hot_flow_versions_off);
+  auto* hot_epochs = reinterpret_cast<volatile uint64_t*>(base + layout.hot_flow_epochs_off);
+  persistent_contract_store_event_slot(ring + ring_index, cr.update_ring[ring_index]);
+  persistent_contract_store_event_slot(hot + flow_id, cr.hot_flow_table[flow_id]);
+  __atomic_store_n(&hot_versions[flow_id], cr.hot_flow_versions[flow_id], __ATOMIC_RELEASE);
+  __atomic_store_n(&hot_epochs[flow_id], cr.hot_flow_epochs[flow_id], __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n(&heads[shard], cr.ring_head[shard], __ATOMIC_RELEASE);
+  return true;
+}
+
+inline bool persistent_contract_runtime_refresh_device_tail_unlocked(PersistentContractRuntime& cr, size_t shard) {
+  if (!cr.device_mirror_initialized || !cr.ring_tail_dev || !cr.export_region_host || shard >= cr.ring_tail.size()) {
+    return true;
+  }
+  PersistentContractRegionLayout layout{};
+  if (!persistent_contract_region_layout(
+          static_cast<size_t>(cr.shard_count),
+          static_cast<size_t>(cr.ring_slots_per_shard),
+          static_cast<size_t>(cr.hot_flow_capacity),
+          &layout) ||
+      cr.export_region_bytes < layout.total_bytes) {
+    cr.device_sync_error_count += 1u;
+    return false;
+  }
+  auto* tails = reinterpret_cast<volatile uint64_t*>(persistent_contract_region_base(cr) + layout.ring_tail_off);
+  const uint64_t device_tail = __atomic_load_n(&tails[shard], __ATOMIC_ACQUIRE);
+  if (device_tail > cr.ring_tail[shard]) {
+    cr.ring_tail[shard] = device_tail;
+  }
+  return true;
+}
+
+inline bool persistent_contract_runtime_sync_device_tail_unlocked(PersistentContractRuntime& cr, size_t shard) {
+  if (!cr.device_mirror_initialized || !cr.ring_tail_dev || !cr.export_region_host || shard >= cr.ring_tail.size()) {
+    return true;
+  }
+  PersistentContractRegionLayout layout{};
+  if (!persistent_contract_region_layout(
+          static_cast<size_t>(cr.shard_count),
+          static_cast<size_t>(cr.ring_slots_per_shard),
+          static_cast<size_t>(cr.hot_flow_capacity),
+          &layout) ||
+      cr.export_region_bytes < layout.total_bytes) {
+    cr.device_sync_error_count += 1u;
+    return false;
+  }
+  auto* tails = reinterpret_cast<volatile uint64_t*>(persistent_contract_region_base(cr) + layout.ring_tail_off);
+  __atomic_store_n(&tails[shard], cr.ring_tail[shard], __ATOMIC_RELEASE);
+  return true;
+}
+
+inline bool persistent_contract_runtime_ensure_started_unlocked(const PersistentRuntime& rt) {
+  auto& cr = g_persistent_contract_runtime;
+  if (cr.initialized) {
+    return true;
+  }
+  auto clamp_local = [](int v, int lo, int hi) -> int {
+    if (v < lo) {
+      return lo;
+    }
+    if (v > hi) {
+      return hi;
+    }
+    return v;
+  };
+  auto env_int_local_contract = [](const char* name, int defv) -> int {
+    const char* v = std::getenv(name);
+    if (!v || !*v) {
+      return defv;
+    }
+    try {
+      return std::stoi(v);
+    } catch (...) {
+      return defv;
+    }
+  };
+  auto env_string_or_contract = [](const char* name, const std::string& defv) -> std::string {
+    const char* v = std::getenv(name);
+    if (!v || !*v) {
+      return defv;
+    }
+    return std::string(v);
+  };
+  auto lower_copy_contract = [](std::string s) -> std::string {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+  };
+  const int shard_default = std::max(1, rt.queue_count);
+  const int ring_default = 1024;
+  const int hot_default = kPersistentMaxStreams;
+
+  auto parse_overflow_policy = [&](const std::string& raw)
+      -> ddos_samurai::gpu_packet_cuda::zero_copy::RingOverflowPolicy {
+    const std::string v = lower_copy_contract(raw);
+    if (v == "hard_fail" || v == "hardfail" || v == "fail") {
+      return ddos_samurai::gpu_packet_cuda::zero_copy::RingOverflowPolicy::kHardFail;
+    }
+    return ddos_samurai::gpu_packet_cuda::zero_copy::RingOverflowPolicy::kControlledDrop;
+  };
+
+  cr.shard_count = clamp_local(env_int_local_contract("SAMURAI_GPU_CONTRACT_SHARDS", shard_default), 1, 256);
+  cr.ring_slots_per_shard = clamp_local(
+      env_int_local_contract("SAMURAI_GPU_CONTRACT_RING_SLOTS", ring_default), 64, 65536);
+  cr.hot_flow_capacity = clamp_local(
+      env_int_local_contract("SAMURAI_GPU_CONTRACT_HOT_FLOW_CAPACITY", hot_default), 1, 1 << 20);
+  cr.overflow_policy = parse_overflow_policy(
+      env_string_or_contract("SAMURAI_GPU_CONTRACT_RING_OVERFLOW", "controlled_drop"));
+
+  const size_t shard_count_s = static_cast<size_t>(cr.shard_count);
+  const size_t ring_slots_s = static_cast<size_t>(cr.ring_slots_per_shard);
+  const size_t ring_total = shard_count_s * ring_slots_s;
+  try {
+    cr.update_ring.assign(ring_total, ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1{});
+    cr.ring_head.assign(shard_count_s, 0u);
+    cr.ring_tail.assign(shard_count_s, 0u);
+    cr.ring_drop_by_shard.assign(shard_count_s, 0u);
+    cr.hot_flow_table.assign(
+        static_cast<size_t>(cr.hot_flow_capacity),
+        ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1{});
+    cr.hot_flow_versions.assign(static_cast<size_t>(cr.hot_flow_capacity), 0u);
+    cr.hot_flow_epochs.assign(static_cast<size_t>(cr.hot_flow_capacity), 0u);
+  } catch (...) {
+    persistent_contract_runtime_release_unlocked();
+    return false;
+  }
+  if (!persistent_contract_runtime_alloc_device_mirror_unlocked(
+          cr,
+          ring_total,
+          shard_count_s,
+          static_cast<size_t>(cr.hot_flow_capacity))) {
+    persistent_contract_runtime_release_unlocked();
+    return false;
+  }
+  cr.publish_count = 0u;
+  cr.drop_count = 0u;
+  cr.version_gap_count = 0u;
+  cr.epoch_mismatch_count = 0u;
+  cr.device_sync_error_count = 0u;
+  cr.initialized = true;
+  return true;
 }
 
 inline void host_u64_add(volatile uint64_t* p, uint64_t v) {
@@ -2702,7 +3232,15 @@ inline void persistent_build_stream_template(volatile PersistentDeviceStreamStat
   const int has_eth = (sv->has_ethernet != 0) ? 1 : 0;
   const int ip_off = has_eth ? 14 : 0;
   const int ip_len = 20;
-  const int tcp_len = 20;
+  int tcp_opt_len = 0;
+  if (is_tcp && (sv->tcp_flags & 0x02u) != 0u) {
+    tcp_opt_len = 4;
+    if (sv->tcp_sack_permitted != 0u) tcp_opt_len += 2;
+    if (sv->tcp_timestamp_enabled != 0u) tcp_opt_len += 10;
+    tcp_opt_len += 3;
+    while ((tcp_opt_len & 3) != 0) ++tcp_opt_len;
+  }
+  const int tcp_len = 20 + tcp_opt_len;
   const int udp_len = 8;
   const int icmp_len = 8;
   const int l4_len = (is_tcp ? tcp_len : (is_udp ? udp_len : icmp_len)) + payload_len;
@@ -2765,11 +3303,36 @@ inline void persistent_build_stream_template(volatile PersistentDeviceStreamStat
     w16(out, t_off + 2, sv->target_port);
     w32(out, t_off + 4, tcp_seq);
     w32(out, t_off + 8, tcp_ack);
-    out[t_off + 12] = 0x50;
+    out[t_off + 12] = static_cast<uint8_t>((tcp_len / 4) << 4);
     out[t_off + 13] = static_cast<uint8_t>(sv->tcp_flags & 0xFFu);
     w16(out, t_off + 14, sv->tcp_window);
     w16(out, t_off + 16, 0u);
     w16(out, t_off + 18, 0u);
+    int opt = t_off + 20;
+    if (tcp_opt_len > 0) {
+      out[opt++] = 2u;
+      out[opt++] = 4u;
+      w16(out, opt, sv->tcp_mss);
+      opt += 2;
+      if (sv->tcp_sack_permitted != 0u) {
+        out[opt++] = 4u;
+        out[opt++] = 2u;
+      }
+      if (sv->tcp_timestamp_enabled != 0u) {
+        out[opt++] = 8u;
+        out[opt++] = 10u;
+        w32(out, opt, 1u);
+        opt += 4;
+        w32(out, opt, 0u);
+        opt += 4;
+      }
+      out[opt++] = 3u;
+      out[opt++] = 3u;
+      out[opt++] = static_cast<uint8_t>(sv->tcp_window_scale <= 14u ? sv->tcp_window_scale : 14u);
+      while (opt < t_off + tcp_len) {
+        out[opt++] = 1u;
+      }
+    }
   } else if (is_udp) {
     w16(out, t_off + 0, src_port);
     w16(out, t_off + 2, sv->target_port);
@@ -2816,6 +3379,7 @@ inline void persistent_build_stream_template(volatile PersistentDeviceStreamStat
   sv->template_base_dst_ip = r32(out, ip + 16);
   sv->template_base_tcp_seq = is_tcp ? r32(out, t_off + 4) : 0u;
   sv->template_base_tcp_ack = is_tcp ? r32(out, t_off + 8) : 0u;
+  sv->template_base_tcp_flags = is_tcp ? r16(out, t_off + 12) : 0u;
   sv->template_valid = 1;
 }
 
@@ -2980,7 +3544,6 @@ __device__ inline void persistent_write_packet(
   const int has_eth = (sv->has_ethernet != 0) ? 1 : 0;
   const int ip_off = has_eth ? 14 : 0;
   const int ip_len = 20;
-  const int tcp_len = 20;
   const int udp_len = 8;
   const int icmp_len = 8;
   const bool is_tcp = (protocol == 6);
@@ -3049,12 +3612,20 @@ __device__ inline void persistent_write_packet(
 
     if (is_tcp) {
       w16(t_off_t + 0, src_port);
-      const uint32_t tcp_seq = seq * 2654435761u;
+      const uint32_t tcp_seq = seq;
+      const uint32_t tcp_ack = sv->tcp_ack_counter;
       w32(t_off_t + 4, tcp_seq);
+      w32(t_off_t + 8, tcp_ack);
+      payload[t_off_t + 13] = static_cast<uint8_t>(sv->tcp_flags & 0xFFu);
+      const uint16_t tcp_flags_word =
+          static_cast<uint16_t>((static_cast<uint16_t>(payload[t_off_t + 12]) << 8) |
+                                static_cast<uint16_t>(payload[t_off_t + 13]));
       uint16_t tcp_csum = sv->template_base_l4_csum;
       tcp_csum = persistent_rfc1624_update_dword(tcp_csum, sv->template_base_src_ip, src_ip);
       tcp_csum = persistent_rfc1624_update_word(tcp_csum, sv->template_base_src_port, src_port);
       tcp_csum = persistent_rfc1624_update_dword(tcp_csum, sv->template_base_tcp_seq, tcp_seq);
+      tcp_csum = persistent_rfc1624_update_dword(tcp_csum, sv->template_base_tcp_ack, tcp_ack);
+      tcp_csum = persistent_rfc1624_update_word(tcp_csum, sv->template_base_tcp_flags, tcp_flags_word);
       w16(t_off_t + 16, tcp_csum);
     } else if (is_udp) {
       w16(t_off_t + 0, src_port);
@@ -3085,6 +3656,15 @@ __device__ inline void persistent_write_packet(
   if (payload_len > kPersistentPayloadCapacity) {
     payload_len = kPersistentPayloadCapacity;
   }
+  int tcp_opt_len = 0;
+  if (is_tcp && (sv->tcp_flags & 0x02u) != 0u) {
+    tcp_opt_len = 4;
+    if (sv->tcp_sack_permitted != 0u) tcp_opt_len += 2;
+    if (sv->tcp_timestamp_enabled != 0u) tcp_opt_len += 10;
+    tcp_opt_len += 3;
+    while ((tcp_opt_len & 3) != 0) ++tcp_opt_len;
+  }
+  const int tcp_len = 20 + tcp_opt_len;
   const int transport_len = (is_tcp ? tcp_len : (is_udp ? udp_len : icmp_len)) + payload_len;
   const int total_len = ip_off + ip_len + transport_len;
   if (total_len <= 0 || total_len > static_cast<int>(max_packet_bytes)) {
@@ -3135,13 +3715,38 @@ __device__ inline void persistent_write_packet(
   if (is_tcp) {
     w16(t_off + 0, src_port);
     w16(t_off + 2, sv->target_port);
-    w32(t_off + 4, seq * 2654435761u);
-    w32(t_off + 8, 0u);
-    payload[t_off + 12] = 0x50;  // TCP header len 20 bytes
+    w32(t_off + 4, seq);
+    w32(t_off + 8, sv->tcp_ack_counter);
+    payload[t_off + 12] = static_cast<uint8_t>((tcp_len / 4) << 4);
     payload[t_off + 13] = static_cast<uint8_t>(sv->tcp_flags & 0xFFu);
     w16(t_off + 14, sv->tcp_window);
     w16(t_off + 16, 0u);
     w16(t_off + 18, 0u);
+    int opt = t_off + 20;
+    if (tcp_opt_len > 0) {
+      payload[opt++] = 2u;
+      payload[opt++] = 4u;
+      w16(opt, sv->tcp_mss);
+      opt += 2;
+      if (sv->tcp_sack_permitted != 0u) {
+        payload[opt++] = 4u;
+        payload[opt++] = 2u;
+      }
+      if (sv->tcp_timestamp_enabled != 0u) {
+        payload[opt++] = 8u;
+        payload[opt++] = 10u;
+        w32(opt, seq);
+        opt += 4;
+        w32(opt, sv->tcp_ack_counter);
+        opt += 4;
+      }
+      payload[opt++] = 3u;
+      payload[opt++] = 3u;
+      payload[opt++] = static_cast<uint8_t>(sv->tcp_window_scale <= 14u ? sv->tcp_window_scale : 14u);
+      while (opt < t_off + tcp_len) {
+        payload[opt++] = 1u;
+      }
+    }
   } else if (is_udp) {
     w16(t_off + 0, src_port);
     w16(t_off + 2, sv->target_port);
@@ -3185,6 +3790,10 @@ __device__ inline uint32_t u32_load(const volatile uint32_t* p) {
 }
 
 __device__ inline int32_t i32_load(const volatile int32_t* p) {
+  return *p;
+}
+
+__device__ inline uint64_t u64_load(const volatile uint64_t* p) {
   return *p;
 }
 
@@ -3388,6 +3997,265 @@ __global__ void persistent_quota_refill_kernel(
   sv->quota_left = static_cast<uint32_t>(next_left);
 }
 
+static constexpr uint8_t kPersistentContractTcpStateMigrating = 250u;
+static constexpr uint8_t kPersistentContractTcpStatePoisoned = 255u;
+
+__device__ inline void persistent_contract_pause_stream(volatile PersistentDeviceStreamState* sv) {
+  if (!sv) {
+    return;
+  }
+  sv->active = 0;
+  sv->quota_left = 0;
+  sv->quota = 0;
+}
+
+__device__ inline void persistent_contract_stop_kernel(
+    volatile PersistentRuntimeControl* ctrl,
+    volatile int32_t* run_flag_dev) {
+  if (ctrl) {
+    ctrl->run = 0;
+  }
+  if (run_flag_dev) {
+    atomicExch((int*)run_flag_dev, 0);
+  }
+}
+
+__device__ inline bool persistent_slot_transition(
+    PersistentRingSlot* slot,
+    int32_t expected,
+    int32_t next,
+    volatile PersistentRuntimeControl* ctrl) {
+  if (!slot) {
+    return false;
+  }
+  if (slot->state != expected) {
+    if (ctrl) {
+      u64_add(&ctrl->tx_ownership_invalid_events, 1u);
+    }
+    return false;
+  }
+  slot->state = next;
+  if (ctrl) {
+    u64_add(&ctrl->tx_ownership_transitions, 1u);
+  }
+  return true;
+}
+
+__device__ inline void persistent_contract_poll_assigned_shard(
+    volatile PersistentRuntimeControl* ctrl,
+    volatile PersistentDeviceStreamState* streams,
+    volatile int32_t* run_flag_dev,
+    const volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* contract_update_ring,
+    volatile uint64_t* contract_ring_head,
+    volatile uint64_t* contract_ring_tail,
+    volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* contract_hot_flow_table,
+    volatile uint64_t* contract_hot_flow_versions,
+    volatile uint64_t* contract_hot_flow_epochs,
+    int32_t contract_shard_count,
+    int32_t contract_ring_slots_per_shard,
+    int32_t contract_hot_flow_capacity,
+    int32_t max_streams,
+    uint64_t contract_stale_ttl_ns,
+    uint64_t contract_heartbeat_timeout_ns,
+    uint32_t lane) {
+  using FlowUpdateEvent = ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1;
+  if (!ctrl || !streams || !contract_update_ring || !contract_ring_head || !contract_ring_tail ||
+      !contract_hot_flow_table || !contract_hot_flow_versions || !contract_hot_flow_epochs ||
+      contract_shard_count <= 0 || contract_ring_slots_per_shard <= 0 || contract_hot_flow_capacity <= 0 ||
+      max_streams <= 0) {
+    return;
+  }
+  constexpr unsigned int kPollWarpMask = 0xFFFFFFFFu;
+  constexpr uint32_t kPollWarpWidth = 32u;
+  __shared__ uint32_t s_contract_flow_ids[32];
+  __shared__ uint64_t s_contract_versions[32];
+  __shared__ int32_t s_contract_loaded[32];
+  // The first warp is the block-local polling scope. Each lane drains one
+  // event, while lane 0 remains the single tail publisher for the shard.
+  if (threadIdx.x >= static_cast<int>(kPollWarpWidth)) {
+    return;
+  }
+  const int32_t shard = static_cast<int32_t>(blockIdx.x);
+  if (shard < 0 || shard >= contract_shard_count) {
+    return;
+  }
+  if (lane == 0u && contract_heartbeat_timeout_ns > 0u) {
+    const uint64_t host_now = u64_load(&ctrl->host_time_ns);
+    const uint64_t last_dpu_ts = u64_load(&ctrl->last_contract_dpu_ts_ns);
+    if (host_now > last_dpu_ts && last_dpu_ts != 0u &&
+        (host_now - last_dpu_ts) > contract_heartbeat_timeout_ns) {
+      u64_add(&ctrl->contract_heartbeat_lost_events, 1u);
+      persistent_contract_stop_kernel(ctrl, run_flag_dev);
+      return;
+    }
+  }
+  uint64_t head = 0u;
+  uint64_t tail = 0u;
+  if (lane == 0u) {
+    head = u64_load(contract_ring_head + shard);
+    tail = u64_load(contract_ring_tail + shard);
+  }
+  head = __shfl_sync(kPollWarpMask, head, 0);
+  tail = __shfl_sync(kPollWarpMask, tail, 0);
+  if (tail >= head) {
+    return;
+  }
+
+  uint64_t available = head - tail;
+  if (available > static_cast<uint64_t>(kPollWarpWidth)) {
+    available = static_cast<uint64_t>(kPollWarpWidth);
+  }
+  const uint32_t drain_count = static_cast<uint32_t>(available);
+  const bool lane_active = lane < drain_count;
+  const uint64_t lane_tail = tail + static_cast<uint64_t>(lane);
+  const uint64_t slot = lane_tail % static_cast<uint64_t>(contract_ring_slots_per_shard);
+  const size_t ring_index =
+      (static_cast<size_t>(shard) * static_cast<size_t>(contract_ring_slots_per_shard)) +
+      static_cast<size_t>(slot);
+  const volatile FlowUpdateEvent* entry = contract_update_ring + ring_index;
+  FlowUpdateEvent ev{};
+  bool loaded = false;
+  if (lane_active) {
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      const uint64_t v1 = u64_load(&entry->version);
+      if (v1 == 0u || (v1 & 1ull) != 0ull) {
+        break;
+      }
+      __threadfence_system();
+      ev.version = v1;
+      ev.epoch = u64_load(&entry->epoch);
+      ev.flow_id = entry->flow_id;
+      ev.tcp_seq = entry->tcp_seq;
+      ev.tcp_ack = entry->tcp_ack;
+      ev.src_port = entry->src_port;
+      ev.dst_port = entry->dst_port;
+      ev.tcp_state = entry->tcp_state;
+      ev.proto = entry->proto;
+      ev.flags = entry->flags;
+      ev.rtt_us = entry->rtt_us;
+      ev.dpu_ts_ns = u64_load(&entry->dpu_ts_ns);
+      __threadfence_system();
+      const uint64_t v2 = u64_load(&entry->version);
+      if (v1 == v2 && (v2 & 1ull) == 0ull) {
+        loaded = true;
+        break;
+      }
+    }
+  }
+  const unsigned int loaded_mask = __ballot_sync(kPollWarpMask, loaded);
+  s_contract_flow_ids[lane] = ev.flow_id;
+  s_contract_versions[lane] = ev.version;
+  s_contract_loaded[lane] = loaded ? 1 : 0;
+  __syncwarp(kPollWarpMask);
+
+  bool should_apply = true;
+  if (!loaded) {
+    should_apply = false;
+  } else if (lane > 0u && (loaded_mask & ((1u << lane) - 1u)) != ((1u << lane) - 1u)) {
+    should_apply = false;
+  } else if (ev.flow_id >= static_cast<uint32_t>(contract_hot_flow_capacity)) {
+    should_apply = false;
+    u64_add(&ctrl->contract_poll_stale_events, 1u);
+  } else {
+    for (uint32_t other_lane = lane + 1u; other_lane < drain_count; ++other_lane) {
+      const bool other_loaded = s_contract_loaded[other_lane] != 0;
+      if (!other_loaded) {
+        continue;
+      }
+      const uint32_t other_flow = s_contract_flow_ids[other_lane];
+      const uint64_t other_version = s_contract_versions[other_lane];
+      if (other_flow == ev.flow_id && other_version >= ev.version) {
+        should_apply = false;
+        break;
+      }
+    }
+    const uint64_t current_version = u64_load(contract_hot_flow_versions + ev.flow_id);
+    const uint64_t current_epoch = u64_load(contract_hot_flow_epochs + ev.flow_id);
+    if (current_version != 0u && ev.version < current_version) {
+      should_apply = false;
+      u64_add(&ctrl->contract_poll_stale_events, 1u);
+    }
+    if (current_version != 0u && ev.version > (current_version + 2u)) {
+      should_apply = false;
+      u64_add(&ctrl->contract_poll_version_gap_events, 1u);
+      u64_add(&ctrl->contract_resync_requests, 1u);
+    }
+    if (current_epoch != 0u && ev.epoch < current_epoch) {
+      should_apply = false;
+      u64_add(&ctrl->contract_poll_epoch_mismatch, 1u);
+    }
+    if (contract_stale_ttl_ns > 0u && ev.dpu_ts_ns != 0u) {
+      const uint64_t host_now = u64_load(&ctrl->host_time_ns);
+      if (host_now > ev.dpu_ts_ns && (host_now - ev.dpu_ts_ns) > contract_stale_ttl_ns) {
+        should_apply = false;
+        u64_add(&ctrl->contract_stale_ttl_pause_events, 1u);
+        if (ev.flow_id < static_cast<uint32_t>(max_streams)) {
+          persistent_contract_pause_stream(streams + ev.flow_id);
+        }
+      }
+    }
+  }
+
+  if (should_apply) {
+    const bool poisoned = ev.tcp_state == kPersistentContractTcpStatePoisoned;
+    const bool migrating = ev.tcp_state == kPersistentContractTcpStateMigrating;
+    volatile FlowUpdateEvent* hot = contract_hot_flow_table + ev.flow_id;
+    hot->version = ev.version;
+    hot->epoch = ev.epoch;
+    hot->flow_id = ev.flow_id;
+    hot->tcp_seq = ev.tcp_seq;
+    hot->tcp_ack = ev.tcp_ack;
+    hot->src_port = ev.src_port;
+    hot->dst_port = ev.dst_port;
+    hot->tcp_state = ev.tcp_state;
+    hot->proto = ev.proto;
+    hot->flags = ev.flags;
+    hot->rtt_us = ev.rtt_us;
+    hot->dpu_ts_ns = ev.dpu_ts_ns;
+    contract_hot_flow_versions[ev.flow_id] = ev.version;
+    contract_hot_flow_epochs[ev.flow_id] = ev.epoch;
+    if (ev.dpu_ts_ns != 0u) {
+      ctrl->last_contract_dpu_ts_ns = ev.dpu_ts_ns;
+    }
+
+    if (ev.flow_id < static_cast<uint32_t>(max_streams)) {
+      volatile PersistentDeviceStreamState* sv = streams + ev.flow_id;
+      if (poisoned || migrating) {
+        persistent_contract_pause_stream(sv);
+        u64_add(
+            poisoned ? &ctrl->contract_poll_poison_events : &ctrl->contract_poll_migration_events,
+            1u);
+      } else if (i32_load(&sv->active) != 0) {
+        if (ev.src_port != 0u) {
+          sv->source_port = ev.src_port;
+          sv->source_port_mode = 1u;
+        }
+        if (ev.flags != 0u) {
+          sv->tcp_flags = ev.flags;
+        }
+        sv->seq_counter = ev.tcp_seq;
+        sv->tcp_ack_counter = ev.tcp_ack;
+        sv->tcp_state = ev.tcp_state;
+      } else {
+        u64_add(&ctrl->contract_poll_inactive_flow, 1u);
+      }
+    }
+    u64_add(&ctrl->contract_poll_events, 1u);
+  }
+
+  __threadfence_system();
+  __syncwarp(kPollWarpMask);
+  if (lane == 0u) {
+    uint32_t contiguous_loaded = 0u;
+    while (contiguous_loaded < drain_count && ((loaded_mask >> contiguous_loaded) & 1u) != 0u) {
+      contiguous_loaded += 1u;
+    }
+    if (contiguous_loaded > 0u) {
+      contract_ring_tail[shard] = tail + static_cast<uint64_t>(contiguous_loaded);
+    }
+  }
+}
+
 __global__ void persistent_dataplane_kernel(
     volatile int32_t* run_flag_dev,
     volatile PersistentRuntimeControl* ctrl,
@@ -3397,7 +4265,16 @@ __global__ void persistent_dataplane_kernel(
     int32_t* queue_slot_hint,
     uint8_t* payload_base,
     const uint64_t* doca_gpu_txq_handles,
-    const uint32_t* doca_txq_mkeys_be) {
+    const uint32_t* doca_txq_mkeys_be,
+    const volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* contract_update_ring,
+    volatile uint64_t* contract_ring_head,
+    volatile uint64_t* contract_ring_tail,
+    volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1* contract_hot_flow_table,
+    volatile uint64_t* contract_hot_flow_versions,
+    volatile uint64_t* contract_hot_flow_epochs,
+    int32_t contract_shard_count,
+    int32_t contract_ring_slots_per_shard,
+    int32_t contract_hot_flow_capacity) {
   const uint32_t tid = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   const uint32_t workers = static_cast<uint32_t>(gridDim.x * blockDim.x);
   constexpr uint32_t kWarpWidth = 32u;
@@ -3448,6 +4325,23 @@ __global__ void persistent_dataplane_kernel(
     if (tid == 0u) {
       u64_add(&ctrl->heartbeat, 1u);
     }
+    persistent_contract_poll_assigned_shard(
+        ctrl,
+        streams,
+        run_flag_dev,
+        contract_update_ring,
+        contract_ring_head,
+        contract_ring_tail,
+        contract_hot_flow_table,
+        contract_hot_flow_versions,
+        contract_hot_flow_epochs,
+        contract_shard_count,
+        contract_ring_slots_per_shard,
+        contract_hot_flow_capacity,
+        max_streams,
+        cfg.contract_stale_ttl_ns,
+        cfg.contract_heartbeat_timeout_ns,
+        lane);
     bool produced = false;
     int active_streams = i32_load(&ctrl->active_streams);
     if (active_streams < 1) {
@@ -3506,29 +4400,39 @@ __global__ void persistent_dataplane_kernel(
       affinity_q = __shfl_sync(warp_mask, affinity_q, 0);
       sid = __shfl_sync(warp_mask, sid, 0);
       uint32_t packet_seq_base = 0u;
+      uint32_t packet_seq_advance = 1u;
       if (lane == 0u) {
+        if (sv->protocol == 6) {
+          const uint32_t control_advance =
+              ((sv->tcp_flags & 0x01u) != 0u ? 1u : 0u) +
+              ((sv->tcp_flags & 0x02u) != 0u ? 1u : 0u);
+          packet_seq_advance = static_cast<uint32_t>(sv->payload_len) + control_advance;
+        }
         packet_seq_base = atomicAdd(
             (unsigned int*)&sv->seq_counter,
-            reserved_tokens);
+            reserved_tokens * packet_seq_advance);
       }
       packet_seq_base = __shfl_sync(warp_mask, packet_seq_base, 0);
+      packet_seq_advance = __shfl_sync(warp_mask, packet_seq_advance, 0);
       int produced_for_stream_lane = 0;
       int direct_sent_for_stream_lane = 0;
       int direct_released_for_stream_lane = 0;
       int direct_enqueued_for_stream_lane = 0;
       int direct_packet_qids[kTokenReserveChunkPerLane];
+      PersistentRingSlot* direct_packet_slots[kTokenReserveChunkPerLane];
       int direct_packet_count = 0;
       PersistentRingSlot* publish_slots[kTokenReserveChunkPerLane];
       int publish_count = 0;
       #pragma unroll
       for (int pi = 0; pi < static_cast<int>(kTokenReserveChunkPerLane); ++pi) {
         direct_packet_qids[pi] = -1;
+        direct_packet_slots[pi] = nullptr;
         publish_slots[pi] = nullptr;
       }
 
       for (uint32_t token_i = lane; token_i < reserved_tokens; token_i += kWarpWidth) {
-        const uint32_t packet_seq = packet_seq_base + token_i + 1u;
-        const uint32_t route_seed = packet_seq ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
+        const uint32_t packet_seq = packet_seq_base + (token_i * packet_seq_advance);
+        const uint32_t route_seed = (packet_seq + token_i + 1u) ^ (tid * 2654435761u) ^ static_cast<uint32_t>(sid);
         int q_base = affinity_q;
         if (q_base < 0 || q_base >= queue_count) {
           q_base = queue_pow2
@@ -3626,15 +4530,18 @@ __global__ void persistent_dataplane_kernel(
         if (slot_len_u > 0u && doca_gpu_txq_handles && doca_txq_mkeys_be && q >= 0 && q < queue_count) {
           const uint64_t gpu_txq_handle = doca_gpu_txq_handles[static_cast<size_t>(q)];
           const uint32_t mkey_be = doca_txq_mkeys_be[static_cast<size_t>(q)];
+          if (!persistent_slot_transition(&slot, 2, 1, ctrl)) {
+            persistent_contract_stop_kernel(ctrl, run_flag_dev);
+            return;
+          }
           if (persistent_doca_kernel_try_enqueue(gpu_txq_handle, mkey_be, slot_payload, slot_len_u)) {
-            slot.state = 0;
-            slot.len = 0;
-            slot.stream_id = 0;
-            slot.stream_slot = -1;
-            slot.protocol = 0;
-            slot.tx_timestamp_ns = 0u;
+            if (!persistent_slot_transition(&slot, 1, 3, ctrl)) {
+              persistent_contract_stop_kernel(ctrl, run_flag_dev);
+              return;
+            }
             if (direct_packet_count < static_cast<int>(kTokenReserveChunkPerLane)) {
               direct_packet_qids[direct_packet_count] = q;
+              direct_packet_slots[direct_packet_count] = &slot;
               direct_packet_count += 1;
             }
             direct_enqueued_for_stream_lane += 1;
@@ -3645,7 +4552,13 @@ __global__ void persistent_dataplane_kernel(
         }
         if (doca_gpu_txq_handles && doca_txq_mkeys_be) {
           // Direct-DOCA mode is fail-fast: no host fallback in this path.
-          slot.state = 0;
+          if (slot.state == 1) {
+            (void)persistent_slot_transition(&slot, 1, 0, ctrl);
+          } else if (slot.state == 2) {
+            (void)persistent_slot_transition(&slot, 2, 0, ctrl);
+          } else {
+            slot.state = 0;
+          }
           slot.len = 0;
           slot.stream_id = 0;
           slot.stream_slot = -1;
@@ -3700,6 +4613,23 @@ __global__ void persistent_dataplane_kernel(
               atomicExch((int*)run_flag_dev, 0);
             }
             return;
+          }
+        }
+        #pragma unroll
+        for (int pi = 0; pi < static_cast<int>(kTokenReserveChunkPerLane); ++pi) {
+          PersistentRingSlot* done_slot = direct_packet_slots[pi];
+          if (pi < direct_packet_count && done_slot) {
+            if (persistent_slot_transition(done_slot, 3, 4, ctrl)) {
+              done_slot->len = 0;
+              done_slot->stream_id = 0;
+              done_slot->stream_slot = -1;
+              done_slot->protocol = 0;
+              done_slot->tx_timestamp_ns = 0u;
+              (void)persistent_slot_transition(done_slot, 4, 0, ctrl);
+            } else {
+              persistent_contract_stop_kernel(ctrl, run_flag_dev);
+              return;
+            }
           }
         }
         direct_sent_for_stream_lane += direct_enqueued_for_stream_lane;
@@ -4678,6 +5608,11 @@ inline bool persistent_launch_kernel() {
   if (rt.doca_kernel_direct_tx && (!rt.doca_gpu_txq_handles_dev || !rt.doca_txq_mkeys_be_dev)) {
     return false;
   }
+  PersistentContractRuntime& cr = g_persistent_contract_runtime;
+  if (!cr.initialized || !cr.device_mirror_initialized || !cr.update_ring_dev || !cr.ring_head_dev ||
+      !cr.ring_tail_dev || !cr.hot_flow_table_dev || !cr.hot_flow_versions_dev || !cr.hot_flow_epochs_dev) {
+    return false;
+  }
   if (!rt.kernel_stream) {
     if (cudaStreamCreateWithFlags(&rt.kernel_stream, cudaStreamNonBlocking) != cudaSuccess) {
       return false;
@@ -4691,12 +5626,27 @@ inline bool persistent_launch_kernel() {
     }
   }
   {
+    auto env_u64_local = [](const char* name, uint64_t defv) -> uint64_t {
+      const char* v = std::getenv(name);
+      if (!v || !*v) {
+        return defv;
+      }
+      try {
+        return static_cast<uint64_t>(std::stoull(v));
+      } catch (...) {
+        return defv;
+      }
+    };
     PersistentKernelStaticConfig cfg{};
     cfg.queue_count = rt.queue_count;
     cfg.ring_slots = rt.ring_slots;
     cfg.max_streams = kPersistentMaxStreams;
     cfg.queue_probe_span = rt.ctrl->queue_probe_span;
     cfg.max_packet_bytes = rt.max_packet_bytes;
+    cfg.contract_stale_ttl_ns = env_u64_local("SAMURAI_GPU_CONTRACT_STALE_TTL_NS", 0u);
+    cfg.contract_heartbeat_timeout_ns =
+        env_u64_local("SAMURAI_GPU_CONTRACT_HEARTBEAT_TIMEOUT_NS", 0u);
+    rt.ctrl->host_time_ns = now_ns_steady();
     if (cudaMemcpyToSymbol(
             g_persistent_kernel_static_cfg,
             &cfg,
@@ -4734,7 +5684,16 @@ inline bool persistent_launch_kernel() {
       rt.queue_slot_hint_dev,
       rt.payload_dev,
       rt.doca_gpu_txq_handles_dev,
-      rt.doca_txq_mkeys_be_dev);
+      rt.doca_txq_mkeys_be_dev,
+      cr.update_ring_dev,
+      cr.ring_head_dev,
+      cr.ring_tail_dev,
+      cr.hot_flow_table_dev,
+      cr.hot_flow_versions_dev,
+      cr.hot_flow_epochs_dev,
+      cr.shard_count,
+      cr.ring_slots_per_shard,
+      cr.hot_flow_capacity);
   return (cudaPeekAtLastError() == cudaSuccess);
 }
 
@@ -4763,6 +5722,7 @@ inline void persistent_monitor_loop() {
     if (!rt.ctrl) {
       continue;
     }
+    rt.ctrl->host_time_ns = now_ns_steady();
     if (rt.doca_kernel_direct_tx && rt.ctrl->run == 0) {
       rt.threads_running.store(false, std::memory_order_relaxed);
       break;
@@ -5040,6 +6000,7 @@ inline void persistent_runtime_release_unlocked() {
     c.store(0u, std::memory_order_relaxed);
   }
   persistent_bridge_backend_shutdown_unlocked(rt);
+  persistent_contract_runtime_release_unlocked();
 }
 
 inline bool persistent_runtime_ensure_started_unlocked() {
@@ -5269,6 +6230,10 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   rt.queue_drain_cursor.assign(static_cast<size_t>(rt.queue_count), 0u);
   rt.queue_sent_counts.assign(static_cast<size_t>(rt.queue_count), 0u);
   persistent_sync_active_stream_count_unlocked(rt);
+  if (!persistent_contract_runtime_ensure_started_unlocked(rt)) {
+    persistent_runtime_release_unlocked();
+    return false;
+  }
   if (!persistent_bridge_backend_init_unlocked(rt)) {
     persistent_runtime_release_unlocked();
     return false;
@@ -5339,6 +6304,13 @@ inline std::string stream_state_to_json(const PersistentStreamState& st) {
       << "\"queue_affinity\":" << st.queue_affinity << ","
       << "\"source_port\":" << st.source_port << ","
       << "\"source_port_mode\":" << static_cast<int>(st.source_port_mode) << ","
+      << "\"tcp_seq\":" << st.tcp_seq << ","
+      << "\"tcp_ack\":" << st.tcp_ack << ","
+      << "\"tcp_state\":" << static_cast<int>(st.tcp_state) << ","
+      << "\"tcp_mss\":" << st.tcp_mss << ","
+      << "\"tcp_window_scale\":" << static_cast<int>(st.tcp_window_scale) << ","
+      << "\"tcp_sack_permitted\":" << static_cast<int>(st.tcp_sack_permitted) << ","
+      << "\"tcp_timestamp_enabled\":" << static_cast<int>(st.tcp_timestamp_enabled) << ","
       << "\"icmp_type\":" << st.icmp_type << ","
       << "\"icmp_code\":" << st.icmp_code << ","
       << "\"payload_len\":" << st.payload_len << ","
@@ -5822,6 +6794,297 @@ extern "C" int samurai_gpu_packet_generate_icmp_packets(
   }
 }
 
+extern "C" int samurai_gpu_packet_publication_budget_us(uint32_t rtt_us, uint32_t* out_budget_us) {
+  if (!out_budget_us) {
+    return set_c_api_error("out_budget_us must not be null");
+  }
+  *out_budget_us = ddos_samurai::gpu_packet_cuda::zero_copy::publication_budget_us(rtt_us);
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_seqlock_next_versions(
+    uint64_t current_version,
+    uint64_t* out_write_begin,
+    uint64_t* out_write_commit) {
+  if (!out_write_begin || !out_write_commit) {
+    return set_c_api_error("out_write_begin and out_write_commit must not be null");
+  }
+  ddos_samurai::gpu_packet_cuda::zero_copy::next_seqlock_versions(
+      current_version, out_write_begin, out_write_commit);
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_descriptor_transition_valid(
+    int32_t from_state,
+    int32_t to_state,
+    int32_t* out_valid) {
+  if (!out_valid) {
+    return set_c_api_error("out_valid must not be null");
+  }
+  using ddos_samurai::gpu_packet_cuda::zero_copy::DescriptorOwnershipState;
+  if (from_state < static_cast<int32_t>(DescriptorOwnershipState::kFree) ||
+      from_state > static_cast<int32_t>(DescriptorOwnershipState::kComplete) ||
+      to_state < static_cast<int32_t>(DescriptorOwnershipState::kFree) ||
+      to_state > static_cast<int32_t>(DescriptorOwnershipState::kComplete)) {
+    return set_c_api_error("descriptor state value is out of range");
+  }
+  const auto from = static_cast<DescriptorOwnershipState>(from_state);
+  const auto to = static_cast<DescriptorOwnershipState>(to_state);
+  *out_valid = ddos_samurai::gpu_packet_cuda::zero_copy::is_valid_descriptor_transition(from, to) ? 1 : 0;
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_compute_flow_affinity_v1(
+    int32_t block_idx,
+    int32_t block_dim,
+    int32_t thread_idx,
+    int32_t flows_per_warp,
+    int32_t warp_size,
+    samurai_gpu_packet_flow_affinity_v1* out) {
+  if (!out) {
+    return set_c_api_error("out must not be null");
+  }
+  const auto aff = ddos_samurai::gpu_packet_cuda::zero_copy::compute_flow_affinity(
+      block_idx, block_dim, thread_idx, flows_per_warp, warp_size);
+  out->global_tid = aff.global_tid;
+  out->global_warp_id = aff.global_warp_id;
+  out->lane = aff.lane;
+  out->flow_start = aff.flow_start;
+  out->flow_id = aff.flow_id;
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_contract_publish_flow_update_v1(
+    const samurai_gpu_packet_flow_update_event_v1* event) {
+  if (!event) {
+    return set_c_api_error("event must not be null");
+  }
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  if (!persistent_runtime_ensure_started_unlocked()) {
+    return set_c_api_error("persistent runtime is not available");
+  }
+  PersistentRuntime& rt = g_persistent_runtime;
+  if (!persistent_contract_runtime_ensure_started_unlocked(rt)) {
+    return set_c_api_error("contract runtime is not available");
+  }
+  auto& cr = g_persistent_contract_runtime;
+  const uint32_t flow_id = event->flow_id;
+  if ((event->version & 1ull) != 0ull) {
+    return set_c_api_error("flow update version must be committed/even");
+  }
+  if (flow_id >= static_cast<uint32_t>(cr.hot_flow_capacity)) {
+    return set_c_api_error("flow_id exceeds contract hot-flow capacity");
+  }
+  if (cr.shard_count <= 0 || cr.ring_slots_per_shard <= 0 || cr.update_ring.empty()) {
+    return set_c_api_error("contract ring is not initialized");
+  }
+
+  ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1 ev{};
+  ev.version = event->version;
+  ev.epoch = event->epoch;
+  ev.flow_id = event->flow_id;
+  ev.tcp_seq = event->tcp_seq;
+  ev.tcp_ack = event->tcp_ack;
+  ev.src_port = event->src_port;
+  ev.dst_port = event->dst_port;
+  ev.tcp_state = event->tcp_state;
+  ev.proto = event->proto;
+  ev.flags = event->flags;
+  ev.rtt_us = event->rtt_us;
+  ev.dpu_ts_ns = event->dpu_ts_ns;
+
+  const uint64_t prev_epoch = cr.hot_flow_epochs[static_cast<size_t>(flow_id)];
+  if (prev_epoch != 0u && ev.epoch < prev_epoch) {
+    cr.epoch_mismatch_count += 1u;
+    return set_c_api_error("contract epoch mismatch: stale flow update");
+  }
+
+  const int shard = static_cast<int>(flow_id % static_cast<uint32_t>(cr.shard_count));
+  if (!persistent_contract_runtime_refresh_device_tail_unlocked(cr, static_cast<size_t>(shard))) {
+    return set_c_api_error("failed to refresh contract device tail");
+  }
+  uint64_t& head = cr.ring_head[static_cast<size_t>(shard)];
+  uint64_t& tail = cr.ring_tail[static_cast<size_t>(shard)];
+  const uint64_t used = (head >= tail) ? (head - tail) : 0u;
+  const uint64_t cap = static_cast<uint64_t>(cr.ring_slots_per_shard);
+  if (used >= cap) {
+    cr.drop_count += 1u;
+    cr.ring_drop_by_shard[static_cast<size_t>(shard)] += 1u;
+    if (rt.ctrl) {
+      rt.ctrl->ring_drop_events += 1u;
+    }
+    if (cr.overflow_policy == ddos_samurai::gpu_packet_cuda::zero_copy::RingOverflowPolicy::kHardFail) {
+      return set_c_api_error("contract ring overflow (hard fail)");
+    }
+    tail += 1u;
+    if (!persistent_contract_runtime_sync_device_tail_unlocked(cr, static_cast<size_t>(shard))) {
+      return set_c_api_error("failed to sync contract controlled-drop tail");
+    }
+  }
+
+  const size_t shard_base = static_cast<size_t>(shard) * static_cast<size_t>(cr.ring_slots_per_shard);
+  const size_t slot = static_cast<size_t>(head % cap);
+  const size_t ring_index = shard_base + slot;
+  cr.update_ring[ring_index] = ev;
+  head += 1u;
+
+  const uint64_t prev_version = cr.hot_flow_versions[static_cast<size_t>(flow_id)];
+  if (prev_version != 0u && ev.version > (prev_version + 2u)) {
+    cr.version_gap_count += 1u;
+    cr.resync_request_count += 1u;
+    if (rt.ctrl) {
+      rt.ctrl->contract_poll_version_gap_events += 1u;
+      rt.ctrl->contract_resync_requests += 1u;
+    }
+  }
+  const bool poisoned = ev.tcp_state == 255u;
+  const bool migrating = ev.tcp_state == 250u;
+  if (poisoned) {
+    cr.poison_event_count += 1u;
+    if (rt.ctrl) {
+      rt.ctrl->contract_poll_poison_events += 1u;
+    }
+  } else if (migrating) {
+    cr.migration_event_count += 1u;
+    if (rt.ctrl) {
+      rt.ctrl->contract_poll_migration_events += 1u;
+    }
+  }
+  cr.hot_flow_table[static_cast<size_t>(flow_id)] = ev;
+  cr.hot_flow_versions[static_cast<size_t>(flow_id)] = ev.version;
+  cr.hot_flow_epochs[static_cast<size_t>(flow_id)] = ev.epoch;
+  if (rt.ctrl && ev.dpu_ts_ns != 0u) {
+    rt.ctrl->last_contract_dpu_ts_ns = ev.dpu_ts_ns;
+  }
+  cr.publish_count += 1u;
+  if (!persistent_contract_runtime_sync_device_slot_unlocked(
+          cr,
+          ring_index,
+          static_cast<size_t>(shard),
+          static_cast<size_t>(flow_id))) {
+    return set_c_api_error("failed to sync contract update into device mirror");
+  }
+
+  if (flow_id < static_cast<uint32_t>(kPersistentMaxStreams) && rt.streams && rt.streams_dev && rt.streams_hot_dev) {
+    const int slot_id = static_cast<int>(flow_id);
+    PersistentDeviceStreamState& d = rt.streams[static_cast<size_t>(slot_id)];
+    if (poisoned || migrating) {
+      d.active = 0;
+      d.quota = 0;
+      d.quota_left = 0;
+      if (!persistent_stream_copy_slot_to_device(rt, slot_id)) {
+        return set_c_api_error("failed to sync contract pause into stream state");
+      }
+      if (!persistent_sync_hot_stream_slot(rt, slot_id)) {
+        return set_c_api_error("failed to sync contract pause into hot stream table");
+      }
+    } else if (d.active != 0) {
+      if (ev.proto == 1u || ev.proto == 6u || ev.proto == 17u) {
+        d.protocol = static_cast<int32_t>(ev.proto);
+      }
+      if (ev.dst_port != 0u && d.protocol != 1) {
+        d.target_port = ev.dst_port;
+      }
+      if (ev.src_port != 0u) {
+        d.source_port = ev.src_port;
+        d.source_port_mode = 1u;
+      }
+      if (ev.flags != 0u) {
+        d.tcp_flags = ev.flags;
+      }
+      d.seq_counter = ev.tcp_seq;
+      d.tcp_ack_counter = ev.tcp_ack;
+      d.tcp_state = ev.tcp_state;
+      persistent_build_stream_template(&d);
+      if (!persistent_stream_copy_slot_to_device(rt, slot_id)) {
+        return set_c_api_error("failed to sync flow update into stream state");
+      }
+      if (!persistent_sync_hot_stream_slot(rt, slot_id)) {
+        return set_c_api_error("failed to sync flow update into hot stream table");
+      }
+    }
+  }
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_contract_heartbeat_v1(uint64_t dpu_ts_ns) {
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  if (!persistent_runtime_ensure_started_unlocked()) {
+    return set_c_api_error("persistent runtime is not available");
+  }
+  PersistentRuntime& rt = g_persistent_runtime;
+  if (!rt.ctrl) {
+    return set_c_api_error("persistent runtime control is not available");
+  }
+  const uint64_t now = now_ns_steady();
+  rt.ctrl->host_time_ns = now;
+  rt.ctrl->last_contract_dpu_ts_ns = dpu_ts_ns != 0u ? dpu_ts_ns : now;
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_contract_read_hot_flow_v1(
+    uint32_t flow_id,
+    samurai_gpu_packet_flow_update_event_v1* out_event) {
+  if (!out_event) {
+    return set_c_api_error("out_event must not be null");
+  }
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  if (!persistent_runtime_ensure_started_unlocked()) {
+    return set_c_api_error("persistent runtime is not available");
+  }
+  PersistentRuntime& rt = g_persistent_runtime;
+  if (!persistent_contract_runtime_ensure_started_unlocked(rt)) {
+    return set_c_api_error("contract runtime is not available");
+  }
+  auto& cr = g_persistent_contract_runtime;
+  if (flow_id >= static_cast<uint32_t>(cr.hot_flow_capacity)) {
+    return set_c_api_error("flow_id exceeds contract hot-flow capacity");
+  }
+  const auto& ev = cr.hot_flow_table[static_cast<size_t>(flow_id)];
+  out_event->version = ev.version;
+  out_event->epoch = ev.epoch;
+  out_event->flow_id = ev.flow_id;
+  out_event->tcp_seq = ev.tcp_seq;
+  out_event->tcp_ack = ev.tcp_ack;
+  out_event->src_port = ev.src_port;
+  out_event->dst_port = ev.dst_port;
+  out_event->tcp_state = ev.tcp_state;
+  out_event->proto = ev.proto;
+  out_event->flags = ev.flags;
+  out_event->rtt_us = ev.rtt_us;
+  out_event->dpu_ts_ns = ev.dpu_ts_ns;
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_contract_export_region_v1(char* out_spec, size_t out_spec_len) {
+  if (!out_spec || out_spec_len == 0u) {
+    return set_c_api_error("out_spec must not be null or empty");
+  }
+  std::lock_guard<std::mutex> g(g_persistent_lock);
+  if (!persistent_runtime_ensure_started_unlocked()) {
+    return set_c_api_error("persistent runtime is not available");
+  }
+  if (!persistent_contract_runtime_ensure_started_unlocked(g_persistent_runtime)) {
+    return set_c_api_error("contract runtime is not available");
+  }
+  const auto& cr = g_persistent_contract_runtime;
+  if (!cr.device_mirror_initialized || cr.export_region_spec.empty()) {
+    return set_c_api_error("contract export region is not initialized");
+  }
+  const size_t n = std::min(out_spec_len - 1u, cr.export_region_spec.size());
+  std::memcpy(out_spec, cr.export_region_spec.data(), n);
+  out_spec[n] = '\0';
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
 extern "C" int samurai_gpu_packet_set_kernel_mode(int mode) {
   if (mode != static_cast<int>(KernelMode::kBatch) &&
       mode != static_cast<int>(KernelMode::kPersistent)) {
@@ -5895,6 +7158,13 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
       clamp_i(json_get_int(profile, "source_port_mode", (st.source_port > 0 ? 1 : 0)), 0, 1));
   st.tcp_flags = static_cast<uint16_t>(clamp_i(json_get_int(profile, "tcp_flags", 0x02), 0, 255));
   st.tcp_window = static_cast<uint16_t>(clamp_i(json_get_int(profile, "window", 65535), 0, 65535));
+  st.tcp_mss = static_cast<uint16_t>(clamp_i(json_get_int(profile, "tcp_mss", 1460), 536, 8960));
+  st.tcp_window_scale = static_cast<uint8_t>(clamp_i(json_get_int(profile, "tcp_window_scale", 8), 0, 14));
+  st.tcp_sack_permitted = static_cast<uint8_t>(json_get_bool(profile, "tcp_sack_permitted", true) ? 1 : 0);
+  st.tcp_timestamp_enabled = static_cast<uint8_t>(json_get_bool(profile, "tcp_timestamp_enabled", true) ? 1 : 0);
+  st.tcp_seq = static_cast<uint32_t>(json_get_u64(profile, "tcp_seq", 0u));
+  st.tcp_ack = static_cast<uint32_t>(json_get_u64(profile, "tcp_ack", 0u));
+  st.tcp_state = static_cast<uint8_t>(clamp_i(json_get_int(profile, "tcp_state", 0), 0, 255));
   st.icmp_type = clamp_i(json_get_int(profile, "icmp_type", 8), 0, 255);
   st.icmp_code = clamp_i(json_get_int(profile, "icmp_code", 0), 0, 255);
   st.pcap_file = json_get_string(profile, "pcap_file", std::string());
@@ -5953,6 +7223,13 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   d.source_port_mode = st.source_port_mode;
   d.tcp_flags = st.tcp_flags;
   d.tcp_window = st.tcp_window;
+  d.tcp_mss = st.tcp_mss;
+  d.tcp_window_scale = st.tcp_window_scale;
+  d.tcp_sack_permitted = st.tcp_sack_permitted;
+  d.tcp_timestamp_enabled = st.tcp_timestamp_enabled;
+  d.seq_counter = st.tcp_seq;
+  d.tcp_ack_counter = st.tcp_ack;
+  d.tcp_state = st.tcp_state;
   d.icmp_type = st.icmp_type;
   d.icmp_code = st.icmp_code;
   d.payload_len = st.payload_len;
@@ -6082,6 +7359,25 @@ extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* u
       json_get_int(st.update_json, "window", static_cast<int>(st.tcp_window)), 0, 65535));
   d.tcp_flags = st.tcp_flags;
   d.tcp_window = st.tcp_window;
+  st.tcp_mss = static_cast<uint16_t>(clamp_i(
+      json_get_int(st.update_json, "tcp_mss", static_cast<int>(st.tcp_mss)), 536, 8960));
+  st.tcp_window_scale = static_cast<uint8_t>(clamp_i(
+      json_get_int(st.update_json, "tcp_window_scale", static_cast<int>(st.tcp_window_scale)), 0, 14));
+  st.tcp_sack_permitted = static_cast<uint8_t>(
+      json_get_bool(st.update_json, "tcp_sack_permitted", static_cast<bool>(st.tcp_sack_permitted)) ? 1 : 0);
+  st.tcp_timestamp_enabled = static_cast<uint8_t>(
+      json_get_bool(st.update_json, "tcp_timestamp_enabled", static_cast<bool>(st.tcp_timestamp_enabled)) ? 1 : 0);
+  d.tcp_mss = st.tcp_mss;
+  d.tcp_window_scale = st.tcp_window_scale;
+  d.tcp_sack_permitted = st.tcp_sack_permitted;
+  d.tcp_timestamp_enabled = st.tcp_timestamp_enabled;
+  st.tcp_seq = static_cast<uint32_t>(json_get_u64(st.update_json, "tcp_seq", st.tcp_seq));
+  st.tcp_ack = static_cast<uint32_t>(json_get_u64(st.update_json, "tcp_ack", st.tcp_ack));
+  st.tcp_state = static_cast<uint8_t>(clamp_i(
+      json_get_int(st.update_json, "tcp_state", static_cast<int>(st.tcp_state)), 0, 255));
+  d.seq_counter = st.tcp_seq;
+  d.tcp_ack_counter = st.tcp_ack;
+  d.tcp_state = st.tcp_state;
   st.icmp_type = clamp_i(json_get_int(st.update_json, "icmp_type", st.icmp_type), 0, 255);
   st.icmp_code = clamp_i(json_get_int(st.update_json, "icmp_code", st.icmp_code), 0, 255);
   d.icmp_type = st.icmp_type;
@@ -6247,6 +7543,30 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << "\"drain_attempts\":" << (rt_active ? g_persistent_runtime.ctrl->drain_attempts : 0u) << ","
         << "\"native_batch_degrade_events\":"
         << (rt_active ? g_persistent_runtime.ctrl->native_batch_degrade_events : 0u) << ","
+        << "\"contract_kernel_poll_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_events : 0u) << ","
+        << "\"contract_kernel_poll_epoch_mismatch_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_epoch_mismatch : 0u) << ","
+        << "\"contract_kernel_poll_inactive_flow_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_inactive_flow : 0u) << ","
+        << "\"contract_kernel_poll_stale_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_stale_events : 0u) << ","
+        << "\"contract_kernel_poll_version_gap_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_version_gap_events : 0u) << ","
+        << "\"contract_resync_requests\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_resync_requests : 0u) << ","
+        << "\"contract_kernel_poll_poison_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_poison_events : 0u) << ","
+        << "\"contract_kernel_poll_migration_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_poll_migration_events : 0u) << ","
+        << "\"contract_stale_ttl_pause_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_stale_ttl_pause_events : 0u) << ","
+        << "\"contract_heartbeat_lost_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->contract_heartbeat_lost_events : 0u) << ","
+        << "\"tx_ownership_invalid_events\":"
+        << (rt_active ? g_persistent_runtime.ctrl->tx_ownership_invalid_events : 0u) << ","
+        << "\"tx_ownership_transitions\":"
+        << (rt_active ? g_persistent_runtime.ctrl->tx_ownership_transitions : 0u) << ","
         << "\"compat_fallback_count\":" << g_compat_fallback_count.load(std::memory_order_relaxed) << ","
         << "\"persistent_tx_backend\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.active) << "\","
         << "\"persistent_doca_kernel_direct_tx\":"
@@ -6257,7 +7577,24 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << "\"persistent_bridge_ipg_ns\":" << g_persistent_runtime.bridge_ipg_ns << ","
         << "\"persistent_tx_bridge_sent\":" << (rt_active ? g_persistent_runtime.ctrl->tx_bridge_sent : 0u) << ","
         << "\"persistent_produced\":" << (rt_active ? g_persistent_runtime.ctrl->produced : 0u) << ","
-        << "\"persistent_heartbeat\":" << (rt_active ? g_persistent_runtime.ctrl->heartbeat : 0u)
+        << "\"persistent_heartbeat\":" << (rt_active ? g_persistent_runtime.ctrl->heartbeat : 0u) << ","
+        << "\"contract_runtime_active\":" << (g_persistent_contract_runtime.initialized ? 1 : 0) << ","
+        << "\"contract_shard_count\":" << g_persistent_contract_runtime.shard_count << ","
+        << "\"contract_ring_slots_per_shard\":" << g_persistent_contract_runtime.ring_slots_per_shard << ","
+        << "\"contract_hot_flow_capacity\":" << g_persistent_contract_runtime.hot_flow_capacity << ","
+        << "\"contract_export_region_spec\":\""
+        << json_escape_string(g_persistent_contract_runtime.export_region_spec) << "\","
+        << "\"contract_export_region_bytes\":" << g_persistent_contract_runtime.export_region_bytes << ","
+        << "\"contract_flow_update_published\":" << g_persistent_contract_runtime.publish_count << ","
+        << "\"contract_ring_drop_events\":" << g_persistent_contract_runtime.drop_count << ","
+        << "\"contract_version_gap_events\":" << g_persistent_contract_runtime.version_gap_count << ","
+        << "\"contract_resync_request_events\":" << g_persistent_contract_runtime.resync_request_count << ","
+        << "\"contract_epoch_mismatch_events\":" << g_persistent_contract_runtime.epoch_mismatch_count << ","
+        << "\"contract_poison_events\":" << g_persistent_contract_runtime.poison_event_count << ","
+        << "\"contract_migration_events\":" << g_persistent_contract_runtime.migration_event_count << ","
+        << "\"contract_device_mirror_active\":"
+        << (g_persistent_contract_runtime.device_mirror_initialized ? 1 : 0) << ","
+        << "\"contract_device_sync_error_events\":" << g_persistent_contract_runtime.device_sync_error_count
         << "}";
     g_stream_stats_json = oss.str();
     return g_stream_stats_json.c_str();

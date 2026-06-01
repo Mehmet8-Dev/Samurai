@@ -3,10 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from ddos_samurai.zmq.dispatcher import ZmqDispatcher
 from ddos_samurai.zmq.event_collector import ZmqEventCollector
 from ddos_samurai.zmq.runtime_manager import ZmqRuntimeManager
-from ddos_samurai.zmq.wire import MessageType, WorkerKind, default_event_endpoint, default_job_endpoint
+from ddos_samurai.zmq.wire import (
+    FlowStreamUpsertV1,
+    FlowUpdateEventV1,
+    MessageType,
+    WorkerKind,
+    default_event_endpoint,
+    default_job_endpoint,
+    unpack_message,
+)
 from ddos_samurai.zmq.worker_prototype import ZmqWorkerPrototype
 
 
@@ -105,6 +115,7 @@ def test_m3_worker_sources_exist() -> None:
         root / "ddos_samurai" / "zmq" / "daemon" / "l7_worker.cpp",
         root / "ddos_samurai" / "zmq" / "daemon" / "defense_worker.cpp",
         root / "ddos_samurai" / "zmq" / "daemon" / "scenario_worker.cpp",
+        root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp",
     ]
     for p in expected:
         assert p.exists(), str(p)
@@ -145,11 +156,270 @@ def test_m3_gpu_worker_has_native_cuda_bridge_and_failfast_fallback() -> None:
     assert "dlopen" in src
     assert "samurai_gpu_packet_generate_packets" in src
     assert "samurai_gpu_packet_generate_icmp_packets" in src
+    assert "samurai_gpu_packet_contract_publish_flow_update_v1" in src
+    assert "samurai_gpu_packet_contract_export_region_v1" in src
+    assert "TryReadContractExportRegionSpec" in src
+    assert "contract_export_region_spec" in src
+    assert "SAMURAI_GPU_CONTRACT_EXPORT_ON_JOB_DONE" in src
+    assert "samurai_gpu_packet_set_kernel_mode" in src
+    assert "samurai_gpu_packet_start_stream" in src
+    assert "samurai_gpu_packet_update_stream" in src
+    assert "samurai_gpu_packet_stop_stream" in src
+    assert "MessageType::FLOW_UPDATE" in src
+    assert "MessageType::FLOW_STREAM_UPSERT" in src
+    assert "FlowStreamUpsertJson" in src
+    assert "UpsertFlowStreamFromStreamUpsert" in src
+    assert "FlowUpdateFromStreamUpsert" in src
+    assert "flow_stream_upsert_size_mismatch" in src
+    assert "gpu_flow_stream_upsert_target_ip_required" in src
+    assert "FlowEventStreamJson" in src
+    assert "UpsertFlowStreamFromEvent" in src
+    assert "flow_streams" in src
+    assert "SAMURAI_GPU_FLOW_UPDATE_STREAM_LIFECYCLE" in src
+    assert "SAMURAI_GPU_FLOW_UPDATE_TARGET_IP" in src
+    assert "SAMURAI_GPU_FLOW_UPDATE_STREAM_QUOTA" in src
+    assert "gpu_native_stream_lifecycle_symbol_missing" in src
+    assert "gpu_flow_update_start_stream_failed" in src
+    assert "gpu_flow_update_update_stream_failed" in src
+    assert "gpu_flow_update_pause_stream_failed" in src
     assert "samurai_gpu_packet_free" in src
     assert "MessageType::HEARTBEAT" in src
     assert "MessageType::METRIC_SNAPSHOT" in src
     assert "gpu_native_lib_unavailable" in src
     assert "gpu_native_symbol_missing" in src
+
+
+def test_m3_gpu_stream_policy_accepts_zero_quota_pause_contract() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "gpu_worker.cpp").read_text(encoding="utf-8")
+
+    assert "kGpuStreamPolicyTemplateValid = 0x80000000u" in src
+    assert "policy_valid" in src
+    assert "(policy_valid || upsert.quota > 0u) ? upsert.quota : static_cast<std::uint32_t>(cfg.quota)" in src
+    assert '\\"tcp_seq\\":' in src
+    assert '\\"tcp_ack\\":' in src
+    assert '\\"tcp_state\\":' in src
+    assert '\\"tcp_mss\\":1460' in src
+    assert '\\"tcp_window_scale\\":8' in src
+    assert '\\"tcp_sack_permitted\\":true' in src
+    assert '\\"tcp_timestamp_enabled\\":true' in src
+
+
+def test_m3_dispatch_flow_update_targets_gpu_contract_channel() -> None:
+    ctx = _FakeContext()
+    zmq = _FakeZmq()
+    _FakeZmq.Context._instance = ctx
+    endpoint = "ipc:///tmp/samurai_jobs_gpu_contract_test"
+    event = FlowUpdateEventV1(
+        version=12,
+        epoch=5,
+        flow_id=9,
+        tcp_seq=101,
+        tcp_ack=88,
+        src_port=40000,
+        dst_port=443,
+        tcp_state=4,
+        proto=6,
+        flags=0x18,
+        rtt_us=750,
+        dpu_ts_ns=987654321,
+    )
+
+    dispatcher = ZmqDispatcher(context=ctx, zmq_module=zmq)
+    try:
+        result = dispatcher.dispatch_flow_update(
+            correlation_id=77,
+            job_id="contract-flow-9",
+            event=event,
+            endpoint=endpoint,
+        )
+        assert result.endpoint == endpoint
+        assert result.bytes_sent == dispatcher.expected_flow_update_frame_size()
+
+        queue = ctx.ensure(endpoint)
+        assert len(queue) == 1
+        header, payload = unpack_message(queue[0])
+        assert header.worker_kind == WorkerKind.GPU
+        assert header.msg_type == MessageType.FLOW_UPDATE
+        assert header.correlation_id == 77
+        assert header.job_id == "contract-flow-9"
+        assert FlowUpdateEventV1.unpack(payload) == event
+    finally:
+        dispatcher.close()
+
+
+def test_m3_dispatch_flow_stream_upsert_targets_gpu_lifecycle_channel() -> None:
+    ctx = _FakeContext()
+    zmq = _FakeZmq()
+    _FakeZmq.Context._instance = ctx
+    endpoint = "ipc:///tmp/samurai_jobs_gpu_stream_upsert_test"
+    upsert = FlowStreamUpsertV1(
+        version=14,
+        epoch=6,
+        flow_id=12,
+        tcp_seq=123,
+        tcp_ack=99,
+        src_port=40100,
+        dst_port=443,
+        tcp_state=4,
+        proto=6,
+        flags=0x18,
+        rtt_us=800,
+        quota=4096,
+        tx_ipg_ns=250,
+        dpu_ts_ns=987654322,
+        target_ip="10.0.0.9",
+        payload_len=16,
+        payload_byte=66,
+        weight=2,
+        template_id=3,
+    )
+
+    dispatcher = ZmqDispatcher(context=ctx, zmq_module=zmq)
+    try:
+        result = dispatcher.dispatch_flow_stream_upsert(
+            correlation_id=78,
+            job_id="stream-upsert-12",
+            upsert=upsert,
+            endpoint=endpoint,
+        )
+        assert result.endpoint == endpoint
+        assert result.bytes_sent == dispatcher.expected_flow_stream_upsert_frame_size()
+
+        queue = ctx.ensure(endpoint)
+        assert len(queue) == 1
+        header, payload = unpack_message(queue[0])
+        assert header.worker_kind == WorkerKind.GPU
+        assert header.msg_type == MessageType.FLOW_STREAM_UPSERT
+        assert header.correlation_id == 78
+        assert header.job_id == "stream-upsert-12"
+        assert FlowStreamUpsertV1.unpack(payload) == upsert
+    finally:
+        dispatcher.close()
+
+
+def test_m3_dispatch_flow_update_contract_rejects_epoch_rollback() -> None:
+    ctx = _FakeContext()
+    zmq = _FakeZmq()
+    _FakeZmq.Context._instance = ctx
+    endpoint = "ipc:///tmp/samurai_jobs_gpu_contract_epoch_guard"
+
+    dispatcher = ZmqDispatcher(context=ctx, zmq_module=zmq)
+    try:
+        event_ok = FlowUpdateEventV1(
+            version=2,
+            epoch=7,
+            flow_id=11,
+            tcp_seq=100,
+            tcp_ack=90,
+            src_port=40001,
+            dst_port=443,
+            tcp_state=4,
+            proto=6,
+            flags=0x18,
+            rtt_us=700,
+            dpu_ts_ns=111,
+        )
+        dispatcher.dispatch_flow_update(
+            correlation_id=101,
+            job_id="epoch-ok",
+            event=event_ok,
+            endpoint=endpoint,
+        )
+
+        event_rollback = FlowUpdateEventV1(
+            version=4,
+            epoch=6,
+            flow_id=11,
+            tcp_seq=110,
+            tcp_ack=95,
+            src_port=40001,
+            dst_port=443,
+            tcp_state=4,
+            proto=6,
+            flags=0x18,
+            rtt_us=650,
+            dpu_ts_ns=222,
+        )
+        with pytest.raises(ValueError, match="epoch mismatch"):
+            dispatcher.dispatch_flow_update(
+                correlation_id=102,
+                job_id="epoch-rollback",
+                event=event_rollback,
+                endpoint=endpoint,
+            )
+
+        stats = dispatcher.flow_update_contract_stats()
+        assert stats["published"] == 1
+        assert stats["epoch_mismatch"] == 1
+    finally:
+        dispatcher.close()
+
+
+def test_m3_dispatch_flow_update_contract_detects_version_gap() -> None:
+    ctx = _FakeContext()
+    zmq = _FakeZmq()
+    _FakeZmq.Context._instance = ctx
+    endpoint = "ipc:///tmp/samurai_jobs_gpu_contract_version_gap"
+
+    dispatcher = ZmqDispatcher(context=ctx, zmq_module=zmq)
+    try:
+        first = FlowUpdateEventV1(
+            version=2,
+            epoch=3,
+            flow_id=15,
+            tcp_seq=1,
+            tcp_ack=1,
+            src_port=50000,
+            dst_port=80,
+            tcp_state=1,
+            proto=6,
+            flags=0x02,
+            rtt_us=100,
+            dpu_ts_ns=1,
+        )
+        dispatcher.dispatch_flow_update(
+            correlation_id=201,
+            job_id="v-ok",
+            event=first,
+            endpoint=endpoint,
+        )
+
+        gap = FlowUpdateEventV1(
+            version=10,
+            epoch=3,
+            flow_id=15,
+            tcp_seq=2,
+            tcp_ack=2,
+            src_port=50000,
+            dst_port=80,
+            tcp_state=1,
+            proto=6,
+            flags=0x12,
+            rtt_us=110,
+            dpu_ts_ns=2,
+        )
+        with pytest.raises(ValueError, match="version gap"):
+            dispatcher.dispatch_flow_update(
+                correlation_id=202,
+                job_id="v-gap",
+                event=gap,
+                endpoint=endpoint,
+            )
+
+        dispatcher.dispatch_flow_update(
+            correlation_id=203,
+            job_id="v-gap-allowed",
+            event=gap,
+            allow_version_gap=True,
+            endpoint=endpoint,
+        )
+        stats = dispatcher.flow_update_contract_stats()
+        assert stats["version_gap_detected"] >= 1
+        assert stats["published"] == 2
+        assert dispatcher.next_committed_flow_version(15) == 12
+    finally:
+        dispatcher.close()
 
 
 def test_m3_dpdk_worker_has_native_tx_path_and_failfast_fallback() -> None:
@@ -177,15 +447,236 @@ def test_m3_afxdp_worker_has_native_bridge_and_failfast_fallback() -> None:
 def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     root = Path(__file__).resolve().parents[1]
     src = (root / "ddos_samurai" / "zmq" / "daemon" / "doca_gpunetio_worker.cpp").read_text(encoding="utf-8")
+    backend = (root / "ddos_samurai" / "gpu_packet_cuda" / "doca_gpunetio_backend.cpp").read_text(encoding="utf-8")
+    api = (root / "ddos_samurai" / "gpu_packet_cuda" / "tx_backend_doca_gpunetio.cuh").read_text(encoding="utf-8")
     assert "LoadDocaNative" in src
+    assert '#include "dpu_state_runtime.hpp"' in src
     assert "samurai_doca_gpunetio_get_api_v1" in src
     assert "samurai_doca_backend_create_txq" in src
     assert "samurai_doca_backend_send_vector" in src
+    assert "kDefaultGpuJobs" in src
+    assert "--gpu-job-endpoint" in src
+    assert "--dpu-state-publish" in src
+    assert "SAMURAI_DPU_STATE_PUBLISH" in src
+    assert "InitialFlowStateFromEnvelope" in src
+    assert "BuildFlowStreamUpsert" in src
+    assert "PublishDpuFlowStreamUpsert" in src
+    assert "PublishDpuFlowUpdate" in src
+    assert "DpuContractWriterGuard" in src
+    assert "OpenDpuContractRdmaWriter" in src
+    assert "PublishDpuFlowUpdateOptionalRdma" in src
+    assert "DefaultGpuContractExportSpec" in src
+    assert "GpuContractExportSpecWithLayout" in src
+    assert "EnvContractU32" in src
+    assert "SAMURAI_GPU_CONTRACT_EXPORT_SPEC" in src
+    assert "SAMURAI_GPU_CONTRACT_EXPORT_PATH" in src
+    assert "std::string(\"kind=\") + kind + \",file=\"" in src
+    assert "layout=1,shards=" in src
+    assert "event=\" + std::to_string(sizeof(DocaFlowUpdateEventV1))" in src
+    assert "--dpu-contract-rdma" in src
+    assert "SAMURAI_DPU_CONTRACT_RDMA" in src
+    assert "SAMURAI_DPU_CONTRACT_RDMA_SPEC" in src
+    assert "dpu_contract_rdma_writer_unavailable" in src
+    assert "dpu_contract_rdma_publish_failed" in src
+    assert "DocaContractWriterConfigV1" in api
+    assert "DocaFlowUpdateEventV1" in api
+    assert "contract_writer_publish_flow_update_v1" in api
+    assert "samurai_doca_backend_contract_writer_open" in backend
+    assert "samurai_doca_backend_contract_writer_close" in backend
+    assert "samurai_doca_backend_contract_writer_publish_flow_update_v1" in backend
+    assert "BackendContractFlowUpdateSlot" in backend
+    assert "ContractRegionSpec" in backend
+    assert "out->kind = \"file\"" in backend
+    assert "contract region kind=rdma requires SAMURAI_DOCA_CONTRACT_RDMA_IMPORTER_SO" in backend
+    assert "samurai_doca_contract_rdma_import_v1" in backend
+    assert "samurai_doca_contract_rdma_release_v1" in backend
+    assert "register_contract_writer_doca_mmap" in backend
+    assert "contract doca_mmap_set_memrange failed" in backend
+    assert "contract doca_mmap_get_mkey failed" in backend
+    assert "contract region layout version mismatch" in backend
+    assert "contract region shard count mismatch" in backend
+    assert "contract region ring slot count mismatch" in backend
+    assert "contract region hot-flow capacity mismatch" in backend
+    assert "contract region event size mismatch" in backend
+    assert "contract_store_event_slot" in backend
+    assert "__atomic_store_n(&heads[shard], head + 1u, __ATOMIC_RELEASE)" in backend
+    assert "contract writer ring overflow" in backend
+    assert "MessageType::FLOW_UPDATE" in src
+    assert "MessageType::FLOW_STREAM_UPSERT" in src
+    assert "ZMQ_DONTWAIT" in src
+    assert "dpu_gpu_flow_stream_upsert_publish_failed" in src
+    assert "dpu_gpu_flow_update_publish_failed" in src
     assert "MessageType::HEARTBEAT" in src
     assert "MessageType::METRIC_SNAPSHOT" in src
     assert "doca_native_lib_unavailable" in src
     assert "doca_interface_required" in src
     assert "doca_device_required" in src
+
+
+def test_m3_doca_worker_dpu_tcp_feedback_is_zmq_stateful_not_python_bridge() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "doca_gpunetio_worker.cpp").read_text(encoding="utf-8")
+
+    assert "SAMURAI_DPU_TCP_RX_FEEDBACK" in src
+    assert "SAMURAI_DPU_TCP_PASSIVE_OPEN" in src
+    assert "--dpu-tcp-rx-feedback" in src
+    assert "--dpu-tcp-passive-open" in src
+    assert "PollDpuTcpRxFeedback" in src
+    assert "WaitForDpuPassiveOpen" in src
+    assert "AcceptPassiveOpen" in src
+    assert "ObserveTcpPacket" in src
+    assert "ApplyDpuStreamPolicyToUpsert" in src
+    assert "BuildGpuStreamPolicy" in src
+    assert "PublishDpuFlowStreamUpsert" in src
+    assert "MessageType::FLOW_STREAM_UPSERT" in src
+    assert "python" not in src.lower()
+
+
+def test_m3_doca_worker_perf_critical_feedback_path_reuses_scratch_and_batches_tcb_tx() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "doca_gpunetio_worker.cpp").read_text(encoding="utf-8")
+    poll_body = src.split("bool PollDpuTcpRxFeedback(", 1)[1].split("bool WaitForDpuPassiveOpen(", 1)[0]
+
+    assert "struct DpuTcpRxScratch" in src
+    assert "std::vector<std::uint8_t> flat" in src
+    assert "std::vector<std::uint16_t> lengths" in src
+    assert "std::unordered_map<std::uint32_t, StreamPolicySnapshot> stream_policy_cache" in src
+    assert "DpuTcpRxScratch& scratch" in poll_body
+    assert "scratch.flat.data()" in poll_body
+    assert "scratch.lengths.data()" in poll_body
+    assert "std::vector<std::uint8_t> flat" not in poll_body
+    assert "std::vector<std::uint16_t> lengths" not in poll_body
+    assert "ShouldPublishStreamPolicy(scratch, upsert)" in poll_body
+    assert "TrackTransmitBatch(" in src
+
+
+def test_m3_dpu_state_runtime_models_authoritative_flow_updates() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp").read_text(encoding="utf-8")
+    assert "struct FlowState" in src
+    assert "class FlowStateTable" in src
+    assert "NextCommittedVersion" in src
+    assert "BuildUpdateEvent" in src
+    assert "FlowUpdateEventV1" in src
+    assert "kTcpStateMigrating" in src
+    assert "kTcpStatePoisoned" in src
+
+
+def test_m3_dpu_state_runtime_models_full_tcp_offload_control_blocks() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp").read_text(encoding="utf-8")
+
+    for token in [
+        "struct TcpControlBlock",
+        "TcpFlowKey",
+        "retransmit_queue",
+        "next_rto_deadline_ns",
+        "dup_ack_count",
+        "fast_recovery",
+        "zero_window_probe_pending",
+        "sack_permitted",
+        "timestamp_enabled",
+        "out_of_order",
+        "receive_queue",
+        "receive_ready_bytes",
+        "ConsumeReceiveBytes(",
+        "PopAcceptedFlow(",
+        "accept_queue",
+        "backlog_drop_count",
+        "syn_cookie_issued_count",
+        "ApplyPacketTooBig(",
+        "InitiateClose(",
+        "ecn_echo_pending",
+        "cwr_pending",
+        "Listen(",
+        "AcceptPassiveOpen(",
+        "ObserveTcpPacketByTuple(",
+        "TrackTransmitBatch(",
+        "TickTcpTimers(",
+        "UpdatePathMtu(",
+        "BuildGpuStreamPolicy(",
+        "kGpuStreamPolicyPause",
+        "kGpuStreamPolicyRetransmit",
+        "kGpuStreamPolicyZeroWindowProbe",
+    ]:
+        assert token in src
+
+
+def test_m3_cuda_stream_templates_emit_negotiated_tcp_options() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "gpu_packet_cuda" / "host_api.cuh").read_text(encoding="utf-8")
+
+    for token in [
+        "tcp_mss",
+        "tcp_window_scale",
+        "tcp_sack_permitted",
+        "tcp_timestamp_enabled",
+        "tcp_opt_len",
+        "sv->tcp_sack_permitted",
+        "sv->tcp_timestamp_enabled",
+        "sv->tcp_window_scale <= 14u",
+        "json_get_int(profile, \"tcp_mss\", 1460)",
+        "json_get_bool(profile, \"tcp_sack_permitted\", true)",
+        "json_get_bool(st.update_json, \"tcp_timestamp_enabled\"",
+    ]:
+        assert token in src
+
+
+
+def test_m3_cuda_contract_runtime_has_device_visible_mirror() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "gpu_packet_cuda" / "host_api.cuh").read_text(encoding="utf-8")
+    assert "update_ring_dev" in src
+    assert "ring_head_dev" in src
+    assert "ring_tail_dev" in src
+    assert "hot_flow_table_dev" in src
+    assert "hot_flow_versions_dev" in src
+    assert "hot_flow_epochs_dev" in src
+    assert "persistent_contract_runtime_alloc_device_mirror_unlocked" in src
+    assert "persistent_contract_runtime_sync_device_slot_unlocked" in src
+    assert "persistent_contract_runtime_refresh_device_tail_unlocked" in src
+    assert "persistent_contract_runtime_sync_device_tail_unlocked" in src
+    assert "persistent_contract_default_export_path" in src
+    assert "SAMURAI_GPU_CONTRACT_EXPORT_PATH" in src
+    assert "cudaHostRegister(mapped, layout.total_bytes, cudaHostRegisterMapped)" in src
+    assert "cudaHostGetDevicePointer(&dev_base, mapped, 0)" in src
+    assert "persistent_contract_export_region_spec" in src
+    assert "std::string kind = \"file\"" in src
+    assert "<< \"kind=\" << kind" in src
+    assert "<< \",shards=\" << shard_count" in src
+    assert "<< \",event=\" << sizeof" in src
+    assert "samurai_gpu_packet_contract_export_region_v1" in src
+    assert "failed to sync contract update into device mirror" in src
+    assert "contract_device_mirror_active" in src
+    assert "contract_device_sync_error_events" in src
+    assert "contract_export_region_spec" in src
+    assert "contract_export_region_bytes" in src
+
+
+def test_m3_cuda_persistent_kernel_drains_contract_ring() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "ddos_samurai" / "gpu_packet_cuda" / "host_api.cuh").read_text(encoding="utf-8")
+    assert "persistent_contract_poll_assigned_shard" in src
+    assert "contract_update_ring" in src
+    assert "contract_ring_head" in src
+    assert "contract_ring_tail" in src
+    assert "contract_hot_flow_table" in src
+    assert "contract_hot_flow_versions" in src
+    assert "contract_hot_flow_epochs" in src
+    assert "kPollWarpWidth = 32u" in src
+    assert "lane < drain_count" in src
+    assert "loaded_mask = __ballot_sync" in src
+    assert "s_contract_flow_ids" in src
+    assert "s_contract_versions" in src
+    assert "for (uint32_t other_lane = lane + 1u" in src
+    assert "contiguous_loaded" in src
+    assert "const int32_t shard = static_cast<int32_t>(blockIdx.x)" in src
+    assert "contract_ring_tail[shard] = tail + static_cast<uint64_t>(contiguous_loaded)" in src
+    assert "sv->source_port = ev.src_port" in src
+    assert "sv->tcp_flags = ev.flags" in src
+    assert "sv->seq_counter = ev.tcp_seq" in src
+    assert "contract_poll_events" in src
+    assert "contract_kernel_poll_events" in src
 
 
 def test_m3_l7_worker_has_real_runtime_and_failfast_fallback() -> None:

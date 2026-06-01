@@ -7,7 +7,6 @@ import os
 import time
 from datetime import datetime, timezone
 
-from .. import cpu_packet_engine as packet
 from .. import metrics, reporting, selftest, utils
 from .reporting import publish_metrics_prom_to_textfile
 
@@ -199,41 +198,62 @@ def handle_dry_run(args, parser, report_ctx: dict) -> int:
         payload_source = "payload_arg"
         payload_len = len(str(payload_obj))
 
-    spoof_opts = packet.SpoofingOptions(
-        mode=args.spoof_mode,
-        subnet=args.spoof_subnet,
-        list_file=args.spoof_list_file,
-    )
-    p_config = packet.PacketConfig(
-        target_ip=args.target,
-        target_port=args.port,
-        protocol=args.protocol,
-        spoof=args.spoof,
-        spoof_opts=spoof_opts,
-        payload=payload_obj,
-        tcp_flags=args.tcp_flags,
-        ttl=args.ttl,
-        tos=args.tos,
-        window=args.window,
-        fragment_enabled=args.fragment,
-        fragment_size=args.fragment_size,
-        pad_size=args.pad,
-        attack_vector=args.attack_vector,
-        dns_name=args.dns_name,
-        dns_qtype=args.dns_qtype,
-        dns_edns=args.dns_edns,
-        dns_recursive=not args.dns_nord,
-    )
-    pkt_bytes = b""
+
+
+    # ── ZMQ-based dispatch ──
+    from .. import orchestrator
+
+    worker_args = dict(vars(args))
+    worker_args["packets"] = 1
+    worker_args["count"] = 1
+    worker_args["zmq_ack_timeout_s"] = 2.0
+    worker_args["zmq_heartbeat_timeout_s"] = 5.0
+    worker_args["zmq_overall_timeout_s"] = 10.0
+    if "compute_backend" not in worker_args or not worker_args["compute_backend"]:
+        worker_args["compute_backend"] = "cpu"
+
+    run_events = []
+    utils.log_info("Dry-run: ZMQ daemonuna doğrulama işi gönderiliyor...")
     try:
-        pkt = packet.create_packet(p_config)
-        pkt_bytes = bytes(pkt)
-        utils.log_info(f"Örnek paket üretildi: {len(pkt_bytes)} bayt. (attack_vector={args.attack_vector})")
-    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as e:
-        warnings.append(f"sample_packet_unavailable: {type(e).__name__}: {e}")
-        utils.log_warning(f"Dry-run: örnek paket üretilemedi (ortam/izin kısıtı olabilir): {e}")
+        orchestrator.start_worker_zmq(
+            worker_id=1,
+            args=worker_args,
+            run_events=run_events,
+        )
+    except Exception as e:
+        warnings.append(f"zmq_worker_exception: {type(e).__name__}: {e}")
+        utils.log_warning(f"Dry-run: ZMQ worker başlatılamadı veya hata oluştu: {e}")
+
+    zmq_ok = False
+    if run_events:
+        event = run_events[-1]
+        if event.get("status") == "ok":
+            zmq_ok = True
+            utils.log_info(f"ZMQ Daemon doğrulandı: {event.get('status')}. ZMQ Süresi: {event.get('duration_s', 0.0):.4f}s.")
+        else:
+            zmq_err = event.get("error", "Bilinmeyen hata")
+            warnings.append(f"zmq_worker_failed: {zmq_err}")
+            utils.log_warning(f"Dry-run: ZMQ daemon hatası bildirdi: {zmq_err}")
+    else:
+        warnings.append("zmq_worker_no_response: ZMQ daemon'ından yanıt alınamadı.")
+        utils.log_warning("Dry-run: ZMQ daemon'ından yanıt alınamadı.")
+
+    # ── ZMQ-based inspection (metadata generation) ──
+    pkt_bytes = b""
+    if zmq_ok and run_events:
+        stats = run_events[-1].get("stats", {})
+        bytes_sent = stats.get("bytes_sent", 0)
+        if bytes_sent > 0:
+            pkt_bytes = b"\x00" * bytes_sent
+            utils.log_info(f"Örnek paket boyutu ZMQ daemonundan alındı: {len(pkt_bytes)} bayt.")
+        else:
+            warnings.append("sample_packet_unavailable: ZMQ returned 0 bytes_sent")
+            utils.log_warning("Dry-run: örnek paket boyutu alınamadı (0 bytes).")
+    else:
+        warnings.append("sample_packet_unavailable: ZMQ daemon failed")
+        utils.log_warning("Dry-run: örnek paket üretilemedi (ZMQ hatası).")
         if not report_ctx["want_report"]:
-            raise
+            raise RuntimeError("Dry-run: örnek paket üretilemedi (ZMQ hatası).")
 
     finished_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     duration_wall = max(0.0, time.time() - t0)

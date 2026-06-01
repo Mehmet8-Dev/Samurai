@@ -1,0 +1,33 @@
+{
+  "checks": [
+    {
+      "name": "flow_update_odd_version_rejected",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "name": "gpu_kernel_mode_nonpersistent_rejected",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "name": "gpu_legacy_bridge_call_rejected",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "name": "job_envelope_invalid_port_detected",
+      "passed": true,
+      "weight": 1.0
+    },
+    {
+      "name": "wire_header_bad_magic_detected",
+      "passed": true,
+      "weight": 1.0
+    }
+  ],
+  "passed": 5,
+  "score": 100.0,
+  "suite": "rfc_negative",
+  "total": 5
+}
