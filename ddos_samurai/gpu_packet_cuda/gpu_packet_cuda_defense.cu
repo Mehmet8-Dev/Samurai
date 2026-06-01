@@ -76,6 +76,10 @@ struct DefenseRuntime {
   std::string engine_path;
   std::string expected_sm;
   std::string expected_trt_version;
+  bool infer_backend_ready = false;
+  bool infer_mock_mode = false;
+  std::string infer_backend_kind = "none";
+  std::string infer_backend_detail = "none";
 
   uint64_t infer_calls = 0;
   uint64_t infer_packets = 0;
@@ -113,9 +117,104 @@ thread_local std::string g_defense_last_error;
 DefenseRuntime g_runtime;
 std::mutex g_runtime_mu;
 
+using TrtBackendInitFn = int (*)(const char* engine_path, int64_t max_batch_size, char* err, size_t err_len);
+using TrtBackendClassifyViewsFn =
+    int (*)(const PacketView* views, int64_t packet_count, int32_t* out_labels, float* out_confidences, char* err, size_t err_len);
+using TrtBackendShutdownFn = int (*)(char* err, size_t err_len);
+
+struct TrtBackendDispatch {
+  void* so_handle = nullptr;
+  TrtBackendInitFn init = nullptr;
+  TrtBackendClassifyViewsFn classify_views = nullptr;
+  TrtBackendShutdownFn shutdown = nullptr;
+  bool initialized = false;
+  std::string so_path;
+};
+
+TrtBackendDispatch g_trt_backend{};
+
 int set_err(const std::string& reason) {
   g_defense_last_error = reason;
   return -1;
+}
+
+std::string normalize_text(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+void reset_trt_backend_dispatch_unlocked() {
+  if (g_trt_backend.initialized && g_trt_backend.shutdown != nullptr) {
+    char errbuf[192];
+    std::memset(errbuf, 0, sizeof(errbuf));
+    (void)g_trt_backend.shutdown(errbuf, sizeof(errbuf));
+  }
+  if (g_trt_backend.so_handle != nullptr) {
+    dlclose(g_trt_backend.so_handle);
+  }
+  g_trt_backend = TrtBackendDispatch{};
+}
+
+bool init_trt_backend_unlocked(const std::string& engine_path, int64_t max_batch_size, std::string* reason) {
+  reset_trt_backend_dispatch_unlocked();
+  const char* so_env = std::getenv("SAMURAI_GPU_TENSORRT_BACKEND_SO");
+  const std::string so_path =
+      (so_env != nullptr && *so_env != '\0') ? std::string(so_env) : std::string("libsamurai_tensorrt_backend.so");
+  g_trt_backend.so_path = so_path;
+  dlerror();
+  g_trt_backend.so_handle = dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (g_trt_backend.so_handle == nullptr) {
+    const char* why = dlerror();
+    if (reason != nullptr) {
+      *reason = std::string("dlopen failed: ") + (why ? why : "unknown");
+    }
+    return false;
+  }
+
+  auto resolve_symbol = [&](const char* name, void** out) -> bool {
+    if (out == nullptr) {
+      return false;
+    }
+    dlerror();
+    void* sym = dlsym(g_trt_backend.so_handle, name);
+    const char* sym_err = dlerror();
+    if (sym == nullptr || sym_err != nullptr) {
+      if (reason != nullptr) {
+        *reason = std::string("dlsym(") + name + ") failed: " + (sym_err ? sym_err : "unknown");
+      }
+      return false;
+    }
+    *out = sym;
+    return true;
+  };
+
+  void* p_init = nullptr;
+  void* p_classify = nullptr;
+  void* p_shutdown = nullptr;
+  if (!resolve_symbol("samurai_tensorrt_backend_init_v1", &p_init) ||
+      !resolve_symbol("samurai_tensorrt_backend_classify_packet_views_v1", &p_classify) ||
+      !resolve_symbol("samurai_tensorrt_backend_shutdown_v1", &p_shutdown)) {
+    reset_trt_backend_dispatch_unlocked();
+    return false;
+  }
+
+  g_trt_backend.init = reinterpret_cast<TrtBackendInitFn>(p_init);
+  g_trt_backend.classify_views = reinterpret_cast<TrtBackendClassifyViewsFn>(p_classify);
+  g_trt_backend.shutdown = reinterpret_cast<TrtBackendShutdownFn>(p_shutdown);
+  char errbuf[192];
+  std::memset(errbuf, 0, sizeof(errbuf));
+  const int init_rc = g_trt_backend.init(engine_path.c_str(), max_batch_size, errbuf, sizeof(errbuf));
+  if (init_rc != 0) {
+    if (reason != nullptr) {
+      *reason = (errbuf[0] != '\0') ? std::string(errbuf) : "backend_init_failed";
+    }
+    reset_trt_backend_dispatch_unlocked();
+    return false;
+  }
+  g_trt_backend.initialized = true;
+  return true;
 }
 
 const char* rdma_mode_name(RdmaMode mode) {
@@ -929,14 +1028,45 @@ int classify_packet_views_common_locked(
   g_runtime.stream_overlap_events += 1;
   g_runtime.total_batches += 1;
 
-  constexpr size_t feature_dim = 8;
-  std::vector<float> features(static_cast<size_t>(packet_count) * feature_dim, 0.0f);
-  extract_features_stub(views, static_cast<size_t>(packet_count), features.data(), feature_dim);
-  if (enqueue_inference_stub(features.data(), static_cast<size_t>(packet_count), feature_dim, out_labels, out_confidences) != 0) {
+  if (!g_runtime.infer_backend_ready) {
     if (out_reason != nullptr) {
-      *out_reason = "infer_enqueue_failed";
+      *out_reason = "infer_backend_unavailable";
     }
-    return set_err("infer_enqueue_failed");
+    return set_err("infer_backend_unavailable");
+  }
+
+  if (g_runtime.infer_mock_mode) {
+    constexpr size_t feature_dim = 8;
+    std::vector<float> features(static_cast<size_t>(packet_count) * feature_dim, 0.0f);
+    extract_features_stub(views, static_cast<size_t>(packet_count), features.data(), feature_dim);
+    if (enqueue_inference_stub(features.data(), static_cast<size_t>(packet_count), feature_dim, out_labels, out_confidences) != 0) {
+      if (out_reason != nullptr) {
+        *out_reason = "infer_enqueue_failed";
+      }
+      return set_err("infer_enqueue_failed");
+    }
+  } else {
+    if (!g_trt_backend.initialized || g_trt_backend.classify_views == nullptr) {
+      if (out_reason != nullptr) {
+        *out_reason = "infer_backend_unavailable";
+      }
+      return set_err("infer_backend_unavailable");
+    }
+    char errbuf[192];
+    std::memset(errbuf, 0, sizeof(errbuf));
+    const int rc = g_trt_backend.classify_views(
+        views,
+        packet_count,
+        out_labels,
+        out_confidences,
+        errbuf,
+        sizeof(errbuf));
+    if (rc != 0) {
+      if (out_reason != nullptr) {
+        *out_reason = (errbuf[0] != '\0') ? errbuf : "infer_enqueue_failed";
+      }
+      return set_err((errbuf[0] != '\0') ? std::string(errbuf) : "infer_enqueue_failed");
+    }
   }
 
   g_runtime.infer_calls += 1;
@@ -1212,6 +1342,7 @@ extern "C" int samurai_gpu_packet_defense_init(
   g_runtime.max_batch_size = (max_batch_size > 0) ? max_batch_size : 1024;
   g_runtime.flush_timeout_ms = (flush_timeout_ms > 0) ? flush_timeout_ms : 2;
   g_runtime.doca_rx_device_path_requested = env_flag("SAMURAI_GPU_DOCA_RX_DEVICE_PATH", true);
+  reset_trt_backend_dispatch_unlocked();
 
   if (g_runtime.engine_path.empty()) {
     return set_err("engine_load_failed");
@@ -1223,6 +1354,27 @@ extern "C" int samurai_gpu_packet_defense_init(
   std::string compat_reason;
   if (!validate_engine_compat(g_runtime.engine_path, &compat_reason)) {
     return set_err(compat_reason.empty() ? "engine_compat_mismatch" : compat_reason);
+  }
+
+  const std::string runtime_mode = normalize_text(g_runtime.runtime);
+  const bool allow_stub = env_flag("SAMURAI_GPU_DEFENSE_ALLOW_STUB", false) || runtime_mode == "mock";
+  std::string infer_reason;
+  if (init_trt_backend_unlocked(g_runtime.engine_path, g_runtime.max_batch_size, &infer_reason)) {
+    g_runtime.infer_backend_ready = true;
+    g_runtime.infer_mock_mode = false;
+    g_runtime.infer_backend_kind = "tensorrt_backend_so";
+    g_runtime.infer_backend_detail = g_trt_backend.so_path.empty() ? "loaded" : g_trt_backend.so_path;
+  } else if (allow_stub) {
+    g_runtime.infer_backend_ready = true;
+    g_runtime.infer_mock_mode = true;
+    g_runtime.infer_backend_kind = "stub_mock";
+    g_runtime.infer_backend_detail = infer_reason.empty() ? "allowed_by_flag" : infer_reason;
+  } else {
+    g_runtime.infer_backend_ready = false;
+    g_runtime.infer_mock_mode = false;
+    g_runtime.infer_backend_kind = "none";
+    g_runtime.infer_backend_detail = infer_reason.empty() ? "backend_load_failed" : infer_reason;
+    return set_err("infer_backend_unavailable");
   }
 
   RdmaDecision rdma = resolve_rdma_ingress(g_runtime.rdma_mode, g_runtime.strict);
@@ -1519,6 +1671,9 @@ extern "C" const char* samurai_gpu_packet_read_classifier_stats() {
   oss << "\"gpu_rdma_mode\":\"" << rdma_mode_name(g_runtime.rdma_mode) << "\",";
   oss << "\"gpu_rdma_ingress_path\":\"" << ingress_path_name(g_runtime.ingress_path) << "\",";
   oss << "\"gpu_rdma_fallback_reason\":\"" << g_runtime.fallback_reason << "\",";
+  oss << "\"gpu_infer_backend_kind\":\"" << g_runtime.infer_backend_kind << "\",";
+  oss << "\"gpu_infer_backend_mock_mode\":" << (g_runtime.infer_mock_mode ? 1 : 0) << ",";
+  oss << "\"gpu_infer_backend_detail\":\"" << g_runtime.infer_backend_detail << "\",";
   oss << "\"gpu_cls_label_0_count\":" << g_runtime.label0_count << ",";
   oss << "\"gpu_cls_label_1_count\":" << g_runtime.label1_count << ",";
   oss << "\"gpu_cls_confidence_mean\":" << confidence_mean << ",";
@@ -1568,6 +1723,7 @@ extern "C" int samurai_gpu_packet_defense_shutdown() {
   }
   release_ingress_device_buffers(&g_runtime);
   g_runtime = DefenseRuntime{};
+  reset_trt_backend_dispatch_unlocked();
   g_defense_last_error.clear();
   return 0;
 }
