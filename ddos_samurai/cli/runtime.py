@@ -44,7 +44,8 @@ class _ThreadWorker:
 
     def __init__(self, *, target, args: tuple, name: str):
         self._target = target
-        self._args = tuple(args)
+        self._stop_event = threading.Event()
+        self._args = tuple(args) + (self._stop_event,)
         self._thread = threading.Thread(target=self._run, name=str(name), daemon=True)
         self.exitcode = None
         self._terminate_requested = False
@@ -65,15 +66,12 @@ class _ThreadWorker:
         self._thread.join(timeout=timeout)
 
     def is_alive(self) -> bool:
-        if self._terminate_requested:
-            return False
         return bool(self._thread.is_alive())
 
     def terminate(self):
-        # Cooperative termination path can be added here by job-id stop dispatch.
+        # Cooperative stop request for worker loop.
         self._terminate_requested = True
-        if self.exitcode is None:
-            self.exitcode = -15
+        self._stop_event.set()
 
     @property
     def name(self) -> str:
@@ -543,6 +541,25 @@ def run_live_mode(args, parser, argv, soak_cfg, report_ctx: dict, runtime_ctx: d
         utils.log_info("Tüm süreçler sonlandırıldı.")
 
     duration = time.time() - start_time
+    # Surface worker failures in non-report mode as well; otherwise
+    # short-circuit exits can look like "silent success" with zero progress.
+    try:
+        events_local_for_log = list(run_events or [])
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
+        events_local_for_log = []
+    failed_events = [ev for ev in events_local_for_log if str((ev or {}).get("status", "ok")) != "ok"]
+    if failed_events:
+        for ev in failed_events[:3]:
+            wid = int((ev or {}).get("worker_id", 0) or 0)
+            st = str((ev or {}).get("status", "failed") or "failed")
+            err = str((ev or {}).get("error", "") or "")
+            if err:
+                utils.log_warning(f"Worker-{wid} durum={st} hata={err}")
+            else:
+                utils.log_warning(f"Worker-{wid} durum={st}")
+        if len(failed_events) > 3:
+            utils.log_warning(f"Ek worker hata kaydı: {len(failed_events) - 3}")
+
     try:
         vae_anomaly_events, vae_summary = _run_vae_post_analysis(
             args,

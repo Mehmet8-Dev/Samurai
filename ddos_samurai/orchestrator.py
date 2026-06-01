@@ -71,9 +71,11 @@ def _build_pacing_config(args: dict) -> PacingConfig:
 
 def _resolve_worker_kind_for_zmq(args: dict) -> WorkerKind:
     backend = str(args.get("compute_backend", "cpu") or "cpu").strip().lower()
+    sender_backend = str(args.get("sender_backend", "") or "").strip().lower()
     attack_vector = str(args.get("attack_vector", "basic") or "basic").strip().lower()
     scenario_mode = str(args.get("scenario_mode", "off") or "off").strip().lower()
     scenario_payload_ref = str(args.get("scenario_payload_ref", "") or "").strip()
+    xdp_enable = _coerce_bool(args.get("xdp_enable", False), default=False)
 
     if scenario_mode in {"shadow", "enforce"} or bool(scenario_payload_ref):
         return WorkerKind.SCENARIO
@@ -84,6 +86,8 @@ def _resolve_worker_kind_for_zmq(args: dict) -> WorkerKind:
         return WorkerKind.GPU
     if backend == "dpdk":
         return WorkerKind.DPDK
+    if xdp_enable or sender_backend == "xdp":
+        return WorkerKind.AF_XDP
     if backend in {"af_xdp", "xdp"}:
         return WorkerKind.AF_XDP
     if attack_vector in {"http", "http2", "websocket", "slowloris", "l4_tcp", "quic"}:
@@ -133,6 +137,27 @@ def _resolve_worker_search_dir(args: dict) -> str | None:
     auto = repo_root / "build-workers"
     if auto.exists():
         return str(auto)
+    return None
+
+
+def _resolve_xdp_native_lib_path() -> str | None:
+    env_path = str(os.environ.get("SAMURAI_XDP_NATIVE_LIB", "") or "").strip()
+    if env_path:
+        return env_path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    candidates = [
+        repo_root / "ddos_samurai" / "xdp_sender.so",
+        repo_root / "ddos_samurai" / "xdp_sender.cpython-312-x86_64-linux-gnu.so",
+        repo_root / "ddos_samurai" / "xdp_sender.cpython-311-x86_64-linux-gnu.so",
+        repo_root / "ddos_samurai" / "xdp_sender.cpython-310-x86_64-linux-gnu.so",
+        repo_root / "build" / "lib.linux-x86_64-cpython-312" / "ddos_samurai" / "xdp_sender.cpython-312-x86_64-linux-gnu.so",
+        repo_root / "build" / "lib.linux-x86_64-cpython-311" / "ddos_samurai" / "xdp_sender.cpython-311-x86_64-linux-gnu.so",
+        repo_root / "build" / "lib.linux-x86_64-cpython-310" / "ddos_samurai" / "xdp_sender.cpython-310-x86_64-linux-gnu.so",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
     return None
 
 
@@ -203,6 +228,7 @@ def start_worker_zmq(
     sent_total=None,
     errors_total=None,
     resource_stats=None,
+    stop_event=None,
 ):
     _ = tls_profile
     _ = resource_stats
@@ -217,6 +243,7 @@ def start_worker_zmq(
     if correlation_id <= 0:
         correlation_id = int((time.time_ns() ^ int(worker_id)) & 0xFFFFFFFFFFFFFFFF)
     job_id = str(args.get("job_id", "") or "").strip() or f"w{int(worker_id)}-{correlation_id:016x}"
+    last_correlation_id = int(correlation_id)
 
     dispatcher: ZmqDispatcher | None = None
     collector: ZmqEventCollector | None = None
@@ -230,6 +257,14 @@ def start_worker_zmq(
         job_id=job_id,
     )
 
+    def _stop_requested() -> bool:
+        if stop_event is None:
+            return False
+        try:
+            return bool(stop_event.is_set())
+        except (AttributeError, TypeError, ValueError, OSError):
+            return False
+
     try:
         worker_kind = _resolve_worker_kind_for_zmq(args)
         job_endpoint = str(args.get("zmq_job_endpoint", "") or default_job_endpoint(worker_kind))
@@ -237,6 +272,17 @@ def start_worker_zmq(
         worker_search_dir = _resolve_worker_search_dir(args)
 
         runtime = ZmqRuntimeManager()
+        worker_env: dict[str, str] | None = None
+        if worker_kind == WorkerKind.AF_XDP:
+            xdp_native_lib = _resolve_xdp_native_lib_path()
+            if xdp_native_lib:
+                worker_env = {"SAMURAI_XDP_NATIVE_LIB": xdp_native_lib}
+            else:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "AF_XDP worker selected but _resolve_xdp_native_lib_path() returned None; "
+                    "worker will attempt exe-relative discovery"
+                )
         runtime.launch_worker(
             worker_kind,
             search_dir=worker_search_dir,
@@ -250,6 +296,7 @@ def start_worker_zmq(
                 "--events-mode",
                 "connect",
             ],
+            env=worker_env,
         )
 
         collector = ZmqEventCollector(bind=True)
@@ -258,42 +305,107 @@ def start_worker_zmq(
         telemetry_before = _snapshot_loss_telemetry(args)
 
         dispatcher = ZmqDispatcher()
-        dispatcher.dispatch_start_job(
-            worker_kind=worker_kind,
-            correlation_id=correlation_id,
-            job_id=job_id,
-            args=args,
-            scenario_payload_ref=scenario_payload_ref,
-            endpoint=job_endpoint,
-        )
+        ack_timeout_s = float(args.get("zmq_ack_timeout_s", 2.0) or 2.0)
+        heartbeat_timeout_s = float(args.get("zmq_heartbeat_timeout_s", 5.0) or 5.0)
+        overall_timeout_s = float(args.get("zmq_overall_timeout_s", 120.0) or 120.0)
+        soak_deadline_ts = float(args.get("soak_deadline_ts", 0.0) or 0.0)
+        soak_continuous = bool(soak_deadline_ts > 0.0)
+        iteration = 0
 
-        terminal = collector.wait_for_terminal_event(
-            correlation_id=correlation_id,
-            worker_kind=worker_kind,
-            ack_timeout_s=float(args.get("zmq_ack_timeout_s", 2.0) or 2.0),
-            heartbeat_timeout_s=float(args.get("zmq_heartbeat_timeout_s", 5.0) or 5.0),
-            overall_timeout_s=float(args.get("zmq_overall_timeout_s", 120.0) or 120.0),
-        )
+        while True:
+            if _stop_requested():
+                if worker_status == "ok":
+                    worker_status = "interrupted"
+                    worker_error = "worker_stop_requested"
+                break
+            if soak_continuous and time.time() >= soak_deadline_ts:
+                break
 
-        if terminal.header.msg_type == MessageType.ERROR:
-            worker_status = "failed"
-            worker_error = str(terminal.payload_decoded or "worker_error")
-        elif terminal.header.msg_type == MessageType.JOB_DONE:
-            if isinstance(terminal.payload_decoded, dict):
-                worker_stats.update(dict(terminal.payload_decoded))
+            iteration += 1
+            job_correlation_id = int((correlation_id + iteration - 1) & 0xFFFFFFFFFFFFFFFF)
+            last_correlation_id = int(job_correlation_id)
+            job_id_iter = str(job_id if not soak_continuous else f"{job_id}:iter-{iteration}")
+
+            dispatcher.dispatch_start_job(
+                worker_kind=worker_kind,
+                correlation_id=job_correlation_id,
+                job_id=job_id_iter,
+                args=args,
+                scenario_payload_ref=scenario_payload_ref,
+                endpoint=job_endpoint,
+            )
+
+            wait_overall_timeout_s = float(overall_timeout_s)
+            if soak_continuous:
+                remaining_s = max(0.0, float(soak_deadline_ts) - float(time.time()))
+                grace_s = max(2.0, float(heartbeat_timeout_s) * 2.0)
+                wait_overall_timeout_s = max(1.0, min(float(overall_timeout_s), remaining_s + grace_s))
+
+            terminal = collector.wait_for_terminal_event(
+                correlation_id=job_correlation_id,
+                worker_kind=worker_kind,
+                ack_timeout_s=ack_timeout_s,
+                heartbeat_timeout_s=heartbeat_timeout_s,
+                overall_timeout_s=wait_overall_timeout_s,
+            )
+
+            if terminal.header.msg_type == MessageType.ERROR:
+                worker_status = "failed"
+                worker_error = str(terminal.payload_decoded or "worker_error")
+                break
+
+            if terminal.header.msg_type != MessageType.JOB_DONE:
+                worker_status = "failed"
+                worker_error = f"unexpected_terminal_msg_type:{int(terminal.header.msg_type)}"
+                break
+
+            payload_map = dict(terminal.payload_decoded or {}) if isinstance(terminal.payload_decoded, dict) else {}
+            attempted_i = int(payload_map.get("attempted", 0) or 0)
+            sent_i = int(payload_map.get("sent", payload_map.get("packets_sent", 0)) or 0)
+            errors_i = int(payload_map.get("errors", payload_map.get("packets_errors", 0)) or 0)
+            if attempted_i <= 0:
+                attempted_i = max(0, sent_i + errors_i)
+            if errors_i <= 0 and attempted_i > sent_i:
+                errors_i = max(0, attempted_i - sent_i)
+            bytes_i = int(payload_map.get("bytes_sent_est", payload_map.get("bytes_sent", 0)) or 0)
+            worker_stats = _add_stats(
+                worker_stats,
+                {
+                    "attempted": int(attempted_i),
+                    "sent": int(sent_i),
+                    "errors": int(errors_i),
+                    "bytes_sent_est": int(bytes_i),
+                },
+            )
+
             last_metric = getattr(terminal, "last_metric", None)
             if last_metric is not None:
-                worker_stats.setdefault("packets_sent", int(last_metric.packets_sent))
-                worker_stats.setdefault("packets_errors", int(last_metric.packets_errors))
-                worker_stats.setdefault("bytes_sent", int(last_metric.bytes_sent))
-                worker_stats.setdefault("actual_rps", float(last_metric.actual_rps))
-                worker_stats.setdefault("jitter_p99_ns", float(last_metric.jitter_p99_ns))
-                worker_stats.setdefault("rate_accuracy_pct", float(last_metric.rate_accuracy_pct))
-                worker_stats.setdefault("busywait_cycles", int(last_metric.busywait_cycles))
-                worker_stats.setdefault("sleep_calls", int(last_metric.sleep_calls))
-        else:
-            worker_status = "failed"
-            worker_error = f"unexpected_terminal_msg_type:{int(terminal.header.msg_type)}"
+                worker_stats["packets_sent"] = int(last_metric.packets_sent)
+                worker_stats["packets_errors"] = int(last_metric.packets_errors)
+                worker_stats["bytes_sent"] = int(last_metric.bytes_sent)
+                worker_stats["actual_rps"] = float(last_metric.actual_rps)
+                worker_stats["jitter_p99_ns"] = float(last_metric.jitter_p99_ns)
+                worker_stats["rate_accuracy_pct"] = float(last_metric.rate_accuracy_pct)
+                worker_stats["busywait_cycles"] = int(last_metric.busywait_cycles)
+                worker_stats["sleep_calls"] = int(last_metric.sleep_calls)
+
+            for key in (
+                "status",
+                "worker_kind",
+                "note",
+                "actual_rps",
+                "rate_accuracy_pct",
+                "jitter_p99_ns",
+                "busywait_cycles",
+                "sleep_calls",
+                "xdp_mode",
+                "xdp_queue_id",
+            ):
+                if key in payload_map:
+                    worker_stats[key] = payload_map[key]
+
+            if not soak_continuous:
+                break
     except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError) as exc:
         worker_status = "failed"
         worker_error = str(exc)
@@ -304,7 +416,7 @@ def start_worker_zmq(
                 try:
                     dispatcher.dispatch_shutdown_worker(
                         worker_kind=worker_kind,
-                        correlation_id=(correlation_id + 1) & 0xFFFFFFFFFFFFFFFF,
+                        correlation_id=(last_correlation_id + 1) & 0xFFFFFFFFFFFFFFFF,
                         job_id=f"{job_id}:shutdown",
                     )
                 except (OSError, RuntimeError, ValueError, TypeError, AttributeError, ImportError, KeyError, IndexError):
@@ -384,6 +496,7 @@ def start_worker(
     sent_total=None,
     errors_total=None,
     resource_stats=None,
+    stop_event=None,
 ):
     return start_worker_zmq(
         worker_id,
@@ -395,6 +508,7 @@ def start_worker(
         sent_total=sent_total,
         errors_total=errors_total,
         resource_stats=resource_stats,
+        stop_event=stop_event,
     )
 
 
