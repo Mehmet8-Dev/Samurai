@@ -700,23 +700,6 @@ def get_extensions() -> List[Extension]:
     )
     extensions.append(l4_state_engine)
 
-    cpu_packet_engine_native = Extension(
-        "ddos_samurai._cpu_packet_engine_native",
-        sources=[
-            "ddos_samurai/cpu_native/module.cpp",
-            "ddos_samurai/cpu_native/common.cpp",
-            "ddos_samurai/cpu_native/spoofing.cpp",
-            "ddos_samurai/cpu_native/packets.cpp",
-            "ddos_samurai/cpu_native/pool.cpp",
-            "ddos_samurai/cpu_native/amp.cpp",
-        ],
-        include_dirs=[pybind11_include],
-        language="c++",
-        extra_compile_args=["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"],
-        extra_link_args=["-lpthread", "-lm"],
-    )
-    extensions.append(cpu_packet_engine_native)
-
     scenario_native = Extension(
         "ddos_samurai._scenario_native",
         sources=[

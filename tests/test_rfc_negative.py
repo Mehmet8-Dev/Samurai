@@ -1,4 +1,4 @@
-"""RFC negative suite: expected-violation checks for malformed packets."""
+"""Negative-path checks for ZMQ wire/GPU facade contracts."""
 
 from __future__ import annotations
 
@@ -9,12 +9,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ddos_samurai.cpu_packet_engine import PacketConfig, create_packet
+from ddos_samurai import gpu_packet
+from ddos_samurai.zmq import wire
 
 try:
     import pytest
     pytestmark = [pytest.mark.rfc_negative, pytest.mark.ci_safe]
-except Exception:  # pragma: no cover - unittest-only environments
+except Exception:  # pragma: no cover
     pytestmark = []
 
 
@@ -54,7 +55,6 @@ def _score(name: str, weight: float = 1.0):
                 raise
 
         wrapper.__name__ = fn.__name__
-        wrapper.__doc__ = fn.__doc__
         return wrapper
 
     return deco
@@ -79,100 +79,72 @@ def _write_json_with_fallback(preferred: Path, payload: dict, fallback_name: str
             return cand
         except PermissionError:
             continue
-    raise PermissionError(f"Unable to write RFC negative report to any candidate path: {candidates}")
+    raise PermissionError(f"Unable to write report to any candidate path: {candidates}")
+
 
 _ScoreBoard.reset()
 
 
-def _ones_complement_ok(buf: bytes) -> bool:
-    if len(buf) % 2:
-        buf += b"\x00"
-    s = 0
-    for i in range(0, len(buf), 2):
-        s += (buf[i] << 8) | buf[i + 1]
-    while s >> 16:
-        s = (s & 0xFFFF) + (s >> 16)
-    return s == 0xFFFF
-
-
-def _validate_packet(pkt: bytes) -> list[str]:
-    v: list[str] = []
-    if len(pkt) < 20:
-        return ["ip_header_too_short"]
-
-    ver = (pkt[0] >> 4) & 0xF
-    ihl = (pkt[0] & 0xF) * 4
-    if ver != 4:
-        v.append("ip_version_not_ipv4")
-    if ihl < 20 or ihl > len(pkt):
-        v.append("ip_ihl_invalid")
-        return v
-
-    total = struct.unpack("!H", pkt[2:4])[0]
-    if total != len(pkt):
-        v.append("ip_total_length_mismatch")
-
-    if pkt[8] == 0:
-        v.append("ip_ttl_zero")
-
-    hdr = pkt[:ihl]
-    if not _ones_complement_ok(hdr):
-        v.append("ip_checksum_invalid")
-
-    proto = pkt[9]
-    if proto == 6 and len(pkt) >= ihl + 20:
-        data_off_words = (pkt[ihl + 12] >> 4) & 0xF
-        if data_off_words < 5:
-            v.append("tcp_data_offset_invalid")
-    elif proto == 17 and len(pkt) >= ihl + 8:
-        udp_len = struct.unpack("!H", pkt[ihl + 4:ihl + 6])[0]
-        if udp_len != max(0, total - ihl):
-            v.append("udp_length_mismatch")
-
-    return v
-
-
 class TestRFCNegativeExpectedViolations(unittest.TestCase):
-    @_score("total_length_mismatch_detected")
-    def test_total_length_mismatch_detected(self):
-        pkt = bytearray(create_packet(PacketConfig("10.0.0.1", 80, protocol="tcp", tcp_flags="S")))
-        struct.pack_into("!H", pkt, 2, len(pkt) + 5)
-        self.assertIn("ip_total_length_mismatch", _validate_packet(bytes(pkt)))
+    @_score("wire_header_bad_magic_detected")
+    def test_wire_header_bad_magic_detected(self):
+        hdr = wire.SamuraiWireHeaderV1(
+            msg_type=wire.MessageType.START_JOB,
+            payload_len=0,
+            correlation_id=1,
+            worker_kind=wire.WorkerKind.CPU,
+            job_id="x",
+        )
+        blob = bytearray(hdr.pack())
+        struct.pack_into("<I", blob, 0, 0xDEADBEEF)
+        with self.assertRaises(wire.WireProtocolError):
+            wire.SamuraiWireHeaderV1.unpack(bytes(blob))
 
-    @_score("ttl_zero_detected")
-    def test_ttl_zero_detected(self):
-        pkt = bytearray(create_packet(PacketConfig("10.0.0.1", 80, protocol="tcp", tcp_flags="S")))
-        pkt[8] = 0
-        self.assertIn("ip_ttl_zero", _validate_packet(bytes(pkt)))
+    @_score("job_envelope_invalid_port_detected")
+    def test_job_envelope_invalid_port_detected(self):
+        env = wire.JobEnvelopeV1(
+            target_ip="203.0.113.5",
+            target_port=70000,
+            packet_count=1,
+            packet_size=64,
+        )
+        with self.assertRaises(wire.WireProtocolError):
+            env.pack()
 
-    @_score("tcp_data_offset_invalid_detected")
-    def test_tcp_data_offset_invalid_detected(self):
-        pkt = bytearray(create_packet(PacketConfig("10.0.0.1", 80, protocol="tcp", tcp_flags="S")))
-        ihl = (pkt[0] & 0xF) * 4
-        pkt[ihl + 12] = 0x40  # data offset = 4 (invalid)
-        self.assertIn("tcp_data_offset_invalid", _validate_packet(bytes(pkt)))
+    @_score("flow_update_odd_version_rejected")
+    def test_flow_update_odd_version_rejected(self):
+        evt = wire.FlowUpdateEventV1(
+            version=1,
+            epoch=1,
+            flow_id=1,
+            tcp_seq=1,
+            tcp_ack=1,
+            src_port=1234,
+            dst_port=443,
+            tcp_state=1,
+            proto=6,
+            flags=0x12,
+            rtt_us=1,
+            dpu_ts_ns=1,
+        )
+        with self.assertRaises(wire.WireProtocolError):
+            evt.pack()
 
-    @_score("udp_length_mismatch_detected")
-    def test_udp_length_mismatch_detected(self):
-        pkt = bytearray(create_packet(PacketConfig("8.8.8.8", 53, protocol="udp", payload=b"hello")))
-        ihl = (pkt[0] & 0xF) * 4
-        struct.pack_into("!H", pkt, ihl + 4, 8)  # force wrong length
-        self.assertIn("udp_length_mismatch", _validate_packet(bytes(pkt)))
+    @_score("gpu_kernel_mode_nonpersistent_rejected")
+    def test_gpu_kernel_mode_nonpersistent_rejected(self):
+        with self.assertRaises(gpu_packet.GPUPacketError):
+            gpu_packet.set_kernel_mode("batch")
 
-    @_score("checksum_invalid_detected")
-    def test_checksum_invalid_detected(self):
-        pkt = bytearray(create_packet(PacketConfig("10.0.0.1", 80, protocol="tcp", tcp_flags="S")))
-        pkt[10] ^= 0xFF
-        self.assertIn("ip_checksum_invalid", _validate_packet(bytes(pkt)))
+    @_score("gpu_legacy_bridge_call_rejected")
+    def test_gpu_legacy_bridge_call_rejected(self):
+        with self.assertRaises(gpu_packet.GPUPacketError):
+            gpu_packet.generate_packets()
 
 
 class TestZZFinalRFCNegativeReport(unittest.TestCase):
     def test_zzz_write_report(self):
         r = _ScoreBoard.report()
 
-        # Optional SAMURAI_RFC_REPORT_OUT handling:
-        # - if it points to a directory, write rfc_negative_report.json inside it.
-        # - if it points to a file, write a sibling rfc_negative_report.json.
         base = str(os.environ.get("SAMURAI_RFC_REPORT_OUT", "") or "").strip()
         if not base:
             out = Path(tempfile.gettempdir()) / "rfc_negative_report.json"
@@ -183,9 +155,8 @@ class TestZZFinalRFCNegativeReport(unittest.TestCase):
             else:
                 out = base_path / "rfc_negative_report.json"
 
-        out = _write_json_with_fallback(out, r, "rfc_negative_report.json")
-
-        self.assertGreaterEqual(r["score"], 95.0)
+        _write_json_with_fallback(out, r, "rfc_negative_report.json")
+        self.assertGreaterEqual(r["score"], 100.0)
 
 
 if __name__ == "__main__":
