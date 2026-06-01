@@ -60,6 +60,8 @@ struct DefenseRuntime {
   bool doca_rx_active = false;
   bool doca_rx_device_path_requested = false;
   bool doca_rx_device_path_active = false;
+  bool doca_rx_device_require_verified_len = true;
+  bool doca_rx_device_fallback_host_view = true;
   bool doca_flow_steering_active = false;
   uint32_t doca_flow_proto_mask = 0u;
   int doca_rx_rr_cursor = 0;
@@ -101,6 +103,8 @@ struct DefenseRuntime {
   uint64_t doca_rx_device_packets = 0;
   uint64_t doca_rx_device_poll_errors = 0;
   uint64_t doca_rx_device_drops = 0;
+  uint64_t doca_rx_device_len_unverified_events = 0;
+  uint64_t doca_rx_device_host_view_fallback_events = 0;
   std::vector<uint64_t> ingress_packet_ptrs_scratch{};
   std::vector<uint64_t> ingress_packet_handles_scratch{};
   std::vector<uint16_t> ingress_lengths_u16_scratch{};
@@ -1170,6 +1174,138 @@ bool ensure_ingress_device_buffers(DefenseRuntime* rt, size_t packet_capacity, s
   return true;
 }
 
+int classify_from_ingress_doca_host_view_locked(
+    int32_t max_packets,
+    int32_t max_packet_size,
+    int32_t* out_packet_count,
+    int32_t* out_labels,
+    float* out_confidences,
+    const char** out_reason) {
+  if (g_doca_rx.receive_burst_view == nullptr || g_doca_rx.release_burst_view == nullptr) {
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_unavailable";
+    }
+    return set_err("doca_rx_unavailable");
+  }
+
+  const size_t max_packets_sz = static_cast<size_t>(max_packets);
+  if (max_packets_sz == 0u || max_packets_sz > 1048576u) {
+    if (out_reason != nullptr) {
+      *out_reason = "infer_enqueue_failed";
+    }
+    return set_err("infer_enqueue_failed");
+  }
+
+  if (g_runtime.ingress_packet_ptrs_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_packet_ptrs_scratch.resize(max_packets_sz, 0u);
+  }
+  if (g_runtime.ingress_packet_handles_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_packet_handles_scratch.resize(max_packets_sz, 0u);
+  }
+  if (g_runtime.ingress_lengths_u16_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_lengths_u16_scratch.resize(max_packets_sz, 0u);
+  }
+  if (g_runtime.ingress_views_scratch.size() < max_packets_sz) {
+    g_runtime.ingress_views_scratch.resize(max_packets_sz);
+  }
+
+  std::memset(g_runtime.ingress_packet_ptrs_scratch.data(), 0, sizeof(uint64_t) * max_packets_sz);
+  std::memset(g_runtime.ingress_packet_handles_scratch.data(), 0, sizeof(uint64_t) * max_packets_sz);
+  std::memset(g_runtime.ingress_lengths_u16_scratch.data(), 0, sizeof(uint16_t) * max_packets_sz);
+
+  int selected_rxq_handle = g_runtime.doca_rxq_handle;
+  if (!g_runtime.doca_rxq_handles.empty()) {
+    const size_t qcount = g_runtime.doca_rxq_handles.size();
+    const size_t idx = static_cast<size_t>(std::max(0, g_runtime.doca_rx_rr_cursor) % static_cast<int>(qcount));
+    selected_rxq_handle = g_runtime.doca_rxq_handles[idx];
+    g_runtime.doca_rx_rr_cursor = static_cast<int>((idx + 1u) % qcount);
+  }
+  int received = 0;
+  char errbuf[192];
+  std::memset(errbuf, 0, sizeof(errbuf));
+  const int rx_rc = g_doca_rx.receive_burst_view(
+      selected_rxq_handle,
+      g_runtime.ingress_packet_ptrs_scratch.data(),
+      g_runtime.ingress_lengths_u16_scratch.data(),
+      g_runtime.ingress_packet_handles_scratch.data(),
+      static_cast<int>(max_packets),
+      &received,
+      errbuf,
+      sizeof(errbuf));
+  g_runtime.doca_rx_polls += 1u;
+  if (rx_rc != 0) {
+    g_runtime.doca_rx_poll_errors += 1u;
+    if (out_reason != nullptr) {
+      *out_reason = (errbuf[0] != '\0') ? errbuf : "doca_rx_receive_failed";
+    }
+    return set_err((errbuf[0] != '\0') ? std::string(errbuf) : "doca_rx_receive_failed");
+  }
+  if (received <= 0) {
+    if (out_reason != nullptr) {
+      *out_reason = "none";
+    }
+    return 0;
+  }
+
+  if (received > max_packets) {
+    received = max_packets;
+  }
+  bool invalid_pkt_view = false;
+  for (int i = 0; i < received; ++i) {
+    const uint64_t ptr_raw = g_runtime.ingress_packet_ptrs_scratch[static_cast<size_t>(i)];
+    const uint16_t len_u16 = g_runtime.ingress_lengths_u16_scratch[static_cast<size_t>(i)];
+    if (ptr_raw == 0u || len_u16 == 0u || len_u16 > static_cast<uint16_t>(max_packet_size)) {
+      g_runtime.doca_rx_drops += 1u;
+      invalid_pkt_view = true;
+      break;
+    }
+    g_runtime.ingress_views_scratch[static_cast<size_t>(i)] = PacketView{
+        reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(ptr_raw)),
+        static_cast<size_t>(len_u16)};
+  }
+  g_runtime.doca_rx_packets += static_cast<uint64_t>(received);
+
+  int cls_rc = 0;
+  if (!invalid_pkt_view) {
+    cls_rc = classify_packet_views_common_locked(
+        g_runtime.ingress_views_scratch.data(),
+        static_cast<int64_t>(received),
+        out_labels,
+        out_confidences,
+        out_reason);
+  }
+  int rearmed = 0;
+  std::memset(errbuf, 0, sizeof(errbuf));
+  const int release_rc = g_doca_rx.release_burst_view(
+      selected_rxq_handle,
+      g_runtime.ingress_packet_handles_scratch.data(),
+      received,
+      &rearmed,
+      errbuf,
+      sizeof(errbuf));
+  if (release_rc != 0 || rearmed < received) {
+    g_runtime.doca_rx_poll_errors += 1u;
+    if (rearmed < received) {
+      g_runtime.doca_rx_drops += static_cast<uint64_t>(received - rearmed);
+    }
+    if (out_reason != nullptr) {
+      *out_reason = (errbuf[0] != '\0') ? errbuf : "doca_rx_receive_failed";
+    }
+    return set_err((errbuf[0] != '\0') ? std::string(errbuf) : "doca_rx_receive_failed");
+  }
+  if (invalid_pkt_view) {
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_receive_failed";
+    }
+    return set_err("doca_rx_receive_failed");
+  }
+  if (cls_rc != 0) {
+    return cls_rc;
+  }
+  *out_packet_count = received;
+  return 0;
+}
+
 int classify_from_ingress_doca_device_locked(
     int32_t max_packets,
     int32_t max_packet_size,
@@ -1284,6 +1420,8 @@ int classify_from_ingress_doca_device_locked(
   }
 
   bool invalid_pkt_view = false;
+  int synthetic_len_match = 0;
+  const uint16_t synthetic_len_u16 = static_cast<uint16_t>(max_packet_size > 65535 ? 65535 : max_packet_size);
   for (int i = 0; i < n; ++i) {
     const uint64_t ptr_raw = g_runtime.ingress_packet_ptrs_scratch[static_cast<size_t>(i)];
     const uint16_t len_u16 = g_runtime.ingress_lengths_u16_scratch[static_cast<size_t>(i)];
@@ -1291,6 +1429,9 @@ int classify_from_ingress_doca_device_locked(
       g_runtime.doca_rx_device_drops += 1u;
       invalid_pkt_view = true;
       break;
+    }
+    if (len_u16 == synthetic_len_u16) {
+      synthetic_len_match += 1;
     }
     g_runtime.ingress_views_scratch[static_cast<size_t>(i)] = PacketView{
         reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(ptr_raw)),
@@ -1301,6 +1442,17 @@ int classify_from_ingress_doca_device_locked(
       *out_reason = "doca_rx_receive_failed";
     }
     return set_err("doca_rx_receive_failed");
+  }
+  const bool len_unverified =
+      g_runtime.doca_rx_device_require_verified_len &&
+      n >= 4 &&
+      synthetic_len_match == n;
+  if (len_unverified) {
+    g_runtime.doca_rx_device_len_unverified_events += 1u;
+    if (out_reason != nullptr) {
+      *out_reason = "doca_rx_device_len_unverified";
+    }
+    return set_err("doca_rx_device_len_unverified");
   }
   const int cls_rc = classify_packet_views_common_locked(
       g_runtime.ingress_views_scratch.data(),
@@ -1342,6 +1494,10 @@ extern "C" int samurai_gpu_packet_defense_init(
   g_runtime.max_batch_size = (max_batch_size > 0) ? max_batch_size : 1024;
   g_runtime.flush_timeout_ms = (flush_timeout_ms > 0) ? flush_timeout_ms : 2;
   g_runtime.doca_rx_device_path_requested = env_flag("SAMURAI_GPU_DOCA_RX_DEVICE_PATH", true);
+  g_runtime.doca_rx_device_require_verified_len =
+      env_flag("SAMURAI_GPU_DOCA_RX_DEVICE_REQUIRE_VERIFIED_LEN", true);
+  g_runtime.doca_rx_device_fallback_host_view =
+      env_flag("SAMURAI_GPU_DOCA_RX_DEVICE_FALLBACK_HOST_VIEW", true);
   reset_trt_backend_dispatch_unlocked();
 
   if (g_runtime.engine_path.empty()) {
@@ -1482,13 +1638,28 @@ extern "C" int samurai_gpu_packet_classify_from_ingress(
   *out_packet_count = 0;
 
   if (g_runtime.doca_rx_device_path_active) {
-    return classify_from_ingress_doca_device_locked(
+    const int device_rc = classify_from_ingress_doca_device_locked(
         max_packets,
         max_packet_size,
         out_packet_count,
         out_labels,
         out_confidences,
         out_reason);
+    if (device_rc == 0) {
+      return 0;
+    }
+    if (g_runtime.doca_rx_device_fallback_host_view &&
+        g_defense_last_error == "doca_rx_device_len_unverified") {
+      g_runtime.doca_rx_device_host_view_fallback_events += 1u;
+      return classify_from_ingress_doca_host_view_locked(
+          max_packets,
+          max_packet_size,
+          out_packet_count,
+          out_labels,
+          out_confidences,
+          out_reason);
+    }
+    return device_rc;
   }
   if (g_runtime.doca_rx_device_path_requested && !g_runtime.doca_rx_device_path_active) {
     if (out_reason != nullptr) {
@@ -1496,129 +1667,13 @@ extern "C" int samurai_gpu_packet_classify_from_ingress(
     }
     return set_err("doca_rx_device_unavailable");
   }
-  if (g_doca_rx.receive_burst_view == nullptr || g_doca_rx.release_burst_view == nullptr) {
-    if (out_reason != nullptr) {
-      *out_reason = "doca_rx_unavailable";
-    }
-    return set_err("doca_rx_unavailable");
-  }
-
-  const size_t max_packets_sz = static_cast<size_t>(max_packets);
-  if (max_packets_sz == 0u || max_packets_sz > 1048576u) {
-    if (out_reason != nullptr) {
-      *out_reason = "infer_enqueue_failed";
-    }
-    return set_err("infer_enqueue_failed");
-  }
-
-  if (g_runtime.ingress_packet_ptrs_scratch.size() < max_packets_sz) {
-    g_runtime.ingress_packet_ptrs_scratch.resize(max_packets_sz, 0u);
-  }
-  if (g_runtime.ingress_packet_handles_scratch.size() < max_packets_sz) {
-    g_runtime.ingress_packet_handles_scratch.resize(max_packets_sz, 0u);
-  }
-  if (g_runtime.ingress_lengths_u16_scratch.size() < max_packets_sz) {
-    g_runtime.ingress_lengths_u16_scratch.resize(max_packets_sz, 0u);
-  }
-  if (g_runtime.ingress_views_scratch.size() < max_packets_sz) {
-    g_runtime.ingress_views_scratch.resize(max_packets_sz);
-  }
-
-  std::memset(g_runtime.ingress_packet_ptrs_scratch.data(), 0, sizeof(uint64_t) * max_packets_sz);
-  std::memset(g_runtime.ingress_packet_handles_scratch.data(), 0, sizeof(uint64_t) * max_packets_sz);
-  std::memset(g_runtime.ingress_lengths_u16_scratch.data(), 0, sizeof(uint16_t) * max_packets_sz);
-
-  int selected_rxq_handle = g_runtime.doca_rxq_handle;
-  if (!g_runtime.doca_rxq_handles.empty()) {
-    const size_t qcount = g_runtime.doca_rxq_handles.size();
-    const size_t idx = static_cast<size_t>(std::max(0, g_runtime.doca_rx_rr_cursor) % static_cast<int>(qcount));
-    selected_rxq_handle = g_runtime.doca_rxq_handles[idx];
-    g_runtime.doca_rx_rr_cursor = static_cast<int>((idx + 1u) % qcount);
-  }
-  int received = 0;
-  char errbuf[192];
-  std::memset(errbuf, 0, sizeof(errbuf));
-  const int rx_rc = g_doca_rx.receive_burst_view(
-      selected_rxq_handle,
-      g_runtime.ingress_packet_ptrs_scratch.data(),
-      g_runtime.ingress_lengths_u16_scratch.data(),
-      g_runtime.ingress_packet_handles_scratch.data(),
-      static_cast<int>(max_packets),
-      &received,
-      errbuf,
-      sizeof(errbuf));
-  g_runtime.doca_rx_polls += 1u;
-  if (rx_rc != 0) {
-    g_runtime.doca_rx_poll_errors += 1u;
-    if (out_reason != nullptr) {
-      *out_reason = (errbuf[0] != '\0') ? errbuf : "doca_rx_receive_failed";
-    }
-    return set_err((errbuf[0] != '\0') ? std::string(errbuf) : "doca_rx_receive_failed");
-  }
-  if (received <= 0) {
-    if (out_reason != nullptr) {
-      *out_reason = "none";
-    }
-    return 0;
-  }
-
-  if (received > max_packets) {
-    received = max_packets;
-  }
-  bool invalid_pkt_view = false;
-  for (int i = 0; i < received; ++i) {
-    const uint64_t ptr_raw = g_runtime.ingress_packet_ptrs_scratch[static_cast<size_t>(i)];
-    const uint16_t len_u16 = g_runtime.ingress_lengths_u16_scratch[static_cast<size_t>(i)];
-    if (ptr_raw == 0u || len_u16 == 0u || len_u16 > static_cast<uint16_t>(max_packet_size)) {
-      g_runtime.doca_rx_drops += 1u;
-      invalid_pkt_view = true;
-      break;
-    }
-    g_runtime.ingress_views_scratch[static_cast<size_t>(i)] = PacketView{
-        reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(ptr_raw)),
-        static_cast<size_t>(len_u16)};
-  }
-  g_runtime.doca_rx_packets += static_cast<uint64_t>(received);
-
-  int cls_rc = 0;
-  if (!invalid_pkt_view) {
-    cls_rc = classify_packet_views_common_locked(
-        g_runtime.ingress_views_scratch.data(),
-        static_cast<int64_t>(received),
-        out_labels,
-        out_confidences,
-        out_reason);
-  }
-  int rearmed = 0;
-  std::memset(errbuf, 0, sizeof(errbuf));
-  const int release_rc = g_doca_rx.release_burst_view(
-      selected_rxq_handle,
-      g_runtime.ingress_packet_handles_scratch.data(),
-      received,
-      &rearmed,
-      errbuf,
-      sizeof(errbuf));
-  if (release_rc != 0 || rearmed < received) {
-    g_runtime.doca_rx_poll_errors += 1u;
-    if (rearmed < received) {
-      g_runtime.doca_rx_drops += static_cast<uint64_t>(received - rearmed);
-    }
-    if (out_reason != nullptr) {
-      *out_reason = (errbuf[0] != '\0') ? errbuf : "doca_rx_receive_failed";
-    }
-    return set_err((errbuf[0] != '\0') ? std::string(errbuf) : "doca_rx_receive_failed");
-  }
-  if (invalid_pkt_view) {
-    if (out_reason != nullptr) {
-      *out_reason = "doca_rx_receive_failed";
-    }
-    return set_err("doca_rx_receive_failed");
-  }
-  if (cls_rc != 0) {
-    return cls_rc;
-  }
-  *out_packet_count = received;
-  return 0;
+  return classify_from_ingress_doca_host_view_locked(
+      max_packets,
+      max_packet_size,
+      out_packet_count,
+      out_labels,
+      out_confidences,
+      out_reason);
 }
 
 extern "C" const char* samurai_gpu_packet_read_classifier_stats() {
@@ -1658,10 +1713,18 @@ extern "C" const char* samurai_gpu_packet_read_classifier_stats() {
   oss << "\"gpu_doca_rx_drops\":" << g_runtime.doca_rx_drops << ",";
   oss << "\"gpu_doca_rx_device_path_requested\":" << (g_runtime.doca_rx_device_path_requested ? 1 : 0) << ",";
   oss << "\"gpu_doca_rx_device_path_active\":" << (g_runtime.doca_rx_device_path_active ? 1 : 0) << ",";
+  oss << "\"gpu_doca_rx_device_require_verified_len\":"
+      << (g_runtime.doca_rx_device_require_verified_len ? 1 : 0) << ",";
+  oss << "\"gpu_doca_rx_device_fallback_host_view\":"
+      << (g_runtime.doca_rx_device_fallback_host_view ? 1 : 0) << ",";
   oss << "\"gpu_doca_rx_device_polls\":" << g_runtime.doca_rx_device_polls << ",";
   oss << "\"gpu_doca_rx_device_packets\":" << g_runtime.doca_rx_device_packets << ",";
   oss << "\"gpu_doca_rx_device_poll_errors\":" << g_runtime.doca_rx_device_poll_errors << ",";
   oss << "\"gpu_doca_rx_device_drops\":" << g_runtime.doca_rx_device_drops << ",";
+  oss << "\"gpu_doca_rx_device_len_unverified_events\":"
+      << g_runtime.doca_rx_device_len_unverified_events << ",";
+  oss << "\"gpu_doca_rx_device_host_view_fallback_events\":"
+      << g_runtime.doca_rx_device_host_view_fallback_events << ",";
   oss << "\"gpu_doca_rx_queue_count\":" << g_runtime.doca_rxq_handles.size() << ",";
   oss << "\"gpu_doca_rx_rr_cursor\":" << g_runtime.doca_rx_rr_cursor << ",";
   oss << "\"gpu_doca_flow_steering_active\":" << (g_runtime.doca_flow_steering_active ? 1 : 0) << ",";
