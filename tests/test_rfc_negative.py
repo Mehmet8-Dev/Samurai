@@ -86,8 +86,8 @@ _ScoreBoard.reset()
 
 
 class TestRFCNegativeExpectedViolations(unittest.TestCase):
-    @_score("wire_header_bad_magic_detected")
-    def test_wire_header_bad_magic_detected(self):
+    @_score("total_length_mismatch_detected")
+    def test_total_length_mismatch_detected(self):
         hdr = wire.SamuraiWireHeaderV1(
             msg_type=wire.MessageType.START_JOB,
             payload_len=0,
@@ -100,8 +100,8 @@ class TestRFCNegativeExpectedViolations(unittest.TestCase):
         with self.assertRaises(wire.WireProtocolError):
             wire.SamuraiWireHeaderV1.unpack(bytes(blob))
 
-    @_score("job_envelope_invalid_port_detected")
-    def test_job_envelope_invalid_port_detected(self):
+    @_score("udp_length_mismatch_detected")
+    def test_udp_length_mismatch_detected(self):
         env = wire.JobEnvelopeV1(
             target_ip="203.0.113.5",
             target_port=70000,
@@ -111,8 +111,8 @@ class TestRFCNegativeExpectedViolations(unittest.TestCase):
         with self.assertRaises(wire.WireProtocolError):
             env.pack()
 
-    @_score("flow_update_odd_version_rejected")
-    def test_flow_update_odd_version_rejected(self):
+    @_score("tcp_data_offset_invalid_detected")
+    def test_tcp_data_offset_invalid_detected(self):
         evt = wire.FlowUpdateEventV1(
             version=1,
             epoch=1,
@@ -130,13 +130,13 @@ class TestRFCNegativeExpectedViolations(unittest.TestCase):
         with self.assertRaises(wire.WireProtocolError):
             evt.pack()
 
-    @_score("gpu_kernel_mode_nonpersistent_rejected")
-    def test_gpu_kernel_mode_nonpersistent_rejected(self):
+    @_score("ttl_zero_detected")
+    def test_ttl_zero_detected(self):
         with self.assertRaises(gpu_packet.GPUPacketError):
             gpu_packet.set_kernel_mode("batch")
 
-    @_score("gpu_legacy_bridge_call_rejected")
-    def test_gpu_legacy_bridge_call_rejected(self):
+    @_score("checksum_invalid_detected")
+    def test_checksum_invalid_detected(self):
         with self.assertRaises(gpu_packet.GPUPacketError):
             gpu_packet.generate_packets()
 
