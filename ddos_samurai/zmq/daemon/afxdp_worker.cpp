@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <exception>
 #include <iostream>
 #include <optional>
@@ -118,10 +119,38 @@ samurai_pacing_config_t PacingFromEnvelope(const samurai::wire::JobEnvelopeV1& e
   return out;
 }
 
+std::string GetExeDir() {
+  char buf[4096];
+  const ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (len <= 0) return ".";
+  buf[len] = '\0';
+  std::string exe(buf);
+  const auto slash = exe.rfind('/');
+  if (slash == std::string::npos) return ".";
+  return exe.substr(0, slash);
+}
+
 std::vector<std::string> CandidateNativeLibs() {
   std::vector<std::string> out;
+
+  // 1. Explicit env var (absolute path) — highest priority.
   const char* env = std::getenv("SAMURAI_XDP_NATIVE_LIB");
   if (env && *env) out.emplace_back(env);
+
+  // 2. Paths relative to the executable directory (build-workers/../...).
+  const std::string exe_dir = GetExeDir();
+  const std::string repo_root = exe_dir + "/..";
+  // Direct repo source tree
+  out.emplace_back(repo_root + "/ddos_samurai/xdp_sender.so");
+  // cpython-tagged builds for 3.11 and 3.12
+  out.emplace_back(repo_root + "/build/lib.linux-x86_64-cpython-311/ddos_samurai/xdp_sender.cpython-311-x86_64-linux-gnu.so");
+  out.emplace_back(repo_root + "/build/lib.linux-x86_64-cpython-312/ddos_samurai/xdp_sender.cpython-312-x86_64-linux-gnu.so");
+  out.emplace_back(repo_root + "/build/lib.linux-x86_64-cpython-310/ddos_samurai/xdp_sender.cpython-310-x86_64-linux-gnu.so");
+  out.emplace_back(repo_root + "/ddos_samurai/xdp_sender.cpython-312-x86_64-linux-gnu.so");
+  out.emplace_back(repo_root + "/ddos_samurai/xdp_sender.cpython-311-x86_64-linux-gnu.so");
+  out.emplace_back(repo_root + "/ddos_samurai/xdp_sender.cpython-310-x86_64-linux-gnu.so");
+
+  // 3. Legacy relative-to-CWD paths (kept for backward compat).
   out.emplace_back("ddos_samurai/xdp_sender.so");
   out.emplace_back("xdp_sender.so");
   out.emplace_back("ddos_samurai/xdp_sender.cpython-312-x86_64-linux-gnu.so");
@@ -132,25 +161,47 @@ std::vector<std::string> CandidateNativeLibs() {
 
 bool LoadXdpNative(XdpNativeBridge& out, std::string& err) {
   if (out.handle && out.api) return true;
-  for (const std::string& p : CandidateNativeLibs()) {
+  std::string last_dlerror;
+  const auto candidates = CandidateNativeLibs();
+  for (const std::string& p : candidates) {
+    dlerror();  // Clear previous error.
     void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!h) continue;
+    if (!h) {
+      const char* de = dlerror();
+      if (de) last_dlerror = de;
+      continue;
+    }
     auto fn = reinterpret_cast<fn_xdp_get_native_api_v1_t>(dlsym(h, "samurai_xdp_get_native_api_v1"));
     if (!fn) {
+      const char* de = dlerror();
+      if (de) last_dlerror = std::string("dlsym failed: ") + de;
       dlclose(h);
       continue;
     }
     xdp_native_api_v1* api = fn();
     if (!api || api->version != XDP_NATIVE_API_VERSION || !api->create_ctx || !api->destroy_ctx || !api->send_buffer || !api->get_stats) {
+      last_dlerror = "xdp_native_api version/vtable mismatch (got=" + std::to_string(api ? api->version : -1) + " expected=" + std::to_string(XDP_NATIVE_API_VERSION) + ")";
       dlclose(h);
       continue;
     }
     out.handle = h;
     out.api = api;
     out.lib_path = p;
+    std::cerr << "[afxdp_worker] loaded native lib: " << p << "\n";
     return true;
   }
   err = "xdp_native_lib_unavailable";
+  if (!last_dlerror.empty()) {
+    err += ": " + last_dlerror;
+  }
+  // Log all attempted paths for diagnostics.
+  std::cerr << "[afxdp_worker] FATAL: failed to load xdp native lib. Tried:\n";
+  for (const std::string& p : candidates) {
+    std::cerr << "  - " << p << "\n";
+  }
+  if (!last_dlerror.empty()) {
+    std::cerr << "  last dlerror: " << last_dlerror << "\n";
+  }
   return false;
 }
 
