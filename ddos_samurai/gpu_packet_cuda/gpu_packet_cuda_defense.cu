@@ -341,6 +341,10 @@ void release_ingress_device_buffers(DefenseRuntime* rt) {
   rt->ingress_device_capacity = 0u;
 }
 
+constexpr uint32_t kDocaRxDeviceStatusNoRxq = std::numeric_limits<uint32_t>::max();
+constexpr uint32_t kDocaRxDeviceStatusNativeLenUnsupported = std::numeric_limits<uint32_t>::max() - 1u;
+constexpr uint32_t kDocaRxDeviceStatusNativeLenError = std::numeric_limits<uint32_t>::max() - 2u;
+
 #if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
 __global__ void doca_rx_receive_burst_kernel(
     const uint64_t* gpu_rxq_handles,
@@ -378,7 +382,7 @@ __global__ void doca_rx_receive_burst_kernel(
 
   if (selected_gpu_rxq_handle == 0ull) {
     if (threadIdx.x == 0) {
-      out_meta[3] = std::numeric_limits<uint32_t>::max();
+      out_meta[3] = kDocaRxDeviceStatusNoRxq;
     }
     return;
   }
@@ -401,6 +405,13 @@ __global__ void doca_rx_receive_burst_kernel(
     return;
   }
 
+#if !defined(SAMURAI_GPU_DOCA_RX_DEVICE_LEN_API_DATA_LEN) && !defined(SAMURAI_GPU_DOCA_RX_DEVICE_LEN_API_LEN)
+  if (threadIdx.x == 0) {
+    out_meta[3] = kDocaRxDeviceStatusNativeLenUnsupported;
+  }
+  return;
+#endif
+
   for (uint32_t i = static_cast<uint32_t>(threadIdx.x); i < received; i += static_cast<uint32_t>(blockDim.x)) {
     doca_gpu_buf* buf_ptr = nullptr;
     const doca_error_t rc_buf = doca_gpu_dev_eth_rxq_get_buf(rxq, rx_buf_idx + static_cast<uint64_t>(i), &buf_ptr);
@@ -415,8 +426,26 @@ __global__ void doca_rx_receive_burst_kernel(
       continue;
     }
 
+    size_t pkt_len = 0u;
+#if defined(SAMURAI_GPU_DOCA_RX_DEVICE_LEN_API_DATA_LEN)
+    const doca_error_t rc_len = doca_gpu_dev_buf_get_data_len(buf_ptr, &pkt_len);
+#elif defined(SAMURAI_GPU_DOCA_RX_DEVICE_LEN_API_LEN)
+    const doca_error_t rc_len = doca_gpu_dev_buf_get_len(buf_ptr, &pkt_len);
+#endif
+    if (rc_len != 0 || pkt_len == 0u) {
+      atomicAdd(&out_meta[2], 1u);
+      atomicExch(&out_meta[3], kDocaRxDeviceStatusNativeLenError);
+      continue;
+    }
+    if (pkt_len > static_cast<size_t>(max_packet_size)) {
+      pkt_len = static_cast<size_t>(max_packet_size);
+    }
+    if (pkt_len > static_cast<size_t>(65535u)) {
+      pkt_len = static_cast<size_t>(65535u);
+    }
+
     out_packet_ptrs[i] = static_cast<uint64_t>(pkt_addr);
-    out_lengths[i] = static_cast<uint16_t>(max_packet_size > 65535u ? 65535u : max_packet_size);
+    out_lengths[i] = static_cast<uint16_t>(pkt_len);
     atomicAdd(&out_meta[1], 1u);
   }
   __syncthreads();
@@ -1382,6 +1411,14 @@ int classify_from_ingress_doca_device_locked(
 
   g_runtime.doca_rx_device_polls += 1u;
   if (host_meta[3] != 0u) {
+    if (host_meta[3] == kDocaRxDeviceStatusNativeLenUnsupported ||
+        host_meta[3] == kDocaRxDeviceStatusNativeLenError) {
+      g_runtime.doca_rx_device_len_unverified_events += 1u;
+      if (out_reason != nullptr) {
+        *out_reason = "doca_rx_device_len_unverified";
+      }
+      return set_err("doca_rx_device_len_unverified");
+    }
     g_runtime.doca_rx_device_poll_errors += 1u;
     if (out_reason != nullptr) {
       *out_reason = "doca_rx_receive_failed";
