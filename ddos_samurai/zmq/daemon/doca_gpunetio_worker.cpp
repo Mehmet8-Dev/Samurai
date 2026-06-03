@@ -20,7 +20,7 @@
 #include <zmq.h>
 
 #include "../../ddos_samurai/gpu_packet_cuda/tx_backend_doca_gpunetio.cuh"
-#include "dpu_state_runtime.hpp"
+#include "../../gpu_packet_cuda/dpu_state_runtime.hpp"
 #include "engine.hpp"
 #include "pacing_engine.h"
 #include "wire_protocol.h"

@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-#include "wire_protocol.h"
+#include "../zmq/daemon/wire_protocol.h"
 
 namespace samurai::dpu {
 

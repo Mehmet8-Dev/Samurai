@@ -361,7 +361,7 @@ def test_dpu_state_runtime_header_executes_tcp_policy_smoke() -> None:
         pytest.skip("No C++ compiler found")
 
     root = Path(__file__).resolve().parents[1]
-    hdr = root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp"
+    hdr = root / "ddos_samurai" / "gpu_packet_cuda" / "dpu_state_runtime.hpp"
     source = f"""
 #include \"{hdr}\"
 #include <cstdint>
@@ -431,7 +431,7 @@ def test_dpu_state_runtime_header_executes_tcp_edge_policy_smoke() -> None:
         pytest.skip("No C++ compiler found")
 
     root = Path(__file__).resolve().parents[1]
-    hdr = root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp"
+    hdr = root / "ddos_samurai" / "gpu_packet_cuda" / "dpu_state_runtime.hpp"
     source = f"""
 #include \"{hdr}\"
 #include <cstdint>

@@ -115,7 +115,7 @@ def test_m3_worker_sources_exist() -> None:
         root / "ddos_samurai" / "zmq" / "daemon" / "l7_worker.cpp",
         root / "ddos_samurai" / "zmq" / "daemon" / "defense_worker.cpp",
         root / "ddos_samurai" / "zmq" / "daemon" / "scenario_worker.cpp",
-        root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp",
+        root / "ddos_samurai" / "gpu_packet_cuda" / "dpu_state_runtime.hpp",
     ]
     for p in expected:
         assert p.exists(), str(p)
@@ -450,7 +450,7 @@ def test_m3_doca_worker_has_native_bridge_and_failfast_fallback() -> None:
     backend = (root / "ddos_samurai" / "gpu_packet_cuda" / "doca_gpunetio_backend.cpp").read_text(encoding="utf-8")
     api = (root / "ddos_samurai" / "gpu_packet_cuda" / "tx_backend_doca_gpunetio.cuh").read_text(encoding="utf-8")
     assert "LoadDocaNative" in src
-    assert '#include "dpu_state_runtime.hpp"' in src
+    assert '#include "../../gpu_packet_cuda/dpu_state_runtime.hpp"' in src
     assert "samurai_doca_gpunetio_get_api_v1" in src
     assert "samurai_doca_backend_create_txq" in src
     assert "samurai_doca_backend_send_vector" in src
@@ -552,7 +552,7 @@ def test_m3_doca_worker_perf_critical_feedback_path_reuses_scratch_and_batches_t
 
 def test_m3_dpu_state_runtime_models_authoritative_flow_updates() -> None:
     root = Path(__file__).resolve().parents[1]
-    src = (root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp").read_text(encoding="utf-8")
+    src = (root / "ddos_samurai" / "gpu_packet_cuda" / "dpu_state_runtime.hpp").read_text(encoding="utf-8")
     assert "struct FlowState" in src
     assert "class FlowStateTable" in src
     assert "NextCommittedVersion" in src
@@ -564,7 +564,7 @@ def test_m3_dpu_state_runtime_models_authoritative_flow_updates() -> None:
 
 def test_m3_dpu_state_runtime_models_full_tcp_offload_control_blocks() -> None:
     root = Path(__file__).resolve().parents[1]
-    src = (root / "ddos_samurai" / "zmq" / "daemon" / "dpu_state_runtime.hpp").read_text(encoding="utf-8")
+    src = (root / "ddos_samurai" / "gpu_packet_cuda" / "dpu_state_runtime.hpp").read_text(encoding="utf-8")
 
     for token in [
         "struct TcpControlBlock",
