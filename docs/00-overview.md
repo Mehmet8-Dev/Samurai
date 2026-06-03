@@ -22,14 +22,17 @@ Bu belge, projeyi hizli ama teknik olarak dogru sekilde anlamak icin "harita" do
 - Moduller: `ddos_samurai/cli/runtime.py`, `ddos_samurai/orchestrator.py`
 - Gorev: worker lifecycle, process yonetimi, progress/telemetry toplama
 
-3. Sender facade ve transport katmani
-- Facade: `ddos_samurai/senders.py`
-- Uygulamalar: `ddos_samurai/_senders/*`
-- Aktif politika: sender backend tarafinda XDP odakli, fallback politikasi fail
+3. Local worker transport katmani
+- ZMQ contract: `ddos_samurai/zmq/wire.py`
+- Dispatcher/event collector: `ddos_samurai/zmq/dispatcher.py`, `ddos_samurai/zmq/event_collector.py`
+- Runtime manager: `ddos_samurai/zmq/runtime_manager.py`
+- Native worker daemons: `ddos_samurai/zmq/daemon/*.cpp`
+- Gorev: CLI/orchestrator ile local CPU/GPU/DPDK/AF_XDP/DOCA/L7/Defense/Scenario worker process'leri arasinda job/event IPC
 
 4. Packet/payload uretim katmani
-- CPU packet engine: `ddos_samurai/cpu_packet_engine.py`, `ddos_samurai/packet.py`
-- GPU packet/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/_gpu_packet_cuda_backend.py`, `ddos_samurai/gpu_cuda_payload/*`
+- CPU native packet engine: `ddos_samurai/cpu_native/*`
+- GPU packet/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_packet_cuda/*`, `ddos_samurai/gpu_cuda_payload/*`
+- DPU/GPU state contract: `ddos_samurai/gpu_packet_cuda/dpu_state_runtime.hpp`
 
 5. Dagitik control-plane
 - Master: `ddos_samurai/control/master.py`
@@ -73,7 +76,8 @@ Bu belge, projeyi hizli ama teknik olarak dogru sekilde anlamak icin "harita" do
 
 - CLI akisi: `docs/01-cli.md`
 - Orkestrasyon ve sender zinciri: `docs/02-orchestrator.md`, `docs/03-senders.md`
-- GPU ve AF_XDP: `docs/05-gpu.md`, `docs/06-af_xdp-fast_sender.md`
+- GPU, ZMQ worker ve DPU/GPU dataplane: `docs/05-gpu.md`, `docs/36-zmq-worker-architecture.md`, `docs/37-dpu-gpu-dataplane-architecture.md`
+- AF_XDP ve native sender notlari: `docs/06-af_xdp-fast_sender.md`
 - Safety ve config: `docs/07-safety.md`, `docs/08-config.md`
 - Dagitik deployment: `docs/distributed-container-native.md`, `docs/29-distributed-control-plane.md`
 - Lisans ve urun paketleme: `docs/30-licensing-and-commercialization.md`, `docs/31-security-release-gates.md`

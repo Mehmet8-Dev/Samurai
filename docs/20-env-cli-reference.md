@@ -670,9 +670,27 @@ Lisans ozel notu: `--license-key` > `SAMURAI_LICENSE_KEY` > `~/.samurai/license.
 
 Control-plane ozel notu: bazi token/secret degerleri yalniz env uzerinden tasinmaya daha uygundur (ornek: `SAMURAI_CLUSTER_SECRET`, `SAMURAI_MANAGEMENT_API_*`).
 
-## 5) DOCA GPUNetIO Native Env Notlari
+## 5) ZMQ Worker ve DOCA/DPU-GPU Native Env Notlari
 
-Asagidaki env adlari native CUDA/DOCA katmaninda kullanilir; hepsi parser flag'i olarak gecmeyebilir:
+Asagidaki env adlari ZMQ worker runtime veya native CUDA/DOCA katmaninda
+kullanilir; hepsi parser flag'i olarak gecmeyebilir.
+
+### ZMQ worker runtime
+
+- `SAMURAI_ZMQ_WORKER_DIR`
+  - Native worker binary'leri icin arama dizini.
+  - `zmq_worker_search_dir` runtime/config alanı verilirse o deger onceliklidir.
+- `SAMURAI_XDP_NATIVE_LIB`
+  - AF_XDP worker icin native sender library path override.
+
+Varsayilan endpoint'ler `ddos_samurai/zmq/wire.py` icindedir:
+
+- `ipc:///tmp/samurai_jobs_<kind>`
+- `ipc:///tmp/samurai_events_<kind>`
+
+Detay: `docs/36-zmq-worker-architecture.md`
+
+### DOCA/GPUNetIO ve DPU/GPU contract
 
 - `SAMURAI_GPU_DOCA_ENABLE`
 - `SAMURAI_GPU_DOCA_DEVICE`
@@ -688,6 +706,16 @@ Asagidaki env adlari native CUDA/DOCA katmaninda kullanilir; hepsi parser flag'i
 - `SAMURAI_GPU_DOCA_FLOW_PORT_DEVARGS`
 - `SAMURAI_GPU_DOCA_FLOW_STREAMS_MULTI_PIPE`
 - `SAMURAI_GPU_DOCA_FLOW_SHIM_SO`
+- `SAMURAI_GPU_JOB_ENDPOINT`
+- `SAMURAI_DPU_STATE_PUBLISH`
+- `SAMURAI_DPU_TCP_RX_FEEDBACK`
+- `SAMURAI_DPU_TCP_PASSIVE_OPEN`
+- `SAMURAI_DPU_TCP_PASSIVE_OPEN_TIMEOUT_MS`
+- `SAMURAI_DPU_CONTRACT_RDMA`
+- `SAMURAI_DPU_CONTRACT_RDMA_SPEC`
+- `SAMURAI_GPU_CONTRACT_EXPORT_KIND`
+- `SAMURAI_GPU_CONTRACT_EXPORT_SPEC`
+- `SAMURAI_GPU_CONTRACT_EXPORT_PATH`
 
 Strict calisma beklentisi:
 
@@ -698,6 +726,24 @@ Strict calisma beklentisi:
 5. `--xdp-interface` verilmis
 
 Bu kombinasyonda amac fallback degil, ortam hazir degilse net fail-visible davranistir.
+
+DOCA worker runtime flag'leri:
+
+- `--gpu-job-endpoint`
+- `--dpu-state-publish 0|1`
+- `--dpu-contract-rdma`
+- `--dpu-contract-rdma-spec <spec>`
+- `--dpu-tcp-rx-feedback`
+- `--no-dpu-tcp-rx-feedback`
+- `--dpu-tcp-passive-open`
+- `--doca-interface <iface>`
+- `--doca-device <device>`
+- `--doca-queue-id <id>`
+- `--doca-rx-queue-id <id>`
+- `--doca-gpu-id <id>`
+- `--doca-batch-size <n>`
+
+Detay: `docs/37-dpu-gpu-dataplane-architecture.md`
 
 ## 6) Bakim Notu
 

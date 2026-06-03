@@ -16,9 +16,9 @@ Samurai, **yalnızca yetkili/lab ortamlarında** kullanılmak üzere geliştiril
 - L3/L4/L7 test yolları
 - Savunma odaklı VAE anomaly katmanı (60s pencere, 8 feature, JSONL event çıkışı)
 - `cpu` + opsiyonel `cuda` üretim yolu
-- Sender backend: **zorunlu `xdp`**, fallback policy: **zorunlu `fail`**
-- Stateful runtime backend: **zorunlu `afxdp`**
-- Native RX->GPU classify hattı: `AF_XDP RX` + `GPU defense backend`
+- Local native worker runtime: **ZMQ job/event IPC**
+- Sender/dataplane aileleri: CPU, GPU, AF_XDP, DPDK, DOCA GPUNetIO, L7, Defense, Scenario
+- DPU/GPU state kontratı: `gpu_packet_cuda` altında authoritative flow-state + GPU stream policy
 
 ## Yasal ve Etik Sınır
 
@@ -158,10 +158,11 @@ Varsayılan artifact dizini:
 
 - CLI paketi: `ddos_samurai/cli/`
 - Worker orchestration: `ddos_samurai/orchestrator.py`
-- Sender facade + iç modüller: `ddos_samurai/senders.py`, `ddos_samurai/_senders/*`
+- Local ZMQ worker runtime: `ddos_samurai/zmq/*`, `ddos_samurai/zmq/daemon/*.cpp`
 - L7 stateful emulation: `ddos_samurai/l7_emu/*`, `ddos_samurai/l7_emu_native/*`
-- Dataplane / AF_PACKET / XDP: `ddos_samurai/dataplane.py`, `fast_sender.c`, `xdp_sender.c`
-- GPU paket/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_cuda_payload/*`
+- Dataplane / AF_XDP / DPDK: `ddos_samurai/af_xdp_sender.py`, `ddos_samurai/dpdk/*`, `ddos_samurai/xdp_sender.c`
+- GPU paket/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_packet_cuda/*`, `ddos_samurai/gpu_cuda_payload/*`
+- DPU/GPU state contract: `ddos_samurai/gpu_packet_cuda/dpu_state_runtime.hpp`
 - AF_XDP Python wrapper + RX pipeline bridge: `ddos_samurai/af_xdp_sender.py`
 
 ## Önemli Notlar
@@ -181,8 +182,10 @@ pytest tests -q -rs
 - [Dokümantasyon İndeksi](docs/README.md)
 - [Scenario Engine (Web/Mobile Persona)](docs/28-scenario-engine-web-mobile-persona.md)
 - [VAE Defense Integration (Mimari + Kullanim)](docs/35-vae-defense-integration.md)
+- [ZMQ Worker Architecture](docs/36-zmq-worker-architecture.md)
+- [DPU/GPU Dataplane Architecture](docs/37-dpu-gpu-dataplane-architecture.md)
 - [L7 Native Custom QUIC/H3 Parity Planı](docs/PLAN_L7_NATIVE_CUSTOM_QUIC_H3_PARITY.md)
-- [DOCA GPUNetIO Geçiş Durumu](docs/33-doca-gpunetio-migration-status.md)
+- [DOCA GPUNetIO Mimari ve Operasyon Notları](docs/33-doca-gpunetio-migration-status.md)
 
 ## Lisans
 

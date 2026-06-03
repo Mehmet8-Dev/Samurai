@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 
 
 ### Changed
-- 
+- ZMQ worker architecture and DPU/GPU dataplane documentation refreshed.
+- Stale ZMQ legacy cleanup documentation removed.
 
 ### Fixed
 - 

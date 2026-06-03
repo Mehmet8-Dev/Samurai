@@ -1,26 +1,34 @@
-# 33 - DOCA GPUNetIO Gecis Durumu ve Operasyon Notlari
+# 33 - DOCA GPUNetIO Mimari ve Operasyon Notlari
 
 - Tarih: 2026-05-13
-- Kapsam: Mevcut CUDA persistent dataplane + DOCA GPUNetIO/DOCA Flow gecisinin yazilim durumu
-- Durum: Yazilim entegrasyonu ileri seviyede, donanim lab dogrulamasi beklemede
+- Guncelleme: 2026-06-03
+- Kapsam: CUDA persistent/stream runtime, DOCA GPUNetIO, DPU/GPU flow-state contract
+- Durum: Kod entegrasyonu mevcut; donanim lab KPI kapanisi ayri kosudur
 
-## 1) Hedef Mimari
+## 1) Mevcut Mimari
 
-Hedef, mevcut yapiyi kaldirmadan yeni bir backend ekleyerek gecmek:
+DOCA GPUNetIO artik GPU TX backend ailesinin bir uyesidir. Local process
+boundary ZMQ worker runtime ile, dataplane state contract ise `gpu_packet_cuda`
+altinda tutulur.
 
-- Mevcut backendler korunur: `af_xdp`, `af_packet`
-- Yeni backend: `doca_gpunetio`
-- Persistent + stream modunda strict fail-fast kontrati korunur
-- Uygun olmayan ortamda fallback yerine fail-visible davranis verilir
+Ana bilesenler:
 
-## 2) Faz Durumu (Ozet)
+- ZMQ DOCA worker: `ddos_samurai/zmq/daemon/doca_gpunetio_worker.cpp`
+- DPU authoritative state runtime: `ddos_samurai/gpu_packet_cuda/dpu_state_runtime.hpp`
+- DOCA GPUNetIO ABI: `ddos_samurai/gpu_packet_cuda/tx_backend_doca_gpunetio.cuh`
+- DOCA backend bridge: `ddos_samurai/gpu_packet_cuda/doca_gpunetio_backend.cpp`
+- GPU worker hot-flow receiver: `ddos_samurai/zmq/daemon/gpu_worker.cpp`
 
-1. Faz 1 - Hybrid backend secimi: Tamam
-2. Faz 2 - Native DOCA TX entegrasyonu: Tamam (host-side backend ve GPU handle export dahil)
-3. Faz 3 - Native DOCA RX + defense baglantisi: Tamam (device receive path + GPU RXQ handle akisi)
-4. Faz 4 - DOCA Flow steering: Tamam (single-pipe + multi-pipe stream rule injection)
+## 2) Runtime Akisi
 
-Not: "Tamam" ifadesi kod entegrasyonu icindir. Gercek NIC/DPU uzerinde throughput/latency KPI kapanisi ayrica lab kosusu gerektirir.
+1. CLI/orchestrator DOCA worker'a ZMQ `START_JOB` gonderir.
+2. DOCA worker native DOCA backend'i yukler.
+3. TXQ/RXQ ve opsiyonel contract writer acilir.
+4. `FlowStateTable` flow state'i olusturur.
+5. DPU state, GPU worker'a `FLOW_STREAM_UPSERT` ve `FLOW_UPDATE` yollar.
+6. TX batch'ler `send_vector` ile gonderilir.
+7. RX feedback aciksa ACK/SYN/FIN/RST paketleri `receive_burst` ile state'e islenir.
+8. Retransmit, zero-window, pause ve quota kararlari GPU stream policy'ye yansitilir.
 
 ## 3) Strict/Fallback Politikasi
 
@@ -35,40 +43,44 @@ Not: "Tamam" ifadesi kod entegrasyonu icindir. Gercek NIC/DPU uzerinde throughpu
 
 Bu davranis fallback yerine fail-fast stratejisini korur.
 
-## 4) Faz 3/4 Teknik Cikti Basliklari
+## 4) DPU/GPU Contract Basliklari
 
-- DOCA RX queue create/destroy akisi native backend tarafina baglandi
-- `receive_burst_view + release` tek akisa indirildi
-- GPU RXQ handle defense runtime tarafina export edildi
-- Device-side `doca_gpu_dev_eth_rxq_receive_block(...)` kullanimi aktif
-- Flow steering icin stream-bazli rule ABI ve multi-pipe programlama eklendi
+- `dpu_state_runtime.hpp` ZMQ dizininde degil, `gpu_packet_cuda` altindadir.
+- DPU state event'leri version/epoch tasir.
+- GPU'ya iki ana event akar: `FLOW_UPDATE` ve `FLOW_STREAM_UPSERT`.
+- Policy template bitleri pause, retransmit ve zero-window-probe bilgisini tasir.
+- DOCA worker, DPU state'i GPU worker job endpoint'ine non-blocking ZMQ publish eder.
 
 ## 5) Donanim Olmadan Dogrulama
 
 Donanim yokken kosulabilen dogrulama:
 
 ```bash
-python setup.py build_ext --inplace
-pytest tests/native_gpu/test_cuda_backend_bridge.py -q
-pytest tests/native_gpu/test_backend_facade.py -q
-pytest tests/native_gpu/test_defense_cuda_backend_bridge.py -q
+PYTHONPATH=. pytest tests/test_zmq_wire_contract.py -q
+PYTHONPATH=. pytest tests/test_zmq_m3_workers.py -q
+PYTHONPATH=. pytest tests/native_gpu/test_backend_facade.py -q
 ```
 
 Beklenti:
 
-- ABI/symbol kontratlari dogrulanir
-- Strict preflight kontrolleri dogrulanir
+- ZMQ wire ABI ve DPU state header smoke testleri dogrulanir
+- Worker source/layout kontratlari dogrulanir
+- Backend facade kontratlari dogrulanir
 - Gercek line-rate/perf metrikleri dogrulanmaz (lab gerekir)
 
-## 6) Kalan Isler
+## 6) Donanimli Lab Kapanisi
 
-1. Multi-GPU runtime topolojisi (`per-GPU PersistentRuntime`) tamamlama
-2. DOCA lab benchmark seti ile Faz 2/3/4 KPI kapanisi
-3. Uretim runbook'una donanim preflight adimlarini ekleme
+- E2E TX latency ve Mpps
+- RX feedback latency
+- DPU->GPU update latency
+- Queue scaling ve jitter dagilimi
+- GPU/NIC ayni PCIe switch topoloji etkisi
 
 ## 7) Ilgili Belgeler
 
 - [05 - GPU](./05-gpu.md)
 - [20 - Env + CLI Tam Referans](./20-env-cli-reference.md)
+- [36 - ZMQ Worker Architecture](./36-zmq-worker-architecture.md)
+- [37 - DPU/GPU Dataplane Architecture](./37-dpu-gpu-dataplane-architecture.md)
 - [ADR: DOCA Hybrid + Strict](./adr/2026-05-13-doca-gpunetio-hybrid-strict.md)
 - [Perf: DOCA GPUNetIO Progress Report](./perf/doca-gpunetio-progress-report.md)
