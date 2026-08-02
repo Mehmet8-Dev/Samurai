@@ -28,6 +28,8 @@
 #include "worker_common.hpp"
 
 namespace {
+using samurai::daemon::OptionalIntFromWire;
+using samurai::daemon::SendFrame;
 using samurai::daemon::BuildSnapshot;
 using samurai::daemon::JsonError;
 using samurai::daemon::PacingFromEnvelope;
@@ -144,10 +146,6 @@ struct DpuTcpRxScratch {
 };
 
 
-std::optional<int> OptionalIntFromWire(std::uint64_t raw) {
-  if (raw == 0ull) return std::nullopt;
-  return static_cast<int>(raw);
-}
 
 std::uint32_t EnvContractU32(const char* name, std::uint32_t default_value, std::uint32_t min_value) {
   const char* raw = std::getenv(name);
@@ -425,30 +423,6 @@ bool LoadDocaNative(DocaNativeBridge& out, std::string& err) {
   return false;
 }
 
-int SendFrame(
-    void* event_socket,
-    std::uint8_t msg_type,
-    std::uint64_t correlation_id,
-    samurai::wire::WorkerKind worker_kind,
-    const std::string& job_id,
-    const std::vector<std::uint8_t>& payload = {},
-    int send_flags = 0) {
-  samurai::wire::SamuraiWireHeaderV1 header = samurai::daemon::MakeHeader(
-      msg_type,
-      static_cast<std::uint32_t>(payload.size()),
-      correlation_id,
-      worker_kind,
-      job_id);
-  zmq_msg_t msg;
-  const std::size_t total = sizeof(header) + payload.size();
-  if (zmq_msg_init_size(&msg, total) != 0) return -1;
-  auto* p = static_cast<std::uint8_t*>(zmq_msg_data(&msg));
-  std::memcpy(p, &header, sizeof(header));
-  if (!payload.empty()) std::memcpy(p + sizeof(header), payload.data(), payload.size());
-  const int rc = zmq_msg_send(&msg, event_socket, send_flags);
-  zmq_msg_close(&msg);
-  return rc;
-}
 
 std::uint8_t ProtoFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
   const std::string proto = ReadFixed(env.protocol, sizeof(env.protocol));

@@ -20,6 +20,8 @@
 #include "worker_common.hpp"
 
 namespace {
+using samurai::daemon::OptionalIntFromWire;
+using samurai::daemon::SendFrame;
 using samurai::daemon::JsonError;
 using samurai::daemon::PacingFromEnvelope;
 using samurai::daemon::ReadFixed;
@@ -31,12 +33,6 @@ constexpr const char* kDefaultJobs = "ipc:///tmp/samurai_jobs_cpu";
 constexpr const char* kDefaultEvents = "ipc:///tmp/samurai_events_cpu";
 
 
-std::optional<int> OptionalIntFromWire(std::uint64_t raw) {
-  if (raw == 0ull) {
-    return std::nullopt;
-  }
-  return static_cast<int>(raw);
-}
 
 void ApplyAffinity(std::int32_t pin_cpu) {
   if (pin_cpu < 0) {
@@ -48,34 +44,6 @@ void ApplyAffinity(std::int32_t pin_cpu) {
   (void)sched_setaffinity(0, sizeof(cpuset), &cpuset);
 }
 
-int SendFrame(
-    void* event_socket,
-    std::uint8_t msg_type,
-    std::uint64_t correlation_id,
-    samurai::wire::WorkerKind worker_kind,
-    const std::string& job_id,
-    const std::vector<std::uint8_t>& payload = {}) {
-  samurai::wire::SamuraiWireHeaderV1 header = samurai::daemon::MakeHeader(
-      msg_type,
-      static_cast<std::uint32_t>(payload.size()),
-      correlation_id,
-      worker_kind,
-      job_id);
-
-  zmq_msg_t msg;
-  const std::size_t total = sizeof(header) + payload.size();
-  if (zmq_msg_init_size(&msg, total) != 0) {
-    return -1;
-  }
-  auto* p = static_cast<std::uint8_t*>(zmq_msg_data(&msg));
-  std::memcpy(p, &header, sizeof(header));
-  if (!payload.empty()) {
-    std::memcpy(p + sizeof(header), payload.data(), payload.size());
-  }
-  const int rc = zmq_msg_send(&msg, event_socket, 0);
-  zmq_msg_close(&msg);
-  return rc;
-}
 
 std::vector<std::uint8_t> JsonPayloadFromStats(
     std::uint64_t correlation_id,
