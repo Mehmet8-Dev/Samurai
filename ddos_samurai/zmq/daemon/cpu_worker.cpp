@@ -17,8 +17,12 @@
 #include "pacing_engine.h"
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
+#include "worker_common.hpp"
 
 namespace {
+using samurai::daemon::JsonError;
+using samurai::daemon::PacingFromEnvelope;
+using samurai::daemon::ReadFixed;
 
 using ddos_samurai::cpu_native::PacketConfig;
 using ddos_samurai::cpu_native::SpoofOptions;
@@ -26,9 +30,6 @@ using ddos_samurai::cpu_native::SpoofOptions;
 constexpr const char* kDefaultJobs = "ipc:///tmp/samurai_jobs_cpu";
 constexpr const char* kDefaultEvents = "ipc:///tmp/samurai_events_cpu";
 
-std::string ReadFixed(const char* raw, std::size_t n) {
-  return std::string(raw, strnlen(raw, n));
-}
 
 std::optional<int> OptionalIntFromWire(std::uint64_t raw) {
   if (raw == 0ull) {
@@ -97,10 +98,6 @@ std::vector<std::uint8_t> JsonPayloadFromStats(
   return std::vector<std::uint8_t>(json.begin(), json.end());
 }
 
-std::vector<std::uint8_t> JsonError(const std::string& reason) {
-  const std::string json = "{\"status\":\"error\",\"error\":\"" + reason + "\"}";
-  return std::vector<std::uint8_t>(json.begin(), json.end());
-}
 
 PacketConfig ConfigFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
   PacketConfig cfg;
@@ -163,15 +160,6 @@ PacketConfig ConfigFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
   return cfg;
 }
 
-samurai_pacing_config_t PacingFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
-  samurai_pacing_config_t out{};
-  out.mode = env.pacing_mode;
-  out.target_rps = env.target_rps;
-  out.ipg_ns = env.ipg_ns;
-  out.burst_size = env.burst_size > 0u ? env.burst_size : 1u;
-  out.burst_gap_ns = env.burst_gap_ns;
-  return out;
-}
 
 int SendAck(void* push, std::uint64_t cid, const std::string& job_id) {
   return SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK), cid, samurai::wire::WorkerKind::CPU, job_id);
