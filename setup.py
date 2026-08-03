@@ -699,7 +699,7 @@ def get_extensions() -> List[Extension]:
         "ddos_samurai.pacing_engine",
         sources=[
             "ddos_samurai/pacing_engine.c",
-            "ddos_samurai/xdp_core.c",
+            "ddos_samurai/xdp/xdp_core.c",
         ],
         extra_compile_args=["-O2", "-Wall", "-fPIC"],
         extra_link_args=["-lpthread", "-lm"],

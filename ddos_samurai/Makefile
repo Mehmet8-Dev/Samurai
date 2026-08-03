@@ -30,10 +30,12 @@ CFLAGS := -O2 -Wall -Wextra -fPIC -shared
 XDP_CFLAGS := -O2 -target bpf -D__BPF_TRACING__
 
 # Source files
-XDP_SENDER_SRC := xdp_sender.c
-XDP_SENDER_OUT := xdp_sender.so
-XDP_PROG_SRC := xdp_prog.c
-XDP_PROG_OUT := xdp_prog.o
+# XDP sources live in the dedicated xdp/ subtree.
+XDP_DIR := xdp
+XDP_SENDER_SRC := $(XDP_DIR)/xdp_sender.c
+XDP_SENDER_OUT := $(XDP_DIR)/xdp_sender.so
+XDP_PROG_SRC := $(XDP_DIR)/xdp_prog.c
+XDP_PROG_OUT := $(XDP_DIR)/xdp_prog.o
 PACING_SRC := pacing_engine.c
 FAST_SENDER_SRC := fast_sender.c
 

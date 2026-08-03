@@ -16,7 +16,7 @@
 
 #include <zmq.h>
 
-#include "../../ddos_samurai/xdp_native_api.h"
+#include "../../ddos_samurai/xdp/xdp_native_api.h"
 #include "engine.hpp"
 #include "pacing_engine.h"
 #include "wire_protocol.h"
@@ -132,7 +132,10 @@ std::vector<std::string> CandidateNativeLibs() {
   // 2. Paths relative to the executable directory (build-workers/../...).
   const std::string exe_dir = GetExeDir();
   const std::string repo_root = exe_dir + "/..";
-  // Direct repo source tree
+  // Primary location: the dedicated ddos_samurai/xdp/ source tree.
+  out.emplace_back(repo_root + "/ddos_samurai/xdp/xdp_sender.so");
+  out.emplace_back("ddos_samurai/xdp/xdp_sender.so");
+  // Legacy in-package location (kept for backward compat).
   out.emplace_back(repo_root + "/ddos_samurai/xdp_sender.so");
   // cpython-tagged builds for 3.11 and 3.12
   out.emplace_back(repo_root + "/build/lib.linux-x86_64-cpython-311/ddos_samurai/xdp_sender.cpython-311-x86_64-linux-gnu.so");
