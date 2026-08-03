@@ -83,7 +83,7 @@ void PrintSnapshot(const samurai::wire::MetricSnapshotV1& s) {
 
 }  // namespace
 
-int RunJob(const SupervisorConfig& cfg, const JobOptions& job) {
+int RunJob(const SupervisorConfig& cfg, const JobOptions& job, RunStats& out_stats) {
   void* ctx = zmq_ctx_new();
   if (ctx == nullptr) {
     std::fprintf(stderr, "orchestrator: zmq_ctx_new failed\n");
@@ -142,7 +142,7 @@ int RunJob(const SupervisorConfig& cfg, const JobOptions& job) {
   int idle = 0;
   bool done = false;
   int status_out = 0;
-  RunStats stats;
+  RunStats& stats = out_stats;
   while (!done && idle < cfg.max_idle_recvs) {
     zmq_msg_t msg;
     zmq_msg_init(&msg);

@@ -24,6 +24,8 @@ add_executable(
   args.cpp
   validation.cpp
   profiles.cpp
+  kpi_gate.cpp
+  reporting.cpp
   ../orchestrator/supervisor.cpp
 )
 target_include_directories(

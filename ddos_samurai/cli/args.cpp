@@ -39,6 +39,12 @@ void PrintUsage(const char* argv0) {
       "  --timeout-ms N      per-recv timeout on the events channel (default: 5000)\n"
       "  --profile NAME      apply a named workload profile (put before overrides)\n"
       "  --list-profiles     list the available workload profiles and exit\n"
+      "  --report-json PATH  write the run report as JSON to PATH\n"
+      "  --report-text PATH  write the run report as text to PATH\n"
+      "  --kpi-min-rate-accuracy PCT  gate: rate_accuracy_pct must be >= PCT\n"
+      "  --kpi-max-loss-pct PCT       gate: wire_loss_est_pct must be <= PCT\n"
+      "  --kpi-max-errors N           gate: errors must be <= N\n"
+      "  --kpi-min-sent N             gate: sent must be >= N\n"
       "  -h, --help          show this help\n",
       argv0);
 }
@@ -92,6 +98,24 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
         std::fprintf(stderr, "samurai: %s\n", err->c_str());
         return ParseStatus::kError;
       }
+    } else if (a == "--report-json") {
+      if (!NeedsValue(i, argc, "--report-json")) return ParseStatus::kError;
+      out.report_json_path = argv[++i];
+    } else if (a == "--report-text") {
+      if (!NeedsValue(i, argc, "--report-text")) return ParseStatus::kError;
+      out.report_text_path = argv[++i];
+    } else if (a == "--kpi-min-rate-accuracy") {
+      if (!NeedsValue(i, argc, "--kpi-min-rate-accuracy")) return ParseStatus::kError;
+      out.kpi.min_rate_accuracy_pct = std::strtod(argv[++i], nullptr);
+    } else if (a == "--kpi-max-loss-pct") {
+      if (!NeedsValue(i, argc, "--kpi-max-loss-pct")) return ParseStatus::kError;
+      out.kpi.max_wire_loss_pct = std::strtod(argv[++i], nullptr);
+    } else if (a == "--kpi-max-errors") {
+      if (!NeedsValue(i, argc, "--kpi-max-errors")) return ParseStatus::kError;
+      out.kpi.max_errors = std::strtod(argv[++i], nullptr);
+    } else if (a == "--kpi-min-sent") {
+      if (!NeedsValue(i, argc, "--kpi-min-sent")) return ParseStatus::kError;
+      out.kpi.min_sent = std::strtod(argv[++i], nullptr);
     } else {
       std::fprintf(stderr, "samurai: unknown argument: %s\n", a.c_str());
       return ParseStatus::kError;

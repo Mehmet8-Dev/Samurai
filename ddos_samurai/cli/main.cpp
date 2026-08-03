@@ -11,8 +11,11 @@
 #include <unistd.h>
 
 #include "args.hpp"
+#include "kpi_gate.hpp"
 #include "options.hpp"
 #include "profiles.hpp"
+#include "reporting.hpp"
+#include "run_summary.hpp"
 #include "supervisor.hpp"
 #include "validation.hpp"
 #include "worker_registry.hpp"
@@ -50,5 +53,35 @@ int main(int argc, char** argv) {
   cfg.events_endpoint = "ipc:///tmp/samurai_events_" + suffix;
   cfg.recv_timeout_ms = opt.timeout_ms;
 
-  return orchestrator::RunJob(cfg, opt.job);
+  orchestrator::RunStats stats;
+  int run_status = orchestrator::RunJob(cfg, opt.job, stats);
+
+  // KPI gate: evaluate thresholds against the run stats.
+  const cli::KpiGateResult gate = cli::EvaluateKpiGate(opt.kpi, stats);
+  if (gate.evaluated) {
+    std::printf("%s\n", cli::KpiGateJson(gate).c_str());
+    if (!gate.passed && run_status == 0) {
+      run_status = 3;  // gate failure surfaces as a non-zero exit
+    }
+  }
+
+  // Reports.
+  if (!opt.report_json_path.empty() || !opt.report_text_path.empty()) {
+    cli::RunReport report;
+    report.worker_name = opt.worker_name;
+    report.job = opt.job;
+    report.stats = stats;
+    report.gate = gate;
+    report.exit_status = run_status;
+    if (!opt.report_json_path.empty() &&
+        !cli::WriteReportFile(opt.report_json_path, cli::ReportJson(report))) {
+      std::fprintf(stderr, "samurai: failed to write %s\n", opt.report_json_path.c_str());
+    }
+    if (!opt.report_text_path.empty() &&
+        !cli::WriteReportFile(opt.report_text_path, cli::ReportText(report))) {
+      std::fprintf(stderr, "samurai: failed to write %s\n", opt.report_text_path.c_str());
+    }
+  }
+
+  return run_status;
 }

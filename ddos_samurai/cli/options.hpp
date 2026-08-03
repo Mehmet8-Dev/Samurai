@@ -10,6 +10,7 @@
 #include <string>
 
 #include "job_builder.hpp"  // samurai::orchestrator::JobOptions
+#include "kpi_gate.hpp"      // samurai::cli::KpiThresholds
 
 namespace samurai::cli {
 
@@ -20,6 +21,9 @@ struct CliOptions {
   samurai::orchestrator::JobOptions job;  // maps onto the wire JobEnvelopeV1
   bool show_help = false;
   bool list_profiles = false;             // --list-profiles: print and exit
+  KpiThresholds kpi;                      // KPI-gate thresholds (--kpi-*)
+  std::string report_json_path;           // --report-json PATH (empty = off)
+  std::string report_text_path;           // --report-text PATH (empty = off)
 };
 
 }  // namespace samurai::cli

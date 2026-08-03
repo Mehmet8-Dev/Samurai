@@ -11,6 +11,7 @@
 #include <string>
 
 #include "job_builder.hpp"
+#include "run_summary.hpp"
 #include "wire_protocol.h"
 #include "worker_registry.hpp"
 
@@ -26,7 +27,8 @@ struct SupervisorConfig {
 };
 
 // Runs one job end-to-end. Returns the worker process exit status (0 on a clean
-// JOB_DONE), or a negative value on a supervisor-side error.
-int RunJob(const SupervisorConfig& cfg, const JobOptions& job);
+// JOB_DONE), or a negative value on a supervisor-side error. The aggregated
+// run statistics are written to `out_stats` for reporting / KPI gating.
+int RunJob(const SupervisorConfig& cfg, const JobOptions& job, RunStats& out_stats);
 
 }  // namespace samurai::orchestrator
