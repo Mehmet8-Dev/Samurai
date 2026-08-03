@@ -11,6 +11,7 @@
 
 #include <zmq.h>
 
+#include "run_summary.hpp"
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
 
@@ -141,6 +142,7 @@ int RunJob(const SupervisorConfig& cfg, const JobOptions& job) {
   int idle = 0;
   bool done = false;
   int status_out = 0;
+  RunStats stats;
   while (!done && idle < cfg.max_idle_recvs) {
     zmq_msg_t msg;
     zmq_msg_init(&msg);
@@ -164,6 +166,7 @@ int RunJob(const SupervisorConfig& cfg, const JobOptions& job) {
             if (plen >= sizeof(samurai::wire::MetricSnapshotV1)) {
               samurai::wire::MetricSnapshotV1 s{};
               std::memcpy(&s, pl, sizeof(s));
+              AccumulateSnapshot(stats, s);
               PrintSnapshot(s);
             }
             break;
@@ -186,6 +189,9 @@ int RunJob(const SupervisorConfig& cfg, const JobOptions& job) {
   }
 
   (void)SendWire(jobs, MessageType::SHUTDOWN, correlation_id, cfg.worker.kind, job_id, nullptr, 0);
+
+  RecomputeLoss(stats);
+  std::printf("%s\n", SummaryJson(stats).c_str());
 
   int wstatus = 0;
   waitpid(pid, &wstatus, 0);
