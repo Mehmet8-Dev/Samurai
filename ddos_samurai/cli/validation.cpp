@@ -1,10 +1,10 @@
-#include "cli_validate.hpp"
+#include "validation.hpp"
 
 #include <string>
 
 #include <arpa/inet.h>
 
-#include "../worker_registry.hpp"
+#include "worker_registry.hpp"
 
 namespace samurai::cli {
 

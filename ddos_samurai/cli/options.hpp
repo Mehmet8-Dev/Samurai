@@ -1,15 +1,15 @@
 #pragma once
 
-// Parsed command-line options for the native `samurai` CLI.
+// Parsed command-line options for the native Samurai CLI.
 //
-// This is the C/C++ replacement for the Python `ddos_samurai.cli` package: the
-// argument surface is parsed into this struct (cli_parser), validated
-// (cli_validate), and handed to the orchestrator. Extend CliOptions/JobOptions
-// together as more of the Python CLI flags are ported.
+// This is the C/C++ replacement for the Python ddos_samurai/cli package. The
+// argument surface is parsed into this struct (args.*), validated
+// (validation.*), and handed to the orchestrator. Extend CliOptions/JobOptions
+// together as more of the former Python CLI flags are ported.
 
 #include <string>
 
-#include "../job_builder.hpp"
+#include "job_builder.hpp"  // samurai::orchestrator::JobOptions
 
 namespace samurai::cli {
 

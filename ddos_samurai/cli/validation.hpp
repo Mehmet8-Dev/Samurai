@@ -1,12 +1,12 @@
 #pragma once
 
-// Validates parsed CLI options before a job is dispatched. Native counterpart of
-// ddos_samurai/cli/validation.py (subset; grows toward parity).
+// Validates parsed CLI options before a job is dispatched. Native replacement
+// for ddos_samurai/cli/validation.py (subset; grows toward parity).
 
 #include <optional>
 #include <string>
 
-#include "cli_options.hpp"
+#include "options.hpp"
 
 namespace samurai::cli {
 

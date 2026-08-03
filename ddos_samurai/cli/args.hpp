@@ -1,9 +1,8 @@
 #pragma once
 
-// argv -> CliOptions. Native replacement for the argparse layer in
-// ddos_samurai/cli/args.py.
+// argv -> CliOptions. Native replacement for ddos_samurai/cli/args.py.
 
-#include "cli_options.hpp"
+#include "options.hpp"
 
 namespace samurai::cli {
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(samurai_orchestrator LANGUAGES CXX)
+project(samurai_cli LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,23 +11,25 @@ if(PkgConfig_FOUND)
 endif()
 
 if(NOT LIBZMQ_FOUND)
-  message(WARNING "libzmq not found: native samurai orchestrator will not be built.")
+  message(WARNING "libzmq not found: native samurai CLI will not be built.")
   return()
 endif()
 
-# Native orchestrator / CLI front-end. Spawns and drives the compiled worker
-# binaries (built by ../zmq/CMakeLists.txt) over the shared ZMQ wire protocol.
+# Native CLI front-end (`samurai`). Replaces the Python ddos_samurai/cli package:
+# argument parsing + validation here, driving the orchestrator engine (which
+# spawns/manages the ZMQ worker binaries built by ../zmq/CMakeLists.txt).
 add_executable(
   samurai
   main.cpp
-  supervisor.cpp
-  cli/cli_parser.cpp
-  cli/cli_validate.cpp
+  args.cpp
+  validation.cpp
+  ../orchestrator/supervisor.cpp
 )
 target_include_directories(
   samurai
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator
   ${CMAKE_CURRENT_SOURCE_DIR}/../zmq/daemon
   ${LIBZMQ_INCLUDE_DIRS})
 target_link_directories(samurai PRIVATE ${LIBZMQ_LIBRARY_DIRS})

@@ -1,19 +1,19 @@
-// samurai — native orchestrator/CLI entrypoint.
+// samurai — native CLI entrypoint.
 //
-// Thin driver: parse (cli/cli_parser) -> validate (cli/cli_validate) -> run the
-// job via the ZMQ supervisor. This is the seed of the native CLI/orchestrator
-// that replaces the Python entrypoint; the CLI surface lives in cli/ and grows
-// toward parity with ddos_samurai/cli/.
+// Native replacement for ddos_samurai/cli/__main__.py + app.py. Thin driver:
+// parse (args) -> validate (validation) -> run the job via the orchestrator's
+// ZMQ supervisor. The CLI surface grows toward parity with the former Python
+// cli/ package.
 
 #include <cstdio>
 #include <string>
 
 #include <unistd.h>
 
-#include "cli/cli_options.hpp"
-#include "cli/cli_parser.hpp"
-#include "cli/cli_validate.hpp"
+#include "args.hpp"
+#include "options.hpp"
 #include "supervisor.hpp"
+#include "validation.hpp"
 #include "worker_registry.hpp"
 
 int main(int argc, char** argv) {
