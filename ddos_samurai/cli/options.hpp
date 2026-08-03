@@ -19,6 +19,7 @@ struct CliOptions {
   int timeout_ms = 5000;                // per-recv timeout on the events channel
   samurai::orchestrator::JobOptions job;  // maps onto the wire JobEnvelopeV1
   bool show_help = false;
+  bool list_profiles = false;             // --list-profiles: print and exit
 };
 
 }  // namespace samurai::cli

@@ -12,6 +12,7 @@
 
 #include "args.hpp"
 #include "options.hpp"
+#include "profiles.hpp"
 #include "supervisor.hpp"
 #include "validation.hpp"
 #include "worker_registry.hpp"
@@ -28,6 +29,10 @@ int main(int argc, char** argv) {
   if (status == cli::ParseStatus::kError) {
     cli::PrintUsage(argv[0]);
     return 2;
+  }
+  if (opt.list_profiles) {
+    cli::ListProfiles();
+    return 0;
   }
 
   if (const auto err = cli::Validate(opt)) {

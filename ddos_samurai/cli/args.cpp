@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <string>
 
+#include "profiles.hpp"
+
 namespace samurai::cli {
 
 namespace {
@@ -35,6 +37,8 @@ void PrintUsage(const char* argv0) {
       "  --vector NAME       attack vector label (default: flood)\n"
       "  --pin-cpu N         pin worker to CPU core (default: -1 = none)\n"
       "  --timeout-ms N      per-recv timeout on the events channel (default: 5000)\n"
+      "  --profile NAME      apply a named workload profile (put before overrides)\n"
+      "  --list-profiles     list the available workload profiles and exit\n"
       "  -h, --help          show this help\n",
       argv0);
 }
@@ -79,6 +83,15 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
     } else if (a == "--timeout-ms") {
       if (!NeedsValue(i, argc, "--timeout-ms")) return ParseStatus::kError;
       out.timeout_ms = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+    } else if (a == "--list-profiles") {
+      out.list_profiles = true;
+      return ParseStatus::kOk;
+    } else if (a == "--profile") {
+      if (!NeedsValue(i, argc, "--profile")) return ParseStatus::kError;
+      if (const auto err = ApplyProfile(argv[++i], out)) {
+        std::fprintf(stderr, "samurai: %s\n", err->c_str());
+        return ParseStatus::kError;
+      }
     } else {
       std::fprintf(stderr, "samurai: unknown argument: %s\n", a.c_str());
       return ParseStatus::kError;

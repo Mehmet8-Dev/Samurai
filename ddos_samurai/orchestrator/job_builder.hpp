@@ -30,6 +30,10 @@ struct JobOptions {
   std::string protocol = "udp";
   std::string attack_vector = "flood";
   std::uint8_t ttl = 64;
+  bool spoof = false;
+  std::string spoof_mode;   // e.g. "random" / "realistic"
+  std::string dns_name;
+  std::string dns_qtype;
 };
 
 // Copies a std::string into a fixed-size char buffer, always NUL-terminating and
@@ -58,6 +62,10 @@ inline samurai::wire::JobEnvelopeV1 BuildJobEnvelope(const JobOptions& opt) {
   CopyFixed(env.protocol, sizeof(env.protocol), opt.protocol);
   CopyFixed(env.attack_vector, sizeof(env.attack_vector), opt.attack_vector);
   env.ttl = opt.ttl;
+  env.spoof_enabled = opt.spoof ? 1u : 0u;
+  CopyFixed(env.spoof_mode, sizeof(env.spoof_mode), opt.spoof_mode);
+  CopyFixed(env.dns_name, sizeof(env.dns_name), opt.dns_name);
+  CopyFixed(env.dns_qtype, sizeof(env.dns_qtype), opt.dns_qtype);
   return env;
 }
 

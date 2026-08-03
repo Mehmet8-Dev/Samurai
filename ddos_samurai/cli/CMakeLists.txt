@@ -23,6 +23,7 @@ add_executable(
   main.cpp
   args.cpp
   validation.cpp
+  profiles.cpp
   ../orchestrator/supervisor.cpp
 )
 target_include_directories(
