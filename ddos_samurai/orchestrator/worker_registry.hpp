@@ -11,6 +11,15 @@
 
 #include "wire_protocol.h"
 
+// Some Linux socket headers (<sys/socket.h>, pulled in by e.g. <arpa/inet.h>)
+// define AF_XDP as a numeric macro. If such a header is included after
+// wire_protocol.h, its #pragma once prevents wire_protocol.h from re-running its
+// own undef, and the macro then clobbers WorkerKind::AF_XDP below. Undef it here
+// so this header is robust to include order.
+#ifdef AF_XDP
+#undef AF_XDP
+#endif
+
 namespace samurai::orchestrator {
 
 struct WorkerEntry {

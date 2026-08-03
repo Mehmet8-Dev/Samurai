@@ -68,21 +68,3 @@ add_samurai_worker(samurai_defense_worker daemon/defense_worker.cpp)
 target_link_libraries(samurai_defense_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)
 add_samurai_worker(samurai_scenario_worker daemon/scenario_worker.cpp)
 target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_native_static pthread)
-
-# Native orchestrator / CLI front-end. Spawns and drives the worker binaries
-# above over the shared ZMQ wire protocol (native replacement for the Python
-# orchestrator's start_worker_zmq path).
-add_executable(
-  samurai
-  orchestrator/main.cpp
-  orchestrator/supervisor.cpp
-)
-target_include_directories(
-  samurai
-  PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/orchestrator
-  ${CMAKE_CURRENT_SOURCE_DIR}/daemon
-  ${LIBZMQ_INCLUDE_DIRS})
-target_link_directories(samurai PRIVATE ${LIBZMQ_LIBRARY_DIRS})
-target_link_libraries(samurai PRIVATE ${LIBZMQ_LIBRARIES} pthread)
-target_compile_options(samurai PRIVATE ${LIBZMQ_CFLAGS_OTHER})
