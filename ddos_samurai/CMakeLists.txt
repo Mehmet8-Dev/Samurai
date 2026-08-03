@@ -4,6 +4,8 @@ project(samurai_native LANGUAGES C CXX)
 # Native build tree for Samurai:
 #   core/         -> shared native utility layer (logging, net helpers, target
 #                    safety); the C++ replacement for ddos_samurai/utils.py
+#   control/      -> native control-plane layer (shard/auth/autoscale/discovery
+#                    so far); the C++ replacement for ddos_samurai/control
 #   zmq/          -> the ZMQ worker daemons (samurai_*_worker)
 #   orchestrator/ -> the native orchestrator engine (worker registry, job
 #                    builder, ZMQ supervisor); header + supervisor.cpp, compiled
@@ -15,5 +17,6 @@ project(samurai_native LANGUAGES C CXX)
 # the native worker + orchestrator + CLI layer that replaces the Python
 # launcher/orchestrator/CLI path.
 add_subdirectory(core)
+add_subdirectory(control)
 add_subdirectory(zmq)
 add_subdirectory(cli)
