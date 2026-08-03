@@ -39,6 +39,9 @@ void PrintUsage(const char* argv0) {
       "  --timeout-ms N      per-recv timeout on the events channel (default: 5000)\n"
       "  --profile NAME      apply a named workload profile (put before overrides)\n"
       "  --list-profiles     list the available workload profiles and exit\n"
+      "  --allow-public-target        permit non-private/loopback targets\n"
+      "  --allow-target IP|CIDR       allowlist a target (repeatable)\n"
+      "  --deny-target IP|CIDR        denylist a target; always wins (repeatable)\n"
       "  --report-json PATH  write the run report as JSON to PATH\n"
       "  --report-text PATH  write the run report as text to PATH\n"
       "  --kpi-min-rate-accuracy PCT  gate: rate_accuracy_pct must be >= PCT\n"
@@ -116,6 +119,14 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
     } else if (a == "--kpi-min-sent") {
       if (!NeedsValue(i, argc, "--kpi-min-sent")) return ParseStatus::kError;
       out.kpi.min_sent = std::strtod(argv[++i], nullptr);
+    } else if (a == "--allow-public-target") {
+      out.allow_public = true;
+    } else if (a == "--allow-target") {
+      if (!NeedsValue(i, argc, "--allow-target")) return ParseStatus::kError;
+      out.allow_targets.emplace_back(argv[++i]);
+    } else if (a == "--deny-target") {
+      if (!NeedsValue(i, argc, "--deny-target")) return ParseStatus::kError;
+      out.deny_targets.emplace_back(argv[++i]);
     } else {
       std::fprintf(stderr, "samurai: unknown argument: %s\n", a.c_str());
       return ParseStatus::kError;

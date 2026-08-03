@@ -36,5 +36,5 @@ target_include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/../zmq/daemon
   ${LIBZMQ_INCLUDE_DIRS})
 target_link_directories(samurai PRIVATE ${LIBZMQ_LIBRARY_DIRS})
-target_link_libraries(samurai PRIVATE ${LIBZMQ_LIBRARIES} pthread)
+target_link_libraries(samurai PRIVATE samurai_core ${LIBZMQ_LIBRARIES} pthread)
 target_compile_options(samurai PRIVATE ${LIBZMQ_CFLAGS_OTHER})

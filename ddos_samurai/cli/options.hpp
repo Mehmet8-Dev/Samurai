@@ -8,6 +8,7 @@
 // together as more of the former Python CLI flags are ported.
 
 #include <string>
+#include <vector>
 
 #include "job_builder.hpp"  // samurai::orchestrator::JobOptions
 #include "kpi_gate.hpp"      // samurai::cli::KpiThresholds
@@ -24,6 +25,10 @@ struct CliOptions {
   KpiThresholds kpi;                      // KPI-gate thresholds (--kpi-*)
   std::string report_json_path;           // --report-json PATH (empty = off)
   std::string report_text_path;           // --report-text PATH (empty = off)
+  // Target-safety gate (core::ValidateTargetSafety).
+  bool allow_public = false;              // --allow-public-target
+  std::vector<std::string> allow_targets;  // --allow-target IP|CIDR (repeatable)
+  std::vector<std::string> deny_targets;   // --deny-target IP|CIDR (repeatable)
 };
 
 }  // namespace samurai::cli

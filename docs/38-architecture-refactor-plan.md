@@ -107,9 +107,10 @@ Sıra: native karşılık kanıtlanmadan Python yol sökülmez.
 3. **CLI** (`cli/`) → native argparse + dispatch (C++ giriş binary'si).
 4. Her adımda: native yol çalışır kanıtlanır → Python yol kaldırılır.
 
-> Not: `reporting.py`, `licensing/`, ML/VAE (`models/vae`, torch) gibi katmanlar
-> native önceliği dışında; bunların kaderi ayrı kararlaştırılır (bu turda
-> DOKUNULMADI — önceki Python-split girişimi geri alındı).
+> Durum: `cli/` + `orchestrator.py` native'e geçti; `kpi_gate`/`reporting`
+> native C++ (`cli/`); `utils.py` native `core/`'a taşındı (`live_metrics.py`
+> kaldırıldı). Sıradaki: `control/` ve `licensing/` alt sistemleri native'e.
+> ML/VAE (`models/vae`, torch) native önceliği dışında; kaderi ayrı kararlaştırılır.
 
 ---
 
@@ -127,8 +128,13 @@ Sıra: native karşılık kanıtlanmadan Python yol sökülmez.
 - [x] Legacy analizi kanıtla düzeltildi
 - [x] Increment 1: worker_common.hpp — 5 paylaşılan helper
 - [x] Increment 2: SendFrame + OptionalIntFromWire paylaşıldı
+- [x] Native orkestratör (`orchestrator/`) + CLI (`cli/`) → Python `cli/`/`orchestrator.py` kaldırıldı
+- [x] `kpi_gate` + `reporting` native C++ olarak yeniden yaratıldı (`cli/`)
+- [x] `xdp*.c` → `ddos_samurai/xdp/` altına taşındı
+- [x] `utils.py` → native `core/` (log + net_utils + target_safety); `live_metrics.py` (orphan) kaldırıldı
+- [ ] `control/` alt sistemi → native C/C++
+- [ ] `licensing/` katmanı → native C/C++
 - [ ] Increment 3: SendAck/JsonDone/ConfigFromEnvelope + WorkerBase event-loop
 - [ ] `dataplane_core.c` + `fast_sender.c` (kanıtlı ölü) kaldırma
 - [ ] doca/gpu worker .cpp monolit dekompozisyonu (burada doğrulanabilir)
 - [ ] CUDA/DOCA monolitleri (CI gerektirir)
-- [ ] Python orkestratör/CLI → native geçişi

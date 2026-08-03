@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 
+#include "target_safety.hpp"
 #include "worker_registry.hpp"
 
 namespace samurai::cli {
@@ -26,6 +27,13 @@ std::optional<std::string> Validate(const CliOptions& opt) {
   }
   if (!IsValidIpv4(opt.job.target_ip)) {
     return "invalid --target IPv4 address: " + opt.job.target_ip;
+  }
+  // Safety gate: private/loopback by default; allowlist/denylist and
+  // --allow-public-target relax/tighten the policy (core::ValidateTargetSafety).
+  const auto safety = samurai::core::ValidateTargetSafety(
+      opt.job.target_ip, opt.allow_targets, opt.allow_public, opt.deny_targets);
+  if (!safety.ok) {
+    return safety.reason;
   }
   if (opt.job.target_port == 0) {
     return "--port must be between 1 and 65535";
