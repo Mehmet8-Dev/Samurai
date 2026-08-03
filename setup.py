@@ -700,20 +700,9 @@ def get_extensions() -> List[Extension]:
     )
     extensions.append(l4_state_engine)
 
-    scenario_native = Extension(
-        "ddos_samurai._scenario_native",
-        sources=[
-            "ddos_samurai/scenario_engine_native/module.cpp",
-            "ddos_samurai/scenario_engine_native/compiler.cpp",
-            "ddos_samurai/scenario_engine_native/scheduler.cpp",
-            "ddos_samurai/scenario_engine_native/sla.cpp",
-        ],
-        include_dirs=[pybind11_include],
-        language="c++",
-        extra_compile_args=["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"],
-        extra_link_args=["-lpthread", "-lm"],
-    )
-    extensions.append(scenario_native)
+    # NOTE: the pybind `_scenario_native` extension and the Python
+    # scenario_engine facade were removed: pybind is legacy, scenarios run
+    # through the native ZMQ scenario worker.
 
     l7_compile_args, l7_link_args, l7_macros = _resolve_l7_flags()
     l7_emu_native = Extension(
