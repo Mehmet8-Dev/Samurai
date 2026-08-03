@@ -135,7 +135,7 @@ Sıra: native karşılık kanıtlanmadan Python yol sökülmez.
 - [x] JSON altyapısı → `core/json.*` (parser+serializer, insertion-order object'ler)
 - [~] `control/` alt sistemi → native `samurai_control` (transport: ZMQ)
   - [x] Increment 1 (saf mantık): `shard` + `auth`(RBAC) + `autoscale`(karar makinesi) + `discovery`(manuel); selftest ile doğrulandı
-  - [~] Increment 2: `jwt_claims` → `control/jwt.*` (OpenSSL HMAC-SHA256, core JSON) **[bitti]**; `telemetry`, `multimaster` sırada
+  - [x] Increment 2: `jwt_claims` → `control/jwt.*` (OpenSSL HMAC-SHA256, core JSON); `telemetry` → `control/telemetry.*` (DistributedAggregator, saf rollup); `multimaster` → `control/multimaster.*` (KvStore soyutlaması + in-memory backend; hiredis-Redis ertelendi)
   - [ ] Increment 3: ağ modülleri (`client`/`server`/`slave`/`master`/`ha`/`management_api`) → ZMQ transport
   - [ ] Parity'de Python `control/*.py` toptan kaldırılır (`jwt_claims.py` hâlâ `server.py`/`management_api.py` tarafından import ediliyor)
 - [ ] `licensing/` katmanı → native C/C++

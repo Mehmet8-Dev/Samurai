@@ -9,15 +9,17 @@ find_package(OpenSSL REQUIRED)
 
 # samurai_control — native control-plane layer, the C++ replacement for the
 # Python ddos_samurai/control package.
-#   shard.*     -> split_job_to_shards (equal/capability/region)
-#   auth.*      -> endpoint parsing, cluster-secret metadata, RBAC resolution
-#   autoscale.* -> the K8s autoscale decision state machine (in-memory mode)
-#   discovery.* -> manual endpoint discovery
-#   jwt.*       -> HS256 JWT decode/verify + encode (OpenSSL HMAC-SHA256)
+#   shard.*       -> split_job_to_shards (equal/capability/region)
+#   auth.*        -> endpoint parsing, cluster-secret metadata, RBAC resolution
+#   autoscale.*   -> the K8s autoscale decision state machine (in-memory mode)
+#   discovery.*   -> manual endpoint discovery
+#   jwt.*         -> HS256 JWT decode/verify + encode (OpenSSL HMAC-SHA256)
+#   telemetry.*   -> DistributedAggregator (per-shard/worker/region rollups)
+#   multimaster.* -> cross-region coordinator over a KvStore backend
+#                    (in-memory now; hiredis-backed Redis deferred)
 #
-# Networked modules (client/server/slave/master/ha/management_api/multimaster)
-# and telemetry are ported in later increments, using the ZMQ transport that
-# the workers already speak.
+# Networked modules (client/server/slave/master/ha/management_api) are ported in
+# a later increment, using the ZMQ transport that the workers already speak.
 add_library(
   samurai_control
   STATIC
@@ -25,7 +27,9 @@ add_library(
   auth.cpp
   autoscale.cpp
   discovery.cpp
-  jwt.cpp)
+  jwt.cpp
+  telemetry.cpp
+  multimaster.cpp)
 target_include_directories(samurai_control PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(samurai_control PUBLIC samurai_core PRIVATE OpenSSL::Crypto)
 

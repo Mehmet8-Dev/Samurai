@@ -16,7 +16,9 @@
 #include "discovery.hpp"
 #include "json.hpp"
 #include "jwt.hpp"
+#include "multimaster.hpp"
 #include "shard.hpp"
+#include "telemetry.hpp"
 
 namespace {
 
@@ -212,6 +214,98 @@ int main() {
     Check(DecodeJwtHs256("not.a.jwt.token", secret).error == "invalid jwt format",
           "jwt: malformed rejected");
     Check(DecodeJwtHs256("", secret).error == "empty token", "jwt: empty rejected");
+  }
+
+  // --- telemetry: DistributedAggregator rollups ---
+  {
+    namespace json = samurai::core::json;
+    DistributedAggregator agg;
+    auto mk = [](const std::string& wid, const std::string& sid, int sent, int errors,
+                 const std::string& region) {
+      json::Value v = json::Value::Object();
+      v.set("worker_id", json::Value::Str(wid));
+      v.set("shard_id", json::Value::Str(sid));
+      v.set("sent", json::Value::Int(sent));
+      v.set("errors", json::Value::Int(errors));
+      v.set("region", json::Value::Str(region));
+      return v;
+    };
+    // Two updates for shard-1 (max semantics), one for shard-2 with more errors.
+    agg.Add(mk("w1", "shard-1", 100, 0, "eu"));
+    agg.Add(mk("w1", "shard-1", 250, 1, "eu"));
+    agg.Add(mk("w2", "shard-2", 40, 9, "us"));
+    auto snap = agg.Snapshot();
+    Check(snap.find("sent")->as_int() == 390, "telemetry: sent summed (100+250+40)");
+    Check(snap.find("errors")->as_int() == 10, "telemetry: errors summed");
+    Check(snap.find("workers")->as_int() == 2, "telemetry: distinct workers");
+    Check(snap.find("shards")->as_int() == 2, "telemetry: distinct shards");
+    // per_shard uses max, not sum, for shard-1
+    const auto* per_shard = snap.find("per_shard");
+    Check(per_shard && per_shard->elements().size() == 2, "telemetry: per_shard size");
+    // top_error_shards ordered by errors desc -> shard-2 first
+    const auto* top = snap.find("top_error_shards");
+    Check(top && !top->elements().empty() &&
+              top->elements()[0].find("shard_id")->as_string() == "shard-2",
+          "telemetry: top error shard first");
+    // numeric_totals accumulates sent across all items
+    const auto* nt = snap.find("numeric_totals");
+    Check(nt && nt->find("sent") && nt->find("sent")->as_double() == 390.0,
+          "telemetry: numeric_totals sent");
+    // region rollup: two regions
+    const auto* rr = snap.find("region_rollup");
+    Check(rr && rr->elements().size() == 2, "telemetry: two regions");
+  }
+
+  // --- multimaster: cross-region enqueue/dequeue + heartbeat scan ---
+  {
+    namespace json = samurai::core::json;
+    InMemoryKvStore store;
+    std::int64_t clock_ms = 1000;
+    auto now = [&clock_ms]() { return clock_ms; };
+
+    MultiMasterConfig eu_cfg;
+    eu_cfg.enabled = true;
+    eu_cfg.region_id = "eu";
+    eu_cfg.node_id = "eu-master";
+    RedisMultiMasterCoordinator eu(eu_cfg, &store, now);
+
+    MultiMasterConfig us_cfg;
+    us_cfg.enabled = true;
+    us_cfg.region_id = "us";
+    us_cfg.node_id = "us-master";
+    RedisMultiMasterCoordinator us(us_cfg, &store, now);
+
+    Check(eu.active() && us.active(), "multimaster: active with store");
+
+    // eu enqueues a job destined for us; us dequeues it with delegated_from.
+    json::Value job = json::Value::Object();
+    job.set("target", json::Value::Str("10.0.0.1"));
+    job.set("count", json::Value::Int(500));
+    Check(eu.EnqueueJob("us", job), "multimaster: enqueue to us");
+    auto jobs = us.DequeueJobs(5);
+    Check(jobs.size() == 1, "multimaster: us dequeues one job");
+    Check(!jobs.empty() && jobs[0].find("target") &&
+              jobs[0].find("target")->as_string() == "10.0.0.1",
+          "multimaster: job payload preserved");
+    Check(!jobs.empty() && jobs[0].find("_mmr_delegated_from") &&
+              jobs[0].find("_mmr_delegated_from")->as_string() == "eu",
+          "multimaster: delegated_from stamped");
+    // queue now empty
+    Check(us.DequeueJobs(5).empty(), "multimaster: queue drained");
+
+    // heartbeats from both regions -> regions_state returns both, sorted.
+    Check(eu.Heartbeat() && us.Heartbeat(), "multimaster: heartbeats");
+    auto regions = us.RegionsState();
+    Check(regions.size() == 2, "multimaster: two regions in state");
+    Check(regions.size() == 2 && regions[0].find("region_id")->as_string() == "eu" &&
+              regions[1].find("region_id")->as_string() == "us",
+          "multimaster: regions sorted by id");
+
+    // offline coordinator (no store) is inert.
+    RedisMultiMasterCoordinator offline(eu_cfg, nullptr, now);
+    Check(!offline.active(), "multimaster: null store -> inactive");
+    Check(!offline.Heartbeat(), "multimaster: offline heartbeat no-op");
+    Check(!offline.Snapshot().find("enabled")->as_bool(), "multimaster: offline snapshot enabled=false");
   }
 
   if (g_failures == 0) {
