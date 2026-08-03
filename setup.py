@@ -704,88 +704,9 @@ def get_extensions() -> List[Extension]:
     # scenario_engine facade were removed: pybind is legacy, scenarios run
     # through the native ZMQ scenario worker.
 
-    l7_compile_args, l7_link_args, l7_macros = _resolve_l7_flags()
-    l7_emu_native = Extension(
-        "ddos_samurai._l7_emu_native",
-        sources=[
-            "ddos_samurai/l7_emu_native/module.cpp",
-            "ddos_samurai/l7_emu_native/engine.cpp",
-            "ddos_samurai/l7_emu_native/custom_quic_stack/quic_stack.cpp",
-            "ddos_samurai/l7_emu_native/custom_quic_stack/udp_io.cpp",
-            "ddos_samurai/l7_emu_native/custom_quic_stack/crypto_backend.cpp",
-            "ddos_samurai/l7_emu_native/custom_quic_stack/h3_minimal_client.cpp",
-            "ddos_samurai/l7_emu_native/custom_quic_stack/h3_real_client.cpp",
-            "ddos_samurai/l7_emu_native/custom_quic_stack/h3_ngtcp2_client.cpp",
-            "ddos_samurai/l7_emu_native/custom_quic_stack/h3_control_plane.cpp",
-            "ddos_samurai/l7_emu_native/custom_quic_stack/h3_parity_state.cpp",
-            "ddos_samurai/l7_emu_native/custom_quic_stack/loss_recovery.cpp",
-            "ddos_samurai/l7_emu_native/custom_quic_stack/quic_metrics.cpp",
-            "ddos_samurai/l4/tcp_dataplane_ffi.cpp",
-            "ddos_samurai/l4/tcp_dataplane_core.cpp",
-        ],
-        include_dirs=[pybind11_include],
-        language="c++",
-        extra_compile_args=_dedupe(["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"] + l7_compile_args),
-        extra_link_args=_dedupe(["-lpthread", "-lm"] + l7_link_args),
-        define_macros=l7_macros,
-    )
-    extensions.append(l7_emu_native)
-
-    gpu_cuda_payload_sources = [
-        "ddos_samurai/gpu_cuda_payload/src/bridge_pybind.cpp",
-        "ddos_samurai/gpu_cuda_payload/src/compiler.cpp",
-        "ddos_samurai/gpu_cuda_payload/src/vector_spec_parser.cpp",
-        "ddos_samurai/gpu_cuda_payload/src/plan_batch.cpp",
-        "ddos_samurai/gpu_cuda_payload/src/oracle.cpp",
-    ]
-    gpu_cuda_payload_include_dirs = [
-        pybind11_include,
-        os.path.join(project_root, "ddos_samurai", "gpu_cuda_payload", "include"),
-    ]
-    gpu_cuda_payload_compile_args: List[str] | Dict[str, List[str]] = ["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"]
-    gpu_cuda_payload_link_args = ["-lpthread", "-lm"]
-    gpu_cuda_payload_macros: List[Tuple[str, str]] = []
-    gpu_cuda_payload_library_dirs: List[str] = []
-
-    nvcc_path = _resolve_nvcc_path()
-    cuda_home = _resolve_cuda_home(nvcc_path)
-    cuda_include = os.path.join(cuda_home, "include") if cuda_home else ""
-    cuda_lib_dir = _resolve_cuda_runtime_lib_dir(cuda_home) if cuda_home else ""
-    enable_payload_cuda = (
-        (not _env_flag("SAMURAI_SKIP_CUDA_BUILD", "0"))
-        and bool(nvcc_path)
-        and bool(cuda_include)
-        and os.path.exists(cuda_include)
-    )
-    if enable_payload_cuda:
-        gpu_cuda_payload_sources.extend([
-            "ddos_samurai/gpu_cuda_payload/cuda/planner_kernels.cu",
-            "ddos_samurai/gpu_cuda_payload/cuda/rng_kernels.cu",
-            "ddos_samurai/gpu_cuda_payload/cuda/template_expand_kernels.cu",
-        ])
-        gpu_cuda_payload_include_dirs.append(cuda_include)
-        if cuda_lib_dir:
-            gpu_cuda_payload_library_dirs.append(cuda_lib_dir)
-        gpu_cuda_payload_link_args.append("-lcudart")
-        gpu_cuda_payload_macros.append(("SAMURAI_GPU_CUDA_PAYLOAD_KERNELS", "1"))
-        gpu_cuda_payload_compile_args = {
-            "cxx": ["-O2", "-Wall", "-Wextra", "-fPIC", "-std=c++20"],
-            "nvcc": ["-O3", "-std=c++20", "-Xcompiler", "-fPIC", "-diag-suppress=177"],
-        }
-    else:
-        print("Info: CUDA planner kernels disabled for _gpu_cuda_payload_native (nvcc/CUDA headers not found).")
-
-    gpu_cuda_payload_native = Extension(
-        "ddos_samurai._gpu_cuda_payload_native",
-        sources=gpu_cuda_payload_sources,
-        include_dirs=gpu_cuda_payload_include_dirs,
-        library_dirs=gpu_cuda_payload_library_dirs,
-        language="c++",
-        extra_compile_args=gpu_cuda_payload_compile_args,
-        extra_link_args=gpu_cuda_payload_link_args,
-        define_macros=gpu_cuda_payload_macros,
-    )
-    extensions.append(gpu_cuda_payload_native)
+    # NOTE: the pybind `_l7_emu_native` and `_gpu_cuda_payload_native`
+    # extensions (and their Python facades) were removed: pybind is legacy;
+    # L7 runs through the native ZMQ l7 worker.
 
     pacing_engine = Extension(
         "ddos_samurai.pacing_engine",
