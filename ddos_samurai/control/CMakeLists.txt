@@ -23,10 +23,13 @@ endif()
 #   multimaster.*   -> cross-region coordinator over a KvStore backend
 #   control_auth.*  -> server-side RBAC/secret/JWT authorization (interceptor)
 #   servicer.*      -> master control service (worker registry + 8 RPCs)
+#   worker_shard_service.* -> slave-side shard lifecycle service (StartShard/
+#                    StopShard/GetWorkerStatus + leader-epoch fencing)
+#   master_coordinator.*   -> master job dispatch state machine (_run_single_job)
 #   control_server/client.* -> ZMQ transport (built only when libzmq is present)
 #
-# Remaining networked modules (slave/master orchestration, ha, management_api)
-# land in later increments on top of this transport.
+# Remaining networked pieces (register/heartbeat loops, ha electors,
+# management_api, arg-wired entrypoints) land in a later increment.
 set(CONTROL_SOURCES
   shard.cpp
   auth.cpp
@@ -36,7 +39,9 @@ set(CONTROL_SOURCES
   telemetry.cpp
   multimaster.cpp
   control_auth.cpp
-  servicer.cpp)
+  servicer.cpp
+  worker_shard_service.cpp
+  master_coordinator.cpp)
 
 if(LIBZMQ_FOUND)
   list(APPEND CONTROL_SOURCES control_server.cpp control_client.cpp)

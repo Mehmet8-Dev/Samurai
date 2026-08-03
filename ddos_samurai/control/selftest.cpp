@@ -16,9 +16,12 @@
 #include "discovery.hpp"
 #include "json.hpp"
 #include "jwt.hpp"
+#include "master_coordinator.hpp"
 #include "multimaster.hpp"
 #include "shard.hpp"
+#include "shard_runner.hpp"
 #include "telemetry.hpp"
+#include "worker_shard_service.hpp"
 
 #ifdef SAMURAI_CONTROL_HAVE_ZMQ
 #include "control_client.hpp"
@@ -311,6 +314,119 @@ int main() {
     Check(!offline.active(), "multimaster: null store -> inactive");
     Check(!offline.Heartbeat(), "multimaster: offline heartbeat no-op");
     Check(!offline.Snapshot().find("enabled")->as_bool(), "multimaster: offline snapshot enabled=false");
+  }
+
+  // --- slave: worker shard service lifecycle ---
+  {
+    namespace json = samurai::core::json;
+    InMemoryShardRunner runner;
+    WorkerShardService svc("worker-A", &runner);
+    RpcContext ctx;  // no meta/role needed for the worker service
+
+    json::Value args = json::Value::Object();
+    args.set("_leader_epoch", json::Value::Int(5));
+    args.set("count", json::Value::Int(300));
+    args.set("_test_sent", json::Value::Int(300));
+    json::Value start = json::Value::Object();
+    start.set("shard_id", json::Value::Str("shard-1"));
+    start.set("job_id", json::Value::Str("job-1"));
+    start.set("args_json", json::Value::Str(args.dump()));
+    auto sr = svc.StartShard(start, ctx);
+    Check(sr.find("started") && sr.find("started")->as_bool(), "wss: StartShard started");
+    svc.WaitForShardIdle("shard-1");
+
+    json::Value gbody = json::Value::Object();
+    gbody.set("worker_id", json::Value::Str("worker-A"));
+    auto status = svc.GetWorkerStatus(gbody, ctx);
+    Check(status.find("state") && status.find("state")->as_string() == "done",
+          "wss: completed shard -> state done");
+    auto stats = json::Parse(status.find("stats_json")->as_string());
+    Check(stats.ok && stats.value.find("sent") && stats.value.find("sent")->as_int() == 300,
+          "wss: finalized stats carry sent");
+    Check(stats.value.find("exitcode") && stats.value.find("exitcode")->as_int() == 0,
+          "wss: exitcode 0");
+
+    // Stale leader epoch is fenced off.
+    json::Value stale_args = json::Value::Object();
+    stale_args.set("_leader_epoch", json::Value::Int(3));
+    json::Value stale = json::Value::Object();
+    stale.set("shard_id", json::Value::Str("shard-2"));
+    stale.set("args_json", json::Value::Str(stale_args.dump()));
+    auto srr = svc.StartShard(stale, ctx);
+    Check(!srr.find("started")->as_bool() &&
+              srr.find("error")->as_string().find("stale leader epoch") != std::string::npos,
+          "wss: stale leader epoch rejected");
+
+    // Unknown worker id -> disconnected.
+    json::Value other = json::Value::Object();
+    other.set("worker_id", json::Value::Str("worker-Z"));
+    auto st2 = svc.GetWorkerStatus(other, ctx);
+    Check(st2.find("state")->as_string() == "disconnected", "wss: unknown worker disconnected");
+  }
+
+  // --- master: dispatch coordinator drives a job to completion ---
+  {
+    namespace json = samurai::core::json;
+
+    struct FakeView : MasterView {
+      std::map<std::string, WorkerInfo> workers;
+      std::map<std::string, std::string> stats;
+      std::vector<WorkerInfo> Workers() override {
+        std::vector<WorkerInfo> out;
+        for (auto& kv : workers) out.push_back(kv.second);
+        return out;
+      }
+      bool ShardReported(const std::string& sid) override { return stats.count(sid) > 0; }
+      std::string GetShardStats(const std::string& sid) override {
+        auto it = stats.find(sid);
+        return it == stats.end() ? std::string("{}") : it->second;
+      }
+      void SetShardStats(const std::string& sid, const std::string& js) override { stats[sid] = js; }
+    };
+    struct FakeCmd : WorkerCommander {
+      FakeView* view = nullptr;
+      DispatchOutcome Dispatch(const std::string&, const std::string& sid, const std::string&,
+                               const std::string&, std::int64_t count, std::int64_t) override {
+        json::Value s = json::Value::Object();
+        s.set("shard_id", json::Value::Str(sid));
+        s.set("sent", json::Value::Int(count));
+        s.set("errors", json::Value::Int(0));
+        view->SetShardStats(sid, s.dump());  // simulate the worker finishing + reporting
+        return {true, "ok"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override {
+        return {"done", "", "{}"};
+      }
+      bool StopShard(const std::string&, const std::string&) override { return true; }
+    };
+
+    FakeView view;
+    std::int64_t clk = 1000000;
+    for (const char* wid : {"w1", "w2"}) {
+      WorkerInfo w;
+      w.worker_id = wid;
+      w.capabilities["control_endpoint"] = std::string("tcp://") + wid + ":5099";
+      w.last_heartbeat_ms = clk;
+      view.workers[wid] = w;
+    }
+    FakeCmd cmd;
+    cmd.view = &view;
+
+    MasterCoordinator coord(&view, &cmd, [&clk]() { return clk; }, [](int) {});
+    JobConfig job;
+    job.count = 1000;
+    job.shard_unit_count = 250;  // -> 4 shards
+    job.master_poll_interval_ms = 1;
+    auto res = coord.RunSingleJob(job, "job-1");
+    Check(res.rc == 0, "master: job completes rc=0");
+    Check(res.snapshot.find("sent") && res.snapshot.find("sent")->as_int() == 1000,
+          "master: aggregated sent=1000");
+    Check(res.snapshot.find("shards_reported") &&
+              res.snapshot.find("shards_reported")->as_int() == 4,
+          "master: 4 shards reported");
+    Check(res.snapshot.find("inflight_shards_left")->as_int() == 0 &&
+              res.snapshot.find("pending_shards_left")->as_int() == 0,
+          "master: nothing left pending/inflight");
   }
 
 #ifdef SAMURAI_CONTROL_HAVE_ZMQ

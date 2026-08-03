@@ -138,8 +138,8 @@ Sıra: native karşılık kanıtlanmadan Python yol sökülmez.
   - [x] Increment 2: `jwt_claims` → `control/jwt.*` (OpenSSL HMAC-SHA256, core JSON); `telemetry` → `control/telemetry.*` (DistributedAggregator, saf rollup); `multimaster` → `control/multimaster.*` (KvStore soyutlaması + in-memory backend; hiredis-Redis ertelendi)
   - [~] Increment 3 (ZMQ transport — **KARAR: ZMQ, gRPC değil**; kod `control/` altında, `zmq/`'ye taşınmaz):
     - [x] 3a: transport çekirdeği — `control_wire` (JSON zarf), `control_auth` (interceptor: secret+JWT+RBAC+allowed-roles), `servicer` (8 RPC + worker registry), `control_server` (ZMQ ROUTER), `control_client` (ZMQ REQ, `Slave`/`Worker`); selftest'te uçtan-uca round-trip + RBAC doğrulandı
-    - [ ] 3b: `slave`/`master` orkestrasyon döngüleri (register/heartbeat/shard yaşam döngüsü, dispatch)
-    - [ ] 3c: `ha` (leader election/epoch) + `management_api` (HTTP) + RBAC audit zinciri
+    - [x] 3b: orkestrasyon state-machine'leri — `worker_shard_service` (slave: StartShard/StopShard/GetWorkerStatus + leader-epoch fencing + shard yaşam döngüsü, `ShardRunner` soyutlaması) ve `master_coordinator` (`_run_single_job`: shard split → dispatch → lost-worker rebalance → completion → aggregate, `MasterView`/`WorkerCommander` soyutlaması); fake'lerle test edildi
+    - [ ] 3c: register/heartbeat döngüleri + `ha` (leader election/epoch, 5 backend) + `management_api` (HTTP) + RBAC audit zinciri + arg-wired entrypoint'ler (gerçek `MasterView`/`WorkerCommander` adaptörleri)
   - [ ] Parity'de Python `control/*.py` toptan kaldırılır (henüz networked Python modülleri duruyor)
 - [ ] `licensing/` katmanı → native C/C++
 - [ ] Increment 3: SendAck/JsonDone/ConfigFromEnvelope + WorkerBase event-loop
