@@ -683,22 +683,9 @@ def get_extensions() -> List[Extension]:
     extensions: List[Extension] = []
     l4se_std_flag = "-std=c++23" if _env_flag("SAMURAI_L4SE_CXX23", "0") else "-std=c++20"
     project_root = os.path.abspath(os.path.dirname(__file__))
-    pybind11_include = os.path.join(project_root, "third_party", "pybind11", "include")
-
-    l4_state_engine = Extension(
-        "ddos_samurai.l4.state_engine",
-        sources=[
-            "ddos_samurai/l4/state_engine_module.cpp",
-            "ddos_samurai/l4/l4_state_engine_ffi.cpp",
-            "ddos_samurai/l4/l4_state_engine_core.cpp",
-            "ddos_samurai/l4/tcp_dataplane_ffi.cpp",
-            "ddos_samurai/l4/tcp_dataplane_core.cpp",
-        ],
-        language="c++",
-        extra_compile_args=["-O2", "-Wall", "-fPIC", l4se_std_flag],
-        extra_link_args=["-lpthread", "-lm"],
-    )
-    extensions.append(l4_state_engine)
+    # NOTE: the pybind `l4.state_engine` extension (and l4/ pybind cores)
+    # were removed: pybind is legacy; L4 state runs through the native ZMQ
+    # workers.
 
     # NOTE: the pybind `_scenario_native` extension and the Python
     # scenario_engine facade were removed: pybind is legacy, scenarios run
