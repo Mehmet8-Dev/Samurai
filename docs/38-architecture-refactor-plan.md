@@ -132,11 +132,12 @@ Sıra: native karşılık kanıtlanmadan Python yol sökülmez.
 - [x] `kpi_gate` + `reporting` native C++ olarak yeniden yaratıldı (`cli/`)
 - [x] `xdp*.c` → `ddos_samurai/xdp/` altına taşındı
 - [x] `utils.py` → native `core/` (log + net_utils + target_safety); `live_metrics.py` (orphan) kaldırıldı
+- [x] JSON altyapısı → `core/json.*` (parser+serializer, insertion-order object'ler)
 - [~] `control/` alt sistemi → native `samurai_control` (transport: ZMQ)
   - [x] Increment 1 (saf mantık): `shard` + `auth`(RBAC) + `autoscale`(karar makinesi) + `discovery`(manuel); selftest ile doğrulandı
-  - [ ] Increment 2: `jwt_claims` (JSON+OpenSSL HMAC), `telemetry`, `multimaster`
+  - [~] Increment 2: `jwt_claims` → `control/jwt.*` (OpenSSL HMAC-SHA256, core JSON) **[bitti]**; `telemetry`, `multimaster` sırada
   - [ ] Increment 3: ağ modülleri (`client`/`server`/`slave`/`master`/`ha`/`management_api`) → ZMQ transport
-  - [ ] Parity'de Python `control/*.py` toptan kaldırılır
+  - [ ] Parity'de Python `control/*.py` toptan kaldırılır (`jwt_claims.py` hâlâ `server.py`/`management_api.py` tarafından import ediliyor)
 - [ ] `licensing/` katmanı → native C/C++
 - [ ] Increment 3: SendAck/JsonDone/ConfigFromEnvelope + WorkerBase event-loop
 - [ ] `dataplane_core.c` + `fast_sender.c` (kanıtlı ölü) kaldırma

@@ -9,9 +9,13 @@
 #include <string>
 #include <vector>
 
+#include <ctime>
+
 #include "auth.hpp"
 #include "autoscale.hpp"
 #include "discovery.hpp"
+#include "json.hpp"
+#include "jwt.hpp"
 #include "shard.hpp"
 
 namespace {
@@ -137,6 +141,77 @@ int main() {
     clock += 6.0;
     auto d3 = ctl.MaybeScale(16, 0, 1);
     Check(d3.changed && d3.applied == 4, "autoscale: reaches desired after cooldown");
+  }
+
+  // --- json: parse / access / round-trip ---
+  {
+    namespace json = samurai::core::json;
+    auto r = json::Parse(R"({"a":1,"b":"two","c":[true,null,3.5],"n":{"x":-7}})");
+    Check(r.ok && r.value.is_object(), "json: parse object");
+    Check(r.value.find("a") && r.value.find("a")->as_int() == 1, "json: int field");
+    Check(r.value.find("b") && r.value.find("b")->as_string() == "two", "json: string field");
+    const auto* c = r.value.find("c");
+    Check(c && c->is_array() && c->elements().size() == 3, "json: array field");
+    Check(c && c->elements()[2].as_double() == 3.5, "json: nested double");
+    const auto* n = r.value.find("n");
+    Check(n && n->find("x") && n->find("x")->as_int() == -7, "json: nested object");
+    // round-trip: dump then re-parse yields the same int
+    auto r2 = json::Parse(r.value.dump());
+    Check(r2.ok && r2.value.find("a")->as_int() == 1, "json: dump/parse round-trip");
+    // trailing garbage is an error
+    Check(!json::Parse("{}x").ok, "json: trailing garbage rejected");
+    // escaping round-trips through dump/parse
+    auto esc = json::Parse(R"({"s":"a\"b\\c\n"})");
+    Check(esc.ok && esc.value.find("s")->as_string() == "a\"b\\c\n", "json: escapes decoded");
+  }
+
+  // --- jwt: HS256 encode/decode round-trip + verification ---
+  {
+    namespace json = samurai::core::json;
+    const std::string secret = "top-secret-key";
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+
+    json::Value claims = json::Value::Object();
+    claims.set("sub", json::Value::Str("admin"));
+    claims.set("role", json::Value::Str("operator"));
+    claims.set("exp", json::Value::Int(now + 3600));
+    claims.set("nbf", json::Value::Int(now - 10));
+
+    const std::string token = EncodeJwtHs256(claims, secret);
+    auto ok = DecodeJwtHs256(token, secret);
+    Check(ok.ok, "jwt: valid token decodes");
+    Check(ok.ok && ok.payload.find("sub") && ok.payload.find("sub")->as_string() == "admin",
+          "jwt: claims recovered");
+
+    // wrong secret -> signature mismatch
+    auto bad_secret = DecodeJwtHs256(token, "not-the-secret");
+    Check(!bad_secret.ok && bad_secret.error == "jwt signature mismatch",
+          "jwt: wrong secret rejected");
+
+    // tampered signature -> mismatch
+    std::string tampered = token;
+    tampered[tampered.size() - 1] = (tampered.back() == 'A') ? 'B' : 'A';
+    auto bad_sig = DecodeJwtHs256(tampered, secret);
+    Check(!bad_sig.ok && bad_sig.error == "jwt signature mismatch", "jwt: tampered signature rejected");
+
+    // expired token
+    json::Value expired = json::Value::Object();
+    expired.set("exp", json::Value::Int(now - 100));
+    auto exp_tok = EncodeJwtHs256(expired, secret);
+    Check(DecodeJwtHs256(exp_tok, secret).error == "jwt expired", "jwt: expired rejected");
+    // ...but accepted when verify_exp = false
+    Check(DecodeJwtHs256(exp_tok, secret, /*verify_exp=*/false).ok, "jwt: exp skipped when disabled");
+
+    // not-yet-valid token
+    json::Value future = json::Value::Object();
+    future.set("nbf", json::Value::Int(now + 1000));
+    auto nbf_tok = EncodeJwtHs256(future, secret);
+    Check(DecodeJwtHs256(nbf_tok, secret).error == "jwt not yet valid", "jwt: nbf rejected");
+
+    // malformed token
+    Check(DecodeJwtHs256("not.a.jwt.token", secret).error == "invalid jwt format",
+          "jwt: malformed rejected");
+    Check(DecodeJwtHs256("", secret).error == "empty token", "jwt: empty rejected");
   }
 
   if (g_failures == 0) {

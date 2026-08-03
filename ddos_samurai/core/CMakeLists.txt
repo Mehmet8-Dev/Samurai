@@ -6,10 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # samurai_core — shared native utility layer, the C++ replacement for the
-# generic helpers of the former ddos_samurai/utils.py:
+# generic helpers of the former ddos_samurai/utils.py, plus shared JSON:
 #   log.*           -> log_info/log_warning/log_error/log_critical + timestamp
 #   net_utils.*     -> get_local_ip / get_gateway_mac / mac_to_int
 #   target_safety.* -> validate_target_safety (allow/deny lists, public gate)
+#   json.*          -> minimal JSON value/parser/serializer for the control plane
 #
 # Consumed by the CLI/orchestrator today, and by the control/licensing layers as
 # they are ported off Python.
@@ -18,5 +19,6 @@ add_library(
   STATIC
   log.cpp
   net_utils.cpp
-  target_safety.cpp)
+  target_safety.cpp
+  json.cpp)
 target_include_directories(samurai_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
