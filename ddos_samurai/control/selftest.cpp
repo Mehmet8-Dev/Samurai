@@ -20,6 +20,11 @@
 #include "shard.hpp"
 #include "telemetry.hpp"
 
+#ifdef SAMURAI_CONTROL_HAVE_ZMQ
+#include "control_client.hpp"
+#include "control_server.hpp"
+#endif
+
 namespace {
 
 int g_failures = 0;
@@ -307,6 +312,84 @@ int main() {
     Check(!offline.Heartbeat(), "multimaster: offline heartbeat no-op");
     Check(!offline.Snapshot().find("enabled")->as_bool(), "multimaster: offline snapshot enabled=false");
   }
+
+#ifdef SAMURAI_CONTROL_HAVE_ZMQ
+  // --- control transport: ZMQ server<->client round trip (RPCs + auth) ---
+  {
+    namespace json = samurai::core::json;
+
+    // Cluster-secret auth, no RBAC.
+    ServicerConfig scfg;
+    scfg.cluster_id = "cluster-test";
+    Servicer servicer(scfg);
+    AuthConfig auth;
+    auth.expected_secret = "s3cr3t";
+    ControlServer server("tcp://127.0.0.1:*", &servicer, auth);
+    Check(server.Start(), "control: server starts");
+    const std::string ep = server.endpoint();
+    Check(!ep.empty(), "control: endpoint resolved");
+
+    SlaveControlClient slave(ep, "s3cr3t");
+    auto reg = slave.RegisterWorker("w1", "host1", {{"gpu_available", "1"}});
+    Check(reg.ok && reg.body.find("accepted") && reg.body.find("accepted")->as_bool(),
+          "control: RegisterWorker accepted");
+    Check(reg.body.find("cluster_id") && reg.body.find("cluster_id")->as_string() == "cluster-test",
+          "control: cluster_id echoed");
+
+    auto hb = slave.Heartbeat("w1", 1000);
+    Check(hb.ok && hb.body.find("acknowledged")->as_bool() &&
+              hb.body.find("command")->as_string() == "continue",
+          "control: Heartbeat ack for known worker");
+    auto hb2 = slave.Heartbeat("ghost", 1000);
+    Check(hb2.ok && !hb2.body.find("acknowledged")->as_bool() &&
+              hb2.body.find("command")->as_string() == "register",
+          "control: unknown worker told to register");
+
+    auto rs = slave.ReportStats("w1", "shard-1", "{\"sent\":42}", 123);
+    Check(rs.ok && rs.body.find("received")->as_bool(), "control: ReportStats received");
+
+    WorkerControlClient master(ep, "s3cr3t");
+    auto st = master.GetWorkerStatus("w1");
+    Check(st.ok && st.body.find("state")->as_string() == "idle", "control: GetWorkerStatus state");
+    Check(st.body.find("stats_json")->as_string() == "{\"sent\":42}",
+          "control: reported stats propagated to status");
+
+    // Wrong secret -> UNAUTHENTICATED.
+    SlaveControlClient bad(ep, "wrong-secret");
+    auto badreg = bad.RegisterWorker("w2", "host2", {});
+    Check(!badreg.ok && badreg.status == "UNAUTHENTICATED", "control: wrong secret rejected");
+
+    server.Stop();
+    Check(!server.running(), "control: server stops");
+  }
+
+  // --- control transport: RBAC per-RPC enforcement ---
+  {
+    Servicer servicer;  // no tenant, no jwt
+    AuthConfig auth;
+    auth.rbac_enabled = true;
+    auth.role_secrets = NormalizeRoleSecrets("ADMINSEC", "", "", "WORKERSEC");
+    ControlServer server("tcp://127.0.0.1:*", &servicer, auth);
+    Check(server.Start(), "rbac: server starts");
+    const std::string ep = server.endpoint();
+
+    // worker-role secret: may Register, may not AbortJob.
+    SlaveControlClient worker(ep, "WORKERSEC");
+    auto wr = worker.RegisterWorker("w1", "h", {});
+    Check(wr.ok && wr.body.find("accepted")->as_bool(), "rbac: worker may RegisterWorker");
+    WorkerControlClient worker_cmd(ep, "WORKERSEC");
+    auto forbidden = worker_cmd.AbortJob("job-1", "test");
+    Check(!forbidden.ok && forbidden.status == "PERMISSION_DENIED",
+          "rbac: worker forbidden from AbortJob");
+
+    // admin-role secret: may AbortJob.
+    WorkerControlClient admin(ep, "ADMINSEC");
+    auto aborted = admin.AbortJob("job-1", "test");
+    Check(aborted.ok && aborted.body.find("aborted")->as_bool(), "rbac: admin may AbortJob");
+
+    server.Stop();
+  }
+#endif  // SAMURAI_CONTROL_HAVE_ZMQ
 
   if (g_failures == 0) {
     std::printf("control selftest: all checks passed\n");

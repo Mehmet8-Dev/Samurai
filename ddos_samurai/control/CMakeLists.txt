@@ -6,32 +6,55 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(LIBZMQ QUIET libzmq)
+endif()
 
 # samurai_control — native control-plane layer, the C++ replacement for the
 # Python ddos_samurai/control package.
-#   shard.*       -> split_job_to_shards (equal/capability/region)
-#   auth.*        -> endpoint parsing, cluster-secret metadata, RBAC resolution
-#   autoscale.*   -> the K8s autoscale decision state machine (in-memory mode)
-#   discovery.*   -> manual endpoint discovery
-#   jwt.*         -> HS256 JWT decode/verify + encode (OpenSSL HMAC-SHA256)
-#   telemetry.*   -> DistributedAggregator (per-shard/worker/region rollups)
-#   multimaster.* -> cross-region coordinator over a KvStore backend
-#                    (in-memory now; hiredis-backed Redis deferred)
+#   shard.*         -> split_job_to_shards (equal/capability/region)
+#   auth.*          -> endpoint parsing, cluster-secret metadata, RBAC resolution
+#   autoscale.*     -> the K8s autoscale decision state machine (in-memory mode)
+#   discovery.*     -> manual endpoint discovery
+#   jwt.*           -> HS256 JWT decode/verify + encode (OpenSSL HMAC-SHA256)
+#   telemetry.*     -> DistributedAggregator (per-shard/worker/region rollups)
+#   multimaster.*   -> cross-region coordinator over a KvStore backend
+#   control_auth.*  -> server-side RBAC/secret/JWT authorization (interceptor)
+#   servicer.*      -> master control service (worker registry + 8 RPCs)
+#   control_server/client.* -> ZMQ transport (built only when libzmq is present)
 #
-# Networked modules (client/server/slave/master/ha/management_api) are ported in
-# a later increment, using the ZMQ transport that the workers already speak.
-add_library(
-  samurai_control
-  STATIC
+# Remaining networked modules (slave/master orchestration, ha, management_api)
+# land in later increments on top of this transport.
+set(CONTROL_SOURCES
   shard.cpp
   auth.cpp
   autoscale.cpp
   discovery.cpp
   jwt.cpp
   telemetry.cpp
-  multimaster.cpp)
+  multimaster.cpp
+  control_auth.cpp
+  servicer.cpp)
+
+if(LIBZMQ_FOUND)
+  list(APPEND CONTROL_SOURCES control_server.cpp control_client.cpp)
+else()
+  message(WARNING "libzmq not found: native control ZMQ transport will not be built.")
+endif()
+
+add_library(samurai_control STATIC ${CONTROL_SOURCES})
 target_include_directories(samurai_control PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(samurai_control PUBLIC samurai_core PRIVATE OpenSSL::Crypto)
+target_link_libraries(samurai_control PUBLIC samurai_core Threads::Threads PRIVATE OpenSSL::Crypto)
+
+if(LIBZMQ_FOUND)
+  target_include_directories(samurai_control PRIVATE ${LIBZMQ_INCLUDE_DIRS})
+  target_link_directories(samurai_control PUBLIC ${LIBZMQ_LIBRARY_DIRS})
+  target_link_libraries(samurai_control PUBLIC ${LIBZMQ_LIBRARIES})
+  target_compile_options(samurai_control PRIVATE ${LIBZMQ_CFLAGS_OTHER})
+  target_compile_definitions(samurai_control PUBLIC SAMURAI_CONTROL_HAVE_ZMQ=1)
+endif()
 
 # Self-test driver: verifies the ported logic matches the Python contract.
 add_executable(samurai_control_selftest selftest.cpp)

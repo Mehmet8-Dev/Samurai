@@ -136,8 +136,11 @@ Sıra: native karşılık kanıtlanmadan Python yol sökülmez.
 - [~] `control/` alt sistemi → native `samurai_control` (transport: ZMQ)
   - [x] Increment 1 (saf mantık): `shard` + `auth`(RBAC) + `autoscale`(karar makinesi) + `discovery`(manuel); selftest ile doğrulandı
   - [x] Increment 2: `jwt_claims` → `control/jwt.*` (OpenSSL HMAC-SHA256, core JSON); `telemetry` → `control/telemetry.*` (DistributedAggregator, saf rollup); `multimaster` → `control/multimaster.*` (KvStore soyutlaması + in-memory backend; hiredis-Redis ertelendi)
-  - [ ] Increment 3: ağ modülleri (`client`/`server`/`slave`/`master`/`ha`/`management_api`) → ZMQ transport
-  - [ ] Parity'de Python `control/*.py` toptan kaldırılır (`jwt_claims.py` hâlâ `server.py`/`management_api.py` tarafından import ediliyor)
+  - [~] Increment 3 (ZMQ transport — **KARAR: ZMQ, gRPC değil**; kod `control/` altında, `zmq/`'ye taşınmaz):
+    - [x] 3a: transport çekirdeği — `control_wire` (JSON zarf), `control_auth` (interceptor: secret+JWT+RBAC+allowed-roles), `servicer` (8 RPC + worker registry), `control_server` (ZMQ ROUTER), `control_client` (ZMQ REQ, `Slave`/`Worker`); selftest'te uçtan-uca round-trip + RBAC doğrulandı
+    - [ ] 3b: `slave`/`master` orkestrasyon döngüleri (register/heartbeat/shard yaşam döngüsü, dispatch)
+    - [ ] 3c: `ha` (leader election/epoch) + `management_api` (HTTP) + RBAC audit zinciri
+  - [ ] Parity'de Python `control/*.py` toptan kaldırılır (henüz networked Python modülleri duruyor)
 - [ ] `licensing/` katmanı → native C/C++
 - [ ] Increment 3: SendAck/JsonDone/ConfigFromEnvelope + WorkerBase event-loop
 - [ ] `dataplane_core.c` + `fast_sender.c` (kanıtlı ölü) kaldırma
