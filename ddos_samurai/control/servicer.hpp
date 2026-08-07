@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "json.hpp"
 
@@ -57,6 +58,17 @@ class Servicer : public ControlService {
   // Reject ReportStats carrying a stale leader epoch (< min). 0 disables.
   void set_leader_epoch_min(std::int64_t epoch);
   std::size_t worker_count() const;
+
+  // Read-side accessors used by the master coordinator's MasterView adapter.
+  struct WorkerSnapshot {
+    std::string worker_id;
+    std::map<std::string, std::string> capabilities;
+    std::int64_t last_heartbeat_ms = 0;
+  };
+  std::vector<WorkerSnapshot> SnapshotWorkers() const;
+  bool HasShardStats(const std::string& shard_id) const;
+  std::string GetShardStatsRaw(const std::string& shard_id) const;  // "{}" if none
+  void SetShardStatsRaw(const std::string& shard_id, const std::string& stats_json);
 
  private:
   struct WorkerRec {

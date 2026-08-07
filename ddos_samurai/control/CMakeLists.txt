@@ -52,7 +52,11 @@ set(CONTROL_SOURCES
   management_api.cpp)
 
 if(LIBZMQ_FOUND)
-  list(APPEND CONTROL_SOURCES control_server.cpp control_client.cpp)
+  list(APPEND CONTROL_SOURCES
+    control_server.cpp
+    control_client.cpp
+    master_adapters.cpp   # Servicer->MasterView + WorkerControlClient->WorkerCommander
+    slave_node.cpp)       # register/heartbeat orchestration loop
 else()
   message(WARNING "libzmq not found: native control ZMQ transport will not be built.")
 endif()

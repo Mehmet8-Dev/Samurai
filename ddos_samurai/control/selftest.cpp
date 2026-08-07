@@ -35,6 +35,8 @@
 #ifdef SAMURAI_CONTROL_HAVE_ZMQ
 #include "control_client.hpp"
 #include "control_server.hpp"
+#include "master_adapters.hpp"
+#include "slave_node.hpp"
 #endif
 
 namespace {
@@ -707,6 +709,56 @@ int main() {
     Check(aborted.ok && aborted.body.find("aborted")->as_bool(), "rbac: admin may AbortJob");
 
     server.Stop();
+  }
+
+  // --- full distributed round trip: slave register/heartbeat + master
+  //     coordinator dispatch over the real ZMQ transport ---
+  {
+    namespace json = samurai::core::json;
+    AuthConfig no_auth;  // inactive (no secret, no rbac)
+
+    // Master: servicer + control server.
+    ServicerConfig scfg;
+    scfg.cluster_id = "cluster-int";
+    Servicer master_svc(scfg);
+    ControlServer master_server("tcp://127.0.0.1:*", &master_svc, no_auth);
+    Check(master_server.Start(), "int: master server up");
+    const std::string em = master_server.endpoint();
+
+    // Worker: shard service + control server.
+    InMemoryShardRunner runner;
+    WorkerShardService worker_svc("w1", &runner);
+    ControlServer worker_server("tcp://127.0.0.1:*", &worker_svc, no_auth);
+    Check(worker_server.Start(), "int: worker server up");
+    const std::string ew = worker_server.endpoint();
+
+    // Slave registers with the master, advertising its control endpoint.
+    SlaveControlClient slave_client(em);
+    SlaveConfig slcfg;
+    slcfg.worker_id = "w1";
+    slcfg.capabilities["control_endpoint"] = ew;
+    SlaveNode slave(&slave_client, slcfg);
+    Check(slave.Register(), "int: slave registers with master");
+    auto hb = slave.HeartbeatOnce();
+    Check(hb.ok && hb.acknowledged, "int: slave heartbeat acknowledged");
+    Check(master_svc.worker_count() == 1, "int: master registry has the worker");
+
+    // Master dispatches a job; the worker runs the shards; master aggregates.
+    ServicerMasterView view(&master_svc);
+    ClientWorkerCommander cmd;
+    MasterCoordinator coord(&view, &cmd);
+    JobConfig job;
+    job.count = 1000;
+    job.shard_unit_count = 250;  // -> 4 shards, all to the single worker
+    job.master_poll_interval_ms = 10;
+    auto res = coord.RunSingleJob(job, "jobI");
+    Check(res.rc == 0, "int: distributed job completes rc=0");
+    Check(res.snapshot.find("sent") && res.snapshot.find("sent")->as_int() == 1000,
+          "int: aggregated sent=1000 across the cluster");
+    Check(res.snapshot.find("shards_reported")->as_int() == 4, "int: 4 shards reported");
+
+    worker_server.Stop();
+    master_server.Stop();
   }
 #endif  // SAMURAI_CONTROL_HAVE_ZMQ
 

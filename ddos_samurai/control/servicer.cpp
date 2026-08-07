@@ -50,6 +50,36 @@ std::size_t Servicer::worker_count() const {
   return workers_.size();
 }
 
+std::vector<Servicer::WorkerSnapshot> Servicer::SnapshotWorkers() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  std::vector<WorkerSnapshot> out;
+  out.reserve(workers_.size());
+  for (const auto& kv : workers_) {
+    WorkerSnapshot s;
+    s.worker_id = kv.second.worker_id;
+    s.capabilities = kv.second.capabilities;
+    s.last_heartbeat_ms = kv.second.last_heartbeat_ms;
+    out.push_back(std::move(s));
+  }
+  return out;
+}
+
+bool Servicer::HasShardStats(const std::string& shard_id) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return shard_stats_.find(shard_id) != shard_stats_.end();
+}
+
+std::string Servicer::GetShardStatsRaw(const std::string& shard_id) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = shard_stats_.find(shard_id);
+  return it == shard_stats_.end() ? std::string("{}") : it->second;
+}
+
+void Servicer::SetShardStatsRaw(const std::string& shard_id, const std::string& stats_json) {
+  std::lock_guard<std::mutex> lk(mu_);
+  shard_stats_[shard_id] = stats_json;
+}
+
 std::string Servicer::TenantFromContext(const RpcContext& ctx) const {
   if (ctx.meta == nullptr) return "";
   const std::string raw = Strip(StrField(*ctx.meta, "x-tenant-namespace"));
