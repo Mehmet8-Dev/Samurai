@@ -14,6 +14,7 @@
 #include "auth.hpp"
 #include "autoscale.hpp"
 #include "discovery.hpp"
+#include "ha.hpp"
 #include "json.hpp"
 #include "jwt.hpp"
 #include "master_coordinator.hpp"
@@ -198,9 +199,11 @@ int main() {
     Check(!bad_secret.ok && bad_secret.error == "jwt signature mismatch",
           "jwt: wrong secret rejected");
 
-    // tampered signature -> mismatch
+    // tampered signature -> mismatch. Flip the FIRST signature char (all real
+    // bits); the last char only carries discarded padding bits.
     std::string tampered = token;
-    tampered[tampered.size() - 1] = (tampered.back() == 'A') ? 'B' : 'A';
+    const auto sig_dot = tampered.rfind('.');
+    tampered[sig_dot + 1] = (tampered[sig_dot + 1] == 'A') ? 'B' : 'A';
     auto bad_sig = DecodeJwtHs256(tampered, secret);
     Check(!bad_sig.ok && bad_sig.error == "jwt signature mismatch", "jwt: tampered signature rejected");
 
@@ -314,6 +317,31 @@ int main() {
     Check(!offline.active(), "multimaster: null store -> inactive");
     Check(!offline.Heartbeat(), "multimaster: offline heartbeat no-op");
     Check(!offline.Snapshot().find("enabled")->as_bool(), "multimaster: offline snapshot enabled=false");
+  }
+
+  // --- ha: static + file-lease leader election ---
+  {
+    // Static: lexical-min node id wins.
+    StaticLeaderElector a("node-a", "node-b,node-c");
+    StaticLeaderElector b("node-b", "node-a,node-c");
+    Check(a.IsLeader(), "ha: static lexical-min is leader");
+    Check(!b.IsLeader(), "ha: static non-min is follower");
+    Check(a.Snapshot().find("leader_id")->as_string() == "node-a", "ha: static leader_id");
+
+    // File-lease: first acquirer holds; second is blocked until release.
+    const std::string lease =
+        "/tmp/claude-0/-home-user-Samurai/e22cf02a-7f79-5de1-b1eb-8cd527ed8d7d/scratchpad/ha_lease.json";
+    std::remove(lease.c_str());
+    FileLeaseLeaderElector e1("n1", lease, 30.0);
+    FileLeaseLeaderElector e2("n2", lease, 30.0);
+    Check(e1.TryAcquire() && e1.IsLeader(), "ha: file-lease first acquires");
+    Check(!e2.TryAcquire() && !e2.IsLeader(), "ha: file-lease second blocked");
+    Check(e1.RenewOnce(), "ha: file-lease owner renews");
+    Check(e1.Snapshot().find("leader_id")->as_string() == "n1", "ha: file-lease leader_id");
+    e1.Release();
+    Check(e2.TryAcquire() && e2.IsLeader(), "ha: file-lease acquirable after release");
+    e2.Release();
+    std::remove(lease.c_str());
   }
 
   // --- slave: worker shard service lifecycle ---

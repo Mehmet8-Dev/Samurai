@@ -26,9 +26,11 @@ endif()
 #   worker_shard_service.* -> slave-side shard lifecycle service (StartShard/
 #                    StopShard/GetWorkerStatus + leader-epoch fencing)
 #   master_coordinator.*   -> master job dispatch state machine (_run_single_job)
+#   ha.*            -> leader election: static + file-lease electors (redis/etcd/
+#                    raft electors deferred)
 #   control_server/client.* -> ZMQ transport (built only when libzmq is present)
 #
-# Remaining networked pieces (register/heartbeat loops, ha electors,
+# Remaining networked pieces (register/heartbeat loops, redis/etcd/raft electors,
 # management_api, arg-wired entrypoints) land in a later increment.
 set(CONTROL_SOURCES
   shard.cpp
@@ -41,7 +43,8 @@ set(CONTROL_SOURCES
   control_auth.cpp
   servicer.cpp
   worker_shard_service.cpp
-  master_coordinator.cpp)
+  master_coordinator.cpp
+  ha.cpp)
 
 if(LIBZMQ_FOUND)
   list(APPEND CONTROL_SOURCES control_server.cpp control_client.cpp)
