@@ -21,3 +21,7 @@ add_subdirectory(control)
 add_subdirectory(licensing)
 add_subdirectory(zmq)
 add_subdirectory(cli)
+# Toolchain-gated optional backends (CUDA/DPDK/AF_XDP/DOCA), the CMake
+# replacement for setup.py's OptionalBuildExt; each skips cleanly when its
+# toolchain is absent.
+add_subdirectory(optional)
