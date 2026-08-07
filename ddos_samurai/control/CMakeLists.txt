@@ -76,3 +76,8 @@ endif()
 # Self-test driver: verifies the ported logic matches the Python contract.
 add_executable(samurai_control_selftest selftest.cpp)
 target_link_libraries(samurai_control_selftest PRIVATE samurai_control)
+
+# Native control daemons (samurai_master / samurai_slave) — need the ZMQ transport.
+if(LIBZMQ_FOUND)
+  add_subdirectory(daemon)
+endif()

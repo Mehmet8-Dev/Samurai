@@ -144,8 +144,9 @@ Sıra: native karşılık kanıtlanmadan Python yol sökülmez.
       - [x] RBAC audit zinciri → `control/audit_log.*` (SHA256 hash-chain, sort_keys JSON, tamper-detect); selftest ile doğrulandı
       - [x] `management_api` → `control/management_api.*` (native HTTP/1.1 sunucu: /healthz, /v1/cluster/{summary,workers,shards,events}, /v1/jobs/abort, /metrics + trusted-identity/bearer/JWT auth, tenant filtreleme); SSE/WebSocket stream'ler ertelendi
       - [x] register/heartbeat orkestrasyon (`slave_node.*` — `SlaveNode` Register-retry + heartbeat/re-register) + gerçek adaptörler (`master_adapters.*` — `ServicerMasterView` + `ClientWorkerCommander`); **uçtan-uca entegrasyon testi**: slave gerçek ZMQ üstünden master'a register/heartbeat, master coordinator 4 shard'ı worker'a dağıtıyor, worker çalıştırıyor, master sent=1000'e aggregate ediyor (5/5 stabil)
+      - [x] arg-wired daemon entrypoint'leri: `samurai_master` + `samurai_slave` (`control/daemon/`); slave `SupervisorShardRunner` ile shard'ları native worker supervisor'a bağlıyor. **Canlı dağıtık çalıştırma doğrulandı:** master+slave daemon'ları + gerçek ZMQ transport + gerçek `cpu_worker` → 200 paket / 2 shard, sent=200 errors=0 rc=0
       - [ ] `ha` redis/etcd elector'ları (dış servis, ertelendi) + native Raft elector (~600 satır konsensüs, ayrı increment)
-      - [ ] arg-wired daemon entrypoint'leri (`run_distributed_slave`/`master` — args→config; server/servicer/coordinator/ha/mgmt/audit'i bağlayan main'ler) → sonra Python `control/*.py` toptan kaldırılır
+      - [ ] Python `control/*.py` toptan kaldırılır (raft hariç native parity sağlandı; raft opsiyonel HA modu, ayrı ele alınır)
   - [ ] Parity'de Python `control/*.py` toptan kaldırılır (henüz networked Python modülleri duruyor)
 - [ ] `licensing/` katmanı → native C/C++
 - [ ] Increment 3: SendAck/JsonDone/ConfigFromEnvelope + WorkerBase event-loop
