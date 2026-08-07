@@ -18,5 +18,6 @@ project(samurai_native LANGUAGES C CXX)
 # launcher/orchestrator/CLI path.
 add_subdirectory(core)
 add_subdirectory(control)
+add_subdirectory(licensing)
 add_subdirectory(zmq)
 add_subdirectory(cli)

@@ -148,7 +148,9 @@ Sıra: native karşılık kanıtlanmadan Python yol sökülmez.
       - [ ] `ha` redis/etcd elector'ları (dış servis, ertelendi) + native Raft elector (~600 satır konsensüs, ayrı increment)
       - [ ] Python `control/*.py` toptan kaldırılır (raft hariç native parity sağlandı; raft opsiyonel HA modu, ayrı ele alınır)
   - [ ] Parity'de Python `control/*.py` toptan kaldırılır (henüz networked Python modülleri duruyor)
-- [ ] `licensing/` katmanı → native C/C++
+- [~] `licensing/` katmanı → native `samurai_license`
+  - [x] Offline çekirdek: `license_types`(tier/feature/limit) + `constants` + `hwid`(SHA-256) + `gates`(feature-gate enforcement, exec-grant client soyut) + `cache`(AES-256-GCM offline cache); selftest ile doğrulandı
+  - [ ] HTTP(S) license client (validate/heartbeat/exec-grant) + updater — native HTTPS client yok, ertelendi
 - [ ] Increment 3: SendAck/JsonDone/ConfigFromEnvelope + WorkerBase event-loop
 - [ ] `dataplane_core.c` + `fast_sender.c` (kanıtlı ölü) kaldırma
 - [ ] doca/gpu worker .cpp monolit dekompozisyonu (burada doğrulanabilir)
