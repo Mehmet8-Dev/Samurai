@@ -13,6 +13,10 @@
 #include <fstream>
 #include <sstream>
 
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include "audit_log.hpp"
 #include "auth.hpp"
 #include "autoscale.hpp"
@@ -20,6 +24,7 @@
 #include "ha.hpp"
 #include "json.hpp"
 #include "jwt.hpp"
+#include "management_api.hpp"
 #include "master_coordinator.hpp"
 #include "multimaster.hpp"
 #include "shard.hpp"
@@ -47,6 +52,28 @@ std::uint64_t Sum(const std::vector<samurai::control::Shard>& shards) {
   std::uint64_t t = 0;
   for (const auto& s : shards) t += s.packet_count;
   return t;
+}
+
+// Minimal HTTP round trip to 127.0.0.1:<port>; returns the raw response ("" on
+// failure).
+std::string HttpRequestRaw(int port, const std::string& raw_request) {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return "";
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  timeval tv{3, 0};
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  std::string resp;
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+      ::send(fd, raw_request.data(), raw_request.size(), 0) >= 0) {
+    char buf[4096];
+    ssize_t n;
+    while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0) resp.append(buf, static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  return resp;
 }
 
 }  // namespace
@@ -320,6 +347,95 @@ int main() {
     Check(!offline.active(), "multimaster: null store -> inactive");
     Check(!offline.Heartbeat(), "multimaster: offline heartbeat no-op");
     Check(!offline.Snapshot().find("enabled")->as_bool(), "multimaster: offline snapshot enabled=false");
+  }
+
+  // --- management api: router auth + endpoints + one socket round trip ---
+  {
+    namespace json = samurai::core::json;
+
+    // state_provider: two workers (one tenantless, one under "t1").
+    auto state = []() {
+      json::Value st = json::Value::Object();
+      json::Value workers = json::Value::Array();
+      json::Value w1 = json::Value::Object();
+      w1.set("worker_id", json::Value::Str("w1"));
+      w1.set("tenant_namespace", json::Value::Str(""));
+      json::Value w2 = json::Value::Object();
+      w2.set("worker_id", json::Value::Str("w2"));
+      w2.set("tenant_namespace", json::Value::Str("t1"));
+      workers.push_back(w1);
+      workers.push_back(w2);
+      st.set("workers", std::move(workers));
+      return st;
+    };
+    ManagementConfig cfg;
+    cfg.role_tokens["admin"] = "ADM";
+    cfg.role_tokens["viewer"] = "VIEW";
+    ManagementProviders providers;
+    providers.state_provider = state;
+    providers.abort_callback = []() {
+      json::Value r = json::Value::Object();
+      r.set("aborted", json::Value::Bool(true));
+      r.set("workers_notified", json::Value::Int(3));
+      return r;
+    };
+    providers.metrics_provider = []() { return std::string("samurai_up 1\n"); };
+    ManagementApi api(cfg, providers);
+
+    auto req = [](const std::string& method, const std::string& path, const std::string& authz) {
+      HttpRequest r;
+      r.method = method;
+      r.path = path;
+      if (!authz.empty()) r.headers["authorization"] = authz;
+      return r;
+    };
+
+    Check(api.Handle(req("GET", "/healthz", "")).status == 200, "mgmt: healthz open");
+    // viewer token can read summary
+    auto sum = api.Handle(req("GET", "/v1/cluster/summary", "Bearer VIEW"));
+    Check(sum.status == 200, "mgmt: viewer reads summary");
+    auto sumj = json::Parse(sum.body);
+    Check(sumj.ok && sumj.value.find("workers_count")->as_int() == 2,
+          "mgmt: summary counts both workers (no tenant filter)");
+    // no auth -> 401
+    Check(api.Handle(req("GET", "/v1/cluster/summary", "")).status == 401,
+          "mgmt: missing token unauthorized");
+    // viewer cannot abort -> 403
+    Check(api.Handle(req("POST", "/v1/jobs/abort", "Bearer VIEW")).status == 403,
+          "mgmt: viewer forbidden from abort");
+    // admin can abort -> 200
+    auto ab = api.Handle(req("POST", "/v1/jobs/abort", "Bearer ADM"));
+    Check(ab.status == 200 && json::Parse(ab.body).value.find("aborted")->as_bool(),
+          "mgmt: admin aborts");
+    // workers endpoint lists workers
+    auto wk = api.Handle(req("GET", "/v1/cluster/workers", "Bearer ADM"));
+    Check(wk.status == 200 && json::Parse(wk.body).value.find("workers")->elements().size() == 2,
+          "mgmt: workers endpoint lists both");
+    // metrics (viewer+)
+    auto mx = api.Handle(req("GET", "/metrics", "Bearer VIEW"));
+    Check(mx.status == 200 && mx.body == "samurai_up 1\n", "mgmt: metrics text");
+    Check(api.Handle(req("GET", "/nope", "Bearer ADM")).status == 404, "mgmt: unknown path 404");
+
+    // ParseHttpRequest sanity (query + headers).
+    HttpRequest parsed;
+    Check(ParseHttpRequest("GET /v1/cluster/summary?tenant_namespace=t1 HTTP/1.1\r\n"
+                           "Authorization: Bearer X\r\n\r\n",
+                           parsed) &&
+              parsed.path == "/v1/cluster/summary" && parsed.query["tenant_namespace"] == "t1" &&
+              parsed.headers["authorization"] == "Bearer X",
+          "mgmt: request parser");
+
+    // End-to-end over a real socket.
+    ManagementApiServer server("127.0.0.1:0", cfg, providers);
+    Check(server.Start(), "mgmt: server starts");
+    const std::string ep = server.endpoint();
+    const int port = std::atoi(ep.substr(ep.rfind(':') + 1).c_str());
+    const std::string resp =
+        HttpRequestRaw(port, "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    Check(resp.find("200 OK") != std::string::npos && resp.find("\"status\":\"ok\"") != std::string::npos,
+          "mgmt: socket round trip healthz 200");
+    server.Stop();
+    Check(!server.running(), "mgmt: server stops");
   }
 
   // --- audit: RBAC tamper-evident hash chain ---
