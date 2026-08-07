@@ -1,11 +1,13 @@
 #include "json.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 namespace samurai::core::json {
 
@@ -132,7 +134,7 @@ void DumpString(const std::string& s, std::string& out) {
   out.push_back('"');
 }
 
-void DumpValue(const Value& v, std::string& out) {
+void DumpValue(const Value& v, std::string& out, bool sort_keys) {
   switch (v.type()) {
     case Value::Type::Null:
       out += "null";
@@ -163,20 +165,37 @@ void DumpValue(const Value& v, std::string& out) {
       for (const auto& e : v.elements()) {
         if (!first) out.push_back(',');
         first = false;
-        DumpValue(e, out);
+        DumpValue(e, out, sort_keys);
       }
       out.push_back(']');
       break;
     }
     case Value::Type::Object: {
       out.push_back('{');
-      bool first = true;
-      for (const auto& kv : v.members()) {
-        if (!first) out.push_back(',');
-        first = false;
-        DumpString(kv.first, out);
-        out.push_back(':');
-        DumpValue(kv.second, out);
+      const auto& members = v.members();
+      if (sort_keys) {
+        std::vector<const std::pair<std::string, Value>*> ptrs;
+        ptrs.reserve(members.size());
+        for (const auto& kv : members) ptrs.push_back(&kv);
+        std::sort(ptrs.begin(), ptrs.end(),
+                  [](const auto* a, const auto* b) { return a->first < b->first; });
+        bool first = true;
+        for (const auto* kv : ptrs) {
+          if (!first) out.push_back(',');
+          first = false;
+          DumpString(kv->first, out);
+          out.push_back(':');
+          DumpValue(kv->second, out, sort_keys);
+        }
+      } else {
+        bool first = true;
+        for (const auto& kv : members) {
+          if (!first) out.push_back(',');
+          first = false;
+          DumpString(kv.first, out);
+          out.push_back(':');
+          DumpValue(kv.second, out, sort_keys);
+        }
       }
       out.push_back('}');
       break;
@@ -186,9 +205,9 @@ void DumpValue(const Value& v, std::string& out) {
 
 }  // namespace
 
-std::string Value::dump() const {
+std::string Value::dump(bool sort_keys) const {
   std::string out;
-  DumpValue(*this, out);
+  DumpValue(*this, out, sort_keys);
   return out;
 }
 

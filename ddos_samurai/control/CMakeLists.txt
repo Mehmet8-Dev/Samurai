@@ -28,6 +28,7 @@ endif()
 #   master_coordinator.*   -> master job dispatch state machine (_run_single_job)
 #   ha.*            -> leader election: static + file-lease electors (redis/etcd/
 #                    raft electors deferred)
+#   audit_log.*     -> RBAC audit chain (SHA256 hash-chained, tamper-evident)
 #   control_server/client.* -> ZMQ transport (built only when libzmq is present)
 #
 # Remaining networked pieces (register/heartbeat loops, redis/etcd/raft electors,
@@ -44,7 +45,8 @@ set(CONTROL_SOURCES
   servicer.cpp
   worker_shard_service.cpp
   master_coordinator.cpp
-  ha.cpp)
+  ha.cpp
+  audit_log.cpp)
 
 if(LIBZMQ_FOUND)
   list(APPEND CONTROL_SOURCES control_server.cpp control_client.cpp)

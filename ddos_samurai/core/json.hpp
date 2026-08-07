@@ -56,8 +56,10 @@ class Value {
   const std::vector<Value>& elements() const { return arr_; }
 
   // Compact serialization (separators ",", ":"), matching Python
-  // json.dumps(..., separators=(",", ":")).
-  std::string dump() const;
+  // json.dumps(..., separators=(",", ":")). With sort_keys, object keys are
+  // emitted in lexicographic (byte) order at every level — matching Python
+  // json.dumps(..., sort_keys=True) for deterministic hashing.
+  std::string dump(bool sort_keys = false) const;
 
  private:
   Type type_ = Type::Null;

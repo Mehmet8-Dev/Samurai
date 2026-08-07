@@ -10,7 +10,10 @@
 #include <vector>
 
 #include <ctime>
+#include <fstream>
+#include <sstream>
 
+#include "audit_log.hpp"
 #include "auth.hpp"
 #include "autoscale.hpp"
 #include "discovery.hpp"
@@ -317,6 +320,62 @@ int main() {
     Check(!offline.active(), "multimaster: null store -> inactive");
     Check(!offline.Heartbeat(), "multimaster: offline heartbeat no-op");
     Check(!offline.Snapshot().find("enabled")->as_bool(), "multimaster: offline snapshot enabled=false");
+  }
+
+  // --- audit: RBAC tamper-evident hash chain ---
+  {
+    namespace json = samurai::core::json;
+    const std::string path =
+        "/tmp/claude-0/-home-user-Samurai/e22cf02a-7f79-5de1-b1eb-8cd527ed8d7d/scratchpad/rbac_audit.log";
+    std::remove(path.c_str());
+    auto mk = [](const char* rpc, int allowed, const char* role) {
+      json::Value v = json::Value::Object();
+      v.set("rpc", json::Value::Str(rpc));
+      v.set("allowed", json::Value::Int(allowed));
+      v.set("role", json::Value::Str(role));
+      return v;
+    };
+    {
+      RbacAuditLog log(path);
+      Check(log.Append(mk("AbortJob", 0, "worker")), "audit: append 1");
+      Check(log.Append(mk("RegisterWorker", 1, "worker")), "audit: append 2");
+      Check(log.Append(mk("StartShard", 1, "operator")), "audit: append 3");
+    }
+    Check(RbacAuditLog::Verify(path).ok, "audit: chain verifies");
+
+    // Reopen: continues the chain from the last hash.
+    std::string last_hash;
+    {
+      std::ifstream f(path);
+      std::string line, l;
+      while (std::getline(f, line)) {
+        if (!line.empty()) l = line;
+      }
+      auto p = json::Parse(l);
+      last_hash = p.value.find("entry_hash")->as_string("");
+    }
+    {
+      RbacAuditLog log2(path);
+      Check(log2.prev_hash() == last_hash, "audit: reopen loads last hash");
+      Check(log2.Append(mk("Heartbeat", 1, "worker")), "audit: append after reopen");
+    }
+    Check(RbacAuditLog::Verify(path).ok, "audit: verifies after reopen append");
+
+    // Tamper: edit a field without recomputing the hash -> verification breaks.
+    {
+      std::ifstream in(path);
+      std::stringstream ss;
+      ss << in.rdbuf();
+      std::string content = ss.str();
+      const auto pos = content.find("AbortJob");
+      if (pos != std::string::npos) content.replace(pos, 8, "HackedJb");  // same length
+      std::ofstream out(path, std::ios::trunc);
+      out << content;
+    }
+    auto tampered = RbacAuditLog::Verify(path);
+    Check(!tampered.ok && tampered.error.find("entry_hash mismatch") != std::string::npos,
+          "audit: tampered entry detected");
+    std::remove(path.c_str());
   }
 
   // --- ha: static + file-lease leader election ---
