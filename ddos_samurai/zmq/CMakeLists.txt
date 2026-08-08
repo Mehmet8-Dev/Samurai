@@ -16,6 +16,18 @@ if(NOT LIBZMQ_FOUND)
   return()
 endif()
 
+# Native engine libraries consumed by the workers. They no longer ship as
+# pybind extensions; the ZMQ daemons link them directly as static libs.
+# When this file is configured as part of the root samurai_native tree, the
+# engines are already owned by that tree (core/l4/l7_emu/scenario are added
+# at the top level); only the standalone zmq build pulls them in here.
+if(NOT SAMURAI_ENGINES_OWNED_BY_ROOT)
+  add_subdirectory(../core core)
+  add_subdirectory(../scenario_engine_native scenario_engine_native)
+  add_subdirectory(../l4 l4)
+  add_subdirectory(../l7_emu_native l7_emu_native)
+endif()
+
 add_library(
   pacing_engine_static
   STATIC
@@ -63,8 +75,8 @@ target_link_libraries(samurai_afxdp_worker PRIVATE pacing_engine_static cpu_nati
 add_samurai_worker(samurai_doca_worker daemon/doca_gpunetio_worker.cpp)
 target_link_libraries(samurai_doca_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)
 add_samurai_worker(samurai_l7_worker daemon/l7_worker.cpp)
-target_link_libraries(samurai_l7_worker PRIVATE pacing_engine_static pthread)
+target_link_libraries(samurai_l7_worker PRIVATE pacing_engine_static samurai_l7emu pthread)
 add_samurai_worker(samurai_defense_worker daemon/defense_worker.cpp)
 target_link_libraries(samurai_defense_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)
 add_samurai_worker(samurai_scenario_worker daemon/scenario_worker.cpp)
-target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_native_static pthread)
+target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_native_static samurai_scenario pthread)

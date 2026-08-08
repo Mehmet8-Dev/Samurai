@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -18,6 +19,11 @@
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
 #include "worker_common.hpp"
+
+#include "compiler.hpp"
+#include "json.hpp"
+#include "scheduler.hpp"
+#include "sla.hpp"
 
 namespace {
 using samurai::daemon::OptionalIntFromWire;
@@ -137,6 +143,9 @@ std::vector<std::uint8_t> JsonDone(
     std::uint64_t scenario_payload_bytes,
     std::uint64_t scenario_steps_est,
     std::uint64_t scenario_flows_est,
+    std::uint64_t scenario_sessions,
+    const std::string& scenario_backend,
+    std::int64_t scenario_sla_passed,
     double actual_rps,
     double rate_accuracy_pct) {
   std::ostringstream oss;
@@ -150,10 +159,13 @@ std::vector<std::uint8_t> JsonDone(
       << ",\"scenario_payload_bytes\":" << scenario_payload_bytes
       << ",\"scenario_steps_est\":" << scenario_steps_est
       << ",\"scenario_flows_est\":" << scenario_flows_est
+      << ",\"scenario_sessions\":" << scenario_sessions
+      << ",\"scenario_backend\":\"" << scenario_backend << "\""
+      << ",\"scenario_sla_passed\":" << scenario_sla_passed
       << ",\"actual_rps\":" << actual_rps
       << ",\"rate_accuracy_pct\":" << rate_accuracy_pct
-      << ",\"scenario_engine_path\":\"scenario_engine_native_bridge\""
-      << ",\"note\":\"scenario_payload_ref+cpu_native+pacing_static\"}";
+      << ",\"scenario_engine_path\":\"samurai_scenario_static_cpp\""
+      << ",\"note\":\"scenario_payload_ref+compile_soa+sla_native+pacing_static\"}";
   const std::string json = oss.str();
   return std::vector<std::uint8_t>(json.begin(), json.end());
 }
@@ -317,12 +329,72 @@ int main(int argc, char** argv) {
         const std::string scenario_text(
             reinterpret_cast<const char*>(scenario_blob.data()),
             scenario_blob.size());
-        std::uint64_t scenario_steps_est = static_cast<std::uint64_t>(
-            CountToken(scenario_text, "\"opcode\"") + CountToken(scenario_text, "\"type\""));
-        std::uint64_t scenario_flows_est = static_cast<std::uint64_t>(
-            CountToken(scenario_text, "\"flow\"") + CountToken(scenario_text, "\"flow_name\""));
-        if (scenario_steps_est == 0u) scenario_steps_est = 1u;
-        if (scenario_flows_est == 0u) scenario_flows_est = 1u;
+        std::uint64_t scenario_steps_est = 1u;
+        std::uint64_t scenario_flows_est = 1u;
+        std::uint64_t scenario_sessions = 0u;
+        std::string scenario_backend = "http";
+        std::int64_t scenario_sla_passed = -1;
+        const samurai::core::json::ParseResult parsed = samurai::core::json::Parse(scenario_text);
+        if (parsed.ok) {
+          try {
+            const ddos_samurai::scenario_native::ScenarioSpecNative spec =
+                ddos_samurai::scenario_native::parse_spec(parsed.value);
+            if (!spec.flows.empty()) {
+              scenario_flows_est = spec.flows.size();
+              scenario_backend = spec.load_model.backend;
+              std::mt19937_64 rng(std::random_device{}());
+              const int sessions =
+                  std::min<int>(spec.load_model.concurrent_vus > 0 ? spec.load_model.concurrent_vus : 16, 512);
+              std::vector<std::string> flow_names;
+              std::vector<std::uint64_t> seeds;
+              flow_names.reserve(static_cast<std::size_t>(sessions));
+              seeds.reserve(static_cast<std::size_t>(sessions));
+              for (int i = 0; i < sessions; ++i) {
+                flow_names.push_back(spec.flows[static_cast<std::size_t>(rng() % spec.flows.size())].name);
+                seeds.push_back(rng());
+              }
+              const samurai::core::json::Value soa =
+                  ddos_samurai::scenario_native::compile_session_plans_packed_bulk_soa_native(
+                      spec, flow_names, seeds);
+              const samurai::core::json::Value* offsets = soa.find("session_offsets");
+              if (offsets != nullptr && offsets->is_array() && !offsets->elements().empty()) {
+                scenario_steps_est = static_cast<std::uint64_t>(offsets->elements().back().as_int(0));
+              }
+              const samurai::core::json::Value* attempts = soa.find("session_step_attempted");
+              if (attempts != nullptr && attempts->is_array()) {
+                for (const auto& a : attempts->elements()) {
+                  scenario_steps_est += static_cast<std::uint64_t>(a.as_int(0));
+                }
+              }
+              const samurai::core::json::Value* sf = soa.find("session_flow");
+              if (sf != nullptr && sf->is_array()) scenario_sessions = sf->elements().size();
+              const samurai::core::json::Value* sla = parsed.value.find("sla");
+              if (sla != nullptr) {
+                const samurai::core::json::Value ev = ddos_samurai::scenario_native::evaluate_sla_native(
+                    *sla,
+                    static_cast<int>(scenario_sessions),
+                    static_cast<int>(scenario_sessions),
+                    static_cast<int>(scenario_steps_est),
+                    0,
+                    0.0,
+                    false,
+                    0,
+                    0,
+                    0,
+                    0);
+                const samurai::core::json::Value* passed = ev.find("passed");
+                if (passed != nullptr) scenario_sla_passed = passed->as_bool(false) ? 1 : 0;
+              }
+            }
+          } catch (const std::exception&) {
+            scenario_steps_est = static_cast<std::uint64_t>(
+                CountToken(scenario_text, "\"opcode\"") + CountToken(scenario_text, "\"type\""));
+            scenario_flows_est = static_cast<std::uint64_t>(
+                CountToken(scenario_text, "\"flow\"") + CountToken(scenario_text, "\"flow_name\""));
+            if (scenario_steps_est == 0u) scenario_steps_est = 1u;
+            if (scenario_flows_est == 0u) scenario_flows_est = 1u;
+          }
+        }
 
         PacketConfig cfg = ConfigFromEnvelope(env);
         const int packet_count = std::max(1, static_cast<int>(env.packet_count));
@@ -399,6 +471,9 @@ int main(int argc, char** argv) {
             static_cast<std::uint64_t>(scenario_blob.size()),
             scenario_steps_est,
             scenario_flows_est,
+            scenario_sessions,
+            scenario_backend,
+            scenario_sla_passed,
             snap.actual_rps,
             snap.rate_accuracy_pct);
         (void)SendFrame(

@@ -28,6 +28,9 @@
 #include "zmq_worker_base.hpp"
 #include "worker_common.hpp"
 
+#include "bridge.hpp"
+#include "json.hpp"
+
 namespace {
 using samurai::daemon::SendFrame;
 using samurai::daemon::BuildSnapshot;
@@ -79,6 +82,22 @@ std::vector<std::uint8_t> JsonDone(
       << ",\"actual_rps\":" << actual_rps
       << ",\"rate_accuracy_pct\":" << rate_accuracy_pct
       << ",\"note\":\"l7_tcp_native+pacing_static\"}";
+  const std::string s = oss.str();
+  return std::vector<std::uint8_t>(s.begin(), s.end());
+}
+
+std::vector<std::uint8_t> JsonDoneEmu(
+    std::uint64_t correlation_id,
+    const std::string& job_id,
+    const std::string& protocol,
+    const std::string& result_json) {
+  std::ostringstream oss;
+  oss << "{\"status\":\"ok\",\"worker_kind\":\"l7\""
+      << ",\"correlation_id\":" << correlation_id
+      << ",\"job_id\":\"" << job_id << "\""
+      << ",\"l7_protocol\":\"" << protocol << "\""
+      << ",\"engine\":\"l7_emu_native_bridge\""
+      << ",\"engine_result\":" << result_json << "}";
   const std::string s = oss.str();
   return std::vector<std::uint8_t>(s.begin(), s.end());
 }
@@ -361,16 +380,9 @@ int main(int argc, char** argv) {
 
         const std::string protocol = ReadFixed(env.protocol, sizeof(env.protocol));
         const std::string protocol_lc = ToLower(protocol.empty() ? std::string("http1") : protocol);
-        if (protocol_lc == "quic" || protocol_lc == "h3" || protocol_lc == "http3") {
-          (void)SendFrame(
-              push,
-              static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
-              header.correlation_id,
-              samurai::wire::WorkerKind::L7,
-              job_id,
-              JsonError("l7_protocol_requires_udp_or_quic_worker"));
-          continue;
-        }
+        const std::string scenario_ref = ReadFixed(env.scenario_payload_ref, sizeof(env.scenario_payload_ref));
+        const bool use_l7_emu =
+            protocol_lc == "quic" || protocol_lc == "h3" || protocol_lc == "http3" || !scenario_ref.empty();
 
         std::vector<std::uint8_t> request_payload;
         const std::string payload_ref = ReadFixed(env.payload_ref, sizeof(env.payload_ref));
@@ -401,21 +413,92 @@ int main(int argc, char** argv) {
         }
 
         std::uint64_t scenario_payload_bytes = 0;
-        const std::string scenario_ref = ReadFixed(env.scenario_payload_ref, sizeof(env.scenario_payload_ref));
+        std::vector<std::uint8_t> scenario_content;
         if (!scenario_ref.empty()) {
-          std::ifstream sf(scenario_ref, std::ios::binary | std::ios::ate);
-          if (!sf) {
+          std::string scenario_read_err;
+          if (!ReadFileBytes(scenario_ref, scenario_content, scenario_read_err)) {
             (void)SendFrame(
                 push,
                 static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
                 header.correlation_id,
                 samurai::wire::WorkerKind::L7,
                 job_id,
-                JsonError("scenario_payload_ref_missing"));
+                JsonError(scenario_read_err));
             continue;
           }
-          const std::streamoff ssz = sf.tellg();
-          scenario_payload_bytes = ssz > 0 ? static_cast<std::uint64_t>(ssz) : 0u;
+          scenario_payload_bytes = static_cast<std::uint64_t>(scenario_content.size());
+        }
+
+        if (use_l7_emu) {
+          try {
+            using samurai::core::json::Parse;
+            using samurai::core::json::ParseResult;
+            using samurai::core::json::Value;
+            Value profile = Value::Object();
+            if (!scenario_content.empty()) {
+              const std::string scenario_text(
+                  reinterpret_cast<const char*>(scenario_content.data()), scenario_content.size());
+              const ParseResult pr = Parse(scenario_text);
+              if (pr.ok && pr.value.is_object()) profile = pr.value;
+            }
+            if (profile.find("target_ip") == nullptr || profile.find("protocol") == nullptr) {
+              Value p = Value::Object();
+              p.set("protocol", Value::Str(protocol_lc == "h3" ? "quic" : protocol_lc));
+              p.set("target_ip", Value::Str(target));
+              p.set("target_port", Value::Int(port));
+              p.set("scheme", Value::Str(
+                  (protocol_lc == "https" || protocol_lc == "quic" || protocol_lc == "h3" || protocol_lc == "http3")
+                      ? "https" : "http"));
+              p.set("host_header", Value::Str(target));
+              p.set("verify", Value::Int(0));
+              p.set("keepalive", Value::Int(0));
+              p.set("timeout_ms", Value::Int(5000));
+              p.set("max_connections", Value::Int(1));
+              p.set("max_streams_per_connection", Value::Int(1));
+              p.set("session_repeats", Value::Int(std::max(1, static_cast<int>(env.packet_count))));
+              for (const auto& kv : profile.members()) p.set(kv.first, kv.second);
+              profile = p;
+            }
+            if (profile.find("ops") == nullptr && !request_payload.empty()) {
+              Value op = Value::Object();
+              op.set("opcode", Value::Str("http_request"));
+              op.set("method", Value::Str("GET"));
+              op.set("path", Value::Str("/"));
+              Value body = Value::Object();
+              body.set("kind", Value::Str("raw"));
+              Value body_bytes = Value::Array();
+              for (const std::uint8_t b : request_payload) body_bytes.push_back(Value::Int(static_cast<std::int64_t>(b)));
+              body.set("bytes", body_bytes);
+              op.set("body", body);
+              Value ops = Value::Array();
+              ops.push_back(op);
+              profile.set("ops", ops);
+            }
+            Value cfg = Value::Object();
+            cfg.set("concurrency", Value::Int(1));
+            cfg.set("profile_l7", Value::Int(1));
+            cfg.set("profile_sample_limit", Value::Int(0));
+            const Value emu_result = ddos_samurai::l7_emu_native::run_profile_json(profile, cfg);
+            const std::vector<std::uint8_t> emu_done = JsonDoneEmu(
+                header.correlation_id, job_id, protocol_lc, emu_result.dump());
+            (void)SendFrame(
+                push,
+                static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
+                header.correlation_id,
+                samurai::wire::WorkerKind::L7,
+                job_id,
+                emu_done);
+            continue;
+          } catch (const std::exception& exc) {
+            (void)SendFrame(
+                push,
+                static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                header.correlation_id,
+                samurai::wire::WorkerKind::L7,
+                job_id,
+                JsonError(std::string("l7_emu_profile_failed:") + exc.what()));
+            continue;
+          }
         }
 
         samurai_pacing_config_t pace_cfg = PacingFromEnvelope(env);
