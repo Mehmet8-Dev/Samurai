@@ -25,4 +25,24 @@ LossRecoveryCounters derive_loss_recovery(const UdpProbeCounters& udp) {
   return out;
 }
 
+QuicCongestionState derive_bbr_congestion_state(const UdpProbeCounters& udp, double rtt_ms) {
+  QuicCongestionState state;
+  state.rtt_sample_ms = (rtt_ms > 0.1) ? rtt_ms : 20.0;
+  LossRecoveryCounters lr = derive_loss_recovery(udp);
+
+  // BBR pacing rate derivation based on bandwidth & RTT estimate
+  const double rtt_sec = state.rtt_sample_ms / 1000.0;
+  if (lr.retransmission_count > 0 || udp.timeouts > 0) {
+    // Loss detected: scale back cwnd and pacing rate
+    const double loss_factor = std::max(0.5, 1.0 - (lr.retransmission_count * 0.05));
+    state.cwnd_bytes = static_cast<uint32_t>(state.cwnd_bytes * loss_factor);
+    state.ssthresh_bytes = state.cwnd_bytes;
+  } else {
+    // Increase congestion window during clean delivery
+    state.cwnd_bytes = std::min<uint32_t>(1048576u, state.cwnd_bytes + 1460u * std::max(1, udp.send_ok));
+  }
+  state.pacing_rate_bps = (static_cast<double>(state.cwnd_bytes) * 8.0) / rtt_sec;
+  return state;
+}
+
 }  // namespace ddos_samurai::l7_emu_native::custom_quic_stack

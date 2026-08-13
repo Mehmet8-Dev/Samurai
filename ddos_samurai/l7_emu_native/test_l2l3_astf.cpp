@@ -214,6 +214,11 @@ int main() {
   assert(lr.retransmission_count == 15);
   std::cout << "    [OK] QUIC Loss Recovery derived PTO count: " << lr.pto_count << ", retransmission count: " << lr.retransmission_count << "\n";
 
+  QuicCongestionState cs = derive_bbr_congestion_state(udp_counters, 25.0);
+  assert(cs.rtt_sample_ms == 25.0);
+  assert(cs.cwnd_bytes < 14600u);
+  std::cout << "    [OK] QUIC BBR Congestion State derived cwnd: " << cs.cwnd_bytes << " bytes, pacing rate: " << cs.pacing_rate_bps << " bps\n";
+
   std::cout << "\nALL VERIFICATION TESTS PASSED SUCCESSFULLY! 🚀\n";
   return 0;
 }
