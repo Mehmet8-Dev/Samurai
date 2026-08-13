@@ -130,6 +130,11 @@ ScenarioSpecNative parse_spec(const json::Value& spec) {
             step.think_time.mean_ms = std::max(0, GetInt(*tt, "mean_ms", 0));
             step.think_time.stddev_ms = std::max(0, GetInt(*tt, "stddev_ms", 0));
           }
+          step.extract_token_regex = GetStr(st_obj, "extract_token_regex");
+          step.token_variable_name = GetStr(st_obj, "token_variable_name");
+          step.headers = GetStrMap(st_obj, "headers");
+          step.cookies = GetStrMap(st_obj, "cookies");
+
           // L7 action fields.
           step.tls_sni = GetStr(st_obj, "tls_sni");
           step.tls_alpn = GetStr(st_obj, "tls_alpn");
@@ -431,6 +436,12 @@ static void compile_flow_recursive_packed(
           timeout_ms = persona->request_timeout_ms;
           retry_count = persona->max_retries;
         }
+        for (const auto& kv : step.headers) {
+          headers[kv.first] = kv.second;
+        }
+        for (const auto& kv : step.cookies) {
+          cookies[kv.first] = kv.second;
+        }
         out.event_kind.push_back(0);
         out.request_kind.push_back((st.backend == "http2") ? "http2_headers" : "http_request");
         out.method.push_back(step.method);
@@ -442,11 +453,11 @@ static void compile_flow_recursive_packed(
         out.timeout_ms.push_back(timeout_ms);
         out.retry_count.push_back(retry_count);
         out.on_failure.push_back(step.on_failure);
-        out.think_min_ms.push_back(0);
-        out.think_max_ms.push_back(0);
-        out.think_distribution.emplace_back("uniform");
-        out.think_mean_ms.push_back(0);
-        out.think_stddev_ms.push_back(0);
+        out.think_min_ms.push_back(step.think_time.min_ms);
+        out.think_max_ms.push_back(std::max(step.think_time.min_ms, step.think_time.max_ms));
+        out.think_distribution.push_back(step.think_time.distribution.empty() ? "uniform" : step.think_time.distribution);
+        out.think_mean_ms.push_back(step.think_time.mean_ms);
+        out.think_stddev_ms.push_back(step.think_time.stddev_ms);
         out.tcp_dst_port.push_back(0);
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.emplace_back("");
