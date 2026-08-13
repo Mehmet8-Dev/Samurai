@@ -32,6 +32,8 @@ __pycache__/
 *.a
 *.egg-info/
 build/
+build_test/
+build_mehmet_tmp/
 dist/
 .pytest_cache/
 .mypy_cache/
