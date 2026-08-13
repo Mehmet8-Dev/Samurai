@@ -48,9 +48,9 @@ target_include_directories(cpu_native_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/
 
 function(add_samurai_worker target_name source_file)
   add_executable(${target_name} ${source_file})
-  target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR}/../cpu_native ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native ${LIBZMQ_INCLUDE_DIRS})
+  target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../core ${CMAKE_CURRENT_SOURCE_DIR}/../cpu_native ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native ${LIBZMQ_INCLUDE_DIRS})
   target_link_directories(${target_name} PRIVATE ${LIBZMQ_LIBRARY_DIRS})
-  target_link_libraries(${target_name} PRIVATE ${LIBZMQ_LIBRARIES})
+  target_link_libraries(${target_name} PRIVATE ${LIBZMQ_LIBRARIES} samurai_core)
   target_compile_options(${target_name} PRIVATE ${LIBZMQ_CFLAGS_OTHER})
 endfunction()
 

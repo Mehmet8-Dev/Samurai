@@ -11,12 +11,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include <zmq.h>
 
+#include "engine.hpp"
+#include "json.hpp"
 #include "pacing_engine.h"
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
@@ -42,6 +45,7 @@ inline int SendFrame(
     const std::string& job_id,
     const std::vector<std::uint8_t>& payload = {},
     int send_flags = 0) {
+  if (!event_socket) return -1;
   samurai::wire::SamuraiWireHeaderV1 header = samurai::daemon::MakeHeader(
       msg_type,
       static_cast<std::uint32_t>(payload.size()),
@@ -50,18 +54,111 @@ inline int SendFrame(
       job_id);
   zmq_msg_t msg;
   const std::size_t total = sizeof(header) + payload.size();
-  if (zmq_msg_init_size(&msg, total) != 0) return -1;
+  if (zmq_msg_init_size(&msg, total) != 0) {
+    std::cerr << "[worker_frame] zmq_msg_init_size failed: " << zmq_strerror(zmq_errno()) << "\n";
+    return -1;
+  }
   auto* p = static_cast<std::uint8_t*>(zmq_msg_data(&msg));
   std::memcpy(p, &header, sizeof(header));
   if (!payload.empty()) std::memcpy(p + sizeof(header), payload.data(), payload.size());
   const int rc = zmq_msg_send(&msg, event_socket, send_flags);
+  if (rc < 0) {
+    std::cerr << "[worker_frame] zmq_msg_send error: " << zmq_strerror(zmq_errno()) << "\n";
+  }
   zmq_msg_close(&msg);
   return rc;
 }
 
 inline std::vector<std::uint8_t> JsonError(const std::string& reason) {
-  const std::string json = "{\"status\":\"error\",\"error\":\"" + reason + "\"}";
+  samurai::core::json::Value val = samurai::core::json::Value::Object();
+  val.set("status", samurai::core::json::Value::Str("error"));
+  val.set("error", samurai::core::json::Value::Str(reason));
+  const std::string json = val.dump();
   return std::vector<std::uint8_t>(json.begin(), json.end());
+}
+
+inline std::vector<std::uint8_t> JsonPayloadFromStats(
+    std::uint64_t correlation_id,
+    const std::string& job_id,
+    std::uint64_t packets_sent,
+    std::uint64_t packets_errors,
+    std::uint64_t bytes_sent,
+    double actual_rps,
+    double rate_accuracy_pct,
+    const std::string& note = "done") {
+  samurai::core::json::Value val = samurai::core::json::Value::Object();
+  val.set("status", samurai::core::json::Value::Str("ok"));
+  val.set("correlation_id", samurai::core::json::Value::Int(static_cast<int64_t>(correlation_id)));
+  val.set("job_id", samurai::core::json::Value::Str(job_id));
+  val.set("packets_sent", samurai::core::json::Value::Int(static_cast<int64_t>(packets_sent)));
+  val.set("packets_errors", samurai::core::json::Value::Int(static_cast<int64_t>(packets_errors)));
+  val.set("bytes_sent", samurai::core::json::Value::Int(static_cast<int64_t>(bytes_sent)));
+  val.set("actual_rps", samurai::core::json::Value::Double(actual_rps));
+  val.set("rate_accuracy_pct", samurai::core::json::Value::Double(rate_accuracy_pct));
+  val.set("note", samurai::core::json::Value::Str(note));
+  const std::string json = val.dump();
+  return std::vector<std::uint8_t>(json.begin(), json.end());
+}
+
+inline ddos_samurai::cpu_native::PacketConfig ConfigFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
+  ddos_samurai::cpu_native::PacketConfig cfg;
+  cfg.target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
+  cfg.target_port = static_cast<int>(env.target_port);
+  cfg.protocol = ReadFixed(env.protocol, sizeof(env.protocol));
+  if (cfg.protocol.empty()) {
+    cfg.protocol = "tcp";
+  }
+  cfg.spoof = env.spoof_enabled != 0u;
+  cfg.spoof_opts = ddos_samurai::cpu_native::SpoofOptions{
+      .mode = ReadFixed(env.spoof_mode, sizeof(env.spoof_mode)),
+      .subnet = [&]() -> std::optional<std::string> {
+        const std::string v = ReadFixed(env.spoof_subnet, sizeof(env.spoof_subnet));
+        return v.empty() ? std::nullopt : std::optional<std::string>(v);
+      }(),
+      .list_file = [&]() -> std::optional<std::string> {
+        const std::string v = ReadFixed(env.spoof_list_file, sizeof(env.spoof_list_file));
+        return v.empty() ? std::nullopt : std::optional<std::string>(v);
+      }(),
+  };
+  cfg.has_payload = env.has_payload != 0u;
+  cfg.tcp_flags = ReadFixed(env.tcp_flags, sizeof(env.tcp_flags));
+  if (cfg.tcp_flags.empty()) {
+    cfg.tcp_flags = "S";
+  }
+  cfg.ttl = OptionalIntFromWire(env.ttl);
+  cfg.tos = OptionalIntFromWire(env.tos);
+  cfg.window = OptionalIntFromWire(env.window);
+  cfg.fragment_enabled = env.fragment_enabled != 0u;
+  cfg.fragment_size = static_cast<int>(env.fragment_size);
+  cfg.pad_size = static_cast<int>(env.pad_size);
+  cfg.attack_vector = ReadFixed(env.attack_vector, sizeof(env.attack_vector));
+  if (cfg.attack_vector.empty()) {
+    cfg.attack_vector = "basic";
+  }
+  cfg.dns_name = ReadFixed(env.dns_name, sizeof(env.dns_name));
+  if (cfg.dns_name.empty()) {
+    cfg.dns_name = "example.com";
+  }
+  cfg.dns_edns = env.dns_edns != 0u;
+  cfg.dns_recursive = env.dns_recursive != 0u;
+  const std::string qtypes_raw = ReadFixed(env.dns_qtype, sizeof(env.dns_qtype));
+  if (!qtypes_raw.empty()) {
+    cfg.dns_qtypes.clear();
+    std::size_t start = 0;
+    while (start < qtypes_raw.size()) {
+      const std::size_t comma = qtypes_raw.find(',', start);
+      const std::size_t end = (comma == std::string::npos) ? qtypes_raw.size() : comma;
+      const std::string part = qtypes_raw.substr(start, end - start);
+      if (!part.empty()) {
+        cfg.dns_qtypes.push_back(part);
+      }
+      if (comma == std::string::npos) {
+        break;
+      }
+      start = comma + 1;
+    }
+  }
+  return cfg;
 }
 
 inline samurai_pacing_config_t PacingFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {

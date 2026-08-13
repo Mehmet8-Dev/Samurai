@@ -61,55 +61,7 @@ struct XdpCtxGuard {
 
 
 
-PacketConfig ConfigFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
-  PacketConfig cfg;
-  cfg.target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
-  cfg.target_port = static_cast<int>(env.target_port);
-  cfg.protocol = ReadFixed(env.protocol, sizeof(env.protocol));
-  if (cfg.protocol.empty()) cfg.protocol = "tcp";
-  cfg.spoof = env.spoof_enabled != 0u;
-  cfg.spoof_opts = SpoofOptions{
-      .mode = ReadFixed(env.spoof_mode, sizeof(env.spoof_mode)),
-      .subnet = [&]() -> std::optional<std::string> {
-        const std::string v = ReadFixed(env.spoof_subnet, sizeof(env.spoof_subnet));
-        return v.empty() ? std::nullopt : std::optional<std::string>(v);
-      }(),
-      .list_file = [&]() -> std::optional<std::string> {
-        const std::string v = ReadFixed(env.spoof_list_file, sizeof(env.spoof_list_file));
-        return v.empty() ? std::nullopt : std::optional<std::string>(v);
-      }(),
-  };
-  cfg.has_payload = env.has_payload != 0u;
-  cfg.tcp_flags = ReadFixed(env.tcp_flags, sizeof(env.tcp_flags));
-  if (cfg.tcp_flags.empty()) cfg.tcp_flags = "S";
-  cfg.ttl = OptionalIntFromWire(env.ttl);
-  cfg.tos = OptionalIntFromWire(env.tos);
-  cfg.window = OptionalIntFromWire(env.window);
-  cfg.fragment_enabled = env.fragment_enabled != 0u;
-  cfg.fragment_size = static_cast<int>(env.fragment_size);
-  cfg.pad_size = static_cast<int>(env.pad_size);
-  cfg.attack_vector = ReadFixed(env.attack_vector, sizeof(env.attack_vector));
-  if (cfg.attack_vector.empty()) cfg.attack_vector = "basic";
-  cfg.dns_name = ReadFixed(env.dns_name, sizeof(env.dns_name));
-  if (cfg.dns_name.empty()) cfg.dns_name = "example.com";
-  cfg.dns_edns = env.dns_edns != 0u;
-  cfg.dns_recursive = env.dns_recursive != 0u;
-
-  const std::string qtypes_raw = ReadFixed(env.dns_qtype, sizeof(env.dns_qtype));
-  if (!qtypes_raw.empty()) {
-    cfg.dns_qtypes.clear();
-    std::size_t start = 0;
-    while (start < qtypes_raw.size()) {
-      const std::size_t comma = qtypes_raw.find(',', start);
-      const std::size_t end = (comma == std::string::npos) ? qtypes_raw.size() : comma;
-      const std::string part = qtypes_raw.substr(start, end - start);
-      if (!part.empty()) cfg.dns_qtypes.push_back(part);
-      if (comma == std::string::npos) break;
-      start = comma + 1;
-    }
-  }
-  return cfg;
-}
+using samurai::daemon::ConfigFromEnvelope;
 
 
 std::string GetExeDir() {
