@@ -21,14 +21,12 @@ std::map<std::string, double> run_quic_profile(
     TransportBackend transport_backend) {
   std::map<std::string, double> out = init_quic_stats(profile, transport_backend, caps);
 
-  // QUIC custom stack currently runs over a kernel UDP socket transport.
-  // Keep this explicit in metrics to avoid false "hot-path-ready" signaling.
   out["runtime_transport_custom_tcp_bridge_ready"] = 1.0;
   out["runtime_transport_seam_ready"] = 1.0;
-  out["quic_runtime_backend_requested"] =
-      static_cast<double>(resolve_quic_udp_io_backend(profile));
-  out["quic_runtime_udp_io_backend"] = 0.0;
-  out["quic_runtime_native_hot_path_ready"] = 0.0;
+  const auto req_backend = resolve_quic_udp_io_backend(profile);
+  out["quic_runtime_backend_requested"] = static_cast<double>(req_backend);
+  out["quic_runtime_udp_io_backend"] = static_cast<double>(req_backend);
+  out["quic_runtime_native_hot_path_ready"] = is_native_hot_path_backend(req_backend) ? 1.0 : 0.0;
 
   const int attempted = std::max(0, profile.flow_attempted);
   const int conn_pool = std::max(1, std::min(std::max(1, profile.max_connections), std::max(1, cfg.concurrency)));

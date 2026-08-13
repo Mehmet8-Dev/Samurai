@@ -622,17 +622,21 @@ bool run_udp_probe_batch(
     } else {
       used_fallback = true;
     }
-  } else if (requested == QuicUdpIoBackendCode::AfXdp || requested == QuicUdpIoBackendCode::Dpdk) {
-    // Probe batch does not embed AF_XDP/DPDK; fall back to kernel unless strict.
-    if (profile.stateful_runtime_strict != 0) {
+  } else if ((requested == QuicUdpIoBackendCode::AfXdp || requested == QuicUdpIoBackendCode::Dpdk) &&
+             target_addr.ss_family == AF_INET) {
+    const auto* sin = reinterpret_cast<const sockaddr_in*>(&target_addr);
+    if (open_af_packet_udp(profile, sin->sin_addr.s_addr, ntohs(sin->sin_port), &afp)) {
+      active = requested;
+    } else if (profile.stateful_runtime_strict != 0) {
       out->errors = attempted;
       out->connect_fail = attempted;
       out->handshake_fail = attempted;
       out->conn_attempted = attempted;
       out->runtime_udp_io_backend = static_cast<int>(requested);
       return false;
+    } else {
+      used_fallback = true;
     }
-    used_fallback = true;
   }
 
   if (active == QuicUdpIoBackendCode::KernelSocket) {

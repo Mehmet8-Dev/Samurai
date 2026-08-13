@@ -62,6 +62,7 @@ struct Profile {
   int legacy_mode{0};
   std::string source_ip;
   std::string target_ip;
+  std::string interface_name;
   int target_port{0};
   std::string scheme;
   std::string host_header;
