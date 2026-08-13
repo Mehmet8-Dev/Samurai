@@ -1,6 +1,10 @@
-#include "dpdk_pmd_core.hpp"
-
+#ifndef SAMURAI_NO_PYTHON
+#if __has_include(<Python.h>)
 #include <Python.h>
+#else
+#define SAMURAI_NO_PYTHON 1
+#endif
+#endif
 
 extern "C" {
 #include <rte_common.h>
