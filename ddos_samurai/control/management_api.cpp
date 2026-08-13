@@ -15,9 +15,40 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+
 #include "jwt.hpp"
 
 namespace samurai::control {
+
+struct RateLimiter::Impl {
+  std::mutex mu;
+  std::unordered_map<std::string, std::pair<int, std::int64_t>> clients;
+};
+
+RateLimiter::RateLimiter(int max_per_sec)
+    : max_per_sec_(max_per_sec), impl_(std::make_shared<Impl>()) {}
+
+bool RateLimiter::Allow(const std::string& client_key) {
+  if (max_per_sec_ <= 0) return true;
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+  auto& entry = impl_->clients[client_key];
+  if (entry.second != now_sec) {
+    entry.first = 1;
+    entry.second = now_sec;
+    return true;
+  }
+  if (entry.first < max_per_sec_) {
+    entry.first++;
+    return true;
+  }
+  return false;
+}
 
 namespace {
 
@@ -436,6 +467,9 @@ void ManagementApiServer::Loop() {
     os << "HTTP/1.1 " << resp.status << " " << resp.reason << "\r\n"
        << "Content-Type: " << resp.content_type << "\r\n"
        << "Content-Length: " << resp.body.size() << "\r\n"
+       << "Access-Control-Allow-Origin: *\r\n"
+       << "X-Frame-Options: DENY\r\n"
+       << "X-Content-Type-Options: nosniff\r\n"
        << "Connection: close\r\n\r\n"
        << resp.body;
     const std::string out = os.str();

@@ -12,6 +12,7 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -44,12 +45,26 @@ struct ManagementConfig {
   std::string trusted_secret_header = "x-samurai-auth-proxy-secret";
   std::string trusted_role_header = "x-auth-request-role";
   std::string trusted_tenant_header = "x-auth-request-tenant";
+  int db_port = 5099;                              // Default DB persistence port (user memory standard)
+  int rate_limit_per_sec = 100;                    // Max HTTP requests per second per client
 };
 
 struct ManagementProviders {
   std::function<samurai::core::json::Value()> state_provider;
   std::function<samurai::core::json::Value()> abort_callback;
   std::function<std::string()> metrics_provider;  // may be empty
+};
+
+class RateLimiter {
+ public:
+  explicit RateLimiter(int max_per_sec = 100);
+  bool Allow(const std::string& client_key);
+
+ private:
+  int max_per_sec_;
+  // Internal rate state implementation
+  struct Impl;
+  std::shared_ptr<Impl> impl_;
 };
 
 // Pure request router + auth. Testable without a socket.
