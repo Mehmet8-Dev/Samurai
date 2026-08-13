@@ -149,6 +149,12 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
     } else if (a == "--report-text") {
       if (!NeedsValue(i, argc, "--report-text")) return ParseStatus::kError;
       out.report_text_path = argv[++i];
+    } else if (a == "--run-rfc-suite") {
+      if (!NeedsValue(i, argc, "--run-rfc-suite")) return ParseStatus::kError;
+      out.run_rfc_suite = argv[++i];
+    } else if (a == "--rfc-report-out") {
+      if (!NeedsValue(i, argc, "--rfc-report-out")) return ParseStatus::kError;
+      out.rfc_report_out = argv[++i];
     } else if (a == "--kpi-min-rate-accuracy") {
       if (!NeedsValue(i, argc, "--kpi-min-rate-accuracy")) return ParseStatus::kError;
       out.kpi.min_rate_accuracy_pct = std::strtod(argv[++i], nullptr);

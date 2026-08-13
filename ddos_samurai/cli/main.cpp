@@ -15,6 +15,7 @@
 #include "options.hpp"
 #include "profiles.hpp"
 #include "reporting.hpp"
+#include "rfc_suite.hpp"
 #include "run_summary.hpp"
 #include "supervisor.hpp"
 #include "validation.hpp"
@@ -36,6 +37,25 @@ int main(int argc, char** argv) {
   if (opt.list_profiles) {
     cli::ListProfiles();
     return 0;
+  }
+
+  if (!opt.run_rfc_suite.empty()) {
+    cli::Rfc2544Config c2544;
+    cli::Rfc3511Config c3511;
+    cli::Rfc8219Config c8219;
+    const cli::RfcSuiteResult res = cli::RfcSuiteEngine::RunAll(c2544, c3511, c8219);
+    const std::string md_report = cli::RfcReportGenerator::GenerateMarkdownReport(res);
+    const std::string html_report = cli::RfcReportGenerator::GenerateHtmlReport(res);
+    std::printf("%s\n", md_report.c_str());
+
+    if (!opt.rfc_report_out.empty()) {
+      if (!cli::WriteReportFile(opt.rfc_report_out, html_report)) {
+        std::fprintf(stderr, "samurai: failed to write RFC report to %s\n", opt.rfc_report_out.c_str());
+      } else {
+        std::printf("RFC Benchmark HTML Report written to: %s\n", opt.rfc_report_out.c_str());
+      }
+    }
+    return res.overall_passed ? 0 : 3;
   }
 
   if (const auto err = cli::Validate(opt)) {

@@ -25,6 +25,8 @@ struct CliOptions {
   KpiThresholds kpi;                      // KPI-gate thresholds (--kpi-*)
   std::string report_json_path;           // --report-json PATH (empty = off)
   std::string report_text_path;           // --report-text PATH (empty = off)
+  std::string run_rfc_suite;              // --run-rfc-suite rfc2544|rfc3511|rfc8219|all
+  std::string rfc_report_out;             // --rfc-report-out PATH (empty = off)
   // Target-safety gate (core::ValidateTargetSafety).
   bool allow_public = false;              // --allow-public-target
   std::vector<std::string> allow_targets;  // --allow-target IP|CIDR (repeatable)

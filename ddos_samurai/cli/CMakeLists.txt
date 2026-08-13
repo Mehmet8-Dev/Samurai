@@ -26,6 +26,7 @@ add_executable(
   profiles.cpp
   kpi_gate.cpp
   reporting.cpp
+  rfc_suite.cpp
   ../orchestrator/supervisor.cpp
 )
 target_include_directories(
