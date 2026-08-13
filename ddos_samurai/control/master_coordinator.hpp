@@ -76,6 +76,7 @@ struct JobConfig {
   std::string tenant_namespace;
   std::int64_t leader_epoch = 0;
   int stop_shard_retries = 3;
+  int db_port = 5099;                        // Default DB persistence port (user memory standard)
   // Base shard args (JSON object) cloned per shard; the coordinator injects
   // count/_worker_id/_leader_epoch/role.
   samurai::core::json::Value base_args = samurai::core::json::Value::Object();
