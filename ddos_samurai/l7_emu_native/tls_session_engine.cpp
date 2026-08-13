@@ -111,6 +111,11 @@ ThreadLocalTlsContext* TlsSessionEngine::get_thread_context() {
   // Set minimum protocol to TLS 1.2.
   SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 
+#ifdef SSL_OP_ENABLE_KTLS
+  // Enable Linux Kernel TLS (kTLS) crypto offload for high-performance transport.
+  SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+#endif
+
   // Apply cipher suite configuration.
   if (!cipher_config_.cipher_list.empty()) {
     SSL_CTX_set_cipher_list(ctx, cipher_config_.cipher_list.c_str());
