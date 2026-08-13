@@ -136,9 +136,8 @@ int main() {
 
   // --- cache (redirect HOME to a scratch dir) ---
   {
-    ::setenv("HOME",
-             "/tmp/claude-0/-home-user-Samurai/e22cf02a-7f79-5de1-b1eb-8cd527ed8d7d/scratchpad",
-             1);
+    ::setenv("HOME", "/tmp/samurai_license_test_home", 1);
+    ::system("mkdir -p /tmp/samurai_license_test_home");
     ClearCache();
     const std::string hwid = "test-hwid-abc";
     auto src = Lic(Tier::kPro);

@@ -325,35 +325,63 @@ int main(int argc, char** argv) {
         std::uint64_t packets_errors = 0;
         std::uint64_t bytes_sent = 0;
 
-        for (int i = 0; i < packet_count; ++i) {
+        constexpr std::uint16_t kTxBurstMax = 64;
+        std::vector<rte_mbuf*> tx_mbufs(kTxBurstMax, nullptr);
+
+        int i = 0;
+        while (i < packet_count) {
           samurai_pacing_wait_next(&pace_state, &pace_cfg);
-          const std::size_t off = static_cast<std::size_t>(i) * stride;
-          if (off + stride > pool.size()) {
-            packets_errors += 1u;
+          const std::uint16_t batch_target = static_cast<std::uint16_t>(
+              std::min<int>(packet_count - i, static_cast<int>(kTxBurstMax)));
+
+          std::uint16_t allocated = 0;
+          if (rte_pktmbuf_alloc_bulk(dpdk.session.mempool, tx_mbufs.data(), batch_target) == 0) {
+            allocated = batch_target;
+          } else {
+            for (std::uint16_t b = 0; b < batch_target; ++b) {
+              rte_mbuf* m = rte_pktmbuf_alloc(dpdk.session.mempool);
+              if (!m) break;
+              tx_mbufs[b] = m;
+              allocated++;
+            }
+          }
+
+          if (allocated == 0) {
+            packets_errors += batch_target;
+            i += batch_target;
             continue;
           }
 
-          rte_mbuf* mbuf = rte_pktmbuf_alloc(dpdk.session.mempool);
-          if (!mbuf) {
-            packets_errors += 1u;
-            continue;
+          std::uint16_t prepared = 0;
+          for (std::uint16_t b = 0; b < allocated; ++b) {
+            const std::size_t off = static_cast<std::size_t>(i + b) * stride;
+            if (off + stride > pool.size()) {
+              rte_pktmbuf_free(tx_mbufs[b]);
+              continue;
+            }
+            void* dst = rte_pktmbuf_append(tx_mbufs[b], static_cast<std::uint16_t>(stride));
+            if (!dst) {
+              rte_pktmbuf_free(tx_mbufs[b]);
+              continue;
+            }
+            std::memcpy(dst, pool.data() + off, stride);
+            tx_mbufs[prepared++] = tx_mbufs[b];
           }
-          void* dst = rte_pktmbuf_append(mbuf, static_cast<std::uint16_t>(stride));
-          if (!dst) {
-            rte_pktmbuf_free(mbuf);
-            packets_errors += 1u;
-            continue;
+
+          if (prepared > 0) {
+            const std::uint16_t tx_sent = rte_eth_tx_burst(
+                dpdk.session.port_id, dpdk.session.queue_id, tx_mbufs.data(), prepared);
+            packets_sent += tx_sent;
+            bytes_sent += static_cast<std::uint64_t>(tx_sent) * stride;
+            if (tx_sent < prepared) {
+              for (std::uint16_t b = tx_sent; b < prepared; ++b) {
+                rte_pktmbuf_free(tx_mbufs[b]);
+              }
+              packets_errors += static_cast<std::uint64_t>(prepared - tx_sent);
+            }
           }
-          std::memcpy(dst, pool.data() + off, stride);
-          rte_mbuf* burst[1] = {mbuf};
-          const std::uint16_t tx = rte_eth_tx_burst(dpdk.session.port_id, dpdk.session.queue_id, burst, 1);
-          if (tx == 1) {
-            packets_sent += 1u;
-            bytes_sent += static_cast<std::uint64_t>(stride);
-          } else {
-            rte_pktmbuf_free(mbuf);
-            packets_errors += 1u;
-          }
+
+          i += batch_target;
 
           if ((static_cast<std::uint32_t>(i) & 0x3FFu) == 0u) {
             const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
