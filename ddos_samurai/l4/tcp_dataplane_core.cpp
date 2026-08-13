@@ -843,6 +843,36 @@ TcpDpFlowSnapshot TcpDataplaneCore::GetFlow(uint64_t flow_id) const {
   return out;
 }
 
+TcpDpFlowSnapshot TcpDataplaneCore::GetFlowLockless(uint64_t flow_id) const {
+  // Lockless read path: avoids mutex contention by attempting lock-free lookup
+  TcpDpFlowSnapshot out;
+  const size_t flow_shard = FlowLockShardForFlowId(flow_id);
+  auto it = flows_by_id_shard_[flow_shard].find(flow_id);
+  if (it == flows_by_id_shard_[flow_shard].end()) {
+    return out;
+  }
+  const FlowEntry& flow = it->second;
+  out.flow_id = flow.flow_id;
+  out.src_ip = flow.key.src_ip;
+  out.dst_ip = flow.key.dst_ip;
+  out.src_port = flow.key.src_port;
+  out.dst_port = flow.key.dst_port;
+  out.iss = flow.iss;
+  out.snd_una = flow.snd_una;
+  out.snd_nxt = flow.snd_nxt;
+  out.rcv_nxt = flow.rcv_nxt;
+  out.peer_window = flow.peer_window;
+  out.local_window = flow.local_window;
+  out.mss = flow.mss;
+  out.ttl = flow.ttl;
+  out.state = static_cast<uint8_t>(flow.state);
+  out.retransmit_count = flow.retransmit_count;
+  out.rto_deadline_ns = flow.rto_deadline_ns;
+  out.last_activity_ns = flow.last_activity_ns;
+  out.found = true;
+  return out;
+}
+
 bool TcpDataplaneCore::ParseIpv4TcpFrame(
     const uint8_t* pkt,
     size_t pkt_len,
@@ -1298,15 +1328,28 @@ uint32_t TcpDataplaneCore::DrainDpdkTxBurst(void* mempool_ptr, void** out_mbufs,
   size_t stride = 0;
 
   if (PeekTxPacketsStrided(max_burst, &base, &count, &pkt_size, &stride) && count > 0 && base) {
-    for (uint32_t i = 0; i < count; ++i) {
-      rte_mbuf* mbuf = rte_pktmbuf_alloc(mp);
-      if (!mbuf) break;
-      const uint8_t* src = base + i * stride;
-      uint8_t* dst = rte_pktmbuf_mtod(mbuf, uint8_t*);
-      std::memcpy(dst, src, pkt_size);
-      mbuf->pkt_len = static_cast<uint32_t>(pkt_size);
-      mbuf->data_len = static_cast<uint16_t>(pkt_size);
-      out_mbufs[produced++] = mbuf;
+    const uint16_t alloc_count = static_cast<uint16_t>(count);
+    if (rte_pktmbuf_alloc_bulk(mp, reinterpret_cast<rte_mbuf**>(out_mbufs), alloc_count) == 0) {
+      for (uint32_t i = 0; i < count; ++i) {
+        rte_mbuf* mbuf = reinterpret_cast<rte_mbuf*>(out_mbufs[i]);
+        const uint8_t* src = base + i * stride;
+        uint8_t* dst = rte_pktmbuf_mtod(mbuf, uint8_t*);
+        std::memcpy(dst, src, pkt_size);
+        mbuf->pkt_len = static_cast<uint32_t>(pkt_size);
+        mbuf->data_len = static_cast<uint16_t>(pkt_size);
+      }
+      produced = count;
+    } else {
+      for (uint32_t i = 0; i < count; ++i) {
+        rte_mbuf* mbuf = rte_pktmbuf_alloc(mp);
+        if (!mbuf) break;
+        const uint8_t* src = base + i * stride;
+        uint8_t* dst = rte_pktmbuf_mtod(mbuf, uint8_t*);
+        std::memcpy(dst, src, pkt_size);
+        mbuf->pkt_len = static_cast<uint32_t>(pkt_size);
+        mbuf->data_len = static_cast<uint16_t>(pkt_size);
+        out_mbufs[produced++] = mbuf;
+      }
     }
     if (produced > 0) {
       ConsumeTxPackets(produced);

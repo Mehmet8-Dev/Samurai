@@ -123,6 +123,7 @@ class TcpDataplaneCore {
   std::vector<TcpDpRxPayload> CollectRxPayloads();
   TcpDpStatsSnapshot SnapshotStats() const;
   TcpDpFlowSnapshot GetFlow(uint64_t flow_id) const;
+  TcpDpFlowSnapshot GetFlowLockless(uint64_t flow_id) const;
 
  private:
   struct FlowKey {
