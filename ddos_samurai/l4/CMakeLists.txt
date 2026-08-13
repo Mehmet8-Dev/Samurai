@@ -14,5 +14,6 @@ add_library(
   l4_state_engine_core.cpp
   l4_state_engine_ffi.cpp
   tcp_dataplane_core.cpp
-  tcp_dataplane_ffi.cpp)
+  tcp_dataplane_ffi.cpp
+  hw_timestamping.cpp)
 target_include_directories(samurai_l4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
