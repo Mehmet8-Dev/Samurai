@@ -86,3 +86,19 @@ void samurai_pacing_wait_next(samurai_pacing_state_t* state, const samurai_pacin
   state->sent += 1ull;
 }
 
+void samurai_pacing_adjust_rate(samurai_pacing_state_t* state, samurai_pacing_config_t* cfg, double drop_rate_pct) {
+  (void)state;
+  if (!cfg || drop_rate_pct < 0.0) {
+    return;
+  }
+  // Adaptive rate adjustment: if drop rate exceeds 5%, scale down target_rps or increase IPG
+  if (drop_rate_pct > 5.0) {
+    const double factor = 1.0 - (drop_rate_pct / 200.0); // e.g. 10% drops -> 0.95 factor
+    if (cfg->mode == SAMURAI_PACING_RPS && cfg->target_rps > 0.0) {
+      cfg->target_rps *= (factor < 0.5 ? 0.5 : factor);
+    } else if (cfg->mode == SAMURAI_PACING_IPG && cfg->ipg_ns > 0ull) {
+      cfg->ipg_ns = (uint64_t)((double)cfg->ipg_ns / (factor < 0.5 ? 0.5 : factor));
+    }
+  }
+}
+

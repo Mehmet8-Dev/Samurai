@@ -31,6 +31,7 @@ typedef struct samurai_pacing_state_t {
 uint64_t samurai_pacing_monotonic_now_ns(void);
 void samurai_pacing_init(samurai_pacing_state_t* state, const samurai_pacing_config_t* cfg);
 void samurai_pacing_wait_next(samurai_pacing_state_t* state, const samurai_pacing_config_t* cfg);
+void samurai_pacing_adjust_rate(samurai_pacing_state_t* state, samurai_pacing_config_t* cfg, double drop_rate_pct);
 
 #ifdef __cplusplus
 }
