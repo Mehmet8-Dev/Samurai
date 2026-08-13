@@ -99,8 +99,23 @@ void DistributedAggregator::Add(const Value& item) {
   }
 }
 
+void DistributedAggregator::CalculateLatencyPercentiles(std::vector<double> latencies_ms,
+                                                         double& out_p50,
+                                                         double& out_p95,
+                                                         double& out_p99) {
+  out_p50 = out_p95 = out_p99 = 0.0;
+  if (latencies_ms.empty()) return;
+  std::sort(latencies_ms.begin(), latencies_ms.end());
+  const std::size_t n = latencies_ms.size();
+  out_p50 = latencies_ms[static_cast<std::size_t>(n * 0.50)];
+  out_p95 = latencies_ms[static_cast<std::size_t>(n * 0.95 >= n ? n - 1 : n * 0.95)];
+  out_p99 = latencies_ms[static_cast<std::size_t>(n * 0.99 >= n ? n - 1 : n * 0.99)];
+}
+
 Value DistributedAggregator::Snapshot() const {
   std::int64_t sent = 0, errors = 0, progress = 0;
+  std::int64_t ring_starvation_count = 0;
+  std::vector<double> latencies;
   std::set<std::string> workers, shards;
   Value numeric_totals = Value::Object();  // insertion-ordered, like the dict
   std::map<std::string, ShardRec> per_shard;
@@ -111,6 +126,10 @@ Value DistributedAggregator::Snapshot() const {
     sent += IntField(item, "sent");
     errors += IntField(item, "errors");
     progress += IntField(item, "progress");
+    ring_starvation_count += IntField(item, "starvation_count");
+    if (item.contains("latency_ms")) {
+      latencies.push_back(DoubleField(item, "latency_ms"));
+    }
 
     // numeric_totals: sum every non-bool numeric field, first-seen order.
     for (const auto& kv : item.members()) {
@@ -166,6 +185,9 @@ Value DistributedAggregator::Snapshot() const {
     if (!sid.empty()) r.shards.insert(sid);
     r.updates += 1;
   }
+
+  double p50 = 0.0, p95 = 0.0, p99 = 0.0;
+  CalculateLatencyPercentiles(latencies, p50, p95, p99);
 
   // per_shard sorted by (-errors, -last_exitcode, shard_id).
   std::vector<const ShardRec*> shard_ptrs;
@@ -253,6 +275,10 @@ Value DistributedAggregator::Snapshot() const {
   out.set("sent", Value::Int(sent));
   out.set("errors", Value::Int(errors));
   out.set("progress", Value::Int(progress));
+  out.set("ring_starvation_count", Value::Int(ring_starvation_count));
+  out.set("latency_p50_ms", Value::Double(p50));
+  out.set("latency_p95_ms", Value::Double(p95));
+  out.set("latency_p99_ms", Value::Double(p99));
   out.set("shards", Value::Int(static_cast<std::int64_t>(
                         !shards.empty() ? shards.size() : items_.size())));
   out.set("workers", Value::Int(static_cast<std::int64_t>(workers.size())));

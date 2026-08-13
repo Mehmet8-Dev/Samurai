@@ -24,6 +24,11 @@ class DistributedAggregator {
   // shape/ordering rules as the Python implementation.
   samurai::core::json::Value Snapshot() const;
 
+  static void CalculateLatencyPercentiles(std::vector<double> latencies_ms,
+                                           double& out_p50,
+                                           double& out_p95,
+                                           double& out_p99);
+
   std::size_t size() const { return items_.size(); }
 
  private:
