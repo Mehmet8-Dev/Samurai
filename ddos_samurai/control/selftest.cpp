@@ -443,8 +443,7 @@ int main() {
   // --- audit: RBAC tamper-evident hash chain ---
   {
     namespace json = samurai::core::json;
-    const std::string path =
-        "/tmp/claude-0/-home-user-Samurai/e22cf02a-7f79-5de1-b1eb-8cd527ed8d7d/scratchpad/rbac_audit.log";
+    const std::string path = "/tmp/samurai_rbac_audit_test.log";
     std::remove(path.c_str());
     auto mk = [](const char* rpc, int allowed, const char* role) {
       json::Value v = json::Value::Object();
@@ -506,8 +505,7 @@ int main() {
     Check(a.Snapshot().find("leader_id")->as_string() == "node-a", "ha: static leader_id");
 
     // File-lease: first acquirer holds; second is blocked until release.
-    const std::string lease =
-        "/tmp/claude-0/-home-user-Samurai/e22cf02a-7f79-5de1-b1eb-8cd527ed8d7d/scratchpad/ha_lease.json";
+    const std::string lease = "/tmp/samurai_ha_lease_test.json";
     std::remove(lease.c_str());
     FileLeaseLeaderElector e1("n1", lease, 30.0);
     FileLeaseLeaderElector e2("n2", lease, 30.0);
