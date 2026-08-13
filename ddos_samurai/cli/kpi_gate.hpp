@@ -42,8 +42,17 @@ struct KpiThresholds {
   std::optional<double> max_errors;             // errors             <= X
   std::optional<double> min_sent;               // sent               >= X
 
+  // L7 Gates (Phase 6)
+  std::optional<double> min_tls_handshakes;     // tls_handshakes_completed >= X
+  std::optional<double> min_dns_queries;        // dns_queries_sent >= X
+  std::optional<double> min_dhcp_leases;        // dhcp_leases_active >= X
+  std::optional<double> min_zc_tx_bytes;        // hot_path_zero_copy_tx_bytes >= X
+  std::optional<double> max_tcp_overflows;      // tcp_timer_wheel_overflows <= X
+
   bool any() const {
-    return min_rate_accuracy_pct || max_wire_loss_pct || max_errors || min_sent;
+    return min_rate_accuracy_pct || max_wire_loss_pct || max_errors || min_sent ||
+           min_tls_handshakes || min_dns_queries || min_dhcp_leases ||
+           min_zc_tx_bytes || max_tcp_overflows;
   }
 };
 

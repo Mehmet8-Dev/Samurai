@@ -26,9 +26,9 @@ struct ProfileDef {
 
 constexpr ProfileDef kProfiles[] = {
     {"web-stress", "Standard Web Server Stress Test (HTTP/1.1 GET Flood)",
-     "http", "tcp", 80, 100000, -1, -1, nullptr, nullptr},
+     "http", "http1", 80, 100000, -1, -1, nullptr, nullptr},
     {"web-bypass", "Advanced WAF/CDN Evasion Test (Polymorphic HTTP/2 & Ninja Mode)",
-     "http2", "tcp", 443, 50000, -1, -1, nullptr, nullptr},
+     "http2", "http2", 443, 50000, -1, -1, nullptr, nullptr},
     {"stateful-exhaustion", "Stateful Firewall & Load Balancer Exhaustion (TCP SYN Flood)",
      "basic", "tcp", -1, 500000, -1, 1, "realistic", nullptr},
     {"volumetric-udp", "Raw Volumetric Pipe Saturation (UDP Flood)",

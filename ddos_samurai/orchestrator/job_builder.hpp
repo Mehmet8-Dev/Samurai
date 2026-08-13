@@ -6,6 +6,7 @@
 // with every worker, so a job built here is binary-compatible with the worker
 // that consumes it by construction (see the static_asserts in wire_protocol.h).
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -34,6 +35,19 @@ struct JobOptions {
   std::string spoof_mode;   // e.g. "random" / "realistic"
   std::string dns_name;
   std::string dns_qtype;
+
+  // L7 stateful-runtime options (wire JobEnvelopeV2). Defaults mirror the
+  // l7_emu_native engine defaults so a bare job behaves like today.
+  std::uint32_t concurrency = 1;
+  std::uint32_t max_connections = 1;
+  std::uint32_t max_streams_per_connection = 1;
+  std::uint8_t verify_tls = 0;
+  std::uint8_t keepalive = 0;
+  std::string scheme;        // http | https (empty = derived from protocol)
+  std::string host_header;   // Host/SNI override (empty = target_ip)
+  std::uint32_t l7_timeout_ms = 5000;
+  std::string l7_profile_file;  // scenario_payload_ref (JSON L7 profile)
+  std::string l7_payload_file;  // payload_ref (raw request bytes)
 };
 
 // Copies a std::string into a fixed-size char buffer, always NUL-terminating and
@@ -66,6 +80,26 @@ inline samurai::wire::JobEnvelopeV1 BuildJobEnvelope(const JobOptions& opt) {
   CopyFixed(env.spoof_mode, sizeof(env.spoof_mode), opt.spoof_mode);
   CopyFixed(env.dns_name, sizeof(env.dns_name), opt.dns_name);
   CopyFixed(env.dns_qtype, sizeof(env.dns_qtype), opt.dns_qtype);
+  CopyFixed(env.scenario_payload_ref, sizeof(env.scenario_payload_ref), opt.l7_profile_file);
+  CopyFixed(env.payload_ref, sizeof(env.payload_ref), opt.l7_payload_file);
+  env.has_payload = opt.l7_payload_file.empty() ? 0u : 1u;
+  return env;
+}
+
+// Builds the V2 envelope used by the L7 worker. `base` carries the same fields
+// as V1 plus the scenario/payload refs; the tail adds the stateful-runtime knobs.
+inline samurai::wire::JobEnvelopeV2 BuildJobEnvelopeV2(const JobOptions& opt) {
+  samurai::wire::JobEnvelopeV2 env{};
+  env.base = BuildJobEnvelope(opt);
+  env.concurrency = std::max(1u, opt.concurrency);
+  env.max_connections = std::max(1u, opt.max_connections);
+  env.max_streams_per_connection = std::max(1u, opt.max_streams_per_connection);
+  env.verify_tls = opt.verify_tls != 0u ? 1u : 0u;
+  env.keepalive = opt.keepalive != 0u ? 1u : 0u;
+  CopyFixed(env.scheme, sizeof(env.scheme), opt.scheme);
+  CopyFixed(env.host_header, sizeof(env.host_header), opt.host_header);
+  env.l7_timeout_ms = opt.l7_timeout_ms > 0u ? opt.l7_timeout_ms : 5000u;
+  std::memset(env.pad2, 0, sizeof(env.pad2));
   return env;
 }
 

@@ -22,6 +22,16 @@ static StepType parse_step_type(const std::string& s) {
   if (s == "tcp_send") return StepType::TcpSend;
   if (s == "tcp_expect") return StepType::TcpExpect;
   if (s == "tcp_close") return StepType::TcpClose;
+  // L7 protocol emulation actions.
+  if (s == "tls_connect") return StepType::TlsConnect;
+  if (s == "tls_disconnect") return StepType::TlsDisconnect;
+  if (s == "dns_resolve") return StepType::DnsResolve;
+  if (s == "dhcp_acquire") return StepType::DhcpAcquire;
+  if (s == "dhcp_release") return StepType::DhcpRelease;
+  if (s == "arp_resolve") return StepType::ArpResolve;
+  if (s == "igmp_join") return StepType::IgmpJoin;
+  if (s == "igmp_leave") return StepType::IgmpLeave;
+  if (s == "ipv6_nd_solicit") return StepType::Ipv6NdSolicit;
   return StepType::EndSession;
 }
 
@@ -120,6 +130,21 @@ ScenarioSpecNative parse_spec(const json::Value& spec) {
             step.think_time.mean_ms = std::max(0, GetInt(*tt, "mean_ms", 0));
             step.think_time.stddev_ms = std::max(0, GetInt(*tt, "stddev_ms", 0));
           }
+          // L7 action fields.
+          step.tls_sni = GetStr(st_obj, "tls_sni");
+          step.tls_alpn = GetStr(st_obj, "tls_alpn");
+          step.tls_cipher_list = GetStr(st_obj, "tls_cipher_list");
+          step.tls_verify = GetInt(st_obj, "tls_verify", 0);
+          step.dns_hostname = GetStr(st_obj, "dns_hostname");
+          step.dns_protocol = GetStr(st_obj, "dns_protocol", "udp");
+          step.dns_qtype = GetStr(st_obj, "dns_qtype", "A");
+          step.dns_edns0 = GetInt(st_obj, "dns_edns0", 0);
+          step.dns_ecs_subnet = GetStr(st_obj, "dns_ecs_subnet");
+          step.dhcp_client_mac = GetStr(st_obj, "dhcp_client_mac");
+          step.dhcp_version = GetInt(st_obj, "dhcp_version", 4);
+          step.igmp_group_ip = GetStr(st_obj, "igmp_group_ip");
+          step.igmp_version = GetInt(st_obj, "igmp_version", 2);
+          step.nd_target_ip = GetStr(st_obj, "nd_target_ip");
           flow.steps.push_back(std::move(step));
         }
       }
@@ -142,7 +167,9 @@ struct CompileState {
 };
 
 struct PackedEvents {
-  std::vector<int> event_kind{};  // 0=request, 1=think_time, 2=tcp_connect, 3=tcp_send, 4=tcp_expect, 5=tcp_close
+  std::vector<int> event_kind{};  // 0=request, 1=think_time, 2=tcp_connect, 3=tcp_send, 4=tcp_expect, 5=tcp_close,
+                                  // 6=tls_connect, 7=tls_disconnect, 8=dns_resolve, 9=dhcp_acquire, 10=dhcp_release,
+                                  // 11=arp_resolve, 12=igmp_join, 13=igmp_leave, 14=ipv6_nd_solicit
   std::vector<std::string> request_kind{};  // http_request | http2_headers | ""
   std::vector<std::string> method{};
   std::vector<std::string> path{};
@@ -166,6 +193,21 @@ struct PackedEvents {
   std::vector<std::string> tcp_payload{};
   std::vector<std::string> tcp_expect_condition{};
   std::vector<int> tcp_expect_timeout_ms{};
+  // L7 protocol emulation fields (Faz 5).
+  std::vector<std::string> tls_sni{};
+  std::vector<std::string> tls_alpn{};
+  std::vector<std::string> tls_cipher_list{};
+  std::vector<int> tls_verify{};
+  std::vector<std::string> dns_hostname{};
+  std::vector<std::string> dns_protocol{};
+  std::vector<std::string> dns_qtype{};
+  std::vector<int> dns_edns0{};
+  std::vector<std::string> dns_ecs_subnet{};
+  std::vector<std::string> dhcp_client_mac{};
+  std::vector<int> dhcp_version{};
+  std::vector<std::string> igmp_group_ip{};
+  std::vector<int> igmp_version{};
+  std::vector<std::string> nd_target_ip{};
 };
 
 struct CompiledPackedSession {
@@ -197,7 +239,22 @@ static void reserve_packed_events(PackedEvents& pe, std::size_t event_cap) {
   pe.tcp_payload.reserve(event_cap);
   pe.tcp_expect_condition.reserve(event_cap);
   pe.tcp_expect_timeout_ms.reserve(event_cap);
+  pe.tls_sni.reserve(event_cap);
+  pe.tls_alpn.reserve(event_cap);
+  pe.tls_cipher_list.reserve(event_cap);
+  pe.tls_verify.reserve(event_cap);
+  pe.dns_hostname.reserve(event_cap);
+  pe.dns_protocol.reserve(event_cap);
+  pe.dns_qtype.reserve(event_cap);
+  pe.dns_edns0.reserve(event_cap);
+  pe.dns_ecs_subnet.reserve(event_cap);
+  pe.dhcp_client_mac.reserve(event_cap);
+  pe.dhcp_version.reserve(event_cap);
+  pe.igmp_group_ip.reserve(event_cap);
+  pe.igmp_version.reserve(event_cap);
+  pe.nd_target_ip.reserve(event_cap);
 }
+
 
 static std::uint64_t fnv1a_update(std::uint64_t h, const char* data, std::size_t n) {
   constexpr std::uint64_t kPrime = 1099511628211ULL;
@@ -254,6 +311,47 @@ static int intern_map(
   return idx;
 }
 
+// Helper: push default L7 fields for non-L7 event kinds.
+static void emit_l7_defaults(PackedEvents& out) {
+  out.tls_sni.emplace_back("");
+  out.tls_alpn.emplace_back("");
+  out.tls_cipher_list.emplace_back("");
+  out.tls_verify.push_back(0);
+  out.dns_hostname.emplace_back("");
+  out.dns_protocol.emplace_back("");
+  out.dns_qtype.emplace_back("");
+  out.dns_edns0.push_back(0);
+  out.dns_ecs_subnet.emplace_back("");
+  out.dhcp_client_mac.emplace_back("");
+  out.dhcp_version.push_back(0);
+  out.igmp_group_ip.emplace_back("");
+  out.igmp_version.push_back(0);
+  out.nd_target_ip.emplace_back("");
+}
+
+// Helper: push default base fields (request_kind through tcp_expect_timeout_ms) for L7 events.
+static void emit_base_defaults(PackedEvents& out) {
+  out.request_kind.emplace_back("");
+  out.method.emplace_back("");
+  out.path.emplace_back("");
+  out.body_template.emplace_back("");
+  out.headers_idx.push_back(intern_map({}, out.headers_pool, out.headers_hash_index));
+  out.cookies_idx.push_back(intern_map({}, out.cookies_pool, out.cookies_hash_index));
+  out.device_profile.emplace_back("");
+  out.timeout_ms.push_back(0);
+  out.retry_count.push_back(0);
+  out.on_failure.emplace_back("retry");
+  out.think_min_ms.push_back(0);
+  out.think_max_ms.push_back(0);
+  out.think_distribution.emplace_back("uniform");
+  out.think_mean_ms.push_back(0);
+  out.think_stddev_ms.push_back(0);
+  out.tcp_dst_port.push_back(0);
+  out.tcp_payload.emplace_back("");
+  out.tcp_expect_condition.emplace_back("");
+  out.tcp_expect_timeout_ms.push_back(0);
+}
+
 static void compile_flow_recursive_packed(
     const ScenarioSpecNative& spec,
     const std::string& flow_name,
@@ -294,6 +392,7 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.emplace_back("");
         out.tcp_expect_timeout_ms.push_back(0);
+        emit_l7_defaults(out);
         st.emitted += 1;
         break;
       }
@@ -352,6 +451,7 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.emplace_back("");
         out.tcp_expect_timeout_ms.push_back(0);
+        emit_l7_defaults(out);
         st.emitted += 1;
         break;
       }
@@ -377,6 +477,7 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.emplace_back("");
         out.tcp_expect_timeout_ms.push_back(0);
+        emit_l7_defaults(out);
         st.emitted += 1;
         break;
       }
@@ -402,6 +503,7 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.push_back(step.payload_template);
         out.tcp_expect_condition.emplace_back("");
         out.tcp_expect_timeout_ms.push_back(0);
+        emit_l7_defaults(out);
         st.emitted += 1;
         break;
       }
@@ -427,6 +529,7 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.push_back(step.condition);
         out.tcp_expect_timeout_ms.push_back(step.timeout_ms);
+        emit_l7_defaults(out);
         st.emitted += 1;
         break;
       }
@@ -452,6 +555,124 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.emplace_back("");
         out.tcp_expect_timeout_ms.push_back(0);
+        emit_l7_defaults(out);
+        st.emitted += 1;
+        break;
+      }
+      // L7 protocol emulation actions (Faz 5).
+      case StepType::TlsConnect:
+      case StepType::TlsDisconnect: {
+        st.attempted += 1;
+        out.event_kind.push_back(step.type == StepType::TlsConnect ? 6 : 7);
+        emit_base_defaults(out);
+        out.tls_sni.push_back(step.tls_sni);
+        out.tls_alpn.push_back(step.tls_alpn);
+        out.tls_cipher_list.push_back(step.tls_cipher_list);
+        out.tls_verify.push_back(step.tls_verify);
+        out.dns_hostname.emplace_back("");
+        out.dns_protocol.emplace_back("");
+        out.dns_qtype.emplace_back("");
+        out.dns_edns0.push_back(0);
+        out.dns_ecs_subnet.emplace_back("");
+        out.dhcp_client_mac.emplace_back("");
+        out.dhcp_version.push_back(0);
+        out.igmp_group_ip.emplace_back("");
+        out.igmp_version.push_back(0);
+        out.nd_target_ip.emplace_back("");
+        st.emitted += 1;
+        break;
+      }
+      case StepType::DnsResolve: {
+        st.attempted += 1;
+        out.event_kind.push_back(8);
+        emit_base_defaults(out);
+        out.tls_sni.emplace_back("");
+        out.tls_alpn.emplace_back("");
+        out.tls_cipher_list.emplace_back("");
+        out.tls_verify.push_back(0);
+        out.dns_hostname.push_back(step.dns_hostname);
+        out.dns_protocol.push_back(step.dns_protocol);
+        out.dns_qtype.push_back(step.dns_qtype);
+        out.dns_edns0.push_back(step.dns_edns0);
+        out.dns_ecs_subnet.push_back(step.dns_ecs_subnet);
+        out.dhcp_client_mac.emplace_back("");
+        out.dhcp_version.push_back(0);
+        out.igmp_group_ip.emplace_back("");
+        out.igmp_version.push_back(0);
+        out.nd_target_ip.emplace_back("");
+        st.emitted += 1;
+        break;
+      }
+      case StepType::DhcpAcquire:
+      case StepType::DhcpRelease: {
+        st.attempted += 1;
+        out.event_kind.push_back(step.type == StepType::DhcpAcquire ? 9 : 10);
+        emit_base_defaults(out);
+        out.tls_sni.emplace_back("");
+        out.tls_alpn.emplace_back("");
+        out.tls_cipher_list.emplace_back("");
+        out.tls_verify.push_back(0);
+        out.dns_hostname.emplace_back("");
+        out.dns_protocol.emplace_back("");
+        out.dns_qtype.emplace_back("");
+        out.dns_edns0.push_back(0);
+        out.dns_ecs_subnet.emplace_back("");
+        out.dhcp_client_mac.push_back(step.dhcp_client_mac);
+        out.dhcp_version.push_back(step.dhcp_version);
+        out.igmp_group_ip.emplace_back("");
+        out.igmp_version.push_back(0);
+        out.nd_target_ip.emplace_back("");
+        st.emitted += 1;
+        break;
+      }
+      case StepType::ArpResolve: {
+        st.attempted += 1;
+        out.event_kind.push_back(11);
+        emit_base_defaults(out);
+        emit_l7_defaults(out);
+        st.emitted += 1;
+        break;
+      }
+      case StepType::IgmpJoin:
+      case StepType::IgmpLeave: {
+        st.attempted += 1;
+        out.event_kind.push_back(step.type == StepType::IgmpJoin ? 12 : 13);
+        emit_base_defaults(out);
+        out.tls_sni.emplace_back("");
+        out.tls_alpn.emplace_back("");
+        out.tls_cipher_list.emplace_back("");
+        out.tls_verify.push_back(0);
+        out.dns_hostname.emplace_back("");
+        out.dns_protocol.emplace_back("");
+        out.dns_qtype.emplace_back("");
+        out.dns_edns0.push_back(0);
+        out.dns_ecs_subnet.emplace_back("");
+        out.dhcp_client_mac.emplace_back("");
+        out.dhcp_version.push_back(0);
+        out.igmp_group_ip.push_back(step.igmp_group_ip);
+        out.igmp_version.push_back(step.igmp_version);
+        out.nd_target_ip.emplace_back("");
+        st.emitted += 1;
+        break;
+      }
+      case StepType::Ipv6NdSolicit: {
+        st.attempted += 1;
+        out.event_kind.push_back(14);
+        emit_base_defaults(out);
+        out.tls_sni.emplace_back("");
+        out.tls_alpn.emplace_back("");
+        out.tls_cipher_list.emplace_back("");
+        out.tls_verify.push_back(0);
+        out.dns_hostname.emplace_back("");
+        out.dns_protocol.emplace_back("");
+        out.dns_qtype.emplace_back("");
+        out.dns_edns0.push_back(0);
+        out.dns_ecs_subnet.emplace_back("");
+        out.dhcp_client_mac.emplace_back("");
+        out.dhcp_version.push_back(0);
+        out.igmp_group_ip.emplace_back("");
+        out.igmp_version.push_back(0);
+        out.nd_target_ip.push_back(step.nd_target_ip);
         st.emitted += 1;
         break;
       }

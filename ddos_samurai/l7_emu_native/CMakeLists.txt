@@ -23,6 +23,12 @@ endif()
 set(SAMURAI_L7EMU_SOURCES
   engine.cpp
   bridge.cpp
+  tls_session_engine.cpp
+  dns_client_engine.cpp
+  l2l3_stack/dhcp_state_machine.cpp
+  l2l3_stack/arp_engine.cpp
+  l2l3_stack/igmp_engine.cpp
+  l2l3_stack/nd_engine.cpp
   custom_quic_stack/crypto_backend.cpp
   custom_quic_stack/h3_control_plane.cpp
   custom_quic_stack/h3_minimal_client.cpp
@@ -73,3 +79,7 @@ endif()
 if(SAMURAI_QUIC_BACKENDS)
   target_link_libraries(samurai_l7emu PUBLIC ${NGTCP2_LIBRARIES} ${NGTCP2_GNUTLS_LIBRARIES} ${NGHTTP3_LIBRARIES} ${GNUTLS_LIBRARIES})
 endif()
+
+add_executable(test_l2l3_astf test_l2l3_astf.cpp)
+target_link_libraries(test_l2l3_astf PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
+

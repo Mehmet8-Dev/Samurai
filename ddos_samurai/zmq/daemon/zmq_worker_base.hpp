@@ -9,7 +9,8 @@
 
 namespace samurai::daemon {
 
-inline samurai::wire::SamuraiWireHeaderV1 MakeHeader(
+inline samurai::wire::SamuraiWireHeaderV1 MakeHeaderV(
+    std::uint8_t version,
     std::uint8_t msg_type,
     std::uint32_t payload_len,
     std::uint64_t correlation_id,
@@ -17,7 +18,7 @@ inline samurai::wire::SamuraiWireHeaderV1 MakeHeader(
     const std::string& job_id) {
   samurai::wire::SamuraiWireHeaderV1 header{};
   header.magic = samurai::wire::kMagic;
-  header.version = samurai::wire::kVersionV1;
+  header.version = version;
   header.msg_type = msg_type;
   header.payload_len = payload_len;
   header.flags = 0;
@@ -27,6 +28,16 @@ inline samurai::wire::SamuraiWireHeaderV1 MakeHeader(
   std::memcpy(header.job_id, job_id.data(), std::min(job_id.size(), sizeof(header.job_id) - 1));
   std::memset(header.pad, 0, sizeof(header.pad));
   return header;
+}
+
+inline samurai::wire::SamuraiWireHeaderV1 MakeHeader(
+    std::uint8_t msg_type,
+    std::uint32_t payload_len,
+    std::uint64_t correlation_id,
+    samurai::wire::WorkerKind worker_kind,
+    const std::string& job_id) {
+  return MakeHeaderV(
+      samurai::wire::kVersionV1, msg_type, payload_len, correlation_id, worker_kind, job_id);
 }
 
 inline std::string ReadJobId(const samurai::wire::SamuraiWireHeaderV1& header) {

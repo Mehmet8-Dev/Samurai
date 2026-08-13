@@ -74,6 +74,24 @@ inline samurai_pacing_config_t PacingFromEnvelope(const samurai::wire::JobEnvelo
   return out;
 }
 
+// Version-agnostic overload: derives the pacing config from either a V1 or a V2
+// envelope payload (the pacing fields live in the shared V1 prefix).
+inline samurai_pacing_config_t PacingFromEnvelope(
+    const samurai::wire::SamuraiWireHeaderV1& header, const std::uint8_t* payload) {
+  samurai_pacing_config_t out{};
+  if (payload == nullptr) {
+    return out;
+  }
+  if (header.version == samurai::wire::kVersionV2) {
+    samurai::wire::JobEnvelopeV2 env{};
+    std::memcpy(&env, payload, sizeof(env));
+    return PacingFromEnvelope(env.base);
+  }
+  samurai::wire::JobEnvelopeV1 env{};
+  std::memcpy(&env, payload, sizeof(env));
+  return PacingFromEnvelope(env);
+}
+
 inline samurai::wire::MetricSnapshotV1 BuildSnapshot(
     std::uint64_t now_ns,
     std::uint64_t start_ns,
@@ -103,6 +121,12 @@ inline samurai::wire::MetricSnapshotV1 BuildSnapshot(
 }
 
 inline std::vector<std::uint8_t> SerializeSnapshot(const samurai::wire::MetricSnapshotV1& snap) {
+  std::vector<std::uint8_t> payload(sizeof(snap));
+  std::memcpy(payload.data(), &snap, sizeof(snap));
+  return payload;
+}
+
+inline std::vector<std::uint8_t> SerializeSnapshotV2(const samurai::wire::MetricSnapshotV2& snap) {
   std::vector<std::uint8_t> payload(sizeof(snap));
   std::memcpy(payload.data(), &snap, sizeof(snap));
   return payload;

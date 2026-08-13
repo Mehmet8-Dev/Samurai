@@ -27,13 +27,37 @@ struct FlowOp {
   std::string capture_source;
   int think_time_ms{0};
   int loop_count{0};
+
+  // TLS action fields
+  std::string tls_sni{};
+  std::string tls_alpn{};
+  std::string tls_cipher_list{};
+  int tls_verify{0};
+
+  // DNS action fields
+  std::string dns_hostname{};
+  std::string dns_protocol{"udp"};
+  std::string dns_qtype{"A"};
+  int dns_edns0{0};
+  std::string dns_ecs_subnet{};
+
+  // DHCP action fields
+  std::string dhcp_client_mac{};
+  int dhcp_version{4};
+
+  // IGMP action fields
+  std::string igmp_group_ip{};
+  int igmp_version{2};
+
+  // IPv6 ND action fields
+  std::string nd_target_ip{};
 };
 
 struct Profile {
   std::string protocol;
   std::string sender_path;
   std::string transport_backend{"custom_tcp"};
-  std::string stateful_runtime_backend{"afxdp"};
+  std::string stateful_runtime_backend{"kernel"};
   int stateful_runtime_strict{0};
   int legacy_mode{0};
   std::string source_ip;
@@ -82,6 +106,8 @@ enum class ReactorBackend {
 enum class TransportBackend {
   CustomTcp = 0,
   CustomQuic = 1,
+  KernelSocket = 2,
+  DpdkDirect = 3,
 };
 
 enum class TlsBackend {
@@ -114,6 +140,10 @@ inline const char* transport_backend_name(TransportBackend backend) {
       return "custom_tcp";
     case TransportBackend::CustomQuic:
       return "custom_quic";
+    case TransportBackend::KernelSocket:
+      return "kernel_socket";
+    case TransportBackend::DpdkDirect:
+      return "dpdk_direct";
   }
   return "unknown";
 }

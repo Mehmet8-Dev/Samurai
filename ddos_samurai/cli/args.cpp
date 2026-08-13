@@ -38,6 +38,17 @@ void PrintUsage(const char* argv0) {
       "  --pin-cpu N         pin worker to CPU core (default: -1 = none)\n"
       "  --timeout-ms N      per-recv timeout on the events channel (default: 5000)\n"
       "  --profile NAME      apply a named workload profile (put before overrides)\n"
+      "  --l7-protocol NAME  L7 protocol: http1|http2|quic|dns (default: http1)\n"
+      "  --l7-profile-file PATH  L7 JSON profile used as the emu scenario (scenario_payload_ref)\n"
+      "  --l7-payload-file PATH  raw request bytes file (payload_ref)\n"
+      "  --concurrency N     L7 parallel lanes/threads (default: 1)\n"
+      "  --max-connections N L7 connection pool size (default: 1)\n"
+      "  --max-streams N     L7 H2/H3 streams per connection (default: 1)\n"
+      "  --scheme NAME       L7 scheme http|https (default: derived from protocol)\n"
+      "  --verify-tls        verify the peer TLS certificate (default: off)\n"
+      "  --keepalive         reuse L7 connections across requests (default: off)\n"
+      "  --host-header NAME  L7 Host/SNI override (default: target IP)\n"
+      "  --l7-timeout-ms N   L7 per-request timeout ms (default: 5000)\n"
       "  --list-profiles     list the available workload profiles and exit\n"
       "  --allow-public-target        permit non-private/loopback targets\n"
       "  --allow-target IP|CIDR       allowlist a target (repeatable)\n"
@@ -83,6 +94,37 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
     } else if (a == "--protocol") {
       if (!NeedsValue(i, argc, "--protocol")) return ParseStatus::kError;
       out.job.protocol = argv[++i];
+    } else if (a == "--l7-protocol") {
+      if (!NeedsValue(i, argc, "--l7-protocol")) return ParseStatus::kError;
+      out.job.protocol = argv[++i];
+    } else if (a == "--l7-profile-file") {
+      if (!NeedsValue(i, argc, "--l7-profile-file")) return ParseStatus::kError;
+      out.job.l7_profile_file = argv[++i];
+    } else if (a == "--l7-payload-file") {
+      if (!NeedsValue(i, argc, "--l7-payload-file")) return ParseStatus::kError;
+      out.job.l7_payload_file = argv[++i];
+    } else if (a == "--concurrency") {
+      if (!NeedsValue(i, argc, "--concurrency")) return ParseStatus::kError;
+      out.job.concurrency = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--max-connections") {
+      if (!NeedsValue(i, argc, "--max-connections")) return ParseStatus::kError;
+      out.job.max_connections = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--max-streams") {
+      if (!NeedsValue(i, argc, "--max-streams")) return ParseStatus::kError;
+      out.job.max_streams_per_connection = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--scheme") {
+      if (!NeedsValue(i, argc, "--scheme")) return ParseStatus::kError;
+      out.job.scheme = argv[++i];
+    } else if (a == "--verify-tls") {
+      out.job.verify_tls = 1;
+    } else if (a == "--keepalive") {
+      out.job.keepalive = 1;
+    } else if (a == "--host-header") {
+      if (!NeedsValue(i, argc, "--host-header")) return ParseStatus::kError;
+      out.job.host_header = argv[++i];
+    } else if (a == "--l7-timeout-ms") {
+      if (!NeedsValue(i, argc, "--l7-timeout-ms")) return ParseStatus::kError;
+      out.job.l7_timeout_ms = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
     } else if (a == "--vector") {
       if (!NeedsValue(i, argc, "--vector")) return ParseStatus::kError;
       out.job.attack_vector = argv[++i];
@@ -119,6 +161,21 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
     } else if (a == "--kpi-min-sent") {
       if (!NeedsValue(i, argc, "--kpi-min-sent")) return ParseStatus::kError;
       out.kpi.min_sent = std::strtod(argv[++i], nullptr);
+    } else if (a == "--kpi-min-tls-handshakes") {
+      if (!NeedsValue(i, argc, "--kpi-min-tls-handshakes")) return ParseStatus::kError;
+      out.kpi.min_tls_handshakes = std::strtod(argv[++i], nullptr);
+    } else if (a == "--kpi-min-dns-queries") {
+      if (!NeedsValue(i, argc, "--kpi-min-dns-queries")) return ParseStatus::kError;
+      out.kpi.min_dns_queries = std::strtod(argv[++i], nullptr);
+    } else if (a == "--kpi-min-dhcp-leases") {
+      if (!NeedsValue(i, argc, "--kpi-min-dhcp-leases")) return ParseStatus::kError;
+      out.kpi.min_dhcp_leases = std::strtod(argv[++i], nullptr);
+    } else if (a == "--kpi-min-zc-tx-bytes") {
+      if (!NeedsValue(i, argc, "--kpi-min-zc-tx-bytes")) return ParseStatus::kError;
+      out.kpi.min_zc_tx_bytes = std::strtod(argv[++i], nullptr);
+    } else if (a == "--kpi-max-tcp-overflows") {
+      if (!NeedsValue(i, argc, "--kpi-max-tcp-overflows")) return ParseStatus::kError;
+      out.kpi.max_tcp_overflows = std::strtod(argv[++i], nullptr);
     } else if (a == "--allow-public-target") {
       out.allow_public = true;
     } else if (a == "--allow-target") {

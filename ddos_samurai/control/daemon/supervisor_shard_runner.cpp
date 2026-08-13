@@ -46,6 +46,17 @@ JobOptions JobFromArgs(const Value& a) {
   j.ttl = static_cast<std::uint8_t>(IntArg(a, "ttl", 64));
   j.spoof = BoolArg(a, "spoof", false);
   j.spoof_mode = StrArg(a, "spoof_mode", "");
+  j.l7_profile_file = StrArg(a, "l7_profile_file", StrArg(a, "scenario_payload_ref", ""));
+  j.l7_payload_file = StrArg(a, "l7_payload_file", StrArg(a, "payload_ref", ""));
+  j.concurrency = static_cast<std::uint32_t>(std::max<int64_t>(1, IntArg(a, "concurrency", 1)));
+  j.max_connections = static_cast<std::uint32_t>(std::max<int64_t>(1, IntArg(a, "max_connections", 1)));
+  j.max_streams_per_connection =
+      static_cast<std::uint32_t>(std::max<int64_t>(1, IntArg(a, "max_streams_per_connection", 1)));
+  j.scheme = StrArg(a, "scheme", "");
+  j.host_header = StrArg(a, "host_header", "");
+  j.verify_tls = BoolArg(a, "verify_tls", false) ? 1u : 0u;
+  j.keepalive = BoolArg(a, "keepalive", false) ? 1u : 0u;
+  j.l7_timeout_ms = static_cast<std::uint32_t>(std::max<int64_t>(1, IntArg(a, "l7_timeout_ms", 5000)));
   return j;
 }
 }  // namespace

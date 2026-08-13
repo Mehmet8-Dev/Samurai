@@ -29,8 +29,10 @@ int SendWire(
     samurai::wire::WorkerKind kind,
     const std::string& job_id,
     const std::uint8_t* payload,
-    std::size_t payload_len) {
-  const auto header = samurai::daemon::MakeHeader(
+    std::size_t payload_len,
+    std::uint8_t version = samurai::wire::kVersionV1) {
+  const auto header = samurai::daemon::MakeHeaderV(
+      version,
       static_cast<std::uint8_t>(type),
       static_cast<std::uint32_t>(payload_len),
       correlation_id,
@@ -128,7 +130,23 @@ int RunJob(const SupervisorConfig& cfg, const JobOptions& job, RunStats& out_sta
 
   const std::string job_id = "cli-job";
   const std::uint64_t correlation_id = 1;
-  const samurai::wire::JobEnvelopeV1 env = BuildJobEnvelope(job);
+
+  std::uint8_t envelope_version = samurai::wire::kVersionV1;
+  const std::uint8_t* envelope_ptr = nullptr;
+  std::size_t envelope_size = 0;
+  // Per-call locals: must not be static — each RunJob needs a fresh envelope.
+  samurai::wire::JobEnvelopeV2 env_v2{};
+  samurai::wire::JobEnvelopeV1 env_v1{};
+  if (cfg.worker.kind == samurai::wire::WorkerKind::L7) {
+    env_v2 = BuildJobEnvelopeV2(job);
+    envelope_version = samurai::wire::kVersionV2;
+    envelope_ptr = reinterpret_cast<const std::uint8_t*>(&env_v2);
+    envelope_size = sizeof(env_v2);
+  } else {
+    env_v1 = BuildJobEnvelope(job);
+    envelope_ptr = reinterpret_cast<const std::uint8_t*>(&env_v1);
+    envelope_size = sizeof(env_v1);
+  }
 
   (void)SendWire(
       jobs,
@@ -136,8 +154,9 @@ int RunJob(const SupervisorConfig& cfg, const JobOptions& job, RunStats& out_sta
       correlation_id,
       cfg.worker.kind,
       job_id,
-      reinterpret_cast<const std::uint8_t*>(&env),
-      sizeof(env));
+      envelope_ptr,
+      envelope_size,
+      envelope_version);
 
   int idle = 0;
   bool done = false;
@@ -163,7 +182,12 @@ int RunJob(const SupervisorConfig& cfg, const JobOptions& job, RunStats& out_sta
       if (samurai::wire::IsHeaderV1Compatible(h)) {
         switch (static_cast<MessageType>(h.msg_type)) {
           case MessageType::METRIC_SNAPSHOT:
-            if (plen >= sizeof(samurai::wire::MetricSnapshotV1)) {
+            if (plen >= sizeof(samurai::wire::MetricSnapshotV2)) {
+              samurai::wire::MetricSnapshotV2 s2{};
+              std::memcpy(&s2, pl, sizeof(s2));
+              AccumulateSnapshotV2(stats, s2);
+              PrintSnapshot(s2.base);
+            } else if (plen >= sizeof(samurai::wire::MetricSnapshotV1)) {
               samurai::wire::MetricSnapshotV1 s{};
               std::memcpy(&s, pl, sizeof(s));
               AccumulateSnapshot(stats, s);

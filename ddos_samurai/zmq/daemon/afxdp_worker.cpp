@@ -17,6 +17,7 @@
 #include <zmq.h>
 
 #include "../../ddos_samurai/xdp/xdp_native_api.h"
+#include "bridge.hpp"
 #include "engine.hpp"
 #include "pacing_engine.h"
 #include "wire_protocol.h"
@@ -460,6 +461,37 @@ int main(int argc, char** argv) {
           int local_off = 0;
           int retry_zeros = 0;
           while (remaining > 0) {
+            const std::uint8_t* raw_base = nullptr;
+            std::uint32_t raw_count = 0;
+            std::size_t raw_pkt_size = 0;
+            std::size_t raw_stride = 0;
+            if ((cfg.attack_vector == "l7_custom_tcp" || cfg.protocol == "custom_tcp") &&
+                ddos_samurai::l7_emu_native::peek_custom_tcp_tx_packets_raw(
+                    static_cast<std::uint32_t>(remaining), &raw_base, &raw_count, &raw_pkt_size, &raw_stride) == 0 &&
+                raw_base != nullptr && raw_count > 0) {
+              int sent = 0;
+              xdp_err[0] = '\0';
+              if (xdp.api->send_buffer_strided) {
+                sent = xdp.api->send_buffer_strided(
+                    ctx_guard.handle,
+                    raw_base,
+                    static_cast<int>(raw_pkt_size),
+                    static_cast<int>(raw_stride),
+                    static_cast<int>(raw_count),
+                    xdp_err,
+                    sizeof(xdp_err));
+              }
+              if (sent > 0) {
+                std::uint32_t consumed = 0;
+                ddos_samurai::l7_emu_native::consume_custom_tcp_tx_packets_raw(static_cast<std::uint32_t>(sent), &consumed);
+                packets_sent += static_cast<std::uint64_t>(sent);
+                bytes_sent += static_cast<std::uint64_t>(sent) * static_cast<std::uint64_t>(raw_stride);
+                local_off += sent;
+                remaining -= sent;
+                continue;
+              }
+            }
+
             const std::uint8_t* buf = pool.data() + (static_cast<std::size_t>(offset + local_off) * stride);
             xdp_err[0] = '\0';
             int sent = 0;

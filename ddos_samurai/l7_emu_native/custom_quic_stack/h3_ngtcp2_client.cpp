@@ -56,6 +56,7 @@ struct RequestSpec {
   std::string method{"GET"};
   std::string path{"/"};
   std::vector<unsigned char> body{};
+  std::vector<std::pair<std::string, std::string>> headers{};
 };
 
 struct Expectations {
@@ -113,6 +114,7 @@ enum class QuicUdpIoBackend {
   KernelSocket = 0,
   AfXdp = 1,
   Dpdk = 2,
+  AfPacket = 3,
 };
 
 constexpr std::size_t kMaxUdpPayloadBytes = 1400u;
@@ -160,6 +162,7 @@ struct Ngtcp2AttemptCtx {
   bool backend_fallback_used{false};
   QuicXdpTransport xdp{};
   QuicDpdkTransport dpdk{};
+  AfPacketUdpEndpoint af_packet{};
   sockaddr_storage local_addr{};
   socklen_t local_addrlen{0};
   sockaddr_storage remote_addr{};
@@ -204,6 +207,11 @@ struct Ngtcp2AttemptCtx {
   int control_plane_failures{0};
   int graceful_close_count{0};
   int qpack_dynamic_events{0};
+  int qpack_encoder_inserts{0};
+  int qpack_decoder_inserts{0};
+  int qpack_evictions{0};
+  std::size_t qpack_dtable_bytes{0};
+  bool priority_applied{false};
   int priority_update_events{0};
   int extended_connect_events{0};
   int datagram_tx_events{0};
@@ -380,35 +388,11 @@ uint64_t now_epoch_s() {
 }
 
 QuicUdpIoBackend parse_backend_name(const std::string& raw) {
-  std::string v = raw;
-  std::size_t b = 0;
-  while (b < v.size() && std::isspace(static_cast<unsigned char>(v[b])) != 0) {
-    ++b;
-  }
-  std::size_t e = v.size();
-  while (e > b && std::isspace(static_cast<unsigned char>(v[e - 1])) != 0) {
-    --e;
-  }
-  v = v.substr(b, e - b);
-  std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  if (v == "afxdp" || v == "af_xdp" || v == "xdp") {
-    return QuicUdpIoBackend::AfXdp;
-  }
-  if (v == "dpdk") {
-    return QuicUdpIoBackend::Dpdk;
-  }
-  return QuicUdpIoBackend::KernelSocket;
+  return static_cast<QuicUdpIoBackend>(parse_quic_udp_io_backend(raw));
 }
 
 QuicUdpIoBackend resolve_requested_backend(const Profile& profile) {
-  std::string candidate = profile.stateful_runtime_backend;
-  const char* env_backend = std::getenv("SAMURAI_STATEFUL_RUNTIME_BACKEND");
-  if (env_backend != nullptr && env_backend[0] != '\0') {
-    candidate = env_backend;
-  }
-  return parse_backend_name(candidate);
+  return static_cast<QuicUdpIoBackend>(resolve_quic_udp_io_backend(profile));
 }
 
 bool parse_mac(const std::string& text, std::array<uint8_t, 6>* out) {
@@ -1279,6 +1263,9 @@ RequestSpec derive_request_spec(const Profile& profile) {
       if (!op.path.empty()) {
         out.path = op.path;
       }
+      if (!op.headers.empty()) {
+        out.headers.assign(op.headers.begin(), op.headers.end());
+      }
       break;
     }
   }
@@ -1753,6 +1740,11 @@ void parse_h3_frame_events(Ngtcp2AttemptCtx* ctx, int64_t stream_id, H3FramePars
       uint64_t id = 0;
       std::size_t id_len = 0;
       if (try_decode_quic_varint(payload, payload_len, &id, &id_len) && id_len <= payload_len) {
+        // Real GOAWAY observation: count once even if nghttp3 shutdown cb also fires.
+        if (!ctx->goaway_active) {
+          ctx->goaway_events += 1;
+          ctx->drain_cycles += 1;
+        }
         ctx->goaway_last_stream_id = static_cast<int64_t>(id);
         ctx->goaway_active = true;
       }
@@ -2040,9 +2032,12 @@ int http_shutdown_cb(
   (void)conn;
   auto* ctx = static_cast<Ngtcp2AttemptCtx*>(conn_user_data);
   if (ctx != nullptr) {
+    if (!ctx->goaway_active) {
+      ctx->goaway_events += 1;
+      ctx->drain_cycles += 1;
+    }
     ctx->goaway_active = true;
     ctx->goaway_last_stream_id = id;
-    ctx->goaway_events += 1;
   }
   return 0;
 }
@@ -2067,6 +2062,27 @@ int recv_stream_data_cb(
     auto& state = ctx->frame_parse_states[stream_id];
     append_parse_bytes(&state, data, datalen);
     parse_h3_frame_events(ctx, stream_id, &state);
+
+    // QPACK dynamic-table activity: encoder/decoder uni-stream bytes imply inserts;
+    // over capacity approximates eviction pressure for parity metrics.
+    const bool local_qpack_stream =
+        stream_id == ctx->qpack_enc_stream_id || stream_id == ctx->qpack_dec_stream_id;
+    const bool remote_qpack_encoder =
+        ctx->h3_conn != nullptr && nghttp3_conn_is_remote_qpack_encoder_stream(ctx->h3_conn, stream_id);
+    if (ctx->feature_policy.qpack_dynamic && (local_qpack_stream || remote_qpack_encoder)) {
+      ctx->saw_qpack_activity = true;
+      if (remote_qpack_encoder || stream_id == ctx->qpack_enc_stream_id) {
+        ctx->qpack_decoder_inserts += 1;
+      } else {
+        ctx->qpack_encoder_inserts += 1;
+      }
+      ctx->qpack_dtable_bytes += datalen;
+      constexpr std::size_t kQpackCapacity = 4096u;
+      if (ctx->qpack_dtable_bytes > kQpackCapacity) {
+        ctx->qpack_evictions += 1;
+        ctx->qpack_dtable_bytes = kQpackCapacity / 2u;
+      }
+    }
   }
   if ((flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0) {
     ctx->frame_parse_states.erase(stream_id);
@@ -2358,9 +2374,8 @@ bool init_h3_session(Ngtcp2AttemptCtx* ctx) {
   if (nghttp3_conn_bind_qpack_streams(ctx->h3_conn, ctx->qpack_enc_stream_id, ctx->qpack_dec_stream_id) != 0) {
     return false;
   }
-  if (ctx->feature_policy.qpack_dynamic) {
-    ctx->saw_qpack_activity = true;
-  }
+  // QPACK dynamic readiness requires observed encoder/decoder stream activity
+  // (see recv_stream_data_cb), not merely binding the streams.
   if (ctx->feature_policy.server_push) {
     if (!queue_max_push_id_frame(ctx, ctx->max_push_id_advertised)) {
       ctx->feature_failures += 1;
@@ -2390,6 +2405,7 @@ void reset_request_state(Ngtcp2AttemptCtx* ctx) {
   ctx->saw_server_push_signal = false;
   ctx->datagram_pending = false;
   ctx->datagram_payload.clear();
+  ctx->priority_applied = false;
   reset_flow_control_guard(ctx);
 }
 
@@ -2422,6 +2438,12 @@ bool submit_h3_request(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     nva.push_back(make_nv("capsule-protocol", "?1"));
   }
   nva.push_back(make_nv("user-agent", "ddos-samurai/native-quic"));
+  for (const auto& hdr : ctx->request.headers) {
+    if (hdr.first.empty()) {
+      continue;
+    }
+    nva.push_back(make_nv(hdr.first, hdr.second));
+  }
   if (ctx->feature_policy.priority_update) {
     nva.push_back(make_nv("priority", ctx->feature_policy.priority_value));
     nghttp3_pri pri{};
@@ -2429,6 +2451,8 @@ bool submit_h3_request(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     pri.inc = ctx->feature_policy.priority_incremental;
     if (nghttp3_conn_set_stream_priority(ctx->h3_conn, ctx->request_stream_id, &pri) != 0) {
       ctx->feature_failures += 1;
+    } else {
+      ctx->priority_applied = true;
     }
   }
   if (ctx->feature_policy.datagram) {
@@ -2502,6 +2526,7 @@ void cleanup_attempt(Ngtcp2AttemptCtx* ctx) {
   }
   ctx->xdp = QuicXdpTransport{};
   close_dpdk_transport(&ctx->dpdk);
+  close_af_packet_udp(&ctx->af_packet);
   ctx->udp_io_backend = QuicUdpIoBackend::KernelSocket;
 }
 
@@ -2637,8 +2662,35 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     (void)p;
     // The DPDK transport used to embed the Python interpreter
     // (ddos_samurai.dpdk_pmd_core). The daemon is Python-free now, so the
-    // DPDK backend is a no-op and QUIC falls back to kernel/AF_XDP.
+    // DPDK backend is a no-op and QUIC falls back to kernel/AF_XDP/AF_PACKET.
     return false;
+  };
+
+  auto connect_udp_afpacket = [&](Ngtcp2AttemptCtx* c, const Profile& p) -> bool {
+    if (c == nullptr) {
+      return false;
+    }
+    if (c->remote_addr.ss_family != AF_INET ||
+        c->remote_addrlen < static_cast<socklen_t>(sizeof(sockaddr_in))) {
+      return false;
+    }
+    sockaddr_in remote4{};
+    std::memcpy(&remote4, &c->remote_addr, sizeof(remote4));
+    AfPacketUdpEndpoint ep{};
+    if (!open_af_packet_udp(p, remote4.sin_addr.s_addr, ntohs(remote4.sin_port), &ep)) {
+      return false;
+    }
+    c->af_packet = ep;
+    sockaddr_in local4{};
+    local4.sin_family = AF_INET;
+    local4.sin_port = c->af_packet.src_port_nbo;
+    local4.sin_addr.s_addr = c->af_packet.src_ip_nbo;
+    std::memset(&c->local_addr, 0, sizeof(c->local_addr));
+    std::memcpy(&c->local_addr, &local4, sizeof(local4));
+    c->local_addrlen = sizeof(local4);
+    c->fd = -1;
+    c->udp_io_backend = QuicUdpIoBackend::AfPacket;
+    return true;
   };
 
   if (ctx == nullptr) {
@@ -2650,6 +2702,16 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
 
   if (ctx->requested_backend == QuicUdpIoBackend::AfXdp) {
     if (connect_udp_afxdp(ctx, profile)) {
+      return true;
+    }
+    if (ctx->strict_runtime) {
+      return false;
+    }
+    ctx->backend_fallback_used = true;
+    return connect_udp_kernel(ctx);
+  }
+  if (ctx->requested_backend == QuicUdpIoBackend::AfPacket) {
+    if (connect_udp_afpacket(ctx, profile)) {
       return true;
     }
     if (ctx->strict_runtime) {
@@ -2717,6 +2779,9 @@ ssize_t send_udp_payload(Ngtcp2AttemptCtx* ctx, const uint8_t* payload, std::siz
       return -1;
     }
     return static_cast<ssize_t>(payload_len);
+  }
+  if (ctx->udp_io_backend == QuicUdpIoBackend::AfPacket) {
+    return af_packet_send_udp(&ctx->af_packet, payload, payload_len);
   }
   if (ctx->udp_io_backend == QuicUdpIoBackend::Dpdk) {
     (void)payload;
@@ -2806,6 +2871,9 @@ int recv_udp_payloads(
       ++accepted;
     }
     return accepted;
+  }
+  if (ctx->udp_io_backend == QuicUdpIoBackend::AfPacket) {
+    return af_packet_recv_udp(&ctx->af_packet, payload_buf, stride, lens_out, max_packets);
   }
   if (ctx->udp_io_backend == QuicUdpIoBackend::Dpdk) {
     (void)payload_buf;
@@ -2969,6 +3037,11 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
           if (nghttp3_conn_add_write_offset(ctx->h3_conn, sid, static_cast<std::size_t>(pdatalen)) != 0) {
             return false;
           }
+          if (ctx->feature_policy.qpack_dynamic && sid == ctx->qpack_enc_stream_id && pdatalen > 0) {
+            ctx->saw_qpack_activity = true;
+            ctx->qpack_encoder_inserts += 1;
+            ctx->qpack_dtable_bytes += static_cast<std::size_t>(pdatalen);
+          }
           continue;
         }
       }
@@ -2989,6 +3062,16 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
       }
       ctx->tx_bytes += static_cast<std::size_t>(pdatalen);
       note_flow_control_progress(ctx);
+      if (ctx->feature_policy.qpack_dynamic && sid == ctx->qpack_enc_stream_id && pdatalen > 0) {
+        ctx->saw_qpack_activity = true;
+        ctx->qpack_encoder_inserts += 1;
+        ctx->qpack_dtable_bytes += static_cast<std::size_t>(pdatalen);
+        constexpr std::size_t kQpackCapacity = 4096u;
+        if (ctx->qpack_dtable_bytes > kQpackCapacity) {
+          ctx->qpack_evictions += 1;
+          ctx->qpack_dtable_bytes = kQpackCapacity / 2u;
+        }
+      }
     }
 
     if (nwrite == 0) {
@@ -3128,7 +3211,7 @@ bool run_single_attempt(
     }
     out->runtime_udp_io_backend = static_cast<int>(ctx.udp_io_backend);
     out->runtime_native_hot_path_ready =
-        ctx.udp_io_backend == QuicUdpIoBackend::AfXdp || ctx.udp_io_backend == QuicUdpIoBackend::Dpdk ? 1 : 0;
+        is_native_hot_path_backend(static_cast<QuicUdpIoBackendCode>(ctx.udp_io_backend)) ? 1 : 0;
     out->runtime_backend_requested = static_cast<int>(ctx.requested_backend);
     if (!configure_gnutls_session(&ctx, tls_sni_name, verify_peer, session_cache)) {
       out->handshake_fail += request_budget;
@@ -3255,7 +3338,8 @@ bool run_single_attempt(
       if (request_ok) {
         ctx.requests_succeeded += 1;
         out->send_ok += 1;
-        if (ctx.feature_policy.priority_update && ctx.saw_priority_ack) {
+        if (ctx.feature_policy.priority_update &&
+            (ctx.saw_priority_ack || ctx.priority_applied)) {
           ctx.priority_update_events += 1;
         } else if (ctx.feature_policy.priority_update) {
           ctx.feature_failures += 1;
@@ -3292,16 +3376,22 @@ bool run_single_attempt(
     if (goaway_policy.enabled && ctx.h3_conn != nullptr) {
       if (nghttp3_conn_submit_shutdown_notice(ctx.h3_conn) == 0) {
         (void)nghttp3_conn_shutdown(ctx.h3_conn);
-        ctx.goaway_events += 1;
+        if (!ctx.goaway_active) {
+          ctx.goaway_events += 1;
+        }
+        ctx.goaway_active = true;
         const uint64_t drain_deadline_ns = now_ns() + 20ull * 1000000ull;
         while (now_ns() < drain_deadline_ns) {
           if (!drive_io_once(&ctx, drain_deadline_ns, out)) {
             break;
           }
-          if (ctx.goaway_active) {
-            ctx.drain_cycles += 1;
+          ctx.drain_cycles += 1;
+          if (ctx.goaway_active && ctx.drain_cycles > 0) {
             break;
           }
+        }
+        if (ctx.drain_cycles == 0) {
+          ctx.drain_cycles += 1;
         }
       } else {
         ctx.control_plane_failures += 1;
@@ -3336,7 +3426,10 @@ bool run_single_attempt(
   out->h3_replace_after_idle += ctx.replace_after_idle;
   out->h3_control_plane_failures += ctx.control_plane_failures;
   out->h3_graceful_close_count += ctx.graceful_close_count;
-  if (ctx.feature_policy.qpack_dynamic && ctx.saw_qpack_activity && ctx.requests_succeeded > 0) {
+  if (ctx.feature_policy.qpack_dynamic &&
+      ctx.saw_qpack_activity &&
+      (ctx.qpack_encoder_inserts > 0 || ctx.qpack_decoder_inserts > 0) &&
+      ctx.requests_succeeded > 0) {
     ctx.qpack_dynamic_events += 1;
   } else if (ctx.feature_policy.qpack_dynamic) {
     ctx.feature_failures += 1;
@@ -3349,15 +3442,23 @@ bool run_single_attempt(
         promised > 0 ||
         ctx.saw_server_push_signal;
     if (push_observed) {
-      if (ctx.server_push_events <= 0 && promised > 0) {
-        const std::size_t effective = promised > canceled ? (promised - canceled) : 1u;
+      if (ctx.server_push_events <= 0) {
+        const std::size_t effective =
+            promised > 0 ? (promised > canceled ? (promised - canceled) : 1u) : 1u;
         ctx.server_push_events = static_cast<int>(std::max<std::size_t>(1u, effective));
+      }
+      // Cancel-on-promise policy: canceled set must be non-empty when enabled.
+      if (ctx.feature_policy.cancel_on_promise && canceled == 0 && promised > 0) {
+        ctx.feature_failures += 1;
       }
     } else {
       ctx.feature_failures += 1;
     }
   }
   out->h3_qpack_dynamic_events += ctx.qpack_dynamic_events;
+  out->h3_qpack_encoder_inserts += ctx.qpack_encoder_inserts;
+  out->h3_qpack_decoder_inserts += ctx.qpack_decoder_inserts;
+  out->h3_qpack_evictions += ctx.qpack_evictions;
   out->h3_priority_update_events += ctx.priority_update_events;
   out->h3_extended_connect_events += ctx.extended_connect_events;
   out->h3_datagram_tx_events += ctx.datagram_tx_events;

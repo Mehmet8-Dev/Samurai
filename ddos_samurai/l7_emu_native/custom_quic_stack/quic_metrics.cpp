@@ -33,8 +33,8 @@ std::map<std::string, double> init_quic_stats(
   out["runtime_transport_custom_tcp_bridge_ready"] = transport_backend == TransportBackend::CustomTcp ? 0.0 : 1.0;
   out["runtime_transport_custom_tcp_rx_bridge_active"] = 0.0;
   out["runtime_transport_seam_ready"] = transport_backend == TransportBackend::CustomTcp ? 0.0 : 1.0;
-  out["quic_runtime_udp_io_backend"] = 0.0;  // 0=kernel_socket, 1=af_xdp, 2=dpdk
-  out["quic_runtime_backend_requested"] = 0.0;  // 0=kernel/default, 1=af_xdp, 2=dpdk
+  out["quic_runtime_udp_io_backend"] = 0.0;  // 0=kernel_socket, 1=af_xdp, 2=dpdk, 3=af_packet
+  out["quic_runtime_backend_requested"] = 0.0;  // 0=kernel/default, 1=af_xdp, 2=dpdk, 3=af_packet
   out["quic_runtime_native_hot_path_ready"] = 0.0;
   out["quic_runtime_backend_fallback_count"] = 0.0;
 
@@ -69,6 +69,9 @@ std::map<std::string, double> init_quic_stats(
   out["quic_h3_control_plane_failures"] = 0.0;
   out["quic_h3_graceful_close_ratio"] = 0.0;
   out["quic_h3_qpack_dynamic_events"] = 0.0;
+  out["quic_h3_qpack_encoder_inserts"] = 0.0;
+  out["quic_h3_qpack_decoder_inserts"] = 0.0;
+  out["quic_h3_qpack_evictions"] = 0.0;
   out["quic_h3_priority_update_events"] = 0.0;
   out["quic_h3_extended_connect_events"] = 0.0;
   out["quic_h3_datagram_tx_events"] = 0.0;
@@ -146,6 +149,9 @@ void apply_quic_run_metrics(
   (*out)["quic_pto_count"] = static_cast<double>(recovery.pto_count);
   (*out)["quic_retransmission_count"] = static_cast<double>(recovery.retransmission_count);
   (*out)["quic_h3_qpack_dynamic_events"] = static_cast<double>(udp.h3_qpack_dynamic_events);
+  (*out)["quic_h3_qpack_encoder_inserts"] = static_cast<double>(udp.h3_qpack_encoder_inserts);
+  (*out)["quic_h3_qpack_decoder_inserts"] = static_cast<double>(udp.h3_qpack_decoder_inserts);
+  (*out)["quic_h3_qpack_evictions"] = static_cast<double>(udp.h3_qpack_evictions);
   (*out)["quic_h3_priority_update_events"] = static_cast<double>(udp.h3_priority_update_events);
   (*out)["quic_h3_extended_connect_events"] = static_cast<double>(udp.h3_extended_connect_events);
   (*out)["quic_h3_datagram_tx_events"] = static_cast<double>(udp.h3_datagram_tx_events);

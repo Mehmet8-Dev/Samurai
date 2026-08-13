@@ -466,6 +466,27 @@ FlowOp parse_op(const json::Value& obj) {
   op.capture_source = GetStr(obj, "capture_source");
   op.think_time_ms = GetInt(obj, "think_time_ms", op.think_time_ms);
   op.loop_count = GetInt(obj, "loop_count", op.loop_count);
+
+  // Parse L7 scenario fields
+  op.tls_sni = GetStr(obj, "tls_sni");
+  op.tls_alpn = GetStr(obj, "tls_alpn");
+  op.tls_cipher_list = GetStr(obj, "tls_cipher_list");
+  op.tls_verify = GetInt(obj, "tls_verify", op.tls_verify);
+
+  op.dns_hostname = GetStr(obj, "dns_hostname");
+  op.dns_protocol = GetStr(obj, "dns_protocol", op.dns_protocol);
+  op.dns_qtype = GetStr(obj, "dns_qtype", op.dns_qtype);
+  op.dns_edns0 = GetInt(obj, "dns_edns0", op.dns_edns0);
+  op.dns_ecs_subnet = GetStr(obj, "dns_ecs_subnet");
+
+  op.dhcp_client_mac = GetStr(obj, "dhcp_client_mac");
+  op.dhcp_version = GetInt(obj, "dhcp_version", op.dhcp_version);
+
+  op.igmp_group_ip = GetStr(obj, "igmp_group_ip");
+  op.igmp_version = GetInt(obj, "igmp_version", op.igmp_version);
+
+  op.nd_target_ip = GetStr(obj, "nd_target_ip");
+
   return op;
 }
 
@@ -590,12 +611,16 @@ json::Value run_profile_json(const json::Value& profile_dict, const json::Value&
   const bool is_quic_profile = ToLower(profile.protocol) == "quic";
   const bool runtime_requires_custom_tcp = strict_runtime && !is_quic_profile;
   const std::string requested_transport = ToLower(profile.transport_backend);
-  const bool requested_custom_tcp = requested_transport == "custom_tcp";
+  const std::string requested_stateful_backend = ToLower(profile.stateful_runtime_backend);
+  const bool requested_custom_tcp = requested_transport == "custom_tcp" || requested_transport == "dpdk" || requested_stateful_backend == "dpdk";
   const TransportBackend transport_backend =
-      (is_quic_profile &&
-       (requested_transport.empty() || requested_transport == "custom_tcp" || requested_transport == "custom_quic"))
+      is_quic_profile
           ? TransportBackend::CustomQuic
-          : TransportBackend::CustomTcp;
+          : (requested_transport == "kernel_socket"
+                 ? TransportBackend::KernelSocket
+                 : ((requested_transport == "dpdk" || requested_stateful_backend == "dpdk")
+                        ? TransportBackend::DpdkDirect
+                        : TransportBackend::CustomTcp));
 
   auto build_failed = [&](const std::string& reason, const std::string& detail) {
     json::Value failed = json::Value::Object();
@@ -1015,6 +1040,66 @@ json::Value topology_tuple_preview_json(const json::Value& compiled_plan, int sa
   return out;
 }
 
+FiveTuple generate_5tuple(const json::Value& compiled_plan, uint64_t index) {
+  FiveTuple tup{};
+  const json::Value* spec = compiled_plan.find("spec");
+  if (spec == nullptr || !spec->is_object()) {
+    return tup;
+  }
+  const json::Value* clients = spec->find("clients");
+  const json::Value* servers = spec->find("servers");
+  const json::Value* templates = spec->find("templates");
+  const json::Value* links = spec->find("links");
+  if (clients == nullptr || servers == nullptr || links == nullptr ||
+      clients->elements().empty() || servers->elements().empty() || links->elements().empty()) {
+    return tup;
+  }
+
+  const int seed = GetInt(compiled_plan, "seed", 0);
+  std::string allocator = "hash";
+  const json::Value* tuple_gen = spec->find("tuple_gen");
+  if (tuple_gen != nullptr && tuple_gen->is_object()) {
+    allocator = GetStr(*tuple_gen, "port_allocator", allocator);
+  }
+
+  const int idx = static_cast<int>(index);
+  const json::Value& l = links->elements()[static_cast<std::size_t>(index % links->elements().size())];
+  tup.client_group = GetStr(l, "client_group");
+  tup.server_group = GetStr(l, "server_group");
+  tup.template_name = GetStr(l, "template");
+
+  const json::Value* c = find_group(*clients, tup.client_group);
+  const json::Value* s = find_group(*servers, tup.server_group);
+  const json::Value* t = templates != nullptr ? find_group(*templates, tup.template_name) : nullptr;
+  if (c == nullptr || s == nullptr) return tup;
+
+  const json::Value* c_ranges = c->find("ip_ranges");
+  const json::Value* s_ranges = s->find("ip_ranges");
+  const json::Value* c_port_ranges = c->find("port_ranges");
+  const json::Value* s_ports = s->find("ports");
+
+  const json::Value kEmptyObj = json::Value::Object();
+  const json::Value kEmptyArr = json::Value::Array();
+  if (c_ranges == nullptr || !c_ranges->is_object()) c_ranges = &kEmptyObj;
+  if (s_ranges == nullptr || !s_ranges->is_object()) s_ranges = &kEmptyObj;
+  if (c_port_ranges == nullptr || !c_port_ranges->is_array()) c_port_ranges = &kEmptyArr;
+  if (s_ports == nullptr || !s_ports->is_array()) s_ports = &kEmptyArr;
+
+  const std::string c_dist = GetStr(*c, "dist", "uniform");
+  tup.client_ip = pick_ip(*c_ranges, idx, c_dist, tup.client_group + ":client_ip", seed);
+  tup.server_ip = pick_ip(*s_ranges, idx + 17, "uniform", tup.server_group + ":server_ip", seed);
+  tup.client_port = static_cast<uint16_t>(pick_client_port(
+      *c_port_ranges, idx, tup.client_ip + ":" + tup.server_ip + ":" + tup.template_name, allocator, seed));
+  tup.server_port = static_cast<uint16_t>(pick_server_port(
+      *s_ports, idx, tup.server_ip + ":" + tup.client_ip + ":" + tup.template_name, allocator, seed));
+
+  if (t != nullptr && t->contains("protocol")) {
+    tup.protocol = GetStr(*t, "protocol", "tcp");
+  }
+  return tup;
+}
+
+
 json::Value peek_custom_tcp_tx_buffer_strided_json() {
   const std::uint8_t* base = nullptr;
   std::uint32_t count = 0;
@@ -1042,6 +1127,23 @@ int consume_custom_tcp_tx_packets(std::uint32_t max_packets) {
     throw std::runtime_error("failed to consume custom TCP TX packets");
   }
   return static_cast<int>(consumed);
+}
+
+int peek_custom_tcp_tx_packets_raw(
+    std::uint32_t max_packets,
+    const std::uint8_t** out_base,
+    std::uint32_t* out_count,
+    std::size_t* out_packet_size,
+    std::size_t* out_stride) {
+  return tcpdp_peek_tx_packets_strided(max_packets, out_base, out_count, out_packet_size, out_stride);
+}
+
+int consume_custom_tcp_tx_packets_raw(std::uint32_t max_packets, std::uint32_t* out_consumed) {
+  return tcpdp_consume_tx_packets(max_packets, out_consumed);
+}
+
+int ingest_custom_tcp_rx_frame_raw(const std::uint8_t* raw_bytes, std::size_t len, std::uint32_t* out_updated) {
+  return tcpdp_ingest_rx_frame(raw_bytes, len, out_updated);
 }
 
 int ingest_custom_tcp_rx_frame_hex(const std::string& hex_frame) {

@@ -14,6 +14,7 @@
 
 #include <zmq.h>
 
+#include "bridge.hpp"
 #include "engine.hpp"
 #include "pacing_engine.h"
 #include "wire_protocol.h"
@@ -401,7 +402,7 @@ int main(int argc, char** argv) {
             continue;
           }
 
-          rte_mbuf* mbuf = rte_pktmbuf_alloc(sess.mempool);
+          rte_mbuf* mbuf = rte_pktmbuf_alloc(dpdk.session.mempool);
           if (!mbuf) {
             packets_errors += 1u;
             continue;

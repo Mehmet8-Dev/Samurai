@@ -19,7 +19,7 @@ struct CliOptions {
   std::string worker_name;              // required: cpu/gpu/dpdk/afxdp/doca/l7/defense/scenario
   std::string worker_dir = ".";         // directory containing the worker binaries
   int timeout_ms = 5000;                // per-recv timeout on the events channel
-  samurai::orchestrator::JobOptions job;  // maps onto the wire JobEnvelopeV1
+  samurai::orchestrator::JobOptions job;  // maps onto the wire JobEnvelopeV1/V2
   bool show_help = false;
   bool list_profiles = false;             // --list-profiles: print and exit
   KpiThresholds kpi;                      // KPI-gate thresholds (--kpi-*)

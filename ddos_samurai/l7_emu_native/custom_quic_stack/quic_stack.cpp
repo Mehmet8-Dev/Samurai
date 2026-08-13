@@ -10,6 +10,7 @@
 #include "h3_parity_state.hpp"
 #include "loss_recovery.hpp"
 #include "quic_metrics.hpp"
+#include "udp_io.hpp"
 
 namespace ddos_samurai::l7_emu_native::custom_quic_stack {
 
@@ -24,17 +25,8 @@ std::map<std::string, double> run_quic_profile(
   // Keep this explicit in metrics to avoid false "hot-path-ready" signaling.
   out["runtime_transport_custom_tcp_bridge_ready"] = 1.0;
   out["runtime_transport_seam_ready"] = 1.0;
-  std::string backend = profile.stateful_runtime_backend;
-  std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  if (backend == "afxdp") {
-    out["quic_runtime_backend_requested"] = 1.0;
-  } else if (backend == "dpdk") {
-    out["quic_runtime_backend_requested"] = 2.0;
-  } else {
-    out["quic_runtime_backend_requested"] = 0.0;
-  }
+  out["quic_runtime_backend_requested"] =
+      static_cast<double>(resolve_quic_udp_io_backend(profile));
   out["quic_runtime_udp_io_backend"] = 0.0;
   out["quic_runtime_native_hot_path_ready"] = 0.0;
 

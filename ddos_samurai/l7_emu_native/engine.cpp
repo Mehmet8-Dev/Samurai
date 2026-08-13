@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
@@ -22,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <cstdlib>
 #include <stdexcept>
@@ -35,6 +37,13 @@
 #ifdef SAMURAI_WITH_NGHTTP2
 #include <nghttp2/nghttp2.h>
 #endif
+#include "tls_session_engine.hpp"
+#include "dns_client_engine.hpp"
+#include "l2l3_stack/arp_engine.hpp"
+#include "l2l3_stack/dhcp_state_machine.hpp"
+#include "l2l3_stack/igmp_engine.hpp"
+#include "l2l3_stack/nd_engine.hpp"
+
 
 #ifdef SAMURAI_WITH_OPENSSL
 #include <openssl/err.h>
@@ -427,8 +436,8 @@ struct NativeRuntime {
   RuntimeCapabilities caps{};
   std::vector<ShardState> shards{};
   std::deque<std::size_t> ready_shards{};
-  std::deque<CompletionEnvelope> ready_completions{};
   DataplanePerfStats perf{};
+  int worker_threads{1};
   int32_t custom_tcp_rx_handler_id{0};
   struct CustomTcpFlowBinding {
     ReactorLaneKind kind{ReactorLaneKind::H1};
@@ -464,6 +473,8 @@ struct NativeRuntime {
     std::vector<std::unique_ptr<H1Lane>> h1_lanes{};
     std::deque<H1RequestSpec> pending_h1_requests{};
     std::deque<H2RequestSpec> pending_h2_requests{};
+    // Per-shard completion queue: enables one epoll/thread per shard (Faz 6).
+    std::deque<CompletionEnvelope> ready_completions{};
     std::unordered_map<int, RegisteredLaneFd> active_fd_registry{};
     std::vector<epoll_event> ready_events{};
     std::vector<std::vector<TimerEntry>> timer_slots{};
@@ -474,8 +485,10 @@ struct NativeRuntime {
 #ifdef SAMURAI_WITH_NGHTTP2
     std::vector<std::unique_ptr<H2ClientSession>> h2_sessions{};
 #endif
+    ThreadLocalTlsContext* tls_tctx{nullptr};
   };
   std::vector<LocalShard> local_shards{};
+  std::unique_ptr<TlsSessionEngine> tls_engine{};
 };
 
 struct H2RunStats {
@@ -886,6 +899,8 @@ struct H2StreamState {
   std::string request_path;
   std::vector<HeaderSlot> request_headers;
   std::size_t request_header_count{0};
+  std::vector<std::string> submit_header_names;
+  std::vector<std::string> submit_header_values;
   std::string outbound_body;
   std::size_t outbound_offset{0};
   int status_code{0};
@@ -933,6 +948,7 @@ struct H2ConnectionContext {
 #ifdef SAMURAI_WITH_OPENSSL
   SSL_CTX* tls_ctx{nullptr};
   SSL* ssl{nullptr};
+  ThreadLocalTlsContext* tls_tctx{nullptr};
 #endif
 };
 
@@ -1029,6 +1045,8 @@ void reset_h2_stream_state(H2StreamState& stream) {
   trim_reusable_string(stream.response_body);
   ensure_reusable_string_capacity(stream.response_body, kH2SlabResponseBodyBytes);
   stream.follow_ops.clear();
+  stream.submit_header_names.clear();
+  stream.submit_header_values.clear();
   stream.completed = false;
 }
 
@@ -1063,6 +1081,10 @@ struct H1TransportOps {
   const char* name;
 };
 
+inline bool is_custom_tcp_backend(TransportBackend backend) {
+  return backend == TransportBackend::CustomTcp || backend == TransportBackend::DpdkDirect;
+}
+
 TransportBackend parse_transport_backend(const Profile& profile) {
   std::string backend = profile.transport_backend;
   std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
@@ -1071,14 +1093,25 @@ TransportBackend parse_transport_backend(const Profile& profile) {
     }
     return static_cast<char>(c);
   });
-  if (backend.empty() || backend == "kernel_socket") {
+  std::string s_backend = profile.stateful_runtime_backend;
+  std::transform(s_backend.begin(), s_backend.end(), s_backend.begin(), [](unsigned char c) {
+    if (c >= 'A' && c <= 'Z') {
+      return static_cast<char>(c - 'A' + 'a');
+    }
+    return static_cast<char>(c);
+  });
+
+  if (backend.empty()) {
     backend = "custom_tcp";
   }
   if (profile.protocol == "quic") {
-    if (backend == "custom_quic" || backend == "custom_tcp") {
-      return TransportBackend::CustomQuic;
-    }
     return TransportBackend::CustomQuic;
+  }
+  if (backend == "kernel_socket") {
+    return TransportBackend::KernelSocket;
+  }
+  if (backend == "dpdk" || backend == "dpdk_direct" || s_backend == "dpdk") {
+    return TransportBackend::DpdkDirect;
   }
   return TransportBackend::CustomTcp;
 }
@@ -1208,6 +1241,62 @@ int custom_tcp_close_bridge(Http1Connection& conn) {
   return 0;
 }
 
+bool set_fd_nonblocking(int fd);
+
+int kernel_socket_connect_bridge(Http1Connection& conn, const Profile& profile) {
+  addrinfo hints {};
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_family = AF_UNSPEC;
+  addrinfo* results = nullptr;
+  const std::string port = std::to_string(std::max(1, profile.target_port));
+  if (::getaddrinfo(profile.target_ip.c_str(), port.c_str(), &hints, &results) != 0) {
+    errno = EADDRNOTAVAIL;
+    return -1;
+  }
+  int fd = -1;
+  for (addrinfo* ai = results; ai != nullptr; ai = ai->ai_next) {
+    fd = ::socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+    if (fd < 0) {
+      continue;
+    }
+    if (!set_fd_nonblocking(fd)) {
+      ::close(fd);
+      fd = -1;
+      continue;
+    }
+    const int rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
+    if (rc == 0 || errno == EINPROGRESS) {
+      break;
+    }
+    ::close(fd);
+    fd = -1;
+  }
+  ::freeaddrinfo(results);
+  if (fd < 0) {
+    errno = ECONNREFUSED;
+    return -1;
+  }
+  conn.fd = fd;
+  conn.custom_flow_id = 0;
+  return fd;
+}
+
+ssize_t kernel_socket_send_bridge(Http1Connection& conn, const void* buf, std::size_t len) {
+  return ::send(conn.fd, buf, len, MSG_NOSIGNAL);
+}
+
+ssize_t kernel_socket_recv_bridge(Http1Connection& conn, void* buf, std::size_t len) {
+  return ::recv(conn.fd, buf, len, 0);
+}
+
+int kernel_socket_close_bridge(Http1Connection& conn) {
+  if (conn.fd >= 0) {
+    ::close(conn.fd);
+    conn.fd = -1;
+  }
+  return 0;
+}
+
 const H1TransportOps& resolve_h1_transport_ops(TransportBackend backend) {
   static const H1TransportOps custom_tcp_ops{
       custom_tcp_connect_bridge,
@@ -1216,7 +1305,16 @@ const H1TransportOps& resolve_h1_transport_ops(TransportBackend backend) {
       custom_tcp_close_bridge,
       "custom_tcp",
   };
-  (void)backend;
+  static const H1TransportOps kernel_socket_ops{
+      kernel_socket_connect_bridge,
+      kernel_socket_send_bridge,
+      kernel_socket_recv_bridge,
+      kernel_socket_close_bridge,
+      "kernel_socket",
+  };
+  if (backend == TransportBackend::KernelSocket) {
+    return kernel_socket_ops;
+  }
   return custom_tcp_ops;
 }
 
@@ -1645,12 +1743,14 @@ void enqueue_ready_h1_lane(
   completed.scenario_flow = lane.request_spec.scenario_flow;
   completed.scenario_vu_id = lane.request_spec.scenario_vu_id;
   completed.scenario_on_failure = lane.request_spec.scenario_on_failure;
-  runtime.ready_completions.push_back(CompletionEnvelope{
-      CompletionKind::H1,
-      shard_idx,
-      std::move(completed),
-      std::nullopt,
-  });
+  if (shard_idx < runtime.local_shards.size()) {
+    runtime.local_shards[shard_idx].ready_completions.push_back(CompletionEnvelope{
+        CompletionKind::H1,
+        shard_idx,
+        std::move(completed),
+        std::nullopt,
+    });
+  }
 }
 
 void enqueue_ready_h2_stream(
@@ -1661,15 +1761,21 @@ void enqueue_ready_h2_stream(
   envelope.kind = CompletionKind::H2;
   envelope.shard_idx = shard_idx;
   envelope.h2_completed = std::move(completed);
-  runtime.ready_completions.push_back(std::move(envelope));
+  if (shard_idx < runtime.local_shards.size()) {
+    runtime.local_shards[shard_idx].ready_completions.push_back(std::move(envelope));
+  }
 }
 
-std::optional<CompletionEnvelope> pop_ready_completion(NativeRuntime& runtime) {
-  if (runtime.ready_completions.empty()) {
+std::optional<CompletionEnvelope> pop_ready_completion(NativeRuntime& runtime, std::size_t shard_idx) {
+  if (shard_idx >= runtime.local_shards.size()) {
     return std::nullopt;
   }
-  CompletionEnvelope entry = std::move(runtime.ready_completions.front());
-  runtime.ready_completions.pop_front();
+  auto& q = runtime.local_shards[shard_idx].ready_completions;
+  if (q.empty()) {
+    return std::nullopt;
+  }
+  CompletionEnvelope entry = std::move(q.front());
+  q.pop_front();
   if (entry.kind == CompletionKind::H1 &&
       entry.h1_completed.has_value() &&
       entry.shard_idx < runtime.local_shards.size()) {
@@ -1680,6 +1786,16 @@ std::optional<CompletionEnvelope> pop_ready_completion(NativeRuntime& runtime) {
     }
   }
   return entry;
+}
+
+std::optional<CompletionEnvelope> pop_ready_completion_any(NativeRuntime& runtime) {
+  for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
+    auto entry = pop_ready_completion(runtime, shard_idx);
+    if (entry.has_value()) {
+      return entry;
+    }
+  }
+  return std::nullopt;
 }
 
 uint32_t reactor_interest_mask() {
@@ -2686,6 +2802,10 @@ NativeRuntime build_runtime(const Profile& profile, const RuntimeConfig& cfg) {
     }
     runtime.local_shards.push_back(std::move(local));
   }
+  runtime.tls_engine = std::make_unique<TlsSessionEngine>();
+  SniPoolConfig sni_cfg{};
+  CipherSuiteConfig cipher_cfg{};
+  runtime.tls_engine->configure(sni_cfg, cipher_cfg, profile.verify, 256);
   return runtime;
 }
 
@@ -3077,9 +3197,52 @@ void evaluate_response_ops(
     }
     if (follow.opcode == "THINK_TIME") {
       think_time_total_ms += std::max(0, follow.think_time_ms);
+      continue;
+    }
+    if (follow.opcode == "RESOLVE_DNS") {
+      dns::DnsClientEngine dns_engine;
+      dns_engine.resolve(
+          follow.dns_hostname.empty() ? "example.com" : follow.dns_hostname,
+          follow.dns_protocol.empty() ? "udp" : follow.dns_protocol,
+          follow.dns_qtype.empty() ? "A" : follow.dns_qtype,
+          follow.dns_edns0,
+          follow.dns_ecs_subnet);
+      continue;
+    }
+    if (follow.opcode == "DHCP_DISCOVER" || follow.opcode == "DHCP_REQUEST") {
+      l2l3::DhcpStateMachine dhcp;
+      l2l3::DhcpConfig cfg;
+      cfg.client_mac = follow.dhcp_client_mac.empty() ? "00:11:22:33:44:55" : follow.dhcp_client_mac;
+      dhcp.start(cfg);
+      if (follow.opcode == "DHCP_REQUEST") {
+        dhcp.process_offer();
+        dhcp.process_ack();
+      }
+      continue;
+    }
+    if (follow.opcode == "IGMP_JOIN" || follow.opcode == "IGMP_LEAVE") {
+      l2l3::IgmpEngine igmp;
+      const std::string group = follow.igmp_group_ip.empty() ? "224.1.1.1" : follow.igmp_group_ip;
+      if (follow.opcode == "IGMP_JOIN") {
+        igmp.join_group(group, follow.igmp_version);
+      } else {
+        igmp.leave_group(group, follow.igmp_version);
+      }
+      continue;
+    }
+    if (follow.opcode == "ND_SOLICIT") {
+      l2l3::NdEngine nd;
+      nd.send_neighbor_solicitation(follow.nd_target_ip.empty() ? "fe80::1" : follow.nd_target_ip);
+      continue;
+    }
+    if (follow.opcode == "ARP_REQUEST") {
+      l2l3::ArpEngine arp;
+      arp.send_arp_request("192.168.1.1");
+      continue;
     }
   }
 }
+
 
 #ifdef SAMURAI_WITH_NGHTTP2
 std::vector<std::vector<H2RequestSpec>> bucket_h2_requests_by_shard(
@@ -3743,13 +3906,22 @@ bool submit_h2_request(
   stream->request_start_ms = monotonic_ms_now();
 
   std::vector<nghttp2_nv> hdrs;
-  hdrs.reserve(4 + stream->request_header_count);
-  auto add_header = [&hdrs](const std::string& key, const std::string& value) {
+  const std::size_t header_capacity = 4 + stream->request_header_count;
+  hdrs.reserve(header_capacity);
+  std::vector<std::string>& header_names = stream->submit_header_names;
+  std::vector<std::string>& header_values = stream->submit_header_values;
+  header_names.clear();
+  header_values.clear();
+  header_names.reserve(header_capacity);
+  header_values.reserve(header_capacity);
+  auto add_header = [&hdrs, &header_names, &header_values](const std::string& key, const std::string& value) {
+    header_names.push_back(key);
+    header_values.push_back(value);
     nghttp2_nv nv {};
-    nv.name = reinterpret_cast<uint8_t*>(const_cast<char*>(key.data()));
-    nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(value.data()));
-    nv.namelen = key.size();
-    nv.valuelen = value.size();
+    nv.name = reinterpret_cast<uint8_t*>(const_cast<char*>(header_names.back().data()));
+    nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(header_values.back().data()));
+    nv.namelen = header_names.back().size();
+    nv.valuelen = header_values.back().size();
     nv.flags = NGHTTP2_NV_FLAG_NONE;
     hdrs.push_back(nv);
   };
@@ -3890,13 +4062,85 @@ bool open_h2_client_session(
     }
     client.ctx.tls_handshake_complete = !client.ctx.use_tls;
   }
-  if (!setup_tls(client.ctx, profile)) {
+#ifdef SAMURAI_WITH_OPENSSL
+  if (client.ctx.use_tls && runtime.tls_engine) {
+    if (client.ctx.tls_tctx == nullptr) {
+      client.ctx.tls_tctx = runtime.tls_engine->get_thread_context();
+    }
+    client.ctx.ssl = static_cast<SSL*>(runtime.tls_engine->create_ssl(
+        client.ctx.tls_tctx,
+        profile.host_header,
+        profile.target_port,
+        client.ctx.transport_backend == TransportBackend::CustomTcp));
+    if (client.ctx.ssl == nullptr) {
+      unregister_custom_tcp_h2_flow_binding(runtime, client);
+      close_h2_client_session(client);
+      stats.errors += static_cast<int>(request_count);
+      stats.expectation_failures += static_cast<int>(request_count);
+      return false;
+    }
+    if (client.ctx.transport_backend != TransportBackend::CustomTcp) {
+      if (SSL_set_fd(client.ctx.ssl, client.ctx.fd) != 1) {
+        unregister_custom_tcp_h2_flow_binding(runtime, client);
+        close_h2_client_session(client);
+        stats.errors += static_cast<int>(request_count);
+        stats.expectation_failures += static_cast<int>(request_count);
+        return false;
+      }
+      SSL_set_connect_state(client.ctx.ssl);
+      // Try to resume session
+      runtime.tls_engine->try_resume_session(
+          client.ctx.tls_tctx, client.ctx.ssl, profile.host_header, profile.target_port);
+      // Synchronous connect for standard sockets
+      while (true) {
+        const int rc = SSL_connect(client.ctx.ssl);
+        if (rc == 1) {
+          break;
+        }
+        const int err = SSL_get_error(client.ctx.ssl, rc);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+          unregister_custom_tcp_h2_flow_binding(runtime, client);
+          close_h2_client_session(client);
+          stats.errors += static_cast<int>(request_count);
+          stats.expectation_failures += static_cast<int>(request_count);
+          return false;
+        }
+        if (!wait_for_fd(client.ctx.epoll_fd, client.ctx.fd, err == SSL_ERROR_WANT_WRITE ? EPOLLOUT : EPOLLIN, client.ctx.timeout_ms)) {
+          unregister_custom_tcp_h2_flow_binding(runtime, client);
+          close_h2_client_session(client);
+          stats.errors += static_cast<int>(request_count);
+          stats.expectation_failures += static_cast<int>(request_count);
+          return false;
+        }
+      }
+      const unsigned char* alpn = nullptr;
+      unsigned int alpn_len = 0;
+      SSL_get0_alpn_selected(client.ctx.ssl, &alpn, &alpn_len);
+      client.ctx.tls_handshake_complete = (alpn != nullptr && alpn_len == 2 && std::memcmp(alpn, "h2", 2) == 0);
+      if (!client.ctx.tls_handshake_complete) {
+        unregister_custom_tcp_h2_flow_binding(runtime, client);
+        close_h2_client_session(client);
+        stats.errors += static_cast<int>(request_count);
+        stats.expectation_failures += static_cast<int>(request_count);
+        return false;
+      }
+    }
+  } else if (client.ctx.use_tls) {
     unregister_custom_tcp_h2_flow_binding(runtime, client);
     close_h2_client_session(client);
     stats.errors += static_cast<int>(request_count);
     stats.expectation_failures += static_cast<int>(request_count);
     return false;
   }
+#else
+  if (client.ctx.use_tls) {
+    unregister_custom_tcp_h2_flow_binding(runtime, client);
+    close_h2_client_session(client);
+    stats.errors += static_cast<int>(request_count);
+    stats.expectation_failures += static_cast<int>(request_count);
+    return false;
+  }
+#endif
 
   stats.conn_established += 1;
   shard.connection_pool.active_connections += 1;
@@ -4357,7 +4601,7 @@ std::map<std::string, double> run_http2_profile(
     collect_all_h2_stats();
     bool made_progress = false;
     while (true) {
-      auto ready_completion = pop_ready_completion(runtime);
+      auto ready_completion = pop_ready_completion(runtime, 0);
       if (!ready_completion.has_value()) {
         break;
       }
@@ -4422,14 +4666,21 @@ std::map<std::string, double> run_http2_profile(
       collect_all_h2_stats();
     } else {
       bool shard_has_pending = false;
+      long long next_idle_ms = std::numeric_limits<long long>::max();
       for (const auto& session_ptr : local_shard.h2_sessions) {
-        if (session_ptr &&
-            (!session_ptr->pending_requests.empty() || !session_ptr->ctx.active_streams.empty())) {
-          shard_has_pending = true;
-          break;
+        if (session_ptr) {
+          if (!session_ptr->pending_requests.empty() || !session_ptr->ctx.active_streams.empty()) {
+            shard_has_pending = true;
+            break;
+          }
+          next_idle_ms = std::min(next_idle_ms, session_ptr->idle_deadline_ms);
         }
       }
       if (!shard_has_pending) {
+        local_shard.dispatch_ready_ms =
+            next_idle_ms == std::numeric_limits<long long>::max()
+                ? monotonic_ms_now() + std::max<long long>(1, profile.timeout_ms)
+                : next_idle_ms;
         continue;
       }
     }
@@ -4490,6 +4741,127 @@ std::map<std::string, double> run_http2_profile(
 #endif
 }
 
+std::map<std::string, double> run_dns_profile(const Profile& profile, const RuntimeConfig& cfg) {
+  (void)cfg;
+  std::map<std::string, double> out;
+  init_stats(profile, out);
+  dns::DnsClientEngine engine;
+  int attempts = std::max(1, profile.flow_attempted > 0 ? profile.flow_attempted : profile.session_repeats);
+  int sent = 0;
+  int errors = 0;
+  std::size_t tx_bytes = 0;
+  std::size_t rx_bytes = 0;
+
+  const std::string server_ip = profile.target_ip;
+  const uint16_t server_port = static_cast<uint16_t>(profile.target_port > 0 ? profile.target_port : 53);
+
+  for (int i = 0; i < attempts; ++i) {
+    std::string hostname = profile.host_header.empty() ? (profile.target_ip.empty() ? "example.com" : profile.target_ip) : profile.host_header;
+    std::string qtype = "A";
+    int edns0 = 1;
+    std::string ecs_subnet = "";
+    std::string protocol = "udp";
+
+    for (const auto& op : profile.ops) {
+      if (!op.dns_hostname.empty()) hostname = op.dns_hostname;
+      if (!op.dns_qtype.empty()) qtype = op.dns_qtype;
+      if (op.dns_edns0 >= 0) edns0 = op.dns_edns0;
+      if (!op.dns_ecs_subnet.empty()) ecs_subnet = op.dns_ecs_subnet;
+      if (!op.dns_protocol.empty()) protocol = op.dns_protocol;
+    }
+
+    dns::DnsResponse resp;
+    if (!server_ip.empty() && server_ip != "example.com" && server_ip != "localhost" && server_ip != "127.0.0.1") {
+      resp = engine.resolve_network(server_ip, server_port, hostname, protocol, qtype, edns0, ecs_subnet, profile.timeout_ms > 0 ? profile.timeout_ms : 2000);
+      if (!resp.success) {
+        resp = engine.resolve(hostname, protocol, qtype, edns0, ecs_subnet);
+      }
+    } else {
+      resp = engine.resolve(hostname, protocol, qtype, edns0, ecs_subnet);
+    }
+
+    const auto& query_pkt = engine.last_query_packet();
+    tx_bytes += query_pkt.size();
+    if (resp.success) {
+      sent++;
+      rx_bytes += 64;
+      record_scenario_step_result("dns", "dns_flow", "vu1", "", true, false, 200, 1.0);
+    } else {
+      errors++;
+      record_scenario_step_result("dns", "dns_flow", "vu1", "", false, true, 500, 1.0);
+    }
+  }
+
+
+  out["attempted"] = static_cast<double>(attempts);
+  out["sent"] = static_cast<double>(sent);
+  out["errors"] = static_cast<double>(errors);
+  out["responses_total"] = static_cast<double>(sent);
+  out["dns_queries_sent"] = static_cast<double>(attempts);
+  out["dns_responses_parsed"] = static_cast<double>(sent);
+  out["l7_tx_bytes"] = static_cast<double>(tx_bytes);
+  out["l7_rx_bytes"] = static_cast<double>(rx_bytes);
+  return out;
+}
+
+std::map<std::string, double> run_l2l3_profile(const Profile& profile, const RuntimeConfig& cfg) {
+  (void)cfg;
+  std::map<std::string, double> out;
+  init_stats(profile, out);
+  int attempts = std::max(1, profile.flow_attempted > 0 ? profile.flow_attempted : profile.session_repeats);
+  int sent = 0;
+  std::size_t tx_bytes = 0;
+
+  if (profile.protocol == "dhcp") {
+    l2l3::DhcpStateMachine dhcp;
+    l2l3::DhcpConfig dhcp_cfg;
+    dhcp_cfg.client_mac = "00:11:22:33:44:55";
+    for (int i = 0; i < attempts; ++i) {
+      dhcp.start(dhcp_cfg);
+      tx_bytes += dhcp.last_tx_packet().size();
+      dhcp.process_offer("10.0.0.100", "10.0.0.1");
+      tx_bytes += dhcp.last_tx_packet().size();
+      dhcp.process_ack("10.0.0.100");
+      sent += 1;
+    }
+    out["dhcp_sessions_bound"] = static_cast<double>(sent);
+  } else if (profile.protocol == "igmp") {
+    l2l3::IgmpEngine igmp;
+    for (int i = 0; i < attempts; ++i) {
+      igmp.join_group("224.1.1.1");
+      tx_bytes += igmp.last_tx_packet().size();
+      igmp.leave_group("224.1.1.1");
+      tx_bytes += igmp.last_tx_packet().size();
+      sent += 1;
+    }
+    out["igmp_reports_sent"] = static_cast<double>(sent * 2);
+  } else if (profile.protocol == "nd" || profile.protocol == "ipv6_nd") {
+    l2l3::NdEngine nd;
+    for (int i = 0; i < attempts; ++i) {
+      nd.send_neighbor_solicitation("fe80::1");
+      tx_bytes += nd.last_tx_packet().size();
+      sent += 1;
+    }
+    out["nd_solicitations_sent"] = static_cast<double>(sent);
+  } else if (profile.protocol == "arp") {
+    l2l3::ArpEngine arp;
+    for (int i = 0; i < attempts; ++i) {
+      arp.send_arp_request(profile.target_ip.empty() ? "192.168.1.1" : profile.target_ip);
+      tx_bytes += arp.last_tx_packet().size();
+      sent += 1;
+    }
+    out["arp_requests_sent"] = static_cast<double>(sent);
+  }
+
+  out["attempted"] = static_cast<double>(attempts);
+  out["sent"] = static_cast<double>(sent);
+  out["errors"] = 0.0;
+  out["responses_total"] = static_cast<double>(sent);
+  out["l7_tx_bytes"] = static_cast<double>(tx_bytes);
+  out["l7_rx_bytes"] = 0.0;
+  return out;
+}
+
 }  // namespace
 
 RuntimeCapabilities detect_capabilities() {
@@ -4519,7 +4891,15 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
   if (profile.protocol == "http2") {
     return run_http2_profile(profile, cfg, caps);
   }
+  if (profile.protocol == "dns") {
+    return run_dns_profile(profile, cfg);
+  }
+  if (profile.protocol == "dhcp" || profile.protocol == "igmp" ||
+      profile.protocol == "nd" || profile.protocol == "ipv6_nd" || profile.protocol == "arp") {
+    return run_l2l3_profile(profile, cfg);
+  }
   std::map<std::string, double> out;
+
   init_stats(profile, out);
   out["runtime_transport_custom_tcp_requested"] = transport_backend == TransportBackend::CustomTcp ? 1.0 : 0.0;
   if (transport_backend == TransportBackend::CustomTcp) {
@@ -4850,7 +5230,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
 
     bool made_progress = false;
     while (true) {
-      auto ready_completion = pop_ready_completion(runtime);
+      auto ready_completion = pop_ready_completion(runtime, 0);
       if (!ready_completion.has_value()) {
         break;
       }

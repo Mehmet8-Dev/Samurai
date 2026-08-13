@@ -18,6 +18,16 @@ enum class StepType : std::uint8_t {
   TcpSend = 7,
   TcpExpect = 8,
   TcpClose = 9,
+  // L7 protocol emulation actions (Faz 5).
+  TlsConnect = 10,
+  TlsDisconnect = 11,
+  DnsResolve = 12,
+  DhcpAcquire = 13,
+  DhcpRelease = 14,
+  ArpResolve = 15,
+  IgmpJoin = 16,
+  IgmpLeave = 17,
+  Ipv6NdSolicit = 18,
 };
 
 struct ThinkTime {
@@ -42,6 +52,30 @@ struct Step {
   std::string condition{};
   int timeout_ms{0};
   ThinkTime think_time{};
+
+  // TLS action fields (TlsConnect / TlsDisconnect).
+  std::string tls_sni{};
+  std::string tls_alpn{};          // e.g. "h2", "http/1.1"
+  std::string tls_cipher_list{};   // OpenSSL cipher string
+  int tls_verify{0};
+
+  // DNS action fields (DnsResolve).
+  std::string dns_hostname{};
+  std::string dns_protocol{"udp"};  // udp, tcp, doh, dot
+  std::string dns_qtype{"A"};       // A, AAAA, CNAME, MX, etc.
+  int dns_edns0{0};
+  std::string dns_ecs_subnet{};     // EDNS0 Client Subnet
+
+  // DHCP action fields (DhcpAcquire / DhcpRelease).
+  std::string dhcp_client_mac{};
+  int dhcp_version{4};              // 4 or 6
+
+  // IGMP action fields (IgmpJoin / IgmpLeave).
+  std::string igmp_group_ip{};
+  int igmp_version{2};              // 2 or 3
+
+  // IPv6 ND action fields (Ipv6NdSolicit).
+  std::string nd_target_ip{};
 };
 
 struct Persona {
@@ -75,3 +109,4 @@ struct ScenarioSpecNative {
 };
 
 }  // namespace ddos_samurai::scenario_native
+
