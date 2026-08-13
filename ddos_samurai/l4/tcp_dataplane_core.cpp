@@ -807,6 +807,10 @@ TcpDpStatsSnapshot TcpDataplaneCore::SnapshotStats() const {
   out.out_of_order_rx_count = stats_.out_of_order_rx_count.load(std::memory_order_relaxed);
   out.peer_rst_count = stats_.peer_rst_count.load(std::memory_order_relaxed);
   out.peer_fin_count = stats_.peer_fin_count.load(std::memory_order_relaxed);
+  out.sack_blocks_rx_count = stats_.sack_blocks_rx_count.load(std::memory_order_relaxed);
+  out.zero_window_probes_sent = stats_.zero_window_probes_sent.load(std::memory_order_relaxed);
+  out.congestion_window_reductions = stats_.congestion_window_reductions.load(std::memory_order_relaxed);
+  out.native_tls_handshakes_completed = stats_.native_tls_handshakes_completed.load(std::memory_order_relaxed);
   out.tx_packets_queued = tx_packets_queued_.load(std::memory_order_relaxed);
   out.tx_packets_drained = tx_packets_drained_.load(std::memory_order_relaxed);
   out.tx_packets_sent = tx_packets_sent_.load(std::memory_order_relaxed);
@@ -833,6 +837,13 @@ TcpDpFlowSnapshot TcpDataplaneCore::GetFlow(uint64_t flow_id) const {
   out.rcv_nxt = flow.rcv_nxt;
   out.peer_window = flow.peer_window;
   out.local_window = flow.local_window;
+  out.snd_wscale = flow.snd_wscale;
+  out.rcv_wscale = flow.rcv_wscale;
+  out.sack_permitted = flow.sack_permitted;
+  out.cwnd = flow.cwnd;
+  out.ssthresh = flow.ssthresh;
+  out.srtt_ms = flow.srtt_ms;
+  out.zero_window_probing = flow.zero_window_probing;
   out.mss = flow.mss;
   out.ttl = flow.ttl;
   out.state = static_cast<uint8_t>(flow.state);
@@ -844,7 +855,6 @@ TcpDpFlowSnapshot TcpDataplaneCore::GetFlow(uint64_t flow_id) const {
 }
 
 TcpDpFlowSnapshot TcpDataplaneCore::GetFlowLockless(uint64_t flow_id) const {
-  // Lockless read path: avoids mutex contention by attempting lock-free lookup
   TcpDpFlowSnapshot out;
   const size_t flow_shard = FlowLockShardForFlowId(flow_id);
   auto it = flows_by_id_shard_[flow_shard].find(flow_id);
@@ -863,6 +873,13 @@ TcpDpFlowSnapshot TcpDataplaneCore::GetFlowLockless(uint64_t flow_id) const {
   out.rcv_nxt = flow.rcv_nxt;
   out.peer_window = flow.peer_window;
   out.local_window = flow.local_window;
+  out.snd_wscale = flow.snd_wscale;
+  out.rcv_wscale = flow.rcv_wscale;
+  out.sack_permitted = flow.sack_permitted;
+  out.cwnd = flow.cwnd;
+  out.ssthresh = flow.ssthresh;
+  out.srtt_ms = flow.srtt_ms;
+  out.zero_window_probing = flow.zero_window_probing;
   out.mss = flow.mss;
   out.ttl = flow.ttl;
   out.state = static_cast<uint8_t>(flow.state);
@@ -1361,6 +1378,56 @@ uint32_t TcpDataplaneCore::DrainDpdkTxBurst(void* mempool_ptr, void** out_mbufs,
   (void)max_burst;
 #endif
   return produced;
+}
+
+std::vector<uint8_t> TcpDataplaneCore::BuildNativeTlsClientHello(const std::string& sni) const {
+  std::vector<uint8_t> record;
+  const std::string hostname = sni.empty() ? "localhost" : sni;
+  std::vector<uint8_t> hs;
+  hs.push_back(0x01); // Handshake Type: ClientHello
+  hs.push_back(0x00); hs.push_back(0x00); hs.push_back(0x00);
+  hs.push_back(0x03); hs.push_back(0x03); // TLS 1.2
+  for (int i = 0; i < 32; ++i) hs.push_back(static_cast<uint8_t>((i * 37 + 13) & 0xFF));
+  hs.push_back(0x00); // Session ID len 0
+  hs.push_back(0x00); hs.push_back(0x04); // Cipher suites len 4
+  hs.push_back(0x13); hs.push_back(0x01);
+  hs.push_back(0xc0); hs.push_back(0x2f);
+  hs.push_back(0x01); hs.push_back(0x00); // Compression
+  std::vector<uint8_t> ext;
+  ext.push_back(0x00); ext.push_back(0x00); // Server name extension
+  uint16_t sni_list_len = static_cast<uint16_t>(hostname.size() + 3);
+  uint16_t sni_ext_len = static_cast<uint16_t>(sni_list_len + 2);
+  ext.push_back(static_cast<uint8_t>((sni_ext_len >> 8) & 0xFF));
+  ext.push_back(static_cast<uint8_t>(sni_ext_len & 0xFF));
+  ext.push_back(static_cast<uint8_t>((sni_list_len >> 8) & 0xFF));
+  ext.push_back(static_cast<uint8_t>(sni_list_len & 0xFF));
+  ext.push_back(0x00);
+  ext.push_back(static_cast<uint8_t>((hostname.size() >> 8) & 0xFF));
+  ext.push_back(static_cast<uint8_t>(hostname.size() & 0xFF));
+  ext.insert(ext.end(), hostname.begin(), hostname.end());
+  uint16_t total_ext_len = static_cast<uint16_t>(ext.size());
+  hs.push_back(static_cast<uint8_t>((total_ext_len >> 8) & 0xFF));
+  hs.push_back(static_cast<uint8_t>(total_ext_len & 0xFF));
+  hs.insert(hs.end(), ext.begin(), ext.end());
+  uint32_t hs_body_len = static_cast<uint32_t>(hs.size() - 4);
+  hs[1] = static_cast<uint8_t>((hs_body_len >> 16) & 0xFF);
+  hs[2] = static_cast<uint8_t>((hs_body_len >> 8) & 0xFF);
+  hs[3] = static_cast<uint8_t>(hs_body_len & 0xFF);
+  record.push_back(0x16);
+  record.push_back(0x03); record.push_back(0x01);
+  uint16_t rec_len = static_cast<uint16_t>(hs.size());
+  record.push_back(static_cast<uint8_t>((rec_len >> 8) & 0xFF));
+  record.push_back(static_cast<uint8_t>(rec_len & 0xFF));
+  record.insert(record.end(), hs.begin(), hs.end());
+  return record;
+}
+
+bool TcpDataplaneCore::ParseNativeTlsServerHello(const uint8_t* payload, size_t len) const {
+  if (!payload || len < 9) return false;
+  if (payload[0] != 0x16) return false;
+  if (payload[5] != 0x02) return false;
+  stats_.native_tls_handshakes_completed.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 }  // namespace ddos_samurai::tcpdp

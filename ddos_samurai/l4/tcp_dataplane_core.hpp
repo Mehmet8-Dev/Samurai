@@ -40,6 +40,11 @@ struct TcpDpConfig {
   uint16_t dpdk_burst_size = 64;
 };
 
+struct TcpDpSackBlock {
+  uint32_t left = 0;
+  uint32_t right = 0;
+};
+
 struct TcpDpFlowSnapshot {
   uint64_t flow_id = 0;
   uint32_t src_ip = 0;
@@ -50,8 +55,15 @@ struct TcpDpFlowSnapshot {
   uint32_t snd_una = 0;
   uint32_t snd_nxt = 0;
   uint32_t rcv_nxt = 0;
-  uint16_t peer_window = 0;
+  uint32_t peer_window = 0;
   uint16_t local_window = 0;
+  uint8_t snd_wscale = 0;
+  uint8_t rcv_wscale = 0;
+  bool sack_permitted = false;
+  uint32_t cwnd = 0;
+  uint32_t ssthresh = 0;
+  uint32_t srtt_ms = 0;
+  bool zero_window_probing = false;
   uint16_t mss = 0;
   uint8_t ttl = 0;
   uint8_t state = 0;
@@ -86,6 +98,10 @@ struct TcpDpStatsSnapshot {
   uint64_t out_of_order_rx_count = 0;
   uint64_t peer_rst_count = 0;
   uint64_t peer_fin_count = 0;
+  uint64_t sack_blocks_rx_count = 0;
+  uint64_t zero_window_probes_sent = 0;
+  uint64_t congestion_window_reductions = 0;
+  uint64_t native_tls_handshakes_completed = 0;
 };
 
 struct TcpDpCompletion {
@@ -125,6 +141,10 @@ class TcpDataplaneCore {
   TcpDpFlowSnapshot GetFlow(uint64_t flow_id) const;
   TcpDpFlowSnapshot GetFlowLockless(uint64_t flow_id) const;
 
+  // Native TLS handshake generator helper for user-space dataplane
+  std::vector<uint8_t> BuildNativeTlsClientHello(const std::string& sni) const;
+  bool ParseNativeTlsServerHello(const uint8_t* payload, size_t len) const;
+
  private:
   struct FlowKey {
     uint32_t src_ip = 0;
@@ -157,8 +177,20 @@ class TcpDataplaneCore {
     uint32_t snd_una = 0;
     uint32_t snd_nxt = 0;
     uint32_t rcv_nxt = 0;
-    uint16_t peer_window = 0;
+    uint32_t peer_window = 0;
     uint16_t local_window = 0;
+    uint8_t snd_wscale = 7;
+    uint8_t rcv_wscale = 0;
+    bool sack_permitted = false;
+    std::vector<TcpDpSackBlock> sack_blocks{};
+    bool zero_window_probing = false;
+    uint32_t zero_window_probe_count = 0;
+    uint64_t zero_window_probe_deadline_ns = 0;
+    uint32_t cwnd = 1460;
+    uint32_t ssthresh = 65535;
+    uint32_t srtt_ms = 100;
+    uint32_t rttvar_ms = 50;
+    bool in_fast_recovery = false;
     uint16_t mss = 0;
     uint8_t ttl = 0;
     TcpDpState state = TcpDpState::kClosed;
@@ -171,6 +203,8 @@ class TcpDataplaneCore {
     uint32_t connect_timer_gen = 0;
     uint32_t idle_timer_gen = 0;
     uint64_t last_activity_ns = 0;
+    bool tls_native_active = false;
+    uint8_t tls_state = 0;
     std::optional<OutstandingTx> outstanding;
   };
 
@@ -178,6 +212,7 @@ class TcpDataplaneCore {
     kRto = 1,
     kConnectTimeout = 2,
     kIdleTimeout = 3,
+    kZeroWindowProbe = 4,
   };
 
   struct TimerEntry {
@@ -224,6 +259,10 @@ class TcpDataplaneCore {
     std::atomic<uint64_t> out_of_order_rx_count{0};
     std::atomic<uint64_t> peer_rst_count{0};
     std::atomic<uint64_t> peer_fin_count{0};
+    std::atomic<uint64_t> sack_blocks_rx_count{0};
+    std::atomic<uint64_t> zero_window_probes_sent{0};
+    std::atomic<uint64_t> congestion_window_reductions{0};
+    std::atomic<uint64_t> native_tls_handshakes_completed{0};
 
     void Reset() {
       flows_active.store(0, std::memory_order_relaxed);
@@ -247,6 +286,10 @@ class TcpDataplaneCore {
       out_of_order_rx_count.store(0, std::memory_order_relaxed);
       peer_rst_count.store(0, std::memory_order_relaxed);
       peer_fin_count.store(0, std::memory_order_relaxed);
+      sack_blocks_rx_count.store(0, std::memory_order_relaxed);
+      zero_window_probes_sent.store(0, std::memory_order_relaxed);
+      congestion_window_reductions.store(0, std::memory_order_relaxed);
+      native_tls_handshakes_completed.store(0, std::memory_order_relaxed);
     }
   };
 
@@ -331,7 +374,7 @@ class TcpDataplaneCore {
   std::atomic<uint64_t> tx_packets_drained_{0};
   std::atomic<uint64_t> tx_packets_sent_{0};
   std::atomic<uint64_t> tx_queue_epoch_{0};
-  TcpDpStatsCounters stats_{};
+  mutable TcpDpStatsCounters stats_{};
 };
 
 }  // namespace ddos_samurai::tcpdp
