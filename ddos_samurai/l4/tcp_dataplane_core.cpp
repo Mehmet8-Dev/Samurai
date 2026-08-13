@@ -9,6 +9,14 @@
 #include <cstring>
 #include <new>
 
+#ifdef SAMURAI_WITH_DPDK
+extern "C" {
+#include <rte_common.h>
+#include <rte_mbuf.h>
+#include <rte_mempool.h>
+}
+#endif
+
 namespace ddos_samurai::tcpdp {
 
 namespace {
@@ -1254,6 +1262,62 @@ void TcpDataplaneCore::CloseTimedOutFlow(FlowEntry& flow, TcpDpState terminal_st
     }
   }
   PushCompletion(flow.flow_id, flow.state, false, event);
+}
+
+uint32_t TcpDataplaneCore::IngestDpdkRxBurst(void** mbufs, uint16_t count) {
+  if (!mbufs || count == 0) return 0;
+  uint32_t ingested = 0;
+#ifdef SAMURAI_WITH_DPDK
+  for (uint16_t i = 0; i < count; ++i) {
+    rte_mbuf* mbuf = reinterpret_cast<rte_mbuf*>(mbufs[i]);
+    if (!mbuf) continue;
+    const uint8_t* data = rte_pktmbuf_mtod(mbuf, const uint8_t*);
+    const uint32_t len = rte_pktmbuf_pkt_len(mbuf);
+    if (data && len > 0) {
+      ingested += IngestRxFrame(data, len);
+    }
+    rte_pktmbuf_free(mbuf);
+  }
+#else
+  (void)mbufs;
+  (void)count;
+#endif
+  return ingested;
+}
+
+uint32_t TcpDataplaneCore::DrainDpdkTxBurst(void* mempool_ptr, void** out_mbufs, uint16_t max_burst) {
+  if (!out_mbufs || max_burst == 0) return 0;
+  uint32_t produced = 0;
+#ifdef SAMURAI_WITH_DPDK
+  rte_mempool* mp = reinterpret_cast<rte_mempool*>(mempool_ptr);
+  if (!mp) return 0;
+
+  const uint8_t* base = nullptr;
+  uint32_t count = 0;
+  size_t pkt_size = 0;
+  size_t stride = 0;
+
+  if (PeekTxPacketsStrided(max_burst, &base, &count, &pkt_size, &stride) && count > 0 && base) {
+    for (uint32_t i = 0; i < count; ++i) {
+      rte_mbuf* mbuf = rte_pktmbuf_alloc(mp);
+      if (!mbuf) break;
+      const uint8_t* src = base + i * stride;
+      uint8_t* dst = rte_pktmbuf_mtod(mbuf, uint8_t*);
+      std::memcpy(dst, src, pkt_size);
+      mbuf->pkt_len = static_cast<uint32_t>(pkt_size);
+      mbuf->data_len = static_cast<uint16_t>(pkt_size);
+      out_mbufs[produced++] = mbuf;
+    }
+    if (produced > 0) {
+      ConsumeTxPackets(produced);
+    }
+  }
+#else
+  (void)mempool_ptr;
+  (void)out_mbufs;
+  (void)max_burst;
+#endif
+  return produced;
 }
 
 }  // namespace ddos_samurai::tcpdp

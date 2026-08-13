@@ -90,6 +90,8 @@ int tcpdp_peek_tx_packets_strided(
     size_t* out_packet_size,
     size_t* out_stride);
 int tcpdp_consume_tx_packets(uint32_t max_packets, uint32_t* out_consumed);
+int tcpdp_ingest_dpdk_rx_burst(void** mbufs, uint16_t count, uint32_t* out_ingested);
+int tcpdp_drain_dpdk_tx_burst(void* mempool, void** out_mbufs, uint16_t max_burst, uint32_t* out_produced);
 int tcpdp_collect_completions(tcpdp_completion_t** out_items, uint32_t* out_count);
 void tcpdp_free_completions(tcpdp_completion_t* items, uint32_t count);
 int tcpdp_collect_rx_payloads(tcpdp_rx_payload_t** out_items, uint32_t* out_count);

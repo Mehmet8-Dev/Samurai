@@ -107,6 +107,22 @@ int tcpdp_consume_tx_packets(uint32_t max_packets, uint32_t* out_consumed) {
   return 0;
 }
 
+int tcpdp_ingest_dpdk_rx_burst(void** mbufs, uint16_t count, uint32_t* out_ingested) {
+  if (!mbufs || !out_ingested) {
+    return -1;
+  }
+  *out_ingested = ddos_samurai::tcpdp::Core().IngestDpdkRxBurst(mbufs, count);
+  return 0;
+}
+
+int tcpdp_drain_dpdk_tx_burst(void* mempool, void** out_mbufs, uint16_t max_burst, uint32_t* out_produced) {
+  if (!out_mbufs || !out_produced) {
+    return -1;
+  }
+  *out_produced = ddos_samurai::tcpdp::Core().DrainDpdkTxBurst(mempool, out_mbufs, max_burst);
+  return 0;
+}
+
 int tcpdp_collect_completions(tcpdp_completion_t** out_items, uint32_t* out_count) {
   if (!out_items || !out_count) {
     return -1;

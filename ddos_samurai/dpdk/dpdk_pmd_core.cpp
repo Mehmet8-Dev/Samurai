@@ -138,7 +138,12 @@ static bool ensure_eal_locked(const std::string& eal_args, std::string& err) {
         std::vector<std::string> argv_store;
         argv_store.emplace_back("ddos_samurai_dpdk");
         auto extra = split_ws(eal_args);
-        argv_store.insert(argv_store.end(), extra.begin(), extra.end());
+        if (const char* vdev_env = std::getenv("SAMURAI_DPDK_VDEV")) {
+            if (vdev_env[0] != '\0' && eal_args.find("--vdev") == std::string::npos) {
+                argv_store.emplace_back("--vdev");
+                argv_store.emplace_back(vdev_env);
+            }
+        }
 
         std::vector<char*> argv;
         argv.reserve(argv_store.size());
@@ -1098,6 +1103,39 @@ PyModuleDef module_def = {
 };
 
 } // namespace
+
+extern "C" {
+
+uint16_t samurai_dpdk_rx_burst(uint16_t port_id, uint16_t queue_id, void** rx_mbufs, uint16_t nb_pkts) {
+    if (!rx_mbufs || nb_pkts == 0) return 0;
+#ifdef SAMURAI_WITH_DPDK
+    return rte_eth_rx_burst(port_id, queue_id, reinterpret_cast<rte_mbuf**>(rx_mbufs), nb_pkts);
+#else
+    (void)port_id; (void)queue_id;
+    return 0;
+#endif
+}
+
+uint16_t samurai_dpdk_tx_burst(uint16_t port_id, uint16_t queue_id, void** tx_mbufs, uint16_t nb_pkts) {
+    if (!tx_mbufs || nb_pkts == 0) return 0;
+#ifdef SAMURAI_WITH_DPDK
+    return rte_eth_tx_burst(port_id, queue_id, reinterpret_cast<rte_mbuf**>(tx_mbufs), nb_pkts);
+#else
+    (void)port_id; (void)queue_id;
+    return 0;
+#endif
+}
+
+void* samurai_dpdk_get_mempool(uint16_t port_id) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto it = g_ports.find(port_id);
+    if (it != g_ports.end()) {
+        return it->second.mempool;
+    }
+    return nullptr;
+}
+
+} // extern "C"
 
 PyMODINIT_FUNC PyInit_dpdk_pmd_core(void) {
     return PyModule_Create(&module_def);

@@ -35,6 +35,9 @@ struct TcpDpConfig {
   uint16_t local_window = 64240;
   uint16_t default_mss = 1460;
   uint8_t default_ttl = 64;
+  uint16_t dpdk_port_id = 0;
+  uint16_t dpdk_queue_id = 0;
+  uint16_t dpdk_burst_size = 64;
 };
 
 struct TcpDpFlowSnapshot {
@@ -114,6 +117,8 @@ class TcpDataplaneCore {
       size_t* out_packet_size,
       size_t* out_stride);
   uint32_t ConsumeTxPackets(uint32_t max_packets);
+  uint32_t IngestDpdkRxBurst(void** mbufs, uint16_t count);
+  uint32_t DrainDpdkTxBurst(void* mempool, void** out_mbufs, uint16_t max_burst);
   std::vector<TcpDpCompletion> CollectCompletions();
   std::vector<TcpDpRxPayload> CollectRxPayloads();
   TcpDpStatsSnapshot SnapshotStats() const;
@@ -262,7 +267,7 @@ class TcpDataplaneCore {
   static uint64_t NsFromMs(uint32_t ms);
   static uint32_t AdvanceSeq(uint32_t seq, uint32_t amount);
   static std::vector<uint8_t> ExtractIpv4TcpPayload(const uint8_t* pkt, size_t pkt_len);
-  static constexpr size_t kFlowLockShards = 16;
+  static constexpr size_t kFlowLockShards = 64;
   size_t FlowLockShardForFlowId(uint64_t flow_id) const;
   size_t FlowIndexShardForKey(const FlowKey& key) const;
   std::vector<uint8_t> BuildPacket(
