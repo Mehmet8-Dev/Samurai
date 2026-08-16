@@ -1,116 +1,37 @@
-# 04 - Packet Builder (ddos_samurai/packet.py)
+# 04 - CPU Packet Builder ve Spoofing Engine
 
-## Rol
+CPU Dataplane motorunda paketlerin sentezlenmesi, başlık alanlarının yapılandırılması ve spoofing (kaynak IP sahteciliği) işlemleri tamamen yerel C++ modülü olan [`ddos_samurai/cpu_native/`](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/DDoSamurai/ddos_samurai/cpu_native/) altında yürütülür.
 
-CPU dataplane'de paketin "ham iskeleti" bu modulde kurulur.
-Sender katmani paketleri sadece iletir; IP/TCP/UDP/ICMP/DNS seviyesindeki
-alan kombinasyonlari esasen burada olusur.
+---
 
-Bu modulun birincil sorumluluklari:
+## 1. Modül Bileşenleri
 
-- Spoofing kaynak IP secimi
-- L3/L4 paket olusturma (TCP/UDP/ICMP)
-- DNS paket olusturma
-- HTTP icin polymorphic payload olusturma
-- Padding/payload guard kurallari
+- **`engine.cpp` / `engine.hpp`:** CPU tabanlı paket üretim motoru ve tampon halkası yöneticisi.
+- **`packets.cpp`:** TCP (SYN, ACK, FIN, RST, XMAS), UDP, ICMP, DNS ve HTTP paketlerinin bayt seviyesinde C++ ile üretimi.
+- **`spoofing.cpp`:** Kaynak IP seçim algoritmaları (Rastgele, CIDR alt ağ, IP listesi, Gerçekçi internet dağılımı).
+- **`amp.cpp`:** Amplifikasyon (Yükseltme) saldırı paket şablonları (DNS, NTP, SSDP, SNMP, Memcached).
+- **`pool.cpp`:** Bellek ayırma (allocation) gecikmesini sıfırlayan önceden ayrılmış paket havuzları.
 
-## Kod Haritasi
+---
 
-- Konfig dataclass'lari:
-  - `PacketConfig`
-  - `SpoofingOptions`
-- Yardimci ureticiler:
-  - `build_packet(...)`
-  - `build_dns_packet(...)`
-  - `build_http_payload(...)`
-  - `get_spoofed_ip(...)`
+## 2. Desteklenen Protokoller ve Vektörler
 
-Not: CPU paket jenerasyonu Scapy'ye dayalidir; runtime tarafinda lazy import
-deseni (`ddos_samurai/scapy_support.py`) ile sandbox ortamlari korunur.
+### L4 Protokolleri:
+- **TCP:** SYN Flood, ACK Flood, RST Flood, SYN-ACK Flood, Custom TCP Flags.
+- **UDP:** UDP Flood, Generic UDP Payload, DNS Query Flood.
+- **ICMP:** Echo Request (Ping Flood), Unreachable, Redirect.
 
-## Temel Veri Yapilari
+### L7 & Amplifikasyon Vektörleri:
+- **DNS Amplification:** ANY / TXT sorgu paketleri.
+- **NTP Monlist:** UDP port 123 istekleri.
+- **SSDP M-SEARCH:** UDP port 1900 UPnP keşif istekleri.
+- **Memcached:** UDP port 11211 get/stats istekleri.
 
-### `PacketConfig`
+---
 
-Alan gruplari:
+## 3. Spoofing Modları
 
-- Hedef: `target_ip`, `target_port`, `protocol`
-- Spoofing: `spoof`, `spoof_opts`
-- TCP tuning: `tcp_flags`, `ttl`, `tos`, `window`
-- Fragment niyeti: `fragment_enabled`, `fragment_size`
-- Boyut/payload: `pad_size`, `attack_vector`
-- DNS secenekleri: `dns_*`
-
-Onemli not:
-
-- `fragment_enabled` ve `fragment_size` niyeti burada tasinir; gercek fragment
-  davranisi sender/runtime tarafinda uygulanir.
-
-### `SpoofingOptions`
-
-- `mode`: `random | realistic | subnet | list`
-- `subnet`: CIDR kaynagi
-- `list_file`: satir bazli IP listesi
-
-## Paket Uretim Akisi
-
-1. Girdi normalizasyonu (`PacketConfig`)
-2. Kaynak IP karari (`get_spoofed_ip`)
-3. Protokole gore temel katman olusturma
-4. Payload/padding guard kurallari
-5. Paket boyutu ve alan tutarliligi
-6. Sender'a byte stream olarak gecis
-
-## Spoofing Detayi
-
-`get_spoofed_ip()` moda gore:
-
-- `subnet`: CIDR icinden rastgele secim
-- `list`: dosyadan okunan IP havuzundan secim
-- `random/realistic`: runtime tarafinda tanimli basitlestirilmis secim
-
-Performans notu:
-
-- `list` modunda `_CACHED_IP_LIST` ile dosya tekrar okunmaz.
-- Uzun sureli worker'larda liste degistiyse cache invalidation stratejisi
-  operasyonel olarak planlanmalidir (restart veya acik cache reset akisi).
-
-## Payload ve Padding Kurallari
-
-- SYN-only paketlerde payload/padding eklenmez.
-- Non-SYN akislar icin payload yoksa dinamik random payload uretilir.
-- HTTP attack vector senaryolarinda polymorphic payload jenerasyonu devreye girer.
-
-Bu kurallar:
-
-- TCP semantigini bozmayi engeller
-- Basit IDS/heuristic yakalanma desenlerini azaltir
-- Benchmark kosularinda daha tutarli paket davranisi uretir
-
-## En Sık Hata Modlari
-
-1. Scapy import/permission sorunlari
-- Belirti: test collection veya runtime'da import error
-- Cozum: lazy import yolunu koru, ortam profile'ini (`ci_safe/full`) dogru sec
-
-2. Spoof list dosyasi bozuk
-- Belirti: invalid IP parse veya bos havuz
-- Cozum: listeyi pre-validate et, invalid satirlari fail-fast raporla
-
-3. Protokol/flag uyumsuzlugu
-- Belirti: beklenmeyen paket formati veya hedefte no-op
-- Cozum: parser katmaninda stricter validation + unit test
-
-## Test ve Dogrulama
-
-Dokunus sonrasi minimum set:
-
-```bash
-PYTHONPATH=. python3 -m pytest -q tests/test_packet.py
-PYTHONPATH=. python3 -m pytest -q tests/test_packet_extra.py
-```
-
-Ilgili senaryolarda ek dogrulama:
-
-- `tests/test_cpu_packet_engine.py`
-- `tests/test_orchestrator_cpu.py`
+1. **Random (`random`):** Tamamen rastgele 0.0.0.0 - 255.255.255.255 aralığında kaynak IP üretimi (özel ayrılmış bloklar hariç).
+2. **Subnet (`subnet`):** Belirtilen CIDR bloğu (örneğin `192.168.1.0/24`) içinden rastgele kaynak IP seçimi.
+3. **List (`list`):** Harici bir dosyadan okunan IP listesi üzerinden döngüsel veya rastgele seçim.
+4. **Realistic (`realistic`):** Gerçek internet AS (Autonomous System) dağılımlarına uygun kaynak IP seçimi.

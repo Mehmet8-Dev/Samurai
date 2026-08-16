@@ -1,59 +1,45 @@
-# Senders
+# 03 - Senders ve Native Dataplane Motorları
 
-Sender katmani, runtime'dan gelen "paket/payload + policy" bilgisini gercek transport yoluna cevirir.
-Facade: `ddos_samurai/senders.py`
-Icerik moduller: `ddos_samurai/_senders/*`
+Senders katmanı, orkestratörden gelen iş zarflarını (`JobEnvelopeV1`) doğrudan işletim sistemi çekirdeğine, ağ kartına (NIC) veya GPU donanımına aktaran yüksek performanslı C++ motorlarından oluşur.
 
-## Moduler Yapi
+---
 
-- `runtime.py`: backend/fallback resolver + optional import yardimcilari
-- `l2l3_entry.py`: XDP tabanli ana gonderim yolu
-- `l2l3_raw.py`: raw socket / txring alternatifleri
-- `gpu_defense.py`: send-path classifier bridge
-- `stats_core.py`: ortak stats/telemetry normalize
-- `context.py`: sender context cleanup
+## 1. Dataplane Motorları Matrisi
 
-## Policy Gercegi
+| Motor / Worker | Katman | Teknoloji | Açıklama |
+| :--- | :--- | :--- | :--- |
+| **`samurai_cpu_worker`** | L3/L4 | Raw Socket, TPACKET_V3, Packet Ring | Klasik Linux raw socket ve halka tamponları üzerinden optimize edilmiş TCP/UDP/ICMP iletimi. |
+| **`samurai_afxdp_worker`** | L3/L4 | Linux AF_XDP (XSK), Zero-Copy UMEM | Linux çekirdeğini atlayarak doğrudan NIC donanım halkalarına yazar/okur. |
+| **`samurai_dpdk_worker`** | L3/L4 | DPDK PMD, Hugepages, Polled-Mode | Donanım kuyruklarına doğrudan zero-copy erişim sağlayarak Mpps seviyesinde paket üretir. |
+| **`samurai_gpu_worker`** | L3/L4 | NVIDIA CUDA, GPU Parallel Synthesis | Milyonlarca paketin başlık ve yüklerini GPU çekirdeklerinde paralel sentezler. |
+| **`samurai_doca_worker`** | L3/L4 | NVIDIA BlueField DPU, GPUNetIO | DPU üzerinden doğrudan GPUDirect RDMA ile paket iletimi ve akış takibi. |
+| **`samurai_l7_worker`** | L7 | Epoll Reactor, User-Space TCP, nghttp2, ngtcp2 | HTTP/1.1, HTTP/2, QUIC/H3 ve DNS protokollerini hem Kernel socket hem de Kernel-Bypass ile yönetir. |
+| **`samurai_scenario_worker`** | L7 | Scenario DSL Compiler, Scheduler, SLA Engine | Gerçek kullanıcı davranışlarını (Web/Mobile Persona) simüle eden çok adımlı senaryolar. |
+| **`samurai_defense_worker`** | Savunma | VAE (Variational Autoencoder), Bypass Tests | Savunma sistemlerinin anomali tespit eşiklerini test eden akıllı analiz motoru. |
 
-Su an backend policy bilincli olarak dar:
+---
 
-- backend secimi: `xdp`
-- fallback policy: `fail`
+## 2. ZMQ Binary Wire Başlığı (`SamuraiWireHeaderV1`)
 
-Bu davranis `ddos_samurai/_senders/runtime.py` icindeki resolver ile enforce edilir.
+Tüm worker'lar standartlaştırılmış 56 baytlık ikili başlık üzerinden haberleşir:
 
-## XDP Yolunun Akisi
+```cpp
+#pragma pack(push, 1)
+struct SamuraiWireHeaderV1 {
+  uint32_t magic;           // 0x534D5249 ("SMRI")
+  uint8_t  version;         // 0x01
+  uint8_t  msg_type;        // START_JOB, STOP_JOB, ACK, HEARTBEAT vb.
+  uint8_t  worker_kind;     // CPU, GPU, DPDK, AF_XDP, L7 vb.
+  uint8_t  reserved;        // Hizalama dolgusu
+  uint64_t correlation_id;  // İstek/Yanıt eşleme kimliği
+  char     job_id[32];      // İş kimliği
+  uint32_t payload_len;     // Ek veri uzunluğu
+};
+#pragma pack(pop)
+```
 
-`_senders/l2l3_entry.py::xdp_sender`
+---
 
-1. XDP module availability kontrolu
-2. Route/gateway MAC resolve
-3. Buffer normalize ve stride kontrol
-4. (Opsiyonel) GPU defense classify
-5. XDP send loop / pacing entegrasyonu
-6. Stats donus ve fail-visible alanlari
+## 3. Pacing ve Hız Denetimi (`pacing_engine.c`)
 
-## Stats Semasi
-
-`stats_core.py` tarafi su alanlari normalize eder:
-
-- attempted/sent/errors
-- sender_path
-- sender_fallback_reason
-- pacing metrikleri (`actual_rps`, `rate_accuracy_pct`, jitter vb.)
-- loss telemetry alanlari
-
-## L7 ve Stateful Integrasyon
-
-Facade yalnizca L2/L3 degil, L7 stateful runtime cagrilarini da kapsar.
-Ozellikle:
-
-- custom TCP bridge
-- L7 emulation path
-- stateful_runtime_backend metadata
-
-## Performans ve Guvenilirlik
-
-- Copy/copyless path ayrimi buffer normalize ile kontrol edilir
-- Pacing entegrasyonu live progress ile uyumlu tutulur
-- Fallback yerine fail-visible davranis tercih edilerek benchmark sapmalari gizlenmez
+Tüm sender motorları, mikrosaniye seviyesinde hassas zamanlama ve TSC (Time Stamp Counter) tabanlı donanım sayaçları kullanan `pacing_engine` ile hedef RPS / pps değerine birebir uyum sağlar.

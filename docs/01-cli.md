@@ -1,104 +1,88 @@
-# CLI
+# 01 - Native CLI (`samurai`) Kullanımı
 
-Bu belge `python -m ddos_samurai.cli` giris noktasinin gercek akisini ve operasyonel kullanimini aciklar.
+`samurai`, DDoSamurai platformunun C++ ile derlenmiş ana komut satırı arayüzüdür (`ddos_samurai/cli/main.cpp`).
 
-## Giris Noktasi ve Baslangic
+---
 
-- Entrypoint: `ddos_samurai/cli/__main__.py`
-- Start method: `multiprocessing.spawn`
-- Ana akıs: `ddos_samurai/cli/app.py::main()`
-
-Sirayla yapilanlar:
-
-1. Banner + uvloop denemesi
-2. Parser olusturma (`build_parser`)
-3. YAML config defaultlari merge (`load_config_defaults`)
-4. Arguman parse
-5. Lisans gate
-6. Profile/preflight/validation
-7. Offline mode dispatch veya live mode dispatch
-
-## Lisans Akisi (Canli Run Oncesi Zorunlu)
-
-`app.py` asagidaki komutlari ayri ele alir:
-
-- `--license-activate`
-- `--license-deactivate`
-- `--license-info`
-- `--license-account`
-- `--license-trial`
-
-Canli run'da:
-
-- `validate_license()` cagrilir
-- Gecersizse process `EX_CONFIG (78)` ile sonlanir
-- Gecerliyse tier/feature/limit bilgisi args'e inject edilir
-
-## Offline Modlar
-
-`ddos_samurai/cli/offline_modes.py`
-
-- `--self-test`: test discovery calistirir
-- `--dry-run`: paket olusturma ve raporlama smoke
-- `--gpu-pcap`: GPU tabanli sentetik PCAP
-- `--pcap-info`: PCAP metadata ozeti
-
-Bu modlar trafik gondermeden pipeline dogrulama icin idealdir.
-
-## Live Mod
-
-`ddos_samurai/cli/runtime.py::run_live_mode`
-
-Ana adimlar:
-
-1. Arguman validasyonu
-2. Lisans feature gate enforcement
-3. Root/yetki kontrolu (raw path gereksinimleri)
-4. Payload yukleme
-5. Profile cozumleme
-6. Safety gate (`validate_target_safety`)
-7. Worker process spawn
-8. Live monitor + telemetry + soak evaluasyon
-9. Rapor/artefakt yazimi
-
-## Distributed Mod
-
-- `--role master`: `ddos_samurai/control/master.py`
-- `--role slave`: `ddos_samurai/control/slave.py`
-
-Management API enable oldugunda master tarafinda REST/SSE/WS endpointleri acilir.
-
-## Sık Kullanilan Komutlar
-
-Self-test:
+## 1. Temel Kullanım Sözdizimi
 
 ```bash
-python -m ddos_samurai.cli --self-test
+./build/ddos_samurai/cli/samurai --worker <cpu|gpu|dpdk|afxdp|doca|l7|defense|scenario> [seçenekler]
 ```
 
-Dry-run:
+### Zorunlu / Temel Parametreler
 
+- `--worker <kind>`: Çalıştırılacak native motor türü (`cpu`, `afxdp`, `dpdk`, `gpu`, `doca`, `l7`, `scenario`, `defense`).
+- `--target <IP>`: Hedef IPv4 adresi (Varsayılan: `127.0.0.1`).
+- `--port <N>`: Hedef port (Varsayılan: `80`).
+- `--protocol <P>`: Protokol adı (`tcp`, `udp`, `icmp`, `http1`, `http2`, `quic`, `dns`).
+- `--count <N>`: Gönderilecek toplam paket veya istek sayısı.
+- `--confirm`: Etik onay uyarısını atlayarak testi başlatır.
+
+---
+
+## 2. Yaygın Kullanım Örnekleri
+
+### A) CPU Raw Socket ile UDP Testi
 ```bash
-python -m ddos_samurai.cli \
-  --target 127.0.0.1 --port 8080 \
-  --protocol tcp --attack-vector basic \
-  --count 100 --dry-run --confirm
+./build/ddos_samurai/cli/samurai \
+  --worker cpu \
+  --target 127.0.0.1 \
+  --port 8080 \
+  --protocol udp \
+  --count 100000 \
+  --size 64 \
+  --confirm
 ```
 
-Distributed master (dev/insecure):
-
+### B) AF_XDP Kernel-Bypass ile Ultra Hızlı Test
 ```bash
-python -m ddos_samurai.cli \
-  --role master \
-  --control-insecure \
-  --control-listen 127.0.0.1:5099 \
-  --management-api-enable \
-  --management-api-listen 127.0.0.1:8089 \
-  --target 127.0.0.1 --port 80 --protocol tcp --count 100000 --confirm
+sudo ./build/ddos_samurai/cli/samurai \
+  --worker afxdp \
+  --target 10.0.0.50 \
+  --port 80 \
+  --protocol tcp \
+  --count 5000000 \
+  --confirm
 ```
 
-## Operasyonel Notlar
+### C) L7 HTTP/2 Stres Testi
+```bash
+./build/ddos_samurai/cli/samurai \
+  --worker l7 \
+  --target 10.0.0.50 \
+  --port 443 \
+  --protocol http2 \
+  --scheme https \
+  --concurrency 100 \
+  --max-connections 50 \
+  --count 200000 \
+  --confirm
+```
 
-- `--sender-backend` ve `--sender-fallback-policy` preflight tarafinda kisitli calisir.
-- `--traffic-model mamba2` runtime entegrasyonu kaldirildi; egitim/infer yolu `training/mamba2_monolith.py` altindadir.
-- `--run-report` aktifse JSON/Markdown/Prom artefaktlari uretilir.
+### D) Scenario Engine (Web/Mobile Persona) Testi
+```bash
+./build/ddos_samurai/cli/samurai \
+  --worker scenario \
+  --target 10.0.0.50 \
+  --scenario-payload-ref docs/scenario_web_mobile.yaml \
+  --count 50000 \
+  --confirm
+```
+
+---
+
+## 3. Güvenlik ve Doğrulama Bayrakları
+
+- `--allow-public-target`: Genel (Public) IP adreslerine test gönderimine izin verir (Varsayılan olarak sadece yerel/özel IP'lere izin verilir).
+- `--allow-target <CIDR>`: İzin verilen IP/Subnet listesi tanımlar.
+- `--safety-global-deny-target <CIDR>`: Asla trafik gönderilmeyecek IP bloklarını kilitler.
+
+---
+
+## 4. Özel Test Modları
+
+- `--self-test`: Dahili self-testleri çalıştırır.
+- `--list-profiles`: Önceden tanımlanmış test profillerini listeler.
+- `--profile <name>`: Belirtilen profili yükler.
+- `--rfc-suite <suite>`: RFC uyumluluk test paketini çalıştırır.

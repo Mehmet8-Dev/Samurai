@@ -1,83 +1,63 @@
-# Genel Bakis
+# 00 - Genel Bakış ve Mimari Haritası
 
-Samurai, yetkili/lab ortamlarinda kullanilmak uzere tasarlanmis, moduler bir ag stres ve dayaniklilik test platformudur.
-Bu belge, projeyi hizli ama teknik olarak dogru sekilde anlamak icin "harita" dokumanidir.
+Samurai (Sürüm 2.2+, Kod Adı: **Shogun**), yetkili ve izole lab ortamlarında kullanılmak üzere tasarlanmış, sıfır Python çalışma zamanı gecikmesine sahip, modüler ve yüksek performanslı bir ağ stres ve dayanıklılık test platformudur.
 
-## Neyi Cozer?
+Bu belge, projenin native C++ mimarisini ve bileşenler arası ilişkileri özetleyen ana mimari haritadır.
 
-- L2/L3/L4/L7 seviyelerinde yuk uretimi
-- CPU ve opsiyonel GPU hizlandirmali paket/payload uretimi
-- Dagitik (master/slave) calisma modeli
-- Benchmark, KPI gate, soak ve run raporlama
-- Tenant ve role bazli control-plane yonetimi
+---
 
-## Ust Seviye Mimari
+## 1. Mimari Katmanlar
 
-1. CLI katmani
-- Giris noktasi: `python -m ddos_samurai.cli`
-- Moduller: `ddos_samurai/cli/*`
-- Gorev: arguman/cofiguration parse, lisans gate, preflight, mode dispatch
+### A) Native CLI Katmanı (`ddos_samurai/cli/`)
+- **İkili Dosya:** `samurai`
+- **Kaynaklar:** `main.cpp`, `args.cpp`, `validation.cpp`, `profiles.cpp`, `kpi_gate.cpp`, `reporting.cpp`, `rfc_suite.cpp`
+- **Sorumluluk:** CLI argümanlarını parse etme, hedef güvenlik kurallarını işletme (`TargetSafety`), profilleri çözümleme, RFC testlerini yürütme ve ZMQ Supervisor üzerinden yerel dataplane işlerini başlatma.
 
-2. Runtime/orkestrasyon katmani
-- Moduller: `ddos_samurai/cli/runtime.py`, `ddos_samurai/orchestrator.py`
-- Gorev: worker lifecycle, process yonetimi, progress/telemetry toplama
+### B) Dağıtık Control-Plane (`ddos_samurai/control/`)
+- **Master Daemon:** `samurai_master` (`daemon/master_main.cpp`)
+- **Slave Daemon:** `samurai_slave` (`daemon/slave_main.cpp`)
+- **İletişim:** ZMQ ROUTER / DEALER asenkron RPC katmanı (`control_server.cpp`, `control_client.cpp`, `control_wire.hpp`).
+- **Servisler:**
+  - `servicer.cpp`: Worker kayıtları (`RegisterWorker`), heartbeat, telemetri toplama ve shard durum takibi.
+  - `shard.cpp`: Yükü kapasite, bölge ve yeteneğe göre shard'lara bölme.
+  - `ha.cpp`: Lider seçimi (`StaticLeaderElector`, `FileLeaseLeaderElector`).
+  - `management_api.cpp`: POSIX socket tabanlı yerleşik HTTP REST API (`:8089`).
+  - `control_auth.cpp` & `jwt.cpp`: HMAC-SHA256 JWT ve RBAC doğrulaması.
+  - `multimaster.cpp`: Bölgeler arası koordinasyon.
 
-3. Local worker transport katmani
-- ZMQ contract: `ddos_samurai/zmq/wire.py`
-- Dispatcher/event collector: `ddos_samurai/zmq/dispatcher.py`, `ddos_samurai/zmq/event_collector.py`
-- Runtime manager: `ddos_samurai/zmq/runtime_manager.py`
-- Native worker daemons: `ddos_samurai/zmq/daemon/*.cpp`
-- Gorev: CLI/orchestrator ile local CPU/GPU/DPDK/AF_XDP/DOCA/L7/Defense/Scenario worker process'leri arasinda job/event IPC
+### C) Native Orchestrator ve ZMQ Supervisor (`ddos_samurai/orchestrator/`)
+- **Modüller:** `supervisor.cpp`, `worker_registry.hpp`
+- **Sorumluluk:** Master, Slave veya yerel CLI'dan gelen `JobOptions` parametrelerini alarak ilgili native worker binary'sini (`samurai_*_worker`) ZMQ IPC (`ipc:///tmp/samurai_jobs_*`) üzerinden ayağa kaldırır, yönetir ve metrikleri toplar.
 
-4. Packet/payload uretim katmani
-- CPU native packet engine: `ddos_samurai/cpu_native/*`
-- GPU packet/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_packet_cuda/*`, `ddos_samurai/gpu_cuda_payload/*`
-- DPU/GPU state contract: `ddos_samurai/gpu_packet_cuda/dpu_state_runtime.hpp`
+### D) ZMQ Native Dataplane Worker İkilleri (`ddos_samurai/zmq/daemon/`)
+- `samurai_cpu_worker`: Standart raw socket ve packet ring motoru.
+- `samurai_afxdp_worker`: Linux Kernel-Bypass AF_XDP zero-copy motoru.
+- `samurai_dpdk_worker`: DPDK PMD donanım halkası motoru.
+- `samurai_gpu_worker`: NVIDIA CUDA paralel paket sentez motoru.
+- `samurai_doca_worker`: NVIDIA DPU & GPUNetIO doğrudan bellek yolu.
+- `samurai_l7_worker`: HTTP/1.1, HTTP/2, QUIC/H3 ve DNS emülasyon motoru.
+- `samurai_scenario_worker`: Çok adımlı web/mobil kullanıcı senaryoları.
+- `samurai_defense_worker`: VAE savunma bypass ve doğrulama motoru.
 
-5. Dagitik control-plane
-- Master: `ddos_samurai/control/master.py`
-- Slave: `ddos_samurai/control/slave.py`
-- gRPC server/interceptor: `ddos_samurai/control/server.py`
-- Management API: `ddos_samurai/control/management_api.py`
-- HA, discovery, autoscale, multi-master: `ddos_samurai/control/*`
+### E) Donanım ve Protokol Motorları
+- `ddos_samurai/l4/`: `tcp_dataplane_core.cpp` (64-shard kilit şeritli User-Space TCP Stack), `l4_state_engine_core.cpp`.
+- `ddos_samurai/l7_emu_native/`: `engine.cpp`, `bridge.cpp`, `custom_quic_stack/`, `l2l3_stack/`.
+- `ddos_samurai/scenario_engine_native/`: `compiler.cpp`, `scheduler.cpp`, `sla.cpp`.
+- `ddos_samurai/cpu_native/`: `engine.cpp`, `packets.cpp`, `spoofing.cpp`, `amp.cpp`.
+- `ddos_samurai/core/`: `json.hpp`, `target_safety.cpp`, `logging.hpp`.
 
-6. Lisans ve urunlestirme katmani
-- Client-side lisans: `ddos_samurai/licensing/*`
-- (Ayrik) lisans sunucusu: `license_server/*`
-- Tier/feature gate: `ddos_samurai/licensing/features.py`, `ddos_samurai/licensing/gates.py`
+---
 
-## Calisma Modlari
+## 2. Çalışma Modları
 
-- Offline modlar:
-  - `--self-test`
-  - `--dry-run`
-  - `--gpu-pcap`
-  - `--pcap-info`
-- Live standalone mod:
-  - `--role standalone` (default)
-- Distributed mod:
-  - `--role master`
-  - `--role slave`
-
-## Kritik Guvenlik ve Kalite Noktalari
-
-- Hedef guvenligi:
-  - `utils.validate_target_safety()`
-  - default: public hedef blok
-  - allowlist + global denylist destekli
-- Runtime guvenlik davranisi:
-  - soak alarminda auto-abort opsiyonu
-- Lisans gate:
-  - live run oncesi zorunlu dogrulama
-- KPI/benchmark gate:
-  - CI acceptance ve run-quality kontrolu
-
-## Dokuman Seti Icinde Nereye Bakmali?
-
-- CLI akisi: `docs/01-cli.md`
-- Orkestrasyon ve sender zinciri: `docs/02-orchestrator.md`, `docs/03-senders.md`
-- GPU, ZMQ worker ve DPU/GPU dataplane: `docs/05-gpu.md`, `docs/36-zmq-worker-architecture.md`, `docs/37-dpu-gpu-dataplane-architecture.md`
-- AF_XDP ve native sender notlari: `docs/06-af_xdp-fast_sender.md`
-- Safety ve config: `docs/07-safety.md`, `docs/08-config.md`
-- Dagitik deployment: `docs/distributed-container-native.md`, `docs/29-distributed-control-plane.md`
-- Lisans ve urun paketleme: `docs/30-licensing-and-commercialization.md`, `docs/31-security-release-gates.md`
+1. **Standalone (Yerel Çalışma):**
+   ```bash
+   ./build/ddos_samurai/cli/samurai --worker <cpu|afxdp|l7|scenario|...> --target <IP> --count <N> --confirm
+   ```
+2. **Dağıtık Master/Slave (Distributed):**
+   - **Master:** `./build/ddos_samurai/control/daemon/samurai_master --control-listen tcp://0.0.0.0:5099 --count 10000000 ...`
+   - **Slave:** `./build/ddos_samurai/control/daemon/samurai_slave --control-endpoints <MASTER_IP>:5099 --worker afxdp ...`
+3. **Doğrulama ve Self-Test Modu:**
+   - `./build/ddos_samurai/control/samurai_control_selftest`
+   - `./build/ddos_samurai/l7_emu_native/samurai_l7_selftest`
+   - `./build/ddos_samurai/scenario_engine_native/samurai_scenario_engine_selftest`

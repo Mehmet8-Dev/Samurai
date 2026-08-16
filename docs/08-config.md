@@ -1,61 +1,30 @@
-# Config
+# 08 - Konfigürasyon ve Profil Yapılandırması
 
-CLI, `--config` ile YAML bazli default degerleri yukler.
-Kaynak: `ddos_samurai/cli/config.py`
+Native CLI ve Daemon'lar, komut satırı bayrakları, JSON test profilleri ve ortam değişkenleri (Environment Variables) üzerinden yapılandırılır.
 
-## Merge Mantigi
+---
 
-1. Parser once bilinen argumanlarla config yolunu alir
-2. YAML okunur ve flatten edilir
-3. YAML degerleri parser defaults olarak set edilir
-4. Komut satiri explicit degerleri YAML'i override eder
+## 1. Test Profilleri (`profiles.cpp`)
 
-## Nested Key Mapping
+Sık kullanılan test kalıpları hazır profiller halinde kaydedilebilir veya çağrılabilir:
 
-YAML:
+```bash
+# Mevcut profilleri listeleme
+./build/ddos_samurai/cli/samurai --list-profiles
 
-```yaml
-http:
-  scheme: https
-  timeout: 5.0
+# Belirli bir profili çalıştırma
+./build/ddos_samurai/cli/samurai --profile dedicated_lab --confirm
 ```
 
-Argparse `dest`:
+---
 
-- `http_scheme`
-- `http_timeout`
+## 2. Ortam Değişkenleri (Environment Variables)
 
-## Pratik Dosya Ornegi
-
-```yaml
-target: 10.0.0.5
-port: 443
-protocol: tcp
-attack_vector: http2
-workers: 8
-count: 200000
-allow_target:
-  - 10.0.0.0/8
-safety_global_deny_target:
-  - 10.10.10.0/24
-run_report: true
-run_report_format: both
-```
-
-## Config Tasariminda Kural
-
-- Runtime tarafinda kritik policyleri explicit flag olarak da gecirin
-- CI run'lari icin deterministic alanlari YAML'da sabitleyin:
-  - sender backend/policy
-  - pacing mode/rps
-  - report out path
-
-## Dogrulama Onerisi
-
-Config degisikliginden sonra en az:
-
-- `--dry-run`
-- `--self-test`
-- kritik test paketleri (`tests/test_cli_parser.py`, `tests/test_profile_resolver.py`)
-
-ile smoke alin.
+| Değişken Adı | Varsayılan | Açıklama |
+| :--- | :--- | :--- |
+| `SAMURAI_CLUSTER_SECRET` | Boş | Master ve Slave düğümleri arasındaki ortak doğrulama anahtarı. |
+| `SAMURAI_JWT_SECRET` | Boş | Management API ve Control Plane için HMAC-SHA256 gizli anahtarı. |
+| `SAMURAI_XDP_INTERFACE` | Boş | AF_XDP motorunun bağlanacağı ağ kartı arayüzü (örneğin `eth0`). |
+| `SAMURAI_XDP_QUEUE_ID` | `0` | Bağlanılacak NIC kuyruk numarası. |
+| `SAMURAI_L7_TRANSPORT` | `kernel_socket` | L7 için transport seçimi (`kernel_socket`, `custom_tcp`, `custom_quic`). |
+| `SAMURAI_TENANT_NAMESPACE` | `default` | Çoklu kiracı (Multi-tenant) izolasyon alanı. |

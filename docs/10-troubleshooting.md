@@ -1,118 +1,45 @@
-# Troubleshooting
+# 10 - Sorun Giderme (Troubleshooting)
 
-Bu belge sahada en sik gorulen hata siniflarini ve hizli tani adimlarini toplar.
+Bu belge, native C++ çalışma zamanında en sık karşılaşılan hata durumlarını ve çözüm adımlarını içerir.
 
-## 1) Lisans dogrulama basarisiz
+---
 
-Belirti:
+## 1. ZMQ IPC Soket Erişim Hataları (`/tmp/samurai_jobs_*`)
 
-- process `78` ile cikiyor
-- log: `Lisans doğrulaması başarısız`
+- **Belirti:** `jobs socket init failed` veya `Permission denied`.
+- **Neden:** `/tmp` altındaki soket dosyalarının önceki bir çalışmadan kalan farklı kullanıcı izinlerine sahip olması.
+- **Çözüm:** Eski soket dosyalarını temizleyin:
+  ```bash
+  rm -f /tmp/samurai_jobs_* /tmp/samurai_events_*
+  ```
 
-Kontrol:
+---
 
-1. `--license-key` veya `SAMURAI_LICENSE_KEY` var mi?
-2. Lisans sunucusuna erisim var mi?
-3. Sistem saati dogru mu (token/expiry etkiler)?
+## 2. AF_XDP / Raw Socket Yetki Hataları (`Operation not permitted`)
 
-## 2) Raw socket/XDP yetki hatalari
+- **Belirti:** `samurai_afxdp_worker` veya raw socket başlatılamıyor.
+- **Neden:** Linux kernel raw paket ve XSK soketleri için `CAP_NET_RAW` / `CAP_NET_ADMIN` veya root yetkisi gerektirir.
+- **Çözüm:** Komutu `sudo` ile çalıştırın veya ilgili ikiliye capability atayın:
+  ```bash
+  sudo setcap cap_net_raw,cap_net_admin=eip ./build/ddos_samurai/zmq/daemon/samurai_afxdp_worker
+  ```
 
-Belirti:
+---
 
-- `Operation not permitted`
-- root/capability uyarilari
+## 3. Dağıtık Slave Master'a Bağlanamıyor
 
-Kontrol:
+- **Belirti:** `registration with master failed (endpoints=...)`.
+- **Kontrol:**
+  1. Master çalışıyor ve portu (`:5099`) dinliyor mu? (`ss -tulpn | grep 5099`)
+  2. `--cluster-secret` değerleri Master ve Slave üzerinde birebir aynı mı?
+  3. Güvenlik duvarı (UFW / iptables) port erişimini engelliyor mu?
 
-- root veya gerekli capability set edildi mi?
-- container ise NET_RAW/NET_ADMIN var mi?
-- XDP iface dogru mu?
+---
 
-## 3) XDP yolu acilmiyor
+## 4. CMake / Derleme Bağımlılık Eksikleri
 
-Belirti:
-
-- `xdp_unavailable` / module not available
-
-Kontrol:
-
-1. `python setup.py build_ext --inplace`
-2. NIC/driver XDP uygunlugu
-3. `--xdp-interface` degeri
-
-## 4) GPU classifier init hatasi
-
-Belirti:
-
-- engine load/init hatasi
-- `gpu_classifier_hard_fail`
-
-Kontrol:
-
-- `--gpu-classifier-engine-path` dogru mu?
-- TensorRT/CUDA surum uyumu var mi?
-- `--gpu-defense-mode on` gerekli mi?
-
-## 5) Soak run beklenmedik abort
-
-Belirti:
-
-- monitor tarafinda alarm + auto-abort
-
-Kontrol:
-
-- `--safety-auto-abort` aktif mi?
-- thresholdlar (error rate, backlog, growth) fazla siki mi?
-- kaynak metrikleri (RSS/VRAM/pinned) baseline'a gore normal mi?
-
-## 6) Distributed slave register olmuyor
-
-Belirti:
-
-- slave, master register reddi veya timeout
-
-Kontrol:
-
-1. `--control-endpoints` dogru mu?
-2. `--cluster-secret` uyusuyor mu?
-3. tenant namespace mismatch var mi?
-4. TLS/mTLS dosyalari dogru mu?
-
-## 7) Management API 401/403
-
-Belirti:
-
-- `/v1/cluster/*` endpointleri yetki reddi
-
-Kontrol:
-
-- bearer token/role token dogru mu?
-- JWT role/tenant claim adlari uyusuyor mu?
-- trusted identity header kullaniyorsaniz secret/header isimleri uyumlu mu?
-
-## 8) CI'da grpc/protobuf eksikligi
-
-Belirti:
-
-- distributed testlerde import hatalari
-
-Kontrol:
-
-- `pip install -e '.[distributed]'`
-- protobuf/grpc paketleri mevcut mu?
-
-## 9) Dashboard/API legacy beklentisi
-
-Not:
-
-- Bu checkout'ta klasik `dashboard/` ve `ddos_samurai/api.py` yok
-- Aktif API, distributed management API katmanidir (`control/management_api.py`)
-
-## 10) Hizli Tani Komutlari
-
-```bash
-python -m ddos_samurai.cli --self-test
-python -m ddos_samurai.cli --list-profiles
-pytest tests/test_cli_parser.py -q -rs
-pytest tests/test_distributed_management_api.py -q -rs
-```
+- **Belirti:** `libzmq not found` veya `OpenSSL not found`.
+- **Çözüm:**
+  ```bash
+  sudo apt-get install -y libzmq3-dev libssl-dev pkg-config build-essential cmake
+  ```
