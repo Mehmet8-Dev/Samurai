@@ -88,7 +88,19 @@ std::string resolve_local_source_ip(const std::string& target_ip);
 std::string get_spoofed_ip(const std::string& mode, const std::optional<std::string>& subnet, const std::optional<std::string>& list_file);
 int parse_tcp_flags(const std::string& flags_str);
 std::vector<uint8_t> build_tcp_options(const std::vector<std::pair<int, std::optional<std::pair<uint32_t, uint32_t>>>>& options);
+void build_tcp_options(std::vector<uint8_t>& out, const std::vector<std::pair<int, std::optional<std::pair<uint32_t, uint32_t>>>>& options);
 std::vector<uint8_t> build_ipv4_header(
+    const std::string& src_ip,
+    const std::string& dst_ip,
+    int protocol,
+    int payload_len,
+    int ttl,
+    int tos,
+    int identification,
+    uint16_t flags_frag,
+    const std::vector<uint8_t>& options);
+void build_ipv4_header(
+    std::vector<uint8_t>& out,
     const std::string& src_ip,
     const std::string& dst_ip,
     int protocol,
@@ -110,6 +122,19 @@ std::vector<uint8_t> build_tcp_header(
     uint32_t src_ip_int,
     uint32_t dst_ip_int,
     const std::vector<uint8_t>& payload);
+void build_tcp_header(
+    std::vector<uint8_t>& out,
+    int src_port,
+    int dst_port,
+    uint32_t seq,
+    uint32_t ack,
+    int flags,
+    int window,
+    int urgent,
+    const std::vector<uint8_t>& options_bytes,
+    uint32_t src_ip_int,
+    uint32_t dst_ip_int,
+    const std::vector<uint8_t>& payload);
 std::vector<uint8_t> build_udp_header(
     int src_port,
     int dst_port,
@@ -117,12 +142,26 @@ std::vector<uint8_t> build_udp_header(
     uint32_t src_ip_int,
     uint32_t dst_ip_int,
     bool compute_checksum);
+void build_udp_header(
+    std::vector<uint8_t>& out,
+    int src_port,
+    int dst_port,
+    const std::vector<uint8_t>& payload,
+    uint32_t src_ip_int,
+    uint32_t dst_ip_int,
+    bool compute_checksum);
 std::vector<uint8_t> build_icmp_echo(int identifier, int sequence, const std::vector<uint8_t>& payload);
+void build_icmp_echo(std::vector<uint8_t>& out, int identifier, int sequence, const std::vector<uint8_t>& payload);
 std::vector<uint8_t> build_ethernet_header(const std::vector<uint8_t>& dst_mac, const std::vector<uint8_t>& src_mac, int ethertype);
+void build_ethernet_header(std::vector<uint8_t>& out, const std::vector<uint8_t>& dst_mac, const std::vector<uint8_t>& src_mac, int ethertype);
 std::vector<uint8_t> build_dns_query(const std::string& qname, const std::string& qtype, bool recursive, bool edns, int transaction_id);
+void build_dns_query(std::vector<uint8_t>& out, const std::string& qname, const std::string& qtype, bool recursive, bool edns, int transaction_id);
 std::vector<uint8_t> build_transport_packet(const PacketConfig& cfg);
+void build_transport_packet(std::vector<uint8_t>& out, const PacketConfig& cfg);
 std::vector<uint8_t> build_dns_packet(const PacketConfig& cfg);
+void build_dns_packet(std::vector<uint8_t>& out, const PacketConfig& cfg);
 std::vector<uint8_t> build_polymorphic_http_packet(const PacketConfig& cfg);
+void build_polymorphic_http_packet(std::vector<uint8_t>& out, const PacketConfig& cfg);
 std::vector<uint8_t> create_packet(const PacketConfig& cfg);
 std::tuple<std::shared_ptr<std::vector<uint8_t>>, size_t> generate_packet_pool_impl(const PacketConfig& cfg, int count, bool uniform_size, bool low_peak_memory);
 PacketPoolBuffer generate_packet_pool_view(const PacketConfig& cfg, int count, bool uniform_size, bool low_peak_memory);

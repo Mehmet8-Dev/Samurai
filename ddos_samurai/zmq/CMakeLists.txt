@@ -38,8 +38,8 @@ target_include_directories(pacing_engine_static PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 add_library(
   cpu_native_static
   STATIC
+  ../cpu_native/engine.cpp
   ../cpu_native/amp.cpp
-  ../cpu_native/common.cpp
   ../cpu_native/packets.cpp
   ../cpu_native/pool.cpp
   ../cpu_native/spoofing.cpp

