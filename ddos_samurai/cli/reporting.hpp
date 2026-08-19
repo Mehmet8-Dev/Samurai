@@ -1,7 +1,6 @@
 #pragma once
 
-// Native run reporting. C++ reimplementation of the essentials from the former
-// ddos_samurai/reporting.py: assemble a run report from the job context, the
+// Native run reporting: assemble a run report from the job context, the
 // aggregated run stats, and the KPI-gate verdict, and serialize it as JSON or a
 // human-readable text summary that can be written to a file.
 

@@ -1,7 +1,7 @@
 #pragma once
 
-// Master job dispatch coordinator — native C++ port of master.py's
-// _run_single_job. Splits a job into shards, dispatches them to free workers
+// Master job dispatch coordinator. Splits a job into shards, dispatches them to
+// free workers
 // (region-aware scoring), detects lost workers by heartbeat timeout and
 // rebalances/retries their shards, tracks completion via reported stats or a
 // worker status probe, stops any stragglers, and aggregates the result via the

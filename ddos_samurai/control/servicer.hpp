@@ -1,7 +1,7 @@
 #pragma once
 
-// Master-side control service — native C++ port of server.py's _SamuraiServicer.
-// Holds the worker registry + shard stats and implements the eight control RPCs
+// Master-side control service. Holds the worker registry + shard stats and
+// implements the eight control RPCs
 // as pure request-body -> response-body transforms (JSON), independent of the
 // transport. ControlServer drives it over ZMQ; it is equally testable directly.
 

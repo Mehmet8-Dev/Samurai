@@ -8,7 +8,7 @@ namespace samurai::core {
 
 namespace {
 
-// ANSI palette — matches utils.py (RESET/DIM/WHITE/ACCENT).
+// ANSI palette (RESET/DIM/WHITE/ACCENT).
 constexpr const char* kReset = "\033[0m";
 constexpr const char* kDim = "\033[90m";
 constexpr const char* kWhite = "\033[37m";

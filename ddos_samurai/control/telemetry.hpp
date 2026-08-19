@@ -1,7 +1,6 @@
 #pragma once
 
-// Distributed telemetry aggregation — native C++ port of
-// ddos_samurai/control/telemetry.py (DistributedAggregator). Pure logic: fold a
+// Distributed telemetry aggregation (DistributedAggregator). Pure logic: fold a
 // stream of per-update telemetry items (JSON objects) into a rolled-up snapshot
 // (totals, per-shard/worker/region rollups, top-error shards). No I/O.
 //

@@ -44,7 +44,7 @@ bool SlaveNode::Register() {
     if (r.ok) {
       const Value* accepted = r.body.find("accepted");
       if (accepted && accepted->as_bool()) return true;
-      // A definitive rejection is terminal (mirrors slave.py returning 1).
+      // A definitive rejection is terminal.
       if (accepted && !accepted->as_bool()) return false;
     }
     sleep_ms_(250);

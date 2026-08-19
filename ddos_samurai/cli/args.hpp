@@ -1,6 +1,6 @@
 #pragma once
 
-// argv -> CliOptions. Native replacement for ddos_samurai/cli/args.py.
+// argv -> CliOptions.
 
 #include "options.hpp"
 

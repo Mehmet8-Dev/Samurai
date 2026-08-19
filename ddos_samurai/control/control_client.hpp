@@ -16,7 +16,7 @@
 namespace samurai::control {
 
 // Worker (slave) side: register / heartbeat / report stats, with endpoint
-// failover — port of client.py SlaveControlClient.
+// failover.
 class SlaveControlClient {
  public:
   SlaveControlClient(const std::string& endpoints, const std::string& cluster_secret = "",
@@ -45,8 +45,7 @@ class SlaveControlClient {
   void* ctx_ = nullptr;  // shared zmq context (opaque)
 };
 
-// Master side: command a single worker/master endpoint directly — port of
-// client.py WorkerControlClient.
+// Master side: command a single worker/master endpoint directly.
 class WorkerControlClient {
  public:
   WorkerControlClient(const std::string& endpoint, const std::string& cluster_secret = "",

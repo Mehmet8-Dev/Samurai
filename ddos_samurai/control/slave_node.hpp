@@ -1,8 +1,8 @@
 #pragma once
 
-// Distributed slave orchestration loop — native C++ port of the register +
-// heartbeat control flow in slave.py run_distributed_slave (the shard execution
-// side is WorkerShardService). Drives a SlaveControlClient: register with retry
+// Distributed slave orchestration loop — the register + heartbeat control flow
+// (the shard execution side is WorkerShardService). Drives a SlaveControlClient:
+// register with retry
 // until accepted or a deadline, then heartbeat periodically and re-register when
 // the master answers "register". Built only with libzmq (uses the ZMQ client).
 

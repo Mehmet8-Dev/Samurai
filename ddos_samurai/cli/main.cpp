@@ -1,9 +1,7 @@
 // samurai — native CLI entrypoint.
 //
-// Native replacement for ddos_samurai/cli/__main__.py + app.py. Thin driver:
-// parse (args) -> validate (validation) -> run the job via the orchestrator's
-// ZMQ supervisor. The CLI surface grows toward parity with the former Python
-// cli/ package.
+// Thin driver: parse (args) -> validate (validation) -> run the job via the
+// orchestrator's ZMQ supervisor.
 
 #include <cstdio>
 #include <string>

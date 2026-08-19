@@ -1,9 +1,8 @@
 #pragma once
 
-// Native aggregation of worker metric snapshots into a run summary. Replaces the
-// wire-stats helpers from ddos_samurai/metrics_schema.py (merge_worker_stats +
-// recompute_loss_metrics), operating directly on the wire MetricSnapshotV1 that
-// the workers emit.
+// Native aggregation of worker metric snapshots into a run summary
+// (merge_worker_stats + recompute_loss_metrics), operating directly on the wire
+// MetricSnapshotV1 that the workers emit.
 
 #include <cstdint>
 #include <string>

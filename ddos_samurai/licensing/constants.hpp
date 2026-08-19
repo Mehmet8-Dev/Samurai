@@ -1,8 +1,7 @@
 #pragma once
 
-// License system configuration — native C++ port of
-// ddos_samurai/licensing/constants.py. Values resolve from the environment at
-// call time (not load time), matching the Python getenv semantics.
+// License system configuration. Values resolve from the environment at call
+// time (not load time).
 
 #include <cstdlib>
 #include <string>

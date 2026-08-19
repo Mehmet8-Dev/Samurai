@@ -1,7 +1,7 @@
 #pragma once
 
-// RBAC audit chain — native C++ port of server.py's _append_rbac_audit /
-// _load_last_audit_hash / verify_rbac_audit_chain. Each appended entry is a
+// RBAC audit chain — append_rbac_audit / load_last_audit_hash /
+// verify_rbac_audit_chain. Each appended entry is a
 // tamper-evident JSON line: schema + fields + prev_hash, with an entry_hash =
 // SHA256 over the sorted-key JSON of the entry (excluding entry_hash). Entries
 // chain via prev_hash so any edit/reorder/deletion breaks verification.

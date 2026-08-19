@@ -1,13 +1,12 @@
 #pragma once
 
-// Control-plane auth helpers — native C++ port of the transport-agnostic parts
-// of ddos_samurai/control/auth.py: endpoint parsing, cluster-secret metadata,
-// and role/secret (RBAC) resolution. Pure logic, no I/O.
+// Control-plane auth helpers — the transport-agnostic parts: endpoint parsing,
+// cluster-secret metadata, and role/secret (RBAC) resolution. Pure logic, no
+// I/O.
 //
-// The gRPC TLS credential constructors (load_tls_*_credentials,
-// client_call_credentials) are transport wiring and belong to the native
+// TLS credential construction is transport wiring and belongs to the native
 // transport layer; only EnsureTlsFilesExist (a filesystem precondition check)
-// is ported here.
+// lives here.
 
 #include <string>
 #include <utility>

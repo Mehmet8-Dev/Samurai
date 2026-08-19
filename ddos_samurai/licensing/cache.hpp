@@ -1,7 +1,7 @@
 #pragma once
 
-// Offline license cache — native C++ port of ddos_samurai/licensing/cache.py.
-// The validated result is stored encrypted so the tool can keep running for the
+// Offline license cache. The validated result is stored encrypted so the tool
+// can keep running for the
 // grace period when the license server is unreachable. Encryption is
 // AES-256-GCM (OpenSSL) with a key derived from the HWID, so the cache only
 // opens on the same machine.

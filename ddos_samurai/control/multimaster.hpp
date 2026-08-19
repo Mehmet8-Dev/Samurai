@@ -1,7 +1,6 @@
 #pragma once
 
-// Cross-region multi-master coordination — native C++ port of
-// ddos_samurai/control/multimaster.py (RedisMultiMasterCoordinator).
+// Cross-region multi-master coordination (RedisMultiMasterCoordinator).
 //
 // The coordination logic (key scheme, JSON envelopes, heartbeat/snapshot/event
 // publication, cross-region job enqueue/dequeue, region scans) is native and

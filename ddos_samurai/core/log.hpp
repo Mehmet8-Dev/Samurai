@@ -1,9 +1,8 @@
 #pragma once
 
-// Native logging helpers — the C++ replacement for the log_* family in the
-// former ddos_samurai/utils.py. Timestamped, ANSI-coloured console lines with
-// the same visual grammar (dim timestamp, accent glyph, message). Shared by the
-// CLI, the orchestrator, and (as they are ported) the control/licensing layers.
+// Native logging helpers — the log_* family. Timestamped, ANSI-coloured console
+// lines (dim timestamp, accent glyph, message). Shared by the CLI, the
+// orchestrator, and the control/licensing layers.
 
 #include <string>
 

@@ -1,7 +1,7 @@
 #pragma once
 
-// Feature-gate enforcement — native C++ port of ddos_samurai/licensing/gates.py.
-// Given the requested run parameters and a validated LicenseResult, allow or
+// Feature-gate enforcement. Given the requested run parameters and a validated
+// LicenseResult, allow or
 // reject the run and clamp duration/PPS to the tier limits. Pure logic, except
 // the "critical capabilities" server-side execution grant, which is abstracted
 // behind ExecGrantClient (its HTTP transport is deferred, like the license

@@ -9,8 +9,8 @@ namespace samurai::cli {
 namespace {
 
 // One corporate test profile. Sentinel values (nullptr / negative) mean "leave
-// the option at its current/default value". Mirrors TEST_PROFILES in the former
-// workload_profiles.py, restricted to fields the wire JobEnvelopeV1 carries.
+// the option at its current/default value", restricted to fields the wire
+// JobEnvelopeV1 carries.
 struct ProfileDef {
   const char* name;
   const char* description;

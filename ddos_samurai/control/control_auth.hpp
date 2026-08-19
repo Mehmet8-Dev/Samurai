@@ -1,9 +1,8 @@
 #pragma once
 
-// Server-side control-plane authorization — native C++ port of
-// server.py's _SecretServerInterceptor authorization core: cluster-secret
-// validation, optional JWT fallback, RBAC role resolution, and per-RPC
-// allowed-role enforcement. Reuses control/auth.* (RBAC) and control/jwt.*.
+// Server-side control-plane authorization core: cluster-secret validation,
+// optional JWT fallback, RBAC role resolution, and per-RPC allowed-role
+// enforcement. Reuses control/auth.* (RBAC) and control/jwt.*.
 
 #include <set>
 #include <string>

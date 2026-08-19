@@ -48,7 +48,7 @@ std::optional<Cidr> ParseCidr(const std::string& s) {
 
 bool InCidr(std::uint32_t ip, const Cidr& c) { return (ip & c.mask) == c.network; }
 
-// utils.py policy subset: RFC1918 + loopback + link-local + CGNAT.
+// Private/loopback policy: RFC1918 + loopback + link-local + CGNAT.
 bool IsPrivateOrLoopback(std::uint32_t ip) {
   static const Cidr kRanges[] = {
       {0x0A000000u, 0xFF000000u},  // 10.0.0.0/8

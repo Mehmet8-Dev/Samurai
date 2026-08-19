@@ -1,12 +1,8 @@
 #pragma once
 
-// Native KPI gate. C++ reimplementation of the essential engine from the former
-// ddos_samurai/kpi_gate.py: evaluate a set of min/max threshold rules against a
-// run's aggregated stats and produce an overall pass/fail verdict.
-//
-// The Python version carried dozens of domain-specific thresholds keyed off the
-// old Python result dicts; here we gate the KPIs the native RunStats actually
-// produces. Add rules as the native metric surface grows.
+// Native KPI gate: evaluate a set of min/max threshold rules against a run's
+// aggregated stats and produce an overall pass/fail verdict. Gates the KPIs the
+// native RunStats produces; add rules as the native metric surface grows.
 
 #include <optional>
 #include <string>

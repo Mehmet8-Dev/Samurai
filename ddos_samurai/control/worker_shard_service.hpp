@@ -1,7 +1,7 @@
 #pragma once
 
-// Worker-side control service — native C++ port of slave.py's _WorkerServicer.
-// The distributed slave serves this so the master can drive shards directly:
+// Worker-side control service. The distributed slave serves this so the master
+// can drive shards directly:
 // StartShard (with leader-epoch fencing + duplicate guard), StopShard, and
 // GetWorkerStatus. Shard execution goes through the ShardRunner abstraction; a
 // per-shard monitor thread finalizes stats on completion.

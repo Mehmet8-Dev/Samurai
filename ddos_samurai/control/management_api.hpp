@@ -1,7 +1,7 @@
 #pragma once
 
-// HTTP management API — native C++ port of management_api.py. A minimal HTTP/1.1
-// server (POSIX sockets, no framework) exposes the cluster's read endpoints plus
+// HTTP management API — a minimal HTTP/1.1 server (POSIX sockets, no framework)
+// exposes the cluster's read endpoints plus
 // a job-abort action, with the same auth model: trusted-identity proxy headers,
 // bearer role tokens, and JWT role/tenant claims, all tenant-filtered.
 //

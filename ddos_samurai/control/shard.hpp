@@ -1,8 +1,8 @@
 #pragma once
 
-// Shard-split helpers for distributed jobs — native C++ port of
-// ddos_samurai/control/shard.py. Pure logic: given a total packet count and a
-// set of workers, split the work across shards by an equal / capability /
+// Shard-split helpers for distributed jobs. Pure logic: given a total packet
+// count and a set of workers, split the work across shards by an equal /
+// capability /
 // region-weighted strategy. No I/O, no transport.
 
 #include <cstdint>

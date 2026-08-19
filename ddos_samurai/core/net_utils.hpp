@@ -1,7 +1,6 @@
 #pragma once
 
-// Native network helpers — the C++ replacement for the L2/L3 resolution
-// utilities in the former ddos_samurai/utils.py (get_local_ip,
+// Native network helpers — L2/L3 resolution utilities (get_local_ip,
 // get_gateway_mac, mac_to_int). Used by the L2-capable senders (AF_XDP/DPDK)
 // and the orchestrator when a source address or next-hop MAC is needed.
 //

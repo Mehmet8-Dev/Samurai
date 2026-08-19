@@ -1,9 +1,8 @@
 #pragma once
 
-// Minimal JWT HS256 helpers — native C++ port of
-// ddos_samurai/control/jwt_claims.py. Verifies/creates HS256 (HMAC-SHA256)
-// tokens for control-plane auth, using OpenSSL for the MAC and samurai_core's
-// JSON for the header/payload. Signature comparison is constant-time.
+// Minimal JWT HS256 helpers. Verifies/creates HS256 (HMAC-SHA256) tokens for
+// control-plane auth, using OpenSSL for the MAC and samurai_core's JSON for the
+// header/payload. Signature comparison is constant-time.
 
 #include <string>
 

@@ -1,7 +1,7 @@
 #pragma once
 
-// Endpoint discovery — native C++ port of ddos_samurai/control/discovery.py.
-// Manual endpoints are first-class and always win when present (the v1 policy).
+// Endpoint discovery. Manual endpoints are first-class and always win when
+// present (the v1 policy).
 // Kubernetes-based discovery is deferred to a native k8s client; until then
 // ResolveWithFallback() returns the manual set (or empty).
 

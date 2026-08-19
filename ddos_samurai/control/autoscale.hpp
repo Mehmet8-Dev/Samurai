@@ -1,9 +1,8 @@
 #pragma once
 
-// Autoscale decision controller — native C++ port of the control logic in
-// ddos_samurai/control/autoscale.py (K8sAutoscaleController). The scaling
-// *decision* state machine (cooldown, step limiting, idle scale-down, desired
-// replica computation) is ported here and unit-testable.
+// Autoscale decision controller (K8sAutoscaleController). The scaling *decision*
+// state machine (cooldown, step limiting, idle scale-down, desired replica
+// computation) is native and unit-testable.
 //
 // The live Kubernetes read/patch calls are deferred to a native k8s client;
 // this controller runs in the in-memory mode (the Python `_api is None` path),

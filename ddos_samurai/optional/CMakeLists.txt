@@ -1,9 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(samurai_optional_backends LANGUAGES C CXX)
 
-# Optional native backend libraries — the CMake replacement for the toolchain-
-# gated builds that used to live in setup.py (OptionalBuildExt). These produce
-# the runtime .so libraries the corresponding ZMQ workers dlopen at runtime:
+# Optional native backend libraries — toolchain-gated builds that produce the
+# runtime .so libraries the corresponding ZMQ workers dlopen at runtime:
 #
 #   libgpu_packet_cuda.so  (nvcc)      -> gpu worker
 #   dpdk_pmd_core.so       (libdpdk)   -> dpdk worker
@@ -11,10 +10,8 @@ project(samurai_optional_backends LANGUAGES C CXX)
 #   DOCA backends          (DOCA SDK)  -> doca worker
 #
 # Every backend is conditional on its toolchain being present; when it is not,
-# the backend is skipped with a status message (exactly as setup.py did). The
-# legacy pybind `pacing_engine` Python extension is intentionally NOT ported —
-# pybind is legacy and the native workers use the pacing_engine_static C library
-# built under zmq/.
+# the backend is skipped with a status message. The native workers use the
+# pacing_engine_static C library built under zmq/.
 #
 # Outputs are written into the source tree next to where the workers look for
 # them via dlopen.
@@ -89,7 +86,7 @@ endif()
 # --- DOCA GPUNetIO / Flow backends (DOCA SDK) -----------------------------
 # The DOCA backends require the Mellanox DOCA SDK + nvcc device build and are
 # only produced where that SDK is installed (SAMURAI_WITH_DOCA_GPUNETIO_DEVICE);
-# left as a toolchain-gated build, off by default (as in setup.py).
+# left as a toolchain-gated build, off by default.
 if(DEFINED ENV{SAMURAI_WITH_DOCA_GPUNETIO_DEVICE})
   message(STATUS "optional: DOCA GPUNetIO requested -> requires DOCA SDK + nvcc (built out-of-tree)")
 else()

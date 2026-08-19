@@ -1,7 +1,7 @@
 #pragma once
 
-// License tiers, feature constants, limits, and the validation result — native
-// C++ port of ddos_samurai/licensing/features.py. Pure data + lookups.
+// License tiers, feature constants, limits, and the validation result. Pure
+// data + lookups.
 
 #include <string>
 #include <vector>
@@ -28,7 +28,7 @@ struct TierLimits {
   int max_pps = 0;          // 0 = unlimited
   int max_duration_s = 0;   // 0 = unlimited
   int max_devices = 1;
-  bool has_value = false;   // false => "no limits object" (Python None)
+  bool has_value = false;   // false => "no limits object"
 };
 
 struct LicenseResult {
@@ -45,7 +45,7 @@ struct LicenseResult {
   std::string exec_grant_expires;
 };
 
-// Feature identifiers (match features.py).
+// Feature identifiers.
 inline constexpr const char* kFeatureGpuEngine = "gpu_engine";
 inline constexpr const char* kFeatureAfXdp = "af_xdp";
 inline constexpr const char* kFeatureL7Http11 = "l7_http11";
@@ -66,7 +66,7 @@ inline constexpr const char* kFeatureSpoofing = "spoofing";
 inline constexpr const char* kFeatureSlowloris = "slowloris";
 inline constexpr const char* kFeatureApiKey = "api_key";
 
-// Feature set for a tier (Pro ⊂ Enterprise), matching features.py.
+// Feature set for a tier (Pro ⊂ Enterprise).
 std::vector<std::string> TierFeatures(Tier tier);
 TierLimits TierLimitsFor(Tier tier);
 

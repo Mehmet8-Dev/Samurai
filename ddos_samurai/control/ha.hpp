@@ -1,7 +1,7 @@
 #pragma once
 
-// HA leader election — native C++ port of ha.py. This increment covers the two
-// backends that need no external service:
+// HA leader election. This increment covers the two backends that need no
+// external service:
 //   * StaticLeaderElector    — deterministic lexical-min node id (bootstrap HA)
 //   * FileLeaseLeaderElector — file-backed lease with flock + atomic rename,
 //                              renew loop, and release

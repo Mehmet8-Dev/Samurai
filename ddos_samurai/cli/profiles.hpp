@@ -1,13 +1,12 @@
 #pragma once
 
-// Native workload/browser profiles. Replaces the Python modules
-// ddos_samurai/workload_profiles.py, profiles.py and profile_names.py.
+// Native workload/browser profiles.
 //
 //   - ApplyProfile(): applies a named corporate test profile's overrides onto
-//     the parsed job options (was TEST_PROFILES in workload_profiles.py).
-//   - ListProfiles(): prints the available profiles (was print_profiles()).
-//   - The browser TLS/H2 profile names (was profile_names.py) are exposed as
-//     constants for the L7 paths.
+//     the parsed job options.
+//   - ListProfiles(): prints the available profiles.
+//   - The browser TLS/H2 profile names are exposed as constants for the L7
+//     paths.
 
 #include <optional>
 #include <string>
@@ -16,7 +15,7 @@
 
 namespace samurai::cli {
 
-// Browser TLS/H2 fingerprint profiles (was profile_names.py).
+// Browser TLS/H2 fingerprint profiles.
 inline constexpr const char* kProfileNone = "none";
 inline constexpr const char* kDefaultBrowserProfile = "chrome_120";
 inline constexpr const char* kBrowserProfileNames[] = {
