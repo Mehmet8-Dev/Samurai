@@ -1,13 +1,21 @@
 // Self-test for the native licensing offline core. Exits 0 on success, 1 on the
 // first failed check.
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "cache.hpp"
+#include "client.hpp"
 #include "constants.hpp"
 #include "gates.hpp"
+#include "http_client.hpp"
 #include "hwid.hpp"
 #include "license_types.hpp"
 
@@ -31,6 +39,66 @@ LicenseResult Lic(Tier tier, bool offline = false) {
   r.offline = offline;
   return r;
 }
+
+// One-thread mock HTTP server: replies by path (validate vs exec-grant).
+struct MockLicenseServer {
+  int fd = -1;
+  int port = 0;
+  std::atomic<bool> running{false};
+  std::thread th;
+
+  bool Start() {
+    fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    int one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    timeval tv{0, 200 * 1000};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || ::listen(fd, 8) != 0) {
+      ::close(fd);
+      fd = -1;
+      return false;
+    }
+    sockaddr_in bound{};
+    socklen_t bl = sizeof(bound);
+    ::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bl);
+    port = ntohs(bound.sin_port);
+    running.store(true);
+    th = std::thread([this] { Loop(); });
+    return true;
+  }
+  void Loop() {
+    while (running.load()) {
+      int c = ::accept(fd, nullptr, nullptr);
+      if (c < 0) continue;
+      std::string req;
+      char buf[2048];
+      timeval tv{1, 0};
+      ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      ssize_t n = ::recv(c, buf, sizeof(buf), 0);
+      if (n > 0) req.assign(buf, static_cast<std::size_t>(n));
+      const bool grant = req.find("exec-grant") != std::string::npos;
+      const std::string body =
+          grant ? std::string("{\"granted\":true,\"grant_token\":\"grant-xyz\",\"expires_at\":\"2030\"}")
+                : std::string("{\"valid\":true,\"tier\":\"pro\",\"features\":[\"af_xdp\",\"gpu_engine\"],"
+                              "\"limits\":{\"max_workers\":16,\"max_pps\":0,\"max_duration_s\":0,\"max_devices\":3},"
+                              "\"expires\":\"2030-01-01\",\"customer_email\":\"a@b.co\",\"session_id\":\"sess-9\"}");
+      std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                         std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+      ::send(c, resp.data(), resp.size(), 0);
+      ::close(c);
+    }
+  }
+  void Stop() {
+    running.store(false);
+    if (th.joinable()) th.join();
+    if (fd >= 0) ::close(fd);
+  }
+};
 
 struct StubGrant : ExecGrantClient {
   bool succeed;
@@ -160,6 +228,45 @@ int main() {
     ClearCache();
     LicenseResult gone;
     Check(!LoadCache(hwid, gone), "cache: cleared");
+  }
+
+  // --- http license client against a mock server ---
+  {
+    MockLicenseServer server;
+    if (!server.Start()) {
+      std::fprintf(stderr, "FAIL: mock server start\n");
+      ++g_failures;
+    } else {
+      const std::string url = "http://127.0.0.1:" + std::to_string(server.port);
+      HttpLicenseClient client(url, 3);
+
+      LicenseResult lr = client.Validate("SAM-AAAA-BBBB-CCCC-DDDD", "hwid-1");
+      Check(lr.valid && lr.tier == Tier::kPro, "client: validate -> valid pro");
+      Check(HasFeature(lr, kFeatureAfXdp) && lr.limits.has_value && lr.limits.max_workers == 16,
+            "client: features + limits parsed");
+      Check(lr.session_id == "sess-9" && lr.customer_email == "a@b.co",
+            "client: metadata parsed");
+
+      ExecGrantResult g = client.RequestGrant("SAM-AAAA-BBBB-CCCC-DDDD", "hwid-1", "sess-9",
+                                              "http2", "cpu", "standalone", {"l7_http2"});
+      Check(g.ok && g.grant_token == "grant-xyz", "client: exec-grant granted");
+
+      // The client satisfies the gates' ExecGrantClient interface end to end.
+      auto ent = Lic(Tier::kEnterprise);
+      GateInput crit;
+      crit.attack_vector = "http2";
+      crit.has_role = true;
+      crit.license_key = "SAM-AAAA-BBBB-CCCC-DDDD";
+      auto rg = EnforceFeatureGates(crit, ent, &client);
+      Check(rg.ok && ent.exec_grant_token == "grant-xyz", "client: drives gate exec-grant");
+
+      server.Stop();
+    }
+    // Unreachable server -> invalid with a reason (no hang).
+    HttpLicenseClient dead("http://127.0.0.1:9", 1);
+    LicenseResult bad = dead.Validate("SAM-X", "h");
+    Check(!bad.valid && bad.reason.find("unreachable") != std::string::npos,
+          "client: unreachable server reason");
   }
 
   if (g_failures == 0) {

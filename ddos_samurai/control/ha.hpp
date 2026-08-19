@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "json.hpp"
+#include "multimaster.hpp"  // KvStore
 
 namespace samurai::control {
 
@@ -74,6 +75,44 @@ class FileLeaseLeaderElector : public LeaderElector {
   std::string lease_path_;
   double lease_seconds_;
   std::atomic<bool> leader_{false};
+
+  std::atomic<bool> stop_{false};
+  std::thread renew_thread_;
+  std::mutex cv_mu_;
+  std::condition_variable cv_;
+};
+
+// Redis-backed lease elector with a fencing epoch — native C++ port of ha.py's
+// RedisLeaseLeaderElector. The Redis protocol operations are expressed against
+// the KvStore abstraction (SET NX PX / INCR / compare-and-PEXPIRE /
+// compare-and-DEL / PTTL), so the election logic is native and testable with the
+// in-memory store; a real hiredis-backed KvStore is deferred (as elsewhere).
+class RedisLeaseLeaderElector : public LeaderElector {
+ public:
+  // `store` is non-owning and may be null (offline/inactive).
+  RedisLeaseLeaderElector(const std::string& node_id, const std::string& lease_key,
+                          KvStore* store, double lease_seconds = 15.0);
+  ~RedisLeaseLeaderElector() override;
+
+  bool TryAcquire() override;
+  bool RenewOnce() override;
+  bool IsLeader() const override { return leader_.load(); }
+  std::int64_t LeaderEpoch() const override { return leader_epoch_.load(); }
+  samurai::core::json::Value Snapshot() const override;
+  void StartRenewLoop(double interval_s) override;
+  void Stop() override;
+  void Release();
+
+ private:
+  std::string EpochKey() const { return lease_key_ + ":epoch"; }
+
+  std::string node_id_;
+  std::string lease_key_;
+  std::string owner_token_;
+  double lease_seconds_;
+  KvStore* store_;
+  std::atomic<bool> leader_{false};
+  std::atomic<std::int64_t> leader_epoch_{0};
 
   std::atomic<bool> stop_{false};
   std::thread renew_thread_;

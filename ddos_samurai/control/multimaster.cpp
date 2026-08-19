@@ -106,6 +106,45 @@ bool InMemoryKvStore::Get(const std::string& key, std::string& out) {
   out = it->second;
   return true;
 }
+bool InMemoryKvStore::SetNx(const std::string& key, const std::string& value, long long ttl_ms) {
+  if (strings_.count(key)) return false;  // exists -> NX fails
+  strings_[key] = value;
+  ttls_[key] = ttl_ms;
+  return true;
+}
+std::int64_t InMemoryKvStore::Incr(const std::string& key) {
+  std::int64_t v = 0;
+  auto it = strings_.find(key);
+  if (it != strings_.end()) {
+    try {
+      v = std::stoll(it->second);
+    } catch (...) {
+      v = 0;
+    }
+  }
+  ++v;
+  strings_[key] = std::to_string(v);
+  return v;
+}
+bool InMemoryKvStore::CompareAndPExpire(const std::string& key, const std::string& expected,
+                                        long long ttl_ms) {
+  auto it = strings_.find(key);
+  if (it == strings_.end() || it->second != expected) return false;
+  ttls_[key] = ttl_ms;
+  return true;
+}
+bool InMemoryKvStore::CompareAndDel(const std::string& key, const std::string& expected) {
+  auto it = strings_.find(key);
+  if (it == strings_.end() || it->second != expected) return false;
+  strings_.erase(it);
+  ttls_.erase(key);
+  return true;
+}
+long long InMemoryKvStore::Pttl(const std::string& key) {
+  auto it = ttls_.find(key);
+  return it == ttls_.end() ? -1 : it->second;
+}
+
 std::vector<std::string> InMemoryKvStore::ScanMatch(const std::string& pattern, int) {
   std::vector<std::string> out;
   for (const auto& kv : strings_) {

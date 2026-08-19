@@ -517,6 +517,23 @@ int main() {
     Check(e2.TryAcquire() && e2.IsLeader(), "ha: file-lease acquirable after release");
     e2.Release();
     std::remove(lease.c_str());
+
+    // Redis-lease elector over the in-memory KvStore (fencing epoch increments).
+    InMemoryKvStore store;
+    RedisLeaseLeaderElector r1("n1", "samurai:ha:master", &store, 30.0);
+    RedisLeaseLeaderElector r2("n2", "samurai:ha:master", &store, 30.0);
+    Check(r1.TryAcquire() && r1.IsLeader() && r1.LeaderEpoch() == 1,
+          "ha: redis first acquires, epoch 1");
+    Check(!r2.TryAcquire() && !r2.IsLeader(), "ha: redis second blocked");
+    Check(r1.RenewOnce() && r1.IsLeader(), "ha: redis owner renews");
+    Check(r1.Snapshot().find("leader_id")->as_string() == "n1", "ha: redis leader_id");
+    r1.Release();
+    Check(r2.TryAcquire() && r2.IsLeader() && r2.LeaderEpoch() == 2,
+          "ha: redis re-acquire bumps fencing epoch to 2");
+    r2.Release();
+    // Null store -> inert.
+    RedisLeaseLeaderElector offline("n3", "k", nullptr, 30.0);
+    Check(!offline.TryAcquire() && !offline.IsLeader(), "ha: redis null store inert");
   }
 
   // --- slave: worker shard service lifecycle ---

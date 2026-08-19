@@ -35,6 +35,21 @@ class KvStore {
   virtual bool LPop(const std::string& key, std::string& out) = 0;  // pop head; false if empty
   virtual bool Get(const std::string& key, std::string& out) = 0;   // false if missing
   virtual std::vector<std::string> ScanMatch(const std::string& pattern, int count) = 0;
+
+  // Lease/atomic ops used by the Redis lease leader elector (SET NX PX / INCR /
+  // compare-and-PEXPIRE / compare-and-DEL / PTTL). Defaulted so existing
+  // KvStore implementations need not change.
+  virtual bool SetNx(const std::string& key, const std::string& value, long long ttl_ms) {
+    (void)key; (void)value; (void)ttl_ms; return false;
+  }
+  virtual std::int64_t Incr(const std::string& key) { (void)key; return 0; }
+  virtual bool CompareAndPExpire(const std::string& key, const std::string& expected, long long ttl_ms) {
+    (void)key; (void)expected; (void)ttl_ms; return false;
+  }
+  virtual bool CompareAndDel(const std::string& key, const std::string& expected) {
+    (void)key; (void)expected; return false;
+  }
+  virtual long long Pttl(const std::string& key) { (void)key; return -1; }
 };
 
 // Non-persistent, single-process KvStore for tests and offline operation.
@@ -48,10 +63,16 @@ class InMemoryKvStore : public KvStore {
   bool LPop(const std::string& key, std::string& out) override;
   bool Get(const std::string& key, std::string& out) override;
   std::vector<std::string> ScanMatch(const std::string& pattern, int count) override;
+  bool SetNx(const std::string& key, const std::string& value, long long ttl_ms) override;
+  std::int64_t Incr(const std::string& key) override;
+  bool CompareAndPExpire(const std::string& key, const std::string& expected, long long ttl_ms) override;
+  bool CompareAndDel(const std::string& key, const std::string& expected) override;
+  long long Pttl(const std::string& key) override;
 
  private:
   std::unordered_map<std::string, std::string> strings_;
   std::unordered_map<std::string, std::deque<std::string>> lists_;
+  std::unordered_map<std::string, long long> ttls_;  // advisory, not expired in-memory
 };
 
 struct MultiMasterConfig {

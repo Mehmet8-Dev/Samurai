@@ -145,12 +145,12 @@ Sıra: native karşılık kanıtlanmadan Python yol sökülmez.
       - [x] `management_api` → `control/management_api.*` (native HTTP/1.1 sunucu: /healthz, /v1/cluster/{summary,workers,shards,events}, /v1/jobs/abort, /metrics + trusted-identity/bearer/JWT auth, tenant filtreleme); SSE/WebSocket stream'ler ertelendi
       - [x] register/heartbeat orkestrasyon (`slave_node.*` — `SlaveNode` Register-retry + heartbeat/re-register) + gerçek adaptörler (`master_adapters.*` — `ServicerMasterView` + `ClientWorkerCommander`); **uçtan-uca entegrasyon testi**: slave gerçek ZMQ üstünden master'a register/heartbeat, master coordinator 4 shard'ı worker'a dağıtıyor, worker çalıştırıyor, master sent=1000'e aggregate ediyor (5/5 stabil)
       - [x] arg-wired daemon entrypoint'leri: `samurai_master` + `samurai_slave` (`control/daemon/`); slave `SupervisorShardRunner` ile shard'ları native worker supervisor'a bağlıyor. **Canlı dağıtık çalıştırma doğrulandı:** master+slave daemon'ları + gerçek ZMQ transport + gerçek `cpu_worker` → 200 paket / 2 shard, sent=200 errors=0 rc=0
-      - [ ] `ha` redis/etcd elector'ları (dış servis, ertelendi) + native Raft elector (~600 satır konsensüs, ayrı increment)
+      - [x] `ha` redis elector → `RedisLeaseLeaderElector` (KvStore soyutlaması: SETNX PX / INCR fencing epoch / compare-PEXPIRE / compare-DEL; InMemoryKvStore ile doğrulandı). etcd (gRPC) + native Raft (~600 satır konsensüs) hâlâ ertelendi
       - [ ] Python `control/*.py` toptan kaldırılır (raft hariç native parity sağlandı; raft opsiyonel HA modu, ayrı ele alınır)
   - [ ] Parity'de Python `control/*.py` toptan kaldırılır (henüz networked Python modülleri duruyor)
 - [~] `licensing/` katmanı → native `samurai_license`
   - [x] Offline çekirdek: `license_types`(tier/feature/limit) + `constants` + `hwid`(SHA-256) + `gates`(feature-gate enforcement, exec-grant client soyut) + `cache`(AES-256-GCM offline cache); selftest ile doğrulandı
-  - [ ] HTTP(S) license client (validate/heartbeat/exec-grant) + updater — native HTTPS client yok, ertelendi
+  - [x] HTTP(S) license client → `http_client` (POSIX socket + OpenSSL TLS) + `HttpLicenseClient` (validate + exec-grant, gates'in ExecGrantClient'ı); mock HTTP sunucusuna karşı doğrulandı. heartbeat/deactivate + updater eklenecek
 - [ ] Increment 3: SendAck/JsonDone/ConfigFromEnvelope + WorkerBase event-loop
 - [ ] `dataplane_core.c` + `fast_sender.c` (kanıtlı ölü) kaldırma
 - [ ] doca/gpu worker .cpp monolit dekompozisyonu (burada doğrulanabilir)

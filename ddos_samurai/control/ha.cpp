@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <ctime>
 #include <fstream>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -213,6 +214,127 @@ Value FileLeaseLeaderElector::Snapshot() const {
   o.set("lease_path", Value::Str(lease_path_));
   o.set("lease_seconds", Value::Double(lease_seconds_));
   o.set("lease_expires_at", Value::Double(exp));
+  return o;
+}
+
+// --- RedisLeaseLeaderElector -----------------------------------------------
+
+namespace {
+std::string RandomHex16() {
+  std::random_device rd;
+  static const char* kHex = "0123456789abcdef";
+  std::string s;
+  s.reserve(32);
+  for (int i = 0; i < 32; ++i) s.push_back(kHex[rd() & 0xF]);
+  return s;
+}
+std::string TokenOwner(const std::string& token) {
+  const auto pos = token.find(':');
+  return pos == std::string::npos ? token : token.substr(0, pos);
+}
+}  // namespace
+
+RedisLeaseLeaderElector::RedisLeaseLeaderElector(const std::string& node_id,
+                                                 const std::string& lease_key, KvStore* store,
+                                                 double lease_seconds)
+    : lease_key_(Strip(lease_key)), lease_seconds_(std::max(1.0, lease_seconds)), store_(store) {
+  node_id_ = Strip(node_id);
+  if (node_id_.empty()) node_id_ = Hostname();
+  owner_token_ = node_id_ + ":" + RandomHex16();
+}
+
+RedisLeaseLeaderElector::~RedisLeaseLeaderElector() { Stop(); }
+
+bool RedisLeaseLeaderElector::TryAcquire() {
+  if (store_ == nullptr) return false;
+  const long long lease_ms = static_cast<long long>(lease_seconds_ * 1000.0);
+  if (store_->SetNx(lease_key_, owner_token_, lease_ms)) {
+    leader_.store(true);
+    leader_epoch_.store(store_->Incr(EpochKey()));
+    return true;
+  }
+  std::string cur;
+  if (store_->Get(lease_key_, cur) && cur == owner_token_) {
+    leader_.store(true);
+    if (leader_epoch_.load() <= 0) {
+      std::string ep;
+      if (store_->Get(EpochKey(), ep)) {
+        try {
+          leader_epoch_.store(std::stoll(ep));
+        } catch (...) {
+        }
+      }
+    }
+    return true;
+  }
+  leader_.store(false);
+  return false;
+}
+
+bool RedisLeaseLeaderElector::RenewOnce() {
+  if (store_ == nullptr) {
+    leader_.store(false);
+    return false;
+  }
+  const long long lease_ms = static_cast<long long>(lease_seconds_ * 1000.0);
+  if (!store_->CompareAndPExpire(lease_key_, owner_token_, lease_ms)) {
+    leader_.store(false);
+    return false;
+  }
+  leader_.store(true);
+  if (leader_epoch_.load() <= 0) {
+    std::string ep;
+    if (store_->Get(EpochKey(), ep)) {
+      try {
+        leader_epoch_.store(std::stoll(ep));
+      } catch (...) {
+      }
+    }
+  }
+  return true;
+}
+
+void RedisLeaseLeaderElector::Release() {
+  if (store_ != nullptr) store_->CompareAndDel(lease_key_, owner_token_);
+  leader_.store(false);
+}
+
+void RedisLeaseLeaderElector::StartRenewLoop(double interval_s) {
+  const double iv = std::max(0.2, interval_s);
+  stop_.store(false);
+  renew_thread_ = std::thread([this, iv]() {
+    while (!stop_.load()) {
+      std::unique_lock<std::mutex> lk(cv_mu_);
+      if (cv_.wait_for(lk, std::chrono::duration<double>(iv), [this]() { return stop_.load(); })) break;
+      lk.unlock();
+      if (!RenewOnce()) break;
+    }
+  });
+}
+
+void RedisLeaseLeaderElector::Stop() {
+  stop_.store(true);
+  cv_.notify_all();
+  if (renew_thread_.joinable()) renew_thread_.join();
+  Release();
+}
+
+Value RedisLeaseLeaderElector::Snapshot() const {
+  std::string leader_id;
+  long long ttl_ms = -1;
+  if (store_ != nullptr) {
+    std::string cur;
+    if (store_->Get(lease_key_, cur)) leader_id = TokenOwner(cur);
+    ttl_ms = store_->Pttl(lease_key_);
+  }
+  Value o = Value::Object();
+  o.set("mode", Value::Str("redis"));
+  o.set("node_id", Value::Str(node_id_));
+  o.set("leader_id", Value::Str(leader_id));
+  o.set("is_leader", Value::Int(IsLeader() ? 1 : 0));
+  o.set("lease_key", Value::Str(lease_key_));
+  o.set("lease_ttl_ms", Value::Int(ttl_ms));
+  o.set("leader_epoch", Value::Int(leader_epoch_.load()));
   return o;
 }
 
