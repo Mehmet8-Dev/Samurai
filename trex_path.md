@@ -1,3 +1,15 @@
+> ⚠️ **SUPERSEDED (2026-08-19).** Bu belgedeki "Baslangic Durumu" kanitlari
+> (self-test 263/0, GPU 10M/0-hata ~26.9k pps, CPU soak 10M-error) **2026-02-20
+> tarihli, ortam-kisitli** kayitlardir ve artik guncel motoru yansitmaz:
+> - "0 sent / all error" tablolari bir **kod hatasi degil, ortam artefaktidir**
+>   (yetkisiz makinede `XDP_UNAVAILABLE` + `sender_fallback_policy=fail` +
+>   `runtime_backend=legacy` / `persistent_tx_backend=noop`).
+> - O tarihten sonra RFC 2544/3511/8219 benchmark motoru, IEEE 1588 PTP ns-latency,
+>   TCP SACK/window-scaling/TLS, DPDK stateful fast-path parity eklendi.
+> - **Guncel/karsilastirilabilir baseline icin** bkz.
+>   [`docs/39-rfc-benchmark-baseline-runbook.md`](docs/39-rfc-benchmark-baseline-runbook.md)
+>   (`samurai --run-rfc-suite all`). Asagisi tarihsel yol haritasi olarak korunur.
+
 # TRex Path (30 Gunluk Teknik Yol Haritasi)
 
 Tarih: 2026-02-20  
