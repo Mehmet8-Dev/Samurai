@@ -3,6 +3,12 @@
 > Legacy notu (2026-03-14): Bu belge tarihsel analiz icerir. Bu checkout'ta
 > `dashboard/` ve `ddos_samurai/api.py` bulunmadigi icin UI/API kisimlari
 > aktif runtime yerine arsiv baglam olarak degerlendirilmelidir.
+>
+> ⚠️ **TRex kiyas guncellemesi (2026-08-19):** Buradaki "geride" hukumleri ve
+> throughput sayilari RFC-suite oncesi (Mart) doneme aittir; o tarihten sonra
+> RFC 2544/3511/8219 benchmark motoru, PTP ns-latency ve DPDK stateful fast-path
+> parity eklendi. Karsilastirilabilir, guncel baseline icin:
+> [`39-rfc-benchmark-baseline-runbook.md`](39-rfc-benchmark-baseline-runbook.md).
 
 Bu doküman Samurai (Ronin) projesinin kapsamlı analizini ve Cisco TRex ile detaylı karşılaştırma/puanlamasını içerir.
 

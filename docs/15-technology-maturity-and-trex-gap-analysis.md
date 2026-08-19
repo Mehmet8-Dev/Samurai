@@ -3,6 +3,12 @@
 > Legacy notu (2026-03-14): Bu belge tarihsel analiz icerir. Bu checkout'ta
 > `dashboard/` ve `ddos_samurai/api.py` bulunmadigi icin UI/API/SaaS ile ilgili
 > bolumler aktif runtime yerine arsiv baglam olarak okunmalidir.
+>
+> ⚠️ **TRex fark guncellemesi (2026-08-19):** 2026-02-21 skor tablosu ve
+> "sender path stabilize et" gap notlari RFC-suite oncesi doneme aittir. O
+> tarihten sonra RFC 2544/3511/8219 motoru + DPDK fast-path parity geldi; "0 sent"
+> tipi kayitlar kod degil ortam artefaktiydi. Guncel baseline uretimi:
+> [`39-rfc-benchmark-baseline-runbook.md`](39-rfc-benchmark-baseline-runbook.md).
 
 Tarih: 2026-03-07  
 Kapsam: Tam stack (`ddos_samurai/` + API + dashboard + monitoring + testler + raporlar)
