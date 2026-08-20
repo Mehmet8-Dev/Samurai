@@ -1,16 +1,23 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <deque>
 #include <exception>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <pthread.h>
+#include <sched.h>
 
 #include <zmq.h>
 
@@ -21,17 +28,9 @@
 #include "zmq_worker_base.hpp"
 #include "worker_common.hpp"
 
-#ifdef SAMURAI_WITH_DPDK
-extern "C" {
-#include <rte_common.h>
-#include <rte_eal.h>
-#include <rte_ether.h>
-#include <rte_errno.h>
-#include <rte_ethdev.h>
-#include <rte_mbuf.h>
-#include <rte_mempool.h>
-}
-#endif
+// DDoSamurai'nin tek native DPDK çekirdeği. Başlık rte_*.h/Python.h içermez;
+// gerçek DPDK mantığı dpdk_core.cpp içinde SAMURAI_WITH_DPDK ile koşullanmıştır.
+#include "dpdk/dpdk_core.hpp"
 
 namespace {
 using samurai::daemon::OptionalIntFromWire;
@@ -55,114 +54,79 @@ constexpr const char* kDefaultEvents = "ipc:///tmp/samurai_events_dpdk";
 using samurai::daemon::ConfigFromEnvelope;
 using samurai::daemon::JsonPayloadFromStats;
 
-
 #ifdef SAMURAI_WITH_DPDK
-struct DpdkSession {
-  bool eal_ok{false};
-  std::uint16_t port_id{0};
+// Portu iş süresince açık tutan RAII sarmalayıcı; scope çıkışında çekirdeğe
+// close_port bildirir (portu teardown eder).
+struct DpdkPortGuard {
+  std::int64_t handle{-1};
+  ~DpdkPortGuard() {
+    if (handle >= 0) {
+      samurai::dpdk::close_port(handle);
+    }
+  }
+};
+
+// Tek bir TX kuyruğuna adanmış worker thread durumu (K4 multi-queue).
+struct TxWorkerThread {
+  std::thread th;
   std::uint16_t queue_id{0};
-  rte_mempool* mempool{nullptr};
-  bool port_started{false};
+  int cpu_core{-1};  // -1 = pinleme yok
+  std::atomic<std::uint64_t> packets_sent{0};
+  std::atomic<std::uint64_t> packets_errors{0};
+  std::atomic<std::uint64_t> bytes_sent{0};
+  std::atomic<std::uint64_t> sleep_calls{0};
+  std::atomic<bool> done{false};
 };
 
-bool EnsureEalOnce(const std::string& eal_args, std::string& err) {
-  static bool initialized = false;
-  static std::string locked_args;
-  if (initialized) {
-    if (locked_args != eal_args) {
-      err = "dpdk_eal_duplicate_init";
-      return false;
+// Her TX thread kendi kuyruğuna, kendi paket alt-aralığına ve kendi pacing
+// durumuna sahiptir; kuyruklar thread'e özel olduğundan kilit gerekmez.
+void tx_thread_func(TxWorkerThread* tw, std::int64_t handle,
+                    const std::uint8_t* pool_data, std::size_t pool_len,
+                    std::uint16_t stride, int start, int end,
+                    samurai_pacing_config_t pace_cfg) {
+  if (tw->cpu_core >= 0) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(tw->cpu_core, &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+  }
+  // PMD/mempool güvenliği için thread'i EAL lcore olarak kaydet.
+  const bool registered = samurai::dpdk::register_lcore_thread();
+
+  samurai_pacing_state_t st{};
+  samurai_pacing_init(&st, &pace_cfg);
+
+  constexpr std::uint16_t kTxBurstMax = 64;
+  int i = start;
+  while (i < end) {
+    samurai_pacing_wait_next(&st, &pace_cfg);
+    std::uint16_t batch = static_cast<std::uint16_t>(
+        std::min<int>(end - i, static_cast<int>(kTxBurstMax)));
+
+    const std::size_t off = static_cast<std::size_t>(i) * stride;
+    if (off + static_cast<std::size_t>(batch) * stride > pool_len) {
+      const std::size_t avail = pool_len > off ? (pool_len - off) / stride : 0;
+      batch = static_cast<std::uint16_t>(std::min<std::size_t>(batch, avail));
     }
-    return true;
-  }
-
-  std::vector<std::string> argv_store;
-  argv_store.emplace_back("samurai_dpdk_worker");
-  std::string token;
-  for (char c : eal_args) {
-    if (std::isspace(static_cast<unsigned char>(c))) {
-      if (!token.empty()) {
-        argv_store.push_back(token);
-        token.clear();
-      }
-      continue;
+    if (batch == 0) {
+      break;
     }
-    token.push_back(c);
-  }
-  if (!token.empty()) argv_store.push_back(token);
 
-  std::vector<char*> argv;
-  argv.reserve(argv_store.size());
-  for (auto& s : argv_store) argv.push_back(const_cast<char*>(s.c_str()));
-  if (rte_eal_init(static_cast<int>(argv.size()), argv.data()) < 0) {
-    err = std::string("dpdk_eal_init_failed:") + rte_strerror(rte_errno);
-    return false;
-  }
-  initialized = true;
-  locked_args = eal_args;
-  return true;
-}
-
-bool InitPort(DpdkSession& sess, std::uint32_t mempool_size, std::string& err) {
-  if (!rte_eth_dev_is_valid_port(sess.port_id)) {
-    err = "dpdk_port_invalid";
-    return false;
-  }
-  rte_eth_conf port_conf{};
-  const std::uint16_t txq = static_cast<std::uint16_t>(sess.queue_id + 1);
-  if (rte_eth_dev_configure(sess.port_id, 0, txq, &port_conf) < 0) {
-    err = std::string("dpdk_dev_configure_failed:") + rte_strerror(rte_errno);
-    return false;
+    const samurai::dpdk::TxResult r = samurai::dpdk::tx_burst(
+        handle, tw->queue_id, pool_data + off, stride, batch);
+    tw->packets_sent.fetch_add(r.sent, std::memory_order_relaxed);
+    tw->packets_errors.fetch_add(r.errors, std::memory_order_relaxed);
+    tw->bytes_sent.fetch_add(r.sent * static_cast<std::uint64_t>(stride),
+                             std::memory_order_relaxed);
+    i += batch;
   }
 
-  int socket_id = rte_eth_dev_socket_id(sess.port_id);
-  if (socket_id < 0) socket_id = 0;
-  char mp_name[64];
-  std::snprintf(mp_name, sizeof(mp_name), "samurai_dpdk_worker_mp_%u", static_cast<unsigned>(sess.port_id));
-  sess.mempool = rte_pktmbuf_pool_create(
-      mp_name,
-      std::max<std::uint32_t>(mempool_size, 1024u),
-      256,
-      0,
-      RTE_MBUF_DEFAULT_BUF_SIZE,
-      socket_id);
-  if (!sess.mempool) {
-    err = std::string("dpdk_mempool_create_failed:") + rte_strerror(rte_errno);
-    return false;
-  }
-
-  rte_eth_dev_info dev_info{};
-  if (rte_eth_dev_info_get(sess.port_id, &dev_info) != 0) {
-    err = "dpdk_dev_info_failed";
-    return false;
-  }
-  rte_eth_txconf tx_conf = dev_info.default_txconf;
-  for (std::uint16_t q = 0; q < txq; ++q) {
-    if (rte_eth_tx_queue_setup(sess.port_id, q, 1024, socket_id, &tx_conf) < 0) {
-      err = std::string("dpdk_tx_queue_setup_failed:") + rte_strerror(rte_errno);
-      return false;
-    }
-  }
-  if (rte_eth_dev_start(sess.port_id) < 0) {
-    err = std::string("dpdk_dev_start_failed:") + rte_strerror(rte_errno);
-    return false;
-  }
-  sess.port_started = true;
-  return true;
-}
-
-void Teardown(DpdkSession& sess) {
-  if (sess.port_started) {
-    (void)rte_eth_dev_stop(sess.port_id);
-    (void)rte_eth_dev_close(sess.port_id);
-    sess.port_started = false;
+  tw->sleep_calls.store(st.sleep_calls, std::memory_order_relaxed);
+  tw->done.store(true, std::memory_order_release);
+  if (registered) {
+    samurai::dpdk::unregister_lcore_thread();
   }
 }
-
-struct DpdkSessionGuard {
-  DpdkSession session{};
-  ~DpdkSessionGuard() { Teardown(session); }
-};
 #endif
 
 }  // namespace
@@ -174,6 +138,7 @@ int main(int argc, char** argv) {
   bool bind_events = false;
   int cli_port_id = -1;
   int cli_queue_id = -1;
+  int cli_tx_queues = -1;
   std::string cli_eal_args;
 
   for (int i = 1; i < argc; ++i) {
@@ -190,6 +155,8 @@ int main(int argc, char** argv) {
       cli_port_id = std::stoi(argv[++i]);
     } else if (arg == "--dpdk-queue-id" && i + 1 < argc) {
       cli_queue_id = std::stoi(argv[++i]);
+    } else if (arg == "--dpdk-tx-queues" && i + 1 < argc) {
+      cli_tx_queues = std::stoi(argv[++i]);
     } else if (arg == "--dpdk-eal-args" && i + 1 < argc) {
       cli_eal_args = argv[++i];
     }
@@ -293,118 +260,169 @@ int main(int argc, char** argv) {
           continue;
         }
 
-        DpdkSessionGuard dpdk{};
-        dpdk.session.port_id = static_cast<std::uint16_t>(std::max(0, cli_port_id >= 0 ? cli_port_id : static_cast<int>(std::getenv("SAMURAI_DPDK_PORT_ID") ? std::atoi(std::getenv("SAMURAI_DPDK_PORT_ID")) : 0)));
-        dpdk.session.queue_id = static_cast<std::uint16_t>(std::max(0, cli_queue_id >= 0 ? cli_queue_id : static_cast<int>(env.xdp_queue_id)));
+        const std::uint16_t port_id = static_cast<std::uint16_t>(std::max(0,
+            cli_port_id >= 0 ? cli_port_id
+                             : (std::getenv("SAMURAI_DPDK_PORT_ID")
+                                    ? std::atoi(std::getenv("SAMURAI_DPDK_PORT_ID"))
+                                    : 0)));
+        const std::uint16_t queue_id = static_cast<std::uint16_t>(std::max(0,
+            cli_queue_id >= 0 ? cli_queue_id : static_cast<int>(env.xdp_queue_id)));
         std::string eal_args = cli_eal_args;
         if (eal_args.empty()) {
           const char* p = std::getenv("SAMURAI_DPDK_EAL_ARGS");
           if (p) eal_args = p;
         }
 
+        std::string eal_args_effective = eal_args;
         std::string err;
-        if (!EnsureEalOnce(eal_args, err)) {
-          (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR), header.correlation_id,
-                          samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
-          continue;
-        }
-        if (!InitPort(dpdk.session, 8192u, err)) {
+        if (!samurai::dpdk::ensure_eal(eal_args_effective, err)) {
           (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR), header.correlation_id,
                           samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
           continue;
         }
 
+        // Kaç TX kuyruğu/thread? CLI/env ile istenir; NIC max_tx_queues ve
+        // packet_count ile sınırlanır (K4 multi-queue).
+        int requested_queues = cli_tx_queues > 0
+            ? cli_tx_queues
+            : (std::getenv("SAMURAI_DPDK_TX_QUEUES")
+                   ? std::atoi(std::getenv("SAMURAI_DPDK_TX_QUEUES"))
+                   : 1);
+        if (requested_queues < 1) requested_queues = 1;
+        samurai::dpdk::PortCapabilities caps{};
+        if (samurai::dpdk::query_capabilities(port_id, caps, err) && caps.max_tx_queues > 0) {
+          requested_queues = std::min<int>(requested_queues, static_cast<int>(caps.max_tx_queues));
+        }
+        requested_queues = std::min<int>(requested_queues, packet_count);
+        const int num_queues = std::max(1, requested_queues);
+        const bool multi_queue = num_queues > 1;
+
+        // Port aç. Tek-queue'da eski queue_id davranışı korunur (queue_id+1 kuyruk);
+        // multi-queue'da 0..N-1 kuyrukları kurulur.
+        samurai::dpdk::OpenConfig open_cfg{};
+        open_cfg.port_id = port_id;
+        open_cfg.num_tx_queues = multi_queue
+            ? static_cast<std::uint16_t>(num_queues)
+            : static_cast<std::uint16_t>(queue_id + 1);
+        open_cfg.num_rx_queues = 0;
+        open_cfg.burst_size = 64;
+        open_cfg.mempool_size = 8192u;
+        open_cfg.eal_args = eal_args_effective;
+
+        DpdkPortGuard dpdk{};
+        dpdk.handle = samurai::dpdk::open_port(open_cfg, err);
+        if (dpdk.handle < 0) {
+          (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR), header.correlation_id,
+                          samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
+          continue;
+        }
+
+        // NUMA pinning guard (O1): CPU çekirdek tabanı env ile verilebilir.
+        const int base_core = std::getenv("SAMURAI_DPDK_BASE_CORE")
+            ? std::atoi(std::getenv("SAMURAI_DPDK_BASE_CORE")) : -1;
+        const int nic_socket = samurai::dpdk::port_socket_id(dpdk.handle);
+        if (base_core >= 0 && nic_socket >= 0) {
+          std::fprintf(stderr,
+              "[dpdk] port %u NUMA node=%d; %d TX thread core %d'den pinlenecek. "
+              "Cross-NUMA ise: numactl --cpunodebind=%d\n",
+              static_cast<unsigned>(port_id), nic_socket, num_queues, base_core, nic_socket);
+        }
+
+        // Pacing: snapshot için tam hedef; thread'ler için N'e bölünmüş hedef.
         samurai_pacing_config_t pace_cfg = PacingFromEnvelope(env);
-        samurai_pacing_state_t pace_state{};
-        samurai_pacing_init(&pace_state, &pace_cfg);
+        samurai_pacing_config_t thread_pace = pace_cfg;
+        if (multi_queue) {
+          if (thread_pace.mode == SAMURAI_PACING_RPS) {
+            thread_pace.target_rps = pace_cfg.target_rps / static_cast<double>(num_queues);
+          } else if (thread_pace.mode == SAMURAI_PACING_IPG && thread_pace.ipg_ns > 0) {
+            thread_pace.ipg_ns = pace_cfg.ipg_ns * static_cast<std::uint64_t>(num_queues);
+          } else if (thread_pace.mode == SAMURAI_PACING_BURST && thread_pace.burst_size > 1) {
+            thread_pace.burst_size =
+                std::max<std::uint32_t>(1u, thread_pace.burst_size / static_cast<std::uint32_t>(num_queues));
+          }
+        }
+
+        // TX thread'lerini başlat: her biri kendi kuyruğu + paket alt-aralığı.
+        std::deque<TxWorkerThread> workers;
+        const int base_packets = packet_count / num_queues;
+        const int remainder = packet_count % num_queues;
+        int cursor = 0;
+        for (int q = 0; q < num_queues; ++q) {
+          workers.emplace_back();
+          TxWorkerThread& tw = workers.back();
+          tw.queue_id = multi_queue ? static_cast<std::uint16_t>(q) : queue_id;
+          tw.cpu_core = base_core >= 0 ? base_core + q : -1;
+          const int cnt = base_packets + (q < remainder ? 1 : 0);
+          const int seg_start = cursor;
+          const int seg_end = cursor + cnt;
+          cursor = seg_end;
+          tw.th = std::thread(tx_thread_func, &tw, dpdk.handle, pool.data(), pool.size(),
+                              static_cast<std::uint16_t>(stride), seg_start, seg_end, thread_pace);
+        }
+
+        auto aggregate = [&workers](std::uint64_t& ps, std::uint64_t& pe,
+                                    std::uint64_t& bs, std::uint64_t& sc) {
+          ps = pe = bs = sc = 0;
+          for (auto& w : workers) {
+            ps += w.packets_sent.load(std::memory_order_relaxed);
+            pe += w.packets_errors.load(std::memory_order_relaxed);
+            bs += w.bytes_sent.load(std::memory_order_relaxed);
+            sc += w.sleep_calls.load(std::memory_order_relaxed);
+          }
+        };
 
         const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
         std::uint64_t last_hb_ns = start_ns;
         std::uint64_t last_metric_ns = start_ns;
-        std::uint64_t packets_sent = 0;
-        std::uint64_t packets_errors = 0;
-        std::uint64_t bytes_sent = 0;
 
-        constexpr std::uint16_t kTxBurstMax = 64;
-        std::vector<rte_mbuf*> tx_mbufs(kTxBurstMax, nullptr);
-
-        int i = 0;
-        while (i < packet_count) {
-          samurai_pacing_wait_next(&pace_state, &pace_cfg);
-          const std::uint16_t batch_target = static_cast<std::uint16_t>(
-              std::min<int>(packet_count - i, static_cast<int>(kTxBurstMax)));
-
-          std::uint16_t allocated = 0;
-          if (rte_pktmbuf_alloc_bulk(dpdk.session.mempool, tx_mbufs.data(), batch_target) == 0) {
-            allocated = batch_target;
-          } else {
-            for (std::uint16_t b = 0; b < batch_target; ++b) {
-              rte_mbuf* m = rte_pktmbuf_alloc(dpdk.session.mempool);
-              if (!m) break;
-              tx_mbufs[b] = m;
-              allocated++;
+        // Ana thread ilerlemeyi zamana göre yoklar; TX'i thread'ler yapar.
+        bool all_done = false;
+        while (!all_done) {
+          struct timespec ts{0, 50'000'000L};  // 50 ms
+          nanosleep(&ts, nullptr);
+          all_done = true;
+          for (auto& w : workers) {
+            if (!w.done.load(std::memory_order_acquire)) {
+              all_done = false;
+              break;
             }
           }
 
-          if (allocated == 0) {
-            packets_errors += batch_target;
-            i += batch_target;
-            continue;
+          const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+          std::uint64_t ps, pe, bs, sc;
+          aggregate(ps, pe, bs, sc);
+          if (now_ns - last_hb_ns >= 1'000'000'000ull) {
+            (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
+                            header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id);
+            last_hb_ns = now_ns;
           }
-
-          std::uint16_t prepared = 0;
-          for (std::uint16_t b = 0; b < allocated; ++b) {
-            const std::size_t off = static_cast<std::size_t>(i + b) * stride;
-            if (off + stride > pool.size()) {
-              rte_pktmbuf_free(tx_mbufs[b]);
-              continue;
-            }
-            void* dst = rte_pktmbuf_append(tx_mbufs[b], static_cast<std::uint16_t>(stride));
-            if (!dst) {
-              rte_pktmbuf_free(tx_mbufs[b]);
-              continue;
-            }
-            std::memcpy(dst, pool.data() + off, stride);
-            tx_mbufs[prepared++] = tx_mbufs[b];
-          }
-
-          if (prepared > 0) {
-            const std::uint16_t tx_sent = rte_eth_tx_burst(
-                dpdk.session.port_id, dpdk.session.queue_id, tx_mbufs.data(), prepared);
-            packets_sent += tx_sent;
-            bytes_sent += static_cast<std::uint64_t>(tx_sent) * stride;
-            if (tx_sent < prepared) {
-              for (std::uint16_t b = tx_sent; b < prepared; ++b) {
-                rte_pktmbuf_free(tx_mbufs[b]);
-              }
-              packets_errors += static_cast<std::uint64_t>(prepared - tx_sent);
-            }
-          }
-
-          i += batch_target;
-
-          if ((static_cast<std::uint32_t>(i) & 0x3FFu) == 0u) {
-            const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
-            if (now_ns - last_hb_ns >= 1'000'000'000ull) {
-              (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
-                              header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id);
-              last_hb_ns = now_ns;
-            }
-            if (now_ns - last_metric_ns >= 2'000'000'000ull) {
-              const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
-                  now_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
-              (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
-                              header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
-                              SerializeSnapshot(snap));
-              last_metric_ns = now_ns;
-              last_hb_ns = now_ns;
-            }
+          if (now_ns - last_metric_ns >= 2'000'000'000ull) {
+            samurai_pacing_state_t agg_state{};
+            agg_state.sleep_calls = sc;
+            const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
+                now_ns, start_ns, ps, pe, bs, pace_cfg, agg_state);
+            (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
+                            header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
+                            SerializeSnapshot(snap));
+            last_metric_ns = now_ns;
+            last_hb_ns = now_ns;
           }
         }
 
+        for (auto& w : workers) {
+          if (w.th.joinable()) {
+            w.th.join();
+          }
+        }
+
+        std::uint64_t packets_sent, packets_errors, bytes_sent, sleep_calls;
+        aggregate(packets_sent, packets_errors, bytes_sent, sleep_calls);
+
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
+        samurai_pacing_state_t final_state{};
+        final_state.sleep_calls = sleep_calls;
         const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
-            end_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
+            end_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, final_state);
         (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
                         header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
                         SerializeSnapshot(snap));

@@ -5,9 +5,11 @@ project(samurai_optional_backends LANGUAGES C CXX)
 # runtime .so libraries the corresponding ZMQ workers dlopen at runtime:
 #
 #   libgpu_packet_cuda.so  (nvcc)      -> gpu worker
-#   dpdk_pmd_core.so       (libdpdk)   -> dpdk worker
 #   xdp/xdp_sender.so      (libbpf)    -> afxdp worker
 #   DOCA backends          (DOCA SDK)  -> doca worker
+#
+# NOT: DPDK artık burada üretilmez; native çekirdek (dpdk/dpdk_core) doğrudan
+# samurai_dpdk_worker'a derlenir (zmq/CMakeLists.txt).
 #
 # Every backend is conditional on its toolchain being present; when it is not,
 # the backend is skipped with a status message. The native workers use the
@@ -41,25 +43,11 @@ else()
   message(STATUS "optional: SAMURAI_SKIP_CUDA_BUILD set -> skipping CUDA backend")
 endif()
 
-# --- DPDK: dpdk_pmd_core.so (libdpdk) -------------------------------------
-set(_dpdk_src ${SAMURAI_PKG_DIR}/dpdk/dpdk_pmd_core.cpp)
-if(DEFINED ENV{SAMURAI_WITH_DPDK} AND EXISTS ${_dpdk_src})
-  if(PkgConfig_FOUND)
-    pkg_check_modules(DPDK QUIET libdpdk)
-  endif()
-  if(DPDK_FOUND)
-    add_library(dpdk_pmd_core SHARED ${_dpdk_src})
-    set_target_properties(dpdk_pmd_core PROPERTIES
-      LIBRARY_OUTPUT_DIRECTORY ${SAMURAI_PKG_DIR} PREFIX "" OUTPUT_NAME "dpdk_pmd_core")
-    target_compile_features(dpdk_pmd_core PRIVATE cxx_std_17)
-    target_include_directories(dpdk_pmd_core PRIVATE ${DPDK_INCLUDE_DIRS})
-    target_link_libraries(dpdk_pmd_core PRIVATE ${DPDK_LIBRARIES} pthread m)
-  else()
-    message(STATUS "optional: SAMURAI_WITH_DPDK set but libdpdk not found -> skipping dpdk_pmd_core")
-  endif()
-else()
-  message(STATUS "optional: DPDK not requested/unavailable -> skipping dpdk_pmd_core")
-endif()
+# --- DPDK ------------------------------------------------------------------
+# Artık ayrı bir CPython eklentisi (dpdk_pmd_core.so) YOK. DPDK katmanı tek bir
+# native çekirdeğe (ddos_samurai/dpdk/dpdk_core.{hpp,cpp}) konsolide edildi ve
+# doğrudan samurai_dpdk_worker binary'sine (zmq/CMakeLists.txt) derlenir.
+message(STATUS "optional: DPDK native core, samurai_dpdk_worker ile birlikte derlenir (bkz. zmq/CMakeLists.txt)")
 
 # --- AF_XDP: xdp/xdp_sender.so (libbpf/libxdp) ----------------------------
 set(_xdp_src ${SAMURAI_PKG_DIR}/xdp/xdp_sender.c)

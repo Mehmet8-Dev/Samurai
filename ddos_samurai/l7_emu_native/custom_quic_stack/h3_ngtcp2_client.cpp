@@ -2660,9 +2660,10 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
   auto connect_udp_dpdk = [&](Ngtcp2AttemptCtx* c, const Profile& p) -> bool {
     (void)c;
     (void)p;
-    // The DPDK transport used to embed the Python interpreter
-    // (ddos_samurai.dpdk_pmd_core). The daemon is Python-free now, so the
-    // DPDK backend is a no-op and QUIC falls back to kernel/AF_XDP/AF_PACKET.
+    // The DPDK transport used to embed the Python interpreter (the former
+    // ddos_samurai.dpdk_pmd_core extension). The DPDK layer is now a Python-free
+    // native core (ddos_samurai/dpdk/dpdk_core), and this QUIC path does not use
+    // it: the DPDK backend is a no-op and QUIC falls back to kernel/AF_XDP/AF_PACKET.
     return false;
   };
 

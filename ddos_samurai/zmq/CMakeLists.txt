@@ -59,6 +59,10 @@ target_link_libraries(samurai_cpu_worker PRIVATE pacing_engine_static cpu_native
 add_samurai_worker(samurai_gpu_worker daemon/gpu_worker.cpp)
 target_link_libraries(samurai_gpu_worker PRIVATE pacing_engine_static pthread dl)
 add_samurai_worker(samurai_dpdk_worker daemon/dpdk_worker.cpp)
+# Tek native DPDK çekirdeği; başlık rte/Python bağımsız, kaynak SAMURAI_WITH_DPDK
+# ile kendini gate'ler (libdpdk yokken güvenli saplama derlenir).
+target_sources(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk/dpdk_core.cpp)
+target_include_directories(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk)
 target_link_libraries(samurai_dpdk_worker PRIVATE pacing_engine_static cpu_native_static samurai_l7emu pthread)
 if(DPDK_FOUND)
   target_compile_definitions(samurai_dpdk_worker PRIVATE SAMURAI_WITH_DPDK=1)
