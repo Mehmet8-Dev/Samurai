@@ -154,6 +154,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
 
   std::map<std::string, Shard> inflight_by_worker;
   std::map<std::string, Shard> inflight_by_sid;
+  std::map<std::string, std::int64_t> reverse_dispatch_ms;  // sid -> dispatch time (reverse)
   std::set<std::string> lost_workers;
   std::set<std::string> done_shards;
   std::vector<std::string> dispatch_failures;
@@ -162,6 +163,22 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     auto it = workers.find(wid);
     if (it == workers.end()) return std::string();
     return Strip(CapStr(it->second.capabilities, "control_endpoint"));
+  };
+  auto dispatch_mode_of = [&](const std::map<std::string, WorkerInfo>& workers,
+                              const std::string& wid) -> std::string {
+    auto it = workers.find(wid);
+    if (it == workers.end()) return "";
+    return Lower(Strip(CapStr(it->second.capabilities, "dispatch_mode")));
+  };
+  // Pure reverse: no inbound endpoint, pull-only.
+  auto is_reverse = [&](const std::map<std::string, WorkerInfo>& workers, const std::string& wid) {
+    return dispatch_mode_of(workers, wid) == "reverse";
+  };
+  // Auto: advertises an endpoint (direct-preferred) but is also reverse-capable,
+  // so the master can fall back to the heartbeat pull path if direct is
+  // unreachable (NAT).
+  auto is_auto = [&](const std::map<std::string, WorkerInfo>& workers, const std::string& wid) {
+    return dispatch_mode_of(workers, wid) == "auto";
   };
   auto hb_timeout_for = [&](const std::map<std::string, std::string>& caps) -> std::int64_t {
     if (!region_aware) return job.heartbeat_timeout_ms;
@@ -237,6 +254,33 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
       }
       const std::string wid = sit->second.worker_id;
       if (wid.empty()) continue;
+      // A shard delivered over the pull path (pure reverse, or an auto worker
+      // that fell back) can't be probed; instead verify the worker echoed the
+      // dispatched shard, and rebalance if the enqueue looks lost (worker alive
+      // — lost workers were already handled above).
+      if (reverse_dispatch_ms.count(sid)) {
+        const std::int64_t grace = job.reverse_pickup_grace_ms > 0
+                                       ? job.reverse_pickup_grace_ms
+                                       : 2 * job.heartbeat_timeout_ms;
+        auto wit = workers.find(wid);
+        const std::int64_t disp = reverse_dispatch_ms.count(sid) ? reverse_dispatch_ms[sid] : now;
+        const std::string echoed = wit == workers.end() ? std::string() : wit->second.active_shard_id;
+        if ((now - disp) > grace && echoed != sid) {
+          Shard sh = sit->second;
+          inflight_by_sid.erase(sid);
+          inflight_by_worker.erase(wid);
+          reverse_dispatch_ms.erase(sid);
+          if (!done_shards.count(sid)) {
+            sh.attempt += 1;
+            if (sh.attempt <= 2) {
+              pending.push_front(sh);
+            } else {
+              dispatch_failures.push_back("E_REVERSE_PICKUP_LOST worker=" + wid + " shard=" + sid);
+            }
+          }
+        }
+        continue;
+      }
       if (!job.worker_status_probe) continue;
       const std::string ep = endpoint_of(workers, wid);
       if (ep.empty()) continue;
@@ -260,7 +304,10 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     for (const auto& kv : workers) {
       if (lost_workers.count(kv.first)) continue;
       if (inflight_by_worker.count(kv.first)) continue;
-      if (!endpoint_of(workers, kv.first).empty()) free_workers.push_back(kv.first);
+      // Direct workers advertise a control_endpoint; reverse workers advertise
+      // none but are reachable via the heartbeat pull path.
+      if (!endpoint_of(workers, kv.first).empty() || is_reverse(workers, kv.first))
+        free_workers.push_back(kv.first);
     }
 
     while (!pending.empty() && !free_workers.empty()) {
@@ -283,7 +330,9 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
       free_workers.erase(free_workers.begin() + pick);
 
       const std::string ep = endpoint_of(workers, wid);
-      if (ep.empty()) {
+      const bool pure_reverse = is_reverse(workers, wid);
+      const bool reverse_capable = pure_reverse || is_auto(workers, wid);
+      if (ep.empty() && !reverse_capable) {
         dispatch_failures.push_back("E_STARTSHARD_NO_ENDPOINT worker=" + wid + " shard=" + sh.shard_id);
         sh.attempt += 1;
         if (sh.attempt <= 2) pending.push_back(sh);
@@ -295,12 +344,33 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
       args.set("role", Value::Str("standalone"));
       args.set("_worker_id", Value::Str(wid));
       args.set("_leader_epoch", Value::Int(job.leader_epoch));
-      const DispatchOutcome d =
-          commander_->Dispatch(ep, sh.shard_id, job_id, args.dump(), sh.packet_count, timeout_ms);
+      DispatchOutcome d;
+      bool via_reverse = false;
+      if (pure_reverse) {
+        d = commander_->DispatchReverse(wid, sh.shard_id, job_id, args.dump(), sh.packet_count,
+                                        timeout_ms);
+        via_reverse = true;
+      } else {
+        // Direct-preferred (a direct worker, or an auto worker with an endpoint).
+        d = commander_->Dispatch(ep, sh.shard_id, job_id, args.dump(), sh.packet_count, timeout_ms);
+        if (!d.started && is_auto(workers, wid)) {
+          // Auto-fallback: the direct RPC failed (endpoint unreachable, likely
+          // NAT) -> deliver over the heartbeat pull path instead.
+          const DispatchOutcome fb = commander_->DispatchReverse(
+              wid, sh.shard_id, job_id, args.dump(), sh.packet_count, timeout_ms);
+          if (fb.started) {
+            d = fb;
+            via_reverse = true;
+            dispatch_failures.push_back("W_DIRECT_FALLBACK_REVERSE worker=" + wid + " shard=" +
+                                        sh.shard_id);
+          }
+        }
+      }
       if (d.started) {
         sh.worker_id = wid;
         inflight_by_worker[wid] = sh;
         inflight_by_sid[sh.shard_id] = sh;
+        if (via_reverse) reverse_dispatch_ms[sh.shard_id] = now;
       } else {
         dispatch_failures.push_back(d.message.empty()
                                         ? ("E_STARTSHARD_REJECTED worker=" + wid + " shard=" + sh.shard_id)
@@ -322,9 +392,17 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     for (auto it = unresolved.begin(); it != unresolved.end();) {
       const std::string sid = *it;
       const auto sh = inflight_by_sid.find(sid);
-      const std::string ep = sh == inflight_by_sid.end() ? std::string()
-                                                         : endpoint_of(workers, sh->second.worker_id);
-      if (!ep.empty() && commander_->StopShard(ep, sid)) {
+      const std::string wid = sh == inflight_by_sid.end() ? std::string() : sh->second.worker_id;
+      const std::string ep = wid.empty() ? std::string() : endpoint_of(workers, wid);
+      bool stopped = false;
+      if (reverse_dispatch_ms.count(sid)) {
+        // Pull-delivered shard (reverse or auto-fallback): queue the stop; the
+        // worker pulls it on the next heartbeat.
+        stopped = wid.empty() ? false : commander_->StopShardReverse(wid, sid);
+      } else if (!ep.empty()) {
+        stopped = commander_->StopShard(ep, sid);
+      }
+      if (stopped) {
         it = unresolved.erase(it);
       } else {
         ++it;

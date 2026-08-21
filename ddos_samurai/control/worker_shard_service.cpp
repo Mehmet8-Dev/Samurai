@@ -100,6 +100,8 @@ void WorkerShardService::MonitorRuntime(const std::string& shard_id, std::int64_
   }
   if (run) run->Join();
 
+  std::string finalized_stats;
+  bool did_finalize = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = shard_runs_.find(shard_id);
@@ -115,8 +117,14 @@ void WorkerShardService::MonitorRuntime(const std::string& shard_id, std::int64_
       s.stats_json = stats;
       shard_status_[shard_id] = std::move(s);
       RefreshWorkerStateLocked();
+      finalized_stats = stats;
+      did_finalize = true;
     }
   }
+  // Report completion outside the lock (reverse mode: outbound ReportStats).
+  // Ordered before the active-monitors decrement so WaitForShardIdle implies the
+  // report has been delivered.
+  if (did_finalize && on_finalize_) on_finalize_(shard_id, finalized_stats);
   active_monitors_.fetch_sub(1);
   idle_cv_.notify_all();
 }
@@ -124,6 +132,11 @@ void WorkerShardService::MonitorRuntime(const std::string& shard_id, std::int64_
 void WorkerShardService::WaitForShardIdle(const std::string& /*shard_id*/) {
   std::unique_lock<std::mutex> lk(mu_);
   idle_cv_.wait(lk, [this]() { return active_monitors_.load() == 0; });
+}
+
+std::string WorkerShardService::ActiveShardId() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return worker_active_shard_;
 }
 
 Value WorkerShardService::StartShard(const Value& body, const RpcContext& /*ctx*/) {
@@ -245,6 +258,9 @@ Value WorkerShardService::StopShard(const Value& body, const RpcContext& /*ctx*/
     shard_status_[sid] = std::move(s);
     RefreshWorkerStateLocked();
   }
+  // Report the stop as a completion (reverse mode: outbound ReportStats), so the
+  // master's straggler loop resolves it. The bailing monitor won't re-report.
+  if (on_finalize_) on_finalize_(sid, stats);
   out.set("stopped", Value::Bool(true));
   return out;
 }

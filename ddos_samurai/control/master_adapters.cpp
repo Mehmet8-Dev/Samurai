@@ -29,6 +29,7 @@ std::vector<WorkerInfo> ServicerMasterView::Workers() {
     wi.worker_id = w.worker_id;
     wi.capabilities = std::move(w.capabilities);
     wi.last_heartbeat_ms = w.last_heartbeat_ms;
+    wi.active_shard_id = std::move(w.active_shard_id);
     out.push_back(std::move(wi));
   }
   return out;
@@ -86,6 +87,43 @@ bool ClientWorkerCommander::StopShard(const std::string& endpoint, const std::st
   WorkerControlClient wc(endpoint, cluster_secret_, tenant_namespace_, timeout_ms_);
   const wire::Response r = wc.StopShard(shard_id, true);
   return r.ok && BodyBool(r, "stopped");
+}
+
+DispatchOutcome ClientWorkerCommander::DispatchReverse(const std::string& worker_id,
+                                                       const std::string& shard_id,
+                                                       const std::string& job_id,
+                                                       const std::string& args_json,
+                                                       std::int64_t packet_count,
+                                                       std::int64_t timeout_ms) {
+  DispatchOutcome out;
+  if (!servicer_) {
+    out.started = false;
+    out.message = "E_STARTSHARD_NO_SERVICER worker=" + worker_id + " shard=" + shard_id;
+    return out;
+  }
+  PendingCommand cmd;
+  cmd.type = "start";
+  cmd.shard_id = shard_id;
+  cmd.job_id = job_id;
+  cmd.args_json = args_json.empty() ? "{}" : args_json;
+  cmd.packet_count = packet_count;
+  cmd.timeout_ms = timeout_ms;
+  servicer_->EnqueueCommand(worker_id, cmd);
+  // Optimistic accept: the worker pulls + acks on its next heartbeat; completion
+  // is confirmed later via ReportStats (ShardReported).
+  out.started = true;
+  out.message = "Enqueued reverse shard " + shard_id + " -> " + worker_id;
+  return out;
+}
+
+bool ClientWorkerCommander::StopShardReverse(const std::string& worker_id,
+                                             const std::string& shard_id) {
+  if (!servicer_) return false;
+  PendingCommand cmd;
+  cmd.type = "stop";
+  cmd.shard_id = shard_id;
+  servicer_->EnqueueCommand(worker_id, cmd);
+  return true;  // best-effort enqueue; delivered on the worker's next heartbeat
 }
 
 }  // namespace samurai::control

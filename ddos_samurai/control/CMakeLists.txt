@@ -55,6 +55,7 @@ if(LIBZMQ_FOUND)
   list(APPEND CONTROL_SOURCES
     control_server.cpp
     control_client.cpp
+    curve.cpp             # CURVE transport-encryption helpers (opt-in)
     master_adapters.cpp   # Servicer->MasterView + WorkerControlClient->WorkerCommander
     slave_node.cpp)       # register/heartbeat orchestration loop
 else()

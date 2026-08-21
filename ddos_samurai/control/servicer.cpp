@@ -59,6 +59,7 @@ std::vector<Servicer::WorkerSnapshot> Servicer::SnapshotWorkers() const {
     s.worker_id = kv.second.worker_id;
     s.capabilities = kv.second.capabilities;
     s.last_heartbeat_ms = kv.second.last_heartbeat_ms;
+    s.active_shard_id = kv.second.active_shard_id;
     out.push_back(std::move(s));
   }
   return out;
@@ -143,19 +144,58 @@ Value Servicer::Heartbeat(const Value& body, const RpcContext& ctx) {
   }
   bool acknowledged = false;
   std::string command = "continue";
+  PendingCommand cmd;
+  bool have_cmd = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = workers_.find(wid);
     if (it != workers_.end()) {
       it->second.last_heartbeat_ms = NowMs();
       acknowledged = true;
+      // Apply the worker's echoed active shard (reverse pickup ground truth)
+      // before any optimistic override from a freshly delivered command below.
+      const Value* echo = body.find("active_shard_id");
+      if (echo) it->second.active_shard_id = echo->as_string("");
+      // Drain one queued command (reverse-mode dispatch) into this response.
+      auto qit = pending_cmds_.find(wid);
+      if (qit != pending_cmds_.end() && !qit->second.empty()) {
+        cmd = qit->second.front();
+        qit->second.pop_front();
+        if (qit->second.empty()) pending_cmds_.erase(qit);
+        have_cmd = true;
+        if (cmd.type == "start") {
+          it->second.state = "running";
+          it->second.active_shard_id = cmd.shard_id;
+        } else if (cmd.type == "stop") {
+          it->second.state = "idle";
+          it->second.active_shard_id = "";
+        }
+      }
     } else {
       command = "register";
     }
   }
   out.set("acknowledged", Value::Bool(acknowledged));
   out.set("command", Str(command));
+  if (have_cmd) {
+    if (cmd.type == "start") {
+      Value shard = Value::Object();
+      shard.set("shard_id", Str(cmd.shard_id));
+      shard.set("job_id", Str(cmd.job_id));
+      shard.set("args_json", Str(cmd.args_json.empty() ? "{}" : cmd.args_json));
+      shard.set("packet_count", Value::Int(cmd.packet_count));
+      shard.set("timeout_ms", Value::Int(cmd.timeout_ms));
+      out.set("shard", std::move(shard));
+    } else if (cmd.type == "stop") {
+      out.set("stop_shard", Str(cmd.shard_id));
+    }
+  }
   return out;
+}
+
+void Servicer::EnqueueCommand(const std::string& worker_id, const PendingCommand& cmd) {
+  std::lock_guard<std::mutex> lk(mu_);
+  pending_cmds_[worker_id].push_back(cmd);
 }
 
 Value Servicer::StartShard(const Value& body, const RpcContext& ctx) {

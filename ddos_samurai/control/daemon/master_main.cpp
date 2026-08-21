@@ -15,6 +15,7 @@
 
 #include "control_auth.hpp"
 #include "control_server.hpp"
+#include "curve.hpp"
 #include "daemon_args.hpp"
 #include "ha.hpp"
 #include "json.hpp"
@@ -52,6 +53,8 @@ void Usage(const char* argv0) {
       "  --control-listen EP       control server bind (default tcp://0.0.0.0:5099)\n"
       "  --cluster-secret S        cluster secret\n"
       "  --tenant-namespace T      tenant namespace\n"
+      "  --curve-server-secret K   enable CURVE encryption (Z85 server secret key)\n"
+      "  --gen-curve-keys          print a fresh CURVE keypair and exit\n"
       "  --count N                 total packets for the job (required, > 0)\n"
       "  --target IP               target ipv4 (default 127.0.0.1)\n"
       "  --port N                  target port (default 80)\n"
@@ -78,6 +81,15 @@ int main(int argc, char** argv) {
 
   if (Flag(argc, argv, "-h") || Flag(argc, argv, "--help")) {
     Usage(argv[0]);
+    return 0;
+  }
+  if (Flag(argc, argv, "--gen-curve-keys")) {
+    const CurveKeypair kp = GenerateCurveKeypair();
+    if (!kp.ok) {
+      std::fprintf(stderr, "samurai_master: CURVE not supported by this libzmq build\n");
+      return 1;
+    }
+    std::printf("curve_public=%s\ncurve_secret=%s\n", kp.public_key.c_str(), kp.secret_key.c_str());
     return 0;
   }
   const long count = OptInt(argc, argv, "--count", 0);
@@ -120,6 +132,11 @@ int main(int argc, char** argv) {
   AuthConfig auth;
   auth.expected_secret = cluster_secret;
   ControlServer server(Opt(argc, argv, "--control-listen", "tcp://0.0.0.0:5099"), &servicer, auth);
+  const std::string curve_secret = Opt(argc, argv, "--curve-server-secret", "");
+  if (!curve_secret.empty()) {
+    server.set_curve_server(curve_secret);
+    std::printf("samurai_master: CURVE encryption enabled on the control server\n");
+  }
   if (!server.Start()) {
     std::fprintf(stderr, "samurai_master: failed to bind control server\n");
     return 1;
@@ -166,7 +183,7 @@ int main(int argc, char** argv) {
 
   // Build + dispatch the job.
   ServicerMasterView view(&servicer);
-  ClientWorkerCommander commander(cluster_secret, tenant);
+  ClientWorkerCommander commander(cluster_secret, tenant, 5000, &servicer);
   MasterCoordinator coord(&view, &commander);
 
   JobConfig job;

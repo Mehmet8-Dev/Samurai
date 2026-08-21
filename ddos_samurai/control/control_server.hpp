@@ -28,6 +28,11 @@ class ControlServer {
   ControlServer(const ControlServer&) = delete;
   ControlServer& operator=(const ControlServer&) = delete;
 
+  // Enable CURVE encryption on this server (call before Start()). `secret_key`
+  // is the server's Z85 secret key; clients must present the matching public
+  // key. Empty key = plaintext (default).
+  void set_curve_server(const std::string& secret_key) { curve_secret_ = secret_key; }
+
   bool Start();  // bind + spawn the receive thread; false on failure
   void Stop();   // signal + join + close
 
@@ -43,6 +48,7 @@ class ControlServer {
   std::string endpoint_;
   ControlService* service_;
   Interceptor interceptor_;
+  std::string curve_secret_;  // Z85 server secret; empty = plaintext
 
   void* ctx_ = nullptr;   // zmq context (opaque)
   void* sock_ = nullptr;  // zmq ROUTER socket (opaque)

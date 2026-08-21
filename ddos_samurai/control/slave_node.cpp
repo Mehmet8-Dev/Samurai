@@ -55,7 +55,15 @@ bool SlaveNode::Register() {
 HeartbeatOutcome SlaveNode::HeartbeatOnce() {
   HeartbeatOutcome out;
   const std::int64_t now_ms = static_cast<std::int64_t>(now_s_() * 1000.0);
-  const wire::Response r = client_->Heartbeat(worker_id_, std::max<std::int64_t>(0, now_ms - boot_ms_));
+  std::string active;
+  const std::string* active_ptr = nullptr;
+  if (active_shard_provider_) {
+    active = active_shard_provider_();
+    active_ptr = &active;  // reverse mode: always echo (even when idle)
+  }
+  const wire::Response r =
+      client_->Heartbeat(worker_id_, std::max<std::int64_t>(0, now_ms - boot_ms_), 0.0, 0.0, 0.0,
+                         active_ptr);
   if (!r.ok) return out;  // ok=false
   out.ok = true;
   const Value* ack = r.body.find("acknowledged");
@@ -65,6 +73,11 @@ HeartbeatOutcome SlaveNode::HeartbeatOnce() {
   if (out.command == "register") {
     client_->RegisterWorker(worker_id_, hostname_, cfg_.capabilities);  // best effort
   }
+  // Reverse-mode: the master piggybacks shard start/stop on the heartbeat body.
+  const Value* shard = r.body.find("shard");
+  if (shard && shard->is_object() && on_start_) on_start_(*shard);
+  const Value* stop = r.body.find("stop_shard");
+  if (stop && on_stop_) on_stop_(stop->as_string(""));
   return out;
 }
 

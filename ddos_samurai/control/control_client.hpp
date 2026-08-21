@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "control_wire.hpp"
+#include "curve.hpp"
 
 namespace samurai::control {
 
@@ -28,10 +29,19 @@ class SlaveControlClient {
 
   wire::Response RegisterWorker(const std::string& worker_id, const std::string& hostname,
                                 const std::map<std::string, std::string>& capabilities);
+  // active_shard_id, when non-null, echoes the shard the worker is currently
+  // running ("" = idle) so the master can confirm reverse pickup. Direct workers
+  // pass nullptr (the field is omitted and the master's state is untouched).
   wire::Response Heartbeat(const std::string& worker_id, long long uptime_ms,
-                           double cpu_pct = 0.0, double mem_pct = 0.0, double gpu_util_pct = 0.0);
+                           double cpu_pct = 0.0, double mem_pct = 0.0, double gpu_util_pct = 0.0,
+                           const std::string* active_shard_id = nullptr);
   wire::Response ReportStats(const std::string& worker_id, const std::string& shard_id,
                              const std::string& stats_json, long long timestamp_ms);
+
+  // Enable CURVE encryption toward the master (call before use). Generates an
+  // ephemeral client keypair and trusts `server_public_key` (Z85). Returns false
+  // if key generation fails; on failure the client stays plaintext.
+  bool set_curve_client(const std::string& server_public_key);
 
  private:
   wire::Response CallWithFailover(const std::string& method,
@@ -43,6 +53,7 @@ class SlaveControlClient {
   int timeout_ms_;
   std::size_t last_idx_ = 0;
   void* ctx_ = nullptr;  // shared zmq context (opaque)
+  CurveClientCreds curve_;
 };
 
 // Master side: command a single worker/master endpoint directly.
@@ -62,6 +73,9 @@ class WorkerControlClient {
   wire::Response AbortJob(const std::string& job_id, const std::string& reason);
   wire::Response ForceSync(const std::string& worker_id);
 
+  // Enable CURVE encryption toward the worker endpoint (call before use).
+  bool set_curve_client(const std::string& server_public_key);
+
  private:
   wire::Response Call(const std::string& method, const samurai::core::json::Value& body);
 
@@ -70,6 +84,7 @@ class WorkerControlClient {
   std::string tenant_namespace_;
   int timeout_ms_;
   void* ctx_ = nullptr;
+  CurveClientCreds curve_;
 };
 
 }  // namespace samurai::control

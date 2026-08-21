@@ -11,6 +11,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -42,6 +43,19 @@ class WorkerShardService : public ControlService {
 
   // Block until any monitor threads for a shard finish (test helper).
   void WaitForShardIdle(const std::string& shard_id);
+
+  // The shard the worker is currently running ("" if idle). Reverse slaves echo
+  // this on each heartbeat so the master can confirm a dispatched shard was
+  // actually picked up.
+  std::string ActiveShardId() const;
+
+  // Reverse-mode completion hook: invoked (outside the lock) when a shard's
+  // monitor finalizes, with the shard_id and its finalized stats JSON. Reverse
+  // slaves wire this to SlaveControlClient::ReportStats so the master learns of
+  // completion over the outbound channel (it cannot probe a NAT'd worker).
+  void set_on_finalize(std::function<void(const std::string&, const std::string&)> cb) {
+    on_finalize_ = std::move(cb);
+  }
 
  private:
   struct ShardRec {
@@ -76,6 +90,7 @@ class WorkerShardService : public ControlService {
   std::vector<std::thread> monitors_;      // joined in the destructor
   std::atomic<int> active_monitors_{0};
   std::condition_variable idle_cv_;
+  std::function<void(const std::string&, const std::string&)> on_finalize_;
 };
 
 }  // namespace samurai::control

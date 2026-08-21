@@ -45,6 +45,19 @@ bool ControlServer::Start() {
   zmq_setsockopt(sock_, ZMQ_LINGER, &linger, sizeof(linger));
   int rcvtimeo = 200;  // ms, so Loop can observe the stop flag
   zmq_setsockopt(sock_, ZMQ_RCVTIMEO, &rcvtimeo, sizeof(rcvtimeo));
+  if (!curve_secret_.empty()) {
+    // CURVE server: encrypt + authenticate. Clients must present the matching
+    // public key. Fail closed if the key is rejected.
+    int as_server = 1;
+    if (zmq_setsockopt(sock_, ZMQ_CURVE_SERVER, &as_server, sizeof(as_server)) != 0 ||
+        zmq_setsockopt(sock_, ZMQ_CURVE_SECRETKEY, curve_secret_.data(), curve_secret_.size()) != 0) {
+      zmq_close(sock_);
+      zmq_ctx_term(ctx_);
+      sock_ = nullptr;
+      ctx_ = nullptr;
+      return false;
+    }
+  }
   if (zmq_bind(sock_, bind_endpoint_.c_str()) != 0) {
     zmq_close(sock_);
     zmq_ctx_term(ctx_);

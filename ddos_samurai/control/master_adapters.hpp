@@ -26,13 +26,15 @@ class ServicerMasterView : public MasterView {
 
 // WorkerCommander that issues real StartShard/GetWorkerStatus/StopShard RPCs to
 // a worker endpoint over ZMQ (a WorkerControlClient is created per call, as the
-// Python master did).
+// Python master did). For reverse-mode workers it queues the command on the
+// Servicer instead, to be pulled via heartbeat (no inbound endpoint exists).
 class ClientWorkerCommander : public WorkerCommander {
  public:
   ClientWorkerCommander(const std::string& cluster_secret = "",
-                        const std::string& tenant_namespace = "", int timeout_ms = 5000)
+                        const std::string& tenant_namespace = "", int timeout_ms = 5000,
+                        Servicer* servicer = nullptr)
       : cluster_secret_(cluster_secret), tenant_namespace_(tenant_namespace),
-        timeout_ms_(timeout_ms) {}
+        timeout_ms_(timeout_ms), servicer_(servicer) {}
 
   DispatchOutcome Dispatch(const std::string& endpoint, const std::string& shard_id,
                            const std::string& job_id, const std::string& args_json,
@@ -40,10 +42,16 @@ class ClientWorkerCommander : public WorkerCommander {
   ProbeOutcome Probe(const std::string& endpoint, const std::string& worker_id) override;
   bool StopShard(const std::string& endpoint, const std::string& shard_id) override;
 
+  DispatchOutcome DispatchReverse(const std::string& worker_id, const std::string& shard_id,
+                                  const std::string& job_id, const std::string& args_json,
+                                  std::int64_t packet_count, std::int64_t timeout_ms) override;
+  bool StopShardReverse(const std::string& worker_id, const std::string& shard_id) override;
+
  private:
   std::string cluster_secret_;
   std::string tenant_namespace_;
   int timeout_ms_;
+  Servicer* servicer_;  // non-owning; source of the reverse command queue
 };
 
 }  // namespace samurai::control

@@ -6,6 +6,7 @@
 // transport. ControlServer drives it over ZMQ; it is equally testable directly.
 
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -19,6 +20,19 @@ namespace samurai::control {
 struct RpcContext {
   const samurai::core::json::Value* meta = nullptr;  // request meta object
   std::string role;                                  // resolved RBAC role
+};
+
+// A command the master wants a reverse-mode (NAT'd) worker to execute. The
+// worker never exposes an inbound control endpoint, so the master cannot push a
+// StartShard/StopShard RPC to it; instead the command is queued here and
+// piggybacked onto the worker's next Heartbeat response (agent-initiated pull).
+struct PendingCommand {
+  std::string type;          // "start" | "stop"
+  std::string shard_id;
+  std::string job_id;
+  std::string args_json = "{}";
+  std::int64_t packet_count = 0;
+  std::int64_t timeout_ms = 0;
 };
 
 // Transport-agnostic control service interface (one method per proto RPC).
@@ -64,11 +78,16 @@ class Servicer : public ControlService {
     std::string worker_id;
     std::map<std::string, std::string> capabilities;
     std::int64_t last_heartbeat_ms = 0;
+    std::string active_shard_id;  // ground truth echoed by the worker (reverse)
   };
   std::vector<WorkerSnapshot> SnapshotWorkers() const;
   bool HasShardStats(const std::string& shard_id) const;
   std::string GetShardStatsRaw(const std::string& shard_id) const;  // "{}" if none
   void SetShardStatsRaw(const std::string& shard_id, const std::string& stats_json);
+
+  // Reverse-mode dispatch: queue a command for a worker; the next Heartbeat
+  // response drains one command into its body (see Heartbeat). Thread-safe.
+  void EnqueueCommand(const std::string& worker_id, const PendingCommand& cmd);
 
  private:
   struct WorkerRec {
@@ -90,6 +109,7 @@ class Servicer : public ControlService {
   mutable std::mutex mu_;
   std::map<std::string, WorkerRec> workers_;
   std::map<std::string, std::string> shard_stats_;  // shard_id -> raw JSON
+  std::map<std::string, std::deque<PendingCommand>> pending_cmds_;  // worker_id -> queue
 };
 
 }  // namespace samurai::control

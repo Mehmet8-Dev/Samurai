@@ -31,15 +31,27 @@ wire::Response TransportError(const std::string& msg) {
 }
 
 // One request/response round trip on a fresh ZMQ_REQ socket. Returns false on
-// any transport failure (connect/send/timeout), leaving `out` untouched.
+// any transport failure (connect/send/timeout), leaving `out` untouched. When
+// `curve` is non-null and complete, the socket is a CURVE client.
 bool CallOnce(void* ctx, const std::string& endpoint, const std::string& request,
-              int timeout_ms, wire::Response& out) {
+              int timeout_ms, wire::Response& out, const CurveClientCreds* curve) {
   void* sock = zmq_socket(ctx, ZMQ_REQ);
   if (!sock) return false;
   int linger = 0;
   zmq_setsockopt(sock, ZMQ_LINGER, &linger, sizeof(linger));
   zmq_setsockopt(sock, ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
   zmq_setsockopt(sock, ZMQ_SNDTIMEO, &timeout_ms, sizeof(timeout_ms));
+  if (curve && curve->ok()) {
+    if (zmq_setsockopt(sock, ZMQ_CURVE_SERVERKEY, curve->server_public.data(),
+                       curve->server_public.size()) != 0 ||
+        zmq_setsockopt(sock, ZMQ_CURVE_PUBLICKEY, curve->client_public.data(),
+                       curve->client_public.size()) != 0 ||
+        zmq_setsockopt(sock, ZMQ_CURVE_SECRETKEY, curve->client_secret.data(),
+                       curve->client_secret.size()) != 0) {
+      zmq_close(sock);
+      return false;
+    }
+  }
 
   bool ok = false;
   if (zmq_connect(sock, endpoint.c_str()) == 0) {
@@ -78,6 +90,16 @@ SlaveControlClient::~SlaveControlClient() {
   }
 }
 
+bool SlaveControlClient::set_curve_client(const std::string& server_public_key) {
+  if (server_public_key.empty()) return false;
+  const CurveKeypair kp = GenerateCurveKeypair();
+  if (!kp.ok) return false;
+  curve_.server_public = server_public_key;
+  curve_.client_public = kp.public_key;
+  curve_.client_secret = kp.secret_key;
+  return true;
+}
+
 wire::Response SlaveControlClient::CallWithFailover(const std::string& method, const Value& body) {
   if (!ok()) return TransportError("no endpoint available");
   const std::string request = wire::BuildRequest(method, BuildMeta(cluster_secret_, tenant_namespace_), body);
@@ -86,7 +108,7 @@ wire::Response SlaveControlClient::CallWithFailover(const std::string& method, c
   for (std::size_t i = 0; i < n; ++i) {
     const std::size_t idx = (start + i) % n;
     wire::Response resp;
-    if (CallOnce(ctx_, endpoints_[idx], request, timeout_ms_, resp)) {
+    if (CallOnce(ctx_, endpoints_[idx], request, timeout_ms_, resp, &curve_)) {
       last_idx_ = idx;
       return resp;
     }
@@ -107,13 +129,15 @@ wire::Response SlaveControlClient::RegisterWorker(
 }
 
 wire::Response SlaveControlClient::Heartbeat(const std::string& worker_id, long long uptime_ms,
-                                             double cpu_pct, double mem_pct, double gpu_util_pct) {
+                                             double cpu_pct, double mem_pct, double gpu_util_pct,
+                                             const std::string* active_shard_id) {
   Value body = Value::Object();
   body.set("worker_id", Value::Str(worker_id));
   body.set("uptime_ms", Value::Int(uptime_ms));
   body.set("cpu_pct", Value::Double(cpu_pct));
   body.set("mem_pct", Value::Double(mem_pct));
   body.set("gpu_util_pct", Value::Double(gpu_util_pct));
+  if (active_shard_id) body.set("active_shard_id", Value::Str(*active_shard_id));
   return CallWithFailover(wire::kHeartbeat, body);
 }
 
@@ -148,11 +172,21 @@ WorkerControlClient::~WorkerControlClient() {
   }
 }
 
+bool WorkerControlClient::set_curve_client(const std::string& server_public_key) {
+  if (server_public_key.empty()) return false;
+  const CurveKeypair kp = GenerateCurveKeypair();
+  if (!kp.ok) return false;
+  curve_.server_public = server_public_key;
+  curve_.client_public = kp.public_key;
+  curve_.client_secret = kp.secret_key;
+  return true;
+}
+
 wire::Response WorkerControlClient::Call(const std::string& method, const Value& body) {
   if (!ok()) return TransportError("worker endpoint is empty");
   const std::string request = wire::BuildRequest(method, BuildMeta(cluster_secret_, tenant_namespace_), body);
   wire::Response resp;
-  if (CallOnce(ctx_, endpoint_, request, timeout_ms_, resp)) return resp;
+  if (CallOnce(ctx_, endpoint_, request, timeout_ms_, resp, &curve_)) return resp;
   return TransportError("E_RPC endpoint=" + endpoint_);
 }
 

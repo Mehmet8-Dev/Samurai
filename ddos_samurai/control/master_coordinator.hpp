@@ -26,6 +26,7 @@ struct WorkerInfo {
   std::string worker_id;
   std::map<std::string, std::string> capabilities;
   std::int64_t last_heartbeat_ms = 0;
+  std::string active_shard_id;  // shard the worker reports running (reverse echo)
 };
 
 // The master's authoritative state: the worker registry and reported shard
@@ -58,6 +59,22 @@ class WorkerCommander {
                                    std::int64_t packet_count, std::int64_t timeout_ms) = 0;
   virtual ProbeOutcome Probe(const std::string& endpoint, const std::string& worker_id) = 0;
   virtual bool StopShard(const std::string& endpoint, const std::string& shard_id) = 0;
+
+  // Reverse-mode delivery (NAT'd workers with no inbound endpoint): keyed by
+  // worker_id, the command is queued on the master and pulled by the worker on
+  // its next heartbeat. Default no-ops so direct-only commanders/tests are
+  // unaffected.
+  virtual DispatchOutcome DispatchReverse(const std::string& worker_id, const std::string& shard_id,
+                                          const std::string& job_id, const std::string& args_json,
+                                          std::int64_t packet_count, std::int64_t timeout_ms) {
+    (void)worker_id; (void)shard_id; (void)job_id; (void)args_json;
+    (void)packet_count; (void)timeout_ms;
+    return {false, "reverse dispatch not supported"};
+  }
+  virtual bool StopShardReverse(const std::string& worker_id, const std::string& shard_id) {
+    (void)worker_id; (void)shard_id;
+    return false;
+  }
 };
 
 struct JobConfig {
@@ -76,6 +93,10 @@ struct JobConfig {
   std::string tenant_namespace;
   std::int64_t leader_epoch = 0;
   int stop_shard_retries = 3;
+  // Reverse-mode pickup grace: if a reverse worker hasn't echoed the dispatched
+  // shard (nor reported it) within this window, the enqueue is deemed lost and
+  // the shard is rebalanced. 0 => 2 x heartbeat_timeout_ms.
+  std::int64_t reverse_pickup_grace_ms = 0;
   int db_port = 5099;                        // Default DB persistence port (user memory standard)
   // Base shard args (JSON object) cloned per shard; the coordinator injects
   // count/_worker_id/_leader_epoch/role.

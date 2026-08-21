@@ -2,11 +2,14 @@
 // ported behaviour matches the Python ddos_samurai/control contract. Exits 0 on
 // success, 1 on the first failed check.
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <map>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ctime>
@@ -35,6 +38,7 @@
 #ifdef SAMURAI_CONTROL_HAVE_ZMQ
 #include "control_client.hpp"
 #include "control_server.hpp"
+#include "curve.hpp"
 #include "master_adapters.hpp"
 #include "slave_node.hpp"
 #endif
@@ -649,6 +653,275 @@ int main() {
           "master: nothing left pending/inflight");
   }
 
+  // --- master: reverse-mode dispatch (NAT'd worker, no control_endpoint) ---
+  {
+    namespace json = samurai::core::json;
+
+    struct FakeView : MasterView {
+      std::map<std::string, WorkerInfo> workers;
+      std::map<std::string, std::string> stats;
+      std::vector<WorkerInfo> Workers() override {
+        std::vector<WorkerInfo> out;
+        for (auto& kv : workers) out.push_back(kv.second);
+        return out;
+      }
+      bool ShardReported(const std::string& sid) override { return stats.count(sid) > 0; }
+      std::string GetShardStats(const std::string& sid) override {
+        auto it = stats.find(sid);
+        return it == stats.end() ? std::string("{}") : it->second;
+      }
+      void SetShardStats(const std::string& sid, const std::string& js) override { stats[sid] = js; }
+    };
+    struct FakeCmd : WorkerCommander {
+      FakeView* view = nullptr;
+      int direct_calls = 0;
+      int reverse_calls = 0;
+      DispatchOutcome Dispatch(const std::string&, const std::string&, const std::string&,
+                               const std::string&, std::int64_t, std::int64_t) override {
+        ++direct_calls;
+        return {false, "direct path must not be used for a reverse worker"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override { return {}; }
+      bool StopShard(const std::string&, const std::string&) override { return true; }
+      DispatchOutcome DispatchReverse(const std::string&, const std::string& sid, const std::string&,
+                                      const std::string&, std::int64_t count,
+                                      std::int64_t) override {
+        ++reverse_calls;
+        json::Value s = json::Value::Object();
+        s.set("shard_id", json::Value::Str(sid));
+        s.set("sent", json::Value::Int(count));
+        s.set("errors", json::Value::Int(0));
+        view->SetShardStats(sid, s.dump());  // simulate the worker pulling + reporting
+        return {true, "enqueued"};
+      }
+    };
+
+    FakeView view;
+    std::int64_t clk = 1000000;
+    WorkerInfo w;
+    w.worker_id = "rev1";
+    w.capabilities["dispatch_mode"] = "reverse";  // deliberately no control_endpoint
+    w.last_heartbeat_ms = clk;
+    view.workers["rev1"] = w;
+    FakeCmd cmd;
+    cmd.view = &view;
+
+    MasterCoordinator coord(&view, &cmd, [&clk]() { return clk; }, [](int) {});
+    JobConfig job;
+    job.count = 500;
+    job.shard_unit_count = 250;  // -> 2 shards
+    job.master_poll_interval_ms = 1;
+    auto res = coord.RunSingleJob(job, "rjob");
+    Check(res.rc == 0, "master(reverse): job completes rc=0");
+    Check(cmd.reverse_calls == 2 && cmd.direct_calls == 0,
+          "master(reverse): dispatched via the reverse path only");
+    Check(res.snapshot.find("sent") && res.snapshot.find("sent")->as_int() == 500,
+          "master(reverse): aggregated sent=500");
+  }
+
+  // --- master: reverse pickup verification — a lost enqueue is rebalanced ---
+  {
+    namespace json = samurai::core::json;
+
+    struct FakeView : MasterView {
+      std::map<std::string, WorkerInfo> workers;
+      std::map<std::string, std::string> stats;
+      std::int64_t* clk = nullptr;
+      std::vector<WorkerInfo> Workers() override {
+        std::vector<WorkerInfo> out;
+        for (auto& kv : workers) {
+          WorkerInfo w = kv.second;
+          w.last_heartbeat_ms = *clk;  // keep the worker "alive" (not lost)
+          out.push_back(w);
+        }
+        return out;
+      }
+      bool ShardReported(const std::string& sid) override { return stats.count(sid) > 0; }
+      std::string GetShardStats(const std::string& sid) override {
+        auto it = stats.find(sid);
+        return it == stats.end() ? std::string("{}") : it->second;
+      }
+      void SetShardStats(const std::string& sid, const std::string& js) override { stats[sid] = js; }
+    };
+    struct FakeCmd : WorkerCommander {
+      FakeView* view = nullptr;
+      int reverse_calls = 0;
+      bool drop_first = true;
+      DispatchOutcome Dispatch(const std::string&, const std::string&, const std::string&,
+                               const std::string&, std::int64_t, std::int64_t) override {
+        return {false, "no"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override { return {}; }
+      bool StopShard(const std::string&, const std::string&) override { return true; }
+      DispatchOutcome DispatchReverse(const std::string&, const std::string& sid, const std::string&,
+                                      const std::string&, std::int64_t count,
+                                      std::int64_t) override {
+        ++reverse_calls;
+        if (drop_first) {
+          drop_first = false;  // simulate a lost enqueue: worker never picks it up
+          return {true, "enqueued-but-lost"};
+        }
+        json::Value s = json::Value::Object();
+        s.set("shard_id", json::Value::Str(sid));
+        s.set("sent", json::Value::Int(count));
+        s.set("errors", json::Value::Int(0));
+        view->SetShardStats(sid, s.dump());  // second attempt completes
+        return {true, "enqueued"};
+      }
+    };
+
+    FakeView view;
+    std::int64_t clk = 1000000;
+    view.clk = &clk;
+    WorkerInfo w;
+    w.worker_id = "rev1";
+    w.capabilities["dispatch_mode"] = "reverse";
+    w.active_shard_id = "";  // never echoes the shard -> pickup deemed lost
+    view.workers["rev1"] = w;
+    FakeCmd cmd;
+    cmd.view = &view;
+
+    MasterCoordinator coord(&view, &cmd, [&clk]() { return clk; }, [&clk](int ms) { clk += ms; });
+    JobConfig job;
+    job.count = 100;
+    job.shard_unit_count = 100;  // 1 shard
+    job.master_poll_interval_ms = 1000;
+    job.heartbeat_timeout_ms = 100000;  // keep the worker alive across the grace window
+    job.reverse_pickup_grace_ms = 3000;
+    auto res = coord.RunSingleJob(job, "pjob");
+    Check(res.rc == 0, "master(reverse): stuck pickup rebalanced to completion");
+    Check(cmd.reverse_calls == 2, "master(reverse): re-dispatched after pickup grace");
+    Check(res.snapshot.find("sent") && res.snapshot.find("sent")->as_int() == 100,
+          "master(reverse): rebalanced shard aggregated sent=100");
+  }
+
+  // --- master: auto-fallback — direct unreachable, delivered via reverse pull ---
+  {
+    namespace json = samurai::core::json;
+
+    struct FakeView : MasterView {
+      std::map<std::string, WorkerInfo> workers;
+      std::map<std::string, std::string> stats;
+      std::vector<WorkerInfo> Workers() override {
+        std::vector<WorkerInfo> out;
+        for (auto& kv : workers) out.push_back(kv.second);
+        return out;
+      }
+      bool ShardReported(const std::string& sid) override { return stats.count(sid) > 0; }
+      std::string GetShardStats(const std::string& sid) override {
+        auto it = stats.find(sid);
+        return it == stats.end() ? std::string("{}") : it->second;
+      }
+      void SetShardStats(const std::string& sid, const std::string& js) override { stats[sid] = js; }
+    };
+    struct FakeCmd : WorkerCommander {
+      FakeView* view = nullptr;
+      int direct_calls = 0;
+      int reverse_calls = 0;
+      DispatchOutcome Dispatch(const std::string&, const std::string&, const std::string&,
+                               const std::string&, std::int64_t, std::int64_t) override {
+        ++direct_calls;
+        return {false, "E_RPC endpoint unreachable (simulated NAT)"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override { return {}; }
+      bool StopShard(const std::string&, const std::string&) override { return true; }
+      DispatchOutcome DispatchReverse(const std::string&, const std::string& sid, const std::string&,
+                                      const std::string&, std::int64_t count,
+                                      std::int64_t) override {
+        ++reverse_calls;
+        json::Value s = json::Value::Object();
+        s.set("shard_id", json::Value::Str(sid));
+        s.set("sent", json::Value::Int(count));
+        s.set("errors", json::Value::Int(0));
+        view->SetShardStats(sid, s.dump());  // worker pulled it + reported
+        return {true, "enqueued"};
+      }
+    };
+
+    FakeView view;
+    std::int64_t clk = 1000000;
+    WorkerInfo w;
+    w.worker_id = "auto1";
+    w.capabilities["dispatch_mode"] = "auto";
+    w.capabilities["control_endpoint"] = "tcp://10.0.0.9:5099";  // advertised but unreachable
+    w.last_heartbeat_ms = clk;
+    view.workers["auto1"] = w;
+    FakeCmd cmd;
+    cmd.view = &view;
+
+    MasterCoordinator coord(&view, &cmd, [&clk]() { return clk; }, [](int) {});
+    JobConfig job;
+    job.count = 300;
+    job.shard_unit_count = 300;  // 1 shard
+    job.master_poll_interval_ms = 1;
+    auto res = coord.RunSingleJob(job, "ajob");
+    Check(res.rc == 0, "master(auto): job completes via reverse fallback rc=0");
+    Check(cmd.direct_calls >= 1 && cmd.reverse_calls >= 1,
+          "master(auto): tried direct first, then fell back to reverse");
+    Check(res.snapshot.find("sent") && res.snapshot.find("sent")->as_int() == 300,
+          "master(auto): aggregated sent=300");
+  }
+
+  // --- wss: StopShard reports completion via on_finalize (reverse straggler) ---
+  {
+    namespace json = samurai::core::json;
+
+    struct BlockingRun : ShardRun {
+      std::atomic<bool> alive{true};
+      std::atomic<bool> term{false};
+      bool IsAlive() override { return alive.load(); }
+      std::int64_t Progress() const override { return 5; }
+      std::int64_t Sent() const override { return 5; }
+      std::int64_t Errors() const override { return 0; }
+      int ExitCode() const override { return term.load() ? -15 : 0; }
+      void Terminate() override {
+        term.store(true);
+        alive.store(false);
+      }
+      void Join() override {
+        while (!term.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        alive.store(false);
+      }
+    };
+    struct BlockingRunner : ShardRunner {
+      std::shared_ptr<ShardRun> Start(const std::string&, const json::Value&) override {
+        return std::make_shared<BlockingRun>();
+      }
+    };
+
+    BlockingRunner runner;
+    WorkerShardService svc("wb1", &runner);
+    std::string got_sid, got_stats;
+    int fin = 0;
+    svc.set_on_finalize([&](const std::string& sid, const std::string& st) {
+      got_sid = sid;
+      got_stats = st;
+      ++fin;
+    });
+    RpcContext ctx;
+    json::Value start = json::Value::Object();
+    start.set("shard_id", json::Value::Str("sB"));
+    start.set("job_id", json::Value::Str("jB"));
+    {
+      json::Value a = json::Value::Object();
+      a.set("count", json::Value::Int(5));
+      start.set("args_json", json::Value::Str(a.dump()));
+    }
+    auto sres = svc.StartShard(start, ctx);
+    Check(sres.find("started") && sres.find("started")->as_bool(), "wss(stop): shard started");
+
+    json::Value stop = json::Value::Object();
+    stop.set("shard_id", json::Value::Str("sB"));
+    auto pres = svc.StopShard(stop, ctx);
+    Check(pres.find("stopped") && pres.find("stopped")->as_bool(), "wss(stop): shard stopped");
+    Check(fin == 1 && got_sid == "sB", "wss(stop): on_finalize fired once on stop");
+    const auto p = json::Parse(got_stats);
+    Check(p.ok && p.value.is_object() && p.value.find("status") &&
+              p.value.find("status")->as_string() == "stopped",
+          "wss(stop): finalized status=stopped");
+    svc.WaitForShardIdle("sB");  // let the bailing monitor thread exit cleanly
+  }
+
 #ifdef SAMURAI_CONTROL_HAVE_ZMQ
   // --- control transport: ZMQ server<->client round trip (RPCs + auth) ---
   {
@@ -774,6 +1047,92 @@ int main() {
 
     worker_server.Stop();
     master_server.Stop();
+  }
+
+  // --- reverse-mode round trip over ZMQ: master enqueues -> worker pulls it on
+  //     its heartbeat -> executes -> reports stats outbound -> master sees it ---
+  {
+    namespace json = samurai::core::json;
+    AuthConfig no_auth;
+
+    ServicerConfig scfg;
+    scfg.cluster_id = "cluster-rev";
+    Servicer master_svc(scfg);
+    ControlServer master_server("tcp://127.0.0.1:*", &master_svc, no_auth);
+    Check(master_server.Start(), "rev: master server up");
+    const std::string em = master_server.endpoint();
+
+    // Reverse worker: shard service + runner, but NO inbound control server.
+    InMemoryShardRunner runner;
+    WorkerShardService worker_svc("wr1", &runner);
+
+    SlaveControlClient slave_client(em);
+    SlaveControlClient reporter(em);
+    SlaveConfig slcfg;
+    slcfg.worker_id = "wr1";
+    slcfg.capabilities["dispatch_mode"] = "reverse";  // no control_endpoint
+    SlaveNode slave(&slave_client, slcfg);
+    slave.set_on_start(
+        [&worker_svc](const json::Value& shard) { worker_svc.StartShard(shard, RpcContext{}); });
+    worker_svc.set_on_finalize([&reporter](const std::string& sid, const std::string& stats) {
+      reporter.ReportStats("wr1", sid, stats, 0);
+    });
+    Check(slave.Register(), "rev: reverse slave registers");
+
+    // Master queues a start command; the worker only learns of it via heartbeat.
+    PendingCommand pc;
+    pc.type = "start";
+    pc.shard_id = "rshard-1";
+    pc.job_id = "rjobZ";
+    {
+      json::Value a = json::Value::Object();
+      a.set("count", json::Value::Int(321));
+      pc.args_json = a.dump();
+    }
+    pc.packet_count = 321;
+    master_svc.EnqueueCommand("wr1", pc);
+    Check(!master_svc.HasShardStats("rshard-1"), "rev: no stats before the worker runs");
+
+    auto hb = slave.HeartbeatOnce();
+    Check(hb.ok && hb.acknowledged, "rev: heartbeat pulls the shard");
+    worker_svc.WaitForShardIdle("rshard-1");  // wait for finalize + outbound report
+
+    Check(master_svc.HasShardStats("rshard-1"), "rev: master received the reported stats");
+    const auto parsed = json::Parse(master_svc.GetShardStatsRaw("rshard-1"));
+    Check(parsed.ok && parsed.value.is_object() && parsed.value.find("sent") &&
+              parsed.value.find("sent")->as_int() == 321,
+          "rev: reported sent=321 round-tripped to the master");
+
+    master_server.Stop();
+  }
+
+  // --- CURVE transport encryption: encrypted round trip + key enforcement ---
+  {
+    const CurveKeypair kp = GenerateCurveKeypair();
+    Check(kp.ok, "curve: keypair generated");
+
+    ServicerConfig scfg;
+    scfg.cluster_id = "cluster-curve";
+    Servicer servicer(scfg);
+    AuthConfig no_auth;
+    ControlServer server("tcp://127.0.0.1:*", &servicer, no_auth);
+    server.set_curve_server(kp.secret_key);
+    Check(server.Start(), "curve: encrypted server starts");
+    const std::string ep = server.endpoint();
+
+    // Client with the correct server public key: encrypted round trip works.
+    SlaveControlClient good(ep, "", "", 1500);
+    Check(good.set_curve_client(kp.public_key), "curve: client keys set");
+    auto reg = good.RegisterWorker("cw1", "h", {});
+    Check(reg.ok && reg.body.find("accepted") && reg.body.find("accepted")->as_bool(),
+          "curve: encrypted RegisterWorker accepted");
+
+    // Plaintext client against a CURVE server: handshake fails (no reply).
+    SlaveControlClient plain(ep, "", "", 800);
+    auto reg2 = plain.RegisterWorker("cw2", "h", {});
+    Check(!reg2.ok, "curve: plaintext client rejected by encrypted server");
+
+    server.Stop();
   }
 #endif  // SAMURAI_CONTROL_HAVE_ZMQ
 

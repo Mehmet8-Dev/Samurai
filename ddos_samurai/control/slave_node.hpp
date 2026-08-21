@@ -38,6 +38,22 @@ class SlaveNode {
 
   const std::string& worker_id() const { return worker_id_; }
 
+  // Reverse-mode callbacks. When the master piggybacks a command on a heartbeat
+  // response, HeartbeatOnce invokes these: on_start with the shard payload
+  // (shard_id/job_id/args_json/...), on_stop with the shard_id. Unset in direct
+  // mode (the master drives shards over the inbound control server instead).
+  void set_on_start(std::function<void(const samurai::core::json::Value&)> cb) {
+    on_start_ = std::move(cb);
+  }
+  void set_on_stop(std::function<void(const std::string&)> cb) { on_stop_ = std::move(cb); }
+
+  // Reverse-mode pickup echo: when set, each heartbeat reports the shard the
+  // worker is currently running ("" = idle) so the master can confirm the
+  // dispatched shard was picked up. Unset (direct mode) omits the field.
+  void set_active_shard_provider(std::function<std::string()> cb) {
+    active_shard_provider_ = std::move(cb);
+  }
+
   // Register with retry until accepted or the register timeout elapses.
   bool Register();
 
@@ -56,6 +72,9 @@ class SlaveNode {
   std::int64_t boot_ms_;
   std::function<double()> now_s_;
   std::function<void(int)> sleep_ms_;
+  std::function<void(const samurai::core::json::Value&)> on_start_;
+  std::function<void(const std::string&)> on_stop_;
+  std::function<std::string()> active_shard_provider_;
 };
 
 }  // namespace samurai::control
