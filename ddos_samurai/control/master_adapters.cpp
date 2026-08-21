@@ -18,6 +18,31 @@ bool BodyBool(const wire::Response& r, const char* key) {
   const Value* v = r.body.find(key);
   return v && v->as_bool();
 }
+
+// Per-worker direct-channel CURVE: a slave started with --gen-control-curve
+// advertises its inbound control server's public key in capabilities. Look it up
+// so the master encrypts the direct RPC toward that worker. Empty => plaintext.
+std::string CurveByEndpoint(Servicer* s, const std::string& endpoint) {
+  if (!s || endpoint.empty()) return "";
+  for (const auto& w : s->SnapshotWorkers()) {
+    const auto ep = w.capabilities.find("control_endpoint");
+    if (ep != w.capabilities.end() && ep->second == endpoint) {
+      const auto pub = w.capabilities.find("control_curve_public");
+      if (pub != w.capabilities.end()) return pub->second;
+    }
+  }
+  return "";
+}
+std::string CurveByWorker(Servicer* s, const std::string& worker_id) {
+  if (!s || worker_id.empty()) return "";
+  for (const auto& w : s->SnapshotWorkers()) {
+    if (w.worker_id == worker_id) {
+      const auto pub = w.capabilities.find("control_curve_public");
+      if (pub != w.capabilities.end()) return pub->second;
+    }
+  }
+  return "";
+}
 }  // namespace
 
 // --- ServicerMasterView ----------------------------------------------------
@@ -53,6 +78,8 @@ DispatchOutcome ClientWorkerCommander::Dispatch(const std::string& endpoint,
                                                 std::int64_t packet_count,
                                                 std::int64_t timeout_ms) {
   WorkerControlClient wc(endpoint, cluster_secret_, tenant_namespace_, timeout_ms_);
+  const std::string cpub = CurveByEndpoint(servicer_, endpoint);
+  if (!cpub.empty()) (void)wc.set_curve_client(cpub);
   const wire::Response r = wc.StartShard(shard_id, job_id, args_json, packet_count, timeout_ms);
   DispatchOutcome out;
   if (!r.ok) {
@@ -73,6 +100,8 @@ DispatchOutcome ClientWorkerCommander::Dispatch(const std::string& endpoint,
 ProbeOutcome ClientWorkerCommander::Probe(const std::string& endpoint,
                                           const std::string& worker_id) {
   WorkerControlClient wc(endpoint, cluster_secret_, tenant_namespace_, timeout_ms_);
+  const std::string cpub = CurveByWorker(servicer_, worker_id);
+  if (!cpub.empty()) (void)wc.set_curve_client(cpub);
   const wire::Response r = wc.GetWorkerStatus(worker_id);
   ProbeOutcome out;
   if (!r.ok) return out;  // empty state -> treated as not-done
@@ -85,6 +114,8 @@ ProbeOutcome ClientWorkerCommander::Probe(const std::string& endpoint,
 
 bool ClientWorkerCommander::StopShard(const std::string& endpoint, const std::string& shard_id) {
   WorkerControlClient wc(endpoint, cluster_secret_, tenant_namespace_, timeout_ms_);
+  const std::string cpub = CurveByEndpoint(servicer_, endpoint);
+  if (!cpub.empty()) (void)wc.set_curve_client(cpub);
   const wire::Response r = wc.StopShard(shard_id, true);
   return r.ok && BodyBool(r, "stopped");
 }

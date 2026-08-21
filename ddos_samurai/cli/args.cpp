@@ -23,7 +23,7 @@ bool NeedsValue(int i, int argc, const char* flag) {
 
 void PrintUsage(const char* argv0) {
   std::printf(
-      "usage: %s --worker <cpu|gpu|dpdk|afxdp|doca|l7|defense|scenario> [options]\n"
+      "usage: %s --worker <cpu|gpu|dpdk|afxdp|afpacket|doca|l7|defense|scenario> [options]\n"
       "\n"
       "options:\n"
       "  --worker NAME       worker backend to run (required)\n"

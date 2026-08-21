@@ -17,6 +17,7 @@ add_subdirectory(core)
 add_subdirectory(control)
 add_subdirectory(licensing)
 add_subdirectory(scenario_engine_native)
+add_subdirectory(af_packet)  # before l4: samurai_l4 uses it as the custom_tcp wire backend
 add_subdirectory(l4)
 add_subdirectory(l7_emu_native)
 set(SAMURAI_ENGINES_OWNED_BY_ROOT ON)

@@ -169,11 +169,15 @@ enum class MessageType : std::uint8_t {
   JOB_DONE = 40,
 };
 
-// Some Linux headers define AF_XDP as a preprocessor macro socket-family value.
-// That macro collides with our enum member name and can break parsing depending
-// on include order (e.g. when sys/socket.h is included before this header).
+// Some Linux headers define AF_XDP / AF_PACKET as preprocessor macro
+// socket-family values. Those macros collide with our enum member names and can
+// break parsing depending on include order (e.g. when sys/socket.h or
+// linux/if_packet.h is included before this header).
 #ifdef AF_XDP
 #undef AF_XDP
+#endif
+#ifdef AF_PACKET
+#undef AF_PACKET
 #endif
 
 enum class WorkerKind : std::uint8_t {
@@ -185,6 +189,7 @@ enum class WorkerKind : std::uint8_t {
   L7 = 6,
   DEFENSE = 7,
   SCENARIO = 8,
+  AF_PACKET = 9,
 };
 
 static_assert(sizeof(SamuraiWireHeaderV1) == 56, "SamuraiWireHeaderV1 size mismatch");

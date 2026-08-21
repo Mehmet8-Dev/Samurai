@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies
-# - build-essential: for compiling C extensions (fast_sender)
+# - build-essential: for compiling the native C/C++ engines (af_packet, cpu_native, ...)
 # - libpcap-dev: for Scapy
 # - iproute2: for ip commands
 # - curl: utility

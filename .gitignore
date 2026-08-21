@@ -55,6 +55,10 @@ dashboard/dist/
 
 # Runtime outputs / telemetry / artifacts
 reports/
+# Loss/telemetry runs are produced at runtime by the benchmark/CI jobs
+# (SAMURAI_LOSS_REPORT_OUT) and must not be tracked.
+artifacts/loss_telemetry_*.json
+artifacts/loss_*.json
 monitoring/textfile/
 *.log
 *.log.txt

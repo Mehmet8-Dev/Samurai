@@ -37,7 +37,6 @@ XDP_SENDER_OUT := $(XDP_DIR)/xdp_sender.so
 XDP_PROG_SRC := $(XDP_DIR)/xdp_prog.c
 XDP_PROG_OUT := $(XDP_DIR)/xdp_prog.o
 PACING_SRC := pacing_engine.c
-FAST_SENDER_SRC := fast_sender.c
 
 # Libraries
 LIBS := -lpthread
@@ -48,7 +47,6 @@ ARCH := $(shell uname -m)
 PYTHON_EXT := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')")
 XDP_SENDER_MODULE := xdp_sender$(PYTHON_EXT)
 PACING_MODULE := pacing_engine$(PYTHON_EXT)
-FAST_SENDER_MODULE := fast_sender$(PYTHON_EXT)
 
 # Colors for output
 RED := \033[0;31m
@@ -57,9 +55,9 @@ YELLOW := \033[0;33m
 BLUE := \033[0;34m
 NC := \033[0m # No Color
 
-.PHONY: all xdp xdp-prog pacing fast clean check help install
+.PHONY: all xdp xdp-prog pacing clean check help install
 
-all: xdp xdp-prog pacing fast
+all: xdp xdp-prog pacing
 	@echo "$(GREEN)✅ All targets built successfully!$(NC)"
 
 # Build AF_XDP Python extension
@@ -95,20 +93,6 @@ pacing: $(PACING_MODULE)
 
 $(PACING_MODULE): $(PACING_SRC)
 	@echo "$(BLUE)Building Pacing Engine module...$(NC)"
-	$(CC) $(CFLAGS) $(PYTHON_INCLUDE) -o $@ $< $(PYTHON_LDFLAGS) $(PACING_LIBS)
-	@if [ -f "$@" ]; then \
-		echo "$(GREEN)✅ Built: $@$(NC)"; \
-	else \
-		echo "$(RED)❌ Failed to build: $@$(NC)"; \
-		exit 1; \
-	fi
-
-# Build fast_sender Python extension (TX_RING + SO_TXTIME + sendmmsg)
-fast: $(FAST_SENDER_MODULE)
-	@echo "$(GREEN)✅ Fast sender module built: $(FAST_SENDER_MODULE)$(NC)"
-
-$(FAST_SENDER_MODULE): $(FAST_SENDER_SRC)
-	@echo "$(BLUE)Building Fast Sender module (with SO_TXTIME)...$(NC)"
 	$(CC) $(CFLAGS) $(PYTHON_INCLUDE) -o $@ $< $(PYTHON_LDFLAGS) $(PACING_LIBS)
 	@if [ -f "$@" ]; then \
 		echo "$(GREEN)✅ Built: $@$(NC)"; \
@@ -176,8 +160,8 @@ install: xdp
 # Clean build artifacts
 clean:
 	@echo "$(BLUE)Cleaning build artifacts...$(NC)"
-	rm -f $(XDP_SENDER_MODULE) $(PACING_MODULE) $(FAST_SENDER_MODULE) $(XDP_PROG_OUT) *.o *.so
-	rm -f xdp_sender.cpython-*.so pacing_engine.cpython-*.so fast_sender.cpython-*.so
+	rm -f $(XDP_SENDER_MODULE) $(PACING_MODULE) $(XDP_PROG_OUT) *.o *.so
+	rm -f xdp_sender.cpython-*.so pacing_engine.cpython-*.so
 	@echo "$(GREEN)✅ Cleaned$(NC)"
 
 # Help
@@ -190,7 +174,6 @@ help:
 	@echo "  make xdp        Build xdp_sender Python extension"
 	@echo "  make xdp-prog   Compile XDP BPF program"
 	@echo "  make pacing     Build pacing_engine Python extension"
-	@echo "  make fast       Build fast_sender Python extension (SO_TXTIME)"
 	@echo "  make all        Build everything"
 	@echo "  make check      Check system dependencies"
 	@echo "  make clean      Remove build artifacts"

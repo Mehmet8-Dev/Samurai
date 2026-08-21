@@ -17,3 +17,11 @@ add_library(
   tcp_dataplane_ffi.cpp
   hw_timestamping.cpp)
 target_include_directories(samurai_l4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# af_packet is the custom_tcp wire backend (kernel sockets on commodity NICs).
+# Standalone builds of this tree add the subdirectory themselves; guarded so it
+# is defined exactly once when the root already added it.
+if(NOT TARGET af_packet_static)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../af_packet af_packet)
+endif()
+target_link_libraries(samurai_l4 PUBLIC af_packet_static)

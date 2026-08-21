@@ -19,6 +19,9 @@
 #ifdef AF_XDP
 #undef AF_XDP
 #endif
+#ifdef AF_PACKET
+#undef AF_PACKET
+#endif
 
 namespace samurai::orchestrator {
 
@@ -37,6 +40,7 @@ inline constexpr WorkerEntry kWorkerTable[] = {
     {samurai::wire::WorkerKind::L7, "l7", "samurai_l7_worker"},
     {samurai::wire::WorkerKind::DEFENSE, "defense", "samurai_defense_worker"},
     {samurai::wire::WorkerKind::SCENARIO, "scenario", "samurai_scenario_worker"},
+    {samurai::wire::WorkerKind::AF_PACKET, "afpacket", "samurai_afpacket_worker"},
 };
 
 inline std::optional<WorkerEntry> LookupWorker(const std::string& name) {

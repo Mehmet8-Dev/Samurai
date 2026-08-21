@@ -17,6 +17,7 @@
 #include "control_client.hpp"
 #include "control_server.hpp"
 #include "control_auth.hpp"
+#include "curve.hpp"
 #include "daemon_args.hpp"
 #include "slave_node.hpp"
 #include "supervisor_shard_runner.hpp"
@@ -49,6 +50,10 @@ void Usage(const char* argv0) {
       "  --tenant-namespace T      tenant namespace\n"
       "  --curve-server-public K   master CURVE public key (Z85) — encrypts the\n"
       "                            outbound channel; required if master uses CURVE\n"
+      "  --gen-control-curve       generate a CURVE keypair for this worker's\n"
+      "                            inbound control server (direct/auto) and\n"
+      "                            advertise its public key so the master encrypts\n"
+      "                            direct StartShard/StopShard/Probe RPCs\n"
       "  --worker-id ID            worker id (default: hostname)\n"
       "  --worker-region R         worker region capability\n"
       "  --worker NAME             dataplane worker kind (default: cpu)\n"
@@ -122,13 +127,28 @@ int main(int argc, char** argv) {
 
   std::unique_ptr<ControlServer> server;
   std::string advertise;
+  std::string control_curve_public;  // advertised so the master encrypts direct RPCs
+  const bool gen_control_curve = Flag(argc, argv, "--gen-control-curve");
   if (wants_server) {
     server = std::make_unique<ControlServer>(listen, &service, auth);
+    if (gen_control_curve) {
+      const CurveKeypair kp = GenerateCurveKeypair();
+      if (!kp.ok) {
+        std::fprintf(stderr, "samurai_slave: CURVE not supported by this libzmq build\n");
+        return 1;
+      }
+      server->set_curve_server(kp.secret_key);
+      control_curve_public = kp.public_key;
+    }
     if (!server->Start()) {
       std::fprintf(stderr, "samurai_slave: failed to bind control server on %s\n", listen.c_str());
       return 1;
     }
     advertise = Opt(argc, argv, "--advertise", server->endpoint());
+    if (gen_control_curve) {
+      std::printf("samurai_slave: inbound control CURVE enabled (public=%s)\n",
+                  control_curve_public.c_str());
+    }
   }
 
   std::signal(SIGINT, OnSignal);
@@ -144,6 +164,11 @@ int main(int argc, char** argv) {
     cfg.capabilities["control_endpoint"] = advertise;
   } else {
     cfg.capabilities["control_endpoint"] = advertise;
+  }
+  // Advertise the inbound control server's CURVE public key so the master can
+  // encrypt direct StartShard/StopShard/Probe RPCs toward this worker.
+  if (!control_curve_public.empty()) {
+    cfg.capabilities["control_curve_public"] = control_curve_public;
   }
   if (!region.empty()) cfg.capabilities["region"] = region;
   if (!tenant.empty()) cfg.capabilities["tenant_namespace"] = tenant;

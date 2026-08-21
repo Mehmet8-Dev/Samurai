@@ -46,6 +46,13 @@ add_library(
 )
 target_include_directories(cpu_native_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../cpu_native)
 
+# Kernel-socket TX/RX engine (commodity NICs, no AF_XDP/DPDK). Pure C, no Python.
+# Shared single target: the root tree already added it (before l4, which links it
+# as the custom_tcp wire backend); a standalone zmq build adds it here.
+if(NOT TARGET af_packet_static)
+  add_subdirectory(../af_packet af_packet)
+endif()
+
 function(add_samurai_worker target_name source_file)
   add_executable(${target_name} ${source_file})
   target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../core ${CMAKE_CURRENT_SOURCE_DIR}/../cpu_native ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native ${LIBZMQ_INCLUDE_DIRS})
@@ -57,7 +64,9 @@ endfunction()
 add_samurai_worker(samurai_cpu_worker daemon/cpu_worker.cpp)
 target_link_libraries(samurai_cpu_worker PRIVATE pacing_engine_static cpu_native_static pthread)
 add_samurai_worker(samurai_gpu_worker daemon/gpu_worker.cpp)
-target_link_libraries(samurai_gpu_worker PRIVATE pacing_engine_static pthread dl)
+# Link the af_packet engine so the CUDA host path's weak AF_PACKET TX_RING
+# bridge symbols (afpkt_send_ring_bridge/afpkt_cleanup_ring_bridge) resolve.
+target_link_libraries(samurai_gpu_worker PRIVATE pacing_engine_static af_packet_static pthread dl)
 add_samurai_worker(samurai_dpdk_worker daemon/dpdk_worker.cpp)
 # Tek native DPDK çekirdeği; başlık rte/Python bağımsız, kaynak SAMURAI_WITH_DPDK
 # ile kendini gate'ler (libdpdk yokken güvenli saplama derlenir).
@@ -84,3 +93,6 @@ add_samurai_worker(samurai_defense_worker daemon/defense_worker.cpp)
 target_link_libraries(samurai_defense_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)
 add_samurai_worker(samurai_scenario_worker daemon/scenario_worker.cpp)
 target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_native_static samurai_scenario pthread)
+add_samurai_worker(samurai_afpacket_worker daemon/afpacket_worker.cpp)
+target_include_directories(samurai_afpacket_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
+target_link_libraries(samurai_afpacket_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static pthread)

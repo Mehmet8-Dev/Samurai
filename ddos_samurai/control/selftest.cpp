@@ -1134,6 +1134,165 @@ int main() {
 
     server.Stop();
   }
+
+  // --- direct-channel CURVE: the master encrypts StartShard/Probe toward a
+  //     worker that advertised its inbound control server's CURVE public key ---
+  {
+    namespace json = samurai::core::json;
+    const CurveKeypair kp = GenerateCurveKeypair();
+    Check(kp.ok, "curve-direct: worker keypair generated");
+    AuthConfig no_auth;
+
+    ServicerConfig scfg;
+    scfg.cluster_id = "cluster-curve-direct";
+    Servicer master_svc(scfg);
+    ControlServer master_server("tcp://127.0.0.1:*", &master_svc, no_auth);
+    Check(master_server.Start(), "curve-direct: master server up");
+    const std::string em = master_server.endpoint();
+
+    // Worker inbound control server protected with CURVE.
+    InMemoryShardRunner runner;
+    WorkerShardService worker_svc("wc1", &runner);
+    ControlServer worker_server("tcp://127.0.0.1:*", &worker_svc, no_auth);
+    worker_server.set_curve_server(kp.secret_key);
+    Check(worker_server.Start(), "curve-direct: encrypted worker server up");
+    const std::string ew = worker_server.endpoint();
+
+    // A plaintext master client is rejected by the CURVE-protected worker.
+    {
+      WorkerControlClient plain(ew, "", "", 800);
+      auto rr = plain.StartShard("cshard-x", "cjob", "{}", 1, 1000);
+      Check(!rr.ok, "curve-direct: plaintext StartShard rejected by encrypted worker");
+    }
+
+    // Slave registers advertising its endpoint AND its control CURVE public key.
+    SlaveControlClient slave_client(em);
+    SlaveConfig slcfg;
+    slcfg.worker_id = "wc1";
+    slcfg.capabilities["control_endpoint"] = ew;
+    slcfg.capabilities["control_curve_public"] = kp.public_key;
+    SlaveNode slave(&slave_client, slcfg);
+    Check(slave.Register(), "curve-direct: slave registers with curve public");
+    slave.HeartbeatOnce();
+
+    // The commander (with the servicer) looks up the worker key and encrypts the
+    // direct dispatch; the whole job completes over the encrypted channel.
+    ServicerMasterView view(&master_svc);
+    ClientWorkerCommander cmd("", "", 5000, &master_svc);
+    MasterCoordinator coord(&view, &cmd);
+    JobConfig job;
+    job.count = 500;
+    job.shard_unit_count = 500;  // single shard -> one direct StartShard + Probe
+    job.master_poll_interval_ms = 10;
+    auto res = coord.RunSingleJob(job, "jobCD");
+    Check(res.rc == 0, "curve-direct: encrypted dispatch completes rc=0");
+    Check(res.snapshot.find("sent") && res.snapshot.find("sent")->as_int() == 500,
+          "curve-direct: encrypted shard reported sent=500");
+
+    worker_server.Stop();
+    master_server.Stop();
+  }
+
+  // --- pickup echo daemon-e2e: over real ZMQ, the worker echoes active_shard_id
+  //     on its heartbeat so the master confirms a reverse pickup via the echo
+  //     (independently of the later ReportStats completion) ---
+  {
+    namespace json = samurai::core::json;
+    AuthConfig no_auth;
+
+    struct BlockingRun : ShardRun {
+      std::atomic<bool> alive{true};
+      std::atomic<bool> term{false};
+      bool IsAlive() override { return alive.load(); }
+      std::int64_t Progress() const override { return 7; }
+      std::int64_t Sent() const override { return 7; }
+      std::int64_t Errors() const override { return 0; }
+      int ExitCode() const override { return term.load() ? -15 : 0; }
+      void Terminate() override { term.store(true); alive.store(false); }
+      void Join() override {
+        while (!term.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        alive.store(false);
+      }
+    };
+    struct BlockingRunner : ShardRunner {
+      std::shared_ptr<ShardRun> Start(const std::string&, const json::Value&) override {
+        return std::make_shared<BlockingRun>();
+      }
+    };
+
+    ServicerConfig scfg;
+    scfg.cluster_id = "cluster-pickup";
+    Servicer master_svc(scfg);
+    ControlServer master_server("tcp://127.0.0.1:*", &master_svc, no_auth);
+    Check(master_server.Start(), "pickup-e2e: master server up");
+    const std::string em = master_server.endpoint();
+
+    BlockingRunner runner;
+    WorkerShardService worker_svc("wp1", &runner);
+
+    SlaveControlClient slave_client(em);
+    SlaveConfig slcfg;
+    slcfg.worker_id = "wp1";
+    slcfg.capabilities["dispatch_mode"] = "reverse";
+    SlaveNode slave(&slave_client, slcfg);
+    slave.set_on_start(
+        [&worker_svc](const json::Value& s) { worker_svc.StartShard(s, RpcContext{}); });
+    slave.set_on_stop([&worker_svc](const std::string& sid) {
+      json::Value stop = json::Value::Object();
+      stop.set("shard_id", json::Value::Str(sid));
+      worker_svc.StopShard(stop, RpcContext{});
+    });
+    slave.set_active_shard_provider([&worker_svc]() { return worker_svc.ActiveShardId(); });
+    Check(slave.Register(), "pickup-e2e: reverse slave registers");
+
+    PendingCommand pc;
+    pc.type = "start";
+    pc.shard_id = "pe1";
+    pc.job_id = "jP";
+    {
+      json::Value a = json::Value::Object();
+      a.set("count", json::Value::Int(7));
+      pc.args_json = a.dump();
+    }
+    pc.packet_count = 7;
+    master_svc.EnqueueCommand("wp1", pc);
+
+    // HB1 pulls + starts the shard (the master optimistically marks the pickup).
+    auto hb1 = slave.HeartbeatOnce();
+    Check(hb1.ok, "pickup-e2e: first heartbeat pulls the shard");
+
+    // HB2: with no command in flight, the worker's own echo of the running shard
+    // is what keeps active_shard_id set -> the master confirms the pickup.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    auto hb2 = slave.HeartbeatOnce();
+    Check(hb2.ok, "pickup-e2e: second heartbeat echoes active shard");
+    {
+      auto ws = master_svc.SnapshotWorkers();
+      Check(ws.size() == 1 && ws[0].active_shard_id == "pe1",
+            "pickup-e2e: master confirms pickup via active_shard_id echo");
+    }
+
+    // Reverse stop over the heartbeat releases the blocking shard.
+    PendingCommand stop_cmd;
+    stop_cmd.type = "stop";
+    stop_cmd.shard_id = "pe1";
+    master_svc.EnqueueCommand("wp1", stop_cmd);
+    slave.HeartbeatOnce();
+    worker_svc.WaitForShardIdle("pe1");
+
+    // A further heartbeat carries no command, so the idle echo alone must clear
+    // the master's view -> proves the echo (not a stale optimistic value) drives
+    // active_shard_id end-to-end over ZMQ.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    slave.HeartbeatOnce();
+    {
+      auto ws = master_svc.SnapshotWorkers();
+      Check(ws.size() == 1 && ws[0].active_shard_id.empty(),
+            "pickup-e2e: master clears active via idle echo after stop");
+    }
+
+    master_server.Stop();
+  }
 #endif  // SAMURAI_CONTROL_HAVE_ZMQ
 
   if (g_failures == 0) {

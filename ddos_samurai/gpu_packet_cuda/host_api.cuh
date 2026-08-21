@@ -1287,7 +1287,7 @@ struct XdpNativeApiV1 {
 };
 
 extern "C" __attribute__((weak)) XdpNativeApiV1* samurai_xdp_get_native_api_v1(void);
-extern "C" __attribute__((weak)) int samurai_fast_sender_send_ring_bridge(
+extern "C" __attribute__((weak)) int afpkt_send_ring_bridge(
     const char* iface,
     const uint8_t* buffer,
     size_t buffer_len,
@@ -1298,7 +1298,7 @@ extern "C" __attribute__((weak)) int samurai_fast_sender_send_ring_bridge(
     int* out_errors,
     char* err_msg,
     size_t err_msg_len);
-extern "C" __attribute__((weak)) int samurai_fast_sender_cleanup_ring_bridge(void);
+extern "C" __attribute__((weak)) int afpkt_cleanup_ring_bridge(void);
 extern "C" __attribute__((weak)) uint64_t samurai_pacing_time_ns(void);
 extern "C" __attribute__((weak)) void samurai_pacing_precision_wait_ns(uint64_t target_ns);
 
@@ -3103,7 +3103,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   }
 
   if (want_afpacket && !b.iface.empty()) {
-    if (samurai_fast_sender_send_ring_bridge && samurai_fast_sender_cleanup_ring_bridge) {
+    if (afpkt_send_ring_bridge && afpkt_cleanup_ring_bridge) {
       // Validate AF_PACKET bridge with a zero-count preflight so we don't mark
       // backend active when raw socket/ring setup is not actually available.
       std::array<uint8_t, 64> dummy{};
@@ -3111,7 +3111,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
       int pre_errors = 0;
       char pre_err[160];
       pre_err[0] = '\0';
-      const int pre_rc = samurai_fast_sender_send_ring_bridge(
+      const int pre_rc = afpkt_send_ring_bridge(
           b.iface.c_str(),
           dummy.data(),
           dummy.size(),
@@ -3122,7 +3122,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
           &pre_errors,
           pre_err,
           sizeof(pre_err));
-      (void)samurai_fast_sender_cleanup_ring_bridge();
+      (void)afpkt_cleanup_ring_bridge();
       if (pre_rc < 0) {
         if (b.requested == "af_packet") {
           b.kind = PersistentTxBackendKind::kNoop;
@@ -3130,8 +3130,8 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
           return tx_backend_strict ? false : true;
         }
       } else {
-      b.afpacket_send_bridge = samurai_fast_sender_send_ring_bridge;
-      b.afpacket_cleanup_bridge = samurai_fast_sender_cleanup_ring_bridge;
+      b.afpacket_send_bridge = afpkt_send_ring_bridge;
+      b.afpacket_cleanup_bridge = afpkt_cleanup_ring_bridge;
       b.kind = PersistentTxBackendKind::kAfPacket;
       b.active = "af_packet";
       return true;
