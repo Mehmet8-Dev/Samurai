@@ -18,6 +18,7 @@
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
 #include "worker_common.hpp"
+#include "afpacket_tx.hpp"
 
 namespace {
 using samurai::daemon::OptionalIntFromWire;
@@ -173,9 +174,21 @@ int main(int argc, char** argv) {
         std::uint64_t packets_sent = 0;
         std::uint64_t bytes_sent = 0;
         std::uint64_t packets_errors = 0;
+        std::string done_note = "done";
         const std::size_t stride = pool.packet_size;
         if (stride == 0 || pool.size() < stride) {
           packets_errors = static_cast<std::uint64_t>(packet_count);
+        } else if (samurai::daemon::AfPacketTxEnabled()) {
+          // Real transmission over the af_packet kernel-socket backend (commodity
+          // NICs, no AF_XDP/DPDK). IPG pacing maps to SO_TXTIME; else batched.
+          const long long ipg_ns =
+              (pace_cfg.mode == SAMURAI_PACING_IPG) ? static_cast<long long>(pace_cfg.ipg_ns) : 0;
+          const auto tx = samurai::daemon::AfPacketSendPool(
+              cfg, pool.data(), pool.size(), static_cast<int>(stride), packet_count, ipg_ns);
+          packets_sent = tx.packets_sent;
+          packets_errors = tx.packets_errors;
+          bytes_sent = tx.bytes_sent;
+          done_note = tx.note;
         } else {
           for (int i = 0; i < packet_count; ++i) {
             samurai_pacing_wait_next(&pace_state, &pace_cfg);
@@ -225,7 +238,8 @@ int main(int argc, char** argv) {
             packets_errors,
             bytes_sent,
             actual_rps,
-            rate_accuracy_pct);
+            rate_accuracy_pct,
+            done_note);
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),

@@ -62,7 +62,8 @@ function(add_samurai_worker target_name source_file)
 endfunction()
 
 add_samurai_worker(samurai_cpu_worker daemon/cpu_worker.cpp)
-target_link_libraries(samurai_cpu_worker PRIVATE pacing_engine_static cpu_native_static pthread)
+target_include_directories(samurai_cpu_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
+target_link_libraries(samurai_cpu_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static pthread)
 add_samurai_worker(samurai_gpu_worker daemon/gpu_worker.cpp)
 # Link the af_packet engine so the CUDA host path's weak AF_PACKET TX_RING
 # bridge symbols (afpkt_send_ring_bridge/afpkt_cleanup_ring_bridge) resolve.
@@ -92,7 +93,8 @@ target_link_libraries(samurai_l7_worker PRIVATE pacing_engine_static samurai_l7e
 add_samurai_worker(samurai_defense_worker daemon/defense_worker.cpp)
 target_link_libraries(samurai_defense_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)
 add_samurai_worker(samurai_scenario_worker daemon/scenario_worker.cpp)
-target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_native_static samurai_scenario pthread)
+target_include_directories(samurai_scenario_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
+target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static samurai_scenario pthread)
 add_samurai_worker(samurai_afpacket_worker daemon/afpacket_worker.cpp)
 target_include_directories(samurai_afpacket_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
 target_link_libraries(samurai_afpacket_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static pthread)

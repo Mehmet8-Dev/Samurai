@@ -19,6 +19,7 @@
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
 #include "worker_common.hpp"
+#include "afpacket_tx.hpp"
 
 #include "compiler.hpp"
 #include "json.hpp"
@@ -367,6 +368,17 @@ int main(int argc, char** argv) {
 
         if (stride == 0 || pool.size() < stride) {
           packets_errors = static_cast<std::uint64_t>(packet_count);
+        } else if (samurai::daemon::AfPacketTxEnabled()) {
+          // Real transmission of the scenario's synthesized traffic over the
+          // af_packet kernel-socket backend (commodity NICs, no AF_XDP/DPDK).
+          const long long ipg_ns =
+              (pace_cfg.mode == SAMURAI_PACING_IPG) ? static_cast<long long>(pace_cfg.ipg_ns) : 0;
+          const auto tx = samurai::daemon::AfPacketSendPool(
+              cfg, pool.data(), pool.size(), static_cast<int>(stride), packet_count, ipg_ns);
+          packets_sent = tx.packets_sent;
+          packets_errors = tx.packets_errors;
+          bytes_sent = tx.bytes_sent;
+          scenario_backend += "+" + tx.note;  // surface the af_packet path taken
         } else {
           for (int i = 0; i < packet_count; ++i) {
             samurai_pacing_wait_next(&pace_state, &pace_cfg);
