@@ -16,8 +16,13 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <fstream>
 #include <mutex>
 #include <unordered_map>
+
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
 
 #include "jwt.hpp"
 
@@ -112,6 +117,183 @@ HttpResponse ErrResp(int status, const std::string& reason, const std::string& d
   Value b = Value::Object();
   b.set("detail", Value::Str(detail));
   return JsonResp(status, reason, b);
+}
+
+// --- Self-bootstrapping agent helpers --------------------------------------
+
+std::string HexOf(const unsigned char* p, std::size_t n) {
+  static const char* kHex = "0123456789abcdef";
+  std::string out;
+  out.reserve(n * 2);
+  for (std::size_t i = 0; i < n; ++i) {
+    out.push_back(kHex[p[i] >> 4]);
+    out.push_back(kHex[p[i] & 0x0F]);
+  }
+  return out;
+}
+std::string Sha256Hex(const std::string& data) {
+  unsigned char md[SHA256_DIGEST_LENGTH];
+  SHA256(reinterpret_cast<const unsigned char*>(data.data()), data.size(), md);
+  return HexOf(md, SHA256_DIGEST_LENGTH);
+}
+std::string HmacSha256Hex(const std::string& data, const std::string& key) {
+  unsigned char md[EVP_MAX_MD_SIZE];
+  unsigned int len = 0;
+  HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+       reinterpret_cast<const unsigned char*>(data.data()), data.size(), md, &len);
+  return HexOf(md, len);
+}
+bool ReadFileBytes(const std::string& path, std::string& out) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  out = ss.str();
+  return static_cast<bool>(f) || f.eof();
+}
+bool ConstTimeEq(const std::string& a, const std::string& b) {
+  if (a.size() != b.size() || a.empty()) return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+  }
+  return diff == 0;
+}
+bool SafeBlobName(const std::string& n) {
+  if (n.size() < 9 || n.size() > 64) return false;   // "samurai_" + >=1
+  if (n.rfind("samurai_", 0) != 0) return false;
+  for (char c : n) {
+    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) return false;
+  }
+  return true;
+}
+std::string SanitizeHost(const std::string& h) {
+  std::string out;
+  for (char c : h) {
+    if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == ':' || c == '-') {
+      out.push_back(c);
+    }
+  }
+  return out.empty() ? std::string("127.0.0.1") : out;
+}
+
+// The POSIX-sh installer served at /v1/agent/install. It fetches the HMAC-signed
+// manifest (key = the join token the operator embedded in the curl URL), verifies
+// the signature and every binary's SHA-256, then execs the slave in reverse mode.
+std::string BuildInstallScript(const std::string& base, const std::string& token) {
+  std::ostringstream s;
+  s << "#!/bin/sh\n"
+       "set -eu\n"
+       "BASE=\"" << base << "\"\n"
+       "TOKEN=\"" << token << "\"\n"
+       "TMP=\"$(mktemp -d)\"\n"
+       "curl -fsSL \"$BASE/v1/agent/manifest?token=$TOKEN\" -o \"$TMP/manifest\"\n"
+       "SIG=\"$(head -n1 \"$TMP/manifest\" | awk '{print $2}')\"\n"
+       "tail -n +2 \"$TMP/manifest\" > \"$TMP/body\"\n"
+       "CALC=\"$(openssl dgst -sha256 -hmac \"$TOKEN\" \"$TMP/body\" | awk '{print $NF}')\"\n"
+       "[ \"$SIG\" = \"$CALC\" ] || { echo 'samurai-agent: manifest HMAC mismatch' >&2; exit 1; }\n"
+       "CE=''; DM='reverse'; WK='cpu'; CP=''; CS=''\n"
+       "while read -r k v w; do\n"
+       "  case \"$k\" in\n"
+       "    control_endpoint) CE=\"$v\" ;;\n"
+       "    dispatch_mode) DM=\"$v\" ;;\n"
+       "    worker) WK=\"$v\" ;;\n"
+       "    cluster_secret) CS=\"$v\" ;;\n"
+       "    curve_server_public) CP=\"$v\" ;;\n"
+       "    blob)\n"
+       "      curl -fsSL \"$BASE/v1/agent/blob?token=$TOKEN&name=$v\" -o \"$TMP/$v\"\n"
+       "      echo \"$w  $TMP/$v\" | sha256sum -c - >/dev/null || "
+       "{ echo \"samurai-agent: $v sha256 mismatch\" >&2; exit 1; }\n"
+       "      chmod +x \"$TMP/$v\" ;;\n"
+       "  esac\n"
+       "done < \"$TMP/body\"\n"
+       "[ -n \"$CE\" ] || { echo 'samurai-agent: no control_endpoint' >&2; exit 1; }\n"
+       "echo \"samurai-agent: verified; joining $CE (mode=$DM worker=$WK)\" >&2\n"
+       "set -- --control-endpoints \"$CE\" --dispatch-mode \"$DM\" --worker \"$WK\" --worker-dir \"$TMP\"\n"
+       "if [ -n \"$CS\" ]; then set -- \"$@\" --cluster-secret \"$CS\"; fi\n"
+       "if [ -n \"$CP\" ]; then set -- \"$@\" --curve-server-public \"$CP\"; fi\n"
+       "exec \"$TMP/samurai_slave\" \"$@\"\n";
+  return s.str();
+}
+
+// Handles /v1/agent/* (install/manifest/blob). Returns nullopt when the feature
+// is disabled or the path is not an agent path, so Handle continues its routing.
+std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const HttpRequest& req) {
+  if (cfg.agent_join_token.empty()) return std::nullopt;       // feature disabled
+  if (req.method != "GET" || req.path.rfind("/v1/agent/", 0) != 0) return std::nullopt;
+
+  std::string token;
+  auto tit = req.query.find("token");
+  if (tit != req.query.end()) token = tit->second;
+  if (!ConstTimeEq(token, cfg.agent_join_token)) {
+    return ErrResp(401, "Unauthorized", "agent_unauthorized");
+  }
+
+  const std::string worker = cfg.agent_worker.empty() ? std::string("cpu") : cfg.agent_worker;
+  const std::string slave_bin = "samurai_slave";
+  const std::string worker_bin = "samurai_" + worker + "_worker";
+  const std::string art = cfg.agent_artifact_dir;
+
+  if (req.path == "/v1/agent/manifest") {
+    std::string slave_bytes;
+    std::string worker_bytes;
+    if (art.empty() || !ReadFileBytes(art + "/" + slave_bin, slave_bytes) ||
+        !ReadFileBytes(art + "/" + worker_bin, worker_bytes)) {
+      return ErrResp(500, "Internal Server Error", "agent_artifacts_unavailable");
+    }
+    // Whitespace-delimited "key value" lines so the installer can parse them with
+    // a single `read -r k v w` + `case "$k"` (same shape as the `blob` lines).
+    std::ostringstream body;
+    body << "control_endpoint " << cfg.agent_advertise_endpoint << "\n"
+         << "dispatch_mode " << cfg.agent_dispatch_mode << "\n"
+         << "worker " << worker << "\n";
+    if (!cfg.agent_cluster_secret.empty()) {
+      body << "cluster_secret " << cfg.agent_cluster_secret << "\n";
+    }
+    if (!cfg.agent_curve_public.empty()) {
+      body << "curve_server_public " << cfg.agent_curve_public << "\n";
+    }
+    body << "blob " << slave_bin << " " << Sha256Hex(slave_bytes) << "\n"
+         << "blob " << worker_bin << " " << Sha256Hex(worker_bytes) << "\n";
+    const std::string b = body.str();
+    HttpResponse r;
+    r.status = 200;
+    r.reason = "OK";
+    r.content_type = "text/plain";
+    r.body = "#hmac " + HmacSha256Hex(b, cfg.agent_join_token) + "\n" + b;
+    return r;
+  }
+
+  if (req.path == "/v1/agent/blob") {
+    std::string name;
+    auto nit = req.query.find("name");
+    if (nit != req.query.end()) name = nit->second;
+    if (!SafeBlobName(name) || (name != slave_bin && name != worker_bin)) {
+      return ErrResp(400, "Bad Request", "agent_bad_blob");
+    }
+    std::string bytes;
+    if (art.empty() || !ReadFileBytes(art + "/" + name, bytes)) {
+      return ErrResp(404, "Not Found", "agent_blob_missing");
+    }
+    HttpResponse r;
+    r.status = 200;
+    r.reason = "OK";
+    r.content_type = "application/octet-stream";
+    r.body = std::move(bytes);
+    return r;
+  }
+
+  if (req.path == "/v1/agent/install") {
+    const std::string base = "http://" + SanitizeHost(HeaderOr(req.headers, "host"));
+    HttpResponse r;
+    r.status = 200;
+    r.reason = "OK";
+    r.content_type = "text/x-shellscript";
+    r.body = BuildInstallScript(base, cfg.agent_join_token);
+    return r;
+  }
+
+  return std::nullopt;
 }
 
 bool MatchTenant(const Value& item, const std::string& tenant) {
@@ -249,6 +431,9 @@ HttpResponse ManagementApi::Handle(const HttpRequest& req) const {
     b.set("status", Value::Str("ok"));
     return JsonResp(200, "OK", b);
   }
+
+  // Self-bootstrapping agent join (/v1/agent/*) uses its own join-token auth.
+  if (auto agent = MaybeHandleAgent(cfg_, req)) return *agent;
 
   auto guard = [&](std::initializer_list<const char*> allowed) -> std::optional<HttpResponse> {
     const std::string role = ResolveRole(authz, req.headers);

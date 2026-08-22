@@ -21,6 +21,11 @@ struct CurveKeypair {
 // built without CURVE support.
 CurveKeypair GenerateCurveKeypair();
 
+// Derive the Z85 public key from a Z85 secret key. Returns "" on failure (bad
+// key or CURVE unsupported). Used so the master can advertise its control
+// server's public key to self-bootstrapping agents given only its secret.
+std::string CurvePublicFromSecret(const std::string& z85_secret);
+
 // Client-side CURVE credentials: the server's public key plus this client's own
 // (typically ephemeral) keypair. Encrypts + authenticates the server to the
 // client; combined with the app-layer cluster-secret this protects the channel.

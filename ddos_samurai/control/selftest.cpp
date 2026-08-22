@@ -12,9 +12,14 @@
 #include <thread>
 #include <vector>
 
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <sstream>
+
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -442,6 +447,96 @@ int main() {
           "mgmt: socket round trip healthz 200");
     server.Stop();
     Check(!server.running(), "mgmt: server stops");
+  }
+
+  // --- agent bootstrap: HMAC-signed manifest + SHA-256 pins + token gating ---
+  {
+    const std::string dir = "/tmp/samurai_agent_test";
+    (void)std::system(("rm -rf " + dir + " && mkdir -p " + dir).c_str());
+    const std::string slave_content = std::string("SLAVE-BINARY-\x01\x02\x03", 16);
+    const std::string worker_content = std::string("CPU-WORKER-\x04\x05", 13);
+    { std::ofstream f(dir + "/samurai_slave", std::ios::binary); f << slave_content; }
+    { std::ofstream f(dir + "/samurai_cpu_worker", std::ios::binary); f << worker_content; }
+
+    auto hexof = [](const unsigned char* p, std::size_t n) {
+      static const char* k = "0123456789abcdef";
+      std::string o;
+      for (std::size_t i = 0; i < n; ++i) { o.push_back(k[p[i] >> 4]); o.push_back(k[p[i] & 15]); }
+      return o;
+    };
+    auto sha = [&](const std::string& d) {
+      unsigned char m[SHA256_DIGEST_LENGTH];
+      SHA256(reinterpret_cast<const unsigned char*>(d.data()), d.size(), m);
+      return hexof(m, SHA256_DIGEST_LENGTH);
+    };
+    auto hmac = [&](const std::string& d, const std::string& key) {
+      unsigned char m[EVP_MAX_MD_SIZE];
+      unsigned int l = 0;
+      HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+           reinterpret_cast<const unsigned char*>(d.data()), d.size(), m, &l);
+      return hexof(m, l);
+    };
+
+    ManagementConfig cfg;
+    cfg.agent_join_token = "JOINSECRET";
+    cfg.agent_artifact_dir = dir;
+    cfg.agent_advertise_endpoint = "tcp://master.example:5099";
+    cfg.agent_worker = "cpu";
+    cfg.agent_cluster_secret = "CLUSTERSECRET";
+    ManagementApi api(cfg, ManagementProviders{});
+
+    auto areq = [](const std::string& path, std::map<std::string, std::string> q) {
+      HttpRequest r;
+      r.method = "GET";
+      r.path = path;
+      r.query = std::move(q);
+      r.headers["host"] = "master.example:8089";
+      return r;
+    };
+
+    Check(api.Handle(areq("/v1/agent/manifest", {})).status == 401,
+          "agent: manifest requires token");
+    Check(api.Handle(areq("/v1/agent/manifest", {{"token", "WRONG"}})).status == 401,
+          "agent: wrong token rejected");
+
+    auto man = api.Handle(areq("/v1/agent/manifest", {{"token", "JOINSECRET"}}));
+    Check(man.status == 200 && man.body.rfind("#hmac ", 0) == 0,
+          "agent: manifest served with hmac line");
+    const std::size_t nl = man.body.find('\n');
+    const std::string body = man.body.substr(nl + 1);
+    const std::string sig = man.body.substr(6, nl - 6);
+    Check(sig == hmac(body, "JOINSECRET"), "agent: manifest HMAC valid (key=join token)");
+    Check(body.find("blob samurai_slave " + sha(slave_content)) != std::string::npos,
+          "agent: slave sha256 pinned");
+    Check(body.find("blob samurai_cpu_worker " + sha(worker_content)) != std::string::npos,
+          "agent: worker sha256 pinned");
+    Check(body.find("control_endpoint tcp://master.example:5099") != std::string::npos,
+          "agent: control endpoint advertised");
+    Check(body.find("dispatch_mode reverse") != std::string::npos, "agent: reverse mode advertised");
+    Check(body.find("cluster_secret CLUSTERSECRET") != std::string::npos,
+          "agent: cluster secret advertised for registration auth");
+
+    auto blob = api.Handle(areq("/v1/agent/blob", {{"token", "JOINSECRET"}, {"name", "samurai_slave"}}));
+    Check(blob.status == 200 && blob.body == slave_content &&
+              blob.content_type == "application/octet-stream",
+          "agent: blob bytes served verbatim");
+    Check(api.Handle(areq("/v1/agent/blob", {{"token", "JOINSECRET"}, {"name", "../etc/passwd"}})).status == 400,
+          "agent: path traversal rejected");
+    Check(api.Handle(areq("/v1/agent/blob", {{"token", "JOINSECRET"}, {"name", "samurai_evil"}})).status == 400,
+          "agent: unlisted blob rejected");
+
+    auto inst = api.Handle(areq("/v1/agent/install", {{"token", "JOINSECRET"}}));
+    Check(inst.status == 200 && inst.content_type == "text/x-shellscript" &&
+              inst.body.find("JOINSECRET") != std::string::npos &&
+              inst.body.find("samurai_slave") != std::string::npos &&
+              inst.body.find("--cluster-secret") != std::string::npos,
+          "agent: install script served");
+
+    ManagementApi api_off(ManagementConfig{}, ManagementProviders{});
+    Check(api_off.Handle(areq("/v1/agent/manifest", {{"token", ""}})).status == 404,
+          "agent: disabled without join token");
+
+    (void)std::system(("rm -rf " + dir).c_str());
   }
 
   // --- audit: RBAC tamper-evident hash chain ---

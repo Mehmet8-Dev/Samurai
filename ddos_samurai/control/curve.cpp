@@ -16,4 +16,11 @@ CurveKeypair GenerateCurveKeypair() {
   return kp;
 }
 
+std::string CurvePublicFromSecret(const std::string& z85_secret) {
+  if (z85_secret.size() != 40) return "";
+  char public_key[41] = {0};
+  if (zmq_curve_public(public_key, z85_secret.c_str()) != 0) return "";
+  return std::string(public_key);
+}
+
 }  // namespace samurai::control

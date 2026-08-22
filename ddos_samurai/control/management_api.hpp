@@ -47,6 +47,20 @@ struct ManagementConfig {
   std::string trusted_tenant_header = "x-auth-request-tenant";
   int db_port = 5099;                              // Default DB persistence port (user memory standard)
   int rate_limit_per_sec = 100;                    // Max HTTP requests per second per client
+
+  // Self-bootstrapping agent join (zero-install slave). When agent_join_token is
+  // non-empty the /v1/agent/{install,manifest,blob} endpoints are enabled: a node
+  // runs `curl -fsSL http://master:PORT/v1/agent/install?token=T | sh`, which
+  // fetches an HMAC-signed manifest (key = the join token), downloads the slave +
+  // worker binaries from agent_artifact_dir, verifies each SHA-256, and execs the
+  // slave in reverse mode pointed at agent_advertise_endpoint.
+  std::string agent_join_token;          // gates the endpoints + HMAC key; empty = disabled
+  std::string agent_artifact_dir;        // dir holding samurai_slave + worker binaries
+  std::string agent_advertise_endpoint;  // control endpoint the agent connects to (public)
+  std::string agent_curve_public;        // master control-server CURVE public key (Z85), optional
+  std::string agent_cluster_secret;      // cluster secret the agent presents to register (app-layer auth)
+  std::string agent_dispatch_mode = "reverse";  // reverse|auto (NAT-friendly)
+  std::string agent_worker = "cpu";      // dataplane worker kind the agent runs
 };
 
 struct ManagementProviders {

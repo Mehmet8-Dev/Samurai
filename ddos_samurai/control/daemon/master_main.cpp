@@ -66,6 +66,14 @@ void Usage(const char* argv0) {
       "  --expect-workers N        wait for this many workers first (default 1)\n"
       "  --wait-workers-s N        how long to wait for workers (default 30)\n"
       "  --management-listen EP    also serve the HTTP management API (host:port)\n"
+      "  --agent-join-token T      enable zero-install agent join on the mgmt API\n"
+      "                            (curl .../v1/agent/install?token=T | sh); the\n"
+      "                            token is also the manifest HMAC key\n"
+      "  --agent-artifact-dir DIR  dir with samurai_slave + worker binaries to serve\n"
+      "  --agent-advertise EP      public control endpoint agents connect to\n"
+      "                            (default: --control-listen value)\n"
+      "  --agent-worker NAME       worker kind agents run (default cpu)\n"
+      "  --agent-dispatch-mode M   reverse | auto for agents (default reverse)\n"
       "  --ha-mode MODE            static | file-lock (default off)\n"
       "  --ha-node-id ID           this node's id\n"
       "  --ha-peers CSV            peer node ids (static mode)\n"
@@ -131,10 +139,13 @@ int main(int argc, char** argv) {
   Servicer servicer(scfg);
   AuthConfig auth;
   auth.expected_secret = cluster_secret;
-  ControlServer server(Opt(argc, argv, "--control-listen", "tcp://0.0.0.0:5099"), &servicer, auth);
+  const std::string control_listen = Opt(argc, argv, "--control-listen", "tcp://0.0.0.0:5099");
+  ControlServer server(control_listen, &servicer, auth);
   const std::string curve_secret = Opt(argc, argv, "--curve-server-secret", "");
+  std::string curve_public;
   if (!curve_secret.empty()) {
     server.set_curve_server(curve_secret);
+    curve_public = CurvePublicFromSecret(curve_secret);
     std::printf("samurai_master: CURVE encryption enabled on the control server\n");
   }
   if (!server.Start()) {
@@ -149,6 +160,20 @@ int main(int argc, char** argv) {
   if (!mgmt_listen.empty()) {
     ManagementConfig mcfg;
     mcfg.tenant_namespace = tenant;
+    // Self-bootstrapping agent join (zero-install slave). Opt-in via a join token;
+    // agents pull the slave + worker binaries and register in reverse mode.
+    mcfg.agent_join_token = Opt(argc, argv, "--agent-join-token", "");
+    if (!mcfg.agent_join_token.empty()) {
+      mcfg.agent_artifact_dir = Opt(argc, argv, "--agent-artifact-dir", ".");
+      mcfg.agent_advertise_endpoint = Opt(argc, argv, "--agent-advertise", control_listen);
+      mcfg.agent_dispatch_mode = Opt(argc, argv, "--agent-dispatch-mode", "reverse");
+      mcfg.agent_worker = Opt(argc, argv, "--agent-worker", "cpu");
+      mcfg.agent_cluster_secret = cluster_secret;  // agent presents this for app-layer auth
+      mcfg.agent_curve_public = curve_public;  // empty unless --curve-server-secret set
+      std::printf("samurai_master: agent bootstrap enabled (worker=%s advertise=%s curve=%s)\n",
+                  mcfg.agent_worker.c_str(), mcfg.agent_advertise_endpoint.c_str(),
+                  curve_public.empty() ? "off" : "on");
+    }
     ManagementProviders providers;
     providers.state_provider = [&servicer]() { return BuildState(&servicer); };
     providers.abort_callback = []() {
