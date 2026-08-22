@@ -55,6 +55,8 @@ void Usage(const char* argv0) {
       "  --tenant-namespace T      tenant namespace\n"
       "  --curve-server-secret K   enable CURVE encryption (Z85 server secret key)\n"
       "  --gen-curve-keys          print a fresh CURVE keypair and exit\n"
+      "  --insecure-control        allow a non-loopback control bind without CURVE\n"
+      "                            (cluster secret sent in cleartext — unsafe)\n"
       "  --count N                 total packets for the job (required, > 0)\n"
       "  --target IP               target ipv4 (default 127.0.0.1)\n"
       "  --port N                  target port (default 80)\n"
@@ -74,6 +76,8 @@ void Usage(const char* argv0) {
       "                            (default: --control-listen value)\n"
       "  --agent-worker NAME       worker kind agents run (default cpu)\n"
       "  --agent-dispatch-mode M   reverse | auto for agents (default reverse)\n"
+      "  --agent-insecure-http     allow agent bootstrap on a non-loopback mgmt\n"
+      "                            bind (join token + secret sent in cleartext)\n"
       "  --ha-mode MODE            static | file-lock (default off)\n"
       "  --ha-node-id ID           this node's id\n"
       "  --ha-peers CSV            peer node ids (static mode)\n"
@@ -148,6 +152,23 @@ int main(int argc, char** argv) {
     curve_public = CurvePublicFromSecret(curve_secret);
     std::printf("samurai_master: CURVE encryption enabled on the control server\n");
   }
+  // Public-exposure safety: on a non-loopback bind the cluster secret travels
+  // the control channel app-layer, so refuse plaintext unless explicitly forced.
+  if (!IsLoopbackEndpoint(control_listen) && curve_secret.empty()) {
+    if (!Flag(argc, argv, "--insecure-control")) {
+      std::fprintf(stderr,
+          "samurai_master: refusing to bind the control server to a non-loopback\n"
+          "  address (%s) without CURVE — the cluster secret would travel in\n"
+          "  cleartext. Enable --curve-server-secret, bind to loopback behind a\n"
+          "  tunnel, or pass --insecure-control to override.\n",
+          control_listen.c_str());
+      return 2;
+    }
+    std::fprintf(stderr,
+        "samurai_master: WARNING: control server on %s is plaintext "
+        "(--insecure-control); the cluster secret is exposed.\n",
+        control_listen.c_str());
+  }
   if (!server.Start()) {
     std::fprintf(stderr, "samurai_master: failed to bind control server\n");
     return 1;
@@ -164,6 +185,23 @@ int main(int argc, char** argv) {
     // agents pull the slave + worker binaries and register in reverse mode.
     mcfg.agent_join_token = Opt(argc, argv, "--agent-join-token", "");
     if (!mcfg.agent_join_token.empty()) {
+      // The management API is plaintext HTTP. On a non-loopback bind the join
+      // token + cluster secret would be exposed, so require an explicit opt-in.
+      if (!IsLoopbackEndpoint(mgmt_listen) && !Flag(argc, argv, "--agent-insecure-http")) {
+        std::fprintf(stderr,
+            "samurai_master: refusing to enable agent bootstrap on a non-loopback\n"
+            "  mgmt address (%s): the management API is plaintext HTTP, so the join\n"
+            "  token and cluster secret would be exposed. Bind --management-listen to\n"
+            "  loopback behind a TLS proxy / tunnel, or pass --agent-insecure-http.\n",
+            mgmt_listen.c_str());
+        return 2;
+      }
+      if (!IsLoopbackEndpoint(mgmt_listen)) {
+        std::fprintf(stderr,
+            "samurai_master: WARNING: agent bootstrap served plaintext on %s "
+            "(--agent-insecure-http); join token + secret are exposed.\n",
+            mgmt_listen.c_str());
+      }
       mcfg.agent_artifact_dir = Opt(argc, argv, "--agent-artifact-dir", ".");
       mcfg.agent_advertise_endpoint = Opt(argc, argv, "--agent-advertise", control_listen);
       mcfg.agent_dispatch_mode = Opt(argc, argv, "--agent-dispatch-mode", "reverse");

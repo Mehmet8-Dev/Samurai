@@ -27,6 +27,7 @@
 
 #include "audit_log.hpp"
 #include "auth.hpp"
+#include "daemon/daemon_args.hpp"
 #include "autoscale.hpp"
 #include "discovery.hpp"
 #include "ha.hpp"
@@ -537,6 +538,23 @@ int main() {
           "agent: disabled without join token");
 
     (void)std::system(("rm -rf " + dir).c_str());
+  }
+
+  // --- public-exposure safety: loopback endpoint classification ---
+  {
+    using samurai::control::daemon::IsLoopbackEndpoint;
+    // Loopback (safe to run plaintext behind a local tunnel/proxy).
+    Check(IsLoopbackEndpoint("tcp://127.0.0.1:5099"), "loopback: tcp 127.0.0.1");
+    Check(IsLoopbackEndpoint("127.0.0.1:8089"), "loopback: bare 127.0.0.1");
+    Check(IsLoopbackEndpoint("localhost:8089"), "loopback: localhost");
+    Check(IsLoopbackEndpoint("tcp://127.5.6.7:1"), "loopback: 127/8 range");
+    Check(IsLoopbackEndpoint("[::1]:8089"), "loopback: ipv6 ::1");
+    // Exposed (wildcard or routable — must be encrypted or explicitly forced).
+    Check(!IsLoopbackEndpoint("tcp://0.0.0.0:5099"), "loopback: 0.0.0.0 is exposed");
+    Check(!IsLoopbackEndpoint("0.0.0.0:8089"), "loopback: bare 0.0.0.0 exposed");
+    Check(!IsLoopbackEndpoint("tcp://10.0.0.5:5099"), "loopback: private lan exposed");
+    Check(!IsLoopbackEndpoint("tcp://203.0.113.9:5099"), "loopback: public ip exposed");
+    Check(!IsLoopbackEndpoint(""), "loopback: empty is exposed");
   }
 
   // --- audit: RBAC tamper-evident hash chain ---
