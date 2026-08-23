@@ -68,6 +68,9 @@ void Usage(const char* argv0) {
       "  --expect-workers N        wait for this many workers first (default 1)\n"
       "  --wait-workers-s N        how long to wait for workers (default 30)\n"
       "  --management-listen EP    also serve the HTTP management API (host:port)\n"
+      "  --mgmt-tls                serve the management API over TLS (https)\n"
+      "  --mgmt-tls-cert PATH      PEM cert chain (self-signed if cert/key omitted)\n"
+      "  --mgmt-tls-key PATH       PEM private key\n"
       "  --agent-join-token T      enable zero-install agent join on the mgmt API\n"
       "                            (curl .../v1/agent/install?token=T | sh); the\n"
       "                            token is also the manifest HMAC key\n"
@@ -181,22 +184,35 @@ int main(int argc, char** argv) {
   if (!mgmt_listen.empty()) {
     ManagementConfig mcfg;
     mcfg.tenant_namespace = tenant;
+
+    // TLS for the management HTTP API. Enabled by --mgmt-tls; uses the given
+    // cert/key files or an ephemeral self-signed cert when none are provided.
+    ManagementTlsConfig tls;
+    tls.enabled = Flag(argc, argv, "--mgmt-tls");
+    tls.cert_path = Opt(argc, argv, "--mgmt-tls-cert", "");
+    tls.key_path = Opt(argc, argv, "--mgmt-tls-key", "");
+    mcfg.agent_public_scheme = tls.enabled ? "https" : "http";
+    // Self-signed TLS (no cert files): the agent can't verify the cert, so its
+    // install-script curls must use -k (the manifest HMAC still authenticates).
+    mcfg.agent_tls_skip_verify = tls.enabled && tls.cert_path.empty();
+
     // Self-bootstrapping agent join (zero-install slave). Opt-in via a join token;
     // agents pull the slave + worker binaries and register in reverse mode.
     mcfg.agent_join_token = Opt(argc, argv, "--agent-join-token", "");
     if (!mcfg.agent_join_token.empty()) {
-      // The management API is plaintext HTTP. On a non-loopback bind the join
-      // token + cluster secret would be exposed, so require an explicit opt-in.
-      if (!IsLoopbackEndpoint(mgmt_listen) && !Flag(argc, argv, "--agent-insecure-http")) {
+      // On a non-loopback bind the join token + cluster secret leave the host, so
+      // require a secured channel: TLS on the API, or an explicit plaintext opt-in.
+      if (!IsLoopbackEndpoint(mgmt_listen) && !tls.enabled &&
+          !Flag(argc, argv, "--agent-insecure-http")) {
         std::fprintf(stderr,
             "samurai_master: refusing to enable agent bootstrap on a non-loopback\n"
-            "  mgmt address (%s): the management API is plaintext HTTP, so the join\n"
-            "  token and cluster secret would be exposed. Bind --management-listen to\n"
-            "  loopback behind a TLS proxy / tunnel, or pass --agent-insecure-http.\n",
+            "  mgmt address (%s) without TLS: the join token and cluster secret\n"
+            "  would travel in cleartext. Enable --mgmt-tls, bind --management-listen\n"
+            "  to loopback behind a TLS proxy / tunnel, or pass --agent-insecure-http.\n",
             mgmt_listen.c_str());
         return 2;
       }
-      if (!IsLoopbackEndpoint(mgmt_listen)) {
+      if (!IsLoopbackEndpoint(mgmt_listen) && !tls.enabled) {
         std::fprintf(stderr,
             "samurai_master: WARNING: agent bootstrap served plaintext on %s "
             "(--agent-insecure-http); join token + secret are exposed.\n",
@@ -208,9 +224,9 @@ int main(int argc, char** argv) {
       mcfg.agent_worker = Opt(argc, argv, "--agent-worker", "cpu");
       mcfg.agent_cluster_secret = cluster_secret;  // agent presents this for app-layer auth
       mcfg.agent_curve_public = curve_public;  // empty unless --curve-server-secret set
-      std::printf("samurai_master: agent bootstrap enabled (worker=%s advertise=%s curve=%s)\n",
+      std::printf("samurai_master: agent bootstrap enabled (worker=%s advertise=%s curve=%s tls=%s)\n",
                   mcfg.agent_worker.c_str(), mcfg.agent_advertise_endpoint.c_str(),
-                  curve_public.empty() ? "off" : "on");
+                  curve_public.empty() ? "off" : "on", tls.enabled ? "on" : "off");
     }
     ManagementProviders providers;
     providers.state_provider = [&servicer]() { return BuildState(&servicer); };
@@ -219,9 +235,13 @@ int main(int argc, char** argv) {
       r.set("aborted", Value::Bool(true));
       return r;
     };
-    mgmt = std::make_unique<ManagementApiServer>(mgmt_listen, mcfg, providers);
+    mgmt = std::make_unique<ManagementApiServer>(mgmt_listen, mcfg, providers, tls);
     if (mgmt->Start()) {
-      std::printf("samurai_master: management api on %s\n", mgmt->endpoint().c_str());
+      std::printf("samurai_master: management api on %s (%s)\n", mgmt->endpoint().c_str(),
+                  tls.enabled ? "https" : "http");
+    } else {
+      std::fprintf(stderr, "samurai_master: failed to start management api%s\n",
+                   tls.enabled ? " (TLS cert/key load or self-signed generation failed)" : "");
     }
   }
 

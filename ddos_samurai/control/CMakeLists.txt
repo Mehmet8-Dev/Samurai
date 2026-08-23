@@ -64,7 +64,7 @@ endif()
 
 add_library(samurai_control STATIC ${CONTROL_SOURCES})
 target_include_directories(samurai_control PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(samurai_control PUBLIC samurai_core Threads::Threads PRIVATE OpenSSL::Crypto)
+target_link_libraries(samurai_control PUBLIC samurai_core Threads::Threads PRIVATE OpenSSL::Crypto OpenSSL::SSL)
 
 if(LIBZMQ_FOUND)
   target_include_directories(samurai_control PRIVATE ${LIBZMQ_INCLUDE_DIRS})

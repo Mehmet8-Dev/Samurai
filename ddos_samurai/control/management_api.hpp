@@ -61,6 +61,17 @@ struct ManagementConfig {
   std::string agent_cluster_secret;      // cluster secret the agent presents to register (app-layer auth)
   std::string agent_dispatch_mode = "reverse";  // reverse|auto (NAT-friendly)
   std::string agent_worker = "cpu";      // dataplane worker kind the agent runs
+  std::string agent_public_scheme = "http";  // scheme used in the install-script BASE url (https when TLS on)
+  bool agent_tls_skip_verify = false;    // install script uses `curl -k` (self-signed TLS; test-only)
+};
+
+// TLS options for the management HTTP server. When enabled and cert/key paths
+// are given they are loaded (PEM); when enabled with empty paths an ephemeral
+// self-signed cert is generated at startup (zero-config for quick/secure tests).
+struct ManagementTlsConfig {
+  bool enabled = false;
+  std::string cert_path;  // PEM cert chain; empty -> self-signed
+  std::string key_path;   // PEM private key; empty -> self-signed
 };
 
 struct ManagementProviders {
@@ -104,20 +115,24 @@ bool ParseHttpRequest(const std::string& raw, HttpRequest& out);
 class ManagementApiServer {
  public:
   ManagementApiServer(const std::string& listen_addr, const ManagementConfig& cfg,
-                      ManagementProviders providers);
+                      ManagementProviders providers, ManagementTlsConfig tls = {});
   ~ManagementApiServer();
 
   bool Start();
   void Stop();
   const std::string& endpoint() const { return endpoint_; }  // resolved host:port
   bool running() const { return running_.load(); }
+  bool tls_enabled() const { return tls_.enabled; }
 
  private:
   void Loop();
+  bool InitTls();  // build ssl_ctx_ from files or a self-signed cert; false on error
 
   std::string listen_addr_;
   std::string endpoint_;
   ManagementApi api_;
+  ManagementTlsConfig tls_;
+  void* ssl_ctx_ = nullptr;  // SSL_CTX* (opaque; null when TLS disabled)
   int listen_fd_ = -1;
   std::atomic<bool> running_{false};
   std::thread thread_;

@@ -20,9 +20,13 @@
 #include <mutex>
 #include <unordered_map>
 
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/pem.h>
 #include <openssl/sha.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #include "jwt.hpp"
 
@@ -180,14 +184,18 @@ std::string SanitizeHost(const std::string& h) {
 // The POSIX-sh installer served at /v1/agent/install. It fetches the HMAC-signed
 // manifest (key = the join token the operator embedded in the curl URL), verifies
 // the signature and every binary's SHA-256, then execs the slave in reverse mode.
-std::string BuildInstallScript(const std::string& base, const std::string& token) {
+std::string BuildInstallScript(const std::string& base, const std::string& token,
+                               bool tls_skip_verify) {
+  // `-k` skips cert verification: needed only for the self-signed TLS mode (the
+  // manifest HMAC still authenticates the payload). Real certs verify normally.
+  const char* curl = tls_skip_verify ? "curl -fsSLk" : "curl -fsSL";
   std::ostringstream s;
   s << "#!/bin/sh\n"
        "set -eu\n"
        "BASE=\"" << base << "\"\n"
        "TOKEN=\"" << token << "\"\n"
        "TMP=\"$(mktemp -d)\"\n"
-       "curl -fsSL \"$BASE/v1/agent/manifest?token=$TOKEN\" -o \"$TMP/manifest\"\n"
+    << curl << " \"$BASE/v1/agent/manifest?token=$TOKEN\" -o \"$TMP/manifest\"\n"
        "SIG=\"$(head -n1 \"$TMP/manifest\" | awk '{print $2}')\"\n"
        "tail -n +2 \"$TMP/manifest\" > \"$TMP/body\"\n"
        "CALC=\"$(openssl dgst -sha256 -hmac \"$TOKEN\" \"$TMP/body\" | awk '{print $NF}')\"\n"
@@ -201,7 +209,7 @@ std::string BuildInstallScript(const std::string& base, const std::string& token
        "    cluster_secret) CS=\"$v\" ;;\n"
        "    curve_server_public) CP=\"$v\" ;;\n"
        "    blob)\n"
-       "      curl -fsSL \"$BASE/v1/agent/blob?token=$TOKEN&name=$v\" -o \"$TMP/$v\"\n"
+    << "      " << curl << " \"$BASE/v1/agent/blob?token=$TOKEN&name=$v\" -o \"$TMP/$v\"\n"
        "      echo \"$w  $TMP/$v\" | sha256sum -c - >/dev/null || "
        "{ echo \"samurai-agent: $v sha256 mismatch\" >&2; exit 1; }\n"
        "      chmod +x \"$TMP/$v\" ;;\n"
@@ -284,12 +292,13 @@ std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const 
   }
 
   if (req.path == "/v1/agent/install") {
-    const std::string base = "http://" + SanitizeHost(HeaderOr(req.headers, "host"));
+    const std::string scheme = cfg.agent_public_scheme.empty() ? "http" : cfg.agent_public_scheme;
+    const std::string base = scheme + "://" + SanitizeHost(HeaderOr(req.headers, "host"));
     HttpResponse r;
     r.status = 200;
     r.reason = "OK";
     r.content_type = "text/x-shellscript";
-    r.body = BuildInstallScript(base, cfg.agent_join_token);
+    r.body = BuildInstallScript(base, cfg.agent_join_token, cfg.agent_tls_skip_verify);
     return r;
   }
 
@@ -557,13 +566,78 @@ HttpResponse ManagementApi::Handle(const HttpRequest& req) const {
 
 ManagementApiServer::ManagementApiServer(const std::string& listen_addr,
                                          const ManagementConfig& cfg,
-                                         ManagementProviders providers)
-    : listen_addr_(Strip(listen_addr)), api_(cfg, std::move(providers)) {}
+                                         ManagementProviders providers,
+                                         ManagementTlsConfig tls)
+    : listen_addr_(Strip(listen_addr)),
+      api_(cfg, std::move(providers)),
+      tls_(std::move(tls)) {}
 
-ManagementApiServer::~ManagementApiServer() { Stop(); }
+ManagementApiServer::~ManagementApiServer() {
+  Stop();
+  if (ssl_ctx_) {
+    SSL_CTX_free(static_cast<SSL_CTX*>(ssl_ctx_));
+    ssl_ctx_ = nullptr;
+  }
+}
+
+// Generate an ephemeral RSA-2048 self-signed cert (CN=localhost, 1y) and install
+// it on `ctx`. Returns false on any OpenSSL failure. Used when TLS is enabled
+// without explicit cert/key files (zero-config secure transport for tests).
+static bool InstallSelfSignedCert(SSL_CTX* ctx) {
+  EVP_PKEY* pkey = nullptr;
+  EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+  bool ok = pctx && EVP_PKEY_keygen_init(pctx) > 0 &&
+            EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) > 0 &&
+            EVP_PKEY_keygen(pctx, &pkey) > 0;
+  if (pctx) EVP_PKEY_CTX_free(pctx);
+  if (!ok || !pkey) {
+    if (pkey) EVP_PKEY_free(pkey);
+    return false;
+  }
+  X509* x = X509_new();
+  ok = x != nullptr;
+  if (ok) {
+    ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
+    X509_gmtime_adj(X509_getm_notBefore(x), 0);
+    X509_gmtime_adj(X509_getm_notAfter(x), 60L * 60 * 24 * 365);
+    X509_set_pubkey(x, pkey);
+    X509_NAME* name = X509_get_subject_name(x);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
+    X509_set_issuer_name(x, name);  // self-signed: issuer == subject
+    ok = X509_sign(x, pkey, EVP_sha256()) > 0 &&
+         SSL_CTX_use_certificate(ctx, x) == 1 &&
+         SSL_CTX_use_PrivateKey(ctx, pkey) == 1;
+  }
+  if (x) X509_free(x);
+  EVP_PKEY_free(pkey);
+  return ok;
+}
+
+bool ManagementApiServer::InitTls() {
+  const SSL_METHOD* method = TLS_server_method();
+  SSL_CTX* ctx = SSL_CTX_new(method);
+  if (!ctx) return false;
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  bool ok = false;
+  if (!tls_.cert_path.empty() && !tls_.key_path.empty()) {
+    ok = SSL_CTX_use_certificate_chain_file(ctx, tls_.cert_path.c_str()) == 1 &&
+         SSL_CTX_use_PrivateKey_file(ctx, tls_.key_path.c_str(), SSL_FILETYPE_PEM) == 1 &&
+         SSL_CTX_check_private_key(ctx) == 1;
+  } else {
+    ok = InstallSelfSignedCert(ctx);  // ephemeral self-signed
+  }
+  if (!ok) {
+    SSL_CTX_free(ctx);
+    return false;
+  }
+  ssl_ctx_ = ctx;
+  return true;
+}
 
 bool ManagementApiServer::Start() {
   if (running_.load()) return true;
+  if (tls_.enabled && !ssl_ctx_ && !InitTls()) return false;  // cert load/gen failed
   std::string host = "127.0.0.1";
   int port = 0;
   const auto colon = listen_addr_.rfind(':');
@@ -629,11 +703,29 @@ void ManagementApiServer::Loop() {
     timeval tv{2, 0};
     ::setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    // Optional TLS: wrap the accepted fd. A failed handshake drops the conn.
+    SSL* ssl = nullptr;
+    if (ssl_ctx_) {
+      ssl = SSL_new(static_cast<SSL_CTX*>(ssl_ctx_));
+      if (!ssl || SSL_set_fd(ssl, conn) != 1 || SSL_accept(ssl) != 1) {
+        if (ssl) SSL_free(ssl);
+        ::close(conn);
+        continue;
+      }
+    }
+    auto readb = [&](char* p, int n) -> ssize_t {
+      return ssl ? SSL_read(ssl, p, n) : ::recv(conn, p, n, 0);
+    };
+    auto writeb = [&](const char* p, std::size_t n) {
+      if (ssl) SSL_write(ssl, p, static_cast<int>(n));
+      else ::send(conn, p, n, 0);
+    };
+
     // Read the request head (until CRLFCRLF), capped.
     std::string buf;
     char chunk[4096];
     while (buf.find("\r\n\r\n") == std::string::npos && buf.size() < 64 * 1024) {
-      const ssize_t n = ::recv(conn, chunk, sizeof(chunk), 0);
+      const ssize_t n = readb(chunk, sizeof(chunk));
       if (n <= 0) break;
       buf.append(chunk, static_cast<std::size_t>(n));
     }
@@ -658,7 +750,11 @@ void ManagementApiServer::Loop() {
        << "Connection: close\r\n\r\n"
        << resp.body;
     const std::string out = os.str();
-    ::send(conn, out.data(), out.size(), 0);
+    writeb(out.data(), out.size());
+    if (ssl) {
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+    }
     ::close(conn);
   }
 }

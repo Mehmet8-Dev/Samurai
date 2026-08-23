@@ -537,7 +537,27 @@ int main() {
     Check(api_off.Handle(areq("/v1/agent/manifest", {{"token", ""}})).status == 404,
           "agent: disabled without join token");
 
+    // TLS: the install-script BASE follows the advertised scheme (https).
+    ManagementConfig tcfg = cfg;
+    tcfg.agent_public_scheme = "https";
+    ManagementApi tapi(tcfg, ManagementProviders{});
+    auto tinst = tapi.Handle(areq("/v1/agent/install", {{"token", "JOINSECRET"}}));
+    Check(tinst.status == 200 && tinst.body.find("BASE=\"https://") != std::string::npos,
+          "agent: install BASE uses https when TLS advertised");
+
     (void)std::system(("rm -rf " + dir).c_str());
+  }
+
+  // --- mgmt API: TLS server starts with an ephemeral self-signed cert ---
+  {
+    ManagementTlsConfig tls;
+    tls.enabled = true;  // no cert/key -> self-signed generated at Start()
+    ManagementApiServer srv("127.0.0.1:0", ManagementConfig{}, ManagementProviders{}, tls);
+    Check(srv.Start(), "mgmt-tls: self-signed server starts");
+    Check(srv.tls_enabled(), "mgmt-tls: reports tls enabled");
+    Check(!srv.endpoint().empty(), "mgmt-tls: endpoint resolved");
+    srv.Stop();
+    Check(!srv.running(), "mgmt-tls: server stops");
   }
 
   // --- public-exposure safety: loopback endpoint classification ---
