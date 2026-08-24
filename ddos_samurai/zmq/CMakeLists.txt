@@ -72,6 +72,8 @@ add_samurai_worker(samurai_dpdk_worker daemon/dpdk_worker.cpp)
 # Tek native DPDK çekirdeği; başlık rte/Python bağımsız, kaynak SAMURAI_WITH_DPDK
 # ile kendini gate'ler (libdpdk yokken güvenli saplama derlenir).
 target_sources(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk/dpdk_core.cpp)
+# Paylaşılan userspace stateful TCP fast-path sürücüsü (rte/xdp header'ı içermez).
+target_sources(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
 target_include_directories(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk)
 target_link_libraries(samurai_dpdk_worker PRIVATE pacing_engine_static cpu_native_static samurai_l7emu pthread)
 if(DPDK_FOUND)
@@ -85,6 +87,7 @@ else()
   message(STATUS "libdpdk not found: samurai_dpdk_worker will build without native DPDK path.")
 endif()
 add_samurai_worker(samurai_afxdp_worker daemon/afxdp_worker.cpp)
+target_sources(samurai_afxdp_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
 target_link_libraries(samurai_afxdp_worker PRIVATE pacing_engine_static cpu_native_static samurai_l7emu pthread dl)
 add_samurai_worker(samurai_doca_worker daemon/doca_gpunetio_worker.cpp)
 target_link_libraries(samurai_doca_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)
@@ -98,3 +101,21 @@ target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_n
 add_samurai_worker(samurai_afpacket_worker daemon/afpacket_worker.cpp)
 target_include_directories(samurai_afpacket_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
 target_link_libraries(samurai_afpacket_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static pthread)
+
+# Paylaşılan stateful fast-path sürücüsünün in-process (NIC'siz) doğrulama testi.
+add_executable(test_stateful_fastpath
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon/test_stateful_fastpath.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
+target_include_directories(test_stateful_fastpath PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(test_stateful_fastpath PRIVATE pacing_engine_static samurai_l4 pthread)
+
+# Faz 2: gerçek run_profile_json (dpdk_direct) L7 akışını sürücü üzerinden doğrular.
+add_executable(test_stateful_fastpath_l7
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon/test_stateful_fastpath_l7.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
+target_include_directories(test_stateful_fastpath_l7 PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib
+  ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../core
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native)
+target_link_libraries(test_stateful_fastpath_l7 PRIVATE pacing_engine_static samurai_l7emu samurai_core pthread)

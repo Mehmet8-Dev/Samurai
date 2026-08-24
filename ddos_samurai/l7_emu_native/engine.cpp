@@ -571,6 +571,10 @@ void record_scenario_step_result(
   g_last_scenario_step_results.push_back(std::move(row));
 }
 
+// is_custom_tcp_backend'in tanımı ileride (parse yardımcılarıyla birlikte); burada
+// custom_tcp flow-binding yardımcıları onu kullandığından ileri bildirim gerekli.
+bool is_custom_tcp_backend(TransportBackend backend);
+
 void unregister_custom_tcp_flow_binding(NativeRuntime& runtime, uint64_t flow_id) {
   if (flow_id == 0) {
     return;
@@ -583,7 +587,7 @@ void register_custom_tcp_h1_flow_binding(
     std::size_t shard_idx,
     std::size_t lane_idx,
     H1Lane& lane) {
-  if (!lane.conn || lane.transport_backend != TransportBackend::CustomTcp) {
+  if (!lane.conn || !is_custom_tcp_backend(lane.transport_backend)) {
     return;
   }
   if (lane.conn->custom_flow_id == 0) {
@@ -621,7 +625,7 @@ NativeRuntime::CustomTcpFlowBinding* find_custom_tcp_flow_binding(
   if (it->second.kind == ReactorLaneKind::H1) {
     H1Lane* lane = it->second.h1_lane;
     if (lane == nullptr || !lane->conn ||
-        lane->transport_backend != TransportBackend::CustomTcp ||
+        !is_custom_tcp_backend(lane->transport_backend) ||
         lane->conn->custom_flow_id != flow_id) {
       runtime.custom_tcp_flow_registry.erase(it);
       return nullptr;
@@ -1961,7 +1965,10 @@ void service_all_ready_lanes(NativeRuntime& runtime, const Profile& profile, int
 }
 
 void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
-  if (parse_transport_backend(profile) != TransportBackend::CustomTcp) {
+  // Both CustomTcp (engine owns the wire) and DpdkDirect (an external fast-path
+  // driver owns the NIC) ride the same tcpdp bridge, so both must have their
+  // lanes serviced -- otherwise DpdkDirect never delivers RX payloads/completions.
+  if (!is_custom_tcp_backend(parse_transport_backend(profile))) {
     return;
   }
   uint32_t actions = 0;
@@ -2049,7 +2056,10 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
     auto& local_shard = runtime.local_shards[shard_idx];
     for (std::size_t lane_idx = 0; lane_idx < local_shard.h1_lanes.size(); ++lane_idx) {
       auto& lane_ptr = local_shard.h1_lanes[lane_idx];
-      if (!lane_ptr || lane_ptr->transport_backend != TransportBackend::CustomTcp || !lane_ptr->conn) {
+      // CustomTcp (engine owns wire) ve DpdkDirect (harici fast-path sürücüsü wire
+      // sahibi) aynı tcpdp bridge'i kullanır; her ikisinde de H1 write/read adımları
+      // koşmalı (enqueue_send / read_buffer). Aksi halde DpdkDirect'te HTTP ilerlemez.
+      if (!lane_ptr || !is_custom_tcp_backend(lane_ptr->transport_backend) || !lane_ptr->conn) {
         continue;
       }
       H1Lane& lane = *lane_ptr;
@@ -2512,21 +2522,30 @@ std::map<std::string, double> run_http2_custom_tcp_profile(
     return -1;
   };
 
+  // Under DpdkDirect an external fast-path driver owns the NIC wire and is the
+  // sole TX-ring drainer; this engine must NOT peek/consume TX here (that would
+  // race the driver on tcpdp's single tx_mu_). It still polls + collects so
+  // completions/RX payloads advance the H2 state machine.
+  const bool is_external_wire =
+      parse_transport_backend(profile) == TransportBackend::DpdkDirect;
+
   for (int step = 0; step < 64 && sent < attempted; ++step) {
     uint32_t actions = 0;
     (void)tcpdp_poll(0, 2048, &actions);
 
-    const uint8_t* tx_base = nullptr;
-    uint32_t tx_count = 0;
-    size_t tx_packet_size = 0;
-    size_t tx_stride = 0;
-    if (tcpdp_peek_tx_packets_strided(0, &tx_base, &tx_count, &tx_packet_size, &tx_stride) == 0) {
-      uint32_t consumed = 0;
-      if (tx_base != nullptr && tx_count > 0 && tx_packet_size > 0) {
-        tx_bytes += static_cast<uint64_t>(tx_packet_size) * static_cast<uint64_t>(tx_count);
-        (void)tcpdp_consume_tx_packets(tx_count, &consumed);
-      } else {
-        (void)tcpdp_consume_tx_packets(2048, &consumed);
+    if (!is_external_wire) {
+      const uint8_t* tx_base = nullptr;
+      uint32_t tx_count = 0;
+      size_t tx_packet_size = 0;
+      size_t tx_stride = 0;
+      if (tcpdp_peek_tx_packets_strided(0, &tx_base, &tx_count, &tx_packet_size, &tx_stride) == 0) {
+        uint32_t consumed = 0;
+        if (tx_base != nullptr && tx_count > 0 && tx_packet_size > 0) {
+          tx_bytes += static_cast<uint64_t>(tx_packet_size) * static_cast<uint64_t>(tx_count);
+          (void)tcpdp_consume_tx_packets(tx_count, &consumed);
+        } else {
+          (void)tcpdp_consume_tx_packets(2048, &consumed);
+        }
       }
     }
 
@@ -4607,7 +4626,8 @@ std::map<std::string, double> run_http2_profile(
     collect_all_h2_stats();
     bool made_progress = false;
     while (true) {
-      auto ready_completion = pop_ready_completion(runtime, 0);
+      // Tüm shard'ların kuyruklarını boşalt (H1 ile aynı çok-shard finalize nedeni).
+      auto ready_completion = pop_ready_completion_any(runtime);
       if (!ready_completion.has_value()) {
         break;
       }
@@ -5064,7 +5084,10 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
 
       lane.conn->read_buffer.clear();
       lane.conn->idle_deadline_ms = 0;
-      if (lane.transport_backend == TransportBackend::CustomTcp) {
+      // CustomTcp ve DpdkDirect (harici fast-path wire sahibi) aynı tcpdp bridge'i
+      // kullanır; her ikisinde de flow binding kaydı gerekir, aksi halde connect
+      // completion / RX payload lane'e maplanamaz ve istek hiç gönderilemez.
+      if (is_custom_tcp_backend(lane.transport_backend)) {
         register_custom_tcp_h1_flow_binding(runtime, shard_idx, lane_idx, lane);
       }
       sync_h1_lane_state(lane, profile);
@@ -5285,7 +5308,11 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
 
     bool made_progress = false;
     while (true) {
-      auto ready_completion = pop_ready_completion(runtime, 0);
+      // Tüm shard'ların completion kuyruklarını boşalt. concurrency>1'de
+      // shard_count = min(concurrency, max_connections) > 1 olur; yalnız shard 0'ı
+      // pop etmek diğer shard'ların tamamlanan lane'lerini finalize edilmeden bırakır
+      // (çok-lane L7/dpdk_direct'te sent düşük, errors yüksek görünürdü).
+      auto ready_completion = pop_ready_completion_any(runtime);
       if (!ready_completion.has_value()) {
         break;
       }

@@ -32,6 +32,11 @@
 // gerçek DPDK mantığı dpdk_core.cpp içinde SAMURAI_WITH_DPDK ile koşullanmıştır.
 #include "dpdk/dpdk_core.hpp"
 
+// Paylaşılan userspace stateful TCP fast-path sürücüsü (DPDK/XDP ortak yolu).
+#include "stateful_fastpath.hpp"
+// L7 profil/runner kurucusu (run_profile_json'u dpdk_direct transport ile sürer).
+#include "stateful_l7_profile.hpp"
+
 namespace {
 using samurai::daemon::OptionalIntFromWire;
 using samurai::daemon::SendFrame;
@@ -40,6 +45,7 @@ using samurai::daemon::JsonError;
 using samurai::daemon::PacingFromEnvelope;
 using samurai::daemon::ReadFixed;
 using samurai::daemon::SerializeSnapshot;
+using samurai::daemon::SerializeSnapshotV2;
 
 using ddos_samurai::cpu_native::PacketConfig;
 using ddos_samurai::cpu_native::SpoofOptions;
@@ -65,6 +71,155 @@ struct DpdkPortGuard {
     }
   }
 };
+
+// DPDK taşıma shim'i: paylaşılan StatefulFastpathDriver'ın byte-oriented Send/Recv
+// arayüzünü dpdk_core üzerine oturtur. Portu RX etkin (num_rx_queues=1) açar; RAII
+// ile teardown eder. tcpdp strided peek'te psize==stride olduğundan send_batch
+// birebir uyar; güvenlik için stride!=psize durumunda per-paket tx_burst yapılır.
+struct DpdkShim : samurai::daemon::FastpathTxRxShim {
+  std::int64_t handle{-1};
+  std::uint16_t queue{0};
+  std::string open_err;
+
+  DpdkShim(std::uint16_t port_id, std::uint16_t queue_id, const std::string& eal_args) {
+    samurai::dpdk::OpenConfig cfg{};
+    cfg.port_id = port_id;
+    cfg.num_tx_queues = 1;
+    cfg.num_rx_queues = 1;  // stateful: SYN-ACK'leri almak için RX şart
+    cfg.enable_rss = false;
+    cfg.burst_size = 64;
+    cfg.mempool_size = 8192u;
+    cfg.eal_args = eal_args;
+    handle = samurai::dpdk::open_port(cfg, open_err);
+    queue = queue_id;
+  }
+  ~DpdkShim() override {
+    if (handle >= 0) samurai::dpdk::close_port(handle);
+  }
+  bool ok() const { return handle >= 0; }
+
+  int Send(const std::uint8_t* base, std::size_t psize, std::size_t stride,
+           std::uint32_t count, std::string& err) override {
+    (void)err;
+    if (psize == 0) return 0;
+    if (stride == psize) {
+      const auto r = samurai::dpdk::send_batch(
+          handle, queue, base, static_cast<std::uint16_t>(psize), count);
+      return static_cast<int>(r.sent);
+    }
+    std::uint32_t sent = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+      const auto r = samurai::dpdk::tx_burst(
+          handle, queue, base + static_cast<std::size_t>(i) * stride,
+          static_cast<std::uint16_t>(psize), 1);
+      if (r.sent == 0) break;
+      ++sent;
+    }
+    return static_cast<int>(sent);
+  }
+  int Recv(std::uint8_t* out, std::uint16_t stride, std::uint16_t* lens,
+           std::uint16_t max, std::string& err) override {
+    (void)err;
+    return samurai::dpdk::poll_rx(handle, queue, max, out, stride, lens);
+  }
+  bool RxAvailable() const override { return true; }
+};
+
+// Stateful fast-path job'unu koşar: portu açar, tcpdp'yi yapılandırır, L4 connect'leri
+// seed eder, ortak sürücü loop'unu çalıştırır ve nihai METRIC_SNAPSHOT + JOB_DONE
+// yayınlar. Blast (stateless) yolu değişmeden kalır — bu yalnız stateful branch'tir.
+inline void RunDpdkStatefulJob(
+    void* push,
+    const samurai::wire::SamuraiWireHeaderV1& header,
+    const std::string& job_id,
+    const samurai::wire::JobEnvelopeV2& env2,
+    int cli_port_id,
+    int cli_queue_id,
+    const std::string& cli_eal_args) {
+  const samurai::wire::JobEnvelopeV1& env = env2.base;
+  const std::uint16_t port_id = static_cast<std::uint16_t>(std::max(0,
+      cli_port_id >= 0 ? cli_port_id
+                       : (std::getenv("SAMURAI_DPDK_PORT_ID")
+                              ? std::atoi(std::getenv("SAMURAI_DPDK_PORT_ID"))
+                              : 0)));
+  const std::uint16_t queue_id = static_cast<std::uint16_t>(std::max(0,
+      cli_queue_id >= 0 ? cli_queue_id : static_cast<int>(env.xdp_queue_id)));
+  std::string eal_args = cli_eal_args;
+  if (eal_args.empty()) {
+    const char* p = std::getenv("SAMURAI_DPDK_EAL_ARGS");
+    if (p) eal_args = p;
+  }
+
+  std::string err;
+  if (!samurai::dpdk::ensure_eal(eal_args, err)) {
+    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                    header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
+    return;
+  }
+
+  DpdkShim shim(port_id, queue_id, eal_args);
+  if (!shim.ok()) {
+    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                    header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
+                    JsonError(shim.open_err.empty() ? "dpdk_open_port_failed" : shim.open_err));
+    return;
+  }
+
+  samurai::daemon::FastpathParams params =
+      samurai::daemon::FastpathParamsFromEnvelope(env);
+  params.backend = "dpdk";
+
+  samurai::daemon::StatefulFastpathDriver driver(shim);
+
+  samurai::daemon::FastpathHooks hooks;
+  hooks.emit_heartbeat = [&]() {
+    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
+                    header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id);
+  };
+  hooks.emit_metric = [&](const samurai::wire::MetricSnapshotV2& snap) {
+    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
+                    header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
+                    SerializeSnapshotV2(snap));
+  };
+
+  std::atomic<bool> stop{false};
+  const bool l7 = samurai::daemon::JobWantsL7Fastpath(env);
+  samurai::daemon::L7RunnerBundle l7b;
+  samurai::daemon::FastpathResult res;
+  if (l7) {
+    // L7: run_profile_json (dpdk_direct) kendi connect'lerini açar; SeedL4 yok.
+    // tcpdp yapılandırmasını da configure_custom_tcp_bridge yapar; driver.Configure yok.
+    l7b = samurai::daemon::MakeL7Runner(env2, "dpdk_direct");
+    res = driver.Run(params, l7b.runner, stop, hooks);
+  } else {
+    // Pure L4: driver tcpdp'yi yapılandırır ve connect'leri seed eder.
+    if (!driver.Configure(params, err)) {
+      (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                      header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
+      return;
+    }
+    driver.SeedL4(params);
+    res = driver.Run(params, {}, stop, hooks);
+  }
+
+  samurai::core::json::Value done = samurai::core::json::Value::Object();
+  done.set("status", samurai::core::json::Value::Str("ok"));
+  done.set("mode", samurai::core::json::Value::Str(l7 ? "stateful_fastpath_l7" : "stateful_fastpath"));
+  if (l7 && l7b.result) done.set("l7", *l7b.result);
+  done.set("job_id", samurai::core::json::Value::Str(job_id));
+  done.set("tx_packets", samurai::core::json::Value::Int(static_cast<int64_t>(res.tx_packets)));
+  done.set("rx_frames", samurai::core::json::Value::Int(static_cast<int64_t>(res.rx_frames)));
+  done.set("connect_attempts", samurai::core::json::Value::Int(static_cast<int64_t>(res.connect_attempts)));
+  done.set("connect_established", samurai::core::json::Value::Int(static_cast<int64_t>(res.connect_established)));
+  done.set("retransmit_count", samurai::core::json::Value::Int(static_cast<int64_t>(res.retransmit_count)));
+  done.set("retransmit_exhausted", samurai::core::json::Value::Int(static_cast<int64_t>(res.retransmit_exhausted)));
+  done.set("connect_timeout", samurai::core::json::Value::Int(static_cast<int64_t>(res.connect_timeout)));
+  done.set("rx_available", samurai::core::json::Value::Bool(res.rx_available));
+  const std::string done_str = done.dump();
+  (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
+                  header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
+                  std::vector<std::uint8_t>(done_str.begin(), done_str.end()));
+}
 
 // Tek bir TX kuyruğuna adanmış worker thread durumu (K4 multi-queue).
 struct TxWorkerThread {
@@ -232,7 +387,15 @@ int main(int argc, char** argv) {
     }
 
     if (msg_type == samurai::wire::MessageType::START_JOB) {
-      if (payload_len != sizeof(samurai::wire::JobEnvelopeV1) || header.payload_len != sizeof(samurai::wire::JobEnvelopeV1)) {
+      // V1 (blast) veya V2 (stateful/L7 knob'ları) kabul edilir; env V1 tabanıdır ve
+      // V2 payload'unda V1 offset 0'da gömülüdür, bu yüzden V1 prefix'i memcpy yeterli.
+      const bool env_is_v1 =
+          payload_len == sizeof(samurai::wire::JobEnvelopeV1) &&
+          header.payload_len == sizeof(samurai::wire::JobEnvelopeV1);
+      const bool env_is_v2 =
+          payload_len == sizeof(samurai::wire::JobEnvelopeV2) &&
+          header.payload_len == sizeof(samurai::wire::JobEnvelopeV2);
+      if (!env_is_v1 && !env_is_v2) {
         (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR), header.correlation_id,
                         samurai::wire::WorkerKind::DPDK, job_id, JsonError("job_envelope_size_mismatch"));
         zmq_msg_close(&msg);
@@ -240,6 +403,13 @@ int main(int argc, char** argv) {
       }
       samurai::wire::JobEnvelopeV1 env{};
       std::memcpy(&env, payload_ptr, sizeof(env));
+      // V2 tail'i (varsa) mesaj kapatılmadan önce yakala (payload_ptr sonra geçersiz olur).
+      samurai::wire::JobEnvelopeV2 env2{};
+      if (env_is_v2) {
+        std::memcpy(&env2, payload_ptr, sizeof(env2));
+      } else {
+        env2.base = env;
+      }
       (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK), header.correlation_id,
                       samurai::wire::WorkerKind::DPDK, job_id);
       zmq_msg_close(&msg);
@@ -249,6 +419,12 @@ int main(int argc, char** argv) {
                       samurai::wire::WorkerKind::DPDK, job_id, JsonError("dpdk_not_built"));
       continue;
 #else
+      // Stateful userspace TCP fast-path (protocol=custom_tcp / attack_vector=stateful):
+      // NIC'i sahiplenip TcpDataplaneCore'u koşar. Stateless blast yolu değişmez.
+      if (samurai::daemon::IsStatefulFastpathJob(env)) {
+        RunDpdkStatefulJob(push, header, job_id, env2, cli_port_id, cli_queue_id, cli_eal_args);
+        continue;
+      }
       try {
         PacketConfig cfg = ConfigFromEnvelope(env);
         const int packet_count = std::max(1, static_cast<int>(env.packet_count));
