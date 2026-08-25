@@ -56,7 +56,8 @@ void Usage(const char* argv0) {
       "                            direct StartShard/StopShard/Probe RPCs\n"
       "  --worker-id ID            worker id (default: hostname)\n"
       "  --worker-region R         worker region capability\n"
-      "  --worker NAME             dataplane worker kind (default: cpu)\n"
+      "  --worker NAME             dataplane worker kind, or 'bundle' to hold all\n"
+      "                            binaries and pick per shard (default: cpu)\n"
       "  --worker-dir DIR          directory with the worker binaries (default: .)\n"
       "  --heartbeat-interval-ms N (default 2000)\n"
       "  --register-timeout-s N    (default 10)\n"
@@ -80,7 +81,10 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string worker_kind = Opt(argc, argv, "--worker", "cpu");
-  const auto entry = samurai::orchestrator::LookupWorker(worker_kind);
+  // Bundle: the node holds every worker binary and resolves the flavor per shard
+  // from the job's `worker` field; a fixed kind runs that one flavor for all shards.
+  const bool bundle = samurai::orchestrator::IsBundleWorkerName(worker_kind);
+  const auto entry = samurai::orchestrator::LookupWorker(bundle ? "cpu" : worker_kind);
   if (!entry) {
     std::fprintf(stderr, "samurai_slave: unknown worker kind: %s\n", worker_kind.c_str());
     return 2;
@@ -120,7 +124,10 @@ int main(int argc, char** argv) {
   }
 
   // Worker-side control service (+ inbound control server only in direct mode).
-  SupervisorShardRunner runner(*entry, worker_dir);
+  // Bundle resolves the worker binary per shard (fallback = cpu); fixed runs one.
+  SupervisorShardRunner runner =
+      bundle ? SupervisorShardRunner(worker_dir, *entry)
+             : SupervisorShardRunner(*entry, worker_dir);
   WorkerShardService service(worker_id, &runner);
   AuthConfig auth;
   auth.expected_secret = cluster_secret;  // require the secret if set
@@ -172,6 +179,18 @@ int main(int argc, char** argv) {
   }
   if (!region.empty()) cfg.capabilities["region"] = region;
   if (!tenant.empty()) cfg.capabilities["tenant_namespace"] = tenant;
+  // Advertise which worker flavors this node can run so the master only dispatches
+  // matching shards. Bundle nodes list the whole catalog; fixed nodes list one.
+  if (bundle) {
+    std::string kinds;
+    for (const auto& e : samurai::orchestrator::kWorkerTable) {
+      if (!kinds.empty()) kinds += ",";
+      kinds += e.name;
+    }
+    cfg.capabilities["worker_kinds"] = kinds;
+  } else {
+    cfg.capabilities["worker_kinds"] = worker_kind;
+  }
   cfg.register_timeout_s = static_cast<int>(OptInt(argc, argv, "--register-timeout-s", 10));
   // Auto-tune: reverse/auto workers pull work on the heartbeat, so default to a
   // tighter interval for low dispatch latency (still overridable).

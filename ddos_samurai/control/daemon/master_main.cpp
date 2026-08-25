@@ -62,6 +62,8 @@ void Usage(const char* argv0) {
       "  --port N                  target port (default 80)\n"
       "  --protocol P              l4 protocol (default udp)\n"
       "  --size N                  packet size (default 64)\n"
+      "  --worker NAME             worker flavor this job needs (default cpu); only\n"
+      "                            dispatched to workers advertising that kind\n"
       "  --shard-unit-count N      packets per shard (0 = auto)\n"
       "  --job-timeout-s N         wait cap for the job (default 120)\n"
       "  --poll-interval-ms N      master dispatch poll (default 250)\n"
@@ -77,7 +79,8 @@ void Usage(const char* argv0) {
       "  --agent-artifact-dir DIR  dir with samurai_slave + worker binaries to serve\n"
       "  --agent-advertise EP      public control endpoint agents connect to\n"
       "                            (default: --control-listen value)\n"
-      "  --agent-worker NAME       worker kind agents run (default cpu)\n"
+      "  --agent-worker NAME       worker kind agents run, or 'bundle' to ship all\n"
+      "                            worker binaries and pick per shard (default cpu)\n"
       "  --agent-dispatch-mode M   reverse | auto for agents (default reverse)\n"
       "  --agent-insecure-http     allow agent bootstrap on a non-loopback mgmt\n"
       "                            bind (join token + secret sent in cleartext)\n"
@@ -281,6 +284,10 @@ int main(int argc, char** argv) {
   job.base_args.set("port", Value::Int(OptInt(argc, argv, "--port", 80)));
   job.base_args.set("protocol", Value::Str(Opt(argc, argv, "--protocol", "udp")));
   job.base_args.set("size", Value::Int(OptInt(argc, argv, "--size", 64)));
+  // Declare the worker flavor this job needs. Bundle slaves resolve their worker
+  // binary per shard from this field; the coordinator only dispatches shards to
+  // workers whose advertised worker_kinds include it (see WorkerDispatchScore).
+  job.base_args.set("worker", Value::Str(Opt(argc, argv, "--worker", "cpu")));
 
   const JobResult res = coord.RunSingleJob(job, "job-1", [&elector]() {
     return !elector || elector->IsLeader();

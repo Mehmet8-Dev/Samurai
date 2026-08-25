@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -46,15 +47,27 @@ class SupervisorShardRun : public samurai::control::ShardRun {
 
 class SupervisorShardRunner : public samurai::control::ShardRunner {
  public:
+  // Fixed-flavor: every shard runs `worker`.
   SupervisorShardRunner(samurai::orchestrator::WorkerEntry worker, std::string worker_dir)
-      : worker_(worker), worker_dir_(std::move(worker_dir)) {}
+      : fixed_(worker), worker_dir_(std::move(worker_dir)) {}
+
+  // Bundle: resolve the worker binary per shard from the job's `worker` field
+  // (falls back to `fallback` when the field is missing or unknown). The node is
+  // expected to hold every worker binary in `worker_dir`.
+  SupervisorShardRunner(std::string worker_dir, samurai::orchestrator::WorkerEntry fallback)
+      : fallback_(fallback), worker_dir_(std::move(worker_dir)), bundle_(true) {}
 
   std::shared_ptr<samurai::control::ShardRun> Start(
       const std::string& shard_id, const samurai::core::json::Value& args) override;
 
  private:
-  samurai::orchestrator::WorkerEntry worker_;
+  // Which worker binary to spawn for this shard's args (bundle: from args).
+  samurai::orchestrator::WorkerEntry ResolveWorker(const samurai::core::json::Value& args) const;
+
+  samurai::orchestrator::WorkerEntry fixed_{};     // used when !bundle_
+  samurai::orchestrator::WorkerEntry fallback_{};  // used in bundle_ when unresolved
   std::string worker_dir_;
+  bool bundle_ = false;
 };
 
 }  // namespace samurai::control::daemon

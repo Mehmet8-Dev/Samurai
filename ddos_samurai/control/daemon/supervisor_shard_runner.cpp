@@ -78,10 +78,25 @@ void SupervisorShardRun::Join() {
   if (thread_.joinable()) thread_.join();
 }
 
+samurai::orchestrator::WorkerEntry SupervisorShardRunner::ResolveWorker(
+    const samurai::core::json::Value& args) const {
+  if (!bundle_) {
+    return fixed_;
+  }
+  // Bundle: the job's `worker` field names the flavor for this shard.
+  const std::string name = StrArg(args, "worker", "");
+  if (!name.empty()) {
+    if (auto e = samurai::orchestrator::LookupWorker(name); e) {
+      return *e;
+    }
+  }
+  return fallback_;
+}
+
 std::shared_ptr<samurai::control::ShardRun> SupervisorShardRunner::Start(
     const std::string& shard_id, const samurai::core::json::Value& args) {
   samurai::orchestrator::SupervisorConfig cfg;
-  cfg.worker = worker_;
+  cfg.worker = ResolveWorker(args);
   cfg.worker_dir = worker_dir_;
   const std::string suffix = shard_id + "_" + std::to_string(static_cast<long>(::getpid()));
   cfg.jobs_endpoint = "ipc:///tmp/samurai_jobs_" + suffix;

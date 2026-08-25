@@ -29,6 +29,7 @@
 #include <openssl/x509.h>
 
 #include "jwt.hpp"
+#include "worker_registry.hpp"  // orchestrator::kWorkerTable / IsBundleWorkerName
 
 namespace samurai::control {
 
@@ -239,14 +240,32 @@ std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const 
 
   const std::string worker = cfg.agent_worker.empty() ? std::string("cpu") : cfg.agent_worker;
   const std::string slave_bin = "samurai_slave";
-  const std::string worker_bin = "samurai_" + worker + "_worker";
   const std::string art = cfg.agent_artifact_dir;
+  const bool bundle = samurai::orchestrator::IsBundleWorkerName(worker);
+
+  // The worker binaries this agent join serves. Bundle ships every catalog binary
+  // present in the artifact dir (per-shard resolution on the slave); a fixed kind
+  // ships exactly one. Used by both the manifest (blob list) and the blob gate.
+  auto served_worker_bins = [&]() {
+    std::vector<std::string> bins;
+    if (bundle) {
+      for (const auto& e : samurai::orchestrator::kWorkerTable) {
+        std::string bytes;
+        if (ReadFileBytes(art + "/" + e.binary, bytes)) bins.emplace_back(e.binary);
+      }
+    } else {
+      bins.push_back("samurai_" + worker + "_worker");
+    }
+    return bins;
+  };
 
   if (req.path == "/v1/agent/manifest") {
     std::string slave_bytes;
-    std::string worker_bytes;
-    if (art.empty() || !ReadFileBytes(art + "/" + slave_bin, slave_bytes) ||
-        !ReadFileBytes(art + "/" + worker_bin, worker_bytes)) {
+    if (art.empty() || !ReadFileBytes(art + "/" + slave_bin, slave_bytes)) {
+      return ErrResp(500, "Internal Server Error", "agent_artifacts_unavailable");
+    }
+    const std::vector<std::string> worker_bins = served_worker_bins();
+    if (worker_bins.empty()) {
       return ErrResp(500, "Internal Server Error", "agent_artifacts_unavailable");
     }
     // Whitespace-delimited "key value" lines so the installer can parse them with
@@ -261,8 +280,14 @@ std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const 
     if (!cfg.agent_curve_public.empty()) {
       body << "curve_server_public " << cfg.agent_curve_public << "\n";
     }
-    body << "blob " << slave_bin << " " << Sha256Hex(slave_bytes) << "\n"
-         << "blob " << worker_bin << " " << Sha256Hex(worker_bytes) << "\n";
+    body << "blob " << slave_bin << " " << Sha256Hex(slave_bytes) << "\n";
+    for (const std::string& wb : worker_bins) {
+      std::string wbytes;
+      if (!ReadFileBytes(art + "/" + wb, wbytes)) {
+        return ErrResp(500, "Internal Server Error", "agent_artifacts_unavailable");
+      }
+      body << "blob " << wb << " " << Sha256Hex(wbytes) << "\n";
+    }
     const std::string b = body.str();
     HttpResponse r;
     r.status = 200;
@@ -276,7 +301,13 @@ std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const 
     std::string name;
     auto nit = req.query.find("name");
     if (nit != req.query.end()) name = nit->second;
-    if (!SafeBlobName(name) || (name != slave_bin && name != worker_bin)) {
+    bool allowed = name == slave_bin;
+    if (!allowed) {
+      for (const std::string& wb : served_worker_bins()) {
+        if (name == wb) { allowed = true; break; }
+      }
+    }
+    if (!SafeBlobName(name) || !allowed) {
       return ErrResp(400, "Bad Request", "agent_bad_blob");
     }
     std::string bytes;

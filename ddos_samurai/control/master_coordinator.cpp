@@ -65,6 +65,27 @@ bool CapFlag(const std::map<std::string, std::string>& caps, const std::string& 
   return v == "1" || v == "true" || v == "yes";
 }
 
+// True if the worker can run the job's required worker flavor. `required` empty
+// (job declared no kind) always matches. A worker that doesn't advertise
+// `worker_kinds` (legacy) is treated as a wildcard so old workers keep working;
+// otherwise the required kind must be in its comma-separated list (bundle nodes
+// list the whole catalog).
+bool WorkerRunsKind(const std::map<std::string, std::string>& caps, const std::string& required) {
+  if (required.empty()) return true;
+  const std::string* kinds = CapPtr(caps, "worker_kinds");
+  if (kinds == nullptr) return true;
+  std::size_t pos = 0;
+  const std::string& list = *kinds;
+  while (pos <= list.size()) {
+    const std::size_t comma = list.find(',', pos);
+    const std::size_t end = comma == std::string::npos ? list.size() : comma;
+    if (Lower(Strip(list.substr(pos, end - pos))) == required) return true;
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+  return false;
+}
+
 double WorkerDispatchScore(const std::map<std::string, std::string>& caps, const Shard& sh,
                            const std::string& target_region, bool region_aware) {
   double score = 0.0;
@@ -124,6 +145,13 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
   const std::string target_region = Lower(Strip(job.target_region));
   const std::string master_region = Lower(Strip(job.worker_region));
   const int poll_ms = std::max(1, job.master_poll_interval_ms);
+  // Worker flavor this job needs (from base_args["worker"]); shards only go to
+  // workers advertising it. Empty (or a legacy worker with no worker_kinds cap)
+  // disables the filter for backward compatibility.
+  const std::string required_kind = [&]() -> std::string {
+    const Value* w = job.base_args.is_object() ? job.base_args.find("worker") : nullptr;
+    return (w != nullptr && w->is_string()) ? Lower(Strip(w->as_string(""))) : std::string();
+  }();
 
   auto load_workers = [&]() {
     std::map<std::string, WorkerInfo> m;
@@ -304,6 +332,8 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     for (const auto& kv : workers) {
       if (lost_workers.count(kv.first)) continue;
       if (inflight_by_worker.count(kv.first)) continue;
+      // Skip workers that can't run this job's flavor (bundle nodes match all).
+      if (!WorkerRunsKind(kv.second.capabilities, required_kind)) continue;
       // Direct workers advertise a control_endpoint; reverse workers advertise
       // none but are reachable via the heartbeat pull path.
       if (!endpoint_of(workers, kv.first).empty() || is_reverse(workers, kv.first))

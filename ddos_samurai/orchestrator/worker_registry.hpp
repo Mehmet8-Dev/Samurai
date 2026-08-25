@@ -61,4 +61,13 @@ inline const char* WorkerName(samurai::wire::WorkerKind kind) {
   return "unknown";
 }
 
+// Sentinel worker kind for a "bundle" slave/agent: instead of one fixed flavor
+// the node carries every worker binary and resolves the right one per shard from
+// the job's `worker` field. Not a real WorkerKind — recognized by name only.
+inline constexpr const char* kBundleWorkerName = "bundle";
+
+inline bool IsBundleWorkerName(const std::string& name) {
+  return name == kBundleWorkerName;
+}
+
 }  // namespace samurai::orchestrator

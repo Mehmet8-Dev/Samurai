@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <map>
 #include <numeric>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -546,6 +547,134 @@ int main() {
           "agent: install BASE uses https when TLS advertised");
 
     (void)std::system(("rm -rf " + dir).c_str());
+  }
+
+  // --- agent bootstrap: bundle mode ships every present worker binary ---
+  {
+    const std::string dir = "/tmp/samurai_agent_bundle_test";
+    (void)std::system(("rm -rf " + dir + " && mkdir -p " + dir).c_str());
+    // Slave + a subset of the catalog present; dpdk/doca deliberately absent to
+    // prove the manifest only advertises binaries that actually exist.
+    const std::string slave_c = std::string("SLAVE\x01", 6);
+    const std::string cpu_c = std::string("CPU\x02", 4);
+    const std::string scen_c = std::string("SCEN\x03", 5);
+    const std::string l7_c = std::string("L7\x04", 3);
+    { std::ofstream f(dir + "/samurai_slave", std::ios::binary); f << slave_c; }
+    { std::ofstream f(dir + "/samurai_cpu_worker", std::ios::binary); f << cpu_c; }
+    { std::ofstream f(dir + "/samurai_scenario_worker", std::ios::binary); f << scen_c; }
+    { std::ofstream f(dir + "/samurai_l7_worker", std::ios::binary); f << l7_c; }
+
+    auto hexof = [](const unsigned char* p, std::size_t n) {
+      static const char* k = "0123456789abcdef";
+      std::string o;
+      for (std::size_t i = 0; i < n; ++i) { o.push_back(k[p[i] >> 4]); o.push_back(k[p[i] & 15]); }
+      return o;
+    };
+    auto sha = [&](const std::string& d) {
+      unsigned char m[SHA256_DIGEST_LENGTH];
+      SHA256(reinterpret_cast<const unsigned char*>(d.data()), d.size(), m);
+      return hexof(m, SHA256_DIGEST_LENGTH);
+    };
+
+    ManagementConfig cfg;
+    cfg.agent_join_token = "JOINSECRET";
+    cfg.agent_artifact_dir = dir;
+    cfg.agent_advertise_endpoint = "tcp://master.example:5099";
+    cfg.agent_worker = "bundle";
+    ManagementApi api(cfg, ManagementProviders{});
+    auto areq = [](const std::string& path, std::map<std::string, std::string> q) {
+      HttpRequest r;
+      r.method = "GET"; r.path = path; r.query = std::move(q);
+      r.headers["host"] = "master.example:8089";
+      return r;
+    };
+
+    auto man = api.Handle(areq("/v1/agent/manifest", {{"token", "JOINSECRET"}}));
+    Check(man.status == 200, "agent-bundle: manifest served");
+    const std::string body = man.body.substr(man.body.find('\n') + 1);
+    Check(body.find("worker bundle") != std::string::npos, "agent-bundle: worker=bundle advertised");
+    Check(body.find("blob samurai_cpu_worker " + sha(cpu_c)) != std::string::npos &&
+              body.find("blob samurai_scenario_worker " + sha(scen_c)) != std::string::npos &&
+              body.find("blob samurai_l7_worker " + sha(l7_c)) != std::string::npos,
+          "agent-bundle: every present worker binary pinned");
+    Check(body.find("samurai_dpdk_worker") == std::string::npos,
+          "agent-bundle: absent worker binary not advertised");
+    // Any present catalog binary is fetchable; absent/unknown ones are rejected.
+    Check(api.Handle(areq("/v1/agent/blob",
+                          {{"token", "JOINSECRET"}, {"name", "samurai_scenario_worker"}})).status == 200,
+          "agent-bundle: scenario blob served");
+    Check(api.Handle(areq("/v1/agent/blob",
+                          {{"token", "JOINSECRET"}, {"name", "samurai_dpdk_worker"}})).status == 400,
+          "agent-bundle: absent worker blob rejected");
+    (void)std::system(("rm -rf " + dir).c_str());
+  }
+
+  // --- master: coordinator only dispatches shards to matching worker kinds ---
+  {
+    namespace json = samurai::core::json;
+    struct FakeView : MasterView {
+      std::map<std::string, WorkerInfo> workers;
+      std::map<std::string, std::string> stats;
+      std::vector<WorkerInfo> Workers() override {
+        std::vector<WorkerInfo> out;
+        for (auto& kv : workers) out.push_back(kv.second);
+        return out;
+      }
+      bool ShardReported(const std::string& sid) override { return stats.count(sid) > 0; }
+      std::string GetShardStats(const std::string& sid) override {
+        auto it = stats.find(sid);
+        return it == stats.end() ? std::string("{}") : it->second;
+      }
+      void SetShardStats(const std::string& sid, const std::string& js) override { stats[sid] = js; }
+    };
+    struct FakeCmd : WorkerCommander {
+      FakeView* view = nullptr;
+      std::set<std::string> dispatched_eps;
+      DispatchOutcome Dispatch(const std::string& ep, const std::string& sid, const std::string&,
+                               const std::string&, std::int64_t count, std::int64_t) override {
+        dispatched_eps.insert(ep);
+        json::Value s = json::Value::Object();
+        s.set("shard_id", json::Value::Str(sid));
+        s.set("sent", json::Value::Int(count));
+        s.set("errors", json::Value::Int(0));
+        view->SetShardStats(sid, s.dump());
+        return {true, "ok"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override { return {"done", "", "{}"}; }
+      bool StopShard(const std::string&, const std::string&) override { return true; }
+    };
+
+    FakeView view;
+    std::int64_t clk = 1000000;
+    // w_cpu runs only cpu; w_bundle runs the whole catalog. A scenario job must
+    // land exclusively on w_bundle.
+    WorkerInfo wc;
+    wc.worker_id = "w_cpu";
+    wc.capabilities["control_endpoint"] = "tcp://w_cpu:5099";
+    wc.capabilities["worker_kinds"] = "cpu";
+    wc.last_heartbeat_ms = clk;
+    view.workers["w_cpu"] = wc;
+    WorkerInfo wb;
+    wb.worker_id = "w_bundle";
+    wb.capabilities["control_endpoint"] = "tcp://w_bundle:5099";
+    wb.capabilities["worker_kinds"] = "cpu,gpu,dpdk,afxdp,doca,l7,defense,scenario,afpacket";
+    wb.last_heartbeat_ms = clk;
+    view.workers["w_bundle"] = wb;
+
+    FakeCmd cmd;
+    cmd.view = &view;
+    MasterCoordinator coord(&view, &cmd, [&clk]() { return clk; }, [](int) {});
+    JobConfig job;
+    job.count = 1000;
+    job.shard_unit_count = 250;  // 4 shards
+    job.master_poll_interval_ms = 1;
+    job.base_args = json::Value::Object();
+    job.base_args.set("worker", json::Value::Str("scenario"));
+    auto res = coord.RunSingleJob(job, "kindjob");
+    Check(res.rc == 0, "master-kind: scenario job completes rc=0");
+    Check(cmd.dispatched_eps.count("tcp://w_bundle:5099") == 1 &&
+              cmd.dispatched_eps.count("tcp://w_cpu:5099") == 0,
+          "master-kind: scenario shards only went to the bundle worker");
   }
 
   // --- mgmt API: TLS server starts with an ephemeral self-signed cert ---

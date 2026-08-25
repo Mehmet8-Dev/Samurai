@@ -64,6 +64,11 @@ endif()
 
 add_library(samurai_control STATIC ${CONTROL_SOURCES})
 target_include_directories(samurai_control PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# Header-only worker catalog (worker_registry.hpp -> wire_protocol.h) so the
+# management API can enumerate worker binaries for the bundle agent manifest.
+target_include_directories(samurai_control PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator
+  ${CMAKE_CURRENT_SOURCE_DIR}/../zmq/daemon)
 target_link_libraries(samurai_control PUBLIC samurai_core Threads::Threads PRIVATE OpenSSL::Crypto OpenSSL::SSL)
 
 if(LIBZMQ_FOUND)
