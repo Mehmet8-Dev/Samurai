@@ -195,7 +195,14 @@ int RunJob(const SupervisorConfig& cfg, const JobOptions& job, RunStats& out_sta
             }
             break;
           case MessageType::JOB_DONE:
-            std::printf("{\"event\":\"job_done\"}\n");
+            if (plen > 0) {
+              // Worker'ın JOB_DONE payload'ı (ör. scenario_backend, scenario_sla_passed,
+              // scenario_steps_est) artık yüzeye çıkarılıyor.
+              std::printf("{\"event\":\"job_done\",\"detail\":%.*s}\n",
+                          static_cast<int>(plen), reinterpret_cast<const char*>(pl));
+            } else {
+              std::printf("{\"event\":\"job_done\"}\n");
+            }
             done = true;
             break;
           case MessageType::ERROR:
