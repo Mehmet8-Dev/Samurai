@@ -22,6 +22,7 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/34-dpdk-kurulum-ve-hazirlik-rehberi.md
 !docs/35-vae-defense-integration.md
 !docs/38-architecture-refactor-plan.md
+!docs/pitch-teknik-hazirlik-barikat.md
 
 # Python cache / build
 __pycache__/
