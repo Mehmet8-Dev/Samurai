@@ -258,9 +258,26 @@ ScenarioL7Result RunScenarioL7(
         ops.push_back(std::move(body));
       }
       if (!st.token_variable_name.empty()) {
+        // Bind the login token from wherever the API returns it: Set-Cookie
+        // (default), a response header, or a JSON body field (e.g. a Bearer
+        // access token in {"accessToken":...}). Later steps reference it via
+        // {{token_variable_name}} in their headers.
         Value cap = Value::Object();
-        cap.set("opcode", Value::Str("CAPTURE_COOKIE"));
-        cap.set("capture_name", Value::Str(st.token_variable_name));
+        const std::string src = st.token_source.empty() ? std::string("cookie") : st.token_source;
+        if (src == "body_json") {
+          cap.set("opcode", Value::Str("CAPTURE_BODY_JSON"));
+          cap.set("capture_name", Value::Str(st.token_variable_name));
+          cap.set("capture_source",
+                  Value::Str(st.token_path.empty() ? st.token_variable_name : st.token_path));
+        } else if (src == "header") {
+          cap.set("opcode", Value::Str("CAPTURE_HEADER"));
+          cap.set("capture_name", Value::Str(st.token_variable_name));
+          cap.set("capture_source",
+                  Value::Str(st.token_path.empty() ? st.token_variable_name : st.token_path));
+        } else {
+          cap.set("opcode", Value::Str("CAPTURE_COOKIE"));
+          cap.set("capture_name", Value::Str(st.token_variable_name));
+        }
         ops.push_back(std::move(cap));
       }
     }

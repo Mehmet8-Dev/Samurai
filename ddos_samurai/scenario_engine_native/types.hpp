@@ -84,6 +84,12 @@ struct Step {
   // Dynamic persona, session token & cookie binding fields
   std::string extract_token_regex{};
   std::string token_variable_name{};
+  // Where the session token lives in the login response:
+  //   "cookie"    (default) -> Set-Cookie
+  //   "header"    -> response header named token_path
+  //   "body_json" -> JSON dotted path token_path (e.g. "accessToken", "data.token")
+  std::string token_source{"cookie"};
+  std::string token_path{};
   std::unordered_map<std::string, std::string> headers{};
   std::unordered_map<std::string, std::string> cookies{};
 

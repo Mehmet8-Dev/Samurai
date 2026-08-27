@@ -3162,6 +3162,112 @@ void capture_cookie(
   }
 }
 
+// Minimal, dependency-free JSON field extractor for CAPTURE_BODY_JSON. `path`
+// is a dotted key path (e.g. "accessToken" or "data.token"); intermediate keys
+// descend into nested objects, the final key's value is returned. Handles
+// string values (unescaping \" and \\) and bare scalars (number/bool). This is
+// a pragmatic scanner, not a full parser: it assumes well-formed JSON without
+// duplicate keys shadowing the target path. Returns false if the path is not
+// found.
+bool extract_json_field(const std::string& body, const std::string& path, std::string* out) {
+  std::size_t cursor = 0;
+  std::size_t start = 0;
+  const std::size_t n = path.size();
+  bool matched_any = false;
+  while (start <= n) {
+    std::size_t dot = path.find('.', start);
+    const std::string key = path.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+    if (key.empty()) {
+      break;
+    }
+    // Find "key" at or after cursor, then the following ':'.
+    const std::string needle = "\"" + key + "\"";
+    const std::size_t at = body.find(needle, cursor);
+    if (at == std::string::npos) {
+      return false;
+    }
+    std::size_t colon = body.find(':', at + needle.size());
+    if (colon == std::string::npos) {
+      return false;
+    }
+    cursor = colon + 1;
+    matched_any = true;
+    if (dot == std::string::npos) {
+      break;  // last segment: value starts at `cursor`
+    }
+    start = dot + 1;
+  }
+  if (!matched_any) {
+    return false;
+  }
+  // Skip whitespace before the value.
+  while (cursor < body.size() &&
+         (body[cursor] == ' ' || body[cursor] == '\t' || body[cursor] == '\n' || body[cursor] == '\r')) {
+    ++cursor;
+  }
+  if (cursor >= body.size()) {
+    return false;
+  }
+  if (body[cursor] == '"') {
+    ++cursor;
+    std::string value;
+    while (cursor < body.size()) {
+      const char c = body[cursor];
+      if (c == '\\' && cursor + 1 < body.size()) {
+        const char esc = body[cursor + 1];
+        if (esc == '"' || esc == '\\' || esc == '/') {
+          value.push_back(esc);
+        } else if (esc == 'n') {
+          value.push_back('\n');
+        } else if (esc == 't') {
+          value.push_back('\t');
+        } else {
+          value.push_back(esc);
+        }
+        cursor += 2;
+        continue;
+      }
+      if (c == '"') {
+        break;
+      }
+      value.push_back(c);
+      ++cursor;
+    }
+    if (out != nullptr) {
+      *out = std::move(value);
+    }
+    return true;
+  }
+  // Bare scalar: read until delimiter.
+  std::size_t end = cursor;
+  while (end < body.size()) {
+    const char c = body[end];
+    if (c == ',' || c == '}' || c == ']' || c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+      break;
+    }
+    ++end;
+  }
+  if (out != nullptr) {
+    *out = body.substr(cursor, end - cursor);
+  }
+  return end > cursor;
+}
+
+// Apply a CAPTURE_BODY_JSON follow-op against a response body.
+void capture_body_json(
+    const FlowOp& follow,
+    const std::string& body,
+    std::map<std::string, std::string>& captures) {
+  const std::string path = follow.capture_source.empty() ? follow.capture_name : follow.capture_source;
+  if (path.empty()) {
+    return;
+  }
+  std::string value;
+  if (extract_json_field(body, path, &value)) {
+    captures[follow.capture_name.empty() ? path : follow.capture_name] = value;
+  }
+}
+
 void evaluate_response_ops(
     const std::vector<FlowOp>& follow_ops,
     int status_code,
@@ -3218,6 +3324,10 @@ void evaluate_response_ops(
           capture_cookie(it->second, follow.capture_name, captures);
         }
       }
+      continue;
+    }
+    if (follow.opcode == "CAPTURE_BODY_JSON") {
+      capture_body_json(follow, body, captures);
       continue;
     }
     if (follow.opcode == "THINK_TIME") {
@@ -5174,6 +5284,8 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
             capture_cookie(it->second, follow.capture_name, captures);
           }
         }
+      } else if (follow.opcode == "CAPTURE_BODY_JSON") {
+        capture_body_json(follow, completed.response_body, captures);
       } else if (follow.opcode == "THINK_TIME") {
         lane.think_time_total_ms += std::max(0, follow.think_time_ms);
       }

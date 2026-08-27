@@ -132,6 +132,8 @@ ScenarioSpecNative parse_spec(const json::Value& spec) {
           }
           step.extract_token_regex = GetStr(st_obj, "extract_token_regex");
           step.token_variable_name = GetStr(st_obj, "token_variable_name");
+          step.token_source = GetStr(st_obj, "token_source", "cookie");
+          step.token_path = GetStr(st_obj, "token_path");
           step.headers = GetStrMap(st_obj, "headers");
           step.cookies = GetStrMap(st_obj, "cookies");
 

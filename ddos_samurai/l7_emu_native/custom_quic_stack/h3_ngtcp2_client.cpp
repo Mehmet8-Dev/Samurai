@@ -1460,7 +1460,8 @@ std::vector<ScenarioStep> derive_scenario_steps(const Profile& profile) {
       if (current_open) {
         apply_expect_op(&current.expectations, op);
       }
-    } else if (op.opcode == "CAPTURE_HEADER" || op.opcode == "CAPTURE_COOKIE") {
+    } else if (op.opcode == "CAPTURE_HEADER" || op.opcode == "CAPTURE_COOKIE" ||
+               op.opcode == "CAPTURE_BODY_JSON") {
       if (current_open) {
         current.captures.push_back(
             ScenarioCaptureOp{op.opcode, op.capture_name, op.capture_source});
@@ -1608,9 +1609,86 @@ void harvest_set_cookie(
 }
 
 // Run the step's CAPTURE_* ops and always harvest Set-Cookie into the jar.
+// Minimal JSON field extractor for CAPTURE_BODY_JSON (mirrors engine.cpp).
+// `path` is a dotted key path (e.g. "accessToken" or "data.token").
+bool extract_json_field(const std::string& body, const std::string& path, std::string* out) {
+  std::size_t cursor = 0;
+  std::size_t start = 0;
+  const std::size_t n = path.size();
+  bool matched_any = false;
+  while (start <= n) {
+    const std::size_t dot = path.find('.', start);
+    const std::string key =
+        path.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+    if (key.empty()) {
+      break;
+    }
+    const std::string needle = "\"" + key + "\"";
+    const std::size_t at = body.find(needle, cursor);
+    if (at == std::string::npos) {
+      return false;
+    }
+    const std::size_t colon = body.find(':', at + needle.size());
+    if (colon == std::string::npos) {
+      return false;
+    }
+    cursor = colon + 1;
+    matched_any = true;
+    if (dot == std::string::npos) {
+      break;
+    }
+    start = dot + 1;
+  }
+  if (!matched_any) {
+    return false;
+  }
+  while (cursor < body.size() &&
+         (body[cursor] == ' ' || body[cursor] == '\t' || body[cursor] == '\n' || body[cursor] == '\r')) {
+    ++cursor;
+  }
+  if (cursor >= body.size()) {
+    return false;
+  }
+  if (body[cursor] == '"') {
+    ++cursor;
+    std::string value;
+    while (cursor < body.size()) {
+      const char c = body[cursor];
+      if (c == '\\' && cursor + 1 < body.size()) {
+        const char esc = body[cursor + 1];
+        value.push_back(esc == 'n' ? '\n' : (esc == 't' ? '\t' : esc));
+        cursor += 2;
+        continue;
+      }
+      if (c == '"') {
+        break;
+      }
+      value.push_back(c);
+      ++cursor;
+    }
+    if (out != nullptr) {
+      *out = std::move(value);
+    }
+    return true;
+  }
+  std::size_t end = cursor;
+  while (end < body.size()) {
+    const char c = body[end];
+    if (c == ',' || c == '}' || c == ']' || c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+      break;
+    }
+    ++end;
+  }
+  if (out != nullptr) {
+    *out = body.substr(cursor, end - cursor);
+  }
+  return end > cursor;
+}
+
 void apply_scenario_captures(
     const ScenarioStep& step,
     const std::string& response_headers,
+    const std::string& response_body,
     std::map<std::string, std::string>* captures,
     std::map<std::string, std::string>* cookie_jar) {
   std::string set_cookie;
@@ -1627,6 +1705,13 @@ void apply_scenario_captures(
     } else if (cap.opcode == "CAPTURE_COOKIE") {
       if (have_set_cookie) {
         harvest_set_cookie(set_cookie, cap.capture_name, cookie_jar, captures);
+      }
+    } else if (cap.opcode == "CAPTURE_BODY_JSON") {
+      const std::string path =
+          cap.capture_source.empty() ? cap.capture_name : cap.capture_source;
+      std::string value;
+      if (!path.empty() && extract_json_field(response_body, path, &value) && captures != nullptr) {
+        (*captures)[cap.capture_name.empty() ? path : cap.capture_name] = value;
       }
     }
   }
@@ -3725,7 +3810,7 @@ bool run_single_attempt(
       out->scenario_step_latency_ms_max =
           std::max(out->scenario_step_latency_ms_max, step_latency_ms);
       if (multi_step) {
-        apply_scenario_captures(step, ctx.response_headers, &captures, &cookie_jar);
+        apply_scenario_captures(step, ctx.response_headers, ctx.response_body, &captures, &cookie_jar);
       }
 
       if (flow_control_abort) {
