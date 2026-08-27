@@ -1319,6 +1319,323 @@ Expectations derive_expectations(const Profile& profile) {
   return exp;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-step scenario support (H1/H2 parity).
+//
+// H1/H2 walk profile.ops as an ordered scenario: each SEND_HEADERS begins a new
+// request step, and the following SEND_BODY / EXPECT_* / CAPTURE_* / THINK_TIME
+// ops attach to that step. Prior to this the H3 client collapsed everything into
+// a single request and merely repeated it request_budget times ("ilk adımı
+// tekrarlıyor"). The helpers below segment ops into steps, render {{...}}
+// templates from captured variables + the cookie jar, and harvest cookies/tokens
+// between steps so H3 reaches feature parity.
+// ---------------------------------------------------------------------------
+
+struct ScenarioCaptureOp {
+  std::string opcode;  // CAPTURE_HEADER | CAPTURE_COOKIE
+  std::string capture_name;
+  std::string capture_source;
+};
+
+struct ScenarioStep {
+  RequestSpec request{};
+  Expectations expectations{};
+  std::vector<ScenarioCaptureOp> captures{};
+  int think_time_ms{0};
+};
+
+// Render a {{...}} template against captured variables. Mirrors the H1/H2 syntax
+// in engine.cpp: {{name}}, {{capture:name}}, {{header:name}}, {{cookie:name}}.
+std::string render_capture_template(
+    const std::string& input,
+    const std::map<std::string, std::string>& captures) {
+  if (input.find("{{") == std::string::npos) {
+    return input;
+  }
+  std::string out;
+  out.reserve(input.size());
+  std::size_t pos = 0;
+  while (pos < input.size()) {
+    const std::size_t start = input.find("{{", pos);
+    if (start == std::string::npos) {
+      out.append(input, pos, std::string::npos);
+      break;
+    }
+    out.append(input, pos, start - pos);
+    const std::size_t end = input.find("}}", start + 2);
+    if (end == std::string::npos) {
+      out.append(input, start, std::string::npos);
+      break;
+    }
+    std::string token = input.substr(start + 2, end - (start + 2));
+    for (const char* prefix : {"capture:", "header:", "cookie:"}) {
+      const std::size_t plen = std::char_traits<char>::length(prefix);
+      if (token.rfind(prefix, 0) == 0) {
+        token.erase(0, plen);
+        break;
+      }
+    }
+    const auto it = captures.find(token);
+    if (it != captures.end()) {
+      out.append(it->second);
+    }
+    pos = end + 2;
+  }
+  return out;
+}
+
+void apply_expect_op(Expectations* exp, const FlowOp& op) {
+  if (exp == nullptr) {
+    return;
+  }
+  if (op.opcode == "EXPECT_STATUS" && op.has_expect) {
+    exp->status_min = std::max(100, op.expect.status_min);
+    exp->status_max = std::max(exp->status_min, std::min(599, op.expect.status_max));
+  } else if (op.opcode == "EXPECT_HEADER" && op.has_expect) {
+    exp->has_header_expect = true;
+    exp->header_name = op.expect.name;
+    exp->header_value_contains = op.expect.value;
+  } else if (op.opcode == "EXPECT_BODY_SUBSTRING" && op.has_expect) {
+    if (op.expect.kind == "body_required") {
+      exp->require_body = true;
+    } else if (op.expect.kind == "body_min_bytes") {
+      int min_body = 0;
+      try {
+        min_body = std::stoi(op.expect.value);
+      } catch (...) {
+        min_body = 0;
+      }
+      exp->min_body_bytes = static_cast<std::size_t>(std::max(0, min_body));
+    } else {
+      exp->has_body_expect = true;
+      exp->body_substring = op.expect.value;
+    }
+  }
+}
+
+// Segment profile.ops into ordered scenario steps. Falls back to a single step
+// derived from the whole profile when no SEND_HEADERS op is present, preserving
+// the legacy single-request behaviour used by the H3 feature suites.
+std::vector<ScenarioStep> derive_scenario_steps(const Profile& profile) {
+  std::vector<ScenarioStep> steps;
+  ScenarioStep current{};
+  bool current_open = false;
+
+  auto flush = [&]() {
+    if (current_open) {
+      if (current.request.path.empty()) {
+        current.request.path = "/";
+      }
+      if (current.request.path.front() != '/') {
+        current.request.path.insert(current.request.path.begin(), '/');
+      }
+      steps.push_back(std::move(current));
+      current = ScenarioStep{};
+      current_open = false;
+    }
+  };
+
+  for (const auto& op : profile.ops) {
+    if (op.opcode == "SEND_HEADERS") {
+      flush();
+      current_open = true;
+      if (!op.method.empty()) {
+        current.request.method = op.method;
+      }
+      if (!op.path.empty()) {
+        current.request.path = op.path;
+      }
+      if (!op.headers.empty()) {
+        current.request.headers.assign(op.headers.begin(), op.headers.end());
+      }
+    } else if (op.opcode == "SEND_BODY") {
+      if (!current_open) {
+        current_open = true;
+      }
+      if (!op.body.empty()) {
+        current.request.body = op.body;
+      }
+    } else if (op.opcode == "EXPECT_STATUS" || op.opcode == "EXPECT_HEADER" ||
+               op.opcode == "EXPECT_BODY_SUBSTRING") {
+      if (current_open) {
+        apply_expect_op(&current.expectations, op);
+      }
+    } else if (op.opcode == "CAPTURE_HEADER" || op.opcode == "CAPTURE_COOKIE") {
+      if (current_open) {
+        current.captures.push_back(
+            ScenarioCaptureOp{op.opcode, op.capture_name, op.capture_source});
+      }
+    } else if (op.opcode == "THINK_TIME") {
+      if (current_open) {
+        current.think_time_ms += std::max(0, op.think_time_ms);
+      }
+    }
+  }
+  flush();
+
+  if (steps.empty()) {
+    ScenarioStep fallback{};
+    fallback.request = derive_request_spec(profile);
+    fallback.expectations = derive_expectations(profile);
+    steps.push_back(std::move(fallback));
+  }
+  return steps;
+}
+
+// Materialise a concrete request for one step: templates are rendered against
+// the running capture store and the accumulated cookie jar is injected as a
+// Cookie header (unless the step already sets one).
+RequestSpec render_scenario_request(
+    const ScenarioStep& step,
+    const std::map<std::string, std::string>& captures,
+    const std::map<std::string, std::string>& cookie_jar) {
+  RequestSpec out;
+  out.method = render_capture_template(
+      step.request.method.empty() ? std::string("GET") : step.request.method, captures);
+  out.path = render_capture_template(
+      step.request.path.empty() ? std::string("/") : step.request.path, captures);
+  if (out.path.empty()) {
+    out.path = "/";
+  }
+  if (out.path.front() != '/') {
+    out.path.insert(out.path.begin(), '/');
+  }
+
+  bool has_cookie_header = false;
+  for (const auto& hdr : step.request.headers) {
+    if (hdr.first.empty()) {
+      continue;
+    }
+    if (to_lower_ascii(hdr.first) == "cookie") {
+      has_cookie_header = true;
+    }
+    out.headers.emplace_back(
+        hdr.first, render_capture_template(hdr.second, captures));
+  }
+  if (!has_cookie_header && !cookie_jar.empty()) {
+    std::string cookie_line;
+    for (const auto& kv : cookie_jar) {
+      if (!cookie_line.empty()) {
+        cookie_line.append("; ");
+      }
+      cookie_line.append(kv.first);
+      cookie_line.push_back('=');
+      cookie_line.append(kv.second);
+    }
+    out.headers.emplace_back("cookie", cookie_line);
+  }
+
+  if (!step.request.body.empty()) {
+    const std::string body_str(step.request.body.begin(), step.request.body.end());
+    const std::string rendered = render_capture_template(body_str, captures);
+    out.body.assign(rendered.begin(), rendered.end());
+  }
+  return out;
+}
+
+// Extract a single header value from the "name:value\n" response header buffer.
+bool extract_response_header(
+    const std::string& headers,
+    const std::string& name,
+    std::string* out_value) {
+  if (name.empty()) {
+    return false;
+  }
+  const std::string lowered = to_lower_ascii(headers);
+  const std::string needle = to_lower_ascii(name) + ":";
+  std::size_t pos = 0;
+  while (pos <= lowered.size()) {
+    const std::size_t at = lowered.find(needle, pos);
+    if (at == std::string::npos) {
+      return false;
+    }
+    if (at == 0 || lowered[at - 1] == '\n') {
+      const std::size_t vstart = at + needle.size();
+      const std::size_t line_end = headers.find('\n', vstart);
+      std::string value = line_end == std::string::npos
+          ? headers.substr(vstart)
+          : headers.substr(vstart, line_end - vstart);
+      // trim leading spaces
+      std::size_t b = 0;
+      while (b < value.size() && (value[b] == ' ' || value[b] == '\t')) {
+        ++b;
+      }
+      if (out_value != nullptr) {
+        *out_value = value.substr(b);
+      }
+      return true;
+    }
+    pos = at + needle.size();
+  }
+  return false;
+}
+
+// Parse a Set-Cookie value ("name=value; Path=/; ...") into the cookie jar.
+void harvest_set_cookie(
+    const std::string& cookie_line,
+    const std::string& capture_name,
+    std::map<std::string, std::string>* cookie_jar,
+    std::map<std::string, std::string>* captures) {
+  const std::size_t sep = cookie_line.find(';');
+  const std::string pair = cookie_line.substr(0, sep);
+  const std::size_t eq = pair.find('=');
+  std::string name;
+  std::string value;
+  if (eq != std::string::npos) {
+    name = pair.substr(0, eq);
+    value = pair.substr(eq + 1);
+  } else {
+    value = pair;
+  }
+  // trim whitespace on name
+  while (!name.empty() && (name.front() == ' ' || name.front() == '\t')) {
+    name.erase(name.begin());
+  }
+  while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) {
+    name.pop_back();
+  }
+  if (cookie_jar != nullptr && !name.empty()) {
+    (*cookie_jar)[name] = value;
+  }
+  if (captures != nullptr) {
+    if (!capture_name.empty()) {
+      (*captures)[capture_name] = eq != std::string::npos ? value : pair;
+    } else if (!name.empty()) {
+      (*captures)[name] = value;
+    }
+    (*captures)["set-cookie"] = pair;
+  }
+}
+
+// Run the step's CAPTURE_* ops and always harvest Set-Cookie into the jar.
+void apply_scenario_captures(
+    const ScenarioStep& step,
+    const std::string& response_headers,
+    std::map<std::string, std::string>* captures,
+    std::map<std::string, std::string>* cookie_jar) {
+  std::string set_cookie;
+  const bool have_set_cookie =
+      extract_response_header(response_headers, "set-cookie", &set_cookie);
+  for (const auto& cap : step.captures) {
+    if (cap.opcode == "CAPTURE_HEADER") {
+      const std::string source =
+          cap.capture_source.empty() ? cap.capture_name : cap.capture_source;
+      std::string value;
+      if (extract_response_header(response_headers, source, &value) && captures != nullptr) {
+        (*captures)[cap.capture_name.empty() ? to_lower_ascii(source) : cap.capture_name] = value;
+      }
+    } else if (cap.opcode == "CAPTURE_COOKIE") {
+      if (have_set_cookie) {
+        harvest_set_cookie(set_cookie, cap.capture_name, cookie_jar, captures);
+      }
+    }
+  }
+  // Even without an explicit CAPTURE_COOKIE, maintain the jar for state carry.
+  if (have_set_cookie && step.captures.empty()) {
+    harvest_set_cookie(set_cookie, "", cookie_jar, captures);
+  }
+}
+
 GoawayPolicy derive_goaway_policy(const Profile& profile) {
   GoawayPolicy policy{};
   for (const auto& op : profile.ops) {
@@ -3179,6 +3496,17 @@ bool run_single_attempt(
   }
   const int request_budget = std::max(1, planned_requests);
   const GoawayPolicy goaway_policy = derive_goaway_policy(profile);
+  // Ordered scenario steps. With a single step we preserve the legacy behaviour
+  // of repeating that request request_budget times (stress / feature suites);
+  // with multiple steps we walk them in order once, carrying captures + cookies.
+  const std::vector<ScenarioStep> scenario_steps = derive_scenario_steps(profile);
+  const bool multi_step = scenario_steps.size() > 1;
+  const int plan_len =
+      multi_step ? static_cast<int>(scenario_steps.size()) : request_budget;
+  std::map<std::string, std::string> captures;
+  std::map<std::string, std::string> cookie_jar;
+  out->scenario_multi_step = multi_step ? 1 : 0;
+  out->scenario_steps_planned += plan_len;
   Ngtcp2AttemptCtx ctx{};
   ctx.request = derive_request_spec(profile);
   ctx.expectations = derive_expectations(profile);
@@ -3262,25 +3590,38 @@ bool run_single_attempt(
       break;
     }
 
-    for (int req_i = 0; req_i < request_budget; ++req_i) {
+    for (int req_i = 0; req_i < plan_len; ++req_i) {
       if (ctx.goaway_active) {
-        const int remaining = std::max(0, request_budget - req_i);
+        const int remaining = std::max(0, plan_len - req_i);
         if (ctx.requests_completed > 0) {
           ctx.drain_cycles += 1;
         }
         ctx.replace_now += remaining;
         break;
       }
+      // Select the step for this iteration. Single-step scenarios reuse step 0
+      // for every request (legacy repeat behaviour); multi-step scenarios walk
+      // the ordered list, rendering templates against captured state.
+      const ScenarioStep& step =
+          multi_step ? scenario_steps[static_cast<std::size_t>(req_i)] : scenario_steps.front();
       reset_request_state(&ctx);
+      ctx.request = render_scenario_request(step, captures, cookie_jar);
+      ctx.expectations = step.expectations;
+      const uint64_t step_start_ns = now_ns();
       if (!submit_h3_request(&ctx, profile)) {
         ctx.requests_failed += 1;
         ctx.requests_completed += 1;
         out->errors += 1;
         out->response_validation_fail += 1;
+        out->scenario_steps_completed += 1;
+        out->scenario_steps_failed += 1;
         if (ctx.goaway_active) {
-          const int remaining = std::max(0, request_budget - req_i - 1);
+          const int remaining = std::max(0, plan_len - req_i - 1);
           ctx.replace_now += remaining;
           break;
+        }
+        if (multi_step) {
+          break;  // scenario ordering broken; abandon the remaining steps
         }
         continue;
       }
@@ -3365,13 +3706,48 @@ bool run_single_attempt(
           out->timeouts += 1;
         }
         if (flow_control_abort) {
-          const int remaining = std::max(0, request_budget - req_i);
+          const int remaining = std::max(0, plan_len - req_i);
           ctx.replace_now += remaining;
         }
       }
       ctx.requests_completed += 1;
+
+      // Per-step SLA telemetry + state carry (captures/cookies) + think-time.
+      const double step_latency_ms =
+          static_cast<double>(ns_to_ms_ceil(now_ns() - step_start_ns));
+      out->scenario_steps_completed += 1;
+      if (request_ok) {
+        out->scenario_steps_passed += 1;
+      } else {
+        out->scenario_steps_failed += 1;
+      }
+      out->scenario_step_latency_ms_sum += step_latency_ms;
+      out->scenario_step_latency_ms_max =
+          std::max(out->scenario_step_latency_ms_max, step_latency_ms);
+      if (multi_step) {
+        apply_scenario_captures(step, ctx.response_headers, &captures, &cookie_jar);
+      }
+
       if (flow_control_abort) {
         break;
+      }
+      // Abort the remaining ordered steps once one fails: later steps typically
+      // depend on captured state from earlier ones.
+      if (multi_step && !request_ok) {
+        break;
+      }
+      if (step.think_time_ms > 0) {
+        out->scenario_think_time_total_ms += step.think_time_ms;
+        const int think_ms = std::min(step.think_time_ms, std::max(1, timeout_ms));
+        const uint64_t think_deadline_ns =
+            now_ns() + static_cast<uint64_t>(think_ms) * 1000000ull;
+        // Keep the connection serviced during think-time so the transport stays
+        // live (ACKs, PINGs, ticket delivery) instead of stalling.
+        while (now_ns() < think_deadline_ns) {
+          if (!drive_io_once(&ctx, think_deadline_ns, out)) {
+            break;
+          }
+        }
       }
     }
     if (goaway_policy.enabled && ctx.h3_conn != nullptr) {

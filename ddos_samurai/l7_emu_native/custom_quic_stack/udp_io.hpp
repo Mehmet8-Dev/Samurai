@@ -71,6 +71,15 @@ struct UdpProbeCounters {
   int tls_session_ticket_received{0};
   int tls_cache_load_hit{0};
   int tls_cache_store_updates{0};
+  // Multi-step scenario / per-step SLA telemetry (H1/H2 parity).
+  int scenario_multi_step{0};
+  int scenario_steps_planned{0};
+  int scenario_steps_completed{0};
+  int scenario_steps_passed{0};
+  int scenario_steps_failed{0};
+  int scenario_think_time_total_ms{0};
+  double scenario_step_latency_ms_sum{0.0};
+  double scenario_step_latency_ms_max{0.0};
   std::size_t tx_bytes{0};
   std::size_t rx_bytes{0};
 };

@@ -88,6 +88,25 @@ std::map<std::string, double> run_quic_profile(
   const LossRecoveryCounters recovery = derive_loss_recovery(udp);
   apply_quic_run_metrics(&out, profile, udp, recovery);
   apply_h3_control_plane_metrics(&out, derive_h3_control_plane_state(profile, udp));
+
+  // Multi-step scenario / per-step SLA telemetry (H1/H2 parity surface).
+  const int steps_completed = std::max(0, udp.scenario_steps_completed);
+  out["quic_scenario_multi_step"] = static_cast<double>(udp.scenario_multi_step);
+  out["quic_scenario_steps_planned"] = static_cast<double>(std::max(0, udp.scenario_steps_planned));
+  out["quic_scenario_steps_completed"] = static_cast<double>(steps_completed);
+  out["quic_scenario_steps_passed"] = static_cast<double>(std::max(0, udp.scenario_steps_passed));
+  out["quic_scenario_steps_failed"] = static_cast<double>(std::max(0, udp.scenario_steps_failed));
+  out["quic_scenario_think_time_total_ms"] =
+      static_cast<double>(std::max(0, udp.scenario_think_time_total_ms));
+  out["quic_scenario_step_latency_ms_avg"] =
+      steps_completed > 0 ? udp.scenario_step_latency_ms_sum / static_cast<double>(steps_completed) : 0.0;
+  out["quic_scenario_step_latency_ms_max"] = udp.scenario_step_latency_ms_max;
+  out["quic_scenario_step_pass_ratio"] =
+      steps_completed > 0
+          ? static_cast<double>(std::max(0, udp.scenario_steps_passed)) / static_cast<double>(steps_completed)
+          : 0.0;
+  out["quic_scenario_state_carry_ready"] =
+      (udp.scenario_multi_step != 0 && udp.scenario_steps_passed > 0) ? 1.0 : 0.0;
   return out;
 }
 
