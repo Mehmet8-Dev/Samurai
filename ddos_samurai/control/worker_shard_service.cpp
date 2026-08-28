@@ -208,7 +208,13 @@ Value WorkerShardService::StartShard(const Value& body, const RpcContext& /*ctx*
     active_monitors_.fetch_add(1);
   }
 
-  monitors_.emplace_back(&WorkerShardService::MonitorRuntime, this, sid, runtime_id);
+  {
+    // monitors_ vektörü mu_ ile korunmalı; eşzamanlı StartShard RPC'lerinde
+    // kilitsiz emplace_back veri yarışına yol açar. Thread'ler destructor'da
+    // join edildiği için detach etmiyoruz (aksi halde teardown'da use-after-free).
+    std::lock_guard<std::mutex> lk(mu_);
+    monitors_.emplace_back(&WorkerShardService::MonitorRuntime, this, sid, runtime_id);
+  }
 
   {
     std::lock_guard<std::mutex> lk(mu_);

@@ -1234,9 +1234,11 @@ void TcpDataplaneCore::SetFlowState(FlowEntry& flow, TcpDpState next_state) {
       active_flow_ids_shard_[shard].erase(flow.flow_id);
     }
   }
-  if (IsCountedActive(next_state) && !IsCountedActive(flow.state)) {
+  // flow.state yukarıda zaten next_state'e atandığından eski/yeni durum
+  // karşılaştırması, atamadan önce hesaplanan was_active/now_active ile yapılmalı.
+  if (now_active && !was_active) {
     stats_shard_[FlowLockShardForFlowId(flow.flow_id)].flows_active.fetch_add(1, std::memory_order_relaxed);
-  } else if (IsCountedActive(flow.state) && !IsCountedActive(next_state)) {
+  } else if (was_active && !now_active) {
     SaturatingDecrement(stats_shard_[FlowLockShardForFlowId(flow.flow_id)].flows_active);
   }
 }

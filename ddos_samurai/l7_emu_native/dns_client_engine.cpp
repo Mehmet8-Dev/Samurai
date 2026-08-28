@@ -68,6 +68,9 @@ std::string parse_dns_name(const uint8_t* buf, size_t len, size_t& offset, int d
   size_t original_offset = offset;
 
   while (offset < len) {
+    // Döngüsel sıkıştırma işaretçilerine karşı: derinlik her jump'ta artar,
+    // bu kontrol döngü içinde olmalı yoksa cyclic pointer sonsuz döngüye sokar.
+    if (depth > 10) break;
     uint8_t len_byte = buf[offset];
     if (len_byte == 0) {
       if (!jumped) offset++;

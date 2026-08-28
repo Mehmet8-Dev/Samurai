@@ -86,6 +86,19 @@ TargetSafetyResult ValidateTargetSafety(const std::string& target_ip,
     return {false, "Geçersiz/tehlikeli hedef IP (multicast/unspecified)."};
   }
 
+  // Hard deny policy: blocked targets always win. Allowlist kontrolünden ÖNCE
+  // çalıştırılmalı; aksi halde allowlist eşleşmesi denylist'i bypass ederdi.
+  for (const auto& entry : deny_targets) {
+    if (entry.empty()) continue;
+    const auto cidr = ParseCidr(entry);
+    if (!cidr) {
+      return {false, "Geçersiz denylist girdisi: '" + entry + "'"};
+    }
+    if (InCidr(*ip, *cidr)) {
+      return {false, "Hedef IP global denylist içinde: " + entry};
+    }
+  }
+
   if (!allow_targets.empty()) {
     for (const auto& entry : allow_targets) {
       const auto cidr = ParseCidr(entry);
@@ -97,18 +110,6 @@ TargetSafetyResult ValidateTargetSafety(const std::string& target_ip,
       }
     }
     return {false, "Hedef IP allowlist içinde değil. (--allow-target ile izin ver)"};
-  }
-
-  // Hard deny policy: blocked targets always win.
-  for (const auto& entry : deny_targets) {
-    if (entry.empty()) continue;
-    const auto cidr = ParseCidr(entry);
-    if (!cidr) {
-      return {false, "Geçersiz denylist girdisi: '" + entry + "'"};
-    }
-    if (InCidr(*ip, *cidr)) {
-      return {false, "Hedef IP global denylist içinde: " + entry};
-    }
   }
 
   if (IsPrivateOrLoopback(*ip)) {

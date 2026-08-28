@@ -1513,10 +1513,10 @@ std::optional<std::size_t> parse_chunked_body_length(std::string_view payload, s
     }
     cursor += 2;
     if (chunk_len == 0) {
-      if (payload.size() < cursor + 2) {
-        return std::nullopt;
-      }
-      return cursor + 2 - body_offset;
+      // Sonlandırıcı chunk için gövde CRLF'i (L1511-1514'te) zaten tüketildi;
+      // cursor tüm "0\r\n\r\n" dizisinin sonrasındadır. Ekstra 2 bayt talep etmek
+      // geçerli chunked yanıtları tamamlanmamış sayardı.
+      return cursor - body_offset;
     }
   }
 }

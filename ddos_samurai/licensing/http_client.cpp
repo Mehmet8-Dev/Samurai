@@ -135,6 +135,12 @@ HttpResponse HttpPostJson(const std::string& url, const std::string& json_body, 
     }
     SSL_CTX_set_default_verify_paths(ctx);
     SSL* ssl = SSL_new(ctx);
+    if (!ssl) {
+      SSL_CTX_free(ctx);
+      ::close(fd);
+      r.error = "ssl new failed";
+      return r;
+    }
     SSL_set_fd(ssl, fd);
     SSL_set_tlsext_host_name(ssl, u.host.c_str());  // SNI
     if (SSL_connect(ssl) != 1) {

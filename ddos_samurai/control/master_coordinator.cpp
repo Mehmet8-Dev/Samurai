@@ -479,7 +479,13 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
   snap.set("pending_shards_left", Value::Int(static_cast<std::int64_t>(pending.size())));
   snap.set("inflight_shards_left", Value::Int(static_cast<std::int64_t>(inflight_by_sid.size())));
 
-  result.rc = (pending.empty() && inflight_by_sid.empty()) ? 0 : 1;
+  // Başarı ölçütü: TÜM shard'lar gerçekten tamamlandı mı (done_shards).
+  // Yeniden deneme limitini aşıp düşen shard'lar done_shards'a girmez, dolayısıyla
+  // kuyruklar boşalsa bile job başarısız sayılır. dispatch_failures'a bakmıyoruz:
+  // içinde W_DIRECT_FALLBACK_REVERSE gibi UYARILAR da var (job yine de başarılı);
+  // gerçek başarısızlık zaten done_shards eksikliği olarak yansır.
+  const bool all_done = (done_shards.size() == all_sids.size());
+  result.rc = (all_done && pending.empty() && inflight_by_sid.empty()) ? 0 : 1;
   result.snapshot = std::move(snap);
   return result;
 }

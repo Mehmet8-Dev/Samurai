@@ -739,6 +739,20 @@ static json::Value PackedEventsToJson(const PackedEvents& pe) {
   out.set("tcp_payload", arr_strs(pe.tcp_payload));
   out.set("tcp_expect_condition", arr_strs(pe.tcp_expect_condition));
   out.set("tcp_expect_timeout_ms", arr_ints(pe.tcp_expect_timeout_ms));
+  out.set("tls_sni", arr_strs(pe.tls_sni));
+  out.set("tls_alpn", arr_strs(pe.tls_alpn));
+  out.set("tls_cipher_list", arr_strs(pe.tls_cipher_list));
+  out.set("tls_verify", arr_ints(pe.tls_verify));
+  out.set("dns_hostname", arr_strs(pe.dns_hostname));
+  out.set("dns_protocol", arr_strs(pe.dns_protocol));
+  out.set("dns_qtype", arr_strs(pe.dns_qtype));
+  out.set("dns_edns0", arr_ints(pe.dns_edns0));
+  out.set("dns_ecs_subnet", arr_strs(pe.dns_ecs_subnet));
+  out.set("dhcp_client_mac", arr_strs(pe.dhcp_client_mac));
+  out.set("dhcp_version", arr_ints(pe.dhcp_version));
+  out.set("igmp_group_ip", arr_strs(pe.igmp_group_ip));
+  out.set("igmp_version", arr_ints(pe.igmp_version));
+  out.set("nd_target_ip", arr_strs(pe.nd_target_ip));
   return out;
 }
 
@@ -852,15 +866,11 @@ json::Value compile_session_plans_packed_bulk_soa_native(
     st.backend = spec.load_model.backend;
     const std::string persona_name = spec.flows[itf->second].persona;
     const std::size_t ev_base = flat.event_kind.size();
-    const std::size_t hbase = flat.headers_pool.size();
-    const std::size_t cbase = flat.cookies_pool.size();
+    (void)ev_base;
+    // intern_map() zaten flat.headers_pool / flat.cookies_pool içine ekleyip
+    // paylaşılan havuza göre MUTLAK indeks döndürür. Havuz boyutunu tekrar
+    // eklemek indeksleri havuz sınırının dışına taşıyıp worker'da OOB'ye yol açar.
     compile_flow_recursive_packed(spec, flow_name, st, flat);
-    for (std::size_t j = ev_base; j < flat.headers_idx.size(); ++j) {
-      if (flat.headers_idx[j] >= 0) flat.headers_idx[j] += static_cast<int>(hbase);
-    }
-    for (std::size_t j = ev_base; j < flat.cookies_idx.size(); ++j) {
-      if (flat.cookies_idx[j] >= 0) flat.cookies_idx[j] += static_cast<int>(cbase);
-    }
     session_flow.push_back(flow_name);
     session_persona.push_back(persona_name);
     session_step_attempted.push_back(st.attempted);

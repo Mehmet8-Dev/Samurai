@@ -23,11 +23,9 @@ class TestCpuNativeCppSelftest(unittest.TestCase):
             "-I",
             str(repo / "ddos_samurai" / "cpu_native"),
             str(repo / "ddos_samurai" / "cpu_native" / "native_selftest.cpp"),
-            str(repo / "ddos_samurai" / "cpu_native" / "common.cpp"),
-            str(repo / "ddos_samurai" / "cpu_native" / "spoofing.cpp"),
-            str(repo / "ddos_samurai" / "cpu_native" / "packets.cpp"),
-            str(repo / "ddos_samurai" / "cpu_native" / "pool.cpp"),
-            str(repo / "ddos_samurai" / "cpu_native" / "amp.cpp"),
+            # engine.cpp refactor sonrası tek amalgamation TU'dur; spoofing/
+            # packets/pool/amp tanımlarını da içerir, ayrı derlenmemelidir.
+            str(repo / "ddos_samurai" / "cpu_native" / "engine.cpp"),
             "-o",
             str(binary),
         ]
