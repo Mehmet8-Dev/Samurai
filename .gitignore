@@ -100,3 +100,7 @@ Papers/
 # Local agent/plugin metadata
 .agents/plugins/marketplace.json
 .codex-plugins/caveman/.codex-plugin/plugin.json
+
+# Local research scratch (microbench/paper) - not part of the repo
+/research/
+/artifacts/zero_install/
