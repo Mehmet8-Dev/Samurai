@@ -1,47 +1,78 @@
-# Backend Dockerfile for Samurai
-FROM python:3.12-slim-bookworm
+# Native (ZMQ) control-plane image for DDoSamurai.
+#
+# The project migrated off the Python entrypoint (`python -m ddos_samurai.cli`)
+# to a native C++ control plane. This builds the native daemons + commodity
+# workers and ships them on a slim runtime. The master and slave are separate
+# binaries; the Kubernetes workloads select one via `command:` (no --role).
+#
+#   docker build -f Dockerfile.prod -t ddos-samurai:native .
+#   docker run --rm ddos-samurai:native samurai_master --help
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+# ---- builder ---------------------------------------------------------------
+FROM debian:bookworm-slim AS build
 
-# Install system dependencies
-# - build-essential: for compiling the native C/C++ engines (af_packet, cpu_native, ...)
-# - libpcap-dev: for Scapy
-# - iproute2: for ip commands
-# - curl: utility
-# - git: utility
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    python3-dev \
-    libpcap-dev \
-    iproute2 \
-    curl \
+    cmake \
+    pkg-config \
     git \
+    libssl-dev \
+    libzmq3-dev \
+    libhiredis-dev \
+    libpcap-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Playwright dependencies
-# We install playwright later via pip, but it needs system libs.
-# The 'playwright install-deps' command usually handles this, but requires the python package first.
-
-WORKDIR /app
-
-# Copy requirements first for cache optimization
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install Playwright browsers and system dependencies
-RUN playwright install --with-deps chromium
-
-# Copy the rest of the application
+WORKDIR /src
 COPY . .
 
-# Build C extensions in-place
-RUN python setup.py build_ext --inplace
+# Configure once, then build the deployable targets (the two daemons + the
+# commodity workers). GPU/DPDK/DOCA backends are gated on their toolchains and
+# skip cleanly when absent, so they are omitted from the default image.
+RUN cmake -S ddos_samurai -B build -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build build -j "$(nproc)" --target \
+      samurai_master \
+      samurai_slave \
+      samurai_cpu_worker \
+      samurai_afpacket_worker \
+      samurai_afxdp_worker \
+      samurai_l7_worker \
+      samurai_scenario_worker \
+      samurai_defense_worker
 
-# Default to CLI entrypoint for this repository profile.
-ENTRYPOINT ["python", "-m", "ddos_samurai.cli"]
-CMD ["--help"]
+# ---- runtime ---------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    libzmq5 \
+    libhiredis0.14 \
+    libpcap0.8 \
+    ca-certificates \
+    iproute2 \
+    curl \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root runtime user (matches the Helm securityContext runAsUser).
+RUN useradd -u 10001 -m -s /usr/sbin/nologin samurai
+
+# Install the native binaries on PATH. `--parents` preserves nothing; we flatten
+# every built daemon/worker into /usr/local/bin.
+COPY --from=build /src/build/control/daemon/samurai_master /usr/local/bin/
+COPY --from=build /src/build/control/daemon/samurai_slave  /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_cpu_worker        /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_afpacket_worker   /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_afxdp_worker      /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_l7_worker         /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_scenario_worker   /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_defense_worker    /usr/local/bin/
+
+USER 10001:10001
+WORKDIR /home/samurai
+
+# tini reaps the worker subprocesses the slave forks. The Kubernetes workloads
+# override `command`/`args`; the default just prints master usage.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["samurai_master", "--help"]
