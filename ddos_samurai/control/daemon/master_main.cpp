@@ -5,6 +5,7 @@
 // optionally expose the HTTP management API, wait for workers, then split and
 // dispatch one job across the cluster and print the aggregated snapshot.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -22,6 +23,8 @@
 #include "management_api.hpp"
 #include "master_adapters.hpp"
 #include "master_coordinator.hpp"
+#include "multimaster.hpp"
+#include "redis_kvstore.hpp"
 #include "servicer.hpp"
 
 namespace {
@@ -30,7 +33,17 @@ void OnSignal(int) { g_stop.store(true); }
 
 using samurai::core::json::Value;
 
-Value BuildState(samurai::control::Servicer* svc) {
+std::string LowerCopy(std::string s) {
+  for (char& c : s) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  return s;
+}
+
+// `mm` (nullable) surfaces the federated region snapshots for the management API
+// `multi_master_regions` field; nullptr / inactive => the field is omitted.
+Value BuildState(samurai::control::Servicer* svc,
+                 samurai::control::RedisMultiMasterCoordinator* mm = nullptr) {
   Value st = Value::Object();
   Value workers = Value::Array();
   for (const auto& w : svc->SnapshotWorkers()) {
@@ -44,7 +57,62 @@ Value BuildState(samurai::control::Servicer* svc) {
     workers.push_back(std::move(o));
   }
   st.set("workers", std::move(workers));
+  if (mm && mm->active()) {
+    Value regions = Value::Array();
+    for (auto& snap : mm->LatestRegionSnapshots()) regions.push_back(std::move(snap));
+    st.set("multi_master_regions", std::move(regions));
+  }
   return st;
+}
+
+// Collect the job parameters (CLI or delegated) into a single JSON spec so both
+// the local and cross-region delegated paths build a JobConfig the same way.
+Value JobSpecFromArgs(int argc, char** argv) {
+  using namespace samurai::control::daemon;
+  Value s = Value::Object();
+  s.set("count", Value::Int(OptInt(argc, argv, "--count", 0)));
+  s.set("target", Value::Str(Opt(argc, argv, "--target", "127.0.0.1")));
+  s.set("port", Value::Int(OptInt(argc, argv, "--port", 80)));
+  s.set("protocol", Value::Str(Opt(argc, argv, "--protocol", "udp")));
+  s.set("size", Value::Int(OptInt(argc, argv, "--size", 64)));
+  s.set("worker", Value::Str(Opt(argc, argv, "--worker", "cpu")));
+  s.set("target_region", Value::Str(Opt(argc, argv, "--target-region", "")));
+  s.set("job_timeout_s", Value::Int(OptInt(argc, argv, "--job-timeout-s", 0)));
+  s.set("shard_unit_count", Value::Int(OptInt(argc, argv, "--shard-unit-count", 0)));
+  s.set("poll_interval_ms", Value::Int(OptInt(argc, argv, "--poll-interval-ms", 250)));
+  return s;
+}
+
+samurai::control::JobConfig BuildJobConfig(const Value& spec, std::int64_t leader_epoch,
+                                           const std::string& tenant,
+                                           const std::string& master_region) {
+  auto geti = [&](const char* k, std::int64_t d) {
+    const Value* v = spec.find(k);
+    return v ? v->as_int(d) : d;
+  };
+  auto gets = [&](const char* k, const char* d) {
+    const Value* v = spec.find(k);
+    return v ? v->as_string(d) : std::string(d);
+  };
+  samurai::control::JobConfig job;
+  job.count = geti("count", 0);
+  job.job_timeout_s = geti("job_timeout_s", 0);
+  job.shard_unit_count = geti("shard_unit_count", 0);
+  job.master_poll_interval_ms = static_cast<int>(geti("poll_interval_ms", 250));
+  job.tenant_namespace = tenant;
+  job.leader_epoch = leader_epoch;
+  const std::string tr = LowerCopy(gets("target_region", ""));
+  job.target_region = tr;
+  job.worker_region = master_region;
+  job.region_aware_routing = !tr.empty();
+  if (!tr.empty()) job.shard_strategy = "region";
+  job.base_args = Value::Object();
+  job.base_args.set("target", Value::Str(gets("target", "127.0.0.1")));
+  job.base_args.set("port", Value::Int(geti("port", 80)));
+  job.base_args.set("protocol", Value::Str(gets("protocol", "udp")));
+  job.base_args.set("size", Value::Int(geti("size", 64)));
+  job.base_args.set("worker", Value::Str(gets("worker", "cpu")));
+  return job;
 }
 
 void Usage(const char* argv0) {
@@ -84,10 +152,24 @@ void Usage(const char* argv0) {
       "  --agent-dispatch-mode M   reverse | auto for agents (default reverse)\n"
       "  --agent-insecure-http     allow agent bootstrap on a non-loopback mgmt\n"
       "                            bind (join token + secret sent in cleartext)\n"
-      "  --ha-mode MODE            static | file-lock (default off)\n"
+      "  --target-region R         route/delegate this job to region R (region-\n"
+      "                            aware shard routing; cross-region delegation)\n"
+      "  --ha-mode MODE            static | file-lock | redis (default off)\n"
       "  --ha-node-id ID           this node's id\n"
       "  --ha-peers CSV            peer node ids (static mode)\n"
       "  --ha-lease-path PATH      lease file (file-lock mode)\n"
+      "  --ha-lease-key KEY        Redis lease key (redis mode;\n"
+      "                            default samurai:ha:<tenant|default>:lease)\n"
+      "  Multi-master (region federation):\n"
+      "  --multi-master-enable     coordinate with peer-region masters over Redis;\n"
+      "                            delegate/serve cross-region jobs. With this set,\n"
+      "                            --count 0 means serve-only (no local job)\n"
+      "  --multi-master-region-id R  this master's region (default: --target-region\n"
+      "                            unset -> required when enabled)\n"
+      "  --multi-master-redis-url U  default redis://127.0.0.1:6379/0\n"
+      "  --multi-master-namespace N  key-prefix isolation (default 'default')\n"
+      "  --multi-master-heartbeat-ttl-s N  region heartbeat TTL (default 15)\n"
+      "  --multi-master-dequeue-max N  delegated jobs pulled per poll (default 3)\n"
       "  -h, --help\n",
       argv0);
 }
@@ -111,7 +193,10 @@ int main(int argc, char** argv) {
     return 0;
   }
   const long count = OptInt(argc, argv, "--count", 0);
-  if (count <= 0) {
+  const bool mm_enabled = Flag(argc, argv, "--multi-master-enable");
+  // Multi-master masters may be serve-only (they run delegated jobs pulled from
+  // peer regions), so --count 0 is allowed then; otherwise a job needs a count.
+  if (count <= 0 && !mm_enabled) {
     std::fprintf(stderr, "samurai_master: --count must be > 0\n");
     return 2;
   }
@@ -119,10 +204,29 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, OnSignal);
   std::signal(SIGTERM, OnSignal);
 
+  const std::string ha_mode = Opt(argc, argv, "--ha-mode", "off");
+
+  // Shared Redis KvStore, backing both cross-region multi-master coordination
+  // and (optionally) the Redis-lease HA elector. Unreachable/absent Redis is not
+  // fatal: the master degrades to a single, standalone region.
+  std::unique_ptr<KvStore> kv;
+  if (mm_enabled || ha_mode == "redis") {
+    const std::string url = Opt(argc, argv, "--multi-master-redis-url", "redis://127.0.0.1:6379/0");
+    std::string kverr;
+    kv = MakeKvStore(url, kverr);
+    if (!kv) {
+      std::fprintf(stderr,
+          "samurai_master: Redis backend unavailable (%s); multi-master / redis-HA\n"
+          "  disabled — running as a single standalone region.\n",
+          kverr.c_str());
+    } else {
+      std::printf("samurai_master: Redis backend connected (%s)\n", url.c_str());
+    }
+  }
+
   // HA leadership (optional).
   std::unique_ptr<LeaderElector> elector;
   std::int64_t leader_epoch = 0;
-  const std::string ha_mode = Opt(argc, argv, "--ha-mode", "off");
   if (ha_mode == "static") {
     elector = std::make_unique<StaticLeaderElector>(Opt(argc, argv, "--ha-node-id", ""),
                                                     Opt(argc, argv, "--ha-peers", ""));
@@ -130,6 +234,17 @@ int main(int argc, char** argv) {
     elector = std::make_unique<FileLeaseLeaderElector>(
         Opt(argc, argv, "--ha-node-id", ""),
         Opt(argc, argv, "--ha-lease-path", "/tmp/ddos_samurai_master_lease.json"), 15.0);
+  } else if (ha_mode == "redis") {
+    if (kv) {
+      const std::string tenant0 = Opt(argc, argv, "--tenant-namespace", "");
+      const std::string lease_key = Opt(argc, argv, "--ha-lease-key",
+          "samurai:ha:" + (tenant0.empty() ? std::string("default") : tenant0) + ":lease");
+      elector = std::make_unique<RedisLeaseLeaderElector>(
+          Opt(argc, argv, "--ha-node-id", ""), lease_key, kv.get(), 15.0);
+    } else {
+      std::fprintf(stderr,
+          "samurai_master: --ha-mode redis requires a reachable Redis; skipping HA\n");
+    }
   }
   if (elector) {
     if (!elector->TryAcquire() || !elector->IsLeader()) {
@@ -139,6 +254,36 @@ int main(int argc, char** argv) {
     }
     elector->StartRenewLoop(5.0);
     leader_epoch = elector->LeaderEpoch();
+  }
+
+  // Cross-region multi-master coordinator (region federation). Active only with
+  // a reachable Redis backend; otherwise a harmless no-op (single region).
+  std::unique_ptr<RedisMultiMasterCoordinator> mm;
+  std::string master_region;
+  if (mm_enabled) {
+    MultiMasterConfig mmcfg;
+    mmcfg.enabled = true;
+    mmcfg.namespace_ = Opt(argc, argv, "--multi-master-namespace", "default");
+    mmcfg.region_id =
+        Opt(argc, argv, "--multi-master-region-id", Opt(argc, argv, "--target-region", ""));
+    mmcfg.node_id = Opt(argc, argv, "--ha-node-id", "master");
+    mmcfg.heartbeat_ttl_s =
+        static_cast<int>(OptInt(argc, argv, "--multi-master-heartbeat-ttl-s", 15));
+    master_region = LowerCopy(mmcfg.region_id);
+    mm = std::make_unique<RedisMultiMasterCoordinator>(mmcfg, kv.get());
+    if (mm->active()) {
+      std::printf("samurai_master: multi-master active (region=%s namespace=%s)\n",
+                  master_region.c_str(), mmcfg.namespace_.c_str());
+      if (master_region.empty()) {
+        std::fprintf(stderr,
+            "samurai_master: WARNING: multi-master enabled with an empty region id;\n"
+            "  heartbeat/dequeue are disabled. Set --multi-master-region-id.\n");
+      }
+    } else {
+      std::fprintf(stderr,
+          "samurai_master: multi-master enabled but coordinator inactive (no Redis);\n"
+          "  running as a single standalone region.\n");
+    }
   }
 
   // Control server.
@@ -232,7 +377,7 @@ int main(int argc, char** argv) {
                   curve_public.empty() ? "off" : "on", tls.enabled ? "on" : "off");
     }
     ManagementProviders providers;
-    providers.state_provider = [&servicer]() { return BuildState(&servicer); };
+    providers.state_provider = [&servicer, &mm]() { return BuildState(&servicer, mm.get()); };
     providers.abort_callback = []() {
       Value r = Value::Object();
       r.set("aborted", Value::Bool(true));
@@ -267,35 +412,93 @@ int main(int argc, char** argv) {
                  servicer.worker_count(), expect);
   }
 
-  // Build + dispatch the job.
+  // Build + dispatch the job. The base_args `worker` field declares the flavor
+  // the job needs; bundle slaves resolve their binary per shard from it, and the
+  // coordinator only dispatches to workers advertising it (WorkerDispatchScore).
   ServicerMasterView view(&servicer);
   ClientWorkerCommander commander(cluster_secret, tenant, 5000, &servicer);
   MasterCoordinator coord(&view, &commander);
+  auto guard = [&elector]() { return !elector || elector->IsLeader(); };
 
-  JobConfig job;
-  job.count = count;
-  job.job_timeout_s = OptInt(argc, argv, "--job-timeout-s", 0);
-  job.shard_unit_count = OptInt(argc, argv, "--shard-unit-count", 0);
-  job.master_poll_interval_ms = static_cast<int>(OptInt(argc, argv, "--poll-interval-ms", 250));
-  job.tenant_namespace = tenant;
-  job.leader_epoch = leader_epoch;
-  job.base_args = Value::Object();
-  job.base_args.set("target", Value::Str(Opt(argc, argv, "--target", "127.0.0.1")));
-  job.base_args.set("port", Value::Int(OptInt(argc, argv, "--port", 80)));
-  job.base_args.set("protocol", Value::Str(Opt(argc, argv, "--protocol", "udp")));
-  job.base_args.set("size", Value::Int(OptInt(argc, argv, "--size", 64)));
-  // Declare the worker flavor this job needs. Bundle slaves resolve their worker
-  // binary per shard from this field; the coordinator only dispatches shards to
-  // workers whose advertised worker_kinds include it (see WorkerDispatchScore).
-  job.base_args.set("worker", Value::Str(Opt(argc, argv, "--worker", "cpu")));
+  int rc = 0;
 
-  const JobResult res = coord.RunSingleJob(job, "job-1", [&elector]() {
-    return !elector || elector->IsLeader();
-  });
-  std::printf("%s\n", res.snapshot.dump().c_str());
+  // Background region heartbeat + snapshot publisher (leader only). Runs
+  // alongside the primary job and the serve loop; the store is thread-safe.
+  std::thread hb_thread;
+  if (mm && mm->active() && !master_region.empty()) {
+    const int hb_interval_ms = std::max(
+        1000,
+        static_cast<int>(OptInt(argc, argv, "--multi-master-heartbeat-ttl-s", 15) * 1000 / 3));
+    hb_thread = std::thread([&]() {
+      while (!g_stop.load()) {
+        if (!elector || elector->IsLeader()) {
+          Value hb = Value::Object();
+          hb.set("workers", Value::Int(static_cast<std::int64_t>(servicer.worker_count())));
+          mm->Heartbeat(hb);
+          mm->PublishSnapshot(BuildState(&servicer, nullptr));
+        }
+        for (int slept = 0; slept < hb_interval_ms && !g_stop.load(); slept += 100) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+      }
+    });
+  }
 
+  // Primary job: run it on this region's workers, or delegate the whole job to a
+  // peer region when --target-region names a different region.
+  if (count > 0) {
+    const Value spec = JobSpecFromArgs(argc, argv);
+    const std::string tr = LowerCopy(Opt(argc, argv, "--target-region", ""));
+    if (mm && mm->active() && !tr.empty() && tr != master_region) {
+      if (mm->EnqueueJob(tr, spec)) {
+        std::printf("samurai_master: delegated job (count=%ld) to region %s\n", count, tr.c_str());
+      } else {
+        std::fprintf(stderr, "samurai_master: delegation to region %s failed\n", tr.c_str());
+        rc = 1;
+      }
+    } else {
+      const JobConfig job = BuildJobConfig(spec, leader_epoch, tenant, master_region);
+      const JobResult res = coord.RunSingleJob(job, "job-1", guard);
+      std::printf("%s\n", res.snapshot.dump().c_str());
+      rc = res.rc;
+    }
+  }
+
+  // Serve loop: pull delegated jobs from peer regions and run them locally until
+  // signalled. This is what makes a region a live participant in the federation.
+  if (mm && mm->active() && !master_region.empty()) {
+    const int dequeue_max =
+        static_cast<int>(OptInt(argc, argv, "--multi-master-dequeue-max", 3));
+    std::printf("samurai_master: serving delegated jobs for region %s (Ctrl-C to stop)\n",
+                master_region.c_str());
+    long deleg_seq = 0;
+    while (!g_stop.load()) {
+      if (!elector || elector->IsLeader()) {
+        for (auto& j : mm->DequeueJobs(dequeue_max)) {
+          const JobConfig job = BuildJobConfig(j, leader_epoch, tenant, master_region);
+          const Value* from = j.find("_mmr_delegated_from");
+          const std::string from_region = from ? from->as_string("") : "";
+          std::printf("samurai_master: running delegated job from '%s' (count=%lld)\n",
+                      from_region.c_str(), static_cast<long long>(job.count));
+          const JobResult res =
+              coord.RunSingleJob(job, "deleg-" + std::to_string(++deleg_seq), guard);
+          Value ev = Value::Object();
+          ev.set("type", Value::Str("delegated_job_done"));
+          ev.set("rc", Value::Int(res.rc));
+          ev.set("from_region", Value::Str(from_region));
+          mm->PublishEvent(ev);
+          std::printf("%s\n", res.snapshot.dump().c_str());
+        }
+      }
+      for (int slept = 0; slept < 500 && !g_stop.load(); slept += 100) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
+  }
+
+  if (hb_thread.joinable()) hb_thread.join();
   if (mgmt) mgmt->Stop();
   server.Stop();
   if (elector) elector->Stop();
-  return res.rc;
+  return rc;
 }

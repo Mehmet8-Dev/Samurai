@@ -10,6 +10,7 @@ find_package(Threads REQUIRED)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   pkg_check_modules(LIBZMQ QUIET libzmq)
+  pkg_check_modules(HIREDIS QUIET hiredis)
 endif()
 
 # samurai_control — native control-plane layer, the C++ replacement for the
@@ -43,6 +44,7 @@ set(CONTROL_SOURCES
   jwt.cpp
   telemetry.cpp
   multimaster.cpp
+  redis_kvstore.cpp     # KvStore backend + redis:// url parse (hiredis opt-in)
   control_auth.cpp
   servicer.cpp
   worker_shard_service.cpp
@@ -77,6 +79,20 @@ if(LIBZMQ_FOUND)
   target_link_libraries(samurai_control PUBLIC ${LIBZMQ_LIBRARIES})
   target_compile_options(samurai_control PRIVATE ${LIBZMQ_CFLAGS_OTHER})
   target_compile_definitions(samurai_control PUBLIC SAMURAI_CONTROL_HAVE_ZMQ=1)
+endif()
+
+# hiredis (opt-in): enables the real Redis KvStore backend for cross-process /
+# cross-region multi-master coordination + Redis-lease HA. Absent -> MakeKvStore
+# returns nullptr and the master runs as a single region (in-memory fallback).
+if(HIREDIS_FOUND)
+  target_include_directories(samurai_control PRIVATE ${HIREDIS_INCLUDE_DIRS})
+  target_link_directories(samurai_control PUBLIC ${HIREDIS_LIBRARY_DIRS})
+  target_link_libraries(samurai_control PUBLIC ${HIREDIS_LIBRARIES})
+  target_compile_options(samurai_control PRIVATE ${HIREDIS_CFLAGS_OTHER})
+  target_compile_definitions(samurai_control PUBLIC SAMURAI_CONTROL_HAVE_HIREDIS=1)
+else()
+  message(WARNING "hiredis not found: real Redis KvStore backend disabled; "
+                  "multi-master coordination falls back to in-memory (single process).")
 endif()
 
 # Self-test driver: verifies the ported logic matches the Python contract.

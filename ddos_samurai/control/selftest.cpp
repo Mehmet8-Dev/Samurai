@@ -37,6 +37,7 @@
 #include "management_api.hpp"
 #include "master_coordinator.hpp"
 #include "multimaster.hpp"
+#include "redis_kvstore.hpp"
 #include "shard.hpp"
 #include "shard_runner.hpp"
 #include "telemetry.hpp"
@@ -360,6 +361,134 @@ int main() {
     Check(!offline.active(), "multimaster: null store -> inactive");
     Check(!offline.Heartbeat(), "multimaster: offline heartbeat no-op");
     Check(!offline.Snapshot().find("enabled")->as_bool(), "multimaster: offline snapshot enabled=false");
+  }
+
+  // --- multimaster federation: enqueue -> dequeue -> local dispatch e2e ---
+  // Mirrors what samurai_master does: the eu region delegates a job to us, and
+  // the us master pulls it off the shared queue and runs it on its own workers
+  // via the MasterCoordinator (fake view/commander).
+  {
+    namespace json = samurai::core::json;
+    InMemoryKvStore store;
+    std::int64_t clk = 1000;
+    auto now = [&clk]() { return clk; };
+
+    MultiMasterConfig eu_cfg;
+    eu_cfg.enabled = true;
+    eu_cfg.region_id = "eu";
+    eu_cfg.node_id = "eu-master";
+    RedisMultiMasterCoordinator eu(eu_cfg, &store, now);
+    MultiMasterConfig us_cfg;
+    us_cfg.enabled = true;
+    us_cfg.region_id = "us";
+    us_cfg.node_id = "us-master";
+    RedisMultiMasterCoordinator us(us_cfg, &store, now);
+
+    // eu delegates a 1000-packet cpu job destined for us.
+    json::Value spec = json::Value::Object();
+    spec.set("count", json::Value::Int(1000));
+    spec.set("worker", json::Value::Str("cpu"));
+    spec.set("target", json::Value::Str("10.0.0.9"));
+    Check(eu.EnqueueJob("us", spec), "federation: eu delegates job to us");
+
+    // us pulls the delegated job and reconstructs a JobConfig (as master_main's
+    // BuildJobConfig does).
+    auto jobs = us.DequeueJobs(3);
+    Check(jobs.size() == 1, "federation: us dequeues the delegated job");
+    const json::Value dj = jobs.empty() ? json::Value::Object() : jobs[0];
+    JobConfig jc;
+    jc.count = dj.find("count") ? dj.find("count")->as_int(0) : 0;
+    jc.shard_unit_count = 250;  // 4 shards
+    jc.master_poll_interval_ms = 1;
+    jc.base_args = json::Value::Object();
+    jc.base_args.set(
+        "worker", json::Value::Str(dj.find("worker") ? dj.find("worker")->as_string("cpu") : "cpu"));
+
+    // us runs it on its local worker.
+    struct FedView : MasterView {
+      std::map<std::string, WorkerInfo> workers;
+      std::map<std::string, std::string> stats;
+      std::vector<WorkerInfo> Workers() override {
+        std::vector<WorkerInfo> out;
+        for (auto& kv : workers) out.push_back(kv.second);
+        return out;
+      }
+      bool ShardReported(const std::string& sid) override { return stats.count(sid) > 0; }
+      std::string GetShardStats(const std::string& sid) override {
+        auto it = stats.find(sid);
+        return it == stats.end() ? std::string("{}") : it->second;
+      }
+      void SetShardStats(const std::string& sid, const std::string& js) override { stats[sid] = js; }
+    };
+    struct FedCmd : WorkerCommander {
+      FedView* view = nullptr;
+      int dispatched = 0;
+      DispatchOutcome Dispatch(const std::string&, const std::string& sid, const std::string&,
+                               const std::string&, std::int64_t count, std::int64_t) override {
+        ++dispatched;
+        json::Value s = json::Value::Object();
+        s.set("shard_id", json::Value::Str(sid));
+        s.set("sent", json::Value::Int(count));
+        s.set("errors", json::Value::Int(0));
+        view->SetShardStats(sid, s.dump());
+        return {true, "ok"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override { return {"done", "", "{}"}; }
+      bool StopShard(const std::string&, const std::string&) override { return true; }
+    };
+    FedView view;
+    WorkerInfo w;
+    w.worker_id = "us_cpu";
+    w.capabilities["control_endpoint"] = "tcp://us_cpu:5099";
+    w.capabilities["worker_kinds"] = "cpu";
+    w.last_heartbeat_ms = clk;
+    view.workers["us_cpu"] = w;
+    FedCmd cmd;
+    cmd.view = &view;
+    MasterCoordinator coord(&view, &cmd, [&clk]() { return clk; }, [](int) {});
+    auto res = coord.RunSingleJob(jc, "deleg-1");
+    Check(res.rc == 0, "federation: us runs the delegated job rc=0");
+    Check(cmd.dispatched == 4, "federation: delegated job split into 4 shards on us");
+    Check(us.DequeueJobs(3).empty(), "federation: us queue drained after pickup");
+  }
+
+  // --- redis_kvstore: redis:// url parsing + hiredis-absent factory ---
+  {
+    RedisUrl a = ParseRedisUrl("redis://10.0.0.5:6380/2");
+    Check(a.ok && a.host == "10.0.0.5" && a.port == 6380 && a.db == 2,
+          "redis-url: host/port/db parsed");
+    RedisUrl d = ParseRedisUrl("redis://127.0.0.1:6379/0");
+    Check(d.ok && d.host == "127.0.0.1" && d.port == 6379 && d.db == 0, "redis-url: full default");
+    RedisUrl bare = ParseRedisUrl("redis://myhost");
+    Check(bare.ok && bare.host == "myhost" && bare.port == 6379 && bare.db == 0,
+          "redis-url: bare host -> default port/db");
+    RedisUrl cred = ParseRedisUrl("redis://user:pass@cache.local:6390/1");
+    Check(cred.ok && cred.host == "cache.local" && cred.port == 6390 && cred.db == 1,
+          "redis-url: credentials skipped, host/port/db parsed");
+
+    std::string err;
+    std::unique_ptr<KvStore> kv = MakeKvStore("redis://127.0.0.1:6379/0", err);
+#ifndef SAMURAI_CONTROL_HAVE_HIREDIS
+    Check(kv == nullptr && !err.empty(), "redis-store: MakeKvStore null without hiredis");
+#else
+    // With hiredis compiled in, run a live round trip only if a test Redis is
+    // provided; otherwise just assert MakeKvStore didn't crash.
+    const char* test_url = std::getenv("SAMURAI_TEST_REDIS_URL");
+    if (test_url && kv) {
+      kv->SetEx("samurai:selftest:k", "v1", 30);
+      std::string out;
+      Check(kv->Get("samurai:selftest:k", out) && out == "v1", "redis-store: live SETEX/GET");
+      kv->RPush("samurai:selftest:l", "a");
+      kv->RPush("samurai:selftest:l", "b");
+      std::string popped;
+      Check(kv->LPop("samurai:selftest:l", popped) && popped == "a", "redis-store: live RPUSH/LPOP");
+      Check(kv->SetNx("samurai:selftest:nx", "own", 30000), "redis-store: live SET NX");
+      Check(!kv->SetNx("samurai:selftest:nx", "other", 30000), "redis-store: NX rejects held key");
+      Check(kv->CompareAndDel("samurai:selftest:nx", "own"), "redis-store: CAS del owner");
+    } else {
+      (void)kv;
+    }
+#endif
   }
 
   // --- management api: router auth + endpoints + one socket round trip ---
