@@ -36,6 +36,8 @@
 #include "stateful_fastpath.hpp"
 // L7 profil/runner kurucusu (run_profile_json'u dpdk_direct transport ile sürer).
 #include "stateful_l7_profile.hpp"
+// DPDK TX/RX shim'i (scenario_worker ile paylaşılan; yalnız SAMURAI_WITH_DPDK'da tanımlı).
+#include "dpdk_fastpath_shim.hpp"
 
 namespace {
 using samurai::daemon::OptionalIntFromWire;
@@ -72,58 +74,9 @@ struct DpdkPortGuard {
   }
 };
 
-// DPDK taşıma shim'i: paylaşılan StatefulFastpathDriver'ın byte-oriented Send/Recv
-// arayüzünü dpdk_core üzerine oturtur. Portu RX etkin (num_rx_queues=1) açar; RAII
-// ile teardown eder. tcpdp strided peek'te psize==stride olduğundan send_batch
-// birebir uyar; güvenlik için stride!=psize durumunda per-paket tx_burst yapılır.
-struct DpdkShim : samurai::daemon::FastpathTxRxShim {
-  std::int64_t handle{-1};
-  std::uint16_t queue{0};
-  std::string open_err;
-
-  DpdkShim(std::uint16_t port_id, std::uint16_t queue_id, const std::string& eal_args) {
-    samurai::dpdk::OpenConfig cfg{};
-    cfg.port_id = port_id;
-    cfg.num_tx_queues = 1;
-    cfg.num_rx_queues = 1;  // stateful: SYN-ACK'leri almak için RX şart
-    cfg.enable_rss = false;
-    cfg.burst_size = 64;
-    cfg.mempool_size = 8192u;
-    cfg.eal_args = eal_args;
-    handle = samurai::dpdk::open_port(cfg, open_err);
-    queue = queue_id;
-  }
-  ~DpdkShim() override {
-    if (handle >= 0) samurai::dpdk::close_port(handle);
-  }
-  bool ok() const { return handle >= 0; }
-
-  int Send(const std::uint8_t* base, std::size_t psize, std::size_t stride,
-           std::uint32_t count, std::string& err) override {
-    (void)err;
-    if (psize == 0) return 0;
-    if (stride == psize) {
-      const auto r = samurai::dpdk::send_batch(
-          handle, queue, base, static_cast<std::uint16_t>(psize), count);
-      return static_cast<int>(r.sent);
-    }
-    std::uint32_t sent = 0;
-    for (std::uint32_t i = 0; i < count; ++i) {
-      const auto r = samurai::dpdk::tx_burst(
-          handle, queue, base + static_cast<std::size_t>(i) * stride,
-          static_cast<std::uint16_t>(psize), 1);
-      if (r.sent == 0) break;
-      ++sent;
-    }
-    return static_cast<int>(sent);
-  }
-  int Recv(std::uint8_t* out, std::uint16_t stride, std::uint16_t* lens,
-           std::uint16_t max, std::string& err) override {
-    (void)err;
-    return samurai::dpdk::poll_rx(handle, queue, max, out, stride, lens);
-  }
-  bool RxAvailable() const override { return true; }
-};
+// DPDK taşıma shim'i (DpdkShim) artık dpdk_fastpath_shim.hpp'de tanımlı ve
+// scenario_worker ile paylaşılır; burada using ile kısa adla kullanılır.
+using samurai::daemon::DpdkShim;
 
 // Stateful fast-path job'unu koşar: portu açar, tcpdp'yi yapılandırır, L4 connect'leri
 // seed eder, ortak sürücü loop'unu çalıştırır ve nihai METRIC_SNAPSHOT + JOB_DONE

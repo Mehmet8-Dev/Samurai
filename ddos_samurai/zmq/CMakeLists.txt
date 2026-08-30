@@ -96,8 +96,22 @@ target_link_libraries(samurai_l7_worker PRIVATE pacing_engine_static samurai_l7e
 add_samurai_worker(samurai_defense_worker daemon/defense_worker.cpp)
 target_link_libraries(samurai_defense_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)
 add_samurai_worker(samurai_scenario_worker daemon/scenario_worker.cpp)
-target_include_directories(samurai_scenario_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
+target_include_directories(samurai_scenario_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk)
+# Opt-in DPDK: senaryo load_model.transport="dpdk_direct" için dpdk_worker ile AYNI
+# native çekirdek + paylaşılan stateful fast-path sürücüsü. Header'lar rte/xdp içermez;
+# libdpdk yokken kaynak SAMURAI_WITH_DPDK ile güvenli saplama derler ve worker
+# kernel_socket'e düşer (varsayılan commodity yol değişmez).
+target_sources(samurai_scenario_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk/dpdk_core.cpp)
+target_sources(samurai_scenario_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
 target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static samurai_scenario samurai_l7emu pthread)
+if(DPDK_FOUND)
+  target_compile_definitions(samurai_scenario_worker PRIVATE SAMURAI_WITH_DPDK=1)
+  target_include_directories(samurai_scenario_worker PRIVATE ${DPDK_INCLUDE_DIRS})
+  target_link_directories(samurai_scenario_worker PRIVATE ${DPDK_LIBRARY_DIRS})
+  target_link_libraries(samurai_scenario_worker PRIVATE ${DPDK_LIBRARIES})
+  target_compile_options(samurai_scenario_worker PRIVATE ${DPDK_CFLAGS_OTHER})
+  target_link_options(samurai_scenario_worker PRIVATE ${DPDK_LDFLAGS_OTHER})
+endif()
 add_samurai_worker(samurai_afpacket_worker daemon/afpacket_worker.cpp)
 target_include_directories(samurai_afpacket_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
 target_link_libraries(samurai_afpacket_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static pthread)

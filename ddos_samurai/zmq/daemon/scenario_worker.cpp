@@ -27,6 +27,16 @@
 #include "sla.hpp"
 #include "bridge.hpp"
 
+// Opt-in DPDK: senaryo load_model.transport="dpdk_direct" dediğinde L7 profilini,
+// dpdk_worker ile AYNI paylaşılan userspace stateful fast-path sürücüsü üzerinden
+// (NIC'i DpdkShim sahiplenir, driver wire'ı pump eder) koştururuz. Header'lar
+// SAMURAI_WITH_DPDK yokken boş guard olur; kernel_socket varsayılan yol değişmez.
+#include <atomic>
+#include <cstdlib>
+#include <memory>
+#include "stateful_fastpath.hpp"
+#include "dpdk_fastpath_shim.hpp"
+
 namespace {
 using samurai::daemon::OptionalIntFromWire;
 using samurai::daemon::SendFrame;
@@ -194,6 +204,91 @@ bool IsHttpBackend(const std::string& emu_protocol) {
   return emu_protocol == "http1" || emu_protocol == "http2" || emu_protocol == "quic";
 }
 
+// profile.connection_template.transport_backend'i yerinde değiştirir (json::Value
+// find() yalnız const olduğundan sub-object'i kopyalayıp geri set eder).
+void RewriteProfileTransport(samurai::core::json::Value& profile, const std::string& transport) {
+  using samurai::core::json::Value;
+  const Value* conn = profile.find("connection_template");
+  Value conn_copy = (conn != nullptr && conn->is_object()) ? *conn : Value::Object();
+  conn_copy.set("transport_backend", Value::Str(transport));
+  profile.set("connection_template", std::move(conn_copy));
+}
+
+// Derlenmiş L7 profilini yürütür ve run_profile_json çıktısını döner.
+//
+// transport dpdk/dpdk_direct ise: worker NIC'i DpdkShim ile sahiplenir ve profili
+// StatefulFastpathDriver'ın ikinci thread'inde koşar (dpdk_worker L7 dalıyla aynı
+// yol); driver TEK wire sahibi olarak RX/poll/TX pump eder. Aksi halde (kernel_socket
+// / custom_tcp) profil doğrudan çağıran thread'te koşar.
+//
+// DPDK istenmiş ama bu worker DPDK'sız derlenmiş / EAL veya port açılamıyorsa:
+// transport kernel_socket'e yeniden yazılır ve senaryo gerçek HTTP olarak commodity
+// kernel soketiyle koşar. transport_used bu düşüşü açıkça raporlar (sessiz değil).
+samurai::core::json::Value ExecuteScenarioProfile(
+    samurai::core::json::Value profile,
+    const samurai::core::json::Value& cfg,
+    const std::string& transport,
+    std::string& transport_used) {
+  using samurai::core::json::Value;
+  transport_used = transport;
+  const bool wants_dpdk = (transport == "dpdk" || transport == "dpdk_direct");
+
+#ifdef SAMURAI_WITH_DPDK
+  if (wants_dpdk) {
+    const std::uint16_t port_id = static_cast<std::uint16_t>(std::max(0,
+        std::getenv("SAMURAI_DPDK_PORT_ID") ? std::atoi(std::getenv("SAMURAI_DPDK_PORT_ID")) : 0));
+    const std::uint16_t queue_id = static_cast<std::uint16_t>(std::max(0,
+        std::getenv("SAMURAI_DPDK_QUEUE_ID") ? std::atoi(std::getenv("SAMURAI_DPDK_QUEUE_ID")) : 0));
+    std::string eal_args;
+    if (const char* p = std::getenv("SAMURAI_DPDK_EAL_ARGS")) eal_args = p;
+
+    std::string err;
+    if (samurai::dpdk::ensure_eal(eal_args, err)) {
+      samurai::daemon::DpdkShim shim(port_id, queue_id, eal_args);
+      if (shim.ok()) {
+        samurai::daemon::FastpathParams params;
+        params.backend = "dpdk";
+        params.max_duration_ms = std::getenv("SAMURAI_FASTPATH_MAX_DURATION_MS")
+            ? static_cast<std::uint64_t>(std::strtoull(std::getenv("SAMURAI_FASTPATH_MAX_DURATION_MS"), nullptr, 10))
+            : 15000ull;
+        params.drain_ms = std::getenv("SAMURAI_FASTPATH_DRAIN_MS")
+            ? static_cast<std::uint64_t>(std::strtoull(std::getenv("SAMURAI_FASTPATH_DRAIN_MS"), nullptr, 10))
+            : 500ull;
+
+        samurai::daemon::StatefulFastpathDriver driver(shim);
+        samurai::daemon::FastpathHooks hooks;  // worker nihai telemetriyi kendi yayınlar
+        std::atomic<bool> stop{false};
+        Value result = Value::Object();
+        // dpdk_direct: L7 modunda driver.Configure/SeedL4 yok; tcpdp'yi run_profile_json
+        // (engine configure_custom_tcp_bridge) yapılandırır, driver yalnız wire'ı sürer.
+        RewriteProfileTransport(profile, "dpdk_direct");
+        auto profile_ptr = std::make_shared<Value>(std::move(profile));
+        auto runner = [profile_ptr, &cfg, &result](const std::atomic<bool>&) {
+          result = l7emu::run_profile_json(*profile_ptr, cfg);
+        };
+        (void)driver.Run(params, runner, stop, hooks);
+        transport_used = "dpdk_direct";
+        return result;
+      }
+    }
+    // DPDK istendi ama açılamadı: kernel_socket'e düş (gerçek HTTP korunur).
+    transport_used = "kernel_socket(dpdk_open_failed)";
+    RewriteProfileTransport(profile, "kernel_socket");
+    return l7emu::run_profile_json(profile, cfg);
+  }
+#else
+  if (wants_dpdk) {
+    // Bu worker DPDK'sız derlendi: dpdk_direct'i wire-owner olmadan koşmak asılır;
+    // kernel_socket'e yeniden yazıp senaryoyu gerçek HTTP olarak koştur.
+    transport_used = "kernel_socket(dpdk_not_built)";
+    RewriteProfileTransport(profile, "kernel_socket");
+    return l7emu::run_profile_json(profile, cfg);
+  }
+#endif
+
+  return l7emu::run_profile_json(profile, cfg);
+}
+
 ScenarioL7Result RunScenarioL7(
     const scn::ScenarioSpecNative& spec,
     const samurai::core::json::Value& raw,
@@ -309,7 +404,8 @@ ScenarioL7Result RunScenarioL7(
   cfg.set("profile_l7", Value::Int(1));
   cfg.set("profile_sample_limit", Value::Int(0));
 
-  const Value res = l7emu::run_profile_json(profile, cfg);
+  std::string transport_used;
+  const Value res = ExecuteScenarioProfile(std::move(profile), cfg, transport, transport_used);
   auto num = [&](const char* k) -> double {
     const Value* v = res.find(k);
     return (v != nullptr && v->is_number()) ? v->as_double() : 0.0;
@@ -352,7 +448,7 @@ ScenarioL7Result RunScenarioL7(
       vus, completed_sessions, 0, R.failed);
   const Value* passed = ev.find("passed");
   R.sla_passed = (passed != nullptr && passed->as_bool(false)) ? 1 : 0;
-  R.backend_detail = emu_protocol + "/" + transport + "+l7emu";
+  R.backend_detail = emu_protocol + "/" + transport_used + "+l7emu";
   R.ok = true;
   return R;
 }
