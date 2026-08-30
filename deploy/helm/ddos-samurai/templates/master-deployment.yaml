@@ -34,252 +34,116 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
 {{ toYaml .Values.containerSecurityContext | indent 12 }}
+          # Secrets are injected via the environment; the native daemons read
+          # SAMURAI_CLUSTER_SECRET / SAMURAI_CURVE_SERVER_SECRET directly (kept
+          # off the command line). Non-secret config is inlined into args below.
           env:
             - name: SAMURAI_CLUSTER_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "ddos-samurai.fullname" . }}-auth
                   key: cluster_secret
-            - name: SAMURAI_MANAGEMENT_API_ADMIN_TOKEN
+{{- if .Values.curve.enabled }}
+            - name: SAMURAI_CURVE_SERVER_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-auth
-                  key: management_admin_token
-            - name: SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-auth
-                  key: management_operator_token
-            - name: SAMURAI_MANAGEMENT_API_VIEWER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-auth
-                  key: management_viewer_token
-            - name: SAMURAI_CONTROL_JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-auth
-                  key: control_jwt_secret
-            - name: SAMURAI_MANAGEMENT_API_JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-auth
-                  key: management_jwt_secret
-            - name: SAMURAI_MANAGEMENT_API_TRUSTED_IDENTITY_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-auth
-                  key: management_trusted_identity_secret
-            - name: SAMURAI_CONTROL_RBAC_ADMIN_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-auth
-                  key: rbac_admin_secret
-            - name: SAMURAI_CONTROL_RBAC_OPERATOR_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-auth
-                  key: rbac_operator_secret
-            - name: SAMURAI_CONTROL_RBAC_VIEWER_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-auth
-                  key: rbac_viewer_secret
-            - name: SAMURAI_CONTROL_RBAC_WORKER_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-auth
-                  key: rbac_worker_secret
-            - name: SAMURAI_TENANT_NAMESPACE
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "ddos-samurai.fullname" . }}-config
-                  key: tenant_namespace
+                  name: {{ .Values.curve.existingSecret | default (printf "%s-auth" (include "ddos-samurai.fullname" .)) }}
+                  key: curve_server_secret
+{{- end }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+          # tini (image ENTRYPOINT) runs this; args[0] selects the native binary.
           args:
-            - "--role"
-            - "master"
-            - "--control-listen"
-            - "0.0.0.0:5099"
-            - "--management-api-enable"
-            - "--management-api-listen"
-            - "0.0.0.0:{{ .Values.master.managementPort }}"
-            - "--management-api-live-interval-ms"
-            - "$(management_api_live_interval_ms)"
-            - "--management-api-jwt-role-claim"
-            - "$(management_api_jwt_role_claim)"
-            - "--management-api-jwt-tenant-claim"
-            - "$(management_api_jwt_tenant_claim)"
-            - "--management-api-trusted-identity-secret-header"
-            - "$(management_api_trusted_identity_secret_header)"
-            - "--management-api-trusted-identity-role-header"
-            - "$(management_api_trusted_identity_role_header)"
-            - "--management-api-trusted-identity-tenant-header"
-            - "$(management_api_trusted_identity_tenant_header)"
-            - "--control-jwt-role-claim"
-            - "$(control_jwt_role_claim)"
-            - "--control-jwt-tenant-claim"
-            - "$(control_jwt_tenant_claim)"
-            - "--worker-region"
-            - "$(worker_region)"
-            - "--target-region"
-            - "$(target_region)"
-            - "--cross-region-heartbeat-factor"
-            - "$(cross_region_heartbeat_factor)"
-            - "--region-aware-routing"
-            - "$(region_aware_routing)"
-            - "--control-tls-watch-files"
-            - "$(control_tls_watch_files)"
-            - "--control-tls-reload-interval-s"
-            - "$(control_tls_reload_interval_s)"
-{{- if .Values.auth.rbac.enabled }}
-            - "--control-rbac-enable"
-            - "--control-rbac-default-role"
-            - "$(control_rbac_default_role)"
+            - samurai_master
+            - --control-listen
+            - tcp://0.0.0.0:5099
+            - --management-listen
+            - 0.0.0.0:{{ .Values.master.managementPort }}
+            - --tenant-namespace
+            - {{ .Values.auth.tenantNamespace | quote }}
+{{- if not .Values.curve.enabled }}
+            # Non-loopback control bind without CURVE requires an explicit opt-in.
+            - --insecure-control
 {{- end }}
-{{- if .Values.master.rbacAudit.enabled }}
-            - "--control-rbac-audit-log-path"
-            - {{ .Values.master.rbacAudit.path | quote }}
-            - "--control-rbac-audit-success"
-            - "$(control_rbac_audit_success)"
+{{- if .Values.region.targetRegion }}
+            - --target-region
+            - {{ .Values.region.targetRegion | quote }}
 {{- end }}
-            - "--tenant-namespace"
-            - "$(SAMURAI_TENANT_NAMESPACE)"
 {{- if .Values.ha.enabled }}
-            - "--ha-enable"
-            - "--ha-node-id"
-            - "$(POD_NAME)"
-            - "--ha-mode"
-            - "$(ha_mode)"
-            - "--ha-wait-for-leader"
-            - "$(ha_wait_for_leader)"
-            - "--ha-lease-seconds"
-            - "$(ha_lease_seconds)"
-            - "--ha-renew-interval-s"
-            - "$(ha_renew_interval_s)"
-            - "--ha-redis-url"
-            - "$(ha_redis_url)"
-            - "--ha-redis-key"
-            - "$(ha_redis_key)"
-            - "--ha-etcd-endpoints"
-            - "$(ha_etcd_endpoints)"
-            - "--ha-etcd-key"
-            - "$(ha_etcd_key)"
-            - "--ha-etcd-timeout-s"
-            - "$(ha_etcd_timeout_s)"
-            - "--ha-raft-listen"
-            - "$(ha_raft_listen)"
-            - "--ha-raft-peers"
-            - "$(ha_raft_peers)"
-            - "--ha-raft-election-timeout-min-ms"
-            - "$(ha_raft_election_timeout_min_ms)"
-            - "--ha-raft-election-timeout-max-ms"
-            - "$(ha_raft_election_timeout_max_ms)"
-            - "--ha-raft-heartbeat-interval-ms"
-            - "$(ha_raft_heartbeat_interval_ms)"
-            - "--ha-raft-snapshot-threshold"
-            - "$(ha_raft_snapshot_threshold)"
-            - "--ha-raft-snapshot-keep-entries"
-            - "$(ha_raft_snapshot_keep_entries)"
+            - --ha-mode
+            - {{ .Values.ha.mode | quote }}
+            - --ha-node-id
+            - $(POD_NAME)
+{{- if eq .Values.ha.mode "redis" }}
+            - --ha-lease-key
+            - {{ .Values.ha.redis.key | quote }}
+{{- if not .Values.multiMaster.enabled }}
+            - --multi-master-redis-url
+            - {{ .Values.ha.redis.url | quote }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if .Values.multiMaster.enabled }}
-            - "--multi-master-enable"
-            - "--multi-master-region-id"
-            - "$(multi_master_region_id)"
-            - "--multi-master-redis-url"
-            - "$(multi_master_redis_url)"
-            - "--multi-master-namespace"
-            - "$(multi_master_namespace)"
-            - "--multi-master-heartbeat-ttl-s"
-            - "$(multi_master_heartbeat_ttl_s)"
-            - "--multi-master-dequeue-max"
-            - "$(multi_master_dequeue_max)"
+            - --multi-master-enable
+            - --multi-master-region-id
+            - {{ default .Values.region.workerRegion .Values.multiMaster.regionId | quote }}
+            - --multi-master-redis-url
+            - {{ .Values.multiMaster.redis.url | quote }}
+            - --multi-master-namespace
+            - {{ .Values.multiMaster.namespace | quote }}
+            - --multi-master-heartbeat-ttl-s
+            - {{ .Values.multiMaster.heartbeatTtlS | quote }}
+            - --multi-master-dequeue-max
+            - {{ .Values.multiMaster.dequeueMax | quote }}
 {{- end }}
 {{- if .Values.autoscale.enabled }}
-            - "--control-autoscale-enable"
-            - "--control-autoscale-target-kind"
-            - "$(autoscale_target_kind)"
-            - "--control-autoscale-target-name"
-            - "$(autoscale_target_name)"
-            - "--control-autoscale-min-replicas"
-            - "$(autoscale_min_replicas)"
-            - "--control-autoscale-max-replicas"
-            - "$(autoscale_max_replicas)"
-            - "--control-autoscale-step"
-            - "$(autoscale_step)"
-            - "--control-autoscale-cooldown-s"
-            - "$(autoscale_cooldown_s)"
-            - "--control-autoscale-shards-per-worker"
-            - "$(autoscale_shards_per_worker)"
-            - "--control-autoscale-idle-scale-down-s"
-            - "$(autoscale_idle_scale_down_s)"
-{{- end }}
-{{- if .Values.tls.enabled }}
-            - "--control-tls-cert"
-            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.certFile }}"
-            - "--control-tls-key"
-            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.keyFile }}"
-            - "--control-tls-client-ca"
-            - "{{ .Values.tls.mountPath }}/{{ .Values.tls.clientCaFile }}"
-            - "--control-require-client-auth"
-{{- else }}
-            - "--control-insecure"
+            # The in-cluster service account (master-rbac) is auto-detected for
+            # the live scale backend; no --autoscale-k8s-api needed in-cluster.
+            - --autoscale-enable
+            - --autoscale-target-kind
+            - {{ .Values.autoscale.targetKind | quote }}
+            - --autoscale-target-name
+            - {{ .Values.autoscale.targetName | quote }}
+            - --autoscale-namespace
+            - {{ .Release.Namespace | quote }}
+            - --autoscale-min
+            - {{ .Values.autoscale.minReplicas | quote }}
+            - --autoscale-max
+            - {{ .Values.autoscale.maxReplicas | quote }}
+            - --autoscale-step
+            - {{ .Values.autoscale.step | quote }}
+            - --autoscale-cooldown-s
+            - {{ .Values.autoscale.cooldownS | quote }}
+            - --autoscale-shards-per-worker
+            - {{ .Values.autoscale.shardsPerWorker | quote }}
+            - --autoscale-idle-scale-down-s
+            - {{ .Values.autoscale.idleScaleDownS | quote }}
 {{- end }}
 {{- range .Values.master.extraArgs }}
             - {{ . | quote }}
 {{- end }}
-          envFrom:
-            - configMapRef:
-                name: {{ include "ddos-samurai.fullname" . }}-config
           ports:
-            - containerPort: {{ .Values.master.service.port }}
-              name: grpc
+            - containerPort: 5099
+              name: control
             - containerPort: {{ .Values.master.managementPort }}
               name: mgmt
           readinessProbe:
-            httpGet:
-              path: /healthz
-              port: mgmt
+            tcpSocket:
+              port: control
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: mgmt
+            tcpSocket:
+              port: control
             initialDelaySeconds: 10
             periodSeconds: 10
           resources:
 {{ toYaml .Values.resources | indent 12 }}
-{{- if or .Values.tls.enabled .Values.master.rbacAudit.enabled }}
-          volumeMounts:
-{{- if .Values.tls.enabled }}
-            - name: tls
-              mountPath: {{ .Values.tls.mountPath }}
-              readOnly: true
-{{- end }}
-{{- if .Values.master.rbacAudit.enabled }}
-            - name: rbac-audit
-              mountPath: {{ dir .Values.master.rbacAudit.path | quote }}
-{{- end }}
-{{- end }}
       nodeSelector:
 {{ toYaml .Values.nodeSelector | indent 8 }}
       tolerations:
 {{ toYaml .Values.tolerations | indent 8 }}
       affinity:
 {{ toYaml .Values.affinity | indent 8 }}
-{{- if or .Values.tls.enabled .Values.master.rbacAudit.enabled }}
-      volumes:
-{{- if .Values.tls.enabled }}
-        - name: tls
-          secret:
-            secretName: {{ .Values.tls.existingSecret | default (printf "%s-tls" (include "ddos-samurai.fullname" .)) }}
-{{- end }}
-{{- if .Values.master.rbacAudit.enabled }}
-        - name: rbac-audit
-          emptyDir: {}
-{{- end }}
-{{- end }}
