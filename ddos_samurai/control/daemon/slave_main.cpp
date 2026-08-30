@@ -46,7 +46,7 @@ void Usage(const char* argv0) {
       "                            (no inbound server); auto = inbound server +\n"
       "                            reverse fallback if the master can't reach it\n"
       "  --reverse                 alias for --dispatch-mode reverse\n"
-      "  --cluster-secret S        cluster secret\n"
+      "  --cluster-secret S        cluster secret (or env SAMURAI_CLUSTER_SECRET)\n"
       "  --tenant-namespace T      tenant namespace\n"
       "  --curve-server-public K   master CURVE public key (Z85) — encrypts the\n"
       "                            outbound channel; required if master uses CURVE\n"
@@ -91,7 +91,8 @@ int main(int argc, char** argv) {
   }
   const std::string worker_dir = Opt(argc, argv, "--worker-dir", ".");
   const std::string listen = Opt(argc, argv, "--control-listen", "tcp://0.0.0.0:0");
-  const std::string cluster_secret = Opt(argc, argv, "--cluster-secret", "");
+  const std::string cluster_secret =
+      OptOrEnv(argc, argv, "--cluster-secret", "SAMURAI_CLUSTER_SECRET");
   const std::string tenant = Opt(argc, argv, "--tenant-namespace", "");
   const std::string worker_id = Opt(argc, argv, "--worker-id", Hostname());
   const std::string region = Opt(argc, argv, "--worker-region", "");

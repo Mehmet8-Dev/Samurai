@@ -149,9 +149,10 @@ void Usage(const char* argv0) {
   std::printf(
       "usage: %s --count N [options]\n"
       "  --control-listen EP       control server bind (default tcp://0.0.0.0:5099)\n"
-      "  --cluster-secret S        cluster secret\n"
+      "  --cluster-secret S        cluster secret (or env SAMURAI_CLUSTER_SECRET)\n"
       "  --tenant-namespace T      tenant namespace\n"
-      "  --curve-server-secret K   enable CURVE encryption (Z85 server secret key)\n"
+      "  --curve-server-secret K   enable CURVE encryption (Z85 server secret key;\n"
+      "                            or env SAMURAI_CURVE_SERVER_SECRET)\n"
       "  --gen-curve-keys          print a fresh CURVE keypair and exit\n"
       "  --insecure-control        allow a non-loopback control bind without CURVE\n"
       "                            (cluster secret sent in cleartext — unsafe)\n"
@@ -407,7 +408,8 @@ int main(int argc, char** argv) {
   Value as_json = Value::Object();
 
   // Control server.
-  const std::string cluster_secret = Opt(argc, argv, "--cluster-secret", "");
+  const std::string cluster_secret =
+      OptOrEnv(argc, argv, "--cluster-secret", "SAMURAI_CLUSTER_SECRET");
   const std::string tenant = Opt(argc, argv, "--tenant-namespace", "");
   ServicerConfig scfg;
   scfg.tenant_namespace = tenant;
@@ -416,7 +418,8 @@ int main(int argc, char** argv) {
   auth.expected_secret = cluster_secret;
   const std::string control_listen = Opt(argc, argv, "--control-listen", "tcp://0.0.0.0:5099");
   ControlServer server(control_listen, &servicer, auth);
-  const std::string curve_secret = Opt(argc, argv, "--curve-server-secret", "");
+  const std::string curve_secret =
+      OptOrEnv(argc, argv, "--curve-server-secret", "SAMURAI_CURVE_SERVER_SECRET");
   std::string curve_public;
   if (!curve_secret.empty()) {
     server.set_curve_server(curve_secret);

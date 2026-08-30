@@ -969,6 +969,25 @@ int main() {
     Check(!IsLoopbackEndpoint(""), "loopback: empty is exposed");
   }
 
+  // --- daemon_args: OptOrEnv flag/env/default precedence ---
+  {
+    using samurai::control::daemon::OptOrEnv;
+    const char* av[] = {"prog", "--cluster-secret", "from-flag"};
+    int ac = 3;
+    ::setenv("SAMURAI_TEST_SECRET", "from-env", 1);
+    Check(OptOrEnv(ac, const_cast<char**>(av), "--cluster-secret", "SAMURAI_TEST_SECRET", "d") ==
+              "from-flag",
+          "OptOrEnv: flag wins over env");
+    const char* av2[] = {"prog"};
+    Check(OptOrEnv(1, const_cast<char**>(av2), "--cluster-secret", "SAMURAI_TEST_SECRET", "d") ==
+              "from-env",
+          "OptOrEnv: env used when flag absent");
+    ::unsetenv("SAMURAI_TEST_SECRET");
+    Check(OptOrEnv(1, const_cast<char**>(av2), "--cluster-secret", "SAMURAI_TEST_SECRET", "d") ==
+              "d",
+          "OptOrEnv: default when neither set");
+  }
+
   // --- audit: RBAC tamper-evident hash chain ---
   {
     namespace json = samurai::core::json;

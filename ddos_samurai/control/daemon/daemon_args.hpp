@@ -3,6 +3,7 @@
 // Tiny argv helpers for the control daemons: "--flag value" options and
 // "--flag" booleans. Not a full parser — just enough for the daemon entrypoints.
 
+#include <cstdlib>
 #include <string>
 
 namespace samurai::control::daemon {
@@ -10,6 +11,20 @@ namespace samurai::control::daemon {
 inline std::string Opt(int argc, char** argv, const char* flag, const std::string& def) {
   for (int i = 1; i + 1 < argc; ++i) {
     if (flag == std::string(argv[i])) return argv[i + 1];
+  }
+  return def;
+}
+
+// Like Opt, but when the flag is absent falls back to environment variable
+// `env_var` (if set and non-empty), then `def`. Used for secrets (cluster
+// secret, CURVE server secret) so orchestrators can inject them via the
+// environment instead of argv, keeping them out of the process command line.
+inline std::string OptOrEnv(int argc, char** argv, const char* flag, const char* env_var,
+                            const std::string& def = "") {
+  const std::string v = Opt(argc, argv, flag, "");
+  if (!v.empty()) return v;
+  if (const char* e = std::getenv(env_var)) {
+    if (*e) return std::string(e);
   }
   return def;
 }
