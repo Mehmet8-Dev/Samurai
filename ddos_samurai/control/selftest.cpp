@@ -198,6 +198,68 @@ int main() {
     Check(d3.changed && d3.applied == 4, "autoscale: reaches desired after cooldown");
   }
 
+  // --- autoscale signal path: coordinator progress_cb reports live backlog ---
+  // Proves the wiring the daemon relies on: RunSingleJob feeds (pending,inflight)
+  // shard counts to JobConfig.progress_cb, which the master feeds to MaybeScale.
+  {
+    namespace json = samurai::core::json;
+    struct PView : MasterView {
+      std::map<std::string, WorkerInfo> workers;
+      std::map<std::string, std::string> stats;
+      std::vector<WorkerInfo> Workers() override {
+        std::vector<WorkerInfo> out;
+        for (auto& kv : workers) out.push_back(kv.second);
+        return out;
+      }
+      bool ShardReported(const std::string& sid) override { return stats.count(sid) > 0; }
+      std::string GetShardStats(const std::string& sid) override {
+        auto it = stats.find(sid);
+        return it == stats.end() ? std::string("{}") : it->second;
+      }
+      void SetShardStats(const std::string& sid, const std::string& js) override { stats[sid] = js; }
+    };
+    struct PCmd : WorkerCommander {
+      PView* view = nullptr;
+      DispatchOutcome Dispatch(const std::string&, const std::string& sid, const std::string&,
+                               const std::string&, std::int64_t count, std::int64_t) override {
+        json::Value s = json::Value::Object();
+        s.set("shard_id", json::Value::Str(sid));
+        s.set("sent", json::Value::Int(count));
+        s.set("errors", json::Value::Int(0));
+        view->SetShardStats(sid, s.dump());
+        return {true, "ok"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override {
+        return {"done", "", "{}"};
+      }
+      bool StopShard(const std::string&, const std::string&) override { return true; }
+    };
+    PView view;
+    std::int64_t clk = 1000000;
+    WorkerInfo w;
+    w.worker_id = "w1";
+    w.capabilities["control_endpoint"] = "tcp://w1:5099";
+    w.last_heartbeat_ms = clk;
+    view.workers["w1"] = w;
+    PCmd cmd;
+    cmd.view = &view;
+    MasterCoordinator coord(&view, &cmd, [&clk]() { return clk; }, [](int) {});
+    JobConfig job;
+    job.count = 1000;
+    job.shard_unit_count = 250;  // 4 shards, 1 worker => a backlog must be observed
+    job.master_poll_interval_ms = 1;
+    int max_pending = 0;
+    bool called = false;
+    job.progress_cb = [&](int p, int i) {
+      called = true;
+      if (p > max_pending) max_pending = p;
+      (void)i;
+    };
+    auto res = coord.RunSingleJob(job, "pcbjob");
+    Check(res.rc == 0, "autoscale-signal: job completes rc=0");
+    Check(called && max_pending > 0, "autoscale-signal: progress_cb saw pending backlog");
+  }
+
   // --- json: parse / access / round-trip ---
   {
     namespace json = samurai::core::json;

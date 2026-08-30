@@ -11,9 +11,11 @@
 #include <csignal>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
+#include "autoscale.hpp"
 #include "control_auth.hpp"
 #include "control_server.hpp"
 #include "curve.hpp"
@@ -42,8 +44,11 @@ std::string LowerCopy(std::string s) {
 
 // `mm` (nullable) surfaces the federated region snapshots for the management API
 // `multi_master_regions` field; nullptr / inactive => the field is omitted.
+// `autoscale_json` (nullable) is the latest autoscale decision object; when set
+// it is attached as the `autoscale` field.
 Value BuildState(samurai::control::Servicer* svc,
-                 samurai::control::RedisMultiMasterCoordinator* mm = nullptr) {
+                 samurai::control::RedisMultiMasterCoordinator* mm = nullptr,
+                 const Value* autoscale_json = nullptr) {
   Value st = Value::Object();
   Value workers = Value::Array();
   for (const auto& w : svc->SnapshotWorkers()) {
@@ -62,7 +67,30 @@ Value BuildState(samurai::control::Servicer* svc,
     for (auto& snap : mm->LatestRegionSnapshots()) regions.push_back(std::move(snap));
     st.set("multi_master_regions", std::move(regions));
   }
+  if (autoscale_json && autoscale_json->is_object()) {
+    st.set("autoscale", *autoscale_json);
+  }
   return st;
+}
+
+// Serialize an autoscale decision (+ its static target identity) into the JSON
+// object surfaced by the management API.
+Value AutoscaleStateJson(const samurai::control::AutoscaleDecision& d,
+                         const std::string& target_name, const std::string& target_kind) {
+  Value o = Value::Object();
+  o.set("enabled", Value::Bool(d.enabled));
+  o.set("changed", Value::Bool(d.changed));
+  o.set("reason", Value::Str(d.reason));
+  o.set("has_values", Value::Bool(d.has_values));
+  o.set("current", Value::Int(d.current));
+  o.set("desired", Value::Int(d.desired));
+  o.set("applied", Value::Int(d.applied));
+  o.set("target_name", Value::Str(target_name));
+  o.set("target_kind", Value::Str(target_kind));
+  // The live K8s read/patch backend is deferred; `current`/`applied` are the
+  // controller's in-memory replica model, not an observed cluster value.
+  o.set("backend", Value::Str("in-memory"));
+  return o;
 }
 
 // Collect the job parameters (CLI or delegated) into a single JSON spec so both
@@ -170,6 +198,19 @@ void Usage(const char* argv0) {
       "  --multi-master-namespace N  key-prefix isolation (default 'default')\n"
       "  --multi-master-heartbeat-ttl-s N  region heartbeat TTL (default 15)\n"
       "  --multi-master-dequeue-max N  delegated jobs pulled per poll (default 3)\n"
+      "  Autoscale (worker replica controller; decision-only, k8s patch deferred):\n"
+      "  --autoscale-enable        evaluate desired worker replicas from live load\n"
+      "                            and surface it (log + management API). Keeps the\n"
+      "                            master running as a persistent controller\n"
+      "  --autoscale-target-name N  scale target name (required to activate)\n"
+      "  --autoscale-target-kind K  deployment | statefulset (default deployment)\n"
+      "  --autoscale-namespace N   target namespace (default 'default')\n"
+      "  --autoscale-min N         min replicas (default 1)\n"
+      "  --autoscale-max N         max replicas (default 100)\n"
+      "  --autoscale-step N        max replica delta per step (default 1)\n"
+      "  --autoscale-cooldown-s N  min seconds between scale steps (default 15)\n"
+      "  --autoscale-shards-per-worker N  target shards per worker (default 4)\n"
+      "  --autoscale-idle-scale-down-s N  idle secs before scaling to min (default 60)\n"
       "  -h, --help\n",
       argv0);
 }
@@ -286,6 +327,43 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Autoscale controller (optional). The scaling *decision* state machine is
+  // native and driven by live cluster load; the K8s read/patch backend is
+  // deferred, so it runs in in-memory mode — it computes and surfaces desired
+  // worker replica counts (log + management API) but does not patch a cluster.
+  AutoscaleConfig ascfg;
+  ascfg.enabled = Flag(argc, argv, "--autoscale-enable");
+  ascfg.namespace_ = Opt(argc, argv, "--autoscale-namespace", "default");
+  ascfg.target_kind = Opt(argc, argv, "--autoscale-target-kind", "deployment");
+  ascfg.target_name = Opt(argc, argv, "--autoscale-target-name", "");
+  ascfg.min_replicas = static_cast<int>(OptInt(argc, argv, "--autoscale-min", 1));
+  ascfg.max_replicas = static_cast<int>(OptInt(argc, argv, "--autoscale-max", 100));
+  ascfg.step = static_cast<int>(OptInt(argc, argv, "--autoscale-step", 1));
+  ascfg.cooldown_s = static_cast<double>(OptInt(argc, argv, "--autoscale-cooldown-s", 15));
+  ascfg.shards_per_worker = static_cast<int>(OptInt(argc, argv, "--autoscale-shards-per-worker", 4));
+  ascfg.idle_scale_down_s =
+      static_cast<double>(OptInt(argc, argv, "--autoscale-idle-scale-down-s", 60));
+  const bool autoscale_on = ascfg.enabled && !ascfg.target_name.empty();
+  std::unique_ptr<AutoscaleController> autoscaler;
+  if (ascfg.enabled) {
+    if (ascfg.target_name.empty()) {
+      std::fprintf(stderr,
+          "samurai_master: WARNING: --autoscale-enable without --autoscale-target-name;\n"
+          "  the controller stays disabled (no target to scale).\n");
+    } else {
+      autoscaler = std::make_unique<AutoscaleController>(ascfg);
+      std::printf("samurai_master: autoscale enabled (target=%s/%s ns=%s min=%d max=%d spw=%d)\n",
+                  ascfg.target_kind.c_str(), ascfg.target_name.c_str(), ascfg.namespace_.c_str(),
+                  ascfg.min_replicas, ascfg.max_replicas, ascfg.shards_per_worker);
+    }
+  }
+  // Live load signals fed by the coordinator's progress_cb; the autoscale thread
+  // reads them and publishes its latest decision under as_mu.
+  std::atomic<int> as_pending{0};
+  std::atomic<int> as_inflight{0};
+  std::mutex as_mu;
+  Value as_json = Value::Object();
+
   // Control server.
   const std::string cluster_secret = Opt(argc, argv, "--cluster-secret", "");
   const std::string tenant = Opt(argc, argv, "--tenant-namespace", "");
@@ -377,7 +455,16 @@ int main(int argc, char** argv) {
                   curve_public.empty() ? "off" : "on", tls.enabled ? "on" : "off");
     }
     ManagementProviders providers;
-    providers.state_provider = [&servicer, &mm]() { return BuildState(&servicer, mm.get()); };
+    providers.state_provider = [&servicer, &mm, &as_mu, &as_json, autoscale_on]() {
+      Value asj;
+      bool has_as = false;
+      if (autoscale_on) {
+        std::lock_guard<std::mutex> lk(as_mu);
+        asj = as_json;
+        has_as = asj.find("enabled") != nullptr;  // populated once the thread ran
+      }
+      return BuildState(&servicer, mm.get(), has_as ? &asj : nullptr);
+    };
     providers.abort_callback = []() {
       Value r = Value::Object();
       r.set("aborted", Value::Bool(true));
@@ -420,6 +507,16 @@ int main(int argc, char** argv) {
   MasterCoordinator coord(&view, &commander);
   auto guard = [&elector]() { return !elector || elector->IsLeader(); };
 
+  // Feed the autoscale controller live shard backlog/in-flight counts from the
+  // coordinator (no-op when autoscale is off).
+  auto attach_progress = [&](JobConfig& job) {
+    if (!autoscaler) return;
+    job.progress_cb = [&as_pending, &as_inflight](int p, int i) {
+      as_pending.store(p);
+      as_inflight.store(i);
+    };
+  };
+
   int rc = 0;
 
   // Background region heartbeat + snapshot publisher (leader only). Runs
@@ -444,6 +541,38 @@ int main(int argc, char** argv) {
     });
   }
 
+  // Background autoscale evaluator (leader only). Reads the live load signals the
+  // coordinator publishes via progress_cb, evaluates one scaling step (the
+  // controller enforces its own cooldown), publishes the decision for the
+  // management API, and logs actual changes. In-memory backend: no K8s patch.
+  std::thread as_thread;
+  if (autoscaler) {
+    const int tick_ms = std::max(1000, static_cast<int>(ascfg.cooldown_s * 1000.0 / 3.0));
+    as_thread = std::thread([&]() {
+      while (!g_stop.load()) {
+        if (!elector || elector->IsLeader()) {
+          const int p = as_pending.load();
+          const int i = as_inflight.load();
+          const AutoscaleDecision d =
+              autoscaler->MaybeScale(p, i, static_cast<int>(servicer.worker_count()));
+          {
+            std::lock_guard<std::mutex> lk(as_mu);
+            as_json = AutoscaleStateJson(d, ascfg.target_name, ascfg.target_kind);
+          }
+          if (d.changed) {
+            std::printf(
+                "samurai_master: autoscale scaled current=%d desired=%d applied=%d "
+                "(pending=%d inflight=%d workers=%zu) [in-memory; k8s patch deferred]\n",
+                d.current, d.desired, d.applied, p, i, servicer.worker_count());
+          }
+        }
+        for (int slept = 0; slept < tick_ms && !g_stop.load(); slept += 100) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+      }
+    });
+  }
+
   // Primary job: run it on this region's workers, or delegate the whole job to a
   // peer region when --target-region names a different region.
   if (count > 0) {
@@ -457,7 +586,8 @@ int main(int argc, char** argv) {
         rc = 1;
       }
     } else {
-      const JobConfig job = BuildJobConfig(spec, leader_epoch, tenant, master_region);
+      JobConfig job = BuildJobConfig(spec, leader_epoch, tenant, master_region);
+      attach_progress(job);
       const JobResult res = coord.RunSingleJob(job, "job-1", guard);
       std::printf("%s\n", res.snapshot.dump().c_str());
       rc = res.rc;
@@ -475,7 +605,8 @@ int main(int argc, char** argv) {
     while (!g_stop.load()) {
       if (!elector || elector->IsLeader()) {
         for (auto& j : mm->DequeueJobs(dequeue_max)) {
-          const JobConfig job = BuildJobConfig(j, leader_epoch, tenant, master_region);
+          JobConfig job = BuildJobConfig(j, leader_epoch, tenant, master_region);
+          attach_progress(job);
           const Value* from = j.find("_mmr_delegated_from");
           const std::string from_region = from ? from->as_string("") : "";
           std::printf("samurai_master: running delegated job from '%s' (count=%lld)\n",
@@ -497,6 +628,7 @@ int main(int argc, char** argv) {
   }
 
   if (hb_thread.joinable()) hb_thread.join();
+  if (as_thread.joinable()) as_thread.join();
   if (mgmt) mgmt->Stop();
   server.Stop();
   if (elector) elector->Stop();

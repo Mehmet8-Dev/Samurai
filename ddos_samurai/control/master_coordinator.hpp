@@ -101,6 +101,10 @@ struct JobConfig {
   // Base shard args (JSON object) cloned per shard; the coordinator injects
   // count/_worker_id/_leader_epoch/role.
   samurai::core::json::Value base_args = samurai::core::json::Value::Object();
+  // Optional live progress reporter: invoked once per dispatch poll with the
+  // current (pending, inflight) shard counts. Empty => no-op (the default; all
+  // existing callers and tests are unaffected). Feeds the autoscale controller.
+  std::function<void(int pending_shards, int inflight_shards)> progress_cb;
 };
 
 struct JobResult {

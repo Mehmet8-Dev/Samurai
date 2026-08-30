@@ -6,9 +6,10 @@
 //   * FileLeaseLeaderElector — file-backed lease with flock + atomic rename,
 //                              renew loop, and release
 //
-// The Redis/etcd lease electors (external services) and the native Raft elector
-// (a full consensus implementation, ~600 lines) are deferred to later
-// increments, consistent with how the Redis-backed multimaster was handled.
+// The Redis lease elector (RedisLeaseLeaderElector below) is backed by the real
+// hiredis KvStore in redis_kvstore.{hpp,cpp}. The etcd lease elector (external
+// service) and the native Raft elector (a full consensus implementation,
+// ~600 lines) remain deferred to later increments.
 
 #include <atomic>
 #include <cstdint>
@@ -86,7 +87,8 @@ class FileLeaseLeaderElector : public LeaderElector {
 // RedisLeaseLeaderElector. The Redis protocol operations are expressed against
 // the KvStore abstraction (SET NX PX / INCR / compare-and-PEXPIRE /
 // compare-and-DEL / PTTL), so the election logic is native and testable with the
-// in-memory store; a real hiredis-backed KvStore is deferred (as elsewhere).
+// in-memory store, and runs against real Redis via the hiredis KvStore in
+// redis_kvstore.{hpp,cpp}.
 class RedisLeaseLeaderElector : public LeaderElector {
  public:
   // `store` is non-owning and may be null (offline/inactive).

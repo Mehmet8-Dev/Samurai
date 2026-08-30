@@ -6,8 +6,8 @@
 // publication, cross-region job enqueue/dequeue, region scans) is native and
 // testable. The Redis transport is abstracted behind KvStore; an in-memory
 // backend is provided here for tests/offline use, and a real hiredis-backed
-// KvStore is deferred (hiredis is not available in this environment) — the same
-// pattern used for the autoscale K8s client.
+// KvStore is provided by redis_kvstore.{hpp,cpp} (optional, gated on
+// SAMURAI_CONTROL_HAVE_HIREDIS; absent hiredis falls back to a single region).
 
 #include <cstdint>
 #include <deque>

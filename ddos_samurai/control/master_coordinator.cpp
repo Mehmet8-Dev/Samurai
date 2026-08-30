@@ -325,6 +325,15 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
       }
     }
 
+    // Live progress for the autoscale controller (no-op if unset): the current
+    // backlog (pending, not yet dispatched) and in-flight (dispatched, running)
+    // shard counts. Reported before the terminal break so a completed job emits
+    // its final 0/0.
+    if (job.progress_cb) {
+      job.progress_cb(static_cast<int>(pending.size()),
+                      static_cast<int>(inflight_by_sid.size()));
+    }
+
     if (pending.empty() && inflight_by_sid.empty()) break;
 
     // Dispatch pending shards to free workers.
