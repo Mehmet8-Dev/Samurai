@@ -49,11 +49,10 @@ bu **yanlış**. Modern ZMQ worker'ları eski görünümlü C kütüphanelerini
 | root `gpu_packet_cuda.cu`+`.hpp` → `libgpu_packet_cuda.so` | **CANLI** | `gpu_worker.cpp:28`, `doca_gpunetio_worker.cpp:321` dlopen ediyor |
 | `pacing_engine.c` (2789) + `xdp_core.c` | **CANLI** | resmi setup.py extension'ı |
 | `gpu_packet.py` (506) | **CANLI** | `anomaly_packet.py` + 9 test import ediyor |
-| `dataplane_core.c` (1479) | **ÖLÜ** | hiçbir build/`#include`/dlopen referansı yok |
-| `fast_sender.c` (2497) → `fast_sender.so` | **ÖLÜ (runtime)** | hiçbir worker dlopen etmiyor; sadece Makefile + testler; `FAST_SENDER_AVAILABLE=False` sabit |
+| `dataplane_core.c` (1479) | **SİLİNDİ** | ölüydü; hiçbir build/`#include`/dlopen referansı yoktu, kaldırıldı |
+| `fast_sender.c` → `fast_sender.so` | **SİLİNDİ** | af_packet/'e çıkarıldı (Python-free); dosya artık yok |
 
-**Güvenle silinebilir (kanıtlı):** `dataplane_core.c`, `fast_sender.c` (+ ona bağlı
-testler). Diğer "eski görünenler" modern runtime'ın parçası — **silinmez**.
+Her ikisi de kaldırıldı. Diğer "eski görünenler" modern runtime'ın parçası — **silinmez**.
 
 ---
 
@@ -152,6 +151,6 @@ Sıra: native karşılık kanıtlanmadan Python yol sökülmez.
   - [x] Offline çekirdek: `license_types`(tier/feature/limit) + `constants` + `hwid`(SHA-256) + `gates`(feature-gate enforcement, exec-grant client soyut) + `cache`(AES-256-GCM offline cache); selftest ile doğrulandı
   - [x] HTTP(S) license client → `http_client` (POSIX socket + OpenSSL TLS) + `HttpLicenseClient` (validate + exec-grant, gates'in ExecGrantClient'ı); mock HTTP sunucusuna karşı doğrulandı. heartbeat/deactivate + updater eklenecek
 - [ ] Increment 3: SendAck/JsonDone/ConfigFromEnvelope + WorkerBase event-loop
-- [ ] `dataplane_core.c` + `fast_sender.c` (kanıtlı ölü) kaldırma
+- [x] `dataplane_core.c` + `fast_sender.c` (kanıtlı ölü) kaldırma
 - [ ] doca/gpu worker .cpp monolit dekompozisyonu (burada doğrulanabilir)
 - [ ] CUDA/DOCA monolitleri (CI gerektirir)
