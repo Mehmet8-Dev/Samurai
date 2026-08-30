@@ -52,6 +52,12 @@ AutoscaleController::AutoscaleController(const AutoscaleConfig& cfg,
   last_busy_ts_ = now_fn_();
 }
 
+void AutoscaleController::set_backend(AutoscaleBackend backend) {
+  backend_ = std::move(backend);
+  has_backend_ = static_cast<bool>(backend_.read_replicas) &&
+                 static_cast<bool>(backend_.patch_replicas);
+}
+
 int AutoscaleController::Desired(int pending_shards, int inflight_shards, int workers_count) {
   const int busy = pending_shards + inflight_shards;
   if (busy > 0) {
@@ -85,7 +91,18 @@ AutoscaleDecision AutoscaleController::MaybeScale(int pending_shards, int inflig
     return d;
   }
 
-  const int cur = current_replicas_;  // in-memory read (k8s read deferred)
+  // Read the current replica count: from the live backend when set (falling back
+  // to the in-memory value on a transient read failure), else the in-memory model.
+  int cur = current_replicas_;
+  if (has_backend_) {
+    int live = 0;
+    if (backend_.read_replicas(live)) {
+      cur = live;
+      current_replicas_ = live;
+    } else {
+      d.reason = "backend-read-failed";  // proceed against the in-memory value
+    }
+  }
   const int des = Desired(std::max(0, pending_shards), std::max(0, inflight_shards),
                           std::max(0, workers_count));
 
@@ -100,12 +117,24 @@ AutoscaleDecision AutoscaleController::MaybeScale(int pending_shards, int inflig
   }
 
   const int nxt = des > cur ? std::min(des, cur + step_) : std::max(des, cur - step_);
-  // in-memory patch (k8s patch deferred): always succeeds.
-  current_replicas_ = nxt;
+  if (has_backend_) {
+    int applied = 0;
+    if (!backend_.patch_replicas(nxt, applied)) {
+      d.changed = false;
+      d.ok = false;
+      d.reason = "backend-patch-failed";
+      return d;  // no cooldown consumed: retry on the next tick
+    }
+    current_replicas_ = applied;
+    d.applied = applied;
+  } else {
+    // in-memory patch: always succeeds.
+    current_replicas_ = nxt;
+    d.applied = nxt;
+  }
   last_scale_ts_ = now;
   d.changed = true;
   d.ok = true;
-  d.applied = nxt;
   return d;
 }
 

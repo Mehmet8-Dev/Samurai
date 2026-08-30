@@ -22,6 +22,7 @@
 #include "daemon_args.hpp"
 #include "ha.hpp"
 #include "json.hpp"
+#include "k8s_client.hpp"
 #include "management_api.hpp"
 #include "master_adapters.hpp"
 #include "master_coordinator.hpp"
@@ -76,7 +77,8 @@ Value BuildState(samurai::control::Servicer* svc,
 // Serialize an autoscale decision (+ its static target identity) into the JSON
 // object surfaced by the management API.
 Value AutoscaleStateJson(const samurai::control::AutoscaleDecision& d,
-                         const std::string& target_name, const std::string& target_kind) {
+                         const std::string& target_name, const std::string& target_kind,
+                         const std::string& backend) {
   Value o = Value::Object();
   o.set("enabled", Value::Bool(d.enabled));
   o.set("changed", Value::Bool(d.changed));
@@ -87,9 +89,9 @@ Value AutoscaleStateJson(const samurai::control::AutoscaleDecision& d,
   o.set("applied", Value::Int(d.applied));
   o.set("target_name", Value::Str(target_name));
   o.set("target_kind", Value::Str(target_kind));
-  // The live K8s read/patch backend is deferred; `current`/`applied` are the
-  // controller's in-memory replica model, not an observed cluster value.
-  o.set("backend", Value::Str("in-memory"));
+  // "kubernetes" => current/applied reflect the cluster scale subresource;
+  // "in-memory" => the controller's internal model (no cluster backend resolved).
+  o.set("backend", Value::Str(backend));
   return o;
 }
 
@@ -211,6 +213,10 @@ void Usage(const char* argv0) {
       "  --autoscale-cooldown-s N  min seconds between scale steps (default 15)\n"
       "  --autoscale-shards-per-worker N  target shards per worker (default 4)\n"
       "  --autoscale-idle-scale-down-s N  idle secs before scaling to min (default 60)\n"
+      "  --autoscale-k8s-api URL   scale via this API base (e.g. http://127.0.0.1:8001\n"
+      "                            from `kubectl proxy`); omit to auto-detect the\n"
+      "                            in-cluster service account, else in-memory only\n"
+      "  --autoscale-k8s-insecure  skip TLS verification for the k8s API (dev only)\n"
       "  -h, --help\n",
       argv0);
 }
@@ -355,6 +361,42 @@ int main(int argc, char** argv) {
       std::printf("samurai_master: autoscale enabled (target=%s/%s ns=%s min=%d max=%d spw=%d)\n",
                   ascfg.target_kind.c_str(), ascfg.target_name.c_str(), ascfg.namespace_.c_str(),
                   ascfg.min_replicas, ascfg.max_replicas, ascfg.shards_per_worker);
+      // Resolve a live Kubernetes backend: an explicit --autoscale-k8s-api (e.g.
+      // `kubectl proxy`) wins, else in-cluster service-account auto-detect. When
+      // none resolves the controller stays in in-memory decision-only mode.
+      const K8sConfig k8scfg = ResolveK8sConfig(Opt(argc, argv, "--autoscale-k8s-api", ""),
+                                                Flag(argc, argv, "--autoscale-k8s-insecure"));
+      if (k8scfg.active) {
+        const std::string kind = ascfg.target_kind;
+        const std::string ns = ascfg.namespace_;
+        const std::string name = ascfg.target_name;
+        AutoscaleBackend backend;
+        backend.read_replicas = [k8scfg, kind, ns, name](int& out) {
+          const ScaleResult r = GetScale(k8scfg, kind, ns, name);
+          if (!r.ok) {
+            std::fprintf(stderr, "samurai_master: autoscale k8s read failed: %s\n", r.error.c_str());
+            return false;
+          }
+          out = r.replicas;
+          return true;
+        };
+        backend.patch_replicas = [k8scfg, kind, ns, name](int desired, int& applied) {
+          const ScaleResult r = PatchScale(k8scfg, kind, ns, name, desired);
+          if (!r.ok) {
+            std::fprintf(stderr, "samurai_master: autoscale k8s patch failed: %s\n",
+                         r.error.c_str());
+            return false;
+          }
+          applied = r.replicas;
+          return true;
+        };
+        autoscaler->set_backend(std::move(backend));
+        std::printf("samurai_master: autoscale backend=kubernetes (source=%s api=%s)\n",
+                    k8scfg.source.c_str(), k8scfg.api_base.c_str());
+      } else {
+        std::printf("samurai_master: autoscale backend=in-memory "
+                    "(no k8s config; decision-only)\n");
+      }
     }
   }
   // Live load signals fed by the coordinator's progress_cb; the autoscale thread
@@ -555,15 +597,18 @@ int main(int argc, char** argv) {
           const int i = as_inflight.load();
           const AutoscaleDecision d =
               autoscaler->MaybeScale(p, i, static_cast<int>(servicer.worker_count()));
+          const std::string backend = autoscaler->backend_mode();
           {
             std::lock_guard<std::mutex> lk(as_mu);
-            as_json = AutoscaleStateJson(d, ascfg.target_name, ascfg.target_kind);
+            as_json = AutoscaleStateJson(d, ascfg.target_name, ascfg.target_kind, backend);
           }
           if (d.changed) {
             std::printf(
                 "samurai_master: autoscale scaled current=%d desired=%d applied=%d "
-                "(pending=%d inflight=%d workers=%zu) [in-memory; k8s patch deferred]\n",
-                d.current, d.desired, d.applied, p, i, servicer.worker_count());
+                "(pending=%d inflight=%d workers=%zu) [backend=%s]\n",
+                d.current, d.desired, d.applied, p, i, servicer.worker_count(), backend.c_str());
+          } else if (!d.reason.empty() && d.reason != "cooldown" && d.reason != "disabled") {
+            std::fprintf(stderr, "samurai_master: autoscale no change (%s)\n", d.reason.c_str());
           }
         }
         for (int slept = 0; slept < tick_ms && !g_stop.load(); slept += 100) {

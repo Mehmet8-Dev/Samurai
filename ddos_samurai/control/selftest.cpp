@@ -34,6 +34,7 @@
 #include "ha.hpp"
 #include "json.hpp"
 #include "jwt.hpp"
+#include "k8s_client.hpp"
 #include "management_api.hpp"
 #include "master_coordinator.hpp"
 #include "multimaster.hpp"
@@ -258,6 +259,77 @@ int main() {
     auto res = coord.RunSingleJob(job, "pcbjob");
     Check(res.rc == 0, "autoscale-signal: job completes rc=0");
     Check(called && max_pending > 0, "autoscale-signal: progress_cb saw pending backlog");
+  }
+
+  // --- k8s_client: scale path + config resolution ---
+  {
+    Check(ScalePath("deployment", "default", "slave") ==
+              "/apis/apps/v1/namespaces/default/deployments/slave/scale",
+          "k8s: deployment scale path");
+    Check(ScalePath("StatefulSet", "ns1", "s") ==
+              "/apis/apps/v1/namespaces/ns1/statefulsets/s/scale",
+          "k8s: statefulset scale path (case-insensitive)");
+    auto over = ResolveK8sConfig("http://127.0.0.1:8001", false);
+    Check(over.active && over.source == "api-override" && over.api_base == "http://127.0.0.1:8001",
+          "k8s: api-override config active");
+    // No override + no in-cluster service account => inactive (in-memory fallback).
+    ::unsetenv("KUBERNETES_SERVICE_HOST");
+    auto none = ResolveK8sConfig("", false);
+    Check(!none.active, "k8s: no config => inactive");
+    // Live scale round-trip only when a proxy is provided (e.g. `kubectl proxy`).
+    if (const char* api = std::getenv("SAMURAI_TEST_K8S_API")) {
+      const char* kind = std::getenv("SAMURAI_TEST_K8S_KIND");
+      const char* ns = std::getenv("SAMURAI_TEST_K8S_NS");
+      const char* name = std::getenv("SAMURAI_TEST_K8S_NAME");
+      auto cfg = ResolveK8sConfig(api, true);
+      auto g = GetScale(cfg, kind ? kind : "deployment", ns ? ns : "default",
+                        name ? name : "ddos-samurai-slave");
+      Check(g.ok, "k8s(live): GET scale ok");
+      auto p = PatchScale(cfg, kind ? kind : "deployment", ns ? ns : "default",
+                          name ? name : "ddos-samurai-slave", g.replicas);
+      Check(p.ok && p.replicas == g.replicas, "k8s(live): PATCH scale round-trip");
+    }
+  }
+
+  // --- autoscale real backend: reads + patches through the injected backend ---
+  {
+    double clock = 1000.0;
+    AutoscaleConfig cfg;
+    cfg.enabled = true;
+    cfg.target_name = "slave";
+    cfg.min_replicas = 1;
+    cfg.max_replicas = 10;
+    cfg.step = 10;         // no step limiting so we reach desired in one move
+    cfg.cooldown_s = 5.0;
+    cfg.shards_per_worker = 4;
+    AutoscaleController ctl(cfg, [&clock]() { return clock; });
+    int cluster_replicas = 2;  // the "live" replica count the backend owns
+    int reads = 0, patches = 0;
+    AutoscaleBackend b;
+    b.read_replicas = [&](int& out) { ++reads; out = cluster_replicas; return true; };
+    b.patch_replicas = [&](int desired, int& applied) {
+      ++patches;
+      cluster_replicas = desired;  // the cluster adopts the desired count
+      applied = desired;
+      return true;
+    };
+    ctl.set_backend(std::move(b));
+    Check(ctl.has_backend() && ctl.backend_mode() == "kubernetes", "autoscale-k8s: backend active");
+    // 16 pending / 4 per worker => desired 4; backend read sees 2, patch -> 4.
+    auto d = ctl.MaybeScale(16, 0, 1);
+    Check(d.changed && d.ok && d.current == 2 && d.desired == 4 && d.applied == 4,
+          "autoscale-k8s: read=2 patch->4 applied");
+    Check(reads == 1 && patches == 1 && cluster_replicas == 4,
+          "autoscale-k8s: backend read+patch invoked, cluster updated");
+    // Backend patch failure => no change, retry (no cooldown consumed).
+    clock += 6.0;
+    AutoscaleBackend bf;
+    bf.read_replicas = [&](int& out) { out = cluster_replicas; return true; };
+    bf.patch_replicas = [&](int, int&) { return false; };
+    ctl.set_backend(std::move(bf));
+    auto d2 = ctl.MaybeScale(40, 0, 1);  // desired 10 > 4 => wants a patch
+    Check(!d2.changed && !d2.ok && d2.reason == "backend-patch-failed",
+          "autoscale-k8s: patch failure reported, no change");
   }
 
   // --- json: parse / access / round-trip ---

@@ -45,6 +45,7 @@ set(CONTROL_SOURCES
   telemetry.cpp
   multimaster.cpp
   redis_kvstore.cpp     # KvStore backend + redis:// url parse (hiredis opt-in)
+  k8s_client.cpp        # scale subresource GET/PATCH (in-cluster SA / dev proxy)
   control_auth.cpp
   servicer.cpp
   worker_shard_service.cpp
