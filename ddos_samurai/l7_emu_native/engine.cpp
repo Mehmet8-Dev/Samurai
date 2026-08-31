@@ -192,6 +192,10 @@ struct Http1Connection {
   std::size_t custom_send_queued_bytes{0};
   std::uint32_t custom_send_enqueue_count{0};
   bool custom_terminal{false};
+  // Set when service_custom_tcp_lanes appends fresh RX payload; lets the per-poll
+  // lane scan skip re-parsing Reading lanes that got no new bytes (no progress
+  // possible), avoiding an O(read_buffer) rescan every cycle per in-flight lane.
+  bool custom_rx_pending{false};
   H1ReadBuffer read_buffer{};
   long long idle_deadline_ms{0};
   std::size_t timer_slot{0};
@@ -702,6 +706,7 @@ void reset_h1_lane_io(H1Lane& lane) {
     lane.conn->custom_send_queued_bytes = 0;
     lane.conn->custom_send_enqueue_count = 0;
     lane.conn->custom_terminal = false;
+    lane.conn->custom_rx_pending = false;
   }
   lane.write_offset = 0;
   lane.request_start_ms = 0;
@@ -1589,7 +1594,6 @@ bool h1_lane_try_parse_response(H1Lane& lane) {
         const std::string_view value_view = line.substr(colon + 1);
         std::string key = lowercase_copy(key_view);
         std::string value = trim_header_value_copy(value_view);
-        lane.response.header_fields.emplace_back(key, value);
         if (ascii_iequals(key_view, "content-length")) {
           has_content_length = true;
           content_length_value = static_cast<std::size_t>(std::strtoull(value.c_str(), nullptr, 10));
@@ -1597,6 +1601,9 @@ bool h1_lane_try_parse_response(H1Lane& lane) {
                    ascii_icontains(value_view, "chunked")) {
           lane.parser.chunked = true;
         }
+        // Move the owned strings in -- emplacing the lvalues would copy (and thus
+        // heap-allocate) both key and value a second time per header line.
+        lane.response.header_fields.emplace_back(std::move(key), std::move(value));
       }
       pos = next + 2;
     }
@@ -1782,9 +1789,11 @@ void enqueue_ready_h1_lane(
   completed.tx_bytes = lane.tx_bytes;
   completed.rx_bytes = lane.rx_bytes;
   completed.success = lane.phase != H1LanePhase::Failed && lane.response.status_code > 0;
-  completed.scenario_flow = lane.request_spec.scenario_flow;
-  completed.scenario_vu_id = lane.request_spec.scenario_vu_id;
-  completed.scenario_on_failure = lane.request_spec.scenario_on_failure;
+  // follow_ops is already moved out above; the request_spec is fully overwritten on
+  // the lane's next dispatch, so the scenario strings can be moved rather than copied.
+  completed.scenario_flow = std::move(lane.request_spec.scenario_flow);
+  completed.scenario_vu_id = std::move(lane.request_spec.scenario_vu_id);
+  completed.scenario_on_failure = std::move(lane.request_spec.scenario_on_failure);
   if (shard_idx < runtime.local_shards.size()) {
     runtime.local_shards[shard_idx].ready_completions.push_back(CompletionEnvelope{
         CompletionKind::H1,
@@ -2066,6 +2075,7 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
         conn.read_buffer.append(
             reinterpret_cast<const char*>(item.payload),
             item.payload_len);
+        conn.custom_rx_pending = true;
         lane.response.bytes_received += item.payload_len;
         lane.rx_bytes += item.payload_len;
         if (conn.custom_send_outstanding > 0) {
@@ -2099,7 +2109,13 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
       if (lane.phase == H1LanePhase::Writing) {
         result = h1_lane_write_step(lane);
       } else if (lane.phase == H1LanePhase::Reading) {
-        result = h1_lane_read_step(lane);
+        // Only re-parse when fresh RX payload arrived (or the flow closed);
+        // otherwise a Reading lane cannot make progress and re-scanning
+        // read_buffer for the header terminator is pure per-cycle waste.
+        if (lane.conn->custom_rx_pending || lane.conn->custom_terminal) {
+          lane.conn->custom_rx_pending = false;
+          result = h1_lane_read_step(lane);
+        }
       } else if (lane.phase == H1LanePhase::Complete) {
         result = H1LaneIoResult::Completed;
       } else if (lane.phase == H1LanePhase::Failed) {
