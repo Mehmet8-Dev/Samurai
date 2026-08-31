@@ -201,7 +201,7 @@ void Usage(const char* argv0) {
       "  --multi-master-namespace N  key-prefix isolation (default 'default')\n"
       "  --multi-master-heartbeat-ttl-s N  region heartbeat TTL (default 15)\n"
       "  --multi-master-dequeue-max N  delegated jobs pulled per poll (default 3)\n"
-      "  Autoscale (worker replica controller; decision-only, k8s patch deferred):\n"
+      "  Autoscale (worker replica controller; live k8s scale patch or in-memory):\n"
       "  --autoscale-enable        evaluate desired worker replicas from live load\n"
       "                            and surface it (log + management API). Keeps the\n"
       "                            master running as a persistent controller\n"
