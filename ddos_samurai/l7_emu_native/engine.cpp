@@ -1678,6 +1678,38 @@ H1LaneIoResult h1_lane_read_step(H1Lane& lane) {
   if (!lane.conn || lane.conn->fd < 0) {
     return H1LaneIoResult::Failed;
   }
+  // custom_tcp/dpdk_direct: RX payloads are pushed straight into conn.read_buffer by
+  // service_custom_tcp_lanes -- there is no pull-side socket to recv() from. Parse in
+  // place and yield Pending until more payload arrives. Draining via recv_bridge would
+  // copy the buffer out to a temp and re-append it, spinning forever (and reordering
+  // data past the 8 KB temp) on any response not complete in the first pushed chunk.
+  if (is_custom_tcp_backend(lane.transport_backend)) {
+    if (h1_lane_try_parse_response(lane)) {
+      lane.phase = H1LanePhase::Complete;
+      return H1LaneIoResult::Completed;
+    }
+    if (lane.conn->custom_terminal) {
+      // Flow closed: mirror the kernel n==0 handling for close-delimited bodies.
+      if (lane.parser.header_complete && lane.parser.close_delimited) {
+        const std::string_view data = lane.conn->read_buffer.view();
+        lane.parser.expected_body_length =
+            data.size() > lane.parser.body_offset
+            ? data.size() - lane.parser.body_offset
+            : 0;
+        lane.response.body.assign(data.substr(
+            lane.parser.body_offset,
+            lane.parser.expected_body_length));
+        lane.response.consumed_bytes = lane.parser.body_offset + lane.parser.expected_body_length;
+        lane.response.keep_alive = false;
+        lane.conn->read_buffer.clear();
+        lane.phase = lane.response.status_code > 0 ? H1LanePhase::Complete : H1LanePhase::Failed;
+        return lane.response.status_code > 0 ? H1LaneIoResult::Completed : H1LaneIoResult::Failed;
+      }
+      lane.phase = H1LanePhase::Failed;
+      return H1LaneIoResult::Failed;
+    }
+    return H1LaneIoResult::Pending;
+  }
   const H1TransportOps& transport_ops = resolve_h1_transport_ops(lane.transport_backend);
   while (true) {
     if (h1_lane_try_parse_response(lane)) {
