@@ -168,7 +168,8 @@ class TcpDataplaneCore {
     uint32_t rto_ms = 0;
     uint64_t deadline_ns = 0;
     uint32_t payload_offset = 0;
-    std::vector<uint8_t> payload;
+    // Retransmit payload lives in FlowEntry::retx_buf (reused across sends to avoid
+    // per-send heap churn); this struct only carries offset/len into it.
   };
 
   struct FlowEntry {
@@ -207,6 +208,9 @@ class TcpDataplaneCore {
     bool tls_native_active = false;
     uint8_t tls_state = 0;
     std::optional<OutstandingTx> outstanding;
+    // Persistent per-flow retransmit buffer. assign() reuses its capacity across
+    // sends, so steady-state re-sends cost a memcpy with no allocation/free.
+    std::vector<uint8_t> retx_buf;
   };
 
   enum class TimerKind : uint8_t {
@@ -326,6 +330,8 @@ class TcpDataplaneCore {
   size_t BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out, uint8_t* out_buffer) const;
   bool EnqueueTxPacketBytes(const uint8_t* data, size_t len);
   void PushTimer(uint64_t flow_id, TimerKind kind, uint64_t due_ns, uint32_t generation);
+  // Recompute the lock-free due-hint for a shard. Caller must hold timer_shard_mu_[shard].
+  void RefreshTimerHint(size_t shard);
   void ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns);
   void QueuePacket(
       FlowEntry& flow,
@@ -350,6 +356,9 @@ class TcpDataplaneCore {
   mutable std::array<SpinLock, kFlowLockShards> timer_shard_mu_{};
   std::array<std::set<uint64_t>, kFlowLockShards> active_flow_ids_shard_{};
   std::array<std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>, kFlowLockShards> timer_heap_shard_{};
+  // Lock-free hint of each shard's earliest due_ns (UINT64_MAX = empty). Lets Poll
+  // skip shards with nothing due without taking their timer spinlock.
+  std::array<std::atomic<uint64_t>, kFlowLockShards> timer_shard_min_due_ns_{};
   uint32_t poll_rr_shard_ = 0;
   TcpDpConfig config_;
   uint64_t next_flow_id_ = 1;
