@@ -233,7 +233,7 @@ int main() {
       ProbeOutcome Probe(const std::string&, const std::string&) override {
         return {"done", "", "{}"};
       }
-      bool StopShard(const std::string&, const std::string&) override { return true; }
+      bool StopShard(const std::string&, const std::string&, std::int64_t) override { return true; }
     };
     PView view;
     std::int64_t clk = 1000000;
@@ -578,7 +578,7 @@ int main() {
         return {true, "ok"};
       }
       ProbeOutcome Probe(const std::string&, const std::string&) override { return {"done", "", "{}"}; }
-      bool StopShard(const std::string&, const std::string&) override { return true; }
+      bool StopShard(const std::string&, const std::string&, std::int64_t) override { return true; }
     };
     FedView view;
     WorkerInfo w;
@@ -914,7 +914,7 @@ int main() {
         return {true, "ok"};
       }
       ProbeOutcome Probe(const std::string&, const std::string&) override { return {"done", "", "{}"}; }
-      bool StopShard(const std::string&, const std::string&) override { return true; }
+      bool StopShard(const std::string&, const std::string&, std::int64_t) override { return true; }
     };
 
     FakeView view;
@@ -1135,6 +1135,26 @@ int main() {
               srr.find("error")->as_string().find("stale leader epoch") != std::string::npos,
           "wss: stale leader epoch rejected");
 
+    // StopShard is fenced too: a zombie master (epoch below the watermark of 5)
+    // must not be able to tear down a shard the current leader owns. The fence
+    // trips before the shard lookup, so it holds even for a running shard.
+    json::Value stop_stale = json::Value::Object();
+    stop_stale.set("shard_id", json::Value::Str("shard-1"));
+    stop_stale.set("_leader_epoch", json::Value::Int(3));
+    auto stp = svc.StopShard(stop_stale, ctx);
+    Check(!stp.find("stopped")->as_bool() && stp.find("error") &&
+              stp.find("error")->as_string().find("stale leader epoch") != std::string::npos,
+          "wss: stale leader epoch stop rejected");
+
+    // A current-epoch stop clears the fence (no stale-epoch error).
+    json::Value stop_ok = json::Value::Object();
+    stop_ok.set("shard_id", json::Value::Str("shard-absent"));
+    stop_ok.set("_leader_epoch", json::Value::Int(5));
+    auto stp2 = svc.StopShard(stop_ok, ctx);
+    Check(!(stp2.find("error") &&
+            stp2.find("error")->as_string().find("stale leader epoch") != std::string::npos),
+          "wss: current-epoch stop passes fence");
+
     // Unknown worker id -> disconnected.
     json::Value other = json::Value::Object();
     other.set("worker_id", json::Value::Str("worker-Z"));
@@ -1175,7 +1195,7 @@ int main() {
       ProbeOutcome Probe(const std::string&, const std::string&) override {
         return {"done", "", "{}"};
       }
-      bool StopShard(const std::string&, const std::string&) override { return true; }
+      bool StopShard(const std::string&, const std::string&, std::int64_t) override { return true; }
     };
 
     FakeView view;
@@ -1236,7 +1256,7 @@ int main() {
         return {false, "direct path must not be used for a reverse worker"};
       }
       ProbeOutcome Probe(const std::string&, const std::string&) override { return {}; }
-      bool StopShard(const std::string&, const std::string&) override { return true; }
+      bool StopShard(const std::string&, const std::string&, std::int64_t) override { return true; }
       DispatchOutcome DispatchReverse(const std::string&, const std::string& sid, const std::string&,
                                       const std::string&, std::int64_t count,
                                       std::int64_t) override {
@@ -1306,7 +1326,7 @@ int main() {
         return {false, "no"};
       }
       ProbeOutcome Probe(const std::string&, const std::string&) override { return {}; }
-      bool StopShard(const std::string&, const std::string&) override { return true; }
+      bool StopShard(const std::string&, const std::string&, std::int64_t) override { return true; }
       DispatchOutcome DispatchReverse(const std::string&, const std::string& sid, const std::string&,
                                       const std::string&, std::int64_t count,
                                       std::int64_t) override {
@@ -1378,7 +1398,7 @@ int main() {
         return {false, "E_RPC endpoint unreachable (simulated NAT)"};
       }
       ProbeOutcome Probe(const std::string&, const std::string&) override { return {}; }
-      bool StopShard(const std::string&, const std::string&) override { return true; }
+      bool StopShard(const std::string&, const std::string&, std::int64_t) override { return true; }
       DispatchOutcome DispatchReverse(const std::string&, const std::string& sid, const std::string&,
                                       const std::string&, std::int64_t count,
                                       std::int64_t) override {
@@ -1791,9 +1811,10 @@ int main() {
     SlaveNode slave(&slave_client, slcfg);
     slave.set_on_start(
         [&worker_svc](const json::Value& s) { worker_svc.StartShard(s, RpcContext{}); });
-    slave.set_on_stop([&worker_svc](const std::string& sid) {
+    slave.set_on_stop([&worker_svc](const std::string& sid, std::int64_t leader_epoch) {
       json::Value stop = json::Value::Object();
       stop.set("shard_id", json::Value::Str(sid));
+      stop.set("_leader_epoch", json::Value::Int(leader_epoch));
       worker_svc.StopShard(stop, RpcContext{});
     });
     slave.set_active_shard_provider([&worker_svc]() { return worker_svc.ActiveShardId(); });

@@ -188,6 +188,7 @@ Value Servicer::Heartbeat(const Value& body, const RpcContext& ctx) {
       out.set("shard", std::move(shard));
     } else if (cmd.type == "stop") {
       out.set("stop_shard", Str(cmd.shard_id));
+      out.set("stop_leader_epoch", Value::Int(cmd.leader_epoch));
     }
   }
   return out;

@@ -58,7 +58,8 @@ class WorkerCommander {
                                    const std::string& job_id, const std::string& args_json,
                                    std::int64_t packet_count, std::int64_t timeout_ms) = 0;
   virtual ProbeOutcome Probe(const std::string& endpoint, const std::string& worker_id) = 0;
-  virtual bool StopShard(const std::string& endpoint, const std::string& shard_id) = 0;
+  virtual bool StopShard(const std::string& endpoint, const std::string& shard_id,
+                         std::int64_t leader_epoch) = 0;
 
   // Reverse-mode delivery (NAT'd workers with no inbound endpoint): keyed by
   // worker_id, the command is queued on the master and pulled by the worker on
@@ -71,8 +72,9 @@ class WorkerCommander {
     (void)packet_count; (void)timeout_ms;
     return {false, "reverse dispatch not supported"};
   }
-  virtual bool StopShardReverse(const std::string& worker_id, const std::string& shard_id) {
-    (void)worker_id; (void)shard_id;
+  virtual bool StopShardReverse(const std::string& worker_id, const std::string& shard_id,
+                                std::int64_t leader_epoch) {
+    (void)worker_id; (void)shard_id; (void)leader_epoch;
     return false;
   }
 };

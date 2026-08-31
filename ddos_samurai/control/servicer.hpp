@@ -33,6 +33,7 @@ struct PendingCommand {
   std::string args_json = "{}";
   std::int64_t packet_count = 0;
   std::int64_t timeout_ms = 0;
+  std::int64_t leader_epoch = 0;  // fences reverse-delivered "stop" against zombies
 };
 
 // Transport-agnostic control service interface (one method per proto RPC).

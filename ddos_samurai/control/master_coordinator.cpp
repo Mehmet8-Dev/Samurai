@@ -437,9 +437,9 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
       if (reverse_dispatch_ms.count(sid)) {
         // Pull-delivered shard (reverse or auto-fallback): queue the stop; the
         // worker pulls it on the next heartbeat.
-        stopped = wid.empty() ? false : commander_->StopShardReverse(wid, sid);
+        stopped = wid.empty() ? false : commander_->StopShardReverse(wid, sid, job.leader_epoch);
       } else if (!ep.empty()) {
-        stopped = commander_->StopShard(ep, sid);
+        stopped = commander_->StopShard(ep, sid, job.leader_epoch);
       }
       if (stopped) {
         it = unresolved.erase(it);

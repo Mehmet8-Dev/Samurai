@@ -112,11 +112,12 @@ ProbeOutcome ClientWorkerCommander::Probe(const std::string& endpoint,
   return out;
 }
 
-bool ClientWorkerCommander::StopShard(const std::string& endpoint, const std::string& shard_id) {
+bool ClientWorkerCommander::StopShard(const std::string& endpoint, const std::string& shard_id,
+                                      std::int64_t leader_epoch) {
   WorkerControlClient wc(endpoint, cluster_secret_, tenant_namespace_, timeout_ms_);
   const std::string cpub = CurveByEndpoint(servicer_, endpoint);
   if (!cpub.empty()) (void)wc.set_curve_client(cpub);
-  const wire::Response r = wc.StopShard(shard_id, true);
+  const wire::Response r = wc.StopShard(shard_id, true, leader_epoch);
   return r.ok && BodyBool(r, "stopped");
 }
 
@@ -148,11 +149,13 @@ DispatchOutcome ClientWorkerCommander::DispatchReverse(const std::string& worker
 }
 
 bool ClientWorkerCommander::StopShardReverse(const std::string& worker_id,
-                                             const std::string& shard_id) {
+                                             const std::string& shard_id,
+                                             std::int64_t leader_epoch) {
   if (!servicer_) return false;
   PendingCommand cmd;
   cmd.type = "stop";
   cmd.shard_id = shard_id;
+  cmd.leader_epoch = leader_epoch;
   servicer_->EnqueueCommand(worker_id, cmd);
   return true;  // best-effort enqueue; delivered on the worker's next heartbeat
 }

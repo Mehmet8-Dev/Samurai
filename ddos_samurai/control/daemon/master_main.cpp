@@ -274,7 +274,6 @@ int main(int argc, char** argv) {
 
   // HA leadership (optional).
   std::unique_ptr<LeaderElector> elector;
-  std::int64_t leader_epoch = 0;
   if (ha_mode == "static") {
     elector = std::make_unique<StaticLeaderElector>(Opt(argc, argv, "--ha-node-id", ""),
                                                     Opt(argc, argv, "--ha-peers", ""));
@@ -301,8 +300,14 @@ int main(int argc, char** argv) {
       return 0;
     }
     elector->StartRenewLoop(5.0);
-    leader_epoch = elector->LeaderEpoch();
   }
+  // Fencing token, read live at each dispatch. The elector bumps its epoch on a
+  // fresh re-acquire (lose+regain lease), so a cached value would let a briefly
+  // re-elected leader keep stamping a stale epoch and get its own work fenced.
+  auto* elector_ptr = elector.get();
+  const auto current_leader_epoch = [elector_ptr]() -> std::int64_t {
+    return elector_ptr ? elector_ptr->LeaderEpoch() : 0;
+  };
 
   // Cross-region multi-master coordinator (region federation). Active only with
   // a reachable Redis backend; otherwise a harmless no-op (single region).
@@ -634,7 +639,9 @@ int main(int argc, char** argv) {
         rc = 1;
       }
     } else {
-      JobConfig job = BuildJobConfig(spec, leader_epoch, tenant, master_region);
+      const std::int64_t ep_now = current_leader_epoch();
+      servicer.set_leader_epoch_min(ep_now);
+      JobConfig job = BuildJobConfig(spec, ep_now, tenant, master_region);
       attach_progress(job);
       const JobResult res = coord.RunSingleJob(job, "job-1", guard);
       std::printf("%s\n", res.snapshot.dump().c_str());
@@ -653,7 +660,9 @@ int main(int argc, char** argv) {
     while (!g_stop.load()) {
       if (!elector || elector->IsLeader()) {
         for (auto& j : mm->DequeueJobs(dequeue_max)) {
-          JobConfig job = BuildJobConfig(j, leader_epoch, tenant, master_region);
+          const std::int64_t ep_now = current_leader_epoch();
+          servicer.set_leader_epoch_min(ep_now);
+          JobConfig job = BuildJobConfig(j, ep_now, tenant, master_region);
           attach_progress(job);
           const Value* from = j.find("_mmr_delegated_from");
           const std::string from_region = from ? from->as_string("") : "";

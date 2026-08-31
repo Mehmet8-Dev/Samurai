@@ -208,9 +208,10 @@ int main(int argc, char** argv) {
     node.set_on_start([&service](const samurai::core::json::Value& shard) {
       service.StartShard(shard, RpcContext{});
     });
-    node.set_on_stop([&service](const std::string& sid) {
+    node.set_on_stop([&service](const std::string& sid, std::int64_t leader_epoch) {
       samurai::core::json::Value b = samurai::core::json::Value::Object();
       b.set("shard_id", samurai::core::json::Value::Str(sid));
+      b.set("_leader_epoch", samurai::core::json::Value::Int(leader_epoch));
       service.StopShard(b, RpcContext{});
     });
     node.set_active_shard_provider([&service]() { return service.ActiveShardId(); });

@@ -234,11 +234,25 @@ Value WorkerShardService::StartShard(const Value& body, const RpcContext& /*ctx*
 Value WorkerShardService::StopShard(const Value& body, const RpcContext& /*ctx*/) {
   Value out = Value::Object();
   const std::string sid = StrField(body, "shard_id");
+  const Value* ep = body.find("_leader_epoch");
+  const std::int64_t req_epoch = ep ? ep->as_int(0) : 0;
 
   ShardRec rec;
   bool had = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    // Leader-epoch fencing: a stale master (one that lost the lease but has not
+    // noticed) must not be able to tear down shards the current leader started.
+    // Mirror StartShard: reject anything below the highest epoch seen, and raise
+    // the watermark on a legitimate (>=) stop. Epoch 0 (non-HA) never trips.
+    if (req_epoch < leader_epoch_max_seen_) {
+      out.set("stopped", Value::Bool(false));
+      out.set("error", Str("stale leader epoch: got=" + std::to_string(req_epoch) +
+                           " min=" + std::to_string(leader_epoch_max_seen_)));
+      return out;
+    }
+    if (req_epoch > leader_epoch_max_seen_) leader_epoch_max_seen_ = req_epoch;
+
     auto it = shard_runs_.find(sid);
     if (it != shard_runs_.end() && it->second.running) {
       rec = it->second;      // copy (shared_ptr run)

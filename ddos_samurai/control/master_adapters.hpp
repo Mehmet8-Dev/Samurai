@@ -40,12 +40,14 @@ class ClientWorkerCommander : public WorkerCommander {
                            const std::string& job_id, const std::string& args_json,
                            std::int64_t packet_count, std::int64_t timeout_ms) override;
   ProbeOutcome Probe(const std::string& endpoint, const std::string& worker_id) override;
-  bool StopShard(const std::string& endpoint, const std::string& shard_id) override;
+  bool StopShard(const std::string& endpoint, const std::string& shard_id,
+                 std::int64_t leader_epoch) override;
 
   DispatchOutcome DispatchReverse(const std::string& worker_id, const std::string& shard_id,
                                   const std::string& job_id, const std::string& args_json,
                                   std::int64_t packet_count, std::int64_t timeout_ms) override;
-  bool StopShardReverse(const std::string& worker_id, const std::string& shard_id) override;
+  bool StopShardReverse(const std::string& worker_id, const std::string& shard_id,
+                        std::int64_t leader_epoch) override;
 
  private:
   std::string cluster_secret_;

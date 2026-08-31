@@ -77,7 +77,10 @@ HeartbeatOutcome SlaveNode::HeartbeatOnce() {
   const Value* shard = r.body.find("shard");
   if (shard && shard->is_object() && on_start_) on_start_(*shard);
   const Value* stop = r.body.find("stop_shard");
-  if (stop && on_stop_) on_stop_(stop->as_string(""));
+  if (stop && on_stop_) {
+    const Value* se = r.body.find("stop_leader_epoch");
+    on_stop_(stop->as_string(""), se ? se->as_int(0) : 0);
+  }
   return out;
 }
 

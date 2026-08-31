@@ -203,10 +203,12 @@ wire::Response WorkerControlClient::StartShard(const std::string& shard_id,
   return Call(wire::kStartShard, body);
 }
 
-wire::Response WorkerControlClient::StopShard(const std::string& shard_id, bool graceful) {
+wire::Response WorkerControlClient::StopShard(const std::string& shard_id, bool graceful,
+                                             std::int64_t leader_epoch) {
   Value body = Value::Object();
   body.set("shard_id", Value::Str(shard_id));
   body.set("graceful", Value::Bool(graceful));
+  body.set("_leader_epoch", Value::Int(leader_epoch));
   return Call(wire::kStopShard, body);
 }
 
