@@ -149,6 +149,40 @@ struct PerfDerivedInputs {
   int active_conn_peak{0};
 };
 
+// Per-shard result accumulator. Each shard's dispatch/finalize path mutates only
+// its own instance, so shard loops can run on independent worker threads without
+// sharing writable aggregates. Summed into the profile output at join. (Perf and
+// scenario-step counters are already thread_local, so they are not duplicated here.)
+struct ShardAccum {
+  int status_2xx{0};
+  int status_3xx{0};
+  int status_4xx{0};
+  int status_5xx{0};
+  int sent{0};
+  int conn_attempted{0};
+  int conn_established{0};
+  int conn_reused{0};
+  int expectation_failures{0};
+  std::size_t rx_bytes{0};
+  std::size_t tx_bytes{0};
+};
+
+// Wire->worker routing event for the threaded custom_tcp driver. The wire thread
+// (the sole tcpdp poller) resolves each completion/RX payload to a shard+lane and
+// posts it here; the owning shard-worker applies it to its lane. This keeps every
+// lane-state write on the single worker that owns the shard.
+struct InboxEvent {
+  enum class Kind { ConnectEstablished, Terminal, RxPayload };
+  Kind kind{Kind::RxPayload};
+  std::size_t lane_idx{0};
+  std::string payload{};  // populated only for RxPayload
+};
+
+struct ShardIo {
+  std::mutex mu;
+  std::deque<InboxEvent> inbox;
+};
+
 #ifdef SAMURAI_WITH_NGHTTP2
 struct H2ClientSession;
 struct H2StreamState;
@@ -579,10 +613,21 @@ void record_scenario_step_result(
 // custom_tcp flow-binding yardımcıları onu kullandığından ileri bildirim gerekli.
 bool is_custom_tcp_backend(TransportBackend backend);
 
+// Guards custom_tcp_flow_registry. The registry is a process-global concept (one
+// tcpdp Core per process => one stateful profile at a time), so a namespace-scope
+// lock is safe and keeps NativeRuntime movable. In the threaded custom_tcp driver
+// the wire thread reads it while shard-workers register/unregister; single-threaded
+// callers take an uncontended lock. Held only for the brief map op.
+std::mutex& custom_tcp_registry_mu() {
+  static std::mutex mu;
+  return mu;
+}
+
 void unregister_custom_tcp_flow_binding(NativeRuntime& runtime, uint64_t flow_id) {
   if (flow_id == 0) {
     return;
   }
+  std::lock_guard<std::mutex> lk(custom_tcp_registry_mu());
   runtime.custom_tcp_flow_registry.erase(flow_id);
 }
 
@@ -605,6 +650,7 @@ void register_custom_tcp_h1_flow_binding(
 #ifdef SAMURAI_WITH_NGHTTP2
   binding.h2_session = nullptr;
 #endif
+  std::lock_guard<std::mutex> lk(custom_tcp_registry_mu());
   runtime.custom_tcp_flow_registry[lane.conn->custom_flow_id] = binding;
 }
 
@@ -616,12 +662,17 @@ void register_custom_tcp_h2_flow_binding(
 void unregister_custom_tcp_h2_flow_binding(NativeRuntime& runtime, H2ClientSession& client);
 #endif
 
+// Returns a pointer INTO the registry map. Only sequential (non-threaded) callers
+// use this; the threaded wire thread does its own locked lookup that copies out
+// shard/lane instead of holding a pointer across the unlock. The lock here just
+// makes the lazy-erase safe against a concurrent worker register/unregister.
 NativeRuntime::CustomTcpFlowBinding* find_custom_tcp_flow_binding(
     NativeRuntime& runtime,
     uint64_t flow_id) {
   if (flow_id == 0) {
     return nullptr;
   }
+  std::lock_guard<std::mutex> lk(custom_tcp_registry_mu());
   auto it = runtime.custom_tcp_flow_registry.find(flow_id);
   if (it == runtime.custom_tcp_flow_registry.end()) {
     return nullptr;
@@ -1018,6 +1069,7 @@ void register_custom_tcp_h2_flow_binding(
   binding.lane_idx = client.session_idx;
   binding.h1_lane = nullptr;
   binding.h2_session = &client;
+  std::lock_guard<std::mutex> lk(custom_tcp_registry_mu());
   runtime.custom_tcp_flow_registry[client.ctx.custom_flow_id] = binding;
 }
 
@@ -1998,6 +2050,42 @@ int service_ready_lanes(
 
 void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile);
 
+// Runs the H1 write/read progress scan for a single custom_tcp/dpdk shard's lanes.
+// It touches only that shard's lane state; the global tcpdp poll/collect (wire side)
+// is done separately by service_custom_tcp_lanes (or the wire thread once threaded).
+// This makes it safe to run on a per-shard worker thread.
+void service_custom_tcp_shard_lanes(NativeRuntime& runtime, std::size_t shard_idx) {
+  if (shard_idx >= runtime.local_shards.size()) {
+    return;
+  }
+  auto& local_shard = runtime.local_shards[shard_idx];
+  for (std::size_t lane_idx = 0; lane_idx < local_shard.h1_lanes.size(); ++lane_idx) {
+    auto& lane_ptr = local_shard.h1_lanes[lane_idx];
+    if (!lane_ptr || !is_custom_tcp_backend(lane_ptr->transport_backend) || !lane_ptr->conn) {
+      continue;
+    }
+    H1Lane& lane = *lane_ptr;
+    H1LaneIoResult result = H1LaneIoResult::Pending;
+    if (lane.phase == H1LanePhase::Writing) {
+      result = h1_lane_write_step(lane);
+    } else if (lane.phase == H1LanePhase::Reading) {
+      // Only re-parse when fresh RX payload arrived (or the flow closed); otherwise
+      // a Reading lane cannot make progress and re-scanning read_buffer is waste.
+      if (lane.conn->custom_rx_pending || lane.conn->custom_terminal) {
+        lane.conn->custom_rx_pending = false;
+        result = h1_lane_read_step(lane);
+      }
+    } else if (lane.phase == H1LanePhase::Complete) {
+      result = H1LaneIoResult::Completed;
+    } else if (lane.phase == H1LanePhase::Failed) {
+      result = H1LaneIoResult::Failed;
+    }
+    if (result == H1LaneIoResult::Completed || result == H1LaneIoResult::Failed) {
+      enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
+    }
+  }
+}
+
 void service_all_ready_lanes(NativeRuntime& runtime, const Profile& profile, int timeout_ms) {
   for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
     service_ready_lanes(runtime, profile, shard_idx, timeout_ms);
@@ -2094,37 +2182,12 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
     tcpdp_free_rx_payloads(payload_items, payload_count);
   }
 
+  // CustomTcp (engine owns wire) and DpdkDirect (external fast-path driver owns the
+  // NIC) share the tcpdp bridge; both must run the H1 write/read scan per shard,
+  // else DpdkDirect never advances HTTP. Extracted so a worker thread can own one
+  // shard's scan while the wire side above stays single-owner.
   for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
-    auto& local_shard = runtime.local_shards[shard_idx];
-    for (std::size_t lane_idx = 0; lane_idx < local_shard.h1_lanes.size(); ++lane_idx) {
-      auto& lane_ptr = local_shard.h1_lanes[lane_idx];
-      // CustomTcp (engine owns wire) ve DpdkDirect (harici fast-path sürücüsü wire
-      // sahibi) aynı tcpdp bridge'i kullanır; her ikisinde de H1 write/read adımları
-      // koşmalı (enqueue_send / read_buffer). Aksi halde DpdkDirect'te HTTP ilerlemez.
-      if (!lane_ptr || !is_custom_tcp_backend(lane_ptr->transport_backend) || !lane_ptr->conn) {
-        continue;
-      }
-      H1Lane& lane = *lane_ptr;
-      H1LaneIoResult result = H1LaneIoResult::Pending;
-      if (lane.phase == H1LanePhase::Writing) {
-        result = h1_lane_write_step(lane);
-      } else if (lane.phase == H1LanePhase::Reading) {
-        // Only re-parse when fresh RX payload arrived (or the flow closed);
-        // otherwise a Reading lane cannot make progress and re-scanning
-        // read_buffer for the header terminator is pure per-cycle waste.
-        if (lane.conn->custom_rx_pending || lane.conn->custom_terminal) {
-          lane.conn->custom_rx_pending = false;
-          result = h1_lane_read_step(lane);
-        }
-      } else if (lane.phase == H1LanePhase::Complete) {
-        result = H1LaneIoResult::Completed;
-      } else if (lane.phase == H1LanePhase::Failed) {
-        result = H1LaneIoResult::Failed;
-      }
-      if (result == H1LaneIoResult::Completed || result == H1LaneIoResult::Failed) {
-        enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
-      }
-    }
+    service_custom_tcp_shard_lanes(runtime, shard_idx);
   }
 }
 
@@ -3092,6 +3155,21 @@ void expire_all_lane_idle(NativeRuntime& runtime, const Profile& profile) {
 #endif
 }
 
+// Per-shard idle expiry -- a worker thread expires only its own shard's idle
+// connections (the aggregate expire_all_lane_idle touches every shard and would
+// race across workers).
+void expire_lane_idle_shard(NativeRuntime& runtime, const Profile& profile, std::size_t shard_idx) {
+  if (shard_idx >= runtime.local_shards.size()) {
+    return;
+  }
+  expire_http1_idle(runtime, runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
+#ifdef SAMURAI_WITH_NGHTTP2
+  expire_h2_idle(runtime, shard_idx, profile, runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
+#else
+  (void)profile;
+#endif
+}
+
 void advance_runtime_until(NativeRuntime& runtime, const Profile& profile, long long deadline_ms) {
   const int slice_ms = 32;
   while (true) {
@@ -3163,8 +3241,15 @@ std::vector<std::vector<H1RequestSpec>> bucket_h1_requests_by_shard(
     std::size_t shard_count) {
   const std::size_t count = std::max<std::size_t>(1, shard_count);
   std::vector<std::vector<H1RequestSpec>> buckets(count);
+  // VU-affine bucketing: all requests of one scenario VU land on the same shard so
+  // its per-shard captures stay consistent and a single worker owns the VU (no lock
+  // on the capture store once threaded). Untagged requests (plain load, no vu_id)
+  // fall back to index round-robin to keep shards balanced.
+  static const std::hash<std::string> vu_hash{};
   for (std::size_t i = 0; i < requests.size(); ++i) {
-    buckets[i % count].push_back(requests[i]);
+    const std::string& vu = requests[i].scenario_vu_id;
+    const std::size_t bucket = vu.empty() ? (i % count) : (vu_hash(vu) % count);
+    buckets[bucket].push_back(requests[i]);
   }
   return buckets;
 }
@@ -5148,22 +5233,19 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
     }
   }
 
-  int status_2xx = 0;
-  int status_3xx = 0;
-  int status_4xx = 0;
-  int status_5xx = 0;
-  int sent = 0;
-  int conn_attempted = 0;
-  int conn_established = 0;
-  int conn_reused = 0;
-  int expectation_failures = 0;
-  std::size_t rx_bytes = 0;
-  std::size_t tx_bytes = 0;
-  std::map<std::string, std::string> captures;
+  // Per-shard counters (summed at join).
+  std::vector<ShardAccum> accum;
+  // Scenario captures are isolated per VU (keyed by scenario_vu_id) and stored
+  // per shard. VU-affine bucketing keeps a VU on one shard, so a VU sees its own
+  // captured vars, VUs never leak into each other, and a single worker owns the
+  // map (no lock once threaded). Empty vu_id shares that shard's default bucket.
+  std::vector<std::map<std::string, std::map<std::string, std::string>>> captures_by_vu;
 
   const auto request_specs = build_h1_requests(profile);
   const int request_attempts = static_cast<int>(request_specs.size());
   NativeRuntime runtime = build_runtime(profile, cfg);
+  accum.resize(std::max<std::size_t>(1, runtime.shards.size()));
+  captures_by_vu.resize(std::max<std::size_t>(1, runtime.shards.size()));
   runtime.perf.started_ms = monotonic_ms_now();
   g_perf_stats = &runtime.perf;
   out["runtime_shards"] = static_cast<double>(runtime.shards.size());
@@ -5208,6 +5290,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       local_shard.pending_h1_requests.pop_front();
       lane.request_start_ms = now_ms;
       lane.phase = H1LanePhase::Writing;
+      auto& captures = captures_by_vu[shard_idx][lane.request_spec.scenario_vu_id];
       build_http1_request_into(
           lane.write_buffer,
           ensure_lane_string_arena(lane.string_arena),
@@ -5220,20 +5303,20 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
         ensure_reusable_string_capacity(lane.conn->read_buffer.storage, kH1SlabReadBytes);
       }
       if (lane.conn->fd >= 0) {
-        conn_reused += 1;
+        accum[shard_idx].conn_reused += 1;
       } else {
         const H1TransportOps& transport_ops = resolve_h1_transport_ops(lane.transport_backend);
         lane.conn->transport_backend = lane.transport_backend;
         lane.conn->fd = transport_ops.connect_fn(*lane.conn, profile);
         lane.conn->shard_id = static_cast<int>(shard_idx);
-        conn_attempted += 1;
+        accum[shard_idx].conn_attempted += 1;
         if (lane.conn->fd < 0) {
-          expectation_failures += 1;
+          accum[shard_idx].expectation_failures += 1;
           reset_h1_lane_io(lane);
           lane.lane = ReactorLaneState{};
           continue;
         }
-        conn_established += 1;
+        accum[shard_idx].conn_established += 1;
         shard.connection_pool.active_connections += 1;
         shard.connection_pool.active_connections_peak = std::max(
             shard.connection_pool.active_connections_peak,
@@ -5269,14 +5352,16 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       return CompletionDispositionDecision{};
     }
     H1Lane& lane = *local_shard.h1_lanes[completed.lane_idx];
+    ShardAccum& acc = accum[shard_idx];
+    auto& captures = captures_by_vu[shard_idx][completed.scenario_vu_id];
     const long long now_ms = monotonic_ms_now();
-    rx_bytes += completed.rx_bytes;
-    tx_bytes += completed.tx_bytes;
+    acc.rx_bytes += completed.rx_bytes;
+    acc.tx_bytes += completed.tx_bytes;
     lane.expectation_failures = completed.expectation_failures;
     lane.think_time_total_ms = completed.think_time_total_ms;
 
     if (!completed.success || completed.status_code <= 0) {
-      expectation_failures += std::max(1, completed.expectation_failures + (completed.status_code <= 0 ? 1 : 0));
+      acc.expectation_failures += std::max(1, completed.expectation_failures + (completed.status_code <= 0 ? 1 : 0));
       record_scenario_step_result(
           "http1",
           completed.scenario_flow,
@@ -5339,8 +5424,8 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       }
     }
 
-    expectation_failures += lane.expectation_failures;
-    sent += 1;
+    acc.expectation_failures += lane.expectation_failures;
+    acc.sent += 1;
     record_scenario_step_result(
         "http1",
         completed.scenario_flow,
@@ -5354,13 +5439,13 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
         static_cast<double>(std::max<long long>(0, now_ms - completed.request_start_ms)),
         cfg.profile_sample_limit);
     if (completed.status_code >= 200 && completed.status_code <= 299) {
-      status_2xx += 1;
+      acc.status_2xx += 1;
     } else if (completed.status_code >= 300 && completed.status_code <= 399) {
-      status_3xx += 1;
+      acc.status_3xx += 1;
     } else if (completed.status_code >= 400 && completed.status_code <= 499) {
-      status_4xx += 1;
+      acc.status_4xx += 1;
     } else if (completed.status_code >= 500 && completed.status_code <= 599) {
-      status_5xx += 1;
+      acc.status_5xx += 1;
     }
 
     const bool keep_alive = completed.keep_alive && profile.keepalive;
@@ -5426,22 +5511,23 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
 #ifdef SAMURAI_WITH_NGHTTP2
     if (completion.kind == CompletionKind::H2 && completion.h2_completed.has_value()) {
       const H2CompletedStream& completed = *completion.h2_completed;
+      ShardAccum& acc = accum[completion.shard_idx];
       const bool ok = !(completed.rst_stream || !completed.success || completed.status_code <= 0) &&
                       completed.expectation_failures == 0;
-      expectation_failures += completed.expectation_failures;
+      acc.expectation_failures += completed.expectation_failures;
       if (completed.rst_stream || !completed.success || completed.status_code <= 0) {
-        status_4xx += completed.status_code >= 400 && completed.status_code <= 499 ? 1 : 0;
-        status_5xx += completed.status_code >= 500 && completed.status_code <= 599 ? 1 : 0;
+        acc.status_4xx += completed.status_code >= 400 && completed.status_code <= 499 ? 1 : 0;
+        acc.status_5xx += completed.status_code >= 500 && completed.status_code <= 599 ? 1 : 0;
       } else {
-        sent += 1;
+        acc.sent += 1;
         if (completed.status_code >= 200 && completed.status_code <= 299) {
-          status_2xx += 1;
+          acc.status_2xx += 1;
         } else if (completed.status_code >= 300 && completed.status_code <= 399) {
-          status_3xx += 1;
+          acc.status_3xx += 1;
         } else if (completed.status_code >= 400 && completed.status_code <= 499) {
-          status_4xx += 1;
+          acc.status_4xx += 1;
         } else if (completed.status_code >= 500 && completed.status_code <= 599) {
-          status_5xx += 1;
+          acc.status_5xx += 1;
         }
       }
       record_scenario_step_result(
@@ -5459,6 +5545,242 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
     return false;
   };
 
+  // Threaded custom_tcp/dpdk driver: a single wire thread owns the process-global
+  // tcpdp poll/collect and routes RX/completions into per-shard inboxes; one worker
+  // per shard owns all of that shard's lane state (dispatch/parse/finalize). Only
+  // eligible for custom_tcp with >1 shard; everything else keeps the proven
+  // single-threaded loop below.
+  const bool threaded =
+      is_custom_tcp_backend(transport_backend) && runtime.shards.size() > 1;
+  if (threaded) {
+    const std::size_t shard_count = runtime.shards.size();
+    std::vector<std::unique_ptr<ShardIo>> shard_io(shard_count);
+    for (auto& io : shard_io) {
+      io = std::make_unique<ShardIo>();
+    }
+    std::vector<DataplanePerfStats> shard_perf(shard_count);
+    std::vector<std::vector<ScenarioStepResult>> shard_steps(shard_count);
+    std::atomic<bool> wire_stop{false};
+
+    std::thread wire([&]() {
+      struct Held {
+        uint64_t flow_id{0};
+        InboxEvent ev{};
+        int retries{0};
+      };
+      constexpr int kMaxHeldRetries = 2000;  // ~100ms at 50us; covers connect/register races
+      std::deque<Held> held;
+      // Resolve flow_id -> (shard,lane) under the registry lock and post to the
+      // owning shard's inbox. Returns false if the flow is not (yet) registered.
+      auto route = [&](uint64_t flow_id, InboxEvent&& ev, bool erase_on_hit) -> bool {
+        std::size_t sh = 0;
+        std::size_t ln = 0;
+        bool found = false;
+        {
+          std::lock_guard<std::mutex> lk(custom_tcp_registry_mu());
+          auto it = runtime.custom_tcp_flow_registry.find(flow_id);
+          if (it != runtime.custom_tcp_flow_registry.end() &&
+              it->second.kind == ReactorLaneKind::H1) {
+            sh = it->second.shard_idx;
+            ln = it->second.lane_idx;
+            found = true;
+            if (erase_on_hit) {
+              runtime.custom_tcp_flow_registry.erase(it);
+            }
+          }
+        }
+        if (!found || sh >= shard_count) {
+          return false;
+        }
+        ev.lane_idx = ln;
+        std::lock_guard<std::mutex> lk(shard_io[sh]->mu);
+        shard_io[sh]->inbox.push_back(std::move(ev));
+        return true;
+      };
+      while (!wire_stop.load(std::memory_order_relaxed)) {
+        bool did = false;
+        // Retry events whose worker had not registered the binding yet (connect can
+        // complete before dispatch registers). Drop only after a long grace.
+        for (std::size_t i = 0; i < held.size();) {
+          const bool terminal = held[i].ev.kind == InboxEvent::Kind::Terminal;
+          if (route(held[i].flow_id, std::move(held[i].ev), terminal)) {
+            held.erase(held.begin() + static_cast<long>(i));
+            did = true;
+          } else if (++held[i].retries > kMaxHeldRetries) {
+            held.erase(held.begin() + static_cast<long>(i));
+          } else {
+            ++i;
+          }
+        }
+        uint32_t actions = 0;
+        (void)tcpdp_poll(0, 2048, &actions);
+        tcpdp_completion_t* items = nullptr;
+        uint32_t item_count = 0;
+        if (tcpdp_collect_completions(&items, &item_count) == 0 && items != nullptr) {
+          for (uint32_t idx = 0; idx < item_count; ++idx) {
+            const auto& item = items[idx];
+            const bool established = item.event != nullptr &&
+                std::strcmp(item.event, "connect_established") == 0;
+            const auto kind = established ? InboxEvent::Kind::ConnectEstablished
+                                          : InboxEvent::Kind::Terminal;
+            InboxEvent ev;
+            ev.kind = kind;
+            if (route(item.flow_id, std::move(ev), !established)) {
+              did = true;
+            } else {
+              InboxEvent hev;
+              hev.kind = kind;
+              held.push_back(Held{item.flow_id, std::move(hev), 0});
+            }
+          }
+          tcpdp_free_completions(items, item_count);
+        }
+        tcpdp_rx_payload_t* pitems = nullptr;
+        uint32_t pcount = 0;
+        if (tcpdp_collect_rx_payloads(&pitems, &pcount) == 0 && pitems != nullptr) {
+          for (uint32_t idx = 0; idx < pcount; ++idx) {
+            const auto& item = pitems[idx];
+            if (item.payload == nullptr || item.payload_len == 0) {
+              continue;
+            }
+            InboxEvent ev;
+            ev.kind = InboxEvent::Kind::RxPayload;
+            ev.payload.assign(reinterpret_cast<const char*>(item.payload), item.payload_len);
+            if (route(item.flow_id, std::move(ev), false)) {
+              did = true;
+            } else {
+              InboxEvent hev;
+              hev.kind = InboxEvent::Kind::RxPayload;
+              hev.payload.assign(reinterpret_cast<const char*>(item.payload), item.payload_len);
+              held.push_back(Held{item.flow_id, std::move(hev), 0});
+            }
+          }
+          tcpdp_free_rx_payloads(pitems, pcount);
+        }
+        if (!did) {
+          std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+      }
+    });
+
+    std::vector<std::thread> workers;
+    workers.reserve(shard_count);
+    for (std::size_t sh = 0; sh < shard_count; ++sh) {
+      workers.emplace_back([&, sh]() {
+        g_perf_stats = &shard_perf[sh];
+        auto& local_shard = runtime.local_shards[sh];
+        while (true) {
+          bool did_work = false;
+          // 1. Apply routed wire events to this shard's lanes.
+          std::deque<InboxEvent> events;
+          {
+            std::lock_guard<std::mutex> lk(shard_io[sh]->mu);
+            events.swap(shard_io[sh]->inbox);
+          }
+          for (auto& ev : events) {
+            if (ev.lane_idx >= local_shard.h1_lanes.size()) {
+              continue;
+            }
+            auto& lane_ptr = local_shard.h1_lanes[ev.lane_idx];
+            if (!lane_ptr || !lane_ptr->conn) {
+              continue;
+            }
+            H1Lane& lane = *lane_ptr;
+            Http1Connection& conn = *lane.conn;
+            switch (ev.kind) {
+              case InboxEvent::Kind::ConnectEstablished:
+                conn.custom_connect_ready = true;
+                break;
+              case InboxEvent::Kind::Terminal:
+                conn.custom_terminal = true;
+                conn.custom_send_enqueued = false;
+                conn.custom_send_outstanding = 0;
+                lane.phase = H1LanePhase::Failed;
+                break;
+              case InboxEvent::Kind::RxPayload:
+                conn.read_buffer.append(ev.payload.data(), ev.payload.size());
+                conn.custom_rx_pending = true;
+                lane.response.bytes_received += ev.payload.size();
+                lane.rx_bytes += ev.payload.size();
+                if (conn.custom_send_outstanding > 0) {
+                  conn.custom_send_outstanding -= 1;
+                }
+                conn.custom_send_enqueued = conn.custom_send_outstanding > 0;
+                break;
+            }
+            did_work = true;
+          }
+          // 2. Idle expiry + dispatch + lane progress for this shard only.
+          expire_lane_idle_shard(runtime, profile, sh);
+          dispatch_pending_h1_requests(sh);
+          service_custom_tcp_shard_lanes(runtime, sh);
+          // 3. Finalize this shard's completions into its own accumulator.
+          while (true) {
+            auto ready = pop_ready_completion(runtime, sh);
+            if (!ready.has_value()) {
+              break;
+            }
+            finalize_completion(std::move(*ready));
+            did_work = true;
+          }
+          // 4. Done when this shard has no pending requests, no in-flight lane, an
+          //    empty inbox, and made no progress this iteration.
+          bool has_inflight = false;
+          for (const auto& lane_ptr : local_shard.h1_lanes) {
+            if (lane_ptr && (lane_ptr->phase == H1LanePhase::Writing ||
+                             lane_ptr->phase == H1LanePhase::Reading)) {
+              has_inflight = true;
+              break;
+            }
+          }
+          bool inbox_empty = true;
+          {
+            std::lock_guard<std::mutex> lk(shard_io[sh]->mu);
+            inbox_empty = shard_io[sh]->inbox.empty();
+          }
+          if (!has_inflight && local_shard.pending_h1_requests.empty() &&
+              inbox_empty && !did_work) {
+            break;
+          }
+          if (!did_work) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+          }
+        }
+        shard_steps[sh] = std::move(g_last_scenario_step_results);
+        g_last_scenario_step_results.clear();
+        g_perf_stats = nullptr;
+      });
+    }
+    for (auto& w : workers) {
+      w.join();
+    }
+    wire_stop.store(true, std::memory_order_relaxed);
+    wire.join();
+
+    // Merge per-shard perf into runtime.perf and gather scenario step results.
+    for (const DataplanePerfStats& sp : shard_perf) {
+      runtime.perf.epoll_wakeups += sp.epoll_wakeups;
+      runtime.perf.idle_evictions += sp.idle_evictions;
+      runtime.perf.rx_syscalls += sp.rx_syscalls;
+      runtime.perf.tx_syscalls += sp.tx_syscalls;
+      runtime.perf.alloc_bytes += sp.alloc_bytes;
+      runtime.perf.alloc_count += sp.alloc_count;
+      runtime.perf.profile_snapshot_count += sp.profile_snapshot_count;
+      runtime.perf.scheduler_queue_depth_peak = std::max(
+          runtime.perf.scheduler_queue_depth_peak, sp.scheduler_queue_depth_peak);
+      runtime.perf.request_latency_samples_ms.insert(
+          runtime.perf.request_latency_samples_ms.end(),
+          sp.request_latency_samples_ms.begin(), sp.request_latency_samples_ms.end());
+      runtime.perf.tls_handshake_samples_ms.insert(
+          runtime.perf.tls_handshake_samples_ms.end(),
+          sp.tls_handshake_samples_ms.begin(), sp.tls_handshake_samples_ms.end());
+    }
+    for (auto& steps : shard_steps) {
+      for (auto& r : steps) {
+        g_last_scenario_step_results.push_back(std::move(r));
+      }
+    }
+  } else {
   while (true) {
     expire_all_lane_idle(runtime, profile);
     for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
@@ -5521,6 +5843,33 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
     }
     break;
   }
+  }  // end sequential (non-threaded) driver
+  // Sum the per-shard counters into profile-level totals.
+  int sent = 0;
+  int conn_attempted = 0;
+  int conn_established = 0;
+  int conn_reused = 0;
+  int expectation_failures = 0;
+  int status_2xx = 0;
+  int status_3xx = 0;
+  int status_4xx = 0;
+  int status_5xx = 0;
+  std::size_t rx_bytes = 0;
+  std::size_t tx_bytes = 0;
+  for (const ShardAccum& acc : accum) {
+    sent += acc.sent;
+    conn_attempted += acc.conn_attempted;
+    conn_established += acc.conn_established;
+    conn_reused += acc.conn_reused;
+    expectation_failures += acc.expectation_failures;
+    status_2xx += acc.status_2xx;
+    status_3xx += acc.status_3xx;
+    status_4xx += acc.status_4xx;
+    status_5xx += acc.status_5xx;
+    rx_bytes += acc.rx_bytes;
+    tx_bytes += acc.tx_bytes;
+  }
+
   apply_perf_outputs(
       out,
       runtime,
