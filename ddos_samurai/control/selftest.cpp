@@ -1227,6 +1227,76 @@ int main() {
           "master: nothing left pending/inflight");
   }
 
+  // --- master: leadership lost mid-job recalls inflight shards (chaos) ---
+  {
+    namespace json = samurai::core::json;
+
+    struct FakeView : MasterView {
+      std::map<std::string, WorkerInfo> workers;
+      std::vector<WorkerInfo> Workers() override {
+        std::vector<WorkerInfo> out;
+        for (auto& kv : workers) out.push_back(kv.second);
+        return out;
+      }
+      // Never report completion: shards stay inflight so the abort path has work
+      // to recall (simulates a long-running burst outliving the master's lease).
+      bool ShardReported(const std::string&) override { return false; }
+      std::string GetShardStats(const std::string&) override { return "{}"; }
+      void SetShardStats(const std::string&, const std::string&) override {}
+    };
+    struct FakeCmd : WorkerCommander {
+      std::set<std::string> dispatched;
+      std::set<std::string> recalled;
+      std::int64_t stop_epoch = -1;
+      DispatchOutcome Dispatch(const std::string&, const std::string& sid, const std::string&,
+                               const std::string&, std::int64_t, std::int64_t) override {
+        dispatched.insert(sid);  // accepted but never completes (view reports nothing)
+        return {true, "ok"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override { return {"running", "", "{}"}; }
+      bool StopShard(const std::string&, const std::string& sid, std::int64_t epoch) override {
+        recalled.insert(sid);
+        stop_epoch = epoch;
+        return true;
+      }
+    };
+
+    FakeView view;
+    std::int64_t clk = 1000000;
+    for (const char* wid : {"w1", "w2"}) {
+      WorkerInfo w;
+      w.worker_id = wid;
+      w.capabilities["control_endpoint"] = std::string("tcp://") + wid + ":5099";
+      w.last_heartbeat_ms = clk;
+      view.workers[wid] = w;
+    }
+    FakeCmd cmd;
+    MasterCoordinator coord(&view, &cmd, [&clk]() { return clk; }, [](int) {});
+    JobConfig job;
+    job.count = 1000;
+    job.shard_unit_count = 250;  // -> 4 shards
+    job.master_poll_interval_ms = 1;
+    job.leader_epoch = 7;
+    // Leader for the first poll (shards get dispatched), then lease is lost.
+    int polls = 0;
+    auto guard = [&polls]() { return polls++ < 1; };
+    auto res = coord.RunSingleJob(job, "chaos-1", guard);
+    Check(res.rc == 1 && res.snapshot.find("error") &&
+              res.snapshot.find("error")->as_string() == "leadership_lost_abort",
+          "chaos: leadership loss aborts the job");
+    Check(!cmd.dispatched.empty() && cmd.recalled == cmd.dispatched,
+          "chaos: every inflight shard is recalled on leadership loss");
+    Check(cmd.stop_epoch == 7, "chaos: recall stops carry the job leader epoch");
+    Check(res.snapshot.find("recalled_shards") &&
+              res.snapshot.find("recalled_shards")->as_int() ==
+                  static_cast<std::int64_t>(cmd.dispatched.size()),
+          "chaos: snapshot recalled_shards matches");
+    Check(res.snapshot.find("active_shards_at_loss") &&
+              res.snapshot.find("active_shards_at_loss")->as_int() > 0 &&
+              res.snapshot.find("abort_latency_ms"),
+          "chaos: snapshot carries residual metrics");
+  }
+
   // --- master: reverse-mode dispatch (NAT'd worker, no control_endpoint) ---
   {
     namespace json = samurai::core::json;

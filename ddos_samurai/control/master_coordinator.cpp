@@ -223,10 +223,37 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
 
   while (now_ms_() < deadline) {
     if (leadership_guard && !leadership_guard()) {
+      // Leadership lost mid-job. Fencing already blocks *new* commands from this
+      // now-stale master, but shards it already dispatched keep running on the
+      // workers. Recall them best-effort so residual unauthorized execution is
+      // bounded by stop latency (ms) rather than the shard's own burst length.
+      // The stops carry this job's leader_epoch: a worker the new leader already
+      // superseded fences them off (correct — the new leader owns those now),
+      // otherwise they land and stop our own inflight work cleanly.
+      const std::int64_t t_loss = now_ms_();
+      const auto workers = load_workers();
+      const int active_at_loss = static_cast<int>(inflight_by_sid.size());
+      int recalled = 0;
+      for (const auto& kv : inflight_by_sid) {
+        const std::string& sid = kv.first;
+        const std::string& wid = kv.second.worker_id;
+        if (done_shards.count(sid)) continue;
+        bool ok = false;
+        if (reverse_dispatch_ms.count(sid)) {
+          ok = wid.empty() ? false : commander_->StopShardReverse(wid, sid, job.leader_epoch);
+        } else {
+          const std::string ep = wid.empty() ? std::string() : endpoint_of(workers, wid);
+          if (!ep.empty()) ok = commander_->StopShard(ep, sid, job.leader_epoch);
+        }
+        if (ok) ++recalled;
+      }
       Value snap = Value::Object();
       snap.set("job_id", Value::Str(job_id));
       snap.set("error", Value::Str("leadership_lost_abort"));
       snap.set("leader_epoch", Value::Int(job.leader_epoch));
+      snap.set("active_shards_at_loss", Value::Int(active_at_loss));
+      snap.set("recalled_shards", Value::Int(recalled));
+      snap.set("abort_latency_ms", Value::Int(now_ms_() - t_loss));
       result.rc = 1;
       result.snapshot = std::move(snap);
       return result;
