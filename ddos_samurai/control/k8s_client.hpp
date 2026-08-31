@@ -53,4 +53,8 @@ ScaleResult PatchScale(const K8sConfig& cfg, const std::string& kind, const std:
 // Exposed for testing: the scale subresource path for a kind/ns/name.
 std::string ScalePath(const std::string& kind, const std::string& ns, const std::string& name);
 
+// Exposed for testing: whether a raw HTTP response is fully received (so the
+// reader can stop without waiting for a keep-alive close).
+bool ResponseCompleteForTest(const std::string& raw);
+
 }  // namespace samurai::control

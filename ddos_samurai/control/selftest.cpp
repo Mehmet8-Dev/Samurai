@@ -272,6 +272,16 @@ int main() {
     auto over = ResolveK8sConfig("http://127.0.0.1:8001", false);
     Check(over.active && over.source == "api-override" && over.api_base == "http://127.0.0.1:8001",
           "k8s: api-override config active");
+    // Reader must recognise a complete response (Content-Length) so it stops
+    // instead of blocking until a keep-alive connection closes.
+    Check(ResponseCompleteForTest("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"),
+          "k8s: response complete at content-length");
+    Check(!ResponseCompleteForTest("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab"),
+          "k8s: response incomplete under content-length");
+    Check(ResponseCompleteForTest("HTTP/1.1 204 No Content\r\nX: y\r\n\r\n"),
+          "k8s: bodyless response complete on headers");
+    Check(!ResponseCompleteForTest("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n"),
+          "k8s: headers-only with content-length not complete");
     // No override + no in-cluster service account => inactive (in-memory fallback).
     ::unsetenv("KUBERNETES_SERVICE_HOST");
     auto none = ResolveK8sConfig("", false);

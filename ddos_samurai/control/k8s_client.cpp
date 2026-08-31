@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -130,6 +131,46 @@ struct HttpResult {
   std::string error;
 };
 
+// Case-insensitive search for a header value; returns "" if absent.
+std::string HeaderValue(const std::string& headers, const std::string& name) {
+  std::string lh = headers, ln = name;
+  for (char& c : lh) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  for (char& c : ln) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  auto pos = lh.find("\r\n" + ln + ":");
+  if (pos == std::string::npos) return "";
+  pos += 2 + ln.size() + 1;  // skip "\r\n" + name + ":"
+  auto end = lh.find("\r\n", pos);
+  std::string v = headers.substr(pos, (end == std::string::npos ? headers.size() : end) - pos);
+  const auto a = v.find_first_not_of(" \t");
+  const auto b = v.find_last_not_of(" \t");
+  return a == std::string::npos ? "" : v.substr(a, b - a + 1);
+}
+
+// True once `raw` holds a complete HTTP response, so the reader can stop without
+// waiting for the server to close a keep-alive connection (which would otherwise
+// block until the socket timeout — the cause of stalls against the API server).
+bool ResponseComplete(const std::string& raw) {
+  const auto hdr_end = raw.find("\r\n\r\n");
+  if (hdr_end == std::string::npos) return false;  // headers not fully received
+  const std::string headers = raw.substr(0, hdr_end);
+  const std::size_t body_len = raw.size() - (hdr_end + 4);
+  const std::string te = HeaderValue(headers, "Transfer-Encoding");
+  if (!te.empty() && te.find("chunked") != std::string::npos) {
+    return raw.size() >= hdr_end + 4 + 5 && raw.compare(raw.size() - 5, 5, "0\r\n\r\n") == 0;
+  }
+  const std::string cl = HeaderValue(headers, "Content-Length");
+  if (!cl.empty()) {
+    try {
+      return body_len >= static_cast<std::size_t>(std::stoul(cl));
+    } catch (...) {
+      return false;
+    }
+  }
+  // No length signalled (e.g. 204 No Content or a bodyless status): headers alone
+  // complete the response.
+  return true;
+}
+
 HttpResult ParseResponse(const std::string& raw) {
   HttpResult r;
   if (raw.empty()) {
@@ -219,7 +260,10 @@ HttpResult HttpRequest(const std::string& method, const K8sConfig& cfg,
     SSL_write(ssl, request.data(), static_cast<int>(request.size()));
     char buf[4096];
     int n;
-    while ((n = SSL_read(ssl, buf, sizeof(buf))) > 0) raw.append(buf, static_cast<std::size_t>(n));
+    while ((n = SSL_read(ssl, buf, sizeof(buf))) > 0) {
+      raw.append(buf, static_cast<std::size_t>(n));
+      if (ResponseComplete(raw)) break;  // don't wait for a keep-alive close
+    }
     SSL_shutdown(ssl);
     SSL_free(ssl);
     SSL_CTX_free(ctx);
@@ -227,7 +271,10 @@ HttpResult HttpRequest(const std::string& method, const K8sConfig& cfg,
     ::send(fd, request.data(), request.size(), 0);
     char buf[4096];
     ssize_t n;
-    while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0) raw.append(buf, static_cast<std::size_t>(n));
+    while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0) {
+      raw.append(buf, static_cast<std::size_t>(n));
+      if (ResponseComplete(raw)) break;
+    }
   }
   ::close(fd);
   if (raw.empty()) {
@@ -250,6 +297,8 @@ bool ParseReplicas(const std::string& body, int& out) {
 }
 
 }  // namespace
+
+bool ResponseCompleteForTest(const std::string& raw) { return ResponseComplete(raw); }
 
 std::string ScalePath(const std::string& kind, const std::string& ns, const std::string& name) {
   const std::string plural = LowerCopy(kind) == "statefulset" ? "statefulsets" : "deployments";
