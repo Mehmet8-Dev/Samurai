@@ -1057,7 +1057,7 @@ void register_custom_tcp_h2_flow_binding(
     NativeRuntime& runtime,
     std::size_t shard_idx,
     H2ClientSession& client) {
-  if (client.ctx.transport_backend != TransportBackend::CustomTcp) {
+  if (!is_custom_tcp_backend(client.ctx.transport_backend)) {
     return;
   }
   if (client.ctx.custom_flow_id == 0) {
@@ -1074,7 +1074,7 @@ void register_custom_tcp_h2_flow_binding(
 }
 
 void unregister_custom_tcp_h2_flow_binding(NativeRuntime& runtime, H2ClientSession& client) {
-  if (client.ctx.transport_backend != TransportBackend::CustomTcp) {
+  if (!is_custom_tcp_backend(client.ctx.transport_backend)) {
     return;
   }
   unregister_custom_tcp_flow_binding(runtime, client.ctx.custom_flow_id);
@@ -2086,6 +2086,32 @@ void service_custom_tcp_shard_lanes(NativeRuntime& runtime, std::size_t shard_id
   }
 }
 
+#ifdef SAMURAI_WITH_NGHTTP2
+// Bir shard'ın custom_tcp/dpdk H2 oturumlarına I/O servisi verir: tamponlanan
+// preface/HEADERS'i flush, ctx.read_buffer'daki RX'i nghttp2'ye besle, biten
+// stream'leri completion kuyruğuna aktar. Kernel yolunda bunu epoll'lu
+// service_ready_lanes yapar; custom_tcp'de fd/epoll olmadığından buraya taşındı.
+void service_custom_tcp_h2_shard_sessions(
+    NativeRuntime& runtime, const Profile& profile, std::size_t shard_idx) {
+  if (shard_idx >= runtime.local_shards.size()) {
+    return;
+  }
+  auto& local_shard = runtime.local_shards[shard_idx];
+  auto& shard = runtime.shards[shard_idx];
+  for (auto& session_ptr : local_shard.h2_sessions) {
+    if (!session_ptr) {
+      continue;
+    }
+    H2ClientSession& client = *session_ptr;
+    if (!client.ready || !is_custom_tcp_backend(client.ctx.transport_backend)) {
+      continue;
+    }
+    service_h2_session_io(runtime, profile, shard, local_shard, client, 0, true);
+    flush_ready_h2_completions(runtime, shard_idx, client);
+  }
+}
+#endif
+
 void service_all_ready_lanes(NativeRuntime& runtime, const Profile& profile, int timeout_ms) {
   for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
     service_ready_lanes(runtime, profile, shard_idx, timeout_ms);
@@ -2189,6 +2215,18 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
   for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
     service_custom_tcp_shard_lanes(runtime, shard_idx);
   }
+
+#ifdef SAMURAI_WITH_NGHTTP2
+  // custom_tcp/dpdk H2 oturumları kernel fd'sine (epoll) kayıtlı değildir; dispatch
+  // onları stream bütçesi dolunca servis dışı bırakır (session_load >= budget) ve
+  // başka servis yolu yoktur. Bu yüzden her poll'de burada I/O servisi veririz:
+  // tamponlanmış preface/HEADERS'i flush eder, ctx.read_buffer'daki RX'i nghttp2'ye
+  // besler, biten stream'leri completion kuyruğuna aktarır. (H1'deki
+  // service_custom_tcp_shard_lanes'in H2 karşılığı.)
+  for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
+    service_custom_tcp_h2_shard_sessions(runtime, profile, shard_idx);
+  }
+#endif
 }
 
 std::string lower_copy(const std::string& in) {
@@ -2497,320 +2535,6 @@ const std::string& build_h2_preface_and_settings() {
 
 bool configure_custom_tcp_bridge(const Profile& profile);
 void merge_custom_tcp_stats(std::map<std::string, double>& out);
-
-std::map<std::string, double> run_http2_custom_tcp_profile(
-    const Profile& profile,
-    const RuntimeConfig& cfg,
-    const RuntimeCapabilities& caps) {
-  struct H2CustomLane {
-    uint64_t flow_id{0};
-    bool connected{false};
-    bool preface_sent{false};
-    bool draining{false};
-    bool replace_now{false};
-    int inflight_streams{0};
-    int reuse_hits{0};
-  };
-
-  std::map<std::string, double> out;
-  init_stats(profile, out);
-  out["runtime_transport_custom_tcp_requested"] = 1.0;
-  out["runtime_transport_custom_tcp_bridge_ready"] = configure_custom_tcp_bridge(profile) ? 1.0 : 0.0;
-  out["runtime_transport_custom_tcp_rx_bridge_active"] = 0.0;
-  out["runtime_h2_transport_contract"] = 1.0;
-  out["runtime_h2_transport_mode_custom_tcp"] = 1.0;
-  out["h2_native_capability_available"] = (caps.openssl && caps.nghttp2) ? 1.0 : 0.0;
-  if (out["runtime_transport_custom_tcp_bridge_ready"] == 0.0) {
-    if (profile.stateful_runtime_strict != 0) {
-      auto failed = fail_visible_stats(profile, caps, "custom_tcp_transport_not_yet_wired");
-      failed["runtime_transport_custom_tcp_bridge_ready"] = 0.0;
-      failed["runtime_h2_transport_contract"] = 0.0;
-      failed["runtime_h2_transport_mode_custom_tcp"] = 1.0;
-      return failed;
-    }
-    // Non-strict mode keeps going best-effort even when the custom TCP bridge
-    // is not ready; downstream enqueue/runtime counters decide final outcome.
-    out["runtime_failure_reason_code"] = runtime_failure_reason_code("custom_tcp_transport_not_yet_wired");
-  }
-
-  uint32_t dst_ip = 0;
-  if (!parse_ipv4_u32(profile.target_ip, &dst_ip)) {
-    return fail_visible_stats(profile, caps, "invalid_target_ip");
-  }
-  const int conn_budget = std::max(1, std::min(profile.max_connections, std::max(1, cfg.concurrency)));
-  const int attempted = std::max(1, profile.flow_attempted);
-  const int stream_budget = std::max(1, profile.max_streams_per_connection);
-  std::vector<H2CustomLane> lanes;
-  lanes.reserve(static_cast<std::size_t>(conn_budget));
-
-  int conn_attempted = 0;
-  auto enqueue_connect_for_lane = [&](H2CustomLane& lane) -> bool {
-    uint64_t flow_id = 0;
-    const int rc = tcpdp_enqueue_connect(
-        custom_tcp_src_ip(profile),
-        dst_ip,
-        0,
-        static_cast<uint16_t>(profile.target_port),
-        &flow_id);
-    if (rc != 0 || flow_id == 0) {
-      return false;
-    }
-    lane.flow_id = flow_id;
-    lane.connected = false;
-    lane.preface_sent = false;
-    lane.draining = false;
-    lane.replace_now = false;
-    lane.inflight_streams = 0;
-    conn_attempted += 1;
-    return true;
-  };
-
-  for (int i = 0; i < conn_budget; ++i) {
-    H2CustomLane lane;
-    if (enqueue_connect_for_lane(lane)) {
-      lanes.push_back(lane);
-    }
-  }
-
-  if (conn_attempted == 0) {
-    auto failed = fail_visible_stats(profile, caps, "custom_tcp_connect_enqueue_failed");
-    failed["runtime_transport_custom_tcp_requested"] = 1.0;
-    failed["runtime_transport_custom_tcp_bridge_ready"] = 1.0;
-    failed["runtime_h2_transport_contract"] = 0.0;
-    failed["runtime_h2_transport_mode_custom_tcp"] = 1.0;
-    return failed;
-  }
-
-  int conn_established = 0;
-  int sent = 0;
-  int scheduler_backpressure = 0;
-  int goaway_replacements = 0;
-  int drain_evictions = 0;
-  int replace_now_decisions = 0;
-  int replace_after_idle_decisions = 0;
-  int stream_pool_reuse_hits = 0;
-  int active_streams_peak = 0;
-  std::size_t tx_bytes = 0;
-  std::size_t rx_bytes = 0;
-  const std::string& preface = build_h2_preface_and_settings();
-  int rr = 0;
-  std::size_t rr_cursor = 0;
-
-  auto map_flow_index = [&](uint64_t flow_id) -> int {
-    for (std::size_t i = 0; i < lanes.size(); ++i) {
-      if (lanes[i].flow_id == flow_id) {
-        return static_cast<int>(i);
-      }
-    }
-    return -1;
-  };
-
-  auto current_active_streams = [&]() -> int {
-    int active = 0;
-    for (const auto& lane : lanes) {
-      active += std::max(0, lane.inflight_streams);
-    }
-    return active;
-  };
-
-  auto find_schedulable_lane = [&]() -> int {
-    const std::size_t lane_count = lanes.size();
-    if (lane_count == 0) {
-      return -1;
-    }
-    for (std::size_t step = 0; step < lane_count; ++step) {
-      const std::size_t idx = (rr_cursor + step) % lane_count;
-      const auto& lane = lanes[idx];
-      if (!lane.connected || lane.replace_now || lane.draining) {
-        continue;
-      }
-      if (lane.inflight_streams >= stream_budget) {
-        continue;
-      }
-      rr_cursor = (idx + 1) % lane_count;
-      return static_cast<int>(idx);
-    }
-    return -1;
-  };
-
-  // Under DpdkDirect an external fast-path driver owns the NIC wire and is the
-  // sole TX-ring drainer; this engine must NOT peek/consume TX here (that would
-  // race the driver on tcpdp's single tx_mu_). It still polls + collects so
-  // completions/RX payloads advance the H2 state machine.
-  const bool is_external_wire =
-      parse_transport_backend(profile) == TransportBackend::DpdkDirect;
-
-  for (int step = 0; step < 64 && sent < attempted; ++step) {
-    uint32_t actions = 0;
-    (void)tcpdp_poll(0, 2048, &actions);
-
-    if (!is_external_wire) {
-      const uint8_t* tx_base = nullptr;
-      uint32_t tx_count = 0;
-      size_t tx_packet_size = 0;
-      size_t tx_stride = 0;
-      if (tcpdp_peek_tx_packets_strided(0, &tx_base, &tx_count, &tx_packet_size, &tx_stride) == 0) {
-        uint32_t consumed = 0;
-        if (tx_base != nullptr && tx_count > 0 && tx_packet_size > 0) {
-          tx_bytes += static_cast<uint64_t>(tx_packet_size) * static_cast<uint64_t>(tx_count);
-          (void)tcpdp_consume_tx_packets(tx_count, &consumed);
-        } else {
-          (void)tcpdp_consume_tx_packets(2048, &consumed);
-        }
-      }
-    }
-
-    tcpdp_completion_t* comps = nullptr;
-    uint32_t comp_count = 0;
-    if (tcpdp_collect_completions(&comps, &comp_count) == 0) {
-      for (uint32_t i = 0; i < comp_count; ++i) {
-        const char* ev = comps[i].event ? comps[i].event : "";
-        const int idx = map_flow_index(comps[i].flow_id);
-        if (idx < 0) {
-          continue;
-        }
-        auto& lane = lanes[static_cast<std::size_t>(idx)];
-        if (std::strcmp(ev, "connect_established") == 0) {
-          if (!lane.connected) {
-            lane.connected = true;
-            conn_established += 1;
-          }
-          continue;
-        }
-        if (std::strcmp(ev, "peer_fin") == 0) {
-          lane.draining = true;
-          continue;
-        }
-        if (
-            std::strcmp(ev, "connect_timeout") == 0 ||
-            std::strcmp(ev, "retransmit_exhausted") == 0 ||
-            std::strcmp(ev, "peer_rst") == 0 ||
-            std::strcmp(ev, "idle_timeout") == 0) {
-          lane.replace_now = true;
-          lane.connected = false;
-          lane.preface_sent = false;
-          lane.inflight_streams = 0;
-        }
-      }
-      tcpdp_free_completions(comps, comp_count);
-    }
-
-    // Model stream lifecycle: each service loop drains one stream per lane.
-    for (auto& lane : lanes) {
-      if (lane.inflight_streams > 0) {
-        lane.inflight_streams -= 1;
-      }
-    }
-
-    // Execute replacement policies.
-    for (auto& lane : lanes) {
-      if (lane.replace_now) {
-        replace_now_decisions += 1;
-        goaway_replacements += 1;
-        lane.reuse_hits = 0;
-        lane.draining = false;
-        lane.replace_now = false;
-        (void)enqueue_connect_for_lane(lane);
-        continue;
-      }
-      if (lane.draining && lane.inflight_streams == 0) {
-        drain_evictions += 1;
-        replace_after_idle_decisions += 1;
-        goaway_replacements += 1;
-        lane.reuse_hits = 0;
-        lane.draining = false;
-        lane.connected = false;
-        lane.preface_sent = false;
-        (void)enqueue_connect_for_lane(lane);
-      }
-    }
-
-    int guard = static_cast<int>(lanes.size()) * std::max(1, stream_budget);
-    while (sent < attempted && guard-- > 0) {
-      const int lane_idx = find_schedulable_lane();
-      if (lane_idx < 0) {
-        scheduler_backpressure += 1;
-        break;
-      }
-      auto& lane = lanes[static_cast<std::size_t>(lane_idx)];
-      if (!lane.preface_sent) {
-        uint32_t queued = 0;
-        if (tcpdp_enqueue_send(
-                lane.flow_id,
-                reinterpret_cast<const uint8_t*>(preface.data()),
-                preface.size(),
-                &queued) == 0 &&
-            queued > 0) {
-          lane.preface_sent = true;
-        }
-      }
-      // Minimal request unit for parity loop (placeholder DATA payload).
-      static const char kReqStub[] = "h2_req_stub";
-      uint32_t queued = 0;
-      if (tcpdp_enqueue_send(
-              lane.flow_id,
-              reinterpret_cast<const uint8_t*>(kReqStub),
-              sizeof(kReqStub) - 1,
-              &queued) != 0 ||
-          queued == 0) {
-        scheduler_backpressure += 1;
-        break;
-      }
-      if (lane.reuse_hits > 0) {
-        stream_pool_reuse_hits += 1;
-      }
-      lane.reuse_hits += 1;
-      lane.inflight_streams += 1;
-      sent += 1;
-      active_streams_peak = std::max(active_streams_peak, current_active_streams());
-    }
-
-    tcpdp_rx_payload_t* rx_items = nullptr;
-    uint32_t rx_count = 0;
-    if (tcpdp_collect_rx_payloads(&rx_items, &rx_count) == 0) {
-      for (uint32_t i = 0; i < rx_count; ++i) {
-        rx_bytes += rx_items[i].payload_len;
-      }
-      tcpdp_free_rx_payloads(rx_items, rx_count);
-    }
-    rr += 1;
-  }
-
-  tcpdp_stats_snapshot_t stats {};
-  (void)tcpdp_snapshot_stats(&stats);
-  merge_custom_tcp_stats(out);
-  out["attempted"] = static_cast<double>(attempted);
-  out["sent"] = static_cast<double>(std::max(0, std::min(sent, attempted)));
-  out["errors"] = static_cast<double>(std::max(0, attempted - std::max(0, std::min(sent, attempted))));
-  out["responses_total"] = out["sent"];
-  out["l7_flow_attempted"] = static_cast<double>(attempted);
-  out["l7_flow_completed"] = out["sent"];
-  out["l7_conn_attempted"] = static_cast<double>(conn_attempted);
-  out["l7_conn_established"] = static_cast<double>(conn_established);
-  out["l7_conn_reused"] = static_cast<double>(std::max(0, attempted - conn_attempted));
-  out["l7_rx_bytes"] = static_cast<double>(rx_bytes);
-  out["l7_tx_bytes"] = static_cast<double>(tx_bytes);
-  out["l7_expectation_failures"] = out["errors"];
-  out["l7_h2_lane_reuse_ratio"] =
-      conn_attempted > 0 ? static_cast<double>(std::max(0, attempted - conn_attempted)) / static_cast<double>(conn_attempted) : 0.0;
-  out["l7_h2_active_streams_peak"] = static_cast<double>(std::max(1, active_streams_peak));
-  out["h2_goaway_count"] = 0.0;
-  out["h2_stream_reset_ratio"] = 0.0;
-  out["h2_goaway_replacements"] = static_cast<double>(goaway_replacements);
-  out["h2_drain_evictions"] = static_cast<double>(drain_evictions);
-  out["h2_replace_now_decisions"] = static_cast<double>(replace_now_decisions);
-  out["h2_replace_after_idle_decisions"] = static_cast<double>(replace_after_idle_decisions);
-  out["h2_stream_pool_reuse_hits"] = static_cast<double>(stream_pool_reuse_hits);
-  out["l7_scheduler_backpressure_count"] = static_cast<double>(scheduler_backpressure);
-  out["runtime_transport_poll_calls"] = static_cast<double>(rr);
-  out["runtime_transport_poll_actions"] = static_cast<double>(stats.poll_calls);
-  out["runtime_transport_rx_poll_enabled"] = 1.0;
-  out["runtime_transport_snapshot_available"] = 1.0;
-  out["runtime_transport_service_loops"] = static_cast<double>(rr);
-  out["runtime_transport_service"] = 1.0;
-  out["runtime_transport_contract"] = 1.0;
-  return out;
-}
 
 bool configure_custom_tcp_bridge(const Profile& profile) {
   auto env_u32 = [](const char* name, uint32_t fallback) -> uint32_t {
@@ -3653,7 +3377,7 @@ ssize_t h2_send_callback(
     if (g_perf_stats != nullptr) {
       g_perf_stats->tx_syscalls += 1;
     }
-    if (ctx->transport_backend == TransportBackend::CustomTcp) {
+    if (is_custom_tcp_backend(ctx->transport_backend)) {
       if (!ctx->custom_connect_ready) {
         errno = EAGAIN;
         return NGHTTP2_ERR_WOULDBLOCK;
@@ -3932,7 +3656,7 @@ ssize_t h2_socket_read(H2ConnectionContext& ctx, unsigned char* buf, size_t cap)
   if (g_perf_stats != nullptr) {
     g_perf_stats->rx_syscalls += 1;
   }
-  if (ctx.transport_backend == TransportBackend::CustomTcp) {
+  if (is_custom_tcp_backend(ctx.transport_backend)) {
     if (ctx.use_tls) {
 #ifdef SAMURAI_WITH_OPENSSL
       if (!h2_custom_advance_tls(ctx)) {
@@ -4037,7 +3761,7 @@ bool setup_tls(H2ConnectionContext& ctx, const Profile& profile) {
   if (!profile.host_header.empty()) {
     SSL_set_tlsext_host_name(ctx.ssl, profile.host_header.c_str());
   }
-  if (ctx.transport_backend == TransportBackend::CustomTcp) {
+  if (is_custom_tcp_backend(ctx.transport_backend)) {
     BIO* rbio = BIO_new(BIO_s_mem());
     BIO* wbio = BIO_new(BIO_s_mem());
     if (rbio == nullptr || wbio == nullptr) {
@@ -4295,7 +4019,7 @@ bool open_h2_client_session(
   }
 
   stats.conn_attempted += 1;
-  if (client.ctx.transport_backend == TransportBackend::CustomTcp) {
+  if (is_custom_tcp_backend(client.ctx.transport_backend)) {
     uint32_t dst_ip = 0;
     if (!parse_ipv4_u32(profile.target_ip, &dst_ip)) {
       errno = EINVAL;
@@ -4339,7 +4063,7 @@ bool open_h2_client_session(
         client.ctx.tls_tctx,
         profile.host_header,
         profile.target_port,
-        client.ctx.transport_backend == TransportBackend::CustomTcp));
+        is_custom_tcp_backend(client.ctx.transport_backend)));
     if (client.ctx.ssl == nullptr) {
       unregister_custom_tcp_h2_flow_binding(runtime, client);
       close_h2_client_session(client);
@@ -4347,7 +4071,7 @@ bool open_h2_client_session(
       stats.expectation_failures += static_cast<int>(request_count);
       return false;
     }
-    if (client.ctx.transport_backend != TransportBackend::CustomTcp) {
+    if (!is_custom_tcp_backend(client.ctx.transport_backend)) {
       if (SSL_set_fd(client.ctx.ssl, client.ctx.fd) != 1) {
         unregister_custom_tcp_h2_flow_binding(runtime, client);
         close_h2_client_session(client);
@@ -4439,7 +4163,7 @@ bool open_h2_client_session(
     return false;
   }
   nghttp2_submit_settings(client.session, NGHTTP2_FLAG_NONE, nullptr, 0);
-  if (client.ctx.transport_backend != TransportBackend::CustomTcp) {
+  if (!is_custom_tcp_backend(client.ctx.transport_backend)) {
     register_h2_lane_fd(shard, local_shard, &client);
   }
   client.ready = true;
@@ -4524,7 +4248,7 @@ void service_h2_session_io(
   const long long now_ms = monotonic_ms_now();
 
 #ifdef SAMURAI_WITH_OPENSSL
-  if (ctx.transport_backend == TransportBackend::CustomTcp && ctx.use_tls && !ctx.tls_handshake_complete) {
+  if (is_custom_tcp_backend(ctx.transport_backend) && ctx.use_tls && !ctx.tls_handshake_complete) {
     const bool ready = h2_custom_advance_tls(ctx);
     if (!ready && ctx.transport_error == 0) {
       return;
@@ -4608,7 +4332,7 @@ void service_h2_session_io(
     client.unhealthy_until_ms = monotonic_ms_now() + std::max(1, profile.timeout_ms / 4);
     shard.connection_pool.active_connections =
         std::max(0, shard.connection_pool.active_connections - 1);
-    if (ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
+    if (!is_custom_tcp_backend(ctx.transport_backend) && client.ctx.fd >= 0) {
       unregister_lane_fd(shard, local_shard, client.ctx.fd);
     }
     unregister_custom_tcp_h2_flow_binding(runtime, client);
@@ -4625,7 +4349,7 @@ void service_h2_session_io(
     requeue_h2_pending_front(local_shard, client);
     shard.connection_pool.active_connections =
         std::max(0, shard.connection_pool.active_connections - 1);
-    if (ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
+    if (!is_custom_tcp_backend(ctx.transport_backend) && client.ctx.fd >= 0) {
       unregister_lane_fd(shard, local_shard, client.ctx.fd);
     }
     unregister_custom_tcp_h2_flow_binding(runtime, client);
@@ -4650,9 +4374,10 @@ std::map<std::string, double> run_http2_profile(
     const RuntimeConfig& cfg,
     const RuntimeCapabilities& caps) {
   const TransportBackend transport_backend = parse_transport_backend(profile);
-  if (transport_backend == TransportBackend::CustomTcp) {
-    return run_http2_custom_tcp_profile(profile, cfg, caps);
-  }
+  // CustomTcp ve DpdkDirect artık her ikisi de gerçek nghttp2 reactor'ını kullanır
+  // (open_h2_client_session tcpdp connect + flow binding + h2_custom_* send/recv ile
+  // custom_tcp'yi zaten destekler). Eski run_http2_custom_tcp_profile stub'ı (düz
+  // h2_req_stub modeli, gerçek stream yoktu) kaldırıldı; H1 ile aynı reactor sözleşmesi.
   NativeRuntime runtime = build_runtime(profile, cfg);
   runtime.perf.started_ms = monotonic_ms_now();
   g_perf_stats = &runtime.perf;
@@ -4660,6 +4385,33 @@ std::map<std::string, double> run_http2_profile(
   init_stats(profile, out);
   out["runtime_shards"] = static_cast<double>(runtime.shards.size());
   out["h2_native_capability_available"] = (caps.openssl && caps.nghttp2) ? 1.0 : 0.0;
+  out["runtime_transport_custom_tcp_requested"] =
+      is_custom_tcp_backend(transport_backend) ? 1.0 : 0.0;
+  if (transport_backend == TransportBackend::CustomTcp) {
+    // Yalnız CustomTcp (engine wire sahibi) bridge'i configure eder; DpdkDirect'te
+    // wire'ı harici fast-path sürücüsü hazırlar (H1 run_profile ile aynı ayrım).
+    out["runtime_transport_custom_tcp_bridge_ready"] =
+        configure_custom_tcp_bridge(profile) ? 1.0 : 0.0;
+    out["runtime_h2_transport_contract"] = 1.0;
+    out["runtime_h2_transport_mode_custom_tcp"] = 1.0;
+    if (out["runtime_transport_custom_tcp_bridge_ready"] == 0.0) {
+      if (profile.stateful_runtime_strict != 0) {
+        g_perf_stats = nullptr;
+        destroy_runtime(runtime);
+        auto failed = fail_visible_stats(profile, caps, "custom_tcp_transport_not_yet_wired");
+        failed["runtime_transport_custom_tcp_requested"] = 1.0;
+        failed["runtime_transport_custom_tcp_bridge_ready"] = 0.0;
+        failed["runtime_h2_transport_contract"] = 0.0;
+        failed["runtime_h2_transport_mode_custom_tcp"] = 1.0;
+        return failed;
+      }
+      out["runtime_failure_reason_code"] =
+          runtime_failure_reason_code("custom_tcp_transport_not_yet_wired");
+    }
+    runtime.custom_tcp_rx_handler_id = maybe_start_custom_tcp_rx_bridge();
+    out["runtime_transport_custom_tcp_rx_bridge_active"] =
+        runtime.custom_tcp_rx_handler_id > 0 ? 1.0 : 0.0;
+  }
   if (!(caps.openssl && caps.nghttp2)) {
     g_perf_stats = nullptr;
     destroy_runtime(runtime);
@@ -4758,7 +4510,7 @@ std::map<std::string, double> run_http2_profile(
     if (decision.action == ConnectionDispositionAction::Close) {
       shard.connection_pool.active_connections =
           std::max(0, shard.connection_pool.active_connections - 1);
-      if (client.ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
+      if (!is_custom_tcp_backend(client.ctx.transport_backend) && client.ctx.fd >= 0) {
         unregister_lane_fd(shard, local_shard, client.ctx.fd);
       }
       unregister_custom_tcp_h2_flow_binding(runtime, client);
@@ -4805,7 +4557,7 @@ std::map<std::string, double> run_http2_profile(
       }
       if (client.replacement_mode == H2LaneReplacementMode::ReplaceNow) {
         stats.replace_now_decisions += 1;
-        if (client.ctx.transport_backend != TransportBackend::CustomTcp && client.ctx.fd >= 0) {
+        if (!is_custom_tcp_backend(client.ctx.transport_backend) && client.ctx.fd >= 0) {
           shard.connection_pool.active_connections =
               std::max(0, shard.connection_pool.active_connections - 1);
           unregister_lane_fd(shard, local_shard, client.ctx.fd);
@@ -4919,6 +4671,17 @@ std::map<std::string, double> run_http2_profile(
       if (active_io) {
         service_all_ready_lanes(runtime, profile, 16);
         collect_all_h2_stats();
+        // custom_tcp/dpdk'da epoll fd yoktur; service_ready_lanes(16) beklemeden
+        // döner, dolayısıyla bu "active_io" dalı tight-spin olur. tcpdp stop-and-wait
+        // (flow başına tek outstanding segment) olduğundan H2, preface/SETTINGS/HEADERS'i
+        // ayrı segmentlerde yollar ve her birinin ACK'ini bekler. Tight-spin,
+        // co-resident wire thread'ini (dpdk fast-path sürücüsü ya da tcpdp RX backend'i)
+        // CPU'dan aç bırakıp ACK teslimini geciktirir (→ ara sıra süre aşımı). Kısa bir
+        // yield ile wire'a CPU verip ACK'in gelmesine izin ver. Kernel yolu buraya girse
+        // bile epoll_wait zaten uyuduğundan yield gereksiz; o yüzden yalnız custom_tcp'de.
+        if (is_custom_tcp_backend(transport_backend)) {
+          std::this_thread::sleep_for(std::chrono::microseconds(150));
+        }
         continue;
       }
       if (!next_deadline.has_value()) {
@@ -4959,6 +4722,9 @@ std::map<std::string, double> run_http2_profile(
   }
 
   collect_all_h2_stats();
+  if (is_custom_tcp_backend(transport_backend)) {
+    merge_custom_tcp_stats(out);
+  }
 
   stats.errors += std::max(0, stats.attempted - stats.sent - stats.errors);
   out["attempted"] = static_cast<double>(stats.attempted);
