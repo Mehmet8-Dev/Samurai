@@ -165,11 +165,24 @@ class TcpDataplaneCore {
     uint32_t ack = 0;
     uint32_t payload_len = 0;
     uint8_t flags = 0;
-    uint32_t rto_ms = 0;
-    uint64_t deadline_ns = 0;
-    uint32_t payload_offset = 0;
-    // Retransmit payload lives in FlowEntry::retx_buf (reused across sends to avoid
-    // per-send heap churn); this struct only carries offset/len into it.
+    uint32_t xmit_count = 0;
+    uint64_t sent_ns = 0;   // first-transmission time; RTT sampled only when xmit_count==1 (Karn)
+    bool sacked = false;    // covered by a received SACK block -> skip on selective retransmit
+    // Owned payload bytes for this in-flight segment (empty for pure SYN/FIN/ACK).
+    // Held per-segment so a retransmit is a straight rebuild with no shared cursor.
+    std::vector<uint8_t> data;
+  };
+
+  // Parsed TCP option fields we care about (from SYN-ACK negotiation and per-ACK SACK).
+  struct TcpOptionInfo {
+    bool has_mss = false;
+    uint16_t mss = 0;
+    bool sack_permitted = false;
+    bool has_wscale = false;
+    uint8_t wscale = 0;
+    uint32_t sack_left[4] = {0, 0, 0, 0};
+    uint32_t sack_right[4] = {0, 0, 0, 0};
+    int sack_block_count = 0;
   };
 
   struct FlowEntry {
@@ -192,6 +205,7 @@ class TcpDataplaneCore {
     uint32_t ssthresh = 65535;
     uint32_t srtt_ms = 100;
     uint32_t rttvar_ms = 50;
+    bool rtt_sampled = false;  // false until the first valid RTT measurement (RFC 6298 init)
     bool in_fast_recovery = false;
     uint16_t mss = 0;
     uint8_t ttl = 0;
@@ -207,10 +221,15 @@ class TcpDataplaneCore {
     uint64_t last_activity_ns = 0;
     bool tls_native_active = false;
     uint8_t tls_state = 0;
-    std::optional<OutstandingTx> outstanding;
-    // Persistent per-flow retransmit buffer. assign() reuses its capacity across
-    // sends, so steady-state re-sends cost a memcpy with no allocation/free.
-    std::vector<uint8_t> retx_buf;
+    uint32_t cur_rto_ms = 0;  // current retransmit timeout (0 => config_.initial_rto_ms); doubles on RTO, resets on new ACK.
+    // Sliding-window sender state (replaces the legacy single-outstanding model).
+    // sndbuf holds application bytes accepted by EnqueueSend but not yet placed on
+    // the wire; PumpSend drains it into MSS segments as the effective window opens.
+    // unacked holds sent-but-unacknowledged segments in ascending seq order
+    // (front == snd_una edge); ACKs pop/trim the front, RTO retransmits it.
+    std::vector<uint8_t> sndbuf;
+    size_t sndbuf_head = 0;  // consumed offset into sndbuf (compacted lazily)
+    std::deque<OutstandingTx> unacked;
   };
 
   enum class TimerKind : uint8_t {
@@ -327,6 +346,21 @@ class TcpDataplaneCore {
       const uint8_t* payload,
       size_t payload_len,
       uint8_t* out_buffer) const;
+  // Same as BuildPacket but injects TCP options (opts_len must be a multiple of 4).
+  size_t BuildPacketOpt(
+      const FlowEntry& flow,
+      uint32_t seq,
+      uint32_t ack,
+      uint8_t flags,
+      const uint8_t* payload,
+      size_t payload_len,
+      const uint8_t* opts,
+      size_t opts_len,
+      uint8_t* out_buffer) const;
+  // Build our SYN option block (MSS, SACK-permitted, window scale). Returns length.
+  size_t BuildSynOptions(uint8_t* out, uint8_t wscale) const;
+  static bool ParseTcpOptions(const uint8_t* frame, size_t frame_len, TcpOptionInfo* out);
+  void UpdateRtt(FlowEntry& flow, uint64_t sample_ns);
   size_t BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out, uint8_t* out_buffer) const;
   bool EnqueueTxPacketBytes(const uint8_t* data, size_t len);
   void PushTimer(uint64_t flow_id, TimerKind kind, uint64_t due_ns, uint32_t generation);
@@ -344,7 +378,14 @@ class TcpDataplaneCore {
       uint32_t payload_len,
       bool arm_rto);
   void PushCompletion(uint64_t flow_id, TcpDpState state, bool success, const char* event);
-  void HandleAck(FlowEntry& flow, uint32_t ack_value);
+  // Drain sndbuf into MSS-sized segments under the effective window
+  // min(cwnd, peer_window); emit each, append to unacked, advance snd_nxt, arm RTO.
+  void PumpSend(FlowEntry& flow, uint64_t now_ns);
+  // Rebuild + re-emit the oldest unacked segment (RTO / fast retransmit).
+  void RetransmitOldest(FlowEntry& flow);
+  uint32_t EffectiveMss(const FlowEntry& flow) const;
+  uint64_t CurrentRtoNs(const FlowEntry& flow) const;
+  void HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpOptionInfo* opt);
   void CloseTimedOutFlow(FlowEntry& flow, TcpDpState terminal_state, const char* event);
   bool IsCountedActive(TcpDpState state) const;
   void SetFlowState(FlowEntry& flow, TcpDpState next_state);

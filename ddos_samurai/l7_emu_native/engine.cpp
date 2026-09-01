@@ -4965,15 +4965,15 @@ std::map<std::string, double> run_http2_profile(
         service_all_ready_lanes(runtime, profile, 16);
         collect_all_h2_stats(stats);
         // custom_tcp/dpdk'da epoll fd yoktur; service_ready_lanes(16) beklemeden
-        // döner, dolayısıyla bu "active_io" dalı tight-spin olur. tcpdp stop-and-wait
-        // (flow başına tek outstanding segment) olduğundan H2, preface/SETTINGS/HEADERS'i
-        // ayrı segmentlerde yollar ve her birinin ACK'ini bekler. Tight-spin,
-        // co-resident wire thread'ini (dpdk fast-path sürücüsü ya da tcpdp RX backend'i)
-        // CPU'dan aç bırakıp ACK teslimini geciktirir (→ ara sıra süre aşımı). Kısa bir
-        // yield ile wire'a CPU verip ACK'in gelmesine izin ver. Kernel yolu buraya girse
-        // bile epoll_wait zaten uyuduğundan yield gereksiz; o yüzden yalnız custom_tcp'de.
+        // döner, dolayısıyla bu "active_io" dalı tight-spin olur ve co-resident wire
+        // thread'ini (dpdk fast-path sürücüsü ya da tcpdp RX backend'i) CPU'dan aç
+        // bırakabilir. tcpdp artık kayan-pencere gönderici olduğundan (çoklu-outstanding;
+        // H2 preface/SETTINGS/HEADERS ardışık gönderilir, per-segment ACK beklenmez)
+        // eski 150µs sabit uyku gereksiz — o yalnızca latency tabanı ekliyordu. Bunun
+        // yerine kooperatif yield: wire thread'e CPU devret ama gecikme tabanı koyma.
+        // Kernel yolu buraya girse bile epoll_wait zaten uyuduğundan yield gereksiz.
         if (is_custom_tcp_backend(transport_backend)) {
-          std::this_thread::sleep_for(std::chrono::microseconds(150));
+          std::this_thread::yield();
         }
         continue;
       }

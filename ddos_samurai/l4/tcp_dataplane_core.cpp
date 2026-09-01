@@ -26,6 +26,24 @@ constexpr uint8_t kTcpFlagRst = 0x04;
 constexpr uint8_t kTcpFlagPsh = 0x08;
 constexpr uint8_t kTcpFlagAck = 0x10;
 
+// Send-side sliding-window limits.
+constexpr size_t kSndBufCap = 1u << 20;           // 1 MiB per-flow app send buffer
+constexpr size_t kSndBufCompactThreshold = 64u * 1024u;  // compact once head passes this
+constexpr uint32_t kMaxCwnd = 16u * 1024u * 1024u;       // cwnd ceiling (bytes)
+constexpr uint32_t kMinRtoMs = 50u;                      // RTO floor (LAN-oriented load generator)
+constexpr uint8_t kOptEnd = 0, kOptNop = 1, kOptMss = 2, kOptWScale = 3, kOptSackPerm = 4, kOptSack = 5;
+constexpr uint8_t kSynWScale = 7;                        // window scale shift we advertise
+
+// RFC 1982 serial-number comparison for 32-bit TCP sequence space.
+inline bool SeqLt(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) < 0; }
+inline bool SeqLeq(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) <= 0; }
+inline bool SeqGt(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) > 0; }
+
+// Sequence footprint a segment consumes (payload + 1 for each of SYN/FIN).
+inline uint32_t SegSeqLen(const uint8_t flags, const uint32_t payload_len) {
+  return payload_len + ((flags & kTcpFlagSyn) ? 1u : 0u) + ((flags & kTcpFlagFin) ? 1u : 0u);
+}
+
 inline uint16_t ReadBe16(const uint8_t* p) {
   return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | static_cast<uint16_t>(p[1]));
 }
@@ -227,6 +245,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
         created.peer_window = 0;
         created.local_window = window > 0 ? window : config_.local_window;
         created.mss = config_.default_mss;
+        created.cwnd = 10u * static_cast<uint32_t>(config_.default_mss);  // IW10
         created.ttl = ttl > 0 ? ttl : config_.default_ttl;
         created.last_activity_ns = DefaultNowNs();
         const size_t flow_shard = FlowLockShardForFlowId(created.flow_id);
@@ -257,16 +276,19 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       flow->snd_nxt = AdvanceSeq(seq, 1U);
       flow->rcv_nxt = 0;
       flow->retransmit_count = 0;
+      flow->cwnd = 10u * static_cast<uint32_t>(config_.default_mss);  // IW10
+      flow->sndbuf.clear();
+      flow->sndbuf_head = 0;
+      flow->unacked.clear();
       OutstandingTx out;
       out.seq = seq;
       out.ack = 0;
       out.payload_len = 0;
       out.flags = kTcpFlagSyn;
-      out.rto_ms = config_.initial_rto_ms;
-      out.deadline_ns = DefaultNowNs() + NsFromMs(out.rto_ms);
-      out.payload_offset = 0;
-      flow->outstanding = std::move(out);
-      flow->rto_deadline_ns = flow->outstanding->deadline_ns;
+      out.xmit_count = 1;
+      flow->unacked.push_back(std::move(out));
+      flow->cur_rto_ms = config_.initial_rto_ms;
+      flow->rto_deadline_ns = DefaultNowNs() + NsFromMs(flow->cur_rto_ms);
       stats_shard_[flow_shard].connect_attempts.fetch_add(1, std::memory_order_relaxed);
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
@@ -277,8 +299,9 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       SetFlowState(*flow, TcpDpState::kEstablished);
       flow->snd_una = ack;
       flow->snd_nxt = seq;
-      flow->outstanding.reset();
+      flow->unacked.clear();
       flow->rto_deadline_ns = 0;
+      flow->cur_rto_ms = 0;
       stats_shard_[flow_shard].connect_established.fetch_add(1, std::memory_order_relaxed);
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
@@ -287,7 +310,8 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
 
     if ((flags & kTcpFlagAck) != 0 && payload_len > 0) {
       SetFlowState(*flow, TcpDpState::kEstablished);
-      flow->snd_una = ack;
+      // snd_una advances only from received ACKs (HandleAck); the ack field on our
+      // own outbound packet is our rcv_nxt, not an acknowledgement of our data.
       flow->snd_nxt = AdvanceSeq(seq, payload_len);
       flow->rcv_nxt = ack;
       flow->local_window = window > 0 ? window : flow->local_window;
@@ -297,17 +321,18 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       out.ack = ack;
       out.payload_len = payload_len;
       out.flags = static_cast<uint8_t>(flags & static_cast<uint8_t>(kTcpFlagFin | kTcpFlagPsh | kTcpFlagAck));
-      out.rto_ms = config_.initial_rto_ms;
-      out.deadline_ns = DefaultNowNs() + NsFromMs(out.rto_ms);
-      out.payload_offset = 0;
+      out.xmit_count = 1;
       const uint8_t* ip = pkt + 14;
       const size_t ihl = static_cast<size_t>(ip[0] & 0x0F) * 4U;
       const uint8_t* tcp = ip + ihl;
       const size_t data_off = static_cast<size_t>((tcp[12] >> 4) & 0x0F) * 4U;
       const uint8_t* payload = tcp + data_off;
-      flow->retx_buf.assign(payload, payload + payload_len);
-      flow->outstanding = std::move(out);
-      flow->rto_deadline_ns = flow->outstanding->deadline_ns;
+      out.data.assign(payload, payload + payload_len);
+      flow->unacked.push_back(std::move(out));
+      if (flow->rto_deadline_ns == 0) {
+        flow->cur_rto_ms = flow->cur_rto_ms ? flow->cur_rto_ms : config_.initial_rto_ms;
+        flow->rto_deadline_ns = DefaultNowNs() + NsFromMs(flow->cur_rto_ms);
+      }
       stats_shard_[flow_shard].tx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
@@ -352,15 +377,18 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   flow.peer_window = 0;
   flow.local_window = config_.local_window;
   flow.mss = config_.default_mss;
+  flow.cwnd = 10u * static_cast<uint32_t>(config_.default_mss);  // IW10 (RFC 6928)
+  flow.snd_wscale = kSynWScale;
   flow.ttl = config_.default_ttl;
   flow.state = TcpDpState::kSynSent;
   flow.last_activity_ns = now_ns;
 
     thread_local uint8_t tls_scratch_buf[2048];
-  size_t syn_len = BuildPacket(flow, flow.snd_nxt, 0, kTcpFlagSyn, nullptr, 0, tls_scratch_buf);
+  uint8_t syn_opts[40];
+  const size_t syn_opts_len = BuildSynOptions(syn_opts, kSynWScale);  // MSS + SACK-perm + WScale
+  size_t syn_len = BuildPacketOpt(flow, flow.snd_nxt, 0, kTcpFlagSyn, nullptr, 0, syn_opts, syn_opts_len, tls_scratch_buf);
   flow.snd_nxt = AdvanceSeq(flow.snd_nxt, 1);
   QueuePacket(flow, tls_scratch_buf, syn_len, flow.iss, 0, kTcpFlagSyn, nullptr, 0, true);
-  flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
   {
     const size_t shard = FlowLockShardForFlowId(flow_id);
     std::lock_guard<SpinLock> tguard(timer_shard_mu_[shard]);
@@ -380,7 +408,7 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
 }
 
 uint32_t TcpDataplaneCore::EnqueueSend(uint64_t flow_id, const uint8_t* payload, size_t payload_len) {
-  if (!payload || payload_len == 0 || payload_len > 65535U) {
+  if (!payload || payload_len == 0) {
     return 0;
   }
   const size_t flow_shard = FlowLockShardForFlowId(flow_id);
@@ -390,28 +418,26 @@ uint32_t TcpDataplaneCore::EnqueueSend(uint64_t flow_id, const uint8_t* payload,
     return 0;
   }
   FlowEntry* flow = &it->second;
-  if (flow->state != TcpDpState::kEstablished || flow->outstanding.has_value()) {
+  if (flow->state != TcpDpState::kEstablished) {
     return 0;
   }
-    thread_local uint8_t tls_scratch_buf[65536];
-  size_t pkt_len = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh), payload, payload_len, tls_scratch_buf);
-  const uint32_t seq = flow->snd_nxt;
-  flow->snd_nxt = AdvanceSeq(flow->snd_nxt, static_cast<uint32_t>(payload_len));
-  flow->last_activity_ns = DefaultNowNs();
-  QueuePacket(
-      *flow,
-      tls_scratch_buf,
-      pkt_len,
-      seq,
-      flow->rcv_nxt,
-      static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh),
-      payload,
-      static_cast<uint32_t>(payload_len),
-      true);
-  flow->rto_deadline_ns = flow->outstanding ? flow->outstanding->deadline_ns : 0;
-  ScheduleFlowTimers(*flow, flow->last_activity_ns);
-  stats_shard_[flow_shard].tx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
-  return static_cast<uint32_t>(payload_len);
+  // socket send() semantics: accepted bytes are copied into the per-flow send
+  // buffer (== owned by us), so a short write is safe — the caller re-offers only
+  // its unaccepted tail. PumpSend then clocks the buffer onto the wire in
+  // MSS-sized segments as the effective window min(cwnd, rwnd) allows. This
+  // replaces the legacy one-outstanding-segment gate (stop-and-wait).
+  const size_t buffered = flow->sndbuf.size() - flow->sndbuf_head;
+  const size_t room = kSndBufCap > buffered ? kSndBufCap - buffered : 0;
+  const size_t accept = std::min(payload_len, room);
+  if (accept == 0) {
+    return 0;  // send buffer full -> backpressure, caller retries later
+  }
+  flow->sndbuf.insert(flow->sndbuf.end(), payload, payload + accept);
+  const uint64_t now_ns = DefaultNowNs();
+  flow->last_activity_ns = now_ns;
+  PumpSend(*flow, now_ns);
+  ScheduleFlowTimers(*flow, now_ns);
+  return static_cast<uint32_t>(accept);
 }
 
 uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len) {
@@ -432,6 +458,9 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
           frame, frame_len, &src_ip, &dst_ip, &src_port, &dst_port, &seq, &ack, &flags, &window, &payload_len, &ttl)) {
     return 0;
   }
+
+  TcpOptionInfo opt;
+  ParseTcpOptions(frame, frame_len, &opt);
 
   uint64_t flow_id = 0;
   const FlowKey key{dst_ip, src_ip, dst_port, src_port};
@@ -462,13 +491,22 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     return rc;
   };
   if (window > 0) {
-    flow->peer_window = window;
+    // Window scaling (RFC 7323): the SYN-ACK window itself is never scaled; every
+    // later segment's window is left-shifted by the peer's advertised shift.
+    const bool is_synack = (flags & kTcpFlagSyn) != 0;
+    uint32_t pw = is_synack ? static_cast<uint32_t>(window)
+                            : (static_cast<uint32_t>(window) << flow->rcv_wscale);
+    if (pw > (1u << 30)) pw = 1u << 30;
+    flow->peer_window = pw;
   }
 
   if ((flags & kTcpFlagRst) != 0) {
     SetFlowState(*flow, TcpDpState::kRstSeen);
-    flow->outstanding.reset();
+    flow->unacked.clear();
+    flow->sndbuf.clear();
+    flow->sndbuf_head = 0;
     flow->rto_deadline_ns = 0;
+    flow->cur_rto_ms = 0;
     stats_shard_[flow_shard].peer_rst_count.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, false, "peer_rst");
     return finish(1);
@@ -482,7 +520,19 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     flow->snd_una = ack;
     flow->rcv_nxt = seq + 1U;
     SetFlowState(*flow, TcpDpState::kSynAckRcvd);
-    flow->outstanding.reset();
+    // Negotiated options — we always offer SACK-permitted + WScale + MSS in our SYN,
+    // so honour whatever the peer echoed.
+    flow->sack_permitted = opt.sack_permitted;
+    flow->rcv_wscale = opt.has_wscale ? opt.wscale : 0;
+    if (opt.has_mss && opt.mss > 0 && opt.mss < flow->mss) {
+      flow->mss = opt.mss;  // effective MSS is the smaller of the two advertisements
+    }
+    // Seed the RTO estimate from the handshake RTT (SYN -> SYN-ACK); the SYN was sent
+    // exactly once, so this is Karn-safe. UpdateRtt sets cur_rto_ms.
+    if (!flow->unacked.empty() && flow->unacked.front().xmit_count == 1) {
+      UpdateRtt(*flow, flow->unacked.front().sent_ns);
+    }
+    flow->unacked.clear();  // our SYN is acknowledged by this SYN-ACK
     flow->rto_deadline_ns = 0;
         thread_local uint8_t tls_scratch_buf[2048];
     size_t ack_len = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
@@ -494,8 +544,10 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
   }
 
   if ((flags & kTcpFlagAck) != 0) {
-    HandleAck(*flow, ack);
+    HandleAck(*flow, ack, &opt);
     stats_shard_[FlowLockShardForFlowId(flow_id)].rx_ack_count.fetch_add(1, std::memory_order_relaxed);
+    // A pure window update (no new data acked) can also reopen the send window.
+    PumpSend(*flow, flow->last_activity_ns);
   }
 
   if (payload_len > 0) {
@@ -588,7 +640,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
     FlowEntry* flow = &it->second;
     switch (entry.kind) {
       case TimerKind::kRto: {
-        if (entry.generation != flow->rto_timer_gen || !flow->outstanding.has_value() || flow->rto_deadline_ns == 0 ||
+        if (entry.generation != flow->rto_timer_gen || flow->unacked.empty() || flow->rto_deadline_ns == 0 ||
             flow->rto_deadline_ns != entry.due_ns) {
           break;
         }
@@ -600,12 +652,22 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
         }
         flow->retransmit_count++;
         stats_shard_[selected_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
-        flow->outstanding->rto_ms = std::min(flow->outstanding->rto_ms * 2U, config_.connect_timeout_ms);
-        flow->outstanding->deadline_ns = now_ns + NsFromMs(flow->outstanding->rto_ms);
-        flow->rto_deadline_ns = flow->outstanding->deadline_ns;
-                thread_local uint8_t tls_scratch_buf[65536];
-        size_t pkt_len = BuildOutstandingPacket(*flow, *flow->outstanding, tls_scratch_buf);
-        (void)EnqueueTxPacketBytes(tls_scratch_buf, pkt_len);
+        // RTO recovery (Reno): remember half the flight as ssthresh, collapse cwnd
+        // to one segment, and slow-start again.
+        {
+          const uint32_t rmss = EffectiveMss(*flow);
+          const uint32_t flight = flow->snd_nxt - flow->snd_una;
+          flow->ssthresh = std::max(flight / 2u, 2u * rmss);
+          flow->cwnd = rmss;
+          flow->in_fast_recovery = false;
+          flow->dup_ack_streak = 0;
+          stats_shard_[selected_shard].congestion_window_reductions.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Exponential backoff of the retransmit timer, then resend the oldest segment.
+        flow->cur_rto_ms =
+            std::min((flow->cur_rto_ms ? flow->cur_rto_ms : config_.initial_rto_ms) * 2U, config_.connect_timeout_ms);
+        flow->rto_deadline_ns = now_ns + NsFromMs(flow->cur_rto_ms);
+        RetransmitOldest(*flow);
         ScheduleFlowTimers(*flow, now_ns);
         actions++;
         break;
@@ -620,7 +682,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
         if (flow->rto_deadline_ns > 0 && now_ns >= flow->rto_deadline_ns) {
           break;
         }
-        if (flow->state == TcpDpState::kSynSent && flow->outstanding.has_value() && now_ns >= flow->connect_deadline_ns) {
+        if (flow->state == TcpDpState::kSynSent && !flow->unacked.empty() && now_ns >= flow->connect_deadline_ns) {
           CloseTimedOutFlow(*flow, TcpDpState::kClosed, "connect_timeout");
           ScheduleFlowTimers(*flow, now_ns);
           actions++;
@@ -632,7 +694,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
             flow->idle_deadline_ns != entry.due_ns) {
           break;
         }
-        if (flow->state == TcpDpState::kEstablished && !flow->outstanding.has_value() && now_ns >= flow->idle_deadline_ns) {
+        if (flow->state == TcpDpState::kEstablished && flow->unacked.empty() && now_ns >= flow->idle_deadline_ns) {
           CloseTimedOutFlow(*flow, TcpDpState::kTimeWait, "idle_timeout");
           ScheduleFlowTimers(*flow, now_ns);
           actions++;
@@ -1043,11 +1105,25 @@ size_t TcpDataplaneCore::BuildPacket(
     const uint8_t* payload,
     size_t payload_len,
     uint8_t* out_buffer) const {
+  return BuildPacketOpt(flow, seq, ack, flags, payload, payload_len, nullptr, 0, out_buffer);
+}
+
+size_t TcpDataplaneCore::BuildPacketOpt(
+    const FlowEntry& flow,
+    uint32_t seq,
+    uint32_t ack,
+    uint8_t flags,
+    const uint8_t* payload,
+    size_t payload_len,
+    const uint8_t* opts,
+    size_t opts_len,
+    uint8_t* out_buffer) const {
   if (!out_buffer) return 0;
-  
+  if (!opts) opts_len = 0;
+
   const size_t l2_len = 14;
   const size_t ip_len = 20;
-  const size_t tcp_len = 20;
+  const size_t tcp_len = 20 + opts_len;  // opts_len is a multiple of 4
   const size_t total_pkt_len = l2_len + ip_len + tcp_len + payload_len;
 
   std::memset(out_buffer, 0, total_pkt_len);
@@ -1074,10 +1150,13 @@ size_t TcpDataplaneCore::BuildPacket(
   std::memcpy(tcp + 2, &dst_port_be, sizeof(dst_port_be));
   std::memcpy(tcp + 4, &seq_be, sizeof(seq_be));
   std::memcpy(tcp + 8, &ack_be, sizeof(ack_be));
-  tcp[12] = 0x50;
+  tcp[12] = static_cast<uint8_t>((tcp_len / 4) << 4);  // data offset in 32-bit words
   tcp[13] = flags;
   const uint16_t win_be = htons(flow.local_window > 0 ? flow.local_window : config_.local_window);
   std::memcpy(tcp + 14, &win_be, sizeof(win_be));
+  if (opts_len > 0) {
+    std::memcpy(tcp + 20, opts, opts_len);
+  }
   if (payload_len > 0 && payload) {
     std::memcpy(tcp + tcp_len, payload, payload_len);
   }
@@ -1086,8 +1165,91 @@ size_t TcpDataplaneCore::BuildPacket(
   std::memcpy(ip + 10, &ip_cksum, sizeof(ip_cksum));
   const uint16_t tcp_cksum = htons(TcpChecksum(ip, tcp, tcp_len + payload_len));
   std::memcpy(tcp + 16, &tcp_cksum, sizeof(tcp_cksum));
-  
+
   return total_pkt_len;
+}
+
+size_t TcpDataplaneCore::BuildSynOptions(uint8_t* out, uint8_t wscale) const {
+  // MSS(4) + SACK-permitted(2) + NOP(1) + WScale(3) + NOP + NOP = 12 bytes (4-aligned).
+  size_t n = 0;
+  const uint16_t mss = config_.default_mss ? config_.default_mss : 1460;
+  out[n++] = kOptMss;      out[n++] = 4; out[n++] = static_cast<uint8_t>(mss >> 8); out[n++] = static_cast<uint8_t>(mss & 0xFF);
+  out[n++] = kOptSackPerm; out[n++] = 2;
+  out[n++] = kOptNop;
+  out[n++] = kOptWScale;   out[n++] = 3; out[n++] = wscale;
+  out[n++] = kOptNop;      out[n++] = kOptNop;
+  return n;  // 12
+}
+
+bool TcpDataplaneCore::ParseTcpOptions(const uint8_t* frame, size_t frame_len, TcpOptionInfo* out) {
+  if (!frame || !out) return false;
+  int ip_offset = -1;
+  if (frame_len >= 18) {
+    const uint16_t eth = ReadBe16(frame + 12);
+    if (eth == 0x8100 && frame_len >= 22) {
+      if (ReadBe16(frame + 16) == 0x0800) ip_offset = 18;
+    } else if (eth == 0x0800) {
+      ip_offset = 14;
+    }
+  }
+  if (ip_offset < 0 && ((frame[0] >> 4) & 0x0F) == 4) ip_offset = 0;
+  if (ip_offset < 0 || frame_len < static_cast<size_t>(ip_offset + 20)) return false;
+  const uint8_t ihl = static_cast<uint8_t>((frame[ip_offset] & 0x0F) * 4);
+  if (ihl < 20 || frame_len < static_cast<size_t>(ip_offset + ihl + 20)) return false;
+  const size_t tcp_off = static_cast<size_t>(ip_offset) + ihl;
+  const uint8_t data_off = static_cast<uint8_t>((frame[tcp_off + 12] >> 4) * 4);
+  if (data_off < 20 || frame_len < tcp_off + data_off) return false;
+  size_t i = tcp_off + 20;
+  const size_t end = tcp_off + data_off;
+  while (i < end) {
+    const uint8_t kind = frame[i];
+    if (kind == kOptEnd) break;
+    if (kind == kOptNop) { i++; continue; }
+    if (i + 1 >= end) break;
+    const uint8_t len = frame[i + 1];
+    if (len < 2 || i + len > end) break;
+    if (kind == kOptMss && len == 4) {
+      out->has_mss = true;
+      out->mss = ReadBe16(frame + i + 2);
+    } else if (kind == kOptWScale && len == 3) {
+      out->has_wscale = true;
+      out->wscale = frame[i + 2];
+    } else if (kind == kOptSackPerm && len == 2) {
+      out->sack_permitted = true;
+    } else if (kind == kOptSack && len >= 10 && ((len - 2) % 8) == 0) {
+      const int blocks = (len - 2) / 8;
+      for (int b = 0; b < blocks && out->sack_block_count < 4; ++b) {
+        const size_t off = i + 2 + static_cast<size_t>(b) * 8;
+        out->sack_left[out->sack_block_count] = ReadBe32(frame + off);
+        out->sack_right[out->sack_block_count] = ReadBe32(frame + off + 4);
+        out->sack_block_count++;
+      }
+    }
+    i += len;
+  }
+  return true;
+}
+
+void TcpDataplaneCore::UpdateRtt(FlowEntry& flow, uint64_t sample_ns) {
+  if (sample_ns == 0) return;
+  const uint64_t now = DefaultNowNs();
+  if (now <= sample_ns) return;
+  uint32_t r_ms = static_cast<uint32_t>((now - sample_ns) / 1000000ULL);
+  if (r_ms == 0) r_ms = 1;  // floor sub-millisecond RTT
+  if (!flow.rtt_sampled) {
+    flow.srtt_ms = r_ms;
+    flow.rttvar_ms = r_ms / 2;
+    flow.rtt_sampled = true;
+  } else {
+    const int32_t err = static_cast<int32_t>(r_ms) - static_cast<int32_t>(flow.srtt_ms);
+    const uint32_t abs_err = err < 0 ? static_cast<uint32_t>(-err) : static_cast<uint32_t>(err);
+    flow.rttvar_ms = (flow.rttvar_ms * 3u + abs_err) / 4u;  // (1-1/4)·rttvar + 1/4·|err|
+    flow.srtt_ms = (flow.srtt_ms * 7u + r_ms) / 8u;         // (1-1/8)·srtt + 1/8·R
+  }
+  uint32_t rto = flow.srtt_ms + std::max(1u, 4u * flow.rttvar_ms);  // RFC 6298
+  if (rto < kMinRtoMs) rto = kMinRtoMs;
+  if (rto > config_.connect_timeout_ms) rto = config_.connect_timeout_ms;
+  flow.cur_rto_ms = rto;
 }
 
 bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len) {
@@ -1148,8 +1310,9 @@ void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
     return;
   }
 
-  if (flow.outstanding.has_value() && flow.outstanding->deadline_ns > 0) {
-    flow.rto_deadline_ns = flow.outstanding->deadline_ns;
+  // The RTO deadline itself is owned by the send path (PumpSend / HandleAck / Poll /
+  // QueuePacket); here we only (re)publish a timer entry for the current deadline.
+  if (!flow.unacked.empty() && flow.rto_deadline_ns > 0) {
     flow.rto_timer_gen++;
     PushTimer(flow.flow_id, TimerKind::kRto, flow.rto_deadline_ns, flow.rto_timer_gen);
   } else {
@@ -1157,7 +1320,7 @@ void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
     flow.rto_timer_gen++;
   }
 
-  if (flow.state == TcpDpState::kSynSent && flow.outstanding.has_value()) {
+  if (flow.state == TcpDpState::kSynSent && !flow.unacked.empty()) {
     flow.connect_deadline_ns = flow.last_activity_ns + NsFromMs(config_.connect_timeout_ms);
     flow.connect_timer_gen++;
     PushTimer(flow.flow_id, TimerKind::kConnectTimeout, flow.connect_deadline_ns, flow.connect_timer_gen);
@@ -1166,7 +1329,7 @@ void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
     flow.connect_timer_gen++;
   }
 
-  if (flow.state == TcpDpState::kEstablished && !flow.outstanding.has_value()) {
+  if (flow.state == TcpDpState::kEstablished && flow.unacked.empty()) {
     flow.idle_deadline_ns = flow.last_activity_ns + NsFromMs(config_.idle_timeout_ms);
     flow.idle_timer_gen++;
     PushTimer(flow.flow_id, TimerKind::kIdleTimeout, flow.idle_deadline_ns, flow.idle_timer_gen);
@@ -1174,6 +1337,94 @@ void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
     flow.idle_deadline_ns = 0;
     flow.idle_timer_gen++;
   }
+}
+
+uint32_t TcpDataplaneCore::EffectiveMss(const FlowEntry& flow) const {
+  const uint32_t mss = flow.mss ? flow.mss : config_.default_mss;
+  return mss ? mss : 1460u;
+}
+
+uint64_t TcpDataplaneCore::CurrentRtoNs(const FlowEntry& flow) const {
+  const uint32_t rto_ms = flow.cur_rto_ms ? flow.cur_rto_ms : config_.initial_rto_ms;
+  return NsFromMs(rto_ms ? rto_ms : 250u);
+}
+
+void TcpDataplaneCore::PumpSend(FlowEntry& flow, uint64_t now_ns) {
+  if (flow.state != TcpDpState::kEstablished) {
+    return;
+  }
+  const uint32_t mss = EffectiveMss(flow);
+  thread_local uint8_t scratch[65536];
+  while (true) {
+    const size_t buffered = flow.sndbuf.size() - flow.sndbuf_head;
+    if (buffered == 0) {
+      break;
+    }
+    // Effective window is the tighter of the congestion window and the peer's
+    // advertised receive window; we may inject up to (awnd - in-flight) bytes.
+    const uint32_t flight = flow.snd_nxt - flow.snd_una;  // seq-space outstanding
+    const uint32_t rwnd = flow.peer_window ? flow.peer_window : config_.local_window;
+    const uint32_t awnd = std::min(flow.cwnd, rwnd);
+    if (flight >= awnd) {
+      break;  // window full: nothing more may be sent until an ACK opens it
+    }
+    const uint32_t window_room = awnd - flight;
+    uint32_t seg_len = static_cast<uint32_t>(std::min<size_t>(buffered, mss));
+    if (seg_len > window_room) {
+      seg_len = window_room;
+    }
+    if (seg_len == 0) {
+      break;
+    }
+    const uint8_t* src = flow.sndbuf.data() + flow.sndbuf_head;
+    const bool is_tail = (flow.sndbuf_head + seg_len == flow.sndbuf.size());
+    const uint8_t flags = static_cast<uint8_t>(kTcpFlagAck | (is_tail ? kTcpFlagPsh : 0));
+    const uint32_t seq = flow.snd_nxt;
+    const size_t pkt_len = BuildPacket(flow, seq, flow.rcv_nxt, flags, src, seg_len, scratch);
+    (void)EnqueueTxPacketBytes(scratch, pkt_len);
+    OutstandingTx seg;
+    seg.seq = seq;
+    seg.ack = flow.rcv_nxt;
+    seg.payload_len = seg_len;
+    seg.flags = flags;
+    seg.xmit_count = 1;
+    seg.sent_ns = now_ns;
+    seg.data.assign(src, src + seg_len);
+    flow.unacked.push_back(std::move(seg));
+    flow.snd_nxt = AdvanceSeq(flow.snd_nxt, seg_len);
+    flow.sndbuf_head += seg_len;
+    stats_shard_[FlowLockShardForFlowId(flow.flow_id)].tx_data_bytes.fetch_add(
+        static_cast<uint64_t>(seg_len), std::memory_order_relaxed);
+  }
+  // Reclaim the consumed prefix of the send buffer.
+  if (flow.sndbuf_head >= flow.sndbuf.size()) {
+    flow.sndbuf.clear();
+    flow.sndbuf_head = 0;
+  } else if (flow.sndbuf_head >= kSndBufCompactThreshold) {
+    flow.sndbuf.erase(flow.sndbuf.begin(), flow.sndbuf.begin() + static_cast<std::ptrdiff_t>(flow.sndbuf_head));
+    flow.sndbuf_head = 0;
+  }
+  // Arm the (single) connection RTO timer for the oldest unacked segment.
+  if (!flow.unacked.empty() && flow.rto_deadline_ns == 0) {
+    flow.rto_deadline_ns = now_ns + CurrentRtoNs(flow);
+  }
+}
+
+void TcpDataplaneCore::RetransmitOldest(FlowEntry& flow) {
+  if (flow.unacked.empty()) {
+    return;
+  }
+  thread_local uint8_t scratch[65536];
+  // SACK-aware: retransmit the lowest hole — the first segment the peer has NOT
+  // selectively acknowledged. Falls back to the head if every segment is SACKed.
+  OutstandingTx* seg = &flow.unacked.front();
+  for (auto& s : flow.unacked) {
+    if (!s.sacked) { seg = &s; break; }
+  }
+  seg->ack = flow.rcv_nxt;  // carry the freshest cumulative ACK on the resend
+  const size_t pkt_len = BuildOutstandingPacket(flow, *seg, scratch);
+  (void)EnqueueTxPacketBytes(scratch, pkt_len);
+  seg->xmit_count++;
 }
 
 void TcpDataplaneCore::QueuePacket(
@@ -1197,22 +1448,25 @@ void TcpDataplaneCore::QueuePacket(
   out.ack = ack;
   out.flags = flags;
   out.payload_len = payload_len;
-  out.rto_ms = config_.initial_rto_ms;
-  out.deadline_ns = DefaultNowNs() + NsFromMs(out.rto_ms);
-  out.payload_offset = 0;
+  out.xmit_count = 1;
+  out.sent_ns = DefaultNowNs();
   if (payload != nullptr && payload_len > 0) {
-    flow.retx_buf.assign(payload, payload + payload_len);
+    out.data.assign(payload, payload + payload_len);
   }
-  flow.outstanding = std::move(out);
-  flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
+  flow.unacked.push_back(std::move(out));
+  if (flow.rto_deadline_ns == 0) {
+    if (flow.cur_rto_ms == 0) {
+      flow.cur_rto_ms = config_.initial_rto_ms;
+    }
+    flow.rto_deadline_ns = DefaultNowNs() + CurrentRtoNs(flow);
+  }
 }
 
 size_t TcpDataplaneCore::BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out, uint8_t* out_buffer) const {
   const uint8_t* payload_ptr = nullptr;
   size_t payload_size = 0;
-  if (out.payload_len > 0 &&
-      flow.retx_buf.size() >= static_cast<size_t>(out.payload_offset) + static_cast<size_t>(out.payload_len)) {
-    payload_ptr = flow.retx_buf.data() + out.payload_offset;
+  if (out.payload_len > 0 && out.data.size() >= static_cast<size_t>(out.payload_len)) {
+    payload_ptr = out.data.data();
     payload_size = static_cast<size_t>(out.payload_len);
   }
   return BuildPacket(flow, out.seq, out.ack, out.flags, payload_ptr, payload_size, out_buffer);
@@ -1260,76 +1514,130 @@ void TcpDataplaneCore::SetFlowState(FlowEntry& flow, TcpDpState next_state) {
   }
 }
 
-void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value) {
+void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpOptionInfo* opt) {
   const size_t stat_shard = FlowLockShardForFlowId(flow.flow_id);
-  if (!flow.outstanding.has_value()) {
-    return;
+  if (flow.unacked.empty()) {
+    return;  // nothing outstanding to acknowledge
   }
-  if (ack_value == flow.snd_una) {
-    stats_shard_[stat_shard].dup_ack_count.fetch_add(1, std::memory_order_relaxed);
-    flow.dup_ack_streak++;
-    if (flow.dup_ack_streak == 3) {
-            thread_local uint8_t tls_scratch_buf[65536];
-      size_t pkt_len = BuildOutstandingPacket(flow, *flow.outstanding, tls_scratch_buf);
-      (void)EnqueueTxPacketBytes(tls_scratch_buf, pkt_len);
-      stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
-      stats_shard_[stat_shard].fast_retransmit_count.fetch_add(1, std::memory_order_relaxed);
-      flow.retransmit_count++;
-      flow.outstanding->deadline_ns = DefaultNowNs() + NsFromMs(flow.outstanding->rto_ms);
-      flow.rto_deadline_ns = flow.outstanding->deadline_ns;
+  const uint32_t mss = EffectiveMss(flow);
+  const uint64_t now_ns = DefaultNowNs();
+
+  // Selective ACK: mark any outstanding segment fully covered by a SACK block so the
+  // retransmit path skips it (holes only). SACK rides on dup-ACKs too, so apply it
+  // before the cumulative-ACK branching.
+  if (flow.sack_permitted && opt && opt->sack_block_count > 0) {
+    for (auto& s : flow.unacked) {
+      if (s.sacked) continue;
+      const uint32_t s_end = s.seq + SegSeqLen(s.flags, s.payload_len);
+      for (int b = 0; b < opt->sack_block_count; ++b) {
+        if (!SeqLt(s.seq, opt->sack_left[b]) && !SeqGt(s_end, opt->sack_right[b])) {
+          s.sacked = true;
+          stats_shard_[stat_shard].sack_blocks_rx_count.fetch_add(1, std::memory_order_relaxed);
+          break;
+        }
+      }
+    }
+  }
+
+  if (SeqLeq(ack_value, flow.snd_una)) {
+    // Old or duplicate ACK. A pure dup-ACK (== snd_una) with data outstanding is a
+    // loss signal: on the third, fast-retransmit the oldest segment and halve the
+    // window (NewReno-style fast recovery).
+    if (ack_value == flow.snd_una) {
+      stats_shard_[stat_shard].dup_ack_count.fetch_add(1, std::memory_order_relaxed);
+      flow.dup_ack_streak++;
+      if (!flow.in_fast_recovery && flow.dup_ack_streak == 3) {
+        const uint32_t flight = flow.snd_nxt - flow.snd_una;
+        flow.ssthresh = std::max(flight / 2u, 2u * mss);
+        flow.cwnd = flow.ssthresh + 3u * mss;  // inflate for the 3 dup-ACKs
+        flow.in_fast_recovery = true;
+        RetransmitOldest(flow);
+        stats_shard_[stat_shard].fast_retransmit_count.fetch_add(1, std::memory_order_relaxed);
+        stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
+        stats_shard_[stat_shard].congestion_window_reductions.fetch_add(1, std::memory_order_relaxed);
+        flow.cur_rto_ms = 0;
+        flow.rto_deadline_ns = now_ns + CurrentRtoNs(flow);
+      } else if (flow.in_fast_recovery) {
+        flow.cwnd = std::min(flow.cwnd + mss, kMaxCwnd);  // window inflation per extra dup-ACK
+        PumpSend(flow, now_ns);
+      }
     }
     return;
   }
-  flow.dup_ack_streak = 0;
-  const uint32_t covered = flow.outstanding->payload_len == 0 ? 1U : flow.outstanding->payload_len;
-  const uint32_t outstanding_end = AdvanceSeq(flow.outstanding->seq, covered);
-  if (ack_value > flow.snd_nxt) {
+
+  if (SeqGt(ack_value, flow.snd_nxt)) {
+    // Acknowledges data we never sent.
     stats_shard_[stat_shard].unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
     stats_shard_[stat_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  if (ack_value <= flow.outstanding->seq) {
-    stats_shard_[stat_shard].unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
-    stats_shard_[stat_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  if (ack_value < outstanding_end && flow.outstanding->payload_len > 1U) {
-    const uint32_t newly_acked = ack_value - flow.outstanding->seq;
-    if (newly_acked == 0 || newly_acked >= flow.outstanding->payload_len) {
-      stats_shard_[stat_shard].unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
-      stats_shard_[stat_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
-      return;
+
+  // New data acknowledged: ack_value in (snd_una, snd_nxt]. Retire fully-acked
+  // segments from the front of the queue; trim the head if it is partially acked.
+  const uint32_t acked_bytes = ack_value - flow.snd_una;
+  bool partial = false;
+  uint64_t rtt_sample_ns = 0;  // newest first-transmission time among fully-acked segs (Karn)
+  while (!flow.unacked.empty()) {
+    OutstandingTx& seg = flow.unacked.front();
+    const uint32_t seg_end = seg.seq + SegSeqLen(seg.flags, seg.payload_len);
+    if (SeqLeq(seg_end, ack_value)) {
+      if (seg.xmit_count == 1 && seg.sent_ns > rtt_sample_ns) rtt_sample_ns = seg.sent_ns;
+      flow.unacked.pop_front();  // fully acknowledged
+    } else if (SeqGt(ack_value, seg.seq)) {
+      const uint32_t drop = ack_value - seg.seq;
+      if (drop < seg.payload_len) {
+        seg.data.erase(seg.data.begin(), seg.data.begin() + static_cast<std::ptrdiff_t>(drop));
+        seg.payload_len -= drop;
+        seg.seq = ack_value;
+        partial = true;
+      }
+      break;
+    } else {
+      break;
     }
-    if (flow.retx_buf.size() <
-        static_cast<size_t>(flow.outstanding->payload_offset) + static_cast<size_t>(flow.outstanding->payload_len)) {
-      stats_shard_[stat_shard].unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
-      stats_shard_[stat_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-    const uint32_t unacked_len = flow.outstanding->payload_len - newly_acked;
-    flow.outstanding->payload_offset += newly_acked;
-    flow.outstanding->seq = ack_value;
-    flow.outstanding->ack = flow.rcv_nxt;
-    flow.outstanding->flags = static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh);
-    flow.outstanding->payload_len = unacked_len;
-    flow.outstanding->deadline_ns = DefaultNowNs() + NsFromMs(flow.outstanding->rto_ms);
-    flow.rto_deadline_ns = flow.outstanding->deadline_ns;
-    flow.snd_una = ack_value;
-    flow.retransmit_count = 0;
-    stats_shard_[stat_shard].partial_ack_count.fetch_add(1, std::memory_order_relaxed);
-    return;
   }
   flow.snd_una = ack_value;
-  flow.outstanding.reset();
-  flow.rto_deadline_ns = 0;
+  if (partial) {
+    stats_shard_[stat_shard].partial_ack_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  // Round-trip sample from a non-retransmitted segment (Karn's algorithm) refreshes
+  // the RTO estimate and clears any prior backoff.
+  if (rtt_sample_ns != 0) {
+    UpdateRtt(flow, rtt_sample_ns);
+  }
+
+  // Congestion control on forward progress.
+  if (flow.in_fast_recovery) {
+    flow.in_fast_recovery = false;
+    flow.cwnd = flow.ssthresh;  // deflate on recovery exit
+  } else if (flow.cwnd < flow.ssthresh) {
+    flow.cwnd = std::min(flow.cwnd + std::min(acked_bytes, mss), kMaxCwnd);  // slow start
+  } else {
+    const uint32_t inc = std::max<uint32_t>(
+        1u, static_cast<uint32_t>((static_cast<uint64_t>(mss) * mss) / (flow.cwnd ? flow.cwnd : 1u)));
+    flow.cwnd = std::min(flow.cwnd + inc, kMaxCwnd);  // congestion avoidance (Reno)
+  }
+
+  flow.dup_ack_streak = 0;
   flow.retransmit_count = 0;
+  // RTO backoff is cleared only by a valid RTT sample (Karn); UpdateRtt above did so
+  // when a non-retransmitted segment was acked.
+
+  // Restart / disarm the single connection RTO timer (RFC 6298).
+  flow.rto_deadline_ns = flow.unacked.empty() ? 0 : now_ns + CurrentRtoNs(flow);
+
+  // The window may have opened; clock any buffered data onto the wire.
+  PumpSend(flow, now_ns);
 }
 
 void TcpDataplaneCore::CloseTimedOutFlow(FlowEntry& flow, TcpDpState terminal_state, const char* event) {
   const size_t stat_shard = FlowLockShardForFlowId(flow.flow_id);
   SetFlowState(flow, terminal_state);
-  flow.outstanding.reset();
+  flow.unacked.clear();
+  flow.sndbuf.clear();
+  flow.sndbuf_head = 0;
   flow.rto_deadline_ns = 0;
+  flow.cur_rto_ms = 0;
   stats_shard_[stat_shard].timeout_close_count.fetch_add(1, std::memory_order_relaxed);
   if (event != nullptr) {
     if (std::strcmp(event, "connect_timeout") == 0) {

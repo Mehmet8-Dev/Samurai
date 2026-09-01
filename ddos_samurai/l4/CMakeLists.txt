@@ -25,3 +25,8 @@ if(NOT TARGET af_packet_static)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../af_packet af_packet)
 endif()
 target_link_libraries(samurai_l4 PUBLIC af_packet_static)
+
+# Focused, NIC-less verification of the sliding-window TCP sender (multi-outstanding
+# + effective window + Reno cwnd). Proves stop-and-wait removal against the real core.
+add_executable(test_tcp_sliding_window test_tcp_sliding_window.cpp)
+target_link_libraries(test_tcp_sliding_window PRIVATE samurai_l4 pthread)
