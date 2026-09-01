@@ -83,3 +83,7 @@ endif()
 add_executable(test_l2l3_astf test_l2l3_astf.cpp)
 target_link_libraries(test_l2l3_astf PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
 
+# kernel_socket H1 threaded driver e2e: real localhost HTTP/1.1 server + shards>1.
+add_executable(test_kernel_threaded_l7 test_kernel_threaded_l7.cpp)
+target_link_libraries(test_kernel_threaded_l7 PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
+

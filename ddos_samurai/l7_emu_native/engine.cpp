@@ -2844,6 +2844,18 @@ void destroy_runtime(NativeRuntime& runtime) {
   }
 }
 
+// Guards the process-shared runtime.ready_shards deque (and the peak counter it
+// updates). In the single-threaded driver this is uncontended; in the kernel_socket
+// threaded driver each shard worker calls service_ready_lanes -> enqueue_ready_shard
+// concurrently, so the shared deque push must be serialized. A function-local static
+// (mirroring custom_tcp_registry_mu) keeps NativeRuntime movable. Only enqueue is
+// guarded: pop_ready_shard runs exclusively on the single-threaded scheduler path
+// (and would deadlock if it re-locked here via refresh_ready_queue).
+std::mutex& ready_shards_mu() {
+  static std::mutex mu;
+  return mu;
+}
+
 void enqueue_ready_shard(NativeRuntime& runtime, std::size_t shard_idx) {
   if (shard_idx >= runtime.local_shards.size()) {
     return;
@@ -2852,6 +2864,7 @@ void enqueue_ready_shard(NativeRuntime& runtime, std::size_t shard_idx) {
   if (local_shard.in_ready_queue || local_shard.dispatch_ready_ms > monotonic_ms_now()) {
     return;
   }
+  std::lock_guard<std::mutex> lk(ready_shards_mu());
   runtime.ready_shards.push_back(shard_idx);
   local_shard.in_ready_queue = true;
   runtime.perf.scheduler_queue_depth_peak =
@@ -4762,32 +4775,98 @@ std::map<std::string, double> run_http2_profile(
     }
   };
 
-  // Threaded custom_tcp/dpdk H2 driver: a single wire thread owns the process-global
-  // tcpdp poll/collect and routes RX/completions into per-shard inboxes; one worker
-  // per shard owns all of that shard's H2 session state (dispatch/service/finalize),
-  // with its own stats accumulator and captures map. Mirrors the H1 driver in
-  // run_profile. Only eligible for custom_tcp with >1 shard; everything else keeps
-  // the proven single-threaded loop below.
-  const bool threaded =
+  // Threaded H2 driver. Two shared-nothing shapes, one merge:
+  //  * custom_tcp/dpdk: a single wire thread owns the process-global tcpdp poll/collect
+  //    and routes RX/completions into per-shard inboxes; one worker per shard owns that
+  //    shard's H2 session state (dispatch/service/finalize).
+  //  * kernel_socket: each shard already owns its own epoll_fd, so there is NO shared
+  //    wire -- one worker per shard drives its own epoll (service_ready_lanes) directly.
+  // Either way each shard has its own stats accumulator + captures map (mirrors the H1
+  // driver in run_profile). Only eligible with >1 shard; everything else keeps the
+  // proven single-threaded loop below.
+  const bool custom_tcp_threaded =
       is_custom_tcp_backend(transport_backend) && runtime.shards.size() > 1;
+  const bool kernel_threaded =
+      transport_backend == TransportBackend::KernelSocket && runtime.shards.size() > 1;
+  const bool threaded = custom_tcp_threaded || kernel_threaded;
   if (threaded) {
     const std::size_t shard_count = runtime.shards.size();
-    std::vector<std::unique_ptr<ShardIo>> shard_io(shard_count);
-    for (auto& io : shard_io) {
-      io = std::make_unique<ShardIo>();
-    }
     std::vector<DataplanePerfStats> shard_perf(shard_count);
     std::vector<H2RunStats> shard_stats(shard_count);
     std::vector<std::map<std::string, std::string>> captures_by_shard(shard_count);
     std::vector<std::vector<ScenarioStepResult>> shard_steps(shard_count);
+
+    std::vector<std::thread> workers;
+    workers.reserve(shard_count);
+
+    if (kernel_threaded) {
+      // kernel_socket: shared-nothing per shard, direct epoll (no wire thread).
+      for (std::size_t sh = 0; sh < shard_count; ++sh) {
+        workers.emplace_back([&, sh]() {
+          g_perf_stats = &shard_perf[sh];
+          auto& local_shard = runtime.local_shards[sh];
+          auto& st = shard_stats[sh];
+          auto& shard_captures = captures_by_shard[sh];
+          while (true) {
+            expire_lane_idle_shard(runtime, profile, sh);
+            dispatch_pending_h2_requests(st, shard_captures, sh);
+            // Real per-shard epoll wait (short timeout so idle sessions still get
+            // dispatched/expired promptly). This blocks instead of busy-spinning.
+            const int rc = service_ready_lanes(runtime, profile, sh, 4);
+            collect_shard_h2_stats(st, sh);
+            bool did_work = rc > 0;
+            while (true) {
+              auto ready = pop_ready_completion(runtime, sh);
+              if (!ready.has_value()) {
+                break;
+              }
+              if (ready->kind == CompletionKind::H2 && ready->h2_completed.has_value()) {
+                // finalize_h2_stream returns a no-op disposition (close/rearm is done
+                // inside service_h2_session_io / GOAWAY handling), so no apply here.
+                finalize_h2_stream(st, *ready->h2_completed);
+              }
+              did_work = true;
+            }
+            bool has_inflight = false;
+            for (const auto& session_ptr : local_shard.h2_sessions) {
+              if (session_ptr &&
+                  (!session_ptr->pending_requests.empty() ||
+                   !session_ptr->ctx.active_streams.empty())) {
+                has_inflight = true;
+                break;
+              }
+            }
+            if (!has_inflight && local_shard.pending_h2_requests.empty() && !did_work) {
+              break;
+            }
+            if (!did_work) {
+              // No epoll events and no completions this pass. When a session is in
+              // health-backoff there is no registered fd for service_ready_lanes to
+              // block on, so nap briefly to avoid a tight spin (the 4ms epoll wait
+              // already paces the common case).
+              std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+          }
+          collect_shard_h2_stats(st, sh);
+          shard_steps[sh] = std::move(g_last_scenario_step_results);
+          g_last_scenario_step_results.clear();
+          g_perf_stats = nullptr;
+        });
+      }
+      for (auto& w : workers) {
+        w.join();
+      }
+    } else {
+    std::vector<std::unique_ptr<ShardIo>> shard_io(shard_count);
+    for (auto& io : shard_io) {
+      io = std::make_unique<ShardIo>();
+    }
     std::atomic<bool> wire_stop{false};
 
     std::thread wire([&]() {
       custom_tcp_wire_pump(runtime, shard_io, wire_stop, ReactorLaneKind::H2);
     });
 
-    std::vector<std::thread> workers;
-    workers.reserve(shard_count);
     for (std::size_t sh = 0; sh < shard_count; ++sh) {
       workers.emplace_back([&, sh]() {
         g_perf_stats = &shard_perf[sh];
@@ -4876,6 +4955,7 @@ std::map<std::string, double> run_http2_profile(
     }
     wire_stop.store(true, std::memory_order_relaxed);
     wire.join();
+    }  // end custom_tcp wire-routed H2 driver
 
     // Merge per-shard perf into runtime.perf, per-shard H2 stats into the aggregate,
     // and gather scenario step results (attempted stays the pre-computed total).
@@ -5605,29 +5685,111 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
     return false;
   };
 
-  // Threaded custom_tcp/dpdk driver: a single wire thread owns the process-global
-  // tcpdp poll/collect and routes RX/completions into per-shard inboxes; one worker
-  // per shard owns all of that shard's lane state (dispatch/parse/finalize). Only
-  // eligible for custom_tcp with >1 shard; everything else keeps the proven
-  // single-threaded loop below.
-  const bool threaded =
+  // Threaded H1 driver. Two shared-nothing shapes, one merge:
+  //  * custom_tcp/dpdk: a single wire thread owns the process-global tcpdp poll/collect
+  //    and routes RX/completions into per-shard inboxes; one worker per shard owns that
+  //    shard's lane state (dispatch/parse/finalize).
+  //  * kernel_socket: each shard already owns its own epoll_fd, so there is NO shared
+  //    wire -- one worker per shard drives its own epoll (service_ready_lanes) directly.
+  // Only eligible with >1 shard; everything else keeps the proven single-threaded loop.
+  const bool custom_tcp_threaded =
       is_custom_tcp_backend(transport_backend) && runtime.shards.size() > 1;
+  const bool kernel_threaded =
+      transport_backend == TransportBackend::KernelSocket && runtime.shards.size() > 1;
+  const bool threaded = custom_tcp_threaded || kernel_threaded;
   if (threaded) {
     const std::size_t shard_count = runtime.shards.size();
+    std::vector<DataplanePerfStats> shard_perf(shard_count);
+    std::vector<std::vector<ScenarioStepResult>> shard_steps(shard_count);
+
+    std::vector<std::thread> workers;
+    workers.reserve(shard_count);
+
+    if (kernel_threaded) {
+      // kernel_socket: shared-nothing per shard, direct epoll (no wire thread).
+      for (std::size_t sh = 0; sh < shard_count; ++sh) {
+        workers.emplace_back([&, sh]() {
+          g_perf_stats = &shard_perf[sh];
+          auto& local_shard = runtime.local_shards[sh];
+          while (true) {
+            expire_lane_idle_shard(runtime, profile, sh);
+            dispatch_pending_h1_requests(sh);
+
+            bool did_work = false;
+            while (true) {
+              auto ready = pop_ready_completion(runtime, sh);
+              if (!ready.has_value()) {
+                break;
+              }
+              finalize_completion(std::move(*ready));
+              did_work = true;
+            }
+            if (did_work) {
+              continue;
+            }
+
+            // Assess this shard's state: in-flight I/O, pending dispatch, or idle
+            // think-time wait. Mirrors the single-threaded scheduler, one shard only.
+            bool pending = false;
+            bool active_io = false;
+            std::optional<long long> next_deadline;
+            const long long now_ms = monotonic_ms_now();
+            if (!local_shard.pending_h1_requests.empty()) {
+              pending = true;
+            }
+            for (const auto& lane_ptr : local_shard.h1_lanes) {
+              if (!lane_ptr) {
+                continue;
+              }
+              const H1Lane& lane = *lane_ptr;
+              if (lane.phase == H1LanePhase::Writing || lane.phase == H1LanePhase::Reading) {
+                pending = true;
+                active_io = true;
+              } else if (!local_shard.pending_h1_requests.empty() &&
+                         lane.phase == H1LanePhase::Idle) {
+                pending = true;
+                const long long candidate = std::max(now_ms, lane.lane.dispatch_ready_at_ms);
+                if (!next_deadline.has_value() || candidate < *next_deadline) {
+                  next_deadline = candidate;
+                }
+              }
+            }
+            if (!pending) {
+              break;
+            }
+            if (active_io) {
+              // Real per-shard epoll wait -- blocks up to 16ms instead of spinning.
+              service_ready_lanes(runtime, profile, sh, 16);
+              continue;
+            }
+            if (next_deadline.has_value()) {
+              // Idle: sleep until the earliest think-time deadline (bounded slice).
+              const long long wait_ms = std::min<long long>(
+                  std::max<long long>(1, *next_deadline - now_ms), 16);
+              std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+              continue;
+            }
+            break;
+          }
+          shard_steps[sh] = std::move(g_last_scenario_step_results);
+          g_last_scenario_step_results.clear();
+          g_perf_stats = nullptr;
+        });
+      }
+      for (auto& w : workers) {
+        w.join();
+      }
+    } else {
     std::vector<std::unique_ptr<ShardIo>> shard_io(shard_count);
     for (auto& io : shard_io) {
       io = std::make_unique<ShardIo>();
     }
-    std::vector<DataplanePerfStats> shard_perf(shard_count);
-    std::vector<std::vector<ScenarioStepResult>> shard_steps(shard_count);
     std::atomic<bool> wire_stop{false};
 
     std::thread wire([&]() {
       custom_tcp_wire_pump(runtime, shard_io, wire_stop, ReactorLaneKind::H1);
     });
 
-    std::vector<std::thread> workers;
-    workers.reserve(shard_count);
     for (std::size_t sh = 0; sh < shard_count; ++sh) {
       workers.emplace_back([&, sh]() {
         g_perf_stats = &shard_perf[sh];
@@ -5719,6 +5881,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
     }
     wire_stop.store(true, std::memory_order_relaxed);
     wire.join();
+    }  // end custom_tcp wire-routed H1 driver
 
     // Merge per-shard perf into runtime.perf and gather scenario step results.
     for (const DataplanePerfStats& sp : shard_perf) {
