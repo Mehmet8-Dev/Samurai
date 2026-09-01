@@ -92,3 +92,9 @@ target_link_libraries(test_kernel_threaded_l7 PRIVATE samurai_l7emu samurai_l4 s
 add_executable(test_kernel_threaded_h2 test_kernel_threaded_h2.cpp)
 target_link_libraries(test_kernel_threaded_h2 PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
 
+# QUIC/H3 threaded driver e2e: real HTTP/3 server (test_h3_server.py, aioquic).
+# The harness starts the server and passes its UDP port via H3_TEST_PORT. Runs the
+# threaded fan-out and the serial reference and asserts they match.
+add_executable(test_kernel_threaded_h3 test_kernel_threaded_h3.cpp)
+target_link_libraries(test_kernel_threaded_h3 PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
+
