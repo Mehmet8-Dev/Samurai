@@ -124,6 +124,14 @@ target_include_directories(test_stateful_fastpath PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(test_stateful_fastpath PRIVATE pacing_engine_static samurai_l4 pthread)
 
+# Shared-nothing çok-çekirdek stateful fast-path (ShardedFastpathDriver) doğrulaması.
+add_executable(test_sharded_fastpath
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon/test_sharded_fastpath.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
+target_include_directories(test_sharded_fastpath PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(test_sharded_fastpath PRIVATE pacing_engine_static samurai_l4 pthread)
+
 # Faz 2: gerçek run_profile_json (dpdk_direct) L7 akışını sürücü üzerinden doğrular.
 add_executable(test_stateful_fastpath_l7
   ${CMAKE_CURRENT_SOURCE_DIR}/daemon/test_stateful_fastpath_l7.cpp

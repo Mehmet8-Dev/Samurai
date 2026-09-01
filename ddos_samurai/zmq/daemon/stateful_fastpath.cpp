@@ -6,14 +6,19 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <sched.h>
+#include <pthread.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <vector>
 
 #include "../../l4/tcp_dataplane_ffi.h"
+#include "../../l4/tcp_dataplane_core.hpp"
 
 namespace samurai::daemon {
 namespace {
@@ -292,6 +297,178 @@ FastpathResult StatefulFastpathDriver::Run(
   result.retransmit_exhausted = st.retransmit_exhausted_count;
   result.connect_timeout = st.connect_timeout_count;
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// ShardedFastpathDriver — shared-nothing çok-çekirdek stateful fast-path (TRex).
+// ---------------------------------------------------------------------------
+namespace {
+
+void PinThisThread(int cpu) {
+  if (cpu < 0) return;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(static_cast<unsigned>(cpu), &set);
+  (void)sched_setaffinity(0, sizeof(set), &set);  // 0 => calling thread
+}
+
+// Worker-yerel çekirdeğe karşı pump loop'u (StatefulFastpathDriver::Run'ın FFI'siz,
+// instance-tabanlı ikizi). Paylaşılan hiçbir duruma dokunmaz.
+void RunShardWorker(ddos_samurai::tcpdp::TcpDataplaneCore& core, FastpathTxRxShim& shim,
+                    const FastpathParams& p, std::uint32_t seeded_flows,
+                    const std::atomic<bool>& stop, FastpathResult& out) {
+  out.rx_available = shim.RxAvailable();
+  std::vector<std::uint8_t> rxbuf(static_cast<std::size_t>(kFrameStride) * p.rx_budget);
+  std::vector<std::uint16_t> rxlens(p.rx_budget);
+  std::string err;
+
+  const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
+  const std::uint64_t deadline_ns = start_ns + p.max_duration_ms * 1'000'000ull;
+  std::uint64_t drain_started_ns = 0;
+
+  while (true) {
+    const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+    bool did_work = false;
+
+    if (shim.RxAvailable()) {
+      const int n = shim.Recv(rxbuf.data(), kFrameStride, rxlens.data(), p.rx_budget, err);
+      if (n > 0) {
+        for (int i = 0; i < n; ++i) {
+          (void)core.IngestRxFrame(rxbuf.data() + static_cast<std::size_t>(i) * kFrameStride,
+                                   rxlens[static_cast<std::size_t>(i)]);
+        }
+        out.rx_frames += static_cast<std::uint64_t>(n);
+        did_work = true;
+      }
+    }
+
+    if (core.Poll(now_ns, 1024) > 0) did_work = true;
+
+    for (int guard = 0; guard < 16; ++guard) {
+      const std::uint8_t* base = nullptr;
+      std::uint32_t count = 0;
+      std::size_t psize = 0, stride = 0;
+      if (!core.PeekTxPacketsStrided(0, &base, &count, &psize, &stride)) break;
+      if (base == nullptr || count == 0 || psize == 0) break;
+      const int sent = shim.Send(base, psize, stride, count, err);
+      if (sent < 0) {
+        out.tx_errors += count;
+        (void)core.ConsumeTxPackets(count);
+        break;
+      }
+      if (sent == 0) break;
+      (void)core.ConsumeTxPackets(static_cast<std::uint32_t>(sent));
+      out.tx_packets += static_cast<std::uint64_t>(sent);
+      out.tx_bytes += static_cast<std::uint64_t>(sent) * static_cast<std::uint64_t>(psize);
+      did_work = true;
+      if (static_cast<std::uint32_t>(sent) < count) break;
+    }
+
+    if (stop.load(std::memory_order_relaxed) || now_ns >= deadline_ns) break;
+
+    const auto st = core.SnapshotStats();
+    const std::uint64_t resolved =
+        st.connect_established + st.connect_timeout_count + st.retransmit_exhausted_count;
+    if (seeded_flows > 0 && resolved >= seeded_flows) {
+      if (drain_started_ns == 0) {
+        drain_started_ns = now_ns;
+      } else if (now_ns - drain_started_ns >= p.drain_ms * 1'000'000ull) {
+        break;
+      }
+    } else {
+      drain_started_ns = 0;
+    }
+
+    if (!did_work) {
+      struct timespec ts {
+        0, 50'000
+      };  // 50µs idle backoff
+      nanosleep(&ts, nullptr);
+    }
+  }
+
+  const auto st = core.SnapshotStats();
+  out.connect_attempts = st.connect_attempts;
+  out.connect_established = st.connect_established;
+  out.retransmit_count = st.retransmit_count;
+  out.retransmit_exhausted = st.retransmit_exhausted_count;
+  out.connect_timeout = st.connect_timeout_count;
+  out.tx_errors += 0;
+}
+
+}  // namespace
+
+FastpathResult ShardedFastpathDriver::Run(const FastpathParams& p, const std::atomic<bool>& stop,
+                                          std::vector<FastpathResult>* per_worker) {
+  std::uint32_t n = cfg_.workers;
+  if (n == 0) {
+    n = std::thread::hardware_concurrency();
+    if (n == 0) n = 1;
+  }
+  resolved_workers_ = n;
+
+  // Flow'ları worker'lara eşit paylaştır (kalan ilk worker'lara).
+  std::vector<std::uint32_t> flows_per(n, 0);
+  for (std::uint32_t i = 0; i < p.target_flows; ++i) {
+    flows_per[i % n]++;
+  }
+
+  std::vector<FastpathResult> results(n);
+  std::vector<std::thread> threads;
+  threads.reserve(n);
+
+  for (std::uint32_t w = 0; w < n; ++w) {
+    threads.emplace_back([this, &p, &stop, &results, &flows_per, w]() {
+      if (cfg_.cpu_base >= 0) {
+        PinThisThread(cfg_.cpu_base + static_cast<int>(w));
+      }
+      std::unique_ptr<FastpathTxRxShim> shim = factory_(w);
+      if (!shim) return;
+
+      ddos_samurai::tcpdp::TcpDataplaneCore core;
+      ddos_samurai::tcpdp::TcpDpConfig cfg;
+      cfg.mode = p.mode;
+      cfg.backend = p.backend;
+      cfg.initial_rto_ms = p.initial_rto_ms;
+      cfg.max_retransmits = p.max_retransmits;
+      cfg.connect_timeout_ms = p.connect_timeout_ms;
+      cfg.idle_timeout_ms = p.idle_timeout_ms;
+      (void)core.Configure(cfg);
+
+      std::uint32_t seeded = 0;
+      for (std::uint32_t f = 0; f < flows_per[w]; ++f) {
+        const std::uint64_t fid = core.EnqueueConnect(p.src_ip, p.dst_ip, 0, p.dst_port);
+        if (fid != 0) {
+          ++seeded;
+          if (!p.payload.empty()) {
+            std::uint32_t queued = 0;
+            (void)queued;
+            (void)core.EnqueueSend(fid, reinterpret_cast<const std::uint8_t*>(p.payload.data()),
+                                   p.payload.size());
+          }
+        }
+      }
+      RunShardWorker(core, *shim, p, seeded, stop, results[w]);
+    });
+  }
+  for (auto& t : threads) t.join();
+
+  FastpathResult total;
+  for (std::uint32_t w = 0; w < n; ++w) {
+    const auto& r = results[w];
+    total.tx_packets += r.tx_packets;
+    total.tx_bytes += r.tx_bytes;
+    total.tx_errors += r.tx_errors;
+    total.rx_frames += r.rx_frames;
+    total.connect_attempts += r.connect_attempts;
+    total.connect_established += r.connect_established;
+    total.retransmit_count += r.retransmit_count;
+    total.retransmit_exhausted += r.retransmit_exhausted;
+    total.connect_timeout += r.connect_timeout;
+    total.rx_available = total.rx_available || r.rx_available;
+  }
+  if (per_worker) *per_worker = std::move(results);
+  return total;
 }
 
 }  // namespace samurai::daemon

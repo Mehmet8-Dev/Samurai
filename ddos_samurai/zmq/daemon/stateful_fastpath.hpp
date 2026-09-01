@@ -15,7 +15,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "pacing_engine.h"
 #include "wire_protocol.h"
@@ -111,6 +113,39 @@ class StatefulFastpathDriver {
 
  private:
   FastpathTxRxShim& shim_;
+};
+
+// Shared-nothing çok-çekirdek stateful fast-path sürücüsü (TRex modeli). N pinli
+// worker thread; her worker KENDİ TcpDataplaneCore instance'ı + KENDİ wire shim'ini
+// (factory ile) sahiplenir. Flow'lar worker'lara paylaştırılır; worker'lar arası
+// paylaşılan durum YOKTUR (cross-core lock yok, tek TX ring yok). Böylece tek-singleton
+// StatefulFastpathDriver'ın "tek wire poller" pps tavanı kaldırılır ve çekirdek başına
+// TCP durum motoru lineer ölçeklenir.
+struct ShardedFastpathConfig {
+  std::uint32_t workers = 0;  // 0 => std::thread::hardware_concurrency()
+  int cpu_base = -1;          // >=0 ise worker w, (cpu_base + w) çekirdeğine pinlenir
+};
+
+class ShardedFastpathDriver {
+ public:
+  // factory(worker_idx): her worker için ayrı taşıma shim'i (kendi RX kuyruğu) üretir.
+  using ShimFactory = std::function<std::unique_ptr<FastpathTxRxShim>(std::uint32_t worker_idx)>;
+
+  ShardedFastpathDriver(ShimFactory factory, ShardedFastpathConfig cfg)
+      : factory_(std::move(factory)), cfg_(cfg) {}
+
+  // target_flows'u worker'lara böler; her worker kendi core'unda seed + pump eder.
+  // stop tetiklenince ya da tüm flow'lar/deadline bitince döner. Birleşik sonucu döner;
+  // per_worker != nullptr ise her worker'ın kendi FastpathResult'ı da yazılır.
+  FastpathResult Run(const FastpathParams& p, const std::atomic<bool>& stop,
+                     std::vector<FastpathResult>* per_worker = nullptr);
+
+  std::uint32_t worker_count() const { return resolved_workers_; }
+
+ private:
+  ShimFactory factory_;
+  ShardedFastpathConfig cfg_;
+  std::uint32_t resolved_workers_ = 0;
 };
 
 // V1/V2 envelope'un stateful fast-path'i seçip seçmediği (protocol/attack_vector).
