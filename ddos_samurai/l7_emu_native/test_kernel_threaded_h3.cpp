@@ -56,13 +56,12 @@ Profile MakeProfile(int port, int requests, int conc) {
   profile.keepalive = 1;
   profile.timeout_ms = 5000;
   profile.max_connections = conc;
-  // Faz C, BAĞLANTI döngüsünü thread'ledi (stream'i değil). streams=1 → her istek
-  // kendi QUIC bağlantısıdır, dolayısıyla `requests` bağlantı `conc` worker'a
-  // paylaştırılır ve fan-out doğrudan sürülür. (max_streams_per_connection>1
-  // çok-stream drain'i ayrı, thread'lemeden bağımsız bir konudur; seri yolda da
-  // aynı timeout'u verir — bu test onu kapsamaz.)
-  profile.max_streams_per_connection = 1;
-  profile.flow_attempted = requests;        // QUIC istek/bağlantı sayısını bu belirler
+  // streams>1 => aynı QUIC bağlantısında çok ardışık istek (bağlantı yeniden
+  // kullanımı). `conc` bağlantı `conc` worker'a fan-out olur, her biri
+  // streams=10 isteği koşar. Bu hem bağlantı-düzeyi thread fan-out'unu (Faz C)
+  // hem de bağlantı-başına çok-stream drain'i (QPACK dtable=0 fix'i) sürer.
+  profile.max_streams_per_connection = 10;
+  profile.flow_attempted = requests;        // toplam QUIC istek sayısı
   profile.ops.push_back(MakeGet("/"));
   return profile;
 }
@@ -115,10 +114,12 @@ int main() {
   const std::map<std::string, double> threaded = run_profile(p_threaded, cfg);
   Report("threaded", threaded);
   AssertHealthy("threaded", threaded, kRequests);
-  // streams=1 => one connection per request; kRequests connections fanned out over
-  // 4 workers (conn_plans.size()=kRequests>1 && conn_pool=4>1 => threaded branch).
-  CHECK(Get(threaded, "quic_connection_success") == static_cast<double>(kRequests),
-        "expected %d established connections (one per request), got %.0f", kRequests,
+  // conc connections (each running 10 streams) fan out over conc workers
+  // (conn_plans.size()=conc>1 && conn_pool=conc>1 => threaded branch). All kRequests
+  // requests across all connections must receive responses (QPACK dtable=0 fix so
+  // multi-stream-per-connection no longer QPACK-blocks/times out).
+  CHECK(Get(threaded, "quic_connection_success") == static_cast<double>(kConcurrency),
+        "expected %d established connections (one per worker), got %.0f", kConcurrency,
         Get(threaded, "quic_connection_success"));
 
   // (2) Serial reference (threads disabled): must match the threaded result.

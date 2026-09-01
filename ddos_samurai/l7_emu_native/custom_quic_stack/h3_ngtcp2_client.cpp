@@ -2754,8 +2754,18 @@ bool init_h3_session(Ngtcp2AttemptCtx* ctx) {
 
   nghttp3_settings h3_settings{};
   nghttp3_settings_default(&h3_settings);
-  h3_settings.qpack_max_dtable_capacity = 4096;
-  h3_settings.qpack_blocked_streams = 16;
+  // QPACK DECODER capacity we advertise for the server's *response* headers. A
+  // non-zero capacity invites the server to reference dynamic-table entries, which
+  // means a response HEADERS block can become QPACK-blocked until the matching
+  // encoder-stream inserts are applied. For a load-test client the response-side
+  // dynamic table buys nothing, and once the server started using it (e.g. the 3rd+
+  // request on a reused connection) nghttp3 held those streams without ever emitting
+  // end_stream -> the request timed out. Advertise 0 so every response is encoded
+  // with literal/static fields only (never blockable). The opt-in QPACK-dynamic
+  // feature suite (H3_QPACK_DYNAMIC op) still gets a real dynamic table.
+  const bool qpack_dynamic_feature = ctx->feature_policy.qpack_dynamic;
+  h3_settings.qpack_max_dtable_capacity = qpack_dynamic_feature ? 4096 : 0;
+  h3_settings.qpack_blocked_streams = qpack_dynamic_feature ? 16 : 0;
 
   if (nghttp3_conn_client_new(&ctx->h3_conn, &h3_callbacks, &h3_settings, nghttp3_mem_default(), ctx) != 0 ||
       ctx->h3_conn == nullptr) {
