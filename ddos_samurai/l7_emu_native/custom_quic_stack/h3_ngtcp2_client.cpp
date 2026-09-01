@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -3938,6 +3940,69 @@ bool run_single_attempt(
   return true;
 }
 
+// Fold one worker's per-connection counters into the aggregate. Almost every field
+// is an additive count; the backend/config fields are identical across workers so
+// they take the max (a non-zero worker value wins), and the step-latency high-water
+// mark takes the max while its sum accumulates.
+void merge_udp_probe_counters(UdpProbeCounters* dst, const UdpProbeCounters& s) {
+  dst->conn_attempted += s.conn_attempted;
+  dst->conn_established += s.conn_established;
+  dst->responses += s.responses;
+  dst->timeouts += s.timeouts;
+  dst->connect_fail += s.connect_fail;
+  dst->handshake_fail += s.handshake_fail;
+  dst->send_ok += s.send_ok;
+  dst->errors += s.errors;
+  dst->response_headers_ok += s.response_headers_ok;
+  dst->response_body_ok += s.response_body_ok;
+  dst->response_expected_header_ok += s.response_expected_header_ok;
+  dst->response_expected_body_match_ok += s.response_expected_body_match_ok;
+  dst->response_validation_fail += s.response_validation_fail;
+  dst->h3_goaway_events += s.h3_goaway_events;
+  dst->h3_drain_cycles += s.h3_drain_cycles;
+  dst->h3_replace_now += s.h3_replace_now;
+  dst->h3_replace_after_idle += s.h3_replace_after_idle;
+  dst->h3_control_plane_failures += s.h3_control_plane_failures;
+  dst->h3_graceful_close_count += s.h3_graceful_close_count;
+  dst->h3_qpack_dynamic_events += s.h3_qpack_dynamic_events;
+  dst->h3_qpack_encoder_inserts += s.h3_qpack_encoder_inserts;
+  dst->h3_qpack_decoder_inserts += s.h3_qpack_decoder_inserts;
+  dst->h3_qpack_evictions += s.h3_qpack_evictions;
+  dst->h3_priority_update_events += s.h3_priority_update_events;
+  dst->h3_extended_connect_events += s.h3_extended_connect_events;
+  dst->h3_datagram_tx_events += s.h3_datagram_tx_events;
+  dst->h3_datagram_rx_events += s.h3_datagram_rx_events;
+  dst->h3_server_push_events += s.h3_server_push_events;
+  dst->h3_feature_failures += s.h3_feature_failures;
+  dst->backend_fallback_count += s.backend_fallback_count;
+  dst->tx_datagrams += s.tx_datagrams;
+  dst->rx_datagrams += s.rx_datagrams;
+  dst->pacing_wait_events += s.pacing_wait_events;
+  dst->tls_session_resume_attempted += s.tls_session_resume_attempted;
+  dst->tls_session_resume_applied += s.tls_session_resume_applied;
+  dst->tls_session_resumed += s.tls_session_resumed;
+  dst->tls_early_data_accepted += s.tls_early_data_accepted;
+  dst->tls_session_ticket_received += s.tls_session_ticket_received;
+  dst->tls_cache_load_hit += s.tls_cache_load_hit;
+  dst->tls_cache_store_updates += s.tls_cache_store_updates;
+  dst->scenario_steps_planned += s.scenario_steps_planned;
+  dst->scenario_steps_completed += s.scenario_steps_completed;
+  dst->scenario_steps_passed += s.scenario_steps_passed;
+  dst->scenario_steps_failed += s.scenario_steps_failed;
+  dst->scenario_think_time_total_ms += s.scenario_think_time_total_ms;
+  dst->scenario_step_latency_ms_sum += s.scenario_step_latency_ms_sum;
+  dst->tx_bytes += s.tx_bytes;
+  dst->rx_bytes += s.rx_bytes;
+  // Identical-across-workers config fields + the latency high-water mark.
+  dst->runtime_udp_io_backend = std::max(dst->runtime_udp_io_backend, s.runtime_udp_io_backend);
+  dst->runtime_native_hot_path_ready =
+      std::max(dst->runtime_native_hot_path_ready, s.runtime_native_hot_path_ready);
+  dst->runtime_backend_requested = std::max(dst->runtime_backend_requested, s.runtime_backend_requested);
+  dst->scenario_multi_step = std::max(dst->scenario_multi_step, s.scenario_multi_step);
+  dst->scenario_step_latency_ms_max =
+      std::max(dst->scenario_step_latency_ms_max, s.scenario_step_latency_ms_max);
+}
+
 }  // namespace
 #endif
 
@@ -3993,36 +4058,114 @@ bool run_h3_ngtcp2_client(
   const int policy_cap = goaway_policy.enabled ? std::max(1, goaway_policy.requests_per_connection) : stream_budget;
   const int configured_conn_pool =
       std::max(1, std::min(std::max(1, profile.max_connections), std::max(1, cfg.concurrency)));
-  int remaining = attempted;
-  int warm_conn_count = std::max(1, std::min(configured_conn_pool, attempted));
+  const int warm_conn_count = std::max(1, std::min(configured_conn_pool, attempted));
 
-  for (int i = 0; i < warm_conn_count && remaining > 0; ++i) {
-    const int remaining_conn_slots = std::max(0, warm_conn_count - i - 1);
-    const int planned_for_conn = std::min(policy_cap, std::max(1, remaining - remaining_conn_slots));
-    out->conn_attempted += 1;
-    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, feature_policy, &session_cache, out)) {
-      gnutls_global_deinit();
-      return ran;
+  // Pre-compute the per-connection request plan -- the same arithmetic the serial
+  // warm + drain loops used -- so it can run serially or be fanned out to workers
+  // as a single source of truth.
+  std::vector<int> conn_plans;
+  {
+    int remaining = attempted;
+    for (int i = 0; i < warm_conn_count && remaining > 0; ++i) {
+      const int remaining_conn_slots = std::max(0, warm_conn_count - i - 1);
+      const int planned_for_conn = std::min(policy_cap, std::max(1, remaining - remaining_conn_slots));
+      conn_plans.push_back(planned_for_conn);
+      remaining = std::max(0, remaining - planned_for_conn);
     }
-    remaining = std::max(0, remaining - planned_for_conn);
-    if (goaway_policy.enabled && out->conn_established <= 0) {
-      out->h3_control_plane_failures += 1;
+    while (remaining > 0) {
+      const int planned_for_conn = std::min(policy_cap, remaining);
+      conn_plans.push_back(planned_for_conn);
+      remaining -= planned_for_conn;
     }
-    ran = true;
   }
 
-  while (remaining > 0) {
-    const int planned_for_conn = std::min(policy_cap, remaining);
-    out->conn_attempted += 1;
-    if (!run_single_attempt(profile, timeout_ms, planned_for_conn, feature_policy, &session_cache, out)) {
-      gnutls_global_deinit();
-      return ran;
+  // Threaded fan-out: only the kernel UDP-socket backend is parallelized. It uses a
+  // connect()ed socket per attempt, so the kernel assigns a distinct ephemeral src
+  // port to each connection (no 4-tuple collision). The native hot-path backends
+  // (af_xdp/af_packet/dpdk) each own a single NIC resource / fixed src port, so they
+  // keep the serial loop (mirrors the L4/L7 single-wire constraint). Each worker owns
+  // its own counters + a TLS session-cache copy seeded from the on-disk blob with the
+  // disk path cleared (0-RTT resumption from the loaded ticket, but no concurrent disk
+  // writes); one freshly captured ticket is persisted once after join.
+  const QuicUdpIoBackend requested_backend_kind = resolve_requested_backend(profile);
+  const bool quic_threaded =
+      requested_backend_kind == QuicUdpIoBackend::KernelSocket &&
+      configured_conn_pool > 1 && conn_plans.size() > 1 &&
+      !env_truthy("SAMURAI_QUIC_THREADS_DISABLE");
+
+  if (quic_threaded) {
+    const int worker_count =
+        std::min<int>(configured_conn_pool, static_cast<int>(conn_plans.size()));
+    std::vector<UdpProbeCounters> local_outs(static_cast<std::size_t>(worker_count));
+    std::vector<TlsSessionCache> local_caches(static_cast<std::size_t>(worker_count));
+    for (auto& lc : local_caches) {
+      lc = session_cache;     // identity/ttl/pool_size/blob/loaded_from_disk copy
+      lc.disk_path.clear();   // workers never touch disk; single consolidated store below
+      lc.store_updates = 0;
     }
-    remaining -= planned_for_conn;
-    if (goaway_policy.enabled && out->conn_established <= 0) {
-      out->h3_control_plane_failures += 1;
+    std::atomic<bool> hard_fail{false};
+    std::atomic<bool> any_ran{false};
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(worker_count));
+    for (int w = 0; w < worker_count; ++w) {
+      threads.emplace_back([&, w]() {
+        UdpProbeCounters& lo = local_outs[static_cast<std::size_t>(w)];
+        TlsSessionCache& lc = local_caches[static_cast<std::size_t>(w)];
+        // Round-robin plan assignment spreads the warm connections across workers.
+        for (std::size_t idx = static_cast<std::size_t>(w); idx < conn_plans.size();
+             idx += static_cast<std::size_t>(worker_count)) {
+          if (hard_fail.load(std::memory_order_relaxed)) {
+            break;
+          }
+          lo.conn_attempted += 1;
+          if (!run_single_attempt(profile, timeout_ms, conn_plans[idx], feature_policy, &lc, &lo)) {
+            hard_fail.store(true, std::memory_order_relaxed);
+            break;
+          }
+          any_ran.store(true, std::memory_order_relaxed);
+          if (goaway_policy.enabled && lo.conn_established <= 0) {
+            lo.h3_control_plane_failures += 1;
+          }
+        }
+      });
     }
-    ran = true;
+    for (auto& t : threads) {
+      t.join();
+    }
+    for (const auto& lo : local_outs) {
+      merge_udp_probe_counters(out, lo);
+    }
+    ran = any_ran.load(std::memory_order_relaxed);
+    // Consolidated single-writer TLS session store: persist one freshly captured
+    // ticket (if any) and count it once.
+    if (!session_cache.disk_path.empty() && !session_cache.identity.empty()) {
+      for (auto& lc : local_caches) {
+        if (!lc.blob.empty() && lc.blob != session_cache.blob) {
+          if (store_tls_session_cache_file(
+                  session_cache.disk_path,
+                  session_cache.identity,
+                  lc.blob,
+                  session_cache.ttl_sec,
+                  session_cache.pool_size)) {
+            session_cache.blob = lc.blob;
+            session_cache.store_updates += 1;
+          }
+          break;
+        }
+      }
+    }
+  } else {
+    for (std::size_t idx = 0; idx < conn_plans.size(); ++idx) {
+      out->conn_attempted += 1;
+      if (!run_single_attempt(profile, timeout_ms, conn_plans[idx], feature_policy, &session_cache, out)) {
+        gnutls_global_deinit();
+        return ran;
+      }
+      if (goaway_policy.enabled && out->conn_established <= 0) {
+        out->h3_control_plane_failures += 1;
+      }
+      ran = true;
+    }
   }
   out->errors = std::max(out->errors, attempted - out->send_ok);
   out->tls_cache_store_updates += session_cache.store_updates;
