@@ -87,3 +87,8 @@ target_link_libraries(test_l2l3_astf PRIVATE samurai_l7emu samurai_l4 samurai_co
 add_executable(test_kernel_threaded_l7 test_kernel_threaded_l7.cpp)
 target_link_libraries(test_kernel_threaded_l7 PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
 
+# kernel_socket H2 threaded driver e2e: real h2c server (test_h2c_server.py) + shards>1.
+# The harness starts the Python h2 server and passes its port via H2_TEST_PORT.
+add_executable(test_kernel_threaded_h2 test_kernel_threaded_h2.cpp)
+target_link_libraries(test_kernel_threaded_h2 PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
+
