@@ -20,6 +20,7 @@ extern "C" {
 #include <rte_ether.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
+#include <rte_flow.h>
 #include <rte_ip.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
@@ -837,6 +838,112 @@ int poll_udp_payloads(int64_t handle, uint16_t queue_id, uint32_t local_ip_nbo,
     return static_cast<int>(accepted);
 }
 
+bool steer_l4_dst_port_to_queue(int64_t handle, uint8_t l4_proto, uint16_t queue_id,
+                                uint16_t dst_port_spec, uint16_t dst_port_mask,
+                                std::string& err) {
+    if (l4_proto != IPPROTO_TCP && l4_proto != IPPROTO_UDP) {
+        err = "dpdk_steer_bad_proto";
+        return false;
+    }
+
+    std::shared_lock<std::shared_mutex> lock(g_mu);
+    auto it = g_contexts.find(static_cast<long>(handle));
+    if (it == g_contexts.end()) {
+        err = "dpdk_invalid_handle";
+        return false;
+    }
+    auto pt = g_ports.find(it->second.port_id);
+    if (pt == g_ports.end() || !pt->second.started) {
+        err = "dpdk_port_not_ready";
+        return false;
+    }
+    if (queue_id >= pt->second.rx_queues) {
+        err = "dpdk_steer_queue_unavailable";
+        return false;
+    }
+    const uint16_t port_id = it->second.port_id;
+
+    // Attr: ingress (dönüş trafiği).
+    rte_flow_attr attr;
+    std::memset(&attr, 0, sizeof(attr));
+    attr.ingress = 1;
+
+    // Pattern: ETH / IPV4 / (TCP|UDP dst port spec+mask) / END.
+    rte_flow_item_eth eth_spec;
+    rte_flow_item_eth eth_mask;
+    std::memset(&eth_spec, 0, sizeof(eth_spec));
+    std::memset(&eth_mask, 0, sizeof(eth_mask));
+
+    rte_flow_item_ipv4 ip_spec;
+    rte_flow_item_ipv4 ip_mask;
+    std::memset(&ip_spec, 0, sizeof(ip_spec));
+    std::memset(&ip_mask, 0, sizeof(ip_mask));
+
+    rte_flow_item_tcp tcp_spec;
+    rte_flow_item_tcp tcp_mask;
+    rte_flow_item_udp udp_spec;
+    rte_flow_item_udp udp_mask;
+    std::memset(&tcp_spec, 0, sizeof(tcp_spec));
+    std::memset(&tcp_mask, 0, sizeof(tcp_mask));
+    std::memset(&udp_spec, 0, sizeof(udp_spec));
+    std::memset(&udp_mask, 0, sizeof(udp_mask));
+
+    rte_flow_item pattern[4];
+    std::memset(pattern, 0, sizeof(pattern));
+
+    pattern[0].type = RTE_FLOW_ITEM_TYPE_ETH;
+    pattern[0].spec = &eth_spec;
+    pattern[0].mask = &eth_mask;
+
+    pattern[1].type = RTE_FLOW_ITEM_TYPE_IPV4;
+    pattern[1].spec = &ip_spec;
+    pattern[1].mask = &ip_mask;
+
+    if (l4_proto == IPPROTO_TCP) {
+        tcp_spec.hdr.dst_port = rte_cpu_to_be_16(dst_port_spec);
+        tcp_mask.hdr.dst_port = rte_cpu_to_be_16(dst_port_mask);
+        pattern[2].type = RTE_FLOW_ITEM_TYPE_TCP;
+        pattern[2].spec = &tcp_spec;
+        pattern[2].mask = &tcp_mask;
+    } else {
+        udp_spec.hdr.dst_port = rte_cpu_to_be_16(dst_port_spec);
+        udp_mask.hdr.dst_port = rte_cpu_to_be_16(dst_port_mask);
+        pattern[2].type = RTE_FLOW_ITEM_TYPE_UDP;
+        pattern[2].spec = &udp_spec;
+        pattern[2].mask = &udp_mask;
+    }
+    pattern[3].type = RTE_FLOW_ITEM_TYPE_END;
+
+    // Action: QUEUE(queue_id) / END.
+    rte_flow_action_queue queue_action;
+    std::memset(&queue_action, 0, sizeof(queue_action));
+    queue_action.index = queue_id;
+
+    rte_flow_action actions[2];
+    std::memset(actions, 0, sizeof(actions));
+    actions[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+    actions[0].conf = &queue_action;
+    actions[1].type = RTE_FLOW_ACTION_TYPE_END;
+
+    rte_flow_error flow_err;
+    std::memset(&flow_err, 0, sizeof(flow_err));
+    if (rte_flow_validate(port_id, &attr, pattern, actions, &flow_err) != 0) {
+        err = std::string("dpdk_flow_validate_failed:") +
+              (flow_err.message ? flow_err.message : "unknown");
+        return false;
+    }
+
+    rte_flow* flow = rte_flow_create(port_id, &attr, pattern, actions, &flow_err);
+    if (flow == nullptr) {
+        err = std::string("dpdk_flow_create_failed:") +
+              (flow_err.message ? flow_err.message : "unknown");
+        return false;
+    }
+    // Kural port teardown'unda rte_flow_flush(rte_eth_dev_close içinde) ile
+    // temizlenir; handle'ı ayrıca saklamaya gerek yok (port kapanınca hepsi gider).
+    return true;
+}
+
 Snapshot snapshot(int64_t handle) {
     Snapshot snap{};
     uint16_t port_id = 0;
@@ -953,6 +1060,11 @@ int poll_rx(int64_t, uint16_t, uint16_t, uint8_t*, uint16_t, uint16_t*) { return
 int poll_udp_payloads(int64_t, uint16_t, uint32_t, uint16_t, uint16_t, uint16_t, uint8_t*,
                       uint16_t, uint16_t*) {
     return 0;
+}
+bool steer_l4_dst_port_to_queue(int64_t, uint8_t, uint16_t, uint16_t, uint16_t,
+                                std::string& err) {
+    err = "dpdk_not_built";
+    return false;
 }
 Snapshot snapshot(int64_t) { return {}; }
 void close_port(int64_t) {}

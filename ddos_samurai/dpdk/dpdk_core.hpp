@@ -140,6 +140,23 @@ int poll_udp_payloads(int64_t handle, uint16_t queue_id, uint32_t local_ip_nbo,
                       uint16_t budget, uint8_t* out_payload, uint16_t stride,
                       uint16_t* out_lens);
 
+// rte_flow akış-yönlendirme (per-core / shared-nothing demux).
+//
+// Bir IPv4 + (TCP|UDP) kuralı kurar: dst L4 portu `dst_port_spec & dst_port_mask`
+// eşleşen paketleri `queue_id` kuyruğuna yönlendirir. Shard `s`, kendi ephemeral
+// port kümesini `port & mask == s` olacak biçimde seçer; böylece dönüş trafiği
+// deterministik olarak shard'ın kuyruğuna düşer (RSS-hash yerine kesin steering).
+//
+// `l4_proto`: IPPROTO_TCP (6) veya IPPROTO_UDP (17).
+// `dst_port_spec` / `dst_port_mask`: host byte order; PMD'ye verilirken
+// network byte order'a çevrilir.
+//
+// PMD rte_flow'u veya bu kuralı desteklemezse `false` döner (çağıran tek-wire
+// dpdk_direct'e degrade eder). SAMURAI_WITH_DPDK tanımlı değilse daima `false`.
+bool steer_l4_dst_port_to_queue(int64_t handle, uint8_t l4_proto, uint16_t queue_id,
+                                uint16_t dst_port_spec, uint16_t dst_port_mask,
+                                std::string& err);
+
 // Sayaç + donanım istatistik anlık görüntüsü.
 Snapshot snapshot(int64_t handle);
 
