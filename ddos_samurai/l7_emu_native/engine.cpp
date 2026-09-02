@@ -16,6 +16,7 @@
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <sys/ioctl.h>
+#include <sched.h>
 #endif
 
 #include <algorithm>
@@ -2404,6 +2405,41 @@ ShardPortRange custom_tcp_shard_port_range(std::size_t sh, std::size_t n) {
 // tcpdp's one-outstanding-segment model livelocks on the inline per-shard pump
 // (single-shard H2-over-tcpdp works, so this is a per-shard H2 driver bug, not a
 // transport limit); H2 custom_tcp keeps the legacy shared-wire pump until fixed.
+// Optional CPU pinning for shard workers (opt-in via SAMURAI_L7_PIN). The
+// shared-nothing per-shard drivers (own_wire / kernel_threaded) only deliver
+// per-core scaling if each shard's worker stays on one core; otherwise the
+// scheduler migrates them and the per-core cache/NUMA locality the sharding is
+// built for is lost. Pin shard `sh` to the sh-th CPU in the process's *allowed*
+// affinity mask so `taskset -c ...` / cgroup cpusets are respected (wrapping if
+// there are more shards than allowed CPUs). Called from inside the worker thread
+// (pid 0 == current thread). No-op when the env gate is unset or the mask can't
+// be read, so default behaviour is unchanged.
+void maybe_pin_shard_worker(std::size_t sh) {
+  const char* pin = std::getenv("SAMURAI_L7_PIN");
+  if (pin == nullptr || pin[0] == '\0' || pin[0] == '0') {
+    return;
+  }
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (::sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+    return;
+  }
+  std::vector<int> cpus;
+  for (int c = 0; c < CPU_SETSIZE; ++c) {
+    if (CPU_ISSET(c, &allowed)) {
+      cpus.push_back(c);
+    }
+  }
+  if (cpus.empty()) {
+    return;
+  }
+  const int target = cpus[sh % cpus.size()];
+  cpu_set_t one;
+  CPU_ZERO(&one);
+  CPU_SET(target, &one);
+  (void)::sched_setaffinity(0, sizeof(one), &one);
+}
+
 bool custom_tcp_use_own_wire(const NativeRuntime& runtime, TransportBackend backend,
                              const std::string& protocol) {
   if (backend != TransportBackend::CustomTcp || runtime.shards.size() <= 1) {
@@ -5020,6 +5056,7 @@ std::map<std::string, double> run_http2_profile(
       // shared wire thread, no flow-registry routing, no inbox.
       for (std::size_t sh = 0; sh < shard_count; ++sh) {
         workers.emplace_back([&, sh]() {
+          maybe_pin_shard_worker(sh);
           g_perf_stats = &shard_perf[sh];
           void* shard_core = tcpdp_core_create();
           tcpdp_core_bind_current(shard_core);
@@ -5087,6 +5124,7 @@ std::map<std::string, double> run_http2_profile(
       // kernel_socket: shared-nothing per shard, direct epoll (no wire thread).
       for (std::size_t sh = 0; sh < shard_count; ++sh) {
         workers.emplace_back([&, sh]() {
+          maybe_pin_shard_worker(sh);
           g_perf_stats = &shard_perf[sh];
           auto& local_shard = runtime.local_shards[sh];
           auto& st = shard_stats[sh];
@@ -5153,6 +5191,7 @@ std::map<std::string, double> run_http2_profile(
 
     for (std::size_t sh = 0; sh < shard_count; ++sh) {
       workers.emplace_back([&, sh]() {
+        maybe_pin_shard_worker(sh);
         g_perf_stats = &shard_perf[sh];
         auto& local_shard = runtime.local_shards[sh];
         auto& st = shard_stats[sh];
@@ -6005,6 +6044,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       // wire thread, no flow-registry routing, no inbox.
       for (std::size_t sh = 0; sh < shard_count; ++sh) {
         workers.emplace_back([&, sh]() {
+          maybe_pin_shard_worker(sh);
           g_perf_stats = &shard_perf[sh];
           void* shard_core = tcpdp_core_create();
           tcpdp_core_bind_current(shard_core);
@@ -6065,6 +6105,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       // kernel_socket: shared-nothing per shard, direct epoll (no wire thread).
       for (std::size_t sh = 0; sh < shard_count; ++sh) {
         workers.emplace_back([&, sh]() {
+          maybe_pin_shard_worker(sh);
           g_perf_stats = &shard_perf[sh];
           auto& local_shard = runtime.local_shards[sh];
           while (true) {
@@ -6148,6 +6189,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
 
     for (std::size_t sh = 0; sh < shard_count; ++sh) {
       workers.emplace_back([&, sh]() {
+        maybe_pin_shard_worker(sh);
         g_perf_stats = &shard_perf[sh];
         auto& local_shard = runtime.local_shards[sh];
         while (true) {
