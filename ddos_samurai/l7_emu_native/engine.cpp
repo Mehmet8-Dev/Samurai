@@ -96,6 +96,13 @@ struct H1ReadBuffer {
     storage.append(data, len);
   }
 
+  // Take ownership of an already-materialised buffer without copying its bytes.
+  // Only valid when empty() (all prior bytes consumed); callers guard on that.
+  void adopt(std::string&& s) {
+    storage = std::move(s);
+    head = 0;
+  }
+
   void consume(std::size_t len) {
     head += std::min(len, size());
     compact_if_needed();
@@ -5261,7 +5268,15 @@ std::map<std::string, double> run_http2_profile(
                 ctx.transport_error = 1;
                 break;
               case InboxEvent::Kind::RxPayload:
-                ctx.read_buffer.append(ev.payload.data(), ev.payload.size());
+                // Adopt the wire thread's payload buffer by move when the reader
+                // buffer is drained (the steady state: parser consumed the prior
+                // response), eliminating the second copy. Only append-copy when
+                // bytes remain unparsed.
+                if (ctx.read_buffer.empty()) {
+                  ctx.read_buffer = std::move(ev.payload);
+                } else {
+                  ctx.read_buffer.append(ev.payload.data(), ev.payload.size());
+                }
                 break;
             }
             did_work = true;
@@ -6263,16 +6278,25 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
                 conn.custom_send_outstanding = 0;
                 lane.phase = H1LanePhase::Failed;
                 break;
-              case InboxEvent::Kind::RxPayload:
-                conn.read_buffer.append(ev.payload.data(), ev.payload.size());
+              case InboxEvent::Kind::RxPayload: {
+                // size() first: adopt-by-move (below) leaves ev.payload empty.
+                const std::size_t plen = ev.payload.size();
+                // Adopt by move when the reader buffer is drained (steady state),
+                // else append-copy the unparsed remainder.
+                if (conn.read_buffer.empty()) {
+                  conn.read_buffer.adopt(std::move(ev.payload));
+                } else {
+                  conn.read_buffer.append(ev.payload.data(), ev.payload.size());
+                }
                 conn.custom_rx_pending = true;
-                lane.response.bytes_received += ev.payload.size();
-                lane.rx_bytes += ev.payload.size();
+                lane.response.bytes_received += plen;
+                lane.rx_bytes += plen;
                 if (conn.custom_send_outstanding > 0) {
                   conn.custom_send_outstanding -= 1;
                 }
                 conn.custom_send_enqueued = conn.custom_send_outstanding > 0;
                 break;
+              }
             }
             did_work = true;
           }
