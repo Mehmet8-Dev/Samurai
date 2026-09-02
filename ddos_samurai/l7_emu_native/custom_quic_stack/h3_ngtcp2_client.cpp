@@ -39,6 +39,7 @@
 #include <unistd.h>
 
 #include "../../xdp/xdp_native_api.h"
+#include "../../dpdk/dpdk_core.hpp"
 
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_GNUTLS) && defined(SAMURAI_WITH_NGTCP2_GNUTLS) && defined(SAMURAI_WITH_NGHTTP3)
 #include <gnutls/crypto.h>
@@ -141,6 +142,9 @@ struct QuicXdpTransport {
 
 struct QuicDpdkTransport {
   long handle{0};
+  uint16_t queue_id{0};
+  uint16_t port_mask{0};   // ephemeral src-port stride mask for per-core steering
+  bool owns_handle{false}; // true when this attempt opened the handle (serial path)
   std::array<uint8_t, 6> src_mac{};
   std::array<uint8_t, 6> dst_mac{};
   uint32_t src_ip_nbo{0};
@@ -149,6 +153,18 @@ struct QuicDpdkTransport {
   uint16_t dst_port_nbo{0};
   uint16_t ip_id{1};
   int rx_stride{2048};
+  std::vector<uint8_t> rx_payload{};   // budget*rx_stride, allocated on connect
+  std::array<uint16_t, 64> rx_lens{};
+};
+
+// Fan-out-managed DPDK context: the manager (opened before the worker threads)
+// configures the shared port with N queues and installs the per-queue steering
+// rules; each worker opens its own handle on the same port for a private UDP
+// template (distinct strided ephemeral src port). See run_ngtcp2_profile.
+struct QuicDpdkFanoutCtx {
+  long shared_handle{0};  // per-worker handle (private template), 0 = unmanaged/serial
+  uint16_t queue_id{0};
+  uint16_t port_mask{0};
 };
 
 struct Ngtcp2AttemptCtx {
@@ -652,6 +668,11 @@ const xdp_native_api_v1* load_xdp_native_api() {
 void close_dpdk_transport(QuicDpdkTransport* t) {
   if (t == nullptr) {
     return;
+  }
+  // Only the serial (unmanaged) path owns its handle; fan-out worker handles are
+  // owned by the worker thread and closed after the attempt loop joins.
+  if (t->owns_handle && t->handle > 0) {
+    samurai::dpdk::close_port(t->handle);
   }
   *t = QuicDpdkTransport{};
 }
@@ -2944,6 +2965,43 @@ void cleanup_attempt(Ngtcp2AttemptCtx* ctx) {
   ctx->udp_io_backend = QuicUdpIoBackend::KernelSocket;
 }
 
+// DPDK port id for the QUIC UDP hot path (env SAMURAI_DPDK_PORT, default 0).
+uint16_t dpdk_port_id_from_env() {
+  if (const char* p = std::getenv("SAMURAI_DPDK_PORT"); p != nullptr && p[0] != '\0') {
+    const long v = std::strtol(p, nullptr, 10);
+    if (v >= 0 && v <= 0xFFFF) {
+      return static_cast<uint16_t>(v);
+    }
+  }
+  return 0;
+}
+
+// Ephemeral src port for a DPDK queue. With per-core steering (mask != 0) the low
+// bits encode the queue so return traffic (dst port == our src port) matches the
+// queue's rte_flow rule `port & mask == queue`. Returns host byte order.
+uint16_t pick_dpdk_src_port(uint16_t queue, uint16_t mask) {
+  static std::atomic<uint32_t> counter{0};
+  const uint32_t n = counter.fetch_add(1, std::memory_order_relaxed);
+  uint16_t base = static_cast<uint16_t>(20000u + (n % 45000u));  // [20000, 65000)
+  if (mask == 0) {
+    return base;
+  }
+  return static_cast<uint16_t>((base & static_cast<uint16_t>(~mask)) |
+                               (queue & mask));
+}
+
+// Round worker count up to a power of two and return mask = 2^k - 1 (0 for <=1).
+uint16_t dpdk_queue_mask(int worker_count) {
+  if (worker_count <= 1) {
+    return 0;
+  }
+  uint16_t m = 1;
+  while (m < worker_count) {
+    m = static_cast<uint16_t>(m << 1);
+  }
+  return static_cast<uint16_t>(m - 1);
+}
+
 bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
   auto connect_udp_kernel = [](Ngtcp2AttemptCtx* c) -> bool {
     if (c == nullptr) {
@@ -3072,13 +3130,140 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
   };
 
   auto connect_udp_dpdk = [&](Ngtcp2AttemptCtx* c, const Profile& p) -> bool {
-    (void)c;
-    (void)p;
-    // The DPDK transport used to embed the Python interpreter (the former
-    // ddos_samurai.dpdk_pmd_core extension). The DPDK layer is now a Python-free
-    // native core (ddos_samurai/dpdk/dpdk_core), and this QUIC path does not use
-    // it: the DPDK backend is a no-op and QUIC falls back to kernel/AF_XDP/AF_PACKET.
-    return false;
+    // Bridges the QUIC UDP hot path onto the native DPDK core
+    // (ddos_samurai/dpdk/dpdk_core). When libdpdk is absent the core is a stub
+    // (available()==false) and this returns false so QUIC falls back to kernel.
+    if (c == nullptr || !samurai::dpdk::available()) {
+      return false;
+    }
+    if (c->remote_addr.ss_family != AF_INET ||
+        c->remote_addrlen < static_cast<socklen_t>(sizeof(sockaddr_in))) {
+      return false;
+    }
+    sockaddr_in remote4{};
+    std::memcpy(&remote4, &c->remote_addr, sizeof(remote4));
+
+    // Interface addressing (src MAC/IP + dst MAC). On a DPDK-bound NIC these come
+    // from env overrides; with the software net_af_packet PMD over a veth the
+    // kernel interface still exists, so /sys + ARP resolution works — identical to
+    // the af_packet path.
+    const char* iface_env = std::getenv("SAMURAI_XDP_INTERFACE");
+    if (iface_env == nullptr || iface_env[0] == '\0') {
+      iface_env = std::getenv("SAMURAI_AF_PACKET_IFACE");
+    }
+    const std::string iface = iface_env == nullptr ? "" : std::string(iface_env);
+
+    // Source IP: explicit profile.source_ip, else the interface IPv4, else env.
+    uint32_t src_ip_nbo = 0;
+    in_addr src_ip_addr{};
+    if (!p.source_ip.empty() && ::inet_pton(AF_INET, p.source_ip.c_str(), &src_ip_addr) == 1) {
+      src_ip_nbo = src_ip_addr.s_addr;
+    } else if (iface.empty() || !read_iface_ipv4_nbo(iface, &src_ip_nbo)) {
+      const char* sip = std::getenv("SAMURAI_DPDK_SRC_IP");
+      if (sip != nullptr && ::inet_pton(AF_INET, sip, &src_ip_addr) == 1) {
+        src_ip_nbo = src_ip_addr.s_addr;
+      } else {
+        return false;
+      }
+    }
+
+    // Source MAC: env override, else the interface MAC.
+    std::array<uint8_t, 6> src_mac{};
+    bool got_src = false;
+    if (const char* sm = std::getenv("SAMURAI_DPDK_SRC_MAC"); sm != nullptr && sm[0] != '\0') {
+      got_src = parse_mac_address(sm, &src_mac);
+    }
+    if (!got_src && !iface.empty()) {
+      got_src = read_iface_mac_address(iface, &src_mac);
+    }
+    if (!got_src) {
+      return false;
+    }
+
+    // Destination MAC: env overrides, else ARP for the target IP.
+    std::array<uint8_t, 6> dst_mac{};
+    bool got_dst = false;
+    if (const char* dm = std::getenv("SAMURAI_DPDK_DST_MAC"); dm != nullptr && dm[0] != '\0') {
+      got_dst = parse_mac_address(dm, &dst_mac);
+    }
+    if (!got_dst) {
+      if (const char* dm2 = std::getenv("SAMURAI_AF_PACKET_DST_MAC"); dm2 != nullptr && dm2[0] != '\0') {
+        got_dst = parse_mac_address(dm2, &dst_mac);
+      }
+    }
+    if (!got_dst && !iface.empty()) {
+      const auto arp = lookup_arp_mac_address(iface, p.target_ip);
+      if (arp.has_value()) {
+        dst_mac = *arp;
+        got_dst = true;
+      }
+    }
+    if (!got_dst) {
+      return false;
+    }
+
+    // Handle: fan-out-managed (worker-owned, per-core queue+steering installed
+    // up front) or self-opened for this serial attempt (single queue, no steer).
+    const bool managed = c->dpdk.handle > 0;
+    long handle = c->dpdk.handle;
+    bool owns = false;
+    if (!managed) {
+      samurai::dpdk::OpenConfig cfg{};
+      cfg.port_id = dpdk_port_id_from_env();
+      cfg.num_tx_queues = 1;
+      cfg.num_rx_queues = 1;
+      cfg.enable_rss = false;
+      std::string open_err;
+      handle = samurai::dpdk::open_port(cfg, open_err);
+      if (handle <= 0) {
+        return false;
+      }
+      owns = true;
+    }
+
+    const uint16_t queue = c->dpdk.queue_id;
+    const uint16_t mask = c->dpdk.port_mask;
+    const uint16_t sport_nbo = htons(pick_dpdk_src_port(queue, mask));
+
+    samurai::dpdk::UdpFlowConfig fcfg{};
+    fcfg.src_ip_nbo = src_ip_nbo;
+    fcfg.dst_ip_nbo = remote4.sin_addr.s_addr;
+    fcfg.src_port_nbo = sport_nbo;
+    fcfg.dst_port_nbo = remote4.sin_port;
+    std::memcpy(fcfg.src_mac, src_mac.data(), 6);
+    std::memcpy(fcfg.dst_mac, dst_mac.data(), 6);
+    fcfg.initial_ip_id = 1;
+    std::string cfg_err;
+    if (!samurai::dpdk::configure_udp_flow(handle, fcfg, cfg_err)) {
+      if (owns) {
+        samurai::dpdk::close_port(handle);
+      }
+      return false;
+    }
+
+    c->dpdk.handle = handle;
+    c->dpdk.owns_handle = owns;
+    c->dpdk.src_mac = src_mac;
+    c->dpdk.dst_mac = dst_mac;
+    c->dpdk.src_ip_nbo = src_ip_nbo;
+    c->dpdk.dst_ip_nbo = remote4.sin_addr.s_addr;
+    c->dpdk.src_port_nbo = sport_nbo;
+    c->dpdk.dst_port_nbo = remote4.sin_port;
+    c->dpdk.ip_id = 1;
+    c->dpdk.rx_stride = 2048;
+    c->dpdk.rx_payload.assign(
+        static_cast<std::size_t>(c->dpdk.rx_stride) * c->dpdk.rx_lens.size(), 0);
+
+    sockaddr_in local4{};
+    local4.sin_family = AF_INET;
+    local4.sin_port = sport_nbo;
+    local4.sin_addr.s_addr = src_ip_nbo;
+    std::memset(&c->local_addr, 0, sizeof(c->local_addr));
+    std::memcpy(&c->local_addr, &local4, sizeof(local4));
+    c->local_addrlen = sizeof(local4);
+    c->fd = -1;
+    c->udp_io_backend = QuicUdpIoBackend::Dpdk;
+    return true;
   };
 
   auto connect_udp_afpacket = [&](Ngtcp2AttemptCtx* c, const Profile& p) -> bool {
@@ -3199,8 +3384,13 @@ ssize_t send_udp_payload(Ngtcp2AttemptCtx* ctx, const uint8_t* payload, std::siz
     return af_packet_send_udp(&ctx->af_packet, payload, payload_len);
   }
   if (ctx->udp_io_backend == QuicUdpIoBackend::Dpdk) {
-    (void)payload;
-    return -1;
+    if (ctx->dpdk.handle <= 0) {
+      return -1;
+    }
+    std::string err;
+    const int sent = samurai::dpdk::send_udp_payload(
+        ctx->dpdk.handle, ctx->dpdk.queue_id, payload, payload_len, err);
+    return sent > 0 ? static_cast<ssize_t>(payload_len) : -1;
   }
   return -1;
 }
@@ -3291,8 +3481,39 @@ int recv_udp_payloads(
     return af_packet_recv_udp(&ctx->af_packet, payload_buf, stride, lens_out, max_packets);
   }
   if (ctx->udp_io_backend == QuicUdpIoBackend::Dpdk) {
-    (void)payload_buf;
-    return -1;
+    if (ctx->dpdk.handle <= 0 || ctx->dpdk.rx_payload.empty()) {
+      return -1;
+    }
+    const uint16_t rx_stride = static_cast<uint16_t>(ctx->dpdk.rx_stride);
+    const int budget = std::min<int>(max_packets, static_cast<int>(ctx->dpdk.rx_lens.size()));
+    // poll_udp_payloads already extracts the UDP payload for frames matching
+    // (local_ip, local_port==our src, remote_port==server dst) on our queue.
+    const int got = samurai::dpdk::poll_udp_payloads(
+        ctx->dpdk.handle,
+        ctx->dpdk.queue_id,
+        ctx->dpdk.src_ip_nbo,
+        ctx->dpdk.src_port_nbo,
+        ctx->dpdk.dst_port_nbo,
+        static_cast<uint16_t>(budget),
+        ctx->dpdk.rx_payload.data(),
+        rx_stride,
+        ctx->dpdk.rx_lens.data());
+    if (got <= 0) {
+      return 0;
+    }
+    int accepted = 0;
+    for (int i = 0; i < got && accepted < max_packets; ++i) {
+      const uint16_t plen = ctx->dpdk.rx_lens[static_cast<std::size_t>(i)];
+      if (plen == 0 || plen > stride) {
+        continue;
+      }
+      std::memcpy(payload_buf + static_cast<std::size_t>(accepted) * stride,
+                  ctx->dpdk.rx_payload.data() + static_cast<std::size_t>(i) * rx_stride,
+                  plen);
+      lens_out[static_cast<std::size_t>(accepted)] = plen;
+      ++accepted;
+    }
+    return accepted;
   }
   return -1;
 }
@@ -3587,7 +3808,8 @@ bool run_single_attempt(
     int planned_requests,
     const H3FeaturePolicy& feature_policy,
     TlsSessionCache* session_cache,
-    UdpProbeCounters* out) {
+    UdpProbeCounters* out,
+    const QuicDpdkFanoutCtx* dpdk_fanout = nullptr) {
   if (out == nullptr) {
     return false;
   }
@@ -3618,6 +3840,13 @@ bool run_single_attempt(
       env_truthy("SAMURAI_L7_CAPABILITY_STRICT") ||
       env_truthy("SAMURAI_L7_QUIC_REQUIRE_NATIVE");
   out->runtime_backend_requested = static_cast<int>(ctx.requested_backend);
+  // Fan-out-managed DPDK: adopt the worker's shared handle, queue and stride mask
+  // so connect_udp_dpdk configures a private template on the pre-steered queue.
+  if (dpdk_fanout != nullptr && dpdk_fanout->shared_handle > 0) {
+    ctx.dpdk.handle = dpdk_fanout->shared_handle;
+    ctx.dpdk.queue_id = dpdk_fanout->queue_id;
+    ctx.dpdk.port_mask = dpdk_fanout->port_mask;
+  }
   std::string tls_sni_name{};
   std::string tls_verify_name{};
   derive_tls_names(profile, &tls_sni_name, &tls_verify_name);
@@ -4089,23 +4318,64 @@ bool run_h3_ngtcp2_client(
     }
   }
 
-  // Threaded fan-out: only the kernel UDP-socket backend is parallelized. It uses a
-  // connect()ed socket per attempt, so the kernel assigns a distinct ephemeral src
-  // port to each connection (no 4-tuple collision). The native hot-path backends
-  // (af_xdp/af_packet/dpdk) keep the serial loop: af_xdp/dpdk each own a single
-  // exclusive NIC resource (one umem/queue, one port), and while af_packet CAN
-  // fan out per-core in principle (distinct ephemeral src ports via
-  // next_af_packet_src_port + software return-demux, like the L4/L7 custom_tcp
-  // own-wire), its ngtcp2 QUIC datagram drain is not yet reliable enough over a raw
-  // socket to complete H3 request/response end-to-end (a pre-existing data-path
-  // limitation, independent of threading -- see perf-gaps-backlog). Fanning it out
-  // is deferred until that raw-socket I/O path is hardened. Each worker owns its own
-  // counters + a TLS session-cache copy seeded from the on-disk blob with the disk
-  // path cleared (0-RTT resumption from the loaded ticket, but no concurrent disk
-  // writes); one freshly captured ticket is persisted once after join.
+  // Threaded fan-out: the kernel UDP-socket backend and the DPDK backend are
+  // parallelized per-core. Kernel uses a connect()ed socket per attempt (the kernel
+  // assigns a distinct ephemeral src port -> no 4-tuple collision). DPDK opens the
+  // shared port once with N RX/TX queues, installs an rte_flow steering rule per
+  // queue (return dst-port & mask == queue), and each worker drives its own queue
+  // with a private strided ephemeral src port -- the same shared-nothing per-core
+  // model as the L4/L7 custom_tcp own-wire. af_xdp still keeps the serial loop (a
+  // single exclusive umem/queue), and af_packet is deferred (its raw-socket QUIC
+  // datagram drain is not yet reliable enough end-to-end -- see perf-gaps-backlog).
+  // Each worker owns its own counters + a TLS session-cache copy seeded from the
+  // on-disk blob with the disk path cleared (0-RTT resumption from the loaded
+  // ticket, but no concurrent disk writes); one freshly captured ticket is persisted
+  // once after join.
   const QuicUdpIoBackend requested_backend_kind = resolve_requested_backend(profile);
+  const int quic_worker_count_candidate =
+      std::min<int>(configured_conn_pool, static_cast<int>(conn_plans.size()));
+
+  // DPDK per-core fan-out setup: open the shared port with N queues and install the
+  // per-queue steering rules up front. If the PMD lacks rte_flow (or DPDK is not
+  // built), degrade to the serial loop (which still tries single-queue DPDK, then
+  // kernel) -- exactly the "steering unsupported -> single-wire" fallback.
+  long quic_dpdk_manager = 0;
+  uint16_t quic_dpdk_port_mask = 0;
+  bool dpdk_fanout_active = false;
+  if (requested_backend_kind == QuicUdpIoBackend::Dpdk &&
+      samurai::dpdk::available() && configured_conn_pool > 1 &&
+      conn_plans.size() > 1 && !env_truthy("SAMURAI_QUIC_THREADS_DISABLE")) {
+    const int wc = quic_worker_count_candidate;
+    quic_dpdk_port_mask = dpdk_queue_mask(wc);
+    samurai::dpdk::OpenConfig mcfg{};
+    mcfg.port_id = dpdk_port_id_from_env();
+    mcfg.num_tx_queues = static_cast<uint16_t>(wc);
+    mcfg.num_rx_queues = static_cast<uint16_t>(wc);
+    mcfg.enable_rss = true;
+    std::string merr;
+    quic_dpdk_manager = samurai::dpdk::open_port(mcfg, merr);
+    if (quic_dpdk_manager > 0) {
+      bool steer_ok = true;
+      for (int q = 0; q < wc; ++q) {
+        std::string serr;
+        if (!samurai::dpdk::steer_l4_dst_port_to_queue(
+                quic_dpdk_manager, IPPROTO_UDP, static_cast<uint16_t>(q),
+                static_cast<uint16_t>(q), quic_dpdk_port_mask, serr)) {
+          steer_ok = false;
+          break;
+        }
+      }
+      if (steer_ok) {
+        dpdk_fanout_active = true;
+      } else {
+        samurai::dpdk::close_port(quic_dpdk_manager);
+        quic_dpdk_manager = 0;
+      }
+    }
+  }
+
   const bool quic_threaded =
-      requested_backend_kind == QuicUdpIoBackend::KernelSocket &&
+      (requested_backend_kind == QuicUdpIoBackend::KernelSocket || dpdk_fanout_active) &&
       configured_conn_pool > 1 && conn_plans.size() > 1 &&
       !env_truthy("SAMURAI_QUIC_THREADS_DISABLE");
 
@@ -4127,6 +4397,30 @@ bool run_h3_ngtcp2_client(
       threads.emplace_back([&, w]() {
         UdpProbeCounters& lo = local_outs[static_cast<std::size_t>(w)];
         TlsSessionCache& lc = local_caches[static_cast<std::size_t>(w)];
+        // Per-core DPDK: register this thread as an EAL lcore (mempool per-lcore
+        // cache) and open a worker-private handle on the shared port so it gets its
+        // own UDP template (distinct strided src port) on queue == w. Steering was
+        // installed up front by the manager. Non-DPDK (kernel) workers leave this 0.
+        QuicDpdkFanoutCtx fanout{};
+        long worker_dpdk_handle = 0;
+        bool lcore_registered = false;
+        if (dpdk_fanout_active) {
+          lcore_registered = samurai::dpdk::register_lcore_thread();
+          samurai::dpdk::OpenConfig wcfg{};
+          wcfg.port_id = dpdk_port_id_from_env();
+          wcfg.num_tx_queues = static_cast<uint16_t>(worker_count);
+          wcfg.num_rx_queues = static_cast<uint16_t>(worker_count);
+          wcfg.enable_rss = true;
+          std::string werr;
+          worker_dpdk_handle = samurai::dpdk::open_port(wcfg, werr);
+          if (worker_dpdk_handle > 0) {
+            fanout.shared_handle = worker_dpdk_handle;
+            fanout.queue_id = static_cast<uint16_t>(w);
+            fanout.port_mask = quic_dpdk_port_mask;
+          }
+        }
+        const QuicDpdkFanoutCtx* fanout_ptr =
+            (dpdk_fanout_active && worker_dpdk_handle > 0) ? &fanout : nullptr;
         // Round-robin plan assignment spreads the warm connections across workers.
         for (std::size_t idx = static_cast<std::size_t>(w); idx < conn_plans.size();
              idx += static_cast<std::size_t>(worker_count)) {
@@ -4134,7 +4428,7 @@ bool run_h3_ngtcp2_client(
             break;
           }
           lo.conn_attempted += 1;
-          if (!run_single_attempt(profile, timeout_ms, conn_plans[idx], feature_policy, &lc, &lo)) {
+          if (!run_single_attempt(profile, timeout_ms, conn_plans[idx], feature_policy, &lc, &lo, fanout_ptr)) {
             hard_fail.store(true, std::memory_order_relaxed);
             break;
           }
@@ -4142,6 +4436,12 @@ bool run_h3_ngtcp2_client(
           if (goaway_policy.enabled && lo.conn_established <= 0) {
             lo.h3_control_plane_failures += 1;
           }
+        }
+        if (worker_dpdk_handle > 0) {
+          samurai::dpdk::close_port(worker_dpdk_handle);
+        }
+        if (lcore_registered) {
+          samurai::dpdk::unregister_lcore_thread();
         }
       });
     }
@@ -4170,7 +4470,17 @@ bool run_h3_ngtcp2_client(
         }
       }
     }
+    // Release the shared DPDK port after all worker handles have closed on join.
+    if (quic_dpdk_manager > 0) {
+      samurai::dpdk::close_port(quic_dpdk_manager);
+      quic_dpdk_manager = 0;
+    }
   } else {
+    // If DPDK fan-out setup ran but the threaded path was not taken, release it.
+    if (quic_dpdk_manager > 0) {
+      samurai::dpdk::close_port(quic_dpdk_manager);
+      quic_dpdk_manager = 0;
+    }
     for (std::size_t idx = 0; idx < conn_plans.size(); ++idx) {
       out->conn_attempted += 1;
       if (!run_single_attempt(profile, timeout_ms, conn_plans[idx], feature_policy, &session_cache, out)) {
