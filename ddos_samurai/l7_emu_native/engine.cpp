@@ -2,6 +2,7 @@
 #include "custom_quic_stack/quic_stack.hpp"
 #include "../l4/tcp_dataplane_ffi.h"
 #include "../af_packet/af_packet.h"
+#include "../dpdk/dpdk_core.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -2400,15 +2401,47 @@ bool pump_custom_tcp_shard_wire(NativeRuntime& runtime, afpkt_wire_t* wire,
 // for same-segment lab use -- matching the legacy FFI wire pump). have_iface is
 // false when no interface is configured, in which case the own-wire path is
 // unavailable and the caller keeps the legacy shared-wire behaviour.
+// The "tel" (wire) that carries a shard's tcpdp frames. AfPacket = per-shard raw
+// socket with a src-port BPF filter (default). Dpdk = per-shard DPDK queue on a
+// shared port with rte_flow steering (per-core, opt-in SAMURAI_CUSTOM_TCP_WIRE=dpdk).
+enum class WireKind { AfPacket, Dpdk };
+
 struct CustomTcpWireConfig {
   std::string iface;
   uint8_t dst_mac[6];
+  uint8_t src_mac[6];
   bool have_iface{false};
+  bool have_src_mac{false};
+  WireKind kind{WireKind::AfPacket};
+  uint16_t dpdk_port{0};
 };
+
+// Resolve the interface MAC (SIOCGIFHWADDR) for stamping TX frames on the DPDK
+// wire (tcpdp emits MAC-less L2 frames; the af_packet wire fills them in the
+// kernel, but the DPDK send path must complete them itself). Returns true on ok.
+bool resolve_wire_iface_mac(const std::string& iface, uint8_t out[6]) {
+#if defined(__linux__)
+  if (iface.empty()) return false;
+  const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) return false;
+  ifreq ifr{};
+  std::snprintf(ifr.ifr_name, IFNAMSIZ, "%s", iface.c_str());
+  const int rc = ::ioctl(fd, SIOCGIFHWADDR, &ifr);
+  ::close(fd);
+  if (rc != 0) return false;
+  std::memcpy(out, ifr.ifr_hwaddr.sa_data, 6);
+  return true;
+#else
+  (void)iface;
+  (void)out;
+  return false;
+#endif
+}
 
 CustomTcpWireConfig resolve_custom_tcp_wire_config() {
   CustomTcpWireConfig c;
   std::memset(c.dst_mac, 0xff, sizeof(c.dst_mac));
+  std::memset(c.src_mac, 0x00, sizeof(c.src_mac));
   const char* iface = std::getenv("SAMURAI_CUSTOM_TCP_RX_IFACE");
   if (iface != nullptr && iface[0] != '\0') {
     c.iface = iface;
@@ -2419,6 +2452,26 @@ CustomTcpWireConfig resolve_custom_tcp_wire_config() {
   if (m != nullptr &&
       std::sscanf(m, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
     for (int i = 0; i < 6; ++i) c.dst_mac[i] = static_cast<uint8_t>(b[i] & 0xffu);
+  }
+  // Opt-in DPDK wire: SAMURAI_CUSTOM_TCP_WIRE=dpdk and a built DPDK core. Falls
+  // back to af_packet silently when DPDK is unavailable so behaviour is unchanged.
+  const char* wire = std::getenv("SAMURAI_CUSTOM_TCP_WIRE");
+  if (wire != nullptr && (std::strcmp(wire, "dpdk") == 0) && samurai::dpdk::available()) {
+    c.kind = WireKind::Dpdk;
+    if (const char* p = std::getenv("SAMURAI_DPDK_PORT"); p != nullptr && p[0] != '\0') {
+      const long v = std::strtol(p, nullptr, 10);
+      if (v >= 0 && v <= 0xFFFF) c.dpdk_port = static_cast<uint16_t>(v);
+    }
+    // Source MAC: explicit env override, else the interface MAC.
+    unsigned int sb[6];
+    const char* sm = std::getenv("SAMURAI_CUSTOM_TCP_SRC_MAC");
+    if (sm != nullptr &&
+        std::sscanf(sm, "%x:%x:%x:%x:%x:%x", &sb[0], &sb[1], &sb[2], &sb[3], &sb[4], &sb[5]) == 6) {
+      for (int i = 0; i < 6; ++i) c.src_mac[i] = static_cast<uint8_t>(sb[i] & 0xffu);
+      c.have_src_mac = true;
+    } else if (resolve_wire_iface_mac(c.iface, c.src_mac)) {
+      c.have_src_mac = true;
+    }
   }
   return c;
 }
@@ -2496,6 +2549,188 @@ bool custom_tcp_use_own_wire(const NativeRuntime& runtime, TransportBackend back
   }
   const char* iface = std::getenv("SAMURAI_CUSTOM_TCP_RX_IFACE");
   return iface != nullptr && iface[0] != '\0';
+}
+
+// ---- DPDK per-core own-wire (opt-in) --------------------------------------
+// Mirrors pump_custom_tcp_shard_wire but the "tel" is a per-shard DPDK queue on
+// a shared port: RX frames come from dpdk::poll_rx (queue==shard) and TX frames
+// are MAC-completed then handed to dpdk::send_batch (queue==shard). Steering
+// (installed up front by the manager) guarantees a flow's return traffic lands
+// on the owning shard's queue, so the bound core only ever ingests its own flows.
+
+// next power of two minus one (0 for <=1); the ephemeral-port stride mask.
+uint16_t custom_tcp_dpdk_mask(std::size_t shard_count) {
+  if (shard_count <= 1) return 0;
+  uint16_t m = 1;
+  while (m < shard_count) m = static_cast<uint16_t>(m << 1);
+  return static_cast<uint16_t>(m - 1);
+}
+
+bool pump_custom_tcp_shard_dpdk(NativeRuntime& runtime, long handle, uint16_t queue,
+                                const uint8_t dst_mac[6], const uint8_t src_mac[6],
+                                uint8_t* rxbuf, uint16_t* rxlens, uint16_t rx_budget,
+                                std::vector<std::uint8_t>& txscratch) {
+  bool did_work = false;
+  // 1) RX: drain this queue's inbound frames into the bound core.
+  const int n = samurai::dpdk::poll_rx(handle, queue, rx_budget, rxbuf,
+                                       kCustomTcpWireStride, rxlens);
+  for (int i = 0; i < n; ++i) {
+    uint32_t updated = 0;
+    (void)tcpdp_ingest_rx_frame(
+        rxbuf + static_cast<std::size_t>(i) * kCustomTcpWireStride,
+        rxlens[static_cast<std::size_t>(i)], &updated);
+  }
+  if (n > 0) did_work = true;
+
+  // 2) Poll + apply completions/RX payloads to this shard's lanes.
+  apply_custom_tcp_core_events(runtime);
+
+  // 3) TX: drain the core's TX ring, MAC-complete each frame (tcpdp emits MAC-less
+  // L2), compact the strided ring into a contiguous burst, and send on this queue.
+  for (int guard = 0; guard < 16; ++guard) {
+    const uint8_t* base = nullptr;
+    uint32_t count = 0;
+    size_t psize = 0;
+    size_t stride = 0;
+    if (tcpdp_peek_tx_packets_strided(0, &base, &count, &psize, &stride) != 0) break;
+    if (base == nullptr || count == 0 || psize < 14) {
+      if (base != nullptr && count > 0 && psize < 14) {  // malformed: flush so it can't wedge
+        uint32_t consumed = 0;
+        (void)tcpdp_consume_tx_packets(count, &consumed);
+      }
+      break;
+    }
+    const uint32_t cap = txscratch.empty()
+                             ? 0u
+                             : static_cast<uint32_t>(txscratch.size() / psize);
+    const uint32_t batch = std::min<uint32_t>(count, cap);
+    if (batch == 0) break;
+    for (uint32_t i = 0; i < batch; ++i) {
+      uint8_t* d = txscratch.data() + static_cast<std::size_t>(i) * psize;
+      std::memcpy(d, base + static_cast<std::size_t>(i) * stride, psize);
+      std::memcpy(d, dst_mac, 6);       // dst MAC
+      std::memcpy(d + 6, src_mac, 6);   // src MAC
+    }
+    const samurai::dpdk::TxResult r = samurai::dpdk::send_batch(
+        handle, queue, txscratch.data(), static_cast<uint16_t>(psize), batch);
+    if (r.sent == 0) break;             // wire full; retry next pass
+    uint32_t consumed = 0;
+    (void)tcpdp_consume_tx_packets(static_cast<uint32_t>(r.sent), &consumed);
+    did_work = true;
+    if (r.sent < count) break;          // partial; retry next pass
+  }
+  return did_work;
+}
+
+// Per-run shared DPDK port for the own-wire path: opened once with N queues and
+// one steering rule per shard, before the worker threads spawn.
+struct DpdkOwnWire {
+  long manager{0};
+  uint16_t mask{0};
+  bool active{false};
+};
+
+DpdkOwnWire open_dpdk_own_wire(const CustomTcpWireConfig& cfg, std::size_t shard_count) {
+  DpdkOwnWire dw;
+  if (cfg.kind != WireKind::Dpdk || !samurai::dpdk::available() || shard_count <= 1) {
+    return dw;
+  }
+  dw.mask = custom_tcp_dpdk_mask(shard_count);
+  samurai::dpdk::OpenConfig oc;
+  oc.port_id = cfg.dpdk_port;
+  oc.num_tx_queues = static_cast<uint16_t>(shard_count);
+  oc.num_rx_queues = static_cast<uint16_t>(shard_count);
+  oc.enable_rss = true;
+  std::string err;
+  const long manager = samurai::dpdk::open_port(oc, err);
+  if (manager <= 0) {
+    return dw;  // inactive -> caller degrades to af_packet
+  }
+  for (std::size_t q = 0; q < shard_count; ++q) {
+    std::string serr;
+    if (!samurai::dpdk::steer_l4_dst_port_to_queue(
+            manager, IPPROTO_TCP, static_cast<uint16_t>(q), static_cast<uint16_t>(q),
+            dw.mask, serr)) {
+      samurai::dpdk::close_port(manager);
+      return dw;  // steering unsupported -> degrade to single-wire af_packet
+    }
+  }
+  dw.manager = manager;
+  dw.active = true;
+  return dw;
+}
+
+void close_dpdk_own_wire(DpdkOwnWire& dw) {
+  if (dw.manager > 0) {
+    samurai::dpdk::close_port(dw.manager);
+  }
+  dw.manager = 0;
+  dw.active = false;
+}
+
+// The per-shard wire handle (af_packet socket or DPDK queue), opened on the shard
+// worker thread. Sets the tcpdp ephemeral-port base/stride so return traffic
+// demuxes to this shard (af_packet: BPF range; DPDK: mask steering).
+struct ShardWire {
+  WireKind kind{WireKind::AfPacket};
+  afpkt_wire_t* afpkt{nullptr};
+  long dpdk_handle{0};
+  uint16_t dpdk_queue{0};
+  bool lcore_registered{false};
+};
+
+ShardWire open_shard_wire(const CustomTcpWireConfig& cfg, const DpdkOwnWire& dw,
+                          std::size_t sh, std::size_t shard_count,
+                          const ShardPortRange& pr) {
+  ShardWire w;
+  if (cfg.kind == WireKind::Dpdk && dw.active) {
+    w.kind = WireKind::Dpdk;
+    // Strided ephemeral ports so every port satisfies (port & mask) == sh, matching
+    // this shard's steering rule.
+    const uint16_t stride = static_cast<uint16_t>(dw.mask + 1);
+    uint32_t base = 40000u - (40000u % stride) + static_cast<uint32_t>(sh % stride);
+    if (base < 40000u) base += stride;
+    tcpdp_set_ephemeral_port_base(static_cast<uint16_t>(base));
+    tcpdp_set_ephemeral_port_stride(stride);
+    w.lcore_registered = samurai::dpdk::register_lcore_thread();
+    samurai::dpdk::OpenConfig oc;
+    oc.port_id = cfg.dpdk_port;
+    oc.num_tx_queues = static_cast<uint16_t>(shard_count);
+    oc.num_rx_queues = static_cast<uint16_t>(shard_count);
+    oc.enable_rss = true;
+    std::string err;
+    w.dpdk_handle = samurai::dpdk::open_port(oc, err);
+    w.dpdk_queue = static_cast<uint16_t>(sh);
+    return w;
+  }
+  w.kind = WireKind::AfPacket;
+  tcpdp_set_ephemeral_port_base(pr.lo);
+  (void)afpkt_wire_open(cfg.iface.c_str(), pr.lo, pr.hi, &w.afpkt);
+  return w;
+}
+
+bool pump_shard_wire(NativeRuntime& runtime, const CustomTcpWireConfig& cfg,
+                     ShardWire& w, uint8_t* rxbuf, uint16_t* rxlens, uint16_t budget,
+                     std::vector<std::uint8_t>& txscratch) {
+  if (w.kind == WireKind::Dpdk) {
+    if (w.dpdk_handle <= 0) return false;
+    return pump_custom_tcp_shard_dpdk(runtime, w.dpdk_handle, w.dpdk_queue,
+                                      cfg.dst_mac, cfg.src_mac, rxbuf, rxlens, budget,
+                                      txscratch);
+  }
+  if (w.afpkt != nullptr) {
+    return pump_custom_tcp_shard_wire(runtime, w.afpkt, cfg.dst_mac, rxbuf, rxlens, budget);
+  }
+  return false;
+}
+
+void close_shard_wire(ShardWire& w) {
+  if (w.kind == WireKind::Dpdk) {
+    if (w.dpdk_handle > 0) samurai::dpdk::close_port(w.dpdk_handle);
+    if (w.lcore_registered) samurai::dpdk::unregister_lcore_thread();
+  } else if (w.afpkt != nullptr) {
+    afpkt_wire_close(w.afpkt);
+  }
 }
 
 void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
@@ -5095,9 +5330,13 @@ std::map<std::string, double> run_http2_profile(
     workers.reserve(shard_count);
 
     if (own_wire_threaded) {
-      // custom_tcp shared-nothing: per shard, a private core + own af_packet wire,
-      // driven inline (RX->core, core events->sessions, core TX ring->wire). No
-      // shared wire thread, no flow-registry routing, no inbox.
+      // custom_tcp shared-nothing: per shard, a private core + own wire (af_packet
+      // socket or, opt-in, a DPDK queue), driven inline (RX->core, core events->
+      // sessions, core TX ring->wire). No shared wire thread, no flow-registry
+      // routing, no inbox. For DPDK the manager opens the shared port with N queues
+      // + per-shard steering up front; if that is unsupported it degrades to
+      // af_packet (single-wire fallback).
+      DpdkOwnWire dpdk_wire = open_dpdk_own_wire(wire_cfg, shard_count);
       for (std::size_t sh = 0; sh < shard_count; ++sh) {
         workers.emplace_back([&, sh]() {
           maybe_pin_shard_worker(sh);
@@ -5106,21 +5345,18 @@ std::map<std::string, double> run_http2_profile(
           tcpdp_core_bind_current(shard_core);
           (void)configure_custom_tcp_bridge(profile);
           const ShardPortRange pr = custom_tcp_shard_port_range(sh, shard_count);
-          tcpdp_set_ephemeral_port_base(pr.lo);
           tcpdp_set_flow_id_base(static_cast<std::uint64_t>(sh + 1) << 40);
-          afpkt_wire_t* wire = nullptr;
-          (void)afpkt_wire_open(wire_cfg.iface.c_str(), pr.lo, pr.hi, &wire);
+          ShardWire wire = open_shard_wire(wire_cfg, dpdk_wire, sh, shard_count, pr);
           std::vector<std::uint8_t> rxbuf(static_cast<std::size_t>(kCustomTcpWireStride) * 256);
           std::vector<std::uint16_t> rxlens(256);
+          std::vector<std::uint8_t> txscratch(static_cast<std::size_t>(kCustomTcpWireStride) * 256);
           auto& local_shard = runtime.local_shards[sh];
           auto& st = shard_stats[sh];
           auto& shard_captures = captures_by_shard[sh];
           while (true) {
             bool did_work = false;
-            if (wire != nullptr) {
-              did_work |= pump_custom_tcp_shard_wire(
-                  runtime, wire, wire_cfg.dst_mac, rxbuf.data(), rxlens.data(), 256);
-            }
+            did_work |= pump_shard_wire(
+                runtime, wire_cfg, wire, rxbuf.data(), rxlens.data(), 256, txscratch);
             expire_lane_idle_shard(runtime, profile, sh);
             dispatch_pending_h2_requests(st, shard_captures, sh);
             service_custom_tcp_h2_shard_sessions(runtime, profile, sh);
@@ -5158,7 +5394,7 @@ std::map<std::string, double> run_http2_profile(
           g_last_scenario_step_results.clear();
           g_perf_stats = nullptr;
           accumulate_custom_tcp_shard_stats(runtime);
-          afpkt_wire_close(wire);
+          close_shard_wire(wire);
           tcpdp_core_bind_current(nullptr);
           tcpdp_core_destroy(shard_core);
         });
@@ -5166,6 +5402,7 @@ std::map<std::string, double> run_http2_profile(
       for (auto& w : workers) {
         w.join();
       }
+      close_dpdk_own_wire(dpdk_wire);
     } else if (kernel_threaded) {
       // kernel_socket: shared-nothing per shard, direct epoll (no wire thread).
       for (std::size_t sh = 0; sh < shard_count; ++sh) {
@@ -6095,9 +6332,12 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
     workers.reserve(shard_count);
 
     if (own_wire_threaded) {
-      // custom_tcp shared-nothing: per shard, a private core + own af_packet wire,
-      // driven inline (RX->core, core events->lanes, core TX ring->wire). No shared
-      // wire thread, no flow-registry routing, no inbox.
+      // custom_tcp shared-nothing: per shard, a private core + own wire (af_packet
+      // socket or, opt-in, a DPDK queue), driven inline (RX->core, core events->
+      // lanes, core TX ring->wire). No shared wire thread, no flow-registry routing,
+      // no inbox. For DPDK the manager opens the shared port with N queues +
+      // per-shard steering up front; if unsupported it degrades to af_packet.
+      DpdkOwnWire dpdk_wire = open_dpdk_own_wire(wire_cfg, shard_count);
       for (std::size_t sh = 0; sh < shard_count; ++sh) {
         workers.emplace_back([&, sh]() {
           maybe_pin_shard_worker(sh);
@@ -6106,19 +6346,16 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
           tcpdp_core_bind_current(shard_core);
           (void)configure_custom_tcp_bridge(profile);
           const ShardPortRange pr = custom_tcp_shard_port_range(sh, shard_count);
-          tcpdp_set_ephemeral_port_base(pr.lo);
           tcpdp_set_flow_id_base(static_cast<std::uint64_t>(sh + 1) << 40);
-          afpkt_wire_t* wire = nullptr;
-          (void)afpkt_wire_open(wire_cfg.iface.c_str(), pr.lo, pr.hi, &wire);
+          ShardWire wire = open_shard_wire(wire_cfg, dpdk_wire, sh, shard_count, pr);
           std::vector<std::uint8_t> rxbuf(static_cast<std::size_t>(kCustomTcpWireStride) * 256);
           std::vector<std::uint16_t> rxlens(256);
+          std::vector<std::uint8_t> txscratch(static_cast<std::size_t>(kCustomTcpWireStride) * 256);
           auto& local_shard = runtime.local_shards[sh];
           while (true) {
             bool did_work = false;
-            if (wire != nullptr) {
-              did_work |= pump_custom_tcp_shard_wire(
-                  runtime, wire, wire_cfg.dst_mac, rxbuf.data(), rxlens.data(), 256);
-            }
+            did_work |= pump_shard_wire(
+                runtime, wire_cfg, wire, rxbuf.data(), rxlens.data(), 256, txscratch);
             expire_lane_idle_shard(runtime, profile, sh);
             dispatch_pending_h1_requests(sh);
             service_custom_tcp_shard_lanes(runtime, sh);
@@ -6151,7 +6388,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
           g_last_scenario_step_results.clear();
           g_perf_stats = nullptr;
           accumulate_custom_tcp_shard_stats(runtime);
-          afpkt_wire_close(wire);
+          close_shard_wire(wire);
           tcpdp_core_bind_current(nullptr);
           tcpdp_core_destroy(shard_core);
         });
@@ -6159,6 +6396,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       for (auto& w : workers) {
         w.join();
       }
+      close_dpdk_own_wire(dpdk_wire);
     } else if (kernel_threaded) {
       // kernel_socket: shared-nothing per shard, direct epoll (no wire thread).
       for (std::size_t sh = 0; sh < shard_count; ++sh) {
