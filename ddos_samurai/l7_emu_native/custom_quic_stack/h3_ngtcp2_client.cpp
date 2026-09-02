@@ -4092,10 +4092,16 @@ bool run_h3_ngtcp2_client(
   // Threaded fan-out: only the kernel UDP-socket backend is parallelized. It uses a
   // connect()ed socket per attempt, so the kernel assigns a distinct ephemeral src
   // port to each connection (no 4-tuple collision). The native hot-path backends
-  // (af_xdp/af_packet/dpdk) each own a single NIC resource / fixed src port, so they
-  // keep the serial loop (mirrors the L4/L7 single-wire constraint). Each worker owns
-  // its own counters + a TLS session-cache copy seeded from the on-disk blob with the
-  // disk path cleared (0-RTT resumption from the loaded ticket, but no concurrent disk
+  // (af_xdp/af_packet/dpdk) keep the serial loop: af_xdp/dpdk each own a single
+  // exclusive NIC resource (one umem/queue, one port), and while af_packet CAN
+  // fan out per-core in principle (distinct ephemeral src ports via
+  // next_af_packet_src_port + software return-demux, like the L4/L7 custom_tcp
+  // own-wire), its ngtcp2 QUIC datagram drain is not yet reliable enough over a raw
+  // socket to complete H3 request/response end-to-end (a pre-existing data-path
+  // limitation, independent of threading -- see perf-gaps-backlog). Fanning it out
+  // is deferred until that raw-socket I/O path is hardened. Each worker owns its own
+  // counters + a TLS session-cache copy seeded from the on-disk blob with the disk
+  // path cleared (0-RTT resumption from the loaded ticket, but no concurrent disk
   // writes); one freshly captured ticket is persisted once after join.
   const QuicUdpIoBackend requested_backend_kind = resolve_requested_backend(profile);
   const bool quic_threaded =

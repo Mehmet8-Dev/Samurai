@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
@@ -390,6 +391,22 @@ bool build_ipv4_udp_ethernet_frame(
   return true;
 }
 
+// Thread-safe ephemeral src-port allocator for the af_packet QUIC endpoint. Each
+// attempt opens its own raw socket and demuxes returns in software by exact
+// dst-port match (see the recv filter: `udp->dest != ep->src_port_nbo` -> skip),
+// so every *concurrent* attempt MUST get a distinct src port or two connections'
+// responses become ambiguous. std::rand() risked birthday collisions once the
+// fan-out runs attempts in parallel; a monotonic atomic counter over the
+// ephemeral range is collision-free until it wraps (far beyond any load-test
+// connection count) and needs no per-worker plumbing.
+uint16_t next_af_packet_src_port() {
+  static std::atomic<uint32_t> counter{0};
+  constexpr uint16_t kBase = 20000;
+  constexpr uint16_t kSpan = 45000;  // ephemeral range [20000, 65000)
+  const uint32_t n = counter.fetch_add(1, std::memory_order_relaxed);
+  return static_cast<uint16_t>(kBase + static_cast<uint16_t>(n % kSpan));
+}
+
 bool open_af_packet_udp(
     const Profile& profile,
     uint32_t dst_ip_nbo,
@@ -442,6 +459,25 @@ bool open_af_packet_udp(
     return false;
   }
 
+  // Do not capture our own transmitted frames back into RX. Without this a raw
+  // SOCK_RAW socket echoes every datagram we send (all QUIC TX) into its own
+  // receive queue, where the software demux discards them -- but under the
+  // threaded fan-out that self-echo (plus other workers' traffic on the shared
+  // iface) can overflow the receive buffer and drop the actual server response
+  // (notably the larger H3 DATA frames). Mirrors the L4/L7 custom_tcp own-wire.
+#ifdef PACKET_IGNORE_OUTGOING
+  {
+    int ignore_outgoing = 1;
+    (void)::setsockopt(fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore_outgoing, sizeof(ignore_outgoing));
+  }
+#endif
+  // Enlarge the receive buffer so a burst of response datagrams is not dropped
+  // before the drive loop drains it.
+  {
+    int rcvbuf = 4 * 1024 * 1024;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+  }
+
   timeval tv{};
   tv.tv_sec = 0;
   tv.tv_usec = 20000;
@@ -454,8 +490,9 @@ bool open_af_packet_udp(
   out->src_ip_nbo = src_ip_nbo;
   out->dst_ip_nbo = dst_ip_nbo;
   out->dst_port_nbo = htons(dst_port_host);
-  // Ephemeral source port in the user-space range.
-  const uint16_t sport = static_cast<uint16_t>(20000 + (std::rand() % 45000));
+  // Ephemeral source port in the user-space range. Collision-free across
+  // concurrent attempts (required for the threaded af_packet fan-out).
+  const uint16_t sport = next_af_packet_src_port();
   out->src_port_nbo = htons(sport);
   out->ip_id = 1;
   return true;

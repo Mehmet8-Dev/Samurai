@@ -68,12 +68,18 @@ class H3Server(QuicConnectionProtocol):
 
 
 async def main() -> int:
+    # Optional argv: [host [port]]. Defaults to an ephemeral loopback port (the
+    # kernel-socket harness). The af_packet veth harness passes the veth server IP
+    # and a fixed port so the native af_packet QUIC wire can target it.
+    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    port_arg = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+
     cert, key = self_signed()
     config = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
     config.certificate = cert
     config.private_key = key
 
-    server = await serve("127.0.0.1", 0, configuration=config, create_protocol=H3Server)
+    server = await serve(host, port_arg, configuration=config, create_protocol=H3Server)
     # aioquic's serve() returns a QuicServer whose _transport holds the bound socket.
     port = server._transport.get_extra_info("sockname")[1]
     print(f"PORT {port}", flush=True)
