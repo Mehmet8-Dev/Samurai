@@ -125,6 +125,13 @@ void tcpdp_core_destroy(void* handle);
  * shard owns a distinct src-port range (deterministic per-shard RX demux). */
 void tcpdp_set_ephemeral_port_base(uint16_t base);
 
+/* Set the ephemeral src-port stride (default 1) on the calling thread's current
+ * core. With stride s and base b every auto-assigned port stays in one residue
+ * class (port - b) % s == 0; the DPDK own-wire uses s = next_pow2(shards) and
+ * b ≡ shard (mod s) so a single mask rte_flow rule steers return traffic to the
+ * owning shard's queue. Stride 1 preserves the legacy contiguous allocation. */
+void tcpdp_set_ephemeral_port_stride(uint16_t stride);
+
 /* Set the auto-assigned flow-id base on the calling thread's current core.
  * Shared-nothing per-shard cores use disjoint bases so flow ids stay globally
  * unique (collision-free flow_id-keyed lookups across shards). */

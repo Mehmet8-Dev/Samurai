@@ -128,6 +128,13 @@ class TcpDataplaneCore {
   // cores set disjoint bases so each shard owns a distinct src-port range,
   // enabling deterministic per-shard RX demux on the wire.
   void SetEphemeralPortBase(uint16_t base);
+  // Set the stride for auto-assigned ephemeral source ports (default 1). With a
+  // stride s and base b every auto-assigned port satisfies (port - b) % s == 0, so
+  // choosing b ≡ shard (mod s) keeps a shard's ports in one residue class. That
+  // lets a single mask-based rte_flow rule (dst-port & (s-1) == shard) steer a
+  // flow's return traffic to the owning shard's DPDK queue (per-core demux).
+  // Ports wrap back to the base within [base, 65536) to preserve the residue.
+  void SetEphemeralPortStride(uint16_t stride);
   // Set the base for auto-assigned flow ids. Shared-nothing per-shard cores set
   // disjoint bases so flow ids stay globally unique across shards, keeping any
   // flow_id-keyed lookup (e.g. the L7 flow-binding registry) collision-free.
@@ -413,6 +420,8 @@ class TcpDataplaneCore {
   TcpDpConfig config_;
   uint64_t next_flow_id_ = 1;
   uint32_t next_ephemeral_port_ = 40000;
+  uint16_t ephemeral_port_base_ = 40000;
+  uint16_t ephemeral_port_stride_ = 1;
   uint32_t seq_seed_ = 0x10203040U;
   std::array<std::unordered_map<uint64_t, FlowEntry>, kFlowLockShards> flows_by_id_shard_{};
   std::array<std::unordered_map<FlowKey, uint64_t, FlowKeyHash>, kFlowLockShards> flow_index_shard_{};

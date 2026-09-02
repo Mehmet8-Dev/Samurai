@@ -353,6 +353,12 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
 void TcpDataplaneCore::SetEphemeralPortBase(uint16_t base) {
   std::lock_guard<SpinLock> sguard(state_mu_);
   next_ephemeral_port_ = base;
+  ephemeral_port_base_ = base;
+}
+
+void TcpDataplaneCore::SetEphemeralPortStride(uint16_t stride) {
+  std::lock_guard<SpinLock> sguard(state_mu_);
+  ephemeral_port_stride_ = stride == 0 ? 1 : stride;
 }
 
 void TcpDataplaneCore::SetFlowIdBase(uint64_t base) {
@@ -368,7 +374,14 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   uint32_t flow_iss = 0;
   if (src_port == 0) {
     std::lock_guard<SpinLock> sguard(state_mu_);
-    src_port = static_cast<uint16_t>(next_ephemeral_port_++);
+    src_port = static_cast<uint16_t>(next_ephemeral_port_);
+    next_ephemeral_port_ += ephemeral_port_stride_;
+    // Wrap back to the base so a shard's ports stay in one residue class (mask
+    // steering). With stride 1 and base 40000 this preserves the legacy behaviour
+    // (natural uint16 wrap well above the base).
+    if (next_ephemeral_port_ > 65535u) {
+      next_ephemeral_port_ = ephemeral_port_base_;
+    }
   }
   {
     std::lock_guard<SpinLock> sguard(state_mu_);

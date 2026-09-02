@@ -442,6 +442,10 @@ void tcpdp_set_ephemeral_port_base(uint16_t base) {
   ddos_samurai::tcpdp::Core().SetEphemeralPortBase(base);
 }
 
+void tcpdp_set_ephemeral_port_stride(uint16_t stride) {
+  ddos_samurai::tcpdp::Core().SetEphemeralPortStride(stride);
+}
+
 void tcpdp_set_flow_id_base(uint64_t base) {
   ddos_samurai::tcpdp::Core().SetFlowIdBase(base);
 }
