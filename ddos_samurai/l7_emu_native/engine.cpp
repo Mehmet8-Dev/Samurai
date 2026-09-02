@@ -648,6 +648,14 @@ void record_scenario_step_result(
 // custom_tcp flow-binding yardımcıları onu kullandığından ileri bildirim gerekli.
 bool is_custom_tcp_backend(TransportBackend backend);
 
+// custom_tcp/dpdk connections have no real kernel socket; the userspace stack keys
+// everything off custom_flow_id. We still stamp a positive value into conn/ctx.fd
+// so the generic "connected" gates (fd >= 0) pass -- but this sentinel must NEVER
+// be handed to ::close (it aliases the process's stdout). Close sites guard with
+// is_custom_tcp_backend(); this names the value so the intent is obvious at the
+// assignment sites.
+constexpr int kVirtualCustomTcpFd = 1;
+
 // Guards custom_tcp_flow_registry. The registry is a process-global concept (one
 // tcpdp Core per process => one stateful profile at a time), so a namespace-scope
 // lock is safe and keeps NativeRuntime movable. In the threaded custom_tcp driver
@@ -1324,7 +1332,7 @@ int custom_tcp_connect_bridge(Http1Connection& conn, const Profile& profile) {
   conn.custom_send_queued_bytes = 0;
   conn.custom_send_enqueue_count = 0;
   conn.custom_terminal = false;
-  conn.fd = 1;
+  conn.fd = kVirtualCustomTcpFd;
   return conn.fd;
 }
 
@@ -2401,7 +2409,11 @@ bool custom_tcp_use_own_wire(const NativeRuntime& runtime, TransportBackend back
   if (backend != TransportBackend::CustomTcp || runtime.shards.size() <= 1) {
     return false;
   }
-  if (protocol != "http1") {
+  // H1 and H2 both ride the per-shard af_packet wire. (H2 was previously gated out
+  // because multi-shard H2-over-tcpdp looked like a livelock; that was actually the
+  // stdout-close bug masking the result -- the real L4 stall was already fixed by
+  // the sliding-window sender, and H2 multi-shard is verified over the wire.)
+  if (protocol != "http1" && protocol != "http2") {
     return false;
   }
   const char* iface = std::getenv("SAMURAI_CUSTOM_TCP_RX_IFACE");
@@ -3014,10 +3026,14 @@ void destroy_runtime(NativeRuntime& runtime) {
         session->callbacks = nullptr;
       }
       cleanup_tls(session->ctx);
-      if (session->ctx.fd >= 0) {
+      // custom_tcp/dpdk H2 sessions have no real kernel socket; ctx.fd holds a
+      // positive sentinel (1) purely so "connected" gates (fd >= 0) pass. Passing
+      // it to ::close would close the process's stdout, so only a real
+      // kernel-socket fd may be closed here.
+      if (session->ctx.fd >= 0 && !is_custom_tcp_backend(session->ctx.transport_backend)) {
         ::close(session->ctx.fd);
-        session->ctx.fd = -1;
       }
+      session->ctx.fd = -1;
       session->ready = false;
     }
   }
@@ -4296,10 +4312,13 @@ void close_h2_client_session(H2ClientSession& client) {
     client.callbacks = nullptr;
   }
   cleanup_tls(client.ctx);
-  if (client.ctx.fd >= 0) {
+  // Only a real kernel socket may be closed here. custom_tcp/dpdk sessions carry
+  // a positive fd sentinel (1) with no backing socket; closing it would close the
+  // process's stdout (fd 1). See connect path where ctx.fd = 1 is set.
+  if (client.ctx.fd >= 0 && !is_custom_tcp_backend(client.ctx.transport_backend)) {
     ::close(client.ctx.fd);
-    client.ctx.fd = -1;
   }
+  client.ctx.fd = -1;
   client.ctx.active_streams.clear();
   client.ctx.custom_flow_id = 0;
   client.ctx.custom_connect_ready = false;
@@ -4381,7 +4400,7 @@ bool open_h2_client_session(
     client.ctx.custom_connect_ready = false;
     client.ctx.custom_terminal = false;
     client.ctx.tls_handshake_complete = !client.ctx.use_tls;
-    client.ctx.fd = 1;
+    client.ctx.fd = kVirtualCustomTcpFd;
   } else {
     client.ctx.fd = connect_h2_tcp_socket(profile, epoll_fd);
     if (client.ctx.fd < 0) {

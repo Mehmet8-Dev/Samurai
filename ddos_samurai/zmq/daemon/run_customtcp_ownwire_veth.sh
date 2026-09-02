@@ -23,19 +23,27 @@ fi
 TEST_BIN="$(readlink -f "${TEST_BIN}")"
 SCRIPT_PATH="$(readlink -f "$0")"
 
-# The shared-nothing own-wire path is HTTP/1.1 only for now: H2 custom_tcp with
-# more than one shard livelocks over a real wire (a pre-existing tcpdp
-# one-outstanding-segment x nghttp2 multi-frame handshake issue, reproducible on
-# the legacy shared-wire path too; single-shard H2-over-tcpdp works). Skip H2 here
-# rather than run a hanging path.
+# The shared-nothing own-wire path drives both HTTP/1.1 and HTTP/2 per shard. (H2
+# was previously skipped here because multi-shard H2-over-tcpdp appeared to
+# livelock; that was actually the engine closing its own stdout fd -- the result
+# was produced but never printed. The real L4 stall was already fixed by the
+# sliding-window sender, and H2 multi-shard is now verified over the wire.)
+# For H2 we need a real HTTP/2 (h2c) server; locate it relative to this script.
+H2C_SERVER="${H2C_SERVER:-$(dirname "${SCRIPT_PATH}")/../../l7_emu_native/test_h2c_server.py}"
 if [[ "${PROTO}" == "http2" || "${PROTO}" == "h2" ]]; then
-  echo "SKIP: custom_tcp own-wire is HTTP/1.1 only; H2 multi-shard over the wire is not yet supported" >&2
-  exit 0
+  if [[ ! -f "${H2C_SERVER}" ]]; then
+    echo "SKIP: h2c server not found at ${H2C_SERVER}" >&2
+    exit 0
+  fi
+  if ! python3 -c 'import h2' 2>/dev/null; then
+    echo "SKIP: python 'h2' module not installed (needed for the h2c server)" >&2
+    exit 0
+  fi
 fi
 
 # Re-exec inside a fresh user+network namespace (unprivileged).
 if [[ "${OWNWIRE_INNER:-}" != "1" ]]; then
-  exec env OWNWIRE_INNER=1 unshare -r -n -- bash "${SCRIPT_PATH}" "${TEST_BIN}" "${PROTO}"
+  exec env OWNWIRE_INNER=1 H2C_SERVER="${H2C_SERVER}" unshare -r -n -- bash "${SCRIPT_PATH}" "${TEST_BIN}" "${PROTO}"
 fi
 
 SRV_IP="10.77.0.2"
@@ -66,8 +74,14 @@ SRV_MAC="$(ip link show v_srv | awk '/link\/ether/{print $2}')"
 # Server must ARP-resolve our (unowned) src IP -> point it at the capture side.
 ip neigh replace "${SRC_IP}" lladdr "${CLI_MAC}" dev v_srv
 
-# Minimal always-200 HTTP/1.1 server bound to the server IP.
-python3 - "${SRV_IP}" "${PORT}" <<'PY' &
+if [[ "${PROTO}" == "http2" || "${PROTO}" == "h2" ]]; then
+  # Real HTTP/2 cleartext (h2c) server bound to the server IP + fixed port.
+  python3 "${H2C_SERVER}" "${SRV_IP}" "${PORT}" >/dev/null 2>&1 &
+  SRV_PID=$!
+  sleep 0.8
+else
+  # Minimal always-200 HTTP/1.1 server bound to the server IP.
+  python3 - "${SRV_IP}" "${PORT}" <<'PY' &
 import sys, http.server, socketserver
 ip, port = sys.argv[1], int(sys.argv[2])
 class H(http.server.BaseHTTPRequestHandler):
@@ -84,8 +98,9 @@ socketserver.TCPServer.allow_reuse_address = True
 with socketserver.TCPServer((ip, port), H) as s:
     s.serve_forever()
 PY
-SRV_PID=$!
-sleep 0.6
+  SRV_PID=$!
+  sleep 0.6
+fi
 
 export SAMURAI_CUSTOM_TCP_RX_IFACE="v_cli"
 export SAMURAI_CUSTOM_TCP_SRC_IP="${SRC_IP}"
