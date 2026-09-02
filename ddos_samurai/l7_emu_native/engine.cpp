@@ -2558,6 +2558,15 @@ bool custom_tcp_use_own_wire(const NativeRuntime& runtime, TransportBackend back
 // (installed up front by the manager) guarantees a flow's return traffic lands
 // on the owning shard's queue, so the bound core only ever ingests its own flows.
 
+// EAL args for every open_port in this run (must be identical across the manager
+// and all worker handles, else ensure_eal rejects the duplicate init). Software
+// PMD recipe: SAMURAI_DPDK_EAL_ARGS="--no-huge --no-pci -l 0-N" +
+// SAMURAI_DPDK_VDEV=net_af_packet,iface=<veth> (the vdev is appended by dpdk_core).
+std::string dpdk_eal_args_from_env() {
+  const char* a = std::getenv("SAMURAI_DPDK_EAL_ARGS");
+  return (a != nullptr && a[0] != '\0') ? std::string(a) : std::string();
+}
+
 // next power of two minus one (0 for <=1); the ephemeral-port stride mask.
 uint16_t custom_tcp_dpdk_mask(std::size_t shard_count) {
   if (shard_count <= 1) return 0;
@@ -2641,6 +2650,7 @@ DpdkOwnWire open_dpdk_own_wire(const CustomTcpWireConfig& cfg, std::size_t shard
   oc.num_tx_queues = static_cast<uint16_t>(shard_count);
   oc.num_rx_queues = static_cast<uint16_t>(shard_count);
   oc.enable_rss = true;
+  oc.eal_args = dpdk_eal_args_from_env();
   std::string err;
   const long manager = samurai::dpdk::open_port(oc, err);
   if (manager <= 0) {
@@ -2698,6 +2708,7 @@ ShardWire open_shard_wire(const CustomTcpWireConfig& cfg, const DpdkOwnWire& dw,
     oc.num_tx_queues = static_cast<uint16_t>(shard_count);
     oc.num_rx_queues = static_cast<uint16_t>(shard_count);
     oc.enable_rss = true;
+    oc.eal_args = dpdk_eal_args_from_env();
     std::string err;
     w.dpdk_handle = samurai::dpdk::open_port(oc, err);
     w.dpdk_queue = static_cast<uint16_t>(sh);

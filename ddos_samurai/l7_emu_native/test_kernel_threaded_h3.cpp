@@ -48,7 +48,14 @@ Profile MakeProfile(int port, int requests, int conc) {
   profile.protocol = "quic";
   profile.transport_backend = "kernel_socket";
   profile.stateful_runtime_backend = "kernel";  // -> QuicUdpIoBackend::KernelSocket
-  profile.target_ip = "127.0.0.1";
+  // Rig override: the DPDK/af_packet veth recipes point the driver at a non-loopback
+  // server (v_srv) and flip the backend via SAMURAI_STATEFUL_RUNTIME_BACKEND=dpdk
+  // (resolve_requested_backend reads that env first). Defaults keep the loopback
+  // kernel-socket regression unchanged.
+  const char* target_ip_env = std::getenv("H3_TARGET_IP");
+  profile.target_ip = (target_ip_env != nullptr && target_ip_env[0] != '\0')
+                          ? std::string(target_ip_env)
+                          : std::string("127.0.0.1");
   profile.target_port = port;
   profile.scheme = "https";
   profile.host_header = "localhost";  // SNI + :authority

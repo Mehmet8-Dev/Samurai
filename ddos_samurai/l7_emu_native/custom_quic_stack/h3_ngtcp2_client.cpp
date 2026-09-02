@@ -2976,6 +2976,12 @@ uint16_t dpdk_port_id_from_env() {
   return 0;
 }
 
+// EAL args for every open_port in a run (must match across manager + workers).
+std::string dpdk_eal_args_from_env() {
+  const char* a = std::getenv("SAMURAI_DPDK_EAL_ARGS");
+  return (a != nullptr && a[0] != '\0') ? std::string(a) : std::string();
+}
+
 // Ephemeral src port for a DPDK queue. With per-core steering (mask != 0) the low
 // bits encode the queue so return traffic (dst port == our src port) matches the
 // queue's rte_flow rule `port & mask == queue`. Returns host byte order.
@@ -3213,6 +3219,7 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
       cfg.num_tx_queues = 1;
       cfg.num_rx_queues = 1;
       cfg.enable_rss = false;
+      cfg.eal_args = dpdk_eal_args_from_env();
       std::string open_err;
       handle = samurai::dpdk::open_port(cfg, open_err);
       if (handle <= 0) {
@@ -4352,6 +4359,7 @@ bool run_h3_ngtcp2_client(
     mcfg.num_tx_queues = static_cast<uint16_t>(wc);
     mcfg.num_rx_queues = static_cast<uint16_t>(wc);
     mcfg.enable_rss = true;
+    mcfg.eal_args = dpdk_eal_args_from_env();
     std::string merr;
     quic_dpdk_manager = samurai::dpdk::open_port(mcfg, merr);
     if (quic_dpdk_manager > 0) {
@@ -4411,6 +4419,7 @@ bool run_h3_ngtcp2_client(
           wcfg.num_tx_queues = static_cast<uint16_t>(worker_count);
           wcfg.num_rx_queues = static_cast<uint16_t>(worker_count);
           wcfg.enable_rss = true;
+          wcfg.eal_args = dpdk_eal_args_from_env();
           std::string werr;
           worker_dpdk_handle = samurai::dpdk::open_port(wcfg, werr);
           if (worker_dpdk_handle > 0) {
