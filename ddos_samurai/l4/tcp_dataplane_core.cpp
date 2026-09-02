@@ -350,6 +350,16 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
   return updated;
 }
 
+void TcpDataplaneCore::SetEphemeralPortBase(uint16_t base) {
+  std::lock_guard<SpinLock> sguard(state_mu_);
+  next_ephemeral_port_ = base;
+}
+
+void TcpDataplaneCore::SetFlowIdBase(uint64_t base) {
+  std::lock_guard<SpinLock> sguard(state_mu_);
+  next_flow_id_ = base == 0 ? 1 : base;
+}
+
 uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port) {
   if (src_ip == 0 || dst_ip == 0 || dst_port == 0) {
     return 0;

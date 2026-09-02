@@ -101,6 +101,35 @@ int tcpdp_get_flow(uint64_t flow_id, tcpdp_flow_snapshot_t* out_flow);
 int tcpdp_start_rx_handler(const char* iface, int32_t* out_handler_id);
 int tcpdp_stop_rx_handler(int32_t handler_id);
 
+/* Per-thread core binding for shared-nothing per-shard custom_tcp.
+ *
+ * tcpdp_core_create()   allocates a private dataplane core and returns an opaque
+ *                       owning handle (NULL on allocation failure).
+ * tcpdp_core_bind_current(handle)
+ *                       makes `handle` the core targeted by every subsequent
+ *                       tcpdp_* call ON THE CALLING THREAD. Pass NULL to restore
+ *                       the process-global default core for this thread.
+ * tcpdp_core_destroy(handle)
+ *                       frees the core; if it is bound on the calling thread the
+ *                       binding is cleared first.
+ *
+ * Threads that never bind keep using the global default core (unchanged
+ * behaviour). A handle is meant to be created, bound, used, unbound and
+ * destroyed on the same shard thread. */
+void* tcpdp_core_create(void);
+void tcpdp_core_bind_current(void* handle);
+void tcpdp_core_destroy(void* handle);
+
+/* Set the base for auto-assigned ephemeral source ports on the calling thread's
+ * current core. Shared-nothing per-shard custom_tcp uses disjoint bases so each
+ * shard owns a distinct src-port range (deterministic per-shard RX demux). */
+void tcpdp_set_ephemeral_port_base(uint16_t base);
+
+/* Set the auto-assigned flow-id base on the calling thread's current core.
+ * Shared-nothing per-shard cores use disjoint bases so flow ids stay globally
+ * unique (collision-free flow_id-keyed lookups across shards). */
+void tcpdp_set_flow_id_base(uint64_t base);
+
 #ifdef __cplusplus
 }
 #endif

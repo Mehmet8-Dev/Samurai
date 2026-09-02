@@ -25,9 +25,22 @@
 namespace ddos_samurai::tcpdp {
 namespace {
 
-TcpDataplaneCore& Core() {
+// Process-global default core. Preserves the historical singleton behaviour for
+// any thread that has NOT bound a private core (blast/L4 workers, the non-sharded
+// custom_tcp path, the global af_packet wire pump, tests).
+TcpDataplaneCore& DefaultCore() {
   static TcpDataplaneCore* core = new TcpDataplaneCore();
   return *core;
+}
+
+// Per-thread current core. Shared-nothing per-shard custom_tcp binds its own core
+// on the shard thread (tcpdp_core_bind_current); every tcpdp_* call made on that
+// thread then targets the shard's private state machine instead of the global one.
+// nullptr => fall back to DefaultCore() (zero behaviour change when unbound).
+thread_local TcpDataplaneCore* t_current_core = nullptr;
+
+TcpDataplaneCore& Core() {
+  return t_current_core != nullptr ? *t_current_core : DefaultCore();
 }
 
 // ---- af_packet wire pump (commodity-NIC custom_tcp transport) --------------
@@ -392,6 +405,45 @@ int tcpdp_stop_rx_handler(int32_t /*handler_id*/) {
   delete g_wire_pump;
   g_wire_pump = nullptr;
   return 0;
+}
+
+// ---- Per-thread core binding (shared-nothing per-shard custom_tcp) ----------
+//
+// A shard worker creates a private core, binds it on its OWN thread, then runs
+// all of its tcpdp_* interactions (configure/enqueue/poll/collect/peek/consume/
+// ingest) on that thread — so they target the private core with zero cross-shard
+// sharing, no registry, and no single wire poller. Unbinding restores the global
+// default core for the thread. These handles are plain owning pointers to
+// TcpDataplaneCore; the caller owns lifetime (create -> bind -> ... -> unbind ->
+// destroy). Binding a handle only affects the calling thread.
+
+void* tcpdp_core_create(void) {
+  return new ddos_samurai::tcpdp::TcpDataplaneCore();
+}
+
+void tcpdp_core_bind_current(void* handle) {
+  ddos_samurai::tcpdp::t_current_core =
+      static_cast<ddos_samurai::tcpdp::TcpDataplaneCore*>(handle);
+}
+
+void tcpdp_core_destroy(void* handle) {
+  if (handle == nullptr) {
+    return;
+  }
+  auto* core = static_cast<ddos_samurai::tcpdp::TcpDataplaneCore*>(handle);
+  // Never leave a dangling thread-local pointer to a core we are about to free.
+  if (ddos_samurai::tcpdp::t_current_core == core) {
+    ddos_samurai::tcpdp::t_current_core = nullptr;
+  }
+  delete core;
+}
+
+void tcpdp_set_ephemeral_port_base(uint16_t base) {
+  ddos_samurai::tcpdp::Core().SetEphemeralPortBase(base);
+}
+
+void tcpdp_set_flow_id_base(uint64_t base) {
+  ddos_samurai::tcpdp::Core().SetFlowIdBase(base);
 }
 
 }

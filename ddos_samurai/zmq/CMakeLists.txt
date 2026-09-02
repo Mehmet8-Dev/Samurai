@@ -132,6 +132,16 @@ target_include_directories(test_sharded_fastpath PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(test_sharded_fastpath PRIVATE pacing_engine_static samurai_l4 pthread)
 
+# Shared-nothing custom_tcp own-wire (per-shard AF_PACKET) e2e doğrulaması.
+# Namespace+veth harness (run_customtcp_ownwire_veth.sh) ile koşar; env yoksa skip.
+add_executable(test_customtcp_ownwire_l7
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon/test_customtcp_ownwire_l7.cpp)
+target_include_directories(test_customtcp_ownwire_l7 PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib
+  ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../core
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native)
+target_link_libraries(test_customtcp_ownwire_l7 PRIVATE pacing_engine_static samurai_l7emu samurai_core pthread)
+
 # Faz 2: gerçek run_profile_json (dpdk_direct) L7 akışını sürücü üzerinden doğrular.
 add_executable(test_stateful_fastpath_l7
   ${CMAKE_CURRENT_SOURCE_DIR}/daemon/test_stateful_fastpath_l7.cpp

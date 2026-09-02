@@ -123,6 +123,15 @@ class TcpDataplaneCore {
 
   bool Configure(const TcpDpConfig& config);
   uint32_t IngestTxPackets(const uint8_t* packets, size_t packet_size, size_t count);
+  // Set the base for auto-assigned ephemeral source ports (used when
+  // EnqueueConnect is called with src_port == 0). Shared-nothing per-shard
+  // cores set disjoint bases so each shard owns a distinct src-port range,
+  // enabling deterministic per-shard RX demux on the wire.
+  void SetEphemeralPortBase(uint16_t base);
+  // Set the base for auto-assigned flow ids. Shared-nothing per-shard cores set
+  // disjoint bases so flow ids stay globally unique across shards, keeping any
+  // flow_id-keyed lookup (e.g. the L7 flow-binding registry) collision-free.
+  void SetFlowIdBase(uint64_t base);
   uint64_t EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port);
   uint32_t EnqueueSend(uint64_t flow_id, const uint8_t* payload, size_t payload_len);
   uint32_t IngestRxFrame(const uint8_t* frame, size_t frame_len);

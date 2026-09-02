@@ -1,6 +1,7 @@
 #include "engine.hpp"
 #include "custom_quic_stack/quic_stack.hpp"
 #include "../l4/tcp_dataplane_ffi.h"
+#include "../af_packet/af_packet.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -493,6 +494,13 @@ struct NativeRuntime {
 #endif
   };
   std::unordered_map<uint64_t, CustomTcpFlowBinding> custom_tcp_flow_registry{};
+  // Shared-nothing own-wire runs use per-shard private tcpdp cores that are
+  // destroyed inside their worker threads, so the process-global core snapshot is
+  // meaningless. Each own-wire worker folds its core's final stats into this POD
+  // accumulator (guarded by custom_tcp_shard_stats_mu()) before it exits; the
+  // final stats merge reads it instead of the global core. POD => stays movable.
+  bool custom_tcp_own_wire_used{false};
+  tcpdp_stats_snapshot_t custom_tcp_shard_stats{};
   struct LocalShard {
     LocalShard() = default;
     LocalShard(const LocalShard&) = delete;
@@ -648,6 +656,42 @@ bool is_custom_tcp_backend(TransportBackend backend);
 std::mutex& custom_tcp_registry_mu() {
   static std::mutex mu;
   return mu;
+}
+
+// Guards NativeRuntime::custom_tcp_shard_stats accumulation across own-wire shard
+// workers (each folds in its private core's final snapshot before exiting).
+std::mutex& custom_tcp_shard_stats_mu() {
+  static std::mutex mu;
+  return mu;
+}
+
+// Fold the calling thread's bound-core stats into the run's per-shard accumulator.
+// Called by each own-wire worker right before it unbinds/destroys its core.
+void accumulate_custom_tcp_shard_stats(NativeRuntime& runtime) {
+  tcpdp_stats_snapshot_t s{};
+  if (tcpdp_snapshot_stats(&s) != 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lk(custom_tcp_shard_stats_mu());
+  auto& a = runtime.custom_tcp_shard_stats;
+  a.flows_active += s.flows_active;
+  a.connect_attempts += s.connect_attempts;
+  a.connect_established += s.connect_established;
+  a.retransmit_count += s.retransmit_count;
+  a.timeout_close_count += s.timeout_close_count;
+  a.connect_timeout_count += s.connect_timeout_count;
+  a.idle_timeout_count += s.idle_timeout_count;
+  a.retransmit_exhausted_count += s.retransmit_exhausted_count;
+  a.rx_ack_count += s.rx_ack_count;
+  a.dup_ack_count += s.dup_ack_count;
+  a.partial_ack_count += s.partial_ack_count;
+  a.fast_retransmit_count += s.fast_retransmit_count;
+  a.unexpected_ack_count += s.unexpected_ack_count;
+  a.tx_data_bytes += s.tx_data_bytes;
+  a.rx_data_bytes += s.rx_data_bytes;
+  a.peer_rst_count += s.peer_rst_count;
+  a.peer_fin_count += s.peer_fin_count;
+  runtime.custom_tcp_own_wire_used = true;
 }
 
 void unregister_custom_tcp_flow_binding(NativeRuntime& runtime, uint64_t flow_id) {
@@ -2146,56 +2190,22 @@ void service_all_ready_lanes(NativeRuntime& runtime, const Profile& profile, int
   service_custom_tcp_lanes(runtime, profile);
 }
 
-void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
-  // Both CustomTcp (engine owns the wire) and DpdkDirect (an external fast-path
-  // driver owns the NIC) ride the same tcpdp bridge, so both must have their
-  // lanes serviced -- otherwise DpdkDirect never delivers RX payloads/completions.
-  if (!is_custom_tcp_backend(parse_transport_backend(profile))) {
-    return;
-  }
+// Wire-side pump for the CURRENT thread's bound tcpdp core: advance timers, then
+// drain completions and RX payloads and apply each to its owning L1/L2 lane via
+// the flow-binding registry (flow ids are globally unique across shards, so the
+// lookup is collision-free). Touches only the core + the lanes the collected
+// flows belong to. Shared by the single-owner service_custom_tcp_lanes() and by
+// each shared-nothing per-shard worker (which binds its own core first).
+void apply_custom_tcp_core_events(NativeRuntime& runtime) {
   uint32_t actions = 0;
   (void)tcpdp_poll(0, 1024, &actions);
-  tcpdp_completion_t* items = nullptr;
-  uint32_t item_count = 0;
-  if (tcpdp_collect_completions(&items, &item_count) == 0 && items != nullptr) {
-    for (uint32_t idx = 0; idx < item_count; ++idx) {
-      const auto& item = items[idx];
-      NativeRuntime::CustomTcpFlowBinding* binding =
-          find_custom_tcp_flow_binding(runtime, item.flow_id);
-      if (binding == nullptr) {
-        continue;
-      }
-      const bool connect_established =
-          item.event != nullptr && std::strcmp(item.event, "connect_established") == 0;
-      if (binding->kind == ReactorLaneKind::H1 && binding->h1_lane != nullptr &&
-          binding->h1_lane->conn != nullptr) {
-        auto& lane = *binding->h1_lane;
-        auto& conn = *lane.conn;
-        if (connect_established) {
-          conn.custom_connect_ready = true;
-        } else {
-          conn.custom_terminal = true;
-          conn.custom_send_enqueued = false;
-          conn.custom_send_outstanding = 0;
-          lane.phase = H1LanePhase::Failed;
-          unregister_custom_tcp_flow_binding(runtime, item.flow_id);
-        }
-      }
-#ifdef SAMURAI_WITH_NGHTTP2
-      else if (binding->kind == ReactorLaneKind::H2 && binding->h2_session != nullptr) {
-        auto& ctx = binding->h2_session->ctx;
-        if (connect_established) {
-          ctx.custom_connect_ready = true;
-        } else {
-          ctx.custom_terminal = true;
-          ctx.transport_error = 1;
-          unregister_custom_tcp_flow_binding(runtime, item.flow_id);
-        }
-      }
-#endif
-    }
-    tcpdp_free_completions(items, item_count);
-  }
+
+  // RX payloads are drained BEFORE completions on purpose: a graceful close
+  // (peer FIN) is reported as a completion, and a server that sets
+  // "Connection: close" typically emits its last response bytes and the FIN in
+  // the same poll window. Delivering buffered data first guarantees the final
+  // body reaches the lane before the terminal completion tears the binding down
+  // (otherwise the closing response is lost and a completed request looks failed).
   tcpdp_rx_payload_t* payload_items = nullptr;
   uint32_t payload_count = 0;
   if (tcpdp_collect_rx_payloads(&payload_items, &payload_count) == 0 && payload_items != nullptr) {
@@ -2234,6 +2244,178 @@ void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
     }
     tcpdp_free_rx_payloads(payload_items, payload_count);
   }
+
+  tcpdp_completion_t* items = nullptr;
+  uint32_t item_count = 0;
+  if (tcpdp_collect_completions(&items, &item_count) == 0 && items != nullptr) {
+    for (uint32_t idx = 0; idx < item_count; ++idx) {
+      const auto& item = items[idx];
+      NativeRuntime::CustomTcpFlowBinding* binding =
+          find_custom_tcp_flow_binding(runtime, item.flow_id);
+      if (binding == nullptr) {
+        continue;
+      }
+      const bool connect_established =
+          item.event != nullptr && std::strcmp(item.event, "connect_established") == 0;
+      // A completion with success!=0 that is not connect_established is a graceful
+      // peer FIN (EOF): it must NOT force the lane to Failed -- the read step may
+      // still complete a fully-buffered response (or a close-delimited body). Only
+      // an error close (RST, success==0) fails the lane outright.
+      const bool graceful_eof = !connect_established && item.success != 0;
+      if (binding->kind == ReactorLaneKind::H1 && binding->h1_lane != nullptr &&
+          binding->h1_lane->conn != nullptr) {
+        auto& lane = *binding->h1_lane;
+        auto& conn = *lane.conn;
+        if (connect_established) {
+          conn.custom_connect_ready = true;
+        } else {
+          conn.custom_terminal = true;
+          conn.custom_send_enqueued = false;
+          conn.custom_send_outstanding = 0;
+          if (!graceful_eof) {
+            lane.phase = H1LanePhase::Failed;
+          }
+          unregister_custom_tcp_flow_binding(runtime, item.flow_id);
+        }
+      }
+#ifdef SAMURAI_WITH_NGHTTP2
+      else if (binding->kind == ReactorLaneKind::H2 && binding->h2_session != nullptr) {
+        auto& ctx = binding->h2_session->ctx;
+        if (connect_established) {
+          ctx.custom_connect_ready = true;
+        } else {
+          ctx.custom_terminal = true;
+          if (!graceful_eof) {
+            ctx.transport_error = 1;
+          }
+          unregister_custom_tcp_flow_binding(runtime, item.flow_id);
+        }
+      }
+#endif
+    }
+    tcpdp_free_completions(items, item_count);
+  }
+}
+
+// Shared-nothing per-shard wire pump: drives ONE shard's private af_packet wire
+// inline on the shard thread. RX frames -> the bound core; core events -> lanes;
+// the bound core's TX ring -> the wire. No shared wire thread, no TX ring, no
+// inbox routing. Returns true if any RX/TX work happened this pass. kWireStride
+// matches the fast-path frame slot size.
+constexpr std::uint16_t kCustomTcpWireStride = 2048;
+bool pump_custom_tcp_shard_wire(NativeRuntime& runtime, afpkt_wire_t* wire,
+                                const uint8_t dst_mac[6], uint8_t* rxbuf,
+                                uint16_t* rxlens, uint16_t rx_budget) {
+  bool did_work = false;
+  // 1) RX: drain inbound frames (this shard's src-port range only) into the core.
+  const int n = afpkt_wire_recv(wire, rxbuf, kCustomTcpWireStride, rxlens, rx_budget);
+  for (int i = 0; i < n; ++i) {
+    uint32_t updated = 0;
+    (void)tcpdp_ingest_rx_frame(
+        rxbuf + static_cast<std::size_t>(i) * kCustomTcpWireStride,
+        rxlens[static_cast<std::size_t>(i)], &updated);
+  }
+  if (n > 0) did_work = true;
+
+  // 2) Poll + apply completions/RX payloads to this shard's lanes.
+  apply_custom_tcp_core_events(runtime);
+
+  // 3) TX: drain the core's TX ring onto the wire (MAC-completed).
+  for (int guard = 0; guard < 16; ++guard) {
+    const uint8_t* base = nullptr;
+    uint32_t count = 0;
+    size_t psize = 0;
+    size_t stride = 0;
+    if (tcpdp_peek_tx_packets_strided(0, &base, &count, &psize, &stride) != 0) break;
+    if (base == nullptr || count == 0 || psize == 0) break;
+    const int sent = afpkt_wire_send(wire, base, psize, stride, count, dst_mac);
+    if (sent <= 0) {
+      if (sent < 0) {  // fatal: drop this batch so the ring cannot wedge
+        uint32_t consumed = 0;
+        (void)tcpdp_consume_tx_packets(count, &consumed);
+      }
+      break;
+    }
+    uint32_t consumed = 0;
+    (void)tcpdp_consume_tx_packets(static_cast<uint32_t>(sent), &consumed);
+    did_work = true;
+    if (static_cast<uint32_t>(sent) < count) break;  // wire full; retry next pass
+  }
+  return did_work;
+}
+
+// Per-run wire config for the shared-nothing custom_tcp own-wire path: the NIC to
+// bind and the destination MAC stamped on TX frames (explicit env, else broadcast
+// for same-segment lab use -- matching the legacy FFI wire pump). have_iface is
+// false when no interface is configured, in which case the own-wire path is
+// unavailable and the caller keeps the legacy shared-wire behaviour.
+struct CustomTcpWireConfig {
+  std::string iface;
+  uint8_t dst_mac[6];
+  bool have_iface{false};
+};
+
+CustomTcpWireConfig resolve_custom_tcp_wire_config() {
+  CustomTcpWireConfig c;
+  std::memset(c.dst_mac, 0xff, sizeof(c.dst_mac));
+  const char* iface = std::getenv("SAMURAI_CUSTOM_TCP_RX_IFACE");
+  if (iface != nullptr && iface[0] != '\0') {
+    c.iface = iface;
+    c.have_iface = true;
+  }
+  const char* m = std::getenv("SAMURAI_CUSTOM_TCP_DST_MAC");
+  unsigned int b[6];
+  if (m != nullptr &&
+      std::sscanf(m, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+    for (int i = 0; i < 6; ++i) c.dst_mac[i] = static_cast<uint8_t>(b[i] & 0xffu);
+  }
+  return c;
+}
+
+// Disjoint ephemeral src-port range owned by shard `sh` of `n`. Bases start at
+// 40000 and split the 40000..65535 space evenly; each shard's af_packet wire BPF
+// filter accepts exactly this range, so a flow's return traffic lands only on the
+// shard that opened it (deterministic demux, no RSS/fanout hashing).
+struct ShardPortRange { std::uint16_t lo; std::uint16_t hi; };
+ShardPortRange custom_tcp_shard_port_range(std::size_t sh, std::size_t n) {
+  if (n == 0) n = 1;
+  const std::uint32_t span = static_cast<std::uint32_t>((65535u - 40000u) / n);
+  const std::uint32_t lo = 40000u + static_cast<std::uint32_t>(sh) * span;
+  std::uint32_t hi = lo + span - 1u;
+  if (hi > 65535u || sh + 1 == n) hi = 65535u;  // last shard soaks the remainder
+  ShardPortRange r;
+  r.lo = static_cast<std::uint16_t>(lo);
+  r.hi = static_cast<std::uint16_t>(hi);
+  return r;
+}
+
+// True when the custom_tcp run should use the shared-nothing own-wire path: a
+// CustomTcp backend, HTTP/1.1, more than one shard, and a NIC configured.
+// DpdkDirect (external fast-path driver owns the NIC) and single-shard runs never
+// qualify. H2 is intentionally excluded for now: its multi-frame handshake over
+// tcpdp's one-outstanding-segment model livelocks on the inline per-shard pump
+// (single-shard H2-over-tcpdp works, so this is a per-shard H2 driver bug, not a
+// transport limit); H2 custom_tcp keeps the legacy shared-wire pump until fixed.
+bool custom_tcp_use_own_wire(const NativeRuntime& runtime, TransportBackend backend,
+                             const std::string& protocol) {
+  if (backend != TransportBackend::CustomTcp || runtime.shards.size() <= 1) {
+    return false;
+  }
+  if (protocol != "http1") {
+    return false;
+  }
+  const char* iface = std::getenv("SAMURAI_CUSTOM_TCP_RX_IFACE");
+  return iface != nullptr && iface[0] != '\0';
+}
+
+void service_custom_tcp_lanes(NativeRuntime& runtime, const Profile& profile) {
+  // Both CustomTcp (engine owns the wire) and DpdkDirect (an external fast-path
+  // driver owns the NIC) ride the same tcpdp bridge, so both must have their
+  // lanes serviced -- otherwise DpdkDirect never delivers RX payloads/completions.
+  if (!is_custom_tcp_backend(parse_transport_backend(profile))) {
+    return;
+  }
+  apply_custom_tcp_core_events(runtime);
 
   // CustomTcp (engine owns wire) and DpdkDirect (external fast-path driver owns the
   // NIC) share the tcpdp bridge; both must run the H1 write/read scan per shard,
@@ -2672,7 +2854,7 @@ const std::string& build_h2_preface_and_settings() {
 }
 
 bool configure_custom_tcp_bridge(const Profile& profile);
-void merge_custom_tcp_stats(std::map<std::string, double>& out);
+void merge_custom_tcp_stats(const NativeRuntime& runtime, std::map<std::string, double>& out);
 
 bool configure_custom_tcp_bridge(const Profile& profile) {
   auto env_u32 = [](const char* name, uint32_t fallback) -> uint32_t {
@@ -2721,9 +2903,13 @@ int32_t maybe_start_custom_tcp_rx_bridge() {
   return handler_id;
 }
 
-void merge_custom_tcp_stats(std::map<std::string, double>& out) {
+void merge_custom_tcp_stats(const NativeRuntime& runtime, std::map<std::string, double>& out) {
   tcpdp_stats_snapshot_t stats{};
-  if (tcpdp_snapshot_stats(&stats) != 0) {
+  if (runtime.custom_tcp_own_wire_used) {
+    // Shared-nothing own-wire: the process-global core was never driven; use the
+    // stats accumulated from the per-shard private cores instead.
+    stats = runtime.custom_tcp_shard_stats;
+  } else if (tcpdp_snapshot_stats(&stats) != 0) {
     return;
   }
   out["tcp_flows_active"] = static_cast<double>(stats.flows_active);
@@ -4559,7 +4745,11 @@ std::map<std::string, double> run_http2_profile(
       out["runtime_failure_reason_code"] =
           runtime_failure_reason_code("custom_tcp_transport_not_yet_wired");
     }
-    runtime.custom_tcp_rx_handler_id = maybe_start_custom_tcp_rx_bridge();
+    // Shared-nothing own-wire path opens a per-shard af_packet socket inside each
+    // worker; the process-global RX pump would only duplicate that capture onto
+    // the default (then unused) core, so it is skipped when own-wire is active.
+    runtime.custom_tcp_rx_handler_id =
+        custom_tcp_use_own_wire(runtime, transport_backend, profile.protocol) ? 0 : maybe_start_custom_tcp_rx_bridge();
     out["runtime_transport_custom_tcp_rx_bridge_active"] =
         runtime.custom_tcp_rx_handler_id > 0 ? 1.0 : 0.0;
   }
@@ -4788,6 +4978,12 @@ std::map<std::string, double> run_http2_profile(
       is_custom_tcp_backend(transport_backend) && runtime.shards.size() > 1;
   const bool kernel_threaded =
       transport_backend == TransportBackend::KernelSocket && runtime.shards.size() > 1;
+  // Shared-nothing own-wire: each shard owns a private tcpdp core + af_packet
+  // socket (no shared wire thread/registry/inbox). DpdkDirect keeps the legacy
+  // shared-wire pump (its NIC is driven by an external fast-path driver).
+  const bool own_wire_threaded = custom_tcp_use_own_wire(runtime, transport_backend, profile.protocol);
+  const CustomTcpWireConfig wire_cfg =
+      own_wire_threaded ? resolve_custom_tcp_wire_config() : CustomTcpWireConfig{};
   const bool threaded = custom_tcp_threaded || kernel_threaded;
   if (threaded) {
     const std::size_t shard_count = runtime.shards.size();
@@ -4799,7 +4995,76 @@ std::map<std::string, double> run_http2_profile(
     std::vector<std::thread> workers;
     workers.reserve(shard_count);
 
-    if (kernel_threaded) {
+    if (own_wire_threaded) {
+      // custom_tcp shared-nothing: per shard, a private core + own af_packet wire,
+      // driven inline (RX->core, core events->sessions, core TX ring->wire). No
+      // shared wire thread, no flow-registry routing, no inbox.
+      for (std::size_t sh = 0; sh < shard_count; ++sh) {
+        workers.emplace_back([&, sh]() {
+          g_perf_stats = &shard_perf[sh];
+          void* shard_core = tcpdp_core_create();
+          tcpdp_core_bind_current(shard_core);
+          (void)configure_custom_tcp_bridge(profile);
+          const ShardPortRange pr = custom_tcp_shard_port_range(sh, shard_count);
+          tcpdp_set_ephemeral_port_base(pr.lo);
+          tcpdp_set_flow_id_base(static_cast<std::uint64_t>(sh + 1) << 40);
+          afpkt_wire_t* wire = nullptr;
+          (void)afpkt_wire_open(wire_cfg.iface.c_str(), pr.lo, pr.hi, &wire);
+          std::vector<std::uint8_t> rxbuf(static_cast<std::size_t>(kCustomTcpWireStride) * 256);
+          std::vector<std::uint16_t> rxlens(256);
+          auto& local_shard = runtime.local_shards[sh];
+          auto& st = shard_stats[sh];
+          auto& shard_captures = captures_by_shard[sh];
+          while (true) {
+            bool did_work = false;
+            if (wire != nullptr) {
+              did_work |= pump_custom_tcp_shard_wire(
+                  runtime, wire, wire_cfg.dst_mac, rxbuf.data(), rxlens.data(), 256);
+            }
+            expire_lane_idle_shard(runtime, profile, sh);
+            dispatch_pending_h2_requests(st, shard_captures, sh);
+            service_custom_tcp_h2_shard_sessions(runtime, profile, sh);
+            collect_shard_h2_stats(st, sh);
+            while (true) {
+              auto ready = pop_ready_completion(runtime, sh);
+              if (!ready.has_value()) {
+                break;
+              }
+              if (ready->kind == CompletionKind::H2 && ready->h2_completed.has_value()) {
+                finalize_h2_stream(st, *ready->h2_completed);
+              }
+              did_work = true;
+            }
+            bool has_inflight = false;
+            for (const auto& session_ptr : local_shard.h2_sessions) {
+              if (session_ptr &&
+                  (!session_ptr->pending_requests.empty() ||
+                   !session_ptr->ctx.active_streams.empty())) {
+                has_inflight = true;
+                break;
+              }
+            }
+            if (!has_inflight && local_shard.pending_h2_requests.empty() && !did_work) {
+              break;
+            }
+            if (!did_work) {
+              std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+          }
+          collect_shard_h2_stats(st, sh);
+          shard_steps[sh] = std::move(g_last_scenario_step_results);
+          g_last_scenario_step_results.clear();
+          g_perf_stats = nullptr;
+          accumulate_custom_tcp_shard_stats(runtime);
+          afpkt_wire_close(wire);
+          tcpdp_core_bind_current(nullptr);
+          tcpdp_core_destroy(shard_core);
+        });
+      }
+      for (auto& w : workers) {
+        w.join();
+      }
+    } else if (kernel_threaded) {
       // kernel_socket: shared-nothing per shard, direct epoll (no wire thread).
       for (std::size_t sh = 0; sh < shard_count; ++sh) {
         workers.emplace_back([&, sh]() {
@@ -5097,7 +5362,7 @@ std::map<std::string, double> run_http2_profile(
 
   collect_all_h2_stats(stats);
   if (is_custom_tcp_backend(transport_backend)) {
-    merge_custom_tcp_stats(out);
+    merge_custom_tcp_stats(runtime, out);
   }
 
   stats.errors += std::max(0, stats.attempted - stats.sent - stats.errors);
@@ -5390,7 +5655,11 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
   g_perf_stats = &runtime.perf;
   out["runtime_shards"] = static_cast<double>(runtime.shards.size());
   if (transport_backend == TransportBackend::CustomTcp) {
-    runtime.custom_tcp_rx_handler_id = maybe_start_custom_tcp_rx_bridge();
+    // Shared-nothing own-wire path opens a per-shard af_packet socket inside each
+    // worker; the process-global RX pump would only duplicate that capture onto
+    // the default (then unused) core, so it is skipped when own-wire is active.
+    runtime.custom_tcp_rx_handler_id =
+        custom_tcp_use_own_wire(runtime, transport_backend, profile.protocol) ? 0 : maybe_start_custom_tcp_rx_bridge();
     out["runtime_transport_custom_tcp_rx_bridge_active"] =
         runtime.custom_tcp_rx_handler_id > 0 ? 1.0 : 0.0;
   }
@@ -5696,6 +5965,12 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       is_custom_tcp_backend(transport_backend) && runtime.shards.size() > 1;
   const bool kernel_threaded =
       transport_backend == TransportBackend::KernelSocket && runtime.shards.size() > 1;
+  // Shared-nothing own-wire: each shard owns a private tcpdp core + af_packet
+  // socket (no shared wire thread/registry/inbox). DpdkDirect keeps the legacy
+  // shared-wire pump (its NIC is driven by an external fast-path driver).
+  const bool own_wire_threaded = custom_tcp_use_own_wire(runtime, transport_backend, profile.protocol);
+  const CustomTcpWireConfig wire_cfg =
+      own_wire_threaded ? resolve_custom_tcp_wire_config() : CustomTcpWireConfig{};
   const bool threaded = custom_tcp_threaded || kernel_threaded;
   if (threaded) {
     const std::size_t shard_count = runtime.shards.size();
@@ -5705,7 +5980,69 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
     std::vector<std::thread> workers;
     workers.reserve(shard_count);
 
-    if (kernel_threaded) {
+    if (own_wire_threaded) {
+      // custom_tcp shared-nothing: per shard, a private core + own af_packet wire,
+      // driven inline (RX->core, core events->lanes, core TX ring->wire). No shared
+      // wire thread, no flow-registry routing, no inbox.
+      for (std::size_t sh = 0; sh < shard_count; ++sh) {
+        workers.emplace_back([&, sh]() {
+          g_perf_stats = &shard_perf[sh];
+          void* shard_core = tcpdp_core_create();
+          tcpdp_core_bind_current(shard_core);
+          (void)configure_custom_tcp_bridge(profile);
+          const ShardPortRange pr = custom_tcp_shard_port_range(sh, shard_count);
+          tcpdp_set_ephemeral_port_base(pr.lo);
+          tcpdp_set_flow_id_base(static_cast<std::uint64_t>(sh + 1) << 40);
+          afpkt_wire_t* wire = nullptr;
+          (void)afpkt_wire_open(wire_cfg.iface.c_str(), pr.lo, pr.hi, &wire);
+          std::vector<std::uint8_t> rxbuf(static_cast<std::size_t>(kCustomTcpWireStride) * 256);
+          std::vector<std::uint16_t> rxlens(256);
+          auto& local_shard = runtime.local_shards[sh];
+          while (true) {
+            bool did_work = false;
+            if (wire != nullptr) {
+              did_work |= pump_custom_tcp_shard_wire(
+                  runtime, wire, wire_cfg.dst_mac, rxbuf.data(), rxlens.data(), 256);
+            }
+            expire_lane_idle_shard(runtime, profile, sh);
+            dispatch_pending_h1_requests(sh);
+            service_custom_tcp_shard_lanes(runtime, sh);
+            while (true) {
+              auto ready = pop_ready_completion(runtime, sh);
+              if (!ready.has_value()) {
+                break;
+              }
+              finalize_completion(std::move(*ready));
+              did_work = true;
+            }
+            bool has_inflight = false;
+            for (const auto& lane_ptr : local_shard.h1_lanes) {
+              if (lane_ptr && (lane_ptr->phase == H1LanePhase::Writing ||
+                               lane_ptr->phase == H1LanePhase::Reading)) {
+                has_inflight = true;
+                break;
+              }
+            }
+            if (!has_inflight && local_shard.pending_h1_requests.empty() && !did_work) {
+              break;
+            }
+            if (!did_work) {
+              std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+          }
+          shard_steps[sh] = std::move(g_last_scenario_step_results);
+          g_last_scenario_step_results.clear();
+          g_perf_stats = nullptr;
+          accumulate_custom_tcp_shard_stats(runtime);
+          afpkt_wire_close(wire);
+          tcpdp_core_bind_current(nullptr);
+          tcpdp_core_destroy(shard_core);
+        });
+      }
+      for (auto& w : workers) {
+        w.join();
+      }
+    } else if (kernel_threaded) {
       // kernel_socket: shared-nothing per shard, direct epoll (no wire thread).
       for (std::size_t sh = 0; sh < shard_count; ++sh) {
         workers.emplace_back([&, sh]() {
@@ -6029,7 +6366,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
   out["status_5xx"] = static_cast<double>(status_5xx);
   out["l7_flow_completed"] = static_cast<double>(sent);
   if (transport_backend == TransportBackend::CustomTcp) {
-    merge_custom_tcp_stats(out);
+    merge_custom_tcp_stats(runtime, out);
   }
   out["l7_conn_attempted"] = static_cast<double>(conn_attempted);
   out["l7_conn_established"] = static_cast<double>(conn_established);

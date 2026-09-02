@@ -84,6 +84,43 @@ int afpkt_start_rx_pump(const char* iface, afpkt_rx_frame_cb cb, void* user);
 void afpkt_stop_rx_handler(void);
 
 /* ------------------------------------------------------------------ */
+/* Per-shard AF_PACKET wire (shared-nothing custom_tcp)                */
+/* ------------------------------------------------------------------ */
+
+/* A per-shard AF_PACKET wire. Each shard opens its OWN socket bound to `iface`
+ * and drives RX/TX inline on its own thread — no shared RX pump thread, no
+ * shared TX ring, no cross-shard state. RX is filtered by a classic BPF program
+ * to inbound IPv4/TCP frames whose TCP destination port (i.e. OUR ephemeral
+ * source port) lies in [src_port_lo, src_port_hi]. When shards use disjoint
+ * port ranges each inbound frame is accepted by exactly one shard's socket, so
+ * every flow's return traffic lands on the shard that opened it — deterministic
+ * demux without RSS/fanout hashing. Requires CAP_NET_RAW. */
+typedef struct afpkt_wire afpkt_wire_t;
+
+/* Open a wire on `iface`, filtered to TCP dst-port range [lo, hi] (inclusive).
+ * The socket is non-blocking and ignores outgoing frames. The interface source
+ * MAC is resolved and used to complete TX frames. Returns 0 and sets *out_wire
+ * on success; -1 on failure (*out_wire left NULL). */
+int afpkt_wire_open(const char* iface, uint16_t src_port_lo, uint16_t src_port_hi,
+                    afpkt_wire_t** out_wire);
+
+/* Non-blocking drain of up to `max` inbound frames into `out_frames` (a
+ * max*stride byte buffer), writing each frame's length to out_lens[i]. Returns
+ * the number of frames read (>=0, 0 when idle) or -1 on a fatal error. */
+int afpkt_wire_recv(afpkt_wire_t* wire, uint8_t* out_frames, uint16_t stride,
+                    uint16_t* out_lens, uint16_t max);
+
+/* Transmit `count` L2 frames laid out at `base` with `stride` bytes between
+ * frames (each `packet_size` bytes). The (dst,src) Ethernet MACs are completed
+ * from `dst_mac` and the wire's resolved source MAC. Returns the number of
+ * frames sent (>=0) or -1 on a fatal error. */
+int afpkt_wire_send(afpkt_wire_t* wire, const uint8_t* base, size_t packet_size,
+                    size_t stride, uint32_t count, const uint8_t dst_mac[6]);
+
+/* Close the wire and free all resources. Safe on NULL. */
+void afpkt_wire_close(afpkt_wire_t* wire);
+
+/* ------------------------------------------------------------------ */
 /* Transmit                                                            */
 /* ------------------------------------------------------------------ */
 

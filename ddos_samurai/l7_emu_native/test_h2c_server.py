@@ -54,9 +54,14 @@ def handle(conn: socket.socket) -> None:
 
 
 def main() -> int:
+    # Optional argv: [host [port]]. Defaults to an ephemeral loopback port (the
+    # kernel-threaded harness). The custom_tcp own-wire veth harness passes the
+    # veth server IP and a fixed port so the userspace stack can target it.
+    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", 0))
+    srv.bind((host, port))
     srv.listen(128)
     port = srv.getsockname()[1]
     print(f"PORT {port}", flush=True)

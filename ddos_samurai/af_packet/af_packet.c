@@ -24,6 +24,8 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <linux/if_packet.h>
+#include <linux/if_ether.h>
+#include <linux/filter.h>
 #include <net/ethernet.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -1685,4 +1687,155 @@ void afpkt_stop_rx_handler(void) {
         pthread_join(g_rx_thread, NULL);
         g_rx_thread_valid = 0;
     }
+}
+
+/* ================================================================== */
+/* Per-shard AF_PACKET wire (shared-nothing custom_tcp)                */
+/* ================================================================== */
+
+struct afpkt_wire {
+    int sock;                       /* AF_PACKET SOCK_RAW, non-blocking */
+    int ifindex;
+    uint8_t src_mac[6];             /* resolved interface MAC (TX source) */
+    uint8_t scratch[2048];          /* per-frame TX assembly (MAC completion) */
+};
+
+/* Resolve the hardware MAC of `iface` into out[6]. Returns 0 on success. */
+static int wire_resolve_iface_mac(const char* iface, uint8_t out[6]) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+    int rc = ioctl(fd, SIOCGIFHWADDR, &ifr);
+    if (rc == 0) memcpy(out, ifr.ifr_hwaddr.sa_data, 6);
+    close(fd);
+    return rc == 0 ? 0 : -1;
+}
+
+/* Attach a classic-BPF filter accepting only inbound IPv4/TCP frames whose TCP
+ * destination port (our ephemeral source port) is in [lo, hi]. Ethernet II
+ * (no VLAN); VLAN-tagged frames are dropped, which is fine for the lab wire. */
+static int wire_attach_port_filter(int sock, uint16_t lo, uint16_t hi) {
+    struct sock_filter code[] = {
+        { BPF_LD  | BPF_H | BPF_ABS, 0, 0, 12 },        /* A = ethertype       */
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 7, ETH_P_IP },  /* IPv4? else -> DROP   */
+        { BPF_LD  | BPF_B | BPF_ABS, 0, 0, 23 },        /* A = IP protocol      */
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 5, IPPROTO_TCP },/* TCP? else -> DROP   */
+        { BPF_LDX | BPF_B | BPF_MSH, 0, 0, 14 },        /* X = IP header length */
+        { BPF_LD  | BPF_H | BPF_IND, 0, 0, 16 },        /* A = TCP dst port     */
+        { BPF_JMP | BPF_JGE | BPF_K, 0, 2, lo },        /* A >= lo? else -> DROP*/
+        { BPF_JMP | BPF_JGT | BPF_K, 1, 0, hi },        /* A > hi? -> DROP      */
+        { BPF_RET | BPF_K,           0, 0, 0x40000 },   /* ACCEPT (whole frame) */
+        { BPF_RET | BPF_K,           0, 0, 0 },         /* DROP                 */
+    };
+    struct sock_fprog prog;
+    prog.len = (unsigned short)(sizeof(code) / sizeof(code[0]));
+    prog.filter = code;
+    return setsockopt(sock, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog));
+}
+
+int afpkt_wire_open(const char* iface, uint16_t src_port_lo, uint16_t src_port_hi,
+                    afpkt_wire_t** out_wire) {
+    if (out_wire) *out_wire = NULL;
+    if (!iface || !iface[0] || !out_wire || src_port_lo > src_port_hi) return -1;
+
+    int ifindex = (int)if_nametoindex(iface);
+    if (ifindex == 0) return -1;
+
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sock < 0) return -1;
+
+    /* Do not receive our own transmitted frames back into the RX path. */
+    int ignore_outgoing = 1;
+    (void)setsockopt(sock, SOL_PACKET, PACKET_IGNORE_OUTGOING,
+                     &ignore_outgoing, sizeof(ignore_outgoing));
+
+    if (wire_attach_port_filter(sock, src_port_lo, src_port_hi) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_ALL);
+    sll.sll_ifindex = ifindex;
+    if (bind(sock, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    afpkt_wire_t* w = (afpkt_wire_t*)calloc(1, sizeof(afpkt_wire_t));
+    if (!w) {
+        close(sock);
+        return -1;
+    }
+    w->sock = sock;
+    w->ifindex = ifindex;
+    if (wire_resolve_iface_mac(iface, w->src_mac) != 0) {
+        memset(w->src_mac, 0, 6);  /* best effort; kernel may still source it */
+    }
+    *out_wire = w;
+    return 0;
+}
+
+int afpkt_wire_recv(afpkt_wire_t* wire, uint8_t* out_frames, uint16_t stride,
+                    uint16_t* out_lens, uint16_t max) {
+    if (!wire || !out_frames || !out_lens || stride == 0 || max == 0) return -1;
+    int n = 0;
+    while (n < (int)max) {
+        ssize_t r = recv(wire->sock, out_frames + (size_t)n * stride, stride, MSG_DONTWAIT);
+        if (r > 0) {
+            out_lens[n] = (uint16_t)(r > stride ? stride : r);
+            ++n;
+            continue;
+        }
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;  /* drained */
+        if (r < 0 && errno == EINTR) continue;
+        break;  /* r == 0 or fatal: stop this burst */
+    }
+    return n;
+}
+
+int afpkt_wire_send(afpkt_wire_t* wire, const uint8_t* base, size_t packet_size,
+                    size_t stride, uint32_t count, const uint8_t dst_mac[6]) {
+    if (!wire || !base || packet_size < 14 || stride == 0) return -1;
+    if (packet_size > sizeof(wire->scratch)) return -1;
+
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_IP);
+    sll.sll_ifindex = wire->ifindex;
+    sll.sll_halen = 6;
+    if (dst_mac) memcpy(sll.sll_addr, dst_mac, 6);
+
+    int sent = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        memcpy(wire->scratch, base + (size_t)i * stride, packet_size);
+        if (dst_mac) memcpy(wire->scratch, dst_mac, 6);      /* dst MAC */
+        memcpy(wire->scratch + 6, wire->src_mac, 6);         /* src MAC */
+        ssize_t w = sendto(wire->sock, wire->scratch, packet_size, 0,
+                           (struct sockaddr*)&sll, sizeof(sll));
+        if (w < 0) {
+            if (errno == EINTR) { --i; continue; }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;  /* TX full */
+            break;
+        }
+        ++sent;
+    }
+    return sent;
+}
+
+void afpkt_wire_close(afpkt_wire_t* wire) {
+    if (!wire) return;
+    if (wire->sock >= 0) close(wire->sock);
+    free(wire);
 }
