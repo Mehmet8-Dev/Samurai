@@ -657,6 +657,41 @@ bool is_custom_tcp_backend(TransportBackend backend);
 // assignment sites.
 constexpr int kVirtualCustomTcpFd = 1;
 
+// Adaptive idle backoff for the *polling* shard workers (own_wire + legacy wire
+// pump). A fixed 50us sleep on every idle pass adds a latency floor between
+// bursts and wakes needlessly when deeply idle. Instead escalate per-thread: a
+// short spin phase (near-zero reaction when work is imminent), then yield, then a
+// capped growing sleep (fewer wakeups when genuinely idle). Each worker is one
+// thread, so a thread_local pass counter tracks per-worker idleness with no extra
+// per-loop state. NOTE: the kernel_threaded workers are deliberately NOT routed
+// here -- they already block in epoll_wait, so spinning would only waste CPU.
+inline void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__)
+  __asm__ __volatile__("yield" ::: "memory");
+#else
+  std::this_thread::yield();
+#endif
+}
+
+thread_local int g_worker_idle_passes = 0;
+
+inline void worker_idle_reset() { g_worker_idle_passes = 0; }
+
+inline void worker_idle_backoff() {
+  const int n = g_worker_idle_passes++;
+  if (n < 64) {
+    cpu_relax();                 // hot: sub-microsecond, react instantly
+  } else if (n < 128) {
+    std::this_thread::yield();   // warm: cede to any colocated thread
+  } else {
+    // cold: grow 10us -> 200us cap so a long-idle worker stops busy-waking.
+    const int us = std::min(200, 10 + (n - 128));
+    std::this_thread::sleep_for(std::chrono::microseconds(us));
+  }
+}
+
 // Guards custom_tcp_flow_registry. The registry is a process-global concept (one
 // tcpdp Core per process => one stateful profile at a time), so a namespace-scope
 // lock is safe and keeps NativeRuntime movable. In the threaded custom_tcp driver
@@ -2592,7 +2627,9 @@ void custom_tcp_wire_pump(
       tcpdp_free_rx_payloads(pitems, pcount);
     }
     if (!did) {
-      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      worker_idle_backoff();
+    } else {
+      worker_idle_reset();
     }
   }
 }
@@ -5104,7 +5141,9 @@ std::map<std::string, double> run_http2_profile(
               break;
             }
             if (!did_work) {
-              std::this_thread::sleep_for(std::chrono::microseconds(50));
+              worker_idle_backoff();
+            } else {
+              worker_idle_reset();
             }
           }
           collect_shard_h2_stats(st, sh);
@@ -5264,7 +5303,9 @@ std::map<std::string, double> run_http2_profile(
             break;
           }
           if (!did_work) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            worker_idle_backoff();
+          } else {
+            worker_idle_reset();
           }
         }
         collect_shard_h2_stats(st, sh);
@@ -6086,7 +6127,9 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
               break;
             }
             if (!did_work) {
-              std::this_thread::sleep_for(std::chrono::microseconds(50));
+              worker_idle_backoff();
+            } else {
+              worker_idle_reset();
             }
           }
           shard_steps[sh] = std::move(g_last_scenario_step_results);
@@ -6266,7 +6309,9 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
             break;
           }
           if (!did_work) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            worker_idle_backoff();
+          } else {
+            worker_idle_reset();
           }
         }
         shard_steps[sh] = std::move(g_last_scenario_step_results);
