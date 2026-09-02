@@ -32,7 +32,10 @@ constexpr size_t kSndBufCompactThreshold = 64u * 1024u;  // compact once head pa
 constexpr uint32_t kMaxCwnd = 16u * 1024u * 1024u;       // cwnd ceiling (bytes)
 constexpr uint32_t kMinRtoMs = 50u;                      // RTO floor (LAN-oriented load generator)
 constexpr uint8_t kOptEnd = 0, kOptNop = 1, kOptMss = 2, kOptWScale = 3, kOptSackPerm = 4, kOptSack = 5;
+constexpr uint8_t kOptTimestamp = 8;                    // RFC 7323 timestamp option kind
 constexpr uint8_t kSynWScale = 7;                        // window scale shift we advertise
+constexpr uint32_t kDupThresh = 3;                       // RFC 6675 duplicate ACK / SACK threshold
+constexpr size_t kTsOptLen = 12;                         // 2 NOP + kind(1)+len(1)+TSval(4)+TSecr(4)
 
 // RFC 1982 serial-number comparison for 32-bit TCP sequence space.
 inline bool SeqLt(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) < 0; }
@@ -120,6 +123,22 @@ uint32_t env_u32_bounded(const char* name, uint32_t fallback, uint32_t min_value
   }
   return static_cast<uint32_t>(parsed);
 }
+
+// Env override for a bool toggle: "1"/"true"/"on"/"yes" -> true, "0"/"false"/
+// "off"/"no" -> false, unset/unrecognised -> fallback.
+bool env_bool(const char* name, bool fallback) {
+  const char* raw = name ? std::getenv(name) : nullptr;
+  if (raw == nullptr || raw[0] == '\0') {
+    return fallback;
+  }
+  if (raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' || raw[0] == 'y' || raw[0] == 'Y' ||
+      raw[0] == 'o' || raw[0] == 'O') {
+    // "on"/"off" both start with 'o' -> disambiguate.
+    if ((raw[0] == 'o' || raw[0] == 'O') && (raw[1] == 'f' || raw[1] == 'F')) return false;
+    return true;
+  }
+  return false;
+}
 }  // namespace
 
 TcpDataplaneCore::TcpDataplaneCore() {
@@ -154,6 +173,12 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   std::lock_guard<SpinLock> sguard(state_mu_);
   std::lock_guard<SpinLock> qguard(tx_mu_);
   config_ = config;
+  // TCP maturity toggles: env overrides the config default (RFC6675 on, the three
+  // behaviour-changing ones off) so operators can flip them without a rebuild.
+  config_.enable_rfc6675_recovery = env_bool("SAMURAI_TCPDP_RFC6675", config_.enable_rfc6675_recovery);
+  config_.enable_delayed_ack = env_bool("SAMURAI_TCPDP_DELAYED_ACK", config_.enable_delayed_ack);
+  config_.enable_nagle = env_bool("SAMURAI_TCPDP_NAGLE", config_.enable_nagle);
+  config_.enable_timestamps = env_bool("SAMURAI_TCPDP_TIMESTAMPS", config_.enable_timestamps);
   tx_ring_capacity_ = static_cast<size_t>(env_u32_bounded(
       "SAMURAI_TCPDP_TX_RING_CAPACITY",
       static_cast<uint32_t>(tx_ring_capacity_),
@@ -408,10 +433,17 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
 
     thread_local uint8_t tls_scratch_buf[2048];
   uint8_t syn_opts[40];
-  const size_t syn_opts_len = BuildSynOptions(syn_opts, kSynWScale);  // MSS + SACK-perm + WScale
+  // MSS + SACK-perm + WScale (+ TS when enabled). We only advertise TS in our SYN;
+  // ts_ok is confirmed on the SYN-ACK if the peer echoes a TS option.
+  const bool ts_offer = config_.enable_timestamps;
+  const size_t syn_opts_len = BuildSynOptions(syn_opts, kSynWScale, ts_offer, TimestampMs());
   size_t syn_len = BuildPacketOpt(flow, flow.snd_nxt, 0, kTcpFlagSyn, nullptr, 0, syn_opts, syn_opts_len, tls_scratch_buf);
   flow.snd_nxt = AdvanceSeq(flow.snd_nxt, 1);
   QueuePacket(flow, tls_scratch_buf, syn_len, flow.iss, 0, kTcpFlagSyn, nullptr, 0, true);
+  // Store the SYN options so a retransmitted SYN replays them (BuildOutstandingPacket).
+  if (!flow.unacked.empty()) {
+    flow.unacked.back().opts.assign(syn_opts, syn_opts + syn_opts_len);
+  }
   {
     const size_t shard = FlowLockShardForFlowId(flow_id);
     std::lock_guard<SpinLock> tguard(timer_shard_mu_[shard]);
@@ -550,6 +582,12 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     if (opt.has_mss && opt.mss > 0 && opt.mss < flow->mss) {
       flow->mss = opt.mss;  // effective MSS is the smaller of the two advertisements
     }
+    // Timestamps (RFC 7323): active only if we offered AND the peer echoed a TS on the
+    // SYN-ACK. Seed ts_recent from its TSval so our first data segment echoes it.
+    if (config_.enable_timestamps && opt.has_ts) {
+      flow->ts_ok = true;
+      flow->ts_recent = opt.ts_val;
+    }
     // Seed the RTO estimate from the handshake RTT (SYN -> SYN-ACK); the SYN was sent
     // exactly once, so this is Karn-safe. UpdateRtt sets cur_rto_ms.
     if (!flow->unacked.empty() && flow->unacked.front().xmit_count == 1) {
@@ -558,7 +596,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     flow->unacked.clear();  // our SYN is acknowledged by this SYN-ACK
     flow->rto_deadline_ns = 0;
         thread_local uint8_t tls_scratch_buf[2048];
-    size_t ack_len = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
+    size_t ack_len = BuildSeg(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
     QueuePacket(*flow, tls_scratch_buf, ack_len, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
     SetFlowState(*flow, TcpDpState::kEstablished);
     stats_shard_[flow_shard].connect_established.fetch_add(1, std::memory_order_relaxed);
@@ -574,30 +612,40 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
   }
 
   if (payload_len > 0) {
+    // PAWS (RFC 7323, opt-in TS): drop an old duplicate whose TSval regressed and
+    // re-acknowledge the current receive point.
+    if (PawsReject(*flow, &opt)) {
+      stats_shard_[flow_shard].out_of_order_rx_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[flow_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
+      SendAckNow(*flow);
+      return finish(1);
+    }
     if (flow->rcv_nxt != 0 && seq != flow->rcv_nxt) {
       stats_shard_[flow_shard].out_of_order_rx_count.fetch_add(1, std::memory_order_relaxed);
       stats_shard_[flow_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
             thread_local uint8_t tls_scratch_buf[2048];
-      size_t dup_ack_len = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
+      size_t dup_ack_len = BuildSeg(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
       QueuePacket(*flow, tls_scratch_buf, dup_ack_len, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
       return finish(1);
     }
     flow->rcv_nxt = AdvanceSeq(seq, payload_len);
+    // RFC 7323: record the peer's TSval (this in-order segment covers rcv_nxt) so our
+    // next segment echoes it back in TSecr.
+    if (flow->ts_ok && opt.has_ts) flow->ts_recent = opt.ts_val;
     stats_shard_[flow_shard].rx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
     {
       std::lock_guard<SpinLock> qguard(tx_mu_);
       rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, ExtractIpv4TcpPayload(frame, frame_len)});
     }
-        thread_local uint8_t tls_scratch_buf[2048];
-    size_t ack_len = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
-    QueuePacket(*flow, tls_scratch_buf, ack_len, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
+    // Acknowledge (immediately, or delayed when the opt-in delayed-ACK is enabled).
+    OnDataReceivedAck(*flow, DefaultNowNs(), /*force_now=*/false);
   }
 
   if ((flags & kTcpFlagFin) != 0) {
     flow->rcv_nxt = AdvanceSeq(flow->rcv_nxt, 1U);
-        thread_local uint8_t tls_scratch_buf[2048];
-    size_t ack_len = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
-    QueuePacket(*flow, tls_scratch_buf, ack_len, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
+    if (flow->ts_ok && opt.has_ts) flow->ts_recent = opt.ts_val;
+    // Force an immediate ACK on FIN (also flushes any withheld delayed ACK).
+    SendAckNow(*flow);
     SetFlowState(*flow, TcpDpState::kTimeWait);
     stats_shard_[flow_shard].peer_fin_count.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, true, "peer_fin");
@@ -684,6 +732,12 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
           flow->cwnd = rmss;
           flow->in_fast_recovery = false;
           flow->dup_ack_streak = 0;
+          // Abort any RFC 6675 episode: the RTO governs recovery now (go-back-N from
+          // snd_una). Keep SACK marks so we still skip SACKed holes, but reset the
+          // retransmitted flags + high_rxt so a fresh episode can re-arm later.
+          flow->sack_recovery = false;
+          flow->high_rxt = flow->snd_una;
+          for (auto& s : flow->unacked) s.retransmitted = false;
           stats_shard_[selected_shard].congestion_window_reductions.fetch_add(1, std::memory_order_relaxed);
         }
         // Exponential backoff of the retransmit timer, then resend the oldest segment.
@@ -724,6 +778,20 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
         }
         break;
       }
+      case TimerKind::kDelayedAck: {
+        // Delayed-ACK expiry: flush the withheld acknowledgement (opt-in path).
+        if (entry.generation != flow->delack_timer_gen || flow->delack_deadline_ns == 0 ||
+            flow->delack_deadline_ns != entry.due_ns) {
+          break;
+        }
+        if (flow->pending_ack_segs > 0) {
+          SendAckNow(*flow);
+          actions++;
+        }
+        break;
+      }
+      case TimerKind::kZeroWindowProbe:
+        break;
     }
   }
   return actions;
@@ -1192,16 +1260,62 @@ size_t TcpDataplaneCore::BuildPacketOpt(
   return total_pkt_len;
 }
 
-size_t TcpDataplaneCore::BuildSynOptions(uint8_t* out, uint8_t wscale) const {
-  // MSS(4) + SACK-permitted(2) + NOP(1) + WScale(3) + NOP + NOP = 12 bytes (4-aligned).
+size_t TcpDataplaneCore::BuildSynOptions(uint8_t* out, uint8_t wscale, bool ts_enabled,
+                                         uint32_t ts_val) const {
   size_t n = 0;
   const uint16_t mss = config_.default_mss ? config_.default_mss : 1460;
   out[n++] = kOptMss;      out[n++] = 4; out[n++] = static_cast<uint8_t>(mss >> 8); out[n++] = static_cast<uint8_t>(mss & 0xFF);
   out[n++] = kOptSackPerm; out[n++] = 2;
+  if (ts_enabled) {
+    // Timestamp(10): kind+len+TSval(4)+TSecr(4). TSecr is 0 on the initial SYN.
+    out[n++] = kOptTimestamp; out[n++] = 10;
+    out[n++] = static_cast<uint8_t>(ts_val >> 24); out[n++] = static_cast<uint8_t>(ts_val >> 16);
+    out[n++] = static_cast<uint8_t>(ts_val >> 8);  out[n++] = static_cast<uint8_t>(ts_val & 0xFF);
+    out[n++] = 0; out[n++] = 0; out[n++] = 0; out[n++] = 0;  // TSecr = 0
+    out[n++] = kOptNop;
+    out[n++] = kOptWScale;   out[n++] = 3; out[n++] = wscale;
+    // MSS(4)+SACKperm(2)+TS(10)+NOP(1)+WScale(3) = 20 -> already 4-aligned.
+    return n;  // 20
+  }
+  // MSS(4) + SACK-permitted(2) + NOP(1) + WScale(3) + NOP + NOP = 12 bytes (4-aligned).
   out[n++] = kOptNop;
   out[n++] = kOptWScale;   out[n++] = 3; out[n++] = wscale;
   out[n++] = kOptNop;      out[n++] = kOptNop;
   return n;  // 12
+}
+
+uint32_t TcpDataplaneCore::TimestampMs() {
+  return static_cast<uint32_t>(DefaultNowNs() / 1000000ull);
+}
+
+size_t TcpDataplaneCore::BuildSegmentOptions(const FlowEntry& flow, uint8_t* out) const {
+  if (!flow.ts_ok) return 0;
+  // 2 NOP pad + Timestamp(10) = 12 bytes (4-aligned). TSval=now, TSecr=ts_recent.
+  const uint32_t ts_val = TimestampMs();
+  size_t n = 0;
+  out[n++] = kOptNop; out[n++] = kOptNop;
+  out[n++] = kOptTimestamp; out[n++] = 10;
+  out[n++] = static_cast<uint8_t>(ts_val >> 24); out[n++] = static_cast<uint8_t>(ts_val >> 16);
+  out[n++] = static_cast<uint8_t>(ts_val >> 8);  out[n++] = static_cast<uint8_t>(ts_val & 0xFF);
+  out[n++] = static_cast<uint8_t>(flow.ts_recent >> 24); out[n++] = static_cast<uint8_t>(flow.ts_recent >> 16);
+  out[n++] = static_cast<uint8_t>(flow.ts_recent >> 8);  out[n++] = static_cast<uint8_t>(flow.ts_recent & 0xFF);
+  return n;  // 12
+}
+
+size_t TcpDataplaneCore::BuildSeg(const FlowEntry& flow, uint32_t seq, uint32_t ack, uint8_t flags,
+                                  const uint8_t* payload, size_t payload_len, uint8_t* out_buffer) const {
+  if (flow.ts_ok) {
+    uint8_t opts[kTsOptLen];
+    const size_t opts_len = BuildSegmentOptions(flow, opts);
+    return BuildPacketOpt(flow, seq, ack, flags, payload, payload_len, opts, opts_len, out_buffer);
+  }
+  return BuildPacket(flow, seq, ack, flags, payload, payload_len, out_buffer);
+}
+
+bool TcpDataplaneCore::PawsReject(const FlowEntry& flow, const TcpOptionInfo* opt) const {
+  // RFC 7323 PAWS: drop an otherwise-acceptable segment whose TSval regressed.
+  if (!flow.ts_ok || opt == nullptr || !opt->has_ts) return false;
+  return SeqLt(opt->ts_val, flow.ts_recent);  // wrap-safe TSval < ts_recent
 }
 
 bool TcpDataplaneCore::ParseTcpOptions(const uint8_t* frame, size_t frame_len, TcpOptionInfo* out) {
@@ -1247,6 +1361,10 @@ bool TcpDataplaneCore::ParseTcpOptions(const uint8_t* frame, size_t frame_len, T
         out->sack_right[out->sack_block_count] = ReadBe32(frame + off + 4);
         out->sack_block_count++;
       }
+    } else if (kind == kOptTimestamp && len == 10) {
+      out->has_ts = true;
+      out->ts_val = ReadBe32(frame + i + 2);
+      out->ts_ecr = ReadBe32(frame + i + 6);
     }
     i += len;
   }
@@ -1363,8 +1481,14 @@ void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
 }
 
 uint32_t TcpDataplaneCore::EffectiveMss(const FlowEntry& flow) const {
-  const uint32_t mss = flow.mss ? flow.mss : config_.default_mss;
-  return mss ? mss : 1460u;
+  uint32_t mss = flow.mss ? flow.mss : config_.default_mss;
+  if (mss == 0) mss = 1460u;
+  // Timestamps consume 12 bytes of every segment's TCP header; shrink the payload
+  // MSS so a full segment still fits the path MTU.
+  if (flow.ts_ok && mss > static_cast<uint32_t>(kTsOptLen)) {
+    mss -= static_cast<uint32_t>(kTsOptLen);
+  }
+  return mss;
 }
 
 uint64_t TcpDataplaneCore::CurrentRtoNs(const FlowEntry& flow) const {
@@ -1372,53 +1496,44 @@ uint64_t TcpDataplaneCore::CurrentRtoNs(const FlowEntry& flow) const {
   return NsFromMs(rto_ms ? rto_ms : 250u);
 }
 
-void TcpDataplaneCore::PumpSend(FlowEntry& flow, uint64_t now_ns) {
-  if (flow.state != TcpDpState::kEstablished) {
-    return;
+uint32_t TcpDataplaneCore::EmitOneDataSegment(FlowEntry& flow, uint64_t now_ns, uint32_t window_room) {
+  const size_t buffered = flow.sndbuf.size() - flow.sndbuf_head;
+  if (buffered == 0 || window_room == 0) {
+    return 0;
   }
   const uint32_t mss = EffectiveMss(flow);
-  thread_local uint8_t scratch[65536];
-  while (true) {
-    const size_t buffered = flow.sndbuf.size() - flow.sndbuf_head;
-    if (buffered == 0) {
-      break;
-    }
-    // Effective window is the tighter of the congestion window and the peer's
-    // advertised receive window; we may inject up to (awnd - in-flight) bytes.
-    const uint32_t flight = flow.snd_nxt - flow.snd_una;  // seq-space outstanding
-    const uint32_t rwnd = flow.peer_window ? flow.peer_window : config_.local_window;
-    const uint32_t awnd = std::min(flow.cwnd, rwnd);
-    if (flight >= awnd) {
-      break;  // window full: nothing more may be sent until an ACK opens it
-    }
-    const uint32_t window_room = awnd - flight;
-    uint32_t seg_len = static_cast<uint32_t>(std::min<size_t>(buffered, mss));
-    if (seg_len > window_room) {
-      seg_len = window_room;
-    }
-    if (seg_len == 0) {
-      break;
-    }
-    const uint8_t* src = flow.sndbuf.data() + flow.sndbuf_head;
-    const bool is_tail = (flow.sndbuf_head + seg_len == flow.sndbuf.size());
-    const uint8_t flags = static_cast<uint8_t>(kTcpFlagAck | (is_tail ? kTcpFlagPsh : 0));
-    const uint32_t seq = flow.snd_nxt;
-    const size_t pkt_len = BuildPacket(flow, seq, flow.rcv_nxt, flags, src, seg_len, scratch);
-    (void)EnqueueTxPacketBytes(scratch, pkt_len);
-    OutstandingTx seg;
-    seg.seq = seq;
-    seg.ack = flow.rcv_nxt;
-    seg.payload_len = seg_len;
-    seg.flags = flags;
-    seg.xmit_count = 1;
-    seg.sent_ns = now_ns;
-    seg.data.assign(src, src + seg_len);
-    flow.unacked.push_back(std::move(seg));
-    flow.snd_nxt = AdvanceSeq(flow.snd_nxt, seg_len);
-    flow.sndbuf_head += seg_len;
-    stats_shard_[FlowLockShardForFlowId(flow.flow_id)].tx_data_bytes.fetch_add(
-        static_cast<uint64_t>(seg_len), std::memory_order_relaxed);
+  uint32_t seg_len = static_cast<uint32_t>(std::min<size_t>(buffered, mss));
+  if (seg_len > window_room) {
+    seg_len = window_room;
   }
+  if (seg_len == 0) {
+    return 0;
+  }
+  // Nagle (opt-in): withhold a sub-MSS segment while any data is still unacknowledged,
+  // coalescing small writes. The first small write (no data in flight) always goes.
+  if (config_.enable_nagle && seg_len < mss && flow.snd_nxt != flow.snd_una) {
+    return 0;
+  }
+  const uint8_t* src = flow.sndbuf.data() + flow.sndbuf_head;
+  const bool is_tail = (flow.sndbuf_head + seg_len == flow.sndbuf.size());
+  const uint8_t flags = static_cast<uint8_t>(kTcpFlagAck | (is_tail ? kTcpFlagPsh : 0));
+  const uint32_t seq = flow.snd_nxt;
+  thread_local uint8_t scratch[65536];
+  const size_t pkt_len = BuildSeg(flow, seq, flow.rcv_nxt, flags, src, seg_len, scratch);
+  (void)EnqueueTxPacketBytes(scratch, pkt_len);
+  OutstandingTx seg;
+  seg.seq = seq;
+  seg.ack = flow.rcv_nxt;
+  seg.payload_len = seg_len;
+  seg.flags = flags;
+  seg.xmit_count = 1;
+  seg.sent_ns = now_ns;
+  seg.data.assign(src, src + seg_len);
+  flow.unacked.push_back(std::move(seg));
+  flow.snd_nxt = AdvanceSeq(flow.snd_nxt, seg_len);
+  flow.sndbuf_head += seg_len;
+  stats_shard_[FlowLockShardForFlowId(flow.flow_id)].tx_data_bytes.fetch_add(
+      static_cast<uint64_t>(seg_len), std::memory_order_relaxed);
   // Reclaim the consumed prefix of the send buffer.
   if (flow.sndbuf_head >= flow.sndbuf.size()) {
     flow.sndbuf.clear();
@@ -1427,9 +1542,34 @@ void TcpDataplaneCore::PumpSend(FlowEntry& flow, uint64_t now_ns) {
     flow.sndbuf.erase(flow.sndbuf.begin(), flow.sndbuf.begin() + static_cast<std::ptrdiff_t>(flow.sndbuf_head));
     flow.sndbuf_head = 0;
   }
-  // Arm the (single) connection RTO timer for the oldest unacked segment.
-  if (!flow.unacked.empty() && flow.rto_deadline_ns == 0) {
+  if (flow.rto_deadline_ns == 0) {
     flow.rto_deadline_ns = now_ns + CurrentRtoNs(flow);
+  }
+  return seg_len;
+}
+
+void TcpDataplaneCore::PumpSend(FlowEntry& flow, uint64_t now_ns) {
+  if (flow.state != TcpDpState::kEstablished) {
+    return;
+  }
+  // In an RFC6675 SACK-recovery episode transmission is governed by pipe, not the
+  // plain window; defer to the recovery clock.
+  if (flow.sack_recovery) {
+    SackRecoveryTransmit(flow, now_ns);
+    return;
+  }
+  while (true) {
+    // Effective window is the tighter of the congestion window and the peer's
+    // advertised receive window; we may inject up to (awnd - in-flight) bytes.
+    const uint32_t flight = flow.snd_nxt - flow.snd_una;  // seq-space outstanding
+    const uint32_t rwnd = flow.peer_window ? flow.peer_window : config_.local_window;
+    const uint32_t awnd = std::min(flow.cwnd, rwnd);
+    if (flight >= awnd) {
+      break;  // window full: nothing more may be sent until an ACK opens it
+    }
+    if (EmitOneDataSegment(flow, now_ns, awnd - flight) == 0) {
+      break;  // buffer empty / window closed / Nagle-held
+    }
   }
 }
 
@@ -1448,6 +1588,141 @@ void TcpDataplaneCore::RetransmitOldest(FlowEntry& flow) {
   const size_t pkt_len = BuildOutstandingPacket(flow, *seg, scratch);
   (void)EnqueueTxPacketBytes(scratch, pkt_len);
   seg->xmit_count++;
+  seg->retransmitted = true;
+}
+
+// RFC 6675 IsLost(seg): the segment is deemed lost when at least DupThresh SACKed
+// segments (or DupThresh*SMSS SACKed bytes) lie above it in the scoreboard.
+bool TcpDataplaneCore::IsLostSeg(const FlowEntry& flow, uint32_t seg_seq) const {
+  const uint32_t mss = EffectiveMss(flow);
+  uint32_t sacked_segs_above = 0;
+  uint32_t sacked_bytes_above = 0;
+  for (const auto& s : flow.unacked) {
+    if (!s.sacked) continue;
+    if (SeqGt(s.seq, seg_seq)) {
+      sacked_segs_above++;
+      sacked_bytes_above += SegSeqLen(s.flags, s.payload_len);
+    }
+  }
+  return sacked_segs_above >= kDupThresh || sacked_bytes_above >= kDupThresh * mss;
+}
+
+// RFC 6675 SetPipe: estimate of bytes in flight over the scoreboard.
+uint32_t TcpDataplaneCore::ComputePipe(const FlowEntry& flow) const {
+  uint32_t pipe = 0;
+  for (const auto& s : flow.unacked) {
+    if (s.sacked) continue;
+    const uint32_t len = SegSeqLen(s.flags, s.payload_len);
+    if (!IsLostSeg(flow, s.seq)) pipe += len;  // original assumed in flight
+    if (s.retransmitted) pipe += len;          // retransmission also in flight
+  }
+  return pipe;
+}
+
+void TcpDataplaneCore::EnterSackRecovery(FlowEntry& flow, uint64_t now_ns) {
+  if (flow.sack_recovery) {
+    return;
+  }
+  const size_t stat_shard = FlowLockShardForFlowId(flow.flow_id);
+  const uint32_t mss = EffectiveMss(flow);
+  const uint32_t flight = flow.snd_nxt - flow.snd_una;
+  flow.ssthresh = std::max(flight / 2u, 2u * mss);
+  flow.cwnd = flow.ssthresh;               // RFC6675: cwnd = ssthresh, pipe governs
+  flow.recovery_point = flow.snd_nxt;      // exit once this is cumulatively acked
+  flow.high_rxt = flow.snd_una;
+  flow.sack_recovery = true;
+  flow.in_fast_recovery = false;           // SACK path supersedes the NewReno fallback
+  stats_shard_[stat_shard].congestion_window_reductions.fetch_add(1, std::memory_order_relaxed);
+  SackRecoveryTransmit(flow, now_ns);
+}
+
+void TcpDataplaneCore::SackRecoveryTransmit(FlowEntry& flow, uint64_t now_ns) {
+  const size_t stat_shard = FlowLockShardForFlowId(flow.flow_id);
+  thread_local uint8_t scratch[65536];
+  const uint32_t rwnd = flow.peer_window ? flow.peer_window : config_.local_window;
+  for (int guard = 0; guard < 4096; ++guard) {
+    const uint32_t pipe = ComputePipe(flow);
+    if (pipe >= flow.cwnd) {
+      break;  // pipe full
+    }
+    // NextSeg rule 1: lowest-seq lost hole not yet retransmitted.
+    OutstandingTx* hole = nullptr;
+    for (auto& s : flow.unacked) {
+      if (s.sacked || s.retransmitted) continue;
+      if (IsLostSeg(flow, s.seq)) { hole = &s; break; }
+    }
+    if (hole != nullptr) {
+      hole->ack = flow.rcv_nxt;
+      const size_t pkt_len = BuildOutstandingPacket(flow, *hole, scratch);
+      (void)EnqueueTxPacketBytes(scratch, pkt_len);
+      hole->xmit_count++;
+      hole->retransmitted = true;
+      const uint32_t hole_end = hole->seq + SegSeqLen(hole->flags, hole->payload_len);
+      if (SeqGt(hole_end, flow.high_rxt)) flow.high_rxt = hole_end;
+      stats_shard_[stat_shard].fast_retransmit_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    // NextSeg rule 2: new data, if the window allows.
+    const uint32_t flight = flow.snd_nxt - flow.snd_una;
+    const uint32_t rwnd_room = rwnd > flight ? rwnd - flight : 0;
+    const uint32_t cwnd_room = flow.cwnd > pipe ? flow.cwnd - pipe : 0;
+    const uint32_t room = std::min(cwnd_room, rwnd_room);
+    if (room > 0 && (flow.sndbuf.size() - flow.sndbuf_head) > 0) {
+      if (EmitOneDataSegment(flow, now_ns, room) > 0) {
+        continue;
+      }
+    }
+    // NextSeg rule 3: rescue retransmit — the highest-seq unSACKed, unretransmitted
+    // segment, to avoid an RTO when only tail segments remain outstanding.
+    OutstandingTx* rescue = nullptr;
+    for (auto& s : flow.unacked) {
+      if (s.sacked || s.retransmitted) continue;
+      rescue = &s;  // keep walking -> ends on the highest such segment
+    }
+    if (rescue != nullptr) {
+      rescue->ack = flow.rcv_nxt;
+      const size_t pkt_len = BuildOutstandingPacket(flow, *rescue, scratch);
+      (void)EnqueueTxPacketBytes(scratch, pkt_len);
+      rescue->xmit_count++;
+      rescue->retransmitted = true;
+      const uint32_t r_end = rescue->seq + SegSeqLen(rescue->flags, rescue->payload_len);
+      if (SeqGt(r_end, flow.high_rxt)) flow.high_rxt = r_end;
+      stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    break;  // nothing left to (re)transmit
+  }
+  if (!flow.unacked.empty() && flow.rto_deadline_ns == 0) {
+    flow.rto_deadline_ns = now_ns + CurrentRtoNs(flow);
+  }
+}
+
+void TcpDataplaneCore::SendAckNow(FlowEntry& flow) {
+  thread_local uint8_t scratch[65536];
+  const size_t len = BuildSeg(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0, scratch);
+  (void)EnqueueTxPacketBytes(scratch, len);
+  flow.pending_ack_segs = 0;
+  flow.delack_deadline_ns = 0;  // disarm (stale generation ignored on fire)
+}
+
+// Delayed-ACK (opt-in): with delayed ACKs disabled we ACK every segment immediately
+// (aggressive load-gen default). Enabled, we ACK every 2nd full segment or arm a
+// short timer so a lone segment is still acknowledged promptly.
+void TcpDataplaneCore::OnDataReceivedAck(FlowEntry& flow, uint64_t now_ns, bool force_now) {
+  if (!config_.enable_delayed_ack || force_now) {
+    SendAckNow(flow);
+    return;
+  }
+  flow.pending_ack_segs++;
+  if (flow.pending_ack_segs >= 2) {
+    SendAckNow(flow);
+    return;
+  }
+  // Arm the delACK timer (40ms, RFC 5681 upper bound is 500ms; LAN-oriented here).
+  flow.delack_timer_gen++;
+  flow.delack_deadline_ns = now_ns + NsFromMs(40u);
+  PushTimer(flow.flow_id, TimerKind::kDelayedAck, flow.delack_deadline_ns, flow.delack_timer_gen);
 }
 
 void TcpDataplaneCore::QueuePacket(
@@ -1491,6 +1766,19 @@ size_t TcpDataplaneCore::BuildOutstandingPacket(const FlowEntry& flow, const Out
   if (out.payload_len > 0 && out.data.size() >= static_cast<size_t>(out.payload_len)) {
     payload_ptr = out.data.data();
     payload_size = static_cast<size_t>(out.payload_len);
+  }
+  // Replay the segment's stored options (e.g. the SYN's MSS/SACK-perm/WScale/TS) so a
+  // retransmitted SYN re-negotiates identically instead of dropping to a bare header.
+  if (!out.opts.empty()) {
+    return BuildPacketOpt(flow, out.seq, out.ack, out.flags, payload_ptr, payload_size,
+                          out.opts.data(), out.opts.size(), out_buffer);
+  }
+  // Ordinary data/ACK segments carry a freshly regenerated timestamp (TSval=now).
+  if (flow.ts_ok) {
+    uint8_t opts[kTsOptLen];
+    const size_t opts_len = BuildSegmentOptions(flow, opts);
+    return BuildPacketOpt(flow, out.seq, out.ack, out.flags, payload_ptr, payload_size,
+                          opts, opts_len, out_buffer);
   }
   return BuildPacket(flow, out.seq, out.ack, out.flags, payload_ptr, payload_size, out_buffer);
 }
@@ -1569,7 +1857,24 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpO
     if (ack_value == flow.snd_una) {
       stats_shard_[stat_shard].dup_ack_count.fetch_add(1, std::memory_order_relaxed);
       flow.dup_ack_streak++;
-      if (!flow.in_fast_recovery && flow.dup_ack_streak == 3) {
+      const bool use_sack = config_.enable_rfc6675_recovery && flow.sack_permitted;
+      if (use_sack) {
+        if (!flow.sack_recovery) {
+          // Enter recovery on the classic 3 dup-ACKs OR early when the scoreboard
+          // already marks the oldest outstanding segment as lost (RFC 6675).
+          const bool oldest_lost =
+              !flow.unacked.empty() && IsLostSeg(flow, flow.unacked.front().seq);
+          if (oldest_lost || flow.dup_ack_streak >= kDupThresh) {
+            EnterSackRecovery(flow, now_ns);
+            flow.cur_rto_ms = 0;
+            flow.rto_deadline_ns = now_ns + CurrentRtoNs(flow);
+          }
+        } else {
+          // Already recovering: fresh SACK info may have opened the pipe.
+          SackRecoveryTransmit(flow, now_ns);
+        }
+      } else if (!flow.in_fast_recovery && flow.dup_ack_streak == 3) {
+        // NewReno fallback (no SACK negotiated).
         const uint32_t flight = flow.snd_nxt - flow.snd_una;
         flow.ssthresh = std::max(flight / 2u, 2u * mss);
         flow.cwnd = flow.ssthresh + 3u * mss;  // inflate for the 3 dup-ACKs
@@ -1630,7 +1935,16 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpO
   }
 
   // Congestion control on forward progress.
-  if (flow.in_fast_recovery) {
+  if (flow.sack_recovery) {
+    // RFC 6675: a cumulative ACK reaching the recovery point ends the episode; a
+    // partial ACK keeps us in recovery (no window growth) and SackRecoveryTransmit
+    // (via PumpSend below) clocks the next hole + new data under pipe.
+    if (!SeqLt(ack_value, flow.recovery_point)) {
+      flow.sack_recovery = false;
+      flow.cwnd = flow.ssthresh;
+      for (auto& s : flow.unacked) s.retransmitted = false;  // episode over
+    }
+  } else if (flow.in_fast_recovery) {
     flow.in_fast_recovery = false;
     flow.cwnd = flow.ssthresh;  // deflate on recovery exit
   } else if (flow.cwnd < flow.ssthresh) {

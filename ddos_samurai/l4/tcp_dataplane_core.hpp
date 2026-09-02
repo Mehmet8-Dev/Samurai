@@ -39,6 +39,15 @@ struct TcpDpConfig {
   uint16_t dpdk_port_id = 0;
   uint16_t dpdk_queue_id = 0;
   uint16_t dpdk_burst_size = 64;
+  // TCP maturity toggles. RFC6675 SACK loss recovery is a strict improvement over
+  // the NewReno fallback and defaults ON (only active on SACK-negotiated flows).
+  // delayed-ACK / Nagle / timestamps change the default aggressive load-gen
+  // behaviour and default OFF; each is also overridable via env in Configure()
+  // (SAMURAI_TCPDP_DELAYED_ACK / _NAGLE / _TIMESTAMPS / _RFC6675).
+  bool enable_rfc6675_recovery = true;
+  bool enable_delayed_ack = false;
+  bool enable_nagle = false;
+  bool enable_timestamps = false;
 };
 
 struct TcpDpSackBlock {
@@ -184,9 +193,14 @@ class TcpDataplaneCore {
     uint32_t xmit_count = 0;
     uint64_t sent_ns = 0;   // first-transmission time; RTT sampled only when xmit_count==1 (Karn)
     bool sacked = false;    // covered by a received SACK block -> skip on selective retransmit
+    bool retransmitted = false;  // RFC6675: this segment has been resent (counts toward pipe)
     // Owned payload bytes for this in-flight segment (empty for pure SYN/FIN/ACK).
     // Held per-segment so a retransmit is a straight rebuild with no shared cursor.
     std::vector<uint8_t> data;
+    // TCP options to replay on retransmit (e.g. the SYN's MSS/SACK-perm/WScale).
+    // Empty for ordinary data/ACK segments; timestamp options are regenerated fresh
+    // per (re)transmission in the build path so they are not stored here.
+    std::vector<uint8_t> opts;
   };
 
   // Parsed TCP option fields we care about (from SYN-ACK negotiation and per-ACK SACK).
@@ -199,6 +213,9 @@ class TcpDataplaneCore {
     uint32_t sack_left[4] = {0, 0, 0, 0};
     uint32_t sack_right[4] = {0, 0, 0, 0};
     int sack_block_count = 0;
+    bool has_ts = false;      // RFC 7323 TCP timestamp option present
+    uint32_t ts_val = 0;      // sender's timestamp
+    uint32_t ts_ecr = 0;      // echoed timestamp
   };
 
   struct FlowEntry {
@@ -222,7 +239,19 @@ class TcpDataplaneCore {
     uint32_t srtt_ms = 100;
     uint32_t rttvar_ms = 50;
     bool rtt_sampled = false;  // false until the first valid RTT measurement (RFC 6298 init)
-    bool in_fast_recovery = false;
+    bool in_fast_recovery = false;      // NewReno fallback recovery (non-SACK flows)
+    // RFC 6675 SACK loss recovery scoreboard state (SACK-negotiated flows only).
+    bool sack_recovery = false;         // in an RFC6675 recovery episode
+    uint32_t recovery_point = 0;        // snd_nxt captured at recovery entry; exit when acked
+    uint32_t high_rxt = 0;              // highest seq (re)transmitted during recovery
+    // RFC 7323 timestamps / PAWS (only when negotiated on both sides).
+    bool ts_ok = false;                 // TS negotiated (we offered + peer echoed on SYN-ACK)
+    uint32_t ts_recent = 0;             // most recent in-order peer TSval (echoed back)
+    // Delayed-ACK state (opt-in). pending_ack_bytes accrues un-ACKed in-order data;
+    // an ACK is forced every 2nd full-MSS segment or when the delACK timer fires.
+    uint32_t pending_ack_segs = 0;
+    uint64_t delack_deadline_ns = 0;
+    uint32_t delack_timer_gen = 0;
     uint16_t mss = 0;
     uint8_t ttl = 0;
     TcpDpState state = TcpDpState::kClosed;
@@ -253,6 +282,7 @@ class TcpDataplaneCore {
     kConnectTimeout = 2,
     kIdleTimeout = 3,
     kZeroWindowProbe = 4,
+    kDelayedAck = 5,
   };
 
   struct TimerEntry {
@@ -373,9 +403,20 @@ class TcpDataplaneCore {
       const uint8_t* opts,
       size_t opts_len,
       uint8_t* out_buffer) const;
-  // Build our SYN option block (MSS, SACK-permitted, window scale). Returns length.
-  size_t BuildSynOptions(uint8_t* out, uint8_t wscale) const;
+  // Build our SYN option block (MSS, SACK-permitted, window scale, optional TS).
+  // Returns length (multiple of 4). ts_enabled adds the RFC 7323 timestamp option.
+  size_t BuildSynOptions(uint8_t* out, uint8_t wscale, bool ts_enabled, uint32_t ts_val) const;
   static bool ParseTcpOptions(const uint8_t* frame, size_t frame_len, TcpOptionInfo* out);
+  // Timestamp/PAWS helpers (RFC 7323). BuildSegmentOptions emits the per-segment TS
+  // option (fresh TSval, echoing ts_recent) when the flow negotiated timestamps;
+  // returns option length (0 or 12). BuildSeg routes an ordinary segment through
+  // BuildPacketOpt with those options so every data/ACK carries TS when enabled.
+  size_t BuildSegmentOptions(const FlowEntry& flow, uint8_t* out) const;
+  size_t BuildSeg(const FlowEntry& flow, uint32_t seq, uint32_t ack, uint8_t flags,
+                  const uint8_t* payload, size_t payload_len, uint8_t* out_buffer) const;
+  static uint32_t TimestampMs();
+  // PAWS: reject an in-window segment whose TSval regressed vs ts_recent.
+  bool PawsReject(const FlowEntry& flow, const TcpOptionInfo* opt) const;
   void UpdateRtt(FlowEntry& flow, uint64_t sample_ns);
   size_t BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out, uint8_t* out_buffer) const;
   bool EnqueueTxPacketBytes(const uint8_t* data, size_t len);
@@ -399,6 +440,21 @@ class TcpDataplaneCore {
   void PumpSend(FlowEntry& flow, uint64_t now_ns);
   // Rebuild + re-emit the oldest unacked segment (RTO / fast retransmit).
   void RetransmitOldest(FlowEntry& flow);
+  // RFC 6675 SACK loss recovery. IsLostSeg: >= DupThresh SACKed segments (or bytes)
+  // above the segment. ComputePipe: bytes estimated in flight. EnterSackRecovery /
+  // SackRecoveryTransmit: enter an episode and clock (re)transmissions while
+  // pipe < cwnd, retransmitting lost holes first (NextSeg), then new data, then a
+  // single rescue retransmit.
+  bool IsLostSeg(const FlowEntry& flow, uint32_t seg_seq) const;
+  uint32_t ComputePipe(const FlowEntry& flow) const;
+  void EnterSackRecovery(FlowEntry& flow, uint64_t now_ns);
+  void SackRecoveryTransmit(FlowEntry& flow, uint64_t now_ns);
+  // Emit a single fresh data segment from sndbuf (shared by PumpSend + recovery).
+  // Returns bytes emitted (0 if window/buffer/Nagle blocked).
+  uint32_t EmitOneDataSegment(FlowEntry& flow, uint64_t now_ns, uint32_t window_room);
+  // Delayed-ACK: account an in-order data segment; send an ACK now or arm the timer.
+  void OnDataReceivedAck(FlowEntry& flow, uint64_t now_ns, bool force_now);
+  void SendAckNow(FlowEntry& flow);
   uint32_t EffectiveMss(const FlowEntry& flow) const;
   uint64_t CurrentRtoNs(const FlowEntry& flow) const;
   void HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpOptionInfo* opt);

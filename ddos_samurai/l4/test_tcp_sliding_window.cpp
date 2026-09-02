@@ -39,9 +39,10 @@ static uint32_t ReadBe32(const uint8_t* p) {
 }
 static uint32_t Ipv4(const char* s) { in_addr a{}; inet_pton(AF_INET, s, &a); return ntohl(a.s_addr); }
 
-struct Seg { uint8_t flags; uint32_t seq; uint32_t payload_len; };
+struct Seg { uint8_t flags; uint32_t seq; uint32_t payload_len; uint8_t doff_words; };
 
-// Drain every packet currently on the TX ring into a flat segment list.
+// Drain every packet currently on the TX ring into a flat segment list. doff_words is
+// the TCP data-offset (header words); >5 means TCP options are present.
 static std::vector<Seg> Drain(TcpDataplaneCore& core) {
   std::vector<Seg> out;
   for (;;) {
@@ -53,7 +54,10 @@ static std::vector<Seg> Drain(TcpDataplaneCore& core) {
       Seg s;
       s.flags = p[47];
       s.seq = ReadBe32(p + 38);
-      s.payload_len = psize > 54 ? uint32_t(psize - 54) : 0;  // 14 L2 + 20 IP + 20 TCP
+      s.doff_words = uint8_t(p[46] >> 4);  // TCP data offset at frame byte 14+20+12=46
+      const size_t tcp_hdr = size_t(s.doff_words) * 4;
+      const size_t hdr = 34 + tcp_hdr;     // 14 L2 + 20 IP + TCP header (incl options)
+      s.payload_len = psize > hdr ? uint32_t(psize - hdr) : 0;
       out.push_back(s);
     }
     core.ConsumeTxPackets(count);
@@ -281,6 +285,174 @@ int main() {
           rtx.empty() ? 0u : rtx[0].seq, base);
     CHECK(!rtx.empty() && rtx[0].payload_len == 1000, "retransmit is the full seg1 (len=%u)",
           rtx.empty() ? 0u : rtx[0].payload_len);
+  }
+
+  // ---- TEST F: RFC 6675 multi-hole recovery. Six segments in flight; the peer SACKs
+  // the top three so segs 1-3 are all "lost" (>= 3 SACKed above). A single recovery
+  // episode must retransmit ALL THREE holes at once (NewReno would resend only seg1).
+  {
+    const uint64_t fidF = core.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = core.GetFlow(fidF);
+    const uint16_t ephF = t.src_port;
+    const uint32_t issF = t.iss;
+    Drain(core);
+    const uint8_t opts[8] = {0x04, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01};  // SACK-perm
+    auto saF = PeerFrameOpt(our_ip, tgt, ephF, 0x82000000u, issF + 1, 0x12, 65535, opts, 8);
+    core.IngestRxFrame(saF.data(), saF.size());
+    Drain(core);
+    t = core.GetFlow(fidF);
+    const uint32_t base = t.snd_una;
+    std::vector<uint8_t> chunk(1000, 'x');
+    for (int i = 0; i < 6; ++i) core.EnqueueSend(fidF, chunk.data(), chunk.size());
+    auto sent = Drain(core);
+    CHECK(sent.size() == 6, "six segments in flight (got %zu)", sent.size());
+
+    // SACK the top three segments [base+3000, base+6000] on three dup-ACKs.
+    uint8_t sack_opt[12] = {0x05, 0x0A};
+    WriteBe32(sack_opt + 2, base + 3000);
+    WriteBe32(sack_opt + 6, base + 6000);
+    sack_opt[10] = 0x01; sack_opt[11] = 0x01;
+    std::vector<Seg> rtx;
+    for (int i = 0; i < 3; ++i) {
+      auto dup = PeerFrameOpt(our_ip, tgt, ephF, 0x82000001u, base, 0x10, 65535, sack_opt, 12);
+      core.IngestRxFrame(dup.data(), dup.size());
+      auto out = Drain(core);
+      for (auto& s : out) rtx.push_back(s);
+    }
+    CHECK(rtx.size() == 3, "RFC6675 resent all three holes in one episode (got %zu)", rtx.size());
+    bool seq1 = false, seq2 = false, seq3 = false;
+    for (auto& s : rtx) {
+      if (s.seq == base) seq1 = true;
+      if (s.seq == base + 1000) seq2 = true;
+      if (s.seq == base + 2000) seq3 = true;
+    }
+    CHECK(seq1 && seq2 && seq3, "holes seg1+seg2+seg3 all retransmitted");
+  }
+
+  // ---- TEST G: a retransmitted SYN carries its options (MSS/SACK-perm/WScale) instead
+  // of degrading to a bare header. Force the SYN RTO with no SYN-ACK.
+  {
+    const uint64_t fidG = core.EnqueueConnect(our_ip, tgt, 0, 80);
+    auto syn0 = Drain(core);
+    CHECK(syn0.size() == 1 && syn0[0].doff_words > 5, "initial SYN carries options (doff=%u)",
+          syn0.empty() ? 0 : syn0[0].doff_words);
+    TcpDpFlowSnapshot t = core.GetFlow(fidG);
+    // Fire exactly the SYN's RTO (earlier than the connect timeout).
+    core.Poll(t.rto_deadline_ns + 1000, 1000);
+    auto synR = Drain(core);
+    CHECK(!synR.empty() && (synR[0].flags & 0x02), "SYN was retransmitted (got %zu pkts)", synR.size());
+    CHECK(!synR.empty() && synR[0].doff_words > 5, "retransmitted SYN still carries options (doff=%u)",
+          synR.empty() ? 0 : synR[0].doff_words);
+  }
+
+  // ---- TEST H: timestamps (RFC 7323) negotiation + echo + PAWS, on an opt-in core.
+  {
+    TcpDataplaneCore tcore;
+    TcpDpConfig tcfg;
+    tcfg.mode = "on"; tcfg.default_mss = 1460; tcfg.local_window = 65535; tcfg.initial_rto_ms = 250;
+    tcfg.enable_timestamps = true;
+    tcore.Configure(tcfg);
+    const uint64_t fidH = tcore.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = tcore.GetFlow(fidH);
+    const uint16_t ephH = t.src_port;
+    const uint32_t issH = t.iss;
+    auto syn = Drain(tcore);
+    CHECK(!syn.empty() && syn[0].doff_words == 10, "SYN advertises TS (doff=%u, expect 10)",
+          syn.empty() ? 0 : syn[0].doff_words);
+    // SYN-ACK echoing SACK-perm + TS.
+    uint8_t sa_opt[12] = {0x04, 0x02, 0x08, 0x0A};
+    WriteBe32(sa_opt + 4, 1000u);        // peer TSval (ts_recent starts here)
+    WriteBe32(sa_opt + 8, 0x0);          // peer TSecr
+    auto sa = PeerFrameOpt(our_ip, tgt, ephH, 0x83000000u, issH + 1, 0x12, 65535, sa_opt, 12);
+    tcore.IngestRxFrame(sa.data(), sa.size());
+    Drain(tcore);
+    // A data send now carries the TS option (2 NOP + TS = 12 bytes -> doff 8).
+    std::vector<uint8_t> body(200, 'z');
+    tcore.EnqueueSend(fidH, body.data(), body.size());
+    auto dseg = Drain(tcore);
+    CHECK(!dseg.empty() && dseg[0].doff_words == 8, "data segment carries TS (doff=%u, expect 8)",
+          dseg.empty() ? 0 : dseg[0].doff_words);
+
+    // PAWS: deliver in-order data with TSval=100 (accepted -> ts_recent=100), then a
+    // fresh in-order segment with TSval=50 must be dropped (rcv_nxt frozen).
+    t = tcore.GetFlow(fidH);
+    const uint32_t rcv0 = t.rcv_nxt;
+    auto mk_data = [&](uint32_t seq, uint32_t tsval, uint8_t plen) {
+      uint8_t o[12] = {0x01, 0x01, 0x08, 0x0A};
+      WriteBe32(o + 4, tsval); WriteBe32(o + 8, 0x0);
+      const uint8_t tcp_hdr = uint8_t(20 + 12);
+      std::vector<uint8_t> f(14 + 20 + tcp_hdr + plen, 0);
+      WriteBe16(f.data() + 12, 0x0800); f[14] = 0x45;
+      WriteBe16(f.data() + 16, uint16_t(20 + tcp_hdr + plen));
+      f[22] = 64; f[23] = 6;
+      WriteBe32(f.data() + 26, tgt); WriteBe32(f.data() + 30, our_ip);
+      WriteBe16(f.data() + 34, 80); WriteBe16(f.data() + 36, ephH);
+      WriteBe32(f.data() + 38, seq); WriteBe32(f.data() + 42, issH + 1);
+      f[46] = uint8_t((tcp_hdr / 4) << 4); f[47] = 0x10;
+      WriteBe16(f.data() + 48, 65535);
+      std::memcpy(f.data() + 54, o, 12);
+      return f;
+    };
+    auto d1 = mk_data(rcv0, 2000, 50);  // TSval > ts_recent(1000) -> accepted
+    tcore.IngestRxFrame(d1.data(), d1.size());
+    t = tcore.GetFlow(fidH);
+    const uint32_t rcv1 = t.rcv_nxt;
+    CHECK(rcv1 == rcv0 + 50, "in-order TS data accepted (rcv_nxt advanced)");
+    auto d2 = mk_data(rcv1, 1500, 50);  // TSval < ts_recent(2000) -> PAWS drop
+    tcore.IngestRxFrame(d2.data(), d2.size());
+    t = tcore.GetFlow(fidH);
+    CHECK(t.rcv_nxt == rcv1, "PAWS dropped the stale-TSval segment (rcv_nxt frozen)");
+  }
+
+  // ---- TEST I: delayed-ACK + Nagle on an opt-in core.
+  {
+    TcpDataplaneCore dcore;
+    TcpDpConfig dcfg;
+    dcfg.mode = "on"; dcfg.default_mss = 1460; dcfg.local_window = 65535; dcfg.initial_rto_ms = 250;
+    dcfg.enable_delayed_ack = true; dcfg.enable_nagle = true;
+    dcore.Configure(dcfg);
+    const uint64_t fidI = dcore.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = dcore.GetFlow(fidI);
+    const uint16_t ephI = t.src_port;
+    const uint32_t issI = t.iss;
+    Drain(dcore);
+    const uint8_t opts[8] = {0x04, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01};
+    auto sa = PeerFrameOpt(our_ip, tgt, ephI, 0x84000000u, issI + 1, 0x12, 65535, opts, 8);
+    dcore.IngestRxFrame(sa.data(), sa.size());
+    Drain(dcore);  // clear the handshake ACK
+
+    // Delayed-ACK: first data segment is NOT acked immediately; the second forces it.
+    const uint32_t pseq = 0x84000001u;
+    std::vector<uint8_t> pay(100, 'a');
+    auto p1 = PeerFrame(our_ip, tgt, ephI, pseq, issI + 1, 0x10, 65535, pay.data(), 100);
+    dcore.IngestRxFrame(p1.data(), p1.size());
+    auto a1 = Drain(dcore);
+    int acks1 = 0; for (auto& s : a1) if (s.flags == 0x10) acks1++;
+    CHECK(acks1 == 0, "delayed-ACK withheld the ACK for the first segment (got %d)", acks1);
+    auto p2 = PeerFrame(our_ip, tgt, ephI, pseq + 100, issI + 1, 0x10, 65535, pay.data(), 100);
+    dcore.IngestRxFrame(p2.data(), p2.size());
+    auto a2 = Drain(dcore);
+    int acks2 = 0; for (auto& s : a2) if (s.flags == 0x10) acks2++;
+    CHECK(acks2 == 1, "second segment forced a single delayed ACK (got %d)", acks2);
+
+    // Nagle: a small write while data is unacked is withheld until the in-flight
+    // data is acknowledged. First 100B write goes (nothing outstanding); second is held.
+    std::vector<uint8_t> w(100, 'w');
+    dcore.EnqueueSend(fidI, w.data(), w.size());
+    auto n1 = Drain(dcore);
+    int data1 = 0; for (auto& s : n1) if (s.payload_len > 0) data1++;
+    CHECK(data1 == 1, "first small write is sent (no data outstanding), got %d", data1);
+    dcore.EnqueueSend(fidI, w.data(), w.size());  // held by Nagle (prev still unacked)
+    auto n2 = Drain(dcore);
+    int data2 = 0; for (auto& s : n2) if (s.payload_len > 0) data2++;
+    CHECK(data2 == 0, "second small write held by Nagle while unacked, got %d", data2);
+    // ACK the first write -> the withheld byte flushes.
+    t = dcore.GetFlow(fidI);
+    auto ackw = PeerFrame(our_ip, tgt, ephI, issI + 1, t.snd_una + 100, 0x10, 65535);
+    dcore.IngestRxFrame(ackw.data(), ackw.size());
+    auto n3 = Drain(dcore);
+    int data3 = 0; for (auto& s : n3) if (s.payload_len > 0) data3++;
+    CHECK(data3 == 1, "Nagle-held write flushes after the ACK, got %d", data3);
   }
 
   if (g_fails == 0) {
