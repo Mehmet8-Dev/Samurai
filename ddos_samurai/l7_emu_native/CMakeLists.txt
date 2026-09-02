@@ -13,6 +13,7 @@ if(PkgConfig_FOUND)
   pkg_check_modules(NGTCP2_GNUTLS QUIET libngtcp2_crypto_gnutls)
   pkg_check_modules(NGHTTP3 QUIET libnghttp3)
   pkg_check_modules(GNUTLS QUIET gnutls)
+  pkg_check_modules(DPDK QUIET libdpdk)
 endif()
 
 # samurai_l7emu — the native L7 emulation engine (HTTP/1.1, HTTP/2 via nghttp2,
@@ -38,11 +39,30 @@ set(SAMURAI_L7EMU_SOURCES
   custom_quic_stack/loss_recovery.cpp
   custom_quic_stack/quic_metrics.cpp
   custom_quic_stack/quic_stack.cpp
-  custom_quic_stack/udp_io.cpp)
+  custom_quic_stack/udp_io.cpp
+  # Tek native DPDK çekirdeği. Başlık rte/Python bağımsız; kaynak kendini
+  # SAMURAI_WITH_DPDK ile gate'ler (libdpdk yokken güvenli saplama derlenir).
+  # Burada konsolide edilir ki samurai_l7emu'yu link'leyen tüm tüketiciler
+  # (own-wire DPDK teli, QUIC DPDK backend, dpdk/scenario worker) tek kopyayı
+  # paylaşsın — worker'larda ayrıca derlemek çift-sembol yaratırdı.
+  ../dpdk/dpdk_core.cpp)
 
 add_library(samurai_l7emu STATIC ${SAMURAI_L7EMU_SOURCES})
-target_include_directories(samurai_l7emu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(samurai_l7emu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk)
 target_link_libraries(samurai_l7emu PUBLIC samurai_l4 samurai_core pthread dl)
+
+if(DPDK_FOUND)
+  # PUBLIC: gate + link bayrakları tüketicilere yayılır; worker'lar artık
+  # dpdk_core.cpp'yi ayrıca derlemez, define'ı buradan miras alır.
+  target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_WITH_DPDK=1)
+  target_include_directories(samurai_l7emu PUBLIC ${DPDK_INCLUDE_DIRS})
+  target_link_directories(samurai_l7emu PUBLIC ${DPDK_LIBRARY_DIRS})
+  target_link_libraries(samurai_l7emu PUBLIC ${DPDK_LIBRARIES})
+  target_compile_options(samurai_l7emu PUBLIC ${DPDK_CFLAGS_OTHER})
+  target_link_options(samurai_l7emu PUBLIC ${DPDK_LDFLAGS_OTHER})
+else()
+  message(STATUS "libdpdk not found: samurai_l7emu links the DPDK stub (no native DPDK path)")
+endif()
 
 if(OPENSSL_FOUND)
   target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_WITH_OPENSSL=1)

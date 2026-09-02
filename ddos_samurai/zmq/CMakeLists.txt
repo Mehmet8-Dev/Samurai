@@ -69,9 +69,9 @@ add_samurai_worker(samurai_gpu_worker daemon/gpu_worker.cpp)
 # bridge symbols (afpkt_send_ring_bridge/afpkt_cleanup_ring_bridge) resolve.
 target_link_libraries(samurai_gpu_worker PRIVATE pacing_engine_static af_packet_static pthread dl)
 add_samurai_worker(samurai_dpdk_worker daemon/dpdk_worker.cpp)
-# Tek native DPDK çekirdeği; başlık rte/Python bağımsız, kaynak SAMURAI_WITH_DPDK
-# ile kendini gate'ler (libdpdk yokken güvenli saplama derlenir).
-target_sources(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk/dpdk_core.cpp)
+# Tek native DPDK çekirdeği (dpdk/dpdk_core) artık samurai_l7emu içinde konsolide
+# derlenir ve SAMURAI_WITH_DPDK + DPDK link bayrakları PUBLIC yayılır; worker onu
+# transitif link'ler (burada ayrıca derlemek çift-sembol yaratırdı).
 # Paylaşılan userspace stateful TCP fast-path sürücüsü (rte/xdp header'ı içermez).
 target_sources(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
 target_include_directories(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk)
@@ -100,8 +100,8 @@ target_include_directories(samurai_scenario_worker PRIVATE ${CMAKE_CURRENT_SOURC
 # Opt-in DPDK: senaryo load_model.transport="dpdk_direct" için dpdk_worker ile AYNI
 # native çekirdek + paylaşılan stateful fast-path sürücüsü. Header'lar rte/xdp içermez;
 # libdpdk yokken kaynak SAMURAI_WITH_DPDK ile güvenli saplama derler ve worker
-# kernel_socket'e düşer (varsayılan commodity yol değişmez).
-target_sources(samurai_scenario_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk/dpdk_core.cpp)
+# kernel_socket'e düşer (varsayılan commodity yol değişmez). dpdk_core artık
+# samurai_l7emu içinde konsolide (bkz. l7_emu_native/CMakeLists.txt); transitif link'lenir.
 target_sources(samurai_scenario_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
 target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static samurai_scenario samurai_l7emu pthread)
 if(DPDK_FOUND)
