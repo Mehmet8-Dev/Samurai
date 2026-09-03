@@ -30,6 +30,7 @@
 #include "auth.hpp"
 #include "daemon/daemon_args.hpp"
 #include "autoscale.hpp"
+#include "closed_loop.hpp"
 #include "discovery.hpp"
 #include "ha.hpp"
 #include "json.hpp"
@@ -340,6 +341,127 @@ int main() {
     auto d2 = ctl.MaybeScale(40, 0, 1);  // desired 10 > 4 => wants a patch
     Check(!d2.changed && !d2.ok && d2.reason == "backend-patch-failed",
           "autoscale-k8s: patch failure reported, no change");
+  }
+
+  // --- closed-loop: disabled short-circuits ---
+  {
+    using namespace samurai::control;
+    ClosedLoopConfig cfg;  // enabled=false
+    ClosedLoopController cl(cfg);
+    LoadSample s;
+    s.valid = true;
+    auto d = cl.Step(s);
+    Check(!d.enabled && d.done && d.phase == "disabled", "closed-loop: disabled short-circuits");
+  }
+
+  // --- closed-loop: SLO health verdict (unknown inputs are skipped) ---
+  {
+    using namespace samurai::control;
+    ClosedLoopConfig cfg;
+    cfg.enabled = true;
+    cfg.slo_max_error_pct = 1.0;
+    cfg.slo_max_latency_ms = 200.0;  // latency unknown on the sample => rule skipped
+    ClosedLoopController cl(cfg);
+
+    LoadSample green;
+    green.attempted = 1000;
+    green.errors = 5;  // 0.5% <= 1%
+    Check(cl.IsHealthy(green), "closed-loop: 0.5% error is green");
+
+    LoadSample red;
+    red.attempted = 1000;
+    red.errors = 20;  // 2% > 1%
+    Check(!cl.IsHealthy(red), "closed-loop: 2% error is red");
+
+    LoadSample derived;  // error_pct left at -1 => derived from errors/attempted
+    derived.attempted = 100;
+    derived.errors = 2;  // 2%
+    Check(!cl.IsHealthy(derived), "closed-loop: derived error_pct honored");
+  }
+
+  // --- closed-loop AIMD: increase while green, backoff on violation ---
+  {
+    using namespace samurai::control;
+    ClosedLoopConfig cfg;
+    cfg.enabled = true;
+    cfg.strategy = ClosedLoopStrategy::kAimd;
+    cfg.min_rps = 100;
+    cfg.max_rps = 10000;
+    cfg.initial_rps = 1000;
+    cfg.aimd_increase_rps = 500;
+    cfg.aimd_backoff = 0.5;
+    cfg.slo_max_error_pct = 1.0;
+    ClosedLoopController cl(cfg);
+    Check(cl.initial_setpoint() == 1000, "closed-loop aimd: initial setpoint");
+
+    LoadSample green;
+    green.attempted = 1000;
+    green.errors = 0;
+    auto d1 = cl.Step(green);  // ran 1000 green -> best=1000, next=1500
+    Check(d1.last_healthy && d1.setpoint_rps == 1500 && d1.best_good_rps == 1000,
+          "closed-loop aimd: additive increase");
+
+    LoadSample red;
+    red.attempted = 1000;
+    red.errors = 50;           // 5% > 1%
+    auto d2 = cl.Step(red);    // ran 1500 red -> next = 1500*0.5 = 750
+    Check(!d2.last_healthy && d2.setpoint_rps == 750 && d2.phase == "backoff",
+          "closed-loop aimd: multiplicative backoff");
+    Check(d2.best_good_rps == 1000, "closed-loop aimd: best-good retained across backoff");
+  }
+
+  // --- closed-loop AIMD: window budget ends the run at best-good ---
+  {
+    using namespace samurai::control;
+    ClosedLoopConfig cfg;
+    cfg.enabled = true;
+    cfg.strategy = ClosedLoopStrategy::kAimd;
+    cfg.min_rps = 100;
+    cfg.max_rps = 10000;
+    cfg.initial_rps = 1000;
+    cfg.aimd_increase_rps = 500;
+    cfg.aimd_max_windows = 2;
+    cfg.slo_max_error_pct = 1.0;
+    ClosedLoopController cl(cfg);
+    LoadSample green;
+    green.attempted = 1000;
+    green.errors = 0;
+    cl.Step(green);            // window 1
+    auto d = cl.Step(green);   // window 2 -> budget exhausted
+    Check(d.done && d.phase == "done" && d.setpoint_rps == d.best_good_rps,
+          "closed-loop aimd: window budget stops at best-good");
+  }
+
+  // --- closed-loop binary-search: brackets up then bisects to the ceiling ---
+  {
+    using namespace samurai::control;
+    ClosedLoopConfig cfg;
+    cfg.enabled = true;
+    cfg.strategy = ClosedLoopStrategy::kBinSearch;
+    cfg.min_rps = 1000;
+    cfg.max_rps = 100000;
+    cfg.initial_rps = 1000;
+    cfg.binsearch_tolerance_rps = 300;
+    cfg.binsearch_max_windows = 40;
+    cfg.slo_max_error_pct = 1.0;
+    ClosedLoopController cl(cfg);
+
+    // The SUT sustains up to ~8000 rps; above that it starts erroring.
+    const double ceiling = 8000.0;
+    int guard = 0;
+    ClosedLoopDecision d;
+    double ran = cl.current_setpoint();
+    do {
+      LoadSample s;
+      s.attempted = 1000;
+      s.errors = ran <= ceiling ? 0 : 50;  // green under the ceiling, red above
+      d = cl.Step(s);
+      ran = d.setpoint_rps;
+    } while (!d.done && ++guard < 60);
+
+    Check(d.done, "closed-loop binsearch: converges");
+    Check(d.best_good_rps <= ceiling && d.best_good_rps >= ceiling - 1500,
+          "closed-loop binsearch: best-good sits just under the true ceiling");
   }
 
   // --- json: parse / access / round-trip ---

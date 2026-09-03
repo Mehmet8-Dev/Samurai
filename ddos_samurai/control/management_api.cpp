@@ -586,6 +586,7 @@ HttpResponse ManagementApi::Handle(const HttpRequest& req) const {
     b.set("multi_master_regions", ArrOr(st, "multi_master_regions"));
     b.set("multi_master_latest", ArrOr(st, "multi_master_latest"));
     b.set("autoscale", ObjOr(st, "autoscale"));
+    b.set("closed_loop", ObjOr(st, "closed_loop"));
     b.set("workers_count", Value::Int(static_cast<std::int64_t>(workers.elements().size())));
     b.set("shards_reported_count", Value::Int(static_cast<std::int64_t>(shards.elements().size())));
     return JsonResp(200, "OK", b);

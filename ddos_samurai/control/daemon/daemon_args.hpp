@@ -39,6 +39,16 @@ inline long OptInt(int argc, char** argv, const char* flag, long def) {
   }
 }
 
+inline double OptDouble(int argc, char** argv, const char* flag, double def) {
+  const std::string v = Opt(argc, argv, flag, "");
+  if (v.empty()) return def;
+  try {
+    return std::stod(v);
+  } catch (...) {
+    return def;
+  }
+}
+
 inline bool Flag(int argc, char** argv, const char* flag) {
   for (int i = 1; i < argc; ++i) {
     if (flag == std::string(argv[i])) return true;

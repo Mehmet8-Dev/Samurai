@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "autoscale.hpp"
+#include "closed_loop.hpp"
 #include "control_auth.hpp"
 #include "control_server.hpp"
 #include "curve.hpp"
@@ -49,7 +50,8 @@ std::string LowerCopy(std::string s) {
 // it is attached as the `autoscale` field.
 Value BuildState(samurai::control::Servicer* svc,
                  samurai::control::RedisMultiMasterCoordinator* mm = nullptr,
-                 const Value* autoscale_json = nullptr) {
+                 const Value* autoscale_json = nullptr,
+                 const Value* closed_loop_json = nullptr) {
   Value st = Value::Object();
   Value workers = Value::Array();
   for (const auto& w : svc->SnapshotWorkers()) {
@@ -70,6 +72,9 @@ Value BuildState(samurai::control::Servicer* svc,
   }
   if (autoscale_json && autoscale_json->is_object()) {
     st.set("autoscale", *autoscale_json);
+  }
+  if (closed_loop_json && closed_loop_json->is_object()) {
+    st.set("closed_loop", *closed_loop_json);
   }
   return st;
 }
@@ -92,6 +97,72 @@ Value AutoscaleStateJson(const samurai::control::AutoscaleDecision& d,
   // "kubernetes" => current/applied reflect the cluster scale subresource;
   // "in-memory" => the controller's internal model (no cluster backend resolved).
   o.set("backend", Value::Str(backend));
+  return o;
+}
+
+// Parse the closed-loop (autopilot) knobs off the CLI into a ClosedLoopConfig.
+samurai::control::ClosedLoopConfig BuildClosedLoopConfig(int argc, char** argv) {
+  using namespace samurai::control;
+  using namespace samurai::control::daemon;
+  ClosedLoopConfig cl;
+  cl.enabled = Flag(argc, argv, "--closed-loop");
+  const std::string strat = LowerCopy(Opt(argc, argv, "--cl-strategy", "aimd"));
+  cl.strategy = (strat == "binsearch" || strat == "binary" || strat == "bisect")
+                    ? ClosedLoopStrategy::kBinSearch
+                    : ClosedLoopStrategy::kAimd;
+  cl.min_rps = static_cast<double>(OptInt(argc, argv, "--cl-min-rps", 1));
+  cl.max_rps = static_cast<double>(OptInt(argc, argv, "--cl-max-rps", 1000000));
+  cl.initial_rps = static_cast<double>(OptInt(argc, argv, "--cl-initial-rps", 0));
+  cl.slo_max_error_pct = OptDouble(argc, argv, "--cl-slo-max-error-pct", 0.0);
+  cl.slo_max_loss_pct = OptDouble(argc, argv, "--cl-slo-max-loss-pct", 0.0);
+  cl.slo_min_rate_accuracy_pct = OptDouble(argc, argv, "--cl-slo-min-rate-accuracy-pct", 0.0);
+  cl.slo_max_latency_ms = OptDouble(argc, argv, "--cl-slo-max-latency-ms", 0.0);
+  cl.aimd_increase_rps = static_cast<double>(OptInt(argc, argv, "--cl-aimd-increase-rps", 0));
+  cl.aimd_backoff = OptDouble(argc, argv, "--cl-aimd-backoff", 0.5);
+  cl.aimd_max_windows = static_cast<int>(OptInt(argc, argv, "--cl-aimd-max-windows", 0));
+  cl.binsearch_tolerance_rps =
+      static_cast<double>(OptInt(argc, argv, "--cl-binsearch-tolerance-rps", 0));
+  cl.binsearch_max_windows = static_cast<int>(OptInt(argc, argv, "--cl-binsearch-max-windows", 24));
+  return cl;
+}
+
+// Derive one closed-loop LoadSample from an aggregated run snapshot. Today the
+// honest SLO signal is the error rate (sent/errors are always present); rps is
+// the cross-shard aggregate. rate-accuracy/loss/latency are left unknown (-1) so
+// their rules stay inert until real per-window signals (and #3 SUT p99) feed them.
+samurai::control::LoadSample DeriveSample(const Value& snap) {
+  samurai::control::LoadSample s;
+  const Value* sent = snap.find("sent");
+  const Value* errs = snap.find("errors");
+  const double sent_v = sent ? static_cast<double>(sent->as_int(0)) : 0.0;
+  const double err_v = errs ? static_cast<double>(errs->as_int(0)) : 0.0;
+  s.attempted = sent_v + err_v;
+  s.errors = err_v;
+  if (const Value* nt = snap.find("numeric_totals")) {
+    if (const Value* rps = nt->find("actual_rps")) s.actual_rps = rps->as_double(0.0);
+  }
+  s.valid = true;
+  return s;
+}
+
+// Serialize a closed-loop decision into the JSON object surfaced by the
+// management API (/v1/cluster/summary -> "closed_loop").
+Value ClosedLoopStateJson(const samurai::control::ClosedLoopDecision& d,
+                          const samurai::control::ClosedLoopConfig& cfg) {
+  Value o = Value::Object();
+  o.set("enabled", Value::Bool(d.enabled));
+  o.set("strategy", Value::Str(cfg.strategy == samurai::control::ClosedLoopStrategy::kBinSearch
+                                   ? "binsearch"
+                                   : "aimd"));
+  o.set("done", Value::Bool(d.done));
+  o.set("phase", Value::Str(d.phase));
+  o.set("reason", Value::Str(d.reason));
+  o.set("window", Value::Int(d.window));
+  o.set("setpoint_rps", Value::Double(d.setpoint_rps));
+  o.set("best_good_rps", Value::Double(d.best_good_rps));
+  o.set("last_healthy", Value::Bool(d.last_healthy));
+  o.set("error_pct", Value::Double(d.error_pct));
+  o.set("slo_max_error_pct", Value::Double(cfg.slo_max_error_pct));
   return o;
 }
 
@@ -412,6 +483,14 @@ int main(int argc, char** argv) {
   std::mutex as_mu;
   Value as_json = Value::Object();
 
+  // Closed-loop (autopilot) load controller. The setpoint-search decision state
+  // machine is native; master drives it by running one RunSingleJob window per
+  // step at the current target_rps and folding the aggregated snapshot back into
+  // a LoadSample. Latest decision is published under cl_mu for the mgmt API.
+  const samurai::control::ClosedLoopConfig clcfg = BuildClosedLoopConfig(argc, argv);
+  std::mutex cl_mu;
+  Value cl_json = Value::Object();
+
   // Control server.
   const std::string cluster_secret =
       OptOrEnv(argc, argv, "--cluster-secret", "SAMURAI_CLUSTER_SECRET");
@@ -505,7 +584,9 @@ int main(int argc, char** argv) {
                   curve_public.empty() ? "off" : "on", tls.enabled ? "on" : "off");
     }
     ManagementProviders providers;
-    providers.state_provider = [&servicer, &mm, &as_mu, &as_json, autoscale_on]() {
+    const bool closed_loop_on = clcfg.enabled;
+    providers.state_provider = [&servicer, &mm, &as_mu, &as_json, autoscale_on, &cl_mu, &cl_json,
+                                closed_loop_on]() {
       Value asj;
       bool has_as = false;
       if (autoscale_on) {
@@ -513,7 +594,15 @@ int main(int argc, char** argv) {
         asj = as_json;
         has_as = asj.find("enabled") != nullptr;  // populated once the thread ran
       }
-      return BuildState(&servicer, mm.get(), has_as ? &asj : nullptr);
+      Value clj;
+      bool has_cl = false;
+      if (closed_loop_on) {
+        std::lock_guard<std::mutex> lk(cl_mu);
+        clj = cl_json;
+        has_cl = clj.find("enabled") != nullptr;  // populated once the first window ran
+      }
+      return BuildState(&servicer, mm.get(), has_as ? &asj : nullptr,
+                        has_cl ? &clj : nullptr);
     };
     providers.abort_callback = []() {
       Value r = Value::Object();
@@ -641,11 +730,87 @@ int main(int argc, char** argv) {
     } else {
       const std::int64_t ep_now = current_leader_epoch();
       servicer.set_leader_epoch_min(ep_now);
-      JobConfig job = BuildJobConfig(spec, ep_now, tenant, master_region);
-      attach_progress(job);
-      const JobResult res = coord.RunSingleJob(job, "job-1", guard);
-      std::printf("%s\n", res.snapshot.dump().c_str());
-      rc = res.rc;
+      if (clcfg.enabled) {
+        // Autopilot: repeatedly run a measured window at the controller's current
+        // setpoint (target_rps), fold the snapshot into a LoadSample, and let the
+        // controller pick the next setpoint until it converges / exhausts budget.
+        const int window_s = std::max(1, static_cast<int>(OptInt(argc, argv, "--cl-window-s", 5)));
+        samurai::control::ClosedLoopController ctl(clcfg);
+        std::printf(
+            "samurai_master: closed-loop enabled (strategy=%s window=%ds min=%.0f max=%.0f "
+            "initial=%.0f slo_max_error_pct=%.2f)\n",
+            clcfg.strategy == samurai::control::ClosedLoopStrategy::kBinSearch ? "binsearch" : "aimd",
+            window_s, clcfg.min_rps, clcfg.max_rps, ctl.initial_setpoint(), clcfg.slo_max_error_pct);
+        int win = 0;
+        bool cl_aborted = false;
+        samurai::control::ClosedLoopDecision dec;
+        while (!g_stop.load() && guard()) {
+          const double setpoint = ctl.current_setpoint();
+          // A window runs `setpoint * window_s` packets at the requested rps.
+          const std::int64_t win_count =
+              std::max<std::int64_t>(1, static_cast<std::int64_t>(setpoint * window_s));
+          Value wspec = spec;
+          wspec.set("count", Value::Int(win_count));
+          wspec.set("target_rps", Value::Double(setpoint));
+          JobConfig job = BuildJobConfig(wspec, ep_now, tenant, master_region);
+          job.base_args.set("target_rps", Value::Double(setpoint));
+          job.base_args.set("pacing_mode", Value::Int(1));
+          attach_progress(job);
+          const JobResult res =
+              coord.RunSingleJob(job, "cl-" + std::to_string(++win), guard);
+          samurai::control::LoadSample sample = DeriveSample(res.snapshot);
+          // A window that generated no traffic (no workers / dispatch failure)
+          // is "no data", not SLO-green — treating it as green would make the
+          // controller ramp forever. Abort the search with a clear error.
+          if (sample.attempted <= 0.0) {
+            std::fprintf(stderr,
+                         "samurai_master: closed-loop window=%d produced no traffic "
+                         "(rc=%d); aborting search — check workers/dispatch.\n",
+                         win, res.rc);
+            rc = 1;
+            Value clj = Value::Object();
+            clj.set("enabled", Value::Bool(true));
+            clj.set("done", Value::Bool(true));
+            clj.set("phase", Value::Str("aborted"));
+            clj.set("reason", Value::Str("no traffic in window"));
+            clj.set("window", Value::Int(win));
+            {
+              std::lock_guard<std::mutex> lk(cl_mu);
+              cl_json = clj;
+            }
+            cl_aborted = true;
+            break;
+          }
+          dec = ctl.Step(sample);
+          {
+            std::lock_guard<std::mutex> lk(cl_mu);
+            cl_json = ClosedLoopStateJson(dec, clcfg);
+          }
+          std::printf(
+              "samurai_master: closed-loop window=%d ran_rps=%.0f healthy=%d error_pct=%.3f "
+              "next_setpoint=%.0f best_good=%.0f phase=%s\n",
+              dec.window, setpoint, dec.last_healthy ? 1 : 0, dec.error_pct, dec.setpoint_rps,
+              dec.best_good_rps, dec.phase.c_str());
+          if (dec.done) break;
+        }
+        Value clsummary = Value::Object();
+        clsummary.set("event", Value::Str("closed_loop_result"));
+        clsummary.set("strategy",
+                      Value::Str(clcfg.strategy == samurai::control::ClosedLoopStrategy::kBinSearch
+                                     ? "binsearch"
+                                     : "aimd"));
+        clsummary.set("windows", Value::Int(dec.window));
+        clsummary.set("best_good_rps", Value::Double(dec.best_good_rps));
+        clsummary.set("final_phase", Value::Str(dec.phase));
+        std::printf("%s\n", clsummary.dump().c_str());
+        if (!cl_aborted) rc = dec.best_good_rps > 0.0 ? 0 : 1;
+      } else {
+        JobConfig job = BuildJobConfig(spec, ep_now, tenant, master_region);
+        attach_progress(job);
+        const JobResult res = coord.RunSingleJob(job, "job-1", guard);
+        std::printf("%s\n", res.snapshot.dump().c_str());
+        rc = res.rc;
+      }
     }
   }
 

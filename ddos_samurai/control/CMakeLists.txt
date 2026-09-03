@@ -40,6 +40,7 @@ set(CONTROL_SOURCES
   shard.cpp
   auth.cpp
   autoscale.cpp
+  closed_loop.cpp       # autopilot load controller (AIMD / binary-search SLO search)
   discovery.cpp
   jwt.cpp
   telemetry.cpp
