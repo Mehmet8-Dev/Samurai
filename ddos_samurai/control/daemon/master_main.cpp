@@ -10,6 +10,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -197,6 +198,114 @@ Value ClosedLoopStateJson(const samurai::control::ClosedLoopDecision& d,
   return o;
 }
 
+// Defense-reaction signals: how the SUT's WAF/IPS/rate-limiter/overload handling
+// pushed back on the load this window. Extracted raw from the aggregated snapshot
+// (numeric_totals) so the offline pipeline can derive the Mahoraga features it
+// wants (rate-limited ratio = status_4xx/responses, overload ratio = status_5xx,
+// conn-drop ratio = 1 - established/attempted, reset/goaway pressure, challenge
+// rate = expectation_failures). Only keys present in the snapshot are emitted;
+// absent ones stay unknown so the dataset builder masks them per run.
+Value RlDefenseJson(const Value& snap) {
+  Value o = Value::Object();
+  const Value* nt = snap.find("numeric_totals");
+  if (!nt || !nt->is_object()) return o;
+  static const char* kKeys[] = {
+      "responses_total",        "status_2xx",
+      "status_3xx",             "status_4xx",
+      "status_5xx",             "l7_conn_attempted",
+      "l7_conn_established",    "l7_expectation_failures",
+      "l7_scheduler_backpressure_count", "h2_goaway_count",
+      "h2_stream_reset_ratio",  "l7_request_latency_p99_ms",
+      "l7_tls_handshake_p99_ms",
+  };
+  for (const char* k : kKeys) {
+    if (const Value* v = nt->find(k)) o.set(k, Value::Double(v->as_double(0.0)));
+  }
+  return o;
+}
+
+// Structured action: today the controller only drives rps (+ a fixed pacing
+// mode), but the RL policy's action space is the richer Mahoraga vector. The
+// columns are logged now so the corpus schema is stable — the not-yet-driven
+// levers carry their current spec value (or -1 = "not a controlled dimension in
+// this run") and start varying the moment a policy drives them, no migration.
+Value RlActionJson(double rps, const Value& base_args) {
+  Value a = Value::Object();
+  a.set("rps", Value::Double(rps));
+  const Value* pm = base_args.find("pacing_mode");
+  a.set("pacing_mode", Value::Int(pm ? pm->as_int(0) : -1));
+  const Value* cc = base_args.find("concurrency");
+  a.set("concurrency", cc ? Value::Int(cc->as_int(0)) : Value::Int(-1));
+  const Value* conns = base_args.find("connections");
+  a.set("connections", conns ? Value::Int(conns->as_int(0)) : Value::Int(-1));
+  // Levers with no spec knob yet: schema placeholders for the rich policy.
+  a.set("request_mix", Value::Int(-1));
+  a.set("source_rotation", Value::Int(-1));
+  return a;
+}
+
+// Serialize one measured window (LoadSample folded with the SUT scrape and the
+// defense-reaction signals) into the raw state object logged to the RL corpus.
+// Fields left < 0 by the caller stay "unknown" and are carried through verbatim —
+// the offline pipeline decides how to impute/mask them. No reward is computed
+// here on purpose: reward shaping lives in Python so it can be retuned without
+// recapturing.
+Value RlStateJson(const samurai::control::LoadSample& s, const Value& defense) {
+  Value o = Value::Object();
+  o.set("valid", Value::Bool(s.valid));
+  o.set("rps", Value::Double(s.actual_rps));
+  o.set("attempted", Value::Double(s.attempted));
+  o.set("errors", Value::Double(s.errors));
+  o.set("error_pct", Value::Double(s.error_pct));
+  o.set("loss_pct", Value::Double(s.loss_pct));
+  o.set("rate_accuracy_pct", Value::Double(s.rate_accuracy_pct));
+  o.set("p99_ms", Value::Double(s.latency_p99_ms));
+  o.set("defense", defense);
+  return o;
+}
+
+// One RL corpus transition: state that produced the action (prev window), the
+// action (setpoint sent), the resulting next state (this window), and enough run
+// context for the offline dataset builder to compute reward and group episodes.
+Value RlTransitionJson(const std::string& run_id, int win, double action_rps,
+                       const Value& action, const samurai::control::LoadSample& s_prev,
+                       const Value& def_prev, const samurai::control::LoadSample& s_next,
+                       const Value& def_next,
+                       const samurai::control::ClosedLoopDecision& dec,
+                       const samurai::control::ClosedLoopConfig& cfg, int window_s,
+                       bool first) {
+  using samurai::control::ClosedLoopStrategy;
+  Value o = Value::Object();
+  o.set("run_id", Value::Str(run_id));
+  o.set("win", Value::Int(win));
+  o.set("ts_ms", Value::Int(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count()));
+  o.set("strategy",
+        Value::Str(cfg.strategy == ClosedLoopStrategy::kBinSearch ? "binsearch" : "aimd"));
+  o.set("min_rps", Value::Double(cfg.min_rps));
+  o.set("max_rps", Value::Double(cfg.max_rps));
+  o.set("window_s", Value::Int(window_s));
+  Value slo = Value::Object();
+  slo.set("max_error_pct", Value::Double(cfg.slo_max_error_pct));
+  slo.set("max_loss_pct", Value::Double(cfg.slo_max_loss_pct));
+  slo.set("min_rate_accuracy_pct", Value::Double(cfg.slo_min_rate_accuracy_pct));
+  slo.set("max_latency_ms", Value::Double(cfg.slo_max_latency_ms));
+  o.set("slo", slo);
+  // Scalar action_rps kept for back-compat; `action` is the full Mahoraga vector.
+  o.set("action_rps", Value::Double(action_rps));
+  o.set("action", action);
+  // s is undefined on the first window (no prior measured state) — mark it so the
+  // dataset builder drops the leading transition instead of learning from a stub.
+  o.set("s_valid", Value::Bool(!first));
+  o.set("s", RlStateJson(s_prev, def_prev));
+  o.set("s2", RlStateJson(s_next, def_next));
+  o.set("healthy", Value::Bool(dec.last_healthy));
+  o.set("phase", Value::Str(dec.phase));
+  o.set("done", Value::Bool(dec.done));
+  return o;
+}
+
 // Collect the job parameters (CLI or delegated) into a single JSON spec so both
 // the local and cross-region delegated paths build a JobConfig the same way.
 Value JobSpecFromArgs(int argc, char** argv) {
@@ -320,6 +429,34 @@ void Usage(const char* argv0) {
       "                            from `kubectl proxy`); omit to auto-detect the\n"
       "                            in-cluster service account, else in-memory only\n"
       "  --autoscale-k8s-insecure  skip TLS verification for the k8s API (dev only)\n"
+      "  Autopilot (closed-loop load controller; find/hold the SUT's SLO ceiling):\n"
+      "  --closed-loop             drive target_rps across measured windows to find\n"
+      "                            and hold the max load that stays SLO-green\n"
+      "  --cl-strategy S           aimd | binsearch (default aimd)\n"
+      "  --cl-window-s N           seconds per measured window (default 5)\n"
+      "  --cl-min-rps N            setpoint floor (default 1)\n"
+      "  --cl-max-rps N            setpoint ceiling (default 1000000)\n"
+      "  --cl-initial-rps N        first setpoint (0 => min)\n"
+      "  --cl-slo-max-error-pct X  SLO: errors/attempted*100 <= X (0 = rule off)\n"
+      "  --cl-slo-max-loss-pct X   SLO: wire loss %% <= X (0 = off)\n"
+      "  --cl-slo-min-rate-accuracy-pct X  SLO: rate accuracy %% >= X (0 = off)\n"
+      "  --cl-slo-max-latency-ms X SLO: SUT p99 ms <= X (needs --sut-*; 0 = off)\n"
+      "  --cl-aimd-increase-rps N  AIMD additive step (0 => 10%% of range)\n"
+      "  --cl-aimd-backoff X       AIMD multiplicative decrease, (0,1) (default 0.5)\n"
+      "  --cl-aimd-max-windows N   AIMD window budget (0 => unbounded soak)\n"
+      "  --cl-binsearch-tolerance-rps N  binsearch stop width (0 => 1%% of range)\n"
+      "  --cl-binsearch-max-windows N    binsearch window cap (default 24)\n"
+      "  SUT correlation (feed target-side p99 into the latency SLO):\n"
+      "  --sut-prometheus-url U    Prometheus base to scrape per window\n"
+      "  --sut-latency-p99-query Q PromQL returning the SUT p99 latency (ms)\n"
+      "  --sut-extra-queries L     ';'-separated name=promql pairs to record\n"
+      "  --sut-timeout-s N         scrape timeout (default 5)\n"
+      "  --sut-insecure            skip TLS verification for the Prometheus scrape\n"
+      "  RL layer (offline-RL training corpus for the autopilot policy):\n"
+      "  --rl-corpus PATH          append one (s,a,s') NDJSON record per closed-loop\n"
+      "                            window to PATH (training data; reward computed\n"
+      "                            offline in ddos_samurai/models/rl). Needs\n"
+      "                            --closed-loop; off => zero overhead\n"
       "  -h, --help\n",
       argv0);
 }
@@ -778,6 +915,28 @@ int main(int argc, char** argv) {
             "initial=%.0f slo_max_error_pct=%.2f)\n",
             clcfg.strategy == samurai::control::ClosedLoopStrategy::kBinSearch ? "binsearch" : "aimd",
             window_s, clcfg.min_rps, clcfg.max_rps, ctl.initial_setpoint(), clcfg.slo_max_error_pct);
+        // RL corpus capture: opt-in per-window (s,a,s') transition log for the
+        // offline-RL training pipeline. Append-only NDJSON (crash-safe); reward is
+        // computed downstream in Python. Disabled => zero overhead.
+        const std::string rl_corpus_path = Opt(argc, argv, "--rl-corpus", "");
+        std::ofstream rl_corpus;
+        if (!rl_corpus_path.empty()) {
+          rl_corpus.open(rl_corpus_path, std::ios::app);
+          if (!rl_corpus.is_open()) {
+            std::fprintf(stderr, "samurai_master: --rl-corpus: cannot open %s for append\n",
+                         rl_corpus_path.c_str());
+          } else {
+            std::printf("samurai_master: RL corpus capture on (path=%s)\n",
+                        rl_corpus_path.c_str());
+          }
+        }
+        const std::string rl_run_id =
+            "cl-" + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count());
+        samurai::control::LoadSample rl_prev_sample;  // state that produced this window's action
+        Value rl_prev_defense = Value::Object();       // its defense-reaction signals
+        bool rl_have_prev = false;
         int win = 0;
         bool cl_aborted = false;
         samurai::control::ClosedLoopDecision dec;
@@ -833,6 +992,21 @@ int main(int argc, char** argv) {
             cl_json = ClosedLoopStateJson(dec, clcfg);
             if (sut.enabled()) cl_json.set("sut", samurai::control::SutProbe::SampleJson(sut_sample));
           }
+          // Log the transition: state that produced `setpoint` (previous window),
+          // the (Mahoraga) action, and the state + defense-reaction it led to.
+          const Value rl_defense = RlDefenseJson(res.snapshot);
+          if (rl_corpus.is_open()) {
+            const Value action = RlActionJson(setpoint, job.base_args);
+            const Value tr =
+                RlTransitionJson(rl_run_id, win, setpoint, action, rl_prev_sample,
+                                 rl_prev_defense, sample, rl_defense, dec, clcfg, window_s,
+                                 !rl_have_prev);
+            rl_corpus << tr.dump() << '\n';
+            rl_corpus.flush();
+          }
+          rl_prev_sample = sample;
+          rl_prev_defense = rl_defense;
+          rl_have_prev = true;
           std::printf(
               "samurai_master: closed-loop window=%d ran_rps=%.0f healthy=%d error_pct=%.3f "
               "p99_ms=%.1f next_setpoint=%.0f best_good=%.0f phase=%s\n",

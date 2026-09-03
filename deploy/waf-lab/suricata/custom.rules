@@ -1,0 +1,25 @@
+# Minimal Suricata signatures for the lab. In the default bridge setup Suricata
+# runs as an IDS (alerts to /var/log/suricata/eve.json); with an inline/NFQUEUE
+# setup and `drop` actions it becomes an IPS. These fire on the traffic the load
+# generator produces so eve.json carries a real IDS signal alongside the WAF/limiter.
+
+# High-rate HTTP from a single source — the load itself, seen as a flood.
+alert http any any -> any any ( \
+    msg:"SAMURAI-LAB HTTP request flood (per-source rate)"; \
+    flow:to_server; \
+    threshold:type both, track by_src, count 500, seconds 5; \
+    classtype:attempted-dos; sid:9000001; rev:1;)
+
+# Scanner user-agents (mirrors the WAF scanner rule at the network layer).
+alert http any any -> any any ( \
+    msg:"SAMURAI-LAB scanner user-agent"; \
+    flow:to_server; http.user_agent; \
+    pcre:"/(?:sqlmap|nikto|nmap|masscan|dirbuster|nuclei|acunetix)/i"; \
+    classtype:web-application-attack; sid:9000002; rev:1;)
+
+# Burst of new connections — connection-flood shape (SYN pressure at L7 ingress).
+alert tcp any any -> any 8080 ( \
+    msg:"SAMURAI-LAB connection flood"; \
+    flags:S; \
+    threshold:type both, track by_src, count 300, seconds 5; \
+    classtype:attempted-dos; sid:9000003; rev:1;)

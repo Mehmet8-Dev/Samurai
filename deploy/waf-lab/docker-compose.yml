@@ -1,0 +1,92 @@
+# DDoSamurai WAF/IPS resilience lab.
+#
+# A *defended* HTTP target you own, built to REACT to load so the closed-loop
+# autopilot (samurai_master --closed-loop --rl-corpus) records real
+# defense-reaction transitions for the Mahoraga RL policy. Request path:
+#
+#     load  ->  caddy (Coraza WAF, 403 block)
+#           ->  nginx (limit_req 429 / limit_conn 503, overload shedding)
+#           ->  whoami (origin, 200)
+#     suricata  sniffs caddy ingress -> eve.json IDS alerts (observability / opt-in IPS)
+#     fail2ban  watches nginx 429 log -> bans source IP (connection refused)
+#
+# Turnkey layers (no host privileges): caddy WAF + nginx rate-limit + whoami.
+# Privileged, opt-in layers (need NET_ADMIN, may need host netfilter): suricata
+# inline drop and fail2ban banning — see README. They still emit signals (alerts /
+# bans) in the default bridge setup; true inline blocking is environment-specific.
+
+name: samurai-waf-lab
+
+services:
+  # Origin — a trivial always-200 echo. The thing "behind" the defenses.
+  whoami:
+    image: traefik/whoami:v1.10.2
+    container_name: samurai-lab-origin
+    restart: unless-stopped
+    command: ["--port", "80"]
+    networks: [labnet]
+
+  # Rate-limit / overload tier. Real 429 (limit_req) and 503 (limit_conn) under load.
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: samurai-lab-nginx
+    restart: unless-stopped
+    depends_on: [whoami]
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_logs:/var/log/nginx
+    networks: [labnet]
+
+  # WAF edge. OWASP-Coraza via Caddy; blocks anomalous requests with 403.
+  # Built locally (xcaddy + coraza-caddy) — see caddy/Dockerfile.
+  caddy:
+    build:
+      context: ./caddy
+    container_name: samurai-lab-waf
+    restart: unless-stopped
+    depends_on: [nginx]
+    ports:
+      - "${WAF_LAB_PORT:-8080}:8080"   # <-- point samurai --target here
+    volumes:
+      - caddy_logs:/var/log/caddy
+    networks: [labnet]
+
+  # IDS. Sniffs the WAF container's ingress and writes eve.json alerts. Passive by
+  # default; NET_ADMIN + a mirror/inline setup turns it into an IPS (see README).
+  suricata:
+    image: jasonish/suricata:7.0
+    container_name: samurai-lab-ids
+    restart: unless-stopped
+    depends_on: [caddy]
+    network_mode: "service:caddy"     # share the WAF netns to see ingress packets
+    cap_add: [NET_ADMIN, NET_RAW, SYS_NICE]
+    command: ["-i", "eth0"]
+    volumes:
+      - ./suricata/custom.rules:/etc/suricata/rules/custom.rules:ro
+      - suricata_logs:/var/log/suricata
+
+  # Log-driven banning. Reads nginx's 429 log and bans the source IP, turning
+  # sustained abuse into connection refusals the load generator observes.
+  fail2ban:
+    image: crazymax/fail2ban:1.1.0
+    container_name: samurai-lab-fail2ban
+    restart: unless-stopped
+    depends_on: [nginx]
+    network_mode: host                # ban with the host's netfilter
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      - TZ=UTC
+      - F2B_LOG_LEVEL=INFO
+    volumes:
+      - ./fail2ban/jail.d:/etc/fail2ban/jail.d:ro
+      - ./fail2ban/filter.d:/etc/fail2ban/filter.d:ro
+      - nginx_logs:/var/log/nginx:ro
+
+networks:
+  labnet:
+    driver: bridge
+
+volumes:
+  nginx_logs:
+  caddy_logs:
+  suricata_logs:

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Drive the closed-loop autopilot against the WAF lab and capture an RL corpus.
+#
+# Prereqs:
+#   1. The lab is up:   docker compose -f deploy/waf-lab/docker-compose.yml up -d --build
+#   2. The native daemons + an L7 worker are built (see build/).
+#
+# This brings up one L7 worker + the master with --closed-loop --rl-corpus pointed
+# at the lab ingress, so every measured window is logged as an (s,a,s') transition
+# carrying the lab's defense reactions (429 / 403 / 503 / connection drops). Feed
+# the resulting NDJSON to ddos_samurai/models/rl (build_dataset).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+BIN_DAEMON="${BIN_DAEMON:-$REPO/build/control/daemon}"
+BIN_WORKER="${BIN_WORKER:-$REPO/build/zmq}"
+
+WAF_LAB_PORT="${WAF_LAB_PORT:-8080}"
+TARGET_HOST="${TARGET_HOST:-127.0.0.1}"
+CONTROL_EP="${CONTROL_EP:-tcp://127.0.0.1:5099}"
+CORPUS="${CORPUS:-$REPO/data/rl-corpus/waf-lab-$(date +%Y%m%d-%H%M%S).ndjson}"
+CLUSTER_SECRET="${SAMURAI_CLUSTER_SECRET:-waf-lab-secret}"
+export SAMURAI_CLUSTER_SECRET="$CLUSTER_SECRET"
+
+# Closed-loop / SLO knobs. Defaults sit around the lab's 200 r/s limiter so the
+# search actually walks into the defense wall. Override via env as needed.
+CL_STRATEGY="${CL_STRATEGY:-aimd}"
+CL_MIN_RPS="${CL_MIN_RPS:-50}"
+CL_MAX_RPS="${CL_MAX_RPS:-2000}"
+CL_WINDOW_S="${CL_WINDOW_S:-5}"
+CL_SLO_MAX_ERROR_PCT="${CL_SLO_MAX_ERROR_PCT:-2.0}"
+CL_AIMD_MAX_WINDOWS="${CL_AIMD_MAX_WINDOWS:-40}"
+
+echo ">> checking lab ingress http://$TARGET_HOST:$WAF_LAB_PORT/healthz"
+if ! curl -fsS "http://$TARGET_HOST:$WAF_LAB_PORT/healthz" >/dev/null 2>&1; then
+	echo "!! lab ingress not responding — start it first:" >&2
+	echo "   docker compose -f $HERE/docker-compose.yml up -d --build" >&2
+	exit 1
+fi
+
+mkdir -p "$(dirname "$CORPUS")"
+
+echo ">> starting L7 worker"
+"$BIN_WORKER/samurai_l7_worker" >/tmp/samurai-lab-worker.log 2>&1 &
+WORKER_PID=$!
+sleep 1
+"$BIN_DAEMON/samurai_slave" \
+	--control-endpoints "${CONTROL_EP#tcp://}" \
+	--worker l7 --worker-dir "$BIN_WORKER" \
+	>/tmp/samurai-lab-slave.log 2>&1 &
+SLAVE_PID=$!
+
+cleanup() { kill "$WORKER_PID" "$SLAVE_PID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+echo ">> waiting for worker registration"
+sleep 3
+
+echo ">> running closed-loop against the lab; corpus -> $CORPUS"
+"$BIN_DAEMON/samurai_master" \
+	--control-listen "$CONTROL_EP" \
+	--target "$TARGET_HOST" --port "$WAF_LAB_PORT" --protocol http \
+	--worker l7 --count "$(( CL_MAX_RPS * CL_WINDOW_S ))" \
+	--expect-workers 1 --wait-workers-s 30 \
+	--closed-loop --cl-strategy "$CL_STRATEGY" \
+	--cl-window-s "$CL_WINDOW_S" \
+	--cl-min-rps "$CL_MIN_RPS" --cl-max-rps "$CL_MAX_RPS" \
+	--cl-slo-max-error-pct "$CL_SLO_MAX_ERROR_PCT" \
+	--cl-aimd-max-windows "$CL_AIMD_MAX_WINDOWS" \
+	--rl-corpus "$CORPUS"
+
+echo ">> done. transitions:"
+wc -l "$CORPUS" || true
+echo ">> build a dataset:"
+echo "   python -c \"from ddos_samurai.models.rl import build_dataset; d=build_dataset('$CORPUS'); print(len(d), d.feature_names)\""

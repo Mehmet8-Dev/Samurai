@@ -1,0 +1,16 @@
+# Ban sources that trip nginx's rate limiter. Once banned, their packets are
+# dropped by the host netfilter, so the load generator sees connection refusals /
+# timeouts (conn_attempted climbs while conn_established stalls) — a distinct
+# defense-reaction signal from a plain 429.
+#
+# Aggressive on purpose: a load test hammers from few IPs, so short windows and a
+# low retry count make the ban fire within a closed-loop window. Tune for realism.
+
+[nginx-ratelimit]
+enabled  = true
+filter   = nginx-ratelimit
+logpath  = /var/log/nginx/access.log
+maxretry = 100
+findtime = 10
+bantime  = 60
+action   = iptables-allports[name=waf-lab]
