@@ -32,6 +32,8 @@
 #include "autoscale.hpp"
 #include "closed_loop.hpp"
 #include "discovery.hpp"
+#include "sut_probe.hpp"
+#include "http_client.hpp"
 #include "ha.hpp"
 #include "json.hpp"
 #include "jwt.hpp"
@@ -462,6 +464,59 @@ int main() {
     Check(d.done, "closed-loop binsearch: converges");
     Check(d.best_good_rps <= ceiling && d.best_good_rps >= ceiling - 1500,
           "closed-loop binsearch: best-good sits just under the true ceiling");
+  }
+
+  // --- sut probe: Prometheus /api/v1/query response parsing ---
+  {
+    using namespace samurai::control;
+    double v = 0.0;
+    std::string err;
+
+    // vector result (the usual histogram_quantile output)
+    const std::string vec =
+        R"({"status":"success","data":{"resultType":"vector","result":[)"
+        R"({"metric":{"job":"api"},"value":[1700000000.5,"183.4"]}]}})";
+    Check(ParsePromInstantScalar(vec, v, err) && v == 183.4, "sut: vector result parsed");
+
+    // scalar result
+    const std::string scal =
+        R"({"status":"success","data":{"resultType":"scalar","result":[1700000000,"42"]}})";
+    v = 0;
+    Check(ParsePromInstantScalar(scal, v, err) && v == 42.0, "sut: scalar result parsed");
+
+    // empty vector => no series matched
+    const std::string empty =
+        R"({"status":"success","data":{"resultType":"vector","result":[]}})";
+    Check(!ParsePromInstantScalar(empty, v, err), "sut: empty result rejected");
+
+    // error status from Prometheus
+    const std::string bad =
+        R"({"status":"error","errorType":"bad_data","error":"parse error"})";
+    Check(!ParsePromInstantScalar(bad, v, err), "sut: error status rejected");
+
+    // URL building percent-encodes the PromQL and normalizes the base slash
+    const std::string url = BuildPromQueryUrl("http://p:9090/",
+                                              "histogram_quantile(0.99, x)*1000");
+    Check(url == "http://p:9090/api/v1/query?query="
+                 "histogram_quantile%280.99%2C%20x%29%2A1000",
+          "sut: query url encoded");
+
+    // A disabled probe scrapes nothing.
+    SutProbeConfig off;  // enabled=false
+    SutProbe p(off);
+    Check(!p.enabled() && !p.Scrape().ok, "sut: disabled probe is inert");
+  }
+
+  // --- http client: URL join + response-complete framing ---
+  {
+    namespace http = samurai::core::http;
+    Check(http::JoinUrl("https://h:443/base/path", "/apis/x") == "https://h:443/apis/x",
+          "http: JoinUrl keeps authority, replaces path");
+    Check(http::ResponseCompleteForTest(
+              "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"),
+          "http: content-length framing complete");
+    Check(!http::ResponseCompleteForTest("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhi"),
+          "http: short body not complete");
   }
 
   // --- json: parse / access / round-trip ---

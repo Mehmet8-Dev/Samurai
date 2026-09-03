@@ -30,6 +30,7 @@
 #include "multimaster.hpp"
 #include "redis_kvstore.hpp"
 #include "servicer.hpp"
+#include "sut_probe.hpp"
 
 namespace {
 std::atomic<bool> g_stop{false};
@@ -124,6 +125,36 @@ samurai::control::ClosedLoopConfig BuildClosedLoopConfig(int argc, char** argv) 
       static_cast<double>(OptInt(argc, argv, "--cl-binsearch-tolerance-rps", 0));
   cl.binsearch_max_windows = static_cast<int>(OptInt(argc, argv, "--cl-binsearch-max-windows", 24));
   return cl;
+}
+
+// Parse the SUT-correlation (Prometheus) knobs off the CLI. Extra queries are
+// given as a ';'-separated list of name=promql pairs.
+samurai::control::SutProbeConfig BuildSutProbeConfig(int argc, char** argv) {
+  using namespace samurai::control;
+  using namespace samurai::control::daemon;
+  SutProbeConfig cfg;
+  cfg.prometheus_url = Opt(argc, argv, "--sut-prometheus-url", "");
+  cfg.latency_p99_query = Opt(argc, argv, "--sut-latency-p99-query", "");
+  cfg.insecure = Flag(argc, argv, "--sut-insecure");
+  cfg.timeout_s = static_cast<int>(OptInt(argc, argv, "--sut-timeout-s", 5));
+  cfg.enabled = !cfg.prometheus_url.empty();
+  const std::string extra = Opt(argc, argv, "--sut-extra-queries", "");
+  std::size_t pos = 0;
+  while (pos < extra.size()) {
+    const std::size_t semi = extra.find(';', pos);
+    const std::string pair = extra.substr(pos, semi == std::string::npos ? std::string::npos
+                                                                          : semi - pos);
+    const std::size_t eq = pair.find('=');
+    if (eq != std::string::npos) {
+      SutQuery q;
+      q.name = pair.substr(0, eq);
+      q.promql = pair.substr(eq + 1);
+      if (!q.name.empty() && !q.promql.empty()) cfg.extra.push_back(std::move(q));
+    }
+    if (semi == std::string::npos) break;
+    pos = semi + 1;
+  }
+  return cfg;
 }
 
 // Derive one closed-loop LoadSample from an aggregated run snapshot. Today the
@@ -736,6 +767,12 @@ int main(int argc, char** argv) {
         // controller pick the next setpoint until it converges / exhausts budget.
         const int window_s = std::max(1, static_cast<int>(OptInt(argc, argv, "--cl-window-s", 5)));
         samurai::control::ClosedLoopController ctl(clcfg);
+        const samurai::control::SutProbe sut(BuildSutProbeConfig(argc, argv));
+        if (sut.enabled()) {
+          std::printf("samurai_master: SUT-correlation on (prometheus=%s latency_query=%s)\n",
+                      sut.config().prometheus_url.c_str(),
+                      sut.config().latency_p99_query.empty() ? "<none>" : "set");
+        }
         std::printf(
             "samurai_master: closed-loop enabled (strategy=%s window=%ds min=%.0f max=%.0f "
             "initial=%.0f slo_max_error_pct=%.2f)\n",
@@ -759,6 +796,15 @@ int main(int argc, char** argv) {
           const JobResult res =
               coord.RunSingleJob(job, "cl-" + std::to_string(++win), guard);
           samurai::control::LoadSample sample = DeriveSample(res.snapshot);
+          // Scrape the SUT (Prometheus) so the p99 latency drives the closed-loop
+          // SLO and the target-side metrics can be correlated with the load.
+          samurai::control::SutSample sut_sample;
+          if (sut.enabled()) {
+            sut_sample = sut.Scrape();
+            if (sut_sample.latency_p99_ms >= 0.0) {
+              sample.latency_p99_ms = sut_sample.latency_p99_ms;
+            }
+          }
           // A window that generated no traffic (no workers / dispatch failure)
           // is "no data", not SLO-green — treating it as green would make the
           // controller ramp forever. Abort the search with a clear error.
@@ -785,12 +831,13 @@ int main(int argc, char** argv) {
           {
             std::lock_guard<std::mutex> lk(cl_mu);
             cl_json = ClosedLoopStateJson(dec, clcfg);
+            if (sut.enabled()) cl_json.set("sut", samurai::control::SutProbe::SampleJson(sut_sample));
           }
           std::printf(
               "samurai_master: closed-loop window=%d ran_rps=%.0f healthy=%d error_pct=%.3f "
-              "next_setpoint=%.0f best_good=%.0f phase=%s\n",
-              dec.window, setpoint, dec.last_healthy ? 1 : 0, dec.error_pct, dec.setpoint_rps,
-              dec.best_good_rps, dec.phase.c_str());
+              "p99_ms=%.1f next_setpoint=%.0f best_good=%.0f phase=%s\n",
+              dec.window, setpoint, dec.last_healthy ? 1 : 0, dec.error_pct,
+              sut_sample.latency_p99_ms, dec.setpoint_rps, dec.best_good_rps, dec.phase.c_str());
           if (dec.done) break;
         }
         Value clsummary = Value::Object();

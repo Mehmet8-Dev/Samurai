@@ -41,6 +41,7 @@ set(CONTROL_SOURCES
   auth.cpp
   autoscale.cpp
   closed_loop.cpp       # autopilot load controller (AIMD / binary-search SLO search)
+  sut_probe.cpp         # SUT-correlation Prometheus scrape (feeds closed-loop latency SLO)
   discovery.cpp
   jwt.cpp
   telemetry.cpp
