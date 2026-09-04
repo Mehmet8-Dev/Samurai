@@ -145,6 +145,36 @@ def test_reward_rewards_healthy_progress_and_penalizes_breach(tmp_path):
     assert r_bad < r_good
 
 
+def test_effective_throughput_reward_prefers_served_over_rejected_load():
+    from ddos_samurai.models.rl import EffectiveThroughputReward
+
+    cfg = RLConfig()
+    reward = EffectiveThroughputReward(cfg)
+
+    # Same served throughput (~200 req/s) two ways: at 250 rps the target honors
+    # most of it (20% rate-limited); at 1200 rps it rejects 83% as pure waste.
+    # The Mahoraga objective must rank the sustainable rate strictly higher.
+    sustainable = Transition.from_json(
+        _rec(
+            win=1, action=250.0, s_rps=100.0, s2_rps=250.0, s_valid=True, healthy=True,
+            error_pct=0.0,
+            s2_defense={"responses_total": 250, "status_2xx": 200, "status_4xx": 50, "status_5xx": 0},
+        )
+    )
+    blasting = Transition.from_json(
+        _rec(
+            win=1, action=1200.0, s_rps=100.0, s2_rps=1200.0, s_valid=True, healthy=True,
+            error_pct=0.0,
+            s2_defense={"responses_total": 1200, "status_2xx": 200, "status_4xx": 1000, "status_5xx": 0},
+        )
+    )
+    assert reward(sustainable) > reward(blasting)
+
+    # A heavier defense penalty widens the gap (blasting looks even worse).
+    harsh = EffectiveThroughputReward(RLConfig(lambda_defense=4.0))
+    assert (reward(sustainable) - reward(blasting)) < (harsh(sustainable) - harsh(blasting))
+
+
 def test_slo_overshoot_max_across_rules():
     slo = SloThresholds(max_error_pct=1.0, max_loss_pct=0.0, min_rate_accuracy_pct=0.0, max_latency_ms=100.0)
     s2 = RawState(valid=True, rps=100.0, attempted=1000.0, errors=20.0, error_pct=2.0,

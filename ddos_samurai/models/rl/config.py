@@ -48,6 +48,11 @@ class RLConfig:
     lambda_slo: float = 2.0
     step_cost: float = 0.02
     rps_scale: float = 0.0  # <=0 => per-record max_rps
+    # Defense penalty weight (EffectiveThroughputReward): how hard rate-limiting /
+    # overload pushback (4xx/5xx share) is penalized. This is what makes the RL
+    # objective differ from AIMD — it discourages blasting past the defense wall
+    # into wasted, rejected load instead of maximizing *served* throughput.
+    lambda_defense: float = 1.0
 
     # Corpus hygiene.
     drop_leading: bool = True  # drop the s_valid=False first window of every episode

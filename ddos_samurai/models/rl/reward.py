@@ -68,3 +68,45 @@ class SloProgressReward:
 
         overshoot = slo_overshoot(t.s2, t.slo)
         return progress - cfg.lambda_slo * overshoot - cfg.step_cost
+
+
+class EffectiveThroughputReward:
+    """r = served_rps_norm - lambda_defense * defense_pushback
+             - lambda_slo * slo_overshoot - step_cost.
+
+    The Mahoraga objective, and where RL earns its keep over AIMD. AIMD (and the
+    plain SloProgressReward) credit *attempted* rps, so their optimum is "ramp to
+    max" — but against a defended target most of that load is rejected (429/403)
+    or shed (503), pure waste. Here the reward credits the load that actually got
+    *served* (rps * success_ratio) and subtracts the defense's pushback (4xx/5xx
+    share), so the optimum sits at the edge of the defense wall: the highest rate
+    the target still honors, found by trading rps against the shaping levers. When
+    the L7 status breakdown is absent (success_ratio unknown), it falls back to
+    the attempted-rps progress so non-L7 corpora still train.
+    """
+
+    def __init__(self, cfg: RLConfig):
+        self._cfg = cfg
+
+    def __call__(self, t: Transition) -> float:
+        cfg = self._cfg
+        scale = cfg.rps_scale if cfg.rps_scale > 0.0 else (t.max_rps if t.max_rps > 0 else 1.0)
+
+        succ = t.s2.defense.success_ratio  # 2xx / responses, or UNKNOWN (<0)
+        if succ >= 0.0:
+            served = max(0.0, t.s2.rps * succ) / scale
+        else:
+            # No L7 status telemetry: degrade to sustainable-rps progress.
+            served = (max(0.0, t.s2.rps - t.s.rps) / scale) if t.healthy else 0.0
+
+        rl = t.s2.defense.rate_limited_ratio
+        ov = t.s2.defense.overload_ratio
+        pushback = (rl if rl >= 0.0 else 0.0) + (ov if ov >= 0.0 else 0.0)
+
+        overshoot = slo_overshoot(t.s2, t.slo)
+        return (
+            served
+            - cfg.lambda_defense * pushback
+            - cfg.lambda_slo * overshoot
+            - cfg.step_cost
+        )

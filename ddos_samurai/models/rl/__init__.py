@@ -24,7 +24,7 @@ from .features import DefaultFeatureExtractor, FeatureExtractor
 from .action_spec import MAHORAGA, RPS_ONLY, ActionSpec
 from .export import load_policy, save_policy
 from .policy_artifact import PolicyArtifact
-from .reward import RewardFn, SloProgressReward, slo_overshoot
+from .reward import EffectiveThroughputReward, RewardFn, SloProgressReward, slo_overshoot
 from .schemas import Action, DefenseSignals, RawState, SloThresholds, Transition
 
 # train_iql (IQL) and evaluate_policy (FQE) live in .train / .ope and require torch;
@@ -45,6 +45,7 @@ __all__ = [
     "DefaultFeatureExtractor",
     "RewardFn",
     "SloProgressReward",
+    "EffectiveThroughputReward",
     "slo_overshoot",
     "build_dataset",
     "Dataset",
