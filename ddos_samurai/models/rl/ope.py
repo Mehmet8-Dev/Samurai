@@ -77,11 +77,11 @@ def _mlp(sizes: list[int]):
 
 
 def _policy_action_norm(artifact: PolicyArtifact, states_raw: np.ndarray,
-                        lo: float, hi: float) -> np.ndarray:
-    """The learned policy's action on raw states, in the [0,1] space Q was fit on."""
-    rps = artifact.act_batch(states_raw)
-    span = (hi - lo) if hi > lo else 1.0
-    return ((rps - lo) / span).clip(0.0, 1.0).reshape(-1, 1)
+                        lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    """The learned policy's (N, A) action on raw states, in the [0,1] space Q was fit on."""
+    act = artifact.act_batch(states_raw)  # (N, A) de-normalized
+    span = np.where(hi <= lo, 1.0, hi - lo)
+    return ((act - lo) / span).clip(0.0, 1.0)
 
 
 def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
@@ -101,13 +101,14 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
 
     norm = dataset.normalizer
     feat_dim = dataset.states.shape[1]
-    lo, hi = dataset.action_bounds
-    if hi <= lo:
-        hi = lo + 1.0
+    a_dim = dataset.action_dim
+    lo = np.asarray(dataset.action_lo, dtype=np.float32)
+    hi = np.asarray(dataset.action_hi, dtype=np.float32)
+    span = np.where(hi <= lo, 1.0, hi - lo)
 
     S = norm.transform(dataset.states)
     S2 = norm.transform(dataset.next_states)
-    A = ((dataset.actions - lo) / (hi - lo)).clip(0.0, 1.0).reshape(-1, 1)
+    A = ((dataset.actions - lo) / span).clip(0.0, 1.0).reshape(-1, a_dim)
     # Learned policy's action at s' (for the FQE bootstrap) and at initial states.
     A2_pi = _policy_action_norm(artifact, dataset.next_states, lo, hi)
 
@@ -119,8 +120,8 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
     r = torch.tensor(dataset.rewards.reshape(-1, 1), dtype=torch.float32, device=dev)
     done = torch.tensor(dataset.dones.reshape(-1, 1), dtype=torch.float32, device=dev)
 
-    q = _mlp([feat_dim + 1, *cfg.hidden_dims, 1]).to(dev)
-    q_t = _mlp([feat_dim + 1, *cfg.hidden_dims, 1]).to(dev)
+    q = _mlp([feat_dim + a_dim, *cfg.hidden_dims, 1]).to(dev)
+    q_t = _mlp([feat_dim + a_dim, *cfg.hidden_dims, 1]).to(dev)
     q_t.load_state_dict(q.state_dict())
     opt = torch.optim.Adam(q.parameters(), lr=cfg.lr)
 

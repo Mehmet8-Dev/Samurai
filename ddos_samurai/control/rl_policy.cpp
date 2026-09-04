@@ -70,7 +70,7 @@ bool RlPolicy::Load(const std::string& path, std::string* err) {
   }
   r.off = 4;
   const std::uint32_t version = r.u32();
-  if (version != 1) {
+  if (version != 2) {
     if (err) *err = "unsupported SRLP version";
     return false;
   }
@@ -100,18 +100,20 @@ bool RlPolicy::Load(const std::string& path, std::string* err) {
   }
   r.floats(norm_mean_, in_dim);
   r.floats(norm_std_, in_dim);
-  action_lo_ = r.f32();
-  action_hi_ = r.f32();
+  const std::uint32_t action_dim = r.u32();
+  if (!r.ok || action_dim == 0 || action_dim != out_dims.back()) {
+    if (err) *err = "bad action_dim (must equal the output layer width)";
+    return false;
+  }
+  r.floats(action_lo_, action_dim);
+  r.floats(action_hi_, action_dim);
   if (!r.ok) {
     if (err) *err = "truncated norm/action footer";
     return false;
   }
-  if (out_dims.back() != 1) {
-    if (err) *err = "policy output must be 1-D (rps)";
-    return false;
-  }
 
   in_dim_ = static_cast<int>(in_dim);
+  action_dim_ = static_cast<int>(action_dim);
   loaded_ = true;
   return true;
 }
@@ -145,8 +147,8 @@ std::vector<float> RlPolicy::BuildFeatures(const RlStateInputs& in) {
   return f;
 }
 
-double RlPolicy::Propose(const std::vector<float>& features) const {
-  if (!loaded_ || static_cast<int>(features.size()) != in_dim_) return -1.0;
+std::vector<double> RlPolicy::Propose(const std::vector<float>& features) const {
+  if (!loaded_ || static_cast<int>(features.size()) != in_dim_) return {};
 
   // Standardize.
   std::vector<float> x(features.size());
@@ -171,10 +173,15 @@ double RlPolicy::Propose(const std::vector<float>& features) const {
     x = std::move(y);
   }
 
-  const float out = x.empty() ? 0.0f : x[0];
-  const float frac = std::max(0.0f, std::min(1.0f, out));
-  return static_cast<double>(action_lo_) +
-         static_cast<double>(frac) * (static_cast<double>(action_hi_) - action_lo_);
+  // Per-dim clamp to [0,1] and de-normalize with the action bounds.
+  std::vector<double> action(action_dim_);
+  for (int k = 0; k < action_dim_; ++k) {
+    const float frac = std::max(0.0f, std::min(1.0f, x[k]));
+    action[k] = static_cast<double>(action_lo_[k]) +
+                static_cast<double>(frac) *
+                    (static_cast<double>(action_hi_[k]) - action_lo_[k]);
+  }
+  return action;
 }
 
 }  // namespace samurai::control

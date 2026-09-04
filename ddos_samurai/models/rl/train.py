@@ -76,14 +76,17 @@ def train_iql(dataset: Dataset, cfg: IQLConfig | None = None) -> PolicyArtifact:
     np.random.seed(cfg.seed)
 
     feat_dim = dataset.states.shape[1]
+    a_dim = dataset.action_dim
     norm = dataset.normalizer
     S = norm.transform(dataset.states)
     S2 = norm.transform(dataset.next_states)
 
-    lo, hi = dataset.action_bounds
-    if hi <= lo:
-        hi = lo + 1.0
-    A = ((dataset.actions - lo) / (hi - lo)).clip(0.0, 1.0).reshape(-1, 1)
+    # Per-dim action normalization to [0,1] using the data-derived bounds that also
+    # travel to serving, so the exported policy de-normalizes each dim identically.
+    lo = np.asarray(dataset.action_lo, dtype=np.float32)
+    hi = np.asarray(dataset.action_hi, dtype=np.float32)
+    span = np.where(hi <= lo, 1.0, hi - lo)
+    A = ((dataset.actions - lo) / span).clip(0.0, 1.0).reshape(-1, a_dim)
 
     dev = torch.device("cpu")
     s = torch.tensor(S, dtype=torch.float32, device=dev)
@@ -92,13 +95,13 @@ def train_iql(dataset: Dataset, cfg: IQLConfig | None = None) -> PolicyArtifact:
     r = torch.tensor(dataset.rewards.reshape(-1, 1), dtype=torch.float32, device=dev)
     done = torch.tensor(dataset.dones.reshape(-1, 1), dtype=torch.float32, device=dev)
 
-    qnet = lambda: _mlp([feat_dim + 1, *cfg.hidden_dims, 1]).to(dev)
+    qnet = lambda: _mlp([feat_dim + a_dim, *cfg.hidden_dims, 1]).to(dev)
     q1, q2 = qnet(), qnet()
     q1_t, q2_t = qnet(), qnet()
     q1_t.load_state_dict(q1.state_dict())
     q2_t.load_state_dict(q2.state_dict())
     vnet = _mlp([feat_dim, *cfg.hidden_dims, 1]).to(dev)
-    policy = _mlp([feat_dim, *cfg.hidden_dims, 1]).to(dev)
+    policy = _mlp([feat_dim, *cfg.hidden_dims, a_dim]).to(dev)
 
     opt_q = torch.optim.Adam([*q1.parameters(), *q2.parameters()], lr=cfg.lr)
     opt_v = torch.optim.Adam(vnet.parameters(), lr=cfg.lr)
@@ -139,10 +142,11 @@ def train_iql(dataset: Dataset, cfg: IQLConfig | None = None) -> PolicyArtifact:
             for tp, sp in zip(q2_t.parameters(), q2.parameters()):
                 tp.mul_(1 - cfg.polyak).add_(cfg.polyak * sp)
 
-    return _extract_artifact(policy, norm, lo, hi, dataset.feature_names)
+    return _extract_artifact(policy, norm, lo, hi, dataset.feature_names,
+                             dataset.action_spec.names)
 
 
-def _extract_artifact(policy, norm, lo: float, hi: float, feature_names) -> PolicyArtifact:
+def _extract_artifact(policy, norm, lo, hi, feature_names, action_names) -> PolicyArtifact:
     """Pull the Linear layers out of the torch policy into a numpy artifact."""
     layers: list[tuple[np.ndarray, np.ndarray]] = []
     for m in policy:
@@ -154,7 +158,8 @@ def _extract_artifact(policy, norm, lo: float, hi: float, feature_names) -> Poli
         layers=layers,
         norm_mean=np.asarray(norm.mean, dtype=np.float32),
         norm_std=np.asarray(norm.std, dtype=np.float32),
-        action_lo=float(lo),
-        action_hi=float(hi),
+        action_lo=np.asarray(lo, dtype=np.float32),
+        action_hi=np.asarray(hi, dtype=np.float32),
         feature_names=tuple(feature_names),
+        action_names=tuple(action_names),
     )

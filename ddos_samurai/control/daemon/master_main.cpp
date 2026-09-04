@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -1016,6 +1017,9 @@ int main(int argc, char** argv) {
                                        .count());
         samurai::control::LoadSample rl_prev_sample;  // state that produced this window's action
         Value rl_prev_defense = Value::Object();       // its defense-reaction signals
+        // kRl Mahoraga levers (dims >=1: concurrency/request_mix/...) proposed last
+        // window, applied to THIS window's job spec. Empty => policy drives only rps.
+        std::vector<double> rl_next_levers;
         bool rl_have_prev = false;
         int win = 0;
         bool cl_aborted = false;
@@ -1031,6 +1035,18 @@ int main(int argc, char** argv) {
           JobConfig job = BuildJobConfig(wspec, ep_now, tenant, master_region);
           job.base_args.set("target_rps", Value::Double(setpoint));
           job.base_args.set("pacing_mode", Value::Int(1));
+          // Apply the policy's Mahoraga levers (dims >=1) to this window's job spec.
+          // Field names follow the canonical action order (kActionFields); the L7
+          // worker honors those it understands, others are inert plumbing for now.
+          for (std::size_t k = 1;
+               k < rl_next_levers.size() &&
+               k < sizeof(samurai::control::kActionFields) /
+                       sizeof(samurai::control::kActionFields[0]);
+               ++k) {
+            job.base_args.set(samurai::control::kActionFields[k],
+                              Value::Int(static_cast<std::int64_t>(
+                                  std::llround(rl_next_levers[k]))));
+          }
           attach_progress(job);
           const JobResult res =
               coord.RunSingleJob(job, "cl-" + std::to_string(++win), guard);
@@ -1075,7 +1091,11 @@ int main(int argc, char** argv) {
           if (rl_policy.loaded()) {
             const samurai::control::RlStateInputs rin =
                 RlInputsFrom(sample, rl_defense, win, clcfg);
-            sample.rl_action_rps = rl_policy.ProposeFor(rin);
+            const std::vector<double> action = rl_policy.ProposeFor(rin);
+            if (!action.empty()) {
+              sample.rl_action_rps = action[0];  // dim 0 = rps -> shield
+              rl_next_levers = action;           // dims >=1 -> next window's job spec
+            }
           }
           dec = ctl.Step(sample);
           {

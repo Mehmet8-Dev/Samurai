@@ -17,19 +17,24 @@ import numpy as np
 @dataclass(frozen=True)
 class PolicyArtifact:
     # Dense layers as (W, b): W is (out, in) row-major, b is (out,). All hidden
-    # layers use ReLU; the output layer is linear and clamped to [0, 1] before it
-    # is de-normalized to an rps setpoint (linear+clamp avoids sigmoid saturation
-    # at the action-range extremes).
+    # layers use ReLU; the output layer is linear, per-dim clamped to [0, 1] and
+    # de-normalized with [action_lo[k], action_hi[k]] (linear+clamp avoids sigmoid
+    # saturation at the range extremes). The output width equals the action dim.
     layers: list[tuple[np.ndarray, np.ndarray]]
     norm_mean: np.ndarray
     norm_std: np.ndarray
-    action_lo: float
-    action_hi: float
-    feature_names: tuple[str, ...]
+    action_lo: np.ndarray            # (A,) per-dim lower bound
+    action_hi: np.ndarray            # (A,) per-dim upper bound
+    feature_names: tuple[str, ...] = ()
+    action_names: tuple[str, ...] = ("rps",)  # ordered; [0] is the primary setpoint
 
     @property
     def input_dim(self) -> int:
         return int(self.layers[0][0].shape[1])
+
+    @property
+    def action_dim(self) -> int:
+        return int(self.layers[-1][0].shape[0])
 
     @property
     def hidden_dims(self) -> tuple[int, ...]:
@@ -46,12 +51,16 @@ class PolicyArtifact:
         return x
 
     def act_batch(self, states: np.ndarray) -> np.ndarray:
-        """Map raw (un-normalized) state rows -> rps setpoints."""
+        """Map raw (un-normalized) state rows -> (N, A) de-normalized actions."""
         std = np.where(self.norm_std == 0.0, 1.0, self.norm_std)
         z = (states.astype(np.float32) - self.norm_mean) / std
-        out = self._forward_norm(z)[:, 0]
-        frac = np.clip(out, 0.0, 1.0)
+        frac = np.clip(self._forward_norm(z), 0.0, 1.0)
         return self.action_lo + frac * (self.action_hi - self.action_lo)
 
     def act(self, state: np.ndarray) -> float:
-        return float(self.act_batch(state[None, :])[0])
+        """The primary (rps) setpoint for one raw state."""
+        return float(self.act_batch(state[None, :])[0, 0])
+
+    def act_vector(self, state: np.ndarray) -> np.ndarray:
+        """The full (A,) action vector for one raw state."""
+        return self.act_batch(state[None, :])[0]

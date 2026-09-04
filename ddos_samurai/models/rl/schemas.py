@@ -89,6 +89,10 @@ class Action:
             source_rotation=int(o.get("source_rotation", -1)),
         )
 
+    def value(self, field_name: str) -> float:
+        """One action dimension's value by field name (see action_spec.ACTION_FIELDS)."""
+        return float(getattr(self, field_name))
+
 
 @dataclass(frozen=True)
 class RawState:

@@ -113,7 +113,8 @@ def test_leading_and_no_traffic_windows_dropped(tmp_path):
     ]
     ds = build_dataset(_write(tmp_path, recs))
     assert len(ds) == 1  # leading (s_valid=False) and no-traffic windows removed
-    assert ds.actions[0] == 200.0
+    assert ds.actions.shape == (1, 1)  # rps-only action by default
+    assert ds.actions[0, 0] == 200.0
 
 
 def test_reward_rewards_healthy_progress_and_penalizes_breach(tmp_path):

@@ -19,6 +19,14 @@
 
 namespace samurai::control {
 
+// Canonical action-dimension order — MUST match ddos_samurai/models/rl
+// action_spec.MAHORAGA. The serving side applies policy output[k] to this field
+// (k=0 is the rps setpoint the shield governs; k>=1 are Mahoraga load-shaping
+// levers set on the job spec). A training ActionSpec must be a prefix of this.
+inline constexpr const char* kActionFields[] = {
+    "rps", "concurrency", "request_mix", "source_rotation", "pacing_mode",
+};
+
 // Raw (pre-normalization) state inputs for one window. Fields left < 0 are
 // "unknown" and imputed/masked exactly like the Python DefaultFeatureExtractor.
 struct RlStateInputs {
@@ -49,6 +57,7 @@ class RlPolicy {
 
   bool loaded() const { return loaded_; }
   int input_dim() const { return in_dim_; }
+  int action_dim() const { return action_dim_; }
 
   // Build the ordered raw feature vector from state inputs. The ordering is fixed
   // and MUST match ddos_samurai/models/rl RLConfig.feature_names + the mask bits:
@@ -60,19 +69,21 @@ class RlPolicy {
   //            challenge_rate.
   static std::vector<float> BuildFeatures(const RlStateInputs& in);
 
-  // Forward pass on a raw feature vector -> proposed rps setpoint. Mirrors
-  // PolicyArtifact.act: standardize, ReLU-MLP, linear output clamped to [0,1],
-  // de-normalized with [action_lo, action_hi]. Returns -1 if unloaded / bad dims.
-  double Propose(const std::vector<float>& features) const;
+  // Forward pass on a raw feature vector -> the full (action_dim) de-normalized
+  // action vector. Mirrors PolicyArtifact.act_batch: standardize, ReLU-MLP, linear
+  // output per-dim clamped to [0,1], de-normalized with [action_lo, action_hi].
+  // Returns empty on unloaded / bad dims. Element 0 is the rps setpoint.
+  std::vector<double> Propose(const std::vector<float>& features) const;
 
   // Convenience: build features from state inputs and run the forward pass.
-  double ProposeFor(const RlStateInputs& in) const {
+  std::vector<double> ProposeFor(const RlStateInputs& in) const {
     return Propose(BuildFeatures(in));
   }
 
  private:
   bool loaded_ = false;
   int in_dim_ = 0;
+  int action_dim_ = 0;
   // Dense layers as (W, b): W flattened row-major (out*in), b size out, out_dim.
   struct Layer {
     std::vector<float> w;
@@ -83,8 +94,8 @@ class RlPolicy {
   std::vector<Layer> layers_;
   std::vector<float> norm_mean_;
   std::vector<float> norm_std_;
-  float action_lo_ = 0.0f;
-  float action_hi_ = 1.0f;
+  std::vector<float> action_lo_;  // per-dim
+  std::vector<float> action_hi_;  // per-dim
 };
 
 }  // namespace samurai::control

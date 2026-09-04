@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from . import corpus as corpus_io
+from .action_spec import RPS_ONLY, ActionSpec
 from .config import RLConfig
 from .features import DefaultFeatureExtractor, FeatureExtractor
 from .reward import RewardFn, SloProgressReward
@@ -47,25 +48,34 @@ class Normalizer:
 
 @dataclass(frozen=True)
 class Dataset:
-    """A stacked offline-RL dataset. Actions are raw setpoints; normalize per use."""
+    """A stacked offline-RL dataset. Actions are raw (per-dim) values; the trainer
+    normalizes each dimension by [action_lo, action_hi] (which travel to serving)."""
 
     states: np.ndarray       # (N, F) raw (un-normalized) state features
-    actions: np.ndarray      # (N,)   setpoint_rps taken
+    actions: np.ndarray      # (N, A) raw action per controlled dim; col 0 == rps
     rewards: np.ndarray      # (N,)
     next_states: np.ndarray  # (N, F)
     dones: np.ndarray        # (N,)   episode-terminal flag
     episode_ids: np.ndarray  # (N,)   run_id index, for per-trajectory OPE
     feature_names: tuple[str, ...]
     normalizer: Normalizer
+    action_spec: ActionSpec = RPS_ONLY
+    action_lo: np.ndarray = None  # (A,) per-dim lower bound (data-derived)
+    action_hi: np.ndarray = None  # (A,) per-dim upper bound
 
     def __len__(self) -> int:
         return int(self.states.shape[0])
 
     @property
+    def action_dim(self) -> int:
+        return int(self.actions.shape[1]) if self.actions.ndim == 2 else 1
+
+    @property
     def action_bounds(self) -> tuple[float, float]:
+        """Bounds of the primary (rps) dimension — back-compat scalar accessor."""
         if len(self) == 0:
             return (0.0, 0.0)
-        return (float(self.actions.min()), float(self.actions.max()))
+        return (float(self.action_lo[0]), float(self.action_hi[0]))
 
 
 def _keep(t: Transition, cfg: RLConfig) -> bool:
@@ -82,22 +92,25 @@ def build_dataset(
     *,
     extractor: FeatureExtractor | None = None,
     reward_fn: RewardFn | None = None,
+    action_spec: ActionSpec | None = None,
 ) -> Dataset:
     """Compose corpus -> (extractor, reward) -> stacked arrays.
 
     ``extractor`` / ``reward_fn`` default to the built-in flat-window /
-    SLO-progress implementations but can be overridden to change the state
-    representation or objective without touching this function.
+    SLO-progress implementations but can be overridden. ``action_spec`` selects the
+    controlled action dimensions (default: rps only); pass action_spec.MAHORAGA for
+    the full vector.
     """
     cfg = cfg or RLConfig()
     extractor = extractor or DefaultFeatureExtractor(cfg)
     reward_fn = reward_fn or SloProgressReward(cfg)
+    action_spec = action_spec or RPS_ONLY
 
     transitions = corpus_io.load_transitions(paths)
     episodes = corpus_io.group_episodes(transitions)
 
     s_list: list[np.ndarray] = []
-    a_list: list[float] = []
+    a_list: list[list[float]] = []
     r_list: list[float] = []
     s2_list: list[np.ndarray] = []
     done_list: list[float] = []
@@ -108,7 +121,7 @@ def build_dataset(
         for i, t in enumerate(kept):
             s_list.append(extractor.state_vector(t.s, t))
             s2_list.append(extractor.state_vector(t.s2, t))
-            a_list.append(t.action_rps)
+            a_list.append([t.action.value(action_spec.field_of(n)) for n in action_spec.names])
             r_list.append(reward_fn(t))
             # Terminal if the controller converged, or it's the last kept window of
             # the trajectory (the corpus was cut here) — bootstrapping past it is wrong.
@@ -116,16 +129,30 @@ def build_dataset(
             eid_list.append(eid)
 
     dim = extractor.dim
+    a_dim = action_spec.dim
     if s_list:
         states = np.stack(s_list).astype(np.float32)
         next_states = np.stack(s2_list).astype(np.float32)
+        actions = np.asarray(a_list, dtype=np.float32).reshape(-1, a_dim)
     else:
         states = np.zeros((0, dim), dtype=np.float32)
         next_states = np.zeros((0, dim), dtype=np.float32)
+        actions = np.zeros((0, a_dim), dtype=np.float32)
+
+    # Per-dim bounds from the data; collapse a degenerate (constant/undriven) dim
+    # to [lo, lo+1] so normalization never divides by zero.
+    if len(actions):
+        action_lo = actions.min(axis=0)
+        action_hi = actions.max(axis=0)
+    else:
+        action_lo = np.zeros(a_dim, dtype=np.float32)
+        action_hi = np.ones(a_dim, dtype=np.float32)
+    action_hi = np.where(action_hi <= action_lo, action_lo + 1.0, action_hi).astype(np.float32)
+    action_lo = action_lo.astype(np.float32)
 
     return Dataset(
         states=states,
-        actions=np.asarray(a_list, dtype=np.float32),
+        actions=actions,
         rewards=np.asarray(r_list, dtype=np.float32),
         next_states=next_states,
         dones=np.asarray(done_list, dtype=np.float32),
@@ -135,4 +162,7 @@ def build_dataset(
         normalizer=Normalizer.fit(states) if len(states) else Normalizer(
             mean=np.zeros(dim, dtype=np.float32), std=np.ones(dim, dtype=np.float32)
         ),
+        action_spec=action_spec,
+        action_lo=action_lo,
+        action_hi=action_hi,
     )

@@ -21,6 +21,7 @@ from .config import RLConfig
 from .corpus import group_episodes, iter_transitions, load_transitions
 from .dataset import Dataset, Normalizer, build_dataset
 from .features import DefaultFeatureExtractor, FeatureExtractor
+from .action_spec import MAHORAGA, RPS_ONLY, ActionSpec
 from .export import load_policy, save_policy
 from .policy_artifact import PolicyArtifact
 from .reward import RewardFn, SloProgressReward, slo_overshoot
@@ -51,4 +52,7 @@ __all__ = [
     "PolicyArtifact",
     "save_policy",
     "load_policy",
+    "ActionSpec",
+    "MAHORAGA",
+    "RPS_ONLY",
 ]

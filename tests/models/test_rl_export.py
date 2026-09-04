@@ -21,9 +21,10 @@ def _artifact() -> PolicyArtifact:
         layers=[(W1, b1), (W2, b2)],
         norm_mean=np.array([0.0, 0.0, 0.0], dtype=np.float32),
         norm_std=np.array([1.0, 1.0, 1.0], dtype=np.float32),
-        action_lo=100.0,
-        action_hi=1100.0,
+        action_lo=np.array([100.0], dtype=np.float32),
+        action_hi=np.array([1100.0], dtype=np.float32),
         feature_names=("a", "b", "c"),
+        action_names=("rps",),
     )
 
 
@@ -50,8 +51,8 @@ def test_save_load_roundtrip_is_exact(tmp_path):
     for (W, b), (W2, b2) in zip(art.layers, back.layers):
         assert np.array_equal(W, W2)
         assert np.array_equal(b, b2)
-    assert back.action_lo == art.action_lo
-    assert back.action_hi == art.action_hi
+    assert np.array_equal(back.action_lo, art.action_lo)
+    assert np.array_equal(back.action_hi, art.action_hi)
     assert np.array_equal(back.norm_mean, art.norm_mean)
     assert back.feature_names == art.feature_names
 
@@ -68,6 +69,32 @@ def test_magic_and_dims_header(tmp_path):
     # in_dim carried so the C++ loader can size its input buffer.
     assert load_policy(p).input_dim == 3
     assert load_policy(p).hidden_dims == (2,)
+    assert load_policy(p).action_dim == 1
+
+
+def test_multidim_action_roundtrip(tmp_path):
+    # 2-in -> 2-out policy (rps + concurrency), per-dim bounds.
+    W = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    b = np.array([0.0, 0.0], dtype=np.float32)
+    art = PolicyArtifact(
+        layers=[(W, b)],
+        norm_mean=np.zeros(2, dtype=np.float32),
+        norm_std=np.ones(2, dtype=np.float32),
+        action_lo=np.array([100.0, 1.0], dtype=np.float32),
+        action_hi=np.array([1100.0, 65.0], dtype=np.float32),
+        feature_names=("f0", "f1"),
+        action_names=("rps", "concurrency"),
+    )
+    p = tmp_path / "m.srlp"
+    save_policy(art, p)
+    back = load_policy(p, action_names=("rps", "concurrency"))
+    assert back.action_dim == 2
+    # input [0.5, 0.25] -> rps=100+0.5*1000=600, concurrency=1+0.25*64=17
+    v = back.act_vector(np.array([0.5, 0.25], dtype=np.float32))
+    assert abs(v[0] - 600.0) < 1e-3
+    assert abs(v[1] - 17.0) < 1e-3
+    # act() returns the primary (rps) dim only.
+    assert abs(back.act(np.array([0.5, 0.25], dtype=np.float32)) - 600.0) < 1e-3
 
 
 def test_normalizer_applied_in_forward(tmp_path):

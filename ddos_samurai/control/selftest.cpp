@@ -530,15 +530,17 @@ int main() {
       s.append(reinterpret_cast<const char*>(&v), 4);
     };
     std::string blob = "SRLP";
-    put_u32(blob, 1);   // version
+    put_u32(blob, 2);   // version
     put_u32(blob, 2);   // in_dim
     put_u32(blob, 1);   // n_layers
-    put_u32(blob, 1);   // out_dims[0]
+    put_u32(blob, 1);   // out_dims[0] (== action_dim)
     put_f32(blob, 1.0f); put_f32(blob, 0.0f);  // W row
     put_f32(blob, 0.0f);                        // b
     put_f32(blob, 0.0f); put_f32(blob, 0.0f);  // norm_mean
     put_f32(blob, 1.0f); put_f32(blob, 1.0f);  // norm_std
-    put_f32(blob, 0.0f); put_f32(blob, 100.0f);// action lo/hi
+    put_u32(blob, 1);                           // action_dim
+    put_f32(blob, 0.0f);                        // action_lo[0]
+    put_f32(blob, 100.0f);                      // action_hi[0]
 
     const std::string path = "/tmp/samurai_selftest_policy.srlp";
     { std::ofstream o(path, std::ios::binary); o.write(blob.data(), blob.size()); }
@@ -546,9 +548,9 @@ int main() {
     RlPolicy p;
     std::string err;
     Check(p.Load(path, &err), "rl policy: SRLP loads");
-    Check(p.input_dim() == 2, "rl policy: in_dim read");
-    Check(std::abs(p.Propose({0.3f, 9.0f}) - 30.0) < 1e-3, "rl policy: forward matches (0.3*100)");
-    Check(std::abs(p.Propose({5.0f, 0.0f}) - 100.0) < 1e-3, "rl policy: output clamped to action_hi");
+    Check(p.input_dim() == 2 && p.action_dim() == 1, "rl policy: in/action dims read");
+    Check(std::abs(p.Propose({0.3f, 9.0f})[0] - 30.0) < 1e-3, "rl policy: forward matches (0.3*100)");
+    Check(std::abs(p.Propose({5.0f, 0.0f})[0] - 100.0) < 1e-3, "rl policy: output clamped to action_hi");
 
     // Feature layout: 20-vector, correct positions + mask bits.
     RlStateInputs in;
@@ -567,6 +569,27 @@ int main() {
     Check(f[14] == 0.0f, "rl policy: p99 mask clear (unknown)");
     Check(f[15] == 1.0f, "rl policy: rate_limited mask set");
     std::remove(path.c_str());
+
+    // Multi-dim (Mahoraga) action: 2-in -> 2-out identity, per-dim bounds
+    // rps in [100,1100], concurrency in [1,65]. input [0.5,0.25] -> [600,17].
+    std::string m = "SRLP";
+    put_u32(m, 2); put_u32(m, 2); put_u32(m, 1); put_u32(m, 2);  // ver,in,nlayers,out=2
+    put_f32(m, 1.0f); put_f32(m, 0.0f);   // W row 0
+    put_f32(m, 0.0f); put_f32(m, 1.0f);   // W row 1
+    put_f32(m, 0.0f); put_f32(m, 0.0f);   // b
+    put_f32(m, 0.0f); put_f32(m, 0.0f);   // norm_mean
+    put_f32(m, 1.0f); put_f32(m, 1.0f);   // norm_std
+    put_u32(m, 2);                         // action_dim
+    put_f32(m, 100.0f); put_f32(m, 1.0f);  // action_lo[rps, concurrency]
+    put_f32(m, 1100.0f); put_f32(m, 65.0f);// action_hi
+    const std::string mpath = "/tmp/samurai_selftest_policy_md.srlp";
+    { std::ofstream o(mpath, std::ios::binary); o.write(m.data(), m.size()); }
+    RlPolicy pm;
+    Check(pm.Load(mpath, &err) && pm.action_dim() == 2, "rl policy: multi-dim SRLP loads");
+    auto av = pm.Propose({0.5f, 0.25f});
+    Check(av.size() == 2 && std::abs(av[0] - 600.0) < 1e-3 && std::abs(av[1] - 17.0) < 1e-3,
+          "rl policy: multi-dim forward (rps=600, concurrency=17)");
+    std::remove(mpath.c_str());
   }
 
   // --- sut probe: Prometheus /api/v1/query response parsing ---

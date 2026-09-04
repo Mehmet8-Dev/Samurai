@@ -91,6 +91,56 @@ def test_train_export_reload_evaluate(tmp_path):
     assert res.gate_pass == (res.fqe_value >= res.behavior_return)
 
 
+def test_multidim_mahoraga_action_end_to_end(tmp_path):
+    from ddos_samurai.models.rl import ActionSpec, load_policy, save_policy
+
+    # Corpus where BOTH rps and concurrency vary, so a 2-D policy is learnable.
+    rng = np.random.default_rng(0)
+    p = tmp_path / "m.ndjson"
+    with open(p, "w", encoding="utf-8") as fh:
+        for ep in range(6):
+            rps = 100.0
+            for w in range(10):
+                conc = int(rng.integers(1, 64))
+                rec = {
+                    "run_id": f"cl-{ep}", "win": w, "ts_ms": w, "strategy": "aimd",
+                    "min_rps": 50.0, "max_rps": 2000.0, "window_s": 5,
+                    "slo": {"max_error_pct": 2.0, "max_loss_pct": 0.0,
+                            "min_rate_accuracy_pct": 0.0, "max_latency_ms": 0.0},
+                    "action_rps": rps,
+                    "action": {"rps": rps, "pacing_mode": 1, "concurrency": conc,
+                               "connections": -1, "request_mix": -1, "source_rotation": -1},
+                    "s_valid": w > 0,
+                    "s": _state(rps - 100), "s2": _state(rps),
+                    "healthy": True, "phase": "probe", "done": w == 9,
+                }
+                fh.write(json.dumps(rec) + "\n")
+                rps += 100.0
+
+    spec = ActionSpec(("rps", "concurrency"))
+    ds = build_dataset(p, action_spec=spec)
+    assert ds.action_dim == 2
+    assert ds.actions.shape[1] == 2
+
+    art = train_iql(ds, IQLConfig(steps=300, seed=0))
+    assert art.action_dim == 2  # policy outputs rps + concurrency
+    assert art.action_names == ("rps", "concurrency")
+
+    # SRLP v2 round-trips the multi-dim action bounds losslessly.
+    fp = tmp_path / "m.srlp"
+    save_policy(art, fp)
+    back = load_policy(fp, action_names=("rps", "concurrency"))
+    assert np.allclose(art.act_batch(ds.states), back.act_batch(ds.states), atol=1e-5)
+
+    # Proposed concurrency stays within the data-derived bound for every state.
+    acts = art.act_batch(ds.states)
+    assert np.all(acts[:, 1] >= art.action_lo[1] - 1e-3)
+    assert np.all(acts[:, 1] <= art.action_hi[1] + 1e-3)
+
+    res = evaluate_policy(ds, art, FQEConfig(steps=300, seed=0))
+    assert np.isfinite(res.fqe_value)
+
+
 def test_training_is_deterministic(tmp_path):
     ds = build_dataset(_corpus(tmp_path / "c.ndjson"))
     a1 = train_iql(ds, IQLConfig(steps=200, seed=7))
