@@ -62,6 +62,12 @@ class Dataset:
     action_spec: ActionSpec = RPS_ONLY
     action_lo: np.ndarray = None  # (A,) per-dim lower bound (data-derived)
     action_hi: np.ndarray = None  # (A,) per-dim upper bound
+    # Per-dim head kind ("continuous"/"categorical") and, for categorical dims, the
+    # sorted unique category values observed in the corpus (None for continuous).
+    # These travel with the exported policy so serving maps a softmax argmax back to
+    # the raw lever value identically.
+    action_kinds: tuple[str, ...] = ()
+    action_categories: tuple = ()
 
     def __len__(self) -> int:
         return int(self.states.shape[0])
@@ -150,6 +156,26 @@ def build_dataset(
     action_hi = np.where(action_hi <= action_lo, action_lo + 1.0, action_hi).astype(np.float32)
     action_lo = action_lo.astype(np.float32)
 
+    # Per-dim head kind + data-derived categories. For a categorical dim we take the
+    # sorted unique (integer-rounded) values it took across the corpus as its class
+    # set, and pin its [lo, hi] to the category range so the critic's scalar action
+    # embedding (used by IQL's Q and FQE) stays consistent with serving.
+    kinds = tuple(
+        "categorical" if action_spec.is_categorical(n) else "continuous"
+        for n in action_spec.names
+    )
+    categories: list = []
+    for k in range(a_dim):
+        if kinds[k] == "categorical" and len(actions):
+            uniq = np.unique(np.rint(actions[:, k]).astype(np.int64)).astype(np.float32)
+            if uniq.size == 0:
+                uniq = np.array([0.0], dtype=np.float32)
+            categories.append(uniq)
+            action_lo[k] = float(uniq.min())
+            action_hi[k] = float(uniq.max() if uniq.max() > uniq.min() else uniq.min() + 1.0)
+        else:
+            categories.append(None)
+
     return Dataset(
         states=states,
         actions=actions,
@@ -165,4 +191,6 @@ def build_dataset(
         action_spec=action_spec,
         action_lo=action_lo,
         action_hi=action_hi,
+        action_kinds=kinds,
+        action_categories=tuple(categories),
     )

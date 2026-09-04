@@ -23,9 +23,11 @@ from .policy_artifact import PolicyArtifact
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
 except ImportError:  # pragma: no cover - optional training dependency
     torch = None
     nn = None
+    F = None
 
 
 @dataclass(frozen=True)
@@ -83,15 +85,40 @@ def train_iql(dataset: Dataset, cfg: IQLConfig | None = None) -> PolicyArtifact:
 
     # Per-dim action normalization to [0,1] using the data-derived bounds that also
     # travel to serving, so the exported policy de-normalizes each dim identically.
+    # The critic (Q/V) always consumes the a_dim scalar action embedding; only the
+    # policy *head* splits continuous vs categorical dims.
     lo = np.asarray(dataset.action_lo, dtype=np.float32)
     hi = np.asarray(dataset.action_hi, dtype=np.float32)
     span = np.where(hi <= lo, 1.0, hi - lo)
     A = ((dataset.actions - lo) / span).clip(0.0, 1.0).reshape(-1, a_dim)
 
+    # Per-dim head layout. A continuous dim owns one output (regressed to A[:,k]); a
+    # categorical dim owns len(cats) logits (classified to the logged category
+    # index). heads[k] = ("continuous", col) or ("categorical", col, width, cats).
+    kinds = dataset.action_kinds or ("continuous",) * a_dim
+    categories = dataset.action_categories or (None,) * a_dim
+    heads: list[tuple] = []
+    cat_targets = np.zeros((dataset.actions.shape[0], a_dim), dtype=np.int64)
+    col = 0
+    for k in range(a_dim):
+        if kinds[k] == "categorical":
+            cats = np.asarray(categories[k], dtype=np.float32)
+            width = int(cats.size)
+            # Map each logged raw value to its nearest category index.
+            diffs = np.abs(dataset.actions[:, k][:, None] - cats[None, :])
+            cat_targets[:, k] = np.argmin(diffs, axis=1)
+            heads.append(("categorical", col, width, cats))
+            col += width
+        else:
+            heads.append(("continuous", col))
+            col += 1
+    out_width = col
+
     dev = torch.device("cpu")
     s = torch.tensor(S, dtype=torch.float32, device=dev)
     s2 = torch.tensor(S2, dtype=torch.float32, device=dev)
     a = torch.tensor(A, dtype=torch.float32, device=dev)
+    ct = torch.tensor(cat_targets, dtype=torch.long, device=dev)
     r = torch.tensor(dataset.rewards.reshape(-1, 1), dtype=torch.float32, device=dev)
     done = torch.tensor(dataset.dones.reshape(-1, 1), dtype=torch.float32, device=dev)
 
@@ -101,7 +128,7 @@ def train_iql(dataset: Dataset, cfg: IQLConfig | None = None) -> PolicyArtifact:
     q1_t.load_state_dict(q1.state_dict())
     q2_t.load_state_dict(q2.state_dict())
     vnet = _mlp([feat_dim, *cfg.hidden_dims, 1]).to(dev)
-    policy = _mlp([feat_dim, *cfg.hidden_dims, a_dim]).to(dev)
+    policy = _mlp([feat_dim, *cfg.hidden_dims, out_width]).to(dev)
 
     opt_q = torch.optim.Adam([*q1.parameters(), *q2.parameters()], lr=cfg.lr)
     opt_v = torch.optim.Adam(vnet.parameters(), lr=cfg.lr)
@@ -112,7 +139,7 @@ def train_iql(dataset: Dataset, cfg: IQLConfig | None = None) -> PolicyArtifact:
 
     for _ in range(cfg.steps):
         idx = torch.randint(0, n, (bs,), device=dev)
-        sb, s2b, ab, rb, db = s[idx], s2[idx], a[idx], r[idx], done[idx]
+        sb, s2b, ab, rb, db, ctb = s[idx], s2[idx], a[idx], r[idx], done[idx], ct[idx]
         sab = torch.cat([sb, ab], dim=1)
 
         # Value: expectile regression toward min of target Q.
@@ -128,12 +155,24 @@ def train_iql(dataset: Dataset, cfg: IQLConfig | None = None) -> PolicyArtifact:
         loss_q = ((q1(sab) - td).pow(2) + (q2(sab) - td).pow(2)).mean()
         opt_q.zero_grad(); loss_q.backward(); opt_q.step()
 
-        # Policy: advantage-weighted regression toward the logged action.
+        # Policy: advantage-weighted imitation of the logged action. Continuous dims
+        # are regressed (MSE); categorical dims are classified (cross-entropy) toward
+        # the logged category — so a WAF-blocked variant gets *down*-weighted, not
+        # averaged in. Both share the same AWR weight exp(beta*adv).
         with torch.no_grad():
             adv = torch.min(q1(sab), q2(sab)) - vnet(sb)
-            weight = torch.clamp(torch.exp(cfg.beta * adv), max=cfg.adv_clip)
+            w = torch.clamp(torch.exp(cfg.beta * adv), max=cfg.adv_clip).squeeze(1)  # (B,)
         pred = policy(sb)
-        loss_p = (weight * (pred - ab).pow(2)).mean()
+        loss_p = pred.new_zeros(())
+        for k, head in enumerate(heads):
+            if head[0] == "categorical":
+                _, c0, width, _ = head
+                logits = pred[:, c0:c0 + width]
+                ce = F.cross_entropy(logits, ctb[:, k], reduction="none")  # (B,)
+                loss_p = loss_p + (w * ce).mean()
+            else:
+                c0 = head[1]
+                loss_p = loss_p + (w * (pred[:, c0] - ab[:, k]).pow(2)).mean()
         opt_p.zero_grad(); loss_p.backward(); opt_p.step()
 
         with torch.no_grad():
@@ -143,10 +182,11 @@ def train_iql(dataset: Dataset, cfg: IQLConfig | None = None) -> PolicyArtifact:
                 tp.mul_(1 - cfg.polyak).add_(cfg.polyak * sp)
 
     return _extract_artifact(policy, norm, lo, hi, dataset.feature_names,
-                             dataset.action_spec.names)
+                             dataset.action_spec.names, kinds, categories)
 
 
-def _extract_artifact(policy, norm, lo, hi, feature_names, action_names) -> PolicyArtifact:
+def _extract_artifact(policy, norm, lo, hi, feature_names, action_names,
+                      action_kinds=(), action_categories=()) -> PolicyArtifact:
     """Pull the Linear layers out of the torch policy into a numpy artifact."""
     layers: list[tuple[np.ndarray, np.ndarray]] = []
     for m in policy:
@@ -162,4 +202,6 @@ def _extract_artifact(policy, norm, lo, hi, feature_names, action_names) -> Poli
         action_hi=np.asarray(hi, dtype=np.float32),
         feature_names=tuple(feature_names),
         action_names=tuple(action_names),
+        action_kinds=tuple(action_kinds),
+        action_categories=tuple(action_categories),
     )

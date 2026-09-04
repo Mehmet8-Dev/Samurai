@@ -97,6 +97,42 @@ def test_multidim_action_roundtrip(tmp_path):
     assert abs(back.act(np.array([0.5, 0.25], dtype=np.float32)) - 600.0) < 1e-3
 
 
+def test_categorical_head_argmax_and_v3_roundtrip(tmp_path):
+    # 1-in -> 4-out policy over 2 dims: rps (continuous, 1 output) + request_mix
+    # (categorical over {0,1,3,4}, 3 outputs as logits). Identity-ish weights let us
+    # steer which logit wins from the input.
+    #   output col 0      -> rps frac
+    #   output cols 1..3  -> logits for categories [0, 3, 4]
+    W = np.array(
+        [[0.0], [0.0], [0.0], [0.0]], dtype=np.float32
+    )  # bias-driven; input ignored for clarity
+    b = np.array([0.5, -1.0, 2.0, 0.0], dtype=np.float32)  # rps=0.5; argmax logit -> col2 (cat 3)
+    art = PolicyArtifact(
+        layers=[(W, b)],
+        norm_mean=np.zeros(1, dtype=np.float32),
+        norm_std=np.ones(1, dtype=np.float32),
+        action_lo=np.array([100.0, 0.0], dtype=np.float32),
+        action_hi=np.array([1100.0, 4.0], dtype=np.float32),
+        feature_names=("f0",),
+        action_names=("rps", "request_mix"),
+        action_kinds=("continuous", "categorical"),
+        action_categories=(None, (0.0, 3.0, 4.0)),
+    )
+    v = art.act_vector(np.array([0.0], dtype=np.float32))
+    assert abs(v[0] - 600.0) < 1e-3          # rps = 100 + 0.5*1000
+    assert v[1] == 3.0                        # argmax of [-1,2,0] -> index 1 -> category 3.0
+
+    p = tmp_path / "cat.srlp"
+    save_policy(art, p)
+    assert p.read_bytes()[4:8] == (3).to_bytes(4, "little")  # version 3
+    back = load_policy(p, action_names=("rps", "request_mix"))
+    assert back.action_dim == 2
+    assert back.action_kinds == ("continuous", "categorical")
+    assert tuple(back.action_categories[1]) == (0.0, 3.0, 4.0)
+    v2 = back.act_vector(np.array([0.0], dtype=np.float32))
+    assert abs(v2[0] - 600.0) < 1e-3 and v2[1] == 3.0
+
+
 def test_normalizer_applied_in_forward(tmp_path):
     art = _artifact()
     shifted = PolicyArtifact(

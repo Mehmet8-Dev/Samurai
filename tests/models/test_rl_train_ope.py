@@ -15,7 +15,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from ddos_samurai.models.rl import build_dataset, load_policy, save_policy
+from ddos_samurai.models.rl import ActionSpec, build_dataset, load_policy, save_policy
 from ddos_samurai.models.rl.ope import FQEConfig, behavior_return, evaluate_policy
 from ddos_samurai.models.rl.train import IQLConfig, train_iql
 
@@ -136,6 +136,80 @@ def test_multidim_mahoraga_action_end_to_end(tmp_path):
     acts = art.act_batch(ds.states)
     assert np.all(acts[:, 1] >= art.action_lo[1] - 1e-3)
     assert np.all(acts[:, 1] <= art.action_hi[1] + 1e-3)
+
+    res = evaluate_policy(ds, art, FQEConfig(steps=300, seed=0))
+    assert np.isfinite(res.fqe_value)
+
+
+def _categorical_corpus(path, *, episodes: int = 12, windows: int = 8):
+    """Corpus where request_mix is categorical: variant 2 is WAF-blocked (mostly
+    4xx, low success) and the others are honored. A continuous head would regress
+    request_mix to the mean of the good variants {0,1,3,4} == 2.0 (the blocked one);
+    a categorical head must be able to avoid it."""
+    rng = np.random.default_rng(1)
+    with open(path, "w", encoding="utf-8") as fh:
+        for ep in range(episodes):
+            variant = ep % 5  # cycle 0..4 so every category is logged
+            rps = 300.0
+            prev = 0.0
+            for w in range(windows):
+                blocked = variant == 2
+                succ = 0.1 if blocked else 0.95
+                resp = max(rps, 1.0) * 5
+                rec = {
+                    "run_id": f"cl-{ep}", "win": w, "ts_ms": 1_700_000_000_000 + w,
+                    "strategy": "explore", "min_rps": 50.0, "max_rps": 2000.0, "window_s": 5,
+                    "slo": {"max_error_pct": 100.0, "max_loss_pct": 0.0,
+                            "min_rate_accuracy_pct": 0.0, "max_latency_ms": 0.0},
+                    "action_rps": rps,
+                    "action": {"rps": rps, "pacing_mode": 1, "concurrency": 4,
+                               "connections": -1, "request_mix": variant, "source_rotation": -1},
+                    "s_valid": w > 0,
+                    "s": _state(prev),
+                    "s2": {
+                        "valid": True, "rps": rps, "attempted": resp, "errors": 0.0,
+                        "error_pct": 0.0, "loss_pct": -1.0, "rate_accuracy_pct": -1.0,
+                        "p99_ms": -1.0,
+                        "defense": {
+                            "responses_total": resp,
+                            "status_2xx": resp * succ,
+                            "status_4xx": resp * (1.0 - succ) if blocked else 0.0,
+                            "status_5xx": 0.0,
+                        },
+                    },
+                    "healthy": True, "phase": "explore", "done": w == windows - 1,
+                }
+                fh.write(json.dumps(rec) + "\n")
+                prev = rps
+    return path
+
+
+def test_categorical_head_can_avoid_blocked_variant(tmp_path):
+    from ddos_samurai.models.rl import EffectiveThroughputReward, MAHORAGA
+    from ddos_samurai.models.rl.config import RLConfig
+
+    spec = ActionSpec(("rps", "request_mix"), categorical_names=("request_mix",))
+    cfg = RLConfig(rps_scale=1000.0)
+    ds = build_dataset(
+        _categorical_corpus(tmp_path / "cat.ndjson"),
+        cfg, reward_fn=EffectiveThroughputReward(cfg), action_spec=spec,
+    )
+    assert ds.action_kinds == ("continuous", "categorical")
+    assert tuple(ds.action_categories[1]) == (0.0, 1.0, 2.0, 3.0, 4.0)
+
+    art = train_iql(ds, IQLConfig(steps=1500, seed=0))
+    acts = art.act_batch(ds.states)
+    # Discreteness: every proposed request_mix is exactly one of the categories.
+    assert np.all(np.isin(acts[:, 1], ds.action_categories[1]))
+    # Learning: the blocked variant 2 is proposed on a minority of states (a
+    # continuous head would collapse to exactly 2.0 everywhere).
+    assert np.mean(acts[:, 1] == 2.0) < 0.5
+
+    # v3 export round-trips the categorical head losslessly.
+    fp = tmp_path / "cat.srlp"
+    save_policy(art, fp)
+    back = load_policy(fp, action_names=("rps", "request_mix"))
+    assert np.array_equal(art.act_batch(ds.states), back.act_batch(ds.states))
 
     res = evaluate_policy(ds, art, FQEConfig(steps=300, seed=0))
     assert np.isfinite(res.fqe_value)
