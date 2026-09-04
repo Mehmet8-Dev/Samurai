@@ -42,6 +42,7 @@ set(CONTROL_SOURCES
   autoscale.cpp
   closed_loop.cpp       # autopilot load controller (AIMD / binary-search / RL SLO search)
   rl_policy.cpp         # native SRLP policy loader + MLP forward (serves the kRl strategy)
+  rl_explore.cpp        # exploration-mode lever perturbation for RL corpus capture
   sut_probe.cpp         # SUT-correlation Prometheus scrape (feeds closed-loop latency SLO)
   discovery.cpp
   jwt.cpp

@@ -20,6 +20,7 @@
 
 #include "autoscale.hpp"
 #include "closed_loop.hpp"
+#include "rl_explore.hpp"
 #include "rl_policy.hpp"
 #include "control_auth.hpp"
 #include "control_server.hpp"
@@ -136,6 +137,36 @@ samurai::control::ClosedLoopConfig BuildClosedLoopConfig(int argc, char** argv) 
   return cl;
 }
 
+// Parse the RL exploration knobs off the CLI. `--rl-explore` turns on the
+// default WAF-lab schedule; `--rl-explore-seed N` makes the perturbation
+// reproducible; `--rl-explore-<field> lo:hi` overrides one lever's range (field
+// is a kActionFields name other than rps, e.g. concurrency/request_mix/
+// source_rotation/pacing_mode). Exploration only fires during corpus capture
+// when a policy is NOT driving the extra levers.
+samurai::control::RlExploreConfig BuildExploreConfig(int argc, char** argv) {
+  using namespace samurai::control;
+  using namespace samurai::control::daemon;
+  if (!Flag(argc, argv, "--rl-explore")) return RlExploreConfig{};  // disabled
+  const auto seed = static_cast<std::uint64_t>(OptInt(argc, argv, "--rl-explore-seed", 0));
+  RlExploreConfig cfg = DefaultExploreConfig(seed);
+  // Per-lever "lo:hi" range overrides. Absent flags keep the lab defaults.
+  for (std::size_t k = 1; k < sizeof(kActionFields) / sizeof(kActionFields[0]); ++k) {
+    const std::string flag = std::string("--rl-explore-") + kActionFields[k];
+    const std::string range = Opt(argc, argv, flag.c_str(), "");
+    if (range.empty()) continue;
+    const std::size_t colon = range.find(':');
+    if (colon == std::string::npos) continue;
+    try {
+      const long lo = std::stol(range.substr(0, colon));
+      const long hi = std::stol(range.substr(colon + 1));
+      cfg.SetLever(kActionFields[k], lo, hi);
+    } catch (...) {
+      // Malformed range -> keep the default for this lever.
+    }
+  }
+  return cfg;
+}
+
 // Parse the SUT-correlation (Prometheus) knobs off the CLI. Extra queries are
 // given as a ';'-separated list of name=promql pairs.
 samurai::control::SutProbeConfig BuildSutProbeConfig(int argc, char** argv) {
@@ -246,9 +277,13 @@ Value RlActionJson(double rps, const Value& base_args) {
   a.set("concurrency", cc ? Value::Int(cc->as_int(0)) : Value::Int(-1));
   const Value* conns = base_args.find("connections");
   a.set("connections", conns ? Value::Int(conns->as_int(0)) : Value::Int(-1));
-  // Levers with no spec knob yet: schema placeholders for the rich policy.
-  a.set("request_mix", Value::Int(-1));
-  a.set("source_rotation", Value::Int(-1));
+  // Mahoraga shaping levers: -1 until a policy or exploration schedule drives
+  // them into base_args, at which point the captured value reflects what the
+  // dataplane was actually told to do this window.
+  const Value* rm = base_args.find("request_mix");
+  a.set("request_mix", rm ? Value::Int(rm->as_int(-1)) : Value::Int(-1));
+  const Value* sr = base_args.find("source_rotation");
+  a.set("source_rotation", sr ? Value::Int(sr->as_int(-1)) : Value::Int(-1));
   return a;
 }
 
@@ -512,6 +547,13 @@ void Usage(const char* argv0) {
       "                            degrades kRl to the AIMD safety fallback\n"
       "  --cl-rl-max-jump-factor X kRl shield: cap the upward setpoint jump to X x\n"
       "                            the last setpoint per window (default 2.0)\n"
+      "  --rl-explore              perturb the shaping levers (concurrency/\n"
+      "                            request_mix/source_rotation/pacing_mode) per\n"
+      "                            window during --rl-corpus capture so they vary\n"
+      "                            and become learnable offline (no policy needed)\n"
+      "  --rl-explore-seed N       reproducible exploration schedule (default 0)\n"
+      "  --rl-explore-<lever> lo:hi  override one lever's range, e.g.\n"
+      "                            --rl-explore-concurrency 1:32\n"
       "  -h, --help\n",
       argv0);
 }
@@ -1011,6 +1053,16 @@ int main(int argc, char** argv) {
                         rl_corpus_path.c_str());
           }
         }
+        // RL exploration: when capturing a corpus without a policy driving the
+        // extra levers, perturb concurrency/request_mix/source_rotation/pacing
+        // per window so those columns vary and become learnable offline. A loaded
+        // policy takes precedence (it drives the levers itself).
+        const samurai::control::RlExploreConfig rl_explore = BuildExploreConfig(argc, argv);
+        if (rl_explore.enabled) {
+          std::printf("samurai_master: RL exploration on (seed=%llu) — perturbing shaping "
+                      "levers for corpus coverage\n",
+                      static_cast<unsigned long long>(rl_explore.seed));
+        }
         const std::string rl_run_id =
             "cl-" + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
@@ -1046,6 +1098,17 @@ int main(int argc, char** argv) {
             job.base_args.set(samurai::control::kActionFields[k],
                               Value::Int(static_cast<std::int64_t>(
                                   std::llround(rl_next_levers[k]))));
+          }
+          // Exploration schedule fills the shaping levers the policy did not (or,
+          // in a capture-only run, all of them). Only dims with a non-sentinel
+          // draw are applied; rps (dim 0) is never touched here.
+          if (rl_explore.enabled && rl_next_levers.empty()) {
+            const std::vector<double> ex = samurai::control::ExploreLevers(win, rl_explore);
+            for (std::size_t k = 1; k < ex.size(); ++k) {
+              if (ex[k] < 0.0) continue;
+              job.base_args.set(samurai::control::kActionFields[k],
+                                Value::Int(static_cast<std::int64_t>(std::llround(ex[k]))));
+            }
           }
           attach_progress(job);
           const JobResult res =

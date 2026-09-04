@@ -32,6 +32,7 @@
 #include "daemon/daemon_args.hpp"
 #include "autoscale.hpp"
 #include "closed_loop.hpp"
+#include "rl_explore.hpp"
 #include "rl_policy.hpp"
 #include "discovery.hpp"
 #include "sut_probe.hpp"
@@ -590,6 +591,60 @@ int main() {
     Check(av.size() == 2 && std::abs(av[0] - 600.0) < 1e-3 && std::abs(av[1] - 17.0) < 1e-3,
           "rl policy: multi-dim forward (rps=600, concurrency=17)");
     std::remove(mpath.c_str());
+  }
+
+  // --- RL exploration: deterministic, in-range, decorrelated lever schedule ---
+  {
+    using namespace samurai::control;
+    const std::size_t nfields = sizeof(kActionFields) / sizeof(kActionFields[0]);
+
+    // A disabled config perturbs nothing.
+    RlExploreConfig off;
+    const auto ex_off = ExploreLevers(3, off);
+    bool all_sentinel = ex_off.size() == nfields;
+    for (double v : ex_off) all_sentinel = all_sentinel && v < 0.0;
+    Check(all_sentinel, "rl explore: disabled config leaves every lever untouched");
+
+    RlExploreConfig cfg = DefaultExploreConfig(42);
+    Check(cfg.enabled && cfg.levers.size() == nfields,
+          "rl explore: default config sized to kActionFields");
+
+    // dim 0 (rps) is never perturbed; the extra levers are.
+    const auto a = ExploreLevers(0, cfg);
+    Check(a.size() == nfields && a[0] < 0.0, "rl explore: rps (dim 0) never perturbed");
+    Check(a[1] >= 1.0 && a[1] <= 16.0, "rl explore: concurrency drawn in [1,16]");
+    Check(a[2] >= 0.0 && a[2] <= 4.0, "rl explore: request_mix drawn in [0,4]");
+    Check(a[3] >= 1.0 && a[3] <= 8.0, "rl explore: source_rotation drawn in [1,8]");
+    Check(a[4] >= 1.0 && a[4] <= 3.0, "rl explore: pacing_mode drawn in [1,3]");
+
+    // Deterministic: same seed + window => identical draw.
+    const auto a2 = ExploreLevers(0, cfg);
+    Check(a == a2, "rl explore: same (seed,win) is reproducible");
+
+    // Decorrelated across windows: the schedule actually moves. Sweep many
+    // windows and require the request_mix column to hit at least 3 distinct
+    // values (a constant column would be unlearnable).
+    std::set<long> mix_values;
+    for (int w = 0; w < 64; ++w) {
+      mix_values.insert(static_cast<long>(ExploreLevers(w, cfg)[2]));
+    }
+    Check(mix_values.size() >= 3, "rl explore: request_mix varies across windows");
+
+    // A different seed yields a different schedule (not a fixed sequence).
+    RlExploreConfig cfg2 = DefaultExploreConfig(7);
+    bool differs = false;
+    for (int w = 0; w < 16 && !differs; ++w) {
+      if (ExploreLevers(w, cfg) != ExploreLevers(w, cfg2)) differs = true;
+    }
+    Check(differs, "rl explore: seed changes the schedule");
+
+    // Range override + guardrails: rps is rejected, unknown field rejected,
+    // inverted range rejected; a valid override takes effect.
+    Check(!cfg.SetLever("rps", 1, 9), "rl explore: refuses to explore rps");
+    Check(!cfg.SetLever("nonsense", 1, 9), "rl explore: unknown lever rejected");
+    Check(!cfg.SetLever("concurrency", 9, 1), "rl explore: inverted range rejected");
+    Check(cfg.SetLever("concurrency", 5, 5), "rl explore: valid override accepted");
+    Check(ExploreLevers(0, cfg)[1] == 5.0, "rl explore: degenerate range pins the value");
   }
 
   // --- sut probe: Prometheus /api/v1/query response parsing ---
