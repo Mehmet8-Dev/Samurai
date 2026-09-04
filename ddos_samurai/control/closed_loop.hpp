@@ -35,6 +35,7 @@ namespace samurai::control {
 enum class ClosedLoopStrategy : std::uint8_t {
   kAimd = 0,
   kBinSearch = 1,
+  kRl = 2,  // learned policy proposes the setpoint; the shield below bounds it
 };
 
 struct ClosedLoopConfig {
@@ -61,6 +62,15 @@ struct ClosedLoopConfig {
   // Binary-search params.
   double binsearch_tolerance_rps = 0.0;  // <=0 => 1% of (max_rps - min_rps)
   int binsearch_max_windows = 24;        // hard cap on windows
+
+  // RL (kRl) safety shield. The learned policy only *proposes* the next setpoint
+  // (LoadSample::rl_action_rps); the controller enforces these bounds so a bad or
+  // untrained policy can never overdrive the SUT:
+  //   - an SLO-red window forces a multiplicative backoff (policy ignored), and
+  //   - a green window caps the upward jump to rl_max_jump_factor x the last
+  //     setpoint (downward moves are unrestricted — lowering load is always safe).
+  // A missing proposal (<0, e.g. policy failed to load) falls back to AIMD.
+  double rl_max_jump_factor = 2.0;  // clamped to >= 1.0 in the controller
 };
 
 // One already-measured window. Fields left < 0 are "unknown" and disable the
@@ -74,6 +84,9 @@ struct LoadSample {
   double loss_pct = -1.0;
   double rate_accuracy_pct = -1.0;
   double latency_p99_ms = -1.0;  // unknown until SUT correlation feeds it
+  // kRl only: the policy's proposed setpoint for the NEXT window, computed by the
+  // caller from this measured state. < 0 => no proposal (shield falls back to AIMD).
+  double rl_action_rps = -1.0;
 };
 
 struct ClosedLoopDecision {
@@ -111,6 +124,7 @@ class ClosedLoopController {
  private:
   ClosedLoopDecision StepAimd(const LoadSample& sample, bool healthy, double err_pct);
   ClosedLoopDecision StepBinSearch(const LoadSample& sample, bool healthy, double err_pct);
+  ClosedLoopDecision StepRl(const LoadSample& sample, bool healthy, double err_pct);
 
   ClosedLoopConfig cfg_;
   bool enabled_ = false;

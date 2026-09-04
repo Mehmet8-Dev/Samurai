@@ -24,6 +24,9 @@ ClosedLoopController::ClosedLoopController(const ClosedLoopConfig& cfg) : cfg_(c
   increase_ = cfg_.aimd_increase_rps > 0.0 ? cfg_.aimd_increase_rps : 0.10 * span;
   backoff_ = (cfg_.aimd_backoff > 0.0 && cfg_.aimd_backoff < 1.0) ? cfg_.aimd_backoff : 0.5;
   tolerance_ = cfg_.binsearch_tolerance_rps > 0.0 ? cfg_.binsearch_tolerance_rps : 0.01 * span;
+  // Shield jump factor is a multiplier on the last setpoint; anything < 1 would
+  // forbid growth, so floor it at 1.0.
+  cfg_.rl_max_jump_factor = std::max(1.0, cfg_.rl_max_jump_factor);
 
   const double init = cfg_.initial_rps > 0.0 ? cfg_.initial_rps : cfg_.min_rps;
   setpoint_ = Clamp(init, cfg_.min_rps, cfg_.max_rps);
@@ -84,9 +87,19 @@ ClosedLoopDecision ClosedLoopController::Step(const LoadSample& sample) {
   const bool healthy = IsHealthy(sample, &err_pct);
   ++window_;
 
-  ClosedLoopDecision d = cfg_.strategy == ClosedLoopStrategy::kBinSearch
-                             ? StepBinSearch(sample, healthy, err_pct)
-                             : StepAimd(sample, healthy, err_pct);
+  ClosedLoopDecision d;
+  switch (cfg_.strategy) {
+    case ClosedLoopStrategy::kBinSearch:
+      d = StepBinSearch(sample, healthy, err_pct);
+      break;
+    case ClosedLoopStrategy::kRl:
+      d = StepRl(sample, healthy, err_pct);
+      break;
+    case ClosedLoopStrategy::kAimd:
+    default:
+      d = StepAimd(sample, healthy, err_pct);
+      break;
+  }
   d.enabled = true;
   d.last_healthy = healthy;
   d.error_pct = err_pct;
@@ -110,6 +123,50 @@ ClosedLoopDecision ClosedLoopController::StepAimd(const LoadSample& /*sample*/, 
     d.reason = "slo-violation: backoff";
   }
 
+  if (cfg_.aimd_max_windows > 0 && window_ >= cfg_.aimd_max_windows) {
+    done_ = true;
+    setpoint_ = best_good_ > 0.0 ? best_good_ : cfg_.min_rps;
+    d.phase = "done";
+    d.reason = "window budget exhausted";
+  }
+
+  d.setpoint_rps = setpoint_;
+  return d;
+}
+
+ClosedLoopDecision ClosedLoopController::StepRl(const LoadSample& sample, bool healthy,
+                                                double /*err_pct*/) {
+  // RL as accelerator, AIMD as safety net. The policy proposes; the shield here
+  // is the only thing that actually moves the setpoint, so no policy can overdrive
+  // the SUT.
+  ClosedLoopDecision d;
+  const double proposal = sample.rl_action_rps;
+
+  if (!healthy) {
+    // SLO red: ignore the policy entirely, force a multiplicative backoff.
+    setpoint_ = std::max(cfg_.min_rps, setpoint_ * backoff_);
+    d.phase = "backoff";
+    d.reason = "shield: slo-violation backoff";
+  } else {
+    best_good_ = std::max(best_good_, setpoint_);
+    if (proposal < 0.0) {
+      // No proposal (policy absent/failed): fall back to AIMD additive increase.
+      setpoint_ = std::min(cfg_.max_rps, setpoint_ + increase_);
+      d.phase = "probe";
+      d.reason = "rl: no proposal, aimd fallback";
+    } else {
+      // Cap the *upward* jump to rl_max_jump_factor x the last setpoint; downward
+      // moves (lowering load) are always allowed. Then clamp to the load band.
+      const double jump_ceiling =
+          setpoint_ > 0.0 ? setpoint_ * cfg_.rl_max_jump_factor : cfg_.max_rps;
+      const double capped = std::min(proposal, jump_ceiling);
+      setpoint_ = Clamp(capped, cfg_.min_rps, cfg_.max_rps);
+      d.phase = "rl";
+      d.reason = "rl: shielded proposal";
+    }
+  }
+
+  // Reuse the AIMD window budget as the soak/stop cap for kRl.
   if (cfg_.aimd_max_windows > 0 && window_ >= cfg_.aimd_max_windows) {
     done_ = true;
     setpoint_ = best_good_ > 0.0 ? best_good_ : cfg_.min_rps;

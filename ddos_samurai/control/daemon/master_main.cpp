@@ -10,6 +10,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -18,6 +19,7 @@
 
 #include "autoscale.hpp"
 #include "closed_loop.hpp"
+#include "rl_policy.hpp"
 #include "control_auth.hpp"
 #include "control_server.hpp"
 #include "curve.hpp"
@@ -109,9 +111,14 @@ samurai::control::ClosedLoopConfig BuildClosedLoopConfig(int argc, char** argv) 
   ClosedLoopConfig cl;
   cl.enabled = Flag(argc, argv, "--closed-loop");
   const std::string strat = LowerCopy(Opt(argc, argv, "--cl-strategy", "aimd"));
-  cl.strategy = (strat == "binsearch" || strat == "binary" || strat == "bisect")
-                    ? ClosedLoopStrategy::kBinSearch
-                    : ClosedLoopStrategy::kAimd;
+  if (strat == "binsearch" || strat == "binary" || strat == "bisect") {
+    cl.strategy = ClosedLoopStrategy::kBinSearch;
+  } else if (strat == "rl" || strat == "policy") {
+    cl.strategy = ClosedLoopStrategy::kRl;
+  } else {
+    cl.strategy = ClosedLoopStrategy::kAimd;
+  }
+  cl.rl_max_jump_factor = OptDouble(argc, argv, "--cl-rl-max-jump-factor", 2.0);
   cl.min_rps = static_cast<double>(OptInt(argc, argv, "--cl-min-rps", 1));
   cl.max_rps = static_cast<double>(OptInt(argc, argv, "--cl-max-rps", 1000000));
   cl.initial_rps = static_cast<double>(OptInt(argc, argv, "--cl-initial-rps", 0));
@@ -242,6 +249,47 @@ Value RlActionJson(double rps, const Value& base_args) {
   a.set("request_mix", Value::Int(-1));
   a.set("source_rotation", Value::Int(-1));
   return a;
+}
+
+// Build the policy's raw state inputs from a measured window + its defense
+// signals. The derived ratios MUST match ddos_samurai/models/rl DefenseSignals
+// (rate_limited = 4xx/responses, overload = 5xx/responses, conn_drop =
+// 1 - established/attempted, reset_pressure = h2_stream_reset_ratio, challenge =
+// expectation_failures/responses); an input missing from `defense` stays -1
+// (unknown) so BuildFeatures masks it, exactly like the offline pipeline.
+samurai::control::RlStateInputs RlInputsFrom(const samurai::control::LoadSample& s,
+                                             const Value& defense, int win,
+                                             const samurai::control::ClosedLoopConfig& cfg) {
+  samurai::control::RlStateInputs in;
+  in.rps = s.actual_rps;
+  in.error_pct = s.error_pct >= 0.0
+                     ? s.error_pct
+                     : (s.attempted > 0.0 ? 100.0 * s.errors / s.attempted : -1.0);
+  in.loss_pct = s.loss_pct;
+  in.rate_accuracy_pct = s.rate_accuracy_pct;
+  in.p99_ms = s.latency_p99_ms;
+  in.win = win;
+  in.max_rps = cfg.max_rps;
+  in.step_horizon = 32.0;  // must match RLConfig.step_horizon
+
+  auto get = [&](const char* k, double* out) -> bool {
+    if (const Value* v = defense.find(k)) {
+      *out = v->as_double(0.0);
+      return true;
+    }
+    return false;
+  };
+  double responses = 0.0, v = 0.0;
+  const bool have_resp = get("responses_total", &responses) && responses > 0.0;
+  if (have_resp && get("status_4xx", &v)) in.rate_limited_ratio = v / responses;
+  if (have_resp && get("status_5xx", &v)) in.overload_ratio = v / responses;
+  if (have_resp && get("l7_expectation_failures", &v)) in.challenge_rate = v / responses;
+  double att = 0.0, est = 0.0;
+  if (get("l7_conn_attempted", &att) && att > 0.0 && get("l7_conn_established", &est)) {
+    in.conn_drop_ratio = std::max(0.0, 1.0 - est / att);
+  }
+  if (get("h2_stream_reset_ratio", &v)) in.reset_pressure = v;
+  return in;
 }
 
 // Serialize one measured window (LoadSample folded with the SUT scrape and the
@@ -432,7 +480,7 @@ void Usage(const char* argv0) {
       "  Autopilot (closed-loop load controller; find/hold the SUT's SLO ceiling):\n"
       "  --closed-loop             drive target_rps across measured windows to find\n"
       "                            and hold the max load that stays SLO-green\n"
-      "  --cl-strategy S           aimd | binsearch (default aimd)\n"
+      "  --cl-strategy S           aimd | binsearch | rl (default aimd)\n"
       "  --cl-window-s N           seconds per measured window (default 5)\n"
       "  --cl-min-rps N            setpoint floor (default 1)\n"
       "  --cl-max-rps N            setpoint ceiling (default 1000000)\n"
@@ -452,11 +500,17 @@ void Usage(const char* argv0) {
       "  --sut-extra-queries L     ';'-separated name=promql pairs to record\n"
       "  --sut-timeout-s N         scrape timeout (default 5)\n"
       "  --sut-insecure            skip TLS verification for the Prometheus scrape\n"
-      "  RL layer (offline-RL training corpus for the autopilot policy):\n"
+      "  RL layer (offline-RL corpus + learned-policy serving for the autopilot):\n"
       "  --rl-corpus PATH          append one (s,a,s') NDJSON record per closed-loop\n"
       "                            window to PATH (training data; reward computed\n"
       "                            offline in ddos_samurai/models/rl). Needs\n"
       "                            --closed-loop; off => zero overhead\n"
+      "  --rl-policy PATH          SRLP weight file to serve with --cl-strategy rl\n"
+      "                            (or env SAMURAI_RL_POLICY). Exported by\n"
+      "                            ddos_samurai/models/rl/export.py; load failure\n"
+      "                            degrades kRl to the AIMD safety fallback\n"
+      "  --cl-rl-max-jump-factor X kRl shield: cap the upward setpoint jump to X x\n"
+      "                            the last setpoint per window (default 2.0)\n"
       "  -h, --help\n",
       argv0);
 }
@@ -910,11 +964,37 @@ int main(int argc, char** argv) {
                       sut.config().prometheus_url.c_str(),
                       sut.config().latency_p99_query.empty() ? "<none>" : "set");
         }
+        const char* strat_name =
+            clcfg.strategy == samurai::control::ClosedLoopStrategy::kBinSearch ? "binsearch"
+            : clcfg.strategy == samurai::control::ClosedLoopStrategy::kRl      ? "rl"
+                                                                              : "aimd";
         std::printf(
             "samurai_master: closed-loop enabled (strategy=%s window=%ds min=%.0f max=%.0f "
             "initial=%.0f slo_max_error_pct=%.2f)\n",
-            clcfg.strategy == samurai::control::ClosedLoopStrategy::kBinSearch ? "binsearch" : "aimd",
-            window_s, clcfg.min_rps, clcfg.max_rps, ctl.initial_setpoint(), clcfg.slo_max_error_pct);
+            strat_name, window_s, clcfg.min_rps, clcfg.max_rps, ctl.initial_setpoint(),
+            clcfg.slo_max_error_pct);
+        // RL policy serving (kRl): load the SRLP weight file once. The policy only
+        // proposes; ClosedLoopController::StepRl shields the proposal. If it fails
+        // to load, kRl degrades to the AIMD fallback baked into the shield.
+        samurai::control::RlPolicy rl_policy;
+        if (clcfg.strategy == samurai::control::ClosedLoopStrategy::kRl) {
+          std::string rl_path = Opt(argc, argv, "--rl-policy", "");
+          if (rl_path.empty()) {
+            if (const char* env = std::getenv("SAMURAI_RL_POLICY")) rl_path = env;
+          }
+          std::string rl_err;
+          if (rl_path.empty()) {
+            std::fprintf(stderr,
+                         "samurai_master: --cl-strategy rl but no --rl-policy / "
+                         "SAMURAI_RL_POLICY; falling back to AIMD shield behavior\n");
+          } else if (!rl_policy.Load(rl_path, &rl_err)) {
+            std::fprintf(stderr, "samurai_master: RL policy load failed (%s): %s — AIMD fallback\n",
+                         rl_path.c_str(), rl_err.c_str());
+          } else {
+            std::printf("samurai_master: RL policy loaded (path=%s in_dim=%d jump<=%.2fx)\n",
+                        rl_path.c_str(), rl_policy.input_dim(), clcfg.rl_max_jump_factor);
+          }
+        }
         // RL corpus capture: opt-in per-window (s,a,s') transition log for the
         // offline-RL training pipeline. Append-only NDJSON (crash-safe); reward is
         // computed downstream in Python. Disabled => zero overhead.
@@ -986,6 +1066,17 @@ int main(int argc, char** argv) {
             cl_aborted = true;
             break;
           }
+          // Defense-reaction signals for this window (used by both the RL policy
+          // proposal below and the corpus record).
+          const Value rl_defense = RlDefenseJson(res.snapshot);
+          // kRl: ask the (shielded) policy for the next setpoint from THIS measured
+          // state. StepRl clamps/overrides the proposal; a negative value means
+          // "no proposal" and the shield uses its AIMD fallback.
+          if (rl_policy.loaded()) {
+            const samurai::control::RlStateInputs rin =
+                RlInputsFrom(sample, rl_defense, win, clcfg);
+            sample.rl_action_rps = rl_policy.ProposeFor(rin);
+          }
           dec = ctl.Step(sample);
           {
             std::lock_guard<std::mutex> lk(cl_mu);
@@ -994,7 +1085,6 @@ int main(int argc, char** argv) {
           }
           // Log the transition: state that produced `setpoint` (previous window),
           // the (Mahoraga) action, and the state + defense-reaction it led to.
-          const Value rl_defense = RlDefenseJson(res.snapshot);
           if (rl_corpus.is_open()) {
             const Value action = RlActionJson(setpoint, job.base_args);
             const Value tr =

@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -31,6 +32,7 @@
 #include "daemon/daemon_args.hpp"
 #include "autoscale.hpp"
 #include "closed_loop.hpp"
+#include "rl_policy.hpp"
 #include "discovery.hpp"
 #include "sut_probe.hpp"
 #include "http_client.hpp"
@@ -464,6 +466,107 @@ int main() {
     Check(d.done, "closed-loop binsearch: converges");
     Check(d.best_good_rps <= ceiling && d.best_good_rps >= ceiling - 1500,
           "closed-loop binsearch: best-good sits just under the true ceiling");
+  }
+
+  // --- closed-loop kRl: the safety shield bounds the policy proposal ---
+  {
+    using namespace samurai::control;
+    ClosedLoopConfig cfg;
+    cfg.enabled = true;
+    cfg.strategy = ClosedLoopStrategy::kRl;
+    cfg.min_rps = 100;
+    cfg.max_rps = 100000;
+    cfg.initial_rps = 1000;
+    cfg.aimd_increase_rps = 500;
+    cfg.aimd_backoff = 0.5;
+    cfg.rl_max_jump_factor = 2.0;
+    cfg.slo_max_error_pct = 1.0;
+    ClosedLoopController cl(cfg);  // setpoint starts at 1000
+
+    // Green, proposal within the 2x jump cap -> taken verbatim.
+    LoadSample g1;
+    g1.attempted = 1000;
+    g1.errors = 0;
+    g1.rl_action_rps = 1800;  // <= 1000*2
+    auto d1 = cl.Step(g1);
+    Check(d1.phase == "rl" && d1.setpoint_rps == 1800, "kRl shield: in-range proposal honored");
+
+    // Green, proposal exceeds the jump cap (1800*2=3600) -> clamped to the cap.
+    LoadSample g2;
+    g2.attempted = 1000;
+    g2.errors = 0;
+    g2.rl_action_rps = 999999;
+    auto d2 = cl.Step(g2);
+    Check(d2.setpoint_rps == 3600, "kRl shield: over-jump proposal clamped to factor*setpoint");
+
+    // Red window -> forced multiplicative backoff, proposal ignored.
+    LoadSample r;
+    r.attempted = 1000;
+    r.errors = 50;             // 5% > 1%
+    r.rl_action_rps = 999999;  // policy still says "go higher"
+    auto d3 = cl.Step(r);
+    Check(!d3.last_healthy && d3.phase == "backoff" && d3.setpoint_rps == 1800,
+          "kRl shield: SLO-red forces backoff, ignores proposal");
+
+    // No proposal (-1) on a green window -> AIMD additive fallback.
+    LoadSample g4;
+    g4.attempted = 1000;
+    g4.errors = 0;
+    g4.rl_action_rps = -1.0;
+    auto d4 = cl.Step(g4);
+    Check(d4.setpoint_rps == 1800 + 500, "kRl shield: missing proposal falls back to AIMD");
+  }
+
+  // --- RL policy: SRLP load + forward + feature layout (golden) ---
+  {
+    using namespace samurai::control;
+    // Build a tiny SRLP file by hand (must match export.py's byte layout):
+    // in_dim=2, one linear layer out_dim=1, W=[[1,0]], b=[0], identity norm,
+    // action in [0,100]. So output = clamp(x0,0,1)*100.
+    auto put_u32 = [](std::string& s, std::uint32_t v) {
+      s.append(reinterpret_cast<const char*>(&v), 4);
+    };
+    auto put_f32 = [](std::string& s, float v) {
+      s.append(reinterpret_cast<const char*>(&v), 4);
+    };
+    std::string blob = "SRLP";
+    put_u32(blob, 1);   // version
+    put_u32(blob, 2);   // in_dim
+    put_u32(blob, 1);   // n_layers
+    put_u32(blob, 1);   // out_dims[0]
+    put_f32(blob, 1.0f); put_f32(blob, 0.0f);  // W row
+    put_f32(blob, 0.0f);                        // b
+    put_f32(blob, 0.0f); put_f32(blob, 0.0f);  // norm_mean
+    put_f32(blob, 1.0f); put_f32(blob, 1.0f);  // norm_std
+    put_f32(blob, 0.0f); put_f32(blob, 100.0f);// action lo/hi
+
+    const std::string path = "/tmp/samurai_selftest_policy.srlp";
+    { std::ofstream o(path, std::ios::binary); o.write(blob.data(), blob.size()); }
+
+    RlPolicy p;
+    std::string err;
+    Check(p.Load(path, &err), "rl policy: SRLP loads");
+    Check(p.input_dim() == 2, "rl policy: in_dim read");
+    Check(std::abs(p.Propose({0.3f, 9.0f}) - 30.0) < 1e-3, "rl policy: forward matches (0.3*100)");
+    Check(std::abs(p.Propose({5.0f, 0.0f}) - 100.0) < 1e-3, "rl policy: output clamped to action_hi");
+
+    // Feature layout: 20-vector, correct positions + mask bits.
+    RlStateInputs in;
+    in.rps = 500; in.max_rps = 1000; in.win = 8; in.step_horizon = 32.0;
+    in.error_pct = 2.0;            // known
+    in.p99_ms = -1.0;              // unknown -> imputed 0, mask 0
+    in.rate_limited_ratio = 0.4;   // known
+    auto f = RlPolicy::BuildFeatures(in);
+    Check(f.size() == 20, "rl policy: feature vector width");
+    Check(f[0] == 0.5f, "rl policy: rps_norm");
+    Check(f[1] == 2.0f, "rl policy: error_pct");
+    Check(f[4] == 0.0f, "rl policy: unknown p99 imputed to 0");
+    Check(f[5] == 0.25f, "rl policy: step_norm = win/horizon");
+    Check(f[6] == 0.4f, "rl policy: rate_limited_ratio");
+    Check(f[11] == 1.0f, "rl policy: error_pct mask set");
+    Check(f[14] == 0.0f, "rl policy: p99 mask clear (unknown)");
+    Check(f[15] == 1.0f, "rl policy: rate_limited mask set");
+    std::remove(path.c_str());
   }
 
   // --- sut probe: Prometheus /api/v1/query response parsing ---
