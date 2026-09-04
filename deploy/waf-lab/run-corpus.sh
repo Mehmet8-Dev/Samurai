@@ -31,6 +31,7 @@ CL_MAX_RPS="${CL_MAX_RPS:-2000}"
 CL_WINDOW_S="${CL_WINDOW_S:-5}"
 CL_SLO_MAX_ERROR_PCT="${CL_SLO_MAX_ERROR_PCT:-2.0}"
 CL_AIMD_MAX_WINDOWS="${CL_AIMD_MAX_WINDOWS:-40}"
+CL_AIMD_INCREASE_RPS="${CL_AIMD_INCREASE_RPS:-0}"  # 0 => controller default step
 
 # Exploration: perturb the Mahoraga shaping levers per window so the corpus has
 # variation to learn from (RL_EXPLORE=1 to enable; RL_EXPLORE_SEED for repeats).
@@ -68,6 +69,7 @@ echo ">> starting master (closed-loop); corpus -> $CORPUS"
 	--cl-min-rps "$CL_MIN_RPS" --cl-max-rps "$CL_MAX_RPS" \
 	--cl-slo-max-error-pct "$CL_SLO_MAX_ERROR_PCT" \
 	--cl-aimd-max-windows "$CL_AIMD_MAX_WINDOWS" \
+	--cl-aimd-increase-rps "$CL_AIMD_INCREASE_RPS" \
 	"${EXPLORE_ARGS[@]}" \
 	--rl-corpus "$CORPUS" >/tmp/samurai-lab-master.log 2>&1 &
 MASTER_PID=$!

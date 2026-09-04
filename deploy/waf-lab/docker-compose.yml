@@ -49,6 +49,9 @@ services:
       - "${WAF_LAB_PORT:-8080}:8080"   # <-- point samurai --target here
     volumes:
       - caddy_logs:/var/log/caddy
+      # Bind-mount the Coraza rules (they are also baked into the image) so rule
+      # edits take effect on `docker compose up -d caddy` without an image rebuild.
+      - ./caddy/coraza:/etc/caddy/coraza:ro
     networks: [labnet]
 
   # IDS. Sniffs the WAF container's ingress and writes eve.json alerts. Passive by

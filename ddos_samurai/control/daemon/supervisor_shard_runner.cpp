@@ -49,7 +49,13 @@ JobOptions JobFromArgs(const Value& a) {
   j.l7_profile_file = StrArg(a, "l7_profile_file", StrArg(a, "scenario_payload_ref", ""));
   j.l7_payload_file = StrArg(a, "l7_payload_file", StrArg(a, "payload_ref", ""));
   j.concurrency = static_cast<std::uint32_t>(std::max<int64_t>(1, IntArg(a, "concurrency", 1)));
-  j.max_connections = static_cast<std::uint32_t>(std::max<int64_t>(1, IntArg(a, "max_connections", 1)));
+  // The emu clamps effective parallelism to min(concurrency, max_connections), so
+  // a pool of 1 pins concurrency to 1 no matter what the lever says. Default the
+  // pool to the concurrency so the lever actually opens that many connections
+  // (and can push a per-IP conn limit into 503). An explicit max_connections
+  // still wins.
+  j.max_connections = static_cast<std::uint32_t>(
+      std::max<int64_t>(1, IntArg(a, "max_connections", static_cast<std::int64_t>(j.concurrency))));
   j.max_streams_per_connection =
       static_cast<std::uint32_t>(std::max<int64_t>(1, IntArg(a, "max_streams_per_connection", 1)));
   j.scheme = StrArg(a, "scheme", "");
