@@ -82,6 +82,16 @@ std::string WorkerShardService::FinalizeStats(const std::string& shard_id, const
   o.set("sent", Value::Int(rec.run ? rec.run->Sent() : 0));
   o.set("errors", Value::Int(rec.run ? rec.run->Errors() : 0));
   o.set("leader_epoch", Value::Int(rec.leader_epoch));
+  // Merge any extra per-shard metrics (L7 defense-reaction signals) as top-level
+  // numeric fields so the master's DistributedAggregator sums them into
+  // numeric_totals — the count fields (status_*/responses_total/l7_conn_*) sum
+  // correctly; the ratio/latency gauges are approximate across multiple shards.
+  if (rec.run) {
+    const Value m = rec.run->MetricsJson();
+    if (m.is_object()) {
+      for (const auto& kv : m.members()) o.set(kv.first, kv.second);
+    }
+  }
   return o.dump();
 }
 

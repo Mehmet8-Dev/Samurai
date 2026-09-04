@@ -81,6 +81,28 @@ void SupervisorShardRun::Join() {
   if (thread_.joinable()) thread_.join();
 }
 
+samurai::core::json::Value SupervisorShardRun::MetricsJson() const {
+  using samurai::core::json::Value;
+  Value o = Value::Object();
+  // Keep this key set in lockstep with run_summary.hpp RunStats + RlDefenseJson.
+  o.set("responses_total", Value::Int(static_cast<std::int64_t>(stats_.responses_total)));
+  o.set("status_2xx", Value::Int(static_cast<std::int64_t>(stats_.status_2xx)));
+  o.set("status_3xx", Value::Int(static_cast<std::int64_t>(stats_.status_3xx)));
+  o.set("status_4xx", Value::Int(static_cast<std::int64_t>(stats_.status_4xx)));
+  o.set("status_5xx", Value::Int(static_cast<std::int64_t>(stats_.status_5xx)));
+  o.set("l7_conn_attempted", Value::Int(static_cast<std::int64_t>(stats_.l7_conn_attempted)));
+  o.set("l7_conn_established", Value::Int(static_cast<std::int64_t>(stats_.l7_conn_established)));
+  o.set("l7_expectation_failures",
+        Value::Int(static_cast<std::int64_t>(stats_.l7_expectation_failures)));
+  o.set("l7_scheduler_backpressure_count",
+        Value::Int(static_cast<std::int64_t>(stats_.l7_scheduler_backpressure_count)));
+  o.set("h2_goaway_count", Value::Int(static_cast<std::int64_t>(stats_.h2_goaway_count)));
+  o.set("h2_stream_reset_ratio", Value::Double(stats_.h2_stream_reset_ratio));
+  o.set("l7_request_latency_p99_ms", Value::Double(stats_.l7_request_latency_p99_ms));
+  o.set("l7_tls_handshake_p99_ms", Value::Double(stats_.l7_tls_handshake_p99_ms));
+  return o;
+}
+
 samurai::orchestrator::WorkerEntry SupervisorShardRunner::ResolveWorker(
     const samurai::core::json::Value& args) const {
   if (!bundle_) {

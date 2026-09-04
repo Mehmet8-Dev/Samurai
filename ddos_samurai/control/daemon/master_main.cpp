@@ -1114,6 +1114,14 @@ int main(int argc, char** argv) {
           const JobResult res =
               coord.RunSingleJob(job, "cl-" + std::to_string(++win), guard);
           samurai::control::LoadSample sample = DeriveSample(res.snapshot);
+          // The per-shard stats carry no achieved-rps field, so the aggregated
+          // snapshot's actual_rps is 0. Derive it from the window's total
+          // attempted count instead — this is the measured load the RL state and
+          // reward key on (rps_norm, throughput progress), so a zero here would
+          // flatten the whole learning signal.
+          if (sample.actual_rps <= 0.0 && window_s > 0) {
+            sample.actual_rps = sample.attempted / static_cast<double>(window_s);
+          }
           // Scrape the SUT (Prometheus) so the p99 latency drives the closed-loop
           // SLO and the target-side metrics can be correlated with the load.
           samurai::control::SutSample sut_sample;

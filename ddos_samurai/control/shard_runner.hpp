@@ -29,6 +29,11 @@ class ShardRun {
   virtual int ExitCode() const = 0;  // meaningful once !IsAlive(); -15 if terminated
   virtual void Terminate() = 0;
   virtual void Join() = 0;
+  // Extra numeric metrics to merge into the shard's reported stats (beyond
+  // sent/errors/progress) — e.g. the L7 defense-reaction signals. Default none.
+  virtual samurai::core::json::Value MetricsJson() const {
+    return samurai::core::json::Value::Object();
+  }
 };
 
 class ShardRunner {

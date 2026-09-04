@@ -35,6 +35,11 @@ class SupervisorShardRun : public samurai::control::ShardRun {
   void Terminate() override { terminated_.store(true); }  // best-effort; RunJob isn't cancellable
   void Join() override;
 
+  // L7 defense-reaction signals folded from the worker's engine_result, emitted
+  // as top-level numeric fields so the master's aggregator sums them into
+  // numeric_totals (where RlDefenseJson reads them). Read after the run joins.
+  samurai::core::json::Value MetricsJson() const override;
+
  private:
   samurai::orchestrator::SupervisorConfig cfg_;
   samurai::orchestrator::JobOptions job_;

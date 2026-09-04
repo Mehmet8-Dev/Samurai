@@ -11,6 +11,7 @@
 
 #include <zmq.h>
 
+#include "json.hpp"
 #include "run_summary.hpp"
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
@@ -81,6 +82,38 @@ void PrintSnapshot(const samurai::wire::MetricSnapshotV1& s) {
       static_cast<unsigned long long>(s.bytes_sent),
       s.actual_rps,
       s.rate_accuracy_pct);
+}
+
+// Fold the L7 defense-reaction signals out of the worker's JOB_DONE detail into
+// the run stats. The HTTP status breakdown (429/403/503 = the SUT's WAF /
+// rate-limiter / overload pushback) lives only in the emu engine_result JSON,
+// not the binary metric snapshot, so without this the corpus would carry no
+// defense signal. `detail` is the JOB_DONE payload: {..,"engine_result":{..}}.
+void FoldEngineDefense(RunStats& acc, const char* detail, std::size_t len) {
+  using samurai::core::json::Value;
+  const auto parsed = samurai::core::json::Parse(std::string(detail, len));
+  if (!parsed.ok || !parsed.value.is_object()) return;
+  const Value* er = parsed.value.find("engine_result");
+  if (er == nullptr || !er->is_object()) return;
+  auto u64 = [&](const char* k, std::uint64_t& dst) {
+    if (const Value* v = er->find(k)) dst = static_cast<std::uint64_t>(std::max<double>(0.0, v->as_double(0.0)));
+  };
+  auto gauge = [&](const char* k, double& dst) {
+    if (const Value* v = er->find(k)) dst = v->as_double(0.0);
+  };
+  u64("responses_total", acc.responses_total);
+  u64("status_2xx", acc.status_2xx);
+  u64("status_3xx", acc.status_3xx);
+  u64("status_4xx", acc.status_4xx);
+  u64("status_5xx", acc.status_5xx);
+  u64("l7_conn_attempted", acc.l7_conn_attempted);
+  u64("l7_conn_established", acc.l7_conn_established);
+  u64("l7_expectation_failures", acc.l7_expectation_failures);
+  u64("l7_scheduler_backpressure_count", acc.l7_scheduler_backpressure_count);
+  u64("h2_goaway_count", acc.h2_goaway_count);
+  gauge("h2_stream_reset_ratio", acc.h2_stream_reset_ratio);
+  gauge("l7_request_latency_p99_ms", acc.l7_request_latency_p99_ms);
+  gauge("l7_tls_handshake_p99_ms", acc.l7_tls_handshake_p99_ms);
 }
 
 }  // namespace
@@ -200,6 +233,8 @@ int RunJob(const SupervisorConfig& cfg, const JobOptions& job, RunStats& out_sta
               // scenario_steps_est) artık yüzeye çıkarılıyor.
               std::printf("{\"event\":\"job_done\",\"detail\":%.*s}\n",
                           static_cast<int>(plen), reinterpret_cast<const char*>(pl));
+              // Surface the L7 defense-reaction signals for the RL corpus.
+              FoldEngineDefense(stats, reinterpret_cast<const char*>(pl), plen);
             } else {
               std::printf("{\"event\":\"job_done\"}\n");
             }

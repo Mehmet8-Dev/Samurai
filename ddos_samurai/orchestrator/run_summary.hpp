@@ -36,6 +36,26 @@ struct RunStats {
   std::uint64_t igmp_active_groups = 0;
   std::uint64_t hot_path_zero_copy_tx_bytes = 0;
   std::uint64_t hot_path_zero_copy_rx_bytes = 0;
+
+  // L7 defense-reaction signals — the SUT's WAF/rate-limiter/overload pushback,
+  // folded from the worker's JOB_DONE engine_result JSON (the binary metric
+  // snapshot carries no HTTP status breakdown). Zero for L4 floods that emit no
+  // L7 telemetry. Counters add across snapshots; ratios/latency are latest-gauge.
+  // These are the raw inputs RlDefenseJson surfaces for the Mahoraga features —
+  // keep the field set in lockstep with its key list.
+  std::uint64_t responses_total = 0;
+  std::uint64_t status_2xx = 0;
+  std::uint64_t status_3xx = 0;
+  std::uint64_t status_4xx = 0;
+  std::uint64_t status_5xx = 0;
+  std::uint64_t l7_conn_attempted = 0;
+  std::uint64_t l7_conn_established = 0;
+  std::uint64_t l7_expectation_failures = 0;
+  std::uint64_t l7_scheduler_backpressure_count = 0;
+  std::uint64_t h2_goaway_count = 0;
+  double h2_stream_reset_ratio = 0.0;      // gauge
+  double l7_request_latency_p99_ms = 0.0;  // gauge
+  double l7_tls_handshake_p99_ms = 0.0;    // gauge
 };
 
 // Folds one snapshot into the accumulator. Counters add up across snapshots;
