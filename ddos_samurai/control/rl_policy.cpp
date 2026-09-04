@@ -49,6 +49,7 @@ bool RlPolicy::Load(const std::string& path, std::string* err) {
   layers_.clear();
   norm_mean_.clear();
   norm_std_.clear();
+  dims_.clear();
 
   std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f.is_open()) {
@@ -70,7 +71,7 @@ bool RlPolicy::Load(const std::string& path, std::string* err) {
   }
   r.off = 4;
   const std::uint32_t version = r.u32();
-  if (version != 2) {
+  if (version != 2 && version != 3) {
     if (err) *err = "unsupported SRLP version";
     return false;
   }
@@ -101,19 +102,69 @@ bool RlPolicy::Load(const std::string& path, std::string* err) {
   r.floats(norm_mean_, in_dim);
   r.floats(norm_std_, in_dim);
   const std::uint32_t action_dim = r.u32();
-  if (!r.ok || action_dim == 0 || action_dim != out_dims.back()) {
-    if (err) *err = "bad action_dim (must equal the output layer width)";
+  const std::uint32_t out_width = out_dims.back();
+  if (!r.ok || action_dim == 0 || action_dim > 64) {
+    if (err) *err = "bad action_dim";
     return false;
   }
-  r.floats(action_lo_, action_dim);
-  r.floats(action_hi_, action_dim);
-  if (!r.ok) {
-    if (err) *err = "truncated norm/action footer";
-    return false;
+
+  // Footer: v2 is all-continuous (one output per dim, flat lo[]/hi[] arrays); v3
+  // carries a per-dim head descriptor (continuous lo/hi or categorical n_cat+cats).
+  dims_.resize(action_dim);
+  int off_out = 0;
+  if (version == 2) {
+    if (action_dim != out_width) {
+      if (err) *err = "v2 action_dim must equal the output layer width";
+      return false;
+    }
+    std::vector<float> lo, hi;
+    r.floats(lo, action_dim);
+    r.floats(hi, action_dim);
+    if (!r.ok) {
+      if (err) *err = "truncated norm/action footer";
+      return false;
+    }
+    for (std::uint32_t k = 0; k < action_dim; ++k) {
+      dims_[k].categorical = false;
+      dims_[k].out_offset = static_cast<int>(k);
+      dims_[k].lo = lo[k];
+      dims_[k].hi = hi[k];
+    }
+    off_out = static_cast<int>(action_dim);
+  } else {  // version == 3
+    for (std::uint32_t k = 0; k < action_dim; ++k) {
+      const std::uint32_t kind = r.u32();
+      DimHead& d = dims_[k];
+      d.out_offset = off_out;
+      if (kind == 1) {  // categorical
+        const std::uint32_t n_cat = r.u32();
+        if (!r.ok || n_cat == 0 || n_cat > 4096) {
+          if (err) *err = "bad categorical head";
+          return false;
+        }
+        d.categorical = true;
+        r.floats(d.cats, n_cat);
+        off_out += static_cast<int>(n_cat);
+      } else {  // continuous
+        d.categorical = false;
+        d.lo = r.f32();
+        d.hi = r.f32();
+        off_out += 1;
+      }
+      if (!r.ok) {
+        if (err) *err = "truncated v3 action footer";
+        return false;
+      }
+    }
+    if (off_out != static_cast<int>(out_width)) {
+      if (err) *err = "v3 head widths do not sum to the output layer width";
+      return false;
+    }
   }
 
   in_dim_ = static_cast<int>(in_dim);
   action_dim_ = static_cast<int>(action_dim);
+  output_width_ = static_cast<int>(out_width);
   loaded_ = true;
   return true;
 }
@@ -173,13 +224,24 @@ std::vector<double> RlPolicy::Propose(const std::vector<float>& features) const 
     x = std::move(y);
   }
 
-  // Per-dim clamp to [0,1] and de-normalize with the action bounds.
+  // Decode the flat output per dim: continuous -> clamp[0,1] + de-normalize;
+  // categorical -> argmax over its logits mapped back to the category value.
   std::vector<double> action(action_dim_);
   for (int k = 0; k < action_dim_; ++k) {
-    const float frac = std::max(0.0f, std::min(1.0f, x[k]));
-    action[k] = static_cast<double>(action_lo_[k]) +
-                static_cast<double>(frac) *
-                    (static_cast<double>(action_hi_[k]) - action_lo_[k]);
+    const DimHead& d = dims_[k];
+    if (d.categorical) {
+      int best = 0;
+      float best_logit = x[d.out_offset];
+      for (int c = 1; c < static_cast<int>(d.cats.size()); ++c) {
+        const float v = x[d.out_offset + c];
+        if (v > best_logit) { best_logit = v; best = c; }
+      }
+      action[k] = static_cast<double>(d.cats[best]);
+    } else {
+      const float frac = std::max(0.0f, std::min(1.0f, x[d.out_offset]));
+      action[k] = static_cast<double>(d.lo) +
+                  static_cast<double>(frac) * (static_cast<double>(d.hi) - d.lo);
+    }
   }
   return action;
 }

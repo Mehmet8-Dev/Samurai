@@ -83,7 +83,8 @@ class RlPolicy {
  private:
   bool loaded_ = false;
   int in_dim_ = 0;
-  int action_dim_ = 0;
+  int action_dim_ = 0;    // number of action DIMENSIONS
+  int output_width_ = 0;  // width of the network output (>= action_dim_ with categorical heads)
   // Dense layers as (W, b): W flattened row-major (out*in), b size out, out_dim.
   struct Layer {
     std::vector<float> w;
@@ -94,8 +95,17 @@ class RlPolicy {
   std::vector<Layer> layers_;
   std::vector<float> norm_mean_;
   std::vector<float> norm_std_;
-  std::vector<float> action_lo_;  // per-dim
-  std::vector<float> action_hi_;  // per-dim
+  // Per-dim output head. A continuous dim reads one output at out_offset, clamped
+  // to [0,1] and de-normalized with [lo, hi]. A categorical dim reads
+  // cats.size() outputs as logits starting at out_offset; argmax -> cats[idx].
+  struct DimHead {
+    bool categorical = false;
+    int out_offset = 0;
+    float lo = 0.0f;
+    float hi = 1.0f;
+    std::vector<float> cats;
+  };
+  std::vector<DimHead> dims_;
 };
 
 }  // namespace samurai::control

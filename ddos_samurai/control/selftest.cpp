@@ -591,6 +591,33 @@ int main() {
     Check(av.size() == 2 && std::abs(av[0] - 600.0) < 1e-3 && std::abs(av[1] - 17.0) < 1e-3,
           "rl policy: multi-dim forward (rps=600, concurrency=17)");
     std::remove(mpath.c_str());
+
+    // v3 categorical head: dim0 rps continuous (1 output), dim1 request_mix
+    // categorical over {0,3,4} (3 logits). W=0 so output == bias:
+    // b = [0.5, -1, 2, 0] -> rps frac 0.5 -> 600; argmax logit at idx1 -> cat 3.
+    std::string c = "SRLP";
+    put_u32(c, 3);            // version 3
+    put_u32(c, 1);            // in_dim
+    put_u32(c, 1);            // n_layers
+    put_u32(c, 4);            // out_dims[0] == total output width
+    for (int i = 0; i < 4; ++i) put_f32(c, 0.0f);  // W (4x1) zeros
+    put_f32(c, 0.5f); put_f32(c, -1.0f); put_f32(c, 2.0f); put_f32(c, 0.0f);  // b
+    put_f32(c, 0.0f);        // norm_mean
+    put_f32(c, 1.0f);        // norm_std
+    put_u32(c, 2);           // action_dim (dimensions, not output width)
+    put_u32(c, 0);           // dim0 kind = continuous
+    put_f32(c, 100.0f); put_f32(c, 1100.0f);       // dim0 lo, hi
+    put_u32(c, 1);           // dim1 kind = categorical
+    put_u32(c, 3);           // dim1 n_cat
+    put_f32(c, 0.0f); put_f32(c, 3.0f); put_f32(c, 4.0f);  // dim1 cats
+    const std::string cpath = "/tmp/samurai_selftest_policy_v3.srlp";
+    { std::ofstream o(cpath, std::ios::binary); o.write(c.data(), c.size()); }
+    RlPolicy pc;
+    Check(pc.Load(cpath, &err) && pc.action_dim() == 2, "rl policy: v3 categorical SRLP loads");
+    auto cv = pc.Propose({0.0f});
+    Check(cv.size() == 2 && std::abs(cv[0] - 600.0) < 1e-3 && cv[1] == 3.0,
+          "rl policy: v3 categorical forward (rps=600, request_mix=argmax->3)");
+    std::remove(cpath.c_str());
   }
 
   // --- RL exploration: deterministic, in-range, decorrelated lever schedule ---
