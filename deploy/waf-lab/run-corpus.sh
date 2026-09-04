@@ -32,6 +32,15 @@ CL_WINDOW_S="${CL_WINDOW_S:-5}"
 CL_SLO_MAX_ERROR_PCT="${CL_SLO_MAX_ERROR_PCT:-2.0}"
 CL_AIMD_MAX_WINDOWS="${CL_AIMD_MAX_WINDOWS:-40}"
 
+# Exploration: perturb the Mahoraga shaping levers per window so the corpus has
+# variation to learn from (RL_EXPLORE=1 to enable; RL_EXPLORE_SEED for repeats).
+RL_EXPLORE="${RL_EXPLORE:-0}"
+RL_EXPLORE_SEED="${RL_EXPLORE_SEED:-0}"
+EXPLORE_ARGS=()
+if [[ "$RL_EXPLORE" == "1" ]]; then
+	EXPLORE_ARGS=(--rl-explore --rl-explore-seed "$RL_EXPLORE_SEED")
+fi
+
 echo ">> checking lab ingress http://$TARGET_HOST:$WAF_LAB_PORT/healthz"
 if ! curl -fsS "http://$TARGET_HOST:$WAF_LAB_PORT/healthz" >/dev/null 2>&1; then
 	echo "!! lab ingress not responding — start it first:" >&2
@@ -41,34 +50,50 @@ fi
 
 mkdir -p "$(dirname "$CORPUS")"
 
+# Ordering matters: the master owns the control-plane listen socket, so it must
+# be up before the slave tries to register. Start worker + master first, wait
+# for the master's control port to accept, then bring up the slave.
 echo ">> starting L7 worker"
 "$BIN_WORKER/samurai_l7_worker" >/tmp/samurai-lab-worker.log 2>&1 &
 WORKER_PID=$!
-sleep 1
-"$BIN_DAEMON/samurai_slave" \
-	--control-endpoints "${CONTROL_EP#tcp://}" \
-	--worker l7 --worker-dir "$BIN_WORKER" \
-	>/tmp/samurai-lab-slave.log 2>&1 &
-SLAVE_PID=$!
 
-cleanup() { kill "$WORKER_PID" "$SLAVE_PID" 2>/dev/null || true; }
-trap cleanup EXIT
-
-echo ">> waiting for worker registration"
-sleep 3
-
-echo ">> running closed-loop against the lab; corpus -> $CORPUS"
+echo ">> starting master (closed-loop); corpus -> $CORPUS"
 "$BIN_DAEMON/samurai_master" \
 	--control-listen "$CONTROL_EP" \
 	--target "$TARGET_HOST" --port "$WAF_LAB_PORT" --protocol http \
 	--worker l7 --count "$(( CL_MAX_RPS * CL_WINDOW_S ))" \
-	--expect-workers 1 --wait-workers-s 30 \
+	--expect-workers 1 --wait-workers-s 60 \
 	--closed-loop --cl-strategy "$CL_STRATEGY" \
 	--cl-window-s "$CL_WINDOW_S" \
 	--cl-min-rps "$CL_MIN_RPS" --cl-max-rps "$CL_MAX_RPS" \
 	--cl-slo-max-error-pct "$CL_SLO_MAX_ERROR_PCT" \
 	--cl-aimd-max-windows "$CL_AIMD_MAX_WINDOWS" \
-	--rl-corpus "$CORPUS"
+	"${EXPLORE_ARGS[@]}" \
+	--rl-corpus "$CORPUS" >/tmp/samurai-lab-master.log 2>&1 &
+MASTER_PID=$!
+SLAVE_PID=""
+
+cleanup() { kill "$WORKER_PID" "$SLAVE_PID" "$MASTER_PID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+CONTROL_PORT="${CONTROL_EP##*:}"
+echo ">> waiting for master control port :$CONTROL_PORT"
+for _ in $(seq 1 30); do
+	if (exec 3<>"/dev/tcp/127.0.0.1/$CONTROL_PORT") 2>/dev/null; then exec 3>&- 3<&-; break; fi
+	sleep 0.5
+done
+
+echo ">> starting slave (registers + runs shards)"
+# Pass the full tcp:// endpoint — the control client hands it straight to
+# zmq_connect, which requires the transport scheme.
+"$BIN_DAEMON/samurai_slave" \
+	--control-endpoints "$CONTROL_EP" \
+	--worker l7 --worker-dir "$BIN_WORKER" \
+	>/tmp/samurai-lab-slave.log 2>&1 &
+SLAVE_PID=$!
+
+echo ">> capture running; waiting for the closed-loop to finish"
+wait "$MASTER_PID"
 
 echo ">> done. transitions:"
 wc -l "$CORPUS" || true
