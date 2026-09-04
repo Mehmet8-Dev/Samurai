@@ -56,6 +56,17 @@ struct RunStats {
   double h2_stream_reset_ratio = 0.0;      // gauge
   double l7_request_latency_p99_ms = 0.0;  // gauge
   double l7_tls_handshake_p99_ms = 0.0;    // gauge
+
+  // Flow / connection-level defense signals (network-layer, below HTTP). These
+  // surface active IPS / conntrack behavior — RST injection, SYN-drop timeouts,
+  // throttling-induced retransmits — that no status code reveals. Populated only
+  // by the userspace TCP stack (custom_tcp/dpdk); ~0 on the kernel_socket path,
+  // where the OS owns the connection. Carried into the corpus defense block for
+  // the fingerprint layer (not the RL feature vector).
+  std::uint64_t tcp_peer_rst_count = 0;         // peer RSTs — reset injection / hard refusal
+  std::uint64_t tcp_connect_timeout_count = 0;  // SYN never answered — filtering / drop
+  std::uint64_t tcp_retransmit_count = 0;       // loss/throttle-induced retransmits
+  std::uint64_t tcp_timeout_close_count = 0;    // idle/stall closes under pressure
 };
 
 // Folds one snapshot into the accumulator. Counters add up across snapshots;

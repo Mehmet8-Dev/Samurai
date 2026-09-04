@@ -256,6 +256,11 @@ Value RlDefenseJson(const Value& snap) {
       "l7_scheduler_backpressure_count", "h2_goaway_count",
       "h2_stream_reset_ratio",  "l7_request_latency_p99_ms",
       "l7_tls_handshake_p99_ms",
+      // Flow / connection-level signals for the fingerprint layer. These enrich
+      // the corpus defense block but are NOT added to RlInputsFrom, so the RL
+      // feature vector (and the SRLP serving contract) stays frozen at 20.
+      "tcp_peer_rst_count",     "tcp_connect_timeout_count",
+      "tcp_retransmit_count",   "tcp_timeout_close_count",
   };
   for (const char* k : kKeys) {
     if (const Value* v = nt->find(k)) o.set(k, Value::Double(v->as_double(0.0)));

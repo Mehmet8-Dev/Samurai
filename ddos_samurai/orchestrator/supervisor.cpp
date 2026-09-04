@@ -114,6 +114,11 @@ void FoldEngineDefense(RunStats& acc, const char* detail, std::size_t len) {
   gauge("h2_stream_reset_ratio", acc.h2_stream_reset_ratio);
   gauge("l7_request_latency_p99_ms", acc.l7_request_latency_p99_ms);
   gauge("l7_tls_handshake_p99_ms", acc.l7_tls_handshake_p99_ms);
+  // Flow / connection-level defense signals (userspace TCP stack only).
+  u64("tcp_peer_rst_count", acc.tcp_peer_rst_count);
+  u64("tcp_connect_timeout_count", acc.tcp_connect_timeout_count);
+  u64("tcp_retransmit_count", acc.tcp_retransmit_count);
+  u64("tcp_timeout_close_count", acc.tcp_timeout_close_count);
 }
 
 }  // namespace
