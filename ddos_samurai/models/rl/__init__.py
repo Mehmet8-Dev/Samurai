@@ -21,8 +21,14 @@ from .config import RLConfig
 from .corpus import group_episodes, iter_transitions, load_transitions
 from .dataset import Dataset, Normalizer, build_dataset
 from .features import DefaultFeatureExtractor, FeatureExtractor
+from .export import load_policy, save_policy
+from .policy_artifact import PolicyArtifact
 from .reward import RewardFn, SloProgressReward, slo_overshoot
 from .schemas import Action, DefenseSignals, RawState, SloThresholds, Transition
+
+# train_iql (IQL) and evaluate_policy (FQE) live in .train / .ope and require torch;
+# import them directly from those submodules so this package stays importable — and
+# serving/export usable — in a torch-free environment.
 
 __all__ = [
     "RLConfig",
@@ -42,4 +48,7 @@ __all__ = [
     "build_dataset",
     "Dataset",
     "Normalizer",
+    "PolicyArtifact",
+    "save_policy",
+    "load_policy",
 ]
