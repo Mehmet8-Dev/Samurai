@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <zmq.h>
 
+#include "l7_request_variants.hpp"
 #include "pacing_engine.h"
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
@@ -123,15 +124,17 @@ bool ReadFileBytes(const std::string& path, std::vector<std::uint8_t>& out, std:
   return true;
 }
 
-std::vector<std::uint8_t> BuildDefaultRequest(const std::string& target_ip, const std::string& protocol_lc) {
+std::vector<std::uint8_t> BuildDefaultRequest(const std::string& target_ip,
+                                              const std::string& protocol_lc,
+                                              std::uint32_t request_mix) {
   const std::string host = target_ip.empty() ? std::string("localhost") : target_ip;
   if (protocol_lc == "http2" || protocol_lc == "h2") {
     static constexpr char kH2Preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     return std::vector<std::uint8_t>(kH2Preface, kH2Preface + sizeof(kH2Preface) - 1);
   }
   if (protocol_lc == "http1" || protocol_lc == "http" || protocol_lc == "https") {
-    std::string req = "GET / HTTP/1.1\r\nHost: " + host +
-                      "\r\nUser-Agent: samurai-l7-worker\r\nConnection: close\r\n\r\n";
+    // request_mix selects the request shape; index 0 == "GET /" (prior default).
+    const std::string req = samurai::l7::BuildHttp1Request(request_mix, host);
     return std::vector<std::uint8_t>(req.begin(), req.end());
   }
   static constexpr char kCustomMsg[] = "samurai-l7\n";
@@ -157,6 +160,8 @@ struct L7JobParams {
   std::string scheme;
   std::string host_header;
   std::uint32_t l7_timeout_ms{5000};
+  std::uint32_t request_mix{0};      // Mahoraga: request-variant selector
+  std::uint32_t source_rotation{0};  // Mahoraga: client source-identity spread
 };
 
 L7JobParams ParseL7Job(
@@ -188,6 +193,8 @@ L7JobParams ParseL7Job(
     p.scheme = ReadFixed(env.scheme, sizeof(env.scheme));
     p.host_header = ReadFixed(env.host_header, sizeof(env.host_header));
     p.l7_timeout_ms = env.l7_timeout_ms > 0u ? env.l7_timeout_ms : 5000u;
+    p.request_mix = env.request_mix;
+    p.source_rotation = env.source_rotation;
     return p;
   }
   if (payload_len < sizeof(samurai::wire::JobEnvelopeV1)) {
@@ -502,7 +509,9 @@ int main(int argc, char** argv) {
             continue;
           }
         } else {
-          request_payload = BuildDefaultRequest(target, raw_protocol_lc);
+          // No explicit payload: synthesize the request the request_mix lever
+          // selects (index 0 == the historical "GET /").
+          request_payload = BuildDefaultRequest(target, raw_protocol_lc, params.request_mix);
         }
         if (request_payload.empty()) {
           (void)SendFrame(
@@ -582,6 +591,13 @@ int main(int argc, char** argv) {
                        Value::Int(static_cast<std::int64_t>(params.max_streams_per_connection)));
             if (conn.find("session_repeats") == nullptr)
               conn.set("session_repeats", Value::Int(std::max(1, static_cast<int>(params.packet_count))));
+            // source_rotation: advisory client source-identity spread. Carried on
+            // the connection template so a transport that supports source-port
+            // spread can honor it; over a single-host loopback lab (one source
+            // IP) it does not move IP-keyed rate limits — recorded for the
+            // corpus, honored where the egress path can vary the source.
+            if (params.source_rotation > 1u && conn.find("source_rotation") == nullptr)
+              conn.set("source_rotation", Value::Int(static_cast<std::int64_t>(params.source_rotation)));
             profile.set("connection_template", conn);
             if (profile.find("flow_attempted") == nullptr) {
               profile.set("flow_attempted", Value::Int(std::max(1, static_cast<int>(params.packet_count))));
@@ -593,10 +609,15 @@ int main(int argc, char** argv) {
               profile.set("protocol", Value::Str(emu_protocol));
             }
             if (profile.find("flow_program") == nullptr && !request_payload.empty()) {
+              // request_mix picks the emitted request line so the emu engine
+              // sends a real method/path the WAF/rate-limiter reacts to (index 0
+              // == GET /). A caller-supplied flow_program overrides this entirely.
+              const samurai::l7::RequestVariant& variant =
+                  samurai::l7::VariantFor(params.request_mix);
               Value op = Value::Object();
               op.set("opcode", Value::Str("SEND_HEADERS"));
-              op.set("method", Value::Str("GET"));
-              op.set("path", Value::Str("/"));
+              op.set("method", Value::Str(variant.method));
+              op.set("path", Value::Str(variant.path));
               Value body = Value::Object();
               body.set("kind", Value::Str("raw"));
               Value body_bytes = Value::Array();

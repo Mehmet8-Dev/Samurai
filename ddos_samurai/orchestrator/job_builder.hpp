@@ -48,6 +48,9 @@ struct JobOptions {
   std::uint32_t l7_timeout_ms = 5000;
   std::string l7_profile_file;  // scenario_payload_ref (JSON L7 profile)
   std::string l7_payload_file;  // payload_ref (raw request bytes)
+  // Mahoraga shaping levers (RL action dims). 0 = baseline / no shaping.
+  std::uint32_t request_mix = 0;      // request-variant selector honored by the L7 worker
+  std::uint32_t source_rotation = 0;  // client source-identity spread (advisory to the L7 path)
 };
 
 // Copies a std::string into a fixed-size char buffer, always NUL-terminating and
@@ -99,7 +102,8 @@ inline samurai::wire::JobEnvelopeV2 BuildJobEnvelopeV2(const JobOptions& opt) {
   CopyFixed(env.scheme, sizeof(env.scheme), opt.scheme);
   CopyFixed(env.host_header, sizeof(env.host_header), opt.host_header);
   env.l7_timeout_ms = opt.l7_timeout_ms > 0u ? opt.l7_timeout_ms : 5000u;
-  std::memset(env.pad2, 0, sizeof(env.pad2));
+  env.request_mix = opt.request_mix;
+  env.source_rotation = opt.source_rotation;
   return env;
 }
 

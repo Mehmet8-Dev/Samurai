@@ -57,6 +57,9 @@ JobOptions JobFromArgs(const Value& a) {
   j.verify_tls = BoolArg(a, "verify_tls", false) ? 1u : 0u;
   j.keepalive = BoolArg(a, "keepalive", false) ? 1u : 0u;
   j.l7_timeout_ms = static_cast<std::uint32_t>(std::max<int64_t>(1, IntArg(a, "l7_timeout_ms", 5000)));
+  // Mahoraga shaping levers set by the RL policy / exploration schedule.
+  j.request_mix = static_cast<std::uint32_t>(std::max<int64_t>(0, IntArg(a, "request_mix", 0)));
+  j.source_rotation = static_cast<std::uint32_t>(std::max<int64_t>(0, IntArg(a, "source_rotation", 0)));
   return j;
 }
 }  // namespace

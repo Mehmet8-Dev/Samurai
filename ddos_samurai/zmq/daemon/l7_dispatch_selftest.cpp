@@ -6,6 +6,7 @@
 #include <string>
 
 #include "job_builder.hpp"
+#include "l7_request_variants.hpp"
 #include "wire_protocol.h"
 
 namespace {
@@ -52,6 +53,8 @@ int main() {
   opt.l7_timeout_ms = 2500;
   opt.l7_profile_file = "profiles/demo.json";
   opt.l7_payload_file = "payloads/req.bin";
+  opt.request_mix = 3;
+  opt.source_rotation = 8;
 
   const samurai::wire::JobEnvelopeV2 env = samurai::orchestrator::BuildJobEnvelopeV2(opt);
 
@@ -77,6 +80,37 @@ int main() {
   ok = expect(read_fixed(env.host_header, sizeof(env.host_header)) == "example.test", "host_header") &&
        ok;
   ok = expect(env.l7_timeout_ms == 2500u, "l7_timeout_ms") && ok;
+  ok = expect(env.request_mix == 3u, "request_mix carried on the wire") && ok;
+  ok = expect(env.source_rotation == 8u, "source_rotation carried on the wire") && ok;
+
+  // V2 size is pinned: request_mix/source_rotation reused the old pad2 tail, so
+  // the envelope ABI (and every V1-prefix parser) is unchanged.
+  ok = expect(sizeof(samurai::wire::JobEnvelopeV2) == 650, "V2 size pinned at 650") && ok;
+
+  // request_mix maps to a stable, wrapping request-variant table. Index 0 is the
+  // historical default so request_mix=0 reproduces prior behavior byte-for-byte.
+  ok = expect(std::string(samurai::l7::VariantFor(0).method) == "GET" &&
+                  std::string(samurai::l7::VariantFor(0).path) == "/",
+              "request_mix 0 == GET /") &&
+       ok;
+  ok = expect(std::string(samurai::l7::VariantFor(3).method) == "POST",
+              "request_mix 3 == POST variant") &&
+       ok;
+  ok = expect(samurai::l7::VariantFor(samurai::l7::kRequestVariantCount).path ==
+                  samurai::l7::VariantFor(0).path,
+              "request_mix wraps out of range") &&
+       ok;
+  {
+    const std::string r0 = samurai::l7::BuildHttp1Request(0, "example.test");
+    const std::string r1 = samurai::l7::BuildHttp1Request(1, "example.test");
+    const std::string rp = samurai::l7::BuildHttp1Request(3, "example.test");
+    ok = expect(r0.rfind("GET / HTTP/1.1\r\n", 0) == 0, "variant 0 request line") && ok;
+    ok = expect(r0.find("Host: example.test\r\n") != std::string::npos, "variant host header") && ok;
+    ok = expect(r1 != r0, "variant 1 differs from baseline (observable to WAF)") && ok;
+    ok = expect(rp.find("Content-Length: 0\r\n") != std::string::npos,
+                "POST variant carries Content-Length") &&
+         ok;
+  }
 
   // Zero concurrency must clamp to 1 (engine-safe default).
   opt.concurrency = 0;
