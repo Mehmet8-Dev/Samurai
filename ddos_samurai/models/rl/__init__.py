@@ -25,6 +25,7 @@ from .action_spec import MAHORAGA, RPS_ONLY, ActionSpec
 from .export import load_policy, save_policy
 from .policy_artifact import PolicyArtifact
 from .fingerprint import DefenseProfile, fingerprint, fingerprint_corpus
+from .variant_prior import build_variant_prior
 from .reward import EffectiveThroughputReward, RewardFn, SloProgressReward, slo_overshoot
 from .schemas import Action, DefenseSignals, RawState, SloThresholds, Transition
 
@@ -50,6 +51,7 @@ __all__ = [
     "DefenseProfile",
     "fingerprint",
     "fingerprint_corpus",
+    "build_variant_prior",
     "slo_overshoot",
     "build_dataset",
     "Dataset",

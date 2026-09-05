@@ -61,6 +61,11 @@ if [[ -n "$RL_POLICY" ]]; then
 	fi
 	# VARIANT_MEMORY: persist/warm-start the per-target block memory across runs.
 	# With a block-aware policy (in_dim 30) this also feeds the block state feature.
+	# Seed it from a fingerprint prior before serving so episode 1 already knows the
+	# target's path-blocked variants (no rediscovery window):
+	#   python -m ddos_samurai.models.rl.variant_prior \
+	#       --corpus data/rl-corpus/<profile>.ndjson --target "$TARGET_HOST:$WAF_LAB_PORT" \
+	#       --variants 5 --out "$VARIANT_MEMORY"
 	if [[ -n "${VARIANT_MEMORY:-}" ]]; then
 		SERVE_ARGS+=(--cl-variant-memory "$VARIANT_MEMORY")
 	fi

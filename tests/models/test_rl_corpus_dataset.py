@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from ddos_samurai.models.rl import RLConfig, build_dataset, load_transitions
 from ddos_samurai.models.rl.reward import SloProgressReward, slo_overshoot
@@ -173,6 +174,54 @@ def test_effective_throughput_reward_prefers_served_over_rejected_load():
     # A heavier defense penalty widens the gap (blasting looks even worse).
     harsh = EffectiveThroughputReward(RLConfig(lambda_defense=4.0))
     assert (reward(sustainable) - reward(blasting)) < (harsh(sustainable) - harsh(blasting))
+
+
+def test_effective_throughput_served_counts_raw_2xx_not_rps_times_ratio():
+    from ddos_samurai.models.rl import EffectiveThroughputReward
+
+    reward = EffectiveThroughputReward(RLConfig())
+    # Both windows HONOR the same load (100 2xx), but the dropper offered 10x the
+    # rate and lost 900 connections (responses << attempts). rps * success_ratio
+    # would credit the dropper 10x (1000 vs 100); counting raw status_2xx/window_s
+    # credits both equally, since the target delivered the same throughput. No conn
+    # keys => flow term is 0 on both, isolating the served metric.
+    honest = Transition.from_json(_rec(
+        win=1, action=100.0, s_rps=50.0, s2_rps=100.0, s_valid=True, healthy=True,
+        error_pct=0.0,
+        s2_defense={"responses_total": 100, "status_2xx": 100},
+    ))
+    dropper = Transition.from_json(_rec(
+        win=1, action=1000.0, s_rps=50.0, s2_rps=1000.0, s_valid=True, healthy=True,
+        error_pct=0.0,
+        s2_defense={"responses_total": 100, "status_2xx": 100},
+    ))
+    assert reward(dropper) == pytest.approx(reward(honest))
+
+
+def test_effective_throughput_penalizes_flow_level_defense():
+    from ddos_samurai.models.rl import EffectiveThroughputReward
+
+    # Identical HTTP status breakdown (200 2xx, 50 4xx), but the second window is
+    # hit by a connection-level IPS: 80% of connections dropped + 10% H2 resets.
+    # With no HTTP-status difference, only the flow term can distinguish them.
+    common = dict(win=1, action=250.0, s_rps=100.0, s2_rps=250.0, s_valid=True,
+                  healthy=True, error_pct=0.0)
+    clean = Transition.from_json(_rec(
+        **common,
+        s2_defense={"responses_total": 250, "status_2xx": 200, "status_4xx": 50},
+    ))
+    ipsed = Transition.from_json(_rec(
+        **common,
+        s2_defense={"responses_total": 250, "status_2xx": 200, "status_4xx": 50,
+                    "l7_conn_attempted": 1000, "l7_conn_established": 200,
+                    "h2_stream_reset_ratio": 0.1},
+    ))
+    # Default lambda_flow > 0 => the connection-reset wall is penalized.
+    reward = EffectiveThroughputReward(RLConfig())
+    assert reward(ipsed) < reward(clean)
+    # ...and disabling the weight makes the flow-blind reward identical again.
+    blind = EffectiveThroughputReward(RLConfig(lambda_flow=0.0))
+    assert blind(ipsed) == pytest.approx(blind(clean))
 
 
 def test_slo_overshoot_max_across_rules():

@@ -88,7 +88,21 @@ def test_train_export_reload_evaluate(tmp_path):
     assert isinstance(res.gate_pass, bool)
     assert res.n_episodes == 8
     assert res.n_initial_states == 8
-    assert res.gate_pass == (res.fqe_value >= res.behavior_return)
+    # Bootstrap CI brackets the point estimate, and the default gate is pessimistic:
+    # it passes iff the improvement's lower confidence bound clears zero.
+    assert res.improvement_ci_low <= res.improvement_ci_high
+    assert res.fqe_ci_low <= res.fqe_value <= res.fqe_ci_high
+    assert res.gate_pass == (res.improvement_ci_low >= 0.0)
+
+    # Disabling pessimism recovers the legacy point-estimate gate.
+    legacy = evaluate_policy(
+        ds, art, FQEConfig(steps=400, batch_size=128, seed=0, pessimistic_gate=False))
+    assert legacy.gate_pass == (legacy.fqe_value >= legacy.behavior_return)
+
+    # The horizon diagnostic is exposed: gamma=0.99 => effective horizon ~100, well
+    # over these ~10-window episodes, so the mismatch flag fires.
+    assert res.effective_horizon > 2.0 * res.mean_episode_len
+    assert res.horizon_mismatch
 
 
 def test_multidim_mahoraga_action_end_to_end(tmp_path):

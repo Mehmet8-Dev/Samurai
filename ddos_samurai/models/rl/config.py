@@ -66,6 +66,12 @@ class RLConfig:
     # objective differ from AIMD — it discourages blasting past the defense wall
     # into wasted, rejected load instead of maximizing *served* throughput.
     lambda_defense: float = 1.0
+    # Flow-level (network) defense penalty weight. rate_limited/overload are HTTP
+    # statuses; a pure connection-level IPS (RST/drop, JS-less) returns no status,
+    # so conn_drop_ratio + reset_pressure are penalized separately here. Defaults to
+    # lambda_defense so both defense classes weigh equally out of the box; retune
+    # when a target leans on one class (e.g. Suricata/fail2ban) more than the other.
+    lambda_flow: float = 1.0
 
     # Corpus hygiene.
     drop_leading: bool = True  # drop the s_valid=False first window of every episode

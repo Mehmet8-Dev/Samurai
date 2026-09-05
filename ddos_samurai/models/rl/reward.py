@@ -71,18 +71,29 @@ class SloProgressReward:
 
 
 class EffectiveThroughputReward:
-    """r = served_rps_norm - lambda_defense * defense_pushback
-             - lambda_slo * slo_overshoot - step_cost.
+    """r = served_rps_norm - lambda_defense * status_pushback
+             - lambda_flow * flow_pushback - lambda_slo * slo_overshoot - step_cost.
 
     The Mahoraga objective, and where RL earns its keep over AIMD. AIMD (and the
     plain SloProgressReward) credit *attempted* rps, so their optimum is "ramp to
     max" — but against a defended target most of that load is rejected (429/403)
     or shed (503), pure waste. Here the reward credits the load that actually got
-    *served* (rps * success_ratio) and subtracts the defense's pushback (4xx/5xx
-    share), so the optimum sits at the edge of the defense wall: the highest rate
-    the target still honors, found by trading rps against the shaping levers. When
-    the L7 status breakdown is absent (success_ratio unknown), it falls back to
-    the attempted-rps progress so non-L7 corpora still train.
+    *served* and subtracts the defense's pushback, so the optimum sits at the edge
+    of the defense wall: the highest rate the target still honors, found by trading
+    rps against the shaping levers.
+
+    Served load is the raw honored count — status_2xx / window_s — the exact figure
+    the fingerprint reports. Deriving it as rps * success_ratio instead overstates
+    service when connections drop: rps is the realized *offered* rate, but
+    success_ratio is 2xx / *responses*, so under connection loss (responses <
+    attempts) the product credits throughput the target never delivered.
+
+    Pushback has two classes. status_pushback is the 4xx/5xx share (rate-limit /
+    overload). flow_pushback folds in conn_drop_ratio + reset_pressure: a pure
+    connection-level IPS (RST/drop with no HTTP status) leaves the status terms at
+    0, so without this the policy is blind to that wall. When the L7 status
+    breakdown is absent, served falls back to attempted-rps progress so non-L7
+    corpora still train.
     """
 
     def __init__(self, cfg: RLConfig):
@@ -92,9 +103,11 @@ class EffectiveThroughputReward:
         cfg = self._cfg
         scale = cfg.rps_scale if cfg.rps_scale > 0.0 else (t.max_rps if t.max_rps > 0 else 1.0)
 
-        succ = t.s2.defense.success_ratio  # 2xx / responses, or UNKNOWN (<0)
-        if succ >= 0.0:
-            served = max(0.0, t.s2.rps * succ) / scale
+        raw = t.s2.defense.raw
+        ws = t.window_s if t.window_s > 0 else 1
+        if "responses_total" in raw:
+            # Raw honored throughput (req/s), counted exactly like fingerprint._rows.
+            served = (raw.get("status_2xx", 0.0) / ws) / scale
         else:
             # No L7 status telemetry: degrade to sustainable-rps progress.
             served = (max(0.0, t.s2.rps - t.s.rps) / scale) if t.healthy else 0.0
@@ -103,10 +116,17 @@ class EffectiveThroughputReward:
         ov = t.s2.defense.overload_ratio
         pushback = (rl if rl >= 0.0 else 0.0) + (ov if ov >= 0.0 else 0.0)
 
+        # Flow-level (network) pushback — no HTTP status, so a status-only penalty
+        # misses it entirely against a connection-resetting IPS.
+        cd = t.s2.defense.conn_drop_ratio
+        rp = t.s2.defense.reset_pressure
+        flow = (cd if cd >= 0.0 else 0.0) + (rp if rp >= 0.0 else 0.0)
+
         overshoot = slo_overshoot(t.s2, t.slo)
         return (
             served
             - cfg.lambda_defense * pushback
+            - cfg.lambda_flow * flow
             - cfg.lambda_slo * overshoot
             - cfg.step_cost
         )

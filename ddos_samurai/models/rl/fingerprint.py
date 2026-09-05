@@ -100,6 +100,24 @@ class DefenseProfile:
     def _fmt(v: float) -> str:
         return "none" if v is UNKNOWN or v < 0 else f"~{v:.0f}"
 
+    def variant_best_success(self, n_variants: int) -> list[float]:
+        """Per-variant best-observed success, as a warm-start prior for the serving
+        loop (LeverShield veto + block-state feature).
+
+        This is the bridge from the human-facing fingerprint into the policy loop:
+        for each variant the corpus exercised, best-success = 1 - variant_block[v]
+        (variant_block is 1 - max success, so this recovers the max success we saw);
+        variants never exercised stay UNKNOWN (-1). Written to the VariantMemory JSON
+        store, it lets a fresh episode start from the discovered walls instead of
+        rediscovering them — WITHOUT adding any feature to the frozen SRLP contract
+        (the block-state feature, when enabled, already consumes exactly this array).
+        """
+        out = [UNKNOWN] * n_variants
+        for v, block in self.variant_block.items():
+            if 0 <= v < n_variants:
+                out[v] = max(0.0, min(1.0, 1.0 - block))
+        return out
+
 
 def _rows(transitions: Iterable[Transition]) -> list[_Row]:
     rows: list[_Row] = []
