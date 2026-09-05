@@ -20,6 +20,7 @@
 
 #include "autoscale.hpp"
 #include "closed_loop.hpp"
+#include "lever_shield.hpp"
 #include "rl_explore.hpp"
 #include "rl_policy.hpp"
 #include "control_auth.hpp"
@@ -552,6 +553,10 @@ void Usage(const char* argv0) {
       "                            degrades kRl to the AIMD safety fallback\n"
       "  --cl-rl-max-jump-factor X kRl shield: cap the upward setpoint jump to X x\n"
       "                            the last setpoint per window (default 2.0)\n"
+      "  --cl-lever-shield 0|1     kRl lever shield: veto a request_mix the target\n"
+      "                            path-blocks online, substituting an honored one\n"
+      "                            (default 1; only active when a policy is loaded)\n"
+      "  --cl-lever-variants N     request_mix cardinality for the shield (default 5)\n"
       "  --rl-explore              perturb the shaping levers (concurrency/\n"
       "                            request_mix/source_rotation/pacing_mode) per\n"
       "                            window during --rl-corpus capture so they vary\n"
@@ -1077,6 +1082,18 @@ int main(int argc, char** argv) {
         // kRl Mahoraga levers (dims >=1: concurrency/request_mix/...) proposed last
         // window, applied to THIS window's job spec. Empty => policy drives only rps.
         std::vector<double> rl_next_levers;
+        // Online lever shield (request_mix): active only when serving a policy — pure
+        // capture must let exploration record blocked variants. --cl-lever-shield 0
+        // disables it for A/B; --cl-lever-variants sets the categorical cardinality.
+        const bool lever_shield_on =
+            rl_policy.loaded() && OptInt(argc, argv, "--cl-lever-shield", 1) != 0;
+        samurai::control::LeverShield lever_shield(samurai::control::LeverShield::Config{
+            0.10, static_cast<int>(OptInt(argc, argv, "--cl-lever-variants", 5))});
+        constexpr int kRequestMixDim = 2;  // index of "request_mix" in kActionFields
+        if (lever_shield_on) {
+          std::printf("samurai_master: lever shield on — vetoing path-blocked "
+                      "request_mix variants online\n");
+        }
         bool rl_have_prev = false;
         int win = 0;
         bool cl_aborted = false;
@@ -1113,6 +1130,22 @@ int main(int argc, char** argv) {
               if (ex[k] < 0.0) continue;
               job.base_args.set(samurai::control::kActionFields[k],
                                 Value::Int(static_cast<std::int64_t>(std::llround(ex[k]))));
+            }
+          }
+          // Online lever shield: veto a request_mix the target is path-blocking this
+          // episode, substituting the best-known honored variant. Track the applied
+          // variant so its reaction can be fed back after the window runs.
+          int applied_variant = -1;
+          if (const Value* rm =
+                  job.base_args.find(samurai::control::kActionFields[kRequestMixDim])) {
+            applied_variant = static_cast<int>(rm->as_int(-1));
+          }
+          if (lever_shield_on && applied_variant >= 0) {
+            const int governed = lever_shield.Govern(applied_variant);
+            if (governed != applied_variant) {
+              job.base_args.set(samurai::control::kActionFields[kRequestMixDim],
+                                Value::Int(static_cast<std::int64_t>(governed)));
+              applied_variant = governed;
             }
           }
           attach_progress(job);
@@ -1161,6 +1194,14 @@ int main(int argc, char** argv) {
           // Defense-reaction signals for this window (used by both the RL policy
           // proposal below and the corpus record).
           const Value rl_defense = RlDefenseJson(res.snapshot);
+          // Feed the window's per-variant reaction back to the lever shield so a
+          // path-blocked variant (served ~0) is vetoed next time it is proposed.
+          if (lever_shield_on && applied_variant >= 0) {
+            double resp = 0.0, s2xx = 0.0;
+            if (const Value* v = rl_defense.find("responses_total")) resp = v->as_double(0.0);
+            if (const Value* v = rl_defense.find("status_2xx")) s2xx = v->as_double(0.0);
+            if (resp > 0.0) lever_shield.Observe(applied_variant, s2xx / resp);
+          }
           // kRl: ask the (shielded) policy for the next setpoint from THIS measured
           // state. StepRl clamps/overrides the proposal; a negative value means
           // "no proposal" and the shield uses its AIMD fallback.

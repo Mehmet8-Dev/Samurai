@@ -32,6 +32,7 @@
 #include "daemon/daemon_args.hpp"
 #include "autoscale.hpp"
 #include "closed_loop.hpp"
+#include "lever_shield.hpp"
 #include "rl_explore.hpp"
 #include "rl_policy.hpp"
 #include "discovery.hpp"
@@ -672,6 +673,39 @@ int main() {
     Check(!cfg.SetLever("concurrency", 9, 1), "rl explore: inverted range rejected");
     Check(cfg.SetLever("concurrency", 5, 5), "rl explore: valid override accepted");
     Check(ExploreLevers(0, cfg)[1] == 5.0, "rl explore: degenerate range pins the value");
+  }
+
+  // --- Lever shield: online veto of a path-blocked categorical variant ---
+  {
+    using namespace samurai::control;
+    LeverShield sh(LeverShield::Config{0.10, 5});
+
+    // Unobserved proposals pass through (first-touch discovery is allowed).
+    Check(sh.Govern(3) == 3, "lever shield: unobserved proposal passes through");
+
+    // Observe variant 3 fully blocked (served ~0 => WAF 403) and variant 0 honored.
+    sh.Observe(3, 0.0);
+    sh.Observe(0, 1.0);
+    Check(sh.Blocked(3), "lever shield: variant with ~0 served is flagged blocked");
+    Check(!sh.Blocked(0), "lever shield: honored variant not flagged");
+    Check(sh.Govern(3) == 0, "lever shield: blocked proposal -> best-known honored variant");
+    Check(sh.Govern(0) == 0, "lever shield: honored proposal kept");
+
+    // A rate-limited (not path-blocked) variant keeps its best-case honored window,
+    // so it is never vetoed even if later windows dip under load.
+    sh.Observe(1, 0.8);
+    sh.Observe(1, 0.05);  // high-rps dip does not lower the best-seen success
+    Check(!sh.Blocked(1), "lever shield: rate-limited variant (honored once) not blocked");
+
+    // With no honored variant known yet, a blocked proposal probes an unobserved one.
+    LeverShield sh2(LeverShield::Config{0.10, 5});
+    sh2.Observe(2, 0.0);
+    const int probe = sh2.Govern(2);
+    Check(probe != 2 && probe >= 0 && probe < 5,
+          "lever shield: blocked with no honored known -> probes an unobserved variant");
+
+    sh.Reset();
+    Check(!sh.Blocked(3) && sh.Govern(3) == 3, "lever shield: reset clears episode memory");
   }
 
   // --- sut probe: Prometheus /api/v1/query response parsing ---
