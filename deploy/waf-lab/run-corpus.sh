@@ -19,7 +19,13 @@ BIN_WORKER="${BIN_WORKER:-$REPO/build/zmq}"
 WAF_LAB_PORT="${WAF_LAB_PORT:-8080}"
 TARGET_HOST="${TARGET_HOST:-127.0.0.1}"
 CONTROL_EP="${CONTROL_EP:-tcp://127.0.0.1:5099}"
-CORPUS="${CORPUS:-$REPO/data/rl-corpus/waf-lab-$(date +%Y%m%d-%H%M%S).ndjson}"
+# Defense profile (strict-waf|rate-only|waf-heavy) — selects the compose tier and
+# labels the corpus so the union is traceable. AUTO_UP=1 (re)creates the nginx/caddy
+# tier for this profile before capture (needs docker + the image already built).
+WAF_PROFILE="${WAF_PROFILE:-strict-waf}"
+AUTO_UP="${AUTO_UP:-0}"
+export WAF_PROFILE
+CORPUS="${CORPUS:-$REPO/data/rl-corpus/waf-lab-${WAF_PROFILE}-$(date +%Y%m%d-%H%M%S).ndjson}"
 CLUSTER_SECRET="${SAMURAI_CLUSTER_SECRET:-waf-lab-secret}"
 export SAMURAI_CLUSTER_SECRET="$CLUSTER_SECRET"
 
@@ -40,6 +46,16 @@ RL_EXPLORE_SEED="${RL_EXPLORE_SEED:-0}"
 EXPLORE_ARGS=()
 if [[ "$RL_EXPLORE" == "1" ]]; then
 	EXPLORE_ARGS=(--rl-explore --rl-explore-seed "$RL_EXPLORE_SEED")
+fi
+
+echo ">> defense profile: $WAF_PROFILE"
+# Optionally (re)create the rate-limit + WAF tier for this profile. nginx re-reads
+# its config on recreate; caddy picks up the profile's waf-rules.conf bind-mount.
+if [[ "$AUTO_UP" == "1" ]]; then
+	echo ">> bringing up lab tier for profile '$WAF_PROFILE' (docker compose up -d)"
+	WAF_PROFILE="$WAF_PROFILE" docker compose -f "$HERE/docker-compose.yml" up -d \
+		--force-recreate nginx caddy whoami >/dev/null
+	sleep 2
 fi
 
 echo ">> checking lab ingress http://$TARGET_HOST:$WAF_LAB_PORT/healthz"
