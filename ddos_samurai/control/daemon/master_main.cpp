@@ -38,6 +38,7 @@
 #include "redis_kvstore.hpp"
 #include "servicer.hpp"
 #include "sut_probe.hpp"
+#include "target_safety.hpp"
 
 namespace {
 std::atomic<bool> g_stop{false};
@@ -461,6 +462,12 @@ void Usage(const char* argv0) {
       "  --count N                 total packets for the job (required, > 0)\n"
       "  --target IP               target ipv4 (default 127.0.0.1)\n"
       "  --port N                  target port (default 80)\n"
+      "  Target consent gate (private/loopback only by default):\n"
+      "  --allow-target IP|CIDR    allowlist a target (repeatable); required to\n"
+      "                            drive a non-private target\n"
+      "  --allow-public-target     permit any public target (use with care; a\n"
+      "                            --deny-target still wins)\n"
+      "  --deny-target IP|CIDR     denylist a target (repeatable; always wins)\n"
       "  --protocol P              l4 protocol (default udp)\n"
       "  --size N                  packet size (default 64)\n"
       "  --worker NAME             worker flavor this job needs (default cpu); only\n"
@@ -597,6 +604,27 @@ int main(int argc, char** argv) {
   if (count <= 0 && !mm_enabled) {
     std::fprintf(stderr, "samurai_master: --count must be > 0\n");
     return 2;
+  }
+
+  // Consent gate for the local job's target. The closed-loop / RL serving path
+  // never went through cli::Validate, so it previously skipped the same safety
+  // check the one-shot CLI enforces. Apply core::ValidateTargetSafety here so
+  // autopilot can only be pointed at user-controlled infrastructure: private /
+  // loopback by default, or an explicit --allow-target / --allow-public-target
+  // allowlist (a --deny-target always wins). Serve-only masters (count<=0,
+  // multi-master) carry no local target; delegated jobs are gated at their
+  // originating master, so only validate when there is a local job to run.
+  if (count > 0) {
+    const std::string tgt = Opt(argc, argv, "--target", "127.0.0.1");
+    const auto safety = samurai::core::ValidateTargetSafety(
+        tgt, OptAll(argc, argv, "--allow-target"),
+        Flag(argc, argv, "--allow-public-target"),
+        OptAll(argc, argv, "--deny-target"));
+    if (!safety.ok) {
+      std::fprintf(stderr, "samurai_master: refusing target %s: %s\n",
+                   tgt.c_str(), safety.reason.c_str());
+      return 2;
+    }
   }
 
   std::signal(SIGINT, OnSignal);

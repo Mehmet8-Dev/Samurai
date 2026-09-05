@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 namespace samurai::control::daemon {
 
@@ -27,6 +28,16 @@ inline std::string OptOrEnv(int argc, char** argv, const char* flag, const char*
     if (*e) return std::string(e);
   }
   return def;
+}
+
+// Collect every value of a repeatable "--flag value" option, in argv order.
+// Used for allowlist/denylist entries where the flag may appear more than once.
+inline std::vector<std::string> OptAll(int argc, char** argv, const char* flag) {
+  std::vector<std::string> out;
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (flag == std::string(argv[i])) out.emplace_back(argv[++i]);
+  }
+  return out;
 }
 
 inline long OptInt(int argc, char** argv, const char* flag, long def) {
