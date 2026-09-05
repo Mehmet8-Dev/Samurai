@@ -36,6 +36,8 @@ class _Row:
     request_mix: int
     served_rps: float          # 2xx / window_s — load the target actually honored
     reject_ratio: float        # 4xx share (rate-limit + WAF, lumped by the emu)
+    success_ratio: float       # 2xx share — path-block drives this to ~0 at any rps
+    responses: float           # responses_total (weight / validity)
     overload_ratio: float      # 5xx share
     conn_drop_ratio: float     # 1 - established/attempted
     flow_events: float         # RST + connect-timeout + retransmit + timeout-close
@@ -53,10 +55,12 @@ class DefenseProfile:
     overload_onset_rps: float = UNKNOWN    # lowest offered rps that draws 5xx
     conn_refusal_onset_rps: float = UNKNOWN  # lowest offered rps that drops connections
 
-    # Uniform (rate-limiter) vs path-specific (WAF) rejection. `variant_excess` is
-    # each request_mix's mean rejection minus the global trend at like rps.
+    # Uniform (rate-limiter) vs path-specific (WAF) rejection. `variant_block` is
+    # each request_mix's blocked fraction at ITS OWN low load (1 - success_ratio);
+    # `blocked_variants` are those blocked even below the rate wall (WAF-blocked).
     path_sensitivity: float = 0.0
-    variant_excess: dict[int, float] = field(default_factory=dict)
+    variant_block: dict[int, float] = field(default_factory=dict)
+    blocked_variants: list[int] = field(default_factory=list)
 
     limiter_type_hint: str = "unknown"
     transition_band_rps: float = UNKNOWN   # rps width over which reject goes .1->.9
@@ -82,10 +86,10 @@ class DefenseProfile:
         L.append(f"limiter type (guess): {self.limiter_type_hint}"
                  + (f"  [transition band ~{self.transition_band_rps:.0f} rps]"
                     if self.transition_band_rps is not UNKNOWN and self.transition_band_rps >= 0 else ""))
-        if self.path_sensitivity >= _ONSET and self.variant_excess:
-            worst = max(self.variant_excess.items(), key=lambda kv: kv[1])
-            L.append(f"path sensitivity    : PATH-SPECIFIC (WAF-like); variant {worst[0]} "
-                     f"rejected +{worst[1]*100:.0f}% vs trend")
+        if self.blocked_variants:
+            vs = ", ".join(str(v) for v in self.blocked_variants)
+            L.append(f"path sensitivity    : PATH-SPECIFIC (WAF-like); variant(s) {vs} "
+                     f"blocked (~0% served at any rps) — not rate-limited")
         else:
             L.append("path sensitivity    : uniform across request variants "
                      "(rate-limiter dominates, no strong path/method WAF blocking)")
@@ -114,6 +118,8 @@ def _rows(transitions: Iterable[Transition]) -> list[_Row]:
             request_mix=int(t.action.request_mix),
             served_rps=served,
             reject_ratio=d.rate_limited_ratio if d.rate_limited_ratio >= 0 else 0.0,
+            success_ratio=d.success_ratio if d.success_ratio >= 0 else 0.0,
+            responses=float(raw.get("responses_total", 0.0)),
             overload_ratio=d.overload_ratio if d.overload_ratio >= 0 else 0.0,
             conn_drop_ratio=d.conn_drop_ratio if d.conn_drop_ratio >= 0 else 0.0,
             flow_events=flow,
@@ -152,19 +158,34 @@ def fingerprint(transitions: Iterable[Transition]) -> DefenseProfile:
     p.overload_onset_rps = _first_onset(rows, lambda r: r.overload_ratio)
     p.conn_refusal_onset_rps = _first_onset(rows, lambda r: r.conn_drop_ratio)
 
-    # Path sensitivity: does rejection depend on the request variant beyond the
-    # rps trend? Compare each variant's mean rejection to the global mean at like
-    # load. If variants diverge, a path/method-aware WAF is in play; if not, the
-    # rate limiter treats every request the same.
+    # Path sensitivity: is a variant blocked *beyond* what rate-limiting explains?
+    # Keying on the 4xx share alone conflates the two — 4xx rises with rps for every
+    # variant, so a variant merely sampled at higher rps looks "path-specific". The
+    # honest discriminator is the SUCCESS ratio at each variant's OWN low load: below
+    # the rate wall a limiter honors traffic (success ~1), while a WAF-blocked path
+    # returns ~0 served at any rps. So we score each variant by how blocked it is
+    # across its lowest-load third, which decouples the judgment from where in the
+    # rps ramp the variant happened to be exercised.
     variants = sorted({r.request_mix for r in rows if r.request_mix >= 0})
     if len(variants) >= 2:
-        global_mean = mean(r.reject_ratio for r in rows)
-        excess = {
-            v: mean(r.reject_ratio for r in rows if r.request_mix == v) - global_mean
-            for v in variants
-        }
-        p.variant_excess = {v: round(e, 3) for v, e in excess.items()}
-        p.path_sensitivity = round(max(excess.values()) - min(excess.values()), 3)
+        # A rate limiter honors every variant at low enough rps, so a non-blocked
+        # variant is served in at least one window (its best success ~ 1). A WAF
+        # path-block returns ~0 served at EVERY rps, so its best window is still ~0.
+        # Scoring by (1 - best success) is thus robust to how each variant happened
+        # to be sampled across the rps ramp — unlike a 4xx mean, which just tracks rps.
+        block: dict[int, float] = {}
+        for v in variants:
+            vr = [r for r in rows if r.request_mix == v and r.responses > 0]
+            if not vr:
+                continue
+            block[v] = 1.0 - max(r.success_ratio for r in vr)
+        if block:
+            p.variant_block = {v: round(b, 3) for v, b in block.items()}
+            # Blocked at its own best-case load => WAF/path policy, not rate-limiting.
+            # The 0.5 floor admits only near-total blocks (real WAF ~1.0), rejecting
+            # the partial dips a small, unlucky sample can produce.
+            p.blocked_variants = sorted(v for v, b in block.items() if b >= 0.5)
+            p.path_sensitivity = round(max(block.values()) - min(block.values()), 3)
 
     # Limiter-type heuristic from how sharply rejection turns on. A hard threshold
     # (fixed/sliding window) flips over a narrow rps band; a token bucket bleeds in

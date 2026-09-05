@@ -89,6 +89,34 @@ def test_fingerprint_flags_path_specific_waf_and_flow_defense(tmp_path):
     p = fingerprint_corpus(_write(tmp_path, recs))
 
     assert p.path_sensitivity >= 0.05
-    assert p.variant_excess[3] == max(p.variant_excess.values())
+    assert p.variant_block[3] == max(p.variant_block.values())
     assert p.flow_defense is True
     assert "IPS" in p.flow_note or "conntrack" in p.flow_note
+
+
+def test_fingerprint_fully_blocked_variant_is_named(tmp_path):
+    # A hard WAF block: variant 2 returns ~0 served at every rps (403 on the path),
+    # while others are only rate-limited. Must be reported as a blocked variant, not
+    # confused with the rate limiter — even though 4xx rises with rps for everyone.
+    recs = []
+    for rps in range(100, 1300, 100):
+        for mix in range(5):
+            if mix == 2:
+                # fully blocked: no 2xx at any rps
+                recs.append(_fully_blocked(rps, mix))
+            else:
+                recs.append(_rec(rps, mix))
+    p = fingerprint_corpus(_write(tmp_path, recs))
+    assert p.blocked_variants == [2]
+    assert p.variant_block[2] >= 0.9
+    # Honored variants are NOT flagged as path-blocked despite heavy 4xx at high rps.
+    assert all(v not in p.blocked_variants for v in (0, 1, 3, 4))
+
+
+def _fully_blocked(rps: float, request_mix: int) -> dict:
+    r = _rec(rps, request_mix)
+    d = r["s2"]["defense"]
+    d["status_2xx"] = 0
+    d["status_4xx"] = d["responses_total"]  # 403 on every request to this path
+    r["s2"]["rps"] = 0.0
+    return r
