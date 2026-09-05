@@ -21,6 +21,7 @@
 #include "autoscale.hpp"
 #include "closed_loop.hpp"
 #include "lever_shield.hpp"
+#include "variant_memory.hpp"
 #include "rl_explore.hpp"
 #include "rl_policy.hpp"
 #include "control_auth.hpp"
@@ -557,6 +558,9 @@ void Usage(const char* argv0) {
       "                            path-blocks online, substituting an honored one\n"
       "                            (default 1; only active when a policy is loaded)\n"
       "  --cl-lever-variants N     request_mix cardinality for the shield (default 5)\n"
+      "  --cl-variant-memory FILE  persist per-target block memory (JSON) across runs:\n"
+      "                            warm-start the shield + block state feature from what\n"
+      "                            a prior run learned about this target (default off)\n"
       "  --rl-explore              perturb the shaping levers (concurrency/\n"
       "                            request_mix/source_rotation/pacing_mode) per\n"
       "                            window during --rl-corpus capture so they vary\n"
@@ -1085,14 +1089,44 @@ int main(int argc, char** argv) {
         // Online lever shield (request_mix): active only when serving a policy — pure
         // capture must let exploration record blocked variants. --cl-lever-shield 0
         // disables it for A/B; --cl-lever-variants sets the categorical cardinality.
+        const int variant_count = static_cast<int>(OptInt(argc, argv, "--cl-lever-variants", 5));
         const bool lever_shield_on =
             rl_policy.loaded() && OptInt(argc, argv, "--cl-lever-shield", 1) != 0;
-        samurai::control::LeverShield lever_shield(samurai::control::LeverShield::Config{
-            0.10, static_cast<int>(OptInt(argc, argv, "--cl-lever-variants", 5))});
+        samurai::control::LeverShield lever_shield(
+            samurai::control::LeverShield::Config{0.10, variant_count});
         constexpr int kRequestMixDim = 2;  // index of "request_mix" in kActionFields
         if (lever_shield_on) {
           std::printf("samurai_master: lever shield on — vetoing path-blocked "
                       "request_mix variants online\n");
+        }
+        // Path-aware state: when the loaded policy's input width includes the block
+        // features (base 20 + 2 per variant), feed it the per-variant block memory as
+        // state so it can *learn* to avoid a path-blocked variant (the shield is then
+        // just the safety net). Keep the memory whenever serving, independent of the
+        // veto toggle, so an A/B run with the veto off still populates the feature.
+        constexpr int kBaseFeatures = 20;
+        const bool block_state_on =
+            rl_policy.loaded() && rl_policy.input_dim() == kBaseFeatures + 2 * variant_count;
+        const bool track_variants = rl_policy.loaded();  // Observe/snapshot while serving
+        // Cross-episode persistence: warm-start the memory from what a prior run
+        // learned about THIS target, and write it back so the next run starts armed.
+        const std::string variant_mem_path = Opt(argc, argv, "--cl-variant-memory", "");
+        const std::string target_key = Opt(argc, argv, "--target", "127.0.0.1") + ":" +
+                                        std::to_string(OptInt(argc, argv, "--port", 80));
+        samurai::control::VariantMemory variant_mem;
+        if (track_variants && !variant_mem_path.empty()) {
+          variant_mem = samurai::control::VariantMemory::Load(variant_mem_path);
+          const std::vector<double> warm = variant_mem.Get(target_key);
+          if (!warm.empty()) {
+            lever_shield.Warm(warm);
+            std::printf("samurai_master: variant memory warm-started for %s (%zu variants)\n",
+                        target_key.c_str(), warm.size());
+          }
+        }
+        if (block_state_on) {
+          std::printf("samurai_master: path-aware block state on (in_dim=%d) — policy "
+                      "conditions on the per-variant block memory\n",
+                      rl_policy.input_dim());
         }
         bool rl_have_prev = false;
         int win = 0;
@@ -1194,9 +1228,11 @@ int main(int argc, char** argv) {
           // Defense-reaction signals for this window (used by both the RL policy
           // proposal below and the corpus record).
           const Value rl_defense = RlDefenseJson(res.snapshot);
-          // Feed the window's per-variant reaction back to the lever shield so a
-          // path-blocked variant (served ~0) is vetoed next time it is proposed.
-          if (lever_shield_on && applied_variant >= 0) {
+          // Feed the window's per-variant reaction into the variant memory so a
+          // path-blocked variant (served ~0) is both vetoed (shield) and visible to
+          // the policy (block state feature). Tracked whenever serving, so the veto
+          // toggle and the state feature share one up-to-date memory.
+          if (track_variants && applied_variant >= 0) {
             double resp = 0.0, s2xx = 0.0;
             if (const Value* v = rl_defense.find("responses_total")) resp = v->as_double(0.0);
             if (const Value* v = rl_defense.find("status_2xx")) s2xx = v->as_double(0.0);
@@ -1206,8 +1242,12 @@ int main(int argc, char** argv) {
           // state. StepRl clamps/overrides the proposal; a negative value means
           // "no proposal" and the shield uses its AIMD fallback.
           if (rl_policy.loaded()) {
-            const samurai::control::RlStateInputs rin =
+            samurai::control::RlStateInputs rin =
                 RlInputsFrom(sample, rl_defense, win, clcfg);
+            // Path-aware: hand the policy the current per-variant block memory (post
+            // this window's Observe, matching the corpus's causal block-after-window
+            // semantics) so BuildFeatures appends the block features it was trained on.
+            if (block_state_on) rin.variant_block_success = lever_shield.snapshot();
             const std::vector<double> action = rl_policy.ProposeFor(rin);
             if (!action.empty()) {
               sample.rl_action_rps = action[0];  // dim 0 = rps -> shield
@@ -1240,6 +1280,18 @@ int main(int argc, char** argv) {
               dec.window, setpoint, dec.last_healthy ? 1 : 0, dec.error_pct,
               sut_sample.latency_p99_ms, dec.setpoint_rps, dec.best_good_rps, dec.phase.c_str());
           if (dec.done) break;
+        }
+        // Persist what this run learned about the target so the next run warm-starts
+        // instead of rediscovering the same path-blocks (cross-episode memory).
+        if (track_variants && !variant_mem_path.empty()) {
+          variant_mem.Put(target_key, lever_shield.snapshot());
+          if (!variant_mem.Save(variant_mem_path)) {
+            std::fprintf(stderr, "samurai_master: could not persist variant memory to %s\n",
+                         variant_mem_path.c_str());
+          } else {
+            std::printf("samurai_master: variant memory saved for %s -> %s\n",
+                        target_key.c_str(), variant_mem_path.c_str());
+          }
         }
         Value clsummary = Value::Object();
         clsummary.set("event", Value::Str("closed_loop_result"));

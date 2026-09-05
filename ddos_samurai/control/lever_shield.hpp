@@ -73,6 +73,20 @@ class LeverShield {
 
   void Reset() { std::fill(best_success_.begin(), best_success_.end(), -1.0); }
 
+  // Seed the memory from a persisted per-target snapshot (cross-episode warm start):
+  // a value >= 0 pre-populates that variant's best-observed success so the policy's
+  // block feature is informed from window 0 instead of rediscovering the target.
+  void Warm(const std::vector<double>& best) {
+    const std::size_t n = std::min(best.size(), best_success_.size());
+    for (std::size_t v = 0; v < n; ++v) {
+      if (best[v] >= 0.0 && best[v] > best_success_[v]) best_success_[v] = best[v];
+    }
+  }
+
+  // The full per-variant best-success vector (-1 = unobserved). Feeds both the
+  // RlStateInputs block features and the persistent store.
+  const std::vector<double>& snapshot() const { return best_success_; }
+
   double best_success(int variant) const {
     if (variant < 0 || variant >= static_cast<int>(best_success_.size())) return -1.0;
     return best_success_[variant];

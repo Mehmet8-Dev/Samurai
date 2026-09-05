@@ -45,6 +45,12 @@ struct RlStateInputs {
   // Context used for normalization of the raw features.
   double max_rps = 1.0;
   double step_horizon = 32.0;  // must match RLConfig.step_horizon
+  // Path-aware variant-block memory (RLConfig.variant_block_features). Per-variant
+  // best-observed success this episode, -1 = unobserved. When non-empty, BuildFeatures
+  // appends 2 features per variant AFTER the mask bits: block ratio (1-best, imputed
+  // 0 if unobserved) then a known bit — matching dataset.build_dataset's layout.
+  // Empty => legacy 20-dim state (no block features), so old policies still load.
+  std::vector<double> variant_block_success;
 };
 
 class RlPolicy {
@@ -67,6 +73,9 @@ class RlPolicy {
   //   [11..19] known-mask bits for error_pct, loss_pct, rate_accuracy_pct, p99_ms,
   //            rate_limited_ratio, overload_ratio, conn_drop_ratio, reset_pressure,
   //            challenge_rate.
+  //   [20..20+V-1]     variant block ratios (1-best success, 0 if unobserved)
+  //   [20+V..20+2V-1]  variant known bits   (present only when in.variant_block_success
+  //                    is non-empty; V == in.variant_block_success.size()).
   static std::vector<float> BuildFeatures(const RlStateInputs& in);
 
   // Forward pass on a raw feature vector -> the full (action_dim) de-normalized

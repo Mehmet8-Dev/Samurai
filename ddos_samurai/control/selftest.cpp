@@ -33,6 +33,7 @@
 #include "autoscale.hpp"
 #include "closed_loop.hpp"
 #include "lever_shield.hpp"
+#include "variant_memory.hpp"
 #include "rl_explore.hpp"
 #include "rl_policy.hpp"
 #include "discovery.hpp"
@@ -572,6 +573,22 @@ int main() {
     Check(f[15] == 1.0f, "rl policy: rate_limited mask set");
     std::remove(path.c_str());
 
+    // Path-aware block features: appended after the 20 base dims as [ratios..., known...].
+    // best_success = {-1, 0.9, -1, 0.05, -1} => variant1 honored (ratio .1), variant3
+    // blocked (ratio .95), the rest unobserved (ratio imputed 0, known 0). Must match
+    // the Python dataset layout (build_dataset._encode_block).
+    RlStateInputs bin;
+    bin.rps = 500; bin.max_rps = 1000; bin.win = 8; bin.step_horizon = 32.0;
+    bin.variant_block_success = {-1.0, 0.9, -1.0, 0.05, -1.0};
+    auto bf = RlPolicy::BuildFeatures(bin);
+    Check(bf.size() == 30, "rl policy: block features widen state to 30");
+    Check(std::abs(bf[20] - 0.0f) < 1e-6 && bf[25] == 0.0f, "rl policy: unobserved variant0 -> ratio 0, known 0");
+    Check(std::abs(bf[21] - 0.1f) < 1e-6 && bf[26] == 1.0f, "rl policy: honored variant1 -> ratio .1, known 1");
+    Check(std::abs(bf[23] - 0.95f) < 1e-6 && bf[28] == 1.0f, "rl policy: blocked variant3 -> ratio .95, known 1");
+    // Empty memory => legacy 20-dim state (old policies keep loading).
+    RlStateInputs lin; lin.rps = 1; lin.max_rps = 1;
+    Check(RlPolicy::BuildFeatures(lin).size() == 20, "rl policy: empty block memory -> legacy 20-dim");
+
     // Multi-dim (Mahoraga) action: 2-in -> 2-out identity, per-dim bounds
     // rps in [100,1100], concurrency in [1,65]. input [0.5,0.25] -> [600,17].
     std::string m = "SRLP";
@@ -706,6 +723,45 @@ int main() {
 
     sh.Reset();
     Check(!sh.Blocked(3) && sh.Govern(3) == 3, "lever shield: reset clears episode memory");
+
+    // Warm-start + snapshot: seed from a persisted vector, expose the full memory.
+    LeverShield sh3(LeverShield::Config{0.10, 5});
+    sh3.Warm({-1.0, 0.9, 0.0, -1.0, 0.5});  // variant2 blocked (0.0), 1 & 4 honored
+    Check(sh3.Blocked(2), "lever shield: warm-started blocked variant is flagged");
+    Check(!sh3.Blocked(1), "lever shield: warm-started honored variant not flagged");
+    const auto snap = sh3.snapshot();
+    Check(snap.size() == 5 && snap[1] == 0.9 && snap[2] == 0.0,
+          "lever shield: snapshot exposes the warm-started memory");
+    sh3.Observe(2, 0.7);  // a later honored window raises best-success past the floor
+    Check(!sh3.Blocked(2), "lever shield: observing an honored window clears the block");
+  }
+
+  // --- Variant memory: per-target block store round-trips through JSON on disk ---
+  {
+    using namespace samurai::control;
+    const std::string mpath = "/tmp/samurai_selftest_variant_mem.json";
+    std::remove(mpath.c_str());
+
+    // Missing file loads as an empty store (a first run must not fail).
+    Check(VariantMemory::Load(mpath).size() == 0, "variant memory: missing file -> empty store");
+
+    VariantMemory mem;
+    mem.Put("10.0.0.1:8080", {-1.0, 0.95, 0.0, 0.9, -1.0});
+    mem.Put("10.0.0.2:443", {0.2, 0.2, 0.2});
+    Check(mem.Save(mpath), "variant memory: save to disk");
+
+    VariantMemory back = VariantMemory::Load(mpath);
+    Check(back.size() == 2, "variant memory: both targets reloaded");
+    const auto a = back.Get("10.0.0.1:8080");
+    Check(a.size() == 5 && a[1] == 0.95 && a[2] == 0.0 && a[0] == -1.0,
+          "variant memory: per-variant values round-trip");
+    Check(back.Get("nope:1").empty(), "variant memory: unknown target -> empty");
+
+    // Put replaces an existing key rather than duplicating it.
+    back.Put("10.0.0.2:443", {0.5});
+    Check(back.size() == 2 && back.Get("10.0.0.2:443").size() == 1,
+          "variant memory: Put replaces in place");
+    std::remove(mpath.c_str());
   }
 
   // --- sut probe: Prometheus /api/v1/query response parsing ---

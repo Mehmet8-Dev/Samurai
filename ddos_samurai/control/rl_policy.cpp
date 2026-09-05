@@ -195,6 +195,13 @@ std::vector<float> RlPolicy::BuildFeatures(const RlStateInputs& in) {
   f.push_back(static_cast<float>(impute(in.reset_pressure)));   // 9
   f.push_back(static_cast<float>(impute(in.challenge_rate)));   // 10
   for (double m : maskable) f.push_back(m < 0.0 ? 0.0f : 1.0f); // 11..19 mask bits
+
+  // Path-aware block features (appended after the mask bits, matching the Python
+  // dataset layout): all block ratios, then all known bits. A variant with best
+  // success < 0 is unobserved => ratio imputed to 0, known bit 0.
+  const std::vector<double>& blk = in.variant_block_success;
+  for (double b : blk) f.push_back(b >= 0.0 ? static_cast<float>(1.0 - b) : 0.0f);
+  for (double b : blk) f.push_back(b >= 0.0 ? 1.0f : 0.0f);
   return f;
 }
 

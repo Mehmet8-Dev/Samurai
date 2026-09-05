@@ -122,11 +122,41 @@ def build_dataset(
     done_list: list[float] = []
     eid_list: list[int] = []
 
+    # Path-aware block memory: per-variant best-observed success, folded causally
+    # across an episode's windows (resets per episode). Mirrors the serving-time
+    # LeverShield memory, so the exported feature layout matches BuildFeatures.
+    use_block = cfg.variant_block_features
+    n_variant = cfg.request_variant_count
+
+    def _encode_block(best: list[float]) -> np.ndarray:
+        # [block ratios..., known bits...]: ratio = 1 - best (impute 0 if unseen),
+        # known = 1 once the variant has a valid success sample this episode.
+        ratios = [
+            (1.0 - b) if b >= 0.0 else cfg.impute_value for b in best
+        ]
+        known = [1.0 if b >= 0.0 else 0.0 for b in best]
+        return np.asarray(ratios + known, dtype=np.float32)
+
     for eid, (run_id, eps) in enumerate(sorted(episodes.items())):
         kept = [t for t in eps if _keep(t, cfg)]
+        best_success = [-1.0] * n_variant  # -1 = variant unobserved this episode
         for i, t in enumerate(kept):
-            s_list.append(extractor.state_vector(t.s, t))
-            s2_list.append(extractor.state_vector(t.s2, t))
+            s_vec = extractor.state_vector(t.s, t)
+            s2_vec = extractor.state_vector(t.s2, t)
+            if use_block:
+                # State conditions on what was known BEFORE this window's action;
+                # next_state folds in this window's own reaction (causal, matching
+                # the serving loop where Observe precedes the next Propose).
+                s_block = _encode_block(best_success)
+                v = int(round(t.action.request_mix))
+                succ = t.s2.defense.success_ratio
+                if 0 <= v < n_variant and succ >= 0.0:
+                    best_success[v] = max(best_success[v], succ)
+                s2_block = _encode_block(best_success)
+                s_vec = np.concatenate([s_vec, s_block])
+                s2_vec = np.concatenate([s2_vec, s2_block])
+            s_list.append(s_vec)
+            s2_list.append(s2_vec)
             a_list.append([t.action.value(action_spec.field_of(n)) for n in action_spec.names])
             r_list.append(reward_fn(t))
             # Terminal if the controller converged, or it's the last kept window of
@@ -134,7 +164,7 @@ def build_dataset(
             done_list.append(1.0 if (t.done or i == len(kept) - 1) else 0.0)
             eid_list.append(eid)
 
-    dim = extractor.dim
+    dim = extractor.dim + (cfg.block_feature_count if use_block else 0)
     a_dim = action_spec.dim
     if s_list:
         states = np.stack(s_list).astype(np.float32)
@@ -184,7 +214,8 @@ def build_dataset(
         dones=np.asarray(done_list, dtype=np.float32),
         episode_ids=np.asarray(eid_list, dtype=np.int64),
         feature_names=tuple(cfg.feature_names)
-        + (tuple(f"{n}_known" for n in cfg.maskable_features) if cfg.mask_unknown else ()),
+        + (tuple(f"{n}_known" for n in cfg.maskable_features) if cfg.mask_unknown else ())
+        + (cfg.block_feature_names() if use_block else ()),
         normalizer=Normalizer.fit(states) if len(states) else Normalizer(
             mean=np.zeros(dim, dtype=np.float32), std=np.ones(dim, dtype=np.float32)
         ),

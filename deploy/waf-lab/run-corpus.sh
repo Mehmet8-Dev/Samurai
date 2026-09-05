@@ -59,6 +59,11 @@ if [[ -n "$RL_POLICY" ]]; then
 	if [[ -n "${LEVER_SHIELD:-}" ]]; then
 		SERVE_ARGS+=(--cl-lever-shield "$LEVER_SHIELD")
 	fi
+	# VARIANT_MEMORY: persist/warm-start the per-target block memory across runs.
+	# With a block-aware policy (in_dim 30) this also feeds the block state feature.
+	if [[ -n "${VARIANT_MEMORY:-}" ]]; then
+		SERVE_ARGS+=(--cl-variant-memory "$VARIANT_MEMORY")
+	fi
 fi
 
 echo ">> defense profile: $WAF_PROFILE"

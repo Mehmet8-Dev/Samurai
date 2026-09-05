@@ -44,6 +44,19 @@ class RLConfig:
     impute_value: float = 0.0
     step_horizon: float = 32.0  # normalizer for the window index feature
 
+    # Path-aware state: append a per-variant "block" memory to the state so the
+    # policy can SEE which request_mix variants the target is path-blocking THIS
+    # episode and learn to avoid them, instead of regressing to a defense-blind
+    # marginal (which is why the model-free LeverShield veto was needed). For each
+    # of `request_variant_count` variants we add two features, appended after the
+    # mask bits: variant{v}_block = 1 - best-observed-success-so-far (causal: only
+    # windows strictly before the current one), and a companion variant{v}_known
+    # bit (0 until the variant has been tried this episode). The running estimate
+    # resets per episode and, at serving, is warm-started from the per-target
+    # persistent store — identical feature semantics either way.
+    variant_block_features: bool = False
+    request_variant_count: int = 5  # categorical cardinality of request_mix
+
     # Reward shaping.
     lambda_slo: float = 2.0
     step_cost: float = 0.02
@@ -60,11 +73,35 @@ class RLConfig:
 
     @property
     def feature_count(self) -> int:
+        """Width the FeatureExtractor emits per window (base features + mask bits).
+        The path-aware block features are appended at dataset level, so they are
+        counted by ``block_feature_count`` / ``state_dim`` instead, not here."""
         base = len(self.feature_names)
         if not self.mask_unknown:
             return base
         # One mask bit per maskable raw field (the four that can be unknown).
         return base + len(self.maskable_features)
+
+    @property
+    def state_dim(self) -> int:
+        """Full policy input width: the extractor output plus the block features."""
+        return self.feature_count + self.block_feature_count
+
+    @property
+    def block_feature_count(self) -> int:
+        """Extra state dims from the path-aware variant-block memory (2 per variant:
+        the block ratio and its known bit), 0 when the feature is disabled."""
+        return 2 * self.request_variant_count if self.variant_block_features else 0
+
+    def block_feature_names(self) -> tuple[str, ...]:
+        """Names for the appended block features, in wire order: all block ratios
+        then all known bits (mirrors the value-then-mask-bit layout above)."""
+        if not self.variant_block_features:
+            return ()
+        v = self.request_variant_count
+        return tuple(f"variant{i}_block" for i in range(v)) + tuple(
+            f"variant{i}_known" for i in range(v)
+        )
 
     @property
     def maskable_features(self) -> tuple[str, ...]:
