@@ -229,6 +229,64 @@ def test_categorical_head_can_avoid_blocked_variant(tmp_path):
     assert np.isfinite(res.fqe_value)
 
 
+def test_ope_scores_shielded_policy(tmp_path):
+    """The OPE gate scores the SHIELDED policy: the request_mix veto that runs at
+    serving is applied to the evaluated action (with block features present)."""
+    from ddos_samurai.models.rl import EffectiveThroughputReward
+    from ddos_samurai.models.rl.config import RLConfig
+    from ddos_samurai.models.rl.shield import best_success_from_states, govern_batch
+
+    spec = ActionSpec(("rps", "request_mix"), categorical_names=("request_mix",))
+    cfg = RLConfig(rps_scale=1000.0, variant_block_features=True)
+    ds = build_dataset(
+        _categorical_corpus(tmp_path / "cat.ndjson"),
+        cfg, reward_fn=EffectiveThroughputReward(cfg), action_spec=spec)
+    assert any(n.endswith("_block") for n in ds.feature_names)  # block features exist
+
+    art = train_iql(ds, IQLConfig(steps=500, seed=0))
+
+    shielded = evaluate_policy(ds, art, FQEConfig(steps=300, seed=0))  # default shielded
+    bare = evaluate_policy(ds, art, FQEConfig(steps=300, seed=0, shielded=False))
+    assert shielded.shielded is True and bare.shielded is False
+    assert np.isfinite(shielded.fqe_value) and np.isfinite(bare.fqe_value)
+
+    # Deterministic invariant of the exact warm+govern path OPE feeds through: with a
+    # prior marking variant 0 honored (so an honored option always exists), the shield
+    # must never APPLY a known-blocked variant — every governed choice is honored
+    # (best >= floor) or an unobserved probe (best < 0). This is what --cl-variant-
+    # memory buys at serving; here it rides the same code the FQE actions go through.
+    warm = [0.9, 0.0, 0.0, 0.0, 0.0]
+    col = spec.names.index("request_mix")
+    best = best_success_from_states(ds.states, cfg.request_variant_count)
+    for v, wv in enumerate(warm):
+        if wv >= 0.0:
+            best[:, v] = np.maximum(best[:, v], wv)
+    proposed = np.rint(art.act_batch(ds.states)[:, col]).astype(np.int64)
+    gov = govern_batch(proposed, best, 0.10)
+    chosen = best[np.arange(gov.shape[0]), gov]
+    assert np.all((chosen < 0.0) | (chosen >= 0.10))  # never a known-blocked variant
+
+    # The warm-started evaluation runs and stays finite.
+    warmed = evaluate_policy(ds, art, FQEConfig(steps=200, seed=0), warm_start=warm)
+    assert warmed.shielded is True and np.isfinite(warmed.fqe_value)
+
+
+def test_ope_shield_inert_without_block_features(tmp_path):
+    """No variant-block features -> the shield has no memory to read, so it stays off
+    (shielded=False) even with a request_mix dim; the score is the bare policy's."""
+    from ddos_samurai.models.rl import EffectiveThroughputReward
+    from ddos_samurai.models.rl.config import RLConfig
+
+    spec = ActionSpec(("rps", "request_mix"), categorical_names=("request_mix",))
+    cfg = RLConfig(rps_scale=1000.0)  # variant_block_features=False (default)
+    ds = build_dataset(
+        _categorical_corpus(tmp_path / "cat.ndjson"),
+        cfg, reward_fn=EffectiveThroughputReward(cfg), action_spec=spec)
+    art = train_iql(ds, IQLConfig(steps=200, seed=0))
+    res = evaluate_policy(ds, art, FQEConfig(steps=200, seed=0))  # default shielded=True
+    assert res.shielded is False
+
+
 def test_training_is_deterministic(tmp_path):
     ds = build_dataset(_corpus(tmp_path / "c.ndjson"))
     a1 = train_iql(ds, IQLConfig(steps=200, seed=7))

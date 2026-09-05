@@ -27,6 +27,7 @@ from .policy_artifact import PolicyArtifact
 from .fingerprint import DefenseProfile, fingerprint, fingerprint_corpus
 from .variant_prior import build_variant_prior
 from .reward import EffectiveThroughputReward, RewardFn, SloProgressReward, slo_overshoot
+from .shield import LeverShield
 from .schemas import Action, DefenseSignals, RawState, SloThresholds, Transition
 
 # train_iql (IQL) and evaluate_policy (FQE) live in .train / .ope and require torch;
@@ -52,6 +53,7 @@ __all__ = [
     "fingerprint",
     "fingerprint_corpus",
     "build_variant_prior",
+    "LeverShield",
     "slo_overshoot",
     "build_dataset",
     "Dataset",

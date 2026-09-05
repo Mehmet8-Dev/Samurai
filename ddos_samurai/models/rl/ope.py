@@ -28,6 +28,7 @@ import numpy as np
 
 from .dataset import Dataset
 from .policy_artifact import PolicyArtifact
+from .shield import HONORED_SUCCESS_FLOOR, best_success_from_states, govern_batch
 
 try:
     import torch
@@ -54,6 +55,13 @@ class FQEConfig:
     n_bootstrap: int = 2000
     ci_alpha: float = 0.10       # 90% CI (two-sided) => 5th-percentile lower bound
     pessimistic_gate: bool = True
+    # Score the SHIELDED policy, not the bare one. Serving wraps the policy in the
+    # LeverShield (see shield.py), which vetoes a request_mix variant the target
+    # path-blocks; evaluating the raw policy overstates what actually ships. Applied
+    # only when the corpus carries variant-block features and request_mix is an
+    # action dim; otherwise the shield is inert and this is a no-op.
+    shielded: bool = True
+    shield_honored_floor: float = HONORED_SUCCESS_FLOOR
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,9 @@ class OPEResult:
     # over far more windows than an episode contains, so tune gamma ~ 1 - 1/mean_len.
     effective_horizon: float = 0.0   # 1 / (1 - gamma)
     mean_episode_len: float = 0.0
+    # True when the shield actually governed the evaluated action (block features
+    # present + request_mix action dim). False => the bare policy was scored.
+    shielded: bool = False
 
     @property
     def improvement(self) -> float:
@@ -134,9 +145,51 @@ def _policy_action_norm(artifact: PolicyArtifact, states_raw: np.ndarray,
     return ((act - lo) / span).clip(0.0, 1.0)
 
 
+def _block_variant_count(feature_names: tuple[str, ...]) -> int:
+    """How many request_mix variants the corpus carries block features for (0 if the
+    variant-block feature is off). Counts the trailing ``variant{i}_block`` names."""
+    return sum(1 for n in feature_names
+               if n.startswith("variant") and n.endswith("_block"))
+
+
+def _request_mix_col(dataset: Dataset) -> int:
+    """Index of the request_mix action dim, or -1 if the action space lacks it."""
+    spec = getattr(dataset, "action_spec", None)
+    if spec is None or "request_mix" not in spec.names:
+        return -1
+    return spec.names.index("request_mix")
+
+
+def _shielded_action_norm(artifact: PolicyArtifact, states_raw: np.ndarray,
+                          lo: np.ndarray, hi: np.ndarray, col: int, n_variant: int,
+                          floor: float, warm: np.ndarray | None) -> np.ndarray:
+    """Like ``_policy_action_norm`` but with the LeverShield veto applied to the
+    request_mix column, using each state's own block-feature memory (optionally
+    warm-started from ``warm``) — the action the master actually applies at serving."""
+    act = artifact.act_batch(states_raw)  # (N, A) de-normalized
+    best = best_success_from_states(states_raw, n_variant)  # (N, n) memory snapshot
+    if warm is not None:
+        for v in range(min(warm.shape[0], best.shape[1])):
+            if warm[v] >= 0.0:  # LeverShield::Warm — a known prior raises, never lowers
+                best[:, v] = np.maximum(best[:, v], warm[v])
+    proposed = np.rint(act[:, col]).astype(np.int64)
+    act[:, col] = govern_batch(proposed, best, floor).astype(act.dtype)
+    span = np.where(hi <= lo, 1.0, hi - lo)
+    return ((act - lo) / span).clip(0.0, 1.0)
+
+
 def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
-                    cfg: FQEConfig | None = None) -> OPEResult:
-    """FQE value of ``artifact`` vs the behavior return. Gate = learned >= behavior."""
+                    cfg: FQEConfig | None = None,
+                    warm_start: list[float] | None = None) -> OPEResult:
+    """FQE value of ``artifact`` vs the behavior return. Gate = learned >= behavior.
+
+    By default scores the SHIELDED policy — the raw action passed through the
+    LeverShield veto that runs at serving — so the gate measures what ships, not the
+    bare policy. ``warm_start`` optionally seeds the shield with the per-target
+    fingerprint prior (the ``--cl-variant-memory`` warm start) so the score reflects
+    the exact served configuration. The shield is inert (and this reduces to the bare
+    FQE) when the corpus has no variant-block features or no request_mix action dim.
+    """
     if torch is None:  # pragma: no cover
         raise ImportError("FQE requires torch (pip install -r requirements-ml.txt)")
     cfg = cfg or FQEConfig()
@@ -160,11 +213,24 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
     hi = np.asarray(dataset.action_hi, dtype=np.float32)
     span = np.where(hi <= lo, 1.0, hi - lo)
 
+    # Shield decision: only govern when the corpus carries variant-block features AND
+    # request_mix is a controlled dim; otherwise the shield has nothing to act on.
+    n_variant = _block_variant_count(dataset.feature_names)
+    mix_col = _request_mix_col(dataset)
+    shield_on = cfg.shielded and n_variant > 0 and mix_col >= 0
+    warm = np.asarray(warm_start, dtype=np.float64) if (shield_on and warm_start) else None
+
+    def policy_act(states_raw: np.ndarray) -> np.ndarray:
+        if shield_on:
+            return _shielded_action_norm(artifact, states_raw, lo, hi, mix_col,
+                                         n_variant, cfg.shield_honored_floor, warm)
+        return _policy_action_norm(artifact, states_raw, lo, hi)
+
     S = norm.transform(dataset.states)
     S2 = norm.transform(dataset.next_states)
     A = ((dataset.actions - lo) / span).clip(0.0, 1.0).reshape(-1, a_dim)
-    # Learned policy's action at s' (for the FQE bootstrap) and at initial states.
-    A2_pi = _policy_action_norm(artifact, dataset.next_states, lo, hi)
+    # (Shielded) policy's action at s' (for the FQE bootstrap) and at initial states.
+    A2_pi = policy_act(dataset.next_states)
 
     dev = torch.device("cpu")
     s = torch.tensor(S, dtype=torch.float32, device=dev)
@@ -198,7 +264,7 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
     eids = dataset.episode_ids
     first_idx = [int(np.where(eids == e)[0][0]) for e in np.unique(eids)]
     s0_raw = dataset.states[first_idx]
-    a0 = _policy_action_norm(artifact, s0_raw, lo, hi)
+    a0 = policy_act(s0_raw)
     with torch.no_grad():
         s0 = torch.tensor(norm.transform(s0_raw), dtype=torch.float32, device=dev)
         s0a0 = torch.cat([s0, torch.tensor(a0, dtype=torch.float32, device=dev)], dim=1)
@@ -230,4 +296,5 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
         fqe_ci_high=fqe_hi,
         effective_horizon=eff_h,
         mean_episode_len=mean_len,
+        shielded=shield_on,
     )
