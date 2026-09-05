@@ -34,6 +34,7 @@
 #include "closed_loop.hpp"
 #include "lever_shield.hpp"
 #include "variant_memory.hpp"
+#include "ban_memory.hpp"
 #include "rl_explore.hpp"
 #include "rl_policy.hpp"
 #include "discovery.hpp"
@@ -589,6 +590,27 @@ int main() {
     RlStateInputs lin; lin.rps = 1; lin.max_rps = 1;
     Check(RlPolicy::BuildFeatures(lin).size() == 20, "rl policy: empty block memory -> legacy 20-dim");
 
+    // Persistent-ban features: appended AFTER the block features as [ban_pressure,
+    // ban_known]. Must match the Python dataset layout (build_dataset._encode_ban).
+    RlStateInputs nin;  // ban only, no block -> width 22
+    nin.rps = 500; nin.max_rps = 1000; nin.ban_features = true; nin.ban_pressure = 0.7;
+    auto nf = RlPolicy::BuildFeatures(nin);
+    Check(nf.size() == 22, "rl policy: ban features widen state to 22");
+    Check(std::abs(nf[20] - 0.7f) < 1e-6 && nf[21] == 1.0f, "rl policy: ban_pressure .7, known 1");
+    RlStateInputs uin;  // ban enabled but never observed -> pressure 0, known 0
+    uin.rps = 1; uin.max_rps = 1; uin.ban_features = true;  // ban_pressure default -1
+    auto uf = RlPolicy::BuildFeatures(uin);
+    Check(uf.size() == 22 && uf[20] == 0.0f && uf[21] == 0.0f,
+          "rl policy: unobserved ban -> pressure 0, known 0");
+    // Block + ban together: ban trails the block bits (width 20 + 2V + 2 = 32).
+    RlStateInputs cin;
+    cin.rps = 500; cin.max_rps = 1000;
+    cin.variant_block_success = {-1.0, 0.9, -1.0, 0.05, -1.0};
+    cin.ban_features = true; cin.ban_pressure = 0.4;
+    auto cf = RlPolicy::BuildFeatures(cin);
+    Check(cf.size() == 32, "rl policy: block+ban widen state to 32");
+    Check(std::abs(cf[30] - 0.4f) < 1e-6 && cf[31] == 1.0f, "rl policy: ban trails block bits");
+
     // Multi-dim (Mahoraga) action: 2-in -> 2-out identity, per-dim bounds
     // rps in [100,1100], concurrency in [1,65]. input [0.5,0.25] -> [600,17].
     std::string m = "SRLP";
@@ -762,6 +784,30 @@ int main() {
     Check(back.size() == 2 && back.Get("10.0.0.2:443").size() == 1,
           "variant memory: Put replaces in place");
     std::remove(mpath.c_str());
+  }
+
+  // --- Ban memory: per-target scalar ban_pressure round-trips through JSON on disk ---
+  {
+    using namespace samurai::control;
+    const std::string bpath = "/tmp/samurai_selftest_ban_mem.json";
+    std::remove(bpath.c_str());
+
+    Check(BanMemory::Load(bpath).size() == 0, "ban memory: missing file -> empty store");
+    Check(BanMemory::Load(bpath).Get("x:1") < 0.0, "ban memory: unknown target -> -1");
+
+    BanMemory bmem;
+    bmem.Put("10.0.0.1:8080", 0.73);
+    bmem.Put("10.0.0.2:443", 0.0);
+    Check(bmem.Save(bpath), "ban memory: save to disk");
+
+    BanMemory bback = BanMemory::Load(bpath);
+    Check(bback.size() == 2, "ban memory: both targets reloaded");
+    Check(std::abs(bback.Get("10.0.0.1:8080") - 0.73) < 1e-9, "ban memory: pressure round-trips");
+    Check(bback.Get("10.0.0.2:443") == 0.0, "ban memory: zero pressure round-trips");
+    bback.Put("10.0.0.2:443", 0.5);
+    Check(bback.size() == 2 && std::abs(bback.Get("10.0.0.2:443") - 0.5) < 1e-9,
+          "ban memory: Put replaces in place");
+    std::remove(bpath.c_str());
   }
 
   // --- sut probe: Prometheus /api/v1/query response parsing ---

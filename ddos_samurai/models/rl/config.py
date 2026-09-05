@@ -57,6 +57,19 @@ class RLConfig:
     variant_block_features: bool = False
     request_variant_count: int = 5  # categorical cardinality of request_mix
 
+    # Persistent-defense (ban) state: expose a cross-window "ban pressure" signal so
+    # the policy can condition on a fail2ban/IPS ban that PERSISTS — the single-window
+    # conn_drop_ratio can't distinguish a transient drop from a sustained ban that
+    # carries across episodes (the union-corpus non-stationarity). ban_pressure is a
+    # causal EWMA of conn_drop_ratio (persistence-weighted: a one-window spike decays,
+    # a sustained ban stays elevated), appended after the block features as two dims:
+    # ban_pressure (imputed 0 if never observed) and a companion ban_known bit. Like
+    # the block memory it resets per episode and, at serving, is warm-started from the
+    # per-target persistent store — identical semantics either way. ban_ewma_alpha is
+    # the smoothing weight; the C++ serving path (rl_policy) must use the same value.
+    ban_state_features: bool = False
+    ban_ewma_alpha: float = 0.5
+
     # Reward shaping.
     lambda_slo: float = 2.0
     step_cost: float = 0.02
@@ -90,8 +103,8 @@ class RLConfig:
 
     @property
     def state_dim(self) -> int:
-        """Full policy input width: the extractor output plus the block features."""
-        return self.feature_count + self.block_feature_count
+        """Full policy input width: extractor output + block features + ban features."""
+        return self.feature_count + self.block_feature_count + self.ban_feature_count
 
     @property
     def block_feature_count(self) -> int:
@@ -108,6 +121,17 @@ class RLConfig:
         return tuple(f"variant{i}_block" for i in range(v)) + tuple(
             f"variant{i}_known" for i in range(v)
         )
+
+    @property
+    def ban_feature_count(self) -> int:
+        """Extra state dims from the persistent-ban memory (ban_pressure + known bit),
+        0 when disabled. Appended AFTER the block features so old (block-only or
+        legacy) policies keep their exact input width."""
+        return 2 if self.ban_state_features else 0
+
+    def ban_feature_names(self) -> tuple[str, ...]:
+        """Names for the appended ban features, in wire order: pressure then known."""
+        return ("ban_pressure", "ban_known") if self.ban_state_features else ()
 
     @property
     def maskable_features(self) -> tuple[str, ...]:

@@ -69,6 +69,12 @@ if [[ -n "$RL_POLICY" ]]; then
 	if [[ -n "${VARIANT_MEMORY:-}" ]]; then
 		SERVE_ARGS+=(--cl-variant-memory "$VARIANT_MEMORY")
 	fi
+	# BAN_MEMORY: persist/warm-start the per-target persistent-ban pressure across
+	# runs (a ban-aware policy, in_dim +2). A run against an already-banned target
+	# starts armed instead of re-folding the ban from zero.
+	if [[ -n "${BAN_MEMORY:-}" ]]; then
+		SERVE_ARGS+=(--cl-ban-memory "$BAN_MEMORY")
+	fi
 fi
 
 echo ">> defense profile: $WAF_PROFILE"

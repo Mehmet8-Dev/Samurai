@@ -202,6 +202,14 @@ std::vector<float> RlPolicy::BuildFeatures(const RlStateInputs& in) {
   const std::vector<double>& blk = in.variant_block_success;
   for (double b : blk) f.push_back(b >= 0.0 ? static_cast<float>(1.0 - b) : 0.0f);
   for (double b : blk) f.push_back(b >= 0.0 ? 1.0f : 0.0f);
+
+  // Persistent-ban features (appended after the block features, matching the Python
+  // dataset layout): [ban_pressure, ban_known]. pressure < 0 => never observed =>
+  // imputed 0, known bit 0.
+  if (in.ban_features) {
+    f.push_back(in.ban_pressure >= 0.0 ? static_cast<float>(in.ban_pressure) : 0.0f);
+    f.push_back(in.ban_pressure >= 0.0 ? 1.0f : 0.0f);
+  }
   return f;
 }
 

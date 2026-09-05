@@ -22,6 +22,7 @@
 #include "closed_loop.hpp"
 #include "lever_shield.hpp"
 #include "variant_memory.hpp"
+#include "ban_memory.hpp"
 #include "rl_explore.hpp"
 #include "rl_policy.hpp"
 #include "control_auth.hpp"
@@ -568,6 +569,10 @@ void Usage(const char* argv0) {
       "  --cl-variant-memory FILE  persist per-target block memory (JSON) across runs:\n"
       "                            warm-start the shield + block state feature from what\n"
       "                            a prior run learned about this target (default off)\n"
+      "  --cl-ban-memory FILE      persist per-target ban pressure (JSON) across runs:\n"
+      "                            warm-start the persistent-ban state feature so a run\n"
+      "                            against an already-banned target starts armed (a\n"
+      "                            ban-aware policy, in_dim +2; default off)\n"
       "  --rl-explore              perturb the shaping levers (concurrency/\n"
       "                            request_mix/source_rotation/pacing_mode) per\n"
       "                            window during --rl-corpus capture so they vary\n"
@@ -1133,8 +1138,17 @@ int main(int argc, char** argv) {
         // just the safety net). Keep the memory whenever serving, independent of the
         // veto toggle, so an A/B run with the veto off still populates the feature.
         constexpr int kBaseFeatures = 20;
+        // Decode which extra state features the loaded policy was trained on from its
+        // input width: block adds 2*V dims, ban adds 2, and they compose. (V defaults
+        // to 5 so 2*V != 2; a custom --cl-lever-variants 1 would be ambiguous.)
+        constexpr int kBanFeatures = 2;
+        const int rl_extra = rl_policy.loaded() ? rl_policy.input_dim() - kBaseFeatures : 0;
         const bool block_state_on =
-            rl_policy.loaded() && rl_policy.input_dim() == kBaseFeatures + 2 * variant_count;
+            rl_policy.loaded() &&
+            (rl_extra == 2 * variant_count || rl_extra == 2 * variant_count + kBanFeatures);
+        const bool ban_state_on =
+            rl_policy.loaded() &&
+            (rl_extra == kBanFeatures || rl_extra == 2 * variant_count + kBanFeatures);
         const bool track_variants = rl_policy.loaded();  // Observe/snapshot while serving
         // Cross-episode persistence: warm-start the memory from what a prior run
         // learned about THIS target, and write it back so the next run starts armed.
@@ -1154,6 +1168,27 @@ int main(int argc, char** argv) {
         if (block_state_on) {
           std::printf("samurai_master: path-aware block state on (in_dim=%d) — policy "
                       "conditions on the per-variant block memory\n",
+                      rl_policy.input_dim());
+        }
+        // Persistent-ban state: a causal EWMA of conn_drop folded across windows, so a
+        // ban-aware policy conditions on a fail2ban/IPS ban that persists. Warm-started
+        // (and persisted) per target like the variant memory, so a fresh run against an
+        // already-banned target does not restart from "no ban known".
+        const std::string ban_mem_path = Opt(argc, argv, "--cl-ban-memory", "");
+        samurai::control::BanMemory ban_mem;
+        double ban_ewma = -1.0;  // -1 = no conn_drop folded yet
+        if (ban_state_on && !ban_mem_path.empty()) {
+          ban_mem = samurai::control::BanMemory::Load(ban_mem_path);
+          const double warm = ban_mem.Get(target_key);
+          if (warm >= 0.0) {
+            ban_ewma = warm;
+            std::printf("samurai_master: ban memory warm-started for %s (pressure=%.3f)\n",
+                        target_key.c_str(), warm);
+          }
+        }
+        if (ban_state_on) {
+          std::printf("samurai_master: persistent-ban state on (in_dim=%d) — policy "
+                      "conditions on the folded conn_drop ban pressure\n",
                       rl_policy.input_dim());
         }
         bool rl_have_prev = false;
@@ -1276,6 +1311,20 @@ int main(int argc, char** argv) {
             // this window's Observe, matching the corpus's causal block-after-window
             // semantics) so BuildFeatures appends the block features it was trained on.
             if (block_state_on) rin.variant_block_success = lever_shield.snapshot();
+            // Persistent-ban: fold THIS window's conn_drop into the running EWMA (same
+            // causal, after-window semantics as the block memory) and hand it to the
+            // policy. kBanEwmaAlpha must match the Python RLConfig.ban_ewma_alpha.
+            if (ban_state_on) {
+              const double cd = rin.conn_drop_ratio;
+              if (cd >= 0.0) {
+                ban_ewma = (ban_ewma < 0.0)
+                               ? cd
+                               : samurai::control::kBanEwmaAlpha * cd +
+                                     (1.0 - samurai::control::kBanEwmaAlpha) * ban_ewma;
+              }
+              rin.ban_features = true;
+              rin.ban_pressure = ban_ewma;
+            }
             const std::vector<double> action = rl_policy.ProposeFor(rin);
             if (!action.empty()) {
               sample.rl_action_rps = action[0];  // dim 0 = rps -> shield
@@ -1319,6 +1368,17 @@ int main(int argc, char** argv) {
           } else {
             std::printf("samurai_master: variant memory saved for %s -> %s\n",
                         target_key.c_str(), variant_mem_path.c_str());
+          }
+        }
+        // Persist the folded ban pressure so the next run warm-starts armed.
+        if (ban_state_on && !ban_mem_path.empty() && ban_ewma >= 0.0) {
+          ban_mem.Put(target_key, ban_ewma);
+          if (!ban_mem.Save(ban_mem_path)) {
+            std::fprintf(stderr, "samurai_master: could not persist ban memory to %s\n",
+                         ban_mem_path.c_str());
+          } else {
+            std::printf("samurai_master: ban memory saved for %s -> %s (pressure=%.3f)\n",
+                        target_key.c_str(), ban_mem_path.c_str(), ban_ewma);
           }
         }
         Value clsummary = Value::Object();

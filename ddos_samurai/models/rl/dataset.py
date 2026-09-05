@@ -127,6 +127,8 @@ def build_dataset(
     # LeverShield memory, so the exported feature layout matches BuildFeatures.
     use_block = cfg.variant_block_features
     n_variant = cfg.request_variant_count
+    use_ban = cfg.ban_state_features
+    ban_alpha = cfg.ban_ewma_alpha
 
     def _encode_block(best: list[float]) -> np.ndarray:
         # [block ratios..., known bits...]: ratio = 1 - best (impute 0 if unseen),
@@ -137,9 +139,23 @@ def build_dataset(
         known = [1.0 if b >= 0.0 else 0.0 for b in best]
         return np.asarray(ratios + known, dtype=np.float32)
 
+    def _encode_ban(ewma: float) -> np.ndarray:
+        # [ban_pressure, ban_known]: pressure = the folded EWMA (impute 0 if never
+        # observed), known = 1 once a conn_drop sample has folded in this episode.
+        pressure = ewma if ewma >= 0.0 else cfg.impute_value
+        return np.asarray([pressure, 1.0 if ewma >= 0.0 else 0.0], dtype=np.float32)
+
+    def _fold_ban(ewma: float, conn_drop: float) -> float:
+        # Persistence-weighted EWMA of conn_drop: a sustained ban stays elevated, a
+        # transient one-window drop decays. Unknown (<0) conn_drop leaves it as-is.
+        if conn_drop < 0.0:
+            return ewma
+        return conn_drop if ewma < 0.0 else ban_alpha * conn_drop + (1.0 - ban_alpha) * ewma
+
     for eid, (run_id, eps) in enumerate(sorted(episodes.items())):
         kept = [t for t in eps if _keep(t, cfg)]
         best_success = [-1.0] * n_variant  # -1 = variant unobserved this episode
+        ban_ewma = -1.0  # -1 = no conn_drop sample folded yet this episode
         for i, t in enumerate(kept):
             s_vec = extractor.state_vector(t.s, t)
             s2_vec = extractor.state_vector(t.s2, t)
@@ -155,6 +171,14 @@ def build_dataset(
                 s2_block = _encode_block(best_success)
                 s_vec = np.concatenate([s_vec, s_block])
                 s2_vec = np.concatenate([s2_vec, s2_block])
+            if use_ban:
+                # Same causal fold as the block memory, but a single EWMA of the
+                # flow-level conn_drop reaction. Appended AFTER the block features.
+                s_ban = _encode_ban(ban_ewma)
+                ban_ewma = _fold_ban(ban_ewma, t.s2.defense.conn_drop_ratio)
+                s2_ban = _encode_ban(ban_ewma)
+                s_vec = np.concatenate([s_vec, s_ban])
+                s2_vec = np.concatenate([s2_vec, s2_ban])
             s_list.append(s_vec)
             s2_list.append(s2_vec)
             a_list.append([t.action.value(action_spec.field_of(n)) for n in action_spec.names])
@@ -164,7 +188,8 @@ def build_dataset(
             done_list.append(1.0 if (t.done or i == len(kept) - 1) else 0.0)
             eid_list.append(eid)
 
-    dim = extractor.dim + (cfg.block_feature_count if use_block else 0)
+    dim = (extractor.dim + (cfg.block_feature_count if use_block else 0)
+           + (cfg.ban_feature_count if use_ban else 0))
     a_dim = action_spec.dim
     if s_list:
         states = np.stack(s_list).astype(np.float32)
@@ -215,7 +240,8 @@ def build_dataset(
         episode_ids=np.asarray(eid_list, dtype=np.int64),
         feature_names=tuple(cfg.feature_names)
         + (tuple(f"{n}_known" for n in cfg.maskable_features) if cfg.mask_unknown else ())
-        + (cfg.block_feature_names() if use_block else ()),
+        + (cfg.block_feature_names() if use_block else ())
+        + (cfg.ban_feature_names() if use_ban else ()),
         normalizer=Normalizer.fit(states) if len(states) else Normalizer(
             mean=np.zeros(dim, dtype=np.float32), std=np.ones(dim, dtype=np.float32)
         ),

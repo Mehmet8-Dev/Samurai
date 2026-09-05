@@ -51,7 +51,17 @@ struct RlStateInputs {
   // 0 if unobserved) then a known bit — matching dataset.build_dataset's layout.
   // Empty => legacy 20-dim state (no block features), so old policies still load.
   std::vector<double> variant_block_success;
+  // Persistent-defense (ban) state (RLConfig.ban_state_features). When ban_features
+  // is set, BuildFeatures appends 2 features AFTER the block features: ban_pressure
+  // (a causal EWMA of conn_drop, imputed 0 if never observed) then a ban_known bit.
+  // ban_pressure < 0 means "no conn_drop folded yet" (known bit 0). Off by default so
+  // block-only / legacy policies keep their exact width.
+  bool ban_features = false;
+  double ban_pressure = -1.0;
 };
+
+// EWMA smoothing for ban_pressure — MUST match RLConfig.ban_ewma_alpha (Python).
+inline constexpr double kBanEwmaAlpha = 0.5;
 
 class RlPolicy {
  public:
@@ -76,6 +86,8 @@ class RlPolicy {
   //   [20..20+V-1]     variant block ratios (1-best success, 0 if unobserved)
   //   [20+V..20+2V-1]  variant known bits   (present only when in.variant_block_success
   //                    is non-empty; V == in.variant_block_success.size()).
+  //   [.. , ..+1]      ban_pressure, ban_known (present only when in.ban_features;
+  //                    appended AFTER the block features, matching the Python layout).
   static std::vector<float> BuildFeatures(const RlStateInputs& in);
 
   // Forward pass on a raw feature vector -> the full (action_dim) de-normalized
