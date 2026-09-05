@@ -48,6 +48,19 @@ if [[ "$RL_EXPLORE" == "1" ]]; then
 	EXPLORE_ARGS=(--rl-explore --rl-explore-seed "$RL_EXPLORE_SEED")
 fi
 
+# Serving mode: point at a trained SRLP policy to run kRl (RL proposes, shields
+# dispose). RL_POLICY sets --rl-policy; LEVER_SHIELD (0|1) toggles the online
+# request_mix veto. Setting RL_POLICY also forces CL_STRATEGY=rl.
+RL_POLICY="${RL_POLICY:-}"
+SERVE_ARGS=()
+if [[ -n "$RL_POLICY" ]]; then
+	CL_STRATEGY="rl"
+	SERVE_ARGS=(--rl-policy "$RL_POLICY")
+	if [[ -n "${LEVER_SHIELD:-}" ]]; then
+		SERVE_ARGS+=(--cl-lever-shield "$LEVER_SHIELD")
+	fi
+fi
+
 echo ">> defense profile: $WAF_PROFILE"
 # Optionally (re)create the rate-limit + WAF tier for this profile. nginx re-reads
 # its config on recreate; caddy picks up the profile's waf-rules.conf bind-mount.
@@ -87,6 +100,7 @@ echo ">> starting master (closed-loop); corpus -> $CORPUS"
 	--cl-aimd-max-windows "$CL_AIMD_MAX_WINDOWS" \
 	--cl-aimd-increase-rps "$CL_AIMD_INCREASE_RPS" \
 	"${EXPLORE_ARGS[@]}" \
+	"${SERVE_ARGS[@]}" \
 	--rl-corpus "$CORPUS" >/tmp/samurai-lab-master.log 2>&1 &
 MASTER_PID=$!
 SLAVE_PID=""
