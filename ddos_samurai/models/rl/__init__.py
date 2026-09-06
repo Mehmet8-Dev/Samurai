@@ -26,6 +26,13 @@ from .export import load_policy, save_policy
 from .policy_artifact import PolicyArtifact
 from .fingerprint import DefenseProfile, fingerprint, fingerprint_corpus
 from .variant_prior import build_variant_prior
+from .generalize import (
+    GeneralizationResult,
+    FoldResult,
+    group_by_profile,
+    leave_one_profile_out,
+    profile_of,
+)
 from .reward import EffectiveThroughputReward, RewardFn, SloProgressReward, slo_overshoot
 from .shield import LeverShield
 from .schemas import Action, DefenseSignals, RawState, SloThresholds, Transition
@@ -53,6 +60,11 @@ __all__ = [
     "fingerprint",
     "fingerprint_corpus",
     "build_variant_prior",
+    "profile_of",
+    "group_by_profile",
+    "leave_one_profile_out",
+    "GeneralizationResult",
+    "FoldResult",
     "LeverShield",
     "slo_overshoot",
     "build_dataset",
