@@ -178,6 +178,39 @@ def _shielded_action_norm(artifact: PolicyArtifact, states_raw: np.ndarray,
     return ((act - lo) / span).clip(0.0, 1.0)
 
 
+def _episode_slices(episode_ids: np.ndarray) -> list[tuple[int, int]]:
+    """Contiguous [start, end) ranges per episode (built in-order by the dataset)."""
+    slices: list[tuple[int, int]] = []
+    if episode_ids.size == 0:
+        return slices
+    start = 0
+    for i in range(1, len(episode_ids)):
+        if episode_ids[i] != episode_ids[i - 1]:
+            slices.append((start, i))
+            start = i
+    slices.append((start, len(episode_ids)))
+    return slices
+
+
+def _recurrent_actions_norm(artifact: PolicyArtifact, dataset: Dataset,
+                            lo: np.ndarray, hi: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Policy actions at (s, s') for every transition, in the [0,1] space Q is fit on,
+    computed by rolling the recurrent policy per episode with the logged trajectory as
+    context — exactly the history the serving loop would have observed."""
+    span = np.where(hi <= lo, 1.0, hi - lo)
+    a_dim = dataset.action_dim
+    A = ((dataset.actions - lo) / span).clip(0.0, 1.0).reshape(-1, a_dim)
+    n = dataset.states.shape[0]
+    a_s = np.zeros((n, a_dim), dtype=np.float32)
+    a_s2 = np.zeros((n, a_dim), dtype=np.float32)
+    for b0, e0 in _episode_slices(dataset.episode_ids):
+        act_s, act_s2 = artifact.act_sequence(
+            dataset.states[b0:e0], A[b0:e0], next_states_raw=dataset.next_states[b0:e0])
+        a_s[b0:e0] = ((act_s - lo) / span).clip(0.0, 1.0)
+        a_s2[b0:e0] = ((act_s2 - lo) / span).clip(0.0, 1.0)
+    return a_s, a_s2
+
+
 def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
                     cfg: FQEConfig | None = None,
                     warm_start: list[float] | None = None) -> OPEResult:
@@ -220,6 +253,15 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
     shield_on = cfg.shielded and n_variant > 0 and mix_col >= 0
     warm = np.asarray(warm_start, dtype=np.float64) if (shield_on and warm_start) else None
 
+    # Recurrent (RL²) policies carry episode context, so their action at a state
+    # depends on the trajectory so far — scored by a per-episode rollout rather than
+    # a stateless per-row forward. RL² datasets have no block features, so the shield
+    # is inert here; the bare recurrent rollout is what ships.
+    recurrent = getattr(artifact, "recurrent", False)
+    rec_a_s = rec_a_s2 = None
+    if recurrent:
+        rec_a_s, rec_a_s2 = _recurrent_actions_norm(artifact, dataset, lo, hi)
+
     def policy_act(states_raw: np.ndarray) -> np.ndarray:
         if shield_on:
             return _shielded_action_norm(artifact, states_raw, lo, hi, mix_col,
@@ -230,7 +272,7 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
     S2 = norm.transform(dataset.next_states)
     A = ((dataset.actions - lo) / span).clip(0.0, 1.0).reshape(-1, a_dim)
     # (Shielded) policy's action at s' (for the FQE bootstrap) and at initial states.
-    A2_pi = policy_act(dataset.next_states)
+    A2_pi = rec_a_s2 if recurrent else policy_act(dataset.next_states)
 
     dev = torch.device("cpu")
     s = torch.tensor(S, dtype=torch.float32, device=dev)
@@ -264,7 +306,9 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
     eids = dataset.episode_ids
     first_idx = [int(np.where(eids == e)[0][0]) for e in np.unique(eids)]
     s0_raw = dataset.states[first_idx]
-    a0 = policy_act(s0_raw)
+    # A recurrent policy's initial-state action is its first-window action (zero
+    # context), which is exactly rec_a_s at each episode's first index.
+    a0 = rec_a_s[first_idx] if recurrent else policy_act(s0_raw)
     with torch.no_grad():
         s0 = torch.tensor(norm.transform(s0_raw), dtype=torch.float32, device=dev)
         s0a0 = torch.cat([s0, torch.tensor(a0, dtype=torch.float32, device=dev)], dim=1)

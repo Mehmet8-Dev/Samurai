@@ -1,6 +1,7 @@
 #include "rl_policy.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 
@@ -50,6 +51,14 @@ bool RlPolicy::Load(const std::string& path, std::string* err) {
   norm_mean_.clear();
   norm_std_.clear();
   dims_.clear();
+  recurrent_ = false;
+  state_dim_ = hidden_dim_ = token_dim_ = 0;
+  gru_w_ih_.clear();
+  gru_w_hh_.clear();
+  gru_b_ih_.clear();
+  gru_b_hh_.clear();
+  hidden_.clear();
+  prev_token_.clear();
 
   std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f.is_open()) {
@@ -71,6 +80,105 @@ bool RlPolicy::Load(const std::string& path, std::string* err) {
   }
   r.off = 4;
   const std::uint32_t version = r.u32();
+
+  // SRLP v4 (RL² recurrent) has a distinct top-level layout — a GRU context encoder
+  // before the MLP, and a state-only normalizer. Parse it here; v2/v3 fall through.
+  if (version == 4) {
+    const std::uint32_t state_dim = r.u32();
+    const std::uint32_t hidden = r.u32();
+    const std::uint32_t a_dim = r.u32();
+    if (!r.ok || state_dim == 0 || hidden == 0 || hidden > 4096 || a_dim == 0 ||
+        a_dim > 64) {
+      if (err) *err = "corrupt v4 header";
+      return false;
+    }
+    const std::uint32_t token = state_dim + a_dim;
+    r.floats(gru_w_ih_, static_cast<std::size_t>(3) * hidden * token);
+    r.floats(gru_w_hh_, static_cast<std::size_t>(3) * hidden * hidden);
+    r.floats(gru_b_ih_, static_cast<std::size_t>(3) * hidden);
+    r.floats(gru_b_hh_, static_cast<std::size_t>(3) * hidden);
+    if (!r.ok) {
+      if (err) *err = "truncated GRU weights";
+      return false;
+    }
+    const std::uint32_t n_layers = r.u32();
+    if (!r.ok || n_layers == 0 || n_layers > 64) {
+      if (err) *err = "corrupt v4 header (layers)";
+      return false;
+    }
+    std::vector<std::uint32_t> out_dims(n_layers);
+    for (std::uint32_t i = 0; i < n_layers; ++i) out_dims[i] = r.u32();
+    std::uint32_t prev = state_dim + hidden;  // first MLP layer consumes [state, hidden]
+    layers_.reserve(n_layers);
+    for (std::uint32_t i = 0; i < n_layers; ++i) {
+      Layer L;
+      L.in_dim = static_cast<int>(prev);
+      L.out_dim = static_cast<int>(out_dims[i]);
+      r.floats(L.w, static_cast<std::size_t>(out_dims[i]) * prev);
+      r.floats(L.b, out_dims[i]);
+      if (!r.ok) {
+        if (err) *err = "truncated weights";
+        return false;
+      }
+      layers_.push_back(std::move(L));
+      prev = out_dims[i];
+    }
+    r.floats(norm_mean_, state_dim);
+    r.floats(norm_std_, state_dim);
+    if (!r.ok) {
+      if (err) *err = "truncated normalizer";
+      return false;
+    }
+    const std::uint32_t out_width = out_dims.back();
+    dims_.resize(a_dim);
+    int off_out = 0;
+    for (std::uint32_t k = 0; k < a_dim; ++k) {
+      const std::uint32_t kind = r.u32();
+      DimHead& d = dims_[k];
+      d.out_offset = off_out;
+      if (kind == 1) {  // categorical
+        const std::uint32_t n_cat = r.u32();
+        if (!r.ok || n_cat == 0 || n_cat > 4096) {
+          if (err) *err = "bad categorical head";
+          return false;
+        }
+        d.categorical = true;
+        r.floats(d.cats, n_cat);
+        // Per-dim [lo, hi] = category range, so NormalizeAction rebuilds the training
+        // token action exactly (A = (value - lo)/span).
+        if (!d.cats.empty()) {
+          d.lo = *std::min_element(d.cats.begin(), d.cats.end());
+          d.hi = *std::max_element(d.cats.begin(), d.cats.end());
+          if (d.hi <= d.lo) d.hi = d.lo + 1.0f;
+        }
+        off_out += static_cast<int>(n_cat);
+      } else {  // continuous
+        d.categorical = false;
+        d.lo = r.f32();
+        d.hi = r.f32();
+        off_out += 1;
+      }
+      if (!r.ok) {
+        if (err) *err = "truncated v4 action footer";
+        return false;
+      }
+    }
+    if (off_out != static_cast<int>(out_width)) {
+      if (err) *err = "v4 head widths do not sum to the output layer width";
+      return false;
+    }
+    recurrent_ = true;
+    state_dim_ = static_cast<int>(state_dim);
+    hidden_dim_ = static_cast<int>(hidden);
+    token_dim_ = static_cast<int>(token);
+    in_dim_ = static_cast<int>(state_dim + hidden);
+    action_dim_ = static_cast<int>(a_dim);
+    output_width_ = static_cast<int>(out_width);
+    ResetContext();
+    loaded_ = true;
+    return true;
+  }
+
   if (version != 2 && version != 3) {
     if (err) *err = "unsupported SRLP version";
     return false;
@@ -163,6 +271,7 @@ bool RlPolicy::Load(const std::string& path, std::string* err) {
   }
 
   in_dim_ = static_cast<int>(in_dim);
+  state_dim_ = in_dim_;  // feedforward: state IS the full MLP input (no GRU hidden)
   action_dim_ = static_cast<int>(action_dim);
   output_width_ = static_cast<int>(out_width);
   loaded_ = true;
@@ -213,15 +322,17 @@ std::vector<float> RlPolicy::BuildFeatures(const RlStateInputs& in) {
   return f;
 }
 
-std::vector<double> RlPolicy::Propose(const std::vector<float>& features) const {
-  if (!loaded_ || static_cast<int>(features.size()) != in_dim_) return {};
-
-  // Standardize.
+std::vector<float> RlPolicy::Standardize(const std::vector<float>& features) const {
   std::vector<float> x(features.size());
   for (std::size_t i = 0; i < features.size(); ++i) {
     const float sd = (norm_std_[i] == 0.0f) ? 1.0f : norm_std_[i];
     x[i] = (features[i] - norm_mean_[i]) / sd;
   }
+  return x;
+}
+
+std::vector<double> RlPolicy::ForwardDecode(const std::vector<float>& mlp_input) const {
+  std::vector<float> x = mlp_input;
 
   // Dense layers: ReLU on all but the last.
   for (std::size_t li = 0; li < layers_.size(); ++li) {
@@ -259,6 +370,84 @@ std::vector<double> RlPolicy::Propose(const std::vector<float>& features) const 
     }
   }
   return action;
+}
+
+std::vector<double> RlPolicy::Propose(const std::vector<float>& features) const {
+  if (!loaded_ || static_cast<int>(features.size()) != state_dim_) return {};
+  std::vector<float> z = Standardize(features);
+  // A recurrent policy scored context-free (isolated first window): append zero hidden.
+  if (recurrent_) z.resize(static_cast<std::size_t>(state_dim_ + hidden_dim_), 0.0f);
+  return ForwardDecode(z);
+}
+
+std::vector<float> RlPolicy::NormalizeAction(const std::vector<double>& action) const {
+  std::vector<float> out(action_dim_, 0.0f);
+  for (int k = 0; k < action_dim_ && k < static_cast<int>(action.size()); ++k) {
+    const DimHead& d = dims_[k];
+    const double span = (d.hi <= d.lo) ? 1.0 : (static_cast<double>(d.hi) - d.lo);
+    double f = (action[k] - d.lo) / span;
+    if (f < 0.0) f = 0.0;
+    if (f > 1.0) f = 1.0;
+    out[k] = static_cast<float>(f);
+  }
+  return out;
+}
+
+std::vector<float> RlPolicy::GruStep(const std::vector<float>& h,
+                                     const std::vector<float>& token) const {
+  const int H = hidden_dim_;
+  const int T = token_dim_;
+  std::vector<float> gi(static_cast<std::size_t>(3) * H);
+  std::vector<float> gh(static_cast<std::size_t>(3) * H);
+  for (int o = 0; o < 3 * H; ++o) {
+    float acc = gru_b_ih_[o];
+    const float* wr = gru_w_ih_.data() + static_cast<std::size_t>(o) * T;
+    for (int i = 0; i < T; ++i) acc += wr[i] * token[i];
+    gi[o] = acc;
+  }
+  for (int o = 0; o < 3 * H; ++o) {
+    float acc = gru_b_hh_[o];
+    const float* wr = gru_w_hh_.data() + static_cast<std::size_t>(o) * H;
+    for (int i = 0; i < H; ++i) acc += wr[i] * h[i];
+    gh[o] = acc;
+  }
+  // torch.nn.GRUCell, gate order (reset, update, new):
+  //   r = σ(gi_r + gh_r), z = σ(gi_z + gh_z), n = tanh(gi_n + r*gh_n)
+  //   h' = (1-z)*n + z*h
+  std::vector<float> hn(H);
+  for (int j = 0; j < H; ++j) {
+    const float rr = 1.0f / (1.0f + std::exp(-(gi[j] + gh[j])));
+    const float zz = 1.0f / (1.0f + std::exp(-(gi[H + j] + gh[H + j])));
+    const float nn = std::tanh(gi[2 * H + j] + rr * gh[2 * H + j]);
+    hn[j] = (1.0f - zz) * nn + zz * h[j];
+  }
+  return hn;
+}
+
+std::vector<double> RlPolicy::ProposeFor(const RlStateInputs& in) {
+  const std::vector<float> feats = BuildFeatures(in);
+  if (!recurrent_) return Propose(feats);
+  if (!loaded_ || static_cast<int>(feats.size()) != state_dim_) return {};
+
+  std::vector<float> z = Standardize(feats);
+  // Advance the carried hidden state with the previous window's token (nothing to
+  // fold on the first window of the episode; hidden stays zero there).
+  if (!prev_token_.empty()) hidden_ = GruStep(hidden_, prev_token_);
+  // MLP head consumes [standardized state, hidden].
+  std::vector<float> mlp_in = z;
+  mlp_in.insert(mlp_in.end(), hidden_.begin(), hidden_.end());
+  const std::vector<double> action = ForwardDecode(mlp_in);
+  // Remember this window's token = [standardized state, normalized action] to fold
+  // on the next call (mirrors PolicyArtifact.act_sequence's token construction).
+  const std::vector<float> anorm = NormalizeAction(action);
+  prev_token_ = std::move(z);
+  prev_token_.insert(prev_token_.end(), anorm.begin(), anorm.end());
+  return action;
+}
+
+void RlPolicy::ResetContext() {
+  hidden_.assign(static_cast<std::size_t>(hidden_dim_), 0.0f);
+  prev_token_.clear();
 }
 
 }  // namespace samurai::control

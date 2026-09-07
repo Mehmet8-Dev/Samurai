@@ -75,6 +75,24 @@ class RlPolicy {
   int input_dim() const { return in_dim_; }
   int action_dim() const { return action_dim_; }
 
+  // Whether this is an RL² recurrent policy (SRLP v4): the GRU context encoder runs
+  // once per window and its hidden state is carried across the episode, so the same
+  // frozen weights adapt as the trajectory unfolds.
+  bool recurrent() const { return recurrent_; }
+
+  // Normalized state feature width — the number of features BuildFeatures must emit
+  // and the length of the exported normalizer. For a feedforward policy this equals
+  // input_dim(); for a recurrent policy the MLP input is [state, hidden] so
+  // input_dim() == state_dim() + hidden_dim(). The caller decodes which extra
+  // (block/ban) features a feedforward policy wants from state_dim(), NOT input_dim().
+  int state_dim() const { return recurrent_ ? state_dim_ : in_dim_; }
+  int hidden_dim() const { return hidden_dim_; }
+
+  // Reset the recurrent context to the start of an episode (hidden state -> 0, no
+  // prior token). A no-op on a feedforward policy. Call before the first ProposeFor
+  // of a new closed-loop run.
+  void ResetContext();
+
   // Build the ordered raw feature vector from state inputs. The ordering is fixed
   // and MUST match ddos_samurai/models/rl RLConfig.feature_names + the mask bits:
   //   [0] rps_norm  [1] error_pct  [2] loss_pct  [3] rate_accuracy_pct
@@ -90,18 +108,32 @@ class RlPolicy {
   //                    appended AFTER the block features, matching the Python layout).
   static std::vector<float> BuildFeatures(const RlStateInputs& in);
 
-  // Forward pass on a raw feature vector -> the full (action_dim) de-normalized
-  // action vector. Mirrors PolicyArtifact.act_batch: standardize, ReLU-MLP, linear
-  // output per-dim clamped to [0,1], de-normalized with [action_lo, action_hi].
-  // Returns empty on unloaded / bad dims. Element 0 is the rps setpoint.
+  // Forward pass on a raw (state) feature vector -> the full (action_dim)
+  // de-normalized action vector. Mirrors PolicyArtifact.act_batch (feedforward):
+  // standardize, ReLU-MLP, per-dim decode (continuous clamp[0,1]+de-normalize;
+  // categorical argmax). Returns empty on unloaded / bad dims. Element 0 is rps.
+  // For a recurrent policy this treats the state as an isolated first window (zero
+  // context); use ProposeFor to carry the episode context that makes it adapt.
   std::vector<double> Propose(const std::vector<float>& features) const;
 
-  // Convenience: build features from state inputs and run the forward pass.
-  std::vector<double> ProposeFor(const RlStateInputs& in) const {
-    return Propose(BuildFeatures(in));
-  }
+  // Build features from state inputs and run the forward pass. For a recurrent
+  // policy this ADVANCES the carried hidden state with the previous window's token
+  // and conditions the action on it (mirrors PolicyArtifact.act_sequence), so it is
+  // stateful across calls — hence non-const. Feedforward policies are unaffected.
+  std::vector<double> ProposeFor(const RlStateInputs& in);
 
  private:
+  // Standardize the state part (length state_dim_) with the exported normalizer.
+  std::vector<float> Standardize(const std::vector<float>& features) const;
+  // Run the ReLU-MLP + per-dim decode on a prepared input of width in_dim_.
+  std::vector<double> ForwardDecode(const std::vector<float>& mlp_input) const;
+  // Normalize a de-normalized action to the per-dim [0,1] token space (mirrors the
+  // training A = (action - lo)/span), used to build the GRU token.
+  std::vector<float> NormalizeAction(const std::vector<double>& action) const;
+  // One torch.nn.GRUCell step (gate order reset, update, new): h' from h and token.
+  std::vector<float> GruStep(const std::vector<float>& h,
+                             const std::vector<float>& token) const;
+
   bool loaded_ = false;
   int in_dim_ = 0;
   int action_dim_ = 0;    // number of action DIMENSIONS
@@ -116,6 +148,20 @@ class RlPolicy {
   std::vector<Layer> layers_;
   std::vector<float> norm_mean_;
   std::vector<float> norm_std_;
+
+  // RL² recurrent context encoder (SRLP v4). Off for v2/v3.
+  bool recurrent_ = false;
+  int state_dim_ = 0;    // normalized state width (== in_dim_ when feedforward)
+  int hidden_dim_ = 0;   // GRU hidden width H
+  int token_dim_ = 0;    // state_dim_ + action_dim_
+  std::vector<float> gru_w_ih_;  // (3H * token_dim_) row-major, gate order r,z,n
+  std::vector<float> gru_w_hh_;  // (3H * H) row-major
+  std::vector<float> gru_b_ih_;  // 3H
+  std::vector<float> gru_b_hh_;  // 3H
+  // Carried episode context: hidden state, and the previous window's token
+  // ([standardized state, action]) folded in on the next ProposeFor.
+  std::vector<float> hidden_;      // H (zero at episode start)
+  std::vector<float> prev_token_;  // token_dim_ (empty until the first proposal)
   // Per-dim output head. A continuous dim reads one output at out_offset, clamped
   // to [0,1] and de-normalized with [lo, hi]. A categorical dim reads
   // cats.size() outputs as logits starting at out_offset; argmax -> cats[idx].

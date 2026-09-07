@@ -658,6 +658,68 @@ int main() {
     Check(cv.size() == 2 && std::abs(cv[0] - 600.0) < 1e-3 && cv[1] == 3.0,
           "rl policy: v3 categorical forward (rps=600, request_mix=argmax->3)");
     std::remove(cpath.c_str());
+
+    // v4 RL² recurrent: GRU context carried across windows (the wheel turns).
+    // state_dim=20 (matches BuildFeatures), hidden=1, action_dim=1 (continuous [0,1]).
+    // Identity normalizer. The MLP is one linear layer over [state(20), hidden(1)]
+    // with W picking rps_norm (state[0], weight 1) + hidden (weight 1), b=0, so
+    //   output = clamp(rps_norm + hidden).
+    // GRU: only the new-gate (n) input weight on token[0] (rps_norm) is 10; every
+    // other weight/bias is 0, w_hh=0. So with h=0, token=[s_std, a_norm]:
+    //   r=z=0.5, n=tanh(10*rps_norm), h' = (1-0.5)*n + 0.5*0 = 0.5*tanh(10*rps_norm).
+    //   window1: rps_norm 0.3, hidden 0 -> out 0.3; token folds -> h = 0.5*tanh(3.0)
+    //            = 0.497527
+    //   window2: rps_norm 0.3, hidden 0.497527 -> out = clamp(0.3+0.497527) = 0.797527
+    std::string g = "SRLP";
+    put_u32(g, 4);    // version
+    put_u32(g, 20);   // state_dim
+    put_u32(g, 1);    // hidden
+    put_u32(g, 1);    // action_dim
+    // gru_w_ih (3H x T = 3 x 21), gate order r,z,n. r,z rows all 0; n row = [10, 0..0].
+    for (int i = 0; i < 21; ++i) put_f32(g, 0.0f);  // r row
+    for (int i = 0; i < 21; ++i) put_f32(g, 0.0f);  // z row
+    put_f32(g, 10.0f);
+    for (int i = 1; i < 21; ++i) put_f32(g, 0.0f);  // n row: token[0]=rps_norm only
+    for (int i = 0; i < 3; ++i) put_f32(g, 0.0f);   // gru_w_hh (3x1)
+    for (int i = 0; i < 3; ++i) put_f32(g, 0.0f);   // gru_b_ih
+    for (int i = 0; i < 3; ++i) put_f32(g, 0.0f);   // gru_b_hh
+    put_u32(g, 1);    // n_layers
+    put_u32(g, 1);    // out_dims[0]
+    put_f32(g, 1.0f);                                 // W[0][0] rps_norm
+    for (int i = 1; i < 20; ++i) put_f32(g, 0.0f);    // W[0][1..19]
+    put_f32(g, 1.0f);                                 // W[0][20] hidden
+    put_f32(g, 0.0f);                                 // b
+    for (int i = 0; i < 20; ++i) put_f32(g, 0.0f);    // norm_mean
+    for (int i = 0; i < 20; ++i) put_f32(g, 1.0f);    // norm_std
+    put_u32(g, 0);                                    // dim0 kind = continuous
+    put_f32(g, 0.0f); put_f32(g, 1.0f);               // dim0 lo, hi
+    const std::string gpath = "/tmp/samurai_selftest_policy_v4.srlp";
+    { std::ofstream o(gpath, std::ios::binary); o.write(g.data(), g.size()); }
+    RlPolicy pg;
+    Check(pg.Load(gpath, &err), "rl policy: v4 recurrent SRLP loads");
+    Check(pg.recurrent() && pg.state_dim() == 20 && pg.hidden_dim() == 1 &&
+              pg.action_dim() == 1 && pg.input_dim() == 21,
+          "rl policy: v4 dims (state=20 hidden=1 action=1, mlp_in=21)");
+
+    RlStateInputs w;
+    w.rps = 300.0; w.max_rps = 1000.0;  // rps_norm = 0.3
+
+    // Context-free Propose treats it as an isolated first window (zero hidden).
+    Check(std::abs(pg.Propose(RlPolicy::BuildFeatures(w))[0] - 0.3) < 1e-3,
+          "rl policy: v4 context-free forward = rps_norm (zero hidden)");
+
+    pg.ResetContext();
+    auto a1 = pg.ProposeFor(w);
+    Check(a1.size() == 1 && std::abs(a1[0] - 0.3) < 1e-3,
+          "rl policy: v4 window1 (zero context) = rps_norm");
+    auto a2 = pg.ProposeFor(w);  // same inputs, but the wheel has turned
+    Check(std::abs(a2[0] - 0.797527) < 2e-3,
+          "rl policy: v4 window2 adapts via carried GRU context (0.3 -> 0.7975)");
+    pg.ResetContext();
+    auto a3 = pg.ProposeFor(w);
+    Check(std::abs(a3[0] - 0.3) < 1e-3,
+          "rl policy: v4 ResetContext restores the zero-context action");
+    std::remove(gpath.c_str());
   }
 
   // --- RL exploration: deterministic, in-range, decorrelated lever schedule ---

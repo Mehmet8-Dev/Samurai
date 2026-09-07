@@ -1083,6 +1083,12 @@ int main(int argc, char** argv) {
           } else {
             std::printf("samurai_master: RL policy loaded (path=%s in_dim=%d jump<=%.2fx)\n",
                         rl_path.c_str(), rl_policy.input_dim(), clcfg.rl_max_jump_factor);
+            if (rl_policy.recurrent()) {
+              std::printf("samurai_master: RL² recurrent policy — the GRU context "
+                          "(hidden=%d) adapts within the episode; resetting context\n",
+                          rl_policy.hidden_dim());
+              rl_policy.ResetContext();
+            }
           }
         }
         // RL corpus capture: opt-in per-window (s,a,s') transition log for the
@@ -1142,7 +1148,10 @@ int main(int argc, char** argv) {
         // input width: block adds 2*V dims, ban adds 2, and they compose. (V defaults
         // to 5 so 2*V != 2; a custom --cl-lever-variants 1 would be ambiguous.)
         constexpr int kBanFeatures = 2;
-        const int rl_extra = rl_policy.loaded() ? rl_policy.input_dim() - kBaseFeatures : 0;
+        // Decode from the STATE width, not input_dim: an RL² recurrent policy's
+        // input_dim includes the GRU hidden vector, but its state is the base 20
+        // (block/ban memory is subsumed by the GRU), so state_dim()-20 == 0 there.
+        const int rl_extra = rl_policy.loaded() ? rl_policy.state_dim() - kBaseFeatures : 0;
         const bool block_state_on =
             rl_policy.loaded() &&
             (rl_extra == 2 * variant_count || rl_extra == 2 * variant_count + kBanFeatures);

@@ -83,6 +83,15 @@ class Dataset:
             return (0.0, 0.0)
         return (float(self.action_lo[0]), float(self.action_hi[0]))
 
+    def block_present(self) -> bool:
+        """True if the state carries path-aware variant-block features."""
+        return any(n.endswith("_block") and n.startswith("variant")
+                   for n in self.feature_names)
+
+    def ban_present(self) -> bool:
+        """True if the state carries the persistent-ban feature."""
+        return "ban_pressure" in self.feature_names
+
 
 def _keep(t: Transition, cfg: RLConfig) -> bool:
     if cfg.drop_leading and not t.s_valid:
