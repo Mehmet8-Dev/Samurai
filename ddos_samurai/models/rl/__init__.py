@@ -34,6 +34,7 @@ from .generalize import (
     profile_of,
 )
 from .reward import EffectiveThroughputReward, RewardFn, SloProgressReward, slo_overshoot
+from .novelty import NoveltyReport, scan_corpus, unexplained_loss
 from .shield import LeverShield
 from .schemas import Action, DefenseSignals, RawState, SloThresholds, Transition
 
@@ -66,6 +67,9 @@ __all__ = [
     "GeneralizationResult",
     "FoldResult",
     "LeverShield",
+    "NoveltyReport",
+    "scan_corpus",
+    "unexplained_loss",
     "slo_overshoot",
     "build_dataset",
     "Dataset",

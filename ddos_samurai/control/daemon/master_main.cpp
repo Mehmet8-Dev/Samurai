@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -23,6 +24,8 @@
 #include "lever_shield.hpp"
 #include "variant_memory.hpp"
 #include "ban_memory.hpp"
+#include "online_adapter.hpp"
+#include "novelty_detector.hpp"
 #include "rl_explore.hpp"
 #include "rl_policy.hpp"
 #include "control_auth.hpp"
@@ -569,6 +572,23 @@ void Usage(const char* argv0) {
       "  --cl-variant-memory FILE  persist per-target block memory (JSON) across runs:\n"
       "                            warm-start the shield + block state feature from what\n"
       "                            a prior run learned about this target (default off)\n"
+      "  --cl-online-adapt 0|1     serving-time continual fine-tuning: a bounded online\n"
+      "                            setpoint correction learned from the served-throughput\n"
+      "                            reward, with a champion-challenger rollback guard\n"
+      "  --cl-online-adapt-lr X    online adapter ES step size (default 0.10)\n"
+      "  --cl-online-adapt-max-dev X  clamp |correction| so applied rps stays in\n"
+      "                            [1-X, 1+X]*proposed (default 0.30)\n"
+      "  --cl-online-adapt-memory FILE  persist the learned correction (JSON) per target\n"
+      "  --cl-novelty 0|1          open-vocabulary detection of an un-modelled defense\n"
+      "                            (success failing with no known signal); names it and\n"
+      "                            damps the kRl setpoint while the novel regime holds. A\n"
+      "                            recurring signature GRADUATES to its own learned lever,\n"
+      "                            tuned by outcome (a new response axis for that defense)\n"
+      "  --cl-novelty-threshold X  unexplained-loss to flag a window novel (default 0.35)\n"
+      "  --cl-novelty-backoff X    default lever for an un-graduated signature (default 0.85)\n"
+      "  --cl-novelty-min-damping X floor on a learned per-signature lever (default 0.50)\n"
+      "  --cl-novelty-promote N    novel windows before a signature graduates (default 3)\n"
+      "  --cl-novelty-memory FILE  persist the discovered signatures + learned levers per target\n"
       "  --cl-ban-memory FILE      persist per-target ban pressure (JSON) across runs:\n"
       "                            warm-start the persistent-ban state feature so a run\n"
       "                            against an already-banned target starts armed (a\n"
@@ -1200,6 +1220,66 @@ int main(int argc, char** argv) {
                       "conditions on the folded conn_drop ban pressure\n",
                       rl_policy.input_dim());
         }
+        // Serving-time continual fine-tuning (the slow Mahoraga wheel): a bounded,
+        // state-conditioned online correction on the policy's setpoint, learned by
+        // an ES gradient from the served-throughput reward and guarded by a champion-
+        // challenger rollback that reverts to the frozen policy on any regression. It
+        // only scales the proposal (StepRl still bounds it), so it cannot overdrive.
+        constexpr int kAdaptFeatures = 4;  // [bias, rps_norm, rate_limited, overload]
+        const bool adapt_on =
+            rl_policy.loaded() && OptInt(argc, argv, "--cl-online-adapt", 0) != 0;
+        samurai::control::OnlineAdapter::Config acfg;
+        acfg.enabled = adapt_on;
+        acfg.lr = OptDouble(argc, argv, "--cl-online-adapt-lr", 0.10);
+        acfg.max_dev = OptDouble(argc, argv, "--cl-online-adapt-max-dev", 0.30);
+        samurai::control::OnlineAdapter online_adapter(
+            acfg, kAdaptFeatures,
+            static_cast<std::uint64_t>(OptInt(argc, argv, "--cl-online-adapt-seed", 0)));
+        const std::string adapt_mem_path = Opt(argc, argv, "--cl-online-adapt-memory", "");
+        samurai::control::AdapterMemory adapt_mem;
+        if (adapt_on && !adapt_mem_path.empty()) {
+          adapt_mem = samurai::control::AdapterMemory::Load(adapt_mem_path);
+          const auto e = adapt_mem.Get(target_key);
+          if (!e.w.empty() || e.has_baseline) {
+            online_adapter.Warm(e.w, e.has_baseline ? e.baseline
+                                                    : std::numeric_limits<double>::quiet_NaN());
+            std::printf("samurai_master: online adapter warm-started for %s (%zu weights)\n",
+                        target_key.c_str(), e.w.size());
+          }
+        }
+        bool adapt_pending = false;
+        if (adapt_on) {
+          std::printf("samurai_master: online adapter on — bounded setpoint correction "
+                      "(lr=%.3f max_dev=%.2f) with rollback guard\n",
+                      acfg.lr, acfg.max_dev);
+        }
+        // Open-vocabulary novelty detection: notice a defense the frozen feature space
+        // cannot represent (success failing with no known signal to explain it), name
+        // it, and damp the kRl setpoint while the un-modelled regime holds. Passive
+        // for every strategy; the cautious backoff is kRl-only. Vocabulary persists.
+        samurai::control::NoveltyDetector::Config nvcfg;
+        nvcfg.enabled = OptInt(argc, argv, "--cl-novelty", 0) != 0;
+        nvcfg.residual_threshold = OptDouble(argc, argv, "--cl-novelty-threshold", 0.35);
+        nvcfg.backoff = OptDouble(argc, argv, "--cl-novelty-backoff", 0.85);
+        nvcfg.min_damping = OptDouble(argc, argv, "--cl-novelty-min-damping", 0.50);
+        nvcfg.promotion_count = OptInt(argc, argv, "--cl-novelty-promote", 3);
+        samurai::control::NoveltyDetector novelty(nvcfg);
+        const std::string novelty_mem_path = Opt(argc, argv, "--cl-novelty-memory", "");
+        samurai::control::NoveltyMemory novelty_mem;
+        if (nvcfg.enabled && !novelty_mem_path.empty()) {
+          novelty_mem = samurai::control::NoveltyMemory::Load(novelty_mem_path);
+          const auto vocab = novelty_mem.Get(target_key);
+          if (!vocab.empty()) {
+            novelty.Warm(vocab);
+            std::printf("samurai_master: novelty vocabulary warm-started for %s (%zu known)\n",
+                        target_key.c_str(), vocab.size());
+          }
+        }
+        if (nvcfg.enabled) {
+          std::printf("samurai_master: open-vocabulary novelty detection on "
+                      "(threshold=%.2f backoff=%.2f)\n",
+                      nvcfg.residual_threshold, nvcfg.backoff);
+        }
         bool rl_have_prev = false;
         int win = 0;
         bool cl_aborted = false;
@@ -1300,6 +1380,28 @@ int main(int argc, char** argv) {
           // Defense-reaction signals for this window (used by both the RL policy
           // proposal below and the corpus record).
           const Value rl_defense = RlDefenseJson(res.snapshot);
+          // Open-vocabulary novelty: fold this window's reaction, so an unmodelled
+          // defense (success failing with no known signal) is noticed and named.
+          if (nvcfg.enabled) {
+            samurai::control::NoveltySignals ns;
+            auto ratio = [&](const char* num, const char* den) -> double {
+              const Value* n = rl_defense.find(num);
+              const Value* d = rl_defense.find(den);
+              if (!n || !d || d->as_double(0.0) <= 0.0) return -1.0;
+              return n->as_double(0.0) / d->as_double(0.0);
+            };
+            ns.success_ratio = ratio("status_2xx", "responses_total");
+            ns.rate_limited = ratio("status_4xx", "responses_total");
+            ns.overload = ratio("status_5xx", "responses_total");
+            ns.challenge = ratio("l7_expectation_failures", "responses_total");
+            if (const Value* v = rl_defense.find("h2_stream_reset_ratio")) ns.reset = v->as_double(-1.0);
+            const Value* att = rl_defense.find("l7_conn_attempted");
+            const Value* est = rl_defense.find("l7_conn_established");
+            if (att && est && att->as_double(0.0) > 0.0) {
+              ns.conn_drop = std::max(0.0, 1.0 - est->as_double(0.0) / att->as_double(0.0));
+            }
+            novelty.Observe(ns);
+          }
           // Feed the window's per-variant reaction into the variant memory so a
           // path-blocked variant (served ~0) is both vetoed (shield) and visible to
           // the policy (block state feature). Tracked whenever serving, so the veto
@@ -1334,9 +1436,64 @@ int main(int argc, char** argv) {
               rin.ban_features = true;
               rin.ban_pressure = ban_ewma;
             }
+            // Online adapter: the reward of THIS window realizes the correction the
+            // adapter applied one window earlier (it shaped the setpoint that just
+            // ran), so fold it in before proposing the next. Reward proxy mirrors the
+            // EffectiveThroughputReward objective: served throughput minus pushback.
+            if (adapt_on && adapt_pending) {
+              // Reward proxy = EffectiveThroughputReward (models/rl/reward.py), the same
+              // objective the offline policy optimizes; coefficients mirror RLConfig
+              // defaults so the online lever and the frozen policy pull the same way.
+              constexpr double kLambdaDefense = 1.0;  // 4xx/5xx status pushback weight
+              constexpr double kLambdaFlow = 1.0;     // conn-drop/reset flow pushback weight
+              constexpr double kLambdaSlo = 2.0;      // SLO-overshoot penalty weight
+              constexpr double kStepCost = 0.02;      // flat per-window cost (fast convergence)
+              const double max_rps = clcfg.max_rps > 0.0 ? clcfg.max_rps : 1.0;
+              double resp = 0.0, s2xx = 0.0;
+              if (const Value* v = rl_defense.find("responses_total")) resp = v->as_double(0.0);
+              if (const Value* v = rl_defense.find("status_2xx")) s2xx = v->as_double(0.0);
+              auto pos = [](double x) { return x > 0.0 ? x : 0.0; };
+              double err = sample.error_pct;
+              if (err < 0.0 && sample.attempted > 0.0) err = 100.0 * sample.errors / sample.attempted;
+              double overshoot = 0.0;
+              if (clcfg.slo_max_error_pct > 0.0 && err >= 0.0) {
+                overshoot = std::max(0.0, (err - clcfg.slo_max_error_pct) / clcfg.slo_max_error_pct);
+              }
+              double served;
+              if (resp > 0.0 && window_s > 0) {
+                // Raw honored throughput (2xx/s), counted exactly like the fingerprint.
+                served = (s2xx / window_s) / max_rps;
+              } else {
+                // No L7 status telemetry: degrade to SLO-green sustainable-rps progress,
+                // matching reward.py's non-L7 fallback (credit only when the window held).
+                const double prev_rps = rl_have_prev ? rl_prev_sample.actual_rps : sample.actual_rps;
+                served = (overshoot <= 0.0)
+                             ? std::max(0.0, (sample.actual_rps - prev_rps) / max_rps)
+                             : 0.0;
+              }
+              const double reward =
+                  served -
+                  kLambdaDefense * (pos(rin.rate_limited_ratio) + pos(rin.overload_ratio)) -
+                  kLambdaFlow * (pos(rin.conn_drop_ratio) + pos(rin.reset_pressure)) -
+                  kLambdaSlo * overshoot - kStepCost;
+              online_adapter.Observe(reward);
+            }
             const std::vector<double> action = rl_policy.ProposeFor(rin);
             if (!action.empty()) {
-              sample.rl_action_rps = action[0];  // dim 0 = rps -> shield
+              double rps = action[0];  // dim 0 = rps -> shield
+              if (adapt_on) {
+                const double max_rps = clcfg.max_rps > 0.0 ? clcfg.max_rps : 1.0;
+                auto pos = [](double x) { return x > 0.0 ? x : 0.0; };
+                const std::vector<double> phi = {1.0, sample.actual_rps / max_rps,
+                                                 pos(rin.rate_limited_ratio),
+                                                 pos(rin.overload_ratio)};
+                rps = online_adapter.Apply(rps, phi);
+                adapt_pending = true;
+              }
+              // Cautious response to an un-modelled defense: damp the proposal while a
+              // novel regime holds (the rps shield still bounds the result downward).
+              if (nvcfg.enabled) rps = novelty.DampSetpoint(rps);
+              sample.rl_action_rps = rps;
               rl_next_levers = action;           // dims >=1 -> next window's job spec
             }
           }
@@ -1345,6 +1502,13 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> lk(cl_mu);
             cl_json = ClosedLoopStateJson(dec, clcfg);
             if (sut.enabled()) cl_json.set("sut", samurai::control::SutProbe::SampleJson(sut_sample));
+            if (nvcfg.enabled) cl_json.set("novelty", novelty.ToJson());
+          }
+          if (nvcfg.enabled && novelty.novel()) {
+            std::printf("samurai_master: NOVEL defense at window=%d — unexplained "
+                        "success-loss=%.2f (score=%.2f) signature=%s; damping setpoint\n",
+                        win, novelty.last_unexplained(), novelty.score(),
+                        novelty.last_signature().c_str());
           }
           // Log the transition: state that produced `setpoint` (previous window),
           // the (Mahoraga) action, and the state + defense-reaction it led to.
@@ -1388,6 +1552,49 @@ int main(int argc, char** argv) {
           } else {
             std::printf("samurai_master: ban memory saved for %s -> %s (pressure=%.3f)\n",
                         target_key.c_str(), ban_mem_path.c_str(), ban_ewma);
+          }
+        }
+        // Persist the online adapter's learned correction so the next run continues
+        // improving instead of relearning from scratch (continual learning).
+        if (adapt_on) {
+          if (online_adapter.rollbacks() > 0) {
+            std::printf("samurai_master: online adapter rolled back %d time(s) this run "
+                        "(a regression was detected and reverted)\n",
+                        online_adapter.rollbacks());
+          }
+          if (!adapt_mem_path.empty()) {
+            adapt_mem.Put(target_key, online_adapter.weights(),
+                          online_adapter.frozen_baseline());
+            if (!adapt_mem.Save(adapt_mem_path)) {
+              std::fprintf(stderr, "samurai_master: could not persist adapter memory to %s\n",
+                           adapt_mem_path.c_str());
+            } else {
+              std::printf("samurai_master: online adapter saved for %s -> %s\n",
+                          target_key.c_str(), adapt_mem_path.c_str());
+            }
+          }
+        }
+        // Persist the discovered novelty vocabulary so the next run recognizes the
+        // out-of-dictionary phenomena this run learned about the target.
+        if (nvcfg.enabled && !novelty.axes().empty()) {
+          std::printf("samurai_master: novelty vocabulary discovered for %s: %zu signature(s)\n",
+                      target_key.c_str(), novelty.axes().size());
+          for (const auto& ax : novelty.axes()) {
+            if (ax.graduated) {
+              std::printf("samurai_master:   graduated axis '%s' -> learned damping=%.2f "
+                          "(seen %ld)\n",
+                          ax.signature.c_str(), ax.damping, ax.count);
+            }
+          }
+          if (!novelty_mem_path.empty()) {
+            novelty_mem.Put(target_key, novelty.axes());
+            if (!novelty_mem.Save(novelty_mem_path)) {
+              std::fprintf(stderr, "samurai_master: could not persist novelty memory to %s\n",
+                           novelty_mem_path.c_str());
+            } else {
+              std::printf("samurai_master: novelty memory saved for %s -> %s\n",
+                          target_key.c_str(), novelty_mem_path.c_str());
+            }
           }
         }
         Value clsummary = Value::Object();

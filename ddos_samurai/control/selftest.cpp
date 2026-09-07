@@ -35,6 +35,8 @@
 #include "lever_shield.hpp"
 #include "variant_memory.hpp"
 #include "ban_memory.hpp"
+#include "online_adapter.hpp"
+#include "novelty_detector.hpp"
 #include "rl_explore.hpp"
 #include "rl_policy.hpp"
 #include "discovery.hpp"
@@ -870,6 +872,155 @@ int main() {
     Check(bback.size() == 2 && std::abs(bback.Get("10.0.0.2:443") - 0.5) < 1e-9,
           "ban memory: Put replaces in place");
     std::remove(bpath.c_str());
+  }
+
+  // --- Online adapter: warmup is inert, a helpful reward pushes the correction up,
+  //     a harmful reward triggers the rollback guard, and state persists ---
+  {
+    using namespace samurai::control;
+    OnlineAdapter::Config cfg;
+    cfg.enabled = true;
+    cfg.warmup_windows = 3;
+    cfg.sigma = 0.05;
+    cfg.lr = 0.1;
+    const std::vector<double> phi = {1.0};  // single bias feature
+
+    // Warmup: the correction is inert (delta 0) and the frozen baseline is recorded.
+    OnlineAdapter ad(cfg, 1, /*seed=*/1);
+    for (int w = 0; w < 3; ++w) {
+      Check(std::abs(ad.Apply(1000.0, phi) - 1000.0) < 1e-9,
+            "online adapter: inert during warmup (no correction)");
+      ad.Observe(0.5);  // frozen-policy baseline = 0.5 (headroom above/below)
+    }
+
+    // Adapting in a "positive correction helps" environment: reward = 0.5 + 0.5*delta,
+    // so a positive correction earns above the 0.5 baseline. The ES gradient must
+    // drive the weight positive, and the adapted reward stays above baseline so the
+    // rollback guard never fires.
+    for (int w = 0; w < 200; ++w) {
+      const double applied = ad.Apply(1000.0, phi);
+      const double delta = applied / 1000.0 - 1.0;
+      ad.Observe(0.5 + 0.5 * delta);
+    }
+    Check(ad.weights()[0] > 0.05, "online adapter: helpful reward grows the correction");
+    Check(ad.rollbacks() == 0, "online adapter: no rollback on a helpful reward");
+    Check(ad.Apply(1000.0, phi) > 1000.0, "online adapter: applies a positive correction");
+
+    // A uniformly harmful reward (any correction is below baseline) must roll back to
+    // the frozen policy and cool down.
+    OnlineAdapter bad(cfg, 1, /*seed=*/2);
+    for (int w = 0; w < 3; ++w) { bad.Apply(1000.0, phi); bad.Observe(0.0); }  // baseline 0
+    for (int w = 0; w < 40; ++w) { bad.Apply(1000.0, phi); bad.Observe(-0.5); }
+    Check(bad.rollbacks() >= 1, "online adapter: harmful reward triggers rollback");
+
+    // Persistence round-trips the learned weights + baseline.
+    const std::string apath = "/tmp/samurai_selftest_adapter_mem.json";
+    std::remove(apath.c_str());
+    Check(AdapterMemory::Load(apath).size() == 0, "adapter memory: missing file -> empty");
+    AdapterMemory amem;
+    amem.Put("10.0.0.1:8080", {0.11, -0.22, 0.33}, 0.75);
+    Check(amem.Save(apath), "adapter memory: save to disk");
+    AdapterMemory aback = AdapterMemory::Load(apath);
+    const auto e = aback.Get("10.0.0.1:8080");
+    Check(e.w.size() == 3 && std::abs(e.w[1] + 0.22) < 1e-9 && e.has_baseline &&
+              std::abs(e.baseline - 0.75) < 1e-9,
+          "adapter memory: weights + baseline round-trip");
+    Check(aback.Get("nope:1").w.empty(), "adapter memory: unknown target -> empty");
+    std::remove(apath.c_str());
+  }
+
+  // --- Novelty detector: an unexplained success collapse is flagged as out-of-
+  //     dictionary; a known-signal failure is NOT; the vocabulary persists ---
+  {
+    using namespace samurai::control;
+    NoveltyDetector::Config cfg;
+    cfg.enabled = true;
+    cfg.warmup_windows = 2;
+    cfg.residual_threshold = 0.35;
+    cfg.backoff = 0.5;
+
+    // A KNOWN-signal failure: success ~0 but rate_limited ~1 explains it fully. Never
+    // novel — the dictionary covers it.
+    NoveltyDetector known(cfg);
+    NoveltySignals rl;
+    rl.success_ratio = 0.02; rl.rate_limited = 0.98;
+    for (int w = 0; w < 6; ++w) known.Observe(rl);
+    Check(!known.novel(), "novelty: rate-limited failure is explained, not novel");
+    Check(known.vocabulary().empty(), "novelty: no signature minted for a known defense");
+    Check(std::abs(known.DampSetpoint(1000.0) - 1000.0) < 1e-9,
+          "novelty: no setpoint damping when not novel");
+
+    // A SILENT failure: success collapses with NO known signal moving. Out of the
+    // dictionary -> novel, named "silent-success-loss", and the setpoint is damped.
+    NoveltyDetector silent(cfg);
+    NoveltySignals sl;
+    sl.success_ratio = 0.1;  // 90% failing; rate_limited/overload/... all unknown (<0)
+    double sc = 0.0;
+    for (int w = 0; w < 6; ++w) sc = silent.Observe(sl);
+    Check(silent.novel() && sc >= 0.35, "novelty: unexplained success loss is flagged novel");
+    Check(silent.last_signature() == "silent-success-loss",
+          "novelty: silent failure gets the silent-success-loss signature");
+    Check(std::abs(silent.DampSetpoint(1000.0) - 500.0) < 1e-9,
+          "novelty: novel regime damps the setpoint (x lever, floored at backoff here)");
+
+    // A graduated signature grows its OWN outcome-tuned lever. With headroom below the
+    // default backoff (min_damping < backoff), a persistently-unexplained regime
+    // tightens the lever; once the regime recovers, the lever relaxes back toward 1.
+    NoveltyDetector::Config lc;
+    lc.enabled = true; lc.warmup_windows = 1; lc.residual_threshold = 0.35;
+    lc.backoff = 0.90; lc.min_damping = 0.30; lc.promotion_count = 2;
+    lc.damp_lr = 0.30; lc.relax_lr = 0.50;
+    NoveltyDetector lever(lc);
+    NoveltySignals silent2; silent2.success_ratio = 0.1;
+    for (int w = 0; w < 8; ++w) lever.Observe(silent2);
+    const double tightened = lever.DampSetpoint(1000.0) / 1000.0;
+    Check(lever.novel() && tightened < 0.90 - 1e-6 && tightened >= 0.30 - 1e-9,
+          "novelty lever: graduated axis tightened below the default backoff");
+    NoveltySignals recovered; recovered.success_ratio = 1.0;  // regime gone: fully served
+    for (int w = 0; w < 20; ++w) lever.Observe(recovered);
+    double relaxed = 0.0;
+    for (const auto& ax : lever.axes())
+      if (ax.signature == "silent-success-loss") relaxed = ax.damping;
+    Check(!lever.novel() && relaxed > tightened + 1e-6,
+          "novelty lever: recovery relaxed the learned lever back up");
+
+    // An UNDER-explained failure: a known signal is present but nowhere near enough
+    // (success 0.1, only 0.2 conn_drop) -> novel, tagged by the dominant known axis.
+    NoveltyDetector partial(cfg);
+    NoveltySignals pl;
+    pl.success_ratio = 0.1; pl.conn_drop = 0.2;
+    for (int w = 0; w < 6; ++w) partial.Observe(pl);
+    Check(partial.novel() && partial.last_signature() == "under-explained:conn_drop",
+          "novelty: under-explained failure tagged by dominant known axis");
+
+    // Warm-start + persistence round-trip the open vocabulary.
+    const std::string npath = "/tmp/samurai_selftest_novelty_mem.json";
+    std::remove(npath.c_str());
+    Check(NoveltyMemory::Load(npath).size() == 0, "novelty memory: missing file -> empty");
+    NoveltyMemory nmem;
+    NoveltyDetector::Axis a1; a1.signature = "silent-success-loss"; a1.count = 4;
+    a1.damping = 0.62; a1.graduated = true;
+    NoveltyDetector::Axis a2; a2.signature = "under-explained:reset"; a2.count = 2;
+    a2.damping = 0.80; a2.graduated = false;
+    nmem.Put("10.0.0.1:8080", {a1, a2});
+    Check(nmem.Save(npath), "novelty memory: save to disk");
+    NoveltyMemory nback = NoveltyMemory::Load(npath);
+    const auto vocab = nback.Get("10.0.0.1:8080");
+    long silent_count = 0;
+    double silent_damp = 0.0;
+    for (const auto& ax : vocab)
+      if (ax.signature == "silent-success-loss") { silent_count = ax.count; silent_damp = ax.damping; }
+    Check(vocab.size() == 2 && silent_count == 4 && std::abs(silent_damp - 0.62) < 1e-9,
+          "novelty memory: learned levers round-trip (count + damping)");
+
+    NoveltyDetector warmed(cfg);
+    warmed.Warm(vocab);
+    double warmed_damp = 0.0;
+    for (const auto& ax : warmed.axes())
+      if (ax.signature == "silent-success-loss") warmed_damp = ax.damping;
+    Check(warmed.vocabulary().size() == 2 && std::abs(warmed_damp - 0.62) < 1e-9,
+          "novelty: warm-start restores the learned levers");
+    std::remove(npath.c_str());
   }
 
   // --- sut probe: Prometheus /api/v1/query response parsing ---
