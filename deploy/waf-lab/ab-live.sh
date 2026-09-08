@@ -39,15 +39,22 @@ CL_MAX_RPS="${CL_MAX_RPS:-800}"
 CL_SLO_MAX_ERROR_PCT="${CL_SLO_MAX_ERROR_PCT:-2.0}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="${RUN_DIR:-$REPO/data/rl-corpus/ablive-$STAMP}"
-declare -A ENGINE=( [coraza]=8080 [modsec]=8081 )
-# alternate which engine each rep STARTS on, so start-engine bias cancels across reps
-PAIRS=("coraza:modsec" "modsec:coraza")
+# Ports are parameterized so one harness runs every regime:
+#   static      : SHIFT=0 STATIC_PORT=8080                  (find/respect a fixed ceiling)
+#   engine-shift: SHIFT=1 SHIFT_A_PORT=8080 SHIFT_B_PORT=8081 (Coraza <-> ModSec, default)
+#   rate-drop   : SHIFT=1 SHIFT_A_PORT=8083 SHIFT_B_PORT=8084 (rate100 <-> rate50)
+STATIC_PORT="${STATIC_PORT:-8080}"
+SHIFT_A_PORT="${SHIFT_A_PORT:-8080}"
+SHIFT_B_PORT="${SHIFT_B_PORT:-8081}"
+# alternate which side each rep STARTS on, so start-side bias cancels across reps
+PAIRS=("$SHIFT_A_PORT:$SHIFT_B_PORT" "$SHIFT_B_PORT:$SHIFT_A_PORT")
 ARMS=(aimd ff rl2)
 
 mkdir -p "$RUN_DIR"
 echo "=================================================================="
 echo ">> Live on-policy A/B  $(date)  (stamp=$STAMP)"
-echo ">> arms=${ARMS[*]}  reps=$REPS  shift=$SHIFT  window=${CL_WINDOW_S}s x $CL_AIMD_MAX_WINDOWS"
+if [[ "$SHIFT" == "1" ]]; then TGT="shift ${SHIFT_A_PORT}<->${SHIFT_B_PORT}"; else TGT="static :${STATIC_PORT}"; fi
+echo ">> arms=${ARMS[*]}  reps=$REPS  target=$TGT  window=${CL_WINDOW_S}s x $CL_AIMD_MAX_WINDOWS"
 echo ">> run dir: $RUN_DIR"
 echo "=================================================================="
 
@@ -102,11 +109,15 @@ run_arm() {  # $1=arm  $2=out_corpus  $3=start_port  $4=target_port
 
 t0=$(date +%s)
 for r in $(seq 1 "$REPS"); do
-    pair="${PAIRS[$(( (r - 1) % ${#PAIRS[@]} ))]}"
-    start="${pair%%:*}"; target="${pair##*:}"
-    echo ""; echo ">> rep $r/$REPS : ${start}(:${ENGINE[$start]}) --> ${target}(:${ENGINE[$target]}) (shift=$SHIFT)"
+    if [[ "$SHIFT" == "1" ]]; then
+        pair="${PAIRS[$(( (r - 1) % ${#PAIRS[@]} ))]}"
+        start="${pair%%:*}"; target="${pair##*:}"
+    else
+        start="$STATIC_PORT"; target="$STATIC_PORT"
+    fi
+    echo ""; echo ">> rep $r/$REPS : :${start} --> :${target} (shift=$SHIFT)"
     for arm in "${ARMS[@]}"; do
-        run_arm "$arm" "$RUN_DIR/arm=$arm.rep=$r.ndjson" "${ENGINE[$start]}" "${ENGINE[$target]}"
+        run_arm "$arm" "$RUN_DIR/arm=$arm.rep=$r.ndjson" "$start" "$target"
     done
 done
 echo ""; echo ">> all runs done in $(( ($(date +%s) - t0) / 60 )) min"

@@ -1,0 +1,42 @@
+# Rate-drop A/B substrate: two nginx-only rate-limited targets at DIFFERENT ceilings
+# (100 r/s and 50 r/s), sharing one origin. The ab-live.sh harness socat-shifts between
+# them mid-episode (SHIFT_A_PORT=8083 SHIFT_B_PORT=8084), so a single episode straddles
+# a pure capacity drop with no engine/rule confound — the cleanest test of the recurrent
+# policy's within-episode adaptation.
+#
+#   docker compose -f deploy/waf-lab/docker-compose.ratedrop.yml up -d
+name: samurai-ratedrop
+
+services:
+  origin:
+    image: traefik/whoami:v1.10.2
+    container_name: samurai-rd-origin
+    restart: unless-stopped
+    command: ["--port", "80"]
+    networks: [rdnet]
+
+  nginx-r100:
+    image: nginx:1.27-alpine
+    container_name: samurai-rd-r100
+    restart: unless-stopped
+    depends_on: [origin]
+    volumes:
+      - ./ratedrop/nginx-r100.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8083:80"
+    networks: [rdnet]
+
+  nginx-r50:
+    image: nginx:1.27-alpine
+    container_name: samurai-rd-r50
+    restart: unless-stopped
+    depends_on: [origin]
+    volumes:
+      - ./ratedrop/nginx-r50.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8084:80"
+    networks: [rdnet]
+
+networks:
+  rdnet:
+    driver: bridge
