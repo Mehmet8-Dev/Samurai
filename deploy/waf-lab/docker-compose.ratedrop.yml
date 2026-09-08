@@ -1,8 +1,13 @@
-# Rate-drop A/B substrate: two nginx-only rate-limited targets at DIFFERENT ceilings
-# (100 r/s and 50 r/s), sharing one origin. The ab-live.sh harness socat-shifts between
-# them mid-episode (SHIFT_A_PORT=8083 SHIFT_B_PORT=8084), so a single episode straddles
-# a pure capacity drop with no engine/rule confound — the cleanest test of the recurrent
-# policy's within-episode adaptation.
+# Biting-wall rate substrate: nginx-only rate-limited targets at several ceilings, all
+# nodelay (reject excess as 429), sharing one origin. Two uses:
+#
+#  1. Rate-drop A/B: socat-shift between two ceilings mid-episode (SHIFT_A_PORT=8083
+#     SHIFT_B_PORT=8084) — a pure capacity drop with no engine/rule confound, the
+#     cleanest test of the recurrent policy's within-episode adaptation.
+#  2. Biting-wall TRAINING substrate: capture corpus against {50,100,200} r/s so the
+#     policy learns the honored ceiling is a variable AND that bursty concurrency/pacing
+#     levers overflow the burst and get rejected (the defect the delayed-limiter corpus
+#     never taught). :8085 (150 r/s) is HELD OUT — evaluation only, unseen ceiling.
 #
 #   docker compose -f deploy/waf-lab/docker-compose.ratedrop.yml up -d
 name: samurai-ratedrop
@@ -35,6 +40,30 @@ services:
       - ./ratedrop/nginx-r50.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "8084:80"
+    networks: [rdnet]
+
+  # 200 r/s — the high end of the training ceiling set {50,100,200}.
+  nginx-r200:
+    image: nginx:1.27-alpine
+    container_name: samurai-rd-r200
+    restart: unless-stopped
+    depends_on: [origin]
+    volumes:
+      - ./ratedrop/nginx-r200.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8086:80"
+    networks: [rdnet]
+
+  # 150 r/s — HELD OUT (unseen ceiling), evaluation-only generalization target.
+  nginx-r150:
+    image: nginx:1.27-alpine
+    container_name: samurai-rd-r150
+    restart: unless-stopped
+    depends_on: [origin]
+    volumes:
+      - ./ratedrop/nginx-r150.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8085:80"
     networks: [rdnet]
 
 networks:
