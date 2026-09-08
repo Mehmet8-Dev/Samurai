@@ -31,6 +31,10 @@ CL_WINDOW_S="${CL_WINDOW_S:-4}"
 CL_AIMD_MAX_WINDOWS="${CL_AIMD_MAX_WINDOWS:-18}"
 CL_MIN_RPS="${CL_MIN_RPS:-20}"
 CL_MAX_RPS="${CL_MAX_RPS:-800}"
+# Pushback SLO: treat a rate-limited window as a breach so the loop settles at the
+# honored ceiling (0 = off). Captured into the corpus so the policy learns from the
+# ceiling-finding dynamics, not blind maxing.
+CL_SLO_MAX_PUSHBACK_PCT="${CL_SLO_MAX_PUSHBACK_PCT:-20.0}"
 # Training targets (NOT :8085 — that is the held-out generalization ceiling).
 #   8083 pure r100, 8084 pure r50, 8086 pure r200, 8080 Coraza r100+WAF.
 STATIC_TARGETS=(8083 8084 8086 8080)
@@ -56,6 +60,7 @@ capture() {  # $1=port $2=corpus $3=seed
         RL_EXPLORE=1 RL_EXPLORE_SEED="$3" \
         CL_STRATEGY=aimd CL_WINDOW_S="$CL_WINDOW_S" CL_AIMD_MAX_WINDOWS="$CL_AIMD_MAX_WINDOWS" \
         CL_MIN_RPS="$CL_MIN_RPS" CL_MAX_RPS="$CL_MAX_RPS" \
+        CL_SLO_MAX_PUSHBACK_PCT="$CL_SLO_MAX_PUSHBACK_PCT" \
         CORPUS="$2" bash "$HERE/run-corpus.sh" >/tmp/samurai-bitewall-sweep.log 2>&1
 }
 
@@ -87,6 +92,7 @@ for pair in "${SHIFT_PAIRS[@]}"; do
             RL_EXPLORE=1 RL_EXPLORE_SEED="$seed" \
             CL_STRATEGY=aimd CL_WINDOW_S="$CL_WINDOW_S" CL_AIMD_MAX_WINDOWS="$CL_AIMD_MAX_WINDOWS" \
             CL_MIN_RPS="$CL_MIN_RPS" CL_MAX_RPS="$CL_MAX_RPS" \
+            CL_SLO_MAX_PUSHBACK_PCT="$CL_SLO_MAX_PUSHBACK_PCT" \
             CORPUS="$out" bash "$HERE/run-corpus.sh" >/tmp/samurai-bitewall-sweep.log 2>&1 &
         pid=$!
         sleep "$switch_after"; proxy_to "$other"       # mid-episode rate drop/rise

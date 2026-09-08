@@ -389,6 +389,32 @@ int main() {
     Check(!cl.IsHealthy(derived), "closed-loop: derived error_pct honored");
   }
 
+  // --- closed-loop pushback SLO: a rate-limited window is red even with 0 errors ---
+  {
+    using namespace samurai::control;
+    ClosedLoopConfig cfg;
+    cfg.enabled = true;
+    cfg.slo_max_pushback_pct = 20.0;  // >20% (4xx+5xx) share is a breach
+    ClosedLoopController cl(cfg);
+
+    LoadSample low;  // 10% pushback, no errors => green
+    low.attempted = 1000;
+    low.errors = 0;
+    low.pushback_pct = 10.0;
+    Check(cl.IsHealthy(low), "closed-loop: 10% pushback under cap is green");
+
+    LoadSample high;  // 60% of requests 429'd, still 0 errors => must be red
+    high.attempted = 1000;
+    high.errors = 0;
+    high.pushback_pct = 60.0;
+    Check(!cl.IsHealthy(high), "closed-loop: 60% pushback (429 wall) is red despite 0 errors");
+
+    LoadSample unknown;  // pushback unknown (-1) => rule skipped, not failed
+    unknown.attempted = 1000;
+    unknown.errors = 0;
+    Check(cl.IsHealthy(unknown), "closed-loop: unknown pushback skips the rule");
+  }
+
   // --- closed-loop AIMD: increase while green, backoff on violation ---
   {
     using namespace samurai::control;

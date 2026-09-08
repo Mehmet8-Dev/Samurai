@@ -58,6 +58,10 @@ bool ClosedLoopController::IsHealthy(const LoadSample& sample, double* out_error
       sample.latency_p99_ms > cfg_.slo_max_latency_ms) {
     return false;
   }
+  if (cfg_.slo_max_pushback_pct > 0.0 && sample.pushback_pct >= 0.0 &&
+      sample.pushback_pct > cfg_.slo_max_pushback_pct) {
+    return false;
+  }
   return true;
 }
 

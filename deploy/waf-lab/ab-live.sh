@@ -37,6 +37,7 @@ CL_AIMD_MAX_WINDOWS="${CL_AIMD_MAX_WINDOWS:-18}"
 CL_MIN_RPS="${CL_MIN_RPS:-20}"
 CL_MAX_RPS="${CL_MAX_RPS:-800}"
 CL_SLO_MAX_ERROR_PCT="${CL_SLO_MAX_ERROR_PCT:-2.0}"
+CL_SLO_MAX_PUSHBACK_PCT="${CL_SLO_MAX_PUSHBACK_PCT:-0.0}"  # >0 => rate-limit 429 counts as SLO breach
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="${RUN_DIR:-$REPO/data/rl-corpus/ablive-$STAMP}"
 # Ports are parameterized so one harness runs every regime:
@@ -89,6 +90,7 @@ run_arm() {  # $1=arm  $2=out_corpus  $3=start_port  $4=target_port
             CL_WINDOW_S="$CL_WINDOW_S" CL_AIMD_MAX_WINDOWS="$CL_AIMD_MAX_WINDOWS" \
             CL_MIN_RPS="$CL_MIN_RPS" CL_MAX_RPS="$CL_MAX_RPS" \
             CL_SLO_MAX_ERROR_PCT="$CL_SLO_MAX_ERROR_PCT" \
+            CL_SLO_MAX_PUSHBACK_PCT="$CL_SLO_MAX_PUSHBACK_PCT" \
             CORPUS="$out" bash "$HERE/run-corpus.sh" >/tmp/samurai-ablive-run.log 2>&1 &
         local pid=$!
         sleep "$switch_after"
@@ -101,6 +103,7 @@ run_arm() {  # $1=arm  $2=out_corpus  $3=start_port  $4=target_port
             CL_WINDOW_S="$CL_WINDOW_S" CL_AIMD_MAX_WINDOWS="$CL_AIMD_MAX_WINDOWS" \
             CL_MIN_RPS="$CL_MIN_RPS" CL_MAX_RPS="$CL_MAX_RPS" \
             CL_SLO_MAX_ERROR_PCT="$CL_SLO_MAX_ERROR_PCT" \
+            CL_SLO_MAX_PUSHBACK_PCT="$CL_SLO_MAX_PUSHBACK_PCT" \
             CORPUS="$out" bash "$HERE/run-corpus.sh" >/tmp/samurai-ablive-run.log 2>&1
     fi
     local n; n=$(wc -l < "$out" 2>/dev/null || echo 0)

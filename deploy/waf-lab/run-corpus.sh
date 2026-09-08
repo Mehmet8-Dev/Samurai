@@ -36,6 +36,9 @@ CL_MIN_RPS="${CL_MIN_RPS:-50}"
 CL_MAX_RPS="${CL_MAX_RPS:-2000}"
 CL_WINDOW_S="${CL_WINDOW_S:-5}"
 CL_SLO_MAX_ERROR_PCT="${CL_SLO_MAX_ERROR_PCT:-2.0}"
+# Defense-pushback SLO: (4xx+5xx)/responses*100 <= X (0 = off). Set >0 so the loop
+# treats ramping into a rate wall as a breach and settles at the honored ceiling.
+CL_SLO_MAX_PUSHBACK_PCT="${CL_SLO_MAX_PUSHBACK_PCT:-0.0}"
 CL_AIMD_MAX_WINDOWS="${CL_AIMD_MAX_WINDOWS:-40}"
 CL_AIMD_INCREASE_RPS="${CL_AIMD_INCREASE_RPS:-0}"  # 0 => controller default step
 
@@ -113,6 +116,7 @@ echo ">> starting master (closed-loop); corpus -> $CORPUS"
 	--cl-window-s "$CL_WINDOW_S" \
 	--cl-min-rps "$CL_MIN_RPS" --cl-max-rps "$CL_MAX_RPS" \
 	--cl-slo-max-error-pct "$CL_SLO_MAX_ERROR_PCT" \
+	--cl-slo-max-pushback-pct "$CL_SLO_MAX_PUSHBACK_PCT" \
 	--cl-aimd-max-windows "$CL_AIMD_MAX_WINDOWS" \
 	--cl-aimd-increase-rps "$CL_AIMD_INCREASE_RPS" \
 	"${EXPLORE_ARGS[@]}" \

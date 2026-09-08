@@ -135,6 +135,7 @@ samurai::control::ClosedLoopConfig BuildClosedLoopConfig(int argc, char** argv) 
   cl.slo_max_loss_pct = OptDouble(argc, argv, "--cl-slo-max-loss-pct", 0.0);
   cl.slo_min_rate_accuracy_pct = OptDouble(argc, argv, "--cl-slo-min-rate-accuracy-pct", 0.0);
   cl.slo_max_latency_ms = OptDouble(argc, argv, "--cl-slo-max-latency-ms", 0.0);
+  cl.slo_max_pushback_pct = OptDouble(argc, argv, "--cl-slo-max-pushback-pct", 0.0);
   cl.aimd_increase_rps = static_cast<double>(OptInt(argc, argv, "--cl-aimd-increase-rps", 0));
   cl.aimd_backoff = OptDouble(argc, argv, "--cl-aimd-backoff", 0.5);
   cl.aimd_max_windows = static_cast<int>(OptInt(argc, argv, "--cl-aimd-max-windows", 0));
@@ -218,6 +219,18 @@ samurai::control::LoadSample DeriveSample(const Value& snap) {
   s.errors = err_v;
   if (const Value* nt = snap.find("numeric_totals")) {
     if (const Value* rps = nt->find("actual_rps")) s.actual_rps = rps->as_double(0.0);
+    // Defense pushback share: (4xx rate-limit + 5xx overload) / responses_total, %.
+    // This is the honest "target rejected our load" signal the error_pct rule misses
+    // (a 429 is not a client/server error), so the SLO can flag ramping into a rate
+    // wall. Left unknown (-1) when the SUT emits no HTTP status telemetry.
+    const Value* resp = nt->find("responses_total");
+    const double resp_v = resp ? resp->as_double(0.0) : 0.0;
+    if (resp_v > 0.0) {
+      const Value* x4 = nt->find("status_4xx");
+      const Value* x5 = nt->find("status_5xx");
+      const double pb = (x4 ? x4->as_double(0.0) : 0.0) + (x5 ? x5->as_double(0.0) : 0.0);
+      s.pushback_pct = 100.0 * pb / resp_v;
+    }
   }
   s.valid = true;
   return s;
@@ -387,6 +400,7 @@ Value RlTransitionJson(const std::string& run_id, int win, double action_rps,
   slo.set("max_loss_pct", Value::Double(cfg.slo_max_loss_pct));
   slo.set("min_rate_accuracy_pct", Value::Double(cfg.slo_min_rate_accuracy_pct));
   slo.set("max_latency_ms", Value::Double(cfg.slo_max_latency_ms));
+  slo.set("max_pushback_pct", Value::Double(cfg.slo_max_pushback_pct));
   o.set("slo", slo);
   // Scalar action_rps kept for back-compat; `action` is the full Mahoraga vector.
   o.set("action_rps", Value::Double(action_rps));
@@ -543,6 +557,9 @@ void Usage(const char* argv0) {
       "  --cl-slo-max-loss-pct X   SLO: wire loss %% <= X (0 = off)\n"
       "  --cl-slo-min-rate-accuracy-pct X  SLO: rate accuracy %% >= X (0 = off)\n"
       "  --cl-slo-max-latency-ms X SLO: SUT p99 ms <= X (needs --sut-*; 0 = off)\n"
+      "  --cl-slo-max-pushback-pct X  SLO: (4xx+5xx)/responses*100 <= X (0 = off);\n"
+      "                            flags ramping into a rate wall so the loop settles\n"
+      "                            at the honored ceiling instead of maxing into 429s\n"
       "  --cl-aimd-increase-rps N  AIMD additive step (0 => 10%% of range)\n"
       "  --cl-aimd-backoff X       AIMD multiplicative decrease, (0,1) (default 0.5)\n"
       "  --cl-aimd-max-windows N   AIMD window budget (0 => unbounded soak)\n"

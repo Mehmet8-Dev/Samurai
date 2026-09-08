@@ -53,6 +53,13 @@ struct ClosedLoopConfig {
   double slo_max_loss_pct = 0.0;           // wire_loss_est_pct    <= X
   double slo_min_rate_accuracy_pct = 0.0;  // rate_accuracy_pct    >= X
   double slo_max_latency_ms = 0.0;         // latency_p99_ms       <= X (needs SUT signal)
+  // Defense pushback (rate-limit 429 / overload 503 share, %) <= X. A load test whose
+  // requests are being rejected is NOT delivering its target load, so sustained
+  // pushback is a real SLO breach — without this rule the controller keeps ramping
+  // into a rate wall (429s do not raise error_pct), never settling at the honored
+  // ceiling. Enables ceiling-finding for AIMD/binsearch and forces the RL shield's
+  // backoff on a rejecting window.
+  double slo_max_pushback_pct = 0.0;       // 100*(4xx+5xx)/responses_total <= X
 
   // AIMD params.
   double aimd_increase_rps = 0.0;  // <=0 => 10% of (max_rps - min_rps)
@@ -84,6 +91,7 @@ struct LoadSample {
   double loss_pct = -1.0;
   double rate_accuracy_pct = -1.0;
   double latency_p99_ms = -1.0;  // unknown until SUT correlation feeds it
+  double pushback_pct = -1.0;    // 100*(4xx+5xx)/responses_total; <0 => unknown (rule skipped)
   // kRl only: the policy's proposed setpoint for the NEXT window, computed by the
   // caller from this measured state. < 0 => no proposal (shield falls back to AIMD).
   double rl_action_rps = -1.0;
