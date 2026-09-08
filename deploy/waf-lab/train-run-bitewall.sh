@@ -36,9 +36,10 @@ CL_MAX_RPS="${CL_MAX_RPS:-800}"
 # ceiling-finding dynamics, not blind maxing.
 CL_SLO_MAX_PUSHBACK_PCT="${CL_SLO_MAX_PUSHBACK_PCT:-20.0}"
 # Training targets (NOT :8085 — that is the held-out generalization ceiling).
-#   8083 pure r100, 8084 pure r50, 8086 pure r200, 8080 Coraza r100+WAF.
-STATIC_TARGETS=(8083 8084 8086 8080)
-SHIFT_PAIRS=("8083:8084" "8086:8083")   # rate-drops: 100->50, 200->100 (and reverse)
+# Env-overridable for a wider profile set; default is the pure-rate {100,50,200}+Coraza.
+#   BW_STATIC_TARGETS="8084 8083 8086 8080 8081" for the 5-profile diversity set.
+read -ra STATIC_TARGETS <<< "${BW_STATIC_TARGETS:-8083 8084 8086 8080}"
+read -ra SHIFT_PAIRS <<< "${BW_SHIFT_PAIRS:-8083:8084 8086:8083}"   # rate-drops
 
 mkdir -p "$BITE_DIR"
 echo "=================================================================="
