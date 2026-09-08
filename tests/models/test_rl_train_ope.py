@@ -81,13 +81,15 @@ def test_train_export_reload_evaluate(tmp_path):
     back = load_policy(p)
     assert np.allclose(art.act_batch(ds.states), back.act_batch(ds.states), atol=1e-5)
 
-    # OPE returns finite numbers and a well-formed gate.
+    # OPE returns finite numbers and a well-formed gate. Default is trajectory-wide:
+    # the value is anchored at every visited state, not just the 8 episode starts.
     res = evaluate_policy(ds, art, FQEConfig(steps=400, batch_size=128, seed=0))
     assert np.isfinite(res.fqe_value)
     assert np.isfinite(res.behavior_return)
     assert isinstance(res.gate_pass, bool)
     assert res.n_episodes == 8
-    assert res.n_initial_states == 8
+    assert res.trajectory_value is True
+    assert res.n_initial_states == len(ds)
     # Bootstrap CI brackets the point estimate, and the default gate is pessimistic:
     # it passes iff the improvement's lower confidence bound clears zero.
     assert res.improvement_ci_low <= res.improvement_ci_high
@@ -98,6 +100,13 @@ def test_train_export_reload_evaluate(tmp_path):
     legacy = evaluate_policy(
         ds, art, FQEConfig(steps=400, batch_size=128, seed=0, pessimistic_gate=False))
     assert legacy.gate_pass == (legacy.fqe_value >= legacy.behavior_return)
+
+    # The s0-anchored mode is still available and pins the value to the 8 episode
+    # starts (zero-context first window) — the legacy instrument.
+    s0mode = evaluate_policy(
+        ds, art, FQEConfig(steps=400, batch_size=128, seed=0, trajectory_value=False))
+    assert s0mode.trajectory_value is False
+    assert s0mode.n_initial_states == 8
 
     # The horizon diagnostic is exposed: gamma=0.99 => effective horizon ~100, well
     # over these ~10-window episodes, so the mismatch flag fires.
@@ -294,6 +303,77 @@ def test_training_is_deterministic(tmp_path):
     for (W1, b1), (W2, b2) in zip(a1.layers, a2.layers):
         assert np.array_equal(W1, W2)
         assert np.array_equal(b1, b2)
+
+
+def test_returns_to_go_matches_manual(tmp_path):
+    """behavior_returns_to_go computes, per transition, the discounted return from that
+    step to the episode's end — the pairing target for the trajectory-wide value."""
+    from ddos_samurai.models.rl.ope import _episode_slices, behavior_returns_to_go
+
+    ds = build_dataset(_corpus(tmp_path / "c.ndjson", episodes=2, windows=4))
+    gamma = 0.9
+    slices = _episode_slices(ds.episode_ids)
+    g = behavior_returns_to_go(ds, gamma, slices)
+    assert g.shape[0] == len(ds)
+    # Recompute independently within each episode: G_t = r_t + gamma*G_{t+1}.
+    for b0, e0 in slices:
+        acc = 0.0
+        for i in range(e0 - 1, b0 - 1, -1):
+            acc = float(ds.rewards[i]) + gamma * acc
+            assert abs(g[i] - acc) < 1e-6
+    # And the first index of each episode equals the full discounted episode return.
+    from ddos_samurai.models.rl.ope import behavior_returns_per_episode
+    per_ep = behavior_returns_per_episode(ds, gamma)
+    for (b0, _e0), ret in zip(slices, per_ep):
+        assert abs(g[b0] - ret) < 1e-6
+
+
+def test_trajectory_value_credits_recurrent_memory(tmp_path):
+    """The whole point of trajectory-wide OPE: score the policy's value-to-go at every
+    visited state (crediting warmed late-window context), not just the zero-context s0.
+    For a recurrent RL² policy on a within-episode regime-shift corpus, the trajectory
+    anchor set spans all transitions and both modes stay finite — the s0 anchor sees
+    only the cold first window."""
+    pytest.importorskip("torch")
+    from ddos_samurai.models.rl.rl2 import RL2Config, train_rl2
+    from ddos_samurai.models.rl.ope import FQEConfig, evaluate_policy
+
+    # Mid-episode shift: the sustainable ceiling drops halfway, so late windows carry
+    # information the cold start cannot — exactly what recurrent context exploits.
+    p = tmp_path / "shift.ndjson"
+    rng = np.random.default_rng(3)
+    with open(p, "w", encoding="utf-8") as fh:
+        for ep in range(10):
+            rps, prev = 100.0, 0.0
+            for w in range(12):
+                ceiling = 1400.0 if w < 6 else 500.0  # regime shift at the midpoint
+                healthy = rps <= ceiling
+                err = 0.0 if healthy else min(20.0, (rps - ceiling) / ceiling * 30.0)
+                s2 = rps if healthy else ceiling
+                fh.write(json.dumps({
+                    "run_id": f"cl-{ep}", "win": w, "ts_ms": w, "strategy": "aimd",
+                    "min_rps": 50.0, "max_rps": 2000.0, "window_s": 5,
+                    "slo": {"max_error_pct": 2.0, "max_loss_pct": 0.0,
+                            "min_rate_accuracy_pct": 0.0, "max_latency_ms": 0.0},
+                    "action_rps": rps, "action": {"rps": rps, "pacing_mode": 1},
+                    "s_valid": w > 0, "s": _state(prev), "s2": _state(s2, error_pct=err),
+                    "healthy": healthy, "phase": "probe", "done": w == 11,
+                }) + "\n")
+                prev = s2
+                rps = rps + 120.0 if healthy else rps * 0.5
+
+    ds = build_dataset(p)
+    art = train_rl2(ds, RL2Config(hidden_dim=8, critic_steps=200, actor_steps=200, seed=0))
+
+    traj = evaluate_policy(ds, art, FQEConfig(steps=300, seed=0))  # default trajectory
+    s0 = evaluate_policy(ds, art, FQEConfig(steps=300, seed=0, trajectory_value=False))
+
+    assert traj.trajectory_value is True and s0.trajectory_value is False
+    # Trajectory mode anchors on every visited state; s0 mode only on episode starts.
+    assert traj.n_initial_states == len(ds)
+    assert s0.n_initial_states == 10
+    assert np.isfinite(traj.fqe_value) and np.isfinite(s0.fqe_value)
+    assert isinstance(traj.gate_pass, bool)
 
 
 def test_behavior_return_matches_manual(tmp_path):

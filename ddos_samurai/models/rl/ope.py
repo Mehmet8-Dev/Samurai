@@ -62,6 +62,17 @@ class FQEConfig:
     # action dim; otherwise the shield is inert and this is a no-op.
     shielded: bool = True
     shield_honored_floor: float = HONORED_SUCCESS_FLOOR
+    # Trajectory-wide value instead of the initial-state anchor. The bare FQE scores
+    # Q(s0, pi(s0)) at each episode's ZERO-CONTEXT first window, which structurally
+    # under-credits a recurrent (RL²) policy whose advantage only materializes once
+    # its context has warmed mid/late-episode. With `trajectory_value`, we instead
+    # score the policy's value-to-go at EVERY visited state — Q(s_t, pi(s_t|ctx_t)) for
+    # the recurrent in-context action — and pair it against the behavior return-to-go
+    # from the same t. Averaged per episode, this credits the late-window adaptation a
+    # meta-RL policy is trained for, while a stateless (FF) policy gets no such lift
+    # (its action does not depend on ctx_t). The s0-anchored score remains available by
+    # setting this False.
+    trajectory_value: bool = True
 
 
 @dataclass(frozen=True)
@@ -83,6 +94,9 @@ class OPEResult:
     # True when the shield actually governed the evaluated action (block features
     # present + request_mix action dim). False => the bare policy was scored.
     shielded: bool = False
+    # True when the value was scored trajectory-wide (value-to-go at every visited
+    # state, crediting late-window recurrent context) rather than at the s0 anchor.
+    trajectory_value: bool = False
 
     @property
     def improvement(self) -> float:
@@ -112,6 +126,21 @@ def behavior_return(dataset: Dataset, gamma: float) -> float:
     """Mean discounted Monte-Carlo return of the logged trajectories (the baseline)."""
     per_ep = behavior_returns_per_episode(dataset, gamma)
     return float(per_ep.mean()) if per_ep.size else 0.0
+
+
+def behavior_returns_to_go(dataset: Dataset, gamma: float,
+                           slices: list[tuple[int, int]]) -> np.ndarray:
+    """Per-transition discounted return-to-go G_t = sum_{k>=t} gamma^(k-t) r_k, computed
+    within each episode. This is the behavior baseline's value-to-go from every visited
+    state, the natural pairing target for a trajectory-wide (not just s0) policy value."""
+    rewards = dataset.rewards
+    g_all = np.zeros(rewards.shape[0], dtype=np.float64)
+    for b0, e0 in slices:
+        g = 0.0
+        for i in range(e0 - 1, b0 - 1, -1):
+            g = float(rewards[i]) + gamma * g
+            g_all[i] = g
+    return g_all
 
 
 def _paired_bootstrap_ci(a: np.ndarray, b: np.ndarray, n_boot: int, alpha: float,
@@ -301,22 +330,45 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
             for tp, sp in zip(q_t.parameters(), q.parameters()):
                 tp.mul_(1 - cfg.polyak).add_(cfg.polyak * sp)
 
-    # Value estimate: Q(s0, pi(s0)) at each episode's initial state (per-episode, so
-    # it pairs 1:1 with beh_per_ep for the bootstrap; np.unique gives the same order).
     eids = dataset.episode_ids
-    first_idx = [int(np.where(eids == e)[0][0]) for e in np.unique(eids)]
-    s0_raw = dataset.states[first_idx]
-    # A recurrent policy's initial-state action is its first-window action (zero
-    # context), which is exactly rec_a_s at each episode's first index.
-    a0 = rec_a_s[first_idx] if recurrent else policy_act(s0_raw)
-    with torch.no_grad():
-        s0 = torch.tensor(norm.transform(s0_raw), dtype=torch.float32, device=dev)
-        s0a0 = torch.cat([s0, torch.tensor(a0, dtype=torch.float32, device=dev)], dim=1)
-        fqe_per_ep = q(s0a0).squeeze(-1).cpu().numpy().astype(np.float64)
+    slices = _episode_slices(eids)
+
+    if cfg.trajectory_value:
+        # Trajectory-wide value: Q(s_t, pi(s_t|ctx_t)) at EVERY visited state, using the
+        # policy's in-context action there (rec_a_s already rolls the recurrent context
+        # through the logged trajectory; a stateless policy is context-free). We pair it
+        # against the behavior return-to-go from the same t, then average per episode so
+        # the bootstrap still resamples whole episodes 1:1. A recurrent policy's late-t
+        # rows carry warmed context — the memory advantage the s0 anchor cannot see.
+        a_all = rec_a_s if recurrent else policy_act(dataset.states)
+        with torch.no_grad():
+            sa_all = torch.cat(
+                [s, torch.tensor(a_all, dtype=torch.float32, device=dev)], dim=1)
+            q_all = q(sa_all).squeeze(-1).cpu().numpy().astype(np.float64)
+        g_all = behavior_returns_to_go(dataset, cfg.gamma, slices)
+        fqe_per_ep = np.array([q_all[b0:e0].mean() for b0, e0 in slices], dtype=np.float64)
+        base_per_ep = np.array([g_all[b0:e0].mean() for b0, e0 in slices], dtype=np.float64)
+        n_anchor = len(dataset)
+    else:
+        # Value estimate: Q(s0, pi(s0)) at each episode's initial state (per-episode, so
+        # it pairs 1:1 with beh_per_ep for the bootstrap; np.unique gives the same order).
+        first_idx = [int(np.where(eids == e)[0][0]) for e in np.unique(eids)]
+        s0_raw = dataset.states[first_idx]
+        # A recurrent policy's initial-state action is its first-window action (zero
+        # context), which is exactly rec_a_s at each episode's first index.
+        a0 = rec_a_s[first_idx] if recurrent else policy_act(s0_raw)
+        with torch.no_grad():
+            s0 = torch.tensor(norm.transform(s0_raw), dtype=torch.float32, device=dev)
+            s0a0 = torch.cat([s0, torch.tensor(a0, dtype=torch.float32, device=dev)], dim=1)
+            fqe_per_ep = q(s0a0).squeeze(-1).cpu().numpy().astype(np.float64)
+        base_per_ep = beh_per_ep
+        n_anchor = len(first_idx)
+
     fqe = float(fqe_per_ep.mean())
+    base = float(base_per_ep.mean()) if base_per_ep.size else base
 
     imp_lo, imp_hi = _paired_bootstrap_ci(
-        fqe_per_ep, beh_per_ep, cfg.n_bootstrap, cfg.ci_alpha, cfg.seed)
+        fqe_per_ep, base_per_ep, cfg.n_bootstrap, cfg.ci_alpha, cfg.seed)
     fqe_lo, fqe_hi = _paired_bootstrap_ci(
         fqe_per_ep, np.zeros_like(fqe_per_ep), cfg.n_bootstrap, cfg.ci_alpha, cfg.seed)
 
@@ -333,7 +385,7 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
         behavior_return=base,
         gate_pass=gate,
         n_episodes=n_eps,
-        n_initial_states=len(first_idx),
+        n_initial_states=n_anchor,
         improvement_ci_low=imp_lo,
         improvement_ci_high=imp_hi,
         fqe_ci_low=fqe_lo,
@@ -341,4 +393,5 @@ def evaluate_policy(dataset: Dataset, artifact: PolicyArtifact,
         effective_horizon=eff_h,
         mean_episode_len=mean_len,
         shielded=shield_on,
+        trajectory_value=cfg.trajectory_value,
     )
