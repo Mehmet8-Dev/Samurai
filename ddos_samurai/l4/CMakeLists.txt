@@ -17,6 +17,10 @@ add_library(
   tcp_dataplane_ffi.cpp
   hw_timestamping.cpp)
 target_include_directories(samurai_l4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# Vendored header-only flat hash map (ankerl::unordered_dense, MIT, v4.4.0).
+# PUBLIC because tcp_dataplane_core.hpp includes it in a public type, so every
+# consumer of samurai_l4 must see it on their include path.
+target_include_directories(samurai_l4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../third_party)
 
 # af_packet is the custom_tcp wire backend (kernel sockets on commodity NICs).
 # Standalone builds of this tree add the subdirectory themselves; guarded so it

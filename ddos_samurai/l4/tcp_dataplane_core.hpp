@@ -12,6 +12,7 @@
 #include <string>
 #include "spinlock.hpp"
 #include <unordered_map>
+#include <ankerl/unordered_dense.h>
 #include <vector>
 
 namespace ddos_samurai::tcpdp {
@@ -479,8 +480,14 @@ class TcpDataplaneCore {
   uint16_t ephemeral_port_base_ = 40000;
   uint16_t ephemeral_port_stride_ = 1;
   uint32_t seq_seed_ = 0x10203040U;
+  // flows_by_id_shard_ stays node-based (std::unordered_map): FlowEntry is a
+  // heavy value and callers hold `FlowEntry*` across mutations — a dense/flat
+  // map would move entries on rehash and invalidate those pointers.
   std::array<std::unordered_map<uint64_t, FlowEntry>, kFlowLockShards> flows_by_id_shard_{};
-  std::array<std::unordered_map<FlowKey, uint64_t, FlowKeyHash>, kFlowLockShards> flow_index_shard_{};
+  // flow_index_shard_ is the per-packet RX 4-tuple->flow_id lookup: tiny value,
+  // no reference-stability requirement (the id is copied out immediately), so a
+  // flat/dense map wins on cache locality with no aliasing hazard.
+  std::array<ankerl::unordered_dense::map<FlowKey, uint64_t, FlowKeyHash>, kFlowLockShards> flow_index_shard_{};
   size_t tx_ring_slot_size_ = 2048;
   size_t tx_ring_capacity_ = 8192;
   size_t tx_overflow_capacity_ = 8192;
