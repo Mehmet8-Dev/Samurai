@@ -64,10 +64,12 @@ for pol in "$RL2_POLICY" "$FF_POLICY"; do
 done
 
 SOCAT_PID=""
-proxy_to()   { [ -n "$SOCAT_PID" ] && kill "$SOCAT_PID" 2>/dev/null && wait "$SOCAT_PID" 2>/dev/null
+# SIGKILL (not TERM) so a wedged socat always dies; else the reap `wait` hangs forever
+# (this stalled a whole run for 8h). Decoupled from the kill so a failed kill can't gate.
+proxy_to()   { if [ -n "$SOCAT_PID" ]; then kill -9 "$SOCAT_PID" 2>/dev/null; wait "$SOCAT_PID" 2>/dev/null; fi
                socat TCP-LISTEN:8090,fork,reuseaddr "TCP:127.0.0.1:$1" >/dev/null 2>&1 &
                SOCAT_PID=$!; }
-proxy_down() { [ -n "$SOCAT_PID" ] && kill "$SOCAT_PID" 2>/dev/null && wait "$SOCAT_PID" 2>/dev/null; SOCAT_PID=""; }
+proxy_down() { if [ -n "$SOCAT_PID" ]; then kill -9 "$SOCAT_PID" 2>/dev/null; wait "$SOCAT_PID" 2>/dev/null; fi; SOCAT_PID=""; }
 wait_proxy() { for _ in $(seq 1 40); do curl -fsS "http://127.0.0.1:8090/healthz" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
 trap proxy_down EXIT
 
