@@ -29,6 +29,7 @@ constexpr uint8_t kTcpFlagAck = 0x10;
 // Send-side sliding-window limits.
 constexpr size_t kSndBufCap = 1u << 20;           // 1 MiB per-flow app send buffer
 constexpr size_t kSndBufCompactThreshold = 64u * 1024u;  // compact once head passes this
+constexpr size_t kSegBufPoolCap = 64;             // max recycled segment buffers held per flow
 constexpr uint32_t kMaxCwnd = 16u * 1024u * 1024u;       // cwnd ceiling (bytes)
 constexpr uint32_t kMinRtoMs = 50u;                      // RTO floor (LAN-oriented load generator)
 constexpr uint8_t kOptEnd = 0, kOptNop = 1, kOptMss = 2, kOptWScale = 3, kOptSackPerm = 4, kOptSack = 5;
@@ -1526,6 +1527,25 @@ uint64_t TcpDataplaneCore::CurrentRtoNs(const FlowEntry& flow) const {
   return NsFromMs(rto_ms ? rto_ms : 250u);
 }
 
+std::vector<uint8_t> TcpDataplaneCore::AcquireSegBuf(FlowEntry& flow) {
+  if (!flow.seg_buf_pool.empty()) {
+    std::vector<uint8_t> buf = std::move(flow.seg_buf_pool.back());
+    flow.seg_buf_pool.pop_back();
+    buf.clear();  // keep capacity, drop stale contents (assign overwrites anyway)
+    return buf;
+  }
+  return {};
+}
+
+void TcpDataplaneCore::RecycleSegBuf(FlowEntry& flow, std::vector<uint8_t>&& buf) {
+  // Only pool buffers that actually own storage, and cap the hoard so a flow that
+  // briefly bursts does not pin memory forever.
+  if (buf.capacity() == 0 || flow.seg_buf_pool.size() >= kSegBufPoolCap) {
+    return;
+  }
+  flow.seg_buf_pool.push_back(std::move(buf));
+}
+
 uint32_t TcpDataplaneCore::EmitOneDataSegment(FlowEntry& flow, uint64_t now_ns, uint32_t window_room) {
   const size_t buffered = flow.sndbuf.size() - flow.sndbuf_head;
   if (buffered == 0 || window_room == 0) {
@@ -1558,6 +1578,7 @@ uint32_t TcpDataplaneCore::EmitOneDataSegment(FlowEntry& flow, uint64_t now_ns, 
   seg.flags = flags;
   seg.xmit_count = 1;
   seg.sent_ns = now_ns;
+  seg.data = AcquireSegBuf(flow);
   seg.data.assign(src, src + seg_len);
   flow.unacked.push_back(std::move(seg));
   flow.snd_nxt = AdvanceSeq(flow.snd_nxt, seg_len);
@@ -1940,6 +1961,7 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpO
     const uint32_t seg_end = seg.seq + SegSeqLen(seg.flags, seg.payload_len);
     if (SeqLeq(seg_end, ack_value)) {
       if (seg.xmit_count == 1 && seg.sent_ns > rtt_sample_ns) rtt_sample_ns = seg.sent_ns;
+      RecycleSegBuf(flow, std::move(seg.data));  // reclaim storage before the element dies
       flow.unacked.pop_front();  // fully acknowledged
     } else if (SeqGt(ack_value, seg.seq)) {
       const uint32_t drop = ack_value - seg.seq;

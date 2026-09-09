@@ -276,6 +276,11 @@ class TcpDataplaneCore {
     std::vector<uint8_t> sndbuf;
     size_t sndbuf_head = 0;  // consumed offset into sndbuf (compacted lazily)
     std::deque<OutstandingTx> unacked;
+    // Free list of segment payload buffers recycled between emit and cumulative
+    // ACK. In steady state a flow emits N segments and retires N, so reusing the
+    // backing storage here turns the per-segment malloc/free churn into zero
+    // heap traffic. Capacity is bounded by kSegBufPoolCap.
+    std::vector<std::vector<uint8_t>> seg_buf_pool;
   };
 
   enum class TimerKind : uint8_t {
@@ -453,6 +458,10 @@ class TcpDataplaneCore {
   // Emit a single fresh data segment from sndbuf (shared by PumpSend + recovery).
   // Returns bytes emitted (0 if window/buffer/Nagle blocked).
   uint32_t EmitOneDataSegment(FlowEntry& flow, uint64_t now_ns, uint32_t window_room);
+  // Segment-payload buffer recycling (see FlowEntry::seg_buf_pool). AcquireSegBuf
+  // hands back a cleared-capacity buffer; RecycleSegBuf returns a retired one.
+  std::vector<uint8_t> AcquireSegBuf(FlowEntry& flow);
+  void RecycleSegBuf(FlowEntry& flow, std::vector<uint8_t>&& buf);
   // Delayed-ACK: account an in-order data segment; send an ACK now or arm the timer.
   void OnDataReceivedAck(FlowEntry& flow, uint64_t now_ns, bool force_now);
   void SendAckNow(FlowEntry& flow);
