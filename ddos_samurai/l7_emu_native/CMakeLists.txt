@@ -23,6 +23,15 @@ endif()
 # present and are otherwise reported as unavailable by detect_capabilities().
 set(SAMURAI_L7EMU_SOURCES
   engine.cpp
+  engine_arena.cpp
+  engine_h1_transport.cpp
+  engine_h1_parser.cpp
+  engine_h2_session.cpp
+  engine_custom_tcp.cpp
+  engine_runtime.cpp
+  engine_h1_request.cpp
+  engine_h2_profile.cpp
+  engine_dns_l2l3.cpp
   bridge.cpp
   tls_session_engine.cpp
   dns_client_engine.cpp
