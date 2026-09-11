@@ -1,5 +1,7 @@
 #include "udp_io.hpp"
 
+#include "../io_uring_compat.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -869,5 +871,94 @@ bool run_udp_probe_batch(
   out->errors = std::max(out->errors, attempted - out->send_ok);
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// io_uring readiness wait for the QUIC/HTTP-3 kernel-socket loop
+// ---------------------------------------------------------------------------
+#if defined(SAMURAI_HAS_LINUX_IO_URING) && defined(__NR_io_uring_setup)
+
+namespace {
+
+// One lazily-initialised ring per worker thread. QUIC connections are pinned to
+// a thread, so a single ring drives all of that thread's readiness waits.
+SamuraiUring& quic_thread_ring() {
+  thread_local SamuraiUring ring;
+  thread_local bool attempted = false;
+  if (!attempted) {
+    attempted = true;
+    ring.init(64, kUringSetupSingleIssuer | kUringSetupCqsize, 128);
+  }
+  return ring;
+}
+
+// Fixed user_data for the readiness poll on the shared thread-local ring; a
+// single wait is in flight at a time, so no per-call generation is needed.
+constexpr uint64_t kQuicPollUserData = 0x5155494350ULL;  // "QUICP"
+
+}  // namespace
+
+bool quic_uring_available() { return quic_thread_ring().is_active(); }
+
+int quic_uring_wait_readable(int fd, int timeout_ms) {
+  SamuraiUring& ring = quic_thread_ring();
+  if (!ring.is_active() || fd < 0) {
+    return -1;
+  }
+  // Drain any stragglers so a previous timeout's poll cannot be mistaken for
+  // this wait's completion.
+  io_uring_cqe* drain[8];
+  int stray = ring.peek_batch_cqe(drain, 8);
+  if (stray > 0) {
+    ring.cq_advance(static_cast<unsigned>(stray));
+  }
+
+  io_uring_sqe* sqe = ring.get_sqe();
+  if (sqe == nullptr) {
+    return -1;
+  }
+  prep_uring_poll_add(sqe, fd, POLLIN | POLLERR | POLLHUP, /*multishot=*/false,
+                      kQuicPollUserData);
+  (void)ring.submit_and_wait_cqes(1, timeout_ms);
+
+  io_uring_cqe* cqes[8];
+  int reaped = ring.peek_batch_cqe(cqes, 8);
+  bool ready = false;
+  for (int i = 0; i < reaped; ++i) {
+    if (cqes[i]->user_data == kQuicPollUserData && cqes[i]->res != 0) {
+      ready = true;
+    }
+  }
+  if (reaped > 0) {
+    ring.cq_advance(static_cast<unsigned>(reaped));
+  }
+
+  if (!ready) {
+    // Timed out: the single-shot poll is still armed in the kernel and would
+    // fire into a later wait. Cancel it and consume the removal completion so
+    // the ring is left clean.
+    io_uring_sqe* rm = ring.get_sqe();
+    if (rm != nullptr) {
+      prep_uring_poll_remove(rm, kQuicPollUserData, kQuicPollUserData + 1);
+      (void)ring.submit();
+      // Best-effort reap of the poll-remove (and a possibly-racing poll) result.
+      for (int spin = 0; spin < 2; ++spin) {
+        int rr = ring.peek_batch_cqe(cqes, 8);
+        if (rr > 0) {
+          ring.cq_advance(static_cast<unsigned>(rr));
+        }
+      }
+    }
+    return 0;
+  }
+  return 1;
+}
+
+#else  // io_uring unavailable at build time
+
+bool quic_uring_available() { return false; }
+
+int quic_uring_wait_readable(int /*fd*/, int /*timeout_ms*/) { return -1; }
+
+#endif
 
 }  // namespace ddos_samurai::l7_emu_native::custom_quic_stack

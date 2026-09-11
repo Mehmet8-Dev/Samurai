@@ -3780,10 +3780,15 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
     if (next_wakeup > now) {
       const int wait_ms = static_cast<int>(std::clamp<int64_t>(ns_to_ms_ceil(next_wakeup - now), 0, 10));
       if (wait_ms > 0) {
-        pollfd pfd{};
-        pfd.fd = ctx->fd;
-        pfd.events = POLLIN;
-        (void)::poll(&pfd, 1, wait_ms);
+        // Prefer the shared io_uring readiness wait so the QUIC/HTTP-3 loop rides
+        // the same ring as H1/H2; fall back to ::poll when io_uring is
+        // unavailable on this build or host (helper returns -1).
+        if (quic_uring_wait_readable(ctx->fd, wait_ms) < 0) {
+          pollfd pfd{};
+          pfd.fd = ctx->fd;
+          pfd.events = POLLIN;
+          (void)::poll(&pfd, 1, wait_ms);
+        }
         if (out != nullptr) {
           out->pacing_wait_events += 1;
         }

@@ -145,6 +145,17 @@ int af_packet_recv_udp(
     std::size_t* lens_out,
     int max_packets);
 
+// Wait for a UDP socket to become readable through an io_uring readiness poll
+// instead of ::poll(), so the QUIC/HTTP-3 kernel-socket event loop shares the
+// same ring machinery as the H1/H2 reactor. Returns 1 if the fd became readable
+// (or errored), 0 on timeout, and -1 when io_uring is unavailable on this build
+// or host - in which case the caller MUST fall back to ::poll(). Safe to call
+// unconditionally; the io_uring ring is a lazily-initialised thread-local.
+int quic_uring_wait_readable(int fd, int timeout_ms);
+
+// True when the thread-local io_uring ring is active (diagnostics / metrics).
+bool quic_uring_available();
+
 bool run_udp_probe_batch(
     const Profile& profile,
     int attempted,
