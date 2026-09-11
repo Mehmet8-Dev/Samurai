@@ -555,6 +555,13 @@ Profile parse_profile(const json::Value& profile_dict) {
     profile.stateful_runtime_backend = GetStr(*conn, "stateful_runtime_backend", profile.stateful_runtime_backend);
     profile.stateful_runtime_strict = GetInt(*conn, "stateful_runtime_strict", profile.stateful_runtime_strict);
     profile.legacy_mode = GetInt(*conn, "legacy_mode", profile.legacy_mode);
+    std::string raw_reactor = GetStr(*conn, "reactor_backend");
+    if (raw_reactor.empty()) {
+      raw_reactor = GetStr(profile_dict, "reactor_backend");
+    }
+    if (!raw_reactor.empty()) {
+      profile.reactor_backend = raw_reactor;
+    }
     profile.source_ip = GetStr(*conn, "source_ip");
     if (profile.source_ip.empty()) profile.source_ip = GetStr(*conn, "client_ip");
     profile.target_ip = GetStr(*conn, "target_ip");
@@ -599,6 +606,7 @@ json::Value runtime_capabilities_json() {
   out.set("nghttp2", json::Value::Bool(caps.nghttp2));
   out.set("ngtcp2", json::Value::Bool(caps.ngtcp2));
   out.set("nghttp3", json::Value::Bool(caps.nghttp3));
+  out.set("io_uring", json::Value::Bool(caps.io_uring));
   out.set("quic_native", json::Value::Bool(quic_native_built));
   return out;
 }
@@ -636,7 +644,8 @@ json::Value run_profile_json(const json::Value& profile_dict, const json::Value&
     failed.set("l7_flow_attempted", json::Value::Int(profile.flow_attempted));
     failed.set("l7_flow_completed", json::Value::Int(0));
     failed.set("l7_expectation_failures", json::Value::Int(profile.flow_attempted));
-    failed.set("runtime_reactor_backend", json::Value::Str("socket_epoll"));
+    const ReactorBackend failed_reactor = resolve_reactor_backend(profile.reactor_backend, caps.io_uring);
+    failed.set("runtime_reactor_backend", json::Value::Str(reactor_backend_name(failed_reactor)));
     failed.set("runtime_transport_backend", json::Value::Str(transport_backend_name(transport_backend)));
     failed.set("runtime_tls_backend", json::Value::Str(caps.openssl ? "openssl" : "unavailable"));
     failed.set("runtime_http2_backend", json::Value::Str(caps.nghttp2 ? "nghttp2_native" : "unavailable"));
@@ -655,7 +664,9 @@ json::Value run_profile_json(const json::Value& profile_dict, const json::Value&
   }
 
   std::map<std::string, double> out = run_profile(profile, cfg);
-  const ReactorBackend reactor_backend = ReactorBackend::SocketEpoll;
+  const auto active_uring_it = out.find("runtime_reactor_io_uring_active");
+  const bool was_uring_active = active_uring_it != out.end() && active_uring_it->second > 0.0;
+  const ReactorBackend reactor_backend = was_uring_active ? ReactorBackend::SocketIoUring : ReactorBackend::SocketEpoll;
   const TlsBackend tls_backend = caps.openssl ? TlsBackend::OpenSSL : TlsBackend::Unavailable;
   const Http2Backend http2_backend = caps.nghttp2 ? Http2Backend::Nghttp2Native : Http2Backend::Unavailable;
   const NativeHotPathLevel hot_path_level = NativeHotPathLevel::UserspaceReactorTemplates;

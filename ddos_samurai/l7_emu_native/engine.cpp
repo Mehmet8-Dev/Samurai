@@ -17,6 +17,9 @@ RuntimeCapabilities detect_capabilities() {
 #ifdef SAMURAI_WITH_NGHTTP3
   caps.nghttp3 = true;
 #endif
+#if defined(SAMURAI_HAS_LINUX_IO_URING) && defined(__NR_io_uring_setup)
+  caps.io_uring = SamuraiUring::probe_kernel_support();
+#endif
   return caps;
 }
 
@@ -147,13 +150,31 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       sync_h1_lane_state(lane, profile);
       register_h1_lane_fd(shard, local_shard, &lane, lane_idx);
 
-      H1LaneIoResult immediate_result = h1_lane_write_step(lane);
-      if (immediate_result == H1LaneIoResult::Pending && lane.phase == H1LanePhase::Reading) {
-        immediate_result = h1_lane_read_step(lane);
-      }
-      if (immediate_result == H1LaneIoResult::Completed || immediate_result == H1LaneIoResult::Failed) {
-        unregister_lane_fd(shard, local_shard, lane.conn ? lane.conn->fd : -1);
-        enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
+      if (local_shard.uring_active) {
+        auto* sqe = local_shard.uring.get_sqe();
+        if (sqe != nullptr) {
+          prep_uring_send(
+              sqe,
+              lane.conn->fd,
+              lane.write_buffer.data() + lane.write_offset,
+              lane.write_buffer.size() - lane.write_offset,
+              MSG_NOSIGNAL,
+              make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Send, static_cast<uint16_t>(lane.conn->timer_generation)));
+          lane.conn->uring_in_flight = true;
+          lane.conn->uring_pending_op = IoUringOp::Send;
+          if (g_perf_stats != nullptr) {
+            g_perf_stats->io_uring_sqe_submitted += 1;
+          }
+        }
+      } else {
+        H1LaneIoResult immediate_result = h1_lane_write_step(lane);
+        if (immediate_result == H1LaneIoResult::Pending && lane.phase == H1LanePhase::Reading) {
+          immediate_result = h1_lane_read_step(lane);
+        }
+        if (immediate_result == H1LaneIoResult::Completed || immediate_result == H1LaneIoResult::Failed) {
+          unregister_lane_fd(shard, local_shard, lane.conn ? lane.conn->fd : -1);
+          enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
+        }
       }
     }
   };
@@ -620,6 +641,8 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       runtime.perf.tx_syscalls += sp.tx_syscalls;
       runtime.perf.alloc_bytes += sp.alloc_bytes;
       runtime.perf.alloc_count += sp.alloc_count;
+      runtime.perf.io_uring_sqe_submitted += sp.io_uring_sqe_submitted;
+      runtime.perf.io_uring_cqe_reaped += sp.io_uring_cqe_reaped;
       runtime.perf.profile_snapshot_count += sp.profile_snapshot_count;
       runtime.perf.scheduler_queue_depth_peak = std::max(
           runtime.perf.scheduler_queue_depth_peak, sp.scheduler_queue_depth_peak);

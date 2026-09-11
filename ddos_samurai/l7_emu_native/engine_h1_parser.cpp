@@ -354,8 +354,22 @@ void register_h1_lane_fd(
     NativeRuntime::LocalShard& local_shard,
     H1Lane* lane,
     std::size_t lane_idx) {
-  if (lane == nullptr || lane->conn == nullptr || lane->conn->fd < 0 || shard.epoll_fd < 0 ||
+  if (lane == nullptr || lane->conn == nullptr || lane->conn->fd < 0 ||
       lane->transport_backend == TransportBackend::CustomTcp) {
+    return;
+  }
+  if (local_shard.uring_active) {
+    local_shard.active_fd_registry[lane->conn->fd] = NativeRuntime::LocalShard::RegisteredLaneFd{
+        ReactorLaneKind::H1,
+        lane,
+        lane_idx,
+#ifdef SAMURAI_WITH_NGHTTP2
+        nullptr,
+#endif
+    };
+    return;
+  }
+  if (shard.epoll_fd < 0) {
     return;
   }
   epoll_event ev {};
@@ -379,7 +393,7 @@ void unregister_lane_fd(ShardState& shard, NativeRuntime::LocalShard& local_shar
     return;
   }
   local_shard.active_fd_registry.erase(fd);
-  if (shard.epoll_fd >= 0) {
+  if (!local_shard.uring_active && shard.epoll_fd >= 0) {
     (void)::epoll_ctl(shard.epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
   }
 }
@@ -392,8 +406,11 @@ int service_ready_lanes(
   if (shard_idx >= runtime.shards.size() || shard_idx >= runtime.local_shards.size()) {
     return 0;
   }
-  ShardState& shard = runtime.shards[shard_idx];
   auto& local_shard = runtime.local_shards[shard_idx];
+  if (local_shard.uring_active) {
+    return service_ready_lanes_io_uring(runtime, profile, shard_idx, timeout_ms);
+  }
+  ShardState& shard = runtime.shards[shard_idx];
   if (shard.epoll_fd < 0 || local_shard.active_fd_registry.empty()) {
     return 0;
   }
@@ -467,6 +484,227 @@ int service_ready_lanes(
     enqueue_ready_shard(runtime, shard_idx);
   }
   return rc;
+}
+
+int service_ready_lanes_io_uring(
+    NativeRuntime& runtime,
+    const Profile& profile,
+    std::size_t shard_idx,
+    int timeout_ms) {
+  if (shard_idx >= runtime.shards.size() || shard_idx >= runtime.local_shards.size()) {
+    return 0;
+  }
+  ShardState& shard = runtime.shards[shard_idx];
+  auto& local_shard = runtime.local_shards[shard_idx];
+  if (!local_shard.uring_active || !local_shard.uring.is_active()) {
+    return 0;
+  }
+
+  // 1. Submit any lanes that are in Writing or Reading phase but don't have an in-flight SQE
+  for (std::size_t lane_idx = 0; lane_idx < local_shard.h1_lanes.size(); ++lane_idx) {
+    auto& lane_ptr = local_shard.h1_lanes[lane_idx];
+    if (!lane_ptr || !lane_ptr->conn || lane_ptr->conn->fd < 0) {
+      continue;
+    }
+    H1Lane& lane = *lane_ptr;
+    if (lane.conn->uring_in_flight) {
+      continue;
+    }
+    if (lane.phase == H1LanePhase::Writing) {
+      if (lane.write_offset < lane.write_buffer.size()) {
+        auto* sqe = local_shard.uring.get_sqe();
+        if (sqe != nullptr) {
+          prep_uring_send(
+              sqe,
+              lane.conn->fd,
+              lane.write_buffer.data() + lane.write_offset,
+              lane.write_buffer.size() - lane.write_offset,
+              MSG_NOSIGNAL,
+              make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Send, static_cast<uint16_t>(lane.conn->timer_generation)));
+          lane.conn->uring_in_flight = true;
+          lane.conn->uring_pending_op = IoUringOp::Send;
+          if (g_perf_stats != nullptr) {
+            g_perf_stats->io_uring_sqe_submitted += 1;
+          }
+        }
+      } else {
+        lane.phase = H1LanePhase::Reading;
+      }
+    }
+    if (lane.phase == H1LanePhase::Reading && !lane.conn->uring_in_flight) {
+      auto* sqe = local_shard.uring.get_sqe();
+      if (sqe != nullptr) {
+        prep_uring_recv(
+            sqe,
+            lane.conn->fd,
+            lane.conn->uring_rx_buf,
+            sizeof(lane.conn->uring_rx_buf),
+            0,
+            make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Recv, static_cast<uint16_t>(lane.conn->timer_generation)));
+        lane.conn->uring_in_flight = true;
+        lane.conn->uring_pending_op = IoUringOp::Recv;
+        if (g_perf_stats != nullptr) {
+          g_perf_stats->io_uring_sqe_submitted += 1;
+        }
+      }
+    }
+  }
+
+  // 2. Submit pending SQEs
+  local_shard.uring.submit();
+
+  // 3. Reap batch of CQEs
+  struct io_uring_cqe* cqes[128];
+  int reaped = local_shard.uring.peek_batch_cqe(cqes, 128);
+
+  if (reaped == 0 && timeout_ms > 0) {
+    bool has_in_flight = false;
+    for (const auto& lane_ptr : local_shard.h1_lanes) {
+      if (lane_ptr && lane_ptr->conn && lane_ptr->conn->uring_in_flight) {
+        has_in_flight = true;
+        break;
+      }
+    }
+    if (has_in_flight) {
+      local_shard.uring.wait_event(timeout_ms);
+      reaped = local_shard.uring.peek_batch_cqe(cqes, 128);
+    }
+  }
+
+  if (reaped <= 0) {
+    return 0;
+  }
+
+  if (g_perf_stats != nullptr) {
+    g_perf_stats->io_uring_cqe_reaped += static_cast<std::size_t>(reaped);
+  }
+
+  const long long now_ms = monotonic_ms_now();
+  local_shard.dispatch_ready_ms = now_ms;
+
+  for (int i = 0; i < reaped; ++i) {
+    const struct io_uring_cqe* cqe = cqes[i];
+    const uint64_t user_data = cqe->user_data;
+    const uint32_t lane_idx = uring_user_data_lane_idx(user_data);
+    const IoUringOp op = uring_user_data_op(user_data);
+    const uint16_t gen = uring_user_data_gen(user_data);
+    const int res = cqe->res;
+
+    if (lane_idx >= local_shard.h1_lanes.size()) {
+      continue;
+    }
+    auto& lane_ptr = local_shard.h1_lanes[lane_idx];
+    if (!lane_ptr || !lane_ptr->conn) {
+      continue;
+    }
+    H1Lane& lane = *lane_ptr;
+    Http1Connection& conn = *lane.conn;
+
+    if (gen != static_cast<uint16_t>(conn.timer_generation)) {
+      continue;
+    }
+
+    conn.uring_in_flight = false;
+    conn.uring_pending_op = IoUringOp::None;
+    conn.idle_deadline_ms = now_ms + std::max(1, profile.timeout_ms);
+
+    if (op == IoUringOp::Send) {
+      if (res > 0) {
+        lane.write_offset += static_cast<std::size_t>(res);
+        lane.tx_bytes += static_cast<std::size_t>(res);
+        if (lane.write_offset < lane.write_buffer.size()) {
+          auto* sqe = local_shard.uring.get_sqe();
+          if (sqe != nullptr) {
+            prep_uring_send(
+                sqe,
+                conn.fd,
+                lane.write_buffer.data() + lane.write_offset,
+                lane.write_buffer.size() - lane.write_offset,
+                MSG_NOSIGNAL,
+                make_uring_user_data(lane_idx, IoUringOp::Send, gen));
+            conn.uring_in_flight = true;
+            conn.uring_pending_op = IoUringOp::Send;
+            if (g_perf_stats != nullptr) {
+              g_perf_stats->io_uring_sqe_submitted += 1;
+            }
+          }
+        } else {
+          lane.phase = H1LanePhase::Reading;
+          auto* sqe = local_shard.uring.get_sqe();
+          if (sqe != nullptr) {
+            prep_uring_recv(
+                sqe,
+                conn.fd,
+                conn.uring_rx_buf,
+                sizeof(conn.uring_rx_buf),
+                0,
+                make_uring_user_data(lane_idx, IoUringOp::Recv, gen));
+            conn.uring_in_flight = true;
+            conn.uring_pending_op = IoUringOp::Recv;
+            if (g_perf_stats != nullptr) {
+              g_perf_stats->io_uring_sqe_submitted += 1;
+            }
+          }
+        }
+      } else {
+        lane.phase = H1LanePhase::Failed;
+        unregister_lane_fd(shard, local_shard, conn.fd);
+        enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
+      }
+    } else if (op == IoUringOp::Recv) {
+      if (res > 0) {
+        conn.read_buffer.append(conn.uring_rx_buf, static_cast<std::size_t>(res));
+        lane.response.bytes_received += static_cast<std::size_t>(res);
+        lane.rx_bytes += static_cast<std::size_t>(res);
+        if (h1_lane_try_parse_response(lane)) {
+          lane.phase = H1LanePhase::Complete;
+          unregister_lane_fd(shard, local_shard, conn.fd);
+          enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
+        } else {
+          auto* sqe = local_shard.uring.get_sqe();
+          if (sqe != nullptr) {
+            prep_uring_recv(
+                sqe,
+                conn.fd,
+                conn.uring_rx_buf,
+                sizeof(conn.uring_rx_buf),
+                0,
+                make_uring_user_data(lane_idx, IoUringOp::Recv, gen));
+            conn.uring_in_flight = true;
+            conn.uring_pending_op = IoUringOp::Recv;
+            if (g_perf_stats != nullptr) {
+              g_perf_stats->io_uring_sqe_submitted += 1;
+            }
+          }
+        }
+      } else if (res == 0) {
+        if (lane.parser.header_complete && lane.parser.close_delimited) {
+          const std::string_view data = conn.read_buffer.view();
+          lane.parser.expected_body_length =
+              data.size() > lane.parser.body_offset ? data.size() - lane.parser.body_offset : 0;
+          lane.response.body.assign(data.substr(lane.parser.body_offset, lane.parser.expected_body_length));
+          lane.response.consumed_bytes = lane.parser.body_offset + lane.parser.expected_body_length;
+          lane.response.keep_alive = false;
+          conn.read_buffer.clear();
+          lane.phase = lane.response.status_code > 0 ? H1LanePhase::Complete : H1LanePhase::Failed;
+        } else {
+          lane.phase = H1LanePhase::Failed;
+        }
+        unregister_lane_fd(shard, local_shard, conn.fd);
+        enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
+      } else {
+        lane.phase = H1LanePhase::Failed;
+        unregister_lane_fd(shard, local_shard, conn.fd);
+        enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
+      }
+    }
+  }
+
+  local_shard.uring.cq_advance(static_cast<unsigned>(reaped));
+  local_shard.uring.submit();
+
+  enqueue_ready_shard(runtime, shard_idx);
+  return reaped;
 }
 
 void service_custom_tcp_shard_lanes(NativeRuntime& runtime, std::size_t shard_idx) {

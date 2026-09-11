@@ -37,6 +37,8 @@ void apply_perf_outputs(
   out["l7_tx_syscalls"] = static_cast<double>(runtime.perf.tx_syscalls);
   out["l7_alloc_bytes"] = static_cast<double>(runtime.perf.alloc_bytes);
   out["l7_alloc_count"] = static_cast<double>(runtime.perf.alloc_count);
+  out["l7_io_uring_sqe_submitted"] = static_cast<double>(runtime.perf.io_uring_sqe_submitted);
+  out["l7_io_uring_cqe_reaped"] = static_cast<double>(runtime.perf.io_uring_cqe_reaped);
   const auto tls_pct = percentile_triplet_ms(runtime.perf.tls_handshake_samples_ms);
   out["l7_tls_handshake_p50_ms"] = tls_pct.p50;
   out["l7_tls_handshake_p95_ms"] = tls_pct.p95;
@@ -47,6 +49,14 @@ void apply_perf_outputs(
   out["l7_request_latency_p99_ms"] = req_pct.p99;
   out["l7_profile_enabled"] = cfg.profile_l7 != 0 ? 1.0 : 0.0;
   out["l7_profile_snapshot_count"] = static_cast<double>(runtime.perf.profile_snapshot_count);
+  bool uring_any_active = false;
+  for (const auto& shard : runtime.local_shards) {
+    if (shard.uring_active) {
+      uring_any_active = true;
+      break;
+    }
+  }
+  out["runtime_reactor_io_uring_active"] = uring_any_active ? 1.0 : 0.0;
 }
 
 void init_stats(const Profile& profile, std::map<std::string, double>& out) {
@@ -65,6 +75,9 @@ void init_stats(const Profile& profile, std::map<std::string, double>& out) {
   out["l7_conn_reused"] = 0.0;
   out["l7_rx_bytes"] = 0.0;
   out["l7_tx_bytes"] = 0.0;
+  out["l7_io_uring_sqe_submitted"] = 0.0;
+  out["l7_io_uring_cqe_reaped"] = 0.0;
+  out["runtime_reactor_io_uring_active"] = 0.0;
   out["l7_expectation_failures"] = 0.0;
   out["l7_scheduler_backpressure_count"] = 0.0;
   out["h2_goaway_count"] = 0.0;
@@ -192,6 +205,21 @@ NativeRuntime build_runtime(const Profile& profile, const RuntimeConfig& cfg) {
         local.h1_lanes.push_back(std::move(lane));
       }
     }
+    const ReactorBackend effective_reactor =
+        resolve_reactor_backend(profile.reactor_backend, runtime.caps.io_uring);
+    if (effective_reactor == ReactorBackend::SocketIoUring) {
+      const unsigned kRingDepth = static_cast<unsigned>(std::max(64, std::min(4096, profile.max_connections * 2)));
+      unsigned flags = 0;
+#ifdef IORING_SETUP_SINGLE_ISSUER
+      flags |= IORING_SETUP_SINGLE_ISSUER;
+#endif
+#ifdef IORING_SETUP_CQSIZE
+      flags |= IORING_SETUP_CQSIZE;
+#endif
+      if (local.uring.init(kRingDepth, flags)) {
+        local.uring_active = true;
+      }
+    }
     runtime.local_shards.push_back(std::move(local));
   }
   runtime.tls_engine = std::make_unique<TlsSessionEngine>();
@@ -234,6 +262,12 @@ void destroy_runtime(NativeRuntime& runtime) {
     if (shard.epoll_fd >= 0) {
       ::close(shard.epoll_fd);
       shard.epoll_fd = -1;
+    }
+  }
+  for (auto& local_shard : runtime.local_shards) {
+    if (local_shard.uring_active) {
+      local_shard.uring.cleanup();
+      local_shard.uring_active = false;
     }
   }
 }
