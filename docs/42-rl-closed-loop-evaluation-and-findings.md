@@ -119,16 +119,21 @@ bedeliyle → EffectiveThroughput'ta geride.
 
 - **Canlı gate gerçeğin kaynağıdır.** OPE (s0 ya da trajectory) mutlak kalite ve
   RL²-vs-FF için güvenilmez; yalnız ucuz bir smoke.
-- **"Yeterli veri" kural-of-thumb ile değil, öğrenme eğrisiyle** belirlenir. Sabit
-  40-episode validation'da FF'nin OPE değeri 17→136 episode arası hâlâ yükseliyor
-  (−3.84 → −2.73) → offline sinyal **doymamış**; daha çok veri (offline) faydalı
-  olabilir. Ancak canlı holdout 612↔2992 transition arası **değişmedi** → offline
-  kazanç henüz canlıya yansımadı. Kesin söz canlı gate'in.
+- **"Yeterli veri" kural-of-thumb ile değil, öğrenme eğrisiyle** belirlenir — ve burada
+  **iki eğri ayrışıyor.** Offline OPE, veriyle **doymadan yükselmeye devam ediyor**:
+  FF'nin OPE değeri 17→136 episode arası −3.84→−2.73, ve havuz 2992→6630 transition'a
+  (176→390 ep) iki katlanınca −2.49→−2.13'e çıktı. AMA **canlı holdout gate DEĞİŞMEDİ**:
+  612 / 2992 / 6630 transition'ın üçünde de FF holdout eff = **−0.110** (birebir),
+  FF−AIMD = +0.218. **Kanıt: canlı (ship edilen) performans ~3000 transition'da DOYMUŞ;
+  veriyi ikiye katlamak sıfır canlı kazanç getirdi.** Offline OPE'nin yükselmesi yalnız
+  daha iyi Q-fit'tir, gerçek politikanın iyileşmesi değil — "OPE zayıf enstrüman"ın en
+  net kanıtı. Kesin söz canlı gate'in: bu görev/lab için FF veri-doymuş.
 - **Prod-grade ölçek ≠ 100k–400k episode.** O rakam sıfırdan online deep-RL
-  dünyasından. Bu düşük-boyutlu offline problemde eğri büyük olasılıkla birkaç bin
-  episode'da düzleşir (400k ≈ 315 gün kesintisiz yük — imkânsız/gereksiz). Prod-grade
-  için asıl gereken **ortam çeşitliliği** (farklı savunma motorları/tavanları) +
-  **online per-target adaptasyon** + güvenlik gate'leri, ham episode sayısı değil.
+  dünyasından. Bu düşük-boyutlu offline problemde canlı performans ~3000 transition'da
+  düzleşti (6630'a çıkarmak ölçülebilir canlı kazanç vermedi; 400k ≈ 315 gün kesintisiz
+  yük — imkânsız/gereksiz). Prod-grade için asıl gereken **ortam çeşitliliği** (farklı
+  savunma motorları/tavanları) + **online per-target adaptasyon** + güvenlik gate'leri,
+  ham episode sayısı değil.
 - **RL²'nin hakkını vereceği rejim henüz kurulmadı:** hafıza ancak geçmiş geleceği
   **tahmin ediyorsa** kazandırır (progresif/tırmanan limiter, ban döngüleri, adaptif
   WAF). Bizim shift'ler rastgele → hafıza sömürülemedi. Bu, RL²'yi *silmek* değil
