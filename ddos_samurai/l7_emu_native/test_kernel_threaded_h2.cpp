@@ -69,6 +69,13 @@ int main() {
     profile.ops.push_back(MakeGet("/"));
   }
 
+  // Drive the sessions through the io_uring reactor where the host supports it,
+  // so this exercises the ring-backed H2 readiness path (multishot POLL feeding
+  // SSL_read/nghttp2), not just epoll. Falls back to epoll otherwise.
+  const RuntimeCapabilities caps = detect_capabilities();
+  const bool want_io_uring = caps.io_uring;
+  profile.reactor_backend = want_io_uring ? "socket_io_uring" : "auto";
+
   RuntimeConfig cfg;
   cfg.concurrency = kConcurrency;
   cfg.profile_l7 = 1;
@@ -86,17 +93,35 @@ int main() {
   const double status_2xx = get("status_2xx");
   const double conn_established = get("l7_conn_established");
   const double h2_cap = get("h2_native_capability_available");
+  const double epoll_wakeups = get("l7_epoll_wakeups");
+  const double cqe_reaped = get("l7_io_uring_cqe_reaped");
+  const double uring_active = get("runtime_reactor_io_uring_active");
 
   std::printf(
       "runtime_shards=%.0f attempted=%.0f sent=%.0f status_2xx=%.0f "
-      "conn_established=%.0f h2_native_capability=%.0f\n",
-      shards, attempted, sent, status_2xx, conn_established, h2_cap);
+      "conn_established=%.0f h2_native_capability=%.0f uring_active=%.0f "
+      "epoll_wakeups=%.0f cqe_reaped=%.0f\n",
+      shards, attempted, sent, status_2xx, conn_established, h2_cap,
+      uring_active, epoll_wakeups, cqe_reaped);
 
   CHECK(h2_cap == 1.0, "nghttp2 native H2 not available in this build");
   CHECK(shards > 1.0, "expected runtime_shards>1 (threaded kernel path), got %.0f", shards);
   CHECK(attempted == static_cast<double>(kRequests), "attempted=%.0f expected %d", attempted, kRequests);
   CHECK(sent == static_cast<double>(kRequests), "sent=%.0f expected %d (all streams completed)", sent, kRequests);
   CHECK(status_2xx == static_cast<double>(kRequests), "status_2xx=%.0f expected %d", status_2xx, kRequests);
+
+  if (want_io_uring) {
+    // The io_uring reactor drives the H2 shard loop (service_ready_lanes routes
+    // to the ring path). Note: H2 byte I/O itself is still synchronous
+    // (SSL_read/SSL_write + nghttp2 + wait_for_fd) - the ring supplies readiness
+    // via a multishot POLL, so on fast localhost the exchange can complete inside
+    // the synchronous service call before a POLL CQE is needed (cqe_reaped may be
+    // 0, and wait_for_fd may register a few epoll wakeups). Moving the H2 byte
+    // transfer onto ring send/recv requires the nghttp2 mem-API rewrite and is
+    // tracked separately; this test asserts functional correctness under the
+    // io_uring reactor.
+    CHECK(uring_active == 1.0, "expected io_uring reactor active, got %.0f", uring_active);
+  }
 
   if (g_fails == 0) {
     std::printf("ALL KERNEL THREADED H2 TESTS PASSED\n");
