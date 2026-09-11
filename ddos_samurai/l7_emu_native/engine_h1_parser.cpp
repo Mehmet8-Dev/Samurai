@@ -486,6 +486,54 @@ int service_ready_lanes(
   return rc;
 }
 
+// Arm a receive on the ring for an H1 connection. When the shard has a provided
+// buffer ring, a single persistent multishot recv feeds every read of the
+// connection into kernel-selected buffers (one SQE, many completions); otherwise
+// a classic single-shot recv into the per-connection scratch buffer is used.
+// Returns true when a recv is outstanding (freshly armed or already live).
+static bool arm_h1_ring_recv(
+    NativeRuntime::LocalShard& local_shard,
+    Http1Connection& conn,
+    std::size_t lane_idx) {
+#if defined(IORING_RECV_MULTISHOT) && defined(IOSQE_BUFFER_SELECT) && defined(__NR_io_uring_register)
+  if (local_shard.uring.buf_ring_active()) {
+    if (conn.uring_multishot) {
+      return true;  // already delivering
+    }
+    auto* sqe = local_shard.uring.get_sqe();
+    if (sqe == nullptr) {
+      return false;
+    }
+    prep_uring_recv_multishot(
+        sqe, conn.fd, /*bgid=*/0,
+        make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Recv,
+                             static_cast<uint16_t>(conn.timer_generation)));
+    conn.uring_multishot = true;
+    if (g_perf_stats != nullptr) {
+      g_perf_stats->io_uring_sqe_submitted += 1;
+    }
+    return true;
+  }
+#endif
+  if (conn.uring_in_flight) {
+    return true;
+  }
+  auto* sqe = local_shard.uring.get_sqe();
+  if (sqe == nullptr) {
+    return false;
+  }
+  prep_uring_recv(
+      sqe, conn.fd, conn.uring_rx_buf, sizeof(conn.uring_rx_buf), 0,
+      make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Recv,
+                           static_cast<uint16_t>(conn.timer_generation)));
+  conn.uring_in_flight = true;
+  conn.uring_pending_op = IoUringOp::Recv;
+  if (g_perf_stats != nullptr) {
+    g_perf_stats->io_uring_sqe_submitted += 1;
+  }
+  return true;
+}
+
 int service_ready_lanes_io_uring(
     NativeRuntime& runtime,
     const Profile& profile,
@@ -531,22 +579,8 @@ int service_ready_lanes_io_uring(
         lane.phase = H1LanePhase::Reading;
       }
     }
-    if (lane.phase == H1LanePhase::Reading && !lane.conn->uring_in_flight) {
-      auto* sqe = local_shard.uring.get_sqe();
-      if (sqe != nullptr) {
-        prep_uring_recv(
-            sqe,
-            lane.conn->fd,
-            lane.conn->uring_rx_buf,
-            sizeof(lane.conn->uring_rx_buf),
-            0,
-            make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Recv, static_cast<uint16_t>(lane.conn->timer_generation)));
-        lane.conn->uring_in_flight = true;
-        lane.conn->uring_pending_op = IoUringOp::Recv;
-        if (g_perf_stats != nullptr) {
-          g_perf_stats->io_uring_sqe_submitted += 1;
-        }
-      }
+    if (lane.phase == H1LanePhase::Reading) {
+      arm_h1_ring_recv(local_shard, *lane.conn, lane_idx);
     }
   }
 
@@ -607,7 +641,8 @@ int service_ready_lanes_io_uring(
     bool has_in_flight = h2_polls_armed > 0;
     if (!has_in_flight) {
       for (const auto& lane_ptr : local_shard.h1_lanes) {
-        if (lane_ptr && lane_ptr->conn && lane_ptr->conn->uring_in_flight) {
+        if (lane_ptr && lane_ptr->conn &&
+            (lane_ptr->conn->uring_in_flight || lane_ptr->conn->uring_multishot)) {
           has_in_flight = true;
           break;
         }
@@ -637,6 +672,12 @@ int service_ready_lanes_io_uring(
     const IoUringOp op = uring_user_data_op(user_data);
     const uint16_t gen = uring_user_data_gen(user_data);
     const int res = cqe->res;
+    // Provided-buffer accounting: a recv CQE that consumed a ring buffer must
+    // return it, even on the drop paths below, or the pool leaks. `more` tells
+    // us whether the multishot that produced it is still armed.
+    const bool cqe_from_ring = SamuraiUring::cqe_has_buffer(cqe);
+    const uint16_t cqe_bid = cqe_from_ring ? SamuraiUring::cqe_buffer_id(cqe) : 0;
+    const bool cqe_more = SamuraiUring::cqe_has_more(cqe);
 
 #ifdef SAMURAI_WITH_NGHTTP2
     if (op == IoUringOp::PollReadiness) {
@@ -659,22 +700,29 @@ int service_ready_lanes_io_uring(
 #endif
 
     if (lane_idx >= local_shard.h1_lanes.size()) {
+      if (cqe_from_ring) local_shard.uring.buf_ring_recycle(cqe_bid);
       continue;
     }
     auto& lane_ptr = local_shard.h1_lanes[lane_idx];
     if (!lane_ptr || !lane_ptr->conn) {
+      if (cqe_from_ring) local_shard.uring.buf_ring_recycle(cqe_bid);
       continue;
     }
     H1Lane& lane = *lane_ptr;
     Http1Connection& conn = *lane.conn;
 
     if (gen != static_cast<uint16_t>(conn.timer_generation)) {
+      if (cqe_from_ring) local_shard.uring.buf_ring_recycle(cqe_bid);
       continue;
     }
 
     conn.uring_in_flight = false;
     conn.uring_pending_op = IoUringOp::None;
     conn.idle_deadline_ms = now_ms + std::max(1, profile.timeout_ms);
+    // A terminated multishot (no F_MORE) must be re-armed on the next pass.
+    if (op == IoUringOp::Recv && conn.uring_multishot && !cqe_more) {
+      conn.uring_multishot = false;
+    }
 
     if (op == IoUringOp::Send) {
       if (res > 0) {
@@ -698,21 +746,7 @@ int service_ready_lanes_io_uring(
           }
         } else {
           lane.phase = H1LanePhase::Reading;
-          auto* sqe = local_shard.uring.get_sqe();
-          if (sqe != nullptr) {
-            prep_uring_recv(
-                sqe,
-                conn.fd,
-                conn.uring_rx_buf,
-                sizeof(conn.uring_rx_buf),
-                0,
-                make_uring_user_data(lane_idx, IoUringOp::Recv, gen));
-            conn.uring_in_flight = true;
-            conn.uring_pending_op = IoUringOp::Recv;
-            if (g_perf_stats != nullptr) {
-              g_perf_stats->io_uring_sqe_submitted += 1;
-            }
-          }
+          arm_h1_ring_recv(local_shard, conn, lane_idx);
         }
       } else {
         lane.phase = H1LanePhase::Failed;
@@ -721,31 +755,36 @@ int service_ready_lanes_io_uring(
       }
     } else if (op == IoUringOp::Recv) {
       if (res > 0) {
-        conn.read_buffer.append(conn.uring_rx_buf, static_cast<std::size_t>(res));
-        lane.response.bytes_received += static_cast<std::size_t>(res);
-        lane.rx_bytes += static_cast<std::size_t>(res);
+        // Data source is the ring-selected buffer under multishot, else the
+        // per-connection scratch buffer. Copy before recycling.
+        const char* rx_data = conn.uring_rx_buf;
+        if (cqe_from_ring) {
+          const void* p = local_shard.uring.buf_ring_addr(cqe_bid);
+          rx_data = p != nullptr ? static_cast<const char*>(p) : nullptr;
+        }
+        if (rx_data != nullptr) {
+          conn.read_buffer.append(rx_data, static_cast<std::size_t>(res));
+          lane.response.bytes_received += static_cast<std::size_t>(res);
+          lane.rx_bytes += static_cast<std::size_t>(res);
+        }
+        if (cqe_from_ring) {
+          local_shard.uring.buf_ring_recycle(cqe_bid);
+        }
         if (h1_lane_try_parse_response(lane)) {
           lane.phase = H1LanePhase::Complete;
           unregister_lane_fd(shard, local_shard, conn.fd);
           enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
+          // A persistent multishot stays armed for the next keepalive request on
+          // this connection; a single-shot recv is not re-armed here.
         } else {
-          auto* sqe = local_shard.uring.get_sqe();
-          if (sqe != nullptr) {
-            prep_uring_recv(
-                sqe,
-                conn.fd,
-                conn.uring_rx_buf,
-                sizeof(conn.uring_rx_buf),
-                0,
-                make_uring_user_data(lane_idx, IoUringOp::Recv, gen));
-            conn.uring_in_flight = true;
-            conn.uring_pending_op = IoUringOp::Recv;
-            if (g_perf_stats != nullptr) {
-              g_perf_stats->io_uring_sqe_submitted += 1;
-            }
-          }
+          // Response not yet complete: keep reading. For multishot this is a
+          // no-op while it is still armed; otherwise a fresh recv is queued.
+          arm_h1_ring_recv(local_shard, conn, lane_idx);
         }
       } else if (res == 0) {
+        if (cqe_from_ring) {
+          local_shard.uring.buf_ring_recycle(cqe_bid);
+        }
         if (lane.parser.header_complete && lane.parser.close_delimited) {
           const std::string_view data = conn.read_buffer.view();
           lane.parser.expected_body_length =
@@ -760,7 +799,15 @@ int service_ready_lanes_io_uring(
         }
         unregister_lane_fd(shard, local_shard, conn.fd);
         enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);
+      } else if (res == -ENOBUFS) {
+        // The provided buffer ring was momentarily drained, ending the multishot
+        // without an error on the connection. uring_multishot was already cleared
+        // above; the next reactor pass re-arms once buffers have been recycled.
+        // Nothing to fail here.
       } else {
+        if (cqe_from_ring) {
+          local_shard.uring.buf_ring_recycle(cqe_bid);
+        }
         lane.phase = H1LanePhase::Failed;
         unregister_lane_fd(shard, local_shard, conn.fd);
         enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, lane);

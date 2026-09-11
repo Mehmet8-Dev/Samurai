@@ -217,6 +217,16 @@ NativeRuntime build_runtime(const Profile& profile, const RuntimeConfig& cfg) {
       // is always safe.
       if (local.uring.init(kRingDepth, flags, kRingDepth * 2)) {
         local.uring_active = true;
+        // Register a provided buffer ring so the H1 read path can use a single
+        // persistent multishot recv per connection (one SQE fans many reads into
+        // kernel-selected buffers). Size the pool to a power of two of the ring
+        // depth; if the kernel lacks PBUF_RING support the call fails cleanly and
+        // the reactor transparently falls back to single-shot recv.
+        unsigned buf_entries = 128;
+        while (buf_entries < kRingDepth && buf_entries < 4096) {
+          buf_entries <<= 1;
+        }
+        (void)local.uring.setup_buf_ring(/*bgid=*/0, buf_entries, /*entry_size=*/8192);
       }
     }
     runtime.local_shards.push_back(std::move(local));

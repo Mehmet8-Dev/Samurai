@@ -111,6 +111,19 @@ class SamuraiUring {
   size_t cq_ring_sz{0};
   void* cq_ptr{nullptr};
 
+  // Provided buffer ring (kernel-selected buffers for multishot recv).
+  struct io_uring_buf_ring* buf_ring{nullptr};
+  void* buf_ring_mem{nullptr};
+  size_t buf_ring_mem_sz{0};
+  void* buf_pool{nullptr};
+  size_t buf_pool_sz{0};
+  unsigned buf_ring_entries{0};
+  unsigned buf_ring_mask{0};
+  size_t buf_entry_size{0};
+  unsigned buf_tail{0};
+  uint16_t buf_ring_bgid{0};
+  bool buf_ring_registered{false};
+
   SamuraiUring() = default;
   ~SamuraiUring() { cleanup(); }
 
@@ -382,7 +395,137 @@ class SamuraiUring {
     }
   }
 
+  // ---- Provided buffer ring (for multishot recv) --------------------------
+  // NOTE: IORING_REGISTER_PBUF_RING is an enumerator, not a macro, so it cannot
+  // be probed with defined(). Gate on the recv-multishot / buffer-select MACROS
+  // instead - a header new enough to define those also carries the PBUF_RING
+  // enum and the io_uring_buf* structs (all landed together, Linux ~5.19-5.20).
+#if defined(__NR_io_uring_register) && defined(IORING_RECV_MULTISHOT) && defined(IOSQE_BUFFER_SELECT)
+  // Register a kernel buffer-selection ring of `entries` (must be a power of
+  // two) buffers of `entry_size` bytes each under group id `bgid`. Once armed,
+  // a BUFFER_SELECT recv lets the kernel pick a free buffer and report its id in
+  // the CQE, which is what makes a single multishot recv able to fan a stream of
+  // reads into distinct buffers without a per-read SQE.
+  bool setup_buf_ring(uint16_t bgid, unsigned entries, size_t entry_size) {
+    if (ring_fd < 0 || entries == 0 || (entries & (entries - 1)) != 0 || entry_size == 0) {
+      return false;
+    }
+    const size_t ring_sz = static_cast<size_t>(entries) * sizeof(struct io_uring_buf);
+    void* rmem = mmap(nullptr, ring_sz, PROT_READ | PROT_WRITE,
+                      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (rmem == MAP_FAILED) {
+      return false;
+    }
+    std::memset(rmem, 0, ring_sz);
+    const size_t pool_sz = static_cast<size_t>(entries) * entry_size;
+    void* pool = mmap(nullptr, pool_sz, PROT_READ | PROT_WRITE,
+                      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (pool == MAP_FAILED) {
+      munmap(rmem, ring_sz);
+      return false;
+    }
+
+    struct io_uring_buf_reg reg;
+    std::memset(&reg, 0, sizeof(reg));
+    reg.ring_addr = reinterpret_cast<uint64_t>(rmem);
+    reg.ring_entries = entries;
+    reg.bgid = bgid;
+    if (syscall(__NR_io_uring_register, ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1) < 0) {
+      munmap(rmem, ring_sz);
+      munmap(pool, pool_sz);
+      return false;
+    }
+
+    buf_ring = static_cast<struct io_uring_buf_ring*>(rmem);
+    buf_ring_mem = rmem;
+    buf_ring_mem_sz = ring_sz;
+    buf_pool = pool;
+    buf_pool_sz = pool_sz;
+    buf_ring_entries = entries;
+    buf_ring_mask = entries - 1;
+    buf_entry_size = entry_size;
+    buf_ring_bgid = bgid;
+    buf_ring_registered = true;
+
+    for (unsigned i = 0; i < entries; ++i) {
+      struct io_uring_buf* b = &buf_ring->bufs[i & buf_ring_mask];
+      b->addr = reinterpret_cast<uint64_t>(static_cast<uint8_t*>(buf_pool) +
+                                           static_cast<size_t>(i) * entry_size);
+      b->len = static_cast<uint32_t>(entry_size);
+      b->bid = static_cast<uint16_t>(i);
+    }
+    buf_tail = entries;
+    __atomic_store_n(&buf_ring->tail, static_cast<uint16_t>(buf_tail), __ATOMIC_RELEASE);
+    return true;
+  }
+
+  bool buf_ring_active() const { return buf_ring_registered && buf_ring != nullptr; }
+
+  void* buf_ring_addr(uint16_t bid) const {
+    if (!buf_ring_registered || bid >= buf_ring_entries) return nullptr;
+    return static_cast<uint8_t*>(buf_pool) + static_cast<size_t>(bid) * buf_entry_size;
+  }
+
+  // Hand a consumed buffer back to the kernel so a later recv can reuse it.
+  void buf_ring_recycle(uint16_t bid) {
+    if (!buf_ring_registered || bid >= buf_ring_entries) return;
+    struct io_uring_buf* b = &buf_ring->bufs[buf_tail & buf_ring_mask];
+    b->addr = reinterpret_cast<uint64_t>(buf_ring_addr(bid));
+    b->len = static_cast<uint32_t>(buf_entry_size);
+    b->bid = bid;
+    ++buf_tail;
+    __atomic_store_n(&buf_ring->tail, static_cast<uint16_t>(buf_tail), __ATOMIC_RELEASE);
+  }
+
+  static uint16_t cqe_buffer_id(const struct io_uring_cqe* cqe) {
+    return static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+  }
+  static bool cqe_has_buffer(const struct io_uring_cqe* cqe) {
+    return (cqe->flags & IORING_CQE_F_BUFFER) != 0;
+  }
+  static bool cqe_has_more(const struct io_uring_cqe* cqe) {
+    return (cqe->flags & IORING_CQE_F_MORE) != 0;
+  }
+
+  void teardown_buf_ring() {
+    if (buf_ring_registered && ring_fd >= 0) {
+      struct io_uring_buf_reg reg;
+      std::memset(&reg, 0, sizeof(reg));
+      reg.bgid = buf_ring_bgid;
+      (void)syscall(__NR_io_uring_register, ring_fd, IORING_UNREGISTER_PBUF_RING, &reg, 1);
+    }
+    buf_ring_registered = false;
+    buf_ring = nullptr;
+    if (buf_ring_mem != nullptr) {
+      munmap(buf_ring_mem, buf_ring_mem_sz);
+      buf_ring_mem = nullptr;
+    }
+    if (buf_pool != nullptr) {
+      munmap(buf_pool, buf_pool_sz);
+      buf_pool = nullptr;
+    }
+    buf_ring_mem_sz = 0;
+    buf_pool_sz = 0;
+    buf_ring_entries = 0;
+    buf_ring_mask = 0;
+    buf_entry_size = 0;
+    buf_tail = 0;
+  }
+#else
+  bool setup_buf_ring(uint16_t, unsigned, size_t) { return false; }
+  bool buf_ring_active() const { return false; }
+  void* buf_ring_addr(uint16_t) const { return nullptr; }
+  void buf_ring_recycle(uint16_t) {}
+  static uint16_t cqe_buffer_id(const struct io_uring_cqe*) { return 0; }
+  static bool cqe_has_buffer(const struct io_uring_cqe*) { return false; }
+  static bool cqe_has_more(const struct io_uring_cqe* cqe) {
+    return (cqe->flags & IORING_CQE_F_MORE) != 0;
+  }
+  void teardown_buf_ring() {}
+#endif
+
   void cleanup() {
+    teardown_buf_ring();
     if (sqes != nullptr) {
       munmap(sqes, sqes_sz);
       sqes = nullptr;
@@ -433,6 +576,18 @@ class SamuraiUring {
     cq_ring_sz = o.cq_ring_sz;
     cq_ptr = o.cq_ptr;
 
+    buf_ring = o.buf_ring;
+    buf_ring_mem = o.buf_ring_mem;
+    buf_ring_mem_sz = o.buf_ring_mem_sz;
+    buf_pool = o.buf_pool;
+    buf_pool_sz = o.buf_pool_sz;
+    buf_ring_entries = o.buf_ring_entries;
+    buf_ring_mask = o.buf_ring_mask;
+    buf_entry_size = o.buf_entry_size;
+    buf_tail = o.buf_tail;
+    buf_ring_bgid = o.buf_ring_bgid;
+    buf_ring_registered = o.buf_ring_registered;
+
     o.ring_fd = -1;
     o.sq_ptr = nullptr;
     o.cq_ptr = nullptr;
@@ -440,6 +595,17 @@ class SamuraiUring {
     o.sq_entries = 0;
     o.cq_entries = 0;
     o.sq_last_submitted = 0;
+
+    o.buf_ring = nullptr;
+    o.buf_ring_mem = nullptr;
+    o.buf_ring_mem_sz = 0;
+    o.buf_pool = nullptr;
+    o.buf_pool_sz = 0;
+    o.buf_ring_entries = 0;
+    o.buf_ring_mask = 0;
+    o.buf_entry_size = 0;
+    o.buf_tail = 0;
+    o.buf_ring_registered = false;
   }
 };
 
@@ -478,6 +644,26 @@ inline void prep_uring_close(struct io_uring_sqe* sqe, int fd, uint64_t user_dat
   sqe->fd = fd;
   sqe->user_data = user_data;
 }
+
+#if defined(IORING_RECV_MULTISHOT) && defined(IOSQE_BUFFER_SELECT)
+// Helper: prep a multishot recv that draws buffers from a provided buffer ring
+// (group bgid). One SQE keeps producing CQEs - each carrying the id of the
+// buffer the kernel filled - until the stream ends or buffers are exhausted
+// (-ENOBUFS), marking every continuation CQE with IORING_CQE_F_MORE. get_sqe()
+// zeroes the SQE, so buffer selection and multishot are set from a clean slate.
+inline void prep_uring_recv_multishot(struct io_uring_sqe* sqe, int fd, uint16_t bgid,
+                                      uint64_t user_data) {
+  sqe->opcode = IORING_OP_RECV;
+  sqe->fd = fd;
+  sqe->addr = 0;
+  sqe->len = 0;
+  sqe->msg_flags = 0;
+  sqe->ioprio = IORING_RECV_MULTISHOT;
+  sqe->flags = IOSQE_BUFFER_SELECT;
+  sqe->buf_group = bgid;
+  sqe->user_data = user_data;
+}
+#endif
 
 // Helper: prep a readiness poll. Used to drive TLS/HTTP-2 sockets (SSL_read /
 // SSL_write) and QUIC/HTTP-3 UDP sockets through the ring without moving their

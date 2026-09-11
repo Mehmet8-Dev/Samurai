@@ -224,6 +224,10 @@ struct Http1Connection {
   bool custom_terminal{false};
   bool custom_rx_pending{false};
   bool uring_in_flight{false};
+  // Set once a persistent multishot recv (drawing from the shard provided-buffer
+  // ring) is armed for this connection; it survives keepalive request boundaries
+  // and is cleared only when the multishot terminates (!F_MORE) so it re-arms.
+  bool uring_multishot{false};
   IoUringOp uring_pending_op{IoUringOp::None};
   sockaddr_storage uring_addr{};
   socklen_t uring_addrlen{0};
