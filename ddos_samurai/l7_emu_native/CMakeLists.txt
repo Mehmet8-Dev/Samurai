@@ -14,7 +14,9 @@ if(PkgConfig_FOUND)
   pkg_check_modules(NGHTTP3 QUIET libnghttp3)
   pkg_check_modules(GNUTLS QUIET gnutls)
   pkg_check_modules(DPDK QUIET libdpdk)
+  pkg_check_modules(URING QUIET liburing)
 endif()
+find_path(LINUX_IO_URING_H NAMES "linux/io_uring.h")
 
 # samurai_l7emu — the native L7 emulation engine (HTTP/1.1, HTTP/2 via nghttp2,
 # custom TCP bridge over samurai_l4, and the in-process QUIC/H3 stack). The
@@ -109,6 +111,18 @@ if(SAMURAI_QUIC_BACKENDS)
   target_link_libraries(samurai_l7emu PUBLIC ${NGTCP2_LIBRARIES} ${NGTCP2_GNUTLS_LIBRARIES} ${NGHTTP3_LIBRARIES} ${GNUTLS_LIBRARIES})
 endif()
 
+if(URING_FOUND)
+  target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_WITH_IO_URING=1 SAMURAI_WITH_LIBURING=1)
+  target_include_directories(samurai_l7emu PUBLIC ${URING_INCLUDE_DIRS})
+  target_link_libraries(samurai_l7emu PUBLIC ${URING_LIBRARIES})
+  message(STATUS "liburing found: native io_uring reactor enabled with liburing")
+elseif(LINUX_IO_URING_H)
+  target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_WITH_IO_URING=1)
+  message(STATUS "linux/io_uring.h found: native io_uring reactor enabled via direct kernel ring")
+else()
+  message(STATUS "io_uring not found: io_uring native reactor disabled (fallback to socket_epoll)")
+endif()
+
 add_executable(test_l2l3_astf test_l2l3_astf.cpp)
 target_link_libraries(test_l2l3_astf PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
 
@@ -126,4 +140,9 @@ target_link_libraries(test_kernel_threaded_h2 PRIVATE samurai_l7emu samurai_l4 s
 # threaded fan-out and the serial reference and asserts they match.
 add_executable(test_kernel_threaded_h3 test_kernel_threaded_h3.cpp)
 target_link_libraries(test_kernel_threaded_h3 PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
+
+if(LINUX_IO_URING_H OR URING_FOUND)
+  add_executable(test_kernel_threaded_io_uring test_kernel_threaded_io_uring.cpp)
+  target_link_libraries(test_kernel_threaded_io_uring PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
+endif()
 
