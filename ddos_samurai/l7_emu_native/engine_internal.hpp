@@ -67,6 +67,7 @@ uint32_t reactor_interest_mask();
 void register_h1_lane_fd(ShardState& shard, NativeRuntime::LocalShard& local_shard, H1Lane* lane, std::size_t lane_idx);
 void unregister_lane_fd(ShardState& shard, NativeRuntime::LocalShard& local_shard, int fd);
 int service_ready_lanes(NativeRuntime& runtime, const Profile& profile, std::size_t shard_idx, int timeout_ms);
+int service_ready_lanes_io_uring(NativeRuntime& runtime, const Profile& profile, std::size_t shard_idx, int timeout_ms);
 void service_custom_tcp_shard_lanes(NativeRuntime& runtime, std::size_t shard_idx);
 void service_all_ready_lanes(NativeRuntime& runtime, const Profile& profile, int timeout_ms);
 

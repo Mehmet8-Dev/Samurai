@@ -58,6 +58,7 @@ struct Profile {
   std::string sender_path;
   std::string transport_backend{"custom_tcp"};
   std::string stateful_runtime_backend{"kernel"};
+  std::string reactor_backend{"auto"};
   int stateful_runtime_strict{0};
   int legacy_mode{0};
   std::string source_ip;
@@ -87,6 +88,7 @@ struct RuntimeCapabilities {
   bool nghttp2{false};
   bool ngtcp2{false};
   bool nghttp3{false};
+  bool io_uring{false};
 };
 
 struct ScenarioStepResult {
@@ -102,6 +104,7 @@ struct ScenarioStepResult {
 
 enum class ReactorBackend {
   SocketEpoll = 0,
+  SocketIoUring = 1,
 };
 
 enum class TransportBackend {
@@ -131,8 +134,28 @@ inline const char* reactor_backend_name(ReactorBackend backend) {
   switch (backend) {
     case ReactorBackend::SocketEpoll:
       return "socket_epoll";
+    case ReactorBackend::SocketIoUring:
+      return "socket_io_uring";
   }
   return "unknown";
+}
+
+inline ReactorBackend parse_reactor_backend_name(const std::string& name) {
+  if (name == "io_uring" || name == "socket_io_uring" || name == "uring") {
+    return ReactorBackend::SocketIoUring;
+  }
+  return ReactorBackend::SocketEpoll;
+}
+
+inline ReactorBackend resolve_reactor_backend(const std::string& name, bool caps_io_uring) {
+  if (name == "epoll" || name == "socket_epoll") {
+    return ReactorBackend::SocketEpoll;
+  }
+  if (name == "io_uring" || name == "socket_io_uring" || name == "uring") {
+    return caps_io_uring ? ReactorBackend::SocketIoUring : ReactorBackend::SocketEpoll;
+  }
+  // "auto", empty, or unspecified default
+  return caps_io_uring ? ReactorBackend::SocketIoUring : ReactorBackend::SocketEpoll;
 }
 
 inline const char* transport_backend_name(TransportBackend backend) {

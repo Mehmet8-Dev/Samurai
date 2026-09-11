@@ -54,6 +54,7 @@
 #include "../af_packet/af_packet.h"
 #include "../dpdk/dpdk_core.hpp"
 #include "tls_session_engine.hpp"
+#include "io_uring_compat.hpp"
 
 namespace ddos_samurai::l7_emu_native {
 
@@ -135,6 +136,8 @@ struct DataplanePerfStats {
   std::size_t tx_syscalls{0};
   std::size_t alloc_bytes{0};
   std::size_t alloc_count{0};
+  std::size_t io_uring_sqe_submitted{0};
+  std::size_t io_uring_cqe_reaped{0};
   std::vector<double> tls_handshake_samples_ms{};
   std::vector<double> request_latency_samples_ms{};
   std::size_t profile_snapshot_count{0};
@@ -214,6 +217,11 @@ struct Http1Connection {
   std::uint32_t custom_send_enqueue_count{0};
   bool custom_terminal{false};
   bool custom_rx_pending{false};
+  bool uring_in_flight{false};
+  IoUringOp uring_pending_op{IoUringOp::None};
+  sockaddr_storage uring_addr{};
+  socklen_t uring_addrlen{0};
+  char uring_rx_buf[8192]{};
   H1ReadBuffer read_buffer{};
   long long idle_deadline_ms{0};
   std::size_t timer_slot{0};
@@ -616,6 +624,8 @@ struct NativeRuntime {
     long long dispatch_ready_ms{0};
     std::size_t h2_dispatch_cursor{0};
     bool in_ready_queue{false};
+    SamuraiUring uring{};
+    bool uring_active{false};
 #ifdef SAMURAI_WITH_NGHTTP2
     std::vector<std::unique_ptr<H2ClientSession>> h2_sessions{};
 #endif
