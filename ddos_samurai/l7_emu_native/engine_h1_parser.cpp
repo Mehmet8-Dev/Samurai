@@ -507,7 +507,7 @@ static bool arm_h1_ring_recv(
     prep_uring_recv_multishot(
         sqe, conn.fd, /*bgid=*/0,
         make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Recv,
-                             static_cast<uint16_t>(conn.timer_generation)));
+                             conn.uring_gen));
     conn.uring_multishot = true;
     if (g_perf_stats != nullptr) {
       g_perf_stats->io_uring_sqe_submitted += 1;
@@ -525,7 +525,7 @@ static bool arm_h1_ring_recv(
   prep_uring_recv(
       sqe, conn.fd, conn.uring_rx_buf, sizeof(conn.uring_rx_buf), 0,
       make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Recv,
-                           static_cast<uint16_t>(conn.timer_generation)));
+                           conn.uring_gen));
   conn.uring_in_flight = true;
   conn.uring_pending_op = IoUringOp::Recv;
   if (g_perf_stats != nullptr) {
@@ -568,7 +568,7 @@ int service_ready_lanes_io_uring(
               lane.write_buffer.data() + lane.write_offset,
               lane.write_buffer.size() - lane.write_offset,
               MSG_NOSIGNAL,
-              make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Send, static_cast<uint16_t>(lane.conn->timer_generation)));
+              make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Send, lane.conn->uring_gen));
           lane.conn->uring_in_flight = true;
           lane.conn->uring_pending_op = IoUringOp::Send;
           if (g_perf_stats != nullptr) {
@@ -711,8 +711,16 @@ int service_ready_lanes_io_uring(
     H1Lane& lane = *lane_ptr;
     Http1Connection& conn = *lane.conn;
 
-    if (gen != static_cast<uint16_t>(conn.timer_generation)) {
+    if (gen != conn.uring_gen) {
       if (cqe_from_ring) local_shard.uring.buf_ring_recycle(cqe_bid);
+      continue;
+    }
+    // A closed connection (fd already reaped) can still surface the terminating
+    // completion of its multishot recv; recycle its buffer and drop it so it does
+    // not corrupt a reused lane slot.
+    if (conn.fd < 0) {
+      if (cqe_from_ring) local_shard.uring.buf_ring_recycle(cqe_bid);
+      conn.uring_multishot = false;
       continue;
     }
 

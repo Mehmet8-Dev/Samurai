@@ -228,6 +228,12 @@ struct Http1Connection {
   // ring) is armed for this connection; it survives keepalive request boundaries
   // and is cleared only when the multishot terminates (!F_MORE) so it re-arms.
   bool uring_multishot{false};
+  // Unique per connection-instance tag carried in every io_uring user_data for
+  // this connection, assigned fresh on each connect(). It lets the reactor drop
+  // completions belonging to a previous connection that reused this lane slot -
+  // in particular the terminating CQE of a multishot recv left over from a since
+  // closed connection - which timer_generation (always 0) could not distinguish.
+  uint16_t uring_gen{0};
   IoUringOp uring_pending_op{IoUringOp::None};
   sockaddr_storage uring_addr{};
   socklen_t uring_addrlen{0};

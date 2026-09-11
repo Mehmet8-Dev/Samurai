@@ -4,6 +4,19 @@
 
 namespace ddos_samurai::l7_emu_native {
 
+// Monotonic per-worker-thread tag source for io_uring connection generations.
+// Each shard runs on one thread, so a thread-local counter yields values unique
+// across the connection instances that pass through a given lane slot; 0 is
+// skipped so it never collides with a default-initialised uring_gen.
+inline uint16_t next_h1_uring_gen() {
+  static thread_local uint16_t seq = 0;
+  ++seq;
+  if (seq == 0) {
+    ++seq;
+  }
+  return seq;
+}
+
 // Thread-local performance and scenario tracking
 extern thread_local DataplanePerfStats* g_perf_stats;
 extern thread_local std::vector<ScenarioStepResult> g_last_scenario_step_results;

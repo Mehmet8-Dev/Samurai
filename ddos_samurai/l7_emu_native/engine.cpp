@@ -136,6 +136,11 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
           continue;
         }
         accum[shard_idx].conn_established += 1;
+        // Fresh io_uring generation for this new connection instance so any
+        // completions still in flight from a prior connection on this lane slot
+        // are rejected by the reactor.
+        lane.conn->uring_gen = next_h1_uring_gen();
+        lane.conn->uring_multishot = false;
         shard.connection_pool.active_connections += 1;
         shard.connection_pool.active_connections_peak = std::max(
             shard.connection_pool.active_connections_peak,
@@ -159,7 +164,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
               lane.write_buffer.data() + lane.write_offset,
               lane.write_buffer.size() - lane.write_offset,
               MSG_NOSIGNAL,
-              make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Send, static_cast<uint16_t>(lane.conn->timer_generation)));
+              make_uring_user_data(static_cast<uint32_t>(lane_idx), IoUringOp::Send, lane.conn->uring_gen));
           lane.conn->uring_in_flight = true;
           lane.conn->uring_pending_op = IoUringOp::Send;
           if (g_perf_stats != nullptr) {
