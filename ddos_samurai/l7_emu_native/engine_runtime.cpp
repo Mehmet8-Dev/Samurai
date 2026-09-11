@@ -209,14 +209,13 @@ NativeRuntime build_runtime(const Profile& profile, const RuntimeConfig& cfg) {
         resolve_reactor_backend(profile.reactor_backend, runtime.caps.io_uring);
     if (effective_reactor == ReactorBackend::SocketIoUring) {
       const unsigned kRingDepth = static_cast<unsigned>(std::max(64, std::min(4096, profile.max_connections * 2)));
-      unsigned flags = 0;
-#ifdef IORING_SETUP_SINGLE_ISSUER
-      flags |= IORING_SETUP_SINGLE_ISSUER;
-#endif
-#ifdef IORING_SETUP_CQSIZE
-      flags |= IORING_SETUP_CQSIZE;
-#endif
-      if (local.uring.init(kRingDepth, flags)) {
+      unsigned flags = kUringSetupSingleIssuer | kUringSetupCqsize;
+      // Give the completion queue headroom over the submission queue: H2/H3
+      // multishot polls and pipelined H1 completions can land several CQEs per
+      // submitted SQE, and an overflowing CQ drops completions. init() peels the
+      // CQSIZE flag automatically if the kernel rejects it, so passing the depth
+      // is always safe.
+      if (local.uring.init(kRingDepth, flags, kRingDepth * 2)) {
         local.uring_active = true;
       }
     }

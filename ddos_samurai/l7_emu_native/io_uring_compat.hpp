@@ -11,16 +11,48 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 
+// Enablement is driven by two signals kept in lockstep so the CMake STATUS
+// messages actually reflect what gets compiled:
+//   * SAMURAI_WITH_IO_URING / SAMURAI_WITH_LIBURING - defined by CMakeLists.txt
+//     when it detects liburing or <linux/io_uring.h>.
+//   * self-detection via __has_include - so unit-test and ad-hoc builds that do
+//     not go through CMake still get the native ring.
+// Either signal pulls in the header and defines SAMURAI_HAS_LINUX_IO_URING, the
+// single macro the rest of the engine keys off.
 #if defined(__has_include)
 #  if __has_include(<linux/io_uring.h>)
 #    include <linux/io_uring.h>
-#    define SAMURAI_HAS_LINUX_IO_URING 1
+#    ifndef SAMURAI_HAS_LINUX_IO_URING
+#      define SAMURAI_HAS_LINUX_IO_URING 1
+#    endif
 #  endif
+#endif
+#if defined(SAMURAI_WITH_IO_URING) && !defined(SAMURAI_HAS_LINUX_IO_URING)
+#  include <linux/io_uring.h>
+#  define SAMURAI_HAS_LINUX_IO_URING 1
 #endif
 
 namespace ddos_samurai::l7_emu_native {
 
 #if defined(SAMURAI_HAS_LINUX_IO_URING) && defined(__NR_io_uring_setup)
+
+// Setup flags that may be absent on the build kernel's headers: fold them to 0
+// so masking/peeling logic stays valid without a thicket of #ifdefs.
+#ifdef IORING_SETUP_SQPOLL
+inline constexpr unsigned kUringSetupSqpoll = IORING_SETUP_SQPOLL;
+#else
+inline constexpr unsigned kUringSetupSqpoll = 0u;
+#endif
+#ifdef IORING_SETUP_CQSIZE
+inline constexpr unsigned kUringSetupCqsize = IORING_SETUP_CQSIZE;
+#else
+inline constexpr unsigned kUringSetupCqsize = 0u;
+#endif
+#ifdef IORING_SETUP_SINGLE_ISSUER
+inline constexpr unsigned kUringSetupSingleIssuer = IORING_SETUP_SINGLE_ISSUER;
+#else
+inline constexpr unsigned kUringSetupSingleIssuer = 0u;
+#endif
 
 enum class IoUringOp : uint8_t {
   None = 0,
@@ -28,6 +60,10 @@ enum class IoUringOp : uint8_t {
   Send = 2,
   Recv = 3,
   Close = 4,
+  // Readiness poll used by the TLS/HTTP-2 and QUIC/HTTP-3 paths, where the data
+  // transfer itself runs through SSL_read/write or the QUIC stack rather than
+  // raw ring send/recv. The ring only delivers the wakeup.
+  PollReadiness = 5,
 };
 
 inline uint64_t make_uring_user_data(uint32_t lane_idx, IoUringOp op, uint16_t gen = 0) {
@@ -104,20 +140,51 @@ class SamuraiUring {
     return false;
   }
 
-  bool init(unsigned entries, unsigned desired_flags = 0) {
+  bool init(unsigned entries, unsigned desired_flags = 0, unsigned desired_cq_entries = 0) {
     cleanup();
-    struct io_uring_params p;
-    std::memset(&p, 0, sizeof(p));
-    p.flags = desired_flags;
 
-    // Try desired flags (e.g. SINGLE_ISSUER | CQSIZE)
-    ring_fd = static_cast<int>(syscall(__NR_io_uring_setup, entries, &p));
-    if (ring_fd < 0 && (desired_flags != 0)) {
-      // Graceful degradation for older kernels (e.g. Linux 5.10 without SINGLE_ISSUER)
-      std::memset(&p, 0, sizeof(p));
-      ring_fd = static_cast<int>(syscall(__NR_io_uring_setup, entries, &p));
+    // IORING_SETUP_CQSIZE REQUIRES a non-zero cq_entries; the old code set the
+    // flag but left cq_entries at 0, so the kernel rejected the first setup and
+    // the single fallback dropped ALL flags at once (SINGLE_ISSUER included).
+    // Instead peel one capability at a time so we keep the strongest feature set
+    // the running kernel actually supports: SQPOLL first (needs privileges),
+    // then CQSIZE, then SINGLE_ISSUER, finally a bare ring.
+    const unsigned cq_req = desired_cq_entries != 0 ? desired_cq_entries : entries * 2;
+
+    unsigned attempt_flags[4];
+    unsigned attempt_cq[4];
+    int attempts = 0;
+    auto push_attempt = [&](unsigned f) {
+      attempt_flags[attempts] = f;
+      attempt_cq[attempts] = (f & kUringSetupCqsize) != 0 ? cq_req : 0u;
+      ++attempts;
+    };
+    push_attempt(desired_flags);
+    if ((desired_flags & kUringSetupSqpoll) != 0) {
+      push_attempt(desired_flags & ~kUringSetupSqpoll);
     }
-    if (ring_fd < 0) {
+    if ((desired_flags & kUringSetupCqsize) != 0) {
+      push_attempt(desired_flags & ~(kUringSetupSqpoll | kUringSetupCqsize));
+    }
+    if (desired_flags != 0) {
+      push_attempt(0u);
+    }
+
+    struct io_uring_params p;
+    bool created = false;
+    for (int i = 0; i < attempts; ++i) {
+      std::memset(&p, 0, sizeof(p));
+      p.flags = attempt_flags[i];
+      if ((attempt_flags[i] & kUringSetupCqsize) != 0) {
+        p.cq_entries = attempt_cq[i];
+      }
+      ring_fd = static_cast<int>(syscall(__NR_io_uring_setup, entries, &p));
+      if (ring_fd >= 0) {
+        created = true;
+        break;
+      }
+    }
+    if (!created) {
       return false;
     }
 
@@ -204,17 +271,66 @@ class SamuraiUring {
     return sqe;
   }
 
+  // With SQPOLL a kernel thread drains the SQ on its own; we only need to enter
+  // to wake it when it has parked (IORING_SQ_NEED_WAKEUP). Returns false for the
+  // common non-SQPOLL case.
+  bool sqpoll_needs_wakeup() const {
+    if ((active_flags & kUringSetupSqpoll) == 0 || sq_kflags == nullptr) {
+      return false;
+    }
+    return (__atomic_load_n(sq_kflags, __ATOMIC_ACQUIRE) & IORING_SQ_NEED_WAKEUP) != 0;
+  }
+
   int submit() {
     if (ring_fd < 0 || sq_ktail == nullptr) return -1;
     unsigned tail = *sq_ktail;
     __atomic_store_n(sq_ktail, tail, __ATOMIC_RELEASE);
     unsigned to_submit = tail - sq_last_submitted;
+
+    if ((active_flags & kUringSetupSqpoll) != 0) {
+      // The SQ poll thread consumes entries up to the tail we just published;
+      // only enter (with SQ_WAKEUP) if it has gone to sleep.
+      if (sqpoll_needs_wakeup()) {
+        (void)syscall(__NR_io_uring_enter, ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, nullptr);
+      }
+      sq_last_submitted = tail;
+      return static_cast<int>(to_submit);
+    }
+
     if (to_submit == 0) return 0;
     int ret = static_cast<int>(syscall(__NR_io_uring_enter, ring_fd, to_submit, 0, 0, nullptr));
     if (ret > 0) {
       sq_last_submitted += static_cast<unsigned>(ret);
     }
     return ret;
+  }
+
+  // Submit pending SQEs and block in the kernel until at least min_complete CQEs
+  // are ready or timeout_ms elapses, in a single io_uring_enter(GETEVENTS) call
+  // when the kernel advertises EXT_ARG. This replaces the submit()+poll()+peek
+  // three-syscall dance with one syscall on the hot path. Falls back to the
+  // poll()-based wait on older kernels.
+  int submit_and_wait_cqes(unsigned min_complete, int timeout_ms) {
+    int submitted = submit();
+    if (ring_fd < 0) return submitted < 0 ? submitted : -1;
+    if (min_complete == 0) return submitted;
+
+    if ((features & IORING_FEAT_EXT_ARG) != 0 && timeout_ms >= 0) {
+      struct __kernel_timespec ts;
+      ts.tv_sec = timeout_ms / 1000;
+      ts.tv_nsec = static_cast<long long>(timeout_ms % 1000) * 1000000LL;
+      struct io_uring_getevents_arg arg;
+      std::memset(&arg, 0, sizeof(arg));
+      arg.ts = reinterpret_cast<uint64_t>(&ts);
+      unsigned enter_flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
+      if (sqpoll_needs_wakeup()) {
+        enter_flags |= IORING_ENTER_SQ_WAKEUP;
+      }
+      return static_cast<int>(syscall(__NR_io_uring_enter, ring_fd, 0u, min_complete,
+                                      enter_flags, &arg, sizeof(arg)));
+    }
+    // Legacy fallback: poll the ring fd for readiness.
+    return wait_event(timeout_ms);
   }
 
   int submit_and_wait(unsigned wait_nr, int timeout_ms = 0) {
@@ -360,6 +476,56 @@ inline void prep_uring_recv(struct io_uring_sqe* sqe, int fd, void* buf, size_t 
 inline void prep_uring_close(struct io_uring_sqe* sqe, int fd, uint64_t user_data) {
   sqe->opcode = IORING_OP_CLOSE;
   sqe->fd = fd;
+  sqe->user_data = user_data;
+}
+
+// Helper: prep a readiness poll. Used to drive TLS/HTTP-2 sockets (SSL_read /
+// SSL_write) and QUIC/HTTP-3 UDP sockets through the ring without moving their
+// byte transfer onto raw send/recv SQEs. When multishot is requested the kernel
+// keeps re-arming the poll and marks every intermediate CQE with
+// IORING_CQE_F_MORE (see IORING_POLL_ADD_MULTI); the caller re-arms once a CQE
+// arrives without F_MORE.
+inline void prep_uring_poll_add(struct io_uring_sqe* sqe, int fd, uint32_t poll_mask,
+                                bool multishot, uint64_t user_data) {
+  sqe->opcode = IORING_OP_POLL_ADD;
+  sqe->fd = fd;
+  sqe->poll32_events = poll_mask;
+#ifdef IORING_POLL_ADD_MULTI
+  sqe->len = multishot ? IORING_POLL_ADD_MULTI : 0u;
+#else
+  (void)multishot;
+  sqe->len = 0u;
+#endif
+  sqe->user_data = user_data;
+}
+
+// Helper: prep poll cancellation, keyed on the original poll's user_data.
+inline void prep_uring_poll_remove(struct io_uring_sqe* sqe, uint64_t target_user_data,
+                                   uint64_t user_data) {
+  sqe->opcode = IORING_OP_POLL_REMOVE;
+  sqe->addr = target_user_data;
+  sqe->user_data = user_data;
+}
+
+// Helper: prep recvmsg (datagram receive for the QUIC/HTTP-3 UDP path).
+inline void prep_uring_recvmsg(struct io_uring_sqe* sqe, int fd, struct msghdr* msg,
+                               unsigned flags, uint64_t user_data) {
+  sqe->opcode = IORING_OP_RECVMSG;
+  sqe->fd = fd;
+  sqe->addr = reinterpret_cast<uint64_t>(msg);
+  sqe->len = 1;
+  sqe->msg_flags = flags;
+  sqe->user_data = user_data;
+}
+
+// Helper: prep sendmsg (datagram send for the QUIC/HTTP-3 UDP path).
+inline void prep_uring_sendmsg(struct io_uring_sqe* sqe, int fd, const struct msghdr* msg,
+                               unsigned flags, uint64_t user_data) {
+  sqe->opcode = IORING_OP_SENDMSG;
+  sqe->fd = fd;
+  sqe->addr = reinterpret_cast<uint64_t>(msg);
+  sqe->len = 1;
+  sqe->msg_flags = flags;
   sqe->user_data = user_data;
 }
 
