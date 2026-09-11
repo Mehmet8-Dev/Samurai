@@ -225,6 +225,11 @@ NativeRuntime build_runtime(const Profile& profile, const RuntimeConfig& cfg) {
   runtime.tls_engine = std::make_unique<TlsSessionEngine>();
   SniPoolConfig sni_cfg{};
   CipherSuiteConfig cipher_cfg{};
+  // Wire the operator-supplied cipher preference through to the TLS engine; when
+  // unset, get_thread_context() falls back to the AES-NI-friendly default so the
+  // symmetric-crypto load stays off the critical path (previously this profile
+  // field was parsed but never applied).
+  cipher_cfg.cipher_list = profile.tls_cipher_list;
   runtime.tls_engine->configure(sni_cfg, cipher_cfg, profile.verify, 256);
   return runtime;
 }

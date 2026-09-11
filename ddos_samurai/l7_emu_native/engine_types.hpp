@@ -89,6 +89,19 @@ struct H1ReadBuffer {
   }
 
   void append(const char* data, std::size_t len) {
+    if (len == 0) {
+      return;
+    }
+    // Reclaim the already-consumed prefix lazily: only compact when the tail
+    // cannot absorb the incoming bytes without forcing a reallocation. When it
+    // does compact it moves just the unconsumed remainder, which is never more
+    // work than the realloc-and-copy it replaces. This keeps consume() O(1) and
+    // avoids the per-response memmove that used to dominate memory bandwidth on
+    // large, pipelined response bodies.
+    if (head > 0 && storage.size() + len > storage.capacity()) {
+      storage.erase(0, head);
+      head = 0;
+    }
     storage.append(data, len);
   }
 
@@ -101,7 +114,14 @@ struct H1ReadBuffer {
 
   void consume(std::size_t len) {
     head += std::min(len, size());
-    compact_if_needed();
+    // Fully drained is the common case (one response per round trip): rewind to
+    // the front and keep the allocation for reuse — no byte movement. Any
+    // leftover (a pipelined next response) is left in place; append() reclaims
+    // the dead prefix only if it later needs the room.
+    if (head >= storage.size()) {
+      storage.clear();
+      head = 0;
+    }
   }
 
   void clear() {
@@ -110,20 +130,6 @@ struct H1ReadBuffer {
   }
 
   void reset_reusable(std::size_t keep_limit, std::size_t min_capacity);
-
-  void compact_if_needed() {
-    if (head == 0) {
-      return;
-    }
-    if (head >= storage.size()) {
-      clear();
-      return;
-    }
-    if (head >= 32768 || head * 2 >= storage.size()) {
-      storage.erase(0, head);
-      head = 0;
-    }
-  }
 };
 
 struct DataplanePerfStats {

@@ -645,6 +645,27 @@ bool setup_tls(H2ConnectionContext& ctx, const Profile& profile) {
   if (ctx.tls_ctx == nullptr) {
     return false;
   }
+  SSL_CTX_set_min_proto_version(ctx.tls_ctx, TLS1_2_VERSION);
+
+#ifdef SSL_OP_ENABLE_KTLS
+  // Offload symmetric record crypto to the kernel (and, where available, the
+  // NIC) on the socket-BIO path so it does not burn userspace CPU. Memory-BIO
+  // custom-TCP connections fall back to in-process crypto automatically.
+  SSL_CTX_set_options(ctx.tls_ctx, SSL_OP_ENABLE_KTLS);
+#endif
+
+  // Pin the AES-NI-friendly cipher ordering (see tls_session_engine.hpp): under
+  // high-throughput HTTP/2 the symmetric-encryption cost saturates the CPU
+  // before the NIC, so preferring AES-128-GCM keeps that cost minimal. Honour an
+  // explicit operator override when one is supplied.
+  SSL_CTX_set_cipher_list(
+      ctx.tls_ctx,
+      profile.tls_cipher_list.empty() ? kDefaultTls12CipherList
+                                      : profile.tls_cipher_list.c_str());
+#if TLS1_3_VERSION
+  SSL_CTX_set_ciphersuites(ctx.tls_ctx, kDefaultTls13Ciphersuites);
+#endif
+
   SSL_CTX_set_alpn_protos(
       ctx.tls_ctx,
       reinterpret_cast<const unsigned char*>("\x02h2"),

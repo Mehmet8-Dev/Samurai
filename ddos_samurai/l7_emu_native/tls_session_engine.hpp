@@ -11,6 +11,17 @@ namespace ddos_samurai::l7_emu_native {
 
 struct Profile;
 
+// AES-NI-friendly cipher preferences shared by every client SSL_CTX in the
+// engine. Offering AES-128-GCM ahead of AES-256-GCM and ChaCha20-Poly1305 keeps
+// the symmetric-encryption CPU cost minimal on hardware with AES acceleration,
+// which is what saturates first under high-throughput HTTP/2 + TLS load.
+inline constexpr const char* kDefaultTls12CipherList =
+    "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+    "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+inline constexpr const char* kDefaultTls13Ciphersuites =
+    "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256";
+
 // TLS session cache entry for session ticket/ID reuse.
 struct TlsSessionCacheEntry {
   std::vector<uint8_t> ticket_data{};

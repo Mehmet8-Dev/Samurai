@@ -116,14 +116,20 @@ ThreadLocalTlsContext* TlsSessionEngine::get_thread_context() {
   SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
 #endif
 
-  // Apply cipher suite configuration.
-  if (!cipher_config_.cipher_list.empty()) {
-    SSL_CTX_set_cipher_list(ctx, cipher_config_.cipher_list.c_str());
-  }
+  // Apply cipher suite configuration. When the caller leaves the preference
+  // empty we still pin an AES-NI-friendly ordering: on hardware with AES
+  // acceleration, AES-128-GCM costs roughly half the CPU of AES-256-GCM and far
+  // less than ChaCha20-Poly1305, so offering it first keeps the symmetric-crypto
+  // load off the critical path before the NIC saturates.
+  SSL_CTX_set_cipher_list(
+      ctx,
+      cipher_config_.cipher_list.empty() ? kDefaultTls12CipherList
+                                         : cipher_config_.cipher_list.c_str());
 #if TLS1_3_VERSION
-  if (!cipher_config_.ciphersuites.empty()) {
-    SSL_CTX_set_ciphersuites(ctx, cipher_config_.ciphersuites.c_str());
-  }
+  SSL_CTX_set_ciphersuites(
+      ctx,
+      cipher_config_.ciphersuites.empty() ? kDefaultTls13Ciphersuites
+                                          : cipher_config_.ciphersuites.c_str());
 #endif
 
   // Configure ALPN to negotiate both h2 and http/1.1.
