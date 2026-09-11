@@ -576,6 +576,12 @@ struct H2ClientSession {
   std::size_t stream_pool_reuse_hits{0};
   std::size_t harvested_stream_pool_reuse_hits{0};
   int drain_evictions{0};
+  // io_uring readiness-poll bookkeeping (SocketIoUring reactor). The data path
+  // stays on SSL_read/write + nghttp2; the ring only delivers the wakeup via a
+  // multishot POLL_ADD keyed on session_idx. uring_poll_gen rejects stale CQEs
+  // from a poll armed on a since-recycled fd.
+  bool uring_poll_armed{false};
+  uint16_t uring_poll_gen{0};
 };
 #endif
 

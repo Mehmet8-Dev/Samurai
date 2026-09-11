@@ -550,6 +550,52 @@ int service_ready_lanes_io_uring(
     }
   }
 
+  // 1b. Drive kernel-socket HTTP/2 sessions through the same ring. Their byte
+  // transfer stays on SSL_read/write + nghttp2; we only need the readiness
+  // wakeup, so each un-armed session is serviced once (to push requests and
+  // drain buffered bytes) and then gets a single-shot POLLIN poll armed on its
+  // fd. Without this, an io_uring-active shard would service H1 lanes but never
+  // wake for H2 traffic (epoll_wait is not called on this path), starving H2.
+  std::size_t h2_polls_armed = 0;
+#ifdef SAMURAI_WITH_NGHTTP2
+  for (std::size_t si = 0; si < local_shard.h2_sessions.size(); ++si) {
+    auto& session_ptr = local_shard.h2_sessions[si];
+    if (!session_ptr) {
+      continue;
+    }
+    H2ClientSession& client = *session_ptr;
+    if (!client.ready || client.ctx.fd < 0 ||
+        is_custom_tcp_backend(client.ctx.transport_backend)) {
+      continue;
+    }
+    if (!client.uring_poll_armed) {
+      service_h2_session_io(runtime, profile, shard, local_shard, client, 0, true);
+      flush_ready_h2_completions(runtime, shard_idx, client);
+      if (!client.ready || client.ctx.fd < 0) {
+        continue;
+      }
+      auto* sqe = local_shard.uring.get_sqe();
+      if (sqe != nullptr) {
+        client.uring_poll_gen = static_cast<uint16_t>(client.uring_poll_gen + 1);
+        prep_uring_poll_add(
+            sqe,
+            client.ctx.fd,
+            POLLIN | POLLERR | POLLHUP,
+            /*multishot=*/false,
+            make_uring_user_data(static_cast<uint32_t>(si), IoUringOp::PollReadiness,
+                                 client.uring_poll_gen));
+        client.uring_poll_armed = true;
+        if (g_perf_stats != nullptr) {
+          g_perf_stats->io_uring_sqe_submitted += 1;
+        }
+      }
+    }
+    if (client.uring_poll_armed) {
+      ++h2_polls_armed;
+    }
+  }
+#endif
+
   // 2. Submit pending SQEs
   local_shard.uring.submit();
 
@@ -558,11 +604,13 @@ int service_ready_lanes_io_uring(
   int reaped = local_shard.uring.peek_batch_cqe(cqes, 128);
 
   if (reaped == 0 && timeout_ms > 0) {
-    bool has_in_flight = false;
-    for (const auto& lane_ptr : local_shard.h1_lanes) {
-      if (lane_ptr && lane_ptr->conn && lane_ptr->conn->uring_in_flight) {
-        has_in_flight = true;
-        break;
+    bool has_in_flight = h2_polls_armed > 0;
+    if (!has_in_flight) {
+      for (const auto& lane_ptr : local_shard.h1_lanes) {
+        if (lane_ptr && lane_ptr->conn && lane_ptr->conn->uring_in_flight) {
+          has_in_flight = true;
+          break;
+        }
       }
     }
     if (has_in_flight) {
@@ -589,6 +637,26 @@ int service_ready_lanes_io_uring(
     const IoUringOp op = uring_user_data_op(user_data);
     const uint16_t gen = uring_user_data_gen(user_data);
     const int res = cqe->res;
+
+#ifdef SAMURAI_WITH_NGHTTP2
+    if (op == IoUringOp::PollReadiness) {
+      // HTTP/2 readiness wakeup: lane_idx addresses the h2_sessions vector, a
+      // different namespace from h1_lanes, so this must be handled before the
+      // h1_lanes bound check below.
+      const std::size_t si = lane_idx;
+      if (si < local_shard.h2_sessions.size() && local_shard.h2_sessions[si]) {
+        H2ClientSession& client = *local_shard.h2_sessions[si];
+        if (gen == client.uring_poll_gen) {
+          client.uring_poll_armed = false;  // single-shot fired; re-armed next pass
+          const uint32_t ev = res < 0 ? static_cast<uint32_t>(EPOLLERR | EPOLLHUP)
+                                      : static_cast<uint32_t>(res);
+          service_h2_session_io(runtime, profile, shard, local_shard, client, ev, true);
+          flush_ready_h2_completions(runtime, shard_idx, client);
+        }
+      }
+      continue;
+    }
+#endif
 
     if (lane_idx >= local_shard.h1_lanes.size()) {
       continue;

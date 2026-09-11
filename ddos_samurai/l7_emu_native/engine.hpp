@@ -67,6 +67,7 @@ struct Profile {
   int target_port{0};
   std::string scheme;
   std::string host_header;
+  std::string tls_cipher_list{};  // optional operator override for the TLS 1.2 cipher list
   int verify{1};
   int keepalive{1};
   int timeout_ms{5000};
