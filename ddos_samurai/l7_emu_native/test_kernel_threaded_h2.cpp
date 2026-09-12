@@ -50,9 +50,20 @@ int main() {
   const int port = std::atoi(port_env);
   const char* tls_env = std::getenv("H2_TEST_TLS");
   const bool use_tls = tls_env != nullptr && *tls_env != '\0' && *tls_env != '0';
+  const char* ktls_env = std::getenv("H2_TEST_KTLS");
+  const bool want_ktls = ktls_env != nullptr && *ktls_env != '\0' && *ktls_env != '0';
 
-  constexpr int kRequests = 40;
-  constexpr int kConcurrency = 4;  // shards = min(concurrency, max_connections)
+  auto env_int = [](const char* name, int fallback) -> int {
+    const char* v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return fallback;
+    const int n = std::atoi(v);
+    return n > 0 ? n : fallback;
+  };
+  // Load knobs (default to the correctness-test values). Raise via env for
+  // perf runs, e.g. H2_TEST_REQS=4000 H2_TEST_CONNS=8 H2_TEST_STREAMS=32.
+  const int kRequests = env_int("H2_TEST_REQS", 40);
+  const int kConcurrency = env_int("H2_TEST_CONNS", 4);  // shards = min(concurrency, max_connections)
+  const int kStreams = env_int("H2_TEST_STREAMS", 4);
 
   Profile profile;
   profile.protocol = "http2";
@@ -63,12 +74,15 @@ int main() {
   // Cleartext h2c by default; H2_TEST_TLS=1 exercises the memory-BIO TLS ring
   // path (ALPN h2 over TLS) against a TLS-wrapped server.
   profile.scheme = use_tls ? "https" : "http";
+  // Opt-in kTLS. When the host's "tls" ULP is unavailable the engine falls back
+  // to memory-BIO transparently, so this must still complete every stream.
+  profile.tls_ktls = want_ktls ? 1 : 0;
   profile.host_header = "127.0.0.1";
   profile.keepalive = 1;  // H2 multiplexer; connections reused across streams
   profile.verify = 0;
   profile.timeout_ms = 5000;
   profile.max_connections = kConcurrency;
-  profile.max_streams_per_connection = 4;
+  profile.max_streams_per_connection = kStreams;
   for (int i = 0; i < kRequests; ++i) {
     profile.ops.push_back(MakeGet("/"));
   }
@@ -103,13 +117,16 @@ int main() {
   const double epoll_wakeups = get("l7_epoll_wakeups");
   const double cqe_reaped = get("l7_io_uring_cqe_reaped");
   const double uring_active = get("runtime_reactor_io_uring_active");
+  const double rx_syscalls = get("l7_rx_syscalls");
+  const double tx_syscalls = get("l7_tx_syscalls");
+  const double sqe = get("l7_io_uring_sqe_submitted");
 
   std::printf(
       "runtime_shards=%.0f attempted=%.0f sent=%.0f status_2xx=%.0f "
       "conn_established=%.0f h2_native_capability=%.0f uring_active=%.0f "
-      "epoll_wakeups=%.0f cqe_reaped=%.0f\n",
+      "epoll_wakeups=%.0f cqe_reaped=%.0f sqe=%.0f rx_syscalls=%.0f tx_syscalls=%.0f\n",
       shards, attempted, sent, status_2xx, conn_established, h2_cap,
-      uring_active, epoll_wakeups, cqe_reaped);
+      uring_active, epoll_wakeups, cqe_reaped, sqe, rx_syscalls, tx_syscalls);
 
   CHECK(h2_cap == 1.0, "nghttp2 native H2 not available in this build");
   CHECK(shards > 1.0, "expected runtime_shards>1 (threaded kernel path), got %.0f", shards);
