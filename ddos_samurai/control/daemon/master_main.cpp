@@ -350,6 +350,17 @@ samurai::control::RlStateInputs RlInputsFrom(const samurai::control::LoadSample&
     in.conn_drop_ratio = std::max(0.0, 1.0 - est / att);
   }
   if (get("h2_stream_reset_ratio", &v)) in.reset_pressure = v;
+  // Flow-level (IPS/NSM) rates, normalized per connection-attempt — mirror
+  // DefenseSignals._flow_rate. Left -1 (masked) when att<=0 or the counter is
+  // absent (kernel-socket path). flow_features / flow_capable are set by the caller
+  // from the loaded policy + the run's transport.
+  double flow_ct = 0.0;
+  if (att > 0.0) {
+    if (get("tcp_peer_rst_count", &flow_ct)) in.rst_rate = flow_ct / att;
+    if (get("tcp_connect_timeout_count", &flow_ct)) in.connect_timeout_rate = flow_ct / att;
+    if (get("tcp_retransmit_count", &flow_ct)) in.retransmit_rate = flow_ct / att;
+    if (get("tcp_timeout_close_count", &flow_ct)) in.timeout_close_rate = flow_ct / att;
+  }
   return in;
 }
 
@@ -382,7 +393,7 @@ Value RlTransitionJson(const std::string& run_id, int win, double action_rps,
                        const Value& def_next,
                        const samurai::control::ClosedLoopDecision& dec,
                        const samurai::control::ClosedLoopConfig& cfg, int window_s,
-                       bool first) {
+                       bool first, const std::string& transport) {
   using samurai::control::ClosedLoopStrategy;
   Value o = Value::Object();
   o.set("run_id", Value::Str(run_id));
@@ -390,6 +401,9 @@ Value RlTransitionJson(const std::string& run_id, int win, double action_rps,
   o.set("ts_ms", Value::Int(std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count()));
+  // Dataplane transport for this run — lets the offline pipeline gate the
+  // flow-level IPS features (only meaningful on a flow-capable transport).
+  o.set("transport", Value::Str(transport));
   o.set("strategy",
         Value::Str(cfg.strategy == ClosedLoopStrategy::kBinSearch ? "binsearch" : "aimd"));
   o.set("min_rps", Value::Double(cfg.min_rps));
@@ -427,6 +441,7 @@ Value JobSpecFromArgs(int argc, char** argv) {
   s.set("protocol", Value::Str(Opt(argc, argv, "--protocol", "udp")));
   s.set("size", Value::Int(OptInt(argc, argv, "--size", 64)));
   s.set("worker", Value::Str(Opt(argc, argv, "--worker", "cpu")));
+  s.set("transport", Value::Str(Opt(argc, argv, "--transport", "")));
   s.set("target_region", Value::Str(Opt(argc, argv, "--target-region", "")));
   s.set("job_timeout_s", Value::Int(OptInt(argc, argv, "--job-timeout-s", 0)));
   s.set("shard_unit_count", Value::Int(OptInt(argc, argv, "--shard-unit-count", 0)));
@@ -463,6 +478,16 @@ samurai::control::JobConfig BuildJobConfig(const Value& spec, std::int64_t leade
   job.base_args.set("protocol", Value::Str(gets("protocol", "udp")));
   job.base_args.set("size", Value::Int(geti("size", 64)));
   job.base_args.set("worker", Value::Str(gets("worker", "cpu")));
+  // Dataplane transport for L7 workers. Made explicit here (rather than relying on
+  // the worker's SAMURAI_L7_TRANSPORT env) so master and worker agree on a single
+  // source of truth and the RL corpus can record it — the flow-level IPS features
+  // are only meaningful on a flow-capable (userspace-TCP) transport.
+  const std::string transport = gets("transport", "");
+  if (!transport.empty()) {
+    Value conn = Value::Object();
+    conn.set("transport_backend", Value::Str(transport));
+    job.base_args.set("connection_template", conn);
+  }
   return job;
 }
 
@@ -490,6 +515,10 @@ void Usage(const char* argv0) {
       "  --size N                  packet size (default 64)\n"
       "  --worker NAME             worker flavor this job needs (default cpu); only\n"
       "                            dispatched to workers advertising that kind\n"
+      "  --transport T             L7 dataplane transport (kernel_socket|custom_tcp|\n"
+      "                            dpdk|af_xdp|af_packet); recorded in the RL corpus\n"
+      "                            and gates the flow-level IPS features (custom_tcp\n"
+      "                            et al. expose the flow counters; kernel_socket does not)\n"
       "  --shard-unit-count N      packets per shard (0 = auto)\n"
       "  --job-timeout-s N         wait cap for the job (default 120)\n"
       "  --poll-interval-ms N      master dispatch poll (default 250)\n"
@@ -1189,12 +1218,36 @@ int main(int argc, char** argv) {
         // input_dim includes the GRU hidden vector, but its state is the base 20
         // (block/ban memory is subsumed by the GRU), so state_dim()-20 == 0 there.
         const int rl_extra = rl_policy.loaded() ? rl_policy.state_dim() - kBaseFeatures : 0;
+        // Flow-level IPS/NSM group adds 5 dims (4 rates + 1 shared known bit); with
+        // V=5 its size collides with no block/ban combo, so peel it off first, then
+        // decode block/ban from the remainder exactly as before.
+        constexpr int kFlowFeatures = 5;
+        const bool flow_state_on =
+            rl_policy.loaded() &&
+            (rl_extra == kFlowFeatures || rl_extra == kFlowFeatures + kBanFeatures ||
+             rl_extra == kFlowFeatures + 2 * variant_count ||
+             rl_extra == kFlowFeatures + 2 * variant_count + kBanFeatures);
+        const int rl_extra_wo_flow = rl_extra - (flow_state_on ? kFlowFeatures : 0);
         const bool block_state_on =
             rl_policy.loaded() &&
-            (rl_extra == 2 * variant_count || rl_extra == 2 * variant_count + kBanFeatures);
+            (rl_extra_wo_flow == 2 * variant_count ||
+             rl_extra_wo_flow == 2 * variant_count + kBanFeatures);
         const bool ban_state_on =
             rl_policy.loaded() &&
-            (rl_extra == kBanFeatures || rl_extra == 2 * variant_count + kBanFeatures);
+            (rl_extra_wo_flow == kBanFeatures ||
+             rl_extra_wo_flow == 2 * variant_count + kBanFeatures);
+        // The run's transport determines whether the flow counters are real. Must
+        // match the flow-capable set in RLConfig.flow_capable_transports (Python).
+        const std::string rl_transport = Opt(argc, argv, "--transport", "kernel_socket");
+        const bool rl_transport_flow_capable =
+            rl_transport == "custom_tcp" || rl_transport == "dpdk" ||
+            rl_transport == "af_xdp" || rl_transport == "af_packet";
+        if (flow_state_on) {
+          std::printf("samurai_master: flow-level IPS state on (in_dim=%d, transport=%s%s) — "
+                      "policy conditions on the connection-layer flow rates\n",
+                      rl_policy.input_dim(), rl_transport.c_str(),
+                      rl_transport_flow_capable ? "" : ", MASKED: kernel-socket exposes no flow signal");
+        }
         const bool track_variants = rl_policy.loaded();  // Observe/snapshot while serving
         // Cross-episode persistence: warm-start the memory from what a prior run
         // learned about THIS target, and write it back so the next run starts armed.
@@ -1453,6 +1506,13 @@ int main(int argc, char** argv) {
               rin.ban_features = true;
               rin.ban_pressure = ban_ewma;
             }
+            // Flow-level IPS/NSM: the rates are already populated by RlInputsFrom
+            // from the defense counters; only enable the group + mark whether this
+            // run's transport actually measures them (kernel_socket => masked).
+            if (flow_state_on) {
+              rin.flow_features = true;
+              rin.flow_capable = rl_transport_flow_capable;
+            }
             // Online adapter: the reward of THIS window realizes the correction the
             // adapter applied one window earlier (it shaped the setpoint that just
             // ran), so fold it in before proposing the next. Reward proxy mirrors the
@@ -1531,10 +1591,14 @@ int main(int argc, char** argv) {
           // the (Mahoraga) action, and the state + defense-reaction it led to.
           if (rl_corpus.is_open()) {
             const Value action = RlActionJson(setpoint, job.base_args);
+            std::string cap_transport = "kernel_socket";
+            if (const Value* ct = job.base_args.find("connection_template"))
+              if (const Value* tb = ct->find("transport_backend"))
+                cap_transport = tb->as_string("kernel_socket");
             const Value tr =
                 RlTransitionJson(rl_run_id, win, setpoint, action, rl_prev_sample,
                                  rl_prev_defense, sample, rl_defense, dec, clcfg, window_s,
-                                 !rl_have_prev);
+                                 !rl_have_prev, cap_transport);
             rl_corpus << tr.dump() << '\n';
             rl_corpus.flush();
           }

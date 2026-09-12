@@ -319,6 +319,27 @@ std::vector<float> RlPolicy::BuildFeatures(const RlStateInputs& in) {
     f.push_back(in.ban_pressure >= 0.0 ? static_cast<float>(in.ban_pressure) : 0.0f);
     f.push_back(in.ban_pressure >= 0.0 ? 1.0f : 0.0f);
   }
+
+  // Flow-level IPS/NSM features (appended after the ban features, matching the
+  // Python dataset layout): four flow rates then ONE shared flow_known bit. The
+  // rates are imputed to 0 when unknown; the shared bit is 1 only on a flow-capable
+  // transport with at least one measurable rate (else the whole group is masked,
+  // exactly like a kernel-socket corpus).
+  if (in.flow_features) {
+    const double flow[4] = {in.rst_rate, in.connect_timeout_rate,
+                            in.retransmit_rate, in.timeout_close_rate};
+    bool any_known = false;
+    for (double r : flow) any_known = any_known || (r >= 0.0);
+    // When the transport can't measure flow the whole group is masked: impute the
+    // values to 0 AND clear the known bit (matches dataset._encode_flow).
+    if (in.flow_capable) {
+      for (double r : flow) f.push_back(r < 0.0 ? 0.0f : static_cast<float>(r));
+      f.push_back(any_known ? 1.0f : 0.0f);
+    } else {
+      for (int i = 0; i < 4; ++i) f.push_back(0.0f);
+      f.push_back(0.0f);
+    }
+  }
   return f;
 }
 

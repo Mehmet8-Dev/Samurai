@@ -18,6 +18,11 @@ BIN_WORKER="${BIN_WORKER:-$REPO/build/zmq}"
 
 WAF_LAB_PORT="${WAF_LAB_PORT:-8080}"
 TARGET_HOST="${TARGET_HOST:-127.0.0.1}"
+# Dataplane transport. custom_tcp (userspace TCP) exposes the flow-level counters
+# (tcp_peer_rst / connect_timeout / retransmit / timeout_close) that the flow-level
+# IPS/NSM features consume; kernel_socket does not. Recorded in the corpus so the
+# offline pipeline can gate those features by transport.
+TRANSPORT="${TRANSPORT:-kernel_socket}"
 CONTROL_EP="${CONTROL_EP:-tcp://127.0.0.1:5099}"
 # Defense profile (strict-waf|rate-only|waf-heavy) — selects the compose tier and
 # labels the corpus so the union is traceable. AUTO_UP=1 (re)creates the nginx/caddy
@@ -110,6 +115,7 @@ echo ">> starting master (closed-loop); corpus -> $CORPUS"
 "$BIN_DAEMON/samurai_master" \
 	--control-listen "$CONTROL_EP" \
 	--target "$TARGET_HOST" --port "$WAF_LAB_PORT" --protocol http \
+	--transport "$TRANSPORT" \
 	--worker l7 --count "$(( CL_MAX_RPS * CL_WINDOW_S ))" \
 	--expect-workers 1 --wait-workers-s 60 \
 	--closed-loop --cl-strategy "$CL_STRATEGY" \

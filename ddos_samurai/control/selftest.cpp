@@ -639,6 +639,35 @@ int main() {
     Check(cf.size() == 32, "rl policy: block+ban widen state to 32");
     Check(std::abs(cf[30] - 0.4f) < 1e-6 && cf[31] == 1.0f, "rl policy: ban trails block bits");
 
+    // Flow-level IPS features: appended AFTER the ban features as four flow rates
+    // then ONE shared flow_known bit. Must match the Python dataset layout
+    // (build_dataset._encode_flow): rates imputed 0 when < 0; known bit 1 only on a
+    // flow-capable transport with a measurable rate. flow-only => width 20 + 5 = 25.
+    RlStateInputs fin;
+    fin.rps = 500; fin.max_rps = 1000; fin.flow_features = true; fin.flow_capable = true;
+    fin.rst_rate = 0.0875; fin.connect_timeout_rate = 0.0;  // retransmit/timeout_close left -1
+    auto ff = RlPolicy::BuildFeatures(fin);
+    Check(ff.size() == 25, "rl policy: flow features widen state to 25");
+    Check(std::abs(ff[20] - 0.0875f) < 1e-6 && ff[21] == 0.0f, "rl policy: rst_rate .0875, connect_timeout 0");
+    Check(ff[22] == 0.0f && ff[23] == 0.0f, "rl policy: unknown flow rates imputed 0");
+    Check(ff[24] == 1.0f, "rl policy: flow_known 1 on flow-capable transport with a rate");
+    // Not flow-capable (kernel_socket serve) => whole group masked (known bit 0).
+    RlStateInputs fkin;
+    fkin.rps = 500; fkin.max_rps = 1000; fkin.flow_features = true; fkin.flow_capable = false;
+    fkin.rst_rate = 0.5;
+    auto fkf = RlPolicy::BuildFeatures(fkin);
+    Check(fkf.size() == 25 && fkf[24] == 0.0f && fkf[20] == 0.0f,
+          "rl policy: kernel-socket serve masks flow (value + known 0)");
+    // Block + ban + flow compose: width 20 + 2V + 2 + 5 = 37, flow trails everything.
+    RlStateInputs ain;
+    ain.rps = 500; ain.max_rps = 1000;
+    ain.variant_block_success = {-1.0, 0.9, -1.0, 0.05, -1.0};
+    ain.ban_features = true; ain.ban_pressure = 0.4;
+    ain.flow_features = true; ain.flow_capable = true; ain.rst_rate = 0.1;
+    auto af = RlPolicy::BuildFeatures(ain);
+    Check(af.size() == 37, "rl policy: block+ban+flow widen state to 37");
+    Check(std::abs(af[32] - 0.1f) < 1e-6 && af[36] == 1.0f, "rl policy: flow trails block+ban bits");
+
     // Multi-dim (Mahoraga) action: 2-in -> 2-out identity, per-dim bounds
     // rps in [100,1100], concurrency in [1,65]. input [0.5,0.25] -> [600,17].
     std::string m = "SRLP";

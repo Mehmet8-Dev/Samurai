@@ -58,6 +58,19 @@ struct RlStateInputs {
   // block-only / legacy policies keep their exact width.
   bool ban_features = false;
   double ban_pressure = -1.0;
+  // Flow-level IPS/NSM state (RLConfig.flow_state_features). When flow_features is
+  // set, BuildFeatures appends 5 features AFTER the ban features: four
+  // per-connection-attempt flow rates (rst / connect-timeout / retransmit /
+  // timeout-close, imputed 0 when < 0) then ONE shared flow_known bit. The bit is
+  // set only when this run drives a flow-capable transport (flow_capable) AND at
+  // least one rate is measurable — mirroring the dataset's transport-gated encoding,
+  // so a kernel-socket serve masks these exactly like the kernel-socket corpus did.
+  bool flow_features = false;
+  bool flow_capable = false;  // transport actually measures the flow counters
+  double rst_rate = -1.0;
+  double connect_timeout_rate = -1.0;
+  double retransmit_rate = -1.0;
+  double timeout_close_rate = -1.0;
 };
 
 // EWMA smoothing for ban_pressure — MUST match RLConfig.ban_ewma_alpha (Python).
