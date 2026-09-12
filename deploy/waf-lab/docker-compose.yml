@@ -59,8 +59,17 @@ services:
       - ./profiles/${WAF_PROFILE:-strict-waf}/waf-rules.conf:/etc/caddy/coraza/waf-rules.conf:ro
     networks: [labnet]
 
-  # IDS. Sniffs the WAF container's ingress and writes eve.json alerts. Passive by
-  # default; NET_ADMIN + a mirror/inline setup turns it into an IPS (see README).
+  # IDS/IPS. Shares the WAF netns. Default: passive IDS sniffing eth0 (alerts to
+  # eve.json). Inline IPS mode is opt-in via env (no host sudo — the NET_ADMIN cap
+  # + the nfq-init sidecar do it inside the container netns):
+  #
+  #   SURICATA_TAP=-q SURICATA_IF=0 \
+  #     docker compose -f deploy/waf-lab/docker-compose.yml --profile ips up -d
+  #
+  # That runs `suricata -q 0` (NFQUEUE) and brings up nfq-init, which installs the
+  # NFQUEUE iptables rule so ingress/egress on :8080 flows through Suricata. The
+  # `reject`/`drop` actions in custom.rules then produce real RST/timeout the
+  # userspace-TCP load generator records as the flow-level RL state axis.
   suricata:
     image: jasonish/suricata:7.0
     container_name: samurai-lab-ids
@@ -68,9 +77,16 @@ services:
     depends_on: [caddy]
     network_mode: "service:caddy"     # share the WAF netns to see ingress packets
     cap_add: [NET_ADMIN, NET_RAW, SYS_NICE]
-    command: ["-i", "eth0"]
+    # -S loads the lab's own signatures ON TOP of the ET ruleset (the default
+    # suricata.yaml rule-files only lists suricata.rules, so custom.rules was
+    # otherwise never loaded and our lab sids never fired). SURICATA_TAP/_IF select
+    # the capture mode: default `-i eth0` (IDS) or `-q 0` (IPS/NFQUEUE) via env.
+    command: ["${SURICATA_TAP:--i}", "${SURICATA_IF:-eth0}", "-S", "/etc/suricata/rules/custom.rules"]
     volumes:
-      - ./suricata/custom.rules:/etc/suricata/rules/custom.rules:ro
+      # NOTE: no :ro — the jasonish/suricata entrypoint chown's its rules dir on
+      # start, which fails ("Read-only file system") and crash-loops if this is
+      # mounted read-only. It only reads the file after that, so rw is harmless.
+      - ./suricata/custom.rules:/etc/suricata/rules/custom.rules
       - suricata_logs:/var/log/suricata
 
   # Log-driven banning. Reads nginx's 429 log and bans the source IP, turning
@@ -89,6 +105,33 @@ services:
       - ./fail2ban/jail.d:/etc/fail2ban/jail.d:ro
       - ./fail2ban/filter.d:/etc/fail2ban/filter.d:ro
       - nginx_logs:/var/log/nginx:ro
+
+  # NFQUEUE installer for inline-IPS mode (opt-in via `--profile ips`). Shares the
+  # WAF netns and, with only the NET_ADMIN cap (no host sudo), inserts an iptables
+  # rule that steers ingress/egress on :8080 through NFQUEUE 0, where `suricata -q 0`
+  # reads the queue and drops/rejects matched packets. --queue-bypass fails OPEN:
+  # if Suricata isn't attached the traffic still flows, so the lab never wedges. The
+  # -C guard makes (re)start idempotent; it then parks so the container stays Up and
+  # the rule persists for the netns lifetime.
+  nfq-init:
+    image: alpine:3.20
+    container_name: samurai-lab-nfq
+    restart: unless-stopped
+    depends_on: [caddy]
+    network_mode: "service:caddy"
+    cap_add: [NET_ADMIN, NET_RAW]
+    profiles: [ips]
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache iptables >/dev/null 2>&1 || exit 1
+        for spec in "INPUT -p tcp --dport 8080" "OUTPUT -p tcp --sport 8080"; do
+          iptables -C $$spec -j NFQUEUE --queue-num 0 --queue-bypass 2>/dev/null \
+            || iptables -I $$spec -j NFQUEUE --queue-num 0 --queue-bypass
+        done
+        echo "NFQUEUE steering installed on :8080 (queue 0, bypass=on)"
+        exec sleep infinity
 
 networks:
   labnet:

@@ -1,24 +1,32 @@
-# Minimal Suricata signatures for the lab. In the default bridge setup Suricata
-# runs as an IDS (alerts to /var/log/suricata/eve.json); with an inline/NFQUEUE
-# setup and `drop` actions it becomes an IPS. These fire on the traffic the load
-# generator produces so eve.json carries a real IDS signal alongside the WAF/limiter.
+# Minimal Suricata signatures for the lab. The action keyword decides the mode:
+#   - IDS (af-packet `-i eth0`): drop/reject are DOWNGRADED to alert (Suricata is
+#     off-path and cannot act), so these still just log to eve.json.
+#   - IPS (NFQUEUE `-q 0`, on-path via the nfq-init sidecar): the actions BITE —
+#     `reject` forges a TCP RST (→ userspace-TCP rst_rate), `drop` silently blocks
+#     (→ connect_timeout_rate / retransmit_rate). This is what makes the flow-level
+#     RL state axis (rst_rate/connect_timeout_rate/…) go NON-ZERO on a custom_tcp
+#     corpus — an inline IPS reaction the HTTP-status defense signals cannot see.
+# The action mix is deliberate: reject (RST) and drop (timeout) exercise different
+# flow counters so the corpus spans both connection-layer reaction shapes.
 
-# High-rate HTTP from a single source — the load itself, seen as a flood.
-alert http any any -> any any ( \
+# High-rate HTTP from a single source — the load itself, seen as a flood. RST it
+# (reject) once over threshold → rst_rate signal.
+reject http any any -> any any ( \
     msg:"SAMURAI-LAB HTTP request flood (per-source rate)"; \
     flow:to_server; \
     threshold:type both, track by_src, count 500, seconds 5; \
     classtype:attempted-dos; sid:9000001; rev:1;)
 
-# Scanner user-agents (mirrors the WAF scanner rule at the network layer).
-alert http any any -> any any ( \
+# Scanner user-agents (mirrors the WAF scanner rule at the network layer). RST it.
+reject http any any -> any any ( \
     msg:"SAMURAI-LAB scanner user-agent"; \
     flow:to_server; http.user_agent; \
     pcre:"/(?:sqlmap|nikto|nmap|masscan|dirbuster|nuclei|acunetix)/i"; \
     classtype:web-application-attack; sid:9000002; rev:1;)
 
 # Burst of new connections — connection-flood shape (SYN pressure at L7 ingress).
-alert tcp any any -> any 8080 ( \
+# Silently drop the excess → connect_timeout_rate / retransmit_rate signal.
+drop tcp any any -> any 8080 ( \
     msg:"SAMURAI-LAB connection flood"; \
     flags:S; \
     threshold:type both, track by_src, count 300, seconds 5; \
