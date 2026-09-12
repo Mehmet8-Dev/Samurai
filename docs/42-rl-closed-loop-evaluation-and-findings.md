@@ -176,3 +176,59 @@ scriptler ve kod versiyonlanır, veri/ağırlık üretilir.
 - **Pushback SLO'yu üretim varsayılanı yap** (429 = ihlal — doğru yük-testi semantiği).
 - **RL²: park** — tahmin-edilebilir/tırmanan-adversary rejimi hedeflenene kadar.
 - **Champion-challenger:** bir politika ancak canlı A/B'de AIMD'yi geçerse promote edilir.
+
+---
+
+## 8. 8+ profil FF accumulate koşusu (2026-09-12)
+
+Amaç: feed-forward (FF) politikasını **en az 8 farklı savunma profiliyle**, mevcut
+korpus havuzunun **üstüne** (accumulate — hiçbir şey ezilmez), ~45 dakika yeniden
+eğitmek. Çeşitlilik, `state-marginal` aşırı-öğrenmeye karşı belgelenen panzehir:
+hangi lever/rate'in duvara toslayacağı **hedefe göre** değişince politika
+reaction-conditioning sinyali alır.
+
+**Orkestratör:** `deploy/waf-lab/train-run-8profile.sh` — `CAP_MIN` dakikalık
+wall-clock capture bütçesi; Coraza profilleri blok halinde (tier başına bir
+recreate), ardından statik hedefler capture deadline'a kadar round-robin. Bitince
+**yalnız FF** (`train_iql`) tüm biriken havuzla retrain edilir (RL² dokunulmaz),
+eski FF `mahoraga-ff.<stamp>.bak.srlp` olarak yedeklenir.
+
+**9 canlı profil:**
+
+| Profil | Port | Savunma karakteri |
+|--------|------|-------------------|
+| coraza strict-waf | 8080 | variant2 (POST/login) → 403, rate ~200 |
+| coraza rate-only  | 8080 | WAF-block yok, uniform rate ~500 |
+| coraza waf-heavy  | 8080 | variant1+3 → 403, rate ~100 |
+| ModSecurity+CRS   | 8081 | farklı bloklu-variant haritası (ikinci motor) |
+| Anubis PoW        | 8082 | proof-of-work challenge gateway |
+| rate-drop r50     | 8084 | `limit_req` ~50 r/s |
+| rate-drop r100    | 8083 | `limit_req` ~100 r/s |
+| rate-drop r150    | 8085 | `limit_req` ~150 r/s |
+| rate-drop r200    | 8086 | `limit_req` ~200 r/s |
+
+**Sonuç:** +1440 yeni transition (coraza 3×36, modsec 234, anubis 234, rd-* 4×216)
+havuza eklendi → havuz **24 dosya / 7774 transition / 422 episode**. FF retrain
+(`in_dim=20`, `action_dim=5`, RLConfig() defaultları = mevcut 25 KB serving
+kontratıyla uyumlu, block/ban kapalı).
+
+```
+OPE (FQE) gate — FF, tüm biriken havuz:
+  behavior (AIMD) : -4.255
+  FF   fqe=-0.226  gate=PASS  imp_ci=[+3.737, +4.321]
+```
+
+improvement CI kesinlikle pozitif → pesimistik gate marjla geçti; FF, AIMD'yi net
+yeniyor. Native doğrulama: `export.load_policy(mahoraga-ff.srlp)` → in_dim 20 /
+action 5 / non-recurrent, forward OK; `samurai_control_selftest` all-passed.
+
+**Dürüst sınır:** OPE-from-s0 gate "AIMD'yi yener mi" kapısıdır (sağlam), RL²-vs-FF
+kıyası için değil (§2). behavior −4.255, önceki regime-shift havuzunun −10.7'sinden
+daha yumuşak; çünkü eklenen rate-drop/anubis/modsec profilleri episode-içi rejim
+kaydırması içermez. Ağırlık/korpus `.gitignore`'dadır (üretilir); yalnız
+orkestratör script'i versiyonlanır.
+
+```bash
+# tekrar üretim (9 profil de ayakta ve /healthz=200 olmalı)
+CAP_MIN=37 bash deploy/waf-lab/train-run-8profile.sh
+```
