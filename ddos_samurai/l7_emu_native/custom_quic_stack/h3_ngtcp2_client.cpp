@@ -3030,6 +3030,10 @@ bool connect_udp(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     tv.tv_usec = 20000;
     (void)::setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     c->udp_io_backend = QuicUdpIoBackend::KernelSocket;
+    // A prior attempt on this thread may have left a multishot recv armed; the
+    // kernel could hand this new socket the same fd number, so force a re-arm
+    // (and bump the generation to drop the old socket's stray completions).
+    quic_uring_recv_reset();
     return true;
   };
 
@@ -3415,6 +3419,16 @@ int recv_udp_payloads(
     if (ctx->fd < 0) {
       return -1;
     }
+    // Preferred: pull datagrams off the io_uring multishot recv over a provided
+    // buffer ring (one SQE fans many datagrams into kernel-selected buffers), so
+    // the QUIC/HTTP-3 byte path rides the same ring as H1/H2. Returns -1 when the
+    // ring/buffer-ring is unavailable on this build or host; then fall back to a
+    // classic non-blocking ::recv().
+    const int ring_got = quic_uring_recv_datagrams(
+        ctx->fd, payload_buf, stride, lens_out, max_packets, /*wait_ms=*/0);
+    if (ring_got >= 0) {
+      return ring_got;
+    }
     const ssize_t nread = ::recv(ctx->fd, payload_buf, stride, MSG_DONTWAIT);
     if (nread <= 0) {
       return 0;
@@ -3732,9 +3746,28 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
     }
   }
 
-  // Receive packet(s)
+  // Feed one received datagram into the QUIC state machine.
   std::array<uint8_t, 64 * 2048> rx_batch{};
   std::array<std::size_t, 64> rx_lens{};
+  auto feed_datagram = [&](const uint8_t* data, std::size_t nread) -> bool {
+    if (nread == 0) {
+      return true;
+    }
+    if (out != nullptr) {
+      out->rx_datagrams += 1;
+    }
+    ctx->rx_bytes += nread;
+    ngtcp2_path path{};
+    path.local.addr = reinterpret_cast<sockaddr*>(&ctx->local_addr);
+    path.local.addrlen = ctx->local_addrlen;
+    path.remote.addr = reinterpret_cast<sockaddr*>(&ctx->remote_addr);
+    path.remote.addrlen = ctx->remote_addrlen;
+    ngtcp2_pkt_info pi{};
+    return ngtcp2_conn_read_pkt(ctx->conn, &path, &pi, data, nread, now_ns()) == 0;
+  };
+
+  // Receive packet(s): drain whatever is ready (ring multishot recv on the
+  // kernel-socket path, else a syscall recv).
   for (int iter = 0; iter < 64; ++iter) {
     const int got = recv_udp_payloads(ctx, rx_batch.data(), 2048, rx_lens.data(), 64);
     if (got < 0) {
@@ -3744,27 +3777,9 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
       break;
     }
     for (int i = 0; i < got; ++i) {
-      const std::size_t nread = rx_lens[static_cast<std::size_t>(i)];
-      if (nread == 0) {
-        continue;
-      }
-      if (out != nullptr) {
-        out->rx_datagrams += 1;
-      }
-      ctx->rx_bytes += nread;
-      ngtcp2_path path{};
-      path.local.addr = reinterpret_cast<sockaddr*>(&ctx->local_addr);
-      path.local.addrlen = ctx->local_addrlen;
-      path.remote.addr = reinterpret_cast<sockaddr*>(&ctx->remote_addr);
-      path.remote.addrlen = ctx->remote_addrlen;
-      ngtcp2_pkt_info pi{};
-      if (ngtcp2_conn_read_pkt(
-              ctx->conn,
-              &path,
-              &pi,
+      if (!feed_datagram(
               rx_batch.data() + static_cast<std::size_t>(i) * 2048u,
-              nread,
-              now_ns()) != 0) {
+              rx_lens[static_cast<std::size_t>(i)])) {
         return false;
       }
     }
@@ -3780,14 +3795,27 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
     if (next_wakeup > now) {
       const int wait_ms = static_cast<int>(std::clamp<int64_t>(ns_to_ms_ceil(next_wakeup - now), 0, 10));
       if (wait_ms > 0) {
-        // Prefer the shared io_uring readiness wait so the QUIC/HTTP-3 loop rides
-        // the same ring as H1/H2; fall back to ::poll when io_uring is
-        // unavailable on this build or host (helper returns -1).
-        if (quic_uring_wait_readable(ctx->fd, wait_ms) < 0) {
-          pollfd pfd{};
-          pfd.fd = ctx->fd;
-          pfd.events = POLLIN;
-          (void)::poll(&pfd, 1, wait_ms);
+        // Block for the next datagram (or the pacing deadline) on the shared
+        // io_uring multishot recv, feeding any that arrive so the QUIC/HTTP-3
+        // byte path stays on the ring. When the ring is unavailable (helper
+        // returns <0) fall back to the io_uring readiness poll, then ::poll.
+        const int woke = quic_uring_recv_datagrams(
+            ctx->fd, rx_batch.data(), 2048, rx_lens.data(), 64, wait_ms);
+        if (woke > 0) {
+          for (int i = 0; i < woke; ++i) {
+            if (!feed_datagram(
+                    rx_batch.data() + static_cast<std::size_t>(i) * 2048u,
+                    rx_lens[static_cast<std::size_t>(i)])) {
+              return false;
+            }
+          }
+        } else if (woke < 0) {
+          if (quic_uring_wait_readable(ctx->fd, wait_ms) < 0) {
+            pollfd pfd{};
+            pfd.fd = ctx->fd;
+            pfd.events = POLLIN;
+            (void)::poll(&pfd, 1, wait_ms);
+          }
         }
         if (out != nullptr) {
           out->pacing_wait_events += 1;

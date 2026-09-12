@@ -156,6 +156,32 @@ int quic_uring_wait_readable(int fd, int timeout_ms);
 // True when the thread-local io_uring ring is active (diagnostics / metrics).
 bool quic_uring_available();
 
+// Receive UDP datagrams for the QUIC/HTTP-3 kernel-socket loop through an
+// io_uring multishot recv over a provided buffer ring, instead of a per-call
+// ::recv() syscall. A single persistent multishot recv is armed on `fd` (kernel
+// re-selects a buffer per datagram and fans many completions off one SQE) and
+// re-armed when `fd` changes. Ready datagrams are copied into payload_buf
+// (stride bytes each, up to max_packets) with per-datagram lengths in lens_out.
+// When wait_ms>0 and nothing is ready yet, waits up to wait_ms for a completion
+// so this doubles as the loop's readiness wait. Returns the datagram count
+// (>=0), or -1 when io_uring / the buffer ring is unavailable on this build or
+// host - in which case the caller MUST fall back to ::recv()/::poll(). Safe to
+// call unconditionally; the ring and buffer pool are lazily-initialised
+// thread-locals shared with quic_uring_wait_readable.
+int quic_uring_recv_datagrams(
+    int fd,
+    uint8_t* payload_buf,
+    std::size_t stride,
+    std::size_t* lens_out,
+    int max_packets,
+    int wait_ms);
+
+// Drop the thread-local multishot recv arming so the next quic_uring_recv_datagrams
+// re-arms on the current fd, and bump the generation so completions from a
+// previous (now-closed) socket that happened to share the fd number are ignored.
+// Call when a QUIC connection's UDP socket is (re)created on this thread.
+void quic_uring_recv_reset();
+
 bool run_udp_probe_batch(
     const Profile& profile,
     int attempted,

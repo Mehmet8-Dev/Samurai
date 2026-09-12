@@ -953,11 +953,153 @@ int quic_uring_wait_readable(int fd, int timeout_ms) {
   return 1;
 }
 
+#if defined(IORING_RECV_MULTISHOT) && defined(IOSQE_BUFFER_SELECT) && defined(__NR_io_uring_register)
+
+namespace {
+
+// Provided buffer ring + multishot recv state for the QUIC datagram path, shared
+// per worker thread with quic_thread_ring(). Datagrams up to a full QUIC packet
+// fit in a 2 KiB slot; 256 slots cover a healthy in-flight burst.
+constexpr uint16_t kQuicRecvBgid = 0;
+constexpr unsigned kQuicRecvEntries = 256;
+constexpr std::size_t kQuicRecvEntrySize = 2048;
+
+thread_local bool quic_bufring_ready = false;
+thread_local int quic_ms_fd = -1;
+thread_local bool quic_ms_armed = false;
+thread_local uint16_t quic_ms_gen = 0;
+
+bool quic_ensure_bufring(SamuraiUring& ring) {
+  thread_local bool attempted = false;
+  if (!attempted) {
+    attempted = true;
+    quic_bufring_ready =
+        ring.setup_buf_ring(kQuicRecvBgid, kQuicRecvEntries, kQuicRecvEntrySize);
+  }
+  return quic_bufring_ready && ring.buf_ring_active();
+}
+
+// Arm (or re-arm) the persistent multishot recv on `fd`. A generation bump on
+// every (re)arm lets stale completions from a since-closed fd be dropped.
+bool quic_arm_multishot(SamuraiUring& ring, int fd) {
+  if (quic_ms_armed && quic_ms_fd == fd) {
+    return true;
+  }
+  io_uring_sqe* sqe = ring.get_sqe();
+  if (sqe == nullptr) {
+    return false;
+  }
+  quic_ms_gen = static_cast<uint16_t>(quic_ms_gen + 1);
+  prep_uring_recv_multishot(
+      sqe, fd, kQuicRecvBgid,
+      make_uring_user_data(0, IoUringOp::Recv, quic_ms_gen));
+  quic_ms_fd = fd;
+  quic_ms_armed = true;
+  return true;
+}
+
+}  // namespace
+
+void quic_uring_recv_reset() {
+  quic_ms_armed = false;
+  quic_ms_fd = -1;
+  quic_ms_gen = static_cast<uint16_t>(quic_ms_gen + 1);
+}
+
+int quic_uring_recv_datagrams(
+    int fd,
+    uint8_t* payload_buf,
+    std::size_t stride,
+    std::size_t* lens_out,
+    int max_packets,
+    int wait_ms) {
+  if (payload_buf == nullptr || lens_out == nullptr || stride == 0 || max_packets <= 0) {
+    return -1;
+  }
+  SamuraiUring& ring = quic_thread_ring();
+  if (!ring.is_active() || fd < 0) {
+    return -1;
+  }
+  if (!quic_ensure_bufring(ring)) {
+    return -1;
+  }
+  if (!quic_arm_multishot(ring, fd)) {
+    return -1;
+  }
+  (void)ring.submit();
+
+  io_uring_cqe* cqes[64];
+  int reaped = ring.peek_batch_cqe(cqes, 64);
+  if (reaped == 0 && wait_ms > 0) {
+    (void)ring.submit_and_wait_cqes(1, wait_ms);
+    reaped = ring.peek_batch_cqe(cqes, 64);
+  }
+  if (reaped <= 0) {
+    return 0;
+  }
+
+  int accepted = 0;
+  for (int i = 0; i < reaped; ++i) {
+    const io_uring_cqe* cqe = cqes[i];
+    const IoUringOp op = uring_user_data_op(cqe->user_data);
+    const uint16_t gen = uring_user_data_gen(cqe->user_data);
+    const bool from_ring = SamuraiUring::cqe_has_buffer(cqe);
+    const uint16_t bid = from_ring ? SamuraiUring::cqe_buffer_id(cqe) : 0;
+    const bool more = SamuraiUring::cqe_has_more(cqe);
+    // Only our multishot recv completions matter; drop stragglers (e.g. a poll
+    // from a previous readiness wait, or a recv armed on a since-closed fd).
+    if (op != IoUringOp::Recv || gen != quic_ms_gen) {
+      if (from_ring) ring.buf_ring_recycle(bid);
+      continue;
+    }
+    // A terminated multishot (no F_MORE, or -ENOBUFS) must be re-armed next call.
+    if (!more) {
+      quic_ms_armed = false;
+    }
+    const int res = cqe->res;
+    if (res > 0 && from_ring && accepted < max_packets &&
+        static_cast<std::size_t>(res) <= stride) {
+      const void* p = ring.buf_ring_addr(bid);
+      if (p != nullptr) {
+        std::memcpy(payload_buf + static_cast<std::size_t>(accepted) * stride, p,
+                    static_cast<std::size_t>(res));
+        lens_out[accepted] = static_cast<std::size_t>(res);
+        ++accepted;
+      }
+      ring.buf_ring_recycle(bid);
+    } else if (from_ring) {
+      ring.buf_ring_recycle(bid);
+    }
+  }
+  ring.cq_advance(static_cast<unsigned>(reaped));
+  return accepted;
+}
+
+#else  // multishot recv / provided buffer ring unavailable at build time
+
+int quic_uring_recv_datagrams(
+    int /*fd*/, uint8_t* /*payload_buf*/, std::size_t /*stride*/,
+    std::size_t* /*lens_out*/, int /*max_packets*/, int /*wait_ms*/) {
+  return -1;
+}
+
+void quic_uring_recv_reset() {}
+
+#endif  // IORING_RECV_MULTISHOT && IOSQE_BUFFER_SELECT
+
 #else  // io_uring unavailable at build time
 
 bool quic_uring_available() { return false; }
 
 int quic_uring_wait_readable(int /*fd*/, int /*timeout_ms*/) { return -1; }
+
+int quic_uring_recv_datagrams(
+    int /*fd*/, uint8_t* /*payload_buf*/, std::size_t /*stride*/,
+    std::size_t* /*lens_out*/, int /*max_packets*/, int /*wait_ms*/) {
+  return -1;
+}
+
+void quic_uring_recv_reset() {}
 
 #endif
 
