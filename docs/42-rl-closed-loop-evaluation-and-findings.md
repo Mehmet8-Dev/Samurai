@@ -271,3 +271,46 @@ Bu FF dokuz profil gördü ama hepsi tek sınıftan: **L7 HTTP-status savunmalar
 
 Lab sınıfı (Coraza/ModSec/nginx-rate) hazır; CF challenge ve IPS için yeni
 sinyal/transport gerekir.
+
+## 9. IDS/IPS/NSM ekseninde genişletme — Faz 1: flow-level IPS state
+
+Mahoraga saldırgan-taraf adaptif bir kontrolcü; yalnızca **gözleyebildiği**
+reaksiyonlardan öğrenir. Üç eksen bu açıdan eşit değil:
+
+- **IDS (tespit+alarm):** inline değil, trafiği kesmez → client tarafında
+  gözlemlenebilir reaksiyon yok. Ayrı eksen olarak öğrenilemez; ancak tetiklediği
+  ban/blok üzerinden aksiyona döner (zaten `ban_pressure` feature'ı var).
+- **IPS (inline block):** kötü trafiği düşürür/reset'ler → **flow-seviye** sinyal
+  (RST / connect-timeout / retransmit / timeout-close). Gerçek, öğrenilebilir eksen.
+- **NSM (pasif metadata/flow/JA3):** reaksiyon üretmez ama defender'ın fingerprint
+  yüzeyini çıkarır → **Faz 2'de lever ailesi** (JA3/TLS/header-sırası/SNI), CF bot
+  katmanını da açar. Henüz uygulanmadı.
+
+**Faz 1 (uygulandı):** opt-in `RLConfig.flow_state_features`. Ban feature'larından
+SONRA dört per-connection-attempt flow oranı + **tek paylaşılan** `flow_known` bit
+(5 dim) eklenir. Sinyaller yalnız **flow-capable transport**'ta (custom_tcp / dpdk /
+af_xdp / af_packet) anlamlıdır; `kernel_socket` (ya da transport-alanı olmayan eski)
+korpus tamamen maskelenir (değer 0, known 0) — böylece dev kernel-socket havuzu
+"flow hep sıfır" öğretmez. Transport artık her korpus transition'ına yazılır
+(master `--transport`); paylaşılan known bit width decode'u da çakışmasız tutar
+(5, V=5'teki block/ban kombinasyonlarının hiçbiriyle çakışmaz → SRLP formatı
+değişmedi). Native serving (rl_policy `BuildFeatures`) aynı transport-gated
+maskelemeyi birebir yansıtır; selftest golden width 25/37'yi ve non-capable
+maskelemeyi Python encoding'e karşı sabitler.
+
+Doğrulama: `tests/models/test_rl_flow_state.py` 6 test + C++ selftest golden yeşil;
+canlı `custom_tcp` capture `transport=custom_tcp` kaydediyor ve uçtan-uca dataset
+custom_tcp satırlarında `flow_known=1`, kernel_socket'te 0 üretiyor.
+
+**Açık (veri adımı, kod değil):** sıfır-dışı flow sinyali için **inline IPS** gerek
+(Suricata NFQUEUE ya da `iptables -j REJECT --reject-with tcp-reset`); bu NET_ADMIN
+ister. Sonraki adım: Suricata-IPS lab + `TRANSPORT=custom_tcp` capture +
+`flow_state_features=True` ile retrain. Kod yolu hazır ve maskelenmiş sıfır
+sinyalle güvenli (temiz hedefte flow=0/known=1, davranış bozulmaz).
+
+```bash
+# flow-capable capture (gerçek IPS hedefine karşı)
+TRANSPORT=custom_tcp WAF_LAB_PORT=<ips-port> bash deploy/waf-lab/run-corpus.sh
+# flow feature'ı açık retrain
+python -c "from ddos_samurai.models.rl.config import RLConfig; RLConfig(flow_state_features=True)"
+```
