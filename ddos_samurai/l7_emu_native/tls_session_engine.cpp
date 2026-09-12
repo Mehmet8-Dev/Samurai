@@ -96,7 +96,20 @@ bool TlsSessionEngine::configure(const SniPoolConfig& sni_config,
 }
 
 ThreadLocalTlsContext* TlsSessionEngine::get_thread_context() {
-  thread_local ThreadLocalTlsContext tctx{};
+  // The context is heap-allocated and owned by the engine (freed in shutdown()),
+  // not by thread-local storage. Worker threads that create TLS sessions exit
+  // (and are joined) before the engine is destroyed; if the context lived in
+  // thread_local storage its destructor would run at thread exit while the
+  // engine's registry still held a pointer to it, so shutdown() would touch
+  // freed memory. Keeping ownership in the engine keeps those pointers valid.
+  thread_local ThreadLocalTlsContext* tctx_ptr = nullptr;
+  if (tctx_ptr != nullptr && tctx_ptr->initialized) {
+    return tctx_ptr;
+  }
+  if (tctx_ptr == nullptr) {
+    tctx_ptr = new ThreadLocalTlsContext();
+  }
+  ThreadLocalTlsContext& tctx = *tctx_ptr;
 
   if (tctx.initialized) {
     return &tctx;
@@ -370,6 +383,9 @@ void TlsSessionEngine::shutdown() {
     }
     tctx->session_cache.clear();
     tctx->initialized = false;
+    // The engine owns the heap-allocated per-thread context (see
+    // get_thread_context); free it now that its worker thread has exited.
+    delete tctx;
   }
   registered_contexts_.clear();
 #endif
