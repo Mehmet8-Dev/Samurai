@@ -602,6 +602,33 @@ static bool arm_h2_ring_send(
   }
   return true;
 }
+
+// Arm a readiness poll for a kTLS HTTP/2 session. Unlike the byte-path Send/Recv
+// SQEs, kTLS sessions move data through SSL_read/SSL_write on the fd (kernel
+// crypto), so the ring only supplies the wakeup. POLLOUT is added while the
+// handshake is in flight or a TX tail is queued, POLLIN otherwise.
+static bool arm_h2_ring_poll(
+    NativeRuntime::LocalShard& local_shard, H2ClientSession& client, std::size_t si) {
+  if (client.uring_poll_in_flight) {
+    return true;
+  }
+  auto* sqe = local_shard.uring.get_sqe();
+  if (sqe == nullptr) {
+    return false;
+  }
+  uint32_t mask = POLLIN;
+  if (!client.ctx.tls_handshake_complete || !client.ktls_tx_pending.empty()) {
+    mask |= POLLOUT;
+  }
+  prep_uring_poll_add(
+      sqe, client.ctx.fd, mask, /*multishot=*/false,
+      make_uring_user_data(static_cast<uint32_t>(si), IoUringOp::PollReadiness, client.uring_gen));
+  client.uring_poll_in_flight = true;
+  if (g_perf_stats != nullptr) {
+    g_perf_stats->io_uring_sqe_submitted += 1;
+  }
+  return true;
+}
 #endif  // SAMURAI_WITH_NGHTTP2
 
 int service_ready_lanes_io_uring(
@@ -681,6 +708,14 @@ int service_ready_lanes_io_uring(
     if (h2_finalize_session_io(runtime, profile, shard, local_shard, client)) {
       continue;  // session torn down (error or drained GOAWAY)
     }
+    if (client.ctx.ktls_mode) {
+      // kTLS: SSL_read/SSL_write own the fd; the ring only wakes us on readiness.
+      arm_h2_ring_poll(local_shard, client, si);
+      if (client.uring_poll_in_flight) {
+        ++h2_in_flight;
+      }
+      continue;
+    }
     arm_h2_ring_send(local_shard, client, si);
     arm_h2_ring_recv(local_shard, client, si);
     if (client.uring_send_in_flight || client.uring_recv_in_flight ||
@@ -740,7 +775,8 @@ int service_ready_lanes_io_uring(
     const bool cqe_more = SamuraiUring::cqe_has_more(cqe);
 
 #ifdef SAMURAI_WITH_NGHTTP2
-    if (op == IoUringOp::H2Send || op == IoUringOp::H2Recv) {
+    if (op == IoUringOp::H2Send || op == IoUringOp::H2Recv ||
+        op == IoUringOp::PollReadiness) {
       // HTTP/2 ring byte-path completion: lane_idx addresses the h2_sessions
       // vector, a different namespace from h1_lanes, so this must be handled
       // before the h1_lanes bound check below.
@@ -756,6 +792,27 @@ int service_ready_lanes_io_uring(
         continue;
       }
       client.ctx.epoll_fd = shard.epoll_fd;
+
+      if (op == IoUringOp::PollReadiness) {
+        // kTLS readiness wakeup: drive SSL_read/SSL_write on the fd (kernel
+        // crypto), then re-arm the poll. res<0 is a fatal poll error.
+        client.uring_poll_in_flight = false;
+        if (res < 0 && res != -EINTR) {
+          client.ctx.transport_error = 1;
+        } else if (client.ctx.protocol_error == 0 && client.ctx.transport_error == 0) {
+          h2_pull_pending_requests(local_shard, client, profile);
+          h2_ingest_inbound(client);
+          if (client.ctx.protocol_error == 0 && client.ctx.transport_error == 0) {
+            h2_pump_outbound(client);
+          }
+          flush_ready_h2_completions(runtime, shard_idx, client);
+        }
+        if (h2_finalize_session_io(runtime, profile, shard, local_shard, client)) {
+          continue;  // torn down
+        }
+        arm_h2_ring_poll(local_shard, client, si);
+        continue;
+      }
 
       if (op == IoUringOp::H2Send) {
         client.uring_send_in_flight = false;

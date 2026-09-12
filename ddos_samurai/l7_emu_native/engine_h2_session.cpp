@@ -1,7 +1,40 @@
 #include "engine_internal.hpp"
 #include "tls_session_engine.hpp"
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <unistd.h>
+
 namespace ddos_samurai::l7_emu_native {
+
+// Probe once whether this host exposes the TCP "tls" ULP so kTLS can engage.
+// Cached: we open a throwaway TCP socket and try setsockopt(TCP_ULP, "tls").
+// EOPNOTSUPP/ENOENT (module absent) -> unavailable; success (or EINVAL, meaning
+// the ULP is known but rejects an unconnected socket) -> available. Any TLS
+// session that requested kTLS falls back to the memory-BIO path when this is
+// false, so a missing ULP is never fatal.
+bool ktls_ulp_available() {
+#if defined(__linux__) && defined(TCP_ULP)
+  static const bool available = []() -> bool {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+      return false;
+    }
+    const int rc = ::setsockopt(fd, SOL_TCP, TCP_ULP, "tls", 4);
+    const int saved = errno;
+    ::close(fd);
+    if (rc == 0) {
+      return true;
+    }
+    // The ULP exists but refuses an unconnected socket -> still available.
+    return saved == EINVAL || saved == EISCONN;
+  }();
+  return available;
+#else
+  return false;
+#endif
+}
 
 const std::string& build_h2_preface_and_settings() {
   static const std::string preface = []() {
@@ -293,6 +326,148 @@ bool h2_custom_advance_tls(H2ConnectionContext& ctx) {
     return false;
   }
   return ctx.tls_handshake_complete;
+}
+
+// Advance the socket-BIO handshake for a kTLS session. OpenSSL owns the fd, so
+// SSL_do_handshake reads/writes it directly (non-blocking); the reactor only
+// wakes us on readiness. On completion we enforce ALPN=h2 and latch which
+// directions the kernel actually offloaded (BIO_get_ktls_{send,recv}); if the
+// ULP silently declined, ktls_*_active stay false and SSL_read/SSL_write still
+// work correctly (just in-process crypto) so the session remains valid.
+bool h2_ktls_advance_handshake(H2ConnectionContext& ctx) {
+  if (ctx.tls_handshake_complete) {
+    return true;
+  }
+  const int hs = SSL_do_handshake(ctx.ssl);
+  if (hs == 1) {
+    const unsigned char* alpn = nullptr;
+    unsigned int alpn_len = 0;
+    SSL_get0_alpn_selected(ctx.ssl, &alpn, &alpn_len);
+    if (alpn == nullptr || alpn_len != 2 || std::memcmp(alpn, "h2", 2) != 0) {
+      errno = EPROTO;
+      ctx.transport_error = 1;
+      return false;
+    }
+    ctx.tls_handshake_complete = true;
+#ifdef BIO_get_ktls_send
+    ctx.ktls_send_active = BIO_get_ktls_send(SSL_get_wbio(ctx.ssl)) > 0;
+#endif
+#ifdef BIO_get_ktls_recv
+    ctx.ktls_recv_active = BIO_get_ktls_recv(SSL_get_rbio(ctx.ssl)) > 0;
+#endif
+    return true;
+  }
+  const int err = SSL_get_error(ctx.ssl, hs);
+  if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+    errno = EIO;
+    ctx.transport_error = 1;
+    return false;
+  }
+  errno = EAGAIN;
+  return false;
+}
+
+// Drain nghttp2 output onto a kTLS socket via SSL_write (kernel encrypts). A
+// WANT_WRITE (socket buffer full) copies the unconsumed tail into ktls_tx_pending
+// and returns; the next writable wakeup retries it before pulling more from
+// nghttp2. Returns false only on a fatal error. Sets errno=EAGAIN when it left
+// pending bytes so the caller can arm POLLOUT.
+bool h2_ktls_pump_outbound(H2ClientSession& client) {
+  H2ConnectionContext& ctx = client.ctx;
+  if (!h2_ktls_advance_handshake(ctx)) {
+    return ctx.transport_error == 0;  // handshake still in flight is not fatal
+  }
+  auto write_all = [&](const uint8_t* data, std::size_t len,
+                       std::size_t start) -> bool {
+    std::size_t off = start;
+    while (off < len) {
+      const int w = SSL_write(
+          ctx.ssl, data + off,
+          static_cast<int>(std::min<std::size_t>(
+              len - off, static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+      if (w > 0) {
+        off += static_cast<std::size_t>(w);
+        ctx.bytes_sent += static_cast<std::size_t>(w);
+        continue;
+      }
+      const int err = SSL_get_error(ctx.ssl, w);
+      if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+        if (&data[0] != reinterpret_cast<const uint8_t*>(client.ktls_tx_pending.data())) {
+          client.ktls_tx_pending.assign(
+              reinterpret_cast<const char*>(data + off), len - off);
+        } else {
+          client.ktls_tx_pending.erase(0, off);
+        }
+        client.ktls_tx_offset = 0;
+        errno = EAGAIN;
+        return false;
+      }
+      ctx.transport_error = 1;
+      return false;
+    }
+    return true;
+  };
+
+  if (!client.ktls_tx_pending.empty()) {
+    if (!write_all(reinterpret_cast<const uint8_t*>(client.ktls_tx_pending.data()),
+                   client.ktls_tx_pending.size(), client.ktls_tx_offset)) {
+      return ctx.transport_error == 0;
+    }
+    client.ktls_tx_pending.clear();
+    client.ktls_tx_offset = 0;
+  }
+
+  for (;;) {
+    const uint8_t* buf = nullptr;
+    const ssize_t n = nghttp2_session_mem_send(client.session, &buf);
+    if (n < 0) {
+      ctx.protocol_error = 1;
+      return false;
+    }
+    if (n == 0) {
+      break;
+    }
+    if (!write_all(buf, static_cast<std::size_t>(n), 0)) {
+      return ctx.transport_error == 0;
+    }
+  }
+  return true;
+}
+
+// Read decrypted plaintext off a kTLS socket via SSL_read (kernel decrypts;
+// OpenSSL transparently handles post-handshake control records / key updates)
+// and feed it into nghttp2. Returns false on a fatal error.
+bool h2_ktls_ingest_inbound(H2ClientSession& client) {
+  H2ConnectionContext& ctx = client.ctx;
+  if (!h2_ktls_advance_handshake(ctx)) {
+    return ctx.transport_error == 0;
+  }
+  unsigned char plain[16384];
+  for (;;) {
+    const int rd = SSL_read(ctx.ssl, plain, static_cast<int>(sizeof(plain)));
+    if (rd > 0) {
+      ctx.bytes_received += static_cast<std::size_t>(rd);
+      if (nghttp2_session_mem_recv(
+              client.session, plain, static_cast<std::size_t>(rd)) < 0) {
+        ctx.protocol_error = 1;
+        return false;
+      }
+      continue;
+    }
+    const int err = SSL_get_error(ctx.ssl, rd);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+      break;
+    }
+    if (err == SSL_ERROR_ZERO_RETURN) {
+      if (!ctx.active_streams.empty()) {
+        ctx.transport_error = 1;
+      }
+      break;
+    }
+    ctx.transport_error = 1;
+    return false;
+  }
+  return ctx.transport_error == 0;
 }
 #endif
 
@@ -935,7 +1110,13 @@ void close_h2_client_session(H2ClientSession& client) {
   client.uring_send_in_flight = false;
   client.uring_recv_in_flight = false;
   client.uring_recv_multishot = false;
+  client.uring_poll_in_flight = false;
   client.uring_gen = static_cast<uint16_t>(client.uring_gen + 1);
+  client.ktls_tx_pending.clear();
+  client.ktls_tx_offset = 0;
+  client.ctx.ktls_mode = false;
+  client.ctx.ktls_send_active = false;
+  client.ctx.ktls_recv_active = false;
   client.ready = false;
   client.replacement_mode = H2LaneReplacementMode::Ready;
   client.idle_deadline_ms = 0;
@@ -1025,16 +1206,35 @@ bool open_h2_client_session(
     if (client.ctx.tls_tctx == nullptr) {
       client.ctx.tls_tctx = runtime.tls_engine->get_thread_context();
     }
-    // Unified memory-BIO TLS for every backend: handshake bytes ride the same
-    // wire buffers as application data, so the reactor advances SSL_do_handshake
+    // Opt-in kTLS: on a kernel socket, when the host exposes the TCP "tls" ULP,
+    // bind the SSL to the real fd so the kernel performs record crypto. Custom-tcp
+    // has no kernel fd, so it always stays on memory-BIO. When the ULP is absent
+    // we fall back transparently to memory-BIO (in-process crypto).
+    // SAMURAI_H2_KTLS_FORCE_SOCKET_BIO exercises the entire socket-BIO kTLS data
+    // path (incremental SSL_do_handshake on the fd, SSL_read/SSL_write, ring
+    // poll-readiness / PollReadiness CQE handling) on hosts where the "tls" ULP
+    // is unavailable. Without a real ULP the kernel simply does not offload, so
+    // BIO_get_ktls_{send,recv} stay 0 and OpenSSL performs in-process crypto over
+    // the socket BIO -- the byte path is otherwise identical, which is what lets
+    // this validate the integration. Never enabled in production paths.
+    static const bool ktls_force_socket_bio =
+        std::getenv("SAMURAI_H2_KTLS_FORCE_SOCKET_BIO") != nullptr;
+    const bool want_ktls = profile.tls_ktls != 0 &&
+                           !is_custom_tcp_backend(client.ctx.transport_backend) &&
+                           (ktls_ulp_available() || ktls_force_socket_bio);
+    client.ctx.ktls_mode = want_ktls;
+    // Unified memory-BIO TLS otherwise: handshake bytes ride the same wire
+    // buffers as application data, so the reactor advances SSL_do_handshake
     // incrementally (h2_pump_outbound / h2_ingest_inbound). No blocking
     // SSL_connect / wait_for_fd runs on the shard thread, and ALPN=h2 is enforced
-    // by h2_custom_advance_tls when the handshake completes.
+    // when the handshake completes. The kTLS path uses a socket-BIO SSL instead
+    // (SSL owns the fd; the reactor supplies readiness only).
     client.ctx.ssl = static_cast<SSL*>(runtime.tls_engine->create_ssl(
         client.ctx.tls_tctx,
         profile.host_header,
         profile.target_port,
-        /*use_mem_bio=*/true));
+        /*use_mem_bio=*/!want_ktls,
+        /*ktls_socket_fd=*/want_ktls ? client.ctx.fd : -1));
     if (client.ctx.ssl == nullptr) {
       unregister_custom_tcp_h2_flow_binding(runtime, client);
       close_h2_client_session(client);
@@ -1250,6 +1450,9 @@ bool h2_pump_outbound(H2ClientSession& client) {
   }
   H2ConnectionContext& ctx = client.ctx;
 #ifdef SAMURAI_WITH_OPENSSL
+  if (ctx.ktls_mode) {
+    return h2_ktls_pump_outbound(client);
+  }
   if (ctx.use_tls) {
     const bool handshake_ready = h2_custom_advance_tls(ctx);
     if (ctx.transport_error != 0) {
@@ -1285,6 +1488,11 @@ bool h2_ingest_inbound(H2ClientSession& client) {
     return false;
   }
   H2ConnectionContext& ctx = client.ctx;
+#ifdef SAMURAI_WITH_OPENSSL
+  if (ctx.ktls_mode) {
+    return h2_ktls_ingest_inbound(client);
+  }
+#endif
   if (ctx.use_tls) {
 #ifdef SAMURAI_WITH_OPENSSL
     const bool handshake_ready = h2_custom_advance_tls(ctx);
@@ -1442,7 +1650,7 @@ void service_h2_session_io(
   if (ctx.protocol_error == 0 && ctx.transport_error == 0) {
     h2_pump_outbound(client);
   }
-  if (ctx.transport_error == 0) {
+  if (ctx.transport_error == 0 && !ctx.ktls_mode) {
     if (is_custom_tcp_backend(ctx.transport_backend)) {
       h2_flush_out_buffer_tcpdp(client);
     } else {
@@ -1460,7 +1668,9 @@ void service_h2_session_io(
        (!ctx.active_streams.empty() || (ctx.use_tls && !ctx.tls_handshake_complete) ||
         is_custom_tcp_backend(ctx.transport_backend)));
   if (ctx.protocol_error == 0 && ctx.transport_error == 0 && want_read) {
-    if (!is_custom_tcp_backend(ctx.transport_backend)) {
+    // kTLS sessions let SSL_read pull straight from the fd (kernel decrypts and
+    // handles control records), so no raw recv() here -- that would steal bytes.
+    if (!is_custom_tcp_backend(ctx.transport_backend) && !ctx.ktls_mode) {
       unsigned char rb[16384];
       while (true) {
         const ssize_t rd = ::recv(ctx.fd, rb, sizeof(rb), 0);
@@ -1491,7 +1701,7 @@ void service_h2_session_io(
     // output; flush it before finalizing.
     if (ctx.protocol_error == 0 && ctx.transport_error == 0) {
       h2_pump_outbound(client);
-      if (ctx.transport_error == 0) {
+      if (ctx.transport_error == 0 && !ctx.ktls_mode) {
         if (is_custom_tcp_backend(ctx.transport_backend)) {
           h2_flush_out_buffer_tcpdp(client);
         } else {

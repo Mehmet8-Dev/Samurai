@@ -182,7 +182,8 @@ ThreadLocalTlsContext* TlsSessionEngine::get_thread_context() {
 void* TlsSessionEngine::create_ssl(ThreadLocalTlsContext* tctx,
                                      const std::string& target_host,
                                      uint16_t target_port,
-                                     bool use_mem_bio) {
+                                     bool use_mem_bio,
+                                     int ktls_socket_fd) {
   (void)target_port;
 #ifdef SAMURAI_WITH_OPENSSL
   if (tctx == nullptr || tctx->ssl_ctx == nullptr) {
@@ -203,6 +204,19 @@ void* TlsSessionEngine::create_ssl(ThreadLocalTlsContext* tctx,
   }
   if (!sni.empty()) {
     SSL_set_tlsext_host_name(ssl, sni.c_str());
+  }
+
+  if (ktls_socket_fd >= 0) {
+    // kTLS path: bind the SSL to the real socket fd so OpenSSL installs the
+    // kernel-TLS ULP + crypto keys on it after the handshake. SSL_OP_ENABLE_KTLS
+    // is already set on the shared CTX (get_thread_context). Record crypto then
+    // runs in the kernel for both SSL_write and SSL_read on this fd.
+    if (SSL_set_fd(ssl, ktls_socket_fd) != 1) {
+      SSL_free(ssl);
+      return nullptr;
+    }
+    SSL_set_connect_state(ssl);
+    return ssl;
   }
 
   if (use_mem_bio) {

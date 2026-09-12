@@ -68,6 +68,13 @@ struct Profile {
   std::string scheme;
   std::string host_header;
   std::string tls_cipher_list{};  // optional operator override for the TLS 1.2 cipher list
+  // Opt-in kernel-TLS (kTLS) crypto offload for kernel-socket HTTP/2. When set
+  // and the host's TCP "tls" ULP is available, TLS sessions use a socket-BIO
+  // SSL (SSL_set_fd + SSL_OP_ENABLE_KTLS) so record crypto runs in the kernel
+  // (and on the NIC where supported); the reactor supplies readiness only. When
+  // the ULP is unavailable the session transparently falls back to the default
+  // memory-BIO in-process crypto path -- so this is always safe to request.
+  int tls_ktls{0};
   int verify{1};
   int keepalive{1};
   int timeout_ms{5000};

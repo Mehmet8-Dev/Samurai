@@ -529,6 +529,14 @@ struct H2ConnectionContext {
   bool custom_connect_ready{false};
   bool custom_terminal{false};
   bool tls_handshake_complete{false};
+  // kTLS (kernel-TLS) socket-BIO mode: SSL owns the real fd (SSL_set_fd) and the
+  // kernel performs record crypto. Set at session creation only when the host's
+  // "tls" ULP is available; otherwise the session stays on the memory-BIO path.
+  // ktls_send_active/ktls_recv_active are latched from BIO_get_ktls_{send,recv}
+  // once the handshake completes (the kernel may enable one direction only).
+  bool ktls_mode{false};
+  bool ktls_send_active{false};
+  bool ktls_recv_active{false};
   std::string read_buffer;
   int transport_error{0};
   int protocol_error{0};
@@ -603,6 +611,15 @@ struct H2ClientSession {
   bool uring_recv_multishot{false};
   uint16_t uring_gen{0};
   unsigned char uring_rx_buf[16384]{};
+  // kTLS TX carry-over: when SSL_write (socket-BIO kTLS) reports WANT_WRITE the
+  // unconsumed plaintext tail from nghttp2_session_mem_send is copied here and
+  // retried on the next writable wakeup. uring_out_buffer is unused in kTLS mode
+  // (OpenSSL owns the fd for both directions); the ring only signals readiness.
+  std::string ktls_tx_pending{};
+  std::size_t ktls_tx_offset{0};
+  // io_uring readiness poll state for kTLS sessions (see H2Poll op). Distinct
+  // from the byte-path Send/Recv SQEs which kTLS sessions do not arm.
+  bool uring_poll_in_flight{false};
 };
 #endif
 

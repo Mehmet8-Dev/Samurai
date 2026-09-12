@@ -90,10 +90,15 @@ class TlsSessionEngine {
 
   // Create a new SSL* from the thread-local context.
   // When use_mem_bio is true, creates with memory BIOs for custom TCP.
+  // When ktls_socket_fd >= 0 the SSL is bound to that real socket fd
+  // (SSL_set_fd) instead of a BIO, so the kernel-TLS ULP can engage after the
+  // handshake (SSL_OP_ENABLE_KTLS is set on the shared CTX); use_mem_bio is
+  // ignored in that case.
   void* create_ssl(ThreadLocalTlsContext* tctx,
                    const std::string& target_host,
                    uint16_t target_port,
-                   bool use_mem_bio);
+                   bool use_mem_bio,
+                   int ktls_socket_fd = -1);
 
   // Attempt to resume a previous TLS session using cached ticket.
   bool try_resume_session(ThreadLocalTlsContext* tctx, void* ssl,

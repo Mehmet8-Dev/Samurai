@@ -569,6 +569,7 @@ Profile parse_profile(const json::Value& profile_dict) {
     profile.scheme = GetStr(*conn, "scheme");
     profile.host_header = GetStr(*conn, "host_header");
     profile.tls_cipher_list = GetStr(*conn, "tls_cipher_list");
+    profile.tls_ktls = GetInt(*conn, "tls_ktls", profile.tls_ktls);
     profile.verify = GetInt(*conn, "verify", profile.verify);
     profile.keepalive = GetInt(*conn, "keepalive", profile.keepalive);
     profile.timeout_ms = GetInt(*conn, "timeout_ms", profile.timeout_ms);
