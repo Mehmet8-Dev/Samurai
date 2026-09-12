@@ -5,18 +5,37 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
 
 namespace ddos_samurai::l7_emu_native {
 
 // Probe once whether this host exposes the TCP "tls" ULP so kTLS can engage.
-// Cached: we open a throwaway TCP socket and try setsockopt(TCP_ULP, "tls").
-// EOPNOTSUPP/ENOENT (module absent) -> unavailable; success (or EINVAL, meaning
-// the ULP is known but rejects an unconnected socket) -> available. Any TLS
-// session that requested kTLS falls back to the memory-BIO path when this is
-// false, so a missing ULP is never fatal.
+// Cached. The authoritative signal is the kernel's registered-ULP list in
+// /proc/sys/net/ipv4/tcp_available_ulp (a space-separated set, e.g.
+// "espintcp mptcp tls"). We fall back to setsockopt(TCP_ULP,"tls") on a throwaway
+// socket: on an unconnected socket the kernel reports the ULP is present but not
+// applicable via ENOTCONN/EINVAL/EISCONN (as opposed to ENOENT/EOPNOTSUPP when
+// the module is absent). Any TLS session that requested kTLS falls back to the
+// memory-BIO path when this is false, so a missing ULP is never fatal.
 bool ktls_ulp_available() {
 #if defined(__linux__) && defined(TCP_ULP)
   static const bool available = []() -> bool {
+    if (FILE* f = std::fopen("/proc/sys/net/ipv4/tcp_available_ulp", "re")) {
+      char buf[256];
+      const std::size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+      std::fclose(f);
+      buf[n] = '\0';
+      // Match the whole "tls" token, not a substring of another ULP name.
+      for (char* tok = std::strtok(buf, " \t\n"); tok != nullptr;
+           tok = std::strtok(nullptr, " \t\n")) {
+        if (std::strcmp(tok, "tls") == 0) {
+          return true;
+        }
+      }
+      return false;  // proc file present and readable but no tls ULP listed
+    }
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
       return false;
@@ -28,7 +47,7 @@ bool ktls_ulp_available() {
       return true;
     }
     // The ULP exists but refuses an unconnected socket -> still available.
-    return saved == EINVAL || saved == EISCONN;
+    return saved == ENOTCONN || saved == EINVAL || saved == EISCONN;
   }();
   return available;
 #else
@@ -355,6 +374,12 @@ bool h2_ktls_advance_handshake(H2ConnectionContext& ctx) {
 #ifdef BIO_get_ktls_recv
     ctx.ktls_recv_active = BIO_get_ktls_recv(SSL_get_rbio(ctx.ssl)) > 0;
 #endif
+    if (std::getenv("SAMURAI_H2_KTLS_DEBUG") != nullptr) {
+      std::fprintf(stderr,
+                   "[ktls] handshake done ver=%s cipher=%s send_active=%d recv_active=%d\n",
+                   SSL_get_version(ctx.ssl), SSL_get_cipher(ctx.ssl),
+                   ctx.ktls_send_active ? 1 : 0, ctx.ktls_recv_active ? 1 : 0);
+    }
     return true;
   }
   const int err = SSL_get_error(ctx.ssl, hs);
