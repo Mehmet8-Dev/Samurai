@@ -130,8 +130,12 @@ target_link_libraries(test_l2l3_astf PRIVATE samurai_l7emu samurai_l4 samurai_co
 add_executable(test_kernel_threaded_l7 test_kernel_threaded_l7.cpp)
 target_link_libraries(test_kernel_threaded_l7 PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
 
-# kernel_socket H2 threaded driver e2e: real h2c server (test_h2c_server.py) + shards>1.
-# The harness starts the Python h2 server and passes its port via H2_TEST_PORT.
+# kernel_socket H2 threaded driver e2e: real h2 server + shards>1, exercising the
+# io_uring ring byte path (nghttp2 mem_send/mem_recv over ring Send/Recv SQEs).
+# The harness starts a Python h2 server and passes its port via H2_TEST_PORT:
+#   * cleartext h2c  -> test_h2c_server.py       (default)
+#   * TLS (ALPN h2)  -> test_h2_tls_server.py    with H2_TEST_TLS=1 (memory-BIO path)
+# Set H2_TEST_EPOLL=1 to force the epoll reactor instead of io_uring.
 add_executable(test_kernel_threaded_h2 test_kernel_threaded_h2.cpp)
 target_link_libraries(test_kernel_threaded_h2 PRIVATE samurai_l7emu samurai_l4 samurai_core pthread dl)
 

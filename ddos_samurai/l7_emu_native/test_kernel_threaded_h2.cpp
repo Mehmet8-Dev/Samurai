@@ -48,6 +48,8 @@ int main() {
     return 2;
   }
   const int port = std::atoi(port_env);
+  const char* tls_env = std::getenv("H2_TEST_TLS");
+  const bool use_tls = tls_env != nullptr && *tls_env != '\0' && *tls_env != '0';
 
   constexpr int kRequests = 40;
   constexpr int kConcurrency = 4;  // shards = min(concurrency, max_connections)
@@ -58,7 +60,9 @@ int main() {
   profile.stateful_runtime_backend = "kernel";
   profile.target_ip = "127.0.0.1";
   profile.target_port = port;
-  profile.scheme = "http";  // h2c (use_tls=false) -> cleartext HTTP/2 prior-knowledge
+  // Cleartext h2c by default; H2_TEST_TLS=1 exercises the memory-BIO TLS ring
+  // path (ALPN h2 over TLS) against a TLS-wrapped server.
+  profile.scheme = use_tls ? "https" : "http";
   profile.host_header = "127.0.0.1";
   profile.keepalive = 1;  // H2 multiplexer; connections reused across streams
   profile.verify = 0;
@@ -72,9 +76,12 @@ int main() {
   // Drive the sessions through the io_uring reactor where the host supports it,
   // so this exercises the ring-backed H2 readiness path (multishot POLL feeding
   // SSL_read/nghttp2), not just epoll. Falls back to epoll otherwise.
+  const char* epoll_env = std::getenv("H2_TEST_EPOLL");
+  const bool force_epoll = epoll_env != nullptr && *epoll_env != '\0' && *epoll_env != '0';
   const RuntimeCapabilities caps = detect_capabilities();
-  const bool want_io_uring = caps.io_uring;
-  profile.reactor_backend = want_io_uring ? "socket_io_uring" : "auto";
+  const bool want_io_uring = caps.io_uring && !force_epoll;
+  profile.reactor_backend = force_epoll ? "socket_epoll"
+                            : (want_io_uring ? "socket_io_uring" : "auto");
 
   RuntimeConfig cfg;
   cfg.concurrency = kConcurrency;
@@ -111,16 +118,17 @@ int main() {
   CHECK(status_2xx == static_cast<double>(kRequests), "status_2xx=%.0f expected %d", status_2xx, kRequests);
 
   if (want_io_uring) {
-    // The io_uring reactor drives the H2 shard loop (service_ready_lanes routes
-    // to the ring path). Note: H2 byte I/O itself is still synchronous
-    // (SSL_read/SSL_write + nghttp2 + wait_for_fd) - the ring supplies readiness
-    // via a multishot POLL, so on fast localhost the exchange can complete inside
-    // the synchronous service call before a POLL CQE is needed (cqe_reaped may be
-    // 0, and wait_for_fd may register a few epoll wakeups). Moving the H2 byte
-    // transfer onto ring send/recv requires the nghttp2 mem-API rewrite and is
-    // tracked separately; this test asserts functional correctness under the
-    // io_uring reactor.
+    // The H2 byte path now runs entirely on the io_uring ring: nghttp2
+    // mem_send output is drained through ring Send SQEs and ring Recv
+    // completions are fed back into nghttp2_session_mem_recv (memory-BIO TLS
+    // for the TLS case). So every request/response pair produces real ring
+    // completions -- assert we actually reaped them rather than falling back to
+    // a synchronous socket path. (A few epoll wakeups may still appear from the
+    // blocking TCP connect's transient wait_for_fd.)
     CHECK(uring_active == 1.0, "expected io_uring reactor active, got %.0f", uring_active);
+    CHECK(cqe_reaped > 0.0,
+          "expected H2 ring byte-path completions (l7_io_uring_cqe_reaped>0), got %.0f",
+          cqe_reaped);
   }
 
   if (g_fails == 0) {
