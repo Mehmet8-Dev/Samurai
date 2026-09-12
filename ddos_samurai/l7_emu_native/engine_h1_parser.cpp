@@ -534,6 +534,76 @@ static bool arm_h1_ring_recv(
   return true;
 }
 
+#ifdef SAMURAI_WITH_NGHTTP2
+// Arm a ring recv for a kernel-socket HTTP/2 session: multishot into the shard's
+// provided buffer ring where available, otherwise single-shot into the session's
+// own scratch buffer. Mirrors arm_h1_ring_recv but keyed on the h2_sessions slot.
+static bool arm_h2_ring_recv(
+    NativeRuntime::LocalShard& local_shard, H2ClientSession& client, std::size_t si) {
+#if defined(IORING_RECV_MULTISHOT) && defined(IOSQE_BUFFER_SELECT) && defined(__NR_io_uring_register)
+  if (local_shard.uring.buf_ring_active()) {
+    if (client.uring_recv_multishot) {
+      return true;
+    }
+    auto* sqe = local_shard.uring.get_sqe();
+    if (sqe == nullptr) {
+      return false;
+    }
+    prep_uring_recv_multishot(
+        sqe, client.ctx.fd, /*bgid=*/0,
+        make_uring_user_data(static_cast<uint32_t>(si), IoUringOp::H2Recv, client.uring_gen));
+    client.uring_recv_multishot = true;
+    if (g_perf_stats != nullptr) {
+      g_perf_stats->io_uring_sqe_submitted += 1;
+    }
+    return true;
+  }
+#endif
+  if (client.uring_recv_in_flight) {
+    return true;
+  }
+  auto* sqe = local_shard.uring.get_sqe();
+  if (sqe == nullptr) {
+    return false;
+  }
+  prep_uring_recv(
+      sqe, client.ctx.fd, client.uring_rx_buf, sizeof(client.uring_rx_buf), 0,
+      make_uring_user_data(static_cast<uint32_t>(si), IoUringOp::H2Recv, client.uring_gen));
+  client.uring_recv_in_flight = true;
+  if (g_perf_stats != nullptr) {
+    g_perf_stats->io_uring_sqe_submitted += 1;
+  }
+  return true;
+}
+
+// Arm a ring send for the pending wire bytes of a kernel-socket HTTP/2 session.
+// Returns true when a send is outstanding after the call.
+static bool arm_h2_ring_send(
+    NativeRuntime::LocalShard& local_shard, H2ClientSession& client, std::size_t si) {
+  if (client.uring_send_in_flight) {
+    return true;
+  }
+  if (client.uring_out_offset >= client.uring_out_buffer.size()) {
+    return false;
+  }
+  auto* sqe = local_shard.uring.get_sqe();
+  if (sqe == nullptr) {
+    return false;
+  }
+  prep_uring_send(
+      sqe, client.ctx.fd,
+      client.uring_out_buffer.data() + client.uring_out_offset,
+      client.uring_out_buffer.size() - client.uring_out_offset,
+      MSG_NOSIGNAL,
+      make_uring_user_data(static_cast<uint32_t>(si), IoUringOp::H2Send, client.uring_gen));
+  client.uring_send_in_flight = true;
+  if (g_perf_stats != nullptr) {
+    g_perf_stats->io_uring_sqe_submitted += 1;
+  }
+  return true;
+}
+#endif  // SAMURAI_WITH_NGHTTP2
+
 int service_ready_lanes_io_uring(
     NativeRuntime& runtime,
     const Profile& profile,
@@ -584,13 +654,14 @@ int service_ready_lanes_io_uring(
     }
   }
 
-  // 1b. Drive kernel-socket HTTP/2 sessions through the same ring. Their byte
-  // transfer stays on SSL_read/write + nghttp2; we only need the readiness
-  // wakeup, so each un-armed session is serviced once (to push requests and
-  // drain buffered bytes) and then gets a single-shot POLLIN poll armed on its
-  // fd. Without this, an io_uring-active shard would service H1 lanes but never
-  // wake for H2 traffic (epoll_wait is not called on this path), starving H2.
-  std::size_t h2_polls_armed = 0;
+  // 1b. Drive kernel-socket HTTP/2 sessions through the same ring as a true byte
+  // path. Each session serializes its pending output (TLS handshake + requests +
+  // window/settings acks) into its wire buffer via nghttp2_session_mem_send, then
+  // we arm a ring Send for those bytes and a ring Recv (multishot where the buffer
+  // ring is live) for the reply. Received bytes are fed back through the memory
+  // BIO / nghttp2_session_mem_recv on completion -- no SSL_read/write on a socket
+  // BIO and no epoll_wait on this path.
+  std::size_t h2_in_flight = 0;
 #ifdef SAMURAI_WITH_NGHTTP2
   for (std::size_t si = 0; si < local_shard.h2_sessions.size(); ++si) {
     auto& session_ptr = local_shard.h2_sessions[si];
@@ -602,30 +673,19 @@ int service_ready_lanes_io_uring(
         is_custom_tcp_backend(client.ctx.transport_backend)) {
       continue;
     }
-    if (!client.uring_poll_armed) {
-      service_h2_session_io(runtime, profile, shard, local_shard, client, 0, true);
-      flush_ready_h2_completions(runtime, shard_idx, client);
-      if (!client.ready || client.ctx.fd < 0) {
-        continue;
-      }
-      auto* sqe = local_shard.uring.get_sqe();
-      if (sqe != nullptr) {
-        client.uring_poll_gen = static_cast<uint16_t>(client.uring_poll_gen + 1);
-        prep_uring_poll_add(
-            sqe,
-            client.ctx.fd,
-            POLLIN | POLLERR | POLLHUP,
-            /*multishot=*/false,
-            make_uring_user_data(static_cast<uint32_t>(si), IoUringOp::PollReadiness,
-                                 client.uring_poll_gen));
-        client.uring_poll_armed = true;
-        if (g_perf_stats != nullptr) {
-          g_perf_stats->io_uring_sqe_submitted += 1;
-        }
-      }
+    client.ctx.epoll_fd = shard.epoll_fd;
+    h2_pull_pending_requests(local_shard, client, profile);
+    if (client.ctx.protocol_error == 0 && client.ctx.transport_error == 0) {
+      h2_pump_outbound(client);
     }
-    if (client.uring_poll_armed) {
-      ++h2_polls_armed;
+    if (h2_finalize_session_io(runtime, profile, shard, local_shard, client)) {
+      continue;  // session torn down (error or drained GOAWAY)
+    }
+    arm_h2_ring_send(local_shard, client, si);
+    arm_h2_ring_recv(local_shard, client, si);
+    if (client.uring_send_in_flight || client.uring_recv_in_flight ||
+        client.uring_recv_multishot) {
+      ++h2_in_flight;
     }
   }
 #endif
@@ -638,7 +698,7 @@ int service_ready_lanes_io_uring(
   int reaped = local_shard.uring.peek_batch_cqe(cqes, 128);
 
   if (reaped == 0 && timeout_ms > 0) {
-    bool has_in_flight = h2_polls_armed > 0;
+    bool has_in_flight = h2_in_flight > 0;
     if (!has_in_flight) {
       for (const auto& lane_ptr : local_shard.h1_lanes) {
         if (lane_ptr && lane_ptr->conn &&
@@ -680,21 +740,81 @@ int service_ready_lanes_io_uring(
     const bool cqe_more = SamuraiUring::cqe_has_more(cqe);
 
 #ifdef SAMURAI_WITH_NGHTTP2
-    if (op == IoUringOp::PollReadiness) {
-      // HTTP/2 readiness wakeup: lane_idx addresses the h2_sessions vector, a
-      // different namespace from h1_lanes, so this must be handled before the
-      // h1_lanes bound check below.
+    if (op == IoUringOp::H2Send || op == IoUringOp::H2Recv) {
+      // HTTP/2 ring byte-path completion: lane_idx addresses the h2_sessions
+      // vector, a different namespace from h1_lanes, so this must be handled
+      // before the h1_lanes bound check below.
       const std::size_t si = lane_idx;
-      if (si < local_shard.h2_sessions.size() && local_shard.h2_sessions[si]) {
-        H2ClientSession& client = *local_shard.h2_sessions[si];
-        if (gen == client.uring_poll_gen) {
-          client.uring_poll_armed = false;  // single-shot fired; re-armed next pass
-          const uint32_t ev = res < 0 ? static_cast<uint32_t>(EPOLLERR | EPOLLHUP)
-                                      : static_cast<uint32_t>(res);
-          service_h2_session_io(runtime, profile, shard, local_shard, client, ev, true);
+      if (si >= local_shard.h2_sessions.size() || !local_shard.h2_sessions[si]) {
+        if (cqe_from_ring) local_shard.uring.buf_ring_recycle(cqe_bid);
+        continue;
+      }
+      H2ClientSession& client = *local_shard.h2_sessions[si];
+      if (gen != client.uring_gen || client.ctx.fd < 0) {
+        // Stale completion from a since-recycled fd/session slot.
+        if (cqe_from_ring) local_shard.uring.buf_ring_recycle(cqe_bid);
+        continue;
+      }
+      client.ctx.epoll_fd = shard.epoll_fd;
+
+      if (op == IoUringOp::H2Send) {
+        client.uring_send_in_flight = false;
+        if (res > 0) {
+          client.uring_out_offset += static_cast<std::size_t>(res);
+          if (client.uring_out_offset >= client.uring_out_buffer.size()) {
+            client.uring_out_buffer.clear();
+            client.uring_out_offset = 0;
+          }
+        } else if (res < 0) {
+          client.ctx.transport_error = 1;
+        }
+      } else {  // H2Recv
+        // A terminated multishot (no F_MORE) must be re-armed next pass.
+        const bool was_multishot = client.uring_recv_multishot;
+        if (was_multishot && !cqe_more) {
+          client.uring_recv_multishot = false;
+        }
+        if (!was_multishot) {
+          client.uring_recv_in_flight = false;
+        }
+        if (res > 0) {
+          const char* rx = reinterpret_cast<const char*>(client.uring_rx_buf);
+          if (cqe_from_ring) {
+            const void* p = local_shard.uring.buf_ring_addr(cqe_bid);
+            rx = p != nullptr ? static_cast<const char*>(p) : nullptr;
+          }
+          if (rx != nullptr) {
+            client.ctx.read_buffer.append(rx, static_cast<std::size_t>(res));
+          }
+          if (cqe_from_ring) local_shard.uring.buf_ring_recycle(cqe_bid);
+          if (client.ctx.protocol_error == 0 && client.ctx.transport_error == 0) {
+            h2_ingest_inbound(client);
+            if (client.ctx.protocol_error == 0 && client.ctx.transport_error == 0) {
+              h2_pump_outbound(client);
+            }
+          }
           flush_ready_h2_completions(runtime, shard_idx, client);
+        } else if (res == 0) {
+          if (cqe_from_ring) local_shard.uring.buf_ring_recycle(cqe_bid);
+          if (!client.ctx.active_streams.empty()) {
+            client.ctx.transport_error = 1;
+          }
+        } else if (res == -ENOBUFS) {
+          // Provided buffer ring momentarily drained; multishot ended without a
+          // connection error and is re-armed once buffers recycle.
+        } else {
+          if (cqe_from_ring) local_shard.uring.buf_ring_recycle(cqe_bid);
+          client.ctx.transport_error = 1;
         }
       }
+
+      if (h2_finalize_session_io(runtime, profile, shard, local_shard, client)) {
+        continue;  // torn down
+      }
+      // Keep the byte path flowing: send any freshly produced bytes and ensure a
+      // recv stays armed for the next reply.
+      arm_h2_ring_send(local_shard, client, si);
+      arm_h2_ring_recv(local_shard, client, si);
       continue;
     }
 #endif

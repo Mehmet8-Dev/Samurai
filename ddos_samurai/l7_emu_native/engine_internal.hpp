@@ -104,6 +104,18 @@ void service_h2_session_io(
     H2ClientSession& client,
     uint32_t events,
     bool allow_read_without_event);
+// Unified mem-BIO byte-path helpers, shared by the epoll (service_h2_session_io)
+// and io_uring (service_ready_lanes_io_uring) reactors. None block.
+void h2_pull_pending_requests(
+    NativeRuntime::LocalShard& local_shard, H2ClientSession& client, const Profile& profile);
+bool h2_pump_outbound(H2ClientSession& client);
+bool h2_ingest_inbound(H2ClientSession& client);
+bool h2_finalize_session_io(
+    NativeRuntime& runtime,
+    const Profile& profile,
+    ShardState& shard,
+    NativeRuntime::LocalShard& local_shard,
+    H2ClientSession& client);
 bool submit_h2_request(
     H2ClientSession& client,
     const Profile& profile,

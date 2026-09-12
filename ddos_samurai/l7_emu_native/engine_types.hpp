@@ -586,12 +586,23 @@ struct H2ClientSession {
   std::size_t stream_pool_reuse_hits{0};
   std::size_t harvested_stream_pool_reuse_hits{0};
   int drain_evictions{0};
-  // io_uring readiness-poll bookkeeping (SocketIoUring reactor). The data path
-  // stays on SSL_read/write + nghttp2; the ring only delivers the wakeup via a
-  // multishot POLL_ADD keyed on session_idx. uring_poll_gen rejects stale CQEs
-  // from a poll armed on a since-recycled fd.
-  bool uring_poll_armed{false};
-  uint16_t uring_poll_gen{0};
+  // Unified mem-BIO ring byte-path state. nghttp2 plaintext <-> (optional
+  // memory-BIO TLS) <-> uring_out_buffer / ctx.read_buffer <-> wire. Both
+  // reactors share the same nghttp2_session_mem_send/mem_recv core: the
+  // io_uring reactor moves these buffers with ring Send/Recv SQEs, the epoll
+  // reactor with plain send()/recv(), and custom-tcp with tcpdp. This replaces
+  // the old blocking send_callback + wait_for_fd + SSL_set_fd data path.
+  //
+  // uring_out_buffer holds wire-ready bytes (ciphertext under TLS) not yet
+  // handed to the kernel; uring_out_offset tracks how many have been. uring_gen
+  // rejects stale Send/Recv CQEs from a since-recycled fd/session slot.
+  std::string uring_out_buffer{};
+  std::size_t uring_out_offset{0};
+  bool uring_send_in_flight{false};
+  bool uring_recv_in_flight{false};
+  bool uring_recv_multishot{false};
+  uint16_t uring_gen{0};
+  unsigned char uring_rx_buf[16384]{};
 };
 #endif
 

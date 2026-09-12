@@ -237,8 +237,16 @@ std::map<std::string, double> run_http2_profile(
       }
       const std::size_t pending_before = local_shard.pending_h2_requests.size();
       const std::size_t load_before = session_load(client);
-      service_h2_session_io(runtime, profile, shard, local_shard, client, 0, true);
-      flush_ready_h2_completions(runtime, shard_idx, client);
+      if (local_shard.uring_active) {
+        // The io_uring reactor (service_ready_lanes_io_uring) owns the byte path
+        // for this shard: it pumps mem_send output onto ring Send SQEs and feeds
+        // ring Recv completions into mem_recv. Here we only queue the requests
+        // onto the session; driving I/O synchronously would bypass the ring.
+        h2_pull_pending_requests(local_shard, client, profile);
+      } else {
+        service_h2_session_io(runtime, profile, shard, local_shard, client, 0, true);
+        flush_ready_h2_completions(runtime, shard_idx, client);
+      }
       const bool progressed =
           local_shard.pending_h2_requests.size() < pending_before || session_load(client) != load_before;
       made_progress = made_progress || progressed;
@@ -492,6 +500,8 @@ std::map<std::string, double> run_http2_profile(
       runtime.perf.idle_evictions += sp.idle_evictions;
       runtime.perf.rx_syscalls += sp.rx_syscalls;
       runtime.perf.tx_syscalls += sp.tx_syscalls;
+      runtime.perf.io_uring_sqe_submitted += sp.io_uring_sqe_submitted;
+      runtime.perf.io_uring_cqe_reaped += sp.io_uring_cqe_reaped;
       runtime.perf.alloc_bytes += sp.alloc_bytes;
       runtime.perf.alloc_count += sp.alloc_count;
       runtime.perf.profile_snapshot_count += sp.profile_snapshot_count;

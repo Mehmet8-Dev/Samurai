@@ -64,6 +64,11 @@ enum class IoUringOp : uint8_t {
   // transfer itself runs through SSL_read/write or the QUIC stack rather than
   // raw ring send/recv. The ring only delivers the wakeup.
   PollReadiness = 5,
+  // HTTP/2 ring byte-path completions. Their lane_idx addresses the h2_sessions
+  // vector (a different namespace from the H1 lane ops above), so the reactor
+  // must dispatch these before the h1_lanes bound check.
+  H2Send = 6,
+  H2Recv = 7,
 };
 
 inline uint64_t make_uring_user_data(uint32_t lane_idx, IoUringOp op, uint16_t gen = 0) {

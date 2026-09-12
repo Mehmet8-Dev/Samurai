@@ -145,21 +145,61 @@ void service_custom_tcp_h2_shard_sessions(
 }
 
 #ifdef SAMURAI_WITH_OPENSSL
-bool h2_custom_queue_ciphertext(H2ConnectionContext& ctx, const uint8_t* data, std::size_t len) {
+// Buffer wire-ready bytes (ciphertext under TLS, plaintext otherwise) that
+// nghttp2/OpenSSL emitted. Everything is appended to the owning session's
+// uring_out_buffer; the reactor drains it to the wire afterwards (ring Send SQE
+// under io_uring, send() under epoll, tcpdp under custom-tcp). Buffering here --
+// rather than pushing straight to the transport -- is required because
+// nghttp2_session_mem_send treats returned bytes as already sent, so a
+// transport that is momentarily not writable must not drop them.
+bool h2_queue_wire_bytes(H2ConnectionContext& ctx, const uint8_t* data, std::size_t len) {
   if (len == 0) {
     return true;
   }
-  if (ctx.custom_flow_id == 0 || !ctx.custom_connect_ready) {
-    errno = EAGAIN;
+  if (ctx.owner_session == nullptr) {
+    errno = EIO;
     return false;
   }
-  uint32_t queued = 0;
-  const int rc = tcpdp_enqueue_send(ctx.custom_flow_id, data, len, &queued);
-  if (rc != 0 || queued != len) {
-    errno = EAGAIN;
-    return false;
+  ctx.owner_session->uring_out_buffer.append(
+      reinterpret_cast<const char*>(data), len);
+  ctx.bytes_sent += len;
+  return true;
+}
+
+// Drain the pending wire buffer into the tcpdp userspace stack (custom-tcp
+// backend). Leaves unqueued bytes in place for the next pass. Returns false only
+// on a fatal enqueue error.
+bool h2_flush_out_buffer_tcpdp(H2ClientSession& client) {
+  H2ConnectionContext& ctx = client.ctx;
+  if (ctx.custom_flow_id == 0 || !ctx.custom_connect_ready) {
+    return true;  // flow not up yet; retry later
+  }
+  while (client.uring_out_offset < client.uring_out_buffer.size()) {
+    uint32_t queued = 0;
+    const std::size_t remaining = client.uring_out_buffer.size() - client.uring_out_offset;
+    const int rc = tcpdp_enqueue_send(
+        ctx.custom_flow_id,
+        reinterpret_cast<const uint8_t*>(client.uring_out_buffer.data()) + client.uring_out_offset,
+        remaining, &queued);
+    if (rc != 0) {
+      ctx.transport_error = 1;
+      return false;
+    }
+    if (queued == 0) {
+      break;  // tcpdp queue full; retry next pass
+    }
+    client.uring_out_offset += queued;
+  }
+  if (client.uring_out_offset >= client.uring_out_buffer.size()) {
+    client.uring_out_buffer.clear();
+    client.uring_out_offset = 0;
   }
   return true;
+}
+
+// Retained name used by TLS flush; delegates to the generalized wire queue.
+bool h2_custom_queue_ciphertext(H2ConnectionContext& ctx, const uint8_t* data, std::size_t len) {
+  return h2_queue_wire_bytes(ctx, data, len);
 }
 
 bool h2_custom_flush_tls_wbio(H2ConnectionContext& ctx) {
@@ -179,7 +219,6 @@ bool h2_custom_flush_tls_wbio(H2ConnectionContext& ctx) {
       if (!h2_custom_queue_ciphertext(ctx, out, static_cast<std::size_t>(n))) {
         return false;
       }
-      ctx.bytes_sent += static_cast<std::size_t>(n);
       continue;
     }
     if (n == 0) {
@@ -222,7 +261,9 @@ bool h2_custom_advance_tls(H2ConnectionContext& ctx) {
     errno = EIO;
     return false;
   }
-  if (!ctx.custom_connect_ready) {
+  // Custom-tcp must wait for the userspace handshake to establish the flow; the
+  // kernel-socket path is already connected by the time we drive TLS.
+  if (is_custom_tcp_backend(ctx.transport_backend) && !ctx.custom_connect_ready) {
     errno = EAGAIN;
     return false;
   }
@@ -887,6 +928,14 @@ void close_h2_client_session(H2ClientSession& client) {
   client.ctx.read_buffer.clear();
   client.pending_requests.clear();
   client.completed_streams.clear();
+  // Reset the ring byte-path state and bump the generation so any Send/Recv CQE
+  // still outstanding on the just-closed fd is rejected by the reactor.
+  client.uring_out_buffer.clear();
+  client.uring_out_offset = 0;
+  client.uring_send_in_flight = false;
+  client.uring_recv_in_flight = false;
+  client.uring_recv_multishot = false;
+  client.uring_gen = static_cast<uint16_t>(client.uring_gen + 1);
   client.ready = false;
   client.replacement_mode = H2LaneReplacementMode::Ready;
   client.idle_deadline_ms = 0;
@@ -976,11 +1025,16 @@ bool open_h2_client_session(
     if (client.ctx.tls_tctx == nullptr) {
       client.ctx.tls_tctx = runtime.tls_engine->get_thread_context();
     }
+    // Unified memory-BIO TLS for every backend: handshake bytes ride the same
+    // wire buffers as application data, so the reactor advances SSL_do_handshake
+    // incrementally (h2_pump_outbound / h2_ingest_inbound). No blocking
+    // SSL_connect / wait_for_fd runs on the shard thread, and ALPN=h2 is enforced
+    // by h2_custom_advance_tls when the handshake completes.
     client.ctx.ssl = static_cast<SSL*>(runtime.tls_engine->create_ssl(
         client.ctx.tls_tctx,
         profile.host_header,
         profile.target_port,
-        is_custom_tcp_backend(client.ctx.transport_backend)));
+        /*use_mem_bio=*/true));
     if (client.ctx.ssl == nullptr) {
       unregister_custom_tcp_h2_flow_binding(runtime, client);
       close_h2_client_session(client);
@@ -988,50 +1042,9 @@ bool open_h2_client_session(
       stats.expectation_failures += static_cast<int>(request_count);
       return false;
     }
-    if (!is_custom_tcp_backend(client.ctx.transport_backend)) {
-      if (SSL_set_fd(client.ctx.ssl, client.ctx.fd) != 1) {
-        unregister_custom_tcp_h2_flow_binding(runtime, client);
-        close_h2_client_session(client);
-        stats.errors += static_cast<int>(request_count);
-        stats.expectation_failures += static_cast<int>(request_count);
-        return false;
-      }
-      SSL_set_connect_state(client.ctx.ssl);
-      runtime.tls_engine->try_resume_session(
-          client.ctx.tls_tctx, client.ctx.ssl, profile.host_header, profile.target_port);
-      while (true) {
-        const int rc = SSL_connect(client.ctx.ssl);
-        if (rc == 1) {
-          break;
-        }
-        const int err = SSL_get_error(client.ctx.ssl, rc);
-        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
-          unregister_custom_tcp_h2_flow_binding(runtime, client);
-          close_h2_client_session(client);
-          stats.errors += static_cast<int>(request_count);
-          stats.expectation_failures += static_cast<int>(request_count);
-          return false;
-        }
-        if (!wait_for_fd(client.ctx.epoll_fd, client.ctx.fd, err == SSL_ERROR_WANT_WRITE ? EPOLLOUT : EPOLLIN, client.ctx.timeout_ms)) {
-          unregister_custom_tcp_h2_flow_binding(runtime, client);
-          close_h2_client_session(client);
-          stats.errors += static_cast<int>(request_count);
-          stats.expectation_failures += static_cast<int>(request_count);
-          return false;
-        }
-      }
-      const unsigned char* alpn = nullptr;
-      unsigned int alpn_len = 0;
-      SSL_get0_alpn_selected(client.ctx.ssl, &alpn, &alpn_len);
-      client.ctx.tls_handshake_complete = (alpn != nullptr && alpn_len == 2 && std::memcmp(alpn, "h2", 2) == 0);
-      if (!client.ctx.tls_handshake_complete) {
-        unregister_custom_tcp_h2_flow_binding(runtime, client);
-        close_h2_client_session(client);
-        stats.errors += static_cast<int>(request_count);
-        stats.expectation_failures += static_cast<int>(request_count);
-        return false;
-      }
-    }
+    runtime.tls_engine->try_resume_session(
+        client.ctx.tls_tctx, client.ctx.ssl, profile.host_header, profile.target_port);
+    client.ctx.tls_handshake_complete = false;
   } else if (client.ctx.use_tls) {
     unregister_custom_tcp_h2_flow_binding(runtime, client);
     close_h2_client_session(client);
@@ -1144,33 +1157,23 @@ void requeue_h2_pending_front(
   }
 }
 
-void service_h2_session_io(
-    NativeRuntime& runtime,
-    const Profile& profile,
-    ShardState& shard,
+// ---------------------------------------------------------------------------
+// Unified mem-BIO byte-path helpers. These carry all nghttp2 I/O for both
+// reactors: the epoll path drives them with plain send()/recv(), the io_uring
+// reactor with ring Send/Recv SQEs (see service_ready_lanes_io_uring), and
+// custom-tcp with tcpdp. None of them block.
+// ---------------------------------------------------------------------------
+
+// Move eligible shard-level pending requests onto the session and submit them to
+// nghttp2 (serializing into the session's send queue). Byte transfer happens
+// later via h2_pump_outbound.
+void h2_pull_pending_requests(
     NativeRuntime::LocalShard& local_shard,
     H2ClientSession& client,
-    uint32_t events,
-    bool allow_read_without_event) {
+    const Profile& profile) {
+  H2ConnectionContext& ctx = client.ctx;
   const std::size_t stream_budget =
       static_cast<std::size_t>(std::max(1, profile.max_streams_per_connection));
-  if (!client.ready || client.ctx.fd < 0 || client.session == nullptr) {
-    return;
-  }
-
-  H2ConnectionContext& ctx = client.ctx;
-  ctx.epoll_fd = shard.epoll_fd;
-  const long long now_ms = monotonic_ms_now();
-
-#ifdef SAMURAI_WITH_OPENSSL
-  if (is_custom_tcp_backend(ctx.transport_backend) && ctx.use_tls && !ctx.tls_handshake_complete) {
-    const bool ready = h2_custom_advance_tls(ctx);
-    if (!ready && ctx.transport_error == 0) {
-      return;
-    }
-  }
-#endif
-
   while (ctx.goaway == 0 &&
          !local_shard.pending_h2_requests.empty() &&
          client.pending_requests.size() + ctx.active_streams.size() < stream_budget) {
@@ -1179,64 +1182,202 @@ void service_h2_session_io(
   }
   if (client.active_since_ms == 0 &&
       (!client.pending_requests.empty() || !ctx.active_streams.empty())) {
-    client.active_since_ms = now_ms;
+    client.active_since_ms = monotonic_ms_now();
   }
-
   while (ctx.goaway == 0 &&
          !client.pending_requests.empty() &&
          ctx.active_streams.size() < stream_budget) {
-    const std::map<std::string, std::string> empty_captures;
+    static const std::map<std::string, std::string> empty_captures;
     const std::map<std::string, std::string>& request_captures =
         ctx.captures != nullptr ? *ctx.captures : empty_captures;
     if (!submit_h2_request(
-            client,
-            profile,
-            client.pending_requests.front(),
-            request_captures)) {
+            client, profile, client.pending_requests.front(), request_captures)) {
       ctx.protocol_error = 1;
       break;
     }
     client.pending_requests.pop_front();
   }
+}
 
-  if ((ctx.protocol_error == 0 && ctx.transport_error == 0) &&
-      (!ctx.active_streams.empty() || !client.pending_requests.empty())) {
-    const int send_rc = nghttp2_session_send(client.session);
-    if (send_rc < 0 && send_rc != NGHTTP2_ERR_WOULDBLOCK) {
-      ctx.protocol_error = 1;
+// Encrypt+queue one plaintext chunk emitted by nghttp2 onto the wire. With a
+// memory-BIO SSL this never blocks on write space; a WANT_* here would only
+// arise on a (client-GET) renegotiation we never initiate, so a short write is
+// treated as fatal to avoid silently dropping the unconsumed tail.
+bool h2_write_plain_to_wire(H2ConnectionContext& ctx, const uint8_t* data, std::size_t len) {
+  if (!ctx.use_tls) {
+    return h2_queue_wire_bytes(ctx, data, len);
+  }
+#ifdef SAMURAI_WITH_OPENSSL
+  if (ctx.ssl == nullptr) {
+    ctx.transport_error = 1;
+    return false;
+  }
+  std::size_t off = 0;
+  while (off < len) {
+    const int w = SSL_write(
+        ctx.ssl, data + off,
+        static_cast<int>(std::min<std::size_t>(
+            len - off, static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+    if (w > 0) {
+      off += static_cast<std::size_t>(w);
+      continue;
+    }
+    const int err = SSL_get_error(ctx.ssl, w);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+      (void)h2_custom_flush_tls_wbio(ctx);
+      ctx.transport_error = 1;
+      errno = EAGAIN;
+      return false;
+    }
+    ctx.transport_error = 1;
+    return false;
+  }
+  return h2_custom_flush_tls_wbio(ctx);
+#else
+  (void)data;
+  (void)len;
+  ctx.transport_error = 1;
+  return false;
+#endif
+}
+
+// Progress the TLS handshake (if any) and drain every byte nghttp2 wants to send
+// into the wire buffer / tcpdp. Returns false only on a fatal protocol/transport
+// error; a still-pending handshake returns true (nothing to send yet).
+bool h2_pump_outbound(H2ClientSession& client) {
+  if (client.session == nullptr) {
+    return false;
+  }
+  H2ConnectionContext& ctx = client.ctx;
+#ifdef SAMURAI_WITH_OPENSSL
+  if (ctx.use_tls) {
+    const bool handshake_ready = h2_custom_advance_tls(ctx);
+    if (ctx.transport_error != 0) {
+      return false;
+    }
+    if (!handshake_ready) {
+      return true;  // waiting on more inbound handshake bytes
     }
   }
+#endif
+  for (;;) {
+    const uint8_t* buf = nullptr;
+    const ssize_t n = nghttp2_session_mem_send(client.session, &buf);
+    if (n < 0) {
+      ctx.protocol_error = 1;
+      return false;
+    }
+    if (n == 0) {
+      break;
+    }
+    if (!h2_write_plain_to_wire(ctx, buf, static_cast<std::size_t>(n))) {
+      return false;
+    }
+  }
+  return true;
+}
 
-  if (ctx.protocol_error == 0 && ctx.transport_error == 0 &&
-      (((events & (EPOLLIN | EPOLLERR | EPOLLHUP)) != 0) ||
-       (allow_read_without_event && !ctx.active_streams.empty()))) {
-    unsigned char read_buf[16384];
-    while (true) {
-      const ssize_t rd = h2_socket_read(ctx, read_buf, sizeof(read_buf));
+// Feed inbound wire bytes (already appended to ctx.read_buffer -- ciphertext
+// under TLS, plaintext otherwise) into nghttp2. Under TLS this decrypts through
+// the memory-BIO first. Returns false on a fatal error.
+bool h2_ingest_inbound(H2ClientSession& client) {
+  if (client.session == nullptr) {
+    return false;
+  }
+  H2ConnectionContext& ctx = client.ctx;
+  if (ctx.use_tls) {
+#ifdef SAMURAI_WITH_OPENSSL
+    const bool handshake_ready = h2_custom_advance_tls(ctx);
+    if (ctx.transport_error != 0) {
+      return false;
+    }
+    if (!handshake_ready) {
+      return true;  // handshake still in flight
+    }
+    unsigned char plain[16384];
+    for (;;) {
+      const int rd = SSL_read(ctx.ssl, plain, static_cast<int>(sizeof(plain)));
       if (rd > 0) {
-        if (nghttp2_session_mem_recv(client.session, read_buf, static_cast<size_t>(rd)) < 0) {
+        if (nghttp2_session_mem_recv(
+                client.session, plain, static_cast<std::size_t>(rd)) < 0) {
           ctx.protocol_error = 1;
-          break;
+          return false;
         }
         continue;
       }
-      if (rd == 0) {
+      const int err = SSL_get_error(ctx.ssl, rd);
+      if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        break;
+      }
+      if (err == SSL_ERROR_ZERO_RETURN) {
         if (!ctx.active_streams.empty()) {
           ctx.transport_error = 1;
         }
         break;
       }
-      if (errno == EINTR) {
-        continue;
-      }
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        break;
-      }
       ctx.transport_error = 1;
-      break;
+      return false;
     }
+    return ctx.transport_error == 0;
+#else
+    ctx.transport_error = 1;
+    return false;
+#endif
   }
+  if (!ctx.read_buffer.empty()) {
+    if (nghttp2_session_mem_recv(
+            client.session,
+            reinterpret_cast<const uint8_t*>(ctx.read_buffer.data()),
+            ctx.read_buffer.size()) < 0) {
+      ctx.protocol_error = 1;
+      return false;
+    }
+    ctx.read_buffer.clear();
+  }
+  return true;
+}
 
+// Drain the pending wire buffer to a kernel socket with non-blocking send()
+// (epoll reactor). The io_uring reactor drains the same buffer with ring Send
+// SQEs instead and never calls this. Returns false on a fatal transport error.
+bool h2_flush_out_buffer_syscall(H2ClientSession& client) {
+  H2ConnectionContext& ctx = client.ctx;
+  while (client.uring_out_offset < client.uring_out_buffer.size()) {
+    const ssize_t wr = ::send(
+        ctx.fd,
+        client.uring_out_buffer.data() + client.uring_out_offset,
+        client.uring_out_buffer.size() - client.uring_out_offset,
+        MSG_NOSIGNAL);
+    if (wr > 0) {
+      client.uring_out_offset += static_cast<std::size_t>(wr);
+      continue;
+    }
+    if (wr < 0 && (errno == EINTR)) {
+      continue;
+    }
+    if (wr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      break;  // socket buffer full; retry on next wakeup
+    }
+    ctx.transport_error = 1;
+    return false;
+  }
+  if (client.uring_out_offset >= client.uring_out_buffer.size()) {
+    client.uring_out_buffer.clear();
+    client.uring_out_offset = 0;
+  }
+  return true;
+}
+
+// Shared post-I/O finalize: error teardown, GOAWAY drain, idle bookkeeping.
+// Returns true when the session was torn down (caller must stop touching it).
+bool h2_finalize_session_io(
+    NativeRuntime& runtime,
+    const Profile& profile,
+    ShardState& shard,
+    NativeRuntime::LocalShard& local_shard,
+    H2ClientSession& client) {
+  H2ConnectionContext& ctx = client.ctx;
+  const long long now_ms = monotonic_ms_now();
   if (ctx.transport_error || ctx.protocol_error) {
     const int outstanding =
         static_cast<int>(client.pending_requests.size() + ctx.active_streams.size());
@@ -1244,7 +1385,7 @@ void service_h2_session_io(
     ctx.expectation_failures += outstanding;
     client.pending_requests.clear();
     client.consecutive_failures += 1;
-    client.unhealthy_until_ms = monotonic_ms_now() + std::max(1, profile.timeout_ms / 4);
+    client.unhealthy_until_ms = now_ms + std::max(1, profile.timeout_ms / 4);
     shard.connection_pool.active_connections =
         std::max(0, shard.connection_pool.active_connections - 1);
     if (!is_custom_tcp_backend(ctx.transport_backend) && client.ctx.fd >= 0) {
@@ -1253,11 +1394,8 @@ void service_h2_session_io(
     unregister_custom_tcp_h2_flow_binding(runtime, client);
     close_h2_client_session(client);
     local_shard.dispatch_ready_ms = client.unhealthy_until_ms;
-    return;
+    return true;
   }
-
-  (void)local_shard;
-
   if (ctx.goaway > 0 && ctx.active_streams.empty()) {
     client.drain_evictions += 1;
     client.replacement_mode = H2LaneReplacementMode::ReplaceNow;
@@ -1270,9 +1408,8 @@ void service_h2_session_io(
     unregister_custom_tcp_h2_flow_binding(runtime, client);
     close_h2_client_session(client);
     local_shard.dispatch_ready_ms = now_ms;
-    return;
+    return true;
   }
-
   client.idle_deadline_ms = now_ms + std::max(1, profile.timeout_ms);
   if (!client.pending_requests.empty() || !ctx.active_streams.empty()) {
     client.dispatch_ready_ms = now_ms;
@@ -1280,6 +1417,91 @@ void service_h2_session_io(
     client.dispatch_ready_ms = now_ms;
     client.active_since_ms = 0;
   }
+  return false;
+}
+
+void service_h2_session_io(
+    NativeRuntime& runtime,
+    const Profile& profile,
+    ShardState& shard,
+    NativeRuntime::LocalShard& local_shard,
+    H2ClientSession& client,
+    uint32_t events,
+    bool allow_read_without_event) {
+  if (!client.ready || client.ctx.fd < 0 || client.session == nullptr) {
+    return;
+  }
+
+  H2ConnectionContext& ctx = client.ctx;
+  ctx.epoll_fd = shard.epoll_fd;
+
+  // Submit new requests and serialize all pending output onto the wire buffer
+  // (TLS handshake is advanced inside the pump). Then drain that buffer to the
+  // kernel socket; custom-tcp routes through tcpdp inside the pump itself.
+  h2_pull_pending_requests(local_shard, client, profile);
+  if (ctx.protocol_error == 0 && ctx.transport_error == 0) {
+    h2_pump_outbound(client);
+  }
+  if (ctx.transport_error == 0) {
+    if (is_custom_tcp_backend(ctx.transport_backend)) {
+      h2_flush_out_buffer_tcpdp(client);
+    } else {
+      h2_flush_out_buffer_syscall(client);
+    }
+  }
+
+  // Read inbound bytes and feed nghttp2. For custom-tcp, ctx.read_buffer is
+  // already populated by the tcpdp rx handler; for kernel sockets we pull it
+  // here with non-blocking recv(). A handshake still in flight also needs to
+  // read even before any stream is open.
+  const bool want_read =
+      ((events & (EPOLLIN | EPOLLERR | EPOLLHUP)) != 0) ||
+      (allow_read_without_event &&
+       (!ctx.active_streams.empty() || (ctx.use_tls && !ctx.tls_handshake_complete) ||
+        is_custom_tcp_backend(ctx.transport_backend)));
+  if (ctx.protocol_error == 0 && ctx.transport_error == 0 && want_read) {
+    if (!is_custom_tcp_backend(ctx.transport_backend)) {
+      unsigned char rb[16384];
+      while (true) {
+        const ssize_t rd = ::recv(ctx.fd, rb, sizeof(rb), 0);
+        if (rd > 0) {
+          ctx.read_buffer.append(reinterpret_cast<const char*>(rb), static_cast<std::size_t>(rd));
+          continue;
+        }
+        if (rd == 0) {
+          if (!ctx.active_streams.empty()) {
+            ctx.transport_error = 1;
+          }
+          break;
+        }
+        if (errno == EINTR) {
+          continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          break;
+        }
+        ctx.transport_error = 1;
+        break;
+      }
+    }
+    if (ctx.transport_error == 0) {
+      h2_ingest_inbound(client);
+    }
+    // Inbound frames (settings, window updates, responses) may have queued more
+    // output; flush it before finalizing.
+    if (ctx.protocol_error == 0 && ctx.transport_error == 0) {
+      h2_pump_outbound(client);
+      if (ctx.transport_error == 0) {
+        if (is_custom_tcp_backend(ctx.transport_backend)) {
+          h2_flush_out_buffer_tcpdp(client);
+        } else {
+          h2_flush_out_buffer_syscall(client);
+        }
+      }
+    }
+  }
+
+  h2_finalize_session_io(runtime, profile, shard, local_shard, client);
 }
 
 #endif  // SAMURAI_WITH_NGHTTP2
