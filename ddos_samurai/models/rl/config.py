@@ -70,6 +70,23 @@ class RLConfig:
     ban_state_features: bool = False
     ban_ewma_alpha: float = 0.5
 
+    # Flow-level (IPS/NSM) state: expose per-window connection-layer defense
+    # reactions that a HTTP-status-only state cannot see — an inline IPS (Suricata,
+    # conntrack) drops/resets packets rather than returning 429/403, so the signal
+    # lives in the userspace-TCP counters (tcp_peer_rst / connect_timeout /
+    # retransmit / timeout_close), each normalized per connection-attempt. These are
+    # only meaningful when the load is driven over a flow-capable transport
+    # (custom_tcp / dpdk / af_xdp / af_packet); the kernel-socket path does not
+    # expose them, so on a kernel_socket (or transport-less legacy) corpus they are
+    # masked. Appended AFTER the ban features as 5 dims: four flow rates then ONE
+    # shared flow_known bit (the four are known-or-unknown together, gated by the
+    # transport — unlike the base ratios they cannot be independently unknown). The
+    # shared bit also keeps the width unambiguous (5 doesn't collide with the
+    # block/ban combos, so the serving decoder can still recover which groups are on).
+    flow_state_features: bool = False
+    # Transports whose userspace TCP stack actually measures the flow counters.
+    flow_capable_transports: tuple[str, ...] = ("custom_tcp", "dpdk", "af_xdp", "af_packet")
+
     # Reward shaping.
     lambda_slo: float = 2.0
     step_cost: float = 0.02
@@ -103,8 +120,9 @@ class RLConfig:
 
     @property
     def state_dim(self) -> int:
-        """Full policy input width: extractor output + block features + ban features."""
-        return self.feature_count + self.block_feature_count + self.ban_feature_count
+        """Full policy input width: extractor + block + ban + flow features."""
+        return (self.feature_count + self.block_feature_count
+                + self.ban_feature_count + self.flow_feature_count)
 
     @property
     def block_feature_count(self) -> int:
@@ -132,6 +150,26 @@ class RLConfig:
     def ban_feature_names(self) -> tuple[str, ...]:
         """Names for the appended ban features, in wire order: pressure then known."""
         return ("ban_pressure", "ban_known") if self.ban_state_features else ()
+
+    @property
+    def flow_feature_count(self) -> int:
+        """Extra state dims from the flow-level IPS memory: four flow rates + one
+        shared known bit (5), 0 when disabled. Appended AFTER the ban features so
+        older (flow-less) policies keep their exact input width."""
+        return 5 if self.flow_state_features else 0
+
+    def flow_feature_names(self) -> tuple[str, ...]:
+        """Names for the appended flow features, in wire order: the four rates then
+        the single shared known bit."""
+        if not self.flow_state_features:
+            return ()
+        return (
+            "rst_rate",
+            "connect_timeout_rate",
+            "retransmit_rate",
+            "timeout_close_rate",
+            "flow_known",
+        )
 
     @property
     def maskable_features(self) -> tuple[str, ...]:

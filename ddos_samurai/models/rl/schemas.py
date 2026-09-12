@@ -65,6 +65,38 @@ class DefenseSignals:
         v = self.raw.get("h2_stream_reset_ratio")
         return UNKNOWN if v is None else v
 
+    def _flow_rate(self, count_key: str) -> float:
+        """A userspace-TCP flow counter normalized per connection-attempt. UNKNOWN
+        when the counter or l7_conn_attempted is absent (kernel-socket path). Note
+        the counter can be present-but-zero on a flow-capable transport (a clean
+        window under an IPS that did not react) — that is a real 0, not unknown; the
+        transport-gated shared known bit (set in the dataset) distinguishes the two."""
+        num = self.raw.get(count_key)
+        att = self.raw.get("l7_conn_attempted")
+        if num is None or att is None or att <= 0.0:
+            return UNKNOWN
+        return num / att
+
+    @property
+    def rst_rate(self) -> float:
+        """Peer/IPS RST injections per connection-attempt (active reset)."""
+        return self._flow_rate("tcp_peer_rst_count")
+
+    @property
+    def connect_timeout_rate(self) -> float:
+        """SYN-drop / blackhole: connections that never established, per attempt."""
+        return self._flow_rate("tcp_connect_timeout_count")
+
+    @property
+    def retransmit_rate(self) -> float:
+        """Mid-flow packet loss / throttling, per connection-attempt."""
+        return self._flow_rate("tcp_retransmit_count")
+
+    @property
+    def timeout_close_rate(self) -> float:
+        """Idle/forced connection closes, per connection-attempt."""
+        return self._flow_rate("tcp_timeout_close_count")
+
 
 @dataclass(frozen=True)
 class Action:
@@ -163,6 +195,7 @@ class Transition:
     run_id: str
     win: int
     ts_ms: int
+    transport: str  # dataplane backend for this run; "" (legacy) => flow-incapable
     strategy: str
     min_rps: float
     max_rps: float
@@ -184,6 +217,7 @@ class Transition:
             run_id=str(o.get("run_id", "")),
             win=int(o.get("win", 0)),
             ts_ms=int(o.get("ts_ms", 0)),
+            transport=str(o.get("transport", "")),
             strategy=str(o.get("strategy", "aimd")),
             min_rps=float(o.get("min_rps", 0.0)),
             max_rps=float(o.get("max_rps", 0.0)),

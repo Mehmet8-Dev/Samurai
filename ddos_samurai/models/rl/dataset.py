@@ -20,7 +20,7 @@ from .action_spec import RPS_ONLY, ActionSpec
 from .config import RLConfig
 from .features import DefaultFeatureExtractor, FeatureExtractor
 from .reward import RewardFn, SloProgressReward
-from .schemas import Transition
+from .schemas import RawState, Transition
 
 
 @dataclass(frozen=True)
@@ -138,6 +138,8 @@ def build_dataset(
     n_variant = cfg.request_variant_count
     use_ban = cfg.ban_state_features
     ban_alpha = cfg.ban_ewma_alpha
+    use_flow = cfg.flow_state_features
+    flow_capable_transports = set(cfg.flow_capable_transports)
 
     def _encode_block(best: list[float]) -> np.ndarray:
         # [block ratios..., known bits...]: ratio = 1 - best (impute 0 if unseen),
@@ -153,6 +155,25 @@ def build_dataset(
         # observed), known = 1 once a conn_drop sample has folded in this episode.
         pressure = ewma if ewma >= 0.0 else cfg.impute_value
         return np.asarray([pressure, 1.0 if ewma >= 0.0 else 0.0], dtype=np.float32)
+
+    def _encode_flow(s: RawState, capable: bool) -> np.ndarray:
+        # [rst, connect_timeout, retransmit, timeout_close, flow_known]. The four
+        # rates are per-connection-attempt; imputed to 0 when unknown. The single
+        # shared known bit is 1 only on a flow-capable transport that produced a
+        # usable measurement (>=1 rate computable) — on kernel_socket / legacy
+        # (transport-less) corpus it is 0, so the policy learns to ignore the zeros.
+        d = s.defense
+        rates = [d.rst_rate, d.connect_timeout_rate, d.retransmit_rate, d.timeout_close_rate]
+        # When the transport can't measure flow the whole group is unknown: impute the
+        # values to 0 AND clear the known bit (mask convention). Otherwise impute only
+        # the individually-missing rates.
+        if capable:
+            vals = [cfg.impute_value if r < 0.0 else r for r in rates]
+            known = 1.0 if any(r >= 0.0 for r in rates) else 0.0
+        else:
+            vals = [cfg.impute_value] * 4
+            known = 0.0
+        return np.asarray(vals + [known], dtype=np.float32)
 
     def _fold_ban(ewma: float, conn_drop: float) -> float:
         # Persistence-weighted EWMA of conn_drop: a sustained ban stays elevated, a
@@ -188,6 +209,13 @@ def build_dataset(
                 s2_ban = _encode_ban(ban_ewma)
                 s_vec = np.concatenate([s_vec, s_ban])
                 s2_vec = np.concatenate([s2_vec, s2_ban])
+            if use_flow:
+                # Per-window flow-level reaction (no cross-window fold; unlike ban
+                # this is the instantaneous connection-layer signal). Known bit is
+                # gated by the run's transport. Appended AFTER the ban features.
+                capable = t.transport in flow_capable_transports
+                s_vec = np.concatenate([s_vec, _encode_flow(t.s, capable)])
+                s2_vec = np.concatenate([s2_vec, _encode_flow(t.s2, capable)])
             s_list.append(s_vec)
             s2_list.append(s2_vec)
             a_list.append([t.action.value(action_spec.field_of(n)) for n in action_spec.names])
@@ -198,7 +226,8 @@ def build_dataset(
             eid_list.append(eid)
 
     dim = (extractor.dim + (cfg.block_feature_count if use_block else 0)
-           + (cfg.ban_feature_count if use_ban else 0))
+           + (cfg.ban_feature_count if use_ban else 0)
+           + (cfg.flow_feature_count if use_flow else 0))
     a_dim = action_spec.dim
     if s_list:
         states = np.stack(s_list).astype(np.float32)
@@ -250,7 +279,8 @@ def build_dataset(
         feature_names=tuple(cfg.feature_names)
         + (tuple(f"{n}_known" for n in cfg.maskable_features) if cfg.mask_unknown else ())
         + (cfg.block_feature_names() if use_block else ())
-        + (cfg.ban_feature_names() if use_ban else ()),
+        + (cfg.ban_feature_names() if use_ban else ())
+        + (cfg.flow_feature_names() if use_flow else ()),
         normalizer=Normalizer.fit(states) if len(states) else Normalizer(
             mean=np.zeros(dim, dtype=np.float32), std=np.ones(dim, dtype=np.float32)
         ),
