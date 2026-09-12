@@ -232,3 +232,42 @@ orkestratör script'i versiyonlanır.
 # tekrar üretim (9 profil de ayakta ve /healthz=200 olmalı)
 CAP_MIN=37 bash deploy/waf-lab/train-run-8profile.sh
 ```
+
+### 8.1 Canlı A/B doğrulaması (champion-challenger)
+
+8-profil FF ağırlığı canlı on-policy A/B'ye sokuldu (static rate-drop r150 :8085,
+4 rep serpiştirilmiş, `CL_SLO_MAX_PUSHBACK_PCT=20` → 429 = SLO ihlali):
+
+| Kol | eff_mean | CI90 | served/s | slo_ok |
+|-----|----------|------|----------|--------|
+| AIMD | -0.326 | [-0.327, -0.325] | 31.6 | 33.3% |
+| FF   | -0.109 | [-0.110, -0.109] | 25.4 | 50.0% |
+| RL²  | -0.110 | [-0.110, -0.110] | 25.4 | 50.0% |
+
+- **FF − AIMD = +0.216**, CI90 [+0.216, +0.217] → sıfırı net geçti: **FF promote**.
+- **FF ≈ RL²** (Δ −0.001) → FF ship kararı korunur.
+- **Nüans:** FF'in *ham* served/s'i AIMD'den düşük (25.4 < 31.6) ama *effective*
+  throughput'u yüksek — AIMD rate duvarını zorlayıp 429 cezası yerken (SLO %33),
+  FF honored tavanın altında parkedip SLO'yu %50'ye çıkarıyor. Eğitim objektifi
+  tam da bu (SLO-güvenli served), OPE değil canlı A/B promote eder.
+
+```bash
+REPS=4 SHIFT=0 STATIC_PORT=8085 CL_SLO_MAX_PUSHBACK_PCT=20 bash deploy/waf-lab/ab-live.sh
+```
+
+### 8.2 Kapsam sınırı: Cloudflare / Suricata'ya hazır mı?
+
+Bu FF dokuz profil gördü ama hepsi tek sınıftan: **L7 HTTP-status savunmaları**
+(WAF 403 + rate 429/503 + PoW challenge), hepsi **kernel_socket** ile. Dolayısıyla:
+
+- **Cloudflare** — WAF/rate katmanı FF'in gördüğü sınıfla aynı, kısmen transfer
+  eder; ama JS/managed-challenge + bot-fingerprint için **sinyal yok** (bizim
+  "challenge" feature'ı expectation_failures türevi, gerçek CF challenge'ı değil),
+  ayrıca public target → rıza + `--allow-public-target` şart. → veri+rıza boşluğu.
+- **Suricata / IPS** — imza flow/paket seviyesinde (RST/drop). Flow sinyalleri
+  20-feature serving vektöründe **yok** ve tüm eğitim kernel_socket (bu sayaçlar 0)
+  → IPS reaksiyonu state'e ulaşmıyor. Çözüm "daha çok profil" değil: **custom_tcp
+  capture + flow sinyallerini serving vektörüne bağlamak** (SRLP in_dim değişir).
+
+Lab sınıfı (Coraza/ModSec/nginx-rate) hazır; CF challenge ve IPS için yeni
+sinyal/transport gerekir.
