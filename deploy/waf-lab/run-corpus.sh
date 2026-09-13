@@ -23,6 +23,12 @@ TARGET_HOST="${TARGET_HOST:-127.0.0.1}"
 # IPS/NSM features consume; kernel_socket does not. Recorded in the corpus so the
 # offline pipeline can gate those features by transport.
 TRANSPORT="${TRANSPORT:-kernel_socket}"
+# The L7 worker job is a fixed BINARY envelope (JobEnvelopeV2) with no transport
+# field, so the master's --transport only LABELS the corpus — it does not reach the
+# worker's datapath. The worker's real transport knob is the SAMURAI_L7_TRANSPORT
+# env, which slave-spawned shard workers inherit. Export it here so --transport is
+# actually honored end-to-end (otherwise custom_tcp silently runs on kernel_socket).
+export SAMURAI_L7_TRANSPORT="$TRANSPORT"
 CONTROL_EP="${CONTROL_EP:-tcp://127.0.0.1:5099}"
 # Defense profile (strict-waf|rate-only|waf-heavy) — selects the compose tier and
 # labels the corpus so the union is traceable. AUTO_UP=1 (re)creates the nginx/caddy

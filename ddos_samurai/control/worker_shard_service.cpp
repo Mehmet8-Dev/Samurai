@@ -53,11 +53,13 @@ void WorkerShardService::RefreshWorkerStateLocked() {
     return;
   }
   const StatusRec* latest = nullptr;
+  std::string latest_sid;
   double latest_ts = -1.0;
   for (const auto& kv : shard_status_) {
     if (kv.second.updated_ts >= latest_ts) {
       latest_ts = kv.second.updated_ts;
       latest = &kv.second;
+      latest_sid = kv.first;
     }
   }
   if (latest == nullptr) {
@@ -66,7 +68,15 @@ void WorkerShardService::RefreshWorkerStateLocked() {
     return;
   }
   worker_state_ = latest->state.empty() ? "idle" : latest->state;
-  worker_active_shard_ = latest->active_shard_id;
+  // Report WHICH shard this terminal (done/error) state belongs to — the finished
+  // shard's id (map key), not the StatusRec's active_shard_id (cleared to "" on
+  // finalize). A blank id makes a stale "done" from the PREVIOUS window match the
+  // master's probe check for the CURRENT window's shard (RunSingleJob accepts
+  // done+empty), so window N+1 is falsely completed by window N's leftover state —
+  // the multi-window closed-loop then collects no traffic. Carrying the real id
+  // keeps completion unambiguous per shard: a stale "done" carries the old sid and
+  // will not match the new window's sid, so the master correctly keeps waiting.
+  worker_active_shard_ = latest->active_shard_id.empty() ? latest_sid : latest->active_shard_id;
 }
 
 std::string WorkerShardService::FinalizeStats(const std::string& shard_id, const ShardRec& rec,

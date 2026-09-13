@@ -1353,6 +1353,15 @@ int main(int argc, char** argv) {
         bool rl_have_prev = false;
         int win = 0;
         bool cl_aborted = false;
+        // Warmup/transient dispatch race: the slave registers before its shard
+        // workers are spawned+ready, and the aggregated result of a window can
+        // occasionally miss a shard's late reply. Both surface as a zero-traffic
+        // window that is NOT a real "no workers" failure. Tolerate a bounded number
+        // of such windows by re-running the SAME setpoint (no ramp, no corpus row)
+        // before giving up — a genuinely dead worker still exhausts the budget and
+        // aborts with the same error.
+        int no_traffic_retries = 0;
+        const int kNoTrafficRetryBudget = OptInt(argc, argv, "--cl-no-traffic-retries", 8);
         samurai::control::ClosedLoopDecision dec;
         while (!g_stop.load() && guard()) {
           const double setpoint = ctl.current_setpoint();
@@ -1429,10 +1438,21 @@ int main(int argc, char** argv) {
           // is "no data", not SLO-green — treating it as green would make the
           // controller ramp forever. Abort the search with a clear error.
           if (sample.attempted <= 0.0) {
+            if (no_traffic_retries < kNoTrafficRetryBudget) {
+              ++no_traffic_retries;
+              std::fprintf(stderr,
+                           "samurai_master: closed-loop window=%d produced no traffic "
+                           "(rc=%d); retrying same setpoint (%d/%d) — workers may still "
+                           "be warming up.\n",
+                           win, res.rc, no_traffic_retries, kNoTrafficRetryBudget);
+              std::this_thread::sleep_for(std::chrono::milliseconds(500));
+              continue;
+            }
             std::fprintf(stderr,
                          "samurai_master: closed-loop window=%d produced no traffic "
-                         "(rc=%d); aborting search — check workers/dispatch.\n",
-                         win, res.rc);
+                         "(rc=%d); aborting search after %d retries — check "
+                         "workers/dispatch.\n",
+                         win, res.rc, no_traffic_retries);
             rc = 1;
             Value clj = Value::Object();
             clj.set("enabled", Value::Bool(true));
