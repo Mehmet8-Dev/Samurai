@@ -642,6 +642,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
     for (const DataplanePerfStats& sp : shard_perf) {
       runtime.perf.epoll_wakeups += sp.epoll_wakeups;
       runtime.perf.idle_evictions += sp.idle_evictions;
+      runtime.perf.request_timeouts += sp.request_timeouts;
       runtime.perf.rx_syscalls += sp.rx_syscalls;
       runtime.perf.tx_syscalls += sp.tx_syscalls;
       runtime.perf.alloc_bytes += sp.alloc_bytes;

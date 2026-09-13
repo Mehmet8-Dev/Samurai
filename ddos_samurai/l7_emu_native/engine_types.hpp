@@ -138,6 +138,7 @@ struct DataplanePerfStats {
   std::size_t epoll_wakeups{0};
   std::size_t scheduler_queue_depth_peak{0};
   std::size_t idle_evictions{0};
+  std::size_t request_timeouts{0};  // in-flight requests evicted past the response deadline
   std::size_t rx_syscalls{0};
   std::size_t tx_syscalls{0};
   std::size_t alloc_bytes{0};

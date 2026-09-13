@@ -33,6 +33,7 @@ void apply_perf_outputs(
   out["l7_epoll_wakeups"] = static_cast<double>(runtime.perf.epoll_wakeups);
   out["l7_scheduler_queue_depth_peak"] = static_cast<double>(runtime.perf.scheduler_queue_depth_peak);
   out["l7_idle_evictions"] = static_cast<double>(runtime.perf.idle_evictions);
+  out["l7_request_timeouts"] = static_cast<double>(runtime.perf.request_timeouts);
   out["l7_rx_syscalls"] = static_cast<double>(runtime.perf.rx_syscalls);
   out["l7_tx_syscalls"] = static_cast<double>(runtime.perf.tx_syscalls);
   out["l7_alloc_bytes"] = static_cast<double>(runtime.perf.alloc_bytes);
@@ -364,14 +365,32 @@ void close_http1_connection(
 
 void expire_http1_idle(
     NativeRuntime& runtime,
+    std::size_t shard_idx,
     ShardState& shard,
-    NativeRuntime::LocalShard& local_shard) {
+    NativeRuntime::LocalShard& local_shard,
+    int response_timeout_ms) {
   const long long now_ms = monotonic_ms_now();
-  for (auto& lane : local_shard.h1_lanes) {
+  for (std::size_t lane_idx = 0; lane_idx < local_shard.h1_lanes.size(); ++lane_idx) {
+    auto& lane = local_shard.h1_lanes[lane_idx];
     if (!lane || !lane->conn || lane->conn->fd < 0) {
       continue;
     }
+    // In-flight response-stall guard: a request whose reply never arrives (e.g. an
+    // inline IPS silently dropping/holding a packet, or a wedged peer) leaves the
+    // lane in Writing/Reading forever — the drive loop then spins on active_io and
+    // never completes the run. Evict it once past the per-request deadline, finalize
+    // it as a FAILED request (surfaces as an error / expectation_failure, and on the
+    // custom_tcp userspace stack as a timeout_close), and let the normal completion
+    // path close the connection so the loop can progress.
     if (lane->phase != H1LanePhase::Idle) {
+      if (response_timeout_ms > 0 && lane->request_start_ms > 0 &&
+          (now_ms - lane->request_start_ms) > response_timeout_ms) {
+        lane->phase = H1LanePhase::Failed;
+        enqueue_ready_h1_lane(runtime, shard_idx, lane_idx, *lane);
+        if (g_perf_stats != nullptr) {
+          g_perf_stats->request_timeouts += 1;
+        }
+      }
       continue;
     }
     if (lane->lane.idle_deadline_ms <= 0 || lane->lane.idle_deadline_ms > now_ms) {
@@ -421,9 +440,10 @@ void expire_http1_idle(
   local_shard.last_timer_tick_ms = now_ms;
 }
 
-void expire_all_http1_idle(NativeRuntime& runtime) {
+void expire_all_http1_idle(NativeRuntime& runtime, int response_timeout_ms) {
   for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
-    expire_http1_idle(runtime, runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
+    expire_http1_idle(runtime, shard_idx, runtime.shards[shard_idx],
+                      runtime.local_shards[shard_idx], response_timeout_ms);
   }
 }
 
@@ -458,7 +478,7 @@ void expire_h2_idle(
 #endif
 
 void expire_all_lane_idle(NativeRuntime& runtime, const Profile& profile) {
-  expire_all_http1_idle(runtime);
+  expire_all_http1_idle(runtime, profile.timeout_ms);
 #ifdef SAMURAI_WITH_NGHTTP2
   for (std::size_t shard_idx = 0; shard_idx < runtime.local_shards.size(); ++shard_idx) {
     expire_h2_idle(runtime, shard_idx, profile, runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
@@ -472,7 +492,8 @@ void expire_lane_idle_shard(NativeRuntime& runtime, const Profile& profile, std:
   if (shard_idx >= runtime.local_shards.size()) {
     return;
   }
-  expire_http1_idle(runtime, runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
+  expire_http1_idle(runtime, shard_idx, runtime.shards[shard_idx],
+                    runtime.local_shards[shard_idx], profile.timeout_ms);
 #ifdef SAMURAI_WITH_NGHTTP2
   expire_h2_idle(runtime, shard_idx, profile, runtime.shards[shard_idx], runtime.local_shards[shard_idx]);
 #else

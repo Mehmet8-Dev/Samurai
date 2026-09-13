@@ -220,9 +220,11 @@ void close_http1_connection(
     NativeRuntime::LocalShard& local_shard);
 void expire_http1_idle(
     NativeRuntime& runtime,
+    std::size_t shard_idx,
     ShardState& shard,
-    NativeRuntime::LocalShard& local_shard);
-void expire_all_http1_idle(NativeRuntime& runtime);
+    NativeRuntime::LocalShard& local_shard,
+    int response_timeout_ms);
+void expire_all_http1_idle(NativeRuntime& runtime, int response_timeout_ms);
 #ifdef SAMURAI_WITH_NGHTTP2
 void expire_h2_idle(
     NativeRuntime& runtime,
