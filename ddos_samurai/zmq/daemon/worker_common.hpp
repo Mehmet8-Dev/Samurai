@@ -103,7 +103,13 @@ inline std::vector<std::uint8_t> JsonPayloadFromStats(
 inline ddos_samurai::cpu_native::PacketConfig ConfigFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
   ddos_samurai::cpu_native::PacketConfig cfg;
   cfg.target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
+  if (cfg.target_ip.empty()) {
+    cfg.target_ip = "127.0.0.1";
+  }
   cfg.target_port = static_cast<int>(env.target_port);
+  if (cfg.target_port <= 0 || cfg.target_port > 65535) {
+    cfg.target_port = 80;
+  }
   cfg.protocol = ReadFixed(env.protocol, sizeof(env.protocol));
   if (cfg.protocol.empty()) {
     cfg.protocol = "tcp";

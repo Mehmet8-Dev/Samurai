@@ -43,13 +43,14 @@ uint32_t fast_rand32() {
 
 uint32_t rand_u32(uint32_t lo, uint32_t hi) {
   if (lo >= hi) return lo;
-  uint64_t range = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1;
+  if (lo == 0u && hi == 0xFFFFFFFFu) return fast_rand32();
+  const uint64_t range = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1ULL;
   return lo + static_cast<uint32_t>(fast_rand32() % range);
 }
 
 int rand_int(int lo, int hi) {
   if (lo >= hi) return lo;
-  uint64_t range = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1;
+  const uint64_t range = static_cast<uint64_t>(static_cast<int64_t>(hi) - static_cast<int64_t>(lo) + 1LL);
   return lo + static_cast<int>(fast_rand32() % range);
 }
 
