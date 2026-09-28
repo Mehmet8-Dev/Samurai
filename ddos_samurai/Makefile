@@ -26,7 +26,7 @@ PYTHON_LDFLAGS := $(shell $(PYTHON_CONFIG) --ldflags --embed 2>/dev/null || $(PY
 # Compiler settings
 CC := gcc
 CLANG := clang
-CFLAGS := -O2 -Wall -Wextra -fPIC -shared
+CFLAGS := -O2 -Wall -Wextra -fPIC -shared -I.
 XDP_CFLAGS := -O2 -target bpf -D__BPF_TRACING__
 
 # Source files

@@ -622,13 +622,14 @@ json::Value run_profile_json(const json::Value& profile_dict, const json::Value&
   const bool runtime_requires_custom_tcp = strict_runtime && !is_quic_profile;
   const std::string requested_transport = ToLower(profile.transport_backend);
   const std::string requested_stateful_backend = ToLower(profile.stateful_runtime_backend);
-  const bool requested_custom_tcp = requested_transport == "custom_tcp" || requested_transport == "dpdk" || requested_stateful_backend == "dpdk";
+  const bool is_dpdk_direct = requested_transport == "dpdk" || requested_transport == "dpdk_direct" || requested_stateful_backend == "dpdk";
+  const bool requested_custom_tcp = requested_transport == "custom_tcp" || is_dpdk_direct;
   const TransportBackend transport_backend =
       is_quic_profile
           ? TransportBackend::CustomQuic
           : (requested_transport == "kernel_socket"
                  ? TransportBackend::KernelSocket
-                 : ((requested_transport == "dpdk" || requested_stateful_backend == "dpdk")
+                 : (is_dpdk_direct
                         ? TransportBackend::DpdkDirect
                         : TransportBackend::CustomTcp));
 

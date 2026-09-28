@@ -114,9 +114,15 @@ inline ddos_samurai::cpu_native::PacketConfig ConfigFromEnvelope(const samurai::
   if (cfg.protocol.empty()) {
     cfg.protocol = "tcp";
   }
-  cfg.spoof = env.spoof_enabled != 0u;
+  const bool env_spoof = (std::getenv("SAMURAI_SPOOF") != nullptr && std::strcmp(std::getenv("SAMURAI_SPOOF"), "1") == 0);
+  cfg.spoof = (env.spoof_enabled != 0u) || env_spoof;
+  std::string s_mode = ReadFixed(env.spoof_mode, sizeof(env.spoof_mode));
+  if (s_mode.empty() && env_spoof) {
+    const char* sm = std::getenv("SAMURAI_SPOOF_MODE");
+    s_mode = (sm && sm[0]) ? sm : "random";
+  }
   cfg.spoof_opts = ddos_samurai::cpu_native::SpoofOptions{
-      .mode = ReadFixed(env.spoof_mode, sizeof(env.spoof_mode)),
+      .mode = s_mode,
       .subnet = [&]() -> std::optional<std::string> {
         const std::string v = ReadFixed(env.spoof_subnet, sizeof(env.spoof_subnet));
         return v.empty() ? std::nullopt : std::optional<std::string>(v);
