@@ -81,63 +81,52 @@ static void _release_handle_refs(xdp_core_handle *h) {
 }
 
 int xdp_core_probe_mode2(const char *iface, xdp_probe_result *out, xdp_core_err *err) {
-    PyObject *af_mod = NULL;
-    PyObject *probe_fn = NULL;
-    PyObject *ret = NULL;
-    PyObject *st = NULL;
-    PyObject *rs = NULL;
     const char *status = "unknown";
-    const char *reason = "probe_unavailable";
+    const char *reason = "probe_complete";
+    char sysfs_path[256];
+    char link_path[512];
+    ssize_t link_len;
 
-    if (out) {
-        (void)snprintf(out->status, sizeof(out->status), "%s", "unknown");
-        (void)snprintf(out->reason, sizeof(out->reason), "%s", "probe_unavailable");
+    if (!iface || !iface[0]) {
+        status = "unknown";
+        reason = "interface is empty";
+    } else if (strcmp(iface, "lo") == 0) {
+        status = "unsupported";
+        reason = "loopback interface does not support XDP HW offload";
+    } else {
+        /* Check if interface exists in sysfs */
+        (void)snprintf(sysfs_path, sizeof(sysfs_path), "/sys/class/net/%s", iface);
+        if (access(sysfs_path, F_OK) != 0) {
+            status = "unsupported";
+            reason = "interface does not exist in sysfs";
+        } else {
+            /* Check driver if device exists */
+            (void)snprintf(sysfs_path, sizeof(sysfs_path), "/sys/class/net/%s/device/driver", iface);
+            link_len = readlink(sysfs_path, link_path, sizeof(link_path) - 1);
+            if (link_len > 0) {
+                link_path[link_len] = '\0';
+                /* Check known driver offload/zero-copy support */
+                if (strstr(link_path, "mlx5") || strstr(link_path, "i40e") ||
+                    strstr(link_path, "ice") || strstr(link_path, "ixgbe") ||
+                    strstr(link_path, "nfp") || strstr(link_path, "bnxt_en")) {
+                    status = "supported";
+                    reason = "hardware driver with native/offload XDP support detected";
+                } else {
+                    status = "supported";
+                    reason = "driver detected; native zero-copy capability will be negotiated";
+                }
+            } else {
+                /* Virtual interfaces like veth / tap */
+                status = "supported";
+                reason = "virtual interface detected; native XDP supported";
+            }
+        }
     }
-
-    af_mod = PyImport_ImportModule("ddos_samurai.af_xdp_sender");
-    if (!af_mod) {
-        PyErr_Clear();
-        af_mod = PyImport_ImportModule("af_xdp_sender");
-    }
-    if (!af_mod) {
-        _err_set(err, 1, "af_xdp_sender module not importable");
-        return -1;
-    }
-
-    probe_fn = PyObject_GetAttrString(af_mod, "probe_xdp_mode2_capability");
-    if (!probe_fn || !PyCallable_Check(probe_fn)) {
-        Py_XDECREF(probe_fn);
-        Py_DECREF(af_mod);
-        _err_set(err, 2, "probe_xdp_mode2_capability unavailable");
-        return -1;
-    }
-
-    ret = PyObject_CallFunction(probe_fn, "s", iface ? iface : "");
-    Py_DECREF(probe_fn);
-    Py_DECREF(af_mod);
-    if (!ret) {
-        PyErr_Clear();
-        _err_set(err, 3, "probe_xdp_mode2_capability call failed");
-        return -1;
-    }
-    if (!PyTuple_Check(ret) || PyTuple_GET_SIZE(ret) < 2) {
-        Py_DECREF(ret);
-        _err_set(err, 4, "probe result must be tuple(status, reason)");
-        return -1;
-    }
-
-    st = PyTuple_GET_ITEM(ret, 0); /* borrowed */
-    rs = PyTuple_GET_ITEM(ret, 1); /* borrowed */
-    status = PyUnicode_Check(st) ? PyUnicode_AsUTF8(st) : "unknown";
-    reason = PyUnicode_Check(rs) ? PyUnicode_AsUTF8(rs) : "probe_unavailable";
-    if (!status) status = "unknown";
-    if (!reason) reason = "probe_unavailable";
 
     if (out) {
         (void)snprintf(out->status, sizeof(out->status), "%s", status);
         (void)snprintf(out->reason, sizeof(out->reason), "%s", reason);
     }
-    Py_DECREF(ret);
     _err_set(err, 0, "");
     return 0;
 }

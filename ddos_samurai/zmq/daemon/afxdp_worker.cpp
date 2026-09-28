@@ -1,17 +1,22 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cctype>
 #include <cstdlib>
+#include <deque>
+#include <dirent.h>
 #include <dlfcn.h>
-#include <unistd.h>
 #include <exception>
 #include <iostream>
 #include <optional>
+#include <pthread.h>
 #include <string>
+#include <sys/types.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include <zmq.h>
@@ -52,55 +57,175 @@ struct XdpNativeBridge {
   std::string lib_path;
 };
 
-struct XdpCtxGuard {
+// Çoklu veya tekli XDP bağlamlarının güvenli temizlenmesi
+struct XdpMultiCtxGuard {
   XdpNativeBridge* bridge{nullptr};
-  int handle{-1};
-  ~XdpCtxGuard() {
-    if (bridge && bridge->api && handle > 0 && bridge->api->destroy_ctx) {
+  std::vector<int> handles;
+
+  void add(int h) {
+    if (h > 0) handles.push_back(h);
+  }
+
+  ~XdpMultiCtxGuard() {
+    if (bridge && bridge->api && bridge->api->destroy_ctx) {
       char err[160];
-      err[0] = '\0';
-      (void)bridge->api->destroy_ctx(handle, err, sizeof(err));
+      for (int h : handles) {
+        if (h > 0) {
+          err[0] = '\0';
+          (void)bridge->api->destroy_ctx(h, err, sizeof(err));
+        }
+      }
     }
   }
 };
 
-// AF_XDP taşıma shim'i: paylaşılan StatefulFastpathDriver'ı mevcut dlopen'lı native
-// vtable (send_buffer_strided / recv_frames) üzerine oturtur. RX ingest (SYN-ACK
-// besleme) recv_frames'e bağlıdır; vtable'da yoksa half-duplex'e düşer (handshake
-// tamamlanamaz) — sürücü bunu raporlar, asmaz.
-struct XdpShim : samurai::daemon::FastpathTxRxShim {
-  xdp_native_api_v1* api{nullptr};
-  int handle{-1};
+// Ağ kartının donanımsal RX/TX kuyruk sayısını sysfs üzerinden dinamik tespit eder
+int DetectInterfaceQueues(const std::string& iface) {
+  if (iface.empty()) return 1;
+  const std::string qpath = "/sys/class/net/" + iface + "/queues";
+  DIR* d = opendir(qpath.c_str());
+  if (!d) return 1;
+  int count = 0;
+  struct dirent* de = nullptr;
+  while ((de = readdir(d)) != nullptr) {
+    if (std::strncmp(de->d_name, "tx-", 3) == 0) {
+      count++;
+    }
+  }
+  closedir(d);
+  return count > 0 ? count : 1;
+}
 
-  XdpShim(xdp_native_api_v1* a, int h) : api(a), handle(h) {}
+// AF_XDP çoklu kuyruk taşıma shim'i:
+// Tek veya çoklu kuyrukları (RSS demux) StatefulFastpathDriver üzerine oturtur.
+// Send kuyruklar arasında round-robin dağıtım yapar; Recv ise tüm kuyruk soketlerini
+// sırayla yoklayarak (fair polling) SYN-ACK'leri donanım RSS hangi kuyruğa atmışsa
+// oradan toplar.
+struct XdpMultiShim : samurai::daemon::FastpathTxRxShim {
+  xdp_native_api_v1* api{nullptr};
+  std::vector<int> handles;
+  std::size_t send_rr{0};
+  std::size_t recv_rr{0};
+
+  XdpMultiShim(xdp_native_api_v1* a, const std::vector<int>& h)
+      : api(a), handles(h) {}
 
   int Send(const std::uint8_t* base, std::size_t psize, std::size_t stride,
            std::uint32_t count, std::string& err) override {
-    if (!api || !api->send_buffer_strided) {
+    if (!api || !api->send_buffer_strided || handles.empty()) {
       err = "xdp_send_buffer_strided_missing";
       return -1;
     }
+    const int h = handles[send_rr % handles.size()];
+    send_rr++;
     char xdp_err[160];
     xdp_err[0] = '\0';
     const int sent = api->send_buffer_strided(
-        handle, base, static_cast<int>(psize), static_cast<int>(stride),
+        h, base, static_cast<int>(psize), static_cast<int>(stride),
         static_cast<int>(count), xdp_err, sizeof(xdp_err));
     if (sent < 0 && xdp_err[0]) err = xdp_err;
     return sent;
   }
+
   int Recv(std::uint8_t* out, std::uint16_t stride, std::uint16_t* lens,
            std::uint16_t max, std::string& err) override {
-    if (!api || !api->recv_frames) return 0;  // half-duplex: RX yok
-    char xdp_err[160];
-    xdp_err[0] = '\0';
-    const int n = api->recv_frames(
-        handle, out, static_cast<int>(stride), lens, static_cast<int>(max),
-        static_cast<int>(stride), xdp_err, sizeof(xdp_err));
-    if (n < 0 && xdp_err[0]) err = xdp_err;
-    return n;
+    if (!api || !api->recv_frames || handles.empty()) return 0;
+    int total_recvd = 0;
+    const std::size_t n_handles = handles.size();
+    for (std::size_t i = 0; i < n_handles && total_recvd < max; ++i) {
+      const std::size_t idx = (recv_rr + i) % n_handles;
+      const int h = handles[idx];
+      const int remaining = max - total_recvd;
+      std::uint8_t* curr_out = out + (static_cast<std::size_t>(total_recvd) * stride);
+      std::uint16_t* curr_lens = lens + total_recvd;
+      char xdp_err[160];
+      xdp_err[0] = '\0';
+      const int n = api->recv_frames(
+          h, curr_out, static_cast<int>(stride), curr_lens, remaining,
+          static_cast<int>(stride), xdp_err, sizeof(xdp_err));
+      if (n > 0) {
+        total_recvd += n;
+      } else if (n < 0 && xdp_err[0] && err.empty()) {
+        err = xdp_err;
+      }
+    }
+    recv_rr = (recv_rr + 1) % n_handles;
+    return total_recvd;
   }
-  bool RxAvailable() const override { return api && api->recv_frames; }
+
+  bool RxAvailable() const override {
+    return api && api->recv_frames && !handles.empty();
+  }
 };
+
+// Çoklu kuyruk stateless TX worker thread yapısı (DPDK ile eşdeğer çoklu çekirdek mimarisi)
+struct XdpTxWorkerThread {
+  std::thread th;
+  int queue_id{0};
+  int cpu_core{-1};
+  int handle{-1};
+  std::atomic<std::uint64_t> packets_sent{0};
+  std::atomic<std::uint64_t> packets_errors{0};
+  std::atomic<std::uint64_t> bytes_sent{0};
+  std::atomic<std::uint64_t> sleep_calls{0};
+  std::atomic<bool> done{false};
+};
+
+void xdp_tx_thread_func(XdpTxWorkerThread* tw, xdp_native_api_v1* api,
+                        const std::uint8_t* pool_data, std::size_t pool_len,
+                        std::size_t stride, int start, int end,
+                        int batch_size, samurai_pacing_config_t pace_cfg) {
+  if (tw->cpu_core >= 0) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(tw->cpu_core, &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+  }
+
+  samurai_pacing_state_t st{};
+  samurai_pacing_init(&st, &pace_cfg);
+
+  const int effective_batch = std::max(1, std::min(batch_size, 64));
+  int i = start;
+  char xdp_err[160];
+  while (i < end) {
+    samurai_pacing_wait_next(&st, &pace_cfg);
+    int batch = std::min(effective_batch, end - i);
+    const std::size_t off = static_cast<std::size_t>(i) * stride;
+    if (off + static_cast<std::size_t>(batch) * stride > pool_len) {
+      const std::size_t avail = pool_len > off ? (pool_len - off) / stride : 0;
+      batch = static_cast<int>(std::min<std::size_t>(batch, avail));
+    }
+    if (batch <= 0) break;
+
+    const std::uint8_t* buf = pool_data + off;
+    xdp_err[0] = '\0';
+    int sent = 0;
+    if (api->send_buffer_strided) {
+      sent = api->send_buffer_strided(
+          tw->handle, buf, static_cast<int>(stride), static_cast<int>(stride),
+          batch, xdp_err, sizeof(xdp_err));
+    } else {
+      sent = api->send_buffer(
+          tw->handle, buf, static_cast<int>(stride),
+          batch, xdp_err, sizeof(xdp_err));
+    }
+
+    if (sent > 0) {
+      tw->packets_sent.fetch_add(sent, std::memory_order_relaxed);
+      tw->bytes_sent.fetch_add(sent * static_cast<std::uint64_t>(stride), std::memory_order_relaxed);
+      i += sent;
+    } else if (sent == 0) {
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    } else {
+      tw->packets_errors.fetch_add(batch, std::memory_order_relaxed);
+      i += batch;
+    }
+  }
+
+  tw->sleep_calls.store(st.sleep_calls, std::memory_order_relaxed);
+  tw->done.store(true, std::memory_order_release);
+}
 
 
 
@@ -207,7 +332,8 @@ std::vector<std::uint8_t> JsonDone(
     double actual_rps,
     double rate_accuracy_pct,
     int xdp_mode_effective,
-    int xdp_queue_id) {
+    int xdp_queue_id,
+    int xdp_num_queues = 1) {
   const std::string json =
       "{\"status\":\"ok\",\"worker_kind\":\"afxdp\",\"correlation_id\":" +
       std::to_string(correlation_id) +
@@ -219,7 +345,8 @@ std::vector<std::uint8_t> JsonDone(
       ",\"rate_accuracy_pct\":" + std::to_string(rate_accuracy_pct) +
       ",\"xdp_mode_effective\":" + std::to_string(xdp_mode_effective) +
       ",\"xdp_queue_id\":" + std::to_string(xdp_queue_id) +
-      ",\"note\":\"xdp_native_api+cpu_native+pacing_static\"}";
+      ",\"xdp_num_queues\":" + std::to_string(xdp_num_queues) +
+      ",\"note\":\"xdp_native_api+multi_queue+cpu_native+pacing_static\"}";
   return std::vector<std::uint8_t>(json.begin(), json.end());
 }
 
@@ -237,6 +364,7 @@ int main(int argc, char** argv) {
   bool bind_jobs = true;
   bool bind_events = false;
   int cli_queue_id = -1;
+  int cli_num_queues = -1;
   int cli_mode = -1;
   int cli_batch_size = 2048;
   std::string cli_iface;
@@ -255,6 +383,8 @@ int main(int argc, char** argv) {
       cli_iface = argv[++i];
     } else if (arg == "--xdp-queue-id" && i + 1 < argc) {
       cli_queue_id = std::stoi(argv[++i]);
+    } else if ((arg == "--xdp-queues" || arg == "--xdp-tx-queues" || arg == "--xdp-num-queues") && i + 1 < argc) {
+      cli_num_queues = std::max(1, std::stoi(argv[++i]));
     } else if (arg == "--xdp-mode" && i + 1 < argc) {
       cli_mode = std::stoi(argv[++i]);
     } else if (arg == "--xdp-batch-size" && i + 1 < argc) {
@@ -413,16 +543,50 @@ int main(int argc, char** argv) {
           continue;
         }
 
+        const int iface_max_queues = DetectInterfaceQueues(iface);
+        int requested_queues = 1;
+        if (cli_num_queues > 0) {
+          requested_queues = cli_num_queues;
+        } else if (std::getenv("SAMURAI_XDP_QUEUES") != nullptr) {
+          requested_queues = std::max(1, std::atoi(std::getenv("SAMURAI_XDP_QUEUES")));
+        } else if (std::getenv("SAMURAI_XDP_TX_QUEUES") != nullptr) {
+          requested_queues = std::max(1, std::atoi(std::getenv("SAMURAI_XDP_TX_QUEUES")));
+        } else if (env_is_v2 && env2.concurrency > 1) {
+          requested_queues = static_cast<int>(env2.concurrency);
+        }
+
         const int queue_id = std::max(0, cli_queue_id >= 0 ? cli_queue_id : static_cast<int>(env.xdp_queue_id));
         const int mode = std::max(0, cli_mode >= 0 ? cli_mode : static_cast<int>(env.xdp_mode));
         const int packet_count = std::max(1, static_cast<int>(env.packet_count));
 
+        int num_queues = 1;
+        if (requested_queues > 1) {
+          num_queues = std::min<int>(requested_queues, iface_max_queues > 0 ? iface_max_queues : requested_queues);
+          num_queues = std::min<int>(num_queues, packet_count);
+          if (num_queues < 1) num_queues = 1;
+        }
+        const bool multi_queue = num_queues > 1;
+
         char xdp_err[160];
         xdp_err[0] = '\0';
-        XdpCtxGuard ctx_guard{};
+        XdpMultiCtxGuard ctx_guard{};
         ctx_guard.bridge = &xdp;
-        ctx_guard.handle = xdp.api->create_ctx(iface.c_str(), queue_id, mode, xdp_err, sizeof(xdp_err));
-        if (ctx_guard.handle <= 0) {
+        std::vector<int> handles;
+
+        bool open_failed = false;
+        for (int q = 0; q < num_queues; ++q) {
+          const int qid = multi_queue ? q : queue_id;
+          xdp_err[0] = '\0';
+          int h = xdp.api->create_ctx(iface.c_str(), qid, mode, xdp_err, sizeof(xdp_err));
+          if (h <= 0) {
+            open_failed = true;
+            break;
+          }
+          ctx_guard.add(h);
+          handles.push_back(h);
+        }
+
+        if (open_failed || handles.empty()) {
           const std::string msg = xdp_err[0] ? std::string(xdp_err) : "xdp_create_ctx_failed";
           (void)SendFrame(
               push,
@@ -435,10 +599,11 @@ int main(int argc, char** argv) {
         }
 
         // Stateful userspace TCP fast-path (protocol=custom_tcp / attack_vector=
-        // stateful|l7_custom_tcp): ortak sürücüyü XDP shim'iyle koştur. Stateless
-        // blast yolu (aşağısı) değişmez.
+        // stateful|l7_custom_tcp): ortak sürücüyü çoklu kuyruk XDP shim'iyle koştur.
+        // Donanımsal RSS trafiği hangi kuyruğa atarsa atsın XdpMultiShim tüm kuyrukları
+        // tarayarak dönüş SYN-ACK'lerini yakalar.
         if (samurai::daemon::IsStatefulFastpathJob(env)) {
-          XdpShim shim(xdp.api, ctx_guard.handle);
+          XdpMultiShim shim(xdp.api, handles);
           samurai::daemon::FastpathParams params =
               samurai::daemon::FastpathParamsFromEnvelope(env);
           params.backend = "af_xdp";
@@ -520,131 +685,216 @@ int main(int argc, char** argv) {
         std::uint64_t packets_errors = 0;
         std::uint64_t bytes_sent = 0;
 
-        int offset = 0;
-        while (offset < packet_count) {
-          const int batch = std::min(cli_batch_size, packet_count - offset);
-          for (int i = 0; i < batch; ++i) {
-            samurai_pacing_wait_next(&pace_state, &pace_cfg);
+        if (multi_queue) {
+          const int base_core = std::getenv("SAMURAI_XDP_BASE_CORE")
+              ? std::atoi(std::getenv("SAMURAI_XDP_BASE_CORE")) : (env.pin_cpu >= 0 ? env.pin_cpu : -1);
+
+          samurai_pacing_config_t thread_pace = pace_cfg;
+          if (thread_pace.mode == SAMURAI_PACING_RPS) {
+            thread_pace.target_rps = pace_cfg.target_rps / static_cast<double>(num_queues);
+          } else if (thread_pace.mode == SAMURAI_PACING_IPG && thread_pace.ipg_ns > 0) {
+            thread_pace.ipg_ns = pace_cfg.ipg_ns * static_cast<std::uint64_t>(num_queues);
+          } else if (thread_pace.mode == SAMURAI_PACING_BURST && thread_pace.burst_size > 1) {
+            thread_pace.burst_size =
+                std::max<std::uint32_t>(1u, thread_pace.burst_size / static_cast<std::uint32_t>(num_queues));
           }
-          int remaining = batch;
-          int local_off = 0;
-          int retry_zeros = 0;
-          while (remaining > 0) {
-            const std::uint8_t* raw_base = nullptr;
-            std::uint32_t raw_count = 0;
-            std::size_t raw_pkt_size = 0;
-            std::size_t raw_stride = 0;
-            if ((cfg.attack_vector == "l7_custom_tcp" || cfg.protocol == "custom_tcp") &&
-                ddos_samurai::l7_emu_native::peek_custom_tcp_tx_packets_raw(
-                    static_cast<std::uint32_t>(remaining), &raw_base, &raw_count, &raw_pkt_size, &raw_stride) == 0 &&
-                raw_base != nullptr && raw_count > 0) {
-              int sent = 0;
+
+          std::deque<XdpTxWorkerThread> workers;
+          const int base_packets = packet_count / num_queues;
+          const int remainder = packet_count % num_queues;
+          int cursor = 0;
+          for (int q = 0; q < num_queues; ++q) {
+            workers.emplace_back();
+            XdpTxWorkerThread& tw = workers.back();
+            tw.queue_id = q;
+            tw.cpu_core = base_core >= 0 ? base_core + q : -1;
+            tw.handle = handles[q];
+            const int cnt = base_packets + (q < remainder ? 1 : 0);
+            const int seg_start = cursor;
+            const int seg_end = cursor + cnt;
+            cursor = seg_end;
+            tw.th = std::thread(xdp_tx_thread_func, &tw, xdp.api, pool.data(), pool.size(),
+                                stride, seg_start, seg_end, cli_batch_size, thread_pace);
+          }
+
+          while (true) {
+            bool all_done = true;
+            for (const auto& w : workers) {
+              if (!w.done.load(std::memory_order_acquire)) {
+                all_done = false;
+                break;
+              }
+            }
+            if (all_done) break;
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+            if (now_ns - last_hb_ns >= 1'000'000'000ull) {
+              (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
+                              header.correlation_id, samurai::wire::WorkerKind::AF_XDP, job_id);
+              last_hb_ns = now_ns;
+            }
+            if (now_ns - last_metric_ns >= 2'000'000'000ull) {
+              std::uint64_t cur_sent = 0, cur_err = 0, cur_bytes = 0;
+              for (const auto& w : workers) {
+                cur_sent += w.packets_sent.load(std::memory_order_relaxed);
+                cur_err += w.packets_errors.load(std::memory_order_relaxed);
+                cur_bytes += w.bytes_sent.load(std::memory_order_relaxed);
+              }
+              const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
+                  now_ns, start_ns, cur_sent, cur_err, cur_bytes, pace_cfg, pace_state);
+              (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
+                              header.correlation_id, samurai::wire::WorkerKind::AF_XDP, job_id,
+                              SerializeSnapshot(snap));
+              last_metric_ns = now_ns;
+              last_hb_ns = now_ns;
+            }
+          }
+
+          for (auto& w : workers) {
+            if (w.th.joinable()) w.th.join();
+            packets_sent += w.packets_sent.load();
+            packets_errors += w.packets_errors.load();
+            bytes_sent += w.bytes_sent.load();
+          }
+        } else {
+          // Tekil kuyruk yolu (handles[0])
+          const int active_handle = handles[0];
+          int offset = 0;
+          while (offset < packet_count) {
+            const int batch = std::min(cli_batch_size, packet_count - offset);
+            for (int i = 0; i < batch; ++i) {
+              samurai_pacing_wait_next(&pace_state, &pace_cfg);
+            }
+            int remaining = batch;
+            int local_off = 0;
+            int retry_zeros = 0;
+            while (remaining > 0) {
+              const std::uint8_t* raw_base = nullptr;
+              std::uint32_t raw_count = 0;
+              std::size_t raw_pkt_size = 0;
+              std::size_t raw_stride = 0;
+              if ((cfg.attack_vector == "l7_custom_tcp" || cfg.protocol == "custom_tcp") &&
+                  ddos_samurai::l7_emu_native::peek_custom_tcp_tx_packets_raw(
+                      static_cast<std::uint32_t>(remaining), &raw_base, &raw_count, &raw_pkt_size, &raw_stride) == 0 &&
+                  raw_base != nullptr && raw_count > 0) {
+                int sent = 0;
+                xdp_err[0] = '\0';
+                if (xdp.api->send_buffer_strided) {
+                  sent = xdp.api->send_buffer_strided(
+                      active_handle,
+                      raw_base,
+                      static_cast<int>(raw_pkt_size),
+                      static_cast<int>(raw_stride),
+                      static_cast<int>(raw_count),
+                      xdp_err,
+                      sizeof(xdp_err));
+                }
+                if (sent > 0) {
+                  std::uint32_t consumed = 0;
+                  ddos_samurai::l7_emu_native::consume_custom_tcp_tx_packets_raw(static_cast<std::uint32_t>(sent), &consumed);
+                  packets_sent += static_cast<std::uint64_t>(sent);
+                  bytes_sent += static_cast<std::uint64_t>(sent) * static_cast<std::uint64_t>(raw_stride);
+                  local_off += sent;
+                  remaining -= sent;
+                  continue;
+                }
+              }
+
+              const std::uint8_t* buf = pool.data() + (static_cast<std::size_t>(offset + local_off) * stride);
               xdp_err[0] = '\0';
+              int sent = 0;
               if (xdp.api->send_buffer_strided) {
                 sent = xdp.api->send_buffer_strided(
-                    ctx_guard.handle,
-                    raw_base,
-                    static_cast<int>(raw_pkt_size),
-                    static_cast<int>(raw_stride),
-                    static_cast<int>(raw_count),
+                    active_handle,
+                    buf,
+                    static_cast<int>(stride),
+                    static_cast<int>(stride),
+                    remaining,
+                    xdp_err,
+                    sizeof(xdp_err));
+              } else {
+                sent = xdp.api->send_buffer(
+                    active_handle,
+                    buf,
+                    static_cast<int>(stride),
+                    remaining,
                     xdp_err,
                     sizeof(xdp_err));
               }
-              if (sent > 0) {
-                std::uint32_t consumed = 0;
-                ddos_samurai::l7_emu_native::consume_custom_tcp_tx_packets_raw(static_cast<std::uint32_t>(sent), &consumed);
-                packets_sent += static_cast<std::uint64_t>(sent);
-                bytes_sent += static_cast<std::uint64_t>(sent) * static_cast<std::uint64_t>(raw_stride);
-                local_off += sent;
-                remaining -= sent;
-                continue;
-              }
-            }
 
-            const std::uint8_t* buf = pool.data() + (static_cast<std::size_t>(offset + local_off) * stride);
-            xdp_err[0] = '\0';
-            int sent = 0;
-            if (xdp.api->send_buffer_strided) {
-              sent = xdp.api->send_buffer_strided(
-                  ctx_guard.handle,
-                  buf,
-                  static_cast<int>(stride),
-                  static_cast<int>(stride),
-                  remaining,
-                  xdp_err,
-                  sizeof(xdp_err));
-            } else {
-              sent = xdp.api->send_buffer(
-                  ctx_guard.handle,
-                  buf,
-                  static_cast<int>(stride),
-                  remaining,
-                  xdp_err,
-                  sizeof(xdp_err));
-            }
-
-            if (sent < 0) {
-              const std::string msg = xdp_err[0] ? std::string(xdp_err) : "xdp_send_failed";
-              (void)SendFrame(
-                  push,
-                  static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
-                  header.correlation_id,
-                  samurai::wire::WorkerKind::AF_XDP,
-                  job_id,
-                  JsonError(msg));
-              packets_errors += static_cast<std::uint64_t>(remaining);
-              remaining = 0;
-              break;
-            }
-            if (sent == 0) {
-              retry_zeros += 1;
-              if (retry_zeros > 8) {
+              if (sent < 0) {
+                const std::string msg = xdp_err[0] ? std::string(xdp_err) : "xdp_send_failed";
+                (void)SendFrame(
+                    push,
+                    static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                    header.correlation_id,
+                    samurai::wire::WorkerKind::AF_XDP,
+                    job_id,
+                    JsonError(msg));
                 packets_errors += static_cast<std::uint64_t>(remaining);
                 remaining = 0;
                 break;
               }
-              std::this_thread::sleep_for(std::chrono::microseconds(100));
-              continue;
+              if (sent == 0) {
+                retry_zeros += 1;
+                if (retry_zeros > 8) {
+                  packets_errors += static_cast<std::uint64_t>(remaining);
+                  remaining = 0;
+                  break;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                continue;
+              }
+              retry_zeros = 0;
+              packets_sent += static_cast<std::uint64_t>(sent);
+              bytes_sent += static_cast<std::uint64_t>(sent) * static_cast<std::uint64_t>(stride);
+              local_off += sent;
+              remaining -= sent;
             }
-            retry_zeros = 0;
-            packets_sent += static_cast<std::uint64_t>(sent);
-            bytes_sent += static_cast<std::uint64_t>(sent) * static_cast<std::uint64_t>(stride);
-            local_off += sent;
-            remaining -= sent;
-          }
 
-          const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
-          if (now_ns - last_hb_ns >= 1'000'000'000ull) {
-            (void)SendFrame(
-                push,
-                static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
-                header.correlation_id,
-                samurai::wire::WorkerKind::AF_XDP,
-                job_id);
-            last_hb_ns = now_ns;
+            const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+            if (now_ns - last_hb_ns >= 1'000'000'000ull) {
+              (void)SendFrame(
+                  push,
+                  static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
+                  header.correlation_id,
+                  samurai::wire::WorkerKind::AF_XDP,
+                  job_id);
+              last_hb_ns = now_ns;
+            }
+            if (now_ns - last_metric_ns >= 2'000'000'000ull) {
+              const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
+                  now_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
+              (void)SendFrame(
+                  push,
+                  static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
+                  header.correlation_id,
+                  samurai::wire::WorkerKind::AF_XDP,
+                  job_id,
+                  SerializeSnapshot(snap));
+              last_metric_ns = now_ns;
+              last_hb_ns = now_ns;
+            }
+            offset += batch;
           }
-          if (now_ns - last_metric_ns >= 2'000'000'000ull) {
-            const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
-                now_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
-            (void)SendFrame(
-                push,
-                static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
-                header.correlation_id,
-                samurai::wire::WorkerKind::AF_XDP,
-                job_id,
-                SerializeSnapshot(snap));
-            last_metric_ns = now_ns;
-            last_hb_ns = now_ns;
-          }
-          offset += batch;
         }
 
         xdp_native_stats native_stats{};
-        xdp_err[0] = '\0';
-        if (xdp.api->get_stats(ctx_guard.handle, &native_stats, xdp_err, sizeof(xdp_err)) == 0) {
-          packets_sent = std::max<std::uint64_t>(packets_sent, native_stats.tx_packets);
-          bytes_sent = std::max<std::uint64_t>(bytes_sent, native_stats.tx_bytes);
-          packets_errors = std::max<std::uint64_t>(packets_errors, native_stats.tx_errors);
+        native_stats.mode = mode;
+        native_stats.queue_id = queue_id;
+        for (int h : handles) {
+          xdp_native_stats cur_stats{};
+          xdp_err[0] = '\0';
+          if (xdp.api->get_stats(h, &cur_stats, xdp_err, sizeof(xdp_err)) == 0) {
+            if (!multi_queue) {
+              packets_sent = std::max<std::uint64_t>(packets_sent, cur_stats.tx_packets);
+              bytes_sent = std::max<std::uint64_t>(bytes_sent, cur_stats.tx_bytes);
+              packets_errors = std::max<std::uint64_t>(packets_errors, cur_stats.tx_errors);
+            }
+            native_stats.mode = cur_stats.mode;
+            native_stats.queue_id = cur_stats.queue_id;
+          }
         }
 
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
@@ -667,7 +917,8 @@ int main(int argc, char** argv) {
             snap.actual_rps,
             snap.rate_accuracy_pct,
             native_stats.mode,
-            native_stats.queue_id);
+            native_stats.queue_id,
+            num_queues);
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),

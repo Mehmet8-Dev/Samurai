@@ -26,8 +26,12 @@ PYTHON_LDFLAGS := $(shell $(PYTHON_CONFIG) --ldflags --embed 2>/dev/null || $(PY
 # Compiler settings
 CC := gcc
 CLANG := clang
-CFLAGS := -O2 -Wall -Wextra -fPIC -shared -I.
+CFLAGS := -O2 -Wall -Wextra -fPIC -shared -I. -Ixdp
 XDP_CFLAGS := -O2 -target bpf -D__BPF_TRACING__
+MULTIARCH_INC := /usr/include/$(shell uname -m)-linux-gnu
+ifneq ($(wildcard $(MULTIARCH_INC)),)
+    XDP_CFLAGS += -I$(MULTIARCH_INC)
+endif
 
 # Source files
 # XDP sources live in the dedicated xdp/ subtree.
@@ -36,7 +40,7 @@ XDP_SENDER_SRC := $(XDP_DIR)/xdp_sender.c
 XDP_SENDER_OUT := $(XDP_DIR)/xdp_sender.so
 XDP_PROG_SRC := $(XDP_DIR)/xdp_prog.c
 XDP_PROG_OUT := $(XDP_DIR)/xdp_prog.o
-PACING_SRC := pacing_engine.c
+PACING_SRC := pacing_engine.c $(XDP_DIR)/xdp_core.c
 
 # Libraries
 LIBS := -lpthread
@@ -68,7 +72,9 @@ $(XDP_SENDER_MODULE): $(XDP_SENDER_SRC)
 	@echo "$(BLUE)Building AF_XDP sender module...$(NC)"
 	$(CC) $(CFLAGS) $(PYTHON_INCLUDE) -o $@ $< $(PYTHON_LDFLAGS) $(LIBS)
 	@if [ -f "$@" ]; then \
-		echo "$(GREEN)✅ Built: $@$(NC)"; \
+		cp -f "$@" $(XDP_SENDER_OUT); \
+		cp -f "$@" xdp_sender.so; \
+		echo "$(GREEN)✅ Built: $@ (and synced to $(XDP_SENDER_OUT))$(NC)"; \
 	else \
 		echo "$(RED)❌ Failed to build: $@$(NC)"; \
 		exit 1; \
@@ -81,7 +87,7 @@ xdp-prog: $(XDP_PROG_OUT)
 $(XDP_PROG_OUT): $(XDP_PROG_SRC)
 	@echo "$(BLUE)Compiling XDP BPF program...$(NC)"
 	@if command -v $(CLANG) >/dev/null 2>&1; then \
-		$(CLANG) $(XDP_CFLAGS) -c $< -o $@; \
+		$(CLANG) $(XDP_CFLAGS) -c $< -o $@ || exit 1; \
 		echo "$(GREEN)✅ Compiled: $@$(NC)"; \
 	else \
 		echo "$(YELLOW)⚠️  clang not found, skipping BPF program$(NC)"; \

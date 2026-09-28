@@ -206,8 +206,11 @@ NativeRuntime build_runtime(const Profile& profile, const RuntimeConfig& cfg) {
         local.h1_lanes.push_back(std::move(lane));
       }
     }
+    const TransportBackend transport_backend = parse_transport_backend(profile);
     const ReactorBackend effective_reactor =
-        resolve_reactor_backend(profile.reactor_backend, runtime.caps.io_uring);
+        is_custom_tcp_backend(transport_backend)
+            ? ReactorBackend::SocketEpoll
+            : resolve_reactor_backend(profile.reactor_backend, runtime.caps.io_uring);
     if (effective_reactor == ReactorBackend::SocketIoUring) {
       const unsigned kRingDepth = static_cast<unsigned>(std::max(64, std::min(4096, profile.max_connections * 2)));
       // CQSIZE only. IORING_SETUP_SINGLE_ISSUER is deliberately NOT set: the ring

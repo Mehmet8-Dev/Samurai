@@ -59,7 +59,8 @@
 // Configuration Constants
 // ============================================================================
 
-#define XDP_NUM_FRAMES      4096        // Number of UMEM frames
+#define XDP_MAX_FRAMES      32768       // Maximum supported UMEM frames
+#define XDP_NUM_FRAMES      8192        // Default UMEM frames (env SAMURAI_XDP_NUM_FRAMES overrides)
 #define XDP_FRAME_SIZE      4096        // Size of each frame (must be power of 2)
 #define XDP_HEADROOM        256         // Headroom for XDP metadata
 #define XDP_BATCH_SIZE      64          // Maximum batch size for TX
@@ -134,7 +135,7 @@ struct xsk_socket_info {
     int ifindex;
     int queue_id;
     uint32_t outstanding_tx;
-    uint32_t free_frames[XDP_NUM_FRAMES];
+    uint32_t free_frames[XDP_MAX_FRAMES];
     uint32_t free_count;
     int need_wakeup;
     char ifname[IFNAMSIZ];
@@ -681,7 +682,13 @@ static int register_xsk_in_xsks_map_ctx(
     int value = xsk_fd;
 
     if (map_path == NULL || map_path[0] == '\0') {
-        return 0;
+        if (access("/sys/fs/bpf/samurai_xsks_map", F_OK) == 0) {
+            map_path = "/sys/fs/bpf/samurai_xsks_map";
+        } else if (access("/sys/fs/bpf/xsks_map", F_OK) == 0) {
+            map_path = "/sys/fs/bpf/xsks_map";
+        } else {
+            return 0;
+        }
     }
 
     map_fd = bpf_obj_get_path(map_path);
@@ -884,6 +891,19 @@ static uint16_t udp_checksum(const struct iphdr *iph,
 // UMEM Management
 // ============================================================================
 
+static uint32_t get_default_num_frames(void) {
+    const char *env = getenv("SAMURAI_XDP_NUM_FRAMES");
+    if (env && env[0]) {
+        long v = strtol(env, NULL, 10);
+        if (v >= 1024 && v <= XDP_MAX_FRAMES) {
+            uint32_t p = 1024;
+            while (p * 2 <= (uint32_t)v) p *= 2;
+            return p;
+        }
+    }
+    return XDP_NUM_FRAMES;
+}
+
 static struct xsk_umem_info *create_umem_with_config(
     void *external_buffer,
     uint32_t frame_count,
@@ -895,10 +915,10 @@ static struct xsk_umem_info *create_umem_with_config(
     struct xsk_umem_info *umem = calloc(1, sizeof(*umem));
     if (!umem) return NULL;
 
-    if (frame_count == 0) frame_count = XDP_NUM_FRAMES;
+    if (frame_count == 0) frame_count = get_default_num_frames();
     if (frame_size == 0) frame_size = XDP_FRAME_SIZE;
     if (headroom == 0) headroom = XDP_HEADROOM;
-    if (frame_count > XDP_NUM_FRAMES || frame_size == 0 || headroom >= frame_size) {
+    if (frame_count > XDP_MAX_FRAMES || frame_size == 0 || headroom >= frame_size) {
         free(umem);
         errno = EINVAL;
         return NULL;
@@ -947,7 +967,7 @@ static struct xsk_umem_info *create_umem_with_config(
         return NULL;
     }
 
-    int fill_size = XDP_FILL_RING_SIZE;
+    int fill_size = (int)(frame_count * 2);
     if (setsockopt(umem->fd, SOL_XDP, XDP_UMEM_FILL_RING, &fill_size, sizeof(fill_size)) < 0) {
         close(umem->fd);
         if (!umem->external_buffer) free(umem->buffer);
@@ -955,7 +975,7 @@ static struct xsk_umem_info *create_umem_with_config(
         return NULL;
     }
 
-    int comp_size = XDP_COMP_RING_SIZE;
+    int comp_size = (int)frame_count;
     if (setsockopt(umem->fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &comp_size, sizeof(comp_size)) < 0) {
         close(umem->fd);
         if (!umem->external_buffer) free(umem->buffer);
@@ -973,7 +993,7 @@ static struct xsk_umem_info *create_umem_with_config(
     }
 
     void *fill_map = mmap(NULL,
-                          offsets.fr.desc + XDP_FILL_RING_SIZE * sizeof(uint64_t),
+                          offsets.fr.desc + (size_t)fill_size * sizeof(uint64_t),
                           PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
                           umem->fd, XDP_UMEM_PGOFF_FILL_RING);
     if (fill_map == MAP_FAILED) {
@@ -983,36 +1003,36 @@ static struct xsk_umem_info *create_umem_with_config(
         return NULL;
     }
 
-    umem->fill.mask = XDP_FILL_RING_SIZE - 1;
-    umem->fill.size = XDP_FILL_RING_SIZE;
+    umem->fill.mask = (uint32_t)fill_size - 1;
+    umem->fill.size = (uint32_t)fill_size;
     umem->fill.producer = (uint32_t*)(fill_map + offsets.fr.producer);
     umem->fill.consumer = (uint32_t*)(fill_map + offsets.fr.consumer);
     umem->fill.flags = (uint32_t*)(fill_map + offsets.fr.flags);
     umem->fill.ring = fill_map + offsets.fr.desc;
-    umem->fill.cached_cons = XDP_FILL_RING_SIZE;
+    umem->fill.cached_cons = (uint32_t)fill_size;
     umem->fill_map = fill_map;
-    umem->fill_map_len = offsets.fr.desc + XDP_FILL_RING_SIZE * sizeof(uint64_t);
+    umem->fill_map_len = offsets.fr.desc + (size_t)fill_size * sizeof(uint64_t);
 
     void *comp_map = mmap(NULL,
-                          offsets.cr.desc + XDP_COMP_RING_SIZE * sizeof(uint64_t),
+                          offsets.cr.desc + (size_t)comp_size * sizeof(uint64_t),
                           PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
                           umem->fd, XDP_UMEM_PGOFF_COMPLETION_RING);
     if (comp_map == MAP_FAILED) {
-        munmap(fill_map, offsets.fr.desc + XDP_FILL_RING_SIZE * sizeof(uint64_t));
+        munmap(fill_map, umem->fill_map_len);
         close(umem->fd);
         if (!umem->external_buffer) free(umem->buffer);
         free(umem);
         return NULL;
     }
 
-    umem->comp.mask = XDP_COMP_RING_SIZE - 1;
-    umem->comp.size = XDP_COMP_RING_SIZE;
+    umem->comp.mask = (uint32_t)comp_size - 1;
+    umem->comp.size = (uint32_t)comp_size;
     umem->comp.producer = (uint32_t*)(comp_map + offsets.cr.producer);
     umem->comp.consumer = (uint32_t*)(comp_map + offsets.cr.consumer);
     umem->comp.flags = (uint32_t*)(comp_map + offsets.cr.flags);
     umem->comp.ring = comp_map + offsets.cr.desc;
     umem->comp_map = comp_map;
-    umem->comp_map_len = offsets.cr.desc + XDP_COMP_RING_SIZE * sizeof(uint64_t);
+    umem->comp_map_len = offsets.cr.desc + (size_t)comp_size * sizeof(uint64_t);
 
     return umem;
 }
@@ -1073,7 +1093,7 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
     }
     
     // Setup TX Ring
-    int tx_size = XDP_TX_RING_SIZE;
+    int tx_size = (int)umem->frame_count;
     if (setsockopt(xsk->fd, SOL_XDP, XDP_TX_RING, &tx_size, sizeof(tx_size)) < 0) {
         fprintf(stderr, "[XDP] Failed to set TX ring: %s\n", strerror(errno));
         close(xsk->fd);
@@ -1082,7 +1102,7 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
     }
     
     // Setup RX Ring (optional, for bidirectional communication)
-    int rx_size = XDP_RX_RING_SIZE;
+    int rx_size = (int)umem->frame_count;
     if (setsockopt(xsk->fd, SOL_XDP, XDP_RX_RING, &rx_size, sizeof(rx_size)) < 0) {
         fprintf(stderr, "[XDP] Failed to set RX ring (continuing without RX): %s\n", strerror(errno));
         // Continue without RX - we're primarily TX focused
@@ -1099,7 +1119,7 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
     
     // Map TX Ring
     void *tx_map = mmap(NULL,
-                        offsets.tx.desc + XDP_TX_RING_SIZE * sizeof(struct xdp_desc),
+                        offsets.tx.desc + (size_t)tx_size * sizeof(struct xdp_desc),
                         PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
                         xsk->fd, XDP_PGOFF_TX_RING);
     if (tx_map == MAP_FAILED) {
@@ -1109,29 +1129,29 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
         return NULL;
     }
     
-    xsk->tx.mask = XDP_TX_RING_SIZE - 1;
-    xsk->tx.size = XDP_TX_RING_SIZE;
+    xsk->tx.mask = (uint32_t)tx_size - 1;
+    xsk->tx.size = (uint32_t)tx_size;
     xsk->tx.producer = (uint32_t*)(tx_map + offsets.tx.producer);
     xsk->tx.consumer = (uint32_t*)(tx_map + offsets.tx.consumer);
     xsk->tx.flags = (uint32_t*)(tx_map + offsets.tx.flags);
     xsk->tx.ring = tx_map + offsets.tx.desc;
     xsk->tx_map = tx_map;
-    xsk->tx_map_len = offsets.tx.desc + XDP_TX_RING_SIZE * sizeof(struct xdp_desc);
+    xsk->tx_map_len = offsets.tx.desc + (size_t)tx_size * sizeof(struct xdp_desc);
 
     // Map RX Ring (optional; required for RX pipeline)
     void *rx_map = mmap(NULL,
-                        offsets.rx.desc + XDP_RX_RING_SIZE * sizeof(struct xdp_desc),
+                        offsets.rx.desc + (size_t)rx_size * sizeof(struct xdp_desc),
                         PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
                         xsk->fd, XDP_PGOFF_RX_RING);
     if (rx_map != MAP_FAILED) {
-        xsk->rx.mask = XDP_RX_RING_SIZE - 1;
-        xsk->rx.size = XDP_RX_RING_SIZE;
+        xsk->rx.mask = (uint32_t)rx_size - 1;
+        xsk->rx.size = (uint32_t)rx_size;
         xsk->rx.producer = (uint32_t*)(rx_map + offsets.rx.producer);
         xsk->rx.consumer = (uint32_t*)(rx_map + offsets.rx.consumer);
         xsk->rx.flags = (uint32_t*)(rx_map + offsets.rx.flags);
         xsk->rx.ring = rx_map + offsets.rx.desc;
         xsk->rx_map = rx_map;
-        xsk->rx_map_len = offsets.rx.desc + XDP_RX_RING_SIZE * sizeof(struct xdp_desc);
+        xsk->rx_map_len = offsets.rx.desc + (size_t)rx_size * sizeof(struct xdp_desc);
     } else {
         xsk->rx.size = 0;
         xsk->rx.ring = NULL;
