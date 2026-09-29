@@ -1,49 +1,27 @@
-# API
+# 13 - Native HTTP Management API (`:8089`)
 
-Bu checkout'ta klasik monolit `ddos_samurai/api.py` bulunmuyor.
-Aktif API katmani distributed management API'dir.
+Master düğümünde `--management-listen` parametresi verildiğinde devreye giren Management API, saf POSIX socket tabanlı, sıfır harici web kütüphanesi bağımlılığına sahip yerel bir C++ HTTP REST sunucusudur (`ddos_samurai/control/management_api.cpp`).
 
-Kaynak: `ddos_samurai/control/management_api.py`
+---
 
-## Endpointler
+## 1. REST Endpointleri
 
-- `GET /healthz`
-- `GET /v1/cluster/summary`
-- `GET /v1/cluster/workers`
-- `GET /v1/cluster/shards`
-- `GET /v1/cluster/events`
-- `POST /v1/jobs/abort`
-- `GET /metrics`
-- `GET /v1/cluster/live/sse`
-- `WS  /v1/cluster/live/ws`
+| Metot | Yol | Açıklama |
+| :--- | :--- | :--- |
+| `GET` | `/healthz` | Sunucu sağlık kontrolü (`200 OK`). |
+| `GET` | `/v1/cluster/summary` | Bağlı worker sayısı, aktif shard'lar ve toplam metrik özeti. |
+| `GET` | `/v1/cluster/workers` | Kayıtlı tüm worker'ların detaylı listesi ve son heartbeat zamanları. |
+| `GET` | `/v1/cluster/shards` | Çalışan veya tamamlanan iş parçalarının (shards) durumu. |
+| `POST` | `/v1/jobs/abort` | Yürütülmekte olan aktif test/saldırı işini anında durdurma. |
+| `GET` | `/metrics` | Prometheus uyumlu ham metrik çıktısı. |
+| `GET` | `/v1/cluster/live/sse` | Server-Sent Events (SSE) ile canlı küme durumu akışı. |
+| `GET` | `/v1/cluster/live/ws` | WebSocket ile canlı durum akışı. |
 
-## Auth Modelleri
+---
 
-1. Role token
-- admin/operator/viewer tokenlari
+## 2. Kimlik Doğrulama ve Yetkilendirme (Auth)
 
-2. JWT
-- role ve tenant claim tabanli
-
-3. Trusted identity headers (reverse proxy)
-- OIDC/SAML forward-auth proxy ile
-- role + tenant headerlari + shared secret dogrulama
-
-## Tenant Izolasyonu
-
-- Query tenant + app tenant + claim tenant kontrolu birlikte yapilir
-- Tenant mismatch durumunda 403 doner
-
-## SSE/WS Live Akisi
-
-- Snapshot tabanli yayin
-- Cursor (`since_ts_ms`) destekli incremental event akisi
-
-## Metrik Export
-
-- `/metrics` endpointi plain text Prometheus formatinda cikti verir
-- Uretilecek metrikler master state aggregator tarafinda normalize edilir
-
-## Not
-
-Purchase/portal/licensing API'leri ayrik `license_server` projesindedir (`license_server/*`).
+API istekleri 3 yöntemden biriyle yetkilendirilebilir:
+1. **Role Token:** `Authorization: Bearer <ADMIN_OR_OPERATOR_TOKEN>`
+2. **HMAC-SHA256 JWT:** OpenSSL ile doğrulanmış tenant ve role claim'leri.
+3. **Trusted Identity Headers:** Kurumsal ters vekil sunucuların (Reverse Proxy / OIDC) ilettiği `X-Forwarded-User` ve `X-Forwarded-Roles` başlıkları.

@@ -1,53 +1,35 @@
-# Docker
+# 11 - Docker ve Dağıtık Konteyner Mimarisi
 
-Bu checkout'ta container-native calisma icin birincil yol distributed compose + helm'dir.
+DDoSamurai, Docker konteynerleri üzerinde hem tekil (standalone) hem de küme (cluster) modunda çalıştırılabilir.
 
-## 1) Docker Compose (Distributed)
+---
 
-Dosya: `docker-compose.distributed.yml`
+## 1. Docker Compose ile Dağıtık Küme
 
-Calistirma:
-
-```bash
-docker compose -f docker-compose.distributed.yml up --build --scale slave=3
-```
-
-Beklenen roller:
-
-- `master`: control-plane + management API
-- `slave`: worker execution
-
-## 2) Production Image
+[`docker-compose.distributed.yml`](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/DDoSamurai/docker-compose.distributed.yml) dosyası Master, Master-Follower (HA), Redis koordinatörü ve çoklu Slave düğümlerini ayağa kaldırır:
 
 ```bash
-docker build -f Dockerfile.prod -t ddos-samurai:prod .
+# 4 adet Slave düğümü ile başlatma
+docker compose -f docker-compose.distributed.yml up --build --scale slave=4
 ```
 
-CI'da da ayni Dockerfile smoke edilir.
+---
 
-## 3) Monitoring Stack
-
-Ayrik monitoring compose:
+## 2. Üretim İmajını Derleme
 
 ```bash
-cd monitoring
-docker compose up -d
+docker build -f Dockerfile.prod -t ddos-samurai:latest .
 ```
 
-- Prometheus: `:9090`
-- Grafana: `:3000`
+---
 
-## 4) Yetki/CAP Notlari
+## 3. Konteyner Ağ Yetkileri (Capabilities)
 
-Dusus seviyeli network path'ler icin container capability gerekebilir.
-Ozellikle:
+Düşük seviyeli ağ motorları (AF_XDP, raw socket, DPDK) için konteyner başlatılırken aşağıdaki yetkiler tanımlanmalıdır:
 
-- `NET_RAW`
-- `NET_ADMIN`
-
-Policy geregi privileged calisma sadece izole test ortaminda onerilir.
-
-## 5) Legacy Notu
-
-Klasik api/dashboard stack referanslari tarihsel olabilir.
-Aktif runtime odagi distributed compose + management API + monitoring stack'tir.
+```yaml
+cap_add:
+  - NET_ADMIN
+  - NET_RAW
+  - SYS_NICE
+```

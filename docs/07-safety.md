@@ -1,45 +1,40 @@
-# Safety
+# 07 - Hedef Güvenliği (Target Safety) ve RFC Kontrolleri
 
-Safety katmani, aracin yanlis hedefe veya kontrolsuz kosullarda calismasini azaltmak icin tasarlanmistir.
-Ana implementasyon: `ddos_samurai/utils.py::validate_target_safety`
+DDoSamurai, testlerin yanlışlıkla yetkisiz hedeflere yönlendirilmesini ve kontrolsüz trafik üretimini engellemek için yerleşik güvenlik mekanizmalarına (`ddos_samurai/core/target_safety.cpp` ve `ddos_samurai/cli/validation.cpp`) sahiptir.
 
-## Hedef Guvenlik Politikasi
+---
 
-Varsayilan davranis:
+## 1. Hedef Güvenlik Kuralları
 
-- Yalnizca IPv4 desteklenir
-- Multicast ve unspecified adresler reddedilir
-- Allowlist verilmediyse sadece private/loopback kabul edilir
-- Public hedef default olarak blok
+- **Özel / Yerel Ağ Koruması (Default Private):**
+  Varsayılan olarak yalnızca loopback (`127.0.0.0/8`), özel yerel ağlar (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) ve lab IP bloklarına izin verilir.
+- **Genel (Public) IP Koruması:**
+  İnternete açık genel IP adreslerine test yapılabilmesi için `--allow-public-target` bayrağının açıkça belirtilmesi zorunludur.
+- **Genel Yasaklı Bloklar (Global Denylist):**
+  Kritik internet altyapıları (örneğin DNS root sunucuları, acil durum ağları vb.) ve `--safety-global-deny-target` ile girilen CIDR blokları asla hedeflenemez; bu kurallar allowlist kurallarını ezer.
 
-## Kontrol Bayraklari
+---
 
-- `--allow-target` (tekrarlanabilir)
-  - IP veya CIDR allowlist
-- `--allow-public-target`
-  - Public hedef kilidini bilincli olarak kaldirir
-- `--safety-global-deny-target` (tekrarlanabilir)
-  - Her kosulda yasak hedef listesi
-  - allow_public veya allowlist'ten daha onceliklidir
+## 2. Güvenlik Bayrakları
 
-## Etik Onay Akisi
+```bash
+# Sadece belirli bir alt ağa izin verme
+./build/ddos_samurai/cli/samurai --allow-target 192.168.10.0/24 ...
 
-- `utils.ethical_warning()` interaktif YES onayi ister
-- `--confirm` ile interaktif adim atlanabilir
+# Belirli bir alt ağı tamamen yasaklama
+./build/ddos_samurai/cli/samurai --safety-global-deny-target 10.0.0.0/24 ...
 
-## Runtime Emniyet Davranisi
+# Kamu/İnternet hedefine bilinçli onay
+./build/ddos_samurai/cli/samurai --allow-public-target --target 203.0.113.10 ...
+```
 
-Soak/monitoring alarmi geldiginde:
+---
 
-- `--safety-auto-abort` aktifse workerlar terminate edilir
-- `--disable-safety-auto-abort` ile bu davranis kapatilabilir
+## 3. RFC Uyumluluk Testleri (`rfc_suite.cpp`)
 
-Bu kontrol, yanlis konfigürasyon veya bozulan kosullarda hasari sinirlamak icindir.
+Paket sentezleme motorlarının doğruluğunu ve anomali filtrelerini test etmek için RFC uygunluk paketleri çalıştırılabilir:
 
-## Operasyon Onerisi
-
-Prod benzeri ortamlarda su kombinasyon onerilir:
-
-- Public hedefte `--allow-public-target` sadece degisiklik kaydi ile
-- Kurumsal denyliste `--safety-global-deny-target` zorunlu
-- Uzun sureli kosularda auto-abort acik
+```bash
+./build/ddos_samurai/cli/samurai --rfc-suite positive
+./build/ddos_samurai/cli/samurai --rfc-suite negative
+```

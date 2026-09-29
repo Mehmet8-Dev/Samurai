@@ -1,192 +1,217 @@
-# Samurai (Shogun)
+# Samurai (Shogun) — Native C++ Network Stress & Security Test Platform
 
-Samurai, **yalnızca yetkili/lab ortamlarında** kullanılmak üzere geliştirilen modüler bir ağ stres ve güvenlik test platformudur.
+Samurai (Sürüm 2.2+, Kod adı: **Shogun**), **yalnızca yetkili lab ve güvenlik testi ortamlarında** kullanılmak üzere geliştirilmiş, yüksek başarımlı (high-throughput), düşük gecikmeli (low-latency) ve modüler bir ağ stres ve dayanıklılık test platformudur.
 
-## Sürüm
+Platform, Python bağımlılıklarından arındırılarak tamamen modern **C++ (C++17)**, **ZeroMQ (ZMQ) binary IPC wire protocol**, **Kernel-Bypass (AF_XDP, DPDK)**, **GPU/CUDA paket sentezi** ve **User-Space TCP/L7 motorları** ile çalışan native mimariye dönüştürülmüştür.
 
-- SemVer: `2.2.0`
-- Kod adı: `Shogun`
-- Önceki kod adı: `Kenjaku`
-- Son doğrulama tarihi: `2026-04-28`
+---
 
-## Hızlı Özet
+## Temel Özellikler
 
-- Tek giriş noktası: `python -m ddos_samurai.cli`
-- Katı lisans geçidi: canlı çalıştırma öncesi lisans doğrulaması zorunlu
-- L3/L4/L7 test yolları
-- Savunma odaklı VAE anomaly katmanı (60s pencere, 8 feature, JSONL event çıkışı)
-- `cpu` + opsiyonel `cuda` üretim yolu
-- Local native worker runtime: **ZMQ job/event IPC**
-- Sender/dataplane aileleri: CPU, GPU, AF_XDP, DPDK, DOCA GPUNetIO, L7, Defense, Scenario
-- DPU/GPU state kontratı: `gpu_packet_cuda` altında authoritative flow-state + GPU stream policy
+- **Saf Native C++ Çalışma Zamanı:** Sıfır Python çalışma zamanı gecikmesi; C++17 ile derlenen mikroservis mimarisi.
+- **Native CLI Front-End (`samurai`):** Güçlü argüman doğrulama, KPI gate kontrolleri, RFC paket testleri ve profil yönetimi.
+- **Dağıtık Control-Plane (`samurai_master` & `samurai_slave`):**
+  - ZMQ ROUTER/DEALER tabanlı asenkron RPC haberleşmesi.
+  - Dinamik iş parçalama (Sharding - eşit, kapasite, bölge bazlı).
+  - High Availability (HA) lider seçimi (Static ve File-Lease).
+  - Multi-Master & Multi-Region koordinatörü.
+  - Saf POSIX soket tabanlı yerleşik HTTP REST Management API (`:8089`).
+  - OpenSSL HMAC-SHA256 ile HS256 JWT ve RBAC yetkilendirme.
+  - Tahrif edilemez (tamper-evident) SHA-256 denetim günlüğü (Audit Log).
+- **Yüksek Başarımlı Dataplane Motorları:**
+  - **L4 User-Space TCP Stack (`tcp_dataplane_core`):** 64-shard kilit şeritli (lock-striped) flow tablosu, out-of-order paket işleme, timer-wheel retransmit.
+  - **AF_XDP (Kernel-Bypass):** Linux XSK / UMEM zero-copy ring bufferları üzerinden Mpps seviyesinde paket iletimi.
+  - **DPDK:** PMD ring tabanlı donanım hızlandırma.
+  - **GPU CUDA & DOCA GPUNetIO:** Donanım hızlandırmalı paket üretimi ve DPU akış yönetimi.
+  - **L7 Emülasyon Native (`l7_emu_native`):** HTTP/1.1, HTTP/2 (nghttp2), QUIC / HTTP/3 (ngtcp2) ve DNS motorları (Kernel socket veya Custom TCP/AF_XDP modları).
+  - **Scenario Engine Native (`scenario_engine_native`):** Web/Mobil persona tabanlı çok adımlı kullanıcı davranışları ve SLA denetleyicisi.
+  - **CPU Native Packet Engine (`cpu_native`):** Raw socket / packet ring optimizasyonu, dinamik spoofing ve amplifikasyon jeneratörleri.
 
-## Yasal ve Etik Sınır
+---
 
-Bu proje sadece izinli hedeflerde kullanılmalıdır. Yetkisiz sistemlere trafik göndermek yasal sorunlara yol açabilir; tüm sorumluluk kullanıcıdadır.
+## Mimari Şema
 
-## Kurulum
+```mermaid
+graph TD
+    subgraph Control Plane
+        Master[samurai_master Daemon]
+        MgmtAPI[Native HTTP Management API :8089]
+        Master -->|ZMQ ROUTER :5099| Slave[samurai_slave Daemon]
+    end
 
-### 1) Python bağımlılıkları
+    subgraph Native CLI & Local Supervisor
+        CLI[samurai CLI] -->|ZMQ IPC / Unix Sockets| Supervisor[Supervisor Engine]
+    end
 
-```bash
-pip install -r requirements.txt
+    Slave -->|Spawns / Manages| Supervisor
+
+    subgraph ZMQ Native Workers
+        Supervisor --> W_CPU[samurai_cpu_worker]
+        Supervisor --> W_AFXDP[samurai_afxdp_worker]
+        Supervisor --> W_DPDK[samurai_dpdk_worker]
+        Supervisor --> W_GPU[samurai_gpu_worker]
+        Supervisor --> W_DOCA[samurai_doca_worker]
+        Supervisor --> W_L7[samurai_l7_worker]
+        Supervisor --> W_SCENARIO[samurai_scenario_worker]
+        Supervisor --> W_DEFENSE[samurai_defense_worker]
+    end
+
+    subgraph Hardware & Kernel Bypass Dataplane
+        W_AFXDP -->|Zero-Copy UMEM| NIC[Ağ Kartı / NIC]
+        W_DPDK -->|PMD Driver / VFIO| NIC
+        W_GPU -->|CUDA Stream / GPUDirect| GPU[NVIDIA GPU]
+        W_L7 -->|User-Space TCP Stack| W_AFXDP
+    end
 ```
 
-### 2) Native/C uzantıları derleme
+---
+
+## Derleme (Build)
+
+### Gereksinimler
+
+- **İşletim Sistemi:** Linux (Ubuntu 20.04+, Debian 11+, RHEL 8+)
+- **Derleyici:** GCC 9+ veya Clang 10+ (C++17 standardı)
+- **Yapı Sistemi:** CMake 3.16+ ve Make / Ninja
+- **Kütüphaneler:** `libzmq3-dev`, `libssl-dev`, `pkg-config`, `build-essential`
+- **Opsiyonel Kütüphaneler:**
+  - AF_XDP için: `libbpf-dev`, `libelf-dev`
+  - HTTP/2 & QUIC için: `libnghttp2-dev`, `libngtcp2-dev`
+  - DPDK için: `libdpdk-dev`
+  - CUDA için: NVIDIA CUDA Toolkit (12.x+)
+
+### Derleme Adımları
 
 ```bash
-python setup.py build_ext --inplace
+# Bağımlılıkları yükleyin (Ubuntu/Debian)
+sudo apt-get update
+sudo apt-get install -y build-essential cmake pkg-config libzmq3-dev libssl-dev libbpf-dev libelf-dev
+
+# Derleme dizinini oluşturun ve derleyin
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
 ```
 
-### 3) Opsiyonel CUDA
+Derleme sonucunda `build/` altında aşağıdaki ikili dosyalar oluşur:
+- `build/ddos_samurai/cli/samurai` (Ana CLI)
+- `build/ddos_samurai/control/daemon/samurai_master` (Master Daemon)
+- `build/ddos_samurai/control/daemon/samurai_slave` (Slave Daemon)
+- `build/ddos_samurai/zmq/daemon/samurai_*_worker` (Tüm Dataplane Worker ikilileri)
+- `build/ddos_samurai/*_selftest` (Bileşen birim testleri)
+
+---
+
+## Kullanım
+
+### 1) Standart CLI ile Test Başlatma (`samurai`)
 
 ```bash
-pip install cupy-cuda12x numba-cuda[cu13]
-python setup.py build_ext --inplace
-```
-
-### 4) Opsiyonel DPDK (system dependency tree)
-
-DPDK backend (`ddos_samurai.dpdk_pmd_core`) Python paketi ile degil, sistem kutuphaneleri ile derlenir.
-
-- System paketleri:
-  - `libdpdk-dev` (veya dagitimdaki esdegeri)
-  - `pkg-config`
-  - `build-essential` / `gcc` / `g++`
-- Runtime gereksinimleri:
-  - hugepage konfigurasyonu
-  - DPDK-uyumlu NIC + uygun driver binding (`vfio-pci` / uygun PMD)
-
-Ornek derleme:
-
-```bash
-SAMURAI_WITH_DPDK=1 python setup.py build_ext --inplace
-```
-
-Gerekirse strict build:
-
-```bash
-SAMURAI_WITH_DPDK=1 SAMURAI_REQUIRE_DPDK_BUILD=1 python setup.py build_ext --inplace
-```
-
-Hazirlik kontrolu (tek komut):
-
-```bash
-bash tools/check_dpdk_env.sh
-```
-
-### 5) Opsiyonel ML/VAE bağımlılıkları
-
-```bash
-pip install -r requirements-ml.txt
-```
-
-## Çalıştırma
-
-### Self-test (trafik göndermez)
-
-```bash
-python -m ddos_samurai.cli --self-test
-```
-
-### Dry-run (gönderim yapmaz)
-
-```bash
-python -m ddos_samurai.cli \
+# CPU worker ile temel UDP flood testi
+./build/ddos_samurai/cli/samurai \
+  --worker cpu \
   --target 127.0.0.1 --port 8080 \
-  --protocol tcp --attack-vector basic \
-  --count 100 --dry-run --confirm
-```
-
-### Profil listesi
-
-```bash
-python -m ddos_samurai.cli --list-profiles
-```
-
-## Scenario Engine (L7 Persona)
-
-Scenario Engine, web/mobile persona tabanlı L7 kullanıcı davranışı üretir.
-
-- Destek: `http` (HTTP/1.1), `http2` (HTTP/2)
-- Modlar: `off`, `shadow`, `enforce`
-- DSL: YAML (`personas`, `flows`, `load_model`, `sla`)
-
-Hızlı örnek:
-
-```bash
-python -m ddos_samurai.cli \
-  --scenario-file docs/scenario_web_mobile.yaml \
-  --scenario-mode enforce \
-  --scenario-vus 100000 \
-  --scenario-ramp-seconds 120 \
-  --scenario-max-session-seconds 60 \
+  --protocol udp --count 100000 \
   --confirm
+
+# AF_XDP Kernel-Bypass ile ultra yüksek hızlı paket testi
+sudo ./build/ddos_samurai/cli/samurai \
+  --worker afxdp \
+  --target 10.0.0.50 --port 80 \
+  --protocol tcp --count 5000000 \
+  --confirm
+
+# L7 HTTP/2 Stres Testi
+./build/ddos_samurai/cli/samurai \
+  --worker l7 \
+  --target 10.0.0.50 --port 443 \
+  --protocol http2 --scheme https \
+  --concurrency 100 --max-connections 50 \
+  --count 200000 --confirm
+
+# Scenario Engine ile Gerçekçi Kullanıcı Senaryosu
+./build/ddos_samurai/cli/samurai \
+  --worker scenario \
+  --target 10.0.0.50 --port 443 \
+  --scenario-payload-ref docs/scenario_web_mobile.yaml \
+  --count 100000 --confirm
 ```
 
-Detaylar:
-- [Scenario Engine Dokümantasyonu](docs/28-scenario-engine-web-mobile-persona.md)
-- [Scenario Örnek Dosyası](docs/scenario_web_mobile.yaml)
+---
 
-## VAE Defense Katmanı
+### 2) Dağıtık (Distributed) Master / Slave Modu
 
-Canlı çalışma sırasında VAE analizi açmak için:
+Farklı sunuculardaki kaynakları birleştirerek test yükünü yatayda ölçekleme:
+
+#### **Master Düğümü (`samurai_master`):**
+```bash
+./build/ddos_samurai/control/daemon/samurai_master \
+  --control-listen tcp://0.0.0.0:5099 \
+  --count 10000000 \
+  --target 10.0.0.50 \
+  --port 443 \
+  --protocol tcp \
+  --expect-workers 4 \
+  --cluster-secret "samurai-cluster-secret" \
+  --management-listen 0.0.0.0:8089
+```
+
+#### **Slave Düğümleri (`samurai_slave`):**
+Her worker sunucusunda çalıştırın:
+```bash
+./build/ddos_samurai/control/daemon/samurai_slave \
+  --control-endpoints <MASTER_IP>:5099 \
+  --worker afxdp \
+  --worker-id "slave-node-01" \
+  --worker-region "eu-central" \
+  --cluster-secret "samurai-cluster-secret" \
+  --heartbeat-interval-ms 2000
+```
+
+---
+
+### 3) Docker Compose ile Dağıtık Çalıştırma
 
 ```bash
-python -m ddos_samurai.cli \
-  --target 127.0.0.1 --port 8080 \
-  --protocol tcp --attack-vector basic \
-  --count 200000 --workers 4 --confirm \
-  --vae-enable
+docker compose -f docker-compose.distributed.yml up --build --scale slave=4
 ```
 
-Sıfırdan model eğitimi:
+---
+
+## Worker Türleri Referansı
+
+| Worker Adı (`--worker`) | Native Binary | Açıklama ve Yetenekler |
+| :--- | :--- | :--- |
+| `cpu` | `samurai_cpu_worker` | Standart CPU raw socket, paket halkası, dinamik spoofing |
+| `afxdp` | `samurai_afxdp_worker` | Linux XDP/UMEM zero-copy kernel bypass |
+| `dpdk` | `samurai_dpdk_worker` | DPDK PMD donanım kuyruğu tabanlı paket iletimi |
+| `gpu` | `samurai_gpu_worker` | CUDA tabanlı GPU paralel paket sentezi |
+| `doca` | `samurai_doca_worker` | NVIDIA DPU & GPUNetIO doğrudan bellek veri yolu |
+| `l7` | `samurai_l7_worker` | HTTP/1.1, HTTP/2, QUIC/HTTP/3, DNS (Epoll / User-Space TCP) |
+| `scenario` | `samurai_scenario_worker` | Çok adımlı web/mobil persona senaryo motoru |
+| `defense` | `samurai_defense_worker` | VAE anomali doğrulama ve savunma bypass analizleri |
+
+---
+
+## Native Self-Testler (Doğrulama)
+
+Tüm bileşenlerin sağlığını C++ birim testleriyle doğrulamak için:
 
 ```bash
-python -m ddos_samurai.models.vae.train \
-  --input-glob "data/vae/*.csv" \
-  --label-col Label \
-  --normal-label BENIGN \
-  --model-version vae-loadtest-v1
+./build/ddos_samurai/control/samurai_control_selftest
+./build/ddos_samurai/l7_emu_native/samurai_l7_selftest
+./build/ddos_samurai/scenario_engine_native/samurai_scenario_engine_selftest
+./build/ddos_samurai/licensing/samurai_licensing_selftest
 ```
 
-Varsayılan artifact dizini:
+---
 
-- `ddos_samurai/models/vae/artifacts/<model_version>/`
+## Yasal ve Etik Bildirim
 
-## Temel Mimari
+Bu yazılım yalnızca sistem yöneticilerinin, güvenlik araştırmacılarının ve ağ mühendislerinin kendi sahip oldukları veya açık yazılı izin aldıkları altyapılarda stres/dayanıklılık testleri yapabilmesi amacıyla tasarlanmıştır. İzin alınmamış hedeflere yönelik trafik üretilmesi yasa dışıdır. Tüm yasal sorumluluk kullanıcıya aittir.
 
-- CLI paketi: `ddos_samurai/cli/`
-- Worker orchestration: `ddos_samurai/orchestrator.py`
-- Local ZMQ worker runtime: `ddos_samurai/zmq/*`, `ddos_samurai/zmq/daemon/*.cpp`
-- L7 stateful emulation: `ddos_samurai/l7_emu/*`, `ddos_samurai/l7_emu_native/*`
-- Dataplane / AF_XDP / DPDK: `ddos_samurai/af_xdp_sender.py`, `ddos_samurai/dpdk/*`, `ddos_samurai/xdp_sender.c`
-- GPU paket/payload: `ddos_samurai/gpu_packet.py`, `ddos_samurai/gpu_packet_cuda/*`, `ddos_samurai/gpu_cuda_payload/*`
-- DPU/GPU state contract: `ddos_samurai/gpu_packet_cuda/dpu_state_runtime.hpp`
-- AF_XDP Python wrapper + RX pipeline bridge: `ddos_samurai/af_xdp_sender.py`
+---
 
-## Önemli Notlar
+## Detaylı Dokümantasyon İndeksi
 
-- Bu checkout içinde `dashboard/` yok.
-- Bu checkout içinde `ddos_samurai/api.py` yok.
-- `docker-compose.yml` içinde görülen `api/dashboard` servisleri bu checkout ile birebir çalışmayabilir.
-
-## Test
-
-```bash
-pytest tests -q -rs
-```
-
-## Dokümantasyon
-
-- [Dokümantasyon İndeksi](docs/README.md)
-- [Scenario Engine (Web/Mobile Persona)](docs/28-scenario-engine-web-mobile-persona.md)
-- [VAE Defense Integration (Mimari + Kullanim)](docs/35-vae-defense-integration.md)
-- [ZMQ Worker Architecture](docs/36-zmq-worker-architecture.md)
-- [DPU/GPU Dataplane Architecture](docs/37-dpu-gpu-dataplane-architecture.md)
-- [L7 Native Custom QUIC/H3 Parity Planı](docs/PLAN_L7_NATIVE_CUSTOM_QUIC_H3_PARITY.md)
-- [DOCA GPUNetIO Mimari ve Operasyon Notları](docs/33-doca-gpunetio-migration-status.md)
-
-## Lisans
-
-`setup.py` sınıflandırmasına göre: MIT.
+Tüm alt modüllerin ayrıntılı teknik açıklamaları için [`docs/README.md`](docs/README.md) dizinini inceleyebilirsiniz.

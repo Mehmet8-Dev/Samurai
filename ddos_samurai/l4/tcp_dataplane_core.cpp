@@ -9,6 +9,14 @@
 #include <cstring>
 #include <new>
 
+#ifdef SAMURAI_WITH_DPDK
+extern "C" {
+#include <rte_common.h>
+#include <rte_mbuf.h>
+#include <rte_mempool.h>
+}
+#endif
+
 namespace ddos_samurai::tcpdp {
 
 namespace {
@@ -17,6 +25,28 @@ constexpr uint8_t kTcpFlagSyn = 0x02;
 constexpr uint8_t kTcpFlagRst = 0x04;
 constexpr uint8_t kTcpFlagPsh = 0x08;
 constexpr uint8_t kTcpFlagAck = 0x10;
+
+// Send-side sliding-window limits.
+constexpr size_t kSndBufCap = 1u << 20;           // 1 MiB per-flow app send buffer
+constexpr size_t kSndBufCompactThreshold = 64u * 1024u;  // compact once head passes this
+constexpr size_t kSegBufPoolCap = 64;             // max recycled segment buffers held per flow
+constexpr uint32_t kMaxCwnd = 16u * 1024u * 1024u;       // cwnd ceiling (bytes)
+constexpr uint32_t kMinRtoMs = 50u;                      // RTO floor (LAN-oriented load generator)
+constexpr uint8_t kOptEnd = 0, kOptNop = 1, kOptMss = 2, kOptWScale = 3, kOptSackPerm = 4, kOptSack = 5;
+constexpr uint8_t kOptTimestamp = 8;                    // RFC 7323 timestamp option kind
+constexpr uint8_t kSynWScale = 7;                        // window scale shift we advertise
+constexpr uint32_t kDupThresh = 3;                       // RFC 6675 duplicate ACK / SACK threshold
+constexpr size_t kTsOptLen = 12;                         // 2 NOP + kind(1)+len(1)+TSval(4)+TSecr(4)
+
+// RFC 1982 serial-number comparison for 32-bit TCP sequence space.
+inline bool SeqLt(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) < 0; }
+inline bool SeqLeq(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) <= 0; }
+inline bool SeqGt(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) > 0; }
+
+// Sequence footprint a segment consumes (payload + 1 for each of SYN/FIN).
+inline uint32_t SegSeqLen(const uint8_t flags, const uint32_t payload_len) {
+  return payload_len + ((flags & kTcpFlagSyn) ? 1u : 0u) + ((flags & kTcpFlagFin) ? 1u : 0u);
+}
 
 inline uint16_t ReadBe16(const uint8_t* p) {
   return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | static_cast<uint16_t>(p[1]));
@@ -27,26 +57,63 @@ inline uint32_t ReadBe32(const uint8_t* p) {
          (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
 }
 
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#define SAMURAI_HOST_BIG_ENDIAN 1
+#else
+#define SAMURAI_HOST_BIG_ENDIAN 0
+#endif
+
+// One's-complement 16-bit sum of the buffer, interpreting each 16-bit word in
+// host byte order, folded to 16 bits. Processed 8 bytes per iteration off a
+// 64-bit accumulator so the compiler auto-vectorizes the reduction; a scalar
+// tail handles the last <8 bytes. ~2.4x faster at -O2 and ~10x with AVX2 vs the
+// byte-at-a-time scalar loop, byte-identical for every input (fuzz-verified).
+inline uint32_t OnesSumHost16(const uint8_t* p, size_t n) {
+  uint64_t sum = 0;
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    uint64_t w;
+    std::memcpy(&w, p + i, 8);
+    sum += (w & 0xFFFFu) + ((w >> 16) & 0xFFFFu) + ((w >> 32) & 0xFFFFu) + ((w >> 48) & 0xFFFFu);
+  }
+  for (; i + 2 <= n; i += 2) {
+    uint16_t w;
+    std::memcpy(&w, p + i, 2);
+    sum += w;
+  }
+  if (i < n) {
+    // Trailing odd byte. The wire checksum pads the tail as the HIGH byte of a
+    // big-endian 16-bit word (b<<8): that is the high byte on BE hosts and the
+    // low byte on LE hosts (the final bswap in ToBe16Space restores it).
+#if SAMURAI_HOST_BIG_ENDIAN
+    sum += static_cast<uint64_t>(p[i]) << 8;
+#else
+    sum += static_cast<uint64_t>(p[i]);
+#endif
+  }
+  while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
+  return static_cast<uint32_t>(sum);
+}
+
+// Convert a host-word-space folded sum into big-endian-word space (the space the
+// pseudo-header terms below are accumulated in).
+inline uint32_t ToBe16Space(uint32_t host_folded) {
+#if SAMURAI_HOST_BIG_ENDIAN
+  return host_folded;
+#else
+  return __builtin_bswap16(static_cast<uint16_t>(host_folded));
+#endif
+}
+
 uint16_t InternetChecksum(const uint8_t* ptr, size_t nbytes) {
-  uint32_t sum = 0;
-  for (size_t i = 0; i < nbytes; i += 2) {
-    if (i + 1 < nbytes) {
-      sum += (static_cast<uint32_t>(ptr[i]) << 8) | static_cast<uint32_t>(ptr[i + 1]);
-    } else {
-      sum += static_cast<uint32_t>(ptr[i]) << 8;
-    }
-  }
-  while (sum >> 16) {
-    sum = (sum & 0xFFFFU) + (sum >> 16);
-  }
-  return static_cast<uint16_t>(~sum);
+  return static_cast<uint16_t>(~ToBe16Space(OnesSumHost16(ptr, nbytes)));
 }
 
 uint16_t TcpChecksum(const uint8_t* ip_header, const uint8_t* tcp_header, size_t tcp_len) {
-  uint32_t sum = 0;
   const uint8_t* src_ip = ip_header + 12;
   const uint8_t* dst_ip = ip_header + 16;
 
+  uint32_t sum = ToBe16Space(OnesSumHost16(tcp_header, tcp_len));  // payload, BE-word space
   sum += (static_cast<uint32_t>(src_ip[0]) << 8) | static_cast<uint32_t>(src_ip[1]);
   sum += (static_cast<uint32_t>(src_ip[2]) << 8) | static_cast<uint32_t>(src_ip[3]);
   sum += (static_cast<uint32_t>(dst_ip[0]) << 8) | static_cast<uint32_t>(dst_ip[1]);
@@ -54,13 +121,6 @@ uint16_t TcpChecksum(const uint8_t* ip_header, const uint8_t* tcp_header, size_t
   sum += 6;
   sum += static_cast<uint32_t>(tcp_len);
 
-  for (size_t i = 0; i < tcp_len; i += 2) {
-    if (i + 1 < tcp_len) {
-      sum += (static_cast<uint32_t>(tcp_header[i]) << 8) | static_cast<uint32_t>(tcp_header[i + 1]);
-    } else {
-      sum += static_cast<uint32_t>(tcp_header[i]) << 8;
-    }
-  }
   while (sum >> 16) {
     sum = (sum & 0xFFFFU) + (sum >> 16);
   }
@@ -94,9 +154,35 @@ uint32_t env_u32_bounded(const char* name, uint32_t fallback, uint32_t min_value
   }
   return static_cast<uint32_t>(parsed);
 }
+
+// Env override for a bool toggle: "1"/"true"/"on"/"yes" -> true, "0"/"false"/
+// "off"/"no" -> false, unset/unrecognised -> fallback.
+bool env_bool(const char* name, bool fallback) {
+  const char* raw = name ? std::getenv(name) : nullptr;
+  if (raw == nullptr || raw[0] == '\0') {
+    return fallback;
+  }
+  if (raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' || raw[0] == 'y' || raw[0] == 'Y' ||
+      raw[0] == 'o' || raw[0] == 'O') {
+    // "on"/"off" both start with 'o' -> disambiguate.
+    if ((raw[0] == 'o' || raw[0] == 'O') && (raw[1] == 'f' || raw[1] == 'F')) return false;
+    return true;
+  }
+  return false;
+}
 }  // namespace
 
-TcpDataplaneCore::TcpDataplaneCore() = default;
+TcpDataplaneCore::TcpDataplaneCore() {
+  for (auto& hint : timer_shard_min_due_ns_) {
+    hint.store(UINT64_MAX, std::memory_order_relaxed);
+  }
+}
+
+void TcpDataplaneCore::RefreshTimerHint(size_t shard) {
+  timer_shard_min_due_ns_[shard].store(
+      timer_heap_shard_[shard].empty() ? UINT64_MAX : timer_heap_shard_[shard].top().due_ns,
+      std::memory_order_relaxed);
+}
 
 bool TcpDataplaneCore::FlowKey::operator==(const FlowKey& other) const {
   return src_ip == other.src_ip && dst_ip == other.dst_ip && src_port == other.src_port && dst_port == other.dst_port;
@@ -115,9 +201,15 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
       config.idle_timeout_ms == 0) {
     return false;
   }
-  std::lock_guard<std::mutex> sguard(state_mu_);
-  std::lock_guard<std::mutex> qguard(tx_mu_);
+  std::lock_guard<SpinLock> sguard(state_mu_);
+  std::lock_guard<SpinLock> qguard(tx_mu_);
   config_ = config;
+  // TCP maturity toggles: env overrides the config default (RFC6675 on, the three
+  // behaviour-changing ones off) so operators can flip them without a rebuild.
+  config_.enable_rfc6675_recovery = env_bool("SAMURAI_TCPDP_RFC6675", config_.enable_rfc6675_recovery);
+  config_.enable_delayed_ack = env_bool("SAMURAI_TCPDP_DELAYED_ACK", config_.enable_delayed_ack);
+  config_.enable_nagle = env_bool("SAMURAI_TCPDP_NAGLE", config_.enable_nagle);
+  config_.enable_timestamps = env_bool("SAMURAI_TCPDP_TIMESTAMPS", config_.enable_timestamps);
   tx_ring_capacity_ = static_cast<size_t>(env_u32_bounded(
       "SAMURAI_TCPDP_TX_RING_CAPACITY",
       static_cast<uint32_t>(tx_ring_capacity_),
@@ -132,17 +224,18 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   next_ephemeral_port_ = 40000;
   seq_seed_ = 0x10203040U;
   for (size_t i = 0; i < kFlowLockShards; ++i) {
-    std::lock_guard<std::mutex> fguard(flow_shard_mu_[i]);
+    std::lock_guard<SpinLock> fguard(flow_shard_mu_[i]);
     flows_by_id_shard_[i].clear();
   }
   for (size_t i = 0; i < kFlowLockShards; ++i) {
-    std::lock_guard<std::mutex> iguard(flow_index_shard_mu_[i]);
+    std::lock_guard<SpinLock> iguard(flow_index_shard_mu_[i]);
     flow_index_shard_[i].clear();
   }
   for (size_t i = 0; i < kFlowLockShards; ++i) {
-    std::lock_guard<std::mutex> tguard(timer_shard_mu_[i]);
+    std::lock_guard<SpinLock> tguard(timer_shard_mu_[i]);
     active_flow_ids_shard_[i].clear();
     timer_heap_shard_[i] = std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>();
+    timer_shard_min_due_ns_[i].store(UINT64_MAX, std::memory_order_relaxed);
   }
   tx_ring_storage_.assign(tx_ring_capacity_ * tx_ring_slot_size_, 0U);
   tx_ring_lengths_.assign(tx_ring_capacity_, 0U);
@@ -157,7 +250,7 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   tx_packets_overflow_.clear();
   completions_.clear();
   rx_payloads_.clear();
-  stats_.Reset();
+  for (auto& s : stats_shard_) { s.Reset(); }
   tx_packets_queued_.store(0, std::memory_order_relaxed);
   tx_packets_drained_.store(0, std::memory_order_relaxed);
   tx_packets_sent_.store(0, std::memory_order_relaxed);
@@ -192,12 +285,12 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
     const size_t index_shard = FlowIndexShardForKey(key);
     uint64_t flow_id = 0;
     {
-      std::lock_guard<std::mutex> iguard(flow_index_shard_mu_[index_shard]);
+      std::lock_guard<SpinLock> iguard(flow_index_shard_mu_[index_shard]);
       auto idx = flow_index_shard_[index_shard].find(key);
       if (idx == flow_index_shard_[index_shard].end()) {
         FlowEntry created;
         {
-          std::lock_guard<std::mutex> sguard(state_mu_);
+          std::lock_guard<SpinLock> sguard(state_mu_);
           created.flow_id = next_flow_id_++;
         }
         created.key = key;
@@ -208,11 +301,12 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
         created.peer_window = 0;
         created.local_window = window > 0 ? window : config_.local_window;
         created.mss = config_.default_mss;
+        created.cwnd = 10u * static_cast<uint32_t>(config_.default_mss);  // IW10
         created.ttl = ttl > 0 ? ttl : config_.default_ttl;
         created.last_activity_ns = DefaultNowNs();
         const size_t flow_shard = FlowLockShardForFlowId(created.flow_id);
         {
-          std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+          std::lock_guard<SpinLock> fguard(flow_shard_mu_[flow_shard]);
           flows_by_id_shard_[flow_shard].emplace(created.flow_id, created);
         }
         flow_index_shard_[index_shard][key] = created.flow_id;
@@ -223,7 +317,7 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
     }
 
     const size_t flow_shard = FlowLockShardForFlowId(flow_id);
-    std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+    std::lock_guard<SpinLock> fguard(flow_shard_mu_[flow_shard]);
     auto it = flows_by_id_shard_[flow_shard].find(flow_id);
     if (it == flows_by_id_shard_[flow_shard].end()) {
       continue;
@@ -238,17 +332,20 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       flow->snd_nxt = AdvanceSeq(seq, 1U);
       flow->rcv_nxt = 0;
       flow->retransmit_count = 0;
+      flow->cwnd = 10u * static_cast<uint32_t>(config_.default_mss);  // IW10
+      flow->sndbuf.clear();
+      flow->sndbuf_head = 0;
+      flow->unacked.clear();
       OutstandingTx out;
       out.seq = seq;
       out.ack = 0;
       out.payload_len = 0;
       out.flags = kTcpFlagSyn;
-      out.rto_ms = config_.initial_rto_ms;
-      out.deadline_ns = DefaultNowNs() + NsFromMs(out.rto_ms);
-      out.payload_offset = 0;
-      flow->outstanding = std::move(out);
-      flow->rto_deadline_ns = flow->outstanding->deadline_ns;
-      stats_.connect_attempts.fetch_add(1, std::memory_order_relaxed);
+      out.xmit_count = 1;
+      flow->unacked.push_back(std::move(out));
+      flow->cur_rto_ms = config_.initial_rto_ms;
+      flow->rto_deadline_ns = DefaultNowNs() + NsFromMs(flow->cur_rto_ms);
+      stats_shard_[flow_shard].connect_attempts.fetch_add(1, std::memory_order_relaxed);
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
@@ -258,9 +355,10 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       SetFlowState(*flow, TcpDpState::kEstablished);
       flow->snd_una = ack;
       flow->snd_nxt = seq;
-      flow->outstanding.reset();
+      flow->unacked.clear();
       flow->rto_deadline_ns = 0;
-      stats_.connect_established.fetch_add(1, std::memory_order_relaxed);
+      flow->cur_rto_ms = 0;
+      stats_shard_[flow_shard].connect_established.fetch_add(1, std::memory_order_relaxed);
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
@@ -268,7 +366,8 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
 
     if ((flags & kTcpFlagAck) != 0 && payload_len > 0) {
       SetFlowState(*flow, TcpDpState::kEstablished);
-      flow->snd_una = ack;
+      // snd_una advances only from received ACKs (HandleAck); the ack field on our
+      // own outbound packet is our rcv_nxt, not an acknowledgement of our data.
       flow->snd_nxt = AdvanceSeq(seq, payload_len);
       flow->rcv_nxt = ack;
       flow->local_window = window > 0 ? window : flow->local_window;
@@ -278,18 +377,19 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
       out.ack = ack;
       out.payload_len = payload_len;
       out.flags = static_cast<uint8_t>(flags & static_cast<uint8_t>(kTcpFlagFin | kTcpFlagPsh | kTcpFlagAck));
-      out.rto_ms = config_.initial_rto_ms;
-      out.deadline_ns = DefaultNowNs() + NsFromMs(out.rto_ms);
-      out.payload_offset = 0;
+      out.xmit_count = 1;
       const uint8_t* ip = pkt + 14;
       const size_t ihl = static_cast<size_t>(ip[0] & 0x0F) * 4U;
       const uint8_t* tcp = ip + ihl;
       const size_t data_off = static_cast<size_t>((tcp[12] >> 4) & 0x0F) * 4U;
       const uint8_t* payload = tcp + data_off;
-      out.payload.assign(payload, payload + payload_len);
-      flow->outstanding = std::move(out);
-      flow->rto_deadline_ns = flow->outstanding->deadline_ns;
-      stats_.tx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
+      out.data.assign(payload, payload + payload_len);
+      flow->unacked.push_back(std::move(out));
+      if (flow->rto_deadline_ns == 0) {
+        flow->cur_rto_ms = flow->cur_rto_ms ? flow->cur_rto_ms : config_.initial_rto_ms;
+        flow->rto_deadline_ns = DefaultNowNs() + NsFromMs(flow->cur_rto_ms);
+      }
+      stats_shard_[flow_shard].tx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
       ScheduleFlowTimers(*flow, flow->last_activity_ns);
       updated++;
       continue;
@@ -306,6 +406,22 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
   return updated;
 }
 
+void TcpDataplaneCore::SetEphemeralPortBase(uint16_t base) {
+  std::lock_guard<SpinLock> sguard(state_mu_);
+  next_ephemeral_port_ = base;
+  ephemeral_port_base_ = base;
+}
+
+void TcpDataplaneCore::SetEphemeralPortStride(uint16_t stride) {
+  std::lock_guard<SpinLock> sguard(state_mu_);
+  ephemeral_port_stride_ = stride == 0 ? 1 : stride;
+}
+
+void TcpDataplaneCore::SetFlowIdBase(uint64_t base) {
+  std::lock_guard<SpinLock> sguard(state_mu_);
+  next_flow_id_ = base == 0 ? 1 : base;
+}
+
 uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port) {
   if (src_ip == 0 || dst_ip == 0 || dst_port == 0) {
     return 0;
@@ -313,11 +429,18 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   uint64_t flow_id = 0;
   uint32_t flow_iss = 0;
   if (src_port == 0) {
-    std::lock_guard<std::mutex> sguard(state_mu_);
-    src_port = static_cast<uint16_t>(next_ephemeral_port_++);
+    std::lock_guard<SpinLock> sguard(state_mu_);
+    src_port = static_cast<uint16_t>(next_ephemeral_port_);
+    next_ephemeral_port_ += ephemeral_port_stride_;
+    // Wrap back to the base so a shard's ports stay in one residue class (mask
+    // steering). With stride 1 and base 40000 this preserves the legacy behaviour
+    // (natural uint16 wrap well above the base).
+    if (next_ephemeral_port_ > 65535u) {
+      next_ephemeral_port_ = ephemeral_port_base_;
+    }
   }
   {
-    std::lock_guard<std::mutex> sguard(state_mu_);
+    std::lock_guard<SpinLock> sguard(state_mu_);
     flow_id = next_flow_id_++;
     flow_iss = seq_seed_;
     seq_seed_ += 0x01010101U;
@@ -333,64 +456,74 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   flow.peer_window = 0;
   flow.local_window = config_.local_window;
   flow.mss = config_.default_mss;
+  flow.cwnd = 10u * static_cast<uint32_t>(config_.default_mss);  // IW10 (RFC 6928)
+  flow.snd_wscale = kSynWScale;
   flow.ttl = config_.default_ttl;
   flow.state = TcpDpState::kSynSent;
   flow.last_activity_ns = now_ns;
 
-  auto syn = BuildPacket(flow, flow.snd_nxt, 0, kTcpFlagSyn, nullptr, 0);
+    thread_local uint8_t tls_scratch_buf[2048];
+  uint8_t syn_opts[40];
+  // MSS + SACK-perm + WScale (+ TS when enabled). We only advertise TS in our SYN;
+  // ts_ok is confirmed on the SYN-ACK if the peer echoes a TS option.
+  const bool ts_offer = config_.enable_timestamps;
+  const size_t syn_opts_len = BuildSynOptions(syn_opts, kSynWScale, ts_offer, TimestampMs());
+  size_t syn_len = BuildPacketOpt(flow, flow.snd_nxt, 0, kTcpFlagSyn, nullptr, 0, syn_opts, syn_opts_len, tls_scratch_buf);
   flow.snd_nxt = AdvanceSeq(flow.snd_nxt, 1);
-  QueuePacket(flow, std::move(syn), flow.iss, 0, kTcpFlagSyn, nullptr, 0, true);
-  flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
+  QueuePacket(flow, tls_scratch_buf, syn_len, flow.iss, 0, kTcpFlagSyn, nullptr, 0, true);
+  // Store the SYN options so a retransmitted SYN replays them (BuildOutstandingPacket).
+  if (!flow.unacked.empty()) {
+    flow.unacked.back().opts.assign(syn_opts, syn_opts + syn_opts_len);
+  }
   {
     const size_t shard = FlowLockShardForFlowId(flow_id);
-    std::lock_guard<std::mutex> tguard(timer_shard_mu_[shard]);
+    std::lock_guard<SpinLock> tguard(timer_shard_mu_[shard]);
     active_flow_ids_shard_[shard].insert(flow_id);
   }
   ScheduleFlowTimers(flow, now_ns);
 
   const size_t index_shard = FlowIndexShardForKey(flow.key);
   const size_t flow_shard = FlowLockShardForFlowId(flow_id);
-  std::lock_guard<std::mutex> iguard(flow_index_shard_mu_[index_shard]);
-  std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+  std::lock_guard<SpinLock> iguard(flow_index_shard_mu_[index_shard]);
+  std::lock_guard<SpinLock> fguard(flow_shard_mu_[flow_shard]);
   flows_by_id_shard_[flow_shard][flow_id] = flow;
   flow_index_shard_[index_shard][flow.key] = flow_id;
-  stats_.flows_active.fetch_add(1, std::memory_order_relaxed);
-  stats_.connect_attempts.fetch_add(1, std::memory_order_relaxed);
+  stats_shard_[FlowLockShardForFlowId(flow_id)].flows_active.fetch_add(1, std::memory_order_relaxed);
+  stats_shard_[flow_shard].connect_attempts.fetch_add(1, std::memory_order_relaxed);
   return flow_id;
 }
 
 uint32_t TcpDataplaneCore::EnqueueSend(uint64_t flow_id, const uint8_t* payload, size_t payload_len) {
-  if (!payload || payload_len == 0 || payload_len > 65535U) {
+  if (!payload || payload_len == 0) {
     return 0;
   }
   const size_t flow_shard = FlowLockShardForFlowId(flow_id);
-  std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+  std::lock_guard<SpinLock> fguard(flow_shard_mu_[flow_shard]);
   auto it = flows_by_id_shard_[flow_shard].find(flow_id);
   if (it == flows_by_id_shard_[flow_shard].end()) {
     return 0;
   }
   FlowEntry* flow = &it->second;
-  if (flow->state != TcpDpState::kEstablished || flow->outstanding.has_value()) {
+  if (flow->state != TcpDpState::kEstablished) {
     return 0;
   }
-  auto pkt =
-      BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh), payload, payload_len);
-  const uint32_t seq = flow->snd_nxt;
-  flow->snd_nxt = AdvanceSeq(flow->snd_nxt, static_cast<uint32_t>(payload_len));
-  flow->last_activity_ns = DefaultNowNs();
-  QueuePacket(
-      *flow,
-      std::move(pkt),
-      seq,
-      flow->rcv_nxt,
-      static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh),
-      payload,
-      static_cast<uint32_t>(payload_len),
-      true);
-  flow->rto_deadline_ns = flow->outstanding ? flow->outstanding->deadline_ns : 0;
-  ScheduleFlowTimers(*flow, flow->last_activity_ns);
-  stats_.tx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
-  return static_cast<uint32_t>(payload_len);
+  // socket send() semantics: accepted bytes are copied into the per-flow send
+  // buffer (== owned by us), so a short write is safe — the caller re-offers only
+  // its unaccepted tail. PumpSend then clocks the buffer onto the wire in
+  // MSS-sized segments as the effective window min(cwnd, rwnd) allows. This
+  // replaces the legacy one-outstanding-segment gate (stop-and-wait).
+  const size_t buffered = flow->sndbuf.size() - flow->sndbuf_head;
+  const size_t room = kSndBufCap > buffered ? kSndBufCap - buffered : 0;
+  const size_t accept = std::min(payload_len, room);
+  if (accept == 0) {
+    return 0;  // send buffer full -> backpressure, caller retries later
+  }
+  flow->sndbuf.insert(flow->sndbuf.end(), payload, payload + accept);
+  const uint64_t now_ns = DefaultNowNs();
+  flow->last_activity_ns = now_ns;
+  PumpSend(*flow, now_ns);
+  ScheduleFlowTimers(*flow, now_ns);
+  return static_cast<uint32_t>(accept);
 }
 
 uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len) {
@@ -412,25 +545,28 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     return 0;
   }
 
+  TcpOptionInfo opt;
+  ParseTcpOptions(frame, frame_len, &opt);
+
   uint64_t flow_id = 0;
-  stats_.rx_frames.fetch_add(1, std::memory_order_relaxed);
   const FlowKey key{dst_ip, src_ip, dst_port, src_port};
   const size_t index_shard = FlowIndexShardForKey(key);
+  stats_shard_[index_shard].rx_frames.fetch_add(1, std::memory_order_relaxed);
   {
-    std::lock_guard<std::mutex> iguard(flow_index_shard_mu_[index_shard]);
+    std::lock_guard<SpinLock> iguard(flow_index_shard_mu_[index_shard]);
     auto idx = flow_index_shard_[index_shard].find(key);
     if (idx == flow_index_shard_[index_shard].end()) {
-      stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[index_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
       return 0;
     }
     flow_id = idx->second;
   }
 
   const size_t flow_shard = FlowLockShardForFlowId(flow_id);
-  std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+  std::lock_guard<SpinLock> fguard(flow_shard_mu_[flow_shard]);
   auto it = flows_by_id_shard_[flow_shard].find(flow_id);
   if (it == flows_by_id_shard_[flow_shard].end()) {
-    stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
+    stats_shard_[flow_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
     return 0;
   }
   FlowEntry* flow = &it->second;
@@ -441,65 +577,108 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     return rc;
   };
   if (window > 0) {
-    flow->peer_window = window;
+    // Window scaling (RFC 7323): the SYN-ACK window itself is never scaled; every
+    // later segment's window is left-shifted by the peer's advertised shift.
+    const bool is_synack = (flags & kTcpFlagSyn) != 0;
+    uint32_t pw = is_synack ? static_cast<uint32_t>(window)
+                            : (static_cast<uint32_t>(window) << flow->rcv_wscale);
+    if (pw > (1u << 30)) pw = 1u << 30;
+    flow->peer_window = pw;
   }
 
   if ((flags & kTcpFlagRst) != 0) {
     SetFlowState(*flow, TcpDpState::kRstSeen);
-    flow->outstanding.reset();
+    flow->unacked.clear();
+    flow->sndbuf.clear();
+    flow->sndbuf_head = 0;
     flow->rto_deadline_ns = 0;
-    stats_.peer_rst_count.fetch_add(1, std::memory_order_relaxed);
+    flow->cur_rto_ms = 0;
+    stats_shard_[flow_shard].peer_rst_count.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, false, "peer_rst");
     return finish(1);
   }
 
   if ((flags & (kTcpFlagSyn | kTcpFlagAck)) == (kTcpFlagSyn | kTcpFlagAck) && flow->state == TcpDpState::kSynSent) {
     if (ack != flow->snd_nxt) {
-      stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[flow_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
       return finish(0);
     }
     flow->snd_una = ack;
     flow->rcv_nxt = seq + 1U;
     SetFlowState(*flow, TcpDpState::kSynAckRcvd);
-    flow->outstanding.reset();
+    // Negotiated options — we always offer SACK-permitted + WScale + MSS in our SYN,
+    // so honour whatever the peer echoed.
+    flow->sack_permitted = opt.sack_permitted;
+    flow->rcv_wscale = opt.has_wscale ? opt.wscale : 0;
+    if (opt.has_mss && opt.mss > 0 && opt.mss < flow->mss) {
+      flow->mss = opt.mss;  // effective MSS is the smaller of the two advertisements
+    }
+    // Timestamps (RFC 7323): active only if we offered AND the peer echoed a TS on the
+    // SYN-ACK. Seed ts_recent from its TSval so our first data segment echoes it.
+    if (config_.enable_timestamps && opt.has_ts) {
+      flow->ts_ok = true;
+      flow->ts_recent = opt.ts_val;
+    }
+    // Seed the RTO estimate from the handshake RTT (SYN -> SYN-ACK); the SYN was sent
+    // exactly once, so this is Karn-safe. UpdateRtt sets cur_rto_ms.
+    if (!flow->unacked.empty() && flow->unacked.front().xmit_count == 1) {
+      UpdateRtt(*flow, flow->unacked.front().sent_ns);
+    }
+    flow->unacked.clear();  // our SYN is acknowledged by this SYN-ACK
     flow->rto_deadline_ns = 0;
-    auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
-    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
+        thread_local uint8_t tls_scratch_buf[2048];
+    size_t ack_len = BuildSeg(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
+    QueuePacket(*flow, tls_scratch_buf, ack_len, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
     SetFlowState(*flow, TcpDpState::kEstablished);
-    stats_.connect_established.fetch_add(1, std::memory_order_relaxed);
+    stats_shard_[flow_shard].connect_established.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, true, "connect_established");
     return finish(1);
   }
 
   if ((flags & kTcpFlagAck) != 0) {
-    HandleAck(*flow, ack);
-    stats_.rx_ack_count.fetch_add(1, std::memory_order_relaxed);
+    HandleAck(*flow, ack, &opt);
+    stats_shard_[FlowLockShardForFlowId(flow_id)].rx_ack_count.fetch_add(1, std::memory_order_relaxed);
+    // A pure window update (no new data acked) can also reopen the send window.
+    PumpSend(*flow, flow->last_activity_ns);
   }
 
   if (payload_len > 0) {
+    // PAWS (RFC 7323, opt-in TS): drop an old duplicate whose TSval regressed and
+    // re-acknowledge the current receive point.
+    if (PawsReject(*flow, &opt)) {
+      stats_shard_[flow_shard].out_of_order_rx_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[flow_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
+      SendAckNow(*flow);
+      return finish(1);
+    }
     if (flow->rcv_nxt != 0 && seq != flow->rcv_nxt) {
-      stats_.out_of_order_rx_count.fetch_add(1, std::memory_order_relaxed);
-      stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
-      auto dup_ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
-      QueuePacket(*flow, std::move(dup_ack_pkt), flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
+      stats_shard_[flow_shard].out_of_order_rx_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[flow_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
+            thread_local uint8_t tls_scratch_buf[2048];
+      size_t dup_ack_len = BuildSeg(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
+      QueuePacket(*flow, tls_scratch_buf, dup_ack_len, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
       return finish(1);
     }
     flow->rcv_nxt = AdvanceSeq(seq, payload_len);
-    stats_.rx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
+    // RFC 7323: record the peer's TSval (this in-order segment covers rcv_nxt) so our
+    // next segment echoes it back in TSecr.
+    if (flow->ts_ok && opt.has_ts) flow->ts_recent = opt.ts_val;
+    stats_shard_[flow_shard].rx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
     {
-      std::lock_guard<std::mutex> qguard(tx_mu_);
+      std::lock_guard<SpinLock> qguard(tx_mu_);
       rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, ExtractIpv4TcpPayload(frame, frame_len)});
     }
-    auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
-    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
+    // Acknowledge (immediately, or delayed when the opt-in delayed-ACK is enabled).
+    OnDataReceivedAck(*flow, DefaultNowNs(), /*force_now=*/false);
   }
 
   if ((flags & kTcpFlagFin) != 0) {
     flow->rcv_nxt = AdvanceSeq(flow->rcv_nxt, 1U);
-    auto ack_pkt = BuildPacket(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0);
-    QueuePacket(*flow, std::move(ack_pkt), flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
+    if (flow->ts_ok && opt.has_ts) flow->ts_recent = opt.ts_val;
+    // Force an immediate ACK on FIN (also flushes any withheld delayed ACK).
+    SendAckNow(*flow);
     SetFlowState(*flow, TcpDpState::kTimeWait);
-    stats_.peer_fin_count.fetch_add(1, std::memory_order_relaxed);
+    stats_shard_[flow_shard].peer_fin_count.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, true, "peer_fin");
   }
   (void)ttl;
@@ -513,26 +692,31 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
   if (now_ns == 0) {
     now_ns = DefaultNowNs();
   }
-  stats_.poll_calls.fetch_add(1, std::memory_order_relaxed);
+  stats_shard_[poll_rr_shard_ % kFlowLockShards].poll_calls.fetch_add(1, std::memory_order_relaxed);
   uint32_t actions = 0;
   while (actions < budget) {
     TimerEntry entry{};
     size_t selected_shard = kFlowLockShards;
     bool have_entry = false;
     {
-      bool scanned_any = false;
       for (size_t probe = 0; probe < kFlowLockShards; ++probe) {
         const size_t shard = static_cast<size_t>((poll_rr_shard_ + probe) % static_cast<uint32_t>(kFlowLockShards));
-        std::lock_guard<std::mutex> tguard(timer_shard_mu_[shard]);
-        if (timer_heap_shard_[shard].empty()) {
+        // Lock-free skip: nothing in this shard is due yet.
+        if (timer_shard_min_due_ns_[shard].load(std::memory_order_relaxed) > now_ns) {
           continue;
         }
-        scanned_any = true;
+        std::lock_guard<SpinLock> tguard(timer_shard_mu_[shard]);
+        if (timer_heap_shard_[shard].empty()) {
+          RefreshTimerHint(shard);
+          continue;
+        }
         const TimerEntry top = timer_heap_shard_[shard].top();
         if (top.due_ns == 0 || top.due_ns > now_ns) {
+          RefreshTimerHint(shard);
           continue;
         }
         timer_heap_shard_[shard].pop();
+        RefreshTimerHint(shard);
         if (active_flow_ids_shard_[shard].find(top.flow_id) == active_flow_ids_shard_[shard].end()) {
           continue;
         }
@@ -542,7 +726,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
         poll_rr_shard_ = static_cast<uint32_t>((shard + 1) % kFlowLockShards);
         break;
       }
-      if (!scanned_any || !have_entry) {
+      if (!have_entry) {
         break;
       }
     }
@@ -550,7 +734,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
       break;
     }
 
-    std::lock_guard<std::mutex> fguard(flow_shard_mu_[selected_shard]);
+    std::lock_guard<SpinLock> fguard(flow_shard_mu_[selected_shard]);
     auto it = flows_by_id_shard_[selected_shard].find(entry.flow_id);
     if (it == flows_by_id_shard_[selected_shard].end()) {
       continue;
@@ -558,7 +742,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
     FlowEntry* flow = &it->second;
     switch (entry.kind) {
       case TimerKind::kRto: {
-        if (entry.generation != flow->rto_timer_gen || !flow->outstanding.has_value() || flow->rto_deadline_ns == 0 ||
+        if (entry.generation != flow->rto_timer_gen || flow->unacked.empty() || flow->rto_deadline_ns == 0 ||
             flow->rto_deadline_ns != entry.due_ns) {
           break;
         }
@@ -569,12 +753,29 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
           break;
         }
         flow->retransmit_count++;
-        stats_.retransmit_count.fetch_add(1, std::memory_order_relaxed);
-        flow->outstanding->rto_ms = std::min(flow->outstanding->rto_ms * 2U, config_.connect_timeout_ms);
-        flow->outstanding->deadline_ns = now_ns + NsFromMs(flow->outstanding->rto_ms);
-        flow->rto_deadline_ns = flow->outstanding->deadline_ns;
-        auto pkt = BuildOutstandingPacket(*flow, *flow->outstanding);
-        (void)EnqueueTxPacketBytes(pkt.data(), pkt.size());
+        stats_shard_[selected_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
+        // RTO recovery (Reno): remember half the flight as ssthresh, collapse cwnd
+        // to one segment, and slow-start again.
+        {
+          const uint32_t rmss = EffectiveMss(*flow);
+          const uint32_t flight = flow->snd_nxt - flow->snd_una;
+          flow->ssthresh = std::max(flight / 2u, 2u * rmss);
+          flow->cwnd = rmss;
+          flow->in_fast_recovery = false;
+          flow->dup_ack_streak = 0;
+          // Abort any RFC 6675 episode: the RTO governs recovery now (go-back-N from
+          // snd_una). Keep SACK marks so we still skip SACKed holes, but reset the
+          // retransmitted flags + high_rxt so a fresh episode can re-arm later.
+          flow->sack_recovery = false;
+          flow->high_rxt = flow->snd_una;
+          for (auto& s : flow->unacked) s.retransmitted = false;
+          stats_shard_[selected_shard].congestion_window_reductions.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Exponential backoff of the retransmit timer, then resend the oldest segment.
+        flow->cur_rto_ms =
+            std::min((flow->cur_rto_ms ? flow->cur_rto_ms : config_.initial_rto_ms) * 2U, config_.connect_timeout_ms);
+        flow->rto_deadline_ns = now_ns + NsFromMs(flow->cur_rto_ms);
+        RetransmitOldest(*flow);
         ScheduleFlowTimers(*flow, now_ns);
         actions++;
         break;
@@ -589,7 +790,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
         if (flow->rto_deadline_ns > 0 && now_ns >= flow->rto_deadline_ns) {
           break;
         }
-        if (flow->state == TcpDpState::kSynSent && flow->outstanding.has_value() && now_ns >= flow->connect_deadline_ns) {
+        if (flow->state == TcpDpState::kSynSent && !flow->unacked.empty() && now_ns >= flow->connect_deadline_ns) {
           CloseTimedOutFlow(*flow, TcpDpState::kClosed, "connect_timeout");
           ScheduleFlowTimers(*flow, now_ns);
           actions++;
@@ -601,13 +802,27 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
             flow->idle_deadline_ns != entry.due_ns) {
           break;
         }
-        if (flow->state == TcpDpState::kEstablished && !flow->outstanding.has_value() && now_ns >= flow->idle_deadline_ns) {
+        if (flow->state == TcpDpState::kEstablished && flow->unacked.empty() && now_ns >= flow->idle_deadline_ns) {
           CloseTimedOutFlow(*flow, TcpDpState::kTimeWait, "idle_timeout");
           ScheduleFlowTimers(*flow, now_ns);
           actions++;
         }
         break;
       }
+      case TimerKind::kDelayedAck: {
+        // Delayed-ACK expiry: flush the withheld acknowledgement (opt-in path).
+        if (entry.generation != flow->delack_timer_gen || flow->delack_deadline_ns == 0 ||
+            flow->delack_deadline_ns != entry.due_ns) {
+          break;
+        }
+        if (flow->pending_ack_segs > 0) {
+          SendAckNow(*flow);
+          actions++;
+        }
+        break;
+      }
+      case TimerKind::kZeroWindowProbe:
+        break;
     }
   }
   return actions;
@@ -627,7 +842,7 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
   *out_packet_size = 0;
   *out_stride = 0;
 
-  std::lock_guard<std::mutex> guard(tx_mu_);
+  std::lock_guard<SpinLock> guard(tx_mu_);
   if (tx_pin_active_) {
     if (tx_pin_count_ == 0) {
       tx_pin_active_ = false;
@@ -691,7 +906,7 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
 }
 
 uint32_t TcpDataplaneCore::ConsumeTxPackets(uint32_t max_packets) {
-  std::lock_guard<std::mutex> guard(tx_mu_);
+  std::lock_guard<SpinLock> guard(tx_mu_);
   if (max_packets == 0) {
     return 0;
   }
@@ -755,7 +970,7 @@ uint32_t TcpDataplaneCore::ConsumeTxPackets(uint32_t max_packets) {
 }
 
 std::vector<TcpDpCompletion> TcpDataplaneCore::CollectCompletions() {
-  std::lock_guard<std::mutex> guard(tx_mu_);
+  std::lock_guard<SpinLock> guard(tx_mu_);
   std::vector<TcpDpCompletion> out;
   out.reserve(completions_.size());
   while (!completions_.empty()) {
@@ -766,7 +981,7 @@ std::vector<TcpDpCompletion> TcpDataplaneCore::CollectCompletions() {
 }
 
 std::vector<TcpDpRxPayload> TcpDataplaneCore::CollectRxPayloads() {
-  std::lock_guard<std::mutex> guard(tx_mu_);
+  std::lock_guard<SpinLock> guard(tx_mu_);
   std::vector<TcpDpRxPayload> out;
   out.reserve(rx_payloads_.size());
   while (!rx_payloads_.empty()) {
@@ -777,38 +992,41 @@ std::vector<TcpDpRxPayload> TcpDataplaneCore::CollectRxPayloads() {
 }
 
 TcpDpStatsSnapshot TcpDataplaneCore::SnapshotStats() const {
-  TcpDpStatsSnapshot out;
-  out.flows_active = stats_.flows_active.load(std::memory_order_relaxed);
-  out.connect_attempts = stats_.connect_attempts.load(std::memory_order_relaxed);
-  out.connect_established = stats_.connect_established.load(std::memory_order_relaxed);
-  out.retransmit_count = stats_.retransmit_count.load(std::memory_order_relaxed);
-  out.timeout_close_count = stats_.timeout_close_count.load(std::memory_order_relaxed);
-  out.connect_timeout_count = stats_.connect_timeout_count.load(std::memory_order_relaxed);
-  out.idle_timeout_count = stats_.idle_timeout_count.load(std::memory_order_relaxed);
-  out.retransmit_exhausted_count = stats_.retransmit_exhausted_count.load(std::memory_order_relaxed);
-  out.rx_ack_count = stats_.rx_ack_count.load(std::memory_order_relaxed);
-  out.dup_ack_count = stats_.dup_ack_count.load(std::memory_order_relaxed);
-  out.partial_ack_count = stats_.partial_ack_count.load(std::memory_order_relaxed);
-  out.fast_retransmit_count = stats_.fast_retransmit_count.load(std::memory_order_relaxed);
-  out.unexpected_ack_count = stats_.unexpected_ack_count.load(std::memory_order_relaxed);
-  out.tx_data_bytes = stats_.tx_data_bytes.load(std::memory_order_relaxed);
-  out.rx_data_bytes = stats_.rx_data_bytes.load(std::memory_order_relaxed);
-  out.poll_calls = stats_.poll_calls.load(std::memory_order_relaxed);
-  out.rx_frames = stats_.rx_frames.load(std::memory_order_relaxed);
-  out.unexpected_rx = stats_.unexpected_rx.load(std::memory_order_relaxed);
-  out.out_of_order_rx_count = stats_.out_of_order_rx_count.load(std::memory_order_relaxed);
-  out.peer_rst_count = stats_.peer_rst_count.load(std::memory_order_relaxed);
-  out.peer_fin_count = stats_.peer_fin_count.load(std::memory_order_relaxed);
-  out.tx_packets_queued = tx_packets_queued_.load(std::memory_order_relaxed);
-  out.tx_packets_drained = tx_packets_drained_.load(std::memory_order_relaxed);
-  out.tx_packets_sent = tx_packets_sent_.load(std::memory_order_relaxed);
+  TcpDpStatsSnapshot out{};
+  for (size_t i = 0; i < kFlowLockShards; ++i) {
+    out.flows_active += stats_shard_[i].flows_active.load(std::memory_order_relaxed);
+    out.connect_attempts += stats_shard_[i].connect_attempts.load(std::memory_order_relaxed);
+    out.connect_established += stats_shard_[i].connect_established.load(std::memory_order_relaxed);
+    out.retransmit_count += stats_shard_[i].retransmit_count.load(std::memory_order_relaxed);
+    out.timeout_close_count += stats_shard_[i].timeout_close_count.load(std::memory_order_relaxed);
+    out.connect_timeout_count += stats_shard_[i].connect_timeout_count.load(std::memory_order_relaxed);
+    out.idle_timeout_count += stats_shard_[i].idle_timeout_count.load(std::memory_order_relaxed);
+    out.retransmit_exhausted_count += stats_shard_[i].retransmit_exhausted_count.load(std::memory_order_relaxed);
+    out.rx_ack_count += stats_shard_[i].rx_ack_count.load(std::memory_order_relaxed);
+    out.dup_ack_count += stats_shard_[i].dup_ack_count.load(std::memory_order_relaxed);
+    out.partial_ack_count += stats_shard_[i].partial_ack_count.load(std::memory_order_relaxed);
+    out.fast_retransmit_count += stats_shard_[i].fast_retransmit_count.load(std::memory_order_relaxed);
+    out.unexpected_ack_count += stats_shard_[i].unexpected_ack_count.load(std::memory_order_relaxed);
+    out.tx_data_bytes += stats_shard_[i].tx_data_bytes.load(std::memory_order_relaxed);
+    out.rx_data_bytes += stats_shard_[i].rx_data_bytes.load(std::memory_order_relaxed);
+    out.poll_calls += stats_shard_[i].poll_calls.load(std::memory_order_relaxed);
+    out.rx_frames += stats_shard_[i].rx_frames.load(std::memory_order_relaxed);
+    out.unexpected_rx += stats_shard_[i].unexpected_rx.load(std::memory_order_relaxed);
+    out.out_of_order_rx_count += stats_shard_[i].out_of_order_rx_count.load(std::memory_order_relaxed);
+    out.peer_rst_count += stats_shard_[i].peer_rst_count.load(std::memory_order_relaxed);
+    out.peer_fin_count += stats_shard_[i].peer_fin_count.load(std::memory_order_relaxed);
+    out.sack_blocks_rx_count += stats_shard_[i].sack_blocks_rx_count.load(std::memory_order_relaxed);
+    out.zero_window_probes_sent += stats_shard_[i].zero_window_probes_sent.load(std::memory_order_relaxed);
+    out.congestion_window_reductions += stats_shard_[i].congestion_window_reductions.load(std::memory_order_relaxed);
+    out.native_tls_handshakes_completed += stats_shard_[i].native_tls_handshakes_completed.load(std::memory_order_relaxed);
+  }
   return out;
 }
 
 TcpDpFlowSnapshot TcpDataplaneCore::GetFlow(uint64_t flow_id) const {
   TcpDpFlowSnapshot out;
   const size_t flow_shard = FlowLockShardForFlowId(flow_id);
-  std::lock_guard<std::mutex> fguard(flow_shard_mu_[flow_shard]);
+  std::lock_guard<SpinLock> fguard(flow_shard_mu_[flow_shard]);
   auto it = flows_by_id_shard_[flow_shard].find(flow_id);
   if (it == flows_by_id_shard_[flow_shard].end()) {
     return out;
@@ -825,6 +1043,49 @@ TcpDpFlowSnapshot TcpDataplaneCore::GetFlow(uint64_t flow_id) const {
   out.rcv_nxt = flow.rcv_nxt;
   out.peer_window = flow.peer_window;
   out.local_window = flow.local_window;
+  out.snd_wscale = flow.snd_wscale;
+  out.rcv_wscale = flow.rcv_wscale;
+  out.sack_permitted = flow.sack_permitted;
+  out.cwnd = flow.cwnd;
+  out.ssthresh = flow.ssthresh;
+  out.srtt_ms = flow.srtt_ms;
+  out.zero_window_probing = flow.zero_window_probing;
+  out.mss = flow.mss;
+  out.ttl = flow.ttl;
+  out.state = static_cast<uint8_t>(flow.state);
+  out.retransmit_count = flow.retransmit_count;
+  out.rto_deadline_ns = flow.rto_deadline_ns;
+  out.last_activity_ns = flow.last_activity_ns;
+  out.found = true;
+  return out;
+}
+
+TcpDpFlowSnapshot TcpDataplaneCore::GetFlowLockless(uint64_t flow_id) const {
+  TcpDpFlowSnapshot out;
+  const size_t flow_shard = FlowLockShardForFlowId(flow_id);
+  auto it = flows_by_id_shard_[flow_shard].find(flow_id);
+  if (it == flows_by_id_shard_[flow_shard].end()) {
+    return out;
+  }
+  const FlowEntry& flow = it->second;
+  out.flow_id = flow.flow_id;
+  out.src_ip = flow.key.src_ip;
+  out.dst_ip = flow.key.dst_ip;
+  out.src_port = flow.key.src_port;
+  out.dst_port = flow.key.dst_port;
+  out.iss = flow.iss;
+  out.snd_una = flow.snd_una;
+  out.snd_nxt = flow.snd_nxt;
+  out.rcv_nxt = flow.rcv_nxt;
+  out.peer_window = flow.peer_window;
+  out.local_window = flow.local_window;
+  out.snd_wscale = flow.snd_wscale;
+  out.rcv_wscale = flow.rcv_wscale;
+  out.sack_permitted = flow.sack_permitted;
+  out.cwnd = flow.cwnd;
+  out.ssthresh = flow.ssthresh;
+  out.srtt_ms = flow.srtt_ms;
+  out.zero_window_probing = flow.zero_window_probing;
   out.mss = flow.mss;
   out.ttl = flow.ttl;
   out.state = static_cast<uint8_t>(flow.state);
@@ -958,21 +1219,40 @@ std::vector<uint8_t> TcpDataplaneCore::ExtractIpv4TcpPayload(const uint8_t* pkt,
   return std::vector<uint8_t>(payload, payload + payload_len);
 }
 
-std::vector<uint8_t> TcpDataplaneCore::BuildPacket(
+size_t TcpDataplaneCore::BuildPacket(
     const FlowEntry& flow,
     uint32_t seq,
     uint32_t ack,
     uint8_t flags,
     const uint8_t* payload,
-    size_t payload_len) const {
+    size_t payload_len,
+    uint8_t* out_buffer) const {
+  return BuildPacketOpt(flow, seq, ack, flags, payload, payload_len, nullptr, 0, out_buffer);
+}
+
+size_t TcpDataplaneCore::BuildPacketOpt(
+    const FlowEntry& flow,
+    uint32_t seq,
+    uint32_t ack,
+    uint8_t flags,
+    const uint8_t* payload,
+    size_t payload_len,
+    const uint8_t* opts,
+    size_t opts_len,
+    uint8_t* out_buffer) const {
+  if (!out_buffer) return 0;
+  if (!opts) opts_len = 0;
+
   const size_t l2_len = 14;
   const size_t ip_len = 20;
-  const size_t tcp_len = 20;
-  std::vector<uint8_t> pkt(l2_len + ip_len + tcp_len + payload_len, 0);
+  const size_t tcp_len = 20 + opts_len;  // opts_len is a multiple of 4
+  const size_t total_pkt_len = l2_len + ip_len + tcp_len + payload_len;
 
-  pkt[12] = 0x08;
-  pkt[13] = 0x00;
-  uint8_t* ip = pkt.data() + l2_len;
+  std::memset(out_buffer, 0, total_pkt_len);
+
+  out_buffer[12] = 0x08;
+  out_buffer[13] = 0x00;
+  uint8_t* ip = out_buffer + l2_len;
   uint8_t* tcp = ip + ip_len;
   ip[0] = 0x45;
   const uint16_t total_len = htons(static_cast<uint16_t>(ip_len + tcp_len + payload_len));
@@ -992,11 +1272,14 @@ std::vector<uint8_t> TcpDataplaneCore::BuildPacket(
   std::memcpy(tcp + 2, &dst_port_be, sizeof(dst_port_be));
   std::memcpy(tcp + 4, &seq_be, sizeof(seq_be));
   std::memcpy(tcp + 8, &ack_be, sizeof(ack_be));
-  tcp[12] = 0x50;
+  tcp[12] = static_cast<uint8_t>((tcp_len / 4) << 4);  // data offset in 32-bit words
   tcp[13] = flags;
   const uint16_t win_be = htons(flow.local_window > 0 ? flow.local_window : config_.local_window);
   std::memcpy(tcp + 14, &win_be, sizeof(win_be));
-  if (payload_len > 0) {
+  if (opts_len > 0) {
+    std::memcpy(tcp + 20, opts, opts_len);
+  }
+  if (payload_len > 0 && payload) {
     std::memcpy(tcp + tcp_len, payload, payload_len);
   }
 
@@ -1004,7 +1287,141 @@ std::vector<uint8_t> TcpDataplaneCore::BuildPacket(
   std::memcpy(ip + 10, &ip_cksum, sizeof(ip_cksum));
   const uint16_t tcp_cksum = htons(TcpChecksum(ip, tcp, tcp_len + payload_len));
   std::memcpy(tcp + 16, &tcp_cksum, sizeof(tcp_cksum));
-  return pkt;
+
+  return total_pkt_len;
+}
+
+size_t TcpDataplaneCore::BuildSynOptions(uint8_t* out, uint8_t wscale, bool ts_enabled,
+                                         uint32_t ts_val) const {
+  size_t n = 0;
+  const uint16_t mss = config_.default_mss ? config_.default_mss : 1460;
+  out[n++] = kOptMss;      out[n++] = 4; out[n++] = static_cast<uint8_t>(mss >> 8); out[n++] = static_cast<uint8_t>(mss & 0xFF);
+  out[n++] = kOptSackPerm; out[n++] = 2;
+  if (ts_enabled) {
+    // Timestamp(10): kind+len+TSval(4)+TSecr(4). TSecr is 0 on the initial SYN.
+    out[n++] = kOptTimestamp; out[n++] = 10;
+    out[n++] = static_cast<uint8_t>(ts_val >> 24); out[n++] = static_cast<uint8_t>(ts_val >> 16);
+    out[n++] = static_cast<uint8_t>(ts_val >> 8);  out[n++] = static_cast<uint8_t>(ts_val & 0xFF);
+    out[n++] = 0; out[n++] = 0; out[n++] = 0; out[n++] = 0;  // TSecr = 0
+    out[n++] = kOptNop;
+    out[n++] = kOptWScale;   out[n++] = 3; out[n++] = wscale;
+    // MSS(4)+SACKperm(2)+TS(10)+NOP(1)+WScale(3) = 20 -> already 4-aligned.
+    return n;  // 20
+  }
+  // MSS(4) + SACK-permitted(2) + NOP(1) + WScale(3) + NOP + NOP = 12 bytes (4-aligned).
+  out[n++] = kOptNop;
+  out[n++] = kOptWScale;   out[n++] = 3; out[n++] = wscale;
+  out[n++] = kOptNop;      out[n++] = kOptNop;
+  return n;  // 12
+}
+
+uint32_t TcpDataplaneCore::TimestampMs() {
+  return static_cast<uint32_t>(DefaultNowNs() / 1000000ull);
+}
+
+size_t TcpDataplaneCore::BuildSegmentOptions(const FlowEntry& flow, uint8_t* out) const {
+  if (!flow.ts_ok) return 0;
+  // 2 NOP pad + Timestamp(10) = 12 bytes (4-aligned). TSval=now, TSecr=ts_recent.
+  const uint32_t ts_val = TimestampMs();
+  size_t n = 0;
+  out[n++] = kOptNop; out[n++] = kOptNop;
+  out[n++] = kOptTimestamp; out[n++] = 10;
+  out[n++] = static_cast<uint8_t>(ts_val >> 24); out[n++] = static_cast<uint8_t>(ts_val >> 16);
+  out[n++] = static_cast<uint8_t>(ts_val >> 8);  out[n++] = static_cast<uint8_t>(ts_val & 0xFF);
+  out[n++] = static_cast<uint8_t>(flow.ts_recent >> 24); out[n++] = static_cast<uint8_t>(flow.ts_recent >> 16);
+  out[n++] = static_cast<uint8_t>(flow.ts_recent >> 8);  out[n++] = static_cast<uint8_t>(flow.ts_recent & 0xFF);
+  return n;  // 12
+}
+
+size_t TcpDataplaneCore::BuildSeg(const FlowEntry& flow, uint32_t seq, uint32_t ack, uint8_t flags,
+                                  const uint8_t* payload, size_t payload_len, uint8_t* out_buffer) const {
+  if (flow.ts_ok) {
+    uint8_t opts[kTsOptLen];
+    const size_t opts_len = BuildSegmentOptions(flow, opts);
+    return BuildPacketOpt(flow, seq, ack, flags, payload, payload_len, opts, opts_len, out_buffer);
+  }
+  return BuildPacket(flow, seq, ack, flags, payload, payload_len, out_buffer);
+}
+
+bool TcpDataplaneCore::PawsReject(const FlowEntry& flow, const TcpOptionInfo* opt) const {
+  // RFC 7323 PAWS: drop an otherwise-acceptable segment whose TSval regressed.
+  if (!flow.ts_ok || opt == nullptr || !opt->has_ts) return false;
+  return SeqLt(opt->ts_val, flow.ts_recent);  // wrap-safe TSval < ts_recent
+}
+
+bool TcpDataplaneCore::ParseTcpOptions(const uint8_t* frame, size_t frame_len, TcpOptionInfo* out) {
+  if (!frame || !out) return false;
+  int ip_offset = -1;
+  if (frame_len >= 18) {
+    const uint16_t eth = ReadBe16(frame + 12);
+    if (eth == 0x8100 && frame_len >= 22) {
+      if (ReadBe16(frame + 16) == 0x0800) ip_offset = 18;
+    } else if (eth == 0x0800) {
+      ip_offset = 14;
+    }
+  }
+  if (ip_offset < 0 && ((frame[0] >> 4) & 0x0F) == 4) ip_offset = 0;
+  if (ip_offset < 0 || frame_len < static_cast<size_t>(ip_offset + 20)) return false;
+  const uint8_t ihl = static_cast<uint8_t>((frame[ip_offset] & 0x0F) * 4);
+  if (ihl < 20 || frame_len < static_cast<size_t>(ip_offset + ihl + 20)) return false;
+  const size_t tcp_off = static_cast<size_t>(ip_offset) + ihl;
+  const uint8_t data_off = static_cast<uint8_t>((frame[tcp_off + 12] >> 4) * 4);
+  if (data_off < 20 || frame_len < tcp_off + data_off) return false;
+  size_t i = tcp_off + 20;
+  const size_t end = tcp_off + data_off;
+  while (i < end) {
+    const uint8_t kind = frame[i];
+    if (kind == kOptEnd) break;
+    if (kind == kOptNop) { i++; continue; }
+    if (i + 1 >= end) break;
+    const uint8_t len = frame[i + 1];
+    if (len < 2 || i + len > end) break;
+    if (kind == kOptMss && len == 4) {
+      out->has_mss = true;
+      out->mss = ReadBe16(frame + i + 2);
+    } else if (kind == kOptWScale && len == 3) {
+      out->has_wscale = true;
+      out->wscale = frame[i + 2];
+    } else if (kind == kOptSackPerm && len == 2) {
+      out->sack_permitted = true;
+    } else if (kind == kOptSack && len >= 10 && ((len - 2) % 8) == 0) {
+      const int blocks = (len - 2) / 8;
+      for (int b = 0; b < blocks && out->sack_block_count < 4; ++b) {
+        const size_t off = i + 2 + static_cast<size_t>(b) * 8;
+        out->sack_left[out->sack_block_count] = ReadBe32(frame + off);
+        out->sack_right[out->sack_block_count] = ReadBe32(frame + off + 4);
+        out->sack_block_count++;
+      }
+    } else if (kind == kOptTimestamp && len == 10) {
+      out->has_ts = true;
+      out->ts_val = ReadBe32(frame + i + 2);
+      out->ts_ecr = ReadBe32(frame + i + 6);
+    }
+    i += len;
+  }
+  return true;
+}
+
+void TcpDataplaneCore::UpdateRtt(FlowEntry& flow, uint64_t sample_ns) {
+  if (sample_ns == 0) return;
+  const uint64_t now = DefaultNowNs();
+  if (now <= sample_ns) return;
+  uint32_t r_ms = static_cast<uint32_t>((now - sample_ns) / 1000000ULL);
+  if (r_ms == 0) r_ms = 1;  // floor sub-millisecond RTT
+  if (!flow.rtt_sampled) {
+    flow.srtt_ms = r_ms;
+    flow.rttvar_ms = r_ms / 2;
+    flow.rtt_sampled = true;
+  } else {
+    const int32_t err = static_cast<int32_t>(r_ms) - static_cast<int32_t>(flow.srtt_ms);
+    const uint32_t abs_err = err < 0 ? static_cast<uint32_t>(-err) : static_cast<uint32_t>(err);
+    flow.rttvar_ms = (flow.rttvar_ms * 3u + abs_err) / 4u;  // (1-1/4)·rttvar + 1/4·|err|
+    flow.srtt_ms = (flow.srtt_ms * 7u + r_ms) / 8u;         // (1-1/8)·srtt + 1/8·R
+  }
+  uint32_t rto = flow.srtt_ms + std::max(1u, 4u * flow.rttvar_ms);  // RFC 6298
+  if (rto < kMinRtoMs) rto = kMinRtoMs;
+  if (rto > config_.connect_timeout_ms) rto = config_.connect_timeout_ms;
+  flow.cur_rto_ms = rto;
 }
 
 bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len) {
@@ -1015,7 +1432,7 @@ bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len) {
   if (len > tx_ring_slot_size_) {
     pkt_prebuilt.assign(data, data + len);
   }
-  std::lock_guard<std::mutex> guard(tx_mu_);
+  std::lock_guard<SpinLock> guard(tx_mu_);
   if (len <= tx_ring_slot_size_ && tx_ring_count_ < static_cast<uint32_t>(tx_ring_capacity_)) {
     const uint32_t idx = tx_ring_tail_;
     const size_t base = static_cast<size_t>(idx) * tx_ring_slot_size_;
@@ -1045,8 +1462,9 @@ void TcpDataplaneCore::PushTimer(uint64_t flow_id, TimerKind kind, uint64_t due_
     return;
   }
   const size_t shard = FlowLockShardForFlowId(flow_id);
-  std::lock_guard<std::mutex> tguard(timer_shard_mu_[shard]);
+  std::lock_guard<SpinLock> tguard(timer_shard_mu_[shard]);
   timer_heap_shard_[shard].push(TimerEntry{due_ns, flow_id, kind, generation});
+  RefreshTimerHint(shard);
 }
 
 void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
@@ -1064,8 +1482,9 @@ void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
     return;
   }
 
-  if (flow.outstanding.has_value() && flow.outstanding->deadline_ns > 0) {
-    flow.rto_deadline_ns = flow.outstanding->deadline_ns;
+  // The RTO deadline itself is owned by the send path (PumpSend / HandleAck / Poll /
+  // QueuePacket); here we only (re)publish a timer entry for the current deadline.
+  if (!flow.unacked.empty() && flow.rto_deadline_ns > 0) {
     flow.rto_timer_gen++;
     PushTimer(flow.flow_id, TimerKind::kRto, flow.rto_deadline_ns, flow.rto_timer_gen);
   } else {
@@ -1073,7 +1492,7 @@ void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
     flow.rto_timer_gen++;
   }
 
-  if (flow.state == TcpDpState::kSynSent && flow.outstanding.has_value()) {
+  if (flow.state == TcpDpState::kSynSent && !flow.unacked.empty()) {
     flow.connect_deadline_ns = flow.last_activity_ns + NsFromMs(config_.connect_timeout_ms);
     flow.connect_timer_gen++;
     PushTimer(flow.flow_id, TimerKind::kConnectTimeout, flow.connect_deadline_ns, flow.connect_timer_gen);
@@ -1082,7 +1501,7 @@ void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
     flow.connect_timer_gen++;
   }
 
-  if (flow.state == TcpDpState::kEstablished && !flow.outstanding.has_value()) {
+  if (flow.state == TcpDpState::kEstablished && flow.unacked.empty()) {
     flow.idle_deadline_ns = flow.last_activity_ns + NsFromMs(config_.idle_timeout_ms);
     flow.idle_timer_gen++;
     PushTimer(flow.flow_id, TimerKind::kIdleTimeout, flow.idle_deadline_ns, flow.idle_timer_gen);
@@ -1092,17 +1511,283 @@ void TcpDataplaneCore::ScheduleFlowTimers(FlowEntry& flow, uint64_t now_ns) {
   }
 }
 
+uint32_t TcpDataplaneCore::EffectiveMss(const FlowEntry& flow) const {
+  uint32_t mss = flow.mss ? flow.mss : config_.default_mss;
+  if (mss == 0) mss = 1460u;
+  // Timestamps consume 12 bytes of every segment's TCP header; shrink the payload
+  // MSS so a full segment still fits the path MTU.
+  if (flow.ts_ok && mss > static_cast<uint32_t>(kTsOptLen)) {
+    mss -= static_cast<uint32_t>(kTsOptLen);
+  }
+  return mss;
+}
+
+uint64_t TcpDataplaneCore::CurrentRtoNs(const FlowEntry& flow) const {
+  const uint32_t rto_ms = flow.cur_rto_ms ? flow.cur_rto_ms : config_.initial_rto_ms;
+  return NsFromMs(rto_ms ? rto_ms : 250u);
+}
+
+std::vector<uint8_t> TcpDataplaneCore::AcquireSegBuf(FlowEntry& flow) {
+  if (!flow.seg_buf_pool.empty()) {
+    std::vector<uint8_t> buf = std::move(flow.seg_buf_pool.back());
+    flow.seg_buf_pool.pop_back();
+    buf.clear();  // keep capacity, drop stale contents (assign overwrites anyway)
+    return buf;
+  }
+  return {};
+}
+
+void TcpDataplaneCore::RecycleSegBuf(FlowEntry& flow, std::vector<uint8_t>&& buf) {
+  // Only pool buffers that actually own storage, and cap the hoard so a flow that
+  // briefly bursts does not pin memory forever.
+  if (buf.capacity() == 0 || flow.seg_buf_pool.size() >= kSegBufPoolCap) {
+    return;
+  }
+  flow.seg_buf_pool.push_back(std::move(buf));
+}
+
+uint32_t TcpDataplaneCore::EmitOneDataSegment(FlowEntry& flow, uint64_t now_ns, uint32_t window_room) {
+  const size_t buffered = flow.sndbuf.size() - flow.sndbuf_head;
+  if (buffered == 0 || window_room == 0) {
+    return 0;
+  }
+  const uint32_t mss = EffectiveMss(flow);
+  uint32_t seg_len = static_cast<uint32_t>(std::min<size_t>(buffered, mss));
+  if (seg_len > window_room) {
+    seg_len = window_room;
+  }
+  if (seg_len == 0) {
+    return 0;
+  }
+  // Nagle (opt-in): withhold a sub-MSS segment while any data is still unacknowledged,
+  // coalescing small writes. The first small write (no data in flight) always goes.
+  if (config_.enable_nagle && seg_len < mss && flow.snd_nxt != flow.snd_una) {
+    return 0;
+  }
+  const uint8_t* src = flow.sndbuf.data() + flow.sndbuf_head;
+  const bool is_tail = (flow.sndbuf_head + seg_len == flow.sndbuf.size());
+  const uint8_t flags = static_cast<uint8_t>(kTcpFlagAck | (is_tail ? kTcpFlagPsh : 0));
+  const uint32_t seq = flow.snd_nxt;
+  thread_local uint8_t scratch[65536];
+  const size_t pkt_len = BuildSeg(flow, seq, flow.rcv_nxt, flags, src, seg_len, scratch);
+  (void)EnqueueTxPacketBytes(scratch, pkt_len);
+  OutstandingTx seg;
+  seg.seq = seq;
+  seg.ack = flow.rcv_nxt;
+  seg.payload_len = seg_len;
+  seg.flags = flags;
+  seg.xmit_count = 1;
+  seg.sent_ns = now_ns;
+  seg.data = AcquireSegBuf(flow);
+  seg.data.assign(src, src + seg_len);
+  flow.unacked.push_back(std::move(seg));
+  flow.snd_nxt = AdvanceSeq(flow.snd_nxt, seg_len);
+  flow.sndbuf_head += seg_len;
+  stats_shard_[FlowLockShardForFlowId(flow.flow_id)].tx_data_bytes.fetch_add(
+      static_cast<uint64_t>(seg_len), std::memory_order_relaxed);
+  // Reclaim the consumed prefix of the send buffer.
+  if (flow.sndbuf_head >= flow.sndbuf.size()) {
+    flow.sndbuf.clear();
+    flow.sndbuf_head = 0;
+  } else if (flow.sndbuf_head >= kSndBufCompactThreshold) {
+    flow.sndbuf.erase(flow.sndbuf.begin(), flow.sndbuf.begin() + static_cast<std::ptrdiff_t>(flow.sndbuf_head));
+    flow.sndbuf_head = 0;
+  }
+  if (flow.rto_deadline_ns == 0) {
+    flow.rto_deadline_ns = now_ns + CurrentRtoNs(flow);
+  }
+  return seg_len;
+}
+
+void TcpDataplaneCore::PumpSend(FlowEntry& flow, uint64_t now_ns) {
+  if (flow.state != TcpDpState::kEstablished) {
+    return;
+  }
+  // In an RFC6675 SACK-recovery episode transmission is governed by pipe, not the
+  // plain window; defer to the recovery clock.
+  if (flow.sack_recovery) {
+    SackRecoveryTransmit(flow, now_ns);
+    return;
+  }
+  while (true) {
+    // Effective window is the tighter of the congestion window and the peer's
+    // advertised receive window; we may inject up to (awnd - in-flight) bytes.
+    const uint32_t flight = flow.snd_nxt - flow.snd_una;  // seq-space outstanding
+    const uint32_t rwnd = flow.peer_window ? flow.peer_window : config_.local_window;
+    const uint32_t awnd = std::min(flow.cwnd, rwnd);
+    if (flight >= awnd) {
+      break;  // window full: nothing more may be sent until an ACK opens it
+    }
+    if (EmitOneDataSegment(flow, now_ns, awnd - flight) == 0) {
+      break;  // buffer empty / window closed / Nagle-held
+    }
+  }
+}
+
+void TcpDataplaneCore::RetransmitOldest(FlowEntry& flow) {
+  if (flow.unacked.empty()) {
+    return;
+  }
+  thread_local uint8_t scratch[65536];
+  // SACK-aware: retransmit the lowest hole — the first segment the peer has NOT
+  // selectively acknowledged. Falls back to the head if every segment is SACKed.
+  OutstandingTx* seg = &flow.unacked.front();
+  for (auto& s : flow.unacked) {
+    if (!s.sacked) { seg = &s; break; }
+  }
+  seg->ack = flow.rcv_nxt;  // carry the freshest cumulative ACK on the resend
+  const size_t pkt_len = BuildOutstandingPacket(flow, *seg, scratch);
+  (void)EnqueueTxPacketBytes(scratch, pkt_len);
+  seg->xmit_count++;
+  seg->retransmitted = true;
+}
+
+// RFC 6675 IsLost(seg): the segment is deemed lost when at least DupThresh SACKed
+// segments (or DupThresh*SMSS SACKed bytes) lie above it in the scoreboard.
+bool TcpDataplaneCore::IsLostSeg(const FlowEntry& flow, uint32_t seg_seq) const {
+  const uint32_t mss = EffectiveMss(flow);
+  uint32_t sacked_segs_above = 0;
+  uint32_t sacked_bytes_above = 0;
+  for (const auto& s : flow.unacked) {
+    if (!s.sacked) continue;
+    if (SeqGt(s.seq, seg_seq)) {
+      sacked_segs_above++;
+      sacked_bytes_above += SegSeqLen(s.flags, s.payload_len);
+    }
+  }
+  return sacked_segs_above >= kDupThresh || sacked_bytes_above >= kDupThresh * mss;
+}
+
+// RFC 6675 SetPipe: estimate of bytes in flight over the scoreboard.
+uint32_t TcpDataplaneCore::ComputePipe(const FlowEntry& flow) const {
+  uint32_t pipe = 0;
+  for (const auto& s : flow.unacked) {
+    if (s.sacked) continue;
+    const uint32_t len = SegSeqLen(s.flags, s.payload_len);
+    if (!IsLostSeg(flow, s.seq)) pipe += len;  // original assumed in flight
+    if (s.retransmitted) pipe += len;          // retransmission also in flight
+  }
+  return pipe;
+}
+
+void TcpDataplaneCore::EnterSackRecovery(FlowEntry& flow, uint64_t now_ns) {
+  if (flow.sack_recovery) {
+    return;
+  }
+  const size_t stat_shard = FlowLockShardForFlowId(flow.flow_id);
+  const uint32_t mss = EffectiveMss(flow);
+  const uint32_t flight = flow.snd_nxt - flow.snd_una;
+  flow.ssthresh = std::max(flight / 2u, 2u * mss);
+  flow.cwnd = flow.ssthresh;               // RFC6675: cwnd = ssthresh, pipe governs
+  flow.recovery_point = flow.snd_nxt;      // exit once this is cumulatively acked
+  flow.high_rxt = flow.snd_una;
+  flow.sack_recovery = true;
+  flow.in_fast_recovery = false;           // SACK path supersedes the NewReno fallback
+  stats_shard_[stat_shard].congestion_window_reductions.fetch_add(1, std::memory_order_relaxed);
+  SackRecoveryTransmit(flow, now_ns);
+}
+
+void TcpDataplaneCore::SackRecoveryTransmit(FlowEntry& flow, uint64_t now_ns) {
+  const size_t stat_shard = FlowLockShardForFlowId(flow.flow_id);
+  thread_local uint8_t scratch[65536];
+  const uint32_t rwnd = flow.peer_window ? flow.peer_window : config_.local_window;
+  for (int guard = 0; guard < 4096; ++guard) {
+    const uint32_t pipe = ComputePipe(flow);
+    if (pipe >= flow.cwnd) {
+      break;  // pipe full
+    }
+    // NextSeg rule 1: lowest-seq lost hole not yet retransmitted.
+    OutstandingTx* hole = nullptr;
+    for (auto& s : flow.unacked) {
+      if (s.sacked || s.retransmitted) continue;
+      if (IsLostSeg(flow, s.seq)) { hole = &s; break; }
+    }
+    if (hole != nullptr) {
+      hole->ack = flow.rcv_nxt;
+      const size_t pkt_len = BuildOutstandingPacket(flow, *hole, scratch);
+      (void)EnqueueTxPacketBytes(scratch, pkt_len);
+      hole->xmit_count++;
+      hole->retransmitted = true;
+      const uint32_t hole_end = hole->seq + SegSeqLen(hole->flags, hole->payload_len);
+      if (SeqGt(hole_end, flow.high_rxt)) flow.high_rxt = hole_end;
+      stats_shard_[stat_shard].fast_retransmit_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    // NextSeg rule 2: new data, if the window allows.
+    const uint32_t flight = flow.snd_nxt - flow.snd_una;
+    const uint32_t rwnd_room = rwnd > flight ? rwnd - flight : 0;
+    const uint32_t cwnd_room = flow.cwnd > pipe ? flow.cwnd - pipe : 0;
+    const uint32_t room = std::min(cwnd_room, rwnd_room);
+    if (room > 0 && (flow.sndbuf.size() - flow.sndbuf_head) > 0) {
+      if (EmitOneDataSegment(flow, now_ns, room) > 0) {
+        continue;
+      }
+    }
+    // NextSeg rule 3: rescue retransmit — the highest-seq unSACKed, unretransmitted
+    // segment, to avoid an RTO when only tail segments remain outstanding.
+    OutstandingTx* rescue = nullptr;
+    for (auto& s : flow.unacked) {
+      if (s.sacked || s.retransmitted) continue;
+      rescue = &s;  // keep walking -> ends on the highest such segment
+    }
+    if (rescue != nullptr) {
+      rescue->ack = flow.rcv_nxt;
+      const size_t pkt_len = BuildOutstandingPacket(flow, *rescue, scratch);
+      (void)EnqueueTxPacketBytes(scratch, pkt_len);
+      rescue->xmit_count++;
+      rescue->retransmitted = true;
+      const uint32_t r_end = rescue->seq + SegSeqLen(rescue->flags, rescue->payload_len);
+      if (SeqGt(r_end, flow.high_rxt)) flow.high_rxt = r_end;
+      stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    break;  // nothing left to (re)transmit
+  }
+  if (!flow.unacked.empty() && flow.rto_deadline_ns == 0) {
+    flow.rto_deadline_ns = now_ns + CurrentRtoNs(flow);
+  }
+}
+
+void TcpDataplaneCore::SendAckNow(FlowEntry& flow) {
+  thread_local uint8_t scratch[65536];
+  const size_t len = BuildSeg(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0, scratch);
+  (void)EnqueueTxPacketBytes(scratch, len);
+  flow.pending_ack_segs = 0;
+  flow.delack_deadline_ns = 0;  // disarm (stale generation ignored on fire)
+}
+
+// Delayed-ACK (opt-in): with delayed ACKs disabled we ACK every segment immediately
+// (aggressive load-gen default). Enabled, we ACK every 2nd full segment or arm a
+// short timer so a lone segment is still acknowledged promptly.
+void TcpDataplaneCore::OnDataReceivedAck(FlowEntry& flow, uint64_t now_ns, bool force_now) {
+  if (!config_.enable_delayed_ack || force_now) {
+    SendAckNow(flow);
+    return;
+  }
+  flow.pending_ack_segs++;
+  if (flow.pending_ack_segs >= 2) {
+    SendAckNow(flow);
+    return;
+  }
+  // Arm the delACK timer (40ms, RFC 5681 upper bound is 500ms; LAN-oriented here).
+  flow.delack_timer_gen++;
+  flow.delack_deadline_ns = now_ns + NsFromMs(40u);
+  PushTimer(flow.flow_id, TimerKind::kDelayedAck, flow.delack_deadline_ns, flow.delack_timer_gen);
+}
+
 void TcpDataplaneCore::QueuePacket(
     FlowEntry& flow,
-    std::vector<uint8_t>&& packet,
+    const uint8_t* packet_data,
+    size_t packet_len,
     uint32_t seq,
     uint32_t ack,
     uint8_t flags,
     const uint8_t* payload,
     uint32_t payload_len,
     bool arm_rto) {
-  if (!packet.empty()) {
-    (void)EnqueueTxPacketBytes(packet.data(), packet.size());
+  if (packet_data != nullptr && packet_len > 0) {
+    (void)EnqueueTxPacketBytes(packet_data, packet_len);
   }
   if (!arm_rto) {
     return;
@@ -1112,29 +1797,45 @@ void TcpDataplaneCore::QueuePacket(
   out.ack = ack;
   out.flags = flags;
   out.payload_len = payload_len;
-  out.rto_ms = config_.initial_rto_ms;
-  out.deadline_ns = DefaultNowNs() + NsFromMs(out.rto_ms);
-  out.payload_offset = 0;
+  out.xmit_count = 1;
+  out.sent_ns = DefaultNowNs();
   if (payload != nullptr && payload_len > 0) {
-    out.payload.assign(payload, payload + payload_len);
+    out.data.assign(payload, payload + payload_len);
   }
-  flow.outstanding = std::move(out);
-  flow.rto_deadline_ns = flow.outstanding ? flow.outstanding->deadline_ns : 0;
+  flow.unacked.push_back(std::move(out));
+  if (flow.rto_deadline_ns == 0) {
+    if (flow.cur_rto_ms == 0) {
+      flow.cur_rto_ms = config_.initial_rto_ms;
+    }
+    flow.rto_deadline_ns = DefaultNowNs() + CurrentRtoNs(flow);
+  }
 }
 
-std::vector<uint8_t> TcpDataplaneCore::BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out) const {
+size_t TcpDataplaneCore::BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out, uint8_t* out_buffer) const {
   const uint8_t* payload_ptr = nullptr;
   size_t payload_size = 0;
-  if (out.payload_len > 0 &&
-      out.payload.size() >= static_cast<size_t>(out.payload_offset) + static_cast<size_t>(out.payload_len)) {
-    payload_ptr = out.payload.data() + out.payload_offset;
+  if (out.payload_len > 0 && out.data.size() >= static_cast<size_t>(out.payload_len)) {
+    payload_ptr = out.data.data();
     payload_size = static_cast<size_t>(out.payload_len);
   }
-  return BuildPacket(flow, out.seq, out.ack, out.flags, payload_ptr, payload_size);
+  // Replay the segment's stored options (e.g. the SYN's MSS/SACK-perm/WScale/TS) so a
+  // retransmitted SYN re-negotiates identically instead of dropping to a bare header.
+  if (!out.opts.empty()) {
+    return BuildPacketOpt(flow, out.seq, out.ack, out.flags, payload_ptr, payload_size,
+                          out.opts.data(), out.opts.size(), out_buffer);
+  }
+  // Ordinary data/ACK segments carry a freshly regenerated timestamp (TSval=now).
+  if (flow.ts_ok) {
+    uint8_t opts[kTsOptLen];
+    const size_t opts_len = BuildSegmentOptions(flow, opts);
+    return BuildPacketOpt(flow, out.seq, out.ack, out.flags, payload_ptr, payload_size,
+                          opts, opts_len, out_buffer);
+  }
+  return BuildPacket(flow, out.seq, out.ack, out.flags, payload_ptr, payload_size, out_buffer);
 }
 
 void TcpDataplaneCore::PushCompletion(uint64_t flow_id, TcpDpState state, bool success, const char* event) {
-  std::lock_guard<std::mutex> guard(tx_mu_);
+  std::lock_guard<SpinLock> guard(tx_mu_);
   completions_.push_back(TcpDpCompletion{flow_id, static_cast<uint8_t>(state), static_cast<uint8_t>(success ? 1 : 0), event});
 }
 
@@ -1159,101 +1860,303 @@ void TcpDataplaneCore::SetFlowState(FlowEntry& flow, TcpDpState next_state) {
   flow.state = next_state;
   {
     const size_t shard = FlowLockShardForFlowId(flow.flow_id);
-    std::lock_guard<std::mutex> tguard(timer_shard_mu_[shard]);
+    std::lock_guard<SpinLock> tguard(timer_shard_mu_[shard]);
     if (now_active) {
       active_flow_ids_shard_[shard].insert(flow.flow_id);
     } else {
       active_flow_ids_shard_[shard].erase(flow.flow_id);
     }
   }
-  if (was_active == now_active) {
-    return;
-  }
-  if (now_active) {
-    stats_.flows_active.fetch_add(1, std::memory_order_relaxed);
-  } else {
-    SaturatingDecrement(stats_.flows_active);
+  // flow.state yukarıda zaten next_state'e atandığından eski/yeni durum
+  // karşılaştırması, atamadan önce hesaplanan was_active/now_active ile yapılmalı.
+  if (now_active && !was_active) {
+    stats_shard_[FlowLockShardForFlowId(flow.flow_id)].flows_active.fetch_add(1, std::memory_order_relaxed);
+  } else if (was_active && !now_active) {
+    SaturatingDecrement(stats_shard_[FlowLockShardForFlowId(flow.flow_id)].flows_active);
   }
 }
 
-void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value) {
-  if (!flow.outstanding.has_value()) {
-    return;
+void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpOptionInfo* opt) {
+  const size_t stat_shard = FlowLockShardForFlowId(flow.flow_id);
+  if (flow.unacked.empty()) {
+    return;  // nothing outstanding to acknowledge
   }
-  if (ack_value == flow.snd_una) {
-    stats_.dup_ack_count.fetch_add(1, std::memory_order_relaxed);
-    flow.dup_ack_streak++;
-    if (flow.dup_ack_streak == 3) {
-      auto pkt = BuildOutstandingPacket(flow, *flow.outstanding);
-      (void)EnqueueTxPacketBytes(pkt.data(), pkt.size());
-      stats_.retransmit_count.fetch_add(1, std::memory_order_relaxed);
-      stats_.fast_retransmit_count.fetch_add(1, std::memory_order_relaxed);
-      flow.retransmit_count++;
-      flow.outstanding->deadline_ns = DefaultNowNs() + NsFromMs(flow.outstanding->rto_ms);
-      flow.rto_deadline_ns = flow.outstanding->deadline_ns;
+  const uint32_t mss = EffectiveMss(flow);
+  const uint64_t now_ns = DefaultNowNs();
+
+  // Selective ACK: mark any outstanding segment fully covered by a SACK block so the
+  // retransmit path skips it (holes only). SACK rides on dup-ACKs too, so apply it
+  // before the cumulative-ACK branching.
+  if (flow.sack_permitted && opt && opt->sack_block_count > 0) {
+    for (auto& s : flow.unacked) {
+      if (s.sacked) continue;
+      const uint32_t s_end = s.seq + SegSeqLen(s.flags, s.payload_len);
+      for (int b = 0; b < opt->sack_block_count; ++b) {
+        if (!SeqLt(s.seq, opt->sack_left[b]) && !SeqGt(s_end, opt->sack_right[b])) {
+          s.sacked = true;
+          stats_shard_[stat_shard].sack_blocks_rx_count.fetch_add(1, std::memory_order_relaxed);
+          break;
+        }
+      }
+    }
+  }
+
+  if (SeqLeq(ack_value, flow.snd_una)) {
+    // Old or duplicate ACK. A pure dup-ACK (== snd_una) with data outstanding is a
+    // loss signal: on the third, fast-retransmit the oldest segment and halve the
+    // window (NewReno-style fast recovery).
+    if (ack_value == flow.snd_una) {
+      stats_shard_[stat_shard].dup_ack_count.fetch_add(1, std::memory_order_relaxed);
+      flow.dup_ack_streak++;
+      const bool use_sack = config_.enable_rfc6675_recovery && flow.sack_permitted;
+      if (use_sack) {
+        if (!flow.sack_recovery) {
+          // Enter recovery on the classic 3 dup-ACKs OR early when the scoreboard
+          // already marks the oldest outstanding segment as lost (RFC 6675).
+          const bool oldest_lost =
+              !flow.unacked.empty() && IsLostSeg(flow, flow.unacked.front().seq);
+          if (oldest_lost || flow.dup_ack_streak >= kDupThresh) {
+            EnterSackRecovery(flow, now_ns);
+            flow.cur_rto_ms = 0;
+            flow.rto_deadline_ns = now_ns + CurrentRtoNs(flow);
+          }
+        } else {
+          // Already recovering: fresh SACK info may have opened the pipe.
+          SackRecoveryTransmit(flow, now_ns);
+        }
+      } else if (!flow.in_fast_recovery && flow.dup_ack_streak == 3) {
+        // NewReno fallback (no SACK negotiated).
+        const uint32_t flight = flow.snd_nxt - flow.snd_una;
+        flow.ssthresh = std::max(flight / 2u, 2u * mss);
+        flow.cwnd = flow.ssthresh + 3u * mss;  // inflate for the 3 dup-ACKs
+        flow.in_fast_recovery = true;
+        RetransmitOldest(flow);
+        stats_shard_[stat_shard].fast_retransmit_count.fetch_add(1, std::memory_order_relaxed);
+        stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
+        stats_shard_[stat_shard].congestion_window_reductions.fetch_add(1, std::memory_order_relaxed);
+        flow.cur_rto_ms = 0;
+        flow.rto_deadline_ns = now_ns + CurrentRtoNs(flow);
+      } else if (flow.in_fast_recovery) {
+        flow.cwnd = std::min(flow.cwnd + mss, kMaxCwnd);  // window inflation per extra dup-ACK
+        PumpSend(flow, now_ns);
+      }
     }
     return;
   }
-  flow.dup_ack_streak = 0;
-  const uint32_t covered = flow.outstanding->payload_len == 0 ? 1U : flow.outstanding->payload_len;
-  const uint32_t outstanding_end = AdvanceSeq(flow.outstanding->seq, covered);
-  if (ack_value > flow.snd_nxt) {
-    stats_.unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
-    stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
+
+  if (SeqGt(ack_value, flow.snd_nxt)) {
+    // Acknowledges data we never sent.
+    stats_shard_[stat_shard].unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
+    stats_shard_[stat_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  if (ack_value <= flow.outstanding->seq) {
-    stats_.unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
-    stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  if (ack_value < outstanding_end && flow.outstanding->payload_len > 1U) {
-    const uint32_t newly_acked = ack_value - flow.outstanding->seq;
-    if (newly_acked == 0 || newly_acked >= flow.outstanding->payload_len) {
-      stats_.unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
-      stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
-      return;
+
+  // New data acknowledged: ack_value in (snd_una, snd_nxt]. Retire fully-acked
+  // segments from the front of the queue; trim the head if it is partially acked.
+  const uint32_t acked_bytes = ack_value - flow.snd_una;
+  bool partial = false;
+  uint64_t rtt_sample_ns = 0;  // newest first-transmission time among fully-acked segs (Karn)
+  while (!flow.unacked.empty()) {
+    OutstandingTx& seg = flow.unacked.front();
+    const uint32_t seg_end = seg.seq + SegSeqLen(seg.flags, seg.payload_len);
+    if (SeqLeq(seg_end, ack_value)) {
+      if (seg.xmit_count == 1 && seg.sent_ns > rtt_sample_ns) rtt_sample_ns = seg.sent_ns;
+      RecycleSegBuf(flow, std::move(seg.data));  // reclaim storage before the element dies
+      flow.unacked.pop_front();  // fully acknowledged
+    } else if (SeqGt(ack_value, seg.seq)) {
+      const uint32_t drop = ack_value - seg.seq;
+      if (drop < seg.payload_len) {
+        seg.data.erase(seg.data.begin(), seg.data.begin() + static_cast<std::ptrdiff_t>(drop));
+        seg.payload_len -= drop;
+        seg.seq = ack_value;
+        partial = true;
+      }
+      break;
+    } else {
+      break;
     }
-    if (flow.outstanding->payload.size() <
-        static_cast<size_t>(flow.outstanding->payload_offset) + static_cast<size_t>(flow.outstanding->payload_len)) {
-      stats_.unexpected_ack_count.fetch_add(1, std::memory_order_relaxed);
-      stats_.unexpected_rx.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-    const uint32_t unacked_len = flow.outstanding->payload_len - newly_acked;
-    flow.outstanding->payload_offset += newly_acked;
-    flow.outstanding->seq = ack_value;
-    flow.outstanding->ack = flow.rcv_nxt;
-    flow.outstanding->flags = static_cast<uint8_t>(kTcpFlagAck | kTcpFlagPsh);
-    flow.outstanding->payload_len = unacked_len;
-    flow.outstanding->deadline_ns = DefaultNowNs() + NsFromMs(flow.outstanding->rto_ms);
-    flow.rto_deadline_ns = flow.outstanding->deadline_ns;
-    flow.snd_una = ack_value;
-    flow.retransmit_count = 0;
-    stats_.partial_ack_count.fetch_add(1, std::memory_order_relaxed);
-    return;
   }
   flow.snd_una = ack_value;
-  flow.outstanding.reset();
-  flow.rto_deadline_ns = 0;
+  if (partial) {
+    stats_shard_[stat_shard].partial_ack_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  // Round-trip sample from a non-retransmitted segment (Karn's algorithm) refreshes
+  // the RTO estimate and clears any prior backoff.
+  if (rtt_sample_ns != 0) {
+    UpdateRtt(flow, rtt_sample_ns);
+  }
+
+  // Congestion control on forward progress.
+  if (flow.sack_recovery) {
+    // RFC 6675: a cumulative ACK reaching the recovery point ends the episode; a
+    // partial ACK keeps us in recovery (no window growth) and SackRecoveryTransmit
+    // (via PumpSend below) clocks the next hole + new data under pipe.
+    if (!SeqLt(ack_value, flow.recovery_point)) {
+      flow.sack_recovery = false;
+      flow.cwnd = flow.ssthresh;
+      for (auto& s : flow.unacked) s.retransmitted = false;  // episode over
+    }
+  } else if (flow.in_fast_recovery) {
+    flow.in_fast_recovery = false;
+    flow.cwnd = flow.ssthresh;  // deflate on recovery exit
+  } else if (flow.cwnd < flow.ssthresh) {
+    flow.cwnd = std::min(flow.cwnd + std::min(acked_bytes, mss), kMaxCwnd);  // slow start
+  } else {
+    const uint32_t inc = std::max<uint32_t>(
+        1u, static_cast<uint32_t>((static_cast<uint64_t>(mss) * mss) / (flow.cwnd ? flow.cwnd : 1u)));
+    flow.cwnd = std::min(flow.cwnd + inc, kMaxCwnd);  // congestion avoidance (Reno)
+  }
+
+  flow.dup_ack_streak = 0;
   flow.retransmit_count = 0;
+  // RTO backoff is cleared only by a valid RTT sample (Karn); UpdateRtt above did so
+  // when a non-retransmitted segment was acked.
+
+  // Restart / disarm the single connection RTO timer (RFC 6298).
+  flow.rto_deadline_ns = flow.unacked.empty() ? 0 : now_ns + CurrentRtoNs(flow);
+
+  // The window may have opened; clock any buffered data onto the wire.
+  PumpSend(flow, now_ns);
 }
 
 void TcpDataplaneCore::CloseTimedOutFlow(FlowEntry& flow, TcpDpState terminal_state, const char* event) {
+  const size_t stat_shard = FlowLockShardForFlowId(flow.flow_id);
   SetFlowState(flow, terminal_state);
-  flow.outstanding.reset();
+  flow.unacked.clear();
+  flow.sndbuf.clear();
+  flow.sndbuf_head = 0;
   flow.rto_deadline_ns = 0;
-  stats_.timeout_close_count.fetch_add(1, std::memory_order_relaxed);
+  flow.cur_rto_ms = 0;
+  stats_shard_[stat_shard].timeout_close_count.fetch_add(1, std::memory_order_relaxed);
   if (event != nullptr) {
     if (std::strcmp(event, "connect_timeout") == 0) {
-      stats_.connect_timeout_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[stat_shard].connect_timeout_count.fetch_add(1, std::memory_order_relaxed);
     } else if (std::strcmp(event, "idle_timeout") == 0) {
-      stats_.idle_timeout_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[stat_shard].idle_timeout_count.fetch_add(1, std::memory_order_relaxed);
     } else if (std::strcmp(event, "retransmit_exhausted") == 0) {
-      stats_.retransmit_exhausted_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[stat_shard].retransmit_exhausted_count.fetch_add(1, std::memory_order_relaxed);
     }
   }
   PushCompletion(flow.flow_id, flow.state, false, event);
+}
+
+uint32_t TcpDataplaneCore::IngestDpdkRxBurst(void** mbufs, uint16_t count) {
+  if (!mbufs || count == 0) return 0;
+  uint32_t ingested = 0;
+#ifdef SAMURAI_WITH_DPDK
+  for (uint16_t i = 0; i < count; ++i) {
+    rte_mbuf* mbuf = reinterpret_cast<rte_mbuf*>(mbufs[i]);
+    if (!mbuf) continue;
+    const uint8_t* data = rte_pktmbuf_mtod(mbuf, const uint8_t*);
+    const uint32_t len = rte_pktmbuf_pkt_len(mbuf);
+    if (data && len > 0) {
+      ingested += IngestRxFrame(data, len);
+    }
+    rte_pktmbuf_free(mbuf);
+  }
+#else
+  (void)mbufs;
+  (void)count;
+#endif
+  return ingested;
+}
+
+uint32_t TcpDataplaneCore::DrainDpdkTxBurst(void* mempool_ptr, void** out_mbufs, uint16_t max_burst) {
+  if (!out_mbufs || max_burst == 0) return 0;
+  uint32_t produced = 0;
+#ifdef SAMURAI_WITH_DPDK
+  rte_mempool* mp = reinterpret_cast<rte_mempool*>(mempool_ptr);
+  if (!mp) return 0;
+
+  const uint8_t* base = nullptr;
+  uint32_t count = 0;
+  size_t pkt_size = 0;
+  size_t stride = 0;
+
+  if (PeekTxPacketsStrided(max_burst, &base, &count, &pkt_size, &stride) && count > 0 && base) {
+    const uint16_t alloc_count = static_cast<uint16_t>(count);
+    if (rte_pktmbuf_alloc_bulk(mp, reinterpret_cast<rte_mbuf**>(out_mbufs), alloc_count) == 0) {
+      for (uint32_t i = 0; i < count; ++i) {
+        rte_mbuf* mbuf = reinterpret_cast<rte_mbuf*>(out_mbufs[i]);
+        const uint8_t* src = base + i * stride;
+        uint8_t* dst = rte_pktmbuf_mtod(mbuf, uint8_t*);
+        std::memcpy(dst, src, pkt_size);
+        mbuf->pkt_len = static_cast<uint32_t>(pkt_size);
+        mbuf->data_len = static_cast<uint16_t>(pkt_size);
+      }
+      produced = count;
+    } else {
+      for (uint32_t i = 0; i < count; ++i) {
+        rte_mbuf* mbuf = rte_pktmbuf_alloc(mp);
+        if (!mbuf) break;
+        const uint8_t* src = base + i * stride;
+        uint8_t* dst = rte_pktmbuf_mtod(mbuf, uint8_t*);
+        std::memcpy(dst, src, pkt_size);
+        mbuf->pkt_len = static_cast<uint32_t>(pkt_size);
+        mbuf->data_len = static_cast<uint16_t>(pkt_size);
+        out_mbufs[produced++] = mbuf;
+      }
+    }
+    if (produced > 0) {
+      ConsumeTxPackets(produced);
+    }
+  }
+#else
+  (void)mempool_ptr;
+  (void)out_mbufs;
+  (void)max_burst;
+#endif
+  return produced;
+}
+
+std::vector<uint8_t> TcpDataplaneCore::BuildNativeTlsClientHello(const std::string& sni) const {
+  std::vector<uint8_t> record;
+  const std::string hostname = sni.empty() ? "localhost" : sni;
+  std::vector<uint8_t> hs;
+  hs.push_back(0x01); // Handshake Type: ClientHello
+  hs.push_back(0x00); hs.push_back(0x00); hs.push_back(0x00);
+  hs.push_back(0x03); hs.push_back(0x03); // TLS 1.2
+  for (int i = 0; i < 32; ++i) hs.push_back(static_cast<uint8_t>((i * 37 + 13) & 0xFF));
+  hs.push_back(0x00); // Session ID len 0
+  hs.push_back(0x00); hs.push_back(0x04); // Cipher suites len 4
+  hs.push_back(0x13); hs.push_back(0x01);
+  hs.push_back(0xc0); hs.push_back(0x2f);
+  hs.push_back(0x01); hs.push_back(0x00); // Compression
+  std::vector<uint8_t> ext;
+  ext.push_back(0x00); ext.push_back(0x00); // Server name extension
+  uint16_t sni_list_len = static_cast<uint16_t>(hostname.size() + 3);
+  uint16_t sni_ext_len = static_cast<uint16_t>(sni_list_len + 2);
+  ext.push_back(static_cast<uint8_t>((sni_ext_len >> 8) & 0xFF));
+  ext.push_back(static_cast<uint8_t>(sni_ext_len & 0xFF));
+  ext.push_back(static_cast<uint8_t>((sni_list_len >> 8) & 0xFF));
+  ext.push_back(static_cast<uint8_t>(sni_list_len & 0xFF));
+  ext.push_back(0x00);
+  ext.push_back(static_cast<uint8_t>((hostname.size() >> 8) & 0xFF));
+  ext.push_back(static_cast<uint8_t>(hostname.size() & 0xFF));
+  ext.insert(ext.end(), hostname.begin(), hostname.end());
+  uint16_t total_ext_len = static_cast<uint16_t>(ext.size());
+  hs.push_back(static_cast<uint8_t>((total_ext_len >> 8) & 0xFF));
+  hs.push_back(static_cast<uint8_t>(total_ext_len & 0xFF));
+  hs.insert(hs.end(), ext.begin(), ext.end());
+  uint32_t hs_body_len = static_cast<uint32_t>(hs.size() - 4);
+  hs[1] = static_cast<uint8_t>((hs_body_len >> 16) & 0xFF);
+  hs[2] = static_cast<uint8_t>((hs_body_len >> 8) & 0xFF);
+  hs[3] = static_cast<uint8_t>(hs_body_len & 0xFF);
+  record.push_back(0x16);
+  record.push_back(0x03); record.push_back(0x01);
+  uint16_t rec_len = static_cast<uint16_t>(hs.size());
+  record.push_back(static_cast<uint8_t>((rec_len >> 8) & 0xFF));
+  record.push_back(static_cast<uint8_t>(rec_len & 0xFF));
+  record.insert(record.end(), hs.begin(), hs.end());
+  return record;
+}
+
+bool TcpDataplaneCore::ParseNativeTlsServerHello(const uint8_t* payload, size_t len) const {
+  if (!payload || len < 9) return false;
+  if (payload[0] != 0x16) return false;
+  if (payload[5] != 0x02) return false;
+  stats_shard_[0].native_tls_handshakes_completed.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 }  // namespace ddos_samurai::tcpdp

@@ -3,4 +3,4 @@ name: ddos-samurai
 description: DDoSamurai distributed control plane (master/slave)
 type: application
 version: 0.3.0
-appVersion: "2.1.1"
+appVersion: "3.0.0"

@@ -1,27 +1,26 @@
-# Dashboard
+# 12 - İzleme, Grafana ve Telemetri Görünürlüğü
 
-Bu repo checkout'unda bagimsiz bir React/Vite dashboard kaynagi yoktur.
+DDoSamurai, çalışma zamanı metriklerini hem anlık CLI üzerinden hem de Prometheus ve Grafana üzerinden izlenebilir kılar.
 
-## Mevcut Gorunurluk Kaynaklari
+---
 
-1. Grafana/Prometheus
-- `monitoring/` altindaki stack
-- Runtime ve distributed metrikleri buradan izlenir
+## 1. İzleme Mimarisi
 
-2. Management API live endpointleri
-- SSE: `/v1/cluster/live/sse`
-- WebSocket: `/v1/cluster/live/ws`
+1. **Prometheus Metrik Çıkışı:**
+   Master ve Management API (`:8089/metrics`), kümedeki tüm worker'ların paket/istek oranlarını (RPS/pps), hata sayılarını, retransmission ve latency istatistiklerini Prometheus formatında sunar.
 
-3. Run report artefaktlari
-- JSON/Markdown ciktilar (`--run-report`)
-- KPI/soak benchmark raporlari
+2. **Grafana Dashboardları:**
+   `monitoring/` dizinindeki hazır Docker Compose stack'i Prometheus ve önceden yapılandırılmış Grafana panellerini barındırır:
+   ```bash
+   cd monitoring && docker compose up -d
+   ```
+   - Prometheus UI: `http://localhost:9090`
+   - Grafana UI: `http://localhost:3000`
 
-## Ne Eksik?
+---
 
-- Dogrudan urun icinde ship edilen web UI katmani
-- Tenant bazli front-end role ekranlari
+## 2. Canlı Olay Akışı (Live Streaming)
 
-## Onerilen Yol (UI sonradan)
-
-- Kisa vadede: Management API + Grafana panel setleri
-- Uzun vadede: Ayrik `web_console` paketi (OIDC + tenant aware)
+Management API üzerinden anlık durum güncellemeleri Server-Sent Events (SSE) ve WebSocket protokolleriyle alınabilir:
+- `GET /v1/cluster/live/sse`
+- `WS /v1/cluster/live/ws`

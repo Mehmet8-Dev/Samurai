@@ -1,16 +1,21 @@
 #pragma once
 
-#include <pybind11/pybind11.h>
+#include <cstdint>
+
+#include "json.hpp"
 
 namespace ddos_samurai::scenario_native {
 
-pybind11::tuple evaluate_sla_native(
-    const pybind11::dict& sla,
+// Evaluate an SLA document against the observed run counters.
+// Returns {"passed": bool, "detail": {...}}.
+samurai::core::json::Value evaluate_sla_native(
+    const samurai::core::json::Value& sla,
     int sessions_started,
     int sessions_completed,
     int step_attempted,
     int step_failed,
-    pybind11::object latency_p95_ms,
+    double latency_p95_ms,
+    bool has_latency,
     int tcp_connect_attempts,
     int tcp_connect_established,
     int tcp_retransmit_count,

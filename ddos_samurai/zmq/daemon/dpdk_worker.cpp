@@ -1,37 +1,53 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <deque>
 #include <exception>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <pthread.h>
+#include <sched.h>
 
 #include <zmq.h>
 
+#include "bridge.hpp"
 #include "engine.hpp"
 #include "pacing_engine.h"
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
+#include "worker_common.hpp"
 
-#ifdef SAMURAI_WITH_DPDK
-extern "C" {
-#include <rte_common.h>
-#include <rte_eal.h>
-#include <rte_ether.h>
-#include <rte_errno.h>
-#include <rte_ethdev.h>
-#include <rte_mbuf.h>
-#include <rte_mempool.h>
-}
-#endif
+// DDoSamurai'nin tek native DPDK çekirdeği. Başlık rte_*.h/Python.h içermez;
+// gerçek DPDK mantığı dpdk_core.cpp içinde SAMURAI_WITH_DPDK ile koşullanmıştır.
+#include "dpdk/dpdk_core.hpp"
+
+// Paylaşılan userspace stateful TCP fast-path sürücüsü (DPDK/XDP ortak yolu).
+#include "stateful_fastpath.hpp"
+// L7 profil/runner kurucusu (run_profile_json'u dpdk_direct transport ile sürer).
+#include "stateful_l7_profile.hpp"
+// DPDK TX/RX shim'i (scenario_worker ile paylaşılan; yalnız SAMURAI_WITH_DPDK'da tanımlı).
+#include "dpdk_fastpath_shim.hpp"
 
 namespace {
+using samurai::daemon::OptionalIntFromWire;
+using samurai::daemon::SendFrame;
+using samurai::daemon::BuildSnapshot;
+using samurai::daemon::JsonError;
+using samurai::daemon::PacingFromEnvelope;
+using samurai::daemon::ReadFixed;
+using samurai::daemon::SerializeSnapshot;
+using samurai::daemon::SerializeSnapshotV2;
 
 using ddos_samurai::cpu_native::PacketConfig;
 using ddos_samurai::cpu_native::SpoofOptions;
@@ -39,267 +55,186 @@ using ddos_samurai::cpu_native::SpoofOptions;
 constexpr const char* kDefaultJobs = "ipc:///tmp/samurai_jobs_dpdk";
 constexpr const char* kDefaultEvents = "ipc:///tmp/samurai_events_dpdk";
 
-std::string ReadFixed(const char* raw, std::size_t n) {
-  return std::string(raw, strnlen(raw, n));
-}
 
-std::optional<int> OptionalIntFromWire(std::uint64_t raw) {
-  if (raw == 0ull) return std::nullopt;
-  return static_cast<int>(raw);
-}
 
-int SendFrame(
-    void* event_socket,
-    std::uint8_t msg_type,
-    std::uint64_t correlation_id,
-    samurai::wire::WorkerKind worker_kind,
-    const std::string& job_id,
-    const std::vector<std::uint8_t>& payload = {}) {
-  samurai::wire::SamuraiWireHeaderV1 header = samurai::daemon::MakeHeader(
-      msg_type,
-      static_cast<std::uint32_t>(payload.size()),
-      correlation_id,
-      worker_kind,
-      job_id);
 
-  zmq_msg_t msg;
-  const std::size_t total = sizeof(header) + payload.size();
-  if (zmq_msg_init_size(&msg, total) != 0) return -1;
-  auto* p = static_cast<std::uint8_t*>(zmq_msg_data(&msg));
-  std::memcpy(p, &header, sizeof(header));
-  if (!payload.empty()) std::memcpy(p + sizeof(header), payload.data(), payload.size());
-  const int rc = zmq_msg_send(&msg, event_socket, 0);
-  zmq_msg_close(&msg);
-  return rc;
-}
 
-std::vector<std::uint8_t> JsonError(const std::string& reason) {
-  const std::string json = "{\"status\":\"error\",\"error\":\"" + reason + "\"}";
-  return std::vector<std::uint8_t>(json.begin(), json.end());
-}
-
-std::vector<std::uint8_t> JsonPayloadFromStats(
-    std::uint64_t correlation_id,
-    const std::string& job_id,
-    std::uint64_t packets_sent,
-    std::uint64_t packets_errors,
-    std::uint64_t bytes_sent,
-    double actual_rps,
-    double rate_accuracy_pct) {
-  const std::string json =
-      "{\"status\":\"ok\",\"worker_kind\":\"dpdk\",\"correlation_id\":" +
-      std::to_string(correlation_id) +
-      ",\"job_id\":\"" + job_id +
-      "\",\"packets_sent\":" + std::to_string(packets_sent) +
-      ",\"packets_errors\":" + std::to_string(packets_errors) +
-      ",\"bytes_sent\":" + std::to_string(bytes_sent) +
-      ",\"actual_rps\":" + std::to_string(actual_rps) +
-      ",\"rate_accuracy_pct\":" + std::to_string(rate_accuracy_pct) +
-      ",\"note\":\"dpdk_tx_burst\"}";
-  return std::vector<std::uint8_t>(json.begin(), json.end());
-}
-
-samurai::wire::MetricSnapshotV1 BuildSnapshot(
-    std::uint64_t now_ns,
-    std::uint64_t start_ns,
-    std::uint64_t packets_sent,
-    std::uint64_t packets_errors,
-    std::uint64_t bytes_sent,
-    const samurai_pacing_config_t& pace_cfg,
-    const samurai_pacing_state_t& pace_state) {
-  const double duration_s = std::max(1e-9, static_cast<double>(now_ns - start_ns) / 1e9);
-  const double actual_rps = static_cast<double>(packets_sent) / duration_s;
-  double rate_accuracy_pct = 100.0;
-  if (pace_cfg.mode == SAMURAI_PACING_RPS && pace_cfg.target_rps > 0.0) {
-    const double err_abs = std::abs(actual_rps - pace_cfg.target_rps);
-    rate_accuracy_pct = std::max(0.0, 100.0 - ((err_abs * 100.0) / pace_cfg.target_rps));
-  }
-
-  samurai::wire::MetricSnapshotV1 snap{};
-  snap.timestamp_ns = now_ns;
-  snap.packets_sent = packets_sent;
-  snap.packets_errors = packets_errors;
-  snap.bytes_sent = bytes_sent;
-  snap.actual_rps = actual_rps;
-  snap.jitter_p99_ns = 0.0;
-  snap.rate_accuracy_pct = rate_accuracy_pct;
-  snap.busywait_cycles = 0;
-  snap.sleep_calls = static_cast<std::uint32_t>(pace_state.sleep_calls & 0xFFFFFFFFu);
-  return snap;
-}
-
-std::vector<std::uint8_t> SerializeSnapshot(const samurai::wire::MetricSnapshotV1& snap) {
-  std::vector<std::uint8_t> payload(sizeof(snap));
-  std::memcpy(payload.data(), &snap, sizeof(snap));
-  return payload;
-}
-
-PacketConfig ConfigFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
-  PacketConfig cfg;
-  cfg.target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
-  cfg.target_port = static_cast<int>(env.target_port);
-  cfg.protocol = ReadFixed(env.protocol, sizeof(env.protocol));
-  if (cfg.protocol.empty()) cfg.protocol = "tcp";
-  cfg.spoof = env.spoof_enabled != 0u;
-  cfg.spoof_opts = SpoofOptions{
-      .mode = ReadFixed(env.spoof_mode, sizeof(env.spoof_mode)),
-      .subnet = [&]() -> std::optional<std::string> {
-        const std::string v = ReadFixed(env.spoof_subnet, sizeof(env.spoof_subnet));
-        return v.empty() ? std::nullopt : std::optional<std::string>(v);
-      }(),
-      .list_file = [&]() -> std::optional<std::string> {
-        const std::string v = ReadFixed(env.spoof_list_file, sizeof(env.spoof_list_file));
-        return v.empty() ? std::nullopt : std::optional<std::string>(v);
-      }(),
-  };
-  cfg.has_payload = env.has_payload != 0u;
-  cfg.tcp_flags = ReadFixed(env.tcp_flags, sizeof(env.tcp_flags));
-  if (cfg.tcp_flags.empty()) cfg.tcp_flags = "S";
-  cfg.ttl = OptionalIntFromWire(env.ttl);
-  cfg.tos = OptionalIntFromWire(env.tos);
-  cfg.window = OptionalIntFromWire(env.window);
-  cfg.fragment_enabled = env.fragment_enabled != 0u;
-  cfg.fragment_size = static_cast<int>(env.fragment_size);
-  cfg.pad_size = static_cast<int>(env.pad_size);
-  cfg.attack_vector = ReadFixed(env.attack_vector, sizeof(env.attack_vector));
-  if (cfg.attack_vector.empty()) cfg.attack_vector = "basic";
-  cfg.dns_name = ReadFixed(env.dns_name, sizeof(env.dns_name));
-  if (cfg.dns_name.empty()) cfg.dns_name = "example.com";
-  cfg.dns_edns = env.dns_edns != 0u;
-  cfg.dns_recursive = env.dns_recursive != 0u;
-  const std::string qtypes_raw = ReadFixed(env.dns_qtype, sizeof(env.dns_qtype));
-  if (!qtypes_raw.empty()) {
-    cfg.dns_qtypes.clear();
-    std::size_t start = 0;
-    while (start < qtypes_raw.size()) {
-      const std::size_t comma = qtypes_raw.find(',', start);
-      const std::size_t end = (comma == std::string::npos) ? qtypes_raw.size() : comma;
-      const std::string part = qtypes_raw.substr(start, end - start);
-      if (!part.empty()) cfg.dns_qtypes.push_back(part);
-      if (comma == std::string::npos) break;
-      start = comma + 1;
-    }
-  }
-  return cfg;
-}
-
-samurai_pacing_config_t PacingFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
-  samurai_pacing_config_t out{};
-  out.mode = env.pacing_mode;
-  out.target_rps = env.target_rps;
-  out.ipg_ns = env.ipg_ns;
-  out.burst_size = env.burst_size > 0u ? env.burst_size : 1u;
-  out.burst_gap_ns = env.burst_gap_ns;
-  return out;
-}
+using samurai::daemon::ConfigFromEnvelope;
+using samurai::daemon::JsonPayloadFromStats;
 
 #ifdef SAMURAI_WITH_DPDK
-struct DpdkSession {
-  bool eal_ok{false};
-  std::uint16_t port_id{0};
+// Portu iş süresince açık tutan RAII sarmalayıcı; scope çıkışında çekirdeğe
+// close_port bildirir (portu teardown eder).
+struct DpdkPortGuard {
+  std::int64_t handle{-1};
+  ~DpdkPortGuard() {
+    if (handle >= 0) {
+      samurai::dpdk::close_port(handle);
+    }
+  }
+};
+
+// DPDK taşıma shim'i (DpdkShim) artık dpdk_fastpath_shim.hpp'de tanımlı ve
+// scenario_worker ile paylaşılır; burada using ile kısa adla kullanılır.
+using samurai::daemon::DpdkShim;
+
+// Stateful fast-path job'unu koşar: portu açar, tcpdp'yi yapılandırır, L4 connect'leri
+// seed eder, ortak sürücü loop'unu çalıştırır ve nihai METRIC_SNAPSHOT + JOB_DONE
+// yayınlar. Blast (stateless) yolu değişmeden kalır — bu yalnız stateful branch'tir.
+inline void RunDpdkStatefulJob(
+    void* push,
+    const samurai::wire::SamuraiWireHeaderV1& header,
+    const std::string& job_id,
+    const samurai::wire::JobEnvelopeV2& env2,
+    int cli_port_id,
+    int cli_queue_id,
+    const std::string& cli_eal_args) {
+  const samurai::wire::JobEnvelopeV1& env = env2.base;
+  const std::uint16_t port_id = static_cast<std::uint16_t>(std::max(0,
+      cli_port_id >= 0 ? cli_port_id
+                       : (std::getenv("SAMURAI_DPDK_PORT_ID")
+                              ? std::atoi(std::getenv("SAMURAI_DPDK_PORT_ID"))
+                              : 0)));
+  const std::uint16_t queue_id = static_cast<std::uint16_t>(std::max(0,
+      cli_queue_id >= 0 ? cli_queue_id : static_cast<int>(env.xdp_queue_id)));
+  std::string eal_args = cli_eal_args;
+  if (eal_args.empty()) {
+    const char* p = std::getenv("SAMURAI_DPDK_EAL_ARGS");
+    if (p) eal_args = p;
+  }
+
+  std::string err;
+  if (!samurai::dpdk::ensure_eal(eal_args, err)) {
+    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                    header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
+    return;
+  }
+
+  DpdkShim shim(port_id, queue_id, eal_args);
+  if (!shim.ok()) {
+    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                    header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
+                    JsonError(shim.open_err.empty() ? "dpdk_open_port_failed" : shim.open_err));
+    return;
+  }
+
+  samurai::daemon::FastpathParams params =
+      samurai::daemon::FastpathParamsFromEnvelope(env);
+  params.backend = "dpdk";
+
+  samurai::daemon::StatefulFastpathDriver driver(shim);
+
+  samurai::daemon::FastpathHooks hooks;
+  hooks.emit_heartbeat = [&]() {
+    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
+                    header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id);
+  };
+  hooks.emit_metric = [&](const samurai::wire::MetricSnapshotV2& snap) {
+    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
+                    header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
+                    SerializeSnapshotV2(snap));
+  };
+
+  std::atomic<bool> stop{false};
+  const bool l7 = samurai::daemon::JobWantsL7Fastpath(env);
+  samurai::daemon::L7RunnerBundle l7b;
+  samurai::daemon::FastpathResult res;
+  if (l7) {
+    // L7: run_profile_json (dpdk_direct) kendi connect'lerini açar; SeedL4 yok.
+    // tcpdp yapılandırmasını da configure_custom_tcp_bridge yapar; driver.Configure yok.
+    l7b = samurai::daemon::MakeL7Runner(env2, "dpdk_direct");
+    res = driver.Run(params, l7b.runner, stop, hooks);
+  } else {
+    // Pure L4: driver tcpdp'yi yapılandırır ve connect'leri seed eder.
+    if (!driver.Configure(params, err)) {
+      (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                      header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
+      return;
+    }
+    driver.SeedL4(params);
+    res = driver.Run(params, {}, stop, hooks);
+  }
+
+  samurai::core::json::Value done = samurai::core::json::Value::Object();
+  done.set("status", samurai::core::json::Value::Str("ok"));
+  done.set("mode", samurai::core::json::Value::Str(l7 ? "stateful_fastpath_l7" : "stateful_fastpath"));
+  if (l7 && l7b.result) done.set("l7", *l7b.result);
+  done.set("job_id", samurai::core::json::Value::Str(job_id));
+  done.set("tx_packets", samurai::core::json::Value::Int(static_cast<int64_t>(res.tx_packets)));
+  done.set("rx_frames", samurai::core::json::Value::Int(static_cast<int64_t>(res.rx_frames)));
+  done.set("connect_attempts", samurai::core::json::Value::Int(static_cast<int64_t>(res.connect_attempts)));
+  done.set("connect_established", samurai::core::json::Value::Int(static_cast<int64_t>(res.connect_established)));
+  done.set("retransmit_count", samurai::core::json::Value::Int(static_cast<int64_t>(res.retransmit_count)));
+  done.set("retransmit_exhausted", samurai::core::json::Value::Int(static_cast<int64_t>(res.retransmit_exhausted)));
+  done.set("connect_timeout", samurai::core::json::Value::Int(static_cast<int64_t>(res.connect_timeout)));
+  done.set("rx_available", samurai::core::json::Value::Bool(res.rx_available));
+  const std::string done_str = done.dump();
+  (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
+                  header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
+                  std::vector<std::uint8_t>(done_str.begin(), done_str.end()));
+}
+
+// Tek bir TX kuyruğuna adanmış worker thread durumu (K4 multi-queue).
+struct alignas(64) TxWorkerThread {
+  std::thread th;
   std::uint16_t queue_id{0};
-  rte_mempool* mempool{nullptr};
-  bool port_started{false};
+  int cpu_core{-1};  // -1 = pinleme yok
+  std::atomic<std::uint64_t> packets_sent{0};
+  std::atomic<std::uint64_t> packets_errors{0};
+  std::atomic<std::uint64_t> bytes_sent{0};
+  std::atomic<std::uint64_t> sleep_calls{0};
+  std::atomic<bool> done{false};
 };
 
-bool EnsureEalOnce(const std::string& eal_args, std::string& err) {
-  static bool initialized = false;
-  static std::string locked_args;
-  if (initialized) {
-    if (locked_args != eal_args) {
-      err = "dpdk_eal_duplicate_init";
-      return false;
+// Her TX thread kendi kuyruğuna, kendi paket alt-aralığına ve kendi pacing
+// durumuna sahiptir; kuyruklar thread'e özel olduğundan kilit gerekmez.
+void tx_thread_func(TxWorkerThread* tw, std::int64_t handle,
+                    const std::uint8_t* pool_data, std::size_t pool_len,
+                    std::uint16_t stride, int start, int end,
+                    samurai_pacing_config_t pace_cfg) {
+  if (tw->cpu_core >= 0) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(tw->cpu_core, &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+  }
+  // PMD/mempool güvenliği için thread'i EAL lcore olarak kaydet.
+  const bool registered = samurai::dpdk::register_lcore_thread();
+
+  samurai_pacing_state_t st{};
+  samurai_pacing_init(&st, &pace_cfg);
+
+  constexpr std::uint16_t kTxBurstMax = 64;
+  int i = start;
+  while (i < end) {
+    samurai_pacing_wait_next(&st, &pace_cfg);
+    std::uint16_t batch = static_cast<std::uint16_t>(
+        std::min<int>(end - i, static_cast<int>(kTxBurstMax)));
+
+    const std::size_t off = static_cast<std::size_t>(i) * stride;
+    if (off + static_cast<std::size_t>(batch) * stride > pool_len) {
+      const std::size_t avail = pool_len > off ? (pool_len - off) / stride : 0;
+      batch = static_cast<std::uint16_t>(std::min<std::size_t>(batch, avail));
     }
-    return true;
-  }
-
-  std::vector<std::string> argv_store;
-  argv_store.emplace_back("samurai_dpdk_worker");
-  std::string token;
-  for (char c : eal_args) {
-    if (std::isspace(static_cast<unsigned char>(c))) {
-      if (!token.empty()) {
-        argv_store.push_back(token);
-        token.clear();
-      }
-      continue;
+    if (batch == 0) {
+      break;
     }
-    token.push_back(c);
-  }
-  if (!token.empty()) argv_store.push_back(token);
 
-  std::vector<char*> argv;
-  argv.reserve(argv_store.size());
-  for (auto& s : argv_store) argv.push_back(const_cast<char*>(s.c_str()));
-  if (rte_eal_init(static_cast<int>(argv.size()), argv.data()) < 0) {
-    err = std::string("dpdk_eal_init_failed:") + rte_strerror(rte_errno);
-    return false;
-  }
-  initialized = true;
-  locked_args = eal_args;
-  return true;
-}
-
-bool InitPort(DpdkSession& sess, std::uint32_t mempool_size, std::string& err) {
-  if (!rte_eth_dev_is_valid_port(sess.port_id)) {
-    err = "dpdk_port_invalid";
-    return false;
-  }
-  rte_eth_conf port_conf{};
-  const std::uint16_t txq = static_cast<std::uint16_t>(sess.queue_id + 1);
-  if (rte_eth_dev_configure(sess.port_id, 0, txq, &port_conf) < 0) {
-    err = std::string("dpdk_dev_configure_failed:") + rte_strerror(rte_errno);
-    return false;
+    const samurai::dpdk::TxResult r = samurai::dpdk::tx_burst(
+        handle, tw->queue_id, pool_data + off, stride, batch);
+    tw->packets_sent.fetch_add(r.sent, std::memory_order_relaxed);
+    tw->packets_errors.fetch_add(r.errors, std::memory_order_relaxed);
+    tw->bytes_sent.fetch_add(r.sent * static_cast<std::uint64_t>(stride),
+                             std::memory_order_relaxed);
+    i += batch;
   }
 
-  int socket_id = rte_eth_dev_socket_id(sess.port_id);
-  if (socket_id < 0) socket_id = 0;
-  char mp_name[64];
-  std::snprintf(mp_name, sizeof(mp_name), "samurai_dpdk_worker_mp_%u", static_cast<unsigned>(sess.port_id));
-  sess.mempool = rte_pktmbuf_pool_create(
-      mp_name,
-      std::max<std::uint32_t>(mempool_size, 1024u),
-      256,
-      0,
-      RTE_MBUF_DEFAULT_BUF_SIZE,
-      socket_id);
-  if (!sess.mempool) {
-    err = std::string("dpdk_mempool_create_failed:") + rte_strerror(rte_errno);
-    return false;
-  }
-
-  rte_eth_dev_info dev_info{};
-  if (rte_eth_dev_info_get(sess.port_id, &dev_info) != 0) {
-    err = "dpdk_dev_info_failed";
-    return false;
-  }
-  rte_eth_txconf tx_conf = dev_info.default_txconf;
-  for (std::uint16_t q = 0; q < txq; ++q) {
-    if (rte_eth_tx_queue_setup(sess.port_id, q, 1024, socket_id, &tx_conf) < 0) {
-      err = std::string("dpdk_tx_queue_setup_failed:") + rte_strerror(rte_errno);
-      return false;
-    }
-  }
-  if (rte_eth_dev_start(sess.port_id) < 0) {
-    err = std::string("dpdk_dev_start_failed:") + rte_strerror(rte_errno);
-    return false;
-  }
-  sess.port_started = true;
-  return true;
-}
-
-void Teardown(DpdkSession& sess) {
-  if (sess.port_started) {
-    (void)rte_eth_dev_stop(sess.port_id);
-    (void)rte_eth_dev_close(sess.port_id);
-    sess.port_started = false;
+  tw->sleep_calls.store(st.sleep_calls, std::memory_order_relaxed);
+  tw->done.store(true, std::memory_order_release);
+  if (registered) {
+    samurai::dpdk::unregister_lcore_thread();
   }
 }
-
-struct DpdkSessionGuard {
-  DpdkSession session{};
-  ~DpdkSessionGuard() { Teardown(session); }
-};
 #endif
 
 }  // namespace
@@ -311,6 +246,7 @@ int main(int argc, char** argv) {
   bool bind_events = false;
   int cli_port_id = -1;
   int cli_queue_id = -1;
+  int cli_tx_queues = -1;
   std::string cli_eal_args;
 
   for (int i = 1; i < argc; ++i) {
@@ -327,6 +263,8 @@ int main(int argc, char** argv) {
       cli_port_id = std::stoi(argv[++i]);
     } else if (arg == "--dpdk-queue-id" && i + 1 < argc) {
       cli_queue_id = std::stoi(argv[++i]);
+    } else if (arg == "--dpdk-tx-queues" && i + 1 < argc) {
+      cli_tx_queues = std::stoi(argv[++i]);
     } else if (arg == "--dpdk-eal-args" && i + 1 < argc) {
       cli_eal_args = argv[++i];
     }
@@ -402,7 +340,15 @@ int main(int argc, char** argv) {
     }
 
     if (msg_type == samurai::wire::MessageType::START_JOB) {
-      if (payload_len != sizeof(samurai::wire::JobEnvelopeV1) || header.payload_len != sizeof(samurai::wire::JobEnvelopeV1)) {
+      // V1 (blast) veya V2 (stateful/L7 knob'ları) kabul edilir; env V1 tabanıdır ve
+      // V2 payload'unda V1 offset 0'da gömülüdür, bu yüzden V1 prefix'i memcpy yeterli.
+      const bool env_is_v1 =
+          payload_len == sizeof(samurai::wire::JobEnvelopeV1) &&
+          header.payload_len == sizeof(samurai::wire::JobEnvelopeV1);
+      const bool env_is_v2 =
+          payload_len == sizeof(samurai::wire::JobEnvelopeV2) &&
+          header.payload_len == sizeof(samurai::wire::JobEnvelopeV2);
+      if (!env_is_v1 && !env_is_v2) {
         (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR), header.correlation_id,
                         samurai::wire::WorkerKind::DPDK, job_id, JsonError("job_envelope_size_mismatch"));
         zmq_msg_close(&msg);
@@ -410,6 +356,13 @@ int main(int argc, char** argv) {
       }
       samurai::wire::JobEnvelopeV1 env{};
       std::memcpy(&env, payload_ptr, sizeof(env));
+      // V2 tail'i (varsa) mesaj kapatılmadan önce yakala (payload_ptr sonra geçersiz olur).
+      samurai::wire::JobEnvelopeV2 env2{};
+      if (env_is_v2) {
+        std::memcpy(&env2, payload_ptr, sizeof(env2));
+      } else {
+        env2.base = env;
+      }
       (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK), header.correlation_id,
                       samurai::wire::WorkerKind::DPDK, job_id);
       zmq_msg_close(&msg);
@@ -419,6 +372,12 @@ int main(int argc, char** argv) {
                       samurai::wire::WorkerKind::DPDK, job_id, JsonError("dpdk_not_built"));
       continue;
 #else
+      // Stateful userspace TCP fast-path (protocol=custom_tcp / attack_vector=stateful):
+      // NIC'i sahiplenip TcpDataplaneCore'u koşar. Stateless blast yolu değişmez.
+      if (samurai::daemon::IsStatefulFastpathJob(env)) {
+        RunDpdkStatefulJob(push, header, job_id, env2, cli_port_id, cli_queue_id, cli_eal_args);
+        continue;
+      }
       try {
         PacketConfig cfg = ConfigFromEnvelope(env);
         const int packet_count = std::max(1, static_cast<int>(env.packet_count));
@@ -430,90 +389,169 @@ int main(int argc, char** argv) {
           continue;
         }
 
-        DpdkSessionGuard dpdk{};
-        dpdk.session.port_id = static_cast<std::uint16_t>(std::max(0, cli_port_id >= 0 ? cli_port_id : static_cast<int>(std::getenv("SAMURAI_DPDK_PORT_ID") ? std::atoi(std::getenv("SAMURAI_DPDK_PORT_ID")) : 0)));
-        dpdk.session.queue_id = static_cast<std::uint16_t>(std::max(0, cli_queue_id >= 0 ? cli_queue_id : static_cast<int>(env.xdp_queue_id)));
+        const std::uint16_t port_id = static_cast<std::uint16_t>(std::max(0,
+            cli_port_id >= 0 ? cli_port_id
+                             : (std::getenv("SAMURAI_DPDK_PORT_ID")
+                                    ? std::atoi(std::getenv("SAMURAI_DPDK_PORT_ID"))
+                                    : 0)));
+        const std::uint16_t queue_id = static_cast<std::uint16_t>(std::max(0,
+            cli_queue_id >= 0 ? cli_queue_id : static_cast<int>(env.xdp_queue_id)));
         std::string eal_args = cli_eal_args;
         if (eal_args.empty()) {
           const char* p = std::getenv("SAMURAI_DPDK_EAL_ARGS");
           if (p) eal_args = p;
         }
 
+        std::string eal_args_effective = eal_args;
         std::string err;
-        if (!EnsureEalOnce(eal_args, err)) {
-          (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR), header.correlation_id,
-                          samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
-          continue;
-        }
-        if (!InitPort(dpdk.session, 8192u, err)) {
+        if (!samurai::dpdk::ensure_eal(eal_args_effective, err)) {
           (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR), header.correlation_id,
                           samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
           continue;
         }
 
+        // Kaç TX kuyruğu/thread? CLI/env ile istenir; NIC max_tx_queues ve
+        // packet_count ile sınırlanır (K4 multi-queue).
+        int requested_queues = cli_tx_queues > 0
+            ? cli_tx_queues
+            : (std::getenv("SAMURAI_DPDK_TX_QUEUES")
+                   ? std::atoi(std::getenv("SAMURAI_DPDK_TX_QUEUES"))
+                   : 1);
+        if (requested_queues < 1) requested_queues = 1;
+        samurai::dpdk::PortCapabilities caps{};
+        if (samurai::dpdk::query_capabilities(port_id, caps, err) && caps.max_tx_queues > 0) {
+          requested_queues = std::min<int>(requested_queues, static_cast<int>(caps.max_tx_queues));
+        }
+        requested_queues = std::min<int>(requested_queues, packet_count);
+        const int num_queues = std::max(1, requested_queues);
+        const bool multi_queue = num_queues > 1;
+
+        // Port aç. Tek-queue'da eski queue_id davranışı korunur (queue_id+1 kuyruk);
+        // multi-queue'da 0..N-1 kuyrukları kurulur.
+        samurai::dpdk::OpenConfig open_cfg{};
+        open_cfg.port_id = port_id;
+        open_cfg.num_tx_queues = multi_queue
+            ? static_cast<std::uint16_t>(num_queues)
+            : static_cast<std::uint16_t>(queue_id + 1);
+        open_cfg.num_rx_queues = 0;
+        open_cfg.burst_size = 64;
+        open_cfg.mempool_size = 8192u;
+        open_cfg.eal_args = eal_args_effective;
+
+        DpdkPortGuard dpdk{};
+        dpdk.handle = samurai::dpdk::open_port(open_cfg, err);
+        if (dpdk.handle < 0) {
+          (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR), header.correlation_id,
+                          samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
+          continue;
+        }
+
+        // NUMA pinning guard (O1): CPU çekirdek tabanı env ile verilebilir.
+        const int base_core = std::getenv("SAMURAI_DPDK_BASE_CORE")
+            ? std::atoi(std::getenv("SAMURAI_DPDK_BASE_CORE")) : -1;
+        const int nic_socket = samurai::dpdk::port_socket_id(dpdk.handle);
+        if (base_core >= 0 && nic_socket >= 0) {
+          std::fprintf(stderr,
+              "[dpdk] port %u NUMA node=%d; %d TX thread core %d'den pinlenecek. "
+              "Cross-NUMA ise: numactl --cpunodebind=%d\n",
+              static_cast<unsigned>(port_id), nic_socket, num_queues, base_core, nic_socket);
+        }
+
+        // Pacing: snapshot için tam hedef; thread'ler için N'e bölünmüş hedef.
         samurai_pacing_config_t pace_cfg = PacingFromEnvelope(env);
-        samurai_pacing_state_t pace_state{};
-        samurai_pacing_init(&pace_state, &pace_cfg);
+        samurai_pacing_config_t thread_pace = pace_cfg;
+        if (multi_queue) {
+          if (thread_pace.mode == SAMURAI_PACING_RPS) {
+            thread_pace.target_rps = pace_cfg.target_rps / static_cast<double>(num_queues);
+          } else if (thread_pace.mode == SAMURAI_PACING_IPG && thread_pace.ipg_ns > 0) {
+            thread_pace.ipg_ns = pace_cfg.ipg_ns * static_cast<std::uint64_t>(num_queues);
+          } else if (thread_pace.mode == SAMURAI_PACING_BURST && thread_pace.burst_size > 1) {
+            thread_pace.burst_size =
+                std::max<std::uint32_t>(1u, thread_pace.burst_size / static_cast<std::uint32_t>(num_queues));
+          }
+        }
+
+        // TX thread'lerini başlat: her biri kendi kuyruğu + paket alt-aralığı.
+        std::deque<TxWorkerThread> workers;
+        const int base_packets = packet_count / num_queues;
+        const int remainder = packet_count % num_queues;
+        int cursor = 0;
+        for (int q = 0; q < num_queues; ++q) {
+          workers.emplace_back();
+          TxWorkerThread& tw = workers.back();
+          tw.queue_id = multi_queue ? static_cast<std::uint16_t>(q) : queue_id;
+          tw.cpu_core = base_core >= 0 ? base_core + q : -1;
+          const int cnt = base_packets + (q < remainder ? 1 : 0);
+          const int seg_start = cursor;
+          const int seg_end = cursor + cnt;
+          cursor = seg_end;
+          tw.th = std::thread(tx_thread_func, &tw, dpdk.handle, pool.data(), pool.size(),
+                              static_cast<std::uint16_t>(stride), seg_start, seg_end, thread_pace);
+        }
+
+        auto aggregate = [&workers](std::uint64_t& ps, std::uint64_t& pe,
+                                    std::uint64_t& bs, std::uint64_t& sc) {
+          ps = pe = bs = sc = 0;
+          for (auto& w : workers) {
+            ps += w.packets_sent.load(std::memory_order_relaxed);
+            pe += w.packets_errors.load(std::memory_order_relaxed);
+            bs += w.bytes_sent.load(std::memory_order_relaxed);
+            sc += w.sleep_calls.load(std::memory_order_relaxed);
+          }
+        };
 
         const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
         std::uint64_t last_hb_ns = start_ns;
         std::uint64_t last_metric_ns = start_ns;
-        std::uint64_t packets_sent = 0;
-        std::uint64_t packets_errors = 0;
-        std::uint64_t bytes_sent = 0;
 
-        for (int i = 0; i < packet_count; ++i) {
-          samurai_pacing_wait_next(&pace_state, &pace_cfg);
-          const std::size_t off = static_cast<std::size_t>(i) * stride;
-          if (off + stride > pool.size()) {
-            packets_errors += 1u;
-            continue;
-          }
-
-          rte_mbuf* mbuf = rte_pktmbuf_alloc(sess.mempool);
-          if (!mbuf) {
-            packets_errors += 1u;
-            continue;
-          }
-          void* dst = rte_pktmbuf_append(mbuf, static_cast<std::uint16_t>(stride));
-          if (!dst) {
-            rte_pktmbuf_free(mbuf);
-            packets_errors += 1u;
-            continue;
-          }
-          std::memcpy(dst, pool.data() + off, stride);
-          rte_mbuf* burst[1] = {mbuf};
-          const std::uint16_t tx = rte_eth_tx_burst(dpdk.session.port_id, dpdk.session.queue_id, burst, 1);
-          if (tx == 1) {
-            packets_sent += 1u;
-            bytes_sent += static_cast<std::uint64_t>(stride);
-          } else {
-            rte_pktmbuf_free(mbuf);
-            packets_errors += 1u;
-          }
-
-          if ((static_cast<std::uint32_t>(i) & 0x3FFu) == 0u) {
-            const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
-            if (now_ns - last_hb_ns >= 1'000'000'000ull) {
-              (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
-                              header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id);
-              last_hb_ns = now_ns;
+        // Ana thread ilerlemeyi zamana göre yoklar; TX'i thread'ler yapar.
+        bool all_done = false;
+        while (!all_done) {
+          struct timespec ts{0, 50'000'000L};  // 50 ms
+          nanosleep(&ts, nullptr);
+          all_done = true;
+          for (auto& w : workers) {
+            if (!w.done.load(std::memory_order_acquire)) {
+              all_done = false;
+              break;
             }
-            if (now_ns - last_metric_ns >= 2'000'000'000ull) {
-              const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
-                  now_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
-              (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
-                              header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
-                              SerializeSnapshot(snap));
-              last_metric_ns = now_ns;
-              last_hb_ns = now_ns;
-            }
+          }
+
+          const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+          std::uint64_t ps, pe, bs, sc;
+          aggregate(ps, pe, bs, sc);
+          if (now_ns - last_hb_ns >= 1'000'000'000ull) {
+            (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
+                            header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id);
+            last_hb_ns = now_ns;
+          }
+          if (now_ns - last_metric_ns >= 2'000'000'000ull) {
+            samurai_pacing_state_t agg_state{};
+            agg_state.sleep_calls = sc;
+            const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
+                now_ns, start_ns, ps, pe, bs, pace_cfg, agg_state);
+            (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
+                            header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
+                            SerializeSnapshot(snap));
+            last_metric_ns = now_ns;
+            last_hb_ns = now_ns;
           }
         }
 
+        for (auto& w : workers) {
+          if (w.th.joinable()) {
+            w.th.join();
+          }
+        }
+
+        std::uint64_t packets_sent, packets_errors, bytes_sent, sleep_calls;
+        aggregate(packets_sent, packets_errors, bytes_sent, sleep_calls);
+
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
+        samurai_pacing_state_t final_state{};
+        final_state.sleep_calls = sleep_calls;
         const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
-            end_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
+            end_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, final_state);
         (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
                         header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
                         SerializeSnapshot(snap));

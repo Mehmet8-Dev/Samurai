@@ -33,8 +33,9 @@ H3ControlPlaneState derive_h3_control_plane_state(
   const int runtime_graceful_close = std::max(0, udp.h3_graceful_close_count);
 
   if (runtime_goaway_events > 0) {
+    // Real runtime GOAWAY / drain observations win.
     state.goaway_events = runtime_goaway_events;
-    state.drain_cycles = std::max(runtime_drain_cycles, std::min(established, std::max(1, udp.responses)));
+    state.drain_cycles = std::max(runtime_drain_cycles, 1);
     state.replace_now = runtime_replace_now;
     state.replace_after_idle = runtime_replace_after_idle;
     state.control_plane_failures = runtime_cp_failures + validation_failures;
@@ -45,17 +46,11 @@ H3ControlPlaneState derive_h3_control_plane_state(
     state.replace_now = std::max(0, hard_failures);
     state.replace_after_idle = 0;
     state.control_plane_failures = validation_failures + 1;
-  } else if (!requested_goaway && established > 0 && hard_failures > 0) {
-    // Fail-visible closure path still reports a control-plane event for observability.
-    state.goaway_events = 1;
-    state.drain_cycles = 1;
-    state.replace_now = hard_failures;
-    state.replace_after_idle = std::max(0, state.goaway_events - state.replace_now);
-    state.control_plane_failures = validation_failures + runtime_cp_failures;
   } else {
+    // Do not synthesize GOAWAY from unrelated hard failures.
     state.goaway_events = 0;
     state.drain_cycles = runtime_drain_cycles;
-    state.replace_now = runtime_replace_now;
+    state.replace_now = runtime_replace_now > 0 ? runtime_replace_now : hard_failures;
     state.replace_after_idle = runtime_replace_after_idle;
     state.control_plane_failures = validation_failures + runtime_cp_failures;
   }

@@ -31,14 +31,28 @@ inline std::mt19937_64& rng() {
   return gen;
 }
 
+inline uint32_t fast_rand32() {
+  thread_local std::array<uint32_t, 256> buf;
+  thread_local size_t idx = 256;
+  if (idx == 256) {
+    auto& g = rng();
+    for (size_t i = 0; i < 256; ++i) buf[i] = static_cast<uint32_t>(g());
+    idx = 0;
+  }
+  return buf[idx++];
+}
+
 inline uint32_t rand_u32(uint32_t lo, uint32_t hi) {
-  std::uniform_int_distribution<uint32_t> dist(lo, hi);
-  return dist(rng());
+  if (lo >= hi) return lo;
+  if (lo == 0u && hi == 0xFFFFFFFFu) return fast_rand32();
+  const uint64_t range = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1ULL;
+  return lo + static_cast<uint32_t>(fast_rand32() % range);
 }
 
 inline int rand_int(int lo, int hi) {
-  std::uniform_int_distribution<int> dist(lo, hi);
-  return dist(rng());
+  if (lo >= hi) return lo;
+  const uint64_t range = static_cast<uint64_t>(static_cast<int64_t>(hi) - static_cast<int64_t>(lo) + 1LL);
+  return lo + static_cast<int>(fast_rand32() % range);
 }
 
 inline void append_u8(std::vector<uint8_t>& out, uint8_t v) { out.push_back(v); }
@@ -58,6 +72,11 @@ inline void append_be32(std::vector<uint8_t>& out, uint32_t v) {
 inline void write_be16(std::vector<uint8_t>& out, size_t off, uint16_t v) {
   out.at(off) = static_cast<uint8_t>((v >> 8) & 0xFF);
   out.at(off + 1) = static_cast<uint8_t>(v & 0xFF);
+}
+
+inline void write_be16(uint8_t* p, size_t off, uint16_t v) {
+  p[off] = static_cast<uint8_t>((v >> 8) & 0xFF);
+  p[off + 1] = static_cast<uint8_t>(v & 0xFF);
 }
 
 inline uint16_t read_be16(const uint8_t* p) {
@@ -159,6 +178,23 @@ inline uint32_t pseudo_header_sum(uint32_t src_ip, uint32_t dst_ip, int protocol
 inline uint16_t finalize_sum(uint32_t s) {
   while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
   return static_cast<uint16_t>((~s) & 0xFFFFu);
+}
+
+inline uint16_t checksum_update(uint16_t old_csum, uint16_t old_val, uint16_t new_val) {
+  uint32_t csum = (~old_csum) & 0xFFFF;
+  csum += (~old_val) & 0xFFFF;
+  csum += new_val;
+  csum = (csum & 0xFFFF) + (csum >> 16);
+  return static_cast<uint16_t>(~csum);
+}
+
+inline uint16_t checksum_update_32(uint16_t old_csum, uint32_t old_val, uint32_t new_val) {
+  uint16_t old_hi = (old_val >> 16) & 0xFFFF;
+  uint16_t old_lo = old_val & 0xFFFF;
+  uint16_t new_hi = (new_val >> 16) & 0xFFFF;
+  uint16_t new_lo = new_val & 0xFFFF;
+  uint16_t temp = checksum_update(old_csum, old_hi, new_hi);
+  return checksum_update(temp, old_lo, new_lo);
 }
 
 inline std::vector<uint8_t> profile_tcp_options(const OSProfile& profile) {

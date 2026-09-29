@@ -17,8 +17,15 @@
 #include "pacing_engine.h"
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
+#include "worker_common.hpp"
+#include "afpacket_tx.hpp"
 
 namespace {
+using samurai::daemon::OptionalIntFromWire;
+using samurai::daemon::SendFrame;
+using samurai::daemon::JsonError;
+using samurai::daemon::PacingFromEnvelope;
+using samurai::daemon::ReadFixed;
 
 using ddos_samurai::cpu_native::PacketConfig;
 using ddos_samurai::cpu_native::SpoofOptions;
@@ -26,16 +33,7 @@ using ddos_samurai::cpu_native::SpoofOptions;
 constexpr const char* kDefaultJobs = "ipc:///tmp/samurai_jobs_cpu";
 constexpr const char* kDefaultEvents = "ipc:///tmp/samurai_events_cpu";
 
-std::string ReadFixed(const char* raw, std::size_t n) {
-  return std::string(raw, strnlen(raw, n));
-}
 
-std::optional<int> OptionalIntFromWire(std::uint64_t raw) {
-  if (raw == 0ull) {
-    return std::nullopt;
-  }
-  return static_cast<int>(raw);
-}
 
 void ApplyAffinity(std::int32_t pin_cpu) {
   if (pin_cpu < 0) {
@@ -47,131 +45,9 @@ void ApplyAffinity(std::int32_t pin_cpu) {
   (void)sched_setaffinity(0, sizeof(cpuset), &cpuset);
 }
 
-int SendFrame(
-    void* event_socket,
-    std::uint8_t msg_type,
-    std::uint64_t correlation_id,
-    samurai::wire::WorkerKind worker_kind,
-    const std::string& job_id,
-    const std::vector<std::uint8_t>& payload = {}) {
-  samurai::wire::SamuraiWireHeaderV1 header = samurai::daemon::MakeHeader(
-      msg_type,
-      static_cast<std::uint32_t>(payload.size()),
-      correlation_id,
-      worker_kind,
-      job_id);
+using samurai::daemon::ConfigFromEnvelope;
+using samurai::daemon::JsonPayloadFromStats;
 
-  zmq_msg_t msg;
-  const std::size_t total = sizeof(header) + payload.size();
-  if (zmq_msg_init_size(&msg, total) != 0) {
-    return -1;
-  }
-  auto* p = static_cast<std::uint8_t*>(zmq_msg_data(&msg));
-  std::memcpy(p, &header, sizeof(header));
-  if (!payload.empty()) {
-    std::memcpy(p + sizeof(header), payload.data(), payload.size());
-  }
-  const int rc = zmq_msg_send(&msg, event_socket, 0);
-  zmq_msg_close(&msg);
-  return rc;
-}
-
-std::vector<std::uint8_t> JsonPayloadFromStats(
-    std::uint64_t correlation_id,
-    const std::string& job_id,
-    std::uint64_t packets_sent,
-    std::uint64_t packets_errors,
-    std::uint64_t bytes_sent,
-    double actual_rps,
-    double rate_accuracy_pct) {
-  const std::string json =
-      "{\"status\":\"ok\",\"worker_kind\":\"cpu\",\"correlation_id\":" +
-      std::to_string(correlation_id) +
-      ",\"job_id\":\"" + job_id +
-      "\",\"packets_sent\":" + std::to_string(packets_sent) +
-      ",\"packets_errors\":" + std::to_string(packets_errors) +
-      ",\"bytes_sent\":" + std::to_string(bytes_sent) +
-      ",\"actual_rps\":" + std::to_string(actual_rps) +
-      ",\"rate_accuracy_pct\":" + std::to_string(rate_accuracy_pct) +
-      ",\"note\":\"cpu_native+pacing_static\"}";
-  return std::vector<std::uint8_t>(json.begin(), json.end());
-}
-
-std::vector<std::uint8_t> JsonError(const std::string& reason) {
-  const std::string json = "{\"status\":\"error\",\"error\":\"" + reason + "\"}";
-  return std::vector<std::uint8_t>(json.begin(), json.end());
-}
-
-PacketConfig ConfigFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
-  PacketConfig cfg;
-  cfg.target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
-  cfg.target_port = static_cast<int>(env.target_port);
-  cfg.protocol = ReadFixed(env.protocol, sizeof(env.protocol));
-  if (cfg.protocol.empty()) {
-    cfg.protocol = "tcp";
-  }
-  cfg.spoof = env.spoof_enabled != 0u;
-  cfg.spoof_opts = SpoofOptions{
-      .mode = ReadFixed(env.spoof_mode, sizeof(env.spoof_mode)),
-      .subnet = [&]() -> std::optional<std::string> {
-        const std::string v = ReadFixed(env.spoof_subnet, sizeof(env.spoof_subnet));
-        return v.empty() ? std::nullopt : std::optional<std::string>(v);
-      }(),
-      .list_file = [&]() -> std::optional<std::string> {
-        const std::string v = ReadFixed(env.spoof_list_file, sizeof(env.spoof_list_file));
-        return v.empty() ? std::nullopt : std::optional<std::string>(v);
-      }(),
-  };
-  cfg.has_payload = env.has_payload != 0u;
-  cfg.tcp_flags = ReadFixed(env.tcp_flags, sizeof(env.tcp_flags));
-  if (cfg.tcp_flags.empty()) {
-    cfg.tcp_flags = "S";
-  }
-  cfg.ttl = OptionalIntFromWire(env.ttl);
-  cfg.tos = OptionalIntFromWire(env.tos);
-  cfg.window = OptionalIntFromWire(env.window);
-  cfg.fragment_enabled = env.fragment_enabled != 0u;
-  cfg.fragment_size = static_cast<int>(env.fragment_size);
-  cfg.pad_size = static_cast<int>(env.pad_size);
-  cfg.attack_vector = ReadFixed(env.attack_vector, sizeof(env.attack_vector));
-  if (cfg.attack_vector.empty()) {
-    cfg.attack_vector = "basic";
-  }
-  cfg.dns_name = ReadFixed(env.dns_name, sizeof(env.dns_name));
-  if (cfg.dns_name.empty()) {
-    cfg.dns_name = "example.com";
-  }
-  cfg.dns_edns = env.dns_edns != 0u;
-  cfg.dns_recursive = env.dns_recursive != 0u;
-  const std::string qtypes_raw = ReadFixed(env.dns_qtype, sizeof(env.dns_qtype));
-  if (!qtypes_raw.empty()) {
-    cfg.dns_qtypes.clear();
-    std::size_t start = 0;
-    while (start < qtypes_raw.size()) {
-      const std::size_t comma = qtypes_raw.find(',', start);
-      const std::size_t end = (comma == std::string::npos) ? qtypes_raw.size() : comma;
-      const std::string part = qtypes_raw.substr(start, end - start);
-      if (!part.empty()) {
-        cfg.dns_qtypes.push_back(part);
-      }
-      if (comma == std::string::npos) {
-        break;
-      }
-      start = comma + 1;
-    }
-  }
-  return cfg;
-}
-
-samurai_pacing_config_t PacingFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
-  samurai_pacing_config_t out{};
-  out.mode = env.pacing_mode;
-  out.target_rps = env.target_rps;
-  out.ipg_ns = env.ipg_ns;
-  out.burst_size = env.burst_size > 0u ? env.burst_size : 1u;
-  out.burst_gap_ns = env.burst_gap_ns;
-  return out;
-}
 
 int SendAck(void* push, std::uint64_t cid, const std::string& job_id) {
   return SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK), cid, samurai::wire::WorkerKind::CPU, job_id);
@@ -298,9 +174,21 @@ int main(int argc, char** argv) {
         std::uint64_t packets_sent = 0;
         std::uint64_t bytes_sent = 0;
         std::uint64_t packets_errors = 0;
+        std::string done_note = "done";
         const std::size_t stride = pool.packet_size;
         if (stride == 0 || pool.size() < stride) {
           packets_errors = static_cast<std::uint64_t>(packet_count);
+        } else if (samurai::daemon::AfPacketTxEnabled()) {
+          // Real transmission over the af_packet kernel-socket backend (commodity
+          // NICs, no AF_XDP/DPDK). IPG pacing maps to SO_TXTIME; else batched.
+          const long long ipg_ns =
+              (pace_cfg.mode == SAMURAI_PACING_IPG) ? static_cast<long long>(pace_cfg.ipg_ns) : 0;
+          const auto tx = samurai::daemon::AfPacketSendPool(
+              cfg, pool.data(), pool.size(), static_cast<int>(stride), packet_count, ipg_ns);
+          packets_sent = tx.packets_sent;
+          packets_errors = tx.packets_errors;
+          bytes_sent = tx.bytes_sent;
+          done_note = tx.note;
         } else {
           for (int i = 0; i < packet_count; ++i) {
             samurai_pacing_wait_next(&pace_state, &pace_cfg);
@@ -350,7 +238,8 @@ int main(int argc, char** argv) {
             packets_errors,
             bytes_sent,
             actual_rps,
-            rate_accuracy_pct);
+            rate_accuracy_pct,
+            done_note);
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),

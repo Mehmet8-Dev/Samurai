@@ -1,121 +1,36 @@
-# 06 - AF_XDP ve fast_sender (C Eklentileri)
+# 06 - AF_XDP Kernel-Bypass ve Zero-Copy
 
-Bu dokuman CPU paketlerinin "nasil daha hizli gonderildigini" anlatir.
-Samurai'de iki temel hizlandirma yolu vardir:
+AF_XDP (XSK - eXpress Data Path Sockets), Linux çekirdeğinin ağ yığınını atlayarak doğrudan ağ kartı halkalarına erişen modern kernel-bypass teknolojisidir.
 
-- `fast_sender`: raw socket / sendmmsg / TX_RING odakli C eklentisi
-- `xdp_sender` + `af_xdp_sender.py`: Linux AF_XDP odakli yol
+---
 
-## Ne Zaman Hangi Yol?
+## 1. Çalışma Prensibi
 
-1. XDP backend aktif ve ortam uyumluysa:
-- Oncelik AF_XDP yoluna verilir
+1. **UMEM Tahsisi:** Kullanıcı alanında (User-Space) büyük bellek blokları (Hugepages / Paged Memory) ayrılır ve UMEM olarak XSK soketine bağlanır.
+2. **Fill & Completion Rings:** Bellek çerçeveleri kernel'a iletilir ve işlenen paketler serbest bırakılır.
+3. **TX Ring:** Hazırlanan paket verisi hiçbir `send()` sistem çağrısı ve kernel kopyalaması olmaksızın doğrudan NIC TX donanım halkasına fırlatılır.
 
-2. XDP acilamiyorsa:
-- Politika ve ortam ayarlarina gore raw socket yoluna gecilir
+---
 
-3. C eklenti yok veya uyumsuzsa:
-- Sistem fail-visible davranabilir ya da fallback edebilir (sender policy'ye bagli)
+## 2. DDoSamurai AF_XDP Worker (`samurai_afxdp_worker`)
 
-Detay fallback kurallari icin bkz: `docs/03-senders.md`
+[`afxdp_worker.cpp`](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/DDoSamurai/ddos_samurai/zmq/daemon/afxdp_worker.cpp) bağımsız bir native daemon olarak çalışır:
 
-## fast_sender
+- **ZMQ Kontrolü:** Master veya CLI'dan gelen `START_JOB` emirlerini alır.
+- **Sıfır Kopyalama:** `libbpf` ve `libxdp` API'leri üzerinden sıfır kopyalı modda (`XDP_ZEROCOPY`) soket bağlar.
+- **CPU & NUMA Pinning:** Ağ kartının bağlı olduğu NUMA düğümündeki izole CPU çekirdeklerine kilitlenir.
 
-Entegrasyon noktasi: `ddos_samurai/senders.py:raw_socket_sender()`
+---
 
-Temel C API:
-
-- L3 hizli yol:
-  - `send_optimized(fd, packets_buffer, target_ip, target_port, packet_size, count)`
-- L2 hizli yol:
-  - `send_ring_optimized(iface, packets_buffer, packet_size, count, gateway_mac)`
-- Introspection:
-  - `get_ring_info()`
-
-### TX_RING Davranisi
-
-- `send_ring_optimized` AF_PACKET TX_RING kurulumunda once `TPACKET_V3` dener.
-- Kernel/ortam desteklemiyorsa otomatik `TPACKET_V2` fallback uygular.
-- Public Python fonksiyon imzasi degismez; fallback C extension icinde cozulur.
-
-`get_ring_info()` ornek donus:
-
-```python
-{
-  "is_setup": 1,
-  "packet_version": 2,
-  "packet_version_name": "TPACKET_V3",
-  "iface": "eth0",
-  "tp_block_size": 4096,
-  "tp_frame_size": 4096,
-  "tp_block_nr": 4096,
-  "tp_frame_nr": 4096,
-  "ring_size": 16777216,
-  "frame_header_size": 48
-}
-```
-
-### fast_sender Icin Operasyonel Gereksinimler
-
-- CAP_NET_RAW / root izinleri
-- Dogru interface secimi
-- L2 modunda Ether header ve gateway MAC tutarliligi
-- packet_size ile buffer offset hesaplarinin uyumu
-
-## AF_XDP
-
-Entegrasyon noktasi: `ddos_samurai/senders.py:xdp_sender()`
-
-`ddos_samurai/af_xdp_sender.py` sorumluluklari:
-
-- C extension lazy-load
-- Kernel/NIC uyumluluk kontrolu
-- Socket/queue setup
-- Uygun degilse kontrollu fallback
-
-### AF_XDP Icin Kritik Gereksinimler
-
-- Uyumlu Linux kernel ve driver
-- NIC'in XDP/zero-copy kabiliyeti
-- Queue/CPU affinity ve NUMA planlamasi
-- Yeterli yetki ve sistem limitleri
-
-Bu gereksinimlerden biri eksikse AF_XDP yolu devreye girmeyebilir.
-
-## En Sık Hata Modlari
-
-1. Extension import hatasi
-- Belirti: module load error
-- Cozum: build artefaktlarini ve ABI uyumunu kontrol et
-
-2. TX_RING setup hatasi
-- Belirti: ring kurulumu fail veya kisa surede packet drop
-- Cozum: iface, MTU, packet_size ve TPACKET surumunu dogrula
-
-3. AF_XDP init hatasi
-- Belirti: queue bind/socket create fail
-- Cozum: kernel config, driver, queue map ve izinleri kontrol et
-
-4. Beklenmeyen fallback
-- Belirti: performans ani dusus, sender backend degisimi
-- Cozum: runtime log + sender policy + preflight raporunu birlikte incele
-
-## Dogrulama ve Benchmark Onerisi
-
-Hizli teknik dogrulama:
+## 3. Çalıştırma
 
 ```bash
-PYTHONPATH=. python3 -m pytest -q tests/test_sender_comprehensive.py
-PYTHONPATH=. python3 -m pytest -q tests/test_senders_import_fallback.py
-PYTHONPATH=. python3 -m pytest -q tests/test_af_xdp_zero_copy.py
+# Gerekli sistem izinleri ve root ile çalıştırma
+sudo ./build/ddos_samurai/cli/samurai \
+  --worker afxdp \
+  --target 10.0.0.50 \
+  --port 80 \
+  --protocol tcp \
+  --count 10000000 \
+  --confirm
 ```
-
-Profil bazli benchmark:
-
-```bash
-python -m ddos_samurai.benchmark_profiles --profile ci_safe --run
-sudo python -m ddos_samurai.benchmark_profiles --profile dedicated_lab --run
-```
-
-Parite ve kapasite yorumlarken `run_quality`, loss telemetry ve SLO gate sonuclari
-birlikte degerlendirilmelidir.

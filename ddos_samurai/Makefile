@@ -26,16 +26,21 @@ PYTHON_LDFLAGS := $(shell $(PYTHON_CONFIG) --ldflags --embed 2>/dev/null || $(PY
 # Compiler settings
 CC := gcc
 CLANG := clang
-CFLAGS := -O2 -Wall -Wextra -fPIC -shared
+CFLAGS := -O2 -Wall -Wextra -fPIC -shared -I. -Ixdp
 XDP_CFLAGS := -O2 -target bpf -D__BPF_TRACING__
+MULTIARCH_INC := /usr/include/$(shell uname -m)-linux-gnu
+ifneq ($(wildcard $(MULTIARCH_INC)),)
+    XDP_CFLAGS += -I$(MULTIARCH_INC)
+endif
 
 # Source files
-XDP_SENDER_SRC := xdp_sender.c
-XDP_SENDER_OUT := xdp_sender.so
-XDP_PROG_SRC := xdp_prog.c
-XDP_PROG_OUT := xdp_prog.o
-PACING_SRC := pacing_engine.c
-FAST_SENDER_SRC := fast_sender.c
+# XDP sources live in the dedicated xdp/ subtree.
+XDP_DIR := xdp
+XDP_SENDER_SRC := $(XDP_DIR)/xdp_sender.c
+XDP_SENDER_OUT := $(XDP_DIR)/xdp_sender.so
+XDP_PROG_SRC := $(XDP_DIR)/xdp_prog.c
+XDP_PROG_OUT := $(XDP_DIR)/xdp_prog.o
+PACING_SRC := pacing_engine.c $(XDP_DIR)/xdp_core.c
 
 # Libraries
 LIBS := -lpthread
@@ -46,7 +51,6 @@ ARCH := $(shell uname -m)
 PYTHON_EXT := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')")
 XDP_SENDER_MODULE := xdp_sender$(PYTHON_EXT)
 PACING_MODULE := pacing_engine$(PYTHON_EXT)
-FAST_SENDER_MODULE := fast_sender$(PYTHON_EXT)
 
 # Colors for output
 RED := \033[0;31m
@@ -55,9 +59,9 @@ YELLOW := \033[0;33m
 BLUE := \033[0;34m
 NC := \033[0m # No Color
 
-.PHONY: all xdp xdp-prog pacing fast clean check help install
+.PHONY: all xdp xdp-prog pacing clean check help install
 
-all: xdp xdp-prog pacing fast
+all: xdp xdp-prog pacing
 	@echo "$(GREEN)✅ All targets built successfully!$(NC)"
 
 # Build AF_XDP Python extension
@@ -68,7 +72,9 @@ $(XDP_SENDER_MODULE): $(XDP_SENDER_SRC)
 	@echo "$(BLUE)Building AF_XDP sender module...$(NC)"
 	$(CC) $(CFLAGS) $(PYTHON_INCLUDE) -o $@ $< $(PYTHON_LDFLAGS) $(LIBS)
 	@if [ -f "$@" ]; then \
-		echo "$(GREEN)✅ Built: $@$(NC)"; \
+		cp -f "$@" $(XDP_SENDER_OUT); \
+		cp -f "$@" xdp_sender.so; \
+		echo "$(GREEN)✅ Built: $@ (and synced to $(XDP_SENDER_OUT))$(NC)"; \
 	else \
 		echo "$(RED)❌ Failed to build: $@$(NC)"; \
 		exit 1; \
@@ -81,7 +87,7 @@ xdp-prog: $(XDP_PROG_OUT)
 $(XDP_PROG_OUT): $(XDP_PROG_SRC)
 	@echo "$(BLUE)Compiling XDP BPF program...$(NC)"
 	@if command -v $(CLANG) >/dev/null 2>&1; then \
-		$(CLANG) $(XDP_CFLAGS) -c $< -o $@; \
+		$(CLANG) $(XDP_CFLAGS) -c $< -o $@ || exit 1; \
 		echo "$(GREEN)✅ Compiled: $@$(NC)"; \
 	else \
 		echo "$(YELLOW)⚠️  clang not found, skipping BPF program$(NC)"; \
@@ -93,20 +99,6 @@ pacing: $(PACING_MODULE)
 
 $(PACING_MODULE): $(PACING_SRC)
 	@echo "$(BLUE)Building Pacing Engine module...$(NC)"
-	$(CC) $(CFLAGS) $(PYTHON_INCLUDE) -o $@ $< $(PYTHON_LDFLAGS) $(PACING_LIBS)
-	@if [ -f "$@" ]; then \
-		echo "$(GREEN)✅ Built: $@$(NC)"; \
-	else \
-		echo "$(RED)❌ Failed to build: $@$(NC)"; \
-		exit 1; \
-	fi
-
-# Build fast_sender Python extension (TX_RING + SO_TXTIME + sendmmsg)
-fast: $(FAST_SENDER_MODULE)
-	@echo "$(GREEN)✅ Fast sender module built: $(FAST_SENDER_MODULE)$(NC)"
-
-$(FAST_SENDER_MODULE): $(FAST_SENDER_SRC)
-	@echo "$(BLUE)Building Fast Sender module (with SO_TXTIME)...$(NC)"
 	$(CC) $(CFLAGS) $(PYTHON_INCLUDE) -o $@ $< $(PYTHON_LDFLAGS) $(PACING_LIBS)
 	@if [ -f "$@" ]; then \
 		echo "$(GREEN)✅ Built: $@$(NC)"; \
@@ -174,8 +166,8 @@ install: xdp
 # Clean build artifacts
 clean:
 	@echo "$(BLUE)Cleaning build artifacts...$(NC)"
-	rm -f $(XDP_SENDER_MODULE) $(PACING_MODULE) $(FAST_SENDER_MODULE) $(XDP_PROG_OUT) *.o *.so
-	rm -f xdp_sender.cpython-*.so pacing_engine.cpython-*.so fast_sender.cpython-*.so
+	rm -f $(XDP_SENDER_MODULE) $(PACING_MODULE) $(XDP_PROG_OUT) *.o *.so
+	rm -f xdp_sender.cpython-*.so pacing_engine.cpython-*.so
 	@echo "$(GREEN)✅ Cleaned$(NC)"
 
 # Help
@@ -188,7 +180,6 @@ help:
 	@echo "  make xdp        Build xdp_sender Python extension"
 	@echo "  make xdp-prog   Compile XDP BPF program"
 	@echo "  make pacing     Build pacing_engine Python extension"
-	@echo "  make fast       Build fast_sender Python extension (SO_TXTIME)"
 	@echo "  make all        Build everything"
 	@echo "  make check      Check system dependencies"
 	@echo "  make clean      Remove build artifacts"

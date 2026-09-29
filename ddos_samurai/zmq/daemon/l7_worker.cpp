@@ -23,101 +23,40 @@
 #include <unistd.h>
 #include <zmq.h>
 
+#include "l7_request_variants.hpp"
 #include "pacing_engine.h"
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
+#include "worker_common.hpp"
+
+#include "bridge.hpp"
+#include "json.hpp"
 
 namespace {
+using samurai::daemon::SendFrame;
+using samurai::daemon::BuildSnapshot;
+using samurai::daemon::JsonError;
+using samurai::daemon::PacingFromEnvelope;
+using samurai::daemon::ReadFixed;
+using samurai::daemon::SerializeSnapshot;
 
 constexpr const char* kDefaultJobs = "ipc:///tmp/samurai_jobs_l7";
 constexpr const char* kDefaultEvents = "ipc:///tmp/samurai_events_l7";
 
-std::string ReadFixed(const char* raw, std::size_t n) {
-  return std::string(raw, strnlen(raw, n));
-}
 
 std::string ToLower(std::string v) {
   for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   return v;
 }
 
-samurai_pacing_config_t PacingFromEnvelope(const samurai::wire::JobEnvelopeV1& env) {
-  samurai_pacing_config_t out{};
-  out.mode = env.pacing_mode;
-  out.target_rps = env.target_rps;
-  out.ipg_ns = env.ipg_ns;
-  out.burst_size = env.burst_size > 0u ? env.burst_size : 1u;
-  out.burst_gap_ns = env.burst_gap_ns;
-  return out;
-}
 
-int SendFrame(
-    void* event_socket,
-    std::uint8_t msg_type,
-    std::uint64_t correlation_id,
-    samurai::wire::WorkerKind worker_kind,
-    const std::string& job_id,
-    const std::vector<std::uint8_t>& payload = {}) {
-  samurai::wire::SamuraiWireHeaderV1 header = samurai::daemon::MakeHeader(
-      msg_type,
-      static_cast<std::uint32_t>(payload.size()),
-      correlation_id,
-      worker_kind,
-      job_id);
-  zmq_msg_t msg;
-  const std::size_t total = sizeof(header) + payload.size();
-  if (zmq_msg_init_size(&msg, total) != 0) return -1;
-  auto* p = static_cast<std::uint8_t*>(zmq_msg_data(&msg));
-  std::memcpy(p, &header, sizeof(header));
-  if (!payload.empty()) std::memcpy(p + sizeof(header), payload.data(), payload.size());
-  const int rc = zmq_msg_send(&msg, event_socket, 0);
-  zmq_msg_close(&msg);
-  return rc;
-}
 
 int SendAck(void* push, std::uint64_t cid, const std::string& job_id) {
   return SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK), cid, samurai::wire::WorkerKind::L7, job_id);
 }
 
-std::vector<std::uint8_t> JsonError(const std::string& reason) {
-  const std::string json = "{\"status\":\"error\",\"error\":\"" + reason + "\"}";
-  return std::vector<std::uint8_t>(json.begin(), json.end());
-}
 
-samurai::wire::MetricSnapshotV1 BuildSnapshot(
-    std::uint64_t now_ns,
-    std::uint64_t start_ns,
-    std::uint64_t packets_sent,
-    std::uint64_t packets_errors,
-    std::uint64_t bytes_sent,
-    const samurai_pacing_config_t& pace_cfg,
-    const samurai_pacing_state_t& pace_state) {
-  const double duration_s = std::max(1e-9, static_cast<double>(now_ns - start_ns) / 1e9);
-  const double actual_rps = static_cast<double>(packets_sent) / duration_s;
-  double rate_accuracy_pct = 100.0;
-  if (pace_cfg.mode == SAMURAI_PACING_RPS && pace_cfg.target_rps > 0.0) {
-    const double err_abs = std::abs(actual_rps - pace_cfg.target_rps);
-    rate_accuracy_pct = std::max(0.0, 100.0 - ((err_abs * 100.0) / pace_cfg.target_rps));
-  }
 
-  samurai::wire::MetricSnapshotV1 snap{};
-  snap.timestamp_ns = now_ns;
-  snap.packets_sent = packets_sent;
-  snap.packets_errors = packets_errors;
-  snap.bytes_sent = bytes_sent;
-  snap.actual_rps = actual_rps;
-  snap.jitter_p99_ns = 0.0;
-  snap.rate_accuracy_pct = rate_accuracy_pct;
-  snap.busywait_cycles = 0;
-  snap.sleep_calls = static_cast<std::uint32_t>(pace_state.sleep_calls & 0xFFFFFFFFu);
-  return snap;
-}
-
-std::vector<std::uint8_t> SerializeSnapshot(const samurai::wire::MetricSnapshotV1& snap) {
-  std::vector<std::uint8_t> payload(sizeof(snap));
-  std::memcpy(payload.data(), &snap, sizeof(snap));
-  return payload;
-}
 
 std::vector<std::uint8_t> JsonDone(
     std::uint64_t correlation_id,
@@ -148,6 +87,22 @@ std::vector<std::uint8_t> JsonDone(
   return std::vector<std::uint8_t>(s.begin(), s.end());
 }
 
+std::vector<std::uint8_t> JsonDoneEmu(
+    std::uint64_t correlation_id,
+    const std::string& job_id,
+    const std::string& protocol,
+    const std::string& result_json) {
+  std::ostringstream oss;
+  oss << "{\"status\":\"ok\",\"worker_kind\":\"l7\""
+      << ",\"correlation_id\":" << correlation_id
+      << ",\"job_id\":\"" << job_id << "\""
+      << ",\"l7_protocol\":\"" << protocol << "\""
+      << ",\"engine\":\"l7_emu_native_bridge\""
+      << ",\"engine_result\":" << result_json << "}";
+  const std::string s = oss.str();
+  return std::vector<std::uint8_t>(s.begin(), s.end());
+}
+
 bool ReadFileBytes(const std::string& path, std::vector<std::uint8_t>& out, std::string& err) {
   std::ifstream f(path, std::ios::binary);
   if (!f) {
@@ -169,19 +124,116 @@ bool ReadFileBytes(const std::string& path, std::vector<std::uint8_t>& out, std:
   return true;
 }
 
-std::vector<std::uint8_t> BuildDefaultRequest(const samurai::wire::JobEnvelopeV1& env, const std::string& protocol_lc) {
-  const std::string host = ReadFixed(env.target_ip, sizeof(env.target_ip));
+std::vector<std::uint8_t> BuildDefaultRequest(const std::string& target_ip,
+                                              const std::string& protocol_lc,
+                                              std::uint32_t request_mix) {
+  const std::string host = target_ip.empty() ? std::string("localhost") : target_ip;
   if (protocol_lc == "http2" || protocol_lc == "h2") {
     static constexpr char kH2Preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     return std::vector<std::uint8_t>(kH2Preface, kH2Preface + sizeof(kH2Preface) - 1);
   }
   if (protocol_lc == "http1" || protocol_lc == "http" || protocol_lc == "https") {
-    std::string req = "GET / HTTP/1.1\r\nHost: " + (host.empty() ? std::string("localhost") : host) +
-                      "\r\nUser-Agent: samurai-l7-worker\r\nConnection: close\r\n\r\n";
+    // request_mix selects the request shape; index 0 == "GET /" (prior default).
+    const std::string req = samurai::l7::BuildHttp1Request(request_mix, host);
     return std::vector<std::uint8_t>(req.begin(), req.end());
   }
   static constexpr char kCustomMsg[] = "samurai-l7\n";
   return std::vector<std::uint8_t>(kCustomMsg, kCustomMsg + sizeof(kCustomMsg) - 1);
+}
+
+// L7 job parameters. Carries the V1 fields plus the V2 stateful-runtime knobs;
+// populated from either envelope version so the worker stays backward compatible.
+struct L7JobParams {
+  std::string target_ip;
+  int target_port{0};
+  std::string protocol;
+  std::string attack_vector;
+  std::string scenario_ref;
+  std::string payload_ref;
+  bool has_payload{false};
+  std::uint32_t packet_count{1};
+  std::uint32_t concurrency{1};
+  std::uint32_t max_connections{1};
+  std::uint32_t max_streams_per_connection{1};
+  bool verify_tls{false};
+  bool keepalive{false};
+  std::string scheme;
+  std::string host_header;
+  std::uint32_t l7_timeout_ms{5000};
+  std::uint32_t request_mix{0};      // Mahoraga: request-variant selector
+  std::uint32_t source_rotation{0};  // Mahoraga: client source-identity spread
+};
+
+L7JobParams ParseL7Job(
+    const samurai::wire::SamuraiWireHeaderV1& header,
+    const std::uint8_t* payload,
+    std::size_t payload_len,
+    std::string& err) {
+  L7JobParams p;
+  if (header.version == samurai::wire::kVersionV2) {
+    if (payload_len < sizeof(samurai::wire::JobEnvelopeV2)) {
+      err = "l7_envelope_v2_size_mismatch";
+      return p;
+    }
+    samurai::wire::JobEnvelopeV2 env{};
+    std::memcpy(&env, payload, sizeof(env));
+    p.target_ip = ReadFixed(env.base.target_ip, sizeof(env.base.target_ip));
+    p.target_port = static_cast<int>(env.base.target_port);
+    p.protocol = ReadFixed(env.base.protocol, sizeof(env.base.protocol));
+    p.attack_vector = ReadFixed(env.base.attack_vector, sizeof(env.base.attack_vector));
+    p.scenario_ref = ReadFixed(env.base.scenario_payload_ref, sizeof(env.base.scenario_payload_ref));
+    p.payload_ref = ReadFixed(env.base.payload_ref, sizeof(env.base.payload_ref));
+    p.has_payload = env.base.has_payload != 0u;
+    p.packet_count = env.base.packet_count;
+    p.concurrency = env.concurrency > 0u ? env.concurrency : 1u;
+    p.max_connections = env.max_connections > 0u ? env.max_connections : 1u;
+    p.max_streams_per_connection = env.max_streams_per_connection > 0u ? env.max_streams_per_connection : 1u;
+    p.verify_tls = env.verify_tls != 0u;
+    p.keepalive = env.keepalive != 0u;
+    p.scheme = ReadFixed(env.scheme, sizeof(env.scheme));
+    p.host_header = ReadFixed(env.host_header, sizeof(env.host_header));
+    p.l7_timeout_ms = env.l7_timeout_ms > 0u ? env.l7_timeout_ms : 5000u;
+    p.request_mix = env.request_mix;
+    p.source_rotation = env.source_rotation;
+    return p;
+  }
+  if (payload_len < sizeof(samurai::wire::JobEnvelopeV1)) {
+    err = "l7_envelope_v1_size_mismatch";
+    return p;
+  }
+  samurai::wire::JobEnvelopeV1 env{};
+  std::memcpy(&env, payload, sizeof(env));
+  p.target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
+  p.target_port = static_cast<int>(env.target_port);
+  p.protocol = ReadFixed(env.protocol, sizeof(env.protocol));
+  p.attack_vector = ReadFixed(env.attack_vector, sizeof(env.attack_vector));
+  p.scenario_ref = ReadFixed(env.scenario_payload_ref, sizeof(env.scenario_payload_ref));
+  p.payload_ref = ReadFixed(env.payload_ref, sizeof(env.payload_ref));
+  p.has_payload = env.has_payload != 0u;
+  p.packet_count = env.packet_count;
+  return p;
+}
+
+// Maps the raw protocol label onto the emu-engine dispatch set. Plain "tcp"
+// plus an http* attack vector (e.g. the web-stress profile) is normalized to
+// http1 so profiles drive the real stateful engine instead of raw byte blobs.
+std::string NormalizeL7Protocol(const std::string& protocol_lc, const std::string& attack_vector_lc) {
+  if (protocol_lc == "http" || protocol_lc == "http1" || protocol_lc == "https") {
+    return "http1";
+  }
+  if (protocol_lc == "h2" || protocol_lc == "http2") {
+    return "http2";
+  }
+  if (protocol_lc == "quic" || protocol_lc == "h3" || protocol_lc == "http3") {
+    return "quic";
+  }
+  if (protocol_lc == "dns") {
+    return "dns";
+  }
+  if (protocol_lc == "tcp" && attack_vector_lc.compare(0, 4, "http") == 0) {
+    return "http1";
+  }
+  return protocol_lc;
 }
 
 bool SetSocketTimeoutMs(int fd, int timeout_ms) {
@@ -383,26 +435,25 @@ int main(int argc, char** argv) {
     }
 
     if (msg_type == samurai::wire::MessageType::START_JOB) {
-      if (payload_len != sizeof(samurai::wire::JobEnvelopeV1) || header.payload_len != sizeof(samurai::wire::JobEnvelopeV1)) {
+      std::string envelope_err;
+      const L7JobParams params = ParseL7Job(header, payload_ptr, payload_len, envelope_err);
+      if (!envelope_err.empty()) {
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
             header.correlation_id,
             samurai::wire::WorkerKind::L7,
             job_id,
-            JsonError("job_envelope_size_mismatch"));
+            JsonError(envelope_err));
         zmq_msg_close(&msg);
         continue;
       }
-
-      samurai::wire::JobEnvelopeV1 env{};
-      std::memcpy(&env, payload_ptr, sizeof(env));
       (void)SendAck(push, header.correlation_id, job_id);
       zmq_msg_close(&msg);
 
       try {
-        const std::string target = ReadFixed(env.target_ip, sizeof(env.target_ip));
-        const int port = static_cast<int>(env.target_port);
+        const std::string target = params.target_ip;
+        const int port = params.target_port;
         if (target.empty()) {
           (void)SendFrame(
               push,
@@ -424,24 +475,30 @@ int main(int argc, char** argv) {
           continue;
         }
 
-        const std::string protocol = ReadFixed(env.protocol, sizeof(env.protocol));
-        const std::string protocol_lc = ToLower(protocol.empty() ? std::string("http1") : protocol);
-        if (protocol_lc == "quic" || protocol_lc == "h3" || protocol_lc == "http3") {
+        const std::string protocol = params.protocol;
+        const std::string raw_protocol_lc = ToLower(protocol.empty() ? std::string("http1") : protocol);
+        const std::string attack_vector_lc = ToLower(params.attack_vector);
+        const std::string dispatch_protocol = NormalizeL7Protocol(raw_protocol_lc, attack_vector_lc);
+        const std::string& scenario_ref = params.scenario_ref;
+        const bool use_l7_emu =
+            dispatch_protocol == "http1" || dispatch_protocol == "http2" || dispatch_protocol == "quic" ||
+            !scenario_ref.empty();
+
+        if (dispatch_protocol == "dns") {
           (void)SendFrame(
               push,
               static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
               header.correlation_id,
               samurai::wire::WorkerKind::L7,
               job_id,
-              JsonError("l7_protocol_requires_udp_or_quic_worker"));
+              JsonError("l7_dns_engine_not_yet_implemented"));
           continue;
         }
 
         std::vector<std::uint8_t> request_payload;
-        const std::string payload_ref = ReadFixed(env.payload_ref, sizeof(env.payload_ref));
-        if (env.has_payload != 0u && !payload_ref.empty()) {
+        if (params.has_payload && !params.payload_ref.empty()) {
           std::string payload_err;
-          if (!ReadFileBytes(payload_ref, request_payload, payload_err)) {
+          if (!ReadFileBytes(params.payload_ref, request_payload, payload_err)) {
             (void)SendFrame(
                 push,
                 static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
@@ -452,7 +509,9 @@ int main(int argc, char** argv) {
             continue;
           }
         } else {
-          request_payload = BuildDefaultRequest(env, protocol_lc);
+          // No explicit payload: synthesize the request the request_mix lever
+          // selects (index 0 == the historical "GET /").
+          request_payload = BuildDefaultRequest(target, raw_protocol_lc, params.request_mix);
         }
         if (request_payload.empty()) {
           (void)SendFrame(
@@ -466,28 +525,189 @@ int main(int argc, char** argv) {
         }
 
         std::uint64_t scenario_payload_bytes = 0;
-        const std::string scenario_ref = ReadFixed(env.scenario_payload_ref, sizeof(env.scenario_payload_ref));
+        std::vector<std::uint8_t> scenario_content;
         if (!scenario_ref.empty()) {
-          std::ifstream sf(scenario_ref, std::ios::binary | std::ios::ate);
-          if (!sf) {
+          std::string scenario_read_err;
+          if (!ReadFileBytes(scenario_ref, scenario_content, scenario_read_err)) {
             (void)SendFrame(
                 push,
                 static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
                 header.correlation_id,
                 samurai::wire::WorkerKind::L7,
                 job_id,
-                JsonError("scenario_payload_ref_missing"));
+                JsonError(scenario_read_err));
             continue;
           }
-          const std::streamoff ssz = sf.tellg();
-          scenario_payload_bytes = ssz > 0 ? static_cast<std::uint64_t>(ssz) : 0u;
+          scenario_payload_bytes = static_cast<std::uint64_t>(scenario_content.size());
         }
 
-        samurai_pacing_config_t pace_cfg = PacingFromEnvelope(env);
+        if (use_l7_emu) {
+          try {
+            using samurai::core::json::Parse;
+            using samurai::core::json::ParseResult;
+            using samurai::core::json::Value;
+            Value profile = Value::Object();
+            if (!scenario_content.empty()) {
+              const std::string scenario_text(
+                  reinterpret_cast<const char*>(scenario_content.data()), scenario_content.size());
+              const ParseResult pr = Parse(scenario_text);
+              if (pr.ok && pr.value.is_object()) profile = pr.value;
+            }
+            Value conn = Value::Object();
+            if (const Value* existing_conn = profile.find("connection_template");
+                existing_conn != nullptr && existing_conn->is_object()) {
+              conn = *existing_conn;
+            }
+            if (conn.find("transport_backend") == nullptr) {
+              const char* transport_env = std::getenv("SAMURAI_L7_TRANSPORT");
+              const std::string transport_lc =
+                  transport_env != nullptr ? ToLower(std::string(transport_env)) : std::string("");
+              const char* transport_name = "kernel_socket";
+              if (dispatch_protocol == "quic") {
+                transport_name = "custom_quic";
+              } else if (transport_lc == "custom_tcp") {
+                transport_name = "custom_tcp";
+              } else if (transport_lc == "custom_quic") {
+                transport_name = "custom_quic";
+              }
+              conn.set("transport_backend", Value::Str(transport_name));
+            }
+            if (conn.find("target_ip") == nullptr) conn.set("target_ip", Value::Str(target));
+            if (conn.find("target_port") == nullptr) conn.set("target_port", Value::Int(port));
+            const bool use_tls_scheme =
+                !params.scheme.empty() ? (params.scheme == "https")
+                                       : (raw_protocol_lc == "https" || dispatch_protocol == "quic");
+            if (conn.find("scheme") == nullptr) conn.set("scheme", Value::Str(use_tls_scheme ? "https" : "http"));
+            if (conn.find("host_header") == nullptr)
+              conn.set("host_header", Value::Str(params.host_header.empty() ? target : params.host_header));
+            if (conn.find("verify") == nullptr) conn.set("verify", Value::Int(params.verify_tls ? 1 : 0));
+            if (conn.find("keepalive") == nullptr) conn.set("keepalive", Value::Int(params.keepalive ? 1 : 0));
+            if (conn.find("timeout_ms") == nullptr)
+              conn.set("timeout_ms", Value::Int(static_cast<std::int64_t>(params.l7_timeout_ms)));
+            if (conn.find("max_connections") == nullptr)
+              conn.set("max_connections", Value::Int(static_cast<std::int64_t>(params.max_connections)));
+            if (conn.find("max_streams_per_connection") == nullptr)
+              conn.set("max_streams_per_connection",
+                       Value::Int(static_cast<std::int64_t>(params.max_streams_per_connection)));
+            if (conn.find("session_repeats") == nullptr)
+              conn.set("session_repeats", Value::Int(std::max(1, static_cast<int>(params.packet_count))));
+            // source_rotation: advisory client source-identity spread. Carried on
+            // the connection template so a transport that supports source-port
+            // spread can honor it; over a single-host loopback lab (one source
+            // IP) it does not move IP-keyed rate limits — recorded for the
+            // corpus, honored where the egress path can vary the source.
+            if (params.source_rotation > 1u && conn.find("source_rotation") == nullptr)
+              conn.set("source_rotation", Value::Int(static_cast<std::int64_t>(params.source_rotation)));
+            profile.set("connection_template", conn);
+            if (profile.find("flow_attempted") == nullptr) {
+              profile.set("flow_attempted", Value::Int(std::max(1, static_cast<int>(params.packet_count))));
+            }
+            if (profile.find("protocol") == nullptr) {
+              const char* emu_protocol = "http1";
+              if (dispatch_protocol == "http2") emu_protocol = "http2";
+              else if (dispatch_protocol == "quic") emu_protocol = "quic";
+              profile.set("protocol", Value::Str(emu_protocol));
+            }
+            if (profile.find("flow_program") == nullptr && !request_payload.empty()) {
+              // request_mix picks the emitted request line so the emu engine
+              // sends a real method/path the WAF/rate-limiter reacts to (index 0
+              // == GET /). A caller-supplied flow_program overrides this entirely.
+              const samurai::l7::RequestVariant& variant =
+                  samurai::l7::VariantFor(params.request_mix);
+              Value op = Value::Object();
+              op.set("opcode", Value::Str("SEND_HEADERS"));
+              op.set("method", Value::Str(variant.method));
+              op.set("path", Value::Str(variant.path));
+              Value body = Value::Object();
+              body.set("kind", Value::Str("raw"));
+              Value body_bytes = Value::Array();
+              for (const std::uint8_t b : request_payload) body_bytes.push_back(Value::Int(static_cast<std::int64_t>(b)));
+              body.set("bytes", body_bytes);
+              op.set("body", body);
+              Value ops = Value::Array();
+              const int repeat_count = std::max(1, static_cast<int>(params.packet_count));
+              for (int r = 0; r < repeat_count; ++r) ops.push_back(op);
+              Value flow_program = Value::Object();
+              flow_program.set("ops", ops);
+              profile.set("flow_program", flow_program);
+            }
+            Value cfg = Value::Object();
+            cfg.set("concurrency", Value::Int(static_cast<std::int64_t>(params.concurrency)));
+            cfg.set("profile_l7", Value::Int(1));
+            cfg.set("profile_sample_limit", Value::Int(0));
+            const Value emu_result = ddos_samurai::l7_emu_native::run_profile_json(profile, cfg);
+
+            auto read_u64 = [&emu_result](const char* key) -> std::uint64_t {
+              const Value* v = emu_result.find(key);
+              if (v == nullptr || !v->is_number()) return 0u;
+              return static_cast<std::uint64_t>(std::max<double>(0.0, v->as_double()));
+            };
+            auto read_double = [&emu_result](const char* key) -> double {
+              const Value* v = emu_result.find(key);
+              if (v == nullptr || !v->is_number()) return 0.0;
+              return v->as_double();
+            };
+            const std::uint64_t emu_attempted = read_u64("attempted");
+            const std::uint64_t emu_sent = read_u64("sent");
+            const std::uint64_t emu_errors = read_u64("errors");
+            const std::uint64_t emu_tx_bytes = read_u64("l7_tx_bytes");
+            const std::uint64_t emu_end_ns = samurai_pacing_monotonic_now_ns();
+            samurai::wire::MetricSnapshotV2 emu_snap{};
+            emu_snap.base.timestamp_ns = emu_end_ns;
+            emu_snap.base.packets_sent = emu_sent;
+            emu_snap.base.packets_errors = emu_errors;
+            emu_snap.base.bytes_sent = emu_tx_bytes;
+            emu_snap.base.actual_rps = read_double("l7_rps");
+            emu_snap.base.rate_accuracy_pct = emu_attempted > 0
+                                             ? std::min(100.0, (static_cast<double>(emu_sent) * 100.0) / static_cast<double>(emu_attempted))
+                                             : 0.0;
+            
+            // Extract Phase 6 L7 metrics
+            emu_snap.tcp_active_tcb_count = static_cast<std::uint32_t>(read_u64("tcp_active_tcb_count"));
+            emu_snap.tcp_timer_wheel_overflows = static_cast<std::uint32_t>(read_u64("tcp_timer_wheel_overflows"));
+            emu_snap.tls_handshakes_completed = static_cast<std::uint32_t>(read_u64("tls_handshakes_completed"));
+            emu_snap.tls_session_reuse_hits = static_cast<std::uint32_t>(read_u64("tls_session_reuse_hits"));
+            emu_snap.dns_queries_sent = static_cast<std::uint32_t>(read_u64("dns_queries_sent"));
+            emu_snap.dns_responses_parsed = static_cast<std::uint32_t>(read_u64("dns_responses_parsed"));
+            emu_snap.dns_ecs_injected = static_cast<std::uint32_t>(read_u64("dns_ecs_injected"));
+            emu_snap.dhcp_leases_active = static_cast<std::uint32_t>(read_u64("dhcp_leases_active"));
+            emu_snap.arp_resolved_entries = static_cast<std::uint32_t>(read_u64("arp_resolved_entries"));
+            emu_snap.igmp_active_groups = static_cast<std::uint32_t>(read_u64("igmp_active_groups"));
+            emu_snap.hot_path_zero_copy_tx_bytes = read_u64("hot_path_zero_copy_tx_bytes");
+            emu_snap.hot_path_zero_copy_rx_bytes = read_u64("hot_path_zero_copy_rx_bytes");
+
+            (void)SendFrame(
+                push,
+                static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
+                header.correlation_id,
+                samurai::wire::WorkerKind::L7,
+                job_id,
+                samurai::daemon::SerializeSnapshotV2(emu_snap));
+            (void)SendFrame(
+                push,
+                static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
+                header.correlation_id,
+                samurai::wire::WorkerKind::L7,
+                job_id,
+                JsonDoneEmu(header.correlation_id, job_id, dispatch_protocol, emu_result.dump()));
+            continue;
+          } catch (const std::exception& exc) {
+            (void)SendFrame(
+                push,
+                static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                header.correlation_id,
+                samurai::wire::WorkerKind::L7,
+                job_id,
+                JsonError(std::string("l7_emu_profile_failed:") + exc.what()));
+            continue;
+          }
+        }
+
+        samurai_pacing_config_t pace_cfg = PacingFromEnvelope(header, payload_ptr);
         samurai_pacing_state_t pace_state{};
         samurai_pacing_init(&pace_state, &pace_cfg);
 
-        const int request_count = std::max(1, static_cast<int>(env.packet_count));
+        const int request_count = std::max(1, static_cast<int>(params.packet_count));
         const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
         std::uint64_t last_hb_ns = start_ns;
         std::uint64_t last_metric_ns = start_ns;
@@ -553,7 +773,7 @@ int main(int argc, char** argv) {
         const std::vector<std::uint8_t> done = JsonDone(
             header.correlation_id,
             job_id,
-            protocol_lc,
+            raw_protocol_lc,
             packets_sent,
             packets_errors,
             bytes_sent,

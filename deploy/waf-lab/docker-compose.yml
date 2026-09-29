@@ -1,0 +1,151 @@
+# DDoSamurai WAF/IPS resilience lab.
+#
+# A *defended* HTTP target you own, built to REACT to load so the closed-loop
+# autopilot (samurai_master --closed-loop --rl-corpus) records real
+# defense-reaction transitions for the Mahoraga RL policy. Request path:
+#
+#     load  ->  caddy (Coraza WAF, 403 block)
+#           ->  nginx (limit_req 429 / limit_conn 503, overload shedding)
+#           ->  whoami (origin, 200)
+#     suricata  sniffs caddy ingress -> eve.json IDS alerts (observability / opt-in IPS)
+#     fail2ban  watches nginx 429 log -> bans source IP (connection refused)
+#
+# Turnkey layers (no host privileges): caddy WAF + nginx rate-limit + whoami.
+# Privileged, opt-in layers (need NET_ADMIN, may need host netfilter): suricata
+# inline drop and fail2ban banning — see README. They still emit signals (alerts /
+# bans) in the default bridge setup; true inline blocking is environment-specific.
+
+name: samurai-waf-lab
+
+services:
+  # Origin — a trivial always-200 echo. The thing "behind" the defenses.
+  whoami:
+    image: traefik/whoami:v1.10.2
+    container_name: samurai-lab-origin
+    restart: unless-stopped
+    command: ["--port", "80"]
+    networks: [labnet]
+
+  # Rate-limit / overload tier. Real 429 (limit_req) and 503 (limit_conn) under load.
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: samurai-lab-nginx
+    restart: unless-stopped
+    depends_on: [whoami]
+    volumes:
+      # Rate-limit tier is profile-selected: WAF_PROFILE picks strict-waf (default),
+      # rate-only, or waf-heavy under ./profiles. Each is a distinct defense
+      # personality so the union corpus spans multiple limiter/WAF regimes.
+      - ./profiles/${WAF_PROFILE:-strict-waf}/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_logs:/var/log/nginx
+    networks: [labnet]
+
+  # WAF edge. OWASP-Coraza via Caddy; blocks anomalous requests with 403.
+  # Built locally (xcaddy + coraza-caddy) — see caddy/Dockerfile.
+  caddy:
+    build:
+      context: ./caddy
+    container_name: samurai-lab-waf
+    restart: unless-stopped
+    depends_on: [nginx]
+    ports:
+      - "${WAF_LAB_PORT:-8080}:8080"   # <-- point samurai --target here
+    volumes:
+      - caddy_logs:/var/log/caddy
+      # Profile-selected WAF policy rules. Only waf-rules.conf varies per profile;
+      # the engine config (coraza.conf) stays baked in the image. Bind-mounting the
+      # single file lets a profile switch take effect on `docker compose up -d caddy`
+      # (with WAF_PROFILE set) without an image rebuild.
+      - ./profiles/${WAF_PROFILE:-strict-waf}/waf-rules.conf:/etc/caddy/coraza/waf-rules.conf:ro
+    networks: [labnet]
+
+  # IDS/IPS. Shares the WAF netns. Default: passive IDS sniffing eth0 (alerts to
+  # eve.json). Inline IPS mode is opt-in via env (no host sudo — the NET_ADMIN cap
+  # + the nfq-init sidecar do it inside the container netns):
+  #
+  #   SURICATA_TAP=-q SURICATA_IF=0 \
+  #     docker compose -f deploy/waf-lab/docker-compose.yml --profile ips up -d
+  #
+  # That runs `suricata -q 0` (NFQUEUE) and brings up nfq-init, which installs the
+  # NFQUEUE iptables rule so ingress/egress on :8080 flows through Suricata. The
+  # `reject`/`drop` actions in custom.rules then produce real RST/timeout the
+  # userspace-TCP load generator records as the flow-level RL state axis.
+  suricata:
+    image: jasonish/suricata:7.0
+    container_name: samurai-lab-ids
+    restart: unless-stopped
+    depends_on: [caddy]
+    network_mode: "service:caddy"     # share the WAF netns to see ingress packets
+    cap_add: [NET_ADMIN, NET_RAW, SYS_NICE]
+    # -S loads the lab's own signatures ON TOP of the ET ruleset (the default
+    # suricata.yaml rule-files only lists suricata.rules, so custom.rules was
+    # otherwise never loaded and our lab sids never fired). SURICATA_TAP/_IF select
+    # the capture mode: default `-i eth0` (IDS) or `-q 0` (IPS/NFQUEUE) via env.
+    command: ["${SURICATA_TAP:--i}", "${SURICATA_IF:-eth0}", "-S", "/etc/suricata/rules/custom.rules"]
+    volumes:
+      # NOTE: no :ro — the jasonish/suricata entrypoint chown's its rules dir on
+      # start, which fails ("Read-only file system") and crash-loops if this is
+      # mounted read-only. It only reads the file after that, so rw is harmless.
+      - ./suricata/custom.rules:/etc/suricata/rules/custom.rules
+      - suricata_logs:/var/log/suricata
+
+  # Log-driven banning. Reads nginx's 429 log and bans the source IP, turning
+  # sustained abuse into connection refusals the load generator observes.
+  fail2ban:
+    image: crazymax/fail2ban:1.1.0
+    container_name: samurai-lab-fail2ban
+    restart: unless-stopped
+    depends_on: [nginx]
+    network_mode: host                # ban with the host's netfilter
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      - TZ=UTC
+      - F2B_LOG_LEVEL=INFO
+    volumes:
+      - ./fail2ban/jail.d:/etc/fail2ban/jail.d:ro
+      - ./fail2ban/filter.d:/etc/fail2ban/filter.d:ro
+      - nginx_logs:/var/log/nginx:ro
+
+  # NFQUEUE installer for inline-IPS mode (opt-in via `--profile ips`). Shares the
+  # WAF netns and, with only the NET_ADMIN cap (no host sudo), inserts an iptables
+  # rule that steers ingress/egress on :8080 through NFQUEUE 0, where `suricata -q 0`
+  # reads the queue and drops/rejects matched packets. --queue-bypass fails OPEN:
+  # if Suricata isn't attached the traffic still flows, so the lab never wedges. The
+  # -C guard makes (re)start idempotent; it then parks so the container stays Up and
+  # the rule persists for the netns lifetime.
+  nfq-init:
+    image: alpine:3.20
+    container_name: samurai-lab-nfq
+    restart: unless-stopped
+    depends_on: [caddy]
+    network_mode: "service:caddy"
+    cap_add: [NET_ADMIN, NET_RAW]
+    profiles: [ips]
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache iptables >/dev/null 2>&1 || exit 1
+        # INPUT (client->server request) only. Steering the OUTPUT (response) path
+        # through the userspace NFQUEUE too adds per-packet verdict latency to every
+        # reply and can stall an established connection mid-response — which hangs a
+        # userspace-TCP/kernel-socket load generator that has no mid-response timeout
+        # (observed: 50 r/s, below any rule threshold, connections wedged in do_poll
+        # for 120s). Suricata's flood/scanner rules are flow:to_server, so they fire
+        # and `reject` (RST) on the request path alone; the response path does not
+        # need inspection. --queue-bypass still fails OPEN if Suricata isn't attached.
+        for spec in "INPUT -p tcp --dport 8080"; do
+          iptables -C $$spec -j NFQUEUE --queue-num 0 --queue-bypass 2>/dev/null \
+            || iptables -I $$spec -j NFQUEUE --queue-num 0 --queue-bypass
+        done
+        echo "NFQUEUE steering installed on :8080 INPUT (queue 0, bypass=on)"
+        exec sleep infinity
+
+networks:
+  labnet:
+    driver: bridge
+
+volumes:
+  nginx_logs:
+  caddy_logs:
+  suricata_logs:

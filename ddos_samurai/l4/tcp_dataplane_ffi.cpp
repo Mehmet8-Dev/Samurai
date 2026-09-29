@@ -4,16 +4,117 @@
 
 #include <errno.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+// af_packet: the kernel-socket wire backend used to run the custom_tcp
+// dataplane on commodity NICs (no AF_XDP/DPDK). Self-guarded extern "C" header.
+#include "af_packet.h"
 
 namespace ddos_samurai::tcpdp {
 namespace {
 
-TcpDataplaneCore& Core() {
+// Process-global default core. Preserves the historical singleton behaviour for
+// any thread that has NOT bound a private core (blast/L4 workers, the non-sharded
+// custom_tcp path, the global af_packet wire pump, tests).
+TcpDataplaneCore& DefaultCore() {
   static TcpDataplaneCore* core = new TcpDataplaneCore();
   return *core;
+}
+
+// Per-thread current core. Shared-nothing per-shard custom_tcp binds its own core
+// on the shard thread (tcpdp_core_bind_current); every tcpdp_* call made on that
+// thread then targets the shard's private state machine instead of the global one.
+// nullptr => fall back to DefaultCore() (zero behaviour change when unbound).
+thread_local TcpDataplaneCore* t_current_core = nullptr;
+
+TcpDataplaneCore& Core() {
+  return t_current_core != nullptr ? *t_current_core : DefaultCore();
+}
+
+// ---- af_packet wire pump (commodity-NIC custom_tcp transport) --------------
+//
+// The dataplane core is backend-agnostic: it produces MAC-less L2 frames into a
+// TX ring and ingests inbound L2 frames. This pump bridges that ring to the wire
+// over kernel sockets — an af_packet RX pump feeds captured frames into the TCP
+// state machine, and a TX thread drains the ring, completes the Ethernet header
+// with the interface's source MAC (and a configured/broadcast destination MAC),
+// and transmits via AF_PACKET TX_RING.
+struct AfPacketWirePump {
+  std::atomic<bool> run{false};
+  std::thread tx_thread;
+  std::string iface;
+  uint8_t src_mac[6]{};
+  uint8_t dst_mac[6]{};
+};
+
+AfPacketWirePump* g_wire_pump = nullptr;
+
+bool ResolveIfaceMac(const char* iface, uint8_t out[6]) {
+  const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) return false;
+  struct ifreq ifr;
+  std::memset(&ifr, 0, sizeof(ifr));
+  std::strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+  const bool ok = ::ioctl(fd, SIOCGIFHWADDR, &ifr) == 0;
+  if (ok) std::memcpy(out, ifr.ifr_hwaddr.sa_data, 6);
+  ::close(fd);
+  return ok;
+}
+
+bool ParseMac(const char* s, uint8_t out[6]) {
+  if (!s || !s[0]) return false;
+  unsigned int b[6];
+  if (std::sscanf(s, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+    return false;
+  }
+  for (int i = 0; i < 6; ++i) out[i] = static_cast<uint8_t>(b[i] & 0xffu);
+  return true;
+}
+
+void RxIngestCb(void* /*user*/, const uint8_t* frame, uint32_t len) {
+  (void)Core().IngestRxFrame(frame, static_cast<size_t>(len));
+}
+
+void TxPumpLoop(AfPacketWirePump* p) {
+  std::vector<uint8_t> batch;
+  while (p->run.load(std::memory_order_relaxed)) {
+    const uint8_t* base = nullptr;
+    uint32_t count = 0;
+    size_t psize = 0;
+    size_t stride = 0;
+    if (Core().PeekTxPacketsStrided(64, &base, &count, &psize, &stride) &&
+        base != nullptr && count > 0 && psize >= 14) {
+      // Compact the strided ring slice into contiguous packet_size frames and
+      // complete the (dst,src) Ethernet MACs the dataplane left zeroed.
+      batch.resize(static_cast<size_t>(count) * psize);
+      for (uint32_t i = 0; i < count; ++i) {
+        uint8_t* dst = batch.data() + static_cast<size_t>(i) * psize;
+        std::memcpy(dst, base + static_cast<size_t>(i) * stride, psize);
+        std::memcpy(dst, p->dst_mac, 6);
+        std::memcpy(dst + 6, p->src_mac, 6);
+      }
+      afpkt_tx_metrics_t metrics;
+      char err[64];
+      (void)afpkt_send_ring(p->iface.c_str(), batch.data(), batch.size(),
+                            static_cast<int>(psize), static_cast<int>(count),
+                            p->src_mac, &metrics, err, sizeof(err));
+      (void)Core().ConsumeTxPackets(count);
+    } else {
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+  }
 }
 
 }  // namespace
@@ -104,6 +205,22 @@ int tcpdp_consume_tx_packets(uint32_t max_packets, uint32_t* out_consumed) {
     return -1;
   }
   *out_consumed = ddos_samurai::tcpdp::Core().ConsumeTxPackets(max_packets);
+  return 0;
+}
+
+int tcpdp_ingest_dpdk_rx_burst(void** mbufs, uint16_t count, uint32_t* out_ingested) {
+  if (!mbufs || !out_ingested) {
+    return -1;
+  }
+  *out_ingested = ddos_samurai::tcpdp::Core().IngestDpdkRxBurst(mbufs, count);
+  return 0;
+}
+
+int tcpdp_drain_dpdk_tx_burst(void* mempool, void** out_mbufs, uint16_t max_burst, uint32_t* out_produced) {
+  if (!out_mbufs || !out_produced) {
+    return -1;
+  }
+  *out_produced = ddos_samurai::tcpdp::Core().DrainDpdkTxBurst(mempool, out_mbufs, max_burst);
   return 0;
 }
 
@@ -240,19 +357,97 @@ int tcpdp_get_flow(uint64_t flow_id, tcpdp_flow_snapshot_t* out_flow) {
 }
 
 int tcpdp_start_rx_handler(const char* iface, int32_t* out_handler_id) {
+  using namespace ddos_samurai::tcpdp;
   if (!iface || !iface[0] || !out_handler_id) {
+    errno = EINVAL;
     return -1;
   }
-  errno = ENOTSUP;
-  (void)iface;
-  (void)out_handler_id;
-  return -1;
+  if (g_wire_pump != nullptr) {  // idempotent: one wire pump per process
+    *out_handler_id = 1;
+    return 0;
+  }
+
+  auto* p = new AfPacketWirePump();
+  p->iface = iface;
+  if (!ResolveIfaceMac(iface, p->src_mac)) {
+    std::memset(p->src_mac, 0, 6);  // best effort; kernel may still source it
+  }
+  if (!ParseMac(std::getenv("SAMURAI_CUSTOM_TCP_DST_MAC"), p->dst_mac)) {
+    std::memset(p->dst_mac, 0xff, 6);  // broadcast default (same-segment lab use)
+  }
+
+  // RX: capture inbound frames into the TCP state machine (needs CAP_NET_RAW).
+  if (afpkt_start_rx_pump(iface, &RxIngestCb, nullptr) != 0) {
+    delete p;
+    errno = EACCES;
+    return -1;
+  }
+
+  // TX: drain the dataplane TX ring onto the wire as MAC-completed L2 frames.
+  p->run.store(true, std::memory_order_relaxed);
+  p->tx_thread = std::thread(TxPumpLoop, p);
+  g_wire_pump = p;
+  *out_handler_id = 1;
+  return 0;
 }
 
-int tcpdp_stop_rx_handler(int32_t handler_id) {
-  (void)handler_id;
-  errno = ENOTSUP;
-  return -1;
+int tcpdp_stop_rx_handler(int32_t /*handler_id*/) {
+  using namespace ddos_samurai::tcpdp;
+  if (g_wire_pump == nullptr) {
+    return 0;
+  }
+  g_wire_pump->run.store(false, std::memory_order_relaxed);
+  if (g_wire_pump->tx_thread.joinable()) {
+    g_wire_pump->tx_thread.join();
+  }
+  afpkt_stop_rx_handler();
+  afpkt_cleanup_ring();
+  delete g_wire_pump;
+  g_wire_pump = nullptr;
+  return 0;
+}
+
+// ---- Per-thread core binding (shared-nothing per-shard custom_tcp) ----------
+//
+// A shard worker creates a private core, binds it on its OWN thread, then runs
+// all of its tcpdp_* interactions (configure/enqueue/poll/collect/peek/consume/
+// ingest) on that thread — so they target the private core with zero cross-shard
+// sharing, no registry, and no single wire poller. Unbinding restores the global
+// default core for the thread. These handles are plain owning pointers to
+// TcpDataplaneCore; the caller owns lifetime (create -> bind -> ... -> unbind ->
+// destroy). Binding a handle only affects the calling thread.
+
+void* tcpdp_core_create(void) {
+  return new ddos_samurai::tcpdp::TcpDataplaneCore();
+}
+
+void tcpdp_core_bind_current(void* handle) {
+  ddos_samurai::tcpdp::t_current_core =
+      static_cast<ddos_samurai::tcpdp::TcpDataplaneCore*>(handle);
+}
+
+void tcpdp_core_destroy(void* handle) {
+  if (handle == nullptr) {
+    return;
+  }
+  auto* core = static_cast<ddos_samurai::tcpdp::TcpDataplaneCore*>(handle);
+  // Never leave a dangling thread-local pointer to a core we are about to free.
+  if (ddos_samurai::tcpdp::t_current_core == core) {
+    ddos_samurai::tcpdp::t_current_core = nullptr;
+  }
+  delete core;
+}
+
+void tcpdp_set_ephemeral_port_base(uint16_t base) {
+  ddos_samurai::tcpdp::Core().SetEphemeralPortBase(base);
+}
+
+void tcpdp_set_ephemeral_port_stride(uint16_t stride) {
+  ddos_samurai::tcpdp::Core().SetEphemeralPortStride(stride);
+}
+
+void tcpdp_set_flow_id_base(uint64_t base) {
+  ddos_samurai::tcpdp::Core().SetFlowIdBase(base);
 }
 
 }

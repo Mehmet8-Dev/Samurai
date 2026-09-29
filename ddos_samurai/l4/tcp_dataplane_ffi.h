@@ -90,6 +90,8 @@ int tcpdp_peek_tx_packets_strided(
     size_t* out_packet_size,
     size_t* out_stride);
 int tcpdp_consume_tx_packets(uint32_t max_packets, uint32_t* out_consumed);
+int tcpdp_ingest_dpdk_rx_burst(void** mbufs, uint16_t count, uint32_t* out_ingested);
+int tcpdp_drain_dpdk_tx_burst(void* mempool, void** out_mbufs, uint16_t max_burst, uint32_t* out_produced);
 int tcpdp_collect_completions(tcpdp_completion_t** out_items, uint32_t* out_count);
 void tcpdp_free_completions(tcpdp_completion_t* items, uint32_t count);
 int tcpdp_collect_rx_payloads(tcpdp_rx_payload_t** out_items, uint32_t* out_count);
@@ -98,6 +100,42 @@ int tcpdp_snapshot_stats(tcpdp_stats_snapshot_t* out_stats);
 int tcpdp_get_flow(uint64_t flow_id, tcpdp_flow_snapshot_t* out_flow);
 int tcpdp_start_rx_handler(const char* iface, int32_t* out_handler_id);
 int tcpdp_stop_rx_handler(int32_t handler_id);
+
+/* Per-thread core binding for shared-nothing per-shard custom_tcp.
+ *
+ * tcpdp_core_create()   allocates a private dataplane core and returns an opaque
+ *                       owning handle (NULL on allocation failure).
+ * tcpdp_core_bind_current(handle)
+ *                       makes `handle` the core targeted by every subsequent
+ *                       tcpdp_* call ON THE CALLING THREAD. Pass NULL to restore
+ *                       the process-global default core for this thread.
+ * tcpdp_core_destroy(handle)
+ *                       frees the core; if it is bound on the calling thread the
+ *                       binding is cleared first.
+ *
+ * Threads that never bind keep using the global default core (unchanged
+ * behaviour). A handle is meant to be created, bound, used, unbound and
+ * destroyed on the same shard thread. */
+void* tcpdp_core_create(void);
+void tcpdp_core_bind_current(void* handle);
+void tcpdp_core_destroy(void* handle);
+
+/* Set the base for auto-assigned ephemeral source ports on the calling thread's
+ * current core. Shared-nothing per-shard custom_tcp uses disjoint bases so each
+ * shard owns a distinct src-port range (deterministic per-shard RX demux). */
+void tcpdp_set_ephemeral_port_base(uint16_t base);
+
+/* Set the ephemeral src-port stride (default 1) on the calling thread's current
+ * core. With stride s and base b every auto-assigned port stays in one residue
+ * class (port - b) % s == 0; the DPDK own-wire uses s = next_pow2(shards) and
+ * b ≡ shard (mod s) so a single mask rte_flow rule steers return traffic to the
+ * owning shard's queue. Stride 1 preserves the legacy contiguous allocation. */
+void tcpdp_set_ephemeral_port_stride(uint16_t stride);
+
+/* Set the auto-assigned flow-id base on the calling thread's current core.
+ * Shared-nothing per-shard cores use disjoint bases so flow ids stay globally
+ * unique (collision-free flow_id-keyed lookups across shards). */
+void tcpdp_set_flow_id_base(uint64_t base);
 
 #ifdef __cplusplus
 }

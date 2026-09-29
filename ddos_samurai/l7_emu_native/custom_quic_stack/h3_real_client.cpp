@@ -8,8 +8,9 @@ bool run_h3_real_client(
     const Profile& profile,
     const RuntimeConfig& cfg,
     UdpProbeCounters* out) {
-  // Compatibility shim: legacy entrypoint now delegates to native in-process
-  // ngtcp2/nghttp3 runtime (no shell curl path).
+  // Compatibility shim (kept intentionally thin): the legacy "real client"
+  // entrypoint delegates to the in-process ngtcp2/nghttp3 runtime. A separate
+  // curl/shell path was removed; do not reintroduce an alternate H3 stack here.
   return run_h3_ngtcp2_client(profile, cfg, out);
 }
 

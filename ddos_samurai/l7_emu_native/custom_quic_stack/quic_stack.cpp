@@ -10,6 +10,7 @@
 #include "h3_parity_state.hpp"
 #include "loss_recovery.hpp"
 #include "quic_metrics.hpp"
+#include "udp_io.hpp"
 
 namespace ddos_samurai::l7_emu_native::custom_quic_stack {
 
@@ -20,23 +21,12 @@ std::map<std::string, double> run_quic_profile(
     TransportBackend transport_backend) {
   std::map<std::string, double> out = init_quic_stats(profile, transport_backend, caps);
 
-  // QUIC custom stack currently runs over a kernel UDP socket transport.
-  // Keep this explicit in metrics to avoid false "hot-path-ready" signaling.
   out["runtime_transport_custom_tcp_bridge_ready"] = 1.0;
   out["runtime_transport_seam_ready"] = 1.0;
-  std::string backend = profile.stateful_runtime_backend;
-  std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  if (backend == "afxdp") {
-    out["quic_runtime_backend_requested"] = 1.0;
-  } else if (backend == "dpdk") {
-    out["quic_runtime_backend_requested"] = 2.0;
-  } else {
-    out["quic_runtime_backend_requested"] = 0.0;
-  }
-  out["quic_runtime_udp_io_backend"] = 0.0;
-  out["quic_runtime_native_hot_path_ready"] = 0.0;
+  const auto req_backend = resolve_quic_udp_io_backend(profile);
+  out["quic_runtime_backend_requested"] = static_cast<double>(req_backend);
+  out["quic_runtime_udp_io_backend"] = static_cast<double>(req_backend);
+  out["quic_runtime_native_hot_path_ready"] = is_native_hot_path_backend(req_backend) ? 1.0 : 0.0;
 
   const int attempted = std::max(0, profile.flow_attempted);
   const int conn_pool = std::max(1, std::min(std::max(1, profile.max_connections), std::max(1, cfg.concurrency)));
@@ -98,6 +88,25 @@ std::map<std::string, double> run_quic_profile(
   const LossRecoveryCounters recovery = derive_loss_recovery(udp);
   apply_quic_run_metrics(&out, profile, udp, recovery);
   apply_h3_control_plane_metrics(&out, derive_h3_control_plane_state(profile, udp));
+
+  // Multi-step scenario / per-step SLA telemetry (H1/H2 parity surface).
+  const int steps_completed = std::max(0, udp.scenario_steps_completed);
+  out["quic_scenario_multi_step"] = static_cast<double>(udp.scenario_multi_step);
+  out["quic_scenario_steps_planned"] = static_cast<double>(std::max(0, udp.scenario_steps_planned));
+  out["quic_scenario_steps_completed"] = static_cast<double>(steps_completed);
+  out["quic_scenario_steps_passed"] = static_cast<double>(std::max(0, udp.scenario_steps_passed));
+  out["quic_scenario_steps_failed"] = static_cast<double>(std::max(0, udp.scenario_steps_failed));
+  out["quic_scenario_think_time_total_ms"] =
+      static_cast<double>(std::max(0, udp.scenario_think_time_total_ms));
+  out["quic_scenario_step_latency_ms_avg"] =
+      steps_completed > 0 ? udp.scenario_step_latency_ms_sum / static_cast<double>(steps_completed) : 0.0;
+  out["quic_scenario_step_latency_ms_max"] = udp.scenario_step_latency_ms_max;
+  out["quic_scenario_step_pass_ratio"] =
+      steps_completed > 0
+          ? static_cast<double>(std::max(0, udp.scenario_steps_passed)) / static_cast<double>(steps_completed)
+          : 0.0;
+  out["quic_scenario_state_carry_ready"] =
+      (udp.scenario_multi_step != 0 && udp.scenario_steps_passed > 0) ? 1.0 : 0.0;
   return out;
 }
 

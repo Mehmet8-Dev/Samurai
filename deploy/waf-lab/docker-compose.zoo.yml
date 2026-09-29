@@ -1,0 +1,72 @@
+# DDoSamurai defense ZOO — multiple *distinct* WAF/defense engines, so the RL corpus
+# spans genuinely different reaction personalities instead of one engine's rule tweaks.
+#
+# The existing lab (docker-compose.yml) is Caddy+Coraza (OWASP CRS family). This adds
+# structurally different engines on their own ports, each fronting a shared origin:
+#
+#   :8081  modsec-crs  — ModSecurity v3 + OWASP CRS on nginx (classic regex/anomaly
+#                        scoring engine; a different implementation from Coraza).
+#   :8082  anubis      — proof-of-work challenge proxy (bot mitigation): a NON-WAF
+#                        defense that answers with an interstitial challenge instead of
+#                        a rule block — exercises the challenge/expectation axis that
+#                        the rule-based profiles leave flat.
+#
+# Point the closed-loop capture at each port to widen the union corpus. Self-contained
+# (own network + origin), so it coexists with the main lab without interference.
+
+name: samurai-waf-zoo
+
+services:
+  origin:
+    image: traefik/whoami:v1.10.2
+    container_name: samurai-zoo-origin
+    restart: unless-stopped
+    command: ["--port", "80"]
+    networks: [zoonet]
+
+  # ModSecurity v3 + OWASP CRS on nginx — the classic WAF engine. Anomalous requests
+  # (the same attack-shaped variants Coraza blocks) trip the anomaly score -> 403,
+  # but the engine, scoring, and edge behavior differ from Coraza.
+  modsec-crs:
+    image: owasp/modsecurity-crs:nginx-alpine
+    container_name: samurai-zoo-modsec
+    restart: unless-stopped
+    depends_on: [origin]
+    environment:
+      - BACKEND=http://origin:80
+      - PORT=8080
+      - MODSEC_RULE_ENGINE=On
+      - PARANOIA=1
+      - ANOMALY_INBOUND=5
+      - ANOMALY_OUTBOUND=4
+      - BLOCKING_PARANOIA=1
+      - MODSEC_AUDIT_ENGINE=Off
+    volumes:
+      # Custom rules give this engine a distinct blocked-variant map (see the file).
+      - ./modsec/zzz-variant-rules.conf:/opt/owasp-crs/rules/zzz-variant-rules.conf:ro
+    ports:
+      - "${ZOO_MODSEC_PORT:-8081}:8080"
+    networks: [zoonet]
+
+  # Anubis — proof-of-work anti-bot reverse proxy. A client that does not solve the
+  # PoW gets the challenge interstitial rather than the origin, so success collapses
+  # with a distinct (non-4xx-rule) signature — a different defense class entirely.
+  anubis:
+    image: ghcr.io/techarohq/anubis:latest
+    container_name: samurai-zoo-anubis
+    restart: unless-stopped
+    depends_on: [origin]
+    environment:
+      - BIND=:8080
+      - TARGET=http://origin:80
+      - DIFFICULTY=4
+      - METRICS_BIND=:9090
+      - SERVE_ROBOTS_TXT=true
+      - USE_REMOTE_ADDRESS=true   # no upstream proxy sets X-Real-Ip; use the TCP peer
+    ports:
+      - "${ZOO_ANUBIS_PORT:-8082}:8080"
+    networks: [zoonet]
+
+networks:
+  zoonet:
+    driver: bridge

@@ -1,0 +1,28 @@
+{
+	# coraza-caddy must run before reverse_proxy so a blocked request never
+	# reaches the origin.
+	order coraza_waf first
+	auto_https off
+}
+
+:8080 {
+	log {
+		output file /var/log/caddy/access.log
+		format json
+	}
+
+	# OWASP Coraza WAF. Blocking mode; anomalous requests get 403 before they
+	# ever hit nginx. The bundled rules (coraza/waf-rules.conf) are a compact,
+	# self-contained set — mount the full OWASP CRS here for production fidelity.
+	coraza_waf {
+		directives `
+			Include /etc/caddy/coraza/coraza.conf
+			Include /etc/caddy/coraza/waf-rules.conf
+		`
+	}
+
+	reverse_proxy nginx:80 {
+		header_up Host {host}
+		header_up X-Forwarded-For {remote_host}
+	}
+}
