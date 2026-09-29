@@ -47,7 +47,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .
-          python -m pip install pytest aioquic h2 cryptography psutil
+          python -m pip install pytest aioquic h2 cryptography psutil numpy
 
       - name: Build Native Binaries and Workers via CMake
         run: |

@@ -15,6 +15,7 @@ dependencies = [
   "PyYAML",
   "httpx[http2]",
   "psutil",
+  "numpy",
 ]
 
 [tool.setuptools.packages.find]
