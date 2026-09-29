@@ -57,15 +57,25 @@ if(EXISTS ${_xdp_src})
     pkg_check_modules(LIBXDP QUIET libxdp)
     pkg_check_modules(LIBBPF QUIET libbpf)
   endif()
-  if(LIBXDP_FOUND OR LIBBPF_FOUND)
+  find_package(Python3 COMPONENTS Development QUIET)
+  if((LIBXDP_FOUND OR LIBBPF_FOUND) AND Python3_Development_FOUND)
     add_library(xdp_sender SHARED ${_xdp_src}
       ${SAMURAI_PKG_DIR}/xdp/xdp_core.c ${SAMURAI_PKG_DIR}/pacing_engine.c)
     set_target_properties(xdp_sender PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY ${SAMURAI_PKG_DIR}/xdp PREFIX "" OUTPUT_NAME "xdp_sender")
-    target_include_directories(xdp_sender PRIVATE ${LIBXDP_INCLUDE_DIRS} ${LIBBPF_INCLUDE_DIRS})
-    target_link_libraries(xdp_sender PRIVATE ${LIBXDP_LIBRARIES} ${LIBBPF_LIBRARIES} pthread m)
+    target_include_directories(xdp_sender PRIVATE
+      ${SAMURAI_PKG_DIR}
+      ${SAMURAI_PKG_DIR}/xdp
+      ${LIBXDP_INCLUDE_DIRS}
+      ${LIBBPF_INCLUDE_DIRS}
+      ${Python3_INCLUDE_DIRS})
+    target_link_libraries(xdp_sender PRIVATE
+      ${LIBXDP_LIBRARIES}
+      ${LIBBPF_LIBRARIES}
+      ${Python3_LIBRARIES}
+      pthread m)
   else()
-    message(STATUS "optional: libbpf/libxdp not found -> skipping xdp/xdp_sender.so")
+    message(STATUS "optional: libbpf/libxdp or Python3 development headers not found -> skipping xdp/xdp_sender.so")
   endif()
 else()
   message(STATUS "optional: xdp/xdp_sender.c not found -> skipping xdp_sender.so")

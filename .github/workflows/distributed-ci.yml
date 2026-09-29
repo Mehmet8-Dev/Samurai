@@ -69,6 +69,8 @@ jobs:
             --port 9999 \
             --control-listen tcp://127.0.0.1:5099 \
             --management-listen 127.0.0.1:5591 \
+            --agent-join-token ci-agent-token \
+            --agent-artifact-dir build/zmq \
             --expect-workers 2 \
             --wait-workers-s 15 \
             --worker cpu \
@@ -85,7 +87,7 @@ jobs:
           echo "Summary: $SUMMARY"
 
           echo "=== Validating Zero-Install Agent Script ==="
-          INSTALL_SCRIPT=$(curl -sf http://127.0.0.1:5591/v1/agent/install)
+          INSTALL_SCRIPT=$(curl -sf "http://127.0.0.1:5591/v1/agent/install?token=ci-agent-token")
           echo "$INSTALL_SCRIPT" | head -n 10
 
           echo "=== Starting slave-1 and slave-2 in reverse pull mode ==="

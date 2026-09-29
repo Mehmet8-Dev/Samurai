@@ -173,7 +173,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config libssl-dev libzmq3-dev libhiredis-dev libpcap-dev
+            build-essential cmake pkg-config git \
+            libssl-dev openssl libzmq3-dev cppzmq-dev \
+            libhiredis-dev libpcap-dev libbpf-dev libelf-dev clang \
+            python3-dev python3-pip
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -185,6 +188,7 @@ jobs:
         run: |
           cmake -B build -S ddos_samurai -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
+          make -C ddos_samurai all || make -C ddos_samurai xdp pacing
 
       - name: Install Python package in editable mode
         run: |
@@ -218,6 +222,8 @@ jobs:
         run: |
           helm template test-release deploy/helm/ddos-samurai > /tmp/samurai-rendered.yaml
           test -s /tmp/samurai-rendered.yaml
+          helm template test-release deploy/helm/ddos-samurai -f deploy/helm/ddos-samurai/values-prod.yaml > /tmp/samurai-prod-rendered.yaml
+          test -s /tmp/samurai-prod-rendered.yaml
 
       - name: Validate distributed compose file
         run: |

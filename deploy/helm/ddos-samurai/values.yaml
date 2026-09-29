@@ -58,8 +58,8 @@ auth:
 # the master then binds with --insecure-control.
 curve:
   enabled: true
-  serverSecret: ""
-  serverPublic: ""
+  serverSecret: "__REQUIRED__"
+  serverPublic: "__REQUIRED__"
   # Optionally supply the server secret from an existing Secret (key
   # `curve_server_secret`) instead of serverSecret above.
   existingSecret: ""
