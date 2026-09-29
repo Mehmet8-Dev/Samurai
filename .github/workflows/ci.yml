@@ -100,6 +100,7 @@ jobs:
             build-essential cmake pkg-config git \
             libssl-dev openssl libzmq3-dev cppzmq-dev \
             libhiredis-dev libpcap-dev libbpf-dev libelf-dev clang \
+            libnghttp2-dev libngtcp2-dev libnghttp3-dev libngtcp2-crypto-gnutls-dev libgnutls28-dev liburing-dev \
             python3-dev python3-pip
 
       - name: Setup Python
@@ -176,6 +177,7 @@ jobs:
             build-essential cmake pkg-config git \
             libssl-dev openssl libzmq3-dev cppzmq-dev \
             libhiredis-dev libpcap-dev libbpf-dev libelf-dev clang \
+            libnghttp2-dev libngtcp2-dev libnghttp3-dev libngtcp2-crypto-gnutls-dev libgnutls28-dev liburing-dev \
             python3-dev python3-pip
 
       - name: Setup Python
