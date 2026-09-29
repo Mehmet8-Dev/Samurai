@@ -175,7 +175,7 @@ inline void RunDpdkStatefulJob(
 }
 
 // Tek bir TX kuyruğuna adanmış worker thread durumu (K4 multi-queue).
-struct TxWorkerThread {
+struct alignas(64) TxWorkerThread {
   std::thread th;
   std::uint16_t queue_id{0};
   int cpu_core{-1};  // -1 = pinleme yok

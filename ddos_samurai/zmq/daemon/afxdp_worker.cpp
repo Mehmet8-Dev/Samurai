@@ -159,7 +159,7 @@ struct XdpMultiShim : samurai::daemon::FastpathTxRxShim {
 };
 
 // Çoklu kuyruk stateless TX worker thread yapısı (DPDK ile eşdeğer çoklu çekirdek mimarisi)
-struct XdpTxWorkerThread {
+struct alignas(64) XdpTxWorkerThread {
   std::thread th;
   int queue_id{0};
   int cpu_core{-1};

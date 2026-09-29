@@ -302,11 +302,11 @@ void enqueue_ready_shard(NativeRuntime& runtime, std::size_t shard_idx) {
   if (shard_idx >= runtime.local_shards.size()) {
     return;
   }
+  std::lock_guard<std::mutex> lk(ready_shards_mu());
   auto& local_shard = runtime.local_shards[shard_idx];
   if (local_shard.in_ready_queue || local_shard.dispatch_ready_ms > monotonic_ms_now()) {
     return;
   }
-  std::lock_guard<std::mutex> lk(ready_shards_mu());
   runtime.ready_shards.push_back(shard_idx);
   local_shard.in_ready_queue = true;
   runtime.perf.scheduler_queue_depth_peak =
@@ -324,6 +324,7 @@ void refresh_ready_queue(NativeRuntime& runtime) {
 
 std::optional<std::size_t> pop_ready_shard(NativeRuntime& runtime) {
   refresh_ready_queue(runtime);
+  std::lock_guard<std::mutex> lk(ready_shards_mu());
   if (runtime.ready_shards.empty()) {
     return std::nullopt;
   }

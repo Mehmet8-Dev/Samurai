@@ -156,6 +156,7 @@ void WorkerShardService::WaitForShardIdle(const std::string& /*shard_id*/) {
 
 std::string WorkerShardService::ActiveShardId() const {
   std::lock_guard<std::mutex> lk(mu_);
+  if (worker_state_ != "running") return "";
   return worker_active_shard_;
 }
 
