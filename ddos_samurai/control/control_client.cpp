@@ -53,8 +53,12 @@ bool CallOnce(void* ctx, const std::string& endpoint, const std::string& request
     }
   }
 
+  std::string ep = endpoint;
+  if (ep.find("://") == std::string::npos) {
+    ep = "tcp://" + ep;
+  }
   bool ok = false;
-  if (zmq_connect(sock, endpoint.c_str()) == 0) {
+  if (zmq_connect(sock, ep.c_str()) == 0) {
     if (zmq_send(sock, request.data(), request.size(), 0) >= 0) {
       zmq_msg_t msg;
       zmq_msg_init(&msg);
