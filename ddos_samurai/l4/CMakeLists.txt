@@ -34,3 +34,8 @@ target_link_libraries(samurai_l4 PUBLIC af_packet_static)
 # + effective window + Reno cwnd). Proves stop-and-wait removal against the real core.
 add_executable(test_tcp_sliding_window test_tcp_sliding_window.cpp)
 target_link_libraries(test_tcp_sliding_window PRIVATE samurai_l4 pthread)
+
+# TASK-TEST-L2-01: 100,000 active TCP flows & 4-tuple lock shard distribution benchmark
+add_executable(test_100k_tcp_flows test_100k_tcp_flows.cpp)
+target_link_libraries(test_100k_tcp_flows PRIVATE samurai_l4 pthread)
+
