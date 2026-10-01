@@ -248,8 +248,14 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   tx_pin_packet_size_ = 0;
   tx_pin_stride_ = 0;
   tx_packets_overflow_.clear();
-  completions_.clear();
-  rx_payloads_.clear();
+  {
+    std::lock_guard<SpinLock> cguard(completion_mu_);
+    completions_.clear();
+  }
+  {
+    std::lock_guard<SpinLock> rguard(rx_payload_mu_);
+    rx_payloads_.clear();
+  }
   for (auto& s : stats_shard_) { s.Reset(); }
   tx_packets_queued_.store(0, std::memory_order_relaxed);
   tx_packets_drained_.store(0, std::memory_order_relaxed);
@@ -665,7 +671,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     if (flow->ts_ok && opt.has_ts) flow->ts_recent = opt.ts_val;
     stats_shard_[flow_shard].rx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
     {
-      std::lock_guard<SpinLock> qguard(tx_mu_);
+      std::lock_guard<SpinLock> qguard(rx_payload_mu_);
       rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, ExtractIpv4TcpPayload(frame, frame_len)});
     }
     // Acknowledge (immediately, or delayed when the opt-in delayed-ACK is enabled).
@@ -970,7 +976,7 @@ uint32_t TcpDataplaneCore::ConsumeTxPackets(uint32_t max_packets) {
 }
 
 std::vector<TcpDpCompletion> TcpDataplaneCore::CollectCompletions() {
-  std::lock_guard<SpinLock> guard(tx_mu_);
+  std::lock_guard<SpinLock> guard(completion_mu_);
   std::vector<TcpDpCompletion> out;
   out.reserve(completions_.size());
   while (!completions_.empty()) {
@@ -981,7 +987,7 @@ std::vector<TcpDpCompletion> TcpDataplaneCore::CollectCompletions() {
 }
 
 std::vector<TcpDpRxPayload> TcpDataplaneCore::CollectRxPayloads() {
-  std::lock_guard<SpinLock> guard(tx_mu_);
+  std::lock_guard<SpinLock> guard(rx_payload_mu_);
   std::vector<TcpDpRxPayload> out;
   out.reserve(rx_payloads_.size());
   while (!rx_payloads_.empty()) {
@@ -1835,7 +1841,7 @@ size_t TcpDataplaneCore::BuildOutstandingPacket(const FlowEntry& flow, const Out
 }
 
 void TcpDataplaneCore::PushCompletion(uint64_t flow_id, TcpDpState state, bool success, const char* event) {
-  std::lock_guard<SpinLock> guard(tx_mu_);
+  std::lock_guard<SpinLock> guard(completion_mu_);
   completions_.push_back(TcpDpCompletion{flow_id, static_cast<uint8_t>(state), static_cast<uint8_t>(success ? 1 : 0), event});
 }
 

@@ -480,7 +480,9 @@ class TcpDataplaneCore {
   struct alignas(64) AlignedSpinLock : public SpinLock {};
 
   mutable SpinLock state_mu_;
-  mutable SpinLock tx_mu_;
+  mutable SpinLock tx_mu_;           // Guards TX ring (enqueue, peek, consume, pin).
+  mutable SpinLock completion_mu_;   // Guards completions_ deque only.
+  mutable SpinLock rx_payload_mu_;   // Guards rx_payloads_ deque only.
   mutable std::array<AlignedSpinLock, kFlowLockShards> flow_shard_mu_{};
   mutable std::array<AlignedSpinLock, kFlowLockShards> flow_index_shard_mu_{};
   mutable std::array<AlignedSpinLock, kFlowLockShards> timer_shard_mu_{};
