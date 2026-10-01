@@ -472,13 +472,20 @@ class TcpDataplaneCore {
   bool IsCountedActive(TcpDpState state) const;
   void SetFlowState(FlowEntry& flow, TcpDpState next_state);
 
+  // Cache-line-aligned spinlock wrapper to prevent false-sharing (HITM) across
+  // adjacent shards. Each AlignedSpinLock occupies its own 64-byte L1 cache
+  // line, eliminating cross-core cache invalidation when different threads
+  // access different shards concurrently.
+  // See: TASK-CORE-01 in test_task.md — Relates to #4
+  struct alignas(64) AlignedSpinLock : public SpinLock {};
+
   mutable SpinLock state_mu_;
   mutable SpinLock tx_mu_;           // Guards TX ring (enqueue, peek, consume, pin).
   mutable SpinLock completion_mu_;   // Guards completions_ deque only.
   mutable SpinLock rx_payload_mu_;   // Guards rx_payloads_ deque only.
-  mutable std::array<SpinLock, kFlowLockShards> flow_shard_mu_{};
-  mutable std::array<SpinLock, kFlowLockShards> flow_index_shard_mu_{};
-  mutable std::array<SpinLock, kFlowLockShards> timer_shard_mu_{};
+  mutable std::array<AlignedSpinLock, kFlowLockShards> flow_shard_mu_{};
+  mutable std::array<AlignedSpinLock, kFlowLockShards> flow_index_shard_mu_{};
+  mutable std::array<AlignedSpinLock, kFlowLockShards> timer_shard_mu_{};
   std::array<std::set<uint64_t>, kFlowLockShards> active_flow_ids_shard_{};
   std::array<std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>, kFlowLockShards> timer_heap_shard_{};
   // Lock-free hint of each shard's earliest due_ns (UINT64_MAX = empty). Lets Poll
