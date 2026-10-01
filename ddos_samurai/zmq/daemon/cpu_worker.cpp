@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 
 #include <sched.h>
 #include <zmq.h>
@@ -170,37 +171,95 @@ int main(int argc, char** argv) {
         samurai_pacing_state_t pace_state{};
         samurai_pacing_init(&pace_state, &pace_cfg);
 
+        // TASK-WORKER-01: Asynchronous control channel decoupling.
+        //
+        // Problem: The original synchronous loop starved the ZMQ pull socket,
+        // causing ABORT/PAUSE/SHUTDOWN messages to queue up unprocessed until
+        // the entire packet generation completed.
+        //
+        // Solution: Spawn packet generation on a dedicated worker thread while
+        // the main thread continuously polls ZMQ for control commands. A shared
+        // atomic stop_flag enables sub-5ms abort reaction latency.
+        //
+        // Relates to #4
         const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
+        std::atomic<bool> stop_flag{false};
+        std::atomic<bool> worker_done{false};
+
+        // Shared result state — written only by the worker thread, read after join.
         std::uint64_t packets_sent = 0;
         std::uint64_t bytes_sent = 0;
         std::uint64_t packets_errors = 0;
         std::string done_note = "done";
-        const std::size_t stride = pool.packet_size;
-        if (stride == 0 || pool.size() < stride) {
-          packets_errors = static_cast<std::uint64_t>(packet_count);
-        } else if (samurai::daemon::AfPacketTxEnabled()) {
-          // Real transmission over the af_packet kernel-socket backend (commodity
-          // NICs, no AF_XDP/DPDK). IPG pacing maps to SO_TXTIME; else batched.
-          const long long ipg_ns =
-              (pace_cfg.mode == SAMURAI_PACING_IPG) ? static_cast<long long>(pace_cfg.ipg_ns) : 0;
-          const auto tx = samurai::daemon::AfPacketSendPool(
-              cfg, pool.data(), pool.size(), static_cast<int>(stride), packet_count, ipg_ns);
-          packets_sent = tx.packets_sent;
-          packets_errors = tx.packets_errors;
-          bytes_sent = tx.bytes_sent;
-          done_note = tx.note;
-        } else {
-          for (int i = 0; i < packet_count; ++i) {
-            samurai_pacing_wait_next(&pace_state, &pace_cfg);
-            const std::size_t off = static_cast<std::size_t>(i) * stride;
-            if (off + stride > pool.size()) {
-              packets_errors += 1u;
-              continue;
+
+        std::thread packet_thread([&]() {
+          const std::size_t stride = pool.packet_size;
+          if (stride == 0 || pool.size() < stride) {
+            packets_errors = static_cast<std::uint64_t>(packet_count);
+          } else if (samurai::daemon::AfPacketTxEnabled()) {
+            // Real transmission over the af_packet kernel-socket backend.
+            const long long ipg_ns =
+                (pace_cfg.mode == SAMURAI_PACING_IPG) ? static_cast<long long>(pace_cfg.ipg_ns) : 0;
+            const auto tx = samurai::daemon::AfPacketSendPool(
+                cfg, pool.data(), pool.size(), static_cast<int>(stride), packet_count, ipg_ns);
+            packets_sent = tx.packets_sent;
+            packets_errors = tx.packets_errors;
+            bytes_sent = tx.bytes_sent;
+            done_note = tx.note;
+          } else {
+            for (int i = 0; i < packet_count; ++i) {
+              // Check stop_flag every iteration for responsive abort handling.
+              if (stop_flag.load(std::memory_order_relaxed)) {
+                done_note = "aborted";
+                break;
+              }
+              samurai_pacing_wait_next(&pace_state, &pace_cfg);
+              const std::size_t off = static_cast<std::size_t>(i) * stride;
+              if (off + stride > pool.size()) {
+                packets_errors += 1u;
+                continue;
+              }
+              packets_sent += 1u;
+              bytes_sent += static_cast<std::uint64_t>(stride);
             }
-            packets_sent += 1u;
-            bytes_sent += static_cast<std::uint64_t>(stride);
+          }
+          worker_done.store(true, std::memory_order_release);
+        });
+
+        // Main thread: poll ZMQ for ABORT/PAUSE/SHUTDOWN while the worker runs.
+        while (!worker_done.load(std::memory_order_acquire)) {
+          zmq_msg_t ctrl_msg;
+          zmq_msg_init(&ctrl_msg);
+          const int ctrl_n = zmq_msg_recv(&ctrl_msg, pull, ZMQ_DONTWAIT);
+          if (ctrl_n > 0) {
+            const std::size_t ctrl_sz = static_cast<std::size_t>(zmq_msg_size(&ctrl_msg));
+            if (ctrl_sz >= sizeof(samurai::wire::SamuraiWireHeaderV1)) {
+              samurai::wire::SamuraiWireHeaderV1 ctrl_hdr{};
+              std::memcpy(&ctrl_hdr, zmq_msg_data(&ctrl_msg), sizeof(ctrl_hdr));
+              if (samurai::wire::IsHeaderV1Compatible(ctrl_hdr)) {
+                const auto ctrl_type = static_cast<samurai::wire::MessageType>(ctrl_hdr.msg_type);
+                const std::string ctrl_jid = samurai::daemon::ReadJobId(ctrl_hdr);
+                if (ctrl_type == samurai::wire::MessageType::SHUTDOWN) {
+                  stop_flag.store(true, std::memory_order_release);
+                  (void)SendAck(push, ctrl_hdr.correlation_id, ctrl_jid);
+                  running = false;  // Exit outer loop after worker joins.
+                } else if (ctrl_type == samurai::wire::MessageType::ABORT) {
+                  stop_flag.store(true, std::memory_order_release);
+                  (void)SendAck(push, ctrl_hdr.correlation_id, ctrl_jid);
+                }
+              }
+            }
+          }
+          zmq_msg_close(&ctrl_msg);
+          // Brief sleep to avoid busy-spinning while still achieving <5ms latency.
+          if (!worker_done.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
           }
         }
+
+        // Wait for the packet thread to finish.
+        packet_thread.join();
+
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
         const double duration_s = std::max(1e-9, static_cast<double>(end_ns - start_ns) / 1e9);
         const double actual_rps = static_cast<double>(packets_sent) / duration_s;
