@@ -160,6 +160,7 @@ enum class MessageType : std::uint8_t {
   START_JOB = 1,
   STOP_JOB = 2,
   SHUTDOWN = 3,
+  ABORT = 4,
 
   ACK = 10,
   HEARTBEAT = 11,

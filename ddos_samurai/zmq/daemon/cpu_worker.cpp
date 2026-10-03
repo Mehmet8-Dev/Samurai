@@ -243,7 +243,8 @@ int main(int argc, char** argv) {
                   stop_flag.store(true, std::memory_order_release);
                   (void)SendAck(push, ctrl_hdr.correlation_id, ctrl_jid);
                   running = false;  // Exit outer loop after worker joins.
-                } else if (ctrl_type == samurai::wire::MessageType::ABORT) {
+                } else if (ctrl_type == samurai::wire::MessageType::ABORT ||
+                           ctrl_type == samurai::wire::MessageType::STOP_JOB) {
                   stop_flag.store(true, std::memory_order_release);
                   (void)SendAck(push, ctrl_hdr.correlation_id, ctrl_jid);
                 }
