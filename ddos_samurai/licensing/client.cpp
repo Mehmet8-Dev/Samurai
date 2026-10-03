@@ -45,7 +45,7 @@ LicenseResult HttpLicenseClient::Validate(const std::string& license_key,
   Value body = Value::Object();
   body.set("license_key", Value::Str(license_key));
   body.set("hardware_id", Value::Str(hardware_id));
-  const HttpResponse resp = HttpPostJson(server_url_ + kValidateEndpoint, body.dump(), timeout_s_);
+  const HttpResponse resp = HttpPostJson(server_url_ + ValidateEndpoint(), body.dump(), timeout_s_);
   if (!resp.ok) {
     LicenseResult r;
     r.valid = false;
@@ -80,7 +80,7 @@ ExecGrantResult HttpLicenseClient::RequestGrant(const std::string& license_key,
   body.set("required_features", std::move(feats));
 
   ExecGrantResult out;
-  const HttpResponse resp = HttpPostJson(server_url_ + kExecGrantEndpoint, body.dump(), timeout_s_);
+  const HttpResponse resp = HttpPostJson(server_url_ + ExecGrantEndpoint(), body.dump(), timeout_s_);
   if (!resp.ok) {
     out.reason = "grant endpoint unreachable: " + resp.error;
     return out;
