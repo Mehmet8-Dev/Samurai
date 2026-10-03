@@ -1668,7 +1668,41 @@ int main() {
     Check(api.Handle(areq("/v1/agent/blob",
                           {{"token", "JOINSECRET"}, {"name", "samurai_dpdk_worker"}})).status == 400,
           "agent-bundle: absent worker blob rejected");
+
+    // In-memory blob cache verification: remove the file from disk, blob must still serve from memory
+    (void)std::system(("rm -f " + dir + "/samurai_scenario_worker").c_str());
+    auto cached_blob = api.Handle(areq("/v1/agent/blob",
+                                       {{"token", "JOINSECRET"}, {"name", "samurai_scenario_worker"}}));
+    Check(cached_blob.status == 200 && cached_blob.body == scen_c,
+          "agent-bundle: blob served from in-memory cache after disk removal");
+
+    // Installer script verification: ensure trap is present and exec is avoided
+    auto inst = api.Handle(areq("/v1/agent/install", {{"token", "JOINSECRET"}}));
+    Check(inst.status == 200, "agent-installer: install script served");
+    Check(inst.body.find("trap 'rm -rf \"$TMP\"' EXIT INT TERM HUP") != std::string::npos,
+          "agent-installer: cleanup trap configured");
+    Check(inst.body.find("exec \"$TMP/samurai_slave\"") == std::string::npos,
+          "agent-installer: exec avoided to preserve exit trap");
+
     (void)std::system(("rm -rf " + dir).c_str());
+
+    // RateLimiter integration verification: bursts beyond rate limit receive HTTP 429
+    ManagementConfig rl_cfg;
+    rl_cfg.rate_limit_per_sec = 3;
+    ManagementApi rl_api(rl_cfg, ManagementProviders{});
+    HttpRequest r1; r1.method = "GET"; r1.path = "/healthz"; r1.client_ip = "10.0.0.1";
+    HttpRequest r2 = r1;
+    HttpRequest r3 = r1;
+    HttpRequest r4 = r1;
+    HttpRequest r_other = r1; r_other.client_ip = "10.0.0.2";
+
+    Check(rl_api.Handle(r1).status == 200, "ratelimit: req 1 allowed");
+    Check(rl_api.Handle(r2).status == 200, "ratelimit: req 2 allowed");
+    Check(rl_api.Handle(r3).status == 200, "ratelimit: req 3 allowed");
+    HttpResponse blocked = rl_api.Handle(r4);
+    Check(blocked.status == 429, "ratelimit: req 4 throttled with 429");
+    Check(blocked.body.find("rate_limited") != std::string::npos, "ratelimit: error reason indicates rate_limited");
+    Check(rl_api.Handle(r_other).status == 200, "ratelimit: different client allowed independently");
   }
 
   // --- master: coordinator only dispatches shards to matching worker kinds ---
