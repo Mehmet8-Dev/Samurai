@@ -425,7 +425,8 @@ class TcpDataplaneCore {
   bool PawsReject(const FlowEntry& flow, const TcpOptionInfo* opt) const;
   void UpdateRtt(FlowEntry& flow, uint64_t sample_ns);
   size_t BuildOutstandingPacket(const FlowEntry& flow, const OutstandingTx& out, uint8_t* out_buffer) const;
-  bool EnqueueTxPacketBytes(const uint8_t* data, size_t len);
+  static constexpr size_t kAnyShard = static_cast<size_t>(-1);
+  bool EnqueueTxPacketBytes(const uint8_t* data, size_t len, size_t shard = kAnyShard);
   void PushTimer(uint64_t flow_id, TimerKind kind, uint64_t due_ns, uint32_t generation);
   // Recompute the lock-free due-hint for a shard. Caller must hold timer_shard_mu_[shard].
   void RefreshTimerHint(size_t shard);
@@ -479,8 +480,26 @@ class TcpDataplaneCore {
   // See: TASK-CORE-01 in test_task.md — Relates to #4
   struct alignas(64) AlignedSpinLock : public SpinLock {};
 
+  // TASK-CORE-02: Per-shard TX ring buffer to eliminate single global tx_mu_ bottleneck.
+  // Each shard owns its own cacheline-aligned SpinLock and ring storage.
+  struct alignas(64) PerShardTxRing {
+    AlignedSpinLock mu;
+    std::vector<uint8_t> storage;
+    std::vector<uint16_t> lengths;
+    std::vector<uint64_t> seqs;
+    uint32_t head = 0;
+    uint32_t tail = 0;
+    uint32_t count = 0;
+    bool pin_active = false;
+    uint32_t pin_head = 0;
+    uint32_t pin_count = 0;
+    size_t pin_packet_size = 0;
+    size_t pin_stride = 0;
+    std::deque<std::pair<uint64_t, std::vector<uint8_t>>> overflow;
+  };
+
   mutable SpinLock state_mu_;
-  mutable SpinLock tx_mu_;           // Guards TX ring (enqueue, peek, consume, pin).
+  mutable SpinLock tx_consumer_mu_;   // Serializes consumer peek/consume across shards
   mutable SpinLock completion_mu_;   // Guards completions_ deque only.
   mutable SpinLock rx_payload_mu_;   // Guards rx_payloads_ deque only.
   mutable std::array<AlignedSpinLock, kFlowLockShards> flow_shard_mu_{};
@@ -509,17 +528,8 @@ class TcpDataplaneCore {
   size_t tx_ring_slot_size_ = 2048;
   size_t tx_ring_capacity_ = 8192;
   size_t tx_overflow_capacity_ = 8192;
-  std::vector<uint8_t> tx_ring_storage_;
-  std::vector<uint16_t> tx_ring_lengths_;
-  uint32_t tx_ring_head_ = 0;
-  uint32_t tx_ring_tail_ = 0;
-  uint32_t tx_ring_count_ = 0;
-  bool tx_pin_active_ = false;
-  uint32_t tx_pin_head_ = 0;
-  uint32_t tx_pin_count_ = 0;
-  size_t tx_pin_packet_size_ = 0;
-  size_t tx_pin_stride_ = 0;
-  std::deque<std::vector<uint8_t>> tx_packets_overflow_;
+  std::array<PerShardTxRing, kFlowLockShards> tx_shard_{};
+  uint32_t current_peek_shard_ = 0;
   std::deque<TcpDpCompletion> completions_;
   std::deque<TcpDpRxPayload> rx_payloads_;
   std::atomic<uint64_t> tx_packets_queued_{0};

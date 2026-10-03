@@ -20,7 +20,7 @@ namespace ddos_samurai {
 //
 // Relates to #4
 class SpinLock {
-  std::atomic_flag flag = ATOMIC_FLAG_INIT;
+  std::atomic<bool> flag{false};
 
   // Maximum number of _mm_pause iterations before resetting the backoff.
   // Capped to avoid excessive latency on short critical sections.
@@ -29,7 +29,7 @@ class SpinLock {
 public:
   void lock() {
     // Fast path: try to acquire immediately (uncontended case).
-    if (!flag.test_and_set(std::memory_order_acquire)) {
+    if (!flag.exchange(true, std::memory_order_acquire)) {
       return;
     }
 
@@ -37,8 +37,7 @@ public:
     uint32_t backoff = 1;
     for (;;) {
       // Test (read-only): spin on shared cache line without bus writes.
-      // std::atomic_flag::test() requires C++20; available in GCC 9+/Clang 9+.
-      while (flag.test(std::memory_order_relaxed)) {
+      while (flag.load(std::memory_order_relaxed)) {
         // Exponential backoff: yield pipeline resources to sibling hyperthread
         // and reduce memory-bus contention.
         for (uint32_t i = 0; i < backoff; ++i) {
@@ -54,7 +53,7 @@ public:
       }
 
       // Test-and-Set: the lock *looks* free, attempt atomic acquisition.
-      if (!flag.test_and_set(std::memory_order_acquire)) {
+      if (!flag.exchange(true, std::memory_order_acquire)) {
         return;  // Acquired.
       }
       // Lost the race — another thread grabbed it first. Reset backoff
@@ -64,7 +63,7 @@ public:
   }
 
   void unlock() {
-    flag.clear(std::memory_order_release);
+    flag.store(false, std::memory_order_release);
   }
 };
 

@@ -176,6 +176,12 @@ TcpDataplaneCore::TcpDataplaneCore() {
   for (auto& hint : timer_shard_min_due_ns_) {
     hint.store(UINT64_MAX, std::memory_order_relaxed);
   }
+  const size_t per_shard_cap = 128;
+  for (size_t i = 0; i < kFlowLockShards; ++i) {
+    tx_shard_[i].storage.assign(per_shard_cap * tx_ring_slot_size_, 0U);
+    tx_shard_[i].lengths.assign(per_shard_cap, 0U);
+    tx_shard_[i].seqs.assign(per_shard_cap, 0U);
+  }
 }
 
 void TcpDataplaneCore::RefreshTimerHint(size_t shard) {
@@ -202,7 +208,6 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
     return false;
   }
   std::lock_guard<SpinLock> sguard(state_mu_);
-  std::lock_guard<SpinLock> qguard(tx_mu_);
   config_ = config;
   // TCP maturity toggles: env overrides the config default (RFC6675 on, the three
   // behaviour-changing ones off) so operators can flip them without a rebuild.
@@ -237,17 +242,26 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
     timer_heap_shard_[i] = std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>();
     timer_shard_min_due_ns_[i].store(UINT64_MAX, std::memory_order_relaxed);
   }
-  tx_ring_storage_.assign(tx_ring_capacity_ * tx_ring_slot_size_, 0U);
-  tx_ring_lengths_.assign(tx_ring_capacity_, 0U);
-  tx_ring_head_ = 0;
-  tx_ring_tail_ = 0;
-  tx_ring_count_ = 0;
-  tx_pin_active_ = false;
-  tx_pin_head_ = 0;
-  tx_pin_count_ = 0;
-  tx_pin_packet_size_ = 0;
-  tx_pin_stride_ = 0;
-  tx_packets_overflow_.clear();
+  const size_t per_shard_cap = std::max<size_t>(64, tx_ring_capacity_ / kFlowLockShards);
+  for (size_t i = 0; i < kFlowLockShards; ++i) {
+    std::lock_guard<SpinLock> guard(tx_shard_[i].mu);
+    tx_shard_[i].storage.assign(per_shard_cap * tx_ring_slot_size_, 0U);
+    tx_shard_[i].lengths.assign(per_shard_cap, 0U);
+    tx_shard_[i].seqs.assign(per_shard_cap, 0U);
+    tx_shard_[i].head = 0;
+    tx_shard_[i].tail = 0;
+    tx_shard_[i].count = 0;
+    tx_shard_[i].pin_active = false;
+    tx_shard_[i].pin_head = 0;
+    tx_shard_[i].pin_count = 0;
+    tx_shard_[i].pin_packet_size = 0;
+    tx_shard_[i].pin_stride = 0;
+    tx_shard_[i].overflow.clear();
+  }
+  {
+    std::lock_guard<SpinLock> cguard(tx_consumer_mu_);
+    current_peek_shard_ = 0;
+  }
   {
     std::lock_guard<SpinLock> cguard(completion_mu_);
     completions_.clear();
@@ -848,28 +862,72 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
   *out_packet_size = 0;
   *out_stride = 0;
 
-  std::lock_guard<SpinLock> guard(tx_mu_);
-  if (tx_pin_active_) {
-    if (tx_pin_count_ == 0) {
-      tx_pin_active_ = false;
-      tx_pin_head_ = 0;
-      tx_pin_packet_size_ = 0;
-      tx_pin_stride_ = 0;
-      return true;
+  std::lock_guard<SpinLock> cguard(tx_consumer_mu_);
+  const size_t per_shard_cap = std::max<size_t>(64, tx_ring_capacity_ / kFlowLockShards);
+
+  if (current_peek_shard_ < kFlowLockShards) {
+    auto& ring = tx_shard_[current_peek_shard_];
+    std::lock_guard<SpinLock> guard(ring.mu);
+    if (ring.pin_active) {
+      if (ring.pin_count == 0) {
+        ring.pin_active = false;
+        ring.pin_head = 0;
+        ring.pin_packet_size = 0;
+        ring.pin_stride = 0;
+      } else {
+        const size_t base = static_cast<size_t>(ring.pin_head) * tx_ring_slot_size_;
+        *out_base = ring.storage.data() + base;
+        *out_count = ring.pin_count;
+        *out_packet_size = ring.pin_packet_size;
+        *out_stride = ring.pin_stride;
+        return true;
+      }
     }
-    const size_t base = static_cast<size_t>(tx_pin_head_) * tx_ring_slot_size_;
-    *out_base = tx_ring_storage_.data() + base;
-    *out_count = tx_pin_count_;
-    *out_packet_size = tx_pin_packet_size_;
-    *out_stride = tx_pin_stride_;
+  }
+
+  size_t best_shard = kFlowLockShards;
+  uint64_t best_seq = UINT64_MAX;
+
+  for (size_t s = 0; s < kFlowLockShards; ++s) {
+    auto& ring = tx_shard_[s];
+    std::lock_guard<SpinLock> guard(ring.mu);
+
+    while (ring.count < static_cast<uint32_t>(per_shard_cap) && !ring.overflow.empty()) {
+      const auto& of = ring.overflow.front();
+      if (of.second.size() > tx_ring_slot_size_) {
+        break;
+      }
+      const uint32_t idx = ring.tail;
+      const size_t base = static_cast<size_t>(idx) * tx_ring_slot_size_;
+      std::memcpy(ring.storage.data() + base, of.second.data(), of.second.size());
+      ring.lengths[idx] = static_cast<uint16_t>(of.second.size());
+      ring.seqs[idx] = of.first;
+      ring.tail = (ring.tail + 1U) % static_cast<uint32_t>(per_shard_cap);
+      ring.count++;
+      ring.overflow.pop_front();
+    }
+
+    if (ring.count > 0) {
+      const uint64_t cur_seq = ring.seqs[ring.head];
+      if (cur_seq < best_seq) {
+        best_seq = cur_seq;
+        best_shard = s;
+      }
+    }
+  }
+
+  if (best_shard >= kFlowLockShards) {
     return true;
   }
-  if (tx_ring_count_ == 0 || !tx_packets_overflow_.empty()) {
+
+  auto& ring = tx_shard_[best_shard];
+  std::lock_guard<SpinLock> guard(ring.mu);
+  if (ring.count == 0) {
     return true;
   }
 
   const uint32_t linear_available =
-      std::min<uint32_t>(tx_ring_count_, static_cast<uint32_t>(tx_ring_capacity_) - tx_ring_head_);
+      std::min<uint32_t>(ring.count, static_cast<uint32_t>(per_shard_cap) - ring.head);
   if (linear_available == 0) {
     return true;
   }
@@ -882,15 +940,15 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
     return true;
   }
 
-  const size_t first_len = static_cast<size_t>(tx_ring_lengths_[tx_ring_head_]);
+  const size_t first_len = static_cast<size_t>(ring.lengths[ring.head]);
   if (first_len == 0) {
     return true;
   }
 
   uint32_t uniform_count = 1;
   for (; uniform_count < take; ++uniform_count) {
-    const uint32_t idx = tx_ring_head_ + uniform_count;
-    if (static_cast<size_t>(tx_ring_lengths_[idx]) != first_len) {
+    const uint32_t idx = ring.head + uniform_count;
+    if (static_cast<size_t>(ring.lengths[idx]) != first_len) {
       break;
     }
   }
@@ -898,81 +956,117 @@ bool TcpDataplaneCore::PeekTxPacketsStrided(
     return true;
   }
 
-  const size_t base = static_cast<size_t>(tx_ring_head_) * tx_ring_slot_size_;
-  *out_base = tx_ring_storage_.data() + base;
+  const size_t base = static_cast<size_t>(ring.head) * tx_ring_slot_size_;
+  *out_base = ring.storage.data() + base;
   *out_count = uniform_count;
   *out_packet_size = first_len;
   *out_stride = tx_ring_slot_size_;
-  tx_pin_active_ = true;
-  tx_pin_head_ = tx_ring_head_;
-  tx_pin_count_ = uniform_count;
-  tx_pin_packet_size_ = first_len;
-  tx_pin_stride_ = tx_ring_slot_size_;
+  ring.pin_active = true;
+  ring.pin_head = ring.head;
+  ring.pin_count = uniform_count;
+  ring.pin_packet_size = first_len;
+  ring.pin_stride = tx_ring_slot_size_;
+  current_peek_shard_ = static_cast<uint32_t>(best_shard);
   return true;
 }
 
 uint32_t TcpDataplaneCore::ConsumeTxPackets(uint32_t max_packets) {
-  std::lock_guard<SpinLock> guard(tx_mu_);
   if (max_packets == 0) {
     return 0;
   }
+  std::lock_guard<SpinLock> cguard(tx_consumer_mu_);
+  const size_t per_shard_cap = std::max<size_t>(64, tx_ring_capacity_ / kFlowLockShards);
 
-  if (tx_pin_active_) {
-    if (tx_pin_count_ == 0) {
-      tx_pin_active_ = false;
-      tx_pin_head_ = 0;
-      tx_pin_packet_size_ = 0;
-      tx_pin_stride_ = 0;
-      return 0;
+  if (current_peek_shard_ < kFlowLockShards) {
+    auto& ring = tx_shard_[current_peek_shard_];
+    std::lock_guard<SpinLock> guard(ring.mu);
+    if (ring.pin_active) {
+      if (ring.pin_count == 0) {
+        ring.pin_active = false;
+        ring.pin_head = 0;
+        ring.pin_packet_size = 0;
+        ring.pin_stride = 0;
+      } else {
+        uint32_t to_drain = std::min(max_packets, ring.pin_count);
+        for (uint32_t i = 0; i < to_drain; ++i) {
+          ring.lengths[ring.head] = 0;
+          ring.seqs[ring.head] = 0;
+          ring.head = (ring.head + 1U) % static_cast<uint32_t>(per_shard_cap);
+        }
+        ring.count -= to_drain;
+        ring.pin_count -= to_drain;
+        if (ring.pin_count == 0) {
+          ring.pin_active = false;
+          ring.pin_head = 0;
+          ring.pin_packet_size = 0;
+          ring.pin_stride = 0;
+        } else {
+          ring.pin_head = ring.head;
+        }
+        tx_packets_drained_.fetch_add(to_drain, std::memory_order_relaxed);
+        tx_packets_sent_.fetch_add(to_drain, std::memory_order_relaxed);
+        tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
+        return to_drain;
+      }
     }
-    if (max_packets > tx_pin_count_) {
-      max_packets = tx_pin_count_;
+  }
+
+  uint32_t total_drained = 0;
+  while (total_drained < max_packets) {
+    size_t best_shard = kFlowLockShards;
+    uint64_t best_seq = UINT64_MAX;
+    uint64_t next_best_seq = UINT64_MAX;
+    for (size_t s = 0; s < kFlowLockShards; ++s) {
+      auto& ring = tx_shard_[s];
+      std::lock_guard<SpinLock> guard(ring.mu);
+      uint64_t s_seq = UINT64_MAX;
+      if (ring.count > 0) {
+        s_seq = ring.seqs[ring.head];
+      } else if (!ring.overflow.empty()) {
+        s_seq = ring.overflow.front().first;
+      }
+      if (s_seq < best_seq) {
+        next_best_seq = best_seq;
+        best_seq = s_seq;
+        best_shard = s;
+      } else if (s_seq < next_best_seq) {
+        next_best_seq = s_seq;
+      }
     }
-    for (uint32_t i = 0; i < max_packets; ++i) {
-      tx_ring_lengths_[tx_ring_head_] = 0;
-      tx_ring_head_ = (tx_ring_head_ + 1U) % static_cast<uint32_t>(tx_ring_capacity_);
+    if (best_shard >= kFlowLockShards) {
+      break;
     }
-    tx_ring_count_ -= max_packets;
-    tx_pin_count_ -= max_packets;
-    if (tx_pin_count_ == 0) {
-      tx_pin_active_ = false;
-      tx_pin_head_ = 0;
-      tx_pin_packet_size_ = 0;
-      tx_pin_stride_ = 0;
-    } else {
-      tx_pin_head_ = tx_ring_head_;
+    auto& ring = tx_shard_[best_shard];
+    std::lock_guard<SpinLock> guard(ring.mu);
+    while (total_drained < max_packets) {
+      if (ring.count > 0 && ring.seqs[ring.head] < next_best_seq) {
+        ring.lengths[ring.head] = 0;
+        ring.seqs[ring.head] = 0;
+        ring.head = (ring.head + 1U) % static_cast<uint32_t>(per_shard_cap);
+        ring.count--;
+        total_drained++;
+      } else if (ring.count == 0 && !ring.overflow.empty() && ring.overflow.front().first < next_best_seq) {
+        ring.overflow.pop_front();
+        total_drained++;
+      } else {
+        break;
+      }
     }
-    tx_packets_drained_.fetch_add(max_packets, std::memory_order_relaxed);
-    tx_packets_sent_.fetch_add(max_packets, std::memory_order_relaxed);
+    if (ring.pin_active) {
+      ring.pin_active = false;
+      ring.pin_head = 0;
+      ring.pin_count = 0;
+      ring.pin_packet_size = 0;
+      ring.pin_stride = 0;
+    }
+  }
+
+  if (total_drained > 0) {
+    tx_packets_drained_.fetch_add(total_drained, std::memory_order_relaxed);
+    tx_packets_sent_.fetch_add(total_drained, std::memory_order_relaxed);
     tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
-    return max_packets;
   }
-
-  const uint32_t total_available =
-      tx_ring_count_ + static_cast<uint32_t>(tx_packets_overflow_.size());
-  if (max_packets > total_available) {
-    max_packets = total_available;
-  }
-  if (max_packets == 0) {
-    return 0;
-  }
-
-  const uint32_t take_ring = std::min<uint32_t>(max_packets, tx_ring_count_);
-  for (uint32_t i = 0; i < take_ring; ++i) {
-    tx_ring_lengths_[tx_ring_head_] = 0;
-    tx_ring_head_ = (tx_ring_head_ + 1U) % static_cast<uint32_t>(tx_ring_capacity_);
-  }
-  tx_ring_count_ -= take_ring;
-
-  const uint32_t take_overflow = max_packets - take_ring;
-  for (uint32_t i = 0; i < take_overflow; ++i) {
-    tx_packets_overflow_.pop_front();
-  }
-
-  tx_packets_drained_.fetch_add(max_packets, std::memory_order_relaxed);
-  tx_packets_sent_.fetch_add(max_packets, std::memory_order_relaxed);
-  tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
-  return max_packets;
+  return total_drained;
 }
 
 std::vector<TcpDpCompletion> TcpDataplaneCore::CollectCompletions() {
@@ -1430,36 +1524,44 @@ void TcpDataplaneCore::UpdateRtt(FlowEntry& flow, uint64_t sample_ns) {
   flow.cur_rto_ms = rto;
 }
 
-bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len) {
+bool TcpDataplaneCore::EnqueueTxPacketBytes(const uint8_t* data, size_t len, size_t shard) {
   if (!data || len == 0) {
     return false;
   }
+  if (shard >= kFlowLockShards) {
+    static std::atomic<uint32_t> any_shard_rr{0};
+    shard = any_shard_rr.fetch_add(1, std::memory_order_relaxed) % kFlowLockShards;
+  }
+  const size_t per_shard_cap = std::max<size_t>(64, tx_ring_capacity_ / kFlowLockShards);
+  const size_t per_shard_overflow_cap = std::max<size_t>(64, tx_overflow_capacity_ / kFlowLockShards);
+
   std::vector<uint8_t> pkt_prebuilt;
   if (len > tx_ring_slot_size_) {
     pkt_prebuilt.assign(data, data + len);
   }
-  std::lock_guard<SpinLock> guard(tx_mu_);
-  if (len <= tx_ring_slot_size_ && tx_ring_count_ < static_cast<uint32_t>(tx_ring_capacity_)) {
-    const uint32_t idx = tx_ring_tail_;
+  const uint64_t seq = tx_packets_queued_.fetch_add(1, std::memory_order_relaxed);
+  tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
+
+  auto& ring = tx_shard_[shard];
+  std::lock_guard<SpinLock> guard(ring.mu);
+  if (len <= tx_ring_slot_size_ && ring.count < static_cast<uint32_t>(per_shard_cap)) {
+    const uint32_t idx = ring.tail;
     const size_t base = static_cast<size_t>(idx) * tx_ring_slot_size_;
-    std::memcpy(tx_ring_storage_.data() + base, data, len);
-    tx_ring_lengths_[idx] = static_cast<uint16_t>(len);
-    tx_ring_tail_ = (tx_ring_tail_ + 1U) % static_cast<uint32_t>(tx_ring_capacity_);
-    tx_ring_count_++;
-    tx_packets_queued_.fetch_add(1, std::memory_order_relaxed);
-    tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
+    std::memcpy(ring.storage.data() + base, data, len);
+    ring.lengths[idx] = static_cast<uint16_t>(len);
+    ring.seqs[idx] = seq;
+    ring.tail = (ring.tail + 1U) % static_cast<uint32_t>(per_shard_cap);
+    ring.count++;
     return true;
   }
   std::vector<uint8_t> pkt = std::move(pkt_prebuilt);
   if (pkt.empty()) {
     pkt.assign(data, data + len);
   }
-  if (tx_packets_overflow_.size() >= tx_overflow_capacity_) {
-    tx_packets_overflow_.pop_front();
+  if (ring.overflow.size() >= per_shard_overflow_cap) {
+    ring.overflow.pop_front();
   }
-  tx_packets_overflow_.push_back(std::move(pkt));
-  tx_packets_queued_.fetch_add(1, std::memory_order_relaxed);
-  tx_queue_epoch_.fetch_add(1, std::memory_order_relaxed);
+  ring.overflow.push_back({seq, std::move(pkt)});
   return true;
 }
 
@@ -1576,7 +1678,7 @@ uint32_t TcpDataplaneCore::EmitOneDataSegment(FlowEntry& flow, uint64_t now_ns, 
   const uint32_t seq = flow.snd_nxt;
   thread_local uint8_t scratch[65536];
   const size_t pkt_len = BuildSeg(flow, seq, flow.rcv_nxt, flags, src, seg_len, scratch);
-  (void)EnqueueTxPacketBytes(scratch, pkt_len);
+  (void)EnqueueTxPacketBytes(scratch, pkt_len, FlowLockShardForFlowId(flow.flow_id));
   OutstandingTx seg;
   seg.seq = seq;
   seg.ack = flow.rcv_nxt;
@@ -1643,7 +1745,7 @@ void TcpDataplaneCore::RetransmitOldest(FlowEntry& flow) {
   }
   seg->ack = flow.rcv_nxt;  // carry the freshest cumulative ACK on the resend
   const size_t pkt_len = BuildOutstandingPacket(flow, *seg, scratch);
-  (void)EnqueueTxPacketBytes(scratch, pkt_len);
+  (void)EnqueueTxPacketBytes(scratch, pkt_len, FlowLockShardForFlowId(flow.flow_id));
   seg->xmit_count++;
   seg->retransmitted = true;
 }
@@ -1711,7 +1813,7 @@ void TcpDataplaneCore::SackRecoveryTransmit(FlowEntry& flow, uint64_t now_ns) {
     if (hole != nullptr) {
       hole->ack = flow.rcv_nxt;
       const size_t pkt_len = BuildOutstandingPacket(flow, *hole, scratch);
-      (void)EnqueueTxPacketBytes(scratch, pkt_len);
+      (void)EnqueueTxPacketBytes(scratch, pkt_len, FlowLockShardForFlowId(flow.flow_id));
       hole->xmit_count++;
       hole->retransmitted = true;
       const uint32_t hole_end = hole->seq + SegSeqLen(hole->flags, hole->payload_len);
@@ -1740,7 +1842,7 @@ void TcpDataplaneCore::SackRecoveryTransmit(FlowEntry& flow, uint64_t now_ns) {
     if (rescue != nullptr) {
       rescue->ack = flow.rcv_nxt;
       const size_t pkt_len = BuildOutstandingPacket(flow, *rescue, scratch);
-      (void)EnqueueTxPacketBytes(scratch, pkt_len);
+      (void)EnqueueTxPacketBytes(scratch, pkt_len, FlowLockShardForFlowId(flow.flow_id));
       rescue->xmit_count++;
       rescue->retransmitted = true;
       const uint32_t r_end = rescue->seq + SegSeqLen(rescue->flags, rescue->payload_len);
@@ -1758,7 +1860,7 @@ void TcpDataplaneCore::SackRecoveryTransmit(FlowEntry& flow, uint64_t now_ns) {
 void TcpDataplaneCore::SendAckNow(FlowEntry& flow) {
   thread_local uint8_t scratch[65536];
   const size_t len = BuildSeg(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0, scratch);
-  (void)EnqueueTxPacketBytes(scratch, len);
+  (void)EnqueueTxPacketBytes(scratch, len, FlowLockShardForFlowId(flow.flow_id));
   flow.pending_ack_segs = 0;
   flow.delack_deadline_ns = 0;  // disarm (stale generation ignored on fire)
 }
@@ -1793,7 +1895,7 @@ void TcpDataplaneCore::QueuePacket(
     uint32_t payload_len,
     bool arm_rto) {
   if (packet_data != nullptr && packet_len > 0) {
-    (void)EnqueueTxPacketBytes(packet_data, packet_len);
+    (void)EnqueueTxPacketBytes(packet_data, packet_len, FlowLockShardForFlowId(flow.flow_id));
   }
   if (!arm_rto) {
     return;
