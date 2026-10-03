@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "anti_tamper.hpp"
 #include "cache.hpp"
 #include "client.hpp"
 #include "constants.hpp"
@@ -18,6 +19,7 @@
 #include "http_client.hpp"
 #include "hwid.hpp"
 #include "license_types.hpp"
+#include "obfuscate.hpp"
 
 namespace {
 int g_failures = 0;
@@ -267,6 +269,41 @@ int main() {
     LicenseResult bad = dead.Validate("SAM-X", "h");
     Check(!bad.valid && bad.reason.find("unreachable") != std::string::npos,
           "client: unreachable server reason");
+  }
+
+  // --- obfuscation & dev mode & anti-tamper ---
+  {
+    const std::string s1 = SAMURAI_OBFUSCATE("hello_secret_world");
+    Check(s1 == "hello_secret_world", "obfuscate: roundtrip string match");
+    Check(ValidateEndpoint() == SAMURAI_OBFUSCATE("/api/v1/license/validate"), "obfuscate: endpoint matches");
+    Check(ExecGrantEndpoint() == SAMURAI_OBFUSCATE("/api/v1/license/exec-grant"), "obfuscate: grant endpoint matches");
+
+    // Dev mode check: in Release mode (NDEBUG defined), IsDevMode must always be false
+#if defined(NDEBUG)
+    ::setenv("SAMURAI_LICENSE_DEV_MODE", "1", 1);
+    Check(!IsDevMode(), "devmode: locked down in release mode");
+#endif
+
+    // Anti-tamper & ELF text section integrity check
+    IntegrityResult ir = VerifySelfIntegrity();
+    Check(ir.ok, "anti-tamper: self integrity check passed");
+    Check(!ir.text_sha256.empty(), "anti-tamper: text sha256 computed");
+
+    // Invalid license rejection check
+    LicenseResult invalid_lr;
+    invalid_lr.valid = false;
+    invalid_lr.reason = "mock test invalid key";
+    GateInput gi;
+    gi.attack_vector = "basic";
+    Check(!EnforceFeatureGates(gi, invalid_lr).ok, "gate: invalid license strictly rejected");
+
+    // Wire-speed clamping check under Community tier
+    GateInput wirespeed_gi;
+    wirespeed_gi.attack_vector = "basic";
+    wirespeed_gi.rps = 0.0;
+    auto comm_lr = Lic(Tier::kCommunity);
+    auto wirespeed_res = EnforceFeatureGates(wirespeed_gi, comm_lr);
+    Check(wirespeed_res.ok && wirespeed_res.rps == 100.0, "gate: wire-speed rps=0 clamped to community max_pps");
   }
 
   if (g_failures == 0) {
