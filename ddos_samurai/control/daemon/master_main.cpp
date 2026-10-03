@@ -44,6 +44,14 @@
 #include "sut_probe.hpp"
 #include "target_safety.hpp"
 
+#include "anti_tamper.hpp"
+#include "cache.hpp"
+#include "client.hpp"
+#include "constants.hpp"
+#include "gates.hpp"
+#include "hwid.hpp"
+#include "license_types.hpp"
+
 namespace {
 std::atomic<bool> g_stop{false};
 void OnSignal(int) { g_stop.store(true); }
@@ -655,6 +663,13 @@ int main(int argc, char** argv) {
   using namespace samurai::control;
   using namespace samurai::control::daemon;
 
+  // 1. Anti-tamper & binary self-integrity verification
+  const samurai::licensing::IntegrityResult integrity = samurai::licensing::VerifySelfIntegrity();
+  if (!integrity.ok) {
+    std::fprintf(stderr, "samurai_master security violation: %s\n", integrity.reason.c_str());
+    return 126;
+  }
+
   if (Flag(argc, argv, "-h") || Flag(argc, argv, "--help")) {
     Usage(argv[0]);
     return 0;
@@ -668,12 +683,112 @@ int main(int argc, char** argv) {
     std::printf("curve_public=%s\ncurve_secret=%s\n", kp.public_key.c_str(), kp.secret_key.c_str());
     return 0;
   }
+
+  // 2. License resolution and feature-gate enforcement
+  std::string license_key = Opt(argc, argv, "--license-key", "");
+  const std::string license_file = Opt(argc, argv, "--license-file", "");
+  if (license_key.empty() && !license_file.empty()) {
+    std::ifstream f(license_file);
+    if (f) {
+      std::stringstream ss;
+      ss << f.rdbuf();
+      license_key = ss.str();
+      const auto first = license_key.find_first_not_of(" \t\r\n");
+      const auto last = license_key.find_last_not_of(" \t\r\n");
+      license_key = (first == std::string::npos) ? "" : license_key.substr(first, last - first + 1);
+    }
+  }
+  if (license_key.empty()) {
+    license_key = samurai::licensing::EnvOr("SAMURAI_LICENSE_KEY", "");
+  }
+  if (license_key.empty()) {
+    std::ifstream f(samurai::licensing::LicenseKeyFile());
+    if (f) {
+      std::stringstream ss;
+      ss << f.rdbuf();
+      license_key = ss.str();
+      const auto first = license_key.find_first_not_of(" \t\r\n");
+      const auto last = license_key.find_last_not_of(" \t\r\n");
+      license_key = (first == std::string::npos) ? "" : license_key.substr(first, last - first + 1);
+    }
+  }
+
+  const std::string hwid = samurai::licensing::GetHardwareId();
+  samurai::licensing::LicenseResult lr;
+  samurai::licensing::HttpLicenseClient license_client(samurai::licensing::LicenseServerUrl(),
+                                                       samurai::licensing::RequestTimeoutS());
+
+  if (samurai::licensing::IsDevMode()) {
+    lr.valid = true;
+    lr.tier = samurai::licensing::Tier::kEnterprise;
+    lr.features = samurai::licensing::TierFeatures(samurai::licensing::Tier::kEnterprise);
+  } else if (!license_key.empty()) {
+    lr = license_client.Validate(license_key, hwid);
+    if (lr.valid) {
+      samurai::licensing::SaveCache(lr, hwid);
+    } else {
+      samurai::licensing::LicenseResult cached;
+      if (samurai::licensing::LoadCache(hwid, cached) && cached.valid) {
+        lr = cached;
+      } else {
+        std::fprintf(stderr, "samurai_master license error: license validation failed: %s\n",
+                     lr.reason.empty() ? "invalid license key" : lr.reason.c_str());
+        return 2;
+      }
+    }
+  } else {
+    if (!samurai::licensing::LoadCache(hwid, lr) || !lr.valid) {
+      lr.valid = true;
+      lr.tier = samurai::licensing::Tier::kCommunity;
+      lr.features = samurai::licensing::TierFeatures(samurai::licensing::Tier::kCommunity);
+      lr.limits = samurai::licensing::TierLimitsFor(samurai::licensing::Tier::kCommunity);
+    }
+  }
+
   const long count = OptInt(argc, argv, "--count", 0);
   const bool mm_enabled = Flag(argc, argv, "--multi-master-enable");
   // Multi-master masters may be serve-only (they run delegated jobs pulled from
   // peer regions), so --count 0 is allowed then; otherwise a job needs a count.
   if (count <= 0 && !mm_enabled) {
     std::fprintf(stderr, "samurai_master: --count must be > 0\n");
+    return 2;
+  }
+
+  // Feature gate check for Master parameters
+  const std::string worker_kind = Opt(argc, argv, "--worker", "cpu");
+  const std::string vector = Opt(argc, argv, "--vector", "basic");
+  const double rps = std::strtod(Opt(argc, argv, "--rps", "0").c_str(), nullptr);
+  const int expected_workers = OptInt(argc, argv, "--workers", 1);
+
+  samurai::licensing::GateInput gate_in;
+  gate_in.attack_vector = vector;
+  gate_in.compute_backend = worker_kind;
+  gate_in.rps = rps;
+  gate_in.has_role = true;
+  gate_in.role = "master";
+  gate_in.license_key = license_key;
+  gate_in.license_file = license_file;
+  if (count > 0 && rps > 0.0) {
+    gate_in.duration = static_cast<long>(count / rps);
+  } else if (count > 0) {
+    gate_in.duration = 1;
+  }
+
+  samurai::licensing::GateResult gate_res =
+      samurai::licensing::EnforceFeatureGates(gate_in, lr, &license_client);
+  if (!gate_res.ok) {
+    std::fprintf(stderr, "samurai_master license error: %s\n%s\n", gate_res.error.c_str(),
+                 gate_res.upgrade_hint.c_str());
+    return 2;
+  }
+  for (const auto& w : gate_res.warnings) {
+    std::fprintf(stderr, "samurai_master license warning: %s\n", w.c_str());
+  }
+
+  if (lr.limits.has_value && lr.limits.max_workers > 0 && expected_workers > lr.limits.max_workers) {
+    std::fprintf(stderr,
+                 "samurai_master license error: requested %d workers exceeds tier limit of %d (tier: %s)\n",
+                 expected_workers, lr.limits.max_workers, samurai::licensing::TierName(lr.tier).c_str());
     return 2;
   }
 
