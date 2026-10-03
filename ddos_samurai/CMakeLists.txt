@@ -1,17 +1,27 @@
 cmake_minimum_required(VERSION 3.16)
 project(samurai_native LANGUAGES C CXX)
 
-# Native build tree for Samurai:
-#   core/         -> shared native utility layer (logging, net helpers, target
-#                    safety)
-#   control/      -> native control-plane layer (shard/auth/autoscale/discovery
-#                    so far)
-#   zmq/          -> the ZMQ worker daemons (samurai_*_worker)
-#   orchestrator/ -> the native orchestrator engine (worker registry, job
-#                    builder, ZMQ supervisor); header + supervisor.cpp, compiled
-#                    into the CLI target
-#   cli/          -> the native CLI front-end (`samurai`)
-#
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the build type" FORCE)
+endif()
+
+# Exploit mitigation & binary hardening flags
+add_compile_options(
+  -fvisibility=hidden
+  -fvisibility-inlines-hidden
+  -fstack-protector-strong
+  $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>
+)
+
+add_link_options(
+  -Wl,-z,relro,-z,now
+  $<$<CONFIG:Release>:-s>
+)
+
 # This tree builds the full native worker + orchestrator + CLI layer.
 add_subdirectory(core)
 add_subdirectory(control)
