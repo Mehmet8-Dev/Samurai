@@ -47,6 +47,15 @@ bool RateLimiter::Allow(const std::string& client_key) {
   const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::steady_clock::now().time_since_epoch())
                            .count();
+  if (impl_->clients.size() > 2048) {
+    for (auto it = impl_->clients.begin(); it != impl_->clients.end(); ) {
+      if (it->second.second < now_sec - 2) {
+        it = impl_->clients.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
   auto& entry = impl_->clients[client_key];
   if (entry.second != now_sec) {
     entry.first = 1;
@@ -196,6 +205,7 @@ std::string BuildInstallScript(const std::string& base, const std::string& token
        "BASE=\"" << base << "\"\n"
        "TOKEN=\"" << token << "\"\n"
        "TMP=\"$(mktemp -d)\"\n"
+       "trap 'rm -rf \"$TMP\"' EXIT INT TERM HUP\n"
     << curl << " \"$BASE/v1/agent/manifest?token=$TOKEN\" -o \"$TMP/manifest\"\n"
        "SIG=\"$(head -n1 \"$TMP/manifest\" | awk '{print $2}')\"\n"
        "tail -n +2 \"$TMP/manifest\" > \"$TMP/body\"\n"
@@ -221,13 +231,18 @@ std::string BuildInstallScript(const std::string& base, const std::string& token
        "set -- --control-endpoints \"$CE\" --dispatch-mode \"$DM\" --worker \"$WK\" --worker-dir \"$TMP\"\n"
        "if [ -n \"$CS\" ]; then set -- \"$@\" --cluster-secret \"$CS\"; fi\n"
        "if [ -n \"$CP\" ]; then set -- \"$@\" --curve-server-public \"$CP\"; fi\n"
-       "exec \"$TMP/samurai_slave\" \"$@\"\n";
+       "\"$TMP/samurai_slave\" \"$@\"\n"
+       "EXIT_CODE=$?\n"
+       "exit $EXIT_CODE\n";
   return s.str();
 }
 
 // Handles /v1/agent/* (install/manifest/blob). Returns nullopt when the feature
 // is disabled or the path is not an agent path, so Handle continues its routing.
-std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const HttpRequest& req) {
+std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg,
+                                            const HttpRequest& req,
+                                            std::unordered_map<std::string, std::string>& blob_cache,
+                                            std::mutex& blob_cache_mu) {
   if (cfg.agent_join_token.empty()) return std::nullopt;       // feature disabled
   if (req.method != "GET" || req.path.rfind("/v1/agent/", 0) != 0) return std::nullopt;
 
@@ -243,6 +258,26 @@ std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const 
   const std::string art = cfg.agent_artifact_dir;
   const bool bundle = samurai::orchestrator::IsBundleWorkerName(worker);
 
+  // Cached file reader to eliminate redundant disk reads for static worker/slave binaries
+  auto read_file_cached = [&](const std::string& path, const std::string& name, std::string& out_bytes) -> bool {
+    {
+      std::lock_guard<std::mutex> lock(blob_cache_mu);
+      auto it = blob_cache.find(name);
+      if (it != blob_cache.end()) {
+        out_bytes = it->second;
+        return true;
+      }
+    }
+    if (!ReadFileBytes(path, out_bytes)) {
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(blob_cache_mu);
+      blob_cache[name] = out_bytes;
+    }
+    return true;
+  };
+
   // The worker binaries this agent join serves. Bundle ships every catalog binary
   // present in the artifact dir (per-shard resolution on the slave); a fixed kind
   // ships exactly one. Used by both the manifest (blob list) and the blob gate.
@@ -251,7 +286,7 @@ std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const 
     if (bundle) {
       for (const auto& e : samurai::orchestrator::kWorkerTable) {
         std::string bytes;
-        if (ReadFileBytes(art + "/" + e.binary, bytes)) bins.emplace_back(e.binary);
+        if (read_file_cached(art + "/" + e.binary, e.binary, bytes)) bins.emplace_back(e.binary);
       }
     } else {
       bins.push_back("samurai_" + worker + "_worker");
@@ -261,7 +296,7 @@ std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const 
 
   if (req.path == "/v1/agent/manifest") {
     std::string slave_bytes;
-    if (art.empty() || !ReadFileBytes(art + "/" + slave_bin, slave_bytes)) {
+    if (art.empty() || !read_file_cached(art + "/" + slave_bin, slave_bin, slave_bytes)) {
       return ErrResp(500, "Internal Server Error", "agent_artifacts_unavailable");
     }
     const std::vector<std::string> worker_bins = served_worker_bins();
@@ -283,7 +318,7 @@ std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const 
     body << "blob " << slave_bin << " " << Sha256Hex(slave_bytes) << "\n";
     for (const std::string& wb : worker_bins) {
       std::string wbytes;
-      if (!ReadFileBytes(art + "/" + wb, wbytes)) {
+      if (!read_file_cached(art + "/" + wb, wb, wbytes)) {
         return ErrResp(500, "Internal Server Error", "agent_artifacts_unavailable");
       }
       body << "blob " << wb << " " << Sha256Hex(wbytes) << "\n";
@@ -311,7 +346,7 @@ std::optional<HttpResponse> MaybeHandleAgent(const ManagementConfig& cfg, const 
       return ErrResp(400, "Bad Request", "agent_bad_blob");
     }
     std::string bytes;
-    if (art.empty() || !ReadFileBytes(art + "/" + name, bytes)) {
+    if (art.empty() || !read_file_cached(art + "/" + name, name, bytes)) {
       return ErrResp(404, "Not Found", "agent_blob_missing");
     }
     HttpResponse r;
@@ -406,7 +441,7 @@ bool ParseHttpRequest(const std::string& raw, HttpRequest& out) {
 }
 
 ManagementApi::ManagementApi(const ManagementConfig& cfg, ManagementProviders providers)
-    : cfg_(cfg), providers_(std::move(providers)) {
+    : cfg_(cfg), providers_(std::move(providers)), rate_limiter_(cfg.rate_limit_per_sec) {
   cfg_.tenant_namespace = Strip(cfg_.tenant_namespace);
   cfg_.jwt_secret = Strip(cfg_.jwt_secret);
   if (cfg_.jwt_role_claim.empty()) cfg_.jwt_role_claim = "role";
@@ -421,6 +456,11 @@ ManagementApi::ManagementApi(const ManagementConfig& cfg, ManagementProviders pr
       if (cfg_.role_tokens.find(r) == cfg_.role_tokens.end()) cfg_.role_tokens[r] = legacy;
     }
   }
+}
+
+void ManagementApi::ClearBlobCache() const {
+  std::lock_guard<std::mutex> lock(blob_cache_mu_);
+  blob_cache_.clear();
 }
 
 std::string ManagementApi::ResolveRole(const std::string& authorization,
@@ -463,6 +503,40 @@ std::string ManagementApi::ResolveRole(const std::string& authorization,
 }
 
 HttpResponse ManagementApi::Handle(const HttpRequest& req) const {
+  // Rate limiter check across all endpoints (/healthz, /v1/agent/*, and API routes)
+  std::string client_key = req.client_ip;
+  if (client_key.empty()) {
+    auto xff = req.headers.find("x-forwarded-for");
+    if (xff != req.headers.end() && !xff->second.empty()) {
+      client_key = xff->second;
+    } else {
+      auto auth = req.headers.find("authorization");
+      if (auth != req.headers.end() && !auth->second.empty()) {
+        client_key = auth->second;
+      } else {
+        auto tok = req.query.find("token");
+        if (tok != req.query.end() && !tok->second.empty()) {
+          client_key = tok->second;
+        } else {
+          client_key = "anonymous";
+        }
+      }
+    }
+  } else {
+    // Only trust X-Forwarded-For if request comes with verified trusted proxy secret
+    const std::string trusted_secret = Strip(cfg_.trusted_identity_secret);
+    if (!trusted_secret.empty() &&
+        Strip(HeaderOr(req.headers, cfg_.trusted_secret_header)) == trusted_secret) {
+      auto xff = req.headers.find("x-forwarded-for");
+      if (xff != req.headers.end() && !xff->second.empty()) {
+        client_key = xff->second;
+      }
+    }
+  }
+  if (!rate_limiter_.Allow(client_key)) {
+    return ErrResp(429, "Too Many Requests", "rate_limited");
+  }
+
   const std::string authz = HeaderOr(req.headers, "authorization");
 
   // /healthz is unauthenticated.
@@ -473,7 +547,7 @@ HttpResponse ManagementApi::Handle(const HttpRequest& req) const {
   }
 
   // Self-bootstrapping agent join (/v1/agent/*) uses its own join-token auth.
-  if (auto agent = MaybeHandleAgent(cfg_, req)) return *agent;
+  if (auto agent = MaybeHandleAgent(cfg_, req, blob_cache_, blob_cache_mu_)) return *agent;
 
   auto guard = [&](std::initializer_list<const char*> allowed) -> std::optional<HttpResponse> {
     const std::string role = ResolveRole(authz, req.headers);
@@ -766,6 +840,10 @@ void ManagementApiServer::Loop() {
     HttpRequest req;
     HttpResponse resp;
     if (ParseHttpRequest(buf, req)) {
+      char ip_str[INET_ADDRSTRLEN] = {0};
+      if (inet_ntop(AF_INET, &peer.sin_addr, ip_str, sizeof(ip_str))) {
+        req.client_ip = ip_str;
+      }
       resp = api_.Handle(req);
     } else {
       resp.status = 400;
