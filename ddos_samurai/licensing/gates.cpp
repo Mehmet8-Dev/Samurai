@@ -82,6 +82,11 @@ GateResult Fail(const std::string& msg, const std::string& hint) {
 }  // namespace
 
 GateResult EnforceFeatureGates(const GateInput& in, LicenseResult& lr, ExecGrantClient* grant) {
+  if (!lr.valid) {
+    return Fail("Lisans geçersiz veya doğrulanamadı: " + (lr.reason.empty() ? std::string("Geçersiz lisans") : lr.reason),
+                "Geçerli bir lisans anahtarı sağlayın veya Community modunda çalıştırın.");
+  }
+
   GateResult result;
   result.duration = in.duration;
   result.rps = in.rps;
@@ -173,9 +178,11 @@ GateResult EnforceFeatureGates(const GateInput& in, LicenseResult& lr, ExecGrant
   // 10. Duration limit.
   if (lr.limits.has_value && lr.limits.max_duration_s > 0) {
     const long max_dur = lr.limits.max_duration_s;
-    if (result.duration > max_dur || result.duration <= 0) {
+    if (result.duration > max_dur) {
       result.warnings.push_back("Süre lisans limitine (" + std::to_string(max_dur) +
                                 "s) düşürüldü. (İstenen: " + std::to_string(result.duration) + "s)");
+      result.duration = max_dur;
+    } else if (result.duration <= 0) {
       result.duration = max_dur;
     }
   }
@@ -183,10 +190,16 @@ GateResult EnforceFeatureGates(const GateInput& in, LicenseResult& lr, ExecGrant
   // 11. PPS limit.
   if (lr.limits.has_value && lr.limits.max_pps > 0) {
     const double max_pps = static_cast<double>(lr.limits.max_pps);
-    if (result.rps > max_pps) {
-      result.warnings.push_back("PPS lisans limitine (" + std::to_string(lr.limits.max_pps) +
-                                ") düşürüldü. (İstenen: " + std::to_string(static_cast<long>(result.rps)) +
-                                ")");
+    if (result.rps <= 0.0 || result.rps > max_pps) {
+      if (result.rps <= 0.0) {
+        result.warnings.push_back(
+            "Sınırsız (wire-speed) PPS Community planında desteklenmiyor. PPS lisans limitine (" +
+            std::to_string(lr.limits.max_pps) + ") düşürüldü.");
+      } else {
+        result.warnings.push_back("PPS lisans limitine (" + std::to_string(lr.limits.max_pps) +
+                                  ") düşürüldü. (İstenen: " + std::to_string(static_cast<long>(result.rps)) +
+                                  ")");
+      }
       result.rps = max_pps;
     }
   }
