@@ -53,6 +53,8 @@ void PrintUsage(const char* argv0) {
       "  --allow-public-target        permit non-private/loopback targets\n"
       "  --allow-target IP|CIDR       allowlist a target (repeatable)\n"
       "  --deny-target IP|CIDR        denylist a target; always wins (repeatable)\n"
+      "  --license-key KEY            license key (or set SAMURAI_LICENSE_KEY)\n"
+      "  --license-file PATH          path to file containing license key\n"
       "  --report-json PATH  write the run report as JSON to PATH\n"
       "  --report-text PATH  write the run report as text to PATH\n"
       "  --kpi-min-rate-accuracy PCT  gate: rate_accuracy_pct must be >= PCT\n"
@@ -190,6 +192,12 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
     } else if (a == "--deny-target") {
       if (!NeedsValue(i, argc, "--deny-target")) return ParseStatus::kError;
       out.deny_targets.emplace_back(argv[++i]);
+    } else if (a == "--license-key") {
+      if (!NeedsValue(i, argc, "--license-key")) return ParseStatus::kError;
+      out.license_key = argv[++i];
+    } else if (a == "--license-file") {
+      if (!NeedsValue(i, argc, "--license-file")) return ParseStatus::kError;
+      out.license_file = argv[++i];
     } else {
       std::fprintf(stderr, "samurai: unknown argument: %s\n", a.c_str());
       return ParseStatus::kError;

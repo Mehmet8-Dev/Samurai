@@ -31,6 +31,8 @@ struct CliOptions {
   bool allow_public = false;              // --allow-public-target
   std::vector<std::string> allow_targets;  // --allow-target IP|CIDR (repeatable)
   std::vector<std::string> deny_targets;   // --deny-target IP|CIDR (repeatable)
+  std::string license_key;                 // --license-key KEY
+  std::string license_file;                // --license-file PATH
 };
 
 }  // namespace samurai::cli
