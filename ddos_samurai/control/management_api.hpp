@@ -13,8 +13,10 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 #include "json.hpp"
 
@@ -25,6 +27,7 @@ struct HttpRequest {
   std::string path;                            // without query
   std::map<std::string, std::string> query;    // decoded query params
   std::map<std::string, std::string> headers;  // lower-cased keys
+  std::string client_ip;                       // client IP address for rate limiting
 };
 
 struct HttpResponse {
@@ -102,9 +105,15 @@ class ManagementApi {
   std::string ResolveRole(const std::string& authorization,
                           const std::map<std::string, std::string>& headers) const;
 
+  RateLimiter& rate_limiter() const { return rate_limiter_; }
+  void ClearBlobCache() const;
+
  private:
   ManagementConfig cfg_;
   ManagementProviders providers_;
+  mutable RateLimiter rate_limiter_;
+  mutable std::mutex blob_cache_mu_;
+  mutable std::unordered_map<std::string, std::string> blob_cache_;
 };
 
 // Parse a raw HTTP request head (request line + headers). Returns false if the
