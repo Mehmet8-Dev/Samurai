@@ -27,7 +27,8 @@ add_library(
   gates.cpp
   cache.cpp
   http_client.cpp
-  client.cpp)
+  client.cpp
+  anti_tamper.cpp)
 target_include_directories(samurai_license PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(samurai_license PUBLIC samurai_core PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
