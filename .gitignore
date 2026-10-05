@@ -109,3 +109,7 @@ Papers/
 # Local research scratch (microbench/paper) - not part of the repo
 /research/
 /artifacts/zero_install/
+
+# Video presentation & assets
+/samurai-video/
+*.mp4

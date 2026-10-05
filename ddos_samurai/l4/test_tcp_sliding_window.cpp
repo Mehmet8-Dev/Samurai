@@ -39,7 +39,14 @@ static uint32_t ReadBe32(const uint8_t* p) {
 }
 static uint32_t Ipv4(const char* s) { in_addr a{}; inet_pton(AF_INET, s, &a); return ntohl(a.s_addr); }
 
-struct Seg { uint8_t flags; uint32_t seq; uint32_t payload_len; uint8_t doff_words; };
+struct Seg {
+  uint8_t flags;
+  uint32_t seq;
+  uint32_t ack;
+  uint32_t payload_len;
+  uint8_t doff_words;
+  std::vector<uint8_t> raw;
+};
 
 // Drain every packet currently on the TX ring into a flat segment list. doff_words is
 // the TCP data-offset (header words); >5 means TCP options are present.
@@ -54,10 +61,12 @@ static std::vector<Seg> Drain(TcpDataplaneCore& core) {
       Seg s;
       s.flags = p[47];
       s.seq = ReadBe32(p + 38);
+      s.ack = ReadBe32(p + 42);
       s.doff_words = uint8_t(p[46] >> 4);  // TCP data offset at frame byte 14+20+12=46
       const size_t tcp_hdr = size_t(s.doff_words) * 4;
       const size_t hdr = 34 + tcp_hdr;     // 14 L2 + 20 IP + TCP header (incl options)
       s.payload_len = psize > hdr ? uint32_t(psize - hdr) : 0;
+      s.raw.assign(p, p + psize);
       out.push_back(s);
     }
     core.ConsumeTxPackets(count);
@@ -453,6 +462,397 @@ int main() {
     auto n3 = Drain(dcore);
     int data3 = 0; for (auto& s : n3) if (s.payload_len > 0) data3++;
     CHECK(data3 == 1, "Nagle-held write flushes after the ACK, got %d", data3);
+  }
+
+  // ---- TEST J: L4 Custom User-Space TCP RX Out-of-Order Segment Reassembly Queue.
+  // Segment 2 arrives before Segment 1. Segment 2 must be buffered in rx_oo_queue
+  // and trigger a dup-ACK carrying SACK block [seq2, seq2+len2]. Segment 3 arrives
+  // next, expanding the SACK block. Segment 1 arrives last, filling the hole;
+  // all 3 segments must be drained into rx_payloads_ in strict sequential order.
+  {
+    const uint64_t fidJ = core.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = core.GetFlow(fidJ);
+    const uint16_t ephJ = t.src_port;
+    const uint32_t issJ = t.iss;
+    Drain(core);
+
+    // SYN-ACK with SACK-permitted
+    const uint8_t opts[8] = {0x04, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01};
+    const uint32_t peer_issJ = 0x90000000u;
+    auto saJ = PeerFrameOpt(our_ip, tgt, ephJ, peer_issJ, issJ + 1, 0x12, 65535, opts, 8);
+    core.IngestRxFrame(saJ.data(), saJ.size());
+    Drain(core);  // clear handshake ACK
+    t = core.GetFlow(fidJ);
+    CHECK(t.state == 3, "Flow established for OO reassembly test");
+    CHECK(t.sack_permitted, "SACK negotiated for OO reassembly test");
+
+    const uint32_t base_rx = t.rcv_nxt;  // peer_issJ + 1
+    const uint32_t len = 100;
+    std::vector<uint8_t> p1(len, '1');
+    std::vector<uint8_t> p2(len, '2');
+    std::vector<uint8_t> p3(len, '3');
+
+    // 1. Send segment 2 FIRST (seq = base_rx + 100).
+    auto f2 = PeerFrame(our_ip, tgt, ephJ, base_rx + 100, issJ + 1, 0x10, 65535, p2.data(), len);
+    core.IngestRxFrame(f2.data(), f2.size());
+
+    // Payload 2 must NOT be delivered yet because hole exists at base_rx.
+    auto rx1 = core.CollectRxPayloads();
+    CHECK(rx1.empty(), "Segment 2 held in reassembly queue; no L7 payload delivered yet");
+
+    // Must emit exactly one dup-ACK with SACK block [base_rx+100, base_rx+200].
+    auto acks1 = Drain(core);
+    CHECK(acks1.size() == 1, "Emitted 1 dup-ACK for out-of-order segment 2 (got %zu)", acks1.size());
+    if (!acks1.empty()) {
+      CHECK(acks1[0].ack == base_rx, "dup-ACK ack=%u expected base_rx=%u", acks1[0].ack, base_rx);
+      CHECK(acks1[0].doff_words > 5, "dup-ACK carries TCP options");
+      if (acks1[0].raw.size() >= 66) {
+        // Frame byte 54: options start. 54, 55: NOPs. 56: Kind 5, 57: Len 10.
+        CHECK(acks1[0].raw[56] == 0x05, "SACK option kind is 5 (got %u)", acks1[0].raw[56]);
+        const uint32_t sack_left = ReadBe32(acks1[0].raw.data() + 58);
+        const uint32_t sack_right = ReadBe32(acks1[0].raw.data() + 62);
+        CHECK(sack_left == base_rx + 100, "SACK left=%u expected %u", sack_left, base_rx + 100);
+        CHECK(sack_right == base_rx + 200, "SACK right=%u expected %u", sack_right, base_rx + 200);
+      }
+    }
+
+    // 2. Send segment 3 NEXT (seq = base_rx + 200).
+    auto f3 = PeerFrame(our_ip, tgt, ephJ, base_rx + 200, issJ + 1, 0x10, 65535, p3.data(), len);
+    core.IngestRxFrame(f3.data(), f3.size());
+
+    auto rx2 = core.CollectRxPayloads();
+    CHECK(rx2.empty(), "Segment 3 held; hole still exists at base_rx");
+
+    auto acks2 = Drain(core);
+    CHECK(acks2.size() == 1, "Emitted 1 dup-ACK for out-of-order segment 3 (got %zu)", acks2.size());
+    if (!acks2.empty() && acks2[0].raw.size() >= 66) {
+      CHECK(acks2[0].ack == base_rx, "dup-ACK ack=%u expected base_rx=%u", acks2[0].ack, base_rx);
+      const uint32_t sack_left = ReadBe32(acks2[0].raw.data() + 58);
+      const uint32_t sack_right = ReadBe32(acks2[0].raw.data() + 62);
+      CHECK(sack_left == base_rx + 100, "Merged SACK left=%u expected %u", sack_left, base_rx + 100);
+      CHECK(sack_right == base_rx + 300, "Merged SACK right=%u expected %u", sack_right, base_rx + 300);
+    }
+
+    // 3. Send segment 1 LAST (seq = base_rx, fills hole!).
+    auto f1 = PeerFrame(our_ip, tgt, ephJ, base_rx, issJ + 1, 0x10, 65535, p1.data(), len);
+    core.IngestRxFrame(f1.data(), f1.size());
+
+    // All 3 segments must now be delivered in exact sequence: p1 then p2 then p3.
+    auto rx3 = core.CollectRxPayloads();
+    std::vector<uint8_t> all_bytes;
+    for (const auto& item : rx3) {
+      all_bytes.insert(all_bytes.end(), item.payload.begin(), item.payload.end());
+    }
+    CHECK(all_bytes.size() == 300, "Reassembled all 300 bytes (got %zu)", all_bytes.size());
+    bool order_ok = (all_bytes.size() == 300);
+    if (order_ok) {
+      for (size_t i = 0; i < 100; ++i) if (all_bytes[i] != '1') order_ok = false;
+      for (size_t i = 100; i < 200; ++i) if (all_bytes[i] != '2') order_ok = false;
+      for (size_t i = 200; i < 300; ++i) if (all_bytes[i] != '3') order_ok = false;
+    }
+    CHECK(order_ok, "Payload reassembled in exact sequential order: 100 '1's, 100 '2's, 100 '3's");
+
+    t = core.GetFlow(fidJ);
+    CHECK(t.rcv_nxt == base_rx + 300, "rcv_nxt advanced to %u (got %u)", base_rx + 300, t.rcv_nxt);
+
+    // TX ring must have cumulative ACK covering base_rx + 300 without SACK blocks.
+    auto acks3 = Drain(core);
+    CHECK(acks3.size() == 1, "Emitted 1 cumulative ACK after hole fill (got %zu)", acks3.size());
+    if (!acks3.empty()) {
+      CHECK(acks3[0].ack == base_rx + 300, "Cumulative ACK ack=%u expected %u", acks3[0].ack, base_rx + 300);
+    }
+
+    // 4. Test duplicate segment rejection: send segment 2 again.
+    core.IngestRxFrame(f2.data(), f2.size());
+    auto rx_dup = core.CollectRxPayloads();
+    CHECK(rx_dup.empty(), "Old duplicate segment rejected; no payload delivered");
+    auto acks_dup = Drain(core);
+    CHECK(acks_dup.size() == 1, "Duplicate segment re-ACKed current rcv_nxt");
+    if (!acks_dup.empty()) {
+      CHECK(acks_dup[0].ack == base_rx + 300, "Duplicate segment ACKed current rcv_nxt=%u", base_rx + 300);
+    }
+
+    // 5. Test queue capacity bound (max 32 out-of-order segments to prevent bloat):
+    // Send 40 disjoint segments with gaps between them.
+    for (uint32_t i = 0; i < 40; ++i) {
+      const uint32_t seg_seq = base_rx + 1000 + i * 200;  // 100-byte segment, 100-byte gap
+      std::vector<uint8_t> p_extra(100, static_cast<uint8_t>('A' + (i % 26)));
+      auto f_extra = PeerFrame(our_ip, tgt, ephJ, seg_seq, issJ + 1, 0x10, 65535, p_extra.data(), 100);
+      core.IngestRxFrame(f_extra.data(), f_extra.size());
+    }
+    Drain(core);
+    auto rx_extra = core.CollectRxPayloads();
+    CHECK(rx_extra.empty(), "Segments past hole kept bounded in queue; none delivered");
+  }
+
+  // ---- TEST K: Sequence Number Wrap-around across 2^32-1 -> 0 boundary.
+  // Tests out-of-order queueing, SACK block ordering, and seamless reassembly across wrap boundary.
+  {
+    const uint64_t fidK = core.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = core.GetFlow(fidK);
+    const uint16_t ephK = t.src_port;
+    const uint32_t issK = t.iss;
+    Drain(core);
+
+    // Peer ISS close to wrap-around: 0xFFFFFFF0
+    const uint8_t opts[8] = {0x04, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01};
+    const uint32_t peer_issK = 0xFFFFFFF0u;
+    auto saK = PeerFrameOpt(our_ip, tgt, ephK, peer_issK, issK + 1, 0x12, 65535, opts, 8);
+    core.IngestRxFrame(saK.data(), saK.size());
+    Drain(core);
+    t = core.GetFlow(fidK);
+    const uint32_t base_rx = t.rcv_nxt; // 0xFFFFFFF1u
+    CHECK(base_rx == 0xFFFFFFF1u, "Flow rcv_nxt initialized to pre-wrap sequence number");
+
+    // Segment 2: seq = 0x00000010u (post-wrap!), len = 50, content 'B'
+    // Hole is [0xFFFFFFF1, 0x00000010) = 31 bytes
+    std::vector<uint8_t> p2(50, 'B');
+    auto f2 = PeerFrame(our_ip, tgt, ephK, 0x00000010u, issK + 1, 0x10, 65535, p2.data(), 50);
+    core.IngestRxFrame(f2.data(), f2.size());
+    auto rx_k1 = core.CollectRxPayloads();
+    CHECK(rx_k1.empty(), "TEST K: Post-wrap Segment 2 held in queue; no L7 delivery yet");
+    auto acks_k1 = Drain(core);
+    CHECK(acks_k1.size() == 1, "TEST K: Emitted dup-ACK for post-wrap segment");
+    if (!acks_k1.empty() && acks_k1[0].raw.size() >= 66) {
+      const uint32_t sack_left = ReadBe32(acks_k1[0].raw.data() + 58);
+      const uint32_t sack_right = ReadBe32(acks_k1[0].raw.data() + 62);
+      CHECK(sack_left == 0x00000010u, "TEST K: SACK left=%u expected 0x00000010", sack_left);
+      CHECK(sack_right == 0x00000010u + 50, "TEST K: SACK right=%u expected %u", sack_right, 0x00000010u + 50);
+    }
+
+    // Segment 3: seq = 0x00000050u (post-wrap!), len = 40, content 'C'
+    std::vector<uint8_t> p3(40, 'C');
+    auto f3 = PeerFrame(our_ip, tgt, ephK, 0x00000050u, issK + 1, 0x10, 65535, p3.data(), 40);
+    core.IngestRxFrame(f3.data(), f3.size());
+    auto acks_k2 = Drain(core);
+    CHECK(acks_k2.size() == 1, "TEST K: Emitted dup-ACK for segment 3");
+    if (!acks_k2.empty() && acks_k2[0].raw.size() >= 74) {
+      // Must have triggering block 3 at head, then block 2
+      const uint32_t sack1_left = ReadBe32(acks_k2[0].raw.data() + 58);
+      const uint32_t sack1_right = ReadBe32(acks_k2[0].raw.data() + 62);
+      const uint32_t sack2_left = ReadBe32(acks_k2[0].raw.data() + 66);
+      const uint32_t sack2_right = ReadBe32(acks_k2[0].raw.data() + 70);
+      CHECK(sack1_left == 0x00000050u && sack1_right == 0x00000050u + 40, "TEST K: Triggering SACK block is segment 3");
+      CHECK(sack2_left == 0x00000010u && sack2_right == 0x00000010u + 50, "TEST K: Second SACK block is segment 2");
+    }
+
+    // Segment 1: seq = 0xFFFFFFF1u, len = 31 (0xFFFFFFF1 + 31 = 0x00000010u!), content 'A'
+    // Fills the hole across the wrap-around boundary!
+    std::vector<uint8_t> p1(31, 'A');
+    auto f1 = PeerFrame(our_ip, tgt, ephK, 0xFFFFFFF1u, issK + 1, 0x10, 65535, p1.data(), 31);
+    core.IngestRxFrame(f1.data(), f1.size());
+
+    // Segments 1 and 2 must drain! (Segment 3 still has gap between 0x42 and 0x50)
+    auto rx_k2 = core.CollectRxPayloads();
+    std::vector<uint8_t> k_bytes;
+    for (const auto& item : rx_k2) {
+      k_bytes.insert(k_bytes.end(), item.payload.begin(), item.payload.end());
+    }
+    CHECK(k_bytes.size() == 31 + 50, "TEST K: Drained segment 1 + 2 across wrap boundary (got %zu bytes)", k_bytes.size());
+    t = core.GetFlow(fidK);
+    CHECK(t.rcv_nxt == 0x00000010u + 50, "TEST K: rcv_nxt advanced across 0 boundary to %u (got %u)", 0x00000010u + 50, t.rcv_nxt);
+    Drain(core);
+
+    // Segment 4: seq = 0x00000042u, len = 14 (fills remaining gap 0x42..0x50)
+    std::vector<uint8_t> p4(14, 'D');
+    auto f4 = PeerFrame(our_ip, tgt, ephK, 0x00000042u, issK + 1, 0x10, 65535, p4.data(), 14);
+    core.IngestRxFrame(f4.data(), f4.size());
+    auto rx_k3 = core.CollectRxPayloads();
+    size_t rx_k3_len = 0;
+    for (const auto& item : rx_k3) rx_k3_len += item.payload.size();
+    CHECK(rx_k3_len == 14 + 40, "TEST K: Drained segment 4 + segment 3 (got %zu bytes)", rx_k3_len);
+    t = core.GetFlow(fidK);
+    CHECK(t.rcv_nxt == 0x00000050u + 40, "TEST K: Final rcv_nxt=%u expected %u", t.rcv_nxt, 0x00000050u + 40);
+    Drain(core);
+  }
+
+  // ---- TEST L: Overlapping, duplicate, and subsumed out-of-order segments.
+  {
+    const uint64_t fidL = core.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = core.GetFlow(fidL);
+    const uint16_t ephL = t.src_port;
+    const uint32_t issL = t.iss;
+    Drain(core);
+    const uint8_t opts[8] = {0x04, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01};
+    auto saL = PeerFrameOpt(our_ip, tgt, ephL, 0x50000000u, issL + 1, 0x12, 65535, opts, 8);
+    core.IngestRxFrame(saL.data(), saL.size());
+    Drain(core);
+    t = core.GetFlow(fidL);
+    const uint32_t base = t.rcv_nxt; // 0x50000001u
+
+    // 1. Arrive at base + 100, len 100 ('B')
+    std::vector<uint8_t> pB(100, 'B');
+    auto fB = PeerFrame(our_ip, tgt, ephL, base + 100, issL + 1, 0x10, 65535, pB.data(), 100);
+    core.IngestRxFrame(fB.data(), fB.size());
+
+    // 2. Arrive at base + 120, len 50 ('C') - completely subsumed inside previous!
+    std::vector<uint8_t> pC(50, 'C');
+    auto fC = PeerFrame(our_ip, tgt, ephL, base + 120, issL + 1, 0x10, 65535, pC.data(), 50);
+    core.IngestRxFrame(fC.data(), fC.size());
+
+    // 3. Arrive at base + 150, len 100 ('D') - partial right overlap with B, extends to base + 250!
+    std::vector<uint8_t> pD(100, 'D');
+    auto fD = PeerFrame(our_ip, tgt, ephL, base + 150, issL + 1, 0x10, 65535, pD.data(), 100);
+    core.IngestRxFrame(fD.data(), fD.size());
+
+    Drain(core);
+    auto rx_l0 = core.CollectRxPayloads();
+    CHECK(rx_l0.empty(), "TEST L: No payload delivered before hole fill");
+
+    // 4. In-order segment arrives: base, len 100 ('A')
+    std::vector<uint8_t> pA(100, 'A');
+    auto fA = PeerFrame(our_ip, tgt, ephL, base, issL + 1, 0x10, 65535, pA.data(), 100);
+    core.IngestRxFrame(fA.data(), fA.size());
+
+    // All data from base to base + 250 must be delivered!
+    auto rx_l1 = core.CollectRxPayloads();
+    std::vector<uint8_t> l_bytes;
+    for (const auto& item : rx_l1) {
+      l_bytes.insert(l_bytes.end(), item.payload.begin(), item.payload.end());
+    }
+    CHECK(l_bytes.size() == 250, "TEST L: Reassembled 250 bytes without duplicate overlap corruption (got %zu)", l_bytes.size());
+    t = core.GetFlow(fidL);
+    CHECK(t.rcv_nxt == base + 250, "TEST L: rcv_nxt advanced to base+250 (got %u)", t.rcv_nxt);
+    Drain(core);
+  }
+
+  // ---- TEST M: Out-of-Order FIN handling.
+  // Segment 2 arrives with FIN; segment 1 arrives second. Connection must deliver all
+  // data and transition cleanly to kTimeWait.
+  {
+    const uint64_t fidM = core.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = core.GetFlow(fidM);
+    const uint16_t ephM = t.src_port;
+    const uint32_t issM = t.iss;
+    Drain(core);
+    const uint8_t opts[8] = {0x04, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01};
+    auto saM = PeerFrameOpt(our_ip, tgt, ephM, 0x60000000u, issM + 1, 0x12, 65535, opts, 8);
+    core.IngestRxFrame(saM.data(), saM.size());
+    Drain(core);
+    t = core.GetFlow(fidM);
+    const uint32_t base = t.rcv_nxt;
+
+    // Segment 2: base + 100, len 100, flags = FIN | ACK
+    std::vector<uint8_t> p2(100, 'Z');
+    auto f2 = PeerFrame(our_ip, tgt, ephM, base + 100, issM + 1, 0x11, 65535, p2.data(), 100);
+    core.IngestRxFrame(f2.data(), f2.size());
+    t = core.GetFlow(fidM);
+    CHECK(t.state == 3, "TEST M: Flow remains established while FIN is pending (state=%u)", t.state);
+    auto acks_m1 = Drain(core);
+    CHECK(acks_m1.size() == 1, "TEST M: Emitted dup-ACK for out-of-order FIN");
+
+    // Segment 1: base, len 100, flags = ACK
+    std::vector<uint8_t> p1(100, 'Y');
+    auto f1 = PeerFrame(our_ip, tgt, ephM, base, issM + 1, 0x10, 65535, p1.data(), 100);
+    core.IngestRxFrame(f1.data(), f1.size());
+
+    // Both segments delivered
+    auto rx_m = core.CollectRxPayloads();
+    size_t total_m = 0;
+    for (const auto& item : rx_m) total_m += item.payload.size();
+    CHECK(total_m == 200, "TEST M: Delivered all 200 bytes before FIN processing (got %zu)", total_m);
+
+    t = core.GetFlow(fidM);
+    CHECK(t.state == 5, "TEST M: Flow transitioned to kTimeWait (state=5, got %u)", t.state);
+    CHECK(t.rcv_nxt == base + 201, "TEST M: rcv_nxt advanced over FIN byte to base+201 (got %u)", t.rcv_nxt);
+    auto acks_m2 = Drain(core);
+    CHECK(!acks_m2.empty(), "TEST M: Sent final ACK for FIN");
+    if (!acks_m2.empty()) {
+      CHECK(acks_m2.back().ack == base + 201, "TEST M: Final ACK ack=%u expected %u", acks_m2.back().ack, base + 201);
+    }
+  }
+
+  // ---- TEST N: Out-of-Order Reassembly without SACK option.
+  // Segment 2 arrives before Segment 1 on a connection without SACK.
+  // Segment 2 must be buffered, dup-ACK sent without SACK options, and
+  // ordered reassembly delivered when segment 1 arrives.
+  {
+    const uint64_t fidN = core.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = core.GetFlow(fidN);
+    const uint16_t ephN = t.src_port;
+    const uint32_t issN = t.iss;
+    Drain(core);
+    // Plain SYN-ACK (no options at all, bare 20-byte header)
+    auto saN = PeerFrame(our_ip, tgt, ephN, 0x70000000u, issN + 1, 0x12, 65535);
+    core.IngestRxFrame(saN.data(), saN.size());
+    Drain(core);
+    t = core.GetFlow(fidN);
+    CHECK(t.state == 3, "TEST N: Flow established");
+    CHECK(!t.sack_permitted, "TEST N: SACK is NOT negotiated");
+    const uint32_t base = t.rcv_nxt;
+
+    // Segment 2 arrives first
+    std::vector<uint8_t> p2(100, '2');
+    auto f2 = PeerFrame(our_ip, tgt, ephN, base + 100, issN + 1, 0x10, 65535, p2.data(), 100);
+    core.IngestRxFrame(f2.data(), f2.size());
+    auto acks_n1 = Drain(core);
+    CHECK(acks_n1.size() == 1, "TEST N: Emitted dup-ACK");
+    if (!acks_n1.empty()) {
+      CHECK(acks_n1[0].ack == base, "TEST N: dup-ACK acknowledges base");
+      CHECK(acks_n1[0].doff_words == 5, "TEST N: dup-ACK carries bare TCP header without SACK (doff=%u)", acks_n1[0].doff_words);
+    }
+
+    // Segment 1 arrives second
+    std::vector<uint8_t> p1(100, '1');
+    auto f1 = PeerFrame(our_ip, tgt, ephN, base, issN + 1, 0x10, 65535, p1.data(), 100);
+    core.IngestRxFrame(f1.data(), f1.size());
+
+    auto rx_n = core.CollectRxPayloads();
+    std::vector<uint8_t> n_bytes;
+    for (const auto& item : rx_n) n_bytes.insert(n_bytes.end(), item.payload.begin(), item.payload.end());
+    CHECK(n_bytes.size() == 200, "TEST N: Delivered all 200 bytes in order without SACK (got %zu)", n_bytes.size());
+    bool n_order = true;
+    for (size_t i = 0; i < 100; ++i) if (n_bytes[i] != '1') n_order = false;
+    for (size_t i = 100; i < 200; ++i) if (n_bytes[i] != '2') n_order = false;
+    CHECK(n_order, "TEST N: Sequential delivery: 100 '1's followed by 100 '2's");
+    Drain(core);
+  }
+
+  // ---- TEST O: Continuous Sliding Window Throughput Benchmark (1 MB transfer).
+  {
+    const uint64_t fidO = core.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = core.GetFlow(fidO);
+    const uint16_t ephO = t.src_port;
+    const uint32_t issO = t.iss;
+    Drain(core);
+    // SYN-ACK with WScale=7, SACK-permitted
+    const uint8_t opts[8] = {0x04, 0x02, 0x03, 0x03, 0x07, 0x01, 0x01, 0x01};
+    auto saO = PeerFrameOpt(our_ip, tgt, ephO, 0x88000000u, issO + 1, 0x12, 65535, opts, 8);
+    core.IngestRxFrame(saO.data(), saO.size());
+    Drain(core);
+
+    const size_t target_bytes = 1024 * 1024; // 1 MB
+    std::vector<uint8_t> chunk(32768, 'U');
+    size_t enqueued = 0;
+    size_t total_acked = 0;
+    size_t total_segs_sent = 0;
+
+    auto t_start = std::chrono::steady_clock::now();
+    while (total_acked < target_bytes) {
+      while (enqueued < target_bytes) {
+        size_t to_send = std::min<size_t>(chunk.size(), target_bytes - enqueued);
+        uint32_t accepted = core.EnqueueSend(fidO, chunk.data(), to_send);
+        if (accepted == 0) break;
+        enqueued += accepted;
+      }
+      auto out = Drain(core);
+      total_segs_sent += out.size();
+      t = core.GetFlow(fidO);
+      const uint32_t inflight = t.snd_nxt - t.snd_una;
+      if (inflight > 0) {
+        auto ack = PeerFrame(our_ip, tgt, ephO, 0x88000001u, t.snd_una + inflight, 0x10, 65535);
+        core.IngestRxFrame(ack.data(), ack.size());
+        total_acked += inflight;
+      }
+    }
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    double mb_sec = (total_acked / (1024.0 * 1024.0)) / (elapsed_ms / 1000.0);
+    double kpps = (total_segs_sent / 1000.0) / (elapsed_ms / 1000.0);
+    std::printf("[BENCHMARK] Sliding Window Throughput: %zu bytes in %.2f ms (%.2f MB/s, %.1f kpps)\n",
+                total_acked, elapsed_ms, mb_sec, kpps);
+    CHECK(total_acked == target_bytes, "Transferred 1 MB via sliding window");
+    Drain(core);
   }
 
   if (g_fails == 0) {
