@@ -613,6 +613,10 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     flow->sndbuf_head = 0;
     flow->rto_deadline_ns = 0;
     flow->cur_rto_ms = 0;
+    flow->rx_oo_queue.clear();
+    flow->rx_oo_bytes = 0;
+    flow->pending_fin_seq.reset();
+    flow->sack_blocks.clear();
     stats_shard_[flow_shard].peer_rst_count.fetch_add(1, std::memory_order_relaxed);
     PushCompletion(flow->flow_id, flow->state, false, "peer_rst");
     return finish(1);
@@ -671,35 +675,197 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
       SendAckNow(*flow);
       return finish(1);
     }
-    if (flow->rcv_nxt != 0 && seq != flow->rcv_nxt) {
-      stats_shard_[flow_shard].out_of_order_rx_count.fetch_add(1, std::memory_order_relaxed);
+
+    const bool state_ok_for_rx = (flow->state == TcpDpState::kEstablished ||
+                                  flow->state == TcpDpState::kSynAckRcvd ||
+                                  flow->state == TcpDpState::kFinWait);
+    if (!state_ok_for_rx) {
       stats_shard_[flow_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
-            thread_local uint8_t tls_scratch_buf[2048];
-      size_t dup_ack_len = BuildSeg(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
-      QueuePacket(*flow, tls_scratch_buf, dup_ack_len, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
       return finish(1);
     }
+
+    // 1. Old duplicate segment: payload completely before or up to rcv_nxt.
+    if (SeqLeq(AdvanceSeq(seq, payload_len), flow->rcv_nxt)) {
+      stats_shard_[flow_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
+      SendAckNow(*flow);
+      return finish(1);
+    }
+
+    // 2. Out-of-order future segment: seq > rcv_nxt (a hole precedes it).
+    if (SeqGt(seq, flow->rcv_nxt)) {
+      stats_shard_[flow_shard].out_of_order_rx_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[flow_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
+      std::vector<uint8_t> p = ExtractIpv4TcpPayload(frame, frame_len);
+      if (p.size() > payload_len) {
+        p.resize(payload_len);
+      }
+      const size_t p_size = p.size();
+      bool queued = false;
+
+      // Check if this segment is completely covered by an existing segment in queue
+      bool covered = false;
+      for (const auto& kv : flow->rx_oo_queue) {
+        const uint32_t s_seq = kv.first;
+        const uint32_t s_end = AdvanceSeq(s_seq, static_cast<uint32_t>(kv.second.size()));
+        if (SeqLeq(s_seq, seq) && SeqLeq(AdvanceSeq(seq, static_cast<uint32_t>(p_size)), s_end)) {
+          covered = true;
+          break;
+        }
+      }
+
+      if (!covered && p_size > 0 &&
+          flow->rx_oo_queue.size() < kMaxRxOoSegments &&
+          (flow->rx_oo_bytes + p_size <= kMaxRxOoBytes)) {
+        // If this new segment completely covers existing smaller segments, purge them
+        for (auto q_it = flow->rx_oo_queue.begin(); q_it != flow->rx_oo_queue.end(); ) {
+          const uint32_t s_seq = q_it->first;
+          const uint32_t s_end = AdvanceSeq(s_seq, static_cast<uint32_t>(q_it->second.size()));
+          if (SeqLeq(seq, s_seq) && SeqLeq(s_end, AdvanceSeq(seq, static_cast<uint32_t>(p_size)))) {
+            flow->rx_oo_bytes = (flow->rx_oo_bytes >= q_it->second.size()) ?
+                                (flow->rx_oo_bytes - q_it->second.size()) : 0;
+            q_it = flow->rx_oo_queue.erase(q_it);
+          } else {
+            ++q_it;
+          }
+        }
+
+        auto it = flow->rx_oo_queue.find(seq);
+        if (it == flow->rx_oo_queue.end()) {
+          flow->rx_oo_bytes += p_size;
+          flow->rx_oo_queue.emplace(seq, std::move(p));
+          queued = true;
+        } else if (p_size > it->second.size()) {
+          flow->rx_oo_bytes = flow->rx_oo_bytes + p_size - it->second.size();
+          it->second = std::move(p);
+          queued = true;
+        }
+      }
+
+      if ((flags & kTcpFlagFin) != 0 && (queued || covered)) {
+        flow->pending_fin_seq = AdvanceSeq(seq, static_cast<uint32_t>(p_size));
+      }
+
+      UpdateFlowSackBlocks(*flow, seq, static_cast<uint32_t>(p_size));
+      SendAckNow(*flow);
+      return finish(1);
+    }
+
+    // 3. Partial overlap: starts before rcv_nxt, ends after rcv_nxt.
+    // Trim the already acknowledged prefix so seq == flow->rcv_nxt.
+    uint32_t trim_offset = 0;
+    if (SeqLt(seq, flow->rcv_nxt)) {
+      trim_offset = flow->rcv_nxt - seq;
+      seq = flow->rcv_nxt;
+      payload_len -= static_cast<uint16_t>(trim_offset);
+    }
+
+    // 4. In-order segment: seq == flow->rcv_nxt.
+    std::vector<uint8_t> in_order_payload = ExtractIpv4TcpPayload(frame, frame_len);
+    if (trim_offset > 0) {
+      if (trim_offset < in_order_payload.size()) {
+        in_order_payload.erase(in_order_payload.begin(), in_order_payload.begin() + trim_offset);
+      } else {
+        in_order_payload.clear();
+      }
+    }
+    if (in_order_payload.size() > payload_len) {
+      in_order_payload.resize(payload_len);
+    }
     flow->rcv_nxt = AdvanceSeq(seq, payload_len);
-    // RFC 7323: record the peer's TSval (this in-order segment covers rcv_nxt) so our
-    // next segment echoes it back in TSecr.
     if (flow->ts_ok && opt.has_ts) flow->ts_recent = opt.ts_val;
     stats_shard_[flow_shard].rx_data_bytes.fetch_add(static_cast<uint64_t>(payload_len), std::memory_order_relaxed);
     {
       std::lock_guard<SpinLock> qguard(rx_payload_mu_);
-      rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, ExtractIpv4TcpPayload(frame, frame_len)});
+      rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, std::move(in_order_payload)});
     }
-    // Acknowledge (immediately, or delayed when the opt-in delayed-ACK is enabled).
-    OnDataReceivedAck(*flow, DefaultNowNs(), /*force_now=*/false);
+
+    // 5. Drain consecutive / overlapping segments from rx_oo_queue.
+    bool drained_any = false;
+    while (!flow->rx_oo_queue.empty()) {
+      auto it = flow->rx_oo_queue.find(flow->rcv_nxt);
+      if (it == flow->rx_oo_queue.end()) {
+        bool found_overlap = false;
+        for (auto o_it = flow->rx_oo_queue.begin(); o_it != flow->rx_oo_queue.end(); ) {
+          const uint32_t s_seq = o_it->first;
+          const size_t s_len = o_it->second.size();
+          const uint32_t s_end = AdvanceSeq(s_seq, static_cast<uint32_t>(s_len));
+          if (SeqLeq(s_end, flow->rcv_nxt)) {
+            flow->rx_oo_bytes = (flow->rx_oo_bytes >= s_len) ? (flow->rx_oo_bytes - s_len) : 0;
+            o_it = flow->rx_oo_queue.erase(o_it);
+            found_overlap = true; // keeps outer drain loop active to check next segments
+          } else if (SeqLt(s_seq, flow->rcv_nxt) && SeqGt(s_end, flow->rcv_nxt)) {
+            const size_t offset = static_cast<size_t>(flow->rcv_nxt - s_seq);
+            const size_t usable_len = s_len - offset;
+            flow->rcv_nxt = AdvanceSeq(flow->rcv_nxt, static_cast<uint32_t>(usable_len));
+            stats_shard_[flow_shard].rx_data_bytes.fetch_add(static_cast<uint64_t>(usable_len), std::memory_order_relaxed);
+            {
+              std::lock_guard<SpinLock> qguard(rx_payload_mu_);
+              rx_payloads_.push_back(TcpDpRxPayload{
+                  flow->flow_id,
+                  std::vector<uint8_t>(o_it->second.begin() + offset, o_it->second.end())});
+            }
+            flow->rx_oo_bytes = (flow->rx_oo_bytes >= s_len) ? (flow->rx_oo_bytes - s_len) : 0;
+            flow->rx_oo_queue.erase(o_it);
+            found_overlap = true;
+            drained_any = true;
+            break;
+          } else {
+            ++o_it;
+          }
+        }
+        if (!found_overlap) {
+          break;
+        }
+        continue;
+      }
+
+      const size_t seg_len = it->second.size();
+      flow->rcv_nxt = AdvanceSeq(flow->rcv_nxt, static_cast<uint32_t>(seg_len));
+      stats_shard_[flow_shard].rx_data_bytes.fetch_add(static_cast<uint64_t>(seg_len), std::memory_order_relaxed);
+      {
+        std::lock_guard<SpinLock> qguard(rx_payload_mu_);
+        rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, std::move(it->second)});
+      }
+      flow->rx_oo_bytes = (flow->rx_oo_bytes >= seg_len) ? (flow->rx_oo_bytes - seg_len) : 0;
+      flow->rx_oo_queue.erase(it);
+      drained_any = true;
+    }
+
+    UpdateFlowSackBlocks(*flow, 0, 0);
+
+    if (flow->pending_fin_seq.has_value() && flow->rcv_nxt == *flow->pending_fin_seq) {
+      flow->pending_fin_seq.reset();
+      flow->rcv_nxt = AdvanceSeq(flow->rcv_nxt, 1U);
+      SendAckNow(*flow);
+      SetFlowState(*flow, TcpDpState::kTimeWait);
+      stats_shard_[flow_shard].peer_fin_count.fetch_add(1, std::memory_order_relaxed);
+      PushCompletion(flow->flow_id, flow->state, true, "peer_fin");
+      return finish(1);
+    }
+
+    if ((flags & kTcpFlagFin) == 0) {
+      // RFC 5681: An acknowledgment SHOULD be generated immediately when an incoming segment fills a gap.
+      OnDataReceivedAck(*flow, DefaultNowNs(), /*force_now=*/drained_any);
+    }
   }
 
-  if ((flags & kTcpFlagFin) != 0) {
-    flow->rcv_nxt = AdvanceSeq(flow->rcv_nxt, 1U);
-    if (flow->ts_ok && opt.has_ts) flow->ts_recent = opt.ts_val;
-    // Force an immediate ACK on FIN (also flushes any withheld delayed ACK).
-    SendAckNow(*flow);
-    SetFlowState(*flow, TcpDpState::kTimeWait);
-    stats_shard_[flow_shard].peer_fin_count.fetch_add(1, std::memory_order_relaxed);
-    PushCompletion(flow->flow_id, flow->state, true, "peer_fin");
+  if ((flags & kTcpFlagFin) != 0 && flow->state != TcpDpState::kTimeWait && flow->state != TcpDpState::kClosed) {
+    const uint32_t fin_seq = AdvanceSeq(seq, payload_len);
+    if (SeqGt(fin_seq, flow->rcv_nxt)) {
+      flow->pending_fin_seq = fin_seq;
+      stats_shard_[flow_shard].out_of_order_rx_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[flow_shard].unexpected_rx.fetch_add(1, std::memory_order_relaxed);
+      SendAckNow(*flow);
+      return finish(1);
+    }
+    if (fin_seq == flow->rcv_nxt) {
+      flow->rcv_nxt = AdvanceSeq(flow->rcv_nxt, 1U);
+      if (flow->ts_ok && opt.has_ts) flow->ts_recent = opt.ts_val;
+      SendAckNow(*flow);
+      SetFlowState(*flow, TcpDpState::kTimeWait);
+      stats_shard_[flow_shard].peer_fin_count.fetch_add(1, std::memory_order_relaxed);
+      PushCompletion(flow->flow_id, flow->state, true, "peer_fin");
+    }
   }
   (void)ttl;
   return finish(1);
@@ -1374,7 +1540,9 @@ size_t TcpDataplaneCore::BuildPacketOpt(
   std::memcpy(tcp + 8, &ack_be, sizeof(ack_be));
   tcp[12] = static_cast<uint8_t>((tcp_len / 4) << 4);  // data offset in 32-bit words
   tcp[13] = flags;
-  const uint16_t win_be = htons(flow.local_window > 0 ? flow.local_window : config_.local_window);
+  const uint16_t base_win = flow.local_window > 0 ? flow.local_window : config_.local_window;
+  const uint16_t eff_win = (base_win > flow.rx_oo_bytes) ? static_cast<uint16_t>(base_win - flow.rx_oo_bytes) : 0;
+  const uint16_t win_be = htons(eff_win);
   std::memcpy(tcp + 14, &win_be, sizeof(win_be));
   if (opts_len > 0) {
     std::memcpy(tcp + 20, opts, opts_len);
@@ -1857,9 +2025,124 @@ void TcpDataplaneCore::SackRecoveryTransmit(FlowEntry& flow, uint64_t now_ns) {
   }
 }
 
+void TcpDataplaneCore::UpdateFlowSackBlocks(FlowEntry& flow, uint32_t newly_arrived_seq, uint32_t newly_arrived_len) {
+  if (!flow.sack_permitted || flow.rx_oo_queue.empty()) {
+    flow.sack_blocks.clear();
+    return;
+  }
+
+  struct Block {
+    uint32_t left;
+    uint32_t right;
+  };
+
+  std::vector<Block> raw;
+  raw.reserve(flow.rx_oo_queue.size());
+  for (const auto& kv : flow.rx_oo_queue) {
+    if (kv.second.empty()) continue;
+    raw.push_back(Block{kv.first, AdvanceSeq(kv.first, static_cast<uint32_t>(kv.second.size()))});
+  }
+
+  if (raw.empty()) {
+    flow.sack_blocks.clear();
+    return;
+  }
+
+  // Sort blocks in TCP sequence space order starting from flow.rcv_nxt.
+  // Using uint32_t distance from rcv_nxt handles 32-bit wrap-around correctly.
+  const uint32_t rcv = flow.rcv_nxt;
+  std::sort(raw.begin(), raw.end(), [rcv](const Block& a, const Block& b) {
+    return static_cast<uint32_t>(a.left - rcv) < static_cast<uint32_t>(b.left - rcv);
+  });
+
+  std::vector<TcpDpSackBlock> merged;
+  for (const auto& b : raw) {
+    if (merged.empty()) {
+      merged.push_back(TcpDpSackBlock{b.left, b.right});
+    } else {
+      auto& prev = merged.back();
+      const uint32_t prev_r_offset = static_cast<uint32_t>(prev.right - rcv);
+      const uint32_t b_l_offset = static_cast<uint32_t>(b.left - rcv);
+      const uint32_t b_r_offset = static_cast<uint32_t>(b.right - rcv);
+      if (b_l_offset <= prev_r_offset) {
+        if (b_r_offset > prev_r_offset) {
+          prev.right = b.right;
+        }
+      } else {
+        merged.push_back(TcpDpSackBlock{b.left, b.right});
+      }
+    }
+  }
+
+  int target_idx = -1;
+  if (newly_arrived_len > 0) {
+    const uint32_t arr_end = AdvanceSeq(newly_arrived_seq, newly_arrived_len);
+    const uint32_t arr_l_off = static_cast<uint32_t>(newly_arrived_seq - rcv);
+    const uint32_t arr_r_off = static_cast<uint32_t>(arr_end - rcv);
+    for (size_t i = 0; i < merged.size(); ++i) {
+      const uint32_t m_l_off = static_cast<uint32_t>(merged[i].left - rcv);
+      const uint32_t m_r_off = static_cast<uint32_t>(merged[i].right - rcv);
+      if (m_l_off <= arr_l_off && arr_r_off <= m_r_off) {
+        target_idx = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+
+  const size_t max_blocks = flow.ts_ok ? 3 : 4;
+  flow.sack_blocks.clear();
+  if (target_idx >= 0) {
+    flow.sack_blocks.push_back(merged[static_cast<size_t>(target_idx)]);
+  }
+  for (size_t i = 0; i < merged.size(); ++i) {
+    if (static_cast<int>(i) == target_idx) continue;
+    if (flow.sack_blocks.size() >= max_blocks) break;
+    flow.sack_blocks.push_back(merged[i]);
+  }
+}
+
+size_t TcpDataplaneCore::BuildAckOptions(const FlowEntry& flow, uint8_t* out) const {
+  if (!out) return 0;
+  size_t n = 0;
+  if (flow.ts_ok) {
+    n += BuildSegmentOptions(flow, out);
+  }
+  if (flow.sack_permitted && !flow.sack_blocks.empty()) {
+    const size_t max_blocks = flow.ts_ok ? 3 : 4;
+    const size_t num_blocks = std::min(flow.sack_blocks.size(), max_blocks);
+    const size_t needed = 2 + 2 + num_blocks * 8;
+    if (num_blocks > 0 && n + needed <= 40) {
+      out[n++] = kOptNop;
+      out[n++] = kOptNop;
+      out[n++] = kOptSack;
+      out[n++] = static_cast<uint8_t>(2 + num_blocks * 8);
+      for (size_t b = 0; b < num_blocks; ++b) {
+        const uint32_t left = flow.sack_blocks[b].left;
+        const uint32_t right = flow.sack_blocks[b].right;
+        out[n++] = static_cast<uint8_t>(left >> 24);
+        out[n++] = static_cast<uint8_t>(left >> 16);
+        out[n++] = static_cast<uint8_t>(left >> 8);
+        out[n++] = static_cast<uint8_t>(left & 0xFF);
+        out[n++] = static_cast<uint8_t>(right >> 24);
+        out[n++] = static_cast<uint8_t>(right >> 16);
+        out[n++] = static_cast<uint8_t>(right >> 8);
+        out[n++] = static_cast<uint8_t>(right & 0xFF);
+      }
+    }
+  }
+  return n;
+}
+
 void TcpDataplaneCore::SendAckNow(FlowEntry& flow) {
+  uint8_t opts[40];
+  const size_t opts_len = BuildAckOptions(flow, opts);
   thread_local uint8_t scratch[65536];
-  const size_t len = BuildSeg(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0, scratch);
+  size_t len = 0;
+  if (opts_len > 0) {
+    len = BuildPacketOpt(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0, opts, opts_len, scratch);
+  } else {
+    len = BuildPacket(flow, flow.snd_nxt, flow.rcv_nxt, kTcpFlagAck, nullptr, 0, scratch);
+  }
   (void)EnqueueTxPacketBytes(scratch, len, FlowLockShardForFlowId(flow.flow_id));
   flow.pending_ack_segs = 0;
   flow.delack_deadline_ns = 0;  // disarm (stale generation ignored on fire)
@@ -2135,6 +2418,10 @@ void TcpDataplaneCore::CloseTimedOutFlow(FlowEntry& flow, TcpDpState terminal_st
   flow.sndbuf_head = 0;
   flow.rto_deadline_ns = 0;
   flow.cur_rto_ms = 0;
+  flow.rx_oo_queue.clear();
+  flow.rx_oo_bytes = 0;
+  flow.pending_fin_seq.reset();
+  flow.sack_blocks.clear();
   stats_shard_[stat_shard].timeout_close_count.fetch_add(1, std::memory_order_relaxed);
   if (event != nullptr) {
     if (std::strcmp(event, "connect_timeout") == 0) {

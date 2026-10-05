@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -281,6 +282,10 @@ class TcpDataplaneCore {
     // backing storage here turns the per-segment malloc/free churn into zero
     // heap traffic. Capacity is bounded by kSegBufPoolCap.
     std::vector<std::vector<uint8_t>> seg_buf_pool;
+    // Out-of-order receive queue for TCP segment reassembly (seq -> payload).
+    std::map<uint32_t, std::vector<uint8_t>> rx_oo_queue;
+    size_t rx_oo_bytes = 0;
+    std::optional<uint32_t> pending_fin_seq;
   };
 
   enum class TimerKind : uint8_t {
@@ -463,7 +468,11 @@ class TcpDataplaneCore {
   // hands back a cleared-capacity buffer; RecycleSegBuf returns a retired one.
   std::vector<uint8_t> AcquireSegBuf(FlowEntry& flow);
   void RecycleSegBuf(FlowEntry& flow, std::vector<uint8_t>&& buf);
-  // Delayed-ACK: account an in-order data segment; send an ACK now or arm the timer.
+  static constexpr size_t kMaxRxOoSegments = 32;
+  static constexpr size_t kMaxRxOoBytes = 64 * 1024;
+
+  size_t BuildAckOptions(const FlowEntry& flow, uint8_t* out) const;
+  void UpdateFlowSackBlocks(FlowEntry& flow, uint32_t newly_arrived_seq, uint32_t newly_arrived_len);
   void OnDataReceivedAck(FlowEntry& flow, uint64_t now_ns, bool force_now);
   void SendAckNow(FlowEntry& flow);
   uint32_t EffectiveMss(const FlowEntry& flow) const;
