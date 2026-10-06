@@ -72,8 +72,10 @@ struct TcpDpFlowSnapshot {
   uint8_t snd_wscale = 0;
   uint8_t rcv_wscale = 0;
   bool sack_permitted = false;
+  bool sack_recovery = false;
   uint32_t cwnd = 0;
   uint32_t ssthresh = 0;
+  uint32_t high_rxt = 0;
   uint32_t srtt_ms = 0;
   bool zero_window_probing = false;
   uint16_t mss = 0;
@@ -173,6 +175,10 @@ class TcpDataplaneCore {
   std::vector<uint8_t> BuildNativeTlsClientHello(const std::string& sni) const;
   bool ParseNativeTlsServerHello(const uint8_t* payload, size_t len) const;
 
+  // RFC 6675 Scoreboard & Pipe testing introspection
+  bool TestInspectIsLost(uint64_t flow_id, uint32_t seg_seq) const;
+  uint32_t TestInspectComputePipe(uint64_t flow_id) const;
+
  private:
   struct FlowKey {
     uint32_t src_ip = 0;
@@ -246,6 +252,8 @@ class TcpDataplaneCore {
     bool sack_recovery = false;         // in an RFC6675 recovery episode
     uint32_t recovery_point = 0;        // snd_nxt captured at recovery entry; exit when acked
     uint32_t high_rxt = 0;              // highest seq (re)transmitted during recovery
+    uint32_t high_sack = 0;             // highest seq covered by any received SACK block
+    uint32_t rescue_rxt = 0;            // highest seq retransmitted via rescue retransmission
     // RFC 7323 timestamps / PAWS (only when negotiated on both sides).
     bool ts_ok = false;                 // TS negotiated (we offered + peer echoed on SYN-ACK)
     uint32_t ts_recent = 0;             // most recent in-order peer TSval (echoed back)

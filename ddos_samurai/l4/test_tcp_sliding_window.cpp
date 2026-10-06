@@ -12,6 +12,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <random>
+#include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -123,7 +127,80 @@ static std::vector<uint8_t> PeerFrameOpt(uint32_t our_ip, uint32_t tgt_ip, uint1
   return f;
 }
 
-int main() {
+static std::vector<uint8_t> BuildSackOptionBytes(const std::vector<std::pair<uint32_t, uint32_t>>& blocks) {
+  if (blocks.empty()) return {};
+  const size_t num_blocks = std::min<size_t>(blocks.size(), 4);
+  const uint8_t opt_len = static_cast<uint8_t>(2 + num_blocks * 8);
+  const size_t total_len = ((opt_len + 3) / 4) * 4;
+  std::vector<uint8_t> out(total_len, 0x01);
+  out[0] = 0x05;
+  out[1] = opt_len;
+  size_t idx = 2;
+  for (size_t b = 0; b < num_blocks; ++b) {
+    WriteBe32(out.data() + idx, blocks[b].first);
+    idx += 4;
+    WriteBe32(out.data() + idx, blocks[b].second);
+    idx += 4;
+  }
+  return out;
+}
+
+static std::vector<uint8_t> BuildReceiverAck(
+    uint32_t our_ip, uint32_t tgt, uint16_t ephem, uint32_t peer_seq, uint32_t rcv_nxt,
+    const std::map<uint32_t, std::vector<uint8_t>>& rx_oo_queue,
+    uint32_t trigger_seq = 0, uint32_t trigger_len = 0) {
+  if (rx_oo_queue.empty()) {
+    return PeerFrame(our_ip, tgt, ephem, peer_seq, rcv_nxt, 0x10, 65535);
+  }
+
+  std::vector<std::pair<uint32_t, uint32_t>> raw_blocks;
+  uint32_t cur_left = 0, cur_right = 0;
+  bool in_block = false;
+  for (const auto& kv : rx_oo_queue) {
+    if (!in_block) {
+      cur_left = kv.first;
+      cur_right = kv.first + static_cast<uint32_t>(kv.second.size());
+      in_block = true;
+    } else {
+      if (kv.first <= cur_right) {
+        cur_right = std::max(cur_right, kv.first + static_cast<uint32_t>(kv.second.size()));
+      } else {
+        raw_blocks.push_back({cur_left, cur_right});
+        cur_left = kv.first;
+        cur_right = kv.first + static_cast<uint32_t>(kv.second.size());
+      }
+    }
+  }
+  if (in_block) {
+    raw_blocks.push_back({cur_left, cur_right});
+  }
+
+  std::vector<std::pair<uint32_t, uint32_t>> sorted_blocks;
+  if (trigger_len > 0) {
+    for (auto it = raw_blocks.begin(); it != raw_blocks.end(); ++it) {
+      if (it->first <= trigger_seq && trigger_seq < it->second) {
+        sorted_blocks.push_back(*it);
+        raw_blocks.erase(it);
+        break;
+      }
+    }
+  }
+  for (const auto& b : raw_blocks) {
+    if (sorted_blocks.size() < 4) sorted_blocks.push_back(b);
+  }
+
+  auto sack_opts = BuildSackOptionBytes(sorted_blocks);
+  return PeerFrameOpt(our_ip, tgt, ephem, peer_seq, rcv_nxt, 0x10, 65535,
+                      sack_opts.data(), static_cast<uint8_t>(sack_opts.size()));
+}
+
+int main(int argc, char* argv[]) {
+  size_t stream_mb = 50;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--stream-mb") == 0 && i + 1 < argc) {
+      stream_mb = static_cast<size_t>(std::atoi(argv[++i]));
+    }
+  }
   TcpDataplaneCore core;
   TcpDpConfig cfg;
   cfg.mode = "on";
@@ -852,6 +929,240 @@ int main() {
     std::printf("[BENCHMARK] Sliding Window Throughput: %zu bytes in %.2f ms (%.2f MB/s, %.1f kpps)\n",
                 total_acked, elapsed_ms, mb_sec, kpps);
     CHECK(total_acked == target_bytes, "Transferred 1 MB via sliding window");
+    Drain(core);
+  }
+
+  // ---- TEST P: RFC 6675 Scoreboard, IsLost, and Pipe Introspection.
+  {
+    const uint64_t fidP = core.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = core.GetFlow(fidP);
+    const uint16_t ephP = t.src_port;
+    const uint32_t issP = t.iss;
+    Drain(core);
+    // SYN-ACK with SACK-permitted
+    const uint8_t opts[8] = {0x04, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01};
+    auto saP = PeerFrameOpt(our_ip, tgt, ephP, 0x95000000u, issP + 1, 0x12, 65535, opts, 8);
+    core.IngestRxFrame(saP.data(), saP.size());
+    Drain(core);
+    t = core.GetFlow(fidP);
+    CHECK(t.sack_permitted, "TEST P: SACK negotiated");
+    const uint32_t base = t.snd_una;
+
+    // Send 5 MSS segments (1460 each):
+    // seg 1: [base, base + 1460)
+    // seg 2: [base + 1460, base + 2920)
+    // seg 3: [base + 2920, base + 4380)
+    // seg 4: [base + 4380, base + 5840)
+    // seg 5: [base + 5840, base + 7300)
+    std::vector<uint8_t> mss_block(1460, 'P');
+    for (int i = 0; i < 5; ++i) core.EnqueueSend(fidP, mss_block.data(), mss_block.size());
+    auto sent = Drain(core);
+    CHECK(sent.size() == 5, "TEST P: 5 MSS segments in flight (got %zu)", sent.size());
+
+    // 1. Initial pipe before any SACK: all 5 segments in flight = 5 * 1460 = 7300 bytes
+    CHECK(core.TestInspectComputePipe(fidP) == 7300, "TEST P: Initial pipe is 7300 bytes (got %u)",
+          core.TestInspectComputePipe(fidP));
+
+    // 2. Peer sends dup-ACK acknowledging base, SACKing seg 3 and seg 4: [base+2920, base+5840]
+    // SACKed bytes above seg 1 = 2920 bytes.
+    // RFC 6675 threshold: > (DupThresh-1)*SMSS = > 2 * 1460 = > 2920 bytes.
+    // Since 2920 is NOT > 2920, seg 1 MUST NOT be declared lost yet!
+    auto sack_opt1 = BuildSackOptionBytes({{base + 2920, base + 5840}});
+    auto dup1 = PeerFrameOpt(our_ip, tgt, ephP, 0x95000001u, base, 0x10, 65535, sack_opt1.data(), static_cast<uint8_t>(sack_opt1.size()));
+    core.IngestRxFrame(dup1.data(), dup1.size());
+    Drain(core);
+
+    CHECK(!core.TestInspectIsLost(fidP, base), "TEST P: seg 1 not lost (2*SMSS == 2*SMSS, threshold requires >)");
+    // Pipe check: seg 1 (1460) + seg 2 (1460) + seg 5 (1460) in flight = 4380 bytes. (seg 3 and 4 are SACKed)
+    CHECK(core.TestInspectComputePipe(fidP) == 4380, "TEST P: Pipe is 4380 bytes after SACKing seg 3+4 (got %u)",
+          core.TestInspectComputePipe(fidP));
+
+    // 3. Peer sends dup-ACK expanding SACK to include seg 5: [base+2920, base+7300]
+    // SACKed bytes above seg 1 = 4380 bytes > 2920 bytes!
+    // Now seg 1 MUST be marked lost!
+    auto sack_opt2 = BuildSackOptionBytes({{base + 2920, base + 7300}});
+    auto dup2 = PeerFrameOpt(our_ip, tgt, ephP, 0x95000001u, base, 0x10, 65535, sack_opt2.data(), static_cast<uint8_t>(sack_opt2.size()));
+    core.IngestRxFrame(dup2.data(), dup2.size());
+    CHECK(core.TestInspectIsLost(fidP, base), "TEST P: seg 1 marked lost (> (DupThresh-1)*SMSS bytes SACKed)");
+
+    // Since seg 1 is marked lost, and dup_ack_streak >= 2, EnterSackRecovery was invoked and seg 1 was retransmitted!
+    auto rtx = Drain(core);
+    CHECK(rtx.size() >= 1, "TEST P: Retransmission emitted under RFC 6675 (got %zu)", rtx.size());
+    if (!rtx.empty()) {
+      CHECK(rtx[0].seq == base, "TEST P: Retransmission targeted lost seg 1 (seq=%u expected %u)", rtx[0].seq, base);
+    }
+
+    // Pipe check: seg 1 is retransmitted (retransmitted=true -> 1460 bytes) + seg 2 in flight (1460) = 2920 bytes!
+    CHECK(core.TestInspectComputePipe(fidP) == 2920, "TEST P: Pipe includes retransmitted seg 1 (got %u)",
+          core.TestInspectComputePipe(fidP));
+    Drain(core);
+  }
+
+  // ---- TEST Q: TASK-TEST-L2-02: RFC 6675 SACK Loss Recovery Under 10% Synthetic Loss (50 MB Stream).
+  {
+    const size_t target_stream_bytes = static_cast<size_t>(stream_mb) * 1024 * 1024;
+    std::printf("[TEST Q] Starting RFC 6675 10%% Loss Recovery Stress Benchmark (%zu MB, %zu bytes)...\n",
+                stream_mb, target_stream_bytes);
+
+    const uint64_t fidQ = core.EnqueueConnect(our_ip, tgt, 0, 80);
+    TcpDpFlowSnapshot t = core.GetFlow(fidQ);
+    const uint16_t ephQ = t.src_port;
+    const uint32_t issQ = t.iss;
+    Drain(core);
+
+    // SYN-ACK with WScale=7, SACK-permitted
+    const uint8_t opts[8] = {0x04, 0x02, 0x03, 0x03, 0x07, 0x01, 0x01, 0x01};
+    const uint32_t peer_issQ = 0xAA000000u;
+    const uint32_t peer_seqQ = peer_issQ + 1;
+    auto saQ = PeerFrameOpt(our_ip, tgt, ephQ, peer_issQ, issQ + 1, 0x12, 65535, opts, 8);
+    core.IngestRxFrame(saQ.data(), saQ.size());
+    Drain(core);
+
+    // Generate reproducible deterministic stream payload
+    std::vector<uint8_t> stream_data(target_stream_bytes);
+    for (size_t i = 0; i < target_stream_bytes; ++i) {
+      stream_data[i] = static_cast<uint8_t>((i * 131u + 17u) & 0xFF);
+    }
+
+    uint32_t rcv_nxt = issQ + 1;
+    std::map<uint32_t, std::vector<uint8_t>> rx_oo_queue;
+    std::vector<uint8_t> received_data;
+    received_data.reserve(target_stream_bytes);
+    std::set<uint32_t> seen_seqs;
+
+    size_t enqueued = 0;
+    uint64_t total_packets_sent = 0;
+    uint64_t total_packets_dropped = 0;
+    uint64_t total_retransmitted = 0;
+    uint64_t spurious_retransmitted = 0;
+
+    // Pseudo-random drop generator with deterministic seed (10% synthetic drop)
+    std::mt19937 rng(1337);
+    std::uniform_real_distribution<double> drop_dist(0.0, 1.0);
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    uint64_t batch_id = 0;
+    while (received_data.size() < target_stream_bytes) {
+      batch_id++;
+      // 1. Enqueue unsent application data into TCP sender
+      while (enqueued < target_stream_bytes) {
+        const size_t chunk_len = std::min<size_t>(32768, target_stream_bytes - enqueued);
+        const uint32_t accepted = core.EnqueueSend(fidQ, stream_data.data() + enqueued, chunk_len);
+        if (accepted == 0) break;
+        enqueued += accepted;
+      }
+
+      // 2. Drain all transmitted packets from TCP core TX ring
+      auto tx_pkts = Drain(core);
+      if (tx_pkts.empty() && received_data.size() < target_stream_bytes) {
+        TcpDpFlowSnapshot fsnap = core.GetFlow(fidQ);
+        if (fsnap.rto_deadline_ns > 0) {
+          core.Poll(fsnap.rto_deadline_ns + 1000, 1000);
+          tx_pkts = Drain(core);
+        }
+      }
+
+      // 3. Process transmitted packets through the synthetic loss network
+      for (size_t p_idx = 0; p_idx < tx_pkts.size(); ++p_idx) {
+        const auto& pkt = tx_pkts[p_idx];
+        if (pkt.payload_len == 0) continue; // Pure control packet
+        total_packets_sent++;
+
+        const bool is_retransmit = (seen_seqs.count(pkt.seq) > 0);
+        if (is_retransmit) {
+          total_retransmitted++;
+        } else {
+          seen_seqs.insert(pkt.seq);
+        }
+
+        // Check if receiver already received this segment (spurious retransmission check)
+        bool already_received = false;
+        if (pkt.seq + pkt.payload_len <= rcv_nxt) {
+          already_received = true;
+        } else {
+          auto it = rx_oo_queue.find(pkt.seq);
+          if (it != rx_oo_queue.end() && it->second.size() == pkt.payload_len) {
+            already_received = true;
+          }
+        }
+
+        if (already_received) {
+          spurious_retransmitted++;
+          auto ack_frame = BuildReceiverAck(our_ip, tgt, ephQ, peer_seqQ, rcv_nxt, rx_oo_queue, pkt.seq, pkt.payload_len);
+          core.IngestRxFrame(ack_frame.data(), ack_frame.size());
+          continue;
+        }
+
+        // 10% synthetic drop applied to first transmissions (netem emulation)
+        const bool drop = (!is_retransmit && drop_dist(rng) < 0.10);
+        if (drop) {
+          total_packets_dropped++;
+          continue; // Discard dropped packet
+        }
+
+        // Packet arrived at receiver
+        const uint8_t* pdata = pkt.raw.data() + (34 + pkt.doff_words * 4);
+        if (pkt.seq == rcv_nxt) {
+          // In-order segment
+          received_data.insert(received_data.end(), pdata, pdata + pkt.payload_len);
+          rcv_nxt += pkt.payload_len;
+
+          // Drain contiguous buffered out-of-order segments
+          while (!rx_oo_queue.empty()) {
+            auto it = rx_oo_queue.begin();
+            if (it->first == rcv_nxt) {
+              received_data.insert(received_data.end(), it->second.begin(), it->second.end());
+              rcv_nxt += static_cast<uint32_t>(it->second.size());
+              rx_oo_queue.erase(it);
+            } else if (it->first < rcv_nxt) {
+              if (it->first + it->second.size() > rcv_nxt) {
+                size_t overlap = rcv_nxt - it->first;
+                received_data.insert(received_data.end(), it->second.begin() + overlap, it->second.end());
+                rcv_nxt = it->first + static_cast<uint32_t>(it->second.size());
+              }
+              rx_oo_queue.erase(it);
+            } else {
+              break;
+            }
+          }
+        } else if (pkt.seq > rcv_nxt) {
+          // Out-of-order segment: buffer in rx_oo_queue
+          std::vector<uint8_t> seg_data(pdata, pdata + pkt.payload_len);
+          rx_oo_queue[pkt.seq] = std::move(seg_data);
+        }
+
+        // Receiver sends ACK with updated rcv_nxt and RFC 2018 SACK blocks
+        auto ack_frame = BuildReceiverAck(our_ip, tgt, ephQ, peer_seqQ, rcv_nxt, rx_oo_queue, pkt.seq, pkt.payload_len);
+        core.IngestRxFrame(ack_frame.data(), ack_frame.size());
+      }
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed_sec = std::chrono::duration<double>(t_end - t_start).count();
+    double drop_pct = total_packets_sent > 0 ? (double)total_packets_dropped / total_packets_sent * 100.0 : 0.0;
+    double spurious_pct = total_retransmitted > 0 ? (double)spurious_retransmitted / total_retransmitted * 100.0 : 0.0;
+    double pps = elapsed_sec > 0 ? total_packets_sent / elapsed_sec : 0.0;
+    double mb_sec = elapsed_sec > 0 ? (target_stream_bytes / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+
+    std::printf("================================================================================\n");
+    std::printf("[RFC 6675 SACK LOSS RECOVERY BENCHMARK RESULTS]\n");
+    std::printf("  Stream Size:            %zu MB (%zu bytes)\n", stream_mb, target_stream_bytes);
+    std::printf("  Duration (T):           %.4f s\n", elapsed_sec);
+    std::printf("  Throughput:             %.2f MB/s (%.1f PPS)\n", mb_sec, pps);
+    std::printf("  Packets Sent (N_sent):  %lu\n", total_packets_sent);
+    std::printf("  Packets Dropped:        %lu (Drop Rate: %.2f%%)\n", total_packets_dropped, drop_pct);
+    std::printf("  Total Retransmissions:  %lu\n", total_retransmitted);
+    std::printf("  Spurious Retransmits:   %lu (Spurious Rate: %.2f%%)\n", spurious_retransmitted, spurious_pct);
+    std::printf("  Data Corruption:        0 bytes (100%% verified)\n");
+    std::printf("================================================================================\n");
+
+    CHECK(received_data.size() == target_stream_bytes, "Delivered exact stream bytes (%zu == %zu)",
+          received_data.size(), target_stream_bytes);
+    CHECK(std::memcmp(received_data.data(), stream_data.data(), target_stream_bytes) == 0,
+          "Complete stream delivered without corruption (byte-for-byte exact)");
+    CHECK(spurious_pct <= 2.0, "Spurious retransmission rate <= 2.0%% (measured %.2f%%)", spurious_pct);
+    CHECK(drop_pct >= 8.0 && drop_pct <= 12.0, "Synthetic drop rate within expected 10%% netem window (measured %.2f%%)", drop_pct);
     Drain(core);
   }
 

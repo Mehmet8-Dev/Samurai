@@ -954,6 +954,8 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
           // retransmitted flags + high_rxt so a fresh episode can re-arm later.
           flow->sack_recovery = false;
           flow->high_rxt = flow->snd_una;
+          flow->high_sack = 0;
+          flow->rescue_rxt = 0;
           for (auto& s : flow->unacked) s.retransmitted = false;
           stats_shard_[selected_shard].congestion_window_reductions.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1312,8 +1314,10 @@ TcpDpFlowSnapshot TcpDataplaneCore::GetFlow(uint64_t flow_id) const {
   out.snd_wscale = flow.snd_wscale;
   out.rcv_wscale = flow.rcv_wscale;
   out.sack_permitted = flow.sack_permitted;
+  out.sack_recovery = flow.sack_recovery;
   out.cwnd = flow.cwnd;
   out.ssthresh = flow.ssthresh;
+  out.high_rxt = flow.high_rxt;
   out.srtt_ms = flow.srtt_ms;
   out.zero_window_probing = flow.zero_window_probing;
   out.mss = flow.mss;
@@ -1348,8 +1352,10 @@ TcpDpFlowSnapshot TcpDataplaneCore::GetFlowLockless(uint64_t flow_id) const {
   out.snd_wscale = flow.snd_wscale;
   out.rcv_wscale = flow.rcv_wscale;
   out.sack_permitted = flow.sack_permitted;
+  out.sack_recovery = flow.sack_recovery;
   out.cwnd = flow.cwnd;
   out.ssthresh = flow.ssthresh;
+  out.high_rxt = flow.high_rxt;
   out.srtt_ms = flow.srtt_ms;
   out.zero_window_probing = flow.zero_window_probing;
   out.mss = flow.mss;
@@ -1360,6 +1366,26 @@ TcpDpFlowSnapshot TcpDataplaneCore::GetFlowLockless(uint64_t flow_id) const {
   out.last_activity_ns = flow.last_activity_ns;
   out.found = true;
   return out;
+}
+
+bool TcpDataplaneCore::TestInspectIsLost(uint64_t flow_id, uint32_t seg_seq) const {
+  const size_t shard = FlowLockShardForFlowId(flow_id);
+  std::lock_guard<SpinLock> guard(flow_shard_mu_[shard]);
+  auto it = flows_by_id_shard_[shard].find(flow_id);
+  if (it == flows_by_id_shard_[shard].end()) {
+    return false;
+  }
+  return IsLostSeg(it->second, seg_seq);
+}
+
+uint32_t TcpDataplaneCore::TestInspectComputePipe(uint64_t flow_id) const {
+  const size_t shard = FlowLockShardForFlowId(flow_id);
+  std::lock_guard<SpinLock> guard(flow_shard_mu_[shard]);
+  auto it = flows_by_id_shard_[shard].find(flow_id);
+  if (it == flows_by_id_shard_[shard].end()) {
+    return 0;
+  }
+  return ComputePipe(it->second);
 }
 
 bool TcpDataplaneCore::ParseIpv4TcpFrame(
@@ -1919,7 +1945,7 @@ void TcpDataplaneCore::RetransmitOldest(FlowEntry& flow) {
 }
 
 // RFC 6675 IsLost(seg): the segment is deemed lost when at least DupThresh SACKed
-// segments (or DupThresh*SMSS SACKed bytes) lie above it in the scoreboard.
+// segments (or more than (DupThresh-1)*SMSS SACKed bytes) lie above it in the scoreboard.
 bool TcpDataplaneCore::IsLostSeg(const FlowEntry& flow, uint32_t seg_seq) const {
   const uint32_t mss = EffectiveMss(flow);
   uint32_t sacked_segs_above = 0;
@@ -1931,7 +1957,7 @@ bool TcpDataplaneCore::IsLostSeg(const FlowEntry& flow, uint32_t seg_seq) const 
       sacked_bytes_above += SegSeqLen(s.flags, s.payload_len);
     }
   }
-  return sacked_segs_above >= kDupThresh || sacked_bytes_above >= kDupThresh * mss;
+  return sacked_segs_above >= kDupThresh || sacked_bytes_above > (kDupThresh - 1) * mss;
 }
 
 // RFC 6675 SetPipe: estimate of bytes in flight over the scoreboard.
@@ -1957,9 +1983,36 @@ void TcpDataplaneCore::EnterSackRecovery(FlowEntry& flow, uint64_t now_ns) {
   flow.cwnd = flow.ssthresh;               // RFC6675: cwnd = ssthresh, pipe governs
   flow.recovery_point = flow.snd_nxt;      // exit once this is cumulatively acked
   flow.high_rxt = flow.snd_una;
+  flow.rescue_rxt = flow.snd_una;          // RFC 6675 5.4.3: prevent premature rescue retransmission
   flow.sack_recovery = true;
   flow.in_fast_recovery = false;           // SACK path supersedes the NewReno fallback
   stats_shard_[stat_shard].congestion_window_reductions.fetch_add(1, std::memory_order_relaxed);
+
+  // RFC 6675 Section 5 (4.3): Retransmit the first data segment presumed dropped (HighACK + 1).
+  // Set both HighRxt and RescueRxt to the highest sequence number in the retransmitted segment.
+  if (!flow.unacked.empty()) {
+    OutstandingTx* first_seg = &flow.unacked.front();
+    for (auto& s : flow.unacked) {
+      if (!s.sacked) { first_seg = &s; break; }
+    }
+    const uint32_t seg_end = first_seg->seq + SegSeqLen(first_seg->flags, first_seg->payload_len);
+    if (!first_seg->retransmitted && SeqGt(seg_end, flow.high_rxt)) {
+      thread_local uint8_t scratch[65536];
+      first_seg->ack = flow.rcv_nxt;
+      const size_t pkt_len = BuildOutstandingPacket(flow, *first_seg, scratch);
+      (void)EnqueueTxPacketBytes(scratch, pkt_len, FlowLockShardForFlowId(flow.flow_id));
+      first_seg->xmit_count++;
+      first_seg->retransmitted = true;
+      flow.high_rxt = seg_end;
+      flow.rescue_rxt = seg_end;
+      stats_shard_[stat_shard].fast_retransmit_count.fetch_add(1, std::memory_order_relaxed);
+      stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      if (SeqGt(seg_end, flow.rescue_rxt)) flow.rescue_rxt = seg_end;
+    }
+  }
+
+  // RFC 6675 Section 5 (4.5): proceed to transmit additional segments if cwnd - pipe allows
   SackRecoveryTransmit(flow, now_ns);
 }
 
@@ -1972,10 +2025,12 @@ void TcpDataplaneCore::SackRecoveryTransmit(FlowEntry& flow, uint64_t now_ns) {
     if (pipe >= flow.cwnd) {
       break;  // pipe full
     }
-    // NextSeg rule 1: lowest-seq lost hole not yet retransmitted.
+    // NextSeg rule 1: lowest-seq lost hole not yet retransmitted (RFC 6675 1.a: S2 > HighRxt).
     OutstandingTx* hole = nullptr;
     for (auto& s : flow.unacked) {
       if (s.sacked || s.retransmitted) continue;
+      const uint32_t send_end = s.seq + SegSeqLen(s.flags, s.payload_len);
+      if (SeqLeq(send_end, flow.high_rxt)) continue;
       if (IsLostSeg(flow, s.seq)) { hole = &s; break; }
     }
     if (hole != nullptr) {
@@ -1986,6 +2041,7 @@ void TcpDataplaneCore::SackRecoveryTransmit(FlowEntry& flow, uint64_t now_ns) {
       hole->retransmitted = true;
       const uint32_t hole_end = hole->seq + SegSeqLen(hole->flags, hole->payload_len);
       if (SeqGt(hole_end, flow.high_rxt)) flow.high_rxt = hole_end;
+      if (SeqGt(hole_end, flow.rescue_rxt)) flow.rescue_rxt = hole_end;
       stats_shard_[stat_shard].fast_retransmit_count.fetch_add(1, std::memory_order_relaxed);
       stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
       continue;
@@ -2000,23 +2056,26 @@ void TcpDataplaneCore::SackRecoveryTransmit(FlowEntry& flow, uint64_t now_ns) {
         continue;
       }
     }
-    // NextSeg rule 3: rescue retransmit — the highest-seq unSACKed, unretransmitted
+    // NextSeg rule 3 (RFC 6675 Rule 4): rescue retransmit — the highest-seq unSACKed, unretransmitted
     // segment, to avoid an RTO when only tail segments remain outstanding.
-    OutstandingTx* rescue = nullptr;
-    for (auto& s : flow.unacked) {
-      if (s.sacked || s.retransmitted) continue;
-      rescue = &s;  // keep walking -> ends on the highest such segment
-    }
-    if (rescue != nullptr) {
-      rescue->ack = flow.rcv_nxt;
-      const size_t pkt_len = BuildOutstandingPacket(flow, *rescue, scratch);
-      (void)EnqueueTxPacketBytes(scratch, pkt_len, FlowLockShardForFlowId(flow.flow_id));
-      rescue->xmit_count++;
-      rescue->retransmitted = true;
-      const uint32_t r_end = rescue->seq + SegSeqLen(rescue->flags, rescue->payload_len);
-      if (SeqGt(r_end, flow.high_rxt)) flow.high_rxt = r_end;
-      stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
-      continue;
+    const bool can_rescue = (flow.rescue_rxt != 0 && SeqGt(flow.snd_una, flow.rescue_rxt));
+    if (can_rescue) {
+      OutstandingTx* rescue = nullptr;
+      for (auto& s : flow.unacked) {
+        if (s.sacked || s.retransmitted) continue;
+        rescue = &s;  // keep walking -> ends on the highest such segment
+      }
+      if (rescue != nullptr) {
+        rescue->ack = flow.rcv_nxt;
+        const size_t pkt_len = BuildOutstandingPacket(flow, *rescue, scratch);
+        (void)EnqueueTxPacketBytes(scratch, pkt_len, FlowLockShardForFlowId(flow.flow_id));
+        rescue->xmit_count++;
+        rescue->retransmitted = true;
+        flow.rescue_rxt = flow.recovery_point;
+        // RFC 6675: HighRxt MUST NOT be updated on rescue retransmission.
+        stats_shard_[stat_shard].retransmit_count.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
     }
     break;  // nothing left to (re)transmit
   }
@@ -2279,6 +2338,11 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpO
   // retransmit path skips it (holes only). SACK rides on dup-ACKs too, so apply it
   // before the cumulative-ACK branching.
   if (flow.sack_permitted && opt && opt->sack_block_count > 0) {
+    for (int b = 0; b < opt->sack_block_count; ++b) {
+      if (flow.high_sack == 0 || SeqGt(opt->sack_right[b], flow.high_sack)) {
+        flow.high_sack = opt->sack_right[b];
+      }
+    }
     for (auto& s : flow.unacked) {
       if (s.sacked) continue;
       const uint32_t s_end = s.seq + SegSeqLen(s.flags, s.payload_len);
@@ -2310,6 +2374,20 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpO
             EnterSackRecovery(flow, now_ns);
             flow.cur_rto_ms = 0;
             flow.rto_deadline_ns = now_ns + CurrentRtoNs(flow);
+          } else {
+            // Limited Transmit (RFC 5681 / RFC 6675 Section 5 step 3):
+            // Transmit up to 1 SMSS of unsent data if (cwnd - pipe) >= 1 SMSS.
+            const uint32_t pipe = ComputePipe(flow);
+            if (flow.cwnd > pipe && (flow.cwnd - pipe) >= mss && (flow.sndbuf.size() - flow.sndbuf_head) > 0) {
+              const uint32_t rwnd = flow.peer_window ? flow.peer_window : config_.local_window;
+              const uint32_t flight = flow.snd_nxt - flow.snd_una;
+              const uint32_t rwnd_room = rwnd > flight ? rwnd - flight : 0;
+              const uint32_t cwnd_room = flow.cwnd - pipe;
+              const uint32_t room = std::min(cwnd_room, rwnd_room);
+              if (room >= mss) {
+                EmitOneDataSegment(flow, now_ns, mss);
+              }
+            }
           }
         } else {
           // Already recovering: fresh SACK info may have opened the pipe.
@@ -2385,7 +2463,8 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpO
     if (!SeqLt(ack_value, flow.recovery_point)) {
       flow.sack_recovery = false;
       flow.cwnd = flow.ssthresh;
-      for (auto& s : flow.unacked) s.retransmitted = false;  // episode over
+      flow.rescue_rxt = 0;
+      flow.high_sack = 0;
     }
   } else if (flow.in_fast_recovery) {
     flow.in_fast_recovery = false;
