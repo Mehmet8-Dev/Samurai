@@ -146,16 +146,16 @@ The following tasks represent the formal backlog of work items to be implemented
 *   **Task Description:**  
     Transmit a 50 MB data stream over a virtual network link configured with `netem` 10% packet drop. Validate scoreboard loss identification (`IsLostSeg`), pipe calculation (`ComputePipe`), and selective retransmission without head-of-line collapse.
 *   **Automation Script:** [`tests/test_tcp_sliding_window_loss_recovery.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_tcp_sliding_window_loss_recovery.py)
-*   **Definition of Done (DoD):** Complete stream delivered without corruption; spurious retransmission rate $\le 2\%$.
+*   **Definition of Done (DoD):** Complete stream delivered without corruption; spurious retransmission rate `<= 2%`.
 *   **Status:** **COMPLETED & VERIFIED (PASS)**
 *   **Verification Benchmark Results:**
     *   **Stream Transferred:** 50 MB (52,428,800 bytes exact byte-for-byte reassembly)
-    *   **Duration ($T$):** 0.1267 s
+    *   **Duration (T):** 0.1267 s
     *   **Throughput:** 394.78 MB/s (519,549.7 PPS)
-    *   **Packets Sent ($N_{\text{sent}}$):** 65,802
-    *   **Packets Dropped ($N_{\text{dropped}}$):** 5,930 (Synthetic Drop Rate: 9.01%)
+    *   **Packets Sent (N_sent):** 65,802
+    *   **Packets Dropped (N_dropped):** 5,930 (Synthetic Drop Rate: 9.01%)
     *   **Total Retransmissions:** 5,930
-    *   **Spurious Retransmissions:** 1 (Spurious Rate: **0.02%**, DoD $\le 2.0\%$)
+    *   **Spurious Retransmissions:** 1 (Spurious Rate: **0.02%**, DoD `<= 2.0%`)
     *   **Data Corruption:** 0 bytes (0.00%)
     *   **Regression & Invariants:** All 17 L4 sliding-window test cases (A–Q) passing.
 
