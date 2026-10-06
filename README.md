@@ -32,106 +32,36 @@ Platform, Python bağımlılıklarından arındırılarak tamamen modern **C++ (
 ## Mimari Şema
 
 ```mermaid
-flowchart TB
-    %% ─────────────────────────────────────────────────────────────
-    %% 1. KULLANICI ARAYÜZÜ, DOĞRULAMA & GÜVENLİK SINIRI
-    %% ─────────────────────────────────────────────────────────────
-    subgraph UI_Layer ["1. Kullanıcı Arayüzü, Doğrulama & Güvenlik Sınırı"]
-        direction LR
-        CLI["samurai Native CLI<br/>(args.cpp · Profil Yönetimi · Validasyon)"]
-        Gate["Anti-Tamper & Lisans Kapısı<br/>(ELF Bütünlük Denetimi · RSA/Ed25519)"]
-        KPIGate["KPI Gate & RFC Test Paketi<br/>(RFC 2544 · RFC 6675 · SLA Eşikleri)"]
-        MgmtAPI["REST Management API (:8089)<br/>(POSIX Sockets · HS256 JWT RBAC)"]
+graph TD
+    subgraph Control Plane
+        Master[samurai_master Daemon]
+        MgmtAPI[Native HTTP Management API :8089]
+        Master -->|ZMQ ROUTER :5099| Slave[samurai_slave Daemon]
     end
 
-    %% ─────────────────────────────────────────────────────────────
-    %% 2. DAĞITIK KONTROL DÜZLEMİ & ORKESTRASYON
-    %% ─────────────────────────────────────────────────────────────
-    subgraph Control_Layer ["2. Dağıtık Kontrol Düzlemi & Orkestrasyon"]
-        direction LR
-        Master["samurai_master Daemon<br/>(Dinamik Shard Bölücü · Telemetri)"]
-        HA["HA Lider Seçimi<br/>(File / Redis Lease)"]
-        Audit["Denetim Günlüğü (Audit Log)<br/>(Kriptografik SHA-256 Zinciri)"]
-        Slave["samurai_slave Daemon<br/>(Düğüm Yöneticisi · Ajan Süreci)"]
-        Supervisor["Supervisor Engine<br/>(Süreç Yaşam Döngüsü & IPC Takibi)"]
+    subgraph Native CLI & Local Supervisor
+        CLI[samurai CLI] -->|ZMQ IPC / Unix Sockets| Supervisor[Supervisor Engine]
     end
 
-    %% ─────────────────────────────────────────────────────────────
-    %% 3. ASENKRON ZMQ IPC & WORKER ÇALIŞMA ZAMANI
-    %% ─────────────────────────────────────────────────────────────
-    subgraph Worker_Layer ["3. Asenkron ZMQ IPC & Worker Yürütme Katmanı"]
-        WireProto["ZMQ Binary IPC Veri Yolu (ipc:///tmp/samurai_*)<br/>56-Bayt SamuraiWireHeaderV1 (Magic: 0x53414D55) · Asenkron Kontrol Kanalı"]
-        
-        subgraph Workers ["Native C++ Worker Daemons (Bağımsız Süreçler)"]
-            direction LR
-            W_Kernel["Kernel-Bypass Dataplane<br/>• samurai_afxdp_worker<br/>• samurai_dpdk_worker<br/>• samurai_cpu_worker"]
-            W_HW["Donanım & Hızlandırıcılar<br/>• samurai_gpu_worker (CUDA)<br/>• samurai_doca_worker (GPUNetIO)"]
-            W_App["Protokol & Senaryo Motorları<br/>• samurai_l7_worker (H2/H3/DNS)<br/>• samurai_scenario_worker (Persona)<br/>• samurai_defense_worker (VAE)"]
-        end
+    Slave -->|Spawns / Manages| Supervisor
+
+    subgraph ZMQ Native Workers
+        Supervisor --> W_CPU[samurai_cpu_worker]
+        Supervisor --> W_AFXDP[samurai_afxdp_worker]
+        Supervisor --> W_DPDK[samurai_dpdk_worker]
+        Supervisor --> W_GPU[samurai_gpu_worker]
+        Supervisor --> W_DOCA[samurai_doca_worker]
+        Supervisor --> W_L7[samurai_l7_worker]
+        Supervisor --> W_SCENARIO[samurai_scenario_worker]
+        Supervisor --> W_DEFENSE[samurai_defense_worker]
     end
 
-    %% ─────────────────────────────────────────────────────────────
-    %% 4. DURUMSAL TAŞIMA & PROTOKOL YIĞINLARI
-    %% ─────────────────────────────────────────────────────────────
-    subgraph Engine_Layer ["4. Durumsal Taşıma & Uygulama Protokol Yığınları"]
-        subgraph L7_Engine ["L7 Reaktif Emülasyon Motoru (l7_emu_native)"]
-            Reactor["Multi-Reactor: epoll & Zero-Syscall io_uring"]
-            L7_Protos["HTTP/1.1 · HTTP/2 (nghttp2) · QUIC / HTTP/3 (ngtcp2) · EDNS0/ECS"]
-            Scenario_Core["Scenario Engine: Web/Mobil Persona Durum Makinesi"]
-        end
-
-        subgraph L4_TCP ["L4 User-Space TCP Stack (tcp_dataplane_core)"]
-            Flow_Table["64-Shard TTAS Akış Tablosu<br/>alignas(64) False-Sharing Önleme"]
-            SACK_Engine["RFC 6675 SACK Kayıp Kurtarma<br/>Out-of-Order Reassembly & PAWS"]
-            Timer_Heap["Per-Shard Timer Heap & Dinamik RTO"]
-        end
+    subgraph Hardware & Kernel Bypass Dataplane
+        W_AFXDP -->|Zero-Copy UMEM| NIC[Ağ Kartı / NIC]
+        W_DPDK -->|PMD Driver / VFIO| NIC
+        W_GPU -->|CUDA Stream / GPUDirect| GPU[NVIDIA GPU]
+        W_L7 -->|User-Space TCP Stack| W_AFXDP
     end
-
-    %% ─────────────────────────────────────────────────────────────
-    %% 5. KERNEL-BYPASS & DONANIM HIZLANDIRMA DATAPLANE
-    %% ─────────────────────────────────────────────────────────────
-    subgraph Dataplane_Layer ["5. Kernel-Bypass & Donanım Hızlandırma Dataplane"]
-        direction LR
-        AFXDP["Linux AF_XDP (XSK)<br/>Zero-Copy UMEM Ring Buffers"]
-        DPDK["DPDK PMD Veri Yolu<br/>rte_mempool, VFIO-PCI Polling"]
-        CUDA_DOCA["NVIDIA CUDA & DOCA GPUNetIO<br/>Async Streams, GPUDirect RDMA"]
-        AFPACKET["Linux PACKET_TX_RING<br/>Mmap Circular Rings & Raw Sockets"]
-    end
-
-    %% ─────────────────────────────────────────────────────────────
-    %% 6. FİZİKSEL ARAYÜZLER & HEDEF ALTYAPI
-    %% ─────────────────────────────────────────────────────────────
-    subgraph Physical_Layer ["6. Fiziksel Donanım Arayüzleri & Hedef Altyapı"]
-        direction LR
-        NIC["10G / 40G / 100G NIC Donanımı (Mellanox ConnectX, Intel i40e/E810)"]
-        GPU_HW["NVIDIA Kurumsal GPU & BlueField DPU Hızlandırıcılar"]
-        SUT["Test Edilen Sistem / Hedef Ağ Altyapısı (SUT)"]
-    end
-
-    %% Akışlar ve İlişkiler
-    CLI --> Gate --> Master
-    CLI -.->|Tekil Yerel Çalıştırma| Supervisor
-    MgmtAPI <--> Master
-    Master --- HA
-    Master --- Audit
-    Master ==>|ZMQ ROUTER / DEALER :5099| Slave
-    Slave --> Supervisor
-    Supervisor -->|fork / execvp & IPC Kurulumu| WireProto
-    WireProto --> W_Kernel & W_HW & W_App
-
-    W_App --> L7_Engine
-    L7_Engine --> L4_TCP
-    W_Kernel --> L4_TCP
-    W_HW --> CUDA_DOCA
-
-    L4_TCP --> AFXDP & DPDK & AFPACKET
-
-    AFXDP -->|Zero-Copy UMEM DMA| NIC
-    DPDK -->|Donanımsal Kuyruk Polling| NIC
-    AFPACKET -->|Halkasal Bellek İletimi| NIC
-    CUDA_DOCA -->|GPUDirect / PCIe Veri Yolu| GPU_HW
-    GPU_HW -->|Doğrudan Paket İletimi| NIC
-    NIC ==>|Hat Hızında Ağ Trafiği| SUT
 ```
 
 ---
