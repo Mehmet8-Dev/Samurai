@@ -1,24 +1,34 @@
-// Kernel Socket H1 threaded io_uring reactor end-to-end integration test.
+// Kernel Socket H1 threaded io_uring reactor end-to-end integration test & benchmark.
 //
 // Spawns a real localhost HTTP/1.1 server and runs the native engine configured
 // with transport_backend=kernel_socket, reactor_backend=SocketIoUring, and concurrency > 1 (multi-core shards).
 // Verifies:
 // 1. runtime_shards > 1 (multi-threaded per-core ring sharding)
 // 2. 100% request completion with HTTP 200 (status_2xx == requests)
-// 3. l7_epoll_wakeups == 0 (epoll is completely bypassed)
+// 3. l7_epoll_wakeups == 0 (epoll is completely bypassed under io_uring)
 // 4. l7_io_uring_cqe_reaped > 0 (completions processed via kernel io_uring rings)
 // 5. bridge.cpp run_profile_json reports runtime_reactor_backend == "socket_io_uring"
+// 6. Supports high-scale 100K request benchmarking against io_uring and epoll engines.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <csignal>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "engine.hpp"
 #include "bridge.hpp"
@@ -41,24 +51,44 @@ int g_fails = 0;
 struct TinyHttpServer {
   int listen_fd = -1;
   uint16_t port = 0;
+  bool keep_alive = true;
   std::atomic<bool> stop{false};
   std::atomic<int> served{0};
   std::thread accept_thread;
+  std::mutex workers_mu;
+  std::vector<std::thread> workers;
+  std::vector<int> client_fds;
 
-  bool Start() {
+  bool Start(uint16_t bind_port = 0, bool keep_alive_mode = true) {
+    keep_alive = keep_alive_mode;
     listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) return false;
     int one = 1;
     ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef SO_REUSEPORT
+    ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-    if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
+    addr.sin_port = htons(bind_port);
+    if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      ::close(listen_fd);
+      listen_fd = -1;
+      return false;
+    }
     socklen_t alen = sizeof(addr);
-    if (::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &alen) != 0) return false;
+    if (::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &alen) != 0) {
+      ::close(listen_fd);
+      listen_fd = -1;
+      return false;
+    }
     port = ntohs(addr.sin_port);
-    if (::listen(listen_fd, 128) != 0) return false;
+    if (::listen(listen_fd, 1024) != 0) {
+      ::close(listen_fd);
+      listen_fd = -1;
+      return false;
+    }
     accept_thread = std::thread([this]() { AcceptLoop(); });
     return true;
   }
@@ -72,33 +102,64 @@ struct TinyHttpServer {
         if (stop.load(std::memory_order_relaxed)) break;
         continue;
       }
-      std::thread([this, fd]() { HandleConn(fd); }).detach();
+      int one = 1;
+      ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+      struct timeval tv{};
+      tv.tv_sec = 1;
+      tv.tv_usec = 0;
+      ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      std::lock_guard<std::mutex> lk(workers_mu);
+      client_fds.push_back(fd);
+      workers.emplace_back([this, fd]() { HandleConn(fd); });
     }
   }
 
   void HandleConn(int fd) {
-    std::string buf;
-    char tmp[2048];
-    while (buf.find("\r\n\r\n") == std::string::npos) {
-      const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
-      if (n <= 0) {
-        ::close(fd);
-        return;
-      }
-      buf.append(tmp, static_cast<std::size_t>(n));
-      if (buf.size() > (1 << 16)) break;
-    }
-    static const char kResp[] =
+    int one = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    static const char kRespKeepAlive[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+    static const std::size_t kRespLen = sizeof(kRespKeepAlive) - 1;
+    static const char kRespClose[] =
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi";
-    const char* p = kResp;
-    std::size_t left = sizeof(kResp) - 1;
-    while (left > 0) {
-      const ssize_t w = ::send(fd, p, left, 0);
-      if (w <= 0) break;
-      p += w;
-      left -= static_cast<std::size_t>(w);
+    static const std::size_t kRespCloseLen = sizeof(kRespClose) - 1;
+
+    std::string in_buf;
+    in_buf.reserve(8192);
+    char tmp[4096];
+
+    while (!stop.load(std::memory_order_relaxed)) {
+      const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+      if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          continue;
+        }
+        break;
+      }
+      if (n == 0) break;
+      in_buf.append(tmp, static_cast<std::size_t>(n));
+
+      while (true) {
+        const std::size_t pos = in_buf.find("\r\n\r\n");
+        if (pos == std::string::npos) break;
+        in_buf.erase(0, pos + 4);
+
+        if (keep_alive) {
+          ssize_t w = ::send(fd, kRespKeepAlive, kRespLen, MSG_NOSIGNAL);
+          if (w <= 0) {
+            ::close(fd);
+            return;
+          }
+          served.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          (void)::send(fd, kRespClose, kRespCloseLen, MSG_NOSIGNAL);
+          served.fetch_add(1, std::memory_order_relaxed);
+          ::close(fd);
+          return;
+        }
+      }
+      if (in_buf.size() > 65536) in_buf.clear();
     }
-    served.fetch_add(1, std::memory_order_relaxed);
     ::close(fd);
   }
 
@@ -109,7 +170,21 @@ struct TinyHttpServer {
       ::close(listen_fd);
       listen_fd = -1;
     }
+    {
+      std::lock_guard<std::mutex> lk(workers_mu);
+      for (int cfd : client_fds) {
+        if (cfd >= 0) {
+          ::shutdown(cfd, SHUT_RDWR);
+        }
+      }
+    }
     if (accept_thread.joinable()) accept_thread.join();
+    std::lock_guard<std::mutex> lk(workers_mu);
+    for (auto& w : workers) {
+      if (w.joinable()) w.join();
+    }
+    workers.clear();
+    client_fds.clear();
   }
 };
 
@@ -122,9 +197,32 @@ FlowOp MakeGet(const char* path) {
   return op;
 }
 
-}  // namespace
+std::atomic<bool> g_sig_stop{false};
+void SigTermHandler(int) {
+  g_sig_stop.store(true, std::memory_order_relaxed);
+}
 
-int main() {
+int RunServerOnly(uint16_t port, bool keepalive) {
+  std::signal(SIGINT, SigTermHandler);
+  std::signal(SIGTERM, SigTermHandler);
+
+  TinyHttpServer server;
+  if (!server.Start(port, keepalive)) {
+    std::fprintf(stderr, "FAIL: could not start HTTP server on port %u\n", port);
+    return 1;
+  }
+  std::printf("SERVER_READY port=%u\n", server.port);
+  std::fflush(stdout);
+
+  while (!g_sig_stop.load(std::memory_order_relaxed)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  server.Stop();
+  std::printf("SERVER_STOPPED served=%d\n", server.served.load());
+  return 0;
+}
+
+int RunRegressionTest() {
   const RuntimeCapabilities caps = detect_capabilities();
   if (!caps.io_uring) {
     std::printf("SKIP: kernel io_uring capability not supported on this host\n");
@@ -234,4 +332,197 @@ int main() {
   std::printf("KERNEL THREADED IO_URING TESTS FAILED (%d)\n", g_fails);
   std::fflush(stdout);
   return 1;
+}
+
+int RunBenchmark(int requests,
+                 int concurrency,
+                 const std::string& reactor_name,
+                 const std::string& target_ip,
+                 uint16_t port,
+                 bool keepalive,
+                 bool json_output) {
+  const RuntimeCapabilities caps = detect_capabilities();
+  const bool want_io_uring = (reactor_name == "io_uring" || reactor_name == "socket_io_uring");
+  if (want_io_uring && !caps.io_uring) {
+    std::fprintf(stderr, "FAIL: io_uring requested but kernel io_uring not supported on this host\n");
+    return 2;
+  }
+
+  TinyHttpServer embedded_server;
+  if (port == 0) {
+    if (!embedded_server.Start(0, keepalive)) {
+      std::fprintf(stderr, "FAIL: could not start embedded benchmark HTTP server\n");
+      return 1;
+    }
+    port = embedded_server.port;
+  }
+
+  Profile profile;
+  profile.protocol = "http";
+  profile.transport_backend = "kernel_socket";
+  profile.reactor_backend = want_io_uring ? "socket_io_uring" : "socket_epoll";
+  profile.stateful_runtime_backend = "kernel";
+  profile.target_ip = target_ip;
+  profile.target_port = port;
+  profile.scheme = "http";
+  profile.host_header = target_ip;
+  profile.keepalive = keepalive ? 1 : 0;
+  profile.verify = 0;
+  profile.timeout_ms = 15000;
+  profile.max_connections = concurrency;
+  profile.max_streams_per_connection = 1;
+  profile.ops.reserve(requests);
+  for (int i = 0; i < requests; ++i) {
+    profile.ops.push_back(MakeGet("/"));
+  }
+
+  RuntimeConfig cfg;
+  cfg.concurrency = concurrency;
+  cfg.profile_l7 = 1;
+  cfg.profile_sample_limit = 0;  // collect full distribution for exact percentiles
+
+  const auto t_start = std::chrono::steady_clock::now();
+  const std::map<std::string, double> out = run_profile(profile, cfg);
+  const auto t_end = std::chrono::steady_clock::now();
+  const double duration_sec = std::chrono::duration<double>(t_end - t_start).count();
+
+  auto get = [&](const char* k) -> double {
+    const auto it = out.find(k);
+    return it == out.end() ? 0.0 : it->second;
+  };
+
+  const double shards = get("runtime_shards");
+  const double attempted = get("attempted");
+  const double sent = get("sent");
+  const double status_2xx = get("status_2xx");
+  const double errors = get("errors");
+  const double rx_syscalls = get("l7_rx_syscalls");
+  const double tx_syscalls = get("l7_tx_syscalls");
+  const double epoll_wakeups = get("l7_epoll_wakeups");
+  const double sqe_submitted = get("l7_io_uring_sqe_submitted");
+  const double cqe_reaped = get("l7_io_uring_cqe_reaped");
+  const double p50_ms = get("l7_request_latency_p50_ms");
+  const double p95_ms = get("l7_request_latency_p95_ms");
+  const double p99_ms = get("l7_request_latency_p99_ms");
+
+  const double rps = duration_sec > 0.0 ? (sent / duration_sec) : 0.0;
+
+  if (embedded_server.listen_fd >= 0) {
+    embedded_server.Stop();
+  }
+
+  if (json_output) {
+    std::cout << std::fixed << std::setprecision(4);
+    std::cout << "{\n"
+              << "  \"task\": \"TASK-TEST-L3-01\",\n"
+              << "  \"reactor\": \"" << (want_io_uring ? "io_uring" : "epoll") << "\",\n"
+              << "  \"requests\": " << static_cast<long>(sent) << ",\n"
+              << "  \"concurrency\": " << concurrency << ",\n"
+              << "  \"shards\": " << static_cast<int>(shards) << ",\n"
+              << "  \"duration_sec\": " << duration_sec << ",\n"
+              << "  \"rps\": " << rps << ",\n"
+              << "  \"status_2xx\": " << static_cast<long>(status_2xx) << ",\n"
+              << "  \"errors\": " << static_cast<long>(errors) << ",\n"
+              << "  \"rx_syscalls\": " << static_cast<long>(rx_syscalls) << ",\n"
+              << "  \"tx_syscalls\": " << static_cast<long>(tx_syscalls) << ",\n"
+              << "  \"epoll_wakeups\": " << static_cast<long>(epoll_wakeups) << ",\n"
+              << "  \"sqe_submitted\": " << static_cast<long>(sqe_submitted) << ",\n"
+              << "  \"cqe_reaped\": " << static_cast<long>(cqe_reaped) << ",\n"
+              << "  \"latency_p50_ms\": " << p50_ms << ",\n"
+              << "  \"latency_p95_ms\": " << p95_ms << ",\n"
+              << "  \"latency_p99_ms\": " << p99_ms << "\n"
+              << "}\n";
+  } else {
+    std::printf("\n================================================================================\n");
+    std::printf("[TASK-TEST-L3-01 BENCHMARK RESULT: %s]\n", want_io_uring ? "io_uring" : "epoll");
+    std::printf("  Requests Completed: %ld / %d (%.2f%% HTTP 200)\n",
+                static_cast<long>(status_2xx), requests,
+                requests > 0 ? (status_2xx / requests * 100.0) : 0.0);
+    std::printf("  Concurrency / Shards: %d / %.0f\n", concurrency, shards);
+    std::printf("  Duration (T):       %.4f s\n", duration_sec);
+    std::printf("  Throughput (RPS):   %.2f req/s\n", rps);
+    std::printf("  Rx Syscalls:        %.0f\n", rx_syscalls);
+    std::printf("  Tx Syscalls:        %.0f\n", tx_syscalls);
+    std::printf("  Epoll Wakeups:      %.0f\n", epoll_wakeups);
+    std::printf("  SQE Submitted:      %.0f\n", sqe_submitted);
+    std::printf("  CQE Reaped:         %.0f\n", cqe_reaped);
+    std::printf("  Latency P50:        %.4f ms\n", p50_ms);
+    std::printf("  Latency P95:        %.4f ms\n", p95_ms);
+    std::printf("  Latency P99:        %.4f ms\n", p99_ms);
+    std::printf("================================================================================\n\n");
+  }
+
+  if (static_cast<int>(status_2xx) != requests) {
+    std::fprintf(stderr, "FAIL: status_2xx (%ld) != expected requests (%d)\n",
+                 static_cast<long>(status_2xx), requests);
+    return 1;
+  }
+  return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc <= 1) {
+    return RunRegressionTest();
+  }
+
+  bool is_benchmark = false;
+  bool is_server_only = false;
+  int requests = 100000;
+  int concurrency = 32;
+  std::string reactor = "io_uring";
+  std::string target_ip = "127.0.0.1";
+  uint16_t port = 0;
+  bool keepalive = true;
+  bool json_output = false;
+
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--benchmark") {
+      is_benchmark = true;
+    } else if (arg == "--server-only") {
+      is_server_only = true;
+    } else if (arg == "--test") {
+      return RunRegressionTest();
+    } else if (arg == "--requests" && i + 1 < argc) {
+      requests = std::max(1, std::atoi(argv[++i]));
+    } else if (arg == "--concurrency" && i + 1 < argc) {
+      concurrency = std::max(1, std::atoi(argv[++i]));
+    } else if (arg == "--reactor" && i + 1 < argc) {
+      reactor = argv[++i];
+    } else if (arg == "--target-ip" && i + 1 < argc) {
+      target_ip = argv[++i];
+    } else if (arg == "--port" && i + 1 < argc) {
+      port = static_cast<uint16_t>(std::atoi(argv[++i]));
+    } else if (arg == "--keepalive" && i + 1 < argc) {
+      keepalive = (std::atoi(argv[++i]) != 0);
+    } else if (arg == "--json") {
+      json_output = true;
+    } else if (arg == "--help" || arg == "-h") {
+      std::printf("Usage: %s [options]\n", argv[0]);
+      std::printf("  --test                  Run quick regression integration test (default if no args)\n");
+      std::printf("  --benchmark             Run 100K request reactor benchmark\n");
+      std::printf("  --requests <N>          Total HTTP requests (default: 100000)\n");
+      std::printf("  --concurrency <C>       Concurrency / shard count (default: 32)\n");
+      std::printf("  --reactor <name>        Reactor backend: io_uring or epoll (default: io_uring)\n");
+      std::printf("  --port <P>              Target port (default: 0 = spawn embedded server)\n");
+      std::printf("  --target-ip <IP>        Target IP (default: 127.0.0.1)\n");
+      std::printf("  --keepalive <0|1>       Enable HTTP/1.1 persistent connections (default: 1)\n");
+      std::printf("  --json                  Output benchmark results in JSON\n");
+      std::printf("  --server-only           Run standalone high-performance HTTP server\n");
+      return 0;
+    }
+  }
+
+  if (is_server_only) {
+    if (port == 0) port = 18088;
+    return RunServerOnly(port, keepalive);
+  }
+
+  if (is_benchmark) {
+    return RunBenchmark(requests, concurrency, reactor, target_ip, port, keepalive, json_output);
+  }
+
+  return RunRegressionTest();
 }

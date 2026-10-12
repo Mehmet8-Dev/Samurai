@@ -725,14 +725,11 @@ int service_ready_lanes_io_uring(
   }
 #endif
 
-  // 2. Submit pending SQEs
-  local_shard.uring.submit();
-
-  // 3. Reap batch of CQEs
+  // 2. Submit pending SQEs and reap completions
   struct io_uring_cqe* cqes[128];
   int reaped = local_shard.uring.peek_batch_cqe(cqes, 128);
 
-  if (reaped == 0 && timeout_ms > 0) {
+  if (reaped == 0) {
     bool has_in_flight = h2_in_flight > 0;
     if (!has_in_flight) {
       for (const auto& lane_ptr : local_shard.h1_lanes) {
@@ -743,10 +740,11 @@ int service_ready_lanes_io_uring(
         }
       }
     }
-    if (has_in_flight) {
-      local_shard.uring.wait_event(timeout_ms);
-      reaped = local_shard.uring.peek_batch_cqe(cqes, 128);
-    }
+    const unsigned wait_nr = (has_in_flight && timeout_ms > 0) ? 1u : 0u;
+    local_shard.uring.submit_and_wait_cqes(wait_nr, timeout_ms);
+    reaped = local_shard.uring.peek_batch_cqe(cqes, 128);
+  } else {
+    local_shard.uring.submit();
   }
 
   if (reaped <= 0) {

@@ -25,6 +25,7 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/38-architecture-refactor-plan.md
 !docs/pitch-teknik-hazirlik-barikat.md
 !docs/PR_TASK_TEST_L2_02_RFC6675_SACK.md
+!docs/PR_TASK_TEST_L3_01_IOURING_VS_EPOLL.md
 
 # Python cache / build
 __pycache__/

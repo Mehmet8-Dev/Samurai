@@ -178,6 +178,8 @@ int kernel_socket_connect_bridge(Http1Connection& conn, const Profile& profile) 
     if (fd < 0) {
       continue;
     }
+    int one = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     if (!set_fd_nonblocking(fd)) {
       ::close(fd);
       fd = -1;

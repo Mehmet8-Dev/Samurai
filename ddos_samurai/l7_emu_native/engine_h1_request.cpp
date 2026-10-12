@@ -233,6 +233,7 @@ void build_http1_request_into(
 
 std::vector<H1RequestSpec> build_h1_requests(const Profile& profile) {
   std::vector<H1RequestSpec> requests;
+  requests.reserve(profile.ops.size());
   for (std::size_t idx = 0; idx < profile.ops.size(); ++idx) {
     const FlowOp& op = profile.ops[idx];
     if (op.opcode != "SEND_HEADERS") {
@@ -283,6 +284,9 @@ std::vector<std::vector<H1RequestSpec>> bucket_h1_requests_by_shard(
     std::size_t shard_count) {
   const std::size_t count = std::max<std::size_t>(1, shard_count);
   std::vector<std::vector<H1RequestSpec>> buckets(count);
+  for (std::size_t b = 0; b < count; ++b) {
+    buckets[b].reserve(requests.size() / count + 1);
+  }
   static const std::hash<std::string> vu_hash{};
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const std::string& vu = requests[i].scenario_vu_id;
