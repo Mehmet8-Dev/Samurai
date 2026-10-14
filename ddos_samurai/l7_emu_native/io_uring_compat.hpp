@@ -329,9 +329,19 @@ class SamuraiUring {
   // three-syscall dance with one syscall on the hot path. Falls back to the
   // poll()-based wait on older kernels.
   int submit_and_wait_cqes(unsigned min_complete, int timeout_ms) {
-    int submitted = submit();
-    if (ring_fd < 0) return submitted < 0 ? submitted : -1;
-    if (min_complete == 0) return submitted;
+    if (ring_fd < 0 || sq_ktail == nullptr) return -1;
+    unsigned tail = *sq_ktail;
+    __atomic_store_n(sq_ktail, tail, __ATOMIC_RELEASE);
+    unsigned to_submit = tail - sq_last_submitted;
+
+    if ((active_flags & kUringSetupSqpoll) != 0) {
+      if (sqpoll_needs_wakeup()) {
+        (void)syscall(__NR_io_uring_enter, ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, nullptr);
+      }
+      sq_last_submitted = tail;
+      if (min_complete > 0) return wait_cqes(min_complete, timeout_ms);
+      return static_cast<int>(to_submit);
+    }
 
     if ((features & IORING_FEAT_EXT_ARG) != 0 && timeout_ms >= 0) {
       struct __kernel_timespec ts;
@@ -340,15 +350,30 @@ class SamuraiUring {
       struct io_uring_getevents_arg arg;
       std::memset(&arg, 0, sizeof(arg));
       arg.ts = reinterpret_cast<uint64_t>(&ts);
-      unsigned enter_flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
-      if (sqpoll_needs_wakeup()) {
-        enter_flags |= IORING_ENTER_SQ_WAKEUP;
+      unsigned enter_flags = (min_complete > 0 ? (IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG) : 0u);
+      int ret = static_cast<int>(syscall(__NR_io_uring_enter, ring_fd, to_submit, min_complete,
+                                         enter_flags, &arg, sizeof(arg)));
+      if (ret > 0) {
+        sq_last_submitted += static_cast<unsigned>(std::min<int>(ret, static_cast<int>(to_submit)));
       }
-      return static_cast<int>(syscall(__NR_io_uring_enter, ring_fd, 0u, min_complete,
-                                      enter_flags, &arg, sizeof(arg)));
+      return ret;
     }
-    // Legacy fallback: poll the ring fd for readiness.
-    return wait_event(timeout_ms);
+
+    int submitted = 0;
+    if (to_submit > 0) {
+      int ret = static_cast<int>(syscall(__NR_io_uring_enter, ring_fd, to_submit, 0, 0, nullptr));
+      if (ret > 0) {
+        sq_last_submitted += static_cast<unsigned>(ret);
+        submitted = ret;
+      } else if (ret < 0) {
+        return ret;
+      }
+    }
+    if (min_complete > 0) {
+      int wait_ret = wait_cqes(min_complete, timeout_ms);
+      if (wait_ret < 0) return wait_ret;
+    }
+    return submitted;
   }
 
   int submit_and_wait(unsigned wait_nr, int timeout_ms = 0) {
@@ -379,6 +404,25 @@ class SamuraiUring {
     pfd.events = POLLIN;
     pfd.revents = 0;
     return ::poll(&pfd, 1, timeout_ms);
+  }
+
+  int wait_cqes(unsigned min_complete, int timeout_ms) {
+    if (ring_fd < 0 || min_complete == 0) return 0;
+    if ((features & IORING_FEAT_EXT_ARG) != 0 && timeout_ms >= 0) {
+      struct __kernel_timespec ts;
+      ts.tv_sec = timeout_ms / 1000;
+      ts.tv_nsec = static_cast<long long>(timeout_ms % 1000) * 1000000LL;
+      struct io_uring_getevents_arg arg;
+      std::memset(&arg, 0, sizeof(arg));
+      arg.ts = reinterpret_cast<uint64_t>(&ts);
+      unsigned enter_flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
+      if (sqpoll_needs_wakeup()) {
+        enter_flags |= IORING_ENTER_SQ_WAKEUP;
+      }
+      return static_cast<int>(syscall(__NR_io_uring_enter, ring_fd, 0u, min_complete,
+                                      enter_flags, &arg, sizeof(arg)));
+    }
+    return wait_event(timeout_ms);
   }
 
   int peek_batch_cqe(struct io_uring_cqe** out_cqes, unsigned count) {
@@ -613,6 +657,13 @@ class SamuraiUring {
     o.buf_ring_registered = false;
   }
 };
+
+// Helper: prep NOP
+inline void prep_uring_nop(struct io_uring_sqe* sqe, uint64_t user_data) {
+  sqe->opcode = IORING_OP_NOP;
+  sqe->fd = -1;
+  sqe->user_data = user_data;
+}
 
 // Helper: prep connect
 inline void prep_uring_connect(struct io_uring_sqe* sqe, int fd, const struct sockaddr* addr, socklen_t addrlen, uint64_t user_data) {

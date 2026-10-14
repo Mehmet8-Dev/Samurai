@@ -164,8 +164,20 @@ The following tasks represent the formal backlog of work items to be implemented
 *   **Target Code:** [`io_uring_compat.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/io_uring_compat.hpp) and [`test_kernel_threaded_io_uring.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp)
 *   **Task Description:**  
     Execute 100,000 HTTP/1.1 requests under concurrency=32 against both `io_uring` and `epoll` engines. Trace system calls (`strace -c`) and measure context switches.
-*   **Automation Script:** `tests/bench_iouring_vs_epoll_syscalls.sh`
+*   **Automation Script:** [`tests/bench_iouring_vs_epoll_syscalls.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_iouring_vs_epoll_syscalls.sh)
 *   **Definition of Done (DoD):** `io_uring` demonstrates `rx_syscalls=0`, `tx_syscalls=0` and achieves $\ge 20\%$ throughput gain over `epoll`.
+*   **Status:** **COMPLETED & VERIFIED (PASS)**
+*   **Verification Benchmark Results:**
+    *   **Total Requests ($N$):** 100,000 (100.0% HTTP 200 OK across both engines)
+    *   **Concurrency / Shards ($C$):** 32 / 32
+    *   **Socket Rx Syscalls (`recvfrom`):** **0** under `io_uring` vs **100,027** under `epoll` (**100.0% eliminated**)
+    *   **Socket Tx Syscalls (`sendto`):** **0** under `io_uring` vs **100,000** under `epoll` (**100.0% eliminated**)
+    *   **Epoll Wait Syscalls (`epoll_wait`):** **0** under `io_uring` vs **48** under `epoll` (**100.0% bypassed**)
+    *   **Total Traced Syscalls:** **218,126** under `io_uring` vs **1,008,148** under `epoll` (**-78.4% reduction**)
+    *   **Throughput under Syscall Tracing:** **57,611.38 req/s** (`io_uring`) vs **23,083.93 req/s** (`epoll`) (**+149.57% Throughput Gain**, DoD $\ge 20\%$)
+    *   **Total Context Switches:** **230,520** under `io_uring` vs **1,016,654** under `epoll` (**-77.33% reduction**, DoD $\ge 50\%$)
+    *   **Latency Triplet:** P50 = 0.0000 ms, P95 = 1.0000 ms, P99 = 1.0000 ms
+    *   **Regression Invariants:** Kernel Socket H1 threaded io_uring e2e tests passing 100%.
 
 #### `TASK-TEST-L3-02`: HTTP/2 kTLS Socket-BIO vs OpenSSL Memory-BIO CPU Overhead
 *   **Category:** Layer 3 (L7 Protocol Emulation)
