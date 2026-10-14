@@ -46,6 +46,8 @@ class TestIoUringVsEpollSyscalls(unittest.TestCase):
         """Execute default integration test suite inside test_kernel_threaded_io_uring."""
         res = subprocess.run([str(self.binary_path)], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, f"Regression test failed:\n{res.stdout}\n{res.stderr}")
+        if "SKIP: kernel io_uring capability not supported on this host" in res.stdout:
+            raise unittest.SkipTest("Kernel io_uring not supported on this host")
         self.assertIn("ALL KERNEL THREADED IO_URING TESTS PASSED", res.stdout)
 
     def test_benchmark_script_execution(self):
@@ -54,9 +56,12 @@ class TestIoUringVsEpollSyscalls(unittest.TestCase):
         env["REQUESTS"] = "10000"
         env["CONCURRENCY"] = "32"
         env["PORT"] = "18099"
+        env["BENCH_RUNS"] = "2"
         env["OUTPUT_DIR"] = str(self.repo_root / "reports" / "benchmarks" / "task_l3_01_ci")
 
         res = subprocess.run(["bash", str(self.bench_script)], env=env, capture_output=True, text=True)
+        if res.returncode == 77 or "[SKIP]" in res.stdout:
+            raise unittest.SkipTest("Kernel io_uring not supported on this host")
         self.assertEqual(res.returncode, 0, f"Benchmark script failed:\n{res.stdout}\n{res.stderr}")
         self.assertIn("Definition of Done (DoD) ALL CRITERIA SATISFIED!", res.stdout)
 

@@ -32,6 +32,7 @@
 
 #include "engine.hpp"
 #include "bridge.hpp"
+#include "io_uring_compat.hpp"
 
 namespace {
 
@@ -222,12 +223,77 @@ int RunServerOnly(uint16_t port, bool keepalive) {
   return 0;
 }
 
+void TestIoUringQueueAccounting() {
+  std::printf("Testing io_uring queue accounting and boundary conditions...\n");
+  SamuraiUring ring;
+  if (!ring.init(32)) {
+    CHECK(false, "failed to initialize SamuraiUring with 32 entries");
+    return;
+  }
+
+  // 1. Fill SQ to capacity and verify get_sqe returns nullptr once full
+  for (unsigned i = 0; i < 32; ++i) {
+    auto* sqe = ring.get_sqe();
+    CHECK(sqe != nullptr, "get_sqe failed at index %u", i);
+    if (sqe != nullptr) {
+      prep_uring_nop(sqe, static_cast<uint64_t>(i + 1));
+    }
+  }
+  // Queue should now be full
+  auto* overflow_sqe = ring.get_sqe();
+  CHECK(overflow_sqe == nullptr, "expected get_sqe to return nullptr when SQ is saturated");
+
+  // 2. Submit all 32 NOP SQEs and wait for at least 32 completions
+  int ret = ring.submit_and_wait_cqes(32, 1000);
+  CHECK(ret >= 0, "submit_and_wait_cqes failed with ret=%d", ret);
+
+  // 3. Harvest completions and verify user_data integrity
+  struct io_uring_cqe* cqes[64];
+  int reaped = ring.peek_batch_cqe(cqes, 64);
+  CHECK(reaped == 32, "expected 32 reaped CQEs, got %d", reaped);
+  for (int i = 0; i < reaped; ++i) {
+    CHECK(cqes[i] != nullptr, "cqe %d is null", i);
+    if (cqes[i] != nullptr) {
+      CHECK(cqes[i]->res == 0, "NOP cqe returned error %d", cqes[i]->res);
+    }
+  }
+  ring.cq_advance(static_cast<unsigned>(reaped));
+
+  // 4. Test zero-submission submit_and_wait_cqes
+  int zero_ret = ring.submit_and_wait_cqes(0, 0);
+  CHECK(zero_ret >= 0, "zero-submission submit_and_wait_cqes failed: %d", zero_ret);
+
+  // 5. Test timeout wait when no completions are pending
+  int timeout_ret = ring.wait_cqes(1, 10);
+  CHECK(timeout_ret == 0 || timeout_ret == -ETIME || timeout_ret == -1,
+        "timeout wait returned unexpected %d", timeout_ret);
+
+  // 6. After reaping, SQ should be ready for new submissions
+  auto* new_sqe = ring.get_sqe();
+  CHECK(new_sqe != nullptr, "expected get_sqe to succeed after CQ reaping");
+  if (new_sqe != nullptr) {
+    prep_uring_nop(new_sqe, 999);
+    int sub = ring.submit_and_wait_cqes(1, 1000);
+    CHECK(sub >= 0, "submit single NOP failed: %d", sub);
+    struct io_uring_cqe* single_cqe[4];
+    int single_reaped = ring.peek_batch_cqe(single_cqe, 4);
+    CHECK(single_reaped == 1, "expected 1 CQE, got %d", single_reaped);
+    if (single_reaped == 1 && single_cqe[0] != nullptr) {
+      CHECK(single_cqe[0]->user_data == 999, "user_data mismatch: %lu",
+            static_cast<unsigned long>(single_cqe[0]->user_data));
+      ring.cq_advance(1);
+    }
+  }
+}
+
 int RunRegressionTest() {
   const RuntimeCapabilities caps = detect_capabilities();
   if (!caps.io_uring) {
     std::printf("SKIP: kernel io_uring capability not supported on this host\n");
     return 0;
   }
+
+  TestIoUringQueueAccounting();
 
   TinyHttpServer server;
   if (!server.Start()) {

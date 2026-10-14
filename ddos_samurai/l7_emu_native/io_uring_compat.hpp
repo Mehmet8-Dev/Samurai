@@ -355,22 +355,25 @@ class SamuraiUring {
                                          enter_flags, &arg, sizeof(arg)));
       if (ret > 0) {
         sq_last_submitted += static_cast<unsigned>(std::min<int>(ret, static_cast<int>(to_submit)));
-      } else if (to_submit > 0 && ret == 0) {
-        sq_last_submitted += to_submit;
       }
       return ret;
     }
 
+    int submitted = 0;
     if (to_submit > 0) {
       int ret = static_cast<int>(syscall(__NR_io_uring_enter, ring_fd, to_submit, 0, 0, nullptr));
       if (ret > 0) {
         sq_last_submitted += static_cast<unsigned>(ret);
+        submitted = ret;
+      } else if (ret < 0) {
+        return ret;
       }
     }
     if (min_complete > 0) {
-      return wait_cqes(min_complete, timeout_ms);
+      int wait_ret = wait_cqes(min_complete, timeout_ms);
+      if (wait_ret < 0) return wait_ret;
     }
-    return static_cast<int>(to_submit);
+    return submitted;
   }
 
   int submit_and_wait(unsigned wait_nr, int timeout_ms = 0) {
@@ -654,6 +657,13 @@ class SamuraiUring {
     o.buf_ring_registered = false;
   }
 };
+
+// Helper: prep NOP
+inline void prep_uring_nop(struct io_uring_sqe* sqe, uint64_t user_data) {
+  sqe->opcode = IORING_OP_NOP;
+  sqe->fd = -1;
+  sqe->user_data = user_data;
+}
 
 // Helper: prep connect
 inline void prep_uring_connect(struct io_uring_sqe* sqe, int fd, const struct sockaddr* addr, socklen_t addrlen, uint64_t user_data) {
