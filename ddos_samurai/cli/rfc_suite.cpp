@@ -82,13 +82,20 @@ Rfc8219Result RfcSuiteEngine::Run8219Benchmark(
   return res;
 }
 
-RfcSuiteResult RfcSuiteEngine::RunAll(const Rfc2544Config& c2544,
-                                      const Rfc3511Config& c3511,
-                                      const Rfc8219Config& c8219) {
+RfcSuiteResult RfcSuiteEngine::RunAll(
+    const Rfc2544Config& c2544,
+    const Rfc3511Config& c3511,
+    const Rfc8219Config& c8219,
+    std::function<double(double trial_rps)> trial_runner,
+    std::function<double(double cps)> cps_runner,
+    std::function<double(double gbps)> inspection_runner,
+    bool live_dataplane) {
   RfcSuiteResult res;
-  res.rfc2544 = Run2544BinarySearch(c2544);
-  res.rfc3511 = Run3511Benchmark(c3511);
-  res.rfc8219 = Run8219Benchmark(c8219);
+  res.live_dataplane = live_dataplane;
+  res.execution_mode = live_dataplane ? "LIVE_DATAPLANE" : "SIMULATED_DRY_RUN";
+  res.rfc2544 = Run2544BinarySearch(c2544, trial_runner);
+  res.rfc3511 = Run3511Benchmark(c3511, cps_runner);
+  res.rfc8219 = Run8219Benchmark(c8219, inspection_runner);
   res.overall_passed = (res.rfc2544.passed && res.rfc3511.passed && res.rfc8219.passed);
   res.score = res.overall_passed ? 100.0 : 50.0;
   return res;
@@ -105,6 +112,7 @@ std::string RfcReportGenerator::GenerateHtmlReport(const RfcSuiteResult& result)
        << "  h1, h2, h3 { color: #38bdf8; margin-top: 0; }\n"
        << "  .badge-pass { background: #166534; color: #4ade80; padding: 6px 16px; border-radius: 20px; font-weight: bold; font-size: 14px; }\n"
        << "  .badge-fail { background: #991b1b; color: #f87171; padding: 6px 16px; border-radius: 20px; font-weight: bold; font-size: 14px; }\n"
+       << "  .badge-mode { background: #334155; color: #facc15; padding: 4px 12px; border-radius: 12px; font-size: 12px; margin-left: 10px; }\n"
        << "  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }\n"
        << "  .metric { background: #334155; padding: 16px; border-radius: 8px; text-align: center; }\n"
        << "  .metric-val { font-size: 28px; font-weight: bold; color: #f43f5e; }\n"
@@ -116,8 +124,11 @@ std::string RfcReportGenerator::GenerateHtmlReport(const RfcSuiteResult& result)
   html << "<div class=\"card\">\n"
        << "  <div style=\"display:flex; justify-content:space-between; align-items:center;\">\n"
        << "    <h1>⚡ Samurai Executive RFC Benchmark Report</h1>\n"
-       << "    <span class=\"" << (result.overall_passed ? "badge-pass" : "badge-fail") << "\">"
+       << "    <div>\n"
+       << "      <span class=\"badge-mode\">MODE: " << result.execution_mode << "</span>\n"
+       << "      <span class=\"" << (result.overall_passed ? "badge-pass" : "badge-fail") << "\">"
        << (result.overall_passed ? "PASSED (100%)" : "FAILED") << "</span>\n"
+       << "    </div>\n"
        << "  </div>\n"
        << "  <p style=\"color: #94a3b8;\">RFC 2544 Throughput Binary Search, RFC 3511 Firewall CPS & Concurrency, RFC 8219 NGFW IPv6 Inspection Certification</p>\n"
        << "</div>\n";
@@ -160,6 +171,7 @@ std::string RfcReportGenerator::GenerateMarkdownReport(const RfcSuiteResult& res
   std::ostringstream md;
   md << "# Samurai Executive RFC Benchmark Report\n\n"
      << "**Overall Verdict:** " << (result.overall_passed ? "PASS 🚀" : "FAIL ❌") << "\n"
+     << "**Execution Mode:** `" << result.execution_mode << "`\n"
      << "**Score:** " << result.score << "/100\n\n"
      << "## RFC 2544 Maximum Zero-Loss Throughput\n"
      << "- **Zero-Loss Bandwidth:** " << result.rfc2544.max_zero_loss_gbps << " Gbps\n"

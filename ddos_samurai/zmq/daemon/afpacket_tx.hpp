@@ -15,6 +15,7 @@
 // Only workers that link af_packet_static include this header.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -39,25 +40,37 @@ inline bool AfPacketEnvFlag(const char* name) {
           ::strcasecmp(v, "yes") == 0 || ::strcasecmp(v, "on") == 0);
 }
 
-// True when a job should transmit for real over af_packet rather than fall back
-// to the worker's simulated accounting.
-inline bool AfPacketTxEnabled() { return AfPacketEnvFlag("SAMURAI_AFPACKET_TX"); }
+inline bool AfPacketEnvExplicitlyDisabled(const char* name) {
+  const char* v = std::getenv(name);
+  return v && v[0] &&
+         (std::strcmp(v, "0") == 0 || ::strcasecmp(v, "false") == 0 ||
+          ::strcasecmp(v, "no") == 0 || ::strcasecmp(v, "off") == 0);
+}
+
+// True by default so jobs transmit for real over af_packet unless explicitly
+// disabled via SAMURAI_AFPACKET_TX=0/false/no/off.
+inline bool AfPacketTxEnabled() {
+  return !AfPacketEnvExplicitlyDisabled("SAMURAI_AFPACKET_TX");
+}
 
 struct AfPacketTxStats {
   std::uint64_t packets_sent = 0;
   std::uint64_t packets_errors = 0;
   std::uint64_t bytes_sent = 0;
+  int rc = 0;
+  std::string error_msg;
   std::string note = "afpacket:l3";
 };
 
 // Transmit `count` packets from `pool` (packet_size stride) over the af_packet
 // backend. L3 raw sendmmsg by default; SO_TXTIME kernel pacing when ipg_ns>0.
 // Stateful RX handshake when SAMURAI_AFPACKET_STATEFUL=1 and an interface is set.
-// Raw-socket failures (no CAP_NET_RAW) are counted as errors, never fatal.
+// Accepts optional `stop_flag` (C volatile int*) for sub-5ms abort propagation.
 inline AfPacketTxStats AfPacketSendPool(
     const ddos_samurai::cpu_native::PacketConfig& cfg,
     const std::uint8_t* pool, std::size_t pool_len,
-    int packet_size, int count, long long ipg_ns) {
+    int packet_size, int count, long long ipg_ns,
+    const volatile int* stop_flag = nullptr) {
   AfPacketTxStats out;
   const char* iface_env = std::getenv("SAMURAI_AFPACKET_IFACE");
   const std::string iface = iface_env ? iface_env : "";
@@ -75,27 +88,37 @@ inline AfPacketTxStats AfPacketSendPool(
 
   char err[128] = {0};
   afpkt_tx_metrics_t m{};
-  const int rc = afpkt_send_l3(cfg.target_ip.c_str(), cfg.target_port,
-                               pool, pool_len, packet_size, count, ipg_ns,
-                               &m, err, sizeof(err));
+  const int rc = afpkt_send_l3_ex(cfg.target_ip.c_str(), cfg.target_port,
+                                  pool, pool_len, packet_size, count, ipg_ns,
+                                  stop_flag, &m, err, sizeof(err));
+  out.rc = rc;
+  if (err[0]) {
+    out.error_msg = err;
+  }
 
   afpkt_state_stats_t st{};
   if (stateful) {
-    (void)afpkt_ingest_tx_packets(pool, pool_len, packet_size, count);
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    afpkt_get_state_engine_stats(&st);
+    if (!(stop_flag && *stop_flag)) {
+      (void)afpkt_ingest_tx_packets(pool, pool_len, packet_size, count);
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      afpkt_get_state_engine_stats(&st);
+    }
     afpkt_stop_rx_handler();
   }
 
   out.packets_sent = static_cast<std::uint64_t>(std::max(0, m.sent));
   out.packets_errors = static_cast<std::uint64_t>(std::max(0, m.errors));
   out.bytes_sent = out.packets_sent * static_cast<std::uint64_t>(packet_size);
-  out.note = stateful ? "afpacket:stateful" : "afpacket:l3";
+  if (stop_flag && *stop_flag) {
+    out.note = "aborted";
+  } else {
+    out.note = stateful ? "afpacket:stateful" : "afpacket:l3";
+  }
   if (rc != 0 && err[0]) {
     out.note += " tx_error=";
     out.note += err;
   }
-  if (stateful) {
+  if (stateful && !(stop_flag && *stop_flag)) {
     out.note += " state_active=" + std::to_string(st.active_entries) +
                 " state_evictions=" + std::to_string(st.timeout_evictions);
   }

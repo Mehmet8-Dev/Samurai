@@ -58,7 +58,57 @@ int main(int argc, char** argv) {
     cli::Rfc2544Config c2544;
     cli::Rfc3511Config c3511;
     cli::Rfc8219Config c8219;
-    const cli::RfcSuiteResult res = cli::RfcSuiteEngine::RunAll(c2544, c3511, c8219);
+
+    bool live_dataplane = opt.confirm && !opt.job.target_ip.empty();
+    std::function<double(double trial_rps)> trial_runner;
+    std::function<double(double cps)> cps_runner;
+    std::function<double(double gbps)> inspection_runner;
+
+    if (live_dataplane) {
+      const std::string worker_name = opt.worker_name.empty() ? "cpu" : opt.worker_name;
+      const auto entry = orchestrator::LookupWorker(worker_name);
+      if (entry.has_value()) {
+        const std::string suffix = std::to_string(static_cast<long>(getpid()));
+        orchestrator::SupervisorConfig sup_cfg;
+        sup_cfg.worker = *entry;
+        sup_cfg.worker_dir = opt.worker_dir;
+        sup_cfg.jobs_endpoint = "ipc:///tmp/samurai_jobs_rfc_" + suffix;
+        sup_cfg.events_endpoint = "ipc:///tmp/samurai_events_rfc_" + suffix;
+        sup_cfg.recv_timeout_ms = opt.timeout_ms;
+
+        trial_runner = [sup_cfg, opt, c2544](double trial_rps) -> double {
+          orchestrator::JobOptions job = opt.job;
+          job.target_rps = trial_rps;
+          const double duration = std::max(0.5, c2544.trial_duration_s);
+          job.packet_count = static_cast<uint32_t>(trial_rps * duration);
+          orchestrator::RunStats stats;
+          (void)orchestrator::RunJob(sup_cfg, job, stats);
+          return std::clamp(stats.wire_loss_est_pct, 0.0, 100.0);
+        };
+
+        cps_runner = [sup_cfg, opt](double target_cps) -> double {
+          orchestrator::JobOptions job = opt.job;
+          job.target_rps = target_cps;
+          job.packet_count = static_cast<uint32_t>(target_cps * 2.0);
+          orchestrator::RunStats stats;
+          (void)orchestrator::RunJob(sup_cfg, job, stats);
+          return stats.actual_rps;
+        };
+
+        inspection_runner = [sup_cfg, opt](double) -> double {
+          orchestrator::JobOptions job = opt.job;
+          orchestrator::RunStats stats;
+          (void)orchestrator::RunJob(sup_cfg, job, stats);
+          double pass_rate = 100.0 - stats.wire_loss_est_pct;
+          return std::clamp(pass_rate, 0.0, 100.0);
+        };
+      } else {
+        live_dataplane = false;
+      }
+    }
+
+    const cli::RfcSuiteResult res = cli::RfcSuiteEngine::RunAll(
+        c2544, c3511, c8219, trial_runner, cps_runner, inspection_runner, live_dataplane);
     const std::string md_report = cli::RfcReportGenerator::GenerateMarkdownReport(res);
     const std::string html_report = cli::RfcReportGenerator::GenerateHtmlReport(res);
     std::printf("%s\n", md_report.c_str());

@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -15,6 +16,10 @@
 #include <vector>
 
 #include <zmq.h>
+
+extern "C" {
+#include "af_packet.h"
+}
 
 #include "pacing_engine.h"
 #include "wire_protocol.h"
@@ -519,12 +524,17 @@ int SendAck(void* push, std::uint64_t cid, const std::string& job_id) {
 struct NativeResult {
   std::size_t bytes_total{0};
   int packet_size{0};
+  int packets_sent{0};
+  int packets_errors{0};
+  bool transmitted_on_wire{false};
+  std::string tx_note{"simulated:dry_run"};
 };
 
 bool RunGpuNativeBatch(
     GpuNativeApi& api,
     const samurai::wire::JobEnvelopeV1& env,
     int batch_count,
+    long long ipg_ns,
     NativeResult& out,
     std::string& err) {
   std::uint8_t* ptr = nullptr;
@@ -538,6 +548,11 @@ bool RunGpuNativeBatch(
   const std::string tcp_flags = ReadFixed(env.tcp_flags, sizeof(env.tcp_flags));
   const std::int64_t tcp_flags_int = static_cast<std::int64_t>(ParseTcpFlags(tcp_flags));
 
+  const std::string iface = EnvString("SAMURAI_AFPACKET_IFACE", "");
+  const bool tx_enabled = EnvFlag("SAMURAI_AFPACKET_TX", true);
+  // L2 TX_RING requires Ethernet header (has_ethernet=1); L3 raw socket uses IPv4 payload (has_ethernet=0).
+  const int has_ethernet = (!iface.empty() || !tx_enabled) ? 1 : 0;
+
   const bool is_icmp = (protocol == "icmp" || protocol == "ICMP");
   int rc = 0;
   if (is_icmp) {
@@ -546,7 +561,7 @@ bool RunGpuNativeBatch(
         target_ip_norm.c_str(),
         "192.168.1.100",
         env.spoof_enabled != 0u ? 1 : 0,
-        1,
+        has_ethernet,
         8,
         0,
         std::max<std::int64_t>(0, static_cast<std::int64_t>(env.packet_size) - 42),
@@ -566,7 +581,7 @@ bool RunGpuNativeBatch(
         env.spoof_enabled != 0u ? 1 : 0,
         "192.168.1.100",
         tcp_flags_int,
-        1,
+        has_ethernet,
         env.window == 0ull ? -1 : static_cast<std::int64_t>(env.window),
         0ull,
         kDefaultGatewayMac,
@@ -576,25 +591,57 @@ bool RunGpuNativeBatch(
         &out_packet_size);
   }
 
+  std::unique_ptr<std::uint8_t, fn_free_t> ptr_guard(ptr, api.free_fn ? api.free_fn : +[](void*) {});
+
   if (rc != 0) {
     err = NativeLastError(api);
     if (err.empty()) {
       err = "gpu_native_generate_failed";
     }
-    if (ptr && api.free_fn) {
-      api.free_fn(ptr);
-    }
     return false;
   }
-  if (ptr && api.free_fn) {
-    api.free_fn(ptr);
-  }
-  if (out_packet_size <= 0) {
+  if (out_packet_size <= 0 || !ptr) {
     err = "gpu_native_packet_size_invalid";
     return false;
   }
+
   out.bytes_total = out_size;
   out.packet_size = out_packet_size;
+
+  if (tx_enabled) {
+    char tx_err[128] = {0};
+    if (!iface.empty()) {
+      const std::uint8_t default_src_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+      int sent = 0;
+      int errors = 0;
+      const int tx_rc = afpkt_send_ring_bridge(
+          iface.c_str(), ptr, out_size, out_packet_size, batch_count,
+          default_src_mac, &sent, &errors, tx_err, sizeof(tx_err));
+      if (tx_rc != 0) {
+        err = tx_err[0] ? std::string(tx_err) : "gpu_afpacket_ring_tx_failed";
+        return false;
+      }
+      out.packets_sent = std::max(0, sent);
+      out.packets_errors = std::max(0, errors);
+      out.transmitted_on_wire = true;
+      out.tx_note = "gpu_native_capi+afpacket:tx_ring";
+    } else {
+      afpkt_tx_metrics_t m{};
+      const int tx_rc = afpkt_send_l3_ex(
+          target_ip_norm.c_str(), static_cast<int>(env.target_port),
+          ptr, out_size, out_packet_size, batch_count, ipg_ns,
+          nullptr, &m, tx_err, sizeof(tx_err));
+      if (tx_rc != 0) {
+        err = tx_err[0] ? std::string(tx_err) : "gpu_afpacket_l3_tx_failed";
+        return false;
+      }
+      out.packets_sent = std::max(0, m.sent);
+      out.packets_errors = std::max(0, m.errors);
+      out.transmitted_on_wire = true;
+      out.tx_note = "gpu_native_capi+afpacket:l3";
+    }
+  }
+
   return true;
 }
 
@@ -931,12 +978,16 @@ int main(int argc, char** argv) {
         std::uint64_t packets_errors = 0;
         std::uint64_t bytes_sent = 0;
 
+        const long long ipg_ns =
+            (pace_cfg.mode == SAMURAI_PACING_IPG) ? static_cast<long long>(pace_cfg.ipg_ns) : 0;
+        std::string run_note = "gpu_native_capi+pacing_static";
+
         int remaining = total_packets;
         while (remaining > 0) {
           const int current = std::min(batch_size, remaining);
           NativeResult gen{};
           std::string gen_err;
-          if (!RunGpuNativeBatch(api, env, current, gen, gen_err)) {
+          if (!RunGpuNativeBatch(api, env, current, ipg_ns, gen, gen_err)) {
             (void)SendFrame(
                 push,
                 static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
@@ -947,35 +998,65 @@ int main(int argc, char** argv) {
             packets_errors += static_cast<std::uint64_t>(current);
             break;
           }
+          run_note = gen.tx_note;
 
           const std::uint64_t packet_size_u = static_cast<std::uint64_t>(std::max(1, gen.packet_size));
-          for (int i = 0; i < current; ++i) {
-            samurai_pacing_wait_next(&pace_state, &pace_cfg);
-            packets_sent += 1u;
-            bytes_sent += packet_size_u;
-            if ((static_cast<std::uint32_t>(i) & 0x3FFu) == 0u) {
-              const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
-              if (now_ns - last_hb_ns >= 1'000'000'000ull) {
-                (void)SendFrame(
-                    push,
-                    static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
-                    header.correlation_id,
-                    samurai::wire::WorkerKind::GPU,
-                    job_id);
-                last_hb_ns = now_ns;
-              }
-              if (now_ns - last_metric_ns >= 2'000'000'000ull) {
-                const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
-                    now_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
-                (void)SendFrame(
-                    push,
-                    static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
-                    header.correlation_id,
-                    samurai::wire::WorkerKind::GPU,
-                    job_id,
-                    SerializeSnapshot(snap));
-                last_metric_ns = now_ns;
-                last_hb_ns = now_ns;
+          if (gen.transmitted_on_wire) {
+            packets_sent += static_cast<std::uint64_t>(gen.packets_sent);
+            packets_errors += static_cast<std::uint64_t>(gen.packets_errors);
+            bytes_sent += static_cast<std::uint64_t>(gen.packets_sent) * packet_size_u;
+            const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+            if (now_ns - last_hb_ns >= 1'000'000'000ull) {
+              (void)SendFrame(
+                  push,
+                  static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
+                  header.correlation_id,
+                  samurai::wire::WorkerKind::GPU,
+                  job_id);
+              last_hb_ns = now_ns;
+            }
+            if (now_ns - last_metric_ns >= 2'000'000'000ull) {
+              const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
+                  now_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
+              (void)SendFrame(
+                  push,
+                  static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
+                  header.correlation_id,
+                  samurai::wire::WorkerKind::GPU,
+                  job_id,
+                  SerializeSnapshot(snap));
+              last_metric_ns = now_ns;
+              last_hb_ns = now_ns;
+            }
+          } else {
+            for (int i = 0; i < current; ++i) {
+              samurai_pacing_wait_next(&pace_state, &pace_cfg);
+              packets_sent += 1u;
+              bytes_sent += packet_size_u;
+              if ((static_cast<std::uint32_t>(i) & 0x3FFu) == 0u) {
+                const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+                if (now_ns - last_hb_ns >= 1'000'000'000ull) {
+                  (void)SendFrame(
+                      push,
+                      static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
+                      header.correlation_id,
+                      samurai::wire::WorkerKind::GPU,
+                      job_id);
+                  last_hb_ns = now_ns;
+                }
+                if (now_ns - last_metric_ns >= 2'000'000'000ull) {
+                  const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
+                      now_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
+                  (void)SendFrame(
+                      push,
+                      static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
+                      header.correlation_id,
+                      samurai::wire::WorkerKind::GPU,
+                      job_id,
+                      SerializeSnapshot(snap));
+                  last_metric_ns = now_ns;
+                  last_hb_ns = now_ns;
+                }
               }
             }
           }
@@ -1002,7 +1083,7 @@ int main(int argc, char** argv) {
             bytes_sent,
             snap.actual_rps,
             snap.rate_accuracy_pct,
-            "gpu_native_capi+pacing_static",
+            run_note,
             TryReadContractExportRegionSpec(api));
         (void)SendFrame(
             push,

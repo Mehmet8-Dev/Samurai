@@ -33,6 +33,7 @@ struct CliOptions {
   std::vector<std::string> deny_targets;   // --deny-target IP|CIDR (repeatable)
   std::string license_key;                 // --license-key KEY
   std::string license_file;                // --license-file PATH
+  bool confirm = false;                    // --confirm: confirm live dataplane execution
 };
 
 }  // namespace samurai::cli

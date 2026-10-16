@@ -67,6 +67,7 @@ target_link_libraries(samurai_cpu_worker PRIVATE pacing_engine_static cpu_native
 add_samurai_worker(samurai_gpu_worker daemon/gpu_worker.cpp)
 # Link the af_packet engine so the CUDA host path's weak AF_PACKET TX_RING
 # bridge symbols (afpkt_send_ring_bridge/afpkt_cleanup_ring_bridge) resolve.
+target_include_directories(samurai_gpu_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
 target_link_libraries(samurai_gpu_worker PRIVATE pacing_engine_static af_packet_static pthread dl)
 add_samurai_worker(samurai_dpdk_worker daemon/dpdk_worker.cpp)
 # Tek native DPDK çekirdeği (dpdk/dpdk_core) artık samurai_l7emu içinde konsolide

@@ -1219,6 +1219,7 @@ static int l3_send_sendmmsg(
     const uint8_t* buffer,
     int packet_size,
     int count,
+    const volatile int* stop_flag,
     afpkt_tx_metrics_t* metrics
 ) {
     struct mmsghdr msgs[BATCH_SIZE];
@@ -1229,9 +1230,14 @@ static int l3_send_sendmmsg(
     int total_sent = 0;
     int eagain_retry_count = 0;
     int partial_send_retry_count = 0;
+    int aborted = 0;
     const char* data_ptr = (const char*)buffer;
 
     for (int pkt_idx = 0; pkt_idx < count; ) {
+        if (stop_flag && *stop_flag) {
+            aborted = 1;
+            break;
+        }
         int batch = count - pkt_idx;
         if (batch > BATCH_SIZE) {
             batch = BATCH_SIZE;
@@ -1250,6 +1256,10 @@ static int l3_send_sendmmsg(
 
         int retval = sendmmsg(sockfd, msgs, batch, 0);
         if (retval < 0) {
+            if (stop_flag && *stop_flag) {
+                aborted = 1;
+                break;
+            }
             if (errno == EINTR) {
                 continue;
             }
@@ -1275,8 +1285,13 @@ static int l3_send_sendmmsg(
     metrics->sent = total_sent;
     metrics->eagain_retry_count = eagain_retry_count;
     metrics->partial_send_retry_count = partial_send_retry_count;
-    metrics->errors = count - total_sent;
-    if (metrics->errors < 0) metrics->errors = 0;
+    if (aborted) {
+        metrics->attempted = total_sent;
+        metrics->errors = 0;
+    } else {
+        metrics->errors = count - total_sent;
+        if (metrics->errors < 0) metrics->errors = 0;
+    }
     return 0;
 }
 
@@ -1287,6 +1302,7 @@ static int l3_send_txtime(
     int packet_size,
     int count,
     long long ipg_ns,
+    const volatile int* stop_flag,
     afpkt_tx_metrics_t* metrics,
     char* err_msg,
     size_t err_msg_len
@@ -1307,6 +1323,7 @@ static int l3_send_txtime(
 
     int total_sent = 0;
     int tx_errors = 0;
+    int aborted = 0;
     const char* data_ptr = (const char*)buffer;
 
     struct timespec ts_tai;
@@ -1317,6 +1334,10 @@ static int l3_send_txtime(
     char cmsgbuf[CMSG_SPACE(sizeof(uint64_t))];
 
     for (int i = 0; i < count; i++) {
+        if (stop_flag && *stop_flag) {
+            aborted = 1;
+            break;
+        }
         struct iovec iov;
         iov.iov_base = (void*)(data_ptr + ((uint64_t)i * packet_size));
         iov.iov_len = packet_size;
@@ -1353,14 +1374,18 @@ static int l3_send_txtime(
 
     metrics->sent = total_sent;
     metrics->errors = tx_errors;
+    if (aborted) {
+        metrics->attempted = total_sent + tx_errors;
+    }
     return 0;
 }
 
-int afpkt_send_l3(const char* target_ip, int target_port,
-                  const uint8_t* buffer, size_t buffer_len,
-                  int packet_size, int count, long long ipg_ns,
-                  afpkt_tx_metrics_t* metrics,
-                  char* err_msg, size_t err_msg_len) {
+int afpkt_send_l3_ex(const char* target_ip, int target_port,
+                     const uint8_t* buffer, size_t buffer_len,
+                     int packet_size, int count, long long ipg_ns,
+                     const volatile int* stop_flag,
+                     afpkt_tx_metrics_t* metrics,
+                     char* err_msg, size_t err_msg_len) {
     if (!metrics) return -1;
     memset(metrics, 0, sizeof(*metrics));
     if (err_msg && err_msg_len > 0) err_msg[0] = '\0';
@@ -1395,13 +1420,23 @@ int afpkt_send_l3(const char* target_ip, int target_port,
 
     int rc;
     if (ipg_ns > 0) {
-        rc = l3_send_txtime(sockfd, &addr, buffer, packet_size, count, ipg_ns, metrics, err_msg, err_msg_len);
+        rc = l3_send_txtime(sockfd, &addr, buffer, packet_size, count, ipg_ns, stop_flag, metrics, err_msg, err_msg_len);
     } else {
-        rc = l3_send_sendmmsg(sockfd, &addr, buffer, packet_size, count, metrics);
+        rc = l3_send_sendmmsg(sockfd, &addr, buffer, packet_size, count, stop_flag, metrics);
     }
 
     close(sockfd);
     return rc;
+}
+
+int afpkt_send_l3(const char* target_ip, int target_port,
+                  const uint8_t* buffer, size_t buffer_len,
+                  int packet_size, int count, long long ipg_ns,
+                  afpkt_tx_metrics_t* metrics,
+                  char* err_msg, size_t err_msg_len) {
+    return afpkt_send_l3_ex(target_ip, target_port, buffer, buffer_len,
+                            packet_size, count, ipg_ns, NULL,
+                            metrics, err_msg, err_msg_len);
 }
 
 int afpkt_send_ring(const char* iface,

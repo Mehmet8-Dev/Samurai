@@ -121,6 +121,11 @@ TxResult tx_burst(int64_t handle, uint16_t queue_id, const uint8_t* src,
 TxResult send_batch(int64_t handle, uint16_t queue_id, const uint8_t* buf,
                     uint16_t packet_size, uint64_t count);
 
+// TX mempool nesnelerini şablon paketle önceden doldurur. Sonraki tx_burst /
+// send_batch çağrılarında yalnızca ilk 64 baytlık L2/L3/L4 başlık mutasyonu
+// yapılarak tam paket memcpy yükü ortadan kaldırılır.
+bool prepopulate_tx_pool(int64_t handle, const uint8_t* template_pkt, uint16_t packet_size);
+
 // UDP hızlı-yol şablonunu yapılandır.
 bool configure_udp_flow(int64_t handle, const UdpFlowConfig& cfg, std::string& err);
 

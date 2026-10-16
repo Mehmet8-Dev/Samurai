@@ -198,6 +198,8 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
     } else if (a == "--license-file") {
       if (!NeedsValue(i, argc, "--license-file")) return ParseStatus::kError;
       out.license_file = argv[++i];
+    } else if (a == "--confirm") {
+      out.confirm = true;
     } else {
       std::fprintf(stderr, "samurai: unknown argument: %s\n", a.c_str());
       return ParseStatus::kError;

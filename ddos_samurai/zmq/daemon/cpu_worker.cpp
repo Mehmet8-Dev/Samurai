@@ -184,29 +184,38 @@ int main(int argc, char** argv) {
         // Relates to #4
         const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
         std::atomic<bool> stop_flag{false};
+        volatile int c_stop_flag = 0;
         std::atomic<bool> worker_done{false};
 
         // Shared result state — written only by the worker thread, read after join.
         std::uint64_t packets_sent = 0;
         std::uint64_t bytes_sent = 0;
         std::uint64_t packets_errors = 0;
+        int tx_rc = 0;
+        std::string tx_err_msg;
         std::string done_note = "done";
 
         std::thread packet_thread([&]() {
           const std::size_t stride = pool.packet_size;
           if (stride == 0 || pool.size() < stride) {
             packets_errors = static_cast<std::uint64_t>(packet_count);
+            tx_rc = -1;
+            tx_err_msg = "invalid_packet_pool_stride";
           } else if (samurai::daemon::AfPacketTxEnabled()) {
             // Real transmission over the af_packet kernel-socket backend.
             const long long ipg_ns =
                 (pace_cfg.mode == SAMURAI_PACING_IPG) ? static_cast<long long>(pace_cfg.ipg_ns) : 0;
             const auto tx = samurai::daemon::AfPacketSendPool(
-                cfg, pool.data(), pool.size(), static_cast<int>(stride), packet_count, ipg_ns);
+                cfg, pool.data(), pool.size(), static_cast<int>(stride),
+                packet_count, ipg_ns, &c_stop_flag);
             packets_sent = tx.packets_sent;
             packets_errors = tx.packets_errors;
             bytes_sent = tx.bytes_sent;
+            tx_rc = tx.rc;
+            tx_err_msg = tx.error_msg;
             done_note = tx.note;
           } else {
+            done_note = "simulated:dry_run";
             for (int i = 0; i < packet_count; ++i) {
               // Check stop_flag every iteration for responsive abort handling.
               if (stop_flag.load(std::memory_order_relaxed)) {
@@ -240,11 +249,13 @@ int main(int argc, char** argv) {
                 const auto ctrl_type = static_cast<samurai::wire::MessageType>(ctrl_hdr.msg_type);
                 const std::string ctrl_jid = samurai::daemon::ReadJobId(ctrl_hdr);
                 if (ctrl_type == samurai::wire::MessageType::SHUTDOWN) {
+                  c_stop_flag = 1;
                   stop_flag.store(true, std::memory_order_release);
                   (void)SendAck(push, ctrl_hdr.correlation_id, ctrl_jid);
                   running = false;  // Exit outer loop after worker joins.
                 } else if (ctrl_type == samurai::wire::MessageType::ABORT ||
                            ctrl_type == samurai::wire::MessageType::STOP_JOB) {
+                  c_stop_flag = 1;
                   stop_flag.store(true, std::memory_order_release);
                   (void)SendAck(push, ctrl_hdr.correlation_id, ctrl_jid);
                 }
@@ -260,6 +271,17 @@ int main(int argc, char** argv) {
 
         // Wait for the packet thread to finish.
         packet_thread.join();
+
+        if (tx_rc != 0) {
+          (void)SendFrame(
+              push,
+              static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+              header.correlation_id,
+              samurai::wire::WorkerKind::CPU,
+              job_id,
+              JsonError(tx_err_msg.empty() ? "afpacket_tx_failed" : tx_err_msg));
+          continue;
+        }
 
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
         const double duration_s = std::max(1e-9, static_cast<double>(end_ns - start_ns) / 1e9);

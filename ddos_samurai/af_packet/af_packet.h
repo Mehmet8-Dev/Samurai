@@ -146,6 +146,15 @@ int afpkt_send_l3(const char* target_ip, int target_port,
                   afpkt_tx_metrics_t* metrics,
                   char* err_msg, size_t err_msg_len);
 
+/* Interruptible variant of afpkt_send_l3: polls `*stop_flag` (when non-NULL)
+ * between sendmmsg batches / SO_TXTIME frames for sub-5ms abort latency. */
+int afpkt_send_l3_ex(const char* target_ip, int target_port,
+                     const uint8_t* buffer, size_t buffer_len,
+                     int packet_size, int count, long long ipg_ns,
+                     const volatile int* stop_flag,
+                     afpkt_tx_metrics_t* metrics,
+                     char* err_msg, size_t err_msg_len);
+
 /* L2 transmit over an AF_PACKET TX_RING bound to `iface`. `buffer` holds `count`
  * full Ethernet frames of `packet_size` bytes each; `mac` is the source MAC.
  * Returns 0 on success, -1 on setup failure. Requires CAP_NET_RAW. */

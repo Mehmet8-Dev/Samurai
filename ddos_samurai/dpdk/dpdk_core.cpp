@@ -63,6 +63,9 @@ struct PortState {
     // K3: capability'ye göre etkinleştirilen TX checksum offload'ları.
     bool hw_tx_cksum_ipv4 = false;
     bool hw_tx_cksum_udp = false;
+    // Zero-copy mempool template pre-population and header mutation.
+    bool pool_prepopulated = false;
+    uint16_t prepopulated_pkt_size = 0;
 };
 
 struct Context {
@@ -335,6 +338,21 @@ bool ensure_port_ready(uint16_t port_id, uint16_t num_tx_queues,
     return true;
 }
 
+struct PrepopulateArg {
+    const uint8_t* data;
+    uint16_t len;
+};
+
+static void prepopulate_mbuf_cb(struct rte_mempool* mp, void* opaque, void* obj, unsigned obj_idx) {
+    (void)mp; (void)obj_idx;
+    auto* arg = static_cast<const PrepopulateArg*>(opaque);
+    struct rte_mbuf* m = static_cast<struct rte_mbuf*>(obj);
+    uint8_t* dst = rte_pktmbuf_mtod(m, uint8_t*);
+    std::memcpy(dst, arg->data, arg->len);
+    m->data_len = arg->len;
+    m->pkt_len = arg->len;
+}
+
 // Tek burst gönderiminin ortak gövdesi. Çağıran shared_lock tutuyor olmalıdır.
 // src en az batch*packet_size bayt içermelidir.
 samurai::dpdk::TxResult do_tx_burst(uint16_t port_id, uint16_t queue_id,
@@ -345,6 +363,19 @@ samurai::dpdk::TxResult do_tx_burst(uint16_t port_id, uint16_t queue_id,
         return r;
     }
 
+    constexpr uint16_t kHeaderMutationBytes = 64;
+    auto it_port = g_ports.find(port_id);
+    const bool use_fast_mutation = (packet_size > kHeaderMutationBytes);
+    if (it_port != g_ports.end() && use_fast_mutation) {
+        PortState& pst = it_port->second;
+        if (!pst.pool_prepopulated || pst.prepopulated_pkt_size != packet_size) {
+            PrepopulateArg arg{src, packet_size};
+            rte_mempool_obj_iter(mempool, prepopulate_mbuf_cb, &arg);
+            pst.pool_prepopulated = true;
+            pst.prepopulated_pkt_size = packet_size;
+        }
+    }
+
     rte_mbuf* mbufs[kMaxBurst];
     if (rte_pktmbuf_alloc_bulk(mempool, mbufs, batch) != 0) {
         r.alloc_failures += batch;
@@ -353,10 +384,14 @@ samurai::dpdk::TxResult do_tx_burst(uint16_t port_id, uint16_t queue_id,
         return r;
     }
 
+    const uint16_t copy_bytes = (it_port != g_ports.end() && it_port->second.pool_prepopulated && use_fast_mutation)
+                                    ? kHeaderMutationBytes
+                                    : packet_size;
+
     for (uint16_t i = 0; i < batch; ++i) {
         const uint8_t* s = src + static_cast<std::size_t>(i) * packet_size;
         uint8_t* dst = rte_pktmbuf_mtod(mbufs[i], uint8_t*);
-        std::memcpy(dst, s, packet_size);
+        std::memcpy(dst, s, copy_bytes);
         mbufs[i]->data_len = packet_size;
         mbufs[i]->pkt_len = packet_size;
     }
@@ -562,6 +597,26 @@ TxResult send_batch(int64_t handle, uint16_t queue_id, const uint8_t* buf,
     it->second.tx_dropped.fetch_add(total.dropped, std::memory_order_relaxed);
     it->second.mbuf_alloc_failures.fetch_add(total.alloc_failures, std::memory_order_relaxed);
     return total;
+}
+
+bool prepopulate_tx_pool(int64_t handle, const uint8_t* template_pkt, uint16_t packet_size) {
+    if (template_pkt == nullptr || packet_size == 0) {
+        return false;
+    }
+    std::unique_lock<std::shared_mutex> lock(g_mu);
+    auto it = g_contexts.find(static_cast<long>(handle));
+    if (it == g_contexts.end()) {
+        return false;
+    }
+    auto pt = g_ports.find(it->second.port_id);
+    if (pt == g_ports.end() || !pt->second.mempool) {
+        return false;
+    }
+    PrepopulateArg arg{template_pkt, packet_size};
+    rte_mempool_obj_iter(pt->second.mempool, prepopulate_mbuf_cb, &arg);
+    pt->second.pool_prepopulated = true;
+    pt->second.prepopulated_pkt_size = packet_size;
+    return true;
 }
 
 bool configure_udp_flow(int64_t handle, const UdpFlowConfig& cfg, std::string& err) {
@@ -1048,6 +1103,7 @@ bool register_lcore_thread() { return false; }
 void unregister_lcore_thread() {}
 TxResult tx_burst(int64_t, uint16_t, const uint8_t*, uint16_t, uint16_t) { return {}; }
 TxResult send_batch(int64_t, uint16_t, const uint8_t*, uint16_t, uint64_t) { return {}; }
+bool prepopulate_tx_pool(int64_t, const uint8_t*, uint16_t) { return false; }
 bool configure_udp_flow(int64_t, const UdpFlowConfig&, std::string& err) {
     err = "dpdk_not_built";
     return false;
