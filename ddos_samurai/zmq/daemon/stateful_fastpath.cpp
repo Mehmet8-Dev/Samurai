@@ -20,10 +20,27 @@
 #include "../../l4/tcp_dataplane_ffi.h"
 #include "../../l4/tcp_dataplane_core.hpp"
 
+#if defined(__i386__) || defined(__x86_64__)
+#include <immintrin.h>
+#define SAMURAI_CPU_RELAX() _mm_pause()
+#elif defined(__aarch64__)
+#define SAMURAI_CPU_RELAX() __asm__ volatile("yield")
+#else
+#define SAMURAI_CPU_RELAX() do {} while (0)
+#endif
+
 namespace samurai::daemon {
 namespace {
 
 constexpr std::uint16_t kFrameStride = 2048;  // tek RX slot boyutu
+
+bool IsFastpathBusyPoll() {
+  static const bool enabled = []() {
+    const char* e = std::getenv("SAMURAI_FASTPATH_BUSY_POLL");
+    return e != nullptr && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0);
+  }();
+  return enabled;
+}
 
 std::uint32_t EnvU32(const char* name, std::uint32_t fallback) {
   const char* v = std::getenv(name);
@@ -192,6 +209,7 @@ FastpathResult StatefulFastpathDriver::Run(
     if (hooks.emit_metric) hooks.emit_metric(snap);
   };
 
+  std::uint32_t idle_spins = 0;
   while (true) {
     const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
     bool did_work = false;
@@ -274,10 +292,14 @@ FastpathResult StatefulFastpathDriver::Run(
       if (deadline_hit || ext_stop) break;
     }
 
-    // 6) İş yoksa CPU'yu yakma.
+    // 6) İş yoksa DPDK tarzı kesintisiz döngüde (cpu_relax) bekle, sıfır uyku.
     if (!did_work) {
-      struct timespec ts { 0, 200'000L };  // 200 us
-      nanosleep(&ts, nullptr);
+      SAMURAI_CPU_RELAX();
+      if (!IsFastpathBusyPoll() && ++idle_spins > 1024) {
+        std::this_thread::yield();
+      }
+    } else {
+      idle_spins = 0;
     }
   }
 
@@ -325,6 +347,7 @@ void RunShardWorker(ddos_samurai::tcpdp::TcpDataplaneCore& core, FastpathTxRxShi
   const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
   const std::uint64_t deadline_ns = start_ns + p.max_duration_ms * 1'000'000ull;
   std::uint64_t drain_started_ns = 0;
+  std::uint32_t idle_spins = 0;
 
   while (true) {
     const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
@@ -380,10 +403,12 @@ void RunShardWorker(ddos_samurai::tcpdp::TcpDataplaneCore& core, FastpathTxRxShi
     }
 
     if (!did_work) {
-      struct timespec ts {
-        0, 50'000
-      };  // 50µs idle backoff
-      nanosleep(&ts, nullptr);
+      SAMURAI_CPU_RELAX();
+      if (!IsFastpathBusyPoll() && ++idle_spins > 1024) {
+        std::this_thread::yield();
+      }
+    } else {
+      idle_spins = 0;
     }
   }
 
@@ -449,6 +474,160 @@ FastpathResult ShardedFastpathDriver::Run(const FastpathParams& p, const std::at
         }
       }
       RunShardWorker(core, *shim, p, seeded, stop, results[w]);
+    });
+  }
+  for (auto& t : threads) t.join();
+
+  FastpathResult total;
+  for (std::uint32_t w = 0; w < n; ++w) {
+    const auto& r = results[w];
+    total.tx_packets += r.tx_packets;
+    total.tx_bytes += r.tx_bytes;
+    total.tx_errors += r.tx_errors;
+    total.rx_frames += r.rx_frames;
+    total.connect_attempts += r.connect_attempts;
+    total.connect_established += r.connect_established;
+    total.retransmit_count += r.retransmit_count;
+    total.retransmit_exhausted += r.retransmit_exhausted;
+    total.connect_timeout += r.connect_timeout;
+    total.rx_available = total.rx_available || r.rx_available;
+  }
+  if (per_worker) *per_worker = std::move(results);
+  return total;
+}
+
+FastpathResult ShardedFastpathDriver::RunL7(
+    const FastpathParams& p,
+    const ShardL7Runner& runner,
+    const std::atomic<bool>& stop,
+    std::vector<FastpathResult>* per_worker) {
+  std::uint32_t n = cfg_.workers;
+  if (n == 0) {
+    n = std::thread::hardware_concurrency();
+    if (n == 0) n = 1;
+  }
+  resolved_workers_ = n;
+
+  std::vector<FastpathResult> results(n);
+  std::vector<std::thread> threads;
+  threads.reserve(n);
+
+  for (std::uint32_t w = 0; w < n; ++w) {
+    threads.emplace_back([this, &p, &stop, &results, &runner, w]() {
+      if (cfg_.cpu_base >= 0) {
+        PinThisThread(cfg_.cpu_base + static_cast<int>(w));
+      }
+      std::unique_ptr<FastpathTxRxShim> shim = factory_(w);
+      if (!shim) return;
+
+      ddos_samurai::tcpdp::TcpDataplaneCore core;
+      ddos_samurai::tcpdp::TcpDpConfig cfg;
+      cfg.mode = p.mode;
+      cfg.backend = p.backend;
+      cfg.initial_rto_ms = p.initial_rto_ms;
+      cfg.max_retransmits = p.max_retransmits;
+      cfg.connect_timeout_ms = p.connect_timeout_ms;
+      cfg.idle_timeout_ms = p.idle_timeout_ms;
+      (void)core.Configure(cfg);
+
+      tcpdp_core_bind_current(&core);
+      tcpdp_set_ephemeral_port_base(10000 + static_cast<uint16_t>(w) * 2000);
+      tcpdp_set_flow_id_base(static_cast<std::uint64_t>(w + 1) << 40);
+
+      auto& out = results[w];
+      out.rx_available = shim->RxAvailable();
+
+      std::atomic<bool> l7_done{false};
+      std::atomic<bool> internal_stop{false};
+
+      std::thread l7_worker([&]() {
+        tcpdp_core_bind_current(&core);
+        if (runner) {
+          runner(w, core, *shim, internal_stop);
+        }
+        l7_done.store(true, std::memory_order_release);
+        tcpdp_core_bind_current(nullptr);
+      });
+
+      const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
+      const std::uint64_t deadline_ns = start_ns + p.max_duration_ms * 1'000'000ull;
+      std::uint64_t drain_started_ns = 0;
+      std::vector<std::uint8_t> rxbuf(static_cast<std::size_t>(kFrameStride) * p.rx_budget);
+      std::vector<std::uint16_t> rxlens(p.rx_budget);
+      std::string err;
+      std::uint32_t idle_spins = 0;
+
+      while (true) {
+        const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+        bool did_work = false;
+
+        if (shim->RxAvailable()) {
+          const int n_rx = shim->Recv(rxbuf.data(), kFrameStride, rxlens.data(), p.rx_budget, err);
+          if (n_rx > 0) {
+            for (int i = 0; i < n_rx; ++i) {
+              (void)core.IngestRxFrame(rxbuf.data() + static_cast<std::size_t>(i) * kFrameStride,
+                                       rxlens[static_cast<std::size_t>(i)]);
+            }
+            out.rx_frames += static_cast<std::uint64_t>(n_rx);
+            did_work = true;
+          }
+        }
+
+        if (core.Poll(now_ns, 1024) > 0) did_work = true;
+
+        for (int guard = 0; guard < 16; ++guard) {
+          const std::uint8_t* base = nullptr;
+          std::uint32_t count = 0;
+          std::size_t psize = 0, stride = 0;
+          if (!core.PeekTxPacketsStrided(0, &base, &count, &psize, &stride)) break;
+          if (base == nullptr || count == 0 || psize == 0) break;
+          const int sent = shim->Send(base, psize, stride, count, err);
+          if (sent < 0) {
+            out.tx_errors += count;
+            (void)core.ConsumeTxPackets(count);
+            break;
+          }
+          if (sent == 0) break;
+          (void)core.ConsumeTxPackets(static_cast<std::uint32_t>(sent));
+          out.tx_packets += static_cast<std::uint64_t>(sent);
+          out.tx_bytes += static_cast<std::uint64_t>(sent) * static_cast<std::uint64_t>(psize);
+          did_work = true;
+          if (static_cast<std::uint32_t>(sent) < count) break;
+        }
+
+        const bool deadline_hit = now_ns >= deadline_ns;
+        const bool ext_stop = stop.load(std::memory_order_relaxed);
+        if (deadline_hit || ext_stop) {
+          internal_stop.store(true, std::memory_order_relaxed);
+        }
+
+        if (l7_done.load(std::memory_order_acquire)) {
+          if (drain_started_ns == 0) drain_started_ns = now_ns;
+          if (now_ns - drain_started_ns >= p.drain_ms * 1'000'000ull) break;
+        }
+        if (deadline_hit || ext_stop) {
+          if (l7_done.load(std::memory_order_acquire)) break;
+        }
+
+        if (!did_work) {
+          SAMURAI_CPU_RELAX();
+          if (!IsFastpathBusyPoll() && ++idle_spins > 1024) {
+            std::this_thread::yield();
+          }
+        } else {
+          idle_spins = 0;
+        }
+      }
+
+      l7_worker.join();
+      tcpdp_core_bind_current(nullptr);
+
+      const auto st = core.SnapshotStats();
+      out.connect_attempts = st.connect_attempts;
+      out.connect_established = st.connect_established;
+      out.retransmit_count = st.retransmit_count;
+      out.retransmit_exhausted = st.retransmit_exhausted_count;
+      out.connect_timeout = st.connect_timeout_count;
     });
   }
   for (auto& t : threads) t.join();

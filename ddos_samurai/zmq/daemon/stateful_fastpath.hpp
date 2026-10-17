@@ -22,6 +22,10 @@
 #include "pacing_engine.h"
 #include "wire_protocol.h"
 
+namespace ddos_samurai::tcpdp {
+class TcpDataplaneCore;
+}
+
 namespace samurai::daemon {
 
 // Byte-oriented, simetrik TX/RX taşıma arayüzü. DPDK ve AF_XDP bu arayüzü
@@ -139,6 +143,16 @@ class ShardedFastpathDriver {
   // per_worker != nullptr ise her worker'ın kendi FastpathResult'ı da yazılır.
   FastpathResult Run(const FastpathParams& p, const std::atomic<bool>& stop,
                      std::vector<FastpathResult>* per_worker = nullptr);
+
+  // L7 shared-nothing modu: her worker kendi core'u ve shim'i üzerinde izole çalışır.
+  using ShardL7Runner = std::function<void(std::uint32_t worker_idx,
+                                           ddos_samurai::tcpdp::TcpDataplaneCore& core,
+                                           FastpathTxRxShim& shim,
+                                           const std::atomic<bool>& stop)>;
+  FastpathResult RunL7(const FastpathParams& p,
+                       const ShardL7Runner& runner,
+                       const std::atomic<bool>& stop,
+                       std::vector<FastpathResult>* per_worker = nullptr);
 
   std::uint32_t worker_count() const { return resolved_workers_; }
 
