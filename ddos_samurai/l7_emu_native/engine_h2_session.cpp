@@ -144,6 +144,11 @@ void register_custom_tcp_h2_flow_binding(
   binding.lane_idx = client.session_idx;
   binding.h1_lane = nullptr;
   binding.h2_session = &client;
+  const uint64_t sh_prefix = client.ctx.custom_flow_id >> 40;
+  if (sh_prefix > 0 && (sh_prefix - 1) < runtime.local_shards.size()) {
+    runtime.local_shards[sh_prefix - 1].custom_tcp_flow_registry[client.ctx.custom_flow_id] = binding;
+    return;
+  }
   std::lock_guard<std::mutex> lk(custom_tcp_registry_mu());
   runtime.custom_tcp_flow_registry[client.ctx.custom_flow_id] = binding;
 }
@@ -1055,16 +1060,21 @@ bool submit_h2_request(
   stream->scenario_on_failure = raw_request.scenario_on_failure;
   stream->request_start_ms = monotonic_ms_now();
 
-  std::vector<nghttp2_nv> hdrs;
+  const std::string& method_str = stream->request_method.empty() ? "GET" : stream->request_method;
+  const std::string& scheme_str = profile.scheme.empty() ? (ctx.use_tls ? "https" : "http") : profile.scheme;
+  const std::string& auth_str = ctx.authority;
+  const std::string& path_str = stream->request_path.empty() ? "/" : stream->request_path;
+
   const std::size_t header_capacity = 4 + stream->request_header_count;
-  hdrs.reserve(header_capacity);
+  std::vector<nghttp2_nv> dynamic_hdrs;
+  dynamic_hdrs.reserve(header_capacity);
   std::vector<std::string>& header_names = stream->submit_header_names;
   std::vector<std::string>& header_values = stream->submit_header_values;
   header_names.clear();
   header_values.clear();
   header_names.reserve(header_capacity);
   header_values.reserve(header_capacity);
-  auto add_header = [&hdrs, &header_names, &header_values](const std::string& key, const std::string& value) {
+  auto add_header = [&dynamic_hdrs, &header_names, &header_values](const std::string& key, const std::string& value) {
     header_names.push_back(key);
     header_values.push_back(value);
     nghttp2_nv nv {};
@@ -1073,13 +1083,13 @@ bool submit_h2_request(
     nv.namelen = header_names.back().size();
     nv.valuelen = header_values.back().size();
     nv.flags = NGHTTP2_NV_FLAG_NONE;
-    hdrs.push_back(nv);
+    dynamic_hdrs.push_back(nv);
   };
 
-  add_header(":method", stream->request_method.empty() ? "GET" : stream->request_method);
-  add_header(":scheme", profile.scheme.empty() ? (ctx.use_tls ? "https" : "http") : profile.scheme);
-  add_header(":authority", ctx.authority);
-  add_header(":path", stream->request_path.empty() ? "/" : stream->request_path);
+  add_header(":method", method_str);
+  add_header(":scheme", scheme_str);
+  add_header(":authority", auth_str);
+  add_header(":path", path_str);
   for (std::size_t idx = 0; idx < stream->request_header_count; ++idx) {
     const std::string& key = stream->request_headers[idx].key;
     const std::string& value = stream->request_headers[idx].value;
@@ -1098,7 +1108,7 @@ bool submit_h2_request(
   }
 
   const int32_t stream_id =
-      nghttp2_submit_request(client.session, nullptr, hdrs.data(), hdrs.size(), provider_ptr, stream.get());
+      nghttp2_submit_request(client.session, nullptr, dynamic_hdrs.data(), dynamic_hdrs.size(), provider_ptr, stream.get());
   if (stream_id < 0) {
     recycle_h2_stream_state(client, std::move(stream));
     return false;

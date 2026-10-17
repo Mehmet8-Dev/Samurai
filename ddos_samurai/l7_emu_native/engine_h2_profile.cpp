@@ -264,7 +264,7 @@ std::map<std::string, double> run_http2_profile(
   const bool own_wire_threaded = custom_tcp_use_own_wire(runtime, transport_backend, profile.protocol);
   const CustomTcpWireConfig wire_cfg =
       own_wire_threaded ? resolve_custom_tcp_wire_config() : CustomTcpWireConfig{};
-  const bool threaded = custom_tcp_threaded || kernel_threaded;
+  const bool threaded = custom_tcp_threaded || kernel_threaded || own_wire_threaded;
   if (threaded) {
     const std::size_t shard_count = runtime.shards.size();
     std::vector<DataplanePerfStats> shard_perf(shard_count);
@@ -380,7 +380,9 @@ std::map<std::string, double> run_http2_profile(
               break;
             }
             if (!did_work) {
-              std::this_thread::sleep_for(std::chrono::microseconds(50));
+              worker_idle_backoff();
+            } else {
+              worker_idle_reset();
             }
           }
           collect_shard_h2_stats(st, sh);
