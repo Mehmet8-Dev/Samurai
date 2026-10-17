@@ -41,15 +41,26 @@ void worker_idle_reset() {
   g_worker_idle_passes = 0;
 }
 
+static bool is_fastpath_busy_poll() {
+  static const bool enabled = []() {
+    const char* e = std::getenv("SAMURAI_FASTPATH_BUSY_POLL");
+    return e != nullptr && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0);
+  }();
+  return enabled;
+}
+
 void worker_idle_backoff() {
-  const int n = g_worker_idle_passes++;
-  if (n < 64) {
+  if (is_fastpath_busy_poll()) {
     cpu_relax();
-  } else if (n < 128) {
+    return;
+  }
+  const int n = g_worker_idle_passes++;
+  if (n < 256) {
+    cpu_relax();
+  } else if (n < 1024) {
     std::this_thread::yield();
   } else {
-    const int us = std::min(200, 10 + (n - 128));
-    std::this_thread::sleep_for(std::chrono::microseconds(us));
+    cpu_relax();
   }
 }
 
