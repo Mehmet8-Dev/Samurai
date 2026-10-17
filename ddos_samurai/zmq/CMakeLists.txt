@@ -152,3 +152,13 @@ target_include_directories(test_stateful_fastpath_l7 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../core
   ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native)
 target_link_libraries(test_stateful_fastpath_l7 PRIVATE pacing_engine_static samurai_l7emu samurai_core pthread)
+
+add_executable(bench_l7_stateful_userspace
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon/bench_l7_stateful_userspace.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
+target_include_directories(bench_l7_stateful_userspace PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon ${CMAKE_CURRENT_SOURCE_DIR}/lib
+  ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../core
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native)
+target_link_libraries(bench_l7_stateful_userspace PRIVATE pacing_engine_static samurai_l7emu samurai_core samurai_l4 pthread dl)
+
