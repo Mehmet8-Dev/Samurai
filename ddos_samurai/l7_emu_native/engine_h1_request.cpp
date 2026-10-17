@@ -265,6 +265,10 @@ std::vector<H1RequestSpec> build_h1_requests(const Profile& profile) {
       spec.body_template = compile_capture_template(
           std::string(reinterpret_cast<const char*>(profile.ops[j].body.data()), profile.ops[j].body.size()));
       ++j;
+    } else if (!op.body.empty()) {
+      spec.body_op = op;
+      spec.body_template = compile_capture_template(
+          std::string(reinterpret_cast<const char*>(op.body.data()), op.body.size()));
     }
     while (j < profile.ops.size()) {
       const FlowOp& follow = profile.ops[j];

@@ -743,7 +743,12 @@ json::Value run_profile_json(const json::Value& profile_dict, const json::Value&
     }
   }
   json::Value step_results = json::Value::Array();
-  for (const auto& row : consume_last_scenario_step_results()) {
+  // 1M gibi devasa ölçekli akışlarda JSON AST şişmesini ve bellek patlamasını
+  // engellemek için JSON detay adımları maksimum 10.000 örneklem ile sınırlandırılır.
+  const auto raw_steps = consume_last_scenario_step_results();
+  const std::size_t max_export = std::min<std::size_t>(raw_steps.size(), 10000);
+  for (std::size_t idx = 0; idx < max_export; ++idx) {
+    const auto& row = raw_steps[idx];
     json::Value it = json::Value::Object();
     it.set("flow", json::Value::Str(row.flow));
     it.set("vu_id", json::Value::Str(row.vu_id));

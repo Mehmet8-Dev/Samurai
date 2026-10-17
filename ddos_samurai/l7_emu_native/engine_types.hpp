@@ -681,6 +681,7 @@ struct NativeRuntime {
     std::vector<std::unique_ptr<H2ClientSession>> h2_sessions{};
 #endif
     ThreadLocalTlsContext* tls_tctx{nullptr};
+    std::unordered_map<uint64_t, CustomTcpFlowBinding> custom_tcp_flow_registry{};
   };
   std::vector<LocalShard> local_shards{};
   std::unique_ptr<TlsSessionEngine> tls_engine{};
@@ -760,7 +761,7 @@ struct ShardPortRange {
   std::uint16_t hi;
 };
 
-enum class WireKind { AfPacket, Dpdk };
+enum class WireKind { AfPacket, Dpdk, AfXdp, InMemory };
 
 struct CustomTcpWireConfig {
   std::string iface;
@@ -784,6 +785,7 @@ struct ShardWire {
   long dpdk_handle{0};
   uint16_t dpdk_queue{0};
   bool lcore_registered{false};
+  void* inmem_peer{nullptr};
 };
 
 }  // namespace ddos_samurai::l7_emu_native
