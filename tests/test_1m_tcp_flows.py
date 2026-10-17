@@ -42,10 +42,16 @@ class Test1mTcpFlows(unittest.TestCase):
 
             self.assertEqual(report.get("status"), "PASSED")
             self.assertEqual(report.get("num_flows"), 1000000)
+            self.assertEqual(report.get("tx_syn_drained"), 1000000)
+            self.assertEqual(report.get("handshakes_completed"), 1000000)
+            self.assertEqual(report.get("tx_ack_drained"), 1000000)
+            self.assertEqual(report.get("completions_collected"), 1000000)
+            self.assertEqual(report.get("single_total_packets"), 3000000)
+            self.assertEqual(report.get("shared_nothing_total_packets"), 3000000)
             self.assertLessEqual(report.get("shard_max_variance_pct", 100.0), 5.0)
-            self.assertGreater(report.get("cps", 0), 100000)  # Expect >= 100k CPS
+            self.assertGreater(report.get("cps", 0), 100000)
+            self.assertGreater(report.get("shared_nothing_cps", 0), 500000)
             self.assertGreater(report.get("bytes_per_flow", 0), 0)
-            self.assertEqual(report.get("handshakes_completed"), 50000)
 
     def test_python_4tuple_hash_distribution_1m(self):
         """Pure Python verification of 4-tuple hash distribution across 64 lock shards for 1,000,000 flows."""

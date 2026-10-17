@@ -1288,6 +1288,9 @@ TcpDpStatsSnapshot TcpDataplaneCore::SnapshotStats() const {
     out.congestion_window_reductions += stats_shard_[i].congestion_window_reductions.load(std::memory_order_relaxed);
     out.native_tls_handshakes_completed += stats_shard_[i].native_tls_handshakes_completed.load(std::memory_order_relaxed);
   }
+  out.tx_packets_queued = tx_packets_queued_.load(std::memory_order_relaxed);
+  out.tx_packets_drained = tx_packets_drained_.load(std::memory_order_relaxed);
+  out.tx_packets_sent = tx_packets_sent_.load(std::memory_order_relaxed);
   return out;
 }
 

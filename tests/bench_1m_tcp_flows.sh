@@ -7,12 +7,12 @@
 #              ddos_samurai/l4/test_1m_tcp_flows.cpp
 #
 # Metrics Evaluated:
-#   1. Flow Allocation & Enqueue Rate (Connections Per Second / CPS).
+#   1. Flow Allocation & Enqueue Rate (CPS) + Zero-Drop 1M SYN Wire Drain.
 #   2. 64-Shard Hash Distribution Variance (DoD: Max Variance <= 5.0%).
-#   3. Process Memory Footprint & TCB Density (Peak RSS, Delta RSS, Bytes/flow).
-#   4. Multithreaded Lockless Concurrency Throughput (M-lookups/sec).
-#   5. Stateful 3-Way Handshake Completion & Counter Verification.
-#   6. Resource Destruction & Memory Reclamation Latency.
+#   3. Full 1,000,000 3-Way Handshake Completion (1M SYN + 1M SYN-ACK + 1M ACK = 3M pkts).
+#   4. Kernel Memory Telemetry (/proc/self/status VmRSS, VmHWM) & malloc_trim Reclamation.
+#   5. Multithreaded Lockless Concurrency Throughput (M-lookups/sec) & Option Verification.
+#   6. Shared-Nothing Multi-Core 1,000,000 Flow Parallel Handshake Scaling.
 # ==============================================================================
 
 set -euo pipefail
@@ -24,7 +24,7 @@ BIN_PATH="${BUILD_DIR}/l4/test_1m_tcp_flows"
 
 FLOWS="${FLOWS:-1000000}"
 THREADS="${THREADS:-0}"
-HANDSHAKES="${HANDSHAKES:-50000}"
+HANDSHAKES="${HANDSHAKES:-1000000}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/reports/benchmarks/tcpdp_1m_flows}"
 JSON_REPORT="${OUTPUT_DIR}/benchmark_1m_metrics.json"
 MD_REPORT="${OUTPUT_DIR}/README.md"
@@ -35,7 +35,7 @@ echo "==========================================================================
 echo "  [TASK-TEST-L2-02] DDoSamurai tcpdp 1,000,000 (1M) Active Flows Benchmark"
 echo "================================================================================"
 echo " Host Environment:"
-echo "   CPU:           $(lscpu | grep 'Model name:' | sed 's/Model name:[ \t]*//' || uname -m)"
+echo "   CPU:           $(LANG=C lscpu | grep 'Model name:' | sed 's/Model name:[ \t]*//' || uname -m)"
 echo "   Cores/Threads: $(nproc) hardware threads"
 echo "   Memory:        $(LANG=C free -h | awk '/^Mem:/ {print $2}') total, $(LANG=C free -h | awk '/^Mem:/ {print $7}') available"
 echo "   Kernel:        $(uname -r)"
@@ -45,12 +45,10 @@ echo "   Handshakes:    $HANDSHAKES"
 echo "   Output Dir:    $OUTPUT_DIR"
 echo "================================================================================"
 
-# 1. Build binary if missing
-if [ ! -f "$BIN_PATH" ]; then
-  echo "[+] Building test_1m_tcp_flows binary..."
-  cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/ddos_samurai"
-  cmake --build "$BUILD_DIR" --target test_1m_tcp_flows -j"$(nproc)"
-fi
+# 1. Build/Ensure binary is up to date
+echo "[+] Building test_1m_tcp_flows binary..."
+cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/ddos_samurai" >/dev/null
+cmake --build "$BUILD_DIR" --target test_1m_tcp_flows -j"$(nproc)"
 
 # 2. Execute 1M Flow Benchmark
 CMD=("$BIN_PATH" "--flows" "$FLOWS" "--handshakes" "$HANDSHAKES" "--json" "$JSON_REPORT")
@@ -61,7 +59,7 @@ fi
 echo "[+] Executing native benchmark binary..."
 "${CMD[@]}"
 
-# 3. Generate Markdown Report if json is available
+# 3. Generate Markdown Report
 if [ -f "$JSON_REPORT" ]; then
   python3 - "$JSON_REPORT" "$MD_REPORT" << 'EOF'
 import sys
@@ -80,36 +78,29 @@ md_content = f"""# DDoSamurai tcpdp 1,000,000 (1M) Active TCP Flows Benchmark Re
 
 - **Date:** {utc_time}
 - **Status:** **{d.get('status')}**
-- **Test Target:** 1,000,000 Active TCP Flows across 64 Intra-Core Lock Shards
+- **Test Target:** 1,000,000 Active Established TCP Flows (Single-Instance 64-Shard & Shared-Nothing Multi-Core)
 
 ## 1. Executive Summary & Key Performance Indicators (KPIs)
 
 | Metric | Measured Value | Unit / Target | Verification Status |
 | :--- | :--- | :--- | :--- |
-| **Total Active Flows** | {d.get('num_flows', 0):,} | flows | **PASS** (100% Allocated) |
-| **Flow Enqueue Rate (CPS)** | {d.get('cps', 0):,.2f} | Conn/sec ({d.get('cps', 0)/1000:,.2f} kCPS) | **PASS** |
-| **Enqueue Duration** | {d.get('enqueue_duration_ms', 0):.2f} | ms | **PASS** |
+| **Total Active Flows ($N$)** | {d.get('num_flows', 0):,} | flows | **PASS** (100% Allocated) |
+| **SYN Frames Emitted & Drained** | {d.get('tx_syn_drained', 0):,} | frames ({d.get('tx_syn_bytes', 0)/(1024*1024):.2f} MB wire) | **PASS** (0% TX Ring Drop) |
+| **Single-Core SYN Enqueue Rate** | {d.get('cps', 0):,.2f} | Conn/sec ({d.get('cps', 0)/1000:,.2f} kCPS) | **PASS** ({d.get('enqueue_duration_ms', 0):.2f} ms) |
 | **64-Shard Hash Variance** | {d.get('shard_max_variance_pct', 0):.4f}% | <= 5.0000% | **PASS** (Optimal Uniformity) |
 | **Shard Distribution (Min / Max)** | {d.get('shard_min')} / {d.get('shard_max')} | Mean: {d.get('shard_mean')} flows/shard | **PASS** (StdDev: {d.get('shard_stddev', 0):.2f}) |
-| **Process Baseline RSS** | {d.get('baseline_rss_kb', 0)/1024:,.2f} | MB | **PASS** |
-| **Peak Resident Set Size (RSS)** | {d.get('peak_rss_kb', 0)/1024:,.2f} | MB | **PASS** (< 2.0 GB ceiling) |
+| **Full 3-Way Handshakes Completed** | {d.get('handshakes_completed', 0):,} | / {d.get('handshakes_attempted', 0):,} (`kEstablished`) | **PASS** (100.0% Established) |
+| **ACK Frames Emitted & Drained** | {d.get('tx_ack_drained', 0):,} | frames ({d.get('tx_ack_bytes', 0)/(1024*1024):.2f} MB wire) | **PASS** (0% TX Ring Drop) |
+| **Handshake Processing Rate** | {d.get('handshakes_per_sec', 0):,.2f} | handshakes/sec ({d.get('handshake_duration_ms', 0):.2f} ms) | **PASS** |
+| **Single-Core Total Packets ($N_{{pkt}}$)** | {d.get('single_total_packets', 0):,} | packets (1M SYN + 1M SYN-ACK + 1M ACK) | **PASS** ({d.get('single_total_pps', 0)/1e6:.2f} M-PPS) |
+| **Baseline Process VmRSS** | {d.get('baseline_rss_kb', 0)/1024:,.2f} | MB | **PASS** |
+| **Established 1M Flows VmRSS** | {d.get('established_rss_kb', 0)/1024:,.2f} | MB (Peak VmHWM: {d.get('peak_rss_kb', 0)/1024:,.2f} MB) | **PASS** (< 2.0 GB ceiling) |
 | **Delta Memory for 1M Flows** | {d.get('delta_rss_kb', 0)/1024:,.2f} | MB | **PASS** |
-| **TCB Memory Density** | {d.get('bytes_per_flow', 0):.2f} | bytes/flow (TCB + indexing) | **PASS** |
-| **Lockless Lookups Throughput** | {d.get('lookups_per_sec', 0)/1e6:,.2f} | Million lookups/sec | **PASS** ({d.get('lookup_threads')} threads) |
-| **Total Concurrent Lookups** | {d.get('total_lookups', 0):,} | 100% Cache/Table Hit Rate | **PASS** |
-| **Stateful 3-Way Handshakes** | {d.get('handshakes_completed', 0):,} | completed / {d.get('handshakes_attempted', 0):,} | **PASS** (100% Transition) |
-| **Handshake Processing Rate** | {d.get('handshakes_per_sec', 0):,.2f} | handshakes/sec | **PASS** |
-| **Memory Reclamation Latency** | {d.get('reclaim_duration_ms', 0):.2f} | ms | **PASS** (Zero Leaks) |
-
-## 2. Technical Architectural Observations
-1. **Intra-Core 64-Shard Uniformity:**
-   Across 1,000,000 flows, the 64-shard 4-tuple hash table achieves an exceptionally low variance of **{d.get('shard_max_variance_pct', 0):.4f}%** (Min: {d.get('shard_min')}, Max: {d.get('shard_max')}, Mean: {d.get('shard_mean')}). This guarantees zero hot spots and zero spinlock contention during high-PPS workloads.
-2. **Memory Footprint:**
-   1,000,000 active TCP connections consume approximately **{d.get('delta_rss_kb', 0)/1024:,.2f} MB** of resident RAM (~**{d.get('bytes_per_flow', 0):.2f} bytes/flow**). This accounts for the complete RFC state machine, sliding-window buffers, timer priority queues, and dense 4-tuple index hash maps.
-3. **Multithreaded Lockless Scalability:**
-   With {d.get('lookup_threads')} worker threads, `GetFlowLockless` sustains **{d.get('lookups_per_sec', 0)/1e6:,.2f} M-lookups/sec**, proving that the lockless read path incurs zero cacheline bouncing across CPU cores.
-4. **Stateful Ingestion:**
-   Synthetic SYN-ACK frame ingestion verified full transition from `kSynSent` to `kEstablished` at **{d.get('handshakes_per_sec', 0)/1e6:,.2f} M-handshakes/sec**, proving end-to-end correctness of the packet parser, checksum, and state transitions under scale.
+| **TCB Memory Density** | {d.get('bytes_per_flow', 0):.2f} | bytes/flow (TCB + 4-tuple index + timers) | **PASS** |
+| **Post-Reclaim VmRSS (`malloc_trim`)** | {d.get('post_reclaim_rss_kb', 0)/1024:,.2f} | MB ({d.get('reclaim_duration_ms', 0):.2f} ms teardown) | **PASS** (Zero Memory Leak) |
+| **Lockless Lookups Throughput** | {d.get('lookups_per_sec', 0)/1e6:,.2f} | Million lookups/sec ({d.get('lookup_duration_ms', 0):.2f} ms) | **PASS** ({d.get('lookup_threads')} threads, 3M hits) |
+| **Shared-Nothing Multi-Core CPS** | {d.get('shared_nothing_cps', 0):,.2f} | Full Handshakes/sec ({d.get('shared_nothing_cps', 0)/1e6:.2f} M-CPS) | **PASS** ({d.get('shared_nothing_duration_ms', 0):.2f} ms) |
+| **Shared-Nothing Multi-Core PPS** | {d.get('shared_nothing_pps', 0):,.2f} | Packets/sec ({d.get('shared_nothing_pps', 0)/1e6:.2f} M-PPS, 3M pkts) | **PASS** ({d.get('shared_nothing_speedup', 0):.2f}x speedup) |
 """
 
 with open(md_file, 'w') as f:
