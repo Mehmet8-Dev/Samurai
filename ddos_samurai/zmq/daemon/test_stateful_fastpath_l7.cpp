@@ -18,6 +18,9 @@
 #include "bridge.hpp"
 #include "json.hpp"
 #include "stateful_fastpath.hpp"
+#include <thread>
+#include "../../l4/tcp_dataplane_ffi.h"
+#include "../../l4/tcp_dataplane_core.hpp"
 
 #ifdef SAMURAI_WITH_NGHTTP2
 #include <nghttp2/nghttp2.h>
@@ -513,6 +516,74 @@ bool run_h2_scenario(int flows) {
 }
 #endif  // SAMURAI_WITH_NGHTTP2
 
+bool run_sharded_l7_scenario(int workers) {
+  samurai::daemon::ShardedFastpathConfig cfg;
+  cfg.workers = static_cast<std::uint32_t>(workers);
+  cfg.cpu_base = -1;
+
+  auto factory = [](std::uint32_t) -> std::unique_ptr<samurai::daemon::FastpathTxRxShim> {
+    return std::make_unique<StatefulHttpPeerShim>();
+  };
+
+  samurai::daemon::ShardedFastpathDriver driver(factory, cfg);
+
+  samurai::daemon::FastpathParams params;
+  params.dst_ip = Ipv4("10.0.0.3");
+  params.dst_port = 80;
+  params.max_duration_ms = 4000;
+  params.drain_ms = 100;
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> completed_workers{0};
+
+  auto runner = [&](std::uint32_t w,
+                    ddos_samurai::tcpdp::TcpDataplaneCore& core,
+                    samurai::daemon::FastpathTxRxShim& shim,
+                    const std::atomic<bool>& internal_stop) {
+    (void)shim;
+    (void)w;
+    uint64_t flow_id = 0;
+    const int rc = tcpdp_enqueue_connect(Ipv4("10.0.0.2"), Ipv4("10.0.0.3"), 0, 80, &flow_id);
+    if (rc != 0 || flow_id == 0) return;
+
+    const uint64_t t0 = samurai_pacing_monotonic_now_ns();
+    while (samurai_pacing_monotonic_now_ns() - t0 < 2000'000'000ull && !internal_stop.load()) {
+      if (core.SnapshotStats().connect_established > 0) break;
+      std::this_thread::yield();
+    }
+    if (core.SnapshotStats().connect_established == 0) return;
+
+    const char req[] = "GET / HTTP/1.1\r\nHost: 10.0.0.3\r\nConnection: close\r\n\r\n";
+    uint32_t queued = 0;
+    (void)tcpdp_enqueue_send(flow_id, reinterpret_cast<const uint8_t*>(req), sizeof(req) - 1, &queued);
+
+    const uint64_t t1 = samurai_pacing_monotonic_now_ns();
+    while (samurai_pacing_monotonic_now_ns() - t1 < 2000'000'000ull && !internal_stop.load()) {
+      if (core.SnapshotStats().rx_data_bytes > 0) break;
+      std::this_thread::yield();
+    }
+
+    if (core.SnapshotStats().rx_data_bytes > 0) {
+      completed_workers.fetch_add(1);
+    }
+  };
+
+  std::vector<samurai::daemon::FastpathResult> per_worker;
+  const samurai::daemon::FastpathResult res = driver.RunL7(params, runner, stop, &per_worker);
+
+  std::printf("[sharded_l7 workers=%d] total: est=%llu tx=%llu rx=%llu completed_workers=%d\n",
+              workers, (unsigned long long)res.connect_established,
+              (unsigned long long)res.tx_packets, (unsigned long long)res.rx_frames,
+              completed_workers.load());
+
+  if (completed_workers.load() != workers || res.connect_established != static_cast<uint64_t>(workers)) {
+    std::fprintf(stderr, "FAIL: sharded_l7 completed_workers=%d est=%llu expected %d\n",
+                 completed_workers.load(), (unsigned long long)res.connect_established, workers);
+    return false;
+  }
+  return true;
+}
+
 int main(int argc, char** argv) {
   setenv("SAMURAI_CUSTOM_TCP_SRC_IP", "10.0.0.2", 1);
   // argv[1] verilirse yalnız o flow sayısı; aksi halde tek-lane + çok-lane (regresyon
@@ -537,6 +608,9 @@ int main(int argc, char** argv) {
 #else
   std::printf("[skip] nghttp2 yok: H2 custom_tcp senaryosu atlandı\n");
 #endif
+  if (!run_sharded_l7_scenario(4)) {
+    return 1;
+  }
   std::printf("ALL STATEFUL FASTPATH L7 TESTS PASSED\n");
   return 0;
 }

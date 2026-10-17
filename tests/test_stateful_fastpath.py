@@ -38,5 +38,20 @@ def test_stateful_fastpath_l7_http_over_fastpath():
     assert "ALL STATEFUL FASTPATH L7 TESTS PASSED" in res.stdout
 
 
+def test_bench_l7_stateful_userspace_quick():
+    bench_bin = os.path.join(_BUILD, "bench_l7_stateful_userspace")
+    if not os.path.exists(bench_bin):
+        pytest.skip(f"bench_l7_stateful_userspace derlenmemiş ({bench_bin})")
+    res = subprocess.run(
+        [bench_bin, "--proto", "h1", "--flows", "100", "--concurrency", "4"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "100.0%" in res.stdout
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
