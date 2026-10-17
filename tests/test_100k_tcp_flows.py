@@ -20,10 +20,12 @@ def hash_flow_key(src_ip: int, dst_ip: int, src_port: int, dst_port: int) -> int
 class Test100kTcpFlows(unittest.TestCase):
     def test_native_100k_flows_binary(self):
         """Execute compiled C++ test_100k_tcp_flows binary if available."""
-        bin_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../ddos_samurai/build/l4/test_100k_tcp_flows")
-        )
-        if os.path.exists(bin_path):
+        candidate_paths = [
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "../build/l4/test_100k_tcp_flows")),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "../ddos_samurai/build/l4/test_100k_tcp_flows")),
+        ]
+        bin_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+        if bin_path:
             res = subprocess.run([bin_path], capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, f"Native test failed:\n{res.stdout}\n{res.stderr}")
             self.assertIn("TEST PASSED", res.stdout)

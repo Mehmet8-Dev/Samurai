@@ -39,3 +39,7 @@ target_link_libraries(test_tcp_sliding_window PRIVATE samurai_l4 pthread)
 add_executable(test_100k_tcp_flows test_100k_tcp_flows.cpp)
 target_link_libraries(test_100k_tcp_flows PRIVATE samurai_l4 pthread)
 
+# TASK-TEST-L2-02: 1,000,000 active TCP flows scale & benchmark
+add_executable(test_1m_tcp_flows test_1m_tcp_flows.cpp)
+target_link_libraries(test_1m_tcp_flows PRIVATE samurai_l4 pthread)
+
