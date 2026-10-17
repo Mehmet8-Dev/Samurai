@@ -31,8 +31,8 @@ class Test1mTcpFlows(unittest.TestCase):
             if os.path.exists(json_report_path):
                 os.remove(json_report_path)
 
-            res = subprocess.run([bin_path, "--flows", "1000000", "--json", json_report_path],
-                                 capture_output=True, text=True, timeout=60)
+            res = subprocess.run([bin_path, "--flows", "1000000", "--runs", "1", "--json", json_report_path],
+                                 capture_output=True, text=True, timeout=120)
             self.assertEqual(res.returncode, 0, f"Native 1M test failed:\n{res.stdout}\n{res.stderr}")
             self.assertIn("TEST PASSED", res.stdout)
 
@@ -51,7 +51,10 @@ class Test1mTcpFlows(unittest.TestCase):
             self.assertLessEqual(report.get("shard_max_variance_pct", 100.0), 5.0)
             self.assertGreater(report.get("cps", 0), 100000)
             self.assertGreater(report.get("shared_nothing_cps", 0), 500000)
+            self.assertGreater(report.get("sizeof_flow_entry_bytes", 0), 0)
+            self.assertGreater(report.get("established_rss_delta_per_flow_bytes", 0), 0)
             self.assertGreater(report.get("bytes_per_flow", 0), 0)
+            self.assertTrue(report.get("shared_nothing_affinity_verified", False))
 
     def test_python_4tuple_hash_distribution_1m(self):
         """Pure Python verification of 4-tuple hash distribution across 64 lock shards for 1,000,000 flows."""

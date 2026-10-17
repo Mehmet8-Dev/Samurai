@@ -215,6 +215,7 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   config_.enable_delayed_ack = env_bool("SAMURAI_TCPDP_DELAYED_ACK", config_.enable_delayed_ack);
   config_.enable_nagle = env_bool("SAMURAI_TCPDP_NAGLE", config_.enable_nagle);
   config_.enable_timestamps = env_bool("SAMURAI_TCPDP_TIMESTAMPS", config_.enable_timestamps);
+  config_.verify_rx_checksum = env_bool("SAMURAI_TCPDP_VERIFY_RX_CHECKSUM", config_.verify_rx_checksum);
   tx_ring_capacity_ = static_cast<size_t>(env_u32_bounded(
       "SAMURAI_TCPDP_TX_RING_CAPACITY",
       static_cast<uint32_t>(tx_ring_capacity_),
@@ -561,7 +562,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
   uint16_t payload_len = 0;
   uint8_t ttl = 0;
   if (!ParseIpv4TcpFrame(
-          frame, frame_len, &src_ip, &dst_ip, &src_port, &dst_port, &seq, &ack, &flags, &window, &payload_len, &ttl)) {
+          frame, frame_len, &src_ip, &dst_ip, &src_port, &dst_port, &seq, &ack, &flags, &window, &payload_len, &ttl, config_.verify_rx_checksum)) {
     return 0;
   }
 
@@ -1391,6 +1392,17 @@ uint32_t TcpDataplaneCore::TestInspectComputePipe(uint64_t flow_id) const {
   return ComputePipe(it->second);
 }
 
+TcpDpMemoryLayout TcpDataplaneCore::GetMemoryLayout() {
+  TcpDpMemoryLayout layout{};
+  layout.sizeof_flow_entry = sizeof(FlowEntry);
+  layout.sizeof_flow_key = sizeof(FlowKey);
+  layout.sizeof_timer_entry = sizeof(TimerEntry);
+  layout.sizeof_outstanding_tx = sizeof(OutstandingTx);
+  layout.sizeof_per_shard_tx_ring = sizeof(PerShardTxRing);
+  layout.sizeof_core = sizeof(TcpDataplaneCore);
+  return layout;
+}
+
 bool TcpDataplaneCore::ParseIpv4TcpFrame(
     const uint8_t* pkt,
     size_t pkt_len,
@@ -1403,7 +1415,8 @@ bool TcpDataplaneCore::ParseIpv4TcpFrame(
     uint8_t* out_flags,
     uint16_t* out_window,
     uint16_t* out_payload_len,
-    uint8_t* out_ttl) {
+    uint8_t* out_ttl,
+    bool verify_checksum) {
   if (!pkt || pkt_len < 20) {
     return false;
   }
@@ -1442,7 +1455,21 @@ bool TcpDataplaneCore::ParseIpv4TcpFrame(
     return false;
   }
   const uint16_t total_len = ReadBe16(pkt + ip_offset + 2);
-  const size_t payload_len = total_len >= static_cast<uint16_t>(ihl + data_off) ? total_len - ihl - data_off : 0U;
+  if (total_len < static_cast<uint16_t>(ihl + data_off) ||
+      pkt_len < static_cast<size_t>(ip_offset + total_len)) {
+    return false;
+  }
+  const size_t payload_len = total_len - ihl - data_off;
+
+  if (verify_checksum) {
+    if (InternetChecksum(pkt + ip_offset, ihl) != 0) {
+      return false;
+    }
+    const size_t tcp_total_len = static_cast<size_t>(data_off) + payload_len;
+    if (TcpChecksum(pkt + ip_offset, pkt + tcp_offset, tcp_total_len) != 0) {
+      return false;
+    }
+  }
 
   if (out_src_ip) *out_src_ip = ReadBe32(pkt + ip_offset + 12);
   if (out_dst_ip) *out_dst_ip = ReadBe32(pkt + ip_offset + 16);

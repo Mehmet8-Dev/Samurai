@@ -50,6 +50,16 @@ struct TcpDpConfig {
   bool enable_delayed_ack = false;
   bool enable_nagle = false;
   bool enable_timestamps = false;
+  bool verify_rx_checksum = false;
+};
+
+struct TcpDpMemoryLayout {
+  size_t sizeof_flow_entry = 0;
+  size_t sizeof_flow_key = 0;
+  size_t sizeof_timer_entry = 0;
+  size_t sizeof_outstanding_tx = 0;
+  size_t sizeof_per_shard_tx_ring = 0;
+  size_t sizeof_core = 0;
 };
 
 struct TcpDpSackBlock {
@@ -178,6 +188,7 @@ class TcpDataplaneCore {
   // RFC 6675 Scoreboard & Pipe testing introspection
   bool TestInspectIsLost(uint64_t flow_id, uint32_t seg_seq) const;
   uint32_t TestInspectComputePipe(uint64_t flow_id) const;
+  static TcpDpMemoryLayout GetMemoryLayout();
 
  private:
   struct FlowKey {
@@ -395,7 +406,8 @@ class TcpDataplaneCore {
       uint8_t* out_flags,
       uint16_t* out_window,
       uint16_t* out_payload_len,
-      uint8_t* out_ttl);
+      uint8_t* out_ttl,
+      bool verify_checksum = false);
   static uint64_t DefaultNowNs();
   static uint64_t NsFromMs(uint32_t ms);
   static uint32_t AdvanceSeq(uint32_t seq, uint32_t amount);
