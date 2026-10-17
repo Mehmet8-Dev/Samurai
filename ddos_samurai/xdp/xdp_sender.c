@@ -668,6 +668,14 @@ static int register_xsk_in_xsks_map(int queue_id, int xsk_fd, char *reason, size
     return 0;
 }
 
+static int bpf_map_get_fd_by_id(uint32_t map_id)
+{
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_id = map_id;
+    return bpf_syscall(BPF_MAP_GET_FD_BY_ID, &attr, sizeof(attr));
+}
+
 static int register_xsk_in_xsks_map_ctx(
     xdp_context_t *ctx,
     int queue_id,
@@ -676,27 +684,41 @@ static int register_xsk_in_xsks_map_ctx(
     size_t reason_len
 )
 {
+    const char *map_id_env = getenv("SAMURAI_XDP_XSKMAP_ID");
     const char *map_path = getenv("SAMURAI_XDP_XSKMAP_PIN");
-    int map_fd;
+    int map_fd = -1;
     int key = queue_id;
     int value = xsk_fd;
 
-    if (map_path == NULL || map_path[0] == '\0') {
-        if (access("/sys/fs/bpf/samurai_xsks_map", F_OK) == 0) {
-            map_path = "/sys/fs/bpf/samurai_xsks_map";
-        } else if (access("/sys/fs/bpf/xsks_map", F_OK) == 0) {
-            map_path = "/sys/fs/bpf/xsks_map";
-        } else {
-            return 0;
+    if (map_id_env != NULL && map_id_env[0] != '\0') {
+        uint32_t mid = (uint32_t)strtoul(map_id_env, NULL, 10);
+        if (mid > 0) {
+            map_fd = bpf_map_get_fd_by_id(mid);
+            if (map_fd < 0 && reason != NULL && reason_len > 0) {
+                (void)snprintf(reason, reason_len, "BPF_MAP_GET_FD_BY_ID(%u) failed: %s", mid, strerror(errno));
+                return -1;
+            }
         }
     }
 
-    map_fd = bpf_obj_get_path(map_path);
     if (map_fd < 0) {
-        if (reason != NULL && reason_len > 0) {
-            (void)snprintf(reason, reason_len, "BPF_OBJ_GET(%s) failed: %s", map_path, strerror(errno));
+        if (map_path == NULL || map_path[0] == '\0') {
+            if (access("/sys/fs/bpf/samurai_xsks_map", F_OK) == 0) {
+                map_path = "/sys/fs/bpf/samurai_xsks_map";
+            } else if (access("/sys/fs/bpf/xsks_map", F_OK) == 0) {
+                map_path = "/sys/fs/bpf/xsks_map";
+            } else {
+                return 0;
+            }
         }
-        return -1;
+
+        map_fd = bpf_obj_get_path(map_path);
+        if (map_fd < 0) {
+            if (reason != NULL && reason_len > 0) {
+                (void)snprintf(reason, reason_len, "BPF_OBJ_GET(%s) failed: %s", map_path, strerror(errno));
+            }
+            return -1;
+        }
     }
 
     if (bpf_map_update_elem_fd(map_fd, &key, &value, BPF_ANY) < 0) {
@@ -772,7 +794,7 @@ static inline uint32_t xsk_ring_prod__reserve(struct xsk_ring_prod *r,
         return nb;
     }
 
-    r->cached_cons = __sync_fetch_and_add(r->consumer, 0);
+    r->cached_cons = __sync_fetch_and_add(r->consumer, 0) + r->size;
     
     if (r->cached_cons - r->cached_prod >= nb) {
         *idx = r->cached_prod;
@@ -928,7 +950,8 @@ static struct xsk_umem_info *create_umem_with_config(
     umem->frame_size = frame_size;
     umem->headroom = headroom;
     umem->external_buffer = external_mode ? 1 : 0;
-    umem->size = (uint64_t)frame_count * (uint64_t)frame_size;
+    uint64_t total_chunks = umem->external_buffer ? (uint64_t)frame_count : (uint64_t)frame_count * 2u;
+    umem->size = total_chunks * (uint64_t)frame_size;
 
     if (umem->external_buffer) {
         if (external_buffer == NULL) {
@@ -1056,7 +1079,10 @@ static void destroy_umem(struct xsk_umem_info *umem)
         umem->comp_map = NULL;
         umem->comp_map_len = 0;
     }
-    if (umem->fd >= 0) close(umem->fd);
+    if (umem->fd >= 0) {
+        close(umem->fd);
+        umem->fd = -1;
+    }
     if (!umem->external_buffer && umem->buffer) free(umem->buffer);
     free(umem);
 }
@@ -1070,6 +1096,7 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
                                                   int queue_id,
                                                   int xdp_mode)
 {
+    if (!umem || umem->fd < 0) return NULL;
     struct xsk_socket_info *xsk = calloc(1, sizeof(*xsk));
     if (!xsk) return NULL;
     
@@ -1084,19 +1111,13 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
         return NULL;
     }
     
-    // Create XDP socket
-    xsk->fd = socket(AF_XDP, SOCK_RAW, 0);
-    if (xsk->fd < 0) {
-        fprintf(stderr, "[XDP] Failed to create AF_XDP socket: %s\n", strerror(errno));
-        free(xsk);
-        return NULL;
-    }
+    // Use the AF_XDP socket descriptor on which UMEM was registered.
+    xsk->fd = umem->fd;
     
     // Setup TX Ring
     int tx_size = (int)umem->frame_count;
     if (setsockopt(xsk->fd, SOL_XDP, XDP_TX_RING, &tx_size, sizeof(tx_size)) < 0) {
         fprintf(stderr, "[XDP] Failed to set TX ring: %s\n", strerror(errno));
-        close(xsk->fd);
         free(xsk);
         return NULL;
     }
@@ -1112,7 +1133,6 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
     struct xdp_mmap_offsets offsets;
     socklen_t optlen = sizeof(offsets);
     if (getsockopt(xsk->fd, SOL_XDP, XDP_MMAP_OFFSETS, &offsets, &optlen) < 0) {
-        close(xsk->fd);
         free(xsk);
         return NULL;
     }
@@ -1124,7 +1144,6 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
                         xsk->fd, XDP_PGOFF_TX_RING);
     if (tx_map == MAP_FAILED) {
         fprintf(stderr, "[XDP] Failed to mmap TX ring: %s\n", strerror(errno));
-        close(xsk->fd);
         free(xsk);
         return NULL;
     }
@@ -1135,6 +1154,7 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
     xsk->tx.consumer = (uint32_t*)(tx_map + offsets.tx.consumer);
     xsk->tx.flags = (uint32_t*)(tx_map + offsets.tx.flags);
     xsk->tx.ring = tx_map + offsets.tx.desc;
+    xsk->tx.cached_cons = (uint32_t)tx_size;
     xsk->tx_map = tx_map;
     xsk->tx_map_len = offsets.tx.desc + (size_t)tx_size * sizeof(struct xdp_desc);
 
@@ -1162,14 +1182,12 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
         .sxdp_family = AF_XDP,
         .sxdp_ifindex = xsk->ifindex,
         .sxdp_queue_id = queue_id,
-        .sxdp_flags = XDP_USE_NEED_WAKEUP
+        .sxdp_flags = XDP_USE_NEED_WAKEUP,
+        .sxdp_shared_umem_fd = 0
     };
     
     // AF_XDP socket mode hint for bind (copy/zerocopy).
     sxdp.sxdp_flags |= xdp_bind_mode_flags(xdp_mode);
-    
-    // Share UMEM with the socket
-    sxdp.sxdp_shared_umem_fd = umem->fd;
     
     if (bind(xsk->fd, (struct sockaddr*)&sxdp, sizeof(sxdp)) < 0) {
         fprintf(stderr, "[XDP] Failed to bind socket to %s (queue %d): %s\n", 
@@ -1180,24 +1198,29 @@ static struct xsk_socket_info *create_xsk_socket(struct xsk_umem_info *umem,
             xsk->tx_map = NULL;
             xsk->tx_map_len = 0;
         }
-        close(xsk->fd);
+        if (xsk->rx_map && xsk->rx_map_len > 0) {
+            munmap(xsk->rx_map, xsk->rx_map_len);
+            xsk->rx_map = NULL;
+            xsk->rx_map_len = 0;
+        }
         free(xsk);
         return NULL;
     }
     
-    // Initialize frame allocation tracking
+    // Initialize TX frame allocation tracking ([0 .. frame_count - 1])
     xsk->free_count = umem->frame_count;
     for (uint32_t i = 0; i < umem->frame_count; i++) {
         xsk->free_frames[i] = i;
     }
     xsk->outstanding_tx = 0;
     
-    // Pre-populate the fill ring
+    // Pre-populate the RX fill ring using dedicated RX frames ([frame_count .. 2*frame_count - 1])
+    uint32_t rx_frame_base = umem->external_buffer ? 0u : umem->frame_count;
     uint32_t fill_idx;
     if (xsk_ring_prod__reserve(&umem->fill, umem->frame_count, &fill_idx) == umem->frame_count) {
         for (uint32_t i = 0; i < umem->frame_count; i++) {
             uint64_t *addr = xsk_ring_prod__fill_addr(&umem->fill, fill_idx + i);
-            *addr = (uint64_t)i * (uint64_t)umem->frame_size;
+            *addr = (uint64_t)(rx_frame_base + i) * (uint64_t)umem->frame_size;
         }
         xsk_ring_prod__submit(&umem->fill, umem->frame_count);
     }
@@ -1227,7 +1250,13 @@ static void destroy_xsk_socket(struct xsk_socket_info *xsk)
         xsk->rx_map = NULL;
         xsk->rx_map_len = 0;
     }
-    if (xsk->fd >= 0) close(xsk->fd);
+    if (xsk->fd >= 0) {
+        if (xsk->umem && xsk->umem->fd == xsk->fd) {
+            xsk->umem->fd = -1;
+        }
+        close(xsk->fd);
+        xsk->fd = -1;
+    }
     free(xsk);
 }
 
@@ -1242,13 +1271,9 @@ static int refill_rx_fill_ring(struct xsk_socket_info *xsk, struct xdp_desc *des
         return 0;
     }
     for (uint32_t i = 0; i < reserved; i++) {
-        uint64_t base = descs[i].addr;
-        if (base >= xsk->umem->headroom) {
-            base -= xsk->umem->headroom;
-        }
-        uint32_t frame_id = (uint32_t)(base / xsk->umem->frame_size);
+        uint64_t frame_id = descs[i].addr / (uint64_t)xsk->umem->frame_size;
         uint64_t *fill_addr = xsk_ring_prod__fill_addr(&xsk->umem->fill, fill_idx + i);
-        *fill_addr = (uint64_t)frame_id * (uint64_t)xsk->umem->frame_size;
+        *fill_addr = frame_id * (uint64_t)xsk->umem->frame_size;
     }
     xsk_ring_prod__submit(&xsk->umem->fill, reserved);
     return (int)reserved;

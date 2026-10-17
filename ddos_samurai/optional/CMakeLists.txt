@@ -57,7 +57,7 @@ if(EXISTS ${_xdp_src})
     pkg_check_modules(LIBXDP QUIET libxdp)
     pkg_check_modules(LIBBPF QUIET libbpf)
   endif()
-  find_package(Python3 COMPONENTS Development QUIET)
+  find_package(Python3 COMPONENTS Interpreter Development QUIET)
   if((LIBXDP_FOUND OR LIBBPF_FOUND) AND Python3_Development_FOUND)
     add_library(xdp_sender SHARED ${_xdp_src}
       ${SAMURAI_PKG_DIR}/xdp/xdp_core.c ${SAMURAI_PKG_DIR}/pacing_engine.c)
@@ -72,7 +72,7 @@ if(EXISTS ${_xdp_src})
     target_link_libraries(xdp_sender PRIVATE
       ${LIBXDP_LIBRARIES}
       ${LIBBPF_LIBRARIES}
-      ${Python3_LIBRARIES}
+      Python3::Python
       pthread m)
   else()
     message(STATUS "optional: libbpf/libxdp or Python3 development headers not found -> skipping xdp/xdp_sender.so")
