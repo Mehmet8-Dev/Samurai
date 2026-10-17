@@ -239,7 +239,6 @@ bool TcpDataplaneCore::Configure(const TcpDpConfig& config) {
   }
   for (size_t i = 0; i < kFlowLockShards; ++i) {
     std::lock_guard<SpinLock> tguard(timer_shard_mu_[i]);
-    active_flow_ids_shard_[i].clear();
     timer_heap_shard_[i] = std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>();
     timer_shard_min_due_ns_[i].store(UINT64_MAX, std::memory_order_relaxed);
   }
@@ -325,13 +324,13 @@ uint32_t TcpDataplaneCore::IngestTxPackets(const uint8_t* packets, size_t packet
         created.cwnd = 10u * static_cast<uint32_t>(config_.default_mss);  // IW10
         created.ttl = ttl > 0 ? ttl : config_.default_ttl;
         created.last_activity_ns = DefaultNowNs();
-        const size_t flow_shard = FlowLockShardForFlowId(created.flow_id);
+        flow_id = created.flow_id;
+        const size_t flow_shard = FlowLockShardForFlowId(flow_id);
         {
           std::lock_guard<SpinLock> fguard(flow_shard_mu_[flow_shard]);
-          flows_by_id_shard_[flow_shard].emplace(created.flow_id, created);
+          flows_by_id_shard_[flow_shard].emplace(flow_id, std::move(created));
         }
-        flow_index_shard_[index_shard][key] = created.flow_id;
-        flow_id = created.flow_id;
+        flow_index_shard_[index_shard][key] = flow_id;
       } else {
         flow_id = idx->second;
       }
@@ -483,7 +482,7 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   flow.state = TcpDpState::kSynSent;
   flow.last_activity_ns = now_ns;
 
-    thread_local uint8_t tls_scratch_buf[2048];
+  thread_local uint8_t tls_scratch_buf[2048];
   uint8_t syn_opts[40];
   // MSS + SACK-perm + WScale (+ TS when enabled). We only advertise TS in our SYN;
   // ts_ok is confirmed on the SYN-ACK if the peer echoes a TS option.
@@ -492,24 +491,21 @@ uint64_t TcpDataplaneCore::EnqueueConnect(uint32_t src_ip, uint32_t dst_ip, uint
   size_t syn_len = BuildPacketOpt(flow, flow.snd_nxt, 0, kTcpFlagSyn, nullptr, 0, syn_opts, syn_opts_len, tls_scratch_buf);
   flow.snd_nxt = AdvanceSeq(flow.snd_nxt, 1);
   QueuePacket(flow, tls_scratch_buf, syn_len, flow.iss, 0, kTcpFlagSyn, nullptr, 0, true);
-  // Store the SYN options so a retransmitted SYN replays them (BuildOutstandingPacket).
-  if (!flow.unacked.empty()) {
-    flow.unacked.back().opts.assign(syn_opts, syn_opts + syn_opts_len);
-  }
-  {
-    const size_t shard = FlowLockShardForFlowId(flow_id);
-    std::lock_guard<SpinLock> tguard(timer_shard_mu_[shard]);
-    active_flow_ids_shard_[shard].insert(flow_id);
+  // Store the SYN options inline so a retransmitted SYN replays them (BuildOutstandingPacket) without heap alloc.
+  if (!flow.unacked.empty() && syn_opts_len <= flow.unacked.back().opts.size()) {
+    std::memcpy(flow.unacked.back().opts.data(), syn_opts, syn_opts_len);
+    flow.unacked.back().opts_len = static_cast<uint8_t>(syn_opts_len);
   }
   ScheduleFlowTimers(flow, now_ns);
 
   const size_t index_shard = FlowIndexShardForKey(flow.key);
   const size_t flow_shard = FlowLockShardForFlowId(flow_id);
+  const FlowKey fkey = flow.key;
   std::lock_guard<SpinLock> iguard(flow_index_shard_mu_[index_shard]);
   std::lock_guard<SpinLock> fguard(flow_shard_mu_[flow_shard]);
-  flows_by_id_shard_[flow_shard][flow_id] = flow;
-  flow_index_shard_[index_shard][flow.key] = flow_id;
-  stats_shard_[FlowLockShardForFlowId(flow_id)].flows_active.fetch_add(1, std::memory_order_relaxed);
+  flows_by_id_shard_[flow_shard].insert_or_assign(flow_id, std::move(flow));
+  flow_index_shard_[index_shard][fkey] = flow_id;
+  stats_shard_[flow_shard].flows_active.fetch_add(1, std::memory_order_relaxed);
   stats_shard_[flow_shard].connect_attempts.fetch_add(1, std::memory_order_relaxed);
   return flow_id;
 }
@@ -649,9 +645,9 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     if (!flow->unacked.empty() && flow->unacked.front().xmit_count == 1) {
       UpdateRtt(*flow, flow->unacked.front().sent_ns);
     }
-    flow->unacked.clear();  // our SYN is acknowledged by this SYN-ACK
+    std::vector<OutstandingTx>().swap(flow->unacked);  // our SYN is acknowledged; release initial vector buffer
     flow->rto_deadline_ns = 0;
-        thread_local uint8_t tls_scratch_buf[2048];
+    thread_local uint8_t tls_scratch_buf[2048];
     size_t ack_len = BuildSeg(*flow, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, tls_scratch_buf);
     QueuePacket(*flow, tls_scratch_buf, ack_len, flow->snd_nxt, flow->rcv_nxt, kTcpFlagAck, nullptr, 0, false);
     SetFlowState(*flow, TcpDpState::kEstablished);
@@ -705,10 +701,9 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
 
       // Check if this segment is completely covered by an existing segment in queue
       bool covered = false;
-      for (const auto& kv : flow->rx_oo_queue) {
-        const uint32_t s_seq = kv.first;
-        const uint32_t s_end = AdvanceSeq(s_seq, static_cast<uint32_t>(kv.second.size()));
-        if (SeqLeq(s_seq, seq) && SeqLeq(AdvanceSeq(seq, static_cast<uint32_t>(p_size)), s_end)) {
+      for (const auto& seg : flow->rx_oo_queue) {
+        const uint32_t s_end = AdvanceSeq(seg.seq, static_cast<uint32_t>(seg.payload.size()));
+        if (SeqLeq(seg.seq, seq) && SeqLeq(AdvanceSeq(seq, static_cast<uint32_t>(p_size)), s_end)) {
           covered = true;
           break;
         }
@@ -719,25 +714,25 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
           (flow->rx_oo_bytes + p_size <= kMaxRxOoBytes)) {
         // If this new segment completely covers existing smaller segments, purge them
         for (auto q_it = flow->rx_oo_queue.begin(); q_it != flow->rx_oo_queue.end(); ) {
-          const uint32_t s_seq = q_it->first;
-          const uint32_t s_end = AdvanceSeq(s_seq, static_cast<uint32_t>(q_it->second.size()));
-          if (SeqLeq(seq, s_seq) && SeqLeq(s_end, AdvanceSeq(seq, static_cast<uint32_t>(p_size)))) {
-            flow->rx_oo_bytes = (flow->rx_oo_bytes >= q_it->second.size()) ?
-                                (flow->rx_oo_bytes - q_it->second.size()) : 0;
+          const uint32_t s_end = AdvanceSeq(q_it->seq, static_cast<uint32_t>(q_it->payload.size()));
+          if (SeqLeq(seq, q_it->seq) && SeqLeq(s_end, AdvanceSeq(seq, static_cast<uint32_t>(p_size)))) {
+            flow->rx_oo_bytes = (flow->rx_oo_bytes >= q_it->payload.size()) ?
+                                (flow->rx_oo_bytes - q_it->payload.size()) : 0;
             q_it = flow->rx_oo_queue.erase(q_it);
           } else {
             ++q_it;
           }
         }
 
-        auto it = flow->rx_oo_queue.find(seq);
-        if (it == flow->rx_oo_queue.end()) {
+        auto it_oo = std::find_if(flow->rx_oo_queue.begin(), flow->rx_oo_queue.end(),
+                                  [seq](const FlowEntry::RxOoSegment& s) { return s.seq == seq; });
+        if (it_oo == flow->rx_oo_queue.end()) {
           flow->rx_oo_bytes += p_size;
-          flow->rx_oo_queue.emplace(seq, std::move(p));
+          flow->rx_oo_queue.push_back(FlowEntry::RxOoSegment{seq, std::move(p)});
           queued = true;
-        } else if (p_size > it->second.size()) {
-          flow->rx_oo_bytes = flow->rx_oo_bytes + p_size - it->second.size();
-          it->second = std::move(p);
+        } else if (p_size > it_oo->payload.size()) {
+          flow->rx_oo_bytes = flow->rx_oo_bytes + p_size - it_oo->payload.size();
+          it_oo->payload = std::move(p);
           queued = true;
         }
       }
@@ -783,12 +778,13 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
     // 5. Drain consecutive / overlapping segments from rx_oo_queue.
     bool drained_any = false;
     while (!flow->rx_oo_queue.empty()) {
-      auto it = flow->rx_oo_queue.find(flow->rcv_nxt);
-      if (it == flow->rx_oo_queue.end()) {
+      auto it_oo = std::find_if(flow->rx_oo_queue.begin(), flow->rx_oo_queue.end(),
+                                [rcv = flow->rcv_nxt](const FlowEntry::RxOoSegment& s) { return s.seq == rcv; });
+      if (it_oo == flow->rx_oo_queue.end()) {
         bool found_overlap = false;
         for (auto o_it = flow->rx_oo_queue.begin(); o_it != flow->rx_oo_queue.end(); ) {
-          const uint32_t s_seq = o_it->first;
-          const size_t s_len = o_it->second.size();
+          const uint32_t s_seq = o_it->seq;
+          const size_t s_len = o_it->payload.size();
           const uint32_t s_end = AdvanceSeq(s_seq, static_cast<uint32_t>(s_len));
           if (SeqLeq(s_end, flow->rcv_nxt)) {
             flow->rx_oo_bytes = (flow->rx_oo_bytes >= s_len) ? (flow->rx_oo_bytes - s_len) : 0;
@@ -803,7 +799,7 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
               std::lock_guard<SpinLock> qguard(rx_payload_mu_);
               rx_payloads_.push_back(TcpDpRxPayload{
                   flow->flow_id,
-                  std::vector<uint8_t>(o_it->second.begin() + offset, o_it->second.end())});
+                  std::vector<uint8_t>(o_it->payload.begin() + offset, o_it->payload.end())});
             }
             flow->rx_oo_bytes = (flow->rx_oo_bytes >= s_len) ? (flow->rx_oo_bytes - s_len) : 0;
             flow->rx_oo_queue.erase(o_it);
@@ -820,15 +816,15 @@ uint32_t TcpDataplaneCore::IngestRxFrame(const uint8_t* frame, size_t frame_len)
         continue;
       }
 
-      const size_t seg_len = it->second.size();
+      const size_t seg_len = it_oo->payload.size();
       flow->rcv_nxt = AdvanceSeq(flow->rcv_nxt, static_cast<uint32_t>(seg_len));
       stats_shard_[flow_shard].rx_data_bytes.fetch_add(static_cast<uint64_t>(seg_len), std::memory_order_relaxed);
       {
         std::lock_guard<SpinLock> qguard(rx_payload_mu_);
-        rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, std::move(it->second)});
+        rx_payloads_.push_back(TcpDpRxPayload{flow->flow_id, std::move(it_oo->payload)});
       }
       flow->rx_oo_bytes = (flow->rx_oo_bytes >= seg_len) ? (flow->rx_oo_bytes - seg_len) : 0;
-      flow->rx_oo_queue.erase(it);
+      flow->rx_oo_queue.erase(it_oo);
       drained_any = true;
     }
 
@@ -904,9 +900,6 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
         }
         timer_heap_shard_[shard].pop();
         RefreshTimerHint(shard);
-        if (active_flow_ids_shard_[shard].find(top.flow_id) == active_flow_ids_shard_[shard].end()) {
-          continue;
-        }
         entry = top;
         selected_shard = shard;
         have_entry = true;
@@ -923,7 +916,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
 
     std::lock_guard<SpinLock> fguard(flow_shard_mu_[selected_shard]);
     auto it = flows_by_id_shard_[selected_shard].find(entry.flow_id);
-    if (it == flows_by_id_shard_[selected_shard].end()) {
+    if (it == flows_by_id_shard_[selected_shard].end() || !IsCountedActive(it->second.state)) {
       continue;
     }
     FlowEntry* flow = &it->second;
@@ -2127,9 +2120,9 @@ void TcpDataplaneCore::UpdateFlowSackBlocks(FlowEntry& flow, uint32_t newly_arri
 
   std::vector<Block> raw;
   raw.reserve(flow.rx_oo_queue.size());
-  for (const auto& kv : flow.rx_oo_queue) {
-    if (kv.second.empty()) continue;
-    raw.push_back(Block{kv.first, AdvanceSeq(kv.first, static_cast<uint32_t>(kv.second.size()))});
+  for (const auto& seg : flow.rx_oo_queue) {
+    if (seg.payload.empty()) continue;
+    raw.push_back(Block{seg.seq, AdvanceSeq(seg.seq, static_cast<uint32_t>(seg.payload.size()))});
   }
 
   if (raw.empty()) {
@@ -2300,9 +2293,9 @@ size_t TcpDataplaneCore::BuildOutstandingPacket(const FlowEntry& flow, const Out
   }
   // Replay the segment's stored options (e.g. the SYN's MSS/SACK-perm/WScale/TS) so a
   // retransmitted SYN re-negotiates identically instead of dropping to a bare header.
-  if (!out.opts.empty()) {
+  if (out.opts_len > 0) {
     return BuildPacketOpt(flow, out.seq, out.ack, out.flags, payload_ptr, payload_size,
-                          out.opts.data(), out.opts.size(), out_buffer);
+                          out.opts.data(), out.opts_len, out_buffer);
   }
   // Ordinary data/ACK segments carry a freshly regenerated timestamp (TSval=now).
   if (flow.ts_ok) {
@@ -2338,15 +2331,6 @@ void TcpDataplaneCore::SetFlowState(FlowEntry& flow, TcpDpState next_state) {
   const bool was_active = IsCountedActive(flow.state);
   const bool now_active = IsCountedActive(next_state);
   flow.state = next_state;
-  {
-    const size_t shard = FlowLockShardForFlowId(flow.flow_id);
-    std::lock_guard<SpinLock> tguard(timer_shard_mu_[shard]);
-    if (now_active) {
-      active_flow_ids_shard_[shard].insert(flow.flow_id);
-    } else {
-      active_flow_ids_shard_[shard].erase(flow.flow_id);
-    }
-  }
   // flow.state yukarıda zaten next_state'e atandığından eski/yeni durum
   // karşılaştırması, atamadan önce hesaplanan was_active/now_active ile yapılmalı.
   if (now_active && !was_active) {
@@ -2455,13 +2439,14 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpO
   const uint32_t acked_bytes = ack_value - flow.snd_una;
   bool partial = false;
   uint64_t rtt_sample_ns = 0;  // newest first-transmission time among fully-acked segs (Karn)
-  while (!flow.unacked.empty()) {
-    OutstandingTx& seg = flow.unacked.front();
+  size_t pop_count = 0;
+  for (size_t idx = 0; idx < flow.unacked.size(); ++idx) {
+    OutstandingTx& seg = flow.unacked[idx];
     const uint32_t seg_end = seg.seq + SegSeqLen(seg.flags, seg.payload_len);
     if (SeqLeq(seg_end, ack_value)) {
       if (seg.xmit_count == 1 && seg.sent_ns > rtt_sample_ns) rtt_sample_ns = seg.sent_ns;
       RecycleSegBuf(flow, std::move(seg.data));  // reclaim storage before the element dies
-      flow.unacked.pop_front();  // fully acknowledged
+      pop_count++;  // fully acknowledged
     } else if (SeqGt(ack_value, seg.seq)) {
       const uint32_t drop = ack_value - seg.seq;
       if (drop < seg.payload_len) {
@@ -2473,6 +2458,13 @@ void TcpDataplaneCore::HandleAck(FlowEntry& flow, uint32_t ack_value, const TcpO
       break;
     } else {
       break;
+    }
+  }
+  if (pop_count > 0) {
+    if (pop_count == flow.unacked.size()) {
+      flow.unacked.clear();
+    } else {
+      flow.unacked.erase(flow.unacked.begin(), flow.unacked.begin() + static_cast<std::ptrdiff_t>(pop_count));
     }
   }
   flow.snd_una = ack_value;

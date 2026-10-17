@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -209,6 +210,8 @@ class TcpDataplaneCore {
     uint32_t ack = 0;
     uint32_t payload_len = 0;
     uint8_t flags = 0;
+    uint8_t opts_len = 0;
+    std::array<uint8_t, 24> opts{};  // Inline TCP options (e.g. SYN MSS/SACK/WScale/TS) -> 0 heap alloc
     uint32_t xmit_count = 0;
     uint64_t sent_ns = 0;   // first-transmission time; RTT sampled only when xmit_count==1 (Karn)
     bool sacked = false;    // covered by a received SACK block -> skip on selective retransmit
@@ -216,10 +219,6 @@ class TcpDataplaneCore {
     // Owned payload bytes for this in-flight segment (empty for pure SYN/FIN/ACK).
     // Held per-segment so a retransmit is a straight rebuild with no shared cursor.
     std::vector<uint8_t> data;
-    // TCP options to replay on retransmit (e.g. the SYN's MSS/SACK-perm/WScale).
-    // Empty for ordinary data/ACK segments; timestamp options are regenerated fresh
-    // per (re)transmission in the build path so they are not stored here.
-    std::vector<uint8_t> opts;
   };
 
   // Parsed TCP option fields we care about (from SYN-ACK negotiation and per-ACK SACK).
@@ -295,14 +294,19 @@ class TcpDataplaneCore {
     // (front == snd_una edge); ACKs pop/trim the front, RTO retransmits it.
     std::vector<uint8_t> sndbuf;
     size_t sndbuf_head = 0;  // consumed offset into sndbuf (compacted lazily)
-    std::deque<OutstandingTx> unacked;
+    std::vector<OutstandingTx> unacked;
     // Free list of segment payload buffers recycled between emit and cumulative
     // ACK. In steady state a flow emits N segments and retires N, so reusing the
     // backing storage here turns the per-segment malloc/free churn into zero
     // heap traffic. Capacity is bounded by kSegBufPoolCap.
     std::vector<std::vector<uint8_t>> seg_buf_pool;
     // Out-of-order receive queue for TCP segment reassembly (seq -> payload).
-    std::map<uint32_t, std::vector<uint8_t>> rx_oo_queue;
+    // Flat vector (0 heap alloc when empty, no pointer null-checks, bounded to kMaxRxOoSegments=32).
+    struct RxOoSegment {
+      uint32_t seq = 0;
+      std::vector<uint8_t> payload;
+    };
+    std::vector<RxOoSegment> rx_oo_queue;
     size_t rx_oo_bytes = 0;
     std::optional<uint32_t> pending_fin_seq;
   };
@@ -534,7 +538,6 @@ class TcpDataplaneCore {
   mutable std::array<AlignedSpinLock, kFlowLockShards> flow_shard_mu_{};
   mutable std::array<AlignedSpinLock, kFlowLockShards> flow_index_shard_mu_{};
   mutable std::array<AlignedSpinLock, kFlowLockShards> timer_shard_mu_{};
-  std::array<std::set<uint64_t>, kFlowLockShards> active_flow_ids_shard_{};
   std::array<std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryMin>, kFlowLockShards> timer_heap_shard_{};
   // Lock-free hint of each shard's earliest due_ns (UINT64_MAX = empty). Lets Poll
   // skip shards with nothing due without taking their timer spinlock.
@@ -546,10 +549,11 @@ class TcpDataplaneCore {
   uint16_t ephemeral_port_base_ = 40000;
   uint16_t ephemeral_port_stride_ = 1;
   uint32_t seq_seed_ = 0x10203040U;
-  // flows_by_id_shard_ stays node-based (std::unordered_map): FlowEntry is a
-  // heavy value and callers hold `FlowEntry*` across mutations — a dense/flat
-  // map would move entries on rehash and invalidate those pointers.
-  std::array<std::unordered_map<uint64_t, FlowEntry>, kFlowLockShards> flows_by_id_shard_{};
+  // Flat/dense map (ankerl::unordered_dense) eliminates the per-flow malloc header +
+  // linked-list node pointer overhead of std::unordered_map (~24-32B/flow saved).
+  // Callers access entries strictly while holding flow_shard_mu_[shard] with no
+  // concurrent rehash on that shard.
+  std::array<ankerl::unordered_dense::map<uint64_t, FlowEntry>, kFlowLockShards> flows_by_id_shard_{};
   // flow_index_shard_ is the per-packet RX 4-tuple->flow_id lookup: tiny value,
   // no reference-stability requirement (the id is copied out immediately), so a
   // flat/dense map wins on cache locality with no aliasing hazard.
