@@ -391,7 +391,7 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
   const bool own_wire_threaded = custom_tcp_use_own_wire(runtime, transport_backend, profile.protocol);
   const CustomTcpWireConfig wire_cfg =
       own_wire_threaded ? resolve_custom_tcp_wire_config() : CustomTcpWireConfig{};
-  const bool threaded = custom_tcp_threaded || kernel_threaded;
+  const bool threaded = custom_tcp_threaded || kernel_threaded || own_wire_threaded;
   if (threaded) {
     const std::size_t shard_count = runtime.shards.size();
     std::vector<DataplanePerfStats> shard_perf(shard_count);

@@ -1,4 +1,9 @@
 #include "engine_internal.hpp"
+#include "../xdp/xdp_native_api.h"
+#include <dlfcn.h>
+#ifdef SAMURAI_WITH_NGHTTP2
+#include <nghttp2/nghttp2.h>
+#endif
 
 namespace ddos_samurai::l7_emu_native {
 
@@ -43,6 +48,11 @@ void unregister_custom_tcp_flow_binding(NativeRuntime& runtime, uint64_t flow_id
   if (flow_id == 0) {
     return;
   }
+  const uint64_t sh_prefix = flow_id >> 40;
+  if (sh_prefix > 0 && (sh_prefix - 1) < runtime.local_shards.size()) {
+    runtime.local_shards[sh_prefix - 1].custom_tcp_flow_registry.erase(flow_id);
+    return;
+  }
   std::lock_guard<std::mutex> lk(custom_tcp_registry_mu());
   runtime.custom_tcp_flow_registry.erase(flow_id);
 }
@@ -66,6 +76,11 @@ void register_custom_tcp_h1_flow_binding(
 #ifdef SAMURAI_WITH_NGHTTP2
   binding.h2_session = nullptr;
 #endif
+  const uint64_t sh_prefix = lane.conn->custom_flow_id >> 40;
+  if (sh_prefix > 0 && (sh_prefix - 1) < runtime.local_shards.size()) {
+    runtime.local_shards[sh_prefix - 1].custom_tcp_flow_registry[lane.conn->custom_flow_id] = binding;
+    return;
+  }
   std::lock_guard<std::mutex> lk(custom_tcp_registry_mu());
   runtime.custom_tcp_flow_registry[lane.conn->custom_flow_id] = binding;
 }
@@ -74,6 +89,35 @@ NativeRuntime::CustomTcpFlowBinding* find_custom_tcp_flow_binding(
     NativeRuntime& runtime,
     uint64_t flow_id) {
   if (flow_id == 0) {
+    return nullptr;
+  }
+  const uint64_t sh_prefix = flow_id >> 40;
+  if (sh_prefix > 0 && (sh_prefix - 1) < runtime.local_shards.size()) {
+    auto& reg = runtime.local_shards[sh_prefix - 1].custom_tcp_flow_registry;
+    auto it = reg.find(flow_id);
+    if (it == reg.end()) {
+      return nullptr;
+    }
+    if (it->second.kind == ReactorLaneKind::H1) {
+      H1Lane* lane = it->second.h1_lane;
+      if (lane == nullptr || !lane->conn ||
+          !is_custom_tcp_backend(lane->transport_backend) ||
+          lane->conn->custom_flow_id != flow_id) {
+        reg.erase(it);
+        return nullptr;
+      }
+      return &it->second;
+    }
+#ifdef SAMURAI_WITH_NGHTTP2
+    if (it->second.kind == ReactorLaneKind::H2) {
+      if (it->second.h2_session == nullptr) {
+        reg.erase(it);
+        return nullptr;
+      }
+      return &it->second;
+    }
+#endif
+    reg.erase(it);
     return nullptr;
   }
   std::lock_guard<std::mutex> lk(custom_tcp_registry_mu());
@@ -257,6 +301,9 @@ CustomTcpWireConfig resolve_custom_tcp_wire_config() {
   std::memset(c.dst_mac, 0xff, sizeof(c.dst_mac));
   std::memset(c.src_mac, 0x00, sizeof(c.src_mac));
   const char* iface = std::getenv("SAMURAI_CUSTOM_TCP_RX_IFACE");
+  if (iface == nullptr || iface[0] == '\0') {
+    iface = std::getenv("SAMURAI_XDP_INTERFACE");
+  }
   if (iface != nullptr && iface[0] != '\0') {
     c.iface = iface;
     c.have_iface = true;
@@ -267,22 +314,28 @@ CustomTcpWireConfig resolve_custom_tcp_wire_config() {
       std::sscanf(m, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
     for (int i = 0; i < 6; ++i) c.dst_mac[i] = static_cast<uint8_t>(b[i] & 0xffu);
   }
+  unsigned int sb[6];
+  const char* sm = std::getenv("SAMURAI_CUSTOM_TCP_SRC_MAC");
+  if (sm != nullptr &&
+      std::sscanf(sm, "%x:%x:%x:%x:%x:%x", &sb[0], &sb[1], &sb[2], &sb[3], &sb[4], &sb[5]) == 6) {
+    for (int i = 0; i < 6; ++i) c.src_mac[i] = static_cast<uint8_t>(sb[i] & 0xffu);
+    c.have_src_mac = true;
+  } else if (resolve_wire_iface_mac(c.iface, c.src_mac)) {
+    c.have_src_mac = true;
+  }
   const char* wire = std::getenv("SAMURAI_CUSTOM_TCP_WIRE");
-  if (wire != nullptr && (std::strcmp(wire, "dpdk") == 0) && samurai::dpdk::available()) {
+  if (wire != nullptr &&
+      (std::strcmp(wire, "in_memory") == 0 || std::strcmp(wire, "inmem") == 0)) {
+    c.kind = WireKind::InMemory;
+  } else if (wire != nullptr && (std::strcmp(wire, "dpdk") == 0) && samurai::dpdk::available()) {
     c.kind = WireKind::Dpdk;
     if (const char* p = std::getenv("SAMURAI_DPDK_PORT"); p != nullptr && p[0] != '\0') {
       const long v = std::strtol(p, nullptr, 10);
       if (v >= 0 && v <= 0xFFFF) c.dpdk_port = static_cast<uint16_t>(v);
     }
-    unsigned int sb[6];
-    const char* sm = std::getenv("SAMURAI_CUSTOM_TCP_SRC_MAC");
-    if (sm != nullptr &&
-        std::sscanf(sm, "%x:%x:%x:%x:%x:%x", &sb[0], &sb[1], &sb[2], &sb[3], &sb[4], &sb[5]) == 6) {
-      for (int i = 0; i < 6; ++i) c.src_mac[i] = static_cast<uint8_t>(sb[i] & 0xffu);
-      c.have_src_mac = true;
-    } else if (resolve_wire_iface_mac(c.iface, c.src_mac)) {
-      c.have_src_mac = true;
-    }
+  } else if (wire != nullptr &&
+             (std::strcmp(wire, "af_xdp") == 0 || std::strcmp(wire, "afxdp") == 0)) {
+    c.kind = WireKind::AfXdp;
   }
   return c;
 }
@@ -327,13 +380,26 @@ void maybe_pin_shard_worker(std::size_t sh) {
 
 bool custom_tcp_use_own_wire(const NativeRuntime& runtime, TransportBackend backend,
                              const std::string& protocol) {
-  if (backend != TransportBackend::CustomTcp || runtime.shards.size() <= 1) {
+  if (backend != TransportBackend::CustomTcp && backend != TransportBackend::DpdkDirect) {
     return false;
   }
   if (protocol != "http1" && protocol != "http2") {
     return false;
   }
+  const char* wire = std::getenv("SAMURAI_CUSTOM_TCP_WIRE");
+  if (wire != nullptr &&
+      (std::strcmp(wire, "in_memory") == 0 || std::strcmp(wire, "inmem") == 0)) {
+    return true;
+  }
+  const bool force_afxdp =
+      wire != nullptr && (std::strcmp(wire, "af_xdp") == 0 || std::strcmp(wire, "afxdp") == 0);
+  if (runtime.shards.size() <= 1 && !force_afxdp) {
+    return false;
+  }
   const char* iface = std::getenv("SAMURAI_CUSTOM_TCP_RX_IFACE");
+  if (iface == nullptr || iface[0] == '\0') {
+    iface = std::getenv("SAMURAI_XDP_INTERFACE");
+  }
   return iface != nullptr && iface[0] != '\0';
 }
 
@@ -347,6 +413,431 @@ uint16_t custom_tcp_dpdk_mask(std::size_t shard_count) {
   uint16_t m = 1;
   while (m < shard_count) m = static_cast<uint16_t>(m << 1);
   return static_cast<uint16_t>(m - 1);
+}
+
+namespace {
+
+inline void write_be16_inmem(uint8_t* p, uint16_t v) {
+  p[0] = static_cast<uint8_t>(v >> 8);
+  p[1] = static_cast<uint8_t>(v & 0xFFu);
+}
+inline void write_be32_inmem(uint8_t* p, uint32_t v) {
+  p[0] = static_cast<uint8_t>((v >> 24) & 0xFFu);
+  p[1] = static_cast<uint8_t>((v >> 16) & 0xFFu);
+  p[2] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+  p[3] = static_cast<uint8_t>(v & 0xFFu);
+}
+inline uint16_t read_be16_inmem(const uint8_t* p) {
+  return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+}
+inline uint32_t read_be32_inmem(const uint8_t* p) {
+  return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+         (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+struct InMemoryShardPeer {
+  struct FlowState {
+    uint32_t peer_seq{0};
+    uint32_t cli_ack{0};
+    uint32_t srv_ip{0};
+    uint32_t cli_ip{0};
+    uint16_t srv_port{0};
+    uint16_t cli_port{0};
+    bool is_h2{false};
+#ifdef SAMURAI_WITH_NGHTTP2
+    nghttp2_session* h2_sess{nullptr};
+#endif
+  };
+
+  std::deque<std::vector<uint8_t>> rx_queue;
+  std::unordered_map<uint64_t, FlowState> flows;
+  uint32_t iss_gen{0x61000000u};
+
+  ~InMemoryShardPeer() {
+#ifdef SAMURAI_WITH_NGHTTP2
+    for (auto& kv : flows) {
+      if (kv.second.h2_sess != nullptr) {
+        nghttp2_session_del(kv.second.h2_sess);
+      }
+    }
+#endif
+  }
+
+  static uint64_t make_key(uint32_t ip, uint16_t port) {
+    return (static_cast<uint64_t>(ip) << 16) | port;
+  }
+
+  static std::vector<uint8_t> build_frame(
+      uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
+      uint32_t seq, uint32_t ack, uint8_t flags, const uint8_t* payload, std::size_t payload_len) {
+    std::vector<uint8_t> f(54 + payload_len, 0);
+    write_be16_inmem(f.data() + 12, 0x0800);
+    f[14] = 0x45;
+    write_be16_inmem(f.data() + 16, static_cast<uint16_t>(40 + payload_len));
+    f[22] = 64;
+    f[23] = 6;
+    write_be32_inmem(f.data() + 26, src_ip);
+    write_be32_inmem(f.data() + 30, dst_ip);
+    write_be16_inmem(f.data() + 34, src_port);
+    write_be16_inmem(f.data() + 36, dst_port);
+    write_be32_inmem(f.data() + 38, seq);
+    write_be32_inmem(f.data() + 42, ack);
+    f[46] = 0x50;
+    f[47] = flags;
+    write_be16_inmem(f.data() + 48, 65535);
+    if (payload != nullptr && payload_len > 0) {
+      std::memcpy(f.data() + 54, payload, payload_len);
+    }
+    return f;
+  }
+
+#ifdef SAMURAI_WITH_NGHTTP2
+  static ssize_t h2_data_read_cb(
+      nghttp2_session*, int32_t, uint8_t* buf, std::size_t length,
+      uint32_t* data_flags, nghttp2_data_source*, void*) {
+    static const char kBody[] = "OK";
+    std::size_t n = sizeof(kBody) - 1;
+    if (n > length) n = length;
+    std::memcpy(buf, kBody, n);
+    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    return static_cast<ssize_t>(n);
+  }
+
+  static int h2_on_frame_recv_cb(nghttp2_session* s, const nghttp2_frame* f, void*) {
+    if (f->hd.type == NGHTTP2_HEADERS && f->headers.cat == NGHTTP2_HCAT_REQUEST &&
+        (f->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
+      nghttp2_nv nv[] = {
+          {(uint8_t*)":status", (uint8_t*)"200", 7, 3, NGHTTP2_NV_FLAG_NONE},
+          {(uint8_t*)"content-length", (uint8_t*)"2", 14, 1, NGHTTP2_NV_FLAG_NONE},
+      };
+      nghttp2_data_provider prd{};
+      prd.read_callback = &InMemoryShardPeer::h2_data_read_cb;
+      nghttp2_submit_response(s, f->hd.stream_id, nv, 2, &prd);
+    }
+    return 0;
+  }
+
+  void ensure_h2_session(FlowState& fl) {
+    if (fl.h2_sess != nullptr) return;
+    nghttp2_session_callbacks* cbs = nullptr;
+    nghttp2_session_callbacks_new(&cbs);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, &InMemoryShardPeer::h2_on_frame_recv_cb);
+    nghttp2_session_server_new(&fl.h2_sess, cbs, this);
+    nghttp2_session_callbacks_del(cbs);
+    nghttp2_settings_entry iv[1] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1024}};
+    nghttp2_submit_settings(fl.h2_sess, NGHTTP2_FLAG_NONE, iv, 1);
+  }
+
+  void pump_h2_out(FlowState& fl) {
+    if (fl.h2_sess == nullptr) return;
+    std::vector<uint8_t> outbuf;
+    const uint8_t* data = nullptr;
+    for (;;) {
+      const ssize_t n = nghttp2_session_mem_send(fl.h2_sess, &data);
+      if (n <= 0) break;
+      outbuf.insert(outbuf.end(), data, data + n);
+    }
+    if (!outbuf.empty()) {
+      constexpr std::size_t kMaxSeg = 1400;
+      std::size_t off = 0;
+      while (off < outbuf.size()) {
+        const std::size_t chunk = std::min<std::size_t>(kMaxSeg, outbuf.size() - off);
+        rx_queue.push_back(build_frame(
+            fl.srv_ip, fl.cli_ip, fl.srv_port, fl.cli_port,
+            fl.peer_seq, fl.cli_ack, 0x18u /* PSH|ACK */,
+            outbuf.data() + off, chunk));
+        fl.peer_seq += static_cast<uint32_t>(chunk);
+        off += chunk;
+      }
+    }
+  }
+#endif
+
+  void ingest_tx_packet(const uint8_t* pkt, std::size_t psize) {
+    if (psize < 54 || read_be16_inmem(pkt + 12) != 0x0800u || pkt[23] != 6u) return;
+    const uint16_t ip_total = read_be16_inmem(pkt + 16);
+    const std::size_t ihl = static_cast<std::size_t>(pkt[14] & 0x0Fu) * 4u;
+    if (ihl < 20u || 14u + ihl + 20u > psize) return;
+    const uint8_t* tcp = pkt + 14u + ihl;
+    const std::size_t tcphl = static_cast<std::size_t>((tcp[12] >> 4u) & 0x0Fu) * 4u;
+    if (tcphl < 20u || 14u + ihl + tcphl > psize) return;
+    const uint8_t flags = tcp[13];
+    const uint32_t cli_ip = read_be32_inmem(pkt + 26);
+    const uint32_t srv_ip = read_be32_inmem(pkt + 30);
+    const uint16_t cli_port = read_be16_inmem(tcp);
+    const uint16_t srv_port = read_be16_inmem(tcp + 2);
+    const uint32_t cli_seq = read_be32_inmem(tcp + 4);
+    const std::size_t payload_len =
+        ip_total >= (ihl + tcphl) ? static_cast<std::size_t>(ip_total) - (ihl + tcphl) : 0u;
+    const uint8_t* payload = tcp + tcphl;
+    if (14u + ihl + tcphl + payload_len > psize) return;
+
+    const uint64_t key = make_key(cli_ip, cli_port);
+    constexpr uint8_t kFin = 0x01u, kSyn = 0x02u, kPsh = 0x08u, kAck = 0x10u;
+
+    if ((flags & kSyn) != 0 && (flags & kAck) == 0) {
+      const uint32_t my_iss = ++iss_gen;
+      FlowState& fl = flows[key];
+      fl.peer_seq = my_iss + 1u;
+      fl.cli_ack = cli_seq + 1u;
+      fl.srv_ip = srv_ip;
+      fl.cli_ip = cli_ip;
+      fl.srv_port = srv_port;
+      fl.cli_port = cli_port;
+      fl.is_h2 = false;
+      rx_queue.push_back(build_frame(
+          srv_ip, cli_ip, srv_port, cli_port, my_iss, cli_seq + 1u, kSyn | kAck, nullptr, 0));
+      return;
+    }
+
+    if (payload_len > 0) {
+      FlowState& fl = flows[key];
+      fl.srv_ip = srv_ip;
+      fl.cli_ip = cli_ip;
+      fl.srv_port = srv_port;
+      fl.cli_port = cli_port;
+      fl.cli_ack = cli_seq + static_cast<uint32_t>(payload_len);
+      if (!fl.is_h2 && payload_len >= 16 &&
+          std::memcmp(payload, "PRI * HTTP/2.0\r\n", 16) == 0) {
+        fl.is_h2 = true;
+      }
+      if (fl.is_h2) {
+#ifdef SAMURAI_WITH_NGHTTP2
+        ensure_h2_session(fl);
+        nghttp2_session_mem_recv(fl.h2_sess, payload, payload_len);
+        pump_h2_out(fl);
+#endif
+      } else {
+        const bool req_close = (payload_len >= 17 &&
+            std::string_view(reinterpret_cast<const char*>(payload), payload_len).find("close") != std::string_view::npos);
+        const char* kResp = req_close
+            ? "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi"
+            : "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
+        const std::size_t kRespLen = std::strlen(kResp);
+        rx_queue.push_back(build_frame(
+            srv_ip, cli_ip, srv_port, cli_port,
+            fl.peer_seq, fl.cli_ack, kPsh | kAck,
+            reinterpret_cast<const uint8_t*>(kResp), kRespLen));
+        fl.peer_seq += static_cast<uint32_t>(kRespLen);
+      }
+      return;
+    }
+
+    if ((flags & kFin) != 0) {
+      auto it = flows.find(key);
+      if (it != flows.end()) {
+        FlowState& fl = it->second;
+        fl.cli_ack = cli_seq + 1u;
+        rx_queue.push_back(build_frame(
+            srv_ip, cli_ip, srv_port, cli_port,
+            fl.peer_seq, fl.cli_ack, kAck, nullptr, 0));
+        flows.erase(it);
+      }
+    }
+  }
+};
+
+struct SharedAfXdpWireState {
+  std::mutex mu;
+  const xdp_native_api_v1* api{nullptr};
+  int handle{0};
+  int refcount{0};
+  std::size_t shard_count{0};
+  std::vector<ShardPortRange> port_ranges;
+  struct QueuedFrame {
+    std::vector<uint8_t> data;
+  };
+  std::vector<std::deque<QueuedFrame>> shard_rx_queues;
+
+  const xdp_native_api_v1* load_api() {
+    if (api != nullptr) return api;
+    static const char* kCandidates[] = {
+        "ddos_samurai/xdp/xdp_sender.so",
+        "ddos_samurai/xdp_sender.so",
+        "ddos_samurai/xdp_sender.cpython-312-x86_64-linux-gnu.so",
+        "xdp_sender.so",
+        "./ddos_samurai/xdp_sender.so",
+    };
+    for (const char* path : kCandidates) {
+      dlerror();
+      void* h = ::dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+      if (!h) continue;
+      using GetApiFn = xdp_native_api_v1* (*)();
+      auto fn = reinterpret_cast<GetApiFn>(::dlsym(h, "samurai_xdp_get_native_api_v1"));
+      if (!fn) {
+        ::dlclose(h);
+        continue;
+      }
+      const xdp_native_api_v1* a = fn();
+      if (a && a->version == XDP_NATIVE_API_VERSION && a->create_ctx && a->destroy_ctx &&
+          a->send_buffer && a->recv_frames) {
+        api = a;
+        return api;
+      }
+      ::dlclose(h);
+    }
+    return nullptr;
+  }
+};
+
+SharedAfXdpWireState& shared_afxdp_wire_state() {
+  static SharedAfXdpWireState s;
+  return s;
+}
+
+bool extract_ipv4_tcp_dst_port(const uint8_t* frame, std::size_t flen, uint16_t* out_dport) {
+  if (frame == nullptr || flen < 14 + 20 + 20 || out_dport == nullptr) return false;
+  const uint16_t ethertype =
+      static_cast<uint16_t>((static_cast<uint16_t>(frame[12]) << 8u) | frame[13]);
+  if (ethertype != 0x0800u) return false;
+  const uint8_t vihl = frame[14];
+  if ((vihl >> 4u) != 4u) return false;
+  const std::size_t ihl = static_cast<std::size_t>(vihl & 0x0fu) * 4u;
+  if (ihl < 20u || 14u + ihl + 20u > flen) return false;
+  if (frame[14 + 9] != IPPROTO_TCP) return false;
+  const uint8_t* tcp = frame + 14u + ihl;
+  *out_dport = static_cast<uint16_t>((static_cast<uint16_t>(tcp[2]) << 8u) | tcp[3]);
+  return true;
+}
+
+}  // namespace
+
+bool pump_custom_tcp_shard_inmem(NativeRuntime& runtime, void* peer_ptr) {
+  auto* peer = static_cast<InMemoryShardPeer*>(peer_ptr);
+  if (peer == nullptr) return false;
+  bool did_work = false;
+  int rx_count = 0;
+  while (!peer->rx_queue.empty() && rx_count < 256) {
+    const auto& front = peer->rx_queue.front();
+    uint32_t updated = 0;
+    (void)tcpdp_ingest_rx_frame(front.data(), front.size(), &updated);
+    peer->rx_queue.pop_front();
+    ++rx_count;
+  }
+  if (rx_count > 0) did_work = true;
+
+  apply_custom_tcp_core_events(runtime);
+
+  for (int guard = 0; guard < 16; ++guard) {
+    const uint8_t* base = nullptr;
+    uint32_t count = 0;
+    size_t psize = 0;
+    size_t stride = 0;
+    if (tcpdp_peek_tx_packets_strided(0, &base, &count, &psize, &stride) != 0) break;
+    if (base == nullptr || count == 0 || psize == 0) break;
+    for (uint32_t i = 0; i < count; ++i) {
+      peer->ingest_tx_packet(base + static_cast<std::size_t>(i) * stride, psize);
+    }
+    uint32_t consumed = 0;
+    (void)tcpdp_consume_tx_packets(count, &consumed);
+    did_work = true;
+  }
+  return did_work;
+}
+
+bool pump_custom_tcp_shard_afxdp(NativeRuntime& runtime, std::size_t sh,
+                                 const uint8_t dst_mac[6], const uint8_t src_mac[6],
+                                 uint8_t* rxbuf, uint16_t* rxlens, uint16_t rx_budget,
+                                 std::vector<std::uint8_t>& txscratch) {
+  bool did_work = false;
+  auto& st = shared_afxdp_wire_state();
+  int got_for_shard = 0;
+  {
+    std::lock_guard<std::mutex> lk(st.mu);
+    if (st.api != nullptr && st.handle > 0) {
+      char err[160]{};
+      const int n = st.api->recv_frames(
+          st.handle, rxbuf, static_cast<int>(kCustomTcpWireStride), rxlens,
+          static_cast<int>(rx_budget), static_cast<int>(kCustomTcpWireStride),
+          err, sizeof(err));
+      for (int i = 0; i < n; ++i) {
+        const uint8_t* f = rxbuf + static_cast<std::size_t>(i) * kCustomTcpWireStride;
+        const uint16_t flen = rxlens[static_cast<std::size_t>(i)];
+        uint16_t dport = 0;
+        if (!extract_ipv4_tcp_dst_port(f, flen, &dport)) continue;
+        for (std::size_t s = 0; s < st.shard_count; ++s) {
+          if (dport >= st.port_ranges[s].lo && dport <= st.port_ranges[s].hi) {
+            SharedAfXdpWireState::QueuedFrame qf;
+            qf.data.assign(f, f + flen);
+            st.shard_rx_queues[s].push_back(std::move(qf));
+            break;
+          }
+        }
+      }
+    }
+    if (sh < st.shard_rx_queues.size()) {
+      auto& q = st.shard_rx_queues[sh];
+      while (!q.empty() && got_for_shard < static_cast<int>(rx_budget)) {
+        const auto& front = q.front();
+        const std::size_t copy_len =
+            std::min<std::size_t>(front.data.size(), kCustomTcpWireStride);
+        std::memcpy(
+            rxbuf + static_cast<std::size_t>(got_for_shard) * kCustomTcpWireStride,
+            front.data.data(), copy_len);
+        rxlens[static_cast<std::size_t>(got_for_shard)] = static_cast<uint16_t>(copy_len);
+        q.pop_front();
+        ++got_for_shard;
+      }
+    }
+  }
+
+  for (int i = 0; i < got_for_shard; ++i) {
+    uint32_t updated = 0;
+    (void)tcpdp_ingest_rx_frame(
+        rxbuf + static_cast<std::size_t>(i) * kCustomTcpWireStride,
+        rxlens[static_cast<std::size_t>(i)], &updated);
+  }
+  if (got_for_shard > 0) did_work = true;
+
+  apply_custom_tcp_core_events(runtime);
+
+  for (int guard = 0; guard < 16; ++guard) {
+    const uint8_t* base = nullptr;
+    uint32_t count = 0;
+    size_t psize = 0;
+    size_t stride = 0;
+    if (tcpdp_peek_tx_packets_strided(0, &base, &count, &psize, &stride) != 0) break;
+    if (base == nullptr || count == 0 || psize < 14) {
+      if (base != nullptr && count > 0 && psize < 14) {
+        uint32_t consumed = 0;
+        (void)tcpdp_consume_tx_packets(count, &consumed);
+      }
+      break;
+    }
+    const uint32_t cap = txscratch.empty()
+                             ? 0u
+                             : static_cast<uint32_t>(txscratch.size() / psize);
+    const uint32_t batch = std::min<uint32_t>(count, cap);
+    if (batch == 0) break;
+    for (uint32_t i = 0; i < batch; ++i) {
+      uint8_t* d = txscratch.data() + static_cast<std::size_t>(i) * psize;
+      std::memcpy(d, base + static_cast<size_t>(i) * stride, psize);
+      std::memcpy(d, dst_mac, 6);
+      std::memcpy(d + 6, src_mac, 6);
+    }
+    int sent = 0;
+    {
+      std::lock_guard<std::mutex> lk(st.mu);
+      if (st.api != nullptr && st.handle > 0) {
+        char err[160]{};
+        if (st.api->send_buffer_strided != nullptr) {
+          sent = st.api->send_buffer_strided(
+              st.handle, txscratch.data(), static_cast<int>(psize),
+              static_cast<int>(psize), static_cast<int>(batch), err, sizeof(err));
+        } else {
+          sent = st.api->send_buffer(
+              st.handle, txscratch.data(), static_cast<int>(psize),
+              static_cast<int>(batch), err, sizeof(err));
+        }
+      }
+    }
+    if (sent <= 0) break;
+    uint32_t consumed = 0;
+    (void)tcpdp_consume_tx_packets(static_cast<uint32_t>(sent), &consumed);
+    did_work = true;
+    if (static_cast<uint32_t>(sent) < count) break;
+  }
+  return did_work;
 }
 
 bool pump_custom_tcp_shard_dpdk(NativeRuntime& runtime, long handle, uint16_t queue,
@@ -444,6 +935,13 @@ ShardWire open_shard_wire(const CustomTcpWireConfig& cfg, const DpdkOwnWire& dw,
                           std::size_t sh, std::size_t shard_count,
                           const ShardPortRange& pr) {
   ShardWire w;
+  if (cfg.kind == WireKind::InMemory) {
+    w.kind = WireKind::InMemory;
+    w.dpdk_queue = static_cast<uint16_t>(sh);
+    tcpdp_set_ephemeral_port_base(pr.lo);
+    w.inmem_peer = new InMemoryShardPeer();
+    return w;
+  }
   if (cfg.kind == WireKind::Dpdk && dw.active) {
     w.kind = WireKind::Dpdk;
     const uint16_t stride = static_cast<uint16_t>(dw.mask + 1);
@@ -463,6 +961,39 @@ ShardWire open_shard_wire(const CustomTcpWireConfig& cfg, const DpdkOwnWire& dw,
     w.dpdk_queue = static_cast<uint16_t>(sh);
     return w;
   }
+  if (cfg.kind == WireKind::AfXdp) {
+    w.kind = WireKind::AfXdp;
+    w.dpdk_queue = static_cast<uint16_t>(sh);
+    tcpdp_set_ephemeral_port_base(pr.lo);
+    auto& st = shared_afxdp_wire_state();
+    std::lock_guard<std::mutex> lk(st.mu);
+    if (st.refcount == 0) {
+      const xdp_native_api_v1* api = st.load_api();
+      if (api != nullptr) {
+        int queue_id = 0;
+        if (const char* qenv = std::getenv("SAMURAI_XDP_QUEUE_ID"); qenv != nullptr) {
+          queue_id = std::max(0, std::atoi(qenv));
+        }
+        int mode = 0;  // Default to SKB/Copy mode (0) unless overridden
+        if (const char* menv = std::getenv("SAMURAI_XDP_MODE"); menv != nullptr) {
+          mode = std::clamp(std::atoi(menv), 0, 2);
+        }
+        char err[160]{};
+        st.handle = api->create_ctx(cfg.iface.c_str(), queue_id, mode, err, sizeof(err));
+        st.shard_count = shard_count;
+        st.port_ranges.resize(shard_count);
+        st.shard_rx_queues.assign(shard_count, {});
+        for (std::size_t i = 0; i < shard_count; ++i) {
+          st.port_ranges[i] = custom_tcp_shard_port_range(i, shard_count);
+        }
+      }
+    }
+    if (st.handle > 0) {
+      st.refcount += 1;
+      w.dpdk_handle = st.handle;
+    }
+    return w;
+  }
   w.kind = WireKind::AfPacket;
   tcpdp_set_ephemeral_port_base(pr.lo);
   (void)afpkt_wire_open(cfg.iface.c_str(), pr.lo, pr.hi, &w.afpkt);
@@ -472,11 +1003,19 @@ ShardWire open_shard_wire(const CustomTcpWireConfig& cfg, const DpdkOwnWire& dw,
 bool pump_shard_wire(NativeRuntime& runtime, const CustomTcpWireConfig& cfg,
                      ShardWire& w, uint8_t* rxbuf, uint16_t* rxlens, uint16_t budget,
                      std::vector<std::uint8_t>& txscratch) {
+  if (w.kind == WireKind::InMemory) {
+    return pump_custom_tcp_shard_inmem(runtime, w.inmem_peer);
+  }
   if (w.kind == WireKind::Dpdk) {
     if (w.dpdk_handle <= 0) return false;
     return pump_custom_tcp_shard_dpdk(runtime, w.dpdk_handle, w.dpdk_queue,
                                       cfg.dst_mac, cfg.src_mac, rxbuf, rxlens, budget,
                                       txscratch);
+  }
+  if (w.kind == WireKind::AfXdp) {
+    if (w.dpdk_handle <= 0) return false;
+    return pump_custom_tcp_shard_afxdp(runtime, w.dpdk_queue, cfg.dst_mac, cfg.src_mac,
+                                       rxbuf, rxlens, budget, txscratch);
   }
   if (w.afpkt != nullptr) {
     return pump_custom_tcp_shard_wire(runtime, w.afpkt, cfg.dst_mac, rxbuf, rxlens, budget);
@@ -485,9 +1024,25 @@ bool pump_shard_wire(NativeRuntime& runtime, const CustomTcpWireConfig& cfg,
 }
 
 void close_shard_wire(ShardWire& w) {
-  if (w.kind == WireKind::Dpdk) {
+  if (w.kind == WireKind::InMemory) {
+    delete static_cast<InMemoryShardPeer*>(w.inmem_peer);
+    w.inmem_peer = nullptr;
+  } else if (w.kind == WireKind::Dpdk) {
     if (w.dpdk_handle > 0) samurai::dpdk::close_port(w.dpdk_handle);
     if (w.lcore_registered) samurai::dpdk::unregister_lcore_thread();
+  } else if (w.kind == WireKind::AfXdp) {
+    auto& st = shared_afxdp_wire_state();
+    std::lock_guard<std::mutex> lk(st.mu);
+    if (w.dpdk_handle > 0 && st.refcount > 0) {
+      st.refcount -= 1;
+      if (st.refcount == 0 && st.api != nullptr && st.handle > 0) {
+        char err[160]{};
+        (void)st.api->destroy_ctx(st.handle, err, sizeof(err));
+        st.handle = 0;
+        st.shard_rx_queues.clear();
+      }
+    }
+    w.dpdk_handle = 0;
   } else if (w.afpkt != nullptr) {
     afpkt_wire_close(w.afpkt);
   }
