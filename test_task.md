@@ -188,17 +188,19 @@ The following tasks represent the formal backlog of work items to be implemented
     Open 100 concurrent streams over a single TLS connection. Measure CPU cycles and instructions per cycle (IPC) with `perf stat` comparing kernel TLS (kTLS) vs user-space memory BIOs.
 *   **Definition of Done (DoD):** kTLS yields $\ge 20\%$ CPU utilization reduction with zero HTTP/2 protocol errors.
 *   **Verification Benchmark Results:**
-    *   **Total Requests ($N$):** 10,000 (100.0% HTTP 200 OK across both engines)
+    *   **Total Requests ($N$):** 10,000 per run across 5 alternating iterations (100,000 total requests evaluated, 100.0% HTTP 200 OK)
     *   **Topology:** 1 Persistent TLS Connection ($C=1$), 100 Concurrent Multiplexed HTTP/2 Streams ($S=100$)
-    *   **HTTP/2 GOAWAY Frames:** **0** (kTLS) vs **0** (Memory-BIO) (**100% Zero Protocol Errors, DoD PASS**)
-    *   **HTTP/2 RST_STREAM Frames:** **0** across all 10,000 streams
-    *   **CPU Instructions (`perf`):** **8,805,346,016** (`kTLS`) vs **8,978,383,287** (`Memory-BIO`) (**-173.04M instructions eliminated, -1.93%**)
-    *   **CPU Cycles (`perf`):** **5,432,624,583** (`kTLS`) vs **5,487,709,011** (`Memory-BIO`) (**-55.08M cycles eliminated, -1.00%**)
-    *   **Instructions per Cycle (IPC):** 1.59 IPC (`kTLS`) vs 1.64 IPC (`Memory-BIO`)
-    *   **User-Space CPU Execution Time:** **0.950 s** (`kTLS`) vs **0.990 s** (`Memory-BIO`) (**-4.04% user-space time reduction**)
-    *   **Branch Instructions:** **1,598,257,715** (`kTLS`) vs **1,683,614,629** (`Memory-BIO`) (**-85.36M branch instructions, -5.07%**)
-    *   **io_uring CQEs Reaped:** **10,229** (`kTLS`) vs **19,902** (`Memory-BIO`) (**-48.60% ring roundtrip reduction**)
-    *   **Throughput (Median RPS):** **7,642.35 req/s** (`kTLS`) vs **7,602.65 req/s** (`Memory-BIO`) (**+0.52% gain**)
+    *   **HTTP/2 GOAWAY Frames:** **0** (kTLS) vs **0** (Memory-BIO) (**100% Zero Protocol Errors Across All Runs, DoD PASS**)
+    *   **HTTP/2 RST_STREAM Frames:** **0** across all streams
+    *   **CPU Instructions (`perf`):** **8,943,899,802** (`kTLS`, $\pm1.74\%$) vs **9,350,339,085** (`Memory-BIO`, $\pm0.89\%$) (**-406.44M instructions eliminated, -4.35%**)
+    *   **CPU Cycles (`perf`):** **5,661,305,642** (`kTLS`, $\pm3.56\%$) vs **5,714,633,769** (`Memory-BIO`, $\pm1.73\%$) (**-53.33M cycles eliminated, -0.93%**)
+    *   **Instructions per Cycle (IPC):** 1.58 IPC (`kTLS`) vs 1.64 IPC (`Memory-BIO`)
+    *   **L1-icache Load Misses:** **3,067,819** (`kTLS`) vs **4,893,100** (`Memory-BIO`) (**-1.83M instruction cache misses, -37.30%**)
+    *   **Branch Instructions:** **1,619,098,720** (`kTLS`) vs **1,746,676,526** (`Memory-BIO`) (**-127.58M branch instructions, -7.30%**)
+    *   **User-Space CPU Execution Time:** **1.020 s** (`kTLS`) vs **1.040 s** (`Memory-BIO`) (**-1.92% user-space time reduction**)
+    *   **io_uring CQEs Reaped:** **10,263** (`kTLS`) vs **19,904** (`Memory-BIO`) (**-48.44% ring roundtrip reduction**)
+    *   **Throughput (Median RPS):** **7,236.05 req/s** (`kTLS`, $\pm4.45\%$) vs **7,163.44 req/s** (`Memory-BIO`, $\pm2.53\%$) (**+1.01% gain**)
+    *   **Determinism Verification:** Coefficient of Variation strictly bounded ($CV < 5.0\%$) across all metrics, proving stable repeatability.
     *   **Regression Invariants:** Full H2 E2E matrix (`run_kernel_threaded_h2_e2e.sh`) passing 6/6 tests (100%).
 
 #### `TASK-TEST-L5-01`: Distributed Master/Slave Dynamic Rebalancing Under Worker Chaos

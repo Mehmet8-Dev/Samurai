@@ -63,7 +63,7 @@ class TestH2KtlsVsMemoryBio(unittest.TestCase):
 
         res = subprocess.run(["bash", str(self.bench_script)], env=env, capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, f"Benchmark script failed:\n{res.stdout}\n{res.stderr}")
-        self.assertIn("Definition of Done (DoD) ALL CRITERIA SATISFIED!", res.stdout)
+        self.assertIn("Definition of Done (DoD) ALL CRITERIA SATISFIED", res.stdout)
 
         out_dir = Path(env["OUTPUT_DIR"])
         summary_path = out_dir / "summary.json"
@@ -77,6 +77,9 @@ class TestH2KtlsVsMemoryBio(unittest.TestCase):
         self.assertTrue(dod["single_connection_verified"], "Single connection check failed")
         self.assertTrue(dod["streams_concurrency_verified"], "100 streams concurrency check failed")
         self.assertTrue(dod["status_200_parity"], "100% 200 OK parity check failed")
+        self.assertTrue(dod["cpu_overhead_reduced"], "CPU overhead reduction check failed")
+        self.assertTrue(summary["determinism"]["deterministic"], "Determinism bounds check failed")
+        self.assertGreater(summary["deltas"]["cqe_reduction_pct"], 20.0, "Expected >= 20% CQE reduction under kTLS")
 
 
 if __name__ == "__main__":

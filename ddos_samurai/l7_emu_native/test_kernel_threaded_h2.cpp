@@ -228,10 +228,16 @@ int RunBenchmark(int requests,
   const double sqe = get("l7_io_uring_sqe_submitted");
   const double cqe = get("l7_io_uring_cqe_reaped");
   const double p50_ms = get("l7_request_latency_p50_ms");
+  const double p90_ms = get("l7_request_latency_p90_ms");
   const double p95_ms = get("l7_request_latency_p95_ms");
   const double p99_ms = get("l7_request_latency_p99_ms");
+  const double avg_ms = get("l7_request_latency_avg_ms");
+  const double max_ms = get("l7_request_latency_max_ms");
+  const double rst_ratio = get("h2_stream_reset_ratio");
 
   const double rps = duration_sec > 0.0 ? (sent / duration_sec) : 0.0;
+  const double bytes_total = rx_bytes + tx_bytes;
+  const double bytes_per_sec = duration_sec > 0.0 ? (bytes_total / duration_sec) : 0.0;
   const std::string mode_str = want_ktls ? "ktls" : (use_tls ? "memory_bio" : "plaintext");
   const std::string reactor_str = force_epoll ? "socket_epoll" : (want_io_uring ? "socket_io_uring" : "auto");
 
@@ -247,9 +253,11 @@ int RunBenchmark(int requests,
               << "  \"shards\": " << static_cast<int>(shards) << ",\n"
               << "  \"duration_sec\": " << duration_sec << ",\n"
               << "  \"rps\": " << rps << ",\n"
+              << "  \"bytes_per_sec\": " << bytes_per_sec << ",\n"
               << "  \"status_2xx\": " << static_cast<long>(status_2xx) << ",\n"
               << "  \"errors\": " << static_cast<long>(errors) << ",\n"
               << "  \"goaway_count\": " << static_cast<long>(goaway_count) << ",\n"
+              << "  \"stream_reset_ratio\": " << rst_ratio << ",\n"
               << "  \"active_streams_peak\": " << static_cast<long>(active_streams_peak) << ",\n"
               << "  \"conn_established\": " << static_cast<long>(conn_established) << ",\n"
               << "  \"rx_bytes\": " << static_cast<long>(rx_bytes) << ",\n"
@@ -259,9 +267,12 @@ int RunBenchmark(int requests,
               << "  \"epoll_wakeups\": " << static_cast<long>(epoll_wakeups) << ",\n"
               << "  \"sqe_submitted\": " << static_cast<long>(sqe) << ",\n"
               << "  \"cqe_reaped\": " << static_cast<long>(cqe) << ",\n"
+              << "  \"latency_avg_ms\": " << avg_ms << ",\n"
               << "  \"latency_p50_ms\": " << p50_ms << ",\n"
+              << "  \"latency_p90_ms\": " << p90_ms << ",\n"
               << "  \"latency_p95_ms\": " << p95_ms << ",\n"
-              << "  \"latency_p99_ms\": " << p99_ms << "\n"
+              << "  \"latency_p99_ms\": " << p99_ms << ",\n"
+              << "  \"latency_max_ms\": " << max_ms << "\n"
               << "}\n";
   } else {
     std::printf("\n================================================================================\n");

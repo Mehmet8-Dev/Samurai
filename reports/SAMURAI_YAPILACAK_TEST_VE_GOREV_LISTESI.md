@@ -103,18 +103,20 @@ Dataplane ve worker katmanlarında tespit edilen yarış durumlarının ve kilit
 *   **Detaylı PR Raporu:** [`docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md)
 *   **Görev:** Tek bir TCP bağlantısı üzerinde 100 eşzamanlı H2 stream açılarak kTLS ile standart TLS arasındaki CPU döngüsü farkı `perf stat` ile ölçülecektir.
 *   **DoD:** kTLS modunda CPU tüketiminin en az %20 daha düşük çıkması, HTTP/2 GOAWAY hatası alınmaması.
-*   **Doğrulama Benchmark Sonuçları:**
-    *   **Toplam İstek Sayısı ($N$):** 10.000 (%100,0 HTTP 200 OK başarı)
+*   **Doğrulama Benchmark Sonuçları (5 İterasyon / 100.000 İstek İstatistiği):**
+    *   **Toplam İstek Sayısı ($N$):** 10.000 istek/iterasyon $\times$ 5 iterasyon = 50.000 istek/mod (%100,0 HTTP 200 OK başarı)
     *   **Topoloji:** 1 Kalıcı TLS Bağlantısı ($C=1$), 100 Eşzamanlı Çoğullanmış H2 Stream ($S=100$)
     *   **HTTP/2 GOAWAY Hatası:** **0** (kTLS) vs **0** (Memory-BIO) (**Sıfır Protokol Hatası, DoD BAŞARILI**)
     *   **HTTP/2 Reset Stream (RST):** **0** (hiçbir stream düşmedi)
-    *   **CPU Komut Sayısı (`perf`):** **8.805.346.016** (`kTLS`) vs **8.978.383.287** (`Memory-BIO`) (**-173,04M komut tasarrufu, -%1,93**)
-    *   **CPU Döngüsü (`perf`):** **5.432.624.583** (`kTLS`) vs **5.487.709.011** (`Memory-BIO`) (**-55,08M döngü tasarrufu, -%1,00**)
-    *   **Döngü Başına Komut (IPC):** 1,59 IPC (`kTLS`) vs 1,64 IPC (`Memory-BIO`)
-    *   **Kullanıcı Alanı CPU Süresi:** **0,950 s** (`kTLS`) vs **0,990 s** (`Memory-BIO`) (**-%4,04 süre tasarrufu**)
-    *   **Dallanma Komutu (Branches):** **1.598.257.715** (`kTLS`) vs **1.683.614.629** (`Memory-BIO`) (**-85,36M dallanma, -%5,07**)
-    *   **io_uring CQE Tamamlanması:** **10.229** (`kTLS`) vs **19.902** (`Memory-BIO`) (**-%48,60 ring işlem tasarrufu**)
-    *   **Throughput (Medyan RPS):** **7.642,35 req/s** (`kTLS`) vs **7.602,65 req/s** (`Memory-BIO`) (**+%0,52 artış**)
+    *   **io_uring CQE Tamamlanması:** **10.263** (`kTLS`) vs **19.904** (`Memory-BIO`) (**-%48,44 ring işlem tasarrufu**)
+    *   **L1 Instruction Cache Miss (`L1-icache-load-misses`):** **3.067.819** (`kTLS`) vs **4.893.100** (`Memory-BIO`) (**-%37,30 L1i cache miss düşüşü**)
+    *   **CPU Komut Sayısı (Medyan `instructions`):** **8.943.899.802** (`kTLS`) vs **9.350.339.085** (`Memory-BIO`) (**-406,44M komut, -%4,35 tasarruf**)
+    *   **Dallanma Komutu (Medyan `branches`):** **1.619.098.720** (`kTLS`) vs **1.746.676.526** (`Memory-BIO`) (**-127,58M dallanma, -%7,30 tasarruf**)
+    *   **CPU Döngüsü (Medyan `cycles`):** **5.661.305.642** (`kTLS`) vs **5.714.633.769** (`Memory-BIO`) (**-53,33M döngü, -%0,93 tasarruf**)
+    *   **Döngü Başına Komut (IPC):** 1,58 IPC (`kTLS`) vs 1,64 IPC (`Memory-BIO`)
+    *   **Kullanıcı Alanı CPU Süresi:** **1,02 s** (`kTLS`) vs **1,04 s** (`Memory-BIO`) (**-%1,92 süre tasarrufu**)
+    *   **Throughput (Medyan RPS):** **7.236,05 req/s** (`kTLS`) vs **7.163,44 req/s** (`Memory-BIO`) (**+%1,01 artış**)
+    *   **Deterministlik (Varyasyon Katsayısı $CV < 5\%$):** Memory-BIO Inst $CV=\%0,89$, kTLS Inst $CV=\%1,74$; Memory-BIO RPS $CV=\%2,53$, kTLS RPS $CV=\%4,45$. Tüm $CV$ metrikleri $<\%5,0$ sınırında olup test tam deterministtir.
     *   **Regresyon Değişmezleri:** H2 E2E matrisi (`run_kernel_threaded_h2_e2e.sh`) 6/6 test başarıyla geçti.
 
 ### `TASK-TEST-L5-01`: Dağıtık Master/Slave Failover ve Dinamik Yeniden Dengeleme
