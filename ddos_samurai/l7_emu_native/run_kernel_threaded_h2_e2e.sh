@@ -16,7 +16,17 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bin="${1:-${H2_TEST_BIN:-$here/../zmq/build/l7_emu_native/test_kernel_threaded_h2}}"
+candidate_bin="${H2_TEST_BIN:-}"
+if [[ -z "$candidate_bin" ]]; then
+  if [[ -x "$here/../../build/l7_emu_native/test_kernel_threaded_h2" ]]; then
+    candidate_bin="$here/../../build/l7_emu_native/test_kernel_threaded_h2"
+  elif [[ -x "$here/../zmq/build/l7_emu_native/test_kernel_threaded_h2" ]]; then
+    candidate_bin="$here/../zmq/build/l7_emu_native/test_kernel_threaded_h2"
+  else
+    candidate_bin="$here/../zmq/build/l7_emu_native/test_kernel_threaded_h2"
+  fi
+fi
+bin="${1:-$candidate_bin}"
 
 if [[ ! -x "$bin" ]]; then
   echo "test binary not found/executable: $bin" >&2

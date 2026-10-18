@@ -5,12 +5,13 @@ Same tiny 200-response server as test_h2c_server.py, but wrapped in TLS with a
 self-signed cert generated at startup and ALPN advertising "h2". Prints the bound
 port as `PORT <n>` on the first stdout line so the harness can read it.
 """
+import datetime
+import os
 import socket
 import ssl
 import sys
 import tempfile
 import threading
-import datetime
 
 import h2.config
 import h2.connection
@@ -27,7 +28,7 @@ def make_self_signed():
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
@@ -54,6 +55,10 @@ def make_self_signed():
 
 
 def handle(conn):
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
     config = h2.config.H2Configuration(client_side=False)
     h2conn = h2.connection.H2Connection(config=config)
     h2conn.initiate_connection()
@@ -71,6 +76,8 @@ def handle(conn):
                         [(":status", "200"), ("content-length", str(len(BODY)))],
                     )
                     h2conn.send_data(sid, BODY, end_stream=True)
+                elif isinstance(event, h2.events.DataReceived):
+                    h2conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
             out = h2conn.data_to_send()
             if out:
                 conn.sendall(out)
@@ -89,10 +96,20 @@ def main():
     ctx.load_cert_chain(cert, key)
     ctx.set_alpn_protocols(["h2"])
 
+    bind_port = 0
+    if len(sys.argv) > 1:
+        try:
+            bind_port = int(sys.argv[1])
+        except ValueError:
+            pass
+    elif "H2_PORT" in os.environ:
+        bind_port = int(os.environ["H2_PORT"])
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", 0))
-    sock.listen(64)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.bind(("127.0.0.1", bind_port))
+    sock.listen(128)
     print("PORT %d" % sock.getsockname()[1], flush=True)
 
     while True:
@@ -101,6 +118,7 @@ def main():
         except OSError:
             break
         try:
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             tls = ctx.wrap_socket(raw, server_side=True)
         except (ssl.SSLError, OSError):
             raw.close()

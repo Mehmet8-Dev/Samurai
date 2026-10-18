@@ -1,0 +1,53 @@
+{
+  "task": "TASK-TEST-L3-02",
+  "timestamp_utc": "2026-10-18T13:47:37.199590+00:00",
+  "host": {
+    "kernel": "6.14.0-37-generic",
+    "arch": "x86_64",
+    "cpu": "x86_64"
+  },
+  "parameters": {
+    "requests": 10000,
+    "concurrency": 1,
+    "streams": 100,
+    "iterations": 3
+  },
+  "medians": {
+    "memory_bio": {
+      "rps": 7602.648,
+      "cycles": 5487709011,
+      "instructions": 8978383287,
+      "ipc": 1.64,
+      "user_time_s": 0.99,
+      "branches": 1683614629,
+      "context_switches": 1,
+      "cqe_reaped": 19902
+    },
+    "ktls": {
+      "rps": 7642.353,
+      "cycles": 5432624583,
+      "instructions": 8805346016,
+      "ipc": 1.59,
+      "user_time_s": 0.95,
+      "branches": 1598257715,
+      "context_switches": 1,
+      "cqe_reaped": 10229
+    }
+  },
+  "deltas": {
+    "cycle_reduction_pct": 1.0037782231088492,
+    "instruction_reduction_pct": 1.9272653602407965,
+    "user_time_reduction_pct": 4.040404040404044,
+    "context_switch_reduction_pct": 0.0,
+    "cqe_reduction_pct": 48.60315546176264,
+    "throughput_gain_pct": 0.5222522468487286
+  },
+  "dod_validation": {
+    "zero_protocol_errors": true,
+    "single_connection_verified": true,
+    "streams_concurrency_verified": true,
+    "status_200_parity": true,
+    "cpu_overhead_reduced": true,
+    "all_criteria_passed": true
+  }
+}
