@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "tx_backend_doca_gpunetio.cuh"
+#include "tx_backend_geforce_p2p.cuh"
 #include "zero_copy_dataplane_contract.cuh"
 #ifndef SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
 #define SAMURAI_WITH_DOCA_GPUNETIO_DEVICE 0
