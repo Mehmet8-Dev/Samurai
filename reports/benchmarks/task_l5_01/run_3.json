@@ -1,0 +1,243 @@
+{
+  "job_id": "job-1",
+  "leader_epoch": 0,
+  "workers": 4,
+  "shards_reported": 10,
+  "lost_workers": [
+    "slave_1"
+  ],
+  "dispatch_failures": [],
+  "sent": 10000000,
+  "errors": 0,
+  "worker_ids": [
+    "slave_0",
+    "slave_1",
+    "slave_2",
+    "slave_3"
+  ],
+  "shard_ids": [
+    "job-1-shard-1",
+    "job-1-shard-10",
+    "job-1-shard-2",
+    "job-1-shard-3",
+    "job-1-shard-4",
+    "job-1-shard-5",
+    "job-1-shard-6",
+    "job-1-shard-7",
+    "job-1-shard-8",
+    "job-1-shard-9"
+  ],
+  "numeric_totals": {
+    "exitcode": 0,
+    "duration_s": 1.2078760490005607,
+    "progress": 10000000,
+    "sent": 10000000,
+    "errors": 0,
+    "leader_epoch": 0
+  },
+  "top_error_shards": [
+    {
+      "shard_id": "job-1-shard-1",
+      "worker_id": "slave_0",
+      "leader_epoch_max": 0,
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "duration_s_max": 0.12076815800014629,
+      "last_status": "ok",
+      "last_exitcode": 0,
+      "updates": 1
+    },
+    {
+      "shard_id": "job-1-shard-10",
+      "worker_id": "slave_3",
+      "leader_epoch_max": 0,
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "duration_s_max": 0.12081842100019458,
+      "last_status": "ok",
+      "last_exitcode": 0,
+      "updates": 1
+    },
+    {
+      "shard_id": "job-1-shard-2",
+      "worker_id": "slave_1",
+      "leader_epoch_max": 0,
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "duration_s_max": 0.12081561200011492,
+      "last_status": "ok",
+      "last_exitcode": 0,
+      "updates": 1
+    },
+    {
+      "shard_id": "job-1-shard-3",
+      "worker_id": "slave_2",
+      "leader_epoch_max": 0,
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "duration_s_max": 0.12077311799998824,
+      "last_status": "ok",
+      "last_exitcode": 0,
+      "updates": 1
+    },
+    {
+      "shard_id": "job-1-shard-4",
+      "worker_id": "slave_3",
+      "leader_epoch_max": 0,
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "duration_s_max": 0.12082625299990468,
+      "last_status": "ok",
+      "last_exitcode": 0,
+      "updates": 1
+    },
+    {
+      "shard_id": "job-1-shard-5",
+      "worker_id": "slave_0",
+      "leader_epoch_max": 0,
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "duration_s_max": 0.12076458100000309,
+      "last_status": "ok",
+      "last_exitcode": 0,
+      "updates": 1
+    },
+    {
+      "shard_id": "job-1-shard-6",
+      "worker_id": "slave_0",
+      "leader_epoch_max": 0,
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "duration_s_max": 0.12076026900012948,
+      "last_status": "ok",
+      "last_exitcode": 0,
+      "updates": 1
+    },
+    {
+      "shard_id": "job-1-shard-7",
+      "worker_id": "slave_2",
+      "leader_epoch_max": 0,
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "duration_s_max": 0.12074917099994309,
+      "last_status": "ok",
+      "last_exitcode": 0,
+      "updates": 1
+    },
+    {
+      "shard_id": "job-1-shard-8",
+      "worker_id": "slave_3",
+      "leader_epoch_max": 0,
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "duration_s_max": 0.12077396900008353,
+      "last_status": "ok",
+      "last_exitcode": 0,
+      "updates": 1
+    },
+    {
+      "shard_id": "job-1-shard-9",
+      "worker_id": "slave_2",
+      "leader_epoch_max": 0,
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "duration_s_max": 0.12082649700005277,
+      "last_status": "ok",
+      "last_exitcode": 0,
+      "updates": 1
+    }
+  ],
+  "worker_rollup": [
+    {
+      "worker_id": "slave_0",
+      "sent": 3000000,
+      "errors": 0,
+      "progress": 3000000,
+      "shard_count": 3,
+      "shard_ids": [
+        "job-1-shard-1",
+        "job-1-shard-5",
+        "job-1-shard-6"
+      ],
+      "updates": 3
+    },
+    {
+      "worker_id": "slave_2",
+      "sent": 3000000,
+      "errors": 0,
+      "progress": 3000000,
+      "shard_count": 3,
+      "shard_ids": [
+        "job-1-shard-3",
+        "job-1-shard-7",
+        "job-1-shard-9"
+      ],
+      "updates": 3
+    },
+    {
+      "worker_id": "slave_3",
+      "sent": 3000000,
+      "errors": 0,
+      "progress": 3000000,
+      "shard_count": 3,
+      "shard_ids": [
+        "job-1-shard-10",
+        "job-1-shard-4",
+        "job-1-shard-8"
+      ],
+      "updates": 3
+    },
+    {
+      "worker_id": "slave_1",
+      "sent": 1000000,
+      "errors": 0,
+      "progress": 1000000,
+      "shard_count": 1,
+      "shard_ids": [
+        "job-1-shard-2"
+      ],
+      "updates": 1
+    }
+  ],
+  "region_rollup": [
+    {
+      "region": "unknown",
+      "sent": 10000000,
+      "errors": 0,
+      "progress": 10000000,
+      "workers": 4,
+      "worker_ids": [
+        "slave_0",
+        "slave_1",
+        "slave_2",
+        "slave_3"
+      ],
+      "shards": 10,
+      "shard_ids": [
+        "job-1-shard-1",
+        "job-1-shard-10",
+        "job-1-shard-2",
+        "job-1-shard-3",
+        "job-1-shard-4",
+        "job-1-shard-5",
+        "job-1-shard-6",
+        "job-1-shard-7",
+        "job-1-shard-8",
+        "job-1-shard-9"
+      ],
+      "updates": 10
+    }
+  ],
+  "pending_shards_left": 0,
+  "inflight_shards_left": 0
+}

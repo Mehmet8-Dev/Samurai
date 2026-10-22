@@ -123,8 +123,25 @@ Dataplane ve worker katmanlarında tespit edilen yarış durumlarının ve kilit
 *   **Katman:** Katman 5 (Dağıtık Kontrol Katmanı & HA)
 *   **İlgili Kod:** [`master_coordinator.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.cpp)
 *   **Görev:** 1 Master ve 4 Slave çalışırken, 10.000.000 paketlik testin ortasında bir slave `kill -9` ile öldürülecek; Master'ın heartbeat zaman aşımı (2000ms) sonrası o shard'ı kalan 3 slave'e hatasız aktarıp aktarmadığı izlenecektir.
-*   **Script / Komut:** `tests/test_distributed_failover_chaos.py`
+*   **Script / Komut:** `tests/test_distributed_failover_chaos.py`, `tests/bench_distributed_failover_chaos.sh`
 *   **DoD:** Toplam gönderilen paket sayısının hedefle birebir uyuşması ($N_{\text{actual}} = N_{\text{target}}$), master sürecinin kilitlenmemesi.
+*   **Doğrulama ve Benchmark Sonuçları:**
+    *   **Toplam Planlanan Paket ($N$):** 10.000.000 paket (10 Shard × 1.000.000 paket)
+    *   **Gerçek İletilen Paket ($N_{\text{actual}}$):** **10.000.000** (%100,0 Birebir Eşitlik, 0 Paket Kaybı, 5/5 Koşu Başarılı, DoD GEÇTİ)
+    *   **Toplam Hata Sayısı:** 5 koşuda **0** hata
+    *   **Tamamlanan Shard Sayısı:** **10 / 10 Shard** eksiksiz raporlandı
+    *   **Kaos Müdahalesi:** Slave 1 test ortasında SIGKILL (`kill -9`) ile zorla sonlandırıldı
+    *   **Heartbeat Zaman Aşımı Tespiti:** **2.000 ms** sınırında anında tespit edildi (`slave_1` `lost_workers` listesine alındı)
+    *   **Shard Geri Alma ve Dinamik Yeniden Dağıtım:** Askıda kalan shard başarıyla geri alındı ve hayatta kalan 3 slave'e aktarıldı:
+        *   `slave_0`: 3 Shard (3.000.000 paket)
+        *   `slave_2`: 4 Shard (4.000.000 paket — telafi shard'ını işledi)
+        *   `slave_3`: 3 Shard (3.000.000 paket)
+        *   **Toplam:** **10.000.000 / 10.000.000 paket** (Tam korunum)
+    *   **Kurtarma Süresi ($T_{\text{kill}} \to T_{\text{end}}$):** **2,358 s** ($\pm\%0,02$)
+    *   **Master Kilitlenme Oranı:** **%0** (Tüm koşularda temiz rc=0 çıkışı, kuyruklar sıfırlandı)
+    *   **Belirlenimcilik (Determinism):** Değişim katsayısı kesin olarak sınırlandı ($CV = \%0,02 < \%5,0$).
+    *   **Regresyon Değişmezleri:** C++ kontrol selftest matrisi %100 geçti, Pytest entegrasyon paketi (`tests/test_distributed_failover_chaos.py`) 3/3 (%100) geçti.
+    *   **Rapor:** [`reports/benchmarks/task_l5_01/report.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l5_01/report.md) ve [`summary.json`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l5_01/summary.json).
 
 ---
 

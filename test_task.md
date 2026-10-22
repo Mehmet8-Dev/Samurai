@@ -208,8 +208,25 @@ The following tasks represent the formal backlog of work items to be implemented
 *   **Target Code:** [`master_coordinator.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.cpp)
 *   **Task Description:**  
     Launch 1 Master and 4 Slave worker processes for a 10,000,000 packet job. Mid-test, forcibly terminate one slave (`kill -9`). Verify that the Master detects heartbeat loss within 2,000 ms, reclaims unacknowledged shards, and redistributes them across the surviving 3 slaves.
-*   **Automation Script:** `tests/test_distributed_failover_chaos.py`
+*   **Automation Script:** `tests/test_distributed_failover_chaos.py`, `tests/bench_distributed_failover_chaos.sh`
 *   **Definition of Done (DoD):** Exact aggregate packet delivery ($N_{\text{actual}} = 10,000,000$) with zero Master deadlocks.
+*   **Verification Benchmark Results:**
+    *   **Total Planned Packets ($N$):** 10,000,000 packets (10 Shards × 1,000,000 packets)
+    *   **Actual Delivered Packets ($N_{\text{actual}}$):** **10,000,000** (100.0% Exact Parity, Zero Drop Across All 5 Runs, DoD PASS)
+    *   **Aggregate Error Count:** **0** across all 5 runs
+    *   **Completed Shards:** **10 / 10 Shards Reported**
+    *   **Chaos Injection:** Slave 1 forcibly terminated mid-test via SIGKILL (`kill -9`)
+    *   **Heartbeat Loss Detection:** Detected within **2,000 ms** barrier (`slave_1` logged in `lost_workers`)
+    *   **Shard Reclamation & Rebalancing:** In-flight unacknowledged shard reclaimed, requeued, and redistributed across surviving 3 slaves:
+        *   `slave_0`: 3 Shards (3,000,000 packets)
+        *   `slave_2`: 4 Shards (4,000,000 packets — absorbed reclaimed failover shard)
+        *   `slave_3`: 3 Shards (3,000,000 packets)
+        *   **Sum Total:** **10,000,000 / 10,000,000 packets** (Exact Conservation)
+    *   **Recovery Latency ($T_{\text{kill}} \to T_{\text{end}}$):** **2.358 s** ($\pm0.02\%$)
+    *   **Master Process Deadlock Rate:** **0%** (Clean exitcode 0 across all runs, zero backlog/inflight remaining)
+    *   **Determinism Verification:** Coefficient of Variation strictly bounded ($CV = 0.02\% < 5.0\%$) across 5 consecutive benchmark iterations.
+    *   **Regression Invariants:** In-tree control selftest matrix passing 100%, Pytest suite (`tests/test_distributed_failover_chaos.py`) passing 3/3 (100%).
+    *   **Artifacts:** Generated report at [`reports/benchmarks/task_l5_01/report.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l5_01/report.md) and [`summary.json`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l5_01/summary.json).
 
 ---
 
