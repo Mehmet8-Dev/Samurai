@@ -95,6 +95,7 @@ struct JobConfig {
   std::string tenant_namespace;
   std::int64_t leader_epoch = 0;
   int stop_shard_retries = 3;
+  int max_shard_retries = 3;
   // Reverse-mode pickup grace: if a reverse worker hasn't echoed the dispatched
   // shard (nor reported it) within this window, the enqueue is deemed lost and
   // the shard is rebalanced. 0 => 2 x heartbeat_timeout_ms.

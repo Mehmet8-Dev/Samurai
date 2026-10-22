@@ -27,11 +27,9 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/PR_TASK_TEST_L2_02_RFC6675_SACK.md
 !docs/PR_TASK_TEST_L3_01_IOURING_VS_EPOLL.md
 !docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md
+!docs/PR_TASK_TEST_L5_01_FAILOVER_CHAOS.md
 !docs/44-l7-stateful-userspace-benchmark-report.md
 !docs/45-commodity-gpu-nic-p2p-packet-engine-report.md
-!reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md
-!reports/benchmarks/task_l3_02/
-!reports/benchmarks/task_l3_02/**
 
 # Python cache / build
 __pycache__/
@@ -64,7 +62,21 @@ dashboard/node_modules/
 dashboard/dist/
 
 # Runtime outputs / telemetry / artifacts
-reports/
+artifacts/reports/
+reports/*
+!reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md
+!reports/benchmarks/
+reports/benchmarks/*
+!reports/benchmarks/task_l3_02/
+reports/benchmarks/task_l3_02/*
+!reports/benchmarks/task_l3_02/report.md
+!reports/benchmarks/task_l3_02/summary.json
+!reports/benchmarks/task_l5_01/
+reports/benchmarks/task_l5_01/*
+!reports/benchmarks/task_l5_01/report.md
+!reports/benchmarks/task_l5_01/TASK_TEST_L5_01_REPORT.md
+!reports/benchmarks/task_l5_01/summary.json
+!reports/benchmarks/task_l5_01/run_*.json
 # Loss/telemetry runs are produced at runtime by the benchmark/CI jobs
 # (SAMURAI_LOSS_REPORT_OUT) and must not be tracked.
 artifacts/loss_telemetry_*.json

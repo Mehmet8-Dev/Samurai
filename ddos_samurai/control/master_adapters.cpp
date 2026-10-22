@@ -99,7 +99,8 @@ DispatchOutcome ClientWorkerCommander::Dispatch(const std::string& endpoint,
 
 ProbeOutcome ClientWorkerCommander::Probe(const std::string& endpoint,
                                           const std::string& worker_id) {
-  WorkerControlClient wc(endpoint, cluster_secret_, tenant_namespace_, timeout_ms_);
+  const int p_timeout = timeout_ms_ > 0 ? std::min(timeout_ms_, 1000) : 1000;
+  WorkerControlClient wc(endpoint, cluster_secret_, tenant_namespace_, p_timeout);
   const std::string cpub = CurveByWorker(servicer_, worker_id);
   if (!cpub.empty()) (void)wc.set_curve_client(cpub);
   const wire::Response r = wc.GetWorkerStatus(worker_id);

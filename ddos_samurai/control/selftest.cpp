@@ -2050,6 +2050,110 @@ int main() {
           "master: nothing left pending/inflight");
   }
 
+  // --- master: TASK-TEST-L5-01 dynamic rebalancing under worker chaos (kill -9) ---
+  {
+    namespace json = samurai::core::json;
+
+    struct ChaosView : MasterView {
+      std::map<std::string, WorkerInfo> workers;
+      std::map<std::string, std::string> stats;
+      std::int64_t* clk = nullptr;
+      std::string dead_worker;
+
+      std::vector<WorkerInfo> Workers() override {
+        std::vector<WorkerInfo> out;
+        for (auto& kv : workers) {
+          WorkerInfo w = kv.second;
+          if (w.worker_id != dead_worker) {
+            w.last_heartbeat_ms = *clk;  // surviving workers stay alive
+          }
+          out.push_back(w);
+        }
+        return out;
+      }
+      bool ShardReported(const std::string& sid) override { return stats.count(sid) > 0; }
+      std::string GetShardStats(const std::string& sid) override {
+        auto it = stats.find(sid);
+        return it == stats.end() ? std::string("{}") : it->second;
+      }
+      void SetShardStats(const std::string& sid, const std::string& js) override { stats[sid] = js; }
+    };
+
+    struct ChaosCmd : WorkerCommander {
+      ChaosView* view = nullptr;
+      std::string killed_worker;
+      std::string killed_shard;
+      std::map<std::string, int> dispatch_counts;
+
+      DispatchOutcome Dispatch(const std::string& endpoint, const std::string& sid,
+                               const std::string& job_id, const std::string& args,
+                               std::int64_t count, std::int64_t timeout_ms) override {
+        (void)job_id; (void)args; (void)timeout_ms;
+        std::string wid;
+        for (const auto& kv : view->workers) {
+          auto it = kv.second.capabilities.find("control_endpoint");
+          if (it != kv.second.capabilities.end() && it->second == endpoint) {
+            wid = kv.first;
+            break;
+          }
+        }
+        dispatch_counts[wid]++;
+        if (wid == killed_worker) {
+          killed_shard = sid;
+          return {true, "accepted-then-killed"};
+        }
+        json::Value s = json::Value::Object();
+        s.set("shard_id", json::Value::Str(sid));
+        s.set("worker_id", json::Value::Str(wid));
+        s.set("sent", json::Value::Int(count));
+        s.set("errors", json::Value::Int(0));
+        view->SetShardStats(sid, s.dump());
+        return {true, "ok"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override { return {}; }
+      bool StopShard(const std::string&, const std::string&, std::int64_t) override { return true; }
+    };
+
+    ChaosView view;
+    std::int64_t clk = 1000000;
+    view.clk = &clk;
+    view.dead_worker = "w2";
+
+    for (const char* wid : {"w1", "w2", "w3", "w4"}) {
+      WorkerInfo w;
+      w.worker_id = wid;
+      w.capabilities["control_endpoint"] = std::string("tcp://") + wid + ":5099";
+      w.last_heartbeat_ms = clk;
+      view.workers[wid] = w;
+    }
+
+    ChaosCmd cmd;
+    cmd.view = &view;
+    cmd.killed_worker = "w2";
+
+    MasterCoordinator coord(&view, &cmd, [&clk]() { return clk; }, [&clk](int ms) { clk += ms; });
+    JobConfig job;
+    job.count = 10000000;
+    job.shard_unit_count = 1000000;  // 10 shards
+    job.heartbeat_timeout_ms = 2000;
+    job.master_poll_interval_ms = 100;
+
+    auto res = coord.RunSingleJob(job, "chaos-l5-01");
+    Check(res.rc == 0, "TASK-TEST-L5-01: master completes with rc=0 under worker chaos");
+    Check(res.snapshot.find("sent") && res.snapshot.find("sent")->as_int() == 10000000,
+          "TASK-TEST-L5-01: exact 10,000,000 packets delivered");
+    Check(res.snapshot.find("shards_reported") &&
+              res.snapshot.find("shards_reported")->as_int() == 10,
+          "TASK-TEST-L5-01: all 10 shards successfully completed");
+    Check(res.snapshot.find("lost_workers") &&
+              res.snapshot.find("lost_workers")->elements().size() == 1 &&
+              res.snapshot.find("lost_workers")->elements()[0].as_string() == "w2",
+          "TASK-TEST-L5-01: master detected w2 loss via heartbeat timeout");
+    Check(res.snapshot.find("pending_shards_left")->as_int() == 0 &&
+              res.snapshot.find("inflight_shards_left")->as_int() == 0,
+          "TASK-TEST-L5-01: zero pending or in-flight shards left (zero deadlock)");
+  }
+
   // --- master: leadership lost mid-job recalls inflight shards (chaos) ---
   {
     namespace json = samurai::core::json;

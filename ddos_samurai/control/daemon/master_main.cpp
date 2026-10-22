@@ -454,6 +454,10 @@ Value JobSpecFromArgs(int argc, char** argv) {
   s.set("job_timeout_s", Value::Int(OptInt(argc, argv, "--job-timeout-s", 0)));
   s.set("shard_unit_count", Value::Int(OptInt(argc, argv, "--shard-unit-count", 0)));
   s.set("poll_interval_ms", Value::Int(OptInt(argc, argv, "--poll-interval-ms", 250)));
+  s.set("heartbeat_timeout_ms", Value::Int(OptInt(argc, argv, "--heartbeat-timeout-ms", 2000)));
+  s.set("max_shard_retries", Value::Int(OptInt(argc, argv, "--max-shard-retries", 3)));
+  s.set("on_worker_loss", Value::Str(Opt(argc, argv, "--on-worker-loss", "continue")));
+  s.set("worker_status_probe", Value::Int(OptInt(argc, argv, "--worker-status-probe", 1)));
   return s;
 }
 
@@ -473,6 +477,10 @@ samurai::control::JobConfig BuildJobConfig(const Value& spec, std::int64_t leade
   job.job_timeout_s = geti("job_timeout_s", 0);
   job.shard_unit_count = geti("shard_unit_count", 0);
   job.master_poll_interval_ms = static_cast<int>(geti("poll_interval_ms", 250));
+  job.heartbeat_timeout_ms = geti("heartbeat_timeout_ms", 2000);
+  job.max_shard_retries = static_cast<int>(geti("max_shard_retries", 3));
+  job.on_worker_loss = gets("on_worker_loss", "continue");
+  job.worker_status_probe = geti("worker_status_probe", 1) != 0;
   job.tenant_namespace = tenant;
   job.leader_epoch = leader_epoch;
   const std::string tr = LowerCopy(gets("target_region", ""));
@@ -530,6 +538,11 @@ void Usage(const char* argv0) {
       "  --shard-unit-count N      packets per shard (0 = auto)\n"
       "  --job-timeout-s N         wait cap for the job (default 120)\n"
       "  --poll-interval-ms N      master dispatch poll (default 250)\n"
+      "  --heartbeat-timeout-ms N  worker heartbeat timeout in ms (default 2000)\n"
+      "  --max-shard-retries N     maximum retries for lost shards (default 3)\n"
+      "  --on-worker-loss continue|abort (default continue)\n"
+      "  --worker-status-probe 0|1 actively probe worker status (default 1)\n"
+      "  --rpc-timeout-ms N        RPC timeout toward workers (default 2000)\n"
       "  --expect-workers N        wait for this many workers first (default 1)\n"
       "  --wait-workers-s N        how long to wait for workers (default 30)\n"
       "  --management-listen EP    also serve the HTTP management API (host:port)\n"
@@ -1135,7 +1148,8 @@ int main(int argc, char** argv) {
   // the job needs; bundle slaves resolve their binary per shard from it, and the
   // coordinator only dispatches to workers advertising it (WorkerDispatchScore).
   ServicerMasterView view(&servicer);
-  ClientWorkerCommander commander(cluster_secret, tenant, 5000, &servicer);
+  const int rpc_timeout_ms = static_cast<int>(OptInt(argc, argv, "--rpc-timeout-ms", 2000));
+  ClientWorkerCommander commander(cluster_secret, tenant, rpc_timeout_ms, &servicer);
   MasterCoordinator coord(&view, &commander);
   auto guard = [&elector]() { return !elector || elector->IsLeader(); };
 

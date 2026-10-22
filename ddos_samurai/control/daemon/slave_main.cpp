@@ -34,6 +34,71 @@ std::string Hostname() {
   return "localhost";
 }
 
+class MockShardRun : public samurai::control::ShardRun {
+ public:
+  MockShardRun(std::int64_t count, int delay_ms)
+      : count_(count), delay_ms_(delay_ms) {
+    thread_ = std::thread([this]() {
+      if (delay_ms_ > 0) {
+        int slept = 0;
+        while (slept < delay_ms_ && !term_.load()) {
+          int step = std::min(10, delay_ms_ - slept);
+          std::this_thread::sleep_for(std::chrono::milliseconds(step));
+          slept += step;
+          sent_.store(count_ * slept / delay_ms_);
+        }
+      }
+      if (!term_.load()) {
+        sent_.store(count_);
+        done_.store(true);
+      }
+      alive_.store(false);
+    });
+  }
+
+  ~MockShardRun() override {
+    if (thread_.joinable()) thread_.join();
+  }
+
+  bool IsAlive() override { return alive_.load(); }
+  std::int64_t Progress() const override { return sent_.load(); }
+  std::int64_t Sent() const override { return sent_.load(); }
+  std::int64_t Errors() const override { return 0; }
+  int ExitCode() const override { return term_.load() ? -15 : 0; }
+  void Terminate() override {
+    term_.store(true);
+    alive_.store(false);
+  }
+  void Join() override {
+    if (thread_.joinable()) thread_.join();
+  }
+
+ private:
+  std::int64_t count_ = 0;
+  int delay_ms_ = 0;
+  std::atomic<bool> alive_{true};
+  std::atomic<bool> done_{false};
+  std::atomic<bool> term_{false};
+  std::atomic<std::int64_t> sent_{0};
+  std::thread thread_;
+};
+
+class MockShardRunner : public samurai::control::ShardRunner {
+ public:
+  explicit MockShardRunner(int default_delay_ms = 100) : default_delay_ms_(default_delay_ms) {}
+  std::shared_ptr<samurai::control::ShardRun> Start(
+      const std::string&, const samurai::core::json::Value& args) override {
+    const auto* c = args.find("count");
+    std::int64_t count = c ? c->as_int(1000) : 1000;
+    const auto* d = args.find("_mock_delay_ms");
+    int delay = d ? static_cast<int>(d->as_int(default_delay_ms_)) : default_delay_ms_;
+    return std::make_shared<MockShardRun>(count, delay);
+  }
+
+ private:
+  int default_delay_ms_ = 100;
+};
+
 void Usage(const char* argv0) {
   std::printf(
       "usage: %s --control-endpoints host:port[,host:port] [options]\n"
@@ -62,6 +127,8 @@ void Usage(const char* argv0) {
       "  --heartbeat-interval-ms N (default 2000)\n"
       "  --register-timeout-s N    (default 10)\n"
       "  --master-timeout-s N      exit if master unreachable this long (default 30)\n"
+      "  --mock                    run in simulated/mock shard execution mode (for HA chaos tests)\n"
+      "  --mock-delay-ms N         simulated execution delay per shard in ms (default 100)\n"
       "  -h, --help\n",
       argv0);
 }
@@ -81,11 +148,12 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string worker_kind = Opt(argc, argv, "--worker", "cpu");
+  const bool is_mock = Flag(argc, argv, "--mock") || (worker_kind == "mock");
   // Bundle: the node holds every worker binary and resolves the flavor per shard
   // from the job's `worker` field; a fixed kind runs that one flavor for all shards.
   const bool bundle = samurai::orchestrator::IsBundleWorkerName(worker_kind);
-  const auto entry = samurai::orchestrator::LookupWorker(bundle ? "cpu" : worker_kind);
-  if (!entry) {
+  const auto entry = is_mock ? std::nullopt : samurai::orchestrator::LookupWorker(bundle ? "cpu" : worker_kind);
+  if (!is_mock && !entry) {
     std::fprintf(stderr, "samurai_slave: unknown worker kind: %s\n", worker_kind.c_str());
     return 2;
   }
@@ -126,10 +194,20 @@ int main(int argc, char** argv) {
 
   // Worker-side control service (+ inbound control server only in direct mode).
   // Bundle resolves the worker binary per shard (fallback = cpu); fixed runs one.
-  SupervisorShardRunner runner =
-      bundle ? SupervisorShardRunner(worker_dir, *entry)
-             : SupervisorShardRunner(*entry, worker_dir);
-  WorkerShardService service(worker_id, &runner);
+  std::unique_ptr<ShardRunner> custom_runner;
+  std::unique_ptr<SupervisorShardRunner> sup_runner;
+  ShardRunner* active_runner = nullptr;
+  if (is_mock) {
+    const int mock_delay = static_cast<int>(OptInt(argc, argv, "--mock-delay-ms", 100));
+    custom_runner = std::make_unique<MockShardRunner>(mock_delay);
+    active_runner = custom_runner.get();
+  } else {
+    sup_runner = std::make_unique<SupervisorShardRunner>(
+        bundle ? SupervisorShardRunner(worker_dir, *entry)
+               : SupervisorShardRunner(*entry, worker_dir));
+    active_runner = sup_runner.get();
+  }
+  WorkerShardService service(worker_id, active_runner);
   AuthConfig auth;
   auth.expected_secret = cluster_secret;  // require the secret if set
 
@@ -189,6 +267,8 @@ int main(int argc, char** argv) {
       kinds += e.name;
     }
     cfg.capabilities["worker_kinds"] = kinds;
+  } else if (is_mock) {
+    cfg.capabilities["worker_kinds"] = (worker_kind == "mock") ? "mock,cpu" : (worker_kind + ",cpu");
   } else {
     cfg.capabilities["worker_kinds"] = worker_kind;
   }

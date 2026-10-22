@@ -169,18 +169,18 @@ Value DistributedAggregator::Snapshot() const {
     if (!wid.empty()) {
       WorkerRec& w = worker_rollup[wid];
       w.worker_id = wid;
-      w.sent = std::max(w.sent, IntField(item, "sent"));
-      w.errors = std::max(w.errors, IntField(item, "errors"));
-      w.progress = std::max(w.progress, IntField(item, "progress"));
+      w.sent += IntField(item, "sent");
+      w.errors += IntField(item, "errors");
+      w.progress += IntField(item, "progress");
       if (!sid.empty()) w.shard_ids.insert(sid);
       w.updates += 1;
     }
 
     RegionRec& r = region_rollup[region];
     r.region = region;
-    r.sent = std::max(r.sent, IntField(item, "sent"));
-    r.errors = std::max(r.errors, IntField(item, "errors"));
-    r.progress = std::max(r.progress, IntField(item, "progress"));
+    r.sent += IntField(item, "sent");
+    r.errors += IntField(item, "errors");
+    r.progress += IntField(item, "progress");
     if (!wid.empty()) r.workers.insert(wid);
     if (!sid.empty()) r.shards.insert(sid);
     r.updates += 1;

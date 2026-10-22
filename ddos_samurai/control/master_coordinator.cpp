@@ -275,9 +275,10 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
         Shard sh = it->second;
         it = inflight_by_worker.erase(it);
         inflight_by_sid.erase(sh.shard_id);
+        reverse_dispatch_ms.erase(sh.shard_id);
         if (!done_shards.count(sh.shard_id)) {
           sh.attempt += 1;
-          if (sh.attempt <= 2) pending.push_front(sh);
+          if (sh.attempt <= job.max_shard_retries) pending.push_front(sh);
         }
       } else {
         ++it;
@@ -327,7 +328,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
           reverse_dispatch_ms.erase(sid);
           if (!done_shards.count(sid)) {
             sh.attempt += 1;
-            if (sh.attempt <= 2) {
+            if (sh.attempt <= job.max_shard_retries) {
               pending.push_front(sh);
             } else {
               dispatch_failures.push_back("E_REVERSE_PICKUP_LOST worker=" + wid + " shard=" + sid);
@@ -401,7 +402,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
       if (ep.empty() && !reverse_capable) {
         dispatch_failures.push_back("E_STARTSHARD_NO_ENDPOINT worker=" + wid + " shard=" + sh.shard_id);
         sh.attempt += 1;
-        if (sh.attempt <= 2) pending.push_back(sh);
+        if (sh.attempt <= job.max_shard_retries) pending.push_back(sh);
         continue;
       }
       // Build the per-shard args from the job's base args.
@@ -442,7 +443,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
                                         ? ("E_STARTSHARD_REJECTED worker=" + wid + " shard=" + sh.shard_id)
                                         : d.message);
         sh.attempt += 1;
-        if (sh.attempt <= 2) pending.push_back(sh);
+        if (sh.attempt <= job.max_shard_retries) pending.push_back(sh);
       }
     }
 
