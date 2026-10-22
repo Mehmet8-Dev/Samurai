@@ -28,6 +28,7 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/PR_TASK_TEST_L3_01_IOURING_VS_EPOLL.md
 !docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md
 !docs/PR_TASK_TEST_L5_01_FAILOVER_CHAOS.md
+!docs/TASK_TEST_L5_01_ISSUE_EXPLANATION.md
 !docs/44-l7-stateful-userspace-benchmark-report.md
 !docs/45-commodity-gpu-nic-p2p-packet-engine-report.md
 
