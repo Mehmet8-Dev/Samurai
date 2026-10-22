@@ -75,7 +75,7 @@ sequenceDiagram
 * In [`master_coordinator.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.hpp) and [`master_coordinator.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.cpp):
   * Added `max_shard_retries` (default 3) to `JobConfig`, replacing hardcoded attempt ceilings.
   * During lost-worker detection:
-    $$\Delta t = t_{\text{now}} - t_{\text{last\_hb}} > T_{\text{hb\_timeout}}$$
+    $$\Delta t = t_{\text{now}} - t_{\text{hb}} > T_{\text{timeout}}$$
     When triggered, the coordinator removes the worker from active scheduling, removes all associated entries from `inflight_by_worker`, `inflight_by_sid`, and `reverse_dispatch_ms`, increments `sh.attempt`, and prepends the unacknowledged shard to the `pending` queue:
     ```cpp
     if (!done_shards.count(sh.shard_id)) {
@@ -102,7 +102,7 @@ sequenceDiagram
 * In [`telemetry.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/telemetry.cpp):
   * Fixed `DistributedAggregator` worker and region rollup accounting from `std::max` to strict summation across reported shards (`w.sent += IntField(item, "sent")`).
   * Mathematically guarantees that the sum of surviving worker totals strictly equals the job's aggregate packet count:
-    $$\sum_{w \in \text{surviving\_workers}} N_w = N_{\text{actual}} = 10,000,000$$
+    $$\sum_{w \in \text{survivors}} N_w = N_{\text{actual}} = 10,000,000$$
 
 ---
 
