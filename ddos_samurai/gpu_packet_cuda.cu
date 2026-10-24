@@ -6,6 +6,9 @@
 #include <unistd.h>
 
 #include "gpu_packet_cuda/zero_copy_dataplane_contract.cuh"
+#include "gpu_packet_cuda/tx_backend_doca_gpunetio.cuh"
+#include "gpu_packet_cuda/tx_backend_geforce_p2p.cuh"
+#include "gpu_packet_cuda/geforce_p2p_runtime.cuh"
 #include "gpu_packet_cuda/preamble.cuh"
 #include "gpu_packet_cuda/kernels_l4.cuh"
 #include "gpu_packet_cuda/kernels_template_pool.cuh"

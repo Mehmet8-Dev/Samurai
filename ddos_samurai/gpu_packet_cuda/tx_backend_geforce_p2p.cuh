@@ -52,6 +52,7 @@ struct alignas(64) GeforceP2pRingSlot {
 struct GeforceP2pConfigV1 {
   char pci_gpu_bdf[32]{};         // e.g. "0000:01:00.0"
   char pci_nic_bdf[32]{};         // e.g. "0000:02:00.0"
+  char iface[32]{};               // e.g. "enp2s0" or "veth0"
   uint64_t bar1_phys_base = 0u;   // e.g. 0xfcc0000000 (detected via sysfs)
   uint32_t ring_slot_count = 1024u;
   uint32_t slot_stride = 2048u;   // 2KB per packet slot
@@ -103,6 +104,26 @@ struct GeforceP2pApiV1 {
   int (*get_stats)(
       int handle,
       GeforceP2pTxStats* out_stats,
+      char* err,
+      size_t err_len) = nullptr;
+
+  // Direct BAR1 Arena introspection (Host BAR1 VA, CUDA GDDR6 VA, Physical BAR1 Bus Address)
+  int (*get_arena_pointers)(
+      int handle,
+      void** out_host_bar1_ptr,
+      void** out_cuda_dev_ptr,
+      uint64_t* out_bar1_phys_addr,
+      size_t* out_arena_bytes,
+      char* err,
+      size_t err_len) = nullptr;
+
+  // Batch slot submission for persistent GPU runtime queues
+  int (*submit_slot_batch)(
+      int handle,
+      const uint32_t* slot_ids,
+      const uint16_t* lengths,
+      uint32_t count,
+      uint32_t* out_sent,
       char* err,
       size_t err_len) = nullptr;
 };

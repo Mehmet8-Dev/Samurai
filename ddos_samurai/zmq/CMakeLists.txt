@@ -76,7 +76,7 @@ add_samurai_worker(samurai_dpdk_worker daemon/dpdk_worker.cpp)
 # Paylaşılan userspace stateful TCP fast-path sürücüsü (rte/xdp header'ı içermez).
 target_sources(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
 target_include_directories(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk)
-target_link_libraries(samurai_dpdk_worker PRIVATE pacing_engine_static cpu_native_static samurai_l7emu pthread)
+target_link_libraries(samurai_dpdk_worker PRIVATE pacing_engine_static cpu_native_static samurai_l7emu pthread dl)
 if(DPDK_FOUND)
   target_compile_definitions(samurai_dpdk_worker PRIVATE SAMURAI_WITH_DPDK=1)
   target_include_directories(samurai_dpdk_worker PRIVATE ${DPDK_INCLUDE_DIRS})

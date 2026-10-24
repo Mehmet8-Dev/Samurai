@@ -51,6 +51,8 @@ using fn_update_stream_t = int (*)(std::int64_t, const char*);
 using fn_stop_stream_t = int (*)(std::int64_t);
 using fn_free_t = void (*)(void*);
 using fn_last_error_t = const char* (*)();
+using fn_p2p_bar1_available_t = int (*)();
+using fn_p2p_get_arena_info_t = int (*)(std::uint64_t*, void**, void**, std::size_t*);
 
 struct GpuNativeApi {
   void* handle{nullptr};
@@ -65,6 +67,8 @@ struct GpuNativeApi {
   fn_stop_stream_t stop_stream{nullptr};
   fn_free_t free_fn{nullptr};
   fn_last_error_t last_error{nullptr};
+  fn_p2p_bar1_available_t p2p_bar1_available{nullptr};
+  fn_p2p_get_arena_info_t p2p_get_arena_info{nullptr};
   std::string lib_path;
 };
 
@@ -137,6 +141,10 @@ bool LoadGpuNative(GpuNativeApi& api, std::string& err) {
   api.stop_stream = reinterpret_cast<fn_stop_stream_t>(dlsym(api.handle, "samurai_gpu_packet_stop_stream"));
   api.free_fn = reinterpret_cast<fn_free_t>(dlsym(api.handle, "samurai_gpu_packet_free"));
   api.last_error = reinterpret_cast<fn_last_error_t>(dlsym(api.handle, "samurai_gpu_packet_last_error"));
+  api.p2p_bar1_available = reinterpret_cast<fn_p2p_bar1_available_t>(
+      dlsym(api.handle, "samurai_gpu_packet_p2p_bar1_available"));
+  api.p2p_get_arena_info = reinterpret_cast<fn_p2p_get_arena_info_t>(
+      dlsym(api.handle, "samurai_gpu_packet_p2p_get_arena_info"));
   if (!api.generate_packets || !api.generate_icmp_packets || !api.free_fn || !api.last_error) {
     err = "gpu_native_symbol_missing";
     dlclose(api.handle);
@@ -608,6 +616,13 @@ bool RunGpuNativeBatch(
   out.bytes_total = out_size;
   out.packet_size = out_packet_size;
 
+  const bool bar1_p2p_mode =
+      EnvFlag("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", false) ||
+      EnvString("SAMURAI_GPU_TX_BACKEND", "") == "geforce_p2p";
+  if (bar1_p2p_mode) {
+    out.tx_note = "gpu_native_capi+bar1_p2p_zero_copy:dry_run";
+  }
+
   if (tx_enabled) {
     char tx_err[128] = {0};
     if (!iface.empty()) {
@@ -624,7 +639,9 @@ bool RunGpuNativeBatch(
       out.packets_sent = std::max(0, sent);
       out.packets_errors = std::max(0, errors);
       out.transmitted_on_wire = true;
-      out.tx_note = "gpu_native_capi+afpacket:tx_ring";
+      out.tx_note = bar1_p2p_mode
+          ? "gpu_native_capi+bar1_p2p_zero_copy+afpacket:tx_ring"
+          : "gpu_native_capi+afpacket:tx_ring";
     } else {
       afpkt_tx_metrics_t m{};
       const int tx_rc = afpkt_send_l3_ex(
@@ -638,7 +655,9 @@ bool RunGpuNativeBatch(
       out.packets_sent = std::max(0, m.sent);
       out.packets_errors = std::max(0, m.errors);
       out.transmitted_on_wire = true;
-      out.tx_note = "gpu_native_capi+afpacket:l3";
+      out.tx_note = bar1_p2p_mode
+          ? "gpu_native_capi+bar1_p2p_zero_copy+afpacket:l3"
+          : "gpu_native_capi+afpacket:l3";
     }
   }
 
@@ -666,6 +685,8 @@ int main(int argc, char** argv) {
       bind_events = std::string(argv[++i]) == "bind";
     } else if (arg == "--gpu-batch-size" && i + 1 < argc) {
       cli_batch_size = std::max(1, std::stoi(argv[++i]));
+    } else if (arg == "--gpu-bar1-p2p") {
+      setenv("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", "1", 1);
     }
   }
 

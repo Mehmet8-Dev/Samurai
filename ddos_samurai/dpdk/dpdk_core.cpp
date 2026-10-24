@@ -24,6 +24,7 @@ extern "C" {
 #include <rte_ip.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_memory.h>
 #include <rte_mempool.h>
 #include <rte_udp.h>
 }
@@ -619,6 +620,140 @@ bool prepopulate_tx_pool(int64_t handle, const uint8_t* template_pkt, uint16_t p
     return true;
 }
 
+static void noop_extbuf_free_cb(void* addr, void* opaque) {
+    (void)addr;
+    (void)opaque;
+}
+
+bool register_extmem_region(int64_t handle, void* vaddr, std::size_t len,
+                            uint64_t iova, uint32_t page_size, std::string& err) {
+    if (!vaddr || len == 0) {
+        err = "dpdk_extmem_invalid_args";
+        return false;
+    }
+    const uint32_t pg_sz = (page_size > 0u) ? page_size : 4096u;
+    const std::size_t aligned_len = (len + pg_sz - 1u) & ~static_cast<std::size_t>(pg_sz - 1u);
+    std::unique_lock<std::shared_mutex> lock(g_mu);
+    auto it = g_contexts.find(static_cast<long>(handle));
+    if (it == g_contexts.end()) {
+        err = "dpdk_invalid_handle";
+        return false;
+    }
+    const uint16_t port_id = it->second.port_id;
+    std::vector<rte_iova_t> iovas;
+    if (iova != 0u) {
+        const std::size_t n_pages = aligned_len / pg_sz;
+        iovas.resize(n_pages);
+        for (std::size_t i = 0; i < n_pages; ++i) {
+            iovas[i] = static_cast<rte_iova_t>(iova + i * pg_sz);
+        }
+    }
+    const int reg_rc = rte_extmem_register(
+        vaddr,
+        aligned_len,
+        iovas.empty() ? nullptr : iovas.data(),
+        static_cast<unsigned int>(iovas.size()),
+        pg_sz);
+    if (reg_rc < 0 && rte_errno != EEXIST) {
+        err = std::string("rte_extmem_register_failed:") + rte_strerror(rte_errno);
+        return false;
+    }
+    rte_eth_dev_info dev_info{};
+    if (rte_eth_dev_info_get(port_id, &dev_info) == 0 && dev_info.device != nullptr && iova != 0u) {
+        (void)rte_dev_dma_map(dev_info.device, vaddr, static_cast<rte_iova_t>(iova), aligned_len);
+    }
+    return true;
+}
+
+TxResult tx_burst_extbuf_zero_copy(int64_t handle, uint16_t queue_id,
+                                   void* bar1_base_vaddr, uint64_t bar1_base_iova,
+                                   std::size_t region_len, std::size_t offset,
+                                   uint16_t packet_size, uint16_t batch) {
+    TxResult r{};
+    if (!bar1_base_vaddr || packet_size == 0 || batch == 0 || region_len < packet_size) {
+        return r;
+    }
+    const uint16_t clamped_batch = std::min<uint16_t>(batch, kMaxBurst);
+    if (bar1_base_iova == 0u) {
+        const uint8_t* src = static_cast<const uint8_t*>(bar1_base_vaddr) + (offset % region_len);
+        return tx_burst(handle, queue_id, src, packet_size, clamped_batch);
+    }
+
+    uint16_t port_id = 0;
+    rte_mempool* mempool = nullptr;
+    Context* ctx = nullptr;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_mu);
+        auto it = g_contexts.find(static_cast<long>(handle));
+        if (it == g_contexts.end()) {
+            return r;
+        }
+        ctx = &it->second;
+        port_id = ctx->port_id;
+        auto pt = g_ports.find(port_id);
+        if (pt == g_ports.end() || !pt->second.started || !pt->second.mempool) {
+            return r;
+        }
+        if (queue_id >= pt->second.tx_queues) {
+            queue_id = 0;
+        }
+        mempool = pt->second.mempool;
+    }
+
+    rte_mbuf* mbufs[kMaxBurst];
+    if (rte_pktmbuf_alloc_bulk(mempool, mbufs, clamped_batch) != 0) {
+        r.alloc_failures += clamped_batch;
+        r.errors += clamped_batch;
+        r.dropped += clamped_batch;
+        ctx->mbuf_alloc_failures.fetch_add(clamped_batch, std::memory_order_relaxed);
+        ctx->tx_errors.fetch_add(clamped_batch, std::memory_order_relaxed);
+        ctx->tx_dropped.fetch_add(clamped_batch, std::memory_order_relaxed);
+        return r;
+    }
+
+    thread_local rte_mbuf_ext_shared_info shinfo_pool[kMaxBurst];
+    for (uint16_t i = 0; i < clamped_batch; ++i) {
+        const std::size_t pkt_off =
+            (offset + static_cast<std::size_t>(i) * packet_size) % (region_len - packet_size + 1u);
+        void* buf_va = static_cast<uint8_t*>(bar1_base_vaddr) + pkt_off;
+        const rte_iova_t buf_iova = static_cast<rte_iova_t>(bar1_base_iova + pkt_off);
+        shinfo_pool[i].free_cb = noop_extbuf_free_cb;
+        shinfo_pool[i].fcb_opaque = nullptr;
+        rte_mbuf_ext_refcnt_set(&shinfo_pool[i], 2);
+        rte_pktmbuf_attach_extbuf(mbufs[i], buf_va, buf_iova, packet_size, &shinfo_pool[i]);
+        mbufs[i]->data_len = packet_size;
+        mbufs[i]->pkt_len = packet_size;
+    }
+
+    uint16_t sent_off = 0;
+    uint16_t remaining = clamped_batch;
+    int retry = 0;
+    while (remaining > 0 && retry < 8) {
+        const uint16_t n = rte_eth_tx_burst(port_id, queue_id, &mbufs[sent_off], remaining);
+        sent_off += n;
+        remaining = static_cast<uint16_t>(remaining - n);
+        if (remaining > 0) {
+            ++retry;
+            rte_pause();
+        }
+    }
+
+    r.sent += sent_off;
+    if (remaining > 0) {
+        for (uint16_t i = 0; i < remaining; ++i) {
+            rte_pktmbuf_free(mbufs[sent_off + i]);
+        }
+        r.dropped += remaining;
+        r.errors += remaining;
+    }
+
+    ctx->tx_packets.fetch_add(r.sent, std::memory_order_relaxed);
+    ctx->tx_bytes.fetch_add(r.sent * static_cast<uint64_t>(packet_size), std::memory_order_relaxed);
+    ctx->tx_errors.fetch_add(r.errors, std::memory_order_relaxed);
+    ctx->tx_dropped.fetch_add(r.dropped, std::memory_order_relaxed);
+    return r;
+}
+
 bool configure_udp_flow(int64_t handle, const UdpFlowConfig& cfg, std::string& err) {
     std::unique_lock<std::shared_mutex> lock(g_mu);
     auto it = g_contexts.find(static_cast<long>(handle));
@@ -1104,6 +1239,14 @@ void unregister_lcore_thread() {}
 TxResult tx_burst(int64_t, uint16_t, const uint8_t*, uint16_t, uint16_t) { return {}; }
 TxResult send_batch(int64_t, uint16_t, const uint8_t*, uint16_t, uint64_t) { return {}; }
 bool prepopulate_tx_pool(int64_t, const uint8_t*, uint16_t) { return false; }
+bool register_extmem_region(int64_t, void*, std::size_t, uint64_t, uint32_t, std::string& err) {
+    err = "dpdk_not_built";
+    return false;
+}
+TxResult tx_burst_extbuf_zero_copy(int64_t, uint16_t, void*, uint64_t, std::size_t, std::size_t,
+                                   uint16_t, uint16_t) {
+    return {};
+}
 bool configure_udp_flow(int64_t, const UdpFlowConfig&, std::string& err) {
     err = "dpdk_not_built";
     return false;

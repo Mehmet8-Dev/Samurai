@@ -87,6 +87,7 @@ struct DeviceBuffer {
   enum class AllocKind : uint8_t {
     kDevice = 0,
     kMappedHost = 1,
+    kVulkanBar1P2p = 2,
   };
 
   uint8_t* ptr = nullptr;
@@ -544,6 +545,14 @@ int samurai_gpu_packet_shutdown_runtime();
 
 void samurai_gpu_packet_free(void* ptr);
 const char* samurai_gpu_packet_last_error();
+
+// Consumer GeForce BAR1 Zero-Copy P2P DMA Arena introspection C ABI.
+int samurai_gpu_packet_p2p_bar1_available(void);
+int samurai_gpu_packet_p2p_get_arena_info(
+    uint64_t* out_bar1_phys,
+    void** out_host_ptr,
+    void** out_dev_ptr,
+    size_t* out_size);
 
 // Isolated defense/classifier C ABI.
 int samurai_gpu_packet_defense_init(
