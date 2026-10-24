@@ -26,13 +26,14 @@ if(NOT DEFINED ENV{SAMURAI_SKIP_CUDA_BUILD})
   find_program(SAMURAI_NVCC nvcc HINTS ENV SAMURAI_NVCC /usr/local/cuda/bin)
   set(_cuda_src ${SAMURAI_PKG_DIR}/gpu_packet_cuda.cu)
   if(SAMURAI_NVCC AND EXISTS ${_cuda_src})
+    file(GLOB _cuda_hdrs ${SAMURAI_PKG_DIR}/gpu_packet_cuda/*.cuh ${SAMURAI_PKG_DIR}/gpu_packet_cuda.hpp)
     set(_cuda_out ${SAMURAI_PKG_DIR}/libgpu_packet_cuda.so)
     add_custom_command(
       OUTPUT ${_cuda_out}
       COMMAND ${SAMURAI_NVCC} -std=c++20 -O3 -Xcompiler -fPIC -diag-suppress=177
               -I ${SAMURAI_PKG_DIR}/.. -c ${_cuda_src} -o ${CMAKE_CURRENT_BINARY_DIR}/gpu_packet_cuda.o
       COMMAND ${SAMURAI_NVCC} -shared ${CMAKE_CURRENT_BINARY_DIR}/gpu_packet_cuda.o -ldl -o ${_cuda_out}
-      DEPENDS ${_cuda_src}
+      DEPENDS ${_cuda_src} ${_cuda_hdrs}
       COMMENT "Building libgpu_packet_cuda.so (nvcc)"
       VERBATIM)
     add_custom_target(gpu_packet_cuda ALL DEPENDS ${_cuda_out})

