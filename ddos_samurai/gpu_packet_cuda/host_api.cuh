@@ -7,28 +7,33 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "tx_backend_doca_gpunetio.cuh"
-#include "tx_backend_geforce_p2p.cuh"
-#include "zero_copy_dataplane_contract.cuh"
-#ifndef SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
-#define SAMURAI_WITH_DOCA_GPUNETIO_DEVICE 0
-#endif
-#if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
-#include <doca_gpunetio_dev_eth_txq.cuh>
-#endif
 #ifndef SAMURAI_GPU_PACKET_CUDA_PREAMBLE_INCLUDED
 #define SAMURAI_GPU_PACKET_CUDA_FRAGMENT_CHAIN 1
+#include "tx_backend_doca_gpunetio.cuh"
+#include "tx_backend_geforce_p2p.cuh"
+#include "geforce_p2p_runtime.cuh"
+#include "zero_copy_dataplane_contract.cuh"
 #include "preamble.cuh"
 #include "kernels_l4.cuh"
 #include "kernels_template_pool.cuh"
 #include "kernels_fragment_amp.cuh"
 #include "kernels_icmp_utils.cuh"
 #undef SAMURAI_GPU_PACKET_CUDA_FRAGMENT_CHAIN
+#else
+#include "tx_backend_doca_gpunetio.cuh"
+#endif
+#ifndef SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+#define SAMURAI_WITH_DOCA_GPUNETIO_DEVICE 0
+#endif
+#if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
+#include <doca_gpunetio_dev_eth_txq.cuh>
 #endif
 
 namespace {
 constexpr uint64_t kMappedExportHeaderMagic = 0x53414d5552414931ull;  // SAMURAI1
 constexpr uint32_t kMappedExportAllocKindCudaHost = 2u;
+constexpr uint32_t kMappedExportAllocKindVulkanBar1P2p = 3u;
+constexpr size_t kVulkanBar1PayloadAlignment = 64u;
 
 struct MappedExportHeader {
   uint64_t magic = kMappedExportHeaderMagic;
@@ -43,6 +48,17 @@ inline bool zero_copy_output_enabled() {
   return env_int("SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT", 0) > 0;
 }
 
+inline bool bar1_p2p_output_enabled() {
+  if (env_int("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", 0) > 0) {
+    return true;
+  }
+  const char* tx_backend = std::getenv("SAMURAI_GPU_TX_BACKEND");
+  if (tx_backend && std::strcmp(tx_backend, "geforce_p2p") == 0) {
+    return true;
+  }
+  return false;
+}
+
 inline DeviceBuffer allocate_packet_output_buffer(
     size_t payload_size,
     cudaStream_t stream,
@@ -51,6 +67,31 @@ inline DeviceBuffer allocate_packet_output_buffer(
   DeviceBuffer out;
   if (payload_size == 0) {
     return out;
+  }
+
+  if (bar1_p2p_output_enabled()) {
+    auto& bar1_pool = ddos_samurai::gpu_packet_cuda::p2p::get_global_bar1_batch_pool();
+    std::string bar1_err;
+    const size_t total_bar1 = kVulkanBar1PayloadAlignment + payload_size;
+    if (bar1_pool.ensure_capacity(total_bar1, bar1_err)) {
+      uint8_t* host_payload = bar1_pool.arena.host_bar1_ptr + kVulkanBar1PayloadAlignment;
+      uint8_t* dev_payload = bar1_pool.arena.cuda_dev_ptr + kVulkanBar1PayloadAlignment;
+      auto* header = reinterpret_cast<MappedExportHeader*>(host_payload) - 1;
+      header->magic = kMappedExportHeaderMagic;
+      header->alloc_kind = kMappedExportAllocKindVulkanBar1P2p;
+      header->reserved = 0u;
+      header->size = payload_size;
+      header->pending_stream_handle = 0u;
+      header->pending_device_ptr = 0u;
+
+      out.ptr = dev_payload;
+      out.host_ptr = host_payload;
+      out.host_base_ptr = reinterpret_cast<uint8_t*>(header);
+      out.size = payload_size;
+      out.alloc_kind = DeviceBuffer::AllocKind::kVulkanBar1P2p;
+      throw_if_cuda(cudaMemsetAsync(out.ptr, 0, payload_size, stream), cuda_memset_error);
+      return out;
+    }
   }
 
   if (zero_copy_output_enabled()) {
@@ -1084,6 +1125,7 @@ constexpr uint64_t kExportHostBufferMagic = 0x53414d5552414931ull;  // SAMURAI1
 enum class ExportHostAllocKind : uint32_t {
   kMalloc = 1u,
   kCudaHost = 2u,
+  kVulkanBar1P2p = 3u,
 };
 
 struct ExportHostBufferHeader {
@@ -1124,7 +1166,8 @@ static int export_packet_result(
   try {
     if (res.packets_gpu.valid()) {
       exported_size = res.packets_gpu.size;
-      if (res.packets_gpu.alloc_kind == ddos_samurai::gpu_packet_cuda::DeviceBuffer::AllocKind::kMappedHost &&
+      if ((res.packets_gpu.alloc_kind == ddos_samurai::gpu_packet_cuda::DeviceBuffer::AllocKind::kMappedHost ||
+           res.packets_gpu.alloc_kind == ddos_samurai::gpu_packet_cuda::DeviceBuffer::AllocKind::kVulkanBar1P2p) &&
           res.packets_gpu.host_ptr != nullptr) {
         auto* mapped_header = reinterpret_cast<ExportHostBufferHeader*>(
             res.packets_gpu.host_base_ptr ? res.packets_gpu.host_base_ptr : (res.packets_gpu.host_ptr - sizeof(ExportHostBufferHeader)));
@@ -1508,6 +1551,7 @@ enum class PersistentTxBackendKind : int {
   kAfXdp = 1,
   kAfPacket = 2,
   kDocaGpuNetIO = 3,
+  kGeforceP2p = 4,
 };
 
 constexpr int kPersistentDocaGpuNetioApiVersion = 3;
@@ -1602,8 +1646,11 @@ struct PersistentTxBridgeRuntime {
   std::array<uint8_t, 6> afpacket_mac{{0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu}};
   const XdpNativeApiV1* xdp_api = nullptr;
   const PersistentDocaGpuNetioApiV1* doca_api = nullptr;
+  const ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pApiV1* geforce_p2p_api = nullptr;
   std::string doca_device{};
   int doca_gpu_id = 0;
+  std::string p2p_gpu_bdf{};
+  std::string p2p_nic_bdf{};
   int (*afpacket_send_bridge)(
       const char* iface,
       const uint8_t* buffer,
@@ -1618,6 +1665,7 @@ struct PersistentTxBridgeRuntime {
   int (*afpacket_cleanup_bridge)(void) = nullptr;
   std::vector<int> xdp_handles{};
   std::vector<int> doca_txq_handles{};
+  std::vector<int> geforce_p2p_handles{};
   std::vector<uint64_t> doca_gpu_txq_handles{};
   std::vector<uint32_t> doca_txq_mkeys_be{};
   bool doca_kernel_direct_tx = false;
@@ -1649,6 +1697,8 @@ struct PersistentRuntime {
   int32_t* queue_slot_hint_dev = nullptr;                         // device queue-local slot hint
   uint8_t* payload_host = nullptr;                                // mapped host UMEM payload
   uint8_t* payload_dev = nullptr;                                 // device payload buffer
+  bool bar1_unified_payload = false;                              // true when payload_host/payload_dev alias Vulkan BAR1 arena
+  ddos_samurai::gpu_packet_cuda::p2p::VulkanBar1Arena bar1_payload_arena{};
   uint64_t* doca_gpu_txq_handles_dev = nullptr;                   // device txq handles for kernel direct DOCA TX
   uint32_t* doca_txq_mkeys_be_dev = nullptr;                      // device txq mkeys (big-endian) for direct DOCA TX
   std::vector<std::thread> bridge_threads;
@@ -1735,13 +1785,20 @@ struct PersistentRuntime {
       (void)cudaFree(rings_dev);
       rings_dev = nullptr;
     }
-    if (payload_host) {
-      (void)cudaFreeHost(payload_host);
+    if (bar1_unified_payload) {
+      bar1_payload_arena.release();
       payload_host = nullptr;
-    }
-    if (payload_dev) {
-      (void)cudaFree(payload_dev);
       payload_dev = nullptr;
+      bar1_unified_payload = false;
+    } else {
+      if (payload_host) {
+        (void)cudaFreeHost(payload_host);
+        payload_host = nullptr;
+      }
+      if (payload_dev) {
+        (void)cudaFree(payload_dev);
+        payload_dev = nullptr;
+      }
     }
     if (doca_gpu_txq_handles_dev) {
       (void)cudaFree(doca_gpu_txq_handles_dev);
@@ -1796,12 +1853,15 @@ struct PersistentContractRuntime {
   uint64_t* hot_flow_epochs_dev = nullptr;
   void* export_region_host = nullptr;
   void* export_region_dev = nullptr;
+  void* export_region_file_mmap = nullptr;
   size_t export_region_bytes = 0u;
   int export_region_fd = -1;
   std::string export_region_path{};
   std::string export_region_spec{};
   bool export_region_registered = false;
   bool export_region_file_backed = false;
+  bool bar1_contract_enabled = false;
+  ddos_samurai::gpu_packet_cuda::p2p::VulkanBar1Arena bar1_contract_arena{};
   uint64_t publish_count = 0u;
   uint64_t drop_count = 0u;
   uint64_t version_gap_count = 0u;
@@ -1907,7 +1967,10 @@ inline std::string persistent_contract_export_region_spec(
     const PersistentContractRegionLayout& layout,
     size_t shard_count,
     size_t ring_slots_per_shard,
-    size_t hot_flow_capacity) {
+    size_t hot_flow_capacity,
+    bool bar1_contract_enabled = false,
+    const void* bar1_host_ptr = nullptr,
+    uint64_t bar1_phys_addr = 0u) {
   std::string kind = "file";
   if (const char* raw_kind = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_KIND")) {
     if (*raw_kind) {
@@ -1917,6 +1980,8 @@ inline std::string persistent_contract_export_region_spec(
       });
       if (kind == "doca-mmap") {
         kind = "doca_mmap";
+      } else if (kind == "bar1-p2p") {
+        kind = "bar1_p2p";
       }
     }
   }
@@ -1929,6 +1994,10 @@ inline std::string persistent_contract_export_region_spec(
       << ",slots=" << ring_slots_per_shard
       << ",hot=" << hot_flow_capacity
       << ",event=" << sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1);
+  if (bar1_contract_enabled && kind == "bar1_p2p") {
+    oss << ",addr=0x" << std::hex << reinterpret_cast<uintptr_t>(bar1_host_ptr)
+        << ",bar1_phys=0x" << bar1_phys_addr << std::dec;
+  }
   return oss.str();
 }
 
@@ -1955,12 +2024,16 @@ inline void persistent_contract_store_event_slot(
 
 inline void persistent_contract_runtime_release_unlocked() {
   auto& cr = g_persistent_contract_runtime;
+  if (cr.bar1_contract_enabled) {
+    cr.bar1_contract_arena.release();
+    cr.bar1_contract_enabled = false;
+  }
   if (cr.export_region_registered && cr.export_region_host) {
     (void)cudaHostUnregister(cr.export_region_host);
   }
-  if (cr.export_region_file_backed && cr.export_region_host && cr.export_region_bytes > 0u) {
-    (void)::msync(cr.export_region_host, cr.export_region_bytes, MS_SYNC);
-    (void)::munmap(cr.export_region_host, cr.export_region_bytes);
+  if (cr.export_region_file_backed && cr.export_region_file_mmap && cr.export_region_bytes > 0u) {
+    (void)::msync(cr.export_region_file_mmap, cr.export_region_bytes, MS_SYNC);
+    (void)::munmap(cr.export_region_file_mmap, cr.export_region_bytes);
   }
   if (cr.export_region_fd >= 0) {
     (void)::close(cr.export_region_fd);
@@ -1973,6 +2046,7 @@ inline void persistent_contract_runtime_release_unlocked() {
   cr.hot_flow_epochs_dev = nullptr;
   cr.export_region_host = nullptr;
   cr.export_region_dev = nullptr;
+  cr.export_region_file_mmap = nullptr;
   cr.export_region_bytes = 0u;
   cr.export_region_fd = -1;
   cr.export_region_path.clear();
@@ -2028,20 +2102,59 @@ inline bool persistent_contract_runtime_alloc_device_mirror_unlocked(
     return false;
   }
   std::memset(mapped, 0, layout.total_bytes);
-  if (cudaHostRegister(mapped, layout.total_bytes, cudaHostRegisterMapped) != cudaSuccess) {
-    (void)::munmap(mapped, layout.total_bytes);
-    (void)::close(fd);
-    return false;
+
+  bool want_bar1_contract = g_persistent_runtime.bar1_unified_payload ||
+                            ddos_samurai::gpu_packet_cuda::bar1_p2p_output_enabled();
+  if (const char* kind_env = std::getenv("SAMURAI_GPU_CONTRACT_EXPORT_KIND")) {
+    if (*kind_env) {
+      std::string k(kind_env);
+      std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+      if (k == "bar1_p2p" || k == "bar1-p2p" || k == "geforce_p2p") {
+        want_bar1_contract = true;
+      }
+    }
   }
+
+  void* host_base = nullptr;
   void* dev_base = nullptr;
-  if (cudaHostGetDevicePointer(&dev_base, mapped, 0) != cudaSuccess || !dev_base) {
-    (void)cudaHostUnregister(mapped);
-    (void)::munmap(mapped, layout.total_bytes);
-    (void)::close(fd);
-    return false;
+  cr.bar1_contract_enabled = false;
+  if (want_bar1_contract) {
+    std::string bar1_err;
+    if (cr.bar1_contract_arena.allocate(
+            layout.total_bytes,
+            g_persistent_runtime.tx_bridge.p2p_gpu_bdf.c_str(),
+            0u,
+            bar1_err) &&
+        cr.bar1_contract_arena.host_bar1_ptr && cr.bar1_contract_arena.cuda_dev_ptr) {
+      std::memset(cr.bar1_contract_arena.host_bar1_ptr, 0, layout.total_bytes);
+      host_base = cr.bar1_contract_arena.host_bar1_ptr;
+      dev_base = cr.bar1_contract_arena.cuda_dev_ptr;
+      cr.bar1_contract_enabled = true;
+      cr.export_region_registered = false;
+    }
   }
-  cr.export_region_host = mapped;
+
+  if (!cr.bar1_contract_enabled) {
+    if (cudaHostRegister(mapped, layout.total_bytes, cudaHostRegisterMapped) != cudaSuccess) {
+      (void)::munmap(mapped, layout.total_bytes);
+      (void)::close(fd);
+      return false;
+    }
+    if (cudaHostGetDevicePointer(&dev_base, mapped, 0) != cudaSuccess || !dev_base) {
+      (void)cudaHostUnregister(mapped);
+      (void)::munmap(mapped, layout.total_bytes);
+      (void)::close(fd);
+      return false;
+    }
+    host_base = mapped;
+    cr.export_region_registered = true;
+  }
+
+  cr.export_region_host = host_base;
   cr.export_region_dev = dev_base;
+  cr.export_region_file_mmap = mapped;
   cr.export_region_bytes = layout.total_bytes;
   cr.export_region_fd = fd;
   cr.export_region_path = path;
@@ -2050,8 +2163,10 @@ inline bool persistent_contract_runtime_alloc_device_mirror_unlocked(
       layout,
       shard_count_s,
       static_cast<size_t>(cr.ring_slots_per_shard),
-      hot_flow_capacity_s);
-  cr.export_region_registered = true;
+      hot_flow_capacity_s,
+      cr.bar1_contract_enabled,
+      cr.bar1_contract_arena.host_bar1_ptr,
+      cr.bar1_contract_arena.bar1_phys_addr);
   cr.export_region_file_backed = true;
   auto* dev_u8 = static_cast<uint8_t*>(dev_base);
   cr.ring_head_dev = reinterpret_cast<uint64_t*>(dev_u8 + layout.ring_head_off);
@@ -2064,6 +2179,120 @@ inline bool persistent_contract_runtime_alloc_device_mirror_unlocked(
   cr.hot_flow_epochs_dev = reinterpret_cast<uint64_t*>(dev_u8 + layout.hot_flow_epochs_off);
   cr.device_mirror_initialized = true;
   return true;
+}
+
+inline void persistent_contract_write_slot_to_region(
+    uint8_t* region_base,
+    const PersistentContractRegionLayout& layout,
+    size_t ring_index,
+    size_t shard,
+    size_t flow_id,
+    const PersistentContractRuntime& cr) {
+  if (!region_base) return;
+  auto* heads = reinterpret_cast<volatile uint64_t*>(region_base + layout.ring_head_off);
+  auto* ring = reinterpret_cast<volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      region_base + layout.update_ring_off);
+  auto* hot = reinterpret_cast<volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      region_base + layout.hot_flow_table_off);
+  auto* hot_versions = reinterpret_cast<volatile uint64_t*>(region_base + layout.hot_flow_versions_off);
+  auto* hot_epochs = reinterpret_cast<volatile uint64_t*>(region_base + layout.hot_flow_epochs_off);
+  persistent_contract_store_event_slot(ring + ring_index, cr.update_ring[ring_index]);
+  persistent_contract_store_event_slot(hot + flow_id, cr.hot_flow_table[flow_id]);
+  __atomic_store_n(&hot_versions[flow_id], cr.hot_flow_versions[flow_id], __ATOMIC_RELEASE);
+  __atomic_store_n(&hot_epochs[flow_id], cr.hot_flow_epochs[flow_id], __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n(&heads[shard], cr.ring_head[shard], __ATOMIC_RELEASE);
+}
+
+inline void persistent_contract_bridge_file_mirror_to_bar1(PersistentContractRuntime& cr) {
+  if (!cr.bar1_contract_enabled || !cr.device_mirror_initialized || !cr.export_region_host ||
+      !cr.export_region_file_mmap || cr.export_region_host == cr.export_region_file_mmap) {
+    return;
+  }
+  PersistentContractRegionLayout layout{};
+  if (!persistent_contract_region_layout(
+          static_cast<size_t>(cr.shard_count),
+          static_cast<size_t>(cr.ring_slots_per_shard),
+          static_cast<size_t>(cr.hot_flow_capacity),
+          &layout) ||
+      cr.export_region_bytes < layout.total_bytes) {
+    return;
+  }
+  auto* bar1_base = static_cast<uint8_t*>(cr.export_region_host);
+  auto* file_base = static_cast<uint8_t*>(cr.export_region_file_mmap);
+
+  auto* bar1_heads = reinterpret_cast<volatile uint64_t*>(bar1_base + layout.ring_head_off);
+  auto* bar1_tails = reinterpret_cast<volatile uint64_t*>(bar1_base + layout.ring_tail_off);
+  auto* bar1_ring = reinterpret_cast<volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      bar1_base + layout.update_ring_off);
+  auto* bar1_hot = reinterpret_cast<volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      bar1_base + layout.hot_flow_table_off);
+  auto* bar1_hot_versions = reinterpret_cast<volatile uint64_t*>(bar1_base + layout.hot_flow_versions_off);
+  auto* bar1_hot_epochs = reinterpret_cast<volatile uint64_t*>(bar1_base + layout.hot_flow_epochs_off);
+
+  auto* file_heads = reinterpret_cast<volatile uint64_t*>(file_base + layout.ring_head_off);
+  auto* file_tails = reinterpret_cast<volatile uint64_t*>(file_base + layout.ring_tail_off);
+  auto* file_ring = reinterpret_cast<const volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+      file_base + layout.update_ring_off);
+
+  const uint64_t slots_per_shard = static_cast<uint64_t>(cr.ring_slots_per_shard);
+  for (int s = 0; s < cr.shard_count; ++s) {
+    const uint64_t f_head = __atomic_load_n(&file_heads[s], __ATOMIC_ACQUIRE);
+    const uint64_t b_head = __atomic_load_n(&bar1_heads[s], __ATOMIC_ACQUIRE);
+    if (f_head > b_head && slots_per_shard > 0u) {
+      const uint64_t start = (f_head - b_head > slots_per_shard) ? (f_head - slots_per_shard) : b_head;
+      for (uint64_t h = start; h < f_head; ++h) {
+        const size_t ring_idx =
+            static_cast<size_t>(s) * static_cast<size_t>(slots_per_shard) + static_cast<size_t>(h % slots_per_shard);
+        const volatile auto* src = file_ring + ring_idx;
+        ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1 ev{};
+        ev.version = __atomic_load_n(&src->version, __ATOMIC_ACQUIRE);
+        if (ev.version == 0u || (ev.version & 1ull) != 0ull) {
+          continue;
+        }
+        ev.epoch = src->epoch;
+        ev.flow_id = src->flow_id;
+        ev.tcp_seq = src->tcp_seq;
+        ev.tcp_ack = src->tcp_ack;
+        ev.src_port = src->src_port;
+        ev.dst_port = src->dst_port;
+        ev.tcp_state = src->tcp_state;
+        ev.proto = src->proto;
+        ev.flags = src->flags;
+        ev.rtt_us = src->rtt_us;
+        ev.dpu_ts_ns = src->dpu_ts_ns;
+
+        persistent_contract_store_event_slot(bar1_ring + ring_idx, ev);
+        if (ev.flow_id < static_cast<uint32_t>(cr.hot_flow_capacity)) {
+          persistent_contract_store_event_slot(bar1_hot + ev.flow_id, ev);
+          __atomic_store_n(&bar1_hot_versions[ev.flow_id], ev.version, __ATOMIC_RELEASE);
+          __atomic_store_n(&bar1_hot_epochs[ev.flow_id], ev.epoch, __ATOMIC_RELEASE);
+          if (ev.flow_id < cr.hot_flow_table.size()) {
+            cr.hot_flow_table[ev.flow_id] = ev;
+            cr.hot_flow_versions[ev.flow_id] = ev.version;
+            cr.hot_flow_epochs[ev.flow_id] = ev.epoch;
+          }
+        }
+        if (ring_idx < cr.update_ring.size()) {
+          cr.update_ring[ring_idx] = ev;
+        }
+      }
+      __atomic_thread_fence(__ATOMIC_RELEASE);
+      __atomic_store_n(&bar1_heads[s], f_head, __ATOMIC_RELEASE);
+      if (static_cast<size_t>(s) < cr.ring_head.size()) {
+        cr.ring_head[static_cast<size_t>(s)] = f_head;
+      }
+    }
+
+    const uint64_t b_tail = __atomic_load_n(&bar1_tails[s], __ATOMIC_ACQUIRE);
+    const uint64_t f_tail = __atomic_load_n(&file_tails[s], __ATOMIC_ACQUIRE);
+    if (b_tail > f_tail) {
+      __atomic_store_n(&file_tails[s], b_tail, __ATOMIC_RELEASE);
+      if (static_cast<size_t>(s) < cr.ring_tail.size() && b_tail > cr.ring_tail[static_cast<size_t>(s)]) {
+        cr.ring_tail[static_cast<size_t>(s)] = b_tail;
+      }
+    }
+  }
 }
 
 inline bool persistent_contract_runtime_sync_device_slot_unlocked(
@@ -2092,20 +2321,12 @@ inline bool persistent_contract_runtime_sync_device_slot_unlocked(
     cr.device_sync_error_count += 1u;
     return false;
   }
-  auto* base = persistent_contract_region_base(cr);
-  auto* heads = reinterpret_cast<volatile uint64_t*>(base + layout.ring_head_off);
-  auto* ring = reinterpret_cast<volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
-      base + layout.update_ring_off);
-  auto* hot = reinterpret_cast<volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
-      base + layout.hot_flow_table_off);
-  auto* hot_versions = reinterpret_cast<volatile uint64_t*>(base + layout.hot_flow_versions_off);
-  auto* hot_epochs = reinterpret_cast<volatile uint64_t*>(base + layout.hot_flow_epochs_off);
-  persistent_contract_store_event_slot(ring + ring_index, cr.update_ring[ring_index]);
-  persistent_contract_store_event_slot(hot + flow_id, cr.hot_flow_table[flow_id]);
-  __atomic_store_n(&hot_versions[flow_id], cr.hot_flow_versions[flow_id], __ATOMIC_RELEASE);
-  __atomic_store_n(&hot_epochs[flow_id], cr.hot_flow_epochs[flow_id], __ATOMIC_RELEASE);
-  __atomic_thread_fence(__ATOMIC_RELEASE);
-  __atomic_store_n(&heads[shard], cr.ring_head[shard], __ATOMIC_RELEASE);
+  persistent_contract_write_slot_to_region(
+      persistent_contract_region_base(cr), layout, ring_index, shard, flow_id, cr);
+  if (cr.export_region_file_mmap && cr.export_region_file_mmap != cr.export_region_host) {
+    persistent_contract_write_slot_to_region(
+        static_cast<uint8_t*>(cr.export_region_file_mmap), layout, ring_index, shard, flow_id, cr);
+  }
   return true;
 }
 
@@ -2113,6 +2334,7 @@ inline bool persistent_contract_runtime_refresh_device_tail_unlocked(PersistentC
   if (!cr.device_mirror_initialized || !cr.ring_tail_dev || !cr.export_region_host || shard >= cr.ring_tail.size()) {
     return true;
   }
+  persistent_contract_bridge_file_mirror_to_bar1(cr);
   PersistentContractRegionLayout layout{};
   if (!persistent_contract_region_layout(
           static_cast<size_t>(cr.shard_count),
@@ -2127,6 +2349,11 @@ inline bool persistent_contract_runtime_refresh_device_tail_unlocked(PersistentC
   const uint64_t device_tail = __atomic_load_n(&tails[shard], __ATOMIC_ACQUIRE);
   if (device_tail > cr.ring_tail[shard]) {
     cr.ring_tail[shard] = device_tail;
+  }
+  if (cr.export_region_file_mmap && cr.export_region_file_mmap != cr.export_region_host) {
+    auto* file_tails = reinterpret_cast<volatile uint64_t*>(
+        static_cast<uint8_t*>(cr.export_region_file_mmap) + layout.ring_tail_off);
+    __atomic_store_n(&file_tails[shard], cr.ring_tail[shard], __ATOMIC_RELEASE);
   }
   return true;
 }
@@ -2147,6 +2374,11 @@ inline bool persistent_contract_runtime_sync_device_tail_unlocked(PersistentCont
   }
   auto* tails = reinterpret_cast<volatile uint64_t*>(persistent_contract_region_base(cr) + layout.ring_tail_off);
   __atomic_store_n(&tails[shard], cr.ring_tail[shard], __ATOMIC_RELEASE);
+  if (cr.export_region_file_mmap && cr.export_region_file_mmap != cr.export_region_host) {
+    auto* file_tails = reinterpret_cast<volatile uint64_t*>(
+        static_cast<uint8_t*>(cr.export_region_file_mmap) + layout.ring_tail_off);
+    __atomic_store_n(&file_tails[shard], cr.ring_tail[shard], __ATOMIC_RELEASE);
+  }
   return true;
 }
 
@@ -2850,6 +3082,16 @@ inline void persistent_bridge_backend_shutdown_unlocked(PersistentRuntime& rt) {
     }
   }
   b.doca_txq_handles.clear();
+  if (b.geforce_p2p_api && b.geforce_p2p_api->destroy_tx_ring) {
+    for (int h : b.geforce_p2p_handles) {
+      if (h >= 0) {
+        char errbuf[160];
+        errbuf[0] = '\0';
+        (void)b.geforce_p2p_api->destroy_tx_ring(h, errbuf, sizeof(errbuf));
+      }
+    }
+  }
+  b.geforce_p2p_handles.clear();
   b.doca_gpu_txq_handles.clear();
   b.doca_txq_mkeys_be.clear();
   b.doca_kernel_direct_tx = false;
@@ -2862,6 +3104,7 @@ inline void persistent_bridge_backend_shutdown_unlocked(PersistentRuntime& rt) {
   b.active = "noop";
   b.xdp_api = nullptr;
   b.doca_api = nullptr;
+  b.geforce_p2p_api = nullptr;
   b.afpacket_send_bridge = nullptr;
   b.afpacket_cleanup_bridge = nullptr;
 }
@@ -2874,6 +3117,8 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   b.iface = env_string_or("SAMURAI_GPU_TX_INTERFACE", env_string_or("SAMURAI_XDP_INTERFACE", ""));
   b.doca_device = env_string_or("SAMURAI_GPU_DOCA_DEVICE", "");
   b.doca_gpu_id = std::max(0, env_int_local("SAMURAI_GPU_DOCA_GPU_ID", 0));
+  b.p2p_gpu_bdf = env_string_or("SAMURAI_GPU_P2P_GPU_BDF", "");
+  b.p2p_nic_bdf = env_string_or("SAMURAI_GPU_P2P_NIC_BDF", "");
   const bool tx_backend_strict = env_int_local("SAMURAI_GPU_TX_BACKEND_STRICT", 0) != 0;
   b.xdp_mode = clamp_i(env_int_local("SAMURAI_XDP_MODE", 0), 0, 2);
   b.xdp_queue_base = std::max(0, env_int_local("SAMURAI_XDP_QUEUE_ID", 0));
@@ -2885,7 +3130,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   }
 
   if (b.requested != "auto" && b.requested != "af_xdp" && b.requested != "af_packet" &&
-      b.requested != "doca_gpunetio" && b.requested != "noop") {
+      b.requested != "doca_gpunetio" && b.requested != "geforce_p2p" && b.requested != "noop") {
     if (tx_backend_strict) {
       b.kind = PersistentTxBackendKind::kNoop;
       b.active = "noop";
@@ -2902,6 +3147,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   const bool want_xdp = (b.requested == "auto" || b.requested == "af_xdp");
   const bool want_afpacket = (b.requested == "auto" || b.requested == "af_packet");
   const bool want_doca = (b.requested == "auto" || b.requested == "doca_gpunetio");
+  const bool want_geforce_p2p = (b.requested == "geforce_p2p");
   const std::string doca_timed_tx_raw = lower_copy(env_string_or("SAMURAI_GPU_DOCA_TIMED_TX", "auto"));
   b.doca_timed_tx_enabled = false;
   b.doca_timed_tx_required = false;
@@ -2997,9 +3243,9 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   }
 
   if (want_doca && !b.iface.empty() && !b.doca_device.empty()) {
-    if (ddos_samurai::gpu_packet_cuda::samurai_doca_gpunetio_get_api_v1) {
+    if (::samurai_doca_gpunetio_get_api_v1) {
       b.doca_api = reinterpret_cast<const PersistentDocaGpuNetioApiV1*>(
-          ddos_samurai::gpu_packet_cuda::samurai_doca_gpunetio_get_api_v1());
+          ::samurai_doca_gpunetio_get_api_v1());
       if (b.doca_api && b.doca_api->version >= 2 && b.doca_api->create_txq &&
           b.doca_api->destroy_txq && b.doca_api->send_vector) {
         if (b.doca_timed_tx_required &&
@@ -3143,6 +3389,50 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
       b.active = "noop";
       return tx_backend_strict ? false : true;
     }
+  }
+
+  if (want_geforce_p2p) {
+    if (::samurai_geforce_p2p_get_api_v1) {
+      b.geforce_p2p_api = ::samurai_geforce_p2p_get_api_v1();
+      if (b.geforce_p2p_api && b.geforce_p2p_api->version == ::kGeforceP2pApiVersion &&
+          b.geforce_p2p_api->create_tx_ring && b.geforce_p2p_api->destroy_tx_ring &&
+          b.geforce_p2p_api->submit_slot_batch) {
+        b.geforce_p2p_handles.assign(static_cast<size_t>(rt.queue_count), -1);
+        bool ok = true;
+        for (int q = 0; q < rt.queue_count; ++q) {
+          ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pConfigV1 cfg{};
+          std::snprintf(cfg.pci_gpu_bdf, sizeof(cfg.pci_gpu_bdf), "%s", b.p2p_gpu_bdf.c_str());
+          std::snprintf(cfg.pci_nic_bdf, sizeof(cfg.pci_nic_bdf), "%s", b.p2p_nic_bdf.c_str());
+          std::snprintf(cfg.iface, sizeof(cfg.iface), "%s", b.iface.c_str());
+          cfg.ring_slot_count = static_cast<uint32_t>(rt.ring_slots);
+          cfg.slot_stride = static_cast<uint32_t>(kPersistentUmemFrameSize);
+          int handle = -1;
+          char errbuf[256];
+          errbuf[0] = '\0';
+          if (b.geforce_p2p_api->create_tx_ring(&cfg, &handle, errbuf, sizeof(errbuf)) < 0 || handle < 0) {
+            ok = false;
+            break;
+          }
+          b.geforce_p2p_handles[static_cast<size_t>(q)] = handle;
+        }
+        if (ok) {
+          b.kind = PersistentTxBackendKind::kGeforceP2p;
+          b.active = "geforce_p2p";
+          return true;
+        }
+        for (int h : b.geforce_p2p_handles) {
+          if (h >= 0) {
+            char derr[96];
+            derr[0] = '\0';
+            (void)b.geforce_p2p_api->destroy_tx_ring(h, derr, sizeof(derr));
+          }
+        }
+        b.geforce_p2p_handles.clear();
+      }
+    }
+    b.kind = PersistentTxBackendKind::kNoop;
+    b.active = "noop";
+    return false;
   }
 
   b.kind = PersistentTxBackendKind::kNoop;
@@ -4889,6 +5179,9 @@ inline bool persistent_copy_payload_batch_to_host(
       q < 0 || q >= rt.queue_count) {
     return false;
   }
+  if (rt.bar1_unified_payload) {
+    return true;
+  }
   for (size_t i = 0; i < count; ++i) {
     const uint32_t slot_id = slot_ids[i];
     const uint16_t len = lengths[i];
@@ -5537,6 +5830,125 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
             continue;
           }
 
+          if (rt.tx_bridge.kind == PersistentTxBackendKind::kGeforceP2p && rt.tx_bridge.geforce_p2p_api &&
+              rt.tx_bridge.geforce_p2p_api->submit_slot_batch &&
+              q < static_cast<int>(rt.tx_bridge.geforce_p2p_handles.size()) &&
+              rt.tx_bridge.geforce_p2p_handles[static_cast<size_t>(q)] >= 0) {
+            const int handle = rt.tx_bridge.geforce_p2p_handles[static_cast<size_t>(q)];
+            const int max_packet = (rt.ctrl && rt.ctrl->max_packet_bytes > 0) ? rt.ctrl->max_packet_bytes : kPersistentMaxPacketBytes;
+            const int burst_limit = std::max(1, rt.bridge_max_burst);
+            const int remaining_budget = std::max(1, burst_limit - static_cast<int>(drained));
+            submit_frame_ids.clear();
+            submit_lengths.clear();
+            afpacket_stream_slots.clear();
+            const uint32_t scan_start = cursor;
+            const int scan_budget = std::min(remaining_budget, rt.ring_slots);
+            if (!persistent_sync_queue_ring_window_to_host(
+                    rt,
+                    q,
+                    scan_start,
+                    static_cast<uint32_t>(scan_budget))) {
+              break;
+            }
+            if (!persistent_bridge_copy_fence(rt)) {
+              break;
+            }
+            for (int i = 0; i < scan_budget; ++i) {
+              const uint32_t slot_id = (scan_start + static_cast<uint32_t>(i)) % static_cast<uint32_t>(rt.ring_slots);
+              const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
+              PersistentRingSlot& slot = rt.rings_host[idx];
+              if (slot.state != 1) {
+                break;
+              }
+              if (slot.len <= 0 || slot.len > max_packet) {
+                slot.state = 0;
+                slot.len = 0;
+                slot.stream_id = 0;
+                slot.stream_slot = -1;
+                slot.protocol = 0;
+                slot.tx_timestamp_ns = 0u;
+                (void)persistent_set_device_slot_state(rt, q, slot_id, 0);
+                local_drops += 1u;
+                local_released += 1u;
+                progressed = true;
+                break;
+              }
+              submit_frame_ids.push_back(slot_id);
+              submit_lengths.push_back(static_cast<uint16_t>(slot.len));
+              afpacket_stream_slots.push_back(slot.stream_slot);
+            }
+            if (submit_frame_ids.empty()) {
+              break;
+            }
+            if (!persistent_copy_payload_batch_to_host(
+                    rt,
+                    q,
+                    submit_frame_ids.data(),
+                    submit_lengths.data(),
+                    submit_frame_ids.size())) {
+              break;
+            }
+            if (!rt.bar1_unified_payload && !persistent_bridge_copy_fence(rt)) {
+              break;
+            }
+            uint32_t sent_u32 = 0u;
+            char errbuf[160];
+            errbuf[0] = '\0';
+            (void)rt.tx_bridge.geforce_p2p_api->submit_slot_batch(
+                handle,
+                submit_frame_ids.data(),
+                submit_lengths.data(),
+                static_cast<uint32_t>(submit_frame_ids.size()),
+                &sent_u32,
+                errbuf,
+                sizeof(errbuf));
+            int sent = static_cast<int>(sent_u32);
+            if (sent < 0) {
+              sent = 0;
+            }
+            const int batch_count = static_cast<int>(submit_frame_ids.size());
+            if (sent > batch_count) {
+              sent = batch_count;
+            }
+            for (int i = 0; i < batch_count; ++i) {
+              const uint32_t slot_id = submit_frame_ids[static_cast<size_t>(i)];
+              const int idx = q * rt.ring_slots + static_cast<int>(slot_id);
+              PersistentRingSlot& slot = rt.rings_host[idx];
+              slot.state = 0;
+              slot.len = 0;
+              slot.stream_id = 0;
+              slot.stream_slot = -1;
+              slot.protocol = 0;
+              slot.tx_timestamp_ns = 0u;
+              (void)persistent_set_device_slot_state(rt, q, slot_id, 0);
+              local_released += 1u;
+              if (i < sent) {
+                const int32_t slot_idx = afpacket_stream_slots[static_cast<size_t>(i)];
+                if (slot_idx >= 0 && slot_idx < kPersistentMaxStreams) {
+                  rt.completed_by_slot[static_cast<size_t>(slot_idx)].fetch_add(1u, std::memory_order_relaxed);
+                  if (rt.streams) {
+                    host_u32_add(&rt.streams[slot_idx].completed, 1u);
+                  }
+                }
+              } else {
+                local_drops += 1u;
+              }
+            }
+            drained += static_cast<uint64_t>(sent);
+            progressed = true;
+            local_sent += static_cast<uint64_t>(sent);
+            rt.queue_sent_counts[static_cast<size_t>(q)] += static_cast<uint64_t>(sent);
+            if (rt.bridge_ipg_ns > 0 && sent > 0) {
+              const uint64_t base = (rt.bridge_next_send_ns > 0u ? rt.bridge_next_send_ns : now_ns_steady());
+              const uint64_t target =
+                  base + (static_cast<uint64_t>(rt.bridge_ipg_ns) * static_cast<uint64_t>(sent));
+              bridge_wait_until_ns(target);
+              rt.bridge_next_send_ns = target;
+            }
+            cursor = (cursor + static_cast<uint32_t>(batch_count)) % static_cast<uint32_t>(rt.ring_slots);
+            continue;
+          }
+
           // No native sender backend available: preserve legacy noop drain for non-network test paths.
           if (!persistent_sync_queue_ring_window_to_host(rt, q, cursor, 1u)) {
             break;
@@ -5588,6 +6000,7 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
         host_u64_add(&rt.ctrl->ring_released, local_released);
       }
       if (worker == 0) {
+        persistent_contract_bridge_file_mirror_to_bar1(g_persistent_contract_runtime);
         const int occ = ring_occupancy_now(rt);
         if (static_cast<uint64_t>(occ) > rt.ctrl->ring_occupancy_peak) {
           rt.ctrl->ring_occupancy_peak = static_cast<uint64_t>(occ);
@@ -5953,13 +6366,20 @@ inline void persistent_runtime_release_unlocked() {
     (void)cudaFree(rt.queue_slot_hint_dev);
     rt.queue_slot_hint_dev = nullptr;
   }
-  if (rt.payload_host) {
-    (void)cudaFreeHost(rt.payload_host);
+  if (rt.bar1_unified_payload) {
+    rt.bar1_payload_arena.release();
     rt.payload_host = nullptr;
-  }
-  if (rt.payload_dev) {
-    (void)cudaFree(rt.payload_dev);
     rt.payload_dev = nullptr;
+    rt.bar1_unified_payload = false;
+  } else {
+    if (rt.payload_host) {
+      (void)cudaFreeHost(rt.payload_host);
+      rt.payload_host = nullptr;
+    }
+    if (rt.payload_dev) {
+      (void)cudaFree(rt.payload_dev);
+      rt.payload_dev = nullptr;
+    }
   }
   if (rt.doca_gpu_txq_handles_dev) {
     (void)cudaFree(rt.doca_gpu_txq_handles_dev);
@@ -6196,22 +6616,42 @@ inline bool persistent_runtime_ensure_started_unlocked() {
     return false;
   }
 
-  void* payload_host = nullptr;
   const size_t payload_bytes = ring_count * static_cast<size_t>(kPersistentUmemFrameSize);
-  if (cudaHostAlloc(&payload_host, payload_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
-      !payload_host) {
-    persistent_runtime_release_unlocked();
-    return false;
+  const std::string req_backend = lower_copy(env_string_or("SAMURAI_GPU_TX_BACKEND", "auto"));
+  const bool want_bar1_payload =
+      (req_backend == "geforce_p2p") || ddos_samurai::gpu_packet_cuda::bar1_p2p_output_enabled();
+  bool bar1_allocated = false;
+  if (want_bar1_payload) {
+    std::string bar1_err;
+    if (rt.bar1_payload_arena.allocate(payload_bytes, nullptr, 0u, bar1_err) &&
+        rt.bar1_payload_arena.host_bar1_ptr && rt.bar1_payload_arena.cuda_dev_ptr) {
+      rt.payload_host = rt.bar1_payload_arena.host_bar1_ptr;
+      rt.payload_dev = rt.bar1_payload_arena.cuda_dev_ptr;
+      rt.bar1_unified_payload = true;
+      (void)cudaMemset(rt.payload_dev, 0, payload_bytes);
+      bar1_allocated = true;
+    } else {
+      rt.bar1_payload_arena.release();
+      rt.bar1_unified_payload = false;
+    }
   }
-  rt.payload_host = static_cast<uint8_t*>(payload_host);
-  std::memset(rt.payload_host, 0, payload_bytes);
-  if (cudaMalloc(&rt.payload_dev, payload_bytes) != cudaSuccess || !rt.payload_dev) {
-    persistent_runtime_release_unlocked();
-    return false;
-  }
-  if (cudaMemset(rt.payload_dev, 0, payload_bytes) != cudaSuccess) {
-    persistent_runtime_release_unlocked();
-    return false;
+  if (!bar1_allocated) {
+    void* payload_host = nullptr;
+    if (cudaHostAlloc(&payload_host, payload_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+        !payload_host) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+    rt.payload_host = static_cast<uint8_t*>(payload_host);
+    std::memset(rt.payload_host, 0, payload_bytes);
+    if (cudaMalloc(&rt.payload_dev, payload_bytes) != cudaSuccess || !rt.payload_dev) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+    if (cudaMemset(rt.payload_dev, 0, payload_bytes) != cudaSuccess) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
   }
   if (!rt.bridge_copy_stream) {
     if (cudaStreamCreateWithFlags(&rt.bridge_copy_stream, cudaStreamNonBlocking) != cudaSuccess) {
@@ -7044,8 +7484,39 @@ extern "C" int samurai_gpu_packet_contract_read_hot_flow_v1(
     return set_c_api_error("contract runtime is not available");
   }
   auto& cr = g_persistent_contract_runtime;
+  persistent_contract_bridge_file_mirror_to_bar1(cr);
   if (flow_id >= static_cast<uint32_t>(cr.hot_flow_capacity)) {
     return set_c_api_error("flow_id exceeds contract hot-flow capacity");
+  }
+  if (cr.device_mirror_initialized && cr.export_region_host) {
+    PersistentContractRegionLayout layout{};
+    if (persistent_contract_region_layout(
+            static_cast<size_t>(cr.shard_count),
+            static_cast<size_t>(cr.ring_slots_per_shard),
+            static_cast<size_t>(cr.hot_flow_capacity),
+            &layout) &&
+        cr.export_region_bytes >= layout.total_bytes) {
+      const auto* hot = reinterpret_cast<const volatile ddos_samurai::gpu_packet_cuda::zero_copy::FlowUpdateEventV1*>(
+          persistent_contract_region_base(cr) + layout.hot_flow_table_off) + flow_id;
+      const uint64_t v = __atomic_load_n(&hot->version, __ATOMIC_ACQUIRE);
+      if (v > cr.hot_flow_versions[static_cast<size_t>(flow_id)] && (v & 1ull) == 0ull) {
+        auto& dst_ev = cr.hot_flow_table[static_cast<size_t>(flow_id)];
+        dst_ev.version = v;
+        dst_ev.epoch = hot->epoch;
+        dst_ev.flow_id = hot->flow_id;
+        dst_ev.tcp_seq = hot->tcp_seq;
+        dst_ev.tcp_ack = hot->tcp_ack;
+        dst_ev.src_port = hot->src_port;
+        dst_ev.dst_port = hot->dst_port;
+        dst_ev.tcp_state = hot->tcp_state;
+        dst_ev.proto = hot->proto;
+        dst_ev.flags = hot->flags;
+        dst_ev.rtt_us = hot->rtt_us;
+        dst_ev.dpu_ts_ns = hot->dpu_ts_ns;
+        cr.hot_flow_versions[static_cast<size_t>(flow_id)] = v;
+        cr.hot_flow_epochs[static_cast<size_t>(flow_id)] = dst_ev.epoch;
+      }
+    }
   }
   const auto& ev = cr.hot_flow_table[static_cast<size_t>(flow_id)];
   out_event->version = ev.version;
@@ -7570,6 +8041,8 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << (rt_active ? g_persistent_runtime.ctrl->tx_ownership_transitions : 0u) << ","
         << "\"compat_fallback_count\":" << g_compat_fallback_count.load(std::memory_order_relaxed) << ","
         << "\"persistent_tx_backend\":\"" << json_escape_string(g_persistent_runtime.tx_bridge.active) << "\","
+        << "\"bar1_unified_payload\":" << (g_persistent_runtime.bar1_unified_payload ? 1 : 0) << ","
+        << "\"bar1_phys_base\":" << g_persistent_runtime.bar1_payload_arena.bar1_phys_base << ","
         << "\"persistent_doca_kernel_direct_tx\":"
         << (g_persistent_runtime.doca_kernel_direct_tx ? 1 : 0) << ","
         << "\"persistent_bridge_threads_active\":" << g_persistent_runtime.bridge_threads.size() << ","
@@ -7595,6 +8068,10 @@ extern "C" const char* samurai_gpu_packet_read_stream_stats(int64_t stream_id) {
         << "\"contract_migration_events\":" << g_persistent_contract_runtime.migration_event_count << ","
         << "\"contract_device_mirror_active\":"
         << (g_persistent_contract_runtime.device_mirror_initialized ? 1 : 0) << ","
+        << "\"contract_bar1_p2p_active\":"
+        << (g_persistent_contract_runtime.bar1_contract_enabled ? 1 : 0) << ","
+        << "\"contract_bar1_phys_base\":"
+        << g_persistent_contract_runtime.bar1_contract_arena.bar1_phys_addr << ","
         << "\"contract_device_sync_error_events\":" << g_persistent_contract_runtime.device_sync_error_count
         << "}";
     g_stream_stats_json = oss.str();
@@ -7734,6 +8211,9 @@ extern "C" void samurai_gpu_packet_free(void* ptr) {
     header->pending_device_ptr = 0u;
   }
   const auto kind = static_cast<ExportHostAllocKind>(header->alloc_kind);
+  if (kind == ExportHostAllocKind::kVulkanBar1P2p) {
+    return;
+  }
   if (kind == ExportHostAllocKind::kCudaHost) {
     cudaFreeHost(static_cast<void*>(header));
     return;
@@ -7759,6 +8239,46 @@ extern "C" int samurai_gpu_packet_wait(void* ptr) {
     return set_c_api_error(std::string("samurai_gpu_packet_wait synchronize failed: ") + cudaGetErrorString(st));
   }
   header->pending_stream_handle = 0u;
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_p2p_bar1_available(void) {
+  auto& pool = ddos_samurai::gpu_packet_cuda::p2p::get_global_bar1_batch_pool();
+  std::string err;
+  if (!pool.ensure_capacity(65536u, err)) {
+    return 0;
+  }
+  return (pool.arena.host_bar1_ptr != nullptr && pool.arena.cuda_dev_ptr != nullptr) ? 1 : 0;
+}
+
+extern "C" int samurai_gpu_packet_p2p_get_arena_info(
+    uint64_t* out_bar1_phys,
+    void** out_host_ptr,
+    void** out_dev_ptr,
+    size_t* out_size) {
+  auto& pool = ddos_samurai::gpu_packet_cuda::p2p::get_global_bar1_batch_pool();
+  std::string err;
+  if (!pool.ensure_capacity(65536u, err)) {
+    return set_c_api_error("GlobalBar1BatchPool ensure_capacity failed: " + err);
+  }
+  std::lock_guard<std::mutex> lock(pool.mu);
+  if (out_bar1_phys) {
+    *out_bar1_phys = pool.arena.iommu_iova_base + ddos_samurai::gpu_packet_cuda::kVulkanBar1PayloadAlignment;
+  }
+  if (out_host_ptr) {
+    *out_host_ptr = static_cast<void*>(
+        pool.arena.host_bar1_ptr + ddos_samurai::gpu_packet_cuda::kVulkanBar1PayloadAlignment);
+  }
+  if (out_dev_ptr) {
+    *out_dev_ptr = static_cast<void*>(
+        pool.arena.cuda_dev_ptr + ddos_samurai::gpu_packet_cuda::kVulkanBar1PayloadAlignment);
+  }
+  if (out_size) {
+    *out_size = (pool.arena.arena_bytes > ddos_samurai::gpu_packet_cuda::kVulkanBar1PayloadAlignment)
+                    ? (pool.arena.arena_bytes - ddos_samurai::gpu_packet_cuda::kVulkanBar1PayloadAlignment)
+                    : 0u;
+  }
+  g_samurai_gpu_packet_last_error.clear();
   return 0;
 }
 
