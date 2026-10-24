@@ -126,6 +126,18 @@ TxResult send_batch(int64_t handle, uint16_t queue_id, const uint8_t* buf,
 // yapılarak tam paket memcpy yükü ortadan kaldırılır.
 bool prepopulate_tx_pool(int64_t handle, const uint8_t* template_pkt, uint16_t packet_size);
 
+// Harici GPU BAR1 / DMA bellek bölgesini DPDK alt sistemine (rte_extmem_register +
+// rte_dev_dma_map) kaydeder. PCIe P2P zero-copy dataplane için kullanılır.
+bool register_extmem_region(int64_t handle, void* vaddr, std::size_t len,
+                            uint64_t iova, uint32_t page_size, std::string& err);
+
+// Harici GPU BAR1 bellek dilimlerini rte_pktmbuf_attach_extbuf ile mbuf'lara
+// bağlayarak CPU DRAM kopyası olmadan doğrudan TX kuyruğuna gönderir.
+TxResult tx_burst_extbuf_zero_copy(int64_t handle, uint16_t queue_id,
+                                   void* bar1_base_vaddr, uint64_t bar1_base_iova,
+                                   std::size_t region_len, std::size_t offset,
+                                   uint16_t packet_size, uint16_t batch);
+
 // UDP hızlı-yol şablonunu yapılandır.
 bool configure_udp_flow(int64_t handle, const UdpFlowConfig& cfg, std::string& err);
 
