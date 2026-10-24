@@ -447,11 +447,18 @@ inline bool parse_contract_region_spec(
       std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
       });
-      if (k != "file" && k != "addr" && k != "rdma" && k != "doca_mmap" && k != "doca-mmap") {
+      if (k != "file" && k != "addr" && k != "rdma" && k != "doca_mmap" && k != "doca-mmap" &&
+          k != "bar1_p2p" && k != "bar1-p2p") {
         if (why) *why = "unknown contract region kind: " + value;
         return false;
       }
-      out->kind = (k == "doca-mmap") ? "doca_mmap" : k;
+      if (k == "doca-mmap") {
+        out->kind = "doca_mmap";
+      } else if (k == "bar1-p2p") {
+        out->kind = "bar1_p2p";
+      } else {
+        out->kind = k;
+      }
     } else if (key == "addr") {
       uint64_t addr = 0u;
       if (!parse_u64_text(value, &addr) || addr == 0u) {
@@ -505,6 +512,12 @@ inline bool parse_contract_region_spec(
         return false;
       }
       out->event_size = static_cast<size_t>(v);
+    } else if (key == "bar1_phys") {
+      uint64_t v = 0u;
+      if (!parse_u64_text(value, &v)) {
+        if (why) *why = "invalid contract bar1_phys value";
+        return false;
+      }
     } else {
       if (why) *why = "unknown contract region key: " + key;
       return false;
@@ -2425,7 +2438,8 @@ extern "C" int samurai_doca_backend_contract_writer_open(
     if (!register_contract_writer_doca_mmap(*writer, cfg->device_name, err, err_len)) {
       return -1;
     }
-  } else if (writer->region_kind != "file" && writer->region_kind != "addr" && writer->region_kind != "rdma") {
+  } else if (writer->region_kind != "file" && writer->region_kind != "addr" &&
+             writer->region_kind != "rdma" && writer->region_kind != "bar1_p2p") {
     write_err(err, err_len, "unsupported contract region kind");
     close_contract_writer_resources(*writer);
     return -1;
