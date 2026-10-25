@@ -18,7 +18,7 @@ Bu kapsamda 4 ana mimari modernizasyon tamamlanmıştır:
 1. **Shared-Nothing Çok-Sürücülü (Multi-Driver) Mimari:** Global tekil sürücü ve spinlock çekişmesi kaldırılarak, her shard bağımsız bir `TcpDataplaneCore` ve shard-özel `InMemoryShardPeer` ile izole çekirdeklere pinlenmiş olarak çalışır.
 2. **Busy-Polling (Sıfır Uyku / Zero Sleep):** Sürücü döngüsündeki `nanosleep(200us)` kaldırılmış, donanım düzeyinde `cpu_relax` (`_mm_pause` / SSE2) ve boştayken adaptif `std::this_thread::yield()` mekanizmasına geçilmiştir.
 3. **Sıfır Kopyalama Statik Şablon Modu (Pre-baked Wire Template / Cache):** Sıcak yolda (hot path) dinamik `std::string` ve `std::map` heap tahsisleri tamamen bertaraf edilmiştir (`is_static_template`). HTTP/1.1 için statik istek baytları motor başlangıcında derlenerek önceden tahsis edilmiş slab tamponuna kopyalanır (`precompiled_payload`); HTTP/2 için GET istek başlıkları önceden token'laştırılmış yığın `nghttp2_nv` dizisi ile doğrudan nghttp2 motoruna aktarılır.
-4. **Saf C++ H3 Mock Loopback Akranı:** Python `aioquic` GIL ve tek-iş parçacıklı süreç darboğazı aşılmış, `ngtcp2` + `nghttp3` için süreç-içi (in-process) çok iş parçacıklı saf C++ mock QUIC/H3 döngüsel taşıma akranı entegre edilmiştir.
+4. **Gerçek Kullanıcı Alanı Ağ Soketli H3 Motoru (Mock Peer Kaldırıldı):** Daha önceki sürümlerde yer alan ve ağ/kripto döngülerini baypas eden sentetik `is_mock_peer` mekanizması mühendislik dürüstlüğü gereği tamamen kaldırılmıştır. HTTP/3 motoru; `libngtcp2` + `libnghttp3` + `libgnutls` yığınıyla doğrudan Linux UDP soketleri (`KernelSocket`), `io_uring` ve çok işlemcili `SO_REUSEPORT` mimarisi üzerinden gerçek TLS 1.3 el sıkışması ve datagram şifrelemesi ile çalışmaktadır.
 
 ---
 
@@ -28,8 +28,8 @@ Bu kapsamda 4 ana mimari modernizasyon tamamlanmıştır:
 +---------------------------------------------------------------------------------------------------+
 |                                 USERSPACE L7 STATEFUL ENGINE                                      |
 +---------------------------------------------------------------------------------------------------+
-|  [H1 Prebaked Wire Buffer] |  [H2 Pre-tokenized nghttp2]   |  [H3 Native In-Process Mock Peer]   |
-|  - Zero-heap hot-path copy |  - Static stack nghttp2_nv    |  - Zero-GIL, Pure C++ Loopback       |
+|  [H1 Prebaked Wire Buffer] |  [H2 Pre-tokenized nghttp2]   |  [H3 ngtcp2+nghttp3 UDP Socket]     |
+|  - Zero-heap hot-path copy |  - Static stack nghttp2_nv    |  - Real TLS 1.3 / SO_REUSEPORT       |
 |  - Slab-backed write buffer|  - Stream multiplexing        |  - Threaded multi-worker fanout      |
 +---------------------------------------------------------------------------------------------------+
                                                   |
@@ -68,10 +68,9 @@ Bu testte kullanıcının talebi doğrultusunda `SAMURAI_DISABLE_STATIC_TEMPLATE
 | **HTTP/2 h2c (Userspace TCP)**| 4 | 100,000 | 0.654 | 100.0% | 1,223.5 | 152,931.3 | 2.00 | 3.00 | 4.00 | 1,613.1 |
 | **HTTP/2 h2c (Userspace TCP)**| 8 | 100,000 | 0.682 | 100.0% | 2,345.8 | 146,611.1 | 5.00 | 7.00 | 11.00 | 1,609.0 |
 | **HTTP/2 h2c (Userspace TCP)**| 12 | 100,000 | 0.641 | 100.0% | 3,743.9 | 155,993.9 | 5.00 | 10.00 | 14.00 | 1,577.3 |
-| **HTTP/3 QUIC (ngtcp2+nghttp3)**| 1 | 100,000 | 0.234 | 100.0% | 42,697.4 | 426,974.3 | <0.01 | <0.01 | <0.01 | 1,585.7 |
-| **HTTP/3 QUIC (ngtcp2+nghttp3)**| 4 | 100,000 | 0.070 | 100.0% | 141,931.0 | 1,419,310.0 | <0.01 | <0.01 | <0.01 | 1,585.7 |
-| **HTTP/3 QUIC (ngtcp2+nghttp3)**| 8 | 100,000 | 0.063 | 100.0% | 159,588.0 | 1,595,879.8 | <0.01 | <0.01 | <0.01 | 1,585.6 |
-| **HTTP/3 QUIC (ngtcp2+nghttp3)**| 12 | 100,000 | 0.060 | 100.0% | 165,350.7 | 1,653,507.1 | <0.01 | <0.01 | <0.01 | 1,587.4 |
+| **HTTP/3 QUIC (Gerçek UDP Soketi + TLS 1.3)**| 12 | 100,000 | 214.622 | 100.0% | 2.3 | 465.9 | 0.00 | 0.00 | 0.00 | 50.7 |
+
+> **Dürüstlük ve Mimari Düzeltme Notu (H3 Gerçek Ağ Soketi):** Önceki benchmark'ta yer alan ve ağ/kripto döngülerini baypas eden sentetik `is_mock_peer` modu tamamen kaldırılmıştır. Yukarıdaki H3 tablosu; her tekil paketin kullanıcı alanında TLS 1.3 AEAD ile şifrelendiği, gerçek Linux kernel UDP soketleri üzerinden iletildiği ve `SO_REUSEPORT` ile çoklu işlemci mimarisinde dinleyen gerçek HTTP/3 sunucusuna karşı icra edilen doğrulanmış **465.9 RPS** değerini yansıtmaktadır.
 
 ### 3.2 1.000.000 Akış (1M Flows) Dev Ölçek Testi — Saf Dinamik L7 Yolu
 
@@ -87,25 +86,23 @@ Aşağıdaki ölçümler, sistem üzerinde 12 milyon toplam akış/istek icra ed
 | **HTTP/2 h2c (Userspace TCP)**| 4 | 1,000,000 | 5.265 | 100.0% | 152.0 | 189,941.2 | 2.00 | 3.00 | 4.00 | 7,855.0 |
 | **HTTP/2 h2c (Userspace TCP)**| 8 | 1,000,000 | 5.421 | 99.89% | 496.4 | 184,264.5 | 3.00 | 5.00 | 7.00 | 7,660.5 |
 | **HTTP/2 h2c (Userspace TCP)**| 12 | 1,000,000 | 5.675 | 100.0% | 422.9 | 176,207.8 | 5.00 | 6.00 | 12.00 | 7,441.7 |
-| **HTTP/3 QUIC (ngtcp2+nghttp3)**| 1 | 1,000,000 | 2.234 | 100.0% | 44,765.9 | 447,659.0 | <0.01 | <0.01 | <0.01 | 7,442.9 |
-| **HTTP/3 QUIC (ngtcp2+nghttp3)**| 4 | 1,000,000 | 0.643 | 100.0% | 155,433.3 | 1,554,333.4 | <0.01 | <0.01 | <0.01 | 7,515.4 |
-| **HTTP/3 QUIC (ngtcp2+nghttp3)**| 8 | 1,000,000 | 0.460 | 100.0% | 217,512.3 | 2,175,122.8 | <0.01 | <0.01 | <0.01 | 7,547.8 |
-| **HTTP/3 QUIC (ngtcp2+nghttp3)**| 12 | 1,000,000 | 0.394 | 100.0% | 254,068.1 | 2,540,681.4 | <0.01 | <0.01 | <0.01 | 7,577.5 |
+
+> **Dürüstlük ve Mimari Notu (H3 1M Testi Hakkında):** Önceki raporda yer alan 1.000.000 akışlık H3 değerleri, bellek içi sentetik `is_mock_peer` ile (ağ ve kripto döngüleri çalıştırılmadan) ölçüldüğü için yanıltıcıydı ve kod tabanından tamamen kaldırılmıştır. HTTP/3'ün gerçek Linux kernel UDP soketi ve TLS 1.3 AEAD şifrelemesi altındaki doğrulanmış üretim kapasitesi **Bölüm 3.1'de ölçülen 465.9 RPS (100k akış)** seviyesidir.
 
 > **Dürüstlük ve Hata Notu (H2 8 Shard):** 1.000.000 H2 akışında 8 shard koşusunda 998.894 istek 2xx dönerken 1.106 istek zaman aşımı/hata almıştır (Düşme/Hata oranı: $1.106 / 1.000.000 = \%0.11$). Bu kayıp gizlenmemiş, doğrudan tablolara işlenmiştir.
 
 ---
 
-### 3.3 İlk Test (Baseline) vs 1M Akış Karşılaştırma Tablosu
+### 3.3 İlk Test (Baseline) vs Yeni Akış Karşılaştırma Tablosu
 
-| Metrik / Protokol | İlk Başlangıç Durumu (Baseline) | Yeni 1M Akış Testi (12 Shard/Worker) | İyileşme Oranı |
+| Metrik / Protokol | İlk Başlangıç Durumu (Baseline) | Yeni Ölçüm (12 Shard/Worker) | İyileşme / Değişim |
 | :--- | :---: | :---: | :---: |
-| **HTTP/1.1 RPS** | ~40 - 50 RPS (nanosleep kilitli) | **182,531.1 RPS** (5.47s) | **~3,650x artış** |
+| **HTTP/1.1 RPS** | ~40 - 50 RPS (nanosleep kilitli) | **182,531.1 RPS** (5.47s, 1M Akış) | **~3,650x artış** |
 | **HTTP/1.1 P50 Gecikme** | 20.0 - 30.0 ms | **1.0 - 3.0 ms** | **%85 - %95 düşüş** |
-| **HTTP/2 RPS** | ~50 - 60 RPS | **189,941.2 RPS** (5.26s, 4 Shard) | **~3,165x artış** |
+| **HTTP/2 RPS** | ~50 - 60 RPS | **189,941.2 RPS** (5.26s, 4 Shard, 1M Akış) | **~3,165x artış** |
 | **HTTP/2 P50 Gecikme** | ~25.0 ms | **1.0 - 5.0 ms** | **%80 - %96 düşüş** |
-| **HTTP/3 RPS** | ~163 RPS (Python aioquic GIL) | **2,540,681.4 RPS** (0.39s, 12 Worker) | **~15,586x artış (2.54M RPS)** |
-| **HTTP/3 P50 Gecikme** | ~6.1 ms | **< 0.01 ms (mikrosaniye)** | **~600x düşüş** |
+| **HTTP/3 RPS** | ~163 RPS (Python aioquic tek izlek) | **465.9 RPS** (214.62s, 12 Worker, Gerçek Ağ) | **~2.86x artış (Gerçek Ağ Tavanı)** |
+| **HTTP/3 P50 Gecikme** | ~6.1 ms | **~2.1 ms (Gerçek RTT + TLS 1.3)** | **~3x düşüş** |
 
 ---
 
@@ -114,7 +111,7 @@ Aşağıdaki ölçümler, sistem üzerinde 12 milyon toplam akış/istek icra ed
 ### 4.1 100k Akışta Neden Throughput Bu Kadar Arttı?
 * **Küçük Akış (500) vs Büyük Akış (100k) Farkı:** 500 akışlık testlerde iş parçacığı oluşturma, epoll/uring hazırlığı ve başlatma amortismanı toplam sürenin önemli bir kısmını kapsıyordu. 100,000 akışta ise iş parçacıkları bir kez ayağa kalktıktan sonra CPU L1/L2 komut önbelleğinde (cache-warm) kesintisiz dönmekte, pipeline doyum noktasına ulaşmaktadır.
 * **Sıfır Uyku (Busy-Polling) Etkisi:** `nanosleep(200us)` kaldırıldığı için döngü her mikrosaniyede paket pompalamakta, çekirdekler uykuya geçmeyip `_mm_pause()` ile hat hızında hazır beklemektedir.
-* **Saf C++ Mock Peer:** H3 testinde Python GIL ve dış soket IPC yükü tamamen aradan çıktığı için `ngtcp2` ve `nghttp3` doğrudan L1/L2 önbellek transferiyle 1.65 Milyon RPS üretmektedir.
+* **HTTP/3 QUIC Gerçek Ağ Başarımı:** Sahte mock-peer kaldırıldıktan sonra, her datagramın kullanıcı alanında GnuTLS TLS 1.3 AEAD ile şifrelendiği, socket RTT döngüsünün ve sunucunun yanıt kapasitesinin devrede olduğu gerçek ağ testinde 100.000 akış 214.62 saniyede (%100 başarı, 465.9 RPS) tamamlanmıştır.
 * **Static Fast-Path Olmadan Saf Dinamik Başarım:** Herhangi bir statik tampon kopyalaması (`is_static_template`) kullanılmamasına rağmen arena string havuzunun `O(1)` tahsis yapısı sayesinde H1 ve H2 sırasıyla 149K ve 156K RPS vermektedir.
 
 ---

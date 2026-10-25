@@ -597,13 +597,14 @@ BenchMetricResult BenchmarkH3(int concurrency, int requests, int h3_port) {
 
   ddos_samurai::l7_emu_native::Profile profile;
   profile.protocol = "quic";
-  if (h3_port == 0) {
-    profile.transport_backend = "in_memory";
-    profile.target_port = 0;
-  } else {
-    profile.transport_backend = "kernel_socket";
-    profile.target_port = h3_port;
+  if (h3_port <= 0) {
+    std::fprintf(stderr, "[ERROR] BenchmarkH3 requires an active HTTP/3 server port (h3_port > 0). Mock peer removed.\n");
+    res.duration_sec = 0.001;
+    res.errors = requests;
+    return res;
   }
+  profile.transport_backend = "kernel_socket";
+  profile.target_port = h3_port;
   profile.stateful_runtime_backend = "kernel";
   profile.target_ip = "127.0.0.1";
   profile.scheme = "https";
@@ -613,6 +614,9 @@ BenchMetricResult BenchmarkH3(int concurrency, int requests, int h3_port) {
   profile.timeout_ms = 8000;
   profile.max_connections = concurrency;
   profile.max_streams_per_connection = 10;
+  if (const char* sm = std::getenv("SAMURAI_QUIC_STREAMS_PER_CONN"); sm != nullptr && sm[0] != '\0') {
+    profile.max_streams_per_connection = std::max(1, std::atoi(sm));
+  }
   profile.flow_attempted = requests;
 
   ddos_samurai::l7_emu_native::FlowOp op;
@@ -799,9 +803,8 @@ int main(int argc, char** argv) {
 
   // 3) HTTP/3 Benchmarks
   if (proto == "all" || proto == "h3" || proto == "http3" || proto == "quic") {
-    std::printf("\n--- Running L7 H3 Stateful Userspace Benchmarks (%s) ---\n",
-                h3_port > 0 ? ("port " + std::to_string(h3_port)).c_str() : "in-memory pure C++ mock peer");
-    std::vector<int> h3_concurrency = {1, 4, 8, 12};
+    std::printf("\n--- Running L7 H3 Stateful Userspace Benchmarks (real network port %d) ---\n", h3_port);
+    std::vector<int> h3_concurrency = concurrency_levels;
     int h3_requests = base_flows;
     for (int conc : h3_concurrency) {
       std::printf("[H3] Testing workers=%d requests=%d...\n", conc, h3_requests);

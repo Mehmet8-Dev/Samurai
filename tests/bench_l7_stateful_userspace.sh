@@ -33,10 +33,15 @@ usage() {
 }
 
 PROTO="all"
+EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --flows)
       BASE_FLOWS="$2"
+      shift 2
+      ;;
+    --concurrency)
+      EXTRA_ARGS+=("--concurrency" "$2")
       shift 2
       ;;
     --quick)
@@ -82,31 +87,26 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [[ "$PROTO" == "all" || "$PROTO" == "h3" || "$PROTO" == "http3" || "$PROTO" == "quic" ]]; then
-  if [[ "${SAMURAI_H3_USE_PYTHON_SERVER:-0}" == "1" ]]; then
-    SRV_OUT="$(mktemp)"
-    python3 "$ROOT_DIR/ddos_samurai/l7_emu_native/test_h3_server.py" >"$SRV_OUT" 2>&1 &
-    SRV_PID=$!
+  echo "[SETUP] Launching real HTTP/3 server (aioquic multi-worker) for authentic network benchmarks..."
+  SRV_OUT="$(mktemp)"
+  H3_SERVER_WORKERS="${H3_SERVER_WORKERS:-6}" python3 "$ROOT_DIR/ddos_samurai/l7_emu_native/test_h3_server.py" >"$SRV_OUT" 2>&1 &
+  SRV_PID=$!
 
-    for _ in $(seq 1 100); do
-      H3_PORT=$(sed -n "s/^PORT //p" "$SRV_OUT" 2>/dev/null | head -1 || true)
-      [[ -n "$H3_PORT" ]] && break
-      sleep 0.05
-    done
-    rm -f "$SRV_OUT"
+  for _ in $(seq 1 100); do
+    H3_PORT=$(sed -n "s/^PORT //p" "$SRV_OUT" 2>/dev/null | head -1 || true)
+    [[ -n "$H3_PORT" ]] && break
+    sleep 0.05
+  done
+  rm -f "$SRV_OUT"
 
-    if [[ -z "$H3_PORT" || "$H3_PORT" -eq 0 ]]; then
-      echo "[INFO] Fallback to native C++ in-process H3 mock peer"
-      H3_PORT=0
-    else
-      echo "[INFO] Real Python H3 Server running on 127.0.0.1:$H3_PORT (pid $SRV_PID)"
-    fi
-  else
-    echo "[INFO] Using native C++ in-process H3 mock loopback peer (Zero-GIL, multi-threaded)"
-    H3_PORT=0
+  if [[ -z "$H3_PORT" || "$H3_PORT" -eq 0 ]]; then
+    echo "[ERROR] Real HTTP/3 server failed to launch! Mock peer is disabled." >&2
+    exit 1
   fi
+  echo "[INFO] Real Python H3 Server running on 127.0.0.1:$H3_PORT (pid $SRV_PID)"
 fi
 
 echo "[EXEC] Running bench_l7_stateful_userspace (proto=$PROTO, flows=$BASE_FLOWS, h3_port=$H3_PORT)..."
-"$BENCH_BIN" --proto "$PROTO" --flows "$BASE_FLOWS" --h3-port "$H3_PORT" --json "$JSON_OUT"
+"$BENCH_BIN" --proto "$PROTO" --flows "$BASE_FLOWS" --h3-port "$H3_PORT" --json "$JSON_OUT" "${EXTRA_ARGS[@]}"
 
 echo "[DONE] Benchmark completed successfully. Raw metrics exported to $JSON_OUT"

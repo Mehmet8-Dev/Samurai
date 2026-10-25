@@ -10,10 +10,15 @@ Prints `PORT <n>` on the first stdout line so the test harness can read the port
 """
 import asyncio
 import datetime
+import multiprocessing
+import os
+import signal
+import socket
 import sys
 
 from aioquic.asyncio import serve
 from aioquic.asyncio.protocol import QuicConnectionProtocol
+from aioquic.asyncio.server import QuicServer
 from aioquic.h3.connection import H3Connection
 from aioquic.h3.events import HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
@@ -29,7 +34,7 @@ BODY = b"hi"
 def self_signed():
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
@@ -67,28 +72,82 @@ class H3Server(QuicConnectionProtocol):
         self.transmit()
 
 
-async def main() -> int:
-    # Optional argv: [host [port]]. Defaults to an ephemeral loopback port (the
-    # kernel-socket harness). The af_packet veth harness passes the veth server IP
-    # and a fixed port so the native af_packet QUIC wire can target it.
+def _run_reuseport_worker(host: str, port: int, cert, key):
+    async def worker_main():
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock.bind((host, port))
+        sock.setblocking(False)
+        config = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
+        config.certificate = cert
+        config.private_key = key
+        transport, proto = await loop.create_datagram_endpoint(
+            lambda: QuicServer(configuration=config, create_protocol=H3Server),
+            sock=sock,
+        )
+        await asyncio.Future()
+
+    try:
+        asyncio.run(worker_main())
+    except KeyboardInterrupt:
+        pass
+
+
+def main() -> int:
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     port_arg = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    num_workers = int(os.environ.get("H3_SERVER_WORKERS", "1"))
+    if len(sys.argv) > 3:
+        num_workers = int(sys.argv[3])
 
     cert, key = self_signed()
-    config = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
-    config.certificate = cert
-    config.private_key = key
 
-    server = await serve(host, port_arg, configuration=config, create_protocol=H3Server)
-    # aioquic's serve() returns a QuicServer whose _transport holds the bound socket.
-    port = server._transport.get_extra_info("sockname")[1]
-    print(f"PORT {port}", flush=True)
-    await asyncio.Future()  # run forever
-    return 0
+    if num_workers > 1:
+        bind_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        bind_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        bind_sock.bind((host, port_arg))
+        port = bind_sock.getsockname()[1]
+        bind_sock.close()
+
+        workers = []
+        for _ in range(num_workers):
+            p = multiprocessing.Process(
+                target=_run_reuseport_worker, args=(host, port, cert, key)
+            )
+            p.daemon = True
+            p.start()
+            workers.append(p)
+
+        print(f"PORT {port}", flush=True)
+
+        def sig_handler(sig, frame):
+            for p in workers:
+                p.terminate()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, sig_handler)
+        signal.signal(signal.SIGTERM, sig_handler)
+
+        for p in workers:
+            p.join()
+        return 0
+    else:
+        async def single_main():
+            config = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
+            config.certificate = cert
+            config.private_key = key
+            server = await serve(host, port_arg, configuration=config, create_protocol=H3Server)
+            port = server._transport.get_extra_info("sockname")[1]
+            print(f"PORT {port}", flush=True)
+            await asyncio.Future()
+
+        try:
+            asyncio.run(single_main())
+        except KeyboardInterrupt:
+            pass
+        return 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(asyncio.run(main()))
-    except KeyboardInterrupt:
-        pass
+    sys.exit(main())
