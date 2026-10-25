@@ -652,17 +652,29 @@ BenchMetricResult BenchmarkH3(int concurrency, int requests, int h3_port) {
   res.sent = static_cast<std::uint64_t>(get_val("quic_requests_sent"));
   res.status_2xx = static_cast<std::uint64_t>(get_val("quic_responses_received"));
   res.errors = static_cast<std::uint64_t>(get_val("quic_errors"));
+  res.tx_packets = static_cast<std::uint64_t>(get_val("quic_tx_datagrams"));
+  res.rx_frames = static_cast<std::uint64_t>(get_val("quic_rx_datagrams"));
+  res.tx_mbytes = get_val("l7_tx_bytes") / (1024.0 * 1024.0);
+  res.rx_mbytes = get_val("l7_rx_bytes") / (1024.0 * 1024.0);
 
   res.cps = get_val("quic_connection_success") / res.duration_sec;
   res.rps = static_cast<double>(res.status_2xx) / res.duration_sec;
 
-  // Latencies from scenario step results
+  // Latencies from scenario step results or QUIC stream latency percentiles
   auto step_results = ddos_samurai::l7_emu_native::consume_last_scenario_step_results();
   std::vector<double> latencies;
   for (const auto& step : step_results) {
     latencies.push_back(step.latency_ms);
   }
-  res.latency = ComputeLatencyStats(latencies);
+  if (!latencies.empty()) {
+    res.latency = ComputeLatencyStats(latencies);
+  } else {
+    res.latency.p50_ms = get_val("latency_p50_ms");
+    res.latency.p95_ms = get_val("latency_p95_ms");
+    res.latency.p99_ms = get_val("latency_p99_ms");
+    res.latency.max_ms = get_val("quic_scenario_step_latency_ms_max");
+    res.latency.avg_ms = get_val("quic_scenario_step_latency_ms_avg");
+  }
 
   return res;
 }
@@ -758,7 +770,7 @@ int main(int argc, char** argv) {
       concurrency_levels = {std::atoi(argv[++i])};
     } else if (arg == "--h3-port" && i + 1 < argc) {
       h3_port = std::atoi(argv[++i]);
-    } else if (arg == "--json" && i + 1 < argc) {
+    } else if ((arg == "--json" || arg == "--json-out") && i + 1 < argc) {
       json_path = argv[++i];
     }
   }

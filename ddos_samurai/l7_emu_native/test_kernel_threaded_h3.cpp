@@ -19,6 +19,7 @@
 #include <string>
 
 #include "engine.hpp"
+#include "custom_quic_stack/quic_cuda_crypto.hpp"
 
 namespace {
 
@@ -101,6 +102,13 @@ void AssertHealthy(const char* label, const std::map<std::string, double>& out, 
 }  // namespace
 
 int main() {
+  // (0) RFC 9001 Appendix A.1 + AEAD + HP mask CUDA/CPU crypto self-test.
+  CHECK(ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_crypto_selftest(),
+        "quic_cuda_crypto_selftest failed (RFC 9001 Appendix A.1 / AEAD mismatch)");
+  std::printf(
+      "[cuda_crypto] available=%d selftest=PASS\n",
+      ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_crypto_available() ? 1 : 0);
+
   const char* port_env = std::getenv("H3_TEST_PORT");
   if (port_env == nullptr || *port_env == '\0') {
     std::printf("FAIL: H3_TEST_PORT not set (harness must start test_h3_server.py)\n");

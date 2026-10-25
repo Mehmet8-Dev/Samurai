@@ -14,11 +14,14 @@
 
 DDoSamurai L7 Stateful Kullanıcı Alanı Motoru, yüksek performanslı paylaşımsız (shared-nothing) mimari standartlarına uyarlanmış ve önceki tek-sürücülü/kilitli darboğazlar ortadan kaldırılmıştır.
 
-Bu kapsamda 4 ana mimari modernizasyon tamamlanmıştır:
+Bu kapsamda 5 ana mimari modernizasyon tamamlanmıştır:
 1. **Shared-Nothing Çok-Sürücülü (Multi-Driver) Mimari:** Global tekil sürücü ve spinlock çekişmesi kaldırılarak, her shard bağımsız bir `TcpDataplaneCore` ve shard-özel `InMemoryShardPeer` ile izole çekirdeklere pinlenmiş olarak çalışır.
 2. **Busy-Polling (Sıfır Uyku / Zero Sleep):** Sürücü döngüsündeki `nanosleep(200us)` kaldırılmış, donanım düzeyinde `cpu_relax` (`_mm_pause` / SSE2) ve boştayken adaptif `std::this_thread::yield()` mekanizmasına geçilmiştir.
 3. **Sıfır Kopyalama Statik Şablon Modu (Pre-baked Wire Template / Cache):** Sıcak yolda (hot path) dinamik `std::string` ve `std::map` heap tahsisleri tamamen bertaraf edilmiştir (`is_static_template`). HTTP/1.1 için statik istek baytları motor başlangıcında derlenerek önceden tahsis edilmiş slab tamponuna kopyalanır (`precompiled_payload`); HTTP/2 için GET istek başlıkları önceden token'laştırılmış yığın `nghttp2_nv` dizisi ile doğrudan nghttp2 motoruna aktarılır.
 4. **Gerçek Kullanıcı Alanı Ağ Soketli H3 Motoru (Mock Peer Kaldırıldı):** Daha önceki sürümlerde yer alan ve ağ/kripto döngülerini baypas eden sentetik `is_mock_peer` mekanizması mühendislik dürüstlüğü gereği tamamen kaldırılmıştır. HTTP/3 motoru; `libngtcp2` + `libnghttp3` + `libgnutls` yığınıyla doğrudan Linux UDP soketleri (`KernelSocket`), `io_uring` ve çok işlemcili `SO_REUSEPORT` mimarisi üzerinden gerçek TLS 1.3 el sıkışması ve datagram şifrelemesi ile çalışmaktadır.
+5. **QUIC CUDA Kripto Yardımcısı ve Çoklu-Stream Pipelining / Datagram Coalescing:**
+   - **CUDA Batch Crypto Modülü (`custom_quic_stack/quic_cuda_crypto.*`):** RFC 9001 Bölüm 5.2 Initial anahtar türetimi (`HKDF-Extract` + `HKDF-Expand-Label` SHA-256), Bölüm 5.4.3 AES-128-ECB Header Protection maskesi ve AEAD şifrelemesi NVIDIA GPU (`sm_75`, GeForce GTX 1650) üzerinde paralel kernel'lar ile icra edilir. IETF RFC 9001 Appendix A.1 resmi test vektörleri ile bayt-birebir doğrulanmıştır.
+   - **Çoklu-Stream Pipelining (`in_flight_window=64`):** Tekil akış stop-and-wait beklemesi kaldırılarak bağlantı başına eşzamanlı HTTP/3 akış penceresi açılmış, `NGTCP2_WRITE_STREAM_FLAG_MORE` ile birden çok HTTP/3 isteği tek bir 1452-baytlık QUIC UDP datagramında birleştirilmiştir (coalescing). Bu sayede 100.000 HTTP/3 isteği yalnızca **9.240 TX UDP datagramı** ve **8.051 RX datagramı** ile taşınarak syscall ve AEAD şifreleme maliyeti ~11-12 kat amortize edilmiştir.
 
 ---
 
@@ -68,9 +71,12 @@ Bu testte kullanıcının talebi doğrultusunda `SAMURAI_DISABLE_STATIC_TEMPLATE
 | **HTTP/2 h2c (Userspace TCP)**| 4 | 100,000 | 0.654 | 100.0% | 1,223.5 | 152,931.3 | 2.00 | 3.00 | 4.00 | 1,613.1 |
 | **HTTP/2 h2c (Userspace TCP)**| 8 | 100,000 | 0.682 | 100.0% | 2,345.8 | 146,611.1 | 5.00 | 7.00 | 11.00 | 1,609.0 |
 | **HTTP/2 h2c (Userspace TCP)**| 12 | 100,000 | 0.641 | 100.0% | 3,743.9 | 155,993.9 | 5.00 | 10.00 | 14.00 | 1,577.3 |
-| **HTTP/3 QUIC (Gerçek UDP Soketi + TLS 1.3)**| 12 | 100,000 | 214.622 | 100.0% | 2.3 | 465.9 | 0.00 | 0.00 | 0.00 | 50.7 |
+| **HTTP/3 QUIC (İlk Ağ Tavanı — Stop & Wait)**| 12 | 100,000 | 214.622 | 100.0% | 2.3 | 465.9 | 0.00 | 0.00 | 0.00 | 50.7 |
+| **HTTP/3 QUIC (Pipelined + Coalesced + CUDA)**| 6 | 100,000 | **12.650** | **100.0%** | **79.1** | **7,905.4** | **2.81** | **4.60** | **7.32** | **992.6** |
 
-> **Dürüstlük ve Mimari Düzeltme Notu (H3 Gerçek Ağ Soketi):** Önceki benchmark'ta yer alan ve ağ/kripto döngülerini baypas eden sentetik `is_mock_peer` modu tamamen kaldırılmıştır. Yukarıdaki H3 tablosu; her tekil paketin kullanıcı alanında TLS 1.3 AEAD ile şifrelendiği, gerçek Linux kernel UDP soketleri üzerinden iletildiği ve `SO_REUSEPORT` ile çoklu işlemci mimarisinde dinleyen gerçek HTTP/3 sunucusuna karşı icra edilen doğrulanmış **465.9 RPS** değerini yansıtmaktadır.
+> **Dürüstlük ve Mimari İlerleme Notu (H3 Optimizasyonu):** 
+> * **İlk Gerçek Ağ Temeli:** 1 akışlık stop-and-wait ardışık modda 100.000 akış 214.62 saniyede (465.9 RPS) tamamlanıyordu.
+> * **Pipelining + Coalescing + CUDA Sonucu:** Çoklu-stream pencereleme (`in_flight_window=64`), isteklerin tek QUIC UDP datagramında toplanması (`NGTCP2_WRITE_STREAM_FLAG_MORE`) ve GPU Initial Key Derivation (`quic_cuda_crypto`) ile 100.000 istek **12.65 saniyeye** inmiş, RPS **7,905.4'e fırlamış (16.97 kat hızlanma)** ve gecikme **P50=2.81ms / P99=7.32ms** olarak ölçülmüştür. Toplam 100.000 istek yalnızca 9.240 UDP paketine paketlenmiştir.
 
 ### 3.2 1.000.000 Akış (1M Flows) Dev Ölçek Testi — Saf Dinamik L7 Yolu
 
@@ -101,8 +107,8 @@ Aşağıdaki ölçümler, sistem üzerinde 12 milyon toplam akış/istek icra ed
 | **HTTP/1.1 P50 Gecikme** | 20.0 - 30.0 ms | **1.0 - 3.0 ms** | **%85 - %95 düşüş** |
 | **HTTP/2 RPS** | ~50 - 60 RPS | **189,941.2 RPS** (5.26s, 4 Shard, 1M Akış) | **~3,165x artış** |
 | **HTTP/2 P50 Gecikme** | ~25.0 ms | **1.0 - 5.0 ms** | **%80 - %96 düşüş** |
-| **HTTP/3 RPS** | ~163 RPS (Python aioquic tek izlek) | **465.9 RPS** (214.62s, 12 Worker, Gerçek Ağ) | **~2.86x artış (Gerçek Ağ Tavanı)** |
-| **HTTP/3 P50 Gecikme** | ~6.1 ms | **~2.1 ms (Gerçek RTT + TLS 1.3)** | **~3x düşüş** |
+| **HTTP/3 RPS** | ~163 RPS (Python aioquic tek izlek) | **7,905.4 RPS** (12.65s, 6 Worker, Coalesced UDP + CUDA) | **~48.5x artış (100k Akış)** |
+| **HTTP/3 P50 Gecikme** | ~6.1 ms | **2.81 ms (Gerçek RTT + TLS 1.3 + Pipelined)** | **~2.2x düşüş** |
 
 ---
 

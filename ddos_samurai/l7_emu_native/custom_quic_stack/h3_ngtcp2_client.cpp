@@ -41,6 +41,7 @@
 #include "../../xdp/xdp_native_api.h"
 #include "../../dpdk/dpdk_core.hpp"
 #include "../engine_internal.hpp"
+#include "quic_cuda_crypto.hpp"
 
 #if defined(SAMURAI_WITH_NGTCP2) && defined(SAMURAI_WITH_GNUTLS) && defined(SAMURAI_WITH_NGTCP2_GNUTLS) && defined(SAMURAI_WITH_NGHTTP3)
 #include <gnutls/crypto.h>
@@ -112,6 +113,18 @@ struct FlowControlGuardPolicy {
   int blocked_streak_budget{12};
   int blocked_window_ms{200};
   bool fast_fail{true};
+};
+
+struct PipelinedStreamState {
+  int64_t stream_id{-1};
+  uint64_t start_ns{0};
+  std::size_t req_body_off{0};
+  int response_status{0};
+  bool response_headers_seen{false};
+  bool response_complete{false};
+  bool has_body_data{false};
+  std::string response_headers{};
+  std::string response_body{};
 };
 
 enum class QuicUdpIoBackend {
@@ -265,6 +278,14 @@ struct Ngtcp2AttemptCtx {
   bool tls_session_resumed{false};
   bool tls_early_data_accepted{false};
   bool tls_session_ticket_received{false};
+  bool has_precomputed_cids{false};
+  std::array<uint8_t, 8> precomputed_dcid{};
+  std::array<uint8_t, 8> precomputed_scid{};
+  QuicInitialKeyMaterial precomputed_initial_keys{};
+  bool pipelined_mode{false};
+  std::unordered_map<int64_t, PipelinedStreamState> active_streams{};
+  std::vector<PipelinedStreamState> completed_streams{};
+  std::vector<double> stream_latencies_ms{};
 };
 
 struct TlsSessionCache {
@@ -2229,19 +2250,25 @@ nghttp3_ssize read_data_cb(
     void* conn_user_data,
     void* stream_user_data) {
   (void)conn;
-  (void)stream_id;
   (void)stream_user_data;
   auto* ctx = static_cast<Ngtcp2AttemptCtx*>(conn_user_data);
   if (ctx == nullptr || vec == nullptr || veccnt == 0 || pflags == nullptr) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
-  if (ctx->req_body_off >= ctx->request.body.size()) {
+  std::size_t* body_off_ptr = &ctx->req_body_off;
+  if (ctx->pipelined_mode) {
+    auto it = ctx->active_streams.find(stream_id);
+    if (it != ctx->active_streams.end()) {
+      body_off_ptr = &it->second.req_body_off;
+    }
+  }
+  if (*body_off_ptr >= ctx->request.body.size()) {
     *pflags |= NGHTTP3_DATA_FLAG_EOF;
     return 0;
   }
-  vec[0].base = reinterpret_cast<uint8_t*>(ctx->request.body.data() + ctx->req_body_off);
-  vec[0].len = ctx->request.body.size() - ctx->req_body_off;
-  ctx->req_body_off = ctx->request.body.size();
+  vec[0].base = reinterpret_cast<uint8_t*>(ctx->request.body.data() + *body_off_ptr);
+  vec[0].len = ctx->request.body.size() - *body_off_ptr;
+  *body_off_ptr = ctx->request.body.size();
   *pflags |= NGHTTP3_DATA_FLAG_EOF;
   return 1;
 }
@@ -2270,7 +2297,19 @@ int http_stream_close_cb(
   (void)app_error_code;
   (void)stream_user_data;
   auto* ctx = static_cast<Ngtcp2AttemptCtx*>(conn_user_data);
-  if (ctx != nullptr && stream_id == ctx->request_stream_id) {
+  if (ctx == nullptr) {
+    return 0;
+  }
+  if (ctx->pipelined_mode) {
+    auto it = ctx->active_streams.find(stream_id);
+    if (it != ctx->active_streams.end()) {
+      it->second.response_complete = true;
+      ctx->completed_streams.push_back(std::move(it->second));
+      ctx->active_streams.erase(it);
+    }
+    return 0;
+  }
+  if (stream_id == ctx->request_stream_id) {
     ctx->response_complete = true;
   }
   return 0;
@@ -2292,7 +2331,19 @@ int http_recv_data_cb(
   if (datalen > 0 && data != nullptr) {
     ctx->received_any_stream_data = true;
     ctx->rx_bytes += datalen;
-    if (ctx->response_body.size() < 131072) {
+    if (ctx->pipelined_mode) {
+      auto it = ctx->active_streams.find(stream_id);
+      if (it != ctx->active_streams.end()) {
+        auto& st = it->second;
+        st.has_body_data = true;
+        if ((ctx->expectations.has_body_expect || ctx->expectations.min_body_bytes > 0) &&
+            st.response_body.size() < 131072) {
+          const std::size_t cap_left = 131072 - st.response_body.size();
+          const std::size_t ncopy = std::min(cap_left, datalen);
+          st.response_body.append(reinterpret_cast<const char*>(data), ncopy);
+        }
+      }
+    } else if (ctx->response_body.size() < 131072) {
       const std::size_t cap_left = 131072 - ctx->response_body.size();
       const std::size_t ncopy = std::min(cap_left, datalen);
       ctx->response_body.append(reinterpret_cast<const char*>(data), ncopy);
@@ -2353,6 +2404,25 @@ int http_recv_header_cb(
   }
   const nghttp3_vec nbuf = nghttp3_rcbuf_get_buf(name);
   const nghttp3_vec vbuf = nghttp3_rcbuf_get_buf(value);
+  if (ctx->pipelined_mode) {
+    auto it = ctx->active_streams.find(stream_id);
+    if (it != ctx->active_streams.end()) {
+      auto& st = it->second;
+      st.response_headers_seen = true;
+      if (ctx->expectations.has_header_expect && st.response_headers.size() < 131072) {
+        st.response_headers.append(reinterpret_cast<const char*>(nbuf.base), nbuf.len);
+        st.response_headers.push_back(':');
+        st.response_headers.append(reinterpret_cast<const char*>(vbuf.base), vbuf.len);
+        st.response_headers.push_back('\n');
+      }
+      if (token == NGHTTP3_QPACK_TOKEN__STATUS ||
+          (nbuf.len == 7 && std::memcmp(nbuf.base, ":status", 7) == 0)) {
+        std::string v(reinterpret_cast<const char*>(vbuf.base), vbuf.len);
+        st.response_status = parse_status_code(v);
+      }
+    }
+    return 0;
+  }
   std::string n(reinterpret_cast<const char*>(nbuf.base), nbuf.len);
   std::string v(reinterpret_cast<const char*>(vbuf.base), vbuf.len);
   const std::string lower_n = to_lower_ascii(n);
@@ -2429,7 +2499,19 @@ int http_end_stream_cb(
   (void)conn;
   (void)stream_user_data;
   auto* ctx = static_cast<Ngtcp2AttemptCtx*>(conn_user_data);
-  if (ctx != nullptr && stream_id == ctx->request_stream_id) {
+  if (ctx == nullptr) {
+    return 0;
+  }
+  if (ctx->pipelined_mode) {
+    auto it = ctx->active_streams.find(stream_id);
+    if (it != ctx->active_streams.end()) {
+      it->second.response_complete = true;
+      ctx->completed_streams.push_back(std::move(it->second));
+      ctx->active_streams.erase(it);
+    }
+    return 0;
+  }
+  if (stream_id == ctx->request_stream_id) {
     ctx->response_complete = true;
   }
   return 0;
@@ -2487,9 +2569,12 @@ int recv_stream_data_cb(
     return 0;
   }
   if (data != nullptr && datalen > 0) {
-    auto& state = ctx->frame_parse_states[stream_id];
-    append_parse_bytes(&state, data, datalen);
-    parse_h3_frame_events(ctx, stream_id, &state);
+    const bool is_server_uni = (stream_id >= 0) && ((stream_id & 0x3) == 0x3);
+    if (!ctx->pipelined_mode || is_server_uni || ctx->feature_policy.server_push) {
+      auto& state = ctx->frame_parse_states[stream_id];
+      append_parse_bytes(&state, data, datalen);
+      parse_h3_frame_events(ctx, stream_id, &state);
+    }
 
     // QPACK dynamic-table activity: encoder/decoder uni-stream bytes imply inserts;
     // over capacity approximates eviction pressure for parity metrics.
@@ -2512,7 +2597,7 @@ int recv_stream_data_cb(
       }
     }
   }
-  if ((flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0) {
+  if ((flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0 && !ctx->frame_parse_states.empty()) {
     ctx->frame_parse_states.erase(stream_id);
   }
   const int fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0 ? 1 : 0;
@@ -2693,12 +2778,16 @@ bool init_quic_conn(Ngtcp2AttemptCtx* ctx) {
 
   ngtcp2_cid dcid{};
   dcid.datalen = NGTCP2_MIN_INITIAL_DCIDLEN;
-  if (rand_fill(dcid.data, dcid.datalen) != 0) {
+  if (ctx->has_precomputed_cids) {
+    std::memcpy(dcid.data, ctx->precomputed_dcid.data(), 8);
+  } else if (rand_fill(dcid.data, dcid.datalen) != 0) {
     return false;
   }
   ngtcp2_cid scid{};
   scid.datalen = 8;
-  if (rand_fill(scid.data, scid.datalen) != 0) {
+  if (ctx->has_precomputed_cids) {
+    std::memcpy(scid.data, ctx->precomputed_scid.data(), 8);
+  } else if (rand_fill(scid.data, scid.datalen) != 0) {
     return false;
   }
 
@@ -2709,8 +2798,10 @@ bool init_quic_conn(Ngtcp2AttemptCtx* ctx) {
   ngtcp2_transport_params params{};
   ngtcp2_transport_params_default(&params);
   params.initial_max_streams_uni = 16;
-  params.initial_max_stream_data_bidi_local = 512 * 1024;
-  params.initial_max_data = 4 * 1024 * 1024;
+  params.initial_max_streams_bidi = 1024;
+  params.initial_max_stream_data_bidi_local = 2 * 1024 * 1024;
+  params.initial_max_stream_data_bidi_remote = 2 * 1024 * 1024;
+  params.initial_max_data = 16 * 1024 * 1024;
   params.max_datagram_frame_size = 1200;
 
   ngtcp2_callbacks callbacks{};
@@ -3612,11 +3703,17 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
     }
   }
 
-  for (int iter = 0; iter < 32; ++iter) {
-    std::array<uint8_t, 1452> pkt{};
-    ngtcp2_path_storage ps;
-    ngtcp2_path_storage_zero(&ps);
-    ngtcp2_pkt_info pi{};
+  std::array<uint8_t, 1452> pkt{};
+  ngtcp2_path_storage ps;
+  ngtcp2_path_storage_zero(&ps);
+  ngtcp2_pkt_info pi{};
+  bool coalescing_pkt = false;
+
+  for (int iter = 0; iter < 256; ++iter) {
+    if (!coalescing_pkt) {
+      ngtcp2_path_storage_zero(&ps);
+      pi = ngtcp2_pkt_info{};
+    }
     ngtcp2_ssize pdatalen = -1;
 
     int64_t sid = -1;
@@ -3627,26 +3724,29 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
     bool custom_stream_payload = false;
     bool stream_from_nghttp3 = false;
 
-    if (!ctx->control_tx_buffer.empty() &&
-        ctx->control_tx_off < ctx->control_tx_buffer.size() &&
-        ctx->ctrl_stream_id >= 0) {
-      sid = ctx->ctrl_stream_id;
-      custom_vec.base = ctx->control_tx_buffer.data() + ctx->control_tx_off;
-      custom_vec.len = ctx->control_tx_buffer.size() - ctx->control_tx_off;
-      custom_stream_payload = custom_vec.len > 0;
-    }
-
-    if (!custom_stream_payload && ctx->h3_ready && ctx->h3_conn != nullptr) {
-      h3_veccnt = nghttp3_conn_writev_stream(
-          ctx->h3_conn,
-          &sid,
-          &fin,
-          h3_vec.data(),
-          h3_vec.size());
-      if (h3_veccnt < 0) {
-        return false;
+    const bool force_flush_coalesced = (iter == 255 && coalescing_pkt);
+    if (!force_flush_coalesced) {
+      if (!ctx->control_tx_buffer.empty() &&
+          ctx->control_tx_off < ctx->control_tx_buffer.size() &&
+          ctx->ctrl_stream_id >= 0) {
+        sid = ctx->ctrl_stream_id;
+        custom_vec.base = ctx->control_tx_buffer.data() + ctx->control_tx_off;
+        custom_vec.len = ctx->control_tx_buffer.size() - ctx->control_tx_off;
+        custom_stream_payload = custom_vec.len > 0;
       }
-      stream_from_nghttp3 = sid >= 0;
+
+      if (!custom_stream_payload && ctx->h3_ready && ctx->h3_conn != nullptr) {
+        h3_veccnt = nghttp3_conn_writev_stream(
+            ctx->h3_conn,
+            &sid,
+            &fin,
+            h3_vec.data(),
+            h3_vec.size());
+        if (h3_veccnt < 0) {
+          return false;
+        }
+        stream_from_nghttp3 = sid >= 0;
+      }
     }
 
     uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_NONE;
@@ -3676,6 +3776,7 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
     if (nwrite < 0) {
       if (custom_stream_payload) {
         if (nwrite == NGTCP2_ERR_WRITE_MORE && pdatalen > 0) {
+          coalescing_pkt = true;
           ctx->control_tx_off += static_cast<std::size_t>(pdatalen);
           if (ctx->control_tx_off >= ctx->control_tx_buffer.size()) {
             ctx->control_tx_buffer.clear();
@@ -3708,6 +3809,7 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
           continue;
         }
         if (nwrite == NGTCP2_ERR_WRITE_MORE && pdatalen >= 0) {
+          coalescing_pkt = true;
           if (nghttp3_conn_add_write_offset(ctx->h3_conn, sid, static_cast<std::size_t>(pdatalen)) != 0) {
             return false;
           }
@@ -3721,6 +3823,7 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
       }
       return false;
     }
+    coalescing_pkt = false;
 
     if (custom_stream_payload && pdatalen > 0) {
       ctx->control_tx_off += static_cast<std::size_t>(pdatalen);
@@ -3785,6 +3888,7 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
 
   // Receive packet(s): drain whatever is ready (ring multishot recv on the
   // kernel-socket path, else a syscall recv).
+  int total_rx_got = 0;
   for (int iter = 0; iter < 64; ++iter) {
     const int got = recv_udp_payloads(ctx, rx_batch.data(), 2048, rx_lens.data(), 64);
     if (got < 0) {
@@ -3793,6 +3897,7 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
     if (got == 0) {
       break;
     }
+    total_rx_got += got;
     for (int i = 0; i < got; ++i) {
       if (!feed_datagram(
               rx_batch.data() + static_cast<std::size_t>(i) * 2048u,
@@ -3805,7 +3910,7 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
   if (ngtcp2_conn_handle_expiry(ctx->conn, now_ns()) != 0) {
     return false;
   }
-  if (ctx->udp_io_backend == QuicUdpIoBackend::KernelSocket && ctx->fd >= 0) {
+  if (total_rx_got == 0 && ctx->udp_io_backend == QuicUdpIoBackend::KernelSocket && ctx->fd >= 0) {
     const uint64_t now = now_ns();
     const uint64_t expiry = ngtcp2_conn_get_expiry(ctx->conn);
     const uint64_t next_wakeup = std::min(deadline_ns, expiry);
@@ -3859,6 +3964,17 @@ bool evaluate_response(const Ngtcp2AttemptCtx& ctx) {
   return ctx.response_headers_seen && status_ok && expected_header_ok && expected_body_ok;
 }
 
+int resolve_pipelined_in_flight_window() {
+  if (const char* env = std::getenv("SAMURAI_QUIC_IN_FLIGHT_WINDOW");
+      env != nullptr && env[0] != '\0') {
+    const int v = std::atoi(env);
+    if (v >= 1 && v <= 512) {
+      return v;
+    }
+  }
+  return 64;
+}
+
 bool run_single_attempt(
     const Profile& profile,
     int timeout_ms,
@@ -3866,7 +3982,9 @@ bool run_single_attempt(
     const H3FeaturePolicy& feature_policy,
     TlsSessionCache* session_cache,
     UdpProbeCounters* out,
-    const QuicDpdkFanoutCtx* dpdk_fanout = nullptr) {
+    const QuicDpdkFanoutCtx* dpdk_fanout = nullptr,
+    const QuicInitialKeyMaterial* precomputed_keys = nullptr,
+    std::vector<double>* latency_samples_out = nullptr) {
   if (out == nullptr) {
     return false;
   }
@@ -3884,6 +4002,12 @@ bool run_single_attempt(
   out->scenario_multi_step = multi_step ? 1 : 0;
   out->scenario_steps_planned += plan_len;
   Ngtcp2AttemptCtx ctx{};
+  if (precomputed_keys != nullptr) {
+    ctx.has_precomputed_cids = true;
+    std::memcpy(ctx.precomputed_dcid.data(), precomputed_keys->dcid, 8);
+    std::memcpy(ctx.precomputed_scid.data(), precomputed_keys->scid, 8);
+    ctx.precomputed_initial_keys = *precomputed_keys;
+  }
   ctx.request = derive_request_spec(profile);
   ctx.expectations = derive_expectations(profile);
   ctx.requests_planned = request_budget;
@@ -3973,6 +4097,178 @@ bool run_single_attempt(
       break;
     }
 
+    const int in_flight_window = resolve_pipelined_in_flight_window();
+    const bool use_pipelined_window =
+        !multi_step &&
+        !goaway_policy.enabled &&
+        !feature_policy.qpack_dynamic &&
+        !feature_policy.priority_update &&
+        !feature_policy.extended_connect &&
+        !feature_policy.datagram &&
+        !feature_policy.server_push &&
+        plan_len > 1 &&
+        in_flight_window > 1 &&
+        (scenario_steps.empty() || scenario_steps.front().think_time_ms <= 0) &&
+        !env_truthy("SAMURAI_QUIC_PIPELINE_DISABLE");
+
+    if (use_pipelined_window) {
+      ctx.pipelined_mode = true;
+      const ScenarioStep& step = scenario_steps.front();
+      ctx.request = render_scenario_request(step, captures, cookie_jar);
+      ctx.expectations = step.expectations;
+
+      const std::string scheme = profile.scheme.empty() ? "https" : profile.scheme;
+      const std::string authority = profile.host_header.empty()
+          ? (profile.target_ip + ":" + std::to_string(std::max(1, profile.target_port)))
+          : profile.host_header;
+      const std::string method = ctx.request.method.empty() ? "GET" : ctx.request.method;
+      const std::string path = ctx.request.path.empty() ? "/" : ctx.request.path;
+      std::string content_length;
+      if (!ctx.request.body.empty()) {
+        content_length = std::to_string(ctx.request.body.size());
+      }
+
+      std::vector<nghttp3_nv> nva;
+      nva.reserve(6 + ctx.request.headers.size());
+      nva.push_back(make_nv(":method", method));
+      nva.push_back(make_nv(":scheme", scheme));
+      nva.push_back(make_nv(":authority", authority));
+      nva.push_back(make_nv(":path", path));
+      nva.push_back(make_nv("user-agent", "ddos-samurai/native-quic"));
+      for (const auto& hdr : ctx.request.headers) {
+        if (!hdr.first.empty()) {
+          nva.push_back(make_nv(hdr.first, hdr.second));
+        }
+      }
+      if (!ctx.request.body.empty()) {
+        nva.push_back(make_nv("content-length", content_length));
+      }
+      nghttp3_data_reader dr{};
+      dr.read_data = read_data_cb;
+      const nghttp3_data_reader* dr_ptr = ctx.request.body.empty() ? nullptr : &dr;
+
+      ctx.active_streams.reserve(static_cast<std::size_t>(in_flight_window * 2));
+      ctx.completed_streams.reserve(static_cast<std::size_t>(in_flight_window * 2));
+      ctx.stream_latencies_ms.reserve(static_cast<std::size_t>(plan_len));
+
+      int requests_submitted = 0;
+      const uint64_t step_timeout_ns =
+          static_cast<uint64_t>(std::max(50, timeout_ms)) * 1000000ull;
+      uint64_t last_progress_ns = now_ns();
+      bool fatal_pipeline_abort = false;
+
+      while (ctx.requests_completed < plan_len && !fatal_pipeline_abort) {
+        while (requests_submitted < plan_len &&
+               static_cast<int>(ctx.active_streams.size()) < in_flight_window &&
+               !ctx.goaway_active) {
+          int64_t sid = -1;
+          const int rv_open = ngtcp2_conn_open_bidi_stream(ctx.conn, &sid, nullptr);
+          if (rv_open == NGTCP2_ERR_STREAM_ID_BLOCKED) {
+            break;  // Wait for MAX_STREAMS credits from peer
+          }
+          if (rv_open != 0 || sid < 0) {
+            fatal_pipeline_abort = true;
+            break;
+          }
+          PipelinedStreamState st{};
+          st.stream_id = sid;
+          st.start_ns = now_ns();
+          ctx.active_streams.emplace(sid, std::move(st));
+          if (nghttp3_conn_submit_request(
+                  ctx.h3_conn,
+                  sid,
+                  nva.data(),
+                  nva.size(),
+                  dr_ptr,
+                  nullptr) != 0) {
+            ctx.active_streams.erase(sid);
+            fatal_pipeline_abort = true;
+            break;
+          }
+          requests_submitted += 1;
+        }
+
+        const uint64_t io_deadline_ns = last_progress_ns + step_timeout_ns;
+        if (!drive_io_once(&ctx, io_deadline_ns, out)) {
+          fatal_pipeline_abort = true;
+        }
+
+        if (!ctx.completed_streams.empty()) {
+          const uint64_t done_ns = now_ns();
+          last_progress_ns = done_ns;
+          for (const auto& st : ctx.completed_streams) {
+            if (st.response_headers_seen || st.has_body_data || st.response_complete) {
+              out->responses += 1;
+            }
+            if (st.response_headers_seen) {
+              out->response_headers_ok += 1;
+            }
+            if (st.has_body_data) {
+              out->response_body_ok += 1;
+            }
+            const bool status_ok =
+                st.response_status >= ctx.expectations.status_min &&
+                st.response_status <= ctx.expectations.status_max;
+            const bool expected_header_ok =
+                !ctx.expectations.has_header_expect ||
+                header_expect_ok(
+                    st.response_headers,
+                    ctx.expectations.header_name,
+                    ctx.expectations.header_value_contains);
+            const bool body_substring_ok =
+                !ctx.expectations.has_body_expect ||
+                body_expect_ok(st.response_body, ctx.expectations.body_substring);
+            const bool body_required_ok = !ctx.expectations.require_body || st.has_body_data;
+            const bool min_body_ok =
+                ctx.expectations.min_body_bytes == 0 ||
+                st.response_body.size() >= ctx.expectations.min_body_bytes;
+            const bool expected_body_ok = body_substring_ok && body_required_ok && min_body_ok;
+            if (expected_header_ok) {
+              out->response_expected_header_ok += 1;
+            }
+            if (expected_body_ok) {
+              out->response_expected_body_match_ok += 1;
+            }
+            const bool request_ok =
+                st.response_headers_seen && status_ok && expected_header_ok && expected_body_ok;
+            if (request_ok) {
+              ctx.requests_succeeded += 1;
+              out->send_ok += 1;
+              out->scenario_steps_passed += 1;
+            } else {
+              ctx.requests_failed += 1;
+              out->errors += 1;
+              out->response_validation_fail += 1;
+              out->scenario_steps_failed += 1;
+            }
+            ctx.requests_completed += 1;
+            out->scenario_steps_completed += 1;
+            const double lat_ms =
+                done_ns > st.start_ns
+                    ? static_cast<double>(done_ns - st.start_ns) / 1000000.0
+                    : 0.01;
+            out->scenario_step_latency_ms_sum += lat_ms;
+            out->scenario_step_latency_ms_max =
+                std::max(out->scenario_step_latency_ms_max, lat_ms);
+            ctx.stream_latencies_ms.push_back(lat_ms);
+          }
+          ctx.completed_streams.clear();
+        } else if (now_ns() >= io_deadline_ns) {
+          fatal_pipeline_abort = true;
+        }
+      }
+
+      if (ctx.requests_completed < plan_len) {
+        const int remaining = plan_len - ctx.requests_completed;
+        ctx.requests_failed += remaining;
+        ctx.requests_completed += remaining;
+        out->errors += remaining;
+        out->response_validation_fail += remaining;
+        out->timeouts += remaining;
+        out->scenario_steps_completed += remaining;
+        out->scenario_steps_failed += remaining;
+      }
+    } else {
     for (int req_i = 0; req_i < plan_len; ++req_i) {
       if (ctx.goaway_active) {
         const int remaining = std::max(0, plan_len - req_i);
@@ -4097,7 +4393,8 @@ bool run_single_attempt(
 
       // Per-step SLA telemetry + state carry (captures/cookies) + think-time.
       const double step_latency_ms =
-          static_cast<double>(ns_to_ms_ceil(now_ns() - step_start_ns));
+          static_cast<double>(now_ns() - step_start_ns) / 1000000.0;
+      ctx.stream_latencies_ms.push_back(step_latency_ms);
       out->scenario_steps_completed += 1;
       if (request_ok) {
         out->scenario_steps_passed += 1;
@@ -4132,6 +4429,7 @@ bool run_single_attempt(
           }
         }
       }
+    }
     }
     if (goaway_policy.enabled && ctx.h3_conn != nullptr) {
       if (nghttp3_conn_submit_shutdown_notice(ctx.h3_conn) == 0) {
@@ -4232,6 +4530,12 @@ bool run_single_attempt(
   out->tls_session_ticket_received += ctx.tls_session_ticket_received ? 1 : 0;
   out->tx_bytes += ctx.tx_bytes;
   out->rx_bytes += ctx.rx_bytes;
+  if (latency_samples_out != nullptr && !ctx.stream_latencies_ms.empty()) {
+    latency_samples_out->insert(
+        latency_samples_out->end(),
+        ctx.stream_latencies_ms.begin(),
+        ctx.stream_latencies_ms.end());
+  }
   cleanup_attempt(&ctx);
   return true;
 }
@@ -4382,6 +4686,51 @@ bool run_h3_ngtcp2_client(
     return false;
   }
 
+  // GPU Batch Crypto Pre-derivation: generate cryptographically random 8-byte
+  // DCIDs and SCIDs for all planned connections up front, then dispatch a
+  // single GPU batch kernel (RFC 9001 Section 5.2 HKDF-Extract +
+  // HKDF-Expand-Label over SHA-256 + RFC 9001 Section 5.4.3 AES-128-ECB header
+  // protection masks) across all planned connections.
+  const std::size_t num_planned_conns = conn_plans.size();
+  std::vector<uint8_t> batch_dcids(num_planned_conns * 8u, 0);
+  std::vector<uint8_t> batch_scids(num_planned_conns * 8u, 0);
+  std::vector<QuicInitialKeyMaterial> batch_initial_keys(num_planned_conns);
+  uint64_t cuda_elapsed_ns_1 = 0;
+  uint64_t cuda_elapsed_ns_2 = 0;
+  if (num_planned_conns > 0) {
+    (void)rand_fill(batch_dcids.data(), batch_dcids.size());
+    (void)rand_fill(batch_scids.data(), batch_scids.size());
+    (void)quic_cuda_derive_initial_keys_batch(
+        batch_dcids.data(),
+        batch_scids.data(),
+        num_planned_conns,
+        batch_initial_keys.data(),
+        &cuda_elapsed_ns_1);
+    std::vector<uint8_t> hp_keys(num_planned_conns * 16u);
+    std::vector<uint8_t> hp_samples(num_planned_conns * 16u, 0);
+    std::vector<uint8_t> hp_masks(num_planned_conns * 5u, 0);
+    for (std::size_t i = 0; i < num_planned_conns; ++i) {
+      std::memcpy(hp_keys.data() + i * 16u, batch_initial_keys[i].quic_hp, 16u);
+      std::memcpy(hp_samples.data() + i * 16u, batch_initial_keys[i].client_initial_secret, 16u);
+    }
+    (void)quic_cuda_aes128_hp_mask_batch(
+        hp_keys.data(),
+        hp_samples.data(),
+        num_planned_conns,
+        hp_masks.data(),
+        &cuda_elapsed_ns_2);
+  }
+  const QuicCudaCryptoTelemetry cuda_telemetry = quic_cuda_crypto_get_telemetry();
+  out->cuda_crypto_available = cuda_telemetry.gpu_available ? 1 : 0;
+  out->cuda_crypto_batches = static_cast<int>(cuda_telemetry.kernel_launches);
+  out->cuda_initial_keys_derived = static_cast<int>(num_planned_conns);
+  out->cuda_hp_masks_computed = static_cast<int>(num_planned_conns);
+  out->cuda_aead_packets = static_cast<int>(cuda_telemetry.aead_packets_processed);
+  out->cuda_crypto_ms = static_cast<double>(cuda_elapsed_ns_1 + cuda_elapsed_ns_2) / 1000000.0;
+
+  std::vector<double> all_latency_samples;
+  all_latency_samples.reserve(static_cast<std::size_t>(attempted));
+
   // Threaded fan-out: the kernel UDP-socket backend and the DPDK backend are
   // parallelized per-core. Kernel uses a connect()ed socket per attempt (the kernel
   // assigns a distinct ephemeral src port -> no 4-tuple collision). DPDK opens the
@@ -4449,6 +4798,7 @@ bool run_h3_ngtcp2_client(
         std::min<int>(configured_conn_pool, static_cast<int>(conn_plans.size()));
     std::vector<UdpProbeCounters> local_outs(static_cast<std::size_t>(worker_count));
     std::vector<TlsSessionCache> local_caches(static_cast<std::size_t>(worker_count));
+    std::vector<std::vector<double>> local_latencies(static_cast<std::size_t>(worker_count));
     for (auto& lc : local_caches) {
       lc = session_cache;     // identity/ttl/pool_size/blob/loaded_from_disk copy
       lc.disk_path.clear();   // workers never touch disk; single consolidated store below
@@ -4462,6 +4812,7 @@ bool run_h3_ngtcp2_client(
       threads.emplace_back([&, w]() {
         UdpProbeCounters& lo = local_outs[static_cast<std::size_t>(w)];
         TlsSessionCache& lc = local_caches[static_cast<std::size_t>(w)];
+        std::vector<double>& llat = local_latencies[static_cast<std::size_t>(w)];
         // Per-core DPDK: register this thread as an EAL lcore (mempool per-lcore
         // cache) and open a worker-private handle on the shared port so it gets its
         // own UDP template (distinct strided src port) on queue == w. Steering was
@@ -4494,7 +4845,16 @@ bool run_h3_ngtcp2_client(
             break;
           }
           lo.conn_attempted += 1;
-          if (!run_single_attempt(profile, timeout_ms, conn_plans[idx], feature_policy, &lc, &lo, fanout_ptr)) {
+          if (!run_single_attempt(
+                  profile,
+                  timeout_ms,
+                  conn_plans[idx],
+                  feature_policy,
+                  &lc,
+                  &lo,
+                  fanout_ptr,
+                  &batch_initial_keys[idx],
+                  &llat)) {
             hard_fail.store(true, std::memory_order_relaxed);
             break;
           }
@@ -4514,8 +4874,14 @@ bool run_h3_ngtcp2_client(
     for (auto& t : threads) {
       t.join();
     }
-    for (const auto& lo : local_outs) {
-      merge_udp_probe_counters(out, lo);
+    for (std::size_t w = 0; w < static_cast<std::size_t>(worker_count); ++w) {
+      merge_udp_probe_counters(out, local_outs[w]);
+      if (!local_latencies[w].empty()) {
+        all_latency_samples.insert(
+            all_latency_samples.end(),
+            local_latencies[w].begin(),
+            local_latencies[w].end());
+      }
     }
     ran = any_ran.load(std::memory_order_relaxed);
     // Consolidated single-writer TLS session store: persist one freshly captured
@@ -4549,7 +4915,16 @@ bool run_h3_ngtcp2_client(
     }
     for (std::size_t idx = 0; idx < conn_plans.size(); ++idx) {
       out->conn_attempted += 1;
-      if (!run_single_attempt(profile, timeout_ms, conn_plans[idx], feature_policy, &session_cache, out)) {
+      if (!run_single_attempt(
+              profile,
+              timeout_ms,
+              conn_plans[idx],
+              feature_policy,
+              &session_cache,
+              out,
+              nullptr,
+              &batch_initial_keys[idx],
+              &all_latency_samples)) {
         gnutls_global_deinit();
         return ran;
       }
@@ -4558,6 +4933,18 @@ bool run_h3_ngtcp2_client(
       }
       ran = true;
     }
+  }
+  if (!all_latency_samples.empty()) {
+    std::sort(all_latency_samples.begin(), all_latency_samples.end());
+    auto pct = [&](double p) -> double {
+      const std::size_t n = all_latency_samples.size();
+      const std::size_t idx = std::min<std::size_t>(
+          n - 1, static_cast<std::size_t>(p * static_cast<double>(n)));
+      return all_latency_samples[idx];
+    };
+    out->latency_p50_ms = pct(0.50);
+    out->latency_p95_ms = pct(0.95);
+    out->latency_p99_ms = pct(0.99);
   }
   out->errors = std::max(out->errors, attempted - out->send_ok);
   out->tls_cache_store_updates += session_cache.store_updates;

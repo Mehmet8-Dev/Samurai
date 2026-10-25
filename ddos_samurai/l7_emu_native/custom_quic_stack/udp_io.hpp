@@ -80,6 +80,15 @@ struct UdpProbeCounters {
   int scenario_think_time_total_ms{0};
   double scenario_step_latency_ms_sum{0.0};
   double scenario_step_latency_ms_max{0.0};
+  double latency_p50_ms{0.0};
+  double latency_p95_ms{0.0};
+  double latency_p99_ms{0.0};
+  int cuda_crypto_available{0};
+  int cuda_crypto_batches{0};
+  int cuda_initial_keys_derived{0};
+  int cuda_hp_masks_computed{0};
+  int cuda_aead_packets{0};
+  double cuda_crypto_ms{0.0};
   std::size_t tx_bytes{0};
   std::size_t rx_bytes{0};
 };

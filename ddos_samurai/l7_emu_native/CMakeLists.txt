@@ -48,6 +48,7 @@ set(SAMURAI_L7EMU_SOURCES
   custom_quic_stack/h3_parity_state.cpp
   custom_quic_stack/h3_real_client.cpp
   custom_quic_stack/loss_recovery.cpp
+  custom_quic_stack/quic_cuda_crypto.cpp
   custom_quic_stack/quic_metrics.cpp
   custom_quic_stack/quic_stack.cpp
   custom_quic_stack/udp_io.cpp
@@ -61,6 +62,33 @@ set(SAMURAI_L7EMU_SOURCES
 add_library(samurai_l7emu STATIC ${SAMURAI_L7EMU_SOURCES})
 target_include_directories(samurai_l7emu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk)
 target_link_libraries(samurai_l7emu PUBLIC samurai_l4 samurai_core pthread dl)
+
+if(NOT DEFINED ENV{SAMURAI_SKIP_CUDA_BUILD})
+  find_program(SAMURAI_NVCC nvcc HINTS ENV SAMURAI_NVCC /usr/local/cuda/bin)
+  find_library(SAMURAI_CUDART cudart HINTS /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu)
+  set(_quic_cuda_src ${CMAKE_CURRENT_SOURCE_DIR}/custom_quic_stack/quic_cuda_crypto_kernels.cu)
+  set(_quic_cuda_hdrs
+    ${CMAKE_CURRENT_SOURCE_DIR}/custom_quic_stack/quic_cuda_crypto.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/custom_quic_stack/quic_crypto_primitives.cuh)
+  if(SAMURAI_NVCC AND SAMURAI_CUDART AND EXISTS ${_quic_cuda_src})
+    set(_quic_cuda_obj ${CMAKE_CURRENT_BINARY_DIR}/quic_cuda_crypto_kernels.o)
+    add_custom_command(
+      OUTPUT ${_quic_cuda_obj}
+      COMMAND ${SAMURAI_NVCC} -std=c++17 -O3 -Xcompiler -fPIC,-fvisibility=hidden -diag-suppress=177
+              -I ${CMAKE_CURRENT_SOURCE_DIR} -c ${_quic_cuda_src} -o ${_quic_cuda_obj}
+      DEPENDS ${_quic_cuda_src} ${_quic_cuda_hdrs}
+      COMMENT "Building QUIC CUDA crypto helper kernels (quic_cuda_crypto_kernels.o)"
+      VERBATIM)
+    target_sources(samurai_l7emu PRIVATE ${_quic_cuda_obj})
+    target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_WITH_QUIC_CUDA_CRYPTO=1)
+    get_filename_component(_cudart_dir ${SAMURAI_CUDART} DIRECTORY)
+    target_link_libraries(samurai_l7emu PUBLIC ${SAMURAI_CUDART})
+    target_link_options(samurai_l7emu PUBLIC "-Wl,-rpath,${_cudart_dir}")
+    message(STATUS "QUIC CUDA crypto helper enabled: ${SAMURAI_NVCC} (${SAMURAI_CUDART})")
+  else()
+    message(STATUS "nvcc/cudart not found: QUIC CUDA crypto helper falls back to CPU")
+  endif()
+endif()
 
 if(DPDK_FOUND)
   # PUBLIC: gate + link bayrakları tüketicilere yayılır; worker'lar artık

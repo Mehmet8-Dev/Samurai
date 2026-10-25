@@ -69,7 +69,9 @@ class H3Server(QuicConnectionProtocol):
                     ],
                 )
                 self._http.send_data(stream_id=sid, data=BODY, end_stream=True)
-        self.transmit()
+        # Note: QuicConnectionProtocol.datagram_received() and _handle_timer()
+        # call self.transmit() once after _process_events() finishes draining all
+        # StreamDataReceived events from a coalesced datagram.
 
 
 def _run_reuseport_worker(host: str, port: int, cert, key):

@@ -92,6 +92,15 @@ std::map<std::string, double> init_quic_stats(
   out["quic_tls_early_data_accept_ratio"] = 0.0;
   out["quic_requests_per_connection_eff"] = 0.0;
   out["quic_retransmission_ratio"] = 0.0;
+  out["quic_cuda_crypto_available"] = 0.0;
+  out["quic_cuda_crypto_batches"] = 0.0;
+  out["quic_cuda_initial_keys_derived"] = 0.0;
+  out["quic_cuda_hp_masks_computed"] = 0.0;
+  out["quic_cuda_aead_packets"] = 0.0;
+  out["quic_cuda_crypto_ms"] = 0.0;
+  out["latency_p50_ms"] = 0.0;
+  out["latency_p95_ms"] = 0.0;
+  out["latency_p99_ms"] = 0.0;
   return out;
 }
 
@@ -178,6 +187,15 @@ void apply_quic_run_metrics(
       static_cast<double>(std::max(0, udp.send_ok)) / static_cast<double>(effective_conn_success);
   (*out)["quic_retransmission_ratio"] =
       static_cast<double>(recovery.retransmission_count) / static_cast<double>(std::max(1, udp.tx_datagrams));
+  (*out)["quic_cuda_crypto_available"] = static_cast<double>(udp.cuda_crypto_available);
+  (*out)["quic_cuda_crypto_batches"] = static_cast<double>(udp.cuda_crypto_batches);
+  (*out)["quic_cuda_initial_keys_derived"] = static_cast<double>(udp.cuda_initial_keys_derived);
+  (*out)["quic_cuda_hp_masks_computed"] = static_cast<double>(udp.cuda_hp_masks_computed);
+  (*out)["quic_cuda_aead_packets"] = static_cast<double>(udp.cuda_aead_packets);
+  (*out)["quic_cuda_crypto_ms"] = udp.cuda_crypto_ms;
+  (*out)["latency_p50_ms"] = udp.latency_p50_ms;
+  (*out)["latency_p95_ms"] = udp.latency_p95_ms;
+  (*out)["latency_p99_ms"] = udp.latency_p99_ms;
 }
 
 }  // namespace ddos_samurai::l7_emu_native::custom_quic_stack
