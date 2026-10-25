@@ -23,7 +23,7 @@
 | **Lost Worker Detection** | Heartbeat loss $\le 2,000$ ms | **Detected within 2,000 ms** (`slave_1`) | **PASSED** |
 | **Shard Reclamation & Rebalance** | Reclaimed from `slave_1` | **Dynamic Redistribution to surviving 3 slaves** | **PASSED** |
 | **Surviving Active Workers** | 3 Workers (`slave_0`, `slave_2`, `slave_3`) | **3 Workers** | **PASSED** |
-| **Recovery Latency (T_kill -> End)** | $\le 3.5$ s | **2.358 s** ($\pm0.02\%$) | **PASSED** |
+| **Recovery Latency (T_kill -> End)** | $\le 3.5$ s | **2.362 s** ($\pm0.15\%$) | **PASSED** |
 | **Master Process Deadlock Rate** | **0%** | **0%** (Clean exitcode 0 across all runs) | **PASSED** |
 
 ---
@@ -42,8 +42,8 @@ The surviving 3 slaves dynamically picked up the remainder of the backlog:
 
 ### 3. Statistical Determinism Analysis
 
-* **Recovery Latency Dispersion:** Min=2.358s, Max=2.359s, Mean=2.358s, StDev=0.0006s
-* **Coefficient of Variation (CV%):** **0.02%** (Bounded $< 5.0\%$, strictly deterministic)
+* **Recovery Latency Dispersion:** Min=2.358s, Max=2.365s, Mean=2.362s, StDev=0.0036s
+* **Coefficient of Variation (CV%):** **0.15%** (Bounded $< 5.0\%$, strictly deterministic)
 * **Master Deadlocks:** 0 / 3 (100% deadlock-free completion)
 
 ---
