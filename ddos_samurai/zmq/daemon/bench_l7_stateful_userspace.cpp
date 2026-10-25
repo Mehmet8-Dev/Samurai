@@ -25,6 +25,7 @@
 #include "engine.hpp"
 #include "json.hpp"
 #include "stateful_fastpath.hpp"
+#include "custom_quic_stack/quic_cuda_crypto.hpp"
 
 #ifdef SAMURAI_WITH_NGHTTP2
 #include <nghttp2/nghttp2.h>
@@ -613,6 +614,9 @@ BenchMetricResult BenchmarkH3(int concurrency, int requests, int h3_port) {
   profile.keepalive = 1;
   profile.timeout_ms = 8000;
   profile.max_connections = concurrency;
+  if (const char* mc = std::getenv("SAMURAI_QUIC_MAX_CONNS"); mc != nullptr && mc[0] != '\0') {
+    profile.max_connections = std::max(1, std::atoi(mc));
+  }
   profile.max_streams_per_connection = 10;
   if (const char* sm = std::getenv("SAMURAI_QUIC_STREAMS_PER_CONN"); sm != nullptr && sm[0] != '\0') {
     profile.max_streams_per_connection = std::max(1, std::atoi(sm));
@@ -677,6 +681,100 @@ BenchMetricResult BenchmarkH3(int concurrency, int requests, int h3_port) {
   }
 
   return res;
+}
+
+void RunCudaCryptoBenchmark(int n_keys = 100000) {
+  std::printf("\n========================================================================================================================\n");
+  std::printf("                         NVIDIA GPU (CUDA) QUIC CRYPTO COPROCESSOR ENGINE BENCHMARK                              \n");
+  std::printf("========================================================================================================================\n");
+
+  if (!ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_crypto_available()) {
+    std::printf("[CUDA CRYPTO] No CUDA-capable NVIDIA GPU detected. Skipping GPU microbenchmarks.\n");
+    return;
+  }
+
+  // 1. Warm-up and Selftest against official RFC 9001 Appendix A.1
+  const bool selftest_ok = ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_crypto_selftest();
+  std::printf("[CUDA CRYPTO] Self-test against IETF RFC 9001 Appendix A.1: %s\n",
+              selftest_ok ? "PASS (Byte-Exact Match)" : "FAIL");
+
+  // 2. Initial Key Derivation Batch Benchmark:
+  // HKDF-Extract + HKDF-Expand-Label (client in, quic key, quic iv, quic hp) over SHA-256
+  std::vector<int> test_scales = {10000, 50000, n_keys};
+  for (int scale : test_scales) {
+    std::vector<uint8_t> dcids(scale * 8u);
+    std::vector<uint8_t> scids(scale * 8u);
+    std::vector<ddos_samurai::l7_emu_native::custom_quic_stack::QuicInitialKeyMaterial> out_materials(scale);
+
+    for (std::size_t i = 0; i < dcids.size(); ++i) dcids[i] = static_cast<uint8_t>(i ^ 0x5a);
+    for (std::size_t i = 0; i < scids.size(); ++i) scids[i] = static_cast<uint8_t>(i ^ 0xa5);
+
+    uint64_t elapsed_ns = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_derive_initial_keys_batch(
+        dcids.data(), scids.data(), scale, out_materials.data(), &elapsed_ns);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double wall_sec = std::chrono::duration<double>(t1 - t0).count();
+    const double gpu_sec = static_cast<double>(elapsed_ns) / 1e9;
+    const double keys_per_sec = static_cast<double>(scale) / (gpu_sec > 1e-9 ? gpu_sec : wall_sec);
+
+    std::printf("  [GPU Initial Key Deriv] Scale: %-7d conns | GPU Kernel: %6.2f ms | Wall: %6.2f ms | Throughput: %10.1f keys/sec (%.2f Mkeys/s)\n",
+                scale, gpu_sec * 1000.0, wall_sec * 1000.0, keys_per_sec, keys_per_sec / 1e6);
+  }
+
+  // 3. RFC 9001 Section 5.4.3 AES-128-ECB Header Protection Mask Generation Benchmark
+  for (int scale : test_scales) {
+    std::vector<uint8_t> hp_keys(scale * 16u, 0x3d);
+    std::vector<uint8_t> samples(scale * 16u, 0x8a);
+    std::vector<uint8_t> masks(scale * 5u, 0);
+
+    uint64_t elapsed_ns = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_aes128_hp_mask_batch(
+        hp_keys.data(), samples.data(), scale, masks.data(), &elapsed_ns);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double wall_sec = std::chrono::duration<double>(t1 - t0).count();
+    const double gpu_sec = static_cast<double>(elapsed_ns) / 1e9;
+    const double masks_per_sec = static_cast<double>(scale) / (gpu_sec > 1e-9 ? gpu_sec : wall_sec);
+
+    std::printf("  [GPU AES-128 HP Mask  ] Scale: %-7d pkts  | GPU Kernel: %6.2f ms | Wall: %6.2f ms | Throughput: %10.1f masks/sec (%.2f Mmasks/s)\n",
+                scale, gpu_sec * 1000.0, wall_sec * 1000.0, masks_per_sec, masks_per_sec / 1e6);
+  }
+
+  // 4. Batch AEAD Encryption (AES-128-GCM & ChaCha20-Poly1305)
+  for (int scale : {10000, std::min(n_keys, 65536)}) {
+    constexpr std::size_t kPacketStride = 1452u;
+    std::vector<ddos_samurai::l7_emu_native::custom_quic_stack::QuicAeadBatchItem> items(scale);
+    std::vector<uint8_t> packet_buf(scale * kPacketStride, 0x42);
+
+    for (int i = 0; i < scale; ++i) {
+      items[i].aad_len = 25;
+      items[i].plaintext_len = 1200;
+      items[i].pn_offset = 20;
+      items[i].pn_length = 4;
+      items[i].pkt_num = static_cast<uint64_t>(i);
+    }
+
+    uint64_t gcm_ns = 0;
+    ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_aes128_gcm_encrypt_batch(
+        items.data(), packet_buf.data(), kPacketStride, scale, &gcm_ns);
+    const double gcm_sec = static_cast<double>(gcm_ns) / 1e9;
+    const double gcm_mbytes = (static_cast<double>(scale) * 1200.0) / (1024.0 * 1024.0);
+    const double gcm_mbps = gcm_mbytes / (gcm_sec > 1e-9 ? gcm_sec : 1e-6);
+
+    uint64_t chacha_ns = 0;
+    ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_chacha20_poly1305_encrypt_batch(
+        items.data(), packet_buf.data(), kPacketStride, scale, &chacha_ns);
+    const double chacha_sec = static_cast<double>(chacha_ns) / 1e9;
+    const double chacha_mbytes = (static_cast<double>(scale) * 1200.0) / (1024.0 * 1024.0);
+    const double chacha_mbps = chacha_mbytes / (chacha_sec > 1e-9 ? chacha_sec : 1e-6);
+
+    std::printf("  [GPU AES-128-GCM AEAD ] Scale: %-7d pkts  | GPU Kernel: %6.2f ms | Data: %6.1f MB  | Throughput: %8.1f MB/s (%8.0f PPS)\n",
+                scale, gcm_sec * 1000.0, gcm_mbytes, gcm_mbps, static_cast<double>(scale) / (gcm_sec > 1e-9 ? gcm_sec : 1e-6));
+    std::printf("  [GPU ChaCha20-Poly1305] Scale: %-7d pkts  | GPU Kernel: %6.2f ms | Data: %6.1f MB  | Throughput: %8.1f MB/s (%8.0f PPS)\n",
+                scale, chacha_sec * 1000.0, chacha_mbytes, chacha_mbps, static_cast<double>(scale) / (chacha_sec > 1e-9 ? chacha_sec : 1e-6));
+  }
+  std::printf("========================================================================================================================\n\n");
 }
 
 void PrintTable(const std::vector<BenchMetricResult>& results) {
@@ -753,6 +851,8 @@ int main(int argc, char** argv) {
   std::string proto = "all";
   std::string json_path = "";
   int h3_port = 0;
+  bool run_gpu_bench = false;
+  int gpu_bench_keys = 100000;
   if (const char* p = std::getenv("H3_TEST_PORT"); p != nullptr && *p != '\0') {
     h3_port = std::atoi(p);
   }
@@ -772,7 +872,16 @@ int main(int argc, char** argv) {
       h3_port = std::atoi(argv[++i]);
     } else if ((arg == "--json" || arg == "--json-out") && i + 1 < argc) {
       json_path = argv[++i];
+    } else if (arg == "--gpu-crypto-bench") {
+      run_gpu_bench = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        gpu_bench_keys = std::atoi(argv[++i]);
+      }
     }
+  }
+
+  if (run_gpu_bench) {
+    RunCudaCryptoBenchmark(gpu_bench_keys);
   }
 
   std::printf("[BENCHMARK] Starting L7 Stateful Userspace Suite (proto=%s, base_flows=%d, h3_port=%d)\n",

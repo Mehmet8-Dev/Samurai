@@ -99,7 +99,34 @@ Aşağıdaki ölçümler, sistem üzerinde 12 milyon toplam akış/istek icra ed
 
 ---
 
-### 3.3 İlk Test (Baseline) vs Yeni Akış Karşılaştırma Tablosu
+### 3.4 Aşırı Yoğunluk (Extreme Stress) & GPU Kripto Koprofesör Tavan Testi
+
+Sistemin mutlak donanım tavanını belirlemek için iki ayrı stres testi icra edilmiştir:
+1. **Saf GPU CUDA Kripto Koprofesör Tavanı (Ağ Soketi Olmadan - GTX 1650 Mobile):**
+   - **RFC 9001 Initial Key Derivation (`HKDF-Extract` + `Expand` SHA-256):**
+     - 10,000 bağlantı: **0.93 ms** (10.75 Mkeys/s)
+     - 50,000 bağlantı: **4.43 ms** (11.27 Mkeys/s)
+     - 500,000 bağlantı: **42.52 ms** (**11.76 Mkeys/s**)
+   - **RFC 9001 Header Protection Mask Generation (AES-128-ECB):**
+     - 10,000 paket: **0.39 ms** (25.91 Mmasks/s)
+     - 50,000 paket: **0.66 ms** (75.34 Mmasks/s)
+     - 500,000 paket: **3.87 ms** (**129.32 Mmasks/s**)
+   - **Batch AEAD Şifreleme (65,536 x 1452B Datagram):**
+     - AES-128-GCM: **88.70 ms** (**845.6 MB/s, 738,890 PPS**)
+     - ChaCha20-Poly1305: **223.78 ms** (**335.2 MB/s, 292,865 PPS**)
+
+2. **12 Çekirdek Tam Doyum Uçtan Uca Ağ Stres Testi:**
+   | Protokol | Shard / Worker | Akış / İstek | Süre (s) | Başarı (%) | CPS (Bağlantı/s) | RPS (İstek/s) | P50 (ms) | P95 (ms) | P99 (ms) | VmRSS (MB) |
+   | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+   | **HTTP/1.1 (Userspace TCP)** | 12 | 1,000,000 | 11.724 | 100.0% | 85,297.8 | 85,297.8 | 3.00 | 8.00 | 31.00 | 4,372.4 |
+   | **HTTP/2 h2c (Userspace TCP)** | 12 | 1,000,000 | 7.591 | 100.0% | 316.2 | 131,735.2 | 6.00 | 11.00 | 16.00 | 2,879.2 |
+   | **HTTP/3 QUIC (ngtcp2+nghttp3)** | 12 | 200,000 | 12.917 | 100.0% | 154.8 | **15,483.0** | 3.04 | 5.21 | 8.64 | 192.9 |
+   | **HTTP/3 QUIC (ngtcp2+nghttp3)** | 12 | 500,000 | 32.407 | 100.0% | 154.3 | **15,428.7** | 3.04 | 5.34 | 8.46 | 151.5 |
+   | **HTTP/3 QUIC (Saf Handshake Flood - 1 req/conn)** | 12 | 2,000 | 11.927 | 100.0% | **167.7** | **167.7** | 0.54 | 1.79 | 2.54 | 185.7 |
+
+---
+
+### 3.5 İlk Test (Baseline) vs Yeni Akış Karşılaştırma Tablosu
 
 | Metrik / Protokol | İlk Başlangıç Durumu (Baseline) | Yeni Ölçüm (12 Shard/Worker) | İyileşme / Değişim |
 | :--- | :---: | :---: | :---: |
