@@ -1,0 +1,28 @@
+{
+  "gpu_hardware": {
+    "device_name": "NVIDIA GeForce RTX 3050 Laptop GPU (GA107)",
+    "pci_bdf": "0000:01:00.0",
+    "bar1_phys_base_hex": "0x6000000000",
+    "bar1_arena_bytes": 2097152
+  },
+  "geforce_bar1_p2p": {
+    "ring_lifecycle_pass": true,
+    "batch_throughput_mpps": 667.13,
+    "batch_throughput_gbps": 341.57
+  },
+  "quic_cuda_crypto": {
+    "rfc9001_selftest_pass": true,
+    "hkdf_50k_time_ms": 206.08,
+    "hkdf_50k_mkeys_sec": 0.24,
+    "hp_50k_time_ms": 6.53,
+    "hp_50k_mmasks_sec": 7.65,
+    "aes_gcm_mbps": 12.91,
+    "aes_gcm_pps": 11281.55,
+    "chacha20_mbps": 312.80,
+    "chacha20_pps": 273325.11,
+    "telemetry_verified": true
+  },
+  "overall_status": "PASS",
+  "passed_checks": 27,
+  "failed_checks": 0
+}
