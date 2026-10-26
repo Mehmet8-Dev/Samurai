@@ -342,36 +342,27 @@ struct VulkanBar1Arena {
 
     cudaError_t cu_rc = cudaImportExternalMemory(&cuda_ext_mem, &ext_desc);
     if (cu_rc != cudaSuccess || !cuda_ext_mem) {
-      const char* emu_env = std::getenv("SAMURAI_GEFORCE_P2P_EMU");
-      const bool allow_emu = (emu_env != nullptr && (std::strcmp(emu_env, "1") == 0 || std::strcmp(emu_env, "true") == 0));
-      if (allow_emu) {
-        // Fall back to direct Vulkan Host-Visible BAR1 aperture without CUDA runtime bridge
-        cuda_dev_ptr = host_bar1_ptr;
-        arena_bytes = aligned_bytes;
-      } else {
-        err = std::string("cudaImportExternalMemory failed: ") + cudaGetErrorString(cu_rc);
-        release();
-        return false;
-      }
-    } else {
-      // Note: cudaImportExternalMemory takes ownership of opaque_fd on Linux
-      exported_fd = -1;
-
-      cudaExternalMemoryBufferDesc buf_desc{};
-      buf_desc.offset = 0;
-      buf_desc.size = aligned_bytes;
-      buf_desc.flags = 0;
-
-      void* dev_ptr = nullptr;
-      cu_rc = cudaExternalMemoryGetMappedBuffer(&dev_ptr, cuda_ext_mem, &buf_desc);
-      if (cu_rc != cudaSuccess || !dev_ptr) {
-        err = std::string("cudaExternalMemoryGetMappedBuffer failed: ") + cudaGetErrorString(cu_rc);
-        release();
-        return false;
-      }
-      cuda_dev_ptr = static_cast<uint8_t*>(dev_ptr);
-      arena_bytes = aligned_bytes;
+      err = std::string("cudaImportExternalMemory failed: ") + cudaGetErrorString(cu_rc);
+      release();
+      return false;
     }
+    // Note: cudaImportExternalMemory takes ownership of opaque_fd on Linux
+    exported_fd = -1;
+
+    cudaExternalMemoryBufferDesc buf_desc{};
+    buf_desc.offset = 0;
+    buf_desc.size = aligned_bytes;
+    buf_desc.flags = 0;
+
+    void* dev_ptr = nullptr;
+    cu_rc = cudaExternalMemoryGetMappedBuffer(&dev_ptr, cuda_ext_mem, &buf_desc);
+    if (cu_rc != cudaSuccess || !dev_ptr) {
+      err = std::string("cudaExternalMemoryGetMappedBuffer failed: ") + cudaGetErrorString(cu_rc);
+      release();
+      return false;
+    }
+    cuda_dev_ptr = static_cast<uint8_t*>(dev_ptr);
+    arena_bytes = aligned_bytes;
 
     pci_gpu_bdf = (bdf_hint && bdf_hint[0] != '\0') ? std::string(bdf_hint) : detect_gpu_pci_bdf();
     bar1_phys_base = read_sysfs_bar1_phys_base(pci_gpu_bdf);
@@ -397,9 +388,7 @@ struct VulkanBar1Arena {
   void release() noexcept {
     auto& vk = get_vulkan_loader();
     if (cuda_dev_ptr) {
-      if (cuda_ext_mem != nullptr) {
-        (void)cudaFree(cuda_dev_ptr);
-      }
+      (void)cudaFree(cuda_dev_ptr);
       cuda_dev_ptr = nullptr;
     }
     if (cuda_ext_mem) {

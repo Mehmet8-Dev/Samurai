@@ -13,7 +13,6 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN="$ROOT_DIR/tests/native_gpu/test_gpu_architecture"
 JSON_OUT="$ROOT_DIR/docs/gpu_architecture_benchmark_results.json"
 
-export SAMURAI_GEFORCE_P2P_EMU=1
 
 if [[ ! -x "$BIN" ]]; then
   echo "[BUILD] Compiling test_gpu_architecture..."

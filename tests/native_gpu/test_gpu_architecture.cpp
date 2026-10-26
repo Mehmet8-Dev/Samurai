@@ -100,8 +100,6 @@ int main(int argc, char** argv) {
   // ---------------------------------------------------------------------------
   std::printf("\n[SECTION 2: COMMODITY GPU (GEFORCE BAR1 P2P DMA) ENGINE VERIFICATION]\n");
 
-  // Ensure emulation/direct Vulkan mode is enabled for environments without nvidia.ko
-  ::setenv("SAMURAI_GEFORCE_P2P_EMU", "1", 0);
 
   void* lib_handle = dlopen("ddos_samurai/libgpu_packet_cuda.so", RTLD_NOW);
   TEST_CHECK(lib_handle != nullptr, "dlopen('ddos_samurai/libgpu_packet_cuda.so') successful");

@@ -61,7 +61,6 @@ class TestGpuArchitecture(unittest.TestCase):
     def test_gpu_architecture_comprehensive_matrix(self) -> None:
         """Runs the 27-point comprehensive GPU architecture verification test suite."""
         env = os.environ.copy()
-        env["SAMURAI_GEFORCE_P2P_EMU"] = "1"
         res = subprocess.run(
             [str(self.binary_path), "--json-file", str(self.json_output)],
             env=env,
