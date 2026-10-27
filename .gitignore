@@ -105,7 +105,9 @@ artifacts/rl/
 Papers/
 *.pdf
 *.docx
-
+graphify-out/
+.graphify_version
+settings.json
 # Local env files
 .env
 .env.*
