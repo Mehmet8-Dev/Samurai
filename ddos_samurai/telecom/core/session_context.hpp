@@ -123,6 +123,25 @@ struct alignas(64) TelcoSessionContext {
         std::memset(this, 0, sizeof(TelcoSessionContext));
         state = SessionState::IDLE;
     }
+
+    inline uint32_t GetDhcpXid() const noexcept { return session_id; }
+    inline void SetDhcpXid(uint32_t xid) noexcept { session_id = xid; }
+
+    inline uint32_t GetBfdLocalDisc() const noexcept { return session_id; }
+    inline void SetBfdLocalDisc(uint32_t disc) noexcept { session_id = disc; }
+    inline uint32_t GetBfdRemoteDisc() const noexcept { return ppp_magic_number; }
+    inline void SetBfdRemoteDisc(uint32_t disc) noexcept { ppp_magic_number = disc; }
+
+    inline uint64_t GetPfcpSeid() const noexcept {
+        uint32_t upper = 0;
+        std::memcpy(&upper, pad1, 4);
+        return (static_cast<uint64_t>(upper) << 32) | session_id;
+    }
+    inline void SetPfcpSeid(uint64_t seid) noexcept {
+        session_id = static_cast<uint32_t>(seid & 0xFFFFFFFFULL);
+        uint32_t upper = static_cast<uint32_t>(seid >> 32);
+        std::memcpy(pad1, &upper, 4);
+    }
 };
 
 static_assert(sizeof(TelcoSessionContext) == 128, "TelcoSessionContext tam 2 cache line (128 bayt) olmalidir!");

@@ -53,6 +53,21 @@ public:
     bool BindGtpuSession(TelcoSessionContext* ctx, uint32_t teid) noexcept;
     void UnbindGtpuSession(TelcoSessionContext* ctx) noexcept;
 
+    // DHCP için Transaction ID (xid) ile O(1) arama
+    TelcoSessionContext* FindDhcpSession(uint32_t xid) const noexcept;
+    bool BindDhcpSession(TelcoSessionContext* ctx, uint32_t xid) noexcept;
+    void UnbindDhcpSession(TelcoSessionContext* ctx) noexcept;
+
+    // BFD için Local Discriminator ile O(1) arama
+    TelcoSessionContext* FindBfdSession(uint32_t my_disc) const noexcept;
+    bool BindBfdSession(TelcoSessionContext* ctx, uint32_t my_disc) noexcept;
+    void UnbindBfdSession(TelcoSessionContext* ctx) noexcept;
+
+    // 5G PFCP için 64-bit SEID ile O(1) arama
+    TelcoSessionContext* FindPfcpSession(uint64_t seid) const noexcept;
+    bool BindPfcpSession(TelcoSessionContext* ctx, uint64_t seid) noexcept;
+    void UnbindPfcpSession(TelcoSessionContext* ctx) noexcept;
+
     uint32_t GetActiveSessionCount() const noexcept {
         return active_sessions_.load(std::memory_order_relaxed);
     }
@@ -85,6 +100,15 @@ private:
     // GTP-U (TEID) hash tablosu
     TelcoSessionContext** gtpu_buckets_{nullptr};
 
+    // DHCP (xid) hash tablosu
+    TelcoSessionContext** dhcp_buckets_{nullptr};
+
+    // BFD (Discriminator) hash tablosu
+    TelcoSessionContext** bfd_buckets_{nullptr};
+
+    // PFCP (SEID) hash tablosu
+    TelcoSessionContext** pfcp_buckets_{nullptr};
+
     static inline uint32_t HashPppoe(const uint8_t mac[6], uint16_t session_id) noexcept {
         uint32_t h = (static_cast<uint32_t>(session_id) * 2654435761u);
         h ^= (static_cast<uint32_t>(mac[4]) << 8) | mac[5];
@@ -94,6 +118,19 @@ private:
 
     static inline uint32_t HashTeid(uint32_t teid) noexcept {
         return teid * 2654435761u;
+    }
+
+    static inline uint32_t HashDhcp(uint32_t xid) noexcept {
+        return xid * 2654435761u;
+    }
+
+    static inline uint32_t HashBfd(uint32_t disc) noexcept {
+        return disc * 2654435761u;
+    }
+
+    static inline uint32_t HashPfcp(uint64_t seid) noexcept {
+        uint64_t h = seid * 11400714819323198485ULL;
+        return static_cast<uint32_t>(h ^ (h >> 32));
     }
 };
 

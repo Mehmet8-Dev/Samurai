@@ -62,16 +62,21 @@ SessionManager::SessionManager(uint32_t max_sessions, int socket_id)
     hash_mask_ = hash_size_ - 1;
 
     // Hash tabloları için bellek tahsisi
-    size_t bucket_bytes = static_cast<size_t>(hash_size_) * sizeof(TelcoSessionContext*);
     hash_buckets_ = static_cast<TelcoSessionContext**>(::calloc(hash_size_, sizeof(TelcoSessionContext*)));
     pppoe_buckets_ = static_cast<TelcoSessionContext**>(::calloc(hash_size_, sizeof(TelcoSessionContext*)));
     gtpu_buckets_ = static_cast<TelcoSessionContext**>(::calloc(hash_size_, sizeof(TelcoSessionContext*)));
+    dhcp_buckets_ = static_cast<TelcoSessionContext**>(::calloc(hash_size_, sizeof(TelcoSessionContext*)));
+    bfd_buckets_ = static_cast<TelcoSessionContext**>(::calloc(hash_size_, sizeof(TelcoSessionContext*)));
+    pfcp_buckets_ = static_cast<TelcoSessionContext**>(::calloc(hash_size_, sizeof(TelcoSessionContext*)));
 }
 
 SessionManager::~SessionManager() {
     if (hash_buckets_) { ::free(hash_buckets_); hash_buckets_ = nullptr; }
     if (pppoe_buckets_) { ::free(pppoe_buckets_); pppoe_buckets_ = nullptr; }
     if (gtpu_buckets_) { ::free(gtpu_buckets_); gtpu_buckets_ = nullptr; }
+    if (dhcp_buckets_) { ::free(dhcp_buckets_); dhcp_buckets_ = nullptr; }
+    if (bfd_buckets_) { ::free(bfd_buckets_); bfd_buckets_ = nullptr; }
+    if (pfcp_buckets_) { ::free(pfcp_buckets_); pfcp_buckets_ = nullptr; }
 
     if (sessions_pool_) {
         if (using_hugepages_) {
@@ -108,6 +113,9 @@ void SessionManager::ReleaseSession(TelcoSessionContext* ctx) noexcept {
     Unbind5Tuple(ctx);
     UnbindPppoeSession(ctx);
     UnbindGtpuSession(ctx);
+    UnbindDhcpSession(ctx);
+    UnbindBfdSession(ctx);
+    UnbindPfcpSession(ctx);
 
     // İndeksi hesapla
     ptrdiff_t diff = ctx - sessions_pool_;
@@ -381,10 +389,229 @@ void SessionManager::UnbindGtpuSession(TelcoSessionContext* ctx) noexcept {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DHCP Session Lookup & Management
+// ---------------------------------------------------------------------------
+
+TelcoSessionContext* SessionManager::FindDhcpSession(uint32_t xid) const noexcept {
+    if (xid == 0) return nullptr;
+    uint32_t h = HashDhcp(xid);
+    uint32_t idx = h & hash_mask_;
+
+    for (uint32_t p = 0; p < MAX_PROBES; ++p) {
+        uint32_t slot = (idx + p) & hash_mask_;
+        TelcoSessionContext* s = dhcp_buckets_[slot];
+        if (!s) return nullptr;
+
+        if (s->GetDhcpXid() == xid) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+bool SessionManager::BindDhcpSession(TelcoSessionContext* ctx, uint32_t xid) noexcept {
+    if (!ctx || xid == 0) return false;
+
+    UnbindDhcpSession(ctx);
+
+    ctx->SetDhcpXid(xid);
+    uint32_t h = HashDhcp(xid);
+    uint32_t idx = h & hash_mask_;
+
+    for (uint32_t p = 0; p < MAX_PROBES; ++p) {
+        uint32_t slot = (idx + p) & hash_mask_;
+        if (dhcp_buckets_[slot] == nullptr || dhcp_buckets_[slot] == ctx) {
+            dhcp_buckets_[slot] = ctx;
+            return true;
+        }
+    }
+    return false;
+}
+
+void SessionManager::UnbindDhcpSession(TelcoSessionContext* ctx) noexcept {
+    if (!ctx || ctx->GetDhcpXid() == 0) return;
+
+    uint32_t h = HashDhcp(ctx->GetDhcpXid());
+    uint32_t idx = h & hash_mask_;
+
+    for (uint32_t p = 0; p < MAX_PROBES; ++p) {
+        uint32_t slot = (idx + p) & hash_mask_;
+        if (dhcp_buckets_[slot] == ctx) {
+            dhcp_buckets_[slot] = nullptr;
+
+            uint32_t next = (slot + 1) & hash_mask_;
+            while (dhcp_buckets_[next] != nullptr) {
+                TelcoSessionContext* rehash_ctx = dhcp_buckets_[next];
+                dhcp_buckets_[next] = nullptr;
+
+                uint32_t r_h = HashDhcp(rehash_ctx->GetDhcpXid());
+                uint32_t r_idx = r_h & hash_mask_;
+                for (uint32_t rp = 0; rp < MAX_PROBES; ++rp) {
+                    uint32_t r_slot = (r_idx + rp) & hash_mask_;
+                    if (dhcp_buckets_[r_slot] == nullptr) {
+                        dhcp_buckets_[r_slot] = rehash_ctx;
+                        break;
+                    }
+                }
+                next = (next + 1) & hash_mask_;
+            }
+            break;
+        }
+        if (dhcp_buckets_[slot] == nullptr) break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BFD Session Lookup & Management
+// ---------------------------------------------------------------------------
+
+TelcoSessionContext* SessionManager::FindBfdSession(uint32_t my_disc) const noexcept {
+    if (my_disc == 0) return nullptr;
+    uint32_t h = HashBfd(my_disc);
+    uint32_t idx = h & hash_mask_;
+
+    for (uint32_t p = 0; p < MAX_PROBES; ++p) {
+        uint32_t slot = (idx + p) & hash_mask_;
+        TelcoSessionContext* s = bfd_buckets_[slot];
+        if (!s) return nullptr;
+
+        if (s->GetBfdLocalDisc() == my_disc) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+bool SessionManager::BindBfdSession(TelcoSessionContext* ctx, uint32_t my_disc) noexcept {
+    if (!ctx || my_disc == 0) return false;
+
+    UnbindBfdSession(ctx);
+
+    ctx->SetBfdLocalDisc(my_disc);
+    uint32_t h = HashBfd(my_disc);
+    uint32_t idx = h & hash_mask_;
+
+    for (uint32_t p = 0; p < MAX_PROBES; ++p) {
+        uint32_t slot = (idx + p) & hash_mask_;
+        if (bfd_buckets_[slot] == nullptr || bfd_buckets_[slot] == ctx) {
+            bfd_buckets_[slot] = ctx;
+            return true;
+        }
+    }
+    return false;
+}
+
+void SessionManager::UnbindBfdSession(TelcoSessionContext* ctx) noexcept {
+    if (!ctx || ctx->GetBfdLocalDisc() == 0) return;
+
+    uint32_t h = HashBfd(ctx->GetBfdLocalDisc());
+    uint32_t idx = h & hash_mask_;
+
+    for (uint32_t p = 0; p < MAX_PROBES; ++p) {
+        uint32_t slot = (idx + p) & hash_mask_;
+        if (bfd_buckets_[slot] == ctx) {
+            bfd_buckets_[slot] = nullptr;
+
+            uint32_t next = (slot + 1) & hash_mask_;
+            while (bfd_buckets_[next] != nullptr) {
+                TelcoSessionContext* rehash_ctx = bfd_buckets_[next];
+                bfd_buckets_[next] = nullptr;
+
+                uint32_t r_h = HashBfd(rehash_ctx->GetBfdLocalDisc());
+                uint32_t r_idx = r_h & hash_mask_;
+                for (uint32_t rp = 0; rp < MAX_PROBES; ++rp) {
+                    uint32_t r_slot = (r_idx + rp) & hash_mask_;
+                    if (bfd_buckets_[r_slot] == nullptr) {
+                        bfd_buckets_[r_slot] = rehash_ctx;
+                        break;
+                    }
+                }
+                next = (next + 1) & hash_mask_;
+            }
+            break;
+        }
+        if (bfd_buckets_[slot] == nullptr) break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5G PFCP Session Lookup & Management
+// ---------------------------------------------------------------------------
+
+TelcoSessionContext* SessionManager::FindPfcpSession(uint64_t seid) const noexcept {
+    if (seid == 0) return nullptr;
+    uint32_t h = HashPfcp(seid);
+    uint32_t idx = h & hash_mask_;
+
+    for (uint32_t p = 0; p < MAX_PROBES; ++p) {
+        uint32_t slot = (idx + p) & hash_mask_;
+        TelcoSessionContext* s = pfcp_buckets_[slot];
+        if (!s) return nullptr;
+
+        if (s->GetPfcpSeid() == seid) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+bool SessionManager::BindPfcpSession(TelcoSessionContext* ctx, uint64_t seid) noexcept {
+    if (!ctx || seid == 0) return false;
+
+    UnbindPfcpSession(ctx);
+
+    ctx->SetPfcpSeid(seid);
+    uint32_t h = HashPfcp(seid);
+    uint32_t idx = h & hash_mask_;
+
+    for (uint32_t p = 0; p < MAX_PROBES; ++p) {
+        uint32_t slot = (idx + p) & hash_mask_;
+        if (pfcp_buckets_[slot] == nullptr || pfcp_buckets_[slot] == ctx) {
+            pfcp_buckets_[slot] = ctx;
+            return true;
+        }
+    }
+    return false;
+}
+
+void SessionManager::UnbindPfcpSession(TelcoSessionContext* ctx) noexcept {
+    if (!ctx || ctx->GetPfcpSeid() == 0) return;
+
+    uint32_t h = HashPfcp(ctx->GetPfcpSeid());
+    uint32_t idx = h & hash_mask_;
+
+    for (uint32_t p = 0; p < MAX_PROBES; ++p) {
+        uint32_t slot = (idx + p) & hash_mask_;
+        if (pfcp_buckets_[slot] == ctx) {
+            pfcp_buckets_[slot] = nullptr;
+
+            uint32_t next = (slot + 1) & hash_mask_;
+            while (pfcp_buckets_[next] != nullptr) {
+                TelcoSessionContext* rehash_ctx = pfcp_buckets_[next];
+                pfcp_buckets_[next] = nullptr;
+
+                uint32_t r_h = HashPfcp(rehash_ctx->GetPfcpSeid());
+                uint32_t r_idx = r_h & hash_mask_;
+                for (uint32_t rp = 0; rp < MAX_PROBES; ++rp) {
+                    uint32_t r_slot = (r_idx + rp) & hash_mask_;
+                    if (pfcp_buckets_[r_slot] == nullptr) {
+                        pfcp_buckets_[r_slot] = rehash_ctx;
+                        break;
+                    }
+                }
+                next = (next + 1) & hash_mask_;
+            }
+            break;
+        }
+        if (pfcp_buckets_[slot] == nullptr) break;
+    }
+}
+
 size_t SessionManager::GetMemoryFootprintBytes() const noexcept {
     size_t total = pool_alloc_size_;
     total += static_cast<size_t>(max_sessions_) * sizeof(uint32_t); // free_indices
-    total += 3 * static_cast<size_t>(hash_size_) * sizeof(TelcoSessionContext*); // buckets
+    total += 6 * static_cast<size_t>(hash_size_) * sizeof(TelcoSessionContext*); // 6 bucket tables
     return total;
 }
 
