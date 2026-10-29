@@ -23,6 +23,7 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/34-dpdk-kurulum-ve-hazirlik-rehberi.md
 !docs/35-vae-defense-integration.md
 !docs/38-architecture-refactor-plan.md
+!plan/*.md
 !docs/pitch-teknik-hazirlik-barikat.md
 !docs/PR_TASK_TEST_L2_02_RFC6675_SACK.md
 !docs/PR_TASK_TEST_L3_01_IOURING_VS_EPOLL.md
