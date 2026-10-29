@@ -15,6 +15,7 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/33-doca-gpunetio-migration-status.md
 !docs/36-zmq-worker-architecture.md
 !docs/37-dpu-gpu-dataplane-architecture.md
+!docs/37-telecom-engine-guide.md
 !docs/adr/2026-05-13-doca-gpunetio-hybrid-strict.md
 !docs/perf/doca-gpunetio-progress-report.md
 !policies/TERMS_OF_USE.md
