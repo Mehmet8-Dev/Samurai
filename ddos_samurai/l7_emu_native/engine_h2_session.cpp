@@ -659,24 +659,33 @@ int h2_on_header_callback(
     return 0;
   }
   H2StreamState& stream = *it->second;
-  const std::string key = lower_copy(std::string(reinterpret_cast<const char*>(name), namelen));
-  const std::string val(reinterpret_cast<const char*>(value), valuelen);
-  if (key == ":status") {
-    stream.status_code = std::atoi(val.c_str());
-  } else {
-    bool merged = false;
-    for (auto& [field_key, field_value] : stream.response_header_fields) {
-      if (field_key != key) {
-        continue;
+  if (namelen == 7 && std::memcmp(name, ":status", 7) == 0) {
+    int code = 0;
+    for (size_t i = 0; i < valuelen; ++i) {
+      if (value[i] >= '0' && value[i] <= '9') {
+        code = code * 10 + (value[i] - '0');
       }
-      field_value.append("\n");
-      field_value.append(val);
-      merged = true;
-      break;
     }
-    if (!merged) {
-      stream.response_header_fields.emplace_back(key, val);
+    stream.status_code = code;
+    return 0;
+  }
+  std::string key(reinterpret_cast<const char*>(name), namelen);
+  for (char& c : key) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+  }
+  const std::string val(reinterpret_cast<const char*>(value), valuelen);
+  bool merged = false;
+  for (auto& [field_key, field_value] : stream.response_header_fields) {
+    if (field_key != key) {
+      continue;
     }
+    field_value.append("\n");
+    field_value.append(val);
+    merged = true;
+    break;
+  }
+  if (!merged) {
+    stream.response_header_fields.emplace_back(std::move(key), val);
   }
   return 0;
 }

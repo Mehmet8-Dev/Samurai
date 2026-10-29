@@ -3915,8 +3915,14 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
     const uint64_t expiry = ngtcp2_conn_get_expiry(ctx->conn);
     const uint64_t next_wakeup = std::min(deadline_ns, expiry);
     if (next_wakeup > now) {
-      const int wait_ms = static_cast<int>(std::clamp<int64_t>(ns_to_ms_ceil(next_wakeup - now), 0, 10));
-      if (wait_ms > 0) {
+      static const bool busy_poll = env_truthy("SAMURAI_FASTPATH_BUSY_POLL") || env_truthy("SAMURAI_BUSY_POLL");
+      const int wait_ms = busy_poll ? 0 : static_cast<int>(std::clamp<int64_t>(ns_to_ms_ceil(next_wakeup - now), 0, 10));
+      if (busy_poll) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#endif
+      }
+      if (wait_ms > 0 || busy_poll) {
         // Block for the next datagram (or the pacing deadline) on the shared
         // io_uring multishot recv, feeding any that arrive so the QUIC/HTTP-3
         // byte path stays on the ring. When the ring is unavailable (helper
@@ -3939,7 +3945,7 @@ bool drive_io_once(Ngtcp2AttemptCtx* ctx, uint64_t deadline_ns, UdpProbeCounters
             (void)::poll(&pfd, 1, wait_ms);
           }
         }
-        if (out != nullptr) {
+        if (out != nullptr && !busy_poll) {
           out->pacing_wait_events += 1;
         }
       }
