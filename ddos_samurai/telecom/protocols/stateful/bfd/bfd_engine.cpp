@@ -405,7 +405,7 @@ bool BfdEngine::ParseBfdControlPacket(const uint8_t* data, size_t len,
     if (len < offset + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(BfdControlHeader)) return false;
 
     const auto* ip = reinterpret_cast<const Ipv4Header*>(data + offset);
-    if ((ip->ihl_version >> 4) != 4 || ip->protocol != 17) return false;
+    if ((ip->ihl_version >> 4) != 4 || (ip->ihl_version & 0x0F) < 5 || ip->protocol != 17) return false;
 
     // RFC 5881 strict TTL 255 check
     if (ip->ttl != 255) return false;

@@ -142,6 +142,17 @@ struct alignas(64) TelcoSessionContext {
         uint32_t upper = static_cast<uint32_t>(seid >> 32);
         std::memcpy(pad1, &upper, 4);
     }
+
+    inline uint64_t GetPfcpRemoteSeid() const noexcept {
+        uint32_t upper = (static_cast<uint32_t>(s_vlan) << 16) | c_vlan;
+        return (static_cast<uint64_t>(upper) << 32) | ppp_magic_number;
+    }
+    inline void SetPfcpRemoteSeid(uint64_t seid) noexcept {
+        ppp_magic_number = static_cast<uint32_t>(seid & 0xFFFFFFFFULL);
+        uint32_t upper = static_cast<uint32_t>(seid >> 32);
+        s_vlan = static_cast<uint16_t>(upper >> 16);
+        c_vlan = static_cast<uint16_t>(upper & 0xFFFF);
+    }
 };
 
 static_assert(sizeof(TelcoSessionContext) == 128, "TelcoSessionContext tam 2 cache line (128 bayt) olmalidir!");

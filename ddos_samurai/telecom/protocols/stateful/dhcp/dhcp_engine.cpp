@@ -290,6 +290,7 @@ bool DhcpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, TelcoSessionCo
 
     if (ethertype == 0x0800 && len >= offset + sizeof(Ipv4Header) + sizeof(UdpHeader)) {
         const auto* ip = reinterpret_cast<const Ipv4Header*>(frame + offset);
+        if ((ip->ihl_version >> 4) != 4 || (ip->ihl_version & 0x0F) < 5) return false;
         uint8_t ihl = (ip->ihl_version & 0x0F) * 4;
         if (len < offset + ihl + sizeof(UdpHeader)) return false;
 
@@ -414,8 +415,10 @@ void DhcpEngine::HandleDhcpv4Message(const uint8_t* frame, size_t offset, size_t
 
             if (timing_wheel_) {
                 timing_wheel_->Cancel(session);
-                // Schedule T1 renewal timer (0.5 * lease_time)
-                uint32_t t1_ms = (lease_time / 2) * 1000;
+                // Schedule T1 renewal timer (0.5 * lease_time) with 64-bit overflow guard
+                uint64_t t1_ms_64 = (static_cast<uint64_t>(lease_time) / 2) * 1000ULL;
+                if (t1_ms_64 > 0xFFFFFFFFULL) t1_ms_64 = 0xFFFFFFFFULL;
+                uint32_t t1_ms = static_cast<uint32_t>(t1_ms_64);
                 if (t1_ms == 0) t1_ms = 1000;
                 timing_wheel_->Schedule(session, t1_ms);
             }
@@ -487,6 +490,9 @@ void DhcpEngine::HandleDhcpv6Message(const uint8_t* frame, size_t offset, size_t
         if (current_st == DhcpSubState::SELECTING) {
             SetSubState(session, DhcpSubState::REQUESTING);
             session->retry_count = 0;
+            if (has_ipv6) {
+                std::memcpy(&session->client_ip, assigned_ipv6 + 12, 4);
+            }
             last_tx_frame_ = BuildDhcpv6Request(session, server_duid, server_duid_len, assigned_ipv6);
             session->tx_packets++;
             session->tx_bytes += last_tx_frame_.size();
@@ -499,6 +505,9 @@ void DhcpEngine::HandleDhcpv6Message(const uint8_t* frame, size_t offset, size_t
         if (current_st == DhcpSubState::REQUESTING || current_st == DhcpSubState::RENEWING) {
             SetSubState(session, DhcpSubState::BOUND);
             session->retry_count = 0;
+            if (has_ipv6) {
+                std::memcpy(&session->client_ip, assigned_ipv6 + 12, 4);
+            }
             if (timing_wheel_) {
                 timing_wheel_->Cancel(session);
                 // Schedule T1 renewal (e.g. 1800s)

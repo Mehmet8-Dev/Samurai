@@ -34,6 +34,15 @@ struct UdpHeader {
     uint16_t length;
     uint16_t checksum;
 };
+
+struct Ipv6Header {
+    uint32_t vtc_flow;
+    uint16_t payload_length;
+    uint8_t  next_header;
+    uint8_t  hop_limit;
+    uint8_t  src_ip[16];
+    uint8_t  dst_ip[16];
+};
 #pragma pack(pop)
 
 uint16_t ComputeChecksum(const uint16_t* data, size_t bytes) {
@@ -289,43 +298,82 @@ std::vector<uint8_t> GtpuEngine::Encapsulate(TelcoSessionContext* session,
 
 bool GtpuEngine::Decapsulate(const uint8_t* frame, size_t len, GtpuDecapInfo& out_info) {
     out_info = {};
-    if (!frame || len < (sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(GtpuHeader))) {
+    if (!frame || len < sizeof(GtpuHeader)) {
         return false;
     }
 
-    size_t offset = 12;
-    uint16_t ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
-    offset += 2;
+    size_t offset = 0;
 
-    // VLAN/QinQ Atla
-    if (ethertype == 0x88A8 && len >= offset + 4) {
-        offset += 2;
-        ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
-        offset += 2;
+    // Check if packet starts directly with a GTP-U header (payload pointer from upper layer)
+    bool is_direct_gtp = false;
+    if (len >= sizeof(GtpuHeader)) {
+        uint8_t flags = frame[0];
+        uint8_t version = (flags >> 5) & 0x07;
+        uint8_t proto_pt = (flags >> 4) & 0x01;
+        if (version == 1 && proto_pt == 1) {
+            // Check if not an Ethernet header
+            if (len < 14) {
+                is_direct_gtp = true;
+            } else {
+                uint16_t eth_cand = (static_cast<uint16_t>(frame[12]) << 8) | frame[13];
+                if (eth_cand != 0x0800 && eth_cand != 0x86DD && eth_cand != 0x8100 && eth_cand != 0x88A8) {
+                    is_direct_gtp = true;
+                }
+            }
+        }
     }
-    if (ethertype == 0x8100 && len >= offset + 4) {
+
+    if (!is_direct_gtp) {
+        if (len < 14) return false;
+        offset = 12;
+        uint16_t ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
         offset += 2;
-        ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
-        offset += 2;
+
+        // VLAN/QinQ
+        if (ethertype == 0x88A8 && len >= offset + 4) {
+            offset += 2;
+            ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
+            offset += 2;
+        }
+        if (ethertype == 0x8100 && len >= offset + 4) {
+            offset += 2;
+            ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
+            offset += 2;
+        }
+
+        if (ethertype == 0x0800) {
+            if (len < offset + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(GtpuHeader)) return false;
+            const auto* ip = reinterpret_cast<const Ipv4Header*>(frame + offset);
+            if ((ip->ihl_version >> 4) != 4 || (ip->ihl_version & 0x0F) < 5 || ip->protocol != 17) return false;
+            size_t ip_len = (ip->ihl_version & 0x0F) * 4;
+            offset += ip_len;
+
+            if (len < offset + sizeof(UdpHeader) + sizeof(GtpuHeader)) return false;
+            const auto* udp = reinterpret_cast<const UdpHeader*>(frame + offset);
+            uint16_t dst_port = ntohs(udp->dst_port);
+            uint16_t src_port = ntohs(udp->src_port);
+            if (dst_port != GTPU_PORT && src_port != GTPU_PORT) return false;
+            offset += sizeof(UdpHeader);
+        } else if (ethertype == 0x86DD) {
+            if (len < offset + sizeof(Ipv6Header) + sizeof(UdpHeader) + sizeof(GtpuHeader)) return false;
+            const auto* ip6 = reinterpret_cast<const Ipv6Header*>(frame + offset);
+            if (ip6->next_header != 17) return false;
+            offset += sizeof(Ipv6Header);
+
+            if (len < offset + sizeof(UdpHeader) + sizeof(GtpuHeader)) return false;
+            const auto* udp = reinterpret_cast<const UdpHeader*>(frame + offset);
+            uint16_t dst_port = ntohs(udp->dst_port);
+            uint16_t src_port = ntohs(udp->src_port);
+            if (dst_port != GTPU_PORT && src_port != GTPU_PORT) return false;
+            offset += sizeof(UdpHeader);
+        } else {
+            return false;
+        }
     }
 
-    if (ethertype != 0x0800) return false;
-    if (len < offset + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(GtpuHeader)) return false;
-
-    const auto* ip = reinterpret_cast<const Ipv4Header*>(frame + offset);
-    if ((ip->ihl_version >> 4) != 4 || ip->protocol != 17) return false;
-    size_t ip_len = (ip->ihl_version & 0x0F) * 4;
-    offset += ip_len;
-
-    if (len < offset + sizeof(UdpHeader) + sizeof(GtpuHeader)) return false;
-    const auto* udp = reinterpret_cast<const UdpHeader*>(frame + offset);
-    uint16_t dst_port = ntohs(udp->dst_port);
-    uint16_t src_port = ntohs(udp->src_port);
-    if (dst_port != GTPU_PORT && src_port != GTPU_PORT) return false;
-    offset += sizeof(UdpHeader);
-
-    if (len < offset + sizeof(GtpuHeader)) return false;
-    const auto* gtp = reinterpret_cast<const GtpuHeader*>(frame + offset);
+    size_t gtp_start = offset;
+    if (len < gtp_start + sizeof(GtpuHeader)) return false;
+    const auto* gtp = reinterpret_cast<const GtpuHeader*>(frame + gtp_start);
 
     // 3GPP Sürüm ve Protokol Doğrulaması (Version 1, GTP Proto)
     uint8_t version = (gtp->flags >> 5) & 0x07;
@@ -335,6 +383,9 @@ bool GtpuEngine::Decapsulate(const uint8_t* frame, size_t len, GtpuDecapInfo& ou
     out_info.msg_type = gtp->msg_type;
     out_info.teid = ntohl(gtp->teid);
     uint16_t gtp_payload_len = ntohs(gtp->length);
+
+    // Wire length check: frame MUST contain at least the claimed GTP payload
+    if (len < gtp_start + sizeof(GtpuHeader) + gtp_payload_len) return false;
 
     offset += sizeof(GtpuHeader);
     bool has_e = (gtp->flags & GTPU_FLAG_E) != 0;
@@ -352,9 +403,11 @@ bool GtpuEngine::Decapsulate(const uint8_t* frame, size_t len, GtpuDecapInfo& ou
 
         // Uzantı Başlıkları Zinciri
         uint8_t next_ext = opt->next_ext;
+        uint32_t ext_count = 0;
         while (next_ext != 0 && offset < len) {
+            if (++ext_count > 16) return false; // Prevent malformed infinite loops
             uint8_t ext_len_octets = frame[offset];
-            if (ext_len_octets == 0) break;
+            if (ext_len_octets == 0) return false;
             size_t ext_bytes = ext_len_octets * 4;
             if (offset + ext_bytes > len) return false;
             next_ext = frame[offset + ext_bytes - 1];
@@ -362,11 +415,14 @@ bool GtpuEngine::Decapsulate(const uint8_t* frame, size_t len, GtpuDecapInfo& ou
         }
     }
 
-    if (offset <= len) {
-        out_info.payload = frame + offset;
-        out_info.payload_len = len - offset;
-        (void)gtp_payload_len;
-    }
+    size_t hdr_and_opts = offset - (gtp_start + sizeof(GtpuHeader));
+    if (gtp_payload_len < hdr_and_opts) return false;
+
+    size_t inner_len = gtp_payload_len - hdr_and_opts;
+    if (offset + inner_len > len) return false;
+
+    out_info.payload = frame + offset;
+    out_info.payload_len = inner_len;
 
     return true;
 }
@@ -390,6 +446,7 @@ bool GtpuEngine::ProcessRxFrame(const uint8_t* frame, size_t len, TelcoSessionCo
 
     // 1. G-PDU Veri Düzlemi Paketi (Msg Type 255)
     if (info.msg_type == static_cast<uint8_t>(GtpuMessageType::GPdu)) {
+        if (info.teid == 0) return false; // 3GPP TS 29.281: G-PDU TEID must not be 0
         if (!session) return false; // Bilinmeyen tünel
 
         session->rx_packets++;

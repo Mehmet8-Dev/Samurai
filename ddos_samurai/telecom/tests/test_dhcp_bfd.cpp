@@ -389,6 +389,62 @@ void TestBfdRfc5881StrictValidationAndFuzz() {
     std::cout << "  -> BFD RFC 5881 Strict TTL 255 & Fuzz Protection: PASSED" << std::endl;
 }
 
+void TestDhcpv4InfiniteLease() {
+    std::cout << "[TEST] 9. DHCPv4 Infinite Lease (0xFFFFFFFF) Timing Overflow Guard..." << std::endl;
+
+    SessionManager mgr(10);
+    HierarchicalTimingWheel wheel(2400000000ULL);
+    DhcpEngine engine(mgr, &wheel);
+
+    TelcoSessionContext* s = mgr.AcquireSession();
+    uint8_t mac[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    std::memcpy(s->client_mac, mac, 6);
+
+    uint32_t xid = 0x55667788;
+    engine.StartDhcpv4(s, xid);
+
+    // Offer with lease_time = 0xFFFFFFFF (RFC 2131 infinite lease)
+    auto offer = engine.BuildDhcpv4Offer(s, 0x0A010101, 0x0A0101FE, 0xFFFFFFFF);
+    engine.ProcessRxFrame(offer.data(), offer.size(), s);
+    assert(engine.GetSubState(s) == DhcpSubState::REQUESTING);
+
+    // Ack with lease_time = 0xFFFFFFFF (Must not overflow uint32 timing wheel calculation)
+    auto ack = engine.BuildDhcpv4Ack(s, 0x0A010101, 0x0A0101FE, 0xFFFFFFFF);
+    engine.ProcessRxFrame(ack.data(), ack.size(), s);
+    assert(engine.GetSubState(s) == DhcpSubState::BOUND);
+    assert(s->state == SessionState::ESTABLISHED);
+
+    std::cout << "  -> DHCPv4 Infinite Lease Overflow Guard: PASSED" << std::endl;
+}
+
+void TestIpv4MalformedIhlRejection() {
+    std::cout << "[TEST] 10. IPv4 Malformed IHL < 5 Rejection (BFD & DHCP)..." << std::endl;
+
+    SessionManager mgr(10);
+    BfdEngine bfd(mgr, nullptr);
+    DhcpEngine dhcp(mgr, nullptr);
+    TelcoSessionContext* s = mgr.AcquireSession();
+
+    auto valid_bfd = BfdEngine::build_bfd_control_packet(
+        {"10.0.0.1", "10.0.0.2", "00:11:22:33:44:55", "00:aa:bb:cc:dd:ee", 49152, 3784, 10000, 10000, 3, 0x11112222},
+        BfdState::Up, BfdDiag::None, 0x33334444);
+
+    // Corrupt IHL to 3 (less than minimum 5)
+    auto bad_ihl_bfd = valid_bfd;
+    bad_ihl_bfd[14] = 0x43; // Version 4, IHL 3 (12 bytes, invalid!)
+    BfdControlHeader hdr{};
+    uint32_t r_disc = 0;
+    assert(!BfdEngine::ParseBfdControlPacket(bad_ihl_bfd.data(), bad_ihl_bfd.size(), hdr, r_disc));
+
+    // Corrupt DHCP frame IHL to 2
+    auto valid_offer = dhcp.BuildDhcpv4Offer(s, 0x0A000002, 0x0A000001, 3600);
+    auto bad_ihl_dhcp = valid_offer;
+    bad_ihl_dhcp[14] = 0x42; // Version 4, IHL 2
+    assert(!dhcp.ProcessRxFrame(bad_ihl_dhcp.data(), bad_ihl_dhcp.size(), s));
+
+    std::cout << "  -> IPv4 Malformed IHL < 5 Rejection: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "        SAMURAI DHCP & BFD STATEFUL FSM VERIFICATION SUITE       " << std::endl;
@@ -402,6 +458,8 @@ int main() {
     TestBfdFullLifecycleAndKeepalive();
     TestBfdDetectionTimeoutFailover();
     TestBfdRfc5881StrictValidationAndFuzz();
+    TestDhcpv4InfiniteLease();
+    TestIpv4MalformedIhlRejection();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL DHCP & BFD TESTS PASSED SUCCESSFULLY! (100% VERIFIED)      " << std::endl;

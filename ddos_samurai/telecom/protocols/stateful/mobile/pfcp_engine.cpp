@@ -34,6 +34,15 @@ struct UdpHeader {
     uint16_t length;
     uint16_t checksum;
 };
+
+struct Ipv6Header {
+    uint32_t vtc_flow;
+    uint16_t payload_length;
+    uint8_t  next_header;
+    uint8_t  hop_limit;
+    uint8_t  src_ip[16];
+    uint8_t  dst_ip[16];
+};
 #pragma pack(pop)
 
 uint16_t ComputeChecksum(const uint16_t* data, size_t bytes) {
@@ -83,12 +92,12 @@ void AppendIe(std::vector<uint8_t>& buf, PfcpIeType type, const uint8_t* val, ui
     }
 }
 
-void ScanIe(const uint8_t* data, size_t len, PfcpDecapInfo& out_info) {
+void ScanIe(const uint8_t* data, size_t len, PfcpDecapInfo& out_info, uint32_t depth = 0) {
+    if (depth > 8) return; // Recursion depth safeguard against malformed loops
     size_t curr = 0;
     while (curr + sizeof(PfcpIeHeader) <= len) {
-        const auto* ie = reinterpret_cast<const PfcpIeHeader*>(data + curr);
-        uint16_t ie_type = ntohs(ie->type);
-        uint16_t ie_len = ntohs(ie->length);
+        uint16_t ie_type = (static_cast<uint16_t>(data[curr]) << 8) | data[curr + 1];
+        uint16_t ie_len = (static_cast<uint16_t>(data[curr + 2]) << 8) | data[curr + 3];
         curr += sizeof(PfcpIeHeader);
         if (curr + ie_len > len) break;
 
@@ -99,30 +108,40 @@ void ScanIe(const uint8_t* data, size_t len, PfcpDecapInfo& out_info) {
             out_info.has_cause = true;
         } else if (ie_type == static_cast<uint16_t>(PfcpIeType::FSeid) && ie_len >= 9) {
             uint8_t flags = val[0];
-            if (flags & 0x02) { // IPv4
+            if ((flags & 0x03) != 0) { // 3GPP TS 29.244: Flags bit 1=V6, bit 2=V4 (SEID is always 8 bytes)
                 out_info.has_f_seid = true;
-                const uint64_t* seid_ptr = reinterpret_cast<const uint64_t*>(val + 1);
-                out_info.f_seid = Ntoh64(*seid_ptr);
+                uint64_t raw_seid = 0;
+                std::memcpy(&raw_seid, val + 1, 8);
+                out_info.f_seid = Ntoh64(raw_seid);
             }
         } else if (ie_type == static_cast<uint16_t>(PfcpIeType::PdrId) && ie_len >= 2) {
             out_info.pdr_id = (static_cast<uint16_t>(val[0]) << 8) | val[1];
         } else if (ie_type == static_cast<uint16_t>(PfcpIeType::FarId) && ie_len >= 4) {
-            const uint32_t* fid_ptr = reinterpret_cast<const uint32_t*>(val);
-            out_info.far_id = ntohl(*fid_ptr);
+            uint32_t raw_fid = 0;
+            std::memcpy(&raw_fid, val, 4);
+            out_info.far_id = ntohl(raw_fid);
         } else if (ie_type == static_cast<uint16_t>(PfcpIeType::FTeid) && ie_len >= 5) {
-            out_info.has_f_teid = true;
-            const uint32_t* t_ptr = reinterpret_cast<const uint32_t*>(val + 1);
-            out_info.f_teid = ntohl(*t_ptr);
+            uint8_t flags = val[0];
+            if (!(flags & 0x04)) { // CH (Choose) flag not set -> TEID present
+                out_info.has_f_teid = true;
+                uint32_t raw_teid = 0;
+                std::memcpy(&raw_teid, val + 1, 4);
+                out_info.f_teid = ntohl(raw_teid);
+            }
         } else if (ie_type == static_cast<uint16_t>(PfcpIeType::UeIpAddress) && ie_len >= 5) {
-            out_info.has_ue_ip = true;
-            const uint32_t* u_ptr = reinterpret_cast<const uint32_t*>(val + 1);
-            out_info.ue_ip = ntohl(*u_ptr);
+            uint8_t flags = val[0];
+            if (flags & 0x02) { // V4 present
+                out_info.has_ue_ip = true;
+                uint32_t raw_ue = 0;
+                std::memcpy(&raw_ue, val + 1, 4);
+                out_info.ue_ip = ntohl(raw_ue);
+            }
         } else if (ie_type == static_cast<uint16_t>(PfcpIeType::CreatePdr) ||
                    ie_type == static_cast<uint16_t>(PfcpIeType::Pdi) ||
                    ie_type == static_cast<uint16_t>(PfcpIeType::CreateFar) ||
                    ie_type == static_cast<uint16_t>(PfcpIeType::ForwardingParameters) ||
                    ie_type == static_cast<uint16_t>(PfcpIeType::UpdateFar)) {
-            ScanIe(val, ie_len, out_info);
+            ScanIe(val, ie_len, out_info, depth + 1);
         }
 
         curr += ie_len;
@@ -322,68 +341,113 @@ rte_mbuf* PfcpEngine::BuildTxPacket(rte_mempool* /*pool*/, TelcoSessionContext* 
 
 bool PfcpEngine::ParsePfcpPacket(const uint8_t* frame, size_t len, PfcpDecapInfo& out_info) {
     out_info = {};
-    if (!frame || len < (sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(PfcpNodeHeader))) {
+    if (!frame || len < sizeof(PfcpNodeHeader)) {
         return false;
     }
 
-    size_t offset = 12;
-    uint16_t ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
-    offset += 2;
+    size_t offset = 0;
 
-    if (ethertype == 0x88A8 && len >= offset + 4) {
-        offset += 2;
-        ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
-        offset += 2;
+    // Direct PFCP payload detection
+    bool is_direct_pfcp = false;
+    if (len >= sizeof(PfcpNodeHeader)) {
+        uint8_t flags = frame[0];
+        uint8_t version = (flags >> 5) & 0x07;
+        if (version == 1) {
+            if (len < 14) {
+                is_direct_pfcp = true;
+            } else {
+                uint16_t eth_cand = (static_cast<uint16_t>(frame[12]) << 8) | frame[13];
+                if (eth_cand != 0x0800 && eth_cand != 0x86DD && eth_cand != 0x8100 && eth_cand != 0x88A8) {
+                    is_direct_pfcp = true;
+                }
+            }
+        }
     }
-    if (ethertype == 0x8100 && len >= offset + 4) {
+
+    if (!is_direct_pfcp) {
+        if (len < 14) return false;
+        offset = 12;
+        uint16_t ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
         offset += 2;
-        ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
-        offset += 2;
+
+        if (ethertype == 0x88A8 && len >= offset + 4) {
+            offset += 2;
+            ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
+            offset += 2;
+        }
+        if (ethertype == 0x8100 && len >= offset + 4) {
+            offset += 2;
+            ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
+            offset += 2;
+        }
+
+        if (ethertype == 0x0800) {
+            if (len < offset + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(PfcpNodeHeader)) return false;
+            const auto* ip = reinterpret_cast<const Ipv4Header*>(frame + offset);
+            if ((ip->ihl_version >> 4) != 4 || (ip->ihl_version & 0x0F) < 5 || ip->protocol != 17) return false;
+            size_t ip_len = (ip->ihl_version & 0x0F) * 4;
+            offset += ip_len;
+
+            if (len < offset + sizeof(UdpHeader) + sizeof(PfcpNodeHeader)) return false;
+            const auto* udp = reinterpret_cast<const UdpHeader*>(frame + offset);
+            uint16_t dst_port = ntohs(udp->dst_port);
+            uint16_t src_port = ntohs(udp->src_port);
+            if (dst_port != PFCP_PORT && src_port != PFCP_PORT) return false;
+            offset += sizeof(UdpHeader);
+        } else if (ethertype == 0x86DD) {
+            if (len < offset + sizeof(Ipv6Header) + sizeof(UdpHeader) + sizeof(PfcpNodeHeader)) return false;
+            const auto* ip6 = reinterpret_cast<const Ipv6Header*>(frame + offset);
+            if (ip6->next_header != 17) return false;
+            offset += sizeof(Ipv6Header);
+
+            if (len < offset + sizeof(UdpHeader) + sizeof(PfcpNodeHeader)) return false;
+            const auto* udp = reinterpret_cast<const UdpHeader*>(frame + offset);
+            uint16_t dst_port = ntohs(udp->dst_port);
+            uint16_t src_port = ntohs(udp->src_port);
+            if (dst_port != PFCP_PORT && src_port != PFCP_PORT) return false;
+            offset += sizeof(UdpHeader);
+        } else {
+            return false;
+        }
     }
 
-    if (ethertype != 0x0800) return false;
-    if (len < offset + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(PfcpNodeHeader)) return false;
+    size_t pfcp_start = offset;
+    if (len < pfcp_start + sizeof(PfcpNodeHeader)) return false;
 
-    const auto* ip = reinterpret_cast<const Ipv4Header*>(frame + offset);
-    if ((ip->ihl_version >> 4) != 4 || ip->protocol != 17) return false;
-    size_t ip_len = (ip->ihl_version & 0x0F) * 4;
-    offset += ip_len;
-
-    if (len < offset + sizeof(UdpHeader) + sizeof(PfcpNodeHeader)) return false;
-    const auto* udp = reinterpret_cast<const UdpHeader*>(frame + offset);
-    uint16_t dst_port = ntohs(udp->dst_port);
-    uint16_t src_port = ntohs(udp->src_port);
-    if (dst_port != PFCP_PORT && src_port != PFCP_PORT) return false;
-    offset += sizeof(UdpHeader);
-
-    if (len < offset + sizeof(PfcpNodeHeader)) return false;
-    uint8_t flags = frame[offset];
+    uint8_t flags = frame[pfcp_start];
     uint8_t version = (flags >> 5) & 0x07;
     if (version != 1) return false;
 
     bool has_s = (flags & 0x01) != 0;
     out_info.is_session = has_s;
-    out_info.msg_type = frame[offset + 1];
+    out_info.msg_type = frame[pfcp_start + 1];
+
+    uint16_t pfcp_len = (static_cast<uint16_t>(frame[pfcp_start + 2]) << 8) | frame[pfcp_start + 3];
+    // 3GPP TS 29.244: length covers 4 octets following first 4 octets
+    if (len < pfcp_start + 4 + pfcp_len) return false; // Truncated frame!
 
     size_t hdr_size = has_s ? sizeof(PfcpSessionHeader) : sizeof(PfcpNodeHeader);
-    if (len < offset + hdr_size) return false;
+    if (static_cast<size_t>(pfcp_len + 4) < hdr_size) return false;
 
     if (has_s) {
-        const auto* s_hdr = reinterpret_cast<const PfcpSessionHeader*>(frame + offset);
-        out_info.seid = Ntoh64(s_hdr->seid);
+        const auto* s_hdr = reinterpret_cast<const PfcpSessionHeader*>(frame + pfcp_start);
+        uint64_t raw_seid = 0;
+        std::memcpy(&raw_seid, &s_hdr->seid, 8);
+        out_info.seid = Ntoh64(raw_seid);
         out_info.seq_num = GetSeq24(s_hdr->seq_num);
     } else {
-        const auto* n_hdr = reinterpret_cast<const PfcpNodeHeader*>(frame + offset);
+        const auto* n_hdr = reinterpret_cast<const PfcpNodeHeader*>(frame + pfcp_start);
         out_info.seid = 0;
         out_info.seq_num = GetSeq24(n_hdr->seq_num);
     }
 
-    offset += hdr_size;
+    offset = pfcp_start + hdr_size;
+    size_t ie_payload_len = (pfcp_start + 4 + pfcp_len) - offset;
     out_info.payload = frame + offset;
-    out_info.payload_len = len - offset;
+    out_info.payload_len = ie_payload_len;
 
-    // Parse TLV IEs recursively
-    ScanIe(frame + offset, len - offset, out_info);
+    // Parse TLV IEs recursively bounded strictly by claimed PFCP message length
+    ScanIe(frame + offset, ie_payload_len, out_info);
 
     return true;
 }
@@ -429,8 +493,8 @@ bool PfcpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, TelcoSessionCo
         if (info.has_cause && info.cause == static_cast<uint8_t>(PfcpCause::RequestAccepted)) {
             SetSubState(session, PfcpSubState::ESTABLISHED);
             if (info.has_f_seid) {
-                // Remote UPF SEID
-                session->teid_downlink = static_cast<uint32_t>(info.f_seid & 0xFFFFFFFFULL);
+                // Store UPF assigned SEID in Remote SEID (Preserve downlink TEID!)
+                session->SetPfcpRemoteSeid(info.f_seid);
             }
             if (timing_wheel_) {
                 timing_wheel_->Schedule(session, pfcp_cfg_.heartbeat_interval_ms);
@@ -449,8 +513,12 @@ bool PfcpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, TelcoSessionCo
     }
 
     if (info.msg_type == static_cast<uint8_t>(PfcpMessageType::SessionDeletionResponse)) {
-        SetSubState(session, PfcpSubState::RELEASED);
-        session_mgr_.UnbindPfcpSession(session);
+        if (!info.has_cause || info.cause == static_cast<uint8_t>(PfcpCause::RequestAccepted)) {
+            SetSubState(session, PfcpSubState::RELEASED);
+            session_mgr_.UnbindPfcpSession(session);
+        } else {
+            SetSubState(session, PfcpSubState::FAILED);
+        }
         return true;
     }
 
@@ -889,7 +957,8 @@ std::vector<uint8_t> PfcpEngine::BuildSessionModificationRequest(TelcoSessionCon
     pfcp->flags = 0x21;
     pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::SessionModificationRequest);
     pfcp->length = htons(static_cast<uint16_t>(12 + payload.size()));
-    pfcp->seid = Hton64(session ? session->GetPfcpSeid() : 0);
+    uint64_t target_seid = session ? (session->GetPfcpRemoteSeid() != 0 ? session->GetPfcpRemoteSeid() : session->GetPfcpSeid()) : 0;
+    pfcp->seid = Hton64(target_seid);
     SetSeq24(pfcp->seq_num, seq);
     pfcp->spare = 0;
 
@@ -971,7 +1040,8 @@ std::vector<uint8_t> PfcpEngine::BuildSessionDeletionRequest(TelcoSessionContext
     pfcp->flags = 0x21;
     pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::SessionDeletionRequest);
     pfcp->length = htons(12);
-    pfcp->seid = Hton64(session ? session->GetPfcpSeid() : 0);
+    uint64_t target_seid = session ? (session->GetPfcpRemoteSeid() != 0 ? session->GetPfcpRemoteSeid() : session->GetPfcpSeid()) : 0;
+    pfcp->seid = Hton64(target_seid);
     SetSeq24(pfcp->seq_num, seq);
     pfcp->spare = 0;
 

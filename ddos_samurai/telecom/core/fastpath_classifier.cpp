@@ -159,6 +159,14 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
                 out_type = TelcoFrameType::Bfd;
                 return true;
             }
+            if (meta.dst_port == 2152 || meta.src_port == 2152) { // 3GPP GTP-U over IPv6
+                out_type = TelcoFrameType::Gtpu;
+                return true;
+            }
+            if (meta.dst_port == 8805 || meta.src_port == 8805) { // 3GPP PFCP over IPv6
+                out_type = TelcoFrameType::Pfcp;
+                return true;
+            }
         }
 
         out_type = TelcoFrameType::Ipv6Data;

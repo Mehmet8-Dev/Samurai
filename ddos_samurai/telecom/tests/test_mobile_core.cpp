@@ -316,6 +316,8 @@ void TestPfcpSessionLifecycle() {
     assert(handled);
     assert(engine.GetSubState(s) == PfcpSubState::ESTABLISHED);
     assert(s->state == SessionState::ESTABLISHED);
+    assert(s->teid_downlink == far.outer_teid); // DOWNLINK TEID PRESERVED!
+    assert(s->GetPfcpRemoteSeid() == up_seid);  // REMOTE UPF SEID STORED!
 
     // 2. Modify Session (e.g. Switch Action to Drop / Forwarding Update)
     PfcpFar updated_far = far;
@@ -328,6 +330,7 @@ void TestPfcpSessionLifecycle() {
     ok = PfcpEngine::ParsePfcpPacket(mod_req.data(), mod_req.size(), mod_info);
     assert(ok);
     assert(mod_info.msg_type == static_cast<uint8_t>(PfcpMessageType::SessionModificationRequest));
+    assert(mod_info.seid == up_seid); // 3GPP TS 29.244: UPF SEID MUST BE USED IN REQUEST!
 
     auto mod_resp = engine.BuildSessionModificationResponse(s, mod_info.seq_num, PfcpCause::RequestAccepted);
     handled = engine.ProcessRxFrame(mod_resp.data(), mod_resp.size(), s);
@@ -343,6 +346,7 @@ void TestPfcpSessionLifecycle() {
     ok = PfcpEngine::ParsePfcpPacket(del_req.data(), del_req.size(), del_info);
     assert(ok);
     assert(del_info.msg_type == static_cast<uint8_t>(PfcpMessageType::SessionDeletionRequest));
+    assert(del_info.seid == up_seid); // UPF SEID MUST BE USED IN REQUEST!
 
     auto del_resp = engine.BuildSessionDeletionResponse(s, del_info.seq_num, PfcpCause::RequestAccepted);
     handled = engine.ProcessRxFrame(del_resp.data(), del_resp.size(), s);
@@ -440,6 +444,181 @@ void TestMobileFuzzResistance() {
     std::cout << "  -> Mobile Core Fuzz / Truncation Immunity: PASSED (No Crash)" << std::endl;
 }
 
+void TestGtpuAndPfcpIpv6Transport() {
+    std::cout << "[TEST] 9. GTP-U & PFCP IPv6 Outer Transport Decapsulation & Demux..." << std::endl;
+
+    // 1. Build an IPv6/UDP/GTP-U frame manually
+    std::vector<uint8_t> frame;
+    // Ethernet Header (14 bytes)
+    for (int i = 0; i < 6; ++i) frame.push_back(0x11);
+    for (int i = 0; i < 6; ++i) frame.push_back(0x22);
+    frame.push_back(0x86); frame.push_back(0xDD); // Ethertype IPv6
+
+    // IPv6 Header (40 bytes)
+    frame.push_back(0x60); frame.push_back(0x00); frame.push_back(0x00); frame.push_back(0x00); // VTC
+    uint16_t udp_total_len = htons(8 + 8 + 20); // UDP + GTP + 20-byte payload
+    frame.push_back(static_cast<uint8_t>(udp_total_len & 0xFF)); // payload length
+    frame.push_back(static_cast<uint8_t>(udp_total_len >> 8));
+    frame.push_back(17); // Next Header UDP
+    frame.push_back(64); // Hop Limit
+    // Src IPv6 (2001:db8::1)
+    frame.push_back(0x20); frame.push_back(0x01); frame.push_back(0x0D); frame.push_back(0xB8);
+    for (int i = 0; i < 11; ++i) frame.push_back(0x00);
+    frame.push_back(0x01);
+    // Dst IPv6 (2001:db8::2)
+    frame.push_back(0x20); frame.push_back(0x01); frame.push_back(0x0D); frame.push_back(0xB8);
+    for (int i = 0; i < 11; ++i) frame.push_back(0x00);
+    frame.push_back(0x02);
+
+    // UDP Header (8 bytes)
+    uint16_t src_p = htons(2152);
+    uint16_t dst_p = htons(2152);
+    uint16_t u_len = htons(8 + 8 + 20);
+    frame.push_back(static_cast<uint8_t>(src_p & 0xFF)); frame.push_back(static_cast<uint8_t>(src_p >> 8));
+    frame.push_back(static_cast<uint8_t>(dst_p & 0xFF)); frame.push_back(static_cast<uint8_t>(dst_p >> 8));
+    frame.push_back(static_cast<uint8_t>(u_len & 0xFF)); frame.push_back(static_cast<uint8_t>(u_len >> 8));
+    frame.push_back(0); frame.push_back(0); // Checksum 0
+
+    // GTP-U Header (8 bytes)
+    frame.push_back(0x30); // Flags (v1, proto=1)
+    frame.push_back(255);  // MsgType G-PDU
+    uint16_t gtp_len = htons(20);
+    frame.push_back(static_cast<uint8_t>(gtp_len & 0xFF)); frame.push_back(static_cast<uint8_t>(gtp_len >> 8));
+    uint32_t teid = htonl(0xCAFEBABE);
+    const auto* teid_bytes = reinterpret_cast<const uint8_t*>(&teid);
+    frame.insert(frame.end(), teid_bytes, teid_bytes + 4);
+
+    // 20 bytes dummy payload
+    for (int i = 0; i < 20; ++i) frame.push_back(static_cast<uint8_t>(i + 1));
+
+    // Test FastpathClassifier on IPv6 GTP-U
+    TelcoFrameType f_type;
+    PacketMetadata meta;
+    bool class_ok = FastpathClassifier::Classify(frame.data(), frame.size(), meta, f_type);
+    assert(class_ok);
+    assert(f_type == TelcoFrameType::Gtpu);
+
+    // Test GtpuEngine::Decapsulate on IPv6 frame
+    GtpuDecapInfo d_info{};
+    bool decap_ok = GtpuEngine::Decapsulate(frame.data(), frame.size(), d_info);
+    assert(decap_ok);
+    assert(d_info.teid == 0xCAFEBABE);
+    assert(d_info.msg_type == 255);
+    assert(d_info.payload_len == 20);
+
+    std::cout << "  -> GTP-U & PFCP IPv6 Outer Transport Decapsulation: PASSED" << std::endl;
+}
+
+void TestGtpuWireFramePaddingAndDirectDecap() {
+    std::cout << "[TEST] 10. GTP-U Wire Frame Padding & Direct Decapsulation..." << std::endl;
+
+    SessionManager mgr(10);
+    GtpuEngine gtpu(mgr, nullptr);
+    TelcoSessionContext* s = mgr.AcquireSession();
+    GtpuTunnelConfig cfg{};
+    cfg.uplink_teid = 0x55443322;
+    gtpu.StartSession(s, cfg);
+
+    auto inner = CreateDummyInnerIpPacket(); // 28 bytes
+    auto frame = gtpu.Encapsulate(s, inner.data(), inner.size());
+
+    // Append 30 bytes of Ethernet switch zero padding to simulate wire padding
+    std::vector<uint8_t> padded_frame = frame;
+    padded_frame.insert(padded_frame.end(), 30, 0x00);
+
+    GtpuDecapInfo decap{};
+    bool ok = GtpuEngine::Decapsulate(padded_frame.data(), padded_frame.size(), decap);
+    assert(ok);
+    // Payload length MUST strictly equal the original inner packet size (28), NOT include the 30 padding bytes!
+    assert(decap.payload_len == inner.size());
+    assert(std::memcmp(decap.payload, inner.data(), inner.size()) == 0);
+
+    // Direct GTP-U Decapsulation test (using pointer directly into GTP-U header)
+    size_t gtp_header_offset = 14 + 20 + 8; // Eth + IPv4 + UDP
+    GtpuDecapInfo direct_decap{};
+    ok = GtpuEngine::Decapsulate(frame.data() + gtp_header_offset, frame.size() - gtp_header_offset, direct_decap);
+    assert(ok);
+    assert(direct_decap.teid == cfg.uplink_teid);
+    assert(direct_decap.payload_len == inner.size());
+
+    std::cout << "  -> GTP-U Wire Frame Padding & Direct Decap: PASSED" << std::endl;
+}
+
+void TestPfcpIpv6FseidParsing() {
+    std::cout << "[TEST] 11. PFCP IPv6 F-SEID Parsing & Downlink TEID Integrity..." << std::endl;
+
+    SessionManager mgr(10);
+    PfcpEngine pfcp(mgr, nullptr);
+    TelcoSessionContext* s = mgr.AcquireSession();
+
+    PfcpPdr pdr{};
+    pdr.teid = 0x11112222;
+    PfcpFar far{};
+    far.outer_teid = 0x33334444; // This outer TEID MUST remain intact!
+
+    uint64_t cp_seid = 0x1234567890ABCDEFULL;
+    pfcp.EstablishSession(s, cp_seid, pdr, far);
+    assert(s->teid_downlink == 0x33334444);
+
+    // Build Response with IPv6 F-SEID (Flags = 0x01: IPv6 only)
+    uint64_t up_seid_v6 = 0xFEDCBA0987654321ULL;
+    auto resp = pfcp.BuildSessionEstablishmentResponse(s, 1, cp_seid, up_seid_v6, PfcpCause::RequestAccepted);
+
+    // Patch F-SEID in response frame to have Flags=0x01 (IPv6 only)
+    for (size_t i = 0; i < resp.size() - 15; ++i) {
+        if (resp[i] == 0x00 && resp[i + 1] == 57) { // IE Type 57 (F-SEID)
+            resp[i + 4] = 0x01; // Flags: IPv6
+            break;
+        }
+    }
+
+    bool handled = pfcp.ProcessRxFrame(resp.data(), resp.size(), s);
+    assert(handled);
+    assert(pfcp.GetSubState(s) == PfcpSubState::ESTABLISHED);
+    assert(s->GetPfcpRemoteSeid() == up_seid_v6); // Successfully parsed IPv6 F-SEID!
+    assert(s->teid_downlink == 0x33334444);      // Downlink TEID NOT clobbered!
+
+    std::cout << "  -> PFCP IPv6 F-SEID Parsing & Downlink TEID Integrity: PASSED" << std::endl;
+}
+
+void TestGtpuTeidZeroDropAndPfcpRecursionLimit() {
+    std::cout << "[TEST] 12. GTP-U TEID=0 Drop & PFCP IE Recursion Limit..." << std::endl;
+
+    SessionManager mgr(10);
+    GtpuEngine gtpu(mgr, nullptr);
+    TelcoSessionContext* s = mgr.AcquireSession();
+    GtpuTunnelConfig cfg{};
+    cfg.uplink_teid = 0x1000;
+    gtpu.StartSession(s, cfg);
+
+    auto inner = CreateDummyInnerIpPacket();
+    auto frame = gtpu.Encapsulate(s, inner.data(), inner.size());
+
+    // Corrupt TEID to 0 in G-PDU
+    size_t gtp_hdr_offset = 14 + 20 + 8;
+    frame[gtp_hdr_offset + 4] = 0;
+    frame[gtp_hdr_offset + 5] = 0;
+    frame[gtp_hdr_offset + 6] = 0;
+    frame[gtp_hdr_offset + 7] = 0;
+
+    // ProcessRxFrame MUST drop G-PDU with TEID 0 per 3GPP TS 29.281
+    bool handled = gtpu.ProcessRxFrame(frame.data(), frame.size());
+    assert(!handled);
+
+    // Deeply nested CreatePdr IEs (20 layers) to verify recursion limit (depth > 8)
+    std::vector<uint8_t> nested_ies;
+    for (int layer = 0; layer < 20; ++layer) {
+        nested_ies.push_back(0x00); nested_ies.push_back(0x01); // CreatePdr (Type 1)
+        nested_ies.push_back(0x00); nested_ies.push_back(10);   // Length
+    }
+    PfcpDecapInfo d_info{};
+    PfcpEngine pfcp(mgr, nullptr);
+    // Must not crash or stack-overflow
+    pfcp.ProcessRxFrame(nested_ies.data(), nested_ies.size());
+
+    std::cout << "  -> GTP-U TEID=0 Drop & PFCP IE Recursion Limit: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "     SAMURAI 4G/5G GTP-U & PFCP MOBILE CORE VERIFICATION SUITE   " << std::endl;
@@ -453,6 +632,10 @@ int main() {
     TestPfcpSessionLifecycle();
     TestCrossPlanePfcpGtpuIntegration();
     TestMobileFuzzResistance();
+    TestGtpuAndPfcpIpv6Transport();
+    TestGtpuWireFramePaddingAndDirectDecap();
+    TestPfcpIpv6FseidParsing();
+    TestGtpuTeidZeroDropAndPfcpRecursionLimit();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL MOBILE CORE TESTS PASSED SUCCESSFULLY! (100% VERIFIED)     " << std::endl;
