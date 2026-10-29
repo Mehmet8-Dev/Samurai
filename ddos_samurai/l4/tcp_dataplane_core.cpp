@@ -875,15 +875,16 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
   if (now_ns == 0) {
     now_ns = DefaultNowNs();
   }
-  stats_shard_[poll_rr_shard_ % kFlowLockShards].poll_calls.fetch_add(1, std::memory_order_relaxed);
+  stats_shard_[poll_rr_shard_.load(std::memory_order_relaxed) % kFlowLockShards].poll_calls.fetch_add(1, std::memory_order_relaxed);
   uint32_t actions = 0;
   while (actions < budget) {
     TimerEntry entry{};
     size_t selected_shard = kFlowLockShards;
     bool have_entry = false;
     {
+      const uint32_t rr_base = poll_rr_shard_.load(std::memory_order_relaxed);
       for (size_t probe = 0; probe < kFlowLockShards; ++probe) {
-        const size_t shard = static_cast<size_t>((poll_rr_shard_ + probe) % static_cast<uint32_t>(kFlowLockShards));
+        const size_t shard = static_cast<size_t>((rr_base + probe) % static_cast<uint32_t>(kFlowLockShards));
         // Lock-free skip: nothing in this shard is due yet.
         if (timer_shard_min_due_ns_[shard].load(std::memory_order_relaxed) > now_ns) {
           continue;
@@ -903,7 +904,7 @@ uint32_t TcpDataplaneCore::Poll(uint64_t now_ns, uint32_t budget) {
         entry = top;
         selected_shard = shard;
         have_entry = true;
-        poll_rr_shard_ = static_cast<uint32_t>((shard + 1) % kFlowLockShards);
+        poll_rr_shard_.store(static_cast<uint32_t>((shard + 1) % kFlowLockShards), std::memory_order_relaxed);
         break;
       }
       if (!have_entry) {
@@ -1232,23 +1233,29 @@ uint32_t TcpDataplaneCore::ConsumeTxPackets(uint32_t max_packets) {
 }
 
 std::vector<TcpDpCompletion> TcpDataplaneCore::CollectCompletions() {
-  std::lock_guard<SpinLock> guard(completion_mu_);
+  std::deque<TcpDpCompletion> local;
+  {
+    std::lock_guard<SpinLock> guard(completion_mu_);
+    local.swap(completions_);
+  }
   std::vector<TcpDpCompletion> out;
-  out.reserve(completions_.size());
-  while (!completions_.empty()) {
-    out.push_back(completions_.front());
-    completions_.pop_front();
+  out.reserve(local.size());
+  for (const auto& item : local) {
+    out.push_back(item);
   }
   return out;
 }
 
 std::vector<TcpDpRxPayload> TcpDataplaneCore::CollectRxPayloads() {
-  std::lock_guard<SpinLock> guard(rx_payload_mu_);
+  std::deque<TcpDpRxPayload> local;
+  {
+    std::lock_guard<SpinLock> guard(rx_payload_mu_);
+    local.swap(rx_payloads_);
+  }
   std::vector<TcpDpRxPayload> out;
-  out.reserve(rx_payloads_.size());
-  while (!rx_payloads_.empty()) {
-    out.push_back(std::move(rx_payloads_.front()));
-    rx_payloads_.pop_front();
+  out.reserve(local.size());
+  for (auto& item : local) {
+    out.push_back(std::move(item));
   }
   return out;
 }

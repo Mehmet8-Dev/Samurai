@@ -533,8 +533,8 @@ class TcpDataplaneCore {
 
   mutable SpinLock state_mu_;
   mutable SpinLock tx_consumer_mu_;   // Serializes consumer peek/consume across shards
-  mutable SpinLock completion_mu_;   // Guards completions_ deque only.
-  mutable SpinLock rx_payload_mu_;   // Guards rx_payloads_ deque only.
+  mutable AlignedSpinLock completion_mu_;   // Guards completions_ deque only.
+  mutable AlignedSpinLock rx_payload_mu_;   // Guards rx_payloads_ deque only.
   mutable std::array<AlignedSpinLock, kFlowLockShards> flow_shard_mu_{};
   mutable std::array<AlignedSpinLock, kFlowLockShards> flow_index_shard_mu_{};
   mutable std::array<AlignedSpinLock, kFlowLockShards> timer_shard_mu_{};
@@ -542,7 +542,7 @@ class TcpDataplaneCore {
   // Lock-free hint of each shard's earliest due_ns (UINT64_MAX = empty). Lets Poll
   // skip shards with nothing due without taking their timer spinlock.
   std::array<std::atomic<uint64_t>, kFlowLockShards> timer_shard_min_due_ns_{};
-  uint32_t poll_rr_shard_ = 0;
+  std::atomic<uint32_t> poll_rr_shard_{0};
   TcpDpConfig config_;
   uint64_t next_flow_id_ = 1;
   uint32_t next_ephemeral_port_ = 40000;
