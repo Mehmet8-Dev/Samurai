@@ -20,7 +20,8 @@ enum class TelcoProtocolId : uint8_t {
     BFD = 6,
     DOT1X = 7,
     STATELESS_GTPU = 10,
-    QINQ_SWEEP = 11
+    QINQ_SWEEP = 11,
+    STATELESS_ARP = 12
 };
 
 struct PacketMetadata {
