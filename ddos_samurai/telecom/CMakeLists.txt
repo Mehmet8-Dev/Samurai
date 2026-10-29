@@ -30,6 +30,12 @@ set(SAMURAI_TELECOM_SOURCES
   protocols/stateful/bfd/bfd_fsm.hpp
   protocols/stateful/bfd/bfd_engine.hpp
   protocols/stateful/bfd/bfd_engine.cpp
+  protocols/stateful/mobile/gtpu_types.hpp
+  protocols/stateful/mobile/gtpu_engine.hpp
+  protocols/stateful/mobile/gtpu_engine.cpp
+  protocols/stateful/mobile/pfcp_types.hpp
+  protocols/stateful/mobile/pfcp_engine.hpp
+  protocols/stateful/mobile/pfcp_engine.cpp
 )
 
 add_library(samurai_telecom_static STATIC ${SAMURAI_TELECOM_SOURCES})
@@ -42,6 +48,7 @@ target_include_directories(samurai_telecom_static PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/pppoe
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/dhcp
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/bfd
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/mobile
   ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
   ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk
 )
@@ -88,4 +95,16 @@ target_include_directories(test_dhcp_bfd PRIVATE
 )
 target_compile_options(test_dhcp_bfd PRIVATE -UNDEBUG)
 target_link_libraries(test_dhcp_bfd PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
+add_executable(test_mobile_core tests/test_mobile_core.cpp)
+target_include_directories(test_mobile_core PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/mobile
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_mobile_core PRIVATE -UNDEBUG)
+target_link_libraries(test_mobile_core PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
 
