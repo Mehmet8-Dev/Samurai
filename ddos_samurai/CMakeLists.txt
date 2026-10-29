@@ -22,6 +22,8 @@ add_link_options(
   $<$<CONFIG:Release>:-s>
 )
 
+enable_testing()
+
 # This tree builds the full native worker + orchestrator + CLI layer.
 add_subdirectory(core)
 add_subdirectory(control)

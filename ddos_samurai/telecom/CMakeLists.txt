@@ -183,3 +183,17 @@ target_include_directories(test_telco_audit_logger PRIVATE
 )
 target_compile_options(test_telco_audit_logger PRIVATE -msse4.2 -UNDEBUG)
 target_link_libraries(test_telco_audit_logger PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
+# ---------------------------------------------------------------------------
+# CTest Registrations for Automated CI/CD
+# ---------------------------------------------------------------------------
+add_test(NAME telecom_core COMMAND test_telco_core)
+add_test(NAME telecom_pppoe_fsm COMMAND test_pppoe_fsm)
+add_test(NAME telecom_dhcp_bfd COMMAND test_dhcp_bfd)
+add_test(NAME telecom_mobile_core COMMAND test_mobile_core)
+add_test(NAME telecom_stateless_generators COMMAND test_stateless_generators)
+add_test(NAME telecom_multi_worker_telco COMMAND test_multi_worker_telco)
+add_test(NAME telecom_cluster_sharding COMMAND test_telco_cluster_sharding)
+add_test(NAME telecom_chaos_recovery COMMAND test_telco_chaos_recovery)
+add_test(NAME telecom_audit_logger COMMAND test_telco_audit_logger)
+
