@@ -147,4 +147,18 @@ target_include_directories(test_multi_worker_telco PRIVATE
 target_compile_options(test_multi_worker_telco PRIVATE -msse4.2 -UNDEBUG)
 target_link_libraries(test_multi_worker_telco PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
 
+add_executable(test_telco_cluster_sharding tests/test_telco_cluster_sharding.cpp)
+target_include_directories(test_telco_cluster_sharding PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/../control
+  ${CMAKE_CURRENT_SOURCE_DIR}/../core
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_telco_cluster_sharding PRIVATE -msse4.2 -UNDEBUG)
+target_link_libraries(test_telco_cluster_sharding PRIVATE samurai_control samurai_telecom_static samurai_l7emu samurai_core pthread)
+
+
 
