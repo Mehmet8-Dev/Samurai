@@ -195,7 +195,43 @@ enum class WorkerKind : std::uint8_t {
   DEFENSE = 7,
   SCENARIO = 8,
   AF_PACKET = 9,
+  TELCO = 10,
 };
+
+enum class TelcoMsgType : uint16_t {
+  START_PPPOE_EMULATION = 0x0501,
+  STOP_PPPOE_EMULATION  = 0x0502,
+  START_GTPU_EMULATION  = 0x0503,
+  STOP_GTPU_EMULATION   = 0x0504,
+  TELCO_STATS_REQUEST   = 0x0505,
+  TELCO_STATS_REPORT    = 0x0506,
+};
+
+#pragma pack(push, 1)
+struct TelcoJobPayload {
+  uint32_t subscriber_count;
+  uint32_t rate_cps;
+  uint16_t base_vlan_s;
+  uint16_t base_vlan_c;
+  uint8_t  base_mac[6];
+  uint32_t base_client_ip;
+  uint32_t gateway_ip;
+  char     auth_username[32];
+  char     auth_password[32];
+};
+
+struct TelcoStatsPayload {
+  uint32_t active_sessions;
+  uint32_t established_sessions;
+  uint32_t failed_sessions;
+  uint32_t current_cps;
+  uint64_t tx_packets;
+  uint64_t rx_packets;
+  uint64_t tx_bytes;
+  uint64_t rx_bytes;
+  uint32_t avg_setup_latency_us;
+};
+#pragma pack(pop)
 
 static_assert(sizeof(SamuraiWireHeaderV1) == 56, "SamuraiWireHeaderV1 size mismatch");
 static_assert(sizeof(JobEnvelopeV1) == 480, "JobEnvelopeV1 size mismatch");

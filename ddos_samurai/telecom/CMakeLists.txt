@@ -1,0 +1,67 @@
+cmake_minimum_required(VERSION 3.16)
+project(samurai_telecom LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+set(SAMURAI_TELECOM_SOURCES
+  lockfree_l2l3_cache.hpp
+  l2l3_fastpath_wiring.hpp
+  l2l3_fastpath_wiring.cpp
+  core/session_context.hpp
+  core/telco_protocol_if.hpp
+  core/session_manager.hpp
+  core/session_manager.cpp
+  core/hierarchical_timing_wheel.hpp
+  core/hierarchical_timing_wheel.cpp
+  core/fastpath_classifier.hpp
+  core/fastpath_classifier.cpp
+  core/ring_buffer_shuttle.hpp
+  protocols/stateful/pppoe/pppoe_types.hpp
+  protocols/stateful/pppoe/pppoe_fsm.hpp
+  protocols/stateful/pppoe/pppoe_engine.hpp
+  protocols/stateful/pppoe/pppoe_engine.cpp
+)
+
+add_library(samurai_telecom_static STATIC ${SAMURAI_TELECOM_SOURCES})
+
+target_include_directories(samurai_telecom_static PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/pppoe
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+  ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk
+)
+
+target_compile_options(samurai_telecom_static PUBLIC -msse4.2)
+target_link_libraries(samurai_telecom_static PUBLIC samurai_l7emu samurai_core pthread dl)
+
+# ---------------------------------------------------------------------------
+# Unit Test Executables
+# ---------------------------------------------------------------------------
+
+add_executable(test_telco_core tests/test_telco_core.cpp)
+target_include_directories(test_telco_core PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_telco_core PRIVATE -UNDEBUG)
+target_link_libraries(test_telco_core PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
+add_executable(test_pppoe_fsm tests/test_pppoe_fsm.cpp)
+target_include_directories(test_pppoe_fsm PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/pppoe
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_pppoe_fsm PRIVATE -UNDEBUG)
+target_link_libraries(test_pppoe_fsm PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)

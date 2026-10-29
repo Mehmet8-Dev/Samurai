@@ -41,6 +41,7 @@ inline constexpr WorkerEntry kWorkerTable[] = {
     {samurai::wire::WorkerKind::DEFENSE, "defense", "samurai_defense_worker"},
     {samurai::wire::WorkerKind::SCENARIO, "scenario", "samurai_scenario_worker"},
     {samurai::wire::WorkerKind::AF_PACKET, "afpacket", "samurai_afpacket_worker"},
+    {samurai::wire::WorkerKind::TELCO, "telco", "samurai_telco_worker"},
 };
 
 inline std::optional<WorkerEntry> LookupWorker(const std::string& name) {
