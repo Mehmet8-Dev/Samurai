@@ -17,7 +17,7 @@ DDoSamurai L7 Stateful Kullanıcı Alanı Motoru, yüksek performanslı paylaş�
 Bu kapsamda 5 ana mimari modernizasyon tamamlanmıştır:
 1. **Shared-Nothing Çok-Sürücülü (Multi-Driver) Mimari:** Global tekil sürücü ve spinlock çekişmesi kaldırılarak, her shard bağımsız bir `TcpDataplaneCore` ve shard-özel `InMemoryShardPeer` ile izole çekirdeklere pinlenmiş olarak çalışır.
 2. **Busy-Polling (Sıfır Uyku / Zero Sleep):** Sürücü döngüsündeki `nanosleep(200us)` kaldırılmış, donanım düzeyinde `cpu_relax` (`_mm_pause` / SSE2) ve boştayken adaptif `std::this_thread::yield()` mekanizmasına geçilmiştir.
-3. **Sıfır Kopyalama Statik Şablon Modu (Pre-baked Wire Template / Cache):** Sıcak yolda (hot path) dinamik `std::string` ve `std::map` heap tahsisleri tamamen bertaraf edilmiştir (`is_static_template`). HTTP/1.1 için statik istek baytları motor başlangıcında derlenerek önceden tahsis edilmiş slab tamponuna kopyalanır (`precompiled_payload`); HTTP/2 için GET istek başlıkları önceden token'laştırılmış yığın `nghttp2_nv` dizisi ile doğrudan nghttp2 motoruna aktarılır.
+3. **Dinamik RFC 7230 Başlık Ayrıştırma ve LaneStringArena Tahsisi:** Statik bayt tekrarlama (ASTF şablonları) tamamen devre dışı bırakılmıştır. HTTP/1.1 için her istek `LaneStringArena` üzerinden dinamik bellek kiralanarak derlenir, RFC 7230 standartlarında başlıklar dinamik formatlanır ve yanıtlar durum makinesiyle ayrıştırılır; HTTP/2 için istek başlıkları nghttp2 oturumlarına aktarılır.
 4. **Gerçek Kullanıcı Alanı Ağ Soketli H3 Motoru (Mock Peer Kaldırıldı):** Daha önceki sürümlerde yer alan ve ağ/kripto döngülerini baypas eden sentetik `is_mock_peer` mekanizması mühendislik dürüstlüğü gereği tamamen kaldırılmıştır. HTTP/3 motoru; `libngtcp2` + `libnghttp3` + `libgnutls` yığınıyla doğrudan Linux UDP soketleri (`KernelSocket`), `io_uring` ve çok işlemcili `SO_REUSEPORT` mimarisi üzerinden gerçek TLS 1.3 el sıkışması ve datagram şifrelemesi ile çalışmaktadır.
 5. **QUIC CUDA Kripto Yardımcısı ve Çoklu-Stream Pipelining / Datagram Coalescing:**
    - **CUDA Batch Crypto Modülü (`custom_quic_stack/quic_cuda_crypto.*`):** RFC 9001 Bölüm 5.2 Initial anahtar türetimi (`HKDF-Extract` + `HKDF-Expand-Label` SHA-256), Bölüm 5.4.3 AES-128-ECB Header Protection maskesi ve AEAD şifrelemesi NVIDIA GPU (`sm_75`, GeForce GTX 1650) üzerinde paralel kernel'lar ile icra edilir. IETF RFC 9001 Appendix A.1 resmi test vektörleri ile bayt-birebir doğrulanmıştır.
@@ -31,9 +31,9 @@ Bu kapsamda 5 ana mimari modernizasyon tamamlanmıştır:
 +---------------------------------------------------------------------------------------------------+
 |                                 USERSPACE L7 STATEFUL ENGINE                                      |
 +---------------------------------------------------------------------------------------------------+
-|  [H1 Prebaked Wire Buffer] |  [H2 Pre-tokenized nghttp2]   |  [H3 ngtcp2+nghttp3 UDP Socket]     |
-|  - Zero-heap hot-path copy |  - Static stack nghttp2_nv    |  - Real TLS 1.3 / SO_REUSEPORT       |
-|  - Slab-backed write buffer|  - Stream multiplexing        |  - Threaded multi-worker fanout      |
+|  [H1 Dynamic RFC Parser]   |  [H2 nghttp2 Session]         |  [H3 ngtcp2+nghttp3 UDP Socket]     |
+|  - Dynamic LaneStringArena |  - Stream multiplexing        |  - Real TLS 1.3 / SO_REUSEPORT       |
+|  - RFC 7230 header format  |  - In-place header parse      |  - Threaded multi-worker fanout      |
 +---------------------------------------------------------------------------------------------------+
                                                   |
                                                   v
@@ -57,9 +57,9 @@ Bu kapsamda 5 ana mimari modernizasyon tamamlanmıştır:
 
 ## 3. Doğrulanmış Benchmark Sonuçları
 
-### 3.1 100.000 Akış (100k Flows) Ölçek Testi — Saf Dinamik L7 Yolu (Static Template Fast-Path DEVRE DIŞI)
+### 3.1 100.000 Akış (100k Flows) Ölçek Testi — Saf Dinamik L7 Yolu
 
-Bu testte kullanıcının talebi doğrultusunda `SAMURAI_DISABLE_STATIC_TEMPLATE=1` aktif edilmiş; hiçbir statik şablon kısayolu veya önceden derlenmiş bayt kopyalama kullanılmamıştır. Her istek için tam dinamik `LaneStringArena` kiralama, capture şablon çözümleme, başlık döngüleri ve RFC formatlama çalıştırılmıştır:
+Bu testte hiçbir statik şablon kısayolu veya önceden derlenmiş bayt kopyalama kullanılmamıştır. Her istek için tam dinamik `LaneStringArena` kiralama, capture şablon çözümleme, başlık döngüleri ve RFC formatlama çalıştırılmıştır:
 
 | Protokol | Shard / Worker | Akış / İstek | Süre (s) | Başarı (%) | CPS (Bağlantı/s) | RPS (İstek/s) | P50 (ms) | P95 (ms) | P99 (ms) | VmRSS (MB) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -80,7 +80,7 @@ Bu testte kullanıcının talebi doğrultusunda `SAMURAI_DISABLE_STATIC_TEMPLATE
 
 ### 3.2 1.000.000 Akış (1M Flows) Dev Ölçek Testi — Saf Dinamik L7 Yolu
 
-Aşağıdaki ölçümler, sistem üzerinde 12 milyon toplam akış/istek icra eden tam paket üzerinden, `SAMURAI_DISABLE_STATIC_TEMPLATE=1` ile saf dinamik yolda ölçülmüştür:
+Aşağıdaki ölçümler, sistem üzerinde 12 milyon toplam akış/istek icra eden tam paket üzerinden saf dinamik yolda ölçülmüştür:
 
 | Protokol | Shard / Worker | Akış / İstek | Süre (s) | Başarı (%) | CPS (Bağlantı/s) | RPS (İstek/s) | P50 (ms) | P95 (ms) | P99 (ms) | VmRSS (MB) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
