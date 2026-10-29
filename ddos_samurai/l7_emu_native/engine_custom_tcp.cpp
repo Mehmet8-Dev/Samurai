@@ -1083,7 +1083,20 @@ void custom_tcp_wire_pump(
     std::size_t sh = 0;
     std::size_t ln = 0;
     bool found = false;
-    {
+    const uint64_t sh_prefix = flow_id >> 40;
+    if (sh_prefix > 0 && (sh_prefix - 1) < runtime.local_shards.size()) {
+      auto& reg = runtime.local_shards[sh_prefix - 1].custom_tcp_flow_registry;
+      auto it = reg.find(flow_id);
+      if (it != reg.end() && it->second.kind == want_kind) {
+        sh = it->second.shard_idx;
+        ln = it->second.lane_idx;
+        found = true;
+        if (erase_on_hit) {
+          reg.erase(it);
+        }
+      }
+    }
+    if (!found) {
       std::lock_guard<std::mutex> lk(custom_tcp_registry_mu());
       auto it = runtime.custom_tcp_flow_registry.find(flow_id);
       if (it != runtime.custom_tcp_flow_registry.end() && it->second.kind == want_kind) {
@@ -1106,15 +1119,17 @@ void custom_tcp_wire_pump(
 
   while (!wire_stop.load(std::memory_order_relaxed)) {
     bool did = false;
-    for (std::size_t i = 0; i < held.size();) {
-      const bool terminal = held[i].ev.kind == InboxEvent::Kind::Terminal;
-      if (route(held[i].flow_id, std::move(held[i].ev), terminal)) {
-        held.erase(held.begin() + static_cast<long>(i));
-        did = true;
-      } else if (++held[i].retries > kMaxHeldRetries) {
-        held.erase(held.begin() + static_cast<long>(i));
-      } else {
-        ++i;
+    if (!held.empty()) {
+      const std::size_t original_count = held.size();
+      for (std::size_t i = 0; i < original_count; ++i) {
+        Held item = std::move(held.front());
+        held.pop_front();
+        const bool terminal = item.ev.kind == InboxEvent::Kind::Terminal;
+        if (route(item.flow_id, std::move(item.ev), terminal)) {
+          did = true;
+        } else if (++item.retries <= kMaxHeldRetries) {
+          held.push_back(std::move(item));
+        }
       }
     }
     uint32_t actions = 0;
