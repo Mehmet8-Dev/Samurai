@@ -18,6 +18,7 @@ set(SAMURAI_TELECOM_SOURCES
   core/fastpath_classifier.hpp
   core/fastpath_classifier.cpp
   core/ring_buffer_shuttle.hpp
+  core/telecom_audit_logger.hpp
   protocols/stateful/pppoe/pppoe_types.hpp
   protocols/stateful/pppoe/pppoe_fsm.hpp
   protocols/stateful/pppoe/pppoe_engine.hpp
