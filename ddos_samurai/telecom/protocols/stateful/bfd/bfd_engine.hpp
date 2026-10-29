@@ -56,6 +56,14 @@ public:
                                                bool poll = false, 
                                                bool final_flag = false);
 
+    static std::vector<uint8_t> build_bfd_control_packet(
+        const BfdSessionConfig& cfg, 
+        BfdState state, 
+        BfdDiag diag, 
+        uint32_t remote_disc, 
+        bool poll = false, 
+        bool final_flag = false);
+
     // Paket Ayrıştırıcı
     static bool ParseBfdControlPacket(const uint8_t* data, size_t len, 
                                       BfdControlHeader& out_hdr, 

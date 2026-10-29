@@ -22,6 +22,14 @@ set(SAMURAI_TELECOM_SOURCES
   protocols/stateful/pppoe/pppoe_fsm.hpp
   protocols/stateful/pppoe/pppoe_engine.hpp
   protocols/stateful/pppoe/pppoe_engine.cpp
+  protocols/stateful/dhcp/dhcp_types.hpp
+  protocols/stateful/dhcp/dhcp_fsm.hpp
+  protocols/stateful/dhcp/dhcp_engine.hpp
+  protocols/stateful/dhcp/dhcp_engine.cpp
+  protocols/stateful/bfd/bfd_types.hpp
+  protocols/stateful/bfd/bfd_fsm.hpp
+  protocols/stateful/bfd/bfd_engine.hpp
+  protocols/stateful/bfd/bfd_engine.cpp
 )
 
 add_library(samurai_telecom_static STATIC ${SAMURAI_TELECOM_SOURCES})
@@ -32,6 +40,8 @@ target_include_directories(samurai_telecom_static PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/../..
   ${CMAKE_CURRENT_SOURCE_DIR}/core
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/pppoe
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/dhcp
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/bfd
   ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
   ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk
 )
@@ -65,3 +75,17 @@ target_include_directories(test_pppoe_fsm PRIVATE
 )
 target_compile_options(test_pppoe_fsm PRIVATE -UNDEBUG)
 target_link_libraries(test_pppoe_fsm PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
+add_executable(test_dhcp_bfd tests/test_dhcp_bfd.cpp)
+target_include_directories(test_dhcp_bfd PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/dhcp
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/bfd
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_dhcp_bfd PRIVATE -UNDEBUG)
+target_link_libraries(test_dhcp_bfd PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+

@@ -51,6 +51,17 @@ uint16_t ComputeChecksum(const uint16_t* data, size_t bytes) {
     return static_cast<uint16_t>(~sum);
 }
 
+void ParseMac(const std::string& mac_str, uint8_t* out) {
+    unsigned int bytes[6];
+    if (std::sscanf(mac_str.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x",
+                    &bytes[0], &bytes[1], &bytes[2],
+                    &bytes[3], &bytes[4], &bytes[5]) == 6) {
+        for (int i = 0; i < 6; ++i) out[i] = static_cast<uint8_t>(bytes[i]);
+    } else {
+        std::memset(out, 0, 6);
+    }
+}
+
 } // namespace
 
 BfdEngine::BfdEngine(SessionManager& session_mgr, HierarchicalTimingWheel* wheel)
@@ -307,6 +318,62 @@ std::vector<uint8_t> BfdEngine::BuildBfdControlPacket(TelcoSessionContext* sessi
     bfd->your_discriminator = htonl(session ? session->GetBfdRemoteDisc() : 0);
     bfd->min_tx_interval_us = htonl(negotiated_tx_us_);
     bfd->min_rx_interval_us = htonl(negotiated_rx_us_);
+    bfd->min_echo_rx_interval = 0;
+
+    return packet;
+}
+
+std::vector<uint8_t> BfdEngine::build_bfd_control_packet(
+    const BfdSessionConfig& cfg, 
+    BfdState state, 
+    BfdDiag diag, 
+    uint32_t remote_disc, 
+    bool poll, 
+    bool final_flag) {
+
+    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(BfdControlHeader);
+    std::vector<uint8_t> packet(total_len, 0);
+
+    auto* eth = reinterpret_cast<EthHeader*>(packet.data());
+    ParseMac(cfg.remote_mac, eth->dst_mac);
+    ParseMac(cfg.local_mac, eth->src_mac);
+    eth->ethertype = htons(0x0800);
+
+    auto* ip = reinterpret_cast<Ipv4Header*>(packet.data() + sizeof(EthHeader));
+    ip->ihl_version = 0x45;
+    ip->tos = 0xC0; // CS6 / Network Control DSCP (RFC 5881)
+    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(BfdControlHeader)));
+    ip->id = htons(0xBFD1);
+    ip->flags_fragment = 0;
+    ip->ttl = 255; // Strict TTL 255 required by RFC 5881
+    ip->protocol = 17; // UDP
+    inet_pton(AF_INET, cfg.local_ip.c_str(), &ip->src_ip);
+    inet_pton(AF_INET, cfg.remote_ip.c_str(), &ip->dst_ip);
+    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
+
+    auto* udp = reinterpret_cast<UdpHeader*>(packet.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
+    udp->src_port = htons(cfg.udp_src_port);
+    udp->dst_port = htons(cfg.udp_dst_port);
+    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + sizeof(BfdControlHeader)));
+    udp->checksum = 0;
+
+    auto* bfd = reinterpret_cast<BfdControlHeader*>(
+        packet.data() + sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader));
+
+    uint8_t diag_val = static_cast<uint8_t>(diag) & 0x1F;
+    bfd->vers_diag = 0x20 | diag_val;
+
+    uint8_t sta_val = (static_cast<uint8_t>(state) & 0x03) << 6;
+    if (poll) sta_val |= 0x20;
+    if (final_flag) sta_val |= 0x10;
+    bfd->sta_flags = sta_val;
+
+    bfd->detect_mult = cfg.detect_multiplier;
+    bfd->length = sizeof(BfdControlHeader);
+    bfd->my_discriminator = htonl(cfg.local_disc);
+    bfd->your_discriminator = htonl(remote_disc);
+    bfd->min_tx_interval_us = htonl(cfg.desired_tx_interval_us);
+    bfd->min_rx_interval_us = htonl(cfg.required_rx_interval_us);
     bfd->min_echo_rx_interval = 0;
 
     return packet;

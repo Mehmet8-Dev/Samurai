@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <string>
 #include <string_view>
 
 namespace ddos_samurai::telecom::bfd {
@@ -64,6 +65,19 @@ struct BfdConfig {
     uint32_t local_disc{0x10000001};
     uint8_t  dscp{0xC0};                    // CS6 (RFC 5881)
     bool     demand_mode{false};
+};
+
+struct BfdSessionConfig {
+    std::string local_ip{"192.168.1.100"};
+    std::string remote_ip{"192.168.1.1"};
+    std::string local_mac{"00:11:22:33:44:55"};
+    std::string remote_mac{"00:aa:bb:cc:dd:ee"};
+    uint16_t udp_src_port{49152};           // Dynamic source port (RFC 5881: 49152..65535)
+    uint16_t udp_dst_port{3784};            // Single-hop BFD destination port (RFC 5881)
+    uint32_t desired_tx_interval_us{10000}; // Default 10ms transmit interval
+    uint32_t required_rx_interval_us{10000};// Default 10ms receive interval
+    uint8_t  detect_multiplier{3};          // 3 x 10ms = 30ms detection time
+    uint32_t local_disc{0x10000001};        // Local session discriminator
 };
 
 } // namespace ddos_samurai::telecom::bfd

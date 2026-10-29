@@ -45,7 +45,7 @@ public:
         } else if (current == BfdState::Down) {
             if (r_state == BfdState::Down) {
                 SetState(ctx, BfdState::Init);
-            } else if (r_state == BfdState::Init) {
+            } else if (r_state == BfdState::Init || r_state == BfdState::Up) {
                 SetState(ctx, BfdState::Up);
             }
         } else if (current == BfdState::Init) {
