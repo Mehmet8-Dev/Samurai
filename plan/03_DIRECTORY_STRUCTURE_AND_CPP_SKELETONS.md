@@ -581,6 +581,131 @@ int main(int argc, char** argv) {
 
 ---
 
+### 2.6 Faz 1: PPPoE İkili Başlıkları ve Motor İskeleti: `pppoe_types.hpp` & `pppoe_engine.hpp`
+
+```cpp
+// ddos_samurai/telecom/protocols/stateful/pppoe/pppoe_types.hpp
+#pragma once
+
+#include <cstdint>
+
+namespace ddos_samurai::telecom::pppoe {
+
+inline constexpr uint16_t ETHERTYPE_PPPOE_DISCOVERY = 0x8863;
+inline constexpr uint16_t ETHERTYPE_PPPOE_SESSION   = 0x8864;
+
+inline constexpr uint16_t PPP_PROTOCOL_LCP   = 0xC021;
+inline constexpr uint16_t PPP_PROTOCOL_PAP   = 0xC023;
+inline constexpr uint16_t PPP_PROTOCOL_CHAP  = 0xC223;
+inline constexpr uint16_t PPP_PROTOCOL_IPCP  = 0x8021;
+inline constexpr uint16_t PPP_PROTOCOL_IPV6CP= 0x8057;
+inline constexpr uint16_t PPP_PROTOCOL_IPV4  = 0x0021;
+
+enum class PppoeCode : uint8_t {
+    PADI = 0x09,
+    PADO = 0x07,
+    PADR = 0x19,
+    PADS = 0x65,
+    PADT = 0xA7,
+    DATA = 0x00
+};
+
+enum class LcpCode : uint8_t {
+    CONF_REQ  = 1,
+    CONF_ACK  = 2,
+    CONF_NAK  = 3,
+    CONF_REJ  = 4,
+    TERM_REQ  = 5,
+    TERM_ACK  = 6,
+    CODE_REJ  = 7,
+    PROT_REJ  = 8,
+    ECHO_REQ  = 9,
+    ECHO_REP  = 10,
+    DISC_REQ  = 11
+};
+
+#pragma pack(push, 1)
+struct PppoeHeader {
+    uint8_t  type : 4;
+    uint8_t  version : 4;
+    uint8_t  code;
+    uint16_t session_id;
+    uint16_t length;
+};
+
+struct PppoeTag {
+    uint16_t type;
+    uint16_t length;
+};
+
+struct PppHeader {
+    uint16_t protocol;
+};
+
+struct PppControlHeader {
+    uint8_t  code;
+    uint8_t  identifier;
+    uint16_t length;
+};
+#pragma pack(pop)
+
+} // namespace ddos_samurai::telecom::pppoe
+```
+
+#### `pppoe_engine.hpp` İskeleti:
+
+```cpp
+// ddos_samurai/telecom/protocols/stateful/pppoe/pppoe_engine.hpp
+#pragma once
+
+#include "ddos_samurai/telecom/core/telco_protocol_if.hpp"
+#include "ddos_samurai/telecom/core/session_manager.hpp"
+#include "pppoe_types.hpp"
+
+namespace ddos_samurai::telecom::pppoe {
+
+class PppoeEngine final : public ITelcoProtocol {
+public:
+    explicit PppoeEngine(SessionManager& session_mgr);
+    ~PppoeEngine() override = default;
+
+    bool Init(const ProtocolConfig& cfg) override;
+    void Shutdown() override;
+
+    void OnRxPacket(rte_mbuf* mbuf, 
+                    const PacketMetadata& meta, 
+                    TelcoSessionContext* session) override;
+
+    uint32_t OnTimerTick(uint64_t current_tsc) override;
+
+    rte_mbuf* BuildTxPacket(rte_mempool* pool, 
+                            TelcoSessionContext* session, 
+                            uint16_t event_type) override;
+
+    bool IsStateful() const noexcept override { return true; }
+    TelcoProtocolId GetProtocolId() const noexcept override { return TelcoProtocolId::PPPOE; }
+    std::string_view GetProtocolName() const noexcept override { return "PPPoE"; }
+
+    // PPPoE FSM Olay Tetikleyicileri
+    void StartDiscovery(TelcoSessionContext* session, rte_mempool* pool);
+    void SendLcpEcho(TelcoSessionContext* session, rte_mempool* pool);
+    void TerminateSession(TelcoSessionContext* session, rte_mempool* pool);
+
+private:
+    SessionManager& session_mgr_;
+    ProtocolConfig config_;
+
+    void ProcessPado(const PppoeHeader* hdr, uint16_t len, TelcoSessionContext* session);
+    void ProcessPads(const PppoeHeader* hdr, uint16_t len, TelcoSessionContext* session);
+    void ProcessLcp(const uint8_t* payload, uint16_t len, TelcoSessionContext* session);
+    void ProcessIpcp(const uint8_t* payload, uint16_t len, TelcoSessionContext* session);
+};
+
+} // namespace ddos_samurai::telecom::pppoe
+```
+
+---
+
 ## 3. 5 Aşamalı Test ve Doğrulama Yol Haritası (5-Stage Verification Roadmap)
 
 Yüz binlerce aboneye geçmeden önce, tek protokolde (PPPoE) uçtan uca doğrulanabilir 5 aşamalı test planı uygulanır:

@@ -51,6 +51,24 @@ PPPoE Discovery paketlerini yüksek hızda basmak ile yüz binlerce abonenin dur
 4. **Network Control Protocol (IPCP - RFC 1332 / IPv6CP - RFC 5072):**
    - IPCP: İstemci `0.0.0.0` talep eder, BRAS `Nak` ile gerçek IP ve Primary/Secondary DNS sunucularını bildirir. İstemci `Configure-Ack` ile onaylar.
 
+### 2.2 PPPoE FSM Durum Geçiş Tablosu (State Machine Matrix)
+
+| Mevcut Durum | Girdi Olayı (Event) | Sonraki Durum | Tetiklenen Eylem (Action / Packet TX) | Zamanlayıcı (HTW Slot) |
+|---|---|---|---|---|
+| `IDLE` | `START_SESSION` | `DISCOVERING` | PADI paketi üretilir ve ağa broadcast basılır | 100ms (PADO bekleme) |
+| `DISCOVERING` | `RX PADO` (Teklif Alındı) | `DISCOVERING` | PADR oturum talebi seçilen BRAS'a gönderilir | 100ms (PADS bekleme) |
+| `DISCOVERING` | `RX PADS` (Oturum Onaylandı) | `AUTHENTICATING` | Session-ID kaydedilir; PPP LCP Configure-Req gönderilir | 100ms (LCP Ack bekleme) |
+| `DISCOVERING` | `DISCOVERY_TIMEOUT` | `DISCOVERING` / `FAILED` | Retry sayacı artırılır; max_retries aşıldıysa oturum FAILED | Exponential backoff |
+| `AUTHENTICATING`| `RX LCP Conf-Ack` | `AUTHENTICATING` | PPP PAP Authenticate-Req veya CHAP Response iletilir | 200ms (Auth Ack bekleme)|
+| `AUTHENTICATING`| `RX Auth-Success` | `AUTHENTICATING` | PPP IPCP Configure-Req (0.0.0.0 talep) gönderilir | 100ms (IPCP Nak/Ack) |
+| `AUTHENTICATING`| `RX IPCP Conf-Nak` (IP Geldi) | `AUTHENTICATING` | Atanan IP ile IPCP Configure-Req tekrar gönderilir | 100ms |
+| `AUTHENTICATING`| `RX IPCP Conf-Ack` | `ESTABLISHED` | Abone IP ve DNS'i kaydedilir; veri trafiği serbest bırakılır | 1s (LCP Echo Keepalive)|
+| `ESTABLISHED` | `TICK (1s)` | `ESTABLISHED` | LCP Echo-Request gönderilir (Magic Number kontrolü) | 1s (Echo-Reply bekleme)|
+| `ESTABLISHED` | `RX LCP Echo-Reply` | `ESTABLISHED` | Keepalive sayacı sıfırlanır, `last_activity_tsc` güncellenir| 1s sonraki Echo |
+| `ESTABLISHED` | `ECHO_TIMEOUT (3x)` | `TERMINATING` | PADT veya LCP Terminate-Req gönderilir | 100ms |
+| `ESTABLISHED` | `STOP_SESSION` (Teardown)| `TERMINATING` | BRAS'a PADT gönderilir | 100ms |
+| `TERMINATING` | `RX PADT` / `TIMEOUT` | `IDLE` | Oturum bağlamı havuza iade edilir (`ReleaseSession`) | Yok |
+
 ```mermaid
 sequenceDiagram
     autonumber
