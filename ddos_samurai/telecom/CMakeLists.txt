@@ -36,6 +36,15 @@ set(SAMURAI_TELECOM_SOURCES
   protocols/stateful/mobile/pfcp_types.hpp
   protocols/stateful/mobile/pfcp_engine.hpp
   protocols/stateful/mobile/pfcp_engine.cpp
+  protocols/stateless/gtpu_gen/gtpu_gen_types.hpp
+  protocols/stateless/gtpu_gen/stateless_gtpu_generator.hpp
+  protocols/stateless/gtpu_gen/stateless_gtpu_generator.cpp
+  protocols/stateless/qinq_sweep/qinq_types.hpp
+  protocols/stateless/qinq_sweep/qinq_generator.hpp
+  protocols/stateless/qinq_sweep/qinq_generator.cpp
+  protocols/stateless/arp_gen/arp_gen_types.hpp
+  protocols/stateless/arp_gen/stateless_arp_generator.hpp
+  protocols/stateless/arp_gen/stateless_arp_generator.cpp
 )
 
 add_library(samurai_telecom_static STATIC ${SAMURAI_TELECOM_SOURCES})
@@ -49,6 +58,9 @@ target_include_directories(samurai_telecom_static PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/dhcp
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/bfd
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/mobile
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateless/gtpu_gen
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateless/qinq_sweep
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateless/arp_gen
   ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
   ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk
 )
@@ -107,4 +119,18 @@ target_include_directories(test_mobile_core PRIVATE
 )
 target_compile_options(test_mobile_core PRIVATE -UNDEBUG)
 target_link_libraries(test_mobile_core PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
+add_executable(test_stateless_generators tests/test_stateless_generators.cpp)
+target_include_directories(test_stateless_generators PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateless/gtpu_gen
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateless/qinq_sweep
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateless/arp_gen
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_stateless_generators PRIVATE -UNDEBUG)
+target_link_libraries(test_stateless_generators PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
 
