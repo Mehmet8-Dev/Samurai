@@ -19,6 +19,10 @@ bool StatelessArpGenerator::Init(const ProtocolConfig& cfg) {
     ArpGeneratorConfig acfg;
     acfg.target_ip_start = 0x0A000001;
     acfg.target_ip_end = acfg.target_ip_start + (cfg.max_sessions > 0 ? cfg.max_sessions : 1000);
+    if (cfg.enable_vlan_tagging) {
+        acfg.enable_vlan = true;
+        acfg.vlan_id = cfg.base_vlan_s > 0 ? cfg.base_vlan_s : (cfg.base_vlan_c > 0 ? cfg.base_vlan_c : 100);
+    }
     return Init(acfg);
 }
 
@@ -89,6 +93,10 @@ void StatelessArpGenerator::SetSubnetCidr(uint32_t network_ip, uint8_t prefix_le
 void StatelessArpGenerator::BuildTemplate() {
     std::memset(template_buf_, 0, sizeof(template_buf_));
 
+    if (config_.min_frame_size > sizeof(template_buf_)) {
+        config_.min_frame_size = static_cast<uint16_t>(sizeof(template_buf_));
+    }
+
     if (config_.enable_vlan) {
         eth_header_len_ = sizeof(ArpVlanEthernetHeaderRaw);
         arp_payload_offset_ = eth_header_len_;
@@ -144,9 +152,10 @@ inline uint32_t StatelessArpGenerator::NextIp() noexcept {
         rng_state_ ^= rng_state_ << 13;
         rng_state_ ^= rng_state_ >> 17;
         rng_state_ ^= rng_state_ << 5;
-        uint32_t range = (config_.target_ip_end >= config_.target_ip_start) 
-                         ? (config_.target_ip_end - config_.target_ip_start + 1) : 1;
-        ip = config_.target_ip_start + (range > 0 ? (rng_state_ % range) : 0);
+        if (rng_state_ == 0) rng_state_ = 0x55AA55AA;
+        uint64_t range = (static_cast<uint64_t>(config_.target_ip_end) >= config_.target_ip_start) 
+                         ? (static_cast<uint64_t>(config_.target_ip_end) - config_.target_ip_start + 1) : 1;
+        ip = config_.target_ip_start + static_cast<uint32_t>(rng_state_ % range);
         return ip;
     }
 
@@ -231,7 +240,8 @@ uint32_t StatelessArpGenerator::GeneratePacket(uint8_t* out_buf, size_t max_len)
 
     stats_.packets_generated++;
     stats_.bytes_generated += total_len_;
-    stats_.current_target_ip = ip;
+    stats_.current_target_ip = (config_.probe_mode == ArpProbeMode::ARP_REQUEST && config_.cycle_sender_ip)
+                               ? config_.sender_ip : ip;
     return static_cast<uint32_t>(total_len_);
 }
 
@@ -262,7 +272,7 @@ bool StatelessArpGenerator::VerifyFrame(const uint8_t* frame, size_t len, ArpVer
     offset += 2;
 
     if (ethertype == 0x8100) { // 802.1Q tagged
-        if (len < offset + 2 + sizeof(ArpPayloadRaw)) return false;
+        if (len < offset + 4 + sizeof(ArpPayloadRaw)) return false;
         out_verif.has_vlan = true;
         uint16_t tci = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
         out_verif.vlan_pcp = static_cast<uint8_t>((tci >> 13) & 0x07);

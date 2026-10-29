@@ -49,7 +49,9 @@ public:
     // Durum ve İstatistikler
     const ArpGenStats& GetStats() const noexcept { return stats_; }
     void ResetStats() noexcept;
-    uint32_t GetCurrentTargetIp() const noexcept { return current_ip_; }
+    uint32_t GetCurrentTargetIp() const noexcept {
+        return stats_.packets_generated > 0 ? stats_.current_target_ip : config_.target_ip_start;
+    }
     size_t GetPacketSize() const noexcept { return total_len_; }
     const ArpGeneratorConfig& GetConfig() const noexcept { return config_; }
 
@@ -63,8 +65,8 @@ private:
     ArpGeneratorConfig config_;
     ArpGenStats        stats_;
 
-    // 64-bayt hizalı şablon tampon
-    alignas(64) uint8_t template_buf_[128];
+    // 64-bayt hizalı şablon tampon (Padded frames desteği: 2048B)
+    alignas(64) uint8_t template_buf_[2048];
     size_t total_len_{0};
 
     // Ofsetler

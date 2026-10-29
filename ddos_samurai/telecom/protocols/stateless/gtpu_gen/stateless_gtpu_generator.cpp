@@ -100,6 +100,12 @@ bool StatelessGtpuGenerator::Init(const GtpuGenConfig& cfg) {
     if (config_.teid_step == 0) {
         config_.teid_step = 1;
     }
+    if (config_.inner_ip_start > config_.inner_ip_end) {
+        std::swap(config_.inner_ip_start, config_.inner_ip_end);
+    }
+    if (config_.inner_ip_step == 0) {
+        config_.inner_ip_step = 1;
+    }
     if (config_.prng_seed == 0) {
         config_.prng_seed = 0x12345678;
     }
@@ -142,6 +148,15 @@ rte_mbuf* StatelessGtpuGenerator::BuildTxPacket(rte_mempool* /*pool*/,
 
 void StatelessGtpuGenerator::BuildTemplate() {
     std::memset(template_buf_, 0, sizeof(template_buf_));
+
+    // Clamp inner payload size to prevent overflowing template_buf_
+    constexpr size_t kMaxHeaderOverhead = sizeof(EthHeader) + sizeof(Ipv4Header) + 
+                                         sizeof(UdpHeader) + sizeof(GtpuHeaderWire) + 
+                                         sizeof(GtpuOptFieldsWire) + sizeof(Ipv4Header) + 
+                                         sizeof(UdpHeader);
+    if (config_.inner_payload_size > sizeof(template_buf_) - kMaxHeaderOverhead) {
+        config_.inner_payload_size = static_cast<uint16_t>(sizeof(template_buf_) - kMaxHeaderOverhead);
+    }
 
     eth_offset_ = 0;
     outer_ip_offset_ = sizeof(EthHeader);
@@ -231,7 +246,7 @@ void StatelessGtpuGenerator::BuildTemplate() {
     // 6. Inner L4 & Payload
     inner_payload_offset_ = inner_l4_offset_ + (config_.inner_proto == InnerProtocol::ICMP_ECHO ? sizeof(IcmpHeaderWire) : sizeof(UdpHeader));
     
-    // Fill dummy payload bytes
+    // Fill dummy payload bytes safely within template_buf_
     for (size_t i = 0; i < config_.inner_payload_size; ++i) {
         template_buf_[inner_payload_offset_ + i] = static_cast<uint8_t>(i & 0xFF);
     }
@@ -259,9 +274,10 @@ inline uint32_t StatelessGtpuGenerator::NextTeid() noexcept {
         rng_state_ ^= rng_state_ << 13;
         rng_state_ ^= rng_state_ >> 17;
         rng_state_ ^= rng_state_ << 5;
-        uint32_t range = (config_.teid_end >= config_.teid_start) 
-                         ? (config_.teid_end - config_.teid_start + 1) : 1;
-        teid = config_.teid_start + (range > 0 ? (rng_state_ % range) : 0);
+        if (rng_state_ == 0) rng_state_ = 0x12345678;
+        uint64_t range = (static_cast<uint64_t>(config_.teid_end) >= config_.teid_start) 
+                         ? (static_cast<uint64_t>(config_.teid_end) - config_.teid_start + 1) : 1;
+        teid = config_.teid_start + static_cast<uint32_t>(rng_state_ % range);
         return teid;
     }
 
@@ -300,15 +316,18 @@ uint32_t StatelessGtpuGenerator::GeneratePacket(uint8_t* out_buf, size_t max_len
     std::memcpy(out_buf, template_buf_, total_len_);
 
     uint32_t teid = NextTeid();
-    *reinterpret_cast<uint32_t*>(out_buf + teid_offset_) = htonl(teid);
+    uint32_t teid_be = htonl(teid);
+    std::memcpy(out_buf + teid_offset_, &teid_be, sizeof(teid_be));
 
     if (config_.with_seq_num) {
-        *reinterpret_cast<uint16_t*>(out_buf + seq_offset_) = htons(current_seq_++);
+        uint16_t seq_be = htons(current_seq_++);
+        std::memcpy(out_buf + seq_offset_, &seq_be, sizeof(seq_be));
     }
 
     if (config_.cycle_inner_ip) {
         uint32_t inner_ip = NextInnerIp();
-        *reinterpret_cast<uint32_t*>(out_buf + inner_src_ip_offset_) = htonl(inner_ip);
+        uint32_t inner_ip_be = htonl(inner_ip);
+        std::memcpy(out_buf + inner_src_ip_offset_, &inner_ip_be, sizeof(inner_ip_be));
         UpdateInnerIpChecksum(out_buf);
     }
 

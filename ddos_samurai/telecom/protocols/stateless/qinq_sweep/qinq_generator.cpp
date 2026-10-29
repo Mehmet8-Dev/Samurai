@@ -59,9 +59,9 @@ QinQGenerator::QinQGenerator(const QinQGeneratorConfig& cfg) {
 bool QinQGenerator::Init(const ProtocolConfig& cfg) {
     QinQGeneratorConfig qcfg;
     qcfg.s_vlan_min = cfg.base_vlan_s > 0 ? cfg.base_vlan_s : 100;
-    qcfg.s_vlan_max = qcfg.s_vlan_min + 10;
+    qcfg.s_vlan_max = std::min<uint32_t>(qcfg.s_vlan_min + 10, 4094);
     qcfg.c_vlan_min = cfg.base_vlan_c > 0 ? cfg.base_vlan_c : 200;
-    qcfg.c_vlan_max = qcfg.c_vlan_min + 100;
+    qcfg.c_vlan_max = std::min<uint32_t>(qcfg.c_vlan_min + 100, 4094);
     return Init(qcfg);
 }
 
@@ -122,6 +122,12 @@ rte_mbuf* QinQGenerator::BuildTxPacket(rte_mempool* /*pool*/,
 
 void QinQGenerator::BuildTemplate() {
     std::memset(template_buf_, 0, sizeof(template_buf_));
+
+    // Clamp payload_size so total_len_ fits within template_buf_
+    constexpr size_t kMaxPayload = sizeof(template_buf_) - sizeof(QinQEthernetHeader) - 64;
+    if (config_.payload_size > kMaxPayload) {
+        config_.payload_size = static_cast<uint16_t>(kMaxPayload);
+    }
 
     // 1. QinQ Dual VLAN Ethernet Header (22 Bytes)
     auto* eth = reinterpret_cast<QinQEthernetHeader*>(template_buf_);
@@ -241,8 +247,10 @@ uint32_t QinQGenerator::GeneratePacket(uint8_t* out_buf, size_t max_len) noexcep
     uint16_t s_vlan = current_s_vlan_;
     uint16_t c_vlan = current_c_vlan_;
 
-    *reinterpret_cast<uint16_t*>(out_buf + s_tci_offset_) = EncodeTci(s_vlan, config_.s_pcp, config_.s_dei);
-    *reinterpret_cast<uint16_t*>(out_buf + c_tci_offset_) = EncodeTci(c_vlan, config_.c_pcp, config_.c_dei);
+    uint16_t s_tci = EncodeTci(s_vlan, config_.s_pcp, config_.s_dei);
+    uint16_t c_tci = EncodeTci(c_vlan, config_.c_pcp, config_.c_dei);
+    std::memcpy(out_buf + s_tci_offset_, &s_tci, sizeof(s_tci));
+    std::memcpy(out_buf + c_tci_offset_, &c_tci, sizeof(c_tci));
 
     if (config_.cycle_src_mac) {
         out_buf[10] = static_cast<uint8_t>((s_vlan >> 8) & 0x0F);

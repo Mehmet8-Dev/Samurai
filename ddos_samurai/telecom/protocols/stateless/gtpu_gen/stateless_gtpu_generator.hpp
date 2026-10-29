@@ -46,7 +46,9 @@ public:
     // Durum ve İstatistikler
     const GtpuGenStats& GetStats() const noexcept { return stats_; }
     void ResetStats() noexcept;
-    uint32_t GetCurrentTeid() const noexcept { return current_teid_; }
+    uint32_t GetCurrentTeid() const noexcept {
+        return stats_.packets_generated > 0 ? stats_.current_teid : config_.teid_start;
+    }
     size_t GetPacketSize() const noexcept { return total_len_; }
     const GtpuGenConfig& GetConfig() const noexcept { return config_; }
 
@@ -62,8 +64,8 @@ private:
     GtpuGenConfig config_;
     GtpuGenStats  stats_;
 
-    // 64-bayt hizalı şablon tampon (Zero-heap hot path)
-    alignas(64) uint8_t template_buf_[1536];
+    // 64-bayt hizalı şablon tampon (Zero-heap hot path, Jumbo frame desteği: 10240B)
+    alignas(64) uint8_t template_buf_[10240];
     size_t total_len_{0};
 
     // Şablon içi hızlı erişim ofsetleri (Precomputed Offsets)

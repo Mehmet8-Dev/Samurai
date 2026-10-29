@@ -550,10 +550,181 @@ void TestBoundaryFuzzAndTruncationSafety() {
 }
 
 // =========================================================================
-// Test 6: Generator Throughput Benchmark (Honest CPU Memory Construction)
+// Test 6: Hardened Edge Cases, Jumbo Frames & Full 32-bit PRNG Ranges
+// =========================================================================
+void TestHardenedEdgeCasesAndJumboFrames() {
+    std::cout << "[TEST] 6. Hardened Edge Cases, Jumbo Frames & Full 32-bit PRNG Ranges..." << std::endl;
+
+    // 1. Jumbo Frame Generation: GTP-U (8900B payload -> ~9000B frame)
+    {
+        GtpuGenConfig cfg;
+        cfg.inner_payload_size = 8900;
+        StatelessGtpuGenerator gen(cfg);
+        alignas(64) uint8_t jumbo_buf[10240];
+        uint32_t len = gen.GeneratePacket(jumbo_buf, sizeof(jumbo_buf));
+        assert(len >= 8900 && len <= 10240);
+
+        GtpuGenVerification verif;
+        bool ok = StatelessGtpuGenerator::VerifyFrame(jumbo_buf, len, verif);
+        assert(ok && verif.is_valid);
+        assert(verif.frame_len == len);
+    }
+
+    // 2. Jumbo Frame Generation: QinQ (8900B payload)
+    {
+        QinQGeneratorConfig cfg;
+        cfg.payload_size = 8900;
+        QinQGenerator gen(cfg);
+        alignas(64) uint8_t jumbo_buf[10240];
+        uint32_t len = gen.GeneratePacket(jumbo_buf, sizeof(jumbo_buf));
+        assert(len >= 8900 && len <= 10240);
+
+        QinQVerificationInfo verif;
+        bool ok = QinQGenerator::VerifyFrame(jumbo_buf, len, verif);
+        assert(ok && verif.is_valid);
+    }
+
+    // 3. Padded Frame Generation: ARP (1500B MTU padding)
+    {
+        ArpGeneratorConfig cfg;
+        cfg.pad_to_min_frame = true;
+        cfg.min_frame_size = 1500;
+        StatelessArpGenerator gen(cfg);
+        alignas(64) uint8_t pad_buf[2048];
+        uint32_t len = gen.GeneratePacket(pad_buf, sizeof(pad_buf));
+        assert(len == 1500);
+
+        ArpVerificationInfo verif;
+        bool ok = StatelessArpGenerator::VerifyFrame(pad_buf, len, verif);
+        assert(ok && verif.is_valid);
+        assert(verif.frame_len == 1500);
+    }
+
+    // 4. Full 32-bit PRNG Sweep Overflow Safety (0..0xFFFFFFFF)
+    {
+        ArpGeneratorConfig acfg;
+        acfg.target_ip_start = 0;
+        acfg.target_ip_end = 0xFFFFFFFFU;
+        acfg.ip_cycle_mode = ArpIpCycleMode::PSEUDO_RANDOM;
+        StatelessArpGenerator agen(acfg);
+        alignas(64) uint8_t buf[256];
+        bool non_zero_seen = false;
+        for (int i = 0; i < 20; ++i) {
+            agen.GeneratePacket(buf, sizeof(buf));
+            if (agen.GetCurrentTargetIp() != 0) non_zero_seen = true;
+        }
+        assert(non_zero_seen && "PRNG stuck at 0 due to 32-bit unsigned overflow!");
+
+        GtpuGenConfig gcfg;
+        gcfg.teid_start = 0;
+        gcfg.teid_end = 0xFFFFFFFFU;
+        gcfg.teid_mode = TeidCycleMode::PSEUDO_RANDOM;
+        StatelessGtpuGenerator ggen(gcfg);
+        non_zero_seen = false;
+        for (int i = 0; i < 20; ++i) {
+            ggen.GeneratePacket(buf, sizeof(buf));
+            if (ggen.GetCurrentTeid() != 0) non_zero_seen = true;
+        }
+        assert(non_zero_seen && "TEID PRNG stuck at 0 due to 32-bit unsigned overflow!");
+    }
+
+    // 5. Inverted Inner IP Range Auto-Normalization
+    {
+        GtpuGenConfig cfg;
+        cfg.cycle_inner_ip = true;
+        cfg.inner_ip_start = 0x0A000005;
+        cfg.inner_ip_end = 0x0A000001; // Inverted
+        cfg.inner_ip_step = 0;         // Zero step
+        StatelessGtpuGenerator gen(cfg);
+        assert(gen.GetConfig().inner_ip_start == 0x0A000001);
+        assert(gen.GetConfig().inner_ip_end == 0x0A000005);
+        assert(gen.GetConfig().inner_ip_step == 1);
+
+        alignas(64) uint8_t buf[512];
+        GtpuGenVerification verif;
+        gen.GeneratePacket(buf, sizeof(buf));
+        StatelessGtpuGenerator::VerifyFrame(buf, gen.GetPacketSize(), verif);
+        assert(verif.inner_src_ip == 0x0A000001);
+        gen.GeneratePacket(buf, sizeof(buf));
+        StatelessGtpuGenerator::VerifyFrame(buf, gen.GetPacketSize(), verif);
+        assert(verif.inner_src_ip == 0x0A000002);
+    }
+
+    // 6. FastpathClassifier Legacy 0x9100 QinQ Demux
+    {
+        QinQGeneratorConfig cfg;
+        cfg.s_tpid = ETHERTYPE_9100;
+        cfg.s_vlan_min = 777;
+        cfg.c_vlan_min = 888;
+        cfg.sweep_mode = QinQSweepMode::FLAT_FIXED;
+        QinQGenerator gen(cfg);
+
+        alignas(64) uint8_t frame[512];
+        uint32_t len = gen.GeneratePacket(frame, sizeof(frame));
+        assert(len >= 64);
+
+        PacketMetadata meta{};
+        TelcoFrameType ftype = TelcoFrameType::Unknown;
+        bool ok = FastpathClassifier::Classify(frame, len, meta, ftype);
+        assert(ok);
+        assert(meta.outer_vlan == 777);
+        assert(meta.inner_vlan == 888);
+        assert(ftype == TelcoFrameType::Ipv4Data);
+    }
+
+    // 7. Getter consistency with generated packet stats
+    {
+        GtpuGenConfig gcfg;
+        gcfg.teid_start = 42;
+        StatelessGtpuGenerator ggen(gcfg);
+        alignas(64) uint8_t buf[512];
+        ggen.GeneratePacket(buf, sizeof(buf));
+        assert(ggen.GetCurrentTeid() == ggen.GetStats().current_teid);
+        assert(ggen.GetCurrentTeid() == 42);
+
+        QinQGeneratorConfig qcfg;
+        qcfg.s_vlan_min = 100;
+        qcfg.c_vlan_min = 200;
+        qcfg.sweep_mode = QinQSweepMode::FLAT_FIXED;
+        QinQGenerator qgen(qcfg);
+        qgen.GeneratePacket(buf, sizeof(buf));
+        assert(qgen.GetCurrentSVlan() == qgen.GetStats().current_s_vlan);
+        assert(qgen.GetCurrentCVlan() == qgen.GetStats().current_c_vlan);
+        assert(qgen.GetCurrentSVlan() == 100);
+        assert(qgen.GetCurrentCVlan() == 200);
+
+        ArpGeneratorConfig acfg;
+        acfg.target_ip_start = 0x0A000009;
+        StatelessArpGenerator agen(acfg);
+        agen.GeneratePacket(buf, sizeof(buf));
+        assert(agen.GetCurrentTargetIp() == agen.GetStats().current_target_ip);
+        assert(agen.GetCurrentTargetIp() == 0x0A000009);
+    }
+
+    // 8. ProtocolConfig VLAN propagation for StatelessArpGenerator
+    {
+        ProtocolConfig pcfg;
+        pcfg.enable_vlan_tagging = true;
+        pcfg.base_vlan_s = 350;
+        StatelessArpGenerator agen;
+        bool ok = agen.Init(pcfg);
+        assert(ok);
+        alignas(64) uint8_t buf[256];
+        uint32_t len = agen.GeneratePacket(buf, sizeof(buf));
+        ArpVerificationInfo verif;
+        StatelessArpGenerator::VerifyFrame(buf, len, verif);
+        assert(verif.has_vlan);
+        assert(verif.vlan_id == 350);
+    }
+
+    std::cout << "  -> Jumbo frames (9KB+), 32-bit overflow guards, 0x9100 demux & getters: PASSED" << std::endl;
+}
+
+// =========================================================================
+// Test 7: Generator Throughput Benchmark (Honest CPU Memory Construction)
 // =========================================================================
 void TestStatelessThroughputBenchmark() {
-    std::cout << "[TEST] 6. Stateless Generators In-Memory Construction Benchmark (1M Packets)..." << std::endl;
+    std::cout << "[TEST] 7. Stateless Generators In-Memory Construction Benchmark (1M Packets)..." << std::endl;
 
     constexpr uint32_t TOTAL_PACKETS = 1000000;
     alignas(64) uint8_t pkt_buf[1536];
@@ -640,6 +811,7 @@ int main() {
     TestQinQSweepWireFormatAndVlanRanges();
     TestStatelessArpWireFormatAndModes();
     TestBoundaryFuzzAndTruncationSafety();
+    TestHardenedEdgeCasesAndJumboFrames();
     TestStatelessThroughputBenchmark();
 
     std::cout << "=================================================================" << std::endl;

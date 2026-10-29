@@ -46,8 +46,12 @@ public:
     // Durum ve İstatistikler
     const QinQGenStats& GetStats() const noexcept { return stats_; }
     void ResetStats() noexcept;
-    uint16_t GetCurrentSVlan() const noexcept { return current_s_vlan_; }
-    uint16_t GetCurrentCVlan() const noexcept { return current_c_vlan_; }
+    uint16_t GetCurrentSVlan() const noexcept {
+        return stats_.packets_generated > 0 ? stats_.current_s_vlan : config_.s_vlan_min;
+    }
+    uint16_t GetCurrentCVlan() const noexcept {
+        return stats_.packets_generated > 0 ? stats_.current_c_vlan : config_.c_vlan_min;
+    }
     size_t GetPacketSize() const noexcept { return total_len_; }
     const QinQGeneratorConfig& GetConfig() const noexcept { return config_; }
 
@@ -61,8 +65,8 @@ private:
     QinQGeneratorConfig config_;
     QinQGenStats        stats_;
 
-    // 64-bayt hizalı şablon tampon
-    alignas(64) uint8_t template_buf_[512];
+    // 64-bayt hizalı şablon tampon (Jumbo frame desteği: 10240B)
+    alignas(64) uint8_t template_buf_[10240];
     size_t total_len_{0};
 
     // Ofsetler

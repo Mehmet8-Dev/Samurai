@@ -24,8 +24,8 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
     uint16_t ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
     offset += 2;
 
-    // 802.1ad (QinQ Service Tag)
-    if (ethertype == 0x88A8 && len >= offset + 4) {
+    // 802.1ad (QinQ Service Tag) - supports 0x88A8 and legacy 0x9100
+    if ((ethertype == 0x88A8 || ethertype == 0x9100) && len >= offset + 4) {
         meta.outer_vlan = ((static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1]) & 0x0FFF;
         offset += 2;
         ethertype = (static_cast<uint16_t>(frame[offset]) << 8) | frame[offset + 1];
@@ -62,7 +62,7 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
         return true;
     }
 
-    if (ethertype == 0x0806) { // ARP
+    if (ethertype == 0x0806 && len >= offset + 28) { // ARP (RFC 826 payload is 28 bytes)
         out_type = TelcoFrameType::Arp;
         meta.payload_ptr = frame + offset;
         meta.payload_len = static_cast<uint16_t>(len - offset);
@@ -83,8 +83,10 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
         if (len < offset + ihl) return false;
 
         uint8_t proto = ip_hdr[9];
-        uint32_t src_ip = *reinterpret_cast<const uint32_t*>(ip_hdr + 12);
-        uint32_t dst_ip = *reinterpret_cast<const uint32_t*>(ip_hdr + 16);
+        uint32_t src_ip = 0;
+        uint32_t dst_ip = 0;
+        std::memcpy(&src_ip, ip_hdr + 12, sizeof(src_ip));
+        std::memcpy(&dst_ip, ip_hdr + 16, sizeof(dst_ip));
         meta.src_ip = ntohl(src_ip);
         meta.dst_ip = ntohl(dst_ip);
 
