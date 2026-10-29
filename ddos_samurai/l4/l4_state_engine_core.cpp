@@ -135,7 +135,7 @@ void L4StateEngineCore::ResetStorage(uint32_t table_size, uint32_t lock_count, u
   lock_count_ = lock_count;
   timeout_sec_ = timeout_sec;
   table_.assign(static_cast<size_t>(table_size_), Entry{});
-  std::vector<std::mutex> new_locks(static_cast<size_t>(lock_count_));
+  std::vector<PaddedMutex> new_locks(static_cast<size_t>(lock_count_));
   locks_.swap(new_locks);
   sweep_cursor_ = 0;
   active_entries_.store(0, std::memory_order_relaxed);
@@ -176,7 +176,8 @@ void L4StateEngineCore::UpsertState(
     TcpEventCode event,
     uint16_t window,
     uint16_t mss,
-    uint8_t ttl) {
+    uint8_t ttl,
+    uint32_t now_sec) {
   if (src_ip == 0 || src_port == 0 || table_.empty() || locks_.empty()) {
     return;
   }
@@ -188,7 +189,7 @@ void L4StateEngineCore::UpsertState(
   const uint32_t segment = h % lock_count_;
   const uint32_t segment_start = segment * segment_size;
   const uint32_t start_idx = segment_start + ((h / lock_count_) % segment_size);
-  const uint32_t now = MonotonicSeconds();
+  const uint32_t now = (now_sec != 0) ? now_sec : MonotonicSeconds();
 
   std::lock_guard<std::mutex> guard(locks_[segment]);
   uint32_t idx = start_idx;
@@ -386,6 +387,7 @@ IngestResult L4StateEngineCore::IngestTxPackets(const uint8_t* packets, size_t p
     mimicry_mss = mimicry_mss_;
     mimicry_ttl = mimicry_ttl_;
   }
+  const uint32_t batch_now = MonotonicSeconds();
   for (size_t i = 0; i < count; ++i) {
     const uint8_t* pkt = packets + (i * packet_size);
     uint32_t src_ip = 0;
@@ -436,7 +438,7 @@ IngestResult L4StateEngineCore::IngestTxPackets(const uint8_t* packets, size_t p
     const uint16_t final_win = win > 0 ? win : mimicry_window;
     const uint16_t final_mss = mss > 0 ? mss : mimicry_mss;
     const uint8_t final_ttl = ttl > 0 ? ttl : mimicry_ttl;
-    UpsertState(src_ip, src_port, dst_port, next_seq, next_ack, event, final_win, final_mss, final_ttl);
+    UpsertState(src_ip, src_port, dst_port, next_seq, next_ack, event, final_win, final_mss, final_ttl, batch_now);
     out.updated++;
   }
   return out;
@@ -491,7 +493,8 @@ IngestResult L4StateEngineCore::IngestRxFrame(const uint8_t* frame, size_t frame
   const uint16_t final_win = win > 0 ? win : mimicry_window;
   const uint16_t final_mss = mss > 0 ? mss : mimicry_mss;
   const uint8_t final_ttl = ttl > 0 ? ttl : mimicry_ttl;
-  UpsertState(dst_ip, dst_port, src_port, next_seq, next_ack, TcpEventCode::kRxSynAck, final_win, final_mss, final_ttl);
+  const uint32_t rx_now = MonotonicSeconds();
+  UpsertState(dst_ip, dst_port, src_port, next_seq, next_ack, TcpEventCode::kRxSynAck, final_win, final_mss, final_ttl, rx_now);
   out.updated = 1;
   return out;
 }

@@ -115,7 +115,8 @@ class L4StateEngineCore {
       TcpEventCode event,
       uint16_t window,
       uint16_t mss,
-      uint8_t ttl);
+      uint8_t ttl,
+      uint32_t now_sec = 0);
 
   static bool ParseIpv4TcpView(
       const uint8_t* pkt,
@@ -133,9 +134,11 @@ class L4StateEngineCore {
       uint16_t* out_mss,
       uint8_t* out_ttl);
 
+  struct alignas(64) PaddedMutex : public std::mutex {};
+
   mutable std::mutex meta_mu_;
   std::vector<Entry> table_;
-  std::vector<std::mutex> locks_;
+  std::vector<PaddedMutex> locks_;
   uint32_t table_size_ = 65536;
   uint32_t lock_count_ = 256;
   uint32_t timeout_sec_ = 60;
