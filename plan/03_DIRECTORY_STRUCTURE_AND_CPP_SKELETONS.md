@@ -156,7 +156,94 @@ public:
 
 ---
 
-### 2.2 Oturum Yöneticisi: `session_manager.hpp`
+### 2.2 128-Bayt Önbellek Hizalı Oturum Bağlamı: `session_context.hpp`
+
+```cpp
+#pragma once
+
+#include <cstdint>
+
+namespace ddos_samurai::telecom {
+
+enum class SessionState : uint8_t {
+    IDLE = 0,
+    DISCOVERING,     // PPPoE PADI / DHCP DISCOVER / PFCP Assoc Req
+    AUTHENTICATING,  // PPP PAP/CHAP / 802.1X EAP
+    ESTABLISHED,     // Aktif tünel / Abone hatta / Veri akışı serbest
+    TERMINATING,     // PADT / DHCP RELEASE / PFCP Deletion
+    FAILED,          // Timeout veya auth rejection
+    TEARDOWN         // Bellek temizleme aşaması
+};
+
+struct alignas(16) Flow5Tuple {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t  proto;
+    uint8_t  pad[7];
+};
+
+struct alignas(64) TelcoSessionContext {
+    // =========================================================================
+    // --- 1. CACHE LINE (64 Bayt): FASTPATH 5-TUPLE, L2/L3 & TÜNEL TANIMLAYICILARI ---
+    // =========================================================================
+    // Durumlu L4 5-Tuple (IPv4/Port/Protokol - 13 bayt)
+    uint32_t client_ip;        // Abone IPv4 adresi (4 bayt)
+    uint32_t peer_ip;          // Ağ geçidi / Hedef Sunucu IPv4 adresi (4 bayt)
+    uint16_t client_port;      // İstemci kaynak portu (2 bayt)
+    uint16_t peer_port;        // Sunucu hedef portu (2 bayt)
+    uint8_t  ip_proto;         // IP Protokol numarası (TCP:6, UDP:17, ICMP:1) (1 bayt)
+
+    // Telekom Kimlikleri ve Tüneller (16 bayt)
+    uint32_t session_id;       // PPPoE Session ID veya Abone İndeksi (4 bayt)
+    uint32_t teid_uplink;      // 5G/4G GTP-U Uplink TEID (4 bayt)
+    uint32_t teid_downlink;    // 5G/4G GTP-U Downlink TEID (4 bayt)
+    uint16_t s_vlan;           // Outer Service VLAN (802.1ad QinQ) (2 bayt)
+    uint16_t c_vlan;           // Inner Customer VLAN (802.1q) (2 bayt)
+
+    // L2 MAC Adresleri (12 bayt)
+    uint8_t  client_mac[6];    // Abone MAC adresi (6 bayt)
+    uint8_t  peer_mac[6];      // BRAS / Ağ Geçidi MAC adresi (6 bayt)
+
+    // Durum ve Hızlı Eşleme Doğrulaması (13 bayt)
+    SessionState state;        // FSM Oturum Durumu (1 bayt)
+    uint8_t  protocol_id;      // PPPOE, DHCP, GTP, vb. (1 bayt)
+    uint32_t flow_hash;        // Donanım RSS / SSE4.2 CRC32 5-Tuple Hash Özeti (4 bayt)
+    uint8_t  pad1[6];          // 64 Bayta Tamamlama Dolgusu (6 bayt)
+    // -------------------------------------------------------------------------
+    // 1. Cache Line Toplamı: 13 + 16 + 12 + 1 + 1 + 4 + 7 = 64 bayt.
+
+    // =========================================================================
+    // --- 2. CACHE LINE (64 Bayt): ZAMANLAYICI ÇARKI, FSM VE TELEMETRİ SAYAÇLARI ---
+    // =========================================================================
+    // Hiyerarşik Zamanlayıcı Çarkı Bağlantıları (O(1) İki Yönlü Liste - 24 bayt)
+    TelcoSessionContext* wheel_prev; // Zamanlayıcı çarkı önceki düğüm (8 bayt)
+    TelcoSessionContext* wheel_next; // Zamanlayıcı çarkı sonraki düğüm (8 bayt)
+    uint64_t timer_expire_tsc;       // Zaman aşımı süresi dolma TSC zamanı (8 bayt)
+    uint64_t last_activity_tsc;      // Son gelen/giden paket TSC zamanı (8 bayt)
+
+    // Telemetri ve Performans Sayaçları (24 bayt)
+    uint64_t tx_packets;             // İletilen toplam paket (8 bayt)
+    uint64_t rx_packets;             // Alınan toplam paket (8 bayt)
+    uint64_t tx_bytes;               // İletilen toplam bayt (8 bayt)
+    uint64_t rx_bytes;               // Alınan toplam bayt (8 bayt)
+
+    // PPP / Tünel Protokol FSM Parametreleri (8 bayt)
+    uint16_t ppp_lcp_identifier;     // PPP transaction identifier (2 bayt)
+    uint16_t retry_count;            // Yeniden deneme sayacı (2 bayt)
+    uint32_t ppp_magic_number;       // PPP loop detection magic number (4 bayt)
+    // -------------------------------------------------------------------------
+    // 2. Cache Line Toplamı: 32 + 24 + 8 = 64 bayt.
+};
+static_assert(sizeof(TelcoSessionContext) == 128, "TelcoSessionContext tam 2 cache line (128 bayt) olmalidir!");
+
+} // namespace ddos_samurai::telecom
+```
+
+---
+
+### 2.3 Oturum Yöneticisi: `session_manager.hpp`
 
 ```cpp
 #pragma once
@@ -195,6 +282,12 @@ public:
     // 4G/5G için TEID ile arama
     TelcoSessionContext* FindGtpuSession(uint32_t teid) noexcept;
 
+    // Durumlu L4 5-Tuple ile donanım hızlandırmalı O(1) arama
+    TelcoSessionContext* FindSessionBy5Tuple(const Flow5Tuple& tuple) noexcept;
+    TelcoSessionContext* FindSessionBy5Tuple(uint32_t src_ip, uint32_t dst_ip, 
+                                            uint16_t src_port, uint16_t dst_port, 
+                                            uint8_t proto) noexcept;
+
     uint32_t GetActiveSessionCount() const noexcept {
         return active_sessions_.load(std::memory_order_relaxed);
     }
@@ -210,6 +303,11 @@ private:
     // Boş oturum indekslerini tutan kilitli olmayan (lock-free) yığın
     std::unique_ptr<uint32_t[]> free_indices_;
     std::atomic<uint32_t> free_head_{0};
+
+    // 5-Tuple O(1) arama hash tablosu (Donanım CRC32 intrinsics)
+    static constexpr uint32_t HASH_TABLE_SIZE = 1048576; // 1M yuva
+    static constexpr uint32_t HASH_TABLE_MASK = HASH_TABLE_SIZE - 1;
+    TelcoSessionContext** hash_buckets_{nullptr};
 };
 
 } // namespace ddos_samurai::telecom
