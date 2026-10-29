@@ -160,5 +160,19 @@ target_include_directories(test_telco_cluster_sharding PRIVATE
 target_compile_options(test_telco_cluster_sharding PRIVATE -msse4.2 -UNDEBUG)
 target_link_libraries(test_telco_cluster_sharding PRIVATE samurai_control samurai_telecom_static samurai_l7emu samurai_core pthread)
 
+add_executable(test_telco_chaos_recovery tests/test_telco_chaos_recovery.cpp)
+target_include_directories(test_telco_chaos_recovery PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/pppoe
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/dhcp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_telco_chaos_recovery PRIVATE -msse4.2 -UNDEBUG)
+target_link_libraries(test_telco_chaos_recovery PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
+
 
 
