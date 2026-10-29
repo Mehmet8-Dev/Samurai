@@ -102,27 +102,27 @@ struct TelcoAuditRecord {
         obj.set("protocol", samurai::core::json::Value::Str(protocol));
         obj.set("subscriber_count", samurai::core::json::Value::Int(subscriber_count));
         obj.set("active_sessions", samurai::core::json::Value::Int(active_sessions));
-        obj.set("session_setup_rate_cps", samurai::core::json::Value::Float(session_setup_rate_cps));
-        obj.set("session_failure_rate_pct", samurai::core::json::Value::Float(session_failure_rate_pct));
+        obj.set("session_setup_rate_cps", samurai::core::json::Value::Double(session_setup_rate_cps));
+        obj.set("session_failure_rate_pct", samurai::core::json::Value::Double(session_failure_rate_pct));
         obj.set("packets_per_second", samurai::core::json::Value::Int(static_cast<std::int64_t>(packets_per_second)));
         obj.set("rx_drops", samurai::core::json::Value::Int(static_cast<std::int64_t>(rx_drops)));
         obj.set("tx_errors", samurai::core::json::Value::Int(static_cast<std::int64_t>(tx_errors)));
-        obj.set("cpu_utilization_pct", samurai::core::json::Value::Float(cpu_utilization_pct));
-        obj.set("memory_usage_mb", samurai::core::json::Value::Float(memory_usage_mb));
-        obj.set("test_duration_s", samurai::core::json::Value::Float(test_duration_s));
+        obj.set("cpu_utilization_pct", samurai::core::json::Value::Double(cpu_utilization_pct));
+        obj.set("memory_usage_mb", samurai::core::json::Value::Double(memory_usage_mb));
+        obj.set("test_duration_s", samurai::core::json::Value::Double(test_duration_s));
         obj.set("hardware_spec", samurai::core::json::Value::Str(hardware_spec));
 
         // RFC 2544 fields
         auto rfc = samurai::core::json::Value::Object();
         rfc.set("tx_frames", samurai::core::json::Value::Int(static_cast<std::int64_t>(tx_frames)));
         rfc.set("rx_frames", samurai::core::json::Value::Int(static_cast<std::int64_t>(rx_frames)));
-        rfc.set("frame_loss_pct", samurai::core::json::Value::Float(frame_loss_pct));
-        rfc.set("throughput_mbps", samurai::core::json::Value::Float(throughput_mbps));
-        rfc.set("min_latency_us", samurai::core::json::Value::Float(min_latency_us));
-        rfc.set("avg_latency_us", samurai::core::json::Value::Float(avg_latency_us));
-        rfc.set("p95_latency_us", samurai::core::json::Value::Float(p95_latency_us));
-        rfc.set("p99_latency_us", samurai::core::json::Value::Float(p99_latency_us));
-        rfc.set("max_latency_us", samurai::core::json::Value::Float(max_latency_us));
+        rfc.set("frame_loss_pct", samurai::core::json::Value::Double(frame_loss_pct));
+        rfc.set("throughput_mbps", samurai::core::json::Value::Double(throughput_mbps));
+        rfc.set("min_latency_us", samurai::core::json::Value::Double(min_latency_us));
+        rfc.set("avg_latency_us", samurai::core::json::Value::Double(avg_latency_us));
+        rfc.set("p95_latency_us", samurai::core::json::Value::Double(p95_latency_us));
+        rfc.set("p99_latency_us", samurai::core::json::Value::Double(p99_latency_us));
+        rfc.set("max_latency_us", samurai::core::json::Value::Double(max_latency_us));
         obj.set("rfc2544", std::move(rfc));
 
         return obj;

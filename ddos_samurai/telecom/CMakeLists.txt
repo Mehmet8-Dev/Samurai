@@ -135,3 +135,16 @@ target_include_directories(test_stateless_generators PRIVATE
 target_compile_options(test_stateless_generators PRIVATE -UNDEBUG)
 target_link_libraries(test_stateless_generators PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
 
+add_executable(test_multi_worker_telco tests/test_multi_worker_telco.cpp)
+target_include_directories(test_multi_worker_telco PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/pppoe
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_multi_worker_telco PRIVATE -msse4.2 -UNDEBUG)
+target_link_libraries(test_multi_worker_telco PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
+
