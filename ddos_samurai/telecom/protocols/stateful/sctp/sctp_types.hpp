@@ -1,0 +1,128 @@
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+#include <string>
+#include <vector>
+
+namespace ddos_samurai::telecom::sctp {
+
+// SCTP IP Protokol Numarası
+constexpr uint8_t IP_PROTO_SCTP = 132;
+
+// Bilinen Telekom SCTP Portları
+constexpr uint16_t SCTP_PORT_S1AP = 36412; // 4G S1-AP (MME - eNB)
+constexpr uint16_t SCTP_PORT_NGAP = 38412; // 5G NG-AP (AMF - gNB)
+constexpr uint16_t SCTP_PORT_DIAMETER = 3868; // Diameter over SCTP
+
+// 3GPP Standart Payload Protocol Identifiers (PPID)
+constexpr uint32_t SCTP_PPID_S1AP = 18; // 3GPP TS 36.413
+constexpr uint32_t SCTP_PPID_NGAP = 60; // 3GPP TS 38.413
+constexpr uint32_t SCTP_PPID_X2AP = 27; // 3GPP TS 36.423
+constexpr uint32_t SCTP_PPID_F1AP = 62; // 3GPP TS 38.472
+constexpr uint32_t SCTP_PPID_DIAMETER = 46; // RFC 6733
+
+// SCTP Chunk Türleri (RFC 4960)
+enum class SctpChunkType : uint8_t {
+    DATA = 0x00,
+    INIT = 0x01,
+    INIT_ACK = 0x02,
+    SACK = 0x03,
+    HEARTBEAT = 0x04,
+    HEARTBEAT_ACK = 0x05,
+    ABORT = 0x06,
+    SHUTDOWN = 0x07,
+    SHUTDOWN_ACK = 0x08,
+    ERROR = 0x09,
+    COOKIE_ECHO = 0x0A,
+    COOKIE_ACK = 0x0B,
+    ECNE = 0x0C,
+    CWR = 0x0D,
+    SHUTDOWN_COMPLETE = 0x0E
+};
+
+// RFC 4960 Durum Makinesi
+enum class SctpState : uint8_t {
+    CLOSED = 0,
+    COOKIE_WAIT,
+    COOKIE_ECHOED,
+    ESTABLISHED,
+    SHUTDOWN_PENDING,
+    SHUTDOWN_SENT,
+    SHUTDOWN_RECEIVED,
+    SHUTDOWN_ACK_SENT,
+    FAILED
+};
+
+#pragma pack(push, 1)
+
+// SCTP Common Header (12 Bayt - RFC 4960 Section 3.1)
+struct SctpCommonHeader {
+    uint16_t src_port;          // Kaynak port (network byte order)
+    uint16_t dst_port;          // Hedef port (network byte order)
+    uint32_t verification_tag;  // Doğrulama etiketi (network byte order)
+    uint32_t checksum;          // CRC32c checksum (little-endian byte order on wire as per RFC 4960)
+};
+static_assert(sizeof(SctpCommonHeader) == 12, "SctpCommonHeader must be 12 bytes");
+
+// SCTP Chunk Header (4 Bayt - RFC 4960 Section 3.2)
+struct SctpChunkHeader {
+    uint8_t  type;              // Chunk Type
+    uint8_t  flags;             // Chunk Flags
+    uint16_t length;            // Chunk Length dahil header (network byte order)
+};
+static_assert(sizeof(SctpChunkHeader) == 4, "SctpChunkHeader must be 4 bytes");
+
+// INIT ve INIT_ACK Sabit Gövdesi (16 Bayt - RFC 4960 Section 3.3.2)
+struct SctpInitChunkBody {
+    uint32_t initiate_tag;      // Başlatma Etiketi (peer'in VTag'i olur)
+    uint32_t a_rwnd;            // Alıcı Penceresi
+    uint16_t num_outbound_streams;
+    uint16_t num_inbound_streams;
+    uint32_t initial_tsn;       // Başlangıç İletim Sıra Numarası (TSN)
+};
+static_assert(sizeof(SctpInitChunkBody) == 16, "SctpInitChunkBody must be 16 bytes");
+
+// DATA Chunk Sabit Gövdesi (12 Bayt - RFC 4960 Section 3.3.1)
+struct SctpDataChunkBody {
+    uint32_t tsn;               // İletim Sıra Numarası
+    uint16_t stream_id;         // Akış Tanımlayıcısı
+    uint16_t stream_seq;        // Akış Sıra Numarası
+    uint32_t ppid;              // Payload Protocol Identifier (S1AP=18, NGAP=60)
+};
+static_assert(sizeof(SctpDataChunkBody) == 12, "SctpDataChunkBody must be 12 bytes");
+
+// SACK Chunk Sabit Gövdesi (12 Bayt - RFC 4960 Section 3.3.4)
+struct SctpSackChunkBody {
+    uint32_t cumulative_tsn_ack;
+    uint32_t a_rwnd;
+    uint16_t num_gap_ack_blocks;
+    uint16_t num_duplicate_tsn;
+};
+static_assert(sizeof(SctpSackChunkBody) == 12, "SctpSackChunkBody must be 12 bytes");
+
+#pragma pack(pop)
+
+struct SctpAssociationConfig {
+    uint32_t local_ip{0};
+    uint32_t peer_ip{0};
+    uint16_t local_port{SCTP_PORT_NGAP};
+    uint16_t peer_port{SCTP_PORT_NGAP};
+    uint8_t  local_mac[6]{0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    uint8_t  peer_mac[6]{0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee};
+    uint16_t vlan_s{0};
+    uint16_t vlan_c{0};
+
+    uint32_t my_vtag{0x12345678};
+    uint32_t peer_vtag{0};
+    uint32_t my_initial_tsn{1000};
+    uint32_t peer_initial_tsn{0};
+    uint32_t a_rwnd{65536};
+    uint16_t outbound_streams{10};
+    uint16_t inbound_streams{10};
+    uint32_t heartbeat_interval_ms{5000};
+    uint32_t retransmit_timeout_ms{1000};
+    uint16_t max_retries{3};
+};
+
+} // namespace ddos_samurai::telecom::sctp
