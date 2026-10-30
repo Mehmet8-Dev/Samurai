@@ -40,7 +40,7 @@ Bu belge, projenin native C++ mimarisini ve bileşenler arası ilişkileri özet
 - `samurai_defense_worker`: VAE savunma bypass ve doğrulama motoru.
 
 ### E) Donanım ve Protokol Motorları
-- `ddos_samurai/l4/`: `tcp_dataplane_core.cpp` (64-shard kilit şeritli User-Space TCP Stack), `l4_state_engine_core.cpp`.
+- `ddos_samurai/l4/`: `tcp_dataplane_core.cpp` (64-shard kilit şeritli User-Space TCP Stack).
 - `ddos_samurai/l7_emu_native/`: `engine.cpp`, `bridge.cpp`, `custom_quic_stack/`, `l2l3_stack/`.
 - `ddos_samurai/scenario_engine_native/`: `compiler.cpp`, `scheduler.cpp`, `sla.cpp`.
 - `ddos_samurai/cpu_native/`: `engine.cpp`, `packets.cpp`, `spoofing.cpp`, `amp.cpp`.

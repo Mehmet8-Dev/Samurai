@@ -5,14 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# samurai_l4 — the L4 TCP state engine + dataplane core, exposed through the
-# clean C FFI (l4se_* / tcp_dp_*). The legacy pybind module (state_engine_module.cpp)
-# is gone; ZMQ workers link this static library directly.
+# samurai_l4 — the L4 User-Space TCP Dataplane core, exposed through the
+# clean C FFI (tcp_dp_*).
 add_library(
   samurai_l4
   STATIC
-  l4_state_engine_core.cpp
-  l4_state_engine_ffi.cpp
   tcp_dataplane_core.cpp
   tcp_dataplane_ffi.cpp
   hw_timestamping.cpp)
