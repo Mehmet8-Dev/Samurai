@@ -67,6 +67,7 @@ public:
 
     const std::vector<uint8_t>& last_tx_packet() const noexcept { return last_tx_frame_; }
     void SetTimingWheel(HierarchicalTimingWheel* wheel) noexcept { timing_wheel_ = wheel; }
+    void HandleTimeout(TelcoSessionContext* session);
 
 private:
     SessionManager& session_mgr_;
@@ -84,7 +85,6 @@ private:
     uint16_t current_rtp_seq_{0};
     RtpJitterStats jitter_stats_{};
 
-    void HandleTimeout(TelcoSessionContext* session);
     bool ProcessSipMessage(TelcoSessionContext* session, const std::string& sip_msg, uint64_t now_tsc);
     bool ProcessRtpPacket(TelcoSessionContext* session, const uint8_t* rtp_data, size_t len, uint64_t now_tsc);
 };

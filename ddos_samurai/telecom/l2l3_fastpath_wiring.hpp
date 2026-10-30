@@ -12,6 +12,7 @@
 #include "ddos_samurai/telecom/protocols/stateful/sctp/sctp_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/diameter/diameter_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/sip_rtp/sip_rtp_engine.hpp"
+#include "ddos_samurai/telecom/protocols/stateful/pppoe/pppoe_engine.hpp"
 
 #include <cstdint>
 #include <cstddef>
@@ -84,6 +85,7 @@ class alignas(64) L2L3FastpathWiring {
   sctp::SctpEngine& sctp() noexcept { return sctp_engine_; }
   diameter::DiameterEngine& diameter() noexcept { return diameter_engine_; }
   sip_rtp::SipRtpEngine& sip_rtp() noexcept { return sip_rtp_engine_; }
+  pppoe::PppoeEngine& pppoe() noexcept { return pppoe_engine_; }
   SessionManager& session_mgr() noexcept { return session_mgr_; }
   HierarchicalTimingWheel& timing_wheel() noexcept { return timing_wheel_; }
 
@@ -115,6 +117,7 @@ class alignas(64) L2L3FastpathWiring {
   sctp::SctpEngine sctp_engine_;
   diameter::DiameterEngine diameter_engine_;
   sip_rtp::SipRtpEngine sip_rtp_engine_;
+  pppoe::PppoeEngine pppoe_engine_;
 
   std::vector<uint8_t> last_out_packet_;
   TxPacketCallback tx_callback_{nullptr};

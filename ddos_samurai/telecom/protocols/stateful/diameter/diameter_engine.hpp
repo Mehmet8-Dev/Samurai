@@ -87,6 +87,7 @@ public:
 
     const std::vector<uint8_t>& last_tx_packet() const noexcept { return last_tx_frame_; }
     void SetTimingWheel(HierarchicalTimingWheel* wheel) noexcept { timing_wheel_ = wheel; }
+    void HandleTimeout(TelcoSessionContext* session);
 
 private:
     SessionManager& session_mgr_;
@@ -98,7 +99,6 @@ private:
     uint32_t next_hop_by_hop_id_{0x10000000};
     uint32_t next_end_to_end_id_{0x20000000};
 
-    void HandleTimeout(TelcoSessionContext* session);
     bool ProcessDiameterPayload(TelcoSessionContext* session, const uint8_t* payload, size_t len, uint64_t now_tsc);
 };
 

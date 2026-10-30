@@ -154,6 +154,7 @@ public:
 
     const std::vector<uint8_t>& last_tx_packet() const noexcept { return last_tx_frame_; }
     void SetTimingWheel(HierarchicalTimingWheel* wheel) noexcept { timing_wheel_ = wheel; }
+    void HandleTimeout(TelcoSessionContext* session);
 
 private:
     SessionManager& session_mgr_;
@@ -166,8 +167,6 @@ private:
 
     SctpAssociationState& GetAssocState(TelcoSessionContext* session);
     const SctpAssociationState& GetAssocState(const TelcoSessionContext* session) const;
-
-    void HandleTimeout(TelcoSessionContext* session);
     bool ParseAndProcessChunks(TelcoSessionContext* session, const uint8_t* sctp_pkt, size_t sctp_len, uint64_t now_tsc);
 };
 

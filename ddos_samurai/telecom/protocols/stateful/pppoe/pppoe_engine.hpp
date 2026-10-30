@@ -47,6 +47,9 @@ public:
     void StartSession(TelcoSessionContext* session);
     void TerminateSession(TelcoSessionContext* session);
 
+    // Zaman aşımı işleyici
+    void HandleTimeout(TelcoSessionContext* session);
+
     // Oturum alt durumları
     PppoeSubState GetSubState(const TelcoSessionContext* session) const noexcept;
     void SetSubState(TelcoSessionContext* session, PppoeSubState sub) noexcept;
@@ -97,8 +100,6 @@ private:
     void HandlePap(const uint8_t* frame, size_t len, TelcoSessionContext* session);
     void HandleChap(const uint8_t* frame, size_t len, TelcoSessionContext* session);
     void HandleIpcp(const uint8_t* frame, size_t len, TelcoSessionContext* session);
-
-    void HandleTimeout(TelcoSessionContext* session);
 };
 
 } // namespace ddos_samurai::telecom::pppoe
