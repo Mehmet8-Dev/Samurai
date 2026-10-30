@@ -180,12 +180,53 @@ bool SrtpEngine::DeriveSessionKeys(const SrtpKeyConfig& key_cfg,
     return ok1 && ok2 && ok3;
 }
 
-void SrtpEngine::ComputeAesIcmKeystream(EVP_CIPHER_CTX* /*aes_ctx*/,
-                                       const uint8_t /*salt*/[SRTP_SESSION_SALT_LEN],
-                                       uint32_t /*ssrc*/,
-                                       uint64_t /*packet_index*/,
-                                       uint8_t* /*data*/,
-                                       size_t /*len*/) {
+void SrtpEngine::ComputeAesIcmKeystream(EVP_CIPHER_CTX* aes_ctx,
+                                       const uint8_t salt[SRTP_SESSION_SALT_LEN],
+                                       uint32_t ssrc,
+                                       uint64_t packet_index,
+                                       uint8_t* data,
+                                       size_t len) {
+    if (!aes_ctx || !salt || !data || len == 0) return;
+
+    // RFC 3711 Section 4.1.1: IV = (salt * 2^16) XOR (SSRC * 2^64) XOR (i * 2^16)
+    uint8_t iv_base[16] = {0};
+    std::memcpy(iv_base, salt, SRTP_SESSION_SALT_LEN);
+
+    // SSRC XOR into bytes 4..7 (network byte order)
+    iv_base[4] ^= static_cast<uint8_t>((ssrc >> 24) & 0xFF);
+    iv_base[5] ^= static_cast<uint8_t>((ssrc >> 16) & 0xFF);
+    iv_base[6] ^= static_cast<uint8_t>((ssrc >> 8) & 0xFF);
+    iv_base[7] ^= static_cast<uint8_t>(ssrc & 0xFF);
+
+    // 48-bit packet index XOR into bytes 8..13 (network byte order)
+    iv_base[8]  ^= static_cast<uint8_t>((packet_index >> 40) & 0xFF);
+    iv_base[9]  ^= static_cast<uint8_t>((packet_index >> 32) & 0xFF);
+    iv_base[10] ^= static_cast<uint8_t>((packet_index >> 24) & 0xFF);
+    iv_base[11] ^= static_cast<uint8_t>((packet_index >> 16) & 0xFF);
+    iv_base[12] ^= static_cast<uint8_t>((packet_index >> 8) & 0xFF);
+    iv_base[13] ^= static_cast<uint8_t>(packet_index & 0xFF);
+
+    uint16_t block_counter = 0;
+    size_t processed = 0;
+    uint8_t iv_block[16];
+    uint8_t keystream_block[16];
+    int out_len = 0;
+
+    // Fastpath packet loop: Zero heap allocations
+    while (processed < len) {
+        std::memcpy(iv_block, iv_base, 16);
+        iv_block[14] = static_cast<uint8_t>((block_counter >> 8) & 0xFF);
+        iv_block[15] = static_cast<uint8_t>(block_counter & 0xFF);
+
+        EVP_EncryptUpdate(aes_ctx, keystream_block, &out_len, iv_block, 16);
+
+        size_t to_xor = std::min(len - processed, static_cast<size_t>(16));
+        for (size_t i = 0; i < to_xor; ++i) {
+            data[processed + i] ^= keystream_block[i];
+        }
+        processed += to_xor;
+        block_counter++;
+    }
 }
 
 void SrtpEngine::ComputeHmacSha1Tag(EVP_MAC_CTX* /*mac_ctx*/,
