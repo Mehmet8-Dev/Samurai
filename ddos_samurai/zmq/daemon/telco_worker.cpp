@@ -191,8 +191,8 @@ int main(int argc, char** argv) {
             ctx->session_id = sub_idx + 1;
             ctx->client_ip = base_ip + sub_idx;
             ctx->peer_ip = gateway_ip;
-            ctx->s_vlan = static_cast<uint16_t>(base_vlan_s + (sub_idx / 4096));
-            ctx->c_vlan = static_cast<uint16_t>(base_vlan_c + (sub_idx % 4096));
+            ctx->s_vlan = static_cast<uint16_t>(1 + ((base_vlan_s - 1 + (sub_idx / 4094)) % 4094));
+            ctx->c_vlan = static_cast<uint16_t>(1 + ((base_vlan_c - 1 + (sub_idx % 4094)) % 4094));
             std::memcpy(ctx->client_mac, base_mac, 6);
             ctx->client_mac[3] ^= static_cast<uint8_t>((sub_idx >> 16) & 0xFF);
             ctx->client_mac[4] ^= static_cast<uint8_t>((sub_idx >> 8) & 0xFF);

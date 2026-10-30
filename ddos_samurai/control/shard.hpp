@@ -69,11 +69,11 @@ struct SubscriberRange {
   }
 
   inline std::uint16_t GetVlanSFor(std::uint32_t sub_idx) const noexcept {
-    return static_cast<std::uint16_t>(base_vlan_s + (sub_idx / 4096));
+    return static_cast<std::uint16_t>(1 + ((base_vlan_s - 1 + (sub_idx / 4094)) % 4094));
   }
 
   inline std::uint16_t GetVlanCFor(std::uint32_t sub_idx) const noexcept {
-    return static_cast<std::uint16_t>(base_vlan_c + (sub_idx % 4096));
+    return static_cast<std::uint16_t>(1 + ((base_vlan_c - 1 + (sub_idx % 4094)) % 4094));
   }
 };
 

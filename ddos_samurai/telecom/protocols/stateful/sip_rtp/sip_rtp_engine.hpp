@@ -84,6 +84,7 @@ private:
     uint32_t current_rtp_ts_{0};
     uint16_t current_rtp_seq_{0};
     RtpJitterStats jitter_stats_{};
+    std::vector<TelcoSessionContext*> active_sip_sessions_;
 
     bool ProcessSipMessage(TelcoSessionContext* session, const std::string& sip_msg, uint64_t now_tsc);
     bool ProcessRtpPacket(TelcoSessionContext* session, const uint8_t* rtp_data, size_t len, uint64_t now_tsc);

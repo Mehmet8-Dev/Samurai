@@ -65,6 +65,7 @@ bool SipRtpEngine::Init(const ProtocolConfig& cfg) {
 }
 
 void SipRtpEngine::Shutdown() {
+    active_sip_sessions_.clear();
     uint32_t cap = session_mgr_.GetCapacity();
     for (uint32_t i = 0; i < cap; ++i) {
         TelcoSessionContext* s = session_mgr_.GetSessionByIndex(i);
@@ -86,6 +87,18 @@ void SipRtpEngine::SetState(TelcoSessionContext* session, SipCallState state) no
     if (!session) return;
     session->protocol_id = static_cast<uint8_t>(TelcoProtocolId::SIP_RTP);
     session->ppp_lcp_identifier = static_cast<uint16_t>(state);
+
+    if (state != SipCallState::TERMINATED && state != SipCallState::IDLE) {
+        if (std::find(active_sip_sessions_.begin(), active_sip_sessions_.end(), session) == active_sip_sessions_.end()) {
+            active_sip_sessions_.push_back(session);
+        }
+    } else {
+        auto it = std::find(active_sip_sessions_.begin(), active_sip_sessions_.end(), session);
+        if (it != active_sip_sessions_.end()) {
+            active_sip_sessions_.erase(it);
+        }
+    }
+
     switch (state) {
         case SipCallState::ESTABLISHED:
             session->state = SessionState::ESTABLISHED;
@@ -442,14 +455,24 @@ bool SipRtpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, uint64_t now
     uint32_t dst_ip = ntohl(ip->dst_ip);
     uint16_t src_port = ntohs(udp->src_port);
 
+    const uint8_t* payload = frame + udp_offset + sizeof(UdpHeader);
+    size_t payload_len = len - (udp_offset + sizeof(UdpHeader));
+
     TelcoSessionContext* session = session_mgr_.FindSessionBy5Tuple(dst_ip, src_ip, dst_port, src_port, 17);
     if (!session) {
-        uint32_t cap = session_mgr_.GetCapacity();
-        for (uint32_t i = 0; i < cap; ++i) {
-            TelcoSessionContext* s = session_mgr_.GetSessionByIndex(i);
+        // RTP veya SIP için aktif oturumlar arasında IP çifti veya SSRC ile eşleştir
+        uint32_t rtp_ssrc = 0;
+        if (payload_len >= sizeof(RtpHeader)) {
+            const auto* rtp = reinterpret_cast<const RtpHeader*>(payload);
+            rtp_ssrc = ntohl(rtp->ssrc);
+        }
+        for (TelcoSessionContext* s : active_sip_sessions_) {
             if (s && s->protocol_id == static_cast<uint8_t>(TelcoProtocolId::SIP_RTP)) {
-                session = s;
-                break;
+                if ((s->client_ip == dst_ip && s->peer_ip == src_ip) ||
+                    (rtp_ssrc != 0 && (s->teid_uplink == rtp_ssrc || s->teid_downlink == rtp_ssrc))) {
+                    session = s;
+                    break;
+                }
             }
         }
     }
@@ -459,9 +482,6 @@ bool SipRtpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, uint64_t now
     session->rx_packets++;
     session->rx_bytes += len;
     session->last_activity_tsc = now_tsc;
-
-    const uint8_t* payload = frame + udp_offset + sizeof(UdpHeader);
-    size_t payload_len = len - (udp_offset + sizeof(UdpHeader));
 
     if (dst_port == SIP_STANDARD_PORT || src_port == SIP_STANDARD_PORT) {
         std::string sip_str(reinterpret_cast<const char*>(payload), payload_len);
