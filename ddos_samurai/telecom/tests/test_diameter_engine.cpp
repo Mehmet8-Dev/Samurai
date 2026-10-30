@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstring>
 #include <vector>
+#include <arpa/inet.h>
 
 using namespace ddos_samurai::telecom;
 using namespace ddos_samurai::telecom::diameter;
@@ -552,6 +553,116 @@ void TestDiameterDictionaryValidation() {
     std::cout << "  -> Schema validation and mandatory AVP checking: PASSED" << std::endl;
 }
 
+void TestDiameterDictionaryDrivenCcrCca() {
+    std::cout << "[TEST] 10. Diameter Dictionary-Driven CCR / CCA Synthesis & Verification..." << std::endl;
+
+    SessionManager mgr(100);
+    HierarchicalTimingWheel wheel(2400000000ULL);
+    DiameterEngine client_engine(mgr, &wheel);
+    DiameterEngine server_engine(mgr, &wheel);
+
+    TelcoSessionContext* client_ctx = mgr.AcquireSession();
+    client_engine.SetState(client_ctx, DiameterPeerState::OPEN);
+    client_ctx->client_ip = 0x0A000001;
+    client_ctx->peer_ip = 0x0A000002;
+    client_ctx->client_port = 13868;
+    client_ctx->peer_port = DIAMETER_STANDARD_PORT;
+    mgr.Bind5Tuple(client_ctx, 0x0A000001, 0x0A000002, 13868, DIAMETER_STANDARD_PORT, 6);
+
+    TelcoSessionContext* server_ctx = mgr.AcquireSession();
+    server_engine.SetState(server_ctx, DiameterPeerState::OPEN);
+    server_ctx->client_ip = 0x0A000002;
+    server_ctx->peer_ip = 0x0A000001;
+    server_ctx->client_port = DIAMETER_STANDARD_PORT;
+    server_ctx->peer_port = 13868;
+    mgr.Bind5Tuple(server_ctx, 0x0A000002, 0x0A000001, DIAMETER_STANDARD_PORT, 13868, 6);
+
+    // 1. Build complex 3GPP Ro / Gx CCR with nested Subscription-Id & MSCC
+    std::vector<DecodedAvp> extra_ccr_avps;
+
+    // Subscription-Id Grouped
+    std::vector<DecodedAvp> sub_children;
+    sub_children.push_back(DecodedAvp::CreateU32(450, 0)); // Subscription-Id-Type: END_USER_E164
+    sub_children.push_back(DecodedAvp::CreateString(444, "441234567890")); // Subscription-Id-Data
+    extra_ccr_avps.push_back(DecodedAvp::CreateGrouped(443, sub_children));
+
+    // MSCC Grouped
+    auto rating_group = DecodedAvp::CreateU32(432, 100, AVP_FLAG_MANDATORY | AVP_FLAG_VENDOR, 10415);
+    auto usu_octets = DecodedAvp::CreateU64(421, 104857600ULL);
+    std::vector<DecodedAvp> usu_children{usu_octets};
+    auto usu = DecodedAvp::CreateGrouped(446, usu_children);
+    std::vector<DecodedAvp> mscc_children{rating_group, usu};
+    extra_ccr_avps.push_back(DecodedAvp::CreateGrouped(456, mscc_children));
+
+    // Framed-IP-Address
+    extra_ccr_avps.push_back(DecodedAvp::CreateAddressIpv4(8, 0x0A2D0016)); // 10.45.0.22
+
+    // Synthesize CCR packet via DiameterEngine
+    auto ccr_packet = client_engine.BuildDictionaryDrivenCcr(
+        client_ctx, "session-ro-carrier-998877", CcRequestType::INITIAL_REQUEST, 0, extra_ccr_avps);
+    assert(!ccr_packet.empty());
+    assert(ccr_packet.size() > 54 + 20); // Eth + IP + TCP + DiameterHeader + AVPs
+
+    // 2. Validate synthesized CCR packet wire layout
+    size_t tcp_payload_offset = 14 + 20 + 20; // 54
+    const auto* diam_hdr = reinterpret_cast<const DiameterHeader*>(ccr_packet.data() + tcp_payload_offset);
+    assert(diam_hdr->version == 1);
+    assert(diam_hdr->command_flags == 0x80); // R=1
+    assert(ntohl(diam_hdr->application_id) == APP_DIAMETER_CREDIT_CONTROL);
+
+    // Extract AVPs and validate against Ro schema
+    const uint8_t* avp_bytes = ccr_packet.data() + tcp_payload_offset + sizeof(DiameterHeader);
+    size_t avp_bytes_len = ccr_packet.size() - tcp_payload_offset - sizeof(DiameterHeader);
+
+    std::vector<DecodedAvp> rx_ccr_avps;
+    std::string rx_err;
+    bool valid = server_engine.ValidateIncomingAvps(
+        CMD_CREDIT_CONTROL, APP_DIAMETER_CREDIT_CONTROL, true,
+        avp_bytes, avp_bytes_len, rx_ccr_avps, rx_err);
+    assert(valid);
+    assert(rx_err.empty());
+    assert(rx_ccr_avps.size() >= 8); // At least required AVPs + extras
+
+    // Verify parsed Subscription-Id in rx_ccr_avps
+    bool found_sub = false;
+    for (const auto& a : rx_ccr_avps) {
+        if (a.code == 443 && a.type == AvpDataType::GROUPED) {
+            found_sub = true;
+            assert(a.grouped_val.size() == 2);
+            assert(a.grouped_val[0].code == 450 && a.grouped_val[0].u32_val == 0);
+            assert(a.grouped_val[1].code == 444 && a.grouped_val[1].str_val == "441234567890");
+        }
+    }
+    assert(found_sub);
+
+    // 3. Server builds CCA response
+    uint32_t hop_id = ntohl(diam_hdr->hop_by_hop_id);
+    uint32_t end_id = ntohl(diam_hdr->end_to_end_id);
+    auto cca_packet = server_engine.BuildDictionaryDrivenCca(
+        server_ctx, "session-ro-carrier-998877", RESULT_DIAMETER_SUCCESS,
+        CcRequestType::INITIAL_REQUEST, 0, hop_id, end_id);
+    assert(!cca_packet.empty());
+
+    // 4. Client receives and validates CCA
+    const auto* cca_diam_hdr = reinterpret_cast<const DiameterHeader*>(cca_packet.data() + tcp_payload_offset);
+    assert(cca_diam_hdr->command_flags == 0x00); // R=0 (Answer)
+    assert(ntohl(cca_diam_hdr->hop_by_hop_id) == hop_id);
+    assert(ntohl(cca_diam_hdr->end_to_end_id) == end_id);
+
+    const uint8_t* cca_avp_bytes = cca_packet.data() + tcp_payload_offset + sizeof(DiameterHeader);
+    size_t cca_avp_bytes_len = cca_packet.size() - tcp_payload_offset - sizeof(DiameterHeader);
+
+    std::vector<DecodedAvp> rx_cca_avps;
+    std::string cca_err;
+    bool cca_valid = client_engine.ValidateIncomingAvps(
+        CMD_CREDIT_CONTROL, APP_DIAMETER_CREDIT_CONTROL, false,
+        cca_avp_bytes, cca_avp_bytes_len, rx_cca_avps, cca_err);
+    assert(cca_valid);
+    assert(cca_err.empty());
+
+    std::cout << "  -> Dictionary-driven CCR/CCA dynamic packet synthesis: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "       SAMURAI DIAMETER (RFC 6733 / 3GPP) VERIFICATION SUITE     " << std::endl;
@@ -566,6 +677,7 @@ int main() {
     TestDiameterDictionaryJsonLoader();
     TestDiameterDynamicGroupedAvpCodec();
     TestDiameterDictionaryValidation();
+    TestDiameterDictionaryDrivenCcrCca();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL DIAMETER ENGINE TESTS PASSED SUCCESSFULLY! (100% VERIFIED) " << std::endl;
