@@ -54,6 +54,27 @@ enum class SctpState : uint8_t {
     FAILED
 };
 
+// RFC 4960 §8 Yol Durumları (Multihoming Path Status)
+enum class SctpPathStatus : uint8_t {
+    INACTIVE = 0,
+    UNCONFIRMED = 1,
+    ACTIVE = 2
+};
+
+// Bir SCTP ilişkilendirmesi için en fazla 4 yol (1 birincil + 3 yedek/ikincil yol)
+constexpr size_t SCTP_MAX_PATHS = 4;
+
+struct SctpPath {
+    uint32_t ip{0};
+    uint16_t port{0};
+    uint8_t  mac[6]{0};
+    SctpPathStatus status{SctpPathStatus::UNCONFIRMED};
+    uint16_t error_counter{0};
+    uint32_t rto_ms{1000};
+    bool is_primary{false};
+    uint64_t last_hb_tsc{0};
+};
+
 #pragma pack(push, 1)
 
 // SCTP Common Header (12 Bayt - RFC 4960 Section 3.1)
@@ -123,6 +144,11 @@ struct SctpAssociationConfig {
     uint32_t heartbeat_interval_ms{5000};
     uint32_t retransmit_timeout_ms{1000};
     uint16_t max_retries{3};
+
+    // Multihoming Desteği (RFC 4960 §5.1.2 & §8)
+    std::vector<uint32_t> peer_secondary_ips{};
+    uint16_t path_max_retrans{3};
+    bool enable_pr_sctp{true};
 };
 
 } // namespace ddos_samurai::telecom::sctp
