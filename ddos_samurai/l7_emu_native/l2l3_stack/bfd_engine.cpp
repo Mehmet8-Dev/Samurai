@@ -262,8 +262,22 @@ bool BfdEngine::parse_bfd_control_packet(
   const auto* ip = reinterpret_cast<const Ipv4Header*>(data + sizeof(EthHeader));
   if ((ip->ihl_version >> 4) != 4 || ip->protocol != 17) return false;
 
+  // RFC 5881 Section 4: The TTL (or Hop Limit) value of all incoming single-hop BFD packets
+  // MUST be validated to have a TTL of 255. Packets with any other TTL value MUST be dropped.
+  if (ip->ttl != 255) return false;
+
   size_t ip_hdr_len = (ip->ihl_version & 0x0F) * 4;
-  if (len < sizeof(EthHeader) + ip_hdr_len + sizeof(UdpHeader) + sizeof(BfdControlHeader)) {
+  if (ip_hdr_len < sizeof(Ipv4Header) || len < sizeof(EthHeader) + ip_hdr_len + sizeof(UdpHeader) + sizeof(BfdControlHeader)) {
+    return false;
+  }
+
+  // IPv4 Header Checksum Doğrulaması
+  if (compute_checksum(reinterpret_cast<const uint16_t*>(ip), ip_hdr_len) != 0) {
+    return false;
+  }
+
+  uint16_t ip_total_len = ntohs(ip->total_length);
+  if (len < sizeof(EthHeader) + ip_total_len || ip_total_len < ip_hdr_len + sizeof(UdpHeader) + sizeof(BfdControlHeader)) {
     return false;
   }
 
@@ -271,11 +285,25 @@ bool BfdEngine::parse_bfd_control_packet(
   uint16_t dst_port = ntohs(udp->dst_port);
   if (dst_port != 3784 && dst_port != 3785) return false;
 
+  uint16_t udp_len = ntohs(udp->length);
+  if (udp_len < sizeof(UdpHeader) + sizeof(BfdControlHeader) || ip_total_len < ip_hdr_len + udp_len) {
+    return false;
+  }
+
   const auto* bfd = reinterpret_cast<const BfdControlHeader*>(
       data + sizeof(EthHeader) + ip_hdr_len + sizeof(UdpHeader));
 
   uint8_t version = (bfd->vers_diag >> 5) & 0x07;
   if (version != 1) return false; // Must be BFD version 1
+
+  // RFC 5880 Section 4.1: BFD Length must be at least 24 bytes
+  if (bfd->length < sizeof(BfdControlHeader)) return false;
+
+  // RFC 5880 Section 6.8.6: If the Detect Mult field is zero, the packet MUST be discarded
+  if (bfd->detect_mult == 0) return false;
+
+  // RFC 5880 Section 6.8.6: If the My Discriminator field is zero, the packet MUST be discarded
+  if (bfd->my_discriminator == 0) return false;
 
   out_hdr = *bfd;
   out_remote_disc = ntohl(bfd->my_discriminator);

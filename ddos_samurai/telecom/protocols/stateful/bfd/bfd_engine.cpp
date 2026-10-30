@@ -423,6 +423,15 @@ bool BfdEngine::ParseBfdControlPacket(const uint8_t* data, size_t len,
     uint8_t version = (bfd->vers_diag >> 5) & 0x07;
     if (version != 1) return false;
 
+    // RFC 5880 Section 4.1: BFD Length must be at least 24 bytes
+    if (bfd->length < sizeof(BfdControlHeader)) return false;
+
+    // RFC 5880 Section 6.8.6: If the Detect Mult field is zero, the packet MUST be discarded
+    if (bfd->detect_mult == 0) return false;
+
+    // RFC 5880 Section 6.8.6: If the My Discriminator field is zero, the packet MUST be discarded
+    if (bfd->my_discriminator == 0) return false;
+
     out_hdr = *bfd;
     out_remote_disc = ntohl(bfd->my_discriminator);
     return true;
