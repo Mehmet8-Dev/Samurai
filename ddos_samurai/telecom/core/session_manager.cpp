@@ -31,21 +31,27 @@ SessionManager::SessionManager(uint32_t max_sessions, int socket_id)
     // Havuz boyutunu hesapla (128 bayt * max_sessions)
     pool_alloc_size_ = static_cast<size_t>(max_sessions_) * sizeof(TelcoSessionContext);
 
-    // Hugepages ile tahsis etmeyi dene (2MB / 1GB sayfalar)
+    // 1. Hugepages ile tahsis etmeyi dene (2MB / 1GB sayfalar)
     void* addr = ::mmap(nullptr, pool_alloc_size_, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
     if (addr != MAP_FAILED) {
         sessions_pool_ = static_cast<TelcoSessionContext*>(addr);
-        using_hugepages_ = true;
+        alloc_type_ = AllocationType::HugePage;
     } else {
-        // Standart posix_memalign (64 bayt önbellek çizgisi hizalamalı fallback)
+        // 2. Standart posix_memalign (64 bayt önbellek çizgisi hizalamalı fallback)
         void* mem = nullptr;
-        if (::posix_memalign(&mem, 64, pool_alloc_size_) == 0) {
+        if (::posix_memalign(&mem, 64, pool_alloc_size_) == 0 && mem != nullptr) {
             sessions_pool_ = static_cast<TelcoSessionContext*>(mem);
+            alloc_type_ = AllocationType::PosixMemalign;
         } else {
-            sessions_pool_ = new TelcoSessionContext[max_sessions_];
+            // 3. Güvenli standart new[] fallback
+            sessions_pool_ = new (std::nothrow) TelcoSessionContext[max_sessions_];
+            alloc_type_ = AllocationType::NewArray;
         }
-        using_hugepages_ = false;
+    }
+
+    if (!sessions_pool_) {
+        throw std::bad_alloc();
     }
 
     std::memset(sessions_pool_, 0, pool_alloc_size_);
@@ -68,6 +74,23 @@ SessionManager::SessionManager(uint32_t max_sessions, int socket_id)
     dhcp_buckets_ = static_cast<TelcoSessionContext**>(::calloc(hash_size_, sizeof(TelcoSessionContext*)));
     bfd_buckets_ = static_cast<TelcoSessionContext**>(::calloc(hash_size_, sizeof(TelcoSessionContext*)));
     pfcp_buckets_ = static_cast<TelcoSessionContext**>(::calloc(hash_size_, sizeof(TelcoSessionContext*)));
+
+    if (!hash_buckets_ || !pppoe_buckets_ || !gtpu_buckets_ ||
+        !dhcp_buckets_ || !bfd_buckets_ || !pfcp_buckets_) {
+        if (hash_buckets_) { ::free(hash_buckets_); hash_buckets_ = nullptr; }
+        if (pppoe_buckets_) { ::free(pppoe_buckets_); pppoe_buckets_ = nullptr; }
+        if (gtpu_buckets_) { ::free(gtpu_buckets_); gtpu_buckets_ = nullptr; }
+        if (dhcp_buckets_) { ::free(dhcp_buckets_); dhcp_buckets_ = nullptr; }
+        if (bfd_buckets_) { ::free(bfd_buckets_); bfd_buckets_ = nullptr; }
+        if (pfcp_buckets_) { ::free(pfcp_buckets_); pfcp_buckets_ = nullptr; }
+        if (sessions_pool_) {
+            if (alloc_type_ == AllocationType::HugePage) ::munmap(sessions_pool_, pool_alloc_size_);
+            else if (alloc_type_ == AllocationType::PosixMemalign) ::free(sessions_pool_);
+            else if (alloc_type_ == AllocationType::NewArray) delete[] sessions_pool_;
+            sessions_pool_ = nullptr;
+        }
+        throw std::bad_alloc();
+    }
 }
 
 SessionManager::~SessionManager() {
@@ -79,10 +102,16 @@ SessionManager::~SessionManager() {
     if (pfcp_buckets_) { ::free(pfcp_buckets_); pfcp_buckets_ = nullptr; }
 
     if (sessions_pool_) {
-        if (using_hugepages_) {
-            ::munmap(sessions_pool_, pool_alloc_size_);
-        } else {
-            ::free(sessions_pool_);
+        switch (alloc_type_) {
+            case AllocationType::HugePage:
+                ::munmap(sessions_pool_, pool_alloc_size_);
+                break;
+            case AllocationType::PosixMemalign:
+                ::free(sessions_pool_);
+                break;
+            case AllocationType::NewArray:
+                delete[] sessions_pool_;
+                break;
         }
         sessions_pool_ = nullptr;
     }

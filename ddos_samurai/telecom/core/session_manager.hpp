@@ -82,11 +82,18 @@ public:
     uint32_t GetCapacity() const noexcept { return max_sessions_; }
     size_t GetMemoryFootprintBytes() const noexcept;
 
+    enum class AllocationType : uint8_t {
+        HugePage,
+        PosixMemalign,
+        NewArray
+    };
+    AllocationType GetAllocationType() const noexcept { return alloc_type_; }
+
 private:
     uint32_t max_sessions_;
     int socket_id_;
-    TelcoSessionContext* sessions_pool_{nullptr}; // Hugepages/posix_memalign
-    bool using_hugepages_{false};
+    TelcoSessionContext* sessions_pool_{nullptr};
+    AllocationType alloc_type_{AllocationType::PosixMemalign};
     size_t pool_alloc_size_{0};
 
     std::atomic<uint32_t> active_sessions_{0};
