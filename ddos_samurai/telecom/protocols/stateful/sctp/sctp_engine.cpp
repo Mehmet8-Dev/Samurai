@@ -145,6 +145,7 @@ const SctpAssociationState& SctpEngine::GetAssocState(const TelcoSessionContext*
 }
 
 void SctpEngine::Shutdown() {
+    active_sctp_sessions_.clear();
     uint32_t cap = session_mgr_.GetCapacity();
     for (uint32_t i = 0; i < cap; ++i) {
         TelcoSessionContext* s = session_mgr_.GetSessionByIndex(i);
@@ -169,6 +170,18 @@ void SctpEngine::SetState(TelcoSessionContext* session, SctpState state) noexcep
     if (!session) return;
     session->protocol_id = static_cast<uint8_t>(TelcoProtocolId::SCTP);
     session->ppp_lcp_identifier = static_cast<uint16_t>(state);
+
+    if (state != SctpState::CLOSED) {
+        if (std::find(active_sctp_sessions_.begin(), active_sctp_sessions_.end(), session) == active_sctp_sessions_.end()) {
+            active_sctp_sessions_.push_back(session);
+        }
+    } else {
+        auto it = std::find(active_sctp_sessions_.begin(), active_sctp_sessions_.end(), session);
+        if (it != active_sctp_sessions_.end()) {
+            active_sctp_sessions_.erase(it);
+        }
+    }
+
     switch (state) {
         case SctpState::ESTABLISHED:
             session->state = SessionState::ESTABLISHED;
@@ -448,6 +461,8 @@ void SctpEngine::StartAssociation(TelcoSessionContext* session, const SctpAssoci
     session->SetSctpActivePathIndex(0);
     session->SetSctpPathCount(state.path_count);
 
+    session_mgr_.Bind5Tuple(session, cfg.local_ip, cfg.peer_ip, cfg.local_port, cfg.peer_port, IP_PROTO_SCTP);
+
     SetState(session, SctpState::COOKIE_WAIT);
 
     // INIT paketi üret ve ilet
@@ -543,7 +558,10 @@ std::vector<uint8_t> SctpEngine::BuildInitAckPacket(TelcoSessionContext* session
                                0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00};
     last_cookie_.assign(cookie_data, cookie_data + 16);
 
-    size_t sctp_payload_len = sizeof(SctpChunkHeader) + sizeof(SctpInitChunkBody) + sizeof(cookie_data);
+    // RFC 4960 §3.3.3.1: State Cookie değişken parametresi TLV olarak eklenir (Type=7, Len=4+16=20)
+    constexpr uint16_t kCookieParamType = 7;
+    constexpr uint16_t kCookieParamLen = 4 + sizeof(cookie_data);
+    size_t sctp_payload_len = sizeof(SctpChunkHeader) + sizeof(SctpInitChunkBody) + kCookieParamLen;
     size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(SctpCommonHeader) + sctp_payload_len;
     std::vector<uint8_t> packet(total_len, 0);
 
@@ -581,8 +599,12 @@ std::vector<uint8_t> SctpEngine::BuildInitAckPacket(TelcoSessionContext* session
     body->num_inbound_streams = htons(10);
     body->initial_tsn = htonl(session->teid_uplink);
 
-    std::memcpy(packet.data() + sctp_offset + sizeof(SctpCommonHeader) + sizeof(SctpChunkHeader) + sizeof(SctpInitChunkBody),
-                cookie_data, sizeof(cookie_data));
+    uint8_t* param_ptr = packet.data() + sctp_offset + sizeof(SctpCommonHeader) + sizeof(SctpChunkHeader) + sizeof(SctpInitChunkBody);
+    uint16_t param_type_net = htons(kCookieParamType);
+    uint16_t param_len_net = htons(kCookieParamLen);
+    std::memcpy(param_ptr, &param_type_net, 2);
+    std::memcpy(param_ptr + 2, &param_len_net, 2);
+    std::memcpy(param_ptr + 4, cookie_data, sizeof(cookie_data));
 
     uint32_t crc = ComputeCrc32c(packet.data() + sctp_offset, total_len - sctp_offset);
     std::memcpy(&sctp->checksum, &crc, 4);
@@ -1348,13 +1370,10 @@ bool SctpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, uint64_t now_t
     uint16_t src_port = ntohs(sctp->src_port);
     uint16_t dst_port = ntohs(sctp->dst_port);
 
-    // Oturum eşleştirme: 5-Tuple veya VTag
+    // Oturum eşleştirme: 5-Tuple veya aktif oturumlarda VTag
     TelcoSessionContext* session = session_mgr_.FindSessionBy5Tuple(dst_ip, src_ip, dst_port, src_port, IP_PROTO_SCTP);
     if (!session && vtag != 0) {
-        // VTag ile arama
-        uint32_t cap = session_mgr_.GetCapacity();
-        for (uint32_t i = 0; i < cap; ++i) {
-            TelcoSessionContext* s = session_mgr_.GetSessionByIndex(i);
+        for (TelcoSessionContext* s : active_sctp_sessions_) {
             if (s && s->protocol_id == static_cast<uint8_t>(TelcoProtocolId::SCTP) && s->session_id == vtag) {
                 session = s;
                 break;
@@ -1377,6 +1396,7 @@ bool SctpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, uint64_t now_t
                 session->ip_proto = IP_PROTO_SCTP;
                 session->session_id = 0x98765432; // Local VTag
                 session_mgr_.Bind5Tuple(session, dst_ip, src_ip, dst_port, src_port, IP_PROTO_SCTP);
+                active_sctp_sessions_.push_back(session);
             }
         }
     }
@@ -1423,13 +1443,27 @@ bool SctpEngine::ParseAndProcessChunks(TelcoSessionContext* session, const uint8
                     session->ppp_magic_number = ntohl(init_ack_body->initiate_tag);
                     session->teid_downlink = ntohl(init_ack_body->initial_tsn);
 
-                    // Cookie verisini çıkar
-                    size_t cookie_offset = sizeof(SctpInitChunkBody);
+                    // RFC 4960 §3.3.3.1 TLV parametrelerini tara (Type 7: State Cookie)
+                    size_t param_offset = sizeof(SctpInitChunkBody);
                     std::vector<uint8_t> cookie;
-                    if (body_len > cookie_offset) {
-                        cookie.assign(chunk_body + cookie_offset, chunk_body + body_len);
-                    } else {
-                        cookie.assign(16, 0x5A);
+                    while (param_offset + 4 <= body_len) {
+                        uint16_t p_type = (static_cast<uint16_t>(chunk_body[param_offset]) << 8) | chunk_body[param_offset + 1];
+                        uint16_t p_len = (static_cast<uint16_t>(chunk_body[param_offset + 2]) << 8) | chunk_body[param_offset + 3];
+                        if (p_len < 4 || param_offset + p_len > body_len) break;
+                        if (p_type == 7) {
+                            cookie.assign(chunk_body + param_offset + 4, chunk_body + param_offset + p_len);
+                            break;
+                        }
+                        size_t padded_len = (p_len + 3) & ~3;
+                        param_offset += padded_len;
+                    }
+                    if (cookie.empty()) {
+                        // Geriye dönük uyumluluk: ham cookie verisi
+                        if (body_len > sizeof(SctpInitChunkBody)) {
+                            cookie.assign(chunk_body + sizeof(SctpInitChunkBody), chunk_body + body_len);
+                        } else {
+                            cookie.assign(16, 0x5A);
+                        }
                     }
 
                     SetState(session, SctpState::COOKIE_ECHOED);

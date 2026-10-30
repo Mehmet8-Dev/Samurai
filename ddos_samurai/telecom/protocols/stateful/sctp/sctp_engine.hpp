@@ -164,6 +164,7 @@ private:
     std::vector<uint8_t> last_cookie_;
     std::vector<SctpAssociationState> assoc_states_;
     mutable SctpAssociationState fallback_state_;
+    std::vector<TelcoSessionContext*> active_sctp_sessions_;
 
     SctpAssociationState& GetAssocState(TelcoSessionContext* session);
     const SctpAssociationState& GetAssocState(const TelcoSessionContext* session) const;
