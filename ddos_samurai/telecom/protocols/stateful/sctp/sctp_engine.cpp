@@ -1365,6 +1365,38 @@ bool SctpEngine::ParseAndProcessChunks(TelcoSessionContext* session, const uint8
                 break;
             }
 
+            case SctpChunkType::FORWARD_TSN: {
+                if (body_len >= sizeof(SctpForwardTsnChunkBody)) {
+                    const auto* fwd = reinterpret_cast<const SctpForwardTsnChunkBody*>(chunk_body);
+                    uint32_t new_cum_tsn = ntohl(fwd->new_cumulative_tsn);
+                    if (new_cum_tsn > session->teid_downlink) {
+                        session->teid_downlink = new_cum_tsn;
+                    }
+
+                    auto& state = GetAssocState(session);
+                    size_t entry_bytes = body_len - sizeof(SctpForwardTsnChunkBody);
+                    size_t num_entries = entry_bytes / sizeof(SctpForwardTsnStreamEntry);
+                    const auto* entries = reinterpret_cast<const SctpForwardTsnStreamEntry*>(
+                        chunk_body + sizeof(SctpForwardTsnChunkBody));
+
+                    for (size_t i = 0; i < num_entries; ++i) {
+                        uint16_t sid = ntohs(entries[i].stream_id);
+                        uint16_t sseq = ntohs(entries[i].stream_seq);
+                        if (sid < SctpAssociationState::MAX_STREAMS) {
+                            if (sseq >= state.next_stream_seq[sid]) {
+                                state.next_stream_seq[sid] = sseq + 1;
+                            }
+                        }
+                    }
+
+                    // RFC 3758 §3.5: FORWARD_TSN işlendiğinde hemen güncel SACK üret
+                    last_tx_frame_ = BuildSackPacket(session, session->teid_downlink);
+                    session->tx_packets++;
+                    session->tx_bytes += last_tx_frame_.size();
+                }
+                break;
+            }
+
             case SctpChunkType::SACK: {
                 // SACK başarıyla işlendi
                 break;
