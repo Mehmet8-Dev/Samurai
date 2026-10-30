@@ -9,12 +9,14 @@ namespace ddos_samurai::telecom {
 
 enum class TelcoFrameType : uint8_t {
     Unknown = 0,
+    None = 0,
     Arp = 1,
     Dhcp = 2,
     Icmpv6Nd = 3,
     Igmp = 4,
     Bfd = 5,
     PppoeDiscovery = 6,
+    Pppoe = 6,
     PppoeSession = 7,
     Eapol = 8,
     Gtpu = 9,
@@ -41,7 +43,8 @@ public:
                type == TelcoFrameType::Pfcp ||
                type == TelcoFrameType::Sctp ||
                type == TelcoFrameType::Diameter ||
-               type == TelcoFrameType::Sip;
+               type == TelcoFrameType::Sip ||
+               type == TelcoFrameType::Rtp;
     }
 
     // Nanometrik hizda calisan donanim/mbuf ayrıştırıcı

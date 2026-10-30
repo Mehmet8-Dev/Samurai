@@ -21,15 +21,31 @@ bool parse_mac_string(const std::string& mac_str, uint8_t out[6]) {
 
 }  // namespace
 
+L2L3FastpathWiring::L2L3FastpathWiring(uint32_t session_capacity, uint64_t tsc_hz)
+    : session_mgr_(session_capacity),
+      timing_wheel_(tsc_hz),
+      sctp_engine_(session_mgr_, &timing_wheel_),
+      diameter_engine_(session_mgr_, &timing_wheel_),
+      sip_rtp_engine_(session_mgr_, &timing_wheel_) {
+  ProtocolConfig default_cfg{};
+  default_cfg.retransmit_timeout_ms = 1000;
+  default_cfg.max_retries = 3;
+  sctp_engine_.Init(default_cfg);
+  diameter_engine_.Init(default_cfg);
+  sip_rtp_engine_.Init(default_cfg);
+}
+
+L2L3FastpathWiring::~L2L3FastpathWiring() = default;
+
 bool L2L3FastpathWiring::DispatchRxControlFrame(
     const uint8_t* data, std::size_t len, uint64_t now_tsc) {
 
   uint16_t vlan_id = 0;
-  ControlFrameType type = ClassifyFrame(data, len, &vlan_id);
+  TelcoFrameType type = ClassifyFrame(data, len, &vlan_id);
   last_out_packet_.clear();
 
   switch (type) {
-    case ControlFrameType::Arp: {
+    case TelcoFrameType::Arp: {
       std::string sender_ip, sender_mac;
       uint16_t oper = 0;
       if (l7_emu_native::l2l3::ArpEngine::parse_arp_packet(data, len, sender_ip, sender_mac, oper)) {
@@ -47,7 +63,7 @@ bool L2L3FastpathWiring::DispatchRxControlFrame(
       return false;
     }
 
-    case ControlFrameType::Dhcp: {
+    case TelcoFrameType::Dhcp: {
       uint32_t xid = 0;
       std::string yiaddr, server_ip;
       int msg_type = 0;
@@ -63,7 +79,7 @@ bool L2L3FastpathWiring::DispatchRxControlFrame(
       return false;
     }
 
-    case ControlFrameType::Icmpv6Nd: {
+    case TelcoFrameType::Icmpv6Nd: {
       std::string sender_ip, sender_mac;
       if (l7_emu_native::l2l3::NdEngine::parse_neighbor_advertisement(data, len, sender_ip, sender_mac)) {
         nd_engine_.process_neighbor_advertisement(sender_ip, sender_mac);
@@ -80,7 +96,7 @@ bool L2L3FastpathWiring::DispatchRxControlFrame(
       return false;
     }
 
-    case ControlFrameType::Bfd: {
+    case TelcoFrameType::Bfd: {
       if (bfd_engine_.process_rx_packet(data, len, now_tsc)) {
         EmitTxPacket(bfd_engine_.last_tx_packet());
         return true;
@@ -88,10 +104,42 @@ bool L2L3FastpathWiring::DispatchRxControlFrame(
       return false;
     }
 
-    case ControlFrameType::Igmp:
-    case ControlFrameType::Pppoe:
-    case ControlFrameType::Eapol:
-    case ControlFrameType::None:
+    case TelcoFrameType::Sctp: {
+      if (sctp_engine_.ProcessRxFrame(data, len, now_tsc)) {
+        if (!sctp_engine_.last_tx_packet().empty()) {
+          EmitTxPacket(sctp_engine_.last_tx_packet());
+        }
+        return true;
+      }
+      return false;
+    }
+
+    case TelcoFrameType::Diameter: {
+      if (diameter_engine_.ProcessRxFrame(data, len, now_tsc)) {
+        if (!diameter_engine_.last_tx_packet().empty()) {
+          EmitTxPacket(diameter_engine_.last_tx_packet());
+        }
+        return true;
+      }
+      return false;
+    }
+
+    case TelcoFrameType::Sip:
+    case TelcoFrameType::Rtp: {
+      if (sip_rtp_engine_.ProcessRxFrame(data, len, now_tsc)) {
+        if (!sip_rtp_engine_.last_tx_packet().empty()) {
+          EmitTxPacket(sip_rtp_engine_.last_tx_packet());
+        }
+        return true;
+      }
+      return false;
+    }
+
+    case TelcoFrameType::Igmp:
+    case TelcoFrameType::PppoeDiscovery:
+    case TelcoFrameType::PppoeSession:
+    case TelcoFrameType::Eapol:
+    case TelcoFrameType::Unknown:
     default:
       return false;
   }
@@ -104,6 +152,27 @@ void L2L3FastpathWiring::StepTimers(uint64_t now_tsc, uint64_t tsc_hz) {
   if (bfd_engine_.step_timer(now_tsc, tsc_hz)) {
     EmitTxPacket(bfd_engine_.last_tx_packet());
   }
+
+  // HierarchicalTimingWheel adımı
+  timing_wheel_.Advance(now_tsc, [&](TelcoSessionContext* session) {
+    if (!session) return;
+    if (session->protocol_id == static_cast<uint8_t>(TelcoProtocolId::SCTP)) {
+      sctp_engine_.OnTimerTick(now_tsc);
+      if (!sctp_engine_.last_tx_packet().empty()) {
+        EmitTxPacket(sctp_engine_.last_tx_packet());
+      }
+    } else if (session->protocol_id == static_cast<uint8_t>(TelcoProtocolId::DIAMETER)) {
+      diameter_engine_.OnTimerTick(now_tsc);
+      if (!diameter_engine_.last_tx_packet().empty()) {
+        EmitTxPacket(diameter_engine_.last_tx_packet());
+      }
+    } else if (session->protocol_id == static_cast<uint8_t>(TelcoProtocolId::SIP_RTP)) {
+      sip_rtp_engine_.OnTimerTick(now_tsc);
+      if (!sip_rtp_engine_.last_tx_packet().empty()) {
+        EmitTxPacket(sip_rtp_engine_.last_tx_packet());
+      }
+    }
+  });
 }
 
 }  // namespace ddos_samurai::telecom
