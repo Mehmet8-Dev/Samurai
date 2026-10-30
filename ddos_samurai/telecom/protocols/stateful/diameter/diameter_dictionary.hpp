@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <array>
 
 namespace ddos_samurai::telecom::diameter {
 
@@ -103,7 +104,13 @@ public:
     bool LoadFromJson(const std::string& json_str, std::string* error_msg = nullptr);
 
     // Lookups
-    const AvpDefinition* FindAvp(uint32_t code, uint32_t vendor_id = 0) const noexcept;
+    const AvpDefinition* FindAvp(uint32_t code, uint32_t vendor_id = 0) const noexcept {
+        if (vendor_id == 0 && code < FAST_LOOKUP_TABLE_SIZE && fast_defined_[code]) {
+            return &fast_table_[code];
+        }
+        return FindAvpSlow(code, vendor_id);
+    }
+    const AvpDefinition* FindAvpSlow(uint32_t code, uint32_t vendor_id = 0) const noexcept;
     const AvpDefinition* FindAvpByName(const std::string& name) const noexcept;
     const CommandDefinition* FindCommand(uint32_t code, uint32_t app_id, bool is_request) const noexcept;
     const CommandDefinition* FindCommandByName(const std::string& name, bool is_request) const noexcept;
@@ -133,6 +140,11 @@ private:
         uint64_t req_bit = is_request ? 0x8000000000000000ULL : 0ULL;
         return req_bit | (static_cast<uint64_t>(app_id) << 32) | static_cast<uint64_t>(code);
     }
+
+    static constexpr size_t FAST_LOOKUP_TABLE_SIZE = 512;
+
+    alignas(64) std::array<AvpDefinition, FAST_LOOKUP_TABLE_SIZE> fast_table_{};
+    alignas(64) std::array<bool, FAST_LOOKUP_TABLE_SIZE> fast_defined_{};
 
     std::unordered_map<uint64_t, AvpDefinition> avp_by_key_;
     std::unordered_map<std::string, uint64_t> avp_by_name_;

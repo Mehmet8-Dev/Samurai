@@ -229,6 +229,10 @@ void DiameterDictionary::AddAvpDefinition(const AvpDefinition& def) {
     if (!def.name.empty()) {
         avp_by_name_[def.name] = key;
     }
+    if (def.vendor_id == 0 && def.code < FAST_LOOKUP_TABLE_SIZE) {
+        fast_table_[def.code] = def;
+        fast_defined_[def.code] = true;
+    }
 }
 
 void DiameterDictionary::AddCommandDefinition(const CommandDefinition& def) {
@@ -240,13 +244,16 @@ void DiameterDictionary::AddCommandDefinition(const CommandDefinition& def) {
     }
 }
 
-const AvpDefinition* DiameterDictionary::FindAvp(uint32_t code, uint32_t vendor_id) const noexcept {
+const AvpDefinition* DiameterDictionary::FindAvpSlow(uint32_t code, uint32_t vendor_id) const noexcept {
     auto it = avp_by_key_.find(MakeAvpKey(code, vendor_id));
     if (it != avp_by_key_.end()) {
         return &it->second;
     }
     // Fallback if vendor_id is given but definition is standard (vendor 0)
     if (vendor_id != 0) {
+        if (code < FAST_LOOKUP_TABLE_SIZE && fast_defined_[code]) {
+            return &fast_table_[code];
+        }
         auto it0 = avp_by_key_.find(MakeAvpKey(code, 0));
         if (it0 != avp_by_key_.end()) {
             return &it0->second;
@@ -294,6 +301,7 @@ const CommandDefinition* DiameterDictionary::FindCommandByName(const std::string
 }
 
 void DiameterDictionary::Clear() {
+    fast_defined_.fill(false);
     avp_by_key_.clear();
     avp_by_name_.clear();
     commands_.clear();
