@@ -118,6 +118,10 @@ public:
     // Yol bazlı Heartbeat yoklama (RFC 4960 §8.3 Path Heartbeat Probing)
     bool ProbePathHeartbeat(TelcoSessionContext* session, size_t path_idx, uint64_t now_tsc);
 
+    // Multihoming Hata Sayacı ve Otomatik Yedek Yola Geçiş (RFC 4960 §8.2 Failover)
+    void HandlePathError(TelcoSessionContext* session, size_t path_idx);
+    bool FailoverPath(TelcoSessionContext* session);
+
     // Donanım Hızlandırmalı CRC32c Hesaplama (RFC 4960 Castagnoli 0x1EDC6F41)
     static uint32_t ComputeCrc32c(const uint8_t* data, size_t len) noexcept;
 

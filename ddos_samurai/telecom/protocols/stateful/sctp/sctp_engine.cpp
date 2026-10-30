@@ -328,6 +328,61 @@ size_t SctpEngine::GetActivePathIndex(const TelcoSessionContext* session) const 
     return GetAssocState(session).active_path_idx;
 }
 
+void SctpEngine::HandlePathError(TelcoSessionContext* session, size_t path_idx) {
+    if (!session) return;
+    auto& state = GetAssocState(session);
+    if (path_idx >= state.path_count) return;
+
+    state.paths[path_idx].error_counter++;
+    if (state.paths[path_idx].error_counter >= state.path_max_retrans) {
+        state.paths[path_idx].status = SctpPathStatus::INACTIVE;
+        if (state.active_path_idx == path_idx) {
+            FailoverPath(session);
+        }
+    }
+}
+
+bool SctpEngine::FailoverPath(TelcoSessionContext* session) {
+    if (!session) return false;
+    auto& state = GetAssocState(session);
+    if (state.path_count <= 1) return false;
+
+    size_t new_idx = SIZE_MAX;
+    // 1. Önce başka bir ACTIVE yol ara
+    for (size_t i = 0; i < state.path_count; ++i) {
+        if (i != state.active_path_idx && state.paths[i].status == SctpPathStatus::ACTIVE) {
+            new_idx = i;
+            break;
+        }
+    }
+
+    // 2. Bulunamazsa UNCONFIRMED yol ara
+    if (new_idx == SIZE_MAX) {
+        for (size_t i = 0; i < state.path_count; ++i) {
+            if (i != state.active_path_idx && state.paths[i].status == SctpPathStatus::UNCONFIRMED) {
+                new_idx = i;
+                break;
+            }
+        }
+    }
+
+    if (new_idx == SIZE_MAX) {
+        return false;
+    }
+
+    // Aktif yolu güncelle
+    state.active_path_idx = static_cast<uint8_t>(new_idx);
+    uint32_t new_peer_ip = state.paths[new_idx].ip;
+
+    session_mgr_.Unbind5Tuple(session);
+    session->peer_ip = new_peer_ip;
+    std::memcpy(session->peer_mac, state.paths[new_idx].mac, 6);
+    session->SetSctpActivePathIndex(state.active_path_idx);
+    session_mgr_.Bind5Tuple(session, session->client_ip, new_peer_ip, session->client_port, session->peer_port, IP_PROTO_SCTP);
+
+    return true;
+}
+
 void SctpEngine::StartAssociation(TelcoSessionContext* session, const SctpAssociationConfig& cfg) {
     if (!session) return;
 
@@ -1228,8 +1283,11 @@ void SctpEngine::HandleTimeout(TelcoSessionContext* session) {
     }
 
     if (state == SctpState::ESTABLISHED) {
-        // Canlılık Heartbeat zamanı
-        last_tx_frame_ = BuildHeartbeatPacket(session);
+        auto& a_state = GetAssocState(session);
+        HandlePathError(session, a_state.active_path_idx);
+
+        // Canlılık Heartbeat zamanı (aktif yola gönder)
+        last_tx_frame_ = BuildHeartbeatPacket(session, a_state.active_path_idx);
         session->tx_packets++;
         session->tx_bytes += last_tx_frame_.size();
         if (timing_wheel_) timing_wheel_->Schedule(session, 1000); // 1s Heartbeat Ack bekle
