@@ -146,6 +146,8 @@ public:
     std::vector<uint8_t> BuildAsconfAckPacket(TelcoSessionContext* session, 
                                              uint32_t serial_number, 
                                              const std::vector<uint32_t>& correlation_ids);
+    uint32_t GetAsconfSerial(const TelcoSessionContext* session) const;
+    uint32_t GetAsconfAckSerial(const TelcoSessionContext* session) const;
 
     // Donanım Hızlandırmalı CRC32c Hesaplama (RFC 4960 Castagnoli 0x1EDC6F41)
     static uint32_t ComputeCrc32c(const uint8_t* data, size_t len) noexcept;

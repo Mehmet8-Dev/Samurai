@@ -383,6 +383,16 @@ bool SctpEngine::FailoverPath(TelcoSessionContext* session) {
     return true;
 }
 
+uint32_t SctpEngine::GetAsconfSerial(const TelcoSessionContext* session) const {
+    if (!session) return 0;
+    return GetAssocState(session).asconf_serial;
+}
+
+uint32_t SctpEngine::GetAsconfAckSerial(const TelcoSessionContext* session) const {
+    if (!session) return 0;
+    return GetAssocState(session).asconf_ack_serial;
+}
+
 void SctpEngine::StartAssociation(TelcoSessionContext* session, const SctpAssociationConfig& cfg) {
     if (!session) return;
 
@@ -1591,6 +1601,16 @@ bool SctpEngine::ParseAndProcessChunks(TelcoSessionContext* session, const uint8
                     last_tx_frame_ = BuildAsconfAckPacket(session, serial, success_correlations);
                     session->tx_packets++;
                     session->tx_bytes += last_tx_frame_.size();
+                }
+                break;
+            }
+
+            case SctpChunkType::ASCONF_ACK: {
+                if (body_len >= sizeof(SctpAsconfAckChunkBody)) {
+                    const auto* ack_body = reinterpret_cast<const SctpAsconfAckChunkBody*>(chunk_body);
+                    uint32_t serial = ntohl(ack_body->serial_number);
+                    auto& state = GetAssocState(session);
+                    state.asconf_ack_serial = serial;
                 }
                 break;
             }
