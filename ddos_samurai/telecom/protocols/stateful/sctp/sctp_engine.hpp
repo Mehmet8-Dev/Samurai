@@ -107,13 +107,16 @@ public:
     std::vector<uint8_t> BuildInitAckPacket(TelcoSessionContext* session, uint32_t peer_initiate_tag, uint32_t peer_initial_tsn);
     std::vector<uint8_t> BuildCookieEchoPacket(TelcoSessionContext* session, const std::vector<uint8_t>& cookie);
     std::vector<uint8_t> BuildCookieAckPacket(TelcoSessionContext* session);
-    std::vector<uint8_t> BuildHeartbeatPacket(TelcoSessionContext* session);
+    std::vector<uint8_t> BuildHeartbeatPacket(TelcoSessionContext* session, size_t path_idx = 0);
     std::vector<uint8_t> BuildHeartbeatAckPacket(TelcoSessionContext* session, const uint8_t* info_param, size_t info_len);
     std::vector<uint8_t> BuildDataPacket(TelcoSessionContext* session, uint32_t ppid, const uint8_t* payload, size_t payload_len);
     std::vector<uint8_t> BuildSackPacket(TelcoSessionContext* session, uint32_t cumulative_tsn);
     std::vector<uint8_t> BuildShutdownPacket(TelcoSessionContext* session);
     std::vector<uint8_t> BuildShutdownAckPacket(TelcoSessionContext* session);
     std::vector<uint8_t> BuildShutdownCompletePacket(TelcoSessionContext* session);
+
+    // Yol bazlı Heartbeat yoklama (RFC 4960 §8.3 Path Heartbeat Probing)
+    bool ProbePathHeartbeat(TelcoSessionContext* session, size_t path_idx, uint64_t now_tsc);
 
     // Donanım Hızlandırmalı CRC32c Hesaplama (RFC 4960 Castagnoli 0x1EDC6F41)
     static uint32_t ComputeCrc32c(const uint8_t* data, size_t len) noexcept;

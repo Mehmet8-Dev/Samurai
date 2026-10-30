@@ -602,14 +602,38 @@ std::vector<uint8_t> SctpEngine::BuildCookieAckPacket(TelcoSessionContext* sessi
     return packet;
 }
 
-std::vector<uint8_t> SctpEngine::BuildHeartbeatPacket(TelcoSessionContext* session) {
-    uint8_t hb_info[8] = {0x01, 0x00, 0x00, 0x08, 0xCA, 0xFE, 0xBA, 0xBE}; // Param Type 1, Len 8, Nonce
+std::vector<uint8_t> SctpEngine::BuildHeartbeatPacket(TelcoSessionContext* session, size_t path_idx) {
+    if (!session) return {};
+
+    const auto& state = GetAssocState(session);
+    uint32_t target_ip = session->peer_ip;
+    const uint8_t* target_mac = session->peer_mac;
+
+    if (path_idx < state.path_count) {
+        target_ip = state.paths[path_idx].ip;
+        target_mac = state.paths[path_idx].mac;
+    }
+
+    // RFC 4960 §3.3.5 Heartbeat Info Parametresi (16 Bayt)
+    uint8_t hb_info[16];
+    uint16_t param_type = htons(0x0001); // Heartbeat Info Type
+    uint16_t param_len = htons(16);      // Param Length
+    uint32_t sender_ip = htonl(session->client_ip);
+    uint32_t target_ip_net = htonl(target_ip);
+    uint32_t nonce = htonl(static_cast<uint32_t>(path_idx) ^ 0xCAFEBABE);
+
+    std::memcpy(hb_info, &param_type, 2);
+    std::memcpy(hb_info + 2, &param_len, 2);
+    std::memcpy(hb_info + 4, &sender_ip, 4);
+    std::memcpy(hb_info + 8, &target_ip_net, 4);
+    std::memcpy(hb_info + 12, &nonce, 4);
+
     size_t chunk_len = sizeof(SctpChunkHeader) + sizeof(hb_info);
     size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(SctpCommonHeader) + chunk_len;
     std::vector<uint8_t> packet(total_len, 0);
 
     auto* eth = reinterpret_cast<EthHeader*>(packet.data());
-    std::memcpy(eth->dst_mac, session->peer_mac, 6);
+    std::memcpy(eth->dst_mac, target_mac, 6);
     std::memcpy(eth->src_mac, session->client_mac, 6);
     eth->ethertype = htons(0x0800);
 
@@ -619,7 +643,7 @@ std::vector<uint8_t> SctpEngine::BuildHeartbeatPacket(TelcoSessionContext* sessi
     ip->ttl = 64;
     ip->protocol = IP_PROTO_SCTP;
     ip->src_ip = htonl(session->client_ip);
-    ip->dst_ip = htonl(session->peer_ip);
+    ip->dst_ip = htonl(target_ip);
     ip->checksum = ComputeIpChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
 
     size_t sctp_offset = sizeof(EthHeader) + sizeof(Ipv4Header);
@@ -641,6 +665,18 @@ std::vector<uint8_t> SctpEngine::BuildHeartbeatPacket(TelcoSessionContext* sessi
     std::memcpy(&sctp->checksum, &crc, 4);
 
     return packet;
+}
+
+bool SctpEngine::ProbePathHeartbeat(TelcoSessionContext* session, size_t path_idx, uint64_t now_tsc) {
+    if (!session) return false;
+    auto& state = GetAssocState(session);
+    if (path_idx >= state.path_count) return false;
+
+    state.paths[path_idx].last_hb_tsc = now_tsc;
+    last_tx_frame_ = BuildHeartbeatPacket(session, path_idx);
+    session->tx_packets++;
+    session->tx_bytes += last_tx_frame_.size();
+    return true;
 }
 
 std::vector<uint8_t> SctpEngine::BuildHeartbeatAckPacket(TelcoSessionContext* session, const uint8_t* info_param, size_t info_len) {
@@ -1069,6 +1105,30 @@ bool SctpEngine::ParseAndProcessChunks(TelcoSessionContext* session, const uint8
 
             case SctpChunkType::HEARTBEAT_ACK: {
                 session->retry_count = 0;
+                auto& state = GetAssocState(session);
+                uint32_t acked_path_ip = 0;
+                if (body_len >= 16) {
+                    uint16_t param_type = (static_cast<uint16_t>(chunk_body[0]) << 8) | chunk_body[1];
+                    if (param_type == 0x0001) {
+                        std::memcpy(&acked_path_ip, chunk_body + 8, 4);
+                        acked_path_ip = ntohl(acked_path_ip);
+                    }
+                }
+                if (acked_path_ip == 0) {
+                    acked_path_ip = session->peer_ip;
+                }
+
+                for (size_t i = 0; i < state.path_count; ++i) {
+                    if (state.paths[i].ip == acked_path_ip) {
+                        state.paths[i].error_counter = 0;
+                        if (state.paths[i].status == SctpPathStatus::UNCONFIRMED ||
+                            state.paths[i].status == SctpPathStatus::INACTIVE) {
+                            state.paths[i].status = SctpPathStatus::ACTIVE;
+                        }
+                        break;
+                    }
+                }
+
                 if (timing_wheel_) {
                     timing_wheel_->Cancel(session);
                     timing_wheel_->Schedule(session, 5000); // Yeniden 5s sonra Heartbeat
