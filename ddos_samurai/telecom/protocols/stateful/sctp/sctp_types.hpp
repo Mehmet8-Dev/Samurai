@@ -38,7 +38,9 @@ enum class SctpChunkType : uint8_t {
     COOKIE_ACK = 0x0B,
     ECNE = 0x0C,
     CWR = 0x0D,
-    SHUTDOWN_COMPLETE = 0x0E
+    SHUTDOWN_COMPLETE = 0x0E,
+    // PR-SCTP (RFC 3758)
+    FORWARD_TSN = 0xC0
 };
 
 // RFC 4960 Durum Makinesi
@@ -121,6 +123,19 @@ struct SctpSackChunkBody {
     uint16_t num_duplicate_tsn;
 };
 static_assert(sizeof(SctpSackChunkBody) == 12, "SctpSackChunkBody must be 12 bytes");
+
+// PR-SCTP FORWARD_TSN Chunk Gövdesi (4 Bayt - RFC 3758 Section 3.2)
+struct SctpForwardTsnChunkBody {
+    uint32_t new_cumulative_tsn; // İlerletilecek yeni kümülatif TSN
+};
+static_assert(sizeof(SctpForwardTsnChunkBody) == 4, "SctpForwardTsnChunkBody must be 4 bytes");
+
+// PR-SCTP Terk Edilen Akış Sıra Numarası Çifti (4 Bayt - RFC 3758 Section 3.2)
+struct SctpForwardTsnStreamEntry {
+    uint16_t stream_id;
+    uint16_t stream_seq;
+};
+static_assert(sizeof(SctpForwardTsnStreamEntry) == 4, "SctpForwardTsnStreamEntry must be 4 bytes");
 
 #pragma pack(pop)
 
