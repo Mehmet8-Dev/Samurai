@@ -983,6 +983,166 @@ std::vector<uint8_t> SctpEngine::BuildShutdownCompletePacket(TelcoSessionContext
     return packet;
 }
 
+std::vector<uint8_t> SctpEngine::BuildForwardTsnPacket(TelcoSessionContext* session, 
+                                                      uint32_t new_cumulative_tsn, 
+                                                      const std::vector<std::pair<uint16_t, uint16_t>>& abandoned_streams) {
+    if (!session) return {};
+
+    size_t streams_len = abandoned_streams.size() * sizeof(SctpForwardTsnStreamEntry);
+    size_t chunk_len = sizeof(SctpChunkHeader) + sizeof(SctpForwardTsnChunkBody) + streams_len;
+    size_t padded_chunk_len = (chunk_len + 3) & ~3;
+    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(SctpCommonHeader) + padded_chunk_len;
+    std::vector<uint8_t> packet(total_len, 0);
+
+    auto* eth = reinterpret_cast<EthHeader*>(packet.data());
+    std::memcpy(eth->dst_mac, session->peer_mac, 6);
+    std::memcpy(eth->src_mac, session->client_mac, 6);
+    eth->ethertype = htons(0x0800);
+
+    auto* ip = reinterpret_cast<Ipv4Header*>(packet.data() + sizeof(EthHeader));
+    ip->ihl_version = 0x45;
+    ip->total_length = htons(static_cast<uint16_t>(total_len - sizeof(EthHeader)));
+    ip->ttl = 64;
+    ip->protocol = IP_PROTO_SCTP;
+    ip->src_ip = htonl(session->client_ip);
+    ip->dst_ip = htonl(session->peer_ip);
+    ip->checksum = ComputeIpChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
+
+    size_t sctp_offset = sizeof(EthHeader) + sizeof(Ipv4Header);
+    auto* sctp = reinterpret_cast<SctpCommonHeader*>(packet.data() + sctp_offset);
+    sctp->src_port = htons(session->client_port);
+    sctp->dst_port = htons(session->peer_port);
+    sctp->verification_tag = htonl(session->ppp_magic_number);
+    sctp->checksum = 0;
+
+    auto* chunk = reinterpret_cast<SctpChunkHeader*>(packet.data() + sctp_offset + sizeof(SctpCommonHeader));
+    chunk->type = static_cast<uint8_t>(SctpChunkType::FORWARD_TSN);
+    chunk->flags = 0;
+    chunk->length = htons(static_cast<uint16_t>(chunk_len));
+
+    auto* fwd_body = reinterpret_cast<SctpForwardTsnChunkBody*>(
+        packet.data() + sctp_offset + sizeof(SctpCommonHeader) + sizeof(SctpChunkHeader));
+    fwd_body->new_cumulative_tsn = htonl(new_cumulative_tsn);
+
+    uint8_t* stream_ptr = packet.data() + sctp_offset + sizeof(SctpCommonHeader) + sizeof(SctpChunkHeader) + sizeof(SctpForwardTsnChunkBody);
+    for (const auto& s : abandoned_streams) {
+        auto* entry = reinterpret_cast<SctpForwardTsnStreamEntry*>(stream_ptr);
+        entry->stream_id = htons(s.first);
+        entry->stream_seq = htons(s.second);
+        stream_ptr += sizeof(SctpForwardTsnStreamEntry);
+    }
+
+    uint32_t crc = ComputeCrc32c(packet.data() + sctp_offset, total_len - sctp_offset);
+    std::memcpy(&sctp->checksum, &crc, 4);
+
+    return packet;
+}
+
+std::vector<uint8_t> SctpEngine::BuildTimedDataPacket(TelcoSessionContext* session, 
+                                                     uint16_t stream_id, 
+                                                     uint32_t ppid, 
+                                                     const uint8_t* payload, 
+                                                     size_t payload_len, 
+                                                     uint32_t lifetime_ms, 
+                                                     uint64_t now_tsc) {
+    if (!session) return {};
+
+    auto& state = GetAssocState(session);
+    uint32_t assigned_tsn = session->teid_uplink++;
+    uint16_t s_idx = stream_id < SctpAssociationState::MAX_STREAMS ? stream_id : 0;
+    uint16_t assigned_seq = state.next_stream_seq[s_idx]++;
+
+    size_t slot = state.unacked_head % SctpAssociationState::MAX_UNACKED_CHUNKS;
+    state.unacked_chunks[slot].tsn = assigned_tsn;
+    state.unacked_chunks[slot].stream_id = stream_id;
+    state.unacked_chunks[slot].stream_seq = assigned_seq;
+    state.unacked_chunks[slot].expire_tsc = now_tsc + lifetime_ms * 2400000ULL;
+    state.unacked_chunks[slot].active = true;
+    state.unacked_chunks[slot].abandoned = false;
+    state.unacked_head++;
+
+    size_t chunk_len = sizeof(SctpChunkHeader) + sizeof(SctpDataChunkBody) + payload_len;
+    size_t padded_chunk_len = (chunk_len + 3) & ~3;
+    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(SctpCommonHeader) + padded_chunk_len;
+    std::vector<uint8_t> packet(total_len, 0);
+
+    auto* eth = reinterpret_cast<EthHeader*>(packet.data());
+    std::memcpy(eth->dst_mac, session->peer_mac, 6);
+    std::memcpy(eth->src_mac, session->client_mac, 6);
+    eth->ethertype = htons(0x0800);
+
+    auto* ip = reinterpret_cast<Ipv4Header*>(packet.data() + sizeof(EthHeader));
+    ip->ihl_version = 0x45;
+    ip->total_length = htons(static_cast<uint16_t>(total_len - sizeof(EthHeader)));
+    ip->ttl = 64;
+    ip->protocol = IP_PROTO_SCTP;
+    ip->src_ip = htonl(session->client_ip);
+    ip->dst_ip = htonl(session->peer_ip);
+    ip->checksum = ComputeIpChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
+
+    size_t sctp_offset = sizeof(EthHeader) + sizeof(Ipv4Header);
+    auto* sctp = reinterpret_cast<SctpCommonHeader*>(packet.data() + sctp_offset);
+    sctp->src_port = htons(session->client_port);
+    sctp->dst_port = htons(session->peer_port);
+    sctp->verification_tag = htonl(session->ppp_magic_number);
+    sctp->checksum = 0;
+
+    auto* chunk = reinterpret_cast<SctpChunkHeader*>(packet.data() + sctp_offset + sizeof(SctpCommonHeader));
+    chunk->type = static_cast<uint8_t>(SctpChunkType::DATA);
+    chunk->flags = 0x03; // B=1, E=1
+    chunk->length = htons(static_cast<uint16_t>(chunk_len));
+
+    auto* data_body = reinterpret_cast<SctpDataChunkBody*>(
+        packet.data() + sctp_offset + sizeof(SctpCommonHeader) + sizeof(SctpChunkHeader));
+    data_body->tsn = htonl(assigned_tsn);
+    data_body->stream_id = htons(stream_id);
+    data_body->stream_seq = htons(assigned_seq);
+    data_body->ppid = htonl(ppid);
+
+    if (payload && payload_len > 0) {
+        std::memcpy(packet.data() + sctp_offset + sizeof(SctpCommonHeader) + sizeof(SctpChunkHeader) + sizeof(SctpDataChunkBody),
+                    payload, payload_len);
+    }
+
+    uint32_t crc = ComputeCrc32c(packet.data() + sctp_offset, total_len - sctp_offset);
+    std::memcpy(&sctp->checksum, &crc, 4);
+
+    last_tx_frame_ = packet;
+    session->tx_packets++;
+    session->tx_bytes += packet.size();
+
+    return packet;
+}
+
+std::vector<uint8_t> SctpEngine::CheckTimedReliability(TelcoSessionContext* session, uint64_t now_tsc) {
+    if (!session) return {};
+
+    auto& state = GetAssocState(session);
+    uint32_t highest_abandoned = 0;
+    std::vector<std::pair<uint16_t, uint16_t>> abandoned_streams;
+
+    for (size_t i = 0; i < SctpAssociationState::MAX_UNACKED_CHUNKS; ++i) {
+        auto& c = state.unacked_chunks[i];
+        if (c.active && !c.abandoned && now_tsc >= c.expire_tsc) {
+            c.abandoned = true;
+            c.active = false;
+            if (c.tsn > highest_abandoned) {
+                highest_abandoned = c.tsn;
+            }
+            abandoned_streams.emplace_back(c.stream_id, c.stream_seq);
+        }
+    }
+
+    if (highest_abandoned > 0) {
+        last_tx_frame_ = BuildForwardTsnPacket(session, highest_abandoned, abandoned_streams);
+        session->tx_packets++;
+        session->tx_bytes += last_tx_frame_.size();
+        return last_tx_frame_;
+    }
+
+    return {};
+}
+
 bool SctpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, uint64_t now_tsc) {
     size_t min_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(SctpCommonHeader);
     if (!frame || len < min_len) return false;

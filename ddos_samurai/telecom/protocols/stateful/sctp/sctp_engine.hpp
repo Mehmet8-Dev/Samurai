@@ -122,6 +122,19 @@ public:
     void HandlePathError(TelcoSessionContext* session, size_t path_idx);
     bool FailoverPath(TelcoSessionContext* session);
 
+    // PR-SCTP Kısmi Güvenilirlik & FORWARD_TSN (RFC 3758)
+    std::vector<uint8_t> BuildTimedDataPacket(TelcoSessionContext* session, 
+                                             uint16_t stream_id, 
+                                             uint32_t ppid, 
+                                             const uint8_t* payload, 
+                                             size_t payload_len, 
+                                             uint32_t lifetime_ms, 
+                                             uint64_t now_tsc);
+    std::vector<uint8_t> CheckTimedReliability(TelcoSessionContext* session, uint64_t now_tsc);
+    std::vector<uint8_t> BuildForwardTsnPacket(TelcoSessionContext* session, 
+                                              uint32_t new_cumulative_tsn, 
+                                              const std::vector<std::pair<uint16_t, uint16_t>>& abandoned_streams = {});
+
     // Donanım Hızlandırmalı CRC32c Hesaplama (RFC 4960 Castagnoli 0x1EDC6F41)
     static uint32_t ComputeCrc32c(const uint8_t* data, size_t len) noexcept;
 
