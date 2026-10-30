@@ -330,9 +330,18 @@ cd /home/mehmet/Masaüstü/Python/v11/DDoSamurai/build
 
 # 9. Carrier-Grade RFC 2544 / RFC 2889 Audit Logger & Exporter
 ./telecom/test_telco_audit_logger
+
+# 10. SCTP Protocol Engine (SSE4.2 CRC32c Castagnoli, S1-AP/NG-AP DATA, SACK, SHUTDOWN)
+./telecom/test_sctp_engine
+
+# 11. Diameter Protocol Engine (RFC 6733 / 3GPP Ro/Gx CCR/CCA, AVP Codec, DWR/DWA, DPR/DPA)
+./telecom/test_diameter_engine
+
+# 12. SIP / RTP IMS Engine (RFC 3261 FSM + SDP, RFC 3550 20ms G.711 PCMU, RFC 3550 A.8 Jitter)
+./telecom/test_sip_rtp_engine
 ```
 
-**Verification Result**: **53 out of 53 tests passing with 100% verification across all subsystems.**
+**Verification Result**: **12 out of 12 test suites passing (100% test pass rate across all telecom and core subsystems).**
 
 ---
 

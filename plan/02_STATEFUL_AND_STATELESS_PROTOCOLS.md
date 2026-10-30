@@ -149,6 +149,25 @@ sequenceDiagram
     UPF-->>RAN: GTP-U Decapsulated / Forwarded Traffic
 ```
 
+### 4.3 SCTP Sinyalleşme Yığını (RFC 4960 - IP Proto 132)
+- **Kullanım Alanı:** 4G LTE S1-AP (MME sinyalleşmesi - Port 36412) ve 5G NG-AP / F1-C (AMF/gNodeB sinyalleşmesi - Port 38412).
+- **Donanımsal Sağlama Toplamı Hızlandırması:** Intel SSE4.2 `_mm_crc32_u64` / `u32` / `u8` talimatlarıyla Castagnoli CRC32c polinomu donanımsal olarak hesaplanır; x86 olmayan ortamlarda yazılımsal fallback devreye girer.
+- **4 Yollu Kurulum ve Durum Makinesi:** INIT -> INIT_ACK -> COOKIE_ECHO -> COOKIE_ACK -> ESTABLISHED.
+- **DATA Chunking & SACK:** Taşıyıcı PDU'ları (S1-AP PPID 18, NG-AP PPID 60) chunk seviyesinde paketlenir; TSN tabanlı otomatik SACK geri bildirimi sağlanır.
+- **Yol Yönetimi:** Heartbeat (Chunk 4) ve Heartbeat-Ack (Chunk 5) ile canlılık izleme; zarif SHUTDOWN -> SHUTDOWN_ACK -> SHUTDOWN_COMPLETE sonlandırma.
+
+### 4.4 Diameter Kimlik ve Faturalama Yığını (RFC 6733 / 3GPP Ro / Gx - Port 3868)
+- **Kullanım Alanı:** EPC / 5G HSS, PCRF, OCS ve SMF kimlik doğrulama, yetkilendirme ve çevrimiçi/çevrimdışı faturalama oturumları.
+- **Protokol Başlığı:** 24-bit uzunluk ve komut kodlu Diameter Base Header; AVP (Attribute-Value Pair) kodlayıcı/kod çözücü (4-bayt hizalama dolgusu ile RFC uyumlu UTF8String, Unsigned32, Address ve 3GPP Vendor ID 10415 desteği).
+- **Eşleşme ve Canlılık (Peer FSM):** Capabilities-Exchange-Request/Answer (CER/CEA - Cmd 257), Device-Watchdog-Request/Answer (DWR/DWA - Cmd 280), Disconnect-Peer-Request/Answer (DPR/DPA - Cmd 282).
+- **Kredi Kontrol (Credit-Control Application):** 3GPP Ro / Gx CCR/CCA (Cmd 272) INITIAL_REQUEST, UPDATE_REQUEST ve TERMINATION_REQUEST oturum akışları.
+
+### 4.5 SIP / RTP IMS & VoIP Oturum ve Medya Yığını (RFC 3261 / RFC 3550)
+- **Kullanım Alanı:** VoLTE, VoNR ve IMS taşıyıcı ses/medya altyapısı stres ve çağrı kapasitesi testleri.
+- **SIP Oturum Kontrolü (RFC 3261):** INVITE -> 100 Trying -> 180 Ringing -> 200 OK -> ACK çağrı kurulum diyalogu; SDP oturum tanımlayıcısı (`m=audio`, `rtpmap:0 PCMU/8000`); BYE -> 200 OK çağrı sonlandırma.
+- **RTP Medya Akışı (RFC 3550):** 12-baytlık standart RTP başlığı (V=2, SSRC, ardışık artan Sequence Number ve Timestamp); 20ms G.711 PCMU (160 bayt / 8000Hz) paket akışı.
+- **Gecikme Titremesi (Jitter) Ölçümü:** RFC 3550 Ek A.8 $J(i) = J(i-1) + \frac{|D(i-1, i)| - J(i-1)}{16}$ standart kayan nokta filtresi ile milisaniye/mikrosaniye hassasiyetinde paketler arası varış titremesi hesaplaması.
+
 ---
 
 ## 5. Durumsuz Telekom Trafik Üreteçleri (Stateless Generators)
