@@ -46,6 +46,15 @@ set(SAMURAI_TELECOM_SOURCES
   protocols/stateless/arp_gen/arp_gen_types.hpp
   protocols/stateless/arp_gen/stateless_arp_generator.hpp
   protocols/stateless/arp_gen/stateless_arp_generator.cpp
+  protocols/stateful/sctp/sctp_types.hpp
+  protocols/stateful/sctp/sctp_engine.hpp
+  protocols/stateful/sctp/sctp_engine.cpp
+  protocols/stateful/diameter/diameter_types.hpp
+  protocols/stateful/diameter/diameter_engine.hpp
+  protocols/stateful/diameter/diameter_engine.cpp
+  protocols/stateful/sip_rtp/sip_rtp_types.hpp
+  protocols/stateful/sip_rtp/sip_rtp_engine.hpp
+  protocols/stateful/sip_rtp/sip_rtp_engine.cpp
 )
 
 add_library(samurai_telecom_static STATIC ${SAMURAI_TELECOM_SOURCES})
@@ -59,6 +68,9 @@ target_include_directories(samurai_telecom_static PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/dhcp
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/bfd
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/mobile
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/sctp
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/diameter
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/sip_rtp
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateless/gtpu_gen
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateless/qinq_sweep
   ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateless/arp_gen
@@ -184,6 +196,42 @@ target_include_directories(test_telco_audit_logger PRIVATE
 target_compile_options(test_telco_audit_logger PRIVATE -msse4.2 -UNDEBUG)
 target_link_libraries(test_telco_audit_logger PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
 
+add_executable(test_sctp_engine tests/test_sctp_engine.cpp)
+target_include_directories(test_sctp_engine PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/sctp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_sctp_engine PRIVATE -msse4.2 -UNDEBUG)
+target_link_libraries(test_sctp_engine PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
+add_executable(test_diameter_engine tests/test_diameter_engine.cpp)
+target_include_directories(test_diameter_engine PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/diameter
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_diameter_engine PRIVATE -msse4.2 -UNDEBUG)
+target_link_libraries(test_diameter_engine PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
+add_executable(test_sip_rtp_engine tests/test_sip_rtp_engine.cpp)
+target_include_directories(test_sip_rtp_engine PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/sip_rtp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_sip_rtp_engine PRIVATE -msse4.2 -UNDEBUG)
+target_link_libraries(test_sip_rtp_engine PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
 # ---------------------------------------------------------------------------
 # CTest Registrations for Automated CI/CD
 # ---------------------------------------------------------------------------
@@ -196,4 +244,7 @@ add_test(NAME telecom_multi_worker_telco COMMAND test_multi_worker_telco)
 add_test(NAME telecom_cluster_sharding COMMAND test_telco_cluster_sharding)
 add_test(NAME telecom_chaos_recovery COMMAND test_telco_chaos_recovery)
 add_test(NAME telecom_audit_logger COMMAND test_telco_audit_logger)
+add_test(NAME telecom_sctp COMMAND test_sctp_engine)
+add_test(NAME telecom_diameter COMMAND test_diameter_engine)
+add_test(NAME telecom_sip_rtp COMMAND test_sip_rtp_engine)
 
