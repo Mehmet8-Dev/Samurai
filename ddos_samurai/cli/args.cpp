@@ -49,6 +49,11 @@ void PrintUsage(const char* argv0) {
       "  --keepalive         reuse L7 connections across requests (default: off)\n"
       "  --host-header NAME  L7 Host/SNI override (default: target IP)\n"
       "  --l7-timeout-ms N   L7 per-request timeout ms (default: 5000)\n"
+      "  --sctp-rate N       target rate for SCTP associations/chunks\n"
+      "  --diameter-rate N   target rate for Diameter CCR transactions\n"
+      "  --diameter-ccr-rate N alias for --diameter-rate\n"
+      "  --sip-rate N        target rate for SIP calls\n"
+      "  --enable-srtp       enable SRTP encrypted audio stream\n"
       "  --list-profiles     list the available workload profiles and exit\n"
       "  --allow-public-target        permit non-private/loopback targets\n"
       "  --allow-target IP|CIDR       allowlist a target (repeatable)\n"
@@ -200,6 +205,17 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
       out.license_file = argv[++i];
     } else if (a == "--confirm") {
       out.confirm = true;
+    } else if (a == "--sctp-rate") {
+      if (!NeedsValue(i, argc, "--sctp-rate")) return ParseStatus::kError;
+      out.sctp_rate = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--diameter-rate" || a == "--diameter-ccr-rate") {
+      if (!NeedsValue(i, argc, a.c_str())) return ParseStatus::kError;
+      out.diameter_rate = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--sip-rate") {
+      if (!NeedsValue(i, argc, "--sip-rate")) return ParseStatus::kError;
+      out.sip_rate = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--enable-srtp") {
+      out.enable_srtp = true;
     } else {
       std::fprintf(stderr, "samurai: unknown argument: %s\n", a.c_str());
       return ParseStatus::kError;
