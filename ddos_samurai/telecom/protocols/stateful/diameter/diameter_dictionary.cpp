@@ -9,6 +9,105 @@
 
 namespace ddos_samurai::telecom::diameter {
 
+namespace {
+
+AvpDataType StringToAvpDataType(const std::string& type_str) {
+    if (type_str == "OCTET_STRING") return AvpDataType::OCTET_STRING;
+    if (type_str == "INTEGER32") return AvpDataType::INTEGER32;
+    if (type_str == "INTEGER64") return AvpDataType::INTEGER64;
+    if (type_str == "UNSIGNED32") return AvpDataType::UNSIGNED32;
+    if (type_str == "UNSIGNED64") return AvpDataType::UNSIGNED64;
+    if (type_str == "FLOAT32") return AvpDataType::FLOAT32;
+    if (type_str == "FLOAT64") return AvpDataType::FLOAT64;
+    if (type_str == "ADDRESS") return AvpDataType::ADDRESS;
+    if (type_str == "TIME") return AvpDataType::TIME;
+    if (type_str == "UTF8_STRING") return AvpDataType::UTF8_STRING;
+    if (type_str == "GROUPED") return AvpDataType::GROUPED;
+    return AvpDataType::OCTET_STRING;
+}
+
+uint8_t ParseFlags(const samurai::core::json::Value* flag_val, uint32_t vendor_id) {
+    uint8_t flags = 0;
+    if (vendor_id != 0) {
+        flags |= AVP_FLAG_VENDOR;
+    }
+    if (!flag_val) return flags;
+    if (flag_val->is_number()) {
+        flags |= static_cast<uint8_t>(flag_val->as_int());
+    } else if (flag_val->is_string()) {
+        std::string s = flag_val->as_string();
+        for (char c : s) {
+            if (c == 'M' || c == 'm') flags |= AVP_FLAG_MANDATORY;
+            if (c == 'V' || c == 'v') flags |= AVP_FLAG_VENDOR;
+            if (c == 'P' || c == 'p') flags |= AVP_FLAG_PROTECTED;
+        }
+    }
+    return flags;
+}
+
+bool ParseAvpDefinition(const samurai::core::json::Value& v, AvpDefinition& def) {
+    if (!v.is_object()) return false;
+    const auto* code_val = v.find("code");
+    if (!code_val) return false;
+    def.code = static_cast<uint32_t>(code_val->as_int());
+
+    const auto* vendor_val = v.find("vendor_id");
+    def.vendor_id = vendor_val ? static_cast<uint32_t>(vendor_val->as_int()) : 0;
+
+    const auto* name_val = v.find("name");
+    def.name = name_val ? name_val->as_string() : "";
+
+    const auto* type_val = v.find("type");
+    std::string type_str = type_val ? type_val->as_string() : "OCTET_STRING";
+    def.type = StringToAvpDataType(type_str);
+
+    def.flags = ParseFlags(v.find("flags"), def.vendor_id);
+
+    const auto* children_val = v.find("children");
+    if (children_val && children_val->is_array()) {
+        for (const auto& child_elem : children_val->elements()) {
+            AvpDefinition child_def;
+            if (ParseAvpDefinition(child_elem, child_def)) {
+                def.children.push_back(std::move(child_def));
+            }
+        }
+    }
+    return true;
+}
+
+bool ParseCommandDefinition(const samurai::core::json::Value& v, CommandDefinition& cmd) {
+    if (!v.is_object()) return false;
+    const auto* code_val = v.find("code");
+    if (!code_val) return false;
+    cmd.code = static_cast<uint32_t>(code_val->as_int());
+
+    const auto* app_val = v.find("app_id");
+    cmd.app_id = app_val ? static_cast<uint32_t>(app_val->as_int()) : 0;
+
+    const auto* name_val = v.find("name");
+    cmd.name = name_val ? name_val->as_string() : "";
+
+    const auto* req_val = v.find("is_request");
+    cmd.is_request = req_val ? req_val->as_bool(true) : true;
+
+    const auto* req_avps = v.find("required_avps");
+    if (req_avps && req_avps->is_array()) {
+        for (const auto& elem : req_avps->elements()) {
+            cmd.required_avps.push_back(static_cast<uint32_t>(elem.as_int()));
+        }
+    }
+
+    const auto* opt_avps = v.find("optional_avps");
+    if (opt_avps && opt_avps->is_array()) {
+        for (const auto& elem : opt_avps->elements()) {
+            cmd.optional_avps.push_back(static_cast<uint32_t>(elem.as_int()));
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 DecodedAvp DecodedAvp::CreateString(uint32_t code, const std::string& str, uint8_t flags, uint32_t vendor_id) {
     DecodedAvp a;
     a.code = code;
@@ -266,8 +365,40 @@ void DiameterDictionary::LoadBuiltinCarrierDictionary() {
                          {456}});
 }
 
-bool DiameterDictionary::LoadFromJson(const std::string& /*json_str*/, std::string* /*error_msg*/) {
-    return false;
+bool DiameterDictionary::LoadFromJson(const std::string& json_str, std::string* error_msg) {
+    auto parse_res = samurai::core::json::Parse(json_str);
+    if (!parse_res.ok) {
+        if (error_msg) *error_msg = "JSON parse error: " + parse_res.error;
+        return false;
+    }
+
+    const auto& root = parse_res.value;
+    if (!root.is_object()) {
+        if (error_msg) *error_msg = "Root JSON must be an object";
+        return false;
+    }
+
+    const auto* avps = root.find("avps");
+    if (avps && avps->is_array()) {
+        for (const auto& elem : avps->elements()) {
+            AvpDefinition def;
+            if (ParseAvpDefinition(elem, def)) {
+                AddAvpDefinition(def);
+            }
+        }
+    }
+
+    const auto* cmds = root.find("commands");
+    if (cmds && cmds->is_array()) {
+        for (const auto& elem : cmds->elements()) {
+            CommandDefinition cmd;
+            if (ParseCommandDefinition(elem, cmd)) {
+                AddCommandDefinition(cmd);
+            }
+        }
+    }
+
+    return true;
 }
 
 bool DiameterDictionary::EncodeAvp(const DecodedAvp& /*avp*/, std::vector<uint8_t>& /*out_buf*/) const {

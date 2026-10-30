@@ -296,6 +296,110 @@ void TestDiameterDictionaryBuiltinSchema() {
     std::cout << "  -> Carrier built-in schema and 3GPP hierarchy: PASSED" << std::endl;
 }
 
+void TestDiameterDictionaryJsonLoader() {
+    std::cout << "[TEST] 7. Diameter Dynamic Dictionary JSON Loader..." << std::endl;
+
+    DiameterDictionary dict;
+    size_t initial_avp_count = dict.AvpCount();
+    size_t initial_cmd_count = dict.CommandCount();
+
+    std::string json_schema = R"({
+        "avps": [
+            {
+                "code": 9991,
+                "vendor_id": 10415,
+                "name": "Custom-Carrier-Token",
+                "type": "UTF8_STRING",
+                "flags": "MV"
+            },
+            {
+                "code": 9992,
+                "vendor_id": 0,
+                "name": "Custom-Telemetry-Group",
+                "type": "GROUPED",
+                "flags": "M",
+                "children": [
+                    {
+                        "code": 9993,
+                        "vendor_id": 0,
+                        "name": "Custom-Probe-ID",
+                        "type": "UNSIGNED32",
+                        "flags": "M"
+                    }
+                ]
+            }
+        ],
+        "commands": [
+            {
+                "code": 888,
+                "app_id": 16777216,
+                "name": "Custom-Policy-Request",
+                "is_request": true,
+                "required_avps": [263, 9991],
+                "optional_avps": [9992]
+            },
+            {
+                "code": 888,
+                "app_id": 16777216,
+                "name": "Custom-Policy-Answer",
+                "is_request": false,
+                "required_avps": [263, 268],
+                "optional_avps": []
+            }
+        ]
+    })";
+
+    std::string err;
+    bool ok = dict.LoadFromJson(json_schema, &err);
+    assert(ok);
+    assert(err.empty());
+    assert(dict.AvpCount() > initial_avp_count);
+    assert(dict.CommandCount() > initial_cmd_count);
+
+    // Verify parsed AVP
+    const auto* token_avp = dict.FindAvp(9991, 10415);
+    assert(token_avp != nullptr);
+    assert(token_avp->name == "Custom-Carrier-Token");
+    assert(token_avp->vendor_id == 10415);
+    assert(token_avp->type == AvpDataType::UTF8_STRING);
+    assert(token_avp->flags & AVP_FLAG_MANDATORY);
+    assert(token_avp->flags & AVP_FLAG_VENDOR);
+
+    // Lookup by name
+    const auto* token_by_name = dict.FindAvpByName("Custom-Carrier-Token");
+    assert(token_by_name != nullptr && token_by_name->code == 9991);
+
+    // Verify Grouped AVP & child
+    const auto* group_avp = dict.FindAvp(9992, 0);
+    assert(group_avp != nullptr);
+    assert(group_avp->type == AvpDataType::GROUPED);
+    assert(group_avp->children.size() == 1);
+    assert(group_avp->children[0].code == 9993);
+    assert(group_avp->children[0].type == AvpDataType::UNSIGNED32);
+
+    // Verify Commands
+    const auto* cmd_req = dict.FindCommand(888, 16777216, true);
+    assert(cmd_req != nullptr);
+    assert(cmd_req->name == "Custom-Policy-Request");
+    assert(cmd_req->required_avps.size() == 2);
+    assert(cmd_req->required_avps[0] == 263);
+    assert(cmd_req->required_avps[1] == 9991);
+    assert(cmd_req->optional_avps.size() == 1);
+    assert(cmd_req->optional_avps[0] == 9992);
+
+    const auto* cmd_ans = dict.FindCommand(888, 16777216, false);
+    assert(cmd_ans != nullptr);
+    assert(cmd_ans->name == "Custom-Policy-Answer");
+
+    // Invalid JSON error reporting
+    std::string invalid_err;
+    bool bad_ok = dict.LoadFromJson("{ malformed json }", &invalid_err);
+    assert(!bad_ok);
+    assert(!invalid_err.empty());
+
+    std::cout << "  -> JSON schema loader for custom AVPs & Commands: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "       SAMURAI DIAMETER (RFC 6733 / 3GPP) VERIFICATION SUITE     " << std::endl;
@@ -307,6 +411,7 @@ int main() {
     TestDiameterCreditControlBilling();
     TestDiameterDisconnectPeer();
     TestDiameterDictionaryBuiltinSchema();
+    TestDiameterDictionaryJsonLoader();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL DIAMETER ENGINE TESTS PASSED SUCCESSFULLY! (100% VERIFIED) " << std::endl;
