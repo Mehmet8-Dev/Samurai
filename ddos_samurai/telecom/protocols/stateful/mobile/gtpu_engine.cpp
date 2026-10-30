@@ -210,8 +210,41 @@ void GtpuEngine::OnRxPacket(rte_mbuf* /*mbuf*/, const PacketMetadata& meta, Telc
     }
 }
 
-rte_mbuf* GtpuEngine::BuildTxPacket(rte_mempool* /*pool*/, TelcoSessionContext* /*session*/, uint16_t /*event_type*/) {
+rte_mbuf* GtpuEngine::BuildTxPacket(rte_mempool* pool, TelcoSessionContext* session, uint16_t event_type) {
+    if (!pool || !session) return nullptr;
+#ifdef SAMURAI_WITH_DPDK
+    rte_mbuf* m = rte_pktmbuf_alloc(pool);
+    if (!m) return nullptr;
+
+    std::vector<uint8_t> pkt;
+    if (event_type == 1) { // GTP-U Echo Request
+        pkt = BuildEchoRequest(session, next_seq_num_++);
+    } else {
+        // Enkapsüle edilmiş iç L4 test yükü (ICMP Echo Request payload)
+        static const uint8_t inner_payload[28] = {
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, 1, 0x00, 0x00,
+            192, 168, 100, 1, 8, 8, 8, 8,
+            0x08, 0x00, 0xf7, 0xff, 0x00, 0x01, 0x00, 0x01
+        };
+        pkt = Encapsulate(session, inner_payload, sizeof(inner_payload), next_seq_num_++);
+    }
+
+    if (pkt.empty() || pkt.size() > rte_pktmbuf_tailroom(m)) {
+        rte_pktmbuf_free(m);
+        return nullptr;
+    }
+
+    char* data = rte_pktmbuf_append(m, pkt.size());
+    if (!data) {
+        rte_pktmbuf_free(m);
+        return nullptr;
+    }
+    std::memcpy(data, pkt.data(), pkt.size());
+    return m;
+#else
+    (void)event_type;
     return nullptr;
+#endif
 }
 
 // ---------------------------------------------------------------------------
