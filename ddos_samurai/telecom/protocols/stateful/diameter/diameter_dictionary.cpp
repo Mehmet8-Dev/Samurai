@@ -683,12 +683,85 @@ bool DiameterDictionary::DecodeAvps(const uint8_t* data, size_t len, std::vector
     return offset == len;
 }
 
-bool DiameterDictionary::ValidateAvp(const DecodedAvp& /*avp*/, std::string& /*err*/) const {
+bool DiameterDictionary::ValidateAvp(const DecodedAvp& avp, std::string& err) const {
+    const AvpDefinition* def = FindAvp(avp.code, avp.vendor_id);
+    if (!def) {
+        if (avp.flags & AVP_FLAG_MANDATORY) {
+            err = "Mandatory AVP code " + std::to_string(avp.code) + " is unsupported / not in dictionary";
+            return false;
+        }
+        return true;
+    }
+
+    if (avp.type != def->type) {
+        err = "Data type mismatch for AVP " + def->name + " (expected " +
+              std::to_string(static_cast<int>(def->type)) + ", got " +
+              std::to_string(static_cast<int>(avp.type)) + ")";
+        return false;
+    }
+
+    if ((def->flags & AVP_FLAG_VENDOR) && !(avp.flags & AVP_FLAG_VENDOR)) {
+        err = "Vendor flag missing for vendor-specific AVP " + def->name;
+        return false;
+    }
+
+    if (def->type == AvpDataType::GROUPED) {
+        for (const auto& child : avp.grouped_val) {
+            if (!ValidateAvp(child, err)) {
+                return false;
+            }
+        }
+        for (const auto& child_def : def->children) {
+            if (child_def.flags & AVP_FLAG_MANDATORY) {
+                bool found = false;
+                for (const auto& child : avp.grouped_val) {
+                    if (child.code == child_def.code) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    err = "Missing mandatory child AVP " + child_def.name + " inside " + def->name;
+                    return false;
+                }
+            }
+        }
+    }
+
     return true;
 }
 
-bool DiameterDictionary::ValidateMessage(uint32_t /*cmd_code*/, uint32_t /*app_id*/, bool /*is_request*/,
-                                         const std::vector<DecodedAvp>& /*avps*/, std::string& /*err*/) const {
+bool DiameterDictionary::ValidateMessage(uint32_t cmd_code, uint32_t app_id, bool is_request,
+                                         const std::vector<DecodedAvp>& avps, std::string& err) const {
+    const CommandDefinition* cmd = FindCommand(cmd_code, app_id, is_request);
+    if (!cmd) {
+        err = "Unsupported command code " + std::to_string(cmd_code) +
+              " (app_id " + std::to_string(app_id) + ", request=" + (is_request ? "true" : "false") + ")";
+        return false;
+    }
+
+    for (uint32_t req_code : cmd->required_avps) {
+        bool found = false;
+        for (const auto& a : avps) {
+            if (a.code == req_code) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            const AvpDefinition* req_def = FindAvp(req_code);
+            std::string name = req_def ? req_def->name : std::to_string(req_code);
+            err = "Command " + cmd->name + " missing required AVP: " + name;
+            return false;
+        }
+    }
+
+    for (const auto& a : avps) {
+        if (!ValidateAvp(a, err)) {
+            return false;
+        }
+    }
+
     return true;
 }
 

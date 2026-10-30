@@ -492,6 +492,66 @@ void TestDiameterDynamicGroupedAvpCodec() {
     std::cout << "  -> Recursive Grouped and Primitive AVP Codec with RFC 6733 padding: PASSED" << std::endl;
 }
 
+void TestDiameterDictionaryValidation() {
+    std::cout << "[TEST] 9. Diameter Schema Validation & Mandatory AVP Enforcement..." << std::endl;
+
+    DiameterDictionary dict;
+
+    // Build valid CCR list of AVPs
+    std::vector<DecodedAvp> valid_ccr_avps;
+    valid_ccr_avps.push_back(DecodedAvp::CreateString(263, "sess-1001@epc.mnc001.org"));
+    valid_ccr_avps.push_back(DecodedAvp::CreateString(264, "pcrf.carrier.net"));
+    valid_ccr_avps.push_back(DecodedAvp::CreateString(296, "carrier.net"));
+    valid_ccr_avps.push_back(DecodedAvp::CreateString(283, "epc.mnc001.org"));
+    valid_ccr_avps.push_back(DecodedAvp::CreateU32(258, 4)); // Auth-Application-Id
+    valid_ccr_avps.push_back(DecodedAvp::CreateString(461, "32251@3gpp.org")); // Service-Context-Id
+    valid_ccr_avps.push_back(DecodedAvp::CreateU32(416, 1)); // CC-Request-Type: INITIAL
+    valid_ccr_avps.push_back(DecodedAvp::CreateU32(415, 0)); // CC-Request-Number
+
+    // Valid Grouped AVP
+    std::vector<DecodedAvp> sub_children;
+    sub_children.push_back(DecodedAvp::CreateU32(450, 0)); // END_USER_E164
+    sub_children.push_back(DecodedAvp::CreateString(444, "905321234567"));
+    valid_ccr_avps.push_back(DecodedAvp::CreateGrouped(443, sub_children));
+
+    std::string err;
+    bool ok = dict.ValidateMessage(272, 4, true, valid_ccr_avps, err);
+    assert(ok);
+    assert(err.empty());
+
+    // 1. Missing mandatory AVP (remove Auth-Application-Id)
+    auto missing_avps = valid_ccr_avps;
+    missing_avps.erase(missing_avps.begin() + 4); // Remove Auth-App-Id
+    ok = dict.ValidateMessage(272, 4, true, missing_avps, err);
+    assert(!ok);
+    assert(err.find("Auth-Application-Id") != std::string::npos);
+
+    // 2. Type mismatch (CC-Request-Number as string)
+    auto bad_type_avps = valid_ccr_avps;
+    bad_type_avps[7] = DecodedAvp::CreateString(415, "invalid-type-number");
+    ok = dict.ValidateMessage(272, 4, true, bad_type_avps, err);
+    assert(!ok);
+    assert(err.find("mismatch") != std::string::npos);
+
+    // 3. Missing mandatory child inside Grouped AVP
+    std::vector<DecodedAvp> incomplete_sub;
+    incomplete_sub.push_back(DecodedAvp::CreateU32(450, 0)); // Only type, missing data!
+    auto incomplete_grouped = DecodedAvp::CreateGrouped(443, incomplete_sub);
+    err.clear();
+    ok = dict.ValidateAvp(incomplete_grouped, err);
+    assert(!ok);
+    assert(err.find("Subscription-Id-Data") != std::string::npos);
+
+    // 4. Missing vendor flag on vendor-specific AVP
+    auto bad_vendor_avp = DecodedAvp::CreateU32(432, 100, AVP_FLAG_MANDATORY, 10415); // Missing AVP_FLAG_VENDOR bit in flags!
+    err.clear();
+    ok = dict.ValidateAvp(bad_vendor_avp, err);
+    assert(!ok);
+    assert(err.find("Vendor flag missing") != std::string::npos);
+
+    std::cout << "  -> Schema validation and mandatory AVP checking: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "       SAMURAI DIAMETER (RFC 6733 / 3GPP) VERIFICATION SUITE     " << std::endl;
@@ -505,6 +565,7 @@ int main() {
     TestDiameterDictionaryBuiltinSchema();
     TestDiameterDictionaryJsonLoader();
     TestDiameterDynamicGroupedAvpCodec();
+    TestDiameterDictionaryValidation();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL DIAMETER ENGINE TESTS PASSED SUCCESSFULLY! (100% VERIFIED) " << std::endl;
