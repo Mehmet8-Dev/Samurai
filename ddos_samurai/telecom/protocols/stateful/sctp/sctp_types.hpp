@@ -39,9 +39,21 @@ enum class SctpChunkType : uint8_t {
     ECNE = 0x0C,
     CWR = 0x0D,
     SHUTDOWN_COMPLETE = 0x0E,
-    // PR-SCTP (RFC 3758)
-    FORWARD_TSN = 0xC0
+    // ASCONF (RFC 5061 - Type 0x80)
+    ASCONF_ACK = 0x80,
+    // PR-SCTP (RFC 3758 - Type 0xC0)
+    FORWARD_TSN = 0xC0,
+    // ASCONF (RFC 5061 - Type 0xC1)
+    ASCONF = 0xC1
 };
+
+// ASCONF (RFC 5061) TLV Parametre Tipleri
+constexpr uint16_t SCTP_ASCONF_PARAM_SUCCESS = 0x0000;      // Success Indication
+constexpr uint16_t SCTP_ASCONF_PARAM_IPV4 = 0x0005;         // IPv4 Address Parameter
+constexpr uint16_t SCTP_ASCONF_PARAM_ADD_IP = 0xC001;       // Add IP Address
+constexpr uint16_t SCTP_ASCONF_PARAM_DEL_IP = 0xC002;       // Delete IP Address
+constexpr uint16_t SCTP_ASCONF_PARAM_ERROR = 0xC003;        // Error Indication
+constexpr uint16_t SCTP_ASCONF_PARAM_SET_PRIMARY = 0xC004;  // Set Primary IP Address
 
 // RFC 4960 Durum Makinesi
 enum class SctpState : uint8_t {
@@ -136,6 +148,50 @@ struct SctpForwardTsnStreamEntry {
     uint16_t stream_seq;
 };
 static_assert(sizeof(SctpForwardTsnStreamEntry) == 4, "SctpForwardTsnStreamEntry must be 4 bytes");
+
+// ASCONF Chunk Gövdesi (4 Bayt Sabit Başlık - RFC 5061 §3.1.1)
+struct SctpAsconfChunkBody {
+    uint32_t serial_number; // ASCONF İstek Sıra Numarası
+};
+static_assert(sizeof(SctpAsconfChunkBody) == 4, "SctpAsconfChunkBody must be 4 bytes");
+
+// ASCONF_ACK Chunk Gövdesi (4 Bayt Sabit Başlık - RFC 5061 §3.1.2)
+struct SctpAsconfAckChunkBody {
+    uint32_t serial_number; // Yanıtlanan ASCONF Sıra Numarası
+};
+static_assert(sizeof(SctpAsconfAckChunkBody) == 4, "SctpAsconfAckChunkBody must be 4 bytes");
+
+// Genel ASCONF TLV Parametre Başlığı (4 Bayt)
+struct SctpAsconfParamHeader {
+    uint16_t type;
+    uint16_t length;
+};
+static_assert(sizeof(SctpAsconfParamHeader) == 4, "SctpAsconfParamHeader must be 4 bytes");
+
+// IPv4 Adres Parametresi (RFC 5061 / RFC 4960 §3.3.2.1 - Type 0x0005, Len 8)
+struct SctpIpv4AddressParam {
+    uint16_t type{0x0005}; // network order
+    uint16_t length{8};     // network order
+    uint32_t ipv4_address;  // network order
+};
+static_assert(sizeof(SctpIpv4AddressParam) == 8, "SctpIpv4AddressParam must be 8 bytes");
+
+// Add / Delete / Set Primary IP Adres Parametresi (RFC 5061 §4.2 - Len 16)
+struct SctpAsconfAddressParam {
+    uint16_t type;          // 0xC001, 0xC002 veya 0xC004
+    uint16_t length;        // 16 bayt
+    uint32_t correlation_id;
+    SctpIpv4AddressParam addr;
+};
+static_assert(sizeof(SctpAsconfAddressParam) == 16, "SctpAsconfAddressParam must be 16 bytes");
+
+// Success Indication Yanıt Parametresi (RFC 5061 §4.2.4 - Type 0x0000, Len 8)
+struct SctpAsconfSuccessParam {
+    uint16_t type{0x0000};
+    uint16_t length{8};
+    uint32_t correlation_id;
+};
+static_assert(sizeof(SctpAsconfSuccessParam) == 8, "SctpAsconfSuccessParam must be 8 bytes");
 
 #pragma pack(pop)
 
