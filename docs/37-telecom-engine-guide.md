@@ -157,6 +157,30 @@ Inter-thread communication uses a power-of-two circular ring buffer (`ddos_samur
 
 ---
 
+### 3.4 Signaling, Billing & Real-Time Media Protocols
+
+#### 3.4.1 SCTP Engine (RFC 4960, 3GPP TS 36.413 / TS 38.413)
+- **Association Lifecycle**: Deterministic 4-way handshake (`INIT` $\to$ `INIT-ACK` $\to$ `COOKIE-ECHO` $\to$ `COOKIE-ACK`) and graceful teardown (`SHUTDOWN` $\to$ `SHUTDOWN-ACK` $\to$ `SHUTDOWN-COMPLETE`).
+- **Multihoming & Path Resiliency**: Primary and alternate destination IP path tracking. Automatically detects path failures and routes chunks to alternate multihomed paths.
+- **Chunk Multiplexing & SSE4.2 Checksum**: Full support for DATA, SACK (selective acknowledgments), HEARTBEAT / HEARTBEAT-ACK, and ABORT chunks. Verified Castagnoli CRC32c calculated via hardware acceleration.
+- **Telecom Control Plane Stress**: Simulates dense eNodeB/gNodeB S1-AP and NG-AP control plane connection storms targeting MME / AMF nodes.
+
+#### 3.4.2 Diameter Engine (RFC 6733, RFC 4006, 3GPP TS 32.299 & TS 29.212)
+- **Base Protocol State Machine**: Capabilities Exchange (`CER`/`CEA`), Device-Watchdog keepalives (`DWR`/`DWA`), and Disconnect-Peer (`DPR`/`DPA`).
+- **3GPP Ro / Gx Credit-Control Application**: Stateful generation and processing of Credit-Control-Request (`CCR`) and Credit-Control-Answer (`CCA`) flows:
+  - `CCR-Initial` (Type 1): Reservation and session establishment.
+  - `CCR-Update` (Type 2): Quota consumption and interim quota renewal bursts.
+  - `CCR-Termination` (Type 3): Final billing session teardown.
+- **AVP Codec**: Zero-copy parser/builder for Session-Id, Origin-Host, Destination-Realm, Auth-Application-Id, CC-Request-Type, and Multiple-Services-Credit-Control AVPs.
+
+#### 3.4.3 SIP & RTP / SRTP Engine (RFC 3261, RFC 3550, RFC 3711)
+- **SIP IMS Signaling (RFC 3261)**: Full transaction/dialog FSM supporting `INVITE`, `100 Trying`, `180 Ringing`, `200 OK`, `ACK`, `BYE`, and `CANCEL`. SDP (Session Description Protocol) negotiation for audio codecs.
+- **RTP Real-Time Media (RFC 3550)**: Fixed 20ms G.711 PCMU audio packetization, dynamic sequence numbering, timestamp increments, and RFC 3550 Appendix A.8 interarrival jitter calculations.
+- **SRTP In-Place Encryption (RFC 3711)**: Integrated `SrtpEngine` providing zero-heap in-place packet encryption and authentication for carrier-grade media security validation without buffer allocations.
+
+
+---
+
 ## 4. Distributed Cluster Sharding & Master Orchestration
 
 ### 4.1 MasterCoordinator & Port 5099
@@ -185,13 +209,13 @@ Each slave node receives its shard specification via a `TelcoJobPayload` ZeroMQ 
 - No MAC address collisions (MAC low bytes derived deterministically from subscriber ID).
 - No IPv4 address collisions (IP low bytes mapped directly to range index).
 
-### 4.3 Worker Daemon Execution (`telco_worker`)
+### 4.3 Worker Daemon Execution (`samurai_telco_worker`)
 
-The telecom worker daemon (`ddos_samurai/zmq/daemon/telco_worker.cpp`) runs on each physical host:
+The telecom worker daemon (`ddos_samurai/zmq/daemon/telco_worker.cpp`) runs on each physical host or cluster node, executing high-throughput subscriber loops across fixed-line, mobile, signaling, billing, and real-time media protocols.
 
 ```bash
-# Launch worker daemon bound to Master on port 5099
-./telco_worker \
+# Launch worker daemon connected to Master Coordinator on port 5099
+./samurai_telco_worker \
   --master tcp://10.0.0.1:5099 \
   --id worker-node-01 \
   --subscribers 250000 \
@@ -201,6 +225,77 @@ The telecom worker daemon (`ddos_samurai/zmq/daemon/telco_worker.cpp`) runs on e
   --core-fsm 3 \
   --export-audit /var/log/ddos_samurai/audit_node01.csv
 ```
+
+#### Protocol Engine Execution Options
+The daemon supports dedicated and compound protocol modes:
+- `--protocol sctp` / `--protocol sctp-flood`: SCTP association storm with primary & alternate multihoming path cycling, simulating massive S1-AP/NG-AP control plane bursts.
+- `--protocol diameter` / `--protocol diameter-ccr`: 3GPP Ro/Gx Credit-Control-Request (`CCR`) initial, update, and termination charging transaction storms.
+- `--protocol sip` / `--protocol sip-rtp` / `--protocol sip-storm`: SIP INVITE dialog storms with negotiated SDP and continuous 20ms G.711 PCMU RTP media packets (or SRTP).
+- `--protocol pppoe`: High-density PPPoE discovery, LCP/IPCP negotiation, and keepalive traffic.
+- `--protocol dhcp`: Rapid DHCPv4 DORA / DHCPv6 SARR lease acquisition with Option 82.
+- `--protocol bfd`: Sub-50ms BFD session keepalive monitoring and fault induction.
+- `--protocol gtpu`: High-rate GTP-U tunnel encap/decap flood across randomized TEIDs.
+
+#### Rate Controls & Cryptography Flags
+- `--sctp-rate <pps>`: Controls active SCTP association and chunk generation rate (default: `10000`).
+- `--diameter-rate <pps>` or `--diameter-ccr-rate <pps>`: Controls Diameter CCR transaction rate (default: `10000`).
+- `--sip-rate <calls/sec>`: Controls SIP INVITE dialog and audio generation rate (default: `5000`).
+- `--enable-srtp`: Enforces RFC 3711 SRTP zero-heap in-place encryption for all generated RTP audio frames.
+
+---
+
+### 4.4 CLI Workload Profiles
+
+DDoSamurai CLI (`ddos_samurai/cli/options.hpp`, `args.cpp`, `profiles.cpp`) incorporates preconfigured carrier workload profiles:
+
+| Workload Profile | Target Architecture | Rate & Engine Defaults |
+| :--- | :--- | :--- |
+| `telco-sctp-flood` | 4G MME / 5G AMF Control Plane | `--protocol sctp-flood --sctp-rate 100000` |
+| `telco-diameter-billing` | 4G OCS / 5G CHF Billing & Policy | `--protocol diameter-ccr --diameter-rate 50000` |
+| `telco-sip-storm` | IMS CSCF / SBC VoIP Infrastructure | `--protocol sip-storm --sip-rate 20000 --enable-srtp` |
+| `telco-full-carrier` | End-to-End Carrier Stress Benchmark | Mixed workload: 50,000 SCTP/s, 25,000 CCR/s, 10,000 SIP/s + SRTP |
+
+```bash
+# Executing preconfigured carrier profile via DDoSamurai CLI
+./ddos_samurai --profile telco-full-carrier --duration 120 --interface eth1
+```
+
+---
+
+### 4.5 Fastpath Multi-Engine Integration (`L2L3FastpathWiring`)
+
+The `L2L3FastpathWiring` pipeline (`ddos_samurai/telecom/l2l3_fastpath_wiring.hpp`) integrates the protocol engines into a unified zero-allocation packet demultiplexing and dispatch layer:
+
+```
+                      +-----------------------------+
+                      | Raw Ingress Ethernet Frame  |
+                      +--------------+--------------+
+                                     |
+                                     v
+                      +-----------------------------+
+                      |   FastpathClassifier (SSE4) |
+                      +--------------+--------------+
+                                     |
+       +---------------+-------------+-------------+---------------+
+       |               |                           |               |
+       v               v                           v               v
+ [PPPoE/DHCP/BFD]   [SCTP Engine]         [Diameter Engine]  [SIP/RTP Engine]
+       |               |                           |               |
+       |               +-------------+-------------+               |
+       |                             |                             |
+       +-----------------------------v-----------------------------+
+                                     |
+                       [tx_callback_ via EmitTxPacket]
+                                     |
+                                     v
+                        +--------------------------+
+                        | Zero-Copy Egress TX NIC  |
+                        +--------------------------+
+```
+
+1. **Ingress Demultiplexing**: In `DispatchRxControlFrame()`, packets classified as `TelcoFrameType::Sctp`, `TelcoFrameType::Diameter`, `TelcoFrameType::Sip`, or `TelcoFrameType::Rtp` are directly forwarded to `sctp_engine_.ProcessRxFrame()`, `diameter_engine_.ProcessRxFrame()`, or `sip_rtp_engine_.ProcessRxFrame()`.
+2. **Egress Packet Routing**: When protocol engines emit response frames (e.g., `INIT-ACK`, `CCA`, SIP `200 OK`, RTP audio), they route to `EmitTxPacket()`, which hands buffers directly to `tx_callback_` without heap allocations or intermediary copies.
+3. **Timer Ticks**: `StepTimers(now_tsc)` synchronously steps the internal timing wheels and retransmit queues of `SctpEngine`, `DiameterEngine`, and `SipRtpEngine` alongside `BfdEngine`.
 
 ---
 
@@ -299,7 +394,7 @@ RFC2544-PPPOE-01,PPPOE,50000,50000,10000.00,0.00,500000,0,0,22.50,128.00,5.00,"L
 
 ## 8. Verification & Test Suite Execution
 
-All 9 telecom test suites are built with `-msse4.2 -UNDEBUG` to guarantee that assertions and performance checks are never optimized away:
+All 13 telecom test suites are built with `-msse4.2 -UNDEBUG` to guarantee that assertions and performance checks are never optimized away:
 
 ```bash
 cd /home/mehmet/Masaüstü/Python/v11/DDoSamurai/build
@@ -339,9 +434,12 @@ cd /home/mehmet/Masaüstü/Python/v11/DDoSamurai/build
 
 # 12. SIP / RTP IMS Engine (RFC 3261 FSM + SDP, RFC 3550 20ms G.711 PCMU, RFC 3550 A.8 Jitter)
 ./telecom/test_sip_rtp_engine
+
+# 13. Upstream Telco Integration (Fastpath Demux, CLI Args Parsing, Multi-Protocol Worker Loop)
+./telecom/test_upstream_telco_integration
 ```
 
-**Verification Result**: **12 out of 12 test suites passing (100% test pass rate across all telecom and core subsystems).**
+**Verification Result**: **13 out of 13 test suites passing (100% test pass rate across all telecom and core subsystems).**
 
 ---
 
