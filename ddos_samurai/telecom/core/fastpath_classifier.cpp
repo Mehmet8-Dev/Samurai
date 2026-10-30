@@ -99,6 +99,41 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
             return true;
         }
 
+        if (proto == 132 && len >= offset + 12) { // SCTP
+            const uint8_t* sctp_hdr = frame + offset;
+            meta.src_port = (static_cast<uint16_t>(sctp_hdr[0]) << 8) | sctp_hdr[1];
+            meta.dst_port = (static_cast<uint16_t>(sctp_hdr[2]) << 8) | sctp_hdr[3];
+            offset += 12;
+            meta.payload_ptr = frame + offset;
+            meta.payload_len = static_cast<uint16_t>(len - offset);
+
+            if (meta.dst_port == 3868 || meta.src_port == 3868) {
+                out_type = TelcoFrameType::Diameter;
+            } else {
+                out_type = TelcoFrameType::Sctp;
+            }
+            return true;
+        }
+
+        if (proto == 6 && len >= offset + 20) { // TCP
+            const uint8_t* tcp_hdr = frame + offset;
+            meta.src_port = (static_cast<uint16_t>(tcp_hdr[0]) << 8) | tcp_hdr[1];
+            meta.dst_port = (static_cast<uint16_t>(tcp_hdr[2]) << 8) | tcp_hdr[3];
+            size_t tcp_hdr_len = ((tcp_hdr[12] >> 4) & 0x0F) * 4;
+            offset += tcp_hdr_len;
+            meta.payload_ptr = frame + offset;
+            meta.payload_len = static_cast<uint16_t>(len > offset ? len - offset : 0);
+
+            if (meta.dst_port == 3868 || meta.src_port == 3868) {
+                out_type = TelcoFrameType::Diameter;
+                return true;
+            }
+            if (meta.dst_port == 5060 || meta.src_port == 5060) {
+                out_type = TelcoFrameType::Sip;
+                return true;
+            }
+        }
+
         if (proto == 17 && len >= offset + 8) { // UDP
             const uint8_t* udp_hdr = frame + offset;
             meta.src_port = (static_cast<uint16_t>(udp_hdr[0]) << 8) | udp_hdr[1];
@@ -123,6 +158,17 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
             if (meta.dst_port == 8805 || meta.src_port == 8805) { // 3GPP PFCP
                 out_type = TelcoFrameType::Pfcp;
                 return true;
+            }
+            if (meta.dst_port == 5060 || meta.src_port == 5060) { // SIP
+                out_type = TelcoFrameType::Sip;
+                return true;
+            }
+            if ((meta.dst_port >= 10000 && meta.dst_port <= 20000) ||
+                (meta.src_port >= 10000 && meta.src_port <= 20000)) { // RTP Audio
+                if (meta.payload_len >= 12 && (meta.payload_ptr[0] >> 6) == 2) {
+                    out_type = TelcoFrameType::Rtp;
+                    return true;
+                }
             }
         }
 

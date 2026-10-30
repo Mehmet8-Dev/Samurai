@@ -19,6 +19,10 @@ enum class TelcoFrameType : uint8_t {
     Eapol = 8,
     Gtpu = 9,
     Pfcp = 10,
+    Sctp = 11,
+    Diameter = 12,
+    Sip = 13,
+    Rtp = 14,
     Ipv4Data = 20,
     Ipv6Data = 21
 };
@@ -34,7 +38,10 @@ public:
                type == TelcoFrameType::PppoeDiscovery ||
                type == TelcoFrameType::PppoeSession ||
                type == TelcoFrameType::Eapol ||
-               type == TelcoFrameType::Pfcp;
+               type == TelcoFrameType::Pfcp ||
+               type == TelcoFrameType::Sctp ||
+               type == TelcoFrameType::Diameter ||
+               type == TelcoFrameType::Sip;
     }
 
     // Nanometrik hizda calisan donanim/mbuf ayrıştırıcı
