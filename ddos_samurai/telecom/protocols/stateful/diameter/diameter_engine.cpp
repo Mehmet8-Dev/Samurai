@@ -715,6 +715,12 @@ bool DiameterEngine::ProcessDiameterPayload(TelcoSessionContext* session, const 
     uint32_t hop_id = ntohl(diam->hop_by_hop_id);
     uint32_t end_id = ntohl(diam->end_to_end_id);
 
+    // Decode incoming AVPs via Dynamic Dictionary
+    std::vector<DecodedAvp> rx_avps;
+    if (msg_len > sizeof(DiameterHeader)) {
+        dictionary_.DecodeAvps(payload + sizeof(DiameterHeader), msg_len - sizeof(DiameterHeader), rx_avps);
+    }
+
     // FSM Geçişleri
     if (cmd_code == CMD_CAPABILITIES_EXCHANGE) {
         if (!is_request) { // CEA alındı
@@ -750,7 +756,15 @@ bool DiameterEngine::ProcessDiameterPayload(TelcoSessionContext* session, const 
         if (!is_request) { // CCA alındı
             // Başarılı billing oturumu
         } else { // CCR alındı -> CCA üret
-            last_tx_frame_ = BuildCcaPacket(session, "session-samurai-01", RESULT_DIAMETER_SUCCESS, CcRequestType::INITIAL_REQUEST, 0, hop_id, end_id);
+            std::string session_id = "session-samurai-01";
+            CcRequestType req_type = CcRequestType::INITIAL_REQUEST;
+            uint32_t req_number = 0;
+            for (const auto& a : rx_avps) {
+                if (a.code == AVP_SESSION_ID) session_id = a.str_val;
+                if (a.code == AVP_CC_REQUEST_TYPE) req_type = static_cast<CcRequestType>(a.u32_val);
+                if (a.code == AVP_CC_REQUEST_NUMBER) req_number = a.u32_val;
+            }
+            last_tx_frame_ = BuildCcaPacket(session, session_id, RESULT_DIAMETER_SUCCESS, req_type, req_number, hop_id, end_id);
             session->tx_packets++;
             session->tx_bytes += last_tx_frame_.size();
         }
