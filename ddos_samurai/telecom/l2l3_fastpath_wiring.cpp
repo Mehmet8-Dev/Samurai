@@ -24,7 +24,8 @@ bool parse_mac_string(const std::string& mac_str, uint8_t out[6]) {
 bool L2L3FastpathWiring::DispatchRxControlFrame(
     const uint8_t* data, std::size_t len, uint64_t now_tsc) {
 
-  ControlFrameType type = ClassifyFrame(data, len);
+  uint16_t vlan_id = 0;
+  ControlFrameType type = ClassifyFrame(data, len, &vlan_id);
   last_out_packet_.clear();
 
   switch (type) {
@@ -34,12 +35,12 @@ bool L2L3FastpathWiring::DispatchRxControlFrame(
       if (l7_emu_native::l2l3::ArpEngine::parse_arp_packet(data, len, sender_ip, sender_mac, oper)) {
         arp_engine_.process_arp_reply(sender_ip, sender_mac);
 
-        // Lock-free tablosunu anında güncelle (Wait-free Okuma için)
+        // Lock-free tablosunu VLAN farkındalıklı güncelle (Wait-free Okuma için)
         uint32_t sender_ip_be = 0;
         inet_pton(AF_INET, sender_ip.c_str(), &sender_ip_be);
         uint8_t mac_bytes[6];
         if (parse_mac_string(sender_mac, mac_bytes)) {
-          lockfree_arp_.UpdateEntry(sender_ip_be, mac_bytes, 0, now_tsc);
+          lockfree_arp_.UpdateEntry(sender_ip_be, mac_bytes, vlan_id, now_tsc);
         }
         return true;
       }
@@ -53,7 +54,7 @@ bool L2L3FastpathWiring::DispatchRxControlFrame(
       if (l7_emu_native::l2l3::DhcpStateMachine::parse_dhcp_packet(data, len, xid, yiaddr, server_ip, msg_type)) {
         if (msg_type == 2) { // DHCPOFFER
           dhcp_engine_.process_offer(yiaddr, server_ip);
-          last_out_packet_ = dhcp_engine_.last_tx_packet();
+          EmitTxPacket(dhcp_engine_.last_tx_packet());
         } else if (msg_type == 5) { // DHCPACK
           dhcp_engine_.process_ack(yiaddr);
         }
@@ -67,12 +68,12 @@ bool L2L3FastpathWiring::DispatchRxControlFrame(
       if (l7_emu_native::l2l3::NdEngine::parse_neighbor_advertisement(data, len, sender_ip, sender_mac)) {
         nd_engine_.process_neighbor_advertisement(sender_ip, sender_mac);
 
-        // Lock-free IPv6 tablosunu güncelle
+        // Lock-free IPv6 tablosunu VLAN farkındalıklı güncelle
         uint8_t ip6_bytes[16];
         inet_pton(AF_INET6, sender_ip.c_str(), ip6_bytes);
         uint8_t mac_bytes[6];
         if (parse_mac_string(sender_mac, mac_bytes)) {
-          lockfree_nd_.UpdateEntry(ip6_bytes, mac_bytes, 0, now_tsc);
+          lockfree_nd_.UpdateEntry(ip6_bytes, mac_bytes, vlan_id, now_tsc);
         }
         return true;
       }
@@ -81,7 +82,7 @@ bool L2L3FastpathWiring::DispatchRxControlFrame(
 
     case ControlFrameType::Bfd: {
       if (bfd_engine_.process_rx_packet(data, len, now_tsc)) {
-        last_out_packet_ = bfd_engine_.last_tx_packet();
+        EmitTxPacket(bfd_engine_.last_tx_packet());
         return true;
       }
       return false;
@@ -98,8 +99,10 @@ bool L2L3FastpathWiring::DispatchRxControlFrame(
 
 void L2L3FastpathWiring::StepTimers(uint64_t now_tsc, uint64_t tsc_hz) {
   last_out_packet_.clear();
+
+  // BFD periyodik adımı
   if (bfd_engine_.step_timer(now_tsc, tsc_hz)) {
-    last_out_packet_ = bfd_engine_.last_tx_packet();
+    EmitTxPacket(bfd_engine_.last_tx_packet());
   }
 }
 
