@@ -122,6 +122,12 @@ target_include_directories(samurai_telco_worker PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../telecom
     ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/core
     ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/pppoe
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/dhcp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/bfd
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/mobile
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/sctp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/diameter
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/sip_rtp
     ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk)
 target_link_libraries(samurai_telco_worker PRIVATE
     samurai_telecom_static
