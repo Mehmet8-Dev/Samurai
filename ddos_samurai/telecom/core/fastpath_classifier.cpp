@@ -79,8 +79,29 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
     // IPv4
     if (ethertype == 0x0800 && len >= offset + 20) {
         const uint8_t* ip_hdr = frame + offset;
+        if ((ip_hdr[0] >> 4) != 4) return false;
+
         uint8_t ihl = (ip_hdr[0] & 0x0F) * 4;
         if (ihl < 20 || len < offset + ihl) return false;
+
+        size_t ip_start_offset = offset;
+        uint16_t total_len = (static_cast<uint16_t>(ip_hdr[2]) << 8) | ip_hdr[3];
+        if (total_len >= ihl && ip_start_offset + total_len <= len) {
+            // Frame uzunluğunu IP total_length ile sınırla (Ethernet trailer padding'i kaldır)
+            len = ip_start_offset + total_len;
+        }
+
+        // IPv4 Fragmentation Kontrolü (RFC 791)
+        uint16_t frag_field = (static_cast<uint16_t>(ip_hdr[6]) << 8) | ip_hdr[7];
+        uint16_t frag_offset = (frag_field & 0x1FFF) * 8;
+        if (frag_offset > 0) {
+            // İlk olmayan fragment; L4 başlığı içermez
+            out_type = TelcoFrameType::Ipv4Data;
+            offset += ihl;
+            meta.payload_ptr = frame + offset;
+            meta.payload_len = static_cast<uint16_t>(len - offset);
+            return true;
+        }
 
         uint8_t proto = ip_hdr[9];
         uint32_t src_ip = 0;
@@ -138,12 +159,17 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
 
         if (proto == 17 && len >= offset + 8) { // UDP
             const uint8_t* udp_hdr = frame + offset;
+            uint16_t udp_len = (static_cast<uint16_t>(udp_hdr[4]) << 8) | udp_hdr[5];
+            if (udp_len < 8) {
+                return false; // RFC 768 geçersiz UDP header boyutu
+            }
             meta.src_port = (static_cast<uint16_t>(udp_hdr[0]) << 8) | udp_hdr[1];
             meta.dst_port = (static_cast<uint16_t>(udp_hdr[2]) << 8) | udp_hdr[3];
             offset += 8;
 
             meta.payload_ptr = frame + offset;
-            meta.payload_len = static_cast<uint16_t>(len - offset);
+            size_t avail = (len >= offset) ? (len - offset) : 0;
+            meta.payload_len = static_cast<uint16_t>(std::min(static_cast<size_t>(udp_len - 8), avail));
 
             if (meta.dst_port == 67 || meta.dst_port == 68 || meta.src_port == 67 || meta.src_port == 68) {
                 out_type = TelcoFrameType::Dhcp;
@@ -183,8 +209,39 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
     // IPv6
     if (ethertype == 0x86DD && len >= offset + 40) {
         const uint8_t* ip6_hdr = frame + offset;
+        if ((ip6_hdr[0] >> 4) != 6) return false;
+
         uint8_t next_header = ip6_hdr[6];
         offset += 40;
+
+        // IPv6 Extension Headers traversal (RFC 8200)
+        while (offset < len) {
+            if (next_header == 0 || next_header == 43 || next_header == 60) {
+                // Hop-by-Hop (0), Routing (43), Destination Options (60)
+                if (len < offset + 2) break;
+                uint8_t nxt = frame[offset];
+                size_t ext_len = (static_cast<size_t>(frame[offset + 1]) + 1) * 8;
+                if (len < offset + ext_len) break;
+                next_header = nxt;
+                offset += ext_len;
+            } else if (next_header == 44) {
+                // Fragment Header (RFC 8200 §4.5) - 8 bayt
+                if (len < offset + 8) break;
+                uint8_t nxt = frame[offset];
+                uint16_t frag_off = (static_cast<uint16_t>(frame[offset + 2]) << 8) | frame[offset + 3];
+                frag_off &= 0xFFF8;
+                offset += 8;
+                next_header = nxt;
+                if (frag_off > 0) {
+                    out_type = TelcoFrameType::Ipv6Data;
+                    meta.payload_ptr = frame + offset;
+                    meta.payload_len = static_cast<uint16_t>(len - offset);
+                    return true;
+                }
+            } else {
+                break;
+            }
+        }
 
         meta.payload_ptr = frame + offset;
         meta.payload_len = static_cast<uint16_t>(len - offset);
@@ -195,11 +252,16 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
         }
         if (next_header == 17 && len >= offset + 8) { // UDP
             const uint8_t* udp_hdr = frame + offset;
+            uint16_t udp_len = (static_cast<uint16_t>(udp_hdr[4]) << 8) | udp_hdr[5];
+            if (udp_len < 8) {
+                return false;
+            }
             meta.src_port = (static_cast<uint16_t>(udp_hdr[0]) << 8) | udp_hdr[1];
             meta.dst_port = (static_cast<uint16_t>(udp_hdr[2]) << 8) | udp_hdr[3];
             offset += 8;
             meta.payload_ptr = frame + offset;
-            meta.payload_len = static_cast<uint16_t>(len - offset);
+            size_t avail = (len >= offset) ? (len - offset) : 0;
+            meta.payload_len = static_cast<uint16_t>(std::min(static_cast<size_t>(udp_len - 8), avail));
 
             if (meta.dst_port == 546 || meta.dst_port == 547) {
                 out_type = TelcoFrameType::Dhcp;
