@@ -114,10 +114,12 @@ bool SrtpEngine::ProtectRtp(const uint8_t* rtp_header,
         session_ctx_.s_l = seq;
         session_ctx_.roc = 0;
     } else {
-        if (seq < session_ctx_.s_l) {
+        if (session_ctx_.s_l > 32768 && seq < 32768 && (session_ctx_.s_l - seq > 32768)) {
             session_ctx_.roc++;
         }
-        session_ctx_.s_l = seq;
+        if (seq > session_ctx_.s_l || (session_ctx_.s_l > 32768 && seq < 32768)) {
+            session_ctx_.s_l = seq;
+        }
     }
 
     uint64_t packet_index = (static_cast<uint64_t>(session_ctx_.roc) << 16) | seq;
@@ -162,10 +164,12 @@ bool SrtpEngine::ProtectRtpInPlace(uint8_t* packet_buf, size_t rtp_header_len, s
         session_ctx_.s_l = seq;
         session_ctx_.roc = 0;
     } else {
-        if (seq < session_ctx_.s_l) {
+        if (session_ctx_.s_l > 32768 && seq < 32768 && (session_ctx_.s_l - seq > 32768)) {
             session_ctx_.roc++;
         }
-        session_ctx_.s_l = seq;
+        if (seq > session_ctx_.s_l || (session_ctx_.s_l > 32768 && seq < 32768)) {
+            session_ctx_.s_l = seq;
+        }
     }
 
     uint64_t packet_index = (static_cast<uint64_t>(session_ctx_.roc) << 16) | seq;
