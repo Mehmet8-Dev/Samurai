@@ -400,6 +400,98 @@ void TestDiameterDictionaryJsonLoader() {
     std::cout << "  -> JSON schema loader for custom AVPs & Commands: PASSED" << std::endl;
 }
 
+void TestDiameterDynamicGroupedAvpCodec() {
+    std::cout << "[TEST] 8. Diameter Dynamic Grouped & Primitive AVP Codec..." << std::endl;
+
+    DiameterDictionary dict;
+
+    // 1. Primitive Roundtrip: UTF8_STRING with padding
+    {
+        auto avp_str = DecodedAvp::CreateString(264, "diameter.ims.mnc001.mcc001.3gppnetwork.org");
+        std::vector<uint8_t> buf;
+        bool ok = dict.EncodeAvp(avp_str, buf);
+        assert(ok);
+        assert(buf.size() % 4 == 0);
+
+        DecodedAvp decoded;
+        size_t consumed = 0;
+        ok = dict.DecodeAvp(buf.data(), buf.size(), decoded, consumed);
+        assert(ok);
+        assert(consumed == buf.size());
+        assert(decoded.code == 264);
+        assert(decoded.str_val == "diameter.ims.mnc001.mcc001.3gppnetwork.org");
+    }
+
+    // 2. Primitive Roundtrip: UNSIGNED64, INTEGER64, FLOAT32, FLOAT64, TIME, ADDRESS
+    {
+        std::vector<uint8_t> buf;
+
+        // U64
+        auto avp_u64 = DecodedAvp::CreateU64(421, 9876543210123456ULL);
+        assert(dict.EncodeAvp(avp_u64, buf));
+
+        // Address (IPv4: 192.168.10.55 = 0xC0A80A37)
+        auto avp_ip = DecodedAvp::CreateAddressIpv4(8, 0xC0A80A37);
+        assert(dict.EncodeAvp(avp_ip, buf));
+
+        // Decode multi-AVP sequence
+        std::vector<DecodedAvp> decoded_list;
+        assert(dict.DecodeAvps(buf.data(), buf.size(), decoded_list));
+        assert(decoded_list.size() == 2);
+        assert(decoded_list[0].code == 421 && decoded_list[0].u64_val == 9876543210123456ULL);
+        assert(decoded_list[1].code == 8 && decoded_list[1].ipv4_val == 0xC0A80A37);
+    }
+
+    // 3. Recursive Grouped AVP: MSCC -> Rating-Group + (Used-Service-Unit -> CC-Total-Octets)
+    {
+        auto rating_group = DecodedAvp::CreateU32(432, 500, AVP_FLAG_MANDATORY | AVP_FLAG_VENDOR, 10415);
+        auto cc_total_octets = DecodedAvp::CreateU64(421, 52428800ULL);
+
+        std::vector<DecodedAvp> usu_children;
+        usu_children.push_back(cc_total_octets);
+        auto usu = DecodedAvp::CreateGrouped(446, usu_children);
+
+        std::vector<DecodedAvp> mscc_children;
+        mscc_children.push_back(rating_group);
+        mscc_children.push_back(usu);
+        auto mscc = DecodedAvp::CreateGrouped(456, mscc_children);
+
+        std::vector<uint8_t> mscc_buf;
+        bool ok = dict.EncodeAvp(mscc, mscc_buf);
+        assert(ok);
+        assert(mscc_buf.size() % 4 == 0);
+
+        DecodedAvp mscc_decoded;
+        size_t consumed = 0;
+        ok = dict.DecodeAvp(mscc_buf.data(), mscc_buf.size(), mscc_decoded, consumed);
+        assert(ok);
+        assert(consumed == mscc_buf.size());
+        assert(mscc_decoded.code == 456);
+        assert(mscc_decoded.type == AvpDataType::GROUPED);
+        assert(mscc_decoded.grouped_val.size() == 2);
+
+        // Child 1: Rating-Group
+        const auto& c1 = mscc_decoded.grouped_val[0];
+        assert(c1.code == 432);
+        assert(c1.vendor_id == 10415);
+        assert(c1.flags & AVP_FLAG_VENDOR);
+        assert(c1.u32_val == 500);
+
+        // Child 2: Used-Service-Unit
+        const auto& c2 = mscc_decoded.grouped_val[1];
+        assert(c2.code == 446);
+        assert(c2.type == AvpDataType::GROUPED);
+        assert(c2.grouped_val.size() == 1);
+
+        // Grandchild: CC-Total-Octets
+        const auto& gc = c2.grouped_val[0];
+        assert(gc.code == 421);
+        assert(gc.u64_val == 52428800ULL);
+    }
+
+    std::cout << "  -> Recursive Grouped and Primitive AVP Codec with RFC 6733 padding: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "       SAMURAI DIAMETER (RFC 6733 / 3GPP) VERIFICATION SUITE     " << std::endl;
@@ -412,6 +504,7 @@ int main() {
     TestDiameterDisconnectPeer();
     TestDiameterDictionaryBuiltinSchema();
     TestDiameterDictionaryJsonLoader();
+    TestDiameterDynamicGroupedAvpCodec();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL DIAMETER ENGINE TESTS PASSED SUCCESSFULLY! (100% VERIFIED) " << std::endl;

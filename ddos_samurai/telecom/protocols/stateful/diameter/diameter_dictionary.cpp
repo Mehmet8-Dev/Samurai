@@ -520,12 +520,167 @@ bool DiameterDictionary::EncodeAvp(const DecodedAvp& avp, std::vector<uint8_t>& 
     return true;
 }
 
-bool DiameterDictionary::DecodeAvp(const uint8_t* /*data*/, size_t /*len*/, DecodedAvp& /*out_avp*/, size_t& /*bytes_consumed*/) const {
-    return false;
+bool DiameterDictionary::DecodeAvp(const uint8_t* data, size_t len, DecodedAvp& out_avp, size_t& bytes_consumed) const {
+    if (!data || len < 8) {
+        return false;
+    }
+
+    uint32_t code_be;
+    std::memcpy(&code_be, data, 4);
+    uint32_t avp_code = ntohl(code_be);
+
+    uint8_t flags = data[4];
+    uint32_t avp_len = (static_cast<uint32_t>(data[5]) << 16) |
+                       (static_cast<uint32_t>(data[6]) << 8) |
+                       static_cast<uint32_t>(data[7]);
+
+    bool has_vendor = (flags & AVP_FLAG_VENDOR) != 0;
+    size_t header_len = has_vendor ? 12 : 8;
+
+    if (avp_len < header_len || len < header_len) {
+        return false;
+    }
+
+    uint32_t vendor_id = 0;
+    if (has_vendor) {
+        uint32_t vendor_be;
+        std::memcpy(&vendor_be, data + 8, 4);
+        vendor_id = ntohl(vendor_be);
+    }
+
+    if (len < avp_len) {
+        return false;
+    }
+
+    size_t padded_len = (avp_len + 3) & ~3;
+    if (len < padded_len) {
+        return false;
+    }
+
+    out_avp.code = avp_code;
+    out_avp.flags = flags;
+    out_avp.vendor_id = vendor_id;
+
+    // Determine type from dictionary if available
+    const AvpDefinition* def = FindAvp(avp_code, vendor_id);
+    if (def) {
+        out_avp.type = def->type;
+    } else {
+        out_avp.type = AvpDataType::OCTET_STRING;
+    }
+
+    size_t payload_len = avp_len - header_len;
+    const uint8_t* payload_data = data + header_len;
+
+    switch (out_avp.type) {
+        case AvpDataType::OCTET_STRING:
+            out_avp.octet_string_val.assign(payload_data, payload_data + payload_len);
+            break;
+        case AvpDataType::UTF8_STRING:
+            out_avp.str_val.assign(reinterpret_cast<const char*>(payload_data), payload_len);
+            break;
+        case AvpDataType::INTEGER32: {
+            if (payload_len < 4) return false;
+            uint32_t val_be;
+            std::memcpy(&val_be, payload_data, 4);
+            out_avp.i32_val = static_cast<int32_t>(ntohl(val_be));
+            break;
+        }
+        case AvpDataType::UNSIGNED32: {
+            if (payload_len < 4) return false;
+            uint32_t val_be;
+            std::memcpy(&val_be, payload_data, 4);
+            out_avp.u32_val = ntohl(val_be);
+            break;
+        }
+        case AvpDataType::INTEGER64: {
+            if (payload_len < 8) return false;
+            uint64_t val_be;
+            std::memcpy(&val_be, payload_data, 8);
+            out_avp.i64_val = static_cast<int64_t>(be64toh(val_be));
+            break;
+        }
+        case AvpDataType::UNSIGNED64: {
+            if (payload_len < 8) return false;
+            uint64_t val_be;
+            std::memcpy(&val_be, payload_data, 8);
+            out_avp.u64_val = be64toh(val_be);
+            break;
+        }
+        case AvpDataType::FLOAT32: {
+            if (payload_len < 4) return false;
+            uint32_t bits;
+            std::memcpy(&bits, payload_data, 4);
+            bits = ntohl(bits);
+            std::memcpy(&out_avp.f32_val, &bits, 4);
+            break;
+        }
+        case AvpDataType::FLOAT64: {
+            if (payload_len < 8) return false;
+            uint64_t bits;
+            std::memcpy(&bits, payload_data, 8);
+            bits = be64toh(bits);
+            std::memcpy(&out_avp.f64_val, &bits, 8);
+            break;
+        }
+        case AvpDataType::ADDRESS: {
+            if (payload_len >= 6) {
+                uint16_t fam;
+                std::memcpy(&fam, payload_data, 2);
+                fam = ntohs(fam);
+                if (fam == 1) { // IPv4
+                    uint32_t ip;
+                    std::memcpy(&ip, payload_data + 2, 4);
+                    out_avp.ipv4_val = ntohl(ip);
+                }
+            } else if (payload_len == 4) {
+                uint32_t ip;
+                std::memcpy(&ip, payload_data, 4);
+                out_avp.ipv4_val = ntohl(ip);
+            }
+            break;
+        }
+        case AvpDataType::TIME: {
+            if (payload_len < 4) return false;
+            uint32_t val_be;
+            std::memcpy(&val_be, payload_data, 4);
+            out_avp.time_val = ntohl(val_be);
+            break;
+        }
+        case AvpDataType::GROUPED: {
+            size_t inner_offset = 0;
+            while (inner_offset < payload_len) {
+                DecodedAvp child_avp;
+                size_t child_consumed = 0;
+                if (!DecodeAvp(payload_data + inner_offset, payload_len - inner_offset, child_avp, child_consumed)) {
+                    return false;
+                }
+                if (child_consumed == 0) return false;
+                out_avp.grouped_val.push_back(std::move(child_avp));
+                inner_offset += child_consumed;
+            }
+            break;
+        }
+    }
+
+    bytes_consumed = padded_len;
+    return true;
 }
 
-bool DiameterDictionary::DecodeAvps(const uint8_t* /*data*/, size_t /*len*/, std::vector<DecodedAvp>& /*out_avps*/) const {
-    return false;
+bool DiameterDictionary::DecodeAvps(const uint8_t* data, size_t len, std::vector<DecodedAvp>& out_avps) const {
+    if (!data || len == 0) return true;
+    size_t offset = 0;
+    while (offset < len) {
+        DecodedAvp avp;
+        size_t consumed = 0;
+        if (!DecodeAvp(data + offset, len - offset, avp, consumed)) {
+            return false;
+        }
+        if (consumed == 0) return false;
+        out_avps.push_back(std::move(avp));
+        offset += consumed;
+    }
+    return offset == len;
 }
 
 bool DiameterDictionary::ValidateAvp(const DecodedAvp& /*avp*/, std::string& /*err*/) const {
