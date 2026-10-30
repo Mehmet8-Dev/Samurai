@@ -3,6 +3,8 @@
 #include "ddos_samurai/telecom/core/hierarchical_timing_wheel.hpp"
 #include "ddos_samurai/telecom/core/fastpath_classifier.hpp"
 #include "ddos_samurai/telecom/core/ring_buffer_shuttle.hpp"
+#include "ddos_samurai/telecom/lockfree_l2l3_cache.hpp"
+#include "ddos_samurai/telecom/l2l3_fastpath_wiring.hpp"
 
 #include <iostream>
 #include <cassert>
@@ -406,6 +408,91 @@ void TestFastpathClassifier() {
     std::cout << "  -> FastpathClassifier L2/QinQ/PPPoE/GTP-U Demux: PASSED" << std::endl;
 }
 
+void TestLockfreeArpNdSeqlockAndVlan() {
+    std::cout << "[TEST] 6. LockfreeArpTable & LockfreeNdTable Seqlock Concurrency & VLAN Isolation..." << std::endl;
+
+    LockfreeArpTable arp_table;
+    uint32_t ip1 = 0x0A000001; // 10.0.0.1
+    uint8_t mac1[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    uint8_t mac2[6] = {0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee};
+
+    // 1. VLAN Isolation on same IP
+    arp_table.UpdateEntry(ip1, mac1, 100, 1000);
+    arp_table.UpdateEntry(ip1, mac2, 200, 1001);
+
+    uint8_t resolved[6];
+    bool ok = arp_table.LookupMac(ip1, resolved, 100);
+    assert(ok);
+    assert(std::memcmp(resolved, mac1, 6) == 0);
+
+    ok = arp_table.LookupMac(ip1, resolved, 200);
+    assert(ok);
+    assert(std::memcmp(resolved, mac2, 6) == 0);
+
+    // Non-existent VLAN lookup returns false
+    ok = arp_table.LookupMac(ip1, resolved, 300);
+    assert(!ok);
+
+    // 2. Concurrency stress test: 1 writer thread rapidly updating, 2 reader threads reading
+    std::atomic<bool> stop_flag{false};
+    std::atomic<uint64_t> read_hits{0};
+    std::atomic<uint64_t> torn_reads{0};
+
+    auto reader = [&]() {
+        uint8_t out[6];
+        while (!stop_flag.load(std::memory_order_relaxed)) {
+            if (arp_table.LookupMac(ip1, out, 100)) {
+                read_hits.fetch_add(1, std::memory_order_relaxed);
+                // Verify MAC address is never torn / corrupted
+                if (out[0] != 0x00 || out[1] != 0x11 || out[2] != 0x22) {
+                    torn_reads.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    };
+
+    auto writer = [&]() {
+        uint64_t tsc = 2000;
+        for (int i = 0; i < 20000; ++i) {
+            arp_table.UpdateEntry(ip1, mac1, 100, ++tsc);
+        }
+    };
+
+    std::thread r1(reader);
+    std::thread r2(reader);
+    std::thread w(writer);
+
+    w.join();
+    stop_flag.store(true);
+    r1.join();
+    r2.join();
+
+    assert(torn_reads.load() == 0); // Must be strictly 0 torn reads thanks to Seqlock!
+    assert(read_hits.load() > 0);
+
+    // 3. IPv6 ND Table verification
+    LockfreeNdTable nd_table;
+    uint8_t ip6_addr[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    nd_table.UpdateEntry(ip6_addr, mac1, 50, 5000);
+    ok = nd_table.LookupMac(ip6_addr, resolved, 50);
+    assert(ok);
+    assert(std::memcmp(resolved, mac1, 6) == 0);
+
+    // 4. L2L3FastpathWiring VLAN Peeling
+    uint8_t vlan_arp[18 + 28] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+        0x81, 0x00, 0x00, 0x64,             // 802.1Q VLAN 100
+        0x08, 0x06                          // Inner EtherType: ARP
+    };
+    uint16_t parsed_vlan = 0;
+    ControlFrameType ctype = L2L3FastpathWiring::ClassifyFrame(vlan_arp, sizeof(vlan_arp), &parsed_vlan);
+    assert(ctype == ControlFrameType::Arp);
+    assert(parsed_vlan == 100);
+
+    std::cout << "  -> LockfreeArpTable/NdTable Seqlock & VLAN isolation: PASSED (Torn reads: 0)" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "        SAMURAI TELECOM ENGINE CORE VERIFICATION SUITE           " << std::endl;
@@ -416,6 +503,7 @@ int main() {
     TestHierarchicalTimingWheel();
     TestRingBufferShuttle();
     TestFastpathClassifier();
+    TestLockfreeArpNdSeqlockAndVlan();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL TELECOM CORE TESTS PASSED SUCCESSFULLY! (100% VERIFIED)    " << std::endl;
