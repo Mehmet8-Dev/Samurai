@@ -80,7 +80,7 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
     if (ethertype == 0x0800 && len >= offset + 20) {
         const uint8_t* ip_hdr = frame + offset;
         uint8_t ihl = (ip_hdr[0] & 0x0F) * 4;
-        if (len < offset + ihl) return false;
+        if (ihl < 20 || len < offset + ihl) return false;
 
         uint8_t proto = ip_hdr[9];
         uint32_t src_ip = 0;
@@ -120,17 +120,19 @@ bool FastpathClassifier::Classify(const uint8_t* frame, size_t len,
             meta.src_port = (static_cast<uint16_t>(tcp_hdr[0]) << 8) | tcp_hdr[1];
             meta.dst_port = (static_cast<uint16_t>(tcp_hdr[2]) << 8) | tcp_hdr[3];
             size_t tcp_hdr_len = ((tcp_hdr[12] >> 4) & 0x0F) * 4;
-            offset += tcp_hdr_len;
-            meta.payload_ptr = frame + offset;
-            meta.payload_len = static_cast<uint16_t>(len > offset ? len - offset : 0);
+            if (tcp_hdr_len >= 20 && len >= offset + tcp_hdr_len) {
+                offset += tcp_hdr_len;
+                meta.payload_ptr = frame + offset;
+                meta.payload_len = static_cast<uint16_t>(len - offset);
 
-            if (meta.dst_port == 3868 || meta.src_port == 3868) {
-                out_type = TelcoFrameType::Diameter;
-                return true;
-            }
-            if (meta.dst_port == 5060 || meta.src_port == 5060) {
-                out_type = TelcoFrameType::Sip;
-                return true;
+                if (meta.dst_port == 3868 || meta.src_port == 3868) {
+                    out_type = TelcoFrameType::Diameter;
+                    return true;
+                }
+                if (meta.dst_port == 5060 || meta.src_port == 5060) {
+                    out_type = TelcoFrameType::Sip;
+                    return true;
+                }
             }
         }
 

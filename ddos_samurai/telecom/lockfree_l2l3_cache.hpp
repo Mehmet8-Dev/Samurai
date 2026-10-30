@@ -74,7 +74,10 @@ class alignas(64) LockfreeArpTable {
             return true;
           }
         } else {
-          break; // Bu slot eşleşmiyor
+          uint32_t s2 = entry.seq.load(std::memory_order_acquire);
+          if (s1 == s2 && (s1 & 1) == 0) {
+            break; // Bu slot gerçekten eşleşmiyor
+          }
         }
       }
     }
@@ -213,7 +216,10 @@ class alignas(64) LockfreeNdTable {
             return true;
           }
         } else {
-          break;
+          uint32_t s2 = entry.seq.load(std::memory_order_acquire);
+          if (s1 == s2 && (s1 & 1) == 0) {
+            break; // Bu slot gerçekten eşleşmiyor
+          }
         }
       }
     }
