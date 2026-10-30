@@ -135,6 +135,18 @@ public:
                                               uint32_t new_cumulative_tsn, 
                                               const std::vector<std::pair<uint16_t, uint16_t>>& abandoned_streams = {});
 
+    // ASCONF Dinamik Adres Yeniden Yapılandırma (RFC 5061)
+    std::vector<uint8_t> BuildAsconfPacket(TelcoSessionContext* session, 
+                                          uint16_t param_type, 
+                                          uint32_t ip_address, 
+                                          uint32_t correlation_id);
+    std::vector<uint8_t> BuildAsconfAddIpPacket(TelcoSessionContext* session, uint32_t new_ip, uint32_t correlation_id = 1);
+    std::vector<uint8_t> BuildAsconfDeleteIpPacket(TelcoSessionContext* session, uint32_t del_ip, uint32_t correlation_id = 2);
+    std::vector<uint8_t> BuildAsconfSetPrimaryIpPacket(TelcoSessionContext* session, uint32_t primary_ip, uint32_t correlation_id = 3);
+    std::vector<uint8_t> BuildAsconfAckPacket(TelcoSessionContext* session, 
+                                             uint32_t serial_number, 
+                                             const std::vector<uint32_t>& correlation_ids);
+
     // Donanım Hızlandırmalı CRC32c Hesaplama (RFC 4960 Castagnoli 0x1EDC6F41)
     static uint32_t ComputeCrc32c(const uint8_t* data, size_t len) noexcept;
 

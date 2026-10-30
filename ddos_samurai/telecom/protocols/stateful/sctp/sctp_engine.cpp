@@ -1143,6 +1143,148 @@ std::vector<uint8_t> SctpEngine::CheckTimedReliability(TelcoSessionContext* sess
     return {};
 }
 
+std::vector<uint8_t> SctpEngine::BuildAsconfPacket(TelcoSessionContext* session, 
+                                                  uint16_t param_type, 
+                                                  uint32_t ip_address, 
+                                                  uint32_t correlation_id) {
+    if (!session) return {};
+
+    auto& state = GetAssocState(session);
+    uint32_t serial = state.asconf_serial++;
+
+    size_t chunk_len = sizeof(SctpChunkHeader) + sizeof(SctpAsconfChunkBody) + 
+                       sizeof(SctpIpv4AddressParam) + sizeof(SctpAsconfAddressParam);
+    size_t padded_chunk_len = (chunk_len + 3) & ~3;
+    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(SctpCommonHeader) + padded_chunk_len;
+    std::vector<uint8_t> packet(total_len, 0);
+
+    auto* eth = reinterpret_cast<EthHeader*>(packet.data());
+    std::memcpy(eth->dst_mac, session->peer_mac, 6);
+    std::memcpy(eth->src_mac, session->client_mac, 6);
+    eth->ethertype = htons(0x0800);
+
+    auto* ip = reinterpret_cast<Ipv4Header*>(packet.data() + sizeof(EthHeader));
+    ip->ihl_version = 0x45;
+    ip->total_length = htons(static_cast<uint16_t>(total_len - sizeof(EthHeader)));
+    ip->ttl = 64;
+    ip->protocol = IP_PROTO_SCTP;
+    ip->src_ip = htonl(session->client_ip);
+    ip->dst_ip = htonl(session->peer_ip);
+    ip->checksum = ComputeIpChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
+
+    size_t sctp_offset = sizeof(EthHeader) + sizeof(Ipv4Header);
+    auto* sctp = reinterpret_cast<SctpCommonHeader*>(packet.data() + sctp_offset);
+    sctp->src_port = htons(session->client_port);
+    sctp->dst_port = htons(session->peer_port);
+    sctp->verification_tag = htonl(session->ppp_magic_number);
+    sctp->checksum = 0;
+
+    auto* chunk = reinterpret_cast<SctpChunkHeader*>(packet.data() + sctp_offset + sizeof(SctpCommonHeader));
+    chunk->type = static_cast<uint8_t>(SctpChunkType::ASCONF);
+    chunk->flags = 0;
+    chunk->length = htons(static_cast<uint16_t>(chunk_len));
+
+    size_t body_offset = sctp_offset + sizeof(SctpCommonHeader) + sizeof(SctpChunkHeader);
+    auto* asconf_body = reinterpret_cast<SctpAsconfChunkBody*>(packet.data() + body_offset);
+    asconf_body->serial_number = htonl(serial);
+
+    size_t addr_offset = body_offset + sizeof(SctpAsconfChunkBody);
+    auto* lookup_addr = reinterpret_cast<SctpIpv4AddressParam*>(packet.data() + addr_offset);
+    lookup_addr->type = htons(SCTP_ASCONF_PARAM_IPV4);
+    lookup_addr->length = htons(sizeof(SctpIpv4AddressParam));
+    lookup_addr->ipv4_address = htonl(session->client_ip);
+
+    size_t param_offset = addr_offset + sizeof(SctpIpv4AddressParam);
+    auto* asconf_param = reinterpret_cast<SctpAsconfAddressParam*>(packet.data() + param_offset);
+    asconf_param->type = htons(param_type);
+    asconf_param->length = htons(sizeof(SctpAsconfAddressParam));
+    asconf_param->correlation_id = htonl(correlation_id);
+    asconf_param->addr.type = htons(SCTP_ASCONF_PARAM_IPV4);
+    asconf_param->addr.length = htons(sizeof(SctpIpv4AddressParam));
+    asconf_param->addr.ipv4_address = htonl(ip_address);
+
+    uint32_t crc = ComputeCrc32c(packet.data() + sctp_offset, total_len - sctp_offset);
+    std::memcpy(&sctp->checksum, &crc, 4);
+
+    last_tx_frame_ = packet;
+    session->tx_packets++;
+    session->tx_bytes += packet.size();
+
+    return packet;
+}
+
+std::vector<uint8_t> SctpEngine::BuildAsconfAddIpPacket(TelcoSessionContext* session, uint32_t new_ip, uint32_t correlation_id) {
+    return BuildAsconfPacket(session, SCTP_ASCONF_PARAM_ADD_IP, new_ip, correlation_id);
+}
+
+std::vector<uint8_t> SctpEngine::BuildAsconfDeleteIpPacket(TelcoSessionContext* session, uint32_t del_ip, uint32_t correlation_id) {
+    return BuildAsconfPacket(session, SCTP_ASCONF_PARAM_DEL_IP, del_ip, correlation_id);
+}
+
+std::vector<uint8_t> SctpEngine::BuildAsconfSetPrimaryIpPacket(TelcoSessionContext* session, uint32_t primary_ip, uint32_t correlation_id) {
+    return BuildAsconfPacket(session, SCTP_ASCONF_PARAM_SET_PRIMARY, primary_ip, correlation_id);
+}
+
+std::vector<uint8_t> SctpEngine::BuildAsconfAckPacket(TelcoSessionContext* session, 
+                                                     uint32_t serial_number, 
+                                                     const std::vector<uint32_t>& correlation_ids) {
+    if (!session) return {};
+
+    size_t params_len = correlation_ids.size() * sizeof(SctpAsconfSuccessParam);
+    size_t chunk_len = sizeof(SctpChunkHeader) + sizeof(SctpAsconfAckChunkBody) + params_len;
+    size_t padded_chunk_len = (chunk_len + 3) & ~3;
+    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(SctpCommonHeader) + padded_chunk_len;
+    std::vector<uint8_t> packet(total_len, 0);
+
+    auto* eth = reinterpret_cast<EthHeader*>(packet.data());
+    std::memcpy(eth->dst_mac, session->peer_mac, 6);
+    std::memcpy(eth->src_mac, session->client_mac, 6);
+    eth->ethertype = htons(0x0800);
+
+    auto* ip = reinterpret_cast<Ipv4Header*>(packet.data() + sizeof(EthHeader));
+    ip->ihl_version = 0x45;
+    ip->total_length = htons(static_cast<uint16_t>(total_len - sizeof(EthHeader)));
+    ip->ttl = 64;
+    ip->protocol = IP_PROTO_SCTP;
+    ip->src_ip = htonl(session->client_ip);
+    ip->dst_ip = htonl(session->peer_ip);
+    ip->checksum = ComputeIpChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
+
+    size_t sctp_offset = sizeof(EthHeader) + sizeof(Ipv4Header);
+    auto* sctp = reinterpret_cast<SctpCommonHeader*>(packet.data() + sctp_offset);
+    sctp->src_port = htons(session->client_port);
+    sctp->dst_port = htons(session->peer_port);
+    sctp->verification_tag = htonl(session->ppp_magic_number);
+    sctp->checksum = 0;
+
+    auto* chunk = reinterpret_cast<SctpChunkHeader*>(packet.data() + sctp_offset + sizeof(SctpCommonHeader));
+    chunk->type = static_cast<uint8_t>(SctpChunkType::ASCONF_ACK);
+    chunk->flags = 0;
+    chunk->length = htons(static_cast<uint16_t>(chunk_len));
+
+    size_t body_offset = sctp_offset + sizeof(SctpCommonHeader) + sizeof(SctpChunkHeader);
+    auto* ack_body = reinterpret_cast<SctpAsconfAckChunkBody*>(packet.data() + body_offset);
+    ack_body->serial_number = htonl(serial_number);
+
+    uint8_t* p_ptr = packet.data() + body_offset + sizeof(SctpAsconfAckChunkBody);
+    for (uint32_t cid : correlation_ids) {
+        auto* succ = reinterpret_cast<SctpAsconfSuccessParam*>(p_ptr);
+        succ->type = htons(SCTP_ASCONF_PARAM_SUCCESS);
+        succ->length = htons(sizeof(SctpAsconfSuccessParam));
+        succ->correlation_id = htonl(cid);
+        p_ptr += sizeof(SctpAsconfSuccessParam);
+    }
+
+    uint32_t crc = ComputeCrc32c(packet.data() + sctp_offset, total_len - sctp_offset);
+    std::memcpy(&sctp->checksum, &crc, 4);
+
+    last_tx_frame_ = packet;
+    session->tx_packets++;
+    session->tx_bytes += packet.size();
+
+    return packet;
+}
+
 bool SctpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, uint64_t now_tsc) {
     size_t min_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(SctpCommonHeader);
     if (!frame || len < min_len) return false;
@@ -1391,6 +1533,62 @@ bool SctpEngine::ParseAndProcessChunks(TelcoSessionContext* session, const uint8
 
                     // RFC 3758 §3.5: FORWARD_TSN işlendiğinde hemen güncel SACK üret
                     last_tx_frame_ = BuildSackPacket(session, session->teid_downlink);
+                    session->tx_packets++;
+                    session->tx_bytes += last_tx_frame_.size();
+                }
+                break;
+            }
+
+            case SctpChunkType::ASCONF: {
+                if (body_len >= sizeof(SctpAsconfChunkBody)) {
+                    const auto* asconf_body = reinterpret_cast<const SctpAsconfChunkBody*>(chunk_body);
+                    uint32_t serial = ntohl(asconf_body->serial_number);
+
+                    std::vector<uint32_t> success_correlations;
+                    size_t p_offset = sizeof(SctpAsconfChunkBody);
+
+                    // Adres parametresini kontrol et ve atla (RFC 5061)
+                    if (p_offset + sizeof(SctpAsconfParamHeader) <= body_len) {
+                        const auto* p_hdr = reinterpret_cast<const SctpAsconfParamHeader*>(chunk_body + p_offset);
+                        uint16_t p_type = ntohs(p_hdr->type);
+                        uint16_t p_len = ntohs(p_hdr->length);
+                        if (p_type == SCTP_ASCONF_PARAM_IPV4 && p_len <= body_len - p_offset) {
+                            p_offset += (p_len + 3) & ~3;
+                        }
+                    }
+
+                    // TLV parametrelerini işle (Add IP, Del IP, Set Primary IP)
+                    while (p_offset + sizeof(SctpAsconfParamHeader) <= body_len) {
+                        const auto* p_hdr = reinterpret_cast<const SctpAsconfParamHeader*>(chunk_body + p_offset);
+                        uint16_t p_type = ntohs(p_hdr->type);
+                        uint16_t p_len = ntohs(p_hdr->length);
+                        if (p_len < sizeof(SctpAsconfParamHeader) || p_offset + p_len > body_len) break;
+
+                        if (p_type == SCTP_ASCONF_PARAM_ADD_IP && p_len >= sizeof(SctpAsconfAddressParam)) {
+                            const auto* a_param = reinterpret_cast<const SctpAsconfAddressParam*>(chunk_body + p_offset);
+                            uint32_t ip = ntohl(a_param->addr.ipv4_address);
+                            uint32_t cid = ntohl(a_param->correlation_id);
+                            AddPath(session, ip, false);
+                            success_correlations.push_back(cid);
+                        } else if (p_type == SCTP_ASCONF_PARAM_DEL_IP && p_len >= sizeof(SctpAsconfAddressParam)) {
+                            const auto* a_param = reinterpret_cast<const SctpAsconfAddressParam*>(chunk_body + p_offset);
+                            uint32_t ip = ntohl(a_param->addr.ipv4_address);
+                            uint32_t cid = ntohl(a_param->correlation_id);
+                            RemovePath(session, ip);
+                            success_correlations.push_back(cid);
+                        } else if (p_type == SCTP_ASCONF_PARAM_SET_PRIMARY && p_len >= sizeof(SctpAsconfAddressParam)) {
+                            const auto* a_param = reinterpret_cast<const SctpAsconfAddressParam*>(chunk_body + p_offset);
+                            uint32_t ip = ntohl(a_param->addr.ipv4_address);
+                            uint32_t cid = ntohl(a_param->correlation_id);
+                            SetPrimaryPath(session, ip);
+                            success_correlations.push_back(cid);
+                        }
+
+                        p_offset += (p_len + 3) & ~3;
+                    }
+
+                    // ASCONF_ACK yanıtını derle ve gönder (RFC 5061 §3.1.2)
+                    last_tx_frame_ = BuildAsconfAckPacket(session, serial, success_correlations);
                     session->tx_packets++;
                     session->tx_bytes += last_tx_frame_.size();
                 }
