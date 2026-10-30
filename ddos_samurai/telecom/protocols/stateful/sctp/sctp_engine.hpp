@@ -11,6 +11,54 @@
 
 namespace ddos_samurai::telecom::sctp {
 
+// Önbellek çizgisi hizalı SCTP İlişkilendirme Ek Durumu (Multihoming & PR-SCTP & ASCONF)
+struct alignas(64) SctpAssociationState {
+    SctpPath paths[SCTP_MAX_PATHS];
+    uint8_t  path_count{0};
+    uint8_t  primary_path_idx{0};
+    uint8_t  active_path_idx{0};
+    uint16_t path_max_retrans{3};
+    uint32_t asconf_serial{100};
+    uint32_t asconf_ack_serial{0};
+
+    // PR-SCTP Zaman Aşımı Kuyruğu (Sıfır yığın ayırma halka tamponu)
+    static constexpr size_t MAX_UNACKED_CHUNKS = 32;
+    struct TimedChunk {
+        uint32_t tsn{0};
+        uint16_t stream_id{0};
+        uint16_t stream_seq{0};
+        uint64_t expire_tsc{0};
+        bool active{false};
+        bool abandoned{false};
+    } unacked_chunks[MAX_UNACKED_CHUNKS];
+    size_t unacked_head{0};
+    size_t unacked_tail{0};
+
+    // Akış yeniden birleştirme ve sıra takip dizisi
+    static constexpr size_t MAX_STREAMS = 16;
+    uint16_t next_stream_seq[MAX_STREAMS]{0};
+
+    void Reset() noexcept {
+        for (size_t i = 0; i < SCTP_MAX_PATHS; ++i) {
+            paths[i] = SctpPath{};
+        }
+        path_count = 0;
+        primary_path_idx = 0;
+        active_path_idx = 0;
+        path_max_retrans = 3;
+        asconf_serial = 100;
+        asconf_ack_serial = 0;
+        unacked_head = 0;
+        unacked_tail = 0;
+        for (size_t i = 0; i < MAX_UNACKED_CHUNKS; ++i) {
+            unacked_chunks[i] = TimedChunk{};
+        }
+        for (size_t i = 0; i < MAX_STREAMS; ++i) {
+            next_stream_seq[i] = 0;
+        }
+    }
+};
+
 class SctpEngine : public ITelcoProtocol {
 public:
     SctpEngine(SessionManager& session_mgr, HierarchicalTimingWheel* timing_wheel);
@@ -44,6 +92,16 @@ public:
     SctpState GetState(const TelcoSessionContext* session) const noexcept;
     void SetState(TelcoSessionContext* session, SctpState state) noexcept;
 
+    // Multihoming Yol Yönetimi Fonksiyonları (RFC 4960 §5.1.2 & §8)
+    bool AddPath(TelcoSessionContext* session, uint32_t peer_ip, bool is_primary = false);
+    bool RemovePath(TelcoSessionContext* session, uint32_t peer_ip);
+    bool SetPrimaryPath(TelcoSessionContext* session, uint32_t peer_ip);
+    size_t GetPathCount(const TelcoSessionContext* session) const;
+    const SctpPath* GetPath(const TelcoSessionContext* session, size_t index) const;
+    const SctpPath* GetPrimaryPath(const TelcoSessionContext* session) const;
+    const SctpPath* GetActivePath(const TelcoSessionContext* session) const;
+    size_t GetActivePathIndex(const TelcoSessionContext* session) const;
+
     // Paket İnşa Fonksiyonları
     std::vector<uint8_t> BuildInitPacket(TelcoSessionContext* session);
     std::vector<uint8_t> BuildInitAckPacket(TelcoSessionContext* session, uint32_t peer_initiate_tag, uint32_t peer_initial_tsn);
@@ -69,6 +127,11 @@ private:
     ProtocolConfig config_{};
     std::vector<uint8_t> last_tx_frame_;
     std::vector<uint8_t> last_cookie_;
+    std::vector<SctpAssociationState> assoc_states_;
+    mutable SctpAssociationState fallback_state_;
+
+    SctpAssociationState& GetAssocState(TelcoSessionContext* session);
+    const SctpAssociationState& GetAssocState(const TelcoSessionContext* session) const;
 
     void HandleTimeout(TelcoSessionContext* session);
     bool ParseAndProcessChunks(TelcoSessionContext* session, const uint8_t* sctp_pkt, size_t sctp_len, uint64_t now_tsc);

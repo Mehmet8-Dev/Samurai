@@ -104,11 +104,44 @@ uint32_t SctpEngine::ComputeCrc32c(const uint8_t* data, size_t len) noexcept {
 
 SctpEngine::SctpEngine(SessionManager& session_mgr, HierarchicalTimingWheel* timing_wheel)
     : session_mgr_(session_mgr),
-      timing_wheel_(timing_wheel) {}
+      timing_wheel_(timing_wheel) {
+    uint32_t cap = session_mgr_.GetCapacity();
+    if (cap > 0) {
+        assoc_states_.resize(cap);
+        for (auto& s : assoc_states_) {
+            s.Reset();
+        }
+    }
+}
 
 bool SctpEngine::Init(const ProtocolConfig& cfg) {
     config_ = cfg;
+    uint32_t cap = session_mgr_.GetCapacity();
+    if (cap > 0 && assoc_states_.size() < cap) {
+        assoc_states_.resize(cap);
+        for (auto& s : assoc_states_) {
+            s.Reset();
+        }
+    }
     return true;
+}
+
+SctpAssociationState& SctpEngine::GetAssocState(TelcoSessionContext* session) {
+    if (!session) return fallback_state_;
+    int32_t idx = session_mgr_.GetSessionIndex(session);
+    if (idx >= 0 && static_cast<size_t>(idx) < assoc_states_.size()) {
+        return assoc_states_[idx];
+    }
+    return fallback_state_;
+}
+
+const SctpAssociationState& SctpEngine::GetAssocState(const TelcoSessionContext* session) const {
+    if (!session) return fallback_state_;
+    int32_t idx = session_mgr_.GetSessionIndex(session);
+    if (idx >= 0 && static_cast<size_t>(idx) < assoc_states_.size()) {
+        return assoc_states_[idx];
+    }
+    return fallback_state_;
 }
 
 void SctpEngine::Shutdown() {
@@ -118,6 +151,9 @@ void SctpEngine::Shutdown() {
         if (s && s->protocol_id == static_cast<uint8_t>(TelcoProtocolId::SCTP)) {
             if (timing_wheel_) {
                 timing_wheel_->Cancel(s);
+            }
+            if (i < assoc_states_.size()) {
+                assoc_states_[i].Reset();
             }
             session_mgr_.ReleaseSession(s);
         }
@@ -157,6 +193,141 @@ void SctpEngine::SetState(TelcoSessionContext* session, SctpState state) noexcep
     }
 }
 
+bool SctpEngine::AddPath(TelcoSessionContext* session, uint32_t peer_ip, bool is_primary) {
+    if (!session || peer_ip == 0) return false;
+    auto& state = GetAssocState(session);
+
+    for (size_t i = 0; i < state.path_count; ++i) {
+        if (state.paths[i].ip == peer_ip) {
+            if (is_primary) {
+                SetPrimaryPath(session, peer_ip);
+            }
+            return true;
+        }
+    }
+
+    if (state.path_count >= SCTP_MAX_PATHS) {
+        return false;
+    }
+
+    size_t idx = state.path_count;
+    state.paths[idx].ip = peer_ip;
+    state.paths[idx].port = session->peer_port;
+    std::memcpy(state.paths[idx].mac, session->peer_mac, 6);
+    state.paths[idx].status = SctpPathStatus::UNCONFIRMED;
+    state.paths[idx].error_counter = 0;
+    state.paths[idx].rto_ms = config_.retransmit_timeout_ms > 0 ? config_.retransmit_timeout_ms : 1000;
+    state.paths[idx].is_primary = is_primary;
+    state.path_count++;
+
+    session->SetSctpPathCount(state.path_count);
+
+    if (is_primary) {
+        SetPrimaryPath(session, peer_ip);
+    }
+    return true;
+}
+
+bool SctpEngine::RemovePath(TelcoSessionContext* session, uint32_t peer_ip) {
+    if (!session || peer_ip == 0) return false;
+    auto& state = GetAssocState(session);
+
+    size_t found_idx = SIZE_MAX;
+    for (size_t i = 0; i < state.path_count; ++i) {
+        if (state.paths[i].ip == peer_ip) {
+            found_idx = i;
+            break;
+        }
+    }
+
+    if (found_idx == SIZE_MAX || state.path_count <= 1) {
+        return false;
+    }
+
+    bool was_primary = state.paths[found_idx].is_primary;
+    bool was_active = (state.active_path_idx == found_idx);
+
+    for (size_t i = found_idx; i + 1 < state.path_count; ++i) {
+        state.paths[i] = state.paths[i + 1];
+    }
+    state.path_count--;
+    state.paths[state.path_count] = SctpPath{};
+
+    session->SetSctpPathCount(state.path_count);
+
+    if (was_primary || state.primary_path_idx >= state.path_count) {
+        state.primary_path_idx = 0;
+        state.paths[0].is_primary = true;
+        session->SetSctpPrimaryPathIndex(0);
+    }
+    if (was_active || state.active_path_idx >= state.path_count) {
+        state.active_path_idx = state.primary_path_idx;
+        session->SetSctpActivePathIndex(state.active_path_idx);
+        session->peer_ip = state.paths[state.active_path_idx].ip;
+    }
+    return true;
+}
+
+bool SctpEngine::SetPrimaryPath(TelcoSessionContext* session, uint32_t peer_ip) {
+    if (!session || peer_ip == 0) return false;
+    auto& state = GetAssocState(session);
+
+    size_t found_idx = SIZE_MAX;
+    for (size_t i = 0; i < state.path_count; ++i) {
+        if (state.paths[i].ip == peer_ip) {
+            found_idx = i;
+            break;
+        }
+    }
+
+    if (found_idx == SIZE_MAX) return false;
+
+    for (size_t i = 0; i < state.path_count; ++i) {
+        state.paths[i].is_primary = (i == found_idx);
+    }
+    state.primary_path_idx = static_cast<uint8_t>(found_idx);
+    state.active_path_idx = static_cast<uint8_t>(found_idx);
+    session->peer_ip = peer_ip;
+    session->SetSctpPrimaryPathIndex(state.primary_path_idx);
+    session->SetSctpActivePathIndex(state.active_path_idx);
+    return true;
+}
+
+size_t SctpEngine::GetPathCount(const TelcoSessionContext* session) const {
+    if (!session) return 0;
+    return GetAssocState(session).path_count;
+}
+
+const SctpPath* SctpEngine::GetPath(const TelcoSessionContext* session, size_t index) const {
+    if (!session) return nullptr;
+    const auto& state = GetAssocState(session);
+    if (index >= state.path_count) return nullptr;
+    return &state.paths[index];
+}
+
+const SctpPath* SctpEngine::GetPrimaryPath(const TelcoSessionContext* session) const {
+    if (!session) return nullptr;
+    const auto& state = GetAssocState(session);
+    if (state.primary_path_idx < state.path_count) {
+        return &state.paths[state.primary_path_idx];
+    }
+    return nullptr;
+}
+
+const SctpPath* SctpEngine::GetActivePath(const TelcoSessionContext* session) const {
+    if (!session) return nullptr;
+    const auto& state = GetAssocState(session);
+    if (state.active_path_idx < state.path_count) {
+        return &state.paths[state.active_path_idx];
+    }
+    return nullptr;
+}
+
+size_t SctpEngine::GetActivePathIndex(const TelcoSessionContext* session) const {
+    if (!session) return 0;
+    return GetAssocState(session).active_path_idx;
+}
+
 void SctpEngine::StartAssociation(TelcoSessionContext* session, const SctpAssociationConfig& cfg) {
     if (!session) return;
 
@@ -176,6 +347,41 @@ void SctpEngine::StartAssociation(TelcoSessionContext* session, const SctpAssoci
 
     std::memcpy(session->client_mac, cfg.local_mac, 6);
     std::memcpy(session->peer_mac, cfg.peer_mac, 6);
+
+    // Multihoming Yol Durumunu Başlat (RFC 4960 §5.1.2)
+    auto& state = GetAssocState(session);
+    state.Reset();
+    state.path_max_retrans = cfg.path_max_retrans > 0 ? cfg.path_max_retrans : 3;
+
+    state.paths[0].ip = cfg.peer_ip;
+    state.paths[0].port = cfg.peer_port;
+    std::memcpy(state.paths[0].mac, cfg.peer_mac, 6);
+    state.paths[0].status = SctpPathStatus::ACTIVE;
+    state.paths[0].is_primary = true;
+    state.paths[0].rto_ms = cfg.retransmit_timeout_ms > 0 ? cfg.retransmit_timeout_ms : 1000;
+    state.paths[0].error_counter = 0;
+    state.path_count = 1;
+
+    for (uint32_t sec_ip : cfg.peer_secondary_ips) {
+        if (state.path_count >= SCTP_MAX_PATHS) break;
+        if (sec_ip == cfg.peer_ip || sec_ip == 0) continue;
+        size_t idx = state.path_count;
+        state.paths[idx].ip = sec_ip;
+        state.paths[idx].port = cfg.peer_port;
+        std::memcpy(state.paths[idx].mac, cfg.peer_mac, 6);
+        state.paths[idx].status = SctpPathStatus::UNCONFIRMED;
+        state.paths[idx].is_primary = false;
+        state.paths[idx].rto_ms = cfg.retransmit_timeout_ms > 0 ? cfg.retransmit_timeout_ms : 1000;
+        state.paths[idx].error_counter = 0;
+        state.path_count++;
+    }
+
+    state.primary_path_idx = 0;
+    state.active_path_idx = 0;
+
+    session->SetSctpPrimaryPathIndex(0);
+    session->SetSctpActivePathIndex(0);
+    session->SetSctpPathCount(state.path_count);
 
     SetState(session, SctpState::COOKIE_WAIT);
 
