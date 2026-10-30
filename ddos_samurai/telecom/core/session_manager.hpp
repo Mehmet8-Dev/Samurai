@@ -91,9 +91,20 @@ private:
 
     std::atomic<uint32_t> active_sessions_{0};
 
-    // Boş oturum indekslerini tutan kilitli olmayan yığın
+    // Boş oturum indekslerini tutan kilitli olmayan yığın (ABA-korumalı Treiber Stack)
     std::unique_ptr<uint32_t[]> free_indices_;
-    std::atomic<uint32_t> free_head_{0};
+    std::atomic<uint64_t> free_head_{0};
+
+    static constexpr uint32_t EMPTY_HEAD = 0xFFFFFFFFu;
+    static inline uint64_t PackHead(uint32_t idx, uint32_t tag) noexcept {
+        return (static_cast<uint64_t>(tag) << 32) | idx;
+    }
+    static inline uint32_t UnpackIdx(uint64_t packed) noexcept {
+        return static_cast<uint32_t>(packed & 0xFFFFFFFFu);
+    }
+    static inline uint32_t UnpackTag(uint64_t packed) noexcept {
+        return static_cast<uint32_t>(packed >> 32);
+    }
 
     // 5-Tuple O(1) arama hash tablosu
     static constexpr uint32_t MAX_PROBES = 32;

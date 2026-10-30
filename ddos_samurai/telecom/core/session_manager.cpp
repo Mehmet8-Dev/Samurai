@@ -50,12 +50,12 @@ SessionManager::SessionManager(uint32_t max_sessions, int socket_id)
 
     std::memset(sessions_pool_, 0, pool_alloc_size_);
 
-    // Boş indeks yığınını hazırla
+    // Boş indeks yığınını hazırla (ABA-korumalı Treiber Stack)
     free_indices_ = std::make_unique<uint32_t[]>(max_sessions_);
     for (uint32_t i = 0; i < max_sessions_; ++i) {
-        free_indices_[i] = max_sessions_ - 1 - i;
+        free_indices_[i] = (i + 1 < max_sessions_) ? (i + 1) : EMPTY_HEAD;
     }
-    free_head_.store(max_sessions_, std::memory_order_relaxed);
+    free_head_.store(PackHead(0, 0), std::memory_order_release);
 
     // Hash tablolarının boyutunu belirle (En az 2 katı, 2'nin kuvveti)
     hash_size_ = NextPowerOf2(std::max(65536u, max_sessions_ * 2));
@@ -90,15 +90,19 @@ SessionManager::~SessionManager() {
 
 TelcoSessionContext* SessionManager::AcquireSession() noexcept {
     while (true) {
-        uint32_t current_head = free_head_.load(std::memory_order_relaxed);
-        if (current_head == 0) {
+        uint64_t current = free_head_.load(std::memory_order_acquire);
+        uint32_t head_idx = UnpackIdx(current);
+        if (head_idx == EMPTY_HEAD || head_idx >= max_sessions_) {
             return nullptr; // Havuz doldu
         }
-        if (free_head_.compare_exchange_weak(current_head, current_head - 1,
-                                             std::memory_order_acquire,
-                                             std::memory_order_relaxed)) {
-            uint32_t idx = free_indices_[current_head - 1];
-            TelcoSessionContext* session = &sessions_pool_[idx];
+        uint32_t tag = UnpackTag(current);
+        uint32_t next_idx = free_indices_[head_idx];
+        uint64_t next_packed = PackHead(next_idx, tag + 1);
+
+        if (free_head_.compare_exchange_weak(current, next_packed,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+            TelcoSessionContext* session = &sessions_pool_[head_idx];
             session->Reset();
             active_sessions_.fetch_add(1, std::memory_order_relaxed);
             return session;
@@ -128,14 +132,15 @@ void SessionManager::ReleaseSession(TelcoSessionContext* ctx) noexcept {
     ctx->state = SessionState::TEARDOWN;
 
     while (true) {
-        uint32_t current_head = free_head_.load(std::memory_order_relaxed);
-        if (current_head >= max_sessions_) {
-            break; // Hata durumunda taşmayı engelle
-        }
-        free_indices_[current_head] = idx;
-        if (free_head_.compare_exchange_weak(current_head, current_head + 1,
+        uint64_t current = free_head_.load(std::memory_order_acquire);
+        uint32_t head_idx = UnpackIdx(current);
+        uint32_t tag = UnpackTag(current);
+        free_indices_[idx] = head_idx;
+        uint64_t next_packed = PackHead(idx, tag + 1);
+
+        if (free_head_.compare_exchange_weak(current, next_packed,
                                              std::memory_order_release,
-                                             std::memory_order_relaxed)) {
+                                             std::memory_order_acquire)) {
             active_sessions_.fetch_sub(1, std::memory_order_relaxed);
             break;
         }
