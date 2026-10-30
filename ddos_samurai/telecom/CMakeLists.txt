@@ -240,6 +240,27 @@ target_include_directories(test_sip_rtp_engine PRIVATE
 target_compile_options(test_sip_rtp_engine PRIVATE -msse4.2 -UNDEBUG)
 target_link_libraries(test_sip_rtp_engine PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
 
+add_executable(test_upstream_telco_integration
+  tests/test_upstream_telco_integration.cpp
+  ../cli/args.cpp
+  ../cli/profiles.cpp
+)
+target_include_directories(test_upstream_telco_integration PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  ${CMAKE_CURRENT_SOURCE_DIR}/core
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/sctp
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/diameter
+  ${CMAKE_CURRENT_SOURCE_DIR}/protocols/stateful/sip_rtp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../cli
+  ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator
+  ${CMAKE_CURRENT_SOURCE_DIR}/../zmq/daemon
+  ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native
+)
+target_compile_options(test_upstream_telco_integration PRIVATE -msse4.2 -UNDEBUG)
+target_link_libraries(test_upstream_telco_integration PRIVATE samurai_telecom_static samurai_l7emu samurai_core pthread)
+
 # ---------------------------------------------------------------------------
 # CTest Registrations for Automated CI/CD
 # ---------------------------------------------------------------------------
@@ -255,4 +276,5 @@ add_test(NAME telecom_audit_logger COMMAND test_telco_audit_logger)
 add_test(NAME telecom_sctp COMMAND test_sctp_engine)
 add_test(NAME telecom_diameter COMMAND test_diameter_engine)
 add_test(NAME telecom_sip_rtp COMMAND test_sip_rtp_engine)
+add_test(NAME telecom_upstream_integration COMMAND test_upstream_telco_integration)
 
