@@ -3,6 +3,7 @@
 #include "ddos_samurai/core/json.hpp"
 
 #include <arpa/inet.h>
+#include <endian.h>
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -401,8 +402,122 @@ bool DiameterDictionary::LoadFromJson(const std::string& json_str, std::string* 
     return true;
 }
 
-bool DiameterDictionary::EncodeAvp(const DecodedAvp& /*avp*/, std::vector<uint8_t>& /*out_buf*/) const {
-    return false;
+bool DiameterDictionary::EncodeAvp(const DecodedAvp& avp, std::vector<uint8_t>& out_buf) const {
+    bool has_vendor = (avp.flags & AVP_FLAG_VENDOR) != 0 || avp.vendor_id != 0;
+    uint8_t flags = avp.flags;
+    if (has_vendor) {
+        flags |= AVP_FLAG_VENDOR;
+    }
+
+    size_t header_len = has_vendor ? 12 : 8;
+    std::vector<uint8_t> payload;
+
+    switch (avp.type) {
+        case AvpDataType::OCTET_STRING:
+            payload = avp.octet_string_val;
+            break;
+        case AvpDataType::UTF8_STRING:
+            payload.assign(avp.str_val.begin(), avp.str_val.end());
+            break;
+        case AvpDataType::INTEGER32: {
+            uint32_t val_be = htonl(static_cast<uint32_t>(avp.i32_val));
+            payload.resize(4);
+            std::memcpy(payload.data(), &val_be, 4);
+            break;
+        }
+        case AvpDataType::UNSIGNED32: {
+            uint32_t val_be = htonl(avp.u32_val);
+            payload.resize(4);
+            std::memcpy(payload.data(), &val_be, 4);
+            break;
+        }
+        case AvpDataType::INTEGER64: {
+            uint64_t val_be = htobe64(static_cast<uint64_t>(avp.i64_val));
+            payload.resize(8);
+            std::memcpy(payload.data(), &val_be, 8);
+            break;
+        }
+        case AvpDataType::UNSIGNED64: {
+            uint64_t val_be = htobe64(avp.u64_val);
+            payload.resize(8);
+            std::memcpy(payload.data(), &val_be, 8);
+            break;
+        }
+        case AvpDataType::FLOAT32: {
+            uint32_t bits;
+            std::memcpy(&bits, &avp.f32_val, 4);
+            bits = htonl(bits);
+            payload.resize(4);
+            std::memcpy(payload.data(), &bits, 4);
+            break;
+        }
+        case AvpDataType::FLOAT64: {
+            uint64_t bits;
+            std::memcpy(&bits, &avp.f64_val, 8);
+            bits = htobe64(bits);
+            payload.resize(8);
+            std::memcpy(payload.data(), &bits, 8);
+            break;
+        }
+        case AvpDataType::ADDRESS: {
+            // RFC 6733 Address: 2 bytes AddressType (1=IPv4) + 4 bytes IPv4
+            payload.resize(6);
+            uint16_t addr_type = htons(1);
+            std::memcpy(payload.data(), &addr_type, 2);
+            uint32_t ip_be = htonl(avp.ipv4_val);
+            std::memcpy(payload.data() + 2, &ip_be, 4);
+            break;
+        }
+        case AvpDataType::TIME: {
+            uint32_t val_be = htonl(avp.time_val);
+            payload.resize(4);
+            std::memcpy(payload.data(), &val_be, 4);
+            break;
+        }
+        case AvpDataType::GROUPED: {
+            for (const auto& child : avp.grouped_val) {
+                if (!EncodeAvp(child, payload)) {
+                    return false;
+                }
+            }
+            break;
+        }
+    }
+
+    size_t payload_len = payload.size();
+    size_t avp_len = header_len + payload_len;
+    if (avp_len > 0x00FFFFFF) {
+        return false;
+    }
+    size_t padded_len = (avp_len + 3) & ~3;
+
+    size_t start_pos = out_buf.size();
+    out_buf.resize(start_pos + padded_len, 0);
+
+    // Write AVP Code (4 bytes)
+    uint32_t code_be = htonl(avp.code);
+    std::memcpy(out_buf.data() + start_pos, &code_be, 4);
+
+    // Write Flags (1 byte)
+    out_buf[start_pos + 4] = flags;
+
+    // Write Length (3 bytes)
+    out_buf[start_pos + 5] = static_cast<uint8_t>((avp_len >> 16) & 0xFF);
+    out_buf[start_pos + 6] = static_cast<uint8_t>((avp_len >> 8) & 0xFF);
+    out_buf[start_pos + 7] = static_cast<uint8_t>(avp_len & 0xFF);
+
+    size_t data_pos = start_pos + 8;
+    if (has_vendor) {
+        uint32_t vendor_be = htonl(avp.vendor_id);
+        std::memcpy(out_buf.data() + data_pos, &vendor_be, 4);
+        data_pos += 4;
+    }
+
+    if (payload_len > 0) {
+        std::memcpy(out_buf.data() + data_pos, payload.data(), payload_len);
+    }
+
+    return true;
 }
 
 bool DiameterDictionary::DecodeAvp(const uint8_t* /*data*/, size_t /*len*/, DecodedAvp& /*out_avp*/, size_t& /*bytes_consumed*/) const {
