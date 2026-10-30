@@ -97,25 +97,168 @@ bool SrtpEngine::InitKeys(const SrtpKeyConfig& key_cfg) {
     return true;
 }
 
-bool SrtpEngine::ProtectRtp(const uint8_t* /*rtp_header*/,
-                            const uint8_t* /*payload*/,
-                            size_t /*payload_len*/,
-                            std::vector<uint8_t>& /*out_srtp_pkt*/) {
-    return false;
+bool SrtpEngine::ProtectRtp(const uint8_t* rtp_header,
+                            const uint8_t* payload,
+                            size_t payload_len,
+                            std::vector<uint8_t>& out_srtp_pkt) {
+    if (!enc_ctx_ || !mac_ctx_ || !rtp_header) return false;
+
+    uint16_t seq = (static_cast<uint16_t>(rtp_header[2]) << 8) | rtp_header[3];
+    uint32_t ssrc = (static_cast<uint32_t>(rtp_header[8]) << 24) |
+                    (static_cast<uint32_t>(rtp_header[9]) << 16) |
+                    (static_cast<uint32_t>(rtp_header[10]) << 8) |
+                    rtp_header[11];
+
+    if (!session_ctx_.initialized) {
+        session_ctx_.initialized = true;
+        session_ctx_.s_l = seq;
+        session_ctx_.roc = 0;
+    } else {
+        if (seq < session_ctx_.s_l) {
+            session_ctx_.roc++;
+        }
+        session_ctx_.s_l = seq;
+    }
+
+    uint64_t packet_index = (static_cast<uint64_t>(session_ctx_.roc) << 16) | seq;
+
+    size_t total_len = 12 + payload_len + SRTP_AUTH_TAG_LEN;
+    out_srtp_pkt.resize(total_len);
+
+    // 1. Copy plaintext RTP header (12 bytes)
+    std::memcpy(out_srtp_pkt.data(), rtp_header, 12);
+
+    // 2. Encrypt audio payload
+    if (payload && payload_len > 0) {
+        std::memcpy(out_srtp_pkt.data() + 12, payload, payload_len);
+        ComputeAesIcmKeystream(enc_ctx_, session_ctx_.k_s, ssrc, packet_index, out_srtp_pkt.data() + 12, payload_len);
+    }
+
+    // 3. Compute HMAC-SHA1-80 auth tag over RTP header + Encrypted Payload + ROC
+    ComputeHmacSha1Tag(mac_ctx_,
+                       out_srtp_pkt.data(),
+                       12,
+                       out_srtp_pkt.data() + 12,
+                       payload_len,
+                       session_ctx_.roc,
+                       out_srtp_pkt.data() + 12 + payload_len);
+
+    return true;
 }
 
-bool SrtpEngine::ProtectRtpInPlace(uint8_t* /*packet_buf*/, size_t /*rtp_header_len*/, size_t /*payload_len*/, size_t /*max_buf_len*/, size_t& /*out_total_len*/) {
-    return false;
+bool SrtpEngine::ProtectRtpInPlace(uint8_t* packet_buf, size_t rtp_header_len, size_t payload_len, size_t max_buf_len, size_t& out_total_len) {
+    if (!enc_ctx_ || !mac_ctx_ || !packet_buf || rtp_header_len < 12) return false;
+    size_t required_len = rtp_header_len + payload_len + SRTP_AUTH_TAG_LEN;
+    if (max_buf_len < required_len) return false;
+
+    uint16_t seq = (static_cast<uint16_t>(packet_buf[2]) << 8) | packet_buf[3];
+    uint32_t ssrc = (static_cast<uint32_t>(packet_buf[8]) << 24) |
+                    (static_cast<uint32_t>(packet_buf[9]) << 16) |
+                    (static_cast<uint32_t>(packet_buf[10]) << 8) |
+                    packet_buf[11];
+
+    if (!session_ctx_.initialized) {
+        session_ctx_.initialized = true;
+        session_ctx_.s_l = seq;
+        session_ctx_.roc = 0;
+    } else {
+        if (seq < session_ctx_.s_l) {
+            session_ctx_.roc++;
+        }
+        session_ctx_.s_l = seq;
+    }
+
+    uint64_t packet_index = (static_cast<uint64_t>(session_ctx_.roc) << 16) | seq;
+
+    if (payload_len > 0) {
+        ComputeAesIcmKeystream(enc_ctx_, session_ctx_.k_s, ssrc, packet_index, packet_buf + rtp_header_len, payload_len);
+    }
+
+    ComputeHmacSha1Tag(mac_ctx_,
+                       packet_buf,
+                       rtp_header_len,
+                       packet_buf + rtp_header_len,
+                       payload_len,
+                       session_ctx_.roc,
+                       packet_buf + rtp_header_len + payload_len);
+
+    out_total_len = required_len;
+    return true;
 }
 
-bool SrtpEngine::UnprotectRtp(const uint8_t* /*srtp_pkt*/,
-                              size_t /*srtp_len*/,
-                              std::vector<uint8_t>& /*out_payload*/) {
-    return false;
+bool SrtpEngine::UnprotectRtp(const uint8_t* srtp_pkt,
+                              size_t srtp_len,
+                              std::vector<uint8_t>& out_payload) {
+    if (!enc_ctx_ || !mac_ctx_ || !srtp_pkt) return false;
+    if (srtp_len < 12 + SRTP_AUTH_TAG_LEN) return false;
+
+    size_t cipher_len = srtp_len - 12 - SRTP_AUTH_TAG_LEN;
+    uint16_t seq = (static_cast<uint16_t>(srtp_pkt[2]) << 8) | srtp_pkt[3];
+    uint32_t ssrc = (static_cast<uint32_t>(srtp_pkt[8]) << 24) |
+                    (static_cast<uint32_t>(srtp_pkt[9]) << 16) |
+                    (static_cast<uint32_t>(srtp_pkt[10]) << 8) |
+                    srtp_pkt[11];
+
+    uint64_t packet_index = 0;
+    uint32_t est_roc = 0;
+    if (!CheckAndProcessReplay(session_ctx_, seq, packet_index, est_roc)) {
+        return false; // Replay check failed
+    }
+
+    // Verify HMAC-SHA1-80 auth tag
+    uint8_t expected_tag[SRTP_AUTH_TAG_LEN];
+    ComputeHmacSha1Tag(mac_ctx_, srtp_pkt, 12, srtp_pkt + 12, cipher_len, est_roc, expected_tag);
+
+    const uint8_t* rx_tag = srtp_pkt + 12 + cipher_len;
+    if (CRYPTO_memcmp(rx_tag, expected_tag, SRTP_AUTH_TAG_LEN) != 0) {
+        return false; // Authentication tag mismatch (tampering detected)
+    }
+
+    // Auth succeeded: commit to sliding replay window
+    CommitReplay(session_ctx_, seq, packet_index, est_roc);
+
+    // Decrypt audio payload
+    out_payload.resize(cipher_len);
+    if (cipher_len > 0) {
+        std::memcpy(out_payload.data(), srtp_pkt + 12, cipher_len);
+        ComputeAesIcmKeystream(enc_ctx_, session_ctx_.k_s, ssrc, packet_index, out_payload.data(), cipher_len);
+    }
+
+    return true;
 }
 
-bool SrtpEngine::UnprotectRtpInPlace(uint8_t* /*packet_buf*/, size_t /*srtp_len*/, size_t& /*out_decrypted_len*/) {
-    return false;
+bool SrtpEngine::UnprotectRtpInPlace(uint8_t* packet_buf, size_t srtp_len, size_t& out_decrypted_len) {
+    if (!enc_ctx_ || !mac_ctx_ || !packet_buf) return false;
+    if (srtp_len < 12 + SRTP_AUTH_TAG_LEN) return false;
+
+    size_t cipher_len = srtp_len - 12 - SRTP_AUTH_TAG_LEN;
+    uint16_t seq = (static_cast<uint16_t>(packet_buf[2]) << 8) | packet_buf[3];
+    uint32_t ssrc = (static_cast<uint32_t>(packet_buf[8]) << 24) |
+                    (static_cast<uint32_t>(packet_buf[9]) << 16) |
+                    (static_cast<uint32_t>(packet_buf[10]) << 8) |
+                    packet_buf[11];
+
+    uint64_t packet_index = 0;
+    uint32_t est_roc = 0;
+    if (!CheckAndProcessReplay(session_ctx_, seq, packet_index, est_roc)) {
+        return false;
+    }
+
+    uint8_t expected_tag[SRTP_AUTH_TAG_LEN];
+    ComputeHmacSha1Tag(mac_ctx_, packet_buf, 12, packet_buf + 12, cipher_len, est_roc, expected_tag);
+
+    const uint8_t* rx_tag = packet_buf + 12 + cipher_len;
+    if (CRYPTO_memcmp(rx_tag, expected_tag, SRTP_AUTH_TAG_LEN) != 0) {
+        return false;
+    }
+
+    CommitReplay(session_ctx_, seq, packet_index, est_roc);
+
+    if (cipher_len > 0) {
+        ComputeAesIcmKeystream(enc_ctx_, session_ctx_.k_s, ssrc, packet_index, packet_buf + 12, cipher_len);
+    }
+    out_decrypted_len = cipher_len;
+    return true;
 }
 
 bool SrtpEngine::DeriveSessionKeys(const SrtpKeyConfig& key_cfg,
@@ -229,20 +372,117 @@ void SrtpEngine::ComputeAesIcmKeystream(EVP_CIPHER_CTX* aes_ctx,
     }
 }
 
-void SrtpEngine::ComputeHmacSha1Tag(EVP_MAC_CTX* /*mac_ctx*/,
-                                   const uint8_t* /*rtp_header*/,
-                                   size_t /*header_len*/,
-                                   const uint8_t* /*ciphertext*/,
-                                   size_t /*cipher_len*/,
-                                   uint32_t /*roc*/,
-                                   uint8_t /*out_tag*/[SRTP_AUTH_TAG_LEN]) {
+void SrtpEngine::ComputeHmacSha1Tag(EVP_MAC_CTX* mac_ctx,
+                                   const uint8_t* rtp_header,
+                                   size_t header_len,
+                                   const uint8_t* ciphertext,
+                                   size_t cipher_len,
+                                   uint32_t roc,
+                                   uint8_t out_tag[SRTP_AUTH_TAG_LEN]) {
+    if (!mac_ctx || !out_tag) return;
+
+    // Reset HMAC state without re-allocating or re-deriving key
+    EVP_MAC_init(mac_ctx, nullptr, 0, nullptr);
+
+    // 1. Authenticated portion: RTP header
+    if (rtp_header && header_len > 0) {
+        EVP_MAC_update(mac_ctx, rtp_header, header_len);
+    }
+
+    // 2. Authenticated portion: Encrypted RTP payload
+    if (ciphertext && cipher_len > 0) {
+        EVP_MAC_update(mac_ctx, ciphertext, cipher_len);
+    }
+
+    // 3. ROC (4 bytes network byte order, RFC 3711 Section 4.2)
+    uint32_t roc_be = htonl(roc);
+    EVP_MAC_update(mac_ctx, reinterpret_cast<const uint8_t*>(&roc_be), sizeof(roc_be));
+
+    uint8_t full_digest[20];
+    size_t digest_len = 0;
+    EVP_MAC_final(mac_ctx, full_digest, &digest_len, sizeof(full_digest));
+
+    // Truncate to first 10 bytes (80-bit auth tag)
+    std::memcpy(out_tag, full_digest, SRTP_AUTH_TAG_LEN);
 }
 
-bool SrtpEngine::CheckAndProcessReplay(SrtpSessionContext& /*ctx*/, uint16_t /*seq*/, uint64_t& /*out_index*/, uint32_t& /*out_roc*/) {
-    return false;
+bool SrtpEngine::CheckAndProcessReplay(SrtpSessionContext& ctx, uint16_t seq, uint64_t& out_index, uint32_t& out_roc) {
+    if (!ctx.initialized) {
+        out_roc = 0;
+        out_index = seq;
+        return true;
+    }
+
+    // RFC 3711 Appendix A: Pseudocode for index determination
+    uint32_t v = ctx.roc;
+    uint16_t s_l = ctx.s_l;
+
+    if (s_l < 32768) {
+        if (static_cast<int32_t>(seq) - static_cast<int32_t>(s_l) > 32768) {
+            v = (ctx.roc > 0) ? (ctx.roc - 1) : 0;
+        } else {
+            v = ctx.roc;
+        }
+    } else {
+        if (static_cast<int32_t>(s_l) - 32768 > static_cast<int32_t>(seq)) {
+            v = ctx.roc + 1;
+        } else {
+            v = ctx.roc;
+        }
+    }
+
+    uint64_t index = (static_cast<uint64_t>(v) << 16) | seq;
+    uint64_t highest_index = (static_cast<uint64_t>(ctx.roc) << 16) | ctx.s_l;
+    int64_t diff = static_cast<int64_t>(index) - static_cast<int64_t>(highest_index);
+
+    if (diff > 0) {
+        // Ahead of highest packet received so far
+        out_index = index;
+        out_roc = v;
+        return true;
+    }
+
+    // Behind highest received packet
+    if (-diff >= static_cast<int64_t>(SRTP_REPLAY_WINDOW_SIZE)) {
+        // Packet lags by >= 64, reject
+        return false;
+    }
+
+    uint64_t bit_mask = 1ULL << (-diff);
+    if ((ctx.replay_bitmap & bit_mask) != 0) {
+        // Packet already seen (replay attack)
+        return false;
+    }
+
+    out_index = index;
+    out_roc = v;
+    return true;
 }
 
-void SrtpEngine::CommitReplay(SrtpSessionContext& /*ctx*/, uint16_t /*seq*/, uint64_t /*index*/, uint32_t /*roc*/) {
+void SrtpEngine::CommitReplay(SrtpSessionContext& ctx, uint16_t seq, uint64_t index, uint32_t roc) {
+    if (!ctx.initialized) {
+        ctx.initialized = true;
+        ctx.s_l = seq;
+        ctx.roc = 0;
+        ctx.replay_bitmap = 1ULL;
+        return;
+    }
+
+    uint64_t highest_index = (static_cast<uint64_t>(ctx.roc) << 16) | ctx.s_l;
+    int64_t diff = static_cast<int64_t>(index) - static_cast<int64_t>(highest_index);
+
+    if (diff > 0) {
+        if (diff < static_cast<int64_t>(SRTP_REPLAY_WINDOW_SIZE)) {
+            ctx.replay_bitmap = (ctx.replay_bitmap << diff) | 1ULL;
+        } else {
+            ctx.replay_bitmap = 1ULL;
+        }
+        ctx.s_l = seq;
+        ctx.roc = roc;
+    } else {
+        uint64_t bit_mask = 1ULL << (-diff);
+        ctx.replay_bitmap |= bit_mask;
+    }
 }
 
 } // namespace ddos_samurai::telecom::sip_rtp
