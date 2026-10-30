@@ -1,4 +1,5 @@
 #include "master_coordinator.hpp"
+#include "shard.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -44,12 +45,14 @@ std::vector<std::int64_t> ChunkCounts(std::int64_t total, std::int64_t unit) {
   return out;
 }
 
-struct Shard {
+struct CoordShard {
   std::string shard_id;
   std::int64_t packet_count = 0;
   int attempt = 0;
   std::string target_region;
   std::string worker_id;  // set on dispatch
+  bool is_telco = false;
+  TelcoShardSpec telco_spec;
 };
 
 const std::string* CapPtr(const std::map<std::string, std::string>& caps, const std::string& k) {
@@ -86,7 +89,7 @@ bool WorkerRunsKind(const std::map<std::string, std::string>& caps, const std::s
   return false;
 }
 
-double WorkerDispatchScore(const std::map<std::string, std::string>& caps, const Shard& sh,
+double WorkerDispatchScore(const std::map<std::string, std::string>& caps, const CoordShard& sh,
                            const std::string& target_region, bool region_aware) {
   double score = 0.0;
   std::string tr = Lower(Strip(sh.target_region.empty() ? target_region : sh.target_region));
@@ -129,10 +132,13 @@ MasterCoordinator::MasterCoordinator(MasterView* view, WorkerCommander* commande
 JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::string& job_id,
                                           std::function<bool()> leadership_guard) {
   JobResult result;
-  if (job.count <= 0) {
+  const bool is_telco = job.is_telco_job || (job.base_args.is_object() && job.base_args.find("telco") != nullptr);
+  const std::int64_t total_workload = is_telco ? (job.telco_subscribers > 0 ? static_cast<std::int64_t>(job.telco_subscribers) : job.count) : job.count;
+
+  if (total_workload <= 0) {
     Value snap = Value::Object();
     snap.set("job_id", Value::Str(job_id));
-    snap.set("error", Value::Str("count<=0"));
+    snap.set("error", Value::Str(is_telco ? "telco_subscribers<=0" : "count<=0"));
     result.rc = 1;
     result.snapshot = std::move(snap);
     return result;
@@ -149,6 +155,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
   // workers advertising it. Empty (or a legacy worker with no worker_kinds cap)
   // disables the filter for backward compatibility.
   const std::string required_kind = [&]() -> std::string {
+    if (is_telco) return "telco";
     const Value* w = job.base_args.is_object() ? job.base_args.find("worker") : nullptr;
     return (w != nullptr && w->is_string()) ? Lower(Strip(w->as_string(""))) : std::string();
   }();
@@ -159,29 +166,71 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     return m;
   };
 
-  std::int64_t initial_workers = std::max<std::int64_t>(1, static_cast<std::int64_t>(load_workers().size()));
-  std::int64_t shard_unit = job.shard_unit_count;
-  if (shard_unit <= 0) {
-    shard_unit = std::max<std::int64_t>(1, job.count / std::max<std::int64_t>(4, initial_workers * 4));
-  }
-  const auto counts = ChunkCounts(job.count, shard_unit);
-
-  std::deque<Shard> pending;
+  std::deque<CoordShard> pending;
   std::set<std::string> all_sids;
-  int seq = 0;
-  for (std::int64_t c : counts) {
-    ++seq;
-    Shard s;
-    s.shard_id = job_id + "-shard-" + std::to_string(seq);
-    s.packet_count = c;
-    s.attempt = 0;
-    s.target_region = target_region;
-    all_sids.insert(s.shard_id);
-    pending.push_back(std::move(s));
+
+  if (is_telco) {
+    auto w_map = load_workers();
+    std::vector<std::string> telco_workers;
+    for (const auto& kv : w_map) {
+      if (WorkerRunsKind(kv.second.capabilities, "telco")) {
+        telco_workers.push_back(kv.first);
+      }
+    }
+    if (telco_workers.empty()) {
+      for (const auto& kv : w_map) telco_workers.push_back(kv.first);
+    }
+    if (telco_workers.empty()) {
+      telco_workers.push_back("worker-1");
+    }
+
+    auto telco_specs = SplitTelcoSubscribers(
+        static_cast<std::uint32_t>(total_workload),
+        telco_workers,
+        job.telco_protocol,
+        job.telco_rate_cps,
+        job.telco_base_vlan_s,
+        job.telco_base_vlan_c,
+        nullptr,
+        job.telco_base_ip,
+        job.telco_gateway_ip);
+
+    int seq = 0;
+    for (auto& spec : telco_specs) {
+      ++seq;
+      CoordShard s;
+      s.shard_id = job_id + "-telco-shard-" + std::to_string(seq);
+      spec.shard_id = s.shard_id;
+      s.packet_count = spec.range.count;
+      s.attempt = 0;
+      s.target_region = target_region;
+      s.is_telco = true;
+      s.telco_spec = std::move(spec);
+      all_sids.insert(s.shard_id);
+      pending.push_back(std::move(s));
+    }
+  } else {
+    std::int64_t initial_workers = std::max<std::int64_t>(1, static_cast<std::int64_t>(load_workers().size()));
+    std::int64_t shard_unit = job.shard_unit_count;
+    if (shard_unit <= 0) {
+      shard_unit = std::max<std::int64_t>(1, job.count / std::max<std::int64_t>(4, initial_workers * 4));
+    }
+    const auto counts = ChunkCounts(job.count, shard_unit);
+    int seq = 0;
+    for (std::int64_t c : counts) {
+      ++seq;
+      CoordShard s;
+      s.shard_id = job_id + "-shard-" + std::to_string(seq);
+      s.packet_count = c;
+      s.attempt = 0;
+      s.target_region = target_region;
+      all_sids.insert(s.shard_id);
+      pending.push_back(std::move(s));
+    }
   }
 
-  std::map<std::string, Shard> inflight_by_worker;
-  std::map<std::string, Shard> inflight_by_sid;
+  std::map<std::string, CoordShard> inflight_by_worker;
+  std::map<std::string, CoordShard> inflight_by_sid;
   std::map<std::string, std::int64_t> reverse_dispatch_ms;  // sid -> dispatch time (reverse)
   std::set<std::string> lost_workers;
   std::set<std::string> done_shards;
@@ -272,7 +321,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     // Rebalance shards held by lost workers.
     for (auto it = inflight_by_worker.begin(); it != inflight_by_worker.end();) {
       if (lost_workers.count(it->first)) {
-        Shard sh = it->second;
+        CoordShard sh = it->second;
         it = inflight_by_worker.erase(it);
         inflight_by_sid.erase(sh.shard_id);
         reverse_dispatch_ms.erase(sh.shard_id);
@@ -322,7 +371,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
         const std::int64_t disp = reverse_dispatch_ms.count(sid) ? reverse_dispatch_ms[sid] : now;
         const std::string echoed = wit == workers.end() ? std::string() : wit->second.active_shard_id;
         if ((now - disp) > grace && echoed != sid) {
-          Shard sh = sit->second;
+          CoordShard sh = sit->second;
           inflight_by_sid.erase(sid);
           inflight_by_worker.erase(wid);
           reverse_dispatch_ms.erase(sid);
@@ -378,7 +427,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     }
 
     while (!pending.empty() && !free_workers.empty()) {
-      Shard sh = pending.front();
+      CoordShard sh = pending.front();
       pending.pop_front();
       // Select a worker (region-aware if enabled), else the first free one.
       std::size_t pick = 0;
@@ -411,6 +460,19 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
       args.set("role", Value::Str("standalone"));
       args.set("_worker_id", Value::Str(wid));
       args.set("_leader_epoch", Value::Int(job.leader_epoch));
+      args.set("db_port", Value::Int(job.db_port));
+      if (sh.is_telco) {
+        args.set("worker", Value::Str("telco"));
+        args.set("telco", sh.telco_spec.ToJson());
+        args.set("start_idx", Value::Int(sh.telco_spec.range.start_idx));
+        args.set("sub_count", Value::Int(sh.telco_spec.range.count));
+        args.set("protocol", Value::Str(sh.telco_spec.protocol));
+        args.set("target_cps", Value::Int(sh.telco_spec.target_cps));
+        args.set("base_vlan_s", Value::Int(sh.telco_spec.range.base_vlan_s));
+        args.set("base_vlan_c", Value::Int(sh.telco_spec.range.base_vlan_c));
+        args.set("base_ip", Value::Int(sh.telco_spec.range.base_ip));
+        args.set("gateway_ip", Value::Int(sh.telco_spec.range.gateway_ip));
+      }
       DispatchOutcome d;
       bool via_reverse = false;
       if (pure_reverse) {
@@ -515,6 +577,13 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
   if (const Value* v = agg_field("region_rollup")) snap.set("region_rollup", *v);
   snap.set("pending_shards_left", Value::Int(static_cast<std::int64_t>(pending.size())));
   snap.set("inflight_shards_left", Value::Int(static_cast<std::int64_t>(inflight_by_sid.size())));
+
+  if (is_telco) {
+    snap.set("is_telco", Value::Bool(true));
+    snap.set("telco_protocol", Value::Str(job.telco_protocol));
+    snap.set("telco_subscribers", Value::Int(total_workload));
+    snap.set("cluster_db_port", Value::Int(job.db_port));
+  }
 
   // Başarı ölçütü: TÜM shard'lar gerçekten tamamlandı mı (done_shards).
   // Yeniden deneme limitini aşıp düşen shard'lar done_shards'a girmez, dolayısıyla

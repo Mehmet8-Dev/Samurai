@@ -101,6 +101,17 @@ struct JobConfig {
   // the shard is rebalanced. 0 => 2 x heartbeat_timeout_ms.
   std::int64_t reverse_pickup_grace_ms = 0;
   int db_port = 5099;                        // Default DB persistence port (user memory standard)
+
+  // Telecom cluster job configuration
+  bool is_telco_job = false;
+  std::string telco_protocol = "pppoe";      // "pppoe", "dhcp", "gtpu", "bfd", "qinq", "arp"
+  std::uint32_t telco_subscribers = 0;       // Total subscriber pool size across cluster
+  std::uint32_t telco_rate_cps = 5000;       // New subscriber setup rate (CPS)
+  std::uint16_t telco_base_vlan_s = 100;     // 802.1ad Service Outer VLAN base
+  std::uint16_t telco_base_vlan_c = 10;      // 802.1Q Customer Inner VLAN base
+  std::uint32_t telco_base_ip = 0x0A000001;  // 10.0.0.1
+  std::uint32_t telco_gateway_ip = 0x0A0000FE; // 10.0.0.254
+
   // Base shard args (JSON object) cloned per shard; the coordinator injects
   // count/_worker_id/_leader_epoch/role.
   samurai::core::json::Value base_args = samurai::core::json::Value::Object();

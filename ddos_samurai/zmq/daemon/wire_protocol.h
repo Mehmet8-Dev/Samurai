@@ -195,7 +195,80 @@ enum class WorkerKind : std::uint8_t {
   DEFENSE = 7,
   SCENARIO = 8,
   AF_PACKET = 9,
+  TELCO = 10,
 };
+
+enum class TelcoMsgType : uint16_t {
+  START_PPPOE_EMULATION = 0x0501,
+  STOP_PPPOE_EMULATION  = 0x0502,
+  START_GTPU_EMULATION  = 0x0503,
+  STOP_GTPU_EMULATION   = 0x0504,
+  START_DHCP_EMULATION  = 0x0505,
+  STOP_DHCP_EMULATION   = 0x0506,
+  START_BFD_EMULATION   = 0x0507,
+  STOP_BFD_EMULATION    = 0x0508,
+  START_QINQ_SWEEP      = 0x0509,
+  STOP_QINQ_SWEEP       = 0x050A,
+  START_ARP_FLOOD       = 0x050B,
+  STOP_ARP_FLOOD        = 0x050C,
+  TELCO_STATS_REQUEST   = 0x050D,
+  TELCO_STATS_REPORT    = 0x050E,
+  TELCO_CHAOS_INJECT    = 0x050F,
+};
+
+enum class TelcoProtocolKind : uint8_t {
+  PPPOE = 1,
+  DHCP  = 2,
+  BFD   = 3,
+  GTPU  = 4,
+  QINQ  = 5,
+  ARP   = 6,
+};
+
+#pragma pack(push, 1)
+
+struct TelcoJobPayload {
+  uint32_t subscriber_start_idx;
+  uint32_t subscriber_count;
+  uint32_t rate_cps;
+  uint8_t  protocol_kind;
+  uint16_t base_vlan_s;
+  uint16_t base_vlan_c;
+  uint8_t  base_mac[6];
+  uint32_t base_client_ip;
+  uint32_t gateway_ip;
+  char     auth_username[32];
+  char     auth_password[32];
+  int32_t  pin_cpu;
+  uint16_t db_port;
+  uint8_t  pad[3];
+};
+
+struct TelcoChaosPayload {
+  uint8_t  chaos_type; // 1: PADT/Release flood, 2: link flap, 3: packet drop
+  uint32_t duration_ms;
+  uint32_t drop_ratio_pct;
+  uint32_t affected_subscribers;
+  uint8_t  pad[3];
+};
+
+struct TelcoStatsPayload {
+  uint32_t active_sessions;
+  uint32_t established_sessions;
+  uint32_t failed_sessions;
+  uint32_t current_cps;
+  uint64_t tx_packets;
+  uint64_t rx_packets;
+  uint64_t tx_bytes;
+  uint64_t rx_bytes;
+  uint32_t avg_setup_latency_us;
+  uint32_t p99_setup_latency_us;
+  uint32_t retransmit_count;
+  uint16_t db_port;
+  uint8_t  pad[2];
+};
+
+#pragma pack(pop)
 
 static_assert(sizeof(SamuraiWireHeaderV1) == 56, "SamuraiWireHeaderV1 size mismatch");
 static_assert(sizeof(JobEnvelopeV1) == 480, "JobEnvelopeV1 size mismatch");
@@ -205,6 +278,9 @@ static_assert(offsetof(JobEnvelopeV2, base) == 0, "JobEnvelopeV2 must embed V1 a
 static_assert(sizeof(MetricSnapshotV1) == 64, "MetricSnapshotV1 size mismatch");
 static_assert(sizeof(FlowUpdateEventV1) == 48, "FlowUpdateEventV1 size mismatch");
 static_assert(sizeof(FlowStreamUpsertV1) == 84, "FlowStreamUpsertV1 size mismatch");
+static_assert(sizeof(TelcoJobPayload) == 104, "TelcoJobPayload size mismatch");
+static_assert(sizeof(TelcoChaosPayload) == 16, "TelcoChaosPayload size mismatch");
+static_assert(sizeof(TelcoStatsPayload) == 64, "TelcoStatsPayload size mismatch");
 
 inline constexpr bool IsVersionSupported(std::uint8_t version) {
   return version == kVersionV1 || version == kVersionV2;

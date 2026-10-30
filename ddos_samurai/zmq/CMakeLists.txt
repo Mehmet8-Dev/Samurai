@@ -117,6 +117,34 @@ add_samurai_worker(samurai_afpacket_worker daemon/afpacket_worker.cpp)
 target_include_directories(samurai_afpacket_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
 target_link_libraries(samurai_afpacket_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static pthread)
 
+add_samurai_worker(samurai_telco_worker daemon/telco_worker.cpp)
+target_include_directories(samurai_telco_worker PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/pppoe
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/dhcp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/bfd
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/mobile
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/sctp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/diameter
+    ${CMAKE_CURRENT_SOURCE_DIR}/../telecom/protocols/stateful/sip_rtp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk)
+target_link_libraries(samurai_telco_worker PRIVATE
+    samurai_telecom_static
+    samurai_core
+    pacing_engine_static
+    pthread
+    dl)
+
+if(DPDK_FOUND)
+  target_compile_definitions(samurai_telco_worker PRIVATE SAMURAI_WITH_DPDK=1)
+  target_include_directories(samurai_telco_worker PRIVATE ${DPDK_INCLUDE_DIRS})
+  target_link_directories(samurai_telco_worker PRIVATE ${DPDK_LIBRARY_DIRS})
+  target_link_libraries(samurai_telco_worker PRIVATE ${DPDK_LIBRARIES})
+  target_compile_options(samurai_telco_worker PRIVATE ${DPDK_CFLAGS_OTHER})
+  target_link_options(samurai_telco_worker PRIVATE ${DPDK_LDFLAGS_OTHER})
+endif()
+
 # Paylaşılan stateful fast-path sürücüsünün in-process (NIC'siz) doğrulama testi.
 add_executable(test_stateful_fastpath
   ${CMAKE_CURRENT_SOURCE_DIR}/daemon/test_stateful_fastpath.cpp

@@ -41,6 +41,7 @@ set(SAMURAI_L7EMU_SOURCES
   l2l3_stack/arp_engine.cpp
   l2l3_stack/igmp_engine.cpp
   l2l3_stack/nd_engine.cpp
+  l2l3_stack/bfd_engine.cpp
   custom_quic_stack/crypto_backend.cpp
   custom_quic_stack/h3_control_plane.cpp
   custom_quic_stack/h3_minimal_client.cpp

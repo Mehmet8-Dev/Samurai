@@ -15,6 +15,7 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/33-doca-gpunetio-migration-status.md
 !docs/36-zmq-worker-architecture.md
 !docs/37-dpu-gpu-dataplane-architecture.md
+!docs/37-telecom-engine-guide.md
 !docs/adr/2026-05-13-doca-gpunetio-hybrid-strict.md
 !docs/perf/doca-gpunetio-progress-report.md
 !policies/TERMS_OF_USE.md
@@ -23,6 +24,7 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/34-dpdk-kurulum-ve-hazirlik-rehberi.md
 !docs/35-vae-defense-integration.md
 !docs/38-architecture-refactor-plan.md
+!plan/*.md
 !docs/pitch-teknik-hazirlik-barikat.md
 !docs/PR_TASK_TEST_L2_02_RFC6675_SACK.md
 !docs/PR_TASK_TEST_L3_01_IOURING_VS_EPOLL.md
