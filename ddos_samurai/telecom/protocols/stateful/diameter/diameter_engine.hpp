@@ -1,6 +1,7 @@
 #pragma once
 
 #include "diameter_types.hpp"
+#include "diameter_dictionary.hpp"
 #include "ddos_samurai/telecom/core/telco_protocol_if.hpp"
 #include "ddos_samurai/telecom/core/session_context.hpp"
 #include "ddos_samurai/telecom/core/session_manager.hpp"
@@ -55,6 +56,30 @@ public:
     std::vector<uint8_t> BuildCcrPacket(TelcoSessionContext* session, const std::string& session_id, CcRequestType req_type, uint32_t req_number);
     std::vector<uint8_t> BuildCcaPacket(TelcoSessionContext* session, const std::string& session_id, uint32_t result_code, CcRequestType req_type, uint32_t req_number, uint32_t hop_id, uint32_t end_id);
 
+    // Dictionary Access & Schema Methods
+    DiameterDictionary& GetDictionary() noexcept { return dictionary_; }
+    const DiameterDictionary& GetDictionary() const noexcept { return dictionary_; }
+    void SetDictionary(const DiameterDictionary& dict) { dictionary_ = dict; }
+
+    bool DecodePayloadAvps(const uint8_t* avp_payload, size_t avp_len, std::vector<DecodedAvp>& out_avps) const;
+    bool ValidateIncomingAvps(uint32_t cmd_code, uint32_t app_id, bool is_request,
+                              const uint8_t* avp_payload, size_t avp_len,
+                              std::vector<DecodedAvp>& out_avps, std::string& err) const;
+
+    // Dictionary-driven packet builders
+    std::vector<uint8_t> BuildDictionaryDrivenPacket(TelcoSessionContext* session, uint32_t cmd_code, uint32_t app_id,
+                                                    bool is_request, const std::vector<DecodedAvp>& avps,
+                                                    uint32_t hop_id = 0, uint32_t end_id = 0);
+    std::vector<uint8_t> BuildDictionaryDrivenCcr(TelcoSessionContext* session, const std::string& session_id,
+                                                 CcRequestType req_type, uint32_t req_number,
+                                                 const std::vector<DecodedAvp>& extra_avps = {},
+                                                 uint32_t app_id = APP_DIAMETER_CREDIT_CONTROL);
+    std::vector<uint8_t> BuildDictionaryDrivenCca(TelcoSessionContext* session, const std::string& session_id,
+                                                 uint32_t result_code, CcRequestType req_type, uint32_t req_number,
+                                                 uint32_t hop_id, uint32_t end_id,
+                                                 const std::vector<DecodedAvp>& extra_avps = {},
+                                                 uint32_t app_id = APP_DIAMETER_CREDIT_CONTROL);
+
     // AVP Kodlama Yardımcıları
     static void AppendAvpString(std::vector<uint8_t>& buf, uint32_t code, uint8_t flags, const std::string& str, uint32_t vendor_id = 0);
     static void AppendAvpU32(std::vector<uint8_t>& buf, uint32_t code, uint8_t flags, uint32_t val, uint32_t vendor_id = 0);
@@ -66,6 +91,7 @@ public:
 private:
     SessionManager& session_mgr_;
     HierarchicalTimingWheel* timing_wheel_{nullptr};
+    DiameterDictionary dictionary_{};
     ProtocolConfig config_{};
     DiameterPeerConfig peer_cfg_{};
     std::vector<uint8_t> last_tx_frame_;

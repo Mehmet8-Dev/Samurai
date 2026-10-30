@@ -819,4 +819,134 @@ rte_mbuf* DiameterEngine::BuildTxPacket(rte_mempool* /*pool*/, TelcoSessionConte
     return nullptr;
 }
 
+bool DiameterEngine::DecodePayloadAvps(const uint8_t* avp_payload, size_t avp_len, std::vector<DecodedAvp>& out_avps) const {
+    return dictionary_.DecodeAvps(avp_payload, avp_len, out_avps);
+}
+
+bool DiameterEngine::ValidateIncomingAvps(uint32_t cmd_code, uint32_t app_id, bool is_request,
+                                          const uint8_t* avp_payload, size_t avp_len,
+                                          std::vector<DecodedAvp>& out_avps, std::string& err) const {
+    if (!dictionary_.DecodeAvps(avp_payload, avp_len, out_avps)) {
+        err = "Failed to decode Diameter AVPs from payload";
+        return false;
+    }
+    return dictionary_.ValidateMessage(cmd_code, app_id, is_request, out_avps, err);
+}
+
+std::vector<uint8_t> DiameterEngine::BuildDictionaryDrivenPacket(TelcoSessionContext* session,
+                                                                uint32_t cmd_code,
+                                                                uint32_t app_id,
+                                                                bool is_request,
+                                                                const std::vector<DecodedAvp>& avps,
+                                                                uint32_t hop_id,
+                                                                uint32_t end_id) {
+    if (!session) return {};
+
+    std::vector<uint8_t> avp_buf;
+    for (const auto& a : avps) {
+        if (!dictionary_.EncodeAvp(a, avp_buf)) {
+            return {};
+        }
+    }
+
+    size_t diam_len = sizeof(DiameterHeader) + avp_buf.size();
+    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(TcpHeader) + diam_len;
+    std::vector<uint8_t> packet(total_len, 0);
+
+    // 1. Ethernet Header
+    auto* eth = reinterpret_cast<EthHeader*>(packet.data());
+    std::memcpy(eth->dst_mac, session->peer_mac, 6);
+    std::memcpy(eth->src_mac, session->client_mac, 6);
+    eth->ethertype = htons(0x0800);
+
+    // 2. IPv4 Header
+    auto* ip = reinterpret_cast<Ipv4Header*>(packet.data() + sizeof(EthHeader));
+    ip->ihl_version = 0x45;
+    ip->total_length = htons(static_cast<uint16_t>(total_len - sizeof(EthHeader)));
+    ip->ttl = 64;
+    ip->protocol = 6; // TCP
+    ip->src_ip = htonl(session->client_ip);
+    ip->dst_ip = htonl(session->peer_ip);
+    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
+
+    // 3. TCP Header
+    size_t tcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header);
+    auto* tcp = reinterpret_cast<TcpHeader*>(packet.data() + tcp_offset);
+    tcp->src_port = htons(session->client_port);
+    tcp->dst_port = htons(session->peer_port);
+    tcp->seq_num = htonl(100);
+    tcp->ack_num = htonl(1);
+    tcp->data_offset = 0x50; // 20 bytes
+    tcp->flags = 0x18;       // ACK + PSH
+    tcp->window_size = htons(65535);
+
+    // 4. Diameter Header
+    size_t diam_offset = tcp_offset + sizeof(TcpHeader);
+    auto* diam = reinterpret_cast<DiameterHeader*>(packet.data() + diam_offset);
+    diam->version = 1;
+    Set24(diam->length, static_cast<uint32_t>(diam_len));
+    diam->command_flags = is_request ? 0x80 : 0x00;
+    Set24(diam->command_code, cmd_code);
+    diam->application_id = htonl(app_id);
+
+    uint32_t h_id = (hop_id != 0) ? hop_id : ++next_hop_by_hop_id_;
+    uint32_t e_id = (end_id != 0) ? end_id : ++next_end_to_end_id_;
+    diam->hop_by_hop_id = htonl(h_id);
+    diam->end_to_end_id = htonl(e_id);
+
+    // 5. Copy AVPs
+    if (!avp_buf.empty()) {
+        std::memcpy(packet.data() + diam_offset + sizeof(DiameterHeader), avp_buf.data(), avp_buf.size());
+    }
+
+    return packet;
+}
+
+std::vector<uint8_t> DiameterEngine::BuildDictionaryDrivenCcr(TelcoSessionContext* session,
+                                                             const std::string& session_id,
+                                                             CcRequestType req_type,
+                                                             uint32_t req_number,
+                                                             const std::vector<DecodedAvp>& extra_avps,
+                                                             uint32_t app_id) {
+    std::vector<DecodedAvp> avps;
+    avps.push_back(DecodedAvp::CreateString(AVP_SESSION_ID, session_id, AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateString(AVP_ORIGIN_HOST, peer_cfg_.origin_host, AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateString(AVP_ORIGIN_REALM, peer_cfg_.origin_realm, AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateString(AVP_DESTINATION_REALM, peer_cfg_.destination_realm, AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateU32(AVP_AUTH_APPLICATION_ID, app_id, AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateString(461, "32251@3gpp.org", AVP_FLAG_MANDATORY)); // Service-Context-Id
+    avps.push_back(DecodedAvp::CreateU32(AVP_CC_REQUEST_TYPE, static_cast<uint32_t>(req_type), AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateU32(AVP_CC_REQUEST_NUMBER, req_number, AVP_FLAG_MANDATORY));
+
+    for (const auto& a : extra_avps) {
+        avps.push_back(a);
+    }
+
+    return BuildDictionaryDrivenPacket(session, CMD_CREDIT_CONTROL, app_id, true, avps);
+}
+
+std::vector<uint8_t> DiameterEngine::BuildDictionaryDrivenCca(TelcoSessionContext* session,
+                                                             const std::string& session_id,
+                                                             uint32_t result_code,
+                                                             CcRequestType req_type,
+                                                             uint32_t req_number,
+                                                             uint32_t hop_id,
+                                                             uint32_t end_id,
+                                                             const std::vector<DecodedAvp>& extra_avps,
+                                                             uint32_t app_id) {
+    std::vector<DecodedAvp> avps;
+    avps.push_back(DecodedAvp::CreateString(AVP_SESSION_ID, session_id, AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateU32(AVP_RESULT_CODE, result_code, AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateString(AVP_ORIGIN_HOST, peer_cfg_.origin_host, AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateString(AVP_ORIGIN_REALM, peer_cfg_.origin_realm, AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateU32(AVP_CC_REQUEST_TYPE, static_cast<uint32_t>(req_type), AVP_FLAG_MANDATORY));
+    avps.push_back(DecodedAvp::CreateU32(AVP_CC_REQUEST_NUMBER, req_number, AVP_FLAG_MANDATORY));
+
+    for (const auto& a : extra_avps) {
+        avps.push_back(a);
+    }
+
+    return BuildDictionaryDrivenPacket(session, CMD_CREDIT_CONTROL, app_id, false, avps, hop_id, end_id);
+}
+
 } // namespace ddos_samurai::telecom::diameter
