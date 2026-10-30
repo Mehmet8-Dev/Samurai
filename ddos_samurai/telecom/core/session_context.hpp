@@ -153,6 +153,23 @@ struct alignas(64) TelcoSessionContext {
         s_vlan = static_cast<uint16_t>(upper >> 16);
         c_vlan = static_cast<uint16_t>(upper & 0xFFFF);
     }
+
+    // SCTP RFC 4960 Yardımcı Fonksiyonları & Multihoming İzleme
+    inline uint32_t GetSctpLocalVTag() const noexcept { return session_id; }
+    inline void SetSctpLocalVTag(uint32_t vtag) noexcept { session_id = vtag; }
+    inline uint32_t GetSctpPeerVTag() const noexcept { return ppp_magic_number; }
+    inline void SetSctpPeerVTag(uint32_t vtag) noexcept { ppp_magic_number = vtag; }
+    inline uint32_t GetSctpOutboundTsn() const noexcept { return teid_uplink; }
+    inline void SetSctpOutboundTsn(uint32_t tsn) noexcept { teid_uplink = tsn; }
+    inline uint32_t GetSctpInboundTsn() const noexcept { return teid_downlink; }
+    inline void SetSctpInboundTsn(uint32_t tsn) noexcept { teid_downlink = tsn; }
+
+    inline uint8_t GetSctpActivePathIndex() const noexcept { return pad1[0]; }
+    inline void SetSctpActivePathIndex(uint8_t idx) noexcept { pad1[0] = idx; }
+    inline uint8_t GetSctpPrimaryPathIndex() const noexcept { return pad1[1]; }
+    inline void SetSctpPrimaryPathIndex(uint8_t idx) noexcept { pad1[1] = idx; }
+    inline uint8_t GetSctpPathCount() const noexcept { return pad1[2]; }
+    inline void SetSctpPathCount(uint8_t cnt) noexcept { pad1[2] = cnt; }
 };
 
 static_assert(sizeof(TelcoSessionContext) == 128, "TelcoSessionContext tam 2 cache line (128 bayt) olmalidir!");

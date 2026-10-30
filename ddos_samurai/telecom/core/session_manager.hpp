@@ -31,6 +31,13 @@ public:
         return &sessions_pool_[index];
     }
 
+    // İşaretçiden havuz indeksini bulma (O(1))
+    inline int32_t GetSessionIndex(const TelcoSessionContext* ctx) const noexcept {
+        if (!ctx || !sessions_pool_) return -1;
+        ptrdiff_t diff = ctx - sessions_pool_;
+        return (diff >= 0 && static_cast<size_t>(diff) < max_sessions_) ? static_cast<int32_t>(diff) : -1;
+    }
+
     // Durumlu L4 5-Tuple ile donanım hızlandırmalı O(1) arama
     TelcoSessionContext* FindSessionBy5Tuple(const Flow5Tuple& tuple) const noexcept;
     TelcoSessionContext* FindSessionBy5Tuple(uint32_t src_ip, uint32_t dst_ip, 
