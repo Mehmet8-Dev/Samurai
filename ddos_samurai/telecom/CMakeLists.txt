@@ -50,6 +50,8 @@ set(SAMURAI_TELECOM_SOURCES
   protocols/stateful/sctp/sctp_engine.hpp
   protocols/stateful/sctp/sctp_engine.cpp
   protocols/stateful/diameter/diameter_types.hpp
+  protocols/stateful/diameter/diameter_dictionary.hpp
+  protocols/stateful/diameter/diameter_dictionary.cpp
   protocols/stateful/diameter/diameter_engine.hpp
   protocols/stateful/diameter/diameter_engine.cpp
   protocols/stateful/sip_rtp/sip_rtp_types.hpp
