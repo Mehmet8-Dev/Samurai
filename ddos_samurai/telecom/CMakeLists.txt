@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+find_package(OpenSSL REQUIRED)
+
 set(SAMURAI_TELECOM_SOURCES
   lockfree_l2l3_cache.hpp
   l2l3_fastpath_wiring.hpp
@@ -57,6 +59,10 @@ set(SAMURAI_TELECOM_SOURCES
   protocols/stateful/sip_rtp/sip_rtp_types.hpp
   protocols/stateful/sip_rtp/sip_rtp_engine.hpp
   protocols/stateful/sip_rtp/sip_rtp_engine.cpp
+  protocols/stateful/sip_rtp/sip_digest_auth.hpp
+  protocols/stateful/sip_rtp/sip_digest_auth.cpp
+  protocols/stateful/sip_rtp/srtp_engine.hpp
+  protocols/stateful/sip_rtp/srtp_engine.cpp
 )
 
 add_library(samurai_telecom_static STATIC ${SAMURAI_TELECOM_SOURCES})
@@ -81,7 +87,7 @@ target_include_directories(samurai_telecom_static PUBLIC
 )
 
 target_compile_options(samurai_telecom_static PUBLIC -msse4.2)
-target_link_libraries(samurai_telecom_static PUBLIC samurai_l7emu samurai_core pthread dl)
+target_link_libraries(samurai_telecom_static PUBLIC samurai_l7emu samurai_core pthread dl OpenSSL::Crypto)
 
 # ---------------------------------------------------------------------------
 # Unit Test Executables
