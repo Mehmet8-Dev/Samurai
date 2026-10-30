@@ -663,6 +663,55 @@ void TestDiameterDictionaryDrivenCcrCca() {
     std::cout << "  -> Dictionary-driven CCR/CCA dynamic packet synthesis: PASSED" << std::endl;
 }
 
+void TestDiameterDictionaryStressAndEdgeCases() {
+    std::cout << "[TEST] 11. Diameter Dictionary Stress & Wire Malformation Edge Cases..." << std::endl;
+
+    DiameterDictionary dict;
+
+    // 1. Truncated & Malformed AVP Wire Packets
+    DecodedAvp dummy;
+    size_t consumed = 0;
+
+    // Truncated buffer (< 8 bytes)
+    uint8_t short_buf[6] = {0, 0, 1, 0x05, 0x40, 0};
+    assert(!dict.DecodeAvp(short_buf, sizeof(short_buf), dummy, consumed));
+
+    // AVP length smaller than header (e.g. length = 6 when header is 8)
+    uint8_t bad_len_buf[8] = {0, 0, 1, 0x05, 0x40, 0, 0, 6};
+    assert(!dict.DecodeAvp(bad_len_buf, sizeof(bad_len_buf), dummy, consumed));
+
+    // Vendor bit set but packet smaller than 12 bytes
+    uint8_t vendor_short_buf[10] = {0, 0, 1, 0x05, 0xC0, 0, 0, 16, 0, 0};
+    assert(!dict.DecodeAvp(vendor_short_buf, sizeof(vendor_short_buf), dummy, consumed));
+
+    // Stated AVP length exceeds buffer (truncated frame)
+    uint8_t truncated_wire[12] = {0, 0, 1, 0x05, 0x40, 0, 0, 20, 1, 2, 3, 4};
+    assert(!dict.DecodeAvp(truncated_wire, sizeof(truncated_wire), dummy, consumed));
+
+    // 2. Stress Test: 5,000 rapid encode/decode cycles of complex nested AVP structures
+    auto rating_group = DecodedAvp::CreateU32(432, 200, AVP_FLAG_MANDATORY | AVP_FLAG_VENDOR, 10415);
+    auto usu_octets = DecodedAvp::CreateU64(421, 1048576000ULL);
+    std::vector<DecodedAvp> usu_children{usu_octets};
+    auto usu = DecodedAvp::CreateGrouped(446, usu_children);
+    std::vector<DecodedAvp> mscc_children{rating_group, usu};
+    auto mscc = DecodedAvp::CreateGrouped(456, mscc_children);
+
+    std::vector<uint8_t> encoded_wire;
+    assert(dict.EncodeAvp(mscc, encoded_wire));
+    assert(!encoded_wire.empty());
+
+    for (int i = 0; i < 5000; ++i) {
+        DecodedAvp out;
+        size_t bytes = 0;
+        bool ok = dict.DecodeAvp(encoded_wire.data(), encoded_wire.size(), out, bytes);
+        assert(ok);
+        assert(bytes == encoded_wire.size());
+        assert(out.grouped_val.size() == 2);
+    }
+
+    std::cout << "  -> Wire malformation rejects and 5,000 cycle stress test: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "       SAMURAI DIAMETER (RFC 6733 / 3GPP) VERIFICATION SUITE     " << std::endl;
@@ -678,6 +727,7 @@ int main() {
     TestDiameterDynamicGroupedAvpCodec();
     TestDiameterDictionaryValidation();
     TestDiameterDictionaryDrivenCcrCca();
+    TestDiameterDictionaryStressAndEdgeCases();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL DIAMETER ENGINE TESTS PASSED SUCCESSFULLY! (100% VERIFIED) " << std::endl;
