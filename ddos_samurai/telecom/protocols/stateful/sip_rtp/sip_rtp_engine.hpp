@@ -2,6 +2,7 @@
 
 #include "sip_rtp_types.hpp"
 #include "sip_digest_auth.hpp"
+#include "srtp_engine.hpp"
 #include "ddos_samurai/telecom/core/telco_protocol_if.hpp"
 #include "ddos_samurai/telecom/core/session_context.hpp"
 #include "ddos_samurai/telecom/core/session_manager.hpp"
@@ -59,6 +60,11 @@ public:
     uint32_t current_cseq() const noexcept { return current_cseq_; }
     const std::string& auth_header() const noexcept { return auth_header_; }
 
+    SrtpEngine& srtp_tx() noexcept { return srtp_tx_; }
+    const SrtpEngine& srtp_tx() const noexcept { return srtp_tx_; }
+    SrtpEngine& srtp_rx() noexcept { return srtp_rx_; }
+    const SrtpEngine& srtp_rx() const noexcept { return srtp_rx_; }
+
     const std::vector<uint8_t>& last_tx_packet() const noexcept { return last_tx_frame_; }
     void SetTimingWheel(HierarchicalTimingWheel* wheel) noexcept { timing_wheel_ = wheel; }
 
@@ -68,6 +74,9 @@ private:
     ProtocolConfig config_{};
     SipCallConfig call_cfg_{};
     std::vector<uint8_t> last_tx_frame_;
+
+    SrtpEngine srtp_tx_{};
+    SrtpEngine srtp_rx_{};
 
     uint32_t current_cseq_{1};
     std::string auth_header_;

@@ -106,6 +106,12 @@ public:
                       size_t srtp_len,
                       std::vector<uint8_t>& out_payload);
 
+    bool UnprotectRtpBuffer(const uint8_t* srtp_pkt,
+                            size_t srtp_len,
+                            uint8_t* out_payload,
+                            size_t max_out_len,
+                            size_t& out_len);
+
     bool UnprotectRtpInPlace(uint8_t* packet_buf, size_t srtp_len, size_t& out_decrypted_len);
 
     // KDF and Cryptographic primitives (exposed for explicit RFC test verification)

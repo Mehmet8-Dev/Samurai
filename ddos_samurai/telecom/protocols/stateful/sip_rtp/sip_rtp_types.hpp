@@ -76,6 +76,11 @@ struct SipCallConfig {
     std::string auth_password{"secret123"};
     std::string auth_cnonce{"0a4f113b"};
     uint32_t    auth_nc{1};
+
+    // SRTP Medya Şifreleme Parametreleri (RFC 3711)
+    bool    enable_srtp{false};
+    uint8_t master_key[16]{0};
+    uint8_t master_salt[14]{0};
 };
 
 // RFC 3550 Jitter İstatistikleri

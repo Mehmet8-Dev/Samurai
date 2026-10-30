@@ -115,6 +115,14 @@ void SipRtpEngine::StartCall(TelcoSessionContext* session, const SipCallConfig& 
     call_cfg_ = cfg;
     current_cseq_ = 1;
     auth_header_.clear();
+
+    if (cfg.enable_srtp) {
+        SrtpKeyConfig key_cfg{};
+        std::memcpy(key_cfg.master_key, cfg.master_key, SRTP_MASTER_KEY_LEN);
+        std::memcpy(key_cfg.master_salt, cfg.master_salt, SRTP_MASTER_SALT_LEN);
+        srtp_tx_.InitKeys(key_cfg);
+        srtp_rx_.InitKeys(key_cfg);
+    }
     session->protocol_id = static_cast<uint8_t>(TelcoProtocolId::SIP_RTP);
     session->client_ip = cfg.local_ip;
     session->peer_ip = cfg.peer_ip;
@@ -340,7 +348,9 @@ std::vector<uint8_t> SipRtpEngine::BuildResponsePacket(TelcoSessionContext* sess
 
 std::vector<uint8_t> SipRtpEngine::BuildRtpPacket(TelcoSessionContext* session, const uint8_t* audio_samples, size_t sample_len) {
     if (!session) return {};
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(RtpHeader) + sample_len;
+
+    size_t srtp_auth_len = call_cfg_.enable_srtp ? SRTP_AUTH_TAG_LEN : 0;
+    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(RtpHeader) + sample_len + srtp_auth_len;
     std::vector<uint8_t> packet(total_len, 0);
 
     // 1. Ethernet
@@ -365,7 +375,7 @@ std::vector<uint8_t> SipRtpEngine::BuildRtpPacket(TelcoSessionContext* session, 
     auto* udp = reinterpret_cast<UdpHeader*>(packet.data() + udp_offset);
     udp->src_port = htons(call_cfg_.local_rtp_port);
     udp->dst_port = htons(call_cfg_.peer_rtp_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + sizeof(RtpHeader) + sample_len));
+    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + sizeof(RtpHeader) + sample_len + srtp_auth_len));
     udp->checksum = 0;
 
     // 4. RTP Header (RFC 3550)
@@ -381,6 +391,16 @@ std::vector<uint8_t> SipRtpEngine::BuildRtpPacket(TelcoSessionContext* session, 
     // 5. Audio Payload
     if (audio_samples && sample_len > 0) {
         std::memcpy(packet.data() + rtp_offset + sizeof(RtpHeader), audio_samples, sample_len);
+    }
+
+    // 6. SRTP Encryption & Authentication Tag (RFC 3711)
+    if (call_cfg_.enable_srtp) {
+        size_t out_len = 0;
+        srtp_tx_.ProtectRtpInPlace(packet.data() + rtp_offset,
+                                   sizeof(RtpHeader),
+                                   sample_len,
+                                   packet.size() - rtp_offset,
+                                   out_len);
     }
 
     return packet;
@@ -546,7 +566,25 @@ bool SipRtpEngine::ProcessSipMessage(TelcoSessionContext* session, const std::st
 }
 
 bool SipRtpEngine::ProcessRtpPacket(TelcoSessionContext* /*session*/, const uint8_t* rtp_data, size_t len, uint64_t now_tsc) {
-    if (len < sizeof(RtpHeader)) return false;
+    if (!rtp_data) return false;
+
+    if (call_cfg_.enable_srtp) {
+        if (len < sizeof(RtpHeader) + SRTP_AUTH_TAG_LEN) {
+            jitter_stats_.packets_lost++;
+            return false;
+        }
+
+        // SRTP Doğrulama ve Deşifreleme (Zero Heap Allocation)
+        uint8_t audio_buf[2048];
+        size_t audio_len = 0;
+        if (!srtp_rx_.UnprotectRtpBuffer(rtp_data, len, audio_buf, sizeof(audio_buf), audio_len)) {
+            // Kimlik doğrulama başarısız veya replay saldırısı tespit edildi
+            jitter_stats_.packets_lost++;
+            return false;
+        }
+    } else {
+        if (len < sizeof(RtpHeader)) return false;
+    }
 
     const auto* rtp = reinterpret_cast<const RtpHeader*>(rtp_data);
     uint32_t rtp_ts = ntohl(rtp->timestamp);

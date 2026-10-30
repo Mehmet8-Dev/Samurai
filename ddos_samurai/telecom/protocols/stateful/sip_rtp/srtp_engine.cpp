@@ -186,13 +186,17 @@ bool SrtpEngine::ProtectRtpInPlace(uint8_t* packet_buf, size_t rtp_header_len, s
     return true;
 }
 
-bool SrtpEngine::UnprotectRtp(const uint8_t* srtp_pkt,
-                              size_t srtp_len,
-                              std::vector<uint8_t>& out_payload) {
+bool SrtpEngine::UnprotectRtpBuffer(const uint8_t* srtp_pkt,
+                                    size_t srtp_len,
+                                    uint8_t* out_payload,
+                                    size_t max_out_len,
+                                    size_t& out_len) {
     if (!enc_ctx_ || !mac_ctx_ || !srtp_pkt) return false;
     if (srtp_len < 12 + SRTP_AUTH_TAG_LEN) return false;
 
     size_t cipher_len = srtp_len - 12 - SRTP_AUTH_TAG_LEN;
+    if (max_out_len < cipher_len) return false;
+
     uint16_t seq = (static_cast<uint16_t>(srtp_pkt[2]) << 8) | srtp_pkt[3];
     uint32_t ssrc = (static_cast<uint32_t>(srtp_pkt[8]) << 24) |
                     (static_cast<uint32_t>(srtp_pkt[9]) << 16) |
@@ -217,14 +221,28 @@ bool SrtpEngine::UnprotectRtp(const uint8_t* srtp_pkt,
     // Auth succeeded: commit to sliding replay window
     CommitReplay(session_ctx_, seq, packet_index, est_roc);
 
-    // Decrypt audio payload
-    out_payload.resize(cipher_len);
-    if (cipher_len > 0) {
-        std::memcpy(out_payload.data(), srtp_pkt + 12, cipher_len);
-        ComputeAesIcmKeystream(enc_ctx_, session_ctx_.k_s, ssrc, packet_index, out_payload.data(), cipher_len);
+    // Decrypt audio payload directly into buffer (Zero Heap Allocation)
+    if (cipher_len > 0 && out_payload) {
+        std::memcpy(out_payload, srtp_pkt + 12, cipher_len);
+        ComputeAesIcmKeystream(enc_ctx_, session_ctx_.k_s, ssrc, packet_index, out_payload, cipher_len);
     }
+    out_len = cipher_len;
 
     return true;
+}
+
+bool SrtpEngine::UnprotectRtp(const uint8_t* srtp_pkt,
+                              size_t srtp_len,
+                              std::vector<uint8_t>& out_payload) {
+    if (!srtp_pkt || srtp_len < 12 + SRTP_AUTH_TAG_LEN) return false;
+    size_t cipher_len = srtp_len - 12 - SRTP_AUTH_TAG_LEN;
+    out_payload.resize(cipher_len);
+    size_t out_len = 0;
+    bool ok = UnprotectRtpBuffer(srtp_pkt, srtp_len, out_payload.data(), out_payload.size(), out_len);
+    if (!ok) {
+        out_payload.clear();
+    }
+    return ok;
 }
 
 bool SrtpEngine::UnprotectRtpInPlace(uint8_t* packet_buf, size_t srtp_len, size_t& out_decrypted_len) {
