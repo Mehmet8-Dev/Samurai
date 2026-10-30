@@ -21,14 +21,15 @@ enum class SipMethod : uint8_t {
     OPTIONS
 };
 
-// SIP FSM Durumları (RFC 3261)
+// SIP FSM Durumları (RFC 3261 & RFC 2617)
 enum class SipCallState : uint8_t {
     IDLE = 0,
-    CALLING,      // INVITE gönderildi
-    PROCEEDING,   // 100 Trying veya 180 Ringing alındı
-    ESTABLISHED,  // 200 OK alındı, ACK gönderildi (Medya/RTP aktif)
-    TERMINATING,  // BYE gönderildi
-    TERMINATED,   // 200 OK (BYE) alındı veya arama sonlandı
+    CALLING,        // INVITE gönderildi
+    AUTHENTICATING, // 401/407 Unauthorized alındı, Authorization ile yeni INVITE gönderildi
+    PROCEEDING,     // 100 Trying veya 180 Ringing alındı
+    ESTABLISHED,    // 200 OK alındı, ACK gönderildi (Medya/RTP aktif)
+    TERMINATING,    // BYE gönderildi
+    TERMINATED,     // 200 OK (BYE) alındı veya arama sonlandı
     FAILED
 };
 
@@ -69,6 +70,12 @@ struct SipCallConfig {
     uint8_t  payload_type{0}; // 0 = PCMU (G.711 u-law 64 kbps)
     uint32_t ptime_ms{20};    // 20ms packetization interval
     uint32_t sample_rate{8000};
+
+    // SIP Digest Kimlik Doğrulama Parametreleri (RFC 2617 & RFC 3261)
+    std::string auth_username{"alice"};
+    std::string auth_password{"secret123"};
+    std::string auth_cnonce{"0a4f113b"};
+    uint32_t    auth_nc{1};
 };
 
 // RFC 3550 Jitter İstatistikleri

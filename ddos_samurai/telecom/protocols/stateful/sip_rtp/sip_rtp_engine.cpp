@@ -91,6 +91,7 @@ void SipRtpEngine::SetState(TelcoSessionContext* session, SipCallState state) no
             session->state = SessionState::ESTABLISHED;
             break;
         case SipCallState::CALLING:
+        case SipCallState::AUTHENTICATING:
         case SipCallState::PROCEEDING:
             session->state = SessionState::DISCOVERING;
             break;
@@ -112,6 +113,8 @@ void SipRtpEngine::StartCall(TelcoSessionContext* session, const SipCallConfig& 
     if (!session) return;
 
     call_cfg_ = cfg;
+    current_cseq_ = 1;
+    auth_header_.clear();
     session->protocol_id = static_cast<uint8_t>(TelcoProtocolId::SIP_RTP);
     session->client_ip = cfg.local_ip;
     session->peer_ip = cfg.peer_ip;
@@ -158,6 +161,7 @@ void SipRtpEngine::TerminateCall(TelcoSessionContext* session) {
 }
 
 std::vector<uint8_t> SipRtpEngine::BuildInvitePacket(TelcoSessionContext* session) {
+    if (!session) return {};
     // 1. SDP Body
     std::string sdp = 
         "v=0\r\n"
@@ -172,13 +176,14 @@ std::vector<uint8_t> SipRtpEngine::BuildInvitePacket(TelcoSessionContext* sessio
     // 2. SIP Header
     std::string sip = 
         "INVITE " + call_cfg_.to_uri + " SIP/2.0\r\n"
-        "Via: SIP/2.0/UDP " + call_cfg_.local_ip_str + ":" + std::to_string(call_cfg_.local_sip_port) + ";branch=z9hG4bK-samurai-1\r\n"
+        "Via: SIP/2.0/UDP " + call_cfg_.local_ip_str + ":" + std::to_string(call_cfg_.local_sip_port) + ";branch=z9hG4bK-samurai-" + std::to_string(current_cseq_) + "\r\n"
         "Max-Forwards: 70\r\n"
         "From: <" + call_cfg_.from_uri + ">;tag=tag-samurai-client\r\n"
         "To: <" + call_cfg_.to_uri + ">\r\n"
         "Call-ID: " + call_cfg_.call_id + "\r\n"
-        "CSeq: 1 INVITE\r\n"
+        "CSeq: " + std::to_string(current_cseq_) + " INVITE\r\n"
         "Contact: <sip:alice@" + call_cfg_.local_ip_str + ":" + std::to_string(call_cfg_.local_sip_port) + ">\r\n"
+        + auth_header_ +
         "Content-Type: application/sdp\r\n"
         "Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
 
@@ -186,8 +191,8 @@ std::vector<uint8_t> SipRtpEngine::BuildInvitePacket(TelcoSessionContext* sessio
     std::vector<uint8_t> packet(total_len, 0);
 
     auto* eth = reinterpret_cast<EthHeader*>(packet.data());
-    std::memcpy(eth->dst_mac, session->peer_mac, 6);
-    std::memcpy(eth->src_mac, session->client_mac, 6);
+    std::memcpy(packet.data(), session->peer_mac, 6);
+    std::memcpy(packet.data() + 6, session->client_mac, 6);
     eth->ethertype = htons(0x0800);
 
     auto* ip = reinterpret_cast<Ipv4Header*>(packet.data() + sizeof(EthHeader));
@@ -212,22 +217,23 @@ std::vector<uint8_t> SipRtpEngine::BuildInvitePacket(TelcoSessionContext* sessio
 }
 
 std::vector<uint8_t> SipRtpEngine::BuildAckPacket(TelcoSessionContext* session) {
+    if (!session) return {};
     std::string sip = 
         "ACK " + call_cfg_.to_uri + " SIP/2.0\r\n"
-        "Via: SIP/2.0/UDP " + call_cfg_.local_ip_str + ":" + std::to_string(call_cfg_.local_sip_port) + ";branch=z9hG4bK-samurai-2\r\n"
+        "Via: SIP/2.0/UDP " + call_cfg_.local_ip_str + ":" + std::to_string(call_cfg_.local_sip_port) + ";branch=z9hG4bK-samurai-ack\r\n"
         "Max-Forwards: 70\r\n"
         "From: <" + call_cfg_.from_uri + ">;tag=tag-samurai-client\r\n"
         "To: <" + call_cfg_.to_uri + ">;tag=tag-samurai-server\r\n"
         "Call-ID: " + call_cfg_.call_id + "\r\n"
-        "CSeq: 1 ACK\r\n"
+        "CSeq: " + std::to_string(current_cseq_) + " ACK\r\n"
         "Content-Length: 0\r\n\r\n";
 
     size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sip.size();
     std::vector<uint8_t> packet(total_len, 0);
 
     auto* eth = reinterpret_cast<EthHeader*>(packet.data());
-    std::memcpy(eth->dst_mac, session->peer_mac, 6);
-    std::memcpy(eth->src_mac, session->client_mac, 6);
+    std::memcpy(packet.data(), session->peer_mac, 6);
+    std::memcpy(packet.data() + 6, session->client_mac, 6);
     eth->ethertype = htons(0x0800);
 
     auto* ip = reinterpret_cast<Ipv4Header*>(packet.data() + sizeof(EthHeader));
@@ -252,6 +258,7 @@ std::vector<uint8_t> SipRtpEngine::BuildAckPacket(TelcoSessionContext* session) 
 }
 
 std::vector<uint8_t> SipRtpEngine::BuildByePacket(TelcoSessionContext* session) {
+    if (!session) return {};
     std::string sip = 
         "BYE " + call_cfg_.to_uri + " SIP/2.0\r\n"
         "Via: SIP/2.0/UDP " + call_cfg_.local_ip_str + ":" + std::to_string(call_cfg_.local_sip_port) + ";branch=z9hG4bK-samurai-bye\r\n"
@@ -259,15 +266,15 @@ std::vector<uint8_t> SipRtpEngine::BuildByePacket(TelcoSessionContext* session) 
         "From: <" + call_cfg_.from_uri + ">;tag=tag-samurai-client\r\n"
         "To: <" + call_cfg_.to_uri + ">;tag=tag-samurai-server\r\n"
         "Call-ID: " + call_cfg_.call_id + "\r\n"
-        "CSeq: 2 BYE\r\n"
+        "CSeq: " + std::to_string(current_cseq_ + 1) + " BYE\r\n"
         "Content-Length: 0\r\n\r\n";
 
     size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sip.size();
     std::vector<uint8_t> packet(total_len, 0);
 
     auto* eth = reinterpret_cast<EthHeader*>(packet.data());
-    std::memcpy(eth->dst_mac, session->peer_mac, 6);
-    std::memcpy(eth->src_mac, session->client_mac, 6);
+    std::memcpy(packet.data(), session->peer_mac, 6);
+    std::memcpy(packet.data() + 6, session->client_mac, 6);
     eth->ethertype = htons(0x0800);
 
     auto* ip = reinterpret_cast<Ipv4Header*>(packet.data() + sizeof(EthHeader));
@@ -292,6 +299,7 @@ std::vector<uint8_t> SipRtpEngine::BuildByePacket(TelcoSessionContext* session) 
 }
 
 std::vector<uint8_t> SipRtpEngine::BuildResponsePacket(TelcoSessionContext* session, int status_code, const std::string& reason) {
+    if (!session) return {};
     std::string sip = 
         "SIP/2.0 " + std::to_string(status_code) + " " + reason + "\r\n"
         "Via: SIP/2.0/UDP " + call_cfg_.peer_ip_str + ":" + std::to_string(call_cfg_.peer_sip_port) + ";branch=z9hG4bK-peer\r\n"
@@ -305,8 +313,8 @@ std::vector<uint8_t> SipRtpEngine::BuildResponsePacket(TelcoSessionContext* sess
     std::vector<uint8_t> packet(total_len, 0);
 
     auto* eth = reinterpret_cast<EthHeader*>(packet.data());
-    std::memcpy(eth->dst_mac, session->peer_mac, 6);
-    std::memcpy(eth->src_mac, session->client_mac, 6);
+    std::memcpy(packet.data(), session->peer_mac, 6);
+    std::memcpy(packet.data() + 6, session->client_mac, 6);
     eth->ethertype = htons(0x0800);
 
     auto* ip = reinterpret_cast<Ipv4Header*>(packet.data() + sizeof(EthHeader));
@@ -331,13 +339,14 @@ std::vector<uint8_t> SipRtpEngine::BuildResponsePacket(TelcoSessionContext* sess
 }
 
 std::vector<uint8_t> SipRtpEngine::BuildRtpPacket(TelcoSessionContext* session, const uint8_t* audio_samples, size_t sample_len) {
+    if (!session) return {};
     size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(RtpHeader) + sample_len;
     std::vector<uint8_t> packet(total_len, 0);
 
     // 1. Ethernet
     auto* eth = reinterpret_cast<EthHeader*>(packet.data());
-    std::memcpy(eth->dst_mac, session->peer_mac, 6);
-    std::memcpy(eth->src_mac, session->client_mac, 6);
+    std::memcpy(packet.data(), session->peer_mac, 6);
+    std::memcpy(packet.data() + 6, session->client_mac, 6);
     eth->ethertype = htons(0x0800);
 
     // 2. IPv4
@@ -444,13 +453,67 @@ bool SipRtpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, uint64_t now
 }
 
 bool SipRtpEngine::ProcessSipMessage(TelcoSessionContext* session, const std::string& sip_msg, uint64_t /*now_tsc*/) {
+    // 401 Unauthorized veya 407 Proxy Authentication Required kontrolü
+    if (sip_msg.find("401 Unauthorized") != std::string::npos ||
+        sip_msg.find("407 Proxy Authentication Required") != std::string::npos) {
+        if (GetState(session) == SipCallState::CALLING) {
+            DigestChallenge challenge;
+            bool is_proxy = false;
+            if (ExtractDigestChallengeFromSipMessage(sip_msg, challenge, is_proxy)) {
+                SetState(session, SipCallState::AUTHENTICATING);
+                current_cseq_++; // RFC 3261 Section 22.2: Bump CSeq for re-INVITE
+
+                DigestCredentials creds;
+                creds.username = call_cfg_.auth_username;
+                creds.realm = challenge.realm;
+                creds.nonce = challenge.nonce;
+                creds.uri = call_cfg_.to_uri;
+                creds.algorithm = challenge.algorithm.empty() ? "MD5" : challenge.algorithm;
+                creds.opaque = challenge.opaque;
+                creds.qop = challenge.qop;
+                char nc_buf[16];
+                std::snprintf(nc_buf, sizeof(nc_buf), "%08x", call_cfg_.auth_nc);
+                creds.nc = nc_buf;
+                creds.cnonce = call_cfg_.auth_cnonce;
+
+                creds.response = CalculateDigestResponse(
+                    creds.username,
+                    creds.realm,
+                    call_cfg_.auth_password,
+                    "INVITE",
+                    creds.uri,
+                    creds.nonce,
+                    creds.nc,
+                    creds.cnonce,
+                    creds.qop,
+                    creds.algorithm
+                );
+
+                auth_header_ = BuildAuthorizationHeader(creds, is_proxy);
+
+                // Yetkilendirme başlığı eklenmiş yeni INVITE gönder
+                last_tx_frame_ = BuildInvitePacket(session);
+                session->tx_packets++;
+                session->tx_bytes += last_tx_frame_.size();
+
+                if (timing_wheel_) {
+                    timing_wheel_->Cancel(session);
+                    timing_wheel_->Schedule(session, 1000);
+                }
+                return true;
+            }
+        }
+    }
+
     if (sip_msg.find("100 Trying") != std::string::npos || sip_msg.find("180 Ringing") != std::string::npos) {
         SetState(session, SipCallState::PROCEEDING);
         return true;
     }
 
     if (sip_msg.find("200 OK") != std::string::npos) {
-        if (GetState(session) == SipCallState::CALLING || GetState(session) == SipCallState::PROCEEDING) {
+        if (GetState(session) == SipCallState::CALLING ||
+            GetState(session) == SipCallState::AUTHENTICATING ||
+            GetState(session) == SipCallState::PROCEEDING) {
             SetState(session, SipCallState::ESTABLISHED);
             // 200 OK alındı; hemen ACK üret
             last_tx_frame_ = BuildAckPacket(session);
@@ -512,7 +575,7 @@ void SipRtpEngine::HandleTimeout(TelcoSessionContext* session) {
 
     SipCallState state = GetState(session);
 
-    if (state == SipCallState::CALLING) {
+    if (state == SipCallState::CALLING || state == SipCallState::AUTHENTICATING) {
         session->retry_count++;
         if (session->retry_count >= config_.max_retries) {
             SetState(session, SipCallState::FAILED);

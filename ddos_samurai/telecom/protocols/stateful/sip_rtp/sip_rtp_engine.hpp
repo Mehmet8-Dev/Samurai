@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sip_rtp_types.hpp"
+#include "sip_digest_auth.hpp"
 #include "ddos_samurai/telecom/core/telco_protocol_if.hpp"
 #include "ddos_samurai/telecom/core/session_context.hpp"
 #include "ddos_samurai/telecom/core/session_manager.hpp"
@@ -55,6 +56,9 @@ public:
     // RFC 3550 Jitter Bilgisi
     RtpJitterStats GetJitterStats() const noexcept { return jitter_stats_; }
 
+    uint32_t current_cseq() const noexcept { return current_cseq_; }
+    const std::string& auth_header() const noexcept { return auth_header_; }
+
     const std::vector<uint8_t>& last_tx_packet() const noexcept { return last_tx_frame_; }
     void SetTimingWheel(HierarchicalTimingWheel* wheel) noexcept { timing_wheel_ = wheel; }
 
@@ -65,6 +69,8 @@ private:
     SipCallConfig call_cfg_{};
     std::vector<uint8_t> last_tx_frame_;
 
+    uint32_t current_cseq_{1};
+    std::string auth_header_;
     uint32_t current_rtp_ts_{0};
     uint16_t current_rtp_seq_{0};
     RtpJitterStats jitter_stats_{};
