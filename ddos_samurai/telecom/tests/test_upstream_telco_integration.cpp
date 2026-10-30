@@ -1,6 +1,11 @@
 #include "ddos_samurai/telecom/l2l3_fastpath_wiring.hpp"
 #include "ddos_samurai/telecom/core/session_manager.hpp"
 #include "ddos_samurai/telecom/core/hierarchical_timing_wheel.hpp"
+#include "ddos_samurai/telecom/core/fastpath_classifier.hpp"
+#include "ddos_samurai/telecom/protocols/stateful/pppoe/pppoe_engine.hpp"
+#include "ddos_samurai/telecom/protocols/stateful/dhcp/dhcp_engine.hpp"
+#include "ddos_samurai/telecom/protocols/stateful/bfd/bfd_engine.hpp"
+#include "ddos_samurai/telecom/protocols/stateful/mobile/gtpu_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/sctp/sctp_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/diameter/diameter_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/sip_rtp/sip_rtp_engine.hpp"
@@ -15,6 +20,10 @@
 #include <arpa/inet.h>
 
 using namespace ddos_samurai::telecom;
+using namespace ddos_samurai::telecom::pppoe;
+using namespace ddos_samurai::telecom::dhcp;
+using namespace ddos_samurai::telecom::bfd;
+using namespace ddos_samurai::telecom::mobile;
 using namespace ddos_samurai::telecom::sctp;
 using namespace ddos_samurai::telecom::diameter;
 using namespace ddos_samurai::telecom::sip_rtp;
@@ -381,6 +390,124 @@ void TestTelcoMultiProtocolWorkerLoop() {
               << " packets (" << total_tx_bytes << " bytes) generated across SCTP, Diameter, and SRTP: PASSED" << std::endl;
 }
 
+void TestTelcoAllProtocolsDriverLifecycle() {
+    std::cout << "[TEST 4] Telco Full Engine Driver Lifecycle (PPPoE, DHCP, BFD, GTP-U, SCTP, Diameter, SIP/RTP)..." << std::endl;
+
+    // 1. Invariant TSC & Frequency Calibration
+    uint64_t tsc_hz = HierarchicalTimingWheel::CalibrateTscHz();
+    assert(tsc_hz > 100000000ULL); // > 100 MHz
+    std::cout << "  -> Calibrated TSC Frequency: " << (tsc_hz / 1000000.0) << " MHz: PASSED" << std::endl;
+
+    // 2. SessionManager Safe Allocation Type Tracking
+    SessionManager mgr(128);
+    assert(mgr.GetCapacity() == 128);
+    auto alloc_type = mgr.GetAllocationType();
+    assert(alloc_type == SessionManager::AllocationType::HugePage ||
+           alloc_type == SessionManager::AllocationType::PosixMemalign ||
+           alloc_type == SessionManager::AllocationType::NewArray);
+    std::cout << "  -> SessionManager AllocationType Checked & Memory Safe: PASSED" << std::endl;
+
+    HierarchicalTimingWheel wheel(tsc_hz);
+    PppoeEngine pppoe(mgr, &wheel);
+    DhcpEngine dhcp(mgr, &wheel);
+    BfdEngine bfd(mgr, &wheel);
+    GtpuEngine gtpu(mgr, &wheel);
+    SctpEngine sctp(mgr, &wheel);
+    DiameterEngine diameter(mgr, &wheel);
+    SipRtpEngine sip(mgr, &wheel);
+
+    ProtocolConfig cfg{};
+    cfg.retransmit_timeout_ms = 500;
+    cfg.max_retries = 3;
+    pppoe.Init(cfg);
+    dhcp.Init(cfg);
+    bfd.Init(cfg);
+    gtpu.Init(cfg);
+    sctp.Init(cfg);
+    diameter.Init(cfg);
+    sip.Init(cfg);
+
+    // 3. PPPoE Session Lifecycle
+    {
+        TelcoSessionContext* s = mgr.AcquireSession();
+        assert(s != nullptr);
+        s->session_id = 101;
+        uint8_t mac[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+        std::memcpy(s->client_mac, mac, 6);
+        mgr.BindPppoeSession(s, mac, 101);
+        pppoe.StartSession(s);
+        auto pkt = pppoe.BuildPadiFrame(s);
+        assert(!pkt.empty());
+        PacketMetadata meta{};
+        TelcoFrameType type = TelcoFrameType::Unknown;
+        assert(FastpathClassifier::Classify(pkt.data(), pkt.size(), meta, type));
+        assert(type == TelcoFrameType::PppoeDiscovery);
+        mgr.ReleaseSession(s);
+    }
+
+    // 4. DHCPv4 Session Lifecycle
+    {
+        TelcoSessionContext* s = mgr.AcquireSession();
+        assert(s != nullptr);
+        uint32_t xid = 0x54454C01;
+        s->SetDhcpXid(xid);
+        uint8_t mac[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x56};
+        std::memcpy(s->client_mac, mac, 6);
+        mgr.BindDhcpSession(s, xid);
+        dhcp.StartDhcpv4(s, xid);
+        auto pkt = dhcp.BuildDhcpv4Discover(s);
+        assert(!pkt.empty());
+        PacketMetadata meta{};
+        TelcoFrameType type = TelcoFrameType::Unknown;
+        assert(FastpathClassifier::Classify(pkt.data(), pkt.size(), meta, type));
+        assert(type == TelcoFrameType::Dhcp);
+        mgr.ReleaseSession(s);
+    }
+
+    // 5. BFD Session Lifecycle
+    {
+        TelcoSessionContext* s = mgr.AcquireSession();
+        assert(s != nullptr);
+        uint32_t disc = 0x80000001;
+        s->SetBfdLocalDisc(disc);
+        mgr.BindBfdSession(s, disc);
+        BfdConfig bfd_cfg{};
+        bfd_cfg.local_disc = disc;
+        bfd.StartSession(s, bfd_cfg);
+        auto pkt = bfd.BuildBfdControlPacket(s, BfdState::Up, BfdDiag::None);
+        assert(!pkt.empty());
+        PacketMetadata meta{};
+        TelcoFrameType type = TelcoFrameType::Unknown;
+        assert(FastpathClassifier::Classify(pkt.data(), pkt.size(), meta, type));
+        assert(type == TelcoFrameType::Bfd);
+        mgr.ReleaseSession(s);
+    }
+
+    // 6. GTP-U Session Lifecycle & Encapsulation
+    {
+        TelcoSessionContext* s = mgr.AcquireSession();
+        assert(s != nullptr);
+        s->teid_uplink = 0x10000001;
+        s->client_ip = 0x0A000001;
+        s->peer_ip = 0x0A0000FE;
+        mgr.BindGtpuSession(s, s->teid_uplink);
+        GtpuTunnelConfig gtp_cfg{};
+        gtp_cfg.uplink_teid = s->teid_uplink;
+        gtp_cfg.peer_upf_ip = s->peer_ip;
+        gtpu.StartSession(s, gtp_cfg);
+        static const uint8_t inner_pdu[20] = {0x45, 0x00, 0x00, 0x14};
+        auto pkt = gtpu.Encapsulate(s, inner_pdu, sizeof(inner_pdu), 1);
+        assert(!pkt.empty());
+        PacketMetadata meta{};
+        TelcoFrameType type = TelcoFrameType::Unknown;
+        assert(FastpathClassifier::Classify(pkt.data(), pkt.size(), meta, type));
+        assert(type == TelcoFrameType::Gtpu);
+        mgr.ReleaseSession(s);
+    }
+
+    std::cout << "  -> Full Protocol Driver Lifecycle (PPPoE, DHCP, BFD, GTP-U): PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "     UPSTREAM TELCO WORKER & FASTPATH INTEGRATION TEST SUITE     " << std::endl;
@@ -389,6 +516,7 @@ int main() {
     TestL2L3FastpathWiringTelcoDispatch();
     TestTelcoWorkerCliArgParsing();
     TestTelcoMultiProtocolWorkerLoop();
+    TestTelcoAllProtocolsDriverLifecycle();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL UPSTREAM TELCO INTEGRATION TESTS PASSED SUCCESSFULLY!      " << std::endl;
