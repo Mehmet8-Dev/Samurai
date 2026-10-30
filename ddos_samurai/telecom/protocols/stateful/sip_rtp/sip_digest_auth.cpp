@@ -179,4 +179,62 @@ bool ExtractDigestChallengeFromSipMessage(const std::string& sip_msg, DigestChal
     return false;
 }
 
+namespace {
+
+inline std::string HashByAlgo(std::string_view data, std::string_view algo) {
+    std::string lower = ToLower(algo);
+    if (lower == "sha-256" || lower == "sha256") {
+        return ComputeSha256Hex(data);
+    }
+    return ComputeMd5Hex(data);
+}
+
+} // namespace
+
+std::string CalculateDigestResponse(
+    const std::string& username,
+    const std::string& realm,
+    const std::string& password,
+    const std::string& method,
+    const std::string& digest_uri,
+    const std::string& nonce,
+    const std::string& nc,
+    const std::string& cnonce,
+    const std::string& qop,
+    const std::string& algorithm
+) {
+    std::string ha1 = HashByAlgo(username + ":" + realm + ":" + password, algorithm);
+    std::string ha2 = HashByAlgo(method + ":" + digest_uri, algorithm);
+
+    if (!qop.empty()) {
+        return HashByAlgo(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop + ":" + ha2, algorithm);
+    } else {
+        return HashByAlgo(ha1 + ":" + nonce + ":" + ha2, algorithm);
+    }
+}
+
+std::string BuildAuthorizationHeader(const DigestCredentials& creds, bool is_proxy) {
+    std::ostringstream oss;
+    oss << (is_proxy ? "Proxy-Authorization: Digest " : "Authorization: Digest ");
+    oss << "username=\"" << creds.username << "\"";
+    oss << ", realm=\"" << creds.realm << "\"";
+    oss << ", nonce=\"" << creds.nonce << "\"";
+    oss << ", uri=\"" << creds.uri << "\"";
+    oss << ", response=\"" << creds.response << "\"";
+
+    if (!creds.algorithm.empty()) {
+        oss << ", algorithm=" << creds.algorithm;
+    }
+    if (!creds.opaque.empty()) {
+        oss << ", opaque=\"" << creds.opaque << "\"";
+    }
+    if (!creds.qop.empty()) {
+        oss << ", qop=" << creds.qop;
+        oss << ", nc=" << creds.nc;
+        oss << ", cnonce=\"" << creds.cnonce << "\"";
+    }
+    oss << "\r\n";
+    return oss.str();
+}
+
 } // namespace ddos_samurai::telecom::sip_rtp

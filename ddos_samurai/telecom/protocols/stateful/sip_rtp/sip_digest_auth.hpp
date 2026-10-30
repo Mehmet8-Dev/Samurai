@@ -20,6 +20,22 @@ struct DigestChallenge {
 };
 
 /**
+ * @brief Credentials to format an Authorization or Proxy-Authorization header.
+ */
+struct DigestCredentials {
+    std::string username;
+    std::string realm;
+    std::string nonce;
+    std::string uri;
+    std::string response;
+    std::string algorithm{"MD5"};
+    std::string cnonce;
+    std::string opaque;
+    std::string qop;
+    std::string nc{"00000001"};
+};
+
+/**
  * @brief Computes MD5 hash and returns a 32-character lowercase hex string.
  */
 std::string ComputeMd5Hex(std::string_view data);
@@ -50,5 +66,34 @@ bool ParseDigestChallenge(std::string_view header_val, DigestChallenge& out_chal
  * @return true if a challenge header was found and successfully parsed.
  */
 bool ExtractDigestChallengeFromSipMessage(const std::string& sip_msg, DigestChallenge& out_challenge, bool& is_proxy);
+
+/**
+ * @brief Computes RFC 2617 / RFC 3261 digest response hex string.
+ *
+ * HA1 = Hash(username:realm:password)
+ * HA2 = Hash(method:digest_uri)
+ * Response = Hash(HA1:nonce:nc:cnonce:qop:HA2) or Hash(HA1:nonce:HA2)
+ */
+std::string CalculateDigestResponse(
+    const std::string& username,
+    const std::string& realm,
+    const std::string& password,
+    const std::string& method,
+    const std::string& digest_uri,
+    const std::string& nonce,
+    const std::string& nc = "00000001",
+    const std::string& cnonce = "0a4f113b",
+    const std::string& qop = "auth",
+    const std::string& algorithm = "MD5"
+);
+
+/**
+ * @brief Builds the Authorization or Proxy-Authorization header string.
+ *
+ * @param creds Full credentials and digest response.
+ * @param is_proxy If true, produces "Proxy-Authorization: ...", else "Authorization: ...".
+ * @return Formatted header line ending with "\r\n".
+ */
+std::string BuildAuthorizationHeader(const DigestCredentials& creds, bool is_proxy = false);
 
 } // namespace ddos_samurai::telecom::sip_rtp
