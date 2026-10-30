@@ -17,8 +17,12 @@ public:
 
     using ExpireCallback = std::function<void(TelcoSessionContext*)>;
 
-    explicit HierarchicalTimingWheel(uint64_t tsc_hz);
+    explicit HierarchicalTimingWheel(uint64_t tsc_hz = 0);
     ~HierarchicalTimingWheel();
+
+    // Donanım TSC Kalibrasyonu (CPUID leaf 0x15/0x16 + CLOCK_MONOTONIC fallback)
+    static uint64_t CalibrateTscHz() noexcept;
+    static bool IsInvariantTscSupported() noexcept;
 
     HierarchicalTimingWheel(const HierarchicalTimingWheel&) = delete;
     HierarchicalTimingWheel& operator=(const HierarchicalTimingWheel&) = delete;

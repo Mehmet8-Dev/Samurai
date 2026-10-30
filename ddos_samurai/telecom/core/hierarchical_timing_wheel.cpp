@@ -2,11 +2,77 @@
 
 #include <cstring>
 #include <algorithm>
+#include <time.h>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#include <x86intrin.h>
+#endif
 
 namespace ddos_samurai::telecom {
 
+bool HierarchicalTimingWheel::IsInvariantTscSupported() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    unsigned int max_ext = __get_cpuid_max(0x80000000U, nullptr);
+    if (max_ext >= 0x80000007U) {
+        if (__get_cpuid(0x80000007U, &eax, &ebx, &ecx, &edx)) {
+            return (edx & (1U << 8)) != 0; // Invariant TSC flag (bit 8)
+        }
+    }
+#endif
+    return false;
+}
+
+uint64_t HierarchicalTimingWheel::CalibrateTscHz() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    // 1. CPUID Leaf 0x15: Time Stamp Counter and Nominal Core Crystal Clock
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    unsigned int max_leaf = __get_cpuid_max(0, nullptr);
+    if (max_leaf >= 0x15) {
+        __cpuid(0x15, eax, ebx, ecx, edx);
+        if (eax != 0 && ebx != 0 && ecx != 0) {
+            uint64_t hz = (static_cast<uint64_t>(ecx) * ebx) / eax;
+            if (hz >= 500000000ULL && hz <= 10000000000ULL) {
+                return hz;
+            }
+        }
+    }
+#endif
+
+    // 2. CLOCK_MONOTONIC kalibrasyonu (5 ms pencere)
+    struct timespec ts_start, ts_end;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts_start) == 0) {
+#if defined(__x86_64__) || defined(__i386__)
+        uint64_t c_start = __builtin_ia32_rdtsc();
+#else
+        uint64_t c_start = 0;
+#endif
+        struct timespec req{0, 5000000}; // 5 ms
+        nanosleep(&req, nullptr);
+        clock_gettime(CLOCK_MONOTONIC, &ts_end);
+#if defined(__x86_64__) || defined(__i386__)
+        uint64_t c_end = __builtin_ia32_rdtsc();
+#else
+        uint64_t c_end = 0;
+#endif
+
+        uint64_t ns_elapsed = static_cast<uint64_t>(ts_end.tv_sec - ts_start.tv_sec) * 1000000000ULL +
+                              static_cast<uint64_t>(ts_end.tv_nsec - ts_start.tv_nsec);
+        if (ns_elapsed > 0 && c_end > c_start) {
+            uint64_t cycles = c_end - c_start;
+            uint64_t hz = (static_cast<unsigned __int128>(cycles) * 1000000000ULL) / ns_elapsed;
+            if (hz >= 500000000ULL && hz <= 10000000000ULL) {
+                return hz;
+            }
+        }
+    }
+
+    return 2400000000ULL; // Güvenli 2.4 GHz varsayılan
+}
+
 HierarchicalTimingWheel::HierarchicalTimingWheel(uint64_t tsc_hz)
-    : tsc_hz_(tsc_hz > 0 ? tsc_hz : 2400000000ULL),
+    : tsc_hz_(tsc_hz > 0 ? tsc_hz : CalibrateTscHz()),
       tsc_per_ms_(tsc_hz_ / 1000ULL) {
     if (tsc_per_ms_ == 0) tsc_per_ms_ = 2400000ULL;
 
