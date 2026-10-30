@@ -222,6 +222,8 @@ void DiameterEngine::StartPeerSession(TelcoSessionContext* session, const Diamet
     std::memcpy(session->client_mac, cfg.local_mac, 6);
     std::memcpy(session->peer_mac, cfg.peer_mac, 6);
 
+    session_mgr_.Bind5Tuple(session, cfg.local_ip, cfg.peer_ip, cfg.local_port, cfg.peer_port, session->ip_proto);
+
     SetState(session, DiameterPeerState::WAIT_I_CEA);
 
     // CER Gönder
@@ -658,36 +660,70 @@ bool DiameterEngine::ProcessRxFrame(const uint8_t* frame, size_t len, uint64_t n
         offset += 2;
     }
 
-    if (ethertype != 0x0800 || len < offset + sizeof(Ipv4Header) + sizeof(TcpHeader) + sizeof(DiameterHeader)) {
+    if (ethertype != 0x0800 || len < offset + sizeof(Ipv4Header) + sizeof(DiameterHeader)) {
         return false;
     }
 
     const auto* ip = reinterpret_cast<const Ipv4Header*>(frame + offset);
-    if ((ip->ihl_version >> 4) != 4 || ip->protocol != 6) return false;
+    if ((ip->ihl_version >> 4) != 4 || (ip->protocol != 6 && ip->protocol != 132)) return false;
 
     size_t ip_len = (ip->ihl_version & 0x0F) * 4;
-    size_t tcp_offset = offset + ip_len;
-    if (len < tcp_offset + sizeof(TcpHeader) + sizeof(DiameterHeader)) return false;
+    if (ip_len < sizeof(Ipv4Header) || len < offset + ip_len) return false;
 
-    const auto* tcp = reinterpret_cast<const TcpHeader*>(frame + tcp_offset);
-    size_t tcp_hdr_len = ((tcp->data_offset >> 4) & 0x0F) * 4;
-    size_t diam_offset = tcp_offset + tcp_hdr_len;
-    if (len < diam_offset + sizeof(DiameterHeader)) return false;
-
+    size_t l4_offset = offset + ip_len;
     uint32_t src_ip = ntohl(ip->src_ip);
     uint32_t dst_ip = ntohl(ip->dst_ip);
-    uint16_t src_port = ntohs(tcp->src_port);
-    uint16_t dst_port = ntohs(tcp->dst_port);
+    uint16_t src_port = 0;
+    uint16_t dst_port = 0;
+    size_t diam_offset = 0;
+    uint8_t ip_proto = ip->protocol;
 
-    TelcoSessionContext* session = session_mgr_.FindSessionBy5Tuple(dst_ip, src_ip, dst_port, src_port, 6);
+    if (ip_proto == 6) { // TCP
+        if (len < l4_offset + sizeof(TcpHeader) + sizeof(DiameterHeader)) return false;
+        const auto* tcp = reinterpret_cast<const TcpHeader*>(frame + l4_offset);
+        size_t tcp_hdr_len = ((tcp->data_offset >> 4) & 0x0F) * 4;
+        if (tcp_hdr_len < sizeof(TcpHeader)) return false;
+        diam_offset = l4_offset + tcp_hdr_len;
+        if (len < diam_offset + sizeof(DiameterHeader)) return false;
+        src_port = ntohs(tcp->src_port);
+        dst_port = ntohs(tcp->dst_port);
+    } else if (ip_proto == 132) { // SCTP (RFC 6733 §2.1)
+        if (len < l4_offset + 12 + sizeof(DiameterHeader)) return false;
+        src_port = (static_cast<uint16_t>(frame[l4_offset]) << 8) | frame[l4_offset + 1];
+        dst_port = (static_cast<uint16_t>(frame[l4_offset + 2]) << 8) | frame[l4_offset + 3];
+
+        size_t sctp_common_len = 12;
+        if (len >= l4_offset + sctp_common_len + 16 + sizeof(DiameterHeader) &&
+            frame[l4_offset + sctp_common_len] == 0) { // SctpChunkType::DATA
+            diam_offset = l4_offset + sctp_common_len + 16;
+        } else {
+            diam_offset = l4_offset + sctp_common_len;
+        }
+        if (len < diam_offset + sizeof(DiameterHeader)) return false;
+    }
+
+    TelcoSessionContext* session = session_mgr_.FindSessionBy5Tuple(dst_ip, src_ip, dst_port, src_port, ip_proto);
+    if (!session && ip_proto == 6) {
+        session = session_mgr_.FindSessionBy5Tuple(dst_ip, src_ip, dst_port, src_port, 0);
+    }
+
     if (!session) {
-        // Oturumu doğrudan ara
-        uint32_t cap = session_mgr_.GetCapacity();
-        for (uint32_t i = 0; i < cap; ++i) {
-            TelcoSessionContext* s = session_mgr_.GetSessionByIndex(i);
-            if (s && s->protocol_id == static_cast<uint8_t>(TelcoProtocolId::DIAMETER)) {
-                session = s;
-                break;
+        // Gelen CER (Capabilities-Exchange-Request) için yeni sunucu oturumu tahsis et
+        const auto* diam = reinterpret_cast<const DiameterHeader*>(frame + diam_offset);
+        if (diam->version == 1) {
+            uint32_t cmd_code = Get24(diam->command_code);
+            bool is_request = (diam->command_flags & 0x80) != 0;
+            if (cmd_code == CMD_CAPABILITIES_EXCHANGE && is_request) {
+                session = session_mgr_.AcquireSession();
+                if (session) {
+                    session->protocol_id = static_cast<uint8_t>(TelcoProtocolId::DIAMETER);
+                    session->client_ip = dst_ip;
+                    session->peer_ip = src_ip;
+                    session->client_port = dst_port;
+                    session->peer_port = src_port;
+                    session->ip_proto = ip_proto;
+                    session_mgr_.Bind5Tuple(session, dst_ip, src_ip, dst_port, src_port, ip_proto);
+                }
             }
         }
     }
