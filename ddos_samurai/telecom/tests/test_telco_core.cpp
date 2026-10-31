@@ -493,6 +493,75 @@ void TestLockfreeArpNdSeqlockAndVlan() {
     std::cout << "  -> LockfreeArpTable/NdTable Seqlock & VLAN isolation: PASSED (Torn reads: 0)" << std::endl;
 }
 
+void TestMultiThreadedSessionManagerConcurrency() {
+    std::cout << "[TEST] 7. Multi-Threaded SessionManager 256-Shard RW-SpinLock Concurrency..." << std::endl;
+
+    constexpr uint32_t kNumThreads = 8;
+    constexpr uint32_t kSessionsPerThread = 1000;
+    constexpr uint32_t kIterations = 25;
+    SessionManager mgr(kNumThreads * kSessionsPerThread + 1024);
+
+    std::atomic<bool> start_flag{false};
+    std::atomic<uint64_t> total_lookups{0};
+
+    std::vector<std::thread> workers;
+    workers.reserve(kNumThreads);
+
+    for (uint32_t t = 0; t < kNumThreads; ++t) {
+        workers.emplace_back([&, t]() {
+            while (!start_flag.load(std::memory_order_acquire)) {}
+
+            std::vector<TelcoSessionContext*> local_sessions(kSessionsPerThread, nullptr);
+            const uint32_t base_id = (t + 1) * 1000000u;
+
+            for (uint32_t iter = 0; iter < kIterations; ++iter) {
+                // 1. Acquire & Bind across 5-Tuple, GTP-U TEID, and PFCP SEID tables concurrently
+                for (uint32_t i = 0; i < kSessionsPerThread; ++i) {
+                    TelcoSessionContext* s = mgr.AcquireSession();
+                    assert(s != nullptr);
+                    local_sessions[i] = s;
+
+                    const uint32_t key = base_id + i + iter * 10000u;
+                    const bool b5 = mgr.Bind5Tuple(s, 0x0A000000u + key, 0xC0A80001u,
+                                                   static_cast<uint16_t>(1000 + (i % 50000)), 2152, 17);
+                    const bool bg = mgr.BindGtpuSession(s, key);
+                    const bool bp = mgr.BindPfcpSession(s, (static_cast<uint64_t>(key) << 16) | t);
+                    assert(b5 && bg && bp);
+                }
+
+                // 2. Concurrent Find verification
+                for (uint32_t i = 0; i < kSessionsPerThread; ++i) {
+                    const uint32_t key = base_id + i + iter * 10000u;
+                    TelcoSessionContext* f5 = mgr.FindSessionBy5Tuple(
+                        0x0A000000u + key, 0xC0A80001u,
+                        static_cast<uint16_t>(1000 + (i % 50000)), 2152, 17);
+                    TelcoSessionContext* fg = mgr.FindGtpuSession(key);
+                    TelcoSessionContext* fp = mgr.FindPfcpSession((static_cast<uint64_t>(key) << 16) | t);
+                    assert(f5 == local_sessions[i]);
+                    assert(fg == local_sessions[i]);
+                    assert(fp == local_sessions[i]);
+                    total_lookups.fetch_add(3, std::memory_order_relaxed);
+                }
+
+                // 3. Concurrent Unbind & Release (including backward-shift deletion under lock)
+                for (uint32_t i = 0; i < kSessionsPerThread; ++i) {
+                    mgr.ReleaseSession(local_sessions[i]);
+                    local_sessions[i] = nullptr;
+                }
+            }
+        });
+    }
+
+    start_flag.store(true, std::memory_order_release);
+    for (auto& w : workers) {
+        w.join();
+    }
+
+    assert(mgr.GetActiveSessionCount() == 0);
+    std::cout << "  -> Multi-Threaded SessionManager (" << kNumThreads << " threads, "
+              << total_lookups.load() << " concurrent lookups/binds/unbinds): PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "        SAMURAI TELECOM ENGINE CORE VERIFICATION SUITE           " << std::endl;
@@ -504,6 +573,7 @@ int main() {
     TestRingBufferShuttle();
     TestFastpathClassifier();
     TestLockfreeArpNdSeqlockAndVlan();
+    TestMultiThreadedSessionManagerConcurrency();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL TELECOM CORE TESTS PASSED SUCCESSFULLY! (100% VERIFIED)    " << std::endl;

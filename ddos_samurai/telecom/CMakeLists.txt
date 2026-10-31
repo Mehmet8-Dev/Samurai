@@ -13,6 +13,7 @@ set(SAMURAI_TELECOM_SOURCES
   l2l3_fastpath_wiring.cpp
   core/session_context.hpp
   core/telco_protocol_if.hpp
+  core/telco_packet_transport.hpp
   core/session_manager.hpp
   core/session_manager.cpp
   core/hierarchical_timing_wheel.hpp
