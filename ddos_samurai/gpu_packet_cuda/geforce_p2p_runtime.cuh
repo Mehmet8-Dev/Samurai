@@ -2208,13 +2208,21 @@ class GeforceP2pRegistry {
       return -1;
     }
 
+    uint64_t ring_iova = db_cfg->tx_desc_ring_iova;
+    if (ring_iova == 0u && ring.host_tx_desc_ring != nullptr) {
+      uint64_t phys_addr = 0u;
+      if (resolve_bar1_allocation_phys_addr(ring.host_tx_desc_ring, 0u, ~0ull, &phys_addr)) {
+        ring_iova = phys_addr;
+      }
+    }
+
     if ((db_cfg->flags & doorbell::kDoorbellFlagInitPmdRegs) != 0u && ring.host_nic_mmio_base != nullptr) {
       if (!doorbell::host_init_nic_pmd_tx_ring_mmio(
               ring.host_nic_mmio_base,
               ring.nic_mmio_bytes,
               static_cast<doorbell::NicHardwareDriverType>(db_cfg->nic_driver_type),
               db_cfg->queue_id,
-              db_cfg->tx_desc_ring_iova,
+              ring_iova,
               ring_sz)) {
         write_error(err, err_len, "geforce_p2p: host_init_nic_pmd_tx_ring_mmio failed (MMIO BAR size too small)");
         ring.cleanup_gpu_doorbell();

@@ -1689,6 +1689,7 @@ std::atomic<int> g_kernel_mode{static_cast<int>(KernelMode::kBatch)};
 std::atomic<uint64_t> g_compat_fallback_count{0};
 struct PersistentRuntime {
   cudaStream_t kernel_stream = nullptr;
+  cudaStream_t control_stream = nullptr;
   cudaStream_t bridge_copy_stream = nullptr;
   cudaEvent_t bridge_copy_event = nullptr;
   cudaStream_t quota_refill_stream = nullptr;
@@ -1697,7 +1698,7 @@ struct PersistentRuntime {
   bool quota_refill_graph_enabled = false;
   PersistentRuntimeControl* ctrl = nullptr;                       // mapped host
   PersistentRuntimeControl* ctrl_dev = nullptr;                   // mapped device
-  int32_t* run_flag_dev = nullptr;                                // device-only hot run gate
+  int32_t* run_flag_dev = nullptr;                                // device-resident GDDR6 run gate
   PersistentDeviceStreamState* streams = nullptr;                 // mapped host
   PersistentDeviceStreamState* streams_dev = nullptr;             // device-resident authoritative state
   PersistentStreamHotState* streams_hot_dev = nullptr;            // device-only hot stream mirror
@@ -1741,9 +1742,10 @@ struct PersistentRuntime {
     if (ctrl) {
       ctrl->run = 0;
     }
-    if (run_flag_dev) {
+    if (run_flag_dev && control_stream) {
       const int32_t run_off = 0;
-      (void)cudaMemcpy(run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice);
+      (void)cudaMemcpyAsync(run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice, control_stream);
+      (void)cudaStreamSynchronize(control_stream);
     }
     if (kernel_stream) {
       (void)cudaStreamSynchronize(kernel_stream);
@@ -1833,6 +1835,10 @@ struct PersistentRuntime {
     if (streams_hot_dev) {
       (void)cudaFree(streams_hot_dev);
       streams_hot_dev = nullptr;
+    }
+    if (control_stream) {
+      (void)cudaStreamDestroy(control_stream);
+      control_stream = nullptr;
     }
     if (run_flag_dev) {
       (void)cudaFree(run_flag_dev);
@@ -3466,7 +3472,8 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
             auto_db.nic_driver_type = ddos_samurai::gpu_packet_cuda::p2p::detect_nic_driver_type(b.p2p_nic_bdf.c_str());
             auto_db.queue_id = static_cast<uint32_t>(q);
             auto_db.tx_ring_size = static_cast<uint32_t>(rt.ring_slots);
-            auto_db.flags = ddos_samurai::gpu_packet_cuda::p2p::doorbell::kDoorbellFlagAutoReapOnWrap;
+            auto_db.flags = ddos_samurai::gpu_packet_cuda::p2p::doorbell::kDoorbellFlagInitPmdRegs |
+                            ddos_samurai::gpu_packet_cuda::p2p::doorbell::kDoorbellFlagAutoReapOnWrap;
             auto_db.pci_mmio_bar_index = (auto_db.nic_driver_type == 0u) ? 2u : 0u;
             (void)b.geforce_p2p_api->bind_gpu_doorbell(handle, &auto_db, errbuf, sizeof(errbuf));
 
@@ -4270,59 +4277,21 @@ __device__ inline uint32_t reserve_stream_tokens(
     *slot_base_out = 0u;
   }
 
-  if (u32_load(&sv->deficit) == 0u) {
-    const uint32_t weight = u32_load(&sv->weight);
-    (void)atomicCAS(
-        (unsigned int*)&sv->deficit,
-        0u,
-        weight == 0u ? 1u : weight);
-  }
-
-  uint32_t reserve = 0u;
-  bool committed = false;
   while (true) {
     const uint32_t quota_now = u32_load(&sv->quota_left);
-    const uint32_t deficit_now = u32_load(&sv->deficit);
-    if (quota_now == 0u || deficit_now == 0u) {
+    if (quota_now == 0u) {
       return 0u;
     }
-    reserve = quota_now;
-    if (reserve > deficit_now) {
-      reserve = deficit_now;
-    }
-    if (reserve > max_tokens) {
-      reserve = max_tokens;
-    }
-    if (reserve == 0u) {
-      return 0u;
-    }
-
+    const uint32_t reserve = (quota_now < max_tokens) ? quota_now : max_tokens;
     const uint32_t next_quota = quota_now - reserve;
-    if (atomicCAS((unsigned int*)&sv->quota_left, quota_now, next_quota) != quota_now) {
-      continue;
-    }
-
-    while (true) {
-      const uint32_t d_now = u32_load(&sv->deficit);
-      if (d_now < reserve) {
-        (void)atomicAdd((unsigned int*)&sv->quota_left, reserve);
-        break;
+    if (atomicCAS((unsigned int*)&sv->quota_left, quota_now, next_quota) == quota_now) {
+      sv->deficit = next_quota;
+      if (slot_base_out) {
+        *slot_base_out = atomicAdd((unsigned int*)&sv->queue_cursor, reserve);
       }
-      const uint32_t next_deficit = d_now - reserve;
-      if (atomicCAS((unsigned int*)&sv->deficit, d_now, next_deficit) == d_now) {
-        committed = true;
-        break;
-      }
-    }
-    if (committed) {
-      break;
+      return reserve;
     }
   }
-
-  if (slot_base_out) {
-    *slot_base_out = atomicAdd((unsigned int*)&sv->queue_cursor, reserve);
-  }
-  return reserve;
 }
 
 __global__ void persistent_quota_refill_kernel(
@@ -4683,14 +4652,10 @@ __global__ void persistent_dataplane_kernel(
   __shared__ unsigned long long s_queue_spread_events;
   __shared__ unsigned long long s_quota_stall;
   __shared__ unsigned long long s_idle_gap;
-  while (*run_flag_dev == 1) {
-
-    uint64_t local_queue_pressure = 0u;
-    uint64_t local_ring_drop_events = 0u;
-    uint64_t local_queue_spread_events = 0u;
-    uint64_t local_quota_stall = 0u;
-    uint64_t local_idle_gap = 0u;
+  __shared__ int s_run_flag;
+  while (true) {
     if (threadIdx.x == 0) {
+      s_run_flag = (*run_flag_dev == 1) ? 1 : 0;
       s_queue_pressure = 0u;
       s_ring_drop_events = 0u;
       s_queue_spread_events = 0u;
@@ -4698,6 +4663,15 @@ __global__ void persistent_dataplane_kernel(
       s_idle_gap = 0u;
     }
     __syncthreads();
+    if (s_run_flag != 1) {
+      break;
+    }
+
+    uint64_t local_queue_pressure = 0u;
+    uint64_t local_ring_drop_events = 0u;
+    uint64_t local_queue_spread_events = 0u;
+    uint64_t local_quota_stall = 0u;
+    uint64_t local_idle_gap = 0u;
 
     if (tid == 0u) {
       u64_add(&ctrl->heartbeat, 1u);
@@ -4764,6 +4738,7 @@ __global__ void persistent_dataplane_kernel(
       }
       reserved_tokens = __shfl_sync(warp_mask, reserved_tokens, 0);
       slot_seq_base = __shfl_sync(warp_mask, slot_seq_base, 0);
+
       if (reserved_tokens == 0u) {
         continue;
       }
@@ -4928,11 +4903,9 @@ __global__ void persistent_dataplane_kernel(
           }
         }
         if (doca_gpu_txq_handles && doca_txq_mkeys_be) {
-          // Direct-DOCA mode is fail-fast: no host fallback in this path.
-          if (slot.state == 1) {
-            (void)persistent_slot_transition(&slot, 1, 0, ctrl);
-          } else if (slot.state == 2) {
-            (void)persistent_slot_transition(&slot, 2, 0, ctrl);
+          // Hardware PMD Backpressure: NIC descriptor ring full. Reclaim slot back to free, record drop, and continue.
+          if (slot.state == 1 || slot.state == 2) {
+            (void)persistent_slot_transition(&slot, slot.state, 0, ctrl);
           } else {
             slot.state = 0;
           }
@@ -4941,12 +4914,10 @@ __global__ void persistent_dataplane_kernel(
           slot.stream_slot = -1;
           slot.protocol = 0;
           slot.tx_timestamp_ns = 0u;
-          if (lane == 0u) {
-            u64_add(&ctrl->native_batch_degrade_events, 1u);
-            ctrl->run = 0;
-            atomicExch((int*)run_flag_dev, 0);
-          }
-          return;
+          local_queue_pressure += 1u;
+          local_ring_drop_events += 1u;
+          (void)atomicAdd((unsigned int*)&sv->quota_left, 1u);
+          continue;
         }
         if (publish_count < static_cast<int>(kTokenReserveChunkPerLane)) {
           publish_slots[publish_count++] = &slot;
@@ -5650,9 +5621,10 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 	            if (rt.tx_bridge.doca_timed_tx_required && !can_timed) {
 	              rt.threads_running.store(false, std::memory_order_relaxed);
 	              rt.ctrl->run = 0;
-	              if (rt.run_flag_dev) {
+	              if (rt.run_flag_dev && rt.control_stream) {
 	                const int32_t run_off = 0;
-	                (void)cudaMemcpy(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice);
+	                (void)cudaMemcpyAsync(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice, rt.control_stream);
+	                (void)cudaStreamSynchronize(rt.control_stream);
 	              }
 	              break;
 	            }
@@ -5687,9 +5659,10 @@ inline void persistent_bridge_loop(int worker_idx, int worker_count) {
 	            if (rc < 0 || sent <= 0) {
 	              rt.threads_running.store(false, std::memory_order_relaxed);
 	              rt.ctrl->run = 0;
-	              if (rt.run_flag_dev) {
+	              if (rt.run_flag_dev && rt.control_stream) {
 	                const int32_t run_off = 0;
-	                (void)cudaMemcpy(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice);
+	                (void)cudaMemcpyAsync(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice, rt.control_stream);
+	                (void)cudaStreamSynchronize(rt.control_stream);
 	              }
 	              break;
 	            }
@@ -6118,12 +6091,18 @@ inline bool persistent_launch_kernel() {
       return false;
     }
   }
-  rt.ctrl->run = 1;
-  {
-    const int32_t run_on = 1;
-    if (cudaMemcpy(rt.run_flag_dev, &run_on, sizeof(run_on), cudaMemcpyHostToDevice) != cudaSuccess) {
+  if (!rt.control_stream) {
+    if (cudaStreamCreateWithFlags(&rt.control_stream, cudaStreamNonBlocking) != cudaSuccess) {
       return false;
     }
+  }
+  rt.ctrl->run = 1;
+  if (rt.run_flag_dev && rt.control_stream) {
+    const int32_t run_on = 1;
+    if (cudaMemcpyAsync(rt.run_flag_dev, &run_on, sizeof(run_on), cudaMemcpyHostToDevice, rt.control_stream) != cudaSuccess) {
+      return false;
+    }
+    (void)cudaStreamSynchronize(rt.control_stream);
   }
   {
     auto env_u64_local = [](const char* name, uint64_t defv) -> uint64_t {
@@ -6199,12 +6178,14 @@ inline bool persistent_launch_kernel() {
 
 inline void persistent_stop_kernel() {
   PersistentRuntime& rt = g_persistent_runtime;
-  if (rt.ctrl) {
-    rt.ctrl->run = 0;
+  if (!rt.ctrl) {
+    return;
   }
-  if (rt.run_flag_dev) {
+  rt.ctrl->run = 0;
+  if (rt.run_flag_dev && rt.control_stream) {
     const int32_t run_off = 0;
-    (void)cudaMemcpy(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice);
+    (void)cudaMemcpyAsync(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice, rt.control_stream);
+    (void)cudaStreamSynchronize(rt.control_stream);
   }
   if (rt.kernel_stream) {
     (void)cudaStreamSynchronize(rt.kernel_stream);
@@ -6252,9 +6233,10 @@ inline void persistent_monitor_loop() {
           rt.ctrl->native_batch_degrade_events += 1u;
           rt.threads_running.store(false, std::memory_order_relaxed);
           rt.ctrl->run = 0;
-          if (rt.run_flag_dev) {
+          if (rt.run_flag_dev && rt.control_stream) {
             const int32_t run_off = 0;
-            (void)cudaMemcpy(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice);
+            (void)cudaMemcpyAsync(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice, rt.control_stream);
+            (void)cudaStreamSynchronize(rt.control_stream);
           }
           break;
         }
@@ -6492,6 +6474,10 @@ inline void persistent_runtime_release_unlocked() {
     rt.ctrl = nullptr;
     rt.ctrl_dev = nullptr;
   }
+  if (rt.control_stream) {
+    (void)cudaStreamDestroy(rt.control_stream);
+    rt.control_stream = nullptr;
+  }
   if (rt.run_flag_dev) {
     (void)cudaFree(rt.run_flag_dev);
     rt.run_flag_dev = nullptr;
@@ -6640,12 +6626,19 @@ inline bool persistent_runtime_ensure_started_unlocked() {
     persistent_runtime_release_unlocked();
     return false;
   }
-  {
-    const int32_t run_init = 0;
-    if (cudaMemcpy(rt.run_flag_dev, &run_init, sizeof(run_init), cudaMemcpyHostToDevice) != cudaSuccess) {
+  if (!rt.control_stream) {
+    if (cudaStreamCreateWithFlags(&rt.control_stream, cudaStreamNonBlocking) != cudaSuccess) {
       persistent_runtime_release_unlocked();
       return false;
     }
+  }
+  {
+    const int32_t run_init = 0;
+    if (cudaMemcpyAsync(rt.run_flag_dev, &run_init, sizeof(run_init), cudaMemcpyHostToDevice, rt.control_stream) != cudaSuccess) {
+      persistent_runtime_release_unlocked();
+      return false;
+    }
+    (void)cudaStreamSynchronize(rt.control_stream);
   }
 
   void* streams_host = nullptr;

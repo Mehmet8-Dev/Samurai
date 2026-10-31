@@ -842,12 +842,16 @@ int main(int argc, char** argv) {
 
     const char* stats_json = samurai_gpu_packet_read_stream_stats(0);
     const std::string s_json = stats_json ? stats_json : "";
+    const char* stream_stats_json = samurai_gpu_packet_read_stream_stats(stream_id);
+    const std::string st_json = stream_stats_json ? stream_stats_json : "";
+
     const bool has_rt_active = (s_json.find("\"runtime_active\":1") != std::string::npos);
     const bool has_geforce_backend = (s_json.find("\"persistent_tx_backend\":\"geforce_p2p\"") != std::string::npos);
     const bool has_kernel_direct = (s_json.find("\"persistent_doca_kernel_direct_tx\":1") != std::string::npos);
     const bool no_degrade = (s_json.find("\"native_batch_degrade_events\":0") != std::string::npos);
 
-    std::printf("  * [Persistent Dataplane JSON]: %s\n", s_json.substr(0, std::min<size_t>(s_json.size(), 220)).c_str());
+    std::printf("  * [Persistent Dataplane Global JSON]: %s\n", s_json.c_str());
+    std::printf("  * [Persistent Stream %ld JSON]: %s\n", (long)stream_id, st_json.c_str());
     TEST_CHECK(has_rt_active && has_geforce_backend && has_kernel_direct && no_degrade,
                "Persistent Kernel running with geforce_p2p & direct kernel doorbell (0 degrade events)");
 
