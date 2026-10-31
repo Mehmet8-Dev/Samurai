@@ -36,6 +36,9 @@ Bu dizin, DDoSamurai projesinin teknik mimarisini, native C++ bileşenlerini ve 
 - [28 - Scenario Engine (Web/Mobil Persona Modeli)](./28-scenario-engine-web-mobile-persona.md)
 - [43 - L4 Stateful TCP Motoru (`tcpdp`) 1M Aktif Akış Ölçek ve Mimari Doğrulama Raporu](./43-tcpdp-1m-flows-benchmark-report.md)
 - [45 - Tüketici Sınıfı GeForce GPU & DPDK NIC P2P DMA Paket Motoru Mimari Raporu](./45-commodity-gpu-nic-p2p-packet-engine-report.md)
+- [46 - Bare-Metal GPU-PMD ve GPU-Initiated NIC MMIO Doorbell Mimarisi](./46-gpu-initiated-doorbell-and-baremetal-pmd.md)
+- [47 - Sıfır CPU Bağımlı Persistent Kernel Veri Düzlemi Mimarisi](./47-zero-cpu-persistent-dataplane-architecture.md)
+- [48 - Tüketici Donanımı Zorunlu Çözümleri ve Kurumsal Donanım Geçiş Planı](./48-commodity-workarounds-and-enterprise-migration-plan.md)
 
 ---
 

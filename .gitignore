@@ -34,6 +34,9 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/44-l7-stateful-userspace-benchmark-report.md
 !docs/45-commodity-gpu-nic-p2p-packet-engine-report.md
 !docs/46-gpu-architecture-validation-and-benchmark-report.md
+!docs/46-gpu-initiated-doorbell-and-baremetal-pmd.md
+!docs/47-zero-cpu-persistent-dataplane-architecture.md
+!docs/48-commodity-workarounds-and-enterprise-migration-plan.md
 tests/native_gpu/test_gpu_architecture
 
 # Python cache / build
