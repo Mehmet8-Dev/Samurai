@@ -128,6 +128,7 @@ bool prepopulate_tx_pool(int64_t handle, const uint8_t* template_pkt, uint16_t p
 
 // Harici GPU BAR1 / DMA bellek bölgesini DPDK alt sistemine (rte_extmem_register +
 // rte_dev_dma_map) kaydeder. PCIe P2P zero-copy dataplane için kullanılır.
+// IOMMU / DMA eşlemesi başarısız olursa kesin olarak false döner (sessiz fallback yok).
 bool register_extmem_region(int64_t handle, void* vaddr, std::size_t len,
                             uint64_t iova, uint32_t page_size, std::string& err);
 
@@ -137,6 +138,24 @@ TxResult tx_burst_extbuf_zero_copy(int64_t handle, uint16_t queue_id,
                                    void* bar1_base_vaddr, uint64_t bar1_base_iova,
                                    std::size_t region_len, std::size_t offset,
                                    uint16_t packet_size, uint16_t batch);
+
+using ExtbufSlotFreeCallback = void (*)(void* addr, void* opaque);
+
+// GPU BAR1 P2P ring slot indeks dizisini doğrudan rte_pktmbuf_attach_extbuf ile
+// NIC TX descriptor kuyruğuna sıfır-kopya olarak gönderir.
+TxResult tx_burst_extbuf_slots(int64_t handle, uint16_t queue_id,
+                               void* bar1_base_vaddr, uint64_t bar1_base_iova,
+                               uint32_t slot_stride, const uint32_t* slot_indices,
+                               const uint16_t* pkt_lengths, uint16_t count,
+                               ExtbufSlotFreeCallback free_cb = nullptr,
+                               void* free_cb_opaque = nullptr);
+
+// NIC RX kuyruğundan alınan paketleri doğrudan GPU BAR1 P2P RX slotlarına yazar.
+// Alınan paket sayısını döner (hata durumunda < 0).
+int rx_burst_to_bar1_slots(int64_t handle, uint16_t queue_id,
+                           void* bar1_base_vaddr, uint32_t slot_stride,
+                           const uint32_t* slot_indices, uint16_t max_slots,
+                           uint16_t* out_lengths);
 
 // UDP hızlı-yol şablonunu yapılandır.
 bool configure_udp_flow(int64_t handle, const UdpFlowConfig& cfg, std::string& err);
