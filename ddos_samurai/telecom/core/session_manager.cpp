@@ -66,6 +66,9 @@ SessionManager::SessionManager(uint32_t max_sessions, int socket_id)
     // Hash tablolarının boyutunu belirle (En az 2 katı, 2'nin kuvveti)
     hash_size_ = NextPowerOf2(std::max(65536u, max_sessions_ * 2));
     hash_mask_ = hash_size_ - 1;
+    shard_size_ = hash_size_ / NUM_LOCK_SHARDS;
+    shard_mask_ = shard_size_ - 1;
+    shard_locks_ = std::make_unique<ShardRwSpinLock[]>(NUM_LOCK_SHARDS);
 
     // Hash tabloları için bellek tahsisi
     hash_buckets_ = static_cast<TelcoSessionContext**>(::calloc(hash_size_, sizeof(TelcoSessionContext*)));
@@ -177,16 +180,19 @@ void SessionManager::ReleaseSession(TelcoSessionContext* ctx) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// 5-Tuple Hash Lookup & Management
+// 5-Tuple Hash Lookup & Management (Shard-Locked Linear Probing)
 // ---------------------------------------------------------------------------
 
 TelcoSessionContext* SessionManager::FindSessionBy5Tuple(const Flow5Tuple& tuple) const noexcept {
     uint32_t h = Hash5Tuple(tuple);
     if (h == 0) h = 1;
-    uint32_t idx = h & hash_mask_;
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    ReadLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         TelcoSessionContext* s = hash_buckets_[slot];
         if (!s) return nullptr;
 
@@ -217,6 +223,11 @@ bool SessionManager::Bind5Tuple(TelcoSessionContext* ctx, const Flow5Tuple& tupl
 
     uint32_t h = Hash5Tuple(tuple);
     if (h == 0) h = 1;
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
+
+    WriteLockGuard guard(shard_locks_[shard_id]);
     ctx->client_ip = tuple.src_ip;
     ctx->peer_ip = tuple.dst_ip;
     ctx->client_port = tuple.src_port;
@@ -224,14 +235,14 @@ bool SessionManager::Bind5Tuple(TelcoSessionContext* ctx, const Flow5Tuple& tupl
     ctx->ip_proto = tuple.proto;
     ctx->flow_hash = h;
 
-    uint32_t idx = h & hash_mask_;
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         if (hash_buckets_[slot] == nullptr || hash_buckets_[slot] == ctx) {
             hash_buckets_[slot] = ctx;
             return true;
         }
     }
+    ctx->flow_hash = 0;
     return false; // Probe limiti aşıldı
 }
 
@@ -242,32 +253,41 @@ bool SessionManager::Bind5Tuple(TelcoSessionContext* ctx, uint32_t src_ip, uint3
 }
 
 void SessionManager::Unbind5Tuple(TelcoSessionContext* ctx) noexcept {
-    if (!ctx || ctx->flow_hash == 0) return;
+    if (!ctx) return;
+    const uint32_t h = ctx->flow_hash;
+    if (h == 0) return;
 
-    uint32_t h = ctx->flow_hash;
-    uint32_t idx = h & hash_mask_;
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
+
+    WriteLockGuard guard(shard_locks_[shard_id]);
+    if (ctx->flow_hash != h) return;
 
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t local_slot = (local_idx + p) & shard_mask_;
+        const uint32_t slot = shard_base + local_slot;
         if (hash_buckets_[slot] == ctx) {
             hash_buckets_[slot] = nullptr;
 
-            // Backward-shift deletion (tombstone gerektirmeyen deterministik temizleme)
-            uint32_t next = (slot + 1) & hash_mask_;
-            while (hash_buckets_[next] != nullptr) {
-                TelcoSessionContext* rehash_ctx = hash_buckets_[next];
-                hash_buckets_[next] = nullptr;
+            // Backward-shift deletion (shard sınırları içinde deterministik temizleme)
+            uint32_t next_local = (local_slot + 1) & shard_mask_;
+            uint32_t steps = 0;
+            while (hash_buckets_[shard_base + next_local] != nullptr && steps < shard_size_) {
+                TelcoSessionContext* rehash_ctx = hash_buckets_[shard_base + next_local];
+                hash_buckets_[shard_base + next_local] = nullptr;
 
-                uint32_t r_h = rehash_ctx->flow_hash;
-                uint32_t r_idx = r_h & hash_mask_;
+                const uint32_t r_h = rehash_ctx->flow_hash;
+                const uint32_t r_local_idx = r_h & shard_mask_;
                 for (uint32_t rp = 0; rp < MAX_PROBES; ++rp) {
-                    uint32_t r_slot = (r_idx + rp) & hash_mask_;
+                    const uint32_t r_slot = shard_base + ((r_local_idx + rp) & shard_mask_);
                     if (hash_buckets_[r_slot] == nullptr) {
                         hash_buckets_[r_slot] = rehash_ctx;
                         break;
                     }
                 }
-                next = (next + 1) & hash_mask_;
+                next_local = (next_local + 1) & shard_mask_;
+                ++steps;
             }
             break;
         }
@@ -281,11 +301,14 @@ void SessionManager::Unbind5Tuple(TelcoSessionContext* ctx) noexcept {
 // ---------------------------------------------------------------------------
 
 TelcoSessionContext* SessionManager::FindPppoeSession(const uint8_t mac[6], uint16_t session_id) const noexcept {
-    uint32_t h = HashPppoe(mac, session_id);
-    uint32_t idx = h & hash_mask_;
+    const uint32_t h = HashPppoe(mac, session_id);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    ReadLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         TelcoSessionContext* s = pppoe_buckets_[slot];
         if (!s) return nullptr;
 
@@ -301,14 +324,17 @@ bool SessionManager::BindPppoeSession(TelcoSessionContext* ctx, const uint8_t ma
 
     UnbindPppoeSession(ctx);
 
+    const uint32_t h = HashPppoe(mac, session_id);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
+
+    WriteLockGuard guard(shard_locks_[shard_id]);
     std::memcpy(ctx->client_mac, mac, 6);
     ctx->session_id = session_id;
 
-    uint32_t h = HashPppoe(mac, session_id);
-    uint32_t idx = h & hash_mask_;
-
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         if (pppoe_buckets_[slot] == nullptr || pppoe_buckets_[slot] == ctx) {
             pppoe_buckets_[slot] = ctx;
             return true;
@@ -320,29 +346,35 @@ bool SessionManager::BindPppoeSession(TelcoSessionContext* ctx, const uint8_t ma
 void SessionManager::UnbindPppoeSession(TelcoSessionContext* ctx) noexcept {
     if (!ctx || ctx->session_id == 0) return;
 
-    uint32_t h = HashPppoe(ctx->client_mac, static_cast<uint16_t>(ctx->session_id));
-    uint32_t idx = h & hash_mask_;
+    const uint32_t h = HashPppoe(ctx->client_mac, static_cast<uint16_t>(ctx->session_id));
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    WriteLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t local_slot = (local_idx + p) & shard_mask_;
+        const uint32_t slot = shard_base + local_slot;
         if (pppoe_buckets_[slot] == ctx) {
             pppoe_buckets_[slot] = nullptr;
 
-            uint32_t next = (slot + 1) & hash_mask_;
-            while (pppoe_buckets_[next] != nullptr) {
-                TelcoSessionContext* rehash_ctx = pppoe_buckets_[next];
-                pppoe_buckets_[next] = nullptr;
+            uint32_t next_local = (local_slot + 1) & shard_mask_;
+            uint32_t steps = 0;
+            while (pppoe_buckets_[shard_base + next_local] != nullptr && steps < shard_size_) {
+                TelcoSessionContext* rehash_ctx = pppoe_buckets_[shard_base + next_local];
+                pppoe_buckets_[shard_base + next_local] = nullptr;
 
-                uint32_t r_h = HashPppoe(rehash_ctx->client_mac, static_cast<uint16_t>(rehash_ctx->session_id));
-                uint32_t r_idx = r_h & hash_mask_;
+                const uint32_t r_h = HashPppoe(rehash_ctx->client_mac, static_cast<uint16_t>(rehash_ctx->session_id));
+                const uint32_t r_local_idx = r_h & shard_mask_;
                 for (uint32_t rp = 0; rp < MAX_PROBES; ++rp) {
-                    uint32_t r_slot = (r_idx + rp) & hash_mask_;
+                    const uint32_t r_slot = shard_base + ((r_local_idx + rp) & shard_mask_);
                     if (pppoe_buckets_[r_slot] == nullptr) {
                         pppoe_buckets_[r_slot] = rehash_ctx;
                         break;
                     }
                 }
-                next = (next + 1) & hash_mask_;
+                next_local = (next_local + 1) & shard_mask_;
+                ++steps;
             }
             break;
         }
@@ -356,11 +388,14 @@ void SessionManager::UnbindPppoeSession(TelcoSessionContext* ctx) noexcept {
 
 TelcoSessionContext* SessionManager::FindGtpuSession(uint32_t teid) const noexcept {
     if (teid == 0) return nullptr;
-    uint32_t h = HashTeid(teid);
-    uint32_t idx = h & hash_mask_;
+    const uint32_t h = HashTeid(teid);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    ReadLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         TelcoSessionContext* s = gtpu_buckets_[slot];
         if (!s) return nullptr;
 
@@ -376,12 +411,16 @@ bool SessionManager::BindGtpuSession(TelcoSessionContext* ctx, uint32_t teid) no
 
     UnbindGtpuSession(ctx);
 
+    const uint32_t h = HashTeid(teid);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
+
+    WriteLockGuard guard(shard_locks_[shard_id]);
     ctx->teid_uplink = teid;
-    uint32_t h = HashTeid(teid);
-    uint32_t idx = h & hash_mask_;
 
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         if (gtpu_buckets_[slot] == nullptr || gtpu_buckets_[slot] == ctx) {
             gtpu_buckets_[slot] = ctx;
             return true;
@@ -393,29 +432,35 @@ bool SessionManager::BindGtpuSession(TelcoSessionContext* ctx, uint32_t teid) no
 void SessionManager::UnbindGtpuSession(TelcoSessionContext* ctx) noexcept {
     if (!ctx || ctx->teid_uplink == 0) return;
 
-    uint32_t h = HashTeid(ctx->teid_uplink);
-    uint32_t idx = h & hash_mask_;
+    const uint32_t h = HashTeid(ctx->teid_uplink);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    WriteLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t local_slot = (local_idx + p) & shard_mask_;
+        const uint32_t slot = shard_base + local_slot;
         if (gtpu_buckets_[slot] == ctx) {
             gtpu_buckets_[slot] = nullptr;
 
-            uint32_t next = (slot + 1) & hash_mask_;
-            while (gtpu_buckets_[next] != nullptr) {
-                TelcoSessionContext* rehash_ctx = gtpu_buckets_[next];
-                gtpu_buckets_[next] = nullptr;
+            uint32_t next_local = (local_slot + 1) & shard_mask_;
+            uint32_t steps = 0;
+            while (gtpu_buckets_[shard_base + next_local] != nullptr && steps < shard_size_) {
+                TelcoSessionContext* rehash_ctx = gtpu_buckets_[shard_base + next_local];
+                gtpu_buckets_[shard_base + next_local] = nullptr;
 
-                uint32_t r_h = HashTeid(rehash_ctx->teid_uplink);
-                uint32_t r_idx = r_h & hash_mask_;
+                const uint32_t r_h = HashTeid(rehash_ctx->teid_uplink);
+                const uint32_t r_local_idx = r_h & shard_mask_;
                 for (uint32_t rp = 0; rp < MAX_PROBES; ++rp) {
-                    uint32_t r_slot = (r_idx + rp) & hash_mask_;
+                    const uint32_t r_slot = shard_base + ((r_local_idx + rp) & shard_mask_);
                     if (gtpu_buckets_[r_slot] == nullptr) {
                         gtpu_buckets_[r_slot] = rehash_ctx;
                         break;
                     }
                 }
-                next = (next + 1) & hash_mask_;
+                next_local = (next_local + 1) & shard_mask_;
+                ++steps;
             }
             break;
         }
@@ -429,11 +474,14 @@ void SessionManager::UnbindGtpuSession(TelcoSessionContext* ctx) noexcept {
 
 TelcoSessionContext* SessionManager::FindDhcpSession(uint32_t xid) const noexcept {
     if (xid == 0) return nullptr;
-    uint32_t h = HashDhcp(xid);
-    uint32_t idx = h & hash_mask_;
+    const uint32_t h = HashDhcp(xid);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    ReadLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         TelcoSessionContext* s = dhcp_buckets_[slot];
         if (!s) return nullptr;
 
@@ -449,12 +497,16 @@ bool SessionManager::BindDhcpSession(TelcoSessionContext* ctx, uint32_t xid) noe
 
     UnbindDhcpSession(ctx);
 
+    const uint32_t h = HashDhcp(xid);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
+
+    WriteLockGuard guard(shard_locks_[shard_id]);
     ctx->SetDhcpXid(xid);
-    uint32_t h = HashDhcp(xid);
-    uint32_t idx = h & hash_mask_;
 
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         if (dhcp_buckets_[slot] == nullptr || dhcp_buckets_[slot] == ctx) {
             dhcp_buckets_[slot] = ctx;
             return true;
@@ -466,29 +518,35 @@ bool SessionManager::BindDhcpSession(TelcoSessionContext* ctx, uint32_t xid) noe
 void SessionManager::UnbindDhcpSession(TelcoSessionContext* ctx) noexcept {
     if (!ctx || ctx->GetDhcpXid() == 0) return;
 
-    uint32_t h = HashDhcp(ctx->GetDhcpXid());
-    uint32_t idx = h & hash_mask_;
+    const uint32_t h = HashDhcp(ctx->GetDhcpXid());
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    WriteLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t local_slot = (local_idx + p) & shard_mask_;
+        const uint32_t slot = shard_base + local_slot;
         if (dhcp_buckets_[slot] == ctx) {
             dhcp_buckets_[slot] = nullptr;
 
-            uint32_t next = (slot + 1) & hash_mask_;
-            while (dhcp_buckets_[next] != nullptr) {
-                TelcoSessionContext* rehash_ctx = dhcp_buckets_[next];
-                dhcp_buckets_[next] = nullptr;
+            uint32_t next_local = (local_slot + 1) & shard_mask_;
+            uint32_t steps = 0;
+            while (dhcp_buckets_[shard_base + next_local] != nullptr && steps < shard_size_) {
+                TelcoSessionContext* rehash_ctx = dhcp_buckets_[shard_base + next_local];
+                dhcp_buckets_[shard_base + next_local] = nullptr;
 
-                uint32_t r_h = HashDhcp(rehash_ctx->GetDhcpXid());
-                uint32_t r_idx = r_h & hash_mask_;
+                const uint32_t r_h = HashDhcp(rehash_ctx->GetDhcpXid());
+                const uint32_t r_local_idx = r_h & shard_mask_;
                 for (uint32_t rp = 0; rp < MAX_PROBES; ++rp) {
-                    uint32_t r_slot = (r_idx + rp) & hash_mask_;
+                    const uint32_t r_slot = shard_base + ((r_local_idx + rp) & shard_mask_);
                     if (dhcp_buckets_[r_slot] == nullptr) {
                         dhcp_buckets_[r_slot] = rehash_ctx;
                         break;
                     }
                 }
-                next = (next + 1) & hash_mask_;
+                next_local = (next_local + 1) & shard_mask_;
+                ++steps;
             }
             break;
         }
@@ -502,11 +560,14 @@ void SessionManager::UnbindDhcpSession(TelcoSessionContext* ctx) noexcept {
 
 TelcoSessionContext* SessionManager::FindBfdSession(uint32_t my_disc) const noexcept {
     if (my_disc == 0) return nullptr;
-    uint32_t h = HashBfd(my_disc);
-    uint32_t idx = h & hash_mask_;
+    const uint32_t h = HashBfd(my_disc);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    ReadLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         TelcoSessionContext* s = bfd_buckets_[slot];
         if (!s) return nullptr;
 
@@ -522,12 +583,16 @@ bool SessionManager::BindBfdSession(TelcoSessionContext* ctx, uint32_t my_disc) 
 
     UnbindBfdSession(ctx);
 
+    const uint32_t h = HashBfd(my_disc);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
+
+    WriteLockGuard guard(shard_locks_[shard_id]);
     ctx->SetBfdLocalDisc(my_disc);
-    uint32_t h = HashBfd(my_disc);
-    uint32_t idx = h & hash_mask_;
 
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         if (bfd_buckets_[slot] == nullptr || bfd_buckets_[slot] == ctx) {
             bfd_buckets_[slot] = ctx;
             return true;
@@ -539,29 +604,35 @@ bool SessionManager::BindBfdSession(TelcoSessionContext* ctx, uint32_t my_disc) 
 void SessionManager::UnbindBfdSession(TelcoSessionContext* ctx) noexcept {
     if (!ctx || ctx->GetBfdLocalDisc() == 0) return;
 
-    uint32_t h = HashBfd(ctx->GetBfdLocalDisc());
-    uint32_t idx = h & hash_mask_;
+    const uint32_t h = HashBfd(ctx->GetBfdLocalDisc());
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    WriteLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t local_slot = (local_idx + p) & shard_mask_;
+        const uint32_t slot = shard_base + local_slot;
         if (bfd_buckets_[slot] == ctx) {
             bfd_buckets_[slot] = nullptr;
 
-            uint32_t next = (slot + 1) & hash_mask_;
-            while (bfd_buckets_[next] != nullptr) {
-                TelcoSessionContext* rehash_ctx = bfd_buckets_[next];
-                bfd_buckets_[next] = nullptr;
+            uint32_t next_local = (local_slot + 1) & shard_mask_;
+            uint32_t steps = 0;
+            while (bfd_buckets_[shard_base + next_local] != nullptr && steps < shard_size_) {
+                TelcoSessionContext* rehash_ctx = bfd_buckets_[shard_base + next_local];
+                bfd_buckets_[shard_base + next_local] = nullptr;
 
-                uint32_t r_h = HashBfd(rehash_ctx->GetBfdLocalDisc());
-                uint32_t r_idx = r_h & hash_mask_;
+                const uint32_t r_h = HashBfd(rehash_ctx->GetBfdLocalDisc());
+                const uint32_t r_local_idx = r_h & shard_mask_;
                 for (uint32_t rp = 0; rp < MAX_PROBES; ++rp) {
-                    uint32_t r_slot = (r_idx + rp) & hash_mask_;
+                    const uint32_t r_slot = shard_base + ((r_local_idx + rp) & shard_mask_);
                     if (bfd_buckets_[r_slot] == nullptr) {
                         bfd_buckets_[r_slot] = rehash_ctx;
                         break;
                     }
                 }
-                next = (next + 1) & hash_mask_;
+                next_local = (next_local + 1) & shard_mask_;
+                ++steps;
             }
             break;
         }
@@ -575,11 +646,14 @@ void SessionManager::UnbindBfdSession(TelcoSessionContext* ctx) noexcept {
 
 TelcoSessionContext* SessionManager::FindPfcpSession(uint64_t seid) const noexcept {
     if (seid == 0) return nullptr;
-    uint32_t h = HashPfcp(seid);
-    uint32_t idx = h & hash_mask_;
+    const uint32_t h = HashPfcp(seid);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    ReadLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         TelcoSessionContext* s = pfcp_buckets_[slot];
         if (!s) return nullptr;
 
@@ -595,12 +669,16 @@ bool SessionManager::BindPfcpSession(TelcoSessionContext* ctx, uint64_t seid) no
 
     UnbindPfcpSession(ctx);
 
+    const uint32_t h = HashPfcp(seid);
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
+
+    WriteLockGuard guard(shard_locks_[shard_id]);
     ctx->SetPfcpSeid(seid);
-    uint32_t h = HashPfcp(seid);
-    uint32_t idx = h & hash_mask_;
 
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t slot = shard_base + ((local_idx + p) & shard_mask_);
         if (pfcp_buckets_[slot] == nullptr || pfcp_buckets_[slot] == ctx) {
             pfcp_buckets_[slot] = ctx;
             return true;
@@ -612,29 +690,35 @@ bool SessionManager::BindPfcpSession(TelcoSessionContext* ctx, uint64_t seid) no
 void SessionManager::UnbindPfcpSession(TelcoSessionContext* ctx) noexcept {
     if (!ctx || ctx->GetPfcpSeid() == 0) return;
 
-    uint32_t h = HashPfcp(ctx->GetPfcpSeid());
-    uint32_t idx = h & hash_mask_;
+    const uint32_t h = HashPfcp(ctx->GetPfcpSeid());
+    const uint32_t shard_id = ShardIdFromHash(h);
+    const uint32_t shard_base = shard_id * shard_size_;
+    const uint32_t local_idx = h & shard_mask_;
 
+    WriteLockGuard guard(shard_locks_[shard_id]);
     for (uint32_t p = 0; p < MAX_PROBES; ++p) {
-        uint32_t slot = (idx + p) & hash_mask_;
+        const uint32_t local_slot = (local_idx + p) & shard_mask_;
+        const uint32_t slot = shard_base + local_slot;
         if (pfcp_buckets_[slot] == ctx) {
             pfcp_buckets_[slot] = nullptr;
 
-            uint32_t next = (slot + 1) & hash_mask_;
-            while (pfcp_buckets_[next] != nullptr) {
-                TelcoSessionContext* rehash_ctx = pfcp_buckets_[next];
-                pfcp_buckets_[next] = nullptr;
+            uint32_t next_local = (local_slot + 1) & shard_mask_;
+            uint32_t steps = 0;
+            while (pfcp_buckets_[shard_base + next_local] != nullptr && steps < shard_size_) {
+                TelcoSessionContext* rehash_ctx = pfcp_buckets_[shard_base + next_local];
+                pfcp_buckets_[shard_base + next_local] = nullptr;
 
-                uint32_t r_h = HashPfcp(rehash_ctx->GetPfcpSeid());
-                uint32_t r_idx = r_h & hash_mask_;
+                const uint32_t r_h = HashPfcp(rehash_ctx->GetPfcpSeid());
+                const uint32_t r_local_idx = r_h & shard_mask_;
                 for (uint32_t rp = 0; rp < MAX_PROBES; ++rp) {
-                    uint32_t r_slot = (r_idx + rp) & hash_mask_;
+                    const uint32_t r_slot = shard_base + ((r_local_idx + rp) & shard_mask_);
                     if (pfcp_buckets_[r_slot] == nullptr) {
                         pfcp_buckets_[r_slot] = rehash_ctx;
                         break;
                     }
                 }
-                next = (next + 1) & hash_mask_;
+                next_local = (next_local + 1) & shard_mask_;
+                ++steps;
             }
             break;
         }
@@ -646,6 +730,7 @@ size_t SessionManager::GetMemoryFootprintBytes() const noexcept {
     size_t total = pool_alloc_size_;
     total += static_cast<size_t>(max_sessions_) * sizeof(uint32_t); // free_indices
     total += 6 * static_cast<size_t>(hash_size_) * sizeof(TelcoSessionContext*); // 6 bucket tables
+    total += static_cast<size_t>(NUM_LOCK_SHARDS) * sizeof(ShardRwSpinLock);
     return total;
 }
 
