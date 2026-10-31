@@ -230,7 +230,11 @@ void DeviceBuffer::reset() {
         cudaFreeHost(base);
       }
     } else if (alloc_kind == AllocKind::kVulkanBar1P2p) {
-      // Persistent Vulkan-CUDA BAR1 GDDR6 arena owns the memory; no per-batch free required.
+      if (host_ptr) {
+        (void)p2p::get_global_bar1_batch_pool().release_slice(host_ptr);
+      } else {
+        (void)p2p::get_global_bar1_batch_pool().release_slice(ptr);
+      }
     } else {
       cudaFree(ptr);
     }
