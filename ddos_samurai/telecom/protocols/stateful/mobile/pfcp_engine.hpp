@@ -56,13 +56,52 @@ public:
     // Ayrıştırıcı (Decoder / Packet Parser)
     static bool ParsePfcpPacket(const uint8_t* frame, size_t len, PfcpDecapInfo& out_info);
 
-    // Node Paket Üreticileri (S = 0)
+    // Node Paket Üreticileri (S = 0) - Zero-Allocation Buffer & Vector API
+    size_t BuildAssociationSetupRequestInto(uint32_t seq, uint32_t node_ip, uint8_t* out_buf, size_t max_len) noexcept;
+    size_t BuildAssociationSetupResponseInto(uint32_t seq, uint32_t node_ip, PfcpCause cause, uint8_t* out_buf, size_t max_len) noexcept;
+    size_t BuildHeartbeatRequestInto(uint32_t seq, uint8_t* out_buf, size_t max_len) noexcept;
+    size_t BuildHeartbeatResponseInto(uint32_t seq, uint32_t recovery_timestamp, uint8_t* out_buf, size_t max_len) noexcept;
+
     std::vector<uint8_t> BuildAssociationSetupRequest(uint32_t seq, const std::string& node_id, uint32_t node_ip);
     std::vector<uint8_t> BuildAssociationSetupResponse(uint32_t seq, const std::string& node_id, uint32_t node_ip, PfcpCause cause = PfcpCause::RequestAccepted);
     std::vector<uint8_t> BuildHeartbeatRequest(uint32_t seq);
     std::vector<uint8_t> BuildHeartbeatResponse(uint32_t seq, uint32_t recovery_timestamp);
 
-    // Oturum Paket Üreticileri (S = 1)
+    // Oturum Paket Üreticileri (S = 1) - Zero-Allocation Buffer & Vector API
+    size_t BuildSessionEstablishmentRequestInto(TelcoSessionContext* session,
+                                                uint32_t seq,
+                                                uint64_t cp_seid,
+                                                const PfcpPdr& pdr,
+                                                const PfcpFar& far,
+                                                uint8_t* out_buf,
+                                                size_t max_len) noexcept;
+    size_t BuildSessionEstablishmentResponseInto(TelcoSessionContext* session,
+                                                 uint32_t seq,
+                                                 uint64_t cp_seid,
+                                                 uint64_t up_seid,
+                                                 PfcpCause cause,
+                                                 uint8_t* out_buf,
+                                                 size_t max_len) noexcept;
+    size_t BuildSessionModificationRequestInto(TelcoSessionContext* session,
+                                               uint32_t seq,
+                                               const PfcpFar& updated_far,
+                                               uint8_t* out_buf,
+                                               size_t max_len) noexcept;
+    size_t BuildSessionModificationResponseInto(TelcoSessionContext* session,
+                                                uint32_t seq,
+                                                PfcpCause cause,
+                                                uint8_t* out_buf,
+                                                size_t max_len) noexcept;
+    size_t BuildSessionDeletionRequestInto(TelcoSessionContext* session,
+                                           uint32_t seq,
+                                           uint8_t* out_buf,
+                                           size_t max_len) noexcept;
+    size_t BuildSessionDeletionResponseInto(TelcoSessionContext* session,
+                                            uint32_t seq,
+                                            PfcpCause cause,
+                                            uint8_t* out_buf,
+                                            size_t max_len) noexcept;
+
     std::vector<uint8_t> BuildSessionEstablishmentRequest(TelcoSessionContext* session, 
                                                          uint32_t seq, 
                                                          uint64_t cp_seid, 
