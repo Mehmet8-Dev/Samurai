@@ -113,10 +113,82 @@ private:
         return static_cast<uint32_t>(packed >> 32);
     }
 
-    // 5-Tuple O(1) arama hash tablosu
+    // 5-Tuple O(1) arama hash tablosu (256-shard RW-spinlock korumalı)
     static constexpr uint32_t MAX_PROBES = 32;
+    static constexpr uint32_t NUM_LOCK_SHARDS = 256;
+
+    struct alignas(64) ShardRwSpinLock {
+        static constexpr uint32_t WRITER_BIT = 0x80000000u;
+        std::atomic<uint32_t> state{0};
+
+        inline void LockRead() noexcept {
+            while (true) {
+                uint32_t s = state.load(std::memory_order_relaxed);
+                if ((s & WRITER_BIT) == 0) {
+                    if (state.compare_exchange_weak(s, s + 1,
+                                                    std::memory_order_acquire,
+                                                    std::memory_order_relaxed)) {
+                        return;
+                    }
+                } else {
+#if defined(__x86_64__) || defined(__i386__)
+                    __builtin_ia32_pause();
+#endif
+                }
+            }
+        }
+
+        inline void UnlockRead() noexcept {
+            state.fetch_sub(1, std::memory_order_release);
+        }
+
+        inline void LockWrite() noexcept {
+            while (true) {
+                uint32_t s = state.load(std::memory_order_relaxed);
+                if ((s & WRITER_BIT) == 0) {
+                    if (state.compare_exchange_weak(s, s | WRITER_BIT,
+                                                    std::memory_order_acquire,
+                                                    std::memory_order_relaxed)) {
+                        break;
+                    }
+                }
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#endif
+            }
+            while ((state.load(std::memory_order_acquire) & ~WRITER_BIT) != 0) {
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#endif
+            }
+        }
+
+        inline void UnlockWrite() noexcept {
+            state.fetch_and(~WRITER_BIT, std::memory_order_release);
+        }
+    };
+
+    struct ReadLockGuard {
+        ShardRwSpinLock& lock;
+        explicit inline ReadLockGuard(ShardRwSpinLock& l) noexcept : lock(l) { lock.LockRead(); }
+        inline ~ReadLockGuard() noexcept { lock.UnlockRead(); }
+    };
+
+    struct WriteLockGuard {
+        ShardRwSpinLock& lock;
+        explicit inline WriteLockGuard(ShardRwSpinLock& l) noexcept : lock(l) { lock.LockWrite(); }
+        inline ~WriteLockGuard() noexcept { lock.UnlockWrite(); }
+    };
+
+    static inline uint32_t ShardIdFromHash(uint32_t h) noexcept {
+        return ((h >> 16) ^ h) & (NUM_LOCK_SHARDS - 1);
+    }
+
     uint32_t hash_size_{0};
     uint32_t hash_mask_{0};
+    uint32_t shard_size_{0};
+    uint32_t shard_mask_{0};
+    mutable std::unique_ptr<ShardRwSpinLock[]> shard_locks_;
     TelcoSessionContext** hash_buckets_{nullptr};
 
     // PPPoE (MAC + SessionID) hash tablosu
