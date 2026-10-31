@@ -80,16 +80,128 @@ inline uint64_t Hton64(uint64_t val) { return val; }
 inline uint64_t Ntoh64(uint64_t val) { return val; }
 #endif
 
-void AppendIe(std::vector<uint8_t>& buf, PfcpIeType type, const uint8_t* val, uint16_t len) {
-    uint16_t t_be = htons(static_cast<uint16_t>(type));
-    uint16_t l_be = htons(len);
-    const auto* t_ptr = reinterpret_cast<const uint8_t*>(&t_be);
-    const auto* l_ptr = reinterpret_cast<const uint8_t*>(&l_be);
-    buf.insert(buf.end(), t_ptr, t_ptr + 2);
-    buf.insert(buf.end(), l_ptr, l_ptr + 2);
-    if (val && len > 0) {
-        buf.insert(buf.end(), val, val + len);
+bool AppendIeRaw(uint8_t* buf, size_t& offset, size_t max_len, PfcpIeType type, const uint8_t* val, uint16_t len) noexcept {
+    if (!buf || offset + 4 + static_cast<size_t>(len) > max_len) {
+        return false;
     }
+    const uint16_t t_be = htons(static_cast<uint16_t>(type));
+    const uint16_t l_be = htons(len);
+    std::memcpy(buf + offset, &t_be, 2);
+    std::memcpy(buf + offset + 2, &l_be, 2);
+    offset += 4;
+    if (val && len > 0) {
+        std::memcpy(buf + offset, val, len);
+        offset += len;
+    }
+    return true;
+}
+
+size_t WritePfcpNodeFrame(uint8_t* out_buf,
+                          size_t max_len,
+                          const uint8_t dst_mac[6],
+                          const uint8_t src_mac[6],
+                          uint32_t src_ip_host,
+                          uint32_t dst_ip_host,
+                          uint16_t src_port_host,
+                          uint16_t dst_port_host,
+                          uint16_t ip_id_host,
+                          PfcpMessageType msg_type,
+                          uint32_t seq,
+                          const uint8_t* ie_payload,
+                          size_t ie_len) noexcept {
+    const size_t pfcp_len = sizeof(PfcpNodeHeader) + ie_len;
+    const size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
+    if (!out_buf || max_len < total_len) return 0;
+
+    std::memset(out_buf, 0, sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(PfcpNodeHeader));
+
+    auto* eth = reinterpret_cast<EthHeader*>(out_buf);
+    std::memcpy(eth->dst_mac, dst_mac, 6);
+    std::memcpy(eth->src_mac, src_mac, 6);
+    eth->ethertype = htons(0x0800);
+
+    auto* ip = reinterpret_cast<Ipv4Header*>(out_buf + sizeof(EthHeader));
+    ip->ihl_version = 0x45;
+    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
+    ip->id = htons(ip_id_host);
+    ip->ttl = 64;
+    ip->protocol = 17;
+    ip->src_ip = htonl(src_ip_host);
+    ip->dst_ip = htonl(dst_ip_host);
+    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
+
+    auto* udp = reinterpret_cast<UdpHeader*>(out_buf + sizeof(EthHeader) + sizeof(Ipv4Header));
+    udp->src_port = htons(src_port_host);
+    udp->dst_port = htons(dst_port_host);
+    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
+
+    const size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
+    auto* pfcp = reinterpret_cast<PfcpNodeHeader*>(out_buf + pfcp_offset);
+    pfcp->flags = 0x20; // Version 1, S=0
+    pfcp->msg_type = static_cast<uint8_t>(msg_type);
+    pfcp->length = htons(static_cast<uint16_t>(4 + ie_len));
+    SetSeq24(pfcp->seq_num, seq);
+    pfcp->spare = 0;
+
+    if (ie_payload && ie_len > 0) {
+        std::memcpy(out_buf + pfcp_offset + sizeof(PfcpNodeHeader), ie_payload, ie_len);
+    }
+    return total_len;
+}
+
+size_t WritePfcpSessionFrame(uint8_t* out_buf,
+                             size_t max_len,
+                             const uint8_t dst_mac[6],
+                             const uint8_t src_mac[6],
+                             uint32_t src_ip_host,
+                             uint32_t dst_ip_host,
+                             uint16_t src_port_host,
+                             uint16_t dst_port_host,
+                             uint16_t ip_id_host,
+                             PfcpMessageType msg_type,
+                             uint64_t header_seid_host,
+                             uint32_t seq,
+                             const uint8_t* ie_payload,
+                             size_t ie_len) noexcept {
+    const size_t pfcp_len = sizeof(PfcpSessionHeader) + ie_len;
+    const size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
+    if (!out_buf || max_len < total_len) return 0;
+
+    std::memset(out_buf, 0, sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(PfcpSessionHeader));
+
+    auto* eth = reinterpret_cast<EthHeader*>(out_buf);
+    std::memcpy(eth->dst_mac, dst_mac, 6);
+    std::memcpy(eth->src_mac, src_mac, 6);
+    eth->ethertype = htons(0x0800);
+
+    auto* ip = reinterpret_cast<Ipv4Header*>(out_buf + sizeof(EthHeader));
+    ip->ihl_version = 0x45;
+    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
+    ip->id = htons(ip_id_host);
+    ip->ttl = 64;
+    ip->protocol = 17;
+    ip->src_ip = htonl(src_ip_host);
+    ip->dst_ip = htonl(dst_ip_host);
+    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
+
+    auto* udp = reinterpret_cast<UdpHeader*>(out_buf + sizeof(EthHeader) + sizeof(Ipv4Header));
+    udp->src_port = htons(src_port_host);
+    udp->dst_port = htons(dst_port_host);
+    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
+
+    const size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
+    auto* pfcp = reinterpret_cast<PfcpSessionHeader*>(out_buf + pfcp_offset);
+    pfcp->flags = 0x21; // Version 1, S=1
+    pfcp->msg_type = static_cast<uint8_t>(msg_type);
+    pfcp->length = htons(static_cast<uint16_t>(12 + ie_len));
+    pfcp->seid = Hton64(header_seid_host);
+    SetSeq24(pfcp->seq_num, seq);
+    pfcp->spare = 0;
+
+    if (ie_payload && ie_len > 0) {
+        std::memcpy(out_buf + pfcp_offset + sizeof(PfcpSessionHeader), ie_payload, ie_len);
+    }
+    return total_len;
 }
 
 void ScanIe(const uint8_t* data, size_t len, PfcpDecapInfo& out_info, uint32_t depth = 0) {
@@ -152,10 +264,15 @@ void ScanIe(const uint8_t* data, size_t len, PfcpDecapInfo& out_info, uint32_t d
 
 PfcpEngine::PfcpEngine(SessionManager& session_mgr, HierarchicalTimingWheel* wheel)
     : session_mgr_(session_mgr),
-      timing_wheel_(wheel) {}
+      timing_wheel_(wheel) {
+    last_tx_frame_.reserve(2048);
+}
 
 bool PfcpEngine::Init(const ProtocolConfig& cfg) {
     config_ = cfg;
+    if (last_tx_frame_.capacity() < 2048) {
+        last_tx_frame_.reserve(2048);
+    }
     return true;
 }
 
@@ -210,8 +327,10 @@ void PfcpEngine::StartAssociation(const PfcpConfig& cfg) {
     pfcp_cfg_ = cfg;
     is_associated_ = false;
 
-    // Send Association Setup Request
-    last_tx_frame_ = BuildAssociationSetupRequest(next_seq_++, cfg.local_node_id, cfg.local_ip);
+    // Send Association Setup Request (zero-allocation into pre-reserved buffer)
+    last_tx_frame_.resize(256);
+    const size_t written = BuildAssociationSetupRequestInto(next_seq_++, cfg.local_ip, last_tx_frame_.data(), last_tx_frame_.size());
+    last_tx_frame_.resize(written);
 }
 
 void PfcpEngine::EstablishSession(TelcoSessionContext* session, 
@@ -241,9 +360,12 @@ void PfcpEngine::EstablishSession(TelcoSessionContext* session,
     session_mgr_.BindPfcpSession(session, cp_seid);
 
     SetSubState(session, PfcpSubState::SESSION_ESTAB_PENDING);
-    last_tx_frame_ = BuildSessionEstablishmentRequest(session, next_seq_++, cp_seid, pdr, far);
+    last_tx_frame_.resize(512);
+    const size_t written = BuildSessionEstablishmentRequestInto(
+        session, next_seq_++, cp_seid, pdr, far, last_tx_frame_.data(), last_tx_frame_.size());
+    last_tx_frame_.resize(written);
     session->tx_packets++;
-    session->tx_bytes += last_tx_frame_.size();
+    session->tx_bytes += written;
 
     if (timing_wheel_) {
         timing_wheel_->Schedule(session, config_.retransmit_timeout_ms > 0 ? config_.retransmit_timeout_ms : 500);
@@ -257,9 +379,12 @@ void PfcpEngine::ModifySession(TelcoSessionContext* session, const PfcpFar& upda
     last_far_ = updated_far;
     session->teid_downlink = updated_far.outer_teid;
 
-    last_tx_frame_ = BuildSessionModificationRequest(session, next_seq_++, updated_far);
+    last_tx_frame_.resize(256);
+    const size_t written = BuildSessionModificationRequestInto(
+        session, next_seq_++, updated_far, last_tx_frame_.data(), last_tx_frame_.size());
+    last_tx_frame_.resize(written);
     session->tx_packets++;
-    session->tx_bytes += last_tx_frame_.size();
+    session->tx_bytes += written;
 
     if (timing_wheel_) {
         timing_wheel_->Schedule(session, config_.retransmit_timeout_ms > 0 ? config_.retransmit_timeout_ms : 500);
@@ -274,9 +399,12 @@ void PfcpEngine::DeleteSession(TelcoSessionContext* session) {
     }
 
     SetSubState(session, PfcpSubState::SESSION_DEL_PENDING);
-    last_tx_frame_ = BuildSessionDeletionRequest(session, next_seq_++);
+    last_tx_frame_.resize(128);
+    const size_t written = BuildSessionDeletionRequestInto(
+        session, next_seq_++, last_tx_frame_.data(), last_tx_frame_.size());
+    last_tx_frame_.resize(written);
     session->tx_packets++;
-    session->tx_bytes += last_tx_frame_.size();
+    session->tx_bytes += written;
 }
 
 void PfcpEngine::HandleTimeout(TelcoSessionContext* session) {
@@ -297,17 +425,24 @@ void PfcpEngine::HandleTimeout(TelcoSessionContext* session) {
             return;
         }
 
-        // Retransmit
+        // Retransmit (zero-allocation into pre-reserved buffer)
+        last_tx_frame_.resize(512);
+        size_t written = 0;
         if (sub == PfcpSubState::SESSION_ESTAB_PENDING) {
-            last_tx_frame_ = BuildSessionEstablishmentRequest(session, next_seq_++, session->GetPfcpSeid(), last_pdr_, last_far_);
+            written = BuildSessionEstablishmentRequestInto(
+                session, next_seq_++, session->GetPfcpSeid(), last_pdr_, last_far_,
+                last_tx_frame_.data(), last_tx_frame_.size());
         } else if (sub == PfcpSubState::SESSION_MOD_PENDING) {
-            last_tx_frame_ = BuildSessionModificationRequest(session, next_seq_++, last_far_);
+            written = BuildSessionModificationRequestInto(
+                session, next_seq_++, last_far_, last_tx_frame_.data(), last_tx_frame_.size());
         } else {
-            last_tx_frame_ = BuildSessionDeletionRequest(session, next_seq_++);
+            written = BuildSessionDeletionRequestInto(
+                session, next_seq_++, last_tx_frame_.data(), last_tx_frame_.size());
         }
+        last_tx_frame_.resize(written);
 
         session->tx_packets++;
-        session->tx_bytes += last_tx_frame_.size();
+        session->tx_bytes += written;
 
         uint32_t backoff_ms = (config_.retransmit_timeout_ms > 0 ? config_.retransmit_timeout_ms : 500) * (1 << session->retry_count);
         if (timing_wheel_) {
@@ -331,7 +466,72 @@ void PfcpEngine::OnRxPacket(rte_mbuf* /*mbuf*/, const PacketMetadata& meta, Telc
     }
 }
 
-rte_mbuf* PfcpEngine::BuildTxPacket(rte_mempool* /*pool*/, TelcoSessionContext* /*session*/, uint16_t /*event_type*/) {
+rte_mbuf* PfcpEngine::BuildTxPacket(rte_mempool* pool, TelcoSessionContext* session, uint16_t event_type) {
+    auto serialize_into = [&](uint8_t* dst, size_t max_len) noexcept -> size_t {
+        if (event_type == 1 || (!session && !is_associated_)) {
+            return BuildAssociationSetupRequestInto(next_seq_++, pfcp_cfg_.local_ip, dst, max_len);
+        }
+        if (event_type == 2 || !session) {
+            return BuildHeartbeatRequestInto(next_seq_++, dst, max_len);
+        }
+        if (event_type == 3) {
+            return BuildSessionModificationRequestInto(session, next_seq_++, last_far_, dst, max_len);
+        }
+        if (event_type == 4) {
+            return BuildSessionDeletionRequestInto(session, next_seq_++, dst, max_len);
+        }
+
+        const PfcpSubState sub = GetSubState(session);
+        if (sub == PfcpSubState::SESSION_MOD_PENDING) {
+            return BuildSessionModificationRequestInto(session, next_seq_++, last_far_, dst, max_len);
+        }
+        if (sub == PfcpSubState::SESSION_DEL_PENDING) {
+            return BuildSessionDeletionRequestInto(session, next_seq_++, dst, max_len);
+        }
+        if (sub == PfcpSubState::ESTABLISHED) {
+            return BuildHeartbeatRequestInto(next_seq_++, dst, max_len);
+        }
+
+        const uint64_t seid = session->GetPfcpSeid() != 0 ? session->GetPfcpSeid() : 0x10000ULL;
+        PfcpPdr pdr = last_pdr_;
+        if (pdr.pdr_id == 0) pdr.pdr_id = 1;
+        if (pdr.teid == 0) pdr.teid = session->teid_uplink != 0 ? session->teid_uplink : 0x2000u;
+        if (pdr.ue_ip == 0) pdr.ue_ip = session->client_ip;
+        PfcpFar far = last_far_;
+        if (far.far_id == 0) far.far_id = 1;
+        if (far.outer_teid == 0) far.outer_teid = session->teid_downlink;
+        return BuildSessionEstablishmentRequestInto(session, next_seq_++, seid, pdr, far, dst, max_len);
+    };
+
+#ifdef SAMURAI_WITH_DPDK
+    if (pool) {
+        rte_mbuf* m = rte_pktmbuf_alloc(pool);
+        if (!m) return nullptr;
+
+        const size_t tailroom = rte_pktmbuf_tailroom(m);
+        uint8_t* dst = rte_pktmbuf_mtod(m, uint8_t*);
+        const size_t written = serialize_into(dst, tailroom);
+        if (written == 0 || !rte_pktmbuf_append(m, static_cast<uint16_t>(written))) {
+            rte_pktmbuf_free(m);
+            return nullptr;
+        }
+        if (session) {
+            session->tx_packets++;
+            session->tx_bytes += written;
+        }
+        last_tx_frame_.assign(dst, dst + written);
+        return m;
+    }
+#else
+    (void)pool;
+#endif
+    last_tx_frame_.resize(512);
+    const size_t written = serialize_into(last_tx_frame_.data(), last_tx_frame_.size());
+    last_tx_frame_.resize(written);
+    if (session && written > 0) {
+        session->tx_packets++;
+        session->tx_bytes += written;
+    }
     return nullptr;
 }
 
@@ -471,7 +671,10 @@ bool PfcpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, TelcoSessionCo
             return true;
         }
         if (info.msg_type == static_cast<uint8_t>(PfcpMessageType::HeartbeatRequest)) {
-            last_tx_frame_ = BuildHeartbeatResponse(info.seq_num, recovery_timestamp_);
+            last_tx_frame_.resize(128);
+            const size_t written = BuildHeartbeatResponseInto(
+                info.seq_num, recovery_timestamp_, last_tx_frame_.data(), last_tx_frame_.size());
+            last_tx_frame_.resize(written);
             return true;
         }
         if (info.msg_type == static_cast<uint8_t>(PfcpMessageType::HeartbeatResponse)) {
@@ -526,329 +729,269 @@ bool PfcpEngine::ProcessRxFrame(const uint8_t* frame, size_t len, TelcoSessionCo
 }
 
 // ---------------------------------------------------------------------------
-// Düğüm Düzeyi Paket Üreticileri (S = 0)
+// Düğüm Düzeyi Paket Üreticileri (S = 0, Zero-Allocation Buffer & Vector API)
 // ---------------------------------------------------------------------------
 
-std::vector<uint8_t> PfcpEngine::BuildAssociationSetupRequest(uint32_t seq, const std::string& node_id, uint32_t node_ip) {
-    std::vector<uint8_t> payload;
+size_t PfcpEngine::BuildAssociationSetupRequestInto(uint32_t seq, uint32_t node_ip, uint8_t* out_buf, size_t max_len) noexcept {
+    uint8_t payload[64];
+    size_t payload_len = 0;
 
-    // Node ID IE (Type 60)
-    std::vector<uint8_t> node_id_val;
-    node_id_val.push_back(0); // Node ID Type = IPv4
-    uint32_t ip_be = htonl(node_ip != 0 ? node_ip : pfcp_cfg_.local_ip);
-    const auto* ip_ptr = reinterpret_cast<const uint8_t*>(&ip_be);
-    node_id_val.insert(node_id_val.end(), ip_ptr, ip_ptr + 4);
-    AppendIe(payload, PfcpIeType::NodeId, node_id_val.data(), node_id_val.size());
+    uint8_t node_id_val[5];
+    node_id_val[0] = 0; // IPv4
+    const uint32_t ip_host = node_ip != 0 ? node_ip : pfcp_cfg_.local_ip;
+    const uint32_t ip_be = htonl(ip_host);
+    std::memcpy(node_id_val + 1, &ip_be, 4);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::NodeId, node_id_val, 5);
 
-    // Recovery Time Stamp IE (Type 96)
-    uint32_t rec_be = htonl(recovery_timestamp_);
-    AppendIe(payload, PfcpIeType::RecoveryTimeStamp, reinterpret_cast<const uint8_t*>(&rec_be), 4);
+    const uint32_t rec_be = htonl(recovery_timestamp_);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::RecoveryTimeStamp, reinterpret_cast<const uint8_t*>(&rec_be), 4);
 
-    size_t pfcp_len = sizeof(PfcpNodeHeader) + payload.size();
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
-    std::vector<uint8_t> frame(total_len, 0);
+    return WritePfcpNodeFrame(
+        out_buf, max_len,
+        pfcp_cfg_.remote_mac, pfcp_cfg_.local_mac,
+        ip_host, pfcp_cfg_.remote_upf_ip,
+        pfcp_cfg_.local_port, pfcp_cfg_.remote_port,
+        0x5043, PfcpMessageType::AssociationSetupRequest,
+        seq, payload, payload_len);
+}
 
-    EthHeader eth{};
-    std::memcpy(eth.dst_mac, pfcp_cfg_.remote_mac, 6);
-    std::memcpy(eth.src_mac, pfcp_cfg_.local_mac, 6);
-    eth.ethertype = htons(0x0800);
-    std::memcpy(frame.data(), &eth, sizeof(EthHeader));
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
-    ip->ihl_version = 0x45;
-    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
-    ip->id = htons(0x5043);
-    ip->ttl = 64;
-    ip->protocol = 17;
-    ip->src_ip = htonl(node_ip != 0 ? node_ip : pfcp_cfg_.local_ip);
-    ip->dst_ip = htonl(pfcp_cfg_.remote_upf_ip);
-    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
-
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->src_port = htons(pfcp_cfg_.local_port);
-    udp->dst_port = htons(pfcp_cfg_.remote_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
-
-    size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* pfcp = reinterpret_cast<PfcpNodeHeader*>(frame.data() + pfcp_offset);
-    pfcp->flags = 0x20; // Version 1, S=0
-    pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::AssociationSetupRequest);
-    pfcp->length = htons(static_cast<uint16_t>(4 + payload.size()));
-    SetSeq24(pfcp->seq_num, seq);
-    pfcp->spare = 0;
-
-    std::memcpy(frame.data() + pfcp_offset + sizeof(PfcpNodeHeader), payload.data(), payload.size());
+std::vector<uint8_t> PfcpEngine::BuildAssociationSetupRequest(uint32_t seq, const std::string& /*node_id*/, uint32_t node_ip) {
+    std::vector<uint8_t> frame(128, 0);
+    const size_t written = BuildAssociationSetupRequestInto(seq, node_ip, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
+}
+
+size_t PfcpEngine::BuildAssociationSetupResponseInto(uint32_t seq, uint32_t node_ip, PfcpCause cause, uint8_t* out_buf, size_t max_len) noexcept {
+    uint8_t payload[64];
+    size_t payload_len = 0;
+
+    uint8_t node_id_val[5];
+    node_id_val[0] = 0; // IPv4
+    const uint32_t ip_be = htonl(node_ip != 0 ? node_ip : pfcp_cfg_.remote_upf_ip);
+    std::memcpy(node_id_val + 1, &ip_be, 4);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::NodeId, node_id_val, 5);
+
+    const uint8_t cause_val = static_cast<uint8_t>(cause);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::Cause, &cause_val, 1);
+
+    const uint32_t rec_be = htonl(recovery_timestamp_);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::RecoveryTimeStamp, reinterpret_cast<const uint8_t*>(&rec_be), 4);
+
+    return WritePfcpNodeFrame(
+        out_buf, max_len,
+        pfcp_cfg_.local_mac, pfcp_cfg_.remote_mac,
+        pfcp_cfg_.remote_upf_ip, node_ip != 0 ? node_ip : pfcp_cfg_.local_ip,
+        pfcp_cfg_.remote_port, pfcp_cfg_.local_port,
+        0x5044, PfcpMessageType::AssociationSetupResponse,
+        seq, payload, payload_len);
 }
 
 std::vector<uint8_t> PfcpEngine::BuildAssociationSetupResponse(uint32_t seq, const std::string& /*node_id*/, uint32_t node_ip, PfcpCause cause) {
-    std::vector<uint8_t> payload;
-
-    // Node ID IE
-    std::vector<uint8_t> node_id_val;
-    node_id_val.push_back(0); // IPv4
-    uint32_t ip_be = htonl(node_ip != 0 ? node_ip : pfcp_cfg_.remote_upf_ip);
-    const auto* ip_ptr = reinterpret_cast<const uint8_t*>(&ip_be);
-    node_id_val.insert(node_id_val.end(), ip_ptr, ip_ptr + 4);
-    AppendIe(payload, PfcpIeType::NodeId, node_id_val.data(), node_id_val.size());
-
-    // Cause IE
-    uint8_t cause_val = static_cast<uint8_t>(cause);
-    AppendIe(payload, PfcpIeType::Cause, &cause_val, 1);
-
-    // Recovery Time Stamp IE
-    uint32_t rec_be = htonl(recovery_timestamp_);
-    AppendIe(payload, PfcpIeType::RecoveryTimeStamp, reinterpret_cast<const uint8_t*>(&rec_be), 4);
-
-    size_t pfcp_len = sizeof(PfcpNodeHeader) + payload.size();
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
-    std::vector<uint8_t> frame(total_len, 0);
-
-    EthHeader eth{};
-    std::memcpy(eth.dst_mac, pfcp_cfg_.local_mac, 6);
-    std::memcpy(eth.src_mac, pfcp_cfg_.remote_mac, 6);
-    eth.ethertype = htons(0x0800);
-    std::memcpy(frame.data(), &eth, sizeof(EthHeader));
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
-    ip->ihl_version = 0x45;
-    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
-    ip->id = htons(0x5044);
-    ip->ttl = 64;
-    ip->protocol = 17;
-    ip->src_ip = htonl(pfcp_cfg_.remote_upf_ip);
-    ip->dst_ip = htonl(node_ip != 0 ? node_ip : pfcp_cfg_.local_ip);
-    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
-
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->src_port = htons(pfcp_cfg_.remote_port);
-    udp->dst_port = htons(pfcp_cfg_.local_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
-
-    size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* pfcp = reinterpret_cast<PfcpNodeHeader*>(frame.data() + pfcp_offset);
-    pfcp->flags = 0x20;
-    pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::AssociationSetupResponse);
-    pfcp->length = htons(static_cast<uint16_t>(4 + payload.size()));
-    SetSeq24(pfcp->seq_num, seq);
-    pfcp->spare = 0;
-
-    std::memcpy(frame.data() + pfcp_offset + sizeof(PfcpNodeHeader), payload.data(), payload.size());
+    std::vector<uint8_t> frame(128, 0);
+    const size_t written = BuildAssociationSetupResponseInto(seq, node_ip, cause, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
+}
+
+size_t PfcpEngine::BuildHeartbeatRequestInto(uint32_t seq, uint8_t* out_buf, size_t max_len) noexcept {
+    uint8_t payload[16];
+    size_t payload_len = 0;
+    const uint32_t rec_be = htonl(recovery_timestamp_);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::RecoveryTimeStamp, reinterpret_cast<const uint8_t*>(&rec_be), 4);
+
+    return WritePfcpNodeFrame(
+        out_buf, max_len,
+        pfcp_cfg_.remote_mac, pfcp_cfg_.local_mac,
+        pfcp_cfg_.local_ip, pfcp_cfg_.remote_upf_ip,
+        pfcp_cfg_.local_port, pfcp_cfg_.remote_port,
+        0x5045, PfcpMessageType::HeartbeatRequest,
+        seq, payload, payload_len);
 }
 
 std::vector<uint8_t> PfcpEngine::BuildHeartbeatRequest(uint32_t seq) {
-    std::vector<uint8_t> payload;
-    uint32_t rec_be = htonl(recovery_timestamp_);
-    AppendIe(payload, PfcpIeType::RecoveryTimeStamp, reinterpret_cast<const uint8_t*>(&rec_be), 4);
-
-    size_t pfcp_len = sizeof(PfcpNodeHeader) + payload.size();
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
-    std::vector<uint8_t> frame(total_len, 0);
-
-    EthHeader eth{};
-    std::memcpy(eth.dst_mac, pfcp_cfg_.remote_mac, 6);
-    std::memcpy(eth.src_mac, pfcp_cfg_.local_mac, 6);
-    eth.ethertype = htons(0x0800);
-    std::memcpy(frame.data(), &eth, sizeof(EthHeader));
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
-    ip->ihl_version = 0x45;
-    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
-    ip->id = htons(0x5045);
-    ip->ttl = 64;
-    ip->protocol = 17;
-    ip->src_ip = htonl(pfcp_cfg_.local_ip);
-    ip->dst_ip = htonl(pfcp_cfg_.remote_upf_ip);
-    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
-
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->src_port = htons(pfcp_cfg_.local_port);
-    udp->dst_port = htons(pfcp_cfg_.remote_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
-
-    size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* pfcp = reinterpret_cast<PfcpNodeHeader*>(frame.data() + pfcp_offset);
-    pfcp->flags = 0x20;
-    pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::HeartbeatRequest);
-    pfcp->length = htons(static_cast<uint16_t>(4 + payload.size()));
-    SetSeq24(pfcp->seq_num, seq);
-    pfcp->spare = 0;
-
-    std::memcpy(frame.data() + pfcp_offset + sizeof(PfcpNodeHeader), payload.data(), payload.size());
+    std::vector<uint8_t> frame(128, 0);
+    const size_t written = BuildHeartbeatRequestInto(seq, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
+}
+
+size_t PfcpEngine::BuildHeartbeatResponseInto(uint32_t seq, uint32_t recovery_timestamp, uint8_t* out_buf, size_t max_len) noexcept {
+    uint8_t payload[16];
+    size_t payload_len = 0;
+    const uint32_t rec_be = htonl(recovery_timestamp);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::RecoveryTimeStamp, reinterpret_cast<const uint8_t*>(&rec_be), 4);
+
+    return WritePfcpNodeFrame(
+        out_buf, max_len,
+        pfcp_cfg_.local_mac, pfcp_cfg_.remote_mac,
+        pfcp_cfg_.remote_upf_ip, pfcp_cfg_.local_ip,
+        pfcp_cfg_.remote_port, pfcp_cfg_.local_port,
+        0x5046, PfcpMessageType::HeartbeatResponse,
+        seq, payload, payload_len);
 }
 
 std::vector<uint8_t> PfcpEngine::BuildHeartbeatResponse(uint32_t seq, uint32_t recovery_timestamp) {
-    std::vector<uint8_t> payload;
-    uint32_t rec_be = htonl(recovery_timestamp);
-    AppendIe(payload, PfcpIeType::RecoveryTimeStamp, reinterpret_cast<const uint8_t*>(&rec_be), 4);
-
-    size_t pfcp_len = sizeof(PfcpNodeHeader) + payload.size();
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
-    std::vector<uint8_t> frame(total_len, 0);
-
-    EthHeader eth{};
-    std::memcpy(eth.dst_mac, pfcp_cfg_.local_mac, 6);
-    std::memcpy(eth.src_mac, pfcp_cfg_.remote_mac, 6);
-    eth.ethertype = htons(0x0800);
-    std::memcpy(frame.data(), &eth, sizeof(EthHeader));
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
-    ip->ihl_version = 0x45;
-    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
-    ip->id = htons(0x5046);
-    ip->ttl = 64;
-    ip->protocol = 17;
-    ip->src_ip = htonl(pfcp_cfg_.remote_upf_ip);
-    ip->dst_ip = htonl(pfcp_cfg_.local_ip);
-    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
-
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->src_port = htons(pfcp_cfg_.remote_port);
-    udp->dst_port = htons(pfcp_cfg_.local_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
-
-    size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* pfcp = reinterpret_cast<PfcpNodeHeader*>(frame.data() + pfcp_offset);
-    pfcp->flags = 0x20;
-    pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::HeartbeatResponse);
-    pfcp->length = htons(static_cast<uint16_t>(4 + payload.size()));
-    SetSeq24(pfcp->seq_num, seq);
-    pfcp->spare = 0;
-
-    std::memcpy(frame.data() + pfcp_offset + sizeof(PfcpNodeHeader), payload.data(), payload.size());
+    std::vector<uint8_t> frame(128, 0);
+    const size_t written = BuildHeartbeatResponseInto(seq, recovery_timestamp, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
 }
 
 // ---------------------------------------------------------------------------
-// Oturum Düzeyi Paket Üreticileri (S = 1)
+// Oturum Düzeyi Paket Üreticileri (S = 1, Zero-Allocation Buffer & Vector API)
 // ---------------------------------------------------------------------------
+
+size_t PfcpEngine::BuildSessionEstablishmentRequestInto(TelcoSessionContext* session,
+                                                        uint32_t seq,
+                                                        uint64_t cp_seid,
+                                                        const PfcpPdr& pdr,
+                                                        const PfcpFar& far,
+                                                        uint8_t* out_buf,
+                                                        size_t max_len) noexcept {
+    uint8_t payload[256];
+    size_t payload_len = 0;
+
+    // Node ID IE
+    uint8_t node_id_val[5];
+    node_id_val[0] = 0; // IPv4
+    const uint32_t ip_be = htonl(pfcp_cfg_.local_ip);
+    std::memcpy(node_id_val + 1, &ip_be, 4);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::NodeId, node_id_val, 5);
+
+    // CP F-SEID IE (Type 57)
+    uint8_t fseid_buf[13];
+    fseid_buf[0] = 0x02; // Flags: V4
+    const uint64_t seid_be = Hton64(cp_seid);
+    std::memcpy(fseid_buf + 1, &seid_be, 8);
+    std::memcpy(fseid_buf + 9, &ip_be, 4);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::FSeid, fseid_buf, 13);
+
+    // Create PDR Grouped IE (Type 1)
+    {
+        uint8_t pdr_val[128];
+        size_t pdr_len = 0;
+        const uint16_t pdr_id_be = htons(pdr.pdr_id);
+        AppendIeRaw(pdr_val, pdr_len, sizeof(pdr_val), PfcpIeType::PdrId, reinterpret_cast<const uint8_t*>(&pdr_id_be), 2);
+        const uint32_t prec_be = htonl(pdr.precedence);
+        AppendIeRaw(pdr_val, pdr_len, sizeof(pdr_val), static_cast<PfcpIeType>(29), reinterpret_cast<const uint8_t*>(&prec_be), 4);
+
+        // PDI Grouped IE (Type 2)
+        uint8_t pdi_val[64];
+        size_t pdi_len = 0;
+        const uint8_t src_intf = static_cast<uint8_t>(pdr.source_interface);
+        AppendIeRaw(pdi_val, pdi_len, sizeof(pdi_val), PfcpIeType::SourceInterface, &src_intf, 1);
+
+        // F-TEID IE (Type 21)
+        uint8_t fteid_buf[9];
+        fteid_buf[0] = 0x01; // Flags: V4
+        const uint32_t teid_be = htonl(pdr.teid);
+        std::memcpy(fteid_buf + 1, &teid_be, 4);
+        const uint32_t upf_ip_be = htonl(pfcp_cfg_.remote_upf_ip);
+        std::memcpy(fteid_buf + 5, &upf_ip_be, 4);
+        AppendIeRaw(pdi_val, pdi_len, sizeof(pdi_val), PfcpIeType::FTeid, fteid_buf, 9);
+
+        // UE IP Address IE (Type 93)
+        uint8_t ue_ip_buf[5];
+        ue_ip_buf[0] = 0x02; // Flags: V4
+        const uint32_t ue_be = htonl(pdr.ue_ip != 0 ? pdr.ue_ip : (session ? session->client_ip : 0));
+        std::memcpy(ue_ip_buf + 1, &ue_be, 4);
+        AppendIeRaw(pdi_val, pdi_len, sizeof(pdi_val), PfcpIeType::UeIpAddress, ue_ip_buf, 5);
+
+        AppendIeRaw(pdr_val, pdr_len, sizeof(pdr_val), PfcpIeType::Pdi, pdi_val, static_cast<uint16_t>(pdi_len));
+
+        const uint32_t far_id_be = htonl(pdr.far_id);
+        AppendIeRaw(pdr_val, pdr_len, sizeof(pdr_val), PfcpIeType::FarId, reinterpret_cast<const uint8_t*>(&far_id_be), 4);
+
+        AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::CreatePdr, pdr_val, static_cast<uint16_t>(pdr_len));
+    }
+
+    // Create FAR Grouped IE (Type 3)
+    {
+        uint8_t far_val[128];
+        size_t far_len = 0;
+        const uint32_t far_id_be = htonl(far.far_id);
+        AppendIeRaw(far_val, far_len, sizeof(far_val), PfcpIeType::FarId, reinterpret_cast<const uint8_t*>(&far_id_be), 4);
+        const uint8_t action = far.apply_action;
+        AppendIeRaw(far_val, far_len, sizeof(far_val), PfcpIeType::ApplyAction, &action, 1);
+
+        // Forwarding Parameters Grouped IE (Type 4)
+        uint8_t fp_val[64];
+        size_t fp_len = 0;
+        const uint8_t dst_intf = static_cast<uint8_t>(far.destination_interface);
+        AppendIeRaw(fp_val, fp_len, sizeof(fp_val), PfcpIeType::DestinationInterface, &dst_intf, 1);
+
+        if (far.outer_teid != 0) {
+            uint8_t ohc_buf[10];
+            const uint16_t ohc_desc = htons(0x0100);
+            std::memcpy(ohc_buf, &ohc_desc, 2);
+            const uint32_t o_teid = htonl(far.outer_teid);
+            std::memcpy(ohc_buf + 2, &o_teid, 4);
+            const uint32_t o_ip = htonl(far.peer_upf_ip != 0 ? far.peer_upf_ip : pfcp_cfg_.remote_upf_ip);
+            std::memcpy(ohc_buf + 6, &o_ip, 4);
+            AppendIeRaw(fp_val, fp_len, sizeof(fp_val), PfcpIeType::OuterHeaderCreation, ohc_buf, 10);
+        }
+        AppendIeRaw(far_val, far_len, sizeof(far_val), PfcpIeType::ForwardingParameters, fp_val, static_cast<uint16_t>(fp_len));
+
+        AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::CreateFar, far_val, static_cast<uint16_t>(far_len));
+    }
+
+    return WritePfcpSessionFrame(
+        out_buf, max_len,
+        session ? session->peer_mac : pfcp_cfg_.remote_mac,
+        session ? session->client_mac : pfcp_cfg_.local_mac,
+        pfcp_cfg_.local_ip, pfcp_cfg_.remote_upf_ip,
+        pfcp_cfg_.local_port, pfcp_cfg_.remote_port,
+        0x5050, PfcpMessageType::SessionEstablishmentRequest,
+        0, // Initial request has SEID 0 in header
+        seq, payload, payload_len);
+}
 
 std::vector<uint8_t> PfcpEngine::BuildSessionEstablishmentRequest(TelcoSessionContext* session, 
                                                                  uint32_t seq, 
                                                                  uint64_t cp_seid, 
                                                                  const PfcpPdr& pdr, 
                                                                  const PfcpFar& far) {
-    std::vector<uint8_t> payload;
-
-    // Node ID IE
-    std::vector<uint8_t> node_id_val;
-    node_id_val.push_back(0); // IPv4
-    uint32_t ip_be = htonl(pfcp_cfg_.local_ip);
-    const auto* ip_ptr = reinterpret_cast<const uint8_t*>(&ip_be);
-    node_id_val.insert(node_id_val.end(), ip_ptr, ip_ptr + 4);
-    AppendIe(payload, PfcpIeType::NodeId, node_id_val.data(), node_id_val.size());
-
-    // CP F-SEID IE (Type 57)
-    uint8_t fseid_buf[13];
-    fseid_buf[0] = 0x02; // Flags: V4
-    uint64_t seid_be = Hton64(cp_seid);
-    std::memcpy(fseid_buf + 1, &seid_be, 8);
-    std::memcpy(fseid_buf + 9, &ip_be, 4);
-    AppendIe(payload, PfcpIeType::FSeid, fseid_buf, 13);
-
-    // Create PDR Grouped IE (Type 1)
-    {
-        std::vector<uint8_t> pdr_val;
-        uint16_t pdr_id_be = htons(pdr.pdr_id);
-        AppendIe(pdr_val, PfcpIeType::PdrId, reinterpret_cast<const uint8_t*>(&pdr_id_be), 2);
-        uint32_t prec_be = htonl(pdr.precedence);
-        AppendIe(pdr_val, static_cast<PfcpIeType>(29), reinterpret_cast<const uint8_t*>(&prec_be), 4); // Precedence
-
-        // PDI Grouped IE (Type 2)
-        std::vector<uint8_t> pdi_val;
-        uint8_t src_intf = static_cast<uint8_t>(pdr.source_interface);
-        AppendIe(pdi_val, PfcpIeType::SourceInterface, &src_intf, 1);
-
-        // F-TEID IE (Type 21)
-        uint8_t fteid_buf[9];
-        fteid_buf[0] = 0x01; // Flags: V4
-        uint32_t teid_be = htonl(pdr.teid);
-        std::memcpy(fteid_buf + 1, &teid_be, 4);
-        uint32_t upf_ip_be = htonl(pfcp_cfg_.remote_upf_ip);
-        std::memcpy(fteid_buf + 5, &upf_ip_be, 4);
-        AppendIe(pdi_val, PfcpIeType::FTeid, fteid_buf, 9);
-
-        // UE IP Address IE (Type 93)
-        uint8_t ue_ip_buf[5];
-        ue_ip_buf[0] = 0x02; // Flags: V4
-        uint32_t ue_be = htonl(pdr.ue_ip != 0 ? pdr.ue_ip : session->client_ip);
-        std::memcpy(ue_ip_buf + 1, &ue_be, 4);
-        AppendIe(pdi_val, PfcpIeType::UeIpAddress, ue_ip_buf, 5);
-
-        AppendIe(pdr_val, PfcpIeType::Pdi, pdi_val.data(), pdi_val.size());
-
-        uint32_t far_id_be = htonl(pdr.far_id);
-        AppendIe(pdr_val, PfcpIeType::FarId, reinterpret_cast<const uint8_t*>(&far_id_be), 4);
-
-        AppendIe(payload, PfcpIeType::CreatePdr, pdr_val.data(), pdr_val.size());
-    }
-
-    // Create FAR Grouped IE (Type 3)
-    {
-        std::vector<uint8_t> far_val;
-        uint32_t far_id_be = htonl(far.far_id);
-        AppendIe(far_val, PfcpIeType::FarId, reinterpret_cast<const uint8_t*>(&far_id_be), 4);
-        uint8_t action = far.apply_action;
-        AppendIe(far_val, PfcpIeType::ApplyAction, &action, 1);
-
-        // Forwarding Parameters Grouped IE (Type 4)
-        std::vector<uint8_t> fp_val;
-        uint8_t dst_intf = static_cast<uint8_t>(far.destination_interface);
-        AppendIe(fp_val, PfcpIeType::DestinationInterface, &dst_intf, 1);
-
-        if (far.outer_teid != 0) {
-            // Outer Header Creation IE (Type 84)
-            uint8_t ohc_buf[10];
-            uint16_t ohc_desc = htons(0x0100); // GTP-U/UDP/IPv4
-            std::memcpy(ohc_buf, &ohc_desc, 2);
-            uint32_t o_teid = htonl(far.outer_teid);
-            std::memcpy(ohc_buf + 2, &o_teid, 4);
-            uint32_t o_ip = htonl(far.peer_upf_ip != 0 ? far.peer_upf_ip : pfcp_cfg_.remote_upf_ip);
-            std::memcpy(ohc_buf + 6, &o_ip, 4);
-            AppendIe(fp_val, PfcpIeType::OuterHeaderCreation, ohc_buf, 10);
-        }
-        AppendIe(far_val, PfcpIeType::ForwardingParameters, fp_val.data(), fp_val.size());
-
-        AppendIe(payload, PfcpIeType::CreateFar, far_val.data(), far_val.size());
-    }
-
-    size_t pfcp_len = sizeof(PfcpSessionHeader) + payload.size();
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
-    std::vector<uint8_t> frame(total_len, 0);
-
-    auto* eth = reinterpret_cast<EthHeader*>(frame.data());
-    std::memcpy(eth->dst_mac, session ? session->peer_mac : pfcp_cfg_.remote_mac, 6);
-    std::memcpy(eth->src_mac, session ? session->client_mac : pfcp_cfg_.local_mac, 6);
-    eth->ethertype = htons(0x0800);
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
-    ip->ihl_version = 0x45;
-    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
-    ip->id = htons(0x5050);
-    ip->ttl = 64;
-    ip->protocol = 17;
-    ip->src_ip = htonl(pfcp_cfg_.local_ip);
-    ip->dst_ip = htonl(pfcp_cfg_.remote_upf_ip);
-    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
-
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->src_port = htons(pfcp_cfg_.local_port);
-    udp->dst_port = htons(pfcp_cfg_.remote_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
-
-    size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* pfcp = reinterpret_cast<PfcpSessionHeader*>(frame.data() + pfcp_offset);
-    pfcp->flags = 0x21; // Version 1, S=1
-    pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::SessionEstablishmentRequest);
-    pfcp->length = htons(static_cast<uint16_t>(12 + payload.size()));
-    pfcp->seid = 0; // Initial request has SEID 0 in header
-    SetSeq24(pfcp->seq_num, seq);
-    pfcp->spare = 0;
-
-    std::memcpy(frame.data() + pfcp_offset + sizeof(PfcpSessionHeader), payload.data(), payload.size());
+    std::vector<uint8_t> frame(512, 0);
+    const size_t written = BuildSessionEstablishmentRequestInto(session, seq, cp_seid, pdr, far, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
+}
+
+size_t PfcpEngine::BuildSessionEstablishmentResponseInto(TelcoSessionContext* session,
+                                                         uint32_t seq,
+                                                         uint64_t cp_seid,
+                                                         uint64_t up_seid,
+                                                         PfcpCause cause,
+                                                         uint8_t* out_buf,
+                                                         size_t max_len) noexcept {
+    uint8_t payload[64];
+    size_t payload_len = 0;
+
+    uint8_t node_id_val[5];
+    node_id_val[0] = 0;
+    const uint32_t ip_be = htonl(pfcp_cfg_.remote_upf_ip);
+    std::memcpy(node_id_val + 1, &ip_be, 4);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::NodeId, node_id_val, 5);
+
+    const uint8_t cause_val = static_cast<uint8_t>(cause);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::Cause, &cause_val, 1);
+
+    uint8_t fseid_buf[13];
+    fseid_buf[0] = 0x02;
+    const uint64_t up_seid_be = Hton64(up_seid);
+    std::memcpy(fseid_buf + 1, &up_seid_be, 8);
+    std::memcpy(fseid_buf + 9, &ip_be, 4);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::FSeid, fseid_buf, 13);
+
+    return WritePfcpSessionFrame(
+        out_buf, max_len,
+        session ? session->client_mac : pfcp_cfg_.local_mac,
+        session ? session->peer_mac : pfcp_cfg_.remote_mac,
+        pfcp_cfg_.remote_upf_ip, pfcp_cfg_.local_ip,
+        pfcp_cfg_.remote_port, pfcp_cfg_.local_port,
+        0x5051, PfcpMessageType::SessionEstablishmentResponse,
+        cp_seid, seq, payload, payload_len);
 }
 
 std::vector<uint8_t> PfcpEngine::BuildSessionEstablishmentResponse(TelcoSessionContext* session, 
@@ -856,239 +999,125 @@ std::vector<uint8_t> PfcpEngine::BuildSessionEstablishmentResponse(TelcoSessionC
                                                                   uint64_t cp_seid, 
                                                                   uint64_t up_seid, 
                                                                   PfcpCause cause) {
-    std::vector<uint8_t> payload;
-
-    // Node ID IE
-    std::vector<uint8_t> node_id_val;
-    node_id_val.push_back(0); // IPv4
-    uint32_t ip_be = htonl(pfcp_cfg_.remote_upf_ip);
-    const auto* ip_ptr = reinterpret_cast<const uint8_t*>(&ip_be);
-    node_id_val.insert(node_id_val.end(), ip_ptr, ip_ptr + 4);
-    AppendIe(payload, PfcpIeType::NodeId, node_id_val.data(), node_id_val.size());
-
-    // Cause IE
-    uint8_t cause_val = static_cast<uint8_t>(cause);
-    AppendIe(payload, PfcpIeType::Cause, &cause_val, 1);
-
-    // UP F-SEID IE
-    uint8_t fseid_buf[13];
-    fseid_buf[0] = 0x02; // Flags: V4
-    uint64_t up_seid_be = Hton64(up_seid);
-    std::memcpy(fseid_buf + 1, &up_seid_be, 8);
-    std::memcpy(fseid_buf + 9, &ip_be, 4);
-    AppendIe(payload, PfcpIeType::FSeid, fseid_buf, 13);
-
-    size_t pfcp_len = sizeof(PfcpSessionHeader) + payload.size();
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
-    std::vector<uint8_t> frame(total_len, 0);
-
-    auto* eth = reinterpret_cast<EthHeader*>(frame.data());
-    std::memcpy(eth->dst_mac, session ? session->client_mac : pfcp_cfg_.local_mac, 6);
-    std::memcpy(eth->src_mac, session ? session->peer_mac : pfcp_cfg_.remote_mac, 6);
-    eth->ethertype = htons(0x0800);
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
-    ip->ihl_version = 0x45;
-    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
-    ip->id = htons(0x5051);
-    ip->ttl = 64;
-    ip->protocol = 17;
-    ip->src_ip = htonl(pfcp_cfg_.remote_upf_ip);
-    ip->dst_ip = htonl(pfcp_cfg_.local_ip);
-    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
-
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->src_port = htons(pfcp_cfg_.remote_port);
-    udp->dst_port = htons(pfcp_cfg_.local_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
-
-    size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* pfcp = reinterpret_cast<PfcpSessionHeader*>(frame.data() + pfcp_offset);
-    pfcp->flags = 0x21;
-    pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::SessionEstablishmentResponse);
-    pfcp->length = htons(static_cast<uint16_t>(12 + payload.size()));
-    pfcp->seid = Hton64(cp_seid); // Response addresses CP SEID
-    SetSeq24(pfcp->seq_num, seq);
-    pfcp->spare = 0;
-
-    std::memcpy(frame.data() + pfcp_offset + sizeof(PfcpSessionHeader), payload.data(), payload.size());
+    std::vector<uint8_t> frame(256, 0);
+    const size_t written = BuildSessionEstablishmentResponseInto(session, seq, cp_seid, up_seid, cause, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
+}
+
+size_t PfcpEngine::BuildSessionModificationRequestInto(TelcoSessionContext* session,
+                                                       uint32_t seq,
+                                                       const PfcpFar& updated_far,
+                                                       uint8_t* out_buf,
+                                                       size_t max_len) noexcept {
+    uint8_t payload[64];
+    size_t payload_len = 0;
+
+    uint8_t ufar_val[32];
+    size_t ufar_len = 0;
+    const uint32_t far_id_be = htonl(updated_far.far_id);
+    AppendIeRaw(ufar_val, ufar_len, sizeof(ufar_val), PfcpIeType::FarId, reinterpret_cast<const uint8_t*>(&far_id_be), 4);
+    const uint8_t action = updated_far.apply_action;
+    AppendIeRaw(ufar_val, ufar_len, sizeof(ufar_val), PfcpIeType::ApplyAction, &action, 1);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::UpdateFar, ufar_val, static_cast<uint16_t>(ufar_len));
+
+    const uint64_t target_seid = session ? (session->GetPfcpRemoteSeid() != 0 ? session->GetPfcpRemoteSeid() : session->GetPfcpSeid()) : 0;
+    return WritePfcpSessionFrame(
+        out_buf, max_len,
+        session ? session->peer_mac : pfcp_cfg_.remote_mac,
+        session ? session->client_mac : pfcp_cfg_.local_mac,
+        pfcp_cfg_.local_ip, pfcp_cfg_.remote_upf_ip,
+        pfcp_cfg_.local_port, pfcp_cfg_.remote_port,
+        0x5052, PfcpMessageType::SessionModificationRequest,
+        target_seid, seq, payload, payload_len);
 }
 
 std::vector<uint8_t> PfcpEngine::BuildSessionModificationRequest(TelcoSessionContext* session, 
                                                                 uint32_t seq, 
                                                                 const PfcpFar& updated_far) {
-    std::vector<uint8_t> payload;
-
-    // Update FAR Grouped IE (Type 124)
-    std::vector<uint8_t> ufar_val;
-    uint32_t far_id_be = htonl(updated_far.far_id);
-    AppendIe(ufar_val, PfcpIeType::FarId, reinterpret_cast<const uint8_t*>(&far_id_be), 4);
-    uint8_t action = updated_far.apply_action;
-    AppendIe(ufar_val, PfcpIeType::ApplyAction, &action, 1);
-    AppendIe(payload, PfcpIeType::UpdateFar, ufar_val.data(), ufar_val.size());
-
-    size_t pfcp_len = sizeof(PfcpSessionHeader) + payload.size();
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
-    std::vector<uint8_t> frame(total_len, 0);
-
-    auto* eth = reinterpret_cast<EthHeader*>(frame.data());
-    std::memcpy(eth->dst_mac, session ? session->peer_mac : pfcp_cfg_.remote_mac, 6);
-    std::memcpy(eth->src_mac, session ? session->client_mac : pfcp_cfg_.local_mac, 6);
-    eth->ethertype = htons(0x0800);
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
-    ip->ihl_version = 0x45;
-    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
-    ip->id = htons(0x5052);
-    ip->ttl = 64;
-    ip->protocol = 17;
-    ip->src_ip = htonl(pfcp_cfg_.local_ip);
-    ip->dst_ip = htonl(pfcp_cfg_.remote_upf_ip);
-    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
-
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->src_port = htons(pfcp_cfg_.local_port);
-    udp->dst_port = htons(pfcp_cfg_.remote_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
-
-    size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* pfcp = reinterpret_cast<PfcpSessionHeader*>(frame.data() + pfcp_offset);
-    pfcp->flags = 0x21;
-    pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::SessionModificationRequest);
-    pfcp->length = htons(static_cast<uint16_t>(12 + payload.size()));
-    uint64_t target_seid = session ? (session->GetPfcpRemoteSeid() != 0 ? session->GetPfcpRemoteSeid() : session->GetPfcpSeid()) : 0;
-    pfcp->seid = Hton64(target_seid);
-    SetSeq24(pfcp->seq_num, seq);
-    pfcp->spare = 0;
-
-    std::memcpy(frame.data() + pfcp_offset + sizeof(PfcpSessionHeader), payload.data(), payload.size());
+    std::vector<uint8_t> frame(256, 0);
+    const size_t written = BuildSessionModificationRequestInto(session, seq, updated_far, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
+}
+
+size_t PfcpEngine::BuildSessionModificationResponseInto(TelcoSessionContext* session,
+                                                        uint32_t seq,
+                                                        PfcpCause cause,
+                                                        uint8_t* out_buf,
+                                                        size_t max_len) noexcept {
+    uint8_t payload[16];
+    size_t payload_len = 0;
+    const uint8_t cause_val = static_cast<uint8_t>(cause);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::Cause, &cause_val, 1);
+
+    return WritePfcpSessionFrame(
+        out_buf, max_len,
+        session ? session->client_mac : pfcp_cfg_.local_mac,
+        session ? session->peer_mac : pfcp_cfg_.remote_mac,
+        pfcp_cfg_.remote_upf_ip, pfcp_cfg_.local_ip,
+        pfcp_cfg_.remote_port, pfcp_cfg_.local_port,
+        0x5053, PfcpMessageType::SessionModificationResponse,
+        session ? session->GetPfcpSeid() : 0, seq, payload, payload_len);
 }
 
 std::vector<uint8_t> PfcpEngine::BuildSessionModificationResponse(TelcoSessionContext* session, 
                                                                  uint32_t seq, 
                                                                  PfcpCause cause) {
-    std::vector<uint8_t> payload;
-    uint8_t cause_val = static_cast<uint8_t>(cause);
-    AppendIe(payload, PfcpIeType::Cause, &cause_val, 1);
-
-    size_t pfcp_len = sizeof(PfcpSessionHeader) + payload.size();
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
-    std::vector<uint8_t> frame(total_len, 0);
-
-    auto* eth = reinterpret_cast<EthHeader*>(frame.data());
-    std::memcpy(eth->dst_mac, session ? session->client_mac : pfcp_cfg_.local_mac, 6);
-    std::memcpy(eth->src_mac, session ? session->peer_mac : pfcp_cfg_.remote_mac, 6);
-    eth->ethertype = htons(0x0800);
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
-    ip->ihl_version = 0x45;
-    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
-    ip->id = htons(0x5053);
-    ip->ttl = 64;
-    ip->protocol = 17;
-    ip->src_ip = htonl(pfcp_cfg_.remote_upf_ip);
-    ip->dst_ip = htonl(pfcp_cfg_.local_ip);
-    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
-
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->src_port = htons(pfcp_cfg_.remote_port);
-    udp->dst_port = htons(pfcp_cfg_.local_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
-
-    size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* pfcp = reinterpret_cast<PfcpSessionHeader*>(frame.data() + pfcp_offset);
-    pfcp->flags = 0x21;
-    pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::SessionModificationResponse);
-    pfcp->length = htons(static_cast<uint16_t>(12 + payload.size()));
-    pfcp->seid = Hton64(session ? session->GetPfcpSeid() : 0);
-    SetSeq24(pfcp->seq_num, seq);
-    pfcp->spare = 0;
-
-    std::memcpy(frame.data() + pfcp_offset + sizeof(PfcpSessionHeader), payload.data(), payload.size());
+    std::vector<uint8_t> frame(128, 0);
+    const size_t written = BuildSessionModificationResponseInto(session, seq, cause, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
 }
 
+size_t PfcpEngine::BuildSessionDeletionRequestInto(TelcoSessionContext* session,
+                                                   uint32_t seq,
+                                                   uint8_t* out_buf,
+                                                   size_t max_len) noexcept {
+    const uint64_t target_seid = session ? (session->GetPfcpRemoteSeid() != 0 ? session->GetPfcpRemoteSeid() : session->GetPfcpSeid()) : 0;
+    return WritePfcpSessionFrame(
+        out_buf, max_len,
+        session ? session->peer_mac : pfcp_cfg_.remote_mac,
+        session ? session->client_mac : pfcp_cfg_.local_mac,
+        pfcp_cfg_.local_ip, pfcp_cfg_.remote_upf_ip,
+        pfcp_cfg_.local_port, pfcp_cfg_.remote_port,
+        0x5054, PfcpMessageType::SessionDeletionRequest,
+        target_seid, seq, nullptr, 0);
+}
+
 std::vector<uint8_t> PfcpEngine::BuildSessionDeletionRequest(TelcoSessionContext* session, uint32_t seq) {
-    size_t pfcp_len = sizeof(PfcpSessionHeader);
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
-    std::vector<uint8_t> frame(total_len, 0);
-
-    auto* eth = reinterpret_cast<EthHeader*>(frame.data());
-    std::memcpy(eth->dst_mac, session ? session->peer_mac : pfcp_cfg_.remote_mac, 6);
-    std::memcpy(eth->src_mac, session ? session->client_mac : pfcp_cfg_.local_mac, 6);
-    eth->ethertype = htons(0x0800);
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
-    ip->ihl_version = 0x45;
-    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
-    ip->id = htons(0x5054);
-    ip->ttl = 64;
-    ip->protocol = 17;
-    ip->src_ip = htonl(pfcp_cfg_.local_ip);
-    ip->dst_ip = htonl(pfcp_cfg_.remote_upf_ip);
-    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
-
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->src_port = htons(pfcp_cfg_.local_port);
-    udp->dst_port = htons(pfcp_cfg_.remote_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
-
-    size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* pfcp = reinterpret_cast<PfcpSessionHeader*>(frame.data() + pfcp_offset);
-    pfcp->flags = 0x21;
-    pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::SessionDeletionRequest);
-    pfcp->length = htons(12);
-    uint64_t target_seid = session ? (session->GetPfcpRemoteSeid() != 0 ? session->GetPfcpRemoteSeid() : session->GetPfcpSeid()) : 0;
-    pfcp->seid = Hton64(target_seid);
-    SetSeq24(pfcp->seq_num, seq);
-    pfcp->spare = 0;
-
+    std::vector<uint8_t> frame(128, 0);
+    const size_t written = BuildSessionDeletionRequestInto(session, seq, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
+}
+
+size_t PfcpEngine::BuildSessionDeletionResponseInto(TelcoSessionContext* session,
+                                                    uint32_t seq,
+                                                    PfcpCause cause,
+                                                    uint8_t* out_buf,
+                                                    size_t max_len) noexcept {
+    uint8_t payload[16];
+    size_t payload_len = 0;
+    const uint8_t cause_val = static_cast<uint8_t>(cause);
+    AppendIeRaw(payload, payload_len, sizeof(payload), PfcpIeType::Cause, &cause_val, 1);
+
+    return WritePfcpSessionFrame(
+        out_buf, max_len,
+        session ? session->client_mac : pfcp_cfg_.local_mac,
+        session ? session->peer_mac : pfcp_cfg_.remote_mac,
+        pfcp_cfg_.remote_upf_ip, pfcp_cfg_.local_ip,
+        pfcp_cfg_.remote_port, pfcp_cfg_.local_port,
+        0x5055, PfcpMessageType::SessionDeletionResponse,
+        session ? session->GetPfcpSeid() : 0, seq, payload, payload_len);
 }
 
 std::vector<uint8_t> PfcpEngine::BuildSessionDeletionResponse(TelcoSessionContext* session, 
                                                              uint32_t seq, 
                                                              PfcpCause cause) {
-    std::vector<uint8_t> payload;
-    uint8_t cause_val = static_cast<uint8_t>(cause);
-    AppendIe(payload, PfcpIeType::Cause, &cause_val, 1);
-
-    size_t pfcp_len = sizeof(PfcpSessionHeader) + payload.size();
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len;
-    std::vector<uint8_t> frame(total_len, 0);
-
-    auto* eth = reinterpret_cast<EthHeader*>(frame.data());
-    std::memcpy(eth->dst_mac, session ? session->client_mac : pfcp_cfg_.local_mac, 6);
-    std::memcpy(eth->src_mac, session ? session->peer_mac : pfcp_cfg_.remote_mac, 6);
-    eth->ethertype = htons(0x0800);
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
-    ip->ihl_version = 0x45;
-    ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + pfcp_len));
-    ip->id = htons(0x5055);
-    ip->ttl = 64;
-    ip->protocol = 17;
-    ip->src_ip = htonl(pfcp_cfg_.remote_upf_ip);
-    ip->dst_ip = htonl(pfcp_cfg_.local_ip);
-    ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
-
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
-    udp->src_port = htons(pfcp_cfg_.remote_port);
-    udp->dst_port = htons(pfcp_cfg_.local_port);
-    udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + pfcp_len));
-
-    size_t pfcp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* pfcp = reinterpret_cast<PfcpSessionHeader*>(frame.data() + pfcp_offset);
-    pfcp->flags = 0x21;
-    pfcp->msg_type = static_cast<uint8_t>(PfcpMessageType::SessionDeletionResponse);
-    pfcp->length = htons(static_cast<uint16_t>(12 + payload.size()));
-    pfcp->seid = Hton64(session ? session->GetPfcpSeid() : 0);
-    SetSeq24(pfcp->seq_num, seq);
-    pfcp->spare = 0;
-
-    std::memcpy(frame.data() + pfcp_offset + sizeof(PfcpSessionHeader), payload.data(), payload.size());
+    std::vector<uint8_t> frame(128, 0);
+    const size_t written = BuildSessionDeletionResponseInto(session, seq, cause, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
 }
 
