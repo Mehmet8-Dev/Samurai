@@ -566,13 +566,31 @@ int main(int argc, char** argv) {
         }
 
         std::uint64_t active_bar1_iova = 0u;
-        if (using_gpu_p2p && gpu_p2p_pool.bar1_iova != 0u) {
+        if (using_gpu_p2p) {
+          if (gpu_p2p_pool.bar1_iova == 0u) {
+            (void)SendFrame(
+                push,
+                static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                header.correlation_id,
+                samurai::wire::WorkerKind::DPDK,
+                job_id,
+                JsonError("dpdk_gpu_p2p_unverified_bar1_iova"));
+            continue;
+          }
           std::string extmem_err;
-          if (samurai::dpdk::register_extmem_region(
+          if (!samurai::dpdk::register_extmem_region(
                   dpdk.handle, gpu_p2p_pool.data_ptr, gpu_p2p_pool.byte_len,
                   gpu_p2p_pool.bar1_iova, 4096u, extmem_err)) {
-            active_bar1_iova = gpu_p2p_pool.bar1_iova;
+            (void)SendFrame(
+                push,
+                static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                header.correlation_id,
+                samurai::wire::WorkerKind::DPDK,
+                job_id,
+                JsonError("dpdk_gpu_p2p_dma_map_failed:" + extmem_err));
+            continue;
           }
+          active_bar1_iova = gpu_p2p_pool.bar1_iova;
         }
 
         // NUMA pinning guard (O1): CPU çekirdek tabanı env ile verilebilir.

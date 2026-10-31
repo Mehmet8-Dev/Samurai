@@ -4,6 +4,7 @@
 #include "ddos_samurai/telecom/core/fastpath_classifier.hpp"
 #include "ddos_samurai/telecom/core/session_manager.hpp"
 #include "ddos_samurai/telecom/core/hierarchical_timing_wheel.hpp"
+#include "ddos_samurai/telecom/core/telco_packet_transport.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/pppoe/pppoe_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/dhcp/dhcp_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/bfd/bfd_engine.hpp"
@@ -799,6 +800,7 @@ int main(int argc, char** argv) {
     std::string jobs_endpoint = kDefaultJobs;
     std::string events_endpoint = kDefaultEvents;
     std::string iface_name;
+    std::string transport_mode = "af_packet";
     int pin_cpu = -1;
     uint32_t sub_start = 0;
     uint32_t sub_count = 100000;
@@ -820,6 +822,8 @@ int main(int argc, char** argv) {
             events_endpoint = argv[++i];
         } else if (arg == "--iface" && i + 1 < argc) {
             iface_name = argv[++i];
+        } else if (arg == "--transport" && i + 1 < argc) {
+            transport_mode = ToLower(argv[++i]);
         } else if (arg == "--pin-cpu" && i + 1 < argc) {
             pin_cpu = std::stoi(argv[++i]);
         } else if (arg == "--subscriber-start" && i + 1 < argc) {
@@ -852,6 +856,9 @@ int main(int argc, char** argv) {
             iface_name = env_if;
         }
     }
+    if (const char* env_tr = std::getenv("SAMURAI_TELCO_TRANSPORT"); env_tr && env_tr[0]) {
+        transport_mode = ToLower(env_tr);
+    }
 
     if ((protocol_str == "sctp" || protocol_str == "sctp-flood") && sctp_rate > 0) {
         rate_cps = sctp_rate;
@@ -869,7 +876,7 @@ int main(int argc, char** argv) {
     uint64_t tsc_hz = HierarchicalTimingWheel::CalibrateTscHz();
     bool invariant_tsc = HierarchicalTimingWheel::IsInvariantTscSupported();
 
-    std::cout << "[TELCO_WORKER] Samurai Carrier-Grade Telco Daemon starting..." << std::endl;
+    std::cout << "[TELCO_WORKER] Samurai Telco Daemon starting (Transport: " << transport_mode << ")..." << std::endl;
     std::cout << "[TELCO_WORKER] Invariant TSC: " << (invariant_tsc ? "YES" : "NO")
               << " | Calibrated TSC: " << (tsc_hz / 1000000.0) << " MHz" << std::endl;
     std::cout << "[TELCO_WORKER] Jobs (PULL): " << jobs_endpoint << ", Events (PUSH): " << events_endpoint << std::endl;
@@ -880,10 +887,16 @@ int main(int argc, char** argv) {
               << " SIP Rate: " << sip_rate << " SRTP: " << (enable_srtp ? "ON" : "OFF")
               << " DB Port: " << db_port << std::endl;
 
-    // Open Live Wire I/O if interface configured
-    TelcoWireIo wire_io;
-    if (!iface_name.empty()) {
-        wire_io.Open(iface_name);
+    // Open pluggable Packet Transport (AF_PACKET, DPDK, or Loopback)
+    std::unique_ptr<ITelcoPacketTransport> packet_transport = CreateTelcoPacketTransport(transport_mode);
+    if (!iface_name.empty() || transport_mode == "loopback" || transport_mode == "dpdk") {
+        if (!packet_transport->Open(iface_name)) {
+            if (transport_mode == "dpdk" || transport_mode == "dpdk_direct") {
+                std::cerr << "[TELCO_WORKER] FATAL: DPDK transport requested (--transport " << transport_mode
+                          << ") but initialization failed. Refusing silent fallback to AF_PACKET." << std::endl;
+                return 2;
+            }
+        }
     } else {
         std::cout << "[TELCO_WORKER] Notice: No --iface specified (use --iface <dev> or SAMURAI_TELCO_IFACE for wire RX/TX)." << std::endl;
     }
@@ -1027,11 +1040,11 @@ int main(int argc, char** argv) {
         // 1. Advance timing wheel and timer ticks for active protocol driver
         active_driver->OnTimerTick(now_tsc);
 
-        // 2. Poll Real Wire RX Frame Ingestion
-        if (wire_io.IsOpen()) {
+        // 2. Poll Real Wire RX Frame Ingestion via ITelcoPacketTransport
+        if (packet_transport && packet_transport->IsOpen()) {
             uint8_t rx_buffer[2048];
             for (int r = 0; r < 64; ++r) {
-                ssize_t n = wire_io.Receive(rx_buffer, sizeof(rx_buffer));
+                ssize_t n = packet_transport->Receive(rx_buffer, sizeof(rx_buffer));
                 if (n <= 0) break;
 
                 rx_packets_total++;
@@ -1051,13 +1064,27 @@ int main(int argc, char** argv) {
             tx_packets_batch.clear();
             active_driver->GenerateTraffic(session_mgr, active_sub_cursor, burst, tx_packets_batch);
 
-            for (const auto& pkt : tx_packets_batch) {
-                if (pkt.empty()) continue;
-                if (wire_io.IsOpen()) {
-                    (void)wire_io.Transmit(pkt.data(), pkt.size());
+            if (packet_transport && packet_transport->IsOpen()) {
+                std::vector<const uint8_t*> frame_ptrs;
+                std::vector<uint16_t> frame_lens;
+                frame_ptrs.reserve(tx_packets_batch.size());
+                frame_lens.reserve(tx_packets_batch.size());
+                for (const auto& pkt : tx_packets_batch) {
+                    if (pkt.empty() || pkt.size() > 65535u) continue;
+                    frame_ptrs.push_back(pkt.data());
+                    frame_lens.push_back(static_cast<uint16_t>(pkt.size()));
                 }
-                tx_packets_total++;
-                tx_bytes_total += pkt.size();
+                const size_t sent = packet_transport->TransmitBurst(frame_ptrs.data(), frame_lens.data(), frame_ptrs.size());
+                for (size_t i = 0; i < sent; ++i) {
+                    tx_packets_total++;
+                    tx_bytes_total += frame_lens[i];
+                }
+            } else {
+                for (const auto& pkt : tx_packets_batch) {
+                    if (pkt.empty()) continue;
+                    tx_packets_total++;
+                    tx_bytes_total += pkt.size();
+                }
             }
 
             active_sub_cursor = (active_sub_cursor + burst) % sub_count;
@@ -1123,7 +1150,9 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[TELCO_WORKER] Shutting down cleanly." << std::endl;
-    wire_io.Close();
+    if (packet_transport) {
+        packet_transport->Close();
+    }
     zmq_close(jobs_sock);
     zmq_close(events_sock);
     zmq_ctx_term(zmq_ctx);

@@ -620,7 +620,15 @@ bool RunGpuNativeBatch(
       EnvFlag("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", false) ||
       EnvString("SAMURAI_GPU_TX_BACKEND", "") == "geforce_p2p";
   if (bar1_p2p_mode) {
+    if (tx_enabled) {
+      err = "bar1_p2p_afpacket_fallback_disabled_use_dpdk_p2p_transport";
+      return false;
+    }
+    out.packets_sent = 0;
+    out.packets_errors = 0;
+    out.transmitted_on_wire = false;
     out.tx_note = "gpu_native_capi+bar1_p2p_zero_copy:dry_run";
+    return true;
   }
 
   if (tx_enabled) {
@@ -639,9 +647,7 @@ bool RunGpuNativeBatch(
       out.packets_sent = std::max(0, sent);
       out.packets_errors = std::max(0, errors);
       out.transmitted_on_wire = true;
-      out.tx_note = bar1_p2p_mode
-          ? "gpu_native_capi+bar1_p2p_zero_copy+afpacket:tx_ring"
-          : "gpu_native_capi+afpacket:tx_ring";
+      out.tx_note = "gpu_native_capi+afpacket:tx_ring";
     } else {
       afpkt_tx_metrics_t m{};
       const int tx_rc = afpkt_send_l3_ex(
@@ -655,9 +661,7 @@ bool RunGpuNativeBatch(
       out.packets_sent = std::max(0, m.sent);
       out.packets_errors = std::max(0, m.errors);
       out.transmitted_on_wire = true;
-      out.tx_note = bar1_p2p_mode
-          ? "gpu_native_capi+bar1_p2p_zero_copy+afpacket:l3"
-          : "gpu_native_capi+afpacket:l3";
+      out.tx_note = "gpu_native_capi+afpacket:l3";
     }
   }
 
