@@ -72,10 +72,19 @@ inline DeviceBuffer allocate_packet_output_buffer(
   if (bar1_p2p_output_enabled()) {
     auto& bar1_pool = ddos_samurai::gpu_packet_cuda::p2p::get_global_bar1_batch_pool();
     std::string bar1_err;
-    const size_t total_bar1 = kVulkanBar1PayloadAlignment + payload_size;
-    if (bar1_pool.ensure_capacity(total_bar1, bar1_err)) {
-      uint8_t* host_payload = bar1_pool.arena.host_bar1_ptr + kVulkanBar1PayloadAlignment;
-      uint8_t* dev_payload = bar1_pool.arena.cuda_dev_ptr + kVulkanBar1PayloadAlignment;
+    uint8_t* base_host = nullptr;
+    uint8_t* base_dev = nullptr;
+    uint64_t slice_iova = 0u;
+    if (bar1_pool.allocate_slice(
+            payload_size,
+            kVulkanBar1PayloadAlignment,
+            &base_host,
+            &base_dev,
+            &slice_iova,
+            bar1_err) &&
+        base_host != nullptr && base_dev != nullptr) {
+      uint8_t* host_payload = base_host + kVulkanBar1PayloadAlignment;
+      uint8_t* dev_payload = base_dev + kVulkanBar1PayloadAlignment;
       auto* header = reinterpret_cast<MappedExportHeader*>(host_payload) - 1;
       header->magic = kMappedExportHeaderMagic;
       header->alloc_kind = kMappedExportAllocKindVulkanBar1P2p;
@@ -3118,7 +3127,13 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
   b.doca_device = env_string_or("SAMURAI_GPU_DOCA_DEVICE", "");
   b.doca_gpu_id = std::max(0, env_int_local("SAMURAI_GPU_DOCA_GPU_ID", 0));
   b.p2p_gpu_bdf = env_string_or("SAMURAI_GPU_P2P_GPU_BDF", "");
+  if (b.p2p_gpu_bdf.empty()) {
+    b.p2p_gpu_bdf = ddos_samurai::gpu_packet_cuda::p2p::detect_gpu_pci_bdf(0);
+  }
   b.p2p_nic_bdf = env_string_or("SAMURAI_GPU_P2P_NIC_BDF", "");
+  if (b.p2p_nic_bdf.empty() && !b.iface.empty()) {
+    b.p2p_nic_bdf = ddos_samurai::gpu_packet_cuda::p2p::detect_nic_pci_bdf_from_iface(b.iface.c_str());
+  }
   const bool tx_backend_strict = env_int_local("SAMURAI_GPU_TX_BACKEND_STRICT", 0) != 0;
   b.xdp_mode = clamp_i(env_int_local("SAMURAI_XDP_MODE", 0), 0, 2);
   b.xdp_queue_base = std::max(0, env_int_local("SAMURAI_XDP_QUEUE_ID", 0));
@@ -3175,17 +3190,21 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
     want_doca_kernel_direct = false;
     doca_kernel_mode_forced = true;
   } else {
-    // auto: explicit DOCA backend seçildiyse kernel-direct yolu varsayılan olarak dene.
-    want_doca_kernel_direct = (b.requested == "doca_gpunetio");
+    // auto: explicit DOCA backend veya geforce_p2p backend seçildiyse kernel-direct yolu varsayılan olarak dene.
+    want_doca_kernel_direct = (b.requested == "doca_gpunetio" || b.requested == "geforce_p2p");
     doca_kernel_mode_forced = false;
   }
 #if !SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
-  if (want_doca_kernel_direct && doca_kernel_mode_forced) {
-    b.kind = PersistentTxBackendKind::kNoop;
-    b.active = "noop";
-    return false;
+  const bool is_geforce_target = (b.requested == "geforce_p2p") ||
+      (!b.doca_device.empty() && ddos_samurai::gpu_packet_cuda::p2p::is_geforce_p2p_doca_mode(b.doca_device.c_str()));
+  if (!is_geforce_target) {
+    if (want_doca_kernel_direct && doca_kernel_mode_forced) {
+      b.kind = PersistentTxBackendKind::kNoop;
+      b.active = "noop";
+      return false;
+    }
+    want_doca_kernel_direct = false;
   }
-  want_doca_kernel_direct = false;
 #endif
   if (want_xdp && !b.iface.empty()) {
     if (samurai_xdp_get_native_api_v1) {
@@ -3343,7 +3362,7 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
     b.active = "noop";
     return false;
   }
-  if (want_doca_kernel_direct && doca_kernel_mode_forced) {
+  if (b.requested == "doca_gpunetio" && want_doca_kernel_direct && doca_kernel_mode_forced) {
     b.kind = PersistentTxBackendKind::kNoop;
     b.active = "noop";
     return false;
@@ -3397,7 +3416,20 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
       if (b.geforce_p2p_api && b.geforce_p2p_api->version == ::kGeforceP2pApiVersion &&
           b.geforce_p2p_api->create_tx_ring && b.geforce_p2p_api->destroy_tx_ring &&
           b.geforce_p2p_api->submit_slot_batch) {
+        const bool api_has_kernel_hooks = (b.geforce_p2p_api->get_gpu_txq_handle != nullptr);
+        if (want_doca_kernel_direct && !api_has_kernel_hooks) {
+          if (tx_backend_strict) {
+            b.kind = PersistentTxBackendKind::kNoop;
+            b.active = "noop";
+            return false;
+          }
+          want_doca_kernel_direct = false;
+        }
         b.geforce_p2p_handles.assign(static_cast<size_t>(rt.queue_count), -1);
+        if (want_doca_kernel_direct) {
+          b.doca_gpu_txq_handles.assign(static_cast<size_t>(rt.queue_count), 0ull);
+          b.doca_txq_mkeys_be.assign(static_cast<size_t>(rt.queue_count), 0u);
+        }
         bool ok = true;
         for (int q = 0; q < rt.queue_count; ++q) {
           ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pConfigV1 cfg{};
@@ -3406,6 +3438,21 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
           std::snprintf(cfg.iface, sizeof(cfg.iface), "%s", b.iface.c_str());
           cfg.ring_slot_count = static_cast<uint32_t>(rt.ring_slots);
           cfg.slot_stride = static_cast<uint32_t>(kPersistentUmemFrameSize);
+          cfg.dpdk_queue_id = static_cast<uint16_t>(q);
+          if (rt.bar1_unified_payload && rt.bar1_payload_arena.initialized &&
+              rt.bar1_payload_arena.host_bar1_ptr && rt.bar1_payload_arena.cuda_dev_ptr) {
+            const size_t q_bytes =
+                static_cast<size_t>(rt.ring_slots) * static_cast<size_t>(kPersistentUmemFrameSize);
+            const size_t q_off = static_cast<size_t>(q) * q_bytes;
+            if (q_off + q_bytes <= rt.bar1_payload_arena.arena_bytes) {
+              cfg.external_host_bar1_ptr = rt.bar1_payload_arena.host_bar1_ptr + q_off;
+              cfg.external_cuda_dev_ptr = rt.bar1_payload_arena.cuda_dev_ptr + q_off;
+              cfg.external_bar1_iova = (rt.bar1_payload_arena.iommu_iova_base != 0u)
+                                           ? (rt.bar1_payload_arena.iommu_iova_base + q_off)
+                                           : 0u;
+              cfg.external_arena_bytes = q_bytes;
+            }
+          }
           int handle = -1;
           char errbuf[256];
           errbuf[0] = '\0';
@@ -3414,10 +3461,35 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
             break;
           }
           b.geforce_p2p_handles[static_cast<size_t>(q)] = handle;
+          if (want_doca_kernel_direct) {
+            ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pDoorbellConfigV1 auto_db{};
+            auto_db.nic_driver_type = ddos_samurai::gpu_packet_cuda::p2p::detect_nic_driver_type(b.p2p_nic_bdf.c_str());
+            auto_db.queue_id = static_cast<uint32_t>(q);
+            auto_db.tx_ring_size = static_cast<uint32_t>(rt.ring_slots);
+            auto_db.flags = ddos_samurai::gpu_packet_cuda::p2p::doorbell::kDoorbellFlagAutoReapOnWrap;
+            auto_db.pci_mmio_bar_index = (auto_db.nic_driver_type == 0u) ? 2u : 0u;
+            (void)b.geforce_p2p_api->bind_gpu_doorbell(handle, &auto_db, errbuf, sizeof(errbuf));
+
+            uint64_t gpu_txq_handle = 0ull;
+            uint32_t mkey_be = 0u;
+            if (b.geforce_p2p_api->get_gpu_txq_handle(
+                    handle,
+                    &gpu_txq_handle,
+                    &mkey_be,
+                    errbuf,
+                    sizeof(errbuf)) < 0 ||
+                gpu_txq_handle == 0ull || mkey_be == 0u) {
+              ok = false;
+              break;
+            }
+            b.doca_gpu_txq_handles[static_cast<size_t>(q)] = gpu_txq_handle;
+            b.doca_txq_mkeys_be[static_cast<size_t>(q)] = mkey_be;
+          }
         }
         if (ok) {
           b.kind = PersistentTxBackendKind::kGeforceP2p;
           b.active = "geforce_p2p";
+          b.doca_kernel_direct_tx = (want_doca_kernel_direct && api_has_kernel_hooks);
           return true;
         }
         for (int h : b.geforce_p2p_handles) {
@@ -3428,6 +3500,9 @@ inline bool persistent_bridge_backend_init_unlocked(PersistentRuntime& rt) {
           }
         }
         b.geforce_p2p_handles.clear();
+        b.doca_gpu_txq_handles.clear();
+        b.doca_txq_mkeys_be.clear();
+        b.doca_kernel_direct_tx = false;
       }
     }
     b.kind = PersistentTxBackendKind::kNoop;
@@ -4110,6 +4185,13 @@ __device__ __forceinline__ bool persistent_doca_kernel_try_enqueue(
   if (gpu_txq_handle == 0ull || mkey_be == 0u || !packet_ptr || packet_len == 0u) {
     return false;
   }
+  if (mkey_be == ddos_samurai::gpu_packet_cuda::p2p::doorbell::kGeforceP2pDoorbellMkeyBe ||
+      mkey_be == 0x42415231u) {  // 'GPDB' or 'BAR1'
+    auto* txq = reinterpret_cast<ddos_samurai::gpu_packet_cuda::p2p::doorbell::GeforceP2pGpuDeviceTxq*>(gpu_txq_handle);
+    if (txq && txq->magic == ddos_samurai::gpu_packet_cuda::p2p::doorbell::kGeforceP2pDeviceTxqMagic) {
+      return ddos_samurai::gpu_packet_cuda::p2p::doorbell::device_p2p_txq_try_enqueue(txq, packet_ptr, packet_len);
+    }
+  }
 #if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
   auto* txq = reinterpret_cast<doca_gpu_eth_txq*>(gpu_txq_handle);
   if (!txq) {
@@ -4135,16 +4217,20 @@ __device__ __forceinline__ bool persistent_doca_kernel_try_commit_push(uint64_t 
   if (gpu_txq_handle == 0ull) {
     return false;
   }
+  auto* txq = reinterpret_cast<ddos_samurai::gpu_packet_cuda::p2p::doorbell::GeforceP2pGpuDeviceTxq*>(gpu_txq_handle);
+  if (txq && txq->magic == ddos_samurai::gpu_packet_cuda::p2p::doorbell::kGeforceP2pDeviceTxqMagic) {
+    return ddos_samurai::gpu_packet_cuda::p2p::doorbell::device_p2p_txq_try_commit_push(txq);
+  }
 #if SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
-  auto* txq = reinterpret_cast<doca_gpu_eth_txq*>(gpu_txq_handle);
-  if (!txq) {
+  auto* doca_txq = reinterpret_cast<doca_gpu_eth_txq*>(gpu_txq_handle);
+  if (!doca_txq) {
     return false;
   }
-  const doca_error_t rc_commit = doca_gpu_dev_eth_txq_commit_strong(txq);
+  const doca_error_t rc_commit = doca_gpu_dev_eth_txq_commit_strong(doca_txq);
   if (rc_commit != DOCA_SUCCESS) {
     return false;
   }
-  const doca_error_t rc_push = doca_gpu_dev_eth_txq_push(txq);
+  const doca_error_t rc_push = doca_gpu_dev_eth_txq_push(doca_txq);
   return rc_push == DOCA_SUCCESS;
 #else
   (void)gpu_txq_handle;
@@ -6623,7 +6709,12 @@ inline bool persistent_runtime_ensure_started_unlocked() {
   bool bar1_allocated = false;
   if (want_bar1_payload) {
     std::string bar1_err;
-    if (rt.bar1_payload_arena.allocate(payload_bytes, nullptr, 0u, bar1_err) &&
+    uint64_t iova_env = 0u;
+    const char* env_iova_raw = std::getenv("SAMURAI_GPU_BAR1_IOVA");
+    if (env_iova_raw && *env_iova_raw) {
+      try { iova_env = std::stoull(env_iova_raw, nullptr, 0); } catch (...) {}
+    }
+    if (rt.bar1_payload_arena.allocate(payload_bytes, nullptr, 0u, bar1_err, iova_env) &&
         rt.bar1_payload_arena.host_bar1_ptr && rt.bar1_payload_arena.cuda_dev_ptr) {
       rt.payload_host = rt.bar1_payload_arena.host_bar1_ptr;
       rt.payload_dev = rt.bar1_payload_arena.cuda_dev_ptr;
@@ -8212,6 +8303,7 @@ extern "C" void samurai_gpu_packet_free(void* ptr) {
   }
   const auto kind = static_cast<ExportHostAllocKind>(header->alloc_kind);
   if (kind == ExportHostAllocKind::kVulkanBar1P2p) {
+    (void)ddos_samurai::gpu_packet_cuda::p2p::get_global_bar1_batch_pool().release_slice(payload);
     return;
   }
   if (kind == ExportHostAllocKind::kCudaHost) {
