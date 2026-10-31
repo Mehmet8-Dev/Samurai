@@ -2,6 +2,7 @@
 #include "ddos_samurai/telecom/core/session_manager.hpp"
 #include "ddos_samurai/telecom/core/hierarchical_timing_wheel.hpp"
 #include "ddos_samurai/telecom/core/fastpath_classifier.hpp"
+#include "ddos_samurai/telecom/core/telco_packet_transport.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/mobile/gtpu_types.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/mobile/gtpu_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/mobile/pfcp_types.hpp"
@@ -619,6 +620,76 @@ void TestGtpuTeidZeroDropAndPfcpRecursionLimit() {
     std::cout << "  -> GTP-U TEID=0 Drop & PFCP IE Recursion Limit: PASSED" << std::endl;
 }
 
+void TestZeroAllocationSerializationAndPfcpBuildTxPacket() {
+    std::cout << "[TEST] 13. Zero-Allocation Buffer Serialization, PfcpEngine::BuildTxPacket & Transport Abstraction..." << std::endl;
+
+    SessionManager mgr(32);
+    GtpuEngine gtpu(mgr, nullptr);
+    PfcpEngine pfcp(mgr, nullptr);
+
+    PfcpConfig p_cfg{};
+    p_cfg.local_ip = 0x0A000001;
+    p_cfg.remote_upf_ip = 0x0A000002;
+    pfcp.StartAssociation(p_cfg);
+
+    TelcoSessionContext* s = mgr.AcquireSession();
+    assert(s != nullptr);
+
+    GtpuTunnelConfig g_cfg{};
+    g_cfg.uplink_teid = 0xABCDEF01;
+    g_cfg.local_gnb_ip = 0x0A000001;
+    g_cfg.peer_upf_ip = 0x0A000002;
+    gtpu.StartSession(s, g_cfg);
+
+    // 1. Zero-allocation GTP-U EncapsulateInto on stack buffer
+    uint8_t stack_buf[256];
+    auto inner = CreateDummyInnerIpPacket();
+    size_t gtp_written = gtpu.EncapsulateInto(s, inner.data(), inner.size(), stack_buf, sizeof(stack_buf), 77);
+    assert(gtp_written > inner.size());
+    GtpuDecapInfo g_decap{};
+    assert(GtpuEngine::Decapsulate(stack_buf, gtp_written, g_decap));
+    assert(g_decap.teid == 0xABCDEF01);
+    assert(g_decap.seq_num == 77);
+
+    // 2. PfcpEngine::BuildTxPacket verification across event types (Association, Session Estab, Heartbeat, Modification, Deletion)
+    s->SetPfcpSeid(0xCAFEBABE11223344ULL);
+    (void)pfcp.BuildTxPacket(nullptr, s, 0); // Session Establishment Request
+    const auto& tx_estab = pfcp.GetLastTxFrame();
+    assert(!tx_estab.empty());
+    PfcpDecapInfo p_decap{};
+    assert(PfcpEngine::ParsePfcpPacket(tx_estab.data(), tx_estab.size(), p_decap));
+    assert(p_decap.msg_type == static_cast<uint8_t>(PfcpMessageType::SessionEstablishmentRequest));
+
+    (void)pfcp.BuildTxPacket(nullptr, s, 2); // Heartbeat Request
+    const auto& tx_hb = pfcp.GetLastTxFrame();
+    assert(PfcpEngine::ParsePfcpPacket(tx_hb.data(), tx_hb.size(), p_decap));
+    assert(p_decap.msg_type == static_cast<uint8_t>(PfcpMessageType::HeartbeatRequest));
+
+    (void)pfcp.BuildTxPacket(nullptr, s, 4); // Session Deletion Request
+    const auto& tx_del = pfcp.GetLastTxFrame();
+    assert(PfcpEngine::ParsePfcpPacket(tx_del.data(), tx_del.size(), p_decap));
+    assert(p_decap.msg_type == static_cast<uint8_t>(PfcpMessageType::SessionDeletionRequest));
+
+    // 3. ITelcoPacketTransport Loopback roundtrip verification
+    auto transport = CreateTelcoPacketTransport("loopback");
+    assert(transport != nullptr);
+    assert(transport->Open("lo0"));
+    assert(transport->IsOpen());
+    assert(transport->GetBackend() == TelcoTransportBackend::LoopbackMemory);
+
+    const uint8_t* burst_ptrs[1] = {stack_buf};
+    const uint16_t burst_lens[1] = {static_cast<uint16_t>(gtp_written)};
+    assert(transport->TransmitBurst(burst_ptrs, burst_lens, 1) == 1);
+
+    uint8_t rx_buf[256] = {0};
+    ssize_t rx_len = transport->Receive(rx_buf, sizeof(rx_buf));
+    assert(rx_len == static_cast<ssize_t>(gtp_written));
+    assert(std::memcmp(rx_buf, stack_buf, gtp_written) == 0);
+    transport->Close();
+
+    std::cout << "  -> Zero-Allocation Serialization, PfcpEngine::BuildTxPacket & Transport Abstraction: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================" << std::endl;
     std::cout << "     SAMURAI 4G/5G GTP-U & PFCP MOBILE CORE VERIFICATION SUITE   " << std::endl;
@@ -636,6 +707,7 @@ int main() {
     TestGtpuWireFramePaddingAndDirectDecap();
     TestPfcpIpv6FseidParsing();
     TestGtpuTeidZeroDropAndPfcpRecursionLimit();
+    TestZeroAllocationSerializationAndPfcpBuildTxPacket();
 
     std::cout << "=================================================================" << std::endl;
     std::cout << "  ALL MOBILE CORE TESTS PASSED SUCCESSFULLY! (100% VERIFIED)     " << std::endl;
