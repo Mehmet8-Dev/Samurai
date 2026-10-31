@@ -64,10 +64,15 @@ uint16_t ComputeChecksum(const uint16_t* data, size_t bytes) {
 
 GtpuEngine::GtpuEngine(SessionManager& session_mgr, HierarchicalTimingWheel* wheel)
     : session_mgr_(session_mgr),
-      timing_wheel_(wheel) {}
+      timing_wheel_(wheel) {
+    last_tx_frame_.reserve(2048);
+}
 
 bool GtpuEngine::Init(const ProtocolConfig& cfg) {
     config_ = cfg;
+    if (last_tx_frame_.capacity() < 2048) {
+        last_tx_frame_.reserve(2048);
+    }
     return true;
 }
 
@@ -157,14 +162,16 @@ void GtpuEngine::HandleTimeout(TelcoSessionContext* session) {
     GtpuSubState sub = GetSubState(session);
 
     if (sub == GtpuSubState::ACTIVE) {
-        // Canlılık sorgusu zamanı: Echo Request gönder
+        // Canlılık sorgusu zamanı: Echo Request gönder (Zero-allocation into pre-reserved buffer)
         SetSubState(session, GtpuSubState::ECHO_PENDING);
         session->retry_count = 0;
 
         uint16_t seq = next_seq_num_++;
-        last_tx_frame_ = BuildEchoRequest(session, seq);
+        last_tx_frame_.resize(128);
+        size_t written = BuildEchoRequestInto(session, seq, last_tx_frame_.data(), last_tx_frame_.size());
+        last_tx_frame_.resize(written);
         session->tx_packets++;
-        session->tx_bytes += last_tx_frame_.size();
+        session->tx_bytes += written;
 
         if (timing_wheel_) {
             timing_wheel_->Schedule(session, config_.retransmit_timeout_ms > 0 ? config_.retransmit_timeout_ms : 500);
@@ -184,9 +191,11 @@ void GtpuEngine::HandleTimeout(TelcoSessionContext* session) {
 
         SetSubState(session, GtpuSubState::DEGRADED);
         uint16_t seq = next_seq_num_++;
-        last_tx_frame_ = BuildEchoRequest(session, seq);
+        last_tx_frame_.resize(128);
+        size_t written = BuildEchoRequestInto(session, seq, last_tx_frame_.data(), last_tx_frame_.size());
+        last_tx_frame_.resize(written);
         session->tx_packets++;
-        session->tx_bytes += last_tx_frame_.size();
+        session->tx_bytes += written;
 
         uint32_t backoff_ms = (config_.retransmit_timeout_ms > 0 ? config_.retransmit_timeout_ms : 500) * (1 << session->retry_count);
         if (timing_wheel_) {
@@ -211,60 +220,81 @@ void GtpuEngine::OnRxPacket(rte_mbuf* /*mbuf*/, const PacketMetadata& meta, Telc
 }
 
 rte_mbuf* GtpuEngine::BuildTxPacket(rte_mempool* pool, TelcoSessionContext* session, uint16_t event_type) {
-    if (!pool || !session) return nullptr;
+    if (!session) return nullptr;
+    static const uint8_t inner_payload[28] = {
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, 1, 0x00, 0x00,
+        192, 168, 100, 1, 8, 8, 8, 8,
+        0x08, 0x00, 0xf7, 0xff, 0x00, 0x01, 0x00, 0x01
+    };
+
 #ifdef SAMURAI_WITH_DPDK
-    rte_mbuf* m = rte_pktmbuf_alloc(pool);
-    if (!m) return nullptr;
+    if (pool) {
+        rte_mbuf* m = rte_pktmbuf_alloc(pool);
+        if (!m) return nullptr;
 
-    std::vector<uint8_t> pkt;
-    if (event_type == 1) { // GTP-U Echo Request
-        pkt = BuildEchoRequest(session, next_seq_num_++);
-    } else {
-        // Enkapsüle edilmiş iç L4 test yükü (ICMP Echo Request payload)
-        static const uint8_t inner_payload[28] = {
-            0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, 1, 0x00, 0x00,
-            192, 168, 100, 1, 8, 8, 8, 8,
-            0x08, 0x00, 0xf7, 0xff, 0x00, 0x01, 0x00, 0x01
-        };
-        pkt = Encapsulate(session, inner_payload, sizeof(inner_payload), next_seq_num_++);
-    }
+        const size_t tailroom = rte_pktmbuf_tailroom(m);
+        uint8_t* dst = rte_pktmbuf_mtod(m, uint8_t*);
+        size_t written = 0;
 
-    if (pkt.empty() || pkt.size() > rte_pktmbuf_tailroom(m)) {
-        rte_pktmbuf_free(m);
-        return nullptr;
-    }
+        if (event_type == 1) { // GTP-U Echo Request (zero-allocation direct into mbuf)
+            written = BuildEchoRequestInto(session, next_seq_num_++, dst, tailroom);
+            if (written > 0) {
+                session->tx_packets++;
+                session->tx_bytes += written;
+            }
+        } else {
+            written = EncapsulateInto(session, inner_payload, sizeof(inner_payload), dst, tailroom, next_seq_num_++);
+        }
 
-    char* data = rte_pktmbuf_append(m, pkt.size());
-    if (!data) {
-        rte_pktmbuf_free(m);
-        return nullptr;
+        if (written == 0 || !rte_pktmbuf_append(m, static_cast<uint16_t>(written))) {
+            rte_pktmbuf_free(m);
+            return nullptr;
+        }
+        last_tx_frame_.assign(dst, dst + written);
+        return m;
     }
-    std::memcpy(data, pkt.data(), pkt.size());
-    return m;
 #else
-    (void)event_type;
-    return nullptr;
+    (void)pool;
 #endif
+    // Pool verilmediğinde önceden rezerve edilmiş last_tx_frame_ içine zero-heap-alloc yaz
+    last_tx_frame_.resize(256);
+    size_t written = 0;
+    if (event_type == 1) {
+        written = BuildEchoRequestInto(session, next_seq_num_++, last_tx_frame_.data(), last_tx_frame_.size());
+        if (written > 0) {
+            session->tx_packets++;
+            session->tx_bytes += written;
+        }
+    } else {
+        written = EncapsulateInto(session, inner_payload, sizeof(inner_payload),
+                                  last_tx_frame_.data(), last_tx_frame_.size(), next_seq_num_++);
+    }
+    last_tx_frame_.resize(written);
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
-// GTP-U Paket Kapsülleme (Encapsulation)
+// GTP-U Paket Kapsülleme (Encapsulation - Zero-Allocation Buffer & Vector API)
 // ---------------------------------------------------------------------------
 
-std::vector<uint8_t> GtpuEngine::Encapsulate(TelcoSessionContext* session, 
-                                             const uint8_t* inner_pkt, 
-                                             size_t inner_len, 
-                                             uint16_t seq_num) {
-    bool has_seq = (seq_num > 0);
-    size_t opt_len = has_seq ? sizeof(GtpuOptFields) : 0;
-    size_t gtp_payload_len = opt_len + inner_len;
-    size_t gtp_hdr_len = sizeof(GtpuHeader) + opt_len;
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + inner_len;
+size_t GtpuEngine::EncapsulateInto(TelcoSessionContext* session,
+                                   const uint8_t* inner_pkt,
+                                   size_t inner_len,
+                                   uint8_t* out_buf,
+                                   size_t max_len,
+                                   uint16_t seq_num) noexcept {
+    if (!out_buf) return 0;
+    const bool has_seq = (seq_num > 0);
+    const size_t opt_len = has_seq ? sizeof(GtpuOptFields) : 0;
+    const size_t gtp_payload_len = opt_len + inner_len;
+    const size_t gtp_hdr_len = sizeof(GtpuHeader) + opt_len;
+    const size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + inner_len;
+    if (max_len < total_len) return 0;
 
-    std::vector<uint8_t> frame(total_len, 0);
+    std::memset(out_buf, 0, sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len);
 
     // 1. Ethernet Header
-    auto* eth = reinterpret_cast<EthHeader*>(frame.data());
+    auto* eth = reinterpret_cast<EthHeader*>(out_buf);
     if (session) {
         std::memcpy(eth->dst_mac, session->peer_mac, 6);
         std::memcpy(eth->src_mac, session->client_mac, 6);
@@ -274,7 +304,7 @@ std::vector<uint8_t> GtpuEngine::Encapsulate(TelcoSessionContext* session,
     eth->ethertype = htons(0x0800);
 
     // 2. IPv4 Outer Header
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
+    auto* ip = reinterpret_cast<Ipv4Header*>(out_buf + sizeof(EthHeader));
     ip->ihl_version = 0x45;
     ip->tos = 0;
     ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + inner_len));
@@ -289,23 +319,22 @@ std::vector<uint8_t> GtpuEngine::Encapsulate(TelcoSessionContext* session,
     ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
 
     // 3. UDP Header
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
+    auto* udp = reinterpret_cast<UdpHeader*>(out_buf + sizeof(EthHeader) + sizeof(Ipv4Header));
     udp->src_port = htons(GTPU_PORT);
     udp->dst_port = htons(GTPU_PORT);
     udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + gtp_hdr_len + inner_len));
-    udp->checksum = 0; // IPv4 UDP opsiyonel
+    udp->checksum = 0;
 
     // 4. GTP-U Header (3GPP TS 29.281)
-    size_t gtp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* gtp = reinterpret_cast<GtpuHeader*>(frame.data() + gtp_offset);
+    const size_t gtp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
+    auto* gtp = reinterpret_cast<GtpuHeader*>(out_buf + gtp_offset);
     gtp->flags = GTPU_HDR_BASE_FLAGS | (has_seq ? GTPU_FLAG_S : 0);
     gtp->msg_type = static_cast<uint8_t>(GtpuMessageType::GPdu);
     gtp->length = htons(static_cast<uint16_t>(gtp_payload_len));
     gtp->teid = htonl(session ? session->teid_uplink : 0);
 
-    // Opsiyonel Sequence Number Alanı
     if (has_seq) {
-        auto* opt = reinterpret_cast<GtpuOptFields*>(frame.data() + gtp_offset + sizeof(GtpuHeader));
+        auto* opt = reinterpret_cast<GtpuOptFields*>(out_buf + gtp_offset + sizeof(GtpuHeader));
         opt->seq_num = htons(seq_num);
         opt->n_pdu = 0;
         opt->next_ext = 0;
@@ -313,15 +342,32 @@ std::vector<uint8_t> GtpuEngine::Encapsulate(TelcoSessionContext* session,
 
     // 5. İç Yük (Inner T-PDU / IP Packet)
     if (inner_pkt && inner_len > 0) {
-        std::memcpy(frame.data() + gtp_offset + gtp_hdr_len, inner_pkt, inner_len);
+        std::memcpy(out_buf + gtp_offset + gtp_hdr_len, inner_pkt, inner_len);
     }
 
     if (session) {
-        last_tx_frame_ = frame;
         session->tx_packets++;
-        session->tx_bytes += frame.size();
+        session->tx_bytes += total_len;
     }
 
+    return total_len;
+}
+
+std::vector<uint8_t> GtpuEngine::Encapsulate(TelcoSessionContext* session, 
+                                             const uint8_t* inner_pkt, 
+                                             size_t inner_len, 
+                                             uint16_t seq_num) {
+    const bool has_seq = (seq_num > 0);
+    const size_t opt_len = has_seq ? sizeof(GtpuOptFields) : 0;
+    const size_t gtp_hdr_len = sizeof(GtpuHeader) + opt_len;
+    const size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + inner_len;
+
+    std::vector<uint8_t> frame(total_len, 0);
+    const size_t written = EncapsulateInto(session, inner_pkt, inner_len, frame.data(), frame.size(), seq_num);
+    frame.resize(written);
+    if (session) {
+        last_tx_frame_ = frame;
+    }
     return frame;
 }
 
@@ -491,10 +537,12 @@ bool GtpuEngine::ProcessRxFrame(const uint8_t* frame, size_t len, TelcoSessionCo
     // 2. Path Management: Echo Request (Msg Type 1)
     if (info.msg_type == static_cast<uint8_t>(GtpuMessageType::EchoRequest)) {
         uint16_t seq = info.has_seq ? info.seq_num : 0;
-        last_tx_frame_ = BuildEchoResponse(session, seq, restart_counter_);
+        last_tx_frame_.resize(128);
+        size_t written = BuildEchoResponseInto(session, seq, restart_counter_, last_tx_frame_.data(), last_tx_frame_.size());
+        last_tx_frame_.resize(written);
         if (session) {
             session->tx_packets++;
-            session->tx_bytes += last_tx_frame_.size();
+            session->tx_bytes += written;
         }
         return true;
     }
@@ -530,26 +578,29 @@ bool GtpuEngine::ProcessRxFrame(const uint8_t* frame, size_t len, TelcoSessionCo
 }
 
 // ---------------------------------------------------------------------------
-// Canlılık ve Hata Mesaj Üreticileri
+// Canlılık ve Hata Mesaj Üreticileri (Zero-Allocation Buffer & Vector API)
 // ---------------------------------------------------------------------------
 
-std::vector<uint8_t> GtpuEngine::BuildEchoRequest(TelcoSessionContext* session, uint16_t seq_num) {
-    // 3GPP TS 29.281 Section 7.2.1: Echo Request (flags=0x32, TEID=0, SeqNum, Recovery IE)
-    // Recovery IE (Type 14 = 0x0E), Restart Counter (1 byte)
-    size_t gtp_hdr_len = sizeof(GtpuHeader) + sizeof(GtpuOptFields);
-    size_t recovery_ie_len = 2; // Type(1) + RestartCounter(1)
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + recovery_ie_len;
+size_t GtpuEngine::BuildEchoRequestInto(TelcoSessionContext* session,
+                                        uint16_t seq_num,
+                                        uint8_t* out_buf,
+                                        size_t max_len) noexcept {
+    if (!out_buf) return 0;
+    const size_t gtp_hdr_len = sizeof(GtpuHeader) + sizeof(GtpuOptFields);
+    const size_t recovery_ie_len = 2; // Type(1) + RestartCounter(1)
+    const size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + recovery_ie_len;
+    if (max_len < total_len) return 0;
 
-    std::vector<uint8_t> frame(total_len, 0);
+    std::memset(out_buf, 0, total_len);
 
-    auto* eth = reinterpret_cast<EthHeader*>(frame.data());
+    auto* eth = reinterpret_cast<EthHeader*>(out_buf);
     if (session) {
         std::memcpy(eth->dst_mac, session->peer_mac, 6);
         std::memcpy(eth->src_mac, session->client_mac, 6);
     }
     eth->ethertype = htons(0x0800);
 
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
+    auto* ip = reinterpret_cast<Ipv4Header*>(out_buf + sizeof(EthHeader));
     ip->ihl_version = 0x45;
     ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + recovery_ie_len));
     ip->id = htons(0x4701);
@@ -561,46 +612,60 @@ std::vector<uint8_t> GtpuEngine::BuildEchoRequest(TelcoSessionContext* session, 
     }
     ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
 
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
+    auto* udp = reinterpret_cast<UdpHeader*>(out_buf + sizeof(EthHeader) + sizeof(Ipv4Header));
     udp->src_port = htons(session ? session->client_port : GTPU_PORT);
     udp->dst_port = htons(session ? session->peer_port : GTPU_PORT);
     udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + gtp_hdr_len + recovery_ie_len));
 
-    size_t gtp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* gtp = reinterpret_cast<GtpuHeader*>(frame.data() + gtp_offset);
+    const size_t gtp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
+    auto* gtp = reinterpret_cast<GtpuHeader*>(out_buf + gtp_offset);
     gtp->flags = GTPU_HDR_BASE_FLAGS | GTPU_FLAG_S;
     gtp->msg_type = static_cast<uint8_t>(GtpuMessageType::EchoRequest);
     gtp->length = htons(static_cast<uint16_t>(sizeof(GtpuOptFields) + recovery_ie_len));
-    gtp->teid = 0; // TEID 0 for path management
+    gtp->teid = 0;
 
-    auto* opt = reinterpret_cast<GtpuOptFields*>(frame.data() + gtp_offset + sizeof(GtpuHeader));
+    auto* opt = reinterpret_cast<GtpuOptFields*>(out_buf + gtp_offset + sizeof(GtpuHeader));
     opt->seq_num = htons(seq_num);
     opt->n_pdu = 0;
     opt->next_ext = 0;
 
-    // Recovery IE (Type 14, Restart Counter)
-    size_t ie_offset = gtp_offset + gtp_hdr_len;
-    frame[ie_offset] = 14;              // Type = 14 (Recovery)
-    frame[ie_offset + 1] = restart_counter_; // Restart Counter
+    const size_t ie_offset = gtp_offset + gtp_hdr_len;
+    out_buf[ie_offset] = 14;              // Type = 14 (Recovery)
+    out_buf[ie_offset + 1] = restart_counter_;
+    return total_len;
+}
 
+std::vector<uint8_t> GtpuEngine::BuildEchoRequest(TelcoSessionContext* session, uint16_t seq_num) {
+    const size_t gtp_hdr_len = sizeof(GtpuHeader) + sizeof(GtpuOptFields);
+    const size_t recovery_ie_len = 2;
+    const size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + recovery_ie_len;
+    std::vector<uint8_t> frame(total_len, 0);
+    const size_t written = BuildEchoRequestInto(session, seq_num, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
 }
 
-std::vector<uint8_t> GtpuEngine::BuildEchoResponse(TelcoSessionContext* session, uint16_t seq_num, uint8_t restart_counter) {
-    size_t gtp_hdr_len = sizeof(GtpuHeader) + sizeof(GtpuOptFields);
-    size_t recovery_ie_len = 2;
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + recovery_ie_len;
+size_t GtpuEngine::BuildEchoResponseInto(TelcoSessionContext* session,
+                                         uint16_t seq_num,
+                                         uint8_t restart_counter,
+                                         uint8_t* out_buf,
+                                         size_t max_len) noexcept {
+    if (!out_buf) return 0;
+    const size_t gtp_hdr_len = sizeof(GtpuHeader) + sizeof(GtpuOptFields);
+    const size_t recovery_ie_len = 2;
+    const size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + recovery_ie_len;
+    if (max_len < total_len) return 0;
 
-    std::vector<uint8_t> frame(total_len, 0);
+    std::memset(out_buf, 0, total_len);
 
-    auto* eth = reinterpret_cast<EthHeader*>(frame.data());
+    auto* eth = reinterpret_cast<EthHeader*>(out_buf);
     if (session) {
         std::memcpy(eth->dst_mac, session->peer_mac, 6);
         std::memcpy(eth->src_mac, session->client_mac, 6);
     }
     eth->ethertype = htons(0x0800);
 
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
+    auto* ip = reinterpret_cast<Ipv4Header*>(out_buf + sizeof(EthHeader));
     ip->ihl_version = 0x45;
     ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + recovery_ie_len));
     ip->id = htons(0x4702);
@@ -612,47 +677,59 @@ std::vector<uint8_t> GtpuEngine::BuildEchoResponse(TelcoSessionContext* session,
     }
     ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
 
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
+    auto* udp = reinterpret_cast<UdpHeader*>(out_buf + sizeof(EthHeader) + sizeof(Ipv4Header));
     udp->src_port = htons(session ? session->peer_port : GTPU_PORT);
     udp->dst_port = htons(session ? session->client_port : GTPU_PORT);
     udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + gtp_hdr_len + recovery_ie_len));
 
-    size_t gtp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* gtp = reinterpret_cast<GtpuHeader*>(frame.data() + gtp_offset);
+    const size_t gtp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
+    auto* gtp = reinterpret_cast<GtpuHeader*>(out_buf + gtp_offset);
     gtp->flags = GTPU_HDR_BASE_FLAGS | GTPU_FLAG_S;
     gtp->msg_type = static_cast<uint8_t>(GtpuMessageType::EchoResponse);
     gtp->length = htons(static_cast<uint16_t>(sizeof(GtpuOptFields) + recovery_ie_len));
     gtp->teid = 0;
 
-    auto* opt = reinterpret_cast<GtpuOptFields*>(frame.data() + gtp_offset + sizeof(GtpuHeader));
+    auto* opt = reinterpret_cast<GtpuOptFields*>(out_buf + gtp_offset + sizeof(GtpuHeader));
     opt->seq_num = htons(seq_num);
     opt->n_pdu = 0;
     opt->next_ext = 0;
 
-    size_t ie_offset = gtp_offset + gtp_hdr_len;
-    frame[ie_offset] = 14;
-    frame[ie_offset + 1] = restart_counter;
+    const size_t ie_offset = gtp_offset + gtp_hdr_len;
+    out_buf[ie_offset] = 14;
+    out_buf[ie_offset + 1] = restart_counter;
+    return total_len;
+}
 
+std::vector<uint8_t> GtpuEngine::BuildEchoResponse(TelcoSessionContext* session, uint16_t seq_num, uint8_t restart_counter) {
+    const size_t gtp_hdr_len = sizeof(GtpuHeader) + sizeof(GtpuOptFields);
+    const size_t recovery_ie_len = 2;
+    const size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + gtp_hdr_len + recovery_ie_len;
+    std::vector<uint8_t> frame(total_len, 0);
+    const size_t written = BuildEchoResponseInto(session, seq_num, restart_counter, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
 }
 
-std::vector<uint8_t> GtpuEngine::BuildErrorIndication(TelcoSessionContext* session, uint32_t teid, uint32_t peer_ip) {
-    // 3GPP TS 29.281 Section 7.3.1: Error Indication (TEID Data I IE 16, GTP-U Peer Address IE 133)
-    // IE 16: Type(1) + TEID(4) = 5 bayt
-    // IE 133: Type(1) + Length(2) + IPv4(4) = 7 bayt
-    size_t ies_len = 5 + 7;
-    size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(GtpuHeader) + ies_len;
+size_t GtpuEngine::BuildErrorIndicationInto(TelcoSessionContext* session,
+                                            uint32_t teid,
+                                            uint32_t peer_ip,
+                                            uint8_t* out_buf,
+                                            size_t max_len) noexcept {
+    if (!out_buf) return 0;
+    const size_t ies_len = 5 + 7;
+    const size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(GtpuHeader) + ies_len;
+    if (max_len < total_len) return 0;
 
-    std::vector<uint8_t> frame(total_len, 0);
+    std::memset(out_buf, 0, total_len);
 
-    auto* eth = reinterpret_cast<EthHeader*>(frame.data());
+    auto* eth = reinterpret_cast<EthHeader*>(out_buf);
     if (session) {
         std::memcpy(eth->dst_mac, session->peer_mac, 6);
         std::memcpy(eth->src_mac, session->client_mac, 6);
     }
     eth->ethertype = htons(0x0800);
 
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame.data() + sizeof(EthHeader));
+    auto* ip = reinterpret_cast<Ipv4Header*>(out_buf + sizeof(EthHeader));
     ip->ihl_version = 0x45;
     ip->total_length = htons(static_cast<uint16_t>(sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(GtpuHeader) + ies_len));
     ip->id = htons(0x471A);
@@ -664,33 +741,40 @@ std::vector<uint8_t> GtpuEngine::BuildErrorIndication(TelcoSessionContext* sessi
     }
     ip->checksum = ComputeChecksum(reinterpret_cast<const uint16_t*>(ip), sizeof(Ipv4Header));
 
-    auto* udp = reinterpret_cast<UdpHeader*>(frame.data() + sizeof(EthHeader) + sizeof(Ipv4Header));
+    auto* udp = reinterpret_cast<UdpHeader*>(out_buf + sizeof(EthHeader) + sizeof(Ipv4Header));
     udp->src_port = htons(GTPU_PORT);
     udp->dst_port = htons(GTPU_PORT);
     udp->length = htons(static_cast<uint16_t>(sizeof(UdpHeader) + sizeof(GtpuHeader) + ies_len));
 
-    size_t gtp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
-    auto* gtp = reinterpret_cast<GtpuHeader*>(frame.data() + gtp_offset);
-    gtp->flags = GTPU_HDR_BASE_FLAGS; // No optional fields
+    const size_t gtp_offset = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader);
+    auto* gtp = reinterpret_cast<GtpuHeader*>(out_buf + gtp_offset);
+    gtp->flags = GTPU_HDR_BASE_FLAGS;
     gtp->msg_type = static_cast<uint8_t>(GtpuMessageType::ErrorIndication);
     gtp->length = htons(static_cast<uint16_t>(ies_len));
     gtp->teid = 0;
 
     size_t offset = gtp_offset + sizeof(GtpuHeader);
-    // IE 16: TEID Data I
-    frame[offset++] = 16;
-    uint32_t teid_be = htonl(teid);
-    std::memcpy(frame.data() + offset, &teid_be, 4);
+    out_buf[offset++] = 16;
+    const uint32_t teid_be = htonl(teid);
+    std::memcpy(out_buf + offset, &teid_be, 4);
     offset += 4;
 
-    // IE 133: GTP-U Peer Address
-    frame[offset++] = 133;
-    uint16_t ip_len_be = htons(4);
-    std::memcpy(frame.data() + offset, &ip_len_be, 2);
+    out_buf[offset++] = 133;
+    const uint16_t ip_len_be = htons(4);
+    std::memcpy(out_buf + offset, &ip_len_be, 2);
     offset += 2;
-    uint32_t peer_ip_be = htonl(peer_ip != 0 ? peer_ip : (session ? session->peer_ip : 0));
-    std::memcpy(frame.data() + offset, &peer_ip_be, 4);
+    const uint32_t peer_ip_be = htonl(peer_ip != 0 ? peer_ip : (session ? session->peer_ip : 0));
+    std::memcpy(out_buf + offset, &peer_ip_be, 4);
 
+    return total_len;
+}
+
+std::vector<uint8_t> GtpuEngine::BuildErrorIndication(TelcoSessionContext* session, uint32_t teid, uint32_t peer_ip) {
+    const size_t ies_len = 5 + 7;
+    const size_t total_len = sizeof(EthHeader) + sizeof(Ipv4Header) + sizeof(UdpHeader) + sizeof(GtpuHeader) + ies_len;
+    std::vector<uint8_t> frame(total_len, 0);
+    const size_t written = BuildErrorIndicationInto(session, teid, peer_ip, frame.data(), frame.size());
+    frame.resize(written);
     return frame;
 }
 
