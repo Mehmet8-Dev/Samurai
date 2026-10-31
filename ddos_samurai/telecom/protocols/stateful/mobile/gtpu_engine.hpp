@@ -40,7 +40,14 @@ public:
     void StartSession(TelcoSessionContext* session, const GtpuTunnelConfig& tunnel_cfg);
     void StopSession(TelcoSessionContext* session);
 
-    // Tünelleme / Paket Kapsülleme (Encapsulation)
+    // Tünelleme / Paket Kapsülleme (Encapsulation) - Zero-Allocation Buffer & Vector API
+    size_t EncapsulateInto(TelcoSessionContext* session,
+                           const uint8_t* inner_pkt,
+                           size_t inner_len,
+                           uint8_t* out_buf,
+                           size_t max_len,
+                           uint16_t seq_num = 0) noexcept;
+
     std::vector<uint8_t> Encapsulate(TelcoSessionContext* session, 
                                      const uint8_t* inner_pkt, 
                                      size_t inner_len, 
@@ -49,7 +56,22 @@ public:
     // Tünel Çözme (Decapsulation & Doğrulama)
     static bool Decapsulate(const uint8_t* frame, size_t len, GtpuDecapInfo& out_info);
 
-    // Canlılık ve Hata Paket Üreticileri
+    // Canlılık ve Hata Paket Üreticileri (Zero-Allocation Buffer & Vector API)
+    size_t BuildEchoRequestInto(TelcoSessionContext* session,
+                                uint16_t seq_num,
+                                uint8_t* out_buf,
+                                size_t max_len) noexcept;
+    size_t BuildEchoResponseInto(TelcoSessionContext* session,
+                                 uint16_t seq_num,
+                                 uint8_t restart_counter,
+                                 uint8_t* out_buf,
+                                 size_t max_len) noexcept;
+    size_t BuildErrorIndicationInto(TelcoSessionContext* session,
+                                    uint32_t teid,
+                                    uint32_t peer_ip,
+                                    uint8_t* out_buf,
+                                    size_t max_len) noexcept;
+
     std::vector<uint8_t> BuildEchoRequest(TelcoSessionContext* session, uint16_t seq_num);
     std::vector<uint8_t> BuildEchoResponse(TelcoSessionContext* session, uint16_t seq_num, uint8_t restart_counter = 0);
     std::vector<uint8_t> BuildErrorIndication(TelcoSessionContext* session, uint32_t teid, uint32_t peer_ip);
