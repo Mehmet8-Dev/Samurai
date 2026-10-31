@@ -627,8 +627,8 @@ static void noop_extbuf_free_cb(void* addr, void* opaque) {
 
 bool register_extmem_region(int64_t handle, void* vaddr, std::size_t len,
                             uint64_t iova, uint32_t page_size, std::string& err) {
-    if (!vaddr || len == 0) {
-        err = "dpdk_extmem_invalid_args";
+    if (!vaddr || len == 0 || iova == 0u) {
+        err = "dpdk_extmem_invalid_args_or_zero_iova";
         return false;
     }
     const uint32_t pg_sz = (page_size > 0u) ? page_size : 4096u;
@@ -640,27 +640,36 @@ bool register_extmem_region(int64_t handle, void* vaddr, std::size_t len,
         return false;
     }
     const uint16_t port_id = it->second.port_id;
-    std::vector<rte_iova_t> iovas;
-    if (iova != 0u) {
-        const std::size_t n_pages = aligned_len / pg_sz;
-        iovas.resize(n_pages);
-        for (std::size_t i = 0; i < n_pages; ++i) {
-            iovas[i] = static_cast<rte_iova_t>(iova + i * pg_sz);
-        }
+    rte_eth_dev_info dev_info{};
+    if (rte_eth_dev_info_get(port_id, &dev_info) != 0 || dev_info.device == nullptr) {
+        err = "dpdk_extmem_missing_rte_device";
+        return false;
+    }
+
+    const std::size_t n_pages = aligned_len / pg_sz;
+    std::vector<rte_iova_t> iovas(n_pages);
+    for (std::size_t i = 0; i < n_pages; ++i) {
+        iovas[i] = static_cast<rte_iova_t>(iova + i * pg_sz);
     }
     const int reg_rc = rte_extmem_register(
         vaddr,
         aligned_len,
-        iovas.empty() ? nullptr : iovas.data(),
+        iovas.data(),
         static_cast<unsigned int>(iovas.size()),
         pg_sz);
     if (reg_rc < 0 && rte_errno != EEXIST) {
         err = std::string("rte_extmem_register_failed:") + rte_strerror(rte_errno);
         return false;
     }
-    rte_eth_dev_info dev_info{};
-    if (rte_eth_dev_info_get(port_id, &dev_info) == 0 && dev_info.device != nullptr && iova != 0u) {
-        (void)rte_dev_dma_map(dev_info.device, vaddr, static_cast<rte_iova_t>(iova), aligned_len);
+    const int dma_rc = rte_dev_dma_map(
+        dev_info.device, vaddr, static_cast<rte_iova_t>(iova), aligned_len);
+    if (dma_rc < 0 && rte_errno != EEXIST) {
+        const int saved_errno = rte_errno;
+        if (reg_rc == 0) {
+            (void)rte_extmem_unregister(vaddr, aligned_len);
+        }
+        err = std::string("rte_dev_dma_map_failed:") + rte_strerror(saved_errno);
+        return false;
     }
     return true;
 }
@@ -675,8 +684,10 @@ TxResult tx_burst_extbuf_zero_copy(int64_t handle, uint16_t queue_id,
     }
     const uint16_t clamped_batch = std::min<uint16_t>(batch, kMaxBurst);
     if (bar1_base_iova == 0u) {
-        const uint8_t* src = static_cast<const uint8_t*>(bar1_base_vaddr) + (offset % region_len);
-        return tx_burst(handle, queue_id, src, packet_size, clamped_batch);
+        // BAR1 IOVA doğrulanmadan sessizce CPU kopyasına düşülmez (fail-closed).
+        r.errors += clamped_batch;
+        r.dropped += clamped_batch;
+        return r;
     }
 
     uint16_t port_id = 0;
@@ -711,16 +722,18 @@ TxResult tx_burst_extbuf_zero_copy(int64_t handle, uint16_t queue_id,
         return r;
     }
 
-    thread_local rte_mbuf_ext_shared_info shinfo_pool[kMaxBurst];
+    thread_local rte_mbuf_ext_shared_info shinfo_pool[4096];
+    thread_local uint32_t shinfo_cursor = 0;
     for (uint16_t i = 0; i < clamped_batch; ++i) {
         const std::size_t pkt_off =
             (offset + static_cast<std::size_t>(i) * packet_size) % (region_len - packet_size + 1u);
         void* buf_va = static_cast<uint8_t*>(bar1_base_vaddr) + pkt_off;
         const rte_iova_t buf_iova = static_cast<rte_iova_t>(bar1_base_iova + pkt_off);
-        shinfo_pool[i].free_cb = noop_extbuf_free_cb;
-        shinfo_pool[i].fcb_opaque = nullptr;
-        rte_mbuf_ext_refcnt_set(&shinfo_pool[i], 2);
-        rte_pktmbuf_attach_extbuf(mbufs[i], buf_va, buf_iova, packet_size, &shinfo_pool[i]);
+        const uint32_t sidx = (shinfo_cursor++) & 4095u;
+        shinfo_pool[sidx].free_cb = noop_extbuf_free_cb;
+        shinfo_pool[sidx].fcb_opaque = nullptr;
+        rte_mbuf_ext_refcnt_set(&shinfo_pool[sidx], 2);
+        rte_pktmbuf_attach_extbuf(mbufs[i], buf_va, buf_iova, packet_size, &shinfo_pool[sidx]);
         mbufs[i]->data_len = packet_size;
         mbufs[i]->pkt_len = packet_size;
     }
@@ -752,6 +765,148 @@ TxResult tx_burst_extbuf_zero_copy(int64_t handle, uint16_t queue_id,
     ctx->tx_errors.fetch_add(r.errors, std::memory_order_relaxed);
     ctx->tx_dropped.fetch_add(r.dropped, std::memory_order_relaxed);
     return r;
+}
+
+TxResult tx_burst_extbuf_slots(int64_t handle, uint16_t queue_id,
+                               void* bar1_base_vaddr, uint64_t bar1_base_iova,
+                               uint32_t slot_stride, const uint32_t* slot_indices,
+                               const uint16_t* pkt_lengths, uint16_t count,
+                               ExtbufSlotFreeCallback free_cb,
+                               void* free_cb_opaque) {
+    TxResult r{};
+    if (!bar1_base_vaddr || bar1_base_iova == 0u || slot_stride == 0u ||
+        !slot_indices || !pkt_lengths || count == 0u) {
+        return r;
+    }
+    const uint16_t clamped_batch = std::min<uint16_t>(count, kMaxBurst);
+
+    uint16_t port_id = 0;
+    rte_mempool* mempool = nullptr;
+    Context* ctx = nullptr;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_mu);
+        auto it = g_contexts.find(static_cast<long>(handle));
+        if (it == g_contexts.end()) {
+            return r;
+        }
+        ctx = &it->second;
+        port_id = ctx->port_id;
+        auto pt = g_ports.find(port_id);
+        if (pt == g_ports.end() || !pt->second.started || !pt->second.mempool) {
+            return r;
+        }
+        if (queue_id >= pt->second.tx_queues) {
+            queue_id = 0;
+        }
+        mempool = pt->second.mempool;
+    }
+
+    rte_mbuf* mbufs[kMaxBurst];
+    if (rte_pktmbuf_alloc_bulk(mempool, mbufs, clamped_batch) != 0) {
+        r.alloc_failures += clamped_batch;
+        r.errors += clamped_batch;
+        r.dropped += clamped_batch;
+        ctx->mbuf_alloc_failures.fetch_add(clamped_batch, std::memory_order_relaxed);
+        ctx->tx_errors.fetch_add(clamped_batch, std::memory_order_relaxed);
+        ctx->tx_dropped.fetch_add(clamped_batch, std::memory_order_relaxed);
+        return r;
+    }
+
+    thread_local rte_mbuf_ext_shared_info shinfo_ring[4096];
+    for (uint16_t i = 0; i < clamped_batch; ++i) {
+        const uint32_t slot_idx = slot_indices[i];
+        const uint16_t pkt_len = (pkt_lengths[i] > 0u) ? pkt_lengths[i] : 64u;
+        const std::size_t pkt_off = static_cast<std::size_t>(slot_idx) * slot_stride;
+        void* buf_va = static_cast<uint8_t*>(bar1_base_vaddr) + pkt_off;
+        const rte_iova_t buf_iova = static_cast<rte_iova_t>(bar1_base_iova + pkt_off);
+        const uint32_t sidx = slot_idx & 4095u;
+        if (free_cb != nullptr) {
+            shinfo_ring[sidx].free_cb = free_cb;
+            shinfo_ring[sidx].fcb_opaque = free_cb_opaque;
+            rte_mbuf_ext_refcnt_set(&shinfo_ring[sidx], 1);
+        } else {
+            shinfo_ring[sidx].free_cb = noop_extbuf_free_cb;
+            shinfo_ring[sidx].fcb_opaque = nullptr;
+            rte_mbuf_ext_refcnt_set(&shinfo_ring[sidx], 2);
+        }
+        rte_pktmbuf_attach_extbuf(mbufs[i], buf_va, buf_iova, pkt_len, &shinfo_ring[sidx]);
+        mbufs[i]->data_len = pkt_len;
+        mbufs[i]->pkt_len = pkt_len;
+    }
+
+    uint16_t sent_off = 0;
+    uint16_t remaining = clamped_batch;
+    int retry = 0;
+    while (remaining > 0 && retry < 8) {
+        const uint16_t n = rte_eth_tx_burst(port_id, queue_id, &mbufs[sent_off], remaining);
+        sent_off += n;
+        remaining = static_cast<uint16_t>(remaining - n);
+        if (remaining > 0) {
+            ++retry;
+            rte_pause();
+        }
+    }
+
+    uint64_t sent_bytes = 0;
+    for (uint16_t i = 0; i < sent_off; ++i) {
+        sent_bytes += (pkt_lengths[i] > 0u) ? pkt_lengths[i] : 64u;
+    }
+    r.sent += sent_off;
+    if (remaining > 0) {
+        for (uint16_t i = 0; i < remaining; ++i) {
+            rte_pktmbuf_free(mbufs[sent_off + i]);
+        }
+        r.dropped += remaining;
+        r.errors += remaining;
+    }
+
+    ctx->tx_packets.fetch_add(r.sent, std::memory_order_relaxed);
+    ctx->tx_bytes.fetch_add(sent_bytes, std::memory_order_relaxed);
+    ctx->tx_errors.fetch_add(r.errors, std::memory_order_relaxed);
+    ctx->tx_dropped.fetch_add(r.dropped, std::memory_order_relaxed);
+    return r;
+}
+
+int rx_burst_to_bar1_slots(int64_t handle, uint16_t queue_id,
+                           void* bar1_base_vaddr, uint32_t slot_stride,
+                           const uint32_t* slot_indices, uint16_t max_slots,
+                           uint16_t* out_lengths) {
+    if (!bar1_base_vaddr || slot_stride == 0u || !slot_indices || !out_lengths || max_slots == 0u) {
+        return -1;
+    }
+    const uint16_t budget = std::min<uint16_t>(max_slots, kMaxBurst);
+
+    std::shared_lock<std::shared_mutex> lock(g_mu);
+    auto it = g_contexts.find(static_cast<long>(handle));
+    if (it == g_contexts.end() || !it->second.rx_enable) {
+        return -1;
+    }
+    auto pt = g_ports.find(it->second.port_id);
+    if (pt == g_ports.end() || !pt->second.started || queue_id >= pt->second.rx_queues) {
+        return -1;
+    }
+    const uint16_t port_id = it->second.port_id;
+
+    rte_mbuf* mbufs[kMaxBurst];
+    const uint16_t n = rte_eth_rx_burst(port_id, queue_id, mbufs, budget);
+
+    uint64_t rx_bytes = 0;
+    for (uint16_t i = 0; i < n; ++i) {
+        const uint16_t pkt_len = rte_pktmbuf_pkt_len(mbufs[i]);
+        const uint16_t copy_len =
+            static_cast<uint16_t>(std::min<uint32_t>(pkt_len, slot_stride));
+        const void* data = rte_pktmbuf_mtod(mbufs[i], const void*);
+        uint8_t* dst = static_cast<uint8_t*>(bar1_base_vaddr) +
+                       static_cast<std::size_t>(slot_indices[i]) * slot_stride;
+        std::memcpy(dst, data, copy_len);
+        out_lengths[i] = copy_len;
+        rx_bytes += copy_len;
+        rte_pktmbuf_free(mbufs[i]);
+    }
+
+    it->second.rx_packets.fetch_add(n, std::memory_order_relaxed);
+    it->second.rx_bytes.fetch_add(rx_bytes, std::memory_order_relaxed);
+    return static_cast<int>(n);
 }
 
 bool configure_udp_flow(int64_t handle, const UdpFlowConfig& cfg, std::string& err) {
@@ -1247,6 +1402,14 @@ TxResult tx_burst_extbuf_zero_copy(int64_t, uint16_t, void*, uint64_t, std::size
                                    uint16_t, uint16_t) {
     return {};
 }
+TxResult tx_burst_extbuf_slots(int64_t, uint16_t, void*, uint64_t, uint32_t, const uint32_t*,
+                               const uint16_t*, uint16_t, ExtbufSlotFreeCallback, void*) {
+    return {};
+}
+int rx_burst_to_bar1_slots(int64_t, uint16_t, void*, uint32_t, const uint32_t*, uint16_t,
+                           uint16_t*) {
+    return -1;
+}
 bool configure_udp_flow(int64_t, const UdpFlowConfig&, std::string& err) {
     err = "dpdk_not_built";
     return false;
@@ -1271,3 +1434,39 @@ void close_port(int64_t) {}
 }  // namespace samurai::dpdk
 
 #endif  // SAMURAI_WITH_DPDK
+
+extern "C" {
+
+__attribute__((visibility("default"))) int samurai_dpdk_p2p_register_extmem(
+    int64_t handle, void* vaddr, std::size_t len, uint64_t iova, uint32_t page_size) {
+    std::string err;
+    return samurai::dpdk::register_extmem_region(handle, vaddr, len, iova, page_size, err) ? 0 : -1;
+}
+
+__attribute__((visibility("default"))) int samurai_dpdk_p2p_tx_burst_slots(
+    int64_t handle, uint16_t queue_id, void* bar1_base_vaddr, uint64_t bar1_base_iova,
+    uint32_t slot_stride, const uint32_t* slot_indices, const uint16_t* pkt_lengths,
+    uint16_t count, samurai::dpdk::ExtbufSlotFreeCallback free_cb, void* free_cb_opaque,
+    uint64_t* out_sent, uint64_t* out_dropped) {
+    if (!samurai::dpdk::available() || handle < 0) {
+        return -1;
+    }
+    const auto res = samurai::dpdk::tx_burst_extbuf_slots(
+        handle, queue_id, bar1_base_vaddr, bar1_base_iova, slot_stride, slot_indices,
+        pkt_lengths, count, free_cb, free_cb_opaque);
+    if (out_sent) *out_sent = res.sent;
+    if (out_dropped) *out_dropped = res.dropped;
+    return static_cast<int>(res.sent);
+}
+
+__attribute__((visibility("default"))) int samurai_dpdk_p2p_rx_burst_slots(
+    int64_t handle, uint16_t queue_id, void* bar1_base_vaddr, uint32_t slot_stride,
+    const uint32_t* slot_indices, uint16_t max_slots, uint16_t* out_lengths) {
+    if (!samurai::dpdk::available() || handle < 0) {
+        return -1;
+    }
+    return samurai::dpdk::rx_burst_to_bar1_slots(
+        handle, queue_id, bar1_base_vaddr, slot_stride, slot_indices, max_slots, out_lengths);
+}
+
+}  // extern "C"
