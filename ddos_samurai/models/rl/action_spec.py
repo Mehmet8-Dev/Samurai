@@ -23,6 +23,8 @@ ACTION_FIELDS: dict[str, str] = {
     "request_mix": "request_mix",
     "source_rotation": "source_rotation",
     "pacing_mode": "pacing_mode",
+    "auth_mode": "auth_mode",
+    "evasion_tactic": "evasion_tactic",
 }
 
 
@@ -71,8 +73,16 @@ class ActionSpec:
 # categorical heads — so the policy can learn to *avoid* a WAF-blocked variant
 # instead of regressing to the mean of the good ones.
 MAHORAGA = ActionSpec(
-    ("rps", "concurrency", "request_mix", "source_rotation", "pacing_mode"),
-    categorical_names=("request_mix", "pacing_mode"),
+    (
+        "rps",
+        "concurrency",
+        "request_mix",
+        "source_rotation",
+        "pacing_mode",
+        "auth_mode",
+        "evasion_tactic",
+    ),
+    categorical_names=("request_mix", "pacing_mode", "auth_mode", "evasion_tactic"),
 )
 
 # Back-compat default: scalar setpoint only.

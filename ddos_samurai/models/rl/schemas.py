@@ -108,6 +108,8 @@ class Action:
     connections: int = -1
     request_mix: int = -1
     source_rotation: int = -1
+    auth_mode: int = -1
+    evasion_tactic: int = -1
 
     @classmethod
     def from_json(cls, o: dict | None, *, fallback_rps: float = 0.0) -> "Action":
@@ -119,6 +121,8 @@ class Action:
             connections=int(o.get("connections", -1)),
             request_mix=int(o.get("request_mix", -1)),
             source_rotation=int(o.get("source_rotation", -1)),
+            auth_mode=int(o.get("auth_mode", -1)),
+            evasion_tactic=int(o.get("evasion_tactic", -1)),
         )
 
     def value(self, field_name: str) -> float:
