@@ -164,6 +164,60 @@ def test_multidim_mahoraga_action_end_to_end(tmp_path):
     assert np.isfinite(res.fqe_value)
 
 
+def test_mahoraga_7d_auth_and_evasion_end_to_end(tmp_path):
+    from ddos_samurai.models.rl import MAHORAGA, load_policy, save_policy
+
+    rng = np.random.default_rng(42)
+    p = tmp_path / "m7.ndjson"
+    with open(p, "w", encoding="utf-8") as fh:
+        for ep in range(6):
+            rps = 100.0
+            for w in range(8):
+                conc = int(rng.integers(1, 16))
+                rm = int(ep % 12)
+                pm = int(1 + (w % 3))
+                am = int(ep % 3)
+                et = int(w % 4)
+                rec = {
+                    "run_id": f"cl-{ep}", "win": w, "ts_ms": w, "strategy": "explore",
+                    "min_rps": 50.0, "max_rps": 2000.0, "window_s": 5,
+                    "slo": {"max_error_pct": 2.0, "max_loss_pct": 0.0,
+                            "min_rate_accuracy_pct": 0.0, "max_latency_ms": 0.0},
+                    "action_rps": rps,
+                    "action": {
+                        "rps": rps, "concurrency": conc, "request_mix": rm,
+                        "source_rotation": 1, "pacing_mode": pm,
+                        "auth_mode": am, "evasion_tactic": et,
+                    },
+                    "s_valid": w > 0,
+                    "s": _state(rps - 100), "s2": _state(rps),
+                    "healthy": True, "phase": "probe", "done": w == 7,
+                }
+                fh.write(json.dumps(rec) + "\n")
+                rps += 50.0
+
+    ds = build_dataset(p, action_spec=MAHORAGA)
+    assert ds.action_dim == 7
+    assert ds.actions.shape[1] == 7
+    assert ds.action_kinds == (
+        "continuous", "continuous", "categorical", "continuous", "categorical", "categorical", "categorical"
+    )
+
+    art = train_iql(ds, IQLConfig(steps=200, seed=0))
+    assert art.action_dim == 7
+    assert art.action_names == (
+        "rps", "concurrency", "request_mix", "source_rotation", "pacing_mode", "auth_mode", "evasion_tactic"
+    )
+
+    fp = tmp_path / "m7.srlp"
+    save_policy(art, fp)
+    back = load_policy(fp, action_names=MAHORAGA.names)
+    assert np.allclose(art.act_batch(ds.states), back.act_batch(ds.states), atol=1e-5)
+
+    res = evaluate_policy(ds, art, FQEConfig(steps=100, seed=0))
+    assert np.isfinite(res.fqe_value)
+
+
 def _categorical_corpus(path, *, episodes: int = 12, windows: int = 8):
     """Corpus where request_mix is categorical: variant 2 is WAF-blocked (mostly
     4xx, low success) and the others are honored. A continuous head would regress
