@@ -799,9 +799,11 @@ int main() {
     const auto a = ExploreLevers(0, cfg);
     Check(a.size() == nfields && a[0] < 0.0, "rl explore: rps (dim 0) never perturbed");
     Check(a[1] >= 1.0 && a[1] <= 16.0, "rl explore: concurrency drawn in [1,16]");
-    Check(a[2] >= 0.0 && a[2] <= 4.0, "rl explore: request_mix drawn in [0,4]");
+    Check(a[2] >= 0.0 && a[2] <= 11.0, "rl explore: request_mix drawn in [0,11]");
     Check(a[3] >= 1.0 && a[3] <= 8.0, "rl explore: source_rotation drawn in [1,8]");
     Check(a[4] >= 1.0 && a[4] <= 3.0, "rl explore: pacing_mode drawn in [1,3]");
+    Check(a[5] >= 0.0 && a[5] <= 2.0, "rl explore: auth_mode drawn in [0,2]");
+    Check(a[6] >= 0.0 && a[6] <= 3.0, "rl explore: evasion_tactic drawn in [0,3]");
 
     // Deterministic: same seed + window => identical draw.
     const auto a2 = ExploreLevers(0, cfg);

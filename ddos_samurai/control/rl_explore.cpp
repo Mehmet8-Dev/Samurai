@@ -56,9 +56,11 @@ RlExploreConfig DefaultExploreConfig(std::uint64_t seed) {
   //   source_rotation client source-identity spread — connection-tracking load.
   //   pacing_mode     1=RPS 2=IPG 3=BURST — burstiness the rate-limiter sees.
   cfg.SetLever("concurrency", 1, 16);
-  cfg.SetLever("request_mix", 0, 4);
+  cfg.SetLever("request_mix", 0, 11);
   cfg.SetLever("source_rotation", 1, 8);
   cfg.SetLever("pacing_mode", 1, 3);
+  cfg.SetLever("auth_mode", 0, 2);
+  cfg.SetLever("evasion_tactic", 0, 3);
   return cfg;
 }
 

@@ -24,7 +24,7 @@ namespace samurai::control {
 // (k=0 is the rps setpoint the shield governs; k>=1 are Mahoraga load-shaping
 // levers set on the job spec). A training ActionSpec must be a prefix of this.
 inline constexpr const char* kActionFields[] = {
-    "rps", "concurrency", "request_mix", "source_rotation", "pacing_mode",
+    "rps", "concurrency", "request_mix", "source_rotation", "pacing_mode", "auth_mode", "evasion_tactic",
 };
 
 // Raw (pre-normalization) state inputs for one window. Fields left < 0 are
