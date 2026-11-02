@@ -86,6 +86,9 @@ struct JobEnvelopeV2 {
   // pad) decode as request_mix=0 / source_rotation=0 = "no shaping".
   std::uint32_t request_mix;                  // L7: request-variant selector (0 = baseline GET /)
   std::uint32_t source_rotation;             // L7: client source-identity spread (0/1 = single)
+  std::uint32_t auth_mode;                   // L7: 0=Anon, 1=Bearer JWT, 2=Cookie
+  std::uint32_t evasion_tactic;              // L7: 0=Normal, 1=Path Traversal, 2=URL Encoded, 3=Header Spoof
+  char auth_payload[128];                   // L7: dynamic json auth payload
 };
 
 struct MetricSnapshotV1 {
@@ -273,7 +276,7 @@ struct TelcoStatsPayload {
 static_assert(sizeof(SamuraiWireHeaderV1) == 56, "SamuraiWireHeaderV1 size mismatch");
 static_assert(sizeof(JobEnvelopeV1) == 480, "JobEnvelopeV1 size mismatch");
 static_assert(sizeof(JobEnvelopeV2) > sizeof(JobEnvelopeV1), "JobEnvelopeV2 must extend V1");
-static_assert(sizeof(JobEnvelopeV2) == 650, "JobEnvelopeV2 size pinned (request_mix/source_rotation reused pad2)");
+static_assert(sizeof(JobEnvelopeV2) == 786, "JobEnvelopeV2 size pinned (request_mix/source_rotation/auth/evasion)");
 static_assert(offsetof(JobEnvelopeV2, base) == 0, "JobEnvelopeV2 must embed V1 at offset 0");
 static_assert(sizeof(MetricSnapshotV1) == 64, "MetricSnapshotV1 size mismatch");
 static_assert(sizeof(FlowUpdateEventV1) == 48, "FlowUpdateEventV1 size mismatch");
