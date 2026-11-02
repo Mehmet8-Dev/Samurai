@@ -124,23 +124,6 @@ bool ReadFileBytes(const std::string& path, std::vector<std::uint8_t>& out, std:
   return true;
 }
 
-std::vector<std::uint8_t> BuildDefaultRequest(const std::string& target_ip,
-                                              const std::string& protocol_lc,
-                                              std::uint32_t request_mix) {
-  const std::string host = target_ip.empty() ? std::string("localhost") : target_ip;
-  if (protocol_lc == "http2" || protocol_lc == "h2") {
-    static constexpr char kH2Preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    return std::vector<std::uint8_t>(kH2Preface, kH2Preface + sizeof(kH2Preface) - 1);
-  }
-  if (protocol_lc == "http1" || protocol_lc == "http" || protocol_lc == "https") {
-    // request_mix selects the request shape; index 0 == "GET /" (prior default).
-    const std::string req = samurai::l7::BuildHttp1Request(request_mix, host);
-    return std::vector<std::uint8_t>(req.begin(), req.end());
-  }
-  static constexpr char kCustomMsg[] = "samurai-l7\n";
-  return std::vector<std::uint8_t>(kCustomMsg, kCustomMsg + sizeof(kCustomMsg) - 1);
-}
-
 // L7 job parameters. Carries the V1 fields plus the V2 stateful-runtime knobs;
 // populated from either envelope version so the worker stays backward compatible.
 struct L7JobParams {
@@ -162,7 +145,43 @@ struct L7JobParams {
   std::uint32_t l7_timeout_ms{5000};
   std::uint32_t request_mix{0};      // Mahoraga: request-variant selector
   std::uint32_t source_rotation{0};  // Mahoraga: client source-identity spread
+  std::uint32_t auth_mode{0};        // Mahoraga: 0=Anon, 1=Bearer JWT, 2=Cookie
+  std::uint32_t evasion_tactic{0};   // Mahoraga: 0=Normal, 1=Path Traversal, 2=URL Encoded, 3=Header Spoof
+  std::string auth_payload;          // Dynamic JSON payload
 };
+
+std::vector<std::uint8_t> BuildDefaultRequest(const std::string& target_ip,
+                                              const std::string& protocol_lc,
+                                              const L7JobParams& params,
+                                              const samurai::l7::SessionContext* session = nullptr) {
+  const std::string host = target_ip.empty() ? std::string("localhost") : target_ip;
+  if (protocol_lc == "http2" || protocol_lc == "h2") {
+    static constexpr char kH2Preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    return std::vector<std::uint8_t>(kH2Preface, kH2Preface + sizeof(kH2Preface) - 1);
+  }
+  if (protocol_lc == "http1" || protocol_lc == "http" || protocol_lc == "https") {
+    // request_mix selects the request shape; index 0 == "GET /" (prior default).
+    samurai::l7::Http1BuildOptions opts;
+    opts.host = host;
+    opts.keep_alive = params.keepalive;
+    opts.auth_payload = params.auth_payload;
+    opts.auth_mode = params.auth_mode;
+    opts.evasion_tactic = params.evasion_tactic;
+    opts.session = session;
+    const std::string req = samurai::l7::BuildHttp1Request(params.request_mix, opts);
+    return std::vector<std::uint8_t>(req.begin(), req.end());
+  }
+  static constexpr char kCustomMsg[] = "samurai-l7\n";
+  return std::vector<std::uint8_t>(kCustomMsg, kCustomMsg + sizeof(kCustomMsg) - 1);
+}
+
+std::vector<std::uint8_t> BuildDefaultRequest(const std::string& target_ip,
+                                              const std::string& protocol_lc,
+                                              std::uint32_t request_mix) {
+  L7JobParams p;
+  p.request_mix = request_mix;
+  return BuildDefaultRequest(target_ip, protocol_lc, p);
+}
 
 L7JobParams ParseL7Job(
     const samurai::wire::SamuraiWireHeaderV1& header,
@@ -195,6 +214,9 @@ L7JobParams ParseL7Job(
     p.l7_timeout_ms = env.l7_timeout_ms > 0u ? env.l7_timeout_ms : 5000u;
     p.request_mix = env.request_mix;
     p.source_rotation = env.source_rotation;
+    p.auth_mode = env.auth_mode;
+    p.evasion_tactic = env.evasion_tactic;
+    p.auth_payload = ReadFixed(env.auth_payload, sizeof(env.auth_payload));
     return p;
   }
   if (payload_len < sizeof(samurai::wire::JobEnvelopeV1)) {
@@ -510,8 +532,8 @@ int main(int argc, char** argv) {
           }
         } else {
           // No explicit payload: synthesize the request the request_mix lever
-          // selects (index 0 == the historical "GET /").
-          request_payload = BuildDefaultRequest(target, raw_protocol_lc, params.request_mix);
+          // selects (index 0 == the historical "GET /") with auth/keepalive/evasion options.
+          request_payload = BuildDefaultRequest(target, raw_protocol_lc, params);
         }
         if (request_payload.empty()) {
           (void)SendFrame(
@@ -716,22 +738,56 @@ int main(int argc, char** argv) {
         std::uint64_t bytes_sent = 0;
         std::uint64_t bytes_recv = 0;
 
+        samurai::l7::SessionContext session_ctx;
+        int persistent_fd = -1;
+
         for (int i = 0; i < request_count; ++i) {
           samurai_pacing_wait_next(&pace_state, &pace_cfg);
 
-          int fd = -1;
-          std::string conn_err;
-          if (!ConnectWithTimeout(target, port, connect_timeout_ms, fd, conn_err)) {
-            packets_errors += 1u;
-          } else {
-            if (!SendAll(fd, request_payload.data(), request_payload.size())) {
+          int fd = persistent_fd;
+          if (fd < 0) {
+            std::string conn_err;
+            if (!ConnectWithTimeout(target, port, connect_timeout_ms, fd, conn_err)) {
               packets_errors += 1u;
-            } else {
-              packets_sent += 1u;
-              bytes_sent += static_cast<std::uint64_t>(request_payload.size());
-              bytes_recv += RecvSome(fd);
+              continue;
             }
+            if (params.keepalive) {
+              persistent_fd = fd;
+            }
+          }
+
+          std::vector<std::uint8_t> current_payload;
+          if (params.has_payload && !params.payload_ref.empty()) {
+            current_payload = request_payload;
+          } else {
+            current_payload = BuildDefaultRequest(target, raw_protocol_lc, params, &session_ctx);
+          }
+
+          if (!SendAll(fd, current_payload.data(), current_payload.size())) {
+            packets_errors += 1u;
             close(fd);
+            if (persistent_fd == fd) persistent_fd = -1;
+          } else {
+            packets_sent += 1u;
+            bytes_sent += static_cast<std::uint64_t>(current_payload.size());
+
+            std::array<char, 4096> resp_buf{};
+            const ssize_t nr = recv(fd, resp_buf.data(), resp_buf.size() - 1, 0);
+            if (nr > 0) {
+              bytes_recv += static_cast<std::uint64_t>(nr);
+              resp_buf[nr] = '\0';
+              std::string resp_str(resp_buf.data(), static_cast<std::size_t>(nr));
+              std::size_t header_end = resp_str.find("\r\n\r\n");
+              if (header_end != std::string::npos) {
+                session_ctx.UpdateFromResponse(resp_str.substr(0, header_end), resp_str.substr(header_end + 4));
+              } else {
+                session_ctx.UpdateFromResponse(resp_str, resp_str);
+              }
+            }
+
+            if (!params.keepalive) {
+              close(fd);
+            }
           }
 
           const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
@@ -757,6 +813,10 @@ int main(int argc, char** argv) {
             last_metric_ns = now_ns;
             last_hb_ns = now_ns;
           }
+        }
+        if (persistent_fd >= 0) {
+          close(persistent_fd);
+          persistent_fd = -1;
         }
 
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
