@@ -51,6 +51,9 @@ struct JobOptions {
   // Mahoraga shaping levers (RL action dims). 0 = baseline / no shaping.
   std::uint32_t request_mix = 0;      // request-variant selector honored by the L7 worker
   std::uint32_t source_rotation = 0;  // client source-identity spread (advisory to the L7 path)
+  std::uint32_t auth_mode = 0;        // 0=Anon, 1=Bearer JWT, 2=Cookie
+  std::uint32_t evasion_tactic = 0;   // 0=Normal, 1=Path Traversal, 2=URL Encoded, 3=Header Spoof
+  std::string auth_payload;           // Dynamic JSON body for login
 };
 
 // Copies a std::string into a fixed-size char buffer, always NUL-terminating and
@@ -104,6 +107,9 @@ inline samurai::wire::JobEnvelopeV2 BuildJobEnvelopeV2(const JobOptions& opt) {
   env.l7_timeout_ms = opt.l7_timeout_ms > 0u ? opt.l7_timeout_ms : 5000u;
   env.request_mix = opt.request_mix;
   env.source_rotation = opt.source_rotation;
+  env.auth_mode = opt.auth_mode;
+  env.evasion_tactic = opt.evasion_tactic;
+  CopyFixed(env.auth_payload, sizeof(env.auth_payload), opt.auth_payload);
   return env;
 }
 
