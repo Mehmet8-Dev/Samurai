@@ -8,12 +8,12 @@
   "benchmark_runs": 3,
   "statistical_metrics": {
     "recovery_latency_seconds": {
-      "mean": 2.359,
-      "median": 2.357,
-      "min": 2.357,
-      "max": 2.364,
-      "stdev": 0.004,
-      "cv_percent": 0.17
+      "mean": 2.36,
+      "median": 2.358,
+      "min": 2.358,
+      "max": 2.363,
+      "stdev": 0.0029,
+      "cv_percent": 0.12
     },
     "aggregate_packets_sent": 10000000,
     "aggregate_errors": 0,
@@ -58,7 +58,7 @@
     ],
     "numeric_totals": {
       "exitcode": 0,
-      "duration_s": 1.207818402997873,
+      "duration_s": 1.2144360879992746,
       "progress": 10000000,
       "sent": 10000000,
       "errors": 0,
@@ -72,7 +72,7 @@
         "sent": 1000000,
         "errors": 0,
         "progress": 1000000,
-        "duration_s_max": 0.12075578299845802,
+        "duration_s_max": 0.12199591599892301,
         "last_status": "ok",
         "last_exitcode": 0,
         "updates": 1
@@ -84,7 +84,7 @@
         "sent": 1000000,
         "errors": 0,
         "progress": 1000000,
-        "duration_s_max": 0.12091327999951318,
+        "duration_s_max": 0.12211131900039618,
         "last_status": "ok",
         "last_exitcode": 0,
         "updates": 1
@@ -96,7 +96,7 @@
         "sent": 1000000,
         "errors": 0,
         "progress": 1000000,
-        "duration_s_max": 0.12076467999941087,
+        "duration_s_max": 0.12135460999888892,
         "last_status": "ok",
         "last_exitcode": 0,
         "updates": 1
@@ -108,7 +108,7 @@
         "sent": 1000000,
         "errors": 0,
         "progress": 1000000,
-        "duration_s_max": 0.1207671140000457,
+        "duration_s_max": 0.12160921500071709,
         "last_status": "ok",
         "last_exitcode": 0,
         "updates": 1
@@ -120,7 +120,7 @@
         "sent": 1000000,
         "errors": 0,
         "progress": 1000000,
-        "duration_s_max": 0.12070412700086308,
+        "duration_s_max": 0.12109585799953493,
         "last_status": "ok",
         "last_exitcode": 0,
         "updates": 1
@@ -132,7 +132,7 @@
         "sent": 1000000,
         "errors": 0,
         "progress": 1000000,
-        "duration_s_max": 0.12076112200156786,
+        "duration_s_max": 0.12075462600114406,
         "last_status": "ok",
         "last_exitcode": 0,
         "updates": 1
@@ -144,7 +144,7 @@
         "sent": 1000000,
         "errors": 0,
         "progress": 1000000,
-        "duration_s_max": 0.12084283500007587,
+        "duration_s_max": 0.12132091099920217,
         "last_status": "ok",
         "last_exitcode": 0,
         "updates": 1
@@ -156,7 +156,7 @@
         "sent": 1000000,
         "errors": 0,
         "progress": 1000000,
-        "duration_s_max": 0.12079042799996387,
+        "duration_s_max": 0.12074009800016938,
         "last_status": "ok",
         "last_exitcode": 0,
         "updates": 1
@@ -168,7 +168,7 @@
         "sent": 1000000,
         "errors": 0,
         "progress": 1000000,
-        "duration_s_max": 0.1207537689988385,
+        "duration_s_max": 0.12076792100015155,
         "last_status": "ok",
         "last_exitcode": 0,
         "updates": 1
@@ -180,7 +180,7 @@
         "sent": 1000000,
         "errors": 0,
         "progress": 1000000,
-        "duration_s_max": 0.12076526499913598,
+        "duration_s_max": 0.12268561400014732,
         "last_status": "ok",
         "last_exitcode": 0,
         "updates": 1
