@@ -66,6 +66,9 @@ JobOptions JobFromArgs(const Value& a) {
   // Mahoraga shaping levers set by the RL policy / exploration schedule.
   j.request_mix = static_cast<std::uint32_t>(std::max<int64_t>(0, IntArg(a, "request_mix", 0)));
   j.source_rotation = static_cast<std::uint32_t>(std::max<int64_t>(0, IntArg(a, "source_rotation", 0)));
+  j.auth_mode = static_cast<std::uint32_t>(std::max<int64_t>(0, IntArg(a, "auth_mode", 0)));
+  j.evasion_tactic = static_cast<std::uint32_t>(std::max<int64_t>(0, IntArg(a, "evasion_tactic", 0)));
+  j.auth_payload = StrArg(a, "auth_payload", "");
   return j;
 }
 }  // namespace
