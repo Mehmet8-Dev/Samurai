@@ -36,6 +36,7 @@
 #include "json.hpp"
 #include "k8s_client.hpp"
 #include "management_api.hpp"
+#include "provisioner.hpp"
 #include "master_adapters.hpp"
 #include "master_coordinator.hpp"
 #include "multimaster.hpp"
@@ -560,6 +561,12 @@ void Usage(const char* argv0) {
       "  --agent-dispatch-mode M   reverse | auto for agents (default reverse)\n"
       "  --agent-insecure-http     allow agent bootstrap on a non-loopback mgmt\n"
       "                            bind (join token + secret sent in cleartext)\n"
+      "  Agent push provisioner (trigger connections to remote nodes):\n"
+      "  --provision-hosts CSV     host[:port] list to trigger over SSH and auto-join\n"
+      "  --provision-ssh-user U    SSH username on target nodes (default root)\n"
+      "  --provision-ssh-key PATH  SSH private key for targets (default system default)\n"
+      "  --provision-worker NAME   worker kind to deploy (default agent-worker)\n"
+      "  --provision-timeout-s N   wait up to N seconds for heartbeat (default 10)\n"
       "  --target-region R         route/delegate this job to region R (region-\n"
       "                            aware shard routing; cross-region delegation)\n"
       "  --ha-mode MODE            static | file-lock | redis (default off)\n"
@@ -1115,10 +1122,71 @@ int main(int argc, char** argv) {
       r.set("aborted", Value::Bool(true));
       return r;
     };
+
+    auto provisioner = std::make_shared<samurai::control::NodeProvisioner>();
+    provisioner->SetWorkerChecker([&servicer](const std::string& host) {
+      for (const auto& w : servicer.SnapshotWorkers()) {
+        if (w.worker_id.find(host) != std::string::npos) return true;
+        auto it = w.capabilities.find("hostname");
+        if (it != w.capabilities.end() && it->second.find(host) != std::string::npos) return true;
+        auto ip_it = w.capabilities.find("ip");
+        if (ip_it != w.capabilities.end() && ip_it->second.find(host) != std::string::npos) return true;
+      }
+      return false;
+    });
+
+    std::string mgmt_h = "127.0.0.1";
+    std::string mgmt_p = "8089";
+    const auto colon = mgmt_listen.rfind(':');
+    if (colon != std::string::npos) {
+      mgmt_h = mgmt_listen.substr(0, colon);
+      mgmt_p = mgmt_listen.substr(colon + 1);
+    }
+    if (mgmt_h.empty() || mgmt_h == "0.0.0.0") mgmt_h = "127.0.0.1";
+    const std::string default_install_url = (tls.enabled ? "https://" : "http://") +
+        mgmt_h + ":" + mgmt_p + "/v1/agent/install?token=" + mcfg.agent_join_token;
+
+    providers.provision_callback = [provisioner, default_install_url, tls_skip = mcfg.agent_tls_skip_verify](
+        const samurai::core::json::Value& b) {
+      return provisioner->ProvisionJson(b, default_install_url, tls_skip);
+    };
+
     mgmt = std::make_unique<ManagementApiServer>(mgmt_listen, mcfg, providers, tls);
     if (mgmt->Start()) {
       std::printf("samurai_master: management api on %s (%s)\n", mgmt->endpoint().c_str(),
                   tls.enabled ? "https" : "http");
+
+      const std::string prov_hosts = Opt(argc, argv, "--provision-hosts", "");
+      const std::string prov_user = Opt(argc, argv, "--provision-ssh-user", "root");
+      const std::string prov_key = Opt(argc, argv, "--provision-ssh-key", "");
+      const std::string prov_worker =
+          Opt(argc, argv, "--provision-worker", mcfg.agent_worker.empty() ? "cpu" : mcfg.agent_worker);
+      const int prov_timeout_s = static_cast<int>(OptInt(argc, argv, "--provision-timeout-s", 10));
+
+      if (!prov_hosts.empty()) {
+        if (mcfg.agent_join_token.empty()) {
+          std::fprintf(stderr,
+                       "samurai_master: --provision-hosts requires --agent-join-token to be set\n");
+        } else {
+          std::printf("samurai_master: provisioning remote nodes via SSH trigger (%s)...\n",
+                      prov_hosts.c_str());
+          Value req = Value::Object();
+          req.set("hosts", Value::Str(prov_hosts));
+          req.set("ssh_user", Value::Str(prov_user));
+          req.set("ssh_key_path", Value::Str(prov_key));
+          req.set("worker_kind", Value::Str(prov_worker));
+          req.set("timeout_s", Value::Int(prov_timeout_s));
+
+          Value res =
+              provisioner->ProvisionJson(req, default_install_url, mcfg.agent_tls_skip_verify);
+          std::int64_t total = res.find("total") ? res.find("total")->as_int(0) : 0;
+          std::int64_t triggered = res.find("triggered") ? res.find("triggered")->as_int(0) : 0;
+          std::int64_t joined = res.find("joined") ? res.find("joined")->as_int(0) : 0;
+          std::printf(
+              "samurai_master: provisioning results: %ld total, %ld triggered, %ld joined cluster\n",
+              static_cast<long>(total), static_cast<long>(triggered), static_cast<long>(joined));
+        }
+      }
     } else {
       std::fprintf(stderr, "samurai_master: failed to start management api%s\n",
                    tls.enabled ? " (TLS cert/key load or self-signed generation failed)" : "");

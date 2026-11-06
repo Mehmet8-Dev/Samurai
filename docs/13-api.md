@@ -13,6 +13,10 @@ Master düğümünde `--management-listen` parametresi verildiğinde devreye gir
 | `GET` | `/v1/cluster/workers` | Kayıtlı tüm worker'ların detaylı listesi ve son heartbeat zamanları. |
 | `GET` | `/v1/cluster/shards` | Çalışan veya tamamlanan iş parçalarının (shards) durumu. |
 | `POST` | `/v1/jobs/abort` | Yürütülmekte olan aktif test/saldırı işini anında durdurma. |
+| `POST` | `/v1/cluster/provision` | Uzak sunuculara SSH ile tetikleme bağlantısı atarak (`curl \| sh`) otomatik agent provizyonu. |
+| `GET` | `/v1/agent/install` | Zero-Install ajan kurulum kabuk (POSIX sh) betiği. |
+| `GET` | `/v1/agent/manifest` | HMAC-SHA256 imzalı worker manifest dosyası. |
+| `GET` | `/v1/agent/blob` | İmzalı ikili blob indirme uç noktası. |
 | `GET` | `/metrics` | Prometheus uyumlu ham metrik çıktısı. |
 | `GET` | `/v1/cluster/live/sse` | Server-Sent Events (SSE) ile canlı küme durumu akışı. |
 | `GET` | `/v1/cluster/live/ws` | WebSocket ile canlı durum akışı. |

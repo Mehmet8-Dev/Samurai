@@ -47,6 +47,7 @@
 #include "jwt.hpp"
 #include "k8s_client.hpp"
 #include "management_api.hpp"
+#include "provisioner.hpp"
 #include "master_coordinator.hpp"
 #include "multimaster.hpp"
 #include "redis_kvstore.hpp"
@@ -1705,6 +1706,101 @@ int main() {
     Check(blocked.status == 429, "ratelimit: req 4 throttled with 429");
     Check(blocked.body.find("rate_limited") != std::string::npos, "ratelimit: error reason indicates rate_limited");
     Check(rl_api.Handle(r_other).status == 200, "ratelimit: different client allowed independently");
+  }
+
+  // --- provisioner: endpoint parsing, command generation, and agent push ---
+  {
+    using namespace samurai::control;
+    namespace json = samurai::core::json;
+
+    // 1. Endpoint parsing
+    HostEndpoint ep1 = HostEndpoint::Parse("198.51.100.20:2222");
+    Check(ep1.host == "198.51.100.20" && ep1.port == 2222, "provisioner: host endpoint with port");
+    HostEndpoint ep2 = HostEndpoint::Parse("node1.internal");
+    Check(ep2.host == "node1.internal" && ep2.port == 22, "provisioner: host endpoint default port 22");
+    HostEndpoint ep3 = HostEndpoint::Parse("  10.0.0.5:8022  ");
+    Check(ep3.host == "10.0.0.5" && ep3.port == 8022, "provisioner: trimmed endpoint");
+
+    // 2. Install command builder
+    std::string cmd1 = BuildRemoteInstallCmd("http://127.0.0.1:8089/v1/agent/install?token=SECRET", false);
+    Check(cmd1.find("curl -fsSL ") != std::string::npos && cmd1.find("nohup") != std::string::npos,
+          "provisioner: install command http");
+    std::string cmd2 = BuildRemoteInstallCmd("https://127.0.0.1:8443/v1/agent/install?token=SECRET", true);
+    Check(cmd2.find("curl -fsSLk ") != std::string::npos,
+          "provisioner: install command https with skip verify");
+
+    // 3. Mock SSH executor & worker checker
+    std::vector<std::string> executed_hosts;
+    std::set<std::string> joined_hosts;
+    auto mock_exec = [&](const std::string& host, int port, const std::string& user,
+                         const std::string& key_path, const std::string& remote_cmd,
+                         std::string& err) -> int {
+      (void)port; (void)user; (void)key_path; (void)remote_cmd; (void)err;
+      executed_hosts.push_back(host);
+      joined_hosts.insert(host);  // simulate immediate join
+      return 0;
+    };
+    auto mock_check = [&](const std::string& host) -> bool {
+      return joined_hosts.count(host) > 0;
+    };
+
+    NodeProvisioner prov(mock_exec, mock_check);
+    json::Value req_body = json::Value::Object();
+    json::Value hosts_arr = json::Value::Array();
+    hosts_arr.push_back(json::Value::Str("198.51.100.20:22"));
+    hosts_arr.push_back(json::Value::Str("198.51.100.21"));
+    req_body.set("hosts", hosts_arr);
+    req_body.set("ssh_user", json::Value::Str("ubuntu"));
+    req_body.set("ssh_key_path", json::Value::Str("/etc/samurai/key"));
+    req_body.set("worker_kind", json::Value::Str("cpu"));
+    req_body.set("timeout_s", json::Value::Int(1));
+
+    json::Value res = prov.ProvisionJson(req_body, "http://127.0.0.1:8089/v1/agent/install?token=SEC");
+    Check(res.find("status") && res.find("status")->as_string() == "ok", "provisioner: provision status ok");
+    Check(res.find("total") && res.find("total")->as_int() == 2, "provisioner: total targets count");
+    Check(res.find("triggered") && res.find("triggered")->as_int() == 2, "provisioner: triggered count");
+    Check(res.find("joined") && res.find("joined")->as_int() == 2, "provisioner: joined count");
+    Check(executed_hosts.size() == 2, "provisioner: executed on both hosts");
+
+    // 4. REST API endpoint /v1/cluster/provision
+    ManagementConfig mcfg;
+    mcfg.role_tokens["admin"] = "ADMINTKN";
+    mcfg.role_tokens["viewer"] = "VIEWTKN";
+    mcfg.agent_join_token = "JOINTOKEN";
+
+    ManagementProviders providers;
+    bool callback_called = false;
+    providers.provision_callback = [&](const json::Value& body) {
+      callback_called = true;
+      return prov.ProvisionJson(body, "http://127.0.0.1:8089/v1/agent/install?token=JOINTOKEN");
+    };
+
+    ManagementApi api(mcfg, providers);
+
+    // POST /v1/cluster/provision with admin token
+    HttpRequest prov_req;
+    prov_req.method = "POST";
+    prov_req.path = "/v1/cluster/provision";
+    prov_req.headers["authorization"] = "Bearer ADMINTKN";
+    prov_req.body = req_body.dump();
+
+    HttpResponse prov_resp = api.Handle(prov_req);
+    Check(prov_resp.status == 200, "mgmt: /v1/cluster/provision returns 200 for admin");
+    Check(callback_called, "mgmt: /v1/cluster/provision triggered callback");
+    Check(prov_resp.body.find("\"joined\":2") != std::string::npos, "mgmt: /v1/cluster/provision returned joined count");
+
+    // POST with viewer token should be forbidden (403)
+    HttpRequest view_req = prov_req;
+    view_req.headers["authorization"] = "Bearer VIEWTKN";
+    HttpResponse view_resp = api.Handle(view_req);
+    Check(view_resp.status == 403, "mgmt: /v1/cluster/provision forbidden for viewer");
+
+    // POST without agent join token configured
+    ManagementConfig no_join_cfg = mcfg;
+    no_join_cfg.agent_join_token = "";
+    ManagementApi no_join_api(no_join_cfg, providers);
+    HttpResponse no_join_resp = no_join_api.Handle(prov_req);
+    Check(no_join_resp.status == 400, "mgmt: /v1/cluster/provision requires agent_join_token");
   }
 
   // --- master: coordinator only dispatches shards to matching worker kinds ---

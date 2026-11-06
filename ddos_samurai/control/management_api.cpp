@@ -437,6 +437,14 @@ bool ParseHttpRequest(const std::string& raw, HttpRequest& out) {
     if (next == std::string::npos) break;
     pos = next + 2;
   }
+
+  // Extract body if present
+  const auto head_end = raw.find("\r\n\r\n");
+  if (head_end != std::string::npos) {
+    out.body = raw.substr(head_end + 4);
+  } else {
+    out.body.clear();
+  }
   return true;
 }
 
@@ -609,6 +617,26 @@ HttpResponse ManagementApi::Handle(const HttpRequest& req) const {
       res.set("aborted", Value::Bool(false));
     }
     return JsonResp(200, "OK", res);
+  }
+
+  if (is_post && req.path == "/v1/cluster/provision") {
+    if (auto e = guard({"admin", "operator"})) return *e;
+    std::string tenant;
+    if (auto e = effective_tenant(&tenant)) return *e;
+    if (cfg_.agent_join_token.empty()) {
+      return ErrResp(400, "Bad Request", "agent_join_token_not_configured");
+    }
+    samurai::core::json::ParseResult parsed =
+        samurai::core::json::Parse(req.body.empty() ? "{}" : req.body);
+    if (!parsed.ok || !parsed.value.is_object()) {
+      return ErrResp(400, "Bad Request", "invalid_json_body");
+    }
+    Value json_body = std::move(parsed.value);
+    if (providers_.provision_callback) {
+      Value res = providers_.provision_callback(json_body);
+      return JsonResp(200, "OK", res);
+    }
+    return ErrResp(501, "Not Implemented", "provision_callback_not_set");
   }
 
   // Read endpoints (viewer+).
@@ -831,15 +859,31 @@ void ManagementApiServer::Loop() {
     // Read the request head (until CRLFCRLF), capped.
     std::string buf;
     char chunk[4096];
-    while (buf.find("\r\n\r\n") == std::string::npos && buf.size() < 64 * 1024) {
+    std::size_t head_end = std::string::npos;
+    while (head_end == std::string::npos && buf.size() < 64 * 1024) {
       const ssize_t n = readb(chunk, sizeof(chunk));
       if (n <= 0) break;
       buf.append(chunk, static_cast<std::size_t>(n));
+      head_end = buf.find("\r\n\r\n");
     }
 
     HttpRequest req;
     HttpResponse resp;
-    if (ParseHttpRequest(buf, req)) {
+    if (head_end != std::string::npos && ParseHttpRequest(buf, req)) {
+      auto cl_it = req.headers.find("content-length");
+      if (cl_it != req.headers.end()) {
+        long cl = std::strtol(cl_it->second.c_str(), nullptr, 10);
+        if (cl > 0 && cl < 1024 * 1024) {
+          std::size_t body_already = buf.size() - (head_end + 4);
+          while (body_already < static_cast<std::size_t>(cl) && buf.size() < 1024 * 1024) {
+            const ssize_t n = readb(chunk, sizeof(chunk));
+            if (n <= 0) break;
+            buf.append(chunk, static_cast<std::size_t>(n));
+            body_already = buf.size() - (head_end + 4);
+          }
+          req.body = buf.substr(head_end + 4, static_cast<std::size_t>(cl));
+        }
+      }
       char ip_str[INET_ADDRSTRLEN] = {0};
       if (inet_ntop(AF_INET, &peer.sin_addr, ip_str, sizeof(ip_str))) {
         req.client_ip = ip_str;

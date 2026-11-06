@@ -28,6 +28,7 @@ struct HttpRequest {
   std::map<std::string, std::string> query;    // decoded query params
   std::map<std::string, std::string> headers;  // lower-cased keys
   std::string client_ip;                       // client IP address for rate limiting
+  std::string body;                            // HTTP request body
 };
 
 struct HttpResponse {
@@ -81,6 +82,7 @@ struct ManagementProviders {
   std::function<samurai::core::json::Value()> state_provider;
   std::function<samurai::core::json::Value()> abort_callback;
   std::function<std::string()> metrics_provider;  // may be empty
+  std::function<samurai::core::json::Value(const samurai::core::json::Value&)> provision_callback;  // node trigger/provision
 };
 
 class RateLimiter {

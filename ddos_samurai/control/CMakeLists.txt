@@ -56,6 +56,7 @@ set(CONTROL_SOURCES
   master_coordinator.cpp
   ha.cpp
   audit_log.cpp
+  provisioner.cpp
   management_api.cpp)
 
 if(LIBZMQ_FOUND)
