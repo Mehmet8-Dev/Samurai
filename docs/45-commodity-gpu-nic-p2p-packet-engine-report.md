@@ -7,6 +7,8 @@
 
 ---
 
+![Samurai GPU-NIC P2P Zero-Copy Dataplane Architecture](assets/diagrams/samurai_gpu_p2p_dataplane.svg)
+
 ## 1. Yönetici Özeti ve Vizyon
 
 Kullanıcının nihai hedefi; pahalı kurumsal veri merkezi donanımlarına (NVIDIA A100/H100 + ConnectX DPU / DOCA GPUNetIO lisansları) mahkûm kalmadan, **tüketici sınıfı (GeForce GTX 1650, RTX 30/40 serisi) GPU'ların binlerce CUDA çekirdeğini kullanarak tel hızında (wire-rate) paket üretmek ve bu paketleri CPU ana belleğine (RAM) hiç uğratmadan doğrudan ağ kartına (NIC) basan sıfır kopyalı (Zero-Copy P2P DMA) bir paket motoru mimarisi kurmaktır.**

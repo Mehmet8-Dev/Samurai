@@ -1,135 +1,108 @@
-# 18 - AF_PACKET HugePage Policy
+# 18 - AF_PACKET & HugePage Policy Reference
 
-Bu dokuman AF_PACKET/TX_RING yolunda explicit HugePage policy davranisini, telemetry alanlarini ve KPI gate etkisini tek yerde toplar.
+This document details the memory allocation policies, Transparent HugePages (THP) enforcement, telemetry instrumentation, and KPI gate criteria for the high-speed packet ring engine.
 
-## Kapsam ve Sinir
+![Samurai NUMA Topology & Kernel-Bypass Memory Architecture](assets/diagrams/samurai_numa_afxdp_dpdk.svg)
 
-- Kapsam: `AF_PACKET + THP enforce` (TX_RING icinde policy + telemetry + gate).
-- Not: AF_PACKET ring bellegi kernel tarafinda ayrilir. Bu nedenle `MAP_HUGETLB` benzeri "mutlak hugetlb garantisi" bu yol icin teknik olarak sinirlidir.
-- Sonuc: Buradaki politika, "enforce edilebilir hugepage policy" saglar; tam hugetlb garantisi gerektiren senaryoda XDP/DPDK ayri yol olarak degerlendirilmelidir.
+---
 
-## Mode Semantigi
+## 1. Scope & Architectural Boundaries
 
-- `off`: HugePage policy kapali, geriye uyumlu davranis.
-- `auto`: Best-effort policy. `madvise(MADV_HUGEPAGE)` + opsiyonel `mlock/prefault` uygulanir, basarisizlik run'i durdurmaz.
-- `required`: TX_RING kurulumundan sonra `afpacket_hugepage_effective != 1` ise fail-visible olur.
+- **Primary Scope:** `AF_PACKET / TX_RING + THP enforcement` (ring allocation, memory locking, telemetry, and gate verification).
+- **Kernel Memory Constraints:** Standard AF_PACKET ring memory is allocated inside the Linux kernel. Therefore, direct userspace `MAP_HUGETLB` guarantees are constrained by kernel memory layout.
+- **Engineering Principle:** This policy provides rigorous, verifiable hugepage backing. For guaranteed zero-copy and complete hugepage isolation, AF_XDP (`samurai_afxdp_worker`) or DPDK PMD (`samurai_dpdk_worker`) must be utilized.
 
-## Dedicated Profil Davranisi
+---
 
-`--lab-profile dedicated` ve TX_RING yolu birlikte secildiginde:
+## 2. HugePage Allocation Modes
 
-- `afpacket_hugepage_mode` otomatik `required` olur.
-- KPI gate tarafinda hugepage kosulu fail kapisina girer.
-- Hard-fail aciksa (`--kpi-hard-fail`) run non-zero exit ile biter.
+- `off`: HugePage enforcement disabled; standard 4 KB page allocations.
+- `auto`: Best-effort policy. Applies `madvise(MADV_HUGEPAGE)` and optional page prefaulting (`mlock`); allocation failure does not abort execution.
+- `required`: Strict enforcement. If `afpacket_hugepage_effective != 1` after TX_RING allocation, the test is aborted with a critical failure.
 
-## CLI Bayraklari
+---
 
-- `--afpacket-hugepage-mode {off,auto,required}`
-- `--afpacket-hugepage-size-kb <int>` (varsayilan: `2048`)
-- `--afpacket-ring-target-mb <int>` (varsayilan: `64`)
-- `--afpacket-block-size-kb <int>` (varsayilan: `0`, auto)
-- `--afpacket-frame-size <int>` (varsayilan: `0`, auto)
-- `--afpacket-frames-per-block <int>` (varsayilan: `64`)
-- `--afpacket-poll-timeout-ms <int>` (varsayilan: `1`)
-- `--afpacket-spin-limit <int>` (varsayilan: `2000`)
-- `--afpacket-busy-poll-us <int>` (varsayilan: `0`)
-- `--afpacket-qdisc-bypass` / `--no-afpacket-qdisc-bypass`
-- `--afpacket-mlock-ring` / `--no-afpacket-mlock-ring`
-- `--afpacket-prefault-ring` / `--no-afpacket-prefault-ring`
+## 3. Dedicated Lab Profile Semantics
 
-## Ortam Degiskenleri
+When running under `--lab-profile dedicated`:
+- `afpacket_hugepage_mode` automatically defaults to `required`.
+- The KPI performance gate checks that hugepages are active and backing the packet buffer rings.
+- If `--kpi-hard-fail` is enabled, the CLI exits immediately with a non-zero status code if hugepage backing is unavailable.
 
-- `SAMURAI_AF_PACKET_HUGEPAGE_MODE`
-- `SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB`
-- `SAMURAI_AF_PACKET_RING_TARGET_MB`
-- `SAMURAI_AF_PACKET_BLOCK_SIZE_KB`
-- `SAMURAI_AF_PACKET_FRAME_SIZE`
-- `SAMURAI_AF_PACKET_FRAMES_PER_BLOCK`
-- `SAMURAI_AF_PACKET_POLL_TIMEOUT_MS`
-- `SAMURAI_AF_PACKET_SPIN_LIMIT`
-- `SAMURAI_AF_PACKET_BUSY_POLL_US`
-- `SAMURAI_AF_PACKET_QDISC_BYPASS`
-- `SAMURAI_AF_PACKET_MLOCK_RING`
-- `SAMURAI_AF_PACKET_PREFAULT_RING`
+---
 
-## Ring Tuning Notlari
+## 4. CLI Configuration Options
 
-- Ring geometrisi: `frame_size`, `frames_per_block`, `block_size`, `block_nr`.
-- Auto modda geometri paket boyuna gore hizalama/pow2 kurallariyla secilir.
-- `poll_timeout_ms` + `spin_limit` TX frame bekleme stratejisini belirler.
-- `busy_poll_us` ve `qdisc_bypass` best-effort kernel tuning knob'laridir.
-- `tp_retire_blk_tov` TX_RING icin RX-ozel bir alan oldugu icin sifir tutulur.
+| Flag | Default | Description |
+| :--- | :---: | :--- |
+| `--afpacket-hugepage-mode {off,auto,required}` | `auto` | Enforces HugePage policy for memory ring buffers. |
+| `--afpacket-hugepage-size-kb <int>` | `2048` | Target hugepage size (e.g., 2048 KB or 1048576 KB). |
+| `--afpacket-ring-target-mb <int>` | `64` | Desired total ring buffer allocation size in megabytes. |
+| `--afpacket-block-size-kb <int>` | `0` | Ring block size in KB (0 = autodetect power of 2). |
+| `--afpacket-frame-size <int>` | `0` | Per-packet frame size (0 = auto-aligned). |
+| `--afpacket-frames-per-block <int>` | `64` | Number of packet frames contained per memory block. |
+| `--afpacket-poll-timeout-ms <int>` | `1` | Blocking timeout for kernel transmission drain. |
+| `--afpacket-spin-limit <int>` | `2000` | Busy-wait spin iterations before sleeping. |
+| `--afpacket-busy-poll-us <int>` | `0` | Low-latency socket polling duration in microseconds. |
+| `--afpacket-qdisc-bypass` | Enabled | Directly bypass Linux queueing discipline (`PACKET_QDISC_BYPASS`). |
+| `--afpacket-mlock-ring` | Enabled | Lock ring buffers into physical RAM via `mlockall()`. |
+| `--afpacket-prefault-ring` | Enabled | Prefault pages into CPU cache before starting traffic. |
 
-## Runtime Telemetry Alanlari
+---
 
-Run report / metrics tarafinda beklenen temel alanlar:
+## 5. Ring Geometry & Tuning Mechanics
 
-- `afpacket_hugepage_mode`
-- `afpacket_hugepage_effective`
-- `afpacket_hugepage_reason`
-- `afpacket_hugepage_size_kb`
-- `afpacket_madvise_hugepage_ok`
-- `afpacket_mlock_ok`
-- `afpacket_prefault_pages`
-- `afpacket_smaps_kernel_page_kb`
-- `afpacket_smaps_anon_hugepages_kb`
-- `afpacket_ring_block_size`
-- `afpacket_ring_block_nr`
-- `afpacket_ring_size_bytes`
+- **Ring Geometry Calculation:** `frame_size`, `frames_per_block`, `block_size`, and `block_nr`.
+- **Power of Two Alignment:** Memory block sizes must strictly align with hardware page size multiples (2 MB or 4 KB) to avoid kernel memory fragmentation.
+- **Qdisc Bypass:** When enabled, the kernel skips packet scheduling qdiscs, injecting packets directly to the NIC driver TX ring for maximum line-rate throughput.
 
-## KPI Gate Baglantisi
+---
 
-Gate motoru TX_RING scope icinde su kosulu uygular:
+## 6. Runtime Telemetry & Observability Fields
 
-- `afpacket_hugepage_effective == 1`
+The performance report and Prometheus exporter publish the following metrics:
 
-Profile davranisi:
-
-- `dedicated_lab`: fail/hard-fail politikasi uygulanir.
-- `developer_fallback`: ihlal raporlanir; hard-fail zorunlu degildir.
-
-## Ornek Komutlar
-
-### Developer fallback (warn/observe)
-
-```bash
-python -m ddos_samurai.cli \
-  --target 127.0.0.1 --port 80 --protocol tcp \
-  --attack-vector basic --count 100000 --confirm \
-  --sender-backend txring --sender-fallback-policy allow \
-  --afpacket-hugepage-mode auto \
-  --run-report --run-report-out artifacts/live_run_hp_auto
+```json
+{
+  "afpacket_hugepage_mode": "required",
+  "afpacket_hugepage_effective": 1,
+  "afpacket_hugepage_size_kb": 2048,
+  "afpacket_madvise_hugepage_ok": true,
+  "afpacket_mlock_ok": true,
+  "afpacket_prefault_pages": 32768,
+  "afpacket_ring_block_size": 2097152,
+  "afpacket_ring_block_nr": 32,
+  "afpacket_ring_size_bytes": 67108864
+}
 ```
 
-### Dedicated strict (hard gate)
+---
 
+## 7. Execution Examples
+
+### Standard Verification Run
 ```bash
-python -m ddos_samurai.cli \
-  --target 192.168.1.10 --port 80 --protocol tcp \
-  --attack-vector basic --count 1000000 --confirm \
+./build/ddos_samurai/cli/samurai \
+  --worker cpu \
+  --target 127.0.0.1 \
+  --port 80 \
+  --protocol tcp \
+  --count 100000 \
+  --confirm \
+  --afpacket-hugepage-mode auto
+```
+
+### Dedicated Lab Strict Production Run
+```bash
+./build/ddos_samurai/cli/samurai \
+  --worker cpu \
+  --target 192.168.1.50 \
+  --port 443 \
+  --protocol tcp \
+  --count 10000000 \
+  --confirm \
   --lab-profile dedicated \
-  --sender-backend txring --sender-fallback-policy fail \
-  --kpi-gate-profile dedicated_lab --kpi-hard-fail \
-  --afpacket-hugepage-mode required \
-  --run-report --run-report-out artifacts/live_run_hp_required
+  --kpi-gate-profile dedicated_lab \
+  --kpi-hard-fail \
+  --afpacket-hugepage-mode required
 ```
-
-## Hata Tanilama Ozeti
-
-Belirti:
-
-- `sender_fallback_reason=afpacket_hugepage_required_not_met`
-
-Bakilacak alanlar:
-
-- `afpacket_hugepage_effective`
-- `afpacket_hugepage_reason`
-- `afpacket_smaps_kernel_page_kb`
-- `afpacket_smaps_anon_hugepages_kb`
-- `sender_paths_used` (gercekten TX_RING mi?)
-
-Ilgili dokumanlar:
-
-- `docs/01-cli.md`
-- `docs/08-config.md`
-- `docs/10-troubleshooting.md`

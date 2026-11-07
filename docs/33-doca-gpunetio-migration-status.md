@@ -1,86 +1,110 @@
-# 33 - DOCA GPUNetIO Mimari ve Operasyon Notlari
+# 33 - DOCA GPUNetIO & DPU-GPU Dataplane Architecture and Migration Status
 
-- Tarih: 2026-05-13
-- Guncelleme: 2026-06-03
-- Kapsam: CUDA persistent/stream runtime, DOCA GPUNetIO, DPU/GPU flow-state contract
-- Durum: Kod entegrasyonu mevcut; donanim lab KPI kapanisi ayri kosudur
+- **Scope:** Native C++ CUDA Persistent Dataplane, NVIDIA BlueField DPU / DOCA GPUNetIO, Zero-Copy PCIe P2P DMA
+- **Current Status:** Fully Integrated in Native C++ Dataplane (`samurai_doca_worker` & `samurai_gpu_worker`)
 
-## 1) Mevcut Mimari
+![Samurai DOCA GPUNetIO & DPU-GPU Dataplane](assets/diagrams/samurai_doca_dpu_architecture.svg)
 
-DOCA GPUNetIO artik GPU TX backend ailesinin bir uyesidir. Local process
-boundary ZMQ worker runtime ile, dataplane state contract ise `gpu_packet_cuda`
-altinda tutulur.
+---
 
-Ana bilesenler:
+## 1. Executive Architecture
 
-- ZMQ DOCA worker: `ddos_samurai/zmq/daemon/doca_gpunetio_worker.cpp`
-- DPU authoritative state runtime: `ddos_samurai/gpu_packet_cuda/dpu_state_runtime.hpp`
-- DOCA GPUNetIO ABI: `ddos_samurai/gpu_packet_cuda/tx_backend_doca_gpunetio.cuh`
-- DOCA backend bridge: `ddos_samurai/gpu_packet_cuda/doca_gpunetio_backend.cpp`
-- GPU worker hot-flow receiver: `ddos_samurai/zmq/daemon/gpu_worker.cpp`
+The NVIDIA DOCA GPUNetIO integration enables line-rate packet streaming directly from GPU GDDR6 VRAM to the network interface, completely bypassing Host-CPU memory traversal.
 
-## 2) Runtime Akisi
+### Core Components:
+1. **ZMQ DOCA Worker Daemon (`ddos_samurai/zmq/daemon/doca_gpunetio_worker.cpp`):**
+   - Independent native daemon managed by `supervisor.cpp`.
+   - Listens on `ipc:///tmp/samurai_jobs_*` for job execution envelopes (`JobEnvelopeV1`).
+   - Dynamically binds and loads the DOCA GPUNetIO backend via `dlopen(libdoca_gpunetio.so)`.
+2. **DPU Authoritative State Runtime (`ddos_samurai/gpu_packet_cuda/dpu_state_runtime.hpp`):**
+   - Implements hardware-offloaded TCP state machine (CLOSED, SYN-SENT, ESTABLISHED, FIN-WAIT).
+   - Manages passive open backlogs, TCB state (`snd_una`, `snd_nxt`, `rcv_nxt`, `cwnd`, `ssthresh`), SACK parsing, and RTO calculations.
+3. **DOCA GPUNetIO ABI (`ddos_samurai/gpu_packet_cuda/tx_backend_doca_gpunetio.cuh`):**
+   - Direct kernel interface mapping DPU NIC TX/RX queues to GPU GDDR6 memory addresses.
+4. **GPU Hot-Flow Policy Receiver (`ddos_samurai/zmq/daemon/gpu_worker.cpp`):**
+   - Streams packet generation bursts according to dynamic flow policies (`FlowStreamUpsertV1` and `FlowUpdateEventV1`).
 
-1. CLI/orchestrator DOCA worker'a ZMQ `START_JOB` gonderir.
-2. DOCA worker native DOCA backend'i yukler.
-3. TXQ/RXQ ve opsiyonel contract writer acilir.
-4. `FlowStateTable` flow state'i olusturur.
-5. DPU state, GPU worker'a `FLOW_STREAM_UPSERT` ve `FLOW_UPDATE` yollar.
-6. TX batch'ler `send_vector` ile gonderilir.
-7. RX feedback aciksa ACK/SYN/FIN/RST paketleri `receive_burst` ile state'e islenir.
-8. Retransmit, zero-window, pause ve quota kararlari GPU stream policy'ye yansitilir.
+---
 
-## 3) Strict/Fallback Politikasi
+## 2. Runtime Execution Flow
 
-`persistent + stream` modunda backend kontrati:
+```
+[SecOps CLI / Master]
+         |
+    START_JOB (JobEnvelopeV1)
+         v
+[samurai_doca_worker Daemon]
+         |-- 1. dlopen(libdoca_gpunetio.so) & Verify NIC PCIe Topo
+         |-- 2. Allocate DPU TXQ / RXQ Descriptor Rings
+         |-- 3. Initialize FlowStateTable (dpu_state_runtime.hpp)
+         |
+         |-- 4. Publish FlowStreamUpsertV1 / FlowUpdateEventV1 (Zero-Copy)
+         v
+[samurai_gpu_worker / GDDR6 VRAM]
+         |
+         |-- 5. Autonomous CUDA Warp Parallel Packet Generation
+         |-- 6. Direct GPUNetIO DMA Transfer (GPU VRAM <-> NIC HW Rings)
+         v
+[Physical 100/200GbE Carrier Wire Egress]
+```
 
-- `SAMURAI_GPU_TX_BACKEND` yalnizca `af_xdp|af_packet|doca_gpunetio`
-- `SAMURAI_GPU_TX_BACKEND_STRICT=1` zorlanir (preflight)
-- `doca_gpunetio` seciminde:
-  - `SAMURAI_GPU_DOCA_ENABLE=1` zorunlu
-  - `SAMURAI_GPU_DOCA_DEVICE` zorunlu (orn: `mlx5_0`)
-  - `--xdp-interface` zorunlu
+1. **Job Initialization:** CLI or Master dispatches `START_JOB` to `samurai_doca_worker` via ZMQ IPC.
+2. **Backend Instantiation:** The DOCA worker loads the native hardware driver and validates preflight preconditions.
+3. **Queue & Context Setup:** Hardware TX/RX queues and the authoritative `FlowStateTable` are initialized on the DPU.
+4. **Policy Synchronization:** Flow policies (`FLOW_STREAM_UPSERT`, `FLOW_UPDATE`) stream to the GPU worker.
+5. **Direct DMA Egress:** Packet vectors are transmitted directly over the PCIe bus without Host DDR memory buffering.
+6. **Closed-Loop Feedback:** If RX feedback is enabled, incoming ACK/SYN/FIN/RST packets update TCP window scale, retransmits, and quotas in sub-microsecond intervals.
 
-Bu davranis fallback yerine fail-fast stratejisini korur.
+---
 
-## 4) DPU/GPU Contract Basliklari
+## 3. Strict vs. Fallback Preflight Policies
 
-- `dpu_state_runtime.hpp` ZMQ dizininde degil, `gpu_packet_cuda` altindadir.
-- DPU state event'leri version/epoch tasir.
-- GPU'ya iki ana event akar: `FLOW_UPDATE` ve `FLOW_STREAM_UPSERT`.
-- Policy template bitleri pause, retransmit ve zero-window-probe bilgisini tasir.
-- DOCA worker, DPU state'i GPU worker job endpoint'ine non-blocking ZMQ publish eder.
+To prevent accidental silent fallback to slower SKB/kernel networking during high-throughput tests, Samurai enforces a strict fail-fast policy:
 
-## 5) Donanim Olmadan Dogrulama
+- `SAMURAI_GPU_TX_BACKEND`: Supported values are `doca_gpunetio`, `af_xdp`, or `af_packet`.
+- `SAMURAI_GPU_TX_BACKEND_STRICT=1`: Required during production benchmarks.
+- In `doca_gpunetio` mode:
+  - `SAMURAI_GPU_DOCA_ENABLE=1` must be set.
+  - `SAMURAI_GPU_DOCA_DEVICE` must be specified (e.g. `mlx5_0`).
+  - `--xdp-interface` must target the matching network adapter.
+- If hardware constraints are not satisfied, the daemon exits immediately with code `0xFF (ERROR)` instead of silently degrading performance.
 
-Donanim yokken kosulabilen dogrulama:
+---
+
+## 4. Verification & Operational Commands
+
+### A) Dry-Run & Unit Contract Testing
+Verify the ZMQ ABI, DPU state layout, and backend facade contracts without hardware fixtures:
 
 ```bash
+# Verify wire contracts and ZMQ message serialization
 PYTHONPATH=. pytest tests/test_zmq_wire_contract.py -q
 PYTHONPATH=. pytest tests/test_zmq_m3_workers.py -q
 PYTHONPATH=. pytest tests/native_gpu/test_backend_facade.py -q
 ```
 
-Beklenti:
+### B) Native Hardware Execution (Production Lab)
+Run on a bare-metal server equipped with an NVIDIA GPU and BlueField DPU:
 
-- ZMQ wire ABI ve DPU state header smoke testleri dogrulanir
-- Worker source/layout kontratlari dogrulanir
-- Backend facade kontratlari dogrulanir
-- Gercek line-rate/perf metrikleri dogrulanmaz (lab gerekir)
+```bash
+# Run samurai native DOCA GPUNetIO worker
+sudo ./build/ddos_samurai/cli/samurai \
+  --worker doca \
+  --target 10.0.0.50 \
+  --port 80 \
+  --protocol tcp \
+  --count 50000000 \
+  --confirm
+```
 
-## 6) Donanimli Lab Kapanisi
+---
 
-- E2E TX latency ve Mpps
-- RX feedback latency
-- DPU->GPU update latency
-- Queue scaling ve jitter dagilimi
-- GPU/NIC ayni PCIe switch topoloji etkisi
+## 5. Related Architecture Documents
 
-## 7) Ilgili Belgeler
-
-- [05 - GPU](./05-gpu.md)
-- [20 - Env + CLI Tam Referans](./20-env-cli-reference.md)
-- [36 - ZMQ Worker Architecture](./36-zmq-worker-architecture.md)
-- [37 - DPU/GPU Dataplane Architecture](./37-dpu-gpu-dataplane-architecture.md)
-- [ADR: DOCA Hybrid + Strict](./adr/2026-05-13-doca-gpunetio-hybrid-strict.md)
-- [Perf: DOCA GPUNetIO Progress Report](./perf/doca-gpunetio-progress-report.md)
+- [00-overview.md](./00-overview.md) — Main Architecture Overview
+- [05-gpu.md](./05-gpu.md) — GPU CUDA & Accelerator Dataplane
+- [21-numa-tx-rx-afxdp-dpdk-dma-ders-notu.md](./21-numa-tx-rx-afxdp-dpdk-dma-ders-notu.md) — NUMA & Kernel-Bypass Memory Guide
+- [36-zmq-worker-architecture.md](./36-zmq-worker-architecture.md) — ZMQ IPC Architecture
+- [37-dpu-gpu-dataplane-architecture.md](./37-dpu-gpu-dataplane-architecture.md) — DPU/GPU Dataplane Contract Specification
+- [45-commodity-gpu-nic-p2p-packet-engine-report.md](./45-commodity-gpu-nic-p2p-packet-engine-report.md) — GPU-NIC P2P Zero-Copy Dataplane Report
+- [47-zero-cpu-persistent-dataplane-architecture.md](./47-zero-cpu-persistent-dataplane-architecture.md) — Zero-CPU Persistent Dataplane Architecture

@@ -1,32 +1,33 @@
-# 35 - VAE Savunma Entegrasyonu ve Defense Worker
+# 35 - Variational Autoencoder (VAE) Defense Verification & Defense Worker
 
-Bu doküman, DDoSamurai içindeki savunma odaklı VAE (Variational Autoencoder) anomali analiz motorunu ve native `samurai_defense_worker` ikilisini açıklar.
+This document describes the closed-loop anomaly detection and defense evaluation engine within Samurai, operated via the native `samurai_defense_worker` daemon.
 
----
-
-## 1. Amaç ve Kapsam
-
-Savunma katmanının temel amacı:
-- Trafik ve sistem metriklerindeki normal çalışma davranışını öğrenmek.
-- Üretilen test yükü altındaki sistem anomali skorlarını hesaplamak.
-- Savunma / WAF / IPS bypass tekniklerinin etkinlik seviyesini ölçmek.
+![Samurai Resilience & Gateway Architecture](assets/diagrams/samurai_system_architecture.svg)
 
 ---
 
-## 2. Native C++ Defense Worker (`samurai_defense_worker`)
+## 1. Architectural Scope & Objectives
 
-[`defense_worker.cpp`](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/DDoSamurai/ddos_samurai/zmq/daemon/defense_worker.cpp) bağımsız bir native ZMQ işçisi olarak çalışır:
-
-- **ZMQ Supervisor Entegrasyonu:** `ipc:///tmp/samurai_jobs_defense` üzerinden emri alır.
-- **Anomali ve Savunma Testleri:** Farklı paket boyutları, bayrak manipülasyonları ve gecikme örüntüleriyle hedef savunma duvarlarının tepkilerini ölçer.
-- **Metrik Yayını:** Anomali skorlarını ve savunma bypass oranlarını anlık olarak raporlar.
+The defense evaluation layer is engineered to:
+- Learn nominal system and traffic baseline behavior under non-stressed conditions.
+- Compute mathematical anomaly scores during line-rate stress and multi-vector traffic generation.
+- Quantify Web Application Firewall (WAF), IPS, and scrubbing center efficacy by measuring detection accuracy, false positive rates, and evasion latency.
 
 ---
 
-## 3. Çalıştırma
+## 2. Native C++ Defense Worker Architecture (`samurai_defense_worker`)
+
+[`defense_worker.cpp`](../ddos_samurai/zmq/daemon/defense_worker.cpp) operates as an autonomous native worker:
+- **Supervisor Integration:** Attaches to dedicated Unix IPC channels (`ipc:///tmp/samurai_jobs_defense`) managed by the ZMQ Supervisor.
+- **Dynamic Perturbation Testing:** Injects micro-variations into packet sizes, TCP window sizes, header orders, and timing intervals to test the sensitivity boundary of defense classifiers.
+- **Metric Telemetry:** Continuously streams anomaly scores, classified drop ratios, and bypass confidence metrics back to the control plane.
+
+---
+
+## 3. Execution Example
 
 ```bash
-# Defense worker ile analiz testi
+# Execute defense resilience validation
 ./build/ddos_samurai/cli/samurai \
   --worker defense \
   --target 10.0.0.50 \

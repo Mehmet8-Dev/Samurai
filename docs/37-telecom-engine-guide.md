@@ -1,8 +1,13 @@
-# DDoSamurai Carrier-Grade Telecom Engine: Architecture, Operations & Verification Guide
+# Samurai Carrier-Grade Telecom Engine: Architecture, Operations & Verification Guide
 
 ## 1. Executive Architecture & Mission
 
-The DDoSamurai Carrier-Grade Telecom Engine (`samurai_telecom`) is a high-density, low-latency stateful and stateless protocol simulation and stress engine. It is specifically engineered to benchmark, validate, and stress-test Carrier-Grade BNG (Broadband Network Gateway), BRAS, CGNAT, 4G/5G UPF (User Plane Function), and Core Routers under massive subscriber load and adversarial DDoS conditions.
+The Samurai Carrier-Grade Telecom Engine (`samurai_telecom`) is a high-density, low-latency stateful and stateless protocol simulation and stress engine. It is specifically engineered to benchmark, validate, and stress-test Carrier-Grade BNG (Broadband Network Gateway), BRAS, CGNAT, 4G/5G UPF (User Plane Function), and Core Routers under massive subscriber load and adversarial stress conditions.
+
+![Samurai Carrier & 5G/4G Telecom Resilience Engine](assets/diagrams/samurai_telco_carrier.svg)
+
+<details>
+<summary>Cluster Sharding ASCII Diagram</summary>
 
 ```
                     +----------------------------------------------+
@@ -26,6 +31,8 @@ The DDoSamurai Carrier-Grade Telecom Engine (`samurai_telecom`) is a high-densit
   | Classifier | FSM & Timers                                     | Classifier | FSM & Timers
   +-------------------------+                                     +-------------------------+
 ```
+
+</details>
 
 ### Key Design Tenets
 1. **Zero-Allocation Fastpath**: Dynamic memory allocations (`malloc`, `free`, `new`, `delete`) are strictly forbidden on packet reception and transmission paths. All subscriber contexts are pre-allocated at startup.
@@ -246,7 +253,7 @@ The daemon supports dedicated and compound protocol modes:
 
 ### 4.4 CLI Workload Profiles
 
-DDoSamurai CLI (`ddos_samurai/cli/options.hpp`, `args.cpp`, `profiles.cpp`) incorporates preconfigured carrier workload profiles:
+Samurai CLI (`ddos_samurai/cli/options.hpp`, `args.cpp`, `profiles.cpp`) incorporates preconfigured carrier workload profiles:
 
 | Workload Profile | Target Architecture | Rate & Engine Defaults |
 | :--- | :--- | :--- |
@@ -256,8 +263,8 @@ DDoSamurai CLI (`ddos_samurai/cli/options.hpp`, `args.cpp`, `profiles.cpp`) inco
 | `telco-full-carrier` | End-to-End Carrier Stress Benchmark | Mixed workload: 50,000 SCTP/s, 25,000 CCR/s, 10,000 SIP/s + SRTP |
 
 ```bash
-# Executing preconfigured carrier profile via DDoSamurai CLI
-./ddos_samurai --profile telco-full-carrier --duration 120 --interface eth1
+# Executing preconfigured carrier profile via Samurai CLI
+./build/ddos_samurai/cli/samurai --profile telco-full-carrier --duration 120 --interface eth1 --confirm
 ```
 
 ---
@@ -397,7 +404,7 @@ RFC2544-PPPOE-01,PPPOE,50000,50000,10000.00,0.00,500000,0,0,22.50,128.00,5.00,"L
 All 13 telecom test suites are built with `-msse4.2 -UNDEBUG` to guarantee that assertions and performance checks are never optimized away:
 
 ```bash
-cd /home/mehmet/Masaüstü/Python/v11/DDoSamurai/build
+cd build
 
 # 1. Telecom Core Architecture (Alignment, Fastpath lookup, Timing Wheel, SPSC Shuttle)
 ./telecom/test_telco_core
@@ -445,7 +452,7 @@ cd /home/mehmet/Masaüstü/Python/v11/DDoSamurai/build
 
 ## 9. Engineering & Benchmark Honesty Notice
 
-> [!CAUTION] **MÜHENDİSLİK VE BENCHMARK DÜRÜSTLÜK İLKELERİ (MANDATORY DISCLAIMER)**
+> [!CAUTION] **ENGINEERING INTEGRITY & BENCHMARK VALIDATION PRINCIPLES (MANDATORY DISCLAIMER)**
 > 1. **Do Not Claim False Production-Grade or 100G Line Rate**: High-speed packet generation numbers measured in local loopback or veth user-space tests demonstrate internal algorithmic efficiency ($O(1)$ lookup, timing wheel cascading, zero-allocation ring buffering). They **do not** prove physical 100G line-rate capability.
 > 2. **Physical Hardware Prerequisite**: Achieving true 100G line rate requires physical PCIe Gen4/Gen5 NICs (such as Intel E810/i40e or Mellanox ConnectX-5/ConnectX-6 mlx5), native kernel bypass (DPDK / Native XDP), hardware RSS queue hashing, and external RFC 2544 hardware bench testers (e.g. Spirent, Ixia, or Xena).
 > 3. **Mathematical and Time Consistency**: Packet loss, throughput, and connection rates must be mathematically verified ($T = N / \text{PPS}$, $\text{Loss} = (\text{TX} - \text{RX}) / \text{TX} \times 100\%$).

@@ -8,6 +8,8 @@
 
 ---
 
+![Samurai Autonomous Bare-Metal DPU/GPU Doorbell & Flow Dataplane](assets/diagrams/samurai_doca_dpu_architecture.svg)
+
 ## 1. Yönetici Özeti ve Problem Tanımı
 
 Yüksek hızlı paket üretiminde ve telekom/DDoS stres testlerinde modern GPU'lar (CUDA çekirdekleri), GDDR6/HBM bellek bant genişliğini kullanarak saniyede **50 ila 300+ milyon paket (Mpps)** üretebilme potansiyeline sahiptir. Ancak geleneksel paket motorlarında ve hatta standart DPDK yapılarında bu potansiyel **CPU Doorbell Darboğazı** (CPU Doorbell Bottleneck) nedeniyle fiziksel olarak kısıtlanmaktadır:

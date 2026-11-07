@@ -1,343 +1,163 @@
-# 21 - NUMA, TX/RX Olcekleme, AF_XDP/DPDK, DMA (Proje Uzerinden Ders Notu)
+# 21 - NUMA Architecture, TX/RX Scaling, AF_XDP & DPDK Zero-Copy DMA Engineering Guide
 
-Bu not, "kavram -> projedeki karsiligi -> uygulama" formatinda hazirlandi.
-Amac: DDoSamurai'de performans mimarisini teknik olarak okuyabilmen, olcebilmen ve adim adim iyilestirebilmen.
+This guide provides an end-to-end technical reference for understanding, measuring, and tuning high-throughput kernel-bypass packet engines within **Samurai**. It bridges low-level hardware architecture (NUMA, PCIe, Cache hierarchies, and DMA) with native C++ production code (`samurai_afxdp_worker`, `samurai_dpdk_worker`, and `cpu_native`).
 
----
-
-## 0) Baslangic: Bu projede su an ne var?
-
-Bu repoda:
-
-- CPU native packet engine var: `ddos_samurai/cpu_packet_engine.py` + `ddos_samurai/_cpu_packet_engine_native`
-- AF_XDP yolu var: `ddos_samurai/af_xdp_sender.py` + `ddos_samurai/xdp_sender.c`
-- TX_RING / fast sender yolu var: `ddos_samurai/fast_sender.c`
-- Dataplane config katmani var: `ddos_samurai/dataplane.py`
-- Worker/queue/affinity dispatch'i orchestrator tarafinda: `ddos_samurai/orchestrator.py`
-- DPDK runtime backend su an dogrudan entegre degil (belgelerde "gelecek/opsiyonel" konumda).
-
-Ozet:
-- "AF_XDP + TX_RING + native CPU engine" bugun aktif performans alanin.
-- DPDK bugun "tasarlanabilir bir sonraki backend" olarak dusunulmeli.
+![Samurai NUMA Topology & Kernel-Bypass Memory Architecture](assets/diagrams/samurai_numa_afxdp_dpdk.svg)
 
 ---
 
-## 1) Zihin modeli: Paket nasil gider?
+## 1. Executive Summary & Current Dataplane State
 
-Basit zincir:
+In high-frequency packet generation and stress benchmarking, throughput is rarely bound by arithmetic computation. It is strictly constrained by **memory locality, CPU cache-line bouncing, PCIe bus latency, and descriptor ring contention**.
 
-1. Uretim (packet build): CPU native engine veya GPU tarafi
-2. Kuyruklama (batch/ring): worker queue + backend queue
-3. Gonderim (TX path): Python socket / C fast_sender / AF_XDP
-4. NIC DMA: paket host memory'den NIC'e tasinir
-5. Hat (wire): fiziksel cikis
-
-Onemli nokta:
-- Yuksek PPS sistemlerinde "hesaplama"dan cok "memory hareketi + queue uyumu + core pinning" belirleyici olur.
+In the current native C++ architecture of Samurai:
+- **AF_XDP Kernel-Bypass Worker (`samurai_afxdp_worker`):** User-space zero-copy UMEM ring buffers interacting directly with NIC driver queues via XSK sockets.
+- **DPDK PMD Worker (`samurai_dpdk_worker`):** Poll Mode Driver directly managing hardware descriptor rings via hugepage memory (`rte_eth_tx_burst`).
+- **CPU Native Packet Engine (`samurai_cpu_worker`):** Raw socket and packet ring fallback engine with pre-allocated buffer pools (`cpu_native/`).
+- **GPU P2P & DOCA Dataplane (`samurai_gpu_worker`, `samurai_doca_worker`):** Autonomous packet streaming directly from GPU GDDR6 VRAM across the PCIe bus without Host-CPU intervention.
 
 ---
 
-## 2) NUMA nedir ve neden kritik?
+## 2. NUMA (Non-Uniform Memory Access) Topology & Latency Penalties
 
-NUMA (Non-Uniform Memory Access): her CPU soketinin "yakina" bagli memory'si var.
+In multi-socket and multi-die server processors (Intel Xeon, AMD EPYC), physical memory is partitioned across distinct NUMA nodes:
 
-- Local memory: dusuk latency, yuksek bant genisligi
-- Remote memory: daha yavas, daha cok jitter
+- **Local Memory Access (Same Socket):** Lowest latency (~70–90 ns), maximum DDR4/DDR5 bandwidth (>120 GB/s), minimal jitter.
+- **Remote Memory Access (Across Sockets):** Packets must traverse the inter-socket interconnect (Intel UPI or AMD Infinity Fabric). This introduces a **+35% to +50% latency penalty (~140–180 ns)** and causes interconnect bus saturation under heavy load.
 
-Network dataplane acisindan:
-- Worker CPU bir NUMA node'da, NIC diger NUMA node'da ise throughput duser, jitter artar.
-
-### Projedeki karsiligi
-
-- Queue/affinity metadata orchestrator'da tasiniyor:
-  - `dp_queue_id`
-  - `dp_queue_strategy`
-  - `dp_affinity_cpu`
-- Dataplane secimleri:
-  - `--dp-queue-strategy`
-  - `--dp-queues`
-  - `--dp-queue-map`
-- CPU pinning:
-  - `--pin-cpu` (pacing engine pinning)
-  - orchestrator tarafinda worker affinity ayari
-
-### Pratik prensip
-
-- "Ayni worker core -> ayni NIC queue -> ayni NUMA node" hedeflenir.
-
----
-
-## 3) TX/RX olcekleme nedir?
-
-TX/RX olcekleme = tek queue yerine cok queue + cok core ile line-rate'e yakin davranmak.
-
-Temel fikir:
-
-- 1 queue / 1 core: basit ama sinirli
-- N queue / N core: daha yuksek throughput ve daha iyi latency dagilimi
-
-Kotu tasarim:
-- 8 worker, 1 queue: lock contention, burst collapse
-- queue map belirsiz: run-to-run degisen sonuclar (determinism kaybi)
-
-### Projedeki karsiligi
-
-- `--dp-queue-strategy rr|pin|map`
-- `--dp-queues N`
-- `--dp-queue-map "1:0,2:1,3:2,..."`
-- `--xdp-queue-id` (tek queue senaryolari icin)
-
-### Onerilen stratejiler
-
-1. Baslangic: `rr`
-2. Deterministik lab: `map`
-3. Fixed topoloji: `pin`
-
----
-
-## 4) Ring/Pool yerlesimi neden performansi belirler?
-
-Yuksek hizda en pahali islerden biri:
-- packet allocation/free
-- kucuk-kucuk kopya islemleri
-
-Bu yuzden:
-- pre-allocated pool
-- contiguous buffer
-- uygun batch size
-- backpressure kontrollu ring
-
-Projedeki karsiliklar:
-- native packet pool API (`generate_packet_pool`, `generate_packet_pool_owner`)
-- orchestrator ring/backpressure metrikleri (`gpu_ring_depth_peak`, `gpu_ring_block_wait_ns`)
-- TX_RING tuning parametreleri:
-  - `--afpacket-ring-target-mb`
-  - `--afpacket-block-size-kb`
-  - `--afpacket-frame-size`
-  - `--afpacket-frames-per-block`
-  - `--afpacket-poll-timeout-ms`
-  - `--afpacket-spin-limit`
-
----
-
-## 5) DMA nasil dusunulmeli?
-
-DMA = CPU her byte'i tek tek tasimadan NIC'in memory transfer yapmasi.
-
-Gercek dunya etkisi:
-- CPU cycle'lari packet copy yerine scheduling/pacing'e kalir.
-
-Ama:
-- "DMA var" tek basina yeterli degil.
-- Buffer yerlesimi, queue dogrulugu, cache uyumu, zero-copy seviyesi daha belirleyicidir.
-
-AF_XDP native mod ve TX_RING iyilestirmeleri bu noktada fark yaratir.
-
----
-
-## 6) AF_XDP bu projede nasil konumlanir?
-
-`af_xdp_sender.py` tarafinda:
-- mode 0: SKB (en uyumlu)
-- mode 1: Native (daha iyi performans potansiyeli)
-- mode 2: Offload talebi (donanim bagimli)
-
-Ayrica:
-- capability probe var
-- extension yoksa controlled fallback var
-
-Bu, "tek bir ideal yol" yerine "ortama gore adaptif dataplane" tasarimi demek.
-
----
-
-## 7) DPDK nereye oturur? (Mevcut + yol haritasi)
-
-Mevcut durumda DPDK backend yok. Dogru yaklasim:
-
-1. Su anki AF_XDP/TX_RING yolunu olgunlastir
-2. Telemetry + deterministic benchmark disiplini kur
-3. Sonra DPDK'yi yeni backend olarak ekle
-
-DPDK eklenecekse mimari onerisi:
-
-- Yeni backend secenegi: `--sender-backend dpdk` (veya `dataplane_core` altinda adapter)
-- Ortak sender contract:
-  - `send_buffer(packet_buffer, packet_size, count)`
-  - `get_stats()`
-  - `close()`
-- Orchestrator ve rapor semasi degismeden kalmali (yalniz backend adlari artmali)
-
-Hedef:
-- DPDK eklense bile "ustteki kontrol duzlemi" ayni kalir.
-
----
-
-## 8) Proje uzerinden adim adim calisma plani (ders + pekistirme)
-
-## Asama A - Topolojiyi okuyup anlamak
-
-Hedef: queue/core eslesmesini gormek.
-
-Komut:
-
-```bash
-python3 -m ddos_samurai.cli \
-  --target 127.0.0.1 --port 80 --protocol tcp \
-  --count 10000 --workers 4 \
-  --dp-queue-strategy rr --dp-queues 2 \
-  --run-report --run-report-format both
+```
++-------------------------------------------------------------+
+|                      NUMA NODE 0 (LOCAL)                    |
+|  [Pinned Cores: 2, 3, 4, 5] <---> [Local DDR5 Channels]     |
+|              ^                                              |
+|              | Direct PCIe Gen5 x16 Link (~150 ns)          |
+|              v                                              |
+|  [NIC Hardware Queues 0..3]                                 |
++-------------------------------------------------------------+
+                               ^
+                     CROSS-SOCKET UPI LINK 
+       (Adds +40% Latency & Bus Contention Jitter)
+                               v
++-------------------------------------------------------------+
+|                     NUMA NODE 1 (REMOTE)                    |
+|  [Remote Cores: 8, 9, 10, 11] <---> [Remote DDR5 Channels]  |
+|  (AVOIDED: Non-local memory traversal degrades line rate)   |
++-------------------------------------------------------------+
 ```
 
-Bakilacak alanlar (run report / worker stats):
-- `dp_queue_id`
-- `dp_queue_strategy`
-- `dp_affinity_cpu`
-- `sender_path`
+### Engineering Golden Rule
+> **Always ensure: Worker Thread Core Affinity $\rightarrow$ NIC Queue Allocation $\rightarrow$ Memory Buffer Allocation are anchored to the identical NUMA Node.**
 
-Pekistirme sorusu:
-- 4 worker + 2 queue neden bazen stabil, bazen jitter uretir?
+---
 
-## Asama B - Map ile deterministik queue dagitimi
+## 3. TX/RX Scaling & Multi-Queue Queue-to-Core Pinning
+
+Running multiple worker threads against a single hardware descriptor queue produces catastrophic lock contention and cache thrashing. Scaling requires deterministic 1:1 or N:M mapping.
+
+### Queue Distribution Strategies:
+1. **Map Strategy (`map` - Recommended for Deterministic Labs):**
+   Explicit 1:1 binding between worker process threads and NIC hardware queues (e.g. Worker 0 $\rightarrow$ Queue 0, Worker 1 $\rightarrow$ Queue 1).
+2. **Round-Robin (`rr`):**
+   Dynamic round-robin allocation across available hardware queues.
+3. **Pin Strategy (`pin`):**
+   Fixed queue allocation tied strictly to core identifiers.
+
+---
+
+## 4. Zero-Copy Memory Layout: UMEM, Hugepages & Ring Buffers
+
+Dynamic memory allocation (`malloc`, `free`, `new`, `delete`) is strictly forbidden on the dataplane fastpath. Samurai utilizes two contiguous memory models:
+
+### A) AF_XDP UMEM (User Memory Buffer)
+- Pre-allocated contiguous memory divided into fixed-size frames (typically 2048 or 4096 bytes).
+- Governed by four lock-free circular ring buffers:
+  1. **Fill Ring:** User-space supplies empty buffers to the kernel/NIC for RX.
+  2. **RX Ring:** Kernel informs user-space of received packets.
+  3. **TX Ring:** User-space submits packet descriptors for transmission.
+  4. **Completion Ring:** Kernel signals user-space that transmission is complete and buffer frames can be reused.
+
+### B) DPDK Hugepages (2MB / 1GB)
+- Standard 4KB Linux pages incur severe TLB (Translation Lookaside Buffer) thrashing at 10M+ PPS.
+- Pre-allocating 2MB or 1GB hugepages maps massive contiguous physical memory spaces with minimal TLB misses.
+
+---
+
+## 5. Direct Memory Access (DMA) Mechanics
+
+DMA allows the network interface card to transfer packet data directly between host RAM and the physical PHY transceiver without cycling the CPU:
+
+1. The CPU prepares packet headers and payloads inside local NUMA memory frames.
+2. The CPU writes a descriptor pointer into the NIC TX Ring and rings the **NIC Doorbell MMIO register** ($O(1)$ constant time).
+3. The NIC DMA engine autonomously issues PCIe Memory Read (MRd) TLPs to pull the bytes across the PCIe bus into its internal FIFO.
+4. The NIC hardware calculates Ethernet CRC32/FCS and emits the frame onto the physical wire at line rate (148.8 Mpps at 100GbE).
+5. The NIC updates descriptor status flags, and the worker reclaims the frame slot without copying data.
+
+---
+
+## 6. Native Execution Runbook & Operational Commands
+
+### A) Native AF_XDP Zero-Copy Execution
+Ensure the network interface is bound and NUMA affinity is configured:
 
 ```bash
-python3 -m ddos_samurai.cli \
-  --target 127.0.0.1 --port 80 --protocol tcp \
-  --count 20000 --workers 4 \
-  --dp-queue-strategy map \
-  --dp-queues 4 \
-  --dp-queue-map "1:0,2:1,3:2,4:3" \
-  --run-report --run-report-format both
+# Verify NUMA node of the NIC (e.g. eth0)
+cat /sys/class/net/eth0/device/numa_node
+
+# Run samurai native AF_XDP worker pinned to NUMA Node 0 cores
+numactl --cpunodebind=0 --membind=0 \
+  ./build/samurai/cli/samurai \
+    --worker afxdp \
+    --target 10.0.0.50 \
+    --port 80 \
+    --protocol tcp \
+    --count 10000000 \
+    --confirm
 ```
 
-Kontrol:
-- Her worker hep ayni queue'ya mi gidiyor?
-- `fallback_count` sifira yakin mi?
-
-## Asama C - TX_RING tuning
+### B) Native DPDK Hardware PMD Execution
+With hugepages pre-allocated (`default_hugepagesz=1G hugepagesz=1G hugepages=8`):
 
 ```bash
-python3 -m ddos_samurai.cli \
-  --target 127.0.0.1 --port 80 --protocol tcp \
-  --sender-backend txring \
-  --afpacket-ring-target-mb 128 \
-  --afpacket-frames-per-block 128 \
-  --afpacket-spin-limit 4000 \
-  --count 50000 --workers 4 \
-  --run-report --run-report-format both
+# Run samurai native DPDK worker with hardware PMD rings
+sudo ./build/samurai/cli/samurai \
+  --worker dpdk \
+  --target 10.0.0.50 \
+  --port 443 \
+  --protocol tcp \
+  --count 50000000 \
+  --confirm
 ```
 
-Bak:
-- `txring_tp_drops`
-- `txring_flush_error_count`
-- `txring_drop_ratio_pct`
-
-Pekistirme:
-- Ring buyuyunce neden her zaman performans artmaz?
-
-## Asama D - AF_XDP mode karsilastirma
-
-Mode 0 (SKB) ile basla, sonra mode 1 (native) dene.
-
+### C) CPU Native Raw Socket Stress Test
 ```bash
-python3 -m ddos_samurai.cli \
-  --target <hedef_ip> --port 80 --protocol tcp \
-  --xdp-enable --xdp-interface <iface> --xdp-mode 0 \
-  --workers 4 --count 50000 \
-  --run-report --run-report-format both
+./build/samurai/cli/samurai \
+  --worker cpu \
+  --target 127.0.0.1 \
+  --port 8080 \
+  --protocol udp \
+  --count 500000 \
+  --size 64 \
+  --confirm
 ```
 
-Ardindan:
+---
 
-```bash
-python3 -m ddos_samurai.cli \
-  --target <hedef_ip> --port 80 --protocol tcp \
-  --xdp-enable --xdp-interface <iface> --xdp-mode 1 \
-  --workers 4 --count 50000 \
-  --run-report --run-report-format both
-```
+## 7. Common Pitfalls & Anti-Patterns
 
-Karsilastir:
-- sent/errors
-- pps (rapor uzerinden)
-- jitter/pacing alanlari (aktifse)
+| Anti-Pattern | Root Cause | Architectural Consequence | Samurai Solution |
+|:---|:---|:---|:---|
+| **Excessive Worker Threads** | Over-subscribing CPU cores beyond hardware queues | Context switching and cache eviction collapse throughput | Restrict workers to 1 thread per physical core (`--pin-cpu`). |
+| **Silent Driver Fallback** | Kernel falling back to generic SKB mode | Drops PPS from 20+ Mpps down to ~1.2 Mpps | Enforce strict zero-copy mode (`XDP_ZEROCOPY`); fail fast if unavailable. |
+| **Cross-Socket Memory** | Allocating UMEM or buffers on NUMA 1 while NIC is on NUMA 0 | Interconnect UPI bus saturation and latency spikes | Enforce `numactl --membind` and local socket page allocation. |
+| **Unbounded TX Rings** | Sizing rings too large | High packet latency due to bufferbloat | Tune ring depth to burst target (e.g., 2048–4096 frames) with pacing. |
 
 ---
 
-## 9) Benchmark disiplini (zorunlu)
+## 8. Related Architecture Documents
 
-Ayni konfigurasyonu en az 3 kez kos:
-- median sonuc al
-- sadece tek kosa bakip karar verme
-
-Her kosuda kaydet:
-- CPU modeli, core sayisi
-- NIC modeli/driver
-- kernel versiyonu
-- queue sayisi, worker sayisi
-- backend ve mode
-
-Kural:
-- "olcumlenmeyen optimizasyon", optimizasyon degildir.
-
----
-
-## 10) SIK hatalar ve dogru refleksler
-
-Hata 1:
-- Worker sayisini cok artirmak = otomatik hiz artisi sanmak
-- Cozum: queue/core/NUMA uyumunu once kur
-
-Hata 2:
-- Fallback oldugu halde benchmark'i "backend basarili" saymak
-- Cozum: `sender_path` ve `fallback_count` zorunlu kontrol
-
-Hata 3:
-- Bir kez iyi sonuc alip kalici kabul etmek
-- Cozum: tekrarli kosu + median + p95/p99 odakli karar
-
-Hata 4:
-- TX'i optimize edip RX/backpressure'i gormemek
-- Cozum: drop/error/jitter metriklerini birlikte okumak
-
----
-
-## 11) 30 gunluk ogrenme backlog'u (sana ozel)
-
-1. Hafta:
-- Queue stratejileri (rr/pin/map) + worker event okuma
-- Her gun 2 benchmark
-
-2. Hafta:
-- TX_RING parametre taramasi
-- "hangi parametre neyi degistiriyor?" tablo cikarma
-
-3. Hafta:
-- AF_XDP mode 0 vs mode 1 sistematik karsilastirma
-- fallback kosullarini listeleme
-
-4. Hafta:
-- NUMA-aware mapping denemeleri
-- "production profile" default seti olusturma
-
----
-
-## 12) Bu dersin sonunda neyi biliyor olacaksin?
-
-- NUMA'nin neden teorik degil, direkt PPS/jitter konusu oldugunu
-- TX/RX olceklemenin queue/core eslesmesi oldugunu
-- AF_XDP'nin "mode + capability + fallback" mantigini
-- DPDK'yi bugun degil, dogru zamanda nasil sokacagini
-- Projede hangi metric'e bakarak gercek performans karari verecegini
-
----
-
-## Ek Okuma (repo ici)
-
-- `docs/02-orchestrator.md`
-- `docs/03-senders.md`
-- `docs/06-af_xdp-fast_sender.md`
-- `docs/18-afpacket-hugepage-policy.md`
-- `docs/19-benchmark-profiles.md`
-- `docs/20-env-cli-reference.md`
-- `docs/17-gpu-ai-dataplane-research-validation-roadmap.md`
-
+- [00-overview.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/00-overview.md) — Master System Overview & Subsystem Map
+- [01-cli.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/01-cli.md) — Native C++ CLI Reference
+- [06-af_xdp-fast_sender.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/06-af_xdp-fast_sender.md) — AF_XDP Zero-Copy Implementation
+- [34-dpdk-kurulum-ve-hazirlik-rehberi.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/34-dpdk-kurulum-ve-hazirlik-rehberi.md) — DPDK Environment Setup & PMD Configuration
+- [40-distributed-control-plane-handbook.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/40-distributed-control-plane-handbook.md) — Multi-Node Distributed Cluster Architecture
+- [45-commodity-gpu-nic-p2p-packet-engine-report.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/45-commodity-gpu-nic-p2p-packet-engine-report.md) — GPU-NIC P2P Zero-Copy Dataplane Report

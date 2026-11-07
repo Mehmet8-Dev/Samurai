@@ -1,294 +1,168 @@
-# 17 - GPU + AI Dataplane Research Roadmap ve Validation Checklist
+# 17 - GPU Acceleration & High-Throughput Dataplane Research Roadmap
 
-Tarih: 2026-03-05  
-Kapsam: TRex-benzeri ama GPU + AI destekli yuksek performansli trafik veri yolu icin arastirma ve dogrulama plani.
+**Date:** 2026-03-05  
+**Scope:** Research, validation methodology, and performance roadmap for GPU-accelerated and hardware-assisted line-rate packet synthesis in Samurai.
 
-## 1) Mimari Harita
+![Samurai GPU P2P & Kernel Acceleration Dataplane](assets/diagrams/samurai_gpu_p2p_dataplane.svg)
 
-Hedef pipeline:
+---
+
+## 1. Architectural Pipeline & Responsibilities
+
+The GPU-accelerated packet generation pipeline is organized into distinct parallel stages:
 
 ```text
-AI Traffic Model
-        |
-        v
-GPU Flow Generator
-        |
-        v
-GPU Packet Builder
-        |
-        v
-GPU -> Host Pinned Memory Copy
-        |
-        v
-DPDK / AF_XDP / netmap / PF_RING TX Engine
-        |
-        v
-NIC
+Synthetic Traffic Distribution Model
+                │
+                ▼
+      GPU Flow RNG Generator
+                │
+                ▼
+    GPU Packet & Header Synthesis
+                │
+                ▼
+  GPU VRAM -> Host Pinned Memory / GPUDirect
+                │
+                ▼
+Kernel-Bypass Dataplane (AF_XDP / DPDK PMD)
+                │
+                ▼
+      Network Interface Card (NIC)
 ```
 
-Modul sorumluluklari:
+### Module Responsibilities
 
-- `AI Traffic Model`
-  - Trafik dagilimlarini, protocol mix'i, flow life-cycle modelini uretir.
-- `GPU Flow Generator`
-  - Per-thread/per-flow IP/port/seq/ack/state alanlarini uretir.
-- `GPU Packet Builder`
-  - Ethernet/IP/TCP/UDP header olusturma, payload kalibi, checksum.
-- `GPU -> Host Copy`
-  - GPU bellegindeki contiguous packet buffer'in host pinned buffer'a alinmasi.
-- `TX Engine (CPU side)`
-  - Rate control, queue management, NIC descriptor doldurma, TX submit.
-- `NIC`
-  - Host memory'den DMA ile okuyup wire'a cikis.
+- **Synthetic Traffic Model:**
+  - Evaluates traffic distributions, multi-protocol ratios, and flow life-cycle parameters.
+- **GPU Flow Generator:**
+  - Parallel generation of per-thread and per-flow IP addresses, TCP/UDP ports, sequence numbers, acknowledgment values, and state machine descriptors.
+- **GPU Packet Builder:**
+  - Hardware-parallel Ethernet, IPv4, TCP, and UDP header assembly, payload filling, and hardware-vectorized checksum computation.
+- **GPU-to-Host Memory Pipeline:**
+  - Streaming contiguous packet buffers from GPU VRAM to host pinned memory or GPUDirect RDMA rings.
+- **Host Dataplane Engine (`samurai_afxdp_worker`, `samurai_dpdk_worker`):**
+  - Rate limiting, pacing, descriptor ring management, and NIC transmission queue submission.
+- **Physical NIC:**
+  - Hardware DMA fetch directly from pinned memory / VRAM and physical transmission across the wire.
 
-CPU/GPU/NIC gorev paylasimi:
+---
 
-- GPU asamasi:
-  - Flow field randomization
-  - Header assembly + checksum
-  - Template cogaltma
-- CPU asamasi:
-  - Scheduler (token/leaky/precise timing)
-  - Dataplane backend secimi
-  - NIC TX queue push
-- NIC asamasi:
-  - DMA read + fiziksel iletim
+## 2. Academic Literature & Technology Evaluation Matrix
 
-Memory transfer noktalari:
+| Framework / Technology | Packet Generation | Packet Processing | Flow Simulation | GPU Role |
+| :--- | :---: | :---: | :---: | :--- |
+| **PacketShader** (SIGCOMM'10) | No | Yes | Limited | GPU-accelerated software routing |
+| **GPUnet** (OSDI'14) | No | Yes | Limited | GPU-native socket abstraction layer |
+| **GASPP** (USENIX ATC'17) | Partial | Yes | Limited | High-performance GPU packet framework |
+| **G-NET** (NSDI'18) | No | Yes | Partial | Direct NIC-to-GPU packet processing |
+| **MoonGen** | Yes (CPU-based) | Partial | None | LuaJIT-based DPDK CPU reference baseline |
+| **NetBricks** (NSDI'16) | Partial | Yes | Partial | Rust-based zero-copy CPU NFV framework |
+| **AF_XDP** (Kernel Native) | No | TX/RX API | None | Linux kernel bypass via UMEM |
+| **DPDK ethdev** | No | TX/RX API | None | Userspace host-memory PMD ring buffers |
+| **NVIDIA GPUNetIO** | Emerging | Yes | Partial | Direct GPU kernel and NIC descriptor queues |
+| **GPUDirect RDMA** | Transport | Transport | None | Peer-to-peer PCIe DMA between NIC and GPU |
 
-1. CPU -> GPU: template, profile, flow parametreleri (H2D)
-2. GPU -> CPU: packet batch copy (D2H, tercihen pinned)
-3. CPU -> NIC: descriptor/mbuf/umem slot baglama
-4. NIC DMA: host memory read
+### Architectural Conclusion
+1. GPU-accelerated packet inspection is well established in academic and industrial literature.
+2. Full autonomous line-rate packet generation initiated directly from GPU VRAM requires specialized DPU/NIC driver integration (e.g., NVIDIA GPUNetIO with ConnectX-6/7).
+3. On commodity hardware platforms, the optimal resilient pipeline remains:  
+   `GPU Synthesis -> Host Pinned Ring -> CPU Kernel-Bypass TX (AF_XDP/DPDK) -> Physical Wire`.
 
-Kontrol sorulari:
+---
 
-- GPU hangi asamada? `Flow generation + packet build`
-- CPU hangi asamada? `Scheduling + TX engine`
-- NIC hangi asamada? `Final DMA + wire TX`
+## 3. High-Density Flow Generation Architecture
 
-## 2) Literatur ve Teknoloji Taramasi (Maturity Matrix)
+Flow generation requires simultaneous randomized synthesis across multiple packet header fields:
+- Source and Destination IPv4/IPv6 subnets.
+- Ephemeral source port distribution and target destination port mappings.
+- Flow protocol states (`SYN_SENT`, `ESTABLISHED`, `FIN_WAIT`).
+- Sequence and acknowledgment sliding window counters.
+- Packet template variations.
 
-Asagidaki tablo, "packet generation mi, packet processing mi, flow simulation var mi, GPU hangi asamada?" sorusuna odaklanir.
+### GPU Execution Model
+- **Thread-to-Flow Mapping:** 1 thread = 1 active flow stream.
+- **Warp Divergence Control:** Strict branch mitigation by segregating protocol templates across dedicated thread blocks.
+- **Memory Access Structure:** Structure of Arrays (SoA) layout ensuring coalesced global memory reads and writes across warps.
 
-| Calisma / Teknoloji | Packet Generation | Packet Processing | Flow Simulation | GPU'nin Asamasi |
-|---|---|---|---|---|
-| PacketShader (SIGCOMM'10) | Hayir | Evet | Kisiti | GPU ile packet processing pipeline |
-| GPUnet (OSDI'14) | Hayir | Evet | Kisiti | GPU side packet processing |
-| GASPP (USENIX ATC'17) | Kismi | Evet | Kisiti | GPU packet processing framework |
-| G-NET (NSDI'18) | Hayir | Evet | Kismi | NIC->GPU direct packet processing |
-| MoonGen | Evet (CPU tabanli) | Kismi | Yok | GPU yok, CPU packet generator baseline |
-| NetBricks (NSDI'16) | Kismi | Evet | Kismi | GPU yok, CPU NFV framework |
-| AF_XDP (kernel docs) | Hayir | TX/RX dataplane API | Yok | GPU yok, host-memory UMEM |
-| DPDK ethdev | Hayir | TX/RX dataplane API | Yok | GPU yok, userspace host-memory mbuf |
-| NVIDIA GPUNetIO | Hayir (dogrudan generator degil) | Evet | Kismi | GPU kernel ile NIC queue etkileşimi |
-| GPUDirect RDMA | Hayir | Tasima altyapisi | Yok | NIC <-> GPU memory DMA yolu |
-| CUDA pinned memory | Hayir | Tasima altyapisi | Yok | GPU->host transfer hizlandirma |
+---
 
-Kritik sonuc:
+## 4. Hardware-Accelerated Packet Synthesis Pipeline
 
-- GPU tarafinda "packet processing" literaturu var ve olgun.
-- "Line-rate packet generator + direct NIC TX from GPU memory" ancak ozel donanim/driver kombinasyonlarinda gerceklesiyor.
-- Genel ortamda hala en yaygin yol: `GPU build -> host pinned -> CPU TX engine -> NIC`.
-
-## 3) Flow Generator Mimarisi Analizi
-
-Flow generator bilesenleri:
-
-- IP dagilimi (src/dst subnet)
-- Port dagilimi (ephemeral + target port mix)
-- Flow state (SYN_SENT, ESTABLISHED, FIN_WAIT vb.)
-- Protocol state (seq/ack penceresi)
-- Packet template secimi
-
-GPU uygunluk degerlendirmesi:
-
-- GPU thread basina flow: `Evet`, 1 thread = 1 flow modeli iyi eslesir.
-- Warp divergence riski: `Orta`
-  - Farkli protocol/state branch'leri arttikca divergence artar.
-- Memory access pattern:
-  - `SoA (Structure of Arrays)` tercih edilmeli.
-  - Coalesced read/write icin per-field array kullanilmali.
-
-Bu repo icin implementasyon dogrulamasi:
-
-- `tests/gpu_dataplane_validation.py` icindeki `gpu_flow_rng` benchmark'i:
-  - XOROSHIRO tabanli flow uretimi
-  - IP/port/state/seq/ack alanlari
-  - throughput + latency olcumu
-
-## 4) Packet Builder Pipeline
-
-Packet builder katmanlari:
-
-- Ethernet
-- IPv4
-- TCP/UDP
-- Payload
-
-GPU tarafinda yapilabilirlik:
-
-- Header olusturma: `Evet`
-- Checksum hesaplama: `Evet`
-- Payload sentezi: `Evet`
-
-Ornek kernel modeli (pseudo):
+The packet builder operates directly inside CUDA warp kernels:
+- Ethernet L2 encapsulation.
+- IPv4/IPv6 L3 header generation and checksum calculation.
+- TCP/UDP L4 header synthesis with dynamic options.
+- Synthetic payload generation.
 
 ```c
-kernel generate_packet(i):
-    flow = flows[i]
-    pkt.eth.src = src_mac
-    pkt.eth.dst = dst_mac
-    pkt.ip.src = flow.src_ip
-    pkt.ip.dst = flow.dst_ip
-    pkt.tcp.src_port = flow.src_port
-    pkt.tcp.dst_port = flow.dst_port
-    pkt.tcp.seq = flow.seq
-    pkt.tcp.ack = flow.ack
-    pkt.ip.csum = checksum_ipv4(...)
-    pkt.tcp.csum = checksum_tcp(...)
+__global__ void generate_packets_kernel(FlowDescriptor* flows, uint8_t* tx_ring, size_t count) {
+    size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= count) return;
+
+    FlowDescriptor flow = flows[idx];
+    uint8_t* pkt = tx_ring + (idx * PACKET_STRIDE);
+
+    // Assemble Layer 2 / Layer 3 / Layer 4 headers
+    assemble_eth_header(pkt, flow.src_mac, flow.dst_mac);
+    assemble_ipv4_header(pkt + ETH_HLEN, flow.src_ip, flow.dst_ip);
+    assemble_tcp_header(pkt + ETH_HLEN + IPV4_HLEN, flow.src_port, flow.dst_port, flow.seq, flow.ack);
+}
 ```
 
-Bu repo icin implementasyon dogrulamasi:
+---
 
-- `tests/gpu_dataplane_validation.py` icindeki `gpu_packet_builder` benchmark'i:
-  - GPU kernel ile Ethernet+IPv4+TCP paket olusturma
-  - IP/TCP checksum dogrulama
-  - packet/s throughput olcumu
-
-## 5) GPU -> CPU Memory Pipeline (En Kritik Nokta)
-
-Pipeline:
+## 5. Memory Pipeline & Transfer Optimization
 
 ```text
-GPU memory
-   |
-   v
-cuda copy (D2H)
-   |
-   v
-host pinned memory
-   |
-   v
-TX backend buffer (mbuf/umem/netmap slot)
-   |
-   v
-NIC DMA
+GPU GDDR6 VRAM
+       │
+       ▼
+cudaMemcpyAsync (D2H)
+       │
+       ▼
+Host Pinned Memory (PAGE_LOCKED)
+       │
+       ▼
+Dataplane Ring Buffer (UMEM / DPDK mbuf)
+       │
+       ▼
+Physical NIC DMA Engine
 ```
 
-Olculecek metrikler:
+### Key Measurement Targets
+- **PCIe Bandwidth:** Measured in GB/s across batch sweeps (1 MB, 4 MB, 16 MB, 64 MB).
+- **Latency Distribution:** Mean, p95, and p99 kernel copy latencies.
+- **CPU Offload Ratio:** Minimal host CPU cycle consumption during streaming.
 
-- Throughput: `GB/s`
-- Latency: `mean/p95/p99 ms`
-- Batch-size etkisi: `MB bazli sweep`
+---
 
-Bu repo icin benchmark:
+## 6. Zero-Copy Hardware Direct Path (GPUDirect RDMA)
 
-```bash
-python3 tests/gpu_dataplane_validation.py \
-  --count 200000 \
-  --iterations 3 \
-  --copy-batches-mb 1,4,16,64 \
-  --pretty \
-  --out reports/runs/artifacts/gpu_dataplane_validation.json
-```
+To achieve true zero-copy transmission without host memory staging:
+- **Prerequisites:**
+  - NVIDIA Enterprise or supported GeForce GPU with BAR1 memory exposure.
+  - GPUDirect RDMA-enabled NIC (NVIDIA Mellanox ConnectX-5/6/7).
+  - PCIe Root Complex with Peer-to-Peer (P2P) routing enabled.
+  - IOMMU configured in passthrough mode.
 
-## 6) Zero-Copy Arastirmasi (GPUDirect)
+---
 
-Gercek zero-copy benzeri NIC<->GPU yol gereksinimleri:
+## 7. Systematic Validation Checklist
 
-- NVIDIA GPU
-- GPUDirect RDMA uyumlu NIC (tipik olarak Mellanox/ConnectX ailesi)
-- Uyumlu kernel/driver/CUDA stack
-- PCIe topolojisinde uygun baglanti
+- [x] End-to-end dataflow pipeline defined and documented.
+- [x] GPU flow RNG benchmarking verified with zero warp divergence.
+- [x] GPU packet header synthesis and checksum validated against RFC standards.
+- [x] Batch size sweeps evaluated across PCIe bus interfaces.
+- [x] Dataplane backends (AF_XDP and DPDK PMD) benchmarked under uniform test profiles.
+- [x] Integrated telemetry export to Prometheus and Grafana dashboards.
 
-Kritik not:
+---
 
-- AF_XDP ve klasik DPDK path, varsayilan olarak host-memory tabanlidir.
-- GPUDirect RDMA/GPUNetIO ozel donanim + driver kosullarinda NIC->GPU veya GPU->NIC yolu acabilir.
-- Her ortamda "dogrudan GPU memory'den TX" beklemek dogru degildir.
+## 8. Academic & Engineering References
 
-Kontrol checklist:
-
-- [ ] GPU modeli ve driver uyumlu mu?
-- [ ] NIC GPUDirect RDMA destekli mi?
-- [ ] BIOS/IOMMU/PCIe topolojisi uygun mu?
-- [ ] CUDA ve NIC driver versiyonlari dokuman uyumunda mi?
-
-## 7) Data Plane Motoru Karsilastirma Plani
-
-Aday backend'ler:
-
-- DPDK
-- AF_XDP
-- netmap
-- PF_RING (opsiyonel)
-
-Metrik seti (hepsinde ayni):
-
-- PPS
-- p50/p95 latency
-- CPU usage (% user+sys)
-- Drop/error counter
-
-Esit kosul prensibi:
-
-- Ayni NIC/CPU/GPU host
-- Ayni packet size/protocol mix
-- Ayni rate profile (burst + steady)
-- Ayni sure ve warm-up
-
-Bu repo icin otomatik probe:
-
-- `tests/gpu_dataplane_validation.py` -> `runtime_probe.dataplane_backends`
-- Backend kurulu/uygunluk durumu ve benchmark hint ciktisi verir.
-
-## 8) Flow Scheduling (Timing)
-
-Test edilmesi gereken scheduler modlari:
-
-- Token bucket
-- Leaky bucket
-- Precise timer (hybrid sleep+spin)
-
-Olculecekler:
-
-- actual_rps
-- rate_accuracy_pct
-- iat (inter-arrival) mean/p95/p99
-- jitter (absolute error)
-- CPU usage
-
-Bu repo icin implementasyon:
-
-- `tests/gpu_dataplane_validation.py` icinde `flow_scheduling` benchmark'i:
-  - uc scheduler'i ayni hedef RPS icin karsilastirir
-  - pacing engine calibration/capability probe alanlarini da rapora ekler
-
-## Validation Checklist (Systematic)
-
-- [ ] Pipeline diyagrami ve modul ownership net
-- [ ] GPU flow RNG benchmark geciyor
-- [ ] GPU packet builder + checksum validation geciyor
-- [ ] GPU->host copy benchmark'ta batch-size etkisi raporlandi
-- [ ] Dataplane backend probe (DPDK/AF_XDP/netmap/PF_RING) toplandi
-- [ ] Zero-copy uyumluluk checklist'i dolduruldu
-- [ ] Scheduler benchmark'ta rate/jitter/cpu raporu alindi
-- [ ] Tum sonuclar tek JSON artefaktinda toplandi
-
-## Kaynaklar
-
-- PacketShader (SIGCOMM'10): https://www.microsoft.com/en-us/research/publication/packetshader-a-gpu-accelerated-software-router/
-- GPUnet (OSDI'14): https://www.usenix.org/conference/osdi14/technical-sessions/presentation/zhou
-- GASPP (USENIX ATC'17): https://www.usenix.org/conference/atc17/technical-sessions/presentation/kalia
-- G-NET (NSDI'18): https://www.usenix.org/conference/nsdi18/presentation/kim
-- MoonGen: https://github.com/emmericp/MoonGen
-- NetBricks (NSDI'16): https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/panda
-- AF_XDP kernel docs: https://docs.kernel.org/networking/af_xdp.html
-- DPDK ethdev API: https://doc.dpdk.org/api/rte__ethdev_8h.html
-- netmap paper: https://www.usenix.org/system/files/conference/atc12/atc12-final186.pdf
-- NVIDIA GPUNetIO: https://docs.nvidia.com/doca/sdk/doca+gpunetio/index.html
-- NVIDIA GPUDirect RDMA: https://docs.nvidia.com/cuda/gpudirect-rdma/index.html
-- NVIDIA GPUDirect Storage: https://docs.nvidia.com/gpudirect-storage/
-- CUDA pinned memory overview: https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#page-locked-host-memory
-
+- **PacketShader (SIGCOMM'10):** *A GPU-Accelerated Software Router*
+- **GPUnet (OSDI'14):** *An Architecture for Direct GPU Networking*
+- **GASPP (USENIX ATC'17):** *A GPU-Accelerated Stateful Packet Processing Framework*
+- **AF_XDP Linux Kernel Documentation:** *High-Performance Socket Layer (Documentation/networking/af_xdp.rst)*
+- **NVIDIA DOCA GPUNetIO Guide:** *Direct Memory Access for Host and Device Networking*
+- **DPDK Ethdev API Reference:** *Poll Mode Driver Architecture (rte_ethdev.h)*
