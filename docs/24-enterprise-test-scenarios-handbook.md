@@ -1,246 +1,233 @@
-# 24 - Kurumsal Test Senaryolari El Kitabi
+# 24 - Enterprise Test Scenarios Handbook
 
-## Amac
+![Samurai End-to-End System Architecture](assets/diagrams/samurai_system_architecture.svg)
 
-Bu dokuman, gercek is ortamlarinda kullanilan kurumsal seviye performans,
-dayaniklilik ve savunma-dogrulama testlerinin nasil planlanacagini anlatir.
+## Purpose
 
-Hedef:
+This handbook provides an operational framework for planning and executing enterprise-grade network resilience, capacity, and defense validation evaluations using the Samurai Network Resilience Platform (`./build/ddos_samurai/cli/samurai`).
 
-- "test calistirmak" ile "kurumsal test programi yürütmek" arasindaki farki netlestirmek
-- testin teknik kismini is riski, onay, rollback ve raporlama ile birlikte ele almak
-- gercek hayata yakin ama etik ve yetkili kullanim sinirlari icinde kalan ornek senaryolar sunmak
-- operator, teknik lider ve platform ekibine ortak bir dil vermek
+Goals:
 
-Bu belge yalnizca yetkili, yazili onayli ve izole test/staging/lab ortamlari
-icin yazilmistir.
+- Differentiate between ad-hoc traffic generation and structured enterprise resilience testing.
+- Integrate technical parameters with business risk management, formal authorization, rollback protocols, and executive reporting.
+- Present realistic, production-relevant scenarios that remain strictly within authorized, ethical testing boundaries.
+- Establish a shared technical vocabulary among test operators, platform engineers, and leadership.
 
-## Kimler Icin
+This handbook is strictly intended for authorized, documented, and isolated staging, pre-production, and laboratory environments.
 
-- performans muhendisleri
-- platform ve SRE ekipleri
-- mavi takim / savunma odakli guvenlik ekipleri
-- on-prem veya cloud ag topolojisi yoneten teknik liderler
-- musteri ortami icin kontrollu dayanıklılık testi tasarlayan profesyonel hizmet ekipleri
+## Target Audience
 
-## Bu Belge Ne Degildir
+- Performance and Systems Engineers
+- Platform Engineering and Site Reliability Engineering (SRE) Teams
+- Blue Teams, SOC Analysts, and Defensive Security Engineers
+- Enterprise Network and Infrastructure Architects
+- Professional Services Teams conducting resilience and capacity verification audits
 
-Bu belge:
+## Scope and Boundaries
 
-- yetkisiz hedeflere karsi test rehberi degildir
-- public internet uzerinde rastgele yuk uretme kilavuzu degildir
-- "daha sert trafik nasil gonderilir" odakli saldiri tarifnamesi degildir
+This document:
 
-Bu nedenle tum ornekler:
+- Is not an unauthorized attack or exploitation guide.
+- Does not authorize arbitrary traffic generation across public networks.
+- Avoids offensive disruption guides in favor of defensive resilience and capacity engineering.
 
-- private IP / staging / lab mantigi ile verilir
-- savunma, kapasite ve dayaniklilik dogrulama amaci tasir
-- yazili kapsam ve geri alma plani varsayar
+All scenarios:
 
-## Kurumsal Testin Temel Ilkeleri
+- Utilize private IP addresses, dedicated staging VIPs, and controlled lab networks.
+- Focus on verifying defenses, measuring saturation thresholds, and ensuring service continuity.
+- Assume signed rules of engagement, defined maintenance windows, and established rollback owners.
 
-Kurumsal testte teknik basari tek basina yeterli degildir. Test ancak su
-kosullar birlikte saglanirsa "profesyonel" sayilir:
+## Core Principles of Enterprise Testing
 
-1. Kapsam yazili ve onaylidir
-2. Hedefler ve zaman penceresi nettir
-3. Basari ve durdurma kriterleri once belirlenmistir
-4. Geri alma (rollback) ve acil durdurma sorumlulari bellidir
-5. Test artefact'lari kalici sekilde toplanir
-6. Sonuc teknik ve is etkisi diliyle birlikte raporlanir
+Technical execution alone does not constitute an enterprise test. A test is considered professional only when the following criteria are satisfied:
 
-Kisa kural:
+1. Written and signed authorization is locked in advance.
+2. Target scopes, network paths, and maintenance windows are explicitly defined.
+3. Success metrics, failure guardrails, and abort criteria are established beforehand.
+4. Dedicated rollback owners and emergency abort controllers are active.
+5. All execution artifacts and telemetry traces are archived immutably.
+6. Test outcomes are communicated through both technical metrics and business impact narratives.
 
-- yetki belgesi yoksa test yok
-- rollback yoksa canliya cikis yok
-- baseline yoksa benchmark anlamsiz
-- kabul kriteri yoksa test "gozlem" olarak kalir
+Operational Rules:
 
-## Kurumsal Test Turleri
+- No signed authorization = No test execution.
+- No emergency rollback plan = No production or pre-production testing window.
+- No reference baseline = Meaningless benchmark comparisons.
+- No predefined acceptance criteria = The test remains purely observational.
 
-| Test tipi | Amac | Tipik ciktisi |
+## Enterprise Test Categories
+
+| Test Type | Operational Goal | Primary Artifact / Output |
 |---|---|---|
-| Smoke / readiness | Ortam hazir mi? | preflight onayi |
-| Baseline | Normal davranis nedir? | referans throughput / latency |
-| Kapasite testi | Nerede darbogaz basliyor? | esik ve doygunluk noktasi |
-| Dayaniklilik testi | Sistem bozulmadan ne kadar sure surdurur? | soak ve drift raporu |
-| Savunma dogrulama testi | WAF/CDN/rate limit/capability bekleneni yapiyor mu? | policy etkinlik raporu |
-| Degisiklik sonrasi regresyon testi | Yeni release zarar verdi mi? | once/sonra karsilastirma |
-| Olay provasi | Gercek incident'e hazir miyiz? | runbook ve ekip koordinasyon raporu |
+| Smoke / Readiness | Verify environment, routes, and dependencies | Clean preflight confirmation |
+| Baseline | Characterize steady-state performance | Reference latency and throughput curves |
+| Capacity Test | Locate infrastructure bottlenecks and saturation points | Saturation knee and cliff analysis |
+| Longevity / Soak | Validate endurance, memory leaks, and drift | Multi-hour drift and degradation report |
+| Defense Verification | Confirm WAF, rate limits, and scrubbers function under load | Policy effectiveness and false-positive audit |
+| Post-Change Regression | Ensure new code releases do not degrade line-rate | Delta comparison report |
+| Incident Drill / GameDay | Evaluate cross-team coordination and runbooks | Incident response timeline report |
 
-## Kurallar Altinda Test Nasil Yurutulur?
+## Rules of Engagement Workflow
 
-Kurumsal bir test su sira ile yürütülmelidir:
+Every enterprise resilience evaluation must follow a disciplined operational progression:
 
-1. Is hedefi tanimlanir
-2. Teknik kapsam ve sinirlar yazilir
-3. Yetki/onay kaydi alinır
-4. Ortam siniflandirilir: lab, staging, pre-prod, dedicated prod window
-5. Baseline alinir
-6. Test dozu kademeli artirilir
-7. Guardrail metrikleri canli izlenir
-8. Gerekirse test durdurulur ve rollback uygulanir
-9. Sonuc, teknik + is etkisi birlikte raporlanir
+1. Define business objectives and critical user journeys.
+2. Formulate technical scope, network interfaces, and concurrency limits.
+3. Secure written authorization from infrastructure stakeholders.
+4. Classify test environment: Lab, Staging, Pre-Production, or Dedicated Maintenance Window.
+5. Capture a clean baseline under normal load.
+6. Increase traffic load incrementally using graduated steps.
+7. Monitor operational guardrails in real time.
+8. Trigger immediate abort and rollback if guardrails are breached.
+9. Publish comprehensive findings incorporating technical metrics and business impact analysis.
 
-## Testten Once Sorulmasi Gereken Sorular
+## Pre-Test Planning Questionnaire
 
-### Is Tarafi
+### Business Dimension
 
-- Hangi hizmet dogrulaniyor?
-- Basarisiz olursa is etkisi ne?
-- Test penceresi hangi saatlerde guvenli?
-- Kim "durdur" deme yetkisine sahip?
+- Which revenue-critical user journey or service is under evaluation?
+- What is the business impact if the test causes unintended degradation?
+- During which maintenance hours is testing authorized?
+- Who possesses the authority to command an emergency abort?
 
-### Teknik Taraf
+### Technical Dimension
 
-- Hedef ortam staging mi, canliya yakin pre-prod mu?
-- WAF/CDN/LB/ingress zinciri net mi?
-- Baseline metrikler mevcut mu?
-- Hangi backend/path testte bekleniyor?
-- Hangi alarm esikleri test boyunca takip edilecek?
+- Is the target environment isolated staging, or an active pre-production replica?
+- Are edge ingress, WAF, load balancers, and upstream proxies mapped out?
+- Do steady-state baseline metrics exist for comparative analysis?
+- Which dataplane backend (e.g., AF_XDP, TX_RING) is expected during execution?
+- Which monitoring dashboards and metric alerts will track guardrails?
 
-### Operasyon Tarafi
+### Operational Dimension
 
-- Iletisim kanali ne? (`Slack/Teams/telefon bridge`)
-- Incident commander kim?
-- Rollback sahibi kim?
-- Log, report, pcap, dashboard snapshot nerede tutulacak?
+- What dedicated communication bridge will teams use (`Slack/Teams/voice bridge`)?
+- Who acts as Incident Commander during the testing window?
+- Who executes the rollback plan if downstream nodes destabilize?
+- Where will execution reports, PCAP captures, and dashboard snapshots be archived?
 
-## Kurumsal Guardrail'ler
+## Enterprise Guardrails
 
-Kurumsal testte yalnizca "maksimum throughput" izlenmez. Asagidaki alanlar
-guardrail olarak onceden ilan edilmelidir:
+Enterprise testing must never focus solely on driving peak throughput. The following operational guardrails must be continuously monitored:
 
-- hata orani
-- timeout orani
-- `5xx` oranı
-- WAF / rate-limit kararları
-- LB health check bozulmasi
-- DB queue backlog
-- worker restart sayisi
-- CPU, memory, NIC queue ve packet drop sinyalleri
+- Client request error rate percentage
+- Upstream gateway timeout frequency
+- HTTP `5xx` internal server error spikes
+- WAF false-positive challenge and block rates
+- Load balancer health-check failures and node eviction
+- Database connection pool exhaustion and queue backlogs
+- Application worker crashes or container restarts
+- CPU throttling, memory exhaustion, and NIC packet drop counters
 
-Kisa kural:
+Operational rule:
+If traffic volume increases while upstream service quality degrades beyond guardrails, the test is not successful.
 
-- throughput artisiyla birlikte servis kalitesi bozuluyorsa test "basarili" sayilmaz
+## Enterprise Acceptance Criteria
 
-## Kurumsal Kabul Kriterleri
+Predefine operational thresholds before initiating load:
 
-Testten once su ifade net olmalidir:
+- `pass`: The infrastructure sustains target concurrency and throughput within SLA latency limits.
+- `pass_with_constraints`: The service remains stable, but specific tuning or capacity ceilings were identified.
+- `fail`: The target failed to sustain load, or defense mechanisms did not activate as designed.
+- `abort`: The test was intentionally terminated early due to guardrail violations.
 
-- hangi seviyeye kadar sistem "kabul edilebilir"
-- hangi noktada "degrade ama kabul"
-- hangi noktada "testi durdur"
+## Enterprise Scenario Design Formula
 
-Ornek kabul siniflari:
+Every enterprise resilience scenario should be specified across seven core dimensions:
 
-- `pass`: hizmet hedeflenen yukte kararlı
-- `pass_with_constraints`: hizmet calisiyor ama tuning veya kapasite siniri var
-- `fail`: savunma/pacing/kapasite hedefi saglanmadi
-- `abort`: test guardrail ihlali nedeniyle bilincli durduruldu
+1. Business Objective
+2. Technical Target
+3. Traffic Workload Model
+4. Success Criteria
+5. Abort Criteria
+6. Required Artifacts
+7. Recommended Next Actions
 
-## Senaryo Tasarlama Formulu
+## Example Scenario 1 - Enterprise E-Commerce Campaign Readiness Test
 
-Her kurumsal test senaryosu asagidaki 7 alanla tanimlanabilir:
+### Business Context
 
-1. Is amaci
-2. Teknik hedef
-3. Trafik modeli
-4. Basari kriteri
-5. Stop kriteri
-6. Artefact listesi
-7. Sonraki aksiyon
+Prior to a major promotional event or seasonal sale, an enterprise e-commerce platform must ensure that its core user funnel:
 
-Bu format kullanildiginda farkli ekipler ayni testten ayni seyi anlar.
+- Homepage
+- Category browsing
+- Product detail pages
+- Shopping cart
+- User authentication
+- Checkout submission API
 
-## Ornek 1 - E-Ticaret Sitesi Altyapi Testi
+can sustain projected peak traffic without performance degradation or service outage.
 
-### Is Baglami
+The operational objective is not to force an outage, but to resolve critical capacity questions:
 
-Bir e-ticaret sirketi, indirim gunu veya kampanya penceresi oncesinde:
+- Up to what concurrency level does the infrastructure scale smoothly?
+- Do edge CDNs, WAF appliances, and load balancers distribute load symmetrically?
+- Is critical checkout traffic isolated from high-volume catalog browsing?
+- Where is the first architectural bottleneck during traffic surges?
 
-- ana sayfa
-- urun listeleme
-- urun detay
-- sepet
-- login
-- odeme oncesi checkout API
+### Scope and Constraints
 
-akisini bozmadan tasiyabildigini dogrulamak ister.
+- Dedicated pre-production environment with production parity.
+- Explicit private target VIP: `10.20.30.40`.
+- Synthetic traffic containing zero real customer credentials or PII.
+- Payment gateway integration connected to a mock sandbox provider.
 
-Buradaki amac "siteyi zorla bozmak" degil, su sorulara cevap bulmaktir:
+### Traffic Composition Model
 
-- altyapi hangi noktaya kadar kontrollu sekilde buyuyebiliyor?
-- WAF/CDN/load balancer beklenen davranisi gosteriyor mu?
-- checkout'a giden kritik yol, browse trafiğinden ayrisilabiliyor mu?
-- kampanya gununde ilk kirilan katman hangisi olur?
+Realistic enterprise e-commerce traffic is never uniform. A representative distribution:
 
-### Kapsam
+- `50%` Catalog browsing: Homepage, category filters, product detail views.
+- `20%` Product catalog search queries.
+- `15%` User login and session refresh operations.
+- `10%` Cart modifications and additions.
+- `5%` Checkout submission API (directed to sandbox provider).
 
-- staging veya pre-prod ortami
-- private target listesi
-- gercek musteri verisi icermeyen sentetik trafik
-- odeme entegrasyonunda sandbox / mock provider
+### Technical Validation Objectives
 
-### Trafik Siniflari
+- Ingress load balancer connection queue depth.
+- Edge cache hit ratio vs. origin forward rates.
+- API gateway rate-limiting stability.
+- Response latency percentiles (p95, p99) along the checkout path.
+- WAF challenge accuracy without false-positive blocking of legitimate browsing.
 
-Kurumsal e-ticaret testinde trafik tek tip olmamalidir. Ornek dagilim:
+### Abort Criteria
 
-- `%50` browse: ana sayfa + kategori + urun detay
-- `%20` arama
-- `%15` login / session yenileme
-- `%10` sepet
-- `%5` checkout API (sandbox)
+Immediately terminate execution if:
 
-### Teknik Dogrulama Hedefleri
+- Checkout sandbox API response times exceed 3000 ms over a 30-second window.
+- Aggregate HTTP `5xx` response codes exceed 1.0% of total volume.
+- Backend load balancers evict healthy nodes due to failed health probes.
+- Upstream database connection backlogs exceed safe operating limits.
 
-- ingress/LB altinda queue birikimi var mi?
-- cache hit/miss degisimi ne?
-- API gateway rate limit davranisi stabil mi?
-- checkout yolunda ayrica timeout artisi oluyor mu?
-- WAF yanlis pozitif uretmeden korunma sagliyor mu?
+### Required Artifacts
 
-### Stop Kriterleri
+- Comprehensive execution report (`run_report.json` and `run_report.md`).
+- Ingress load balancer dashboard snapshots.
+- Latency percentile and HTTP status code distribution charts.
+- WAF decision and challenge logs.
+- Archived application and Samurai engine logs.
 
-Asagidakilerden biri olursa test durdurulur:
+### Expected Outcome Classifications
 
-- checkout sandbox akisi kabul edilen timeout esigini asarsa
-- `5xx` oranı onceden belirlenen guardrail'i gecerse
-- health check basarisizligi nedeniyle node drain baslarsa
-- DB veya queue backlog tehlikeli seviyeye cikarsa
+- Catalog browsing scales smoothly, but checkout API times out:
+  Finding: Insufficient queue isolation between browsing and transactional traffic.
+- WAF blocks traffic, but produces false positives on customer logins:
+  Finding: Behavioral rate-limiting rules require targeted tuning.
+- Ingress layer remains stable, but application workers exhaust memory:
+  Finding: Application service layer is the primary capacity bottleneck.
 
-### Beklenen Artefact'lar
+### Operational Walkthrough - Pre-Production Maintenance Window
 
-- run report
-- upstream / ingress dashboard snapshot
-- `5xx`, latency ve saturation grafigi
-- WAF / rate limit kararlari
-- artifact dizini icinde log + config snapshot
+The following procedure demonstrates a controlled, multi-stage resilience evaluation.
 
-### Olası Sonuc Siniflari
+Environment Assumptions:
+- Pre-production VIP: `10.20.30.40`
+- TLS termination enabled at ingress
+- Checkout sandbox backend isolated
+- Authorized test window: 22:00 - 23:00 UTC
 
-- browse tasiyor ama checkout bozuluyor
-  Sonuc: kritik yol ayrimi yetersiz
-- WAF koruyor ama login'de yanlis pozitif var
-  Sonuc: savunma kurali ince tuning ister
-- LB / ingress stabil ama app worker saturasyonunda gecikme buyuyor
-  Sonuc: uygulama katmani bottleneck
+#### Baseline Configuration File
 
-### Profesyonel Kullanim Ornegi - E-Ticaret Pre-Prod Penceresi
-
-Asagidaki ornek, kampanya oncesi pre-prod ortaminda "browse + login + checkout"
-karisimini kontrollu sekilde dogrulamak icin kullanilabilir.
-
-Ortam varsayimi:
-
-- pre-prod VIP: `10.20.30.40`
-- ingress TLS sonlandirma aktif
-- checkout sandbox upstream'i ayri
-- test penceresi: 22:00 - 23:00
-
-#### Ornek Config
-
-`artifacts/configs/ecommerce_preprod_baseline.yaml`
+`artifacts/configs/ecommerce_preprod_baseline.yaml`:
 
 ```yaml
 target: 10.20.30.40
@@ -250,7 +237,7 @@ http_scheme: https
 http_method: GET
 http_path:
   - /
-  - /category/kampanya
+  - /category/promotions
   - /product/sku-1001
   - /login
   - /cart
@@ -267,43 +254,39 @@ run_report_dir: artifacts/reports/ecommerce_preprod
 log: artifacts/logs/ecommerce_preprod_baseline.log
 ```
 
-#### Adim 1 - Dry-Run
+#### Step 1: Preflight Dry-Run
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --config artifacts/configs/ecommerce_preprod_baseline.yaml \
   --dry-run \
   --confirm
 ```
 
-Beklenen:
+Validation objectives:
+- Confirm configuration parses cleanly.
+- Verify target IP, port, and URL paths are accepted.
+- Validate worker allocation prior to initiating traffic.
 
-- config parse temiz
-- hedef, protokol ve path seti kabul edilir
-- operasyona girmeden once teknik zemin dogrulanir
-
-#### Adim 2 - Baseline Kosusu
+#### Step 2: Reference Baseline Run
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --config artifacts/configs/ecommerce_preprod_baseline.yaml \
   --confirm
 ```
 
-Bu kosudan sonra kaydedilecekler:
+Post-run validation:
+- Archive `run_report.json` and `run_report.md`.
+- Export ingress controller metrics and latency percentiles.
+- Verify zero guardrail violations.
 
-- `run_report.json`
-- `run_report.md`
-- ingress dashboard screenshot
-- app `5xx` ve latency grafikleri
-- WAF/rate-limit karar ozetleri
+#### Step 3: Controlled Incremental Ramp-Up
 
-#### Adim 3 - Kontrollu Artis
-
-Ayni config uzerinden yalnizca doz artisina gidilir:
+Gradually increase load to projected peak volumes:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --config artifacts/configs/ecommerce_preprod_baseline.yaml \
   --rps 2600 \
   --count 120000 \
@@ -312,44 +295,32 @@ python -m ddos_samurai.cli \
   --confirm
 ```
 
-#### Profesyonel Yorumlama
+#### Professional Evaluation Matrix
 
-Asagidaki tablo, bu is orneginde nasil karar verilecegini gosterir:
-
-| Gozlem | Teknik yorum | Is yorumu | Aksiyon |
+| Metric Observation | Technical Diagnosis | Business Impact | Remediation Action |
 |---|---|---|---|
-| browse stabil, checkout timeout artiyor | kritik yol ayrimi zayif | kampanya gunu odeme once etkilenir | checkout upstream ayristir |
-| WAF login path'te fazla challenge atiyor | yanlis pozitif | gercek kullanici giris akisi etkilenebilir | login kurali tuning |
-| `5xx` yok ama latency sert artis var | kapasite sinirina yaklasiliyor | musteri deneyimi bozulabilir | autoscaling / queue tuning |
+| Browsing remains stable; checkout latency surges | Inadequate queue separation on upstream routers | Checkout funnel degrades during sales surges | Implement dedicated upstream ingress pool for checkout |
+| WAF challenges spike on `/login` | Heuristic rate limits tuned too aggressively | Legitimate returning customers cannot log in | Tune rate-limiting thresholds on auth endpoints |
+| Zero `5xx` errors, but p99 latency climbs steeply | Application workers approaching concurrency saturation | Sub-optimal customer experience | Configure auto-scaling rules with lower CPU thresholds |
 
-#### Bu Ornekten Cikan Kurumsal Sonuc Cumlesi
+#### Executive Summary Statement
 
-"Pre-prod kampanya testinde browse akisları hedef hacimde kararlı kaldi; ancak
-checkout health yolunda timeout trendi erken basladi. Sonuc olarak kampanya
-oncesi checkout upstream ayrimi ve ingress-level kritik yol korumasi önerildi."
+"Pre-production campaign readiness testing demonstrated that catalog browsing remains stable at 2,600 RPS. However, checkout API health probes exhibited latency degradation under sustained concurrency. Prior to the promotion, we recommend isolating checkout upstream pools and implementing dedicated ingress priority queuing."
 
-### GPU Tabanli E-Ticaret Senaryolari
+### GPU-Accelerated E-Commerce Workloads
 
-GPU burada "tam L7 network stack" degil, uretim/planning hizlandiricisi olarak
-dusunulmelidir. Bu nedenle GPU tabanli senaryolar en cok su amaclarla deger
-uretir:
+In high-volume e-commerce testing, GPU hardware acceleration acts as a high-density packet generator and traffic modeler rather than a full stateful browser stack:
 
-- buyuk hacimli browse/payload varyasyonu uretmek
-- edge/cache/LB katmanlarini kontrollu sekilde beslemek
-- CPU vs GPU uretim zincirini karsilastirmak
-- staged `GPU -> host pinned RAM -> NIC` yolunda darbogazi bulmak
+- Synthesizing massive catalog browsing and payload variance.
+- Stressing edge reverse proxies, CDN points of presence, and ingress load balancers.
+- Comparing CPU vs. GPU packet generation pipelines.
+- Identifying bottlenecks across PCIe bus, host pinned memory, and NIC queues.
 
-Kisa kural:
+#### GPU Workload 1 - High-Density Catalog Browsing Baseline
 
-- checkout gibi kritik stateful is yollarinda GPU'yu "yardimci producer" olarak dusun
-- asil karar noktasi yine ag yolu, queue yapisi ve servis davranisidir
+Stresses edge caching and ingress distribution using GPU packet synthesis.
 
-#### GPU Senaryo 1 - Kampanya Browse Katmani Baseline
-
-Bu senaryo, ana sayfa + kategori + urun detay agirlikli browse akisini GPU
-uretim zinciri ile besleyip edge/cache/ingress davranisini gozlemlemek icindir.
-
-`artifacts/configs/ecommerce_gpu_browse_baseline.yaml`
+`artifacts/configs/ecommerce_gpu_browse_baseline.yaml`:
 
 ```yaml
 target: 10.20.30.40
@@ -372,47 +343,29 @@ run_report_dir: artifacts/reports/ecommerce_gpu_browse
 log: artifacts/logs/ecommerce_gpu_browse.log
 ```
 
-Dry-run:
+Dry-run validation:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --config artifacts/configs/ecommerce_gpu_browse_baseline.yaml \
   --dry-run \
   --confirm
 ```
 
-Baseline:
+Live baseline run:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --config artifacts/configs/ecommerce_gpu_browse_baseline.yaml \
   --confirm
 ```
 
-Bu kosuda özellikle bakilacaklar:
+#### GPU Workload 2 - Edge Layer Warmup and Capacity Evaluation
 
-- `gpu_ring_depth_peak`
-- `gpu_ring_block_wait_ns`
-- ingress saturation sinyalleri
-- cache hit/miss degisimi
-- `rate_accuracy_pct`
-
-Profesyonel yorum:
-
-- GPU acik ama throughput artmiyorsa once sender/backend tarafina bak
-- cache katmani stabil ama app latency artiyorsa edge degil uygulama darboğazi vardir
-- `gpu_ring_block_wait_ns` yuksekse GPU producer host/NIC tarafini bekliyor olabilir
-
-#### GPU Senaryo 2 - Statik Icerik / Edge Katmani Isitma ve Karsilastirma
-
-Bu senaryo, kampanya oncesi statik varliklarin veya CDN/edge tarafinin
-hazirlik seviyesini olcmek icin kullanilir. Amaç checkout degil, browse ve
-asset dagitim zinciridir.
-
-Ornek kosu:
+Evaluates whether CDN edges and ingress load balancers can handle sudden traffic surges without cache thrashing.
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.20.30.40 \
   --port 443 \
   --protocol tcp \
@@ -432,29 +385,12 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/ecommerce_gpu_edge_warmup.log
 ```
 
-Bu örnekte aranacak cevaplar:
+#### GPU Workload 3 - Extended Endurance Soak Test
 
-- edge/LB katmani hizli doyuyor mu?
-- GPU uretimi ile besleme artinca ilk kirilan katman ingress mi?
-- queue/pinning ayarlari degisince edge throughput fark ediyor mu?
-
-Karar rehberi:
-
-| Gozlem | Teknik yorum | Is yorumu | Aksiyon |
-|---|---|---|---|
-| edge stabil, origin bozuluyor | sorun cache arkasinda | kampanya gunu origin riskli | origin autoscaling/tuning |
-| edge de erken saturation var | LB/CDN/ingress sınıri | kampanya başında ilk kirilim burada olabilir | edge kapasite gözden geçir |
-| GPU degisince fark az | uretim degil ağ yolu darboğaz | GPU optimizasyonu erken olabilir | once TX/queue/NUMA |
-
-#### GPU Senaryo 3 - Kampanya Oncesi GPU Soak
-
-Bu senaryo, uzun sureli browse agirlikli yukte GPU producer + host pinned pool
-+ sender zincirinin drift uretip uretmedigini gormek icindir.
-
-Ornek kosu:
+Validates host DMA memory and GPU ring stability under sustained 1-hour generation:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.20.30.40 \
   --port 443 \
   --protocol tcp \
@@ -482,29 +418,14 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/ecommerce_gpu_soak.log
 ```
 
-Bu senaryoda guardrail'ler:
+#### GPU Workload 4 - CPU vs GPU A/B Comparative Analysis
 
-- pinned memory growth
-- backlog birikimi
-- uzun kosuda `rate_accuracy_pct` drift'i
-- ingress/app timeout trendi
+Determines whether GPU offloading delivers measurable efficiency gains over CPU generation.
 
-Kurumsal yorum:
-
-- kisa benchmark iyi olsa da soak'ta drift varsa kampanya gunu riski devam eder
-- GPU producer kararlı ama app timeout artiyorsa sorun yine servis katmanindadir
-- soak boyunca `gpu_ring_depth_peak` ve backlog buyuyorsa producer-consumer dengesi yeniden ayarlanmalidir
-
-#### GPU Senaryo 4 - CPU vs GPU A/B E-Ticaret Browse Karsilastirmasi
-
-Bu senaryo, "GPU eklemek gercekten is degeri uretmis mi?" sorusunu cevaplamak
-icin kullanilir. Iki kosuda da ayni hedef, ayni worker sayisi ve ayni run
-report standardi korunur.
-
-CPU kosusu:
+CPU Reference:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.20.30.40 \
   --port 443 \
   --protocol tcp \
@@ -517,10 +438,10 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/ecommerce_cpu_ab.log
 ```
 
-GPU kosusu:
+GPU Accelerated Counterpart:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.20.30.40 \
   --port 443 \
   --protocol tcp \
@@ -540,96 +461,57 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/ecommerce_gpu_ab.log
 ```
 
-Beklenen profesyonel soru:
+## Example Scenario 2 - Defensive Security and SOC / MDR Resilience Audit
 
-- GPU eklenince gercek kazanc throughput'ta mi, CPU bosalmasinda mi, yoksa hicbirinde mi?
+### Business Context
 
-Bu A/B karsilastirma ile su ayrim yapilir:
+A cybersecurity operations center (SOC) or Managed Detection and Response (MDR) provider must validate defense automation, telemetry pipelines, and escalation workflows:
 
-- GPU fayda sagliyor ama edge/LB yine ayni yerde tikanıyor
-- GPU fayda saglamiyor, darboğaz TX path / NUMA / queue tarafinda
-- GPU fayda sagliyor ama soak kararliligi düşüyor
+- Do defensive rate-limiting and challenge rules activate accurately under load?
+- Does the security information and event management (SIEM) pipeline drop telemetry events during traffic surges?
+- Do security analysts receive automated escalations within acceptable SLA windows?
+- Does the architecture successfully isolate malicious traffic without disrupting legitimate customer services?
 
-## Ornek 2 - Savunma Odakli Guvenlik Sirketi Icin Is Senaryosu
+### Scope and Constraints
 
-### Is Baglami
+- Isolated customer staging testbed or contractual lab network.
+- Approved destination IP and CIDR allowlists.
+- Explicit maintenance window and active Incident Commander.
+- Pre-authorized traffic patterns and headers.
 
-Bir savunma odakli guvenlik sirketi veya SOC/MDR hizmeti veren kurum, kendi
-platformu ya da musteri icin su sorulari cevaplamak isteyebilir:
+### Technical Validation Objectives
 
-- koruma katmani dogru tetikleniyor mu?
-- telemetry pipeline yuk altinda kayip veriyor mu?
-- alarm ve escalation zinciri test sirasinda gecikiyor mu?
-- "servis devam ederken savunma" ilkesi gercekten calisiyor mu?
+- Verify inline WAF, traffic filtering appliances, and rate-limiting rules engage correctly.
+- Ensure protection policies trigger without causing false-positive blocking of valid traffic.
+- Detect event loss or processing backpressure in telemetry ingestion queues.
+- Measure latency between traffic onset and security analyst alert generation.
 
-Bu senaryoda odak:
+### Abort Criteria
 
-- mavi takim operasyonu
-- koruma kurali dogrulama
-- log/telemetry devamlıligi
-- incident response koordinasyonu
+- Telemetry pipeline event loss exceeds 5.0%.
+- Defensive policies inadvertently block core internal API endpoints.
+- Excessive alert noise risks masking legitimate production anomalies.
+- Customer SLA thresholds are breached.
 
-### Kapsam
+### Required Artifacts
 
-- izole musteri lab'i veya sozlesmeli test ortami
-- onayli IP/CIDR allowlist
-- zaman penceresi ve acil durdurma kisileri yazili
-- testte kullanilan tum pattern'ler onceden kabul edilmis
+- Formal execution report (`run_report.json` and `run_report.md`).
+- WAF and firewall policy enforcement logs.
+- SIEM telemetry ingestion latency charts.
+- Security operations incident escalation timeline.
+- Comprehensive findings summary.
 
-### Teknik Hedefler
+### Operational Walkthrough - Defense Validation Window
 
-- WAF / anti-DDoS politika zinciri dogru devreye giriyor mu?
-- yanlis pozitif olmadan koruma aktivasyonu oluyor mu?
-- telemetry pipeline'da event drop var mi?
-- rate limit / challenge / block politikasi kontrollu sekilde isliyor mu?
-- SOC ekranlarina dusen alarm ile sahadaki olay arasinda gecikme ne kadar?
+Environment Assumptions:
+- Testing VIP: `10.50.60.70`
+- Upstream WAF and policy evaluation engine active
+- Dedicated private network testing environment
+- Active escalation bridge on standby
 
-### Kurumsal Dogrulama Noktalari
+#### Configuration Specification
 
-- Koruma acildi ama servis ayakta kaldi mi?
-- Savunma acildi ama kritik API'ler de etkilenip kapanmadi mi?
-- Runbook'taki kisiler dogru sirada devreye girdi mi?
-- Metrik ve log'lar olay sonrasinda forensik icin yeterli mi?
-
-### Stop Kriterleri
-
-- telemetri kaybi kabul edilemez seviyeye cikarsa
-- koruma politikasi kritik servisleri bloke ederse
-- alarm yorgunlugu yaratacak kadar noise olusursa
-- musteri SLA guardrail'i ihlal edilirse
-
-### Beklenen Artefact'lar
-
-- run report
-- WAF/policy event kayitlari
-- SIEM / telemetry pipeline ozetleri
-- escalation timeline
-- "ne oldu / ne dogru calisti / ne bozuldu" ozet notu
-
-### Olası Sonuc Siniflari
-
-- koruma var ama telemetry gec geliyor
-  Sonuc: savunma gorunurlugu eksik
-- telemetry saglam ama policy gec devreye giriyor
-  Sonuc: detect var, react gec
-- policy hizli ama yanlis pozitif yuksek
-  Sonuc: operasyonel tuning gerekir
-
-### Profesyonel Kullanim Ornegi - Savunma Dogrulama Penceresi
-
-Asagidaki ornek, bir guvenlik/savunma sirketinin musteri lab ortaminda koruma
-politikasini ve telemetry akislarini birlikte dogrulamak icin kullanilabilir.
-
-Ortam varsayimi:
-
-- test VIP: `10.50.60.70`
-- onunde WAF/CDN/policy zinciri var
-- musteri lab'i private agda
-- escalation kanali aktif
-
-#### Ornek Config
-
-`artifacts/configs/defense_validation_http2.yaml`
+`artifacts/configs/defense_validation_http2.yaml`:
 
 ```yaml
 target: 10.50.60.70
@@ -655,200 +537,142 @@ run_report_dir: artifacts/reports/defense_validation
 log: artifacts/logs/defense_validation_http2.log
 ```
 
-#### Adim 1 - Dry-Run ve Scope Dogrulama
+#### Step 1: Preflight Verification
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --config artifacts/configs/defense_validation_http2.yaml \
   --dry-run \
   --confirm
 ```
 
-Beklenen:
-
-- transport secimi dogrulansin
-- path seti, concurrency ve worker dagilimi parse edilsin
-- test penceresi oncesi teknik hata kalmasin
-
-#### Adim 2 - Savunma Dogrulama Kosusu
+#### Step 2: Live Defense Validation Run
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --config artifacts/configs/defense_validation_http2.yaml \
   --confirm
 ```
 
-Bu kosuda teknik ekip yalnizca run report bakmaz. Eszamanli izlenecekler:
+During execution, the security team simultaneously tracks:
+- WAF challenge and drop statistics.
+- SIEM ingestion queue depth.
+- Telemetry backpressure and worker CPU utilization.
+- Time elapsed until SOC dashboard alerts trigger.
 
-- WAF / challenge / block event'leri
-- SIEM ingestion gecikmesi
-- telemetry pipeline queue/backlog durumu
-- escalation kanalinda alarm dusme zamani
+#### Step 3: Comparative Threshold Evaluation
 
-#### Adim 3 - Policy Reaksiyonunu Karsilastirmali Gozlem
-
-Ayni test, daha dusuk concurrency ile tekrar edilip "erken policy tetigi mi,
-yoksa hacimle gelen reaksiyon mu" ayrilir:
+Re-execute with modified concurrency to evaluate whether defense triggers depend on instantaneous burst rate or aggregate volume:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --config artifacts/configs/defense_validation_http2.yaml \
-  --http2_concurrency 120 \
+  --http2-concurrency 120 \
   --count 30000 \
   --run-report-dir artifacts/reports/defense_validation_step2 \
   --log artifacts/logs/defense_validation_step2.log \
   --confirm
 ```
 
-#### Profesyonel Yorumlama
+#### Defensive Evaluation Matrix
 
-| Gozlem | Teknik yorum | Is yorumu | Aksiyon |
+| Metric Observation | Technical Diagnosis | Business Impact | Remediation Action |
 |---|---|---|---|
-| policy aciliyor ama telemetry gec geliyor | koruma var, gorunurluk zayif | olay sonrasi analiz riskli | telemetry pipeline boyutlandir |
-| challenge hizli ama kritik API de etkileniyor | false positive | musteri servisi etkilenebilir | policy ayrimi yap |
-| alarm gec dusuyor | detect/react zinciri yavas | SOC operasyon gec kalabilir | escalation ve SIEM tuning |
+| Mitigation triggers cleanly, but SIEM events are delayed | Policy works, but telemetry pipeline is saturated | Forensic investigation is delayed during active incidents | Scale telemetry ingestion queue workers |
+| Challenges activate rapidly, but legitimate health checks fail | Broad, unsegmented policy rules | Essential microservices experience transient outages | Whitelist internal health-check endpoints |
+| SOC alert generation takes > 10 minutes | Complex correlation rule evaluation delays notification | Slower Mean Time to Respond (MTTR) | Optimize SIEM streaming correlation rules |
 
-#### Bu Ornekten Cikan Kurumsal Sonuc Cumlesi
+#### Executive Summary Statement
 
-"Koruma katmani test penceresinde beklendigi gibi devreye girdi; ancak telemetry
-ingestion gecikmesi nedeniyle SOC ekranina yansiyan olay ile sahadaki karar
-arasinda fark olustu. Sonuc olarak policy tarafi kabul edildi, telemetry hattı
-icin ek kapasite ve alarm zinciri iyilestirmesi onerildi."
+"The edge defense layer successfully mitigated simulated traffic surges according to policy. However, telemetry ingestion delays produced a 12-minute gap between mitigation enforcement and SOC dashboard visibility. We recommend allocating additional pipeline workers to the SIEM log forwarders to ensure real-time visibility."
 
-## Profesyonel Kullanimda Dosya ve Artefact Duzeni
+## Enterprise Artifact Repository Structure
 
-Gercek ekipler testleri tek komutla degil, kalici artefact duzeni ile yürütür.
-Tavsiye edilen dizin:
+Maintain a structured, centralized repository for all test artifacts:
 
 ```text
 artifacts/
 ├── configs/
+│   ├── ecommerce_preprod_baseline.yaml
+│   └── defense_validation_http2.yaml
 ├── reports/
 │   ├── ecommerce_preprod/
 │   └── defense_validation/
 ├── logs/
+│   ├── ecommerce_preprod_baseline.log
+│   └── defense_validation_http2.log
 └── snapshots/
+    ├── ingress_dashboards/
+    └── siem_timelines/
 ```
 
-Kisa kural:
+Operational standards:
+- Dedicate separate configuration files to each test profile.
+- Output each execution phase into an isolated, timestamped report directory.
+- Use unified test run identifiers across log files and dashboard screenshots.
 
-- her is senaryosunun config'i ayri dosyada olsun
-- her step ayri report dizinine yazilsin
-- log ve dashboard snapshot'lari ayni test id'si ile isimlendirilsin
+## Graduated Workload Ramp-Up Principles
 
-## Test Dozunu Artirma Kurali
+Never apply peak traffic volume immediately. Follow a disciplined ramp-up curve:
 
-Kurumsal testlerde yuk aniden verilmez. Tipik artis modeli:
+1. Smoke test: Verify end-to-end connectivity.
+2. Baseline run: Confirm steady-state metrics.
+3. Graduated ramp-up: Step through 25%, 50%, and 75% of target volume.
+4. Target peak load: Evaluate system behavior at 100% capacity.
+5. Longevity soak: Validate endurance across an extended duration.
 
-1. smoke
-2. kisa baseline
-3. kademeli artis
-4. hedef seviye
-5. gerekirse soak
+Operational Rule:
+Validate behavior before volume; verify stability before introducing stress.
 
-Kisa kural:
+## Dual-Track Reporting: Technical and Business Communication
 
-- once davranis, sonra hacim
-- once stabilite, sonra stres
+Enterprise test reports must present findings in two distinct formats:
 
-## Teknik ve Is Dili Birlikte Raporlanmalidir
+### Technical Summary
 
-Kurumsal raporlar yalnizca teknik jargon icermemelidir. Her sonuc iki dilde
-anlatilmalidir:
+- Exact transmission backends and kernel drivers utilized.
+- Operational guardrails tracked and violation thresholds.
+- Concrete pass/fail metrics across latency, error rate, and throughput.
+- Physical bottlenecks identified (e.g., PCIe bus, socket buffer, DB connection pool).
 
-### Teknik Ozet
+### Business Impact Summary
 
-- hangi path / backend kullanildi
-- hangi guardrail ihlal edildi
-- hangi metrikler pass/fail oldu
-- hangi bottleneck goruldu
+- Projected impact on real customer transactions and revenue funnels.
+- Specific microservices or functional business areas exposed to risk.
+- Implications for upcoming sales campaigns, SLAs, or security compliance audits.
+- Prioritized engineering recommendations with estimated remediation effort.
 
-### Is Ozet
-
-- musteri etkisi olur muydu?
-- hangi servisler riskli?
-- kampanya / SLA / mavi takim operasyonu acisindan sonucu nedir?
-- sonraki aksiyon ne?
-
-## Ornek Sonuc Cumleleri
-
-### E-Ticaret
-
-"Browse trafiği hedef hacimde tasindi; ancak checkout API timeout oranı kabul
-esigini astigi icin kritik yol ayrimi yetersiz bulundu. Sonraki adim,
-checkout upstream'i icin ayrik queue ve rate guardrail calismasidir."
-
-### Savunma Odakli Guvenlik Sirketi
-
-"Koruma politikasi devreye girdi ve servis ayakta kaldi; ancak SIEM tarafinda
-event gecikmesi kabul edilebilir seviyenin uzerine cikti. Sonraki adim,
-telemetry ingestion hattinin yuk altinda yeniden boyutlandirilmasidir."
-
-## Sık Yapilan Kurumsal Hatalar
-
-### Hata 1: Yetki ile kapsamı karistirmak
-
-"Test icin izin var" ifadesi tek basina yeterli degildir.
-Hangi hedef, hangi saat, hangi hacim, hangi guardrail sorulari yazili olmali.
-
-### Hata 2: Tek endpoint ile tum sistemi temsil ettigini sanmak
-
-Gercek is akislari cok endpoint'li ve farkli oncelik katmanlarina sahiptir.
-Tek endpoint testi kurumsal riskin tam resmini vermez.
-
-### Hata 3: Stop kriterini test sirasinda uydurmak
-
-Kurumsal testte "biraz daha bakalim" yaklasimi risklidir.
-Stop kriteri testten once tanimli olmali.
-
-### Hata 4: Sadece throughput'a bakmak
-
-Kurumsal testte servis kalitesi, savunma davranisi ve gozlemlenebilirlik en az
-throughput kadar onemlidir.
-
-### Hata 5: Raporu yalnizca teknik ekibe yazmak
-
-Kurumsal kararlar teknik + is dilinin birlikte kullanildigi raporlar uzerinden verilir.
-
-## Profesyonel Senaryo Sabonu
-
-Asagidaki sablon yeni testler icin tekrar kullanilabilir:
+## Reusable Enterprise Scenario Template
 
 ```text
-Senaryo adi:
-Is amaci:
-Hedef ortam:
-Yetki/kapsam referansi:
-Teknik hedef:
-Trafik siniflari:
-Kabul kriteri:
-Stop kriteri:
-Rollback sahibi:
-Artefact listesi:
-Sonraki aksiyon:
+Scenario Name:
+Business Objective:
+Target Environment:
+Authorization / Scope Reference:
+Technical Validation Goals:
+Traffic Workload Model:
+Acceptance Criteria:
+Abort Criteria:
+Rollback Controller:
+Required Artifacts:
+Next Actions:
 ```
 
-## Bu Rehber Nasil Kullanilmali?
+## Recommended Reading Hierarchy
 
-Bu belge en iyi su kombinasyonla kullanilir:
+To maximize the effectiveness of this handbook, review related documentation in sequence:
 
-- testi neden yaptiginizi anlamak icin bu belge
-- testi nasil kosturacaginizi belirlemek icin `docs/22-cli-operational-playbook.md`
-- sonucu nasil yorumlayacaginizi belirlemek icin `docs/23-benchmark-acceptance-handbook.md`
-- hedef ve etik sinirlari netlestirmek icin `docs/07-safety.md`
+- Understand organizational purpose and strategy: This handbook (`docs/24-enterprise-test-scenarios-handbook.md`)
+- Select operational execution commands: `docs/22-cli-operational-playbook.md`
+- Evaluate benchmark validity and acceptance: `docs/23-benchmark-acceptance-handbook.md`
+- Clarify ethical constraints and target safety: `docs/07-safety.md`
 
-## Sonuc
+## Summary
 
-Kurumsal seviye test, yalnizca teknik arac kullanimi degildir. Asil deger:
+Enterprise-grade network testing is fundamentally a risk management and systems engineering discipline. High-value resilience programs succeed by asking the right architectural questions, defining firm operational guardrails, verifying defenses under realistic conditions, and delivering actionable, executive-ready insights.
 
-- dogru is sorusunu sormak
-- test sinirlarini profesyonelce koymak
-- dayaniklilik ve savunma davranisini birlikte dogrulamak
-- sonucu karar verdiren bir rapora donusturmektir
-
-Bu nedenle en iyi testler:
-
-- net yetki ile baslar
-- guardrail ile yürür
-- rollback ile korunur
-- is etkisi diliyle biter
+Core Principles of Excellence:
+- Initiated with explicit authorization
+- Governed by strict operational guardrails
+- Safeguarded by proven rollback plans
+- Concluded with actionable business impact analysis

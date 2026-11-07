@@ -1,62 +1,64 @@
-# 22 - CLI Operasyonel Playbook
+# 22 - CLI Operational Playbook
 
-## Amac
+![Samurai CLI Execution & Worker Lifecycle](assets/diagrams/samurai_cli_lifecycle.svg)
 
-Bu dokuman, `ddos_samurai.cli` icin sadece bayrak referansi degil, gercek is akislarina uygun bir kullanim rehberi sunar.
+## Purpose
 
-Hedef:
+This document provides an end-to-end operational playbook for the Samurai Network Resilience Platform (`./build/ddos_samurai/cli/samurai`), presenting structured operational workflows for testing, benchmarking, and resilience verification.
 
-- yeni bir operatoru hizli sekilde uretken hale getirmek
-- dogru komutu secmeyi kolaylastirmak
-- preflight, benchmark, soak, replay ve artifact uretimi gibi farkli operasyon tiplerini ayirmak
-- kopyalanip uyarlanabilecek dolu komut ornekleri vermek
+Goals:
 
-Bu belge yalnizca yetkili ve izole test/lab ortamlari icin yazilmistir.
+- Rapidly onboard operators to productive execution.
+- Facilitate precise command-line parameter and profile selection.
+- Establish distinct methodologies across preflight checks, application baselines, dataplane benchmarks, soak longevity evaluations, PCAP replays, and artifact generation.
+- Supply production-ready, copy-pasteable command templates.
 
-## Kimler Icin
+This handbook is strictly intended for authorized, isolated laboratory and staging network environments.
 
-- performans muhendisleri
-- platform/SRE ekipleri
-- lab benchmark operatorleri
-- L7 ve dataplane regresyon testi yapan gelistiriciler
-- run-report ve artifact standardi olusturmak isteyen teknik liderler
+## Target Audience
 
-## Operasyon Ilkeleri
+- Performance Engineers
+- Platform and Site Reliability Engineering (SRE) Teams
+- Laboratory Benchmark Operators
+- Layer 7 and Dataplane Developers performing regression evaluations
+- Technical Leads defining benchmark standards and compliance gates
 
-Her ciddi calisma su sirayla ilerlemelidir:
+## Operational Principles
 
-1. Parametreleri dogrula
-2. Hedefin izinli oldugunu dogrula
-3. Dry-run ile parse/preflight gec
-4. Kisa baseline kosusu al
-5. Gerekirse benchmark veya soak kos
-6. Rapor ve artifact topla
-7. Sonucu tekrar uretilebilir hale getir
+Every rigorous performance engagement must proceed through the following phases:
 
-Kisa kural:
+1. Parameter and scope validation
+2. Authorization and boundary verification
+3. Dry-run execution to clear parser and preflight checks
+4. Short baseline verification run
+5. Controlled benchmark or longevity soak execution
+6. Report and artifact aggregation
+7. Statistical reproducibility validation
 
-- `--dry-run` gecmeden live run baslatma
-- root gerektiren yollari ancak lab host'ta calistir
-- `--run-report` kullanmadan uzun kosulari kalici kabul etme
-- dedicated benchmark icin `--lab-profile dedicated` + KPI gate kullan
+Key Operational Rules:
 
-## Ne Zaman Hangi Akis?
+- Never launch a live execution without completing a successful `--dry-run`.
+- Execute privileged kernel-bypass paths (AF_XDP, TX_RING, DPDK) exclusively on dedicated lab infrastructure.
+- Never certify long-running benchmarks without archiving formal run reports via `--run-report`.
+- For authoritative benchmark scoring, always enforce `--lab-profile dedicated` coupled with strict KPI gates.
 
-| Ihtiyac | Uygun Akis |
+## Workflow Selection Matrix
+
+| Operational Need | Recommended Workflow |
 |---|---|
-| Bayraklar dogru mu, config parse oluyor mu? | Dry-run |
-| Kod/ortam saglikli mi? | Self-test |
-| Uygulama seviyesinde HTTP/L7 davranisini hizli dogrulamak | L7 baseline |
-| TX path veya sender fallback davranisini olcmek | Dataplane benchmark |
-| Uzun sureli stabilite, memory growth ve PPS drift gormek | Soak |
-| Gercek trafikten bagimsiz sentetik test verisi uretmek | GPU PCAP |
-| Elinizdeki PCAP'i kontrollu sekilde tekrar oynatmak | PCAP replay |
-| Planner/veri modeli entegrasyonunu trafiksiz dogrulamak | Traffic-model dry-validate |
-| GPU paket uretim zincirini devreye alip throughput calismak | GPU compute backend workflow |
+| Verify flags and validate configuration syntax without traffic | Dry-run validation |
+| Ensure codebase and local environment dependencies are healthy | Automated self-test |
+| Measure baseline application Layer 7 HTTP/HTTPS throughput | Layer 7 baseline |
+| Measure raw line-rate packet transmission and driver efficiency | Dataplane benchmark |
+| Evaluate memory stability, RSS drift, and packet rate degradation | Soak longevity run |
+| Generate synthetic PCAP datasets on hardware accelerators | GPU PCAP generator |
+| Replay historical network capture traces with precise timing | PCAP replay engine |
+| Validate neural traffic model integration without network output | Traffic-model dry-validate |
+| Drive maximum line-rate load using CUDA kernel batching | GPU compute backend workflow |
 
-## Ortam Hazirlik Kontrol Listesi
+## Environment Preparation Checklist
 
-Asagidaki dizin yapisi tavsiye edilir:
+The following directory layout is recommended across operational nodes:
 
 ```text
 artifacts/
@@ -66,33 +68,33 @@ artifacts/
 └── configs/
 ```
 
-Ornek hazirlik:
+Initialize directory tree:
 
 ```bash
 mkdir -p artifacts/reports artifacts/pcaps artifacts/logs artifacts/configs
 ```
 
-Temel kurulum dogrulamasi:
+Verify binary and dependencies:
 
 ```bash
-python -m ddos_samurai.cli --self-test
+./build/ddos_samurai/cli/samurai --self-test
 ```
 
-CLI yardim ve profil listesi:
+Inspect available profiles and command flags:
 
 ```bash
-python -m ddos_samurai.cli --help
-python -m ddos_samurai.cli --list-profiles
+./build/ddos_samurai/cli/samurai --help
+./build/ddos_samurai/cli/samurai --list-profiles
 ```
 
-## Katman 1: Parse ve Preflight Dogrulama
+## Tier 1: Parse and Preflight Validation
 
-Bu asama trafik gondermez. Yeni config, yeni bayrak kombinasyonu veya CI validasyonu icin ilk kapidir.
+Preflight operations transmit zero packets over the wire. This step acts as the primary gate for verifying configuration syntax, flag combinations, and worker thread mapping before engaging network devices.
 
-### Ornek 1: Temel TCP dry-run
+### Example 1: Basic TCP Dry-Run
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.10.20.15 \
   --port 443 \
   --protocol tcp \
@@ -104,16 +106,16 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/basic_dry_run.log
 ```
 
-Bu komutun amaci:
+Validation objectives:
 
-- parser + profile + validation zincirini gecmek
-- worker dagitimini gormek
-- hedef/port/protocol kombinasyonunun kabul edildigini dogrulamak
+- Validate parameter parsing, profile resolution, and schema validation.
+- Review worker process core allocations.
+- Confirm target IP, port, and transport protocol bindings are accepted.
 
-### Ornek 2: HTTP/2 preflight
+### Example 2: HTTP/2 Preflight Check
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.10.30.25 \
   --port 443 \
   --attack-vector http2 \
@@ -131,18 +133,18 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/http2_dry_run.log
 ```
 
-Ne zaman kullanilir:
+Validation objectives:
 
-- yeni bir L7 senaryosunu live kosudan once dogrulamak istediginizde
-- HTTP/2 transport secimi ve TLS profil kombinasyonunu test ederken
+- Validate Layer 7 scenario configuration prior to live execution.
+- Validate HTTP/2 transport engine selection and TLS fingerprint compatibility.
 
-## Katman 2: Config Dosyasi Ile Calisma
+## Tier 2: Configuration File Workflows
 
-Tek seferlik komutlar yerine tekrar uretilebilir kosular icin config dosyasi tercih edilmelidir.
+For reproducible benchmarks and continuous integration pipelines, declarative YAML configuration files are strongly preferred over long command-line invocations.
 
-### Ornek Config
+### Sample Configuration
 
-`artifacts/configs/web_stress_dev.yaml`
+`artifacts/configs/web_stress_dev.yaml`:
 
 ```yaml
 target: 10.10.40.12
@@ -166,37 +168,37 @@ run_report_dir: artifacts/reports
 log: artifacts/logs/web_stress_dev.log
 ```
 
-Bu config ile dry-run:
+Execute dry-run from configuration file:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --config artifacts/configs/web_stress_dev.yaml \
   --dry-run \
   --confirm
 ```
 
-Bu config ile live run:
+Execute live run from configuration file:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --config artifacts/configs/web_stress_dev.yaml \
   --confirm
 ```
 
-Pratik kural:
+Operational rule:
 
-- kalici senaryolari `--config` ile sakla
-- tek seferlik override'lari CLI'dan ver
-- final karar mercisinin CLI oldugunu unutma
+- Store permanent workload configurations in declarative YAML.
+- Pass one-off overrides via command-line flags.
+- Command-line arguments always supersede YAML configuration fields.
 
-## Katman 3: Uygulama Seviyesi Baseline Kosulari
+## Tier 3: Application-Layer Baseline Workflows
 
-Bu katman, hedef sistemin L7 davranisini kisa ve kontrollu bir sekilde olcmek icindir.
+Application-layer baselines evaluate target HTTP/S services under controlled concurrency to establish clean performance benchmarks.
 
-### Akis A: HTTP servis baseline
+### Flow A: HTTP Service Baseline
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.10.50.20 \
   --port 8443 \
   --attack-vector http \
@@ -216,16 +218,16 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/http_baseline.log
 ```
 
-Bu komut neyi verir:
+Key measurements delivered:
 
-- uygulama seviyesi throughput ve timeout davranisi
-- kisa sureli, raporlanabilir bir baseline
-- sonraki benchmark veya soak kosulari icin referans
+- Target application throughput, latency distribution, and timeout characteristics.
+- Structured run report capturing clean baseline metrics.
+- Reference standard for subsequent stress and soak evaluations.
 
-### Akis B: WAF/CDN etkisini gozlemleme
+### Flow B: Web Application Firewall and CDN Resilience Evaluation
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.10.50.30 \
   --port 443 \
   --attack-vector http2 \
@@ -247,22 +249,20 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/web_bypass_baseline.log
 ```
 
-Bu senaryo ne zaman mantikli:
+Applicable scenarios:
 
-- reverse proxy, WAF veya CDN arkasindaki uygulamanin davranisini anlamak istediginizde
-- browser-assisted davranis ile normal HTTP/2 davranisini ayirmak istediginizde
+- Evaluating target application behavior behind reverse proxies, CDNs, or WAF appliances.
+- Assessing browser-assisted challenge evaluation against standard HTTP/2 client multiplexing.
 
-## Katman 4: Stateful ve Ozel L7 Senaryolari
+## Tier 4: Stateful and Specialized Layer 7 Scenarios
 
-Not:
+Note:
+- The `websocket` attack vector is not supported in the Layer 7 V1 strict path and produces a fail-visible preflight error.
 
-- `websocket` attack-vector, mevcut L7 emu V1 strict yolunda destekli degildir.
-- Bu nedenle WebSocket senaryo komutlari fail-visible preflight hatasi uretir.
-
-### Akis A: HTTP2 Stateful Profile + Custom TCP
+### Flow A: HTTP/2 Stateful Profile with Custom TCP Stack
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.10.60.15 \
   --port 443 \
   --attack-vector http2 \
@@ -281,10 +281,10 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/http2_stateful_profile.log
 ```
 
-### Akis B: QUIC native capability gate
+### Flow B: Native QUIC Strict Capability Gate
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.10.70.40 \
   --port 443 \
   --attack-vector quic \
@@ -305,19 +305,19 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/quic_native_strict.log
 ```
 
-Bu senaryo neden profesyonelce faydali:
+Benefits of strict capability gating:
 
-- py-bridge fallback istemediginizde fail-fast davranis saglar
-- capability eksikligini benchmark ortasinda degil, baslangicta gorursunuz
+- Guarantees fail-fast behavior when Python bridge fallback is prohibited.
+- Identifies missing native capabilities during preflight rather than midway through a benchmark.
 
-## Katman 5: Dataplane ve Sender Benchmark Akislari
+## Tier 5: Dataplane and Sender Benchmark Workflows
 
-Bu kisim root/capability gerektirebilir. Lab host'ta kosulmalidir.
+These operations require elevated Linux capabilities (`CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_SYS_NICE`) or root privileges and must be executed in dedicated lab testbeds.
 
-### Akis A: TX_RING kontrollu benchmark
+### Flow A: TX_RING Controlled Dataplane Benchmark
 
 ```bash
-sudo python -m ddos_samurai.cli \
+sudo ./build/ddos_samurai/cli/samurai \
   --target 10.20.10.50 \
   --port 443 \
   --protocol tcp \
@@ -343,16 +343,16 @@ sudo python -m ddos_samurai.cli \
   --log artifacts/logs/txring_dedicated.log
 ```
 
-Ne zaman kullanilir:
+Application context:
 
-- sender fallback istemediginizde
-- dataplane core ve hugepage politikasini zorunlu tutmak istediginizde
-- tekrarlanabilir laboratuvar benchmark'i yapmak istediginizde
+- Eliminates unverified sender fallbacks (`--sender-fallback-policy fail`).
+- Enforces dedicated dataplane core isolation and hugepage ring allocations.
+- Produces rigorous, publishable lab benchmarks.
 
-### Akis B: AF_XDP benchmark
+### Flow B: AF_XDP Zero-Copy Benchmark
 
 ```bash
-sudo python -m ddos_samurai.cli \
+sudo ./build/ddos_samurai/cli/samurai \
   --target 10.20.20.60 \
   --port 53 \
   --protocol udp \
@@ -375,34 +375,28 @@ sudo python -m ddos_samurai.cli \
   --log artifacts/logs/afxdp_benchmark.log
 ```
 
-Not:
+Operational notes:
 
-- `--xdp-mode 1` native/driver mod icin uygundur
-- BPF object/section gerekiyorsa bunlari acikca override edin
+- `--xdp-mode 1` engages native driver mode for maximum kernel-bypass throughput.
+- Explicitly configure BPF object and section paths if non-default filtering is required.
 
-## Katman 5B: GPU Compute Backend Operasyon Akislari
+## Tier 5B: GPU Compute Backend Operational Workflows
 
-Bu katman, `--compute-backend cuda` ile gercek paket uretim zincirini calistirmak icindir.
-Burada odak sadece "GPU acik mi?" sorusu degil, su butun zincirdir:
+Setting `--compute-backend cuda` activates the GPU hardware packet generation pipeline. This workflow monitors the full acceleration pipeline:
 
-- GPU packet/template uretimi
-- host-ready buffer akis modeli
-- stream overlap
-- pinned memory kullanimi
-- sender/backend ile birlesik throughput davranisi
+- GPU template and packet generation kernels
+- Host-ready ring buffer streaming
+- CUDA stream concurrency and memory copy overlap
+- Pinned host memory management
+- Combined throughput behavior across the sender and hardware dataplane
 
-Pratik kural:
+Execution Progression:
+Dry-Run -> Short Smoke Run -> Baseline -> Parameter Tuning -> Longevity Soak -> CPU vs GPU A/B Comparison
 
-- once GPU dry-run
-- sonra kisa smoke/baseline
-- sonra tuning
-- sonra soak
-- en sonunda CPU ile A/B karsilastirma
-
-### Akis A: GPU readiness dry-run
+### Flow A: GPU Readiness Dry-Run
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.21.10.10 \
   --port 443 \
   --protocol tcp \
@@ -421,18 +415,18 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/gpu_readiness_dry_run.log
 ```
 
-Bu komut neyi dogrular:
+Validation objectives:
 
-- CUDA backend parse ediliyor mu
-- GPU tuning bayraklari validation'dan geciyor mu
-- worker/batch/stream kombinasyonu kabul ediliyor mu
+- Confirm CUDA runtime libraries and GPU devices initialize correctly.
+- Verify GPU allocation and pipeline parameters pass schema validation.
+- Validate worker, batch, and stream combinations.
 
-### Akis B: GPU smoke run
+### Flow B: GPU Smoke Run
 
-Bu, tam benchmark degil; amac GPU zincirinin gercek kosuda ayaga kalktigini gormektir.
+Verifies end-to-end functionality of the GPU pipeline in a live transmission cycle.
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.21.10.10 \
   --port 443 \
   --protocol tcp \
@@ -454,18 +448,18 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/gpu_smoke.log
 ```
 
-Ne zaman kullanilir:
+Applicable scenarios:
 
-- yeni CUDA runtime kurulumundan sonra
-- surucu veya native bridge degisikliginden sonra
-- CI disi lab smoke testi olarak
+- Post-installation validation of new CUDA drivers or hardware.
+- Verification following kernel updates or native bridge compilation.
+- Pre-benchmark sanity testing in staging environments.
 
-### Akis C: GPU baseline throughput
+### Flow C: GPU Baseline Throughput
 
-Bu, GPU'nun varsayilan tuning ile verdigi ilk anlamli referans kosudur.
+Establishes initial reference throughput under default GPU tuning.
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.21.20.20 \
   --port 53 \
   --protocol udp \
@@ -486,18 +480,18 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/gpu_baseline_udp.log
 ```
 
-Bu kosudan beklenen:
+Evaluation objectives:
 
-- ilk throughput referansi
-- GPU batch boyutunun sistemde rahat calisip calismadigi
-- pinned memory limiti ile darboz olusup olusmadigi
+- Determine initial GPU line-rate throughput figures.
+- Verify host system stability under large CUDA batch allocations.
+- Detect host pinned memory saturation or DMA transfer bottlenecks.
 
-### Akis D: GPU tuned benchmark
+### Flow D: GPU Tuned Benchmark
 
-Bu senaryo, throughput odakli laboratuvar tuning icindir.
+High-throughput performance measurement under optimized GPU pipeline settings.
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.21.30.30 \
   --port 443 \
   --protocol tcp \
@@ -521,19 +515,18 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/gpu_tuned_benchmark.log
 ```
 
-Neden bu komut profesyonel is akisina uygundur:
+Methodological safeguards:
 
-- sender backend'i acikca belirler
-- fallback'i kapatir
-- tuning parametrelerini raporla birlikte kaydeder
-- daha sonra ayni parametre seti tekrar kosulabilir
+- Explicitly fixes the sender backend and prohibits silent fallback.
+- Records exact GPU pipeline configuration within the run report artifact.
+- Ensures identical tuning parameters can be replayed for verification.
 
-### Akis E: GPU + TX_RING kombinasyonu
+### Flow E: Combined GPU and TX_RING Architecture
 
-GPU uretim ve TX path tuning'i birlikte gormek istediginizde bu akis daha anlamlidir.
+Evaluates GPU generation throughput coupled with kernel-bypass TX_RING transmission.
 
 ```bash
-sudo python -m ddos_samurai.cli \
+sudo ./build/ddos_samurai/cli/samurai \
   --target 10.21.40.40 \
   --port 443 \
   --protocol tcp \
@@ -563,18 +556,18 @@ sudo python -m ddos_samurai.cli \
   --log artifacts/logs/gpu_txring_dedicated.log
 ```
 
-Bu senaryo hangi sorulara cevap verir:
+Diagnostic insights:
 
-- darboz GPU tarafinda mi, TX tarafinda mi
-- queue pinning ile throughput fark ediyor mu
-- dedicated lab profile altinda stabilite korunuyor mu
+- Isolates whether throughput limits stem from GPU generation or TX transmission rings.
+- Evaluates impact of hardware queue pinning on line-rate packet dispatch.
+- Measures pipeline stability under strict laboratory profiles.
 
-### Akis F: GPU soak
+### Flow F: GPU Longevity Soak Test
 
-GPU yolu icin soak kosularinda sadece throughput degil, bellek davranisi da onemlidir.
+Monitors memory footprint and packet rate stability under extended GPU generation.
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.21.50.50 \
   --port 443 \
   --protocol tcp \
@@ -604,17 +597,17 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/gpu_soak_1h.log
 ```
 
-GPU soak'ta ozellikle izlenecek alanlar:
+Critical telemetry metrics:
 
-- VRAM growth
-- pinned memory growth
-- backlog birikimi
-- uzun kosuda PPS drift
+- GPU VRAM consumption over time
+- Host pinned memory expansion
+- Ring buffer backlog depth
+- PPS drift over prolonged duration
 
-### Akis G: GPU fault-injection soak
+### Flow G: GPU Fault-Injection Longevity Soak
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.21.60.60 \
   --port 443 \
   --protocol tcp \
@@ -639,19 +632,19 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/gpu_fault_soak.log
 ```
 
-Bu senaryonun amaci:
+Purpose:
 
-- stream hatasi benzeri bozulmalarda toparlanma davranisini gozlemek
-- uzun kosuda GPU yolunun ne kadar dayanikli oldugunu olcmek
+- Observe recovery and error containment during simulated CUDA stream failures.
+- Validate resilience of GPU worker threads under infrastructure anomalies.
 
-### Akis H: CPU vs GPU A/B karsilastirma
+### Flow H: CPU vs GPU A/B Comparison
 
-Bu kalip, tek seferde hizli karar vermek icin degil, kontrollu benchmark karsilastirmasi icin kullanilmalidir.
+To guarantee statistical validity, keep target IP, worker counts, packet totals, and reporting configurations strictly identical across runs.
 
-CPU referans kosu:
+CPU Baseline Reference:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.21.70.70 \
   --port 53 \
   --protocol udp \
@@ -665,10 +658,10 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/cpu_udp_ab.log
 ```
 
-GPU karsilik kosusu:
+GPU Accelerated Counterpart:
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.21.70.70 \
   --port 53 \
   --protocol udp \
@@ -688,38 +681,31 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/gpu_udp_ab.log
 ```
 
-Bu karsilastirmayi dogru yapmak icin:
+### GPU Operational Troubleshooting Guide
 
-- ayni hedef
-- ayni count veya ayni rps
-- ayni worker sayisi
-- ayni run-report formati
+If GPU throughput falls below theoretical line-rate:
 
-### GPU Is Akisinda Yorumlama Rehberi
+1. Verify whether the sender backend or network interface is the bottleneck.
+2. Check if `--gpu-batch-size` is excessively large, introducing pipeline latency.
+3. Evaluate whether `--gpu-stream-count` is insufficient for effective DMA overlap.
+4. Check if host memory contention exists via `--gpu-pinned-max-mb`.
+5. Measure if `--gpu-full-variation` increases per-packet computation overhead.
 
-Eger GPU throughput artmiyorsa once su sirayla bak:
+Recommended tuning steps:
 
-1. sender backend darboz mu
-2. `gpu-batch-size` fazla buyuk oldugu icin latency artiyor mu
-3. `gpu-stream-count` sisteminize gore fazla mi az mi
-4. `gpu-pinned-max-mb` host tarafinda baski olusturuyor mu
-5. `gpu-full-variation` acik oldugunda varyasyon maliyeti mi artiyor
+1. Increment `--gpu-stream-count`: 2 -> 3 -> 4.
+2. Increment `--gpu-pipeline-depth`: 2 -> 3.
+3. Test graduated batch sizes for `--gpu-batch-size`.
+4. Capture separate run reports for every tuning iteration.
 
-Tipik tuning stratejisi:
+## Tier 6: Soak and Longevity Stability Workflows
 
-1. `gpu-stream-count` icin 2 -> 3 -> 4 deneyin
-2. `gpu-pipeline-depth` icin 2 -> 3 deneyin
-3. `gpu-batch-size` icin orta buyuklukte artan seriler deneyin
-4. Her degisimi ayri run-report ile kaydedin
+Soak runs evaluate system stability, memory leaks, and performance drift over extended time windows.
 
-## Katman 6: Soak ve Uzun Sureli Stabilite Kosulari
-
-Soak, throughput kadar istikrar da olcmek icin kullanilir.
-
-### Akis A: 1 saatlik uygulama seviyesi soak
+### Flow A: 1-Hour Application Layer Soak
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.30.10.70 \
   --port 443 \
   --attack-vector http \
@@ -747,10 +733,10 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/http_soak_1h.log
 ```
 
-### Akis B: Fault-injection ile soak
+### Flow B: Soak with Fault-Injection
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.30.20.80 \
   --port 443 \
   --attack-vector http2 \
@@ -771,19 +757,19 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/http2_fault_soak.log
 ```
 
-Bu akisin degeri:
+Benefits:
 
-- sadece iyi hava performansini degil, toparlanma davranisini da olcersiniz
-- backlog, error-rate ve memory growth gibi KPI'lari tek raporda toplarsiniz
+- Assesses recovery behavior under transient hardware or process failure.
+- Aggregates error rate, backlog growth, and memory degradation into a single report.
 
-## Katman 7: GPU PCAP Artifact Uretimi
+## Tier 7: GPU PCAP Synthetic Artifact Generation
 
-Bu akis trafik gondermez; lab ve CI icin sentetik paket verisi uretir.
+This workflow does not transmit packets over physical interfaces; it synthesizes deterministic, high-realism PCAP traces on GPU hardware for testing and ML pipelines.
 
-### Akis A: Kisa sentetik PCAP
+### Flow A: Short Synthetic PCAP Generation
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --gpu-pcap \
   --gpu-pcap-duration 10 \
   --gpu-pcap-pps 50000 \
@@ -795,10 +781,10 @@ python -m ddos_samurai.cli \
   --gpu-pcap-out artifacts/pcaps/gpu_mix_10s_50k.pcap
 ```
 
-### Akis B: Gercekcilik raporlu dataset artifact'i
+### Flow B: Realistic Dataset Artifact with Realism Scoring
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --gpu-pcap \
   --gpu-pcap-duration 30 \
   --gpu-pcap-pps 75000 \
@@ -816,27 +802,27 @@ python -m ddos_samurai.cli \
   --gpu-pcap-out artifacts/pcaps/gpu_realistic_mix.pcap
 ```
 
-Bu artifact hangi islerde kullanilir:
+Target use cases:
 
-- replay pipeline dogrulama
-- parser/decoder benchmark'i
-- sentetik dataset olusturma
-- realism regression kontrolu
+- Trace replay validation in staging labs.
+- Parser and deep packet inspection (DPI) stress testing.
+- Synthetic dataset generation for traffic classification models.
+- Realism regression validation.
 
-## Katman 8: PCAP Replay Akislari
+## Tier 8: PCAP Replay Workflows
 
-### Akis A: Bilgi cikar ve filtre planla
+### Flow A: Inspect Capture Metadata
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --pcap-file artifacts/pcaps/gpu_realistic_mix.pcap \
   --pcap-info
 ```
 
-### Akis B: Timing-aware replay
+### Flow B: Timing-Aware Replay
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.50.10.90 \
   --port 443 \
   --attack-vector pcap-replay \
@@ -854,10 +840,10 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/pcap_replay_multiplier.log
 ```
 
-### Akis C: L2 replay ile TX_RING yolu
+### Flow C: Layer 2 Replay via TX_RING
 
 ```bash
-sudo python -m ddos_samurai.cli \
+sudo ./build/ddos_samurai/cli/samurai \
   --target 10.50.20.91 \
   --port 443 \
   --attack-vector pcap-replay \
@@ -873,14 +859,14 @@ sudo python -m ddos_samurai.cli \
   --log artifacts/logs/pcap_l2_txring.log
 ```
 
-## Katman 9: Traffic Model ve Dataset Akislari
+## Tier 9: Traffic Model and Dataset Workflows
 
-Bu yolun runtime entegrasyonu kisitli oldugu icin ilk durak dry-validate olmalidir.
+Because runtime traffic model integration is constrained, initial validation should always execute via `--traffic-model-dry-validate`.
 
-### Akis A: Planner validasyonu
+### Flow A: Traffic Planner Model Validation
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --traffic-model mamba2 \
   --traffic-model-checkpoint artifacts/models/mamba2_lab.ckpt \
   --traffic-model-config artifacts/models/mamba2_lab.yaml \
@@ -895,10 +881,10 @@ python -m ddos_samurai.cli \
   --traffic-model-dry-validate
 ```
 
-### Akis B: Dataset capture ile kontrollu live run
+### Flow B: Controlled Live Run with Dataset Capture
 
 ```bash
-python -m ddos_samurai.cli \
+./build/ddos_samurai/cli/samurai \
   --target 10.60.10.100 \
   --port 443 \
   --attack-vector http \
@@ -914,61 +900,58 @@ python -m ddos_samurai.cli \
   --log artifacts/logs/runtime_dataset_capture.log
 ```
 
-## Katman 10: Profesyonel Calisma Kaliplari
+## Tier 10: Professional Operational Patterns
 
-### Kalip 1: Yeni senaryo eklemeden once
+### Pattern 1: Prior to Introducing New Workload Scenarios
 
-1. `--help` ve `--list-profiles` bak
-2. `--dry-run` gec
-3. Kisa baseline al
-4. Run report incele
-5. Sonra benchmark veya soak'a gec
+1. Review `--help` and `--list-profiles`.
+2. Execute `--dry-run` to validate schema and arguments.
+3. Execute a short baseline run.
+4. Inspect the resulting run report.
+5. Proceed to formal benchmark or soak runs.
 
-### Kalip 2: Benchmark sonucunu yayinlamadan once
+### Pattern 2: Prior to Publishing Benchmark Results
 
-1. `--sender-fallback-policy fail` kullan
-2. Metrikleri `--run-report` ile kaydet
-3. Root/capability gereksinimini not et
-4. Queue, worker, backend bilgilerini artefact adina yansit
+1. Enforce strict fallback policies: `--sender-fallback-policy fail`.
+2. Persist comprehensive metrics using `--run-report`.
+3. Document kernel capability and privilege requirements.
+4. Include queue, worker, and backend identifiers in artifact filenames.
 
-### Kalip 3: Soak sonucu kabul etmek icin
+### Pattern 3: Accepting Soak Longevity Runs
 
-1. Warmup tanimla
-2. Snapshot araligini sabitle
-3. Error-rate ve PPS drop esiklerini acik ver
-4. Loss telemetry sonucunu rapora dahil et
+1. Configure an adequate warmup duration.
+2. Fix telemetry snapshot intervals.
+3. Explicitly define error rate and PPS degradation criteria.
+4. Incorporate interface packet loss telemetry in the final report.
 
-## SIk Yapilan Hatalar
+## Common Operational Pitfalls
 
-### Dry-run atlamak
+### Skipping Dry-Run Validation
 
-Sonuc:
+Consequences:
+- Configuration and syntax errors surface mid-run during live execution.
+- Benchmark validity is compromised, wasting test windows.
 
-- parse/preflight hatalari live run'da gorulur
-- benchmark sonucu gecersizlesir
+### Benchmarking with Permissive Fallback (`allow`)
 
-### `allow` fallback ile benchmark yapmak
+Consequences:
+- The engine may silently degrade to a slower or non-deterministic sender backend, falsifying benchmark throughput.
 
-Sonuc:
+Remedy:
+- For authoritative benchmarks, always specify:
+  - `--sender-fallback-policy fail`
+  - `--l7-fallback-policy fail`
 
-- sistem farkli bir sender/backend'e dusup sizi yaniltabilir
+### Running Privileged Dataplane Paths as Non-Root
 
-Benchmark icin tercih:
-
-- `--sender-fallback-policy fail`
-- `--l7-fallback-policy fail`
-
-### Root gerektiren yolu normal kullanici ile kosmak
-
-Ornek riskli alanlar:
-
+Privileged paths requiring elevated Linux capabilities:
 - `txring`
 - `xdp`
-- bazi raw socket senaryolari
+- Raw socket transmission
 
-## Artefact Isimlendirme Onerisi
+## Artifact Naming Conventions
 
-Ornek:
+Structured artifact naming ensures long-term traceability across automated pipelines:
 
 ```text
 artifacts/reports/2026-04-06_http2_webstress_10k_rps_dev
@@ -976,29 +959,28 @@ artifacts/reports/2026-04-06_txring_dedicated_8q_failfast
 artifacts/pcaps/2026-04-06_gpu_mix_30s_75k_realistic.pcap
 ```
 
-Onerilen alanlar:
+Recommended filename elements:
 
-- tarih
-- vektor
-- profil
-- hedef throughput veya sure
-- backend/lab tipi
+- Date stamp (YYYY-MM-DD)
+- Vector / Protocol
+- Profile name
+- Target throughput or duration
+- Sender backend / lab environment classification
 
-## Sonuc
+## Summary and References
 
-`ddos_samurai.cli`, en iyi sonucunu bayraklari tek tek ezberleyerek degil, operasyon tipine uygun akisi secerek verir.
+The Samurai Network Resilience Platform delivers optimal, reproducible results when operators select workflows matching their operational tier:
 
-Onerilen varsayilan davranis:
+1. Always execute `--dry-run` first.
+2. Establish a short reference baseline.
+3. Perform controlled benchmark or longevity soak runs.
+4. Archive artifacts via `--run-report`.
 
-1. once `--dry-run`
-2. sonra kisa baseline
-3. sonra benchmark veya soak
-4. sonunda `--run-report`
-
-Bu belge, referans dokumanlarin yerine gecmez. Ayrintili bayrak davranislari icin:
+Related Architecture Documentation:
 
 - `docs/01-cli.md`
 - `docs/08-config.md`
 - `docs/18-afpacket-hugepage-policy.md`
 - `docs/19-benchmark-profiles.md`
 - `docs/20-env-cli-reference.md`
+- `docs/23-benchmark-acceptance-handbook.md`

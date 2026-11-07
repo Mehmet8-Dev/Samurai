@@ -1,64 +1,66 @@
-# 40 - Dağıtık Control Plane Kapsamlı Başvuru ve Kullanım Rehberi
+# 40 - Distributed Control Plane Comprehensive Reference and Operations Handbook
 
-Bu belge, **DDoSamurai** projesinin yerel C++ ile geliştirilmiş yüksek performanslı dağıtık kontrol düzlemini (**Distributed Control Plane**) mimarisinden başlayarak en ince yapılandırma ayrıntılarına, güvenlik protokollerine, üretim dağıtım senaryolarına ve zengin pratik kullanım örneklerine kadar tüm detaylarıyla anlatmaktadır.
+This document provides an exhaustive, production-grade guide to the high-performance native C++ **Distributed Control Plane** of the **Samurai Network Resilience Platform**. It covers architectural topology, transport wire protocols, end-to-end cryptographic security (CurveZMQ, TLS 1.2/1.3, RBAC, HMAC-SHA256 JWT, tamper-evident audit logs), zero-install agent enrollment (`curl | sh`), high availability (HA) leader election, multi-master regional federation, shard scheduling, REST management APIs, and real-world deployment scenarios.
 
----
-
-## İçindekiler
-
-1. [Mimarî Genel Bakış ve Bileşenler](#1-mimarî-genel-bakış-ve-bileşenler)
-2. [Taşıma Katmanı ve ZMQ Protokolleri](#2-taşıma-katmanı-ve-zmq-protokolleri)
-3. [Güvenlik ve Şifreleme (CURVE, TLS, RBAC, JWT, Audit)](#3-güvenlik-ve-şifreleme-curve-tls-rbac-jwt-audit)
-4. [Sıfır Kurulumlu Agent Katılımı (Zero-Install `curl | sh`)](#4-sıfır-kurulumlu-agent-katılımı-zero-install-curl--sh)
-5. [Yüksek Erişilebilirlik (HA) ve Multi-Master](#5-yüksek-erişilebilirlik-ha-ve-multi-master)
-6. [Shard Yönetimi, Dağıtım ve Otomatik Ölçekleme](#6-shard-yönetimi-dağıtım-ve-otomatik-ölçekleme)
-7. [HTTP Management REST API Tam Referansı](#7-http-management-rest-api-tam-referansı)
-8. [Detaylı Uçtan Uca Uygulama ve Kullanım Senaryoları](#8-detaylı-uçtan-uca-uygulama-ve-kullanım-senaryoları)
-  - [Senaryo 1: Yerel Hızlı Geliştirme ve Test (Sandbox Modu)](#senaryo-1-yerel-hızlı-geliştirme-ve-test-sandbox-modu)
-  - [Senaryo 2: Üretim Seviyesi Güvenli Multi-Node Kümesi (TLS + CURVE + Secret + Tenant)](#senaryo-2-üretim-seviyesi-güvenli-multi-node-kümesi-tls--curve--secret--tenant)
-  - [Senaryo 3: NAT ve Güvenlik Duvarı Arkasındaki Worker'lar (Reverse Mode)](#senaryo-3-nat-ve-güvenlik-duvarı-arkasındaki-workerlar-reverse-mode)
-  - [Senaryo 4: Sıfır Kurulumlu Dinamik Agent Katılımı (`curl | sh` ile Canlı Dağıtım)](#senaryo-4-sıfır-kurulumlu-dinamik-agent-katılımı-curl--sh-ile-canlı-dağıtım)
-  - [Senaryo 5: Yüksek Erişilebilirlik (HA Active-Passive Failover Testi)](#senaryo-5-yüksek-erişilebilirlik-ha-active-passive-failover-testi)
-  - [Senaryo 6: Management REST API Kapsamlı cURL, JWT ve Otomasyon Örnekleri](#senaryo-6-management-rest-api-kapsamlı-curl-jwt-ve-otomasyon-örnekleri)
-  - [Senaryo 7: Docker Compose ile İzole Dağıtık Test Kümesi](#senaryo-7-docker-compose-ile-izole-dağıtık-test-kümesi)
-  - [Senaryo 8: Python ile Otomatik Telemetri ve Alarm İzleme Scripti](#senaryo-8-python-ile-otomatik-telemetri-ve-alarm-izleme-scripti)
-  - [Senaryo 9: Hata Ayıklama ve Sık Karşılaşılan Problemlerin Çözümü (Troubleshooting)](#senaryo-9-hata-ayıklama-ve-sık-karşılaşılan-problemlerin-çözümü-troubleshooting)
-9. [CLI Parametreleri ve Çevresel Yapılandırma](#9-cli-parametreleri-ve-çevresel-yapılandırma)
+![Samurai Distributed Security & Control Plane Architecture](assets/diagrams/samurai_distributed_security.svg)
 
 ---
 
-## 1. Mimarî Genel Bakış ve Bileşenler
+## Table of Contents
 
-DDoSamurai Dağıtık Kontrol Düzlemi, heterojen altyapılarda (CPU, GPU, DPDK, AF_XDP, AF_PACKET) çalışan yüzlerce worker sürecini tek bir orkestrasyon çatısı altında birleştirmek üzere geliştirilmiştir.
+1. [Architectural Overview and Core Components](#1-architectural-overview-and-core-components)
+2. [Transport Layer and ZMQ Wire Protocols](#2-transport-layer-and-zmq-wire-protocols)
+3. [Security, Cryptography, and Access Control](#3-security-cryptography-and-access-control)
+4. [Zero-Install Agent Enrollment (curl | sh)](#4-zero-install-agent-enrollment-curl--sh)
+5. [High Availability (HA) and Multi-Master Federation](#5-high-availability-ha-and-multi-master-federation)
+6. [Shard Management, Allocation, and Auto-Balancing](#6-shard-management-allocation-and-auto-balancing)
+7. [HTTP Management REST API Reference](#7-http-management-rest-api-reference)
+8. [End-to-End Operational Scenarios](#8-end-to-end-operational-scenarios)
+   - [Scenario 1: Local Rapid Development and Testing (Sandbox Mode)](#scenario-1-local-rapid-development-and-testing-sandbox-mode)
+   - [Scenario 2: Production Multi-Node Secure Cluster (TLS + CURVE + Secret + Tenant)](#scenario-2-production-multi-node-secure-cluster-tls--curve--secret--tenant)
+   - [Scenario 3: Workers Behind NAT and Firewalls (Reverse Mode)](#scenario-3-workers-behind-nat-and-firewalls-reverse-mode)
+   - [Scenario 4: Zero-Install Dynamic Agent Bootstrap (Live Deployment)](#scenario-4-zero-install-dynamic-agent-bootstrap-live-deployment)
+   - [Scenario 5: High Availability (Active-Passive Failover Test)](#scenario-5-high-availability-active-passive-failover-test)
+   - [Scenario 6: Management REST API Automation, JWT, and cURL Reference](#scenario-6-management-rest-api-automation-jwt-and-curl-reference)
+   - [Scenario 7: Isolated Distributed Cluster with Docker Compose](#scenario-7-isolated-distributed-cluster-with-docker-compose)
+   - [Scenario 8: Python Telemetry and Cluster Alerting Monitor](#scenario-8-python-telemetry-and-cluster-alerting-monitor)
+   - [Scenario 9: Comprehensive Troubleshooting and Failure Recovery](#scenario-9-comprehensive-troubleshooting-and-failure-recovery)
+9. [CLI Command-Line Options and Configuration Reference](#9-cli-command-line-options-and-configuration-reference)
+
+---
+
+## 1. Architectural Overview and Core Components
+
+The Samurai Distributed Control Plane is engineered to coordinate hundreds of heterogeneous worker processes across bare-metal servers, container fleets, and public cloud instances. It controls packet transmission across CPU threads, GPU CUDA streams, DPDK ports, AF_XDP queues, and kernel sockets under unified orchestration.
 
 ```mermaid
 flowchart TB
-    subgraph MasterNode["Master Düğümü (samurai_master)"]
-        HA["HA Lider Seçimi<br/>(ha.cpp: File-Lock / Static)"]
+    subgraph MasterNode["Master Node (samurai_master)"]
+        HA["HA Leader Election<br/>(ha.cpp: Redis / File-Lock / Static)"]
         CS["ControlServer<br/>(control_server.cpp: ZMQ ROUTER :5099)"]
-        MC["MasterCoordinator<br/>(master_coordinator.cpp: Shard Motoru)"]
+        MC["MasterCoordinator<br/>(master_coordinator.cpp: Shard Engine)"]
         API["ManagementApiServer<br/>(management_api.cpp: HTTPS :8443)"]
-        AUD["AuditLogger<br/>(audit_log.cpp: SHA-256 Chain)"]
-        JWT["JWT & Auth Validator<br/>(jwt.cpp, auth.cpp)"]
+        AUD["AuditLogger<br/>(audit_log.cpp: SHA-256 Hash Chain)"]
+        JWT["JWT & RBAC Validator<br/>(jwt.cpp, auth.cpp)"]
     end
 
-    subgraph Slave1["Slave Düğümü 1 (Direct Mode - Genel Bulut)"]
+    subgraph Slave1["Slave Node 1 (Direct Mode - Public Cloud)"]
         SC1["SlaveControlClient<br/>(control_client.cpp)"]
         WS1["WorkerShardService<br/>(Inbound ControlServer)"]
         SUP1["SupervisorShardRunner"]
         W1["samurai_cpu_worker"]
     end
 
-    subgraph Slave2["Slave Düğümü 2 (Reverse Mode - NAT / On-Premise GPU)"]
+    subgraph Slave2["Slave Node 2 (Reverse Mode - NAT / On-Premise GPU)"]
         SC2["SlaveControlClient<br/>(control_client.cpp)"]
         SUP2["SupervisorShardRunner"]
         W2["samurai_gpu_worker"]
     end
 
-    subgraph Clients["Yönetim & Dış Sistemler"]
+    subgraph Clients["Management & External Control"]
         CLI["samurai CLI"]
         DASH["Web Dashboard / Grafana"]
-        AUTOSCALER["Harici Autoscaler Script"]
+        AUTOSCALER["External Autoscaler / Orchestrator"]
     end
 
     CS <-->|CurveZMQ Z85 Encrypted| SC1
@@ -74,35 +76,31 @@ flowchart TB
     CS --> AUD
 ```
 
+### Source Modules and Functional Breakdown (`ddos_samurai/control/`)
 
-
-### Kaynak Kod Dosyaları ve Görev Dağılımı (`ddos_samurai/control/`)
-
-
-| Dosya / Modül                                                                                                                                                                                                             | Görev ve Fonksiyon                                                                                                                                               |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[daemon/master_main.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/daemon/master_main.cpp)`                                                                                                | `samurai_master` ikili programı. Liderlik kontrolü, ZMQ kontrol sunucusu, Management REST API, worker bekleme, iş bölme ve telemetri toplama adımlarını yürütür. |
-| `[daemon/slave_main.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/daemon/slave_main.cpp)`                                                                                                  | `samurai_slave` ikili programı. Master'a kaydolur, heartbeat yollar, gelen shard'ları yerel worker süreçlerine (`samurai_*_worker`) iletir.                      |
-| `[control_server.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/control_server.cpp)` / `[.hpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/control_server.hpp)` | `ZMQ_ROUTER` soketi üzerinde çalışan asenkron RPC sunucusu. `ZMQ_CURVE_SERVER` yeteneklidir.                                                                     |
-| `[control_client.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/control_client.cpp)` / `[.hpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/control_client.hpp)` | `SlaveControlClient` ve `WorkerControlClient` sınıfları. `ZMQ_REQ` soketleri üzerinden failover ve CURVE istemci bağlantılarını yönetir.                         |
-| `[management_api.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/management_api.cpp)` / `[.hpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/management_api.hpp)` | Harici framework bağımlılığı olmaksızın POSIX soketleri ve OpenSSL ile çalışan HTTP/1.1 REST API sunucusu.                                                       |
-| `[curve.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/curve.cpp)` / `[.hpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/curve.hpp)`                            | Libsodium/LibZMQ Curve25519 anahtar üretimi (`zmq_curve_keypair`) ve genel anahtar türetimi (`zmq_curve_public`) yardımcıları.                                   |
-| `[ha.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/ha.cpp)` / `[.hpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/ha.hpp)`                                     | `FileLeaseLeaderElector` (paylaşımlı dosya kilidi) ve `StaticLeaderElector` (statik sıra) sınıfları ile kesintisiz lider seçimi.                                 |
-| `[jwt.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/jwt.cpp)` / `[.hpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/jwt.hpp)`                                  | HMAC-SHA256 JWT imza üretimi, doğrulaması ve claim (`sub`, `role`, `tenant_namespace`, `exp`) çözümlemesi.                                                       |
-| `[audit_log.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/audit_log.cpp)` / `[.hpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/audit_log.hpp)`                | Kriptografik SHA-256 zincirleme ile kurcalamaya karşı korumalı (tamper-evident) denetim günlüğü.                                                                 |
-| `[shard.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/shard.cpp)` / `[.hpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/shard.hpp)`                            | Toplam hedef paket sayısını aktif worker'lara adil biçimde paylaştıran matematiksel shard bölme algoritması.                                                     |
-
+| Module / Source File | Architecture Role & Responsibilities |
+| :--- | :--- |
+| `daemon/master_main.cpp` | `samurai_master` daemon binary entry point. Coordinates HA election, ZMQ control plane server, HTTPS REST API, worker discovery, shard distribution, and telemetry collation. |
+| `daemon/slave_main.cpp` | `samurai_slave` daemon binary entry point. Discovers master endpoints, manages heartbeat keepalives, and dispatches assigned shards to local native worker binaries (`samurai_*_worker`). |
+| `control_server.cpp` / `.hpp` | High-throughput asynchronous RPC server built on top of `ZMQ_ROUTER` sockets with optional `ZMQ_CURVE_SERVER` hardware-accelerated encryption. |
+| `control_client.cpp` / `.hpp` | `SlaveControlClient` and `WorkerControlClient` implementations handling connection retries, failover switching across multiple masters, and CurveZMQ client handshakes. |
+| `management_api.cpp` / `.hpp` | Embedded zero-dependency HTTP/1.1 REST API server implemented with native POSIX sockets and OpenSSL TLS 1.2/1.3. |
+| `curve.cpp` / `.hpp` | Curve25519 keypair generation (`zmq_curve_keypair`) and public key derivation (`zmq_curve_public`) utilities powered by Libsodium / LibZMQ. |
+| `ha.cpp` / `.hpp` | High-availability leadership coordination supporting `RedisLeaseLeaderElector` (distributed Redis epoch lease), `FileLeaseLeaderElector` (NFS/shared lock), and `StaticLeaderElector`. |
+| `jwt.cpp` / `.hpp` | Native HMAC-SHA256 JWT generation, signature verification, and claims parsing (`sub`, `role`, `tenant_namespace`, `exp`). |
+| `audit_log.cpp` / `.hpp` | Tamper-evident cryptographic append-only audit logger using sequential SHA-256 hash chains. |
+| `shard.cpp` / `.hpp` | Deterministic shard partitioning algorithm distributing total target packet volume across active workers with zero remainder loss. |
 
 ---
 
-## 2. Taşıma Katmanı ve ZMQ Protokolleri
+## 2. Transport Layer and ZMQ Wire Protocols
 
-### Kontrol Düzlemi RPC Wire Formatı (`control_wire.hpp`)
+### Control Plane RPC Wire Format (`control_wire.hpp`)
 
-ZMQ mesajlaşma hattı üzerinde taşınan tüm veriler JSON gövdeli iki parçalı bir protokoldür:
+All communications over the ZeroMQ control channel employ structured JSON payloads wrapped in two-frame or multi-frame ZMQ envelopes:
 
 ```json
-// İstek (Request Wire Frame)
+// Request Wire Frame (Slave -> Master or Master -> Slave)
 {
   "method": "RegisterWorker",
   "meta": {
@@ -120,7 +118,7 @@ ZMQ mesajlaşma hattı üzerinde taşınan tüm veriler JSON gövdeli iki parça
   }
 }
 
-// Yanıt (Response Wire Frame)
+// Response Wire Frame
 {
   "status": "ok",
   "error": "",
@@ -133,101 +131,125 @@ ZMQ mesajlaşma hattı üzerinde taşınan tüm veriler JSON gövdeli iki parça
 }
 ```
 
-### Desteklenen Temel RPC Metodları
+### Supported Core RPC Methods
 
-
-| Metod             | Yön             | Açıklama                                                                                 |
-| ----------------- | --------------- | ---------------------------------------------------------------------------------------- |
-| `RegisterWorker`  | Slave -> Master | Worker ilk açıldığında kimliğini, yeteneklerini ve CURVE anahtarını bildirir.            |
-| `Heartbeat`       | Slave -> Master | Canlılık sinyali gönderir. Master atanmış yeni shard'ları bu yanıtla iletebilir.         |
-| `ReportStats`     | Slave -> Master | Tamamlanan veya çalışan bir shard'ın gönderilen paket ve hata istatistiklerini raporlar. |
-| `StartShard`      | Master -> Slave | Belirtilen parametrelerle yeni bir paket üretim shard'ını başlatır.                      |
-| `StopShard`       | Master -> Slave | Çalışan bir shard'ı zarifçe (graceful) veya anında durdurur.                             |
-| `GetWorkerStatus` | Master -> Slave | Slave üzerindeki süreçlerin sağlık ve CPU/RAM metriklerini çeker.                        |
-| `AbortJob`        | Master -> Slave | Acil durumlarda ilgili tüm shard'ları anında düşürür.                                    |
-
+| RPC Method | Direction | Description |
+| :--- | :--- | :--- |
+| `RegisterWorker` | Slave -> Master | Handshake executed on worker startup. Announces identity, region, hardware capabilities, and CURVE public keys. |
+| `Heartbeat` | Slave -> Master | Periodic keepalive signal. The master embeds newly assigned shards in the heartbeat response when operating in reverse mode. |
+| `ReportStats` | Slave -> Master | Reports telemetry, transmission progress, throughput, and error counters for active or completed shards. |
+| `StartShard` | Master -> Slave | Direct execution RPC instructing a slave to launch a new packet generation workload with designated flow specifications. |
+| `StopShard` | Master -> Slave | Gracefully requests or forces immediate termination of an active packet shard. |
+| `GetWorkerStatus` | Master -> Slave | Queries process health, memory usage, CPU core affinity, and interface status on the slave host. |
+| `AbortJob` | Master -> Slave | Emergency kill-switch broadcast tearing down all running shards immediately across the cluster. |
 
 ---
 
-## 3. Güvenlik ve Şifreleme (CURVE, TLS, RBAC, JWT, Audit)
+## 3. Security, Cryptography, and Access Control
+
+The Samurai platform enforces defense-in-depth across the transport, application, and governance planes.
 
 ```mermaid
 graph LR
-    subgraph "Ağ Güvenliği Katmanı"
-        A[ZMQ Soketleri] -->|CurveZMQ / Libsodium 25519| B[Uçtan Uca Şifreli Kanal]
-        C[Management API] -->|OpenSSL TLS 1.2/1.3| D[HTTPS Şifreli Kanal]
+    subgraph "Network Transport Security"
+        A[ZMQ Sockets] -->|CurveZMQ / Libsodium 25519| B[End-to-End Encrypted Tunnel]
+        C[Management API] -->|OpenSSL TLS 1.2/1.3| D[Encrypted HTTPS Interface]
     end
-    subgraph "Kimlik & Erişim Katmanı"
-        E[Uygulama Katmanı] -->|x-cluster-secret| F[Küme Doğrulama]
-        G[Kullanıcı / API] -->|HMAC-SHA256 JWT| H[Rol Bazlı Yetki - RBAC]
+    subgraph "Identity & Access Control"
+        E[Application Layer] -->|x-cluster-secret| F[Shared Cluster Authentication]
+        G[User / API Client] -->|HMAC-SHA256 JWT| H[Role-Based Access Control - RBAC]
     end
-    subgraph "Denetim & Bütünlük"
-        I[Olaylar] -->|SHA-256 Blok Zinciri| J[Tamper-Evident Audit Log]
+    subgraph "Audit & Cryptographic Integrity"
+        I[Cluster Events] -->|SHA-256 Hash Chain| J[Tamper-Evident Audit Ledger]
     end
 ```
 
+### 1. CurveZMQ (Z85 / Libsodium Transport Encryption)
 
-
-### 1. CurveZMQ (Z85 / Libsodium Taşıma Şifrelemesi)
-
-- **Master Tarafı:** `--curve-server-secret <KEY>` parametresi ile `ZMQ_CURVE_SERVER` aktif edilir.
-- **Slave Tarafı:** `--curve-server-public <KEY>` ile Master'ın genel anahtarı tanımlanır.
-- **Non-Loopback Engeli:** Master `0.0.0.0` IP'sine bağlanırken CURVE belirtilmemişse, parolaların açık metin gitmesini engellemek için sistem **hata verip kapanır**.
+- **Master Configuration:** `--curve-server-secret <KEY>` activates `ZMQ_CURVE_SERVER` mode.
+- **Slave Configuration:** `--curve-server-public <KEY>` specifies the trusted public key of the master.
+- **Non-Loopback Protection Gate:** If `samurai_master` binds to `0.0.0.0` or a public network interface without CURVE encryption enabled, the process **refuses to start and exits with an error**, preventing plaintext leakage of credentials over the wire. This can only be bypassed in isolated development environments using `--insecure-control`.
 
 ### 2. Management API TLS (HTTPS)
 
-- **Özel Sertifika:** `--mgmt-tls --mgmt-tls-cert /path/to/cert.pem --mgmt-tls-key /path/to/key.pem`
-- **Geçici Self-Signed:** `--mgmt-tls` verilip cert/key yolları boş bırakılırsa, çalışma anında OpenSSL ile anlık RSA-2048 sertifikası oluşturulur.
+- **Enterprise Certificates:** `--mgmt-tls --mgmt-tls-cert /path/to/cert.pem --mgmt-tls-key /path/to/key.pem`
+- **Ephemeral Self-Signed Mode:** When `--mgmt-tls` is enabled without explicit certificate paths, an on-the-fly RSA-2048 certificate is generated in memory using OpenSSL.
 
-### 3. Rol Tabanlı Yetkilendirme (RBAC)
+### 3. Role-Based Access Control (RBAC)
 
-- `admin`: Tam yetki, konfigürasyon, job abort.
-- `operator`: İş başlatma, izleme, shard yönetimi.
-- `viewer`: Salt-okunur durum ve telemetri görüntüleme.
-- `worker`: Yalnızca ZMQ kayıt ve raporlama yetkisi.
+- `admin`: Full administrative privileges, configuration modifications, emergency job abortion, dynamic SSH provisioning.
+- `operator`: Job creation, test plan execution, live telemetry monitoring, shard scaling.
+- `viewer`: Read-only access to cluster health, node listings, and Prometheus metrics.
+- `worker`: Restricted service role limited to ZMQ registration, keepalive heartbeats, and shard progress reporting.
+
+### 4. Tamper-Evident Chained Audit Log
+
+Every security-sensitive event (job launch, abort, configuration update, authorization failure) is recorded by `audit_log.cpp`. Each entry contains an incremental sequence number, epoch timestamp, actor identity, action descriptor, and the SHA-256 digest of the preceding entry:
+
+$$H_i = \text{SHA256}(H_{i-1} \parallel \text{timestamp}_i \parallel \text{actor}_i \parallel \text{action}_i \parallel \text{payload}_i)$$
+
+Any modification, omission, or reordering of historical records invalidates the cryptographic hash chain.
 
 ---
 
-## 4. Sıfır Kurulumlu Agent Katılımı (Zero-Install `curl | sh`)
+## 4. Zero-Install Agent Enrollment (`curl | sh`)
 
-Uzak düğümlerde önceden derleme yapmadan, tek bir komutla worker başlatma akışı:
+Remote compute nodes can be dynamically joined to the resilience cluster without manual compilation or pre-installed dependencies using a single shell pipeline:
 
 ```bash
-curl -fsSL https://master-ip:8443/v1/agent/install?token=SECRET_JOIN_TOKEN | sh
+curl -fsSL https://<master-ip>:8443/v1/agent/install?token=SECRET_JOIN_TOKEN | sh
 ```
 
-### Betik Yürütme Detayı:
+### Bootstrap Execution Flow
 
-1. **Manifest İndirilir:** `/v1/agent/manifest?token=...` çekilir.
-2. **HMAC Doğrulanır:** `openssl dgst -sha256 -hmac "TOKEN"` ile ilk satırdaki `#hmac <SIG>` eşleştirilir.
-3. **Binary Dosyaları Çekilir:** `/v1/agent/blob?name=samurai_slave` ve `/v1/agent/blob?name=samurai_cpu_worker` indirilir.
-4. **Checksum Doğrulanır:** `echo "<hash>  $TMP/file" | sha256sum -c -` kontrol edilir.
-5. **Slave Başlatılır:** `exec $TMP/samurai_slave --dispatch-mode reverse ...` ile süreç ayağa kalkar.
+```mermaid
+sequenceDiagram
+    participant Worker as Fresh Linux Node
+    participant Master as Master HTTPS API (:8443)
+    participant ZMQ as Master Control Server (:5099)
+
+    Worker->>Master: GET /v1/agent/install?token=SECRET_JOIN_TOKEN
+    Master-->>Worker: Dynamically Generated Shell Installer Script
+    Worker->>Master: GET /v1/agent/manifest?token=SECRET_JOIN_TOKEN
+    Master-->>Worker: Signed Manifest (Payload Names, Checksums, #hmac Signature)
+    Note over Worker: Verifies HMAC-SHA256 using JOIN_TOKEN
+    Worker->>Master: GET /v1/agent/blob?name=samurai_slave
+    Master-->>Worker: ELF Binary: samurai_slave
+    Worker->>Master: GET /v1/agent/blob?name=samurai_cpu_worker
+    Master-->>Worker: ELF Binary: samurai_cpu_worker
+    Note over Worker: Verifies SHA-256 Checksums of Blobs
+    Worker->>ZMQ: Execute samurai_slave --dispatch-mode reverse
+    ZMQ-->>Worker: Registration Confirmed, Heartbeat Active
+```
+
+1. **Manifest Retrieval:** The script requests `/v1/agent/manifest?token=...`.
+2. **Cryptographic Verification:** The signature header (`#hmac <HEX>`) is verified against the payload body using `openssl dgst -sha256 -hmac "TOKEN"`.
+3. **Binary Acquisition:** The required executables (`samurai_slave` and the target worker engine, e.g. `samurai_cpu_worker`) are downloaded via `/v1/agent/blob?name=...`.
+4. **Integrity Validation:** SHA-256 checksums are verified via `sha256sum -c`.
+5. **Slave Execution:** The slave starts in reverse mode (`exec $TMP/samurai_slave --dispatch-mode reverse ...`) and connects back to the master.
 
 ---
 
-### 4.1 Tetikleme Bağlantısı ile Otomatik Provizyon (Agent Push Provisioner)
+### 4.1 Push Provisioner via SSH (`Agent Push Provisioner`)
 
-Master'ın, genel IP'si ve SSH servisi açık olan uzak hedef sunuculara doğrudan bağlanıp Zero-Install komutunu (`curl | sh`) tetiklemesi ve `samurai_slave`'in Master'a ters (reverse) bağlanmasını sağlaması özelliğidir.
+When automated provisioning is preferred over running commands on remote servers, the master can connect out to target nodes over SSH and trigger the bootstrap sequence automatically.
 
-#### A. CLI Üzerinden Başlatma
-Master ayağa kalkarken `--provision-*` bayrakları ile hedef sunucu listesi verilerek doğrudan provizyon tetiklenebilir:
+#### A. Command-Line Invocation on Master Startup
 
 ```bash
-samurai_master \
+./build/control/daemon/samurai_master \
   --agent-join-token "SUPER_SECRET_TOKEN" \
   --provision-hosts "198.51.100.20:22,198.51.100.21:22" \
   --provision-ssh-user "root" \
   --provision-ssh-key "/root/.ssh/id_ed25519" \
   --provision-worker "cpu" \
-  --provision-timeout-s 10
+  --provision-timeout-s 15
 ```
 
-#### B. REST API Üzerinden Dinamik Tetikleme (`POST /v1/cluster/provision`)
-Master çalışırken operatör veya yönetim paneli HTTP API üzerinden provizyon başlatabilir:
+#### B. Dynamic Triggering via REST API (`POST /v1/cluster/provision`)
 
 ```bash
-curl -X POST https://master-ip:8443/v1/cluster/provision \
+curl -X POST https://198.51.100.10:8443/v1/cluster/provision \
   -H "Authorization: Bearer ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -235,11 +257,12 @@ curl -X POST https://master-ip:8443/v1/cluster/provision \
     "ssh_user": "ubuntu",
     "ssh_key_path": "/etc/samurai/deploy_key",
     "worker_kind": "cpu",
-    "timeout_s": 10
+    "timeout_s": 15
   }'
 ```
 
-**Başarılı Yanıt Örneği (200 OK):**
+**Expected JSON Response (200 OK):**
+
 ```json
 {
   "status": "ok",
@@ -267,105 +290,84 @@ curl -X POST https://master-ip:8443/v1/cluster/provision \
 }
 ```
 
-* **Teknik İşleyiş:** Master, arka planda POSIX `fork()`/`execvp()` ile `ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i <key> <user>@<host> "nohup sh -c 'curl ... | sh' >/dev/null 2>&1 &"` komutunu asenkron olarak tetikler ve `timeout_s` süresi boyunca `Servicer::SnapshotWorkers()` tablosunda hedef düğümlerin kalp atışını (Heartbeat) doğrular.
+---
+
+## 5. High Availability (HA) and Multi-Master Federation
+
+### 5.1 Intra-Region HA Leader Election (Active/Passive)
+
+Within a single deployment zone or region, multiple master daemons can run concurrently. Exactly **one** active leader coordinates workloads, while standby nodes poll leadership state:
+
+- **Static Priority Mode:** Configured via `--ha-mode static --ha-peers node1,node2,node3`. The first reachable, alive node in the ordered list assumes leadership.
+- **File-Lock Lease Mode:** Configured via `--ha-mode file-lock --ha-lease-path /mnt/nfs/samurai_lease.json`. Uses file locks with TTL leasing over shared POSIX filesystems (e.g. NFS, GlusterFS). If the leader crashes, standby nodes acquire the lease after the 15-second TTL expires.
+- **Redis Distributed Lease Mode (`--ha-mode redis`):** Powered by `RedisLeaseLeaderElector` (`control/ha.cpp`). Uses atomic Redis key leases with monotonic fencing epochs. The lease key defaults to `samurai:ha:<tenant|default>:lease`, with the backend URL set by `--multi-master-redis-url`. This provides robust split-brain prevention and sub-second failover recovery.
+
+### 5.2 Inter-Region Multi-Master Federation (Active/Active)
+
+Cross-region federations connect autonomous regional clusters together through a shared Redis state bus:
+
+- Each region operates an independent active master and local worker pool.
+- Masters delegate workloads across regions when target destinations reside in remote geographies.
+- Coordination logic is encapsulated in `control/multimaster.cpp` (`RedisMultiMasterCoordinator`) and `control/redis_kvstore.cpp` (native hiredis client).
+
+**Federation Configuration Flags:**
+
+| Flag | Default Value | Description |
+| :--- | :--- | :--- |
+| `--multi-master-enable` | `false` | Enables inter-region federation. When active, `--count 0` denotes a service-only master that executes delegated tasks. |
+| `--multi-master-region-id R` | `--target-region` | Geographic identifier for this master instance (e.g., `us-east-1`, `eu-central-1`). |
+| `--multi-master-redis-url U` | `redis://127.0.0.1:6379/0` | Connection string for the shared coordination Redis instance. |
+| `--multi-master-namespace N` | `default` | Key prefix namespace preventing tenant collisions. |
+| `--multi-master-heartbeat-ttl-s N` | `15` | Time-to-live expiration for regional presence heartbeats. |
+| `--multi-master-dequeue-max N` | `3` | Maximum number of delegated jobs dequeued per scheduling cycle. |
+| `--target-region R` | `""` | Routes execution to a specific target region. If different from the local region, the workload is automatically delegated via Redis queue. |
 
 ---
 
-## 5. Yüksek Erişilebilirlik (HA) ve Multi-Master
+## 6. Shard Management, Allocation, and Auto-Balancing
 
-### 5.1 HA Lider Seçimi (bölge içi, active/passive)
+The mathematical shard partitioner implemented in `control/shard.cpp` guarantees that large packet volumes are distributed across $N$ workers with fair remainder apportionment:
 
-Aynı bölgede birden çok master çalıştığında yalnızca **bir** lider iş sürer; diğerleri yedektir.
+$$\text{Shard}_i = \left\lfloor \frac{\text{Total Packets}}{N} \right\rfloor + \begin{cases} 1 & \text{if } i < (\text{Total Packets} \bmod N) \\ 0 & \text{otherwise} \end{cases}$$
 
-- **Static Modu:** `--ha-peers node1,node2,node3` listesinde en sol başta bulunan ve ayakta olan düğüm liderdir.
-- **File-Lock Modu:** Paylaşımlı depolamada (`NFS`, `GlusterFS` vb.) `/tmp/ddos_samurai_master_lease.json` dosyasını kullanır. Lider düğüm çöktüğünde 15 saniyelik TTL süresi dolunca ikinci master liderliği alır.
-- **Redis Modu (`--ha-mode redis`):** Redis üstünde fencing-epoch'lu lease (`RedisLeaseLeaderElector`). Lease anahtarı `--ha-lease-key` (varsayılan `samurai:ha:<tenant|default>:lease`) ile ayarlanır; backend, multi-master ile aynı `--multi-master-redis-url`'dir. Bölge başına "tek aktif master" garantisini gerçek Redis ile sağlar.
+For example, when distributing 1,000,001 packets across 3 active workers:
+- **Worker 1:** 333,334 packets
+- **Worker 2:** 333,333 packets
+- **Worker 3:** 333,333 packets
 
-### 5.2 Multi-Master Bölge Federasyonu (bölgeler arası, active/active)
-
-Her **bölge** = 1 aktif master + kendi slave'leri. Masterlar paylaşımlı Redis üzerinden birbirine iş delege eder, bölge heartbeat'i ve snapshot'ı yayınlar. Koordinasyon mantığı `control/multimaster.cpp` (`RedisMultiMasterCoordinator`), gerçek backend `control/redis_kvstore.cpp` (hiredis) — `samurai_master`'a `daemon/master_main.cpp` içinde bağlıdır.
-
-**Etkinleştirme bayrakları:**
-
-| Bayrak | Varsayılan | Açıklama |
-|---|---|---|
-| `--multi-master-enable` | kapalı | Federasyonu aç. Bu bayrakla `--count 0` "yalnızca-servis" (yerel iş yok, sadece delege iş koştur) demektir. |
-| `--multi-master-region-id R` | `--target-region` | Bu master'ın bölgesi (boşsa heartbeat/dequeue devre dışı). |
-| `--multi-master-redis-url U` | `redis://127.0.0.1:6379/0` | Paylaşılan Redis. |
-| `--multi-master-namespace N` | `default` | Anahtar-önek izolasyonu. |
-| `--multi-master-heartbeat-ttl-s N` | `15` | Bölge heartbeat TTL. |
-| `--multi-master-dequeue-max N` | `3` | Poll başına çekilen delege iş sayısı. |
-| `--target-region R` | — | İşi bu bölgeye yönlendir/delege et (bölge farklıysa delegasyon). |
-
-**İşleyiş:**
-1. Master, HA lideri ise arka planda periyodik `Heartbeat` + `PublishSnapshot` yayınlar.
-2. `--target-region` yerel bölgeden farklıysa birincil iş, hedef bölge kuyruğuna **delege** edilir (`EnqueueJob`); aynı bölge ise yerelde koşar.
-3. Master, sinyale kadar bir **servis döngüsünde** kalır: komşu bölgelerden delege edilen işleri `DequeueJobs` ile çekip kendi slave'lerinde `RunSingleJob` ile koşturur ve `delegated_job_done` olayını yayınlar.
-4. Tüm bölgelerin snapshot'ı management API `/v1/cluster/summary` → `multi_master_regions` alanından görülür.
-
-> Not: hiredis derlenmemişse veya Redis erişilemezse master **tek bağımsız bölge** olarak sorunsuz çalışmaya devam eder (`MakeKvStore` nullptr döner, koordinatör pasifleşir).
-
-**İki bölgeli hızlı örnek (tek makinede):**
-```bash
-redis-server --daemonize yes
-# us: servis-only master (kendi slave'i ile delege işi bekler)
-samurai_master --count 0 --multi-master-enable --multi-master-region-id us \
-  --control-listen tcp://0.0.0.0:5099 --management-listen 127.0.0.1:8088 &
-samurai_slave --control-endpoints tcp://127.0.0.1:5099 --worker cpu --worker-region us --worker-dir <build>/zmq &
-# eu: kendi işini us'e delege eder
-samurai_master --count 100000 --multi-master-enable --multi-master-region-id eu \
-  --target-region us --control-listen tcp://0.0.0.0:5199 &
-```
+Sum = 1,000,001 packets. Zero truncation, zero packet drop, zero remainder drift.
 
 ---
 
-## 6. Shard Yönetimi, Dağıtım ve Otomatik Ölçekleme
+## 7. HTTP Management REST API Reference
 
-`[shard.cpp](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/shard.cpp)` algoritması, paket bölüşümünde artık paketleri ilk worker'lara dengeli biçimde paylaştırır:
+The embedded REST API server operates on port `:8443` (or user-defined port) and provides programmatic cluster control.
 
-$$\text{Shard}_i = \lfloor \frac{\text{Toplam Paket}}{N} \rfloor + (1 \text{ if } i < (\text{Toplam Paket} \bmod N) \text{ else } 0)$$
-
-Örnek: 1.000.001 paket 3 worker'a paylaştırılırken:
-
-- Worker 1: 333.334 paket
-- Worker 2: 333.333 paket
-- Worker 3: 333.333 paket
-
----
-
-## 7. HTTP Management REST API Tam Referansı
-
-
-| Metod  | Uç Nokta              | Gerekli Rol | Başarılı Yanıt Örneği                                                            |
-| ------ | --------------------- | ----------- | -------------------------------------------------------------------------------- |
-| `GET`  | `/healthz`            | Yok         | `{"status":"ok","db_port":5099}`                                                 |
-| `GET`  | `/v1/cluster/summary` | `viewer`    | `{"workers_count":4,"shards_reported_count":4,"current_job":{"job_id":"job-1"}}` |
-| `GET`  | `/v1/cluster/workers` | `viewer`    | `[{"worker_id":"slave-01","region":"eu-west","last_heartbeat_ms":1775600010}]`   |
-| `GET`  | `/v1/cluster/shards`  | `viewer`    | `[{"shard_id":"s-01","status":"running","packets_sent":500000}]`                 |
-| `GET`  | `/v1/cluster/events`  | `viewer`    | `[{"seq":1,"event":"worker_registered","time":1775600000}]`                      |
-| `POST` | `/v1/jobs/abort`      | `operator`  | `{"aborted":true,"reason":"operator_abort"}`                                     |
-| `POST` | `/v1/cluster/provision` | `operator` / `admin` | `{"status":"ok","total":2,"triggered":2,"joined":2}`                               |
-| `GET`  | `/metrics`            | `viewer`    | Prometheus text formatında metrikler                                             |
-| `GET`  | `/v1/agent/install`   | Join Token  | Shell installer betiği (`text/x-shellscript`)                                    |
-| `GET`  | `/v1/agent/manifest`  | Join Token  | HMAC imzalı manifest (`text/plain`)                                              |
-| `GET`  | `/v1/agent/blob`      | Join Token  | Binary octet-stream (`application/octet-stream`)                                 |
-
+| Method | Endpoint | Required Role | Example Response Payload |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/healthz` | None | `{"status":"ok","db_port":5099}` |
+| `GET` | `/v1/cluster/summary` | `viewer` | `{"workers_count":4,"shards_reported_count":4,"current_job":{"job_id":"job-1"}}` |
+| `GET` | `/v1/cluster/workers` | `viewer` | `[{"worker_id":"slave-01","region":"eu-west","last_heartbeat_ms":1775600010}]` |
+| `GET` | `/v1/cluster/shards` | `viewer` | `[{"shard_id":"s-01","status":"running","packets_sent":500000}]` |
+| `GET` | `/v1/cluster/events` | `viewer` | `[{"seq":1,"event":"worker_registered","time":1775600000}]` |
+| `POST` | `/v1/jobs/abort` | `operator` | `{"aborted":true,"reason":"operator_abort"}` |
+| `POST` | `/v1/cluster/provision`| `admin` | `{"status":"ok","total":2,"triggered":2,"joined":2}` |
+| `GET` | `/metrics` | `viewer` | Prometheus text-formatted performance metrics |
+| `GET` | `/v1/agent/install` | Join Token | Shell script dynamic installer (`text/x-shellscript`) |
+| `GET` | `/v1/agent/manifest` | Join Token | HMAC-signed artifact manifest (`text/plain`) |
+| `GET` | `/v1/agent/blob` | Join Token | Raw binary executable octet stream (`application/octet-stream`) |
 
 ---
 
-## 8. Detaylı Uçtan Uca Uygulama ve Kullanım Senaryoları
+## 8. End-to-End Operational Scenarios
 
-Bu bölümde, sıfırdan başlayarak en karmaşık kurumsal dağıtımlara kadar 9 adet detaylı senaryo yer almaktadır.
+### Scenario 1: Local Rapid Development and Testing (Sandbox Mode)
 
----
-
-### Senaryo 1: Yerel Hızlı Geliştirme ve Test (Sandbox Modu)
-
-**Amaç:** Geliştiricinin kendi bilgisayarında şifreleme ve karmaşık yapılandırmalarla uğraşmadan, yerel loopback üzerinden 1 Master ve 2 Worker ile hızlı bir UDP yük testi yapması.
+**Objective:** Execute a multi-worker UDP packet generation workload on local loopback without encryption keys or complex network setups.
 
 ```bash
-# Terminal 1: Master'ı Başlatalım (127.0.0.1 üzerinde dinler)
-./build/control/samurai_master \
+# Terminal 1: Launch Master Daemon
+./build/control/daemon/samurai_master \
   --count 100000 \
   --target 127.0.0.1 \
   --port 9999 \
@@ -378,26 +380,26 @@ Bu bölümde, sıfırdan başlayarak en karmaşık kurumsal dağıtımlara kadar
 ```
 
 ```bash
-# Terminal 2: 1. Yerel Slave (CPU Worker)
-./build/control/samurai_slave \
+# Terminal 2: Start First Local Slave (CPU Worker Engine)
+./build/control/daemon/samurai_slave \
   --control-endpoints 127.0.0.1:5099 \
   --worker cpu \
   --worker-id "local-worker-cpu-01" \
-  --worker-dir ./build/zmq/daemon \
+  --worker-dir ./build/zmq \
   --dispatch-mode direct
 ```
 
 ```bash
-# Terminal 3: 2. Yerel Slave (AF_PACKET Worker)
-./build/control/samurai_slave \
+# Terminal 3: Start Second Local Slave (AF_PACKET Worker Engine)
+./build/control/daemon/samurai_slave \
   --control-endpoints 127.0.0.1:5099 \
   --worker afpacket \
   --worker-id "local-worker-afpacket-02" \
-  --worker-dir ./build/zmq/daemon \
+  --worker-dir ./build/zmq \
   --dispatch-mode direct
 ```
 
-**Gözlemlenen Konsol Çıktısı (Master):**
+**Observed Master Console Output:**
 
 ```text
 samurai_master: control server on tcp://127.0.0.1:5099
@@ -412,32 +414,31 @@ samurai_master: job finished. Total sent: 100000 pkts, errors: 0
 
 ---
 
-### Senaryo 2: Üretim Seviyesi Güvenli Multi-Node Kümesi (TLS + CURVE + Secret + Tenant)
+### Scenario 2: Production Multi-Node Secure Cluster (TLS + CURVE + Secret + Tenant)
 
-**Amaç:** Farklı veri merkezlerindeki (Frankfurt, Amsterdam) sunucuları birbirine CurveZMQ, Kurumsal TLS sertifikaları, Cluster Secret ve Tenant İzolasyonu ile bağlamak.
+**Objective:** Interconnect geographically distributed nodes across data centers (Frankfurt, Amsterdam) with CurveZMQ wire encryption, enterprise TLS certificates, cluster authentication tokens, and tenant isolation.
 
-#### 1. Adım: Master İçin CURVE Anahtarları Üretimi
+#### Step 1: Generate Master Curve25519 Keypair
 
 ```bash
-./build/control/samurai_master --gen-curve-keys
+./build/control/daemon/samurai_master --gen-curve-keys
 ```
 
-*Üretilen Değerler:*
-
+*Example Output:*
 - `PUBLIC_KEY`: `Yq#7K$91v.kLmP!2xWz8&NpQ456789abcdefghij`
 - `SECRET_KEY`: `mA1#9Xz.K!pLmN@5rTy8*VbC1234567890abcdef`
 
-#### 2. Adım: Master Düğümünü Başlatma (Frankfurt - `198.51.100.10`)
+#### Step 2: Launch Production Master (Frankfurt - `198.51.100.10`)
 
 ```bash
-./build/control/samurai_master \
+./build/control/daemon/samurai_master \
   --count 10000000 \
   --target 203.0.113.50 \
   --port 443 \
   --protocol tcp \
   --control-listen tcp://0.0.0.0:5099 \
   --curve-server-secret "mA1#9Xz.K!pLmN@5rTy8*VbC1234567890abcdef" \
-  --cluster-secret "UltraGuvenliKurumsalSifre2026" \
+  --cluster-secret "EnterpriseResilienceSecret2026" \
   --tenant-namespace "fintech-prod-stress" \
   --management-listen 0.0.0.0:8443 \
   --mgmt-tls \
@@ -447,13 +448,13 @@ samurai_master: job finished. Total sent: 100000 pkts, errors: 0
   --wait-workers-s 120
 ```
 
-#### 3. Adım: 1. Slave Düğümünü Başlatma (Amsterdam - `198.51.100.20`)
+#### Step 3: Launch Slave 1 (Amsterdam - `198.51.100.20`)
 
 ```bash
-./build/control/samurai_slave \
+./build/control/daemon/samurai_slave \
   --control-endpoints 198.51.100.10:5099 \
   --curve-server-public "Yq#7K$91v.kLmP!2xWz8&NpQ456789abcdefghij" \
-  --cluster-secret "UltraGuvenliKurumsalSifre2026" \
+  --cluster-secret "EnterpriseResilienceSecret2026" \
   --tenant-namespace "fintech-prod-stress" \
   --worker cpu \
   --worker-id "slave-ams-01" \
@@ -462,13 +463,13 @@ samurai_master: job finished. Total sent: 100000 pkts, errors: 0
   --dispatch-mode direct
 ```
 
-#### 4. Adım: 2. Slave Düğümünü Başlatma (Frankfurt Node 2 - `198.51.100.21`)
+#### Step 4: Launch Slave 2 (Frankfurt Node 2 - `198.51.100.21`)
 
 ```bash
-./build/control/samurai_slave \
+./build/control/daemon/samurai_slave \
   --control-endpoints 198.51.100.10:5099 \
   --curve-server-public "Yq#7K$91v.kLmP!2xWz8&NpQ456789abcdefghij" \
-  --cluster-secret "UltraGuvenliKurumsalSifre2026" \
+  --cluster-secret "EnterpriseResilienceSecret2026" \
   --tenant-namespace "fintech-prod-stress" \
   --worker dpdk \
   --worker-id "slave-fra-dpdk-02" \
@@ -479,40 +480,39 @@ samurai_master: job finished. Total sent: 100000 pkts, errors: 0
 
 ---
 
-### Senaryo 3: NAT ve Güvenlik Duvarı Arkasındaki Worker'lar (Reverse Mode)
+### Scenario 3: Workers Behind NAT and Firewalls (Reverse Mode)
 
-**Amaç:** Bir kurum içi (on-premise) laboratuvarda veya ev ağında NAT arkasında bulunan bir GPU makinesini, genel buluttaki Master'a dışarıdan port açmadan güvenle bağlamak.
+**Objective:** Connect an on-premise GPU workstation behind strict stateful NAT to a cloud master without opening any inbound ports on the local network.
 
 ```mermaid
 sequenceDiagram
-    participant Worker as NAT Arkası GPU Worker (192.168.1.50)
-    participant FW as Güvenlik Duvarı / NAT Router
-    participant Master as Genel Bulut Master (198.51.100.10:5099)
+    participant Worker as NAT-Restricted GPU Worker (192.168.1.50)
+    participant FW as NAT Router / Firewall
+    participant Master as Cloud Master (198.51.100.10:5099)
 
-    Note over Worker: Inbound Port AÇILMAZ (Reverse Mod)
-    Worker->>FW: Outbound ZMQ Bağlantısı Başlat
-    FW->>Master: ZMQ RegisterWorker (CURVE Encrypted)
+    Note over Worker: No Inbound Port Required (Reverse Mode)
+    Worker->>FW: Outbound Connection Initiation
+    FW->>Master: ZMQ RegisterWorker (CurveZMQ Encrypted)
     Master-->>Worker: Registration OK
 
-    loop Her 2 Saniyede Bir (Heartbeat Pull)
+    loop Every 1000ms (Heartbeat Long-Poll)
         Worker->>Master: Heartbeat RPC (x-cluster-secret)
-        alt Yeni İş Yoksa
+        alt No Pending Workload
             Master-->>Worker: {"assigned_shards": []}
-        else Yeni İş Geldiğinde
+        else New Shard Dispatched
             Master-->>Worker: {"assigned_shards": [{"shard_id":"s-gpu-1", "packet_count":5000000}]}
-            Note over Worker: Shard Alındı! Yerel samurai_gpu_worker'ı tetikle
+            Note over Worker: Spawns local samurai_gpu_worker process
         end
     end
 ```
 
-
+**Slave Launch Command:**
 
 ```bash
-# Slave Başlatma Komutu (Reverse / Pull Modu):
-./build/control/samurai_slave \
+./build/control/daemon/samurai_slave \
   --control-endpoints 198.51.100.10:5099 \
   --curve-server-public "Yq#7K$91v.kLmP!2xWz8&NpQ456789abcdefghij" \
-  --cluster-secret "UltraGuvenliKurumsalSifre2026" \
+  --cluster-secret "EnterpriseResilienceSecret2026" \
   --worker gpu \
   --worker-id "onprem-gpu-lab-01" \
   --dispatch-mode reverse \
@@ -521,35 +521,35 @@ sequenceDiagram
 
 ---
 
-### Senaryo 4: Sıfır Kurulumlu Dinamik Agent Katılımı (`curl | sh` ile Canlı Dağıtım)
+### Scenario 4: Zero-Install Dynamic Agent Bootstrap (Live Deployment)
 
-**Amaç:** Bulutta yeni oluşturulan sanal sunuculara SSH ile girip binary yüklemek yerine `cloud-init` veya tek bir bash satırı ile otomatik dahil etmek.
+**Objective:** Automatically provision fresh cloud compute instances during traffic scaling events via `cloud-init` or one-line bash commands.
 
-#### 1. Adım: Master'da Agent Bootstrap Özelliğini Açma
+#### Step 1: Configure Agent Distribution on Master
 
 ```bash
-./build/control/samurai_master \
+./build/control/daemon/samurai_master \
   --count 20000000 \
   --target 203.0.113.100 \
   --control-listen tcp://0.0.0.0:5099 \
   --curve-server-secret "mA1#9Xz.K!pLmN@5rTy8*VbC1234567890abcdef" \
-  --cluster-secret "KurumsalSecret123" \
+  --cluster-secret "EnterpriseSecret123" \
   --management-listen 0.0.0.0:8443 \
   --mgmt-tls \
   --agent-join-token "JoinSecretToken99" \
-  --agent-artifact-dir /opt/samurai/binaries \
+  --agent-artifact-dir ./build/control/daemon \
   --agent-advertise tcp://198.51.100.10:5099 \
   --agent-worker cpu \
   --agent-dispatch-mode reverse
 ```
 
-#### 2. Adım: Yeni Sunucuda (Worker) Tek Satır ile Katılım
+#### Step 2: Execute Bootstrap on New Worker Node
 
 ```bash
 curl -fsSLk https://198.51.100.10:8443/v1/agent/install?token=JoinSecretToken99 | sh
 ```
 
-#### Arka Planda Çalışan Doğrulama Adımlarının Terminal Çıktısı:
+**Worker Console Log:**
 
 ```text
 [+] samurai-agent: downloading manifest from https://198.51.100.10:8443/v1/agent/manifest
@@ -563,59 +563,55 @@ curl -fsSLk https://198.51.100.10:8443/v1/agent/install?token=JoinSecretToken99 
 
 ---
 
-### Senaryo 5: Yüksek Erişilebilirlik (HA Active-Passive Failover Testi)
+### Scenario 5: High Availability (Active-Passive Failover Test)
 
-**Amaç:** Aktif Master sunucusu beklenmedik şekilde kapandığında (crash / network partition), yedek Master'ın otomatik olarak liderliği devralmasını sağlamak.
+**Objective:** Verify automatic leadership takeover when the active master node experiences hardware failure or network partitioning.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Node1_Leader: Node 1 Lease Alır (Epoch 1)
-    [*] --> Node2_Standby: Node 2 Beklemede (Epoch 1)
+    [*] --> Node1_Leader: Node 1 Acquires Redis/File Lease (Epoch 1)
+    [*] --> Node2_Standby: Node 2 Observes Active Lease (Epoch 1)
 
-    Node1_Leader --> Node1_Crashed: Donanım Arızası / SIGKILL
-    Note right of Node2_Standby: 15 sn TTL Süresi Doldu
-    Node2_Standby --> Node2_Leader: Node 2 Yeni Lease Alır (Epoch 2)
-    Node2_Leader --> Worker_Reconnected: Slave'ler Node 2'ye Failover Yapar
+    Node1_Leader --> Node1_Crashed: Hardware Failure / SIGKILL
+    Note right of Node2_Standby: 15s TTL Lease Expires
+    Node2_Standby --> Node2_Leader: Node 2 Acquires New Lease (Epoch 2)
+    Node2_Leader --> Worker_Reconnected: Slaves Failover to Node 2
 ```
-
-
 
 ```bash
-# Master 1 (Aktif Lider Adayı):
-./build/control/samurai_master \
+# Master 1 (Initial Active Leader)
+./build/control/daemon/samurai_master \
   --count 5000000 \
-  --ha-mode file-lock \
+  --ha-mode redis \
   --ha-node-id master-eu-primary \
-  --ha-lease-path /mnt/nfs_share/samurai_lease.json \
+  --multi-master-redis-url redis://127.0.0.1:6379/0 \
   --control-listen tcp://0.0.0.0:5099
 
-# Master 2 (Yedek Bekleyen Aday):
-./build/control/samurai_master \
+# Master 2 (Standby Replica on Alternate Port)
+./build/control/daemon/samurai_master \
   --count 5000000 \
-  --ha-mode file-lock \
+  --ha-mode redis \
   --ha-node-id master-eu-backup \
-  --ha-lease-path /mnt/nfs_share/samurai_lease.json \
-  --control-listen tcp://0.0.0.0:5099
+  --multi-master-redis-url redis://127.0.0.1:6379/0 \
+  --control-listen tcp://0.0.0.0:5199
 ```
 
-**Master 2 Terminal Çıktısı (Liderlik Beklerken ve Devralırken):**
+**Master 2 Takeover Logs:**
 
 ```text
 samurai_master: not leader (current leader: master-eu-primary, epoch: 1); standing by...
-[... 15 saniye sonra Master 1 sonlandırıldığında ...]
+[... 15 seconds after terminating Master 1 ...]
 samurai_master: lease expired for master-eu-primary!
 samurai_master: successfully acquired lease. New Leader: master-eu-backup (epoch: 2)
-samurai_master: control server on tcp://0.0.0.0:5099
-samurai_master: accepting worker heartbeats and shard dispatches.
+samurai_master: control server active on tcp://0.0.0.0:5199
+samurai_master: accepting worker heartbeats and resuming shard dispatches.
 ```
 
 ---
 
-### Senaryo 6: Management REST API Kapsamlı cURL, JWT ve Otomasyon Örnekleri
+### Scenario 6: Management REST API Automation, JWT, and cURL Reference
 
-#### 1. HMAC-SHA256 JWT Token Üretme (Python Script)
-
-Aşağıdaki Python tek satırlık scripti ile geçerli bir `admin` JWT token üretilebilir:
+#### 1. Generating an HMAC-SHA256 JWT Token
 
 ```bash
 python3 -c '
@@ -624,7 +620,7 @@ import hmac, hashlib, base64, json, time
 secret = "MyJwtSecretKey2026"
 header = base64.urlsafe_b64encode(json.dumps({"alg":"HS256","typ":"JWT"}).encode()).rstrip(b"=").decode()
 payload = base64.urlsafe_b64encode(json.dumps({
-    "sub": "mehmet-operator",
+    "sub": "resilience-engineer",
     "role": "admin",
     "tenant_namespace": "fintech-prod",
     "exp": int(time.time()) + 3600
@@ -637,60 +633,48 @@ print(f"{header}.{payload}.{sig_b64}")
 '
 ```
 
-#### 2. REST API Sorgulama Örnekleri
+#### 2. Querying Endpoints via cURL
 
 ```bash
-JWT_TOKEN="<YUKARIDA_URETILEN_JWT_TOKEN>"
+JWT_TOKEN="<JWT_TOKEN_GENERATED_ABOVE>"
 
-# 1. Sağlık Kontrolü (Healthcheck)
+# Healthcheck probe
 curl -k -s https://127.0.0.1:8443/healthz | jq .
 
-# 2. Küme Özeti
+# Cluster summary
 curl -k -s https://127.0.0.1:8443/v1/cluster/summary \
   -H "Authorization: Bearer $JWT_TOKEN" | jq .
 
-# Örnek Çıktı:
-# {
-#   "workers_count": 3,
-#   "shards_reported_count": 3,
-#   "current_job": {
-#     "job_id": "job_1775601149",
-#     "target": "203.0.113.10",
-#     "port": 80,
-#     "total_packets": 1000000
-#   }
-# }
-
-# 3. Tüm Aktif Worker'ları Listeleme
+# Worker fleet status
 curl -k -s https://127.0.0.1:8443/v1/cluster/workers \
   -H "Authorization: Bearer $JWT_TOKEN" | jq .
 
-# 4. Denetim Günlüğü Olaylarını Çekme (Audit Log)
+# Cryptographic audit events
 curl -k -s https://127.0.0.1:8443/v1/cluster/events \
   -H "Authorization: Bearer $JWT_TOKEN" | jq .
 
-# 5. Acil Durum: Çalışan İşi İptal Etme (Abort Job)
+# Emergency workload abort
 curl -k -s -X POST https://127.0.0.1:8443/v1/jobs/abort \
   -H "Authorization: Bearer $JWT_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"reason": "DDoS test target threshold exceeded"}' | jq .
+  -d '{"reason": "Target stress threshold reached"}' | jq .
 ```
 
 ---
 
-### Senaryo 7: Docker Compose ile İzole Dağıtık Test Kümesi
+### Scenario 7: Isolated Distributed Cluster with Docker Compose
 
-Tüm dağıtık mimariyi tek bir `docker-compose.yml` dosyası ile ayağa kaldırmak:
+A complete multi-node deployment can be defined in a single `docker-compose.yml`:
 
 ```yaml
 version: '3.8'
 
 services:
   master:
-    image: ddos_samurai:latest
+    image: samurai_platform:latest
     container_name: samurai_master
     command: >
-      ./build/control/samurai_master
+      ./build/control/daemon/samurai_master
       --count 1000000
       --target 172.20.0.100
       --port 80
@@ -707,12 +691,12 @@ services:
         ipv4_address: 172.20.0.10
 
   slave_cpu:
-    image: ddos_samurai:latest
+    image: samurai_platform:latest
     container_name: samurai_slave_cpu
     depends_on:
       - master
     command: >
-      ./build/control/samurai_slave
+      ./build/control/daemon/samurai_slave
       --control-endpoints 172.20.0.10:5099
       --cluster-secret "ComposeSecret99"
       --worker cpu
@@ -723,12 +707,12 @@ services:
         ipv4_address: 172.20.0.11
 
   slave_reverse:
-    image: ddos_samurai:latest
+    image: samurai_platform:latest
     container_name: samurai_slave_reverse
     depends_on:
       - master
     command: >
-      ./build/control/samurai_slave
+      ./build/control/daemon/samurai_slave
       --control-endpoints 172.20.0.10:5099
       --cluster-secret "ComposeSecret99"
       --worker cpu
@@ -745,20 +729,21 @@ networks:
         - subnet: 172.20.0.0/16
 ```
 
-Çalıştırma:
+Launch with:
 
 ```bash
-docker-compose up --build
+docker compose up --build
 ```
 
 ---
 
-### Senaryo 8: Python ile Otomatik Telemetri ve Alarm İzleme Scripti
-
-Master REST API'sini periyodik sorgulayıp worker kopmalarını veya hata oranlarını tespit eden izleme scripti örneği:
+### Scenario 8: Python Telemetry and Cluster Alerting Monitor
 
 ```python
 #!/usr/bin/env python3
+"""
+Samurai Cluster Health and Telemetry Poller
+"""
 import time
 import requests
 
@@ -767,24 +752,23 @@ API_TOKEN = "AdminToken123"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 
 def monitor_cluster():
-    print("[*] DDoSamurai Cluster Monitor başlatıldı...")
+    print("[*] Starting Samurai Cluster Telemetry Poller...")
     while True:
         try:
-            # 1. Küme Özetini Çek
             resp = requests.get(f"{MASTER_URL}/v1/cluster/summary", headers=HEADERS, verify=False, timeout=3)
             if resp.status_code == 200:
                 data = resp.json()
                 active_workers = data.get("workers_count", 0)
                 shards = data.get("shards_reported_count", 0)
-                print(f"[STATUS] Aktif Worker: {active_workers} | Raporlanan Shard: {shards}")
+                print(f"[STATUS] Active Workers: {active_workers} | Reported Shards: {shards}")
 
                 if active_workers < 2:
-                    print("[ALARM] DİKKAT: Aktif worker sayısı eşiğin (2) altına düştü!")
+                    print("[ALERT] WARNING: Active worker count dropped below quorum threshold (2)!")
             else:
-                print(f"[HATA] API Yanıtı: {resp.status_code}")
+                print(f"[ERROR] API returned HTTP {resp.status_code}")
 
         except requests.exceptions.RequestException as e:
-            print(f"[KRİTİK] Master'a ulaşılamıyor: {e}")
+            print(f"[CRITICAL] Master unreachable: {e}")
 
         time.sleep(5)
 
@@ -794,87 +778,82 @@ if __name__ == "__main__":
 
 ---
 
-### Senaryo 9: Hata Ayıklama ve Sık Karşılaşılan Problemlerin Çözümü (Troubleshooting)
+### Scenario 9: Comprehensive Troubleshooting and Failure Recovery
 
-#### 1. Problem: `refusing to bind the control server to a non-loopback address without CURVE`
+#### 1. Issue: `refusing to bind the control server to a non-loopback address without CURVE`
 
-- **Neden:** Master'ı `0.0.0.0` veya genel bir IP üzerinde başlatırken `--curve-server-secret` belirtilmemiştir. Sistem, şifrelerin açık metin ağa yayılmasını önlemek için çalışmayı durdurur.
-- **Çözüm:** `--gen-curve-keys` ile anahtar üretip `--curve-server-secret` ekleyin veya test amaçlı `--insecure-control` flag'ini kullanın.
+- **Cause:** `samurai_master` was launched on `0.0.0.0` or a public IP without specifying `--curve-server-secret`. The platform prevents insecure plaintext network bindings by default.
+- **Remedy:** Generate a keypair with `--gen-curve-keys` and supply `--curve-server-secret <KEY>`, or pass `--insecure-control` strictly for local testing.
 
-#### 2. Problem: `samurai-agent: manifest HMAC mismatch`
+#### 2. Issue: `samurai-agent: manifest HMAC mismatch`
 
-- **Neden:** `/v1/agent/install?token=...` ile verilen join token, Master'da belirtilen `--agent-join-token` ile tam eşleşmemektedir veya ağdaki bir proxy veriyi değiştirmiştir.
-- **Çözüm:** Token değerinin her iki tarafta birebir aynı olduğunu teyit edin.
+- **Cause:** The join token provided to `/v1/agent/install?token=...` does not match the master `--agent-join-token`, or an intermediate proxy corrupted the payload.
+- **Remedy:** Verify that both master and worker use identical token strings without trailing whitespace or shell escaping bugs.
 
-#### 3. Problem: `E_RPC endpoint=tcp://192.168.1.20:XXXX` (Zaman Aşımı)
+#### 3. Issue: `E_RPC endpoint=tcp://192.168.1.20:XXXX` (Connection Timeout)
 
-- **Neden:** Slave `direct` modda çalışırken güvenlik duvarı Master'dan gelen gelen (inbound) ZMQ bağlantısını engellemektedir.
-- **Çözüm:** Slave'i `--dispatch-mode reverse` modunda başlatın. Böylece bağlantı tek yönlü (outbound) olarak Slave'den Master'a açılır.
+- **Cause:** The slave is operating in `direct` mode behind a firewall or NAT router, blocking inbound RPCs from the master.
+- **Remedy:** Launch the slave in reverse mode with `--dispatch-mode reverse`. This switches the slave to initiate all connections outbound to the master.
 
-#### 4. Problem: `HTTP 401 Unauthorized` / `token_expired`
+#### 4. Issue: `HTTP 401 Unauthorized` / `token_expired`
 
-- **Neden:** Gönderilen JWT token'ın `exp` süresi dolmuş veya JWT secret uyuşmamaktadır.
-- **Çözüm:** Yeni bir JWT token üretin veya `--jwt-secret` değerini doğrulayın.
+- **Cause:** The JWT authentication token has expired or was signed with a mismatched secret.
+- **Remedy:** Generate a new JWT token with an updated `exp` timestamp and verify `--jwt-secret`.
 
 ---
 
-## 9. CLI Parametreleri ve Çevresel Yapılandırma
+## 9. CLI Command-Line Options and Configuration Reference
 
-### `samurai_master` Referans Tablosu
+### `samurai_master` Reference
 
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--count N` | Integer | **Required** | Total packet count to generate. |
+| `--target IP` | String | `127.0.0.1` | Target IPv4 destination address. |
+| `--port N` | Integer | `80` | Target destination port. |
+| `--protocol P` | String | `udp` | Protocol layer (`udp`, `tcp`, `icmp`, `syn_flood`, etc.). |
+| `--size N` | Integer | `64` | Packet payload size in bytes. |
+| `--control-listen EP` | String | `tcp://0.0.0.0:5099` | ZMQ RPC control server listen endpoint. |
+| `--cluster-secret S` | String | `""` | Shared cluster authentication secret (`x-cluster-secret`). |
+| `--tenant-namespace T` | String | `""` | Multi-tenancy namespace identifier. |
+| `--curve-server-secret K`| String | `""` | 40-character Z85 CurveZMQ secret key for server mode. |
+| `--gen-curve-keys` | Flag | `false` | Generates a new CurveZMQ keypair and exits. |
+| `--insecure-control` | Flag | `false` | Permits plaintext non-loopback bindings without CURVE. |
+| `--management-listen EP` | String | `""` | HTTP REST API listen endpoint (e.g. `0.0.0.0:8443`). |
+| `--mgmt-tls` | Flag | `false` | Enables HTTPS TLS 1.2/1.3 on the management API. |
+| `--mgmt-tls-cert PATH` | String | `""` | Path to TLS certificate chain (PEM format). |
+| `--mgmt-tls-key PATH` | String | `""` | Path to TLS private key (PEM format). |
+| `--agent-join-token T` | String | `""` | Zero-install agent enrollment token (HMAC key). |
+| `--agent-artifact-dir DIR`| String | `.` | Directory containing worker binaries to distribute. |
+| `--agent-advertise EP` | String | `control-listen` | Public endpoint advertised to enrolled agents. |
+| `--agent-worker NAME` | String | `cpu` | Default worker binary distributed (`cpu`, `gpu`, etc.). |
+| `--agent-dispatch-mode M`| String | `reverse` | Dispatch mode for enrolled agents (`reverse`, `auto`). |
+| `--provision-hosts CSV` | String | `""` | Comma-separated SSH target hosts (`host[:port],...`). |
+| `--provision-ssh-user U` | String | `"root"` | SSH username for remote agent push provisioning. |
+| `--provision-ssh-key PATH`| String | `""` | Path to SSH private key file (e.g. `id_ed25519`). |
+| `--provision-worker NAME`| String | `"cpu"` | Worker kind to deploy via SSH provisioning. |
+| `--provision-timeout-s N`| Integer | `10` | Timeout in seconds waiting for worker heartbeats. |
+| `--expect-workers N` | Integer | `1` | Number of workers required before launching jobs. |
+| `--wait-workers-s N` | Integer | `30` | Maximum seconds to wait for worker registrations. |
+| `--ha-mode MODE` | String | `off` | HA leadership strategy (`off`, `static`, `file-lock`, `redis`). |
+| `--ha-node-id ID` | String | `""` | Unique identity string for this master instance. |
+| `--ha-lease-path PATH` | String | `/tmp/...` | Lease lock path for `file-lock` mode. |
 
-| Parametre                  | Tip     | Varsayılan           | Açıklama                                                   |
-| -------------------------- | ------- | -------------------- | ---------------------------------------------------------- |
-| `--count N`                | Tamsayı | **Zorunlu**          | Gönderilecek toplam paket adedi.                           |
-| `--target IP`              | Metin   | `127.0.0.1`          | Hedef IPv4 adresi.                                         |
-| `--port N`                 | Tamsayı | `80`                 | Hedef port numarası.                                       |
-| `--protocol P`             | Metin   | `udp`                | L4 protokolü (`udp`, `tcp`, `icmp`, `syn_flood` vb.).      |
-| `--size N`                 | Tamsayı | `64`                 | Paket boyutu (byte).                                       |
-| `--control-listen EP`      | Metin   | `tcp://0.0.0.0:5099` | Master ZMQ RPC dinleme adresi.                             |
-| `--cluster-secret S`       | Metin   | `""`                 | Ortak küme parolası (`x-cluster-secret`).                  |
-| `--tenant-namespace T`     | Metin   | `""`                 | Çoklu kiracılık izolasyon adı.                             |
-| `--curve-server-secret K`  | Metin   | `""`                 | 40 karakter Z85 formatında CURVE sunucu gizli anahtarı.    |
-| `--gen-curve-keys`         | Bayrak  | `false`              | Yeni CURVE anahtar çifti üretir ve çıkar.                  |
-| `--insecure-control`       | Bayrak  | `false`              | Dış IP'de CURVE olmadan açık metin çalışmaya izin verir.   |
-| `--management-listen EP`   | Metin   | `""`                 | HTTP Management API dinleme adresi (örn. `0.0.0.0:8443`).  |
-| `--mgmt-tls`               | Bayrak  | `false`              | Management API'de HTTPS/TLS'i aktif eder.                  |
-| `--mgmt-tls-cert PATH`     | Metin   | `""`                 | PEM formatlı TLS sertifika zinciri dosyası yolu.           |
-| `--mgmt-tls-key PATH`      | Metin   | `""`                 | PEM formatlı TLS özel anahtar dosyası yolu.                |
-| `--agent-join-token T`     | Metin   | `""`                 | Zero-install agent katılım token'ı (HMAC anahtarı).        |
-| `--agent-artifact-dir DIR` | Metin   | `.`                  | Dağıtılacak binary dosyalarının bulunduğu dizin.           |
-| `--agent-advertise EP`     | Metin   | `control-listen`     | Agent'ların bağlanacağı genel Master kontrol adresi.       |
-| `--agent-worker NAME`      | Metin   | `cpu`                | Agent'ların çalıştıracağı worker türü (`cpu`, `gpu` vb.).  |
-| `--agent-dispatch-mode M`  | Metin   | `reverse`            | Agent'ların çalışacağı dağıtım modu (`reverse`, `auto`).   |
-| `--provision-hosts CSV`    | Metin   | `""`                 | SSH ile tetiklenecek hedef sunucular (`host[:port],...`).   |
-| `--provision-ssh-user U`   | Metin   | `"root"`             | Hedef sunuculardaki SSH kullanıcı adı.                     |
-| `--provision-ssh-key PATH` | Metin   | `""`                 | Hedef sunucular için özel anahtar yolu (örn. `id_ed25519`). |
-| `--provision-worker NAME`  | Metin   | `"cpu"`              | Provizyon edilecek worker türü (`cpu`, `bundle` vb.).      |
-| `--provision-timeout-s N`  | Tamsayı | `10`                 | SSH tetiklemesi sonrası heartbeat bekleme zaman aşımı (sn).|
-| `--expect-workers N`       | Tamsayı | `1`                  | İşi başlatmadan önce bağlanması beklenen worker adedi.     |
-| `--wait-workers-s N`       | Tamsayı | `30`                 | Worker'ların kaydolması için tanınan zaman aşımı (saniye). |
-| `--ha-mode MODE`           | Metin   | `off`                | HA liderlik modu (`off`, `static`, `file-lock`).           |
-| `--ha-node-id ID`          | Metin   | `""`                 | Bu master düğümünün benzersiz kimliği.                     |
-| `--ha-lease-path PATH`     | Metin   | `/tmp/...`           | `file-lock` modu için paylaşımlı kira dosya yolu.          |
+### `samurai_slave` Reference
 
-
-### `samurai_slave` Referans Tablosu
-
-
-| Parametre                 | Tip     | Varsayılan        | Açıklama                                                          |
-| ------------------------- | ------- | ----------------- | ----------------------------------------------------------------- |
-| `--control-endpoints EPS` | Metin   | **Zorunlu**       | Master kontrol adresi (`host:port` veya virgülle çoklu).          |
-| `--control-listen EP`     | Metin   | `tcp://0.0.0.0:0` | Direct modda açılacak yerel RPC sunucu adresi.                    |
-| `--dispatch-mode MODE`    | Metin   | `direct`          | Dağıtım modu (`direct`, `reverse`, `auto`).                       |
-| `--cluster-secret S`      | Metin   | `""`              | Master ile eşleşmesi gereken küme parolası.                       |
-| `--tenant-namespace T`    | Metin   | `""`              | Kiracı adı.                                                       |
-| `--curve-server-public K` | Metin   | `""`              | Master'ın Z85 CURVE genel anahtarı.                               |
-| `--gen-control-curve`     | Bayrak  | `false`           | Inbound port için CURVE anahtarı üretip Master'a bildirir.        |
-| `--worker NAME`           | Metin   | `cpu`             | Çalıştırılacak worker binary türü (`cpu`, `gpu`, `afpacket` vb.). |
-| `--worker-dir DIR`        | Metin   | `.`               | Worker ikili dosyalarının (`samurai_*_worker`) bulunduğu dizin.   |
-| `--worker-id ID`          | Metin   | Hostname          | Worker için benzersiz düğüm kimliği.                              |
-| `--worker-region R`       | Metin   | `""`              | Coğrafi bölge etiketi (örn. `eu-central-1`).                      |
-| `--heartbeat-interval-ms` | Tamsayı | `2000`            | Canlılık sinyali sıklığı (milisaniye).                            |
-| `--register-timeout-s N`  | Tamsayı | `10`              | Kayıt için maksimum bekleme süresi (saniye).                      |
-| `--master-timeout-s N`    | Tamsayı | `30`              | Master erişilemez olduğunda çıkış için zaman aşımı (saniye).      |
-
-
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--control-endpoints EPS`| String | **Required** | Comma-separated master endpoints (`host:port`). |
+| `--control-listen EP` | String | `tcp://0.0.0.0:0` | Local RPC listen endpoint when running in direct mode. |
+| `--dispatch-mode MODE` | String | `direct` | Execution mode (`direct`, `reverse`, `auto`). |
+| `--cluster-secret S` | String | `""` | Shared cluster secret matching the master. |
+| `--tenant-namespace T` | String | `""` | Tenant namespace identifier. |
+| `--curve-server-public K`| String | `""` | Master's 40-character Z85 CurveZMQ public key. |
+| `--gen-control-curve` | Flag | `false` | Generates a CURVE keypair for inbound direct mode. |
+| `--worker NAME` | String | `cpu` | Native worker engine (`cpu`, `gpu`, `dpdk`, `afpacket`). |
+| `--worker-dir DIR` | String | `.` | Directory containing worker binaries (`samurai_*_worker`). |
+| `--worker-id ID` | String | Hostname | Unique node identifier for this slave. |
+| `--worker-region R` | String | `""` | Geographic region label (e.g. `eu-central-1`). |
+| `--heartbeat-interval-ms`| Integer | `2000` | Keepalive heartbeat interval in milliseconds. |
+| `--register-timeout-s N` | Integer | `10` | Maximum seconds allowed for master registration. |
+| `--master-timeout-s N` | Integer | `30` | Timeout threshold before exiting if master disconnects. |

@@ -1,500 +1,387 @@
-# 23 - Benchmark ve Acceptance Handbook
+# 23 - Benchmark and Acceptance Handbook
 
-## Amac
+![Samurai CLI Execution & Benchmark Lifecycle](assets/diagrams/samurai_cli_lifecycle.svg)
 
-Bu dokuman, `ddos_samurai.cli` ve benchmark pipeline'i ile alinan kosularin
-sadece "calisti mi?" seviyesinde degil, "gecerli mi, karsilastirilabilir mi,
-yayinlanabilir mi?" seviyesinde yorumlanmasi icin yazilmistir.
+## Purpose
 
-Bu belge su sorulara standart cevap vermeyi hedefler:
+This handbook defines the formal evaluation framework for runs executed via the Samurai Network Resilience Platform (`./build/ddos_samurai/cli/samurai`) and its benchmark pipeline. It elevates performance evaluation beyond simple execution ("Did it run?") to rigorous technical certification ("Is the result valid, statistically comparable, and publishable?").
 
-- Bu run teknik olarak kabul edilebilir mi?
-- Bu sonuc benchmark olarak yayinlanabilir mi?
-- Bu kosu sadece gozlemsel mi, yoksa karar verdirici mi?
-- Sonraki adim debug mu olmali, tuning mi olmali, yoksa parity onayi mi?
+This document answers core operational questions:
 
-Bu belge yalnizca yetkili ve izole test/lab ortamlari icin yazilmistir.
+- Is this run technically valid and acceptable?
+- Can these performance figures be certified and published?
+- Is this execution merely observational, or does it provide decisive acceptance evidence?
+- Should the next operational phase focus on debugging, tuning, or parity certification?
 
-## Kimler Icin
+This handbook is strictly designed for authorized, isolated laboratory and staging network environments.
 
-- benchmark operatorleri
-- performans muhendisleri
-- SRE ve platform ekipleri
-- parity/KPI gate sonucu yorumlayan teknik liderler
-- CPU, TX_RING, AF_XDP ve GPU yollarini karsilastiran gelistiriciler
+## Target Audience
 
-## Bu Belge Ne Degildir
+- Benchmark Operators
+- Performance Engineers
+- Platform and Site Reliability Engineering (SRE) Teams
+- Technical Leads evaluating parity and KPI validation gates
+- Systems Developers comparing CPU, TX_RING, AF_XDP, DPDK, and GPU pipelines
 
-Bu dokuman:
+## Scope and Boundaries
 
-- tum CLI bayraklarinin referansi degildir
-- "hangi komutu yazayim?" sorusunun birincil cevabi degildir
-- troubleshooting dokumaninin yerine gecmez
+This handbook:
 
-Bu nedenle birlikte okunmasi gereken temel belgeler:
+- Is not an exhaustive CLI flag reference.
+- Does not serve as a primary command-line cheat sheet.
+- Does not replace standard debugging runbooks.
+
+Recommended companion documentation:
 
 - `docs/22-cli-operational-playbook.md`
 - `docs/19-benchmark-profiles.md`
 - `docs/10-troubleshooting.md`
 - `docs/20-env-cli-reference.md`
 
-## Temel Karar Modeli
+## Core Decision Model
 
-Her run sonunda su sirayla karar verilmelidir:
+Every benchmark run must be evaluated across the following sequential criteria:
 
-1. Run teknik olarak tamamladi mi?
-2. Run kalitesi `valid` mi?
-3. KPI gate sonucu `pass` mi?
-4. Sender/backend davranisi beklenen yol ile uyumlu mu?
-5. Ortam profili (`dev`, `ci_safe`, `dedicated_lab`) sonucun iddiasi ile uyumlu mu?
-6. Artifact seti tekrar incelenebilir ve tekrar uretilebilir mi?
-7. Sonuc benchmark, baseline, soak gozlemi veya debug artifact'i olarak siniflanmali mi?
+1. Did the run terminate cleanly and achieve technical completion?
+2. Is the recorded run quality status marked as `valid`?
+3. Did the execution satisfy all KPI validation gate thresholds (`pass`)?
+4. Did the sender and dataplane backend remain strictly on the designated path?
+5. Does the test environment classification (`dev`, `ci_safe`, `dedicated_lab`) match the claimed performance tier?
+6. Is the archived artifact package complete, reviewable, and reproducible?
+7. Should the result be classified as an authoritative benchmark, a reference baseline, an observational soak, or a debug artifact?
 
-Kisa kural:
+Core Operational Rules:
 
-- `run_quality != valid` ise benchmark iddiasi kurma
-- KPI gate fail ise parity sonucu yayinlama
-- fallback veya mixed path varsa "deterministik backend sonucu" diye sunma
-- artifact yoksa veya eksikse uzun kosuyu kalici kabul etme
+- If `run_quality != valid`, never claim benchmark validity.
+- If the KPI validation gate fails, never publish parity or acceptance claims.
+- If fallback or mixed transmission paths occurred, never present the run as a deterministic backend benchmark.
+- Without an archived, complete artifact bundle, never treat long-running executions as official results.
 
-## Run Siniflari ve Guven Seviyeleri
+## Run Classifications and Confidence Levels
 
-| Run tipi | Amac | Karar gucu |
+| Run Type | Operational Purpose | Evaluative Authority |
 |---|---|---|
-| Dry-run | Parse, config ve preflight dogrulama | Operasyonel hazirlik |
-| Smoke run | Hizli canlilik/temel davranis kontrolu | Dusuk |
-| Baseline | Referans davranis cizgisi olusturma | Orta |
-| Benchmark | KPI/parity odakli olcum | Yuksek |
-| Soak | Uzun sureli stabilite ve drift gozlemi | Yuksek |
-| Fault-injection soak | Dayaniklilik ve bozucu kosul toleransi | Yuksek |
-| Debug run | Koku neden arastirmasi | Analitik, benchmark degil |
+| Dry-run | Configuration, argument parsing, and preflight validation | Operational readiness |
+| Smoke run | Quick health check and end-to-end functionality verification | Low |
+| Baseline | Reference performance characterization | Medium |
+| Benchmark | Rigorous, KPI-governed performance measurement | High |
+| Soak | Longevity stability, memory leak, and throughput drift tracking | High |
+| Fault-injection soak | Resilience and degradation tolerance under simulated failure | High |
+| Debug run | Deep root-cause isolation and diagnostic tracing | Diagnostic only (not a benchmark) |
 
-Onemli ayrim:
+Fundamental distinction:
 
-- Her benchmark bir run'dir
-- Ama her run benchmark degildir
+- Every benchmark is a run.
+- Not every run qualifies as a benchmark.
 
-## Gecerli Run Icin Asgari Kriterler
+## Minimum Criteria for a Valid Run
 
-Bir run'in "gecerli" kabul edilmesi icin asgari olarak su sartlar aranmalidir:
+An execution is classified as technically valid only when all following criteria are satisfied:
 
 - `workers_total > 0`
 - `attempted_total > 0`
-- run kullanici veya sistem tarafindan erken kesilmemis olmali
-- run raporunda metrik zemini olusmus olmali
-- hedeflenen backend ve run tipi ile ilgili temel telemetry alanlari dolu olmali
+- Execution completed without premature manual cancellation or unhandled system interruption.
+- Run report telemetry generated statistically grounded metric data.
+- Core telemetry fields corresponding to the target backend and run profile are fully populated.
 
-Pratikte ilk bakilacak alanlar:
+Primary telemetry fields inspected in the run report:
 
 - `results.run_quality`
 - `results.warnings`
-- `results.sender_path` veya `results.sender_paths_used`
+- `results.sender_path` or `results.sender_paths_used`
 - `results.sender_fallback_reason`
 - `parity.normalized_results.kpi_gate_status`
 - `parity.normalized_results.score_eligible`
 
-## Gecersiz veya Supheli Run Isaretleri
+## Invalid or Suspicious Run Indicators
 
-Asagidaki durumlardan biri varsa run benchmark olarak sunulmamalidir:
+A run must be rejected from official benchmark certification if any of the following conditions exist:
 
 - `run_quality == interrupted`
 - `run_quality == invalid_metrics`
 - `attempted_total == 0`
 - `workers_total == 0`
-- `sender_fallback_reason != none` ve hedef profil deterministik backend bekliyorsa
-- `sender_paths_used` birden fazla aktif path iceriyorsa
-- dedicated lab iddiasi var ama run root/privileged gerektiren yolda degrade olmus ise
-- artifact seti eksik ise
+- `sender_fallback_reason != none` when targeting a deterministic backend.
+- `sender_paths_used` contains multiple disparate active transmission paths (mixed path).
+- The run claimed `dedicated_lab` status but degraded to non-privileged kernel paths.
+- The archived artifact bundle is missing or incomplete.
 
-Bu durumda run tamamen cop degildir. Ancak sinifi degisir:
+In such cases, the execution is not useless, but its classification is downgraded:
 
-- benchmark degil, debug artifact'i olabilir
-- parity sonucu degil, gozlemsel sonuc olabilir
-- yayinlik sonuc degil, tuning girdisi olabilir
+- Downgraded from an authoritative benchmark to a diagnostic debug artifact.
+- Downgraded from a parity certification to an observational baseline.
+- Downgraded from a publishable finding to preliminary tuning input.
 
-## Baseline, Benchmark ve Soak Arasindaki Fark
+## Distinctions: Baseline, Benchmark, and Soak
 
 ### Baseline
 
-Baseline, sistemin belirli bir anda beklenen davranisini kaydetmek icin alinir.
+A baseline captures expected system behavior at a specific point in time under standard conditions.
 
-Ne zaman yeterlidir:
+Applicable use cases:
 
-- yeni branch sonrasi hizli karsilastirma
-- tuning oncesi referans alma
-- buyuk regresyon var mi diye bakma
+- Rapid regression checks across Git branches.
+- Reference checkpoints prior to architectural tuning.
+- Detecting major performance regressions early.
 
-Ne zaman yeterli degildir:
+Insufficient for:
 
-- profil bazli parity iddiasi kurarken
-- yayinlik performans beyaninda
-- uzun sureli stabilite iddiasi kurarken
+- Claiming profile-based parity certification.
+- Publishing formal line-rate performance specifications.
+- Proving multi-hour longevity stability.
 
 ### Benchmark
 
-Benchmark, onceden tanimli profile ve KPI gate'e gore yorumlanan kontrollu
-olcumdur.
+A benchmark is a rigorously controlled performance measurement evaluated against predefined profiles and strict KPI validation gates.
 
-Benchmark icin ek beklentiler:
+Mandatory requirements:
 
-- profil secimi acik olmali
-- ortam sinifi net olmali
-- sender/backend davranisi deterministik olmali
-- artifact standardi eksiksiz olmali
+- Explicitly declared profile.
+- Unambiguous environment classification.
+- Strictly deterministic sender and dataplane backend execution.
+- Comprehensive, reproducible artifact package.
 
 ### Soak
 
-Soak, anlik tepe performanstan cok su sorulara cevap verir:
+Soak evaluations prioritize temporal stability and endurance over peak instantaneous burst rates:
 
-- zamanla memory growth var mi?
-- PPS/RPS drift olusuyor mu?
-- fallback veya degradasyon gec ortaya cikiyor mu?
-- fault-injection altinda run halen kabul edilebilir mi?
+- Does resident memory (RSS) or GPU VRAM expand over time (memory leaks)?
+- Does packet transmission rate (PPS/RPS) drift or degrade over hours?
+- Do hidden sender fallbacks or buffer degradations emerge late in the test?
+- Does the engine maintain acceptable quality under periodic fault injection?
 
-Soak sonucu, kisa benchmark'tan daha guclu stabilite kaniti verir; fakat kisa
-benchmark skorunun yerine tek basina gecmez.
+A successful soak run provides strong evidence of architectural stability, but does not substitute for high-intensity peak throughput benchmarks.
 
-## KPI Gate Okuma Rehberi
+## KPI Gate Interpretation Guide
 
-Profil bazli kabul mantiginin omurgasi `kpi_gate_status` ve `score_eligible`
-alanlaridir.
+Profile-based acceptance is governed by the `kpi_gate_status` and `score_eligible` report fields:
 
-Temel yorum:
+- `kpi_gate_status == pass`: The run satisfied all minimum performance and error rate thresholds defined by the profile.
+- `kpi_gate_status == fail`: The run failed profile criteria and cannot be accepted for parity certification.
+- `score_eligible == 1`: The run meets all architectural prerequisites for formal scoring.
+- `score_eligible == 0`: Even if metrics are generated, the run cannot be accepted as publishable parity data.
 
-- `kpi_gate_status == pass`: run profilin minimum esiklerini gecmistir
-- `kpi_gate_status == fail`: run parity/acceptance icin uygun degildir
-- `score_eligible == 1`: run skorlamaya alinabilir
-- `score_eligible == 0`: skor ciksa bile yayinlik parity sonucu sayilmaz
+Example Certification Outcomes:
 
-Ornek kararlar:
+- `run_quality=valid`, `kpi_gate_status=pass`, `score_eligible=1`:
+  Authoritative benchmark candidate suitable for official publication.
+- `run_quality=valid`, `kpi_gate_status=fail`:
+  Technically valid execution that failed acceptance thresholds; tuning required.
+- `run_quality=invalid_metrics`, `kpi_gate_status=fail`:
+  Invalid run; telemetry or environment failure must be resolved before re-testing.
 
-- `run_quality=valid`, `kpi_gate_status=pass`, `score_eligible=1`
-  Sonuc: yayinlik benchmark adayi
-- `run_quality=valid`, `kpi_gate_status=fail`
-  Sonuc: teknik olarak calismis ama acceptance gecememis
-- `run_quality=invalid_metrics`, `kpi_gate_status=fail`
-  Sonuc: once telemetry/metric zemini duzeltilmeli
+## Extracting Tuning Decisions from Run Reports
 
-## Run Report'tan Tuning Karari Cikarma
+Tuning should not rely on superficial, isolated numbers. Follow this structured methodology:
 
-Run report okunurken hedef "tek bir sayiya bakip tuning yapmak" olmamalidir.
-Su mantik izlenmelidir:
+1. Determine whether the run is technically valid.
+2. Identify the root problem classification.
+3. Adjust only the specific parameter group governing that domain.
+4. Modify a minimal set of variables per iteration.
 
-1. once run gecerli mi karar ver
-2. sonra ana problem sinifini bul
-3. sonra yalniz ilgili knob grubuna dokun
-4. her turda az sayida ayari degistir
+Operational guidelines:
 
-Pratik kural:
+- If packet loss is elevated, inspect queue geometry, transmission rings, and buffer allocations first.
+- If rate accuracy degrades, inspect pacing configurations, CPU pinning, and worker core distribution first.
+- If fallback occurs, resolve backend dependencies and environment privileges before tuning throughput.
+- If mixed transmission paths appear, lock down explicit backend bindings prior to performance optimization.
 
-- loss problemi varsa once queue/path/buffer tarafina bak
-- rate accuracy problemi varsa once pacing ve worker dagitimina bak
-- fallback problemi varsa once backend kararliligini duzelt
-- mixed path varsa tuning'den once deterministik path'e gec
+### Telemetry Field Diagnostic Reference
 
-### Hangi Alan Ne Soyler?
-
-| Run report alani | Tipik anlami | Ilk bakilacak knob grubu |
+| Run Report Field | Diagnostic Meaning | Primary Tuning Target |
 |---|---|---|
-| `wire_loss_est_pct` | Hatta cikmadan veya cikista kayip baskisi | queue/ring/backend |
-| `rate_accuracy_pct` | pacing hedefinden sapma | worker/rps/pacing |
-| `sender_fallback_reason` | secilen hizli yolun korunamadigi | backend/policy/capability |
-| `sender_paths_used` | run boyunca path drift veya mixed path | backend sabitleme |
-| `txring_flush_error_count` | TX_RING flush seviyesinde hata | TX_RING geometri/poll/spin |
-| `txring_flush_eagain_count` | ring/gecis tarafinda gecici baski | TX_RING geometri/backpressure |
-| `txring_tp_drops` | kernel tarafinda drop baskisi | ring boyutu/queue uyumu |
-| `gpu_ring_depth_peak` | GPU producer-consumer baskisi | GPU queue/pipeline |
-| `gpu_ring_block_wait_ns` | producer'in kuyruk doldugu icin beklemesi | GPU batch/stream/depth |
-| `workers_failed` / `workers_interrupted` | run zemini bozulmus olabilir | once stabilite |
-| `dp_queue_id` / `dp_queue_strategy` / `dp_affinity_cpu` | queue-core yerlesimi | NUMA / queue map |
-| `afpacket_hugepage_effective` | TX_RING memory policy etkinligi | hugepage/mlock/prefault |
+| `wire_loss_est_pct` | Packet loss pressure on egress queues or driver interfaces | Queue count, ring target MB, backend mode |
+| `rate_accuracy_pct` | Variance from target pacing and timing intervals | Worker count, RPS rate, pacing engine |
+| `sender_fallback_reason` | Inability to maintain requested high-speed path | Driver capabilities, kernel privileges, backend policy |
+| `sender_paths_used` | Datapath drift or mixed transmitter routing during run | Explicit backend fixation (`--sender-backend`) |
+| `txring_flush_error_count` | Kernel-level transmission errors during TX_RING flush | Ring geometry, poll timeout, spin limits |
+| `txring_flush_eagain_count` | Transient buffer exhaustion and kernel backpressure | Ring capacity, frames per block, queue depth |
+| `txring_tp_drops` | Packet drops recorded by Linux kernel packet socket ring | Ring buffer allocation, NIC queue alignment |
+| `gpu_ring_depth_peak` | Peak queue pressure in GPU producer-consumer ring | GPU worker queues, pipeline overlap depth |
+| `gpu_ring_block_wait_ns` | GPU producer stalled waiting for host buffer space | GPU batch size, stream count, pipeline depth |
+| `workers_failed` / `workers_interrupted` | Worker crash or signal abort | Core stability, memory allocation, permissions |
+| `dp_queue_id` / `strategy` / `affinity` | Alignment across NUMA nodes, queues, and CPU cores | NUMA mapping, explicit queue map (`--dp-queue-map`) |
+| `afpacket_hugepage_effective` | Efficiency of TX_RING hugepage memory allocations | Hugepages configuration, mlock, prefaulting |
 
-### Tuning Matrisi
+### Systematic Tuning Matrix
 
-| Belirti | Olası neden | Arttirilacak ayar | Azaltilacak ayar | Kapatilabilecek ayar |
+| Symptom | Probable Root Cause | Parameter to Increase | Parameter to Decrease | Feature to Disable |
 |---|---|---|---|---|
-| `wire_loss_est_pct` yuksek, `rate_accuracy_pct` makul | gonderim yolu baskida | `--afpacket-ring-target-mb`, `--dp-queues` | `--workers` | gereksiz `--gpu-full-variation` |
-| `rate_accuracy_pct` dusuk, loss orta/dusuk | pacing dagilimi bozuk | `--afpacket-spin-limit`, gerekiyorsa `--dp-queues` | `--workers`, `--gpu-batch-size` | agresif `--afpacket-busy-poll-us` |
-| `txring_flush_eagain_count` yuksek | ring hizli doluyor/bosalmasi yetismiyor | `--afpacket-ring-target-mb`, `--afpacket-frames-per-block` | `--workers`, `--rps` | - |
-| `txring_flush_error_count` yuksek | TX_RING geometri veya kernel baskisi | gerekiyorsa `--afpacket-poll-timeout-ms` az miktar | `--afpacket-spin-limit` veya `--rps` | deneysel `--afpacket-busy-poll-us` |
-| `gpu_ring_block_wait_ns` yuksek | GPU producer cok onde | `--gpu-stream-count`, `--gpu-pipeline-depth` | `--gpu-batch-size` | `--gpu-full-variation` |
-| GPU throughput artmiyor, latency artiyor | batch fazla buyuk | `--gpu-stream-count` | `--gpu-batch-size` | `--gpu-full-variation` |
-| fallback goruluyor | secilen hizli yol korunamiyor | capability uyumlu queue/path | fazla worker veya agresif queue sayisi | `--sender-backend auto` yerine explicit backend |
-| `sender_paths_used` mixed | deterministik olmayan route | `--dp-queue-strategy map` veya `pin` | topolojiye gore `--workers` | fallback'e izin veren gevsek policy |
+| High `wire_loss_est_pct`, acceptable `rate_accuracy_pct` | Egress transmission ring saturated | `--afpacket-ring-target-mb`, `--dp-queues` | `--workers` | Unnecessary `--gpu-full-variation` |
+| Low `rate_accuracy_pct`, low/moderate loss | Pacing thread jitter or core contention | `--afpacket-spin-limit`, `--dp-queues` | `--workers`, `--gpu-batch-size` | Aggressive `--afpacket-busy-poll-us` |
+| High `txring_flush_eagain_count` | Transmission ring emptying slower than ingress fill | `--afpacket-ring-target-mb`, `--afpacket-frames-per-block` | `--workers`, `--rps` | - |
+| High `txring_flush_error_count` | Ring geometry mismatch or driver backpressure | Moderate `--afpacket-poll-timeout-ms` | `--afpacket-spin-limit`, `--rps` | Experimental `--afpacket-busy-poll-us` |
+| Elevated `gpu_ring_block_wait_ns` | GPU kernel generates faster than host DMA drains | `--gpu-stream-count`, `--gpu-pipeline-depth` | `--gpu-batch-size` | `--gpu-full-variation` |
+| GPU active, but throughput stalls while latency increases | GPU kernel batch size excessively large | `--gpu-stream-count` | `--gpu-batch-size` | `--gpu-full-variation` |
+| Sender fallback observed | Host lacks required privileges or device mapping | Compatible queue and interface configuration | Excess workers or unpinned queues | Replace `--sender-backend auto` with explicit backend |
+| Mixed transmission paths recorded | Non-deterministic worker dispatch routing | `--dp-queue-strategy map` or `pin` | `--workers` (match topology) | Permissive fallback policies |
 
-Bu tablo "tek dogru cevap" degil, ilk mudahele yonudur.
+## Profile-Based Acceptance Logic
 
-## Profil Bazli Kabul Mantigi
+### `dev` Profile
 
-### `dev`
+- Designed for rapid local development and sanity testing.
+- Suitable for local regression detection and quick feedback loops.
+- Insufficient for formal product or enterprise marketing claims.
 
-Bu profil:
+Permissible claim:
+"The proposed change introduced no immediate regression against local dev baselines."
 
-- hizli gelistirme dongusu icindir
-- lokal tuning ve regresyon aramasi icin yeterlidir
-- kesin urun seviyesi iddia icin yeterli degildir
+Impermissible claim:
+"Lab-grade parity and maximum throughput certified."
 
-`dev` sonucu ile sunulabilecek iddia:
+### `ci_safe` Profile
 
-- "degisiklik buyuk regresyon yaratmadi"
-- "lokal baseline onceki kosuya yakin"
+- Tailored for deterministic, automated continuous integration pipelines.
+- Provides standard quality and regression gates prior to code merges.
 
-Sunulmamalidir:
+Permissible claim:
+"Passed automated CI benchmark acceptance gates under controlled virtual test harness."
 
-- "lab-grade parity saglandi"
-- "dedicated benchmark sonucu alindi"
+### `dedicated_lab` Profile
 
-### `ci_safe`
+- Required for authoritative, line-rate performance and parity claims.
+- Demands bare-metal hardware, elevated capabilities/root, and deterministic backends.
+- Zero tolerance for fallback or path degradation.
 
-Bu profil:
-
-- daha kontrollu ve tekrarli pipeline yorumlari icindir
-- merge oncesi guven eşiği olusturur
-
-`ci_safe` sonucu ile sunulabilecek iddia:
-
-- "CI benchmark gate gecildi"
-- "kontrollu ortamda kabul esigi saglandi"
-
-### `dedicated_lab`
-
-Bu profil:
-
-- en ciddi performans ve parity iddialari icindir
-- root/privileged ve deterministik backend bekler
-- fallback ve mixed path toleransi dusuktur
-
-Bu profil icin ek sert kural:
-
+Mandatory gate rules:
 - `sender_fallback_reason == none`
-- `sender_paths_used` tek aktif yol gostermeli
+- `sender_paths_used` must report exactly one uniform, active transmission backend.
 
-## Sender Path ve Fallback Yorumlama
+## Sender Path and Fallback Interpretation
 
-Benchmark sonucu yorumlarken yalnizca throughput sayisina bakmak yanlistir.
-Ilk soru "hangi yol calisti?" olmalidir.
+Never evaluate throughput figures without first validating transmission path integrity.
 
-Bakilacak alanlar:
+Inspect these fields:
 
 - `sender_path`
 - `sender_paths_used`
 - `sender_fallback_reason`
-- secilen `--sender-backend`
+- Target `--sender-backend`
 
-Yorum rehberi:
+Evaluation rules:
 
-- Beklenen path ile gercek path ayni ise sonuc karsilastirilabilirlik kazanir
-- Fallback varsa sonuc hala degerli olabilir, ama artik o hedef backend'in temiz sonucu degildir
-- `MIXED` veya coklu path durumu benchmark yayininda risklidir; hangi path'in ne kadar katkida bulundugu bulaniklasir
+- If the actual path matches the requested target path, the benchmark is statistically valid.
+- If fallback occurred, the run may have diagnostic value, but cannot represent the performance of the target backend.
+- A `MIXED` path state invalidates official benchmark claims, as contribution across paths is indeterminate.
 
-Kisa kural:
+Operational rules:
 
-- "TX_RING benchmark sonucu" diyorsaniz run gercekten TX_RING'de sabit kalmis olmali
-- "AF_XDP sonucu" diyorsaniz XDP fallback'siz calismis olmali
-- "GPU baseline" diyorsaniz GPU pipeline'in aktif oldugu telemetry ile desteklenmeli
+- To claim a "TX_RING benchmark", the entire run must have executed exclusively via TX_RING.
+- To claim an "AF_XDP benchmark", execution must have completed via XDP with zero driver fallback.
+- To claim a "GPU baseline", GPU kernel generation must be verified via hardware telemetry.
 
-### Fallback Gorüldüğünde Ne Yapilmali?
+### Corrective Action Upon Detecting Fallback
 
-`sender_fallback_reason` goruldugunde ilk refleks throughput tuning yapmak
-degil, once route kararliligini duzeltmek olmalidir.
+When `sender_fallback_reason` is present, do not tune throughput parameters; fix path stability first:
 
-Operasyon sirası:
+1. Declare `--sender-backend` explicitly (e.g., `xdp` or `txring`).
+2. Enforce strict failure: `--sender-fallback-policy fail`.
+3. Verify `sender_paths_used` reports a single, uniform backend.
+4. Reduce worker and queue counts to align with physical interface capabilities.
+5. Re-run and verify zero fallbacks before resuming throughput optimization.
 
-1. `--sender-backend` explicit ver
-2. benchmark kosusunda `--sender-fallback-policy fail` kullan
-3. `sender_paths_used` tek aktif yol veriyor mu kontrol et
-4. gerekiyorsa worker ve queue sayisini dusurup tekrar dene
-5. backend temizlestikten sonra throughput tuning'e gec
+## Tuning Strategy Based on Loss and Rate Accuracy
 
-Kisa kural:
+Always evaluate `wire_loss_est_pct` and `rate_accuracy_pct` together:
 
-- fallback varken "performans problemi" var demek erken olabilir
-- once "route problemi" cozulmelidir
+- High Loss + High Accuracy: Transmission pipeline is keeping target pace, but physical queues or buffers are overflowing.
+- High Loss + Low Accuracy: Both scheduling and transmission layers are overwhelmed.
+- Low Loss + Low Accuracy: No packets are being dropped, but timing pacing is unstable.
 
-## Loss Sonucuna Gore Hangi Ayar Degiştirilir?
+### Scenario 1: High Loss, High Accuracy
 
-Loss sonucu yorumlarken iki sayiya birlikte bak:
+Diagnosis: The engine sustains the target pacing rhythm, but the transmission rings or interface queues cannot drain the volume.
 
-- `wire_loss_est_pct`
-- `rate_accuracy_pct`
+Corrective actions:
+- Increase `--afpacket-ring-target-mb`.
+- Gradually increment `--afpacket-frames-per-block`.
+- Increase `--dp-queues` up to hardware NIC queue capacity.
+- Reduce `--workers` if CPU core oversubscription is occurring.
+- Disable heavy variation calculations like `--gpu-full-variation`.
 
-Bu iki alan birlikte su resmi verir:
+### Scenario 2: High Loss, Low Accuracy
 
-- loss yuksek + accuracy iyi ise sistem hedef hizda gitmeye calisiyor ama yol tasiyor
-- loss yuksek + accuracy dusuk ise hem pacing hem transport baskida
-- loss dusuk + accuracy dusuk ise daha cok pacing/topoloji sorunu vardir
+Diagnosis: Severe resource contention affecting both timing scheduling and packet transmission.
 
-### Senaryo 1: Loss yuksek, accuracy iyi
+Corrective actions:
+- Reduce `--workers`.
+- Temporarily lower `--rps` or overall count to locate system capacity threshold.
+- Reduce `--gpu-batch-size` if using CUDA backend.
+- Transition from round-robin (`--dp-queue-strategy rr`) to deterministic queue mapping (`map` or `pin`).
 
-Tipik anlam:
+### Scenario 3: Low Loss, Low Accuracy
 
-- hedeflenen hiz korunuyor
-- ama TX path veya queue duzeyi paketi tasiyamiyor
+Diagnosis: Packets are successfully delivered without drops, but inter-packet gap timing and pacing variance fail to meet benchmark standards.
 
-Oncelikli ayarlar:
+Corrective actions:
+- Increment `--afpacket-spin-limit`.
+- Tune `--afpacket-poll-timeout-ms` for workload characteristics.
+- Align worker processes and dataplane queues symmetrically.
+- Enforce pacing thread affinity via `--pin-cpu`.
 
-- `--afpacket-ring-target-mb` artirilabilir
-- `--afpacket-frames-per-block` kademeli artirilabilir
-- `--dp-queues` NIC queue kapasitesine uygun sekilde artirilabilir
-- `--workers` fazla ise azaltilabilir
+### Scenario 4: Kernel TX_RING Drops and Flush Contention
 
-Ilk kapatilacak/geri cekilecekler:
+Examine: `txring_tp_drops`, `txring_flush_error_count`, `txring_flush_eagain_count`, and `txring_hold_block_pressure_pct`.
 
-- gereksiz `--gpu-full-variation`
-- topolojiye gore fazla agresif worker sayisi
+Corrective actions:
+- Increase `--afpacket-ring-target-mb`.
+- Increase `--afpacket-frames-per-block`.
+- Apply moderate `--afpacket-spin-limit` thresholds.
+- Avoid modifying ring parameters by large increments simultaneously; excessively large rings increase memory latency.
 
-### Senaryo 2: Loss yuksek, accuracy de dusuk
+## Interpreting GPU Performance Telemetry
 
-Tipik anlam:
+GPU-accelerated pipelines must not be evaluated solely on peak packets-per-second:
 
-- sistem hem hedef ritmi tutturamiyor
-- hem de tasima zinciri baski altinda
+- Did the GPU readiness dry-run pass cleanly?
+- Did the initial smoke run maintain stability?
+- Did throughput gains coincide with increased error rates or silent fallbacks?
+- Are tuning parameters (pipeline depth, stream count, batch size) documented in the report?
+- Was CPU vs GPU comparison conducted under identical constraints?
 
-Oncelikli ayarlar:
+Negative indicators in GPU evaluations:
+- Passing readiness in dry-run, but falling back to CPU during live execution.
+- Rapid performance collapse under simulated fault injection.
+- High throughput accompanied by `invalid_metrics` or failed KPI gates.
 
-- `--workers` azalt
-- `--rps` veya toplam yuk seviyesini gecici olarak dusur
-- `--gpu-batch-size` buyukse azalt
-- `--dp-queue-strategy rr` kullaniyorsan `map` veya `pin` dene
+Positive indicators in GPU evaluations:
+- Cohesive progression from smoke run to baseline to tuned benchmark.
+- Minimal drift in memory and PPS across extended soak runs.
+- Complete artifact archive enabling exact replication.
 
-Ek not:
+### GPU Tuning Guidelines
 
-- Bu senaryoda ayni anda hem queue hem pacing sorunu olabilir
-- buyuk batch ve fazla worker birlikte kullaniliyorsa once bu ikisini sadeleştir
+Elevated `gpu_ring_depth_peak` and `gpu_ring_block_wait_ns`:
+- Producer is outrunning host DMA transfer capabilities.
+- Action: Decrease `--gpu-batch-size`, increase `--gpu-stream-count`, increase `--gpu-pipeline-depth` (e.g., 2 -> 3).
 
-### Senaryo 3: Loss dusuk, accuracy dusuk
+GPU Enabled but Throughput Stalls:
+- Bottleneck is typically located on the network sender, not the GPU kernel.
+- Action: Inspect `sender_path`, fix `--sender-backend`, and verify NIC queue distribution.
 
-Tipik anlam:
+Throughput Increases but Timing Accuracy Degrades:
+- Large batch sizes or pipeline buffering are disrupting pacing intervals.
+- Action: Reduce `--gpu-batch-size`, reduce worker counts, and stabilize CUDA stream counts.
 
-- sistem paket kaybetmiyor olabilir
-- ama pacing hedefi tutmuyor, yani benchmark kalitesi yine zayif
+## NUMA Topology and Queue Placement Guide
 
-Oncelikli ayarlar:
+![Samurai NUMA Topology & Kernel-Bypass Memory Architecture](assets/diagrams/samurai_numa_afxdp_dpdk.svg)
 
-- `--afpacket-spin-limit` kademeli artirilabilir
-- `--afpacket-poll-timeout-ms` workload'a gore tekrar ayarlanabilir
-- `--workers` ve `--dp-queues` daha dengeli eslestirilebilir
-- `--pin-cpu` ile pacing thread'i daha kararlı bir core'a alinabilir
+Optimal performance requires aligning worker CPU cores, packet queues, network interface TX rings, and physical memory on the identical NUMA node.
 
-Kisa kural:
+### Impact of NUMA Cross-Talk
 
-- loss dusuk diye run iyi kabul edilmez
-- accuracy dusukse parity kalitesi yine bozulur
+When worker threads run on NUMA Node 0 while the network interface is bound to PCIe lanes on NUMA Node 1:
 
-### Senaryo 4: TX_RING drop ve flush baskisi goruluyor
+- Inter-socket UPI/QPI traffic introduces latency and timing jitter.
+- `rate_accuracy_pct` degrades significantly.
+- Memory bus contention increases queue pressure.
+- Effective line-rate throughput drops compared to theoretical capacity.
 
-Ozellikle su alanlara bak:
+### Inspecting Host Topology
 
-- `txring_tp_drops`
-- `txring_flush_error_count`
-- `txring_flush_eagain_count`
-- `txring_hold_block_pressure_pct`
-
-Tuning yonu:
-
-- `--afpacket-ring-target-mb` arttir
-- `--afpacket-frames-per-block` arttir
-- `--afpacket-spin-limit` orta seviyede dene
-- `--afpacket-busy-poll-us` sadece kontrollu deneylerde ac
-
-Dikkat:
-
-- bu ayarlari ayni anda buyuk adimlarla degistirme
-- ring buyudukce her zaman daha iyi sonuc gelmez; latency ve wait de artabilir
-
-## GPU Sonuclarini Okuma
-
-GPU path yorumunda yalnizca daha yuksek throughput beklemek dogru degildir.
-Asagidaki sorular birlikte sorulmalidir:
-
-- GPU readiness dry-run temiz mi?
-- smoke run stabil mi?
-- throughput artisina karsilik error/fallback artisi var mi?
-- pipeline depth, streams, batch gibi tuning alanlari raporlanmis mi?
-- CPU vs GPU karsilastirmasi ayni senaryo sinirlarinda mi yapildi?
-
-GPU sonucunu zayiflatan sinyaller:
-
-- readiness gecerken live run'da beklenmeyen fallback
-- fault-injection altinda hizli kalite dususu
-- artis gorunse bile `run_quality` veya KPI gate tarafinda bozulma
-
-GPU sonucunu guclendiren sinyaller:
-
-- smoke -> baseline -> tuned benchmark zinciri tutarliysa
-- soak sonunda drift sinirliysa
-- artifact seti karsilastirma icin eksiksizse
-
-### GPU Tuning Yonu
-
-#### Belirti: `gpu_ring_depth_peak` ve `gpu_ring_block_wait_ns` yuksek
-
-Tipik anlam:
-
-- producer, consumer'dan hizli
-- host/NIC tarafi GPU tarafini yetistiremiyor
-
-Denenecek ayarlar:
-
-- `--gpu-batch-size` azalt
-- `--gpu-stream-count` kademeli artir
-- `--gpu-pipeline-depth` 2 -> 3 gibi kademeli artir
-
-Geri cekilebilecek ayar:
-
-- `--gpu-full-variation`
-
-#### Belirti: GPU acik ama throughput artmiyor
-
-Tipik anlam:
-
-- darboğaz GPU degil, sender/backend olabilir
-
-Denenecekler:
-
-- `sender_path` ve fallback durumunu kontrol et
-- `--sender-backend` explicit sabitle
-- `--dp-queues` ve worker dagilimini yeniden dene
-
-Kisa kural:
-
-- GPU tuning'den once backend darboğazini ele
-
-#### Belirti: GPU ile throughput artsa da accuracy bozuluyor
-
-Tipik anlam:
-
-- batch buyuklugu veya pipeline baskisi pacing kalitesini bozuyor
-
-Denenecek ayarlar:
-
-- `--gpu-batch-size` azalt
-- `--workers` sayisini kontrollu azalt
-- `--gpu-stream-count` orta seviyede sabitle
-
-## NUMA ve Queue Yerlesimi Rehberi
-
-NUMA tuning'in amaci sudur:
-
-- worker CPU
-- queue
-- NIC TX queue
-- memory yerlesimi
-
-mümkün oldugunca ayni NUMA node uzerinde tutulsun.
-
-### Neden Onemli?
-
-Worker bir NUMA node'da, NIC diger NUMA node'da ise tipik etkiler:
-
-- daha yuksek jitter
-- daha dusuk `rate_accuracy_pct`
-- artan queue baskisi
-- ayni teorik count ile daha dusuk efektif throughput
-
-### Topoloji Okuma
-
-Lab host'ta ilk bakilacak komutlar:
+Execute the following commands on dedicated lab nodes:
 
 ```bash
 lscpu
@@ -503,231 +390,120 @@ ethtool -l <iface>
 cat /sys/class/net/<iface>/device/numa_node
 ```
 
-Amac:
+Operational goals:
+- Identify total NUMA nodes and CPU core layout.
+- Determine which NUMA node physically hosts the target NIC.
+- Confirm hardware TX queue capacity.
+- Align worker processes and thread affinities to matching cores.
 
-- kac NUMA node var
-- NIC hangi NUMA node'a bagli
-- NIC kac TX queue destekliyor
-- worker/core dagitimi buna nasil oturacak
+### Operational NUMA Rules
 
-### Operasyonel Kurallar
+1. Size `--workers` according to physical core counts on the local NUMA node.
+2. Ensure `--dp-queues` does not exceed hardware NIC TX queue capacity.
+3. For rigorous benchmarks, always use `--dp-queue-strategy map` or `pin`.
+4. Define explicit 1-to-1 worker-to-queue bindings via `--dp-queue-map`.
+5. Pin pacing threads to dedicated isolated cores using `--pin-cpu`.
 
-1. `--workers` sayisini fiziksel topolojiye gore sec
-2. `--dp-queues` NIC TX queue sayisini asmamali
-3. benchmark icin `--dp-queue-strategy map` veya `pin` tercih et
-4. `--dp-queue-map` ile worker -> queue eslesmesini sabitle
-5. gerekiyorsa `--pin-cpu` ile pacing thread'ini kararlı bir CPU'ya al
-
-### Hangi Strateji Ne Zaman?
-
-| Strateji | Ne zaman | Not |
+| Strategy | Recommended Context | Architectural Characteristics |
 |---|---|---|
-| `rr` | hizli baseline, ilk deneme | deterministiklik zayif olabilir |
-| `pin` | sabit topoloji, orta seviye lab | daha stabil queue/core baglantisi |
-| `map` | en ciddi benchmark | worker -> queue iliskisini acik sabitler |
+| `rr` | Initial baseline and exploratory runs | Non-deterministic queue assignment across workers |
+| `pin` | Standard lab testing on fixed topology | Stable worker-to-queue binding |
+| `map` | Authoritative line-rate certification | Explicit, deterministic worker-to-queue layout |
 
-### NUMA Tuning Akisi
+## CPU vs GPU A/B Comparison Invariants
 
-#### Asama 1: Basit ve temiz baslangic
+To publish valid A/B comparative performance evaluations between CPU and GPU pipelines, maintain strict identity across all baseline variables:
 
-- `--workers` sayisini NIC queue sayisini asmadan sec
-- `--dp-queue-strategy rr`
-- kisa baseline al
+- Identical destination target, port, and network topology.
+- Identical run profile and duration/count targets.
+- Identical acceptance criteria and KPI gate definitions.
+- Identical reporting formats and telemetry tracking.
 
-#### Asama 2: Deterministik yerlesime gec
+A comparison is invalid if:
+- One run is a short baseline while the other is an extended soak.
+- One run used `dev` criteria while the other used `dedicated_lab`.
+- One run experienced backend fallback while the other executed natively.
+- One run operated across mixed transmission paths.
 
-- `--dp-queue-strategy map`
-- `--dp-queues` ile queue sayisini netlestir
-- `--dp-queue-map` ile her worker'i tek queue'ya bagla
+## Artifact Inspection Checklist
 
-#### Asama 3: CPU affinity sabitle
+Every certified benchmark must archive the following complete artifact set:
 
-- `dp_affinity_cpu` alanlarini run report'ta kontrol et
-- eger ayni worker farkli kosularda farkli CPU davranisi sergiliyorsa `--pin-cpu` kullan
+1. Formal execution report (`run_report.json` and `run_report.md`).
+2. Complete profile and environment metadata embedded within the report.
+3. Telemetry fields (`sender_path`, fallback reason, KPI gates) clearly populated.
+4. Raw execution log file preserved in the artifact repository.
+5. Interface packet loss telemetry or realism evaluation files attached where applicable.
+6. Artifact filenames adhering to standard chronological naming conventions.
 
-### NUMA Sorunu Oldugunu Dusunduren Isaretler
+If artifacts are incomplete:
+- Reject the execution as an authoritative benchmark record.
+- Re-execute the test with mandatory artifact capture enabled.
 
-- ayni count/rps ile run-to-run oynaklik fazla
-- `rate_accuracy_pct` beklenmedik dusuk
-- throughput bazen iyi bazen kotu
-- mixed path veya fallback yok ama yine de jitter yuksek
-- `dp_queue_strategy=rr` ile dagilim kararsiz, `map` ile belirgin iyilesme geliyor
+## Result Publishing Standards
 
-### NUMA Sorununda Ne Artirilir, Ne Azaltilir?
-
-Artirilabilecekler:
-
-- `--dp-queues` (NIC queue kapasitesi dahilinde)
-- deterministik `map` kullanimi
-
-Azaltilabilecekler:
-
-- `--workers` sayisi
-- ayni queue uzerine binen worker yogunlugu
-
-Kapatilabilecekler:
-
-- benchmark kosusunda belirsizlik ureten `rr` dagitimi
-
-Kisa kural:
-
-- NUMA/topoloji problemi varken buyuk ring veya buyuk batch tek basina cozum olmaz
-- once yerlesim, sonra throughput tuning
-
-## CPU vs GPU A/B Karsilastirma Kurallari
-
-CPU ve GPU sonucu ayni tabloda gostermek istiyorsaniz en az su sabitler korunmalidir:
-
-- ayni hedef/senaryo
-- ayni run tipi
-- ayni kabul profili
-- benzer sure veya count zemini
-- ayni rapor/telemetry standardi
-
-Asagidaki durumlarda A/B sonucu zayif kabul edilir:
-
-- biri baseline, digeri soak ise
-- biri `dev`, digeri `dedicated_lab` ise
-- biri fallback'li, digeri fallback'siz ise
-- biri mixed path, digeri tek path ise
-
-## Artifact Inceleme Checklist'i
-
-Her ciddi benchmark sonrasi su kontrol listesi uygulanmalidir:
-
-1. `run_report` mevcut mu?
-2. JSON ve gerekiyorsa Markdown ozeti uretilmis mi?
-3. Profil/metadata artifact'e yazilmis mi?
-4. `sender_path`, fallback ve KPI alanlari gorunuyor mu?
-5. Log dosyasi saklanmis mi?
-6. Gerekli ise loss telemetry veya realism report mevcut mu?
-7. Dosya isimleri tekrar bulunabilir ve tarihsel arsive uygun mu?
-
-Artifact eksikse:
-
-- sonucu "kalici benchmark kaydi" olarak kabul etme
-- gerekirse ayni kosuyu artifact zorunlulugu ile tekrar al
-
-## Sonuc Yayinlama Standardi
-
-Bir benchmark sonucunu ekip icinde veya dokumanda yayinlamadan once su format
-kullanilmalidir:
-
-- run tipi
-- profil
-- hedef backend/path
-- KPI gate sonucu
-- run_quality
-- fallback durumu
-- ana throughput/loss/rate_accuracy ozeti
-- artifact konumu
-
-Ornek ozet kalibi:
+When communicating benchmark results internally or externally, use this structured reporting summary:
 
 ```text
-Run tipi: dedicated benchmark
-Profil: dedicated_lab
-Sender path: txring
-Run quality: valid
-KPI gate: pass
+Run Type: Dedicated Benchmark
+Profile: dedicated_lab
+Sender Path: txring
+Run Quality: valid
+KPI Gate Status: pass
 Fallback: none
-Not: score_eligible=1, artifact seti tam
+Eligibility: score_eligible=1
+Artifact Package: Complete
+Key Metrics: 14.88 Mpps line-rate, 0.02% wire loss, 99.4% rate accuracy
+Archive Location: artifacts/reports/2026-04-06_txring_dedicated_8q_failfast.json
 ```
 
-## Sonraki Adimi Secme Rehberi
+## Next Step Selection Guide
 
-### Durum 1: Run calisti ama KPI gate fail
+### Case 1: Run Completed but KPI Gate Failed
 
-Sonraki adim:
+Action:
+- Perform gap analysis against the failed threshold.
+- Identify whether failure was driven by packet loss, latency, or error rate.
+- Compare against historical `dev` baselines.
+- Apply targeted queue or pacing tuning and re-test.
 
-- once debug degil, fark analizi yap
-- hedef profil esiklerinin hangisinin patladigini cikar
-- gerekirse `dev` baseline ile karsilastir
-- tuning veya backend sabitleme yap
+### Case 2: Run Quality Marked as Invalid
 
-### Durum 2: Run valid degil
+Action:
+- Cease benchmark interpretation immediately.
+- Transition to system troubleshooting.
+- Inspect worker crashes, signal interruptions, kernel errors, and telemetry collection pipelines.
 
-Sonraki adim:
+### Case 3: Run Valid and Gate Passed, but Fallback Detected
 
-- benchmark yorumunu durdur
-- troubleshooting moduna gec
-- metric zemini, worker sayisi, interrupt ve fallback nedenlerini incele
+Action:
+- Archive run as an observational operational baseline.
+- Do not publish as a certified backend benchmark.
+- Fix backend dependencies and re-run with `--sender-fallback-policy fail`.
 
-### Durum 3: Run valid ve gate pass ama fallback var
+### Case 4: Run Valid, Gate Passed, Zero Fallback
 
-Sonraki adim:
+Action:
+- Lock and archive the artifact bundle.
+- Execute a confirmation run to demonstrate reproducibility.
+- Publish formal benchmark certification.
 
-- sonucu "calisan run" olarak kaydet
-- ama deterministik backend benchmark'i diye yayinlama
-- backend sabitleyip run'i tekrar et
+## Common Misinterpretations
 
-### Durum 4: Run valid, gate pass, fallback yok
+- High Throughput Equates to a Good Run:
+  False. If elevated throughput coincides with silent backend fallback or distorted metrics, the benchmark is invalid.
+- `valid` Quality Automatically Qualifies as an Accepted Benchmark:
+  False. `valid` merely confirms technical completion and metric integrity; it must also satisfy KPI gate thresholds.
+- `dev` Results Substitute for Dedicated Lab Testing:
+  False. Development profiles provide fast feedback for engineers, but lack the rigorous controls required for formal line-rate certification.
+- Mixed Transmission Paths Are Acceptable:
+  False. Mixed path execution obscures the contribution of individual drivers and invalidates architectural claims.
 
-Sonraki adim:
+## Summary
 
-- artifact setini kilitle
-- gerekiyorsa tekrar kosu ile tekrarlanabilirlik kontrolu yap
-- benchmark ozeti veya parity raporu yayinla
+A sound benchmarking culture relies on disciplined operational rigor: classifying every run correctly, rejecting invalid results without compromise, and guaranteeing complete statistical reproducibility across every published figure.
 
-## Sik Yapilan Yanlis Yorumlar
-
-### Throughput yuksekse run iyidir
-
-Yanlis. Yuksek throughput, fallback veya metric bozulmasi ile birlikte geliyorsa
-benchmark kalitesi dusmus olabilir.
-
-### `valid` olmak benchmark icin yeterlidir
-
-Yanlis. `valid`, sadece teknik olarak metrik zemininin olustugunu gosterir.
-Acceptance icin KPI gate ve profil uyumu da gerekir.
-
-### `dev` sonucu dedicated lab yerine gecer
-
-Yanlis. `dev`, regresyon ve gelistirme hizini destekler; lab-grade parity iddiasi
-icin yeterli degildir.
-
-### Mixed sender path yine de temiz benchmark sayilir
-
-Genellikle yanlis. Mixed path sonucu gozlemsel olabilir ama deterministik backend
-iddiasi zayiflar.
-
-## Profesyonel Calisma Kaliplari
-
-### Kalip 1: Yeni tuning sonrasi
-
-1. Dry-run
-2. Smoke run
-3. Baseline
-4. Benchmark
-5. Gerekirse soak
-
-Bu zincirden dogrudan benchmark'a sicrama yapma.
-
-### Kalip 2: Benchmark sonucu yayinlamadan once
-
-1. `run_quality` kontrol et
-2. KPI gate kontrol et
-3. fallback/path kontrol et
-4. artifact tamligini kontrol et
-5. profil iddiasini sonuc ile eslestir
-
-### Kalip 3: Regresyon raporu hazirlarken
-
-Her iki tarafta da sunlari esitle:
-
-- profil
-- backend
-- run tipi
-- artifact standardi
-
-## Sonuc
-
-Iyi benchmark kulturu, sadece komut calistirmakla kurulmaz. Asil farki yaratan
-sey, her kosuyu dogru siniflamak, gecersiz sonuclari benchmark gibi sunmamak ve
-yayinlanan her sonucun tekrar uretilebilir oldugunu gostermektir.
-
-Bu dokumanin ana ilkesi sudur:
-
-- once gecerlilik
-- sonra kabul
-- en son performans iddiasi
+Core Evaluation Hierarchy:
+1. Technical Validity First
+2. KPI Acceptance Second
+3. Performance and Line-Rate Claims Third
