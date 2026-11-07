@@ -1,0 +1,241 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 Samurai Team. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 640" role="img" aria-labelledby="gpu-p2p-title gpu-p2p-desc">
+  <title id="gpu-p2p-title">Samurai GPU-NIC P2P Zero-Copy Dataplane</title>
+  <desc id="gpu-p2p-desc">Deep-dive architecture showing zero-CPU packet generation: CUDA SM cores writing to GDDR6 VRAM, PCIe Root Complex P2P TLP Routing, NIC DMA engine reading over BAR1 IOVA, and line-rate egress.</desc>
+  <style>
+    text { font-family: "NVIDIA Sans", Arial, Helvetica, sans-serif; }
+    .bg { fill: #FFFFFF; stroke: #E0E0E0; stroke-width: 1; }
+    .t { fill: #1A1A1A; }
+    .tm { fill: #4B4B4B; }
+    .tw { fill: #FFFFFF; }
+    .tk { fill: #000000; }
+    .l { font-size: 14px; font-weight: 600; }
+    .s { font-size: 13px; font-weight: 400; }
+    .gl { font-size: 13px; font-weight: 600; }
+    .k-nvke { fill: #76B900; }
+    .k-nvkr { fill: #952FC6; }
+    .k-nv { fill: #FFFFFF; stroke: #4B4B4B; stroke-width: 1.5; }
+    .k-tp { fill: #E0E0E0; }
+    .k-hw { fill: #4B4B4B; }
+    .k-actor { fill: #FFFFFF; stroke: #757575; stroke-width: 1.5; }
+    .k-nvke-o { fill: #FFFFFF; stroke: #3F8500; stroke-width: 1.5; }
+    .k-nvkr-o { fill: #FFFFFF; stroke: #952FC6; stroke-width: 1.5; }
+    .dash { stroke-dasharray: 5 4; }
+    .g { fill: none; stroke: #757575; stroke-width: 1.5; }
+    .e { fill: none; stroke: #4B4B4B; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+    .ah { fill: #4B4B4B; }
+    .ko { fill: #FFFFFF; }
+    .ll { stroke: #A7A7A7; stroke-width: 1.5; stroke-dasharray: 2 5; stroke-linecap: round; }
+    .band { fill: none; stroke: #757575; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .badge { fill: #F9C500; }
+    .num { fill: #FFFFFF; stroke: #4B4B4B; stroke-width: 1.5; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #1A1A1A; stroke: #313131; }
+      .t { fill: #FFFFFF; }
+      .tm { fill: #A7A7A7; }
+      .k-nv { fill: #1A1A1A; stroke: #A7A7A7; }
+      .k-tp { fill: #313131; }
+      .k-hw { fill: #757575; }
+      .k-actor { fill: #1A1A1A; stroke: #A7A7A7; }
+      .k-nvke-o { fill: #1A1A1A; stroke: #76B900; }
+      .k-nvkr-o { fill: #1A1A1A; stroke: #C359EF; }
+      .g { stroke: #757575; }
+      .e { stroke: #A7A7A7; }
+      .ah { fill: #A7A7A7; }
+      .ko { fill: #1A1A1A; }
+      .ll { stroke: #757575; }
+      .num { fill: #1A1A1A; stroke: #A7A7A7; }
+    }
+</style>
+  
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah" d="M1,1.5 L9,5 L1,8.5 Z"/>
+    </marker>
+    <marker id="ahs" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah" d="M9,1.5 L1,5 L9,8.5 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="1119" height="639" rx="16"/>
+
+  <!-- Top Banner: Actor / Trigger -->
+  <g class="node">
+    <rect class="k-actor" x="40" y="24" width="240" height="48" rx="24"/>
+    <text class="l t" x="160" y="44" text-anchor="middle">CPU Supervisor Engine</text>
+    <text class="s tm" x="160" y="60" text-anchor="middle">One-Time Setup (Zero Runtime CPU)</text>
+  </g>
+  <g class="node">
+    <rect class="k-nvke" x="320" y="24" width="480" height="48" rx="8"/>
+    <text class="l tk" x="560" y="44" text-anchor="middle">Samurai Zero-CPU Persistent Dataplane</text>
+    <text class="s tk" x="560" y="60" text-anchor="middle">100/200 Gbps Wire-Speed Autonomous P2P Generation</text>
+  </g>
+  <g class="node">
+    <rect class="k-nvkr" x="840" y="24" width="240" height="48" rx="8"/>
+    <text class="l tw" x="960" y="44" text-anchor="middle">Status &amp; Telemetry</text>
+    <text class="s tw" x="960" y="60" text-anchor="middle">BAR1 Atomic Doorbell &amp; Rings</text>
+  </g>
+
+  <!-- Section 1: GPU Domain (Left) -->
+  <g class="group">
+    <rect class="g" x="40" y="96" width="320" height="430" rx="12"/>
+    <text class="gl tm" x="56" y="120">GPU Acceleration Domain</text>
+
+    <g class="node">
+      <rect class="k-nvke" x="60" y="136" width="280" height="68" rx="8"/>
+      <text class="l tk" x="200" y="162" text-anchor="middle">CUDA Streaming Multiprocessors</text>
+      <text class="s tk" x="200" y="180" text-anchor="middle">kernels_l4.cuh (Warp Parallel Synthesis)</text>
+      <text class="s tk" x="200" y="195" text-anchor="middle">Traffic Synthesis / Telemetry / L4 Shuffler</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvke-o" x="60" y="222" width="280" height="64" rx="8"/>
+      <text class="l t" x="200" y="248" text-anchor="middle">Host-Visible GDDR6 VRAM</text>
+      <text class="s tm" x="200" y="266" text-anchor="middle">Ring Buffers &amp; Packet Payloads</text>
+      <text class="s tm" x="200" y="281" text-anchor="middle">__threadfence_system() Cache Flush</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-hw" x="60" y="304" width="280" height="64" rx="8"/>
+      <text class="l tw" x="200" y="330" text-anchor="middle">GPU BAR1 Physical Controller</text>
+      <text class="s tw" x="200" y="348" text-anchor="middle">IOVA: 0xfaf00000 -&gt; 0xfcc01c0000</text>
+      <text class="s tw" x="200" y="363" text-anchor="middle">Direct Hardware Memory Aperture</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nv" x="60" y="388" width="280" height="56" rx="8"/>
+      <text class="l t" x="200" y="412" text-anchor="middle">Descriptor Ownership State</text>
+      <text class="s tm" x="200" y="430" text-anchor="middle">kReadyForNic &lt;--&gt; kComplete</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-tp" x="60" y="460" width="280" height="50" rx="6"/>
+      <text class="s t" x="200" y="482" text-anchor="middle">GPU In-Flight Telemetry Counters</text>
+      <text class="s tm" x="200" y="498" text-anchor="middle">Nanosecond Jitter &amp; Rate Verification</text>
+    </g>
+  </g>
+
+  <!-- Section 2: PCIe Interconnect & Root Complex (Middle) -->
+  <g class="group">
+    <rect class="g" x="400" y="96" width="320" height="430" rx="12"/>
+    <text class="gl tm" x="416" y="120">PCIe Subsystem &amp; P2P Bus Routing</text>
+
+    <g class="node">
+      <rect class="k-hw" x="420" y="136" width="280" height="70" rx="8"/>
+      <text class="l tw" x="560" y="162" text-anchor="middle">PCIe Gen4 / Gen5 Root Complex</text>
+      <text class="s tw" x="560" y="180" text-anchor="middle">IOMMU P2P Access Control Active</text>
+      <text class="s tw" x="560" y="196" text-anchor="middle">ACS (Access Control Services) Bypassed</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nv dash" x="420" y="224" width="280" height="64" rx="8"/>
+      <text class="l t" x="560" y="248" text-anchor="middle">TLP Memory Read (MRd)</text>
+      <text class="s tm" x="560" y="266" text-anchor="middle">NIC DMA -&gt; GPU BAR1 (Tag 0x42)</text>
+      <text class="s tm" x="560" y="281" text-anchor="middle">Direct Peer-to-Peer Bus Request</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nv dash" x="420" y="306" width="280" height="64" rx="8"/>
+      <text class="l t" x="560" y="330" text-anchor="middle">TLP Completion with Data (CplD)</text>
+      <text class="s tm" x="560" y="348" text-anchor="middle">GPU BAR1 -&gt; NIC FIFO Stream</text>
+      <text class="s tm" x="560" y="363" text-anchor="middle">Payload Data Transferred without RAM</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvkr" x="420" y="388" width="280" height="56" rx="8"/>
+      <text class="l tw" x="560" y="412" text-anchor="middle">Zero Host CPU Memory Traversal</text>
+      <text class="s tw" x="560" y="430" text-anchor="middle">Host RAM (DDR4/5) Latency Eliminated</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-tp" x="420" y="460" width="280" height="50" rx="6"/>
+      <text class="s t" x="560" y="482" text-anchor="middle">PCIe Latency: ~420 ns</text>
+      <text class="s tm" x="560" y="498" text-anchor="middle">Bandwidth: up to 256 Gbps Full-Duplex</text>
+    </g>
+  </g>
+
+  <!-- Section 3: High-Speed NIC & Physical Wire (Right) -->
+  <g class="group">
+    <rect class="g" x="760" y="96" width="320" height="430" rx="12"/>
+    <text class="gl tm" x="776" y="120">High-Speed NIC &amp; Egress Wire</text>
+
+    <g class="node">
+      <rect class="k-hw" x="780" y="136" width="280" height="68" rx="8"/>
+      <text class="l tw" x="920" y="162" text-anchor="middle">NIC TX DMA Engine</text>
+      <text class="s tw" x="920" y="180" text-anchor="middle">Multi-Queue Descriptors &amp; Rings</text>
+      <text class="s tw" x="920" y="195" text-anchor="middle">TxDesc[i].addr = GPU BAR1 IOVA</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvke" x="780" y="222" width="280" height="64" rx="8"/>
+      <text class="l tk" x="920" y="248" text-anchor="middle">GPU-Initiated Doorbell MMIO</text>
+      <text class="s tk" x="920" y="266" text-anchor="middle">Autonomous GPU Kernel Trigger</text>
+      <text class="s tk" x="920" y="281" text-anchor="middle">No CPU Interrupt / No Wakeup</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nv" x="780" y="304" width="280" height="64" rx="8"/>
+      <text class="l t" x="920" y="330" text-anchor="middle">NIC MAC / PHY Sublayer</text>
+      <text class="s tm" x="920" y="348" text-anchor="middle">Hardware CRC32 Generation</text>
+      <text class="s tm" x="920" y="363" text-anchor="middle">FCS, Preamble &amp; Inter-Frame Gap</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvke-o" x="780" y="388" width="280" height="56" rx="8"/>
+      <text class="l t" x="920" y="412" text-anchor="middle">100G / 200G Physical Transceiver</text>
+      <text class="s tm" x="920" y="430" text-anchor="middle">QSFP28 / QSFP56 Optical / DAC</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-hw" x="780" y="460" width="280" height="50" rx="6"/>
+      <text class="l tw" x="920" y="482" text-anchor="middle">148.8 Mpps Line-Rate Egress</text>
+      <text class="s tw" x="920" y="498" text-anchor="middle">Physical Wire / Carrier Infrastructure</text>
+    </g>
+  </g>
+
+  <!-- P2P Flow Edges -->
+  <g class="edge">
+    <path class="e" d="M340,170 L420,170" marker-end="url(#ah)"/>
+  </g>
+  <g class="edge">
+    <path class="e" d="M700,170 L780,170" marker-end="url(#ah)"/>
+  </g>
+  <g class="edge">
+    <path class="e" d="M780,256 L700,256" marker-end="url(#ah)"/>
+    <rect class="ko" x="715" y="246" width="50" height="18" rx="3"/>
+    <text class="s tm elabel" x="740" y="259" text-anchor="middle">MRd TLP</text>
+  </g>
+  <g class="edge">
+    <path class="e" d="M420,256 L340,256" marker-end="url(#ah)"/>
+  </g>
+  <g class="edge">
+    <path class="e" d="M340,338 L420,338" marker-end="url(#ah)"/>
+    <rect class="ko" x="355" y="328" width="50" height="18" rx="3"/>
+    <text class="s tm elabel" x="380" y="341" text-anchor="middle">CplD TLP</text>
+  </g>
+  <g class="edge">
+    <path class="e" d="M700,338 L780,338" marker-end="url(#ah)"/>
+  </g>
+
+  <!-- Legend at the bottom -->
+  <g class="legend">
+    <rect class="k-nvke" x="40" y="560" width="22" height="16" rx="4"/>
+    <text class="s t" x="70" y="573">CUDA &amp; GPU Runtime</text>
+
+    <rect class="k-nvkr" x="320" y="560" width="22" height="16" rx="4"/>
+    <text class="s t" x="350" y="573">Zero-Copy Optimization Metric</text>
+
+    <rect class="k-hw" x="600" y="560" width="22" height="16" rx="4"/>
+    <text class="s t" x="630" y="573">Hardware Controller / PCIe Fabric</text>
+
+    <rect class="k-nv dash" x="870" y="560" width="22" height="16" rx="4"/>
+    <text class="s t" x="900" y="573">PCIe TLP Peer-to-Peer Transfer</text>
+
+    <path class="e" d="M40,605 H70" marker-end="url(#ah)"/>
+    <text class="s t" x="78" y="609">Direct Hardware Access Path</text>
+
+    <text class="s tm" x="600" y="609">Samurai Commodity P2P Packet Architecture - Zero CPU Overhead</text>
+  </g>
+</svg>

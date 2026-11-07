@@ -1,0 +1,278 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 Samurai Team. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" role="img" aria-labelledby="samurai-arch-title samurai-arch-desc">
+  <title id="samurai-arch-title">Samurai End-to-End System Architecture</title>
+  <desc id="samurai-arch-desc">Layered view of Samurai architecture: Operators, Control Plane Master, Distributed Slaves with Local Supervisors, Native ZMQ Dataplane Workers, and Line-Rate Hardware Dataplane.</desc>
+  <style>
+    text { font-family: "NVIDIA Sans", Arial, Helvetica, sans-serif; }
+    .bg { fill: #FFFFFF; stroke: #E0E0E0; stroke-width: 1; }
+    .t { fill: #1A1A1A; }
+    .tm { fill: #4B4B4B; }
+    .tw { fill: #FFFFFF; }
+    .tk { fill: #000000; }
+    .l { font-size: 14px; font-weight: 600; }
+    .s { font-size: 13px; font-weight: 400; }
+    .gl { font-size: 13px; font-weight: 600; }
+    .k-nvke { fill: #76B900; }
+    .k-nvkr { fill: #952FC6; }
+    .k-nv { fill: #FFFFFF; stroke: #4B4B4B; stroke-width: 1.5; }
+    .k-tp { fill: #E0E0E0; }
+    .k-hw { fill: #4B4B4B; }
+    .k-actor { fill: #FFFFFF; stroke: #757575; stroke-width: 1.5; }
+    .k-nvke-o { fill: #FFFFFF; stroke: #3F8500; stroke-width: 1.5; }
+    .k-nvkr-o { fill: #FFFFFF; stroke: #952FC6; stroke-width: 1.5; }
+    .dash { stroke-dasharray: 5 4; }
+    .g { fill: none; stroke: #757575; stroke-width: 1.5; }
+    .e { fill: none; stroke: #4B4B4B; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+    .ah { fill: #4B4B4B; }
+    .ko { fill: #FFFFFF; }
+    .ll { stroke: #A7A7A7; stroke-width: 1.5; stroke-dasharray: 2 5; stroke-linecap: round; }
+    .band { fill: none; stroke: #757575; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .badge { fill: #F9C500; }
+    .num { fill: #FFFFFF; stroke: #4B4B4B; stroke-width: 1.5; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #1A1A1A; stroke: #313131; }
+      .t { fill: #FFFFFF; }
+      .tm { fill: #A7A7A7; }
+      .k-nv { fill: #1A1A1A; stroke: #A7A7A7; }
+      .k-tp { fill: #313131; }
+      .k-hw { fill: #757575; }
+      .k-actor { fill: #1A1A1A; stroke: #A7A7A7; }
+      .k-nvke-o { fill: #1A1A1A; stroke: #76B900; }
+      .k-nvkr-o { fill: #1A1A1A; stroke: #C359EF; }
+      .g { stroke: #757575; }
+      .e { stroke: #A7A7A7; }
+      .ah { fill: #A7A7A7; }
+      .ko { fill: #1A1A1A; }
+      .ll { stroke: #757575; }
+      .num { fill: #1A1A1A; stroke: #A7A7A7; }
+    }
+</style>
+  
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah" d="M1,1.5 L9,5 L1,8.5 Z"/>
+    </marker>
+    <marker id="ahs" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah" d="M9,1.5 L1,5 L9,8.5 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="1199" height="759" rx="16"/>
+
+  <!-- Top Actors / Operations Layer -->
+  <g class="node">
+    <rect class="k-actor" x="120" y="24" width="220" height="52" rx="26"/>
+    <text class="l t" x="230" y="46" text-anchor="middle">SecOps Operator</text>
+    <text class="s tm" x="230" y="63" text-anchor="middle">samurai CLI (Native C++)</text>
+  </g>
+  <g class="node">
+    <rect class="k-actor" x="490" y="24" width="220" height="52" rx="26"/>
+    <text class="l t" x="600" y="46" text-anchor="middle">Management &amp; API</text>
+    <text class="s tm" x="600" y="63" text-anchor="middle">REST HTTPS / Web Dashboard</text>
+  </g>
+  <g class="node">
+    <rect class="k-actor" x="850" y="24" width="230" height="52" rx="26"/>
+    <text class="l t" x="965" y="46" text-anchor="middle">CI/CD &amp; Automated Gates</text>
+    <text class="s tm" x="965" y="63" text-anchor="middle">RFC Benchmark &amp; KPI Runner</text>
+  </g>
+
+  <!-- Group 1: Distributed Control Plane (Master Cluster) -->
+  <g class="group">
+    <rect class="g" x="30" y="110" width="480" height="230" rx="12"/>
+    <text class="gl tm" x="46" y="132">Control Plane — samurai_master</text>
+
+    <g class="node">
+      <rect class="k-nvke" x="50" y="146" width="205" height="58" rx="8"/>
+      <text class="l tk" x="152" y="171" text-anchor="middle">MasterCoordinator</text>
+      <text class="s tk" x="152" y="188" text-anchor="middle">Shard Engine &amp; Capacity</text>
+    </g>
+    <g class="node">
+      <rect class="k-nvkr" x="280" y="146" width="210" height="58" rx="8"/>
+      <text class="l tw" x="385" y="171" text-anchor="middle">HA &amp; Auth Engine</text>
+      <text class="s tw" x="385" y="188" text-anchor="middle">FileLock / JWT RBAC</text>
+    </g>
+    <g class="node">
+      <rect class="k-nvke-o" x="50" y="222" width="205" height="58" rx="8"/>
+      <text class="l t" x="152" y="247" text-anchor="middle">ControlServer (ZMQ)</text>
+      <text class="s tm" x="152" y="264" text-anchor="middle">ROUTER :5099 (CurveZMQ)</text>
+    </g>
+    <g class="node">
+      <rect class="k-nv" x="280" y="222" width="210" height="58" rx="8"/>
+      <text class="l t" x="385" y="247" text-anchor="middle">AuditLogger</text>
+      <text class="s tm" x="385" y="264" text-anchor="middle">Tamper-Evident SHA-256</text>
+    </g>
+    <g class="node">
+      <rect class="k-tp" x="50" y="294" width="440" height="34" rx="6"/>
+      <text class="s t" x="270" y="316" text-anchor="middle">Management API (:8443 TLS) &amp; Prometheus Exporter (:9100)</text>
+    </g>
+  </g>
+
+  <!-- Group 2: Distributed Slave & Supervisor Cluster -->
+  <g class="group">
+    <rect class="g" x="560" y="110" width="610" height="230" rx="12"/>
+    <text class="gl tm" x="576" y="132">Distributed Nodes &amp; Local Supervisor — samurai_slave</text>
+
+    <g class="node">
+      <rect class="k-nvke" x="580" y="146" width="270" height="58" rx="8"/>
+      <text class="l tk" x="715" y="171" text-anchor="middle">SlaveControlClient</text>
+      <text class="s tk" x="715" y="188" text-anchor="middle">ZMQ DEALER &amp; Auto-Reconnect</text>
+    </g>
+    <g class="node">
+      <rect class="k-nvkr" x="875" y="146" width="275" height="58" rx="8"/>
+      <text class="l tw" x="1012" y="171" text-anchor="middle">WorkerShardService</text>
+      <text class="s tw" x="1012" y="188" text-anchor="middle">Direct &amp; Reverse NAT RPC</text>
+    </g>
+    <g class="node">
+      <rect class="k-nv" x="580" y="222" width="570" height="58" rx="8"/>
+      <text class="l t" x="865" y="247" text-anchor="middle">Native Supervisor Engine (supervisor.cpp)</text>
+      <text class="s tm" x="865" y="264" text-anchor="middle">ZMQ IPC (/tmp/samurai_jobs_*), Heartbeat Watchdog &amp; Process Isolation</text>
+    </g>
+    <g class="node">
+      <rect class="k-tp" x="580" y="294" width="570" height="34" rx="6"/>
+      <text class="s t" x="865" y="316" text-anchor="middle">Local Telemetry Snapshot Ring (MetricSnapshotV1, 2s Interval)</text>
+    </g>
+  </g>
+
+  <!-- Group 3: ZMQ Native Dataplane Workers (Heterogeneous) -->
+  <g class="group">
+    <rect class="g" x="30" y="370" width="1140" height="175" rx="12"/>
+    <text class="gl tm" x="46" y="392">Heterogeneous Native Dataplane Workers (ZMQ IPC Job Receivers)</text>
+
+    <g class="node">
+      <rect class="k-nvke" x="50" y="408" width="255" height="58" rx="8"/>
+      <text class="l tk" x="177" y="432" text-anchor="middle">samurai_gpu_worker</text>
+      <text class="s tk" x="177" y="449" text-anchor="middle">CUDA L4 Warp Packet Engine</text>
+    </g>
+    <g class="node">
+      <rect class="k-nvke" x="335" y="408" width="255" height="58" rx="8"/>
+      <text class="l tk" x="462" y="432" text-anchor="middle">samurai_doca_worker</text>
+      <text class="s tk" x="462" y="449" text-anchor="middle">NVIDIA DPU &amp; GPUNetIO P2P</text>
+    </g>
+    <g class="node">
+      <rect class="k-nv" x="620" y="408" width="255" height="58" rx="8"/>
+      <text class="l t" x="747" y="432" text-anchor="middle">samurai_afxdp_worker</text>
+      <text class="s tm" x="747" y="449" text-anchor="middle">AF_XDP Kernel Bypass UMEM</text>
+    </g>
+    <g class="node">
+      <rect class="k-nv" x="905" y="408" width="245" height="58" rx="8"/>
+      <text class="l t" x="1027" y="432" text-anchor="middle">samurai_dpdk_worker</text>
+      <text class="s tm" x="1027" y="449" text-anchor="middle">DPDK PMD Ring &amp; Hugepages</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nv" x="50" y="474" width="255" height="58" rx="8"/>
+      <text class="l t" x="177" y="498" text-anchor="middle">samurai_l7_worker</text>
+      <text class="s tm" x="177" y="515" text-anchor="middle">HTTP/1.1, H2, QUIC/H3 &amp; DNS</text>
+    </g>
+    <g class="node">
+      <rect class="k-nv" x="335" y="474" width="255" height="58" rx="8"/>
+      <text class="l t" x="462" y="498" text-anchor="middle">samurai_scenario_worker</text>
+      <text class="s tm" x="462" y="515" text-anchor="middle">Web/Mobile Persona SLA</text>
+    </g>
+    <g class="node">
+      <rect class="k-nvkr" x="620" y="474" width="255" height="58" rx="8"/>
+      <text class="l tw" x="747" y="498" text-anchor="middle">samurai_defense_worker</text>
+      <text class="s tw" x="747" y="515" text-anchor="middle">VAE Closed-Loop Bypass</text>
+    </g>
+    <g class="node">
+      <rect class="k-tp" x="905" y="474" width="245" height="58" rx="8"/>
+      <text class="l t" x="1027" y="498" text-anchor="middle">samurai_cpu_worker</text>
+      <text class="s tm" x="1027" y="515" text-anchor="middle">Raw Socket &amp; Ring Fallback</text>
+    </g>
+  </g>
+
+  <!-- Group 4: Hardware & Kernel Bypass Dataplane -->
+  <g class="group">
+    <rect class="g" x="30" y="570" width="1140" height="95" rx="12"/>
+    <text class="gl tm" x="46" y="590">Hardware, Drivers &amp; Line-Rate Network Fabric</text>
+
+    <g class="node">
+      <rect class="k-hw" x="50" y="602" width="255" height="50" rx="8"/>
+      <text class="l tw" x="177" y="625" text-anchor="middle">GPU Acceleration &amp; GDDR6</text>
+      <text class="s tw" x="177" y="641" text-anchor="middle">BAR1 P2P Direct Memory</text>
+    </g>
+    <g class="node">
+      <rect class="k-hw" x="335" y="602" width="255" height="50" rx="8"/>
+      <text class="l tw" x="462" y="625" text-anchor="middle">SmartNIC / DPU Subsystem</text>
+      <text class="s tw" x="462" y="641" text-anchor="middle">GPUNetIO &amp; Hardware Offload</text>
+    </g>
+    <g class="node">
+      <rect class="k-hw" x="620" y="602" width="255" height="50" rx="8"/>
+      <text class="l tw" x="747" y="625" text-anchor="middle">100/200GbE NIC (VFIO / PMD)</text>
+      <text class="s tw" x="747" y="641" text-anchor="middle">Zero-Copy DMA Rings</text>
+    </g>
+    <g class="node">
+      <rect class="k-hw" x="905" y="602" width="245" height="50" rx="8"/>
+      <text class="l tw" x="1027" y="625" text-anchor="middle">Carrier / Target Network</text>
+      <text class="s tw" x="1027" y="641" text-anchor="middle">Line-Rate Wire Egress</text>
+    </g>
+  </g>
+
+  <!-- Edges & Connectors -->
+  <g class="edge">
+    <path class="e" d="M230,76 L230,110" marker-end="url(#ah)"/>
+    <rect class="ko" x="180" y="84" width="100" height="18" rx="3"/>
+    <text class="s tm elabel" x="230" y="97" text-anchor="middle">CLI Commands</text>
+  </g>
+  <g class="edge">
+    <path class="e" d="M600,76 L600,102 Q600,108 550,108 L470,108" marker-end="url(#ah)"/>
+    <rect class="ko" x="520" y="84" width="80" height="18" rx="3"/>
+    <text class="s tm elabel" x="560" y="97" text-anchor="middle">REST / TLS</text>
+  </g>
+  <g class="edge">
+    <path class="e" d="M965,76 L965,110" marker-end="url(#ah)"/>
+    <rect class="ko" x="915" y="84" width="100" height="18" rx="3"/>
+    <text class="s tm elabel" x="965" y="97" text-anchor="middle">Automated KPI</text>
+  </g>
+
+  <g class="edge">
+    <path class="e" d="M510,225 L560,225" marker-end="url(#ah)"/>
+    <rect class="ko" x="480" y="202" width="110" height="18" rx="3"/>
+    <text class="s tm elabel" x="535" y="215" text-anchor="middle">CurveZMQ :5099</text>
+  </g>
+
+  <g class="edge">
+    <path class="e" d="M720,340 L720,370" marker-end="url(#ah)"/>
+    <rect class="ko" x="650" y="348" width="140" height="18" rx="3"/>
+    <text class="s tm elabel" x="720" y="361" text-anchor="middle">ZMQ Job Envelope V1</text>
+  </g>
+
+  <g class="edge">
+    <path class="e" d="M177,545 L177,570" marker-end="url(#ah)"/>
+  </g>
+  <g class="edge">
+    <path class="e" d="M462,545 L462,570" marker-end="url(#ah)"/>
+  </g>
+  <g class="edge">
+    <path class="e" d="M747,545 L747,570" marker-end="url(#ah)"/>
+  </g>
+  <g class="edge">
+    <path class="e" d="M1027,545 L1027,570" marker-end="url(#ah)"/>
+  </g>
+
+  <!-- Legend at the bottom -->
+  <g class="legend">
+    <rect class="k-nvke" x="30" y="690" width="22" height="16" rx="4"/>
+    <text class="s t" x="60" y="703">GPU / Accelerated Engine</text>
+
+    <rect class="k-nvkr" x="250" y="690" width="22" height="16" rx="4"/>
+    <text class="s t" x="280" y="703">Control &amp; Security Coordination</text>
+
+    <rect class="k-nv" x="510" y="690" width="22" height="16" rx="4"/>
+    <text class="s t" x="540" y="703">Samurai Native Worker</text>
+
+    <rect class="k-tp" x="735" y="690" width="22" height="16" rx="4"/>
+    <text class="s t" x="765" y="703">External / Fallback Service</text>
+
+    <rect class="k-hw" x="965" y="690" width="22" height="16" rx="4"/>
+    <text class="s t" x="995" y="703">Hardware &amp; Fabric</text>
+
+    <path class="e" d="M30,730 H60" marker-end="url(#ah)"/>
+    <text class="s t" x="68" y="734">Control / Telemetry Stream</text>
+
+    <path class="e dash" d="M280,730 H310" marker-end="url(#ah)"/>
+    <text class="s t" x="318" y="734">P2P Zero-Copy DMA / Hardware Path</text>
+  </g>
+</svg>

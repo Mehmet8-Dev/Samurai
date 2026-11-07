@@ -25,6 +25,10 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/35-vae-defense-integration.md
 !docs/38-architecture-refactor-plan.md
 !docs/40-distributed-control-plane-handbook.md
+!docs/41-scenario-json-spec-and-examples.md
+!docs/42-rl-closed-loop-evaluation-and-findings.md
+!docs/scenario_engine.md
+!docs/distributed-ha-smoke.md
 !plan/*.md
 !docs/pitch-teknik-hazirlik-barikat.md
 !docs/PR_TASK_TEST_L2_02_RFC6675_SACK.md
@@ -144,3 +148,8 @@ settings.json
 # Video presentation & assets
 /samurai-video/
 *.mp4
+
+# Diagram theme guide & generator scratch
+DIAGRAM_THEME_GUIDE.md
+docs/DIAGRAM_THEME_GUIDE.md
+tools/

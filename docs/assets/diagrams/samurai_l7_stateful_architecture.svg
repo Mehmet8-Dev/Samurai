@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 Samurai Team. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 620" role="img" aria-labelledby="l7-arch-title l7-arch-desc">
+  <title id="l7-arch-title">Samurai L7 Stateful Userspace Architecture</title>
+  <desc id="l7-arch-desc">Shared-nothing multi-driver architecture for H1, H2, and H3 with isolated CPU core pinning, LaneStringArena, and busy-polling.</desc>
+  <style>
+    text { font-family: "NVIDIA Sans", Arial, Helvetica, sans-serif; }
+    .bg { fill: #FFFFFF; stroke: #E0E0E0; stroke-width: 1; }
+    .t { fill: #1A1A1A; }
+    .tm { fill: #4B4B4B; }
+    .tw { fill: #FFFFFF; }
+    .tk { fill: #000000; }
+    .l { font-size: 14px; font-weight: 600; }
+    .s { font-size: 13px; font-weight: 400; }
+    .gl { font-size: 13px; font-weight: 600; }
+    .k-nvke { fill: #76B900; }
+    .k-nvkr { fill: #952FC6; }
+    .k-nv { fill: #FFFFFF; stroke: #4B4B4B; stroke-width: 1.5; }
+    .k-tp { fill: #E0E0E0; }
+    .k-hw { fill: #4B4B4B; }
+    .k-actor { fill: #FFFFFF; stroke: #757575; stroke-width: 1.5; }
+    .k-nvke-o { fill: #FFFFFF; stroke: #3F8500; stroke-width: 1.5; }
+    .k-nvkr-o { fill: #FFFFFF; stroke: #952FC6; stroke-width: 1.5; }
+    .dash { stroke-dasharray: 5 4; }
+    .g { fill: none; stroke: #757575; stroke-width: 1.5; }
+    .e { fill: none; stroke: #4B4B4B; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+    .ah { fill: #4B4B4B; }
+    .ko { fill: #FFFFFF; }
+    .ll { stroke: #A7A7A7; stroke-width: 1.5; stroke-dasharray: 2 5; stroke-linecap: round; }
+    .band { fill: none; stroke: #757575; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .badge { fill: #F9C500; }
+    .num { fill: #FFFFFF; stroke: #4B4B4B; stroke-width: 1.5; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #1A1A1A; stroke: #313131; }
+      .t { fill: #FFFFFF; }
+      .tm { fill: #A7A7A7; }
+      .k-nv { fill: #1A1A1A; stroke: #A7A7A7; }
+      .k-tp { fill: #313131; }
+      .k-hw { fill: #757575; }
+      .k-actor { fill: #1A1A1A; stroke: #A7A7A7; }
+      .k-nvke-o { fill: #1A1A1A; stroke: #76B900; }
+      .k-nvkr-o { fill: #1A1A1A; stroke: #C359EF; }
+      .g { stroke: #757575; }
+      .e { stroke: #A7A7A7; }
+      .ah { fill: #A7A7A7; }
+      .ko { fill: #1A1A1A; }
+      .ll { stroke: #757575; }
+      .num { fill: #1A1A1A; stroke: #A7A7A7; }
+    }
+</style>
+  
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah" d="M1,1.5 L9,5 L1,8.5 Z"/>
+    </marker>
+    <marker id="ahs" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah" d="M9,1.5 L1,5 L9,8.5 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="1119" height="619" rx="16"/>
+
+  <!-- Top Banner -->
+  <g class="node">
+    <rect class="k-nvke" x="40" y="24" width="1040" height="52" rx="8"/>
+    <text class="l tk" x="560" y="46" text-anchor="middle">Samurai L7 Stateful Userspace Shared-Nothing Architecture</text>
+    <text class="s tk" x="560" y="64" text-anchor="middle">TRex ASTF-Compliant Multi-Driver Engine: HTTP/1.1, HTTP/2 (nghttp2), and HTTP/3 QUIC (ngtcp2)</text>
+  </g>
+
+  <!-- Group 1: Protocol Engines (Top Layer) -->
+  <g class="group">
+    <rect class="g" x="40" y="100" width="1040" height="120" rx="12"/>
+    <text class="gl tm" x="56" y="122">Layer 7 State Machine &amp; Protocol Drivers</text>
+
+    <g class="node">
+      <rect class="k-nv" x="60" y="136" width="310" height="68" rx="8"/>
+      <text class="l t" x="215" y="160" text-anchor="middle">HTTP/1.1 Dynamic RFC 7230</text>
+      <text class="s tm" x="215" y="178" text-anchor="middle">LaneStringArena Memory Rental</text>
+      <text class="s tm" x="215" y="192" text-anchor="middle">Dynamic Header Capture &amp; Parse</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvke" x="405" y="136" width="310" height="68" rx="8"/>
+      <text class="l tk" x="560" y="160" text-anchor="middle">HTTP/2 nghttp2 Session Engine</text>
+      <text class="s tk" x="560" y="178" text-anchor="middle">Stream Multiplexing &amp; Flow Control</text>
+      <text class="s tk" x="560" y="192" text-anchor="middle">In-Place Header HPACK Parsing</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvkr" x="750" y="136" width="310" height="68" rx="8"/>
+      <text class="l tw" x="905" y="160" text-anchor="middle">HTTP/3 QUIC (ngtcp2 / nghttp3)</text>
+      <text class="s tw" x="905" y="178" text-anchor="middle">Real TLS 1.3 / SO_REUSEPORT Sockets</text>
+      <text class="s tw" x="905" y="192" text-anchor="middle">CUDA Parallel Batch Crypto Offload</text>
+    </g>
+  </g>
+
+  <!-- Group 2: Shared-Nothing Core Isolation (Middle Layer) -->
+  <g class="group">
+    <rect class="g" x="40" y="240" width="1040" height="150" rx="12"/>
+    <text class="gl tm" x="56" y="262">Shared-Nothing Core Isolation &amp; Zero-Lock Sharding</text>
+
+    <g class="node">
+      <rect class="k-nvke-o" x="60" y="280" width="225" height="90" rx="8"/>
+      <text class="l t" x="172" y="308" text-anchor="middle">Shard 0: Pinned Core 0</text>
+      <text class="s tm" x="172" y="328" text-anchor="middle">TcpDataplaneCore Instance</text>
+      <text class="s tm" x="172" y="344" text-anchor="middle">InMemoryShardPeer 0</text>
+      <text class="s tm" x="172" y="360" text-anchor="middle">Zero Lock Contention</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvke-o" x="330" y="280" width="225" height="90" rx="8"/>
+      <text class="l t" x="442" y="308" text-anchor="middle">Shard 1: Pinned Core 1</text>
+      <text class="s tm" x="442" y="328" text-anchor="middle">TcpDataplaneCore Instance</text>
+      <text class="s tm" x="442" y="344" text-anchor="middle">InMemoryShardPeer 1</text>
+      <text class="s tm" x="442" y="360" text-anchor="middle">Zero Lock Contention</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvke-o" x="600" y="280" width="225" height="90" rx="8"/>
+      <text class="l t" x="712" y="308" text-anchor="middle">Shard 2: Pinned Core 2</text>
+      <text class="s tm" x="712" y="328" text-anchor="middle">TcpDataplaneCore Instance</text>
+      <text class="s tm" x="712" y="344" text-anchor="middle">InMemoryShardPeer 2</text>
+      <text class="s tm" x="712" y="360" text-anchor="middle">Zero Lock Contention</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvke-o" x="870" y="280" width="190" height="90" rx="8"/>
+      <text class="l t" x="965" y="308" text-anchor="middle">Shard N (Scaling)</text>
+      <text class="s tm" x="965" y="328" text-anchor="middle">Linear Core Scaling</text>
+      <text class="s tm" x="965" y="344" text-anchor="middle">12+ Isolated Lanes</text>
+      <text class="s tm" x="965" y="360" text-anchor="middle">1M+ Active Flows</text>
+    </g>
+  </g>
+
+  <!-- Group 3: Execution Loop & Verified Benchmarks (Bottom Layer) -->
+  <g class="group">
+    <rect class="g" x="40" y="410" width="1040" height="120" rx="12"/>
+    <text class="gl tm" x="56" y="432">Busy-Polling Dataplane Loop &amp; Verified Results</text>
+
+    <g class="node">
+      <rect class="k-hw" x="60" y="448" width="470" height="66" rx="8"/>
+      <text class="l tw" x="295" y="474" text-anchor="middle">Busy-Polling Dataplane Loop (_mm_pause / Zero Sleep)</text>
+      <text class="s tw" x="295" y="492" text-anchor="middle">Eliminates 200us sleep latency jitter | Continuous packet pump</text>
+      <text class="s tw" x="295" y="506" text-anchor="middle">SSE2 hardware pause instruction with adaptive idle yield</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-tp" x="560" y="448" width="500" height="66" rx="8"/>
+      <text class="l t" x="810" y="474" text-anchor="middle">Empirically Verified Benchmark Performance</text>
+      <text class="s tm" x="810" y="492" text-anchor="middle">HTTP/2 h2c: 165,595 RPS (P50: 1.00 ms, P99: 3.00 ms)</text>
+      <text class="s tm" x="810" y="506" text-anchor="middle">HTTP/1.1: 149,139 CPS (100% Success across 100k Flows)</text>
+    </g>
+  </g>
+
+  <!-- Legend -->
+  <g class="legend">
+    <rect class="k-nvke" x="40" y="560" width="22" height="16" rx="4"/>
+    <text class="s t" x="70" y="573">High-Performance Protocol Driver</text>
+
+    <rect class="k-nvkr" x="320" y="560" width="22" height="16" rx="4"/>
+    <text class="s t" x="350" y="573">QUIC / Crypto Hardware Offload</text>
+
+    <rect class="k-nv" x="600" y="560" width="22" height="16" rx="4"/>
+    <text class="s t" x="630" y="573">Dynamic Parser / Arena</text>
+
+    <rect class="k-hw" x="830" y="560" width="22" height="16" rx="4"/>
+    <text class="s t" x="860" y="573">Busy-Polling Hardware Loop</text>
+  </g>
+</svg>

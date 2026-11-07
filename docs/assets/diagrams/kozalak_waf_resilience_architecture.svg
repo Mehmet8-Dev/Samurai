@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 Samurai Team. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 620" role="img" aria-labelledby="kozalak-waf-title kozalak-waf-desc">
+  <title id="kozalak-waf-title">Kozalak WAF Resilience &amp; Samurai Autopilot Architecture</title>
+  <desc id="kozalak-waf-desc">Architecture of Kozalak Caddy and Coraza WAF layer tested by Samurai Native C++ RL Closed-Loop Autopilot engine.</desc>
+  <style>
+    text { font-family: "NVIDIA Sans", Arial, Helvetica, sans-serif; }
+    .bg { fill: #FFFFFF; stroke: #E0E0E0; stroke-width: 1; }
+    .t { fill: #1A1A1A; }
+    .tm { fill: #4B4B4B; }
+    .tw { fill: #FFFFFF; }
+    .tk { fill: #000000; }
+    .l { font-size: 14px; font-weight: 600; }
+    .s { font-size: 13px; font-weight: 400; }
+    .gl { font-size: 13px; font-weight: 600; }
+    .k-nvke { fill: #76B900; }
+    .k-nvkr { fill: #952FC6; }
+    .k-nv { fill: #FFFFFF; stroke: #4B4B4B; stroke-width: 1.5; }
+    .k-tp { fill: #E0E0E0; }
+    .k-hw { fill: #4B4B4B; }
+    .k-actor { fill: #FFFFFF; stroke: #757575; stroke-width: 1.5; }
+    .k-nvke-o { fill: #FFFFFF; stroke: #3F8500; stroke-width: 1.5; }
+    .k-nvkr-o { fill: #FFFFFF; stroke: #952FC6; stroke-width: 1.5; }
+    .dash { stroke-dasharray: 5 4; }
+    .g { fill: none; stroke: #757575; stroke-width: 1.5; }
+    .e { fill: none; stroke: #4B4B4B; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+    .ah { fill: #4B4B4B; }
+    .ko { fill: #FFFFFF; }
+    .ll { stroke: #A7A7A7; stroke-width: 1.5; stroke-dasharray: 2 5; stroke-linecap: round; }
+    .band { fill: none; stroke: #757575; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .badge { fill: #F9C500; }
+    .num { fill: #FFFFFF; stroke: #4B4B4B; stroke-width: 1.5; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #1A1A1A; stroke: #313131; }
+      .t { fill: #FFFFFF; }
+      .tm { fill: #A7A7A7; }
+      .k-nv { fill: #1A1A1A; stroke: #A7A7A7; }
+      .k-tp { fill: #313131; }
+      .k-hw { fill: #757575; }
+      .k-actor { fill: #1A1A1A; stroke: #A7A7A7; }
+      .k-nvke-o { fill: #1A1A1A; stroke: #76B900; }
+      .k-nvkr-o { fill: #1A1A1A; stroke: #C359EF; }
+      .g { stroke: #757575; }
+      .e { stroke: #A7A7A7; }
+      .ah { fill: #A7A7A7; }
+      .ko { fill: #1A1A1A; }
+      .ll { stroke: #757575; }
+      .num { fill: #1A1A1A; stroke: #A7A7A7; }
+    }
+</style>
+  
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah" d="M1,1.5 L9,5 L1,8.5 Z"/>
+    </marker>
+    <marker id="ahs" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah" d="M9,1.5 L1,5 L9,8.5 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="1119" height="619" rx="16"/>
+
+  <!-- Top Banner -->
+  <g class="node">
+    <rect class="k-nvke" x="40" y="24" width="1040" height="52" rx="8"/>
+    <text class="l tk" x="560" y="46" text-anchor="middle">Kozalak WAF Resilience &amp; Samurai Closed-Loop Testing Architecture</text>
+    <text class="s tk" x="560" y="64" text-anchor="middle">Caddy v2.11 + Coraza WAF (OWASP CRS v4.7.0) vs. Samurai Native C++ RL Autopilot</text>
+  </g>
+
+  <!-- Left Column: Samurai Closed-Loop Autopilot & Test Engines -->
+  <g class="group">
+    <rect class="g" x="40" y="104" width="320" height="400" rx="12"/>
+    <text class="gl tm" x="56" y="128">Samurai (Shogun) Stress &amp; RL Engine</text>
+
+    <g class="node">
+      <rect class="k-nvkr" x="60" y="148" width="280" height="64" rx="8"/>
+      <text class="l tw" x="200" y="174" text-anchor="middle">Mahoraga IQL Policy Engine</text>
+      <text class="s tw" x="200" y="192" text-anchor="middle">Feed-Forward (FF / mahoraga-ff.srlp)</text>
+      <text class="s tw" x="200" y="206" text-anchor="middle">20-dim State -&gt; 5-dim Action (RPS, Conc)</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvke" x="60" y="228" width="280" height="64" rx="8"/>
+      <text class="l tk" x="200" y="254" text-anchor="middle">samurai_l7_worker (Native C++)</text>
+      <text class="s tk" x="200" y="272" text-anchor="middle">HTTP/1.1 &amp; HTTP/2 Multiplexing</text>
+      <text class="s tk" x="200" y="286" text-anchor="middle">Payload Mutation &amp; JSON Attacks</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvke-o" x="60" y="308" width="280" height="64" rx="8"/>
+      <text class="l t" x="200" y="334" text-anchor="middle">Closed-Loop SLO Guard</text>
+      <text class="s tm" x="200" y="352" text-anchor="middle">p99 Latency &amp; 4xx/5xx Pushback</text>
+      <text class="s tm" x="200" y="366" text-anchor="middle">Multiplicative Backoff &amp; Jump Limiter</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-tp" x="60" y="388" width="280" height="96" rx="8"/>
+      <text class="s t" x="200" y="410" text-anchor="middle">Empirical Benchmark Results</text>
+      <text class="s tm" x="200" y="428" text-anchor="middle">Direct Backend Latency: 2.60 ms</text>
+      <text class="s tm" x="200" y="444" text-anchor="middle">WAF Protected Latency: 4.52 ms (+1.92 ms)</text>
+      <text class="s tm" x="200" y="460" text-anchor="middle">RL Feed-Forward: 430.7 RPS (+48.8%)</text>
+      <text class="s tm" x="200" y="476" text-anchor="middle">AIMD Baseline: 289.4 RPS</text>
+    </g>
+  </g>
+
+  <!-- Center Column: Kozalak Edge & WAF Security Layer -->
+  <g class="group">
+    <rect class="g" x="400" y="104" width="320" height="400" rx="12"/>
+    <text class="gl tm" x="416" y="128">Kozalak Security Edge Layer (WAF)</text>
+
+    <g class="node">
+      <rect class="k-nv" x="420" y="148" width="280" height="64" rx="8"/>
+      <text class="l t" x="560" y="174" text-anchor="middle">Caddy v2.11 Reverse Proxy</text>
+      <text class="s tm" x="560" y="192" text-anchor="middle">Ingress Port: :3455 / :8088</text>
+      <text class="s tm" x="560" y="206" text-anchor="middle">order coraza_waf first (Fixed)</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvkr" x="420" y="228" width="280" height="64" rx="8"/>
+      <text class="l tw" x="560" y="254" text-anchor="middle">Coraza WAF Engine</text>
+      <text class="s tw" x="560" y="272" text-anchor="middle">http.handlers.waf (Go-Native)</text>
+      <text class="s tw" x="560" y="286" text-anchor="middle">Phase 1 &amp; Phase 2 Request Inspection</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-nvkr-o" x="420" y="308" width="280" height="64" rx="8"/>
+      <text class="l t" x="560" y="334" text-anchor="middle">OWASP Core Rule Set v4.7.0</text>
+      <text class="s tm" x="560" y="352" text-anchor="middle">SQLi, XSS, RCE, LFI CRS Rules</text>
+      <text class="s tm" x="560" y="366" text-anchor="middle">JSON Password False-Positive Fixed</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-tp" x="420" y="388" width="280" height="96" rx="8"/>
+      <text class="s t" x="560" y="412" text-anchor="middle">WAF Decision Engine &amp; Egress</text>
+      <text class="s tm" x="560" y="430" text-anchor="middle">Passed Requests: /api/* Proxy</text>
+      <text class="s tm" x="560" y="446" text-anchor="middle">Blocked Attacks: 403 Forbidden</text>
+      <text class="s tm" x="560" y="462" text-anchor="middle">Rate Limited: 429 Too Many Requests</text>
+      <text class="s tm" x="560" y="478" text-anchor="middle">JSON Body Processor Enabled</text>
+    </g>
+  </g>
+
+  <!-- Right Column: Backend Application & Databases -->
+  <g class="group">
+    <rect class="g" x="760" y="104" width="320" height="400" rx="12"/>
+    <text class="gl tm" x="776" y="128">Kozalak Application &amp; Data Tier</text>
+
+    <g class="node">
+      <rect class="k-nv" x="780" y="148" width="280" height="64" rx="8"/>
+      <text class="l t" x="920" y="174" text-anchor="middle">Kozalak Backend (Node.js :3000)</text>
+      <text class="s tm" x="920" y="192" text-anchor="middle">TypeScript, Express / Fastify</text>
+      <text class="s tm" x="920" y="206" text-anchor="middle">Prisma ORM Data Access Layer</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-hw" x="780" y="228" width="280" height="64" rx="8"/>
+      <text class="l tw" x="920" y="254" text-anchor="middle">PostgreSQL + PostGIS (:5099)</text>
+      <text class="s tw" x="920" y="272" text-anchor="middle">Geospatial Routing &amp; User Data</text>
+      <text class="s tw" x="920" y="286" text-anchor="middle">Dedicated DB Port Policy: 5099</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-tp" x="780" y="308" width="280" height="64" rx="8"/>
+      <text class="l t" x="920" y="334" text-anchor="middle">Redis 7 (:6379)</text>
+      <text class="s tm" x="920" y="352" text-anchor="middle">rl:* Distributed Rate Limiter</text>
+      <text class="s tm" x="920" y="366" text-anchor="middle">Session Cache &amp; Token Validation</text>
+    </g>
+
+    <g class="node">
+      <rect class="k-hw" x="780" y="388" width="280" height="96" rx="8"/>
+      <text class="l tw" x="920" y="412" text-anchor="middle">MinIO S3 Object Storage</text>
+      <text class="s tw" x="920" y="430" text-anchor="middle">originals &amp; public Buckets</text>
+      <text class="s tw" x="920" y="446" text-anchor="middle">Environmental Cleanup Route Images</text>
+      <text class="s tw" x="920" y="462" text-anchor="middle">Static Asset Delivery Tier</text>
+    </g>
+  </g>
+
+  <!-- Connecting Edges -->
+  <g class="edge">
+    <path class="e" d="M340,260 L420,260" marker-end="url(#ah)"/>
+    <rect class="ko" x="350" y="250" width="60" height="20" rx="4"/>
+    <text class="s tm elabel" x="380" y="264" text-anchor="middle">L7 Traffic</text>
+  </g>
+  <g class="edge">
+    <path class="e" d="M700,180 L780,180" marker-end="url(#ah)"/>
+    <rect class="ko" x="710" y="170" width="60" height="20" rx="4"/>
+    <text class="s tm elabel" x="740" y="184" text-anchor="middle">/api/*</text>
+  </g>
+  <g class="edge">
+    <path class="e dash" d="M420,340 L340,340" marker-end="url(#ah)"/>
+    <rect class="ko" x="340" y="330" width="80" height="20" rx="4"/>
+    <text class="s tm elabel" x="380" y="344" text-anchor="middle">Pushback</text>
+  </g>
+
+  <!-- Legend at the bottom -->
+  <g class="legend">
+    <rect class="k-nvke" x="40" y="530" width="22" height="16" rx="4"/>
+    <text class="s t" x="70" y="543">Samurai Native Test Engine</text>
+
+    <rect class="k-nvkr" x="280" y="530" width="22" height="16" rx="4"/>
+    <text class="s t" x="310" y="543">WAF Security &amp; AI Policy</text>
+
+    <rect class="k-nv" x="510" y="530" width="22" height="16" rx="4"/>
+    <text class="s t" x="540" y="543">App / Proxy Service</text>
+
+    <rect class="k-hw" x="720" y="530" width="22" height="16" rx="4"/>
+    <text class="s t" x="750" y="543">Database &amp; Storage (Port 5099)</text>
+
+    <rect class="k-tp" x="970" y="530" width="22" height="16" rx="4"/>
+    <text class="s t" x="1000" y="543">Cache &amp; Metrics</text>
+
+    <text class="s tm" x="40" y="580">Kozalak WAF Resilience Benchmark — Samurai (Shogun) Architecture</text>
+  </g>
+</svg>
