@@ -1,31 +1,37 @@
-# 06 - AF_XDP Kernel-Bypass ve Zero-Copy
+# 06 - AF_XDP Kernel-Bypass & Zero-Copy Engine
 
-AF_XDP (XSK - eXpress Data Path Sockets), Linux çekirdeğinin ağ yığınını atlayarak doğrudan ağ kartı halkalarına erişen modern kernel-bypass teknolojisidir.
+AF_XDP (XSK - eXpress Data Path Sockets) is Linux's high-performance kernel-bypass technology that routes network frames directly into user-space memory buffers, bypassing the TCP/IP network stack.
 
----
-
-## 1. Çalışma Prensibi
-
-1. **UMEM Tahsisi:** Kullanıcı alanında (User-Space) büyük bellek blokları (Hugepages / Paged Memory) ayrılır ve UMEM olarak XSK soketine bağlanır.
-2. **Fill & Completion Rings:** Bellek çerçeveleri kernel'a iletilir ve işlenen paketler serbest bırakılır.
-3. **TX Ring:** Hazırlanan paket verisi hiçbir `send()` sistem çağrısı ve kernel kopyalaması olmaksızın doğrudan NIC TX donanım halkasına fırlatılır.
+![Samurai NUMA Topology & Kernel-Bypass Memory Architecture](assets/diagrams/samurai_numa_afxdp_dpdk.svg)
 
 ---
 
-## 2. DDoSamurai AF_XDP Worker (`samurai_afxdp_worker`)
+## 1. Operating Principles
 
-[`afxdp_worker.cpp`](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/DDoSamurai/ddos_samurai/zmq/daemon/afxdp_worker.cpp) bağımsız bir native daemon olarak çalışır:
-
-- **ZMQ Kontrolü:** Master veya CLI'dan gelen `START_JOB` emirlerini alır.
-- **Sıfır Kopyalama:** `libbpf` ve `libxdp` API'leri üzerinden sıfır kopyalı modda (`XDP_ZEROCOPY`) soket bağlar.
-- **CPU & NUMA Pinning:** Ağ kartının bağlı olduğu NUMA düğümündeki izole CPU çekirdeklerine kilitlenir.
+1. **UMEM Memory Allocation:** Contiguous physical memory blocks (Hugepages or Paged memory) are pre-allocated in user-space and registered with the XSK socket.
+2. **Circular Ring Buffers:** Zero-copy synchronization is achieved via four lock-free rings:
+   - **Fill Ring:** Provides vacant memory chunks to the kernel.
+   - **Rx Ring:** Receives packet frame pointers from the network card.
+   - **Tx Ring:** Submits constructed packets directly to the NIC hardware ring.
+   - **Completion Ring:** Notifies user-space when transmission is complete for buffer recycling.
+3. **Zero Kernel Copies:** Frames are transferred directly over PCIe bus lanes via hardware DMA.
 
 ---
 
-## 3. Çalıştırma
+## 2. Samurai AF_XDP Worker (`samurai_afxdp_worker`)
+
+[`afxdp_worker.cpp`](file://ddos_samurai/zmq/daemon/afxdp_worker.cpp) operates as an autonomous native C++ daemon:
+
+- **ZMQ RPC Management:** Receives binary execution parameters (`JobEnvelopeV1`) via local IPC.
+- **Strict Zero-Copy Mode:** Configures sockets in `XDP_ZEROCOPY` mode using `libbpf` and `libxdp`.
+- **NUMA Socket Pinning:** Locks process threads and memory allocations to the specific NUMA node managing the physical network interface.
+
+---
+
+## 3. Operational Invocations
 
 ```bash
-# Gerekli sistem izinleri ve root ile çalıştırma
+# Run with root privileges for raw network namespace access
 sudo ./build/ddos_samurai/cli/samurai \
   --worker afxdp \
   --target 10.0.0.50 \

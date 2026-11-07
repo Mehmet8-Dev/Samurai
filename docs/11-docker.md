@@ -1,31 +1,31 @@
-# 11 - Docker ve Dağıtık Konteyner Mimarisi
+# 11 - Docker & Containerized Distributed Architecture
 
-DDoSamurai, Docker konteynerleri üzerinde hem tekil (standalone) hem de küme (cluster) modunda çalıştırılabilir.
+Samurai can be deployed and scaled across containerized environments using lightweight multi-stage Docker images.
 
 ---
 
-## 1. Docker Compose ile Dağıtık Küme
+## 1. Distributed Multi-Node Cluster via Docker Compose
 
-[`docker-compose.distributed.yml`](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/DDoSamurai/docker-compose.distributed.yml) dosyası Master, Master-Follower (HA), Redis koordinatörü ve çoklu Slave düğümlerini ayağa kaldırır:
+The [`docker-compose.distributed.yml`](file://docker-compose.distributed.yml) configuration orchestrates the Master daemon, HA Follower, Redis state coordinator, and dynamic Slave workers:
 
 ```bash
-# 4 adet Slave düğümü ile başlatma
+# Launch cluster with 4 parallel Slave workers
 docker compose -f docker-compose.distributed.yml up --build --scale slave=4
 ```
 
 ---
 
-## 2. Üretim İmajını Derleme
+## 2. Building Production Images
 
 ```bash
-docker build -f Dockerfile.prod -t ddos-samurai:latest .
+docker build -f Dockerfile.prod -t samurai-runtime:latest .
 ```
 
 ---
 
-## 3. Konteyner Ağ Yetkileri (Capabilities)
+## 3. Container Security Capabilities for Kernel-Bypass
 
-Düşük seviyeli ağ motorları (AF_XDP, raw socket, DPDK) için konteyner başlatılırken aşağıdaki yetkiler tanımlanmalıdır:
+High-performance networking modules (AF_XDP, raw sockets, DPDK PMD) require specific Linux capabilities within container manifests:
 
 ```yaml
 cap_add:

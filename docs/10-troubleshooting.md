@@ -1,45 +1,51 @@
-# 10 - Sorun Giderme (Troubleshooting)
+# 10 - Troubleshooting & Operational Diagnostics
 
-Bu belge, native C++ çalışma zamanında en sık karşılaşılan hata durumlarını ve çözüm adımlarını içerir.
+This guide covers common diagnostic procedures, error symptoms, and resolution steps for the native C++ Samurai runtime.
 
 ---
 
-## 1. ZMQ IPC Soket Erişim Hataları (`/tmp/samurai_jobs_*`)
+## 1. ZMQ IPC Socket Permissions (`/tmp/samurai_jobs_*`)
 
-- **Belirti:** `jobs socket init failed` veya `Permission denied`.
-- **Neden:** `/tmp` altındaki soket dosyalarının önceki bir çalışmadan kalan farklı kullanıcı izinlerine sahip olması.
-- **Çözüm:** Eski soket dosyalarını temizleyin:
+- **Symptom:** `jobs socket init failed` or `Permission denied` on job startup.
+- **Root Cause:** Stale socket files residing in `/tmp` from an earlier test run owned by a different user/UID.
+- **Remediation:** Remove stale socket files and verify permissions:
   ```bash
   rm -f /tmp/samurai_jobs_* /tmp/samurai_events_*
   ```
 
 ---
 
-## 2. AF_XDP / Raw Socket Yetki Hataları (`Operation not permitted`)
+## 2. Kernel-Bypass & AF_XDP Permissions (`Operation not permitted`)
 
-- **Belirti:** `samurai_afxdp_worker` veya raw socket başlatılamıyor.
-- **Neden:** Linux kernel raw paket ve XSK soketleri için `CAP_NET_RAW` / `CAP_NET_ADMIN` veya root yetkisi gerektirir.
-- **Çözüm:** Komutu `sudo` ile çalıştırın veya ilgili ikiliye capability atayın:
+- **Symptom:** `samurai_afxdp_worker` or raw socket initialization fails.
+- **Root Cause:** Creating raw sockets and XDP XSK bindings requires `CAP_NET_RAW` and `CAP_NET_ADMIN` privileges.
+- **Remediation:** Execute via `sudo` or grant persistent Linux capabilities to the compiled binary:
   ```bash
   sudo setcap cap_net_raw,cap_net_admin=eip ./build/ddos_samurai/zmq/daemon/samurai_afxdp_worker
   ```
 
 ---
 
-## 3. Dağıtık Slave Master'a Bağlanamıyor
+## 3. Distributed Slave Fails to Connect to Master
 
-- **Belirti:** `registration with master failed (endpoints=...)`.
-- **Kontrol:**
-  1. Master çalışıyor ve portu (`:5099`) dinliyor mu? (`ss -tulpn | grep 5099`)
-  2. `--cluster-secret` değerleri Master ve Slave üzerinde birebir aynı mı?
-  3. Güvenlik duvarı (UFW / iptables) port erişimini engelliyor mu?
+- **Symptom:** `registration with master failed (endpoints=...)` in slave logs.
+- **Verification Checklist:**
+  1. Confirm `samurai_master` is running and listening on port `5099`:
+     ```bash
+     ss -tulpn | grep 5099
+     ```
+  2. Verify that `--cluster-secret` matches identically on both Master and Slave nodes.
+  3. Verify that host firewalls (`iptables`, `nftables`, `ufw`) permit traffic on TCP port `5099`.
+  4. If CurveZMQ is enabled, verify matching public/private key pairs.
 
 ---
 
-## 4. CMake / Derleme Bağımlılık Eksikleri
+## 4. Build System & Missing Compiler Dependencies
 
-- **Belirti:** `libzmq not found` veya `OpenSSL not found`.
-- **Çözüm:**
+- **Symptom:** CMake reports `libzmq not found` or `OpenSSL not found`.
+- **Remediation:** Install essential development libraries on Ubuntu/Debian:
   ```bash
-  sudo apt-get install -y libzmq3-dev libssl-dev pkg-config build-essential cmake
+  sudo apt-get update && sudo apt-get install -y \
+    libzmq3-dev libssl-dev libbpf-dev libelf-dev \
+    pkg-config build-essential cmake
   ```

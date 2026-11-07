@@ -1,37 +1,37 @@
-# 04 - CPU Packet Builder ve Spoofing Engine
+# 04 - CPU Packet Builder & Traffic Synthesis Engine
 
-CPU Dataplane motorunda paketlerin sentezlenmesi, başlık alanlarının yapılandırılması ve spoofing (kaynak IP sahteciliği) işlemleri tamamen yerel C++ modülü olan [`ddos_samurai/cpu_native/`](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/DDoSamurai/ddos_samurai/cpu_native/) altında yürütülür.
-
----
-
-## 1. Modül Bileşenleri
-
-- **`engine.cpp` / `engine.hpp`:** CPU tabanlı paket üretim motoru ve tampon halkası yöneticisi.
-- **`packets.cpp`:** TCP (SYN, ACK, FIN, RST, XMAS), UDP, ICMP, DNS ve HTTP paketlerinin bayt seviyesinde C++ ile üretimi.
-- **`spoofing.cpp`:** Kaynak IP seçim algoritmaları (Rastgele, CIDR alt ağ, IP listesi, Gerçekçi internet dağılımı).
-- **`amp.cpp`:** Amplifikasyon (Yükseltme) saldırı paket şablonları (DNS, NTP, SSDP, SNMP, Memcached).
-- **`pool.cpp`:** Bellek ayırma (allocation) gecikmesini sıfırlayan önceden ayrılmış paket havuzları.
+In the CPU dataplane, high-speed packet synthesis, dynamic header encoding, and source address permutation are executed natively in C++ within the [`ddos_samurai/cpu_native/`](file://ddos_samurai/cpu_native/) module.
 
 ---
 
-## 2. Desteklenen Protokoller ve Vektörler
+## 1. Subsystem Architecture
 
-### L4 Protokolleri:
-- **TCP:** SYN Flood, ACK Flood, RST Flood, SYN-ACK Flood, Custom TCP Flags.
-- **UDP:** UDP Flood, Generic UDP Payload, DNS Query Flood.
-- **ICMP:** Echo Request (Ping Flood), Unreachable, Redirect.
-
-### L7 & Amplifikasyon Vektörleri:
-- **DNS Amplification:** ANY / TXT sorgu paketleri.
-- **NTP Monlist:** UDP port 123 istekleri.
-- **SSDP M-SEARCH:** UDP port 1900 UPnP keşif istekleri.
-- **Memcached:** UDP port 11211 get/stats istekleri.
+- **`engine.cpp` / `engine.hpp`:** Core packet synthesis engine, buffer ring lifecycle, and pacing governor.
+- **`packets.cpp`:** Byte-level Ethernet, IPv4, TCP (SYN, ACK, FIN, RST, XMAS), UDP, ICMP, DNS, and HTTP frame construction.
+- **`spoofing.cpp`:** Source IP randomization algorithms (Random, Subnet CIDR, Seeded List, Realistic Autonomous System distribution).
+- **`amp.cpp`:** Amplification and reflection attack simulation templates (DNS ANY/TXT, NTP Monlist, SSDP M-SEARCH, SNMP, Memcached).
+- **`pool.cpp`:** Pre-allocated zero-allocation packet pools eliminating runtime memory allocation overhead.
 
 ---
 
-## 3. Spoofing Modları
+## 2. Supported Protocols & Vectors
 
-1. **Random (`random`):** Tamamen rastgele 0.0.0.0 - 255.255.255.255 aralığında kaynak IP üretimi (özel ayrılmış bloklar hariç).
-2. **Subnet (`subnet`):** Belirtilen CIDR bloğu (örneğin `192.168.1.0/24`) içinden rastgele kaynak IP seçimi.
-3. **List (`list`):** Harici bir dosyadan okunan IP listesi üzerinden döngüsel veya rastgele seçim.
-4. **Realistic (`realistic`):** Gerçek internet AS (Autonomous System) dağılımlarına uygun kaynak IP seçimi.
+### L4 Transport Protocols:
+- **TCP:** SYN Floods, ACK Floods, RST Floods, SYN-ACK Floods, Custom Flag combinations.
+- **UDP:** Generic UDP payload floods, high-rate randomized UDP streams, DNS query generation.
+- **ICMP:** Echo Request (Ping), Destination Unreachable, Redirect simulations.
+
+### L7 & Reflection/Amplification Vectors:
+- **DNS Amplification:** Large ANY and TXT query response payloads.
+- **NTP Monlist:** UDP port 123 administrative reflection requests.
+- **SSDP M-SEARCH:** UDP port 1900 UPnP discovery frames.
+- **Memcached:** UDP port 11211 multi-key retrieval commands.
+
+---
+
+## 3. Source IP Permutation Modes
+
+1. **Random (`random`):** Full 32-bit pseudorandom IPv4 generation (excluding RFC 5735 reserved ranges).
+2. **Subnet (`subnet`):** Constrained randomization within a designated CIDR network block (e.g. `192.168.10.0/24`).
+3. **List (`list`):** Iterative or randomized selection from a pre-loaded IP inventory file.
+4. **Realistic (`realistic`):** Weighted IP generation conforming to empirical global Internet Autonomous System (AS) distributions.

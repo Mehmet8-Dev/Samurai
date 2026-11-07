@@ -1,40 +1,45 @@
-# 05 - GPU CUDA ve DOCA GPUNetIO Dataplane
+# 05 - GPU CUDA & DOCA GPUNetIO Hardware Dataplane
 
-GPU ve DPU hızlandırma katmanı, donanım kaynaklarını kullanarak 100Gbps+ hat hızlarında paket üretimi ve akış yönetimi sağlar.
+The GPU and DPU hardware acceleration subsystem leverages massive parallel computing architectures to deliver wire-speed packet synthesis (100Gbps+) and autonomous flow management with zero runtime Host-CPU overhead.
+
+![Samurai GPU-NIC P2P Zero-Copy Dataplane](assets/diagrams/samurai_gpu_p2p_dataplane.svg)
 
 ---
 
-## 1. Bileşenler ve Mimarisi
+## 1. Architectural Components
 
 1. **`samurai_gpu_worker` (`ddos_samurai/zmq/daemon/gpu_worker.cpp`):**
-   - CUDA çekirdekleri (`ddos_samurai/gpu_packet_cuda/`) üzerinde on binlerce GPU iş parçacığıyla (threads) eşzamanlı paket sentezi yapar.
-   - GPU VRAM içinde oluşturulan paket halkaları (packet buffers) GPUDirect veya host-staging üzerinden ağ kartına iletilir.
+   - Utilizes CUDA streaming multiprocessors (`ddos_samurai/gpu_packet_cuda/kernels_l4.cuh`) to synthesize packets across thousands of parallel threads.
+   - Packet buffers generated directly within Vulkan host-visible GDDR6 VRAM are transferred to the NIC via PCIe peer-to-peer (P2P) memory routing.
 
 2. **`samurai_doca_worker` (`ddos_samurai/zmq/daemon/doca_gpunetio_worker.cpp`):**
-   - NVIDIA BlueField DPU ve DOCA GPUNetIO teknolojisiyle ana işlemciyi (Host CPU) tamamen devre dışı bırakır.
-   - GPU VRAM ile DPU NIC RX/TX halkaları arasında sıfır kopyalı (Zero-Copy) doğrudan DMA transferi sağlar.
+   - Combines NVIDIA BlueField DPU and DOCA GPUNetIO technologies to bypass the host operating system completely.
+   - Enables zero-copy direct memory access (DMA) between DPU NIC RX/TX rings and GPU VRAM.
 
 3. **DPU State Runtime (`dpu_state_runtime.hpp`):**
-   - DPU üzerinde çalışan donanım destekli akış tablosu.
-   - TCP durum takibi, pasif açılış ve retransmission kararlarını DPU seviyesinde yönetir.
+   - Hardware-offloaded TCP state table running directly within DPU memory.
+   - Handles TCP connection lifecycles, passive opens, and dynamic retransmission policies.
 
 ---
 
-## 2. Derleme ve Çalıştırma
+## 2. Compilation & Bare-Metal Execution
 
-CUDA ve DOCA desteği CMake derlemesi sırasında otomatik olarak tespit edilir:
+CUDA and DOCA acceleration flags are automatically discovered during CMake configuration:
 
 ```bash
-# GPU Worker ile çalıştırma
+# Execute native GPU CUDA worker
 ./build/ddos_samurai/cli/samurai \
   --worker gpu \
-  --target 10.0.0.50 --port 80 \
-  --protocol tcp --count 20000000 \
+  --target 10.0.0.50 \
+  --port 80 \
+  --protocol tcp \
+  --count 25000000 \
   --confirm
 
-# DOCA GPUNetIO ile çalıştırma
+# Execute DOCA GPUNetIO hardware pipeline
 sudo ./build/ddos_samurai/cli/samurai \
   --worker doca \
-  --target 10.0.0.50 --port 80 \
+  --target 10.0.0.50 \
+  --port 80 \
   --confirm
 ```

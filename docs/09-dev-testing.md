@@ -1,46 +1,47 @@
-# 09 - Geliştirme, CMake Derleme ve Native Testler
+# 09 - Development, CMake Build System & Native Testing
 
-DDoSamurai'nin geliştirme ve test süreçleri CMake tabanlı C++17 derleme sistemi ve yerleşik C++ self-test ikilileri üzerinden yürütülür.
+Samurai development, continuous integration, and validation workflows utilize a modern CMake build system (C++17) coupled with self-contained native C++ test binaries.
 
 ---
 
-## 1. Projeyi Derleme
+## 1. Building the Project
 
 ```bash
-# 1. Derleme dizini oluşturun
+# 1. Create build directory
 mkdir -p build && cd build
 
-# 2. CMake yapılandırmasını çalıştırın (Release veya Debug)
+# 2. Configure with CMake (Release mode recommended for line-rate performance)
 cmake .. -DCMAKE_BUILD_TYPE=Release
 
-# 3. Tüm hedefleri paralel derleyin
+# 3. Compile all targets in parallel
 make -j$(nproc)
 ```
 
 ---
 
-## 2. Native C++ Self-Testleri Çalıştırma
+## 2. Running Native C++ Test Suites
 
-Her ana alt sistem için ayrı bir self-test sürücüsü derlenir:
+Each major architectural layer includes a standalone native validation harness:
 
 ```bash
-# 1. Control Plane ve Sharding Testleri
+# 1. Control Plane, Shard Engine, and RPC Wire Tests
 ./build/ddos_samurai/control/samurai_control_selftest
 
-# 2. L7 Emülasyon ve Custom TCP Testleri
+# 2. L7 Stateful Transport, QUIC, and Custom TCP Tests
 ./build/ddos_samurai/l7_emu_native/samurai_l7_selftest
 
-# 3. Scenario Engine (DSL / Scheduler / SLA) Testleri
+# 3. Scenario Engine (DSL, Compiler, and SLA Gates)
 ./build/ddos_samurai/scenario_engine_native/samurai_scenario_engine_selftest
 
-# 4. Lisanslama ve Yetkilendirme Testleri
+# 4. Licensing, HMAC, and Access Token Tests
 ./build/ddos_samurai/licensing/samurai_licensing_selftest
 ```
 
 ---
 
-## 3. Kod Standartları
+## 3. Engineering & Performance Standards
 
-- **Standart:** Modern C++17.
-- **Kütüphaneler:** ZeroMQ (`libzmq`), OpenSSL (Kriptografi/JWT), POSIX Soketleri.
-- **Performans:** Lock-free / Lock-striped veri yapıları, zero-copy tampon geçişleri, heap allocation minimizasyonu.
+- **Language Standard:** Strict C++17 without proprietary compiler extensions.
+- **Dependencies:** ZeroMQ (`libzmq`), OpenSSL (TLS 1.3 / HMAC / SHA-256), `libbpf` (AF_XDP).
+- **Zero-Allocation Paradigm:** Zero runtime allocations (`malloc`/`new`) along fastpath TX/RX packet pipelines.
+- **Lock-Free Concurrency:** Single-Producer Single-Consumer (SPSC) ring buffers and lock-striped shard structures.

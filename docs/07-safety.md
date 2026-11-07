@@ -1,40 +1,43 @@
-# 07 - Hedef Güvenliği (Target Safety) ve RFC Kontrolleri
+# 07 - Target Safety & RFC Compliance Verification
 
-DDoSamurai, testlerin yanlışlıkla yetkisiz hedeflere yönlendirilmesini ve kontrolsüz trafik üretimini engellemek için yerleşik güvenlik mekanizmalarına (`ddos_samurai/core/target_safety.cpp` ve `ddos_samurai/cli/validation.cpp`) sahiptir.
-
----
-
-## 1. Hedef Güvenlik Kuralları
-
-- **Özel / Yerel Ağ Koruması (Default Private):**
-  Varsayılan olarak yalnızca loopback (`127.0.0.0/8`), özel yerel ağlar (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) ve lab IP bloklarına izin verilir.
-- **Genel (Public) IP Koruması:**
-  İnternete açık genel IP adreslerine test yapılabilmesi için `--allow-public-target` bayrağının açıkça belirtilmesi zorunludur.
-- **Genel Yasaklı Bloklar (Global Denylist):**
-  Kritik internet altyapıları (örneğin DNS root sunucuları, acil durum ağları vb.) ve `--safety-global-deny-target` ile girilen CIDR blokları asla hedeflenemez; bu kurallar allowlist kurallarını ezer.
+Samurai enforces strict safety boundaries (`ddos_samurai/core/target_safety.cpp` and `ddos_samurai/cli/validation.cpp`) to prevent accidental transmission to unauthorized subnets or critical public infrastructure.
 
 ---
 
-## 2. Güvenlik Bayrakları
+## 1. Safety Boundary Enforcement
+
+- **Default Private Allowlist:**
+  By default, test execution is restricted strictly to loopback (`127.0.0.0/8`), private RFC 1918 subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and configured lab IP blocks.
+- **Explicit Public Destination Flag:**
+  Transmitting packets to routable Internet IP addresses strictly requires the `--allow-public-target` parameter along with interactive or command-line confirmation (`--confirm`).
+- **Global Inviolable Denylist:**
+  Critical public infrastructure ranges (e.g. root DNS nameservers, government/emergency IP blocks, loopback broadcast) and subnets configured via `--safety-global-deny-target` can never be targeted under any condition, overriding any allowlist configuration.
+
+---
+
+## 2. Safety Command Flags
 
 ```bash
-# Sadece belirli bir alt ağa izin verme
+# Allow tests only against an explicitly defined lab subnet
 ./build/ddos_samurai/cli/samurai --allow-target 192.168.10.0/24 ...
 
-# Belirli bir alt ağı tamamen yasaklama
+# Explicitly ban a production management subnet
 ./build/ddos_samurai/cli/samurai --safety-global-deny-target 10.0.0.0/24 ...
 
-# Kamu/İnternet hedefine bilinçli onay
+# Authorized public target testing
 ./build/ddos_samurai/cli/samurai --allow-public-target --target 203.0.113.10 ...
 ```
 
 ---
 
-## 3. RFC Uyumluluk Testleri (`rfc_suite.cpp`)
+## 3. RFC Compliance Validation (`rfc_suite.cpp`)
 
-Paket sentezleme motorlarının doğruluğunu ve anomali filtrelerini test etmek için RFC uygunluk paketleri çalıştırılabilir:
+To verify the mathematical and structural correctness of synthesized packet headers, operators can run built-in RFC validation suites:
 
 ```bash
+# Verify compliant RFC packet structures
 ./build/ddos_samurai/cli/samurai --rfc-suite positive
+
+# Verify packet filters and anomaly rejection
 ./build/ddos_samurai/cli/samurai --rfc-suite negative
 ```

@@ -1,30 +1,30 @@
-# 08 - Konfigürasyon ve Profil Yapılandırması
+# 08 - Configuration & Test Profile Management
 
-Native CLI ve Daemon'lar, komut satırı bayrakları, JSON test profilleri ve ortam değişkenleri (Environment Variables) üzerinden yapılandırılır.
+The Samurai CLI and background daemons are configured via command-line arguments, JSON test profiles, and standard environment variables.
 
 ---
 
-## 1. Test Profilleri (`profiles.cpp`)
+## 1. Test Profiles (`profiles.cpp`)
 
-Sık kullanılan test kalıpları hazır profiller halinde kaydedilebilir veya çağrılabilir:
+Common test configurations and benchmarks can be executed via pre-compiled profiles:
 
 ```bash
-# Mevcut profilleri listeleme
+# List all built-in and discovered profiles
 ./build/ddos_samurai/cli/samurai --list-profiles
 
-# Belirli bir profili çalıştırma
+# Run a specific benchmark profile
 ./build/ddos_samurai/cli/samurai --profile dedicated_lab --confirm
 ```
 
 ---
 
-## 2. Ortam Değişkenleri (Environment Variables)
+## 2. Environment Variables Reference
 
-| Değişken Adı | Varsayılan | Açıklama |
-| :--- | :--- | :--- |
-| `SAMURAI_CLUSTER_SECRET` | Boş | Master ve Slave düğümleri arasındaki ortak doğrulama anahtarı. |
-| `SAMURAI_JWT_SECRET` | Boş | Management API ve Control Plane için HMAC-SHA256 gizli anahtarı. |
-| `SAMURAI_XDP_INTERFACE` | Boş | AF_XDP motorunun bağlanacağı ağ kartı arayüzü (örneğin `eth0`). |
-| `SAMURAI_XDP_QUEUE_ID` | `0` | Bağlanılacak NIC kuyruk numarası. |
-| `SAMURAI_L7_TRANSPORT` | `kernel_socket` | L7 için transport seçimi (`kernel_socket`, `custom_tcp`, `custom_quic`). |
-| `SAMURAI_TENANT_NAMESPACE` | `default` | Çoklu kiracı (Multi-tenant) izolasyon alanı. |
+| Variable Name | Default | Description |
+|:---|:---|:---|
+| `SAMURAI_CLUSTER_SECRET` | None | Shared cluster authentication key between Master and Slave nodes. |
+| `SAMURAI_JWT_SECRET` | None | Secret key used for HMAC-SHA256 JWT tokens on the Management REST API. |
+| `SAMURAI_XDP_INTERFACE` | None | Target network interface for AF_XDP kernel-bypass (e.g. `eth0`, `ens1f0`). |
+| `SAMURAI_XDP_QUEUE_ID` | `0` | Physical hardware queue index to bind. |
+| `SAMURAI_L7_TRANSPORT` | `kernel_socket` | Transport backend for L7 emulation (`kernel_socket`, `custom_tcp`, `custom_quic`). |
+| `SAMURAI_TENANT_NAMESPACE` | `default` | Multi-tenant namespace boundary for resource isolation. |

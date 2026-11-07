@@ -1,26 +1,26 @@
-# 12 - İzleme, Grafana ve Telemetri Görünürlüğü
+# 12 - Telemetry Visibility, Prometheus & Grafana Dashboards
 
-DDoSamurai, çalışma zamanı metriklerini hem anlık CLI üzerinden hem de Prometheus ve Grafana üzerinden izlenebilir kılar.
+Samurai exposes real-time dataplane metrics through an embedded Prometheus exporter, Server-Sent Events (SSE), WebSockets, and pre-configured Grafana monitoring dashboards.
 
 ---
 
-## 1. İzleme Mimarisi
+## 1. Observability Subsystem
 
-1. **Prometheus Metrik Çıkışı:**
-   Master ve Management API (`:8089/metrics`), kümedeki tüm worker'ların paket/istek oranlarını (RPS/pps), hata sayılarını, retransmission ve latency istatistiklerini Prometheus formatında sunar.
+1. **Prometheus Exporter (`:8089/metrics`):**
+   The Management API exposes aggregated telemetry across all active workers, including packet/request throughput (pps / RPS), transmission errors, TCP retransmits, and p50/p95/p99 latency percentiles.
 
-2. **Grafana Dashboardları:**
-   `monitoring/` dizinindeki hazır Docker Compose stack'i Prometheus ve önceden yapılandırılmış Grafana panellerini barındırır:
+2. **Grafana Monitoring Stack:**
+   A complete monitoring stack is available in the `monitoring/` directory:
    ```bash
    cd monitoring && docker compose up -d
    ```
-   - Prometheus UI: `http://localhost:9090`
-   - Grafana UI: `http://localhost:3000`
+   - **Prometheus UI:** `http://localhost:9090`
+   - **Grafana Dashboards:** `http://localhost:3000`
 
 ---
 
-## 2. Canlı Olay Akışı (Live Streaming)
+## 2. Real-Time Telemetry Streams
 
-Management API üzerinden anlık durum güncellemeleri Server-Sent Events (SSE) ve WebSocket protokolleriyle alınabilir:
-- `GET /v1/cluster/live/sse`
-- `WS /v1/cluster/live/ws`
+High-frequency cluster events can be consumed live via standard protocols:
+- **Server-Sent Events (SSE):** `GET /v1/cluster/live/sse`
+- **WebSocket Feed:** `WS /v1/cluster/live/ws`

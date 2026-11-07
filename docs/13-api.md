@@ -1,31 +1,33 @@
-# 13 - Native HTTP Management API (`:8089`)
+# 13 - Native HTTP Management REST API (`:8089`)
 
-Master düğümünde `--management-listen` parametresi verildiğinde devreye giren Management API, saf POSIX socket tabanlı, sıfır harici web kütüphanesi bağımlılığına sahip yerel bir C++ HTTP REST sunucusudur (`ddos_samurai/control/management_api.cpp`).
+When launched with `--management-listen`, `samurai_master` initializes an embedded, zero-dependency C++ HTTP REST server built directly upon POSIX non-blocking sockets (`ddos_samurai/control/management_api.cpp`).
 
----
-
-## 1. REST Endpointleri
-
-| Metot | Yol | Açıklama |
-| :--- | :--- | :--- |
-| `GET` | `/healthz` | Sunucu sağlık kontrolü (`200 OK`). |
-| `GET` | `/v1/cluster/summary` | Bağlı worker sayısı, aktif shard'lar ve toplam metrik özeti. |
-| `GET` | `/v1/cluster/workers` | Kayıtlı tüm worker'ların detaylı listesi ve son heartbeat zamanları. |
-| `GET` | `/v1/cluster/shards` | Çalışan veya tamamlanan iş parçalarının (shards) durumu. |
-| `POST` | `/v1/jobs/abort` | Yürütülmekte olan aktif test/saldırı işini anında durdurma. |
-| `POST` | `/v1/cluster/provision` | Uzak sunuculara SSH ile tetikleme bağlantısı atarak (`curl \| sh`) otomatik agent provizyonu. |
-| `GET` | `/v1/agent/install` | Zero-Install ajan kurulum kabuk (POSIX sh) betiği. |
-| `GET` | `/v1/agent/manifest` | HMAC-SHA256 imzalı worker manifest dosyası. |
-| `GET` | `/v1/agent/blob` | İmzalı ikili blob indirme uç noktası. |
-| `GET` | `/metrics` | Prometheus uyumlu ham metrik çıktısı. |
-| `GET` | `/v1/cluster/live/sse` | Server-Sent Events (SSE) ile canlı küme durumu akışı. |
-| `GET` | `/v1/cluster/live/ws` | WebSocket ile canlı durum akışı. |
+![Samurai Distributed Security & Control Plane](assets/diagrams/samurai_distributed_security.svg)
 
 ---
 
-## 2. Kimlik Doğrulama ve Yetkilendirme (Auth)
+## 1. REST Endpoints Specification
 
-API istekleri 3 yöntemden biriyle yetkilendirilebilir:
-1. **Role Token:** `Authorization: Bearer <ADMIN_OR_OPERATOR_TOKEN>`
-2. **HMAC-SHA256 JWT:** OpenSSL ile doğrulanmış tenant ve role claim'leri.
-3. **Trusted Identity Headers:** Kurumsal ters vekil sunucuların (Reverse Proxy / OIDC) ilettiği `X-Forwarded-User` ve `X-Forwarded-Roles` başlıkları.
+| Method | Route | Description |
+|:---|:---|:---|
+| `GET` | `/healthz` | Health check endpoint returning `200 OK`. |
+| `GET` | `/v1/cluster/summary` | Cluster state overview: active worker counts, running shards, and throughput summary. |
+| `GET` | `/v1/cluster/workers` | Detailed list of registered worker nodes and their last heartbeat timestamps. |
+| `GET` | `/v1/cluster/shards` | Status of in-flight and completed workload shards. |
+| `POST` | `/v1/jobs/abort` | Emergency abort trigger halting active stress test jobs across all workers. |
+| `POST` | `/v1/cluster/provision` | Automated remote SSH agent provisioning trigger (`curl \| sh`). |
+| `GET` | `/v1/agent/install` | Shell installation script for zero-install ephemeral agents. |
+| `GET` | `/v1/agent/manifest` | HMAC-SHA256 signed worker manifest. |
+| `GET` | `/v1/agent/blob` | Authenticated binary payload download endpoint. |
+| `GET` | `/metrics` | Prometheus-compatible raw text metrics feed. |
+| `GET` | `/v1/cluster/live/sse` | Server-Sent Events (SSE) live telemetry stream. |
+| `GET` | `/v1/cluster/live/ws` | Real-time bidirectional WebSocket event stream. |
+
+---
+
+## 2. Authentication & Authorization Boundaries
+
+API requests are authorized via three complementary mechanisms:
+1. **Role Token Header:** `Authorization: Bearer <ADMIN_OR_OPERATOR_TOKEN>`
+2. **HMAC-SHA256 JWT:** Signed tenant, role, and expiration claims verified via OpenSSL.
+3. **Trusted Reverse-Proxy Headers:** Enterprise proxy integration reading `X-Forwarded-User` and `X-Forwarded-Roles` over authenticated local networks.

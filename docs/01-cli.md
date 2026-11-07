@@ -1,29 +1,31 @@
-# 01 - Native CLI (`samurai`) Kullanımı
+# 01 - Native CLI (`samurai`) Reference
 
-`samurai`, DDoSamurai platformunun C++ ile derlenmiş ana komut satırı arayüzüdür (`ddos_samurai/cli/main.cpp`).
+`samurai` is the high-performance native command-line interface for the Samurai network resilience and stress-testing platform, compiled from C++17 source code (`ddos_samurai/cli/main.cpp`).
+
+![Samurai CLI Execution & Worker Lifecycle](assets/diagrams/samurai_cli_lifecycle.svg)
 
 ---
 
-## 1. Temel Kullanım Sözdizimi
+## 1. Syntax & Core Parameters
 
 ```bash
-./build/ddos_samurai/cli/samurai --worker <cpu|gpu|dpdk|afxdp|doca|l7|defense|scenario> [seçenekler]
+./build/ddos_samurai/cli/samurai --worker <cpu|gpu|dpdk|afxdp|doca|l7|defense|scenario> [options]
 ```
 
-### Zorunlu / Temel Parametreler
-
-- `--worker <kind>`: Çalıştırılacak native motor türü (`cpu`, `afxdp`, `dpdk`, `gpu`, `doca`, `l7`, `scenario`, `defense`).
-- `--target <IP>`: Hedef IPv4 adresi (Varsayılan: `127.0.0.1`).
-- `--port <N>`: Hedef port (Varsayılan: `80`).
-- `--protocol <P>`: Protokol adı (`tcp`, `udp`, `icmp`, `http1`, `http2`, `quic`, `dns`).
-- `--count <N>`: Gönderilecek toplam paket veya istek sayısı.
-- `--confirm`: Etik onay uyarısını atlayarak testi başlatır.
+### Essential Parameters
+- `--worker <kind>`: Native dataplane engine (`cpu`, `afxdp`, `dpdk`, `gpu`, `doca`, `l7`, `scenario`, `defense`).
+- `--target <IP>`: Target IPv4 destination (Default: `127.0.0.1`).
+- `--port <N>`: Destination port (Default: `80`).
+- `--protocol <P>`: Network protocol (`tcp`, `udp`, `icmp`, `http1`, `http2`, `quic`, `dns`).
+- `--count <N>`: Total packet or request count.
+- `--rate <RPS>`: Target transmission rate pacing (packets/requests per second).
+- `--confirm`: Mandatory flag to confirm authorization and proceed with test execution.
 
 ---
 
-## 2. Yaygın Kullanım Örnekleri
+## 2. Common Usage Scenarios
 
-### A) CPU Raw Socket ile UDP Testi
+### A) CPU Raw Socket UDP Stress Test
 ```bash
 ./build/ddos_samurai/cli/samurai \
   --worker cpu \
@@ -35,18 +37,29 @@
   --confirm
 ```
 
-### B) AF_XDP Kernel-Bypass ile Ultra Hızlı Test
+### B) Kernel-Bypass AF_XDP Line-Rate Packet Generation
 ```bash
 sudo ./build/ddos_samurai/cli/samurai \
   --worker afxdp \
   --target 10.0.0.50 \
   --port 80 \
   --protocol tcp \
-  --count 5000000 \
+  --count 10000000 \
   --confirm
 ```
 
-### C) L7 HTTP/2 Stres Testi
+### C) Hardware-Offloaded DPDK PMD Ring Burst
+```bash
+sudo ./build/ddos_samurai/cli/samurai \
+  --worker dpdk \
+  --target 10.0.0.50 \
+  --port 443 \
+  --protocol tcp \
+  --count 50000000 \
+  --confirm
+```
+
+### D) Stateful L7 HTTP/2 Multiplexed Load
 ```bash
 ./build/ddos_samurai/cli/samurai \
   --worker l7 \
@@ -56,33 +69,28 @@ sudo ./build/ddos_samurai/cli/samurai \
   --scheme https \
   --concurrency 100 \
   --max-connections 50 \
-  --count 200000 \
+  --count 500000 \
   --confirm
 ```
 
-### D) Scenario Engine (Web/Mobile Persona) Testi
+### E) GPU CUDA Persistent Dataplane Egress
 ```bash
 ./build/ddos_samurai/cli/samurai \
-  --worker scenario \
+  --worker gpu \
   --target 10.0.0.50 \
-  --scenario-payload-ref docs/scenario_web_mobile.yaml \
-  --count 50000 \
+  --port 80 \
+  --protocol tcp \
+  --count 25000000 \
   --confirm
 ```
 
 ---
 
-## 3. Güvenlik ve Doğrulama Bayrakları
+## 3. Exit Codes & Telemetry Formatting
 
-- `--allow-public-target`: Genel (Public) IP adreslerine test gönderimine izin verir (Varsayılan olarak sadece yerel/özel IP'lere izin verilir).
-- `--allow-target <CIDR>`: İzin verilen IP/Subnet listesi tanımlar.
-- `--safety-global-deny-target <CIDR>`: Asla trafik gönderilmeyecek IP bloklarını kilitler.
-
----
-
-## 4. Özel Test Modları
-
-- `--self-test`: Dahili self-testleri çalıştırır.
-- `--list-profiles`: Önceden tanımlanmış test profillerini listeler.
-- `--profile <name>`: Belirtilen profili yükler.
-- `--rfc-suite <suite>`: RFC uyumluluk test paketini çalıştırır.
+The CLI outputs JSON-compatible summary metrics on completion:
+- `0x00`: Success (`KPI_PASS`). All packets sent within rate and SLA parameters.
+- `0x01`: General error or argument parsing failure.
+- `0x02`: Safety boundary violation (`TargetSafety` rejected destination IP).
+- `0x03`: Hardware preflight failure (e.g. Missing NUMA node or AF_XDP interface).
+- `0xFF`: Aborted by operator or emergency shutdown signal.

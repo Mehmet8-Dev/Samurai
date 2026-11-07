@@ -1,217 +1,203 @@
-# Samurai (Shogun) — Native C++ Network Stress & Security Test Platform
+# Samurai Network Resilience & Line-Rate Stress Platform
 
-Samurai (Sürüm 2.2+, Kod adı: **Shogun**), **yalnızca yetkili lab ve güvenlik testi ortamlarında** kullanılmak üzere geliştirilmiş, yüksek başarımlı (high-throughput), düşük gecikmeli (low-latency) ve modüler bir ağ stres ve dayanıklılık test platformudur.
+Samurai (Release 2.2+, Codename: **Shogun**) is an enterprise-grade, high-performance network resilience and line-rate stress testing platform designed strictly for authorized lab and infrastructure validation environments.
 
-Platform, Python bağımlılıklarından arındırılarak tamamen modern **C++ (C++17)**, **ZeroMQ (ZMQ) binary IPC wire protocol**, **Kernel-Bypass (AF_XDP, DPDK)**, **GPU/CUDA paket sentezi** ve **User-Space TCP/L7 motorları** ile çalışan native mimariye dönüştürülmüştür.
-
----
-
-## Temel Özellikler
-
-- **Saf Native C++ Çalışma Zamanı:** Sıfır Python çalışma zamanı gecikmesi; C++17 ile derlenen mikroservis mimarisi.
-- **Native CLI Front-End (`samurai`):** Güçlü argüman doğrulama, KPI gate kontrolleri, RFC paket testleri ve profil yönetimi.
-- **Dağıtık Control-Plane (`samurai_master` & `samurai_slave`):**
-  - ZMQ ROUTER/DEALER tabanlı asenkron RPC haberleşmesi.
-  - Dinamik iş parçalama (Sharding - eşit, kapasite, bölge bazlı).
-  - High Availability (HA) lider seçimi (Static ve File-Lease).
-  - Multi-Master & Multi-Region koordinatörü.
-  - Saf POSIX soket tabanlı yerleşik HTTP REST Management API (`:8089`).
-  - OpenSSL HMAC-SHA256 ile HS256 JWT ve RBAC yetkilendirme.
-  - Tahrif edilemez (tamper-evident) SHA-256 denetim günlüğü (Audit Log).
-- **Yüksek Başarımlı Dataplane Motorları:**
-  - **L4 User-Space TCP Stack (`tcp_dataplane_core`):** 64-shard kilit şeritli (lock-striped) flow tablosu, out-of-order paket işleme, timer-wheel retransmit.
-  - **AF_XDP (Kernel-Bypass):** Linux XSK / UMEM zero-copy ring bufferları üzerinden Mpps seviyesinde paket iletimi.
-  - **DPDK:** PMD ring tabanlı donanım hızlandırma.
-  - **GPU CUDA & DOCA GPUNetIO:** Donanım hızlandırmalı paket üretimi ve DPU akış yönetimi.
-  - **L7 Emülasyon Native (`l7_emu_native`):** HTTP/1.1, HTTP/2 (nghttp2), QUIC / HTTP/3 (ngtcp2) ve DNS motorları (Kernel socket veya Custom TCP/AF_XDP modları).
-  - **Scenario Engine Native (`scenario_engine_native`):** Web/Mobil persona tabanlı çok adımlı kullanıcı davranışları ve SLA denetleyicisi.
-  - **CPU Native Packet Engine (`cpu_native`):** Raw socket / packet ring optimizasyonu, dinamik spoofing ve amplifikasyon jeneratörleri.
+The platform is engineered in modern **C++ (C++17)** with zero runtime Python latency, featuring a **ZeroMQ (ZMQ) binary IPC wire protocol**, **Kernel-Bypass (AF_XDP, DPDK)** drivers, **NVIDIA CUDA & DOCA GPUNetIO packet synthesis**, and a **64-shard Userspace TCP/L7 engine**.
 
 ---
 
-## Mimari Şema
+## Key Capabilities
 
-```mermaid
-graph TD
-    subgraph Control Plane
-        Master[samurai_master Daemon]
-        MgmtAPI[Native HTTP Management API :8089]
-        Master -->|ZMQ ROUTER :5099| Slave[samurai_slave Daemon]
-    end
+- **Pure Native C++17 Runtime:** Zero Python runtime overhead; compiled microservice architecture with direct OS and hardware integration.
+- **Native CLI Front-End (`samurai`):** Robust argument validation, strict KPI performance gates, RFC compliance benchmark suites, and profile management.
+- **Distributed Control Plane (`samurai_master` & `samurai_slave`):**
+  - Asynchronous ZMQ ROUTER/DEALER RPC message broker.
+  - Dynamic workload sharding (even, capacity-based, and geo-locality aware).
+  - High Availability (HA) leader election (Static and File-Lease).
+  - Multi-Master and inter-region cluster federation.
+  - Native POSIX-socket HTTP REST Management API (`:8089`).
+  - Cryptographic HMAC-SHA256 JWT authentication and Role-Based Access Control (RBAC).
+  - Tamper-evident SHA-256 audit logging.
+- **High-Throughput Dataplane Engines:**
+  - **L4 Userspace TCP Stack (`tcp_dataplane_core`):** 64-shard lock-striped connection flow table, out-of-order reassembly, timer-wheel fast retransmission.
+  - **AF_XDP (Kernel-Bypass):** Linux XSK / UMEM zero-copy ring buffers delivering wire-rate Mpps throughput.
+  - **DPDK:** Poll Mode Driver (PMD) hardware ring acceleration with hugepages.
+  - **GPU CUDA & DOCA GPUNetIO:** Warp-parallel packet generation and DPU offloaded memory streaming.
+  - **L7 Stateful Emulation (`l7_emu_native`):** Native HTTP/1.1, HTTP/2 (nghttp2), QUIC / HTTP/3 (ngtcp2), and DNS engines.
+  - **Scenario Engine (`scenario_engine_native`):** Multi-step persona user emulation, stateful session workflows, and microsecond SLA compliance tracking.
+  - **CPU Native Packet Engine (`cpu_native`):** Raw socket / packet ring optimization with dynamic spoofing and amplification generators.
 
-    subgraph Native CLI & Local Supervisor
-        CLI[samurai CLI] -->|ZMQ IPC / Unix Sockets| Supervisor[Supervisor Engine]
-    end
+---
 
-    Slave -->|Spawns / Manages| Supervisor
+## Architectural Topology
 
-    subgraph ZMQ Native Workers
-        Supervisor --> W_CPU[samurai_cpu_worker]
-        Supervisor --> W_AFXDP[samurai_afxdp_worker]
-        Supervisor --> W_DPDK[samurai_dpdk_worker]
-        Supervisor --> W_GPU[samurai_gpu_worker]
-        Supervisor --> W_DOCA[samurai_doca_worker]
-        Supervisor --> W_L7[samurai_l7_worker]
-        Supervisor --> W_SCENARIO[samurai_scenario_worker]
-        Supervisor --> W_DEFENSE[samurai_defense_worker]
-    end
+![Samurai End-to-End System Architecture](docs/assets/diagrams/samurai_system_architecture.svg)
 
-    subgraph Hardware & Kernel Bypass Dataplane
-        W_AFXDP -->|Zero-Copy UMEM| NIC[Ağ Kartı / NIC]
-        W_DPDK -->|PMD Driver / VFIO| NIC
-        W_GPU -->|CUDA Stream / GPUDirect| GPU[NVIDIA GPU]
-        W_L7 -->|User-Space TCP Stack| W_AFXDP
-    end
+<details>
+<summary>System Dataflow Overview</summary>
+
 ```
+[CLI / REST API] 
+       │ (ZMQ / POSIX HTTP)
+       ▼
+[Master / Slave Control Plane]
+       │ (ZMQ RPC Wire Protocol)
+       ▼
+[Native Worker Orchestrator & Supervisor]
+       ├──> AF_XDP Worker  ──────> [Zero-Copy UMEM] ──> [NIC Ring]
+       ├──> DPDK PMD Worker ─────> [Hugepages Ring] ───> [Physical Wire]
+       ├──> GPU / DOCA Worker ───> [VRAM / GPUNetIO] ──> [PCIe Gen4/5 DPU]
+       ├──> L7 Stateful Worker ──> [nghttp2/ngtcp2] ───> [Target App]
+       └──> Scenario Worker ─────> [Stateful Persona] ─> [Target Service]
+```
+</details>
 
 ---
 
-## Derleme (Build)
+## Prerequisites & Compilation
 
-### Gereksinimler
+### System Requirements
+- **Operating System:** Linux (Ubuntu 20.04+, Debian 11+, RHEL 8+)
+- **Compiler:** GCC 9+ or Clang 10+ (C++17 compliant)
+- **Build System:** CMake 3.16+ and Make / Ninja
+- **Core Libraries:** `libzmq3-dev`, `libssl-dev`, `pkg-config`, `build-essential`
+- **Optional Acceleration Drivers:**
+  - AF_XDP: `libbpf-dev`, `libelf-dev`
+  - HTTP/2 & QUIC: `libnghttp2-dev`, `libngtcp2-dev`
+  - DPDK: `libdpdk-dev`
+  - CUDA: NVIDIA CUDA Toolkit (12.x+)
 
-- **İşletim Sistemi:** Linux (Ubuntu 20.04+, Debian 11+, RHEL 8+)
-- **Derleyici:** GCC 9+ veya Clang 10+ (C++17 standardı)
-- **Yapı Sistemi:** CMake 3.16+ ve Make / Ninja
-- **Kütüphaneler:** `libzmq3-dev`, `libssl-dev`, `pkg-config`, `build-essential`
-- **Opsiyonel Kütüphaneler:**
-  - AF_XDP için: `libbpf-dev`, `libelf-dev`
-  - HTTP/2 & QUIC için: `libnghttp2-dev`, `libngtcp2-dev`
-  - DPDK için: `libdpdk-dev`
-  - CUDA için: NVIDIA CUDA Toolkit (12.x+)
-
-### Derleme Adımları
+### Build Procedure
 
 ```bash
-# Bağımlılıkları yükleyin (Ubuntu/Debian)
-sudo apt-get update
-sudo apt-get install -y build-essential cmake pkg-config libzmq3-dev libssl-dev libbpf-dev libelf-dev
+# Install dependencies (Ubuntu/Debian)
+sudo apt update && sudo apt install -y build-essential cmake pkg-config libzmq3-dev libssl-dev
 
-# Derleme dizinini oluşturun ve derleyin
+# Clone repository and create build directory
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
-Derleme sonucunda `build/` altında aşağıdaki ikili dosyalar oluşur:
-- `build/ddos_samurai/cli/samurai` (Ana CLI)
-- `build/ddos_samurai/control/daemon/samurai_master` (Master Daemon)
-- `build/ddos_samurai/control/daemon/samurai_slave` (Slave Daemon)
-- `build/ddos_samurai/zmq/daemon/samurai_*_worker` (Tüm Dataplane Worker ikilileri)
-- `build/ddos_samurai/*_selftest` (Bileşen birim testleri)
+The build produces the following native binaries under `build/`:
+- `build/ddos_samurai/cli/samurai` (Primary CLI tool)
+- `build/ddos_samurai/control/daemon/samurai_master` (Distributed Master daemon)
+- `build/ddos_samurai/control/daemon/samurai_slave` (Distributed Worker node daemon)
+- `build/ddos_samurai/zmq/daemon/samurai_*_worker` (All native dataplane worker engines)
+- `build/ddos_samurai/*_selftest` (Unit test and self-test verification suites)
 
 ---
 
-## Kullanım
+## Usage Guide
 
-### 1) Standart CLI ile Test Başlatma (`samurai`)
+### 1) Standalone CLI Execution (`samurai`)
 
 ```bash
-# CPU worker ile temel UDP flood testi
+# High-speed UDP packet test via CPU engine
 ./build/ddos_samurai/cli/samurai \
   --worker cpu \
-  --target 127.0.0.1 --port 8080 \
-  --protocol udp --count 100000 \
+  --target 192.168.1.100 \
+  --port 80 \
+  --protocol udp \
+  --count 1000000 \
   --confirm
 
-# AF_XDP Kernel-Bypass ile ultra yüksek hızlı paket testi
-sudo ./build/ddos_samurai/cli/samurai \
+# AF_XDP Kernel-Bypass zero-copy line-rate test
+./build/ddos_samurai/cli/samurai \
   --worker afxdp \
-  --target 10.0.0.50 --port 80 \
-  --protocol tcp --count 5000000 \
+  --target 10.0.0.1 \
+  --interface eth0 \
+  --rate 5000000 \
+  --duration 30 \
   --confirm
 
-# L7 HTTP/2 Stres Testi
+# Stateful HTTP/2 simulation test
 ./build/ddos_samurai/cli/samurai \
   --worker l7 \
-  --target 10.0.0.50 --port 443 \
-  --protocol http2 --scheme https \
-  --concurrency 100 --max-connections 50 \
-  --count 200000 --confirm
+  --target 10.0.0.50 \
+  --port 443 \
+  --l7-protocol h2 \
+  --duration 60 \
+  --confirm
 
-# Scenario Engine ile Gerçekçi Kullanıcı Senaryosu
+# Multi-step stateful user scenario execution
 ./build/ddos_samurai/cli/samurai \
   --worker scenario \
-  --target 10.0.0.50 --port 443 \
-  --scenario-payload-ref docs/scenario_web_mobile.yaml \
-  --count 100000 --confirm
+  --scenario-file docs/scenario_web_mobile.yaml \
+  --confirm
 ```
 
----
+### 2) Distributed Multi-Node Cluster Execution
 
-### 2) Dağıtık (Distributed) Master / Slave Modu
+Scale workloads horizontally across multiple baremetal servers:
 
-Farklı sunuculardaki kaynakları birleştirerek test yükünü yatayda ölçekleme:
-
-#### **Master Düğümü (`samurai_master`):**
+#### **Master Node (`samurai_master`):**
 ```bash
 ./build/ddos_samurai/control/daemon/samurai_master \
   --control-listen tcp://0.0.0.0:5099 \
-  --count 10000000 \
+  --api-listen 0.0.0.0:8089 \
   --target 10.0.0.50 \
   --port 443 \
-  --protocol tcp \
-  --expect-workers 4 \
-  --cluster-secret "samurai-cluster-secret" \
-  --management-listen 0.0.0.0:8089
+  --worker afxdp \
+  --count 50000000 \
+  --duration 120
 ```
 
-#### **Slave Düğümleri (`samurai_slave`):**
-Her worker sunucusunda çalıştırın:
+#### **Worker Node (`samurai_slave`):**
+Run on each agent/generator machine:
 ```bash
 ./build/ddos_samurai/control/daemon/samurai_slave \
-  --control-endpoints <MASTER_IP>:5099 \
+  --control-endpoints tcp://<MASTER_IP>:5099 \
   --worker afxdp \
-  --worker-id "slave-node-01" \
-  --worker-region "eu-central" \
-  --cluster-secret "samurai-cluster-secret" \
-  --heartbeat-interval-ms 2000
+  --interface eth0
 ```
 
----
-
-### 3) Docker Compose ile Dağıtık Çalıştırma
+### 3) Docker Compose Deployment
 
 ```bash
-docker compose -f docker-compose.distributed.yml up --build --scale slave=4
+docker-compose -f docker-compose.distributed.yml up -d
 ```
 
 ---
 
-## Worker Türleri Referansı
+## Dataplane Worker Types
 
-| Worker Adı (`--worker`) | Native Binary | Açıklama ve Yetenekler |
+| Worker Name (`--worker`) | Native Binary | Capabilities & Acceleration Path |
 | :--- | :--- | :--- |
-| `cpu` | `samurai_cpu_worker` | Standart CPU raw socket, paket halkası, dinamik spoofing |
-| `afxdp` | `samurai_afxdp_worker` | Linux XDP/UMEM zero-copy kernel bypass |
-| `dpdk` | `samurai_dpdk_worker` | DPDK PMD donanım kuyruğu tabanlı paket iletimi |
-| `gpu` | `samurai_gpu_worker` | CUDA tabanlı GPU paralel paket sentezi |
-| `doca` | `samurai_doca_worker` | NVIDIA DPU & GPUNetIO doğrudan bellek veri yolu |
-| `l7` | `samurai_l7_worker` | HTTP/1.1, HTTP/2, QUIC/HTTP/3, DNS (Epoll / User-Space TCP) |
-| `scenario` | `samurai_scenario_worker` | Çok adımlı web/mobil persona senaryo motoru |
-| `defense` | `samurai_defense_worker` | VAE anomali doğrulama ve savunma bypass analizleri |
+| `cpu` | `samurai_cpu_worker` | Raw sockets, memory ring buffer, dynamic header spoofing |
+| `afxdp` | `samurai_afxdp_worker` | Linux XSK / UMEM zero-copy kernel bypass |
+| `dpdk` | `samurai_dpdk_worker` | DPDK PMD hardware ring buffers and hugepages |
+| `gpu` | `samurai_gpu_worker` | NVIDIA CUDA warp-parallel packet synthesis |
+| `doca` | `samurai_doca_worker` | NVIDIA BlueField DPU & GPUNetIO direct VRAM streaming |
+| `l7` | `samurai_l7_worker` | Stateful HTTP/1.1, HTTP/2 (nghttp2), QUIC / HTTP/3 (ngtcp2) |
+| `scenario` | `samurai_scenario_worker` | Persona-based multi-step user workflows and SLA tracking |
+| `defense` | `samurai_defense_worker` | Variational Autoencoder (VAE) resilience evaluation |
 
 ---
 
-## Native Self-Testler (Doğrulama)
+## Native Self-Test Verification Suites
 
-Tüm bileşenlerin sağlığını C++ birim testleriyle doğrulamak için:
+Run the built-in C++ validation binaries to verify subsystems in isolated environments:
 
 ```bash
+# Verify Distributed Control Plane and RPC wire protocol
 ./build/ddos_samurai/control/samurai_control_selftest
+
+# Verify Stateful L7 Engine and Protocol Bridges
 ./build/ddos_samurai/l7_emu_native/samurai_l7_selftest
+
+# Verify Scenario Engine and SLA Verification
 ./build/ddos_samurai/scenario_engine_native/samurai_scenario_engine_selftest
-./build/ddos_samurai/licensing/samurai_licensing_selftest
 ```
 
 ---
 
-## Yasal ve Etik Bildirim
+## Security & Authorized Use Policy
 
-Bu yazılım yalnızca sistem yöneticilerinin, güvenlik araştırmacılarının ve ağ mühendislerinin kendi sahip oldukları veya açık yazılı izin aldıkları altyapılarda stres/dayanıklılık testleri yapabilmesi amacıyla tasarlanmıştır. İzin alınmamış hedeflere yönelik trafik üretilmesi yasa dışıdır. Tüm yasal sorumluluk kullanıcıya aittir.
+This software is strictly intended for network administrators, security researchers, and systems engineers conducting authorized resilience, scalability, and stress assessments on infrastructure they own or hold explicit written permission to test. Unauthorized generation of hostile traffic is illegal under international computer misuse statutes. The end user assumes all legal liability.
 
 ---
 
-## Detaylı Dokümantasyon İndeksi
+## Technical Documentation Index
 
-Tüm alt modüllerin ayrıntılı teknik açıklamaları için [`docs/README.md`](docs/README.md) dizinini inceleyebilirsiniz.
+For exhaustive architectural specifications and subsystem deep-dives, see [`docs/README.md`](docs/README.md).
