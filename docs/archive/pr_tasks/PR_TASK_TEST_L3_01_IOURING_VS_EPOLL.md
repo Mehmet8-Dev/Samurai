@@ -2,19 +2,19 @@
 
 * **Source Branch:** `test/task-test-l3-01-iouring-vs-epoll`
 * **Target Branch:** `main` (or `develop`)
-* **Task / Issue Tracking:** `TASK-TEST-L3-01` ([test_task.md](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/test_task.md#L162-L182), [SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md#L81-L98))
+* **Task / Issue Tracking:** `TASK-TEST-L3-01` ([test_task.md](file://test_task.md#L162-L182), [SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md](file://reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md#L81-L98))
 * **Architectural Layer:** Layer 3 (L7 Protocol Emulation & Transport Reactor Architecture)
 * **Affected Files:**
-  * [`ddos_samurai/l7_emu_native/io_uring_compat.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/io_uring_compat.hpp)
-  * [`ddos_samurai/l7_emu_native/engine_h1_parser.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/engine_h1_parser.cpp)
-  * [`ddos_samurai/l7_emu_native/engine_h1_transport.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/engine_h1_transport.cpp)
-  * [`ddos_samurai/l7_emu_native/engine_h1_request.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/engine_h1_request.cpp)
-  * [`ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp)
-  * [`tests/bench_iouring_vs_epoll_syscalls.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_iouring_vs_epoll_syscalls.sh)
-  * [`tests/test_iouring_vs_epoll_syscalls.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_iouring_vs_epoll_syscalls.py)
-  * [`test_task.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/test_task.md)
-  * [`reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md)
-  * [`.gitignore`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/.gitignore)
+  * [`ddos_samurai/l7_emu_native/io_uring_compat.hpp`](file://ddos_samurai/l7_emu_native/io_uring_compat.hpp)
+  * [`ddos_samurai/l7_emu_native/engine_h1_parser.cpp`](file://ddos_samurai/l7_emu_native/engine_h1_parser.cpp)
+  * [`ddos_samurai/l7_emu_native/engine_h1_transport.cpp`](file://ddos_samurai/l7_emu_native/engine_h1_transport.cpp)
+  * [`ddos_samurai/l7_emu_native/engine_h1_request.cpp`](file://ddos_samurai/l7_emu_native/engine_h1_request.cpp)
+  * [`ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp`](file://ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp)
+  * [`tests/bench_iouring_vs_epoll_syscalls.sh`](file://tests/bench_iouring_vs_epoll_syscalls.sh)
+  * [`tests/test_iouring_vs_epoll_syscalls.py`](file://tests/test_iouring_vs_epoll_syscalls.py)
+  * [`test_task.md`](file://test_task.md)
+  * [`reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md`](file://reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md)
+  * [`.gitignore`](file://.gitignore)
 
 ---
 
@@ -47,36 +47,36 @@ In high-throughput L7 HTTP/1.1 traffic generation and protocol emulation, the tr
 ## 2. Engineering Changes & Implementation Details
 
 ### A. Unified Batch Submission & CQ Reaping in `io_uring_compat.hpp`
-* Implemented [`wait_cqes(min_complete, timeout_ms)`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/io_uring_compat.hpp) utilizing kernel `IORING_FEAT_EXT_ARG` with `__kernel_timespec`.
-* Implemented [`submit_and_wait_cqes(min_complete, timeout_ms)`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/io_uring_compat.hpp), combining submission queue flushing and completion queue waiting into a single, atomic `io_uring_enter` system call.
+* Implemented [`wait_cqes(min_complete, timeout_ms)`](file://ddos_samurai/l7_emu_native/io_uring_compat.hpp) utilizing kernel `IORING_FEAT_EXT_ARG` with `__kernel_timespec`.
+* Implemented [`submit_and_wait_cqes(min_complete, timeout_ms)`](file://ddos_samurai/l7_emu_native/io_uring_compat.hpp), combining submission queue flushing and completion queue waiting into a single, atomic `io_uring_enter` system call.
 * Fixed ring queue accounting: `sq_last_submitted` is strictly updated only when `ret > 0`, properly handling partial submissions, errors (`EINTR`), and timeout waiting.
 * Added `prep_uring_nop` for zero-overhead unit introspection.
 
 ### B. High-Efficiency Engine Reactor Pipeline in `engine_h1_parser.cpp`
-* Overhauled [`service_ready_lanes_io_uring`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/engine_h1_parser.cpp) to execute ring-level flushing and completion reaping via `submit_and_wait_cqes`.
+* Overhauled [`service_ready_lanes_io_uring`](file://ddos_samurai/l7_emu_native/engine_h1_parser.cpp) to execute ring-level flushing and completion reaping via `submit_and_wait_cqes`.
 * Sockets registered with io_uring process full HTTP/1.1 response pipelines without ever invoking `recv()` or `poll()`.
 
 ### C. Socket-Level Latency Optimization in `engine_h1_transport.cpp`
-* Configured `TCP_NODELAY` via `setsockopt` in [`kernel_socket_connect_bridge`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/engine_h1_transport.cpp).
+* Configured `TCP_NODELAY` via `setsockopt` in [`kernel_socket_connect_bridge`](file://ddos_samurai/l7_emu_native/engine_h1_transport.cpp).
 * Prevents TCP delayed ACK / Nagle interactions on persistent streams, ensuring microsecond response times.
 
 ### D. Zero-Allocation Vector Pre-Sizing in `engine_h1_request.cpp`
-* Pre-allocated vector storage using `.reserve()` across [`build_h1_requests`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/engine_h1_request.cpp) and [`bucket_h1_requests_by_shard`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/engine_h1_request.cpp).
+* Pre-allocated vector storage using `.reserve()` across [`build_h1_requests`](file://ddos_samurai/l7_emu_native/engine_h1_request.cpp) and [`bucket_h1_requests_by_shard`](file://ddos_samurai/l7_emu_native/engine_h1_request.cpp).
 * Prevents heap fragmentation and vector reallocations during 100K request burst initialization.
 
 ### E. Multi-Reactor Benchmark & Server Harness in `test_kernel_threaded_io_uring.cpp`
 * Added dedicated unit test `TestIoUringQueueAccounting()` verifying SQ saturation (`get_sqe() == nullptr` when full), submission accounting, NOP completions, zero-submission call, and timeout behavior.
-* Upgraded [`TinyHttpServer`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp) with persistent HTTP/1.1 keep-alive streaming, `SO_REUSEADDR`, `SO_REUSEPORT`, `TCP_NODELAY`, and coordinated `::shutdown(cfd, SHUT_RDWR)` upon server shutdown.
+* Upgraded [`TinyHttpServer`](file://ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp) with persistent HTTP/1.1 keep-alive streaming, `SO_REUSEADDR`, `SO_REUSEPORT`, `TCP_NODELAY`, and coordinated `::shutdown(cfd, SHUT_RDWR)` upon server shutdown.
 * Added full CLI argument parsing: `--benchmark`, `--requests`, `--concurrency`, `--reactor`, `--server-only`, `--json`.
 
 ### F. Automated Syscall Tracing & Multi-Run Verification Harness
-* Updated [`tests/bench_iouring_vs_epoll_syscalls.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_iouring_vs_epoll_syscalls.sh):
+* Updated [`tests/bench_iouring_vs_epoll_syscalls.sh`](file://tests/bench_iouring_vs_epoll_syscalls.sh):
   * **Warmup Phase:** 5,000 warmup requests to prime caches and socket buffers.
   * **Multi-Run Alternating Benchmark:** 3 iterations alternating order (epoll->uring, uring->epoll) to prevent thermal or execution order bias. Computes median and spread.
   * **Strict All-DoD Gating:** All criteria (`rx_syscalls=0`, `tx_syscalls=0`, `epoll_wakeups=0`, `throughput >= 20%`, `ctx_switch >= 50%`, `status_2xx integrity`) must pass simultaneously or script exits with code 1.
   * **Scoped Socket Syscalls:** Specifically scopes socket I/O (`recvfrom`, `recv`, `recvmsg`, `sendto`, `send`, `sendmsg`) vs generic file/pipe descriptor calls (`read`, `write`).
   * **Dynamic Environment Capture:** Dynamically detects UTC timestamp, kernel release, CPU model name, and vCPU core count.
-* Updated [`tests/test_iouring_vs_epoll_syscalls.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_iouring_vs_epoll_syscalls.py) with clean `unittest.SkipTest` handling on unsupported hosts.
+* Updated [`tests/test_iouring_vs_epoll_syscalls.py`](file://tests/test_iouring_vs_epoll_syscalls.py) with clean `unittest.SkipTest` handling on unsupported hosts.
 
 ---
 
@@ -132,5 +132,5 @@ In compliance with our engineering honesty and benchmark rigor standards:
 - [x] **Throughput Gain $\ge 20\%$:** Verified (**+160.81%** throughput gain under traced benchmark; **+7.61%** in native bare-metal).
 - [x] **100,000 Requests Completed:** 100.0% HTTP 200 OK responses with zero corrupted payloads across 32 concurrent shards.
 - [x] **Strict DoD Enforcement:** All criteria enforced simultaneously in runner; failure of any metric exits 1.
-- [x] **Regression & Queue Accounting Suite:** Unit test `TestIoUringQueueAccounting()` and CI script [`tests/test_iouring_vs_epoll_syscalls.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_iouring_vs_epoll_syscalls.py) verified 100% passing.
-- [x] **Task Tracking Documentation Updated:** Both [`test_task.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/test_task.md) and [`reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md) updated.
+- [x] **Regression & Queue Accounting Suite:** Unit test `TestIoUringQueueAccounting()` and CI script [`tests/test_iouring_vs_epoll_syscalls.py`](file://tests/test_iouring_vs_epoll_syscalls.py) verified 100% passing.
+- [x] **Task Tracking Documentation Updated:** Both [`test_task.md`](file://test_task.md) and [`reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md`](file://reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md) updated.

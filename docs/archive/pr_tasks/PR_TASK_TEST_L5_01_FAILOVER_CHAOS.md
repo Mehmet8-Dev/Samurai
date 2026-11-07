@@ -1,22 +1,22 @@
 # Pull Request: Distributed Master/Slave Dynamic Rebalancing Under Worker Chaos (`TASK-TEST-L5-01`)
 
 * **Target Branch:** `main` (Committed directly to `main` without opening separate branches, as requested)
-* **Task / Issue Tracking:** `TASK-TEST-L5-01` ([`test_task.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/test_task.md#L206-L230), [`reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md#L122-L145))
+* **Task / Issue Tracking:** `TASK-TEST-L5-01` ([`test_task.md`](file://test_task.md#L206-L230), [`reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md`](file://reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md#L122-L145))
 * **Architectural Layer:** Layer 5 (Distributed Control Plane & High Availability)
 * **Affected Subsystems & Files:**
-  * [`ddos_samurai/control/master_coordinator.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.hpp)
-  * [`ddos_samurai/control/master_coordinator.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.cpp)
-  * [`ddos_samurai/control/master_adapters.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_adapters.hpp)
-  * [`ddos_samurai/control/master_adapters.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_adapters.cpp)
-  * [`ddos_samurai/control/telemetry.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/telemetry.cpp)
-  * [`ddos_samurai/control/selftest.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/selftest.cpp)
-  * [`ddos_samurai/control/daemon/master_main.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/daemon/master_main.cpp)
-  * [`ddos_samurai/control/daemon/slave_main.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/daemon/slave_main.cpp)
-  * [`tests/bench_distributed_failover_chaos.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_distributed_failover_chaos.sh)
-  * [`tests/test_distributed_failover_chaos.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_distributed_failover_chaos.py)
-  * [`reports/benchmarks/task_l5_01/report.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l5_01/report.md)
-  * [`reports/benchmarks/task_l5_01/summary.json`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l5_01/summary.json)
-  * [`.gitignore`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/.gitignore)
+  * [`ddos_samurai/control/master_coordinator.hpp`](file://ddos_samurai/control/master_coordinator.hpp)
+  * [`ddos_samurai/control/master_coordinator.cpp`](file://ddos_samurai/control/master_coordinator.cpp)
+  * [`ddos_samurai/control/master_adapters.hpp`](file://ddos_samurai/control/master_adapters.hpp)
+  * [`ddos_samurai/control/master_adapters.cpp`](file://ddos_samurai/control/master_adapters.cpp)
+  * [`ddos_samurai/control/telemetry.cpp`](file://ddos_samurai/control/telemetry.cpp)
+  * [`ddos_samurai/control/selftest.cpp`](file://ddos_samurai/control/selftest.cpp)
+  * [`ddos_samurai/control/daemon/master_main.cpp`](file://ddos_samurai/control/daemon/master_main.cpp)
+  * [`ddos_samurai/control/daemon/slave_main.cpp`](file://ddos_samurai/control/daemon/slave_main.cpp)
+  * [`tests/bench_distributed_failover_chaos.sh`](file://tests/bench_distributed_failover_chaos.sh)
+  * [`tests/test_distributed_failover_chaos.py`](file://tests/test_distributed_failover_chaos.py)
+  * [`reports/benchmarks/task_l5_01/report.md`](file://reports/benchmarks/task_l5_01/report.md)
+  * [`reports/benchmarks/task_l5_01/summary.json`](file://reports/benchmarks/task_l5_01/summary.json)
+  * [`.gitignore`](file://.gitignore)
 
 ---
 
@@ -72,7 +72,7 @@ sequenceDiagram
 ```
 
 ### A. Dynamic Shard Reclamation & Configurable Attempt Bounds
-* In [`master_coordinator.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.hpp) and [`master_coordinator.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.cpp):
+* In [`master_coordinator.hpp`](file://ddos_samurai/control/master_coordinator.hpp) and [`master_coordinator.cpp`](file://ddos_samurai/control/master_coordinator.cpp):
   * Added `max_shard_retries` (default 3) to `JobConfig`, replacing hardcoded attempt ceilings.
   * During lost-worker detection:
     $$\Delta t = t_{\text{now}} - t_{\text{hb}} > T_{\text{timeout}}$$
@@ -86,20 +86,20 @@ sequenceDiagram
   * Dead workers in `lost_workers` are strictly excluded from subsequent dispatch iterations (`free_workers`).
 
 ### B. Bounded Probe Timeout to Prevent Dispatch Loop Stalls
-* In [`master_adapters.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_adapters.cpp):
+* In [`master_adapters.cpp`](file://ddos_samurai/control/master_adapters.cpp):
   * Bounded status probe timeout in `ClientWorkerCommander::Probe` using `std::min(timeout_ms_, 1000)`.
   * If a worker is terminated via `kill -9`, synchronous probe attempts quickly abort within $\le 1,000$ ms rather than blocking the master thread for 5,000 ms, ensuring the heartbeat evaluation runs promptly at the 2,000 ms boundary.
 
 ### C. CLI Argument Wiring in Daemon Daemons
-* In [`master_main.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/daemon/master_main.cpp):
+* In [`master_main.cpp`](file://ddos_samurai/control/daemon/master_main.cpp):
   * Added CLI flags `--heartbeat-timeout-ms`, `--max-shard-retries`, `--on-worker-loss`, `--worker-status-probe`, and `--rpc-timeout-ms`.
   * Updated `JobSpecFromArgs` and `BuildJobConfig` to propagate these parameters into the running coordinator instance.
-* In [`slave_main.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/daemon/slave_main.cpp):
+* In [`slave_main.cpp`](file://ddos_samurai/control/daemon/slave_main.cpp):
   * Added `--mock` and `--mock-delay-ms` flags to instantiate `MockShardRunner`.
   * Enables reproducible control-plane chaos and failover benchmarking on commodity systems and CI environments without requiring kernel `CAP_NET_RAW` privileges.
 
 ### D. Mathematical Worker Rollup Conservation
-* In [`telemetry.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/telemetry.cpp):
+* In [`telemetry.cpp`](file://ddos_samurai/control/telemetry.cpp):
   * Fixed `DistributedAggregator` worker and region rollup accounting from `std::max` to strict summation across reported shards (`w.sent += IntField(item, "sent")`).
   * Mathematically guarantees that the sum of surviving worker totals strictly equals the job's aggregate packet count:
     $$\sum_{w \in \text{survivors}} N_w = N_{\text{actual}} = 10,000,000$$
@@ -108,7 +108,7 @@ sequenceDiagram
 
 ## 3. Empirical Verification & Benchmark Results
 
-The benchmark harness [`tests/bench_distributed_failover_chaos.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_distributed_failover_chaos.sh) executed 5 consecutive chaos runs on a 4-slave topology with 10,000,000 packets per run. In each iteration, `slave_1` was terminated with `kill -9` during active execution.
+The benchmark harness [`tests/bench_distributed_failover_chaos.sh`](file://tests/bench_distributed_failover_chaos.sh) executed 5 consecutive chaos runs on a 4-slave topology with 10,000,000 packets per run. In each iteration, `slave_1` was terminated with `kill -9` during active execution.
 
 ### Determinism Summary (5 Consecutive Runs)
 
@@ -139,6 +139,6 @@ The benchmark harness [`tests/bench_distributed_failover_chaos.sh`](file:///home
 - [x] **Zero Master deadlocks:** All processes terminated cleanly with `rc = 0`; queues completely drained (`pending_shards_left = 0`, `inflight_shards_left = 0`).
 - [x] **Unit, Integration, and E2E Test Parity:**
   - In-tree C++ control selftest matrix (`./build/control/samurai_control_selftest`) passing 100%.
-  - Pytest suite ([`tests/test_distributed_failover_chaos.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_distributed_failover_chaos.py)) passing 3/3 (100%).
-  - Multi-run benchmark harness ([`tests/bench_distributed_failover_chaos.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_distributed_failover_chaos.sh)) passing with $CV = 0.02\% < 5.0\%$.
+  - Pytest suite ([`tests/test_distributed_failover_chaos.py`](file://tests/test_distributed_failover_chaos.py)) passing 3/3 (100%).
+  - Multi-run benchmark harness ([`tests/bench_distributed_failover_chaos.sh`](file://tests/bench_distributed_failover_chaos.sh)) passing with $CV = 0.02\% < 5.0\%$.
 - [x] **Co-authored-by Trailer:** Proper trailer attached to git commits for `0x4nyroot <0x4nyroot@users.noreply.github.com>`.

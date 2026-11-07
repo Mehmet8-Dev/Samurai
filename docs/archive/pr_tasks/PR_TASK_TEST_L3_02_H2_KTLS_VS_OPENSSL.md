@@ -2,18 +2,18 @@
 
 * **Source Branch:** `test/task-test-l3-02-h2-ktls-vs-openssl`
 * **Target Branch:** `main`
-* **Task / Issue Tracking:** `TASK-TEST-L3-02` ([test_task.md](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/test_task.md#L182-L188), [SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md#L99-L104))
+* **Task / Issue Tracking:** `TASK-TEST-L3-02` ([test_task.md](file://test_task.md#L182-L188), [SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md](file://reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md#L99-L104))
 * **Architectural Layer:** Layer 3 (L7 Protocol Emulation & Transport Cryptographic Offload Architecture)
 * **Affected Files:**
-  * [`ddos_samurai/l7_emu_native/test_kernel_threaded_h2.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/test_kernel_threaded_h2.cpp)
-  * [`ddos_samurai/l7_emu_native/test_h2_tls_server.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/test_h2_tls_server.py)
-  * [`ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh)
-  * [`tests/bench_h2_ktls_vs_memory_bio.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_h2_ktls_vs_memory_bio.sh)
-  * [`tests/test_h2_ktls_vs_memory_bio.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_h2_ktls_vs_memory_bio.py)
-  * [`reports/benchmarks/task_l3_02/report.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l3_02/report.md)
-  * [`reports/benchmarks/task_l3_02/summary.json`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l3_02/summary.json)
-  * [`test_task.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/test_task.md)
-  * [`reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md)
+  * [`ddos_samurai/l7_emu_native/test_kernel_threaded_h2.cpp`](file://ddos_samurai/l7_emu_native/test_kernel_threaded_h2.cpp)
+  * [`ddos_samurai/l7_emu_native/test_h2_tls_server.py`](file://ddos_samurai/l7_emu_native/test_h2_tls_server.py)
+  * [`ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh`](file://ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh)
+  * [`tests/bench_h2_ktls_vs_memory_bio.sh`](file://tests/bench_h2_ktls_vs_memory_bio.sh)
+  * [`tests/test_h2_ktls_vs_memory_bio.py`](file://tests/test_h2_ktls_vs_memory_bio.py)
+  * [`reports/benchmarks/task_l3_02/report.md`](file://reports/benchmarks/task_l3_02/report.md)
+  * [`reports/benchmarks/task_l3_02/summary.json`](file://reports/benchmarks/task_l3_02/summary.json)
+  * [`test_task.md`](file://test_task.md)
+  * [`reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md`](file://reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md)
 
 ---
 

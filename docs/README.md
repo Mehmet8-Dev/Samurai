@@ -1,66 +1,68 @@
-# DDoSamurai Dokümantasyon İndeksi (Native C++ / Shogun)
+# Samurai Documentation Index (Native C++ / Shogun)
 
-Bu dizin, DDoSamurai projesinin teknik mimarisini, native C++ bileşenlerini ve operasyonel kullanım kılavuzlarını içerir.
+This directory serves as the centralized technical index for the Samurai network resilience and stress testing platform, covering its native C++17 modular runtime, kernel-bypass engines, hardware accelerators, and distributed control planes.
 
----
-
-## 1. Çekirdek Sistem ve Çalışma Zamanı
-
-- [00 - Genel Bakış ve Mimari Haritası](./00-overview.md)
-- [01 - Native CLI (`samurai`) Kullanımı](./01-cli.md)
-- [02 - Orchestrator & Native Supervisor](./02-orchestrator.md)
-- [03 - Senders ve Native Dataplane Motorları](./03-senders.md)
-- [04 - CPU Packet Builder ve Spoofing Engine](./04-packet-builder.md)
-- [05 - GPU CUDA ve DOCA GPUNetIO Dataplane](./05-gpu.md)
-- [06 - AF_XDP Kernel-Bypass ve Zero-Copy](./06-af_xdp-fast_sender.md)
-- [07 - Hedef Güvenliği (Target Safety) ve RFC Kontrolleri](./07-safety.md)
-- [08 - Konfigürasyon ve Profil Yapılandırması](./08-config.md)
-- [09 - Geliştirme, CMake Derleme ve Native Testler](./09-dev-testing.md)
-- [10 - Sorun Giderme (Troubleshooting)](./10-troubleshooting.md)
-- [11 - Docker ve Dağıtık Konteyner Mimarisi](./11-docker.md)
-- [12 - İzleme, Grafana ve Telemetri Görünürlüğü](./12-dashboard.md)
-- [13 - Native HTTP Management API (`:8089`)](./13-api.md)
+![Samurai End-to-End System Architecture](assets/diagrams/samurai_system_architecture.svg)
 
 ---
 
-## 2. Derinlemesine Teknik ve Benchmark Dokümanları
+## 1. Core Architecture & Runtime Subsystems
 
-- [20 - Environment Değişkenleri ve CLI Parametreleri](./20-env-cli-reference.md)
-- [21 - NUMA, TX/RX, AF_XDP, DPDK ve DMA Mimarisi](./21-numa-tx-rx-afxdp-dpdk-dma-ders-notu.md)
-- [22 - CLI Operasyonel El Kitabı (Playbook)](./22-cli-operational-playbook.md)
-- [23 - Benchmark Kabul ve Başarım Kriterleri](./23-benchmark-acceptance-handbook.md)
-- [24 - Kurumsal Test Senaryoları El Kitabı](./24-enterprise-test-scenarios-handbook.md)
-- [25 - Core Runtime Modülleri](./25-core-runtime-modules.md)
-- [26 - CLI Paket Detay Haritası](./26-cli-package-deep-map.md)
-- [27 - GPU CUDA Payload Motoru](./27-gpu-cuda-payload.md)
-- [28 - Scenario Engine (Web/Mobil Persona Modeli)](./28-scenario-engine-web-mobile-persona.md)
-- [43 - L4 Stateful TCP Motoru (`tcpdp`) 1M Aktif Akış Ölçek ve Mimari Doğrulama Raporu](./43-tcpdp-1m-flows-benchmark-report.md)
-- [45 - Tüketici Sınıfı GeForce GPU & DPDK NIC P2P DMA Paket Motoru Mimari Raporu](./45-commodity-gpu-nic-p2p-packet-engine-report.md)
-- [46 - Bare-Metal GPU-PMD ve GPU-Initiated NIC MMIO Doorbell Mimarisi](./46-gpu-initiated-doorbell-and-baremetal-pmd.md)
-- [47 - Sıfır CPU Bağımlı Persistent Kernel Veri Düzlemi Mimarisi](./47-zero-cpu-persistent-dataplane-architecture.md)
-- [48 - Tüketici Donanımı Zorunlu Çözümleri ve Kurumsal Donanım Geçiş Planı](./48-commodity-workarounds-and-enterprise-migration-plan.md)
-
----
-
-## 3. Dağıtık Küme (Distributed) ve Kurumsal Özellikler
-
-- [29 - Dağıtık Control Plane Derinlemesine İnceleme](./29-distributed-control-plane.md)
-- [30 - Lisanslama ve Ürünleştirme Mimarisi](./30-licensing-and-commercialization.md)
-- [31 - Güvenlik ve Sürüm Çıkış Kapıları (Release Gates)](./31-security-release-gates.md)
-- [32 - Prodüksiyon Operasyonları Runbook'u](./32-production-operations-runbook.md)
-- [33 - DOCA GPUNetIO Göç ve Mimari Durumu](./33-doca-gpunetio-migration-status.md)
-- [34 - DPDK Kurulum ve Hazırlık Rehberi](./34-dpdk-kurulum-ve-hazirlik-rehberi.md)
-- [35 - VAE Savunma Entegrasyonu](./35-vae-defense-integration.md)
-- [36 - ZMQ Worker Mimarisi ve IPC Protokolü](./36-zmq-worker-architecture.md)
-- [37 - DPU/GPU Dataplane Mimarisi](./37-dpu-gpu-dataplane-architecture.md)
-- [39 - Native Mimari ve ZMQ Worker API Referansı](./39-native-architecture-and-worker-api.md)
-- [Distributed Container-Native Kılavuzu](./distributed-container-native.md)
-- [Distributed High Availability (HA) Testleri](./distributed-ha-smoke.md)
+- [00 - System Architecture & Subsystem Map](./00-overview.md)
+- [01 - Native CLI (`samurai`) Reference](./01-cli.md)
+- [02 - Orchestrator & Native Supervisor Engine](./02-orchestrator.md)
+- [04 - CPU Packet Builder & Traffic Synthesis Engine](./04-packet-builder.md)
+- [05 - GPU CUDA & DOCA GPUNetIO Hardware Dataplane](./05-gpu.md)
+- [06 - AF_XDP Kernel-Bypass & Zero-Copy Engine](./06-af_xdp-fast_sender.md)
+- [07 - Target Safety & RFC Compliance Verification](./07-safety.md)
+- [08 - Configuration & Test Profile Management](./08-config.md)
+- [09 - Development, CMake Build System & Native Testing](./09-dev-testing.md)
+- [10 - Troubleshooting & Operational Diagnostics](./10-troubleshooting.md)
+- [11 - Docker & Containerized Distributed Architecture](./11-docker.md)
+- [12 - Telemetry Visibility, Prometheus & Grafana Dashboards](./12-dashboard.md)
+- [13 - Native HTTP Management REST API (`:8089`)](./13-api.md)
 
 ---
 
-## 4. Özel Protokol ve Senaryo Planları
+## 2. Advanced Hardware, Kernel-Bypass & Benchmarks
 
-- [L7 Native Custom QUIC/H3 Parite Planı](./PLAN_L7_NATIVE_CUSTOM_QUIC_H3_PARITY.md)
-- [Scenario Engine Teknik Notları](./scenario_engine.md)
-- [Örnek Senaryo Yapılandırması (YAML)](./scenario_web_mobile.yaml)
+- [17 - GPU AI Dataplane Research & Validation Roadmap](./17-gpu-ai-dataplane-research-validation-roadmap.md)
+- [18 - AF_PACKET & Hugepage Memory Management Policy](./18-afpacket-hugepage-policy.md)
+- [19 - Benchmark Profiles & Workload Definitions](./19-benchmark-profiles.md)
+- [20 - Environment Variables & CLI Options Reference](./20-env-cli-reference.md)
+- [21 - NUMA Architecture, TX/RX Scaling & AF_XDP/DPDK DMA Guide](./21-numa-tx-rx-afxdp-dpdk-dma-ders-notu.md)
+- [22 - CLI Operational Playbook](./22-cli-operational-playbook.md)
+- [23 - Benchmark Acceptance & Throughput Handbook](./23-benchmark-acceptance-handbook.md)
+- [24 - Enterprise Stress Scenarios Handbook](./24-enterprise-test-scenarios-handbook.md)
+- [25 - Core Runtime Modules Deep Dive](./25-core-runtime-modules.md)
+- [26 - CLI Package Deep Architectural Map](./26-cli-package-deep-map.md)
+- [28 - Scenario Engine (Web & Mobile Persona Modeling)](./28-scenario-engine-web-mobile-persona.md)
+- [34 - DPDK Environment Setup & PMD Preparation Guide](./34-dpdk-kurulum-ve-hazirlik-rehberi.md)
+- [37 - Carrier-Grade Telecom Engine Architecture Guide](./37-telecom-engine-guide.md)
+- [45 - Commodity GeForce GPU & NIC P2P Packet Engine Report](./45-commodity-gpu-nic-p2p-packet-engine-report.md)
+- [46 - GPU-Initiated NIC MMIO Doorbell & Baremetal PMD](./46-gpu-initiated-doorbell-and-baremetal-pmd.md)
+- [47 - Zero-CPU Persistent Kernel Dataplane Architecture](./47-zero-cpu-persistent-dataplane-architecture.md)
+- [48 - Commodity Workarounds & Enterprise Hardware Migration Plan](./48-commodity-workarounds-and-enterprise-migration-plan.md)
+
+### Benchmarks & Verified Acceptance Reports:
+- [43 - L4 Stateful TCP 1M Active Flows Benchmark Report](./benchmarks/43-tcpdp-1m-flows-benchmark-report.md)
+- [44 - L7 Stateful Userspace Shared-Nothing Benchmark Report](./benchmarks/44-l7-stateful-userspace-benchmark-report.md)
+
+---
+
+## 3. Distributed Cluster & Enterprise Architecture
+
+- [29 - Distributed Control Plane & Shard Orchestration](./29-distributed-control-plane.md)
+- [30 - Licensing & Commercialization Architecture](./30-licensing-and-commercialization.md)
+- [31 - Security & Release Gate Validation](./31-security-release-gates.md)
+- [32 - Production Operations Runbook](./32-production-operations-runbook.md)
+- [33 - DOCA GPUNetIO & DPU-GPU Dataplane Architecture](./33-doca-gpunetio-migration-status.md)
+- [35 - Variational Autoencoder (VAE) Defense Verification](./35-vae-defense-integration.md)
+- [36 - ZMQ Worker Architecture & IPC Wire Protocol](./36-zmq-worker-architecture.md)
+- [37 - DPU/GPU Dataplane Architecture & Contract Specification](./37-dpu-gpu-dataplane-architecture.md)
+- [39 - Native Architecture & ZMQ Worker API Reference](./39-native-architecture-and-worker-api.md)
+- [40 - Distributed Control Plane Handbook](./40-distributed-control-plane-handbook.md)
+- [41 - Scenario JSON Specification & Examples](./41-scenario-json-spec-and-examples.md)
+- [42 - Reinforcement Learning (RL) Closed-Loop Autopilot Evaluation](./42-rl-closed-loop-evaluation-and-findings.md)
+- [Distributed Container-Native Runbook](./distributed-container-native.md)
+- [Distributed High Availability (HA) Failover Testing](./distributed-ha-smoke.md)
